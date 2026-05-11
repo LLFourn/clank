@@ -1,3 +1,5 @@
+//! HTTP routes (session-centric).
+
 use axum::Router;
 use axum::extract::{Path, State};
 use axum::http::{HeaderMap, Method, Request, StatusCode};
@@ -10,41 +12,49 @@ use super::AppState;
 use super::curator;
 use super::internal_api;
 use super::ui;
+use crate::lifecycle::{CommitSha, SessionId};
 use crate::storage::{
     agents, events as ev_store, implementation_revisions as impl_revs, plan_revisions, plans,
+    sessions,
 };
 
 pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/", get(home))
         .route("/healthz", get(healthz))
-        .route("/plans/{id}", get(plan_detail))
-        .route("/plans/{id}/commits/{sha}", get(commit_diff))
+        .route("/sessions/{session_id}", get(session_detail))
+        .route("/sessions/{session_id}/history", get(session_history))
         .route(
-            "/plans/{id}/feedback/{event_id}/stage",
+            "/sessions/{session_id}/history/{plan_id}",
+            get(history_plan_detail),
+        )
+        .route("/sessions/{session_id}/commits/{sha}", get(commit_diff))
+        .route(
+            "/sessions/{session_id}/feedback/{event_id}/stage",
             post(curator::stage_feedback),
         )
         .route(
-            "/plans/{id}/feedback/{event_id}/unstage",
+            "/sessions/{session_id}/feedback/{event_id}/unstage",
             post(curator::unstage_feedback),
         )
         .route(
-            "/plans/{id}/feedback/{event_id}/edit",
+            "/sessions/{session_id}/feedback/{event_id}/edit",
             post(curator::edit_feedback),
         )
         .route(
-            "/plans/{id}/feedback/{event_id}/delete",
+            "/sessions/{session_id}/feedback/{event_id}/delete",
             post(curator::delete_feedback),
         )
-        .route("/plans/{id}/deliver", post(curator::deliver))
-        .route("/plans/{id}/comment", post(curator::comment))
-        .route("/plans/{id}/approve", post(curator::approve_plan))
-        .route("/plans/{id}/mark-done", post(curator::mark_done))
-        .route("/plans/{id}/archive", post(curator::archive))
-        .route("/plans/{id}/rename", post(curator::rename))
-        .route("/plans/{id}/evict-master", post(curator::evict_master))
+        .route("/sessions/{session_id}/deliver", post(curator::deliver))
+        .route("/sessions/{session_id}/comment", post(curator::comment))
+        .route("/sessions/{session_id}/archive", post(curator::archive))
+        .route("/sessions/{session_id}/rename", post(curator::rename))
         .route(
-            "/plans/{id}/register-head",
+            "/sessions/{session_id}/evict-master",
+            post(curator::evict_master),
+        )
+        .route(
+            "/sessions/{session_id}/register-head",
             post(curator::register_head_as_impl),
         )
         .route("/internal/tools", get(internal_api::list_tools))
@@ -55,160 +65,254 @@ pub fn router(state: AppState) -> Router {
 }
 
 async fn home(State(state): State<AppState>) -> Result<Html<String>, AppError> {
-    let plans = plans::list_active(&state.pool)
+    let rows = sessions::list_active(&state.pool)
         .await
         .map_err(AppError::sqlx)?;
-    let mut rows = Vec::with_capacity(plans.len());
-    for plan in plans {
-        let agents_for_plan = agents::list_for_plan(&state.pool, &plan.id)
+    let mut out = Vec::with_capacity(rows.len());
+    for s in rows {
+        let sid = SessionId::from(s.id.clone());
+        let agents_for = agents::list_for_session(&state.pool, &sid)
             .await
             .map_err(AppError::sqlx)?;
-        let master_label = agents_for_plan
+        let master_label = agents_for
             .iter()
             .find(|a| a.role == "master")
             .map(|a| a.label.clone());
-        let reviewer_labels: Vec<String> = agents_for_plan
+        let reviewer_labels: Vec<String> = agents_for
             .iter()
             .filter(|a| a.role == "reviewer")
             .map(|a| a.label.clone())
             .collect();
-        let latest = plan_revisions::latest(&state.pool, &plan.id)
-            .await
-            .map_err(AppError::sqlx)?;
-        let pending_plan_count = count_pending(&state, &plan.id, "plan_revision").await?;
-        let pending_impl_count = count_pending(&state, &plan.id, "implementation_commit").await?;
-
-        rows.push(ui::HomeRow {
-            plan,
+        let active_plan_state = if let Some(id) = s.active_plan_id {
+            plans::fetch(&state.pool, id)
+                .await
+                .map_err(AppError::sqlx)?
+                .map(|p| p.state)
+        } else {
+            None
+        };
+        let (pending_plan, pending_impl) = pending_counts(&state, &sid).await?;
+        out.push(ui::SessionRow {
+            session: s,
             master_label,
             reviewer_labels,
-            latest_plan_revision_at: latest.as_ref().map(|r| r.created_at),
-            pending_plan_count,
-            pending_impl_count,
+            active_plan_state,
+            pending_plan_count: pending_plan,
+            pending_impl_count: pending_impl,
         });
     }
-    Ok(Html(ui::home(&rows).into_string()))
+    Ok(Html(ui::home(&out).into_string()))
 }
 
-async fn plan_detail(
+async fn session_detail(
     State(state): State<AppState>,
-    Path(plan_id): Path<String>,
+    Path(session_id): Path<String>,
 ) -> Result<Html<String>, AppError> {
-    let plan = plans::fetch(&state.pool, &plan_id)
+    let sid = SessionId::from(session_id.clone());
+    let session = sessions::fetch(&state.pool, &sid)
         .await
         .map_err(AppError::sqlx)?
-        .ok_or_else(|| AppError::not_found(format!("no plan {plan_id}")))?;
-    let agents_for_plan = agents::list_for_plan(&state.pool, &plan_id)
+        .ok_or_else(|| AppError::not_found(format!("no session {session_id}")))?;
+    let agents_for = agents::list_for_session(&state.pool, &sid)
         .await
         .map_err(AppError::sqlx)?;
-    let revisions = plan_revisions::list(&state.pool, &plan_id)
-        .await
-        .map_err(AppError::sqlx)?;
-    let latest_body = revisions.last().map(|r| r.body.as_str()).unwrap_or("");
-    let latest_body_html = render_markdown(latest_body);
+    let active_plan = if let Some(id) = session.active_plan_id {
+        plans::fetch(&state.pool, id)
+            .await
+            .map_err(AppError::sqlx)?
+    } else {
+        None
+    };
+    let plan_revisions = if let Some(p) = &active_plan {
+        plan_revisions::list_for_plan(&state.pool, p.id)
+            .await
+            .map_err(AppError::sqlx)?
+    } else {
+        Vec::new()
+    };
+    let latest_body_html = plan_revisions
+        .last()
+        .map(|r| render_markdown(&r.body))
+        .unwrap_or_default();
+    let impl_revisions = if let Some(p) = &active_plan {
+        impl_revs::list_for_plan(&state.pool, p.id)
+            .await
+            .map_err(AppError::sqlx)?
+    } else {
+        Vec::new()
+    };
 
-    let raw_plan_feedback: Vec<ev_store::Event> = sqlx::query_as(
-        "SELECT * FROM events WHERE plan_id = ? AND kind = 'feedback_added' \
-         AND target_kind = 'plan_revision' AND status IN ('pending', 'staged') ORDER BY id ASC",
-    )
-    .bind(&plan_id)
-    .fetch_all(&state.pool)
-    .await
-    .map_err(AppError::sqlx)?;
-    let (plan_pending, plan_staged) = build_feedback_lists_for_plan(&raw_plan_feedback, &revisions);
-
-    let impl_revisions = impl_revs::list(&state.pool, &plan_id)
+    // Feedback queries are scoped to the *active* plan_id, not just the
+    // session. Without the plan_id filter, leftover pending/staged feedback
+    // from an archived earlier cycle would be visible against a brand-new
+    // active plan. (The apply layer also withdraws those events on archive,
+    // but the filter is the load-bearing defense.)
+    let active_plan_id_for_query: Option<i64> = active_plan.as_ref().map(|p| p.id);
+    let raw_plan_feedback: Vec<ev_store::Event> = if let Some(pid) = active_plan_id_for_query {
+        sqlx::query_as(
+            "SELECT * FROM events WHERE session_id = ? AND plan_id = ? AND kind = 'feedback_added' \
+             AND target_kind = 'plan_revision' AND status IN ('pending', 'staged') ORDER BY id ASC",
+        )
+        .bind(sid.as_str())
+        .bind(pid)
+        .fetch_all(&state.pool)
         .await
-        .map_err(AppError::sqlx)?;
-    let raw_impl_feedback: Vec<ev_store::Event> = sqlx::query_as(
-        "SELECT * FROM events WHERE plan_id = ? AND kind = 'feedback_added' \
-         AND target_kind = 'implementation_commit' AND status IN ('pending', 'staged') ORDER BY id ASC",
-    )
-    .bind(&plan_id)
-    .fetch_all(&state.pool)
-    .await
-    .map_err(AppError::sqlx)?;
-    let current_commit_sha = plan.current_implementation_id.and_then(|id| {
-        impl_revisions
-            .iter()
-            .find(|r| r.id == id)
-            .map(|r| r.commit_sha.clone())
-    });
+        .map_err(AppError::sqlx)?
+    } else {
+        Vec::new()
+    };
+    let (plan_pending, plan_staged) = build_feedback_for_plan(&raw_plan_feedback, &plan_revisions);
+
+    let raw_impl_feedback: Vec<ev_store::Event> = if let Some(pid) = active_plan_id_for_query {
+        sqlx::query_as(
+            "SELECT * FROM events WHERE session_id = ? AND plan_id = ? AND kind = 'feedback_added' \
+             AND target_kind = 'implementation_commit' AND status IN ('pending', 'staged') ORDER BY id ASC",
+        )
+        .bind(sid.as_str())
+        .bind(pid)
+        .fetch_all(&state.pool)
+        .await
+        .map_err(AppError::sqlx)?
+    } else {
+        Vec::new()
+    };
+    let current_commit_sha = impl_revisions.last().map(|r| r.commit_sha.clone());
     let (impl_pending, impl_staged) =
-        build_feedback_lists_for_impl(&raw_impl_feedback, current_commit_sha.as_deref());
-    drop(current_commit_sha);
+        build_feedback_for_impl(&raw_impl_feedback, current_commit_sha.as_deref());
 
-    let timeline_events = ev_store::for_plan(&state.pool, &plan_id)
+    let archived_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM plans WHERE session_id = ? AND state = 'archived'",
+    )
+    .bind(sid.as_str())
+    .fetch_one(&state.pool)
+    .await
+    .map_err(AppError::sqlx)?;
+
+    let timeline_events = ev_store::for_session(&state.pool, &sid)
         .await
         .map_err(AppError::sqlx)?;
-    let post_impl_drift_count = timeline_events
-        .iter()
-        .filter(|ev| ev.kind == "plan_file_changed_after_implementation")
-        .count() as i64;
     let timeline = timeline_events
         .iter()
-        .map(|ev| ui::TimelineItem::from_event(ev, &revisions))
+        .map(|ev| ui::TimelineItem::from_event(ev, &plan_revisions))
         .collect();
 
     Ok(Html(
-        ui::plan_detail(&ui::PlanDetail {
-            plan,
-            agents: agents_for_plan,
-            revisions,
+        ui::session_detail(&ui::SessionDetail {
+            session,
+            agents: agents_for,
+            active_plan,
+            plan_revisions,
             latest_body_html,
+            impl_revisions,
             plan_feedback_pending: plan_pending,
             plan_feedback_staged: plan_staged,
-            impl_revisions,
             impl_feedback_pending: impl_pending,
             impl_feedback_staged: impl_staged,
+            archived_count,
             timeline,
-            post_impl_drift_count,
         })
+        .into_string(),
+    ))
+}
+
+async fn session_history(
+    State(state): State<AppState>,
+    Path(session_id): Path<String>,
+) -> Result<Html<String>, AppError> {
+    let sid = SessionId::from(session_id.clone());
+    let session = sessions::fetch(&state.pool, &sid)
+        .await
+        .map_err(AppError::sqlx)?
+        .ok_or_else(|| AppError::not_found(format!("no session {session_id}")))?;
+    let archived = plans::list_archived_for_session(&state.pool, &sid)
+        .await
+        .map_err(AppError::sqlx)?;
+    Ok(Html(ui::session_history(&session, &archived).into_string()))
+}
+
+async fn history_plan_detail(
+    State(state): State<AppState>,
+    Path((session_id, plan_id)): Path<(String, i64)>,
+) -> Result<Html<String>, AppError> {
+    let sid = SessionId::from(session_id.clone());
+    let session = sessions::fetch(&state.pool, &sid)
+        .await
+        .map_err(AppError::sqlx)?
+        .ok_or_else(|| AppError::not_found(format!("no session {session_id}")))?;
+    let plan = plans::fetch(&state.pool, plan_id)
+        .await
+        .map_err(AppError::sqlx)?
+        .ok_or_else(|| AppError::not_found(format!("no plan {plan_id}")))?;
+    if plan.session_id != session_id {
+        return Err(AppError::not_found(format!(
+            "plan {plan_id} not in session {session_id}"
+        )));
+    }
+    let revisions = plan_revisions::list_for_plan(&state.pool, plan.id)
+        .await
+        .map_err(AppError::sqlx)?;
+    let latest_body_html = revisions
+        .last()
+        .map(|r| render_markdown(&r.body))
+        .unwrap_or_default();
+    let impl_revisions = impl_revs::list_for_plan(&state.pool, plan.id)
+        .await
+        .map_err(AppError::sqlx)?;
+    Ok(Html(
+        ui::history_plan_detail(
+            &session,
+            &plan,
+            &revisions,
+            &latest_body_html,
+            &impl_revisions,
+        )
         .into_string(),
     ))
 }
 
 async fn commit_diff(
     State(state): State<AppState>,
-    Path((plan_id, sha)): Path<(String, String)>,
+    Path((session_id, sha)): Path<(String, String)>,
 ) -> Result<Html<String>, AppError> {
-    let plan = plans::fetch(&state.pool, &plan_id)
+    let sid = SessionId::from(session_id.clone());
+    let session = sessions::fetch(&state.pool, &sid)
         .await
         .map_err(AppError::sqlx)?
-        .ok_or_else(|| AppError::not_found(format!("no plan {plan_id}")))?;
-    let rev = impl_revs::fetch_by_sha(&state.pool, &plan_id, &sha)
+        .ok_or_else(|| AppError::not_found(format!("no session {session_id}")))?;
+    // Walk plans for this session to find a matching commit_sha.
+    let plans_in_session = plans::list_for_session(&state.pool, &sid)
         .await
-        .map_err(AppError::sqlx)?
-        .ok_or_else(|| AppError::not_found(format!("commit {sha} not registered for this plan")))?;
-    let repo = std::path::Path::new(&plan.repo_root).to_path_buf();
-    let diff = match crate::daemon::git::diff_text(
-        &repo,
-        rev.parent_sha.as_deref(),
-        &rev.commit_sha,
-    )
-    .await
-    {
+        .map_err(AppError::sqlx)?;
+    let mut found: Option<impl_revs::ImplementationRevision> = None;
+    for p in plans_in_session {
+        if let Some(r) = impl_revs::fetch_by_sha(&state.pool, p.id, &CommitSha::from(sha.clone()))
+            .await
+            .map_err(AppError::sqlx)?
+        {
+            found = Some(r);
+            break;
+        }
+    }
+    let rev = found
+        .ok_or_else(|| AppError::not_found(format!("commit {sha} not registered in session")))?;
+    let repo = std::path::Path::new(&session.repo_root);
+    let diff = match super::git::diff_text(repo, rev.parent_sha.as_deref(), &rev.commit_sha).await {
         Ok(d) => d,
         Err(e) => format!("(failed to compute diff: {e})"),
     };
-
     let raw_feedback: Vec<ev_store::Event> = sqlx::query_as(
-        "SELECT * FROM events WHERE plan_id = ? AND kind = 'feedback_added' \
+        "SELECT * FROM events WHERE session_id = ? AND kind = 'feedback_added' \
          AND target_kind = 'implementation_commit' AND target_id = ? ORDER BY id ASC",
     )
-    .bind(&plan_id)
+    .bind(sid.as_str())
     .bind(&rev.commit_sha)
     .fetch_all(&state.pool)
     .await
     .map_err(AppError::sqlx)?;
-    let feedback = raw_feedback
-        .iter()
-        .map(impl_feedback_for_diff_view)
-        .collect();
-
+    let feedback = raw_feedback.iter().map(impl_fb).collect();
     Ok(Html(
         ui::commit_diff(&ui::CommitDiffView {
-            plan_id: plan.id,
+            session_id: session.id,
             commit: rev,
             diff,
             feedback,
@@ -217,7 +321,7 @@ async fn commit_diff(
     ))
 }
 
-fn build_feedback_lists_for_plan(
+fn build_feedback_for_plan(
     events: &[ev_store::Event],
     revisions: &[plan_revisions::PlanRevision],
 ) -> (Vec<ui::FeedbackItem>, Vec<ui::FeedbackItem>) {
@@ -254,7 +358,7 @@ fn build_feedback_lists_for_plan(
     (pending, staged)
 }
 
-fn build_feedback_lists_for_impl(
+fn build_feedback_for_impl(
     events: &[ev_store::Event],
     current_sha: Option<&str>,
 ) -> (Vec<ui::FeedbackItem>, Vec<ui::FeedbackItem>) {
@@ -268,10 +372,10 @@ fn build_feedback_lists_for_impl(
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_string();
-        let outdated = match (ev.target_id.as_deref(), current_sha) {
-            (Some(target), Some(current)) => target != current,
-            _ => false,
-        };
+        let outdated = matches!(
+            (ev.target_id.as_deref(), current_sha),
+            (Some(t), Some(c)) if t != c
+        );
         let target_label = ev
             .target_id
             .as_deref()
@@ -293,7 +397,7 @@ fn build_feedback_lists_for_impl(
     (pending, staged)
 }
 
-fn impl_feedback_for_diff_view(ev: &ev_store::Event) -> ui::DiffViewFeedback {
+fn impl_fb(ev: &ev_store::Event) -> ui::DiffViewFeedback {
     let payload: serde_json::Value =
         serde_json::from_str(&ev.payload).unwrap_or(serde_json::Value::Null);
     ui::DiffViewFeedback {
@@ -321,41 +425,55 @@ fn render_markdown(body: &str) -> String {
     ammonia::clean(&html_out)
 }
 
-async fn count_pending(
-    state: &AppState,
-    plan_id: &str,
-    target_kind: &str,
-) -> Result<i64, AppError> {
-    let row: (i64,) = sqlx::query_as(
-        "SELECT COUNT(*) FROM events WHERE plan_id = ? AND kind = 'feedback_added' \
-         AND target_kind = ? AND status IN ('pending', 'staged')",
+async fn pending_counts(state: &AppState, sid: &SessionId) -> Result<(i64, i64), AppError> {
+    // Counts are scoped to the active plan_id, mirroring the feedback display
+    // queries. With no active plan there's nothing the curator can stage or
+    // deliver, so the counts are zero.
+    let active: Option<i64> =
+        sqlx::query_scalar("SELECT active_plan_id FROM sessions WHERE id = ?")
+            .bind(sid.as_str())
+            .fetch_one(&state.pool)
+            .await
+            .map_err(AppError::sqlx)?;
+    let Some(pid) = active else { return Ok((0, 0)) };
+    let plan: (i64,) = sqlx::query_as(
+        "SELECT COUNT(*) FROM events WHERE session_id = ? AND plan_id = ? AND kind = 'feedback_added' \
+         AND target_kind = 'plan_revision' AND status IN ('pending', 'staged')",
     )
-    .bind(plan_id)
-    .bind(target_kind)
+    .bind(sid.as_str())
+    .bind(pid)
     .fetch_one(&state.pool)
     .await
     .map_err(AppError::sqlx)?;
-    Ok(row.0)
+    let impl_: (i64,) = sqlx::query_as(
+        "SELECT COUNT(*) FROM events WHERE session_id = ? AND plan_id = ? AND kind = 'feedback_added' \
+         AND target_kind = 'implementation_commit' AND status IN ('pending', 'staged')",
+    )
+    .bind(sid.as_str())
+    .bind(pid)
+    .fetch_one(&state.pool)
+    .await
+    .map_err(AppError::sqlx)?;
+    Ok((plan.0, impl_.0))
 }
 
 async fn healthz() -> impl IntoResponse {
     "ok"
 }
 
-/// Reject mutating requests whose Origin/Host header isn't a localhost loopback.
 async fn origin_guard(req: Request<axum::body::Body>, next: Next) -> Response {
     let method = req.method().clone();
     if matches!(
         method,
         Method::POST | Method::PUT | Method::PATCH | Method::DELETE
-    ) && !is_loopback_request(req.headers())
+    ) && !is_loopback(req.headers())
     {
         return (StatusCode::FORBIDDEN, "rejected: non-loopback Origin/Host").into_response();
     }
     next.run(req).await
 }
 
-fn is_loopback_request(headers: &HeaderMap) -> bool {
+fn is_loopback(headers: &HeaderMap) -> bool {
     if let Some(origin) = headers.get("origin").and_then(|v| v.to_str().ok())
         && !origin_is_loopback(origin)
     {
@@ -394,7 +512,6 @@ impl AppError {
             message: msg.into(),
         }
     }
-
     fn sqlx(err: sqlx::Error) -> Self {
         tracing::error!(error = ?err, "sqlx error");
         Self {

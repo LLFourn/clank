@@ -11,11 +11,12 @@ use crate::tools::{ToolDescriptor, ToolError, dispatch};
 /// Forwarded by the stdio shim for every MCP tool call.
 ///
 /// `cwd` is the shim's launch directory (used to derive `repo_root` for
-/// `register_plan_file` and to scope `list_plans`).
+/// `register_plan_file` and to scope `list_sessions`).
 ///
-/// `label` is `Some(...)` once the shim has cached a binding from a successful
-/// `register_plan_file` / `join_plan`. It is the agent's self-declared identity;
-/// `(plan_id_from_args, label)` uniquely picks an `agents` row.
+/// `label` is `Some(...)` once the shim has cached a binding from a
+/// successful `register_plan_file` (master) or `join_session` (reviewer).
+/// It is the agent's self-declared identity; `(session_id_from_args, label)`
+/// uniquely picks an `agents` row.
 #[derive(Debug, Deserialize)]
 pub struct ToolCallRequest {
     pub cwd: PathBuf,

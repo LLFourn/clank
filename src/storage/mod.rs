@@ -9,6 +9,7 @@ pub mod events;
 pub mod implementation_revisions;
 pub mod plan_revisions;
 pub mod plans;
+pub mod sessions;
 
 pub async fn open_pool(path: &Path) -> anyhow::Result<SqlitePool> {
     if let Some(parent) = path.parent() {

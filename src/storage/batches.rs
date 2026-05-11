@@ -1,9 +1,14 @@
+//! Directive batch storage. Batches are session-scoped; items reference event ids.
+
 use sqlx::SqlitePool;
+
+use crate::lifecycle::SessionId;
 
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub struct DirectiveBatch {
     pub id: i64,
-    pub plan_id: String,
+    pub session_id: String,
+    pub plan_id: Option<i64>,
     pub target_kind: Option<String>,
     pub created_at: i64,
     pub delivered_by: String,
@@ -13,7 +18,8 @@ pub struct DirectiveBatch {
 
 pub async fn create<'e, E>(
     executor: E,
-    plan_id: &str,
+    session_id: &SessionId,
+    plan_id: Option<i64>,
     target_kind: &str,
     delivered_by: &str,
     now: i64,
@@ -22,9 +28,10 @@ where
     E: sqlx::Executor<'e, Database = sqlx::Sqlite>,
 {
     let result = sqlx::query(
-        "INSERT INTO directive_batches (plan_id, target_kind, created_at, delivered_by) \
-         VALUES (?, ?, ?, ?)",
+        "INSERT INTO directive_batches (session_id, plan_id, target_kind, created_at, delivered_by) \
+         VALUES (?, ?, ?, ?, ?)",
     )
+    .bind(session_id.as_str())
     .bind(plan_id)
     .bind(target_kind)
     .bind(now)
@@ -48,13 +55,13 @@ where
 
 pub async fn oldest_unacked(
     pool: &SqlitePool,
-    plan_id: &str,
+    session_id: &SessionId,
 ) -> sqlx::Result<Option<DirectiveBatch>> {
     sqlx::query_as::<_, DirectiveBatch>(
-        "SELECT * FROM directive_batches WHERE plan_id = ? AND acked_at IS NULL \
+        "SELECT * FROM directive_batches WHERE session_id = ? AND acked_at IS NULL \
          ORDER BY id ASC LIMIT 1",
     )
-    .bind(plan_id)
+    .bind(session_id.as_str())
     .fetch_optional(pool)
     .await
 }

@@ -1,68 +1,100 @@
+//! File-watcher that surfaces a "session's plan file has settled" signal.
+//!
+//! The watcher itself is dumb: it tracks `(session_id → plan_file_path)`,
+//! runs `notify-debouncer-full` on each watched file's parent directory,
+//! and emits a `WatcherEvent::PlanFileDirty { session_id }` to the dispatch
+//! channel. The dispatcher reads the file, captures HEAD, and feeds the
+//! observation through `SessionLifecycle::observe`.
+
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::Mutex;
 use std::time::Duration;
 
 use notify::RecursiveMode;
 use notify_debouncer_full::{DebounceEventResult, Debouncer, RecommendedCache, new_debouncer};
-use sqlx::SqlitePool;
 use tokio::sync::mpsc;
 
-use crate::domain::{EventKind, TargetKind};
-use crate::storage::{events as ev_store, plan_revisions};
-
-/// Manages the file-watcher debouncer and the path→plan_id mapping.
-pub struct PlanWatcher {
-    inner: Arc<Mutex<WatcherInner>>,
-}
-
-struct WatcherInner {
-    debouncer: Debouncer<notify::RecommendedWatcher, RecommendedCache>,
-    /// Canonical plan-file path → plan_id.
-    paths: HashMap<PathBuf, String>,
-    /// Canonical parent directory → set of plan paths under it (for cleanup).
-    parents: HashMap<PathBuf, usize>,
-}
+use crate::lifecycle::{PlanFilePath, SessionId};
 
 const DEBOUNCE_TIMEOUT: Duration = Duration::from_millis(1500);
 
+#[derive(Debug)]
+pub enum WatcherEvent {
+    /// The plan file for this session has changed (post-debounce). The
+    /// dispatcher reads the file + captures HEAD and feeds the lifecycle.
+    PlanFileDirty { session_id: SessionId },
+    /// The plan file for this session has vanished on disk.
+    PlanFileMissing {
+        session_id: SessionId,
+        path: PathBuf,
+    },
+}
+
+struct Inner {
+    debouncer: Debouncer<notify::RecommendedWatcher, RecommendedCache>,
+    /// Canonical plan-file path → session_id.
+    path_to_session: HashMap<PathBuf, SessionId>,
+    /// session_id → canonical plan-file path (for switch/unwatch).
+    session_to_path: HashMap<SessionId, PathBuf>,
+    /// Refcount of watched parent directories.
+    parents: HashMap<PathBuf, usize>,
+}
+
+pub struct PlanWatcher {
+    inner: Mutex<Inner>,
+}
+
 impl PlanWatcher {
-    pub fn start(pool: SqlitePool) -> anyhow::Result<Arc<Self>> {
-        let (tx, mut rx) = mpsc::unbounded_channel::<DebounceEventResult>();
+    /// Build the watcher and return it alongside the receiver the dispatcher
+    /// will drain.
+    pub fn start() -> anyhow::Result<(std::sync::Arc<Self>, mpsc::UnboundedReceiver<WatcherEvent>)>
+    {
+        let (event_tx, event_rx) = mpsc::unbounded_channel::<WatcherEvent>();
+        let (debouncer_tx, mut debouncer_rx) = mpsc::unbounded_channel::<DebounceEventResult>();
 
         let debouncer = new_debouncer(DEBOUNCE_TIMEOUT, None, move |res| {
-            let _ = tx.send(res);
+            let _ = debouncer_tx.send(res);
         })?;
 
-        let inner = Arc::new(Mutex::new(WatcherInner {
+        let inner = Mutex::new(Inner {
             debouncer,
-            paths: HashMap::new(),
+            path_to_session: HashMap::new(),
+            session_to_path: HashMap::new(),
             parents: HashMap::new(),
-        }));
+        });
+        let watcher = std::sync::Arc::new(Self { inner });
 
-        let watcher = Arc::new(PlanWatcher { inner });
-        let watcher_for_task = Arc::clone(&watcher);
+        let routed = std::sync::Arc::clone(&watcher);
         tokio::spawn(async move {
-            while let Some(result) = rx.recv().await {
+            while let Some(result) = debouncer_rx.recv().await {
                 match result {
                     Ok(events) => {
-                        // Collect distinct paths that match a registered plan file.
-                        let mut touched: Vec<PathBuf> = Vec::new();
+                        // Collect unique (path, session) pairs touched in this debounce window.
+                        let mut hits: Vec<(SessionId, PathBuf)> = Vec::new();
                         {
-                            let inner = watcher_for_task.inner.lock().unwrap();
+                            let inner = routed.inner.lock().unwrap();
                             for ev in events {
                                 for path in ev.paths.iter() {
-                                    if inner.paths.contains_key(path) && !touched.contains(path) {
-                                        touched.push(path.clone());
+                                    if let Some(sid) = inner.path_to_session.get(path) {
+                                        let pair = (sid.clone(), path.clone());
+                                        if !hits.contains(&pair) {
+                                            hits.push(pair);
+                                        }
                                     }
                                 }
                             }
                         }
-                        for path in touched {
-                            if let Err(err) =
-                                check_and_snapshot(&pool, &watcher_for_task, &path).await
-                            {
-                                tracing::warn!(path = %path.display(), error = ?err, "failed to snapshot plan file");
+                        for (session_id, path) in hits {
+                            // Was-removed check happens at dispatcher time when it reads.
+                            // We always emit PlanFileDirty; the dispatcher decides between
+                            // "got body" (PlanFileObserved) and "file missing"
+                            // (PlanFileMissing event recorded separately).
+                            if path.exists() {
+                                let _ = event_tx.send(WatcherEvent::PlanFileDirty { session_id });
+                            } else {
+                                let _ = event_tx
+                                    .send(WatcherEvent::PlanFileMissing { session_id, path });
                             }
                         }
                     }
@@ -75,158 +107,90 @@ impl PlanWatcher {
             }
         });
 
-        Ok(watcher)
+        Ok((watcher, event_rx))
     }
 
-    /// Watch a plan file. Idempotent.
-    ///
-    /// `plan_path` must be an already-canonicalized absolute path.
-    pub fn watch(&self, plan_path: &Path, plan_id: &str) -> anyhow::Result<()> {
-        let parent = match plan_path.parent() {
-            Some(p) => p.to_path_buf(),
-            None => anyhow::bail!("plan_path has no parent: {}", plan_path.display()),
+    /// Start watching `path` for `session_id`. Idempotent on `(session_id, path)`.
+    /// If `session_id` was previously watching a different path, that old
+    /// path is implicitly `unwatch`ed first.
+    pub fn switch(&self, session_id: &SessionId, path: &PlanFilePath) {
+        let canonical = match dunce::canonicalize(path.as_str()) {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::warn!(path = path.as_str(), error = ?e, "watcher: cannot canonicalize plan-file path");
+                return;
+            }
         };
+        let parent = match canonical.parent() {
+            Some(p) => p.to_path_buf(),
+            None => {
+                tracing::warn!(path = %canonical.display(), "watcher: plan-file path has no parent");
+                return;
+            }
+        };
+
         let mut inner = self.inner.lock().unwrap();
-        if inner.paths.contains_key(plan_path) {
-            return Ok(());
+
+        // If the same session was already watching the same path, no-op.
+        if let Some(prev) = inner.session_to_path.get(session_id) {
+            if prev == &canonical {
+                return;
+            }
+            // Different path → unwatch the previous binding.
+            let prev = prev.clone();
+            unwatch_inner(&mut inner, session_id, &prev);
         }
+
         let prior_count = inner.parents.get(&parent).copied().unwrap_or(0);
-        if prior_count == 0 {
-            inner
-                .debouncer
-                .watch(&parent, RecursiveMode::NonRecursive)?;
+        if prior_count == 0
+            && let Err(e) = inner.debouncer.watch(&parent, RecursiveMode::NonRecursive)
+        {
+            tracing::warn!(parent = %parent.display(), error = ?e, "watcher: failed to watch parent dir");
+            return;
         }
         inner.parents.insert(parent, prior_count + 1);
         inner
-            .paths
-            .insert(plan_path.to_path_buf(), plan_id.to_string());
-        tracing::info!(path = %plan_path.display(), plan_id = plan_id, "watching plan file");
-        Ok(())
+            .path_to_session
+            .insert(canonical.clone(), session_id.clone());
+        inner
+            .session_to_path
+            .insert(session_id.clone(), canonical.clone());
+        tracing::info!(session_id = session_id.as_str(), path = %canonical.display(), "watcher: now watching");
     }
 
-    /// Stop watching a plan file (e.g., on archive). Idempotent.
-    pub fn unwatch(&self, plan_path: &Path) -> anyhow::Result<()> {
-        let parent = match plan_path.parent() {
-            Some(p) => p.to_path_buf(),
-            None => return Ok(()),
-        };
+    /// Stop watching whatever path `session_id` was bound to. Idempotent.
+    pub fn unwatch(&self, session_id: &SessionId) {
         let mut inner = self.inner.lock().unwrap();
-        if inner.paths.remove(plan_path).is_none() {
-            return Ok(());
-        }
-        if let Some(count) = inner.parents.get_mut(&parent) {
-            *count = count.saturating_sub(1);
-            if *count == 0 {
-                inner.parents.remove(&parent);
-                let _ = inner.debouncer.unwatch(&parent);
-            }
-        }
-        Ok(())
+        let path = match inner.session_to_path.get(session_id) {
+            Some(p) => p.clone(),
+            None => return,
+        };
+        unwatch_inner(&mut inner, session_id, &path);
     }
 
-    fn lookup_plan_id(&self, plan_path: &Path) -> Option<String> {
-        self.inner.lock().unwrap().paths.get(plan_path).cloned()
+    /// For startup recovery: the path the watcher currently has bound for a
+    /// given session, if any.
+    #[allow(dead_code)]
+    pub fn current_path(&self, session_id: &SessionId) -> Option<PathBuf> {
+        self.inner
+            .lock()
+            .unwrap()
+            .session_to_path
+            .get(session_id)
+            .cloned()
     }
 }
 
-async fn check_and_snapshot(
-    pool: &SqlitePool,
-    watcher: &PlanWatcher,
-    plan_path: &Path,
-) -> anyhow::Result<()> {
-    let plan_id = match watcher.lookup_plan_id(plan_path) {
-        Some(id) => id,
-        None => return Ok(()),
-    };
-    let now = chrono::Utc::now().timestamp();
-
-    match tokio::fs::read_to_string(plan_path).await {
-        Ok(body) => {
-            let hash = plan_revisions::compute_content_hash(&body);
-            let latest = plan_revisions::latest(pool, &plan_id).await?;
-            if latest.as_ref().map(|r| r.content_hash.as_str()) == Some(hash.as_str()) {
-                return Ok(());
-            }
-
-            // v0 lifecycle gate: plan-file edits create plan_revisions only
-            // while the plan is in `planning` or `plan_approved`. After
-            // `implementation_review`, `done`, or `archived`, edits become
-            // "needs human lifecycle action" warnings instead of revisions.
-            // Gating on state (not just `current_implementation_id`) catches
-            // the case of a plan that went `plan_approved` → `done` without
-            // ever registering an impl commit.
-            let plan = crate::storage::plans::fetch(pool, &plan_id).await?;
-            let accepts = plan
-                .as_ref()
-                .and_then(|p| crate::domain::WorkState::parse(&p.state))
-                .map(|s| s.accepts_plan_revisions())
-                .unwrap_or(false);
-            if !accepts {
-                let payload = serde_json::json!({
-                    "path": plan_path.display().to_string(),
-                    "new_content_hash": hash,
-                    "note": "v0 ignores this edit; archive/rename the session to start a new cycle.",
-                });
-                ev_store::append(
-                    pool,
-                    &ev_store::NewEvent::note(
-                        &plan_id,
-                        EventKind::PlanFileChangedAfterImplementation,
-                        "system:watcher",
-                        &payload,
-                        now,
-                    ),
-                )
-                .await?;
-                tracing::warn!(
-                    plan_id = %plan_id,
-                    path = %plan_path.display(),
-                    "plan file edited after implementation commit registered; emitted warning, no new revision"
-                );
-                return Ok(());
-            }
-
-            let mut tx = pool.begin().await?;
-            let revision_id =
-                plan_revisions::append(&mut *tx, &plan_id, &hash, &body, now, "watcher").await?;
-            let revision_id_str = revision_id.to_string();
-            let payload = serde_json::json!({"detected_by": "watcher"});
-            ev_store::append(
-                &mut *tx,
-                &ev_store::NewEvent::against_target(
-                    &plan_id,
-                    EventKind::PlanRevisionCreated,
-                    "system:watcher",
-                    &payload,
-                    now,
-                    ev_store::EventTarget {
-                        kind: TargetKind::PlanRevision,
-                        id: &revision_id_str,
-                    },
-                ),
-            )
-            .await?;
-            crate::storage::plans::touch_updated_at(&mut *tx, &plan_id, now).await?;
-            tx.commit().await?;
-            tracing::info!(plan_id = %plan_id, revision_id, "appended plan revision via watcher");
+fn unwatch_inner(inner: &mut Inner, session_id: &SessionId, path: &Path) {
+    inner.path_to_session.remove(path);
+    inner.session_to_path.remove(session_id);
+    if let Some(parent) = path.parent()
+        && let Some(count) = inner.parents.get_mut(parent)
+    {
+        *count = count.saturating_sub(1);
+        if *count == 0 {
+            inner.parents.remove(parent);
+            let _ = inner.debouncer.unwatch(parent);
         }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            // File missing — emit event but don't auto-archive.
-            let payload = serde_json::json!({"path": plan_path.display().to_string()});
-            ev_store::append(
-                pool,
-                &ev_store::NewEvent::note(
-                    &plan_id,
-                    EventKind::PlanFileMissing,
-                    "system:watcher",
-                    &payload,
-                    now,
-                ),
-            )
-            .await?;
-            tracing::warn!(plan_id = %plan_id, path = %plan_path.display(), "plan file missing");
-        }
-        Err(e) => return Err(e.into()),
     }
-    Ok(())
 }

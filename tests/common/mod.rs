@@ -1,9 +1,6 @@
-//! Shared test harness: in-process Trinity daemon on an ephemeral port,
-//! a configured `reqwest::Client`, and helpers for the same wire protocol
-//! the stdio shim uses.
+//! Test harness: in-process Trinity daemon on an ephemeral port, with
+//! restart support so recovery tests can validate startup from the same DB.
 
-// Several helpers here are used by some test files but not all; cargo's
-// per-binary dead-code analysis is overzealous against `tests/common/mod.rs`.
 #![allow(dead_code)]
 
 use std::path::{Path, PathBuf};
@@ -13,7 +10,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use tempfile::TempDir;
 use tokio::task::JoinHandle;
-use trinity::daemon::{self, AppState};
+use trinity::daemon::{self, AppState, DaemonShutdown};
 
 pub struct TestApp {
     pub base: String,
@@ -21,50 +18,61 @@ pub struct TestApp {
     pub state: AppState,
     pub tmp: TempDir,
     pub repo: PathBuf,
-    _server: JoinHandle<()>,
+    pub db_path: PathBuf,
+    server: JoinHandle<()>,
+    shutdown: Option<DaemonShutdown>,
 }
 
 impl TestApp {
     pub async fn spawn() -> Self {
-        let tmp = tempfile::tempdir().expect("tempdir");
+        let tmp = tempfile::tempdir().unwrap();
         let db = tmp.path().join("trinity.sqlite");
-        let state = daemon::build_state(&db).await.expect("build_state");
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        init_repo(&repo);
+        Self::spawn_with(tmp, db, repo).await
+    }
+
+    async fn spawn_with(tmp: TempDir, db: PathBuf, repo: PathBuf) -> Self {
+        let (state, shutdown) = daemon::build_state(&db).await.expect("build_state");
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
         let app = daemon::http::router(state.clone());
         let server = tokio::spawn(async move {
             let _ = axum::serve(listener, app).await;
         });
-
         let client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(10))
             .redirect(reqwest::redirect::Policy::none())
             .build()
             .unwrap();
-
-        // Initialize a throwaway git repo inside the tempdir so tools can derive repo_root.
-        let repo = tmp.path().join("repo");
-        std::fs::create_dir_all(&repo).unwrap();
-        run_git(&repo, &["init", "-q"]);
-        run_git(&repo, &["config", "user.email", "test@trinity"]);
-        run_git(&repo, &["config", "user.name", "trinity-test"]);
-        // An initial commit so root-commit edge cases don't bite later.
-        std::fs::write(repo.join(".gitkeep"), b"").unwrap();
-        run_git(&repo, &["add", ".gitkeep"]);
-        run_git(&repo, &["commit", "-q", "-m", "init"]);
-
         TestApp {
             base: format!("http://127.0.0.1:{port}"),
             client,
             state,
             tmp,
             repo,
-            _server: server,
+            db_path: db,
+            server,
+            shutdown: Some(shutdown),
         }
     }
 
-    /// Issue a tool call on the daemon's internal HTTP API the same way the
-    /// stdio shim does.
+    /// Tear down and rebuild the daemon against the same DB / tempdir. Used
+    /// by restart-recovery tests.
+    pub async fn restart(mut self) -> Self {
+        if let Some(s) = self.shutdown.take() {
+            s.stop().await;
+        }
+        self.server.abort();
+        // Give axum a moment to release the port.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let tmp = self.tmp;
+        let db = self.db_path;
+        let repo = self.repo;
+        Self::spawn_with(tmp, db, repo).await
+    }
+
     pub async fn call(
         &self,
         tool: &str,
@@ -112,6 +120,17 @@ impl TestApp {
             .await
             .expect("get send")
     }
+
+    pub async fn post_form(&self, path: &str, body: &str) -> reqwest::Response {
+        self.client
+            .post(format!("{}{}", self.base, path))
+            .header("origin", "http://127.0.0.1")
+            .header("content-type", "application/x-www-form-urlencoded")
+            .body(body.to_string())
+            .send()
+            .await
+            .expect("post send")
+    }
 }
 
 #[allow(clippy::large_enum_variant)]
@@ -127,7 +146,6 @@ impl ToolCallOutcome {
             ToolCallOutcome::Err(s, t) => panic!("expected ok, got {s}: {t}"),
         }
     }
-
     pub fn expect_err(self) -> (reqwest::StatusCode, String) {
         match self {
             ToolCallOutcome::Ok(v) => panic!("expected error, got ok: {v}"),
@@ -136,18 +154,35 @@ impl ToolCallOutcome {
     }
 }
 
-fn run_git(cwd: &Path, args: &[&str]) {
+fn init_repo(repo: &Path) {
+    run_git(repo, &["init", "-q"]);
+    run_git(repo, &["config", "user.email", "test@trinity"]);
+    run_git(repo, &["config", "user.name", "trinity-test"]);
+    std::fs::write(repo.join(".gitkeep"), b"").unwrap();
+    run_git(repo, &["add", ".gitkeep"]);
+    run_git(repo, &["commit", "-q", "-m", "init"]);
+}
+
+pub fn run_git(cwd: &Path, args: &[&str]) -> String {
     let output = Command::new("git")
         .arg("-C")
         .arg(cwd)
         .args(args)
         .output()
-        .expect("spawn git");
+        .expect("git spawn");
     if !output.status.success() {
         panic!(
-            "git {:?} failed: {}",
+            "git {:?}: {}",
             args,
             String::from_utf8_lossy(&output.stderr)
         );
     }
+    String::from_utf8_lossy(&output.stdout).trim().to_string()
+}
+
+pub fn make_commit(repo: &Path, file: &str, contents: &str) -> String {
+    std::fs::write(repo.join(file), contents).unwrap();
+    run_git(repo, &["add", file]);
+    run_git(repo, &["commit", "-q", "-m", &format!("add {file}")]);
+    run_git(repo, &["rev-parse", "HEAD"])
 }

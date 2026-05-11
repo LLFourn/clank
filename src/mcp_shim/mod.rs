@@ -57,13 +57,13 @@ pub async fn run(args: McpArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Identity that the shim has cached after a successful register/join. The
-/// shim refuses to forward tool calls whose `plan_id` argument doesn't match
-/// `plan_id` here — clients can't accidentally cross-pollinate two plans from
-/// one shell.
+/// Identity the shim has cached after a successful register/join. The shim
+/// refuses to forward tool calls whose `session_id` argument doesn't match
+/// `session_id` here — clients can't accidentally cross-pollinate two
+/// sessions from one shell.
 #[derive(Debug, Clone)]
 struct BoundAgent {
-    plan_id: String,
+    session_id: String,
     label: String,
     role: AgentRole,
 }
@@ -91,42 +91,36 @@ impl ShimHandler {
         *self.binding.lock().unwrap() = Some(binding);
     }
 
-    /// Returns Err with a user-facing message if the tool argument's `plan_id`
-    /// (when present) conflicts with the shim's cached binding. Identification
-    /// of the bound plan_id is the shim's job; the daemon does its own
-    /// (plan_id, label) check independently.
-    fn check_plan_consistency(&self, tool: &str, arguments: &Value) -> Result<(), String> {
-        // Tools that may legitimately be called before binding or that
-        // operate without a plan_id arg: list_plans, echo_cwd. Bind-creating
-        // tools (register_plan_file, join_plan) take plan_id_or_path, not
-        // plan_id, so they're allowed to specify a different plan than any
-        // pre-existing (stale) binding — but we still reject if a binding
-        // already exists, to keep the model 1 shell = 1 plan.
-        let arg_plan_id = arguments.get("plan_id").and_then(|v| v.as_str());
+    /// Returns Err with a user-facing message if the tool argument's
+    /// `session_id` (when present) conflicts with the shim's cached binding.
+    /// The daemon also does its own `(session_id, label)` check; this is a
+    /// client-side guard that prevents accidental cross-session calls.
+    fn check_session_consistency(&self, tool: &str, arguments: &Value) -> Result<(), String> {
+        // Tools that may legitimately be called before binding or that operate
+        // without a session_id: list_sessions, echo_cwd. Bind-creating tools
+        // (register_plan_file, join_session) require no pre-existing binding —
+        // we keep the model 1 shell = 1 session.
+        let arg_session_id = arguments.get("session_id").and_then(|v| v.as_str());
         let bound = self.current_binding();
         match (tool, &bound) {
-            ("register_plan_file" | "join_plan", Some(b)) => Err(format!(
-                "this shell is already bound to plan {} as {} `{}`; one shell binds to one (plan, role). \
-                     Open a new terminal to act on a different plan.",
-                b.plan_id,
+            ("register_plan_file" | "join_session", Some(b)) => Err(format!(
+                "this shell is already bound to session `{}` as {} `{}`; one shell binds to one \
+                 (session, role). Open a new terminal to act on a different session.",
+                b.session_id,
                 b.role.as_str(),
                 b.label,
             )),
-            ("list_plans" | "echo_cwd", _) => Ok(()),
-            (_, None) => {
-                // Most tools require a binding. Let the daemon return the
-                // canonical "register/join first" error; the shim won't try
-                // to second-guess it here.
-                Ok(())
-            }
+            ("list_sessions" | "echo_cwd", _) => Ok(()),
+            (_, None) => Ok(()),
             (_, Some(b)) => {
-                if let Some(arg_id) = arg_plan_id
-                    && arg_id != b.plan_id
+                if let Some(arg_id) = arg_session_id
+                    && arg_id != b.session_id
                 {
                     return Err(format!(
-                        "tool `{tool}` was called with plan_id `{arg_id}` but this shell is bound \
-                         to plan `{}`; refusing to forward. Use the bound plan or open a new terminal.",
-                        b.plan_id
+                        "tool `{tool}` was called with session_id `{arg_id}` but this shell is \
+                         bound to `{}`; refusing to forward. Use the bound session or open a new \
+                         terminal.",
+                        b.session_id
                     ));
                 }
                 Ok(())
@@ -202,10 +196,11 @@ impl ServerHandler for ShimHandler {
             },
             instructions: Some(
                 "Trinity coordinates multi-agent peer review around watched plan files \
-                 and registered git commits. Start by calling `list_plans` (reviewer) \
-                 or `register_plan_file` (master). Once you have called register/join \
-                 you are bound to a (plan, label, role) for the lifetime of this MCP \
-                 connection. To act on a different plan, open a new terminal."
+                 and registered git commits. Start by calling `list_sessions` (reviewer) \
+                 or `register_plan_file` (master). After register_plan_file or \
+                 join_session, this shim is bound to a (session_id, label, role) for the \
+                 lifetime of the MCP connection — calls with a different session_id are \
+                 refused. To act on a different session, open a new terminal."
                     .into(),
             ),
         }
@@ -252,26 +247,27 @@ impl ServerHandler for ShimHandler {
         let tool = request.name.to_string();
         let arguments = request.arguments.map(Value::Object).unwrap_or(Value::Null);
 
-        if let Err(msg) = self.check_plan_consistency(&tool, &arguments) {
+        if let Err(msg) = self.check_session_consistency(&tool, &arguments) {
             return Ok(CallToolResult::error(vec![Content::text(msg)]));
         }
 
         match self.forward(&tool, arguments.clone()).await {
             Ok(result) => {
-                // Bind on successful register/join.
+                // Bind on successful register_plan_file / join_session.
                 let role_for_tool = match tool.as_str() {
                     "register_plan_file" => Some(AgentRole::Master),
-                    "join_plan" => Some(AgentRole::Reviewer),
+                    "join_session" => Some(AgentRole::Reviewer),
                     _ => None,
                 };
                 if let Some(role) = role_for_tool
-                    && let (Some(label), Some(plan_id)) = (
+                    && let (Some(label), Some(session_id)) = (
                         arguments.get("label").and_then(|v| v.as_str()),
-                        result.get("plan_id").and_then(|v| v.as_str()),
+                        arguments.get("session_id").and_then(|v| v.as_str()),
                     )
+                    && result.get("session_id").is_some()
                 {
                     self.set_binding(BoundAgent {
-                        plan_id: plan_id.to_string(),
+                        session_id: session_id.to_string(),
                         label: label.to_string(),
                         role,
                     });

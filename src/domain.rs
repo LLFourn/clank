@@ -1,64 +1,6 @@
-//! Closed-set domain enums. The DB columns store strings (with CHECK constraints
-//! in the migration), and these enums provide a typed interface at the
-//! Rust boundary so call sites and pattern matches don't drift into typo bugs.
-
-use std::fmt;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum WorkState {
-    Planning,
-    PlanApproved,
-    ImplementationReview,
-    Done,
-    Archived,
-}
-
-impl WorkState {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            WorkState::Planning => "planning",
-            WorkState::PlanApproved => "plan_approved",
-            WorkState::ImplementationReview => "implementation_review",
-            WorkState::Done => "done",
-            WorkState::Archived => "archived",
-        }
-    }
-
-    pub fn parse(s: &str) -> Option<Self> {
-        Some(match s {
-            "planning" => WorkState::Planning,
-            "plan_approved" => WorkState::PlanApproved,
-            "implementation_review" => WorkState::ImplementationReview,
-            "done" => WorkState::Done,
-            "archived" => WorkState::Archived,
-            _ => return None,
-        })
-    }
-
-    pub fn is_terminal(self) -> bool {
-        matches!(self, WorkState::Done | WorkState::Archived)
-    }
-
-    /// True iff a plan-file edit should be snapshotted as a new
-    /// `plan_revision`. Once we leave the planning phase or hit a terminal
-    /// state, plan-file edits become "needs human lifecycle action" warnings.
-    pub fn accepts_plan_revisions(self) -> bool {
-        matches!(self, WorkState::Planning | WorkState::PlanApproved)
-    }
-
-    pub fn active_artifact(self) -> TargetKind {
-        match self {
-            WorkState::ImplementationReview | WorkState::Done => TargetKind::ImplementationCommit,
-            _ => TargetKind::PlanRevision,
-        }
-    }
-}
-
-impl fmt::Display for WorkState {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.as_str())
-    }
-}
+//! Closed-set domain enums for the event/feedback layer. Lifecycle state
+//! itself lives in `crate::lifecycle::ActivePlan`; this module only carries
+//! the auxiliary enums used by the events table and the curator surface.
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TargetKind {
@@ -127,24 +69,22 @@ impl AgentRole {
     }
 }
 
-/// Closed set of event kinds Trinity emits in v0. The DB stores the string;
-/// this enum keeps every emit/dispatch site honest.
+/// Event kinds emitted by the apply layer and the curator. The DB stores the
+/// string; this enum keeps call sites honest.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EventKind {
+    // Lifecycle (emitted by apply.rs)
     PlanRevisionCreated,
     ImplRevisionCreated,
-    AgentJoined,
-    FeedbackAdded,
-    HumanComment,
-    Archived,
-    Renamed,
-    MasterEvicted,
-    PlanFileMissing,
-    PlanFileChangedAfterImplementation,
-    PlanApproved,
-    MarkedDone,
     StateTransition,
     DirtyWorktreeWarning,
+    FeedbackAdded,
+    // Session/agent metadata (emitted by curator + master tools)
+    AgentJoined,
+    MasterEvicted,
+    Renamed,
+    PlanFileMissing,
+    HumanComment,
     DirectiveAcked,
 }
 
@@ -153,20 +93,14 @@ impl EventKind {
         match self {
             EventKind::PlanRevisionCreated => "plan_revision_created",
             EventKind::ImplRevisionCreated => "impl_revision_created",
-            EventKind::AgentJoined => "agent_joined",
-            EventKind::FeedbackAdded => "feedback_added",
-            EventKind::HumanComment => "human_comment",
-            EventKind::Archived => "archived",
-            EventKind::Renamed => "renamed",
-            EventKind::MasterEvicted => "master_evicted",
-            EventKind::PlanFileMissing => "plan_file_missing",
-            EventKind::PlanFileChangedAfterImplementation => {
-                "plan_file_changed_after_implementation"
-            }
-            EventKind::PlanApproved => "plan_approved",
-            EventKind::MarkedDone => "marked_done",
             EventKind::StateTransition => "state_transition",
             EventKind::DirtyWorktreeWarning => "dirty_worktree_warning",
+            EventKind::FeedbackAdded => "feedback_added",
+            EventKind::AgentJoined => "agent_joined",
+            EventKind::MasterEvicted => "master_evicted",
+            EventKind::Renamed => "renamed",
+            EventKind::PlanFileMissing => "plan_file_missing",
+            EventKind::HumanComment => "human_comment",
             EventKind::DirectiveAcked => "directive_acked",
         }
     }
