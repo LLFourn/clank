@@ -1,5 +1,6 @@
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use clap::Args;
 use rmcp::ServerHandler;
@@ -26,26 +27,44 @@ pub struct McpArgs {
 
 pub async fn run(args: McpArgs) -> anyhow::Result<()> {
     let cwd = std::env::current_dir()?;
-    tracing::info!(daemon = %args.daemon, cwd = %cwd.display(), "trinity mcp shim starting");
+    let daemon_url = args.daemon.trim_end_matches('/').to_string();
+    tracing::info!(daemon = %daemon_url, cwd = %cwd.display(), "trinity mcp shim starting");
 
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(120))
         .build()?;
 
-    // Snapshot the tool catalog from the daemon at startup.
-    let descriptors: Vec<ToolDescriptor> = client
-        .get(format!(
-            "{}/internal/tools",
-            args.daemon.trim_end_matches('/')
-        ))
-        .send()
-        .await?
-        .error_for_status()?
-        .json()
-        .await?;
+    // Tool catalog is statically known (shim and daemon ship from the same
+    // crate), so the shim can answer `tools/list` even if the daemon
+    // happens to be down. The daemon only needs to be up by the time a
+    // tool call actually arrives.
+    let descriptors: Vec<ToolDescriptor> = crate::tools::catalog();
+
+    // If the daemon isn't reachable and the URL points at the local
+    // machine, try to spawn `trinity serve` ourselves (fully detached).
+    // We don't use a pidfile: the daemon's bound TCP port is a natural
+    // atomic lock — only one process can hold 7777 at a time, and it's
+    // freed automatically on exit. Stale pidfiles are no problem because
+    // there are no pidfiles.
+    if !probe_daemon(&client, &daemon_url).await {
+        if is_loopback_url(&daemon_url) {
+            if let Err(e) = spawn_daemon_detached(&daemon_url).await {
+                tracing::warn!(error = %e, "could not auto-spawn daemon; tool calls will fail until the user runs `trinity serve`");
+            } else if let Err(e) =
+                wait_for_daemon(&client, &daemon_url, Duration::from_secs(10)).await
+            {
+                tracing::warn!(error = %e, "spawned daemon but it did not become healthy in time");
+            }
+        } else {
+            tracing::warn!(
+                daemon = %daemon_url,
+                "daemon unreachable and URL is not loopback; not auto-spawning"
+            );
+        }
+    }
 
     let handler = ShimHandler {
-        daemon: args.daemon.trim_end_matches('/').to_string(),
+        daemon: daemon_url,
         cwd,
         client,
         descriptors,
@@ -55,6 +74,97 @@ pub async fn run(args: McpArgs) -> anyhow::Result<()> {
     let service = handler.serve(stdio()).await?;
     service.waiting().await?;
     Ok(())
+}
+
+async fn probe_daemon(client: &reqwest::Client, daemon: &str) -> bool {
+    let url = format!("{}/healthz", daemon);
+    match tokio::time::timeout(Duration::from_millis(500), client.get(url).send()).await {
+        Ok(Ok(resp)) => resp.status().is_success(),
+        _ => false,
+    }
+}
+
+async fn wait_for_daemon(
+    client: &reqwest::Client,
+    daemon: &str,
+    max: Duration,
+) -> anyhow::Result<()> {
+    let deadline = std::time::Instant::now() + max;
+    while std::time::Instant::now() < deadline {
+        if probe_daemon(client, daemon).await {
+            return Ok(());
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    anyhow::bail!("daemon did not respond within {:?}", max)
+}
+
+fn is_loopback_url(daemon: &str) -> bool {
+    let lower = daemon.to_ascii_lowercase();
+    let stripped = lower
+        .strip_prefix("http://")
+        .or_else(|| lower.strip_prefix("https://"))
+        .unwrap_or(&lower);
+    let host = stripped.split(['/', ':']).next().unwrap_or("");
+    matches!(host, "localhost" | "127.0.0.1" | "::1")
+}
+
+/// Launch `trinity serve` so it survives the shim's exit. On Unix we put
+/// the daemon in its own session via `setsid(2)` so a SIGHUP to the
+/// shim's process group (e.g. terminal close) does not propagate.
+async fn spawn_daemon_detached(daemon: &str) -> anyhow::Result<()> {
+    use std::fs::OpenOptions;
+    use std::os::unix::process::CommandExt;
+    use std::process::{Command, Stdio};
+
+    let exe = std::env::current_exe()?;
+    let log_dir = trinity_home()?;
+    std::fs::create_dir_all(&log_dir)?;
+    let log_path = log_dir.join("daemon.log");
+    let log_out = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)?;
+    let log_err = log_out.try_clone()?;
+
+    tracing::info!(exe = %exe.display(), log = %log_path.display(), "auto-spawning trinity serve");
+
+    let mut cmd = Command::new(&exe);
+    cmd.arg("serve")
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(log_out))
+        .stderr(Stdio::from(log_err));
+
+    // Detach from the shim's session/process group. Stable Rust has no
+    // safe API for this, so we call setsid(2) via pre_exec.
+    unsafe {
+        cmd.pre_exec(|| {
+            // setsid is signal-safe and async-signal-safe; legal in pre_exec.
+            let rc = libc_setsid();
+            if rc < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+
+    let _child = cmd.spawn()?;
+    // Intentionally drop the Child handle: we never want to wait() on it.
+    let _ = daemon; // (only used for logging context above)
+    Ok(())
+}
+
+// Direct FFI to libc::setsid. Avoids pulling in the `libc` crate for a
+// single call site.
+unsafe extern "C" {
+    #[link_name = "setsid"]
+    fn libc_setsid() -> i32;
+}
+
+fn trinity_home() -> anyhow::Result<PathBuf> {
+    let home = std::env::var_os("HOME")
+        .ok_or_else(|| anyhow::anyhow!("$HOME is not set; cannot locate ~/.trinity"))?;
+    Ok(PathBuf::from(home).join(".trinity"))
 }
 
 /// Identity the shim has cached after a successful register/join. The shim
