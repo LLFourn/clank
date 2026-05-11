@@ -8,9 +8,9 @@
 //! metadata maintained by the caller. The reducer cares only about content
 //! and commit identity.
 //!
-//! See `/Users/llfourn/.claude/plans/i-want-to-create-jolly-hamming.md` for
-//! the full reducer behavior table and the identity-model invariants this
-//! enforces.
+//! Feedback is **not** modelled in the reducer. Feedback never alters
+//! `ActivePlan`; it is a separate structural concern owned by
+//! `SessionService::put_feedback`.
 
 use std::fmt;
 
@@ -83,15 +83,6 @@ pub struct CommitSnapshot {
     pub is_head: bool,
 }
 
-/// What a feedback event is "about". The reducer doesn't validate target
-/// membership; the caller (HTTP/MCP layer) must reject targets that don't
-/// belong to the session's active plan.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum FeedbackTarget {
-    PlanRevision { revision_id: i64 },
-    ImplementationCommit { commit_sha: CommitSha },
-}
-
 /// In-memory cache shape of the live plan in a session. Persisted state
 /// lives in SQL; this struct is rebuilt on daemon startup from
 /// `sessions.active_plan_id` and the latest revision rows.
@@ -142,12 +133,6 @@ pub enum Observation {
     PlanFileObserved { body: String, head: CommitSha },
     /// Master registered a commit (real `git rev-parse` validated snapshot).
     CommitObserved { commit: CommitSnapshot },
-    /// Reviewer posted feedback against an artifact.
-    FeedbackPosted {
-        target: FeedbackTarget,
-        author: AgentLabel,
-        body: String,
-    },
     /// Human (or master) asked for the active plan to be archived.
     ArchiveRequested,
 }
@@ -163,11 +148,6 @@ pub enum Effect {
     },
     RecordImplementation {
         commit: CommitSnapshot,
-    },
-    RecordFeedback {
-        target: FeedbackTarget,
-        author: AgentLabel,
-        body: String,
     },
     ArchiveActivePlan,
 }
@@ -232,7 +212,6 @@ pub fn decide(active: Option<ActivePlan>, obs: Observation) -> Result<Decision, 
         }
         (None, PlanFileObserved { .. }) => Err(LifecycleError::NoActivePlan),
         (None, CommitObserved { .. }) => Err(LifecycleError::NoActivePlan),
-        (None, FeedbackPosted { .. }) => Err(LifecycleError::NoActivePlan),
         (None, ArchiveRequested) => Ok(Decision::noop(None)),
 
         // ----- Planning -----
@@ -283,21 +262,6 @@ pub fn decide(active: Option<ActivePlan>, obs: Observation) -> Result<Decision, 
                 effects: vec![Effect::RecordImplementation { commit }],
             })
         }
-        (
-            Some(planning @ Planning { .. }),
-            FeedbackPosted {
-                target,
-                author,
-                body,
-            },
-        ) => Ok(Decision {
-            new_active: Some(planning),
-            effects: vec![Effect::RecordFeedback {
-                target,
-                author,
-                body,
-            }],
-        }),
         (Some(Planning { .. }), ArchiveRequested) => Ok(Decision {
             new_active: None,
             effects: vec![Effect::ArchiveActivePlan],
@@ -370,21 +334,6 @@ pub fn decide(active: Option<ActivePlan>, obs: Observation) -> Result<Decision, 
                 })
             }
         }
-        (
-            Some(implementing @ Implementing { .. }),
-            FeedbackPosted {
-                target,
-                author,
-                body,
-            },
-        ) => Ok(Decision {
-            new_active: Some(implementing),
-            effects: vec![Effect::RecordFeedback {
-                target,
-                author,
-                body,
-            }],
-        }),
         (Some(Implementing { .. }), ArchiveRequested) => Ok(Decision {
             new_active: None,
             effects: vec![Effect::ArchiveActivePlan],
@@ -467,20 +416,6 @@ mod tests {
     }
 
     #[test]
-    fn none_plus_feedback_errors() {
-        let err = decide(
-            None,
-            Observation::FeedbackPosted {
-                target: FeedbackTarget::PlanRevision { revision_id: 1 },
-                author: AgentLabel::from("rev"),
-                body: "x".into(),
-            },
-        )
-        .unwrap_err();
-        assert_eq!(err, LifecycleError::NoActivePlan);
-    }
-
-    #[test]
     fn none_plus_archive_is_noop() {
         let d = decide(None, Observation::ArchiveRequested).unwrap();
         assert_eq!(d, Decision::noop(None));
@@ -523,7 +458,6 @@ mod tests {
             },
         )
         .unwrap();
-        // Crucial: NOT archive + start. Just a revision under the same plan_id.
         assert_eq!(
             d.effects,
             vec![Effect::RecordPlanRevision {
@@ -533,7 +467,7 @@ mod tests {
         assert_eq!(
             d.new_active,
             Some(ActivePlan::Planning {
-                base_commit: CommitSha::from("head1"), // base preserved
+                base_commit: CommitSha::from("head1"),
                 latest_plan_hash: content_hash("body v2"),
             })
         );
@@ -594,29 +528,6 @@ mod tests {
                 latest_impl_commit: CommitSha::from("c1"),
             })
         );
-    }
-
-    #[test]
-    fn planning_plus_feedback_passes_through() {
-        let p = planning("body", "head1");
-        let d = decide(
-            Some(p.clone()),
-            Observation::FeedbackPosted {
-                target: FeedbackTarget::PlanRevision { revision_id: 1 },
-                author: AgentLabel::from("rev"),
-                body: "looks off".into(),
-            },
-        )
-        .unwrap();
-        assert_eq!(
-            d.effects,
-            vec![Effect::RecordFeedback {
-                target: FeedbackTarget::PlanRevision { revision_id: 1 },
-                author: AgentLabel::from("rev"),
-                body: "looks off".into(),
-            }]
-        );
-        assert_eq!(d.new_active, Some(p));
     }
 
     #[test]
@@ -749,33 +660,6 @@ mod tests {
     }
 
     #[test]
-    fn implementing_plus_feedback_passes_through() {
-        let p = implementing("body", "base", "abc");
-        let d = decide(
-            Some(p.clone()),
-            Observation::FeedbackPosted {
-                target: FeedbackTarget::ImplementationCommit {
-                    commit_sha: CommitSha::from("abc"),
-                },
-                author: AgentLabel::from("rev"),
-                body: "rename the function".into(),
-            },
-        )
-        .unwrap();
-        assert_eq!(
-            d.effects,
-            vec![Effect::RecordFeedback {
-                target: FeedbackTarget::ImplementationCommit {
-                    commit_sha: CommitSha::from("abc")
-                },
-                author: AgentLabel::from("rev"),
-                body: "rename the function".into(),
-            }]
-        );
-        assert_eq!(d.new_active, Some(p));
-    }
-
-    #[test]
     fn implementing_plus_archive_returns_none() {
         let p = implementing("body", "base", "abc");
         let d = decide(Some(p), Observation::ArchiveRequested).unwrap();
@@ -785,14 +669,11 @@ mod tests {
 
     // ---------- Round-trip narrative ----------
 
-    /// End-to-end story: register → plan revision → impl commit → second commit (amend) →
-    /// plan-file change post-impl → archive. Asserts the full effect trail and final state.
     #[test]
     fn round_trip_full_lifecycle() {
         let mut state: Option<ActivePlan> = None;
         let mut effects_log: Vec<Effect> = Vec::new();
 
-        // 1. PlanRegistered → StartPlan, Planning.
         let d = decide(
             state.clone(),
             Observation::PlanRegistered {
@@ -806,7 +687,6 @@ mod tests {
         state = d.new_active;
         assert!(matches!(state, Some(ActivePlan::Planning { .. })));
 
-        // 2. PlanFileObserved with edit → RecordPlanRevision, same lifecycle.
         let d = decide(
             state.clone(),
             Observation::PlanFileObserved {
@@ -819,7 +699,6 @@ mod tests {
         state = d.new_active;
         assert!(matches!(state, Some(ActivePlan::Planning { .. })));
 
-        // 3. CommitObserved → Implementing.
         let c1 = commit("impl1");
         let d = decide(
             state.clone(),
@@ -830,7 +709,6 @@ mod tests {
         state = d.new_active;
         assert!(matches!(state, Some(ActivePlan::Implementing { .. })));
 
-        // 4. CommitObserved with different sha → another RecordImplementation, stays Implementing.
         let c2 = commit("impl2");
         let d = decide(
             state.clone(),
@@ -841,7 +719,6 @@ mod tests {
         state = d.new_active;
         assert!(matches!(state, Some(ActivePlan::Implementing { .. })));
 
-        // 5. CommitObserved with same sha as latest → no-op.
         let d = decide(
             state.clone(),
             Observation::CommitObserved { commit: c2.clone() },
@@ -850,7 +727,6 @@ mod tests {
         assert!(d.effects.is_empty());
         state = d.new_active;
 
-        // 6. PlanFileObserved with different body → archive + start new Planning.
         let d = decide(
             state.clone(),
             Observation::PlanFileObserved {
@@ -863,7 +739,6 @@ mod tests {
         state = d.new_active;
         assert!(matches!(state, Some(ActivePlan::Planning { .. })));
 
-        // 7. ArchiveRequested → archive, None.
         let d = decide(state.clone(), Observation::ArchiveRequested).unwrap();
         effects_log.extend(d.effects.clone());
         state = d.new_active;

@@ -1,6 +1,5 @@
 //! Master-agent MCP tools: register_plan_file, register_implementation_commit,
-//! poll_directive, ack_directive. All take `session_id` as a master-supplied
-//! slug. None of them derive identity from the plan-file path.
+//! get_current_feedback. All take `session_id` as a master-supplied slug.
 
 use std::path::{Path, PathBuf};
 
@@ -11,10 +10,12 @@ use crate::daemon::AppState;
 use crate::daemon::apply::AppliedEffect;
 use crate::daemon::git;
 use crate::daemon::internal_api::ToolCallRequest;
+use crate::daemon::{CurrentFeedbackView, ServiceError};
+use crate::domain::{FeedbackTargetRef, TargetKind};
 use crate::lifecycle::{
     AgentLabel, CommitSha, CommitSnapshot, Observation, PlanFilePath, SessionId,
 };
-use crate::storage::{agents, batches, events as ev_store, sessions};
+use crate::storage::{agents, events as ev_store, sessions};
 
 use super::ToolError;
 
@@ -36,14 +37,10 @@ struct RegisterImplementationCommitArgs {
 }
 
 #[derive(Debug, Deserialize)]
-struct PollDirectiveArgs {
+struct GetCurrentFeedbackArgs {
     session_id: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct AckDirectiveArgs {
-    session_id: String,
-    batch_id: i64,
+    #[serde(default)]
+    target_kind: Option<String>,
 }
 
 pub async fn register_plan_file(
@@ -378,106 +375,73 @@ pub async fn register_implementation_commit(
     }))
 }
 
-pub async fn poll_directive(state: &AppState, req: &ToolCallRequest) -> Result<Value, ToolError> {
-    let args: PollDirectiveArgs = serde_json::from_value(req.arguments.clone())
+pub async fn get_current_feedback(
+    state: &AppState,
+    req: &ToolCallRequest,
+) -> Result<Value, ToolError> {
+    let args: GetCurrentFeedbackArgs = serde_json::from_value(req.arguments.clone())
         .map_err(|e| ToolError::Invalid(format!("invalid args: {e}")))?;
     let session_id = sessions::validate_slug(&args.session_id).map_err(ToolError::Invalid)?;
     let label = require_label(req)?;
     require_master(state, &session_id, &label).await?;
 
-    let Some(batch) = batches::oldest_unacked(&state.pool, &session_id)
-        .await
-        .map_err(|e| ToolError::Internal(anyhow::anyhow!(e)))?
-    else {
-        return Ok(json!({"directive": "none"}));
+    let filter = match args.target_kind.as_deref().map(str::trim) {
+        None | Some("") => None,
+        Some(s) => Some(
+            TargetKind::parse(s)
+                .ok_or_else(|| ToolError::Invalid(format!("unknown target_kind: {s}")))?,
+        ),
     };
 
-    let items: Vec<ev_store::Event> = sqlx::query_as(
-        "SELECT events.* FROM events \
-         JOIN directive_batch_items ON directive_batch_items.event_id = events.id \
-         WHERE directive_batch_items.batch_id = ? ORDER BY events.id ASC",
-    )
-    .bind(batch.id)
-    .fetch_all(&state.pool)
-    .await
-    .map_err(|e| ToolError::Internal(anyhow::anyhow!(e)))?;
+    let view = state
+        .lifecycle
+        .current_feedback(&session_id, filter)
+        .await
+        .map_err(map_service_err)?;
 
-    let items_json: Vec<Value> = items
-        .iter()
-        .map(|ev| {
-            let payload: Value = serde_json::from_str(&ev.payload).unwrap_or(Value::Null);
+    Ok(match view {
+        CurrentFeedbackView::NoActivePlan { session_id } => json!({
+            "session_id": session_id.as_str(),
+            "state": "no_active_plan",
+        }),
+        CurrentFeedbackView::Active {
+            session_id,
+            plan_id,
+            filter,
+            feedback_digest,
+            feedback,
+        } => {
+            let items: Vec<Value> = feedback
+                .into_iter()
+                .map(|r| {
+                    let (target_kind, target_id) = match &r.target {
+                        FeedbackTargetRef::PlanRevision(id) => ("plan_revision", id.to_string()),
+                        FeedbackTargetRef::ImplementationCommit(sha) => {
+                            ("implementation_commit", sha.as_str().to_string())
+                        }
+                    };
+                    json!({
+                        "feedback_id": r.id,
+                        "plan_id": r.plan_id,
+                        "target_kind": target_kind,
+                        "target_id": target_id,
+                        "author_label": r.author_label.as_str(),
+                        "body": r.body,
+                        "created_at": r.created_at,
+                        "updated_at": r.updated_at,
+                    })
+                })
+                .collect();
             json!({
-                "event_id": ev.id,
-                "target_kind": ev.target_kind,
-                "target_id": ev.target_id,
-                "text": payload.get("text").cloned().unwrap_or(Value::Null),
-                "actor": ev.actor,
-                "ts": ev.ts,
+                "session_id": session_id.as_str(),
+                "state": "active",
+                "plan_id": plan_id,
+                "filter": filter.map(|k| k.as_str()),
+                "feedback_digest": feedback_digest,
+                "feedback": items,
             })
-        })
-        .collect();
-
-    Ok(json!({
-        "directive": "feedback",
-        "batch_id": batch.id,
-        "target_kind": batch.target_kind,
-        "items": items_json,
-    }))
-}
-
-pub async fn ack_directive(state: &AppState, req: &ToolCallRequest) -> Result<Value, ToolError> {
-    let args: AckDirectiveArgs = serde_json::from_value(req.arguments.clone())
-        .map_err(|e| ToolError::Invalid(format!("invalid args: {e}")))?;
-    let session_id = sessions::validate_slug(&args.session_id).map_err(ToolError::Invalid)?;
-    let label = require_label(req)?;
-
-    let batch = batches::fetch(&state.pool, args.batch_id)
-        .await
-        .map_err(|e| ToolError::Internal(anyhow::anyhow!(e)))?
-        .ok_or_else(|| ToolError::NotFound(format!("batch {} not found", args.batch_id)))?;
-    if batch.session_id != session_id.as_str() {
-        return Err(ToolError::Forbidden(format!(
-            "batch {} belongs to session `{}`, not `{}`",
-            batch.id, batch.session_id, session_id
-        )));
-    }
-    require_master(state, &session_id, &label).await?;
-
-    if batch.acked_at.is_some() {
-        return Ok(json!({"ok": true, "already_acked": true}));
-    }
-
-    let now = chrono::Utc::now().timestamp();
-    let mut tx = state
-        .pool
-        .begin()
-        .await
-        .map_err(|e| ToolError::Internal(anyhow::anyhow!(e)))?;
-    let actor = format!("master:{label}");
-    batches::ack(&mut *tx, batch.id, &actor, now)
-        .await
-        .map_err(|e| ToolError::Internal(anyhow::anyhow!(e)))?;
-    ev_store::append(
-        &mut *tx,
-        &session_id,
-        None,
-        None,
-        None,
-        crate::domain::EventKind::DirectiveAcked.as_str(),
-        &actor,
-        &json!({"batch_id": batch.id}),
-        None,
-        now,
-    )
-    .await
-    .map_err(|e| ToolError::Internal(anyhow::anyhow!(e)))?;
-    sessions::touch_updated_at(&mut *tx, &session_id, now)
-        .await
-        .map_err(|e| ToolError::Internal(anyhow::anyhow!(e)))?;
-    tx.commit()
-        .await
-        .map_err(|e| ToolError::Internal(anyhow::anyhow!(e)))?;
-    Ok(json!({"ok": true}))
+        }
+    })
 }
 
 // ------------- helpers -------------
@@ -525,10 +489,22 @@ pub(crate) fn map_lifecycle_err(err: crate::daemon::LifecycleServiceError) -> To
         E::Apply(a) => ToolError::Internal(anyhow::anyhow!(a)),
         E::ActivePlan(inc) => ToolError::Internal(anyhow::anyhow!(inc)),
         E::NoSession(s) => ToolError::NotFound(format!("session `{s}` not found")),
-        E::TargetNotInActivePlan { .. } | E::NoActivePlanForFeedback(_) => {
+        E::Sql(e) => ToolError::Internal(anyhow::anyhow!(e)),
+    }
+}
+
+pub(crate) fn map_service_err(err: ServiceError) -> ToolError {
+    match err {
+        ServiceError::NoSession(s) => ToolError::NotFound(format!("session `{s}` not found")),
+        ServiceError::NoActivePlanForFeedback(_)
+        | ServiceError::FeedbackTargetNotInActivePlan { .. } => {
             ToolError::Forbidden(err.to_string())
         }
-        E::Sql(e) => ToolError::Internal(anyhow::anyhow!(e)),
+        ServiceError::EmptyFeedbackBody => ToolError::Invalid(err.to_string()),
+        ServiceError::ActivePlan(inc) => ToolError::Internal(anyhow::anyhow!(inc)),
+        ServiceError::Decode(d) => ToolError::Internal(anyhow::anyhow!(d)),
+        ServiceError::Feedback(e) => ToolError::Internal(anyhow::anyhow!(e)),
+        ServiceError::Sql(e) => ToolError::Internal(anyhow::anyhow!(e)),
     }
 }
 

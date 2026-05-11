@@ -15,11 +15,14 @@ pub(crate) mod curator;
 pub(crate) mod git;
 pub mod http;
 pub(crate) mod internal_api;
-pub(crate) mod session_cache;
+pub(crate) mod service;
 mod ui;
 pub(crate) mod watcher;
 
-pub use session_cache::{LifecycleServiceError, ObservationOutcome, SessionLifecycle};
+pub use service::{
+    CurrentFeedbackView, FeedbackUpsertOutcome, LifecycleServiceError, ObservationOutcome,
+    ServiceError, SessionService,
+};
 pub use watcher::{PlanWatcher, WatcherEvent};
 
 use crate::lifecycle::{CommitSha, Observation, PlanFilePath, SessionId, content_hash};
@@ -41,7 +44,7 @@ pub struct ServeArgs {
 #[derive(Clone)]
 pub struct AppState {
     pub pool: SqlitePool,
-    pub lifecycle: Arc<SessionLifecycle>,
+    pub lifecycle: Arc<SessionService>,
 }
 
 pub async fn serve(args: ServeArgs) -> anyhow::Result<()> {
@@ -79,7 +82,7 @@ pub async fn build_state(db_path: &Path) -> anyhow::Result<(AppState, DaemonShut
     let pool = crate::storage::open_pool(db_path).await?;
 
     let (watcher, watcher_rx) = PlanWatcher::start()?;
-    let lifecycle = Arc::new(SessionLifecycle::new(pool.clone(), Arc::clone(&watcher)));
+    let lifecycle = Arc::new(SessionService::new(pool.clone(), Arc::clone(&watcher)));
 
     // Recovery: rebuild per-session cache from SQL, then run drift detection
     // only for sessions with an active plan.
@@ -97,7 +100,7 @@ pub async fn build_state(db_path: &Path) -> anyhow::Result<(AppState, DaemonShut
 /// - Phase 4: drift detection — only for sessions with an active plan.
 async fn recover(
     pool: &SqlitePool,
-    lifecycle: &Arc<SessionLifecycle>,
+    lifecycle: &Arc<SessionService>,
     watcher: &Arc<PlanWatcher>,
 ) -> anyhow::Result<()> {
     let all = sessions::list_active(pool).await?;
@@ -170,7 +173,7 @@ async fn recover(
 }
 
 fn spawn_watcher_dispatch(
-    lifecycle: Arc<SessionLifecycle>,
+    lifecycle: Arc<SessionService>,
     mut watcher_rx: mpsc::UnboundedReceiver<WatcherEvent>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
@@ -193,7 +196,7 @@ fn spawn_watcher_dispatch(
 }
 
 async fn dispatch_dirty(
-    lifecycle: &Arc<SessionLifecycle>,
+    lifecycle: &Arc<SessionService>,
     session_id: &SessionId,
 ) -> anyhow::Result<()> {
     let session = sessions::fetch(lifecycle.pool(), session_id)
@@ -238,7 +241,7 @@ async fn dispatch_dirty(
 }
 
 async fn record_plan_file_missing(
-    lifecycle: &Arc<SessionLifecycle>,
+    lifecycle: &Arc<SessionService>,
     session_id: &SessionId,
     path: &Path,
 ) -> anyhow::Result<()> {

@@ -1,7 +1,10 @@
+use std::collections::HashMap;
+
 use maud::{DOCTYPE, Markup, PreEscaped, html};
 
 use crate::storage::agents::Agent;
 use crate::storage::events::Event;
+use crate::storage::feedback::FeedbackRecord;
 use crate::storage::implementation_revisions::ImplementationRevision;
 use crate::storage::plan_revisions::PlanRevision;
 use crate::storage::plans::Plan;
@@ -14,8 +17,8 @@ pub struct SessionRow {
     pub master_label: Option<String>,
     pub reviewer_labels: Vec<String>,
     pub active_plan_state: Option<String>,
-    pub pending_plan_count: i64,
-    pub pending_impl_count: i64,
+    pub plan_feedback_count: i64,
+    pub impl_feedback_count: i64,
 }
 
 pub fn home(rows: &[SessionRow]) -> Markup {
@@ -40,8 +43,8 @@ pub fn home(rows: &[SessionRow]) -> Markup {
                             th { "Master" }
                             th { "Reviewers" }
                             th { "Active plan" }
-                            th.num { "Plan" }
-                            th.num { "Impl" }
+                            th.num { "Plan fb" }
+                            th.num { "Impl fb" }
                             th { "Updated" }
                         }
                     }
@@ -55,8 +58,8 @@ pub fn home(rows: &[SessionRow]) -> Markup {
                                 td { (row.master_label.clone().unwrap_or_else(|| "—".into())) }
                                 td { (reviewer_summary(&row.reviewer_labels)) }
                                 td { (active_plan_badge(row.active_plan_state.as_deref())) }
-                                td.num { (row.pending_plan_count) }
-                                td.num { (row.pending_impl_count) }
+                                td.num { (row.plan_feedback_count) }
+                                td.num { (row.impl_feedback_count) }
                                 td.relative { (relative_time(Some(row.session.updated_at))) }
                             }
                         }
@@ -70,11 +73,12 @@ pub fn home(rows: &[SessionRow]) -> Markup {
 // ---------- Session detail (active plan + history summary) ----------
 
 pub struct FeedbackItem {
-    pub event_id: i64,
-    pub actor: String,
-    pub text: String,
-    pub status: String,
+    #[allow(dead_code)]
+    pub feedback_id: i64,
+    pub author_label: String,
+    pub body: String,
     pub created_at: i64,
+    pub updated_at: i64,
     pub target_label: Option<String>,
     pub outdated: bool,
 }
@@ -86,18 +90,15 @@ pub struct SessionDetail {
     pub plan_revisions: Vec<PlanRevision>,
     pub latest_body_html: String,
     pub impl_revisions: Vec<ImplementationRevision>,
-    pub plan_feedback_pending: Vec<FeedbackItem>,
-    pub plan_feedback_staged: Vec<FeedbackItem>,
-    pub impl_feedback_pending: Vec<FeedbackItem>,
-    pub impl_feedback_staged: Vec<FeedbackItem>,
+    pub plan_feedback: Vec<FeedbackItem>,
+    pub impl_feedback: Vec<FeedbackItem>,
     pub archived_count: i64,
     pub timeline: Vec<TimelineItem>,
 }
 
 pub struct DiffViewFeedback {
-    pub actor: String,
-    pub text: String,
-    pub status: String,
+    pub author_label: String,
+    pub body: String,
     pub created_at: i64,
 }
 
@@ -116,7 +117,14 @@ pub struct TimelineItem {
 }
 
 impl TimelineItem {
-    pub fn from_event(ev: &Event, revisions: &[PlanRevision]) -> Self {
+    /// Render a single audit event into a timeline row. Feedback events
+    /// look up the structural row in `feedback_by_id` so the body excerpt
+    /// comes from `feedback.body`, not `events.payload`.
+    pub fn from_event(
+        ev: &Event,
+        revisions: &[PlanRevision],
+        feedback_by_id: &HashMap<i64, FeedbackRecord>,
+    ) -> Self {
         let payload: serde_json::Value =
             serde_json::from_str(&ev.payload).unwrap_or(serde_json::Value::Null);
         let summary = match ev.kind.as_str() {
@@ -132,13 +140,16 @@ impl TimelineItem {
                     None => "plan revision".to_string(),
                 }
             }
-            "feedback_added" => {
-                let text = payload.get("text").and_then(|v| v.as_str()).unwrap_or("");
-                format!("feedback: \"{}\"", preview(text, 80))
+            "feedback_added" => summarise_feedback_event(&payload, feedback_by_id, "feedback"),
+            "feedback_updated" => {
+                summarise_feedback_event(&payload, feedback_by_id, "feedback updated")
             }
             "agent_joined" => format!("{} joined", ev.actor),
             "human_comment" => {
-                let text = payload.get("text").and_then(|v| v.as_str()).unwrap_or("");
+                let text = payload
+                    .get("comment")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
                 format!("comment: \"{}\"", preview(text, 80))
             }
             "state_transition" => {
@@ -164,7 +175,6 @@ impl TimelineItem {
             ),
             "master_evicted" => "master evicted by curator".to_string(),
             "plan_file_missing" => "plan file went missing".to_string(),
-            "directive_acked" => "master acked directive batch".to_string(),
             other => other.to_string(),
         };
         Self {
@@ -173,6 +183,33 @@ impl TimelineItem {
             ts: ev.ts,
             summary,
         }
+    }
+
+    /// Audit-only access to `prior_body` on `feedback_updated` events.
+    /// This is the only production path that reads from `events.payload`
+    /// (besides `state_transition`/`renamed`/`human_comment` housekeeping
+    /// fields, which never carry feedback content).
+    #[allow(dead_code)]
+    pub fn feedback_updated_prior_body(payload: &serde_json::Value) -> Option<String> {
+        payload
+            .get("prior_body")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+    }
+}
+
+fn summarise_feedback_event(
+    payload: &serde_json::Value,
+    feedback_by_id: &HashMap<i64, FeedbackRecord>,
+    prefix: &str,
+) -> String {
+    let id = payload.get("feedback_id").and_then(|v| v.as_i64());
+    match id.and_then(|id| feedback_by_id.get(&id)) {
+        Some(record) => format!("{prefix}: \"{}\"", preview(&record.body, 80)),
+        None => match id {
+            Some(id) => format!("{prefix} #{id} (no longer available)"),
+            None => format!("{prefix} (no id)"),
+        },
     }
 }
 
@@ -191,8 +228,8 @@ fn short(sha: &str) -> String {
 
 pub fn session_detail(d: &SessionDetail) -> Markup {
     let session_id = d.session.id.clone();
-    let total_plan_pending = d.plan_feedback_pending.len() + d.plan_feedback_staged.len();
-    let total_impl_pending = d.impl_feedback_pending.len() + d.impl_feedback_staged.len();
+    let total_plan = d.plan_feedback.len();
+    let total_impl = d.impl_feedback.len();
     layout(
         &format!("Trinity — {}", session_title(&d.session)),
         html! {
@@ -250,25 +287,12 @@ pub fn session_detail(d: &SessionDetail) -> Markup {
                             }
                         }
                     }
-                    h3 { "Feedback for master (" (total_plan_pending) ")" }
-                    @if total_plan_pending == 0 {
-                        p.empty { "No pending plan feedback." }
+                    h3 { "Plan feedback (" (total_plan) ")" }
+                    @if total_plan == 0 {
+                        p.empty { "No plan feedback yet." }
                     }
-                    @if !d.plan_feedback_staged.is_empty() {
-                        div.staged-bar {
-                            form method="post" action={ "/sessions/" (session_id) "/deliver" } {
-                                input type="hidden" name="target_kind" value="plan_revision";
-                                button.primary type="submit" {
-                                    "Deliver " (d.plan_feedback_staged.len()) " staged plan-feedback item(s)"
-                                }
-                            }
-                        }
-                    }
-                    @for item in &d.plan_feedback_staged {
-                        (feedback_card(&session_id, item))
-                    }
-                    @for item in &d.plan_feedback_pending {
-                        (feedback_card(&session_id, item))
+                    @for item in &d.plan_feedback {
+                        (feedback_card(item))
                     }
                     @let _ = plan;
                 } @else {
@@ -326,25 +350,12 @@ pub fn session_detail(d: &SessionDetail) -> Markup {
                 }
 
                 @if d.active_plan.is_some() {
-                    h3 { "Feedback for master (" (total_impl_pending) ")" }
-                    @if total_impl_pending == 0 {
-                        p.empty { "No pending impl feedback." }
+                    h3 { "Implementation feedback (" (total_impl) ")" }
+                    @if total_impl == 0 {
+                        p.empty { "No impl feedback yet." }
                     }
-                    @if !d.impl_feedback_staged.is_empty() {
-                        div.staged-bar {
-                            form method="post" action={ "/sessions/" (session_id) "/deliver" } {
-                                input type="hidden" name="target_kind" value="implementation_commit";
-                                button.primary type="submit" {
-                                    "Deliver " (d.impl_feedback_staged.len()) " staged impl-feedback item(s)"
-                                }
-                            }
-                        }
-                    }
-                    @for item in &d.impl_feedback_staged {
-                        (feedback_card(&session_id, item))
-                    }
-                    @for item in &d.impl_feedback_pending {
-                        (feedback_card(&session_id, item))
+                    @for item in &d.impl_feedback {
+                        (feedback_card(item))
                     }
                 }
             }
@@ -426,6 +437,7 @@ pub fn history_plan_detail(
     revisions: &[PlanRevision],
     latest_body_html: &str,
     impl_revisions: &[ImplementationRevision],
+    feedback: &[FeedbackItem],
 ) -> Markup {
     layout(
         &format!("Trinity — archived plan #{}", plan.id),
@@ -443,6 +455,7 @@ pub fn history_plan_detail(
                     dt { "Archived" }      dd.relative { (relative_time(plan.archived_at)) }
                     dt { "Revisions" }     dd { (revisions.len()) }
                     dt { "Impl commits" }  dd { (impl_revisions.len()) }
+                    dt { "Feedback rows" } dd { (feedback.len()) }
                 }
             }
             section.plan-review {
@@ -461,6 +474,14 @@ pub fn history_plan_detail(
                                 " · " (rev.commit_message.lines().next().unwrap_or(""))
                             }
                         }
+                    }
+                }
+            }
+            @if !feedback.is_empty() {
+                section.plan-review {
+                    h2 { "Feedback (historical)" }
+                    @for item in feedback {
+                        (feedback_card(item))
                     }
                 }
             }
@@ -499,11 +520,10 @@ pub fn commit_diff(view: &CommitDiffView) -> Markup {
                     @for fb in &view.feedback {
                         div.feedback {
                             header.feedback-head {
-                                span.actor { (fb.actor) }
+                                span.actor { (fb.author_label) }
                                 " · " span.relative { (relative_time(Some(fb.created_at))) }
-                                " · " span.status { (fb.status) }
                             }
-                            div.feedback-body { pre { (fb.text) } }
+                            div.feedback-body { pre { (fb.body) } }
                         }
                     }
                 }
@@ -514,48 +534,27 @@ pub fn commit_diff(view: &CommitDiffView) -> Markup {
 
 // ---------- helpers ----------
 
-fn feedback_card(session_id: &str, item: &FeedbackItem) -> Markup {
-    let is_staged = item.status == "staged";
+fn feedback_card(item: &FeedbackItem) -> Markup {
     let class = if item.outdated {
         "feedback outdated"
-    } else if is_staged {
-        "feedback staged"
     } else {
-        "feedback pending"
+        "feedback"
     };
+    let updated = item.updated_at != item.created_at;
     html! {
         div.feedback class=(class) {
             header.feedback-head {
-                span.actor { (item.actor) }
+                span.actor { (item.author_label) }
                 " · " span.target { (item.target_label.clone().unwrap_or_else(|| "—".into())) }
                 " · " span.relative { (relative_time(Some(item.created_at))) }
-                " · " span.status { (item.status) }
+                @if updated {
+                    " · " span.muted { "updated " (relative_time(Some(item.updated_at))) }
+                }
                 @if item.outdated {
                     " · " span.outdated-badge { "outdated" }
                 }
             }
-            div.feedback-body { pre { (item.text) } }
-            div.feedback-actions {
-                @if is_staged {
-                    form method="post" action={ "/sessions/" (session_id) "/feedback/" (item.event_id) "/unstage" } {
-                        button type="submit" { "Unstage" }
-                    }
-                } @else {
-                    form method="post" action={ "/sessions/" (session_id) "/feedback/" (item.event_id) "/stage" } {
-                        button.primary type="submit" { "Stage" }
-                    }
-                }
-                details.edit-feedback {
-                    summary { "Edit" }
-                    form method="post" action={ "/sessions/" (session_id) "/feedback/" (item.event_id) "/edit" } {
-                        textarea name="text" rows="4" required { (item.text) }
-                        button type="submit" { "Save" }
-                    }
-                }
-                form method="post" action={ "/sessions/" (session_id) "/feedback/" (item.event_id) "/delete" } onsubmit="return confirm('Delete this feedback?')" {
-                    button.danger type="submit" { "Delete" }
-                }
-            }
+            div.feedback-body { pre { (item.body) } }
         }
     }
 }
@@ -699,22 +698,15 @@ article.markdown pre code { background: none; padding: 0; }
 details.revision-history, details.commit-history { margin-top: 16px; }
 details.revision-history summary, details.commit-history summary { cursor: pointer; color: var(--muted); font-size: 0.9rem; }
 details.revision-history ol, details.commit-history ol { margin: 8px 0; padding-left: 20px; font-size: 0.88rem; color: var(--muted); }
-div.staged-bar { background: #fff8e0; border: 1px solid #e6cf80; border-radius: 6px; padding: 10px 14px; margin-bottom: 14px; }
 div.feedback { background: var(--bg-alt); border: 1px solid var(--line); border-radius: 6px;
   padding: 12px 14px; margin-bottom: 10px; }
-div.feedback.staged { border-color: #c0a040; background: #fffbe8; }
+div.feedback.outdated { border-color: #f3e1c0; background: #fdf6e7; }
 header.feedback-head { font-size: 0.85rem; color: var(--muted); margin-bottom: 6px; }
 header.feedback-head .actor { font-weight: 600; color: var(--fg); }
-header.feedback-head .status { text-transform: uppercase; letter-spacing: 0.05em; font-weight: 600; }
 .outdated-badge { background: #f3e1c0; color: #855900; padding: 1px 6px; border-radius: 4px; font-size: 0.78rem; }
 .warning { color: #855900; }
 div.feedback-body pre { white-space: pre-wrap; word-wrap: break-word; background: none; padding: 0; margin: 0;
   font-family: inherit; font-size: 0.95rem; }
-div.feedback-actions { margin-top: 10px; display: flex; gap: 8px; align-items: center; }
-div.feedback-actions form { display: inline; }
-details.edit-feedback summary { cursor: pointer; font-size: 0.85rem; color: var(--muted); padding: 4px 8px; }
-details.edit-feedback textarea { width: 100%; padding: 8px; border: 1px solid var(--line); border-radius: 4px;
-  font-family: inherit; font-size: 0.9rem; box-sizing: border-box; }
 section.comment-box { margin-top: 24px; }
 section.comment-box form { display: flex; flex-direction: column; gap: 6px; max-width: 600px; }
 section.comment-box textarea, section.comment-box input { padding: 8px; border: 1px solid var(--line);

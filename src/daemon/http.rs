@@ -1,5 +1,7 @@
 //! HTTP routes (session-centric).
 
+use std::collections::HashMap;
+
 use axum::Router;
 use axum::extract::{Path, State};
 use axum::http::{HeaderMap, Method, Request, StatusCode};
@@ -12,10 +14,11 @@ use super::AppState;
 use super::curator;
 use super::internal_api;
 use super::ui;
+use crate::domain::{FeedbackTargetRef, TargetKind};
 use crate::lifecycle::{CommitSha, SessionId};
 use crate::storage::{
-    agents, events as ev_store, implementation_revisions as impl_revs, plan_revisions, plans,
-    sessions,
+    agents, events as ev_store, feedback as feedback_store, feedback::FeedbackRecord,
+    implementation_revisions as impl_revs, plan_revisions, plans, sessions,
 };
 
 pub fn router(state: AppState) -> Router {
@@ -29,23 +32,6 @@ pub fn router(state: AppState) -> Router {
             get(history_plan_detail),
         )
         .route("/sessions/{session_id}/commits/{sha}", get(commit_diff))
-        .route(
-            "/sessions/{session_id}/feedback/{event_id}/stage",
-            post(curator::stage_feedback),
-        )
-        .route(
-            "/sessions/{session_id}/feedback/{event_id}/unstage",
-            post(curator::unstage_feedback),
-        )
-        .route(
-            "/sessions/{session_id}/feedback/{event_id}/edit",
-            post(curator::edit_feedback),
-        )
-        .route(
-            "/sessions/{session_id}/feedback/{event_id}/delete",
-            post(curator::delete_feedback),
-        )
-        .route("/sessions/{session_id}/deliver", post(curator::deliver))
         .route("/sessions/{session_id}/comment", post(curator::comment))
         .route("/sessions/{session_id}/archive", post(curator::archive))
         .route("/sessions/{session_id}/rename", post(curator::rename))
@@ -91,14 +77,14 @@ async fn home(State(state): State<AppState>) -> Result<Html<String>, AppError> {
         } else {
             None
         };
-        let (pending_plan, pending_impl) = pending_counts(&state, &sid).await?;
+        let (plan_count, impl_count) = active_feedback_counts(&state, &sid).await?;
         out.push(ui::SessionRow {
             session: s,
             master_label,
             reviewer_labels,
             active_plan_state,
-            pending_plan_count: pending_plan,
-            pending_impl_count: pending_impl,
+            plan_feedback_count: plan_count,
+            impl_feedback_count: impl_count,
         });
     }
     Ok(Html(ui::home(&out).into_string()))
@@ -142,43 +128,15 @@ async fn session_detail(
         Vec::new()
     };
 
-    // Feedback queries are scoped to the *active* plan_id, not just the
-    // session. Without the plan_id filter, leftover pending/staged feedback
-    // from an archived earlier cycle would be visible against a brand-new
-    // active plan. (The apply layer also withdraws those events on archive,
-    // but the filter is the load-bearing defense.)
-    let active_plan_id_for_query: Option<i64> = active_plan.as_ref().map(|p| p.id);
-    let raw_plan_feedback: Vec<ev_store::Event> = if let Some(pid) = active_plan_id_for_query {
-        sqlx::query_as(
-            "SELECT * FROM events WHERE session_id = ? AND plan_id = ? AND kind = 'feedback_added' \
-             AND target_kind = 'plan_revision' AND status IN ('pending', 'staged') ORDER BY id ASC",
-        )
-        .bind(sid.as_str())
-        .bind(pid)
-        .fetch_all(&state.pool)
+    let active_feedback = feedback_store::list_for_active_plan(&state.pool, &sid)
         .await
-        .map_err(AppError::sqlx)?
-    } else {
-        Vec::new()
-    };
-    let (plan_pending, plan_staged) = build_feedback_for_plan(&raw_plan_feedback, &plan_revisions);
-
-    let raw_impl_feedback: Vec<ev_store::Event> = if let Some(pid) = active_plan_id_for_query {
-        sqlx::query_as(
-            "SELECT * FROM events WHERE session_id = ? AND plan_id = ? AND kind = 'feedback_added' \
-             AND target_kind = 'implementation_commit' AND status IN ('pending', 'staged') ORDER BY id ASC",
-        )
-        .bind(sid.as_str())
-        .bind(pid)
-        .fetch_all(&state.pool)
-        .await
-        .map_err(AppError::sqlx)?
-    } else {
-        Vec::new()
-    };
+        .map_err(AppError::feedback)?;
     let current_commit_sha = impl_revisions.last().map(|r| r.commit_sha.clone());
-    let (impl_pending, impl_staged) =
-        build_feedback_for_impl(&raw_impl_feedback, current_commit_sha.as_deref());
+    let (plan_feedback, impl_feedback) = build_feedback_items(
+        &active_feedback,
+        &plan_revisions,
+        current_commit_sha.as_deref(),
+    );
 
     let archived_count: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM plans WHERE session_id = ? AND state = 'archived'",
@@ -188,12 +146,24 @@ async fn session_detail(
     .await
     .map_err(AppError::sqlx)?;
 
+    // Build the lookup map for timeline rendering. Includes the active
+    // plan's rows (always present) plus any historical feedback rows
+    // referenced by audit events from older plans in the same session.
+    // We just list all of session's feedback once and key by id.
+    let all_session_feedback = feedback_store::list_for_session(&state.pool, &sid)
+        .await
+        .map_err(AppError::feedback)?;
+    let feedback_by_id: HashMap<i64, FeedbackRecord> = all_session_feedback
+        .into_iter()
+        .map(|r| (r.id, r))
+        .collect();
+
     let timeline_events = ev_store::for_session(&state.pool, &sid)
         .await
         .map_err(AppError::sqlx)?;
     let timeline = timeline_events
         .iter()
-        .map(|ev| ui::TimelineItem::from_event(ev, &plan_revisions))
+        .map(|ev| ui::TimelineItem::from_event(ev, &plan_revisions, &feedback_by_id))
         .collect();
 
     Ok(Html(
@@ -204,10 +174,8 @@ async fn session_detail(
             plan_revisions,
             latest_body_html,
             impl_revisions,
-            plan_feedback_pending: plan_pending,
-            plan_feedback_staged: plan_staged,
-            impl_feedback_pending: impl_pending,
-            impl_feedback_staged: impl_staged,
+            plan_feedback,
+            impl_feedback,
             archived_count,
             timeline,
         })
@@ -258,6 +226,10 @@ async fn history_plan_detail(
     let impl_revisions = impl_revs::list_for_plan(&state.pool, plan.id)
         .await
         .map_err(AppError::sqlx)?;
+    let feedback = feedback_store::list_for_plan(&state.pool, plan.id, None)
+        .await
+        .map_err(AppError::feedback)?;
+    let history_feedback = build_history_feedback(&feedback, &revisions);
     Ok(Html(
         ui::history_plan_detail(
             &session,
@@ -265,9 +237,43 @@ async fn history_plan_detail(
             &revisions,
             &latest_body_html,
             &impl_revisions,
+            &history_feedback,
         )
         .into_string(),
     ))
+}
+
+/// Map active-plan feedback into the read-only display shape used by the
+/// archived-plan history page. `outdated` does not apply here (everything
+/// archived is "historical"), so it's always false.
+fn build_history_feedback(
+    feedback: &[FeedbackRecord],
+    revisions: &[plan_revisions::PlanRevision],
+) -> Vec<ui::FeedbackItem> {
+    feedback
+        .iter()
+        .map(|f| {
+            let target_label = match &f.target {
+                FeedbackTargetRef::PlanRevision(id) => revisions
+                    .iter()
+                    .find(|r| r.id == *id)
+                    .map(|r| format!("rev #{}", r.revision_number)),
+                FeedbackTargetRef::ImplementationCommit(sha) => Some(format!(
+                    "commit {}",
+                    sha.as_str().chars().take(12).collect::<String>()
+                )),
+            };
+            ui::FeedbackItem {
+                feedback_id: f.id,
+                author_label: f.author_label.as_str().to_string(),
+                body: f.body.clone(),
+                created_at: f.created_at,
+                updated_at: f.updated_at,
+                target_label,
+                outdated: false,
+            }
+        })
+        .collect()
 }
 
 async fn commit_diff(
@@ -279,7 +285,6 @@ async fn commit_diff(
         .await
         .map_err(AppError::sqlx)?
         .ok_or_else(|| AppError::not_found(format!("no session {session_id}")))?;
-    // Walk plans for this session to find a matching commit_sha.
     let plans_in_session = plans::list_for_session(&state.pool, &sid)
         .await
         .map_err(AppError::sqlx)?;
@@ -300,16 +305,21 @@ async fn commit_diff(
         Ok(d) => d,
         Err(e) => format!("(failed to compute diff: {e})"),
     };
-    let raw_feedback: Vec<ev_store::Event> = sqlx::query_as(
-        "SELECT * FROM events WHERE session_id = ? AND kind = 'feedback_added' \
-         AND target_kind = 'implementation_commit' AND target_id = ? ORDER BY id ASC",
-    )
-    .bind(sid.as_str())
-    .bind(&rev.commit_sha)
-    .fetch_all(&state.pool)
-    .await
-    .map_err(AppError::sqlx)?;
-    let feedback = raw_feedback.iter().map(impl_fb).collect();
+    // Feedback for this commit lives in the feedback table. Filter all
+    // session feedback to rows whose target is the commit_sha (could be
+    // under any plan_id — commits are session-scoped in spirit).
+    let all = feedback_store::list_for_session(&state.pool, &sid)
+        .await
+        .map_err(AppError::feedback)?;
+    let feedback: Vec<ui::DiffViewFeedback> = all
+        .into_iter()
+        .filter(|r| matches!(&r.target, FeedbackTargetRef::ImplementationCommit(s) if s.as_str() == rev.commit_sha))
+        .map(|r| ui::DiffViewFeedback {
+            author_label: r.author_label.as_str().to_string(),
+            body: r.body,
+            created_at: r.created_at,
+        })
+        .collect();
     Ok(Html(
         ui::commit_diff(&ui::CommitDiffView {
             session_id: session.id,
@@ -321,95 +331,52 @@ async fn commit_diff(
     ))
 }
 
-fn build_feedback_for_plan(
-    events: &[ev_store::Event],
+/// Split active-plan feedback rows into (plan_target, impl_target) buckets
+/// for the session-detail UI. Impl-target rows whose `target_id` is not
+/// the current latest commit get an `outdated` badge.
+fn build_feedback_items(
+    feedback: &[FeedbackRecord],
     revisions: &[plan_revisions::PlanRevision],
+    current_commit_sha: Option<&str>,
 ) -> (Vec<ui::FeedbackItem>, Vec<ui::FeedbackItem>) {
-    let mut pending = Vec::new();
-    let mut staged = Vec::new();
-    for ev in events {
-        let payload: serde_json::Value =
-            serde_json::from_str(&ev.payload).unwrap_or(serde_json::Value::Null);
-        let text = payload
-            .get("text")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
-        let target_label = ev
-            .target_id
-            .as_deref()
-            .and_then(|id| id.parse::<i64>().ok())
-            .and_then(|id| revisions.iter().find(|r| r.id == id))
-            .map(|r| format!("rev #{}", r.revision_number));
-        let item = ui::FeedbackItem {
-            event_id: ev.id,
-            actor: ev.actor.clone(),
-            text,
-            status: ev.status.clone().unwrap_or_default(),
-            created_at: ev.ts,
-            target_label,
-            outdated: false,
-        };
-        match ev.status.as_deref() {
-            Some("staged") => staged.push(item),
-            _ => pending.push(item),
+    let mut plan = Vec::new();
+    let mut implv = Vec::new();
+    for f in feedback {
+        match &f.target {
+            FeedbackTargetRef::PlanRevision(rev_id) => {
+                let target_label = revisions
+                    .iter()
+                    .find(|r| r.id == *rev_id)
+                    .map(|r| format!("rev #{}", r.revision_number));
+                plan.push(ui::FeedbackItem {
+                    feedback_id: f.id,
+                    author_label: f.author_label.as_str().to_string(),
+                    body: f.body.clone(),
+                    created_at: f.created_at,
+                    updated_at: f.updated_at,
+                    target_label,
+                    outdated: false,
+                });
+            }
+            FeedbackTargetRef::ImplementationCommit(sha) => {
+                let outdated = matches!(current_commit_sha, Some(cur) if cur != sha.as_str());
+                let target_label = Some(format!(
+                    "commit {}",
+                    sha.as_str().chars().take(12).collect::<String>()
+                ));
+                implv.push(ui::FeedbackItem {
+                    feedback_id: f.id,
+                    author_label: f.author_label.as_str().to_string(),
+                    body: f.body.clone(),
+                    created_at: f.created_at,
+                    updated_at: f.updated_at,
+                    target_label,
+                    outdated,
+                });
+            }
         }
     }
-    (pending, staged)
-}
-
-fn build_feedback_for_impl(
-    events: &[ev_store::Event],
-    current_sha: Option<&str>,
-) -> (Vec<ui::FeedbackItem>, Vec<ui::FeedbackItem>) {
-    let mut pending = Vec::new();
-    let mut staged = Vec::new();
-    for ev in events {
-        let payload: serde_json::Value =
-            serde_json::from_str(&ev.payload).unwrap_or(serde_json::Value::Null);
-        let text = payload
-            .get("text")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
-        let outdated = matches!(
-            (ev.target_id.as_deref(), current_sha),
-            (Some(t), Some(c)) if t != c
-        );
-        let target_label = ev
-            .target_id
-            .as_deref()
-            .map(|sha| format!("commit {}", sha.chars().take(12).collect::<String>()));
-        let item = ui::FeedbackItem {
-            event_id: ev.id,
-            actor: ev.actor.clone(),
-            text,
-            status: ev.status.clone().unwrap_or_default(),
-            created_at: ev.ts,
-            target_label,
-            outdated,
-        };
-        match ev.status.as_deref() {
-            Some("staged") => staged.push(item),
-            _ => pending.push(item),
-        }
-    }
-    (pending, staged)
-}
-
-fn impl_fb(ev: &ev_store::Event) -> ui::DiffViewFeedback {
-    let payload: serde_json::Value =
-        serde_json::from_str(&ev.payload).unwrap_or(serde_json::Value::Null);
-    ui::DiffViewFeedback {
-        actor: ev.actor.clone(),
-        text: payload
-            .get("text")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string(),
-        status: ev.status.clone().unwrap_or_default(),
-        created_at: ev.ts,
-    }
+    (plan, implv)
 }
 
 fn render_markdown(body: &str) -> String {
@@ -425,36 +392,19 @@ fn render_markdown(body: &str) -> String {
     ammonia::clean(&html_out)
 }
 
-async fn pending_counts(state: &AppState, sid: &SessionId) -> Result<(i64, i64), AppError> {
-    // Counts are scoped to the active plan_id, mirroring the feedback display
-    // queries. With no active plan there's nothing the curator can stage or
-    // deliver, so the counts are zero.
-    let active: Option<i64> =
-        sqlx::query_scalar("SELECT active_plan_id FROM sessions WHERE id = ?")
-            .bind(sid.as_str())
-            .fetch_one(&state.pool)
-            .await
-            .map_err(AppError::sqlx)?;
-    let Some(pid) = active else { return Ok((0, 0)) };
-    let plan: (i64,) = sqlx::query_as(
-        "SELECT COUNT(*) FROM events WHERE session_id = ? AND plan_id = ? AND kind = 'feedback_added' \
-         AND target_kind = 'plan_revision' AND status IN ('pending', 'staged')",
-    )
-    .bind(sid.as_str())
-    .bind(pid)
-    .fetch_one(&state.pool)
-    .await
-    .map_err(AppError::sqlx)?;
-    let impl_: (i64,) = sqlx::query_as(
-        "SELECT COUNT(*) FROM events WHERE session_id = ? AND plan_id = ? AND kind = 'feedback_added' \
-         AND target_kind = 'implementation_commit' AND status IN ('pending', 'staged')",
-    )
-    .bind(sid.as_str())
-    .bind(pid)
-    .fetch_one(&state.pool)
-    .await
-    .map_err(AppError::sqlx)?;
-    Ok((plan.0, impl_.0))
+async fn active_feedback_counts(state: &AppState, sid: &SessionId) -> Result<(i64, i64), AppError> {
+    let active = feedback_store::list_for_active_plan(&state.pool, sid)
+        .await
+        .map_err(AppError::feedback)?;
+    let mut plan = 0_i64;
+    let mut implv = 0_i64;
+    for f in &active {
+        match f.target.kind() {
+            TargetKind::PlanRevision => plan += 1,
+            TargetKind::ImplementationCommit => implv += 1,
+        }
+    }
+    Ok((plan, implv))
 }
 
 async fn healthz() -> impl IntoResponse {
@@ -517,6 +467,13 @@ impl AppError {
         Self {
             status: StatusCode::INTERNAL_SERVER_ERROR,
             message: format!("database error: {err}"),
+        }
+    }
+    fn feedback(err: feedback_store::Error) -> Self {
+        tracing::error!(error = ?err, "feedback storage error");
+        Self {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            message: format!("feedback storage: {err}"),
         }
     }
 }

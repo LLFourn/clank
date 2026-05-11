@@ -1,20 +1,21 @@
-//! Reviewer MCP tools: list_sessions, join_session, get_review_context, add_feedback.
+//! Reviewer MCP tools: list_sessions, join_session, get_review_context,
+//! put_feedback.
 
 use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::daemon::AppState;
-use crate::daemon::apply::AppliedEffect;
 use crate::daemon::git;
 use crate::daemon::internal_api::ToolCallRequest;
-use crate::lifecycle::{AgentLabel, CommitSha, FeedbackTarget, Observation, SessionId};
+use crate::domain::{FeedbackTargetRef, TargetKind};
+use crate::lifecycle::{AgentLabel, CommitSha, SessionId};
 use crate::storage::{
-    agents, events as ev_store, implementation_revisions as impl_revs, plan_revisions, plans,
-    sessions,
+    agents, events as ev_store, feedback as feedback_store, implementation_revisions as impl_revs,
+    plan_revisions, plans, sessions,
 };
 
 use super::ToolError;
-use super::master::{map_lifecycle_err, require_label};
+use super::master::{map_service_err, require_label};
 
 #[derive(Debug, Deserialize)]
 struct JoinSessionArgs {
@@ -30,11 +31,11 @@ struct GetReviewContextArgs {
 }
 
 #[derive(Debug, Deserialize)]
-struct AddFeedbackArgs {
+struct PutFeedbackArgs {
     session_id: String,
     target_kind: String,
     target_id: String,
-    text: String,
+    body: String,
 }
 
 pub async fn list_sessions(state: &AppState, req: &ToolCallRequest) -> Result<Value, ToolError> {
@@ -69,7 +70,7 @@ pub async fn list_sessions(state: &AppState, req: &ToolCallRequest) -> Result<Va
             .filter(|a| a.role == "reviewer")
             .map(|a| a.label.clone())
             .collect();
-        let (pending_plan, pending_impl) = pending_counts(state, &sid).await?;
+        let (plan_fb, impl_fb) = active_feedback_counts(state, &sid).await?;
         out.push(json!({
             "session_id": s.id,
             "display_title": s.display_title,
@@ -80,8 +81,8 @@ pub async fn list_sessions(state: &AppState, req: &ToolCallRequest) -> Result<Va
             "master_label": master_label,
             "joined_reviewer_labels": reviewer_labels,
             "updated_at": s.updated_at,
-            "pending_plan_count": pending_plan,
-            "pending_impl_count": pending_impl,
+            "plan_feedback_count": plan_fb,
+            "impl_feedback_count": impl_fb,
         }));
     }
     Ok(json!({"scope_repo_root": scope, "sessions": out}))
@@ -290,12 +291,9 @@ pub async fn get_review_context(
     }
 }
 
-pub async fn add_feedback(state: &AppState, req: &ToolCallRequest) -> Result<Value, ToolError> {
-    let args: AddFeedbackArgs = serde_json::from_value(req.arguments.clone())
+pub async fn put_feedback(state: &AppState, req: &ToolCallRequest) -> Result<Value, ToolError> {
+    let args: PutFeedbackArgs = serde_json::from_value(req.arguments.clone())
         .map_err(|e| ToolError::Invalid(format!("invalid args: {e}")))?;
-    if args.text.trim().is_empty() {
-        return Err(ToolError::Invalid("text must be non-empty".into()));
-    }
     let session_id = sessions::validate_slug(&args.session_id).map_err(ToolError::Invalid)?;
     let label = require_label(req)?;
     let agent = require_joined(state, &session_id, &label).await?;
@@ -306,78 +304,38 @@ pub async fn add_feedback(state: &AppState, req: &ToolCallRequest) -> Result<Val
         )));
     }
 
-    let kind = crate::domain::TargetKind::parse(&args.target_kind).ok_or_else(|| {
+    let kind = TargetKind::parse(&args.target_kind).ok_or_else(|| {
         ToolError::Invalid(format!(
             "target_kind must be 'plan_revision' or 'implementation_commit', got '{}'",
             args.target_kind
         ))
     })?;
-
-    // Target must belong to the active plan. Reject otherwise — archived plans are read-only.
-    let active = plans::load_active_plan(&state.pool, &session_id)
-        .await
-        .map_err(|e| match e {
-            plans::LoadActivePlanError::Sql(s) => ToolError::Internal(anyhow::anyhow!(s)),
-            plans::LoadActivePlanError::Inconsistent(i) => ToolError::Internal(anyhow::anyhow!(i)),
-        })?
-        .ok_or_else(|| {
-            ToolError::Forbidden(format!(
-                "session `{session_id}` has no active plan; feedback only accepted on active plans"
-            ))
-        })?;
-
     let target = match kind {
-        crate::domain::TargetKind::PlanRevision => {
-            let rev_id: i64 = args.target_id.parse().map_err(|_| {
-                ToolError::Invalid("target_id for plan_revision must be a numeric id".into())
+        TargetKind::PlanRevision => {
+            let id: i64 = args.target_id.parse().map_err(|_| {
+                ToolError::Invalid("target_id for plan_revision must be numeric".into())
             })?;
-            let rev = plan_revisions::fetch(&state.pool, rev_id)
-                .await
-                .map_err(|e| ToolError::Internal(anyhow::anyhow!(e)))?
-                .ok_or_else(|| ToolError::NotFound(format!("plan_revision {rev_id} not found")))?;
-            if rev.plan_id != active.id {
-                return Err(ToolError::Forbidden(format!(
-                    "plan_revision {rev_id} belongs to a non-active plan; feedback rejected"
-                )));
-            }
-            FeedbackTarget::PlanRevision {
-                revision_id: rev_id,
-            }
+            FeedbackTargetRef::PlanRevision(id)
         }
-        crate::domain::TargetKind::ImplementationCommit => {
-            let commit = CommitSha::from(args.target_id.clone());
-            let row = impl_revs::fetch_by_sha(&state.pool, active.id, &commit)
-                .await
-                .map_err(|e| ToolError::Internal(anyhow::anyhow!(e)))?
-                .ok_or_else(|| {
-                    ToolError::Forbidden(format!(
-                        "commit `{}` is not registered on the active plan",
-                        args.target_id
-                    ))
-                })?;
-            let _ = row.id;
-            FeedbackTarget::ImplementationCommit { commit_sha: commit }
+        TargetKind::ImplementationCommit => {
+            FeedbackTargetRef::ImplementationCommit(CommitSha::from(args.target_id.clone()))
         }
     };
 
     let outcome = state
         .lifecycle
-        .observe(
-            &session_id,
-            &format!("reviewer:{label}"),
-            Observation::FeedbackPosted {
-                target,
-                author: label.clone(),
-                body: args.text,
-            },
-        )
+        .put_feedback(&session_id, &label, target, args.body)
         .await
-        .map_err(map_lifecycle_err)?;
-    let event_id = outcome.apply.items.iter().find_map(|e| match e {
-        AppliedEffect::Feedback { event_id } => Some(*event_id),
-        _ => None,
-    });
-    Ok(json!({"event_id": event_id, "status": "pending"}))
+        .map_err(map_service_err)?;
+
+    Ok(json!({
+        "feedback_id": outcome.record.id,
+        "plan_id": outcome.record.plan_id,
+        "was_insert": outcome.was_insert,
+        "was_no_op": outcome.was_no_op,
+        "created_at": outcome.record.created_at,
+        "updated_at": outcome.record.updated_at,
+    }))
 }
 
 async fn require_joined(
@@ -398,31 +356,20 @@ async fn require_joined(
     Ok(agent)
 }
 
-async fn pending_counts(state: &AppState, session_id: &SessionId) -> Result<(i64, i64), ToolError> {
-    let active: Option<i64> =
-        sqlx::query_scalar("SELECT active_plan_id FROM sessions WHERE id = ?")
-            .bind(session_id.as_str())
-            .fetch_one(&state.pool)
-            .await
-            .map_err(|e| ToolError::Internal(anyhow::anyhow!(e)))?;
-    let Some(pid) = active else { return Ok((0, 0)) };
-    let plan: (i64,) = sqlx::query_as(
-        "SELECT COUNT(*) FROM events WHERE session_id = ? AND plan_id = ? AND kind = 'feedback_added' \
-         AND target_kind = 'plan_revision' AND status IN ('pending', 'staged')",
-    )
-    .bind(session_id.as_str())
-    .bind(pid)
-    .fetch_one(&state.pool)
-    .await
-    .map_err(|e| ToolError::Internal(anyhow::anyhow!(e)))?;
-    let impl_: (i64,) = sqlx::query_as(
-        "SELECT COUNT(*) FROM events WHERE session_id = ? AND plan_id = ? AND kind = 'feedback_added' \
-         AND target_kind = 'implementation_commit' AND status IN ('pending', 'staged')",
-    )
-    .bind(session_id.as_str())
-    .bind(pid)
-    .fetch_one(&state.pool)
-    .await
-    .map_err(|e| ToolError::Internal(anyhow::anyhow!(e)))?;
-    Ok((plan.0, impl_.0))
+async fn active_feedback_counts(
+    state: &AppState,
+    session_id: &SessionId,
+) -> Result<(i64, i64), ToolError> {
+    let active = feedback_store::list_for_active_plan(&state.pool, session_id)
+        .await
+        .map_err(|e| ToolError::Internal(anyhow::anyhow!(e)))?;
+    let mut plan = 0_i64;
+    let mut implv = 0_i64;
+    for f in &active {
+        match f.target.kind() {
+            TargetKind::PlanRevision => plan += 1,
+            TargetKind::ImplementationCommit => implv += 1,
+        }
+    }
+    Ok((plan, implv))
 }

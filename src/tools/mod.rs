@@ -102,36 +102,32 @@ pub fn catalog() -> Vec<ToolDescriptor> {
             }),
         },
         ToolDescriptor {
-            name: "poll_directive".to_string(),
-            description: "Master tool. Returns the oldest unacked feedback batch the curator \
-                          delivered, or `{directive: \"none\"}` if nothing is waiting.\n\n\
-                          - `session_id`: the session you are master of.\n\n\
-                          Replay-safe: the same batch is returned on every poll until you \
-                          call `ack_directive`. After integrating, call `ack_directive` to \
-                          advance."
+            name: "get_current_feedback".to_string(),
+            description: "Master tool. Returns the current feedback rows for the session's \
+                          active plan, plus a digest you can compare against your last read \
+                          to skip reprocessing when nothing has changed.\n\n\
+                          - `session_id`: the session you are master of.\n\
+                          - `target_kind` (optional): `plan_revision` or `implementation_commit`. \
+                          If omitted, returns feedback for both.\n\n\
+                          Response shape:\n\
+                          - `state`: `\"active\"` or `\"no_active_plan\"`.\n\
+                          - `plan_id`: the active plan id (only when active).\n\
+                          - `feedback_digest`: hex blake3 over the rows + plan_id + filter; \
+                          stable across re-reads when nothing changed.\n\
+                          - `feedback[]`: `{feedback_id, plan_id, target_kind, target_id, \
+                          author_label, body, created_at, updated_at}`.\n\n\
+                          Re-reading is cheap and idempotent. There is no acknowledgement; \
+                          if the digest matches your last read, the feedback set is unchanged."
                 .to_string(),
             input_schema: json!({
                 "type": "object",
                 "required": ["session_id"],
-                "properties": {"session_id": {"type": "string"}},
-                "additionalProperties": false
-            }),
-        },
-        ToolDescriptor {
-            name: "ack_directive".to_string(),
-            description: "Master tool. Acknowledge a feedback batch returned by \
-                          `poll_directive`. Required before the next batch is surfaced. \
-                          Idempotent.\n\n\
-                          - `session_id`: must match the batch's session; the daemon rejects \
-                          mismatches.\n\
-                          - `batch_id`: from `poll_directive`."
-                .to_string(),
-            input_schema: json!({
-                "type": "object",
-                "required": ["session_id", "batch_id"],
                 "properties": {
                     "session_id": {"type": "string"},
-                    "batch_id": {"type": "integer"}
+                    "target_kind": {
+                        "type": "string",
+                        "enum": ["plan_revision", "implementation_commit"]
+                    }
                 },
                 "additionalProperties": false
             }),
@@ -187,21 +183,27 @@ pub fn catalog() -> Vec<ToolDescriptor> {
             }),
         },
         ToolDescriptor {
-            name: "add_feedback".to_string(),
-            description: "Reviewer tool. Posts feedback against an artifact of the session's \
-                          *active* plan. Feedback is `pending` until the curator stages and \
-                          delivers it via the web UI. Archived plans are read-only.\n\n\
+            name: "put_feedback".to_string(),
+            description: "Reviewer tool. Upserts your feedback against an artifact of the \
+                          session's active plan. Each `(target, author)` slot holds one \
+                          current row; calling again with the same target updates the body \
+                          in place. Identical-body re-calls are a no-op (no update, stable \
+                          digest).\n\n\
                           - `session_id`: the session.\n\
                           - `target_kind`: `plan_revision` or `implementation_commit`.\n\
                           - `target_id`: numeric `revision_id` (plan_revision) or full \
                           `commit_sha` (implementation_commit), from `get_review_context`.\n\
-                          - `text`: your critique (markdown).\n\n\
+                          - `body`: your critique (markdown).\n\n\
                           The daemon rejects feedback targeting any plan_revision or \
-                          implementation_commit that doesn't belong to the active plan."
+                          implementation_commit that doesn't belong to the active plan. \
+                          Archived plans are read-only.\n\n\
+                          Response carries `was_insert` (true on first post for this \
+                          target+author) and `was_no_op` (true when the body matches the \
+                          existing row byte-for-byte)."
                 .to_string(),
             input_schema: json!({
                 "type": "object",
-                "required": ["session_id", "target_kind", "target_id", "text"],
+                "required": ["session_id", "target_kind", "target_id", "body"],
                 "properties": {
                     "session_id": {"type": "string"},
                     "target_kind": {
@@ -209,7 +211,7 @@ pub fn catalog() -> Vec<ToolDescriptor> {
                         "enum": ["plan_revision", "implementation_commit"]
                     },
                     "target_id": {"type": "string"},
-                    "text": {"type": "string"}
+                    "body": {"type": "string"}
                 },
                 "additionalProperties": false
             }),
@@ -224,12 +226,11 @@ pub async fn dispatch(state: &AppState, req: &ToolCallRequest) -> Result<Value, 
         "register_implementation_commit" => {
             master::register_implementation_commit(state, req).await
         }
-        "poll_directive" => master::poll_directive(state, req).await,
-        "ack_directive" => master::ack_directive(state, req).await,
+        "get_current_feedback" => master::get_current_feedback(state, req).await,
         "list_sessions" => reviewer::list_sessions(state, req).await,
         "join_session" => reviewer::join_session(state, req).await,
         "get_review_context" => reviewer::get_review_context(state, req).await,
-        "add_feedback" => reviewer::add_feedback(state, req).await,
+        "put_feedback" => reviewer::put_feedback(state, req).await,
         other => Err(ToolError::NotFound(format!("unknown tool: {other}"))),
     }
 }

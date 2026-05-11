@@ -4,8 +4,8 @@ use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use sqlx::{ConnectOptions, SqlitePool};
 
 pub mod agents;
-pub mod batches;
 pub mod events;
+pub mod feedback;
 pub mod implementation_revisions;
 pub mod plan_revisions;
 pub mod plans;

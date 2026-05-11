@@ -4,7 +4,7 @@
 //! runs `notify-debouncer-full` on each watched file's parent directory,
 //! and emits a `WatcherEvent::PlanFileDirty { session_id }` to the dispatch
 //! channel. The dispatcher reads the file, captures HEAD, and feeds the
-//! observation through `SessionLifecycle::observe`.
+//! observation through `SessionService::observe`.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};

@@ -1,5 +1,13 @@
-//! Regression tests for the "feedback must be scoped to the active plan"
-//! invariant + the evict-master FK fix.
+//! Regression tests for "feedback must be scoped to the active plan" +
+//! evict-master FK fix. After the structural-feedback rewrite, scoping
+//! is enforced two ways:
+//!
+//! 1. `put_feedback`'s upsert key is `(plan_id, target_kind, target_id,
+//!    author_label)`, and `plan_id` is the *current* `active_plan_id`
+//!    resolved under the per-session lock — so an archived plan's slot
+//!    can no longer be addressed.
+//! 2. `get_current_feedback` joins through `sessions.active_plan_id`,
+//!    so archived feedback rows are invisible to the master read.
 
 mod common;
 
@@ -7,11 +15,10 @@ use serde_json::json;
 
 use common::{TestApp, make_commit};
 
-/// P1 regression: pending and staged feedback from a previous (now-archived)
-/// lifecycle must NOT leak into a new active plan's pending/staged display
-/// or deliver pickup.
+/// Feedback posted under plan A does not appear under plan B after
+/// archive + register-new.
 #[tokio::test]
-async fn staged_feedback_does_not_leak_across_archive_to_new_plan() {
+async fn feedback_does_not_leak_across_archive_to_new_plan() {
     let app = TestApp::spawn().await;
     let plan_path = app.repo.join("plan.md");
     std::fs::write(&plan_path, "# v1\n").unwrap();
@@ -24,9 +31,9 @@ async fn staged_feedback_does_not_leak_across_archive_to_new_plan() {
         )
         .await
         .unwrap();
-    let revision_a = r["revision_id"].as_i64().unwrap();
+    let plan_a = r["plan_id"].as_i64().unwrap();
+    let rev_a = r["revision_id"].as_i64().unwrap();
 
-    // Reviewer posts feedback under plan A.
     app.call(
         "join_session",
         &app.repo,
@@ -35,37 +42,33 @@ async fn staged_feedback_does_not_leak_across_archive_to_new_plan() {
     )
     .await
     .unwrap();
-    let post = app
+    let posted = app
         .call(
-            "add_feedback",
+            "put_feedback",
             &app.repo,
             Some("rev"),
             json!({
                 "session_id": "s",
                 "target_kind": "plan_revision",
-                "target_id": revision_a.to_string(),
-                "text": "stage me",
+                "target_id": rev_a.to_string(),
+                "body": "stage me",
             }),
         )
         .await
         .unwrap();
-    let event_id = post["event_id"].as_i64().unwrap();
+    let feedback_id = posted["feedback_id"].as_i64().unwrap();
 
-    // Curator stages it. Now archive the active plan via curator route.
-    app.post_form(&format!("/sessions/s/feedback/{event_id}/stage"), "")
-        .await;
+    // Archive plan A. The feedback row stays in the DB.
     let resp = app.post_form("/sessions/s/archive", "").await;
     assert!(resp.status().is_redirection());
-
-    // The previously-staged event must now be `withdrawn` (apply layer does this on archive).
-    let status: Option<String> = sqlx::query_scalar("SELECT status FROM events WHERE id = ?")
-        .bind(event_id)
+    let exists: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM feedback WHERE id = ?")
+        .bind(feedback_id)
         .fetch_one(&app.state.pool)
         .await
         .unwrap();
-    assert_eq!(status.as_deref(), Some("withdrawn"));
+    assert_eq!(exists, 1, "archive must not delete or mutate feedback rows");
 
-    // Start a NEW lifecycle by re-registering with different body.
+    // Start a new lifecycle under the same session.
     std::fs::write(&plan_path, "# v2 — new task\n").unwrap();
     app.call(
         "register_plan_file",
@@ -76,90 +79,36 @@ async fn staged_feedback_does_not_leak_across_archive_to_new_plan() {
     .await
     .unwrap();
 
-    // Homepage / session detail must show 0 pending plan-feedback for the new active plan.
+    // Master read returns no feedback for plan B.
+    let view = app
+        .call(
+            "get_current_feedback",
+            &app.repo,
+            Some("m"),
+            json!({"session_id": "s"}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(view["state"], "active");
+    let plan_b = view["plan_id"].as_i64().unwrap();
+    assert_ne!(plan_a, plan_b);
+    assert!(view["feedback"].as_array().unwrap().is_empty());
+
+    // Session detail's "Plan feedback" section is empty for plan B.
+    // (The audit timeline still shows the historical add as part of
+    // session history; that's intentional.)
     let body = app.get("/sessions/s").await.text().await.unwrap();
     assert!(
-        body.contains("No pending plan feedback") || !body.contains("stage me"),
-        "old-cycle feedback must not appear under the new active plan"
-    );
-
-    // Curator deliver must also refuse to pick up the old event.
-    let resp = app
-        .post_form("/sessions/s/deliver", "target_kind=plan_revision")
-        .await;
-    assert_eq!(
-        resp.status(),
-        400,
-        "deliver should refuse: nothing staged for the new active plan"
+        body.contains("No plan feedback yet"),
+        "expected empty plan-feedback section for the new active plan"
     );
 }
 
-/// P1 regression: re-staging a withdrawn (old-cycle) event must be rejected
-/// even by event_id.
+/// `put_feedback` rejects a target that doesn't belong to the active
+/// plan. The natural-key upsert lives under the per-session lock so an
+/// archive raced into mid-call cannot redirect the write.
 #[tokio::test]
-async fn stage_route_refuses_old_cycle_feedback() {
-    let app = TestApp::spawn().await;
-    let plan_path = app.repo.join("plan.md");
-    std::fs::write(&plan_path, "# v1\n").unwrap();
-    let r = app
-        .call(
-            "register_plan_file",
-            &app.repo,
-            None,
-            json!({"session_id": "s", "path": &plan_path, "label": "m"}),
-        )
-        .await
-        .unwrap();
-    let rev_a = r["revision_id"].as_i64().unwrap();
-    app.call(
-        "join_session",
-        &app.repo,
-        None,
-        json!({"session_id": "s", "label": "rev"}),
-    )
-    .await
-    .unwrap();
-    let post = app
-        .call(
-            "add_feedback",
-            &app.repo,
-            Some("rev"),
-            json!({
-                "session_id": "s",
-                "target_kind": "plan_revision",
-                "target_id": rev_a.to_string(),
-                "text": "x",
-            }),
-        )
-        .await
-        .unwrap();
-    let event_id = post["event_id"].as_i64().unwrap();
-
-    // Archive + start a new plan.
-    app.post_form("/sessions/s/archive", "").await;
-    std::fs::write(&plan_path, "# v2\n").unwrap();
-    app.call(
-        "register_plan_file",
-        &app.repo,
-        Some("m"),
-        json!({"session_id": "s", "path": &plan_path, "label": "m"}),
-    )
-    .await
-    .unwrap();
-
-    // Try to stage the OLD event_id. Must refuse.
-    let resp = app
-        .post_form(&format!("/sessions/s/feedback/{event_id}/stage"), "")
-        .await;
-    assert_eq!(resp.status(), 400);
-}
-
-/// P1 race regression: the reducer-under-lock target validation must reject
-/// feedback whose target belongs to a plan that has just been archived.
-/// Simulated by archiving directly via the curator route between the
-/// reviewer's two interactions.
-#[tokio::test]
-async fn add_feedback_rejects_target_from_archived_plan() {
+async fn put_feedback_rejects_target_from_archived_plan() {
     let app = TestApp::spawn().await;
     let plan_path = app.repo.join("plan.md");
     std::fs::write(&plan_path, "# v1\n").unwrap();
@@ -182,9 +131,8 @@ async fn add_feedback_rejects_target_from_archived_plan() {
     .await
     .unwrap();
 
-    // Archive while the reviewer "still thinks" rev_a is valid.
+    // Archive A.
     app.post_form("/sessions/s/archive", "").await;
-    // Start a fresh lifecycle.
     std::fs::write(&plan_path, "# v2\n").unwrap();
     let r2 = app
         .call(
@@ -195,33 +143,36 @@ async fn add_feedback_rejects_target_from_archived_plan() {
         )
         .await
         .unwrap();
-    let new_revision = r2["revision_id"].as_i64().unwrap();
-    assert_ne!(new_revision, rev_a);
+    let new_rev = r2["revision_id"].as_i64().unwrap();
+    assert_ne!(new_rev, rev_a);
 
-    // Reviewer posts feedback aimed at the OLD plan's revision. Must be rejected.
+    // Reviewer aimed at the OLD plan_revision: must be rejected.
     let (status, body) = app
         .call(
-            "add_feedback",
+            "put_feedback",
             &app.repo,
             Some("rev"),
             json!({
                 "session_id": "s",
                 "target_kind": "plan_revision",
                 "target_id": rev_a.to_string(),
-                "text": "stale",
+                "body": "stale",
             }),
         )
         .await
         .expect_err();
     assert_eq!(status, reqwest::StatusCode::FORBIDDEN);
-    assert!(
-        body.contains("non-active") || body.contains("does not belong"),
-        "body: {body}"
-    );
+    assert!(body.contains("does not belong"), "body: {body}");
+    // No feedback row inserted.
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM feedback WHERE session_id = 's'")
+        .fetch_one(&app.state.pool)
+        .await
+        .unwrap();
+    assert_eq!(count, 0);
 }
 
-/// Same-body re-registration is idempotent: it returns the current active
-/// plan_id and the latest revision_id (not -1/-1 sentinels).
+/// Same-body re-registration is idempotent: returns real `plan_id` and
+/// `revision_id` (not -1/-1 sentinels).
 #[tokio::test]
 async fn register_no_op_returns_real_ids() {
     let app = TestApp::spawn().await;
@@ -254,8 +205,7 @@ async fn register_no_op_returns_real_ids() {
     assert_eq!(second["revision_id"].as_i64().unwrap(), revision_id);
 }
 
-/// P1 regression: evict_master must not violate the
-/// `sessions.master_agent_id → agents.id` FK by trying to point at agent 0.
+/// Evict-master does not violate `sessions.master_agent_id → agents.id`.
 #[tokio::test]
 async fn evict_master_works_with_fk_enabled() {
     let app = TestApp::spawn().await;
@@ -277,7 +227,6 @@ async fn evict_master_works_with_fk_enabled() {
         resp.text().await.unwrap_or_default()
     );
 
-    // master_agent_id should be NULL and the agents row gone.
     let master: Option<i64> =
         sqlx::query_scalar("SELECT master_agent_id FROM sessions WHERE id = 's'")
             .fetch_one(&app.state.pool)
@@ -293,8 +242,7 @@ async fn evict_master_works_with_fk_enabled() {
     assert_eq!(count, 0);
 }
 
-/// And after eviction, a fresh master claim with a new label should work
-/// (the unique constraint must not block).
+/// After eviction, a fresh master claim with a different label succeeds.
 #[tokio::test]
 async fn fresh_master_after_eviction() {
     let app = TestApp::spawn().await;
@@ -323,6 +271,5 @@ async fn fresh_master_after_eviction() {
             .await
             .unwrap();
     assert_eq!(master_label.as_deref(), Some("second"));
-    // unused suppression
     let _ = make_commit;
 }

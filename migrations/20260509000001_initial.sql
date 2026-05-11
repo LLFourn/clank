@@ -24,10 +24,6 @@ CREATE TABLE plans (                              -- one plan-to-implementation 
 CREATE INDEX plans_session ON plans(session_id, id);
 
 -- Belt-and-suspenders: at most one non-archived plan per session.
--- The reducer encodes this rule; this index catches application-layer bugs
--- or concurrent transactions that would violate it. `sessions.active_plan_id`
--- consistency with this index is enforced by code-level checks in the
--- apply layer (see active_plan_invariant tests).
 CREATE UNIQUE INDEX one_active_plan_per_session
     ON plans(session_id) WHERE state != 'archived';
 
@@ -69,6 +65,23 @@ CREATE TABLE agents (
 );
 CREATE INDEX agents_session ON agents(session_id);
 
+-- Feedback is structural state, not an audit row. One row per
+-- (active plan, target, reviewer); repeat posts upsert via put_feedback.
+CREATE TABLE feedback (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id   TEXT    NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+    plan_id      INTEGER NOT NULL REFERENCES plans(id)    ON DELETE CASCADE,
+    target_kind  TEXT    NOT NULL CHECK (target_kind IN ('plan_revision', 'implementation_commit')),
+    target_id    TEXT    NOT NULL,
+    author_label TEXT    NOT NULL,
+    body         TEXT    NOT NULL,
+    created_at   INTEGER NOT NULL,
+    updated_at   INTEGER NOT NULL,
+    UNIQUE(plan_id, target_kind, target_id, author_label)
+);
+CREATE INDEX feedback_plan         ON feedback(plan_id, id);
+CREATE INDEX feedback_session_plan ON feedback(session_id, plan_id, id);
+
 CREATE TABLE events (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
@@ -83,23 +96,4 @@ CREATE TABLE events (
 );
 CREATE INDEX events_session ON events(session_id, id);
 CREATE INDEX events_plan ON events(plan_id, id);
-CREATE INDEX events_status ON events(session_id, status) WHERE status IS NOT NULL;
 CREATE INDEX events_target ON events(session_id, target_kind, target_id);
-
-CREATE TABLE directive_batches (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
-    plan_id INTEGER REFERENCES plans(id),
-    target_kind TEXT,
-    created_at INTEGER NOT NULL,
-    delivered_by TEXT NOT NULL,
-    acked_at INTEGER,
-    acked_by TEXT
-);
-CREATE INDEX directive_batches_session ON directive_batches(session_id, id);
-
-CREATE TABLE directive_batch_items (
-    batch_id INTEGER NOT NULL REFERENCES directive_batches(id) ON DELETE CASCADE,
-    event_id INTEGER NOT NULL REFERENCES events(id) ON DELETE CASCADE,
-    PRIMARY KEY (batch_id, event_id)
-);

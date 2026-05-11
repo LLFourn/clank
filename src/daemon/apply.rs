@@ -1,11 +1,14 @@
 //! Translate `Decision` effects into SQL writes inside a single transaction.
 //! Returns generated IDs the tool layer needs for response bodies.
+//!
+//! Feedback is **not** an effect; it is handled by
+//! `SessionService::put_feedback` as structural state.
 
 use serde_json::json;
 use sqlx::{Sqlite, Transaction};
 
-use crate::domain::{EventKind, FeedbackStatus, TargetKind};
-use crate::lifecycle::{CommitSha, Decision, Effect, FeedbackTarget, SessionId};
+use crate::domain::{EventKind, TargetKind};
+use crate::lifecycle::{CommitSha, Decision, Effect, SessionId};
 use crate::storage::{
     events as ev_store, implementation_revisions as impl_revs, plan_revisions, plans, sessions,
 };
@@ -25,9 +28,6 @@ pub enum AppliedEffect {
         plan_id: i64,
         implementation_revision_id: i64,
         commit_sha: CommitSha,
-    },
-    Feedback {
-        event_id: i64,
     },
     Archived {
         plan_id: i64,
@@ -52,7 +52,7 @@ pub enum ApplyError {
     #[error("apply_decision invariant: ArchiveActivePlan with no active plan in session")]
     ArchiveWithoutActive,
     #[error(
-        "apply_decision invariant: RecordPlanRevision/RecordImplementation/RecordFeedback with no active plan in session"
+        "apply_decision invariant: RecordPlanRevision/RecordImplementation with no active plan in session"
     )]
     EffectWithoutActive,
     #[error("sql: {0}")]
@@ -74,9 +74,6 @@ pub async fn apply_decision(
 ) -> Result<ApplyOutcome, ApplyError> {
     let mut items = Vec::with_capacity(decision.effects.len());
 
-    // Snapshot the current active_plan_id once; effects mutate it as they go.
-    // We don't trust the cache here — read from the DB row inside the tx for
-    // correctness against concurrent (mis)behavior.
     let mut active_plan_id: Option<i64> =
         sqlx::query_scalar::<_, Option<i64>>("SELECT active_plan_id FROM sessions WHERE id = ?")
             .bind(session_id.as_str())
@@ -142,7 +139,6 @@ pub async fn apply_decision(
                 let plan_id = active_plan_id.ok_or(ApplyError::EffectWithoutActive)?;
                 let implementation_revision_id =
                     impl_revs::append(&mut **tx, plan_id, commit, actor, now).await?;
-                // Transition planning → implementing if needed.
                 let state: String = sqlx::query_scalar("SELECT state FROM plans WHERE id = ?")
                     .bind(plan_id)
                     .fetch_one(&mut **tx)
@@ -205,50 +201,13 @@ pub async fn apply_decision(
                     commit_sha: commit.sha.clone(),
                 });
             }
-            Effect::RecordFeedback {
-                target,
-                author,
-                body,
-            } => {
-                let plan_id = active_plan_id.ok_or(ApplyError::EffectWithoutActive)?;
-                let (target_kind, target_id) = match target {
-                    FeedbackTarget::PlanRevision { revision_id } => {
-                        (TargetKind::PlanRevision, revision_id.to_string())
-                    }
-                    FeedbackTarget::ImplementationCommit { commit_sha } => (
-                        TargetKind::ImplementationCommit,
-                        commit_sha.as_str().to_string(),
-                    ),
-                };
-                let event_id = ev_store::append(
-                    &mut **tx,
-                    session_id,
-                    Some(plan_id),
-                    Some(target_kind.as_str()),
-                    Some(&target_id),
-                    EventKind::FeedbackAdded.as_str(),
-                    &format!("reviewer:{author}"),
-                    &json!({"text": body}),
-                    Some(FeedbackStatus::Pending.as_str()),
-                    now,
-                )
-                .await?;
-                sessions::touch_updated_at(&mut **tx, session_id, now).await?;
-                items.push(AppliedEffect::Feedback { event_id });
-            }
             Effect::ArchiveActivePlan => {
                 let plan_id = active_plan_id.ok_or(ApplyError::ArchiveWithoutActive)?;
                 plans::archive(&mut **tx, plan_id, now).await?;
-                // Withdraw any pending/staged feedback that targeted this
-                // plan — archived plans are read-only history and that
-                // feedback must not leak into the next active lifecycle.
-                sqlx::query(
-                    "UPDATE events SET status = 'withdrawn' \
-                     WHERE plan_id = ? AND kind = 'feedback_added' AND status IN ('pending', 'staged')",
-                )
-                .bind(plan_id)
-                .execute(&mut **tx)
-                .await?;
+                // Feedback rows for the archived plan are left in place
+                // (audit history). `get_current_feedback` filters by
+                // `plan_id = active_plan_id`, so archived feedback is
+                // invisible to the read API without any cascade write.
                 sessions::set_active_plan_id(&mut **tx, session_id, None, now).await?;
                 active_plan_id = None;
                 ev_store::append(

@@ -259,19 +259,28 @@ async fn reviewer_join_and_post_feedback() {
     .unwrap();
     let post = app
         .call(
-            "add_feedback",
+            "put_feedback",
             &app.repo,
             Some("rev"),
             json!({
                 "session_id": "s",
                 "target_kind": "plan_revision",
                 "target_id": rev_id.to_string(),
-                "text": "consider X",
+                "body": "consider X",
             }),
         )
         .await
         .unwrap();
-    assert_eq!(post["status"], "pending");
+    assert_eq!(post["was_insert"], true);
+    assert_eq!(post["was_no_op"], false);
+    let feedback_id = post["feedback_id"].as_i64().unwrap();
+
+    let body: String = sqlx::query_scalar("SELECT body FROM feedback WHERE id = ?")
+        .bind(feedback_id)
+        .fetch_one(&app.state.pool)
+        .await
+        .unwrap();
+    assert_eq!(body, "consider X");
 }
 
 #[tokio::test]
@@ -291,7 +300,6 @@ async fn feedback_on_archived_plan_is_rejected() {
     let plan_a = r["plan_id"].as_i64().unwrap();
     let rev_id = r["revision_id"].as_i64().unwrap();
 
-    // Reviewer joins and the curator archives the active plan.
     app.call(
         "join_session",
         &app.repo,
@@ -303,26 +311,23 @@ async fn feedback_on_archived_plan_is_rejected() {
     let resp = app.post_form("/sessions/s/archive", "").await;
     assert!(resp.status().is_redirection());
 
-    // Feedback against the now-archived plan's revision must be rejected.
+    // No active plan now; put_feedback must refuse.
     let (status, body) = app
         .call(
-            "add_feedback",
+            "put_feedback",
             &app.repo,
             Some("rev"),
             json!({
                 "session_id": "s",
                 "target_kind": "plan_revision",
                 "target_id": rev_id.to_string(),
-                "text": "late",
+                "body": "late",
             }),
         )
         .await
         .expect_err();
     assert_eq!(status, reqwest::StatusCode::FORBIDDEN);
-    assert!(
-        body.contains("no active plan") || body.contains("non-active plan"),
-        "body: {body}"
-    );
+    assert!(body.contains("no active plan"), "body: {body}");
     let _ = plan_a;
 }
 
@@ -351,7 +356,7 @@ async fn curator_archive_route_returns_303() {
 }
 
 #[tokio::test]
-async fn poll_and_ack_full_loop() {
+async fn get_current_feedback_returns_active_plan_rows() {
     let app = TestApp::spawn().await;
     let plan_path = app.repo.join("plan.md");
     std::fs::write(&plan_path, "x").unwrap();
@@ -374,145 +379,74 @@ async fn poll_and_ack_full_loop() {
     )
     .await
     .unwrap();
-    let post = app
-        .call(
-            "add_feedback",
-            &app.repo,
-            Some("rev"),
-            json!({
-                "session_id": "s",
-                "target_kind": "plan_revision",
-                "target_id": rev_id.to_string(),
-                "text": "comment",
-            }),
-        )
-        .await
-        .unwrap();
-    let event_id = post["event_id"].as_i64().unwrap();
-
-    app.post_form(&format!("/sessions/s/feedback/{event_id}/stage"), "")
-        .await;
-    app.post_form("/sessions/s/deliver", "target_kind=plan_revision")
-        .await;
-
-    let poll = app
-        .call(
-            "poll_directive",
-            &app.repo,
-            Some("m"),
-            json!({"session_id": "s"}),
-        )
-        .await
-        .unwrap();
-    let batch_id = poll["batch_id"].as_i64().unwrap();
-    // Replay-safe: polling again returns the same batch.
-    let again = app
-        .call(
-            "poll_directive",
-            &app.repo,
-            Some("m"),
-            json!({"session_id": "s"}),
-        )
-        .await
-        .unwrap();
-    assert_eq!(again["batch_id"], poll["batch_id"]);
-
     app.call(
-        "ack_directive",
+        "put_feedback",
         &app.repo,
-        Some("m"),
-        json!({"session_id": "s", "batch_id": batch_id}),
+        Some("rev"),
+        json!({
+            "session_id": "s",
+            "target_kind": "plan_revision",
+            "target_id": rev_id.to_string(),
+            "body": "comment",
+        }),
     )
     .await
     .unwrap();
-    let post_ack = app
+
+    let view = app
         .call(
-            "poll_directive",
+            "get_current_feedback",
             &app.repo,
             Some("m"),
             json!({"session_id": "s"}),
         )
         .await
         .unwrap();
-    assert_eq!(post_ack["directive"], "none");
+    assert_eq!(view["state"], "active");
+    let items = view["feedback"].as_array().unwrap();
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0]["body"], "comment");
+    assert_eq!(items[0]["author_label"], "rev");
+    let digest_first = view["feedback_digest"].as_str().unwrap().to_string();
+
+    // Re-read with no changes: digest is byte-stable.
+    let view_again = app
+        .call(
+            "get_current_feedback",
+            &app.repo,
+            Some("m"),
+            json!({"session_id": "s"}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(view_again["feedback_digest"], digest_first);
 }
 
 #[tokio::test]
-async fn ack_directive_rejects_session_mismatch() {
+async fn get_current_feedback_no_active_plan() {
     let app = TestApp::spawn().await;
-    let plan_a = app.repo.join("a.md");
-    std::fs::write(&plan_a, "a").unwrap();
-    let r_a = app
-        .call(
-            "register_plan_file",
-            &app.repo,
-            None,
-            json!({"session_id": "alpha", "path": &plan_a, "label": "m"}),
-        )
-        .await
-        .unwrap();
-    let rev_id = r_a["revision_id"].as_i64().unwrap();
-    app.call(
-        "join_session",
-        &app.repo,
-        None,
-        json!({"session_id": "alpha", "label": "rev"}),
-    )
-    .await
-    .unwrap();
-    let post = app
-        .call(
-            "add_feedback",
-            &app.repo,
-            Some("rev"),
-            json!({
-                "session_id": "alpha",
-                "target_kind": "plan_revision",
-                "target_id": rev_id.to_string(),
-                "text": "x",
-            }),
-        )
-        .await
-        .unwrap();
-    let event_id = post["event_id"].as_i64().unwrap();
-    app.post_form(&format!("/sessions/alpha/feedback/{event_id}/stage"), "")
-        .await;
-    app.post_form("/sessions/alpha/deliver", "target_kind=plan_revision")
-        .await;
-    let poll = app
-        .call(
-            "poll_directive",
-            &app.repo,
-            Some("m"),
-            json!({"session_id": "alpha"}),
-        )
-        .await
-        .unwrap();
-    let batch_id = poll["batch_id"].as_i64().unwrap();
-
-    // Another session, also master-claimed.
-    let plan_b = app.repo.join("b.md");
-    std::fs::write(&plan_b, "b").unwrap();
+    let plan_path = app.repo.join("plan.md");
+    std::fs::write(&plan_path, "x").unwrap();
     app.call(
         "register_plan_file",
         &app.repo,
         None,
-        json!({"session_id": "beta", "path": &plan_b, "label": "m2"}),
+        json!({"session_id": "s", "path": &plan_path, "label": "m"}),
     )
     .await
     .unwrap();
+    app.post_form("/sessions/s/archive", "").await;
 
-    let (status, body) = app
+    let view = app
         .call(
-            "ack_directive",
+            "get_current_feedback",
             &app.repo,
-            Some("m2"),
-            json!({"session_id": "beta", "batch_id": batch_id}),
+            Some("m"),
+            json!({"session_id": "s"}),
         )
         .await
-        .expect_err();
-    assert_eq!(status, reqwest::StatusCode::FORBIDDEN);
-    assert!(body.contains("belongs to session"), "body: {body}");
+        .unwrap();
+    assert_eq!(view["state"], "no_active_plan");
 }
 
 #[tokio::test]
