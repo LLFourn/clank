@@ -11,7 +11,6 @@ pub struct Session {
     pub repo_root: String,
     pub plan_file_path: String,
     pub display_title: Option<String>,
-    pub master_agent_id: Option<i64>,
     pub active_plan_id: Option<i64>,
     pub created_at: i64,
     pub updated_at: i64,
@@ -55,8 +54,8 @@ where
     E: sqlx::Executor<'e, Database = sqlx::Sqlite>,
 {
     sqlx::query(
-        "INSERT INTO sessions (id, repo_root, plan_file_path, display_title, master_agent_id, active_plan_id, created_at, updated_at, archived_at) \
-         VALUES (?, ?, ?, ?, NULL, NULL, ?, ?, NULL)",
+        "INSERT INTO sessions (id, repo_root, plan_file_path, display_title, active_plan_id, created_at, updated_at, archived_at) \
+         VALUES (?, ?, ?, ?, NULL, ?, ?, NULL)",
     )
     .bind(session_id.as_str())
     .bind(repo_root)
@@ -80,24 +79,6 @@ where
 {
     sqlx::query("UPDATE sessions SET plan_file_path = ?, updated_at = ? WHERE id = ?")
         .bind(path.as_str())
-        .bind(now)
-        .bind(session_id.as_str())
-        .execute(executor)
-        .await?;
-    Ok(())
-}
-
-pub async fn set_master_agent<'e, E>(
-    executor: E,
-    session_id: &SessionId,
-    master_agent_id: Option<i64>,
-    now: i64,
-) -> sqlx::Result<()>
-where
-    E: sqlx::Executor<'e, Database = sqlx::Sqlite>,
-{
-    sqlx::query("UPDATE sessions SET master_agent_id = ?, updated_at = ? WHERE id = ?")
-        .bind(master_agent_id)
         .bind(now)
         .bind(session_id.as_str())
         .execute(executor)

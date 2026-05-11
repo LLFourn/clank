@@ -1,6 +1,6 @@
 //! Human-curator HTTP routes (session-scoped admin). Lifecycle actions
 //! funnel through `SessionService::observe`; non-lifecycle metadata writes
-//! (comment, rename, evict-master, register-head) go straight to the DB.
+//! (comment, rename, register-head) go straight to the DB.
 //!
 //! Feedback mutation is **not** here in v0; reviewers upsert via the
 //! `put_feedback` MCP tool.
@@ -15,9 +15,7 @@ use serde_json::json;
 use super::AppState;
 use crate::domain::EventKind;
 use crate::lifecycle::{AgentLabel, CommitSha, CommitSnapshot, Observation, SessionId};
-use crate::storage::{
-    agents, events as ev_store, implementation_revisions as impl_revs, plans, sessions,
-};
+use crate::storage::{events as ev_store, implementation_revisions as impl_revs, plans, sessions};
 
 #[derive(Debug, Deserialize)]
 pub struct CommentForm {
@@ -118,49 +116,6 @@ pub async fn rename(
     )
     .await
     .map_err(ApiError::sqlx)?;
-    Ok(Redirect::to(&format!("/sessions/{session_id}")))
-}
-
-pub async fn evict_master(
-    State(state): State<AppState>,
-    Path(session_id): Path<String>,
-) -> Result<Redirect, ApiError> {
-    let sid = SessionId::from(session_id.clone());
-    let _ = sessions::fetch(&state.pool, &sid)
-        .await
-        .map_err(ApiError::sqlx)?
-        .ok_or_else(|| ApiError::not_found(format!("session `{session_id}` not found")))?;
-    let now = chrono::Utc::now().timestamp();
-    let master = agents::fetch_master(&state.pool, &sid)
-        .await
-        .map_err(ApiError::sqlx)?;
-    let mut tx = state.pool.begin().await.map_err(ApiError::sqlx)?;
-    // NULL the pointer before deleting the agent row, otherwise the FK
-    // sessions.master_agent_id -> agents.id refuses the delete.
-    sessions::set_master_agent(&mut *tx, &sid, None, now)
-        .await
-        .map_err(ApiError::sqlx)?;
-    if let Some(master) = &master {
-        agents::delete(&mut *tx, master.id)
-            .await
-            .map_err(ApiError::sqlx)?;
-    }
-    let payload = json!({ "prior_label": master.as_ref().map(|m| m.label.clone()) });
-    ev_store::append(
-        &mut *tx,
-        &sid,
-        None,
-        None,
-        None,
-        EventKind::MasterEvicted.as_str(),
-        "human:curator",
-        &payload,
-        None,
-        now,
-    )
-    .await
-    .map_err(ApiError::sqlx)?;
-    tx.commit().await.map_err(ApiError::sqlx)?;
     Ok(Redirect::to(&format!("/sessions/{session_id}")))
 }
 

@@ -78,18 +78,23 @@ impl TestApp {
         tool: &str,
         cwd: &Path,
         label: Option<&str>,
-        arguments: Value,
+        mut arguments: Value,
     ) -> ToolCallOutcome {
-        let mut body = json!({
+        // Mirror the shim's per-tool argument-rewrite: if the caller supplied
+        // a `label` here (the optional helper arg, not the deleted envelope
+        // field) and the tool takes one, merge it into arguments unless
+        // already present.
+        if let (Some(label), Some(key)) = (label, label_arg_for(tool))
+            && let Value::Object(ref mut map) = arguments
+            && !map.contains_key(key)
+        {
+            map.insert(key.to_string(), json!(label));
+        }
+        let body = json!({
             "cwd": cwd,
             "tool": tool,
             "arguments": arguments,
         });
-        if let Some(label) = label {
-            body.as_object_mut()
-                .unwrap()
-                .insert("label".into(), json!(label));
-        }
         let resp = self
             .client
             .post(format!("{}/internal/tool_call", self.base))
@@ -178,6 +183,20 @@ pub fn run_git(cwd: &Path, args: &[&str]) -> String {
         );
     }
     String::from_utf8_lossy(&output.stdout).trim().to_string()
+}
+
+/// Mirror the production shim's per-tool label-arg mapping. Keeps
+/// `TestApp::call(..., Some(label), ...)` working as a shorthand for tests
+/// that don't want to repeat `label` / `author_label` inside `arguments`.
+fn label_arg_for(tool: &str) -> Option<&'static str> {
+    match tool {
+        "put_feedback" => Some("author_label"),
+        "register_plan_file"
+        | "register_implementation_commit"
+        | "get_current_feedback"
+        | "get_review_context" => Some("label"),
+        _ => None,
+    }
 }
 
 pub fn make_commit(repo: &Path, file: &str, contents: &str) -> String {

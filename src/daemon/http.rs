@@ -36,10 +36,6 @@ pub fn router(state: AppState) -> Router {
         .route("/sessions/{session_id}/archive", post(curator::archive))
         .route("/sessions/{session_id}/rename", post(curator::rename))
         .route(
-            "/sessions/{session_id}/evict-master",
-            post(curator::evict_master),
-        )
-        .route(
             "/sessions/{session_id}/register-head",
             post(curator::register_head_as_impl),
         )
@@ -60,15 +56,7 @@ async fn home(State(state): State<AppState>) -> Result<Html<String>, AppError> {
         let agents_for = agents::list_for_session(&state.pool, &sid)
             .await
             .map_err(AppError::sqlx)?;
-        let master_label = agents_for
-            .iter()
-            .find(|a| a.role == "master")
-            .map(|a| a.label.clone());
-        let reviewer_labels: Vec<String> = agents_for
-            .iter()
-            .filter(|a| a.role == "reviewer")
-            .map(|a| a.label.clone())
-            .collect();
+        let recent_agents: Vec<String> = agents_for.iter().map(|a| a.label.clone()).collect();
         let active_plan_state = if let Some(id) = s.active_plan_id {
             plans::fetch(&state.pool, id)
                 .await
@@ -80,8 +68,7 @@ async fn home(State(state): State<AppState>) -> Result<Html<String>, AppError> {
         let (plan_count, impl_count) = active_feedback_counts(&state, &sid).await?;
         out.push(ui::SessionRow {
             session: s,
-            master_label,
-            reviewer_labels,
+            recent_agents,
             active_plan_state,
             plan_feedback_count: plan_count,
             impl_feedback_count: impl_count,

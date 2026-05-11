@@ -60,7 +60,7 @@ pub enum ApplyError {
 }
 
 /// Apply a `Decision` against the session row. `actor` is the
-/// caller-supplied attribution string (e.g. `"master:claude-main"` or
+/// caller-supplied attribution string (e.g. `"agent:claude-main"` or
 /// `"system:watcher"`) and rides on each emitted `events.actor`.
 ///
 /// Effects are applied in order. Generated IDs flow into the returned

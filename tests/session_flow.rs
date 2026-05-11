@@ -249,24 +249,17 @@ async fn reviewer_join_and_post_feedback() {
         .unwrap();
     let rev_id = r["revision_id"].as_i64().unwrap();
 
-    app.call(
-        "join_session",
-        &app.repo,
-        None,
-        json!({"session_id": "s", "label": "rev"}),
-    )
-    .await
-    .unwrap();
     let post = app
         .call(
             "put_feedback",
             &app.repo,
-            Some("rev"),
+            None,
             json!({
                 "session_id": "s",
                 "target_kind": "plan_revision",
                 "target_id": rev_id.to_string(),
                 "body": "consider X",
+                "author_label": "rev",
             }),
         )
         .await
@@ -300,14 +293,6 @@ async fn feedback_on_archived_plan_is_rejected() {
     let plan_a = r["plan_id"].as_i64().unwrap();
     let rev_id = r["revision_id"].as_i64().unwrap();
 
-    app.call(
-        "join_session",
-        &app.repo,
-        None,
-        json!({"session_id": "s", "label": "rev"}),
-    )
-    .await
-    .unwrap();
     let resp = app.post_form("/sessions/s/archive", "").await;
     assert!(resp.status().is_redirection());
 
@@ -316,12 +301,13 @@ async fn feedback_on_archived_plan_is_rejected() {
         .call(
             "put_feedback",
             &app.repo,
-            Some("rev"),
+            None,
             json!({
                 "session_id": "s",
                 "target_kind": "plan_revision",
                 "target_id": rev_id.to_string(),
                 "body": "late",
+                "author_label": "rev",
             }),
         )
         .await
@@ -372,22 +358,15 @@ async fn get_current_feedback_returns_active_plan_rows() {
     let rev_id = r["revision_id"].as_i64().unwrap();
 
     app.call(
-        "join_session",
-        &app.repo,
-        None,
-        json!({"session_id": "s", "label": "rev"}),
-    )
-    .await
-    .unwrap();
-    app.call(
         "put_feedback",
         &app.repo,
-        Some("rev"),
+        None,
         json!({
             "session_id": "s",
             "target_kind": "plan_revision",
             "target_id": rev_id.to_string(),
             "body": "comment",
+            "author_label": "rev",
         }),
     )
     .await
@@ -397,7 +376,7 @@ async fn get_current_feedback_returns_active_plan_rows() {
         .call(
             "get_current_feedback",
             &app.repo,
-            Some("m"),
+            None,
             json!({"session_id": "s"}),
         )
         .await

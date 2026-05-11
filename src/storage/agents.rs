@@ -1,5 +1,6 @@
 //! CRUD on the `agents` table. Agents are per-session: a `label` is unique
-//! within a `session_id`.
+//! within a `session_id`. There is no role; agents are just "labels we've
+//! seen on this session".
 
 use sqlx::SqlitePool;
 
@@ -9,25 +10,19 @@ use crate::lifecycle::{AgentLabel, SessionId};
 pub struct Agent {
     pub id: i64,
     pub session_id: String,
-    pub role: String,
     pub label: String,
     pub first_seen: i64,
     pub last_seen: i64,
 }
 
-#[derive(Debug, Clone, Copy)]
-pub enum Role {
-    Master,
-    Reviewer,
-}
-
-impl Role {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Role::Master => "master",
-            Role::Reviewer => "reviewer",
-        }
-    }
+/// Outcome of an `upsert_seen` call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SeenOutcome {
+    /// First time this `(session_id, label)` was seen — caller can emit
+    /// an `agent_joined` event.
+    Inserted,
+    /// Existing row's `last_seen` was bumped. No event should follow.
+    Touched,
 }
 
 pub async fn fetch_by_label(
@@ -42,81 +37,54 @@ pub async fn fetch_by_label(
         .await
 }
 
-pub async fn fetch_master(
-    pool: &SqlitePool,
-    session_id: &SessionId,
-) -> sqlx::Result<Option<Agent>> {
-    sqlx::query_as::<_, Agent>(
-        "SELECT * FROM agents WHERE session_id = ? AND role = 'master' LIMIT 1",
-    )
-    .bind(session_id.as_str())
-    .fetch_optional(pool)
-    .await
-}
-
 pub async fn list_for_session(
     pool: &SqlitePool,
     session_id: &SessionId,
 ) -> sqlx::Result<Vec<Agent>> {
-    sqlx::query_as::<_, Agent>("SELECT * FROM agents WHERE session_id = ? ORDER BY first_seen ASC")
+    sqlx::query_as::<_, Agent>("SELECT * FROM agents WHERE session_id = ? ORDER BY last_seen DESC")
         .bind(session_id.as_str())
         .fetch_all(pool)
         .await
 }
 
-pub async fn insert<'e, E>(
-    executor: E,
+/// Idempotent: INSERT a `(session_id, label)` row if absent, otherwise
+/// bump `last_seen`. Reports whether the row was inserted so the caller
+/// can decide whether to emit an `agent_joined` audit event.
+///
+/// Touches **only** the `agents` table. Callers on read-only paths
+/// (`get_current_feedback`, `get_review_context`) must not pair this
+/// with `sessions::touch_updated_at` or with appending an event on the
+/// `Touched` branch.
+pub async fn upsert_seen(
+    pool: &SqlitePool,
     session_id: &SessionId,
-    role: Role,
     label: &AgentLabel,
     now: i64,
-) -> sqlx::Result<i64>
-where
-    E: sqlx::Executor<'e, Database = sqlx::Sqlite>,
-{
-    let result = sqlx::query(
-        "INSERT INTO agents (session_id, role, label, first_seen, last_seen) VALUES (?, ?, ?, ?, ?)",
+) -> sqlx::Result<SeenOutcome> {
+    // INSERT OR IGNORE is atomic per call. rows_affected() reliably
+    // distinguishes "I inserted" from "row already existed" without
+    // relying on time-based heuristics that break under same-second
+    // concurrent calls.
+    let inserted = sqlx::query(
+        "INSERT OR IGNORE INTO agents (session_id, label, first_seen, last_seen) \
+         VALUES (?, ?, ?, ?)",
     )
     .bind(session_id.as_str())
-    .bind(role.as_str())
     .bind(label.as_str())
     .bind(now)
     .bind(now)
-    .execute(executor)
-    .await?;
-    Ok(result.last_insert_rowid())
-}
-
-pub async fn touch_last_seen<'e, E>(executor: E, agent_id: i64, now: i64) -> sqlx::Result<()>
-where
-    E: sqlx::Executor<'e, Database = sqlx::Sqlite>,
-{
-    sqlx::query("UPDATE agents SET last_seen = ? WHERE id = ?")
+    .execute(pool)
+    .await?
+    .rows_affected()
+        == 1;
+    if inserted {
+        return Ok(SeenOutcome::Inserted);
+    }
+    sqlx::query("UPDATE agents SET last_seen = ? WHERE session_id = ? AND label = ?")
         .bind(now)
-        .bind(agent_id)
-        .execute(executor)
+        .bind(session_id.as_str())
+        .bind(label.as_str())
+        .execute(pool)
         .await?;
-    Ok(())
-}
-
-pub async fn reset_all_to_stale<'e, E>(executor: E, stale_at: i64) -> sqlx::Result<()>
-where
-    E: sqlx::Executor<'e, Database = sqlx::Sqlite>,
-{
-    sqlx::query("UPDATE agents SET last_seen = ?")
-        .bind(stale_at)
-        .execute(executor)
-        .await?;
-    Ok(())
-}
-
-pub async fn delete<'e, E>(executor: E, agent_id: i64) -> sqlx::Result<()>
-where
-    E: sqlx::Executor<'e, Database = sqlx::Sqlite>,
-{
-    sqlx::query("DELETE FROM agents WHERE id = ?")
-        .bind(agent_id)
-        .execute(executor)
-        .await?;
-    Ok(())
+    Ok(SeenOutcome::Touched)
 }

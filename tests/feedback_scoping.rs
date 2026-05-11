@@ -1,6 +1,5 @@
-//! Regression tests for "feedback must be scoped to the active plan" +
-//! evict-master FK fix. After the structural-feedback rewrite, scoping
-//! is enforced two ways:
+//! Regression tests for "feedback must be scoped to the active plan".
+//! After the structural-feedback rewrite, scoping is enforced two ways:
 //!
 //! 1. `put_feedback`'s upsert key is `(plan_id, target_kind, target_id,
 //!    author_label)`, and `plan_id` is the *current* `active_plan_id`
@@ -34,24 +33,17 @@ async fn feedback_does_not_leak_across_archive_to_new_plan() {
     let plan_a = r["plan_id"].as_i64().unwrap();
     let rev_a = r["revision_id"].as_i64().unwrap();
 
-    app.call(
-        "join_session",
-        &app.repo,
-        None,
-        json!({"session_id": "s", "label": "rev"}),
-    )
-    .await
-    .unwrap();
     let posted = app
         .call(
             "put_feedback",
             &app.repo,
-            Some("rev"),
+            None,
             json!({
                 "session_id": "s",
                 "target_kind": "plan_revision",
                 "target_id": rev_a.to_string(),
                 "body": "stage me",
+                "author_label": "rev",
             }),
         )
         .await
@@ -73,7 +65,7 @@ async fn feedback_does_not_leak_across_archive_to_new_plan() {
     app.call(
         "register_plan_file",
         &app.repo,
-        Some("m"),
+        None,
         json!({"session_id": "s", "path": &plan_path, "label": "m"}),
     )
     .await
@@ -84,7 +76,7 @@ async fn feedback_does_not_leak_across_archive_to_new_plan() {
         .call(
             "get_current_feedback",
             &app.repo,
-            Some("m"),
+            None,
             json!({"session_id": "s"}),
         )
         .await
@@ -95,8 +87,6 @@ async fn feedback_does_not_leak_across_archive_to_new_plan() {
     assert!(view["feedback"].as_array().unwrap().is_empty());
 
     // Session detail's "Plan feedback" section is empty for plan B.
-    // (The audit timeline still shows the historical add as part of
-    // session history; that's intentional.)
     let body = app.get("/sessions/s").await.text().await.unwrap();
     assert!(
         body.contains("No plan feedback yet"),
@@ -122,23 +112,15 @@ async fn put_feedback_rejects_target_from_archived_plan() {
         .await
         .unwrap();
     let rev_a = r["revision_id"].as_i64().unwrap();
-    app.call(
-        "join_session",
-        &app.repo,
-        None,
-        json!({"session_id": "s", "label": "rev"}),
-    )
-    .await
-    .unwrap();
 
-    // Archive A.
+    // Archive A and start a new lifecycle.
     app.post_form("/sessions/s/archive", "").await;
     std::fs::write(&plan_path, "# v2\n").unwrap();
     let r2 = app
         .call(
             "register_plan_file",
             &app.repo,
-            Some("m"),
+            None,
             json!({"session_id": "s", "path": &plan_path, "label": "m"}),
         )
         .await
@@ -151,12 +133,13 @@ async fn put_feedback_rejects_target_from_archived_plan() {
         .call(
             "put_feedback",
             &app.repo,
-            Some("rev"),
+            None,
             json!({
                 "session_id": "s",
                 "target_kind": "plan_revision",
                 "target_id": rev_a.to_string(),
                 "body": "stale",
+                "author_label": "rev",
             }),
         )
         .await
@@ -203,73 +186,5 @@ async fn register_no_op_returns_real_ids() {
     assert_eq!(second["noop"], true);
     assert_eq!(second["plan_id"].as_i64().unwrap(), plan_id);
     assert_eq!(second["revision_id"].as_i64().unwrap(), revision_id);
-}
-
-/// Evict-master does not violate `sessions.master_agent_id → agents.id`.
-#[tokio::test]
-async fn evict_master_works_with_fk_enabled() {
-    let app = TestApp::spawn().await;
-    let plan_path = app.repo.join("plan.md");
-    std::fs::write(&plan_path, "# body\n").unwrap();
-    app.call(
-        "register_plan_file",
-        &app.repo,
-        None,
-        json!({"session_id": "s", "path": &plan_path, "label": "m"}),
-    )
-    .await
-    .unwrap();
-    let resp = app.post_form("/sessions/s/evict-master", "").await;
-    assert!(
-        resp.status().is_redirection(),
-        "expected redirect, got {} body={}",
-        resp.status(),
-        resp.text().await.unwrap_or_default()
-    );
-
-    let master: Option<i64> =
-        sqlx::query_scalar("SELECT master_agent_id FROM sessions WHERE id = 's'")
-            .fetch_one(&app.state.pool)
-            .await
-            .unwrap();
-    assert!(master.is_none());
-    let count: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM agents WHERE session_id = 's' AND role = 'master'",
-    )
-    .fetch_one(&app.state.pool)
-    .await
-    .unwrap();
-    assert_eq!(count, 0);
-}
-
-/// After eviction, a fresh master claim with a different label succeeds.
-#[tokio::test]
-async fn fresh_master_after_eviction() {
-    let app = TestApp::spawn().await;
-    let plan_path = app.repo.join("plan.md");
-    std::fs::write(&plan_path, "# body\n").unwrap();
-    app.call(
-        "register_plan_file",
-        &app.repo,
-        None,
-        json!({"session_id": "s", "path": &plan_path, "label": "first"}),
-    )
-    .await
-    .unwrap();
-    app.post_form("/sessions/s/evict-master", "").await;
-    app.call(
-        "register_plan_file",
-        &app.repo,
-        None,
-        json!({"session_id": "s", "path": &plan_path, "label": "second"}),
-    )
-    .await
-    .unwrap();
-    let master_label: Option<String> =
-        sqlx::query_scalar("SELECT label FROM agents WHERE session_id = 's' AND role = 'master'")
-            .fetch_one(&app.state.pool)
-            .await
-            .unwrap();
-    assert_eq!(master_label.as_deref(), Some("second"));
     let _ = make_commit;
 }

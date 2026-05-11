@@ -167,8 +167,11 @@ async fn recover(
         }
     }
 
-    // Reset all agents' last_seen so masters/reviewers must re-bind.
-    crate::storage::agents::reset_all_to_stale(pool, 0).await?;
+    // Preserve `agents.last_seen` across restarts. With the role concept
+    // removed, the column is purely "this label has called a tool on this
+    // session" — useful UI state. Wiping it on every recover would make
+    // every agent render as stale-since-the-epoch until they happen to
+    // make another call.
     Ok(())
 }
 

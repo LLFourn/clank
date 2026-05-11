@@ -7,7 +7,7 @@ use serde_json::json;
 
 use common::TestApp;
 
-async fn setup_with_reviewer(app: &TestApp, label_reviewer: &str) -> (i64, i64) {
+async fn setup_with_reviewer(app: &TestApp, _label_reviewer: &str) -> (i64, i64) {
     let plan_path = app.repo.join("plan.md");
     std::fs::write(&plan_path, "# body\n").unwrap();
     let r = app
@@ -21,14 +21,6 @@ async fn setup_with_reviewer(app: &TestApp, label_reviewer: &str) -> (i64, i64) 
         .unwrap();
     let plan_id = r["plan_id"].as_i64().unwrap();
     let rev_id = r["revision_id"].as_i64().unwrap();
-    app.call(
-        "join_session",
-        &app.repo,
-        None,
-        json!({"session_id": "s", "label": label_reviewer}),
-    )
-    .await
-    .unwrap();
     (plan_id, rev_id)
 }
 
@@ -167,14 +159,6 @@ async fn put_feedback_identical_body_is_noop() {
 async fn unique_key_enforced_per_author() {
     let app = TestApp::spawn().await;
     let (_, rev_id) = setup_with_reviewer(&app, "rev-a").await;
-    app.call(
-        "join_session",
-        &app.repo,
-        None,
-        json!({"session_id": "s", "label": "rev-b"}),
-    )
-    .await
-    .unwrap();
 
     put_plan_feedback(&app, "rev-a", rev_id, "a1").await;
     put_plan_feedback(&app, "rev-a", rev_id, "a2").await;
@@ -257,14 +241,6 @@ async fn put_feedback_rejects_empty_body() {
 async fn current_feedback_digest_change_conditions() {
     let app = TestApp::spawn().await;
     let (_, rev_id) = setup_with_reviewer(&app, "rev-a").await;
-    app.call(
-        "join_session",
-        &app.repo,
-        None,
-        json!({"session_id": "s", "label": "rev-b"}),
-    )
-    .await
-    .unwrap();
 
     async fn digest(app: &TestApp) -> String {
         app.call(
@@ -352,37 +328,7 @@ async fn feedback_session_id_matches_plans_session_id() {
     assert_eq!(mismatched, 0);
 }
 
-#[tokio::test]
-async fn master_cannot_put_feedback_and_reviewer_cannot_read() {
-    let app = TestApp::spawn().await;
-    let (_, rev_id) = setup_with_reviewer(&app, "rev").await;
-
-    // Master attempting put_feedback: rejected because their agent role is master.
-    let (status, _) = app
-        .call(
-            "put_feedback",
-            &app.repo,
-            Some("m"),
-            json!({
-                "session_id": "s",
-                "target_kind": "plan_revision",
-                "target_id": rev_id.to_string(),
-                "body": "should fail",
-            }),
-        )
-        .await
-        .expect_err();
-    assert_eq!(status, reqwest::StatusCode::FORBIDDEN);
-
-    // Reviewer attempting get_current_feedback: rejected because role is reviewer (require_master).
-    let (status, _) = app
-        .call(
-            "get_current_feedback",
-            &app.repo,
-            Some("rev"),
-            json!({"session_id": "s"}),
-        )
-        .await
-        .expect_err();
-    assert_eq!(status, reqwest::StatusCode::FORBIDDEN);
-}
+// No master/reviewer role gating anymore: any caller can call any tool. The
+// removed test (`master_cannot_put_feedback_and_reviewer_cannot_read`) was
+// the role check; cross-session calls are now allowed at the shim layer
+// too (see tests/mcp_shim_autofill.rs).

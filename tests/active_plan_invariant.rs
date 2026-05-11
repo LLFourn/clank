@@ -40,7 +40,7 @@ async fn cross_session_pointer_returns_inconsistent() {
 
     // Hand-insert a second session whose active_plan_id points at alpha's plan.
     sqlx::query(
-        "INSERT INTO sessions (id, repo_root, plan_file_path, display_title, master_agent_id, active_plan_id, created_at, updated_at, archived_at) VALUES ('beta', '/other', '/p', NULL, NULL, ?, 1, 1, NULL)",
+        "INSERT INTO sessions (id, repo_root, plan_file_path, display_title, active_plan_id, created_at, updated_at, archived_at) VALUES ('beta', '/other', '/p', NULL, ?, 1, 1, NULL)",
     )
     .bind(plan_alpha)
     .execute(&app.state.pool)

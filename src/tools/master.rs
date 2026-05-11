@@ -1,5 +1,9 @@
-//! Master-agent MCP tools: register_plan_file, register_implementation_commit,
-//! get_current_feedback. All take `session_id` as a master-supplied slug.
+//! Lifecycle MCP tools: register_plan_file, register_implementation_commit,
+//! get_current_feedback. All take `session_id` as a caller-chosen slug.
+//!
+//! There is no master/reviewer role; any caller may invoke any tool. `label`
+//! is for attribution only and is recorded on the emitted event + upserted
+//! into `agents.last_seen`.
 
 use std::path::{Path, PathBuf};
 
@@ -11,15 +15,14 @@ use crate::daemon::apply::AppliedEffect;
 use crate::daemon::git;
 use crate::daemon::internal_api::ToolCallRequest;
 use crate::daemon::{CurrentFeedbackView, ServiceError};
-use crate::domain::{FeedbackTargetRef, TargetKind};
-use crate::lifecycle::{
-    AgentLabel, CommitSha, CommitSnapshot, Observation, PlanFilePath, SessionId,
+use crate::domain::{EventKind, FeedbackTargetRef, TargetKind};
+use crate::lifecycle::{AgentLabel, CommitSha, CommitSnapshot, Observation, PlanFilePath};
+use crate::storage::{
+    agents::{self, SeenOutcome},
+    events as ev_store, sessions,
 };
-use crate::storage::{agents, events as ev_store, sessions};
 
 use super::ToolError;
-
-const MASTER_STALE_SECONDS: i64 = 300;
 
 #[derive(Debug, Deserialize)]
 struct RegisterPlanFileArgs {
@@ -34,6 +37,8 @@ struct RegisterImplementationCommitArgs {
     commit_sha: String,
     #[serde(default)]
     force: bool,
+    #[serde(default)]
+    label: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -41,6 +46,8 @@ struct GetCurrentFeedbackArgs {
     session_id: String,
     #[serde(default)]
     target_kind: Option<String>,
+    #[serde(default)]
+    label: Option<String>,
 }
 
 pub async fn register_plan_file(
@@ -99,125 +106,40 @@ pub async fn register_plan_file(
         .await
         .map_err(|e| ToolError::Internal(anyhow::anyhow!("read plan file: {e}")))?;
 
-    // Session row + master claim. Pure DB metadata; the lifecycle reducer
-    // does the body/head decision separately via observe().
     let existing = sessions::fetch(&state.pool, &session_id)
         .await
         .map_err(|e| ToolError::Internal(anyhow::anyhow!(e)))?;
-    let display_title = canonical
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .unwrap_or("plan")
-        .to_string();
 
-    let mut tx = state
-        .pool
-        .begin()
+    // First-sight session insert (initial plan_file_path + repo_root). All
+    // subsequent path updates flow through SessionService::observe so the
+    // path write, reducer effects, and watcher switch stay consistent under
+    // failure.
+    if let Some(session) = existing.as_ref() {
+        if session.repo_root != repo_root_str {
+            return Err(ToolError::Forbidden(format!(
+                "session `{}` was created against repo `{}` but caller cwd resolves to `{}`",
+                session_id, session.repo_root, repo_root_str
+            )));
+        }
+    } else {
+        let display_title = canonical
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("plan")
+            .to_string();
+        sessions::insert(
+            &state.pool,
+            &session_id,
+            &repo_root_str,
+            &PlanFilePath::from(plan_path_str.clone()),
+            Some(&display_title),
+            now,
+        )
         .await
         .map_err(|e| ToolError::Internal(anyhow::anyhow!(e)))?;
-    let agent_id = match existing.as_ref() {
-        None => {
-            sessions::insert(
-                &mut *tx,
-                &session_id,
-                &repo_root_str,
-                &PlanFilePath::from(plan_path_str.clone()),
-                Some(&display_title),
-                now,
-            )
-            .await
-            .map_err(|e| ToolError::Internal(anyhow::anyhow!(e)))?;
-            let new_id = agents::insert(&mut *tx, &session_id, agents::Role::Master, &label, now)
-                .await
-                .map_err(|e| ToolError::Internal(anyhow::anyhow!(e)))?;
-            ev_store::append(
-                &mut *tx,
-                &session_id,
-                None,
-                None,
-                None,
-                crate::domain::EventKind::AgentJoined.as_str(),
-                &format!("master:{label}"),
-                &json!({"role": "master", "label": label.as_str()}),
-                None,
-                now,
-            )
-            .await
-            .map_err(|e| ToolError::Internal(anyhow::anyhow!(e)))?;
-            sessions::set_master_agent(&mut *tx, &session_id, Some(new_id), now)
-                .await
-                .map_err(|e| ToolError::Internal(anyhow::anyhow!(e)))?;
-            new_id
-        }
-        Some(session) => {
-            // Master claim: same label always reclaims; different label only if stale.
-            if let Some(master) = agents::fetch_master(&state.pool, &session_id)
-                .await
-                .map_err(|e| ToolError::Internal(anyhow::anyhow!(e)))?
-            {
-                let stale = now - master.last_seen >= MASTER_STALE_SECONDS;
-                if master.label != label.as_str() && !stale {
-                    return Err(ToolError::Forbidden(format!(
-                        "session `{}` already has live master `{}` (last seen {}s ago); evict via UI or wait {}s",
-                        session_id,
-                        master.label,
-                        now - master.last_seen,
-                        MASTER_STALE_SECONDS - (now - master.last_seen)
-                    )));
-                }
-                if master.label == label.as_str() {
-                    agents::touch_last_seen(&mut *tx, master.id, now)
-                        .await
-                        .map_err(|e| ToolError::Internal(anyhow::anyhow!(e)))?;
-                    master.id
-                } else {
-                    // Stale master: evict and replace.
-                    agents::delete(&mut *tx, master.id)
-                        .await
-                        .map_err(|e| ToolError::Internal(anyhow::anyhow!(e)))?;
-                    let new_id =
-                        agents::insert(&mut *tx, &session_id, agents::Role::Master, &label, now)
-                            .await
-                            .map_err(|e| ToolError::Internal(anyhow::anyhow!(e)))?;
-                    sessions::set_master_agent(&mut *tx, &session_id, Some(new_id), now)
-                        .await
-                        .map_err(|e| ToolError::Internal(anyhow::anyhow!(e)))?;
-                    new_id
-                }
-            } else {
-                // No master yet — claim it.
-                let new_id =
-                    agents::insert(&mut *tx, &session_id, agents::Role::Master, &label, now)
-                        .await
-                        .map_err(|e| ToolError::Internal(anyhow::anyhow!(e)))?;
-                sessions::set_master_agent(&mut *tx, &session_id, Some(new_id), now)
-                    .await
-                    .map_err(|e| ToolError::Internal(anyhow::anyhow!(e)))?;
-                new_id
-            };
-            // Repo_root must match across re-registrations.
-            if session.repo_root != repo_root_str {
-                return Err(ToolError::Forbidden(format!(
-                    "session `{}` was created against repo `{}` but caller cwd resolves to `{}`",
-                    session_id, session.repo_root, repo_root_str
-                )));
-            }
-            // sessions.plan_file_path is updated atomically inside observe() below.
-            // Touch updated_at to reflect the master ping.
-            sessions::touch_updated_at(&mut *tx, &session_id, now)
-                .await
-                .map_err(|e| ToolError::Internal(anyhow::anyhow!(e)))?;
-            agents::fetch_by_label(&state.pool, &session_id, &label)
-                .await
-                .map_err(|e| ToolError::Internal(anyhow::anyhow!(e)))?
-                .map(|a| a.id)
-                .unwrap_or(0)
-        }
-    };
-    tx.commit()
-        .await
-        .map_err(|e| ToolError::Internal(anyhow::anyhow!(e)))?;
-    let _ = agent_id; // currently used only via FK; reserved for future need.
+    }
+
+    upsert_seen_with_event(state, &session_id, &label, now).await?;
 
     // Feed the lifecycle observation. This handles path-update inside the
     // same transaction as the reducer's effects + watcher switch.
@@ -225,7 +147,7 @@ pub async fn register_plan_file(
         .lifecycle
         .observe(
             &session_id,
-            &format!("master:{label}"),
+            &format!("agent:{label}"),
             Observation::PlanRegistered {
                 path: PlanFilePath::from(plan_path_str.clone()),
                 body,
@@ -235,10 +157,9 @@ pub async fn register_plan_file(
         .await
         .map_err(map_lifecycle_err)?;
 
-    // The first effect (if any) tells the caller which plan/revision was started or extended.
-    // On a same-body no-op the reducer emits no effects; we fall back to the
-    // current active plan's (plan_id, latest revision_id) so an idempotent
-    // re-registration returns the actual identifiers rather than sentinels.
+    // On a same-body no-op the reducer emits no effects; fall back to the
+    // current active plan's (plan_id, latest revision_id) so idempotent
+    // re-registration returns the actual identifiers.
     let from_effects = outcome.apply.items.iter().find_map(|e| match e {
         AppliedEffect::Started {
             plan_id,
@@ -254,7 +175,6 @@ pub async fn register_plan_file(
     let (plan_id, revision_id) = match from_effects {
         Some(v) => v,
         None => {
-            // Same-body no-op: look up the current active plan's latest revision.
             let active = crate::storage::plans::load_active_plan(&state.pool, &session_id)
                 .await
                 .map_err(|e| match e {
@@ -293,14 +213,28 @@ pub async fn register_implementation_commit(
     let args: RegisterImplementationCommitArgs = serde_json::from_value(req.arguments.clone())
         .map_err(|e| ToolError::Invalid(format!("invalid args: {e}")))?;
     let session_id = sessions::validate_slug(&args.session_id).map_err(ToolError::Invalid)?;
-    let label = require_label(req)?;
-    require_master(state, &session_id, &label).await?;
 
+    let label_opt = args
+        .label
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| AgentLabel::from(s.to_string()));
+
+    // Validate session existence BEFORE upserting the agent row — otherwise
+    // an unknown session_id surfaces as a 500 (FK violation) instead of the
+    // clean 404 we want, and a non-existent session ends up with a phantom
+    // agents row that the user never wrote to.
     let session = sessions::fetch(&state.pool, &session_id)
         .await
         .map_err(|e| ToolError::Internal(anyhow::anyhow!(e)))?
         .ok_or_else(|| ToolError::NotFound(format!("session {session_id} not found")))?;
     let repo = Path::new(&session.repo_root).to_path_buf();
+
+    let now = chrono::Utc::now().timestamp();
+    if let Some(label) = label_opt.as_ref() {
+        upsert_seen_with_event(state, &session_id, label, now).await?;
+    }
 
     let full_sha = git::resolve_to_full_sha(&repo, &args.commit_sha)
         .await
@@ -348,13 +282,14 @@ pub async fn register_implementation_commit(
         is_head,
     };
 
+    let actor = match label_opt.as_ref() {
+        Some(l) => format!("agent:{l}"),
+        None => "external".to_string(),
+    };
+
     let outcome = state
         .lifecycle
-        .observe(
-            &session_id,
-            &format!("master:{label}"),
-            Observation::CommitObserved { commit },
-        )
+        .observe(&session_id, &actor, Observation::CommitObserved { commit })
         .await
         .map_err(map_lifecycle_err)?;
 
@@ -382,8 +317,6 @@ pub async fn get_current_feedback(
     let args: GetCurrentFeedbackArgs = serde_json::from_value(req.arguments.clone())
         .map_err(|e| ToolError::Invalid(format!("invalid args: {e}")))?;
     let session_id = sessions::validate_slug(&args.session_id).map_err(ToolError::Invalid)?;
-    let label = require_label(req)?;
-    require_master(state, &session_id, &label).await?;
 
     let filter = match args.target_kind.as_deref().map(str::trim) {
         None | Some("") => None,
@@ -393,11 +326,27 @@ pub async fn get_current_feedback(
         ),
     };
 
+    // Call the service FIRST so an unknown session_id returns the clean
+    // NotFound from current_feedback rather than an FK-violation 500 from
+    // the agents upsert below. The shim's per-tool autofill means `label`
+    // is frequently present even when the caller didn't think about it,
+    // so this ordering matters for ergonomic typos / cross-session polls.
     let view = state
         .lifecycle
         .current_feedback(&session_id, filter)
         .await
         .map_err(map_service_err)?;
+
+    if let Some(label) = args
+        .label
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        let label = AgentLabel::from(label.to_string());
+        let now = chrono::Utc::now().timestamp();
+        upsert_seen_with_event(state, &session_id, &label, now).await?;
+    }
 
     Ok(match view {
         CurrentFeedbackView::NoActivePlan { session_id } => json!({
@@ -446,40 +395,43 @@ pub async fn get_current_feedback(
 
 // ------------- helpers -------------
 
-pub(crate) fn require_label(req: &ToolCallRequest) -> Result<AgentLabel, ToolError> {
-    req.label
-        .clone()
-        .filter(|s| !s.trim().is_empty())
-        .map(AgentLabel::from)
-        .ok_or_else(|| {
-            ToolError::Forbidden(
-                "this tool requires a label; call register_plan_file or join_session first".into(),
-            )
-        })
-}
-
-pub(crate) async fn require_master(
+/// Upsert `agents.last_seen` for `(session_id, label)`. On the first
+/// insert ever, emit one `agent_joined` audit event. Used by both write
+/// tools (`register_plan_file`, `register_implementation_commit`,
+/// `put_feedback`) and read tools (`get_current_feedback`,
+/// `get_review_context`). The plan invariant is "exactly once per
+/// `(session_id, label)`", which means even first-seen-via-read counts.
+///
+/// **This helper never touches `sessions.updated_at`.** Write tools
+/// already bump `updated_at` elsewhere (via the apply layer or their own
+/// explicit calls); the read path must not, so polling doesn't churn the
+/// session list / future SSE timeline.
+pub(crate) async fn upsert_seen_with_event(
     state: &AppState,
-    session_id: &SessionId,
+    session_id: &crate::lifecycle::SessionId,
     label: &AgentLabel,
-) -> Result<agents::Agent, ToolError> {
-    let agent = agents::fetch_by_label(&state.pool, session_id, label)
+    now: i64,
+) -> Result<(), ToolError> {
+    let outcome = agents::upsert_seen(&state.pool, session_id, label, now)
         .await
-        .map_err(|e| ToolError::Internal(anyhow::anyhow!(e)))?
-        .ok_or_else(|| {
-            ToolError::Forbidden(format!(
-                "no agent `{label}` on session `{session_id}`; call register_plan_file first"
-            ))
-        })?;
-    if agent.role != "master" {
-        return Err(ToolError::Forbidden(format!(
-            "label `{label}` joined as {} on session `{session_id}`; only the master can run this tool",
-            agent.role
-        )));
+        .map_err(|e| ToolError::Internal(anyhow::anyhow!(e)))?;
+    if outcome == SeenOutcome::Inserted {
+        ev_store::append(
+            &state.pool,
+            session_id,
+            None,
+            None,
+            None,
+            EventKind::AgentJoined.as_str(),
+            &format!("agent:{label}"),
+            &json!({ "label": label.as_str() }),
+            None,
+            now,
+        )
+        .await
+        .map_err(|e| ToolError::Internal(anyhow::anyhow!(e)))?;
     }
-    let now = chrono::Utc::now().timestamp();
-    let _ = agents::touch_last_seen(&state.pool, agent.id, now).await;
-    Ok(agent)
+    Ok(())
 }
 
 pub(crate) fn map_lifecycle_err(err: crate::daemon::LifecycleServiceError) -> ToolError {

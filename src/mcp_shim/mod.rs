@@ -15,7 +15,6 @@ use rmcp::transport::io::stdio;
 use serde::Deserialize;
 use serde_json::{Map, Value};
 
-use crate::domain::AgentRole;
 use crate::tools::ToolDescriptor;
 
 #[derive(Args, Debug, Clone)]
@@ -68,7 +67,7 @@ pub async fn run(args: McpArgs) -> anyhow::Result<()> {
         cwd,
         client,
         descriptors,
-        binding: Arc::new(Mutex::new(None)),
+        cached_label: Arc::new(Mutex::new(None)),
     };
 
     let service = handler.serve(stdio()).await?;
@@ -167,24 +166,17 @@ fn trinity_home() -> anyhow::Result<PathBuf> {
     Ok(PathBuf::from(home).join(".trinity"))
 }
 
-/// Identity the shim has cached after a successful register/join. The shim
-/// refuses to forward tool calls whose `session_id` argument doesn't match
-/// `session_id` here — clients can't accidentally cross-pollinate two
-/// sessions from one shell.
-#[derive(Debug, Clone)]
-struct BoundAgent {
-    session_id: String,
-    label: String,
-    role: AgentRole,
-}
-
 #[derive(Clone)]
 struct ShimHandler {
     daemon: String,
     cwd: PathBuf,
     client: reqwest::Client,
     descriptors: Vec<ToolDescriptor>,
-    binding: Arc<Mutex<Option<BoundAgent>>>,
+    /// Last label observed flowing through any tool call (caller-supplied
+    /// `label` or `author_label` argument). Used as a per-tool fallback so
+    /// the agent doesn't have to repeat `label` on every call. Not a
+    /// session binding — cross-session calls are not refused.
+    cached_label: Arc<Mutex<Option<String>>>,
 }
 
 #[derive(Deserialize)]
@@ -192,57 +184,51 @@ struct ToolCallEnvelope {
     result: Value,
 }
 
+/// Which argument key (if any) holds the agent's label for this tool.
+/// Used both for autofill (cache → arguments) and for cache update
+/// (arguments → cache).
+fn label_arg_for(tool: &str) -> Option<&'static str> {
+    match tool {
+        "put_feedback" => Some("author_label"),
+        "register_plan_file"
+        | "register_implementation_commit"
+        | "get_current_feedback"
+        | "get_review_context" => Some("label"),
+        _ => None,
+    }
+}
+
 impl ShimHandler {
-    fn current_binding(&self) -> Option<BoundAgent> {
-        self.binding.lock().unwrap().clone()
+    fn cached_label(&self) -> Option<String> {
+        self.cached_label.lock().unwrap().clone()
     }
 
-    fn set_binding(&self, binding: BoundAgent) {
-        *self.binding.lock().unwrap() = Some(binding);
+    fn set_cached_label(&self, label: String) {
+        *self.cached_label.lock().unwrap() = Some(label);
     }
 
-    /// Returns Err with a user-facing message if the tool argument's
-    /// `session_id` (when present) conflicts with the shim's cached binding.
-    /// The daemon also does its own `(session_id, label)` check; this is a
-    /// client-side guard that prevents accidental cross-session calls.
-    fn check_session_consistency(&self, tool: &str, arguments: &Value) -> Result<(), String> {
-        // Tools that may legitimately be called before binding or that operate
-        // without a session_id: list_sessions, echo_cwd. Bind-creating tools
-        // (register_plan_file, join_session) require no pre-existing binding —
-        // we keep the model 1 shell = 1 session.
-        let arg_session_id = arguments.get("session_id").and_then(|v| v.as_str());
-        let bound = self.current_binding();
-        match (tool, &bound) {
-            ("register_plan_file" | "join_session", Some(b)) => Err(format!(
-                "this shell is already bound to session `{}` as {} `{}`; one shell binds to one \
-                 (session, role). Open a new terminal to act on a different session.",
-                b.session_id,
-                b.role.as_str(),
-                b.label,
-            )),
-            ("list_sessions" | "echo_cwd", _) => Ok(()),
-            (_, None) => Ok(()),
-            (_, Some(b)) => {
-                if let Some(arg_id) = arg_session_id
-                    && arg_id != b.session_id
-                {
-                    return Err(format!(
-                        "tool `{tool}` was called with session_id `{arg_id}` but this shell is \
-                         bound to `{}`; refusing to forward. Use the bound session or open a new \
-                         terminal.",
-                        b.session_id
-                    ));
-                }
-                Ok(())
-            }
+    /// Merge the cached label into `arguments[key]` if the caller omitted
+    /// it. Returns the (possibly modified) arguments. Tools with no label
+    /// argument pass through unchanged.
+    fn fill_label_from_cache(&self, tool: &str, mut arguments: Value) -> Value {
+        let Some(key) = label_arg_for(tool) else {
+            return arguments;
+        };
+        if arguments.get(key).and_then(|v| v.as_str()).is_some() {
+            return arguments;
         }
+        let Some(label) = self.cached_label() else {
+            return arguments;
+        };
+        if let Value::Object(ref mut map) = arguments {
+            map.insert(key.to_string(), Value::String(label));
+        }
+        arguments
     }
 
     async fn forward(&self, tool: &str, arguments: Value) -> Result<Value, ShimError> {
-        let label = self.current_binding().map(|b| b.label);
         let body = serde_json::json!({
             "cwd": self.cwd,
-            "label": label,
             "tool": tool,
             "arguments": arguments,
         });
@@ -306,11 +292,11 @@ impl ServerHandler for ShimHandler {
             },
             instructions: Some(
                 "Trinity coordinates multi-agent peer review around watched plan files \
-                 and registered git commits. Start by calling `list_sessions` (reviewer) \
-                 or `register_plan_file` (master). After register_plan_file or \
-                 join_session, this shim is bound to a (session_id, label, role) for the \
-                 lifetime of the MCP connection — calls with a different session_id are \
-                 refused. To act on a different session, open a new terminal."
+                 and registered git commits. Start by calling `list_sessions` to discover \
+                 sessions or `register_plan_file` to create one. There is no master / \
+                 reviewer role and no per-shell session binding: any caller may call any \
+                 tool with any `session_id`. The shim caches the last `label` / \
+                 `author_label` you passed so subsequent calls don't need to repeat it."
                     .into(),
             ),
         }
@@ -357,30 +343,20 @@ impl ServerHandler for ShimHandler {
         let tool = request.name.to_string();
         let arguments = request.arguments.map(Value::Object).unwrap_or(Value::Null);
 
-        if let Err(msg) = self.check_session_consistency(&tool, &arguments) {
-            return Ok(CallToolResult::error(vec![Content::text(msg)]));
-        }
+        // Per-tool fallback: if the caller didn't supply `label` /
+        // `author_label` for a tool that takes one, fill in the last value
+        // we saw. No cross-session refusal.
+        let filled = self.fill_label_from_cache(&tool, arguments.clone());
 
-        match self.forward(&tool, arguments.clone()).await {
+        match self.forward(&tool, filled.clone()).await {
             Ok(result) => {
-                // Bind on successful register_plan_file / join_session.
-                let role_for_tool = match tool.as_str() {
-                    "register_plan_file" => Some(AgentRole::Master),
-                    "join_session" => Some(AgentRole::Reviewer),
-                    _ => None,
-                };
-                if let Some(role) = role_for_tool
-                    && let (Some(label), Some(session_id)) = (
-                        arguments.get("label").and_then(|v| v.as_str()),
-                        arguments.get("session_id").and_then(|v| v.as_str()),
-                    )
-                    && result.get("session_id").is_some()
+                // Cache update: store whichever label key actually went on
+                // the wire (caller-supplied or cache-supplied) so the next
+                // call inherits it.
+                if let Some(key) = label_arg_for(&tool)
+                    && let Some(label) = filled.get(key).and_then(|v| v.as_str())
                 {
-                    self.set_binding(BoundAgent {
-                        session_id: session_id.to_string(),
-                        label: label.to_string(),
-                        role,
-                    });
+                    self.set_cached_label(label.to_string());
                 }
                 Ok(CallToolResult::structured(result))
             }

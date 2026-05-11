@@ -177,3 +177,43 @@ async fn no_active_session_drift_does_not_start_plan() {
         .unwrap();
     assert_eq!(total, 2, "1 archived + 1 new active");
 }
+
+/// `agents.last_seen` must survive a daemon restart. The column is the
+/// UI's "agents seen recently" data; without persistence across restart
+/// the widget would render every agent as stale-since-the-epoch.
+#[tokio::test]
+async fn agents_last_seen_survives_restart() {
+    let app = TestApp::spawn().await;
+    let plan_path = app.repo.join("plan.md");
+    std::fs::write(&plan_path, "# body\n").unwrap();
+    app.call(
+        "register_plan_file",
+        &app.repo,
+        None,
+        json!({"session_id": "s", "path": &plan_path, "label": "alice"}),
+    )
+    .await
+    .unwrap();
+    let before: i64 = sqlx::query_scalar(
+        "SELECT last_seen FROM agents WHERE session_id = 's' AND label = 'alice'",
+    )
+    .fetch_one(&app.state.pool)
+    .await
+    .unwrap();
+    assert!(before > 0);
+
+    let app = app.restart().await;
+
+    let after: i64 = sqlx::query_scalar(
+        "SELECT last_seen FROM agents WHERE session_id = 's' AND label = 'alice'",
+    )
+    .fetch_one(&app.state.pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        after, before,
+        "agents.last_seen must not be reset on daemon restart"
+    );
+    // Silence dead-code lint for unused import when only this test uses make_commit.
+    let _ = make_commit;
+}

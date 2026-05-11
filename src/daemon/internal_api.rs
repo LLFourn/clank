@@ -13,15 +13,12 @@ use crate::tools::{ToolDescriptor, ToolError, dispatch};
 /// `cwd` is the shim's launch directory (used to derive `repo_root` for
 /// `register_plan_file` and to scope `list_sessions`).
 ///
-/// `label` is `Some(...)` once the shim has cached a binding from a
-/// successful `register_plan_file` (master) or `join_session` (reviewer).
-/// It is the agent's self-declared identity; `(session_id_from_args, label)`
-/// uniquely picks an `agents` row.
+/// Agent identity (`label` / `author_label`) is carried inside `arguments`,
+/// not on the envelope. The shim is responsible for filling those in from
+/// its cache before forwarding.
 #[derive(Debug, Deserialize)]
 pub struct ToolCallRequest {
     pub cwd: PathBuf,
-    #[serde(default)]
-    pub label: Option<String>,
     pub tool: String,
     pub arguments: serde_json::Value,
 }

@@ -14,8 +14,7 @@ use crate::storage::sessions::Session;
 
 pub struct SessionRow {
     pub session: Session,
-    pub master_label: Option<String>,
-    pub reviewer_labels: Vec<String>,
+    pub recent_agents: Vec<String>,
     pub active_plan_state: Option<String>,
     pub plan_feedback_count: i64,
     pub impl_feedback_count: i64,
@@ -28,7 +27,7 @@ pub fn home(rows: &[SessionRow]) -> Markup {
             h1 { "Sessions" }
             @if rows.is_empty() {
                 p.empty {
-                    "No sessions yet. From a master agent, call "
+                    "No sessions yet. From an agent, call "
                     code { "register_plan_file" } " with a `session_id` slug to create one."
                 }
             }
@@ -40,8 +39,7 @@ pub fn home(rows: &[SessionRow]) -> Markup {
                             th { "Title" }
                             th { "Plan path" }
                             th { "Repo" }
-                            th { "Master" }
-                            th { "Reviewers" }
+                            th { "Agents" }
                             th { "Active plan" }
                             th.num { "Plan fb" }
                             th.num { "Impl fb" }
@@ -55,8 +53,7 @@ pub fn home(rows: &[SessionRow]) -> Markup {
                                 td { (row.session.display_title.clone().unwrap_or_default()) }
                                 td.path { (row.session.plan_file_path) }
                                 td.path { (row.session.repo_root) }
-                                td { (row.master_label.clone().unwrap_or_else(|| "—".into())) }
-                                td { (reviewer_summary(&row.reviewer_labels)) }
+                                td { (agent_summary(&row.recent_agents)) }
                                 td { (active_plan_badge(row.active_plan_state.as_deref())) }
                                 td.num { (row.plan_feedback_count) }
                                 td.num { (row.impl_feedback_count) }
@@ -173,7 +170,6 @@ impl TimelineItem {
                     .and_then(|v| v.as_str())
                     .unwrap_or("")
             ),
-            "master_evicted" => "master evicted by curator".to_string(),
             "plan_file_missing" => "plan file went missing".to_string(),
             other => other.to_string(),
         };
@@ -247,9 +243,6 @@ pub fn session_detail(d: &SessionDetail) -> Markup {
                 form.inline method="post" action={ "/sessions/" (session_id) "/rename" } {
                     input type="text" name="display_title" placeholder="new display title" required;
                     button type="submit" { "Rename" }
-                }
-                form method="post" action={ "/sessions/" (session_id) "/evict-master" } onsubmit="return confirm('Evict the current master agent?')" {
-                    button.warning type="submit" { "Evict master" }
                 }
             }
             section.meta {
@@ -581,7 +574,6 @@ fn agents_widget(agents: &[Agent]) -> Markup {
         ul.agents {
             @for a in agents {
                 li {
-                    span.role { (a.role) ": " }
                     span.label { (a.label) }
                     " " (relative_time(Some(a.last_seen)))
                 }
@@ -590,7 +582,7 @@ fn agents_widget(agents: &[Agent]) -> Markup {
     }
 }
 
-fn reviewer_summary(labels: &[String]) -> String {
+fn agent_summary(labels: &[String]) -> String {
     if labels.is_empty() {
         "—".to_string()
     } else {

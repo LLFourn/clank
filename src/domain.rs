@@ -90,21 +90,6 @@ impl std::fmt::Display for FeedbackTargetRef {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum AgentRole {
-    Master,
-    Reviewer,
-}
-
-impl AgentRole {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            AgentRole::Master => "master",
-            AgentRole::Reviewer => "reviewer",
-        }
-    }
-}
-
 /// Event kinds emitted by the apply layer and the service. The DB stores
 /// the string; this enum keeps call sites honest.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -117,9 +102,8 @@ pub enum EventKind {
     // Feedback (emitted by SessionService::put_feedback)
     FeedbackAdded,
     FeedbackUpdated,
-    // Session/agent metadata (emitted by curator + master tools)
+    // Session/agent metadata
     AgentJoined,
-    MasterEvicted,
     Renamed,
     PlanFileMissing,
     HumanComment,
@@ -135,7 +119,6 @@ impl EventKind {
             EventKind::FeedbackAdded => "feedback_added",
             EventKind::FeedbackUpdated => "feedback_updated",
             EventKind::AgentJoined => "agent_joined",
-            EventKind::MasterEvicted => "master_evicted",
             EventKind::Renamed => "renamed",
             EventKind::PlanFileMissing => "plan_file_missing",
             EventKind::HumanComment => "human_comment",

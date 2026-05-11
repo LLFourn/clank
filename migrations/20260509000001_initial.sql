@@ -2,11 +2,10 @@
 -- for the identity model and required invariants.
 
 CREATE TABLE sessions (
-    id TEXT PRIMARY KEY,                         -- master-chosen URL-safe slug
+    id TEXT PRIMARY KEY,                         -- caller-chosen URL-safe slug
     repo_root TEXT NOT NULL,
     plan_file_path TEXT NOT NULL,                -- current watched file
     display_title TEXT,
-    master_agent_id INTEGER REFERENCES agents(id),
     active_plan_id INTEGER REFERENCES plans(id), -- NULL when no active lifecycle
     created_at INTEGER NOT NULL,
     updated_at INTEGER NOT NULL,
@@ -57,7 +56,6 @@ CREATE INDEX impl_revisions_plan ON implementation_revisions(plan_id, id);
 CREATE TABLE agents (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
-    role TEXT NOT NULL CHECK (role IN ('master', 'reviewer')),
     label TEXT NOT NULL,
     first_seen INTEGER NOT NULL,
     last_seen INTEGER NOT NULL,

@@ -1,5 +1,9 @@
-//! Reviewer MCP tools: list_sessions, join_session, get_review_context,
+//! Feedback + read-context MCP tools: list_sessions, get_review_context,
 //! put_feedback.
+//!
+//! There is no `join_session` and no master/reviewer role check. `put_feedback`
+//! takes `author_label` as a required argument; other tools take an optional
+//! `label` for `agents.last_seen` attribution.
 
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -10,24 +14,20 @@ use crate::daemon::internal_api::ToolCallRequest;
 use crate::domain::{FeedbackTargetRef, TargetKind};
 use crate::lifecycle::{AgentLabel, CommitSha, SessionId};
 use crate::storage::{
-    agents, events as ev_store, feedback as feedback_store, implementation_revisions as impl_revs,
-    plan_revisions, plans, sessions,
+    agents, feedback as feedback_store, implementation_revisions as impl_revs, plan_revisions,
+    plans, sessions,
 };
 
 use super::ToolError;
-use super::master::{map_service_err, require_label};
-
-#[derive(Debug, Deserialize)]
-struct JoinSessionArgs {
-    session_id: String,
-    label: String,
-}
+use super::master::{map_service_err, upsert_seen_with_event};
 
 #[derive(Debug, Deserialize)]
 struct GetReviewContextArgs {
     session_id: String,
     #[serde(default)]
     target: Option<String>,
+    #[serde(default)]
+    label: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -36,6 +36,7 @@ struct PutFeedbackArgs {
     target_kind: String,
     target_id: String,
     body: String,
+    author_label: String,
 }
 
 pub async fn list_sessions(state: &AppState, req: &ToolCallRequest) -> Result<Value, ToolError> {
@@ -61,15 +62,7 @@ pub async fn list_sessions(state: &AppState, req: &ToolCallRequest) -> Result<Va
         let agents_for = agents::list_for_session(&state.pool, &sid)
             .await
             .map_err(|e| ToolError::Internal(anyhow::anyhow!(e)))?;
-        let master_label = agents_for
-            .iter()
-            .find(|a| a.role == "master")
-            .map(|a| a.label.clone());
-        let reviewer_labels: Vec<String> = agents_for
-            .iter()
-            .filter(|a| a.role == "reviewer")
-            .map(|a| a.label.clone())
-            .collect();
+        let recent_agents: Vec<String> = agents_for.iter().map(|a| a.label.clone()).collect();
         let (plan_fb, impl_fb) = active_feedback_counts(state, &sid).await?;
         out.push(json!({
             "session_id": s.id,
@@ -78,82 +71,13 @@ pub async fn list_sessions(state: &AppState, req: &ToolCallRequest) -> Result<Va
             "repo_root": s.repo_root,
             "has_active_plan": s.active_plan_id.is_some(),
             "active_plan_id": s.active_plan_id,
-            "master_label": master_label,
-            "joined_reviewer_labels": reviewer_labels,
+            "recent_agents": recent_agents,
             "updated_at": s.updated_at,
             "plan_feedback_count": plan_fb,
             "impl_feedback_count": impl_fb,
         }));
     }
     Ok(json!({"scope_repo_root": scope, "sessions": out}))
-}
-
-pub async fn join_session(state: &AppState, req: &ToolCallRequest) -> Result<Value, ToolError> {
-    let args: JoinSessionArgs = serde_json::from_value(req.arguments.clone())
-        .map_err(|e| ToolError::Invalid(format!("invalid args: {e}")))?;
-    let session_id = sessions::validate_slug(&args.session_id).map_err(ToolError::Invalid)?;
-    let label = AgentLabel::from(args.label.trim().to_string());
-    if label.as_str().is_empty() {
-        return Err(ToolError::Invalid("label must be non-empty".into()));
-    }
-    let session = sessions::fetch(&state.pool, &session_id)
-        .await
-        .map_err(|e| ToolError::Internal(anyhow::anyhow!(e)))?
-        .ok_or_else(|| ToolError::NotFound(format!("session `{session_id}` not found")))?;
-
-    if let Some(existing) = agents::fetch_by_label(&state.pool, &session_id, &label)
-        .await
-        .map_err(|e| ToolError::Internal(anyhow::anyhow!(e)))?
-    {
-        if existing.role != "reviewer" {
-            return Err(ToolError::Forbidden(format!(
-                "label `{label}` is already a {} on session `{session_id}`",
-                existing.role
-            )));
-        }
-        let now = chrono::Utc::now().timestamp();
-        let _ = agents::touch_last_seen(&state.pool, existing.id, now).await;
-        return Ok(json!({
-            "session_id": session_id.as_str(),
-            "has_active_plan": session.active_plan_id.is_some(),
-            "joined": "existing",
-        }));
-    }
-
-    let now = chrono::Utc::now().timestamp();
-    let mut tx = state
-        .pool
-        .begin()
-        .await
-        .map_err(|e| ToolError::Internal(anyhow::anyhow!(e)))?;
-    let _ = agents::insert(&mut *tx, &session_id, agents::Role::Reviewer, &label, now)
-        .await
-        .map_err(|e| ToolError::Internal(anyhow::anyhow!(e)))?;
-    ev_store::append(
-        &mut *tx,
-        &session_id,
-        None,
-        None,
-        None,
-        crate::domain::EventKind::AgentJoined.as_str(),
-        &format!("reviewer:{label}"),
-        &json!({"role": "reviewer", "label": label.as_str()}),
-        None,
-        now,
-    )
-    .await
-    .map_err(|e| ToolError::Internal(anyhow::anyhow!(e)))?;
-    sessions::touch_updated_at(&mut *tx, &session_id, now)
-        .await
-        .map_err(|e| ToolError::Internal(anyhow::anyhow!(e)))?;
-    tx.commit()
-        .await
-        .map_err(|e| ToolError::Internal(anyhow::anyhow!(e)))?;
-    Ok(json!({
-        "session_id": session_id.as_str(),
-        "has_active_plan": session.active_plan_id.is_some(),
-        "joined": "new",
-    }))
 }
 
 pub async fn get_review_context(
@@ -163,20 +87,33 @@ pub async fn get_review_context(
     let args: GetReviewContextArgs = serde_json::from_value(req.arguments.clone())
         .map_err(|e| ToolError::Invalid(format!("invalid args: {e}")))?;
     let session_id = sessions::validate_slug(&args.session_id).map_err(ToolError::Invalid)?;
-    let label = require_label(req)?;
-    require_joined(state, &session_id, &label).await?;
 
+    // Verify the session exists BEFORE upserting agents — otherwise an
+    // unknown session_id (typo / cross-session poll with cache-filled
+    // label) hits the agents.session_id FK and returns 500 instead of the
+    // intended 404.
     let session = sessions::fetch(&state.pool, &session_id)
         .await
         .map_err(|e| ToolError::Internal(anyhow::anyhow!(e)))?
         .ok_or_else(|| ToolError::NotFound(format!("session `{session_id}` not found")))?;
+
+    if let Some(label) = args
+        .label
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        let label = AgentLabel::from(label.to_string());
+        let now = chrono::Utc::now().timestamp();
+        upsert_seen_with_event(state, &session_id, &label, now).await?;
+    }
 
     let agents_for = agents::list_for_session(&state.pool, &session_id)
         .await
         .map_err(|e| ToolError::Internal(anyhow::anyhow!(e)))?;
     let joined_agents: Vec<Value> = agents_for
         .iter()
-        .map(|a| json!({"role": a.role, "label": a.label}))
+        .map(|a| json!({ "label": a.label, "last_seen": a.last_seen }))
         .collect();
 
     let active_plan = match plans::load_active_plan(&state.pool, &session_id).await {
@@ -295,14 +232,11 @@ pub async fn put_feedback(state: &AppState, req: &ToolCallRequest) -> Result<Val
     let args: PutFeedbackArgs = serde_json::from_value(req.arguments.clone())
         .map_err(|e| ToolError::Invalid(format!("invalid args: {e}")))?;
     let session_id = sessions::validate_slug(&args.session_id).map_err(ToolError::Invalid)?;
-    let label = require_label(req)?;
-    let agent = require_joined(state, &session_id, &label).await?;
-    if agent.role != "reviewer" {
-        return Err(ToolError::Forbidden(format!(
-            "label `{label}` joined as {} — only reviewers can post feedback",
-            agent.role
-        )));
+    let author_label_trim = args.author_label.trim();
+    if author_label_trim.is_empty() {
+        return Err(ToolError::Invalid("author_label must be non-empty".into()));
     }
+    let author_label = AgentLabel::from(author_label_trim.to_string());
 
     let kind = TargetKind::parse(&args.target_kind).ok_or_else(|| {
         ToolError::Invalid(format!(
@@ -322,11 +256,17 @@ pub async fn put_feedback(state: &AppState, req: &ToolCallRequest) -> Result<Val
         }
     };
 
+    // Validate the feedback write before touching the agents table:
+    // rejected calls (no active plan, target not in active plan, empty
+    // body) must not leave a phantom agent_joined event behind.
     let outcome = state
         .lifecycle
-        .put_feedback(&session_id, &label, target, args.body)
+        .put_feedback(&session_id, &author_label, target, args.body)
         .await
         .map_err(map_service_err)?;
+
+    let now = chrono::Utc::now().timestamp();
+    upsert_seen_with_event(state, &session_id, &author_label, now).await?;
 
     Ok(json!({
         "feedback_id": outcome.record.id,
@@ -336,24 +276,6 @@ pub async fn put_feedback(state: &AppState, req: &ToolCallRequest) -> Result<Val
         "created_at": outcome.record.created_at,
         "updated_at": outcome.record.updated_at,
     }))
-}
-
-async fn require_joined(
-    state: &AppState,
-    session_id: &SessionId,
-    label: &AgentLabel,
-) -> Result<agents::Agent, ToolError> {
-    let agent = agents::fetch_by_label(&state.pool, session_id, label)
-        .await
-        .map_err(|e| ToolError::Internal(anyhow::anyhow!(e)))?
-        .ok_or_else(|| {
-            ToolError::Forbidden(format!(
-                "label `{label}` is not joined to session `{session_id}`; call join_session or register_plan_file first"
-            ))
-        })?;
-    let now = chrono::Utc::now().timestamp();
-    let _ = agents::touch_last_seen(&state.pool, agent.id, now).await;
-    Ok(agent)
 }
 
 async fn active_feedback_counts(
