@@ -99,6 +99,7 @@ pub enum EventKind {
     ImplRevisionCreated,
     StateTransition,
     DirtyWorktreeWarning,
+    HeadResetToKnownSha,
     // Feedback (emitted by SessionService::put_feedback)
     FeedbackAdded,
     FeedbackUpdated,
@@ -116,6 +117,7 @@ impl EventKind {
             EventKind::ImplRevisionCreated => "impl_revision_created",
             EventKind::StateTransition => "state_transition",
             EventKind::DirtyWorktreeWarning => "dirty_worktree_warning",
+            EventKind::HeadResetToKnownSha => "head_reset_to_known_sha",
             EventKind::FeedbackAdded => "feedback_added",
             EventKind::FeedbackUpdated => "feedback_updated",
             EventKind::AgentJoined => "agent_joined",

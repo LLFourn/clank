@@ -6,6 +6,7 @@ use sqlx::{ConnectOptions, SqlitePool};
 pub mod agents;
 pub mod events;
 pub mod feedback;
+pub mod feedback_files;
 pub mod implementation_revisions;
 pub mod plan_revisions;
 pub mod plans;

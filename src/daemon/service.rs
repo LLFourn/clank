@@ -100,12 +100,12 @@ pub enum CurrentFeedbackView {
 
 pub struct SessionService {
     pool: SqlitePool,
-    watcher: Arc<super::watcher::PlanWatcher>,
+    watcher: Arc<super::watcher::Watcher>,
     locks: Mutex<HashMap<SessionId, Arc<Mutex<Option<ActivePlan>>>>>,
 }
 
 impl SessionService {
-    pub fn new(pool: SqlitePool, watcher: Arc<super::watcher::PlanWatcher>) -> Self {
+    pub fn new(pool: SqlitePool, watcher: Arc<super::watcher::Watcher>) -> Self {
         Self {
             pool,
             watcher,
@@ -117,7 +117,7 @@ impl SessionService {
         &self.pool
     }
 
-    pub fn watcher(&self) -> &super::watcher::PlanWatcher {
+    pub fn watcher(&self) -> &super::watcher::Watcher {
         &self.watcher
     }
 
@@ -189,7 +189,7 @@ impl SessionService {
         tx.commit().await?;
 
         if let Some(path) = &path_for_update {
-            self.watcher.switch(session_id, path);
+            self.watcher.switch_plan_file(session_id, path);
         }
 
         *state = decision.new_active.clone();

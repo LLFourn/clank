@@ -1,28 +1,31 @@
--- v0' schema. See /Users/llfourn/.claude/plans/i-want-to-create-jolly-hamming.md
--- for the identity model and required invariants.
+-- v0' schema. See /Users/llfourn/.claude/plans/i-want-to-auto-track-impl-commits.md
+-- for the watcher-coordinator model and required invariants.
+--
+-- This migration is rewritten in place; Trinity is pre-shipped, so there
+-- is no forward/backward compatibility burden. Drop the database to
+-- pick up schema changes.
 
 CREATE TABLE sessions (
-    id TEXT PRIMARY KEY,                         -- caller-chosen URL-safe slug
+    id TEXT PRIMARY KEY,
     repo_root TEXT NOT NULL,
-    plan_file_path TEXT NOT NULL,                -- current watched file
+    plan_file_path TEXT NOT NULL,
     display_title TEXT,
-    active_plan_id INTEGER REFERENCES plans(id), -- NULL when no active lifecycle
+    active_plan_id INTEGER REFERENCES plans(id),
     created_at INTEGER NOT NULL,
     updated_at INTEGER NOT NULL,
-    archived_at INTEGER                          -- session-level archive (column reserved for v1)
+    archived_at INTEGER
 );
 
-CREATE TABLE plans (                              -- one plan-to-implementation lifecycle attempt
+CREATE TABLE plans (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
-    base_commit TEXT NOT NULL,                   -- HEAD at PlanRegistered time
+    base_commit TEXT NOT NULL,
     state TEXT NOT NULL CHECK (state IN ('planning', 'implementing', 'archived')),
     started_at INTEGER NOT NULL,
     archived_at INTEGER
 );
 CREATE INDEX plans_session ON plans(session_id, id);
 
--- Belt-and-suspenders: at most one non-archived plan per session.
 CREATE UNIQUE INDEX one_active_plan_per_session
     ON plans(session_id) WHERE state != 'archived';
 
@@ -63,8 +66,6 @@ CREATE TABLE agents (
 );
 CREATE INDEX agents_session ON agents(session_id);
 
--- Feedback is structural state, not an audit row. One row per
--- (active plan, target, reviewer); repeat posts upsert via put_feedback.
 CREATE TABLE feedback (
     id           INTEGER PRIMARY KEY AUTOINCREMENT,
     session_id   TEXT    NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
@@ -80,10 +81,32 @@ CREATE TABLE feedback (
 CREATE INDEX feedback_plan         ON feedback(plan_id, id);
 CREATE INDEX feedback_session_plan ON feedback(session_id, plan_id, id);
 
+-- Sidecar for files in `<repo_root>/.trinity/feedback/<session_id>/<author_label>.md`.
+-- One row per (session, author). Created on first observation by the
+-- feedback directory watcher; path is fully determined by convention.
+CREATE TABLE feedback_files (
+    session_id   TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+    author_label TEXT NOT NULL,
+    path         TEXT NOT NULL,
+    last_observed_hash TEXT,
+    last_observed_at   INTEGER,
+    last_ingested_hash TEXT,
+    last_ingested_at   INTEGER,
+    last_ingested_target_kind TEXT
+        CHECK (last_ingested_target_kind IS NULL
+               OR last_ingested_target_kind IN ('plan_revision','implementation_commit')),
+    last_ingested_target_id TEXT,
+    parse_error TEXT,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL,
+    PRIMARY KEY (session_id, author_label)
+);
+CREATE INDEX feedback_files_session ON feedback_files(session_id);
+
 CREATE TABLE events (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
-    plan_id INTEGER REFERENCES plans(id) ON DELETE CASCADE,  -- NULL for session-scoped events
+    plan_id INTEGER REFERENCES plans(id) ON DELETE CASCADE,
     target_kind TEXT CHECK (target_kind IS NULL OR target_kind IN ('plan_revision', 'implementation_commit')),
     target_id TEXT,
     ts INTEGER NOT NULL,

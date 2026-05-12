@@ -128,3 +128,16 @@ pub async fn worktree_porcelain(repo: &Path) -> Result<String, GitError> {
 pub fn short_sha(full: &str) -> String {
     full.chars().take(12).collect()
 }
+
+/// Resolve the path to `logs/HEAD` inside the repo's git directory.
+/// Uses `git rev-parse --git-path logs/HEAD` so worktree setups produce
+/// the worktree's own reflog file rather than the shared `.git/logs/HEAD`.
+pub async fn resolve_git_logs_head(repo: &Path) -> Result<PathBuf, GitError> {
+    let raw = run_git_ok(repo, &["rev-parse", "--git-path", "logs/HEAD"]).await?;
+    let p = PathBuf::from(&raw);
+    if p.is_absolute() {
+        Ok(p)
+    } else {
+        Ok(repo.join(p))
+    }
+}

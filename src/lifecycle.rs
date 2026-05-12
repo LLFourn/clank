@@ -312,27 +312,25 @@ pub fn decide(active: Option<ActivePlan>, obs: Observation) -> Result<Decision, 
             Some(Implementing {
                 base_commit,
                 latest_plan_hash,
-                latest_impl_commit,
+                ..
             }),
             CommitObserved { commit },
         ) => {
-            if commit.sha == latest_impl_commit {
-                Ok(Decision::noop(Some(Implementing {
+            // Always emit the effect; the apply layer is now the
+            // idempotency layer (it checks whether the SHA already exists
+            // for the plan and either INSERTs or emits an audit-only
+            // `head_reset_to_known_sha` event). This is necessary for
+            // reset-to-older-SHA: the reducer cannot tell whether `sha`
+            // is the latest, an older known, or wholly new.
+            let new_impl = commit.sha.clone();
+            Ok(Decision {
+                new_active: Some(Implementing {
                     base_commit,
                     latest_plan_hash,
-                    latest_impl_commit,
-                })))
-            } else {
-                let new_impl = commit.sha.clone();
-                Ok(Decision {
-                    new_active: Some(Implementing {
-                        base_commit,
-                        latest_plan_hash,
-                        latest_impl_commit: new_impl,
-                    }),
-                    effects: vec![Effect::RecordImplementation { commit }],
-                })
-            }
+                    latest_impl_commit: new_impl,
+                }),
+                effects: vec![Effect::RecordImplementation { commit }],
+            })
         }
         (Some(Implementing { .. }), ArchiveRequested) => Ok(Decision {
             new_active: None,
@@ -635,12 +633,15 @@ mod tests {
     }
 
     #[test]
-    fn implementing_plus_commit_same_sha_is_noop() {
+    fn implementing_plus_commit_same_sha_still_emits_effect_for_apply_layer() {
         let p = implementing("body", "base", "abc");
         let c = commit("abc");
-        let d = decide(Some(p.clone()), Observation::CommitObserved { commit: c }).unwrap();
-        assert!(d.effects.is_empty(), "same SHA must be idempotent");
-        assert_eq!(d.new_active, Some(p));
+        let d = decide(Some(p), Observation::CommitObserved { commit: c.clone() }).unwrap();
+        assert_eq!(
+            d.effects,
+            vec![Effect::RecordImplementation { commit: c }],
+            "reducer always emits the effect; apply layer is the idempotency layer (SHA-exists check + head_reset_to_known_sha audit event)"
+        );
     }
 
     #[test]
@@ -724,7 +725,11 @@ mod tests {
             Observation::CommitObserved { commit: c2.clone() },
         )
         .unwrap();
-        assert!(d.effects.is_empty());
+        // Same-SHA re-observation now emits an effect at the reducer
+        // level; the apply layer is responsible for turning that into an
+        // audit-only `head_reset_to_known_sha` event when the SHA is
+        // already present in implementation_revisions.
+        effects_log.extend(d.effects.clone());
         state = d.new_active;
 
         let d = decide(
@@ -755,6 +760,7 @@ mod tests {
                     body: "draft v2".into()
                 },
                 Effect::RecordImplementation { commit: c1 },
+                Effect::RecordImplementation { commit: c2.clone() },
                 Effect::RecordImplementation { commit: c2 },
                 Effect::ArchiveActivePlan,
                 Effect::StartPlan {

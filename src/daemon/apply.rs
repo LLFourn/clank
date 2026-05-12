@@ -29,6 +29,14 @@ pub enum AppliedEffect {
         implementation_revision_id: i64,
         commit_sha: CommitSha,
     },
+    /// HEAD was observed at a SHA already known for this plan
+    /// (e.g. `git reset --hard <earlier-sha>` or HEAD bouncing back
+    /// to the latest impl). No new `implementation_revisions` row;
+    /// a `head_reset_to_known_sha` audit event was appended.
+    HeadResetToKnownSha {
+        plan_id: i64,
+        commit_sha: CommitSha,
+    },
     Archived {
         plan_id: i64,
     },
@@ -137,6 +145,45 @@ pub async fn apply_decision(
             }
             Effect::RecordImplementation { commit } => {
                 let plan_id = active_plan_id.ok_or(ApplyError::EffectWithoutActive)?;
+
+                // SHA-known check (Codex round-2 P1 #1 + round-3 P1 #1):
+                // if this SHA was already observed for this plan, treat as
+                // a reset to a known SHA — audit only, no INSERT, no state
+                // change. `get_context.active_target` resolves the
+                // implementation target by matching git HEAD against the
+                // table, so the read path will correctly point at the
+                // reset target without us having to update any row here.
+                let exists: Option<i64> = sqlx::query_scalar(
+                    "SELECT 1 FROM implementation_revisions WHERE plan_id = ? AND commit_sha = ?",
+                )
+                .bind(plan_id)
+                .bind(commit.sha.as_str())
+                .fetch_optional(&mut **tx)
+                .await?;
+                if exists.is_some() {
+                    ev_store::append(
+                        &mut **tx,
+                        session_id,
+                        Some(plan_id),
+                        Some(TargetKind::ImplementationCommit.as_str()),
+                        Some(commit.sha.as_str()),
+                        EventKind::HeadResetToKnownSha.as_str(),
+                        actor,
+                        &json!({
+                            "branch": commit.branch,
+                            "is_head": commit.is_head,
+                        }),
+                        None,
+                        now,
+                    )
+                    .await?;
+                    items.push(AppliedEffect::HeadResetToKnownSha {
+                        plan_id,
+                        commit_sha: commit.sha.clone(),
+                    });
+                    continue;
+                }
+
                 let implementation_revision_id =
                     impl_revs::append(&mut **tx, plan_id, commit, actor, now).await?;
                 let state: String = sqlx::query_scalar("SELECT state FROM plans WHERE id = ?")
