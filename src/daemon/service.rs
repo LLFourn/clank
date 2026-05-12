@@ -16,7 +16,7 @@ use std::sync::Arc;
 
 use serde_json::json;
 use sqlx::SqlitePool;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, broadcast};
 
 use crate::domain::{
     EventKind, FeedbackFileStatus, FeedbackKind, FeedbackTargetRef, Phase, TargetKind,
@@ -186,15 +186,29 @@ pub struct SessionService {
     pool: SqlitePool,
     watcher: Arc<super::watcher::Watcher>,
     locks: Mutex<HashMap<SessionId, Arc<Mutex<Option<ActivePlan>>>>>,
+    /// Per-session event ping channel. Emits the `SessionId` after every
+    /// `observe` or `put_feedback` call that produced at least one new row in
+    /// `events`. SSE handlers subscribe here and tail the `events` table past
+    /// the cursor on each ping.
+    events_tx: broadcast::Sender<SessionId>,
 }
 
 impl SessionService {
     pub fn new(pool: SqlitePool, watcher: Arc<super::watcher::Watcher>) -> Self {
+        let (events_tx, _) = broadcast::channel(256);
         Self {
             pool,
             watcher,
             locks: Mutex::new(HashMap::new()),
+            events_tx,
         }
+    }
+
+    /// Subscribe to the per-session event ping channel. Pings carry the
+    /// `SessionId` whose event stream advanced; subscribers filter and
+    /// drive their own cursor against the `events` table.
+    pub fn subscribe(&self) -> broadcast::Receiver<SessionId> {
+        self.events_tx.subscribe()
     }
 
     pub fn pool(&self) -> &SqlitePool {
@@ -634,6 +648,13 @@ impl SessionService {
         // that already has an active plan).
         *state = decision.new_active.clone();
 
+        // SSE ping: any apply layer effect lands a row in `events`. The
+        // ping fires after the DB commit so subscribers querying the
+        // cursor will always see the new row.
+        if !apply_outcome.items.is_empty() {
+            let _ = self.events_tx.send(session_id.clone());
+        }
+
         if let Some(path) = &path_for_update {
             // Propagate watcher errors so the caller knows the session
             // isn't fully wired. The cache already matches the DB above,
@@ -836,6 +857,15 @@ impl SessionService {
         // before it, a no-op had nothing to write, so we'd drop the tx.)
         let _ = committed;
         tx.commit().await?;
+
+        // SSE ping: only when this call produced a feedback_added /
+        // feedback_updated row in `events`. A byte-identical no-op
+        // bumps `agents.last_seen` but writes no feedback event row —
+        // skipping the ping keeps the SSE stream quiet for digest
+        // stability and matches the required invariant.
+        if !outcome.was_no_op {
+            let _ = self.events_tx.send(session_id.clone());
+        }
 
         Ok(outcome)
     }

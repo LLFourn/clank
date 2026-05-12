@@ -47,6 +47,44 @@ pub async fn latest_for_plan(
     .await
 }
 
+/// Fetch a revision by id, returning `None` if the id doesn't belong to a
+/// plan under `session_id`. Joins through `plans.session_id` so page handlers
+/// can 404 cross-session revs in one round trip.
+pub async fn fetch_in_session(
+    pool: &SqlitePool,
+    session_id: &str,
+    revision_id: i64,
+) -> sqlx::Result<Option<PlanRevision>> {
+    sqlx::query_as::<_, PlanRevision>(
+        "SELECT pr.* FROM plan_revisions pr \
+         JOIN plans p ON p.id = pr.plan_id \
+         WHERE pr.id = ? AND p.session_id = ?",
+    )
+    .bind(revision_id)
+    .bind(session_id)
+    .fetch_optional(pool)
+    .await
+}
+
+/// The revision immediately preceding `revision_number` in the same plan
+/// (i.e. `revision_number - 1`). Returns `None` for revision #1.
+pub async fn previous_in_plan(
+    pool: &SqlitePool,
+    plan_id: i64,
+    revision_number: i64,
+) -> sqlx::Result<Option<PlanRevision>> {
+    if revision_number <= 1 {
+        return Ok(None);
+    }
+    sqlx::query_as::<_, PlanRevision>(
+        "SELECT * FROM plan_revisions WHERE plan_id = ? AND revision_number = ?",
+    )
+    .bind(plan_id)
+    .bind(revision_number - 1)
+    .fetch_optional(pool)
+    .await
+}
+
 /// Insert a new revision under `plan_id`. Revision number = `max + 1` per plan.
 /// Returns `(new_revision_id, new_revision_number)`.
 pub async fn append(

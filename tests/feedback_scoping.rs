@@ -79,12 +79,10 @@ async fn feedback_does_not_leak_across_archive_to_new_plan() {
     };
     assert_ne!(plan_a, plan_b);
     assert!(feedback.is_empty());
-
-    let body = app.get("/sessions/s").await.text().await.unwrap();
-    assert!(
-        body.contains("No plan feedback yet"),
-        "expected empty plan-feedback section for the new active plan"
-    );
+    // The structural `feedback.is_empty()` above is the real assertion.
+    // The earlier UI text check ("No plan feedback yet") was coupled to the
+    // dense per-section session_detail; the flat-timeline rewrite doesn't
+    // render a "Plan feedback" section so the text isn't a stable surface.
 }
 
 #[tokio::test]

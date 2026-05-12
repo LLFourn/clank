@@ -10,6 +10,7 @@ use clap::Args;
 use sqlx::SqlitePool;
 use tokio::sync::mpsc;
 
+pub(crate) mod amend;
 pub(crate) mod apply;
 pub(crate) mod curator;
 pub(crate) mod feedback_status;

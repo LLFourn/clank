@@ -57,6 +57,27 @@ pub async fn rev_parse_head(repo: &Path) -> Result<String, GitError> {
     run_git_ok(repo, &["rev-parse", "HEAD"]).await
 }
 
+/// Resolve any rev-spec (full or short SHA, branch, ref) to a full commit
+/// SHA, or return `Err(NotInRepo)` if it doesn't resolve in `repo`. Used by
+/// the `commit_diff` `?vs=<sha>` validator to reject bogus bases before
+/// running `git diff`.
+pub async fn resolve_to_full_sha(repo: &Path, rev: &str) -> Result<String, GitError> {
+    let output = run_git(
+        repo,
+        &["rev-parse", "--verify", &format!("{rev}^{{commit}}")],
+    )
+    .await?;
+    if !output.status.success() {
+        return Err(GitError::NotInRepo(repo.to_path_buf()));
+    }
+    let s = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if s.is_empty() {
+        Err(GitError::NotInRepo(repo.to_path_buf()))
+    } else {
+        Ok(s)
+    }
+}
+
 pub async fn parent_sha(repo: &Path, sha: &str) -> Result<Option<String>, GitError> {
     let output = run_git(repo, &["rev-list", "--parents", "-n", "1", sha]).await?;
     if !output.status.success() {
