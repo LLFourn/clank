@@ -12,6 +12,7 @@ use tokio::sync::mpsc;
 
 pub(crate) mod apply;
 pub(crate) mod curator;
+pub(crate) mod feedback_status;
 pub(crate) mod git;
 pub mod http;
 pub(crate) mod internal_api;
@@ -26,7 +27,7 @@ pub use service::{
 pub use watcher::{Watcher, WatcherEvent};
 
 use crate::lifecycle::{CommitSha, Observation, PlanFilePath, SessionId, content_hash};
-use crate::storage::{plan_revisions, plans, sessions};
+use crate::storage::sessions;
 
 #[derive(Args, Debug, Clone)]
 pub struct ServeArgs {
@@ -112,8 +113,10 @@ async fn recover(
         }
 
         let plan_path = PlanFilePath::from(session.plan_file_path.clone());
-        if Path::new(&session.plan_file_path).exists() {
-            watcher.switch_plan_file(&sid, &plan_path);
+        if Path::new(&session.plan_file_path).exists()
+            && let Err(err) = watcher.switch_plan_file(&sid, &plan_path)
+        {
+            tracing::warn!(session_id = sid.as_str(), error = ?err, "recovery: plan-file watcher attach failed");
         }
 
         // Re-attach git logs/HEAD watcher and feedback dir watcher.
@@ -123,12 +126,20 @@ async fn recover(
         if repo.exists()
             && let Ok(logs_head) = git::resolve_git_logs_head(repo).await
             && logs_head.exists()
+            && let Err(err) = watcher.watch_git_logs(&sid, &logs_head)
         {
-            watcher.watch_git_logs(&sid, &logs_head);
+            tracing::warn!(session_id = sid.as_str(), error = ?err, "recovery: git logs watcher attach failed");
         }
-        let feedback_dir = repo.join(".trinity").join("feedback").join(sid.as_str());
-        if feedback_dir.is_dir() {
-            watcher.watch_feedback_dir(&sid, &feedback_dir);
+        for kind in [
+            crate::domain::FeedbackKind::Plan,
+            crate::domain::FeedbackKind::Impl,
+        ] {
+            let feedback_dir = crate::feedback_path::feedback_dir(repo, &sid, kind);
+            if feedback_dir.is_dir()
+                && let Err(err) = watcher.watch_feedback_dir(&sid, kind, &feedback_dir)
+            {
+                tracing::warn!(session_id = sid.as_str(), kind = kind.as_str(), error = ?err, "recovery: feedback dir watcher attach failed");
+            }
         }
 
         let Some(active) = lifecycle.peek(&sid).await else {
@@ -188,12 +199,19 @@ async fn recover(
             tracing::warn!(session_id = sid.as_str(), error = ?err, "recovery: HEAD drift check failed");
         }
 
-        // Feedback dir drift. List the dir; queue ingests for new or
-        // changed files, mark missing for sidecar rows whose file is gone.
-        if feedback_dir.is_dir()
-            && let Err(err) = recover_feedback_drift(lifecycle, &sid, &feedback_dir).await
-        {
-            tracing::warn!(session_id = sid.as_str(), error = ?err, "recovery: feedback drift check failed");
+        // Feedback dir drift, per kind. List each dir; queue ingests
+        // for new or changed files, mark missing for sidecar rows
+        // whose file is gone.
+        for kind in [
+            crate::domain::FeedbackKind::Plan,
+            crate::domain::FeedbackKind::Impl,
+        ] {
+            let dir = crate::feedback_path::feedback_dir(repo, &sid, kind);
+            if dir.is_dir()
+                && let Err(err) = recover_feedback_drift(lifecycle, &sid, kind, &dir).await
+            {
+                tracing::warn!(session_id = sid.as_str(), kind = kind.as_str(), error = ?err, "recovery: feedback drift check failed");
+            }
         }
     }
 
@@ -256,6 +274,7 @@ async fn recover_head_drift(
 async fn recover_feedback_drift(
     lifecycle: &Arc<SessionService>,
     sid: &SessionId,
+    feedback_kind: crate::domain::FeedbackKind,
     feedback_dir: &Path,
 ) -> anyhow::Result<()> {
     use crate::storage::feedback_files;
@@ -278,29 +297,31 @@ async fn recover_feedback_drift(
         let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
             continue;
         };
-        if !watcher::is_valid_slug(stem) {
+        if !crate::feedback_path::is_valid_slug(stem) {
             continue;
         }
         let label = crate::lifecycle::AgentLabel::from(stem);
         seen_labels.push(label.clone());
 
-        // Queue an ingest pass via the same dispatch path the watcher
-        // would have used. The dispatcher has its own no-op guard for
-        // unchanged-body-AND-target.
-        if let Err(err) = dispatch_feedback_changed(lifecycle, sid, &label, &path).await {
-            tracing::warn!(session_id = sid.as_str(), label = label.as_str(), error = ?err, "recovery: feedback ingest failed");
+        if let Err(err) =
+            dispatch_feedback_changed(lifecycle, sid, feedback_kind, &label, &path).await
+        {
+            tracing::warn!(session_id = sid.as_str(), kind = feedback_kind.as_str(), label = label.as_str(), error = ?err, "recovery: feedback ingest failed");
         }
     }
 
-    // For sidecar rows whose file is gone: mark missing.
+    // For sidecar rows of THIS kind whose file is gone: mark missing.
     let rows = feedback_files::list_for_session(lifecycle.pool(), sid).await?;
     for row in rows {
+        if row.feedback_kind != feedback_kind.as_str() {
+            continue;
+        }
         if seen_labels.iter().any(|l| l.as_str() == row.author_label) {
             continue;
         }
         let label = crate::lifecycle::AgentLabel::from(row.author_label.clone());
-        if let Err(err) = dispatch_feedback_missing(lifecycle, sid, &label).await {
-            tracing::warn!(session_id = sid.as_str(), label = label.as_str(), error = ?err, "recovery: mark-missing failed");
+        if let Err(err) = dispatch_feedback_missing(lifecycle, sid, feedback_kind, &label).await {
+            tracing::warn!(session_id = sid.as_str(), kind = feedback_kind.as_str(), label = label.as_str(), error = ?err, "recovery: mark-missing failed");
         }
     }
 
@@ -332,23 +353,35 @@ fn spawn_watcher_dispatch(
                 }
                 WatcherEvent::FeedbackFileChanged {
                     session_id,
+                    feedback_kind,
                     author_label,
                     path,
                 } => {
-                    if let Err(err) =
-                        dispatch_feedback_changed(&lifecycle, &session_id, &author_label, &path)
-                            .await
+                    if let Err(err) = dispatch_feedback_changed(
+                        &lifecycle,
+                        &session_id,
+                        feedback_kind,
+                        &author_label,
+                        &path,
+                    )
+                    .await
                     {
                         tracing::warn!(session_id = session_id.as_str(), error = ?err, "watcher feedback-changed dispatch failed");
                     }
                 }
                 WatcherEvent::FeedbackFileMissing {
                     session_id,
+                    feedback_kind,
                     author_label,
                     path: _,
                 } => {
-                    if let Err(err) =
-                        dispatch_feedback_missing(&lifecycle, &session_id, &author_label).await
+                    if let Err(err) = dispatch_feedback_missing(
+                        &lifecycle,
+                        &session_id,
+                        feedback_kind,
+                        &author_label,
+                    )
+                    .await
                     {
                         tracing::warn!(session_id = session_id.as_str(), error = ?err, "watcher feedback-missing dispatch failed");
                     }
@@ -420,98 +453,124 @@ async fn dispatch_head_moved(
 async fn dispatch_feedback_changed(
     lifecycle: &Arc<SessionService>,
     session_id: &SessionId,
+    feedback_kind: crate::domain::FeedbackKind,
     author_label: &crate::lifecycle::AgentLabel,
     path: &Path,
 ) -> anyhow::Result<()> {
+    use crate::domain::{FeedbackTargetRef, TargetKind};
     use crate::storage::feedback_files;
-
-    let session = sessions::fetch(lifecycle.pool(), session_id)
-        .await?
-        .ok_or_else(|| anyhow::anyhow!("session vanished: {}", session_id.as_str()))?;
 
     let body = match tokio::fs::read_to_string(path).await {
         Ok(b) => b,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            // Vanished between watcher debounce and read; treat as missing.
-            return dispatch_feedback_missing(lifecycle, session_id, author_label).await;
+            return dispatch_feedback_missing(lifecycle, session_id, feedback_kind, author_label)
+                .await;
         }
         Err(e) => return Err(e.into()),
     };
     let hash = blake3::hash(body.as_bytes()).to_hex().to_string();
 
-    // Resolve the active target before the no-op guard so the guard can
-    // include target equality. Reuses the service-level helper so the
-    // dispatcher, get_context, and the web UI all see the same target.
-    let active_target = lifecycle
-        .resolve_active_target(session_id)
-        .await
-        .ok()
-        .flatten()
-        .and_then(|t| match t.kind {
-            crate::domain::TargetKind::PlanRevision => t.id.parse::<i64>().ok().map(|n| {
-                (
-                    t.kind,
-                    t.id,
-                    crate::domain::FeedbackTargetRef::PlanRevision(n),
-                )
-            }),
-            crate::domain::TargetKind::ImplementationCommit => Some((
-                t.kind,
-                t.id.clone(),
-                crate::domain::FeedbackTargetRef::ImplementationCommit(CommitSha::from(t.id)),
-            )),
-        });
-    let _ = &session;
+    // Resolve the kind's expected target. The parse_error sentinel for
+    // the None branches lives on `FeedbackTargetResolution`.
+    let resolution = lifecycle
+        .resolve_target_for_kind(session_id, feedback_kind)
+        .await?;
 
     let now = chrono::Utc::now().timestamp();
     let mut tx = lifecycle.pool().begin().await?;
 
-    let existing = sqlx::query_as::<_, feedback_files::FeedbackFile>(
-        "SELECT * FROM feedback_files WHERE session_id = ? AND author_label = ?",
-    )
-    .bind(session_id.as_str())
-    .bind(author_label.as_str())
-    .fetch_optional(&mut *tx)
-    .await?;
+    let existing =
+        feedback_files::fetch(lifecycle.pool(), session_id, feedback_kind, author_label).await?;
 
-    // Target-aware no-op guard. Skip when hash hasn't changed AND the
-    // last successful ingest already targets the current active target.
-    // Note: if there was a parse_error on the previous attempt we must
-    // not no-op even if hash matches, because we'd be leaving the row
-    // stuck in the error state when the underlying cause may have cleared.
+    // Target-aware no-op guard. Skip when hash hasn't changed, no
+    // parse_error is set, and the prior ingest's target matches the
+    // currently-expected target for this kind.
+    let target_matches_existing = |row: &feedback_files::FeedbackFile| -> bool {
+        match (
+            &resolution,
+            row.last_ingested_target_kind.as_deref(),
+            row.last_ingested_target_id.as_deref(),
+        ) {
+            (crate::daemon::service::FeedbackTargetResolution::Found(t), Some(rk), Some(rid)) => {
+                rk == t.kind.as_str() && rid == t.id
+            }
+            _ => false,
+        }
+    };
     if let Some(row) = existing.as_ref()
         && row.parse_error.is_none()
         && row.last_observed_hash.as_deref() == Some(hash.as_str())
-        && target_matches(row, &active_target)
+        && target_matches_existing(row)
     {
         return Ok(());
     }
 
     let path_str = path.to_string_lossy().into_owned();
-    feedback_files::upsert_observed(&mut tx, session_id, author_label, &path_str, now).await?;
-    feedback_files::set_observed(&mut tx, session_id, author_label, &hash, now).await?;
+    feedback_files::upsert_observed(
+        &mut tx,
+        session_id,
+        feedback_kind,
+        author_label,
+        &path_str,
+        now,
+    )
+    .await?;
+    feedback_files::set_observed(&mut tx, session_id, feedback_kind, author_label, &hash, now)
+        .await?;
 
-    let Some(target) = active_target else {
-        feedback_files::set_parse_error(&mut tx, session_id, author_label, "no_active_plan", now)
-            .await?;
-        tx.commit().await?;
-        return Ok(());
+    // Phase / kind gate: write parse_error sentinel via the typed
+    // resolution; the strings live in `FeedbackTargetResolution::parse_error`.
+    let target = match resolution {
+        crate::daemon::service::FeedbackTargetResolution::Found(t) => t,
+        other => {
+            if let Some(sentinel) = other.parse_error() {
+                feedback_files::set_parse_error(
+                    &mut tx,
+                    session_id,
+                    feedback_kind,
+                    author_label,
+                    sentinel,
+                    now,
+                )
+                .await?;
+            }
+            tx.commit().await?;
+            return Ok(());
+        }
     };
 
     if body.trim().is_empty() {
-        feedback_files::set_parse_error(&mut tx, session_id, author_label, "empty_body", now)
-            .await?;
+        feedback_files::set_parse_error(
+            &mut tx,
+            session_id,
+            feedback_kind,
+            author_label,
+            "empty_body",
+            now,
+        )
+        .await?;
         tx.commit().await?;
         return Ok(());
     }
 
     // Commit the watcher observation before calling put_feedback;
     // put_feedback opens its own transaction and we don't want them
-    // entangled. The sidecar's last_observed_* will be correct
-    // regardless of whether put_feedback succeeds.
+    // entangled.
     tx.commit().await?;
 
-    let (target_kind, target_id_str, target_ref) = target;
+    let target_ref = match target.kind {
+        TargetKind::PlanRevision => target
+            .id
+            .parse::<i64>()
+            .ok()
+            .map(FeedbackTargetRef::PlanRevision),
+        TargetKind::ImplementationCommit => Some(FeedbackTargetRef::ImplementationCommit(
+            CommitSha::from(target.id.clone()),
+        )),
+    };
+    let Some(target_ref) = target_ref else {
+        return Ok(());
+    };
 
     match lifecycle
         .put_feedback(session_id, author_label, target_ref, body)
@@ -521,12 +580,15 @@ async fn dispatch_feedback_changed(
             let mut tx = lifecycle.pool().begin().await?;
             feedback_files::set_ingested(
                 &mut tx,
-                session_id,
-                author_label,
-                &hash,
-                target_kind,
-                &target_id_str,
-                now,
+                feedback_files::Ingested {
+                    session_id,
+                    kind: feedback_kind,
+                    author_label,
+                    hash: &hash,
+                    target_kind: target.kind,
+                    target_id: &target.id,
+                    now,
+                },
             )
             .await?;
             tx.commit().await?;
@@ -537,6 +599,7 @@ async fn dispatch_feedback_changed(
             feedback_files::set_parse_error(
                 &mut tx,
                 session_id,
+                feedback_kind,
                 author_label,
                 &err.to_string(),
                 now,
@@ -548,37 +611,19 @@ async fn dispatch_feedback_changed(
     }
 }
 
-/// Compute the (kind, id, ref) tuple for the current active review
-fn target_matches(
-    row: &crate::storage::feedback_files::FeedbackFile,
-    cur: &Option<(
-        crate::domain::TargetKind,
-        String,
-        crate::domain::FeedbackTargetRef,
-    )>,
-) -> bool {
-    match (
-        cur,
-        &row.last_ingested_target_kind,
-        &row.last_ingested_target_id,
-    ) {
-        (Some((kind, id, _)), Some(rk), Some(rid)) => rk == kind.as_str() && rid == id,
-        _ => false,
-    }
-}
-
-/// Feedback file vanished from disk. Clear the sidecar's
-/// `last_observed_hash` (derived status flips to `missing`).
-/// Historical `feedback` rows are preserved — retraction is v2.
+/// Feedback file vanished from disk. Clear `last_observed_hash` +
+/// `parse_error` so derived status flips to `missing`. Historical
+/// `feedback` rows are preserved — retraction is v2.
 async fn dispatch_feedback_missing(
     lifecycle: &Arc<SessionService>,
     session_id: &SessionId,
+    feedback_kind: crate::domain::FeedbackKind,
     author_label: &crate::lifecycle::AgentLabel,
 ) -> anyhow::Result<()> {
     use crate::storage::feedback_files;
     let now = chrono::Utc::now().timestamp();
     let mut tx = lifecycle.pool().begin().await?;
-    feedback_files::mark_missing(&mut tx, session_id, author_label, now).await?;
+    feedback_files::mark_missing(&mut tx, session_id, feedback_kind, author_label, now).await?;
     tx.commit().await?;
     Ok(())
 }
@@ -650,11 +695,6 @@ async fn record_plan_file_missing(
     tracing::warn!(session_id = session_id.as_str(), path = %path.display(), "watcher: plan file missing");
     Ok(())
 }
-
-// Suppress dead-code warnings on items only used by other modules during
-// development of the rewrite.
-#[allow(dead_code)]
-fn _ensure_used(_: &plans::Plan, _: &plan_revisions::PlanRevision) {}
 
 fn expand_home(s: &str) -> PathBuf {
     if let Some(rest) = s.strip_prefix("~/")

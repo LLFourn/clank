@@ -5,6 +5,79 @@
 
 use crate::lifecycle::CommitSha;
 
+/// Which subdirectory under `.trinity/feedback/<session_id>/` the file
+/// lives in. The convention determines both the target kind it ingests
+/// against and whether it's accepted in the current phase.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FeedbackKind {
+    Plan,
+    Impl,
+}
+
+impl FeedbackKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            FeedbackKind::Plan => "plan",
+            FeedbackKind::Impl => "impl",
+        }
+    }
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "plan" => Some(FeedbackKind::Plan),
+            "impl" => Some(FeedbackKind::Impl),
+            _ => None,
+        }
+    }
+    pub fn target_kind(self) -> TargetKind {
+        match self {
+            FeedbackKind::Plan => TargetKind::PlanRevision,
+            FeedbackKind::Impl => TargetKind::ImplementationCommit,
+        }
+    }
+}
+
+impl std::fmt::Display for FeedbackKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Derived status of a `feedback_files` row at read time. The status is
+/// computed by `derive_feedback_file_status` from the row's columns and
+/// the kind's expected target — never persisted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FeedbackFileStatus {
+    Current,
+    Stale,
+    Missing,
+    ParseError,
+    NotYetIngested,
+}
+
+impl FeedbackFileStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            FeedbackFileStatus::Current => "current",
+            FeedbackFileStatus::Stale => "stale",
+            FeedbackFileStatus::Missing => "missing",
+            FeedbackFileStatus::ParseError => "parse_error",
+            FeedbackFileStatus::NotYetIngested => "not_yet_ingested",
+        }
+    }
+}
+
+/// Top-level session phase as reported by `get_context`. Derived from
+/// the active plan's state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Phase {
+    Planning,
+    Implementing,
+    NoActivePlan,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TargetKind {

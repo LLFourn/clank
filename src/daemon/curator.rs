@@ -1,9 +1,8 @@
-//! Human-curator HTTP routes (session-scoped admin). Lifecycle actions
-//! funnel through `SessionService::observe`; non-lifecycle metadata writes
-//! (comment, rename, register-head) go straight to the DB.
-//!
-//! Feedback mutation is **not** here in v0; reviewers upsert via the
-//! `put_feedback` MCP tool.
+//! Human-curator HTTP routes (session-scoped admin). The non-lifecycle
+//! routes here (comment, rename) write directly to the DB; the archive
+//! route funnels through `SessionService::observe` like an agent
+//! observation would. Feedback ingest lives entirely on the
+//! filesystem-watcher path — none of it is here.
 
 use axum::Form;
 use axum::extract::{Path, State};
@@ -14,8 +13,8 @@ use serde_json::json;
 
 use super::AppState;
 use crate::domain::EventKind;
-use crate::lifecycle::{AgentLabel, Observation, SessionId};
-use crate::storage::{events as ev_store, implementation_revisions as impl_revs, plans, sessions};
+use crate::lifecycle::{Observation, SessionId};
+use crate::storage::{events as ev_store, sessions};
 
 #[derive(Debug, Deserialize)]
 pub struct CommentForm {
@@ -86,7 +85,7 @@ pub async fn archive(
     Ok(Redirect::to(&format!("/sessions/{session_id}")))
 }
 
-// ---- rename / evict / register-head ----
+// ---- rename ----
 
 pub async fn rename(
     State(state): State<AppState>,
@@ -118,9 +117,6 @@ pub async fn rename(
     .map_err(ApiError::sqlx)?;
     Ok(Redirect::to(&format!("/sessions/{session_id}")))
 }
-
-#[allow(dead_code)]
-fn _ensure_used(_: &impl_revs::ImplementationRevision, _: &plans::Plan, _: AgentLabel) {}
 
 pub struct ApiError {
     status: StatusCode,
@@ -168,6 +164,13 @@ impl ApiError {
                 }
             }
             super::LifecycleServiceError::Sql(e) => Self::sqlx(e),
+            super::LifecycleServiceError::Watcher(msg) => {
+                tracing::error!(error = %msg, "watcher attach failed");
+                Self {
+                    status: StatusCode::INTERNAL_SERVER_ERROR,
+                    message: format!("watcher: {msg}"),
+                }
+            }
         }
     }
 }

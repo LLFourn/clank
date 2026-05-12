@@ -33,16 +33,29 @@ async fn register(app: &TestApp, sid: &str) -> (i64, i64) {
     )
 }
 
-fn feedback_dir(app: &TestApp, sid: &str) -> PathBuf {
+fn plan_feedback_dir(app: &TestApp, sid: &str) -> PathBuf {
     let canonical_repo = dunce::canonicalize(&app.repo).unwrap();
-    canonical_repo.join(".trinity").join("feedback").join(sid)
+    canonical_repo
+        .join(".trinity")
+        .join("feedback")
+        .join(sid)
+        .join("plan")
+}
+
+fn impl_feedback_dir(app: &TestApp, sid: &str) -> PathBuf {
+    let canonical_repo = dunce::canonicalize(&app.repo).unwrap();
+    canonical_repo
+        .join(".trinity")
+        .join("feedback")
+        .join(sid)
+        .join("impl")
 }
 
 #[tokio::test]
 async fn dropping_a_new_md_in_feedback_dir_auto_creates_sidecar_and_ingests() {
     let app = TestApp::spawn().await;
     let (_, rev_id) = register(&app, "s").await;
-    let dir = feedback_dir(&app, "s");
+    let dir = plan_feedback_dir(&app, "s");
 
     std::fs::write(dir.join("rev-a.md"), "first feedback body\n").unwrap();
     tokio::time::sleep(SETTLE).await;
@@ -69,7 +82,7 @@ async fn dropping_a_new_md_in_feedback_dir_auto_creates_sidecar_and_ingests() {
 async fn subsequent_writes_update_same_feedback_row() {
     let app = TestApp::spawn().await;
     let (_, rev_id) = register(&app, "s").await;
-    let dir = feedback_dir(&app, "s");
+    let dir = plan_feedback_dir(&app, "s");
 
     std::fs::write(dir.join("rev-a.md"), "v1\n").unwrap();
     tokio::time::sleep(SETTLE).await;
@@ -104,7 +117,7 @@ async fn subsequent_writes_update_same_feedback_row() {
 async fn debounce_collapses_partial_writes() {
     let app = TestApp::spawn().await;
     let (_, _) = register(&app, "s").await;
-    let dir = feedback_dir(&app, "s");
+    let dir = plan_feedback_dir(&app, "s");
     let p = dir.join("rev-a.md");
 
     for line in ["partial1\n", "partial2\n", "partial3\n", "final\n"] {
@@ -138,7 +151,7 @@ async fn debounce_collapses_partial_writes() {
 async fn file_delete_marks_missing_but_preserves_feedback_row() {
     let app = TestApp::spawn().await;
     let (_, _) = register(&app, "s").await;
-    let dir = feedback_dir(&app, "s");
+    let dir = plan_feedback_dir(&app, "s");
     let p = dir.join("rev-a.md");
 
     std::fs::write(&p, "before deletion\n").unwrap();
@@ -170,66 +183,123 @@ async fn file_delete_marks_missing_but_preserves_feedback_row() {
     );
 }
 
-/// Target moved planning → implementing. A re-write of the SAME body
-/// must re-ingest against the new target — the no-op guard cannot be
-/// hash-only, it must include target equality.
+/// Same author can hold both a `plan/` and an `impl/` row at once;
+/// each is keyed independently in `feedback_files`.
 #[tokio::test]
-async fn unchanged_body_re_ingests_after_target_change() {
+async fn same_author_has_independent_plan_and_impl_feedback_rows() {
     let app = TestApp::spawn().await;
-    let (_, rev_id) = register(&app, "s").await;
-    let dir = feedback_dir(&app, "s");
-    let p = dir.join("rev-a.md");
+    let (_, _rev_id) = register(&app, "s").await;
+    let plan_dir = plan_feedback_dir(&app, "s");
+    let impl_dir = impl_feedback_dir(&app, "s");
 
-    std::fs::write(&p, "same body\n").unwrap();
+    // Write plan-phase critique.
+    std::fs::write(plan_dir.join("rev-a.md"), "plan critique\n").unwrap();
     tokio::time::sleep(SETTLE).await;
-
-    let rows_before: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM feedback WHERE session_id = 's' AND author_label = 'rev-a'",
-    )
-    .fetch_one(&app.state.pool)
-    .await
-    .unwrap();
-    assert_eq!(rows_before, 1);
 
     // Trigger planning → implementing.
-    let head = make_commit(&app.repo, "f.txt", "x\n");
+    make_commit(&app.repo, "f.txt", "x\n");
     tokio::time::sleep(SETTLE).await;
 
-    // Re-touch the file with the SAME body. Watcher fires; the
-    // target-aware guard must NOT no-op (target changed), so ingest
-    // creates a new feedback row keyed to the new target.
-    // mtime alone isn't enough to trigger notify on macOS; rewrite
-    // identical content to force a fs event.
-    std::fs::write(&p, "same body\n").unwrap();
+    // Write impl-phase critique.
+    std::fs::write(impl_dir.join("rev-a.md"), "impl critique\n").unwrap();
     tokio::time::sleep(SETTLE).await;
 
-    let rows_after: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM feedback WHERE session_id = 's' AND author_label = 'rev-a'",
+    let rows: Vec<(String, String)> = sqlx::query_as(
+        "SELECT feedback_kind, author_label FROM feedback_files \
+         WHERE session_id = 's' AND author_label = 'rev-a' ORDER BY feedback_kind",
+    )
+    .fetch_all(&app.state.pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        rows,
+        vec![
+            ("impl".to_string(), "rev-a".to_string()),
+            ("plan".to_string(), "rev-a".to_string()),
+        ]
+    );
+
+    let feedback_targets: Vec<(String, String)> = sqlx::query_as(
+        "SELECT target_kind, body FROM feedback \
+         WHERE session_id = 's' AND author_label = 'rev-a' ORDER BY target_kind",
+    )
+    .fetch_all(&app.state.pool)
+    .await
+    .unwrap();
+    assert_eq!(feedback_targets.len(), 2);
+    assert!(
+        feedback_targets
+            .iter()
+            .any(|(k, b)| k == "implementation_commit" && b == "impl critique\n")
+    );
+    assert!(
+        feedback_targets
+            .iter()
+            .any(|(k, b)| k == "plan_revision" && b == "plan critique\n")
+    );
+}
+
+/// Writes to `impl/` during planning are rejected with a specific
+/// `parse_error` sentinel; the file stays on disk but no feedback row
+/// is created.
+#[tokio::test]
+async fn impl_dir_write_during_planning_records_parse_error_no_active_impl_target() {
+    let app = TestApp::spawn().await;
+    let _ = register(&app, "s").await;
+    let dir = impl_feedback_dir(&app, "s");
+
+    std::fs::write(dir.join("rev-a.md"), "impl critique during planning\n").unwrap();
+    tokio::time::sleep(SETTLE).await;
+
+    let parse_error: Option<String> = sqlx::query_scalar(
+        "SELECT parse_error FROM feedback_files WHERE session_id = 's' AND feedback_kind = 'impl' AND author_label = 'rev-a'",
     )
     .fetch_one(&app.state.pool)
     .await
     .unwrap();
     assert_eq!(
-        rows_after, 2,
-        "target-aware no-op guard must let the same-body re-ingest land for the new target"
+        parse_error.as_deref(),
+        Some("no_active_impl_target_for_kind")
     );
 
-    let target_kinds: Vec<String> = sqlx::query_scalar(
-        "SELECT target_kind FROM feedback WHERE session_id = 's' AND author_label = 'rev-a' ORDER BY id",
+    let feedback_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM feedback WHERE session_id = 's'")
+            .fetch_one(&app.state.pool)
+            .await
+            .unwrap();
+    assert_eq!(feedback_count, 0);
+}
+
+/// `plan/` writes are still accepted in `implementing` phase and
+/// continue to target the latest plan_revision (cross-phase plan
+/// critique stays editable).
+#[tokio::test]
+async fn plan_dir_write_during_implementing_still_ingests_against_plan_revision() {
+    let app = TestApp::spawn().await;
+    let (_, rev_id) = register(&app, "s").await;
+    let plan_dir = plan_feedback_dir(&app, "s");
+
+    make_commit(&app.repo, "f.txt", "x\n");
+    tokio::time::sleep(SETTLE).await;
+
+    std::fs::write(plan_dir.join("rev-a.md"), "plan critique\n").unwrap();
+    tokio::time::sleep(SETTLE).await;
+
+    let (target_kind, target_id): (String, String) = sqlx::query_as(
+        "SELECT target_kind, target_id FROM feedback WHERE session_id = 's' AND author_label = 'rev-a'",
     )
-    .fetch_all(&app.state.pool)
+    .fetch_one(&app.state.pool)
     .await
     .unwrap();
-    assert_eq!(target_kinds, vec!["plan_revision", "implementation_commit"]);
-    let _ = head;
-    let _ = rev_id;
+    assert_eq!(target_kind, "plan_revision");
+    assert_eq!(target_id, rev_id.to_string());
 }
 
 #[tokio::test]
 async fn parse_error_no_active_plan() {
     let app = TestApp::spawn().await;
     let _ = register(&app, "s").await;
-    let dir = feedback_dir(&app, "s");
+    let dir = plan_feedback_dir(&app, "s");
 
     app.archive_via_service("s").await;
 
@@ -256,7 +326,7 @@ async fn parse_error_no_active_plan() {
 async fn parse_error_empty_body() {
     let app = TestApp::spawn().await;
     let _ = register(&app, "s").await;
-    let dir = feedback_dir(&app, "s");
+    let dir = plan_feedback_dir(&app, "s");
 
     std::fs::write(dir.join("rev-a.md"), "   \n\n").unwrap();
     tokio::time::sleep(SETTLE).await;
@@ -281,7 +351,7 @@ async fn parse_error_empty_body() {
 async fn filename_failing_slug_validation_is_ignored() {
     let app = TestApp::spawn().await;
     let _ = register(&app, "s").await;
-    let dir = feedback_dir(&app, "s");
+    let dir = plan_feedback_dir(&app, "s");
 
     std::fs::write(dir.join("has space.md"), "ignored\n").unwrap();
     tokio::time::sleep(SETTLE).await;
@@ -304,7 +374,7 @@ async fn filename_failing_slug_validation_is_ignored() {
 async fn subdirectory_under_feedback_dir_is_ignored() {
     let app = TestApp::spawn().await;
     let _ = register(&app, "s").await;
-    let dir = feedback_dir(&app, "s");
+    let dir = plan_feedback_dir(&app, "s");
     let sub = dir.join("subdir");
     std::fs::create_dir_all(&sub).unwrap();
     std::fs::write(sub.join("rev-a.md"), "hidden\n").unwrap();
@@ -322,7 +392,7 @@ async fn subdirectory_under_feedback_dir_is_ignored() {
 async fn non_md_file_under_feedback_dir_is_ignored() {
     let app = TestApp::spawn().await;
     let _ = register(&app, "s").await;
-    let dir = feedback_dir(&app, "s");
+    let dir = plan_feedback_dir(&app, "s");
 
     std::fs::write(dir.join("rev-a.txt"), "wrong extension\n").unwrap();
     tokio::time::sleep(SETTLE).await;
@@ -342,7 +412,7 @@ async fn non_md_file_under_feedback_dir_is_ignored() {
 async fn deleting_a_parse_error_file_marks_it_missing_not_parse_error() {
     let app = TestApp::spawn().await;
     let _ = register(&app, "s").await;
-    let dir = feedback_dir(&app, "s");
+    let dir = plan_feedback_dir(&app, "s");
     let p = dir.join("rev-a.md");
 
     // Empty body → parse_error="empty_body".
@@ -378,14 +448,58 @@ async fn deleting_a_parse_error_file_marks_it_missing_not_parse_error() {
         )
         .await
         .unwrap();
-    assert_eq!(view["feedback_file"]["status"], "missing");
+    assert_eq!(view["write_feedback"]["status"], "missing");
+}
+
+/// File deleted out-of-band (before watcher processes the delete):
+/// `get_context.status` is `missing` at read time even though the
+/// sidecar still carries `last_observed_hash`. The derived status
+/// helper is the source of truth, not the sidecar columns alone.
+#[tokio::test]
+async fn status_is_missing_when_file_deleted_before_watcher_settles() {
+    let app = TestApp::spawn().await;
+    let _ = register(&app, "s").await;
+    let dir = plan_feedback_dir(&app, "s");
+    let p = dir.join("rev-a.md");
+
+    std::fs::write(&p, "v1\n").unwrap();
+    tokio::time::sleep(SETTLE).await;
+
+    // Confirm the row is current.
+    let r1 = app
+        .call(
+            "get_context",
+            &app.repo,
+            None,
+            json!({"session_id": "s", "author_label": "rev-a"}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(r1["write_feedback"]["status"], "current");
+
+    // Delete and immediately read — do NOT wait for the watcher debounce.
+    std::fs::remove_file(&p).unwrap();
+    let r2 = app
+        .call(
+            "get_context",
+            &app.repo,
+            None,
+            json!({"session_id": "s", "author_label": "rev-a"}),
+        )
+        .await
+        .unwrap();
+    // Sidecar's last_observed_hash is still set (watcher hasn't fired),
+    // but the file doesn't exist on disk, so the derived status MUST be
+    // missing rather than current/stale.
+    assert_eq!(r2["write_feedback"]["status"], "missing");
+    assert_eq!(r2["write_feedback"]["exists"], false);
 }
 
 #[tokio::test]
 async fn get_context_reports_feedback_file_status() {
     let app = TestApp::spawn().await;
     let _ = register(&app, "s").await;
-    let dir = feedback_dir(&app, "s");
+    let dir = plan_feedback_dir(&app, "s");
 
     // before write: not_yet_ingested, file doesn't exist on disk
     let r1 = app
@@ -397,8 +511,8 @@ async fn get_context_reports_feedback_file_status() {
         )
         .await
         .unwrap();
-    assert_eq!(r1["feedback_file"]["status"], "not_yet_ingested");
-    assert_eq!(r1["feedback_file"]["exists"], false);
+    assert_eq!(r1["write_feedback"]["status"], "not_yet_ingested");
+    assert_eq!(r1["write_feedback"]["exists"], false);
 
     // after write: current
     std::fs::write(dir.join("rev-a.md"), "the review\n").unwrap();
@@ -412,11 +526,14 @@ async fn get_context_reports_feedback_file_status() {
         )
         .await
         .unwrap();
-    assert_eq!(r2["feedback_file"]["status"], "current");
-    assert_eq!(r2["feedback_file"]["exists"], true);
+    assert_eq!(r2["write_feedback"]["status"], "current");
+    assert_eq!(r2["write_feedback"]["exists"], true);
 
-    // target change → stale (until next write).
-    make_commit(&app.repo, "f.txt", "x\n");
+    // Bump the plan revision; the plan-row's last_ingested_target_id
+    // no longer matches the new latest plan_revision, so status flips
+    // to stale.
+    let plan_path = app.repo.join("plan.md");
+    std::fs::write(&plan_path, "# body v2\n").unwrap();
     tokio::time::sleep(SETTLE).await;
     let r3 = app
         .call(
@@ -427,5 +544,8 @@ async fn get_context_reports_feedback_file_status() {
         )
         .await
         .unwrap();
-    assert_eq!(r3["feedback_file"]["status"], "stale");
+    // Phase stays planning (plan edit doesn't archive); write_feedback
+    // is still the plan-kind file, but the latest plan_revision moved
+    // forward so the rev-a row goes stale until the file is re-touched.
+    assert_eq!(r3["write_feedback"]["status"], "stale");
 }

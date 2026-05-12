@@ -5,14 +5,16 @@
 //! 2. **Git refs** — `.git/logs/HEAD` per repo. Event: `HeadMoved`.
 //!    Multiple sessions can share one path (two sessions in the same repo);
 //!    we dedupe at the notify-watch level but emit one event per session.
-//! 3. **Feedback dirs** — `<repo_root>/.trinity/feedback/<session_id>/`.
-//!    Event: `FeedbackFileChanged` / `FeedbackFileMissing`. The filename
-//!    stem is validated against the slug rules; files whose names fail
-//!    validation are silently dropped at the watcher layer.
+//! 3. **Feedback dirs** — `<repo_root>/.trinity/feedback/<session_id>/<kind>/`
+//!    where `<kind>` is either `plan` or `impl`. Event:
+//!    `FeedbackFileChanged` / `FeedbackFileMissing` carrying the
+//!    `feedback_kind` derived from which watched dir the change landed
+//!    in. The filename stem is validated against the slug rules;
+//!    files whose names fail validation are silently dropped.
 //!
-//! The watcher itself is dumb: it tracks `(artifact_kind, path → sessions)`,
+//! The watcher itself is dumb: it tracks `(artifact_kind, path → subscribers)`,
 //! runs `notify-debouncer-full`, and emits one `WatcherEvent` per
-//! matched session per debounced touch.
+//! matched subscriber per debounced touch.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -23,34 +25,33 @@ use notify::RecursiveMode;
 use notify_debouncer_full::{DebounceEventResult, Debouncer, RecommendedCache, new_debouncer};
 use tokio::sync::mpsc;
 
+use crate::domain::FeedbackKind;
+use crate::feedback_path::is_valid_slug;
 use crate::lifecycle::{AgentLabel, PlanFilePath, SessionId};
 
 pub const DEBOUNCE_TIMEOUT: Duration = Duration::from_millis(1500);
 
 #[derive(Debug)]
 pub enum WatcherEvent {
-    /// Watched plan file for this session has changed (post-debounce).
-    PlanFileDirty { session_id: SessionId },
-    /// Watched plan file for this session has vanished on disk.
+    PlanFileDirty {
+        session_id: SessionId,
+    },
     PlanFileMissing {
         session_id: SessionId,
         path: PathBuf,
     },
-    /// `.git/logs/HEAD` for the repo this session lives in has moved.
-    /// The dispatcher reads HEAD via `git rev-parse` to discover the
-    /// new SHA and feeds the lifecycle a `CommitObserved`.
-    HeadMoved { session_id: SessionId },
-    /// A markdown file `<author_label>.md` under this session's
-    /// feedback directory changed.
+    HeadMoved {
+        session_id: SessionId,
+    },
     FeedbackFileChanged {
         session_id: SessionId,
+        feedback_kind: FeedbackKind,
         author_label: AgentLabel,
         path: PathBuf,
     },
-    /// The same file vanished. The dispatcher marks the sidecar
-    /// missing; historical feedback rows are preserved.
     FeedbackFileMissing {
         session_id: SessionId,
+        feedback_kind: FeedbackKind,
         author_label: AgentLabel,
         path: PathBuf,
     },
@@ -59,23 +60,18 @@ pub enum WatcherEvent {
 struct Inner {
     debouncer: Debouncer<notify::RecommendedWatcher, RecommendedCache>,
 
-    /// Canonical plan-file path → set of session_ids subscribed to it.
     plan_paths: HashMap<PathBuf, Vec<SessionId>>,
     session_to_plan: HashMap<SessionId, PathBuf>,
 
-    /// Canonical `.git/logs/HEAD` path → set of session_ids in that repo.
     git_log_paths: HashMap<PathBuf, Vec<SessionId>>,
     session_to_git_log: HashMap<SessionId, PathBuf>,
 
-    /// Canonical feedback directory path → set of session_ids.
-    /// (One session per dir in practice, but the map is general.)
-    feedback_dirs: HashMap<PathBuf, Vec<SessionId>>,
-    session_to_feedback_dir: HashMap<SessionId, PathBuf>,
+    /// Reverse: canonical feedback dir path → subscribers `(session, kind)`.
+    feedback_dirs: HashMap<PathBuf, Vec<(SessionId, FeedbackKind)>>,
+    /// Forward: `(session, kind)` → canonical dir path. Two entries per
+    /// session in normal operation (one plan, one impl).
+    session_feedback_dirs: HashMap<(SessionId, FeedbackKind), PathBuf>,
 
-    /// Refcount of paths registered with notify, keyed by the
-    /// directory we actually `watch()`. Plan files: parent dir of the
-    /// file. Git logs: parent dir (`.git/logs/`). Feedback: the dir
-    /// itself.
     notify_refcount: HashMap<PathBuf, usize>,
 }
 
@@ -100,7 +96,7 @@ impl Watcher {
             git_log_paths: HashMap::new(),
             session_to_git_log: HashMap::new(),
             feedback_dirs: HashMap::new(),
-            session_to_feedback_dir: HashMap::new(),
+            session_feedback_dirs: HashMap::new(),
             notify_refcount: HashMap::new(),
         });
         let watcher = std::sync::Arc::new(Self { inner });
@@ -130,27 +126,38 @@ impl Watcher {
         Ok((watcher, event_rx))
     }
 
-    /// Subscribe `session_id` to a plan file path. Idempotent; if the
-    /// session was previously watching a different plan path, the old
-    /// binding is dropped first.
-    pub fn switch_plan_file(&self, session_id: &SessionId, path: &PlanFilePath) {
-        let Some(canonical) = canonicalize_or_warn("plan file", path.as_str()) else {
-            return;
-        };
-        let Some(watch_dir) = canonical.parent().map(PathBuf::from) else {
-            tracing::warn!(path = %canonical.display(), "watcher: plan-file path has no parent");
-            return;
-        };
+    pub fn switch_plan_file(
+        &self,
+        session_id: &SessionId,
+        path: &PlanFilePath,
+    ) -> anyhow::Result<()> {
+        let canonical = canonicalize_or_warn("plan file", path.as_str()).ok_or_else(|| {
+            anyhow::anyhow!(
+                "watcher: cannot canonicalize plan-file path {}",
+                path.as_str()
+            )
+        })?;
+        let watch_dir = canonical.parent().map(PathBuf::from).ok_or_else(|| {
+            anyhow::anyhow!(
+                "watcher: plan-file path has no parent: {}",
+                canonical.display()
+            )
+        })?;
 
         let mut inner = self.inner.lock().unwrap();
 
         if let Some(prev) = inner.session_to_plan.get(session_id).cloned() {
             if prev == canonical {
-                return;
+                return Ok(());
             }
             drop_plan_subscription(&mut inner, session_id, &prev);
         }
 
+        // Notify attachment must succeed before we record the
+        // subscription; otherwise a failure leaves a phantom map entry
+        // that makes the next idempotent retry short-circuit on
+        // `prev == canonical` without re-attempting notify.
+        bump_notify(&mut inner, &watch_dir)?;
         inner
             .plan_paths
             .entry(canonical.clone())
@@ -159,31 +166,38 @@ impl Watcher {
         inner
             .session_to_plan
             .insert(session_id.clone(), canonical.clone());
-        bump_notify(&mut inner, &watch_dir);
         tracing::info!(session_id = session_id.as_str(), path = %canonical.display(), "watcher: now watching plan file");
+        Ok(())
     }
 
-    /// Subscribe `session_id` to its repo's `.git/logs/HEAD`. Idempotent;
-    /// multi-session sharing is fine — the watcher dedupes at notify level
-    /// and emits one `HeadMoved` per session.
-    pub fn watch_git_logs(&self, session_id: &SessionId, git_logs_head: &Path) {
-        let Some(canonical) = canonicalize_or_warn("git logs/HEAD", git_logs_head) else {
-            return;
-        };
-        let Some(watch_dir) = canonical.parent().map(PathBuf::from) else {
-            tracing::warn!(path = %canonical.display(), "watcher: git logs/HEAD path has no parent");
-            return;
-        };
+    pub fn watch_git_logs(
+        &self,
+        session_id: &SessionId,
+        git_logs_head: &Path,
+    ) -> anyhow::Result<()> {
+        let canonical = canonicalize_or_warn("git logs/HEAD", git_logs_head).ok_or_else(|| {
+            anyhow::anyhow!(
+                "watcher: cannot canonicalize git logs/HEAD {}",
+                git_logs_head.display()
+            )
+        })?;
+        let watch_dir = canonical.parent().map(PathBuf::from).ok_or_else(|| {
+            anyhow::anyhow!(
+                "watcher: git logs/HEAD path has no parent: {}",
+                canonical.display()
+            )
+        })?;
 
         let mut inner = self.inner.lock().unwrap();
 
         if let Some(prev) = inner.session_to_git_log.get(session_id).cloned() {
             if prev == canonical {
-                return;
+                return Ok(());
             }
             drop_git_log_subscription(&mut inner, session_id, &prev);
         }
 
+        bump_notify(&mut inner, &watch_dir)?;
         inner
             .git_log_paths
             .entry(canonical.clone())
@@ -192,40 +206,49 @@ impl Watcher {
         inner
             .session_to_git_log
             .insert(session_id.clone(), canonical.clone());
-        bump_notify(&mut inner, &watch_dir);
         tracing::info!(session_id = session_id.as_str(), path = %canonical.display(), "watcher: now watching git logs/HEAD");
+        Ok(())
     }
 
-    /// Subscribe `session_id` to its feedback directory.
-    /// `<repo_root>/.trinity/feedback/<session_id>/`. Idempotent.
-    pub fn watch_feedback_dir(&self, session_id: &SessionId, dir: &Path) {
-        let Some(canonical) = canonicalize_or_warn("feedback dir", dir) else {
-            return;
-        };
+    /// Subscribe `(session_id, kind)` to its feedback subdirectory.
+    /// Idempotent. A session typically has two subscriptions — one for
+    /// `Plan` and one for `Impl`.
+    pub fn watch_feedback_dir(
+        &self,
+        session_id: &SessionId,
+        kind: FeedbackKind,
+        dir: &Path,
+    ) -> anyhow::Result<()> {
+        let canonical = canonicalize_or_warn("feedback dir", dir).ok_or_else(|| {
+            anyhow::anyhow!(
+                "watcher: cannot canonicalize feedback dir {}",
+                dir.display()
+            )
+        })?;
 
         let mut inner = self.inner.lock().unwrap();
+        let key = (session_id.clone(), kind);
 
-        if let Some(prev) = inner.session_to_feedback_dir.get(session_id).cloned() {
+        if let Some(prev) = inner.session_feedback_dirs.get(&key).cloned() {
             if prev == canonical {
-                return;
+                return Ok(());
             }
-            drop_feedback_dir_subscription(&mut inner, session_id, &prev);
+            drop_feedback_dir_subscription(&mut inner, &key, &prev);
         }
 
+        bump_notify(&mut inner, &canonical)?;
         inner
             .feedback_dirs
             .entry(canonical.clone())
             .or_default()
-            .push(session_id.clone());
-        inner
-            .session_to_feedback_dir
-            .insert(session_id.clone(), canonical.clone());
-        bump_notify(&mut inner, &canonical);
-        tracing::info!(session_id = session_id.as_str(), path = %canonical.display(), "watcher: now watching feedback dir");
+            .push(key.clone());
+        inner.session_feedback_dirs.insert(key, canonical.clone());
+        tracing::info!(session_id = session_id.as_str(), kind = kind.as_str(), path = %canonical.display(), "watcher: now watching feedback dir");
+        Ok(())
     }
 
-    /// Drop every subscription for `session_id` (plan file + git logs
-    /// + feedback dir). Used when a session is removed.
+    /// Drop every subscription for `session_id`. Used when a session
+    /// is removed.
     #[allow(dead_code)]
     pub fn unwatch_session(&self, session_id: &SessionId) {
         let mut inner = self.inner.lock().unwrap();
@@ -235,12 +258,14 @@ impl Watcher {
         if let Some(p) = inner.session_to_git_log.get(session_id).cloned() {
             drop_git_log_subscription(&mut inner, session_id, &p);
         }
-        if let Some(p) = inner.session_to_feedback_dir.get(session_id).cloned() {
-            drop_feedback_dir_subscription(&mut inner, session_id, &p);
+        for kind in [FeedbackKind::Plan, FeedbackKind::Impl] {
+            let key = (session_id.clone(), kind);
+            if let Some(p) = inner.session_feedback_dirs.get(&key).cloned() {
+                drop_feedback_dir_subscription(&mut inner, &key, &p);
+            }
         }
     }
 
-    /// For tests / diagnostics.
     #[allow(dead_code)]
     pub fn plan_path(&self, session_id: &SessionId) -> Option<PathBuf> {
         self.inner
@@ -252,22 +277,24 @@ impl Watcher {
     }
 }
 
-/// Translate raw notify events into a flat list of `WatcherEvent`s to
-/// emit. Held lock-free outside the closure to keep emission async.
 fn collect_emits(
     inner: &Inner,
     events: &[notify_debouncer_full::DebouncedEvent],
 ) -> Vec<WatcherEvent> {
     let mut out: Vec<WatcherEvent> = Vec::new();
-    let mut dedupe: Vec<(u8, PathBuf, SessionId)> = Vec::new();
+    let mut dedupe: Vec<(u8, PathBuf, SessionId, Option<FeedbackKind>)> = Vec::new();
 
     for ev in events {
         for path in ev.paths.iter() {
-            // Plan file?
             if let Some(sessions) = inner.plan_paths.get(path) {
                 let exists = path.exists();
                 for sid in sessions {
-                    let key = (if exists { 0_u8 } else { 1_u8 }, path.clone(), sid.clone());
+                    let key = (
+                        if exists { 0_u8 } else { 1_u8 },
+                        path.clone(),
+                        sid.clone(),
+                        None,
+                    );
                     if dedupe.contains(&key) {
                         continue;
                     }
@@ -285,10 +312,9 @@ fn collect_emits(
                 }
             }
 
-            // Git logs/HEAD?
             if let Some(sessions) = inner.git_log_paths.get(path) {
                 for sid in sessions {
-                    let key = (2_u8, path.clone(), sid.clone());
+                    let key = (2_u8, path.clone(), sid.clone(), None);
                     if dedupe.contains(&key) {
                         continue;
                     }
@@ -299,9 +325,8 @@ fn collect_emits(
                 }
             }
 
-            // Feedback file (path's parent is a watched feedback dir)?
             if let Some(parent) = path.parent()
-                && let Some(sessions) = inner.feedback_dirs.get(parent)
+                && let Some(subscribers) = inner.feedback_dirs.get(parent)
             {
                 let extension_ok = path
                     .extension()
@@ -320,8 +345,13 @@ fn collect_emits(
                 }
                 let label = AgentLabel::from(stem);
                 let exists = path.exists();
-                for sid in sessions {
-                    let key = (if exists { 3_u8 } else { 4_u8 }, path.clone(), sid.clone());
+                for (sid, kind) in subscribers {
+                    let key = (
+                        if exists { 3_u8 } else { 4_u8 },
+                        path.clone(),
+                        sid.clone(),
+                        Some(*kind),
+                    );
                     if dedupe.contains(&key) {
                         continue;
                     }
@@ -329,12 +359,14 @@ fn collect_emits(
                     if exists {
                         out.push(WatcherEvent::FeedbackFileChanged {
                             session_id: sid.clone(),
+                            feedback_kind: *kind,
                             author_label: label.clone(),
                             path: path.clone(),
                         });
                     } else {
                         out.push(WatcherEvent::FeedbackFileMissing {
                             session_id: sid.clone(),
+                            feedback_kind: *kind,
                             author_label: label.clone(),
                             path: path.clone(),
                         });
@@ -356,16 +388,16 @@ fn canonicalize_or_warn(label: &str, path: impl AsRef<Path>) -> Option<PathBuf> 
     }
 }
 
-fn bump_notify(inner: &mut Inner, dir: &Path) {
+fn bump_notify(inner: &mut Inner, dir: &Path) -> Result<(), notify::Error> {
     let count = inner.notify_refcount.entry(dir.to_path_buf()).or_insert(0);
     if *count == 0
         && let Err(e) = inner.debouncer.watch(dir, RecursiveMode::NonRecursive)
     {
         tracing::warn!(dir = %dir.display(), error = ?e, "watcher: failed to add to notify");
-        // Leave the refcount at 0 so a later subscription can retry.
-        return;
+        return Err(e);
     }
     *count += 1;
+    Ok(())
 }
 
 fn drop_notify(inner: &mut Inner, dir: &Path) {
@@ -405,23 +437,13 @@ fn drop_git_log_subscription(inner: &mut Inner, session_id: &SessionId, path: &P
     }
 }
 
-fn drop_feedback_dir_subscription(inner: &mut Inner, session_id: &SessionId, dir: &Path) {
-    if let Some(sessions) = inner.feedback_dirs.get_mut(dir) {
-        sessions.retain(|s| s != session_id);
-        if sessions.is_empty() {
+fn drop_feedback_dir_subscription(inner: &mut Inner, key: &(SessionId, FeedbackKind), dir: &Path) {
+    if let Some(subscribers) = inner.feedback_dirs.get_mut(dir) {
+        subscribers.retain(|k| k != key);
+        if subscribers.is_empty() {
             inner.feedback_dirs.remove(dir);
         }
     }
-    inner.session_to_feedback_dir.remove(session_id);
+    inner.session_feedback_dirs.remove(key);
     drop_notify(inner, dir);
-}
-
-/// Same slug rules as `SessionId`: ASCII alphanumerics + `_-.`,
-/// 1..=64 chars. Mirrors validate_session_id in the tools layer.
-pub fn is_valid_slug(s: &str) -> bool {
-    if s.is_empty() || s.len() > 64 {
-        return false;
-    }
-    s.chars()
-        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'))
 }

@@ -194,7 +194,11 @@ async fn feedback_file_changed_while_daemon_off_is_re_ingested() {
         .unwrap();
     let rev_id = r["revision_id"].as_i64().unwrap();
     let canonical_repo = dunce::canonicalize(&app.repo).unwrap();
-    let dir = canonical_repo.join(".trinity").join("feedback").join("s");
+    let dir = canonical_repo
+        .join(".trinity")
+        .join("feedback")
+        .join("s")
+        .join("plan");
     let p = dir.join("rev-a.md");
     std::fs::write(&p, "initial\n").unwrap();
     tokio::time::sleep(std::time::Duration::from_millis(2500)).await;

@@ -1,30 +1,29 @@
-//! `get_context` — the agent-facing read tool. Returns POINTERS and
-//! FRESHNESS, never artifact content. The agent reads `plan_file_path`
-//! directly from disk and runs `git` locally against `repo_root`. Other
-//! agents' feedback bodies are read off the filesystem via the paths
-//! in `other_feedback_files`.
+//! `get_context` — the agent-facing read tool. Returns pointers and
+//! freshness only; never artifact content. Agent reads bodies off disk
+//! and runs `git` locally.
 //!
-//! Audit-state contract: read-only for sessions/plans/feedback state.
-//! The single permitted mutation is `agents.last_seen` upsert + at-most-one
-//! `agent_joined` event when `author_label` is supplied. Does not bump
-//! `sessions.updated_at`.
+//! This module is a thin serializer over `SessionService::build_feedback_context`.
+//! All target resolution, status derivation, and file partitioning
+//! happen inside the service. Author-label filtering (`write_feedback` /
+//! `prior_feedback` split) is the only logic that lives here.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use serde::Deserialize;
-use serde_json::{Value, json};
+use serde_json::{Value, to_value};
 
 use crate::daemon::AppState;
-use crate::daemon::git;
 use crate::daemon::internal_api::ToolCallRequest;
-use crate::domain::TargetKind;
-use crate::lifecycle::{AgentLabel, SessionId};
-use crate::storage::{
-    feedback_files, implementation_revisions as impl_revs, plan_revisions, plans, sessions,
-};
+use crate::daemon::service::{ActiveTarget, FeedbackContext, FeedbackFileSnapshot};
+use crate::domain::{FeedbackFileStatus, FeedbackKind, Phase};
+use crate::feedback_path;
+use crate::lifecycle::AgentLabel;
+use crate::storage::sessions;
 
 use super::ToolError;
 use super::master::upsert_seen_with_event;
+
+const SCHEMA_VERSION: u8 = 1;
 
 #[derive(Debug, Deserialize)]
 struct GetContextArgs {
@@ -33,13 +32,105 @@ struct GetContextArgs {
     author_label: Option<String>,
 }
 
+#[derive(serde::Serialize)]
+struct GetContextResponse {
+    schema_version: u8,
+    session_id: String,
+    repo_root: PathBuf,
+    plan_file_path: PathBuf,
+    git_logs_head_path: Option<PathBuf>,
+    phase: Phase,
+    review_target: Option<ReviewTarget>,
+    latest_plan_revision: Option<PlanRevisionView>,
+    latest_implementation_revision: Option<ImplRevisionView>,
+    write_feedback: Option<FeedbackFileView>,
+    prior_feedback: Option<PriorFeedback>,
+    other_feedback_files: GroupedFeedbackFiles,
+}
+
+#[derive(serde::Serialize)]
+struct ReviewTarget {
+    kind: String,
+    id: String,
+    created_at: Option<i64>,
+    age_label: Option<String>,
+}
+
+#[derive(serde::Serialize)]
+struct PlanRevisionView {
+    id: i64,
+    number: i64,
+    content_hash: String,
+    created_at: i64,
+    age_label: String,
+}
+
+#[derive(serde::Serialize)]
+struct ImplRevisionView {
+    commit_sha: String,
+    parent_sha: Option<String>,
+    branch: Option<String>,
+    is_head: bool,
+    worktree_dirty: bool,
+    worktree_status_hash: String,
+    created_at: i64,
+    age_label: String,
+}
+
+#[derive(serde::Serialize)]
+struct FeedbackFileView {
+    kind: FeedbackKind,
+    path: String,
+    exists: bool,
+    status: FeedbackFileStatus,
+    last_observed_hash: Option<String>,
+    last_observed_at: Option<i64>,
+    last_observed_age_label: Option<String>,
+    last_ingested_hash: Option<String>,
+    last_ingested_at: Option<i64>,
+    last_ingested_age_label: Option<String>,
+    last_ingested_target: Option<TargetRef>,
+    parse_error: Option<String>,
+}
+
+#[derive(serde::Serialize)]
+struct FeedbackFilePointer {
+    author_label: String,
+    kind: FeedbackKind,
+    path: String,
+    status: FeedbackFileStatus,
+    last_ingested_at: Option<i64>,
+    last_ingested_age_label: Option<String>,
+    last_ingested_target: Option<TargetRef>,
+}
+
+#[derive(serde::Serialize)]
+struct TargetRef {
+    kind: String,
+    id: String,
+}
+
+#[derive(serde::Serialize)]
+struct PriorFeedback {
+    #[serde(rename = "self")]
+    self_: Option<FeedbackFileView>,
+    others: Vec<FeedbackFilePointer>,
+}
+
+#[derive(serde::Serialize)]
+struct GroupedFeedbackFiles {
+    plan: Vec<FeedbackFilePointer>,
+    #[serde(rename = "impl")]
+    impl_: Vec<FeedbackFilePointer>,
+}
+
 pub async fn get_context(state: &AppState, req: &ToolCallRequest) -> Result<Value, ToolError> {
     let args: GetContextArgs = serde_json::from_value(req.arguments.clone())
         .map_err(|e| ToolError::Invalid(format!("invalid args: {e}")))?;
     let session_id = sessions::validate_slug(&args.session_id).map_err(ToolError::Invalid)?;
 
-    // Existence check FIRST so unknown session is 404 not 500 from FK.
-    let session = sessions::fetch(&state.pool, &session_id)
+    // Existence check FIRST so unknown session is 404, not 500 from FK.
+    let _ = sessions::fetch(&state.pool, &session_id)
         .await
         .map_err(|e| ToolError::Internal(anyhow::anyhow!(e)))?
         .ok_or_else(|| ToolError::NotFound(format!("session `{session_id}` not found")))?;
@@ -56,246 +147,221 @@ pub async fn get_context(state: &AppState, req: &ToolCallRequest) -> Result<Valu
         upsert_seen_with_event(state, &session_id, label, now).await?;
     }
 
-    let active = match plans::load_active_plan(&state.pool, &session_id).await {
-        Ok(p) => p,
-        Err(plans::LoadActivePlanError::Sql(e)) => {
-            return Err(ToolError::Internal(anyhow::anyhow!(e)));
-        }
-        Err(plans::LoadActivePlanError::Inconsistent(inc)) => {
-            return Err(ToolError::Internal(anyhow::anyhow!(inc)));
-        }
-    };
+    let ctx = state
+        .lifecycle
+        .build_feedback_context(&session_id)
+        .await
+        .map_err(|e| ToolError::Internal(anyhow::anyhow!(e)))?;
 
-    let mut payload = json!({
-        "session_id": session_id.as_str(),
-        "repo_root": session.repo_root,
-        "plan_file_path": session.plan_file_path,
+    let now = chrono::Utc::now().timestamp();
+    let response = render(&ctx, author_label.as_ref(), now);
+    to_value(&response).map_err(|e| ToolError::Internal(anyhow::anyhow!(e)))
+}
+
+fn render(
+    ctx: &FeedbackContext,
+    author_label: Option<&AgentLabel>,
+    now: i64,
+) -> GetContextResponse {
+    // Status is already pre-derived per-row by build_feedback_context
+    // against the kind's expected target; we don't recompute here.
+
+    let review_target = ctx
+        .review_target
+        .as_ref()
+        .map(|t| review_target_view(t, ctx, now));
+
+    let latest_plan_revision = ctx.latest_plan_revision.as_ref().map(|r| PlanRevisionView {
+        id: r.id,
+        number: r.revision_number,
+        content_hash: r.content_hash.clone(),
+        created_at: r.created_at,
+        age_label: age_label(r.created_at, now),
     });
 
-    let Some(active) = active else {
-        payload["phase"] = json!("no_active_plan");
-        if let Some(label) = author_label.as_ref() {
-            payload["feedback_file"] =
-                feedback_file_pointer_only(&session.repo_root, &session_id, label);
-        }
-        return Ok(payload);
-    };
-
-    let phase: &str = if active.state == "implementing" {
-        "implementing"
-    } else {
-        "planning"
-    };
-    payload["phase"] = json!(phase);
-
-    let latest_plan_rev = plan_revisions::latest_for_plan(&state.pool, active.id)
-        .await
-        .map_err(|e| ToolError::Internal(anyhow::anyhow!(e)))?;
-    if let Some(rev) = latest_plan_rev.as_ref() {
-        payload["latest_plan_revision"] = json!({
-            "id": rev.id,
-            "number": rev.revision_number,
-            "content_hash": rev.content_hash,
-            "created_at": rev.created_at,
-        });
-    }
-
-    // Resolve active target via the shared service helper so the MCP
-    // response, file-ingest dispatcher, and web UI all agree after a
-    // reset-to-older-SHA.
-    let active_target = state
-        .lifecycle
-        .resolve_active_target(&session_id)
-        .await
-        .map_err(|e| ToolError::Internal(anyhow::anyhow!(e)))?;
-    let target_kind_now = if phase == "implementing" {
-        TargetKind::ImplementationCommit
-    } else {
-        TargetKind::PlanRevision
-    };
-    let target_id_now: Option<String> = active_target.as_ref().map(|t| t.id.clone());
-
-    if phase == "implementing"
-        && let Some(target) = active_target.as_ref()
-    {
-        let head_sha = git::rev_parse_head(Path::new(&session.repo_root))
-            .await
-            .map_err(|e| ToolError::Internal(anyhow::anyhow!("rev-parse HEAD: {e}")))?;
-        let rev = impl_revs::fetch_by_sha(
-            &state.pool,
-            active.id,
-            &crate::lifecycle::CommitSha::from(target.id.clone()),
-        )
-        .await
-        .map_err(|e| ToolError::Internal(anyhow::anyhow!(e)))?;
-        if let Some(rev) = rev.as_ref() {
-            let porcelain = git::worktree_porcelain(Path::new(&session.repo_root))
-                .await
-                .unwrap_or_default();
-            let dirty = !porcelain.trim().is_empty();
-            let status_hash = blake3::hash(porcelain.as_bytes()).to_hex().to_string();
-
-            payload["latest_implementation_revision"] = json!({
-                "commit_sha": rev.commit_sha,
-                "parent_sha": rev.parent_sha,
-                "branch": rev.branch,
-                "is_head": rev.commit_sha == head_sha,
-                "worktree_dirty": dirty,
-                "worktree_status_hash": status_hash,
-                "created_at": rev.created_at,
-            });
-        }
-    }
-    if let Some(t) = active_target.as_ref() {
-        payload["active_target"] = json!({
-            "kind": t.kind.as_str(),
-            "id": t.id,
-        });
-    }
-
-    let all_files = feedback_files::list_for_session(&state.pool, &session_id)
-        .await
-        .map_err(|e| ToolError::Internal(anyhow::anyhow!(e)))?;
-
-    if let Some(label) = author_label.as_ref() {
-        let conv_path = convention_path(&session.repo_root, &session_id, label);
-        let row = all_files
-            .iter()
-            .find(|f| f.author_label == label.as_str())
-            .cloned();
-        let exists = conv_path.exists();
-        payload["feedback_file"] = feedback_file_view(
-            &conv_path,
-            exists,
-            row.as_ref(),
-            target_kind_now,
-            target_id_now.as_deref(),
-        );
-    }
-
-    let other_files: Vec<Value> = all_files
-        .iter()
-        .filter(|f| {
-            author_label
-                .as_ref()
-                .is_none_or(|l| f.author_label != l.as_str())
-        })
-        .map(|f| {
-            let status = derive_status(f, target_kind_now, target_id_now.as_deref());
-            json!({
-                "author_label": f.author_label,
-                "path": f.path,
-                "status": status,
-                "last_ingested_at": f.last_ingested_at,
-                "last_ingested_target": f.last_ingested_target_kind.as_ref().and_then(|k| {
-                    f.last_ingested_target_id
-                        .as_ref()
-                        .map(|id| json!({ "kind": k, "id": id }))
-                }),
-            })
-        })
-        .collect();
-    if !other_files.is_empty() {
-        payload["other_feedback_files"] = json!(other_files);
-    }
-
-    Ok(payload)
-}
-
-fn convention_path(repo_root: &str, session_id: &SessionId, label: &AgentLabel) -> PathBuf {
-    Path::new(repo_root)
-        .join(".trinity")
-        .join("feedback")
-        .join(session_id.as_str())
-        .join(format!("{}.md", label.as_str()))
-}
-
-/// `feedback_file` view when no sidecar row exists yet. Returns the
-/// convention path so the caller knows where to write.
-fn feedback_file_pointer_only(
-    repo_root: &str,
-    session_id: &SessionId,
-    label: &AgentLabel,
-) -> Value {
-    let path = convention_path(repo_root, session_id, label);
-    let exists = path.exists();
-    json!({
-        "path": path,
-        "exists": exists,
-        "status": "not_yet_ingested",
-        "last_observed_hash": Value::Null,
-        "last_observed_at": Value::Null,
-        "last_ingested_hash": Value::Null,
-        "last_ingested_at": Value::Null,
-        "last_ingested_target": Value::Null,
-        "parse_error": Value::Null,
-    })
-}
-
-fn feedback_file_view(
-    conv_path: &Path,
-    exists: bool,
-    row: Option<&feedback_files::FeedbackFile>,
-    cur_kind: TargetKind,
-    cur_id: Option<&str>,
-) -> Value {
-    let Some(row) = row else {
-        return json!({
-            "path": conv_path,
-            "exists": exists,
-            "status": "not_yet_ingested",
-            "last_observed_hash": Value::Null,
-            "last_observed_at": Value::Null,
-            "last_ingested_hash": Value::Null,
-            "last_ingested_at": Value::Null,
-            "last_ingested_target": Value::Null,
-            "parse_error": Value::Null,
-        });
-    };
-    json!({
-        "path": row.path,
-        "exists": exists,
-        "status": derive_status(row, cur_kind, cur_id),
-        "last_observed_hash": row.last_observed_hash,
-        "last_observed_at": row.last_observed_at,
-        "last_ingested_hash": row.last_ingested_hash,
-        "last_ingested_at": row.last_ingested_at,
-        "last_ingested_target": row
-            .last_ingested_target_kind
+    let latest_implementation_revision =
+        ctx.latest_implementation_revision
             .as_ref()
-            .and_then(|k| row
-                .last_ingested_target_id
-                .as_ref()
-                .map(|id| json!({ "kind": k, "id": id }))),
-        "parse_error": row.parse_error,
-    })
+            .map(|r| ImplRevisionView {
+                commit_sha: r.commit_sha.clone(),
+                parent_sha: r.parent_sha.clone(),
+                branch: r.branch.clone(),
+                is_head: ctx.head_sha.as_deref() == Some(r.commit_sha.as_str()),
+                worktree_dirty: ctx.worktree_dirty.unwrap_or(false),
+                worktree_status_hash: ctx.worktree_status_hash.clone().unwrap_or_default(),
+                created_at: r.created_at,
+                age_label: age_label(r.created_at, now),
+            });
+
+    let write_kind = match ctx.phase {
+        Phase::Planning => Some(FeedbackKind::Plan),
+        Phase::Implementing => Some(FeedbackKind::Impl),
+        Phase::NoActivePlan => None,
+    };
+
+    let write_feedback = match (author_label, write_kind) {
+        (Some(label), Some(kind)) => {
+            let rows = match kind {
+                FeedbackKind::Plan => &ctx.plan_files,
+                FeedbackKind::Impl => &ctx.impl_files,
+            };
+            let snap = rows.iter().find(|s| s.row.author_label == label.as_str());
+            let conv =
+                feedback_path::feedback_file_path(&ctx.repo_root, &ctx.session_id, kind, label);
+            Some(view_for(kind, conv, snap, now))
+        }
+        _ => None,
+    };
+
+    let prior_feedback = author_label.map(|label| {
+        let (prior_kind, prior_rows): (FeedbackKind, &Vec<FeedbackFileSnapshot>) = match ctx.phase {
+            Phase::Implementing => (FeedbackKind::Plan, &ctx.plan_files),
+            _ => {
+                return PriorFeedback {
+                    self_: None,
+                    others: vec![],
+                };
+            }
+        };
+        let self_ = prior_rows
+            .iter()
+            .find(|s| s.row.author_label == label.as_str())
+            .map(|s| view_for_existing(prior_kind, s, now));
+        let others = prior_rows
+            .iter()
+            .filter(|s| s.row.author_label != label.as_str())
+            .map(|s| pointer_for(prior_kind, s, now))
+            .collect();
+        PriorFeedback { self_, others }
+    });
+
+    let author_str = author_label.map(|l| l.as_str().to_string());
+    let plan_pointers = ctx
+        .plan_files
+        .iter()
+        .filter(|s| author_str.as_deref() != Some(s.row.author_label.as_str()))
+        .map(|s| pointer_for(FeedbackKind::Plan, s, now))
+        .collect();
+    let impl_pointers = ctx
+        .impl_files
+        .iter()
+        .filter(|s| author_str.as_deref() != Some(s.row.author_label.as_str()))
+        .map(|s| pointer_for(FeedbackKind::Impl, s, now))
+        .collect();
+
+    GetContextResponse {
+        schema_version: SCHEMA_VERSION,
+        session_id: ctx.session_id.as_str().to_string(),
+        repo_root: ctx.repo_root.clone(),
+        plan_file_path: ctx.plan_file_path.clone(),
+        git_logs_head_path: ctx.git_logs_head_path.clone(),
+        phase: ctx.phase,
+        review_target,
+        latest_plan_revision,
+        latest_implementation_revision,
+        write_feedback,
+        prior_feedback,
+        other_feedback_files: GroupedFeedbackFiles {
+            plan: plan_pointers,
+            impl_: impl_pointers,
+        },
+    }
 }
 
-fn derive_status(
-    row: &feedback_files::FeedbackFile,
-    cur_kind: TargetKind,
-    cur_id: Option<&str>,
-) -> &'static str {
-    if row.parse_error.is_some() {
-        return "parse_error";
-    }
-    if row.last_observed_hash.is_none() {
-        return "missing";
-    }
-    let target_matches = matches!(
-        (&row.last_ingested_target_kind, &row.last_ingested_target_id, cur_id),
-        (Some(k), Some(id), Some(want_id))
-            if k.as_str() == cur_kind.as_str() && id == want_id
-    );
-    let hash_synced = match (&row.last_ingested_hash, &row.last_observed_hash) {
-        (Some(ing), Some(obs)) => ing == obs,
-        _ => false,
+fn review_target_view(t: &ActiveTarget, ctx: &FeedbackContext, now: i64) -> ReviewTarget {
+    let created_at = match t.kind {
+        crate::domain::TargetKind::PlanRevision => {
+            ctx.latest_plan_revision.as_ref().map(|r| r.created_at)
+        }
+        crate::domain::TargetKind::ImplementationCommit => ctx
+            .latest_implementation_revision
+            .as_ref()
+            .map(|r| r.created_at),
     };
-    if target_matches && hash_synced {
-        "current"
-    } else if row.last_ingested_hash.is_some() {
-        "stale"
+    ReviewTarget {
+        kind: t.kind.as_str().to_string(),
+        id: t.id.clone(),
+        created_at,
+        age_label: created_at.map(|ts| age_label(ts, now)),
+    }
+}
+
+fn view_for(
+    kind: FeedbackKind,
+    conv_path: PathBuf,
+    snap: Option<&FeedbackFileSnapshot>,
+    now: i64,
+) -> FeedbackFileView {
+    match snap {
+        Some(s) => view_for_existing(kind, s, now),
+        None => FeedbackFileView {
+            kind,
+            path: conv_path.display().to_string(),
+            exists: conv_path.exists(),
+            status: FeedbackFileStatus::NotYetIngested,
+            last_observed_hash: None,
+            last_observed_at: None,
+            last_observed_age_label: None,
+            last_ingested_hash: None,
+            last_ingested_at: None,
+            last_ingested_age_label: None,
+            last_ingested_target: None,
+            parse_error: None,
+        },
+    }
+}
+
+fn view_for_existing(kind: FeedbackKind, s: &FeedbackFileSnapshot, now: i64) -> FeedbackFileView {
+    FeedbackFileView {
+        kind,
+        path: s.row.path.clone(),
+        exists: s.exists_on_disk,
+        status: s.status,
+        last_observed_hash: s.row.last_observed_hash.clone(),
+        last_observed_at: s.row.last_observed_at,
+        last_observed_age_label: s.row.last_observed_at.map(|ts| age_label(ts, now)),
+        last_ingested_hash: s.row.last_ingested_hash.clone(),
+        last_ingested_at: s.row.last_ingested_at,
+        last_ingested_age_label: s.row.last_ingested_at.map(|ts| age_label(ts, now)),
+        last_ingested_target: target_ref(s),
+        parse_error: s.row.parse_error.clone(),
+    }
+}
+
+fn pointer_for(kind: FeedbackKind, s: &FeedbackFileSnapshot, now: i64) -> FeedbackFilePointer {
+    FeedbackFilePointer {
+        author_label: s.row.author_label.clone(),
+        kind,
+        path: s.row.path.clone(),
+        status: s.status,
+        last_ingested_at: s.row.last_ingested_at,
+        last_ingested_age_label: s.row.last_ingested_at.map(|ts| age_label(ts, now)),
+        last_ingested_target: target_ref(s),
+    }
+}
+
+fn target_ref(s: &FeedbackFileSnapshot) -> Option<TargetRef> {
+    match (
+        s.row.last_ingested_target_kind.as_deref(),
+        s.row.last_ingested_target_id.as_deref(),
+    ) {
+        (Some(k), Some(id)) => Some(TargetRef {
+            kind: k.to_string(),
+            id: id.to_string(),
+        }),
+        _ => None,
+    }
+}
+
+fn age_label(ts: i64, now: i64) -> String {
+    let secs = (now - ts).max(0);
+    if secs < 60 {
+        format!("{secs}s ago")
+    } else if secs < 3600 {
+        format!("{}m ago", secs / 60)
+    } else if secs < 86_400 {
+        format!("{}h ago", secs / 3600)
     } else {
-        "not_yet_ingested"
+        format!("{}d ago", secs / 86_400)
     }
 }

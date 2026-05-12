@@ -18,7 +18,7 @@ use crate::domain::{FeedbackTargetRef, TargetKind};
 use crate::lifecycle::{CommitSha, SessionId};
 use crate::storage::{
     agents, events as ev_store, feedback as feedback_store, feedback::FeedbackRecord,
-    feedback_files, implementation_revisions as impl_revs, plan_revisions, plans, sessions,
+    implementation_revisions as impl_revs, plan_revisions, plans, sessions,
 };
 
 pub fn router(state: AppState) -> Router {
@@ -76,33 +76,22 @@ async fn home(State(state): State<AppState>) -> Result<Html<String>, AppError> {
 }
 
 /// Count how many of this session's `feedback_files` rows currently
-/// render as the `current` status. HEAD-derives the active target via
-/// the shared service helper so this count matches `get_context`.
+/// render as the `current` status. Sums across both plan/ and impl/
+/// since each kind is judged against its own expected target inside
+/// `build_feedback_context`.
 async fn count_current_feedback_files(state: &AppState, sid: &SessionId) -> Result<i64, AppError> {
-    let Some(target) = state
+    let ctx = state
         .lifecycle
-        .resolve_active_target(sid)
+        .build_feedback_context(sid)
         .await
-        .map_err(AppError::lifecycle)?
-    else {
-        return Ok(0);
-    };
-    let n: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM feedback_files \
-         WHERE session_id = ? \
-         AND parse_error IS NULL \
-         AND last_observed_hash IS NOT NULL \
-         AND last_ingested_hash = last_observed_hash \
-         AND last_ingested_target_kind = ? \
-         AND last_ingested_target_id = ?",
-    )
-    .bind(sid.as_str())
-    .bind(target.kind.as_str())
-    .bind(&target.id)
-    .fetch_one(&state.pool)
-    .await
-    .map_err(AppError::sqlx)?;
-    Ok(n)
+        .map_err(AppError::lifecycle)?;
+    let n = ctx
+        .plan_files
+        .iter()
+        .chain(ctx.impl_files.iter())
+        .filter(|s| s.status == crate::domain::FeedbackFileStatus::Current)
+        .count();
+    Ok(n as i64)
 }
 
 async fn session_detail(
@@ -189,27 +178,30 @@ async fn session_detail(
         .map(|ev| ui::TimelineItem::from_event(ev, &plan_revisions, &feedback_by_id))
         .collect();
 
-    let feedback_files_rows = feedback_files::list_for_session(&state.pool, &sid)
+    // Pull the full feedback context once; UI reads the pre-derived
+    // status from each FeedbackFileSnapshot. The MCP tool, the watcher
+    // dispatcher, and these UI tables all consume the same snapshot.
+    let ctx = state
+        .lifecycle
+        .build_feedback_context(&sid)
         .await
-        .map_err(AppError::sqlx)?;
+        .map_err(AppError::lifecycle)?;
 
     let repo_root_path = std::path::Path::new(&session.repo_root);
-    let git_logs_head_path = super::git::resolve_git_logs_head(repo_root_path)
-        .await
-        .ok()
+    let git_logs_head_path = ctx
+        .git_logs_head_path
+        .as_ref()
         .map(|p| p.display().to_string());
-    let feedback_dir_path = Some(
-        repo_root_path
-            .join(".trinity")
-            .join("feedback")
-            .join(sid.as_str())
+    let plan_feedback_dir_path = Some(
+        crate::feedback_path::feedback_dir(repo_root_path, &sid, crate::domain::FeedbackKind::Plan)
             .display()
             .to_string(),
     );
-
-    let active_target_for_ui = active_target
-        .as_ref()
-        .map(|t| (t.kind.as_str().to_string(), t.id.clone()));
+    let impl_feedback_dir_path = Some(
+        crate::feedback_path::feedback_dir(repo_root_path, &sid, crate::domain::FeedbackKind::Impl)
+            .display()
+            .to_string(),
+    );
 
     Ok(Html(
         ui::session_detail(&ui::SessionDetail {
@@ -223,10 +215,11 @@ async fn session_detail(
             impl_feedback,
             archived_count,
             timeline,
-            active_target: active_target_for_ui,
-            feedback_files: feedback_files_rows,
+            plan_feedback_files: ctx.plan_files,
+            impl_feedback_files: ctx.impl_files,
             git_logs_head_path,
-            feedback_dir_path,
+            plan_feedback_dir_path,
+            impl_feedback_dir_path,
         })
         .into_string(),
     ))

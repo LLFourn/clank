@@ -165,16 +165,26 @@ async fn get_context_returns_active_target_and_feedback_status() {
         .await
         .unwrap();
     assert_eq!(r["phase"], "planning");
-    assert_eq!(r["active_target"]["kind"], "plan_revision");
+    assert_eq!(r["review_target"]["kind"], "plan_revision");
     assert!(r["latest_plan_revision"]["id"].is_i64());
-    let ff = &r["feedback_file"];
-    assert_eq!(ff["status"], "not_yet_ingested");
+    assert_eq!(r["schema_version"], 1);
+    let wf = &r["write_feedback"];
+    assert_eq!(wf["kind"], "plan");
+    assert_eq!(wf["status"], "not_yet_ingested");
     assert!(
-        ff["path"]
+        wf["path"]
             .as_str()
             .unwrap()
-            .ends_with("/feedback/s/rev-a.md")
+            .ends_with("/feedback/s/plan/rev-a.md"),
+        "got {wf:?}"
     );
+    // prior_feedback during planning has null self + empty others.
+    let prior = &r["prior_feedback"];
+    assert!(prior["self"].is_null());
+    assert!(prior["others"].as_array().unwrap().is_empty());
+    // other_feedback_files: both arrays always present.
+    assert!(r["other_feedback_files"]["plan"].is_array());
+    assert!(r["other_feedback_files"]["impl"].is_array());
 }
 
 #[tokio::test]

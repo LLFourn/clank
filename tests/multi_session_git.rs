@@ -83,11 +83,16 @@ async fn per_session_feedback_files_are_independent() {
     .unwrap();
 
     let canonical_repo = dunce::canonicalize(&app.repo).unwrap();
-    let dir_for =
-        |sid: &str| -> PathBuf { canonical_repo.join(".trinity").join("feedback").join(sid) };
+    let plan_dir = |sid: &str| -> PathBuf {
+        canonical_repo
+            .join(".trinity")
+            .join("feedback")
+            .join(sid)
+            .join("plan")
+    };
 
-    std::fs::write(dir_for("a").join("rev.md"), "for-a\n").unwrap();
-    std::fs::write(dir_for("b").join("rev.md"), "for-b\n").unwrap();
+    std::fs::write(plan_dir("a").join("rev.md"), "for-a\n").unwrap();
+    std::fs::write(plan_dir("b").join("rev.md"), "for-b\n").unwrap();
     tokio::time::sleep(SETTLE).await;
 
     let body_a: String = sqlx::query_scalar(

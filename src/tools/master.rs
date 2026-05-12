@@ -127,11 +127,16 @@ pub async fn register_plan_file(
         .await
         .map_err(map_lifecycle_err)?;
 
-    // Auto-watch git logs/HEAD + feedback dir as part of plan
-    // registration. Idempotent re-registers are no-ops.
-    if let Err(e) = attach_companion_watchers(state, &session_id, &repo_root_canonical).await {
-        tracing::warn!(session_id = session_id.as_str(), error = ?e, "register_plan_file: companion watcher setup partial failure");
-    }
+    // Auto-watch git logs/HEAD + the plan/ and impl/ feedback dirs as
+    // part of plan registration. With the watcher-coordinator model
+    // these are load-bearing: commits and reviewer feedback only flow
+    // through them. A failure here means the agent would be handed a
+    // session whose feedback paths won't ingest, so it bubbles up as
+    // a tool error. Re-calling `register_plan_file` is idempotent and
+    // retries the attach after the underlying issue is fixed.
+    attach_companion_watchers(state, &session_id, &repo_root_canonical)
+        .await
+        .map_err(|e| ToolError::Internal(anyhow::anyhow!(e)))?;
 
     let from_effects = outcome.apply.items.iter().find_map(|e| match e {
         AppliedEffect::Started {
@@ -183,7 +188,11 @@ pub async fn register_plan_file(
 /// directory for this session. Called by `register_plan_file`.
 /// Idempotent — repeated calls with the same paths are no-ops at the
 /// watcher level. Failures are logged at warn but don't fail the tool
-/// call (the plan-file watcher succeeding is the load-bearing piece).
+/// call. Companion-watcher setup is load-bearing under the
+/// watcher-coordinator model — commits and feedback only flow through
+/// these — so any setup failure bubbles up and the tool returns an
+/// error rather than handing the agent a session whose paths won't
+/// ingest. Idempotent: re-calling after a fix retries cleanly.
 async fn attach_companion_watchers(
     state: &AppState,
     session_id: &SessionId,
@@ -193,17 +202,22 @@ async fn attach_companion_watchers(
 
     let git_logs_head = git::resolve_git_logs_head(repo_root).await?;
     if git_logs_head.exists() {
-        watcher.watch_git_logs(session_id, &git_logs_head);
+        watcher.watch_git_logs(session_id, &git_logs_head)?;
     } else {
-        tracing::debug!(path = %git_logs_head.display(), "register_plan_file: .git/logs/HEAD doesn't exist yet; watcher will pick up on first commit");
+        // No commits yet: leave the watcher unattached. The next commit
+        // makes the path exist; a re-register or the recovery sweep
+        // will attach it then. This is the only non-error "skip".
+        tracing::debug!(path = %git_logs_head.display(), "register_plan_file: .git/logs/HEAD doesn't exist yet; watcher attaches on the next register / restart");
     }
 
-    let feedback_dir = repo_root
-        .join(".trinity")
-        .join("feedback")
-        .join(session_id.as_str());
-    tokio::fs::create_dir_all(&feedback_dir).await?;
-    watcher.watch_feedback_dir(session_id, &feedback_dir);
+    for kind in [
+        crate::domain::FeedbackKind::Plan,
+        crate::domain::FeedbackKind::Impl,
+    ] {
+        let dir = crate::feedback_path::feedback_dir(repo_root, session_id, kind);
+        tokio::fs::create_dir_all(&dir).await?;
+        watcher.watch_feedback_dir(session_id, kind, &dir)?;
+    }
 
     Ok(())
 }
@@ -244,6 +258,7 @@ pub(crate) fn map_lifecycle_err(err: crate::daemon::LifecycleServiceError) -> To
         E::ActivePlan(inc) => ToolError::Internal(anyhow::anyhow!(inc)),
         E::NoSession(s) => ToolError::NotFound(format!("session `{s}` not found")),
         E::Sql(e) => ToolError::Internal(anyhow::anyhow!(e)),
+        E::Watcher(msg) => ToolError::Internal(anyhow::anyhow!(msg)),
     }
 }
 

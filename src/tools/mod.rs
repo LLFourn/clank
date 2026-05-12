@@ -63,14 +63,16 @@ pub fn catalog() -> Vec<ToolDescriptor> {
                           - `label`: attribution name (e.g. `claude-main`).\n\n\
                           On first call for a session, Trinity creates the session row, \
                           starts a `planning` plan with the current HEAD as `base_commit`, \
-                          creates `<repo_root>/.trinity/feedback/<session_id>/` if absent, \
-                          and attaches three watchers: the plan file, `.git/logs/HEAD`, and \
-                          the feedback directory. Subsequent calls update the plan-file path \
-                          or record a new revision if the body differs. Idempotent on \
-                          same-body re-calls.\n\n\
-                          After registration, just edit the plan file normally — Trinity \
-                          observes everything else (plan revisions, implementation commits, \
-                          reviewer feedback files) from the filesystem and git automatically."
+                          and creates two feedback subdirectories: \
+                          `<repo_root>/.trinity/feedback/<session_id>/plan/` and \
+                          `.../impl/`. The plan file, `.git/logs/HEAD`, and both feedback \
+                          directories are attached to the watcher.\n\n\
+                          Subsequent calls update the plan-file path or record a new \
+                          revision if the body differs. Idempotent on same-body re-calls.\n\n\
+                          After registration, edit the plan file normally and drop \
+                          `<author_label>.md` files into the appropriate feedback subdirectory; \
+                          Trinity ingests plan revisions, implementation commits, and reviewer \
+                          feedback from filesystem + git automatically."
                 .to_string(),
             input_schema: json!({
                 "type": "object",
@@ -85,16 +87,24 @@ pub fn catalog() -> Vec<ToolDescriptor> {
         },
         ToolDescriptor {
             name: "get_context".to_string(),
-            description: "Returns pointers + freshness for the session's active review target. \
-                          Never returns artifact content (plan body, commit message, diff \
-                          text, feedback prose) — the agent reads `plan_file_path` directly \
-                          and runs `git` locally against `repo_root` to inspect commits.\n\n\
+            description: "Returns pointers + freshness for the session, in the v1 response \
+                          schema. Never returns artifact content (plan body, commit message, \
+                          diff text, feedback prose) — the agent reads `plan_file_path` \
+                          directly and runs `git` locally against `repo_root` to inspect \
+                          commits.\n\n\
                           - `session_id`: the session.\n\
-                          - `author_label` (optional): if supplied, the response includes a \
-                          `feedback_file` block telling the caller where to write their \
-                          feedback file and its current ingestion status. Also upserts \
-                          `agents.last_seen` and emits at most one `agent_joined` event on \
-                          first sight.\n\n\
+                          - `author_label` (optional): when supplied, populates the \
+                          `write_feedback` and `prior_feedback` blocks scoped to that author. \
+                          Also upserts `agents.last_seen` and emits at most one `agent_joined` \
+                          event on first sight.\n\n\
+                          Response keys (always present, nullable when not applicable): \
+                          `schema_version`, `session_id`, `repo_root`, `plan_file_path`, \
+                          `git_logs_head_path`, `phase`, `review_target`, \
+                          `latest_plan_revision`, `latest_implementation_revision`, \
+                          `write_feedback` (caller's current-phase file), `prior_feedback` \
+                          (`self` + `others` from the caller's prior phase, e.g. plan files \
+                          surfaced during implementation), and `other_feedback_files` \
+                          grouped by `plan` / `impl` arrays.\n\n\
                           Read-only with respect to session/plan/feedback state. Does not \
                           bump `sessions.updated_at`."
                 .to_string(),

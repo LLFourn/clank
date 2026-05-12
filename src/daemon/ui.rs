@@ -2,10 +2,11 @@ use std::collections::HashMap;
 
 use maud::{DOCTYPE, Markup, PreEscaped, html};
 
+use crate::daemon::service::FeedbackFileSnapshot;
+use crate::domain::FeedbackFileStatus;
 use crate::storage::agents::Agent;
 use crate::storage::events::Event;
 use crate::storage::feedback::FeedbackRecord;
-use crate::storage::feedback_files::FeedbackFile;
 use crate::storage::implementation_revisions::ImplementationRevision;
 use crate::storage::plan_revisions::PlanRevision;
 use crate::storage::plans::Plan;
@@ -96,20 +97,18 @@ pub struct SessionDetail {
     pub impl_feedback: Vec<FeedbackItem>,
     pub archived_count: i64,
     pub timeline: Vec<TimelineItem>,
-    /// One row per (session, author_label). Derived status (current /
-    /// stale / missing / parse_error / not_yet_ingested) is computed at
-    /// render time from the row's columns + the session's active target.
-    pub feedback_files: Vec<FeedbackFile>,
+    /// Pre-derived snapshots from `SessionService::build_feedback_context`.
+    /// Each row's `status` is already computed against the kind's
+    /// expected target; the renderer doesn't recompute.
+    pub plan_feedback_files: Vec<FeedbackFileSnapshot>,
+    pub impl_feedback_files: Vec<FeedbackFileSnapshot>,
     /// Path of `.git/logs/HEAD` for the session's repo, if it could be
     /// resolved. Shown in the watched-artifacts strip.
     pub git_logs_head_path: Option<String>,
-    /// `<repo_root>/.trinity/feedback/<session_id>/`, shown in the strip.
-    pub feedback_dir_path: Option<String>,
-    /// HEAD-derived `(kind, id)` of the current review target as
-    /// resolved by `SessionService::resolve_active_target`. Shared so
-    /// the web UI, `get_context`, and the feedback dispatcher all show
-    /// the same target after a reset-to-older-SHA.
-    pub active_target: Option<(String, String)>,
+    /// `<repo_root>/.trinity/feedback/<session_id>/plan/` and `.../impl/`,
+    /// shown in the watched-artifacts strip.
+    pub plan_feedback_dir_path: Option<String>,
+    pub impl_feedback_dir_path: Option<String>,
 }
 
 pub struct DiffViewFeedback {
@@ -246,7 +245,6 @@ fn short(sha: &str) -> String {
 }
 
 fn watched_artifacts_strip(d: &SessionDetail) -> Markup {
-    let active_target = current_active_target(d);
     html! {
         section.watched-artifacts {
             h2 { "Watched artifacts" }
@@ -259,39 +257,53 @@ fn watched_artifacts_strip(d: &SessionDetail) -> Markup {
                         None => "(unresolved)",
                     }
                 }
-                dt { "Feedback directory" }
+                dt { "Plan feedback directory" }
                 dd.path {
-                    @match d.feedback_dir_path.as_deref() {
+                    @match d.plan_feedback_dir_path.as_deref() {
+                        Some(p) => (p),
+                        None => "(not yet attached)",
+                    }
+                }
+                dt { "Impl feedback directory" }
+                dd.path {
+                    @match d.impl_feedback_dir_path.as_deref() {
                         Some(p) => (p),
                         None => "(not yet attached)",
                     }
                 }
             }
-            @if d.feedback_files.is_empty() {
-                p.empty { "No feedback files registered yet. Reviewers drop a `<author>.md` into the feedback directory." }
-            } @else {
-                table.feedback-files {
-                    thead {
-                        tr {
-                            th { "Author" }
-                            th { "Status" }
-                            th { "Last ingested" }
-                            th { "Last ingested target" }
-                        }
+            (feedback_files_table("Plan feedback files", &d.plan_feedback_files))
+            (feedback_files_table("Implementation feedback files", &d.impl_feedback_files))
+        }
+    }
+}
+
+fn feedback_files_table(heading: &str, files: &[FeedbackFileSnapshot]) -> Markup {
+    html! {
+        h3 { (heading) }
+        @if files.is_empty() {
+            p.empty { "None yet. Reviewers drop `<author>.md` into the directory above." }
+        } @else {
+            table.feedback-files {
+                thead {
+                    tr {
+                        th { "Author" }
+                        th { "Status" }
+                        th { "Last ingested" }
+                        th { "Last ingested target" }
                     }
-                    tbody {
-                        @for f in &d.feedback_files {
-                            @let status = derive_feedback_file_status(f, active_target.as_ref());
-                            tr {
-                                td.mono { (f.author_label) }
-                                td { (feedback_file_badge(status)) }
-                                td.relative { (relative_time(f.last_ingested_at)) }
-                                td.mono {
-                                    @match (f.last_ingested_target_kind.as_deref(), f.last_ingested_target_id.as_deref()) {
-                                        (Some(k), Some(id)) if k == "implementation_commit" => (short(id)),
-                                        (Some(_), Some(id)) => (id),
-                                        _ => "—",
-                                    }
+                }
+                tbody {
+                    @for s in files {
+                        tr {
+                            td.mono { (s.row.author_label) }
+                            td { (feedback_file_badge(s.status)) }
+                            td.relative { (relative_time(s.row.last_ingested_at)) }
+                            td.mono {
+                                @match (s.row.last_ingested_target_kind.as_deref(), s.row.last_ingested_target_id.as_deref()) {
+                                    (Some(k), Some(id)) if k == "implementation_commit" => (short(id)),
+                                    (Some(_), Some(id)) => (id),
+                                    _ => "—",
                                 }
                             }
                         }
@@ -302,50 +314,10 @@ fn watched_artifacts_strip(d: &SessionDetail) -> Markup {
     }
 }
 
-/// `(kind, id)` of the session's current active review target — the
-/// HEAD-derived target resolved upstream by
-/// `SessionService::resolve_active_target` and threaded through
-/// `SessionDetail`. The UI no longer re-derives this from
-/// `impl_revisions.last()`, which would disagree with `get_context`
-/// after a reset-to-older-SHA.
-fn current_active_target(d: &SessionDetail) -> Option<(String, String)> {
-    d.active_target.clone()
-}
-
-fn derive_feedback_file_status(
-    f: &FeedbackFile,
-    active_target: Option<&(String, String)>,
-) -> &'static str {
-    if f.parse_error.is_some() {
-        return "parse_error";
-    }
-    if f.last_observed_hash.is_none() {
-        return "missing";
-    }
-    let matches = match (
-        &f.last_ingested_target_kind,
-        &f.last_ingested_target_id,
-        active_target,
-    ) {
-        (Some(k), Some(id), Some((wk, wid))) => k == wk && id == wid,
-        _ => false,
-    };
-    let synced = match (&f.last_ingested_hash, &f.last_observed_hash) {
-        (Some(a), Some(b)) => a == b,
-        _ => false,
-    };
-    if matches && synced {
-        "current"
-    } else if f.last_ingested_hash.is_some() {
-        "stale"
-    } else {
-        "not_yet_ingested"
-    }
-}
-
-fn feedback_file_badge(status: &str) -> Markup {
-    let class = format!("badge feedback-file-status {status}");
-    html! { span.(class) { (status) } }
+fn feedback_file_badge(status: FeedbackFileStatus) -> Markup {
+    let s = status.as_str();
+    let class = format!("badge feedback-file-status {s}");
+    html! { span.(class) { (s) } }
 }
 
 pub fn session_detail(d: &SessionDetail) -> Markup {

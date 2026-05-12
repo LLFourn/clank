@@ -118,7 +118,7 @@ async fn reset_to_latest_impl_sha_records_audit_event_only() {
         .await
         .unwrap();
     assert_eq!(
-        r["active_target"]["id"].as_str().unwrap(),
+        r["review_target"]["id"].as_str().unwrap(),
         sha_b,
         "active_target should HEAD-derive back to sha_b"
     );
@@ -162,7 +162,7 @@ async fn reset_to_older_impl_sha_records_audit_event_and_active_target_moves() {
         .await
         .unwrap();
     assert_eq!(
-        r["active_target"]["id"].as_str().unwrap(),
+        r["review_target"]["id"].as_str().unwrap(),
         sha_a,
         "active_target follows HEAD back to older SHA"
     );
@@ -251,7 +251,7 @@ async fn head_at_unknown_sha_falls_back_to_latest_impl() {
         .call("get_context", &app.repo, None, json!({"session_id": "s"}))
         .await
         .unwrap();
-    let target = r["active_target"]["id"].as_str().unwrap();
+    let target = r["review_target"]["id"].as_str().unwrap();
     let latest_known: String = sqlx::query_scalar(
         "SELECT commit_sha FROM implementation_revisions ORDER BY id DESC LIMIT 1",
     )
@@ -276,15 +276,20 @@ async fn reset_to_older_sha_makes_ui_and_mcp_agree_on_target() {
     // Need a feedback file ingested against sha_a for the count to be
     // meaningful; we'll then reset to sha_a after committing past it.
     let canonical_repo = dunce::canonicalize(&app.repo).unwrap();
-    let feedback_dir = canonical_repo.join(".trinity").join("feedback").join("s");
+    let impl_dir = canonical_repo
+        .join(".trinity")
+        .join("feedback")
+        .join("s")
+        .join("impl");
     let sha_a = make_commit(&app.repo, "a.txt", "a\n");
     tokio::time::sleep(SETTLE).await;
-    std::fs::write(feedback_dir.join("rev-a.md"), "review of sha_a\n").unwrap();
+    // Write IMPL feedback (post-commit, impl phase).
+    std::fs::write(impl_dir.join("rev-a.md"), "review of sha_a\n").unwrap();
     tokio::time::sleep(SETTLE).await;
 
-    // Confirm feedback was ingested against sha_a.
+    // Confirm impl feedback was ingested against sha_a.
     let ingested_target: String = sqlx::query_scalar(
-        "SELECT last_ingested_target_id FROM feedback_files WHERE session_id = 's' AND author_label = 'rev-a'",
+        "SELECT last_ingested_target_id FROM feedback_files WHERE session_id = 's' AND feedback_kind = 'impl' AND author_label = 'rev-a'",
     )
     .fetch_one(&app.state.pool)
     .await
@@ -297,25 +302,20 @@ async fn reset_to_older_sha_makes_ui_and_mcp_agree_on_target() {
     common::run_git(&app.repo, &["reset", "--hard", &sha_a]);
     tokio::time::sleep(SETTLE).await;
 
-    // get_context says HEAD-derived target is sha_a.
+    // get_context: HEAD-derived target is sha_a.
     let mcp = app
         .call("get_context", &app.repo, None, json!({"session_id": "s"}))
         .await
         .unwrap();
-    assert_eq!(mcp["active_target"]["id"].as_str().unwrap(), sha_a);
+    assert_eq!(mcp["review_target"]["id"].as_str().unwrap(), sha_a);
 
-    // Web UI watched-artifacts table should mark rev-a as `current`
-    // (not `stale`) because the active target HEAD-derives to sha_a
-    // which matches the row's last_ingested_target_id.
+    // Web UI's impl table should mark rev-a as `current` because the
+    // active impl target HEAD-derives to sha_a, matching the row.
     let body = app.get("/sessions/s").await.text().await.unwrap();
-    let row_section: &str = body
-        .split("class=\"feedback-files\"")
-        .nth(1)
-        .expect("watched-artifacts table missing");
-    let row_section = row_section.split("</table>").next().unwrap();
     assert!(
-        row_section.contains("feedback-file-status current"),
-        "rev-a row should render `current` after reset to its target: snippet={row_section}"
+        body.contains("feedback-file-status current"),
+        "rev-a impl row should render `current` after reset to its target: body length {}",
+        body.len()
     );
 
     // Home page's "Files" column should also show 1.

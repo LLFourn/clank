@@ -18,10 +18,13 @@ use serde_json::json;
 use sqlx::SqlitePool;
 use tokio::sync::Mutex;
 
-use crate::domain::{EventKind, FeedbackTargetRef, TargetKind};
+use crate::domain::{
+    EventKind, FeedbackFileStatus, FeedbackKind, FeedbackTargetRef, Phase, TargetKind,
+};
 use crate::lifecycle::{
     ActivePlan, AgentLabel, Decision, LifecycleError, Observation, PlanFilePath, SessionId, decide,
 };
+use crate::storage::feedback_files::FeedbackFile;
 use crate::storage::{
     agents, events as ev_store, feedback as feedback_store, feedback::FeedbackRecord,
     implementation_revisions as impl_revs, plan_revisions, plans, sessions,
@@ -41,6 +44,12 @@ pub enum LifecycleServiceError {
     ActivePlan(#[from] plans::ActivePlanInconsistency),
     #[error("sql: {0}")]
     Sql(#[from] sqlx::Error),
+    /// Plan-file watcher attachment failed after the lifecycle
+    /// transaction committed. The DB now records the new plan path
+    /// but the watcher isn't bound to it; the caller must surface
+    /// this so it doesn't hand the agent a silently-broken session.
+    #[error("plan-file watcher attach failed: {0}")]
+    Watcher(String),
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -77,6 +86,71 @@ pub struct ActiveTarget {
     pub plan_id: i64,
     pub kind: TargetKind,
     pub id: String,
+}
+
+/// Outcome of `SessionService::resolve_target_for_kind`. Typed so the
+/// dispatcher's parse_error sentinel mapping lives in one place
+/// (`parse_error_for`) and no caller writes the strings by hand.
+#[derive(Debug, Clone)]
+pub enum FeedbackTargetResolution {
+    Found(ActiveTarget),
+    NoActivePlan,
+    /// kind=plan asked but no plan_revision exists yet. In practice
+    /// every plan is created with revision #1, so this is a rare
+    /// degenerate state.
+    NoActivePlanTarget,
+    /// kind=impl asked but the session is in `planning` phase or has
+    /// no observed impl revision.
+    NoActiveImplTarget,
+}
+
+impl FeedbackTargetResolution {
+    pub fn parse_error(&self) -> Option<&'static str> {
+        match self {
+            FeedbackTargetResolution::Found(_) => None,
+            FeedbackTargetResolution::NoActivePlan => Some("no_active_plan"),
+            FeedbackTargetResolution::NoActivePlanTarget => Some("no_active_plan_target_for_kind"),
+            FeedbackTargetResolution::NoActiveImplTarget => Some("no_active_impl_target_for_kind"),
+        }
+    }
+    pub fn into_option(self) -> Option<ActiveTarget> {
+        match self {
+            FeedbackTargetResolution::Found(t) => Some(t),
+            _ => None,
+        }
+    }
+}
+
+/// Pre-derived snapshot of one `feedback_files` row plus its read-time
+/// status. Carried inside `FeedbackContext` so consumers don't recompute.
+#[derive(Debug, Clone)]
+pub struct FeedbackFileSnapshot {
+    pub row: FeedbackFile,
+    pub exists_on_disk: bool,
+    pub status: FeedbackFileStatus,
+}
+
+/// Materialised feedback-context snapshot. Built once from a single
+/// read transaction; consumed by `get_context`, the watcher ingest
+/// dispatcher, the web UI, and tests.
+#[derive(Debug, Clone)]
+pub struct FeedbackContext {
+    pub session_id: SessionId,
+    pub repo_root: std::path::PathBuf,
+    pub plan_file_path: std::path::PathBuf,
+    pub git_logs_head_path: Option<std::path::PathBuf>,
+    pub phase: Phase,
+    pub review_target: Option<ActiveTarget>,
+    pub plan_target_resolution: FeedbackTargetResolution,
+    pub impl_target_resolution: FeedbackTargetResolution,
+    pub latest_plan_revision: Option<crate::storage::plan_revisions::PlanRevision>,
+    pub latest_implementation_revision:
+        Option<crate::storage::implementation_revisions::ImplementationRevision>,
+    pub head_sha: Option<String>,
+    pub worktree_dirty: Option<bool>,
+    pub worktree_status_hash: Option<String>,
+    pub plan_files: Vec<FeedbackFileSnapshot>,
+    pub impl_files: Vec<FeedbackFileSnapshot>,
 }
 
 /// Outcome of a `put_feedback` call.
@@ -194,6 +268,297 @@ impl SessionService {
         }
     }
 
+    /// Kind-aware target resolution. The dispatcher routes through this
+    /// (not `resolve_active_target`) so plan/ writes always target a
+    /// plan_revision and impl/ writes are accepted only in implementing
+    /// phase. Returns a typed `FeedbackTargetResolution` so the
+    /// parse_error sentinel mapping lives in `parse_error_for`.
+    pub async fn resolve_target_for_kind(
+        &self,
+        session_id: &SessionId,
+        kind: FeedbackKind,
+    ) -> Result<FeedbackTargetResolution, LifecycleServiceError> {
+        let session = match sessions::fetch(&self.pool, session_id).await? {
+            Some(s) => s,
+            None => return Err(LifecycleServiceError::NoSession(session_id.as_str().into())),
+        };
+        let Some(active_plan_id) = session.active_plan_id else {
+            return Ok(FeedbackTargetResolution::NoActivePlan);
+        };
+        let plan = match plans::fetch(&self.pool, active_plan_id).await? {
+            Some(p) => p,
+            None => return Ok(FeedbackTargetResolution::NoActivePlan),
+        };
+
+        match kind {
+            FeedbackKind::Plan => {
+                // plan/ is accepted in any phase that has an active plan.
+                let latest = plan_revisions::latest_for_plan(&self.pool, active_plan_id).await?;
+                match latest {
+                    Some(rev) => Ok(FeedbackTargetResolution::Found(ActiveTarget {
+                        plan_id: active_plan_id,
+                        kind: TargetKind::PlanRevision,
+                        id: rev.id.to_string(),
+                    })),
+                    None => Ok(FeedbackTargetResolution::NoActivePlanTarget),
+                }
+            }
+            FeedbackKind::Impl => {
+                // impl/ requires implementing phase.
+                if plan.state != "implementing" {
+                    return Ok(FeedbackTargetResolution::NoActiveImplTarget);
+                }
+                let head_sha = super::git::rev_parse_head(std::path::Path::new(&session.repo_root))
+                    .await
+                    .ok();
+                let head_match = match head_sha.as_deref() {
+                    Some(h) => impl_revs::fetch_by_sha(
+                        &self.pool,
+                        active_plan_id,
+                        &crate::lifecycle::CommitSha::from(h.to_string()),
+                    )
+                    .await?
+                    .map(|r| r.commit_sha),
+                    None => None,
+                };
+                let chosen = match head_match {
+                    Some(sha) => Some(sha),
+                    None => impl_revs::latest_for_plan(&self.pool, active_plan_id)
+                        .await?
+                        .map(|r| r.commit_sha),
+                };
+                match chosen {
+                    Some(sha) => Ok(FeedbackTargetResolution::Found(ActiveTarget {
+                        plan_id: active_plan_id,
+                        kind: TargetKind::ImplementationCommit,
+                        id: sha,
+                    })),
+                    None => Ok(FeedbackTargetResolution::NoActiveImplTarget),
+                }
+            }
+        }
+    }
+
+    /// One read snapshot consumed by `get_context`, the web UI, and
+    /// tests. Status is pre-derived per row using the row's kind's
+    /// expected target.
+    ///
+    /// Single-snapshot invariant: session, plan, latest revisions, all
+    /// feedback_files rows, and the HEAD SHA are read inside one
+    /// `BEGIN DEFERRED` transaction + one `git rev-parse HEAD` so a
+    /// concurrent watcher update can't yield a mixed view where phase
+    /// comes from one snapshot and target resolution from another.
+    pub async fn build_feedback_context(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<FeedbackContext, LifecycleServiceError> {
+        // Read git state first so we can fold HEAD-match lookup into
+        // the same DB transaction below. The two reads together form
+        // one read snapshot — a concurrent watcher update can't produce
+        // a mixed view where `phase` is from one moment and the
+        // resolved target from another.
+        let pre = sessions::fetch(&self.pool, session_id).await?;
+        let repo_root_for_git = pre.as_ref().map(|s| std::path::PathBuf::from(&s.repo_root));
+        let git_logs_head_path = match repo_root_for_git.as_ref() {
+            Some(r) => super::git::resolve_git_logs_head(r).await.ok(),
+            None => None,
+        };
+        let head_sha_from_git = match repo_root_for_git.as_ref() {
+            Some(r) => super::git::rev_parse_head(r).await.ok(),
+            None => None,
+        };
+
+        let mut tx = self.pool.begin().await?;
+
+        let session: crate::storage::sessions::Session =
+            match sqlx::query_as("SELECT * FROM sessions WHERE id = ?")
+                .bind(session_id.as_str())
+                .fetch_optional(&mut *tx)
+                .await?
+            {
+                Some(s) => s,
+                None => return Err(LifecycleServiceError::NoSession(session_id.as_str().into())),
+            };
+        let repo_root = std::path::PathBuf::from(&session.repo_root);
+        let plan_file_path = std::path::PathBuf::from(&session.plan_file_path);
+
+        let active_plan: Option<crate::storage::plans::Plan> = match session.active_plan_id {
+            Some(id) => {
+                sqlx::query_as("SELECT * FROM plans WHERE id = ?")
+                    .bind(id)
+                    .fetch_optional(&mut *tx)
+                    .await?
+            }
+            None => None,
+        };
+
+        let phase = match active_plan.as_ref().map(|p| p.state.as_str()) {
+            Some("planning") => Phase::Planning,
+            Some("implementing") => Phase::Implementing,
+            _ => Phase::NoActivePlan,
+        };
+
+        let latest_plan_revision: Option<crate::storage::plan_revisions::PlanRevision> =
+            match active_plan.as_ref() {
+                Some(p) => {
+                    sqlx::query_as(
+                        "SELECT * FROM plan_revisions WHERE plan_id = ? ORDER BY id DESC LIMIT 1",
+                    )
+                    .bind(p.id)
+                    .fetch_optional(&mut *tx)
+                    .await?
+                }
+                None => None,
+            };
+
+        let latest_impl_revision_row: Option<
+            crate::storage::implementation_revisions::ImplementationRevision,
+        > = match active_plan.as_ref() {
+            Some(p) => sqlx::query_as(
+                "SELECT * FROM implementation_revisions WHERE plan_id = ? ORDER BY id DESC LIMIT 1",
+            )
+            .bind(p.id)
+            .fetch_optional(&mut *tx)
+            .await?,
+            None => None,
+        };
+
+        // HEAD-match lookup inside the same tx as everything else so
+        // a concurrent INSERT of a new impl_revision can't sneak between
+        // the latest-row read and the HEAD-match read.
+        let head_match_row: Option<
+            crate::storage::implementation_revisions::ImplementationRevision,
+        > =
+            match (active_plan.as_ref(), head_sha_from_git.as_deref()) {
+                (Some(p), Some(head)) => sqlx::query_as(
+                    "SELECT * FROM implementation_revisions WHERE plan_id = ? AND commit_sha = ?",
+                )
+                .bind(p.id)
+                .bind(head)
+                .fetch_optional(&mut *tx)
+                .await?,
+                _ => None,
+            };
+
+        let all_files: Vec<FeedbackFile> = sqlx::query_as(
+            "SELECT * FROM feedback_files WHERE session_id = ? ORDER BY feedback_kind, author_label",
+        )
+        .bind(session_id.as_str())
+        .fetch_all(&mut *tx)
+        .await?;
+
+        tx.commit().await?;
+
+        // resolve_target_for_kind, inlined and driven by the locals.
+        let plan_target_resolution = match (active_plan.as_ref(), latest_plan_revision.as_ref()) {
+            (None, _) => FeedbackTargetResolution::NoActivePlan,
+            (Some(_), None) => FeedbackTargetResolution::NoActivePlanTarget,
+            (Some(p), Some(rev)) => FeedbackTargetResolution::Found(ActiveTarget {
+                plan_id: p.id,
+                kind: TargetKind::PlanRevision,
+                id: rev.id.to_string(),
+            }),
+        };
+
+        let impl_target_resolution = match (active_plan.as_ref(), &latest_impl_revision_row) {
+            (None, _) => FeedbackTargetResolution::NoActivePlan,
+            (Some(p), _) if p.state != "implementing" => {
+                FeedbackTargetResolution::NoActiveImplTarget
+            }
+            (Some(_), None) => FeedbackTargetResolution::NoActiveImplTarget,
+            (Some(p), Some(latest)) => {
+                let sha = match (head_match_row.as_ref(), head_sha_from_git.as_deref()) {
+                    (Some(_), Some(head)) => head.to_string(),
+                    _ => latest.commit_sha.clone(),
+                };
+                FeedbackTargetResolution::Found(ActiveTarget {
+                    plan_id: p.id,
+                    kind: TargetKind::ImplementationCommit,
+                    id: sha,
+                })
+            }
+        };
+
+        // review_target follows the phase: for implementing, this is
+        // the impl resolution; for planning, the plan resolution; for
+        // no-active-plan, None.
+        let review_target = match phase {
+            Phase::Implementing => impl_target_resolution.clone().into_option(),
+            Phase::Planning => plan_target_resolution.clone().into_option(),
+            Phase::NoActivePlan => None,
+        };
+
+        // `latest_implementation_revision` view: present iff phase is
+        // implementing AND we have a row matching the resolved target.
+        let (latest_implementation_revision, worktree_dirty, worktree_status_hash) = if phase
+            == Phase::Implementing
+            && let Some(target) = review_target.as_ref()
+        {
+            let chosen = if let Some(row) = head_match_row {
+                Some(row.clone())
+            } else {
+                latest_impl_revision_row
+                    .as_ref()
+                    .filter(|r| r.commit_sha == target.id)
+                    .cloned()
+            };
+            let porcelain = super::git::worktree_porcelain(&repo_root)
+                .await
+                .unwrap_or_default();
+            let dirty = !porcelain.trim().is_empty();
+            let hash = blake3::hash(porcelain.as_bytes()).to_hex().to_string();
+            (chosen, Some(dirty), Some(hash))
+        } else {
+            (None, None, None)
+        };
+        let head_sha = head_sha_from_git;
+
+        let plan_expected = match &plan_target_resolution {
+            FeedbackTargetResolution::Found(t) => Some(t.clone()),
+            _ => None,
+        };
+        let impl_expected = match &impl_target_resolution {
+            FeedbackTargetResolution::Found(t) => Some(t.clone()),
+            _ => None,
+        };
+
+        let mut plan_files = Vec::new();
+        let mut impl_files = Vec::new();
+        for row in all_files {
+            let exists = std::path::Path::new(&row.path).exists();
+            let (target_expected, bucket) = match row.kind() {
+                Some(FeedbackKind::Plan) => (plan_expected.as_ref(), &mut plan_files),
+                Some(FeedbackKind::Impl) => (impl_expected.as_ref(), &mut impl_files),
+                None => continue,
+            };
+            let status =
+                super::feedback_status::derive_feedback_file_status(&row, target_expected, exists);
+            bucket.push(FeedbackFileSnapshot {
+                row,
+                exists_on_disk: exists,
+                status,
+            });
+        }
+
+        Ok(FeedbackContext {
+            session_id: session_id.clone(),
+            repo_root,
+            plan_file_path,
+            git_logs_head_path,
+            phase,
+            review_target,
+            plan_target_resolution,
+            impl_target_resolution,
+            latest_plan_revision,
+            latest_implementation_revision,
+            head_sha,
+            worktree_dirty,
+            worktree_status_hash,
+            plan_files,
+            impl_files,
+        })
+    }
+
     async fn lock_for(
         &self,
         session_id: &SessionId,
@@ -261,11 +626,23 @@ impl SessionService {
             apply::apply_decision(&mut tx, session_id, &decision, actor, now).await?;
         tx.commit().await?;
 
+        // The DB commit above is durable. Update the in-memory cache
+        // BEFORE the watcher attach so that a watcher failure can't
+        // leave the cache lagging behind committed state — a stale
+        // cache would route the next reducer call from the old state
+        // and re-issue effects (e.g. a second StartPlan on a session
+        // that already has an active plan).
+        *state = decision.new_active.clone();
+
         if let Some(path) = &path_for_update {
-            self.watcher.switch_plan_file(session_id, path);
+            // Propagate watcher errors so the caller knows the session
+            // isn't fully wired. The cache already matches the DB above,
+            // so retries operate on a consistent base.
+            self.watcher
+                .switch_plan_file(session_id, path)
+                .map_err(|err| LifecycleServiceError::Watcher(err.to_string()))?;
         }
 
-        *state = decision.new_active.clone();
         Ok(ObservationOutcome {
             decision,
             apply: apply_outcome,
@@ -296,7 +673,9 @@ impl SessionService {
             Err(LifecycleServiceError::NoSession(s)) => return Err(ServiceError::NoSession(s)),
             Err(LifecycleServiceError::ActivePlan(inc)) => return Err(inc.into()),
             Err(LifecycleServiceError::Sql(e)) => return Err(e.into()),
-            Err(LifecycleServiceError::Reducer(_)) | Err(LifecycleServiceError::Apply(_)) => {
+            Err(LifecycleServiceError::Reducer(_))
+            | Err(LifecycleServiceError::Apply(_))
+            | Err(LifecycleServiceError::Watcher(_)) => {
                 unreachable!("lock_for never returns these")
             }
         };

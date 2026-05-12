@@ -169,10 +169,13 @@ async fn cached_label_fills_missing_author_label_on_get_context() {
     let res = structured_result(&r);
     assert_eq!(res["session_id"], "cache-session");
 
-    // The feedback_file block is present iff author_label was supplied.
-    // Cached "rev-a" should have flowed through, so the block exists.
+    // `write_feedback` is non-null iff author_label was supplied. The
+    // cached "rev-a" should have flowed through.
+    let write = res
+        .get("write_feedback")
+        .expect("write_feedback key absent");
     assert!(
-        res.get("feedback_file").is_some(),
+        !write.is_null(),
         "shim should have filled cached author_label: {res}"
     );
 }
@@ -192,17 +195,18 @@ async fn caller_supplied_author_label_wins_over_cache() {
         }),
     );
 
-    // Caller supplies a different author_label explicitly. The feedback
-    // file path returned by get_context must reflect that, not the cached
-    // "rev-a".
+    // Caller supplies a different author_label explicitly. The
+    // write_feedback path returned by get_context must reflect that,
+    // not the cached "rev-a". Under the split-feedback layout the path
+    // is `<...>/plan/rev-b.md` during the planning phase.
     let r = shim.call_tool(
         "get_context",
         json!({ "session_id": "override-session", "author_label": "rev-b" }),
     );
     let res = structured_result(&r);
-    let feedback_path = res["feedback_file"]["path"].as_str().unwrap_or("");
+    let feedback_path = res["write_feedback"]["path"].as_str().unwrap_or("");
     assert!(
-        feedback_path.ends_with("/rev-b.md"),
-        "explicit author_label must win: got path {feedback_path}"
+        feedback_path.ends_with("/plan/rev-b.md"),
+        "explicit author_label must win + sit under plan/: got path {feedback_path}"
     );
 }

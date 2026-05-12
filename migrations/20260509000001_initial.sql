@@ -81,13 +81,15 @@ CREATE TABLE feedback (
 CREATE INDEX feedback_plan         ON feedback(plan_id, id);
 CREATE INDEX feedback_session_plan ON feedback(session_id, plan_id, id);
 
--- Sidecar for files in `<repo_root>/.trinity/feedback/<session_id>/<author_label>.md`.
--- One row per (session, author). Created on first observation by the
--- feedback directory watcher; path is fully determined by convention.
+-- Sidecar for files in `<repo_root>/.trinity/feedback/<session_id>/<plan|impl>/<author_label>.md`.
+-- One row per (session, feedback_kind, author). Same author can hold both
+-- a `plan` and an `impl` row simultaneously; their states are derived
+-- independently.
 CREATE TABLE feedback_files (
-    session_id   TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
-    author_label TEXT NOT NULL,
-    path         TEXT NOT NULL,
+    session_id    TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+    feedback_kind TEXT NOT NULL CHECK (feedback_kind IN ('plan','impl')),
+    author_label  TEXT NOT NULL,
+    path          TEXT NOT NULL,
     last_observed_hash TEXT,
     last_observed_at   INTEGER,
     last_ingested_hash TEXT,
@@ -99,7 +101,7 @@ CREATE TABLE feedback_files (
     parse_error TEXT,
     created_at INTEGER NOT NULL,
     updated_at INTEGER NOT NULL,
-    PRIMARY KEY (session_id, author_label)
+    PRIMARY KEY (session_id, feedback_kind, author_label)
 );
 CREATE INDEX feedback_files_session ON feedback_files(session_id);
 
