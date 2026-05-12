@@ -132,10 +132,16 @@ pub struct CommitDiffView {
 pub struct PlanRevisionView {
     pub session_id: String,
     pub rev: PlanRevision,
-    pub prev_rev_number: Option<i64>,
-    pub next_rev_number: Option<i64>,
+    pub prev: Option<PlanRevisionLink>,
+    pub next: Option<PlanRevisionLink>,
     pub body_html: String,
     pub feedback: Vec<DiffViewFeedback>,
+}
+
+/// Minimal info needed to render a prev/next link on the plan-revision page.
+pub struct PlanRevisionLink {
+    pub rev_id: i64,
+    pub revision_number: i64,
 }
 
 pub struct PlanRevisionDiffView {
@@ -241,11 +247,12 @@ fn feedback_file_badge(status: FeedbackFileStatus) -> Markup {
 
 pub fn session_detail(d: &SessionDetail) -> Markup {
     let session_id = d.session.id.clone();
-    let phase_text = d
-        .active_plan
-        .as_ref()
-        .map(|p| p.state.as_str())
-        .unwrap_or("no active plan");
+    let ctx = TimelineRenderCtx {
+        session_id: &session_id,
+        plan_rev_number_by_id: &d.plan_rev_number_by_id,
+        amend_by_sha: &d.amend_by_sha,
+        feedback_target_by_id: &d.feedback_target_by_id,
+    };
     layout(
         &format!("Trinity — {}", session_title(&d.session)),
         html! {
@@ -264,7 +271,6 @@ pub fn session_detail(d: &SessionDetail) -> Markup {
                         span.head-meta { "base " code.mono { (short(&plan.base_commit)) } }
                     }
                     span.head-meta { "plan: " span.path.mono { (d.session.plan_file_path) } }
-                    @let _ = phase_text;
                 }
             }
 
@@ -282,7 +288,7 @@ pub fn session_detail(d: &SessionDetail) -> Markup {
                             sse-swap="message"
                             hx-swap="none" {
                         @for ev in d.events.iter().rev() {
-                            (timeline_entry_full(ev, d))
+                            (timeline_entry_full(ev, &ctx))
                         }
                     }
                 }
@@ -291,15 +297,39 @@ pub fn session_detail(d: &SessionDetail) -> Markup {
     )
 }
 
-/// Render one timeline row for the initial page render. Pulls per-kind
-/// context out of `SessionDetail`'s lookup tables for the action links.
-fn timeline_entry_full(ev: &Event, d: &SessionDetail) -> Markup {
-    let class = timeline_entry_class(&ev.kind);
-    let actions = timeline_entry_actions(ev, d);
-    let title = timeline_entry_title(ev, d);
-    let preview = timeline_entry_preview(ev, d);
+/// The minimum lookup context needed to render one timeline row with
+/// click-through actions. Shared between the initial page render (built
+/// from `SessionDetail`) and the SSE per-event renderer (built per-event
+/// from focused DB lookups). Without this, the SSE fragment loses the
+/// action pills and the live timeline isn't actually click-through.
+pub struct TimelineRenderCtx<'a> {
+    pub session_id: &'a str,
+    pub plan_rev_number_by_id: &'a HashMap<i64, i64>,
+    pub amend_by_sha: &'a HashMap<String, crate::daemon::amend::AmendInfo>,
+    pub feedback_target_by_id: &'a HashMap<i64, (String, String)>,
+}
+
+/// Render one timeline row in the initial-page context.
+fn timeline_entry_full(ev: &Event, ctx: &TimelineRenderCtx) -> Markup {
+    render_entry(ev, ctx, false)
+}
+
+/// Shared row renderer. `live=true` adds the `live` class and the
+/// `hx-swap-oob="afterbegin:#timeline-feed"` attribute so an htmx SSE
+/// fragment prepends to the timeline.
+fn render_entry(ev: &Event, ctx: &TimelineRenderCtx, live: bool) -> Markup {
+    let kind_class = timeline_entry_class(&ev.kind);
+    let class_attr = if live {
+        format!("{kind_class} live")
+    } else {
+        kind_class.to_string()
+    };
+    let oob: Option<&str> = live.then_some("afterbegin:#timeline-feed");
+    let actions = timeline_entry_actions(ev, ctx);
+    let title = timeline_entry_title(ev, ctx);
+    let preview = timeline_entry_preview(ev);
     html! {
-        article.(class) id={ "event-" (ev.id) } {
+        article id={ "event-" (ev.id) } class=(class_attr) hx-swap-oob=[oob] {
             div.entry-title { (title) }
             div.entry-meta {
                 span.actor { (ev.actor) }
@@ -319,19 +349,19 @@ fn is_markup_empty(m: &Markup) -> bool {
     m.0.is_empty()
 }
 
-fn timeline_entry_title(ev: &Event, d: &SessionDetail) -> Markup {
+fn timeline_entry_title(ev: &Event, ctx: &TimelineRenderCtx) -> Markup {
     let payload: serde_json::Value =
         serde_json::from_str(&ev.payload).unwrap_or(serde_json::Value::Null);
     match ev.kind.as_str() {
         "plan_revision_created" => {
             let rev_id = ev.target_id.as_deref().and_then(|s| s.parse::<i64>().ok());
-            let n = rev_id.and_then(|id| d.plan_rev_number_by_id.get(&id).copied());
+            let n = rev_id.and_then(|id| ctx.plan_rev_number_by_id.get(&id).copied());
             html! { "Plan revision " @if let Some(n) = n { "#" (n) } @else { "—" } }
         }
         "impl_revision_created" => {
             let sha = ev.target_id.as_deref().unwrap_or("");
             let is_amend = matches!(
-                d.amend_by_sha.get(sha),
+                ctx.amend_by_sha.get(sha),
                 Some(crate::daemon::amend::AmendInfo::Amend { .. })
             );
             html! {
@@ -366,7 +396,7 @@ fn timeline_entry_title(ev: &Event, d: &SessionDetail) -> Markup {
     }
 }
 
-fn timeline_entry_preview(ev: &Event, _d: &SessionDetail) -> Option<Markup> {
+fn timeline_entry_preview(ev: &Event) -> Option<Markup> {
     // For impl commits, surface the first line of commit_message. We
     // don't have direct access to it from `Event`; the payload only
     // carries metadata. Surfacing this would require either a join in
@@ -391,16 +421,16 @@ fn timeline_entry_preview(ev: &Event, _d: &SessionDetail) -> Option<Markup> {
     }
 }
 
-fn timeline_entry_actions(ev: &Event, d: &SessionDetail) -> Markup {
+fn timeline_entry_actions(ev: &Event, ctx: &TimelineRenderCtx) -> Markup {
     use crate::daemon::amend::AmendInfo;
-    let session_id = &d.session.id;
+    let session_id = ctx.session_id;
     match ev.kind.as_str() {
         "plan_revision_created" => {
             let rev_id = ev.target_id.as_deref().and_then(|s| s.parse::<i64>().ok());
             let Some(rev_id) = rev_id else {
                 return html! {};
             };
-            let n = d.plan_rev_number_by_id.get(&rev_id).copied().unwrap_or(0);
+            let n = ctx.plan_rev_number_by_id.get(&rev_id).copied().unwrap_or(0);
             html! {
                 a.pill href={ "/sessions/" (session_id) "/plan_revisions/" (rev_id) } { "View body" }
                 @if n > 1 {
@@ -410,7 +440,7 @@ fn timeline_entry_actions(ev: &Event, d: &SessionDetail) -> Markup {
         }
         "impl_revision_created" => {
             let sha = ev.target_id.as_deref().unwrap_or("");
-            match d.amend_by_sha.get(sha) {
+            match ctx.amend_by_sha.get(sha) {
                 Some(AmendInfo::Amend {
                     prev_sha,
                     amend_base_parent_sha,
@@ -436,18 +466,16 @@ fn timeline_entry_actions(ev: &Event, d: &SessionDetail) -> Markup {
             html! { a.pill href={ "/sessions/" (session_id) "/commits/" (sha) } { "Diff parent..commit" } }
         }
         "feedback_added" | "feedback_updated" => {
-            // Pull the feedback_id from payload, then look up its target
-            // and route to the artifact page with the anchor.
             let payload: serde_json::Value =
                 serde_json::from_str(&ev.payload).unwrap_or(serde_json::Value::Null);
             let fid = payload.get("feedback_id").and_then(|v| v.as_i64());
             let Some(fid) = fid else { return html! {} };
-            let Some((kind, target_id)) = d.feedback_target_by_id.get(&fid) else {
+            let Some((kind, target_id)) = ctx.feedback_target_by_id.get(&fid) else {
                 return html! {};
             };
             if kind == "plan_revision" {
                 let rev_id: i64 = target_id.parse().unwrap_or(0);
-                let n = d.plan_rev_number_by_id.get(&rev_id).copied().unwrap_or(0);
+                let n = ctx.plan_rev_number_by_id.get(&rev_id).copied().unwrap_or(0);
                 html! {
                     a.pill href={ "/sessions/" (session_id) "/plan_revisions/" (rev_id) "#feedback-" (fid) } {
                         "Open in plan revision #" (n)
@@ -469,8 +497,58 @@ fn timeline_head_scripts() -> Markup {
     html! {
         script src="https://unpkg.com/htmx.org@2.0.3" defer {}
         script src="https://unpkg.com/htmx-ext-sse@2.2.2" defer {}
+        script { (PreEscaped(TIMELINE_FLIP_JS)) }
     }
 }
+
+/// FLIP-style shift-down: when an SSE OOB row prepends to `#timeline-feed`,
+/// the existing rows would otherwise reflow instantly. We snapshot the
+/// existing rows' positions before the swap, then on `htmx:oobAfterSwap`
+/// compute the delta and play it backwards as a transition so the rows
+/// appear to shift down to make room for the new entry. Falls back to a
+/// no-op when the user prefers reduced motion.
+const TIMELINE_FLIP_JS: &str = r#"
+(() => {
+  const FEED_SEL = '#timeline-feed';
+  const REDUCED = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+  if (REDUCED) return;
+  let snapshot = new Map();
+  function snap() {
+    snapshot.clear();
+    const feed = document.querySelector(FEED_SEL);
+    if (!feed) return;
+    for (const el of feed.children) {
+      if (!el.id) continue;
+      snapshot.set(el.id, el.getBoundingClientRect().top);
+    }
+  }
+  function play() {
+    const feed = document.querySelector(FEED_SEL);
+    if (!feed) return;
+    for (const el of feed.children) {
+      if (!el.id || !snapshot.has(el.id)) continue;
+      const prev = snapshot.get(el.id);
+      const next = el.getBoundingClientRect().top;
+      const delta = prev - next;
+      if (Math.abs(delta) < 0.5) continue;
+      el.style.transition = 'none';
+      el.style.transform = `translateY(${delta}px)`;
+      requestAnimationFrame(() => {
+        el.style.transition = 'transform 220ms ease-out';
+        el.style.transform = '';
+        el.addEventListener('transitionend', () => {
+          el.style.transition = '';
+        }, { once: true });
+      });
+    }
+    snapshot.clear();
+  }
+  document.addEventListener('htmx:beforeSwap', snap, true);
+  document.addEventListener('htmx:oobBeforeSwap', snap, true);
+  document.addEventListener('htmx:afterSwap', play, true);
+  document.addEventListener('htmx:oobAfterSwap', play, true);
+})();
+"#;
 
 // ---------- History ----------
 
@@ -686,11 +764,12 @@ pub fn plan_revision_view(view: &PlanRevisionView) -> Markup {
         &format!("Trinity — {title}"),
         html! {
             (detail_header(&view.session_id, &title, html! {
-                @if let Some(prev) = view.prev_rev_number {
-                    a.pill href={ "/sessions/" (view.session_id) "/plan_revisions/" (find_rev_id_for(prev)) "/diff" } { "Diff to #" (prev) }
+                @if let Some(prev) = &view.prev {
+                    a.pill href={ "/sessions/" (view.session_id) "/plan_revisions/" (view.rev.id) "/diff" } { "Diff to #" (prev.revision_number) }
+                    a.pill href={ "/sessions/" (view.session_id) "/plan_revisions/" (prev.rev_id) } { "← #" (prev.revision_number) }
                 }
-                @if let Some(next) = view.next_rev_number {
-                    a.pill href={ "/sessions/" (view.session_id) "/plan_revisions/" (find_rev_id_for(next)) } { "Next #" (next) " →" }
+                @if let Some(next) = &view.next {
+                    a.pill href={ "/sessions/" (view.session_id) "/plan_revisions/" (next.rev_id) } { "#" (next.revision_number) " →" }
                 }
             }))
             section.detail-meta {
@@ -730,25 +809,6 @@ pub fn plan_revision_diff(view: &PlanRevisionDiffView) -> Markup {
             (feedback_panel(&view.feedback))
         },
     )
-}
-
-/// The plan revision view's link to the diff page needs an `id` (not a
-/// revision_number). For now we accept that the caller has only the rev
-/// number and synthesises the URL with a placeholder; the route handler
-/// looks the row up by id from the URL. This helper just emits the
-/// numeric rev_id when the caller already knows it — for prev/next we
-/// fall back to a search URL pattern that the router doesn't actually
-/// serve. Keep it simple for v1: prev/next links use the rev_id of the
-/// caller's row plus +/-1 in revision_number, but since we don't have
-/// the prev/next id at render time, render the prev/next *revision*
-/// numbers as plain text labels on the buttons and route to the
-/// current revision's diff/view page — the user clicks Diff to see the
-/// previous-revision body inside the unified diff.
-///
-/// This is a stopgap. The proper fix is to plumb prev_rev_id / next_rev_id
-/// through `PlanRevisionView`; deferred to keep this increment moving.
-fn find_rev_id_for(_revision_number: i64) -> i64 {
-    0
 }
 
 /// Render the inline feedback panel used at the bottom of every artifact
@@ -795,77 +855,70 @@ fn detail_header(session_id: &str, title: &str, actions: Markup) -> Markup {
 }
 
 /// Render one SSE OOB fragment for a single `events` row. Used by the
-/// SSE handler to push live timeline insertions. Targets `#timeline-feed`
-/// with `afterbegin` so newest events land at the top.
+/// SSE handler to push live timeline insertions. Builds a per-event
+/// `TimelineRenderCtx` from focused DB lookups so the live row carries
+/// the same action pills as the initial-page render.
 pub async fn sse_event_fragment(
     pool: &sqlx::SqlitePool,
     session_id: &crate::lifecycle::SessionId,
     ev: &Event,
 ) -> Markup {
-    let _ = (pool, session_id);
-    let entry = timeline_entry_from_event(ev);
-    html! {
-        article.entry.live id={ "event-" (ev.id) } hx-swap-oob="afterbegin:#timeline-feed" class=(timeline_entry_class(&ev.kind)) {
-            (entry)
-        }
-    }
-}
+    use crate::domain::FeedbackTargetRef;
+    use crate::storage::{feedback as feedback_store, implementation_revisions, plan_revisions};
 
-/// One row's content from an `events` row. Used both at initial render
-/// and for SSE OOB fragments. Self-contained: no DB lookups for excerpts;
-/// the user gets the full body by clicking into the artifact page.
-fn timeline_entry_from_event(ev: &Event) -> Markup {
-    let payload: serde_json::Value =
-        serde_json::from_str(&ev.payload).unwrap_or(serde_json::Value::Null);
-    let (title, preview): (String, Option<String>) = match ev.kind.as_str() {
-        "plan_revision_created" => ("Plan revision".to_string(), None),
-        "impl_revision_created" => (
-            format!(
-                "Commit {}",
-                ev.target_id.as_deref().map(short).unwrap_or_default()
-            ),
-            None,
-        ),
-        "head_reset_to_known_sha" => (
-            format!(
-                "HEAD reset to {}",
-                ev.target_id.as_deref().map(short).unwrap_or_default()
-            ),
-            None,
-        ),
-        "state_transition" => {
-            let from = payload.get("from").and_then(|v| v.as_str());
-            let to = payload.get("to").and_then(|v| v.as_str());
-            let body = match (from, to) {
-                (Some(f), Some(t)) => format!("{f} → {t}"),
-                (_, Some(t)) => format!("→ {t}"),
-                _ => "state transition".to_string(),
-            };
-            (format!("State: {body}"), None)
+    let mut plan_rev_number_by_id: HashMap<i64, i64> = HashMap::new();
+    let mut amend_by_sha: HashMap<String, crate::daemon::amend::AmendInfo> = HashMap::new();
+    let mut feedback_target_by_id: HashMap<i64, (String, String)> = HashMap::new();
+
+    match ev.kind.as_str() {
+        "plan_revision_created" => {
+            if let Some(rev_id) = ev.target_id.as_deref().and_then(|s| s.parse::<i64>().ok())
+                && let Ok(Some(rev)) = plan_revisions::fetch(pool, rev_id).await
+            {
+                plan_rev_number_by_id.insert(rev.id, rev.revision_number);
+            }
         }
-        "feedback_added" => ("Feedback added".to_string(), None),
-        "feedback_updated" => ("Feedback updated".to_string(), None),
-        "agent_joined" => (format!("{} joined", ev.actor), None),
-        "dirty_worktree_warning" => (
-            format!(
-                "Dirty worktree at {}",
-                ev.target_id.as_deref().map(short).unwrap_or_default()
-            ),
-            None,
-        ),
-        "plan_file_missing" => ("Plan file missing".to_string(), None),
-        other => (other.to_string(), None),
-    };
-    html! {
-        div.entry-title { (title) }
-        div.entry-meta {
-            span.actor { (ev.actor) }
-            " · " span.relative title=(absolute_time(ev.ts)) { (relative_time(Some(ev.ts))) }
+        "impl_revision_created" | "head_reset_to_known_sha" => {
+            if let Some(plan_id) = ev.plan_id
+                && let Ok(rows) = implementation_revisions::list_for_plan(pool, plan_id).await
+            {
+                let infos = crate::daemon::amend::classify(&rows);
+                for (row, info) in rows.iter().zip(infos) {
+                    amend_by_sha.insert(row.commit_sha.clone(), info);
+                }
+            }
         }
-        @if let Some(p) = preview {
-            div.entry-preview { (p) }
+        "feedback_added" | "feedback_updated" => {
+            let payload: serde_json::Value =
+                serde_json::from_str(&ev.payload).unwrap_or(serde_json::Value::Null);
+            if let Some(fid) = payload.get("feedback_id").and_then(|v| v.as_i64())
+                && let Ok(Some(rec)) = feedback_store::fetch(pool, fid).await
+            {
+                let (kind, target) = match &rec.target {
+                    FeedbackTargetRef::PlanRevision(rev_id) => {
+                        if let Ok(Some(rev)) = plan_revisions::fetch(pool, *rev_id).await {
+                            plan_rev_number_by_id.insert(rev.id, rev.revision_number);
+                        }
+                        ("plan_revision".to_string(), rev_id.to_string())
+                    }
+                    FeedbackTargetRef::ImplementationCommit(sha) => (
+                        "implementation_commit".to_string(),
+                        sha.as_str().to_string(),
+                    ),
+                };
+                feedback_target_by_id.insert(rec.id, (kind, target));
+            }
         }
+        _ => {}
     }
+
+    let ctx = TimelineRenderCtx {
+        session_id: session_id.as_str(),
+        plan_rev_number_by_id: &plan_rev_number_by_id,
+        amend_by_sha: &amend_by_sha,
+        feedback_target_by_id: &feedback_target_by_id,
+    };
+    render_entry(ev, &ctx, true)
 }
 
 fn timeline_entry_class(kind: &str) -> &'static str {

@@ -69,6 +69,14 @@ async fn sse_emits_oob_fragment_for_new_plan_revision() {
         body.contains("entry plan-rev") && body.contains("event-"),
         "expected SSE fragment for plan_revision_created; got:\n{body}"
     );
+    assert!(
+        body.contains("View body"),
+        "SSE plan_revision fragment must carry click-through action pill; got:\n{body}"
+    );
+    assert!(
+        body.contains("hx-swap-oob=\"afterbegin:#timeline-feed\""),
+        "SSE fragment must declare OOB swap target; got:\n{body}"
+    );
 }
 
 #[tokio::test]
@@ -106,6 +114,10 @@ async fn sse_emits_oob_fragment_for_new_impl_commit() {
     make_commit(&app.repo, "f.txt", "x\n");
     let body = stream_handle.await.unwrap();
     assert!(body.contains("entry impl-commit"), "got:\n{body}");
+    assert!(
+        body.contains("Diff parent..commit"),
+        "SSE impl_commit fragment must carry click-through action pill; got:\n{body}"
+    );
 }
 
 #[tokio::test]
@@ -149,6 +161,10 @@ async fn sse_emits_oob_fragment_for_feedback_added() {
     std::fs::write(plan_dir.join("rev-a.md"), "ping\n").unwrap();
     let body = stream_handle.await.unwrap();
     assert!(body.contains("entry feedback"), "got:\n{body}");
+    assert!(
+        body.contains("Open in plan revision #") && body.contains("#feedback-"),
+        "SSE feedback fragment must carry click-through action pill with #feedback- anchor; got:\n{body}"
+    );
 }
 
 #[tokio::test]

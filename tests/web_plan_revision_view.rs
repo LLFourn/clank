@@ -132,6 +132,47 @@ async fn plan_revision_page_renders_inline_feedback_for_target_revision() {
 }
 
 #[tokio::test]
+async fn plan_revision_prev_and_next_links_resolve_to_real_revisions() {
+    let app = TestApp::spawn().await;
+    let rev1 = register(&app).await;
+    let plan_path = app.repo.join("plan.md");
+    std::fs::write(&plan_path, "# v2\n").unwrap();
+    tokio::time::sleep(SETTLE).await;
+    std::fs::write(&plan_path, "# v3\n").unwrap();
+    tokio::time::sleep(SETTLE).await;
+    let rev2: i64 =
+        sqlx::query_scalar("SELECT id FROM plan_revisions WHERE revision_number = 2 LIMIT 1")
+            .fetch_one(&app.state.pool)
+            .await
+            .unwrap();
+    let rev3: i64 =
+        sqlx::query_scalar("SELECT id FROM plan_revisions WHERE revision_number = 3 LIMIT 1")
+            .fetch_one(&app.state.pool)
+            .await
+            .unwrap();
+    let resp = app.get(&format!("/sessions/s/plan_revisions/{rev2}")).await;
+    assert_eq!(resp.status(), 200);
+    let body = resp.text().await.unwrap();
+    assert!(
+        body.contains(&format!("/sessions/s/plan_revisions/{rev1}")),
+        "prev link must point at real prev rev_id {rev1}; body:\n{body}"
+    );
+    assert!(
+        body.contains(&format!("/sessions/s/plan_revisions/{rev3}")),
+        "next link must point at real next rev_id {rev3}; body:\n{body}"
+    );
+    assert!(
+        !body.contains("/plan_revisions/0"),
+        "no link should resolve to rev_id 0; body:\n{body}"
+    );
+    // Follow them — neither should 404.
+    let resp_prev = app.get(&format!("/sessions/s/plan_revisions/{rev1}")).await;
+    assert_eq!(resp_prev.status(), 200);
+    let resp_next = app.get(&format!("/sessions/s/plan_revisions/{rev3}")).await;
+    assert_eq!(resp_next.status(), 200);
+}
+
+#[tokio::test]
 async fn plan_revision_feedback_blocks_carry_stable_feedback_id_anchors() {
     let app = TestApp::spawn().await;
     let rev_id = register(&app).await;

@@ -558,8 +558,14 @@ async fn plan_revision_view(
         ui::plan_revision_view(&ui::PlanRevisionView {
             session_id: sid.as_str().to_string(),
             rev,
-            prev_rev_number: prev.as_ref().map(|r| r.revision_number),
-            next_rev_number: next.as_ref().map(|r| r.revision_number),
+            prev: prev.as_ref().map(|r| ui::PlanRevisionLink {
+                rev_id: r.id,
+                revision_number: r.revision_number,
+            }),
+            next: next.as_ref().map(|r| ui::PlanRevisionLink {
+                rev_id: r.id,
+                revision_number: r.revision_number,
+            }),
             body_html,
             feedback,
         })
