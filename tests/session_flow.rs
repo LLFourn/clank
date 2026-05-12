@@ -3,6 +3,9 @@ mod common;
 use serde_json::json;
 
 use common::{TestApp, make_commit};
+use trinity::daemon::{CurrentFeedbackView, ServiceError};
+use trinity::domain::FeedbackTargetRef;
+use trinity::lifecycle::SessionId;
 
 #[tokio::test]
 async fn register_plan_file_creates_session_and_first_revision() {
@@ -86,7 +89,6 @@ async fn register_plan_file_same_body_is_no_op() {
         )
         .await
         .unwrap();
-    // No new revision; the same lifecycle is still active.
     assert_eq!(second["noop"], true);
 
     let revs: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM plan_revisions WHERE plan_id = ?")
@@ -133,6 +135,9 @@ async fn planning_edit_via_register_records_revision_same_plan() {
     assert_eq!(revs.len(), 2, "planning edit adds a revision, same plan_id");
 }
 
+/// Implementing → plan-file edit archives the active plan and starts
+/// a new one. The implementation commit is observed via the git-logs
+/// watcher rather than an explicit MCP call.
 #[tokio::test]
 async fn implementing_then_plan_edit_archives_and_starts_new() {
     let app = TestApp::spawn().await;
@@ -149,16 +154,8 @@ async fn implementing_then_plan_edit_archives_and_starts_new() {
         .unwrap();
     let plan_a = r["plan_id"].as_i64().unwrap();
     let _head = make_commit(&app.repo, "feature.txt", "x\n");
-    app.call(
-        "register_implementation_commit",
-        &app.repo,
-        Some("claude-main"),
-        json!({"session_id": "s", "commit_sha": "HEAD"}),
-    )
-    .await
-    .unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(2500)).await;
 
-    // Now edit plan file → archive + start new (re-register triggers).
     std::fs::write(&plan_path, "# new task body\n").unwrap();
     app.call(
         "register_plan_file",
@@ -192,49 +189,7 @@ async fn implementing_then_plan_edit_archives_and_starts_new() {
 }
 
 #[tokio::test]
-async fn register_impl_same_sha_is_idempotent() {
-    let app = TestApp::spawn().await;
-    let plan_path = app.repo.join("plan.md");
-    std::fs::write(&plan_path, "x").unwrap();
-    let r = app
-        .call(
-            "register_plan_file",
-            &app.repo,
-            None,
-            json!({"session_id": "s", "path": &plan_path, "label": "m"}),
-        )
-        .await
-        .unwrap();
-    let plan_id = r["plan_id"].as_i64().unwrap();
-    let _head = make_commit(&app.repo, "f.txt", "x\n");
-
-    app.call(
-        "register_implementation_commit",
-        &app.repo,
-        Some("m"),
-        json!({"session_id": "s", "commit_sha": "HEAD"}),
-    )
-    .await
-    .unwrap();
-    app.call(
-        "register_implementation_commit",
-        &app.repo,
-        Some("m"),
-        json!({"session_id": "s", "commit_sha": "HEAD"}),
-    )
-    .await
-    .unwrap();
-    let count: i64 =
-        sqlx::query_scalar("SELECT COUNT(*) FROM implementation_revisions WHERE plan_id = ?")
-            .bind(plan_id)
-            .fetch_one(&app.state.pool)
-            .await
-            .unwrap();
-    assert_eq!(count, 1, "same SHA must not duplicate impl revision");
-}
-
-#[tokio::test]
-async fn reviewer_join_and_post_feedback() {
+async fn feedback_via_service_succeeds_on_active_plan() {
     let app = TestApp::spawn().await;
     let plan_path = app.repo.join("plan.md");
     std::fs::write(&plan_path, "# body\n").unwrap();
@@ -250,23 +205,17 @@ async fn reviewer_join_and_post_feedback() {
     let rev_id = r["revision_id"].as_i64().unwrap();
 
     let post = app
-        .call(
-            "put_feedback",
-            &app.repo,
-            None,
-            json!({
-                "session_id": "s",
-                "target_kind": "plan_revision",
-                "target_id": rev_id.to_string(),
-                "body": "consider X",
-                "author_label": "rev",
-            }),
+        .put_feedback_via_service(
+            "s",
+            "rev",
+            FeedbackTargetRef::PlanRevision(rev_id),
+            "consider X",
         )
         .await
         .unwrap();
-    assert_eq!(post["was_insert"], true);
-    assert_eq!(post["was_no_op"], false);
-    let feedback_id = post["feedback_id"].as_i64().unwrap();
+    assert!(post.was_insert);
+    assert!(!post.was_no_op);
+    let feedback_id = post.record.id;
 
     let body: String = sqlx::query_scalar("SELECT body FROM feedback WHERE id = ?")
         .bind(feedback_id)
@@ -290,59 +239,19 @@ async fn feedback_on_archived_plan_is_rejected() {
         )
         .await
         .unwrap();
-    let plan_a = r["plan_id"].as_i64().unwrap();
     let rev_id = r["revision_id"].as_i64().unwrap();
 
-    let resp = app.post_form("/sessions/s/archive", "").await;
-    assert!(resp.status().is_redirection());
+    app.archive_via_service("s").await;
 
-    // No active plan now; put_feedback must refuse.
-    let (status, body) = app
-        .call(
-            "put_feedback",
-            &app.repo,
-            None,
-            json!({
-                "session_id": "s",
-                "target_kind": "plan_revision",
-                "target_id": rev_id.to_string(),
-                "body": "late",
-                "author_label": "rev",
-            }),
-        )
+    let err = app
+        .put_feedback_via_service("s", "rev", FeedbackTargetRef::PlanRevision(rev_id), "late")
         .await
-        .expect_err();
-    assert_eq!(status, reqwest::StatusCode::FORBIDDEN);
-    assert!(body.contains("no active plan"), "body: {body}");
-    let _ = plan_a;
+        .unwrap_err();
+    assert!(matches!(err, ServiceError::NoActivePlanForFeedback(_)));
 }
 
 #[tokio::test]
-async fn curator_archive_route_returns_303() {
-    let app = TestApp::spawn().await;
-    let plan_path = app.repo.join("plan.md");
-    std::fs::write(&plan_path, "x").unwrap();
-    app.call(
-        "register_plan_file",
-        &app.repo,
-        None,
-        json!({"session_id": "s", "path": &plan_path, "label": "m"}),
-    )
-    .await
-    .unwrap();
-    let resp = app.post_form("/sessions/s/archive", "").await;
-    assert!(resp.status().is_redirection());
-    let state: String = sqlx::query_scalar(
-        "SELECT state FROM plans WHERE session_id = 's' ORDER BY id DESC LIMIT 1",
-    )
-    .fetch_one(&app.state.pool)
-    .await
-    .unwrap();
-    assert_eq!(state, "archived");
-}
-
-#[tokio::test]
-async fn get_current_feedback_returns_active_plan_rows() {
+async fn current_feedback_view_via_service() {
     let app = TestApp::spawn().await;
     let plan_path = app.repo.join("plan.md");
     std::fs::write(&plan_path, "x").unwrap();
@@ -357,52 +266,51 @@ async fn get_current_feedback_returns_active_plan_rows() {
         .unwrap();
     let rev_id = r["revision_id"].as_i64().unwrap();
 
-    app.call(
-        "put_feedback",
-        &app.repo,
-        None,
-        json!({
-            "session_id": "s",
-            "target_kind": "plan_revision",
-            "target_id": rev_id.to_string(),
-            "body": "comment",
-            "author_label": "rev",
-        }),
+    app.put_feedback_via_service(
+        "s",
+        "rev",
+        FeedbackTargetRef::PlanRevision(rev_id),
+        "comment",
     )
     .await
     .unwrap();
 
     let view = app
-        .call(
-            "get_current_feedback",
-            &app.repo,
-            None,
-            json!({"session_id": "s"}),
-        )
+        .state
+        .lifecycle
+        .current_feedback(&SessionId::from("s"), None)
         .await
         .unwrap();
-    assert_eq!(view["state"], "active");
-    let items = view["feedback"].as_array().unwrap();
-    assert_eq!(items.len(), 1);
-    assert_eq!(items[0]["body"], "comment");
-    assert_eq!(items[0]["author_label"], "rev");
-    let digest_first = view["feedback_digest"].as_str().unwrap().to_string();
+    let CurrentFeedbackView::Active {
+        feedback,
+        feedback_digest,
+        ..
+    } = view
+    else {
+        panic!("expected active");
+    };
+    assert_eq!(feedback.len(), 1);
+    assert_eq!(feedback[0].body, "comment");
+    assert_eq!(feedback[0].author_label.as_str(), "rev");
 
-    // Re-read with no changes: digest is byte-stable.
-    let view_again = app
-        .call(
-            "get_current_feedback",
-            &app.repo,
-            Some("m"),
-            json!({"session_id": "s"}),
-        )
+    let view2 = app
+        .state
+        .lifecycle
+        .current_feedback(&SessionId::from("s"), None)
         .await
         .unwrap();
-    assert_eq!(view_again["feedback_digest"], digest_first);
+    let CurrentFeedbackView::Active {
+        feedback_digest: d2,
+        ..
+    } = view2
+    else {
+        panic!("expected active");
+    };
+    assert_eq!(feedback_digest, d2, "digest stable on re-read");
 }
 
 #[tokio::test]
-async fn get_current_feedback_no_active_plan() {
+async fn current_feedback_no_active_plan_via_service() {
     let app = TestApp::spawn().await;
     let plan_path = app.repo.join("plan.md");
     std::fs::write(&plan_path, "x").unwrap();
@@ -414,18 +322,15 @@ async fn get_current_feedback_no_active_plan() {
     )
     .await
     .unwrap();
-    app.post_form("/sessions/s/archive", "").await;
+    app.archive_via_service("s").await;
 
     let view = app
-        .call(
-            "get_current_feedback",
-            &app.repo,
-            Some("m"),
-            json!({"session_id": "s"}),
-        )
+        .state
+        .lifecycle
+        .current_feedback(&SessionId::from("s"), None)
         .await
         .unwrap();
-    assert_eq!(view["state"], "no_active_plan");
+    assert!(matches!(view, CurrentFeedbackView::NoActivePlan { .. }));
 }
 
 #[tokio::test]

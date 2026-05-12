@@ -1,14 +1,18 @@
-//! `agents.last_seen` semantics:
+//! `agents.last_seen` semantics under the watcher-coordinator model.
+//!
 //! - Any tool call that carries a label upserts the agents row.
 //! - First insert emits one `agent_joined` event; subsequent calls don't.
-//! - Read-path calls (`get_current_feedback`, `get_review_context`) bump
-//!   `last_seen` but never touch `sessions.updated_at` or emit events.
+//! - Read-path calls (`get_context`) bump `last_seen` but never touch
+//!   `sessions.updated_at` or emit events beyond the first-sight one.
+//! - Service-layer writes (`SessionService::put_feedback`) follow the
+//!   same first-sight rule when the label hadn't been seen before.
 
 mod common;
 
 use serde_json::json;
 
 use common::TestApp;
+use trinity::domain::FeedbackTargetRef;
 
 #[tokio::test]
 async fn any_labeled_call_upserts_seen() {
@@ -27,17 +31,11 @@ async fn any_labeled_call_upserts_seen() {
         .unwrap();
     let rev_id = r["revision_id"].as_i64().unwrap();
 
-    app.call(
-        "put_feedback",
-        &app.repo,
-        None,
-        json!({
-            "session_id": "s",
-            "target_kind": "plan_revision",
-            "target_id": rev_id.to_string(),
-            "body": "feedback from rev",
-            "author_label": "rev",
-        }),
+    app.put_feedback_via_service(
+        "s",
+        "rev",
+        FeedbackTargetRef::PlanRevision(rev_id),
+        "feedback from rev",
     )
     .await
     .unwrap();
@@ -65,7 +63,6 @@ async fn register_plan_file_is_not_a_claim() {
     )
     .await
     .unwrap();
-    // Re-register with a different label immediately — must succeed.
     app.call(
         "register_plan_file",
         &app.repo,
@@ -98,13 +95,12 @@ async fn first_seen_label_emits_event_subsequent_calls_silent() {
     .await
     .unwrap();
 
-    // Read-path calls multiple times — must not pile up agent_joined events.
     for _ in 0..3 {
         app.call(
-            "get_current_feedback",
+            "get_context",
             &app.repo,
             None,
-            json!({"session_id": "s", "label": "alice"}),
+            json!({"session_id": "s", "author_label": "alice"}),
         )
         .await
         .unwrap();
@@ -138,16 +134,14 @@ async fn read_path_does_not_churn_session_updated_at() {
         .await
         .unwrap();
 
-    // Sleep so a naive (still-erroneous) implementation that bumped
-    // updated_at on reads would write a strictly-greater timestamp.
     tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
 
     for _ in 0..5 {
         app.call(
-            "get_current_feedback",
+            "get_context",
             &app.repo,
             None,
-            json!({"session_id": "s", "label": "alice"}),
+            json!({"session_id": "s", "author_label": "alice"}),
         )
         .await
         .unwrap();
@@ -159,13 +153,10 @@ async fn read_path_does_not_churn_session_updated_at() {
         .unwrap();
     assert_eq!(
         before, after,
-        "read-only get_current_feedback must not bump sessions.updated_at"
+        "read-only get_context must not bump sessions.updated_at"
     );
 }
 
-/// The `agent_joined` invariant is "exactly once per (session_id, label)"
-/// — read paths count, not just write paths. A label that first shows up
-/// via `get_current_feedback` must produce one event, not zero.
 #[tokio::test]
 async fn first_seen_via_read_path_emits_agent_joined() {
     let app = TestApp::spawn().await;
@@ -180,14 +171,12 @@ async fn first_seen_via_read_path_emits_agent_joined() {
     .await
     .unwrap();
 
-    // 'bob' has never been seen. A get_current_feedback with this label
-    // is bob's first appearance. We expect ONE agent_joined event.
     for _ in 0..3 {
         app.call(
-            "get_current_feedback",
+            "get_context",
             &app.repo,
             None,
-            json!({"session_id": "s", "label": "bob"}),
+            json!({"session_id": "s", "author_label": "bob"}),
         )
         .await
         .unwrap();
@@ -202,64 +191,16 @@ async fn first_seen_via_read_path_emits_agent_joined() {
     assert_eq!(bob_joins, 1, "exactly one agent_joined for 'bob'");
 }
 
-/// An unknown session_id must surface as 404 from
-/// `register_implementation_commit` and must not leave a phantom
-/// `agents` row. (The upsert lives behind the existence check so a
-/// non-existent session_id can't trip the agents.session_id FK and
-/// surface as a 500.)
-#[tokio::test]
-async fn register_impl_on_unknown_session_is_404_no_agent_row() {
-    let app = TestApp::spawn().await;
-    let (status, body) = app
-        .call(
-            "register_implementation_commit",
-            &app.repo,
-            None,
-            json!({
-                "session_id": "ghost",
-                "commit_sha": "HEAD",
-                "label": "carol",
-            }),
-        )
-        .await
-        .expect_err();
-    assert_eq!(status, reqwest::StatusCode::NOT_FOUND, "body: {body}");
-
-    let agent_rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM agents WHERE label = 'carol'")
-        .fetch_one(&app.state.pool)
-        .await
-        .unwrap();
-    assert_eq!(
-        agent_rows, 0,
-        "an unknown session must not insert an agents row"
-    );
-}
-
-/// Same invariant as the write-tool case, but for the read tools. The
-/// shim's per-tool autofill means `label` is frequently present on
-/// reads without the caller thinking about it, so an unknown session_id
-/// must still surface as 404 — not as a 500 from the agents FK.
 #[tokio::test]
 async fn read_tools_on_unknown_session_are_404_with_label() {
     let app = TestApp::spawn().await;
 
     let (status, _) = app
         .call(
-            "get_current_feedback",
+            "get_context",
             &app.repo,
             None,
-            json!({"session_id": "ghost", "label": "alice"}),
-        )
-        .await
-        .expect_err();
-    assert_eq!(status, reqwest::StatusCode::NOT_FOUND);
-
-    let (status, _) = app
-        .call(
-            "get_review_context",
-            &app.repo,
-            None,
-            json!({"session_id": "ghost", "label": "alice"}),
+            json!({"session_id": "ghost", "author_label": "alice"}),
         )
         .await
         .expect_err();
@@ -275,9 +216,51 @@ async fn read_tools_on_unknown_session_are_404_with_label() {
     );
 }
 
-/// The toolbar must not advertise actions whose POST routes have been
-/// deleted. (`/evict-master` was the last role-era handler; clicking
-/// would 404.)
+/// Multiple `get_context` calls with the same label must produce
+/// exactly one `agent_joined` event (the first-sight one) and exactly
+/// one `agents` row.
+#[tokio::test]
+async fn get_context_with_label_upserts_seen_once() {
+    let app = TestApp::spawn().await;
+    let plan_path = app.repo.join("plan.md");
+    std::fs::write(&plan_path, "# body\n").unwrap();
+    app.call(
+        "register_plan_file",
+        &app.repo,
+        None,
+        json!({"session_id": "s", "path": &plan_path, "label": "m"}),
+    )
+    .await
+    .unwrap();
+
+    for _ in 0..4 {
+        app.call(
+            "get_context",
+            &app.repo,
+            None,
+            json!({"session_id": "s", "author_label": "polly"}),
+        )
+        .await
+        .unwrap();
+    }
+
+    let polly_joins: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM events WHERE session_id = 's' AND kind = 'agent_joined' AND actor = 'agent:polly'",
+    )
+    .fetch_one(&app.state.pool)
+    .await
+    .unwrap();
+    assert_eq!(polly_joins, 1);
+
+    let polly_rows: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM agents WHERE session_id = 's' AND label = 'polly'",
+    )
+    .fetch_one(&app.state.pool)
+    .await
+    .unwrap();
+    assert_eq!(polly_rows, 1);
+}
+
 #[tokio::test]
 async fn session_detail_does_not_render_evict_master() {
     let app = TestApp::spawn().await;
@@ -302,9 +285,6 @@ async fn session_detail_does_not_render_evict_master() {
     );
 }
 
-/// A rejected `put_feedback` (no active plan, target not in active
-/// plan, empty body) must not leave a phantom `agent_joined` event or
-/// `agents` row. The label upsert sits behind validation.
 #[tokio::test]
 async fn rejected_put_feedback_does_not_record_agent_joined() {
     let app = TestApp::spawn().await;
@@ -319,29 +299,22 @@ async fn rejected_put_feedback_does_not_record_agent_joined() {
     .await
     .unwrap();
 
-    // Archive so the session has no active plan; the next put_feedback
-    // will be rejected at the service layer.
-    let resp = app.post_form("/sessions/s/archive", "").await;
-    assert!(resp.status().is_redirection());
+    app.archive_via_service("s").await;
 
-    let (status, _) = app
-        .call(
-            "put_feedback",
-            &app.repo,
-            None,
-            json!({
-                "session_id": "s",
-                "target_kind": "plan_revision",
-                "target_id": "1",
-                "body": "should be rejected",
-                "author_label": "dave",
-            }),
+    let err = app
+        .put_feedback_via_service(
+            "s",
+            "dave",
+            FeedbackTargetRef::PlanRevision(1),
+            "should be rejected",
         )
         .await
-        .expect_err();
-    assert_eq!(status, reqwest::StatusCode::FORBIDDEN);
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        trinity::daemon::ServiceError::NoActivePlanForFeedback(_)
+    ));
 
-    // 'dave' has never been seen successfully, so no agent_joined event.
     let dave_joins: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM events WHERE session_id = 's' \
          AND kind = 'agent_joined' AND actor = 'agent:dave'",
@@ -354,7 +327,6 @@ async fn rejected_put_feedback_does_not_record_agent_joined() {
         "rejected put_feedback must not log agent_joined"
     );
 
-    // Also: no agents row for 'dave'.
     let dave_rows: i64 =
         sqlx::query_scalar("SELECT COUNT(*) FROM agents WHERE session_id = 's' AND label = 'dave'")
             .fetch_one(&app.state.pool)

@@ -10,7 +10,9 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use tempfile::TempDir;
 use tokio::task::JoinHandle;
-use trinity::daemon::{self, AppState, DaemonShutdown};
+use trinity::daemon::{self, AppState, DaemonShutdown, FeedbackUpsertOutcome, ServiceError};
+use trinity::domain::FeedbackTargetRef;
+use trinity::lifecycle::{AgentLabel, Observation, SessionId};
 
 pub struct TestApp {
     pub base: String,
@@ -136,6 +138,41 @@ impl TestApp {
             .await
             .expect("post send")
     }
+
+    /// Direct in-process call to `SessionService::put_feedback`. The MCP
+    /// tool was removed; this is the supported way tests exercise the
+    /// feedback upsert path under the watcher-coordinator model.
+    pub async fn put_feedback_via_service(
+        &self,
+        session_id: &str,
+        author_label: &str,
+        target: FeedbackTargetRef,
+        body: impl Into<String>,
+    ) -> Result<FeedbackUpsertOutcome, ServiceError> {
+        self.state
+            .lifecycle
+            .put_feedback(
+                &SessionId::from(session_id),
+                &AgentLabel::from(author_label),
+                target,
+                body.into(),
+            )
+            .await
+    }
+
+    /// Direct in-process archive via the lifecycle service. Replaces
+    /// the deleted `POST /sessions/{id}/archive` curator route.
+    pub async fn archive_via_service(&self, session_id: &str) {
+        self.state
+            .lifecycle
+            .observe(
+                &SessionId::from(session_id),
+                "test:archive",
+                Observation::ArchiveRequested,
+            )
+            .await
+            .expect("archive via service");
+    }
 }
 
 #[allow(clippy::large_enum_variant)]
@@ -190,11 +227,8 @@ pub fn run_git(cwd: &Path, args: &[&str]) -> String {
 /// that don't want to repeat `label` / `author_label` inside `arguments`.
 fn label_arg_for(tool: &str) -> Option<&'static str> {
     match tool {
-        "put_feedback" => Some("author_label"),
-        "register_plan_file"
-        | "register_implementation_commit"
-        | "get_current_feedback"
-        | "get_review_context" => Some("label"),
+        "register_plan_file" => Some("label"),
+        "get_context" => Some("author_label"),
         _ => None,
     }
 }

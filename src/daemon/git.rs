@@ -13,8 +13,6 @@ pub enum GitError {
     CommandFailed(String),
     #[error("not in a git repository: {0}")]
     NotInRepo(PathBuf),
-    #[error("commit {sha} not found in {repo}")]
-    CommitNotFound { sha: String, repo: PathBuf },
     #[error("git command exited with non-zero status: {context}: {stderr}")]
     NonZero { context: String, stderr: String },
 }
@@ -59,28 +57,6 @@ pub async fn rev_parse_head(repo: &Path) -> Result<String, GitError> {
     run_git_ok(repo, &["rev-parse", "HEAD"]).await
 }
 
-/// Resolve any rev-spec (full SHA, short SHA, branch, "HEAD") to a full commit SHA.
-/// Returns `CommitNotFound` if the rev does not resolve in the repo.
-pub async fn resolve_to_full_sha(repo: &Path, rev: &str) -> Result<String, GitError> {
-    let output = run_git(
-        repo,
-        &[
-            "rev-parse",
-            "--verify",
-            "--end-of-options",
-            &format!("{rev}^{{commit}}"),
-        ],
-    )
-    .await?;
-    if !output.status.success() {
-        return Err(GitError::CommitNotFound {
-            sha: rev.to_string(),
-            repo: repo.to_path_buf(),
-        });
-    }
-    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
-}
-
 pub async fn parent_sha(repo: &Path, sha: &str) -> Result<Option<String>, GitError> {
     let output = run_git(repo, &["rev-list", "--parents", "-n", "1", sha]).await?;
     if !output.status.success() {
@@ -123,10 +99,6 @@ pub async fn diff_text(repo: &Path, parent: Option<&str>, sha: &str) -> Result<S
 
 pub async fn worktree_porcelain(repo: &Path) -> Result<String, GitError> {
     run_git_ok(repo, &["status", "--porcelain"]).await
-}
-
-pub fn short_sha(full: &str) -> String {
-    full.chars().take(12).collect()
 }
 
 /// Resolve the path to `logs/HEAD` inside the repo's git directory.

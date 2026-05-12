@@ -100,31 +100,35 @@ pub async fn get_context(state: &AppState, req: &ToolCallRequest) -> Result<Valu
         });
     }
 
-    // active_target: for planning, the latest plan_revision. For
-    // implementing, HEAD-derive — match HEAD against
-    // implementation_revisions; fall back to latest row.
-    let active_target = if phase == "implementing" {
+    // Resolve active target via the shared service helper so the MCP
+    // response, file-ingest dispatcher, and web UI all agree after a
+    // reset-to-older-SHA.
+    let active_target = state
+        .lifecycle
+        .resolve_active_target(&session_id)
+        .await
+        .map_err(|e| ToolError::Internal(anyhow::anyhow!(e)))?;
+    let target_kind_now = if phase == "implementing" {
+        TargetKind::ImplementationCommit
+    } else {
+        TargetKind::PlanRevision
+    };
+    let target_id_now: Option<String> = active_target.as_ref().map(|t| t.id.clone());
+
+    if phase == "implementing"
+        && let Some(target) = active_target.as_ref()
+    {
         let head_sha = git::rev_parse_head(Path::new(&session.repo_root))
             .await
             .map_err(|e| ToolError::Internal(anyhow::anyhow!("rev-parse HEAD: {e}")))?;
-
-        // Try HEAD match.
-        let head_match = impl_revs::fetch_by_sha(
+        let rev = impl_revs::fetch_by_sha(
             &state.pool,
             active.id,
-            &crate::lifecycle::CommitSha::from(head_sha.clone()),
+            &crate::lifecycle::CommitSha::from(target.id.clone()),
         )
         .await
         .map_err(|e| ToolError::Internal(anyhow::anyhow!(e)))?;
-
-        let chosen_rev = match head_match {
-            Some(rev) => Some(rev),
-            None => impl_revs::latest_for_plan(&state.pool, active.id)
-                .await
-                .map_err(|e| ToolError::Internal(anyhow::anyhow!(e)))?,
-        };
-
-        if let Some(rev) = chosen_rev.as_ref() {
+        if let Some(rev) = rev.as_ref() {
             let porcelain = git::worktree_porcelain(Path::new(&session.repo_root))
                 .await
                 .unwrap_or_default();
@@ -140,33 +144,14 @@ pub async fn get_context(state: &AppState, req: &ToolCallRequest) -> Result<Valu
                 "worktree_status_hash": status_hash,
                 "created_at": rev.created_at,
             });
-
-            Some(json!({
-                "kind": "implementation_commit",
-                "id": rev.commit_sha,
-            }))
-        } else {
-            None
         }
-    } else {
-        latest_plan_rev
-            .as_ref()
-            .map(|rev| json!({ "kind": "plan_revision", "id": rev.id.to_string() }))
-    };
-    if let Some(t) = active_target.as_ref() {
-        payload["active_target"] = t.clone();
     }
-
-    // Feedback files: caller's own (if author_label supplied) + all others.
-    let target_kind_now = if phase == "implementing" {
-        TargetKind::ImplementationCommit
-    } else {
-        TargetKind::PlanRevision
-    };
-    let target_id_now: Option<String> = active_target
-        .as_ref()
-        .and_then(|t| t.get("id"))
-        .and_then(|v| v.as_str().map(str::to_string));
+    if let Some(t) = active_target.as_ref() {
+        payload["active_target"] = json!({
+            "kind": t.kind.as_str(),
+            "id": t.id,
+        });
+    }
 
     let all_files = feedback_files::list_for_session(&state.pool, &session_id)
         .await

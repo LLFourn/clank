@@ -18,7 +18,7 @@ use crate::domain::{FeedbackTargetRef, TargetKind};
 use crate::lifecycle::{CommitSha, SessionId};
 use crate::storage::{
     agents, events as ev_store, feedback as feedback_store, feedback::FeedbackRecord,
-    implementation_revisions as impl_revs, plan_revisions, plans, sessions,
+    feedback_files, implementation_revisions as impl_revs, plan_revisions, plans, sessions,
 };
 
 pub fn router(state: AppState) -> Router {
@@ -35,10 +35,6 @@ pub fn router(state: AppState) -> Router {
         .route("/sessions/{session_id}/comment", post(curator::comment))
         .route("/sessions/{session_id}/archive", post(curator::archive))
         .route("/sessions/{session_id}/rename", post(curator::rename))
-        .route(
-            "/sessions/{session_id}/register-head",
-            post(curator::register_head_as_impl),
-        )
         .route("/internal/tools", get(internal_api::list_tools))
         .route("/internal/tool_call", post(internal_api::call_tool))
         .layer(middleware::from_fn(origin_guard))
@@ -66,15 +62,47 @@ async fn home(State(state): State<AppState>) -> Result<Html<String>, AppError> {
             None
         };
         let (plan_count, impl_count) = active_feedback_counts(&state, &sid).await?;
+        let current_feedback_files: i64 = count_current_feedback_files(&state, &sid).await?;
         out.push(ui::SessionRow {
             session: s,
             recent_agents,
             active_plan_state,
             plan_feedback_count: plan_count,
             impl_feedback_count: impl_count,
+            current_feedback_files,
         });
     }
     Ok(Html(ui::home(&out).into_string()))
+}
+
+/// Count how many of this session's `feedback_files` rows currently
+/// render as the `current` status. HEAD-derives the active target via
+/// the shared service helper so this count matches `get_context`.
+async fn count_current_feedback_files(state: &AppState, sid: &SessionId) -> Result<i64, AppError> {
+    let Some(target) = state
+        .lifecycle
+        .resolve_active_target(sid)
+        .await
+        .map_err(AppError::lifecycle)?
+    else {
+        return Ok(0);
+    };
+    let n: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM feedback_files \
+         WHERE session_id = ? \
+         AND parse_error IS NULL \
+         AND last_observed_hash IS NOT NULL \
+         AND last_ingested_hash = last_observed_hash \
+         AND last_ingested_target_kind = ? \
+         AND last_ingested_target_id = ?",
+    )
+    .bind(sid.as_str())
+    .bind(target.kind.as_str())
+    .bind(&target.id)
+    .fetch_one(&state.pool)
+    .await
+    .map_err(AppError::sqlx)?;
+    Ok(n)
 }
 
 async fn session_detail(
@@ -118,7 +146,15 @@ async fn session_detail(
     let active_feedback = feedback_store::list_for_active_plan(&state.pool, &sid)
         .await
         .map_err(AppError::feedback)?;
-    let current_commit_sha = impl_revisions.last().map(|r| r.commit_sha.clone());
+    let active_target = state
+        .lifecycle
+        .resolve_active_target(&sid)
+        .await
+        .map_err(AppError::lifecycle)?;
+    let current_commit_sha = active_target.as_ref().and_then(|t| match t.kind {
+        TargetKind::ImplementationCommit => Some(t.id.clone()),
+        _ => None,
+    });
     let (plan_feedback, impl_feedback) = build_feedback_items(
         &active_feedback,
         &plan_revisions,
@@ -153,6 +189,28 @@ async fn session_detail(
         .map(|ev| ui::TimelineItem::from_event(ev, &plan_revisions, &feedback_by_id))
         .collect();
 
+    let feedback_files_rows = feedback_files::list_for_session(&state.pool, &sid)
+        .await
+        .map_err(AppError::sqlx)?;
+
+    let repo_root_path = std::path::Path::new(&session.repo_root);
+    let git_logs_head_path = super::git::resolve_git_logs_head(repo_root_path)
+        .await
+        .ok()
+        .map(|p| p.display().to_string());
+    let feedback_dir_path = Some(
+        repo_root_path
+            .join(".trinity")
+            .join("feedback")
+            .join(sid.as_str())
+            .display()
+            .to_string(),
+    );
+
+    let active_target_for_ui = active_target
+        .as_ref()
+        .map(|t| (t.kind.as_str().to_string(), t.id.clone()));
+
     Ok(Html(
         ui::session_detail(&ui::SessionDetail {
             session,
@@ -165,6 +223,10 @@ async fn session_detail(
             impl_feedback,
             archived_count,
             timeline,
+            active_target: active_target_for_ui,
+            feedback_files: feedback_files_rows,
+            git_logs_head_path,
+            feedback_dir_path,
         })
         .into_string(),
     ))
@@ -461,6 +523,17 @@ impl AppError {
         Self {
             status: StatusCode::INTERNAL_SERVER_ERROR,
             message: format!("feedback storage: {err}"),
+        }
+    }
+    fn lifecycle(err: super::LifecycleServiceError) -> Self {
+        tracing::error!(error = ?err, "lifecycle service error");
+        let status = match &err {
+            super::LifecycleServiceError::NoSession(_) => StatusCode::NOT_FOUND,
+            _ => StatusCode::INTERNAL_SERVER_ERROR,
+        };
+        Self {
+            status,
+            message: err.to_string(),
         }
     }
 }

@@ -5,6 +5,7 @@ use maud::{DOCTYPE, Markup, PreEscaped, html};
 use crate::storage::agents::Agent;
 use crate::storage::events::Event;
 use crate::storage::feedback::FeedbackRecord;
+use crate::storage::feedback_files::FeedbackFile;
 use crate::storage::implementation_revisions::ImplementationRevision;
 use crate::storage::plan_revisions::PlanRevision;
 use crate::storage::plans::Plan;
@@ -18,6 +19,8 @@ pub struct SessionRow {
     pub active_plan_state: Option<String>,
     pub plan_feedback_count: i64,
     pub impl_feedback_count: i64,
+    /// Number of feedback files in `current` status for this session.
+    pub current_feedback_files: i64,
 }
 
 pub fn home(rows: &[SessionRow]) -> Markup {
@@ -43,6 +46,7 @@ pub fn home(rows: &[SessionRow]) -> Markup {
                             th { "Active plan" }
                             th.num { "Plan fb" }
                             th.num { "Impl fb" }
+                            th.num { "Files" }
                             th { "Updated" }
                         }
                     }
@@ -57,6 +61,7 @@ pub fn home(rows: &[SessionRow]) -> Markup {
                                 td { (active_plan_badge(row.active_plan_state.as_deref())) }
                                 td.num { (row.plan_feedback_count) }
                                 td.num { (row.impl_feedback_count) }
+                                td.num { (row.current_feedback_files) }
                                 td.relative { (relative_time(Some(row.session.updated_at))) }
                             }
                         }
@@ -91,6 +96,20 @@ pub struct SessionDetail {
     pub impl_feedback: Vec<FeedbackItem>,
     pub archived_count: i64,
     pub timeline: Vec<TimelineItem>,
+    /// One row per (session, author_label). Derived status (current /
+    /// stale / missing / parse_error / not_yet_ingested) is computed at
+    /// render time from the row's columns + the session's active target.
+    pub feedback_files: Vec<FeedbackFile>,
+    /// Path of `.git/logs/HEAD` for the session's repo, if it could be
+    /// resolved. Shown in the watched-artifacts strip.
+    pub git_logs_head_path: Option<String>,
+    /// `<repo_root>/.trinity/feedback/<session_id>/`, shown in the strip.
+    pub feedback_dir_path: Option<String>,
+    /// HEAD-derived `(kind, id)` of the current review target as
+    /// resolved by `SessionService::resolve_active_target`. Shared so
+    /// the web UI, `get_context`, and the feedback dispatcher all show
+    /// the same target after a reset-to-older-SHA.
+    pub active_target: Option<(String, String)>,
 }
 
 pub struct DiffViewFeedback {
@@ -163,6 +182,10 @@ impl TimelineItem {
                 ev.target_id.as_deref().map(short).unwrap_or_default()
             ),
             "dirty_worktree_warning" => "dirty worktree at commit registration".to_string(),
+            "head_reset_to_known_sha" => format!(
+                "HEAD reset to known commit {}",
+                ev.target_id.as_deref().map(short).unwrap_or_default()
+            ),
             "renamed" => format!(
                 "renamed to \"{}\"",
                 payload
@@ -222,6 +245,109 @@ fn short(sha: &str) -> String {
     sha.chars().take(12).collect()
 }
 
+fn watched_artifacts_strip(d: &SessionDetail) -> Markup {
+    let active_target = current_active_target(d);
+    html! {
+        section.watched-artifacts {
+            h2 { "Watched artifacts" }
+            dl {
+                dt { "Plan file" } dd.path { (d.session.plan_file_path) }
+                dt { "Git logs/HEAD" }
+                dd.path {
+                    @match d.git_logs_head_path.as_deref() {
+                        Some(p) => (p),
+                        None => "(unresolved)",
+                    }
+                }
+                dt { "Feedback directory" }
+                dd.path {
+                    @match d.feedback_dir_path.as_deref() {
+                        Some(p) => (p),
+                        None => "(not yet attached)",
+                    }
+                }
+            }
+            @if d.feedback_files.is_empty() {
+                p.empty { "No feedback files registered yet. Reviewers drop a `<author>.md` into the feedback directory." }
+            } @else {
+                table.feedback-files {
+                    thead {
+                        tr {
+                            th { "Author" }
+                            th { "Status" }
+                            th { "Last ingested" }
+                            th { "Last ingested target" }
+                        }
+                    }
+                    tbody {
+                        @for f in &d.feedback_files {
+                            @let status = derive_feedback_file_status(f, active_target.as_ref());
+                            tr {
+                                td.mono { (f.author_label) }
+                                td { (feedback_file_badge(status)) }
+                                td.relative { (relative_time(f.last_ingested_at)) }
+                                td.mono {
+                                    @match (f.last_ingested_target_kind.as_deref(), f.last_ingested_target_id.as_deref()) {
+                                        (Some(k), Some(id)) if k == "implementation_commit" => (short(id)),
+                                        (Some(_), Some(id)) => (id),
+                                        _ => "—",
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// `(kind, id)` of the session's current active review target — the
+/// HEAD-derived target resolved upstream by
+/// `SessionService::resolve_active_target` and threaded through
+/// `SessionDetail`. The UI no longer re-derives this from
+/// `impl_revisions.last()`, which would disagree with `get_context`
+/// after a reset-to-older-SHA.
+fn current_active_target(d: &SessionDetail) -> Option<(String, String)> {
+    d.active_target.clone()
+}
+
+fn derive_feedback_file_status(
+    f: &FeedbackFile,
+    active_target: Option<&(String, String)>,
+) -> &'static str {
+    if f.parse_error.is_some() {
+        return "parse_error";
+    }
+    if f.last_observed_hash.is_none() {
+        return "missing";
+    }
+    let matches = match (
+        &f.last_ingested_target_kind,
+        &f.last_ingested_target_id,
+        active_target,
+    ) {
+        (Some(k), Some(id), Some((wk, wid))) => k == wk && id == wid,
+        _ => false,
+    };
+    let synced = match (&f.last_ingested_hash, &f.last_observed_hash) {
+        (Some(a), Some(b)) => a == b,
+        _ => false,
+    };
+    if matches && synced {
+        "current"
+    } else if f.last_ingested_hash.is_some() {
+        "stale"
+    } else {
+        "not_yet_ingested"
+    }
+}
+
+fn feedback_file_badge(status: &str) -> Markup {
+    let class = format!("badge feedback-file-status {status}");
+    html! { span.(class) { (status) } }
+}
+
 pub fn session_detail(d: &SessionDetail) -> Markup {
     let session_id = d.session.id.clone();
     let total_plan = d.plan_feedback.len();
@@ -256,6 +382,7 @@ pub fn session_detail(d: &SessionDetail) -> Markup {
                     dt { "Joined agents" }  dd { (agents_widget(&d.agents)) }
                 }
             }
+            (watched_artifacts_strip(d))
 
             section.plan-review {
                 h2 { "Plan review" }
@@ -334,11 +461,8 @@ pub fn session_detail(d: &SessionDetail) -> Markup {
                     }
                 } @else if d.active_plan.is_some() {
                     p.empty {
-                        "No implementation yet. Master agent commits and calls "
-                        code { "register_implementation_commit" } "."
-                    }
-                    form method="post" action={ "/sessions/" (session_id) "/register-head" } onsubmit="return confirm('Register current HEAD as the implementation commit?')" {
-                        button type="submit" { "Start implementation review from current HEAD" }
+                        "No implementation yet. Make a commit in the repo — Trinity's git watcher will observe it automatically and transition the plan to "
+                        code { "implementing" } "."
                     }
                 }
 

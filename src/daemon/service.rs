@@ -23,7 +23,7 @@ use crate::lifecycle::{
     ActivePlan, AgentLabel, Decision, LifecycleError, Observation, PlanFilePath, SessionId, decide,
 };
 use crate::storage::{
-    events as ev_store, feedback as feedback_store, feedback::FeedbackRecord,
+    agents, events as ev_store, feedback as feedback_store, feedback::FeedbackRecord,
     implementation_revisions as impl_revs, plan_revisions, plans, sessions,
 };
 
@@ -67,6 +67,16 @@ pub enum ServiceError {
 pub struct ObservationOutcome {
     pub decision: Decision,
     pub apply: ApplyOutcome,
+}
+
+/// HEAD-derived current review target. `id` is the plan_revision id
+/// (as a string) for `PlanRevision`, or the full commit SHA for
+/// `ImplementationCommit`.
+#[derive(Debug, Clone)]
+pub struct ActiveTarget {
+    pub plan_id: i64,
+    pub kind: TargetKind,
+    pub id: String,
 }
 
 /// Outcome of a `put_feedback` call.
@@ -119,6 +129,69 @@ impl SessionService {
 
     pub fn watcher(&self) -> &super::watcher::Watcher {
         &self.watcher
+    }
+
+    /// Compute the session's current active review target. For
+    /// planning plans this is the latest plan_revision; for implementing
+    /// plans it HEAD-derives — preferring the row that matches current
+    /// `git HEAD`, falling back to the latest impl row when HEAD isn't
+    /// in the table (mid-amend / unobserved reset). Returns `None`
+    /// when the session has no active plan.
+    ///
+    /// Used by `get_context`, the feedback ingest dispatcher, and the
+    /// web UI so a reset-to-older-SHA doesn't leave the three surfaces
+    /// disagreeing about what's currently under review.
+    pub async fn resolve_active_target(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<Option<ActiveTarget>, LifecycleServiceError> {
+        let session = match sessions::fetch(&self.pool, session_id).await? {
+            Some(s) => s,
+            None => return Err(LifecycleServiceError::NoSession(session_id.as_str().into())),
+        };
+        let Some(active_plan_id) = session.active_plan_id else {
+            return Ok(None);
+        };
+        let plan = match plans::fetch(&self.pool, active_plan_id).await? {
+            Some(p) => p,
+            None => return Ok(None),
+        };
+        if plan.state == "implementing" {
+            let head_sha = super::git::rev_parse_head(std::path::Path::new(&session.repo_root))
+                .await
+                .ok();
+            let head_match = match head_sha.as_deref() {
+                Some(h) => impl_revs::fetch_by_sha(
+                    &self.pool,
+                    active_plan_id,
+                    &crate::lifecycle::CommitSha::from(h.to_string()),
+                )
+                .await?
+                .map(|r| r.commit_sha),
+                None => None,
+            };
+            let chosen = match head_match {
+                Some(sha) => Some(sha),
+                None => impl_revs::latest_for_plan(&self.pool, active_plan_id)
+                    .await?
+                    .map(|r| r.commit_sha),
+            };
+            Ok(chosen.map(|sha| ActiveTarget {
+                plan_id: active_plan_id,
+                kind: TargetKind::ImplementationCommit,
+                id: sha,
+            }))
+        } else if plan.state == "planning" {
+            Ok(plan_revisions::latest_for_plan(&self.pool, active_plan_id)
+                .await?
+                .map(|rev| ActiveTarget {
+                    plan_id: active_plan_id,
+                    kind: TargetKind::PlanRevision,
+                    id: rev.id.to_string(),
+                }))
+        } else {
+            Ok(None)
+        }
     }
 
     async fn lock_for(
@@ -273,6 +346,27 @@ impl SessionService {
         let now = chrono::Utc::now().timestamp();
         let mut tx = self.pool.begin().await?;
 
+        // Upsert agents.last_seen + emit one agent_joined on first-sight.
+        // Atomic with the feedback write: on a no-op or validation failure
+        // upstream we've already returned; on a transaction roll-back the
+        // agent row stays consistent with the feedback row.
+        let seen = agents::upsert_seen_tx(&mut tx, session_id, author, now).await?;
+        if matches!(seen, agents::SeenOutcome::Inserted) {
+            ev_store::append(
+                &mut *tx,
+                session_id,
+                None,
+                None,
+                None,
+                EventKind::AgentJoined.as_str(),
+                &format!("agent:{}", author.as_str()),
+                &json!({ "label": author.as_str() }),
+                None,
+                now,
+            )
+            .await?;
+        }
+
         let existing = feedback_store::find_by_natural_key(
             &mut *tx,
             active_plan_id,
@@ -358,11 +452,11 @@ impl SessionService {
             }
         };
 
-        if committed {
-            tx.commit().await?;
-        } else {
-            drop(tx);
-        }
+        // Always commit so the agents upsert above lands even on a
+        // body-no-op. (The `committed` flag predates the agents upsert;
+        // before it, a no-op had nothing to write, so we'd drop the tx.)
+        let _ = committed;
+        tx.commit().await?;
 
         Ok(outcome)
     }

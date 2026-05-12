@@ -168,8 +168,12 @@ pub async fn set_parse_error(
 }
 
 /// File disappeared from disk. Clear `last_observed_hash` so the
-/// derived status flips to `missing`. The historical `feedback` row
-/// (if any) is left alone — retraction is a v2 concern.
+/// derived status flips to `missing`. Also clears `parse_error` since
+/// the prior body that caused it no longer exists on disk — without
+/// clearing, the derived-status helpers check `parse_error` before
+/// `missing` and would leave a deleted-after-error file stuck in the
+/// error state forever. The historical `feedback` row (if any) is
+/// left alone — retraction is a v2 concern.
 pub async fn mark_missing(
     tx: &mut Transaction<'_, Sqlite>,
     session_id: &SessionId,
@@ -178,7 +182,7 @@ pub async fn mark_missing(
 ) -> sqlx::Result<()> {
     sqlx::query(
         "UPDATE feedback_files \
-         SET last_observed_hash = NULL, last_observed_at = ?, updated_at = ? \
+         SET last_observed_hash = NULL, last_observed_at = ?, parse_error = NULL, updated_at = ? \
          WHERE session_id = ? AND author_label = ?",
     )
     .bind(now)

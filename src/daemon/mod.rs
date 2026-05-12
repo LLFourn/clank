@@ -20,8 +20,8 @@ mod ui;
 pub(crate) mod watcher;
 
 pub use service::{
-    CurrentFeedbackView, FeedbackUpsertOutcome, LifecycleServiceError, ObservationOutcome,
-    ServiceError, SessionService,
+    ActiveTarget, CurrentFeedbackView, FeedbackUpsertOutcome, LifecycleServiceError,
+    ObservationOutcome, ServiceError, SessionService,
 };
 pub use watcher::{Watcher, WatcherEvent};
 
@@ -440,8 +440,28 @@ async fn dispatch_feedback_changed(
     let hash = blake3::hash(body.as_bytes()).to_hex().to_string();
 
     // Resolve the active target before the no-op guard so the guard can
-    // include target equality.
-    let active_target = resolve_active_feedback_target(lifecycle, &session).await?;
+    // include target equality. Reuses the service-level helper so the
+    // dispatcher, get_context, and the web UI all see the same target.
+    let active_target = lifecycle
+        .resolve_active_target(session_id)
+        .await
+        .ok()
+        .flatten()
+        .and_then(|t| match t.kind {
+            crate::domain::TargetKind::PlanRevision => t.id.parse::<i64>().ok().map(|n| {
+                (
+                    t.kind,
+                    t.id,
+                    crate::domain::FeedbackTargetRef::PlanRevision(n),
+                )
+            }),
+            crate::domain::TargetKind::ImplementationCommit => Some((
+                t.kind,
+                t.id.clone(),
+                crate::domain::FeedbackTargetRef::ImplementationCommit(CommitSha::from(t.id)),
+            )),
+        });
+    let _ = &session;
 
     let now = chrono::Utc::now().timestamp();
     let mut tx = lifecycle.pool().begin().await?;
@@ -459,13 +479,12 @@ async fn dispatch_feedback_changed(
     // Note: if there was a parse_error on the previous attempt we must
     // not no-op even if hash matches, because we'd be leaving the row
     // stuck in the error state when the underlying cause may have cleared.
-    if let Some(row) = existing.as_ref() {
-        if row.parse_error.is_none()
-            && row.last_observed_hash.as_deref() == Some(hash.as_str())
-            && target_matches(row, &active_target)
-        {
-            return Ok(());
-        }
+    if let Some(row) = existing.as_ref()
+        && row.parse_error.is_none()
+        && row.last_observed_hash.as_deref() == Some(hash.as_str())
+        && target_matches(row, &active_target)
+    {
+        return Ok(());
     }
 
     let path_str = path.to_string_lossy().into_owned();
@@ -530,63 +549,6 @@ async fn dispatch_feedback_changed(
 }
 
 /// Compute the (kind, id, ref) tuple for the current active review
-/// target. None when the session has no active plan.
-///
-/// For implementing plans we HEAD-derive: prefer the impl revision
-/// matching git HEAD; fall back to the latest impl row. This mirrors
-/// `get_context.active_target` resolution so the target the agent saw
-/// is the target the ingest will record against.
-async fn resolve_active_feedback_target(
-    lifecycle: &Arc<SessionService>,
-    session: &crate::storage::sessions::Session,
-) -> anyhow::Result<
-    Option<(
-        crate::domain::TargetKind,
-        String,
-        crate::domain::FeedbackTargetRef,
-    )>,
-> {
-    use crate::domain::{FeedbackTargetRef, TargetKind};
-    use crate::storage::{implementation_revisions as impl_revs, plan_revisions};
-
-    let Some(active_id) = session.active_plan_id else {
-        return Ok(None);
-    };
-    let state: String = sqlx::query_scalar("SELECT state FROM plans WHERE id = ?")
-        .bind(active_id)
-        .fetch_one(lifecycle.pool())
-        .await?;
-
-    if state == "implementing" {
-        let head_sha = git::rev_parse_head(Path::new(&session.repo_root)).await?;
-        let head_sha_obj = CommitSha::from(head_sha.clone());
-        let chosen =
-            match impl_revs::fetch_by_sha(lifecycle.pool(), active_id, &head_sha_obj).await? {
-                Some(rev) => Some(rev),
-                None => impl_revs::latest_for_plan(lifecycle.pool(), active_id).await?,
-            };
-        Ok(chosen.map(|rev| {
-            let sha = rev.commit_sha;
-            (
-                TargetKind::ImplementationCommit,
-                sha.clone(),
-                FeedbackTargetRef::ImplementationCommit(CommitSha::from(sha)),
-            )
-        }))
-    } else if state == "planning" {
-        let latest = plan_revisions::latest_for_plan(lifecycle.pool(), active_id).await?;
-        Ok(latest.map(|rev| {
-            (
-                TargetKind::PlanRevision,
-                rev.id.to_string(),
-                FeedbackTargetRef::PlanRevision(rev.id),
-            )
-        }))
-    } else {
-        Ok(None)
-    }
-}
-
 fn target_matches(
     row: &crate::storage::feedback_files::FeedbackFile,
     cur: &Option<(

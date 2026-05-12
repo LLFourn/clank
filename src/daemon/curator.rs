@@ -14,7 +14,7 @@ use serde_json::json;
 
 use super::AppState;
 use crate::domain::EventKind;
-use crate::lifecycle::{AgentLabel, CommitSha, CommitSnapshot, Observation, SessionId};
+use crate::lifecycle::{AgentLabel, Observation, SessionId};
 use crate::storage::{events as ev_store, implementation_revisions as impl_revs, plans, sessions};
 
 #[derive(Debug, Deserialize)]
@@ -116,60 +116,6 @@ pub async fn rename(
     )
     .await
     .map_err(ApiError::sqlx)?;
-    Ok(Redirect::to(&format!("/sessions/{session_id}")))
-}
-
-pub async fn register_head_as_impl(
-    State(state): State<AppState>,
-    Path(session_id): Path<String>,
-) -> Result<Redirect, ApiError> {
-    let sid = SessionId::from(session_id.clone());
-    let session = sessions::fetch(&state.pool, &sid)
-        .await
-        .map_err(ApiError::sqlx)?
-        .ok_or_else(|| ApiError::not_found(format!("session `{session_id}` not found")))?;
-    let repo = std::path::Path::new(&session.repo_root);
-    let head_sha = super::git::rev_parse_head(repo)
-        .await
-        .map_err(|e| ApiError::bad(format!("git rev-parse HEAD: {e}")))?;
-    let parent = super::git::parent_sha(repo, &head_sha)
-        .await
-        .map_err(|e| ApiError::bad(format!("git parent: {e}")))?;
-    let branch = super::git::current_branch(repo)
-        .await
-        .map_err(|e| ApiError::bad(format!("git branch: {e}")))?;
-    let message = super::git::commit_message(repo, &head_sha)
-        .await
-        .map_err(|e| ApiError::bad(format!("git log: {e}")))?;
-    let stat = super::git::diff_stat(repo, parent.as_deref(), &head_sha)
-        .await
-        .map_err(|e| ApiError::bad(format!("git diff-stat: {e}")))?;
-    let porcelain = super::git::worktree_porcelain(repo)
-        .await
-        .map_err(|e| ApiError::bad(format!("git status: {e}")))?;
-    let dirty = !porcelain.trim().is_empty();
-    let commit = CommitSnapshot {
-        sha: CommitSha::from(head_sha),
-        parent_sha: parent.map(CommitSha::from),
-        branch,
-        message,
-        diff_stat: stat,
-        worktree_status: Some(if dirty {
-            porcelain
-        } else {
-            "clean".to_string()
-        }),
-        is_head: true,
-    };
-    state
-        .lifecycle
-        .observe(
-            &sid,
-            "human:ui_fallback",
-            Observation::CommitObserved { commit },
-        )
-        .await
-        .map_err(ApiError::lifecycle)?;
     Ok(Redirect::to(&format!("/sessions/{session_id}")))
 }
 

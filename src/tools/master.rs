@@ -9,7 +9,6 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::daemon::AppState;
-use crate::daemon::ServiceError;
 use crate::daemon::apply::AppliedEffect;
 use crate::daemon::git;
 use crate::daemon::internal_api::ToolCallRequest;
@@ -245,21 +244,6 @@ pub(crate) fn map_lifecycle_err(err: crate::daemon::LifecycleServiceError) -> To
         E::ActivePlan(inc) => ToolError::Internal(anyhow::anyhow!(inc)),
         E::NoSession(s) => ToolError::NotFound(format!("session `{s}` not found")),
         E::Sql(e) => ToolError::Internal(anyhow::anyhow!(e)),
-    }
-}
-
-pub(crate) fn map_service_err(err: ServiceError) -> ToolError {
-    match err {
-        ServiceError::NoSession(s) => ToolError::NotFound(format!("session `{s}` not found")),
-        ServiceError::NoActivePlanForFeedback(_)
-        | ServiceError::FeedbackTargetNotInActivePlan { .. } => {
-            ToolError::Forbidden(err.to_string())
-        }
-        ServiceError::EmptyFeedbackBody => ToolError::Invalid(err.to_string()),
-        ServiceError::ActivePlan(inc) => ToolError::Internal(anyhow::anyhow!(inc)),
-        ServiceError::Decode(d) => ToolError::Internal(anyhow::anyhow!(d)),
-        ServiceError::Feedback(e) => ToolError::Internal(anyhow::anyhow!(e)),
-        ServiceError::Sql(e) => ToolError::Internal(anyhow::anyhow!(e)),
     }
 }
 

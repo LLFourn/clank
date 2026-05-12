@@ -4,7 +4,7 @@ use serde_json::json;
 
 use common::{TestApp, make_commit};
 
-/// Rule: Planning plan survives restart; watcher continues against the same
+/// Planning plan survives restart; watcher continues against the same
 /// plan_id.
 #[tokio::test]
 async fn planning_plan_survives_restart() {
@@ -52,9 +52,11 @@ async fn planning_plan_survives_restart() {
     assert_eq!(active, Some(plan_id));
 }
 
-/// Rule: Implementing plan survives restart; same-SHA commit re-register is
-/// idempotent; post-impl plan-file edit archives the active plan and starts a
-/// new one based on current HEAD.
+/// Implementing plan survives restart and a post-impl plan-file edit
+/// archives the active plan and starts a new one. Implementation
+/// commits are observed by the git logs/HEAD watcher; we make a commit
+/// then wait for the watcher to pick it up. The `register_implementation_commit`
+/// MCP tool is gone — that flow is fully automatic now.
 #[tokio::test]
 async fn implementing_plan_survives_restart_and_amend_works() {
     let app = TestApp::spawn().await;
@@ -70,36 +72,36 @@ async fn implementing_plan_survives_restart_and_amend_works() {
         .await
         .unwrap();
     let plan_a = r["plan_id"].as_i64().unwrap();
+
+    // First commit. The git-logs watcher transitions plan_a from
+    // planning → implementing.
     let head = make_commit(&app.repo, "feature.txt", "x\n");
-    app.call(
-        "register_implementation_commit",
-        &app.repo,
-        Some("m"),
-        json!({"session_id": "s", "commit_sha": &head}),
-    )
-    .await
-    .unwrap();
-
-    let app = app.restart().await;
-
-    // Same SHA re-register: must NOT add a duplicate impl revision.
-    app.call(
-        "register_implementation_commit",
-        &app.repo,
-        Some("m"),
-        json!({"session_id": "s", "commit_sha": &head}),
-    )
-    .await
-    .unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(2500)).await;
     let impl_count: i64 =
         sqlx::query_scalar("SELECT COUNT(*) FROM implementation_revisions WHERE plan_id = ?")
             .bind(plan_a)
             .fetch_one(&app.state.pool)
             .await
             .unwrap();
-    assert_eq!(impl_count, 1, "duplicate SHA must be a no-op");
+    assert_eq!(impl_count, 1, "first commit observed via watcher");
 
-    // Edit the plan file. Post-impl edit: archive plan_a + start new active plan.
+    let app = app.restart().await;
+
+    // Same HEAD across the restart: recovery's HEAD-drift check must
+    // see the SHA is already known and emit no new impl row.
+    let impl_count_after_restart: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM implementation_revisions WHERE plan_id = ?")
+            .bind(plan_a)
+            .fetch_one(&app.state.pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        impl_count_after_restart, 1,
+        "restart at same HEAD must not duplicate impl row"
+    );
+    let _ = head;
+
+    // Post-impl plan-file edit: archive plan_a + start new plan.
     std::fs::write(&plan_path, "# totally new task\n").unwrap();
     tokio::time::sleep(std::time::Duration::from_millis(2500)).await;
 
@@ -118,7 +120,6 @@ async fn implementing_plan_survives_restart_and_amend_works() {
     assert_ne!(new_active, Some(plan_a));
 }
 
-/// Rule: No-active session — file drift alone does not start a plan.
 #[tokio::test]
 async fn no_active_session_drift_does_not_start_plan() {
     let app = TestApp::spawn().await;
@@ -132,9 +133,7 @@ async fn no_active_session_drift_does_not_start_plan() {
     )
     .await
     .unwrap();
-    // Archive the active plan.
-    let resp = app.post_form("/sessions/s/archive", "").await;
-    assert!(resp.status().is_redirection());
+    app.archive_via_service("s").await;
     let active: Option<i64> =
         sqlx::query_scalar("SELECT active_plan_id FROM sessions WHERE id = 's'")
             .fetch_one(&app.state.pool)
@@ -144,7 +143,6 @@ async fn no_active_session_drift_does_not_start_plan() {
 
     let app = app.restart().await;
 
-    // Edit the watched plan file. The watcher should NOT silently start a new plan.
     std::fs::write(&plan_path, "# new content out of band\n").unwrap();
     tokio::time::sleep(std::time::Duration::from_millis(2500)).await;
 
@@ -156,7 +154,6 @@ async fn no_active_session_drift_does_not_start_plan() {
     .unwrap();
     assert_eq!(plan_count, 0, "no new active plan from drift alone");
 
-    // Explicit register_plan_file starts the next lifecycle.
     app.call(
         "register_plan_file",
         &app.repo,
@@ -178,9 +175,86 @@ async fn no_active_session_drift_does_not_start_plan() {
     assert_eq!(total, 2, "1 archived + 1 new active");
 }
 
-/// `agents.last_seen` must survive a daemon restart. The column is the
-/// UI's "agents seen recently" data; without persistence across restart
-/// the widget would render every agent as stale-since-the-epoch.
+/// Feedback files dropped before the daemon was up must be ingested
+/// when the daemon comes back: recovery scans the dir and queues an
+/// ingest pass for every file whose hash doesn't match the sidecar.
+#[tokio::test]
+async fn feedback_file_changed_while_daemon_off_is_re_ingested() {
+    let app = TestApp::spawn().await;
+    let plan_path = app.repo.join("plan.md");
+    std::fs::write(&plan_path, "# body\n").unwrap();
+    let r = app
+        .call(
+            "register_plan_file",
+            &app.repo,
+            None,
+            json!({"session_id": "s", "path": &plan_path, "label": "m"}),
+        )
+        .await
+        .unwrap();
+    let rev_id = r["revision_id"].as_i64().unwrap();
+    let canonical_repo = dunce::canonicalize(&app.repo).unwrap();
+    let dir = canonical_repo.join(".trinity").join("feedback").join("s");
+    let p = dir.join("rev-a.md");
+    std::fs::write(&p, "initial\n").unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(2500)).await;
+
+    let app = app.restart().await;
+
+    // Write while we're "still off" then restart again.
+    std::fs::write(&p, "updated while off\n").unwrap();
+    let app = app.restart().await;
+
+    let body: String = sqlx::query_scalar(
+        "SELECT body FROM feedback WHERE session_id = 's' AND author_label = 'rev-a' AND target_id = ?",
+    )
+    .bind(rev_id.to_string())
+    .fetch_one(&app.state.pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        body, "updated while off\n",
+        "recovery must re-ingest the updated body"
+    );
+}
+
+/// Commits made while the daemon was off must be observed on restart.
+#[tokio::test]
+async fn commit_made_while_daemon_off_is_observed_on_restart() {
+    let app = TestApp::spawn().await;
+    let plan_path = app.repo.join("plan.md");
+    std::fs::write(&plan_path, "# body\n").unwrap();
+    let r = app
+        .call(
+            "register_plan_file",
+            &app.repo,
+            None,
+            json!({"session_id": "s", "path": &plan_path, "label": "m"}),
+        )
+        .await
+        .unwrap();
+    let plan_id = r["plan_id"].as_i64().unwrap();
+
+    let app = app.restart().await;
+
+    // While restarted, make a commit. We did it after spawn, so the
+    // watcher *can* pick it up too; the point is recovery's HEAD-drift
+    // detection alone is enough to observe.
+    make_commit(&app.repo, "f.txt", "x\n");
+    let app = app.restart().await;
+
+    let count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM implementation_revisions WHERE plan_id = ?")
+            .bind(plan_id)
+            .fetch_one(&app.state.pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        count, 1,
+        "HEAD drift detection on restart records the commit"
+    );
+}
+
 #[tokio::test]
 async fn agents_last_seen_survives_restart() {
     let app = TestApp::spawn().await;
@@ -214,6 +288,4 @@ async fn agents_last_seen_survives_restart() {
         after, before,
         "agents.last_seen must not be reset on daemon restart"
     );
-    // Silence dead-code lint for unused import when only this test uses make_commit.
-    let _ = make_commit;
 }

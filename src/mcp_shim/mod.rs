@@ -189,11 +189,8 @@ struct ToolCallEnvelope {
 /// (arguments → cache).
 fn label_arg_for(tool: &str) -> Option<&'static str> {
     match tool {
-        "put_feedback" => Some("author_label"),
-        "register_plan_file"
-        | "register_implementation_commit"
-        | "get_current_feedback"
-        | "get_review_context" => Some("label"),
+        "register_plan_file" => Some("label"),
+        "get_context" => Some("author_label"),
         _ => None,
     }
 }

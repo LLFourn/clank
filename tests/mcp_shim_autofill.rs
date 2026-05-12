@@ -1,15 +1,12 @@
-//! Shim regression tests: cross-session calls are NOT refused, and the
-//! shim's per-tool label cache fills in `label` / `author_label` when the
-//! caller omits them.
-//!
-//! These tests drive `trinity mcp` over its real stdio JSON-RPC interface
-//! against an auto-spawned daemon. Each test gets its own temporary
-//! `~/.trinity` and TCP port so it doesn't fight other tests for state.
+//! Shim regression tests: per-tool label cache fills in the missing label
+//! argument when the caller omits it. With the watcher-coordinator model
+//! the catalog is only three tools — the only ones taking a label
+//! argument are `register_plan_file` (`label`) and `get_context`
+//! (`author_label`).
 
 mod common;
 
 use std::io::{BufRead, BufReader, Read, Write};
-use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::mpsc;
 use std::thread;
@@ -17,8 +14,6 @@ use std::time::Duration;
 
 use serde_json::{Value, json};
 use tempfile::TempDir;
-
-use common::run_git;
 
 struct Shim {
     child: Child,
@@ -29,14 +24,9 @@ struct Shim {
 }
 
 impl Shim {
-    /// Spawn `trinity mcp` against a unique loopback port + temp DB. Lets
-    /// the shim auto-spawn the daemon on first probe.
     fn spawn() -> Self {
         let tmp = tempfile::tempdir().unwrap();
         let db = tmp.path().join("trinity.sqlite");
-        // Pick an ephemeral port: bind, capture, drop, hand to the daemon.
-        // The daemon binds the same port a beat later. Acceptable race
-        // because nothing else on the box is racing for these ports.
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
         drop(listener);
@@ -80,7 +70,6 @@ impl Shim {
             next_id: 1,
             _tmp: tmp,
         };
-        // Handshake.
         let init = shim.request(
             "initialize",
             json!({
@@ -103,9 +92,8 @@ impl Shim {
             "method": method,
             "params": params,
         });
-        writeln!(self.stdin, "{}", frame).unwrap();
+        writeln!(self.stdin, "{frame}").unwrap();
         self.stdin.flush().unwrap();
-        // Read until we see the matching id.
         loop {
             let line = self
                 .lines_rx
@@ -115,7 +103,6 @@ impl Shim {
             if v.get("id").and_then(|x| x.as_i64()) == Some(id) {
                 return v;
             }
-            // Drop unrelated messages (notifications etc.).
         }
     }
 
@@ -125,7 +112,7 @@ impl Shim {
             "method": method,
             "params": params,
         });
-        writeln!(self.stdin, "{}", frame).unwrap();
+        writeln!(self.stdin, "{frame}").unwrap();
         self.stdin.flush().unwrap();
     }
 
@@ -141,7 +128,6 @@ impl Drop for Shim {
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
-        // Drain stderr to surface any panic for debugging.
         if let Some(mut e) = self.child.stderr.take() {
             let mut buf = String::new();
             let _ = e.read_to_string(&mut buf);
@@ -150,20 +136,6 @@ impl Drop for Shim {
             }
         }
     }
-}
-
-/// Set up a git repo + plan file in a tempdir, return the plan-file path.
-fn make_repo(repo: &Path) -> PathBuf {
-    std::fs::create_dir_all(repo).unwrap();
-    run_git(repo, &["init", "-q"]);
-    run_git(repo, &["config", "user.email", "test@trinity"]);
-    run_git(repo, &["config", "user.name", "trinity-test"]);
-    std::fs::write(repo.join(".gitkeep"), b"").unwrap();
-    run_git(repo, &["add", ".gitkeep"]);
-    run_git(repo, &["commit", "-q", "-m", "init"]);
-    let plan = repo.join("plan.md");
-    std::fs::write(&plan, "# body\n").unwrap();
-    plan
 }
 
 fn structured_result(call: &Value) -> Value {
@@ -175,56 +147,12 @@ fn structured_result(call: &Value) -> Value {
 }
 
 #[tokio::test]
-async fn cross_session_calls_are_not_refused() {
+async fn cached_label_fills_missing_author_label_on_get_context() {
     let mut shim = Shim::spawn();
-    let repo = shim._tmp.path().join("repo");
-    let plan = make_repo(&repo);
-    // The shim's cwd is the test process's cwd, not the repo. The daemon
-    // resolves repo_root from `cwd`, so set absolute plan path + use the
-    // repo as cwd via the shim's TRINITY_CWD if we had one. Since we
-    // don't, we register from the test process's cwd which is the trinity
-    // crate root — that IS a git repo. Use the trinity crate root.
-    let _ = (repo, plan);
-    let crate_root = std::env::current_dir().unwrap();
-    let plan_path = crate_root.join("Cargo.toml"); // any file in the repo
-    // We only care that `register_plan_file` succeeds binding label "A"
-    // into the shim's cache.
-
-    let r = shim.call_tool(
-        "register_plan_file",
-        json!({
-            "session_id": "session-a",
-            "path": plan_path.to_string_lossy().to_string(),
-            "label": "A",
-        }),
-    );
-    let res = structured_result(&r);
-    assert_eq!(res["session_id"], "session-a");
-
-    // Now call get_current_feedback for a DIFFERENT session. The old shim
-    // would refuse; the new shim must forward (daemon will report
-    // not-found, which is fine — what matters is no shim-level refusal).
-    let r2 = shim.call_tool("get_current_feedback", json!({ "session_id": "session-b" }));
-    let text_block = r2["result"]["content"][0]["text"]
-        .as_str()
-        .unwrap_or_default();
-    assert!(
-        !text_block.contains("this shell is bound") && !text_block.contains("refusing to forward"),
-        "shim refused cross-session call: {text_block}"
-    );
-}
-
-#[tokio::test]
-async fn cached_label_fills_missing_author_label() {
-    let mut shim = Shim::spawn();
-    let crate_root = std::env::current_dir().unwrap();
-
-    // We'll use the trinity repo as the git-backed working tree the shim
-    // sees. Make a plan file inside it (in a tempdir under crate root to
-    // avoid clobbering anything).
-    let tmp_plan = shim._tmp.path().join("plan-for-cache.md");
+    let tmp_plan = shim._tmp.path().join("plan.md");
     std::fs::write(&tmp_plan, "# v1\n").unwrap();
 
+    // register_plan_file seeds the cache with label "rev-a".
     let r = shim.call_tool(
         "register_plan_file",
         json!({
@@ -234,39 +162,19 @@ async fn cached_label_fills_missing_author_label() {
         }),
     );
     let res = structured_result(&r);
-    let rev_id = res["revision_id"].as_i64().expect("revision_id");
-    let _ = crate_root;
+    assert_eq!(res["session_id"], "cache-session");
 
-    // Omit author_label entirely on put_feedback — shim should fill it
-    // from the cached "rev-a".
-    let r = shim.call_tool(
-        "put_feedback",
-        json!({
-            "session_id": "cache-session",
-            "target_kind": "plan_revision",
-            "target_id": rev_id.to_string(),
-            "body": "from cache fallback",
-        }),
-    );
+    // Call get_context without author_label — shim must fill it from cache.
+    let r = shim.call_tool("get_context", json!({ "session_id": "cache-session" }));
     let res = structured_result(&r);
-    let feedback_id = res
-        .get("feedback_id")
-        .and_then(|v| v.as_i64())
-        .unwrap_or_else(|| panic!("expected feedback_id in result: {res}"));
+    assert_eq!(res["session_id"], "cache-session");
 
-    // Read it back; the daemon round-trips body + author_label.
-    let view = shim.call_tool(
-        "get_current_feedback",
-        json!({ "session_id": "cache-session" }),
+    // The feedback_file block is present iff author_label was supplied.
+    // Cached "rev-a" should have flowed through, so the block exists.
+    assert!(
+        res.get("feedback_file").is_some(),
+        "shim should have filled cached author_label: {res}"
     );
-    let res = structured_result(&view);
-    let items = res["feedback"].as_array().expect("feedback array");
-    let mine = items
-        .iter()
-        .find(|i| i["feedback_id"].as_i64() == Some(feedback_id))
-        .expect("our feedback row in current view");
-    assert_eq!(mine["author_label"], "rev-a");
-    assert_eq!(mine["body"], "from cache fallback");
 }
 
 #[tokio::test]
@@ -275,7 +183,7 @@ async fn caller_supplied_author_label_wins_over_cache() {
     let tmp_plan = shim._tmp.path().join("plan.md");
     std::fs::write(&tmp_plan, "# v1\n").unwrap();
 
-    let r = shim.call_tool(
+    shim.call_tool(
         "register_plan_file",
         json!({
             "session_id": "override-session",
@@ -283,32 +191,18 @@ async fn caller_supplied_author_label_wins_over_cache() {
             "label": "rev-a",
         }),
     );
-    let res = structured_result(&r);
-    let rev_id = res["revision_id"].as_i64().unwrap();
 
-    // Caller supplies an explicit different author_label. Cache must not override.
+    // Caller supplies a different author_label explicitly. The feedback
+    // file path returned by get_context must reflect that, not the cached
+    // "rev-a".
     let r = shim.call_tool(
-        "put_feedback",
-        json!({
-            "session_id": "override-session",
-            "target_kind": "plan_revision",
-            "target_id": rev_id.to_string(),
-            "body": "from explicit author",
-            "author_label": "rev-b",
-        }),
+        "get_context",
+        json!({ "session_id": "override-session", "author_label": "rev-b" }),
     );
     let res = structured_result(&r);
-    let feedback_id = res["feedback_id"].as_i64().unwrap();
-
-    let view = shim.call_tool(
-        "get_current_feedback",
-        json!({ "session_id": "override-session" }),
+    let feedback_path = res["feedback_file"]["path"].as_str().unwrap_or("");
+    assert!(
+        feedback_path.ends_with("/rev-b.md"),
+        "explicit author_label must win: got path {feedback_path}"
     );
-    let res = structured_result(&view);
-    let items = res["feedback"].as_array().unwrap();
-    let mine = items
-        .iter()
-        .find(|i| i["feedback_id"].as_i64() == Some(feedback_id))
-        .expect("our feedback row in current view");
-    assert_eq!(mine["author_label"], "rev-b");
 }

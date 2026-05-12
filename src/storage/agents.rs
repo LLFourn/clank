@@ -2,7 +2,7 @@
 //! within a `session_id`. There is no role; agents are just "labels we've
 //! seen on this session".
 
-use sqlx::SqlitePool;
+use sqlx::{Sqlite, SqlitePool, Transaction};
 
 use crate::lifecycle::{AgentLabel, SessionId};
 
@@ -61,10 +61,6 @@ pub async fn upsert_seen(
     label: &AgentLabel,
     now: i64,
 ) -> sqlx::Result<SeenOutcome> {
-    // INSERT OR IGNORE is atomic per call. rows_affected() reliably
-    // distinguishes "I inserted" from "row already existed" without
-    // relying on time-based heuristics that break under same-second
-    // concurrent calls.
     let inserted = sqlx::query(
         "INSERT OR IGNORE INTO agents (session_id, label, first_seen, last_seen) \
          VALUES (?, ?, ?, ?)",
@@ -85,6 +81,39 @@ pub async fn upsert_seen(
         .bind(session_id.as_str())
         .bind(label.as_str())
         .execute(pool)
+        .await?;
+    Ok(SeenOutcome::Touched)
+}
+
+/// Same as `upsert_seen` but participates in a caller-owned transaction.
+/// Used by `SessionService::put_feedback` so the agent upsert is
+/// rolled back atomically with the feedback write on failure.
+pub async fn upsert_seen_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    session_id: &SessionId,
+    label: &AgentLabel,
+    now: i64,
+) -> sqlx::Result<SeenOutcome> {
+    let inserted = sqlx::query(
+        "INSERT OR IGNORE INTO agents (session_id, label, first_seen, last_seen) \
+         VALUES (?, ?, ?, ?)",
+    )
+    .bind(session_id.as_str())
+    .bind(label.as_str())
+    .bind(now)
+    .bind(now)
+    .execute(&mut **tx)
+    .await?
+    .rows_affected()
+        == 1;
+    if inserted {
+        return Ok(SeenOutcome::Inserted);
+    }
+    sqlx::query("UPDATE agents SET last_seen = ? WHERE session_id = ? AND label = ?")
+        .bind(now)
+        .bind(session_id.as_str())
+        .bind(label.as_str())
+        .execute(&mut **tx)
         .await?;
     Ok(SeenOutcome::Touched)
 }

@@ -1,13 +1,18 @@
-//! Structural tests on the new `feedback` table + `put_feedback` /
-//! `get_current_feedback` semantics.
+//! Structural tests on the `feedback` table + `SessionService::put_feedback`
+//! semantics. Drives the service path directly via the in-process harness;
+//! the `put_feedback` MCP tool was removed (file-ingest dispatcher is the
+//! external write path now).
 
 mod common;
 
 use serde_json::json;
 
 use common::TestApp;
+use trinity::daemon::CurrentFeedbackView;
+use trinity::domain::{FeedbackTargetRef, TargetKind};
+use trinity::lifecycle::SessionId;
 
-async fn setup_with_reviewer(app: &TestApp, _label_reviewer: &str) -> (i64, i64) {
+async fn setup_with_plan(app: &TestApp) -> (i64, i64) {
     let plan_path = app.repo.join("plan.md");
     std::fs::write(&plan_path, "# body\n").unwrap();
     let r = app
@@ -24,44 +29,28 @@ async fn setup_with_reviewer(app: &TestApp, _label_reviewer: &str) -> (i64, i64)
     (plan_id, rev_id)
 }
 
-async fn put_plan_feedback(
-    app: &TestApp,
-    label: &str,
-    rev_id: i64,
-    body: &str,
-) -> serde_json::Value {
-    app.call(
-        "put_feedback",
-        &app.repo,
-        Some(label),
-        json!({
-            "session_id": "s",
-            "target_kind": "plan_revision",
-            "target_id": rev_id.to_string(),
-            "body": body,
-        }),
-    )
-    .await
-    .unwrap()
-}
-
 #[tokio::test]
 async fn put_feedback_inserts_then_updates() {
     let app = TestApp::spawn().await;
-    let (_plan_id, rev_id) = setup_with_reviewer(&app, "rev").await;
+    let (_plan_id, rev_id) = setup_with_plan(&app).await;
 
-    let first = put_plan_feedback(&app, "rev", rev_id, "v1").await;
-    assert_eq!(first["was_insert"], true);
-    assert_eq!(first["was_no_op"], false);
-    let feedback_id = first["feedback_id"].as_i64().unwrap();
-    let updated_at_first = first["updated_at"].as_i64().unwrap();
+    let first = app
+        .put_feedback_via_service("s", "rev", FeedbackTargetRef::PlanRevision(rev_id), "v1")
+        .await
+        .unwrap();
+    assert!(first.was_insert);
+    assert!(!first.was_no_op);
+    let feedback_id = first.record.id;
+    let updated_at_first = first.record.updated_at;
 
-    // Second call with new body: UPDATE the same row.
-    let second = put_plan_feedback(&app, "rev", rev_id, "v2").await;
-    assert_eq!(second["was_insert"], false);
-    assert_eq!(second["was_no_op"], false);
-    assert_eq!(second["feedback_id"].as_i64().unwrap(), feedback_id);
-    assert!(second["updated_at"].as_i64().unwrap() >= updated_at_first);
+    let second = app
+        .put_feedback_via_service("s", "rev", FeedbackTargetRef::PlanRevision(rev_id), "v2")
+        .await
+        .unwrap();
+    assert!(!second.was_insert);
+    assert!(!second.was_no_op);
+    assert_eq!(second.record.id, feedback_id);
+    assert!(second.record.updated_at >= updated_at_first);
 
     let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM feedback WHERE id = ?")
         .bind(feedback_id)
@@ -77,7 +66,6 @@ async fn put_feedback_inserts_then_updates() {
         .unwrap();
     assert_eq!(body, "v2");
 
-    // Audit chain: feedback_added then feedback_updated with prior_body.
     let events: Vec<(String, String)> = sqlx::query_as(
         "SELECT kind, payload FROM events WHERE session_id = 's' AND kind LIKE 'feedback_%' ORDER BY id ASC",
     )
@@ -95,34 +83,39 @@ async fn put_feedback_inserts_then_updates() {
 #[tokio::test]
 async fn put_feedback_identical_body_is_noop() {
     let app = TestApp::spawn().await;
-    let (_, rev_id) = setup_with_reviewer(&app, "rev").await;
+    let (_, rev_id) = setup_with_plan(&app).await;
 
-    let first = put_plan_feedback(&app, "rev", rev_id, "same body").await;
-    let feedback_id = first["feedback_id"].as_i64().unwrap();
+    let first = app
+        .put_feedback_via_service(
+            "s",
+            "rev",
+            FeedbackTargetRef::PlanRevision(rev_id),
+            "same body",
+        )
+        .await
+        .unwrap();
+    let feedback_id = first.record.id;
     let updated_at_first: i64 = sqlx::query_scalar("SELECT updated_at FROM feedback WHERE id = ?")
         .bind(feedback_id)
         .fetch_one(&app.state.pool)
         .await
         .unwrap();
 
-    let view_first = app
-        .call(
-            "get_current_feedback",
-            &app.repo,
-            Some("m"),
-            json!({"session_id": "s"}),
+    let digest_first = current_feedback_digest(&app, "s", None).await;
+
+    let again = app
+        .put_feedback_via_service(
+            "s",
+            "rev",
+            FeedbackTargetRef::PlanRevision(rev_id),
+            "same body",
         )
         .await
         .unwrap();
-    let digest_first = view_first["feedback_digest"].as_str().unwrap().to_string();
+    assert!(!again.was_insert);
+    assert!(again.was_no_op);
+    assert_eq!(again.record.id, feedback_id);
 
-    // Identical body re-post: no-op.
-    let again = put_plan_feedback(&app, "rev", rev_id, "same body").await;
-    assert_eq!(again["was_insert"], false);
-    assert_eq!(again["was_no_op"], true);
-    assert_eq!(again["feedback_id"].as_i64().unwrap(), feedback_id);
-
-    // updated_at must not have moved.
     let updated_at_now: i64 = sqlx::query_scalar("SELECT updated_at FROM feedback WHERE id = ?")
         .bind(feedback_id)
         .fetch_one(&app.state.pool)
@@ -130,7 +123,6 @@ async fn put_feedback_identical_body_is_noop() {
         .unwrap();
     assert_eq!(updated_at_now, updated_at_first);
 
-    // No new audit event.
     let feedback_events: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM events WHERE session_id = 's' AND kind LIKE 'feedback_%'",
     )
@@ -139,30 +131,21 @@ async fn put_feedback_identical_body_is_noop() {
     .unwrap();
     assert_eq!(feedback_events, 1);
 
-    // Digest unchanged.
-    let view_again = app
-        .call(
-            "get_current_feedback",
-            &app.repo,
-            Some("m"),
-            json!({"session_id": "s"}),
-        )
-        .await
-        .unwrap();
-    assert_eq!(
-        view_again["feedback_digest"].as_str().unwrap(),
-        digest_first
-    );
+    let digest_again = current_feedback_digest(&app, "s", None).await;
+    assert_eq!(digest_again, digest_first);
 }
 
 #[tokio::test]
 async fn unique_key_enforced_per_author() {
     let app = TestApp::spawn().await;
-    let (_, rev_id) = setup_with_reviewer(&app, "rev-a").await;
+    let (_, rev_id) = setup_with_plan(&app).await;
 
-    put_plan_feedback(&app, "rev-a", rev_id, "a1").await;
-    put_plan_feedback(&app, "rev-a", rev_id, "a2").await;
-    // Same author + target -> one row.
+    app.put_feedback_via_service("s", "rev-a", FeedbackTargetRef::PlanRevision(rev_id), "a1")
+        .await
+        .unwrap();
+    app.put_feedback_via_service("s", "rev-a", FeedbackTargetRef::PlanRevision(rev_id), "a2")
+        .await
+        .unwrap();
     let count_a: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM feedback WHERE session_id = 's' AND author_label = 'rev-a'",
     )
@@ -171,8 +154,9 @@ async fn unique_key_enforced_per_author() {
     .unwrap();
     assert_eq!(count_a, 1);
 
-    put_plan_feedback(&app, "rev-b", rev_id, "b1").await;
-    // Different author -> second row.
+    app.put_feedback_via_service("s", "rev-b", FeedbackTargetRef::PlanRevision(rev_id), "b1")
+        .await
+        .unwrap();
     let total: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM feedback WHERE session_id = 's'")
         .fetch_one(&app.state.pool)
         .await
@@ -183,52 +167,55 @@ async fn unique_key_enforced_per_author() {
 #[tokio::test]
 async fn current_feedback_reads_from_feedback_table() {
     let app = TestApp::spawn().await;
-    let (_, rev_id) = setup_with_reviewer(&app, "rev").await;
-    let posted = put_plan_feedback(&app, "rev", rev_id, "real body").await;
-    let feedback_id = posted["feedback_id"].as_i64().unwrap();
+    let (_, rev_id) = setup_with_plan(&app).await;
+    let posted = app
+        .put_feedback_via_service(
+            "s",
+            "rev",
+            FeedbackTargetRef::PlanRevision(rev_id),
+            "real body",
+        )
+        .await
+        .unwrap();
+    let feedback_id = posted.record.id;
 
-    // Corrupt the corresponding events.payload to prove that get_current_feedback
-    // sources `body` from `feedback`, not from `events.payload`.
     sqlx::query("UPDATE events SET payload = '{}' WHERE kind = 'feedback_added'")
         .execute(&app.state.pool)
         .await
         .unwrap();
 
     let view = app
-        .call(
-            "get_current_feedback",
-            &app.repo,
-            Some("m"),
-            json!({"session_id": "s"}),
-        )
+        .state
+        .lifecycle
+        .current_feedback(&SessionId::from("s"), None)
         .await
         .unwrap();
-    let items = view["feedback"].as_array().unwrap();
-    assert_eq!(items.len(), 1);
-    assert_eq!(items[0]["feedback_id"].as_i64().unwrap(), feedback_id);
-    assert_eq!(items[0]["body"], "real body");
+    let CurrentFeedbackView::Active { feedback, .. } = view else {
+        panic!("expected Active view");
+    };
+    assert_eq!(feedback.len(), 1);
+    assert_eq!(feedback[0].id, feedback_id);
+    assert_eq!(feedback[0].body, "real body");
 }
 
 #[tokio::test]
 async fn put_feedback_rejects_empty_body() {
     let app = TestApp::spawn().await;
-    let (_, rev_id) = setup_with_reviewer(&app, "rev").await;
+    let (_, rev_id) = setup_with_plan(&app).await;
     for body in ["", "   "] {
-        let (status, _) = app
-            .call(
-                "put_feedback",
-                &app.repo,
-                Some("rev"),
-                json!({
-                    "session_id": "s",
-                    "target_kind": "plan_revision",
-                    "target_id": rev_id.to_string(),
-                    "body": body,
-                }),
+        let err = app
+            .put_feedback_via_service(
+                "s",
+                "rev",
+                FeedbackTargetRef::PlanRevision(rev_id),
+                body.to_string(),
             )
             .await
-            .expect_err();
-        assert_eq!(status, reqwest::StatusCode::BAD_REQUEST);
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            trinity::daemon::ServiceError::EmptyFeedbackBody
+        ));
     }
     let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM feedback WHERE session_id = 's'")
         .fetch_one(&app.state.pool)
@@ -240,72 +227,68 @@ async fn put_feedback_rejects_empty_body() {
 #[tokio::test]
 async fn current_feedback_digest_change_conditions() {
     let app = TestApp::spawn().await;
-    let (_, rev_id) = setup_with_reviewer(&app, "rev-a").await;
+    let (_, rev_id) = setup_with_plan(&app).await;
 
-    async fn digest(app: &TestApp) -> String {
-        app.call(
-            "get_current_feedback",
-            &app.repo,
-            Some("m"),
-            json!({"session_id": "s"}),
-        )
-        .await
-        .unwrap()["feedback_digest"]
-            .as_str()
-            .unwrap()
-            .to_string()
-    }
+    let empty = current_feedback_digest(&app, "s", None).await;
 
-    let empty = digest(&app).await;
-
-    put_plan_feedback(&app, "rev-a", rev_id, "first").await;
-    let after_insert = digest(&app).await;
+    app.put_feedback_via_service(
+        "s",
+        "rev-a",
+        FeedbackTargetRef::PlanRevision(rev_id),
+        "first",
+    )
+    .await
+    .unwrap();
+    let after_insert = current_feedback_digest(&app, "s", None).await;
     assert_ne!(empty, after_insert, "insert must change digest");
 
-    // No-op upsert keeps digest stable.
-    put_plan_feedback(&app, "rev-a", rev_id, "first").await;
-    let after_noop = digest(&app).await;
-    assert_eq!(
-        after_insert, after_noop,
-        "identical-body no-op must keep digest stable"
-    );
+    app.put_feedback_via_service(
+        "s",
+        "rev-a",
+        FeedbackTargetRef::PlanRevision(rev_id),
+        "first",
+    )
+    .await
+    .unwrap();
+    let after_noop = current_feedback_digest(&app, "s", None).await;
+    assert_eq!(after_insert, after_noop);
 
-    // New body bumps digest.
-    put_plan_feedback(&app, "rev-a", rev_id, "different").await;
-    let after_update = digest(&app).await;
-    assert_ne!(after_noop, after_update, "body change must bump digest");
+    app.put_feedback_via_service(
+        "s",
+        "rev-a",
+        FeedbackTargetRef::PlanRevision(rev_id),
+        "different",
+    )
+    .await
+    .unwrap();
+    let after_update = current_feedback_digest(&app, "s", None).await;
+    assert_ne!(after_noop, after_update);
 
-    // Another reviewer adds a row → digest changes.
-    put_plan_feedback(&app, "rev-b", rev_id, "second-reviewer").await;
-    let after_second_author = digest(&app).await;
+    app.put_feedback_via_service(
+        "s",
+        "rev-b",
+        FeedbackTargetRef::PlanRevision(rev_id),
+        "second-reviewer",
+    )
+    .await
+    .unwrap();
+    let after_second_author = current_feedback_digest(&app, "s", None).await;
     assert_ne!(after_update, after_second_author);
 
-    // Filter to a non-matching target_kind reduces row count to 0; digest
-    // also folds the filter byte, so it differs from the no-filter call.
-    let filtered = app
-        .call(
-            "get_current_feedback",
-            &app.repo,
-            Some("m"),
-            json!({"session_id": "s", "target_kind": "implementation_commit"}),
-        )
-        .await
-        .unwrap()["feedback_digest"]
-        .as_str()
-        .unwrap()
-        .to_string();
+    let filtered = current_feedback_digest(&app, "s", Some(TargetKind::ImplementationCommit)).await;
     assert_ne!(filtered, after_second_author);
 }
 
 #[tokio::test]
 async fn feedback_session_id_matches_plans_session_id() {
     let app = TestApp::spawn().await;
-    let (_, rev_id) = setup_with_reviewer(&app, "rev").await;
-    put_plan_feedback(&app, "rev", rev_id, "a").await;
+    let (_, rev_id) = setup_with_plan(&app).await;
+    app.put_feedback_via_service("s", "rev", FeedbackTargetRef::PlanRevision(rev_id), "a")
+        .await
+        .unwrap();
 
-    // Archive + new plan + new feedback to exercise multiple plan_ids.
     let plan_path = app.repo.join("plan.md");
-    app.post_form("/sessions/s/archive", "").await;
+    app.archive_via_service("s").await;
     std::fs::write(&plan_path, "# v2\n").unwrap();
     let r = app
         .call(
@@ -317,7 +300,9 @@ async fn feedback_session_id_matches_plans_session_id() {
         .await
         .unwrap();
     let new_rev = r["revision_id"].as_i64().unwrap();
-    put_plan_feedback(&app, "rev", new_rev, "b").await;
+    app.put_feedback_via_service("s", "rev", FeedbackTargetRef::PlanRevision(new_rev), "b")
+        .await
+        .unwrap();
 
     let mismatched: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM feedback f JOIN plans p ON p.id = f.plan_id WHERE f.session_id != p.session_id",
@@ -328,7 +313,21 @@ async fn feedback_session_id_matches_plans_session_id() {
     assert_eq!(mismatched, 0);
 }
 
-// No master/reviewer role gating anymore: any caller can call any tool. The
-// removed test (`master_cannot_put_feedback_and_reviewer_cannot_read`) was
-// the role check; cross-session calls are now allowed at the shim layer
-// too (see tests/mcp_shim_autofill.rs).
+async fn current_feedback_digest(
+    app: &TestApp,
+    session_id: &str,
+    filter: Option<TargetKind>,
+) -> String {
+    let view = app
+        .state
+        .lifecycle
+        .current_feedback(&SessionId::from(session_id), filter)
+        .await
+        .unwrap();
+    match view {
+        CurrentFeedbackView::NoActivePlan { .. } => "no_active_plan".into(),
+        CurrentFeedbackView::Active {
+            feedback_digest, ..
+        } => feedback_digest,
+    }
+}
