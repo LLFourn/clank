@@ -126,10 +126,7 @@ async fn recover(
         {
             watcher.watch_git_logs(&sid, &logs_head);
         }
-        let feedback_dir = repo
-            .join(".trinity")
-            .join("feedback")
-            .join(sid.as_str());
+        let feedback_dir = repo.join(".trinity").join("feedback").join(sid.as_str());
         if feedback_dir.is_dir() {
             watcher.watch_feedback_dir(&sid, &feedback_dir);
         }
@@ -214,20 +211,15 @@ async fn recover_head_drift(
     let Some(active_plan_id) = session.active_plan_id else {
         return Ok(());
     };
-    let plan = sqlx::query_as::<_, crate::storage::plans::Plan>(
-        "SELECT * FROM plans WHERE id = ?",
-    )
-    .bind(active_plan_id)
-    .fetch_one(lifecycle.pool())
-    .await?;
+    let plan = sqlx::query_as::<_, crate::storage::plans::Plan>("SELECT * FROM plans WHERE id = ?")
+        .bind(active_plan_id)
+        .fetch_one(lifecycle.pool())
+        .await?;
 
     let baseline = if plan.state == "implementing" {
-        crate::storage::implementation_revisions::latest_for_plan(
-            lifecycle.pool(),
-            active_plan_id,
-        )
-        .await?
-        .map(|r| r.commit_sha)
+        crate::storage::implementation_revisions::latest_for_plan(lifecycle.pool(), active_plan_id)
+            .await?
+            .map(|r| r.commit_sha)
     } else {
         Some(plan.base_commit.clone())
     };
@@ -256,11 +248,7 @@ async fn recover_head_drift(
         is_head: true,
     };
     lifecycle
-        .observe(
-            sid,
-            "system:resume",
-            Observation::CommitObserved { commit },
-        )
+        .observe(sid, "system:resume", Observation::CommitObserved { commit })
         .await?;
     Ok(())
 }
@@ -551,8 +539,13 @@ async fn dispatch_feedback_changed(
 async fn resolve_active_feedback_target(
     lifecycle: &Arc<SessionService>,
     session: &crate::storage::sessions::Session,
-) -> anyhow::Result<Option<(crate::domain::TargetKind, String, crate::domain::FeedbackTargetRef)>>
-{
+) -> anyhow::Result<
+    Option<(
+        crate::domain::TargetKind,
+        String,
+        crate::domain::FeedbackTargetRef,
+    )>,
+> {
     use crate::domain::{FeedbackTargetRef, TargetKind};
     use crate::storage::{implementation_revisions as impl_revs, plan_revisions};
 
@@ -567,12 +560,11 @@ async fn resolve_active_feedback_target(
     if state == "implementing" {
         let head_sha = git::rev_parse_head(Path::new(&session.repo_root)).await?;
         let head_sha_obj = CommitSha::from(head_sha.clone());
-        let chosen = match impl_revs::fetch_by_sha(lifecycle.pool(), active_id, &head_sha_obj)
-            .await?
-        {
-            Some(rev) => Some(rev),
-            None => impl_revs::latest_for_plan(lifecycle.pool(), active_id).await?,
-        };
+        let chosen =
+            match impl_revs::fetch_by_sha(lifecycle.pool(), active_id, &head_sha_obj).await? {
+                Some(rev) => Some(rev),
+                None => impl_revs::latest_for_plan(lifecycle.pool(), active_id).await?,
+            };
         Ok(chosen.map(|rev| {
             let sha = rev.commit_sha;
             (
@@ -597,9 +589,17 @@ async fn resolve_active_feedback_target(
 
 fn target_matches(
     row: &crate::storage::feedback_files::FeedbackFile,
-    cur: &Option<(crate::domain::TargetKind, String, crate::domain::FeedbackTargetRef)>,
+    cur: &Option<(
+        crate::domain::TargetKind,
+        String,
+        crate::domain::FeedbackTargetRef,
+    )>,
 ) -> bool {
-    match (cur, &row.last_ingested_target_kind, &row.last_ingested_target_id) {
+    match (
+        cur,
+        &row.last_ingested_target_kind,
+        &row.last_ingested_target_id,
+    ) {
         (Some((kind, id, _)), Some(rk), Some(rid)) => rk == kind.as_str() && rid == id,
         _ => false,
     }

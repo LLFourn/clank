@@ -9,10 +9,10 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::daemon::AppState;
+use crate::daemon::ServiceError;
 use crate::daemon::apply::AppliedEffect;
 use crate::daemon::git;
 use crate::daemon::internal_api::ToolCallRequest;
-use crate::daemon::ServiceError;
 use crate::domain::EventKind;
 use crate::lifecycle::{AgentLabel, CommitSha, Observation, PlanFilePath, SessionId};
 use crate::storage::{
@@ -130,9 +130,7 @@ pub async fn register_plan_file(
 
     // Auto-watch git logs/HEAD + feedback dir as part of plan
     // registration. Idempotent re-registers are no-ops.
-    if let Err(e) =
-        attach_companion_watchers(state, &session_id, &repo_root_canonical).await
-    {
+    if let Err(e) = attach_companion_watchers(state, &session_id, &repo_root_canonical).await {
         tracing::warn!(session_id = session_id.as_str(), error = ?e, "register_plan_file: companion watcher setup partial failure");
     }
 

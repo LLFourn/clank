@@ -254,7 +254,10 @@ impl Watcher {
 
 /// Translate raw notify events into a flat list of `WatcherEvent`s to
 /// emit. Held lock-free outside the closure to keep emission async.
-fn collect_emits(inner: &Inner, events: &[notify_debouncer_full::DebouncedEvent]) -> Vec<WatcherEvent> {
+fn collect_emits(
+    inner: &Inner,
+    events: &[notify_debouncer_full::DebouncedEvent],
+) -> Vec<WatcherEvent> {
     let mut out: Vec<WatcherEvent> = Vec::new();
     let mut dedupe: Vec<(u8, PathBuf, SessionId)> = Vec::new();
 
@@ -264,11 +267,7 @@ fn collect_emits(inner: &Inner, events: &[notify_debouncer_full::DebouncedEvent]
             if let Some(sessions) = inner.plan_paths.get(path) {
                 let exists = path.exists();
                 for sid in sessions {
-                    let key = (
-                        if exists { 0_u8 } else { 1_u8 },
-                        path.clone(),
-                        sid.clone(),
-                    );
+                    let key = (if exists { 0_u8 } else { 1_u8 }, path.clone(), sid.clone());
                     if dedupe.contains(&key) {
                         continue;
                     }
@@ -322,11 +321,7 @@ fn collect_emits(inner: &Inner, events: &[notify_debouncer_full::DebouncedEvent]
                 let label = AgentLabel::from(stem);
                 let exists = path.exists();
                 for sid in sessions {
-                    let key = (
-                        if exists { 3_u8 } else { 4_u8 },
-                        path.clone(),
-                        sid.clone(),
-                    );
+                    let key = (if exists { 3_u8 } else { 4_u8 }, path.clone(), sid.clone());
                     if dedupe.contains(&key) {
                         continue;
                     }

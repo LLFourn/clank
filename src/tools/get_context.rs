@@ -75,7 +75,8 @@ pub async fn get_context(state: &AppState, req: &ToolCallRequest) -> Result<Valu
     let Some(active) = active else {
         payload["phase"] = json!("no_active_plan");
         if let Some(label) = author_label.as_ref() {
-            payload["feedback_file"] = feedback_file_pointer_only(&session.repo_root, &session_id, label);
+            payload["feedback_file"] =
+                feedback_file_pointer_only(&session.repo_root, &session_id, label);
         }
         return Ok(payload);
     };
@@ -226,7 +227,11 @@ fn convention_path(repo_root: &str, session_id: &SessionId, label: &AgentLabel) 
 
 /// `feedback_file` view when no sidecar row exists yet. Returns the
 /// convention path so the caller knows where to write.
-fn feedback_file_pointer_only(repo_root: &str, session_id: &SessionId, label: &AgentLabel) -> Value {
+fn feedback_file_pointer_only(
+    repo_root: &str,
+    session_id: &SessionId,
+    label: &AgentLabel,
+) -> Value {
     let path = convention_path(repo_root, session_id, label);
     let exists = path.exists();
     json!({
