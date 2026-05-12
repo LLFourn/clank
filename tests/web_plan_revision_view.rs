@@ -129,6 +129,32 @@ async fn plan_revision_page_renders_inline_feedback_for_target_revision() {
     let body = resp.text().await.unwrap();
     assert!(body.contains("the review"));
     assert!(body.contains("rev-a"));
+    assert!(body.contains(">plan<"));
+    assert!(body.contains(">current<"));
+    assert!(body.contains(".trinity/feedback/s/plan/rev-a.md"));
+}
+
+#[tokio::test]
+async fn plan_revision_feedback_body_renders_markdown() {
+    let app = TestApp::spawn().await;
+    let rev_id = register(&app).await;
+    let canonical_repo = dunce::canonicalize(&app.repo).unwrap();
+    let plan_dir = canonical_repo
+        .join(".trinity")
+        .join("feedback")
+        .join("s")
+        .join("plan");
+    std::fs::write(plan_dir.join("rev-a.md"), "**bold feedback**\n").unwrap();
+    tokio::time::sleep(SETTLE).await;
+    let resp = app
+        .get(&format!("/sessions/s/plan_revisions/{rev_id}"))
+        .await;
+    assert_eq!(resp.status(), 200);
+    let body = resp.text().await.unwrap();
+    assert!(
+        body.contains("<strong>bold feedback</strong>"),
+        "feedback should render as markdown, not raw preformatted text; body:\n{body}"
+    );
 }
 
 #[tokio::test]

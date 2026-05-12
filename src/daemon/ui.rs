@@ -74,14 +74,11 @@ pub fn home(rows: &[SessionRow]) -> Markup {
 // ---------- Session detail (active plan + history summary) ----------
 
 pub struct FeedbackItem {
-    #[allow(dead_code)]
-    pub feedback_id: i64,
     pub author_label: String,
     pub body: String,
     pub created_at: i64,
     pub updated_at: i64,
     pub target_label: Option<String>,
-    pub outdated: bool,
 }
 
 pub struct SessionDetail {
@@ -113,7 +110,10 @@ pub struct SessionDetail {
 pub struct DiffViewFeedback {
     pub feedback_id: i64,
     pub author_label: String,
-    pub body: String,
+    pub feedback_kind: String,
+    pub file_status: Option<FeedbackFileStatus>,
+    pub file_path: Option<String>,
+    pub body_html: String,
     pub created_at: i64,
 }
 
@@ -338,15 +338,11 @@ fn render_entry(ev: &Event, ctx: &TimelineRenderCtx, live: bool) -> Markup {
             @if let Some(p) = preview {
                 div.entry-preview { (p) }
             }
-            @if !is_markup_empty(&actions) {
+            @if let Some(actions) = actions {
                 div.entry-actions { (actions) }
             }
         }
     }
-}
-
-fn is_markup_empty(m: &Markup) -> bool {
-    m.0.is_empty()
 }
 
 fn timeline_entry_title(ev: &Event, ctx: &TimelineRenderCtx) -> Markup {
@@ -421,22 +417,20 @@ fn timeline_entry_preview(ev: &Event) -> Option<Markup> {
     }
 }
 
-fn timeline_entry_actions(ev: &Event, ctx: &TimelineRenderCtx) -> Markup {
+fn timeline_entry_actions(ev: &Event, ctx: &TimelineRenderCtx) -> Option<Markup> {
     use crate::daemon::amend::AmendInfo;
     let session_id = ctx.session_id;
     match ev.kind.as_str() {
         "plan_revision_created" => {
             let rev_id = ev.target_id.as_deref().and_then(|s| s.parse::<i64>().ok());
-            let Some(rev_id) = rev_id else {
-                return html! {};
-            };
+            let rev_id = rev_id?;
             let n = ctx.plan_rev_number_by_id.get(&rev_id).copied().unwrap_or(0);
-            html! {
+            Some(html! {
                 a.pill href={ "/sessions/" (session_id) "/plan_revisions/" (rev_id) } { "View body" }
                 @if n > 1 {
                     a.pill href={ "/sessions/" (session_id) "/plan_revisions/" (rev_id) "/diff" } { "Diff to #" (n - 1) }
                 }
-            }
+            })
         }
         "impl_revision_created" => {
             let sha = ev.target_id.as_deref().unwrap_or("");
@@ -444,7 +438,7 @@ fn timeline_entry_actions(ev: &Event, ctx: &TimelineRenderCtx) -> Markup {
                 Some(AmendInfo::Amend {
                     prev_sha,
                     amend_base_parent_sha,
-                }) => html! {
+                }) => Some(html! {
                     a.pill href={ "/sessions/" (session_id) "/commits/" (sha) "?vs=" (prev_sha) } {
                         "Diff vs previous amend"
                     }
@@ -455,41 +449,41 @@ fn timeline_entry_actions(ev: &Event, ctx: &TimelineRenderCtx) -> Markup {
                     } @else {
                         a.pill href={ "/sessions/" (session_id) "/commits/" (sha) } { "Diff parent..commit" }
                     }
-                },
-                _ => html! {
+                }),
+                _ => Some(html! {
                     a.pill href={ "/sessions/" (session_id) "/commits/" (sha) } { "Diff parent..commit" }
-                },
+                }),
             }
         }
         "head_reset_to_known_sha" => {
             let sha = ev.target_id.as_deref().unwrap_or("");
-            html! { a.pill href={ "/sessions/" (session_id) "/commits/" (sha) } { "Diff parent..commit" } }
+            Some(
+                html! { a.pill href={ "/sessions/" (session_id) "/commits/" (sha) } { "Diff parent..commit" } },
+            )
         }
         "feedback_added" | "feedback_updated" => {
             let payload: serde_json::Value =
                 serde_json::from_str(&ev.payload).unwrap_or(serde_json::Value::Null);
             let fid = payload.get("feedback_id").and_then(|v| v.as_i64());
-            let Some(fid) = fid else { return html! {} };
-            let Some((kind, target_id)) = ctx.feedback_target_by_id.get(&fid) else {
-                return html! {};
-            };
+            let fid = fid?;
+            let (kind, target_id) = ctx.feedback_target_by_id.get(&fid)?;
             if kind == "plan_revision" {
                 let rev_id: i64 = target_id.parse().unwrap_or(0);
                 let n = ctx.plan_rev_number_by_id.get(&rev_id).copied().unwrap_or(0);
-                html! {
+                Some(html! {
                     a.pill href={ "/sessions/" (session_id) "/plan_revisions/" (rev_id) "#feedback-" (fid) } {
                         "Open in plan revision #" (n)
                     }
-                }
+                })
             } else {
-                html! {
+                Some(html! {
                     a.pill href={ "/sessions/" (session_id) "/commits/" (target_id) "#feedback-" (fid) } {
                         "Open in commit " code.mono { (short(target_id)) }
                     }
-                }
+                })
             }
         }
-        _ => html! {},
+        _ => None,
     }
 }
 
@@ -688,23 +682,15 @@ pub fn commit_diff(view: &CommitDiffView) -> Markup {
 // ---------- helpers ----------
 
 fn feedback_card(item: &FeedbackItem) -> Markup {
-    let class = if item.outdated {
-        "feedback outdated"
-    } else {
-        "feedback"
-    };
     let updated = item.updated_at != item.created_at;
     html! {
-        div.feedback class=(class) {
+        div.feedback {
             header.feedback-head {
                 span.actor { (item.author_label) }
                 " · " span.target { (item.target_label.clone().unwrap_or_else(|| "—".into())) }
                 " · " span.relative { (relative_time(Some(item.created_at))) }
                 @if updated {
                     " · " span.muted { "updated " (relative_time(Some(item.updated_at))) }
-                }
-                @if item.outdated {
-                    " · " span.outdated-badge { "outdated" }
                 }
             }
             div.feedback-body { pre { (item.body) } }
@@ -825,10 +811,17 @@ fn feedback_panel(feedback: &[DiffViewFeedback]) -> Markup {
                 article.inline-feedback-item id={ "feedback-" (fb.feedback_id) } {
                     header.feedback-head {
                         span.actor { (fb.author_label) }
+                        " · " span.kind-badge { (fb.feedback_kind) }
+                        @if let Some(status) = fb.file_status {
+                            " · " (feedback_file_badge(status))
+                        }
                         " · " span.relative title=(absolute_time(fb.created_at)) { (relative_time(Some(fb.created_at))) }
                         " · " a.anchor href={ "#feedback-" (fb.feedback_id) } { "#" (fb.feedback_id) }
                     }
-                    div.feedback-body { pre { (fb.body) } }
+                    div.feedback-body.markdown { (PreEscaped(&fb.body_html)) }
+                    @if let Some(path) = &fb.file_path {
+                        footer.feedback-file-path { "file: " span.path.mono { (path) } }
+                    }
                 }
             }
         }
@@ -1054,10 +1047,8 @@ details.revision-history summary, details.commit-history summary { cursor: point
 details.revision-history ol, details.commit-history ol { margin: 8px 0; padding-left: 20px; font-size: 0.88rem; color: var(--muted); }
 div.feedback { background: var(--bg-alt); border: 1px solid var(--line); border-radius: 6px;
   padding: 12px 14px; margin-bottom: 10px; }
-div.feedback.outdated { border-color: #f3e1c0; background: #fdf6e7; }
 header.feedback-head { font-size: 0.85rem; color: var(--muted); margin-bottom: 6px; }
 header.feedback-head .actor { font-weight: 600; color: var(--fg); }
-.outdated-badge { background: #f3e1c0; color: #855900; padding: 1px 6px; border-radius: 4px; font-size: 0.78rem; }
 .warning { color: #855900; }
 div.feedback-body pre { white-space: pre-wrap; word-wrap: break-word; background: none; padding: 0; margin: 0;
   font-family: inherit; font-size: 0.95rem; }
@@ -1198,6 +1189,7 @@ article.inline-feedback-item { padding: 12px 14px; background: var(--bg-alt);
   border: 1px solid var(--line); border-radius: 6px; margin-bottom: 8px; }
 article.inline-feedback-item .anchor { color: var(--muted); text-decoration: none; font-size: 0.78rem;
   font-family: ui-monospace, "SF Mono", monospace; }
+article.inline-feedback-item .feedback-file-path { margin-top: 8px; font-size: 0.78rem; color: var(--muted); }
 article.inline-feedback-item:target { border-color: var(--feedback-accent);
   box-shadow: 0 0 0 3px rgba(217, 119, 6, 0.18); }
 .head-tag { background: var(--commit-accent); color: white; padding: 1px 6px; border-radius: 4px;

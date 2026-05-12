@@ -677,7 +677,7 @@ impl SessionService {
     /// 2. validate `target` belongs to the active plan;
     /// 3. SELECT existing row by natural key;
     /// 4. INSERT / UPDATE / no-op + append audit event;
-    /// 5. commit (skip commit on no-op).
+    /// 5. commit and broadcast when the transaction appended an event.
     pub async fn put_feedback(
         &self,
         session_id: &SessionId,
@@ -745,6 +745,7 @@ impl SessionService {
 
         let now = chrono::Utc::now().timestamp();
         let mut tx = self.pool.begin().await?;
+        let mut event_appended = false;
 
         // Upsert agents.last_seen + emit one agent_joined on first-sight.
         // Atomic with the feedback write: on a no-op or validation failure
@@ -765,6 +766,7 @@ impl SessionService {
                 now,
             )
             .await?;
+            event_appended = true;
         }
 
         let existing = feedback_store::find_by_natural_key(
@@ -776,7 +778,7 @@ impl SessionService {
         )
         .await?;
 
-        let (outcome, committed) = match existing {
+        let outcome = match existing {
             None => {
                 let row = feedback_store::insert(
                     &mut *tx,
@@ -804,24 +806,19 @@ impl SessionService {
                     now,
                 )
                 .await?;
+                event_appended = true;
                 sessions::touch_updated_at(&mut *tx, session_id, now).await?;
-                (
-                    FeedbackUpsertOutcome {
-                        record,
-                        was_insert: true,
-                        was_no_op: false,
-                    },
-                    true,
-                )
-            }
-            Some(prior) if prior.body == body => (
                 FeedbackUpsertOutcome {
-                    record: prior.into_record()?,
-                    was_insert: false,
-                    was_no_op: true,
-                },
-                false,
-            ),
+                    record,
+                    was_insert: true,
+                    was_no_op: false,
+                }
+            }
+            Some(prior) if prior.body == body => FeedbackUpsertOutcome {
+                record: prior.into_record()?,
+                was_insert: false,
+                was_no_op: true,
+            },
             Some(prior) => {
                 let feedback_id = prior.id;
                 let prior_body = prior.body.clone();
@@ -840,30 +837,22 @@ impl SessionService {
                     now,
                 )
                 .await?;
+                event_appended = true;
                 sessions::touch_updated_at(&mut *tx, session_id, now).await?;
-                (
-                    FeedbackUpsertOutcome {
-                        record,
-                        was_insert: false,
-                        was_no_op: false,
-                    },
-                    true,
-                )
+                FeedbackUpsertOutcome {
+                    record,
+                    was_insert: false,
+                    was_no_op: false,
+                }
             }
         };
 
-        // Always commit so the agents upsert above lands even on a
-        // body-no-op. (The `committed` flag predates the agents upsert;
-        // before it, a no-op had nothing to write, so we'd drop the tx.)
-        let _ = committed;
         tx.commit().await?;
 
-        // SSE ping: only when this call produced a feedback_added /
-        // feedback_updated row in `events`. A byte-identical no-op
-        // bumps `agents.last_seen` but writes no feedback event row —
-        // skipping the ping keeps the SSE stream quiet for digest
-        // stability and matches the required invariant.
-        if !outcome.was_no_op {
+        // Broadcast only when the transaction appended an event row.
+        // Byte-identical feedback no-ops stay quiet unless the same call
+        // also introduced a new agent_joined event.
+        if event_appended {
             let _ = self.events_tx.send(session_id.clone());
         }
 

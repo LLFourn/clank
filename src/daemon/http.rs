@@ -14,7 +14,7 @@ use super::AppState;
 use super::curator;
 use super::internal_api;
 use super::ui;
-use crate::domain::{FeedbackTargetRef, TargetKind};
+use crate::domain::{FeedbackKind, FeedbackTargetRef, TargetKind};
 use crate::lifecycle::{CommitSha, SessionId};
 use crate::storage::{
     agents, events as ev_store, feedback as feedback_store, feedback::FeedbackRecord,
@@ -112,9 +112,6 @@ async fn session_detail(
         .await
         .map_err(AppError::sqlx)?
         .ok_or_else(|| AppError::not_found(format!("no session {session_id}")))?;
-    let agents_for = agents::list_for_session(&state.pool, &sid)
-        .await
-        .map_err(AppError::sqlx)?;
     let active_plan = if let Some(id) = session.active_plan_id {
         plans::fetch(&state.pool, id)
             .await
@@ -122,42 +119,6 @@ async fn session_detail(
     } else {
         None
     };
-    let plan_revisions = if let Some(p) = &active_plan {
-        plan_revisions::list_for_plan(&state.pool, p.id)
-            .await
-            .map_err(AppError::sqlx)?
-    } else {
-        Vec::new()
-    };
-    let latest_body_html = plan_revisions
-        .last()
-        .map(|r| render_markdown(&r.body))
-        .unwrap_or_default();
-    let impl_revisions = if let Some(p) = &active_plan {
-        impl_revs::list_for_plan(&state.pool, p.id)
-            .await
-            .map_err(AppError::sqlx)?
-    } else {
-        Vec::new()
-    };
-
-    let active_feedback = feedback_store::list_for_active_plan(&state.pool, &sid)
-        .await
-        .map_err(AppError::feedback)?;
-    let active_target = state
-        .lifecycle
-        .resolve_active_target(&sid)
-        .await
-        .map_err(AppError::lifecycle)?;
-    let current_commit_sha = active_target.as_ref().and_then(|t| match t.kind {
-        TargetKind::ImplementationCommit => Some(t.id.clone()),
-        _ => None,
-    });
-    let (plan_feedback, impl_feedback) = build_feedback_items(
-        &active_feedback,
-        &plan_revisions,
-        current_commit_sha.as_deref(),
-    );
 
     let archived_count: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM plans WHERE session_id = ? AND state = 'archived'",
@@ -167,17 +128,9 @@ async fn session_detail(
     .await
     .map_err(AppError::sqlx)?;
 
-    // Build the lookup map for timeline rendering. Includes the active
-    // plan's rows (always present) plus any historical feedback rows
-    // referenced by audit events from older plans in the same session.
-    // We just list all of session's feedback once and key by id.
     let all_session_feedback = feedback_store::list_for_session(&state.pool, &sid)
         .await
         .map_err(AppError::feedback)?;
-    let feedback_by_id: HashMap<i64, FeedbackRecord> = all_session_feedback
-        .into_iter()
-        .map(|r| (r.id, r))
-        .collect();
 
     let events = ev_store::for_session(&state.pool, &sid)
         .await
@@ -215,6 +168,7 @@ async fn session_detail(
     let all_plans = plans::list_for_session(&state.pool, &sid)
         .await
         .map_err(AppError::sqlx)?;
+    let mut plan_rev_number_by_id: HashMap<i64, i64> = HashMap::new();
     for plan in &all_plans {
         let rows = impl_revs::list_for_plan(&state.pool, plan.id)
             .await
@@ -223,30 +177,19 @@ async fn session_detail(
         for (row, ai) in rows.into_iter().zip(info) {
             amend_by_sha.insert(row.commit_sha, ai);
         }
-    }
 
-    // Plan revision id → revision number, for timeline action links.
-    let mut plan_rev_number_by_id: HashMap<i64, i64> = HashMap::new();
-    for rev in &plan_revisions {
-        plan_rev_number_by_id.insert(rev.id, rev.revision_number);
-    }
-    // Also include archived plans' revisions (they may show up in older
-    // timeline events).
-    for plan in &all_plans {
-        if plan.state == "archived" {
-            let revs = plan_revisions::list_for_plan(&state.pool, plan.id)
-                .await
-                .map_err(AppError::sqlx)?;
-            for rev in revs {
-                plan_rev_number_by_id.insert(rev.id, rev.revision_number);
-            }
+        let revs = plan_revisions::list_for_plan(&state.pool, plan.id)
+            .await
+            .map_err(AppError::sqlx)?;
+        for rev in revs {
+            plan_rev_number_by_id.insert(rev.id, rev.revision_number);
         }
     }
 
     // Feedback id → (target_kind, target_id), used by feedback rows to
     // route to the right artifact anchor.
     let mut feedback_target_by_id: HashMap<i64, (String, String)> = HashMap::new();
-    for (id, rec) in feedback_by_id.iter() {
+    for rec in &all_session_feedback {
         let (k, t) = match &rec.target {
             FeedbackTargetRef::PlanRevision(rev_id) => {
                 ("plan_revision".to_string(), rev_id.to_string())
@@ -256,17 +199,8 @@ async fn session_detail(
                 sha.as_str().to_string(),
             ),
         };
-        feedback_target_by_id.insert(*id, (k, t));
+        feedback_target_by_id.insert(rec.id, (k, t));
     }
-
-    let _ = (
-        agents_for,
-        latest_body_html,
-        impl_revisions,
-        plan_feedback,
-        impl_feedback,
-        feedback_by_id,
-    );
 
     Ok(Html(
         ui::session_detail(&ui::SessionDetail {
@@ -349,8 +283,7 @@ async fn history_plan_detail(
 }
 
 /// Map active-plan feedback into the read-only display shape used by the
-/// archived-plan history page. `outdated` does not apply here (everything
-/// archived is "historical"), so it's always false.
+/// archived-plan history page.
 fn build_history_feedback(
     feedback: &[FeedbackRecord],
     revisions: &[plan_revisions::PlanRevision],
@@ -369,13 +302,11 @@ fn build_history_feedback(
                 )),
             };
             ui::FeedbackItem {
-                feedback_id: f.id,
                 author_label: f.author_label.as_str().to_string(),
                 body: f.body.clone(),
                 created_at: f.created_at,
                 updated_at: f.updated_at,
                 target_label,
-                outdated: false,
             }
         })
         .collect()
@@ -437,14 +368,26 @@ async fn commit_diff(
     let all = feedback_store::list_for_session(&state.pool, &sid)
         .await
         .map_err(AppError::feedback)?;
+    let feedback_ctx = state
+        .lifecycle
+        .build_feedback_context(&sid)
+        .await
+        .map_err(AppError::lifecycle)?;
     let feedback: Vec<ui::DiffViewFeedback> = all
         .into_iter()
         .filter(|r| matches!(&r.target, FeedbackTargetRef::ImplementationCommit(s) if s.as_str() == rev.commit_sha))
-        .map(|r| ui::DiffViewFeedback {
-            feedback_id: r.id,
-            author_label: r.author_label.as_str().to_string(),
-            body: r.body,
-            created_at: r.created_at,
+        .map(|r| {
+            let (file_status, file_path) =
+                diff_feedback_file_meta(&feedback_ctx, FeedbackKind::Impl, r.author_label.as_str());
+            ui::DiffViewFeedback {
+                feedback_id: r.id,
+                author_label: r.author_label.as_str().to_string(),
+                feedback_kind: FeedbackKind::Impl.as_str().to_string(),
+                file_status,
+                file_path,
+                body_html: render_markdown(&r.body),
+                created_at: r.created_at,
+            }
         })
         .collect();
     Ok(Html(
@@ -476,18 +419,28 @@ async fn events_stream(
     Path(session_id): Path<String>,
     axum::extract::Query(query): axum::extract::Query<SseQuery>,
     headers: axum::http::HeaderMap,
-) -> impl axum::response::IntoResponse {
+) -> Result<impl axum::response::IntoResponse, AppError> {
     use axum::response::sse::{Event, KeepAlive, Sse};
     use futures::StreamExt;
     use tokio_stream::wrappers::BroadcastStream;
 
     let sid = SessionId::from(session_id.clone());
-    let initial_cursor: i64 = headers
+    if sessions::fetch(&state.pool, &sid)
+        .await
+        .map_err(AppError::sqlx)?
+        .is_none()
+    {
+        return Err(AppError::not_found(format!("no session {session_id}")));
+    }
+    let supplied_cursor = headers
         .get("last-event-id")
         .and_then(|v| v.to_str().ok())
         .and_then(|s| s.parse().ok())
-        .or(query.since)
-        .unwrap_or(i64::MAX);
+        .or(query.since);
+    let initial_cursor = match supplied_cursor {
+        Some(cursor) => cursor,
+        None => session_max_event_id(&state.pool, &sid).await?,
+    };
 
     let rx = state.lifecycle.subscribe();
     let pool = state.pool.clone();
@@ -495,22 +448,14 @@ async fn events_stream(
     let stream = async_stream::stream! {
         let mut cursor = initial_cursor;
         let mut bs = BroadcastStream::new(rx);
-        loop {
-            // Block until any session pings. Re-check `cursor` against the
-            // DB on any lag too; the cursor handles catch-up naturally.
-            match bs.next().await {
-                Some(Ok(received)) if received != sid => continue,
-                Some(Ok(_)) | Some(Err(_)) => {} // matched session OR lag fall-through
-                None => break,
-            }
-            let rows = sqlx::query_as::<_, crate::storage::events::Event>(
-                "SELECT * FROM events WHERE session_id = ? AND id > ? ORDER BY id ASC",
-            )
-            .bind(sid.as_str())
-            .bind(cursor)
-            .fetch_all(&pool)
-            .await
-            .unwrap_or_default();
+        'stream: loop {
+            let rows = match session_events_after(&pool, &sid, cursor).await {
+                Ok(rows) => rows,
+                Err(err) => {
+                    tracing::error!(session_id = sid.as_str(), error = ?err, "SSE event query failed");
+                    break;
+                }
+            };
             for ev in rows {
                 let fragment = ui::sse_event_fragment(&pool, &sid, &ev).await;
                 let id_str = ev.id.to_string();
@@ -519,14 +464,45 @@ async fn events_stream(
                 yield evt;
                 cursor = ev.id;
             }
+            loop {
+                match bs.next().await {
+                    Some(Ok(received)) if received == sid => break,
+                    Some(Ok(_)) => continue,
+                    Some(Err(_)) => break,
+                    None => break 'stream,
+                }
+            }
         }
     };
 
-    Sse::new(Box::pin(stream)
+    Ok(Sse::new(Box::pin(stream)
         as std::pin::Pin<
             Box<dyn futures::Stream<Item = Result<Event, std::convert::Infallible>> + Send>,
         >)
-    .keep_alive(KeepAlive::default())
+    .keep_alive(KeepAlive::default()))
+}
+
+async fn session_max_event_id(pool: &sqlx::SqlitePool, sid: &SessionId) -> Result<i64, AppError> {
+    let max_id: Option<i64> = sqlx::query_scalar("SELECT MAX(id) FROM events WHERE session_id = ?")
+        .bind(sid.as_str())
+        .fetch_one(pool)
+        .await
+        .map_err(AppError::sqlx)?;
+    Ok(max_id.unwrap_or(0))
+}
+
+async fn session_events_after(
+    pool: &sqlx::SqlitePool,
+    sid: &SessionId,
+    cursor: i64,
+) -> sqlx::Result<Vec<crate::storage::events::Event>> {
+    sqlx::query_as::<_, crate::storage::events::Event>(
+        "SELECT * FROM events WHERE session_id = ? AND id > ? ORDER BY id ASC",
+    )
+    .bind(sid.as_str())
+    .bind(cursor)
+    .fetch_all(pool)
+    .await
 }
 
 async fn plan_revision_view(
@@ -632,64 +608,44 @@ async fn feedback_targeting_plan_revision(
     let all = feedback_store::list_for_session(&state.pool, sid)
         .await
         .map_err(AppError::feedback)?;
+    let feedback_ctx = state
+        .lifecycle
+        .build_feedback_context(sid)
+        .await
+        .map_err(AppError::lifecycle)?;
     Ok(all
         .into_iter()
         .filter(|r| matches!(&r.target, FeedbackTargetRef::PlanRevision(id) if *id == rev_id))
-        .map(|r| ui::DiffViewFeedback {
-            feedback_id: r.id,
-            author_label: r.author_label.as_str().to_string(),
-            body: r.body,
-            created_at: r.created_at,
+        .map(|r| {
+            let (file_status, file_path) =
+                diff_feedback_file_meta(&feedback_ctx, FeedbackKind::Plan, r.author_label.as_str());
+            ui::DiffViewFeedback {
+                feedback_id: r.id,
+                author_label: r.author_label.as_str().to_string(),
+                feedback_kind: FeedbackKind::Plan.as_str().to_string(),
+                file_status,
+                file_path,
+                body_html: render_markdown(&r.body),
+                created_at: r.created_at,
+            }
         })
         .collect())
 }
 
-/// Split active-plan feedback rows into (plan_target, impl_target) buckets
-/// for the session-detail UI. Impl-target rows whose `target_id` is not
-/// the current latest commit get an `outdated` badge.
-fn build_feedback_items(
-    feedback: &[FeedbackRecord],
-    revisions: &[plan_revisions::PlanRevision],
-    current_commit_sha: Option<&str>,
-) -> (Vec<ui::FeedbackItem>, Vec<ui::FeedbackItem>) {
-    let mut plan = Vec::new();
-    let mut implv = Vec::new();
-    for f in feedback {
-        match &f.target {
-            FeedbackTargetRef::PlanRevision(rev_id) => {
-                let target_label = revisions
-                    .iter()
-                    .find(|r| r.id == *rev_id)
-                    .map(|r| format!("rev #{}", r.revision_number));
-                plan.push(ui::FeedbackItem {
-                    feedback_id: f.id,
-                    author_label: f.author_label.as_str().to_string(),
-                    body: f.body.clone(),
-                    created_at: f.created_at,
-                    updated_at: f.updated_at,
-                    target_label,
-                    outdated: false,
-                });
-            }
-            FeedbackTargetRef::ImplementationCommit(sha) => {
-                let outdated = matches!(current_commit_sha, Some(cur) if cur != sha.as_str());
-                let target_label = Some(format!(
-                    "commit {}",
-                    sha.as_str().chars().take(12).collect::<String>()
-                ));
-                implv.push(ui::FeedbackItem {
-                    feedback_id: f.id,
-                    author_label: f.author_label.as_str().to_string(),
-                    body: f.body.clone(),
-                    created_at: f.created_at,
-                    updated_at: f.updated_at,
-                    target_label,
-                    outdated,
-                });
-            }
-        }
-    }
-    (plan, implv)
+fn diff_feedback_file_meta(
+    ctx: &super::service::FeedbackContext,
+    kind: FeedbackKind,
+    author_label: &str,
+) -> (Option<crate::domain::FeedbackFileStatus>, Option<String>) {
+    let files = match kind {
+        FeedbackKind::Plan => &ctx.plan_files,
+        FeedbackKind::Impl => &ctx.impl_files,
+    };
+    files
+        .iter()
+        .find(|s| s.row.author_label == author_label)
+        .map(|s| (Some(s.status), Some(s.row.path.clone())))
+        .unwrap_or((None, None))
 }
 
 fn render_markdown(body: &str) -> String {

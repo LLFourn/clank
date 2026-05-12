@@ -98,6 +98,36 @@ async fn impl_commit_row_for_amend_renders_vs_previous_amend_and_full_diff_since
 }
 
 #[tokio::test]
+async fn amend_chain_of_three_commits_renders_chain_aware_actions() {
+    let app = TestApp::spawn().await;
+    register(&app, "s").await;
+    let sha1 = make_commit(&app.repo, "f.txt", "x\n");
+    let parent = common::run_git(&app.repo, &["rev-parse", &format!("{sha1}^")]);
+    tokio::time::sleep(SETTLE).await;
+
+    std::fs::write(app.repo.join("f.txt"), "y\n").unwrap();
+    common::run_git(&app.repo, &["add", "f.txt"]);
+    common::run_git(&app.repo, &["commit", "-q", "--amend", "--no-edit"]);
+    let sha2 = common::run_git(&app.repo, &["rev-parse", "HEAD"]);
+    tokio::time::sleep(SETTLE).await;
+
+    std::fs::write(app.repo.join("f.txt"), "z\n").unwrap();
+    common::run_git(&app.repo, &["add", "f.txt"]);
+    common::run_git(&app.repo, &["commit", "-q", "--amend", "--no-edit"]);
+    tokio::time::sleep(SETTLE).await;
+
+    let body = app.get("/sessions/s").await.text().await.unwrap();
+    assert!(
+        body.contains(&format!("?vs={sha2}")),
+        "third amend should diff against the previous amend commit {sha2}; body:\n{body}"
+    );
+    assert!(
+        body.contains(&format!("?vs={parent}")),
+        "full amend diff should use the original parent {parent}; body:\n{body}"
+    );
+}
+
+#[tokio::test]
 async fn feedback_row_links_to_target_artifact_anchor_not_to_file_path() {
     let app = TestApp::spawn().await;
     register(&app, "s").await;
@@ -119,6 +149,43 @@ async fn feedback_row_links_to_target_artifact_anchor_not_to_file_path() {
 }
 
 #[tokio::test]
+async fn archived_plan_feedback_row_links_to_original_revision_anchor() {
+    let app = TestApp::spawn().await;
+    register(&app, "s").await;
+    let old_rev_id: i64 =
+        sqlx::query_scalar("SELECT id FROM plan_revisions WHERE revision_number = 1")
+            .fetch_one(&app.state.pool)
+            .await
+            .unwrap();
+
+    let canonical_repo = dunce::canonicalize(&app.repo).unwrap();
+    let plan_dir = canonical_repo
+        .join(".trinity")
+        .join("feedback")
+        .join("s")
+        .join("plan");
+    std::fs::write(plan_dir.join("rev-a.md"), "old plan feedback\n").unwrap();
+    tokio::time::sleep(SETTLE).await;
+    let feedback_id: i64 = sqlx::query_scalar(
+        "SELECT id FROM feedback WHERE session_id = 's' AND author_label = 'rev-a'",
+    )
+    .fetch_one(&app.state.pool)
+    .await
+    .unwrap();
+
+    app.archive_via_service("s").await;
+    std::fs::write(app.repo.join("plan.md"), "# new plan\n").unwrap();
+    register(&app, "s").await;
+
+    let body = app.get("/sessions/s").await.text().await.unwrap();
+    let href = format!(r#"/sessions/s/plan_revisions/{old_rev_id}#feedback-{feedback_id}"#);
+    assert!(
+        body.contains(&href),
+        "archived-plan feedback events should keep linking to their original revision anchor; body:\n{body}"
+    );
+}
+
+#[tokio::test]
 async fn timeline_html_uses_kind_accent_class_per_event_type() {
     let app = TestApp::spawn().await;
     register(&app, "s").await;
@@ -133,12 +200,10 @@ async fn timeline_html_uses_kind_accent_class_per_event_type() {
 }
 
 #[tokio::test]
-async fn new_event_row_carries_animation_class_for_live_insertion() {
+async fn stylesheet_defines_timeline_animation_rules() {
     let app = TestApp::spawn().await;
     register(&app, "s").await;
     let body = app.get("/sessions/s").await.text().await.unwrap();
-    // The initial-render rows reuse the same .entry class which carries
-    // the timeline-enter animation; the CSS defines it.
     assert!(body.contains("timeline-enter"));
     assert!(body.contains("timeline-highlight"));
     assert!(body.contains("prefers-reduced-motion"));

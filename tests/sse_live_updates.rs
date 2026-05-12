@@ -26,6 +26,28 @@ async fn register(app: &TestApp) -> i64 {
     r["revision_id"].as_i64().unwrap()
 }
 
+async fn collect_response_until(
+    resp: reqwest::Response,
+    needle: &str,
+    dur: std::time::Duration,
+) -> String {
+    use futures::StreamExt;
+    let mut stream = resp.bytes_stream();
+    let mut bytes = bytes::BytesMut::new();
+    let _ = tokio::time::timeout(dur, async {
+        while let Some(chunk) = stream.next().await {
+            if let Ok(c) = chunk {
+                bytes.extend_from_slice(&c);
+                if String::from_utf8_lossy(&bytes).contains(needle) {
+                    break;
+                }
+            }
+        }
+    })
+    .await;
+    String::from_utf8_lossy(&bytes).into_owned()
+}
+
 #[tokio::test]
 async fn sse_emits_oob_fragment_for_new_plan_revision() {
     let app = TestApp::spawn().await;
@@ -68,6 +90,10 @@ async fn sse_emits_oob_fragment_for_new_plan_revision() {
     assert!(
         body.contains("entry plan-rev") && body.contains("event-"),
         "expected SSE fragment for plan_revision_created; got:\n{body}"
+    );
+    assert!(
+        body.contains(r#"class="entry plan-rev live""#),
+        "live SSE rows must carry the live class that triggers insertion animation; got:\n{body}"
     );
     assert!(
         body.contains("View body"),
@@ -225,4 +251,88 @@ async fn sse_does_not_emit_for_noop_put_feedback() {
         !body.contains("entry feedback"),
         "no SSE feedback event should fire on a no-op; got:\n{body}"
     );
+}
+
+#[tokio::test]
+async fn sse_without_cursor_streams_live_events_from_now() {
+    let app = TestApp::spawn().await;
+    let _ = register(&app).await;
+    let stream_handle = tokio::spawn({
+        let app_url = app.base.clone();
+        let client = app.client.clone();
+        async move {
+            let resp = client
+                .get(format!("{app_url}/sessions/s/events"))
+                .send()
+                .await
+                .unwrap();
+            collect_response_until(resp, "entry plan-rev", std::time::Duration::from_secs(5)).await
+        }
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    std::fs::write(app.repo.join("plan.md"), "# v2\n").unwrap();
+    let body = stream_handle.await.unwrap();
+    assert!(
+        body.contains("entry plan-rev") && body.contains("View body"),
+        "SSE without a cursor should stream future live events; got:\n{body}"
+    );
+}
+
+#[tokio::test]
+async fn sse_cursor_honours_last_event_id_on_reconnect() {
+    let app = TestApp::spawn().await;
+    let _ = register(&app).await;
+    let cursor: i64 = sqlx::query_scalar("SELECT MAX(id) FROM events")
+        .fetch_one(&app.state.pool)
+        .await
+        .unwrap();
+    std::fs::write(app.repo.join("plan.md"), "# v2\n").unwrap();
+    tokio::time::sleep(SETTLE).await;
+
+    let resp = app
+        .client
+        .get(format!("{}/sessions/s/events", app.base))
+        .header("last-event-id", cursor.to_string())
+        .send()
+        .await
+        .unwrap();
+    let body = collect_response_until(resp, "Diff to #1", std::time::Duration::from_secs(3)).await;
+    assert!(
+        body.contains("entry plan-rev") && body.contains("Diff to #1"),
+        "reconnect should immediately flush rows after Last-Event-ID; got:\n{body}"
+    );
+}
+
+#[tokio::test]
+async fn sse_since_cursor_flushes_multiple_pending_rows() {
+    let app = TestApp::spawn().await;
+    let _ = register(&app).await;
+    let cursor: i64 = sqlx::query_scalar("SELECT MAX(id) FROM events")
+        .fetch_one(&app.state.pool)
+        .await
+        .unwrap();
+    let plan_path = app.repo.join("plan.md");
+    for n in 2..=4 {
+        std::fs::write(&plan_path, format!("# v{n}\n")).unwrap();
+        tokio::time::sleep(SETTLE).await;
+    }
+
+    let resp = app
+        .client
+        .get(format!("{}/sessions/s/events?since={cursor}", app.base))
+        .send()
+        .await
+        .unwrap();
+    let body = collect_response_until(resp, "Diff to #3", std::time::Duration::from_secs(3)).await;
+    assert!(
+        body.contains("Diff to #1") && body.contains("Diff to #2") && body.contains("Diff to #3"),
+        "cursor catch-up should flush all pending rows; got:\n{body}"
+    );
+}
+
+#[tokio::test]
+async fn sse_events_for_unknown_session_returns_404() {
+    let app = TestApp::spawn().await;
+    let resp = app.get("/sessions/nope/events").await;
+    assert_eq!(resp.status(), 404);
 }
