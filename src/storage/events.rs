@@ -70,13 +70,15 @@ pub async fn for_plan(pool: &SqlitePool, plan_id: i64) -> sqlx::Result<Vec<Event
 }
 
 pub async fn recent_for_active_sessions(pool: &SqlitePool, limit: i64) -> sqlx::Result<Vec<Event>> {
-    // "Visible session" = not archived. Finished sessions (active_plan_id
-    // IS NULL) are visible by design so their history shows up on the
-    // homepage activity feed.
+    // "Visible session" = not archived. Finished sessions are visible by
+    // design so their history shows up on the homepage activity feed.
     sqlx::query_as::<_, Event>(
         "SELECT e.* FROM events e \
          JOIN sessions s ON s.id = e.session_id \
          WHERE s.archived_at IS NULL \
+           AND e.id > s.current_event_floor \
+           AND e.kind NOT IN ('session_archived', 'session_reactivated') \
+           AND (s.state IS NULL OR s.state NOT IN ('planning', 'implementing') OR e.plan_id IS NULL OR e.plan_id = s.rowid) \
          ORDER BY e.id DESC LIMIT ?",
     )
     .bind(limit)
@@ -95,6 +97,9 @@ pub async fn active_session_events_after(
         "SELECT e.* FROM events e \
          JOIN sessions s ON s.id = e.session_id \
          WHERE s.archived_at IS NULL AND e.id > ? \
+           AND e.id > s.current_event_floor \
+           AND e.kind != 'session_reactivated' \
+           AND (s.state IS NULL OR s.state NOT IN ('planning', 'implementing') OR e.plan_id IS NULL OR e.plan_id = s.rowid) \
          ORDER BY e.id ASC",
     )
     .bind(cursor)

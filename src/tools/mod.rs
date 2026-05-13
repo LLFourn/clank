@@ -27,7 +27,7 @@ pub struct ToolDescriptor {
     pub input_schema: Value,
 }
 
-/// Agent-facing MCP catalog. **Three tools only.** Everything else is
+/// Agent-facing MCP catalog. Keep this as coordination-only. Everything else is
 /// observed from the filesystem / git directly. See the plan at
 /// `~/.claude/plans/i-want-to-auto-track-impl-commits.md` for rationale.
 pub fn catalog() -> Vec<ToolDescriptor> {
@@ -68,11 +68,16 @@ pub fn catalog() -> Vec<ToolDescriptor> {
                           `.../impl/`. The plan file, `.git/logs/HEAD`, and both feedback \
                           directories are attached to the watcher.\n\n\
                           Subsequent calls update the plan-file path or record a new \
-                          revision if the body differs. Idempotent on same-body re-calls.\n\n\
+                          revision if the body differs while the session is still planning. \
+                          Once implementation has started, the plan is sealed and plan-file \
+                          edits are ignored; create a new session for materially different \
+                          work. Idempotent on same-body re-calls.\n\n\
                           After registration, edit the plan file normally and drop \
                           `<author_label>.md` files into the appropriate feedback subdirectory; \
-                          Trinity ingests plan revisions, implementation commits, and reviewer \
-                          feedback from filesystem + git automatically."
+                          Trinity ingests plan revisions and reviewer feedback for the session \
+                          from filesystem watchers. Git commits are attributed only to the \
+                          repo's effective session; registering or discovering another plan \
+                          never changes that claim."
                 .to_string(),
             input_schema: json!({
                 "type": "object",
@@ -99,14 +104,17 @@ pub fn catalog() -> Vec<ToolDescriptor> {
                           event on first sight.\n\n\
                           Response keys (always present, nullable when not applicable): \
                           `schema_version`, `session_id`, `repo_root`, `plan_file_path`, \
-                          `git_logs_head_path`, `phase`, `expected_action`, \
-                          `completion_artifact`, `commit_policy`, `review_target`, \
+                          `git_logs_head_path`, `repo_effective_session_id`, \
+                          `is_repo_effective`, `phase`, `expected_action`, \
+                          `completion_artifact`, `commit_policy`, `review_gate`, `review_target`, \
                           `latest_plan_revision`, `latest_implementation_revision`, \
                           `write_feedback` (caller's current-phase file), `prior_feedback` \
                           (`self` + `others` from the caller's prior phase, e.g. plan files \
                           surfaced during implementation), and `other_feedback_files` \
                           grouped by `plan` / `impl` arrays.\n\n\
-                          When `phase` is `implementing`, implementation is not complete \
+                          Agents must only create implementation commits when \
+                          `is_repo_effective` is true. When `phase` is `implementing`, \
+                          implementation is not complete \
                           until the intended changes are committed. After editing, inspect \
                           `git status` and `git diff`, run relevant checks, commit only the \
                           intended changes, and report the commit hash. When addressing \
@@ -128,18 +136,16 @@ pub fn catalog() -> Vec<ToolDescriptor> {
             }),
         },
         ToolDescriptor {
-            name: "finish_plan".to_string(),
-            description: "Mark the session's active plan as `finished` — the deliberate \
-                          successful-conclusion terminal state, distinct from `archived`. \
-                          Use this when work on the plan is genuinely done and the agent \
-                          is about to move on to something else. Idempotent: calling on \
-                          an already-finished session is a no-op. Rejected when the \
-                          session is archived; re-register first.\n\n\
-                          - `session_id`: the session.\n\
-                          - `label`: attribution name (e.g. `claude-main`).\n\n\
-                          After this call, `get_context` reports `phase: \"finished\"` \
-                          and `expected_action: \"none\"`. The plan and feedback files \
-                          on disk are untouched."
+            name: "claim_session".to_string(),
+            description: "Set a session as the repo's effective implementation target.\n\n\
+                          Use this only when the user has asked you to implement this session. \
+                          Registering or discovering plan files is passive and never changes \
+                          where git commits are attributed; this tool is the explicit claim \
+                          that future `.git/logs/HEAD` movements in the repo should route to \
+                          `session_id`.\n\n\
+                          - `session_id`: URL-safe slug for an active planning/implementing session.\n\
+                          - `label`: attribution name for the claiming agent.\n\n\
+                          This does not finish, archive, or submit feedback for any session."
                 .to_string(),
             input_schema: json!({
                 "type": "object",
@@ -160,7 +166,7 @@ pub async fn dispatch(state: &AppState, req: &ToolCallRequest) -> Result<Value, 
         "list_sessions" => reviewer::list_sessions(state, req).await,
         "register_plan_file" => master::register_plan_file(state, req).await,
         "get_context" => get_context::get_context(state, req).await,
-        "finish_plan" => master::finish_plan(state, req).await,
+        "claim_session" => master::claim_session(state, req).await,
         other => Err(ToolError::NotFound(format!("unknown tool: {other}"))),
     }
 }

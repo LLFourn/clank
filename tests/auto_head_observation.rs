@@ -38,12 +38,15 @@ async fn commit_after_register_is_auto_observed() {
     make_commit(&app.repo, "f.txt", "x\n");
     tokio::time::sleep(SETTLE).await;
 
-    let count: i64 =
-        sqlx::query_scalar("SELECT COUNT(*) FROM implementation_revisions WHERE plan_id = ?")
-            .bind(plan_id)
-            .fetch_one(&app.state.pool)
-            .await
-            .unwrap();
+    let count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM implementation_revisions ir \
+             JOIN sessions s ON s.id = ir.session_id \
+             WHERE s.rowid = ?",
+    )
+    .bind(plan_id)
+    .fetch_one(&app.state.pool)
+    .await
+    .unwrap();
     assert_eq!(count, 1);
     let state: String = sqlx::query_scalar("SELECT state FROM plans WHERE id = ?")
         .bind(plan_id)
@@ -66,12 +69,15 @@ async fn amend_after_register_records_second_revision() {
     common::run_git(&app.repo, &["commit", "-q", "--amend", "--no-edit"]);
     tokio::time::sleep(SETTLE).await;
 
-    let count: i64 =
-        sqlx::query_scalar("SELECT COUNT(*) FROM implementation_revisions WHERE plan_id = ?")
-            .bind(plan_id)
-            .fetch_one(&app.state.pool)
-            .await
-            .unwrap();
+    let count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM implementation_revisions ir \
+             JOIN sessions s ON s.id = ir.session_id \
+             WHERE s.rowid = ?",
+    )
+    .bind(plan_id)
+    .fetch_one(&app.state.pool)
+    .await
+    .unwrap();
     assert_eq!(count, 2, "amend produces a new SHA -> new impl row");
 }
 
@@ -93,12 +99,15 @@ async fn reset_to_latest_impl_sha_records_audit_event_only() {
     common::run_git(&app.repo, &["reset", "--hard", &sha_b]);
     tokio::time::sleep(SETTLE).await;
 
-    let impl_count: i64 =
-        sqlx::query_scalar("SELECT COUNT(*) FROM implementation_revisions WHERE plan_id = ?")
-            .bind(plan_id)
-            .fetch_one(&app.state.pool)
-            .await
-            .unwrap();
+    let impl_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM implementation_revisions ir \
+             JOIN sessions s ON s.id = ir.session_id \
+             WHERE s.rowid = ?",
+    )
+    .bind(plan_id)
+    .fetch_one(&app.state.pool)
+    .await
+    .unwrap();
     assert_eq!(impl_count, 2, "no new impl rows from reset to known SHAs");
 
     let resets: i64 = sqlx::query_scalar(
@@ -139,12 +148,15 @@ async fn reset_to_older_impl_sha_records_audit_event_and_active_target_moves() {
     common::run_git(&app.repo, &["reset", "--hard", &sha_a]);
     tokio::time::sleep(SETTLE).await;
 
-    let impl_count: i64 =
-        sqlx::query_scalar("SELECT COUNT(*) FROM implementation_revisions WHERE plan_id = ?")
-            .bind(plan_id)
-            .fetch_one(&app.state.pool)
-            .await
-            .unwrap();
+    let impl_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM implementation_revisions ir \
+             JOIN sessions s ON s.id = ir.session_id \
+             WHERE s.rowid = ?",
+    )
+    .bind(plan_id)
+    .fetch_one(&app.state.pool)
+    .await
+    .unwrap();
     assert_eq!(impl_count, 2, "reset to older known SHA must not INSERT");
 
     let resets: i64 = sqlx::query_scalar(

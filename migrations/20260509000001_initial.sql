@@ -10,40 +10,42 @@ CREATE TABLE sessions (
     repo_root TEXT NOT NULL,
     plan_file_path TEXT NOT NULL,
     display_title TEXT,
-    active_plan_id INTEGER REFERENCES plans(id),
+    base_commit TEXT,
+    state TEXT CHECK (state IS NULL OR state IN ('planning', 'implementing', 'finished', 'archived')),
+    started_at INTEGER,
+    finished_at INTEGER,
+    current_event_floor INTEGER NOT NULL DEFAULT 0,
     created_at INTEGER NOT NULL,
     updated_at INTEGER NOT NULL,
     archived_at INTEGER
 );
 
-CREATE TABLE plans (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
-    base_commit TEXT NOT NULL,
-    state TEXT NOT NULL CHECK (state IN ('planning', 'implementing', 'finished', 'archived')),
-    started_at INTEGER NOT NULL,
-    archived_at INTEGER,
-    finished_at INTEGER
-);
-CREATE INDEX plans_session ON plans(session_id, id);
-
-CREATE UNIQUE INDEX one_active_plan_per_session
-    ON plans(session_id) WHERE state NOT IN ('archived', 'finished');
+CREATE VIEW plans AS
+    SELECT
+        rowid AS id,
+        id AS session_id,
+        base_commit,
+        state,
+        started_at,
+        archived_at,
+        finished_at
+    FROM sessions
+    WHERE state IS NOT NULL;
 
 CREATE TABLE plan_revisions (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    plan_id INTEGER NOT NULL REFERENCES plans(id) ON DELETE CASCADE,
+    session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
     revision_number INTEGER NOT NULL,
     content_hash TEXT NOT NULL,
     body TEXT NOT NULL,
     created_at INTEGER NOT NULL,
-    UNIQUE(plan_id, revision_number)
+    UNIQUE(session_id, revision_number)
 );
-CREATE INDEX plan_revisions_plan ON plan_revisions(plan_id, id);
+CREATE INDEX plan_revisions_session ON plan_revisions(session_id, id);
 
 CREATE TABLE implementation_revisions (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    plan_id INTEGER NOT NULL REFERENCES plans(id) ON DELETE CASCADE,
+    session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
     commit_sha TEXT NOT NULL,
     parent_sha TEXT,
     branch TEXT,
@@ -53,9 +55,9 @@ CREATE TABLE implementation_revisions (
     is_head INTEGER NOT NULL CHECK (is_head IN (0, 1)),
     registered_by TEXT NOT NULL,
     created_at INTEGER NOT NULL,
-    UNIQUE(plan_id, commit_sha)
+    UNIQUE(session_id, commit_sha)
 );
-CREATE INDEX impl_revisions_plan ON implementation_revisions(plan_id, id);
+CREATE INDEX impl_revisions_session ON implementation_revisions(session_id, id);
 
 CREATE TABLE agents (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -67,20 +69,39 @@ CREATE TABLE agents (
 );
 CREATE INDEX agents_session ON agents(session_id);
 
+CREATE TABLE repo_effective_sessions (
+    repo_root TEXT PRIMARY KEY,
+    session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+    claimed_by TEXT NOT NULL,
+    claimed_at INTEGER NOT NULL
+);
+CREATE INDEX repo_effective_sessions_session ON repo_effective_sessions(session_id);
+
 CREATE TABLE feedback (
     id           INTEGER PRIMARY KEY AUTOINCREMENT,
     session_id   TEXT    NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
-    plan_id      INTEGER NOT NULL REFERENCES plans(id)    ON DELETE CASCADE,
     target_kind  TEXT    NOT NULL CHECK (target_kind IN ('plan_revision', 'implementation_commit')),
     target_id    TEXT    NOT NULL,
     author_label TEXT    NOT NULL,
     body         TEXT    NOT NULL,
     created_at   INTEGER NOT NULL,
     updated_at   INTEGER NOT NULL,
-    UNIQUE(plan_id, target_kind, target_id, author_label)
+    UNIQUE(session_id, target_kind, target_id, author_label)
 );
-CREATE INDEX feedback_plan         ON feedback(plan_id, id);
-CREATE INDEX feedback_session_plan ON feedback(session_id, plan_id, id);
+CREATE INDEX feedback_session ON feedback(session_id, id);
+
+CREATE TABLE review_gate_overrides (
+    session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+    phase TEXT NOT NULL CHECK (phase IN ('plan', 'impl')),
+    target_kind TEXT NOT NULL CHECK (target_kind IN ('plan_revision', 'implementation_commit')),
+    target_id TEXT NOT NULL,
+    state TEXT NOT NULL CHECK (state IN ('changes_requested', 'ready')),
+    actor TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL,
+    PRIMARY KEY (session_id, phase)
+);
+CREATE INDEX review_gate_overrides_session ON review_gate_overrides(session_id);
 
 -- Sidecar for files in `<repo_root>/.trinity/feedback/<session_id>/<plan|impl>/<author_label>.md`.
 -- One row per (session, feedback_kind, author). Same author can hold both
@@ -109,7 +130,7 @@ CREATE INDEX feedback_files_session ON feedback_files(session_id);
 CREATE TABLE events (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
-    plan_id INTEGER REFERENCES plans(id) ON DELETE CASCADE,
+    plan_id INTEGER,
     target_kind TEXT CHECK (target_kind IS NULL OR target_kind IN ('plan_revision', 'implementation_commit')),
     target_id TEXT,
     ts INTEGER NOT NULL,

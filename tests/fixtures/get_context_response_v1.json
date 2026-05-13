@@ -4,12 +4,25 @@
   "repo_root": "/repo",
   "plan_file_path": "/repo/plan.md",
   "git_logs_head_path": "/repo/.git/logs/HEAD",
+  "repo_effective_session_id": "demo",
+  "is_repo_effective": true,
   "phase": "implementing",
-  "expected_action": "implement_and_commit",
-  "completion_artifact": "git_commit",
+  "expected_action": "write_impl_feedback",
+  "completion_artifact": "implementation_feedback_file",
   "commit_policy": {
     "initial_impl": "create_commit",
     "addressing_impl_feedback": "amend_latest_impl_commit_unless_user_requests_new_commit"
+  },
+  "review_gate": {
+    "phase": "impl",
+    "state": "needs_review",
+    "approval_rule": "all_participants",
+    "participants": [],
+    "approvals": [],
+    "request_changes": [],
+    "unmarked": [],
+    "missing_approvals": [],
+    "override": null
   },
   "review_target": {
     "kind": "implementation_commit",

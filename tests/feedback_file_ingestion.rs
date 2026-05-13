@@ -11,7 +11,7 @@ use std::path::PathBuf;
 
 use serde_json::json;
 
-use common::{TestApp, make_commit};
+use common::{TestApp, make_commit, run_git};
 
 use common::SETTLE;
 
@@ -76,6 +76,75 @@ async fn dropping_a_new_md_in_feedback_dir_auto_creates_sidecar_and_ingests() {
     .await
     .unwrap();
     assert_eq!(body, "first feedback body\n");
+}
+
+#[tokio::test]
+async fn registration_scans_existing_feedback_files_and_bootstraps_impl_target() {
+    let app = TestApp::spawn().await;
+    let plan_path = app.repo.join("plan.md");
+    std::fs::write(&plan_path, "# body\n").unwrap();
+    let plan_dir = plan_feedback_dir(&app, "s");
+    let impl_dir = impl_feedback_dir(&app, "s");
+    std::fs::create_dir_all(&plan_dir).unwrap();
+    std::fs::create_dir_all(&impl_dir).unwrap();
+    std::fs::write(plan_dir.join("rev-a.md"), "APPROVE\nplan ok\n").unwrap();
+    std::fs::write(impl_dir.join("rev-b.md"), "REQUEST_CHANGES\nimpl issue\n").unwrap();
+    let head = run_git(&app.repo, &["rev-parse", "HEAD"]);
+
+    let r = app
+        .call(
+            "register_plan_file",
+            &app.repo,
+            None,
+            json!({"session_id": "s", "path": &plan_path, "label": "m"}),
+        )
+        .await
+        .unwrap();
+    let rev_id = r["revision_id"].as_i64().unwrap();
+
+    let state: String = sqlx::query_scalar("SELECT state FROM sessions WHERE id = 's'")
+        .fetch_one(&app.state.pool)
+        .await
+        .unwrap();
+    assert_eq!(state, "implementing");
+
+    let rows: Vec<(String, String, Option<String>)> = sqlx::query_as(
+        "SELECT feedback_kind, author_label, parse_error FROM feedback_files \
+         WHERE session_id = 's' ORDER BY feedback_kind, author_label",
+    )
+    .fetch_all(&app.state.pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        rows,
+        vec![
+            ("impl".to_string(), "rev-b".to_string(), None),
+            ("plan".to_string(), "rev-a".to_string(), None),
+        ]
+    );
+
+    let feedback: Vec<(String, String, String)> = sqlx::query_as(
+        "SELECT target_kind, target_id, body FROM feedback \
+         WHERE session_id = 's' ORDER BY target_kind",
+    )
+    .fetch_all(&app.state.pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        feedback,
+        vec![
+            (
+                "implementation_commit".to_string(),
+                head,
+                "REQUEST_CHANGES\nimpl issue\n".to_string(),
+            ),
+            (
+                "plan_revision".to_string(),
+                rev_id.to_string(),
+                "APPROVE\nplan ok\n".to_string(),
+            ),
+        ]
+    );
 }
 
 #[tokio::test]
@@ -239,35 +308,44 @@ async fn same_author_has_independent_plan_and_impl_feedback_rows() {
     );
 }
 
-/// Writes to `impl/` during planning are rejected with a specific
-/// `parse_error` sentinel; the file stays on disk but no feedback row
-/// is created.
+/// Writes to `impl/` during planning are treated as evidence that
+/// implementation started, so the current HEAD is recorded as the
+/// implementation target before ingesting the review.
 #[tokio::test]
-async fn impl_dir_write_during_planning_records_parse_error_no_active_impl_target() {
+async fn impl_dir_write_during_planning_bootstraps_current_head_target() {
     let app = TestApp::spawn().await;
     let _ = register(&app, "s").await;
     let dir = impl_feedback_dir(&app, "s");
+    let head = run_git(&app.repo, &["rev-parse", "HEAD"]);
 
     std::fs::write(dir.join("rev-a.md"), "impl critique during planning\n").unwrap();
     tokio::time::sleep(SETTLE).await;
 
+    let state: String = sqlx::query_scalar("SELECT state FROM sessions WHERE id = 's'")
+        .fetch_one(&app.state.pool)
+        .await
+        .unwrap();
+    assert_eq!(state, "implementing");
+
     let parse_error: Option<String> = sqlx::query_scalar(
-        "SELECT parse_error FROM feedback_files WHERE session_id = 's' AND feedback_kind = 'impl' AND author_label = 'rev-a'",
+        "SELECT parse_error FROM feedback_files \
+         WHERE session_id = 's' AND feedback_kind = 'impl' AND author_label = 'rev-a'",
     )
     .fetch_one(&app.state.pool)
     .await
     .unwrap();
-    assert_eq!(
-        parse_error.as_deref(),
-        Some("no_active_impl_target_for_kind")
-    );
+    assert_eq!(parse_error, None);
 
-    let feedback_count: i64 =
-        sqlx::query_scalar("SELECT COUNT(*) FROM feedback WHERE session_id = 's'")
-            .fetch_one(&app.state.pool)
-            .await
-            .unwrap();
-    assert_eq!(feedback_count, 0);
+    let (target_kind, target_id, body): (String, String, String) = sqlx::query_as(
+        "SELECT target_kind, target_id, body FROM feedback \
+         WHERE session_id = 's' AND author_label = 'rev-a'",
+    )
+    .fetch_one(&app.state.pool)
+    .await
+    .unwrap();
+    assert_eq!(target_kind, "implementation_commit");
+    assert_eq!(target_id, head);
+    assert_eq!(body, "impl critique during planning\n");
 }
 
 /// `plan/` writes are still accepted in `implementing` phase and

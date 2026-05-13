@@ -1,4 +1,4 @@
-//! Translate `Decision` effects into SQL writes inside a single transaction.
+//! Translate session lifecycle effects into SQL writes inside a single transaction.
 //! Returns generated IDs the tool layer needs for response bodies.
 //!
 //! Feedback is **not** an effect; it is handled by
@@ -9,8 +9,10 @@ use sqlx::{Sqlite, Transaction};
 
 use crate::domain::{EventKind, TargetKind};
 use crate::lifecycle::{CommitSha, Decision, Effect, SessionId};
+use crate::review_state::ReviewPhase;
 use crate::storage::{
-    events as ev_store, implementation_revisions as impl_revs, plan_revisions, plans, sessions,
+    events as ev_store, implementation_revisions as impl_revs, plan_revisions, plans,
+    repo_effective_sessions, review_gate_overrides, sessions,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -45,14 +47,24 @@ pub enum AppliedEffect {
     },
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SessionSideEffect {
+    AttachSessionWatchers,
+    ScanFeedbackDirs { force_reingest: bool },
+}
+
 #[derive(Debug, Clone)]
 pub struct ApplyOutcome {
     pub items: Vec<AppliedEffect>,
+    pub side_effects: Vec<SessionSideEffect>,
 }
 
 impl ApplyOutcome {
     pub fn empty() -> Self {
-        Self { items: Vec::new() }
+        Self {
+            items: Vec::new(),
+            side_effects: Vec::new(),
+        }
     }
 }
 
@@ -60,10 +72,10 @@ impl ApplyOutcome {
 pub enum ApplyError {
     #[error("active plan invariant violated: {0}")]
     ActivePlan(#[from] plans::ActivePlanInconsistency),
-    #[error("apply_decision invariant: ArchiveActivePlan with no active plan in session")]
+    #[error("apply_session_effects invariant: ArchiveActivePlan with no active plan in session")]
     ArchiveWithoutActive,
     #[error(
-        "apply_decision invariant: RecordPlanRevision/RecordImplementation with no active plan in session"
+        "apply_session_effects invariant: RecordPlanRevision/RecordImplementation with no active plan in session"
     )]
     EffectWithoutActive,
     #[error("sql: {0}")]
@@ -76,7 +88,7 @@ pub enum ApplyError {
 ///
 /// Effects are applied in order. Generated IDs flow into the returned
 /// `ApplyOutcome` aligned by index with `decision.effects`.
-pub async fn apply_decision(
+pub async fn apply_session_effects(
     tx: &mut Transaction<'_, Sqlite>,
     session_id: &SessionId,
     decision: &Decision,
@@ -84,24 +96,43 @@ pub async fn apply_decision(
     now: i64,
 ) -> Result<ApplyOutcome, ApplyError> {
     let mut items = Vec::with_capacity(decision.effects.len());
+    let mut side_effects = Vec::new();
 
-    let mut active_plan_id: Option<i64> =
-        sqlx::query_scalar::<_, Option<i64>>("SELECT active_plan_id FROM sessions WHERE id = ?")
-            .bind(session_id.as_str())
-            .fetch_one(&mut **tx)
-            .await?;
+    let mut active_plan_id = sessions::active_plan_rowid(&mut **tx, session_id, true).await?;
 
     for effect in &decision.effects {
         match effect {
             Effect::StartPlan {
                 base_commit,
                 initial_body,
+                source,
             } => {
+                let prior_plan_count: i64 =
+                    sqlx::query_scalar("SELECT COUNT(*) FROM plans WHERE session_id = ?")
+                        .bind(session_id.as_str())
+                        .fetch_one(&mut **tx)
+                        .await?;
+                let event_floor = if prior_plan_count > 0 {
+                    sqlx::query_scalar(
+                        "SELECT COALESCE(MAX(id), 0) FROM events WHERE session_id = ?",
+                    )
+                    .bind(session_id.as_str())
+                    .fetch_one(&mut **tx)
+                    .await?
+                } else {
+                    0
+                };
                 let plan_id = plans::insert(&mut **tx, session_id, base_commit, now).await?;
+                if prior_plan_count > 0 {
+                    sessions::set_current_event_floor(&mut **tx, session_id, event_floor).await?;
+                }
                 let hash = plan_revisions::compute_content_hash(initial_body);
                 let (plan_revision_id, _revision_number) =
                     plan_revisions::append(tx, plan_id, hash.as_str(), initial_body, now).await?;
-                sessions::set_active_plan_id(&mut **tx, session_id, Some(plan_id), now).await?;
+                review_gate_overrides::delete_phase(&mut **tx, session_id, ReviewPhase::Plan)
+                    .await?;
+                review_gate_overrides::delete_phase(&mut **tx, session_id, ReviewPhase::Impl)
+                    .await?;
                 active_plan_id = Some(plan_id);
                 ev_store::append(
                     &mut **tx,
@@ -111,7 +142,16 @@ pub async fn apply_decision(
                     Some(&plan_revision_id.to_string()),
                     EventKind::PlanRevisionCreated.as_str(),
                     actor,
-                    &json!({}),
+                    &json!({
+                        "home_row_projection": if prior_plan_count == 0
+                            || matches!(source, crate::lifecycle::ActivationSource::AutoRegisterReactivation)
+                        {
+                            "insert"
+                        } else {
+                            "replace"
+                        },
+                        "activation_source": source.as_str(),
+                    }),
                     None,
                     now,
                 )
@@ -120,12 +160,36 @@ pub async fn apply_decision(
                     plan_id,
                     plan_revision_id,
                 });
+                if repo_effective_sessions::claim_if_unset(tx, session_id, actor, now).await? {
+                    ev_store::append(
+                        &mut **tx,
+                        session_id,
+                        Some(plan_id),
+                        None,
+                        None,
+                        EventKind::SessionClaimed.as_str(),
+                        actor,
+                        &json!({"mode": "auto_if_unset"}),
+                        None,
+                        now,
+                    )
+                    .await?;
+                }
+                side_effects.push(SessionSideEffect::AttachSessionWatchers);
+                side_effects.push(SessionSideEffect::ScanFeedbackDirs {
+                    force_reingest: matches!(
+                        source,
+                        crate::lifecycle::ActivationSource::AutoRegisterReactivation
+                    ),
+                });
             }
             Effect::RecordPlanRevision { body } => {
                 let plan_id = active_plan_id.ok_or(ApplyError::EffectWithoutActive)?;
                 let hash = plan_revisions::compute_content_hash(body);
                 let (plan_revision_id, revision_number) =
                     plan_revisions::append(tx, plan_id, hash.as_str(), body, now).await?;
+                review_gate_overrides::delete_phase(&mut **tx, session_id, ReviewPhase::Plan)
+                    .await?;
                 ev_store::append(
                     &mut **tx,
                     session_id,
@@ -157,7 +221,9 @@ pub async fn apply_decision(
                 // table, so the read path will correctly point at the
                 // reset target without us having to update any row here.
                 let exists: Option<i64> = sqlx::query_scalar(
-                    "SELECT 1 FROM implementation_revisions WHERE plan_id = ? AND commit_sha = ?",
+                    "SELECT 1 FROM implementation_revisions ir \
+                     JOIN sessions s ON s.id = ir.session_id \
+                     WHERE s.rowid = ? AND ir.commit_sha = ?",
                 )
                 .bind(plan_id)
                 .bind(commit.sha.as_str())
@@ -189,6 +255,8 @@ pub async fn apply_decision(
 
                 let implementation_revision_id =
                     impl_revs::append(&mut **tx, plan_id, commit, actor, now).await?;
+                review_gate_overrides::delete_phase(&mut **tx, session_id, ReviewPhase::Impl)
+                    .await?;
                 let state: String = sqlx::query_scalar("SELECT state FROM plans WHERE id = ?")
                     .bind(plan_id)
                     .fetch_one(&mut **tx)
@@ -251,19 +319,19 @@ pub async fn apply_decision(
                     commit_sha: commit.sha.clone(),
                 });
             }
+            Effect::IgnoreSealedPlanEdit => {}
             Effect::ArchiveActivePlan => {
                 let plan_id = active_plan_id.ok_or(ApplyError::ArchiveWithoutActive)?;
-                let from_state: String =
-                    sqlx::query_scalar("SELECT state FROM plans WHERE id = ?")
-                        .bind(plan_id)
-                        .fetch_one(&mut **tx)
-                        .await?;
+                let from_state: String = sqlx::query_scalar("SELECT state FROM plans WHERE id = ?")
+                    .bind(plan_id)
+                    .fetch_one(&mut **tx)
+                    .await?;
                 plans::archive(&mut **tx, plan_id, now).await?;
+                repo_effective_sessions::clear_session(tx, session_id).await?;
                 // Feedback rows for the archived plan are left in place
-                // (audit history). `get_current_feedback` filters by
-                // `plan_id = active_plan_id`, so archived feedback is
-                // invisible to the read API without any cascade write.
-                sessions::set_active_plan_id(&mut **tx, session_id, None, now).await?;
+                // (audit history). The read API resolves current phase
+                // targets from session state, so archived feedback is
+                // invisible without any cascade write.
                 active_plan_id = None;
                 ev_store::append(
                     &mut **tx,
@@ -282,13 +350,12 @@ pub async fn apply_decision(
             }
             Effect::FinishActivePlan => {
                 let plan_id = active_plan_id.ok_or(ApplyError::ArchiveWithoutActive)?;
-                let from_state: String =
-                    sqlx::query_scalar("SELECT state FROM plans WHERE id = ?")
-                        .bind(plan_id)
-                        .fetch_one(&mut **tx)
-                        .await?;
+                let from_state: String = sqlx::query_scalar("SELECT state FROM plans WHERE id = ?")
+                    .bind(plan_id)
+                    .fetch_one(&mut **tx)
+                    .await?;
                 plans::finish(&mut **tx, plan_id, now).await?;
-                sessions::set_active_plan_id(&mut **tx, session_id, None, now).await?;
+                repo_effective_sessions::clear_session(tx, session_id).await?;
                 active_plan_id = None;
                 ev_store::append(
                     &mut **tx,
@@ -321,5 +388,8 @@ pub async fn apply_decision(
         }
     }
 
-    Ok(ApplyOutcome { items })
+    Ok(ApplyOutcome {
+        items,
+        side_effects,
+    })
 }

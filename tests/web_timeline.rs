@@ -65,6 +65,63 @@ async fn home_page_renders_cross_session_recent_activity() {
 }
 
 #[tokio::test]
+async fn review_gate_state_is_visible_on_home_and_session_pages() {
+    let app = TestApp::spawn().await;
+    register(&app, "s").await;
+    let canonical_repo = dunce::canonicalize(&app.repo).unwrap();
+    let plan_dir = canonical_repo
+        .join(".trinity")
+        .join("feedback")
+        .join("s")
+        .join("plan");
+    std::fs::write(plan_dir.join("rev-a.md"), "APPROVE\nship it\n").unwrap();
+    tokio::time::sleep(SETTLE).await;
+
+    let home = app.get("/").await.text().await.unwrap();
+    assert!(home.contains("ready to implement"), "home body:\n{home}");
+    assert!(
+        home.contains("review_gate_changed") && home.contains("plan review gate"),
+        "home timeline should include review gate event; body:\n{home}"
+    );
+
+    let session = app.get("/sessions/s").await.text().await.unwrap();
+    assert!(
+        session.contains("review-gate-card") && session.contains("approvals 1/1"),
+        "session body:\n{session}"
+    );
+    assert!(session.contains("Mark ready"));
+    assert!(session.contains("Request changes"));
+}
+
+#[tokio::test]
+async fn reactivated_session_homepage_activity_only_shows_current_plan_events() {
+    let app = TestApp::spawn().await;
+    register(&app, "s").await;
+    std::fs::write(app.repo.join("plan.md"), "# old revision\n").unwrap();
+    tokio::time::sleep(SETTLE).await;
+    app.archive_via_service("s").await;
+
+    std::fs::write(app.repo.join("plan.md"), "# reactivated plan\n").unwrap();
+    app.call(
+        "register_plan_file",
+        &app.repo,
+        None,
+        json!({"session_id": "s", "path": app.repo.join("plan.md"), "label": "claude-main"}),
+    )
+    .await
+    .unwrap();
+
+    let body = app.get("/").await.text().await.unwrap();
+    assert!(!body.contains("session_archived"), "home body:\n{body}");
+    assert!(!body.contains("session_reactivated"), "home body:\n{body}");
+    assert!(
+        !body.contains("# old revision"),
+        "homepage activity should not replay prior archived plan revisions; body:\n{body}"
+    );
+    assert!(body.contains("# reactivated plan"), "home body:\n{body}");
+}
+
+#[tokio::test]
 async fn session_detail_renders_active_plan_preview() {
     let app = TestApp::spawn().await;
     register(&app, "s").await;

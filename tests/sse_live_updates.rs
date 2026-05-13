@@ -49,6 +49,50 @@ async fn collect_response_until(
 }
 
 #[tokio::test]
+async fn home_sse_emits_row_and_timeline_for_auto_discovered_plan() {
+    let app = TestApp::spawn().await;
+    let _ = register(&app).await;
+    let max_id: i64 = sqlx::query_scalar("SELECT MAX(id) FROM events")
+        .fetch_one(&app.state.pool)
+        .await
+        .unwrap();
+
+    let resp = app
+        .client
+        .get(format!("{}/events?since={max_id}", app.base))
+        .send()
+        .await
+        .unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+    let plans_dir = dunce::canonicalize(&app.repo)
+        .unwrap()
+        .join(".trinity")
+        .join("plans");
+    std::fs::create_dir_all(&plans_dir).unwrap();
+    std::fs::write(plans_dir.join("new-session.md"), "# new session\n").unwrap();
+
+    let body = collect_response_until(
+        resp,
+        "session-row-new-session",
+        std::time::Duration::from_secs(8),
+    )
+    .await;
+    assert!(
+        body.contains("hx-swap-oob=\"afterbegin:#sessions-table-body\""),
+        "home SSE must insert the new session row; got:\n{body}"
+    );
+    assert!(
+        body.contains("id=\"session-row-new-session\""),
+        "home SSE must include the new session row; got:\n{body}"
+    );
+    assert!(
+        body.contains("hx-swap-oob=\"afterbegin:#home-timeline-feed\""),
+        "home SSE must prepend the home timeline row that drives sound/animation; got:\n{body}"
+    );
+}
+
+#[tokio::test]
 async fn sse_emits_oob_fragment_for_new_plan_revision() {
     let app = TestApp::spawn().await;
     let _ = register(&app).await;

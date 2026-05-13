@@ -4,6 +4,39 @@ use serde_json::json;
 
 use common::{TestApp, make_commit};
 
+async fn active_plan_id(app: &TestApp, session_id: &str) -> Option<i64> {
+    sqlx::query_scalar(
+        "SELECT CASE WHEN state IN ('planning', 'implementing') THEN rowid ELSE NULL END \
+         FROM sessions WHERE id = ?",
+    )
+    .bind(session_id)
+    .fetch_one(&app.state.pool)
+    .await
+    .unwrap()
+}
+
+async fn plan_revision_count(app: &TestApp, plan_id: i64) -> i64 {
+    sqlx::query_scalar(
+        "SELECT COUNT(*) FROM plan_revisions pr JOIN sessions s ON s.id = pr.session_id \
+         WHERE s.rowid = ?",
+    )
+    .bind(plan_id)
+    .fetch_one(&app.state.pool)
+    .await
+    .unwrap()
+}
+
+async fn implementation_count(app: &TestApp, plan_id: i64) -> i64 {
+    sqlx::query_scalar(
+        "SELECT COUNT(*) FROM implementation_revisions ir JOIN sessions s ON s.id = ir.session_id \
+         WHERE s.rowid = ?",
+    )
+    .bind(plan_id)
+    .fetch_one(&app.state.pool)
+    .await
+    .unwrap()
+}
+
 /// Planning plan survives restart; watcher continues against the same
 /// plan_id.
 #[tokio::test]
@@ -23,12 +56,7 @@ async fn planning_plan_survives_restart() {
     let plan_id = r["plan_id"].as_i64().unwrap();
     std::fs::write(&plan_path, "# v2\n").unwrap();
     tokio::time::sleep(std::time::Duration::from_millis(2500)).await;
-    let rev_count: i64 =
-        sqlx::query_scalar("SELECT COUNT(*) FROM plan_revisions WHERE plan_id = ?")
-            .bind(plan_id)
-            .fetch_one(&app.state.pool)
-            .await
-            .unwrap();
+    let rev_count = plan_revision_count(&app, plan_id).await;
     assert_eq!(rev_count, 2);
 
     let app = app.restart().await;
@@ -36,19 +64,10 @@ async fn planning_plan_survives_restart() {
     std::fs::write(&plan_path, "# v3\n").unwrap();
     tokio::time::sleep(std::time::Duration::from_millis(2500)).await;
 
-    let rev_count_after: i64 =
-        sqlx::query_scalar("SELECT COUNT(*) FROM plan_revisions WHERE plan_id = ?")
-            .bind(plan_id)
-            .fetch_one(&app.state.pool)
-            .await
-            .unwrap();
+    let rev_count_after = plan_revision_count(&app, plan_id).await;
     assert_eq!(rev_count_after, 3, "third revision on same plan_id");
 
-    let active: Option<i64> =
-        sqlx::query_scalar("SELECT active_plan_id FROM sessions WHERE id = 's'")
-            .fetch_one(&app.state.pool)
-            .await
-            .unwrap();
+    let active = active_plan_id(&app, "s").await;
     assert_eq!(active, Some(plan_id));
 }
 
@@ -77,31 +96,22 @@ async fn implementing_plan_survives_restart_and_amend_works() {
     // planning → implementing.
     let head = make_commit(&app.repo, "feature.txt", "x\n");
     tokio::time::sleep(std::time::Duration::from_millis(2500)).await;
-    let impl_count: i64 =
-        sqlx::query_scalar("SELECT COUNT(*) FROM implementation_revisions WHERE plan_id = ?")
-            .bind(plan_a)
-            .fetch_one(&app.state.pool)
-            .await
-            .unwrap();
+    let impl_count = implementation_count(&app, plan_a).await;
     assert_eq!(impl_count, 1, "first commit observed via watcher");
 
     let app = app.restart().await;
 
     // Same HEAD across the restart: recovery's HEAD-drift check must
     // see the SHA is already known and emit no new impl row.
-    let impl_count_after_restart: i64 =
-        sqlx::query_scalar("SELECT COUNT(*) FROM implementation_revisions WHERE plan_id = ?")
-            .bind(plan_a)
-            .fetch_one(&app.state.pool)
-            .await
-            .unwrap();
+    let impl_count_after_restart = implementation_count(&app, plan_a).await;
     assert_eq!(
         impl_count_after_restart, 1,
         "restart at same HEAD must not duplicate impl row"
     );
     let _ = head;
 
-    // Post-impl plan-file edit: archive plan_a + start new plan.
+    // Post-impl plan-file edit: sealed out. It must not archive plan_a
+    // or start a new plan after restart either.
     std::fs::write(&plan_path, "# totally new task\n").unwrap();
     tokio::time::sleep(std::time::Duration::from_millis(2500)).await;
 
@@ -110,14 +120,14 @@ async fn implementing_plan_survives_restart_and_amend_works() {
         .fetch_one(&app.state.pool)
         .await
         .unwrap();
-    assert_eq!(old_state, "archived");
-    let new_active: Option<i64> =
-        sqlx::query_scalar("SELECT active_plan_id FROM sessions WHERE id = 's'")
-            .fetch_one(&app.state.pool)
-            .await
-            .unwrap();
-    assert!(new_active.is_some());
-    assert_ne!(new_active, Some(plan_a));
+    assert_eq!(old_state, "implementing");
+    let new_active = active_plan_id(&app, "s").await;
+    assert_eq!(new_active, Some(plan_a));
+    let plan_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM plans WHERE session_id = 's'")
+        .fetch_one(&app.state.pool)
+        .await
+        .unwrap();
+    assert_eq!(plan_count, 1);
 }
 
 #[tokio::test]
@@ -134,11 +144,7 @@ async fn no_active_session_drift_does_not_start_plan() {
     .await
     .unwrap();
     app.archive_via_service("s").await;
-    let active: Option<i64> =
-        sqlx::query_scalar("SELECT active_plan_id FROM sessions WHERE id = 's'")
-            .fetch_one(&app.state.pool)
-            .await
-            .unwrap();
+    let active = active_plan_id(&app, "s").await;
     assert!(active.is_none());
 
     let app = app.restart().await;
@@ -162,17 +168,13 @@ async fn no_active_session_drift_does_not_start_plan() {
     )
     .await
     .unwrap();
-    let active_now: Option<i64> =
-        sqlx::query_scalar("SELECT active_plan_id FROM sessions WHERE id = 's'")
-            .fetch_one(&app.state.pool)
-            .await
-            .unwrap();
+    let active_now = active_plan_id(&app, "s").await;
     assert!(active_now.is_some());
     let total: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM plans WHERE session_id = 's'")
         .fetch_one(&app.state.pool)
         .await
         .unwrap();
-    assert_eq!(total, 2, "1 archived + 1 new active");
+    assert_eq!(total, 1, "one session lifecycle row is reactivated");
 }
 
 /// Feedback files dropped before the daemon was up must be ingested
@@ -247,12 +249,7 @@ async fn commit_made_while_daemon_off_is_observed_on_restart() {
     make_commit(&app.repo, "f.txt", "x\n");
     let app = app.restart().await;
 
-    let count: i64 =
-        sqlx::query_scalar("SELECT COUNT(*) FROM implementation_revisions WHERE plan_id = ?")
-            .bind(plan_id)
-            .fetch_one(&app.state.pool)
-            .await
-            .unwrap();
+    let count = implementation_count(&app, plan_id).await;
     assert_eq!(
         count, 1,
         "HEAD drift detection on restart records the commit"

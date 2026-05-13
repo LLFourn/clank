@@ -98,12 +98,10 @@ async fn cross_session_rev_id_returns_404() {
     .await
     .unwrap();
     // session `t`'s rev_id 1 doesn't belong to session `s`.
-    let t_rev: i64 = sqlx::query_scalar(
-        "SELECT pr.id FROM plan_revisions pr JOIN plans p ON p.id = pr.plan_id WHERE p.session_id = 't'",
-    )
-    .fetch_one(&app.state.pool)
-    .await
-    .unwrap();
+    let t_rev: i64 = sqlx::query_scalar("SELECT id FROM plan_revisions WHERE session_id = 't'")
+        .fetch_one(&app.state.pool)
+        .await
+        .unwrap();
     let resp = app
         .get(&format!("/sessions/s/plan_revisions/{t_rev}"))
         .await;
@@ -120,7 +118,7 @@ async fn plan_revision_page_renders_inline_feedback_for_target_revision() {
         .join("feedback")
         .join("s")
         .join("plan");
-    std::fs::write(plan_dir.join("rev-a.md"), "the review\n").unwrap();
+    std::fs::write(plan_dir.join("rev-a.md"), "APPROVE\nthe review\n").unwrap();
     tokio::time::sleep(SETTLE).await;
     let resp = app
         .get(&format!("/sessions/s/plan_revisions/{rev_id}"))
@@ -131,6 +129,7 @@ async fn plan_revision_page_renders_inline_feedback_for_target_revision() {
     assert!(body.contains("rev-a"));
     assert!(body.contains(">plan<"));
     assert!(body.contains(">current<"));
+    assert!(body.contains(r#"kind-badge verdict approve"#));
     assert!(body.contains(".trinity/feedback/s/plan/rev-a.md"));
 }
 

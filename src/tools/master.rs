@@ -1,9 +1,8 @@
-//! Lifecycle MCP tool: `register_plan_file`. This is the only write-path
-//! agent tool in the catalog after the watcher-coordinator refactor.
+//! Lifecycle MCP tools for plan registration and explicit repo claim.
 //! Implementation commits arrive via the `.git/logs/HEAD` watcher;
 //! feedback arrives via the feedback-directory watcher.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -13,7 +12,9 @@ use crate::daemon::apply::AppliedEffect;
 use crate::daemon::git;
 use crate::daemon::internal_api::ToolCallRequest;
 use crate::domain::EventKind;
-use crate::lifecycle::{AgentLabel, CommitSha, Observation, PlanFilePath, SessionId};
+use crate::lifecycle::{
+    ActivationSource, AgentLabel, CommitSha, Observation, PlanFilePath, SessionId,
+};
 use crate::storage::{
     agents::{self, SeenOutcome},
     events as ev_store, sessions,
@@ -25,6 +26,12 @@ use super::ToolError;
 struct RegisterPlanFileArgs {
     session_id: String,
     path: String,
+    label: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ClaimSessionArgs {
+    session_id: String,
     label: String,
 }
 
@@ -108,6 +115,20 @@ pub async fn register_plan_file(
                 )
                 .await
                 .map_err(map_lifecycle_err)?;
+        } else if session.active_plan_id.is_none() {
+            let finished_exists: Option<i64> = sqlx::query_scalar(
+                "SELECT id FROM plans WHERE session_id = ? AND state = 'finished' LIMIT 1",
+            )
+            .bind(session_id.as_str())
+            .fetch_optional(&state.pool)
+            .await
+            .map_err(|e| ToolError::Internal(anyhow::anyhow!(e)))?;
+            if finished_exists.is_some() {
+                return Err(ToolError::Invalid(format!(
+                    "session `{}` has already finished; create a new session for new work",
+                    session_id
+                )));
+            }
         }
     } else {
         let display_title = canonical
@@ -127,16 +148,6 @@ pub async fn register_plan_file(
         .map_err(|e| ToolError::Internal(anyhow::anyhow!(e)))?;
     }
 
-    state
-        .lifecycle
-        .archive_other_active_sessions_in_repo(
-            &repo_root_str,
-            &session_id,
-            &format!("agent:{label}"),
-        )
-        .await
-        .map_err(map_lifecycle_err)?;
-
     upsert_seen_with_event(state, &session_id, &label, now).await?;
 
     // Reactivation already issued a `PlanRegistered` observation against
@@ -155,38 +166,13 @@ pub async fn register_plan_file(
                         path: PlanFilePath::from(plan_path_str.clone()),
                         body,
                         head,
+                        source: ActivationSource::ExplicitRegister,
                     },
                 )
                 .await
                 .map_err(map_lifecycle_err)?,
         )
     };
-
-    // Auto-watch git logs/HEAD + the plan/ and impl/ feedback dirs as
-    // part of plan registration. With the watcher-coordinator model
-    // these are load-bearing: commits and reviewer feedback only flow
-    // through them. A failure here means the agent would be handed a
-    // session whose feedback paths won't ingest, so it bubbles up as
-    // a tool error. Re-calling `register_plan_file` is idempotent and
-    // retries the attach after the underlying issue is fixed.
-    attach_companion_watchers(state, &session_id, &repo_root_canonical)
-        .await
-        .map_err(|e| ToolError::Internal(anyhow::anyhow!(e)))?;
-
-    // On reactivation, the feedback files on disk haven't changed mtime
-    // since the previous archive — the ordinary watcher won't fire for
-    // them. Drift-scan the directories so existing reviews come back
-    // into the DB. No-op for a freshly-created session: the dirs are
-    // either empty or only contain files the watcher will also pick up
-    // through normal mtime events when they're next touched.
-    if took_reactivation_path {
-        crate::daemon::scan_feedback_dir_for_session(
-            &state.lifecycle,
-            &repo_root_canonical,
-            &session_id,
-        )
-        .await;
-    }
 
     let from_effects = outcome.as_ref().and_then(|o| {
         o.apply.items.iter().find_map(|e| match e {
@@ -236,21 +222,49 @@ pub async fn register_plan_file(
     }))
 }
 
-/// Attach the git-logs/HEAD watcher and create + watch the feedback
-/// directory for this session. Called by `register_plan_file`.
-/// Idempotent — repeated calls with the same paths are no-ops at the
-/// watcher level. Failures are logged at warn but don't fail the tool
-/// call. Companion-watcher setup is load-bearing under the
-/// watcher-coordinator model — commits and feedback only flow through
-/// these — so any setup failure bubbles up and the tool returns an
-/// error rather than handing the agent a session whose paths won't
-/// ingest. Idempotent: re-calling after a fix retries cleanly.
-async fn attach_companion_watchers(
-    state: &AppState,
-    session_id: &SessionId,
-    repo_root: &Path,
-) -> anyhow::Result<()> {
-    crate::daemon::attach_session_watchers(&state.lifecycle, session_id, repo_root).await
+pub async fn claim_session(state: &AppState, req: &ToolCallRequest) -> Result<Value, ToolError> {
+    let args: ClaimSessionArgs = serde_json::from_value(req.arguments.clone())
+        .map_err(|e| ToolError::Invalid(format!("invalid args: {e}")))?;
+    let session_id = sessions::validate_slug(&args.session_id).map_err(ToolError::Invalid)?;
+    let label = AgentLabel::from(args.label.trim().to_string());
+    if label.as_str().is_empty() {
+        return Err(ToolError::Invalid("label must be non-empty".into()));
+    }
+
+    let repo_root = git::rev_parse_show_toplevel(&req.cwd).await.map_err(|e| {
+        ToolError::Invalid(format!(
+            "caller cwd `{}` is not in a git repository: {e}",
+            req.cwd.display()
+        ))
+    })?;
+    let repo_root_canonical = dunce::canonicalize(&repo_root)
+        .map_err(|e| ToolError::Internal(anyhow::anyhow!("canonicalize repo_root: {e}")))?;
+    let repo_root_str = repo_root_canonical.to_string_lossy().into_owned();
+
+    let session = sessions::fetch(&state.pool, &session_id)
+        .await
+        .map_err(|e| ToolError::Internal(anyhow::anyhow!(e)))?
+        .ok_or_else(|| ToolError::NotFound(format!("session `{session_id}` not found")))?;
+    if session.repo_root != repo_root_str {
+        return Err(ToolError::Forbidden(format!(
+            "session `{}` is recorded under repo `{}` but caller cwd resolves to `{}`",
+            session_id, session.repo_root, repo_root_str
+        )));
+    }
+
+    let now = chrono::Utc::now().timestamp();
+    upsert_seen_with_event(state, &session_id, &label, now).await?;
+    state
+        .lifecycle
+        .claim_repo_effective_session(&session_id, &format!("agent:{label}"))
+        .await
+        .map_err(map_lifecycle_err)?;
+
+    Ok(json!({
+        "session_id": session_id.as_str(),
+        "repo_root": repo_root_str,
+        "is_repo_effective": true,
+    }))
 }
 
 pub(crate) async fn upsert_seen_with_event(
@@ -281,42 +295,17 @@ pub(crate) async fn upsert_seen_with_event(
     Ok(())
 }
 
-#[derive(serde::Deserialize)]
-struct FinishPlanArgs {
-    session_id: String,
-    label: String,
-}
-
-pub async fn finish_plan(state: &AppState, req: &ToolCallRequest) -> Result<Value, ToolError> {
-    let args: FinishPlanArgs = serde_json::from_value(req.arguments.clone())
-        .map_err(|e| ToolError::Invalid(format!("invalid args: {e}")))?;
-    let session_id = sessions::validate_slug(&args.session_id).map_err(ToolError::Invalid)?;
-    let label = AgentLabel::from(args.label.trim().to_string());
-    if label.as_str().is_empty() {
-        return Err(ToolError::Invalid("label must be non-empty".into()));
-    }
-    let now = chrono::Utc::now().timestamp();
-    upsert_seen_with_event(state, &session_id, &label, now).await?;
-    state
-        .lifecycle
-        .finish_plan(&session_id, &format!("agent:{label}"))
-        .await
-        .map_err(map_lifecycle_err)?;
-    Ok(json!({
-        "session_id": session_id.as_str(),
-        "ok": true,
-    }))
-}
-
 pub(crate) fn map_lifecycle_err(err: crate::daemon::LifecycleServiceError) -> ToolError {
     use crate::daemon::LifecycleServiceError as E;
     match err {
         E::Reducer(r) => ToolError::Invalid(format!("lifecycle reducer: {r}")),
         E::Apply(a) => ToolError::Internal(anyhow::anyhow!(a)),
         E::ActivePlan(inc) => ToolError::Internal(anyhow::anyhow!(inc)),
+        E::Feedback(e) => ToolError::Internal(anyhow::anyhow!(e)),
         E::NoSession(s) => ToolError::NotFound(format!("session `{s}` not found")),
         E::Sql(e) => ToolError::Internal(anyhow::anyhow!(e)),
-        E::Watcher(msg) => ToolError::Internal(anyhow::anyhow!(msg)),
+        E::InvalidArgs(msg) => ToolError::Invalid(msg),
+        E::Watcher(err) => ToolError::Internal(err),
         E::RepoMismatch {
             session_id,
             expected,
@@ -324,9 +313,9 @@ pub(crate) fn map_lifecycle_err(err: crate::daemon::LifecycleServiceError) -> To
         } => ToolError::Invalid(format!(
             "session `{session_id}` is recorded under repo `{expected}`; cannot re-register under `{actual}`"
         )),
-        E::SessionArchived(s) => ToolError::Invalid(format!(
-            "session `{s}` is archived; re-register first"
-        )),
+        E::SessionArchived(s) => {
+            ToolError::Invalid(format!("session `{s}` is archived; re-register first"))
+        }
     }
 }
 

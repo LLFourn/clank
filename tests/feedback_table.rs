@@ -81,6 +81,55 @@ async fn put_feedback_inserts_then_updates() {
 }
 
 #[tokio::test]
+async fn verdict_feedback_emits_review_gate_changed_only_on_state_transition() {
+    let app = TestApp::spawn().await;
+    let (_plan_id, rev_id) = setup_with_plan(&app).await;
+
+    app.put_feedback_via_service(
+        "s",
+        "rev",
+        FeedbackTargetRef::PlanRevision(rev_id),
+        "APPROVE\nship it",
+    )
+    .await
+    .unwrap();
+    app.put_feedback_via_service(
+        "s",
+        "rev",
+        FeedbackTargetRef::PlanRevision(rev_id),
+        "APPROVE\nstill ship it",
+    )
+    .await
+    .unwrap();
+
+    let events: Vec<String> =
+        sqlx::query_scalar("SELECT kind FROM events WHERE session_id = 's' ORDER BY id ASC")
+            .fetch_all(&app.state.pool)
+            .await
+            .unwrap();
+    let gate_events = events
+        .iter()
+        .filter(|kind| kind.as_str() == "review_gate_changed")
+        .count();
+    assert_eq!(
+        gate_events, 1,
+        "gate events should track state crossings, not every feedback body update: {events:?}"
+    );
+
+    let payload: String = sqlx::query_scalar(
+        "SELECT payload FROM events WHERE session_id = 's' AND kind = 'review_gate_changed'",
+    )
+    .fetch_one(&app.state.pool)
+    .await
+    .unwrap();
+    let payload: serde_json::Value = serde_json::from_str(&payload).unwrap();
+    assert_eq!(payload["phase"], "plan");
+    assert_eq!(payload["from"], "needs_review");
+    assert_eq!(payload["to"], "ready");
+    assert_eq!(payload["approvals"], json!(["rev"]));
+}
+
+#[tokio::test]
 async fn put_feedback_identical_body_is_noop() {
     let app = TestApp::spawn().await;
     let (_, rev_id) = setup_with_plan(&app).await;
@@ -305,7 +354,9 @@ async fn feedback_session_id_matches_plans_session_id() {
         .unwrap();
 
     let mismatched: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM feedback f JOIN plans p ON p.id = f.plan_id WHERE f.session_id != p.session_id",
+        "SELECT COUNT(*) FROM feedback f \
+         LEFT JOIN sessions s ON s.id = f.session_id \
+         WHERE s.id IS NULL",
     )
     .fetch_one(&app.state.pool)
     .await

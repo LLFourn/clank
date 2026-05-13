@@ -18,6 +18,7 @@ use crate::daemon::service::{ActiveTarget, FeedbackContext, FeedbackFileSnapshot
 use crate::domain::{FeedbackFileStatus, FeedbackKind, Phase};
 use crate::feedback_path;
 use crate::lifecycle::AgentLabel;
+use crate::review_state::{ReviewGateDecision, ReviewGateState, ReviewPhase};
 use crate::storage::sessions;
 
 use super::ToolError;
@@ -39,10 +40,13 @@ struct GetContextResponse {
     repo_root: PathBuf,
     plan_file_path: PathBuf,
     git_logs_head_path: Option<PathBuf>,
+    repo_effective_session_id: Option<String>,
+    is_repo_effective: bool,
     phase: Phase,
     expected_action: &'static str,
     completion_artifact: Option<&'static str>,
     commit_policy: Option<CommitPolicy>,
+    review_gate: Option<ReviewGateDecision>,
     review_target: Option<ReviewTarget>,
     latest_plan_revision: Option<PlanRevisionView>,
     latest_implementation_revision: Option<ImplRevisionView>,
@@ -161,15 +165,42 @@ pub async fn get_context(state: &AppState, req: &ToolCallRequest) -> Result<Valu
         .build_feedback_context(&session_id)
         .await
         .map_err(|e| ToolError::Internal(anyhow::anyhow!(e)))?;
+    let repo_effective_session_id = state
+        .lifecycle
+        .repo_effective_session_id(&ctx.repo_root.display().to_string())
+        .await
+        .map_err(|e| ToolError::Internal(anyhow::anyhow!(e)))?
+        .map(|sid| sid.into_inner());
+    let review_gate = match ctx.phase {
+        Phase::Planning => state
+            .lifecycle
+            .review_gate_for_phase(&session_id, ReviewPhase::Plan)
+            .await
+            .map_err(|e| ToolError::Internal(anyhow::anyhow!(e)))?,
+        Phase::Implementing => state
+            .lifecycle
+            .review_gate_for_phase(&session_id, ReviewPhase::Impl)
+            .await
+            .map_err(|e| ToolError::Internal(anyhow::anyhow!(e)))?,
+        Phase::Finished | Phase::NoActivePlan => None,
+    };
 
     let now = chrono::Utc::now().timestamp();
-    let response = render(&ctx, author_label.as_ref(), now);
+    let response = render(
+        &ctx,
+        review_gate,
+        author_label.as_ref(),
+        repo_effective_session_id,
+        now,
+    );
     to_value(&response).map_err(|e| ToolError::Internal(anyhow::anyhow!(e)))
 }
 
 fn render(
     ctx: &FeedbackContext,
+    review_gate: Option<ReviewGateDecision>,
     author_label: Option<&AgentLabel>,
+    repo_effective_session_id: Option<String>,
     now: i64,
 ) -> GetContextResponse {
     // Status is already pre-derived per-row by build_feedback_context
@@ -179,7 +210,6 @@ fn render(
         .review_target
         .as_ref()
         .map(|t| review_target_view(t, ctx, now));
-
     let latest_plan_revision = ctx.latest_plan_revision.as_ref().map(|r| PlanRevisionView {
         id: r.id,
         number: r.revision_number,
@@ -257,7 +287,8 @@ fn render(
         .filter(|s| author_str.as_deref() != Some(s.row.author_label.as_str()))
         .map(|s| pointer_for(FeedbackKind::Impl, s, now))
         .collect();
-    let phase_contract = phase_contract(ctx.phase);
+    let is_repo_effective = repo_effective_session_id.as_deref() == Some(ctx.session_id.as_str());
+    let phase_contract = phase_contract(ctx.phase, review_gate.as_ref(), is_repo_effective);
 
     GetContextResponse {
         schema_version: SCHEMA_VERSION,
@@ -265,10 +296,13 @@ fn render(
         repo_root: ctx.repo_root.clone(),
         plan_file_path: ctx.plan_file_path.clone(),
         git_logs_head_path: ctx.git_logs_head_path.clone(),
+        repo_effective_session_id,
+        is_repo_effective,
         phase: ctx.phase,
         expected_action: phase_contract.expected_action,
         completion_artifact: phase_contract.completion_artifact,
         commit_policy: phase_contract.commit_policy,
+        review_gate,
         review_target,
         latest_plan_revision,
         latest_implementation_revision,
@@ -287,26 +321,51 @@ struct PhaseContract {
     commit_policy: Option<CommitPolicy>,
 }
 
-fn phase_contract(phase: Phase) -> PhaseContract {
-    match phase {
-        Phase::NoActivePlan => PhaseContract {
+fn phase_contract(
+    phase: Phase,
+    review_gate: Option<&ReviewGateDecision>,
+    is_repo_effective: bool,
+) -> PhaseContract {
+    match (phase, review_gate.map(|g| g.state)) {
+        (Phase::NoActivePlan, _) => PhaseContract {
             expected_action: "none",
             completion_artifact: None,
             commit_policy: None,
         },
-        Phase::Finished => PhaseContract {
+        (Phase::Finished, _) => PhaseContract {
             expected_action: "none",
             completion_artifact: None,
             commit_policy: None,
         },
-        Phase::Planning => PhaseContract {
-            expected_action: "review_plan_or_update_plan_file",
+        (Phase::Planning, Some(ReviewGateState::Ready)) if is_repo_effective => PhaseContract {
+            expected_action: "implement_and_commit",
+            completion_artifact: Some("git_commit"),
+            commit_policy: Some(CommitPolicy {
+                initial_impl: "create_commit",
+                addressing_impl_feedback: "amend_latest_impl_commit_unless_user_requests_new_commit",
+            }),
+        },
+        (Phase::Planning, Some(ReviewGateState::Ready)) => PhaseContract {
+            expected_action: "claim_for_implementation",
+            completion_artifact: Some("repo_effective_session"),
+            commit_policy: None,
+        },
+        (Phase::Planning, _) => PhaseContract {
+            expected_action: "write_plan_feedback",
             completion_artifact: Some("plan_revision_or_plan_feedback_file"),
             commit_policy: None,
         },
-        Phase::Implementing => PhaseContract {
-            expected_action: "implement_and_commit",
-            completion_artifact: Some("git_commit"),
+        (Phase::Implementing, Some(ReviewGateState::Ready)) => PhaseContract {
+            expected_action: "ready_to_finish",
+            completion_artifact: None,
+            commit_policy: Some(CommitPolicy {
+                initial_impl: "create_commit",
+                addressing_impl_feedback: "amend_latest_impl_commit_unless_user_requests_new_commit",
+            }),
+        },
+        (Phase::Implementing, _) => PhaseContract {
+            expected_action: "write_impl_feedback",
+            completion_artifact: Some("implementation_feedback_file"),
             commit_policy: Some(CommitPolicy {
                 initial_impl: "create_commit",
                 addressing_impl_feedback: "amend_latest_impl_commit_unless_user_requests_new_commit",

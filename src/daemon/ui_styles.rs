@@ -67,11 +67,15 @@ table.sessions th.row-actions-th { width: 36px; }
 .status-chip.planning    { background: #fff1d6; color: var(--planning); }
 .status-chip.implementing{ background: #d6e5f7; color: var(--impl); }
 .status-chip.finished    { background: #d6f0db; color: #166534; }
+.status-chip.ready       { background: #dcfce7; color: #166534; }
+.status-chip.blocked     { background: #fee2e2; color: #991b1b; }
 .status-chip.muted       { background: #eee;    color: var(--muted); }
 @media (prefers-color-scheme: dark) {
   .status-chip.planning    { background: rgba(255, 193, 7, 0.18); color: #fbbf24; }
   .status-chip.implementing{ background: rgba(67, 134, 240, 0.20); color: #93c5fd; }
   .status-chip.finished    { background: rgba(22, 163, 74, 0.20); color: #86efac; }
+  .status-chip.ready       { background: rgba(22, 163, 74, 0.20); color: #86efac; }
+  .status-chip.blocked     { background: rgba(220, 38, 38, 0.24); color: #fca5a5; }
   .status-chip.muted       { background: rgba(255,255,255,0.06); color: var(--muted); }
 }
 .home-header { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 12px; }
@@ -228,6 +232,12 @@ article.entry.head-reset  a.pill:hover { border-color: var(--head-reset-accent);
   background: var(--pill-bg); color: var(--muted); font-weight: 600; }
 .kind-badge.amend { background: #fef3c7; color: #92400e; }
 .kind-badge.warning-badge, .attention-badge { background: #fef3c7; color: #92400e; }
+.kind-badge.verdict.approve { background: #dcfce7; color: #166534; }
+.kind-badge.verdict.request-changes { background: #fee2e2; color: #991b1b; }
+.kind-badge.verdict.unmarked { background: #f3f4f6; color: #4b5563; }
+.kind-badge.review-gate.ready { background: #dcfce7; color: #166534; }
+.kind-badge.review-gate.changes_requested { background: #fee2e2; color: #991b1b; }
+.kind-badge.review-gate.needs_review { background: #e0f2fe; color: #075985; }
 .attention-badge { display: inline-block; padding: 1px 8px; border-radius: 999px; font-size: 0.7rem;
   text-transform: uppercase; letter-spacing: 0.05em; font-weight: 700; }
 .icon-action { min-height: 32px; display: inline-flex; align-items: center; justify-content: center;
@@ -238,11 +248,24 @@ article.entry.head-reset  a.pill:hover { border-color: var(--head-reset-accent);
 .icon-action .action-icon { display: inline-flex; align-items: center; justify-content: center; }
 .icon-action svg { width: 14px; height: 14px; fill: none; stroke: currentColor; stroke-width: 1.75;
   stroke-linecap: round; stroke-linejoin: round; }
+.review-gates { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 10px; margin: 12px 0; }
+.review-gate-card { border: 1px solid var(--line); background: var(--bg-alt); border-radius: 8px; padding: 12px; }
+.review-gate-main { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.review-gate-phase { font-weight: 700; }
+.review-gate-detail { margin-top: 6px; color: var(--muted); font-size: 0.88rem; }
+.review-gate-override { color: var(--muted); font-size: 0.82rem; }
+.review-gate-actions { margin-top: 10px; display: flex; gap: 8px; flex-wrap: wrap; }
 .sr-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden;
   clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0; }
 @media (prefers-color-scheme: dark) {
   .kind-badge.amend { background: #422a0a; color: #fbbf24; }
   .kind-badge.warning-badge, .attention-badge, .artifact-chip.warn { background: #422a0a; color: #fbbf24; }
+  .kind-badge.verdict.approve { background: rgba(22, 163, 74, 0.20); color: #86efac; }
+  .kind-badge.verdict.request-changes { background: rgba(220, 38, 38, 0.24); color: #fca5a5; }
+  .kind-badge.verdict.unmarked { background: rgba(255,255,255,0.06); color: var(--muted); }
+  .kind-badge.review-gate.ready { background: rgba(22, 163, 74, 0.20); color: #86efac; }
+  .kind-badge.review-gate.changes_requested { background: rgba(220, 38, 38, 0.24); color: #fca5a5; }
+  .kind-badge.review-gate.needs_review { background: rgba(14, 165, 233, 0.20); color: #7dd3fc; }
   .artifact-chip.ok { color: #86efac; background: rgba(22, 163, 74, 0.20); }
 }
 

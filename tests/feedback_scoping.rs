@@ -1,12 +1,10 @@
 //! Regression tests for "feedback must be scoped to the active plan".
 //! Scoping is enforced two ways:
 //!
-//! 1. `SessionService::put_feedback`'s upsert key is `(plan_id,
-//!    target_kind, target_id, author_label)`, with `plan_id` resolved
-//!    from `active_plan_id` under the per-session lock — an archived
-//!    plan's slot is no longer addressable.
-//! 2. `current_feedback` joins through `sessions.active_plan_id`, so
-//!    archived feedback rows are invisible.
+//! 1. `SessionService::put_feedback` validates against the current
+//!    phase target under the per-session lock.
+//! 2. `current_feedback` filters structural rows down to those current
+//!    phase targets, so stale archived feedback rows are invisible.
 
 mod common;
 
@@ -77,7 +75,10 @@ async fn feedback_does_not_leak_across_archive_to_new_plan() {
     else {
         panic!("expected active plan view");
     };
-    assert_ne!(plan_a, plan_b);
+    assert_eq!(
+        plan_a, plan_b,
+        "one-plan sessions keep the same lifecycle row across reactivation"
+    );
     assert!(feedback.is_empty());
     // The structural `feedback.is_empty()` above is the real assertion.
     // The earlier UI text check ("No plan feedback yet") was coupled to the

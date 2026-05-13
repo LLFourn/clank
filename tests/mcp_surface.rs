@@ -1,5 +1,5 @@
 //! Lock the agent-facing MCP surface area. Under the watcher-coordinator
-//! model the catalog is exactly three agent-facing tools (plus the
+//! model the catalog is small and coordination-only (plus the
 //! `echo_cwd` diagnostic stub). Removed tools must not be in
 //! `catalog()` or dispatchable through `dispatch()`.
 
@@ -17,7 +17,7 @@ fn catalog_names() -> Vec<String> {
 }
 
 #[tokio::test]
-async fn catalog_lists_exactly_the_three_normal_tools() {
+async fn catalog_lists_exactly_the_coordination_tools() {
     let names = catalog_names();
     let normal: Vec<&str> = names
         .iter()
@@ -30,9 +30,9 @@ async fn catalog_lists_exactly_the_three_normal_tools() {
             "list_sessions",
             "register_plan_file",
             "get_context",
-            "finish_plan",
+            "claim_session",
         ],
-        "catalog must contain exactly the four agent-facing tools (plus echo_cwd diagnostic), got {names:?}"
+        "catalog must contain exactly the coordination tools (plus echo_cwd diagnostic), got {names:?}"
     );
 }
 
@@ -133,6 +133,7 @@ async fn removed_tools_404_through_dispatch() {
         "join_session",
         "get_current_feedback",
         "get_review_context",
+        "finish_plan",
     ] {
         let (status, body) = app
             .call(tool, &app.repo, None, json!({}))
@@ -190,6 +191,50 @@ async fn get_context_returns_active_target_and_feedback_status() {
     // other_feedback_files: both arrays always present.
     assert!(r["other_feedback_files"]["plan"].is_array());
     assert!(r["other_feedback_files"]["impl"].is_array());
+}
+
+#[tokio::test]
+async fn claim_session_tool_sets_repo_effective_session() {
+    let app = TestApp::spawn().await;
+    let plan_a = app.repo.join("a.md");
+    let plan_b = app.repo.join("b.md");
+    std::fs::write(&plan_a, "# a\n").unwrap();
+    std::fs::write(&plan_b, "# b\n").unwrap();
+    app.call(
+        "register_plan_file",
+        &app.repo,
+        None,
+        json!({"session_id": "a", "path": &plan_a, "label": "m"}),
+    )
+    .await
+    .unwrap();
+    app.call(
+        "register_plan_file",
+        &app.repo,
+        None,
+        json!({"session_id": "b", "path": &plan_b, "label": "m"}),
+    )
+    .await
+    .unwrap();
+
+    let result = app
+        .call(
+            "claim_session",
+            &app.repo,
+            Some("codex"),
+            json!({"session_id": "b"}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(result["session_id"], "b");
+    assert_eq!(result["is_repo_effective"], true);
+
+    let ctx = app
+        .call("get_context", &app.repo, None, json!({"session_id": "b"}))
+        .await
+        .unwrap();
+    assert_eq!(ctx["repo_effective_session_id"], "b");
+    assert_eq!(ctx["is_repo_effective"], true);
 }
 
 #[tokio::test]

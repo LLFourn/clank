@@ -5,6 +5,7 @@ use maud::{DOCTYPE, Markup, PreEscaped, html};
 use crate::daemon::diff_parser::{DiffLineKind as ParsedDiffLineKind, FileDiff, FileDiffMode};
 use crate::daemon::service::FeedbackFileSnapshot;
 use crate::domain::{FeedbackFileStatus, FeedbackKind};
+use crate::review_state::{ReviewGateDecision, ReviewGateState, ReviewPhase, ReviewVerdict};
 use crate::storage::events::Event;
 use crate::storage::implementation_revisions::ImplementationRevision;
 use crate::storage::plan_revisions::PlanRevision;
@@ -18,6 +19,8 @@ use super::ui_styles::STYLE;
 pub struct SessionRow {
     pub session: Session,
     pub active_plan_state: Option<String>,
+    pub review_gate: Option<ReviewGateDecision>,
+    pub is_repo_effective: bool,
     /// True when no active plan exists but the most-recent plan for this
     /// session is in state `finished`. Drives the table's `finished`
     /// status chip.
@@ -130,11 +133,16 @@ fn session_table_row_live(row: &SessionRow, live: bool) -> Markup {
         .unwrap_or(row.session.plan_file_path.as_str())
         .to_string();
     let chip = status_chip(row);
-    let class = if live { "session-row live" } else { "session-row" };
+    let class = if live {
+        "session-row live"
+    } else {
+        "session-row"
+    };
     let can_finish = matches!(
         row.active_plan_state.as_deref(),
         Some("planning") | Some("implementing")
     );
+    let can_claim = can_finish && !row.is_repo_effective;
     html! {
         tr id={ "session-row-" (session_id) } class=(class) {
             td.mono { a href={ "/sessions/" (session_id) } { (session_id) } }
@@ -144,6 +152,16 @@ fn session_table_row_live(row: &SessionRow, live: bool) -> Markup {
             td.relative { (relative_time_tag(Some(row.session.updated_at))) }
             td.row-actions {
                 @if can_finish {
+                    @if can_claim {
+                        form method="post" action={ "/sessions/" (session_id) "/claim" } class="row-claim-form" {
+                            button type="submit"
+                                    class="row-action-button"
+                                    title="Set this session as the repo's implementation target"
+                                    aria-label="Set this session in effect" {
+                                (action_icon(ActionIcon::Check))
+                            }
+                        }
+                    }
                     form method="post" action={ "/sessions/" (session_id) "/finish" } class="row-finish-form" {
                         button type="submit"
                                 class="row-action-button success"
@@ -173,14 +191,44 @@ pub fn session_table_row(row: &SessionRow) -> Markup {
 }
 
 fn status_chip(row: &SessionRow) -> Markup {
-    let (text, class) = match row.active_plan_state.as_deref() {
-        Some("planning") => ("planning", "status-chip planning"),
-        Some("implementing") => ("implementing", "status-chip implementing"),
-        Some("archived") => ("archived", "status-chip muted"),
-        None if row.finished => ("finished", "status-chip finished"),
-        _ => ("—", "status-chip muted"),
+    let override_label = row
+        .review_gate
+        .as_ref()
+        .and_then(|gate| gate.override_status.as_ref())
+        .map(|o| format!("overridden by {}", o.actor));
+    let (text, class) = match (
+        row.active_plan_state.as_deref(),
+        row.review_gate.as_ref().map(|g| g.state),
+    ) {
+        (Some("planning"), Some(ReviewGateState::Ready)) => {
+            ("ready to implement", "status-chip ready")
+        }
+        (Some("planning"), Some(ReviewGateState::ChangesRequested)) => {
+            ("changes requested", "status-chip blocked")
+        }
+        (Some("planning"), _) => ("planning", "status-chip planning"),
+        (Some("implementing"), Some(ReviewGateState::Ready)) => {
+            ("ready to finish", "status-chip ready")
+        }
+        (Some("implementing"), Some(ReviewGateState::ChangesRequested)) => {
+            ("impl changes requested", "status-chip blocked")
+        }
+        (Some("implementing"), _) => ("implementing", "status-chip implementing"),
+        (Some("archived"), _) => ("archived", "status-chip muted"),
+        (None, _) if row.finished => ("finished", "status-chip finished"),
+        _ => ("-", "status-chip muted"),
     };
-    html! { span class=(class) { (text) } }
+    html! {
+        span class=(class) title=[override_label] {
+            (text)
+            @if row.is_repo_effective {
+                " · in effect"
+            }
+            @if row.review_gate.as_ref().and_then(|g| g.override_status.as_ref()).is_some() {
+                " *"
+            }
+        }
+    }
 }
 
 // ---------- Session detail (active plan + history summary) ----------
@@ -188,6 +236,7 @@ fn status_chip(row: &SessionRow) -> Markup {
 pub struct FeedbackItem {
     pub author_label: String,
     pub body: String,
+    pub verdict: ReviewVerdict,
     pub created_at: i64,
     pub updated_at: i64,
     pub target_label: Option<String>,
@@ -196,6 +245,7 @@ pub struct FeedbackItem {
 pub struct SessionDetail {
     pub session: Session,
     pub active_plan: Option<Plan>,
+    pub is_repo_effective: bool,
     pub active_plan_preview: Option<ActivePlanPreview>,
     pub archived_count: i64,
     /// Pre-derived snapshots from `SessionService::build_feedback_context`.
@@ -204,6 +254,8 @@ pub struct SessionDetail {
     pub git_logs_head_path: Option<String>,
     pub plan_feedback_dir_path: Option<String>,
     pub impl_feedback_dir_path: Option<String>,
+    pub plan_review_gate: Option<ReviewGateDecision>,
+    pub impl_review_gate: Option<ReviewGateDecision>,
     pub timeline_rows: Vec<TimelineRow>,
     /// The maximum event id at render time, embedded in the SSE
     /// `?since=` so the live stream picks up from where the page rendered.
@@ -222,6 +274,7 @@ pub struct DiffViewFeedback {
     pub feedback_id: i64,
     pub author_label: String,
     pub feedback_kind: String,
+    pub verdict: ReviewVerdict,
     pub file_status: Option<FeedbackFileStatus>,
     pub file_path: Option<String>,
     pub body_html: String,
@@ -262,7 +315,9 @@ pub enum TimelineTitle {
     Commit { short_sha: String },
     HeadReset { short_sha: String },
     Feedback { kind: FeedbackKind, author: String },
+    ReviewGate { phase: ReviewPhase },
     StateTransition,
+    SessionClaimed,
     AgentJoined { actor: String },
     Warning { kind: WarningKind },
     Other { kind: String },
@@ -277,6 +332,8 @@ pub enum WarningKind {
 #[derive(Debug, Clone)]
 pub enum StatusBadge {
     Amend,
+    ReviewVerdict(ReviewVerdict),
+    ReviewGate(ReviewGateState),
     FeedbackStatus(FeedbackFileStatus),
     State(String),
     Warning,
@@ -288,6 +345,29 @@ pub enum NeedsAttention {
     AwaitingPlanReview,
     AwaitingImplReview,
     StaleFeedback,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RowPresence {
+    NotRendered,
+    Rendered,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RowProjection {
+    Insert,
+    Replace,
+    Remove,
+    Noop,
+}
+
+pub fn project_row(prior: RowPresence, next: RowPresence) -> RowProjection {
+    match (prior, next) {
+        (RowPresence::NotRendered, RowPresence::Rendered) => RowProjection::Insert,
+        (RowPresence::Rendered, RowPresence::Rendered) => RowProjection::Replace,
+        (RowPresence::Rendered, RowPresence::NotRendered) => RowProjection::Remove,
+        (RowPresence::NotRendered, RowPresence::NotRendered) => RowProjection::Noop,
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -488,6 +568,15 @@ pub fn session_detail(d: &SessionDetail) -> Markup {
                     a.back href="/" { "← all sessions" }
                     h1.session-id { (session_id) }
                     (active_plan_badge(d.active_plan.as_ref().map(|p| p.state.as_str())))
+                    @if d.is_repo_effective {
+                        span.kind-badge { "in effect" }
+                    } @else if d.active_plan.is_some() {
+                        form method="post" action={ "/sessions/" (session_id) "/claim" } class="inline-form" {
+                            button type="submit" class="primary" {
+                                "Set in effect"
+                            }
+                        }
+                    }
                     @if d.archived_count > 0 {
                         a.muted-link href={ "/sessions/" (session_id) "/history" } { "history (" (d.archived_count) ")" }
                     }
@@ -502,6 +591,7 @@ pub fn session_detail(d: &SessionDetail) -> Markup {
             }
 
             (watched_artifacts_strip(d))
+            (review_gate_strip(d))
             (active_plan_preview(d.active_plan_preview.as_ref()))
 
             section.timeline-section {
@@ -527,6 +617,71 @@ pub fn session_detail(d: &SessionDetail) -> Markup {
             }
         },
     )
+}
+
+fn review_gate_strip(d: &SessionDetail) -> Markup {
+    if d.plan_review_gate.is_none() && d.impl_review_gate.is_none() {
+        return html! {};
+    }
+    html! {
+        section.review-gates {
+            @if let Some(gate) = &d.plan_review_gate {
+                (review_gate_panel(&d.session.id, gate))
+            }
+            @if let Some(gate) = &d.impl_review_gate {
+                (review_gate_panel(&d.session.id, gate))
+            }
+        }
+    }
+}
+
+fn review_gate_panel(session_id: &str, gate: &ReviewGateDecision) -> Markup {
+    let phase = gate.phase.as_str();
+    let request_changes = join_agents(&gate.request_changes);
+    let missing_approvals = join_agents(&gate.missing_approvals);
+    let unmarked = join_agents(&gate.unmarked);
+    html! {
+        div.review-gate-card {
+            div.review-gate-main {
+                span.review-gate-phase { (phase) " review" }
+                (review_gate_badge(gate.state))
+                @if let Some(override_status) = &gate.override_status {
+                    span.review-gate-override {
+                        "overridden by " (override_status.actor)
+                    }
+                }
+            }
+            div.review-gate-detail {
+                "approvals " (gate.approvals.len()) "/" (gate.participants.len())
+                @if !gate.request_changes.is_empty() {
+                    " · changes from " (request_changes)
+                }
+                @if !gate.missing_approvals.is_empty() {
+                    " · waiting on " (missing_approvals)
+                }
+                @if !gate.unmarked.is_empty() {
+                    " · unmarked " (unmarked)
+                }
+            }
+            form method="post" action={ "/sessions/" (session_id) "/review_gate_override" } class="review-gate-actions" {
+                input type="hidden" name="phase" value=(phase);
+                button type="submit" name="state" value="ready" class="primary" {
+                    "Mark ready"
+                }
+                button type="submit" name="state" value="changes_requested" class="danger" {
+                    "Request changes"
+                }
+            }
+        }
+    }
+}
+
+fn join_agents(labels: &[crate::lifecycle::AgentLabel]) -> String {
+    labels
+        .iter()
+        .map(|label| label.as_str())
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 pub fn timeline_row_from_event(ev: &Event, ctx: &TimelineRenderCtx<'_>) -> TimelineRow {
@@ -623,6 +778,11 @@ pub fn timeline_row_from_event(ev: &Event, ctx: &TimelineRenderCtx<'_>) -> Timel
             let fid = payload.get("feedback_id").and_then(|v| v.as_i64());
             if let Some(fid) = fid {
                 preview = ctx.feedback_preview_by_id.get(&fid).cloned();
+                let verdict = preview
+                    .as_deref()
+                    .map(crate::review_state::parse_verdict)
+                    .unwrap_or(ReviewVerdict::Unmarked);
+                status_badges.push(StatusBadge::ReviewVerdict(verdict));
                 if let Some((target_kind, target_id)) = ctx.feedback_target_by_id.get(&fid) {
                     if target_kind == "plan_revision" {
                         let rev_id = target_id.parse::<i64>().unwrap_or(0);
@@ -673,6 +833,31 @@ pub fn timeline_row_from_event(ev: &Event, ctx: &TimelineRenderCtx<'_>) -> Timel
             }
             TimelineTitle::Feedback { kind, author }
         }
+        "review_gate_changed" => {
+            let phase = payload
+                .get("phase")
+                .and_then(|v| v.as_str())
+                .and_then(ReviewPhase::parse)
+                .unwrap_or(ReviewPhase::Plan);
+            let to = payload
+                .get("to")
+                .and_then(|v| v.as_str())
+                .and_then(ReviewGateState::parse)
+                .unwrap_or(ReviewGateState::NeedsReview);
+            let from = payload.get("from").and_then(|v| v.as_str()).unwrap_or("");
+            status_badges.push(StatusBadge::ReviewGate(to));
+            preview = Some(format!("{from} -> {}", to.as_str()));
+            match (phase, to) {
+                (ReviewPhase::Plan, ReviewGateState::ChangesRequested) => {
+                    needs_attention = NeedsAttention::AwaitingPlanReview;
+                }
+                (ReviewPhase::Impl, ReviewGateState::ChangesRequested) => {
+                    needs_attention = NeedsAttention::AwaitingImplReview;
+                }
+                _ => {}
+            }
+            TimelineTitle::ReviewGate { phase }
+        }
         "state_transition" => {
             let from = payload.get("from").and_then(|v| v.as_str()).unwrap_or("");
             let to = payload.get("to").and_then(|v| v.as_str()).unwrap_or("");
@@ -685,6 +870,13 @@ pub fn timeline_row_from_event(ev: &Event, ctx: &TimelineRenderCtx<'_>) -> Timel
                 _ => None,
             };
             TimelineTitle::StateTransition
+        }
+        "session_claimed" => {
+            preview = payload
+                .get("previous_session_id")
+                .and_then(|v| v.as_str())
+                .map(|previous| format!("previously {previous}"));
+            TimelineTitle::SessionClaimed
         }
         "agent_joined" => {
             let actor = payload
@@ -810,7 +1002,9 @@ fn timeline_title_markup(title: &TimelineTitle) -> Markup {
         TimelineTitle::Feedback { kind, author } => {
             html! { (kind.as_str()) " feedback from " span.actor { (author) } }
         }
+        TimelineTitle::ReviewGate { phase } => html! { (phase.as_str()) " review gate" },
         TimelineTitle::StateTransition => html! { "State changed" },
+        TimelineTitle::SessionClaimed => html! { "Set in effect" },
         TimelineTitle::AgentJoined { actor } => html! { (actor) " joined" },
         TimelineTitle::Warning { kind } => match kind {
             WarningKind::DirtyWorktree => html! { "Dirty worktree" },
@@ -823,10 +1017,32 @@ fn timeline_title_markup(title: &TimelineTitle) -> Markup {
 fn status_badge_markup(badge: &StatusBadge) -> Markup {
     match badge {
         StatusBadge::Amend => html! { span.kind-badge.amend { "amend" } },
+        StatusBadge::ReviewVerdict(verdict) => feedback_verdict_badge(*verdict),
+        StatusBadge::ReviewGate(state) => review_gate_badge(*state),
         StatusBadge::FeedbackStatus(status) => feedback_file_badge(*status),
         StatusBadge::State(state) => html! { span.kind-badge { (state) } },
         StatusBadge::Warning => html! { span.kind-badge.warning-badge { "warning" } },
     }
+}
+
+fn review_gate_badge(state: ReviewGateState) -> Markup {
+    let class = format!("kind-badge review-gate {}", state.as_str());
+    let label = match state {
+        ReviewGateState::NeedsReview => "needs review",
+        ReviewGateState::ChangesRequested => "changes requested",
+        ReviewGateState::Ready => "ready",
+    };
+    html! { span.(class) { (label) } }
+}
+
+fn feedback_verdict_badge(verdict: ReviewVerdict) -> Markup {
+    let class = format!("kind-badge verdict {}", verdict.css_class());
+    let label = match verdict {
+        ReviewVerdict::Approve => "✓ approve",
+        ReviewVerdict::RequestChanges => "! changes",
+        ReviewVerdict::Unmarked => "? unmarked",
+    };
+    html! { span.(class) title=(verdict.marker()) { (label) } }
 }
 
 fn needs_attention_marker(needs: NeedsAttention) -> Markup {
@@ -917,6 +1133,8 @@ fn timeline_kind_class(kind: &str) -> &'static str {
         "impl_revision_created" => "impl-commit",
         "head_reset_to_known_sha" => "head-reset",
         "feedback_added" | "feedback_updated" => "feedback",
+        "review_gate_changed" => "review-gate",
+        "session_claimed" => "state",
         "state_transition" => "state",
         "agent_joined" => "meta-event",
         "dirty_worktree_warning" | "plan_file_missing" => "warning",
@@ -1356,6 +1574,7 @@ fn feedback_card(item: &FeedbackItem) -> Markup {
         div.feedback {
             header.feedback-head {
                 span.actor { (item.author_label) }
+                " · " (feedback_verdict_badge(item.verdict))
                 " · " span.target { (item.target_label.clone().unwrap_or_else(|| "—".into())) }
                 " · " span.relative { (relative_time(Some(item.created_at))) }
                 @if updated {
@@ -1473,6 +1692,7 @@ fn feedback_panel(feedback: &[DiffViewFeedback]) -> Markup {
                     header.feedback-head {
                         span.actor { (fb.author_label) }
                         " · " span.kind-badge { (fb.feedback_kind) }
+                        " · " (feedback_verdict_badge(fb.verdict))
                         @if let Some(status) = fb.file_status {
                             " · " (feedback_file_badge(status))
                         }
@@ -1637,5 +1857,30 @@ fn layout(title: &str, content: Markup) -> Markup {
                 main { (content) }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{RowPresence, RowProjection, project_row};
+
+    #[test]
+    fn row_projection_is_a_pure_visibility_transition() {
+        assert_eq!(
+            project_row(RowPresence::NotRendered, RowPresence::Rendered),
+            RowProjection::Insert
+        );
+        assert_eq!(
+            project_row(RowPresence::Rendered, RowPresence::Rendered),
+            RowProjection::Replace
+        );
+        assert_eq!(
+            project_row(RowPresence::Rendered, RowPresence::NotRendered),
+            RowProjection::Remove
+        );
+        assert_eq!(
+            project_row(RowPresence::NotRendered, RowPresence::NotRendered),
+            RowProjection::Noop
+        );
     }
 }

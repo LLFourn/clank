@@ -7,6 +7,29 @@ use trinity::daemon::{CurrentFeedbackView, ServiceError};
 use trinity::domain::FeedbackTargetRef;
 use trinity::lifecycle::SessionId;
 
+async fn active_plan_id(app: &TestApp, session_id: &str) -> Option<i64> {
+    sqlx::query_scalar(
+        "SELECT CASE WHEN state IN ('planning', 'implementing') THEN rowid ELSE NULL END \
+         FROM sessions WHERE id = ?",
+    )
+    .bind(session_id)
+    .fetch_one(&app.state.pool)
+    .await
+    .unwrap()
+}
+
+async fn plan_revisions(app: &TestApp, plan_id: i64) -> Vec<(i64, String)> {
+    sqlx::query_as(
+        "SELECT pr.revision_number, pr.content_hash \
+         FROM plan_revisions pr JOIN sessions s ON s.id = pr.session_id \
+         WHERE s.rowid = ? ORDER BY pr.revision_number",
+    )
+    .bind(plan_id)
+    .fetch_all(&app.state.pool)
+    .await
+    .unwrap()
+}
+
 #[tokio::test]
 async fn register_plan_file_creates_session_and_first_revision() {
     let app = TestApp::spawn().await;
@@ -25,23 +48,18 @@ async fn register_plan_file_creates_session_and_first_revision() {
     assert_eq!(r["session_id"], "demo");
     assert!(r["plan_id"].as_i64().unwrap() >= 1);
 
-    let s: (String, String, Option<i64>) =
-        sqlx::query_as("SELECT id, plan_file_path, active_plan_id FROM sessions WHERE id = ?")
+    let s: (String, String) =
+        sqlx::query_as("SELECT id, plan_file_path FROM sessions WHERE id = ?")
             .bind("demo")
             .fetch_one(&app.state.pool)
             .await
             .unwrap();
     assert_eq!(s.0, "demo");
     assert!(s.1.ends_with("plan.md"));
-    assert!(s.2.is_some());
+    let active_plan_id = active_plan_id(&app, "demo").await;
+    assert!(active_plan_id.is_some());
 
-    let revisions: Vec<(i64, String)> = sqlx::query_as(
-        "SELECT revision_number, content_hash FROM plan_revisions WHERE plan_id = ? ORDER BY revision_number",
-    )
-    .bind(s.2.unwrap())
-    .fetch_all(&app.state.pool)
-    .await
-    .unwrap();
+    let revisions = plan_revisions(&app, active_plan_id.unwrap()).await;
     assert_eq!(revisions.len(), 1);
     assert_eq!(revisions[0].0, 1);
 }
@@ -91,11 +109,7 @@ async fn register_plan_file_same_body_is_no_op() {
         .unwrap();
     assert_eq!(second["noop"], true);
 
-    let revs: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM plan_revisions WHERE plan_id = ?")
-        .bind(plan_id)
-        .fetch_one(&app.state.pool)
-        .await
-        .unwrap();
+    let revs = plan_revisions(&app, plan_id).await.len();
     assert_eq!(revs, 1, "no extra revision on same-body re-register");
 }
 
@@ -125,21 +139,14 @@ async fn planning_edit_via_register_records_revision_same_plan() {
     .await
     .unwrap();
 
-    let revs: Vec<(i64, String)> = sqlx::query_as(
-        "SELECT revision_number, content_hash FROM plan_revisions WHERE plan_id = ? ORDER BY revision_number",
-    )
-    .bind(plan_id)
-    .fetch_all(&app.state.pool)
-    .await
-    .unwrap();
+    let revs = plan_revisions(&app, plan_id).await;
     assert_eq!(revs.len(), 2, "planning edit adds a revision, same plan_id");
 }
 
-/// Implementing → plan-file edit archives the active plan and starts
-/// a new one. The implementation commit is observed via the git-logs
-/// watcher rather than an explicit MCP call.
+/// Implementing → plan-file edit is sealed out. It must not archive the
+/// active plan or start a new one.
 #[tokio::test]
-async fn implementing_then_plan_edit_archives_and_starts_new() {
+async fn implementing_then_plan_edit_is_ignored() {
     let app = TestApp::spawn().await;
     let plan_path = app.repo.join("plan.md");
     std::fs::write(&plan_path, "# v1\n").unwrap();
@@ -156,6 +163,12 @@ async fn implementing_then_plan_edit_archives_and_starts_new() {
     let _head = make_commit(&app.repo, "feature.txt", "x\n");
     tokio::time::sleep(std::time::Duration::from_millis(2500)).await;
 
+    let before_edit_max_event: i64 =
+        sqlx::query_scalar("SELECT COALESCE(MAX(id), 0) FROM events WHERE session_id = 's'")
+            .fetch_one(&app.state.pool)
+            .await
+            .unwrap();
+
     std::fs::write(&plan_path, "# new task body\n").unwrap();
     app.call(
         "register_plan_file",
@@ -171,21 +184,79 @@ async fn implementing_then_plan_edit_archives_and_starts_new() {
         .fetch_one(&app.state.pool)
         .await
         .unwrap();
-    assert_eq!(old_state, "archived");
+    assert_eq!(old_state, "implementing");
 
-    let new_id: i64 = sqlx::query_scalar(
-        "SELECT id FROM plans WHERE session_id = 's' AND state = 'planning' ORDER BY id DESC LIMIT 1",
+    let plan_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM plans WHERE session_id = 's'")
+        .fetch_one(&app.state.pool)
+        .await
+        .unwrap();
+    assert_eq!(plan_count, 1, "sealed plan edit must not start a new plan");
+    let session_active = active_plan_id(&app, "s").await;
+    assert_eq!(session_active, Some(plan_a));
+
+    let plan_revision_events: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM events WHERE session_id = 's' AND kind = 'plan_revision_created'",
     )
     .fetch_one(&app.state.pool)
     .await
     .unwrap();
-    assert!(new_id > plan_a, "new plan_id should be later than old");
-    let session_active: Option<i64> =
-        sqlx::query_scalar("SELECT active_plan_id FROM sessions WHERE id = 's'")
+    assert_eq!(
+        plan_revision_events, 1,
+        "sealed plan edit must not emit a new plan revision event"
+    );
+
+    let visible_events_after_edit: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM events WHERE session_id = 's' AND id > ?")
+            .bind(before_edit_max_event)
             .fetch_one(&app.state.pool)
             .await
             .unwrap();
-    assert_eq!(session_active, Some(new_id));
+    assert_eq!(
+        visible_events_after_edit, 0,
+        "sealed plan edit must not emit any lifecycle/UI event"
+    );
+}
+
+#[tokio::test]
+async fn finished_visible_session_cannot_start_second_plan_cycle() {
+    let app = TestApp::spawn().await;
+    let plan_path = app.repo.join("plan.md");
+    std::fs::write(&plan_path, "# body\n").unwrap();
+    app.call(
+        "register_plan_file",
+        &app.repo,
+        None,
+        json!({"session_id": "s", "path": &plan_path, "label": "m"}),
+    )
+    .await
+    .unwrap();
+    app.state
+        .lifecycle
+        .finish_plan(&trinity::lifecycle::SessionId::from("s"), "test:finish")
+        .await
+        .unwrap();
+
+    std::fs::write(&plan_path, "# new work\n").unwrap();
+    let (status, body) = app
+        .call(
+            "register_plan_file",
+            &app.repo,
+            None,
+            json!({"session_id": "s", "path": &plan_path, "label": "m"}),
+        )
+        .await
+        .expect_err();
+    assert_eq!(status, reqwest::StatusCode::BAD_REQUEST);
+    assert!(
+        body.contains("create a new session"),
+        "unexpected body: {body}"
+    );
+
+    let plan_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM plans WHERE session_id = 's'")
+        .fetch_one(&app.state.pool)
+        .await
+        .unwrap();
+    assert_eq!(plan_count, 1);
 }
 
 #[tokio::test]

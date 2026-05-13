@@ -5,13 +5,13 @@
 //! - lifecycle observations (`observe`) — feeds the sans-IO reducer +
 //!   apply layer + commit + cache update;
 //! - structural feedback writes (`put_feedback`) — upsert keyed on
-//!   `(plan_id, target, author)` with no-op-on-identical-body semantics;
+//!   `(session, target, author)` with no-op-on-identical-body semantics;
 //! - master-agent reads (`current_feedback`) — snapshot-consistent
 //!   listing + digest.
 //!
 //! Lifecycle and feedback share the same per-session async mutex.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use serde_json::json;
@@ -22,15 +22,18 @@ use crate::domain::{
     EventKind, FeedbackFileStatus, FeedbackKind, FeedbackTargetRef, Phase, TargetKind,
 };
 use crate::lifecycle::{
-    ActivePlan, AgentLabel, Decision, LifecycleError, Observation, PlanFilePath, SessionId, decide,
+    ActivationSource, ActivePlan, AgentLabel, Decision, Effect, LifecycleError, Observation,
+    PlanFilePath, SessionId, decide,
 };
+use crate::review_state::{ReviewGateDecision, ReviewGateState, ReviewPhase, derive_gate};
 use crate::storage::feedback_files::FeedbackFile;
 use crate::storage::{
     agents, events as ev_store, feedback as feedback_store, feedback::FeedbackRecord,
-    implementation_revisions as impl_revs, plan_revisions, plans, sessions,
+    implementation_revisions as impl_revs, plan_revisions, plans, repo_effective_sessions,
+    review_gate_overrides, sessions,
 };
 
-use super::apply::{self, ApplyError, ApplyOutcome};
+use super::apply::{self, ApplyError, ApplyOutcome, SessionSideEffect};
 
 #[derive(Debug, thiserror::Error)]
 pub enum LifecycleServiceError {
@@ -44,12 +47,16 @@ pub enum LifecycleServiceError {
     ActivePlan(#[from] plans::ActivePlanInconsistency),
     #[error("sql: {0}")]
     Sql(#[from] sqlx::Error),
+    #[error("feedback storage: {0}")]
+    Feedback(#[from] feedback_store::Error),
+    #[error("invalid lifecycle arguments: {0}")]
+    InvalidArgs(String),
     /// Plan-file watcher attachment failed after the lifecycle
     /// transaction committed. The DB now records the new plan path
     /// but the watcher isn't bound to it; the caller must surface
     /// this so it doesn't hand the agent a silently-broken session.
     #[error("plan-file watcher attach failed: {0}")]
-    Watcher(String),
+    Watcher(#[source] anyhow::Error),
     #[error("session `{session_id}` is recorded under repo {expected}, not {actual}")]
     RepoMismatch {
         session_id: String,
@@ -76,6 +83,8 @@ pub enum ServiceError {
     Decode(#[from] feedback_store::DecodeError),
     #[error("feedback storage: {0}")]
     Feedback(#[from] feedback_store::Error),
+    #[error("review gate: {0}")]
+    ReviewGate(#[from] LifecycleServiceError),
     #[error("sql: {0}")]
     Sql(#[from] sqlx::Error),
 }
@@ -227,69 +236,78 @@ impl SessionService {
         &self.watcher
     }
 
-    /// Archive active plans in the same repo when a newer session takes over.
-    /// The `.git/logs/HEAD` watcher is repo-wide; leaving older sessions active
-    /// would make future commits look like implementation revisions for every
-    /// still-open session in that repository.
-    pub async fn archive_other_active_sessions_in_repo(
+    pub async fn is_repo_effective_session(
         &self,
-        repo_root: &str,
-        keep_session_id: &SessionId,
-        actor: &str,
-    ) -> Result<Vec<SessionId>, LifecycleServiceError> {
-        let rows: Vec<String> = sqlx::query_scalar(
-            "SELECT id FROM sessions \
-             WHERE repo_root = ? AND archived_at IS NULL \
-               AND active_plan_id IS NOT NULL AND id <> ?",
-        )
-        .bind(repo_root)
-        .bind(keep_session_id.as_str())
-        .fetch_all(&self.pool)
-        .await?;
-
-        let mut archived = Vec::with_capacity(rows.len());
-        for id in rows {
-            let sid = SessionId::from(id);
-            self.delete_session(&sid, actor).await?;
-            archived.push(sid);
-        }
-        Ok(archived)
+        session_id: &SessionId,
+    ) -> Result<bool, LifecycleServiceError> {
+        repo_effective_sessions::is_effective(&self.pool, session_id)
+            .await
+            .map_err(Into::into)
     }
 
-    pub async fn archive_superseded_active_sessions(
+    pub async fn repo_effective_session_id(
         &self,
-        actor: &str,
-    ) -> Result<Vec<SessionId>, LifecycleServiceError> {
-        let rows: Vec<(String, String, i64, i64)> = sqlx::query_as(
-            "SELECT s.id, s.repo_root, p.started_at, p.id \
-             FROM sessions s \
-             JOIN plans p ON p.id = s.active_plan_id \
-             WHERE s.archived_at IS NULL \
-               AND s.active_plan_id IS NOT NULL \
-               AND p.state != 'archived' \
-             ORDER BY s.repo_root ASC, p.started_at DESC, p.id DESC",
+        repo_root: &str,
+    ) -> Result<Option<SessionId>, LifecycleServiceError> {
+        Ok(
+            repo_effective_sessions::fetch_by_repo(&self.pool, repo_root)
+                .await?
+                .map(|row| SessionId::from(row.session_id)),
         )
-        .fetch_all(&self.pool)
-        .await?;
+    }
 
-        let mut kept_repos = HashSet::new();
-        let mut archived = Vec::new();
-        for (id, repo_root, _started_at, _plan_id) in rows {
-            if kept_repos.insert(repo_root) {
-                continue;
-            }
-            let sid = SessionId::from(id);
-            self.delete_session(&sid, actor).await?;
-            archived.push(sid);
+    pub async fn claim_repo_effective_session(
+        &self,
+        session_id: &SessionId,
+        actor: &str,
+    ) -> Result<(), LifecycleServiceError> {
+        let cell = self.lock_for(session_id).await?;
+        let _guard = cell.lock().await;
+
+        let now = chrono::Utc::now().timestamp();
+        let mut tx = self.pool.begin().await?;
+        let session = sessions::fetch_tx(&mut tx, session_id)
+            .await?
+            .ok_or_else(|| LifecycleServiceError::NoSession(session_id.as_str().into()))?;
+        if session.archived_at.is_some() {
+            return Err(LifecycleServiceError::SessionArchived(
+                session_id.as_str().into(),
+            ));
         }
-        Ok(archived)
+        let plan_id = session
+            .active_plan_id
+            .ok_or(LifecycleServiceError::Reducer(LifecycleError::NoActivePlan))?;
+        let prior = repo_effective_sessions::claim(&mut tx, session_id, actor, now).await?;
+        sessions::touch_updated_at(&mut *tx, session_id, now).await?;
+        ev_store::append(
+            &mut *tx,
+            session_id,
+            Some(plan_id),
+            None,
+            None,
+            EventKind::SessionClaimed.as_str(),
+            actor,
+            &json!({
+                "mode": "explicit",
+                "previous_session_id": prior,
+            }),
+            None,
+            now,
+        )
+        .await?;
+        tx.commit().await?;
+        let _ = self.events_tx.send(session_id.clone());
+        if let Some(prior) = prior {
+            let _ = self.events_tx.send(SessionId::from(prior));
+        }
+        Ok(())
     }
 
     /// Soft-delete a session: in a single transaction, archive any
-    /// active plan (clears `active_plan_id`, emits a normalized
-    /// `state_transition`), set `sessions.archived_at`, and emit
-    /// `session_archived`. Plan and feedback files on disk are never
-    /// touched — re-registration restores the session.
+    /// active lifecycle state through `apply_session_effects`, set
+    /// `sessions.archived_at`, and emit `session_archived`. Plan and
+    /// feedback files on disk are never touched; re-registration restores
+    /// the session.
     ///
     /// Idempotent in the steady state. If a prior partial run left the
     /// session archived but with an active plan still attached, this
@@ -306,12 +324,9 @@ impl SessionService {
         let now = chrono::Utc::now().timestamp();
         let mut tx = self.pool.begin().await?;
 
-        let session: crate::storage::sessions::Session =
-            sqlx::query_as("SELECT * FROM sessions WHERE id = ?")
-                .bind(session_id.as_str())
-                .fetch_optional(&mut *tx)
-                .await?
-                .ok_or_else(|| LifecycleServiceError::NoSession(session_id.as_str().into()))?;
+        let session = sessions::fetch_tx(&mut tx, session_id)
+            .await?
+            .ok_or_else(|| LifecycleServiceError::NoSession(session_id.as_str().into()))?;
 
         let was_visible = session.archived_at.is_none();
         let active_plan_id = session.active_plan_id;
@@ -322,25 +337,15 @@ impl SessionService {
         }
 
         if let Some(plan_id) = active_plan_id {
-            let from_state: String = sqlx::query_scalar("SELECT state FROM plans WHERE id = ?")
-                .bind(plan_id)
-                .fetch_one(&mut *tx)
-                .await?;
-            crate::storage::plans::archive(&mut *tx, plan_id, now).await?;
-            crate::storage::sessions::set_active_plan_id(&mut *tx, session_id, None, now).await?;
-            crate::storage::events::append(
-                &mut *tx,
-                session_id,
-                Some(plan_id),
-                None,
-                None,
-                crate::domain::EventKind::StateTransition.as_str(),
-                actor,
-                &json!({ "from": from_state, "to": "archived" }),
-                None,
-                now,
-            )
-            .await?;
+            let decision = Decision {
+                new_active: None,
+                effects: vec![Effect::ArchiveActivePlan],
+            };
+            let _ =
+                apply::apply_session_effects(&mut tx, session_id, &decision, actor, now).await?;
+            debug_assert_eq!(active_plan_id, Some(plan_id));
+        } else {
+            repo_effective_sessions::clear_session(&mut tx, session_id).await?;
         }
         if was_visible {
             sqlx::query("UPDATE sessions SET archived_at = ?, updated_at = ? WHERE id = ?")
@@ -365,9 +370,7 @@ impl SessionService {
         }
         tx.commit().await?;
 
-        // Cache must mirror the post-commit DB state. The plan archive
-        // above cleared `active_plan_id`, so the cached active plan is
-        // None as well.
+        // Cache must mirror the post-commit DB state.
         if active_plan_id.is_some() {
             *cache = None;
         }
@@ -375,8 +378,8 @@ impl SessionService {
         Ok(())
     }
 
-    /// Reactivate an archived session: clear `archived_at`, start a fresh
-    /// active plan from the current plan-file body at the current HEAD,
+    /// Reactivate an archived session: start a fresh active plan from the
+    /// current plan-file body at the current HEAD, clear `archived_at`,
     /// and re-attach watchers. Existing feedback files on disk are
     /// re-ingested via a drift scan.
     ///
@@ -405,6 +408,18 @@ impl SessionService {
         if session.archived_at.is_none() {
             return Ok(());
         }
+        // Start a fresh active plan via the standard registration path.
+        self.observe(
+            session_id,
+            label,
+            Observation::PlanRegistered {
+                path: plan_file_path.clone(),
+                body,
+                head,
+                source: ActivationSource::AutoRegisterReactivation,
+            },
+        )
+        .await?;
         let now = chrono::Utc::now().timestamp();
         sqlx::query("UPDATE sessions SET archived_at = NULL, updated_at = ? WHERE id = ?")
             .bind(now)
@@ -425,17 +440,6 @@ impl SessionService {
         )
         .await?;
         let _ = self.events_tx.send(session_id.clone());
-        // Start a fresh active plan via the standard registration path.
-        self.observe(
-            session_id,
-            label,
-            Observation::PlanRegistered {
-                path: plan_file_path.clone(),
-                body,
-                head,
-            },
-        )
-        .await?;
         Ok(())
     }
 
@@ -545,10 +549,9 @@ impl SessionService {
             Some(p) => p,
             None => return Ok(FeedbackTargetResolution::NoActivePlan),
         };
-        // Defense in depth: finish/archive clear `active_plan_id` so this
-        // pointer should never dangle into a terminal plan. Reject anyway
-        // so a future bug in the apply layer can't route feedback into a
-        // plan whose work is concluded.
+        // Defense in depth: terminal states are not active, so this should
+        // never dangle into a concluded plan. Reject anyway so a future bug
+        // in the apply layer can't route feedback into completed work.
         if plan.state == "archived" || plan.state == "finished" {
             return Ok(FeedbackTargetResolution::NoActivePlan);
         }
@@ -633,15 +636,10 @@ impl SessionService {
 
         let mut tx = self.pool.begin().await?;
 
-        let session: crate::storage::sessions::Session =
-            match sqlx::query_as("SELECT * FROM sessions WHERE id = ?")
-                .bind(session_id.as_str())
-                .fetch_optional(&mut *tx)
-                .await?
-            {
-                Some(s) => s,
-                None => return Err(LifecycleServiceError::NoSession(session_id.as_str().into())),
-            };
+        let session = match sessions::fetch_tx(&mut tx, session_id).await? {
+            Some(s) => s,
+            None => return Err(LifecycleServiceError::NoSession(session_id.as_str().into())),
+        };
         let repo_root = std::path::PathBuf::from(&session.repo_root);
         let plan_file_path = std::path::PathBuf::from(&session.plan_file_path);
 
@@ -679,7 +677,9 @@ impl SessionService {
             match active_plan.as_ref() {
                 Some(p) => {
                     sqlx::query_as(
-                        "SELECT * FROM plan_revisions WHERE plan_id = ? ORDER BY id DESC LIMIT 1",
+                        "SELECT pr.id, s.rowid AS plan_id, pr.revision_number, pr.content_hash, pr.body, pr.created_at \
+                         FROM plan_revisions pr JOIN sessions s ON s.id = pr.session_id \
+                         WHERE s.rowid = ? ORDER BY pr.id DESC LIMIT 1",
                     )
                     .bind(p.id)
                     .fetch_optional(&mut *tx)
@@ -690,15 +690,20 @@ impl SessionService {
 
         let latest_impl_revision_row: Option<
             crate::storage::implementation_revisions::ImplementationRevision,
-        > = match active_plan.as_ref() {
-            Some(p) => sqlx::query_as(
-                "SELECT * FROM implementation_revisions WHERE plan_id = ? ORDER BY id DESC LIMIT 1",
-            )
-            .bind(p.id)
-            .fetch_optional(&mut *tx)
-            .await?,
-            None => None,
-        };
+        > =
+            match active_plan.as_ref() {
+                Some(p) => sqlx::query_as(
+                    "SELECT ir.id, s.rowid AS plan_id, ir.commit_sha, ir.parent_sha, ir.branch, \
+                        ir.commit_message, ir.diff_stat, ir.worktree_status, ir.is_head, \
+                        ir.registered_by, ir.created_at \
+                 FROM implementation_revisions ir JOIN sessions s ON s.id = ir.session_id \
+                 WHERE s.rowid = ? ORDER BY ir.id DESC LIMIT 1",
+                )
+                .bind(p.id)
+                .fetch_optional(&mut *tx)
+                .await?,
+                None => None,
+            };
 
         // HEAD-match lookup inside the same tx as everything else so
         // a concurrent INSERT of a new impl_revision can't sneak between
@@ -708,7 +713,11 @@ impl SessionService {
         > =
             match (active_plan.as_ref(), head_sha_from_git.as_deref()) {
                 (Some(p), Some(head)) => sqlx::query_as(
-                    "SELECT * FROM implementation_revisions WHERE plan_id = ? AND commit_sha = ?",
+                    "SELECT ir.id, s.rowid AS plan_id, ir.commit_sha, ir.parent_sha, ir.branch, \
+                            ir.commit_message, ir.diff_stat, ir.worktree_status, ir.is_head, \
+                            ir.registered_by, ir.created_at \
+                     FROM implementation_revisions ir JOIN sessions s ON s.id = ir.session_id \
+                     WHERE s.rowid = ? AND ir.commit_sha = ?",
                 )
                 .bind(p.id)
                 .bind(head)
@@ -836,6 +845,136 @@ impl SessionService {
         })
     }
 
+    pub async fn review_gate_for_phase(
+        &self,
+        session_id: &SessionId,
+        phase: ReviewPhase,
+    ) -> Result<Option<ReviewGateDecision>, LifecycleServiceError> {
+        let ctx = self.build_feedback_context(session_id).await?;
+        let target = match phase {
+            ReviewPhase::Plan => ctx.plan_target_resolution.clone().into_option(),
+            ReviewPhase::Impl => ctx.impl_target_resolution.clone().into_option(),
+        };
+        let Some(target) = target else {
+            return Ok(None);
+        };
+
+        let target_ref = active_target_ref(&target);
+        let feedback = feedback_store::list_for_active_plan(&self.pool, session_id).await?;
+        let mut gate = derive_gate(phase, target_ref.as_ref(), &feedback);
+        if let Some(override_status) = review_gate_overrides::fetch_for_target(
+            &self.pool,
+            session_id,
+            phase,
+            target.kind,
+            &target.id,
+        )
+        .await?
+        {
+            gate.state = override_status.state;
+            gate.override_status = Some(override_status);
+        }
+        Ok(Some(gate))
+    }
+
+    pub async fn override_review_gate(
+        &self,
+        session_id: &SessionId,
+        phase: ReviewPhase,
+        state: ReviewGateState,
+        actor: &str,
+    ) -> Result<(), LifecycleServiceError> {
+        if matches!(state, ReviewGateState::NeedsReview) {
+            return Err(LifecycleServiceError::InvalidArgs(
+                "review gate override must be ready or changes_requested".into(),
+            ));
+        }
+        let before = self.review_gate_for_phase(session_id, phase).await?;
+        let ctx = self.build_feedback_context(session_id).await?;
+        let target = match phase {
+            ReviewPhase::Plan => ctx.plan_target_resolution.clone().into_option(),
+            ReviewPhase::Impl => ctx.impl_target_resolution.clone().into_option(),
+        }
+        .ok_or_else(|| LifecycleError::NoActivePlan)?;
+
+        let now = chrono::Utc::now().timestamp();
+        let mut tx = self.pool.begin().await?;
+        review_gate_overrides::upsert(
+            &mut *tx,
+            session_id,
+            phase,
+            target.kind,
+            &target.id,
+            state,
+            actor,
+            now,
+        )
+        .await?;
+        sessions::touch_updated_at(&mut *tx, session_id, now).await?;
+        tx.commit().await?;
+
+        let changed = self
+            .append_review_gate_changed_if_needed(session_id, phase, before, actor)
+            .await?;
+        if changed {
+            let _ = self.events_tx.send(session_id.clone());
+        }
+        Ok(())
+    }
+
+    async fn append_review_gate_changed_if_needed(
+        &self,
+        session_id: &SessionId,
+        phase: ReviewPhase,
+        before: Option<ReviewGateDecision>,
+        actor: &str,
+    ) -> Result<bool, LifecycleServiceError> {
+        let Some(before) = before else {
+            return Ok(false);
+        };
+        let Some(after) = self.review_gate_for_phase(session_id, phase).await? else {
+            return Ok(false);
+        };
+        if before.state == after.state {
+            return Ok(false);
+        }
+
+        let ctx = self.build_feedback_context(session_id).await?;
+        let target = match phase {
+            ReviewPhase::Plan => ctx.plan_target_resolution.into_option(),
+            ReviewPhase::Impl => ctx.impl_target_resolution.into_option(),
+        };
+        let (target_kind, target_id, plan_id) = target
+            .as_ref()
+            .map(|t| (Some(t.kind.as_str()), Some(t.id.as_str()), Some(t.plan_id)))
+            .unwrap_or((None, None, None));
+        let now = chrono::Utc::now().timestamp();
+        ev_store::append(
+            &self.pool,
+            session_id,
+            plan_id,
+            target_kind,
+            target_id,
+            EventKind::ReviewGateChanged.as_str(),
+            actor,
+            &json!({
+                "phase": phase.as_str(),
+                "from": before.state.as_str(),
+                "to": after.state.as_str(),
+                "participants": after.participants,
+                "approvals": after.approvals,
+                "request_changes": after.request_changes,
+                "unmarked": after.unmarked,
+                "missing_approvals": after.missing_approvals,
+                "override": after.override_status,
+            }),
+            None,
+            now,
+        )
+        .await?;
+        Ok(true)
+    }
+
     async fn lock_for(
         &self,
         session_id: &SessionId,
@@ -886,13 +1025,27 @@ impl SessionService {
         let cell = self.lock_for(session_id).await?;
         let mut state = cell.lock().await;
         let current = state.clone();
+        let plan_gate_before = self
+            .review_gate_for_phase(session_id, ReviewPhase::Plan)
+            .await?;
+        let impl_gate_before = self
+            .review_gate_for_phase(session_id, ReviewPhase::Impl)
+            .await?;
 
-        let path_for_update: Option<PlanFilePath> = match &obs {
+        let observed_path: Option<PlanFilePath> = match &obs {
             Observation::PlanRegistered { path, .. } => Some(path.clone()),
             _ => None,
         };
-
         let decision = decide(current, obs)?;
+        let sealed_plan_edit_ignored = decision
+            .effects
+            .iter()
+            .any(|effect| matches!(effect, crate::lifecycle::Effect::IgnoreSealedPlanEdit));
+        let path_for_update = if sealed_plan_edit_ignored {
+            None
+        } else {
+            observed_path
+        };
 
         let now = chrono::Utc::now().timestamp();
         let mut tx = self.pool.begin().await?;
@@ -900,7 +1053,7 @@ impl SessionService {
             sessions::set_plan_file_path(&mut *tx, session_id, path, now).await?;
         }
         let apply_outcome =
-            apply::apply_decision(&mut tx, session_id, &decision, actor, now).await?;
+            apply::apply_session_effects(&mut tx, session_id, &decision, actor, now).await?;
         tx.commit().await?;
 
         // The DB commit above is durable. Update the in-memory cache
@@ -911,10 +1064,26 @@ impl SessionService {
         // that already has an active plan).
         *state = decision.new_active.clone();
 
-        // SSE ping: any apply layer effect lands a row in `events`. The
-        // ping fires after the DB commit so subscribers querying the
-        // cursor will always see the new row.
-        if !apply_outcome.items.is_empty() {
+        let plan_gate_event = self
+            .append_review_gate_changed_if_needed(
+                session_id,
+                ReviewPhase::Plan,
+                plan_gate_before,
+                actor,
+            )
+            .await?;
+        let impl_gate_event = self
+            .append_review_gate_changed_if_needed(
+                session_id,
+                ReviewPhase::Impl,
+                impl_gate_before,
+                actor,
+            )
+            .await?;
+
+        // SSE ping fires after all event rows are durable so subscribers
+        // querying the cursor see lifecycle and derived review-gate rows.
+        if !apply_outcome.items.is_empty() || plan_gate_event || impl_gate_event {
             let _ = self.events_tx.send(session_id.clone());
         }
 
@@ -924,8 +1093,12 @@ impl SessionService {
             // so retries operate on a consistent base.
             self.watcher
                 .switch_plan_file(session_id, path)
-                .map_err(|err| LifecycleServiceError::Watcher(err.to_string()))?;
+                .map_err(|err| LifecycleServiceError::Watcher(err.into()))?;
         }
+
+        drop(state);
+        self.run_side_effects(session_id, &apply_outcome.side_effects)
+            .await?;
 
         Ok(ObservationOutcome {
             decision,
@@ -933,11 +1106,44 @@ impl SessionService {
         })
     }
 
-    /// Upsert reviewer feedback for `(active plan, target, author)`.
+    async fn run_side_effects(
+        &self,
+        session_id: &SessionId,
+        effects: &[SessionSideEffect],
+    ) -> Result<(), LifecycleServiceError> {
+        if effects.is_empty() {
+            return Ok(());
+        }
+        let session = sessions::fetch(&self.pool, session_id)
+            .await?
+            .ok_or_else(|| LifecycleServiceError::NoSession(session_id.as_str().into()))?;
+        let repo_root = std::path::PathBuf::from(&session.repo_root);
+        for effect in effects {
+            match effect {
+                SessionSideEffect::AttachSessionWatchers => {
+                    super::attach_session_watchers(self, session_id, &repo_root)
+                        .await
+                        .map_err(LifecycleServiceError::Watcher)?;
+                }
+                SessionSideEffect::ScanFeedbackDirs { force_reingest } => {
+                    super::scan_feedback_dir_for_session(
+                        self,
+                        &repo_root,
+                        session_id,
+                        *force_reingest,
+                    )
+                    .await;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Upsert reviewer feedback for `(session, target, author)`.
     ///
     /// Steps under the per-session lock:
-    /// 1. resolve `active_plan_id`;
-    /// 2. validate `target` belongs to the active plan;
+    /// 1. resolve the current phase target;
+    /// 2. validate `target` is the current target for that phase;
     /// 3. SELECT existing row by natural key;
     /// 4. INSERT / UPDATE / no-op + append audit event;
     /// 5. commit and broadcast when the transaction appended an event.
@@ -959,6 +1165,8 @@ impl SessionService {
             Err(LifecycleServiceError::Sql(e)) => return Err(e.into()),
             Err(LifecycleServiceError::Reducer(_))
             | Err(LifecycleServiceError::Apply(_))
+            | Err(LifecycleServiceError::InvalidArgs(_))
+            | Err(LifecycleServiceError::Feedback(_))
             | Err(LifecycleServiceError::Watcher(_))
             | Err(LifecycleServiceError::RepoMismatch { .. })
             | Err(LifecycleServiceError::SessionArchived(_)) => {
@@ -967,46 +1175,37 @@ impl SessionService {
         };
         let _guard = cell.lock().await;
 
-        // Resolve the active plan through the invariant helper, under the
-        // per-session lock. `load_active_plan` rejects archived /
-        // cross-session / dangling pointers.
-        let active = match plans::load_active_plan(&self.pool, session_id).await {
-            Ok(Some(p)) => p,
-            Ok(None) => {
+        let kind = target.kind();
+        let feedback_kind = match kind {
+            TargetKind::PlanRevision => FeedbackKind::Plan,
+            TargetKind::ImplementationCommit => FeedbackKind::Impl,
+        };
+        let active_target = match self
+            .resolve_target_for_kind(session_id, feedback_kind)
+            .await?
+        {
+            FeedbackTargetResolution::Found(t) => t,
+            _ => {
                 return Err(ServiceError::NoActivePlanForFeedback(
                     session_id.as_str().into(),
                 ));
             }
-            Err(plans::LoadActivePlanError::Sql(e)) => return Err(e.into()),
-            Err(plans::LoadActivePlanError::Inconsistent(inc)) => return Err(inc.into()),
         };
-        let active_plan_id = active.id;
-
-        // Validate target belongs to the active plan.
-        match &target {
-            FeedbackTargetRef::PlanRevision(revision_id) => {
-                let rev = plan_revisions::fetch(&self.pool, *revision_id).await?;
-                if rev.map(|r| r.plan_id) != Some(active_plan_id) {
-                    return Err(ServiceError::FeedbackTargetNotInActivePlan {
-                        target: target.to_string(),
-                        active_plan_id,
-                    });
-                }
-            }
-            FeedbackTargetRef::ImplementationCommit(sha) => {
-                let row = impl_revs::fetch_by_sha(&self.pool, active_plan_id, sha).await?;
-                if row.is_none() {
-                    return Err(ServiceError::FeedbackTargetNotInActivePlan {
-                        target: target.to_string(),
-                        active_plan_id,
-                    });
-                }
-            }
+        let active_plan_id = active_target.plan_id;
+        if active_target_ref(&active_target).as_ref() != Some(&target) {
+            return Err(ServiceError::FeedbackTargetNotInActivePlan {
+                target: target.to_string(),
+                active_plan_id,
+            });
         }
 
-        let kind = target.kind();
         let target_id = target.target_id_string();
         let author_label = author.as_str().to_string();
+        let phase = match kind {
+            TargetKind::PlanRevision => ReviewPhase::Plan,
+            TargetKind::ImplementationCommit => ReviewPhase::Impl,
+        };
+        let gate_before = self.review_gate_for_phase(session_id, phase).await?;
 
         let now = chrono::Utc::now().timestamp();
         let mut tx = self.pool.begin().await?;
@@ -1114,10 +1313,19 @@ impl SessionService {
 
         tx.commit().await?;
 
+        let gate_event_appended = self
+            .append_review_gate_changed_if_needed(
+                session_id,
+                phase,
+                gate_before,
+                &format!("agent:{}", author.as_str()),
+            )
+            .await?;
+
         // Broadcast only when the transaction appended an event row.
         // Byte-identical feedback no-ops stay quiet unless the same call
         // also introduced a new agent_joined event.
-        if event_appended {
+        if event_appended || gate_event_appended {
             let _ = self.events_tx.send(session_id.clone());
         }
 
@@ -1137,11 +1345,13 @@ impl SessionService {
         let mut tx = self.pool.begin().await?;
 
         // Confirm the session exists vs. distinguishing "no active plan".
-        let row: Option<Option<i64>> =
-            sqlx::query_scalar("SELECT active_plan_id FROM sessions WHERE id = ?")
-                .bind(session_id.as_str())
-                .fetch_optional(&mut *tx)
-                .await?;
+        let row: Option<Option<i64>> = sqlx::query_scalar(
+            "SELECT CASE WHEN state IN ('planning', 'implementing') THEN rowid ELSE NULL END \
+                 FROM sessions WHERE id = ?",
+        )
+        .bind(session_id.as_str())
+        .fetch_optional(&mut *tx)
+        .await?;
         let active_plan_id = match row {
             None => return Err(ServiceError::NoSession(session_id.as_str().into())),
             Some(None) => {
@@ -1185,9 +1395,29 @@ impl SessionService {
             Some(_) => { /* Active plan invariant holds; nothing more to assert. */ }
         }
 
-        let feedback = feedback_store::list_for_plan(&mut *tx, active_plan_id, filter).await?;
+        let mut feedback = feedback_store::list_for_plan(&mut *tx, active_plan_id, filter).await?;
         // Read-only tx; explicit rollback for clarity.
         let _ = tx.rollback().await;
+        let ctx = self.build_feedback_context(session_id).await?;
+        let current_plan_target = ctx.plan_target_resolution.into_option();
+        let current_impl_target = ctx.impl_target_resolution.into_option();
+        feedback.retain(|row| {
+            let matches_current = |target: &ActiveTarget| {
+                row.target.kind() == target.kind && row.target.target_id_string() == target.id
+            };
+            match filter {
+                Some(TargetKind::PlanRevision) => {
+                    current_plan_target.as_ref().is_some_and(matches_current)
+                }
+                Some(TargetKind::ImplementationCommit) => {
+                    current_impl_target.as_ref().is_some_and(matches_current)
+                }
+                None => {
+                    current_plan_target.as_ref().is_some_and(matches_current)
+                        || current_impl_target.as_ref().is_some_and(matches_current)
+                }
+            }
+        });
         let digest = compute_digest(active_plan_id, filter, &feedback);
 
         Ok(CurrentFeedbackView::Active {
@@ -1236,4 +1466,13 @@ fn compute_digest(plan_id: i64, filter: Option<TargetKind>, feedback: &[Feedback
         hasher.update(&row.updated_at.to_le_bytes());
     }
     hasher.finalize().to_hex().to_string()
+}
+
+fn active_target_ref(t: &ActiveTarget) -> Option<FeedbackTargetRef> {
+    match t.kind {
+        TargetKind::PlanRevision => t.id.parse().ok().map(FeedbackTargetRef::PlanRevision),
+        TargetKind::ImplementationCommit => Some(FeedbackTargetRef::ImplementationCommit(
+            t.id.as_str().into(),
+        )),
+    }
 }

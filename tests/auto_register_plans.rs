@@ -37,6 +37,39 @@ async fn delete_session(app: &TestApp, session_id: &str) {
     );
 }
 
+async fn active_plan_id(app: &TestApp, session_id: &str) -> Option<i64> {
+    sqlx::query_scalar(
+        "SELECT CASE WHEN state IN ('planning', 'implementing') THEN rowid ELSE NULL END \
+         FROM sessions WHERE id = ?",
+    )
+    .bind(session_id)
+    .fetch_one(&app.state.pool)
+    .await
+    .unwrap()
+}
+
+async fn active_and_archived(app: &TestApp, session_id: &str) -> (Option<i64>, Option<i64>) {
+    sqlx::query_as(
+        "SELECT CASE WHEN state IN ('planning', 'implementing') THEN rowid ELSE NULL END, archived_at \
+         FROM sessions WHERE id = ?",
+    )
+    .bind(session_id)
+    .fetch_one(&app.state.pool)
+    .await
+    .unwrap()
+}
+
+async fn implementation_count_for_plan(app: &TestApp, plan_id: i64) -> i64 {
+    sqlx::query_scalar(
+        "SELECT COUNT(*) FROM implementation_revisions ir JOIN sessions s ON s.id = ir.session_id \
+         WHERE s.rowid = ?",
+    )
+    .bind(plan_id)
+    .fetch_one(&app.state.pool)
+    .await
+    .unwrap()
+}
+
 #[tokio::test]
 async fn recovery_scan_does_not_reactivate_deleted_sessions() {
     let app = TestApp::spawn().await;
@@ -84,11 +117,7 @@ async fn recovery_scan_does_not_reactivate_deleted_sessions() {
         "deleted session must stay archived across daemon restart"
     );
 
-    let active_plan_id: Option<i64> =
-        sqlx::query_scalar("SELECT active_plan_id FROM sessions WHERE id = 'alpha'")
-            .fetch_one(&app.state.pool)
-            .await
-            .unwrap();
+    let active_plan_id = active_plan_id(&app, "alpha").await;
     assert!(
         active_plan_id.is_none(),
         "deleted session must have no active plan after restart"
@@ -191,13 +220,18 @@ async fn reactivation_drift_scan_replays_unchanged_feedback_files() {
     tokio::time::sleep(SETTLE).await;
 
     let original_fb: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM feedback WHERE plan_id = ? AND author_label = 'rev-a'",
+        "SELECT COUNT(*) FROM feedback f JOIN sessions s ON s.id = f.session_id \
+         WHERE s.rowid = ? AND f.target_id = ? AND f.author_label = 'rev-a'",
     )
     .bind(plan_id)
+    .bind(rev_id.to_string())
     .fetch_one(&app.state.pool)
     .await
     .unwrap();
-    assert_eq!(original_fb, 1, "feedback should ingest against initial plan");
+    assert_eq!(
+        original_fb, 1,
+        "feedback should ingest against initial plan"
+    );
 
     // Delete the session, leaving the plan file and feedback files on disk.
     delete_session(&app, "beta").await;
@@ -216,11 +250,11 @@ async fn reactivation_drift_scan_replays_unchanged_feedback_files() {
         .await
         .unwrap();
     let new_plan_id = r2["plan_id"].as_i64().unwrap();
-    assert_ne!(
+    let new_rev_id = r2["revision_id"].as_i64().unwrap();
+    assert_eq!(
         new_plan_id, plan_id,
-        "reactivation must start a new plan, not revive the old one"
+        "one-plan sessions keep the same session lifecycle row across reactivation"
     );
-    let _ = rev_id;
 
     tokio::time::sleep(SETTLE).await;
 
@@ -229,9 +263,11 @@ async fn reactivation_drift_scan_replays_unchanged_feedback_files() {
     // be 0 (the dispatch's content-hash no-op guard would short-circuit
     // because the on-disk file is unchanged).
     let new_fb: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM feedback WHERE plan_id = ? AND author_label = 'rev-a'",
+        "SELECT COUNT(*) FROM feedback f JOIN sessions s ON s.id = f.session_id \
+         WHERE s.rowid = ? AND f.target_id = ? AND f.author_label = 'rev-a'",
     )
     .bind(new_plan_id)
+    .bind(new_rev_id.to_string())
     .fetch_one(&app.state.pool)
     .await
     .unwrap();
@@ -356,11 +392,7 @@ async fn modifying_deleted_sessions_plan_file_does_not_reactivate() {
             .fetch_one(&app.state.pool)
             .await
             .unwrap();
-    let active_after: Option<i64> =
-        sqlx::query_scalar("SELECT active_plan_id FROM sessions WHERE id = 'gamma'")
-            .fetch_one(&app.state.pool)
-            .await
-            .unwrap();
+    let active_after = active_plan_id(&app, "gamma").await;
     assert!(
         archived_after.is_some(),
         "editing the plan file of a deleted session must not reactivate it"
@@ -402,12 +434,13 @@ async fn reactivation_attaches_companion_watchers_after_restart() {
     drop_plan(&app.repo, "epsilon.md", "# epsilon v2\n").await;
     tokio::time::sleep(SETTLE).await;
 
-    let new_plan_id: i64 =
-        sqlx::query_scalar("SELECT active_plan_id FROM sessions WHERE id = 'epsilon'")
-            .fetch_one(&app.state.pool)
-            .await
-            .unwrap();
-    assert!(new_plan_id > 0, "session should be reactivated after fresh drop post-restart");
+    let new_plan_id = active_plan_id(&app, "epsilon")
+        .await
+        .expect("epsilon should be active");
+    assert!(
+        new_plan_id > 0,
+        "session should be reactivated after fresh drop post-restart"
+    );
 
     // Now exercise the companion watchers: a commit must produce an
     // implementation_revisions row (proves git-logs watcher attached),
@@ -415,13 +448,7 @@ async fn reactivation_attaches_companion_watchers_after_restart() {
     // attached).
     common::make_commit(&app.repo, "f.txt", "x\n");
     tokio::time::sleep(SETTLE).await;
-    let impl_count: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM implementation_revisions WHERE plan_id = ?",
-    )
-    .bind(new_plan_id)
-    .fetch_one(&app.state.pool)
-    .await
-    .unwrap();
+    let impl_count = implementation_count_for_plan(&app, new_plan_id).await;
     assert_eq!(
         impl_count, 1,
         "git-logs watcher must be attached after fresh-drop reactivation"
@@ -451,14 +478,10 @@ async fn reactivation_attaches_companion_watchers_after_restart() {
 }
 
 #[tokio::test]
-async fn new_plan_lifecycle_on_existing_session_emits_outerhtml_not_afterbegin() {
-    // A `plan_revision_created` event for revision 1 of the SECOND
-    // plan on a session must target the existing `<tr id="session-row-{id}">`
-    // with `outerHTML`. The bug shape (count_for_plan == 1 alone) would
-    // emit `afterbegin:#sessions-table-body` and double-insert the row.
-    //
-    // This test reads the home SSE stream directly and asserts the OOB
-    // wrapper kind, which is the actual surface that had the bug.
+async fn sealed_plan_edit_on_existing_session_stays_quiet() {
+    // Once implementation has started, re-registering the session with
+    // different plan text is a sealed plan edit. It must not create a
+    // second plan lifecycle and must not emit home SSE row churn.
     let app = TestApp::spawn().await;
 
     let plan_v1 = app.repo.join("plan-v1.md");
@@ -471,9 +494,13 @@ async fn new_plan_lifecycle_on_existing_session_emits_outerhtml_not_afterbegin()
     )
     .await
     .unwrap();
+    let original_path: String =
+        sqlx::query_scalar("SELECT plan_file_path FROM sessions WHERE id = 'zeta'")
+            .fetch_one(&app.state.pool)
+            .await
+            .unwrap();
 
-    // Move into implementing so the body-change below triggers
-    // ArchiveActivePlan + StartPlan (a new plan, revision 1).
+    // Move into implementing so the body-change below is sealed out.
     common::make_commit(&app.repo, "x.txt", "x\n");
     tokio::time::sleep(SETTLE).await;
 
@@ -506,13 +533,11 @@ async fn new_plan_lifecycle_on_existing_session_emits_outerhtml_not_afterbegin()
         }
     });
 
-    // Settle so the stream attaches before we trigger the new lifecycle.
+    // Settle so the stream attaches before we trigger the sealed edit.
     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
 
-    // New plan body via the MCP path. Reducer archives the old plan,
-    // starts a new one in `planning`, revision_number = 1. The home
-    // SSE fragment must dispatch this as REPLACE (outerHTML), not
-    // INSERT (afterbegin).
+    // New plan body via the MCP path. The reducer returns
+    // IgnoreSealedPlanEdit; no event should wake the home stream.
     let plan_v2 = app.repo.join("plan-v2.md");
     std::fs::write(&plan_v2, "# v2 different\n").unwrap();
     app.call(
@@ -526,16 +551,24 @@ async fn new_plan_lifecycle_on_existing_session_emits_outerhtml_not_afterbegin()
 
     let body = stream_handle.await.unwrap();
     assert!(
-        body.contains("session-row-zeta"),
-        "SSE stream must deliver a fragment for the new lifecycle: got:\n{body}"
+        !body.contains("session-row-zeta"),
+        "sealed plan edit must not deliver a home row fragment: got:\n{body}"
     );
-    assert!(
-        body.contains("hx-swap-oob=\"outerHTML:#session-row-zeta\""),
-        "second plan's first revision must dispatch as outerHTML replace, not afterbegin insert; got:\n{body}"
-    );
-    assert!(
-        !body.contains("hx-swap-oob=\"afterbegin:#sessions-table-body\""),
-        "must NOT emit afterbegin for an existing session row; got:\n{body}"
+
+    let plan_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM plans WHERE session_id = 'zeta'")
+            .fetch_one(&app.state.pool)
+            .await
+            .unwrap();
+    assert_eq!(plan_count, 1, "sealed edit must not start a second plan");
+    let current_path: String =
+        sqlx::query_scalar("SELECT plan_file_path FROM sessions WHERE id = 'zeta'")
+            .fetch_one(&app.state.pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        current_path, original_path,
+        "sealed edit must not rebind the watched plan path"
     );
 }
 
@@ -567,8 +600,9 @@ async fn fresh_drop_after_delete_reactivates_via_filesystem() {
             .unwrap();
     assert!(archived.is_some());
 
-    // Register a different active session in the same repo so we can
-    // verify reactivation supersedes it (one-active-per-repo).
+    // Register a different active session in the same repo. Reactivating
+    // delta must not disturb this session; commit routing is controlled by
+    // the repo effective-session claim instead.
     let other_plan = drop_plan(&app.repo, "other-active.md", "# other\n").await;
     app.call(
         "register_plan_file",
@@ -579,11 +613,7 @@ async fn fresh_drop_after_delete_reactivates_via_filesystem() {
     .await
     .unwrap();
 
-    let other_active_before: Option<i64> =
-        sqlx::query_scalar("SELECT active_plan_id FROM sessions WHERE id = 'other-active'")
-            .fetch_one(&app.state.pool)
-            .await
-            .unwrap();
+    let other_active_before = active_plan_id(&app, "other-active").await;
     assert!(other_active_before.is_some());
 
     // Fresh drop: remove the existing `delta.md` then recreate it.
@@ -595,12 +625,7 @@ async fn fresh_drop_after_delete_reactivates_via_filesystem() {
     tokio::time::sleep(SETTLE).await;
 
     // Assert reactivation:
-    let delta_state: (Option<i64>, Option<i64>) = sqlx::query_as(
-        "SELECT active_plan_id, archived_at FROM sessions WHERE id = 'delta'",
-    )
-    .fetch_one(&app.state.pool)
-    .await
-    .unwrap();
+    let delta_state = active_and_archived(&app, "delta").await;
     assert!(
         delta_state.0.is_some(),
         "fresh drop should reactivate the archived session: got active_plan_id = {:?}",
@@ -611,21 +636,15 @@ async fn fresh_drop_after_delete_reactivates_via_filesystem() {
         "reactivated session must clear archived_at"
     );
 
-    // Assert one-active-per-repo: the previously-active session is
-    // archived by the supersession step.
-    let other_state: (Option<i64>, Option<i64>) = sqlx::query_as(
-        "SELECT active_plan_id, archived_at FROM sessions WHERE id = 'other-active'",
-    )
-    .fetch_one(&app.state.pool)
-    .await
-    .unwrap();
+    // Reactivation no longer supersedes other active sessions in the repo.
+    let other_state = active_and_archived(&app, "other-active").await;
     assert!(
-        other_state.0.is_none(),
-        "previously-active session must lose its active plan after reactivation"
+        other_state.0.is_some(),
+        "previously-active session must keep its active plan after reactivation"
     );
     assert!(
-        other_state.1.is_some(),
-        "previously-active session must be archived (one-active-per-repo)"
+        other_state.1.is_none(),
+        "previously-active session must not be archived by passive plan discovery"
     );
 }
 
@@ -691,10 +710,11 @@ async fn recovery_disambiguates_cross_repo_collisions() {
 }
 
 #[tokio::test]
-async fn auto_register_reactivation_archives_other_active_session_in_repo() {
+async fn auto_register_reactivation_preserves_other_active_session_in_repo() {
     // Repo has active session X. A `.md` file appears that reactivates
-    // archived session Y in the same repo. After reactivation, X must
-    // be archived to preserve the one-active-per-repo invariant.
+    // archived session Y in the same repo. Reactivation must not archive X:
+    // dropping plans for later is passive until a session is explicitly
+    // set in effect.
     let app = TestApp::spawn().await;
 
     // Create + delete Y, leaving the plan file on disk.
@@ -709,7 +729,7 @@ async fn auto_register_reactivation_archives_other_active_session_in_repo() {
     .unwrap();
     delete_session(&app, "yankee").await;
 
-    // Now register X — becomes the active session in the repo.
+    // Now register X.
     let plan_x = drop_plan(&app.repo, "xray.md", "# x\n").await;
     app.call(
         "register_plan_file",
@@ -720,15 +740,14 @@ async fn auto_register_reactivation_archives_other_active_session_in_repo() {
     .await
     .unwrap();
 
-    let x_active: Option<i64> =
-        sqlx::query_scalar("SELECT active_plan_id FROM sessions WHERE id = 'xray'")
-            .fetch_one(&app.state.pool)
-            .await
-            .unwrap();
-    assert!(x_active.is_some(), "xray should be active before reactivation");
+    let x_active = active_plan_id(&app, "xray").await;
+    assert!(
+        x_active.is_some(),
+        "xray should be active before reactivation"
+    );
 
-    // Re-register Y via the explicit MCP path — reactivation. The
-    // dispatcher must then archive xray to preserve the invariant.
+    // Re-register Y via the explicit MCP path — reactivation. X must stay
+    // active and visible.
     app.call(
         "register_plan_file",
         &app.repo,
@@ -738,29 +757,24 @@ async fn auto_register_reactivation_archives_other_active_session_in_repo() {
     .await
     .unwrap();
 
-    let y_active: Option<i64> =
-        sqlx::query_scalar("SELECT active_plan_id FROM sessions WHERE id = 'yankee'")
-            .fetch_one(&app.state.pool)
-            .await
-            .unwrap();
-    let x_active_after: Option<i64> =
-        sqlx::query_scalar("SELECT active_plan_id FROM sessions WHERE id = 'xray'")
-            .fetch_one(&app.state.pool)
-            .await
-            .unwrap();
+    let y_active = active_plan_id(&app, "yankee").await;
+    let x_active_after = active_plan_id(&app, "xray").await;
     let x_archived: Option<i64> =
         sqlx::query_scalar("SELECT archived_at FROM sessions WHERE id = 'xray'")
             .fetch_one(&app.state.pool)
             .await
             .unwrap();
 
-    assert!(y_active.is_some(), "reactivated session should have a new active plan");
     assert!(
-        x_active_after.is_none(),
-        "previous active session must lose its active plan after the supersession"
+        y_active.is_some(),
+        "reactivated session should have a new active plan"
     );
     assert!(
-        x_archived.is_some(),
-        "previous active session must be archived (one-active-per-repo)"
+        x_active_after.is_some(),
+        "previous active session must keep its active plan after passive reactivation"
+    );
+    assert!(
+        x_archived.is_none(),
+        "previous active session must not be archived by passive reactivation"
     );
 }

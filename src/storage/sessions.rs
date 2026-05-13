@@ -1,5 +1,5 @@
 //! CRUD on the `sessions` table. A Trinity session is a master-supplied
-//! URL-safe slug; it owns a watched plan-file path and an `Option<active plan>`.
+//! URL-safe slug; it owns a watched plan-file path and its lifecycle state.
 
 use sqlx::SqlitePool;
 
@@ -11,34 +11,59 @@ pub struct Session {
     pub repo_root: String,
     pub plan_file_path: String,
     pub display_title: Option<String>,
+    /// Compatibility projection for call sites still carrying a numeric
+    /// active-plan handle. It is the SQLite rowid while the session is
+    /// planning or implementing, otherwise `None`.
     pub active_plan_id: Option<i64>,
     pub created_at: i64,
     pub updated_at: i64,
     pub archived_at: Option<i64>,
 }
 
+const SELECT_SESSION_BY_ID: &str = "\
+    SELECT id, repo_root, plan_file_path, display_title, \
+           CASE WHEN state IN ('planning', 'implementing') THEN rowid ELSE NULL END AS active_plan_id, \
+           created_at, updated_at, archived_at \
+      FROM sessions WHERE id = ?";
+const SELECT_ACTIVE_SESSIONS: &str = "\
+    SELECT id, repo_root, plan_file_path, display_title, \
+           CASE WHEN state IN ('planning', 'implementing') THEN rowid ELSE NULL END AS active_plan_id, \
+           created_at, updated_at, archived_at \
+      FROM sessions WHERE archived_at IS NULL ORDER BY updated_at DESC";
+const SELECT_ACTIVE_SESSIONS_BY_REPO: &str = "\
+    SELECT id, repo_root, plan_file_path, display_title, \
+           CASE WHEN state IN ('planning', 'implementing') THEN rowid ELSE NULL END AS active_plan_id, \
+           created_at, updated_at, archived_at \
+      FROM sessions WHERE repo_root = ? AND archived_at IS NULL ORDER BY updated_at DESC";
+
 pub async fn fetch(pool: &SqlitePool, session_id: &SessionId) -> sqlx::Result<Option<Session>> {
-    sqlx::query_as::<_, Session>("SELECT * FROM sessions WHERE id = ?")
+    sqlx::query_as::<_, Session>(SELECT_SESSION_BY_ID)
         .bind(session_id.as_str())
         .fetch_optional(pool)
         .await
 }
 
+pub async fn fetch_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    session_id: &SessionId,
+) -> sqlx::Result<Option<Session>> {
+    sqlx::query_as::<_, Session>(SELECT_SESSION_BY_ID)
+        .bind(session_id.as_str())
+        .fetch_optional(&mut **tx)
+        .await
+}
+
 pub async fn list_active(pool: &SqlitePool) -> sqlx::Result<Vec<Session>> {
-    sqlx::query_as::<_, Session>(
-        "SELECT * FROM sessions WHERE archived_at IS NULL ORDER BY updated_at DESC",
-    )
-    .fetch_all(pool)
-    .await
+    sqlx::query_as::<_, Session>(SELECT_ACTIVE_SESSIONS)
+        .fetch_all(pool)
+        .await
 }
 
 pub async fn list_by_repo_root(pool: &SqlitePool, repo_root: &str) -> sqlx::Result<Vec<Session>> {
-    sqlx::query_as::<_, Session>(
-        "SELECT * FROM sessions WHERE repo_root = ? AND archived_at IS NULL ORDER BY updated_at DESC",
-    )
-    .bind(repo_root)
-    .fetch_all(pool)
-    .await
+    sqlx::query_as::<_, Session>(SELECT_ACTIVE_SESSIONS_BY_REPO)
+        .bind(repo_root)
+        .fetch_all(pool)
+        .await
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -54,8 +79,9 @@ where
     E: sqlx::Executor<'e, Database = sqlx::Sqlite>,
 {
     sqlx::query(
-        "INSERT INTO sessions (id, repo_root, plan_file_path, display_title, active_plan_id, created_at, updated_at, archived_at) \
-         VALUES (?, ?, ?, ?, NULL, ?, ?, NULL)",
+        "INSERT INTO sessions \
+            (id, repo_root, plan_file_path, display_title, base_commit, state, started_at, finished_at, created_at, updated_at, archived_at) \
+         VALUES (?, ?, ?, ?, NULL, NULL, NULL, NULL, ?, ?, NULL)",
     )
     .bind(session_id.as_str())
     .bind(repo_root)
@@ -86,22 +112,23 @@ where
     Ok(())
 }
 
-pub async fn set_active_plan_id<'e, E>(
+pub async fn active_plan_rowid<'e, E>(
     executor: E,
     session_id: &SessionId,
-    active_plan_id: Option<i64>,
-    now: i64,
-) -> sqlx::Result<()>
+    require_active: bool,
+) -> sqlx::Result<Option<i64>>
 where
     E: sqlx::Executor<'e, Database = sqlx::Sqlite>,
 {
-    sqlx::query("UPDATE sessions SET active_plan_id = ?, updated_at = ? WHERE id = ?")
-        .bind(active_plan_id)
-        .bind(now)
+    let sql = if require_active {
+        "SELECT rowid FROM sessions WHERE id = ? AND state IN ('planning', 'implementing')"
+    } else {
+        "SELECT rowid FROM sessions WHERE id = ?"
+    };
+    sqlx::query_scalar(sql)
         .bind(session_id.as_str())
-        .execute(executor)
-        .await?;
-    Ok(())
+        .fetch_optional(executor)
+        .await
 }
 
 pub async fn set_display_title<'e, E>(
@@ -132,6 +159,22 @@ where
 {
     sqlx::query("UPDATE sessions SET updated_at = ? WHERE id = ?")
         .bind(now)
+        .bind(session_id.as_str())
+        .execute(executor)
+        .await?;
+    Ok(())
+}
+
+pub async fn set_current_event_floor<'e, E>(
+    executor: E,
+    session_id: &SessionId,
+    event_floor: i64,
+) -> sqlx::Result<()>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Sqlite>,
+{
+    sqlx::query("UPDATE sessions SET current_event_floor = ? WHERE id = ?")
+        .bind(event_floor)
         .bind(session_id.as_str())
         .execute(executor)
         .await?;

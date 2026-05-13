@@ -1,11 +1,7 @@
-//! Code-level invariant tests for `sessions.active_plan_id`.
+//! Code-level invariant tests for the one-plan session lifecycle.
 //!
-//! The SQL partial unique index enforces "at most one non-archived plan per
-//! session". This file covers the stricter rule the apply layer guarantees in
-//! code: `sessions.active_plan_id`, when not NULL, points at a non-archived
-//! plan whose `session_id` matches. We corrupt the DB by hand and assert
-//! `plans::load_active_plan` returns `ActivePlanInconsistency::*` rather than
-//! silently treating the pointer as `None`.
+//! The lifecycle owner is the `sessions` row. There is no separate
+//! `plans` table and no cross-session active-plan pointer to corrupt.
 
 mod common;
 
@@ -15,15 +11,8 @@ use common::TestApp;
 use trinity::lifecycle::SessionId;
 use trinity::storage::plans;
 
-// Dangling pointer is prevented by the SQL FK (`sessions.active_plan_id
-// REFERENCES plans(id)`) before our code-level checks even see the row, so
-// no test here — the FK is the strictest defense.
-//
-// The cross-session and archived cases below exercise the consistency rules
-// that the FK does NOT enforce.
-
 #[tokio::test]
-async fn cross_session_pointer_returns_inconsistent() {
+async fn active_session_loads_from_session_lifecycle_row() {
     let app = TestApp::spawn().await;
     let plan_path = app.repo.join("plan.md");
     std::fs::write(&plan_path, "x").unwrap();
@@ -36,53 +25,40 @@ async fn cross_session_pointer_returns_inconsistent() {
         )
         .await
         .unwrap();
-    let plan_alpha = r["plan_id"].as_i64().unwrap();
+    let plan_id = r["plan_id"].as_i64().unwrap();
 
-    // Hand-insert a second session whose active_plan_id points at alpha's plan.
-    sqlx::query(
-        "INSERT INTO sessions (id, repo_root, plan_file_path, display_title, active_plan_id, created_at, updated_at, archived_at) VALUES ('beta', '/other', '/p', NULL, ?, 1, 1, NULL)",
+    let active = plans::load_active_plan(&app.state.pool, &SessionId::from("alpha"))
+        .await
+        .unwrap()
+        .expect("registered session is active");
+    assert_eq!(active.id, plan_id);
+    assert_eq!(active.session_id, "alpha");
+    assert_eq!(active.state, "planning");
+}
+
+#[tokio::test]
+async fn terminal_session_state_is_not_active() {
+    let app = TestApp::spawn().await;
+    let plan_path = app.repo.join("plan.md");
+    std::fs::write(&plan_path, "x").unwrap();
+    app.call(
+        "register_plan_file",
+        &app.repo,
+        None,
+        json!({"session_id": "s", "path": &plan_path, "label": "m"}),
     )
-    .bind(plan_alpha)
+    .await
+    .unwrap();
+
+    sqlx::query(
+        "UPDATE sessions SET state = 'archived', archived_at = 1, updated_at = 1 WHERE id = 's'",
+    )
     .execute(&app.state.pool)
     .await
     .unwrap();
 
-    let err = plans::load_active_plan(&app.state.pool, &SessionId::from("beta"))
-        .await
-        .unwrap_err();
-    let msg = format!("{err}");
-    assert!(
-        msg.contains("different session"),
-        "msg should mention cross-session: {msg}"
-    );
-}
-
-#[tokio::test]
-async fn pointer_to_archived_plan_returns_inconsistent() {
-    let app = TestApp::spawn().await;
-    let plan_path = app.repo.join("plan.md");
-    std::fs::write(&plan_path, "x").unwrap();
-    let r = app
-        .call(
-            "register_plan_file",
-            &app.repo,
-            None,
-            json!({"session_id": "s", "path": &plan_path, "label": "m"}),
-        )
+    let active = plans::load_active_plan(&app.state.pool, &SessionId::from("s"))
         .await
         .unwrap();
-    let plan_id = r["plan_id"].as_i64().unwrap();
-
-    // Hand-archive the plan but leave sessions.active_plan_id dangling.
-    sqlx::query("UPDATE plans SET state = 'archived', archived_at = 1 WHERE id = ?")
-        .bind(plan_id)
-        .execute(&app.state.pool)
-        .await
-        .unwrap();
-
-    let err = plans::load_active_plan(&app.state.pool, &SessionId::from("s"))
-        .await
-        .unwrap_err();
-    let msg = format!("{err}");
-    assert!(msg.contains("archived"), "msg: {msg}");
+    assert!(active.is_none());
 }

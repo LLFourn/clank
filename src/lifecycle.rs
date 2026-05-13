@@ -20,7 +20,18 @@ use std::fmt;
 
 macro_rules! string_newtype {
     ($name:ident) => {
-        #[derive(Debug, Clone, PartialEq, Eq, Hash)]
+        #[derive(
+            Debug,
+            Clone,
+            PartialEq,
+            Eq,
+            PartialOrd,
+            Ord,
+            Hash,
+            serde::Serialize,
+            serde::Deserialize,
+        )]
+        #[serde(transparent)]
         pub struct $name(String);
 
         impl $name {
@@ -85,7 +96,7 @@ pub struct CommitSnapshot {
 
 /// In-memory cache shape of the live plan in a session. Persisted state
 /// lives in SQL; this struct is rebuilt on daemon startup from
-/// `sessions.active_plan_id` and the latest revision rows.
+/// `sessions.state` and the latest revision rows.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ActivePlan {
     Planning {
@@ -127,6 +138,7 @@ pub enum Observation {
         path: PlanFilePath,
         body: String,
         head: CommitSha,
+        source: ActivationSource,
     },
     /// File-watcher reports the registered file's contents have changed
     /// (already debounced + read).
@@ -135,11 +147,30 @@ pub enum Observation {
     CommitObserved { commit: CommitSnapshot },
     /// Human (or master) asked for the active plan to be archived.
     ArchiveRequested,
-    /// Operator (or agent via `finish_plan`) declared the active plan
+    /// Operator declared the active plan
     /// successfully concluded. Terminal — observations cannot route into
-    /// finished plans (`sessions.active_plan_id` is cleared by the apply
-    /// layer, same shape as `ArchiveRequested`).
+    /// finished plans (the apply layer moves the session out of the
+    /// active states, same shape as `ArchiveRequested`).
     FinishRequested,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ActivationSource {
+    ExplicitRegister,
+    AutoRegisterFreshDrop,
+    AutoRegisterReactivation,
+    RecoveryScan,
+}
+
+impl ActivationSource {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ActivationSource::ExplicitRegister => "explicit_register",
+            ActivationSource::AutoRegisterFreshDrop => "auto_register_fresh_drop",
+            ActivationSource::AutoRegisterReactivation => "auto_register_reactivation",
+            ActivationSource::RecoveryScan => "recovery_scan",
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -147,6 +178,7 @@ pub enum Effect {
     StartPlan {
         base_commit: CommitSha,
         initial_body: String,
+        source: ActivationSource,
     },
     RecordPlanRevision {
         body: String,
@@ -154,6 +186,9 @@ pub enum Effect {
     RecordImplementation {
         commit: CommitSnapshot,
     },
+    /// Frozen-plan edit with no v1 addendum semantics. The apply layer
+    /// deliberately emits no event, revision, or UI wake-up for this.
+    IgnoreSealedPlanEdit,
     ArchiveActivePlan,
     FinishActivePlan,
 }
@@ -203,7 +238,12 @@ pub fn decide(active: Option<ActivePlan>, obs: Observation) -> Result<Decision, 
 
     match (active, obs) {
         // ----- No active plan -----
-        (None, PlanRegistered { body, head, .. }) => {
+        (
+            None,
+            PlanRegistered {
+                body, head, source, ..
+            },
+        ) => {
             let hash = content_hash(&body);
             Ok(Decision {
                 new_active: Some(Planning {
@@ -213,6 +253,7 @@ pub fn decide(active: Option<ActivePlan>, obs: Observation) -> Result<Decision, 
                 effects: vec![Effect::StartPlan {
                     base_commit: head,
                     initial_body: body,
+                    source,
                 }],
             })
         }
@@ -279,43 +320,25 @@ pub fn decide(active: Option<ActivePlan>, obs: Observation) -> Result<Decision, 
         }),
 
         // ----- Implementing -----
-        (Some(implementing @ Implementing { .. }), PlanRegistered { body, head, .. }) => {
+        (Some(implementing @ Implementing { .. }), PlanRegistered { body, .. }) => {
             let new_hash = content_hash(&body);
             if &new_hash == implementing.latest_plan_hash() {
                 Ok(Decision::noop(Some(implementing)))
             } else {
                 Ok(Decision {
-                    new_active: Some(Planning {
-                        base_commit: head.clone(),
-                        latest_plan_hash: new_hash,
-                    }),
-                    effects: vec![
-                        Effect::ArchiveActivePlan,
-                        Effect::StartPlan {
-                            base_commit: head,
-                            initial_body: body,
-                        },
-                    ],
+                    new_active: Some(implementing),
+                    effects: vec![Effect::IgnoreSealedPlanEdit],
                 })
             }
         }
-        (Some(implementing @ Implementing { .. }), PlanFileObserved { body, head }) => {
+        (Some(implementing @ Implementing { .. }), PlanFileObserved { body, .. }) => {
             let new_hash = content_hash(&body);
             if &new_hash == implementing.latest_plan_hash() {
                 Ok(Decision::noop(Some(implementing)))
             } else {
                 Ok(Decision {
-                    new_active: Some(Planning {
-                        base_commit: head.clone(),
-                        latest_plan_hash: new_hash,
-                    }),
-                    effects: vec![
-                        Effect::ArchiveActivePlan,
-                        Effect::StartPlan {
-                            base_commit: head,
-                            initial_body: body,
-                        },
-                    ],
+                    new_active: Some(implementing),
+                    effects: vec![Effect::IgnoreSealedPlanEdit],
                 })
             }
         }
@@ -384,6 +407,7 @@ mod tests {
                 path: PlanFilePath::from("/p"),
                 body: "first".into(),
                 head: CommitSha::from("abc"),
+                source: ActivationSource::ExplicitRegister,
             },
         )
         .unwrap();
@@ -392,6 +416,7 @@ mod tests {
             vec![Effect::StartPlan {
                 base_commit: CommitSha::from("abc"),
                 initial_body: "first".into(),
+                source: ActivationSource::ExplicitRegister,
             }]
         );
         assert_eq!(
@@ -452,6 +477,7 @@ mod tests {
                 path: PlanFilePath::from("/p"),
                 body: "body".into(),
                 head: CommitSha::from("head2"),
+                source: ActivationSource::ExplicitRegister,
             },
         )
         .unwrap();
@@ -468,6 +494,7 @@ mod tests {
                 path: PlanFilePath::from("/p"),
                 body: "body v2".into(),
                 head: CommitSha::from("head2"),
+                source: ActivationSource::ExplicitRegister,
             },
         )
         .unwrap();
@@ -570,6 +597,7 @@ mod tests {
                 path: PlanFilePath::from("/p"),
                 body: "body".into(),
                 head: CommitSha::from("any"),
+                source: ActivationSource::ExplicitRegister,
             },
         )
         .unwrap();
@@ -578,34 +606,21 @@ mod tests {
     }
 
     #[test]
-    fn implementing_plus_register_changed_body_archives_and_starts_new() {
+    fn implementing_plus_register_changed_body_ignores_sealed_plan_edit() {
         let p = implementing("body", "base", "impl1");
+        let expected = p.clone();
         let d = decide(
             Some(p),
             Observation::PlanRegistered {
                 path: PlanFilePath::from("/p"),
                 body: "wholly new task".into(),
                 head: CommitSha::from("head-now"),
+                source: ActivationSource::ExplicitRegister,
             },
         )
         .unwrap();
-        assert_eq!(
-            d.effects,
-            vec![
-                Effect::ArchiveActivePlan,
-                Effect::StartPlan {
-                    base_commit: CommitSha::from("head-now"),
-                    initial_body: "wholly new task".into(),
-                }
-            ]
-        );
-        assert_eq!(
-            d.new_active,
-            Some(ActivePlan::Planning {
-                base_commit: CommitSha::from("head-now"),
-                latest_plan_hash: content_hash("wholly new task"),
-            })
-        );
+        assert_eq!(d.effects, vec![Effect::IgnoreSealedPlanEdit]);
+        assert_eq!(d.new_active, Some(expected));
     }
 
     #[test]
@@ -624,8 +639,9 @@ mod tests {
     }
 
     #[test]
-    fn implementing_plus_file_observed_changed_body_archives_and_starts_new() {
+    fn implementing_plus_file_observed_changed_body_ignores_sealed_plan_edit() {
         let p = implementing("body", "base", "impl1");
+        let expected = p.clone();
         let d = decide(
             Some(p),
             Observation::PlanFileObserved {
@@ -634,17 +650,8 @@ mod tests {
             },
         )
         .unwrap();
-        assert_eq!(
-            d.effects,
-            vec![
-                Effect::ArchiveActivePlan,
-                Effect::StartPlan {
-                    base_commit: CommitSha::from("head-now"),
-                    initial_body: "different".into(),
-                }
-            ]
-        );
-        assert!(matches!(d.new_active, Some(ActivePlan::Planning { .. })));
+        assert_eq!(d.effects, vec![Effect::IgnoreSealedPlanEdit]);
+        assert_eq!(d.new_active, Some(expected));
     }
 
     #[test]
@@ -696,6 +703,7 @@ mod tests {
                 path: PlanFilePath::from("/p.md"),
                 body: "draft v1".into(),
                 head: CommitSha::from("head-a"),
+                source: ActivationSource::ExplicitRegister,
             },
         )
         .unwrap();
@@ -757,7 +765,7 @@ mod tests {
         .unwrap();
         effects_log.extend(d.effects.clone());
         state = d.new_active;
-        assert!(matches!(state, Some(ActivePlan::Planning { .. })));
+        assert!(matches!(state, Some(ActivePlan::Implementing { .. })));
 
         let d = decide(state.clone(), Observation::ArchiveRequested).unwrap();
         effects_log.extend(d.effects.clone());
@@ -770,6 +778,7 @@ mod tests {
                 Effect::StartPlan {
                     base_commit: CommitSha::from("head-a"),
                     initial_body: "draft v1".into(),
+                    source: ActivationSource::ExplicitRegister,
                 },
                 Effect::RecordPlanRevision {
                     body: "draft v2".into()
@@ -777,11 +786,7 @@ mod tests {
                 Effect::RecordImplementation { commit: c1 },
                 Effect::RecordImplementation { commit: c2.clone() },
                 Effect::RecordImplementation { commit: c2 },
-                Effect::ArchiveActivePlan,
-                Effect::StartPlan {
-                    base_commit: CommitSha::from("head-b"),
-                    initial_body: "post-impl new task".into(),
-                },
+                Effect::IgnoreSealedPlanEdit,
                 Effect::ArchiveActivePlan,
             ]
         );

@@ -16,6 +16,7 @@ use super::internal_api;
 use super::ui;
 use crate::domain::{FeedbackKind, FeedbackTargetRef};
 use crate::lifecycle::{CommitSha, SessionId};
+use crate::review_state::{ReviewGateState, ReviewPhase};
 use crate::storage::{
     events as ev_store, feedback as feedback_store, feedback::FeedbackRecord,
     implementation_revisions as impl_revs, plan_revisions, plans, sessions,
@@ -43,7 +44,12 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/sessions/{session_id}/events", get(events_stream))
         .route("/sessions/{session_id}/delete", post(delete_session))
+        .route("/sessions/{session_id}/claim", post(claim_session))
         .route("/sessions/{session_id}/finish", post(finish_session))
+        .route(
+            "/sessions/{session_id}/review_gate_override",
+            post(review_gate_override),
+        )
         .route("/sessions/{session_id}/comment", post(curator::comment))
         .route("/sessions/{session_id}/archive", post(curator::archive))
         .route("/sessions/{session_id}/rename", post(curator::rename))
@@ -83,9 +89,18 @@ async fn home(State(state): State<AppState>) -> Result<Html<String>, AppError> {
         } else {
             false
         };
+        let sid = SessionId::from(s.id.as_str());
+        let review_gate = review_gate_for_row(&state, &sid, active_plan_state.as_deref()).await?;
+        let is_repo_effective = state
+            .lifecycle
+            .is_repo_effective_session(&sid)
+            .await
+            .map_err(AppError::lifecycle)?;
         out.push(ui::SessionRow {
             session: s,
             active_plan_state,
+            review_gate,
+            is_repo_effective,
             finished,
         });
     }
@@ -93,6 +108,22 @@ async fn home(State(state): State<AppState>) -> Result<Html<String>, AppError> {
     Ok(Html(ui::home(&out, &activity).into_string()))
 }
 
+async fn review_gate_for_row(
+    state: &AppState,
+    sid: &SessionId,
+    active_plan_state: Option<&str>,
+) -> Result<Option<crate::review_state::ReviewGateDecision>, AppError> {
+    let phase = match active_plan_state {
+        Some("planning") => ReviewPhase::Plan,
+        Some("implementing") => ReviewPhase::Impl,
+        _ => return Ok(None),
+    };
+    state
+        .lifecycle
+        .review_gate_for_phase(sid, phase)
+        .await
+        .map_err(AppError::lifecycle)
+}
 
 #[derive(Default)]
 struct TimelineMaps {
@@ -276,6 +307,11 @@ async fn session_detail(
     } else {
         None
     };
+    let is_repo_effective = state
+        .lifecycle
+        .is_repo_effective_session(&sid)
+        .await
+        .map_err(AppError::lifecycle)?;
 
     let archived_count: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM plans WHERE session_id = ? AND state = 'archived'",
@@ -317,6 +353,16 @@ async fn session_detail(
 
     let timeline_maps = build_timeline_maps(&state, &sid).await?;
     let timeline_rows = timeline_rows_for_events(&session, &events, &timeline_maps, false);
+    let plan_review_gate = state
+        .lifecycle
+        .review_gate_for_phase(&sid, ReviewPhase::Plan)
+        .await
+        .map_err(AppError::lifecycle)?;
+    let impl_review_gate = state
+        .lifecycle
+        .review_gate_for_phase(&sid, ReviewPhase::Impl)
+        .await
+        .map_err(AppError::lifecycle)?;
     let active_plan_preview = match &active_plan {
         Some(plan) => plan_revisions::latest_for_plan(&state.pool, plan.id)
             .await
@@ -338,6 +384,7 @@ async fn session_detail(
         ui::session_detail(&ui::SessionDetail {
             session,
             active_plan,
+            is_repo_effective,
             active_plan_preview,
             archived_count,
             plan_feedback_files: ctx.plan_files,
@@ -345,6 +392,8 @@ async fn session_detail(
             git_logs_head_path,
             plan_feedback_dir_path,
             impl_feedback_dir_path,
+            plan_review_gate,
+            impl_review_gate,
             timeline_rows,
             max_event_id,
         })
@@ -434,6 +483,7 @@ fn build_history_feedback(
             ui::FeedbackItem {
                 author_label: f.author_label.as_str().to_string(),
                 body: f.body.clone(),
+                verdict: crate::review_state::parse_verdict(&f.body),
                 created_at: f.created_at,
                 updated_at: f.updated_at,
                 target_label,
@@ -525,6 +575,7 @@ async fn commit_diff(
                 feedback_id: r.id,
                 author_label: r.author_label.as_str().to_string(),
                 feedback_kind: FeedbackKind::Impl.as_str().to_string(),
+                verdict: crate::review_state::parse_verdict(&r.body),
                 file_status,
                 file_path,
                 body_html: render_markdown(&r.body),
@@ -713,6 +764,9 @@ async fn home_event_fragment(
     if ev.kind == "session_archived" {
         return Ok(ui::session_table_row_remove(&ev.session_id));
     }
+    if ev.kind == "session_reactivated" {
+        return Ok(maud::html! {});
+    }
 
     // Build the table-row update fragment. For "first plan revision" or
     // "reactivated", insert at the top; otherwise replace the row.
@@ -739,35 +793,73 @@ async fn home_event_fragment(
     };
     let session_row = ui::SessionRow {
         session: session.clone(),
+        review_gate: review_gate_for_row(&state, &sid, active_plan_state.as_deref()).await?,
         active_plan_state,
+        is_repo_effective: state
+            .lifecycle
+            .is_repo_effective_session(&sid)
+            .await
+            .map_err(AppError::lifecycle)?,
         finished,
     };
-    // Insert vs replace dispatch for the sessions-table OOB fragment.
-    // INSERT happens when the row is not currently in the rendered
-    // table: either the session is being reactivated (was hidden by
-    // archived_at) or this is the very first plan_revision for the
-    // session's very first plan. A `plan_revision_created` for the
-    // second plan in a session (e.g. after archive + start-new
-    // lifecycle) targets an existing row and must REPLACE.
-    let is_first_plan_first_revision = if ev.kind == "plan_revision_created" {
-        let revision_count =
-            plan_revisions::count_for_plan(&state.pool, ev.plan_id.unwrap_or(-1))
-                .await
-                .map_err(AppError::sqlx)?;
-        let total_plans_for_session: i64 =
-            sqlx::query_scalar("SELECT COUNT(*) FROM plans WHERE session_id = ?")
-                .bind(&session.id)
-                .fetch_one(&state.pool)
-                .await
-                .map_err(AppError::sqlx)?;
-        revision_count == 1 && total_plans_for_session == 1
-    } else {
-        false
+    let payload: serde_json::Value =
+        serde_json::from_str(&ev.payload).unwrap_or(serde_json::Value::Null);
+    let prior_presence = home_row_prior_presence(ev, &payload);
+    let projection = ui::project_row(prior_presence, ui::RowPresence::Rendered);
+    let table_fragment = match projection {
+        ui::RowProjection::Insert => ui::session_table_row_insert(&session_row),
+        ui::RowProjection::Replace => ui::session_table_row_replace(&session_row),
+        ui::RowProjection::Remove => ui::session_table_row_remove(&ev.session_id),
+        ui::RowProjection::Noop => maud::html! {},
     };
-    let table_fragment = if ev.kind == "session_reactivated" || is_first_plan_first_revision {
-        ui::session_table_row_insert(&session_row)
+    let previous_claim_fragment = if ev.kind == "session_claimed"
+        && let Some(previous_session_id) =
+            payload.get("previous_session_id").and_then(|v| v.as_str())
+        && let Some(previous) = sessions::fetch(&state.pool, &SessionId::from(previous_session_id))
+            .await
+            .map_err(AppError::sqlx)?
+    {
+        let previous_sid = SessionId::from(previous.id.as_str());
+        let previous_active_plan_state = if let Some(id) = previous.active_plan_id {
+            plans::fetch(&state.pool, id)
+                .await
+                .map_err(AppError::sqlx)?
+                .map(|p| p.state)
+        } else {
+            None
+        };
+        let previous_finished = if previous_active_plan_state.is_none() {
+            let row: Option<(i64,)> = sqlx::query_as(
+                "SELECT id FROM plans WHERE session_id = ? AND state = 'finished' \
+                     ORDER BY finished_at DESC, id DESC LIMIT 1",
+            )
+            .bind(&previous.id)
+            .fetch_optional(&state.pool)
+            .await
+            .map_err(AppError::sqlx)?;
+            row.is_some()
+        } else {
+            false
+        };
+        let previous_row = ui::SessionRow {
+            review_gate: review_gate_for_row(
+                state,
+                &previous_sid,
+                previous_active_plan_state.as_deref(),
+            )
+            .await?,
+            is_repo_effective: state
+                .lifecycle
+                .is_repo_effective_session(&previous_sid)
+                .await
+                .map_err(AppError::lifecycle)?,
+            session: previous,
+            active_plan_state: previous_active_plan_state,
+            finished: previous_finished,
+        };
+        ui::session_table_row_replace(&previous_row)
     } else {
-        ui::session_table_row_replace(&session_row)
+        maud::html! {}
     };
 
     // Build the timeline-row OOB. For finished sessions (or any session
@@ -782,8 +874,41 @@ async fn home_event_fragment(
 
     Ok(maud::html! {
         (table_fragment)
+        (previous_claim_fragment)
         (timeline_fragment)
     })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HomeRowPayloadProjection {
+    Insert,
+    Replace,
+}
+
+impl HomeRowPayloadProjection {
+    fn parse(payload: &serde_json::Value) -> Option<Self> {
+        match payload.get("home_row_projection").and_then(|v| v.as_str()) {
+            Some("insert") => Some(Self::Insert),
+            Some("replace") => Some(Self::Replace),
+            _ => None,
+        }
+    }
+}
+
+fn home_row_prior_presence(
+    ev: &crate::storage::events::Event,
+    payload: &serde_json::Value,
+) -> ui::RowPresence {
+    match ev.kind.as_str() {
+        "session_reactivated" => ui::RowPresence::NotRendered,
+        "plan_revision_created"
+            if HomeRowPayloadProjection::parse(payload)
+                == Some(HomeRowPayloadProjection::Insert) =>
+        {
+            ui::RowPresence::NotRendered
+        }
+        _ => ui::RowPresence::Rendered,
+    }
 }
 
 async fn session_max_event_id(pool: &sqlx::SqlitePool, sid: &SessionId) -> Result<i64, AppError> {
@@ -826,7 +951,11 @@ async fn plan_revision_view(
         .await
         .map_err(AppError::sqlx)?;
     let next: Option<plan_revisions::PlanRevision> =
-        sqlx::query_as("SELECT * FROM plan_revisions WHERE plan_id = ? AND revision_number = ?")
+        sqlx::query_as(
+            "SELECT pr.id, s.rowid AS plan_id, pr.revision_number, pr.content_hash, pr.body, pr.created_at \
+             FROM plan_revisions pr JOIN sessions s ON s.id = pr.session_id \
+             WHERE s.rowid = ? AND pr.revision_number = ?",
+        )
             .bind(plan.id)
             .bind(rev.revision_number + 1)
             .fetch_optional(&state.pool)
@@ -927,6 +1056,7 @@ async fn feedback_targeting_plan_revision(
                 feedback_id: r.id,
                 author_label: r.author_label.as_str().to_string(),
                 feedback_kind: FeedbackKind::Plan.as_str().to_string(),
+                verdict: crate::review_state::parse_verdict(&r.body),
                 file_status,
                 file_path,
                 body_html: render_markdown(&r.body),
@@ -982,6 +1112,19 @@ async fn delete_session(
     Ok(redirect_home())
 }
 
+async fn claim_session(
+    State(state): State<AppState>,
+    Path(session_id): Path<String>,
+) -> Result<Response, AppError> {
+    let sid = SessionId::from(session_id.clone());
+    state
+        .lifecycle
+        .claim_repo_effective_session(&sid, "system:operator")
+        .await
+        .map_err(AppError::lifecycle)?;
+    Ok(redirect_session(&session_id))
+}
+
 async fn finish_session(
     State(state): State<AppState>,
     Path(session_id): Path<String>,
@@ -995,12 +1138,51 @@ async fn finish_session(
     Ok(redirect_home())
 }
 
+#[derive(serde::Deserialize)]
+struct ReviewGateOverrideForm {
+    phase: String,
+    state: String,
+}
+
+async fn review_gate_override(
+    State(state): State<AppState>,
+    Path(session_id): Path<String>,
+    axum::extract::Form(form): axum::extract::Form<ReviewGateOverrideForm>,
+) -> Result<Response, AppError> {
+    let sid = SessionId::from(session_id.clone());
+    let phase = ReviewPhase::parse(&form.phase)
+        .ok_or_else(|| AppError::bad(format!("invalid review phase `{}`", form.phase)))?;
+    let gate_state = ReviewGateState::parse(&form.state)
+        .ok_or_else(|| AppError::bad(format!("invalid review gate state `{}`", form.state)))?;
+    if matches!(gate_state, ReviewGateState::NeedsReview) {
+        return Err(AppError::bad(
+            "review gate override must be ready or changes_requested",
+        ));
+    }
+    state
+        .lifecycle
+        .override_review_gate(&sid, phase, gate_state, "system:operator")
+        .await
+        .map_err(AppError::lifecycle)?;
+    Ok(redirect_session(&session_id))
+}
+
 fn redirect_home() -> Response {
     use axum::http::{HeaderValue, StatusCode, header};
     let mut resp = Response::new(axum::body::Body::empty());
     *resp.status_mut() = StatusCode::SEE_OTHER;
     resp.headers_mut()
         .insert(header::LOCATION, HeaderValue::from_static("/"));
+    resp
+}
+
+fn redirect_session(session_id: &str) -> Response {
+    use axum::http::{HeaderValue, StatusCode, header};
+    let mut resp = Response::new(axum::body::Body::empty());
+    *resp.status_mut() = StatusCode::SEE_OTHER;
+    let location = HeaderValue::from_str(&format!("/sessions/{session_id}"))
+        .unwrap_or_else(|_| HeaderValue::from_static("/"));
+    resp.headers_mut().insert(header::LOCATION, location);
     resp
 }
 

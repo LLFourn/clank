@@ -29,7 +29,6 @@ use crate::domain::FeedbackKind;
 use crate::feedback_path::is_valid_slug;
 use crate::lifecycle::{AgentLabel, PlanFilePath, SessionId};
 
-
 #[derive(Debug)]
 pub enum WatcherEvent {
     PlanFileDirty {
@@ -101,8 +100,7 @@ pub struct Watcher {
 impl Watcher {
     pub fn start(
         debounce_timeout: Duration,
-    ) -> anyhow::Result<(std::sync::Arc<Self>, mpsc::UnboundedReceiver<WatcherEvent>)>
-    {
+    ) -> anyhow::Result<(std::sync::Arc<Self>, mpsc::UnboundedReceiver<WatcherEvent>)> {
         let (event_tx, event_rx) = mpsc::unbounded_channel::<WatcherEvent>();
         let (debouncer_tx, mut debouncer_rx) = mpsc::unbounded_channel::<DebounceEventResult>();
 
@@ -275,8 +273,12 @@ impl Watcher {
     /// here become `WatcherEvent::PlanDirFileCreated` so the dispatcher
     /// can auto-register fresh plan files dropped into the directory.
     pub fn watch_plan_dir(&self, repo_root: &Path, plans_dir: &Path) -> anyhow::Result<()> {
-        let canonical = canonicalize_or_warn("plans dir", plans_dir)
-            .ok_or_else(|| anyhow::anyhow!("watcher: cannot canonicalize plans dir {}", plans_dir.display()))?;
+        let canonical = canonicalize_or_warn("plans dir", plans_dir).ok_or_else(|| {
+            anyhow::anyhow!(
+                "watcher: cannot canonicalize plans dir {}",
+                plans_dir.display()
+            )
+        })?;
         let mut inner = self.inner.lock().unwrap();
         if inner.plan_dirs.contains_key(&canonical) {
             return Ok(());
@@ -405,12 +407,7 @@ fn collect_emits(
                         // in-place edit or atomic-rename save — not a
                         // reactivation trigger.
                         if seen.insert(path.clone()) {
-                            let key = (
-                                5_u8,
-                                path.clone(),
-                                SessionId::from(String::new()),
-                                None,
-                            );
+                            let key = (5_u8, path.clone(), SessionId::from(String::new()), None);
                             if !dedupe.contains(&key) {
                                 dedupe.push(key);
                                 out.push(WatcherEvent::PlanDirFileCreated {

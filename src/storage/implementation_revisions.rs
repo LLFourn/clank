@@ -1,5 +1,5 @@
 //! CRUD on the `implementation_revisions` table. A row is a registered git
-//! commit snapshot inside a single `plan_id`.
+//! commit snapshot for a session's implementation.
 
 use sqlx::SqlitePool;
 
@@ -8,6 +8,7 @@ use crate::lifecycle::{CommitSha, CommitSnapshot};
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub struct ImplementationRevision {
     pub id: i64,
+    /// Compatibility projection: the owning session rowid.
     pub plan_id: i64,
     pub commit_sha: String,
     pub parent_sha: Option<String>,
@@ -22,7 +23,11 @@ pub struct ImplementationRevision {
 
 pub async fn fetch(pool: &SqlitePool, id: i64) -> sqlx::Result<Option<ImplementationRevision>> {
     sqlx::query_as::<_, ImplementationRevision>(
-        "SELECT * FROM implementation_revisions WHERE id = ?",
+        "SELECT ir.id, s.rowid AS plan_id, ir.commit_sha, ir.parent_sha, ir.branch, \
+                ir.commit_message, ir.diff_stat, ir.worktree_status, ir.is_head, \
+                ir.registered_by, ir.created_at \
+         FROM implementation_revisions ir JOIN sessions s ON s.id = ir.session_id \
+         WHERE ir.id = ?",
     )
     .bind(id)
     .fetch_optional(pool)
@@ -35,7 +40,11 @@ pub async fn fetch_by_sha(
     commit_sha: &CommitSha,
 ) -> sqlx::Result<Option<ImplementationRevision>> {
     sqlx::query_as::<_, ImplementationRevision>(
-        "SELECT * FROM implementation_revisions WHERE plan_id = ? AND commit_sha = ?",
+        "SELECT ir.id, s.rowid AS plan_id, ir.commit_sha, ir.parent_sha, ir.branch, \
+                ir.commit_message, ir.diff_stat, ir.worktree_status, ir.is_head, \
+                ir.registered_by, ir.created_at \
+         FROM implementation_revisions ir JOIN sessions s ON s.id = ir.session_id \
+         WHERE s.rowid = ? AND ir.commit_sha = ?",
     )
     .bind(plan_id)
     .bind(commit_sha.as_str())
@@ -48,7 +57,11 @@ pub async fn list_for_plan(
     plan_id: i64,
 ) -> sqlx::Result<Vec<ImplementationRevision>> {
     sqlx::query_as::<_, ImplementationRevision>(
-        "SELECT * FROM implementation_revisions WHERE plan_id = ? ORDER BY id ASC",
+        "SELECT ir.id, s.rowid AS plan_id, ir.commit_sha, ir.parent_sha, ir.branch, \
+                ir.commit_message, ir.diff_stat, ir.worktree_status, ir.is_head, \
+                ir.registered_by, ir.created_at \
+         FROM implementation_revisions ir JOIN sessions s ON s.id = ir.session_id \
+         WHERE s.rowid = ? ORDER BY ir.id ASC",
     )
     .bind(plan_id)
     .fetch_all(pool)
@@ -60,7 +73,11 @@ pub async fn latest_for_plan(
     plan_id: i64,
 ) -> sqlx::Result<Option<ImplementationRevision>> {
     sqlx::query_as::<_, ImplementationRevision>(
-        "SELECT * FROM implementation_revisions WHERE plan_id = ? ORDER BY id DESC LIMIT 1",
+        "SELECT ir.id, s.rowid AS plan_id, ir.commit_sha, ir.parent_sha, ir.branch, \
+                ir.commit_message, ir.diff_stat, ir.worktree_status, ir.is_head, \
+                ir.registered_by, ir.created_at \
+         FROM implementation_revisions ir JOIN sessions s ON s.id = ir.session_id \
+         WHERE s.rowid = ? ORDER BY ir.id DESC LIMIT 1",
     )
     .bind(plan_id)
     .fetch_optional(pool)
@@ -80,8 +97,8 @@ where
 {
     let result = sqlx::query(
         "INSERT INTO implementation_revisions \
-         (plan_id, commit_sha, parent_sha, branch, commit_message, diff_stat, worktree_status, is_head, registered_by, created_at) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+         (session_id, commit_sha, parent_sha, branch, commit_message, diff_stat, worktree_status, is_head, registered_by, created_at) \
+         VALUES ((SELECT id FROM sessions WHERE rowid = ?), ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(plan_id)
     .bind(commit.sha.as_str())

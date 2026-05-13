@@ -245,6 +245,7 @@ pub fn run_git(cwd: &Path, args: &[&str]) -> String {
 fn label_arg_for(tool: &str) -> Option<&'static str> {
     match tool {
         "register_plan_file" => Some("label"),
+        "claim_session" => Some("label"),
         "get_context" => Some("author_label"),
         _ => None,
     }

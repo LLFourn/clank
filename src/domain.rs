@@ -175,9 +175,11 @@ pub enum EventKind {
     DirtyWorktreeWarning,
     HeadResetToKnownSha,
     PlanFinished,
+    SessionClaimed,
     // Feedback (emitted by SessionService::put_feedback)
     FeedbackAdded,
     FeedbackUpdated,
+    ReviewGateChanged,
     // Session/agent metadata
     AgentJoined,
     Renamed,
@@ -196,8 +198,10 @@ impl EventKind {
             EventKind::DirtyWorktreeWarning => "dirty_worktree_warning",
             EventKind::HeadResetToKnownSha => "head_reset_to_known_sha",
             EventKind::PlanFinished => "plan_finished",
+            EventKind::SessionClaimed => "session_claimed",
             EventKind::FeedbackAdded => "feedback_added",
             EventKind::FeedbackUpdated => "feedback_updated",
+            EventKind::ReviewGateChanged => "review_gate_changed",
             EventKind::AgentJoined => "agent_joined",
             EventKind::Renamed => "renamed",
             EventKind::PlanFileMissing => "plan_file_missing",

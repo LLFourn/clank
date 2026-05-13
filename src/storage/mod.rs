@@ -10,6 +10,8 @@ pub mod feedback_files;
 pub mod implementation_revisions;
 pub mod plan_revisions;
 pub mod plans;
+pub mod repo_effective_sessions;
+pub mod review_gate_overrides;
 pub mod sessions;
 
 pub async fn open_pool(path: &Path) -> anyhow::Result<SqlitePool> {

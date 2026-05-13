@@ -38,10 +38,13 @@ async fn fixture_parses_as_json_with_all_v1_keys() {
         "repo_root",
         "plan_file_path",
         "git_logs_head_path",
+        "repo_effective_session_id",
+        "is_repo_effective",
         "phase",
         "expected_action",
         "completion_artifact",
         "commit_policy",
+        "review_gate",
         "review_target",
         "latest_plan_revision",
         "latest_implementation_revision",
@@ -55,8 +58,8 @@ async fn fixture_parses_as_json_with_all_v1_keys() {
         );
     }
     assert_eq!(v["schema_version"], 1);
-    assert_eq!(v["expected_action"], "implement_and_commit");
-    assert_eq!(v["completion_artifact"], "git_commit");
+    assert_eq!(v["expected_action"], "write_impl_feedback");
+    assert_eq!(v["completion_artifact"], "implementation_feedback_file");
     assert_eq!(v["commit_policy"]["initial_impl"], "create_commit");
     assert!(v["other_feedback_files"]["plan"].is_array());
     assert!(v["other_feedback_files"]["impl"].is_array());
@@ -112,7 +115,7 @@ async fn planning_phase_prior_feedback_is_empty() {
         .await
         .unwrap();
     assert_eq!(r["phase"], "planning");
-    assert_eq!(r["expected_action"], "review_plan_or_update_plan_file");
+    assert_eq!(r["expected_action"], "write_plan_feedback");
     assert_eq!(
         r["completion_artifact"],
         "plan_revision_or_plan_feedback_file"
@@ -218,6 +221,184 @@ async fn review_target_is_plan_revision_during_planning() {
 }
 
 #[tokio::test]
+async fn review_gate_ready_requires_current_approval_from_all_verdict_participants() {
+    let app = TestApp::spawn().await;
+    register(&app, "s").await;
+    let canonical_repo = dunce::canonicalize(&app.repo).unwrap();
+    let plan_dir = canonical_repo
+        .join(".trinity")
+        .join("feedback")
+        .join("s")
+        .join("plan");
+    std::fs::write(plan_dir.join("rev-a.md"), "APPROVE\nlooks good\n").unwrap();
+    std::fs::write(plan_dir.join("notes.md"), "some notes\n").unwrap();
+    tokio::time::sleep(SETTLE).await;
+
+    let r = app
+        .call("get_context", &app.repo, None, json!({"session_id": "s"}))
+        .await
+        .unwrap();
+    assert_eq!(r["review_gate"]["state"], "ready");
+    assert_eq!(r["review_gate"]["participants"], json!(["rev-a"]));
+    assert_eq!(r["review_gate"]["approvals"], json!(["rev-a"]));
+    assert_eq!(r["review_gate"]["unmarked"], json!(["notes"]));
+    assert_eq!(r["expected_action"], "implement_and_commit");
+}
+
+#[tokio::test]
+async fn ready_plan_requires_claim_when_session_is_not_repo_effective() {
+    let app = TestApp::spawn().await;
+    let plan_a = app.repo.join("plan-a.md");
+    let plan_b = app.repo.join("plan-b.md");
+    std::fs::write(&plan_a, "# a\n").unwrap();
+    std::fs::write(&plan_b, "# b\n").unwrap();
+    app.call(
+        "register_plan_file",
+        &app.repo,
+        None,
+        json!({"session_id": "a", "path": &plan_a, "label": "m"}),
+    )
+    .await
+    .unwrap();
+    app.call(
+        "register_plan_file",
+        &app.repo,
+        None,
+        json!({"session_id": "b", "path": &plan_b, "label": "m"}),
+    )
+    .await
+    .unwrap();
+
+    let canonical_repo = dunce::canonicalize(&app.repo).unwrap();
+    let plan_dir_b = canonical_repo
+        .join(".trinity")
+        .join("feedback")
+        .join("b")
+        .join("plan");
+    std::fs::write(plan_dir_b.join("rev-a.md"), "APPROVE\nlooks good\n").unwrap();
+    tokio::time::sleep(SETTLE).await;
+
+    let before_claim = app
+        .call("get_context", &app.repo, None, json!({"session_id": "b"}))
+        .await
+        .unwrap();
+    assert_eq!(before_claim["is_repo_effective"], false);
+    assert_eq!(before_claim["repo_effective_session_id"], "a");
+    assert_eq!(before_claim["review_gate"]["state"], "ready");
+    assert_eq!(before_claim["expected_action"], "claim_for_implementation");
+
+    let resp = app.post_form("/sessions/b/claim", "").await;
+    assert_eq!(resp.status(), reqwest::StatusCode::SEE_OTHER);
+
+    let after_claim = app
+        .call("get_context", &app.repo, None, json!({"session_id": "b"}))
+        .await
+        .unwrap();
+    assert_eq!(after_claim["is_repo_effective"], true);
+    assert_eq!(after_claim["repo_effective_session_id"], "b");
+    assert_eq!(after_claim["expected_action"], "implement_and_commit");
+}
+
+#[tokio::test]
+async fn new_plan_revision_makes_prior_plan_approval_stale() {
+    let app = TestApp::spawn().await;
+    register(&app, "s").await;
+    let canonical_repo = dunce::canonicalize(&app.repo).unwrap();
+    let plan_dir = canonical_repo
+        .join(".trinity")
+        .join("feedback")
+        .join("s")
+        .join("plan");
+    std::fs::write(plan_dir.join("rev-a.md"), "APPROVE\nlooks good\n").unwrap();
+    tokio::time::sleep(SETTLE).await;
+
+    let ready = app
+        .call("get_context", &app.repo, None, json!({"session_id": "s"}))
+        .await
+        .unwrap();
+    assert_eq!(ready["review_gate"]["state"], "ready");
+
+    std::fs::write(app.repo.join("plan.md"), "# revised\n").unwrap();
+    tokio::time::sleep(SETTLE).await;
+
+    let stale = app
+        .call("get_context", &app.repo, None, json!({"session_id": "s"}))
+        .await
+        .unwrap();
+    assert_eq!(stale["review_gate"]["state"], "needs_review");
+    assert_eq!(stale["review_gate"]["participants"], json!(["rev-a"]));
+    assert_eq!(stale["review_gate"]["missing_approvals"], json!(["rev-a"]));
+    assert_eq!(stale["expected_action"], "write_plan_feedback");
+}
+
+#[tokio::test]
+async fn operator_override_sets_gate_until_target_changes() {
+    let app = TestApp::spawn().await;
+    register(&app, "s").await;
+
+    let resp = app
+        .post_form("/sessions/s/review_gate_override", "phase=plan&state=ready")
+        .await;
+    assert_eq!(resp.status(), reqwest::StatusCode::SEE_OTHER);
+
+    let overridden = app
+        .call("get_context", &app.repo, None, json!({"session_id": "s"}))
+        .await
+        .unwrap();
+    assert_eq!(overridden["review_gate"]["state"], "ready");
+    assert_eq!(
+        overridden["review_gate"]["override"]["actor"],
+        "system:operator"
+    );
+    assert_eq!(overridden["expected_action"], "implement_and_commit");
+
+    std::fs::write(app.repo.join("plan.md"), "# target changed\n").unwrap();
+    tokio::time::sleep(SETTLE).await;
+
+    let after_change = app
+        .call("get_context", &app.repo, None, json!({"session_id": "s"}))
+        .await
+        .unwrap();
+    assert_eq!(after_change["review_gate"]["state"], "needs_review");
+    assert!(after_change["review_gate"]["override"].is_null());
+}
+
+#[tokio::test]
+async fn operator_override_impl_sticky_until_new_commit() {
+    let app = TestApp::spawn().await;
+    register(&app, "s").await;
+    make_commit(&app.repo, "impl.txt", "v1\n");
+    tokio::time::sleep(SETTLE).await;
+
+    let resp = app
+        .post_form("/sessions/s/review_gate_override", "phase=impl&state=ready")
+        .await;
+    assert_eq!(resp.status(), reqwest::StatusCode::SEE_OTHER);
+
+    let overridden = app
+        .call("get_context", &app.repo, None, json!({"session_id": "s"}))
+        .await
+        .unwrap();
+    assert_eq!(overridden["review_gate"]["state"], "ready");
+    assert_eq!(
+        overridden["review_gate"]["override"]["actor"],
+        "system:operator"
+    );
+    assert_eq!(overridden["expected_action"], "ready_to_finish");
+
+    make_commit(&app.repo, "impl.txt", "v2\n");
+    tokio::time::sleep(SETTLE).await;
+
+    let after_change = app
+        .call("get_context", &app.repo, None, json!({"session_id": "s"}))
+        .await
+        .unwrap();
+    assert_eq!(after_change["review_gate"]["state"], "needs_review");
+    assert!(after_change["review_gate"]["override"].is_null());
+    assert_eq!(after_change["expected_action"], "write_impl_feedback");
+}
+
+#[tokio::test]
 async fn review_target_is_implementation_commit_during_implementing() {
     let app = TestApp::spawn().await;
     register(&app, "s").await;
@@ -228,14 +409,50 @@ async fn review_target_is_implementation_commit_during_implementing() {
         .await
         .unwrap();
     assert_eq!(r["phase"], "implementing");
-    assert_eq!(r["expected_action"], "implement_and_commit");
-    assert_eq!(r["completion_artifact"], "git_commit");
+    assert_eq!(r["expected_action"], "write_impl_feedback");
+    assert_eq!(r["completion_artifact"], "implementation_feedback_file");
     assert_eq!(r["commit_policy"]["initial_impl"], "create_commit");
     assert_eq!(
         r["commit_policy"]["addressing_impl_feedback"],
         "amend_latest_impl_commit_unless_user_requests_new_commit"
     );
     assert_eq!(r["review_target"]["kind"], "implementation_commit");
+}
+
+#[tokio::test]
+async fn new_implementation_commit_makes_prior_impl_approval_stale() {
+    let app = TestApp::spawn().await;
+    register(&app, "s").await;
+    make_commit(&app.repo, "impl.txt", "v1\n");
+    tokio::time::sleep(SETTLE).await;
+
+    let canonical_repo = dunce::canonicalize(&app.repo).unwrap();
+    let impl_dir = canonical_repo
+        .join(".trinity")
+        .join("feedback")
+        .join("s")
+        .join("impl");
+    std::fs::write(impl_dir.join("rev-a.md"), "APPROVE\nworks\n").unwrap();
+    tokio::time::sleep(SETTLE).await;
+
+    let ready = app
+        .call("get_context", &app.repo, None, json!({"session_id": "s"}))
+        .await
+        .unwrap();
+    assert_eq!(ready["phase"], "implementing");
+    assert_eq!(ready["review_gate"]["state"], "ready");
+    assert_eq!(ready["expected_action"], "ready_to_finish");
+
+    make_commit(&app.repo, "impl.txt", "v2\n");
+    tokio::time::sleep(SETTLE).await;
+
+    let stale = app
+        .call("get_context", &app.repo, None, json!({"session_id": "s"}))
+        .await
+        .unwrap();
+    assert_eq!(stale["review_gate"]["state"], "needs_review");
+    assert_eq!(stale["review_gate"]["participants"], json!(["rev-a"]));
+    assert_eq!(stale["review_gate"]["missing_approvals"], json!(["rev-a"]));
 }
 
 /// no_active_plan → write_feedback is `null`, prior_feedback is `null`.

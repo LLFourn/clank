@@ -30,7 +30,7 @@ pub use service::{
 pub use watcher::{Watcher, WatcherEvent};
 
 use crate::lifecycle::{CommitSha, Observation, PlanFilePath, SessionId, content_hash};
-use crate::storage::sessions;
+use crate::storage::{plans, sessions};
 
 #[derive(Args, Debug, Clone)]
 pub struct ServeArgs {
@@ -130,23 +130,11 @@ async fn recover(
     lifecycle: &Arc<SessionService>,
     watcher: &Arc<Watcher>,
 ) -> anyhow::Result<()> {
-    for sid in lifecycle
-        .archive_superseded_active_sessions("system:recover")
-        .await?
-    {
-        tracing::info!(
-            session_id = sid.as_str(),
-            "recovery: archived superseded active session"
-        );
-    }
-
     // Discover known repos and attach plan-dir watchers; also scan each
     // for `.md` files that have no session yet and auto-register them.
-    let known_repos: Vec<String> = sqlx::query_scalar(
-        "SELECT DISTINCT repo_root FROM sessions",
-    )
-    .fetch_all(pool)
-    .await?;
+    let known_repos: Vec<String> = sqlx::query_scalar("SELECT DISTINCT repo_root FROM sessions")
+        .fetch_all(pool)
+        .await?;
     for repo_str in known_repos {
         let repo_root = Path::new(&repo_str);
         let plans_dir = repo_root.join(".trinity").join("plans");
@@ -189,11 +177,11 @@ async fn recover(
             let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
                 continue;
             };
-            let resolved =
-                match resolve_auto_register_session_id(lifecycle, stem, &repo_str).await {
-                    Ok(Some(id)) => id,
-                    _ => continue,
-                };
+            let resolved = match resolve_auto_register_session_id(lifecycle, stem, &repo_str).await
+            {
+                Ok(Some(id)) => id,
+                _ => continue,
+            };
             let same_repo_match = sessions::fetch(pool, &resolved)
                 .await?
                 .map(|s| s.repo_root == repo_str)
@@ -201,8 +189,13 @@ async fn recover(
             if same_repo_match {
                 continue;
             }
-            if let Err(err) =
-                dispatch_plan_dir_file_created(lifecycle, repo_root, &path).await
+            if let Err(err) = dispatch_plan_dir_file_created(
+                lifecycle,
+                repo_root,
+                &path,
+                crate::lifecycle::ActivationSource::RecoveryScan,
+            )
+            .await
             {
                 tracing::warn!(path = %path.display(), error = ?err, "recovery: auto-register scan failed");
             }
@@ -492,8 +485,13 @@ fn spawn_watcher_dispatch(
                     }
                 }
                 WatcherEvent::PlanDirFileCreated { repo_root, path } => {
-                    if let Err(err) =
-                        dispatch_plan_dir_file_created(&lifecycle, &repo_root, &path).await
+                    if let Err(err) = dispatch_plan_dir_file_created(
+                        &lifecycle,
+                        &repo_root,
+                        &path,
+                        crate::lifecycle::ActivationSource::AutoRegisterFreshDrop,
+                    )
+                    .await
                     {
                         tracing::warn!(path = %path.display(), error = ?err, "watcher plan-dir dispatch failed");
                     }
@@ -510,6 +508,7 @@ async fn dispatch_plan_dir_file_created(
     lifecycle: &Arc<SessionService>,
     repo_root: &Path,
     path: &Path,
+    source: crate::lifecycle::ActivationSource,
 ) -> anyhow::Result<()> {
     let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
         return Ok(());
@@ -536,18 +535,18 @@ async fn dispatch_plan_dir_file_created(
 
     // Pick a session_id, disambiguating with a repo-derived suffix if the
     // bare basename is already used by a different repo (plan §9).
-    let session_id =
-        match resolve_auto_register_session_id(lifecycle, stem, &repo_root_str).await? {
-            Some(id) => id,
-            None => {
-                tracing::warn!(
-                    stem,
-                    repo_root = %repo_root_str,
-                    "auto-register: could not pick a unique session_id; skipping"
-                );
-                return Ok(());
-            }
-        };
+    let session_id = match resolve_auto_register_session_id(lifecycle, stem, &repo_root_str).await?
+    {
+        Some(id) => id,
+        None => {
+            tracing::warn!(
+                stem,
+                repo_root = %repo_root_str,
+                "auto-register: could not pick a unique session_id; skipping"
+            );
+            return Ok(());
+        }
+    };
 
     let existing = sessions::fetch(lifecycle.pool(), &session_id).await?;
 
@@ -559,21 +558,8 @@ async fn dispatch_plan_dir_file_created(
             // Reactivation on a true fresh drop (remove+re-create or a
             // never-before-seen path) is the auto-register contract.
             lifecycle
-                .reactivate_session(
-                    &session_id,
-                    &repo_root_str,
-                    &plan_path,
-                    body,
-                    head,
-                    actor,
-                )
+                .reactivate_session(&session_id, &repo_root_str, &plan_path, body, head, actor)
                 .await?;
-            // Maintain "at most one active session per repo" invariant.
-            lifecycle
-                .archive_other_active_sessions_in_repo(&repo_root_str, &session_id, actor)
-                .await?;
-            attach_session_watchers(lifecycle, &session_id, repo_root).await?;
-            scan_feedback_dir_for_session(lifecycle, repo_root, &session_id).await;
             return Ok(());
         }
         // Active session already registered; per-file watcher handles edits.
@@ -593,9 +579,6 @@ async fn dispatch_plan_dir_file_created(
     )
     .await?;
     lifecycle
-        .archive_other_active_sessions_in_repo(&repo_root_str, &session_id, actor)
-        .await?;
-    lifecycle
         .observe(
             &session_id,
             actor,
@@ -603,13 +586,10 @@ async fn dispatch_plan_dir_file_created(
                 path: plan_path,
                 body,
                 head,
+                source,
             },
         )
         .await?;
-    // `observe(PlanRegistered)` attached the per-file plan watcher.
-    // Attach git-logs/HEAD, both feedback dirs, and the plan-dir
-    // watcher (shared with reactivation + explicit register paths).
-    attach_session_watchers(lifecycle, &session_id, repo_root).await?;
     Ok(())
 }
 
@@ -671,7 +651,7 @@ async fn resolve_auto_register_session_id(
 /// three paths on the same helper prevents the reactivation-misses-
 /// watcher class of bug.
 pub(crate) async fn attach_session_watchers(
-    lifecycle: &Arc<SessionService>,
+    lifecycle: &SessionService,
     session_id: &SessionId,
     repo_root: &Path,
 ) -> anyhow::Result<()> {
@@ -717,27 +697,27 @@ pub(crate) async fn attach_session_watchers(
 }
 
 /// Walk the session's feedback `plan/` and `impl/` directories and
-/// re-ingest every `<author>.md` file currently on disk. Used after
-/// reactivation: notify mtimes haven't changed since the previous
-/// archive, so the ordinary watcher won't fire for these files.
+/// observe every `<author>.md` file currently on disk. Used after
+/// registration to discover files that predate watcher attachment, and
+/// after reactivation to replay unchanged files against the new active
+/// plan.
 pub(crate) async fn scan_feedback_dir_for_session(
-    lifecycle: &Arc<SessionService>,
+    lifecycle: &SessionService,
     repo_root: &Path,
     session_id: &SessionId,
+    force_reingest: bool,
 ) {
-    // Clear `last_observed_hash` on every sidecar row first so the
-    // `dispatch_feedback_changed` no-op guard doesn't short-circuit on
-    // an unchanged content hash. Active plan has changed; we need to
-    // route the same body against the new target.
-    if let Err(err) =
-        crate::storage::feedback_files::clear_observed_for_session(lifecycle.pool(), session_id)
-            .await
-    {
-        tracing::warn!(
-            session_id = session_id.as_str(),
-            error = ?err,
-            "reactivation drift scan: clear_observed failed"
-        );
+    if force_reingest {
+        if let Err(err) =
+            crate::storage::feedback_files::clear_observed_for_session(lifecycle.pool(), session_id)
+                .await
+        {
+            tracing::warn!(
+                session_id = session_id.as_str(),
+                error = ?err,
+                "feedback dir scan: clear_observed failed"
+            );
+        }
     }
     let feedback_root = repo_root
         .join(".trinity")
@@ -773,7 +753,7 @@ pub(crate) async fn scan_feedback_dir_for_session(
                     session_id = session_id.as_str(),
                     path = %path.display(),
                     error = ?err,
-                    "reactivation drift scan: feedback ingest failed"
+                    "feedback dir scan: feedback ingest failed"
                 );
             }
         }
@@ -798,6 +778,19 @@ async fn dispatch_head_moved(
         tracing::debug!(
             session_id = session_id.as_str(),
             "watcher: HEAD moved but no active plan; dropping"
+        );
+        return Ok(());
+    }
+    let effective_session = lifecycle
+        .repo_effective_session_id(&session.repo_root)
+        .await?
+        .map(|sid| sid.into_inner());
+    if effective_session.as_deref() != Some(session_id.as_str()) {
+        tracing::debug!(
+            session_id = session_id.as_str(),
+            repo_root = %session.repo_root,
+            effective_session = effective_session.as_deref(),
+            "watcher: HEAD moved but session is not in effect; dropping"
         );
         return Ok(());
     }
@@ -831,6 +824,51 @@ async fn dispatch_head_moved(
     Ok(())
 }
 
+async fn bootstrap_impl_target_from_head(
+    lifecycle: &SessionService,
+    session_id: &SessionId,
+) -> anyhow::Result<()> {
+    let session = sessions::fetch(lifecycle.pool(), session_id)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("session vanished: {}", session_id.as_str()))?;
+    let Some(active_plan_id) = session.active_plan_id else {
+        return Ok(());
+    };
+    let Some(plan) = plans::fetch(lifecycle.pool(), active_plan_id).await? else {
+        return Ok(());
+    };
+    if plan.state == "archived" || plan.state == "finished" {
+        return Ok(());
+    }
+
+    let repo = Path::new(&session.repo_root);
+    let head_sha = git::rev_parse_head(repo).await?;
+    let parent = git::parent_sha(repo, &head_sha).await?;
+    let branch = git::current_branch(repo).await?;
+    let message = git::commit_message(repo, &head_sha).await?;
+    let stat = git::diff_stat(repo, parent.as_deref(), &head_sha).await?;
+    let porcelain = git::worktree_porcelain(repo).await.unwrap_or_default();
+    let dirty = !porcelain.trim().is_empty();
+
+    let commit = crate::lifecycle::CommitSnapshot {
+        sha: CommitSha::from(head_sha),
+        parent_sha: parent.map(CommitSha::from),
+        branch,
+        message,
+        diff_stat: stat,
+        worktree_status: Some(if dirty { porcelain } else { "clean".into() }),
+        is_head: true,
+    };
+
+    Box::pin(lifecycle.observe(
+        session_id,
+        "system:feedback-bootstrap",
+        Observation::CommitObserved { commit },
+    ))
+    .await?;
+    Ok(())
+}
+
 /// Ingest a feedback markdown file dropped under a watched feedback
 /// directory. Computes the active review target (HEAD-derived for
 /// implementing plans, so the ingest target matches what `get_context`
@@ -842,7 +880,7 @@ async fn dispatch_head_moved(
 /// artifact it was written for; authors must edit the file to apply the
 /// same words to a newer target.
 async fn dispatch_feedback_changed(
-    lifecycle: &Arc<SessionService>,
+    lifecycle: &SessionService,
     session_id: &SessionId,
     feedback_kind: crate::domain::FeedbackKind,
     author_label: &crate::lifecycle::AgentLabel,
@@ -860,12 +898,6 @@ async fn dispatch_feedback_changed(
         Err(e) => return Err(e.into()),
     };
     let hash = blake3::hash(body.as_bytes()).to_hex().to_string();
-
-    // Resolve the kind's expected target. The parse_error sentinel for
-    // the None branches lives on `FeedbackTargetResolution`.
-    let resolution = lifecycle
-        .resolve_target_for_kind(session_id, feedback_kind)
-        .await?;
 
     let now = chrono::Utc::now().timestamp();
     let mut tx = lifecycle.pool().begin().await?;
@@ -896,11 +928,48 @@ async fn dispatch_feedback_changed(
     feedback_files::set_observed(&mut tx, session_id, feedback_kind, author_label, &hash, now)
         .await?;
 
+    if body.trim().is_empty() {
+        feedback_files::set_parse_error(
+            &mut tx,
+            session_id,
+            feedback_kind,
+            author_label,
+            "empty_body",
+            now,
+        )
+        .await?;
+        tx.commit().await?;
+        return Ok(());
+    }
+
+    // Commit the disk observation before any lifecycle bootstrap. The
+    // file sidecar should survive even if git/DB work below fails.
+    tx.commit().await?;
+
+    // Resolve the kind's expected target. An impl feedback file is a
+    // durable signal that implementation started; if the DB has lost
+    // that fact, reconstruct the current HEAD target before ingesting.
+    let mut resolution = lifecycle
+        .resolve_target_for_kind(session_id, feedback_kind)
+        .await?;
+    if feedback_kind == crate::domain::FeedbackKind::Impl
+        && matches!(
+            resolution,
+            crate::daemon::service::FeedbackTargetResolution::NoActiveImplTarget
+        )
+    {
+        bootstrap_impl_target_from_head(lifecycle, session_id).await?;
+        resolution = lifecycle
+            .resolve_target_for_kind(session_id, feedback_kind)
+            .await?;
+    }
+
     // Phase / kind gate: write parse_error sentinel via the typed
     // resolution; the strings live in `FeedbackTargetResolution::parse_error`.
     let target = match resolution {
         crate::daemon::service::FeedbackTargetResolution::Found(t) => t,
         other => {
+            let mut tx = lifecycle.pool().begin().await?;
             if let Some(sentinel) = other.parse_error() {
                 feedback_files::set_parse_error(
                     &mut tx,
@@ -916,25 +985,6 @@ async fn dispatch_feedback_changed(
             return Ok(());
         }
     };
-
-    if body.trim().is_empty() {
-        feedback_files::set_parse_error(
-            &mut tx,
-            session_id,
-            feedback_kind,
-            author_label,
-            "empty_body",
-            now,
-        )
-        .await?;
-        tx.commit().await?;
-        return Ok(());
-    }
-
-    // Commit the watcher observation before calling put_feedback;
-    // put_feedback opens its own transaction and we don't want them
-    // entangled.
-    tx.commit().await?;
 
     let target_ref = match target.kind {
         TargetKind::PlanRevision => target
@@ -993,7 +1043,7 @@ async fn dispatch_feedback_changed(
 /// `parse_error` so derived status flips to `missing`. Historical
 /// `feedback` rows are preserved — retraction is v2.
 async fn dispatch_feedback_missing(
-    lifecycle: &Arc<SessionService>,
+    lifecycle: &SessionService,
     session_id: &SessionId,
     feedback_kind: crate::domain::FeedbackKind,
     author_label: &crate::lifecycle::AgentLabel,

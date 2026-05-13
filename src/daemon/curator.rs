@@ -163,12 +163,20 @@ impl ApiError {
                     message: format!("invariant: {inc}"),
                 }
             }
-            super::LifecycleServiceError::Sql(e) => Self::sqlx(e),
-            super::LifecycleServiceError::Watcher(msg) => {
-                tracing::error!(error = %msg, "watcher attach failed");
+            super::LifecycleServiceError::Feedback(e) => {
+                tracing::error!(error = ?e, "feedback storage error");
                 Self {
                     status: StatusCode::INTERNAL_SERVER_ERROR,
-                    message: format!("watcher: {msg}"),
+                    message: format!("feedback storage: {e}"),
+                }
+            }
+            super::LifecycleServiceError::Sql(e) => Self::sqlx(e),
+            super::LifecycleServiceError::InvalidArgs(msg) => Self::bad(msg),
+            super::LifecycleServiceError::Watcher(err) => {
+                tracing::error!(error = ?err, "watcher attach failed");
+                Self {
+                    status: StatusCode::INTERNAL_SERVER_ERROR,
+                    message: format!("watcher: {err}"),
                 }
             }
             super::LifecycleServiceError::RepoMismatch {

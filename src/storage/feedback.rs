@@ -1,4 +1,4 @@
-//! Structural feedback storage. One row per `(plan_id, target, author)`;
+//! Structural feedback storage. One row per `(session, target, author)`;
 //! `put_feedback` upserts on that natural key.
 //!
 //! Two row types live here:
@@ -18,6 +18,7 @@ use crate::lifecycle::{AgentLabel, SessionId};
 pub(crate) struct FeedbackRow {
     pub id: i64,
     pub session_id: String,
+    /// Compatibility projection: the owning session rowid.
     pub plan_id: i64,
     pub target_kind: String,
     pub target_id: String,
@@ -97,8 +98,10 @@ where
     E: sqlx::Executor<'e, Database = sqlx::Sqlite>,
 {
     sqlx::query_as::<_, FeedbackRow>(
-        "SELECT * FROM feedback \
-         WHERE plan_id = ? AND target_kind = ? AND target_id = ? AND author_label = ?",
+        "SELECT f.id, f.session_id, s.rowid AS plan_id, f.target_kind, f.target_id, \
+                f.author_label, f.body, f.created_at, f.updated_at \
+         FROM feedback f JOIN sessions s ON s.id = f.session_id \
+         WHERE s.rowid = ? AND f.target_kind = ? AND f.target_id = ? AND f.author_label = ?",
     )
     .bind(plan_id)
     .bind(target_kind.as_str())
@@ -112,7 +115,7 @@ where
 pub(crate) async fn insert<'e, E>(
     executor: E,
     session_id: &SessionId,
-    plan_id: i64,
+    _plan_id: i64,
     target_kind: TargetKind,
     target_id: &str,
     author_label: &str,
@@ -124,12 +127,12 @@ where
 {
     let row = sqlx::query_as::<_, FeedbackRow>(
         "INSERT INTO feedback \
-            (session_id, plan_id, target_kind, target_id, author_label, body, created_at, updated_at) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?) \
-         RETURNING *",
+            (session_id, target_kind, target_id, author_label, body, created_at, updated_at) \
+         VALUES (?, ?, ?, ?, ?, ?, ?) \
+         RETURNING id, session_id, (SELECT rowid FROM sessions WHERE id = feedback.session_id) AS plan_id, \
+                   target_kind, target_id, author_label, body, created_at, updated_at",
     )
     .bind(session_id.as_str())
-    .bind(plan_id)
     .bind(target_kind.as_str())
     .bind(target_id)
     .bind(author_label)
@@ -151,7 +154,9 @@ where
     E: sqlx::Executor<'e, Database = sqlx::Sqlite>,
 {
     let row = sqlx::query_as::<_, FeedbackRow>(
-        "UPDATE feedback SET body = ?, updated_at = ? WHERE id = ? RETURNING *",
+        "UPDATE feedback SET body = ?, updated_at = ? WHERE id = ? \
+         RETURNING id, session_id, (SELECT rowid FROM sessions WHERE id = feedback.session_id) AS plan_id, \
+                   target_kind, target_id, author_label, body, created_at, updated_at",
     )
     .bind(new_body)
     .bind(now)
@@ -165,10 +170,15 @@ pub async fn fetch<'e, E>(executor: E, feedback_id: i64) -> Result<Option<Feedba
 where
     E: sqlx::Executor<'e, Database = sqlx::Sqlite>,
 {
-    let row = sqlx::query_as::<_, FeedbackRow>("SELECT * FROM feedback WHERE id = ?")
-        .bind(feedback_id)
-        .fetch_optional(executor)
-        .await?;
+    let row = sqlx::query_as::<_, FeedbackRow>(
+        "SELECT f.id, f.session_id, s.rowid AS plan_id, f.target_kind, f.target_id, \
+                f.author_label, f.body, f.created_at, f.updated_at \
+         FROM feedback f JOIN sessions s ON s.id = f.session_id \
+         WHERE f.id = ?",
+    )
+    .bind(feedback_id)
+    .fetch_optional(executor)
+    .await?;
     row.map(|r| r.into_record().map_err(Error::from))
         .transpose()
 }
@@ -179,7 +189,7 @@ fn decode_all(rows: Vec<FeedbackRow>) -> Result<Vec<FeedbackRecord>, Error> {
         .collect()
 }
 
-/// List rows for a specific plan_id, optionally filtered by target_kind,
+/// List rows for a specific session rowid, optionally filtered by target_kind,
 /// ordered by id ASC. Used by `current_feedback` and the archived-plan
 /// history pages.
 pub async fn list_for_plan<'e, E>(
@@ -193,7 +203,10 @@ where
     let rows = match filter {
         Some(kind) => {
             sqlx::query_as::<_, FeedbackRow>(
-                "SELECT * FROM feedback WHERE plan_id = ? AND target_kind = ? ORDER BY id ASC",
+                "SELECT f.id, f.session_id, s.rowid AS plan_id, f.target_kind, f.target_id, \
+                        f.author_label, f.body, f.created_at, f.updated_at \
+                 FROM feedback f JOIN sessions s ON s.id = f.session_id \
+                 WHERE s.rowid = ? AND f.target_kind = ? ORDER BY f.id ASC",
             )
             .bind(plan_id)
             .bind(kind.as_str())
@@ -202,7 +215,10 @@ where
         }
         None => {
             sqlx::query_as::<_, FeedbackRow>(
-                "SELECT * FROM feedback WHERE plan_id = ? ORDER BY id ASC",
+                "SELECT f.id, f.session_id, s.rowid AS plan_id, f.target_kind, f.target_id, \
+                        f.author_label, f.body, f.created_at, f.updated_at \
+                 FROM feedback f JOIN sessions s ON s.id = f.session_id \
+                 WHERE s.rowid = ? ORDER BY f.id ASC",
             )
             .bind(plan_id)
             .fetch_all(executor)
@@ -212,18 +228,19 @@ where
     decode_all(rows)
 }
 
-/// List the feedback rows belonging to the session's *current* active plan.
+/// List the feedback rows belonging to the session's current active lifecycle.
 /// Returns `[]` when the session has no active plan. Resolves
-/// `sessions.active_plan_id` and joins through `feedback.plan_id` in one
+/// the session lifecycle state in one
 /// statement, so the result is a consistent snapshot.
 pub async fn list_for_active_plan(
     pool: &SqlitePool,
     session_id: &SessionId,
 ) -> Result<Vec<FeedbackRecord>, Error> {
     let rows = sqlx::query_as::<_, FeedbackRow>(
-        "SELECT f.* FROM feedback f \
-         JOIN sessions s ON s.id = f.session_id \
-         WHERE s.id = ? AND f.plan_id = s.active_plan_id \
+        "SELECT f.id, f.session_id, s.rowid AS plan_id, f.target_kind, f.target_id, \
+                f.author_label, f.body, f.created_at, f.updated_at \
+         FROM feedback f JOIN sessions s ON s.id = f.session_id \
+         WHERE s.id = ? AND s.state IN ('planning', 'implementing') \
          ORDER BY f.id ASC",
     )
     .bind(session_id.as_str())
@@ -239,7 +256,10 @@ pub async fn list_for_session(
     session_id: &SessionId,
 ) -> Result<Vec<FeedbackRecord>, Error> {
     let rows = sqlx::query_as::<_, FeedbackRow>(
-        "SELECT * FROM feedback WHERE session_id = ? ORDER BY id ASC",
+        "SELECT f.id, f.session_id, s.rowid AS plan_id, f.target_kind, f.target_id, \
+                f.author_label, f.body, f.created_at, f.updated_at \
+         FROM feedback f JOIN sessions s ON s.id = f.session_id \
+         WHERE f.session_id = ? ORDER BY f.id ASC",
     )
     .bind(session_id.as_str())
     .fetch_all(pool)
