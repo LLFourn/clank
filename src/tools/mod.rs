@@ -99,12 +99,21 @@ pub fn catalog() -> Vec<ToolDescriptor> {
                           event on first sight.\n\n\
                           Response keys (always present, nullable when not applicable): \
                           `schema_version`, `session_id`, `repo_root`, `plan_file_path`, \
-                          `git_logs_head_path`, `phase`, `review_target`, \
+                          `git_logs_head_path`, `phase`, `expected_action`, \
+                          `completion_artifact`, `commit_policy`, `review_target`, \
                           `latest_plan_revision`, `latest_implementation_revision`, \
                           `write_feedback` (caller's current-phase file), `prior_feedback` \
                           (`self` + `others` from the caller's prior phase, e.g. plan files \
                           surfaced during implementation), and `other_feedback_files` \
                           grouped by `plan` / `impl` arrays.\n\n\
+                          When `phase` is `implementing`, implementation is not complete \
+                          until the intended changes are committed. After editing, inspect \
+                          `git status` and `git diff`, run relevant checks, commit only the \
+                          intended changes, and report the commit hash. When addressing \
+                          implementation feedback, amend the latest implementation commit \
+                          unless the user explicitly asks for a separate commit. Leaving \
+                          implementation work only in the working tree is a blocker and must \
+                          be reported as such.\n\n\
                           Read-only with respect to session/plan/feedback state. Does not \
                           bump `sessions.updated_at`."
                 .to_string(),

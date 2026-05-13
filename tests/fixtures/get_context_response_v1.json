@@ -5,6 +5,12 @@
   "plan_file_path": "/repo/plan.md",
   "git_logs_head_path": "/repo/.git/logs/HEAD",
   "phase": "implementing",
+  "expected_action": "implement_and_commit",
+  "completion_artifact": "git_commit",
+  "commit_policy": {
+    "initial_impl": "create_commit",
+    "addressing_impl_feedback": "amend_latest_impl_commit_unless_user_requests_new_commit"
+  },
   "review_target": {
     "kind": "implementation_commit",
     "id": "abc123",

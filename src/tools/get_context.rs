@@ -40,12 +40,21 @@ struct GetContextResponse {
     plan_file_path: PathBuf,
     git_logs_head_path: Option<PathBuf>,
     phase: Phase,
+    expected_action: &'static str,
+    completion_artifact: Option<&'static str>,
+    commit_policy: Option<CommitPolicy>,
     review_target: Option<ReviewTarget>,
     latest_plan_revision: Option<PlanRevisionView>,
     latest_implementation_revision: Option<ImplRevisionView>,
     write_feedback: Option<FeedbackFileView>,
     prior_feedback: Option<PriorFeedback>,
     other_feedback_files: GroupedFeedbackFiles,
+}
+
+#[derive(serde::Serialize)]
+struct CommitPolicy {
+    initial_impl: &'static str,
+    addressing_impl_feedback: &'static str,
 }
 
 #[derive(serde::Serialize)]
@@ -248,6 +257,7 @@ fn render(
         .filter(|s| author_str.as_deref() != Some(s.row.author_label.as_str()))
         .map(|s| pointer_for(FeedbackKind::Impl, s, now))
         .collect();
+    let phase_contract = phase_contract(ctx.phase);
 
     GetContextResponse {
         schema_version: SCHEMA_VERSION,
@@ -256,6 +266,9 @@ fn render(
         plan_file_path: ctx.plan_file_path.clone(),
         git_logs_head_path: ctx.git_logs_head_path.clone(),
         phase: ctx.phase,
+        expected_action: phase_contract.expected_action,
+        completion_artifact: phase_contract.completion_artifact,
+        commit_policy: phase_contract.commit_policy,
         review_target,
         latest_plan_revision,
         latest_implementation_revision,
@@ -264,6 +277,35 @@ fn render(
         other_feedback_files: GroupedFeedbackFiles {
             plan: plan_pointers,
             impl_: impl_pointers,
+        },
+    }
+}
+
+struct PhaseContract {
+    expected_action: &'static str,
+    completion_artifact: Option<&'static str>,
+    commit_policy: Option<CommitPolicy>,
+}
+
+fn phase_contract(phase: Phase) -> PhaseContract {
+    match phase {
+        Phase::NoActivePlan => PhaseContract {
+            expected_action: "none",
+            completion_artifact: None,
+            commit_policy: None,
+        },
+        Phase::Planning => PhaseContract {
+            expected_action: "review_plan_or_update_plan_file",
+            completion_artifact: Some("plan_revision_or_plan_feedback_file"),
+            commit_policy: None,
+        },
+        Phase::Implementing => PhaseContract {
+            expected_action: "implement_and_commit",
+            completion_artifact: Some("git_commit"),
+            commit_policy: Some(CommitPolicy {
+                initial_impl: "create_commit",
+                addressing_impl_feedback: "amend_latest_impl_commit_unless_user_requests_new_commit",
+            }),
         },
     }
 }

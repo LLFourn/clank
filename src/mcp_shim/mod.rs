@@ -1,4 +1,7 @@
-use std::path::PathBuf;
+use std::fs::{File, OpenOptions};
+use std::io;
+use std::os::fd::AsRawFd;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -41,18 +44,12 @@ pub async fn run(args: McpArgs) -> anyhow::Result<()> {
 
     // If the daemon isn't reachable and the URL points at the local
     // machine, try to spawn `trinity serve` ourselves (fully detached).
-    // We don't use a pidfile: the daemon's bound TCP port is a natural
-    // atomic lock — only one process can hold 7777 at a time, and it's
-    // freed automatically on exit. Stale pidfiles are no problem because
-    // there are no pidfiles.
+    // The port is not enough as a spawn lock: several shims can all
+    // observe "down" before any spawned child has bound the socket.
     if !probe_daemon(&client, &daemon_url).await {
         if is_loopback_url(&daemon_url) {
-            if let Err(e) = spawn_daemon_detached(&daemon_url).await {
+            if let Err(e) = ensure_loopback_daemon(&client, &daemon_url).await {
                 tracing::warn!(error = %e, "could not auto-spawn daemon; tool calls will fail until the user runs `trinity serve`");
-            } else if let Err(e) =
-                wait_for_daemon(&client, &daemon_url, Duration::from_secs(10)).await
-            {
-                tracing::warn!(error = %e, "spawned daemon but it did not become healthy in time");
             }
         } else {
             tracing::warn!(
@@ -108,17 +105,61 @@ fn is_loopback_url(daemon: &str) -> bool {
     matches!(host, "localhost" | "127.0.0.1" | "::1")
 }
 
+async fn ensure_loopback_daemon(client: &reqwest::Client, daemon: &str) -> anyhow::Result<()> {
+    let log_dir = trinity_home()?;
+    std::fs::create_dir_all(&log_dir)?;
+
+    let lock_path = log_dir.join("daemon.spawn.lock");
+    let lock_file = OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(&lock_path)?;
+
+    if !try_flock_exclusive_nb(&lock_file)? {
+        wait_for_daemon(client, daemon, Duration::from_secs(15))
+            .await
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "another shim held {}; daemon still unhealthy: {e}",
+                    lock_path.display()
+                )
+            })?;
+        return Ok(());
+    }
+
+    if probe_daemon(client, daemon).await {
+        return Ok(());
+    }
+
+    spawn_daemon_detached(daemon, &log_dir).await?;
+    wait_for_daemon(client, daemon, Duration::from_secs(10))
+        .await
+        .map_err(|e| anyhow::anyhow!("spawned daemon but it did not become healthy in time: {e}"))
+}
+
+fn try_flock_exclusive_nb(file: &File) -> io::Result<bool> {
+    let rc = unsafe { libc_flock(file.as_raw_fd(), LOCK_EX | LOCK_NB) };
+    if rc == 0 {
+        return Ok(true);
+    }
+
+    let err = io::Error::last_os_error();
+    if err.kind() == io::ErrorKind::WouldBlock {
+        Ok(false)
+    } else {
+        Err(err)
+    }
+}
+
 /// Launch `trinity serve` so it survives the shim's exit. On Unix we put
 /// the daemon in its own session via `setsid(2)` so a SIGHUP to the
 /// shim's process group (e.g. terminal close) does not propagate.
-async fn spawn_daemon_detached(daemon: &str) -> anyhow::Result<()> {
-    use std::fs::OpenOptions;
+async fn spawn_daemon_detached(daemon: &str, log_dir: &Path) -> anyhow::Result<()> {
     use std::os::unix::process::CommandExt;
     use std::process::{Command, Stdio};
 
     let exe = std::env::current_exe()?;
-    let log_dir = trinity_home()?;
-    std::fs::create_dir_all(&log_dir)?;
     let log_path = log_dir.join("daemon.log");
     let log_out = OpenOptions::new()
         .create(true)
@@ -126,7 +167,7 @@ async fn spawn_daemon_detached(daemon: &str) -> anyhow::Result<()> {
         .open(&log_path)?;
     let log_err = log_out.try_clone()?;
 
-    tracing::info!(exe = %exe.display(), log = %log_path.display(), "auto-spawning trinity serve");
+    tracing::info!(daemon = %daemon, exe = %exe.display(), log = %log_path.display(), "auto-spawning trinity serve");
 
     let mut cmd = Command::new(&exe);
     cmd.arg("serve")
@@ -147,17 +188,26 @@ async fn spawn_daemon_detached(daemon: &str) -> anyhow::Result<()> {
         });
     }
 
-    let _child = cmd.spawn()?;
+    let child = cmd.spawn()?;
+    let pid = child.id();
+    // `setsid` does not change PID. If exec fails after fork this sidecar
+    // may point at a short-lived process; it is informational only.
+    if let Err(e) = std::fs::write(log_dir.join("daemon.spawn.last_pid"), format!("{pid}\n")) {
+        tracing::warn!(error = %e, pid, "could not write daemon autospawn pid sidecar");
+    }
     // Intentionally drop the Child handle: we never want to wait() on it.
-    let _ = daemon; // (only used for logging context above)
     Ok(())
 }
 
-// Direct FFI to libc::setsid. Avoids pulling in the `libc` crate for a
-// single call site.
+const LOCK_EX: i32 = 2;
+const LOCK_NB: i32 = 4;
+
+// Direct FFI avoids pulling in the `libc` crate for two small Unix calls.
 unsafe extern "C" {
     #[link_name = "setsid"]
     fn libc_setsid() -> i32;
+    #[link_name = "flock"]
+    fn libc_flock(fd: i32, operation: i32) -> i32;
 }
 
 fn trinity_home() -> anyhow::Result<PathBuf> {

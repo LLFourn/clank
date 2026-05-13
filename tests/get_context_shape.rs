@@ -39,6 +39,9 @@ async fn fixture_parses_as_json_with_all_v1_keys() {
         "plan_file_path",
         "git_logs_head_path",
         "phase",
+        "expected_action",
+        "completion_artifact",
+        "commit_policy",
         "review_target",
         "latest_plan_revision",
         "latest_implementation_revision",
@@ -52,6 +55,9 @@ async fn fixture_parses_as_json_with_all_v1_keys() {
         );
     }
     assert_eq!(v["schema_version"], 1);
+    assert_eq!(v["expected_action"], "implement_and_commit");
+    assert_eq!(v["completion_artifact"], "git_commit");
+    assert_eq!(v["commit_policy"]["initial_impl"], "create_commit");
     assert!(v["other_feedback_files"]["plan"].is_array());
     assert!(v["other_feedback_files"]["impl"].is_array());
 }
@@ -106,6 +112,12 @@ async fn planning_phase_prior_feedback_is_empty() {
         .await
         .unwrap();
     assert_eq!(r["phase"], "planning");
+    assert_eq!(r["expected_action"], "review_plan_or_update_plan_file");
+    assert_eq!(
+        r["completion_artifact"],
+        "plan_revision_or_plan_feedback_file"
+    );
+    assert!(r["commit_policy"].is_null());
     assert!(r["prior_feedback"]["self"].is_null());
     assert!(r["prior_feedback"]["others"].as_array().unwrap().is_empty());
 }
@@ -216,6 +228,13 @@ async fn review_target_is_implementation_commit_during_implementing() {
         .await
         .unwrap();
     assert_eq!(r["phase"], "implementing");
+    assert_eq!(r["expected_action"], "implement_and_commit");
+    assert_eq!(r["completion_artifact"], "git_commit");
+    assert_eq!(r["commit_policy"]["initial_impl"], "create_commit");
+    assert_eq!(
+        r["commit_policy"]["addressing_impl_feedback"],
+        "amend_latest_impl_commit_unless_user_requests_new_commit"
+    );
     assert_eq!(r["review_target"]["kind"], "implementation_commit");
 }
 
@@ -235,6 +254,9 @@ async fn no_active_plan_write_feedback_and_prior_feedback_are_null() {
         .await
         .unwrap();
     assert_eq!(r["phase"], "no_active_plan");
+    assert_eq!(r["expected_action"], "none");
+    assert!(r["completion_artifact"].is_null());
+    assert!(r["commit_policy"].is_null());
     assert!(r["write_feedback"].is_null());
     // Per the spec, prior_feedback is also null when no_active_plan.
     // (Caller may have had prior phase feedback, but we don't surface
