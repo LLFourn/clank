@@ -17,12 +17,11 @@ use super::ui_styles::STYLE;
 
 pub struct SessionRow {
     pub session: Session,
-    pub recent_agents: Vec<String>,
     pub active_plan_state: Option<String>,
-    pub plan_feedback_count: i64,
-    pub impl_feedback_count: i64,
-    /// Number of feedback files in `current` status for this session.
-    pub current_feedback_files: i64,
+    /// True when no active plan exists but the most-recent plan for this
+    /// session is in state `finished`. Drives the table's `finished`
+    /// status chip.
+    pub finished: bool,
 }
 
 pub struct HomeActivity {
@@ -35,7 +34,36 @@ pub fn home(rows: &[SessionRow], activity: &HomeActivity) -> Markup {
         "Trinity",
         html! {
             (timeline_head_scripts())
-            h1 { "Sessions" }
+            div.home-header {
+                h1 { "Sessions" }
+                (sound_test_button())
+            }
+            table.sessions {
+                thead {
+                    tr {
+                        th { "Session" }
+                        th { "Plan" }
+                        th { "Repo" }
+                        th { "Status" }
+                        th { "Updated" }
+                        th.row-actions-th { }
+                    }
+                }
+                tbody id="sessions-table-body" {
+                    @for row in rows {
+                        (session_table_row(row))
+                    }
+                }
+            }
+            @if rows.is_empty() {
+                p.empty {
+                    "No sessions yet. Drop a plan file into "
+                    code { ".trinity/plans/" }
+                    " or call "
+                    code { "register_plan_file" }
+                    " from an agent."
+                }
+            }
             @if activity.unavailable {
                 p.activity-warning { "Activity feed unavailable." }
             }
@@ -43,7 +71,6 @@ pub fn home(rows: &[SessionRow], activity: &HomeActivity) -> Markup {
                 section.timeline-section.home-activity {
                     div.section-title-row {
                         h2 { "Recent activity" }
-                        (sound_test_button())
                     }
                     div.timeline-wrap {
                         section id="home-timeline-feed"
@@ -60,48 +87,100 @@ pub fn home(rows: &[SessionRow], activity: &HomeActivity) -> Markup {
                     }
                 }
             }
-            @if rows.is_empty() {
-                p.empty {
-                    "No sessions yet. From an agent, call "
-                    code { "register_plan_file" } " with a `session_id` slug to create one."
-                }
-            }
-            @if !rows.is_empty() {
-                table.sessions {
-                    thead {
-                        tr {
-                            th { "Session" }
-                            th { "Title" }
-                            th { "Plan path" }
-                            th { "Repo" }
-                            th { "Agents" }
-                            th { "Active plan" }
-                            th.num { "Plan fb" }
-                            th.num { "Impl fb" }
-                            th.num { "Files" }
-                            th { "Updated" }
-                        }
-                    }
-                    tbody {
-                        @for row in rows {
-                            tr {
-                                td.mono { a href={ "/sessions/" (row.session.id) } { (row.session.id) } }
-                                td { (row.session.display_title.clone().unwrap_or_default()) }
-                                td.path { (row.session.plan_file_path) }
-                                td.path { (row.session.repo_root) }
-                                td { (agent_summary(&row.recent_agents)) }
-                                td { (active_plan_badge(row.active_plan_state.as_deref())) }
-                                td.num { (row.plan_feedback_count) }
-                                td.num { (row.impl_feedback_count) }
-                                td.num { (row.current_feedback_files) }
-                                td.relative { (relative_time(Some(row.session.updated_at))) }
-                            }
-                        }
-                    }
-                }
-            }
         },
     )
+}
+
+/// Wrap a session row in an htmx OOB `afterbegin` insert against the
+/// homepage sessions-table tbody. Used for `session_reactivated` and
+/// "first plan revision" SSE events.
+pub fn session_table_row_insert(row: &SessionRow) -> Markup {
+    html! {
+        template hx-swap-oob="afterbegin:#sessions-table-body" {
+            (session_table_row_live(row, true))
+        }
+    }
+}
+
+/// Wrap a session row in an htmx OOB `outerHTML` swap targeting the
+/// existing row by id. Used for in-place state changes
+/// (state_transition, plan_finished, feedback_* events).
+pub fn session_table_row_replace(row: &SessionRow) -> Markup {
+    let session_id = row.session.id.clone();
+    html! {
+        template hx-swap-oob={ "outerHTML:#session-row-" (session_id) } {
+            (session_table_row_live(row, true))
+        }
+    }
+}
+
+/// Emit a self-targeting OOB `<tr hx-swap-oob="delete">` that htmx
+/// removes from the DOM. Used for `session_archived` events.
+pub fn session_table_row_remove(session_id: &str) -> Markup {
+    html! {
+        tr id={ "session-row-" (session_id) } hx-swap-oob="delete" { }
+    }
+}
+
+fn session_table_row_live(row: &SessionRow, live: bool) -> Markup {
+    let session_id = row.session.id.clone();
+    let plan_basename = Path::new(&row.session.plan_file_path)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or(row.session.plan_file_path.as_str())
+        .to_string();
+    let chip = status_chip(row);
+    let class = if live { "session-row live" } else { "session-row" };
+    let can_finish = matches!(
+        row.active_plan_state.as_deref(),
+        Some("planning") | Some("implementing")
+    );
+    html! {
+        tr id={ "session-row-" (session_id) } class=(class) {
+            td.mono { a href={ "/sessions/" (session_id) } { (session_id) } }
+            td.plan-cell { code.mono { (plan_basename) } }
+            td.path { (row.session.repo_root) }
+            td { (chip) }
+            td.relative { (relative_time_tag(Some(row.session.updated_at))) }
+            td.row-actions {
+                @if can_finish {
+                    form method="post" action={ "/sessions/" (session_id) "/finish" } class="row-finish-form" {
+                        button type="submit"
+                                class="row-action-button success"
+                                title="Mark plan as finished"
+                                aria-label="Mark plan as finished"
+                                onclick="return confirm('Mark this session as finished? The active plan will transition to `finished`.');" {
+                            (action_icon(ActionIcon::Check))
+                        }
+                    }
+                }
+                form method="post" action={ "/sessions/" (session_id) "/delete" } class="row-delete-form" {
+                    button type="submit"
+                            class="row-action-button danger"
+                            title="Delete session"
+                            aria-label="Delete session"
+                            onclick="return confirm('Delete this session? Plan file and feedback files are unchanged. Re-register to restore.');" {
+                        (action_icon(ActionIcon::Delete))
+                    }
+                }
+            }
+        }
+    }
+}
+
+pub fn session_table_row(row: &SessionRow) -> Markup {
+    session_table_row_live(row, false)
+}
+
+fn status_chip(row: &SessionRow) -> Markup {
+    let (text, class) = match row.active_plan_state.as_deref() {
+        Some("planning") => ("planning", "status-chip planning"),
+        Some("implementing") => ("implementing", "status-chip implementing"),
+        Some("archived") => ("archived", "status-chip muted"),
+        None if row.finished => ("finished", "status-chip finished"),
+        _ => ("—", "status-chip muted"),
+    };
+    html! { span class=(class) { (text) } }
 }
 
 // ---------- Session detail (active plan + history summary) ----------
@@ -226,6 +305,8 @@ pub enum ActionIcon {
     Diff,
     Previous,
     Sound,
+    Delete,
+    Check,
 }
 
 pub struct TimelineRenderCtx<'a> {
@@ -774,6 +855,8 @@ fn action_icon(icon: ActionIcon) -> Markup {
         ActionIcon::Diff => include_str!("icons/git-compare-arrows.svg"),
         ActionIcon::Previous => include_str!("icons/history.svg"),
         ActionIcon::Sound => include_str!("icons/volume-2.svg"),
+        ActionIcon::Delete => include_str!("icons/trash-2.svg"),
+        ActionIcon::Check => include_str!("icons/check-circle-2.svg"),
     };
     html! { span.action-icon aria-hidden="true" { (PreEscaped(svg)) } }
 }
@@ -1295,14 +1378,6 @@ fn active_plan_badge(state: Option<&str>) -> Markup {
         Some("archived") => html! { span.badge.archived { "archived" } },
         Some(other) => html! { span.badge { (other) } },
         None => html! { span.badge.archived { "no active plan" } },
-    }
-}
-
-fn agent_summary(labels: &[String]) -> String {
-    if labels.is_empty() {
-        "—".to_string()
-    } else {
-        labels.join(", ")
     }
 }
 

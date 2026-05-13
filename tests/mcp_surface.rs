@@ -26,8 +26,13 @@ async fn catalog_lists_exactly_the_three_normal_tools() {
         .collect();
     assert_eq!(
         normal,
-        vec!["list_sessions", "register_plan_file", "get_context"],
-        "catalog must contain exactly the three agent-facing tools (plus echo_cwd diagnostic), got {names:?}"
+        vec![
+            "list_sessions",
+            "register_plan_file",
+            "get_context",
+            "finish_plan",
+        ],
+        "catalog must contain exactly the four agent-facing tools (plus echo_cwd diagnostic), got {names:?}"
     );
 }
 

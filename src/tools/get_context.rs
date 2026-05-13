@@ -205,7 +205,7 @@ fn render(
     let write_kind = match ctx.phase {
         Phase::Planning => Some(FeedbackKind::Plan),
         Phase::Implementing => Some(FeedbackKind::Impl),
-        Phase::NoActivePlan => None,
+        Phase::Finished | Phase::NoActivePlan => None,
     };
 
     let write_feedback = match (author_label, write_kind) {
@@ -290,6 +290,11 @@ struct PhaseContract {
 fn phase_contract(phase: Phase) -> PhaseContract {
     match phase {
         Phase::NoActivePlan => PhaseContract {
+            expected_action: "none",
+            completion_artifact: None,
+            commit_policy: None,
+        },
+        Phase::Finished => PhaseContract {
             expected_action: "none",
             completion_artifact: None,
             commit_policy: None,

@@ -9,7 +9,7 @@ use serde_json::json;
 
 use common::{TestApp, make_commit};
 
-const SETTLE: std::time::Duration = std::time::Duration::from_millis(2500);
+use common::SETTLE;
 
 async fn register(app: &TestApp) -> i64 {
     let plan_path = app.repo.join("plan.md");

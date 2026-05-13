@@ -127,6 +127,30 @@ pub fn catalog() -> Vec<ToolDescriptor> {
                 "additionalProperties": false
             }),
         },
+        ToolDescriptor {
+            name: "finish_plan".to_string(),
+            description: "Mark the session's active plan as `finished` — the deliberate \
+                          successful-conclusion terminal state, distinct from `archived`. \
+                          Use this when work on the plan is genuinely done and the agent \
+                          is about to move on to something else. Idempotent: calling on \
+                          an already-finished session is a no-op. Rejected when the \
+                          session is archived; re-register first.\n\n\
+                          - `session_id`: the session.\n\
+                          - `label`: attribution name (e.g. `claude-main`).\n\n\
+                          After this call, `get_context` reports `phase: \"finished\"` \
+                          and `expected_action: \"none\"`. The plan and feedback files \
+                          on disk are untouched."
+                .to_string(),
+            input_schema: json!({
+                "type": "object",
+                "required": ["session_id", "label"],
+                "properties": {
+                    "session_id": {"type": "string"},
+                    "label": {"type": "string"}
+                },
+                "additionalProperties": false
+            }),
+        },
     ]
 }
 
@@ -136,6 +160,7 @@ pub async fn dispatch(state: &AppState, req: &ToolCallRequest) -> Result<Value, 
         "list_sessions" => reviewer::list_sessions(state, req).await,
         "register_plan_file" => master::register_plan_file(state, req).await,
         "get_context" => get_context::get_context(state, req).await,
+        "finish_plan" => master::finish_plan(state, req).await,
         other => Err(ToolError::NotFound(format!("unknown tool: {other}"))),
     }
 }

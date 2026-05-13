@@ -85,6 +85,14 @@ pub async fn previous_in_plan(
     .await
 }
 
+pub async fn count_for_plan(pool: &sqlx::SqlitePool, plan_id: i64) -> sqlx::Result<i64> {
+    let c: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM plan_revisions WHERE plan_id = ?")
+        .bind(plan_id)
+        .fetch_one(pool)
+        .await?;
+    Ok(c)
+}
+
 /// Insert a new revision under `plan_id`. Revision number = `max + 1` per plan.
 /// Returns `(new_revision_id, new_revision_number)`.
 pub async fn append(

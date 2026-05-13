@@ -9,7 +9,7 @@ use serde_json::json;
 
 use common::{TestApp, make_commit};
 
-const SETTLE: std::time::Duration = std::time::Duration::from_millis(2500);
+use common::SETTLE;
 
 #[tokio::test]
 async fn newer_session_in_same_repo_supersedes_older_session_for_commits() {
@@ -40,8 +40,8 @@ async fn newer_session_in_same_repo_supersedes_older_session_for_commits() {
     let plan_id_a = ra["plan_id"].as_i64().unwrap();
     let plan_id_b = rb["plan_id"].as_i64().unwrap();
 
-    let a_state: (Option<i64>, String) = sqlx::query_as(
-        "SELECT s.active_plan_id, p.state \
+    let a_state: (Option<i64>, String, Option<i64>) = sqlx::query_as(
+        "SELECT s.active_plan_id, p.state, s.archived_at \
          FROM sessions s JOIN plans p ON p.id = ? \
          WHERE s.id = 'a'",
     )
@@ -49,7 +49,12 @@ async fn newer_session_in_same_repo_supersedes_older_session_for_commits() {
     .fetch_one(&app.state.pool)
     .await
     .unwrap();
-    assert_eq!(a_state, (None, "archived".to_string()));
+    assert_eq!(a_state.0, None, "superseded session active_plan_id cleared");
+    assert_eq!(a_state.1, "archived", "superseded plan state archived");
+    assert!(
+        a_state.2.is_some(),
+        "superseded session must also have sessions.archived_at set"
+    );
 
     make_commit(&app.repo, "f.txt", "x\n");
     tokio::time::sleep(SETTLE).await;
@@ -157,16 +162,18 @@ async fn recovery_archives_superseded_active_sessions_in_same_repo() {
         .execute(&app.state.pool)
         .await
         .unwrap();
-    sqlx::query("UPDATE sessions SET active_plan_id = ? WHERE id = 'a'")
-        .bind(plan_id_a)
-        .execute(&app.state.pool)
-        .await
-        .unwrap();
+    sqlx::query(
+        "UPDATE sessions SET active_plan_id = ?, archived_at = NULL WHERE id = 'a'",
+    )
+    .bind(plan_id_a)
+    .execute(&app.state.pool)
+    .await
+    .unwrap();
 
     let app = app.restart().await;
 
-    let a_state: (Option<i64>, String) = sqlx::query_as(
-        "SELECT s.active_plan_id, p.state \
+    let a_state: (Option<i64>, String, Option<i64>) = sqlx::query_as(
+        "SELECT s.active_plan_id, p.state, s.archived_at \
          FROM sessions s JOIN plans p ON p.id = ? \
          WHERE s.id = 'a'",
     )
@@ -180,6 +187,11 @@ async fn recovery_archives_superseded_active_sessions_in_same_repo() {
             .await
             .unwrap();
 
-    assert_eq!(a_state, (None, "archived".to_string()));
+    assert_eq!(a_state.0, None, "recovery clears active_plan_id");
+    assert_eq!(a_state.1, "archived", "plan transitions to archived");
+    assert!(
+        a_state.2.is_some(),
+        "recovery sets sessions.archived_at on superseded session"
+    );
     assert_eq!(b_active, Some(plan_id_b));
 }

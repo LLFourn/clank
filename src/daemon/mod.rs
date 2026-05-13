@@ -53,7 +53,7 @@ pub struct AppState {
 
 pub async fn serve(args: ServeArgs) -> anyhow::Result<()> {
     let db_path = expand_home(&args.db);
-    let (state, _shutdown) = build_state(&db_path).await?;
+    let (state, _shutdown) = build_state(&db_path, DaemonConfig::default()).await?;
     let app = http::router(state);
 
     tracing::info!(bind = %args.bind, "trinity listening");
@@ -77,15 +77,38 @@ impl DaemonShutdown {
     }
 }
 
+/// Runtime knobs threaded through `build_state`. Production callers use
+/// `DaemonConfig::default()`; integration tests construct one with a
+/// short `watcher_debounce` so the suite isn't held hostage to the
+/// real-world debounce window.
+#[derive(Debug, Clone)]
+pub struct DaemonConfig {
+    /// notify-debouncer-full coalescing window. Production default is
+    /// long enough to absorb editor save flurries and bulk
+    /// filesystem operations (`git checkout`, IDE format-on-save).
+    pub watcher_debounce: std::time::Duration,
+}
+
+impl Default for DaemonConfig {
+    fn default() -> Self {
+        Self {
+            watcher_debounce: std::time::Duration::from_millis(1500),
+        }
+    }
+}
+
 /// Open the pool, run migrations, spin up the watcher, build the lifecycle
 /// service, perform startup recovery + drift detection. Returns the
 /// `AppState` plus a shutdown handle. Used by `serve` and by integration
 /// tests.
-pub async fn build_state(db_path: &Path) -> anyhow::Result<(AppState, DaemonShutdown)> {
+pub async fn build_state(
+    db_path: &Path,
+    config: DaemonConfig,
+) -> anyhow::Result<(AppState, DaemonShutdown)> {
     tracing::info!(db = %db_path.display(), "opening database");
     let pool = crate::storage::open_pool(db_path).await?;
 
-    let (watcher, watcher_rx) = Watcher::start()?;
+    let (watcher, watcher_rx) = Watcher::start(config.watcher_debounce)?;
     let lifecycle = Arc::new(SessionService::new(pool.clone(), Arc::clone(&watcher)));
 
     // Recovery: rebuild per-session cache from SQL, then run drift detection
@@ -115,6 +138,75 @@ async fn recover(
             session_id = sid.as_str(),
             "recovery: archived superseded active session"
         );
+    }
+
+    // Discover known repos and attach plan-dir watchers; also scan each
+    // for `.md` files that have no session yet and auto-register them.
+    let known_repos: Vec<String> = sqlx::query_scalar(
+        "SELECT DISTINCT repo_root FROM sessions",
+    )
+    .fetch_all(pool)
+    .await?;
+    for repo_str in known_repos {
+        let repo_root = Path::new(&repo_str);
+        let plans_dir = repo_root.join(".trinity").join("plans");
+        if !plans_dir.is_dir() {
+            continue;
+        }
+        if let Err(err) = watcher.watch_plan_dir(repo_root, &plans_dir) {
+            tracing::warn!(repo_root = %repo_root.display(), error = ?err, "recovery: plan-dir watcher attach failed");
+        }
+        // Scan existing files. Auto-registration is idempotent against
+        // already-known sessions and handles reactivation.
+        let mut read_dir = match tokio::fs::read_dir(&plans_dir).await {
+            Ok(d) => d,
+            Err(_) => continue,
+        };
+        while let Ok(Some(entry)) = read_dir.next_entry().await {
+            let path = entry.path();
+            let is_md = path
+                .extension()
+                .and_then(|s| s.to_str())
+                .map(|s| s.eq_ignore_ascii_case("md"))
+                .unwrap_or(false);
+            if !is_md {
+                continue;
+            }
+            // Recovery is strict about reactivation: a session that
+            // already exists *in this repo* (active or archived) is
+            // left alone. An archived session means delete; the plan
+            // file stays on disk by design, and a restart-driven scan
+            // must NOT undo that delete. An active session is already
+            // wired and the per-file watcher handles edits.
+            //
+            // But — when the bare basename collides with a session in
+            // a *different* repo, recovery must do the same
+            // disambiguation the live `PlanDirFileCreated` path does
+            // (basename + 6-char repo hash) and check the disambiguated
+            // id against this repo's known sessions. Skipping on bare
+            // collision alone strands cross-repo collisions until a
+            // live notify event happens to fire.
+            let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+                continue;
+            };
+            let resolved =
+                match resolve_auto_register_session_id(lifecycle, stem, &repo_str).await {
+                    Ok(Some(id)) => id,
+                    _ => continue,
+                };
+            let same_repo_match = sessions::fetch(pool, &resolved)
+                .await?
+                .map(|s| s.repo_root == repo_str)
+                .unwrap_or(false);
+            if same_repo_match {
+                continue;
+            }
+            if let Err(err) =
+                dispatch_plan_dir_file_created(lifecycle, repo_root, &path).await
+            {
+                tracing::warn!(path = %path.display(), error = ?err, "recovery: auto-register scan failed");
+            }
+        }
     }
 
     let all = sessions::list_active(pool).await?;
@@ -399,9 +491,293 @@ fn spawn_watcher_dispatch(
                         tracing::warn!(session_id = session_id.as_str(), error = ?err, "watcher feedback-missing dispatch failed");
                     }
                 }
+                WatcherEvent::PlanDirFileCreated { repo_root, path } => {
+                    if let Err(err) =
+                        dispatch_plan_dir_file_created(&lifecycle, &repo_root, &path).await
+                    {
+                        tracing::warn!(path = %path.display(), error = ?err, "watcher plan-dir dispatch failed");
+                    }
+                }
             }
         }
     })
+}
+
+/// Auto-register a freshly-dropped `.md` file in `<repo>/.trinity/plans/`
+/// as a session. The basename (minus `.md`) becomes the `session_id`.
+/// Idempotent against existing sessions; archived sessions are reactivated.
+async fn dispatch_plan_dir_file_created(
+    lifecycle: &Arc<SessionService>,
+    repo_root: &Path,
+    path: &Path,
+) -> anyhow::Result<()> {
+    let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+        return Ok(());
+    };
+    let body = match tokio::fs::read_to_string(path).await {
+        Ok(s) => s,
+        Err(err) => {
+            tracing::warn!(path = %path.display(), error = ?err, "auto-register: read failed");
+            return Ok(());
+        }
+    };
+    let plan_path = PlanFilePath::from(path.to_string_lossy().into_owned());
+    let head_str = match super::daemon::git::rev_parse_head(repo_root).await {
+        Ok(s) => s,
+        Err(err) => {
+            tracing::warn!(repo_root = %repo_root.display(), error = ?err, "auto-register: rev-parse HEAD failed");
+            return Ok(());
+        }
+    };
+    let head = crate::lifecycle::CommitSha::from(head_str);
+
+    let repo_root_str = repo_root.to_string_lossy().into_owned();
+    let actor = "system:auto-register";
+
+    // Pick a session_id, disambiguating with a repo-derived suffix if the
+    // bare basename is already used by a different repo (plan §9).
+    let session_id =
+        match resolve_auto_register_session_id(lifecycle, stem, &repo_root_str).await? {
+            Some(id) => id,
+            None => {
+                tracing::warn!(
+                    stem,
+                    repo_root = %repo_root_str,
+                    "auto-register: could not pick a unique session_id; skipping"
+                );
+                return Ok(());
+            }
+        };
+
+    let existing = sessions::fetch(lifecycle.pool(), &session_id).await?;
+
+    if let Some(session) = existing.as_ref() {
+        if session.archived_at.is_some() {
+            // The watcher only emits `PlanDirFileCreated` for genuinely
+            // new paths (it tracks a seen set per plan dir). An edit
+            // to an already-on-disk plan file does NOT reach here.
+            // Reactivation on a true fresh drop (remove+re-create or a
+            // never-before-seen path) is the auto-register contract.
+            lifecycle
+                .reactivate_session(
+                    &session_id,
+                    &repo_root_str,
+                    &plan_path,
+                    body,
+                    head,
+                    actor,
+                )
+                .await?;
+            // Maintain "at most one active session per repo" invariant.
+            lifecycle
+                .archive_other_active_sessions_in_repo(&repo_root_str, &session_id, actor)
+                .await?;
+            attach_session_watchers(lifecycle, &session_id, repo_root).await?;
+            scan_feedback_dir_for_session(lifecycle, repo_root, &session_id).await;
+            return Ok(());
+        }
+        // Active session already registered; per-file watcher handles edits.
+        return Ok(());
+    }
+
+    // Fresh session: create the row and register the plan.
+    let now = chrono::Utc::now().timestamp();
+    let display_title = session_id.as_str().to_string();
+    sessions::insert(
+        lifecycle.pool(),
+        &session_id,
+        &repo_root_str,
+        &plan_path,
+        Some(&display_title),
+        now,
+    )
+    .await?;
+    lifecycle
+        .archive_other_active_sessions_in_repo(&repo_root_str, &session_id, actor)
+        .await?;
+    lifecycle
+        .observe(
+            &session_id,
+            actor,
+            crate::lifecycle::Observation::PlanRegistered {
+                path: plan_path,
+                body,
+                head,
+            },
+        )
+        .await?;
+    // `observe(PlanRegistered)` attached the per-file plan watcher.
+    // Attach git-logs/HEAD, both feedback dirs, and the plan-dir
+    // watcher (shared with reactivation + explicit register paths).
+    attach_session_watchers(lifecycle, &session_id, repo_root).await?;
+    Ok(())
+}
+
+/// Pick the session id for an auto-registered plan file. Returns the
+/// bare basename when no conflicting session exists, or basename plus a
+/// short repo-derived suffix when the bare id is already used by a
+/// session in a *different* repo. Returns `Ok(None)` if every candidate
+/// is still occupied by a foreign repo (extremely unlikely; logged so
+/// we can investigate if it ever happens).
+async fn resolve_auto_register_session_id(
+    lifecycle: &Arc<SessionService>,
+    stem: &str,
+    repo_root_str: &str,
+) -> anyhow::Result<Option<SessionId>> {
+    // The session_id must satisfy the same slug rules MCP `register_plan_file`
+    // enforces — otherwise `get_context` later rejects the id as
+    // invalid. If the bare basename isn't slug-clean, reject (logged
+    // by the caller); we don't try to munge it because the result
+    // would no longer match what the file is named.
+    let bare = match sessions::validate_slug(stem) {
+        Ok(id) => id,
+        Err(_) => return Ok(None),
+    };
+    if let Some(existing) = sessions::fetch(lifecycle.pool(), &bare).await? {
+        if existing.repo_root == repo_root_str {
+            return Ok(Some(bare));
+        }
+        // Bare id collides with a different repo. Try a short repo-hash
+        // suffix; only fall back further if THAT also collides.
+        let hash_hex = blake3::hash(repo_root_str.as_bytes()).to_hex();
+        let suffix: String = hash_hex.chars().take(6).collect();
+        let candidate = format!("{stem}-{suffix}");
+        let disambiguated = match sessions::validate_slug(&candidate) {
+            Ok(id) => id,
+            Err(_) => return Ok(None),
+        };
+        if let Some(other) = sessions::fetch(lifecycle.pool(), &disambiguated).await? {
+            if other.repo_root == repo_root_str {
+                return Ok(Some(disambiguated));
+            }
+            // Hash collision across repos for the same stem. Pathological.
+            return Ok(None);
+        }
+        return Ok(Some(disambiguated));
+    }
+    Ok(Some(bare))
+}
+
+/// Attach all watchers a session needs beyond the per-file plan
+/// watcher (which `observe(PlanRegistered)` handles internally via
+/// `Watcher::switch_plan_file`): the repo's `.git/logs/HEAD` mover,
+/// both feedback subdirectories, and the repo-level `.trinity/plans/`
+/// directory. Idempotent.
+///
+/// Used by all three entry points that bring a session into the
+/// active set: explicit `register_plan_file` MCP calls, fresh
+/// auto-registers via `PlanDirFileCreated`, and reactivations via
+/// `PlanDirFileCreated` against an archived basename. Keeping the
+/// three paths on the same helper prevents the reactivation-misses-
+/// watcher class of bug.
+pub(crate) async fn attach_session_watchers(
+    lifecycle: &Arc<SessionService>,
+    session_id: &SessionId,
+    repo_root: &Path,
+) -> anyhow::Result<()> {
+    let watcher = lifecycle.watcher();
+
+    // `.git/logs/HEAD` resolution failure is a real activation error
+    // (corrupt git layout, unreadable repo). Propagate it so the caller
+    // can surface the partial-activation state instead of handing the
+    // agent a session that can't observe commits. A missing path
+    // (`exists() == false`) is acceptable: fresh repos with no commits
+    // yet have no logs/HEAD, and the watcher attaches on the first
+    // commit when recovery sweeps the path back in.
+    let logs_head = super::daemon::git::resolve_git_logs_head(repo_root).await?;
+    if logs_head.exists() {
+        watcher.watch_git_logs(session_id, &logs_head)?;
+    } else {
+        tracing::debug!(
+            path = %logs_head.display(),
+            "attach_session_watchers: .git/logs/HEAD does not exist yet; attaches on the next commit or re-register"
+        );
+    }
+
+    for kind in [
+        crate::domain::FeedbackKind::Plan,
+        crate::domain::FeedbackKind::Impl,
+    ] {
+        let dir = crate::feedback_path::feedback_dir(repo_root, session_id, kind);
+        tokio::fs::create_dir_all(&dir).await?;
+        watcher.watch_feedback_dir(session_id, kind, &dir)?;
+    }
+
+    let plans_dir = repo_root.join(".trinity").join("plans");
+    tokio::fs::create_dir_all(&plans_dir).await?;
+    if let Err(err) = watcher.watch_plan_dir(repo_root, &plans_dir) {
+        tracing::warn!(
+            repo_root = %repo_root.display(),
+            error = ?err,
+            "attach_session_watchers: plan-dir attach failed"
+        );
+    }
+
+    Ok(())
+}
+
+/// Walk the session's feedback `plan/` and `impl/` directories and
+/// re-ingest every `<author>.md` file currently on disk. Used after
+/// reactivation: notify mtimes haven't changed since the previous
+/// archive, so the ordinary watcher won't fire for these files.
+pub(crate) async fn scan_feedback_dir_for_session(
+    lifecycle: &Arc<SessionService>,
+    repo_root: &Path,
+    session_id: &SessionId,
+) {
+    // Clear `last_observed_hash` on every sidecar row first so the
+    // `dispatch_feedback_changed` no-op guard doesn't short-circuit on
+    // an unchanged content hash. Active plan has changed; we need to
+    // route the same body against the new target.
+    if let Err(err) =
+        crate::storage::feedback_files::clear_observed_for_session(lifecycle.pool(), session_id)
+            .await
+    {
+        tracing::warn!(
+            session_id = session_id.as_str(),
+            error = ?err,
+            "reactivation drift scan: clear_observed failed"
+        );
+    }
+    let feedback_root = repo_root
+        .join(".trinity")
+        .join("feedback")
+        .join(session_id.as_str());
+    for (kind, dir_name) in [
+        (crate::domain::FeedbackKind::Plan, "plan"),
+        (crate::domain::FeedbackKind::Impl, "impl"),
+    ] {
+        let dir = feedback_root.join(dir_name);
+        let mut read = match tokio::fs::read_dir(&dir).await {
+            Ok(d) => d,
+            Err(_) => continue,
+        };
+        while let Ok(Some(entry)) = read.next_entry().await {
+            let path = entry.path();
+            let is_md = path
+                .extension()
+                .and_then(|s| s.to_str())
+                .map(|s| s.eq_ignore_ascii_case("md"))
+                .unwrap_or(false);
+            if !is_md {
+                continue;
+            }
+            let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+                continue;
+            };
+            let label = crate::lifecycle::AgentLabel::from(stem);
+            if let Err(err) =
+                dispatch_feedback_changed(lifecycle, session_id, kind, &label, &path).await
+            {
+                tracing::warn!(
+                    session_id = session_id.as_str(),
+                    path = %path.display(),
+                    error = ?err,
+                    "reactivation drift scan: feedback ingest failed"
+                );
+            }
+        }
+    }
 }
 
 /// Build a CommitSnapshot for the repo's current HEAD and feed it

@@ -171,6 +171,16 @@ impl ApiError {
                     message: format!("watcher: {msg}"),
                 }
             }
+            super::LifecycleServiceError::RepoMismatch {
+                session_id,
+                expected,
+                actual,
+            } => Self::bad(format!(
+                "session `{session_id}` is recorded under repo `{expected}`, not `{actual}`"
+            )),
+            super::LifecycleServiceError::SessionArchived(s) => {
+                Self::bad(format!("session `{s}` is archived"))
+            }
         }
     }
 }

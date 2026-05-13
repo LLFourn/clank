@@ -20,14 +20,15 @@ CREATE TABLE plans (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
     base_commit TEXT NOT NULL,
-    state TEXT NOT NULL CHECK (state IN ('planning', 'implementing', 'archived')),
+    state TEXT NOT NULL CHECK (state IN ('planning', 'implementing', 'finished', 'archived')),
     started_at INTEGER NOT NULL,
-    archived_at INTEGER
+    archived_at INTEGER,
+    finished_at INTEGER
 );
 CREATE INDEX plans_session ON plans(session_id, id);
 
 CREATE UNIQUE INDEX one_active_plan_per_session
-    ON plans(session_id) WHERE state != 'archived';
+    ON plans(session_id) WHERE state NOT IN ('archived', 'finished');
 
 CREATE TABLE plan_revisions (
     id INTEGER PRIMARY KEY AUTOINCREMENT,

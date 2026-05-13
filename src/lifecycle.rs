@@ -135,6 +135,11 @@ pub enum Observation {
     CommitObserved { commit: CommitSnapshot },
     /// Human (or master) asked for the active plan to be archived.
     ArchiveRequested,
+    /// Operator (or agent via `finish_plan`) declared the active plan
+    /// successfully concluded. Terminal — observations cannot route into
+    /// finished plans (`sessions.active_plan_id` is cleared by the apply
+    /// layer, same shape as `ArchiveRequested`).
+    FinishRequested,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -150,6 +155,7 @@ pub enum Effect {
         commit: CommitSnapshot,
     },
     ArchiveActivePlan,
+    FinishActivePlan,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -213,6 +219,7 @@ pub fn decide(active: Option<ActivePlan>, obs: Observation) -> Result<Decision, 
         (None, PlanFileObserved { .. }) => Err(LifecycleError::NoActivePlan),
         (None, CommitObserved { .. }) => Err(LifecycleError::NoActivePlan),
         (None, ArchiveRequested) => Ok(Decision::noop(None)),
+        (None, FinishRequested) => Ok(Decision::noop(None)),
 
         // ----- Planning -----
         (Some(planning @ Planning { .. }), PlanRegistered { body, .. }) => {
@@ -265,6 +272,10 @@ pub fn decide(active: Option<ActivePlan>, obs: Observation) -> Result<Decision, 
         (Some(Planning { .. }), ArchiveRequested) => Ok(Decision {
             new_active: None,
             effects: vec![Effect::ArchiveActivePlan],
+        }),
+        (Some(Planning { .. }), FinishRequested) => Ok(Decision {
+            new_active: None,
+            effects: vec![Effect::FinishActivePlan],
         }),
 
         // ----- Implementing -----
@@ -335,6 +346,10 @@ pub fn decide(active: Option<ActivePlan>, obs: Observation) -> Result<Decision, 
         (Some(Implementing { .. }), ArchiveRequested) => Ok(Decision {
             new_active: None,
             effects: vec![Effect::ArchiveActivePlan],
+        }),
+        (Some(Implementing { .. }), FinishRequested) => Ok(Decision {
+            new_active: None,
+            effects: vec![Effect::FinishActivePlan],
         }),
     }
 }

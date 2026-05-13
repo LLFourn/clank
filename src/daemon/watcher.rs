@@ -29,7 +29,6 @@ use crate::domain::FeedbackKind;
 use crate::feedback_path::is_valid_slug;
 use crate::lifecycle::{AgentLabel, PlanFilePath, SessionId};
 
-pub const DEBOUNCE_TIMEOUT: Duration = Duration::from_millis(1500);
 
 #[derive(Debug)]
 pub enum WatcherEvent {
@@ -55,6 +54,14 @@ pub enum WatcherEvent {
         author_label: AgentLabel,
         path: PathBuf,
     },
+    /// New `.md` file appeared in a repo's `.trinity/plans/` directory.
+    /// Carries no `SessionId` — the dispatcher derives one from the
+    /// basename and routes through `register_plan_file` (creating or
+    /// reactivating the session as needed).
+    PlanDirFileCreated {
+        repo_root: PathBuf,
+        path: PathBuf,
+    },
 }
 
 struct Inner {
@@ -72,6 +79,18 @@ struct Inner {
     /// session in normal operation (one plan, one impl).
     session_feedback_dirs: HashMap<(SessionId, FeedbackKind), PathBuf>,
 
+    /// Canonical `.trinity/plans/` dir → owning repo_root. Watched at
+    /// startup for known repos so new plan files auto-register.
+    plan_dirs: HashMap<PathBuf, PathBuf>,
+
+    /// Per-plan-dir: the set of `.md` file paths we've already seen.
+    /// Used to distinguish "file genuinely appeared" (emit
+    /// `PlanDirFileCreated`) from "file was modified or atomic-saved"
+    /// (notify reports a Create event but the path was already in our
+    /// seen set, so no emit). Populated at `watch_plan_dir` attach
+    /// time from existing files; updated on subsequent events.
+    plan_dir_seen: HashMap<PathBuf, std::collections::HashSet<PathBuf>>,
+
     notify_refcount: HashMap<PathBuf, usize>,
 }
 
@@ -80,12 +99,14 @@ pub struct Watcher {
 }
 
 impl Watcher {
-    pub fn start() -> anyhow::Result<(std::sync::Arc<Self>, mpsc::UnboundedReceiver<WatcherEvent>)>
+    pub fn start(
+        debounce_timeout: Duration,
+    ) -> anyhow::Result<(std::sync::Arc<Self>, mpsc::UnboundedReceiver<WatcherEvent>)>
     {
         let (event_tx, event_rx) = mpsc::unbounded_channel::<WatcherEvent>();
         let (debouncer_tx, mut debouncer_rx) = mpsc::unbounded_channel::<DebounceEventResult>();
 
-        let debouncer = new_debouncer(DEBOUNCE_TIMEOUT, None, move |res| {
+        let debouncer = new_debouncer(debounce_timeout, None, move |res| {
             let _ = debouncer_tx.send(res);
         })?;
 
@@ -97,6 +118,8 @@ impl Watcher {
             session_to_git_log: HashMap::new(),
             feedback_dirs: HashMap::new(),
             session_feedback_dirs: HashMap::new(),
+            plan_dirs: HashMap::new(),
+            plan_dir_seen: HashMap::new(),
             notify_refcount: HashMap::new(),
         });
         let watcher = std::sync::Arc::new(Self { inner });
@@ -107,8 +130,8 @@ impl Watcher {
                 match result {
                     Ok(events) => {
                         let emits = {
-                            let inner = routed.inner.lock().unwrap();
-                            collect_emits(&inner, &events)
+                            let mut inner = routed.inner.lock().unwrap();
+                            collect_emits(&mut inner, &events)
                         };
                         for ev in emits {
                             let _ = event_tx.send(ev);
@@ -247,6 +270,45 @@ impl Watcher {
         Ok(())
     }
 
+    /// Subscribe the canonical `.trinity/plans/` directory for a repo to
+    /// the plan-dir watcher. Idempotent. Notify events for `.md` files
+    /// here become `WatcherEvent::PlanDirFileCreated` so the dispatcher
+    /// can auto-register fresh plan files dropped into the directory.
+    pub fn watch_plan_dir(&self, repo_root: &Path, plans_dir: &Path) -> anyhow::Result<()> {
+        let canonical = canonicalize_or_warn("plans dir", plans_dir)
+            .ok_or_else(|| anyhow::anyhow!("watcher: cannot canonicalize plans dir {}", plans_dir.display()))?;
+        let mut inner = self.inner.lock().unwrap();
+        if inner.plan_dirs.contains_key(&canonical) {
+            return Ok(());
+        }
+        bump_notify(&mut inner, &canonical)?;
+        inner
+            .plan_dirs
+            .insert(canonical.clone(), repo_root.to_path_buf());
+        // Seed the seen set with existing `.md` entries so subsequent
+        // notify events on those paths read as modifications, not as
+        // fresh drops. A separate "remove + re-create" pair produces a
+        // Remove event (which drops the path from this set) followed by
+        // a Create — the second event then emits because the path is
+        // no longer in the set.
+        let mut seen: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
+        if let Ok(read) = std::fs::read_dir(&canonical) {
+            for entry in read.flatten() {
+                let p = entry.path();
+                if p.extension()
+                    .and_then(|s| s.to_str())
+                    .map(|s| s.eq_ignore_ascii_case("md"))
+                    .unwrap_or(false)
+                {
+                    seen.insert(p);
+                }
+            }
+        }
+        inner.plan_dir_seen.insert(canonical.clone(), seen);
+        tracing::info!(repo_root = %repo_root.display(), path = %canonical.display(), "watcher: now watching plans dir");
+        Ok(())
+    }
+
     /// Drop every subscription for `session_id`. Used when a session
     /// is removed.
     #[allow(dead_code)]
@@ -278,7 +340,7 @@ impl Watcher {
 }
 
 fn collect_emits(
-    inner: &Inner,
+    inner: &mut Inner,
     events: &[notify_debouncer_full::DebouncedEvent],
 ) -> Vec<WatcherEvent> {
     let mut out: Vec<WatcherEvent> = Vec::new();
@@ -322,6 +384,47 @@ fn collect_emits(
                     out.push(WatcherEvent::HeadMoved {
                         session_id: sid.clone(),
                     });
+                }
+            }
+
+            if let Some(parent) = path.parent()
+                && let Some(repo_root) = inner.plan_dirs.get(parent).cloned()
+            {
+                let extension_ok = path
+                    .extension()
+                    .and_then(|s| s.to_str())
+                    .map(|s| s.eq_ignore_ascii_case("md"))
+                    .unwrap_or(false);
+                if extension_ok {
+                    let parent_buf = parent.to_path_buf();
+                    let seen = inner.plan_dir_seen.entry(parent_buf).or_default();
+                    if path.exists() {
+                        // Only emit when this path is genuinely new
+                        // under the watched dir. An already-seen path
+                        // with a fresh Create/Modify event means an
+                        // in-place edit or atomic-rename save — not a
+                        // reactivation trigger.
+                        if seen.insert(path.clone()) {
+                            let key = (
+                                5_u8,
+                                path.clone(),
+                                SessionId::from(String::new()),
+                                None,
+                            );
+                            if !dedupe.contains(&key) {
+                                dedupe.push(key);
+                                out.push(WatcherEvent::PlanDirFileCreated {
+                                    repo_root,
+                                    path: path.clone(),
+                                });
+                            }
+                        }
+                    } else {
+                        // File vanished. Drop from the seen set so a
+                        // subsequent re-create reads as a fresh drop
+                        // (auto-register or reactivate path).
+                        seen.remove(path);
+                    }
                 }
             }
 

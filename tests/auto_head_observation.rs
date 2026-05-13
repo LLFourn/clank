@@ -13,7 +13,7 @@ use serde_json::json;
 
 use common::{TestApp, make_commit};
 
-const SETTLE: std::time::Duration = std::time::Duration::from_millis(2500);
+use common::SETTLE;
 
 async fn register(app: &TestApp, sid: &str) -> i64 {
     let plan_path = app.repo.join("plan.md");
@@ -318,14 +318,10 @@ async fn reset_to_older_sha_makes_ui_and_mcp_agree_on_target() {
         body.len()
     );
 
-    // Home page's "Files" column should also show 1.
-    let home = app.get("/").await.text().await.unwrap();
-    // The cell is just the integer in a `td.num` — search for the
-    // session row and assert "1" appears after the impl-fb cell.
-    assert!(
-        home.contains(">1<"),
-        "home page should report 1 current feedback file: body={home}"
-    );
+    // Homepage no longer renders a feedback-file count column under the
+    // home-sessions-table redesign. The per-target feedback-status
+    // assertion above (`feedback-file-status current`) on the session
+    // detail page is the load-bearing signal here.
 
     let _ = plan_id;
 }

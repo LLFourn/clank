@@ -86,12 +86,28 @@ pub async fn register_plan_file(
         .await
         .map_err(|e| ToolError::Internal(anyhow::anyhow!(e)))?;
 
+    let mut took_reactivation_path = false;
     if let Some(session) = existing.as_ref() {
         if session.repo_root != repo_root_str {
             return Err(ToolError::Forbidden(format!(
                 "session `{}` was created against repo `{}` but caller cwd resolves to `{}`",
                 session_id, session.repo_root, repo_root_str
             )));
+        }
+        if session.archived_at.is_some() {
+            took_reactivation_path = true;
+            state
+                .lifecycle
+                .reactivate_session(
+                    &session_id,
+                    &repo_root_str,
+                    &PlanFilePath::from(plan_path_str.clone()),
+                    body.clone(),
+                    head.clone(),
+                    &format!("agent:{label}"),
+                )
+                .await
+                .map_err(map_lifecycle_err)?;
         }
     } else {
         let display_title = canonical
@@ -123,19 +139,28 @@ pub async fn register_plan_file(
 
     upsert_seen_with_event(state, &session_id, &label, now).await?;
 
-    let outcome = state
-        .lifecycle
-        .observe(
-            &session_id,
-            &format!("agent:{label}"),
-            Observation::PlanRegistered {
-                path: PlanFilePath::from(plan_path_str.clone()),
-                body,
-                head,
-            },
+    // Reactivation already issued a `PlanRegistered` observation against
+    // the fresh active plan; the fallback below loads the new plan via
+    // `load_active_plan` rather than re-issuing the observation.
+    let outcome = if took_reactivation_path {
+        None
+    } else {
+        Some(
+            state
+                .lifecycle
+                .observe(
+                    &session_id,
+                    &format!("agent:{label}"),
+                    Observation::PlanRegistered {
+                        path: PlanFilePath::from(plan_path_str.clone()),
+                        body,
+                        head,
+                    },
+                )
+                .await
+                .map_err(map_lifecycle_err)?,
         )
-        .await
-        .map_err(map_lifecycle_err)?;
+    };
 
     // Auto-watch git logs/HEAD + the plan/ and impl/ feedback dirs as
     // part of plan registration. With the watcher-coordinator model
@@ -148,17 +173,34 @@ pub async fn register_plan_file(
         .await
         .map_err(|e| ToolError::Internal(anyhow::anyhow!(e)))?;
 
-    let from_effects = outcome.apply.items.iter().find_map(|e| match e {
-        AppliedEffect::Started {
-            plan_id,
-            plan_revision_id,
-        } => Some((*plan_id, *plan_revision_id)),
-        AppliedEffect::PlanRevision {
-            plan_id,
-            plan_revision_id,
-            ..
-        } => Some((*plan_id, *plan_revision_id)),
-        _ => None,
+    // On reactivation, the feedback files on disk haven't changed mtime
+    // since the previous archive — the ordinary watcher won't fire for
+    // them. Drift-scan the directories so existing reviews come back
+    // into the DB. No-op for a freshly-created session: the dirs are
+    // either empty or only contain files the watcher will also pick up
+    // through normal mtime events when they're next touched.
+    if took_reactivation_path {
+        crate::daemon::scan_feedback_dir_for_session(
+            &state.lifecycle,
+            &repo_root_canonical,
+            &session_id,
+        )
+        .await;
+    }
+
+    let from_effects = outcome.as_ref().and_then(|o| {
+        o.apply.items.iter().find_map(|e| match e {
+            AppliedEffect::Started {
+                plan_id,
+                plan_revision_id,
+            } => Some((*plan_id, *plan_revision_id)),
+            AppliedEffect::PlanRevision {
+                plan_id,
+                plan_revision_id,
+                ..
+            } => Some((*plan_id, *plan_revision_id)),
+            _ => None,
+        })
     });
     let (plan_id, revision_id) = match from_effects {
         Some(v) => v,
@@ -190,7 +232,7 @@ pub async fn register_plan_file(
         "session_id": session_id.as_str(),
         "plan_id": plan_id,
         "revision_id": revision_id,
-        "noop": outcome.apply.items.is_empty(),
+        "noop": outcome.as_ref().is_some_and(|o| o.apply.items.is_empty()),
     }))
 }
 
@@ -208,28 +250,7 @@ async fn attach_companion_watchers(
     session_id: &SessionId,
     repo_root: &Path,
 ) -> anyhow::Result<()> {
-    let watcher = state.lifecycle.watcher();
-
-    let git_logs_head = git::resolve_git_logs_head(repo_root).await?;
-    if git_logs_head.exists() {
-        watcher.watch_git_logs(session_id, &git_logs_head)?;
-    } else {
-        // No commits yet: leave the watcher unattached. The next commit
-        // makes the path exist; a re-register or the recovery sweep
-        // will attach it then. This is the only non-error "skip".
-        tracing::debug!(path = %git_logs_head.display(), "register_plan_file: .git/logs/HEAD doesn't exist yet; watcher attaches on the next register / restart");
-    }
-
-    for kind in [
-        crate::domain::FeedbackKind::Plan,
-        crate::domain::FeedbackKind::Impl,
-    ] {
-        let dir = crate::feedback_path::feedback_dir(repo_root, session_id, kind);
-        tokio::fs::create_dir_all(&dir).await?;
-        watcher.watch_feedback_dir(session_id, kind, &dir)?;
-    }
-
-    Ok(())
+    crate::daemon::attach_session_watchers(&state.lifecycle, session_id, repo_root).await
 }
 
 pub(crate) async fn upsert_seen_with_event(
@@ -260,6 +281,33 @@ pub(crate) async fn upsert_seen_with_event(
     Ok(())
 }
 
+#[derive(serde::Deserialize)]
+struct FinishPlanArgs {
+    session_id: String,
+    label: String,
+}
+
+pub async fn finish_plan(state: &AppState, req: &ToolCallRequest) -> Result<Value, ToolError> {
+    let args: FinishPlanArgs = serde_json::from_value(req.arguments.clone())
+        .map_err(|e| ToolError::Invalid(format!("invalid args: {e}")))?;
+    let session_id = sessions::validate_slug(&args.session_id).map_err(ToolError::Invalid)?;
+    let label = AgentLabel::from(args.label.trim().to_string());
+    if label.as_str().is_empty() {
+        return Err(ToolError::Invalid("label must be non-empty".into()));
+    }
+    let now = chrono::Utc::now().timestamp();
+    upsert_seen_with_event(state, &session_id, &label, now).await?;
+    state
+        .lifecycle
+        .finish_plan(&session_id, &format!("agent:{label}"))
+        .await
+        .map_err(map_lifecycle_err)?;
+    Ok(json!({
+        "session_id": session_id.as_str(),
+        "ok": true,
+    }))
+}
+
 pub(crate) fn map_lifecycle_err(err: crate::daemon::LifecycleServiceError) -> ToolError {
     use crate::daemon::LifecycleServiceError as E;
     match err {
@@ -269,6 +317,16 @@ pub(crate) fn map_lifecycle_err(err: crate::daemon::LifecycleServiceError) -> To
         E::NoSession(s) => ToolError::NotFound(format!("session `{s}` not found")),
         E::Sql(e) => ToolError::Internal(anyhow::anyhow!(e)),
         E::Watcher(msg) => ToolError::Internal(anyhow::anyhow!(msg)),
+        E::RepoMismatch {
+            session_id,
+            expected,
+            actual,
+        } => ToolError::Invalid(format!(
+            "session `{session_id}` is recorded under repo `{expected}`; cannot re-register under `{actual}`"
+        )),
+        E::SessionArchived(s) => ToolError::Invalid(format!(
+            "session `{s}` is archived; re-register first"
+        )),
     }
 }
 

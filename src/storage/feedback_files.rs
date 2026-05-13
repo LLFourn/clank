@@ -93,6 +93,26 @@ pub async fn upsert_observed(
     .await
 }
 
+/// Reset the observation state for every sidecar row in this session.
+/// Used after reactivation so that the next `dispatch_feedback_changed`
+/// call doesn't short-circuit on the unchanged-hash guard — the file
+/// content hasn't changed on disk, but the active plan has, so the
+/// dispatch needs to insert a fresh feedback row against the new
+/// target.
+pub async fn clear_observed_for_session(
+    pool: &sqlx::SqlitePool,
+    session_id: &SessionId,
+) -> sqlx::Result<()> {
+    sqlx::query(
+        "UPDATE feedback_files SET last_observed_hash = NULL, last_observed_at = NULL \
+         WHERE session_id = ?",
+    )
+    .bind(session_id.as_str())
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
 pub async fn set_observed(
     tx: &mut Transaction<'_, Sqlite>,
     session_id: &SessionId,

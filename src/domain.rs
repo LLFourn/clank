@@ -75,6 +75,7 @@ impl FeedbackFileStatus {
 pub enum Phase {
     Planning,
     Implementing,
+    Finished,
     NoActivePlan,
 }
 
@@ -173,6 +174,7 @@ pub enum EventKind {
     StateTransition,
     DirtyWorktreeWarning,
     HeadResetToKnownSha,
+    PlanFinished,
     // Feedback (emitted by SessionService::put_feedback)
     FeedbackAdded,
     FeedbackUpdated,
@@ -181,6 +183,8 @@ pub enum EventKind {
     Renamed,
     PlanFileMissing,
     HumanComment,
+    SessionArchived,
+    SessionReactivated,
 }
 
 impl EventKind {
@@ -191,12 +195,15 @@ impl EventKind {
             EventKind::StateTransition => "state_transition",
             EventKind::DirtyWorktreeWarning => "dirty_worktree_warning",
             EventKind::HeadResetToKnownSha => "head_reset_to_known_sha",
+            EventKind::PlanFinished => "plan_finished",
             EventKind::FeedbackAdded => "feedback_added",
             EventKind::FeedbackUpdated => "feedback_updated",
             EventKind::AgentJoined => "agent_joined",
             EventKind::Renamed => "renamed",
             EventKind::PlanFileMissing => "plan_file_missing",
             EventKind::HumanComment => "human_comment",
+            EventKind::SessionArchived => "session_archived",
+            EventKind::SessionReactivated => "session_reactivated",
         }
     }
 }

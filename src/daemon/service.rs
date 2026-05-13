@@ -50,6 +50,14 @@ pub enum LifecycleServiceError {
     /// this so it doesn't hand the agent a silently-broken session.
     #[error("plan-file watcher attach failed: {0}")]
     Watcher(String),
+    #[error("session `{session_id}` is recorded under repo {expected}, not {actual}")]
+    RepoMismatch {
+        session_id: String,
+        expected: String,
+        actual: String,
+    },
+    #[error("session `{0}` is archived; reactivate via register_plan_file first")]
+    SessionArchived(String),
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -242,8 +250,7 @@ impl SessionService {
         let mut archived = Vec::with_capacity(rows.len());
         for id in rows {
             let sid = SessionId::from(id);
-            self.observe(&sid, actor, Observation::ArchiveRequested)
-                .await?;
+            self.delete_session(&sid, actor).await?;
             archived.push(sid);
         }
         Ok(archived)
@@ -272,11 +279,186 @@ impl SessionService {
                 continue;
             }
             let sid = SessionId::from(id);
-            self.observe(&sid, actor, Observation::ArchiveRequested)
-                .await?;
+            self.delete_session(&sid, actor).await?;
             archived.push(sid);
         }
         Ok(archived)
+    }
+
+    /// Soft-delete a session: in a single transaction, archive any
+    /// active plan (clears `active_plan_id`, emits a normalized
+    /// `state_transition`), set `sessions.archived_at`, and emit
+    /// `session_archived`. Plan and feedback files on disk are never
+    /// touched — re-registration restores the session.
+    ///
+    /// Idempotent in the steady state. If a prior partial run left the
+    /// session archived but with an active plan still attached, this
+    /// call cleans it up. `SessionArchived` is only emitted on the
+    /// first transition from visible to archived.
+    pub async fn delete_session(
+        &self,
+        session_id: &SessionId,
+        actor: &str,
+    ) -> Result<(), LifecycleServiceError> {
+        let cell = self.lock_for(session_id).await?;
+        let mut cache = cell.lock().await;
+
+        let now = chrono::Utc::now().timestamp();
+        let mut tx = self.pool.begin().await?;
+
+        let session: crate::storage::sessions::Session =
+            sqlx::query_as("SELECT * FROM sessions WHERE id = ?")
+                .bind(session_id.as_str())
+                .fetch_optional(&mut *tx)
+                .await?
+                .ok_or_else(|| LifecycleServiceError::NoSession(session_id.as_str().into()))?;
+
+        let was_visible = session.archived_at.is_none();
+        let active_plan_id = session.active_plan_id;
+
+        if !was_visible && active_plan_id.is_none() {
+            // Already fully archived; nothing to do.
+            return Ok(());
+        }
+
+        if let Some(plan_id) = active_plan_id {
+            let from_state: String = sqlx::query_scalar("SELECT state FROM plans WHERE id = ?")
+                .bind(plan_id)
+                .fetch_one(&mut *tx)
+                .await?;
+            crate::storage::plans::archive(&mut *tx, plan_id, now).await?;
+            crate::storage::sessions::set_active_plan_id(&mut *tx, session_id, None, now).await?;
+            crate::storage::events::append(
+                &mut *tx,
+                session_id,
+                Some(plan_id),
+                None,
+                None,
+                crate::domain::EventKind::StateTransition.as_str(),
+                actor,
+                &json!({ "from": from_state, "to": "archived" }),
+                None,
+                now,
+            )
+            .await?;
+        }
+        if was_visible {
+            sqlx::query("UPDATE sessions SET archived_at = ?, updated_at = ? WHERE id = ?")
+                .bind(now)
+                .bind(now)
+                .bind(session_id.as_str())
+                .execute(&mut *tx)
+                .await?;
+            crate::storage::events::append(
+                &mut *tx,
+                session_id,
+                None,
+                None,
+                None,
+                crate::domain::EventKind::SessionArchived.as_str(),
+                actor,
+                &json!({ "actor": actor }),
+                None,
+                now,
+            )
+            .await?;
+        }
+        tx.commit().await?;
+
+        // Cache must mirror the post-commit DB state. The plan archive
+        // above cleared `active_plan_id`, so the cached active plan is
+        // None as well.
+        if active_plan_id.is_some() {
+            *cache = None;
+        }
+        let _ = self.events_tx.send(session_id.clone());
+        Ok(())
+    }
+
+    /// Reactivate an archived session: clear `archived_at`, start a fresh
+    /// active plan from the current plan-file body at the current HEAD,
+    /// and re-attach watchers. Existing feedback files on disk are
+    /// re-ingested via a drift scan.
+    ///
+    /// `repo_root` must match the session's recorded `repo_root` — calling
+    /// with a different root returns `LifecycleServiceError::RepoMismatch`.
+    pub async fn reactivate_session(
+        &self,
+        session_id: &SessionId,
+        repo_root: &str,
+        plan_file_path: &crate::lifecycle::PlanFilePath,
+        body: String,
+        head: crate::lifecycle::CommitSha,
+        label: &str,
+    ) -> Result<(), LifecycleServiceError> {
+        let session = match sessions::fetch(&self.pool, session_id).await? {
+            Some(s) => s,
+            None => return Err(LifecycleServiceError::NoSession(session_id.as_str().into())),
+        };
+        if session.repo_root != repo_root {
+            return Err(LifecycleServiceError::RepoMismatch {
+                session_id: session_id.as_str().into(),
+                expected: session.repo_root,
+                actual: repo_root.into(),
+            });
+        }
+        if session.archived_at.is_none() {
+            return Ok(());
+        }
+        let now = chrono::Utc::now().timestamp();
+        sqlx::query("UPDATE sessions SET archived_at = NULL, updated_at = ? WHERE id = ?")
+            .bind(now)
+            .bind(session_id.as_str())
+            .execute(&self.pool)
+            .await?;
+        crate::storage::events::append(
+            &self.pool,
+            session_id,
+            None,
+            None,
+            None,
+            crate::domain::EventKind::SessionReactivated.as_str(),
+            label,
+            &json!({ "actor": label }),
+            None,
+            now,
+        )
+        .await?;
+        let _ = self.events_tx.send(session_id.clone());
+        // Start a fresh active plan via the standard registration path.
+        self.observe(
+            session_id,
+            label,
+            Observation::PlanRegistered {
+                path: plan_file_path.clone(),
+                body,
+                head,
+            },
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// Mark the active plan as `finished` via the lifecycle reducer.
+    /// Idempotent; calling on a session with no active plan is a no-op.
+    /// Rejects when the session is archived.
+    pub async fn finish_plan(
+        &self,
+        session_id: &SessionId,
+        actor: &str,
+    ) -> Result<(), LifecycleServiceError> {
+        let session = match sessions::fetch(&self.pool, session_id).await? {
+            Some(s) => s,
+            None => return Err(LifecycleServiceError::NoSession(session_id.as_str().into())),
+        };
+        if session.archived_at.is_some() {
+            return Err(LifecycleServiceError::SessionArchived(
+                session_id.as_str().into(),
+            ));
+        }
+        self.observe(session_id, actor, Observation::FinishRequested)
+            .await?;
+        Ok(())
     }
 
     /// Compute the session's current active review target. For
@@ -363,6 +545,13 @@ impl SessionService {
             Some(p) => p,
             None => return Ok(FeedbackTargetResolution::NoActivePlan),
         };
+        // Defense in depth: finish/archive clear `active_plan_id` so this
+        // pointer should never dangle into a terminal plan. Reject anyway
+        // so a future bug in the apply layer can't route feedback into a
+        // plan whose work is concluded.
+        if plan.state == "archived" || plan.state == "finished" {
+            return Ok(FeedbackTargetResolution::NoActivePlan);
+        }
 
         match kind {
             FeedbackKind::Plan => {
@@ -469,7 +658,21 @@ impl SessionService {
         let phase = match active_plan.as_ref().map(|p| p.state.as_str()) {
             Some("planning") => Phase::Planning,
             Some("implementing") => Phase::Implementing,
-            _ => Phase::NoActivePlan,
+            _ => {
+                let finished_exists: Option<(i64,)> = sqlx::query_as(
+                    "SELECT id FROM plans \
+                     WHERE session_id = ? AND state = 'finished' \
+                     ORDER BY finished_at DESC, id DESC LIMIT 1",
+                )
+                .bind(session_id.as_str())
+                .fetch_optional(&mut *tx)
+                .await?;
+                if finished_exists.is_some() {
+                    Phase::Finished
+                } else {
+                    Phase::NoActivePlan
+                }
+            }
         };
 
         let latest_plan_revision: Option<crate::storage::plan_revisions::PlanRevision> =
@@ -559,7 +762,7 @@ impl SessionService {
         let review_target = match phase {
             Phase::Implementing => impl_target_resolution.clone().into_option(),
             Phase::Planning => plan_target_resolution.clone().into_option(),
-            Phase::NoActivePlan => None,
+            Phase::Finished | Phase::NoActivePlan => None,
         };
 
         // `latest_implementation_revision` view: present iff phase is
@@ -756,7 +959,9 @@ impl SessionService {
             Err(LifecycleServiceError::Sql(e)) => return Err(e.into()),
             Err(LifecycleServiceError::Reducer(_))
             | Err(LifecycleServiceError::Apply(_))
-            | Err(LifecycleServiceError::Watcher(_)) => {
+            | Err(LifecycleServiceError::Watcher(_))
+            | Err(LifecycleServiceError::RepoMismatch { .. })
+            | Err(LifecycleServiceError::SessionArchived(_)) => {
                 unreachable!("lock_for never returns these")
             }
         };

@@ -43,6 +43,35 @@ table th, table td { padding: 10px 14px; text-align: left; border-bottom: 1px so
 table th { background: #f3f3ee; font-weight: 600; font-size: 0.82rem; text-transform: uppercase;
   letter-spacing: 0.04em; color: var(--muted); }
 table tr:last-child td { border-bottom: none; }
+table.sessions tbody tr { font-size: 0.85rem; }
+table.sessions tbody td { padding: 6px 12px; vertical-align: middle; }
+table.sessions tbody tr.session-row.live { animation: timeline-highlight 1500ms ease-out; }
+table.sessions .plan-cell { font-family: ui-monospace, "SF Mono", monospace; font-size: 0.85rem; color: var(--fg); }
+table.sessions .row-actions { width: 36px; text-align: right; padding-right: 10px; }
+table.sessions th.row-actions-th { width: 36px; }
+.row-delete-form { display: inline-flex; margin: 0; padding: 0; }
+.row-action-button { width: 28px; height: 28px; padding: 0; display: inline-flex; align-items: center; justify-content: center;
+  background: transparent; border: 1px solid transparent; border-radius: 4px; color: var(--muted); cursor: pointer; }
+.row-action-button:hover { color: var(--fg); background: var(--pill-bg-hover); border-color: var(--line); }
+.row-action-button.danger:hover { color: #b91c1c; border-color: rgba(185, 28, 28, 0.4); }
+.row-action-button.success:hover { color: #166534; border-color: rgba(22, 101, 52, 0.4); }
+.row-finish-form { display: inline-flex; margin: 0 4px 0 0; padding: 0; }
+.row-action-button svg { width: 14px; height: 14px; fill: none; stroke: currentColor; stroke-width: 1.75;
+  stroke-linecap: round; stroke-linejoin: round; }
+.status-chip { display: inline-block; padding: 2px 10px; border-radius: 999px; font-size: 0.75rem;
+  font-weight: 600; letter-spacing: 0.02em; }
+.status-chip.planning    { background: #fff1d6; color: var(--planning); }
+.status-chip.implementing{ background: #d6e5f7; color: var(--impl); }
+.status-chip.finished    { background: #d6f0db; color: #166534; }
+.status-chip.muted       { background: #eee;    color: var(--muted); }
+@media (prefers-color-scheme: dark) {
+  .status-chip.planning    { background: rgba(255, 193, 7, 0.18); color: #fbbf24; }
+  .status-chip.implementing{ background: rgba(67, 134, 240, 0.20); color: #93c5fd; }
+  .status-chip.finished    { background: rgba(22, 163, 74, 0.20); color: #86efac; }
+  .status-chip.muted       { background: rgba(255,255,255,0.06); color: var(--muted); }
+}
+.home-header { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 12px; }
+.home-header h1 { margin: 0; }
 .num { text-align: right; font-variant-numeric: tabular-nums; }
 .path, .mono { font-family: ui-monospace, "SF Mono", monospace; font-size: 0.83rem; color: var(--muted); word-break: break-all; }
 .session-id { font-size: 0.85rem; color: var(--muted); }

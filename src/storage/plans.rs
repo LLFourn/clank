@@ -100,6 +100,18 @@ where
     Ok(())
 }
 
+pub async fn finish<'e, E>(executor: E, plan_id: i64, now: i64) -> sqlx::Result<()>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Sqlite>,
+{
+    sqlx::query("UPDATE plans SET state = 'finished', finished_at = ? WHERE id = ?")
+        .bind(now)
+        .bind(plan_id)
+        .execute(executor)
+        .await?;
+    Ok(())
+}
+
 /// Code-level invariant check failure: `sessions.active_plan_id` references
 /// a row that doesn't satisfy the active-plan invariant.
 #[derive(Debug, thiserror::Error)]
@@ -119,6 +131,11 @@ pub enum ActivePlanInconsistency {
     },
     #[error("active_plan_id={active_plan_id} is archived")]
     Archived {
+        session_id: String,
+        active_plan_id: i64,
+    },
+    #[error("active_plan_id={active_plan_id} is finished")]
+    Finished {
         session_id: String,
         active_plan_id: i64,
     },
@@ -165,6 +182,14 @@ pub async fn load_active_plan(
     if plan.state == "archived" {
         return Err(LoadActivePlanError::Inconsistent(
             ActivePlanInconsistency::Archived {
+                session_id: session_id.as_str().into(),
+                active_plan_id,
+            },
+        ));
+    }
+    if plan.state == "finished" {
+        return Err(LoadActivePlanError::Inconsistent(
+            ActivePlanInconsistency::Finished {
                 session_id: session_id.as_str().into(),
                 active_plan_id,
             },

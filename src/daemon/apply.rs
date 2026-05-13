@@ -40,6 +40,9 @@ pub enum AppliedEffect {
     Archived {
         plan_id: i64,
     },
+    Finished {
+        plan_id: i64,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -250,6 +253,11 @@ pub async fn apply_decision(
             }
             Effect::ArchiveActivePlan => {
                 let plan_id = active_plan_id.ok_or(ApplyError::ArchiveWithoutActive)?;
+                let from_state: String =
+                    sqlx::query_scalar("SELECT state FROM plans WHERE id = ?")
+                        .bind(plan_id)
+                        .fetch_one(&mut **tx)
+                        .await?;
                 plans::archive(&mut **tx, plan_id, now).await?;
                 // Feedback rows for the archived plan are left in place
                 // (audit history). `get_current_feedback` filters by
@@ -265,12 +273,50 @@ pub async fn apply_decision(
                     None,
                     EventKind::StateTransition.as_str(),
                     actor,
-                    &json!({"to": "archived"}),
+                    &json!({"from": from_state, "to": "archived"}),
                     None,
                     now,
                 )
                 .await?;
                 items.push(AppliedEffect::Archived { plan_id });
+            }
+            Effect::FinishActivePlan => {
+                let plan_id = active_plan_id.ok_or(ApplyError::ArchiveWithoutActive)?;
+                let from_state: String =
+                    sqlx::query_scalar("SELECT state FROM plans WHERE id = ?")
+                        .bind(plan_id)
+                        .fetch_one(&mut **tx)
+                        .await?;
+                plans::finish(&mut **tx, plan_id, now).await?;
+                sessions::set_active_plan_id(&mut **tx, session_id, None, now).await?;
+                active_plan_id = None;
+                ev_store::append(
+                    &mut **tx,
+                    session_id,
+                    Some(plan_id),
+                    None,
+                    None,
+                    EventKind::StateTransition.as_str(),
+                    actor,
+                    &json!({"from": from_state, "to": "finished"}),
+                    None,
+                    now,
+                )
+                .await?;
+                ev_store::append(
+                    &mut **tx,
+                    session_id,
+                    Some(plan_id),
+                    None,
+                    None,
+                    EventKind::PlanFinished.as_str(),
+                    actor,
+                    &json!({"plan_id": plan_id, "from_state": from_state}),
+                    None,
+                    now,
+                )
+                .await?;
+                items.push(AppliedEffect::Finished { plan_id });
             }
         }
     }

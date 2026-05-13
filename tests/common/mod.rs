@@ -10,7 +10,22 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use tempfile::TempDir;
 use tokio::task::JoinHandle;
-use trinity::daemon::{self, AppState, DaemonShutdown, FeedbackUpsertOutcome, ServiceError};
+use trinity::daemon::{
+    self, AppState, DaemonConfig, DaemonShutdown, FeedbackUpsertOutcome, ServiceError,
+};
+
+/// Shared SETTLE used by integration tests. Sized for the test
+/// daemon's short debounce window (see `test_daemon_config`); enough
+/// slack for the dispatcher to finish handling a watcher event even
+/// when many test files run in parallel, while staying well under
+/// the 1.5s production debounce.
+pub const SETTLE: std::time::Duration = std::time::Duration::from_millis(1000);
+
+fn test_daemon_config() -> DaemonConfig {
+    DaemonConfig {
+        watcher_debounce: std::time::Duration::from_millis(50),
+    }
+}
 use trinity::domain::FeedbackTargetRef;
 use trinity::lifecycle::{AgentLabel, Observation, SessionId};
 
@@ -36,7 +51,9 @@ impl TestApp {
     }
 
     async fn spawn_with(tmp: TempDir, db: PathBuf, repo: PathBuf) -> Self {
-        let (state, shutdown) = daemon::build_state(&db).await.expect("build_state");
+        let (state, shutdown) = daemon::build_state(&db, test_daemon_config())
+            .await
+            .expect("build_state");
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
         let app = daemon::http::router(state.clone());

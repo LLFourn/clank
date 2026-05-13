@@ -14,10 +14,10 @@ use super::AppState;
 use super::curator;
 use super::internal_api;
 use super::ui;
-use crate::domain::{FeedbackKind, FeedbackTargetRef, TargetKind};
+use crate::domain::{FeedbackKind, FeedbackTargetRef};
 use crate::lifecycle::{CommitSha, SessionId};
 use crate::storage::{
-    agents, events as ev_store, feedback as feedback_store, feedback::FeedbackRecord,
+    events as ev_store, feedback as feedback_store, feedback::FeedbackRecord,
     implementation_revisions as impl_revs, plan_revisions, plans, sessions,
 };
 
@@ -42,6 +42,8 @@ pub fn router(state: AppState) -> Router {
             get(plan_revision_diff),
         )
         .route("/sessions/{session_id}/events", get(events_stream))
+        .route("/sessions/{session_id}/delete", post(delete_session))
+        .route("/sessions/{session_id}/finish", post(finish_session))
         .route("/sessions/{session_id}/comment", post(curator::comment))
         .route("/sessions/{session_id}/archive", post(curator::archive))
         .route("/sessions/{session_id}/rename", post(curator::rename))
@@ -60,11 +62,6 @@ async fn home(State(state): State<AppState>) -> Result<Html<String>, AppError> {
         rows.iter().map(|s| (s.id.clone(), s.clone())).collect();
     let mut out = Vec::with_capacity(rows.len());
     for s in rows {
-        let sid = SessionId::from(s.id.clone());
-        let agents_for = agents::list_for_session(&state.pool, &sid)
-            .await
-            .map_err(AppError::sqlx)?;
-        let recent_agents: Vec<String> = agents_for.iter().map(|a| a.label.clone()).collect();
         let active_plan_state = if let Some(id) = s.active_plan_id {
             plans::fetch(&state.pool, id)
                 .await
@@ -73,39 +70,29 @@ async fn home(State(state): State<AppState>) -> Result<Html<String>, AppError> {
         } else {
             None
         };
-        let (plan_count, impl_count) = active_feedback_counts(&state, &sid).await?;
-        let current_feedback_files: i64 = count_current_feedback_files(&state, &sid).await?;
+        let finished = if active_plan_state.is_none() {
+            let row: Option<(i64,)> = sqlx::query_as(
+                "SELECT id FROM plans WHERE session_id = ? AND state = 'finished' \
+                 ORDER BY finished_at DESC, id DESC LIMIT 1",
+            )
+            .bind(&s.id)
+            .fetch_optional(&state.pool)
+            .await
+            .map_err(AppError::sqlx)?;
+            row.is_some()
+        } else {
+            false
+        };
         out.push(ui::SessionRow {
             session: s,
-            recent_agents,
             active_plan_state,
-            plan_feedback_count: plan_count,
-            impl_feedback_count: impl_count,
-            current_feedback_files,
+            finished,
         });
     }
     let activity = build_home_activity(&state, &sessions_by_id).await?;
     Ok(Html(ui::home(&out, &activity).into_string()))
 }
 
-/// Count how many of this session's `feedback_files` rows currently
-/// render as the `current` status. Sums across both plan/ and impl/
-/// since each kind is judged against its own expected target inside
-/// `build_feedback_context`.
-async fn count_current_feedback_files(state: &AppState, sid: &SessionId) -> Result<i64, AppError> {
-    let ctx = state
-        .lifecycle
-        .build_feedback_context(sid)
-        .await
-        .map_err(AppError::lifecycle)?;
-    let n = ctx
-        .plan_files
-        .iter()
-        .chain(ctx.impl_files.iter())
-        .filter(|s| s.status == crate::domain::FeedbackFileStatus::Current)
-        .count();
-    Ok(n as i64)
-}
 
 #[derive(Default)]
 struct TimelineMaps {
@@ -667,14 +654,25 @@ async fn home_events_stream(
         let mut cursor = initial_cursor;
         let mut bs = BroadcastStream::new(rx);
         'stream: loop {
-            let rows = match ev_store::active_session_events_after(&stream_state.pool, cursor).await {
+            // Merge visibility events and removal events on a shared cursor.
+            let visible = match ev_store::active_session_events_after(&stream_state.pool, cursor).await {
                 Ok(rows) => rows,
                 Err(err) => {
-                    tracing::error!(error = ?err, "home SSE event query failed");
+                    tracing::error!(error = ?err, "home SSE visible-events query failed");
                     break;
                 }
             };
-            for ev in rows {
+            let removal = match ev_store::removal_events_after(&stream_state.pool, cursor).await {
+                Ok(rows) => rows,
+                Err(err) => {
+                    tracing::error!(error = ?err, "home SSE removal-events query failed");
+                    break;
+                }
+            };
+            let mut merged: Vec<_> = visible.into_iter().chain(removal).collect();
+            merged.sort_by_key(|e| e.id);
+            merged.dedup_by_key(|e| e.id);
+            for ev in merged {
                 match home_event_fragment(&stream_state, &ev).await {
                     Ok(fragment) => {
                         let id_str = ev.id.to_string();
@@ -710,18 +708,82 @@ async fn home_event_fragment(
         .await
         .map_err(AppError::sqlx)?
         .ok_or_else(|| AppError::not_found(format!("no session {}", ev.session_id)))?;
-    if session.active_plan_id.is_none() {
-        return Err(AppError::not_found(format!(
-            "session {} has no active plan",
-            ev.session_id
-        )));
+
+    // Session-archived removes the row regardless of any timeline payload.
+    if ev.kind == "session_archived" {
+        return Ok(ui::session_table_row_remove(&ev.session_id));
     }
+
+    // Build the table-row update fragment. For "first plan revision" or
+    // "reactivated", insert at the top; otherwise replace the row.
+    let active_plan_state = if let Some(id) = session.active_plan_id {
+        plans::fetch(&state.pool, id)
+            .await
+            .map_err(AppError::sqlx)?
+            .map(|p| p.state)
+    } else {
+        None
+    };
+    let finished = if active_plan_state.is_none() {
+        let row: Option<(i64,)> = sqlx::query_as(
+            "SELECT id FROM plans WHERE session_id = ? AND state = 'finished' \
+             ORDER BY finished_at DESC, id DESC LIMIT 1",
+        )
+        .bind(&session.id)
+        .fetch_optional(&state.pool)
+        .await
+        .map_err(AppError::sqlx)?;
+        row.is_some()
+    } else {
+        false
+    };
+    let session_row = ui::SessionRow {
+        session: session.clone(),
+        active_plan_state,
+        finished,
+    };
+    // Insert vs replace dispatch for the sessions-table OOB fragment.
+    // INSERT happens when the row is not currently in the rendered
+    // table: either the session is being reactivated (was hidden by
+    // archived_at) or this is the very first plan_revision for the
+    // session's very first plan. A `plan_revision_created` for the
+    // second plan in a session (e.g. after archive + start-new
+    // lifecycle) targets an existing row and must REPLACE.
+    let is_first_plan_first_revision = if ev.kind == "plan_revision_created" {
+        let revision_count =
+            plan_revisions::count_for_plan(&state.pool, ev.plan_id.unwrap_or(-1))
+                .await
+                .map_err(AppError::sqlx)?;
+        let total_plans_for_session: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM plans WHERE session_id = ?")
+                .bind(&session.id)
+                .fetch_one(&state.pool)
+                .await
+                .map_err(AppError::sqlx)?;
+        revision_count == 1 && total_plans_for_session == 1
+    } else {
+        false
+    };
+    let table_fragment = if ev.kind == "session_reactivated" || is_first_plan_first_revision {
+        ui::session_table_row_insert(&session_row)
+    } else {
+        ui::session_table_row_replace(&session_row)
+    };
+
+    // Build the timeline-row OOB. For finished sessions (or any session
+    // missing an active plan) the per-event timeline-row build still
+    // works as long as the timeline maps include the relevant artifacts.
     let maps = build_timeline_maps(state, &sid).await?;
     let rows = timeline_rows_for_events(&session, std::slice::from_ref(ev), &maps, true);
-    let Some(row) = rows.first() else {
-        return Err(AppError::not_found("event vanished"));
-    };
-    Ok(ui::timeline_row_oob(row, "home-timeline-feed"))
+    let timeline_fragment = rows
+        .first()
+        .map(|row| ui::timeline_row_oob(row, "home-timeline-feed"))
+        .unwrap_or_else(|| maud::html! {});
+
+    Ok(maud::html! {
+        (table_fragment)
+        (timeline_fragment)
+    })
 }
 
 async fn session_max_event_id(pool: &sqlx::SqlitePool, sid: &SessionId) -> Result<i64, AppError> {
@@ -903,23 +965,43 @@ fn render_markdown(body: &str) -> String {
     ammonia::clean(&html_out)
 }
 
-async fn active_feedback_counts(state: &AppState, sid: &SessionId) -> Result<(i64, i64), AppError> {
-    let active = feedback_store::list_for_active_plan(&state.pool, sid)
-        .await
-        .map_err(AppError::feedback)?;
-    let mut plan = 0_i64;
-    let mut implv = 0_i64;
-    for f in &active {
-        match f.target.kind() {
-            TargetKind::PlanRevision => plan += 1,
-            TargetKind::ImplementationCommit => implv += 1,
-        }
-    }
-    Ok((plan, implv))
-}
-
 async fn healthz() -> impl IntoResponse {
     "ok"
+}
+
+async fn delete_session(
+    State(state): State<AppState>,
+    Path(session_id): Path<String>,
+) -> Result<Response, AppError> {
+    let sid = SessionId::from(session_id);
+    state
+        .lifecycle
+        .delete_session(&sid, "system:operator")
+        .await
+        .map_err(AppError::lifecycle)?;
+    Ok(redirect_home())
+}
+
+async fn finish_session(
+    State(state): State<AppState>,
+    Path(session_id): Path<String>,
+) -> Result<Response, AppError> {
+    let sid = SessionId::from(session_id);
+    state
+        .lifecycle
+        .finish_plan(&sid, "system:operator")
+        .await
+        .map_err(AppError::lifecycle)?;
+    Ok(redirect_home())
+}
+
+fn redirect_home() -> Response {
+    use axum::http::{HeaderValue, StatusCode, header};
+    let mut resp = Response::new(axum::body::Body::empty());
+    *resp.status_mut() = StatusCode::SEE_OTHER;
+    resp.headers_mut()
+        .insert(header::LOCATION, HeaderValue::from_static("/"));
+    resp
 }
 
 async fn origin_guard(req: Request<axum::body::Body>, next: Next) -> Response {

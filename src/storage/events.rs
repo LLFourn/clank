@@ -70,10 +70,13 @@ pub async fn for_plan(pool: &SqlitePool, plan_id: i64) -> sqlx::Result<Vec<Event
 }
 
 pub async fn recent_for_active_sessions(pool: &SqlitePool, limit: i64) -> sqlx::Result<Vec<Event>> {
+    // "Visible session" = not archived. Finished sessions (active_plan_id
+    // IS NULL) are visible by design so their history shows up on the
+    // homepage activity feed.
     sqlx::query_as::<_, Event>(
         "SELECT e.* FROM events e \
          JOIN sessions s ON s.id = e.session_id \
-         WHERE s.archived_at IS NULL AND s.active_plan_id IS NOT NULL \
+         WHERE s.archived_at IS NULL \
          ORDER BY e.id DESC LIMIT ?",
     )
     .bind(limit)
@@ -85,11 +88,28 @@ pub async fn active_session_events_after(
     pool: &SqlitePool,
     cursor: i64,
 ) -> sqlx::Result<Vec<Event>> {
+    // Visibility filter for the live SSE stream. Removal events emitted
+    // *after* a session is archived (e.g. `session_archived` itself) are
+    // delivered via `removal_events_after`, not this query.
     sqlx::query_as::<_, Event>(
         "SELECT e.* FROM events e \
          JOIN sessions s ON s.id = e.session_id \
-         WHERE s.archived_at IS NULL AND s.active_plan_id IS NOT NULL AND e.id > ? \
+         WHERE s.archived_at IS NULL AND e.id > ? \
          ORDER BY e.id ASC",
+    )
+    .bind(cursor)
+    .fetch_all(pool)
+    .await
+}
+
+/// Removal events to deliver even after the session is hidden from the
+/// table. The home SSE stream merges these with `active_session_events_after`
+/// so the operator sees a row vanish in real time when a delete happens.
+pub async fn removal_events_after(pool: &SqlitePool, cursor: i64) -> sqlx::Result<Vec<Event>> {
+    sqlx::query_as::<_, Event>(
+        "SELECT * FROM events \
+         WHERE kind = 'session_archived' AND id > ? \
+         ORDER BY id ASC",
     )
     .bind(cursor)
     .fetch_all(pool)
