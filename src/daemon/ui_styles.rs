@@ -11,6 +11,8 @@ pub const STYLE: &str = r#"
   --warning-accent: #b45309;
   --pill-bg: #efefe9;
   --pill-bg-hover: #e4e4dd;
+  --code-bg: #f3f3ee;
+  --code-fg: #1f1f1f;
   --entry-shadow: 0 1px 2px rgba(0,0,0,0.04);
   --entry-shadow-hover: 0 4px 12px rgba(0,0,0,0.06);
   --entry-radius: 8px;
@@ -21,6 +23,8 @@ pub const STYLE: &str = r#"
     --bg: #14141a; --bg-alt: #1c1c24; --fg: #e8e8ed; --muted: #9da0aa;
     --line: #2c2c36; --accent: #8aa1ff;
     --pill-bg: #25252e; --pill-bg-hover: #2f2f3a;
+    --code-bg: #25252e;
+    --code-fg: #e8e8ed;
     --entry-shadow: 0 1px 2px rgba(0,0,0,0.4);
     --entry-shadow-hover: 0 4px 12px rgba(0,0,0,0.5);
     --highlight-fade: rgba(67, 56, 202, 0.22);
@@ -103,9 +107,9 @@ ul.agents .role { color: var(--muted); font-size: 0.78rem; text-transform: upper
 .muted { color: var(--muted); }
 article.markdown { background: var(--bg-alt); border: 1px solid var(--line); border-radius: 6px;
   padding: 18px 22px; font-size: 0.95rem; }
-article.markdown pre { background: #f3f3ee; padding: 10px 12px; border-radius: 4px; overflow-x: auto; font-size: 0.85rem; }
-article.markdown code { background: #f3f3ee; padding: 1px 4px; border-radius: 3px; font-size: 0.85rem; font-family: ui-monospace, "SF Mono", monospace; }
-article.markdown pre code { background: none; padding: 0; }
+article.markdown pre { background: var(--code-bg); color: var(--code-fg); padding: 10px 12px; border-radius: 4px; overflow-x: auto; font-size: 0.85rem; }
+article.markdown code { background: var(--code-bg); color: var(--code-fg); padding: 1px 4px; border-radius: 3px; font-size: 0.85rem; font-family: ui-monospace, "SF Mono", monospace; }
+article.markdown pre code { background: none; color: inherit; padding: 0; }
 .revision-meta { color: var(--muted); font-size: 0.85rem; margin-bottom: 8px; }
 details.revision-history, details.commit-history { margin-top: 16px; }
 details.revision-history summary, details.commit-history summary { cursor: pointer; color: var(--muted); font-size: 0.9rem; }
