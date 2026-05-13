@@ -49,7 +49,56 @@ async fn timeline_includes_plan_revision_and_impl_commit_rows() {
     tokio::time::sleep(SETTLE).await;
     let body = app.get("/sessions/s").await.text().await.unwrap();
     assert!(body.contains(r#"class="entry plan-rev""#));
-    assert!(body.contains(r#"class="entry impl-commit""#));
+    assert!(body.contains("entry impl-commit"));
+}
+
+#[tokio::test]
+async fn home_page_renders_cross_session_recent_activity() {
+    let app = TestApp::spawn().await;
+    register(&app, "s").await;
+    let body = app.get("/").await.text().await.unwrap();
+    assert!(body.contains("Recent activity"));
+    assert!(body.contains("home-timeline-feed"));
+    assert!(body.contains("View plan revision #1"));
+    assert!(body.contains("# v1"));
+    assert!(body.contains(r#"class="action-label">View"#));
+}
+
+#[tokio::test]
+async fn session_detail_renders_active_plan_preview() {
+    let app = TestApp::spawn().await;
+    register(&app, "s").await;
+    let body = app.get("/sessions/s").await.text().await.unwrap();
+    assert!(body.contains("Active plan revision #1"));
+    assert!(body.contains("# v1"));
+    assert!(body.contains("active-plan-head"));
+    assert!(body.contains("paths ▾"));
+    assert!(!body.contains("preview-clipped"));
+}
+
+#[tokio::test]
+async fn long_active_plan_preview_renders_body_once() {
+    let app = TestApp::spawn().await;
+    let plan_path = app.repo.join("plan.md");
+    let mut plan_body = String::from("# long plan\n\nunique-long-marker\n\n");
+    for n in 0..40 {
+        plan_body.push_str(&format!("line {n}\n\n"));
+    }
+    std::fs::write(&plan_path, plan_body).unwrap();
+    app.call(
+        "register_plan_file",
+        &app.repo,
+        None,
+        json!({"session_id": "s", "path": &plan_path, "label": "claude-main"}),
+    )
+    .await
+    .unwrap();
+
+    let body = app.get("/sessions/s").await.text().await.unwrap();
+    assert_eq!(body.matches("unique-long-marker").count(), 1);
+    assert!(body.contains(r#"class="active-plan""#));
+    assert!(!body.contains("preview-clipped"));
+    assert!(!body.contains("active-plan-full"));
 }
 
 #[tokio::test]
@@ -60,7 +109,7 @@ async fn plan_revision_row_has_view_and_diff_actions_for_rev_2_plus() {
     std::fs::write(&plan_path, "# v2\n").unwrap();
     tokio::time::sleep(SETTLE).await;
     let body = app.get("/sessions/s").await.text().await.unwrap();
-    assert!(body.contains("View body"));
+    assert!(body.contains("View plan revision #2"));
     assert!(body.contains("Diff to #1"));
 }
 
@@ -69,7 +118,7 @@ async fn plan_revision_row_for_rev_1_has_only_view_action() {
     let app = TestApp::spawn().await;
     register(&app, "s").await;
     let body = app.get("/sessions/s").await.text().await.unwrap();
-    assert!(body.contains("View body"));
+    assert!(body.contains("View plan revision #1"));
     assert!(!body.contains("Diff to #0"));
 }
 
@@ -196,7 +245,7 @@ async fn timeline_html_uses_kind_accent_class_per_event_type() {
     // lands.
     assert!(body.contains(r#"class="entry state""#));
     assert!(body.contains(r#"class="entry plan-rev""#));
-    assert!(body.contains(r#"class="entry impl-commit""#));
+    assert!(body.contains("entry impl-commit"));
 }
 
 #[tokio::test]
@@ -207,4 +256,12 @@ async fn stylesheet_defines_timeline_animation_rules() {
     assert!(body.contains("timeline-enter"));
     assert!(body.contains("timeline-highlight"));
     assert!(body.contains("prefers-reduced-motion"));
+    assert!(body.contains(".home-activity .timeline-wrap"));
+    assert!(body.contains("max-height: 70vh"));
+    assert!(body.contains("function ping()"));
+    assert!(body.contains("data-sound-test"));
+    assert!(
+        !body.contains("trinity.timeline.sound") && !body.contains("data-sound-toggle"),
+        "timeline notification sound should not expose an app-level mute preference"
+    );
 }

@@ -68,3 +68,37 @@ pub async fn for_plan(pool: &SqlitePool, plan_id: i64) -> sqlx::Result<Vec<Event
         .fetch_all(pool)
         .await
 }
+
+pub async fn recent_for_active_sessions(pool: &SqlitePool, limit: i64) -> sqlx::Result<Vec<Event>> {
+    sqlx::query_as::<_, Event>(
+        "SELECT e.* FROM events e \
+         JOIN sessions s ON s.id = e.session_id \
+         WHERE s.archived_at IS NULL AND s.active_plan_id IS NOT NULL \
+         ORDER BY e.id DESC LIMIT ?",
+    )
+    .bind(limit)
+    .fetch_all(pool)
+    .await
+}
+
+pub async fn active_session_events_after(
+    pool: &SqlitePool,
+    cursor: i64,
+) -> sqlx::Result<Vec<Event>> {
+    sqlx::query_as::<_, Event>(
+        "SELECT e.* FROM events e \
+         JOIN sessions s ON s.id = e.session_id \
+         WHERE s.archived_at IS NULL AND s.active_plan_id IS NOT NULL AND e.id > ? \
+         ORDER BY e.id ASC",
+    )
+    .bind(cursor)
+    .fetch_all(pool)
+    .await
+}
+
+pub async fn max_id(pool: &SqlitePool) -> sqlx::Result<i64> {
+    let max_id: Option<i64> = sqlx::query_scalar("SELECT MAX(id) FROM events")
+        .fetch_one(pool)
+        .await?;
+    Ok(max_id.unwrap_or(0))
+}

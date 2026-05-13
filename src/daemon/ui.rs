@@ -1,14 +1,17 @@
-use std::collections::HashMap;
+use std::{collections::HashMap, path::Path};
 
 use maud::{DOCTYPE, Markup, PreEscaped, html};
 
+use crate::daemon::diff_parser::{DiffLineKind as ParsedDiffLineKind, FileDiff, FileDiffMode};
 use crate::daemon::service::FeedbackFileSnapshot;
-use crate::domain::FeedbackFileStatus;
+use crate::domain::{FeedbackFileStatus, FeedbackKind};
 use crate::storage::events::Event;
 use crate::storage::implementation_revisions::ImplementationRevision;
 use crate::storage::plan_revisions::PlanRevision;
 use crate::storage::plans::Plan;
 use crate::storage::sessions::Session;
+
+use super::ui_styles::STYLE;
 
 // ---------- Home (session list) ----------
 
@@ -22,11 +25,41 @@ pub struct SessionRow {
     pub current_feedback_files: i64,
 }
 
-pub fn home(rows: &[SessionRow]) -> Markup {
+pub struct HomeActivity {
+    pub rows: Vec<TimelineRow>,
+    pub unavailable: bool,
+}
+
+pub fn home(rows: &[SessionRow], activity: &HomeActivity) -> Markup {
     layout(
         "Trinity",
         html! {
+            (timeline_head_scripts())
             h1 { "Sessions" }
+            @if activity.unavailable {
+                p.activity-warning { "Activity feed unavailable." }
+            }
+            @if !activity.rows.is_empty() {
+                section.timeline-section.home-activity {
+                    div.section-title-row {
+                        h2 { "Recent activity" }
+                        (sound_test_button())
+                    }
+                    div.timeline-wrap {
+                        section id="home-timeline-feed"
+                                class="timeline-feed"
+                                data-timeline-feed=""
+                                hx-ext="sse"
+                                sse-connect="/events"
+                                sse-swap="message"
+                                hx-swap="none" {
+                            @for row in &activity.rows {
+                                (timeline_row_article(row, false))
+                            }
+                        }
+                    }
+                }
+            }
             @if rows.is_empty() {
                 p.empty {
                     "No sessions yet. From an agent, call "
@@ -84,27 +117,26 @@ pub struct FeedbackItem {
 pub struct SessionDetail {
     pub session: Session,
     pub active_plan: Option<Plan>,
+    pub active_plan_preview: Option<ActivePlanPreview>,
     pub archived_count: i64,
-    /// Raw audit events for the session, oldest-first.
-    pub events: Vec<Event>,
     /// Pre-derived snapshots from `SessionService::build_feedback_context`.
     pub plan_feedback_files: Vec<FeedbackFileSnapshot>,
     pub impl_feedback_files: Vec<FeedbackFileSnapshot>,
     pub git_logs_head_path: Option<String>,
     pub plan_feedback_dir_path: Option<String>,
     pub impl_feedback_dir_path: Option<String>,
-    /// Lookup: commit_sha → amend classification. Populated for all impl
-    /// revisions across all plans in this session.
-    pub amend_by_sha: HashMap<String, crate::daemon::amend::AmendInfo>,
-    /// Lookup: plan_revision id → revision_number, for routing the
-    /// timeline's plan-revision rows to per-revision URLs.
-    pub plan_rev_number_by_id: HashMap<i64, i64>,
-    /// Lookup: feedback id → (kind, target). Used to wire the timeline's
-    /// feedback rows to the right artifact page + anchor.
-    pub feedback_target_by_id: HashMap<i64, (String, String)>,
+    pub timeline_rows: Vec<TimelineRow>,
     /// The maximum event id at render time, embedded in the SSE
     /// `?since=` so the live stream picks up from where the page rendered.
     pub max_event_id: i64,
+}
+
+pub struct ActivePlanPreview {
+    pub rev_id: i64,
+    pub revision_number: i64,
+    pub body_html: String,
+    pub created_at: i64,
+    pub is_long: bool,
 }
 
 pub struct DiffViewFeedback {
@@ -121,10 +153,94 @@ pub struct CommitDiffView {
     pub session_id: String,
     pub commit: ImplementationRevision,
     pub diff: String,
+    pub files: Vec<FileDiff>,
     /// Which base SHA the diff was computed against. Rendered prominently in
     /// the sticky header — `Parent(None)` means root commit (no parent).
     pub base_label: super::http::DiffBaseLabel,
     pub feedback: Vec<DiffViewFeedback>,
+    pub is_amend: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct TimelineRow {
+    pub event_id: i64,
+    pub event_kind: String,
+    pub session_id_for_prefix: Option<String>,
+    pub session_title_for_prefix: Option<String>,
+    pub actor: String,
+    pub ts: i64,
+    pub title: TimelineTitle,
+    pub preview: Option<String>,
+    pub actions: Vec<TimelineAction>,
+    pub status_badges: Vec<StatusBadge>,
+    pub needs_attention: NeedsAttention,
+    pub kind_class: &'static str,
+}
+
+#[derive(Debug, Clone)]
+pub enum TimelineTitle {
+    PlanRevision { revision_number: i64 },
+    Commit { short_sha: String },
+    HeadReset { short_sha: String },
+    Feedback { kind: FeedbackKind, author: String },
+    StateTransition,
+    AgentJoined { actor: String },
+    Warning { kind: WarningKind },
+    Other { kind: String },
+}
+
+#[derive(Debug, Clone)]
+pub enum WarningKind {
+    DirtyWorktree,
+    PlanFileMissing,
+}
+
+#[derive(Debug, Clone)]
+pub enum StatusBadge {
+    Amend,
+    FeedbackStatus(FeedbackFileStatus),
+    State(String),
+    Warning,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NeedsAttention {
+    None,
+    AwaitingPlanReview,
+    AwaitingImplReview,
+    StaleFeedback,
+}
+
+#[derive(Debug, Clone)]
+pub struct TimelineAction {
+    pub label: &'static str,
+    pub href: String,
+    pub icon: ActionIcon,
+    pub aria_label: String,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum ActionIcon {
+    Open,
+    View,
+    Diff,
+    Previous,
+    Sound,
+}
+
+pub struct TimelineRenderCtx<'a> {
+    pub session_id: &'a str,
+    pub session_id_for_prefix: Option<&'a str>,
+    pub session_title_for_prefix: Option<&'a str>,
+    pub plan_rev_number_by_id: &'a HashMap<i64, i64>,
+    pub plan_preview_by_id: &'a HashMap<i64, String>,
+    pub amend_by_sha: &'a HashMap<String, crate::daemon::amend::AmendInfo>,
+    pub commit_preview_by_sha: &'a HashMap<String, String>,
+    pub feedback_target_by_id: &'a HashMap<i64, (String, String)>,
+    pub feedback_preview_by_id: &'a HashMap<i64, String>,
+    pub feedback_kind_by_id: &'a HashMap<i64, FeedbackKind>,
+    pub feedback_author_by_id: &'a HashMap<i64, String>,
+    pub feedback_status_by_author_kind: &'a HashMap<(FeedbackKind, String), FeedbackFileStatus>,
 }
 
 // ---------- Plan revision pages + diff types ----------
@@ -170,36 +286,71 @@ fn short(sha: &str) -> String {
 }
 
 fn watched_artifacts_strip(d: &SessionDetail) -> Markup {
+    let plan_file_name = Path::new(&d.session.plan_file_path)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or(&d.session.plan_file_path);
+    let plan_review_status = feedback_summary_label(&d.plan_feedback_files);
+    let impl_review_status = feedback_summary_label(&d.impl_feedback_files);
     html! {
         section.watched-artifacts {
-            h2 { "Watched artifacts" }
-            dl {
-                dt { "Plan file" } dd.path { (d.session.plan_file_path) }
-                dt { "Git logs/HEAD" }
-                dd.path {
-                    @match d.git_logs_head_path.as_deref() {
-                        Some(p) => (p),
-                        None => "(unresolved)",
+            details {
+                summary {
+                    span { "Watching " code.mono { (plan_file_name) } }
+                    span.summary-separator { "·" }
+                    span { "plan reviews " (d.plan_feedback_files.len()) " (" (plan_review_status) ")" }
+                    span.summary-separator { "·" }
+                    span { "impl reviews " (d.impl_feedback_files.len()) " (" (impl_review_status) ")" }
+                    span.summary-separator { "·" }
+                    @if d.git_logs_head_path.is_none() {
+                        span.artifact-chip.warn { "git log missing" }
+                        span.summary-separator { "·" }
+                    }
+                    span { "paths ▾" }
+                }
+                dl {
+                    dt { "Plan file" } dd.path { (d.session.plan_file_path) }
+                    dt { "Git logs/HEAD" }
+                    dd.path {
+                        @match d.git_logs_head_path.as_deref() {
+                            Some(p) => (p),
+                            None => "(unresolved)",
+                        }
+                    }
+                    dt { "Plan feedback directory" }
+                    dd.path {
+                        @match d.plan_feedback_dir_path.as_deref() {
+                            Some(p) => (p),
+                            None => "(not yet attached)",
+                        }
+                    }
+                    dt { "Impl feedback directory" }
+                    dd.path {
+                        @match d.impl_feedback_dir_path.as_deref() {
+                            Some(p) => (p),
+                            None => "(not yet attached)",
+                        }
                     }
                 }
-                dt { "Plan feedback directory" }
-                dd.path {
-                    @match d.plan_feedback_dir_path.as_deref() {
-                        Some(p) => (p),
-                        None => "(not yet attached)",
-                    }
-                }
-                dt { "Impl feedback directory" }
-                dd.path {
-                    @match d.impl_feedback_dir_path.as_deref() {
-                        Some(p) => (p),
-                        None => "(not yet attached)",
-                    }
-                }
+                (feedback_files_table("Plan feedback files", &d.plan_feedback_files))
+                (feedback_files_table("Implementation feedback files", &d.impl_feedback_files))
             }
-            (feedback_files_table("Plan feedback files", &d.plan_feedback_files))
-            (feedback_files_table("Implementation feedback files", &d.impl_feedback_files))
         }
+    }
+}
+
+fn feedback_summary_label(files: &[FeedbackFileSnapshot]) -> String {
+    if files.is_empty() {
+        return "none".to_string();
+    }
+    let non_current = files
+        .iter()
+        .filter(|s| s.status != FeedbackFileStatus::Current)
+        .count();
+    if non_current == 0 {
+        "current".to_string()
+    } else {
+        format!("{non_current} stale")
     }
 }
 
@@ -247,12 +398,6 @@ fn feedback_file_badge(status: FeedbackFileStatus) -> Markup {
 
 pub fn session_detail(d: &SessionDetail) -> Markup {
     let session_id = d.session.id.clone();
-    let ctx = TimelineRenderCtx {
-        session_id: &session_id,
-        plan_rev_number_by_id: &d.plan_rev_number_by_id,
-        amend_by_sha: &d.amend_by_sha,
-        feedback_target_by_id: &d.feedback_target_by_id,
-    };
     layout(
         &format!("Trinity — {}", session_title(&d.session)),
         html! {
@@ -271,24 +416,30 @@ pub fn session_detail(d: &SessionDetail) -> Markup {
                         span.head-meta { "base " code.mono { (short(&plan.base_commit)) } }
                     }
                     span.head-meta { "plan: " span.path.mono { (d.session.plan_file_path) } }
+                    (sound_test_button())
                 }
             }
 
             (watched_artifacts_strip(d))
+            (active_plan_preview(d.active_plan_preview.as_ref()))
 
             section.timeline-section {
-                h2 { "Timeline" }
-                @if d.events.is_empty() {
+                div.section-title-row {
+                    h2 { "Timeline" }
+                }
+                @if d.timeline_rows.is_empty() {
                     p.empty { "Nothing has happened yet." }
                 }
                 div.timeline-wrap {
                     section id="timeline-feed"
+                            class="timeline-feed"
+                            data-timeline-feed=""
                             hx-ext="sse"
                             sse-connect={ "/sessions/" (session_id) "/events?since=" (d.max_event_id) }
                             sse-swap="message"
                             hx-swap="none" {
-                        @for ev in d.events.iter().rev() {
-                            (timeline_entry_full(ev, &ctx))
+                        @for row in &d.timeline_rows {
+                            (timeline_row_article(row, false))
                         }
                     }
                 }
@@ -297,194 +448,432 @@ pub fn session_detail(d: &SessionDetail) -> Markup {
     )
 }
 
-/// The minimum lookup context needed to render one timeline row with
-/// click-through actions. Shared between the initial page render (built
-/// from `SessionDetail`) and the SSE per-event renderer (built per-event
-/// from focused DB lookups). Without this, the SSE fragment loses the
-/// action pills and the live timeline isn't actually click-through.
-pub struct TimelineRenderCtx<'a> {
-    pub session_id: &'a str,
-    pub plan_rev_number_by_id: &'a HashMap<i64, i64>,
-    pub amend_by_sha: &'a HashMap<String, crate::daemon::amend::AmendInfo>,
-    pub feedback_target_by_id: &'a HashMap<i64, (String, String)>,
-}
-
-/// Render one timeline row in the initial-page context.
-fn timeline_entry_full(ev: &Event, ctx: &TimelineRenderCtx) -> Markup {
-    render_entry(ev, ctx, false)
-}
-
-/// Shared row renderer. `live=true` adds the `live` class and the
-/// `hx-swap-oob="afterbegin:#timeline-feed"` attribute so an htmx SSE
-/// fragment prepends to the timeline.
-fn render_entry(ev: &Event, ctx: &TimelineRenderCtx, live: bool) -> Markup {
-    let kind_class = timeline_entry_class(&ev.kind);
-    let class_attr = if live {
-        format!("{kind_class} live")
-    } else {
-        kind_class.to_string()
-    };
-    let oob: Option<&str> = live.then_some("afterbegin:#timeline-feed");
-    let actions = timeline_entry_actions(ev, ctx);
-    let title = timeline_entry_title(ev, ctx);
-    let preview = timeline_entry_preview(ev);
-    html! {
-        article id={ "event-" (ev.id) } class=(class_attr) hx-swap-oob=[oob] {
-            div.entry-title { (title) }
-            div.entry-meta {
-                span.actor { (ev.actor) }
-                " · " span.relative title=(absolute_time(ev.ts)) { (relative_time(Some(ev.ts))) }
-            }
-            @if let Some(p) = preview {
-                div.entry-preview { (p) }
-            }
-            @if let Some(actions) = actions {
-                div.entry-actions { (actions) }
-            }
-        }
-    }
-}
-
-fn timeline_entry_title(ev: &Event, ctx: &TimelineRenderCtx) -> Markup {
-    let payload: serde_json::Value =
-        serde_json::from_str(&ev.payload).unwrap_or(serde_json::Value::Null);
-    match ev.kind.as_str() {
-        "plan_revision_created" => {
-            let rev_id = ev.target_id.as_deref().and_then(|s| s.parse::<i64>().ok());
-            let n = rev_id.and_then(|id| ctx.plan_rev_number_by_id.get(&id).copied());
-            html! { "Plan revision " @if let Some(n) = n { "#" (n) } @else { "—" } }
-        }
-        "impl_revision_created" => {
-            let sha = ev.target_id.as_deref().unwrap_or("");
-            let is_amend = matches!(
-                ctx.amend_by_sha.get(sha),
-                Some(crate::daemon::amend::AmendInfo::Amend { .. })
-            );
-            html! {
-                "Commit " code.mono { (short(sha)) }
-                @if is_amend { " " span.kind-badge.amend { "amend" } }
-            }
-        }
-        "head_reset_to_known_sha" => {
-            let sha = ev.target_id.as_deref().unwrap_or("");
-            html! { "HEAD reset to " code.mono { (short(sha)) } }
-        }
-        "state_transition" => {
-            let from = payload.get("from").and_then(|v| v.as_str()).unwrap_or("");
-            let to = payload.get("to").and_then(|v| v.as_str()).unwrap_or("");
-            html! { "State: " (from) " → " (to) }
-        }
-        "feedback_added" => html! { "Feedback added" },
-        "feedback_updated" => html! { "Feedback updated" },
-        "agent_joined" => {
-            let a = ev.actor.clone();
-            html! { (a) " joined" }
-        }
-        "dirty_worktree_warning" => {
-            let sha = ev.target_id.as_deref().unwrap_or("");
-            html! { "Dirty worktree at " code.mono { (short(sha)) } }
-        }
-        "plan_file_missing" => html! { "Plan file missing" },
-        other => {
-            let o = other.to_string();
-            html! { (o) }
-        }
-    }
-}
-
-fn timeline_entry_preview(ev: &Event) -> Option<Markup> {
-    // For impl commits, surface the first line of commit_message. We
-    // don't have direct access to it from `Event`; the payload only
-    // carries metadata. Surfacing this would require either a join in
-    // SessionDetail's build or an embedded line in events.payload. Skip
-    // for v1 — the commit detail page shows the full message on click.
-    let payload: serde_json::Value =
-        serde_json::from_str(&ev.payload).unwrap_or(serde_json::Value::Null);
-    match ev.kind.as_str() {
-        // Commit message inline preview: a small follow-up. Left as None
-        // for now to keep ev → row pure.
-        "impl_revision_created" => None,
-        "feedback_added" | "feedback_updated" => {
-            // `prior_body` lives on the updated event only; the new body
-            // is in the structural feedback table. The user clicks
-            // through to read the full body on the artifact page.
-            None
-        }
-        _ => {
-            let _ = payload;
-            None
-        }
-    }
-}
-
-fn timeline_entry_actions(ev: &Event, ctx: &TimelineRenderCtx) -> Option<Markup> {
+pub fn timeline_row_from_event(ev: &Event, ctx: &TimelineRenderCtx<'_>) -> TimelineRow {
     use crate::daemon::amend::AmendInfo;
-    let session_id = ctx.session_id;
-    match ev.kind.as_str() {
+
+    let payload: serde_json::Value =
+        serde_json::from_str(&ev.payload).unwrap_or(serde_json::Value::Null);
+    let mut status_badges = Vec::new();
+    let mut needs_attention = NeedsAttention::None;
+    let mut actions = Vec::new();
+    let mut preview = None;
+
+    let title = match ev.kind.as_str() {
         "plan_revision_created" => {
             let rev_id = ev.target_id.as_deref().and_then(|s| s.parse::<i64>().ok());
-            let rev_id = rev_id?;
-            let n = ctx.plan_rev_number_by_id.get(&rev_id).copied().unwrap_or(0);
-            Some(html! {
-                a.pill href={ "/sessions/" (session_id) "/plan_revisions/" (rev_id) } { "View body" }
-                @if n > 1 {
-                    a.pill href={ "/sessions/" (session_id) "/plan_revisions/" (rev_id) "/diff" } { "Diff to #" (n - 1) }
+            let revision_number = rev_id
+                .and_then(|id| ctx.plan_rev_number_by_id.get(&id).copied())
+                .unwrap_or(0);
+            if let Some(rev_id) = rev_id {
+                preview = ctx.plan_preview_by_id.get(&rev_id).cloned();
+                actions.push(TimelineAction {
+                    label: "View",
+                    href: format!("/sessions/{}/plan_revisions/{rev_id}", ctx.session_id),
+                    icon: ActionIcon::View,
+                    aria_label: format!("View plan revision #{revision_number}"),
+                });
+                if revision_number > 1 {
+                    actions.push(TimelineAction {
+                        label: "Diff",
+                        href: format!("/sessions/{}/plan_revisions/{rev_id}/diff", ctx.session_id),
+                        icon: ActionIcon::Diff,
+                        aria_label: format!("Diff to #{}", revision_number - 1),
+                    });
                 }
-            })
+            }
+            TimelineTitle::PlanRevision { revision_number }
         }
         "impl_revision_created" => {
             let sha = ev.target_id.as_deref().unwrap_or("");
+            preview = ctx.commit_preview_by_sha.get(sha).cloned();
             match ctx.amend_by_sha.get(sha) {
                 Some(AmendInfo::Amend {
                     prev_sha,
                     amend_base_parent_sha,
-                }) => Some(html! {
-                    a.pill href={ "/sessions/" (session_id) "/commits/" (sha) "?vs=" (prev_sha) } {
-                        "Diff vs previous amend"
+                }) => {
+                    status_badges.push(StatusBadge::Amend);
+                    actions.push(TimelineAction {
+                        label: "Prev rev",
+                        href: format!("/sessions/{}/commits/{sha}?vs={prev_sha}", ctx.session_id),
+                        icon: ActionIcon::Previous,
+                        aria_label: "Diff vs previous amend".to_string(),
+                    });
+                    if let Some(base) = amend_base_parent_sha.as_deref() {
+                        actions.push(TimelineAction {
+                            label: "Full diff",
+                            href: format!("/sessions/{}/commits/{sha}?vs={base}", ctx.session_id),
+                            icon: ActionIcon::Diff,
+                            aria_label: "Full diff since parent".to_string(),
+                        });
+                    } else {
+                        actions.push(TimelineAction {
+                            label: "Diff",
+                            href: format!("/sessions/{}/commits/{sha}", ctx.session_id),
+                            icon: ActionIcon::Diff,
+                            aria_label: "Diff parent..commit".to_string(),
+                        });
                     }
-                    @if let Some(base) = amend_base_parent_sha.as_deref() {
-                        a.pill href={ "/sessions/" (session_id) "/commits/" (sha) "?vs=" (base) } {
-                            "Full diff since parent"
-                        }
-                    } @else {
-                        a.pill href={ "/sessions/" (session_id) "/commits/" (sha) } { "Diff parent..commit" }
-                    }
+                }
+                _ => actions.push(TimelineAction {
+                    label: "Diff",
+                    href: format!("/sessions/{}/commits/{sha}", ctx.session_id),
+                    icon: ActionIcon::Diff,
+                    aria_label: "Diff parent..commit".to_string(),
                 }),
-                _ => Some(html! {
-                    a.pill href={ "/sessions/" (session_id) "/commits/" (sha) } { "Diff parent..commit" }
-                }),
+            }
+            needs_attention = NeedsAttention::AwaitingImplReview;
+            TimelineTitle::Commit {
+                short_sha: short(sha),
             }
         }
         "head_reset_to_known_sha" => {
             let sha = ev.target_id.as_deref().unwrap_or("");
-            Some(
-                html! { a.pill href={ "/sessions/" (session_id) "/commits/" (sha) } { "Diff parent..commit" } },
-            )
-        }
-        "feedback_added" | "feedback_updated" => {
-            let payload: serde_json::Value =
-                serde_json::from_str(&ev.payload).unwrap_or(serde_json::Value::Null);
-            let fid = payload.get("feedback_id").and_then(|v| v.as_i64());
-            let fid = fid?;
-            let (kind, target_id) = ctx.feedback_target_by_id.get(&fid)?;
-            if kind == "plan_revision" {
-                let rev_id: i64 = target_id.parse().unwrap_or(0);
-                let n = ctx.plan_rev_number_by_id.get(&rev_id).copied().unwrap_or(0);
-                Some(html! {
-                    a.pill href={ "/sessions/" (session_id) "/plan_revisions/" (rev_id) "#feedback-" (fid) } {
-                        "Open in plan revision #" (n)
-                    }
-                })
-            } else {
-                Some(html! {
-                    a.pill href={ "/sessions/" (session_id) "/commits/" (target_id) "#feedback-" (fid) } {
-                        "Open in commit " code.mono { (short(target_id)) }
-                    }
-                })
+            actions.push(TimelineAction {
+                label: "Diff",
+                href: format!("/sessions/{}/commits/{sha}", ctx.session_id),
+                icon: ActionIcon::Diff,
+                aria_label: "Diff parent..commit".to_string(),
+            });
+            TimelineTitle::HeadReset {
+                short_sha: short(sha),
             }
         }
+        "feedback_added" | "feedback_updated" => {
+            let fid = payload.get("feedback_id").and_then(|v| v.as_i64());
+            if let Some(fid) = fid {
+                preview = ctx.feedback_preview_by_id.get(&fid).cloned();
+                if let Some((target_kind, target_id)) = ctx.feedback_target_by_id.get(&fid) {
+                    if target_kind == "plan_revision" {
+                        let rev_id = target_id.parse::<i64>().unwrap_or(0);
+                        let n = ctx.plan_rev_number_by_id.get(&rev_id).copied().unwrap_or(0);
+                        actions.push(TimelineAction {
+                            label: "Open",
+                            href: format!(
+                                "/sessions/{}/plan_revisions/{rev_id}#feedback-{fid}",
+                                ctx.session_id
+                            ),
+                            icon: ActionIcon::Open,
+                            aria_label: format!("Open in plan revision #{n}"),
+                        });
+                    } else {
+                        actions.push(TimelineAction {
+                            label: "Open",
+                            href: format!(
+                                "/sessions/{}/commits/{target_id}#feedback-{fid}",
+                                ctx.session_id
+                            ),
+                            icon: ActionIcon::Open,
+                            aria_label: format!("Open in commit {}", short(target_id)),
+                        });
+                    }
+                }
+            }
+            let kind = fid
+                .and_then(|id| ctx.feedback_kind_by_id.get(&id).copied())
+                .or_else(|| {
+                    ev.target_kind
+                        .as_deref()
+                        .and_then(feedback_kind_from_target_kind)
+                })
+                .unwrap_or(FeedbackKind::Plan);
+            let author = fid
+                .and_then(|id| ctx.feedback_author_by_id.get(&id).cloned())
+                .unwrap_or_else(|| display_actor(&ev.actor));
+            if let Some(status) = ctx
+                .feedback_status_by_author_kind
+                .get(&(kind, author.clone()))
+                .copied()
+            {
+                if status == FeedbackFileStatus::Current {
+                    status_badges.push(StatusBadge::FeedbackStatus(status));
+                } else {
+                    needs_attention = NeedsAttention::StaleFeedback;
+                }
+            }
+            TimelineTitle::Feedback { kind, author }
+        }
+        "state_transition" => {
+            let from = payload.get("from").and_then(|v| v.as_str()).unwrap_or("");
+            let to = payload.get("to").and_then(|v| v.as_str()).unwrap_or("");
+            if !to.is_empty() {
+                status_badges.push(StatusBadge::State(to.to_string()));
+            }
+            preview = match (from.is_empty(), to.is_empty()) {
+                (false, false) => Some(format!("{from} -> {to}")),
+                (true, false) => Some(to.to_string()),
+                _ => None,
+            };
+            TimelineTitle::StateTransition
+        }
+        "agent_joined" => {
+            let actor = payload
+                .get("label")
+                .and_then(|v| v.as_str())
+                .map(str::to_string)
+                .unwrap_or_else(|| display_actor(&ev.actor));
+            TimelineTitle::AgentJoined { actor }
+        }
+        "dirty_worktree_warning" => {
+            status_badges.push(StatusBadge::Warning);
+            preview = payload
+                .get("porcelain")
+                .and_then(|v| v.as_str())
+                .and_then(first_line_preview);
+            needs_attention = NeedsAttention::AwaitingImplReview;
+            TimelineTitle::Warning {
+                kind: WarningKind::DirtyWorktree,
+            }
+        }
+        "plan_file_missing" => {
+            status_badges.push(StatusBadge::Warning);
+            preview = payload
+                .get("path")
+                .and_then(|v| v.as_str())
+                .and_then(first_line_preview);
+            needs_attention = NeedsAttention::AwaitingPlanReview;
+            TimelineTitle::Warning {
+                kind: WarningKind::PlanFileMissing,
+            }
+        }
+        other => TimelineTitle::Other {
+            kind: other.to_string(),
+        },
+    };
+
+    TimelineRow {
+        event_id: ev.id,
+        event_kind: ev.kind.clone(),
+        session_id_for_prefix: ctx.session_id_for_prefix.map(str::to_string),
+        session_title_for_prefix: ctx.session_title_for_prefix.map(str::to_string),
+        actor: display_actor(&ev.actor),
+        ts: ev.ts,
+        title,
+        preview,
+        actions,
+        status_badges,
+        needs_attention,
+        kind_class: timeline_kind_class(&ev.kind),
+    }
+}
+
+pub fn timeline_row_article(row: &TimelineRow, live: bool) -> Markup {
+    let mut class_attr = format!("entry {}", row.kind_class);
+    if live {
+        class_attr.push_str(" live");
+    }
+    if row.needs_attention != NeedsAttention::None {
+        class_attr.push_str(" needs-attention");
+    }
+    html! {
+        article id={ "event-" (row.event_id) }
+                class=(class_attr)
+                data-event-kind=(row.event_kind) {
+            header.entry-top {
+                div.entry-title-group {
+                    @if let Some(sid) = &row.session_id_for_prefix {
+                        div.entry-session-prefix {
+                            a href={ "/sessions/" (sid) } {
+                                @if let Some(title) = &row.session_title_for_prefix {
+                                    (title)
+                                } @else {
+                                    (sid)
+                                }
+                            }
+                        }
+                    }
+                    div.entry-title {
+                        (timeline_title_markup(&row.title))
+                        @for badge in &row.status_badges {
+                            (status_badge_markup(badge))
+                        }
+                        (needs_attention_marker(row.needs_attention))
+                    }
+                }
+                @if !row.actions.is_empty() {
+                    nav.entry-actions aria-label="Timeline actions" {
+                        @for action in &row.actions {
+                            (timeline_action_link(action))
+                        }
+                    }
+                }
+            }
+            div.entry-meta {
+                span.actor { (row.actor) }
+                " · " (relative_time_tag(Some(row.ts)))
+            }
+            @if let Some(p) = &row.preview {
+                div.entry-preview { (p) }
+            }
+        }
+    }
+}
+
+pub fn timeline_row_oob(row: &TimelineRow, target_id: &str) -> Markup {
+    html! {
+        template hx-swap-oob={ "afterbegin:#" (target_id) } {
+            (timeline_row_article(row, true))
+        }
+    }
+}
+
+fn timeline_title_markup(title: &TimelineTitle) -> Markup {
+    match title {
+        TimelineTitle::PlanRevision { revision_number } => html! {
+            "Plan revision "
+            @if *revision_number > 0 { "#" (revision_number) } @else { "—" }
+        },
+        TimelineTitle::Commit { short_sha } => html! { "Commit " code.mono { (short_sha) } },
+        TimelineTitle::HeadReset { short_sha } => {
+            html! { "HEAD reset to " code.mono { (short_sha) } }
+        }
+        TimelineTitle::Feedback { kind, author } => {
+            html! { (kind.as_str()) " feedback from " span.actor { (author) } }
+        }
+        TimelineTitle::StateTransition => html! { "State changed" },
+        TimelineTitle::AgentJoined { actor } => html! { (actor) " joined" },
+        TimelineTitle::Warning { kind } => match kind {
+            WarningKind::DirtyWorktree => html! { "Dirty worktree" },
+            WarningKind::PlanFileMissing => html! { "Plan file missing" },
+        },
+        TimelineTitle::Other { kind } => html! { (kind) },
+    }
+}
+
+fn status_badge_markup(badge: &StatusBadge) -> Markup {
+    match badge {
+        StatusBadge::Amend => html! { span.kind-badge.amend { "amend" } },
+        StatusBadge::FeedbackStatus(status) => feedback_file_badge(*status),
+        StatusBadge::State(state) => html! { span.kind-badge { (state) } },
+        StatusBadge::Warning => html! { span.kind-badge.warning-badge { "warning" } },
+    }
+}
+
+fn needs_attention_marker(needs: NeedsAttention) -> Markup {
+    let label = match needs {
+        NeedsAttention::None => return html! {},
+        NeedsAttention::AwaitingPlanReview => "needs plan review",
+        NeedsAttention::AwaitingImplReview => "needs impl review",
+        NeedsAttention::StaleFeedback => "feedback stale",
+    };
+    html! { span.attention-badge { (label) } }
+}
+
+fn timeline_action_link(action: &TimelineAction) -> Markup {
+    html! {
+        a.icon-action href=(action.href) title=(action.aria_label) aria-label=(action.aria_label) {
+            (action_icon(action.icon))
+            span.action-label { (action.label) }
+        }
+    }
+}
+
+fn action_icon(icon: ActionIcon) -> Markup {
+    let svg = match icon {
+        ActionIcon::Open => include_str!("icons/external-link.svg"),
+        ActionIcon::View => include_str!("icons/file-text.svg"),
+        ActionIcon::Diff => include_str!("icons/git-compare-arrows.svg"),
+        ActionIcon::Previous => include_str!("icons/history.svg"),
+        ActionIcon::Sound => include_str!("icons/volume-2.svg"),
+    };
+    html! { span.action-icon aria-hidden="true" { (PreEscaped(svg)) } }
+}
+
+fn active_plan_preview(preview: Option<&ActivePlanPreview>) -> Markup {
+    let Some(preview) = preview else {
+        return html! {};
+    };
+    let summary = html! {
+        span { "Active plan revision #" (preview.revision_number) }
+        span.plan-preview-meta {
+            (relative_time_tag(Some(preview.created_at)))
+            " · " code.mono { "rev " (preview.rev_id) }
+        }
+    };
+    if preview.is_long {
+        html! {
+            section.active-plan-preview {
+                details.active-plan {
+                    summary { (summary) }
+                    article.markdown { (PreEscaped(&preview.body_html)) }
+                }
+            }
+        }
+    } else {
+        html! {
+            section.active-plan-preview {
+                header.active-plan-head { (summary) }
+                article.markdown { (PreEscaped(&preview.body_html)) }
+            }
+        }
+    }
+}
+
+fn sound_test_button() -> Markup {
+    html! {
+        button.icon-action type="button" title="Test notification sound" aria-label="Test notification sound" data-sound-test="" {
+            (action_icon(ActionIcon::Sound))
+            span { "Test sound" }
+        }
+    }
+}
+
+fn relative_time_tag(ts: Option<i64>) -> Markup {
+    match ts {
+        Some(ts) => html! {
+            time.relative datetime=(absolute_time(ts)) title=(absolute_time(ts)) data-ts=(ts) {
+                (relative_time(Some(ts)))
+            }
+        },
+        None => html! { span.relative { "—" } },
+    }
+}
+
+fn timeline_kind_class(kind: &str) -> &'static str {
+    match kind {
+        "plan_revision_created" => "plan-rev",
+        "impl_revision_created" => "impl-commit",
+        "head_reset_to_known_sha" => "head-reset",
+        "feedback_added" | "feedback_updated" => "feedback",
+        "state_transition" => "state",
+        "agent_joined" => "meta-event",
+        "dirty_worktree_warning" | "plan_file_missing" => "warning",
+        _ => "meta-event",
+    }
+}
+
+fn feedback_kind_from_target_kind(kind: &str) -> Option<FeedbackKind> {
+    match kind {
+        "plan_revision" => Some(FeedbackKind::Plan),
+        "implementation_commit" => Some(FeedbackKind::Impl),
         _ => None,
     }
+}
+
+fn display_actor(actor: &str) -> String {
+    actor
+        .strip_prefix("agent:")
+        .or_else(|| actor.strip_prefix("system:"))
+        .unwrap_or(actor)
+        .to_string()
+}
+
+fn first_line_preview(body: &str) -> Option<String> {
+    body.lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .map(|line| truncate_chars(line, 180))
+}
+
+fn truncate_chars(value: &str, max: usize) -> String {
+    let mut out = String::new();
+    for (idx, ch) in value.chars().enumerate() {
+        if idx >= max {
+            out.push('…');
+            return out;
+        }
+        out.push(ch);
+    }
+    out
 }
 
 fn timeline_head_scripts() -> Markup {
@@ -503,40 +892,113 @@ fn timeline_head_scripts() -> Markup {
 /// no-op when the user prefers reduced motion.
 const TIMELINE_FLIP_JS: &str = r#"
 (() => {
-  const FEED_SEL = '#timeline-feed';
+  const FEED_SEL = '[data-timeline-feed]';
   const REDUCED = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
-  if (REDUCED) return;
   let snapshot = new Map();
+  let audioCtx = null;
+
+  function relative(ts) {
+    if (!ts || ts <= 0) return 'stale';
+    const diff = Math.floor(Date.now() / 1000) - ts;
+    if (diff < 0) return 'in the future';
+    if (diff < 60) return 'just now';
+    if (diff < 3600) return `${Math.floor(diff / 60)}m ago`;
+    if (diff < 86400) return `${Math.floor(diff / 3600)}h ago`;
+    if (diff < 604800) return `${Math.floor(diff / 86400)}d ago`;
+    return new Date(ts * 1000).toLocaleDateString();
+  }
+
+  function updateTimes() {
+    for (const el of document.querySelectorAll('time.relative[data-ts]')) {
+      const ts = Number(el.dataset.ts);
+      el.textContent = relative(ts);
+    }
+  }
+
+  function ping() {
+    try {
+      const Ctor = window.AudioContext || window.webkitAudioContext;
+      if (!Ctor) return;
+      audioCtx = audioCtx || new Ctor();
+      const playTone = () => {
+        const now = audioCtx.currentTime;
+        const master = audioCtx.createGain();
+        master.gain.setValueAtTime(0.0001, now);
+        master.gain.exponentialRampToValueAtTime(0.16, now + 0.018);
+        master.gain.exponentialRampToValueAtTime(0.0001, now + 1.05);
+        master.connect(audioCtx.destination);
+
+        for (const [offset, base, level] of [[0, 1174.66, 0.46], [0.09, 1567.98, 0.34], [0.19, 2349.32, 0.22]]) {
+          for (const [ratio, mix] of [[1, 1], [2.01, 0.22], [3.98, 0.08]]) {
+            const osc = audioCtx.createOscillator();
+            const gain = audioCtx.createGain();
+            const start = now + offset;
+            osc.type = 'sine';
+            osc.frequency.setValueAtTime(base * ratio, start);
+            osc.frequency.exponentialRampToValueAtTime(base * ratio * 1.006, start + 0.2);
+            gain.gain.setValueAtTime(0.0001, start);
+            gain.gain.exponentialRampToValueAtTime(level * mix, start + 0.012);
+            gain.gain.exponentialRampToValueAtTime(0.0001, start + 0.72);
+            osc.connect(gain).connect(master);
+            osc.start(start);
+            osc.stop(start + 0.78);
+          }
+        }
+      };
+      if (audioCtx.state === 'suspended') {
+        audioCtx.resume().then(playTone).catch(() => {});
+      } else {
+        playTone();
+      }
+    } catch (_) {}
+  }
+
   function snap() {
+    if (REDUCED) return;
     snapshot.clear();
-    const feed = document.querySelector(FEED_SEL);
-    if (!feed) return;
-    for (const el of feed.children) {
-      if (!el.id) continue;
-      snapshot.set(el.id, el.getBoundingClientRect().top);
+    for (const feed of document.querySelectorAll(FEED_SEL)) {
+      for (const el of feed.children) {
+        if (!el.id) continue;
+        snapshot.set(el.id, el.getBoundingClientRect().top);
+      }
     }
   }
   function play() {
-    const feed = document.querySelector(FEED_SEL);
-    if (!feed) return;
-    for (const el of feed.children) {
-      if (!el.id || !snapshot.has(el.id)) continue;
-      const prev = snapshot.get(el.id);
-      const next = el.getBoundingClientRect().top;
-      const delta = prev - next;
-      if (Math.abs(delta) < 0.5) continue;
-      el.style.transition = 'none';
-      el.style.transform = `translateY(${delta}px)`;
-      requestAnimationFrame(() => {
-        el.style.transition = 'transform 220ms ease-out';
-        el.style.transform = '';
-        el.addEventListener('transitionend', () => {
-          el.style.transition = '';
-        }, { once: true });
-      });
+    updateTimes();
+    const live = Array.from(document.querySelectorAll('article.entry.live'));
+    if (live.length) {
+      ping();
+      setTimeout(() => live.forEach((el) => el.classList.remove('live')), 1600);
+    }
+    if (REDUCED) return;
+    for (const feed of document.querySelectorAll(FEED_SEL)) {
+      const clip = feed.parentElement ? feed.parentElement.getBoundingClientRect() : null;
+      for (const el of feed.children) {
+        if (!el.id || !snapshot.has(el.id)) continue;
+        const rect = el.getBoundingClientRect();
+        if (clip && (rect.bottom < clip.top || rect.top > clip.bottom)) continue;
+        const prev = snapshot.get(el.id);
+        const next = rect.top;
+        const delta = prev - next;
+        if (Math.abs(delta) < 0.5) continue;
+        el.style.transition = 'none';
+        el.style.transform = `translateY(${delta}px)`;
+        requestAnimationFrame(() => {
+          el.style.transition = 'transform 220ms ease-out';
+          el.style.transform = '';
+          el.addEventListener('transitionend', () => {
+            el.style.transition = '';
+          }, { once: true });
+        });
+      }
     }
     snapshot.clear();
   }
+  document.addEventListener('click', (event) => {
+    if (event.target.closest('[data-sound-test]')) ping();
+  });
+  updateTimes();
+  setInterval(updateTimes, 30000);
   document.addEventListener('htmx:beforeSwap', snap, true);
   document.addEventListener('htmx:oobBeforeSwap', snap, true);
   document.addEventListener('htmx:afterSwap', play, true);
@@ -653,15 +1115,34 @@ pub fn commit_diff(view: &CommitDiffView) -> Markup {
         super::http::DiffBaseLabel::Parent(None) => "root commit".to_string(),
         super::http::DiffBaseLabel::Override(s) => format!("from {}.. (base override)", short(s)),
     };
+    let file_count = view.files.len();
+    let changed_lines: usize = view.files.iter().map(FileDiff::changed_lines).sum();
+    let file_index_class = if view.files.len() > 8 {
+        "file-index two-col"
+    } else {
+        "file-index"
+    };
+    let review_count = view.feedback.len();
     layout_wide(
         &format!("Trinity — commit {}", short_sha),
         html! {
             (detail_header(&view.session_id, &format!("Commit {short_sha}"), html! {
                 span.base-chip { (base_chip) }
+                @if view.is_amend {
+                    span.kind-badge.amend { "amend" }
+                }
+                @if review_count == 0 {
+                    span.muted { "No reviews yet · 0" }
+                } @else {
+                    a.pill href="#reviews" { "Reviews · " (review_count) " ↓" }
+                }
             }))
             section.detail-meta {
                 "Full SHA: " code.mono { (view.commit.commit_sha) }
                 " · " (relative_time(Some(view.commit.created_at)))
+                " · " (file_count) " files"
+                " · +" (view.files.iter().map(|f| f.additions).sum::<usize>())
+                " -" (view.files.iter().map(|f| f.deletions).sum::<usize>())
                 @if let Some(b) = &view.commit.branch { " · branch " code { (b) } }
                 @if view.commit.is_head != 0 { " · " span.head-tag { "HEAD" } }
             }
@@ -673,10 +1154,115 @@ pub fn commit_diff(view: &CommitDiffView) -> Markup {
                 summary { "Diff stat" }
                 pre.diff-stat { (view.commit.diff_stat) }
             }
-            section.diff-pane.raw-diff { pre { (view.diff) } }
             (feedback_panel(&view.feedback))
+            @if view.files.is_empty() {
+                section.diff-pane.raw-diff { pre { (view.diff) } }
+            } @else {
+                nav.(file_index_class) aria-label="Files changed" {
+                    @for (idx, file) in view.files.iter().enumerate() {
+                        a href={ "#" (file.anchor(idx)) } {
+                            span.file-index-path { (file.path) }
+                            span.file-index-stat {
+                                "+" (file.additions) " -" (file.deletions)
+                            }
+                        }
+                    }
+                }
+                section.structured-diff aria-label="Commit diff" data-changed-lines=(changed_lines) {
+                    @for (idx, file) in view.files.iter().enumerate() {
+                        (render_file_diff(file, idx, view.files.len()))
+                    }
+                }
+            }
         },
     )
+}
+
+fn render_file_diff(file: &FileDiff, idx: usize, total_files: usize) -> Markup {
+    let anchor = file.anchor(idx);
+    let collapsed = file.is_collapsed_by_default(total_files);
+    let path_label = if matches!(file.mode, FileDiffMode::Renamed) {
+        file.old_path
+            .as_ref()
+            .map(|old| format!("{old} -> {}", file.path))
+            .unwrap_or_else(|| file.path.clone())
+    } else {
+        file.path.clone()
+    };
+    let summary = html! {
+        span.file-diff-path { (path_label) }
+        span.file-mode { (file_mode_label(&file.mode)) }
+        span.file-stat { "+" (file.additions) " -" (file.deletions) }
+    };
+    if collapsed {
+        html! {
+            details.file-diff id=(anchor) {
+                summary { (summary) }
+                (render_file_diff_body(file))
+            }
+        }
+    } else {
+        html! {
+            details.file-diff id=(anchor) open {
+                summary { (summary) }
+                (render_file_diff_body(file))
+            }
+        }
+    }
+}
+
+fn render_file_diff_body(file: &FileDiff) -> Markup {
+    if file.binary {
+        return html! { div.binary-diff { "Binary file changed." } };
+    }
+    html! {
+        div.diff-table role="table" {
+            @for hunk in &file.hunks {
+                div.diff-hunk-header role="row" {
+                    span.lineno {}
+                    span.lineno {}
+                    span.diff-content { (hunk.header) }
+                }
+                @for line in &hunk.lines {
+                    (render_parsed_diff_line(line))
+                }
+            }
+        }
+    }
+}
+
+fn render_parsed_diff_line(line: &crate::daemon::diff_parser::DiffLine) -> Markup {
+    let cls = match line.kind {
+        ParsedDiffLineKind::Insert => "diff-row ins",
+        ParsedDiffLineKind::Delete => "diff-row del",
+        ParsedDiffLineKind::Context => "diff-row ctx",
+        ParsedDiffLineKind::Meta => "diff-row meta",
+    };
+    let marker = match line.kind {
+        ParsedDiffLineKind::Insert => "+",
+        ParsedDiffLineKind::Delete => "-",
+        ParsedDiffLineKind::Context => " ",
+        ParsedDiffLineKind::Meta => "\\",
+    };
+    html! {
+        div.(cls) role="row" {
+            span.lineno { @if let Some(n) = line.old_lineno { (n) } }
+            span.lineno { @if let Some(n) = line.new_lineno { (n) } }
+            span.diff-content {
+                span.diff-marker { (marker) }
+                (line.content)
+            }
+        }
+    }
+}
+
+fn file_mode_label(mode: &FileDiffMode) -> &'static str {
+    match mode {
+        FileDiffMode::Added => "added",
+        FileDiffMode::Removed => "removed",
+        FileDiffMode::Renamed => "renamed",
+        FileDiffMode::Modified => "modified",
+    }
 }
 
 // ---------- helpers ----------
@@ -731,7 +1317,7 @@ fn relative_time(ts: Option<i64>) -> String {
         return "in the future".into();
     }
     if diff < 60 {
-        return format!("{diff}s ago");
+        return "just now".into();
     }
     if diff < 3600 {
         return format!("{}m ago", diff / 60);
@@ -805,7 +1391,7 @@ fn feedback_panel(feedback: &[DiffViewFeedback]) -> Markup {
         return html! {};
     }
     html! {
-        section.inline-feedback {
+        section.inline-feedback id="reviews" {
             h2 { "Feedback" }
             @for fb in feedback {
                 article.inline-feedback-item id={ "feedback-" (fb.feedback_id) } {
@@ -860,8 +1446,15 @@ pub async fn sse_event_fragment(
     use crate::storage::{feedback as feedback_store, implementation_revisions, plan_revisions};
 
     let mut plan_rev_number_by_id: HashMap<i64, i64> = HashMap::new();
+    let mut plan_preview_by_id: HashMap<i64, String> = HashMap::new();
     let mut amend_by_sha: HashMap<String, crate::daemon::amend::AmendInfo> = HashMap::new();
+    let mut commit_preview_by_sha: HashMap<String, String> = HashMap::new();
     let mut feedback_target_by_id: HashMap<i64, (String, String)> = HashMap::new();
+    let mut feedback_preview_by_id: HashMap<i64, String> = HashMap::new();
+    let mut feedback_kind_by_id: HashMap<i64, FeedbackKind> = HashMap::new();
+    let mut feedback_author_by_id: HashMap<i64, String> = HashMap::new();
+    let feedback_status_by_author_kind: HashMap<(FeedbackKind, String), FeedbackFileStatus> =
+        HashMap::new();
 
     match ev.kind.as_str() {
         "plan_revision_created" => {
@@ -869,6 +1462,9 @@ pub async fn sse_event_fragment(
                 && let Ok(Some(rev)) = plan_revisions::fetch(pool, rev_id).await
             {
                 plan_rev_number_by_id.insert(rev.id, rev.revision_number);
+                if let Some(preview) = first_line_preview(&rev.body) {
+                    plan_preview_by_id.insert(rev.id, preview);
+                }
             }
         }
         "impl_revision_created" | "head_reset_to_known_sha" => {
@@ -878,6 +1474,9 @@ pub async fn sse_event_fragment(
                 let infos = crate::daemon::amend::classify(&rows);
                 for (row, info) in rows.iter().zip(infos) {
                     amend_by_sha.insert(row.commit_sha.clone(), info);
+                    if let Some(preview) = first_line_preview(&row.commit_message) {
+                        commit_preview_by_sha.insert(row.commit_sha.clone(), preview);
+                    }
                 }
             }
         }
@@ -887,6 +1486,10 @@ pub async fn sse_event_fragment(
             if let Some(fid) = payload.get("feedback_id").and_then(|v| v.as_i64())
                 && let Ok(Some(rec)) = feedback_store::fetch(pool, fid).await
             {
+                if let Some(preview) = first_line_preview(&rec.body) {
+                    feedback_preview_by_id.insert(rec.id, preview);
+                }
+                feedback_author_by_id.insert(rec.id, rec.author_label.as_str().to_string());
                 let (kind, target) = match &rec.target {
                     FeedbackTargetRef::PlanRevision(rev_id) => {
                         if let Ok(Some(rev)) = plan_revisions::fetch(pool, *rev_id).await {
@@ -899,6 +1502,11 @@ pub async fn sse_event_fragment(
                         sha.as_str().to_string(),
                     ),
                 };
+                let feedback_kind = match rec.target.kind() {
+                    crate::domain::TargetKind::PlanRevision => FeedbackKind::Plan,
+                    crate::domain::TargetKind::ImplementationCommit => FeedbackKind::Impl,
+                };
+                feedback_kind_by_id.insert(rec.id, feedback_kind);
                 feedback_target_by_id.insert(rec.id, (kind, target));
             }
         }
@@ -907,25 +1515,20 @@ pub async fn sse_event_fragment(
 
     let ctx = TimelineRenderCtx {
         session_id: session_id.as_str(),
+        session_id_for_prefix: None,
+        session_title_for_prefix: None,
         plan_rev_number_by_id: &plan_rev_number_by_id,
+        plan_preview_by_id: &plan_preview_by_id,
         amend_by_sha: &amend_by_sha,
+        commit_preview_by_sha: &commit_preview_by_sha,
         feedback_target_by_id: &feedback_target_by_id,
+        feedback_preview_by_id: &feedback_preview_by_id,
+        feedback_kind_by_id: &feedback_kind_by_id,
+        feedback_author_by_id: &feedback_author_by_id,
+        feedback_status_by_author_kind: &feedback_status_by_author_kind,
     };
-    render_entry(ev, &ctx, true)
-}
-
-fn timeline_entry_class(kind: &str) -> &'static str {
-    match kind {
-        "plan_revision_created" => "entry plan-rev",
-        "impl_revision_created" => "entry impl-commit",
-        "head_reset_to_known_sha" => "entry head-reset",
-        "feedback_added" | "feedback_updated" => "entry feedback",
-        "state_transition" => "entry state",
-        "agent_joined" => "entry meta-event",
-        "dirty_worktree_warning" => "entry warning",
-        "plan_file_missing" => "entry warning",
-        _ => "entry meta-event",
-    }
+    let row = timeline_row_from_event(ev, &ctx);
+    timeline_row_oob(&row, "timeline-feed")
 }
 
 fn layout_wide(title: &str, content: Markup) -> Markup {
@@ -961,239 +1564,3 @@ fn layout(title: &str, content: Markup) -> Markup {
         }
     }
 }
-
-const STYLE: &str = r#"
-:root {
-  --bg: #fafaf7; --bg-alt: #ffffff; --fg: #1f1f1f; --muted: #6c6c6c;
-  --line: #d8d8d4; --accent: #2b3a55;
-  --planning: #ad6b00; --impl: #1d5fb0; --archived: #999;
-  --plan-accent: #4338ca;       /* indigo */
-  --commit-accent: #16a34a;     /* green  */
-  --feedback-accent: #d97706;   /* amber  */
-  --state-accent: #6b7280;      /* gray   */
-  --head-reset-accent: #ea580c; /* orange */
-  --warning-accent: #b45309;
-  --pill-bg: #efefe9;
-  --pill-bg-hover: #e4e4dd;
-  --entry-shadow: 0 1px 2px rgba(0,0,0,0.04);
-  --entry-shadow-hover: 0 4px 12px rgba(0,0,0,0.06);
-  --entry-radius: 8px;
-  --highlight-fade: rgba(67, 56, 202, 0.10);
-}
-@media (prefers-color-scheme: dark) {
-  :root {
-    --bg: #14141a; --bg-alt: #1c1c24; --fg: #e8e8ed; --muted: #9da0aa;
-    --line: #2c2c36; --accent: #8aa1ff;
-    --pill-bg: #25252e; --pill-bg-hover: #2f2f3a;
-    --entry-shadow: 0 1px 2px rgba(0,0,0,0.4);
-    --entry-shadow-hover: 0 4px 12px rgba(0,0,0,0.5);
-    --highlight-fade: rgba(67, 56, 202, 0.22);
-  }
-}
-* { box-sizing: border-box; }
-body { margin: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
-       background: var(--bg); color: var(--fg); line-height: 1.55; }
-main { max-width: 1100px; margin: 0 auto; padding: 24px; }
-h1 { font-size: 1.6rem; margin: 0 0 16px; font-weight: 600; }
-h2 { font-size: 1.15rem; margin: 28px 0 12px; font-weight: 600; }
-h3 { font-size: 1rem; margin: 22px 0 10px; font-weight: 600; color: #333; }
-nav.crumbs { font-size: 0.9rem; margin-bottom: 12px; }
-nav.crumbs a { color: var(--muted); text-decoration: none; }
-nav.crumbs a:hover { text-decoration: underline; }
-table.sessions, table.history { width: 100%; border-collapse: collapse; background: var(--bg-alt);
-  border: 1px solid var(--line); border-radius: 6px; overflow: hidden; }
-table th, table td { padding: 10px 14px; text-align: left; border-bottom: 1px solid var(--line);
-  font-size: 0.92rem; vertical-align: top; }
-table th { background: #f3f3ee; font-weight: 600; font-size: 0.82rem; text-transform: uppercase;
-  letter-spacing: 0.04em; color: var(--muted); }
-table tr:last-child td { border-bottom: none; }
-.num { text-align: right; font-variant-numeric: tabular-nums; }
-.path, .mono { font-family: ui-monospace, "SF Mono", monospace; font-size: 0.83rem; color: var(--muted); word-break: break-all; }
-.session-id { font-size: 0.85rem; color: var(--muted); }
-.empty { color: var(--muted); font-style: italic; }
-.badge { display: inline-block; padding: 2px 8px; border-radius: 999px; font-size: 0.78rem; font-weight: 600;
-  text-transform: uppercase; letter-spacing: 0.04em; background: #eee; color: #444; }
-.badge.planning { background: #fff1d6; color: var(--planning); }
-.badge.impl-review { background: #d6e5f7; color: var(--impl); }
-.badge.archived { background: #efefef; color: var(--archived); }
-.relative { color: var(--muted); font-size: 0.85rem; }
-section.meta { background: var(--bg-alt); border: 1px solid var(--line); border-radius: 6px;
-  padding: 14px 18px; margin-bottom: 18px; }
-section.meta dl { display: grid; grid-template-columns: 130px 1fr; gap: 4px 16px; margin: 0; }
-section.meta dt { color: var(--muted); font-size: 0.82rem; text-transform: uppercase; letter-spacing: 0.04em; }
-section.meta dd { margin: 0; }
-section.toolbar { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 14px; }
-section.toolbar form { display: inline-flex; gap: 4px; }
-section.toolbar form.inline input { padding: 4px 8px; border: 1px solid var(--line); border-radius: 4px; font-size: 0.88rem; }
-button { padding: 4px 12px; border: 1px solid var(--line); border-radius: 4px; background: var(--bg-alt);
-  color: var(--fg); cursor: pointer; font-size: 0.88rem; }
-button:hover { background: #efefe9; }
-button.primary { background: var(--accent); color: #fff; border-color: var(--accent); }
-button.primary:hover { background: #1f2a3d; }
-button.danger { color: #b03030; border-color: #d8a8a8; }
-button.warning { color: #855900; border-color: #d8c98a; }
-ul.agents { list-style: none; padding: 0; margin: 0; display: flex; flex-wrap: wrap; gap: 8px; }
-ul.agents li { background: #efefe9; padding: 2px 8px; border-radius: 4px; font-size: 0.85rem; }
-ul.agents .role { color: var(--muted); font-size: 0.78rem; text-transform: uppercase; }
-.muted { color: var(--muted); }
-article.markdown { background: var(--bg-alt); border: 1px solid var(--line); border-radius: 6px;
-  padding: 18px 22px; font-size: 0.95rem; }
-article.markdown pre { background: #f3f3ee; padding: 10px 12px; border-radius: 4px; overflow-x: auto; font-size: 0.85rem; }
-article.markdown code { background: #f3f3ee; padding: 1px 4px; border-radius: 3px; font-size: 0.85rem; font-family: ui-monospace, "SF Mono", monospace; }
-article.markdown pre code { background: none; padding: 0; }
-.revision-meta { color: var(--muted); font-size: 0.85rem; margin-bottom: 8px; }
-details.revision-history, details.commit-history { margin-top: 16px; }
-details.revision-history summary, details.commit-history summary { cursor: pointer; color: var(--muted); font-size: 0.9rem; }
-details.revision-history ol, details.commit-history ol { margin: 8px 0; padding-left: 20px; font-size: 0.88rem; color: var(--muted); }
-div.feedback { background: var(--bg-alt); border: 1px solid var(--line); border-radius: 6px;
-  padding: 12px 14px; margin-bottom: 10px; }
-header.feedback-head { font-size: 0.85rem; color: var(--muted); margin-bottom: 6px; }
-header.feedback-head .actor { font-weight: 600; color: var(--fg); }
-.warning { color: #855900; }
-div.feedback-body pre { white-space: pre-wrap; word-wrap: break-word; background: none; padding: 0; margin: 0;
-  font-family: inherit; font-size: 0.95rem; }
-section.comment-box { margin-top: 24px; }
-section.comment-box form { display: flex; flex-direction: column; gap: 6px; max-width: 600px; }
-section.comment-box textarea, section.comment-box input { padding: 8px; border: 1px solid var(--line);
-  border-radius: 4px; font-family: inherit; font-size: 0.92rem; }
-section.comment-box button { align-self: flex-start; }
-section.timeline ol { list-style: none; padding: 0; margin: 0; }
-section.timeline li { padding: 6px 0; font-size: 0.88rem; border-bottom: 1px dashed var(--line); }
-section.timeline .actor { font-weight: 600; }
-section.timeline .kind { color: var(--muted); font-family: ui-monospace, "SF Mono", monospace; }
-
-/* ---------- Session detail v2: flat timeline + sticky head ---------- */
-header.session-head { display: flex; align-items: center; justify-content: space-between;
-  gap: 16px; padding: 14px 18px; margin: 0 0 18px; background: var(--bg-alt);
-  border: 1px solid var(--line); border-radius: 8px; flex-wrap: wrap;
-  position: sticky; top: 12px; z-index: 5; box-shadow: var(--entry-shadow); }
-header.session-head .session-head-left { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
-header.session-head .session-head-right { display: flex; align-items: center; gap: 14px; color: var(--muted);
-  font-size: 0.88rem; flex-wrap: wrap; }
-header.session-head h1.session-id { font-size: 1.15rem; margin: 0; font-weight: 600;
-  font-family: ui-monospace, "SF Mono", monospace; }
-header.session-head a.back { color: var(--muted); text-decoration: none; font-size: 0.9rem; }
-header.session-head a.back:hover { text-decoration: underline; }
-header.session-head a.muted-link { color: var(--muted); font-size: 0.85rem; text-decoration: none;
-  border-bottom: 1px dotted currentColor; }
-.head-meta { font-size: 0.85rem; }
-
-section.watched-artifacts { margin: 0 0 18px; padding: 12px 18px; background: var(--bg-alt);
-  border: 1px solid var(--line); border-radius: 8px; }
-section.watched-artifacts h2 { font-size: 0.95rem; margin: 0 0 8px; color: var(--muted); font-weight: 600; }
-section.watched-artifacts h3 { font-size: 0.85rem; margin: 12px 0 6px; color: var(--muted); }
-
-section.timeline-section h2 { font-size: 1rem; margin: 12px 0 10px; color: var(--muted); font-weight: 600;
-  text-transform: uppercase; letter-spacing: 0.05em; }
-#timeline-feed { display: flex; flex-direction: column; gap: 10px; }
-
-article.entry { position: relative; padding: 12px 14px 12px 18px; background: var(--bg-alt);
-  border: 1px solid var(--line); border-radius: var(--entry-radius); box-shadow: var(--entry-shadow);
-  transition: box-shadow 180ms ease-out, transform 180ms ease-out;
-  animation: timeline-enter 200ms ease-out, timeline-highlight 1500ms ease-out; }
-article.entry:hover { box-shadow: var(--entry-shadow-hover); }
-article.entry::before { content: ""; position: absolute; left: 6px; top: 14px; bottom: 14px;
-  width: 3px; border-radius: 2px; background: var(--state-accent); }
-article.entry.plan-rev::before    { background: var(--plan-accent); }
-article.entry.impl-commit::before { background: var(--commit-accent); }
-article.entry.feedback::before    { background: var(--feedback-accent); }
-article.entry.state::before       { background: var(--state-accent); }
-article.entry.head-reset::before  { background: var(--head-reset-accent); }
-article.entry.warning::before     { background: var(--warning-accent); }
-article.entry.meta-event::before  { background: var(--state-accent); opacity: 0.5; }
-
-article.entry .entry-title { font-size: 1rem; font-weight: 600; line-height: 1.3;
-  display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
-article.entry .entry-meta { font-size: 0.82rem; color: var(--muted); margin-top: 2px; }
-article.entry .entry-meta .actor { font-weight: 600; color: var(--fg); }
-article.entry .entry-preview { font-size: 0.9rem; margin-top: 6px; color: var(--fg);
-  font-family: ui-monospace, "SF Mono", monospace; font-size: 0.85rem; }
-article.entry .entry-actions { margin-top: 10px; display: flex; gap: 6px; flex-wrap: wrap;
-  opacity: 0; transition: opacity 120ms ease-out; }
-article.entry:hover .entry-actions, article.entry:focus-within .entry-actions { opacity: 1; }
-@media (pointer: coarse) {
-  article.entry .entry-actions { opacity: 1; }
-}
-
-a.pill { display: inline-flex; align-items: center; gap: 4px;
-  padding: 3px 10px; border-radius: 999px; font-size: 0.82rem; text-decoration: none;
-  background: var(--pill-bg); color: var(--fg); border: 1px solid transparent;
-  transition: background 120ms ease-out, border-color 120ms ease-out; }
-a.pill:hover { background: var(--pill-bg-hover); }
-article.entry.plan-rev    a.pill:hover { border-color: var(--plan-accent); color: var(--plan-accent); }
-article.entry.impl-commit a.pill:hover { border-color: var(--commit-accent); color: var(--commit-accent); }
-article.entry.feedback    a.pill:hover { border-color: var(--feedback-accent); color: var(--feedback-accent); }
-article.entry.head-reset  a.pill:hover { border-color: var(--head-reset-accent); color: var(--head-reset-accent); }
-
-.kind-badge { display: inline-block; padding: 1px 8px; border-radius: 999px;
-  font-size: 0.7rem; text-transform: uppercase; letter-spacing: 0.05em;
-  background: var(--pill-bg); color: var(--muted); font-weight: 600; }
-.kind-badge.amend { background: #fef3c7; color: #92400e; }
-@media (prefers-color-scheme: dark) {
-  .kind-badge.amend { background: #422a0a; color: #fbbf24; }
-}
-
-@keyframes timeline-enter {
-  from { opacity: 0; transform: translateY(-6px); }
-  to   { opacity: 1; transform: none; }
-}
-@keyframes timeline-highlight {
-  from { background-color: var(--highlight-fade); }
-  to   { background-color: var(--bg-alt); }
-}
-@media (prefers-reduced-motion: reduce) {
-  article.entry { animation: none; transition: none; }
-  article.entry .entry-actions { opacity: 1; }
-}
-
-/* ---------- Detail (diff / revision) wider layout ---------- */
-body.wide-layout main { max-width: 1080px; }
-header.detail-header { display: flex; align-items: baseline; justify-content: space-between;
-  gap: 12px; padding: 12px 16px; margin: 0 0 18px; background: var(--bg-alt);
-  border: 1px solid var(--line); border-radius: 8px; flex-wrap: wrap;
-  position: sticky; top: 12px; z-index: 5; box-shadow: var(--entry-shadow); }
-header.detail-header .detail-crumbs { font-size: 0.88rem; color: var(--muted); }
-header.detail-header .detail-crumbs a { color: var(--muted); text-decoration: none; }
-header.detail-header .detail-crumbs a:hover { text-decoration: underline; }
-header.detail-header .detail-title { font-size: 1.1rem; font-weight: 600; }
-header.detail-header .detail-actions { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
-header.detail-header .detail-actions .base-chip { font-size: 0.85rem; color: var(--muted);
-  font-family: ui-monospace, "SF Mono", monospace; padding: 2px 8px; border-radius: 999px;
-  background: var(--pill-bg); }
-section.detail-meta { font-size: 0.88rem; color: var(--muted); margin: 0 0 14px; }
-article.markdown.detail-body { background: var(--bg-alt); border: 1px solid var(--line);
-  border-radius: 8px; padding: 22px 26px; }
-details.detail-body-fold { margin-top: 12px; }
-details.detail-body-fold summary { cursor: pointer; color: var(--muted); font-size: 0.9rem; }
-details.commit-msg-fold, details.diff-stat-fold { margin: 10px 0; }
-details.commit-msg-fold summary, details.diff-stat-fold summary { cursor: pointer; color: var(--muted);
-  font-size: 0.88rem; font-weight: 600; padding: 4px 0; }
-
-section.diff-pane { background: var(--bg-alt); border: 1px solid var(--line);
-  border-radius: 8px; padding: 8px 0; overflow-x: auto; font-family: ui-monospace, "SF Mono", monospace;
-  font-size: 0.83rem; }
-section.diff-pane .diff-line { white-space: pre; padding: 0 16px; }
-section.diff-pane .diff-line.ins { background: rgba(22, 163, 74, 0.10); color: #166534; }
-section.diff-pane .diff-line.del { background: rgba(220, 38, 38, 0.10); color: #991b1b; }
-section.diff-pane .diff-line.ctx { color: var(--fg); }
-@media (prefers-color-scheme: dark) {
-  section.diff-pane .diff-line.ins { background: rgba(22, 163, 74, 0.20); color: #86efac; }
-  section.diff-pane .diff-line.del { background: rgba(220, 38, 38, 0.20); color: #fca5a5; }
-}
-section.diff-pane.raw-diff pre { margin: 0; padding: 8px 16px; white-space: pre; }
-
-section.inline-feedback { margin-top: 28px; }
-section.inline-feedback h2 { font-size: 1rem; margin: 0 0 10px; color: var(--muted);
-  text-transform: uppercase; letter-spacing: 0.05em; font-weight: 600; }
-article.inline-feedback-item { padding: 12px 14px; background: var(--bg-alt);
-  border: 1px solid var(--line); border-radius: 6px; margin-bottom: 8px; }
-article.inline-feedback-item .anchor { color: var(--muted); text-decoration: none; font-size: 0.78rem;
-  font-family: ui-monospace, "SF Mono", monospace; }
-article.inline-feedback-item .feedback-file-path { margin-top: 8px; font-size: 0.78rem; color: var(--muted); }
-article.inline-feedback-item:target { border-color: var(--feedback-accent);
-  box-shadow: 0 0 0 3px rgba(217, 119, 6, 0.18); }
-.head-tag { background: var(--commit-accent); color: white; padding: 1px 6px; border-radius: 4px;
-  font-size: 0.7rem; font-weight: 600; letter-spacing: 0.05em; }
-
-article.entry.live { /* animation applied via class on initial render too — that's fine */ }
-"#;

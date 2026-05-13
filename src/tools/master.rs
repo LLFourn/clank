@@ -111,6 +111,16 @@ pub async fn register_plan_file(
         .map_err(|e| ToolError::Internal(anyhow::anyhow!(e)))?;
     }
 
+    state
+        .lifecycle
+        .archive_other_active_sessions_in_repo(
+            &repo_root_str,
+            &session_id,
+            &format!("agent:{label}"),
+        )
+        .await
+        .map_err(map_lifecycle_err)?;
+
     upsert_seen_with_event(state, &session_id, &label, now).await?;
 
     let outcome = state

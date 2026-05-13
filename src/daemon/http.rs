@@ -24,6 +24,7 @@ use crate::storage::{
 pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/", get(home))
+        .route("/events", get(home_events_stream))
         .route("/healthz", get(healthz))
         .route("/sessions/{session_id}", get(session_detail))
         .route("/sessions/{session_id}/history", get(session_history))
@@ -55,6 +56,8 @@ async fn home(State(state): State<AppState>) -> Result<Html<String>, AppError> {
     let rows = sessions::list_active(&state.pool)
         .await
         .map_err(AppError::sqlx)?;
+    let sessions_by_id: HashMap<String, sessions::Session> =
+        rows.iter().map(|s| (s.id.clone(), s.clone())).collect();
     let mut out = Vec::with_capacity(rows.len());
     for s in rows {
         let sid = SessionId::from(s.id.clone());
@@ -81,7 +84,8 @@ async fn home(State(state): State<AppState>) -> Result<Html<String>, AppError> {
             current_feedback_files,
         });
     }
-    Ok(Html(ui::home(&out).into_string()))
+    let activity = build_home_activity(&state, &sessions_by_id).await?;
+    Ok(Html(ui::home(&out, &activity).into_string()))
 }
 
 /// Count how many of this session's `feedback_files` rows currently
@@ -101,6 +105,172 @@ async fn count_current_feedback_files(state: &AppState, sid: &SessionId) -> Resu
         .filter(|s| s.status == crate::domain::FeedbackFileStatus::Current)
         .count();
     Ok(n as i64)
+}
+
+#[derive(Default)]
+struct TimelineMaps {
+    plan_rev_number_by_id: HashMap<i64, i64>,
+    plan_preview_by_id: HashMap<i64, String>,
+    amend_by_sha: HashMap<String, crate::daemon::amend::AmendInfo>,
+    commit_preview_by_sha: HashMap<String, String>,
+    feedback_target_by_id: HashMap<i64, (String, String)>,
+    feedback_preview_by_id: HashMap<i64, String>,
+    feedback_kind_by_id: HashMap<i64, FeedbackKind>,
+    feedback_author_by_id: HashMap<i64, String>,
+    feedback_status_by_author_kind:
+        HashMap<(FeedbackKind, String), crate::domain::FeedbackFileStatus>,
+}
+
+async fn build_home_activity(
+    state: &AppState,
+    sessions_by_id: &HashMap<String, sessions::Session>,
+) -> Result<ui::HomeActivity, AppError> {
+    let events = ev_store::recent_for_active_sessions(&state.pool, 40)
+        .await
+        .map_err(AppError::sqlx)?;
+    let mut grouped: HashMap<String, Vec<crate::storage::events::Event>> = HashMap::new();
+    for ev in events {
+        grouped.entry(ev.session_id.clone()).or_default().push(ev);
+    }
+    let mut rows = Vec::new();
+    for (session_id, mut events) in grouped {
+        let Some(session) = sessions_by_id.get(&session_id) else {
+            continue;
+        };
+        let sid = SessionId::from(session_id);
+        let maps = build_timeline_maps(state, &sid).await?;
+        events.sort_by_key(|ev| std::cmp::Reverse(ev.id));
+        rows.extend(timeline_rows_for_events(session, &events, &maps, true));
+    }
+    rows.sort_by_key(|row| std::cmp::Reverse(row.event_id));
+    Ok(ui::HomeActivity {
+        rows,
+        unavailable: false,
+    })
+}
+
+async fn build_timeline_maps(state: &AppState, sid: &SessionId) -> Result<TimelineMaps, AppError> {
+    let all_plans = plans::list_for_session(&state.pool, sid)
+        .await
+        .map_err(AppError::sqlx)?;
+    let all_feedback = feedback_store::list_for_session(&state.pool, sid)
+        .await
+        .map_err(AppError::feedback)?;
+    let feedback_ctx = state
+        .lifecycle
+        .build_feedback_context(sid)
+        .await
+        .map_err(AppError::lifecycle)?;
+
+    let mut maps = TimelineMaps::default();
+    for plan in &all_plans {
+        let impl_rows = impl_revs::list_for_plan(&state.pool, plan.id)
+            .await
+            .map_err(AppError::sqlx)?;
+        let amend_info = crate::daemon::amend::classify(&impl_rows);
+        for (row, info) in impl_rows.into_iter().zip(amend_info) {
+            if let Some(preview) = text_preview(&row.commit_message) {
+                maps.commit_preview_by_sha
+                    .insert(row.commit_sha.clone(), preview);
+            }
+            maps.amend_by_sha.insert(row.commit_sha, info);
+        }
+
+        let revs = plan_revisions::list_for_plan(&state.pool, plan.id)
+            .await
+            .map_err(AppError::sqlx)?;
+        for rev in revs {
+            maps.plan_rev_number_by_id
+                .insert(rev.id, rev.revision_number);
+            if let Some(preview) = text_preview(&rev.body) {
+                maps.plan_preview_by_id.insert(rev.id, preview);
+            }
+        }
+    }
+
+    for rec in &all_feedback {
+        let (kind_string, target_id, feedback_kind) = match &rec.target {
+            FeedbackTargetRef::PlanRevision(rev_id) => (
+                "plan_revision".to_string(),
+                rev_id.to_string(),
+                FeedbackKind::Plan,
+            ),
+            FeedbackTargetRef::ImplementationCommit(sha) => (
+                "implementation_commit".to_string(),
+                sha.as_str().to_string(),
+                FeedbackKind::Impl,
+            ),
+        };
+        maps.feedback_target_by_id
+            .insert(rec.id, (kind_string, target_id));
+        maps.feedback_kind_by_id.insert(rec.id, feedback_kind);
+        maps.feedback_author_by_id
+            .insert(rec.id, rec.author_label.as_str().to_string());
+        if let Some(preview) = text_preview(&rec.body) {
+            maps.feedback_preview_by_id.insert(rec.id, preview);
+        }
+    }
+
+    for snapshot in feedback_ctx.plan_files {
+        maps.feedback_status_by_author_kind.insert(
+            (FeedbackKind::Plan, snapshot.row.author_label.clone()),
+            snapshot.status,
+        );
+    }
+    for snapshot in feedback_ctx.impl_files {
+        maps.feedback_status_by_author_kind.insert(
+            (FeedbackKind::Impl, snapshot.row.author_label.clone()),
+            snapshot.status,
+        );
+    }
+
+    Ok(maps)
+}
+
+fn timeline_rows_for_events(
+    session: &sessions::Session,
+    events: &[crate::storage::events::Event],
+    maps: &TimelineMaps,
+    with_session_prefix: bool,
+) -> Vec<ui::TimelineRow> {
+    let session_title = session.display_title.as_deref();
+    let ctx = ui::TimelineRenderCtx {
+        session_id: &session.id,
+        session_id_for_prefix: with_session_prefix.then_some(session.id.as_str()),
+        session_title_for_prefix: with_session_prefix
+            .then_some(session_title.unwrap_or(session.id.as_str())),
+        plan_rev_number_by_id: &maps.plan_rev_number_by_id,
+        plan_preview_by_id: &maps.plan_preview_by_id,
+        amend_by_sha: &maps.amend_by_sha,
+        commit_preview_by_sha: &maps.commit_preview_by_sha,
+        feedback_target_by_id: &maps.feedback_target_by_id,
+        feedback_preview_by_id: &maps.feedback_preview_by_id,
+        feedback_kind_by_id: &maps.feedback_kind_by_id,
+        feedback_author_by_id: &maps.feedback_author_by_id,
+        feedback_status_by_author_kind: &maps.feedback_status_by_author_kind,
+    };
+    events
+        .iter()
+        .rev()
+        .map(|ev| ui::timeline_row_from_event(ev, &ctx))
+        .collect()
+}
+
+fn text_preview(body: &str) -> Option<String> {
+    body.lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .map(|line| {
+            let mut out = String::new();
+            for (idx, ch) in line.chars().enumerate() {
+                if idx >= 180 {
+                    out.push('…');
+                    return out;
+                }
+                out.push(ch);
+            }
+            out
+        })
 }
 
 async fn session_detail(
@@ -127,10 +297,6 @@ async fn session_detail(
     .fetch_one(&state.pool)
     .await
     .map_err(AppError::sqlx)?;
-
-    let all_session_feedback = feedback_store::list_for_session(&state.pool, &sid)
-        .await
-        .map_err(AppError::feedback)?;
 
     let events = ev_store::for_session(&state.pool, &sid)
         .await
@@ -162,60 +328,37 @@ async fn session_detail(
             .to_string(),
     );
 
-    // Amend chain classification: collect impl revisions across every
-    // plan in the session and classify per-plan, then index by commit_sha.
-    let mut amend_by_sha: HashMap<String, crate::daemon::amend::AmendInfo> = HashMap::new();
-    let all_plans = plans::list_for_session(&state.pool, &sid)
-        .await
-        .map_err(AppError::sqlx)?;
-    let mut plan_rev_number_by_id: HashMap<i64, i64> = HashMap::new();
-    for plan in &all_plans {
-        let rows = impl_revs::list_for_plan(&state.pool, plan.id)
+    let timeline_maps = build_timeline_maps(&state, &sid).await?;
+    let timeline_rows = timeline_rows_for_events(&session, &events, &timeline_maps, false);
+    let active_plan_preview = match &active_plan {
+        Some(plan) => plan_revisions::latest_for_plan(&state.pool, plan.id)
             .await
-            .map_err(AppError::sqlx)?;
-        let info = crate::daemon::amend::classify(&rows);
-        for (row, ai) in rows.into_iter().zip(info) {
-            amend_by_sha.insert(row.commit_sha, ai);
-        }
-
-        let revs = plan_revisions::list_for_plan(&state.pool, plan.id)
-            .await
-            .map_err(AppError::sqlx)?;
-        for rev in revs {
-            plan_rev_number_by_id.insert(rev.id, rev.revision_number);
-        }
-    }
-
-    // Feedback id → (target_kind, target_id), used by feedback rows to
-    // route to the right artifact anchor.
-    let mut feedback_target_by_id: HashMap<i64, (String, String)> = HashMap::new();
-    for rec in &all_session_feedback {
-        let (k, t) = match &rec.target {
-            FeedbackTargetRef::PlanRevision(rev_id) => {
-                ("plan_revision".to_string(), rev_id.to_string())
-            }
-            FeedbackTargetRef::ImplementationCommit(sha) => (
-                "implementation_commit".to_string(),
-                sha.as_str().to_string(),
-            ),
-        };
-        feedback_target_by_id.insert(rec.id, (k, t));
-    }
+            .map_err(AppError::sqlx)?
+            .map(|rev| {
+                let is_long = rev.body.lines().count() > 24 || rev.body.len() > 3500;
+                ui::ActivePlanPreview {
+                    rev_id: rev.id,
+                    revision_number: rev.revision_number,
+                    body_html: render_markdown(&rev.body),
+                    created_at: rev.created_at,
+                    is_long,
+                }
+            }),
+        None => None,
+    };
 
     Ok(Html(
         ui::session_detail(&ui::SessionDetail {
             session,
             active_plan,
+            active_plan_preview,
             archived_count,
-            events,
             plan_feedback_files: ctx.plan_files,
             impl_feedback_files: ctx.impl_files,
             git_logs_head_path,
             plan_feedback_dir_path,
             impl_feedback_dir_path,
-            amend_by_sha,
-            plan_rev_number_by_id,
-            feedback_target_by_id,
+            timeline_rows,
             max_event_id,
         })
         .into_string(),
@@ -332,11 +475,15 @@ async fn commit_diff(
         .await
         .map_err(AppError::sqlx)?;
     let mut found: Option<impl_revs::ImplementationRevision> = None;
+    let mut plan_impl_rows = Vec::new();
     for p in plans_in_session {
         if let Some(r) = impl_revs::fetch_by_sha(&state.pool, p.id, &CommitSha::from(sha.clone()))
             .await
             .map_err(AppError::sqlx)?
         {
+            plan_impl_rows = impl_revs::list_for_plan(&state.pool, p.id)
+                .await
+                .map_err(AppError::sqlx)?;
             found = Some(r);
             break;
         }
@@ -364,6 +511,14 @@ async fn commit_diff(
         Ok(d) => d,
         Err(e) => format!("(failed to compute diff: {e})"),
     };
+    let files = super::diff_parser::parse_diff(&diff);
+    let is_amend = plan_impl_rows
+        .iter()
+        .zip(crate::daemon::amend::classify(&plan_impl_rows))
+        .any(|(row, info)| {
+            row.commit_sha == rev.commit_sha
+                && matches!(info, crate::daemon::amend::AmendInfo::Amend { .. })
+        });
 
     let all = feedback_store::list_for_session(&state.pool, &sid)
         .await
@@ -395,8 +550,10 @@ async fn commit_diff(
             session_id: session.id,
             commit: rev,
             diff,
+            files,
             base_label,
             feedback,
+            is_amend,
         })
         .into_string(),
     ))
@@ -480,6 +637,91 @@ async fn events_stream(
             Box<dyn futures::Stream<Item = Result<Event, std::convert::Infallible>> + Send>,
         >)
     .keep_alive(KeepAlive::default()))
+}
+
+async fn home_events_stream(
+    State(state): State<AppState>,
+    axum::extract::Query(query): axum::extract::Query<SseQuery>,
+    headers: axum::http::HeaderMap,
+) -> Result<impl axum::response::IntoResponse, AppError> {
+    use axum::response::sse::{Event, KeepAlive, Sse};
+    use futures::StreamExt;
+    use tokio_stream::wrappers::BroadcastStream;
+
+    let supplied_cursor = headers
+        .get("last-event-id")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.parse().ok())
+        .or(query.since);
+    let initial_cursor = match supplied_cursor {
+        Some(cursor) => cursor,
+        None => ev_store::max_id(&state.pool)
+            .await
+            .map_err(AppError::sqlx)?,
+    };
+
+    let rx = state.lifecycle.subscribe();
+    let stream_state = state.clone();
+
+    let stream = async_stream::stream! {
+        let mut cursor = initial_cursor;
+        let mut bs = BroadcastStream::new(rx);
+        'stream: loop {
+            let rows = match ev_store::active_session_events_after(&stream_state.pool, cursor).await {
+                Ok(rows) => rows,
+                Err(err) => {
+                    tracing::error!(error = ?err, "home SSE event query failed");
+                    break;
+                }
+            };
+            for ev in rows {
+                match home_event_fragment(&stream_state, &ev).await {
+                    Ok(fragment) => {
+                        let id_str = ev.id.to_string();
+                        let evt: Result<Event, std::convert::Infallible> =
+                            Ok(Event::default().id(id_str).data(fragment.into_string()));
+                        yield evt;
+                    }
+                    Err(err) => {
+                        tracing::warn!(event_id = ev.id, error = ?err.message, "home SSE fragment skipped");
+                    }
+                }
+                cursor = ev.id;
+            }
+            if bs.next().await.is_none() {
+                break 'stream;
+            }
+        }
+    };
+
+    Ok(Sse::new(Box::pin(stream)
+        as std::pin::Pin<
+            Box<dyn futures::Stream<Item = Result<Event, std::convert::Infallible>> + Send>,
+        >)
+    .keep_alive(KeepAlive::default()))
+}
+
+async fn home_event_fragment(
+    state: &AppState,
+    ev: &crate::storage::events::Event,
+) -> Result<maud::Markup, AppError> {
+    let sid = SessionId::from(ev.session_id.clone());
+    let session = sessions::fetch(&state.pool, &sid)
+        .await
+        .map_err(AppError::sqlx)?
+        .ok_or_else(|| AppError::not_found(format!("no session {}", ev.session_id)))?;
+    if session.active_plan_id.is_none() {
+        return Err(AppError::not_found(format!(
+            "session {} has no active plan",
+            ev.session_id
+        )));
+    }
+    let maps = build_timeline_maps(state, &sid).await?;
+    let rows = timeline_rows_for_events(&session, std::slice::from_ref(ev), &maps, true);
+    let Some(row) = rows.first() else {
+        return Err(AppError::not_found("event vanished"));
+    };
+    Ok(ui::timeline_row_oob(row, "home-timeline-feed"))
 }
 
 async fn session_max_event_id(pool: &sqlx::SqlitePool, sid: &SessionId) -> Result<i64, AppError> {

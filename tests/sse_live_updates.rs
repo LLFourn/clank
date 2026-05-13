@@ -96,12 +96,16 @@ async fn sse_emits_oob_fragment_for_new_plan_revision() {
         "live SSE rows must carry the live class that triggers insertion animation; got:\n{body}"
     );
     assert!(
-        body.contains("View body"),
+        body.contains("View plan revision #2"),
         "SSE plan_revision fragment must carry click-through action pill; got:\n{body}"
     );
     assert!(
         body.contains("hx-swap-oob=\"afterbegin:#timeline-feed\""),
         "SSE fragment must declare OOB swap target; got:\n{body}"
+    );
+    assert!(
+        body.contains("<template hx-swap-oob=\"afterbegin:#timeline-feed\"><article"),
+        "OOB swap must wrap the article so htmx does not strip the live row root; got:\n{body}"
     );
 }
 
@@ -273,7 +277,7 @@ async fn sse_without_cursor_streams_live_events_from_now() {
     std::fs::write(app.repo.join("plan.md"), "# v2\n").unwrap();
     let body = stream_handle.await.unwrap();
     assert!(
-        body.contains("entry plan-rev") && body.contains("View body"),
+        body.contains("entry plan-rev") && body.contains("View plan revision #2"),
         "SSE without a cursor should stream future live events; got:\n{body}"
     );
 }

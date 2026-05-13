@@ -260,6 +260,104 @@ async fn commit_made_while_daemon_off_is_observed_on_restart() {
 }
 
 #[tokio::test]
+async fn unchanged_impl_feedback_is_not_retargeted_on_restart_after_amend() {
+    let app = TestApp::spawn().await;
+    let plan_path = app.repo.join("plan.md");
+    std::fs::write(&plan_path, "# body\n").unwrap();
+    app.call(
+        "register_plan_file",
+        &app.repo,
+        None,
+        json!({"session_id": "s", "path": &plan_path, "label": "m"}),
+    )
+    .await
+    .unwrap();
+
+    let sha_a = make_commit(&app.repo, "f.txt", "x\n");
+    tokio::time::sleep(std::time::Duration::from_millis(2500)).await;
+
+    let canonical_repo = dunce::canonicalize(&app.repo).unwrap();
+    let impl_dir = canonical_repo
+        .join(".trinity")
+        .join("feedback")
+        .join("s")
+        .join("impl");
+    std::fs::write(impl_dir.join("rev-a.md"), "same words\n").unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(2500)).await;
+
+    std::fs::write(app.repo.join("f.txt"), "x\ny\n").unwrap();
+    common::run_git(&app.repo, &["add", "f.txt"]);
+    common::run_git(&app.repo, &["commit", "-q", "--amend", "--no-edit"]);
+    let sha_b = common::run_git(&app.repo, &["rev-parse", "HEAD"]);
+    assert_ne!(sha_a, sha_b);
+    tokio::time::sleep(std::time::Duration::from_millis(2500)).await;
+
+    let app = app.restart().await;
+
+    let total: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM feedback \
+         WHERE session_id = 's' AND author_label = 'rev-a' AND target_kind = 'implementation_commit'",
+    )
+    .fetch_one(&app.state.pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        total, 1,
+        "restart recovery must not duplicate unchanged feedback onto the amended commit"
+    );
+
+    let target_id: String = sqlx::query_scalar(
+        "SELECT target_id FROM feedback \
+         WHERE session_id = 's' AND author_label = 'rev-a' AND target_kind = 'implementation_commit'",
+    )
+    .fetch_one(&app.state.pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        target_id, sha_a,
+        "unchanged feedback remains attached to the commit it reviewed"
+    );
+
+    let retargeted: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM feedback \
+         WHERE session_id = 's' AND author_label = 'rev-a' \
+           AND target_kind = 'implementation_commit' AND target_id = ?",
+    )
+    .bind(&sha_b)
+    .fetch_one(&app.state.pool)
+    .await
+    .unwrap();
+    assert_eq!(retargeted, 0);
+
+    let feedback_added: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM events \
+         WHERE session_id = 's' AND kind = 'feedback_added' AND actor = 'agent:rev-a'",
+    )
+    .fetch_one(&app.state.pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        feedback_added, 1,
+        "restart must not emit a new feedback_added event"
+    );
+
+    let ctx = app
+        .call(
+            "get_context",
+            &app.repo,
+            None,
+            json!({"session_id": "s", "author_label": "rev-a"}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(ctx["write_feedback"]["status"], "stale");
+    assert_eq!(
+        ctx["write_feedback"]["last_ingested_target"]["id"].as_str(),
+        Some(sha_a.as_str())
+    );
+}
+
+#[tokio::test]
 async fn agents_last_seen_survives_restart() {
     let app = TestApp::spawn().await;
     let plan_path = app.repo.join("plan.md");

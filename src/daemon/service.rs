@@ -11,7 +11,7 @@
 //!
 //! Lifecycle and feedback share the same per-session async mutex.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use serde_json::json;
@@ -217,6 +217,66 @@ impl SessionService {
 
     pub fn watcher(&self) -> &super::watcher::Watcher {
         &self.watcher
+    }
+
+    /// Archive active plans in the same repo when a newer session takes over.
+    /// The `.git/logs/HEAD` watcher is repo-wide; leaving older sessions active
+    /// would make future commits look like implementation revisions for every
+    /// still-open session in that repository.
+    pub async fn archive_other_active_sessions_in_repo(
+        &self,
+        repo_root: &str,
+        keep_session_id: &SessionId,
+        actor: &str,
+    ) -> Result<Vec<SessionId>, LifecycleServiceError> {
+        let rows: Vec<String> = sqlx::query_scalar(
+            "SELECT id FROM sessions \
+             WHERE repo_root = ? AND archived_at IS NULL \
+               AND active_plan_id IS NOT NULL AND id <> ?",
+        )
+        .bind(repo_root)
+        .bind(keep_session_id.as_str())
+        .fetch_all(&self.pool)
+        .await?;
+
+        let mut archived = Vec::with_capacity(rows.len());
+        for id in rows {
+            let sid = SessionId::from(id);
+            self.observe(&sid, actor, Observation::ArchiveRequested)
+                .await?;
+            archived.push(sid);
+        }
+        Ok(archived)
+    }
+
+    pub async fn archive_superseded_active_sessions(
+        &self,
+        actor: &str,
+    ) -> Result<Vec<SessionId>, LifecycleServiceError> {
+        let rows: Vec<(String, String, i64, i64)> = sqlx::query_as(
+            "SELECT s.id, s.repo_root, p.started_at, p.id \
+             FROM sessions s \
+             JOIN plans p ON p.id = s.active_plan_id \
+             WHERE s.archived_at IS NULL \
+               AND s.active_plan_id IS NOT NULL \
+               AND p.state != 'archived' \
+             ORDER BY s.repo_root ASC, p.started_at DESC, p.id DESC",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        let mut kept_repos = HashSet::new();
+        let mut archived = Vec::new();
+        for (id, repo_root, _started_at, _plan_id) in rows {
+            if kept_repos.insert(repo_root) {
+                continue;
+            }
+            let sid = SessionId::from(id);
+            self.observe(&sid, actor, Observation::ArchiveRequested)
+                .await?;
+            archived.push(sid);
+        }
+        Ok(archived)
     }
 
     /// Compute the session's current active review target. For

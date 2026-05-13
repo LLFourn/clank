@@ -34,6 +34,20 @@ async fn commit_diff_default_uses_parent_sha() {
     // Sticky header chips up the diff base. Default = parent.
     assert!(body.contains("parent "));
     assert!(body.contains("base-chip") || body.contains("Commit"));
+    assert!(body.contains("No reviews yet · 0"));
+}
+
+#[tokio::test]
+async fn commit_diff_page_renders_structured_file_diff() {
+    let app = TestApp::spawn().await;
+    let sha = register_then_commit(&app).await;
+    let resp = app.get(&format!("/sessions/s/commits/{sha}")).await;
+    assert_eq!(resp.status(), 200);
+    let body = resp.text().await.unwrap();
+    assert!(body.contains(r#"class="file-index""#), "body:\n{body}");
+    assert!(body.contains(r#"class="structured-diff""#), "body:\n{body}");
+    assert!(body.contains(r#"class="diff-row ins""#), "body:\n{body}");
+    assert!(body.contains("f.txt"), "body:\n{body}");
 }
 
 #[tokio::test]
@@ -80,6 +94,8 @@ async fn commit_diff_page_renders_inline_feedback_for_target_commit() {
     let body = resp.text().await.unwrap();
     assert!(body.contains("looks good but..."));
     assert!(body.contains("rev-a"));
+    assert!(body.contains(r##"href="#reviews""##));
+    assert!(body.contains("Reviews · 1"));
 }
 
 #[tokio::test]

@@ -13,12 +13,14 @@ use tokio::sync::mpsc;
 pub(crate) mod amend;
 pub(crate) mod apply;
 pub(crate) mod curator;
+pub(crate) mod diff_parser;
 pub(crate) mod feedback_status;
 pub(crate) mod git;
 pub mod http;
 pub(crate) mod internal_api;
 pub(crate) mod service;
 mod ui;
+mod ui_styles;
 pub(crate) mod watcher;
 
 pub use service::{
@@ -105,6 +107,16 @@ async fn recover(
     lifecycle: &Arc<SessionService>,
     watcher: &Arc<Watcher>,
 ) -> anyhow::Result<()> {
+    for sid in lifecycle
+        .archive_superseded_active_sessions("system:recover")
+        .await?
+    {
+        tracing::info!(
+            session_id = sid.as_str(),
+            "recovery: archived superseded active session"
+        );
+    }
+
     let all = sessions::list_active(pool).await?;
     for session in all {
         let sid = SessionId::from(session.id.clone());
@@ -448,9 +460,11 @@ async fn dispatch_head_moved(
 /// implementing plans, so the ingest target matches what `get_context`
 /// reports), then calls `SessionService::put_feedback` internally.
 ///
-/// No-op guard is target-aware: if the file hash equals the previous
-/// observation AND the target hasn't moved, the call returns early. A
-/// target-only change re-ingests the same body against the new target.
+/// No-op guard is content-based: if the file hash equals the previous
+/// observation and the prior ingest did not fail, the call returns early.
+/// Target movement alone leaves historical feedback attached to the
+/// artifact it was written for; authors must edit the file to apply the
+/// same words to a newer target.
 async fn dispatch_feedback_changed(
     lifecycle: &Arc<SessionService>,
     session_id: &SessionId,
@@ -483,25 +497,12 @@ async fn dispatch_feedback_changed(
     let existing =
         feedback_files::fetch(lifecycle.pool(), session_id, feedback_kind, author_label).await?;
 
-    // Target-aware no-op guard. Skip when hash hasn't changed, no
-    // parse_error is set, and the prior ingest's target matches the
-    // currently-expected target for this kind.
-    let target_matches_existing = |row: &feedback_files::FeedbackFile| -> bool {
-        match (
-            &resolution,
-            row.last_ingested_target_kind.as_deref(),
-            row.last_ingested_target_id.as_deref(),
-        ) {
-            (crate::daemon::service::FeedbackTargetResolution::Found(t), Some(rk), Some(rid)) => {
-                rk == t.kind.as_str() && rid == t.id
-            }
-            _ => false,
-        }
-    };
+    // Same content means same feedback. If HEAD or the latest plan revision
+    // moved since the last ingest, keep the prior row anchored to its
+    // original artifact until the reviewer edits the file.
     if let Some(row) = existing.as_ref()
         && row.parse_error.is_none()
         && row.last_observed_hash.as_deref() == Some(hash.as_str())
-        && target_matches_existing(row)
     {
         return Ok(());
     }
