@@ -160,6 +160,7 @@ Derivations:
 - **Implementation commits list for session X:** `Attributed { session: X, has_code_changes: true, .. }`.
 - **Mixed commit:** appears in both the plan-revisions and impl-commits lists. UI marks the row.
 - **Review gate:** derived from `plan_feedback` / `impl_feedback` against current target SHA. SHA-anchored — stale ≡ "verdict for a SHA that isn't the current target." No persistence, no overrides.
+- **`waiting_on`:** derived per session per the case table in "Waiting On — who blocks progress." Always one of `master`, `reviewers`, or `none`. Combines `plan_dirty`, phase, review-gate state, and participant set.
 
 ## Disk Format
 
@@ -260,6 +261,57 @@ One watcher per repo. The per-session-per-feedback-dir explosion is gone.
 
 The homepage shows current state per session + the live ring. No persistent timeline view.
 
+## Waiting On — who blocks progress
+
+At every moment, every active session has exactly one party blocking forward progress. Trinity computes a `waiting_on` value per session and surfaces it consistently in MCP context, on the homepage, and on the session detail page. **It is always one of: `master`, `reviewers`, or `none`.**
+
+The full case table — checked top-down, first match wins:
+
+| Condition | `waiting_on.role` | `reason` | `agents` |
+|---|---|---|---|
+| Plan moved to `plans/done/` | `none` | `session_done` | — |
+| Session has uncommitted plan changes (`plan_dirty == true`) | `master` | `commit_plan_revision` | — |
+| Phase = `planning`, gate = `changes_requested` | `master` | `address_plan_request_changes` | (the reviewers who requested changes, for context) |
+| Phase = `planning`, gate = `ready` | `master` | `ready_to_implement` | — |
+| Phase = `planning`, gate = `needs_review`, no participants yet | `reviewers` | `plan_needs_initial_review` | (empty — anyone) |
+| Phase = `planning`, gate = `needs_review`, participants with stale votes | `reviewers` | `plan_needs_rereview` | (the participants with stale votes for the current plan target) |
+| Phase = `implementing`, gate = `changes_requested` | `master` | `address_impl_request_changes` | (the reviewers who requested changes, for context) |
+| Phase = `implementing`, gate = `ready` | `master` | `ready_to_finish` | — |
+| Phase = `implementing`, gate = `needs_review`, no participants yet | `reviewers` | `impl_needs_initial_review` | (empty — anyone) |
+| Phase = `implementing`, gate = `needs_review`, participants with stale votes | `reviewers` | `impl_needs_rereview` | (the participants with stale votes for the current impl target) |
+
+Notes:
+
+- "Master" is the conceptual role of the agent driving the plan: editing the plan body, committing revisions, making impl commits. Trinity does not identify a specific master agent. The role-name is the contract; the human or AI filling it is whoever picks it up.
+- "Reviewers" is plural and may be empty (when no one has yet voted) or contain specific agent labels (when known participants need to re-review).
+- When `role == "master"` and the reason carries an `agents` list (e.g. for `address_plan_request_changes`), the listed agents are the reviewers who triggered the master's action — purely informational for the UI.
+- "Done" sessions are visible but `waiting_on == none`. They appear in the homepage's "Done" section without an action chip.
+
+The waiting_on derivation is part of the reducer's pure-projection layer (alongside review-gate derivation). It is recomputed on every render and on every observation; never persisted.
+
+### MCP surface
+
+`get_context` returns:
+
+```json
+"waiting_on": {
+  "role": "master" | "reviewers" | "none",
+  "reason": "<reason-key from the table>",
+  "agents": ["alice", "bob"],
+  "description": "Plan has uncommitted changes; commit the revision to release held reviews."
+}
+```
+
+The `description` is the canonical human-readable string for that case (Trinity's own copy; consistent across MCP and web UI). The `reason` is the machine-readable key. The `agents` array is always present (possibly empty).
+
+The existing `expected_action` field stays. It is the **caller-specific** next action: what should I, this agent, do given my role and the global `waiting_on`. `expected_action` is derived from `waiting_on` plus the caller's `author_label` (callers labeled as known reviewers get review-oriented actions; callers acting as master get master-oriented actions; ambiguous callers get the master action when role is master, or `review_plan` / `review_impl` when role is reviewers).
+
+### Web UI surface
+
+- **Homepage session row:** a chip beside each session, color-coded by role and labeled with the description's short form ("Master: commit revision" / "Reviewers: alice, bob" / "Done"). Hovering reveals the full description.
+- **Session detail page header:** a prominent banner with the full description, the role badge, and (when role = reviewers) the list of agents waiting on. Adjacent to the existing "Held reviews" banner when both apply.
+- **SSE live event payloads** include `waiting_on` so the chip and banner update in place as state changes (a new feedback file landing, a plan revision committing, etc.) without page refresh.
+
 ## Cold Start
 
 ```
@@ -304,7 +356,8 @@ Inputs: `session_id`, `author_label`. If `session_id` does not correspond to a p
 When the session exists, returns:
 
 - `phase` (`planning` | `implementing`), `expected_action`
-- `plan_dirty: bool` — true when the working-tree plan body differs from HEAD's plan body. When true, `expected_action` is `commit_plan_revision` (with the exact `git add` + `git commit` commands in `next_step`); plan reviewers should hold their feedback. Impl-phase actions proceed regardless.
+- `waiting_on`: the canonical per-session progress signal — `{ role, reason, agents, description }` per the "Waiting On" section. Always present.
+- `plan_dirty: bool` — true when the working-tree plan body differs from HEAD's plan body. When true, `waiting_on.role` is `master` with `reason: commit_plan_revision`; `expected_action` for the master matches.
 - `review_gate` (derived, SHA-anchored, no overrides)
 - `review_target`, `latest_plan_revision`, `latest_implementation_revision` (derived)
 - `write_feedback`: `{ kind, path: ".../<phase>/<current-target-sha>/<author>.md", status }`. When `plan_dirty` is true and the caller would be writing plan feedback, `status` is `"held_until_plan_committed"` and the caller is advised to wait.
@@ -398,6 +451,10 @@ One large rewrite, sequenced as six commits.
 - **Plan-dirty holds plan feedback.** When a session's working-tree plan body differs from HEAD's plan body, plan-phase feedback dropped during that window is held: the file is not auto-organized into `<plan/<target-sha>/<author>.md`; it appears in `Session.held_plan_feedback` and in the session detail page's "Held reviews" banner. Impl-phase feedback proceeds normally.
 - **Held feedback releases on plan commit.** After the operator commits the plan revision and `plan_dirty` flips false, previously-held feedback files get auto-organized to the new plan target SHA within one watcher round; the held banner clears.
 - **`get_context.plan_dirty` reports working-tree vs HEAD divergence.** When dirty, `expected_action` is `commit_plan_revision` for the plan author and the response carries the exact `git add` + `git commit` invocations.
+- **`waiting_on` is always exactly one of `master`, `reviewers`, `none`.** Computed deterministically from the case table; no session ever lacks a waiting_on value while active.
+- **`waiting_on` cases match the table precisely.** Each row of the table has integration coverage: dirty plan → master/commit_plan_revision; gate=changes_requested → master/address_*_request_changes; gate=needs_review with no participants → reviewers/initial_review; gate=needs_review with stale participants → reviewers/rereview with named agents; gate=ready → master/ready_to_*; done → none.
+- **MCP `get_context.waiting_on` matches the web UI's banner.** Both render from the same derivation; descriptions are byte-identical.
+- **Live updates to `waiting_on`.** Homepage chips and session-page banners update in place when state changes (new feedback file, plan commit, impl commit, done move) without page refresh.
 
 ## Tests
 
@@ -423,6 +480,17 @@ Integration (`tests/`):
 - Drop a plan feedback file while `plan_dirty` is true: file stays where written; `held_plan_feedback` includes it; gate is not affected; banner shows "1 held review."
 - Commit the plan revision: HEAD changes → rebuild → `plan_dirty` flips false → held file auto-organized into `<plan/<new-target-sha>/<author>.md` → gate recomputes → banner clears.
 - Drop an impl feedback file while `plan_dirty` is true: routes normally to `<impl/<current-impl-sha>/<author>.md`; not held.
+- `waiting_on` case coverage (each row of the case table gets one integration test):
+  - Plan committed, no reviews yet → `reviewers` / `plan_needs_initial_review` / `agents: []`.
+  - Alice writes `APPROVE` → `master` / `ready_to_implement` (one approval, no other participants).
+  - Bob then writes `REQUEST_CHANGES` → `master` / `address_plan_request_changes` / `agents: ["bob"]`.
+  - Plan revised + committed → `reviewers` / `plan_needs_rereview` / `agents: ["alice", "bob"]` (both have stale votes).
+  - Alice re-approves, Bob re-approves → `master` / `ready_to_implement`.
+  - First impl commit → phase implementing, `reviewers` / `impl_needs_initial_review`.
+  - Alice approves impl, Bob requests changes on impl → `master` / `address_impl_request_changes` / `agents: ["bob"]`.
+  - Address impl, all approve → `master` / `ready_to_finish`.
+  - `mv plans/<id>.md plans/done/<id>.md` + commit → `none` / `session_done`.
+  - Working-tree edit to plan during any planning state → `master` / `commit_plan_revision` (preempts all other states).
 - `start_plan` adopts an existing plan file without overwriting body.
 - `start_plan` in a repo with `.trinity/` wholesale-gitignored: clear error.
 - Commit the plan (`A` status); commit code: attribution map records the impl commit against the session; phase flips to implementing.
