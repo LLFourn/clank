@@ -89,7 +89,7 @@ If nothing matches before `timeout_secs`, return `{ "matches": [], "timed_out": 
 - **Subscribe + re-check.** Otherwise subscribe to `Runtime::events_tx`. On each event, re-compute matches. Return on first non-empty result.
 - **Timeout.** `tokio::time::timeout` wraps the whole select. On timeout, return `timed_out: true` with `matches: []`.
 - **Role match.** Exact match on `waiting_on.role.as_str()`. `none` (terminal sessions) never matches.
-- **Multi-repo.** When `repo` is unset, match across all known repos. When set, only that repo.
+- **Multi-repo.** When `repo` is unset, match across all known repos. When set, canonicalize via `dunce::canonicalize` and compare against `Trinity.repos` keys (which are already canonical) — so `/Users/...`, `~/...`, and symlinked variants all match correctly. Non-existent paths return an empty match list (don't error).
 - **Single-session.** When `session_id` is set, only that session (and `repo` should match if both given).
 - **Author exclusion.** When `exclude_authors` is set and `role == "reviewers"`, drop matches where any of the listed authors already has a current verdict for the target (i.e. they're already in `gate.approvals` or `gate.request_changes`). Lets a reviewer poll for "anything I haven't yet reviewed" without being woken by their own work.
 - **Deduplication.** When multiple events fire in rapid succession (e.g. a rebuild), the broadcast may deliver duplicates. The match-recompute is idempotent — return shape is the same regardless of how many events fired during the wait. No internal dedup needed.
@@ -120,8 +120,9 @@ pub async fn wait_for_work(runtime: &Runtime, args: WaitArgs) -> WaitResponse {
     let mut rx = runtime.subscribe_events();
 
     // Immediate return path.
-    if let Some(matches) = compute_matches(runtime, &args).await {
-        return WaitResponse { matches, timed_out: false, matched_at: now() };
+    let initial = compute_matches(runtime, &args).await;
+    if !initial.is_empty() {
+        return WaitResponse { matches: initial, timed_out: false };
     }
 
     // Block on events until match or timeout.
@@ -129,12 +130,13 @@ pub async fn wait_for_work(runtime: &Runtime, args: WaitArgs) -> WaitResponse {
     loop {
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
-            return WaitResponse { matches: vec![], timed_out: true, matched_at: now() };
+            return WaitResponse { matches: vec![], timed_out: true };
         }
         match tokio::time::timeout(remaining, rx.recv()).await {
             Ok(Ok(_event)) => {
-                if let Some(matches) = compute_matches(runtime, &args).await {
-                    return WaitResponse { matches, timed_out: false, matched_at: now() };
+                let next = compute_matches(runtime, &args).await;
+                if !next.is_empty() {
+                    return WaitResponse { matches: next, timed_out: false };
                 }
                 // No match yet; keep waiting.
             }
@@ -143,7 +145,7 @@ pub async fn wait_for_work(runtime: &Runtime, args: WaitArgs) -> WaitResponse {
                 rx = runtime.subscribe_events();
             }
             Err(_elapsed) => {
-                return WaitResponse { matches: vec![], timed_out: true, matched_at: now() };
+                return WaitResponse { matches: vec![], timed_out: true };
             }
         }
     }
@@ -152,48 +154,83 @@ pub async fn wait_for_work(runtime: &Runtime, args: WaitArgs) -> WaitResponse {
 
 ### Lock boundary for `compute_matches`
 
-`compute_matches` runs entirely on already-in-memory derived state — `RepoState::sessions`, `attribution`, `commit_order`, `plan_feedback`, `impl_feedback`. **It does no file I/O and no git calls.** That means it's safe to hold the runtime mutex for the duration of the match computation.
+The matcher must consider `plan_worktree_status` correctly — the master waits on `commit_plan_revision` / `commit_done_move` / `restore_or_commit_done_move` are all worktree-state-driven, and missing those wakeups defeats the tool. But `plan_worktree_status` is a disk read (compare working-tree plan body to HEAD's blob hash). We can't do disk reads under the runtime mutex without blocking watchers and other handlers.
 
-Concretely:
+**Solution — snapshot under lock, compute outside.** Two phases:
 
 ```rust
+struct Candidate {
+    repo_root: PathBuf,
+    repo_state_clone: RepoStateSummary, // small, just identifiers + gate state
+    session_id: SessionId,
+    session_clone: SessionSummary,       // body_hash, plan_path, feedback lists
+}
+
 async fn compute_matches(runtime: &Runtime, args: &WaitArgs) -> Vec<Match> {
-    let trinity = runtime.state().lock().await;
+    // Phase 1: under lock, collect candidates + the cheap derived bits.
+    let candidates = {
+        let trinity = runtime.state().lock().await;
+        collect_candidates(&trinity, args)
+    };
+    // Lock released here.
+
+    // Phase 2: per-candidate disk reads + waiting_on derivation outside lock.
     let mut out = Vec::new();
+    for cand in candidates {
+        let status = compute_plan_worktree_status(&cand.repo_root, &cand.session_clone);
+        let w = projection::waiting_on(
+            cand.session_clone.phase,
+            status,
+            cand.session_clone.plan_gate.as_ref(),
+            cand.session_clone.impl_gate.as_ref(),
+        );
+        if w.role.as_str() != args.role {
+            continue;
+        }
+        if matches!(args.role.as_str(), "reviewers")
+            && args.exclude_authors.iter().any(|a| cand.session_clone.has_current_verdict_from(a))
+        {
+            continue;
+        }
+        out.push(Match {
+            repo: cand.repo_root.to_string_lossy().into_owned(),
+            session_id: cand.session_id.as_str().to_string(),
+            reason: w.reason.as_str().to_string(),
+        });
+    }
+    out
+}
+
+fn collect_candidates(trinity: &Trinity, args: &WaitArgs) -> Vec<Candidate> {
+    let mut out = Vec::new();
+    let canonical_filter = args.repo.as_ref().map(canonical_repo_path);
     for (repo_root, repo_state) in &trinity.repos {
-        if let Some(filter_repo) = &args.repo
-            && filter_repo != repo_root
+        if let Some(filter) = &canonical_filter
+            && filter != repo_root
         {
             continue;
         }
         for (session_id, session) in &repo_state.sessions {
             if let Some(filter_sid) = &args.session_id
-                && filter_sid != session_id
+                && filter_sid.as_str() != session_id.as_str()
             {
                 continue;
             }
-            // Pure derivations — no IO, no git.
             let phase = projection::phase(session, &repo_state.attribution);
-            // plan_worktree_status is NOT recomputed here. It requires a
-            // working-tree read which is IO and would violate the no-IO
-            // rule. Use the cached `clean` assumption for the role check;
-            // worktree-status-driven waiting (master / commit_plan_revision)
-            // is captured via the latest broadcast event from the watcher,
-            // which calls into the same role-derivation logic when it fires.
             let plan_gate = projection::plan_gate_for(session, repo_state);
             let impl_gate = projection::impl_gate_for(session, repo_state);
-            let w = projection::waiting_on(phase, PlanWorktreeStatus::Clean,
-                                            plan_gate.as_ref(), impl_gate.as_ref());
-            if w.role.as_str() != args.role { continue; }
-            if matches!(args.role.as_str(), "reviewers")
-                && args.exclude_authors.iter().any(|a| /* in current gate */)
-            {
-                continue;
-            }
-            out.push(Match {
-                repo: repo_root.to_string_lossy().into_owned(),
-                session_id: session_id.as_str().to_string(),
-                reason: w.reason.as_str().to_string(),
+            out.push(Candidate {
+                repo_root: repo_root.clone(),
+                session_id: session_id.clone(),
+                session_clone: SessionSummary {
+                    body_hash: session.body_hash.clone(),
+                    plan_path: session.plan_path.clone(),
+                    phase,
+                    plan_gate,
+                    impl_gate,
+                    // ...verdict-author lookups precomputed for exclude_authors
+                },
+                ..
             });
         }
     }
@@ -201,17 +238,30 @@ async fn compute_matches(runtime: &Runtime, args: &WaitArgs) -> Vec<Match> {
 }
 ```
 
-**Why this is safe to hold under the lock**: each per-session computation is a small linear scan over feedback maps + attribution map. For typical Trinity scopes (< 10 sessions per repo, < 50 commits per session), the whole loop is sub-millisecond. The lock is held briefly enough that concurrent watcher updates and HTTP/MCP calls aren't blocked in practice.
+**Lock-held cost**: one pass over `(repo, session)` pairs, plus a `plan_gate_for` / `impl_gate_for` call per session. Each gate-derivation is a small BTreeMap walk over `plan_feedback` / `impl_feedback`. For ≤10 sessions per repo, sub-millisecond. The lock is held briefly even with many repos.
 
-**What's NOT done under the lock**: any working-tree read (plan_worktree_status recompute), any git call, any rebuild. If a future change makes `compute_matches` need those, refactor to snapshot identifiers under the lock + compute outside. Add a debug assertion or a tracing span to catch lock-held durations > 5ms in dev builds.
+**Outside-lock cost**: one `compute_plan_worktree_status` per candidate = one `git show HEAD:<plan_path>` (cached blob hash already on `Session`) + one `fs::read(<plan_path>)`. Both are fast (<5ms each), parallelizable if it ever matters.
 
-The `projection` helpers (`plan_gate_for`, `impl_gate_for`, `waiting_on`) are already sans-IO and side-effect-free; moving the gate derivations from `mcp_response.rs` to a shared `projection.rs` location is a prerequisite for this plan (purely a code-org change, no behavior change). That's part of Phase 1.
+**Why not cache `plan_worktree_status` on `Session`?** The plan's existing rule says plan_worktree_status is a derived projection computed at every read — `Session` never stores it. Caching it on `RepoState` would invert that invariant and require explicit invalidation on file edits. The watcher's `PlanFileChanged` event already drives a broadcast that triggers `compute_matches` re-runs; the disk read is cheap enough that "recompute each time" beats "cache + invalidate."
+
+**`projection` module additions.** Moving `plan_gate_for`, `impl_gate_for`, and `waiting_on` from `mcp_response.rs` to `projection.rs` is a prerequisite (code-org only, no behavior change). Part of Phase 1.
 
 The MCP dispatcher (`src/server/mcp.rs`) gets a new tool entry that deserializes args and calls into `wait_for_work`. The HTTP route (`src/server/http.rs`) adds `POST /api/wait_for_work` that does the same.
 
+## Prerequisite: `repo` arg on `get_context` and `list_sessions`
+
+`wait_for_work` can return a match in *any* watched repo, not just the caller's cwd-repo. The agent's follow-up `get_context({ repo: match.repo, session_id: match.session_id })` requires `get_context` to accept the repo explicitly — currently it resolves the repo from `req.cwd` via `git rev-parse --show-toplevel`.
+
+Add an optional `repo` arg to both tools:
+
+- `get_context({ session_id, author_label?, repo? })` — when `repo` is provided, canonicalize and look up; otherwise fall back to `req.cwd` resolution.
+- `list_sessions({ repo? })` — when set, return only that repo's sessions; otherwise all known repos.
+
+Schema update in `src/tools.rs`; dispatcher update in `src/server/mcp.rs`. Same `dunce::canonicalize` normalization the runtime already uses for `add_repo` / `read_repo`. Phase 1 of this plan includes the change.
+
 ## Tool catalog update
 
-Add `wait_for_work` to `src/tools.rs` catalog so the MCP shim advertises it. Tool count goes from 4 to 5.
+Add `wait_for_work` to `src/tools.rs` catalog so the MCP shim advertises it. Tool count goes from 4 to 5. `get_context` and `list_sessions` schemas updated to include optional `repo`.
 
 ```rust
 ToolDescriptor {
