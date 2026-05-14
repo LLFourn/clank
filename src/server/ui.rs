@@ -6,14 +6,14 @@
 use serde_json::Value;
 
 /// JS snippet shared by the home and session pages. Subscribes to the
-/// SSE endpoint, plays a short chime on each event, and debounces page
-/// reloads so chips/banners refresh without manual reload.
+/// SSE endpoint and plays a short chime on each event. Shows a manual
+/// "Refresh to see new activity" banner — no auto-reload, since that
+/// fights with reading + scrolling.
 const LIVE_SCRIPT: &str = r#"
 <script>
 (function () {
   const url = window.__trinity_sse || '/events';
   let last = 0;
-  let reloadTimer = null;
   let audioCtx = null;
   function chime() {
     if (window.__trinity_muted) return;
@@ -30,19 +30,26 @@ const LIVE_SCRIPT: &str = r#"
       o.start(t); o.stop(t + 0.18);
     } catch (e) {}
   }
-  function scheduleReload() {
-    if (reloadTimer) clearTimeout(reloadTimer);
-    reloadTimer = setTimeout(() => { window.location.reload(); }, 500);
+  function showRefreshBanner() {
+    let b = document.getElementById('refresh-banner');
+    if (b) return;
+    b = document.createElement('div');
+    b.id = 'refresh-banner';
+    b.innerHTML = '<span>New activity</span> <button onclick="location.reload()">Refresh</button>';
+    b.style.cssText = 'position:fixed;top:1em;right:1em;padding:.5em 1em;background:#1f2937;color:#fff;border-radius:.5em;display:flex;gap:.5em;align-items:center;box-shadow:0 4px 12px rgba(0,0,0,.2);z-index:1000';
+    b.querySelector('button').style.cssText = 'background:#3b82f6;border:none;color:#fff;padding:.25em .75em;border-radius:.3em;cursor:pointer;font-weight:600';
+    document.body.appendChild(b);
   }
   function connect() {
     const es = new EventSource(url);
     es.onmessage = (ev) => {
       const now = Date.now();
+      // Coalesce flurries so the chime doesn't machine-gun.
       if (now - last > 300) {
         chime();
         last = now;
       }
-      scheduleReload();
+      showRefreshBanner();
     };
     es.onerror = () => {
       es.close();
@@ -50,7 +57,6 @@ const LIVE_SCRIPT: &str = r#"
     };
   }
   connect();
-  // Mute toggle on Cmd/Ctrl+M for the impatient.
   document.addEventListener('keydown', (e) => {
     if ((e.metaKey || e.ctrlKey) && e.key === 'm') {
       window.__trinity_muted = !window.__trinity_muted;

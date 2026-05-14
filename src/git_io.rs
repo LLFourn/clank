@@ -7,7 +7,8 @@ use std::path::{Path, PathBuf};
 use tokio::process::Command;
 
 use crate::attribution::{CommitChanges, PlanTouch};
-use crate::disk_format::{plan_path_is_done, session_id_from_plan_path};
+use crate::disk_format::{parse_feedback_path, plan_path_is_done, session_id_from_plan_path};
+use crate::disk_snapshot::{DiskSnapshot, FeedbackBlob, HistoryEntry, PlanFileBlob};
 use crate::lifecycle::CommitSha;
 use crate::repo_state::PlanTouchKind;
 
@@ -347,6 +348,123 @@ fn parse_diff_tree(stdout: &str) -> Result<CommitChanges, GitIoError> {
         plan_touches,
         has_non_plan_code_changes,
     })
+}
+
+/// Gather a `DiskSnapshot` for `repo_root`. This is the IO half of the
+/// rebuild flow; `disk_snapshot::derive_state` consumes the result and
+/// is the pure half.
+///
+/// Steps:
+/// 1. `git rev-parse HEAD` (empty repo → snapshot with `head=None`).
+/// 2. `git ls-tree -r HEAD -- .trinity/plans/` for session discovery;
+///    for each blob, fetch its body via `git show HEAD:<path>`, its
+///    plan_intro via `--diff-filter=A --follow`, and the intro's
+///    first-parent via `rev-parse <intro>^`.
+/// 3. `git log --first-parent --reverse --format=%H` for the commit
+///    chain; for each commit, `git diff-tree -r --name-status -M`
+///    → `CommitChanges`.
+/// 4. Walk `<repo>/.trinity/feedback/` for working-tree feedback files.
+pub async fn snapshot(repo_root: &Path) -> Result<DiskSnapshot, GitIoError> {
+    let head = rev_parse_head(repo_root).await?;
+    let Some(head) = head else {
+        return Ok(DiskSnapshot::default());
+    };
+
+    // Plan files in HEAD.
+    let entries = ls_tree_plans(repo_root, &head).await?;
+    let mut plan_files = Vec::with_capacity(entries.len());
+    for e in entries {
+        let Some(session_id) = session_id_from_plan_path(&e.path) else {
+            continue;
+        };
+        let body = show_blob(repo_root, &head, &e.path).await?;
+        let Some(plan_intro) = first_added_commit(repo_root, &e.path).await? else {
+            continue;
+        };
+        let plan_intro_parent = parent_of(repo_root, &plan_intro).await?;
+        plan_files.push(PlanFileBlob {
+            session_id,
+            plan_path: e.path,
+            body,
+            plan_intro,
+            plan_intro_parent,
+        });
+    }
+
+    // Commit history along the first-parent chain. Skip the walk
+    // entirely if there are no sessions — there's nothing to attribute.
+    let history = if plan_files.is_empty() {
+        Vec::new()
+    } else {
+        let shas = first_parent_commits(repo_root).await?;
+        let mut out = Vec::with_capacity(shas.len());
+        for sha in shas {
+            let changes = diff_tree_changes(repo_root, &sha).await?;
+            out.push(HistoryEntry { commit: sha, changes });
+        }
+        out
+    };
+
+    // Feedback files in the working tree.
+    let feedback_files = collect_feedback_files(repo_root)?;
+
+    Ok(DiskSnapshot {
+        head: Some(head),
+        plan_files,
+        history,
+        feedback_files,
+    })
+}
+
+fn collect_feedback_files(repo_root: &Path) -> Result<Vec<FeedbackBlob>, GitIoError> {
+    let feedback_root = repo_root.join(".trinity").join("feedback");
+    if !feedback_root.exists() {
+        return Ok(Vec::new());
+    }
+    let mut paths = Vec::new();
+    walk_files(&feedback_root, 4, &mut paths).map_err(|e| GitIoError::Parse {
+        context: "walk feedback dir".into(),
+        detail: format!("{e}"),
+    })?;
+    let mut out = Vec::with_capacity(paths.len());
+    for abs in paths {
+        let Ok(rel) = abs.strip_prefix(&feedback_root) else {
+            continue;
+        };
+        let Some(parsed) = parse_feedback_path(rel) else {
+            continue;
+        };
+        let body = std::fs::read_to_string(&abs).map_err(|e| GitIoError::Parse {
+            context: "read feedback file".into(),
+            detail: format!("{}: {e}", abs.display()),
+        })?;
+        out.push(FeedbackBlob {
+            abs_path: abs,
+            parsed,
+            body,
+        });
+    }
+    Ok(out)
+}
+
+fn walk_files(root: &Path, max_depth: usize, out: &mut Vec<PathBuf>) -> std::io::Result<()> {
+    fn walk(dir: &Path, depth: usize, max: usize, out: &mut Vec<PathBuf>) -> std::io::Result<()> {
+        if depth > max {
+            return Ok(());
+        }
+        for entry in std::fs::read_dir(dir)? {
+            let entry = entry?;
+            let path = entry.path();
+            let ft = entry.file_type()?;
+            if ft.is_dir() {
+                walk(&path, depth + 1, max, out)?;
+            } else if ft.is_file() {
+                out.push(path);
+            }
+        }
+        Ok(())
+    }
+    walk(root, 1, max_depth, out)
 }
 
 fn is_plan_path(rel: &Path) -> bool {

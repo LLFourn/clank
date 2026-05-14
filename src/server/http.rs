@@ -140,30 +140,26 @@ async fn session_events_stream(
     Sse::new(event_stream(state, Some(session_id)).await).keep_alive(sse::KeepAlive::default())
 }
 
-/// Push-driven SSE: emits each ring entry once on connect, then forwards
-/// new events from the broadcast channel. `session_filter` (when `Some`)
-/// drops events that aren't for that session id (treating `None` session_id
-/// events as global — they go to all subscribers).
+/// Push-driven SSE: forwards new events from the broadcast channel.
+///
+/// Intentionally does **not** replay the ring on connect. Otherwise every
+/// page reload would re-fire chimes + reloads for every historical event,
+/// causing a refresh loop. The ring buffer is kept for diagnostic /
+/// future-API consumers; SSE only carries live events from the moment of
+/// subscribe forward.
+///
+/// `session_filter` (when `Some`) drops events that aren't for that session.
 async fn event_stream(
     state: AppState,
     session_filter: Option<String>,
 ) -> impl Stream<Item = Result<sse::Event, std::convert::Infallible>> {
-    use futures::stream;
     use futures::stream::StreamExt;
 
-    let runtime = state.runtime.clone();
-    let initial = runtime.live_events_snapshot().await;
-    let rx = runtime.subscribe_events();
-
-    // Replay the current ring on connect.
-    let initial_events: Vec<_> = initial.into_iter().collect();
-    let initial_stream = stream::iter(initial_events);
-
-    // Live: forward broadcast events as they arrive.
+    let rx = state.runtime.subscribe_events();
     let live_stream = tokio_stream::wrappers::BroadcastStream::new(rx)
         .filter_map(|r| async move { r.ok() });
 
-    let combined = initial_stream.chain(live_stream).filter_map(move |e| {
+    let combined = live_stream.filter_map(move |e| {
         let session_filter = session_filter.clone();
         async move {
             if let Some(sid_filter) = session_filter

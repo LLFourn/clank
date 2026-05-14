@@ -65,12 +65,21 @@ impl Runtime {
     /// Idempotent — re-calling against an existing repo re-runs the rebuild.
     /// Canonicalizes the path so callers from different surfaces (test
     /// tempdir vs `git rev-parse --show-toplevel` resolution) hit the same
-    /// HashMap key.
+    /// HashMap key. Runs the held-feedback normalization sweep after the
+    /// initial load so flat-drop feedback that pre-dated this boot gets
+    /// auto-organized into `<phase>/<target-sha>/<author>.md`.
     pub async fn add_repo(&self, repo_root: PathBuf) -> Result<(), RuntimeError> {
         let canonical = dunce::canonicalize(&repo_root).unwrap_or(repo_root);
         let fresh = rebuild_repo(&canonical).await?;
-        let mut trinity = self.state.lock().await;
-        trinity.repos.insert(canonical, fresh);
+        {
+            let mut trinity = self.state.lock().await;
+            trinity.repos.insert(canonical.clone(), fresh);
+        }
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        self.normalize_held_feedback(&canonical, now).await?;
         Ok(())
     }
 
