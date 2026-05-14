@@ -81,7 +81,7 @@ Wide reading column (~720px max for prose; full-width for diffs). Generous margi
 |  GET  /api/sessions/:id/plan/:sha
 |  GET  /api/sessions/:id/commit/:sha
 |  GET  /api/diff?from=&to=&path=
-|  POST /sessions/:id/done    |
+|  POST /api/sessions/:id/done?repo=
 |  POST /internal/tool_call   |  (MCP, unchanged)
 +--+--------------------------+
    |
@@ -137,13 +137,19 @@ Every component subscribes to a single global SSE store; when an event for "thei
 
 Concrete `Router` shape so direct-navigation deep links (`/sessions/foo/plan/sha`) work without redirects:
 
-1. `Router::new().nest("/api", api_router)` — JSON only. Returns 404 on unknown `/api/*` paths.
+1. `Router::new().nest("/api", api_router)` — JSON only. Returns 404 on unknown `/api/*` paths. Includes:
+   - `GET /api/sessions[?repo=<path>]`
+   - `GET /api/sessions/:id?repo=<path>`
+   - `GET /api/sessions/:id/plan/:sha?repo=<path>`
+   - `GET /api/sessions/:id/commit/:sha?repo=<path>`
+   - `GET /api/diff?from=&to=&path=&repo=<path>`
+   - `POST /api/sessions/:id/done?repo=<path>` — operator action to move plan to `plans/done/` (plain `std::fs::rename`; never `git mv`). Repo param required; returns `{ ok: true, new_plan_path }` or 404 if the session isn't found in that repo.
 2. `.nest_service("/static", ServeDir::new("frontend/dist"))` — static assets (Wasm bundle, fonts, CSS).
 3. `.route("/events", get(sse_handler))` — SSE.
 4. `.route("/internal/tool_call", post(...))` — MCP backend, unchanged.
 5. `.fallback(serve_index_html)` — every other GET serves `frontend/dist/index.html`. The Leptos router on the client side renders the right view from the URL.
 
-No redirects on app paths. No collisions: anything that doesn't match `/api/*` or `/static/*` or `/events` or `/internal/*` ends up at the SPA shell, which routes client-side.
+No redirects on app paths. No collisions: anything that doesn't match `/api/*` or `/static/*` or `/events` or `/internal/*` ends up at the SPA shell, which routes client-side. The old top-level `POST /sessions/:id/done` route from `src/server/ui.rs` is removed in Phase 5; the SPA calls `POST /api/sessions/:id/done?repo=...` instead.
 
 ## Component model
 
@@ -247,7 +253,17 @@ trinity/
         └── route.rs
 ```
 
-Build via `trunk` (simpler than cargo-leptos for CSR-only). `trunk build --release` produces `frontend/dist/` which the daemon serves as static.
+Build via `trunk` (simpler than cargo-leptos for CSR-only). `trunk build --release --public-url /static/` produces `frontend/dist/` with all asset references in `index.html` (Wasm, JS shim, CSS, fonts) prefixed by `/static/`. The daemon then mounts `ServeDir::new("frontend/dist")` at `/static`, so `<script>` and `<link>` tags resolve correctly. The fallback handler serves `frontend/dist/index.html` for app paths; the embedded `/static/...` references load the actual assets via the ServeDir mount.
+
+Concretely, commit a `frontend/Trunk.toml`:
+
+```toml
+[build]
+public_url = "/static/"
+release = true
+```
+
+So plain `trunk build --release` (no flags) produces the right output. CI and the `xtask` invoke this command.
 
 **Toolchain.** Trunk and the `wasm32-unknown-unknown` target aren't in a stock Rust toolchain. Bootstrap requirements:
 
@@ -299,7 +315,7 @@ Five commits, each green-buildable, each landing a usable slice.
 - Final CSS pass with the color tokens above and prefers-color-scheme: light counterpart.
 - Sticky header behavior.
 - Copy-to-clipboard on `pr_hint` commands.
-- Remove the old `src/server/ui.rs` (replace `home`, `session_detail`, `plan_revision_view`, `commit_diff_view` routes with redirects to the SPA).
+- Remove the old `src/server/ui.rs`. The `home`, `session_detail`, `plan_revision_view`, `commit_diff_view`, and `move_to_done` handlers go away entirely; the paths they served are picked up by the SPA fallback (for GETs) and by `POST /api/sessions/:id/done` (for the done action). **No redirects** — deep-link navigation must work without an intermediate hop.
 - Delete the inline-style chime infrastructure; reimplement in `frontend/src/store.rs` as a Web Audio call when an event arrives.
 - Acceptance: visit `/` in a fresh browser tab and the result is visibly distinct from the maud version — better typography, calmer color, no white-on-white, and instantly responsive to live events.
 
