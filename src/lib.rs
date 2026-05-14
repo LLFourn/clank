@@ -14,6 +14,8 @@ pub mod tools;
 // the SQL layer will be removed in a later commit.
 pub mod attribution;
 pub mod disk_format;
+pub mod git_io;
 pub mod projection;
+pub mod rebuild;
 pub mod reducer;
 pub mod repo_state;

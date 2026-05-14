@@ -58,10 +58,9 @@ pub fn phase(
             has_code_changes: true,
             ..
         } = attr
+            && sid == &session.id
         {
-            if sid == &session.id {
-                return Phase::Implementing;
-            }
+            return Phase::Implementing;
         }
     }
     Phase::Planning
