@@ -246,6 +246,20 @@ fn label_arg_for(tool: &str) -> Option<&'static str> {
     }
 }
 
+/// Trim a raw label and return it only if non-empty. Used by both the
+/// cache-update path (don't poison the cache with blanks) and the
+/// autofill path (don't propagate cached blanks). Keeps the cache from
+/// becoming a vector for empty/whitespace strings that the daemon would
+/// reject downstream.
+fn normalize_label(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
 impl ShimHandler {
     fn cached_label(&self) -> Option<String> {
         self.cached_label.lock().unwrap().clone()
@@ -257,15 +271,18 @@ impl ShimHandler {
 
     /// Merge the cached label into `arguments[key]` if the caller omitted
     /// it. Returns the (possibly modified) arguments. Tools with no label
-    /// argument pass through unchanged.
+    /// argument pass through unchanged. Blanks in the cache are not
+    /// propagated — `normalize_label` rejects them.
     fn fill_label_from_cache(&self, tool: &str, mut arguments: Value) -> Value {
         let Some(key) = label_arg_for(tool) else {
             return arguments;
         };
-        if arguments.get(key).and_then(|v| v.as_str()).is_some() {
+        if let Some(s) = arguments.get(key).and_then(|v| v.as_str())
+            && !s.trim().is_empty()
+        {
             return arguments;
         }
-        let Some(label) = self.cached_label() else {
+        let Some(label) = self.cached_label().and_then(|s| normalize_label(&s)) else {
             return arguments;
         };
         if let Value::Object(ref mut map) = arguments {
@@ -416,15 +433,93 @@ impl ServerHandler for ShimHandler {
             Ok(result) => {
                 // Cache update: store whichever label key actually went on
                 // the wire (caller-supplied or cache-supplied) so the next
-                // call inherits it.
+                // call inherits it. `normalize_label` keeps blanks /
+                // whitespace-only values out of the cache so they can't
+                // poison later autofills.
                 if let Some(key) = label_arg_for(&tool)
-                    && let Some(label) = filled.get(key).and_then(|v| v.as_str())
+                    && let Some(raw) = filled.get(key).and_then(|v| v.as_str())
+                    && let Some(label) = normalize_label(raw)
                 {
-                    self.set_cached_label(label.to_string());
+                    self.set_cached_label(label);
                 }
                 Ok(CallToolResult::structured(result))
             }
             Err(err) => Ok(err.into_call_tool_result()),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn normalize_label_strips_whitespace() {
+        assert_eq!(normalize_label("  codex  "), Some("codex".to_string()));
+    }
+
+    #[test]
+    fn normalize_label_rejects_empty() {
+        assert_eq!(normalize_label(""), None);
+    }
+
+    #[test]
+    fn normalize_label_rejects_whitespace_only() {
+        assert_eq!(normalize_label("   "), None);
+        assert_eq!(normalize_label("\t\n"), None);
+    }
+
+    fn handler_with_cache(cached: Option<&str>) -> ShimHandler {
+        ShimHandler {
+            daemon: "http://127.0.0.1:0".to_string(),
+            cwd: std::path::PathBuf::from("/tmp"),
+            client: reqwest::Client::new(),
+            descriptors: Vec::new(),
+            cached_label: Arc::new(Mutex::new(cached.map(String::from))),
+        }
+    }
+
+    #[test]
+    fn fill_label_from_cache_ignores_blank_cache() {
+        let h = handler_with_cache(Some("   "));
+        let out = h.fill_label_from_cache(
+            "wait_for_work",
+            serde_json::json!({"role": "reviewers", "session_id": "s"}),
+        );
+        // Blank cache must not poison autofill.
+        assert!(out.get("author_label").is_none());
+    }
+
+    #[test]
+    fn fill_label_from_cache_treats_blank_caller_arg_as_missing() {
+        let h = handler_with_cache(Some("codex"));
+        let out = h.fill_label_from_cache(
+            "wait_for_work",
+            serde_json::json!({"role": "reviewers", "session_id": "s", "author_label": "   "}),
+        );
+        // Whitespace-only caller-supplied label is overwritten with cache.
+        assert_eq!(out["author_label"], "codex");
+    }
+
+    #[test]
+    fn fill_label_from_cache_passes_real_value_through() {
+        let h = handler_with_cache(Some("codex"));
+        let out = h.fill_label_from_cache(
+            "wait_for_work",
+            serde_json::json!({"role": "reviewers", "session_id": "s", "author_label": "alice"}),
+        );
+        // Caller-supplied non-blank label is preserved as-is.
+        assert_eq!(out["author_label"], "alice");
+    }
+
+    #[test]
+    fn fill_label_from_cache_skips_tools_without_label_arg() {
+        let h = handler_with_cache(Some("codex"));
+        let out = h.fill_label_from_cache(
+            "list_sessions",
+            serde_json::json!({"repo": "/r"}),
+        );
+        assert!(out.get("author_label").is_none());
+        assert!(out.get("label").is_none());
     }
 }

@@ -39,12 +39,12 @@ This is deliberate: long-poll agents loop and accumulate every response in their
   "name": "wait_for_work",
   "input_schema": {
     "type": "object",
-    "required": ["role", "session_id", "author_label"],
+    "required": ["role", "session_id"],
     "additionalProperties": false,
     "properties": {
       "role":         { "type": "string", "enum": ["master", "reviewers"] },
       "session_id":   { "type": "string" },
-      "author_label": { "type": "string" },
+      "author_label": { "type": "string", "description": "Schema-optional so strict MCP clients allow shim autofill from cache; daemon-required after autofill." },
       "repo":         { "type": "string", "description": "Optional over MCP (defaults to cwd-repo); required over HTTP." },
       "timeout_secs": { "type": "integer", "minimum": 1, "maximum": 300, "default": 60 }
     }
@@ -252,9 +252,16 @@ Wire (in-process axum router via `tower::ServiceExt::oneshot`):
 - `POST /api/wait_for_work` polling the wrong role → 200 + `{timed_out: true}`.
 - `POST /api/wait_for_work` with invalid role / missing repo / missing author_label → 400.
 - `POST /api/wait_for_work` with unknown session → 404.
+- `POST /api/wait_for_work` reviewer-already-voted regression: codex has APPROVE'd; polling reviewers as codex → 200 + `{timed_out: true}`.
 - `POST /internal/tool_call` with `tool: "wait_for_work"` and explicit repo → 200 + `{result: {work, locations}}`.
 - `POST /internal/tool_call` with no `repo` arg → dispatcher resolves from `req.cwd` via git → 200.
-- `POST /internal/tool_call` with invalid role → 400.
+- `POST /internal/tool_call` with invalid role / missing author_label → 400.
+- `POST /internal/tool_call` timeout case → 200 + `{result: {timed_out: true}}`.
+- HTTP / MCP byte-identical: same args drive both routes; MCP `result` keys and values match HTTP body keys and values modulo the envelope.
+
+Shim cache hygiene (in `src/mcp_shim`):
+- `normalize_label`: trims, rejects empty / whitespace-only.
+- `fill_label_from_cache`: blank cache values never propagate; blank caller-supplied values are overwritten by a cached real label; non-blank caller values pass through; tools with no label arg pass through.
 
 ## Non-goals
 

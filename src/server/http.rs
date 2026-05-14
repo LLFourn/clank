@@ -631,4 +631,208 @@ mod wire_tests {
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     }
+
+    #[tokio::test]
+    async fn mcp_dispatch_400_on_missing_author_label() {
+        // The schema is now optional on author_label, but the daemon
+        // still rejects calls that arrive without one (no shim cache in
+        // a direct /internal/tool_call test).
+        let dir = init_repo();
+        let app = router_with_repo(&dir).await;
+        let body = json!({
+            "cwd": dir.path().to_string_lossy(),
+            "tool": "wait_for_work",
+            "arguments": {
+                "role": "reviewers",
+                "session_id": "foo",
+                "timeout_secs": 1,
+            },
+        });
+        let req = Request::builder()
+            .method("POST")
+            .uri("/internal/tool_call")
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let msg = body_text(resp).await;
+        assert!(
+            msg.contains("author_label"),
+            "expected author_label in error, got: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn mcp_dispatch_timeout_returns_envelope_with_timed_out() {
+        let dir = init_repo();
+        let app = router_with_repo(&dir).await;
+        let body = json!({
+            "cwd": dir.path().to_string_lossy(),
+            "tool": "wait_for_work",
+            "arguments": {
+                "role": "master",
+                "session_id": "foo",
+                "author_label": "lloyd",
+                "timeout_secs": 1,
+            },
+        });
+        let req = Request::builder()
+            .method("POST")
+            .uri("/internal/tool_call")
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let v = body_json(resp).await;
+        // MCP envelope wraps the wait response under `result`.
+        assert_eq!(v["result"]["timed_out"], true);
+        assert!(v["result"].get("work").is_none());
+        assert!(v["result"].get("locations").is_none());
+    }
+
+    #[tokio::test]
+    async fn http_and_mcp_bodies_byte_identical_for_same_input() {
+        // Acceptance: HTTP and MCP dispatch produce byte-identical JSON
+        // responses for the same inputs (modulo MCP's {result: ...}
+        // envelope). Drive both routes with the same args; the MCP
+        // body's `result` value must equal the HTTP body.
+        let dir = init_repo();
+        let args = json!({
+            "role": "reviewers",
+            "session_id": "foo",
+            "author_label": "codex",
+            "repo": dir.path().to_string_lossy(),
+            "timeout_secs": 1,
+        });
+
+        // HTTP path.
+        let app_http = router_with_repo(&dir).await;
+        let http_req = Request::builder()
+            .method("POST")
+            .uri("/api/wait_for_work")
+            .header("content-type", "application/json")
+            .body(Body::from(args.to_string()))
+            .unwrap();
+        let http_resp = app_http.oneshot(http_req).await.unwrap();
+        assert_eq!(http_resp.status(), StatusCode::OK);
+        let http_body = body_json(http_resp).await;
+
+        // MCP path against a fresh repo (same setup) so the wait sees
+        // the same initial state. We can't reuse the router because
+        // oneshot consumes it.
+        let dir2 = init_repo();
+        let app_mcp = router_with_repo(&dir2).await;
+        let mcp_args = {
+            let mut a = args.clone();
+            a["repo"] = json!(dir2.path().to_string_lossy());
+            a
+        };
+        let mcp_body_in = json!({
+            "cwd": dir2.path().to_string_lossy(),
+            "tool": "wait_for_work",
+            "arguments": mcp_args,
+        });
+        let mcp_req = Request::builder()
+            .method("POST")
+            .uri("/internal/tool_call")
+            .header("content-type", "application/json")
+            .body(Body::from(mcp_body_in.to_string()))
+            .unwrap();
+        let mcp_resp = app_mcp.oneshot(mcp_req).await.unwrap();
+        assert_eq!(mcp_resp.status(), StatusCode::OK);
+        let mcp_body = body_json(mcp_resp).await;
+
+        // Both fresh repos surface the same review_plan match shape —
+        // the only differences are the absolute paths embedded in
+        // `locations[0]`. Strip the SHA-bearing path before comparing
+        // structure; assert the keys + work field match exactly.
+        assert_eq!(http_body["work"], mcp_body["result"]["work"]);
+        assert_eq!(http_body["work"], "review_plan");
+        assert_eq!(
+            http_body["locations"].as_array().unwrap().len(),
+            mcp_body["result"]["locations"].as_array().unwrap().len()
+        );
+        // Field set parity: HTTP body keys === MCP `result` keys.
+        let http_keys: std::collections::BTreeSet<&str> = http_body
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        let mcp_keys: std::collections::BTreeSet<&str> = mcp_body["result"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(
+            http_keys, mcp_keys,
+            "HTTP and MCP wait_for_work bodies disagree on key set"
+        );
+    }
+
+    #[tokio::test]
+    async fn http_caller_already_voted_regression_at_wire() {
+        // The P1 regression in commit ab71f34 was that reviewers were
+        // re-woken on targets they had already voted on. Build a real
+        // session where codex has APPROVE'd the only plan target;
+        // polling reviewers as codex over /api/wait_for_work must
+        // time out.
+        let dir = init_repo();
+        write_file(dir.path(), ".trinity/plans/foo.md", "# foo\n");
+        commit(dir.path(), "add foo");
+        let runtime = Arc::new(Runtime::new());
+        runtime.add_repo(dir.path().to_path_buf()).await.unwrap();
+        let intro = runtime
+            .read_repo(dir.path(), |s| {
+                s.sessions[&crate::lifecycle::SessionId::from("foo")]
+                    .plan_intro
+                    .clone()
+            })
+            .await
+            .unwrap();
+        let codex_rel = format!(
+            ".trinity/feedback/foo/plan/{}/codex.md",
+            intro.as_str()
+        );
+        write_file(dir.path(), &codex_rel, "APPROVE\n");
+        let parsed = crate::disk_format::parse_feedback_path(&std::path::PathBuf::from(
+            format!("foo/plan/{}/codex.md", intro.as_str()),
+        ))
+        .unwrap();
+        runtime
+            .handle_signal(
+                dir.path(),
+                crate::fs_watcher::FilesystemSignal::FeedbackWritten { parsed },
+                1,
+            )
+            .await
+            .unwrap();
+        let state = AppState {
+            runtime,
+            watchers: Arc::new(Mutex::new(Vec::new())),
+            watched_repos: Arc::new(Mutex::new(HashSet::new())),
+        };
+        let app = router(state);
+        let body = json!({
+            "role": "reviewers",
+            "session_id": "foo",
+            "author_label": "codex",
+            "repo": dir.path().to_string_lossy(),
+            "timeout_secs": 1,
+        });
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/wait_for_work")
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let v = body_json(resp).await;
+        assert_eq!(v["timed_out"], true);
+        assert!(v.get("work").is_none());
+    }
 }

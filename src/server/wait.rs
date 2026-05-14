@@ -41,8 +41,12 @@ pub struct WaitArgs {
     /// without one once autofill has had its chance.
     #[serde(default)]
     pub author_label: Option<String>,
-    /// Optional. The MCP dispatcher fills it from the caller's cwd when
-    /// absent; the HTTP route rejects the request if absent.
+    /// Absolute repo root. The MCP dispatcher fills it from the caller's
+    /// cwd (via `git rev-parse --show-toplevel`) when absent; the HTTP
+    /// route rejects the request if absent. Canonicalized via
+    /// `dunce::canonicalize` so symlink and case-normalized variants
+    /// match the runtime's `Trinity.repos` keys. `~/…` is NOT expanded
+    /// — callers pass absolute paths.
     #[serde(default)]
     pub repo: Option<String>,
     #[serde(default)]
@@ -214,21 +218,27 @@ async fn compute_match(
 /// re-waking a reviewer for a target they've already voted on (their
 /// vote still stands; the remaining wait is on someone else).
 ///
-/// Non-review reasons (anything in the master role) always return
-/// false — caller-already-voted has no meaning there.
+/// Master-role reasons return false — caller-already-voted is a
+/// reviewer-only concept. The match is exhaustive on purpose: adding a
+/// new reviewer-role `WaitingReason` later forces a compile error here,
+/// preventing silent regressions of the self-wakeup bug this guards.
 fn caller_already_voted(
     cand: &Candidate,
     reason: WaitingReason,
     author: &AgentLabel,
 ) -> bool {
+    use WaitingReason::*;
     let gate = match reason {
-        WaitingReason::PlanNeedsInitialReview | WaitingReason::PlanNeedsRereview => {
-            cand.plan_gate.as_ref()
-        }
-        WaitingReason::ImplNeedsInitialReview | WaitingReason::ImplNeedsRereview => {
-            cand.impl_gate.as_ref()
-        }
-        _ => return false,
+        PlanNeedsInitialReview | PlanNeedsRereview => cand.plan_gate.as_ref(),
+        ImplNeedsInitialReview | ImplNeedsRereview => cand.impl_gate.as_ref(),
+        SessionDone
+        | CommitDoneMove
+        | RestoreOrCommitDoneMove
+        | CommitPlanRevision
+        | AddressPlanRequestChanges
+        | ReadyToImplement
+        | AddressImplRequestChanges
+        | ReadyToFinish => return false,
     };
     let Some(gate) = gate else { return false };
     gate.approvals.contains(author) || gate.request_changes.contains(author)
