@@ -1,7 +1,6 @@
 //! HTTP routes backed by the filesystem-truth runtime.
 
 use std::path::PathBuf;
-use std::time::Duration;
 
 use axum::Router;
 use axum::extract::{Path, Query, State};
@@ -27,6 +26,7 @@ pub fn router(state: AppState) -> Router {
         .route("/sessions/{session_id}/commit/{sha}", get(commit_diff_view))
         .route("/sessions/{session_id}/done", post(move_to_done))
         .route("/events", get(home_events_stream))
+        .route("/sessions/{session_id}/events", get(session_events_stream))
         .route("/internal/tools", get(list_tools))
         .route("/internal/tool_call", post(call_tool))
         .with_state(state)
@@ -130,29 +130,60 @@ async fn move_to_done(
 async fn home_events_stream(
     State(state): State<AppState>,
 ) -> Sse<impl Stream<Item = Result<sse::Event, std::convert::Infallible>>> {
-    use futures::stream::StreamExt;
-    use tokio::time::interval;
-    use tokio_stream::wrappers::IntervalStream;
+    Sse::new(event_stream(state, None).await).keep_alive(sse::KeepAlive::default())
+}
 
-    // Poll-based SSE: every 500ms, emit the current ring snapshot.
-    // A push-driven version using broadcast channels is a follow-up.
+async fn session_events_stream(
+    State(state): State<AppState>,
+    Path(session_id): Path<String>,
+) -> Sse<impl Stream<Item = Result<sse::Event, std::convert::Infallible>>> {
+    Sse::new(event_stream(state, Some(session_id)).await).keep_alive(sse::KeepAlive::default())
+}
+
+/// Push-driven SSE: emits each ring entry once on connect, then forwards
+/// new events from the broadcast channel. `session_filter` (when `Some`)
+/// drops events that aren't for that session id (treating `None` session_id
+/// events as global — they go to all subscribers).
+async fn event_stream(
+    state: AppState,
+    session_filter: Option<String>,
+) -> impl Stream<Item = Result<sse::Event, std::convert::Infallible>> {
+    use futures::stream;
+    use futures::stream::StreamExt;
+
     let runtime = state.runtime.clone();
-    let stream = IntervalStream::new(interval(Duration::from_millis(500))).then(move |_| {
-        let runtime = runtime.clone();
+    let initial = runtime.live_events_snapshot().await;
+    let rx = runtime.subscribe_events();
+
+    // Replay the current ring on connect.
+    let initial_events: Vec<_> = initial.into_iter().collect();
+    let initial_stream = stream::iter(initial_events);
+
+    // Live: forward broadcast events as they arrive.
+    let live_stream = tokio_stream::wrappers::BroadcastStream::new(rx)
+        .filter_map(|r| async move { r.ok() });
+
+    let combined = initial_stream.chain(live_stream).filter_map(move |e| {
+        let session_filter = session_filter.clone();
         async move {
-            let events = runtime.live_events_snapshot().await;
+            if let Some(sid_filter) = session_filter
+                && let Some(ref event_sid) = e.session_id
+                && event_sid.as_str() != sid_filter
+            {
+                return None;
+            }
             let payload = json!({
-                "events": events.iter().map(|e| json!({
-                    "ts": e.ts,
-                    "repo": e.repo.to_string_lossy(),
-                    "session_id": e.session_id.as_ref().map(|s| s.as_str()),
-                    "kind": e.kind,
-                })).collect::<Vec<_>>()
+                "ts": e.ts,
+                "repo": e.repo.to_string_lossy(),
+                "session_id": e.session_id.as_ref().map(|s| s.as_str()),
+                "kind": e.kind,
+                "payload": e.payload,
             });
-            Ok(sse::Event::default().data(payload.to_string()))
+            Some(Ok(sse::Event::default().data(payload.to_string())))
         }
     });
-    Sse::new(stream).keep_alive(sse::KeepAlive::default())
+
+    Box::pin(combined)
 }
 
 async fn healthz() -> &'static str {

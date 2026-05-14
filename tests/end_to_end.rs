@@ -316,6 +316,46 @@ async fn commit_diff_route_renders_patch() {
 }
 
 #[tokio::test]
+async fn sse_pushes_repo_rebuilt_on_head_change() {
+    use futures::StreamExt;
+
+    let dir = init_repo();
+    write_file(dir.path(), ".trinity/plans/foo.md", "# foo\n");
+    commit(dir.path(), "Add foo");
+
+    let (url, handle) = spawn_daemon(dir.path()).await;
+    // Connect to the SSE stream and let the subscription settle.
+    let resp = reqwest::get(format!("{}/events", url)).await.unwrap();
+    let mut stream = resp.bytes_stream();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // Trigger a HEAD change by committing again.
+    write_file(dir.path(), "src/lib.rs", "fn x() {}\n");
+    commit(dir.path(), "Add lib");
+
+    // The fs watcher (notify-debouncer-full, 150ms window) picks up
+    // .git/logs/HEAD and emits a `repo_rebuilt` SSE event.
+    let mut got_event = false;
+    let timeout = tokio::time::sleep(Duration::from_secs(10));
+    tokio::pin!(timeout);
+    loop {
+        tokio::select! {
+            _ = &mut timeout => break,
+            chunk = stream.next() => {
+                let Some(Ok(bytes)) = chunk else { continue; };
+                let text = String::from_utf8_lossy(&bytes);
+                if text.contains("repo_rebuilt") {
+                    got_event = true;
+                    break;
+                }
+            }
+        }
+    }
+    handle.abort();
+    assert!(got_event, "expected `repo_rebuilt` SSE event after HEAD change");
+}
+
+#[tokio::test]
 async fn done_move_endpoint_moves_plan_file() {
     let dir = init_repo();
     write_file(dir.path(), ".trinity/plans/foo.md", "# foo\n");

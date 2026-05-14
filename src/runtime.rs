@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
 
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, broadcast};
 
 use crate::disk_format::FeedbackPhase;
 use crate::fs_watcher::FilesystemSignal;
@@ -21,13 +21,25 @@ use crate::repo_state::{
     AttributionResult, Feedback, HeldFeedback, LiveEvent, RepoState, Session, Trinity,
 };
 
-#[derive(Default)]
 pub struct Runtime {
     state: Arc<Mutex<Trinity>>,
     /// Paths Trinity recently wrote (renames during feedback
     /// auto-organization). Watcher events on these paths are suppressed
     /// for ~1 second so the runtime doesn't reprocess its own edits.
     self_writes: Arc<Mutex<HashMap<PathBuf, Instant>>>,
+    /// Broadcast channel for live events. SSE handlers subscribe here.
+    events_tx: broadcast::Sender<LiveEvent>,
+}
+
+impl Default for Runtime {
+    fn default() -> Self {
+        let (events_tx, _) = broadcast::channel(256);
+        Self {
+            state: Arc::default(),
+            self_writes: Arc::default(),
+            events_tx,
+        }
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -95,6 +107,12 @@ impl Runtime {
         trinity.live_events.clone()
     }
 
+    /// Subscribe to the live event broadcast channel. SSE handlers use
+    /// this to receive new events as they're appended (no polling).
+    pub fn subscribe_events(&self) -> broadcast::Receiver<LiveEvent> {
+        self.events_tx.subscribe()
+    }
+
     /// Mark paths Trinity is about to rename so the watcher loop can
     /// suppress the resulting events. Entries expire after 1 second.
     async fn mark_self_writes(&self, paths: &[PathBuf]) {
@@ -142,8 +160,8 @@ impl Runtime {
                 {
                     let mut trinity = self.state.lock().await;
                     trinity.repos.insert(repo_root.to_path_buf(), fresh);
-                    push_event(
-                        &mut trinity.live_events,
+                    self.push_event(
+                        &mut trinity,
                         LiveEvent {
                             ts: now,
                             repo: repo_root.to_path_buf(),
@@ -167,8 +185,8 @@ impl Runtime {
                     // Untracked draft — drop silently per the plan.
                     return Ok(());
                 }
-                push_event(
-                    &mut trinity.live_events,
+                self.push_event(
+                    &mut trinity,
                     LiveEvent {
                         ts: now,
                         repo: repo_root.to_path_buf(),
@@ -223,8 +241,8 @@ impl Runtime {
                         parsed.author.clone(),
                         body,
                     );
-                    push_event(
-                        &mut trinity.live_events,
+                    self.push_event(
+                        &mut trinity,
                         LiveEvent {
                             ts: now,
                             repo: repo_root.to_path_buf(),
@@ -245,8 +263,8 @@ impl Runtime {
                     return Ok(());
                 };
                 upsert_feedback(session, abs_path, parsed, body);
-                push_event(
-                    &mut trinity.live_events,
+                self.push_event(
+                    &mut trinity,
                     LiveEvent {
                         ts: now,
                         repo: repo_root.to_path_buf(),
@@ -272,8 +290,8 @@ impl Runtime {
                     return Ok(());
                 };
                 remove_feedback(session, &parsed);
-                push_event(
-                    &mut trinity.live_events,
+                self.push_event(
+                    &mut trinity,
                     LiveEvent {
                         ts: now,
                         repo: repo_root.to_path_buf(),
@@ -478,12 +496,18 @@ fn upsert_feedback_at_target(
     );
 }
 
-fn push_event(ring: &mut VecDeque<LiveEvent>, event: LiveEvent) {
-    const CAPACITY: usize = 200;
-    if ring.len() >= CAPACITY {
-        ring.pop_front();
+impl Runtime {
+    /// Push a live event into the ring AND broadcast on the SSE channel.
+    /// Caller must hold the state lock — this writes to `trinity.live_events`.
+    fn push_event(&self, trinity: &mut Trinity, event: LiveEvent) {
+        const CAPACITY: usize = 200;
+        if trinity.live_events.len() >= CAPACITY {
+            trinity.live_events.pop_front();
+        }
+        trinity.live_events.push_back(event.clone());
+        // Broadcast is non-blocking; ignored if no receivers.
+        let _ = self.events_tx.send(event);
     }
-    ring.push_back(event);
 }
 
 fn upsert_feedback(
@@ -979,6 +1003,31 @@ mod tests {
             .unwrap();
         let arr = v.as_array().unwrap();
         assert_eq!(arr.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn broadcast_delivers_live_events_to_subscribers() {
+        let dir = init_repo();
+        write_file(dir.path(), ".trinity/plans/foo.md", "# foo\n");
+        commit(dir.path(), "Add foo");
+
+        let rt = Runtime::new();
+        let mut rx = rt.subscribe_events();
+        rt.add_repo(dir.path().to_path_buf()).await.unwrap();
+
+        // Trigger a rebuild by signaling HeadChanged.
+        write_file(dir.path(), "src/x.rs", "fn x() {}\n");
+        commit(dir.path(), "second commit");
+        rt.handle_signal(dir.path(), FilesystemSignal::HeadChanged, 1)
+            .await
+            .unwrap();
+
+        // We should receive a `repo_rebuilt` event on the broadcast.
+        let event = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+            .await
+            .expect("timeout waiting for broadcast")
+            .expect("broadcast closed");
+        assert_eq!(event.kind, "repo_rebuilt");
     }
 
     #[tokio::test]

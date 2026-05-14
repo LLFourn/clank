@@ -27,7 +27,13 @@ pub async fn start(
 ) -> anyhow::Result<tokio::task::JoinHandle<()>> {
     let trinity_dir = repo_root.join(".trinity");
     std::fs::create_dir_all(&trinity_dir)?;
+    // Canonical paths for strip_prefix. notify events arrive with
+    // realpath-resolved paths (e.g. /private/var/... on macOS); the
+    // runtime's repo_root may be the user-supplied form. We use the
+    // canonical pair for stripping, the original for handle_signal.
+    let canonical_repo = dunce::canonicalize(&repo_root)?;
     let git_dir = resolve_gitdir(&repo_root)?;
+    let canonical_git = dunce::canonicalize(&git_dir)?;
 
     let (tx, mut rx) = mpsc::unbounded_channel::<DebounceEventResult>();
     let mut debouncer = new_debouncer(
@@ -40,11 +46,11 @@ pub async fn start(
 
     debouncer
         .watch(&trinity_dir, RecursiveMode::Recursive)?;
-    // Watch the gitdir's HEAD-family files. If the gitdir is shared with
-    // the worktree (regular repo), one watcher per file is enough; for
-    // linked worktrees, `git_dir` is the resolved per-worktree gitdir.
+    // Watch the gitdir recursively. `.git/HEAD` lives at the root and
+    // `.git/logs/HEAD` is one level deep; we need both. path_to_signal
+    // filters the firehose down to the two HEAD-family files.
     debouncer
-        .watch(&git_dir, RecursiveMode::NonRecursive)?;
+        .watch(&git_dir, RecursiveMode::Recursive)?;
 
     let repo_root_for_task = repo_root.clone();
     let runtime_for_task = Arc::clone(&runtime);
@@ -69,9 +75,10 @@ pub async fn start(
                         FsEventKind::CreatedOrModified
                     };
                     // The path could be under `<repo>/.trinity/` or under the gitdir.
-                    // Try both root strippings.
-                    let signal = path_to_signal(path, &repo_root_for_task, kind)
-                        .or_else(|| path_to_signal(path, &git_dir, kind));
+                    // Strip against the canonical forms; notify reports
+                    // realpath-resolved absolute paths.
+                    let signal = path_to_signal(path, &canonical_repo, kind)
+                        .or_else(|| path_to_signal(path, &canonical_git, kind));
                     let Some(signal) = signal else {
                         continue;
                     };
@@ -131,7 +138,9 @@ fn unix_now() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::runtime::Runtime;
     use std::process::Command;
+    use std::time::Duration;
 
     fn run_git(cwd: &Path, args: &[&str]) {
         let status = Command::new("git")
@@ -141,6 +150,40 @@ mod tests {
             .status()
             .unwrap();
         assert!(status.success());
+    }
+
+    #[tokio::test]
+    async fn watcher_fires_repo_rebuilt_on_head_change() {
+        let dir = tempfile::tempdir().unwrap();
+        run_git(dir.path(), &["init", "--quiet", "--initial-branch=main"]);
+        run_git(dir.path(), &["config", "user.email", "t@t"]);
+        run_git(dir.path(), &["config", "user.name", "t"]);
+        run_git(dir.path(), &["config", "commit.gpgsign", "false"]);
+        // Initial commit so plan can be added.
+        std::fs::create_dir_all(dir.path().join(".trinity/plans")).unwrap();
+        std::fs::write(dir.path().join(".trinity/plans/foo.md"), "# foo\n").unwrap();
+        run_git(dir.path(), &["add", "-A"]);
+        run_git(dir.path(), &["commit", "--quiet", "-m", "init"]);
+
+        let runtime = Arc::new(Runtime::new());
+        runtime.add_repo(dir.path().to_path_buf()).await.unwrap();
+        let mut rx = runtime.subscribe_events();
+        let _handle = super::start(Arc::clone(&runtime), dir.path().to_path_buf())
+            .await
+            .unwrap();
+        // Let the watcher settle.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        // Make another commit to trigger the HEAD change.
+        std::fs::write(dir.path().join("src.rs"), "fn x() {}\n").unwrap();
+        run_git(dir.path(), &["add", "-A"]);
+        run_git(dir.path(), &["commit", "--quiet", "-m", "second"]);
+
+        let event = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("timeout — watcher did not fire repo_rebuilt")
+            .expect("broadcast closed");
+        assert_eq!(event.kind, "repo_rebuilt");
     }
 
     #[test]
