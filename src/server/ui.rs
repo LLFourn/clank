@@ -7,6 +7,63 @@
 
 use serde_json::Value;
 
+/// JS snippet shared by the home and session pages. Subscribes to the
+/// SSE endpoint, plays a short chime on each event, and debounces page
+/// reloads so chips/banners refresh without manual reload.
+const LIVE_SCRIPT: &str = r#"
+<script>
+(function () {
+  const url = window.__trinity_sse || '/events';
+  let last = 0;
+  let reloadTimer = null;
+  let audioCtx = null;
+  function chime() {
+    if (window.__trinity_muted) return;
+    try {
+      audioCtx = audioCtx || new (window.AudioContext || window.webkitAudioContext)();
+      const t = audioCtx.currentTime;
+      const o = audioCtx.createOscillator();
+      const g = audioCtx.createGain();
+      o.type = 'sine'; o.frequency.setValueAtTime(880, t);
+      g.gain.setValueAtTime(0.0001, t);
+      g.gain.exponentialRampToValueAtTime(0.10, t + 0.01);
+      g.gain.exponentialRampToValueAtTime(0.0001, t + 0.15);
+      o.connect(g); g.connect(audioCtx.destination);
+      o.start(t); o.stop(t + 0.18);
+    } catch (e) {}
+  }
+  function scheduleReload() {
+    if (reloadTimer) clearTimeout(reloadTimer);
+    reloadTimer = setTimeout(() => { window.location.reload(); }, 500);
+  }
+  function connect() {
+    const es = new EventSource(url);
+    es.onmessage = (ev) => {
+      const now = Date.now();
+      if (now - last > 300) {
+        chime();
+        last = now;
+      }
+      scheduleReload();
+    };
+    es.onerror = () => {
+      es.close();
+      setTimeout(connect, 2000);
+    };
+  }
+  connect();
+  // Mute toggle on Cmd/Ctrl+M for the impatient.
+  document.addEventListener('keydown', (e) => {
+    if ((e.metaKey || e.ctrlKey) && e.key === 'm') {
+      window.__trinity_muted = !window.__trinity_muted;
+      const tag = document.getElementById('mute-indicator');
+      if (tag) tag.textContent = window.__trinity_muted ? '🔇' : '🔔';
+    }
+  });
+})();
+</script>
+"#;
+
 pub fn home_page(sessions: &Value) -> String {
     let arr = sessions.as_array().cloned().unwrap_or_default();
     let mut rows = String::new();
@@ -35,11 +92,14 @@ pub fn home_page(sessions: &Value) -> String {
          .waiting-master{{background:#fde68a;color:#92400e}}\
          .waiting-reviewers{{background:#bfdbfe;color:#1e40af}}\
          .waiting-none{{background:#d1d5db;color:#374151}}\
+         #mute-indicator{{float:right;font-size:1.2em;opacity:.6}}\
          </style></head><body>\
+         <span id=\"mute-indicator\">🔔</span>\
          <h1>Trinity sessions</h1>\
          <table><thead><tr><th>Session</th><th>Phase</th><th>Worktree</th>\
          <th>Waiting on</th><th>Description</th></tr></thead>\
          <tbody>{rows}</tbody></table>\
+         {LIVE_SCRIPT}\
          </body></html>"
     )
 }
@@ -140,6 +200,8 @@ pub fn session_page(ctx: &Value) -> String {
          <h2>Plan revisions</h2>{plan_revisions_html}\
          <h2>Implementation commits</h2>{impl_commits_html}\
          {pr_hint_html}\
+         <script>window.__trinity_sse = '/sessions/{id}/events';</script>\
+         {LIVE_SCRIPT}\
          </body></html>"
     )
 }

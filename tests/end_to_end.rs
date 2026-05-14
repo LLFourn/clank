@@ -43,17 +43,22 @@ fn commit(repo: &Path, msg: &str) {
 }
 
 async fn spawn_daemon(repo_root: &Path) -> (String, tokio::task::JoinHandle<()>) {
-    // Pick an ephemeral port.
+    spawn_daemon_with_repos(&[repo_root.to_path_buf()]).await
+}
+
+async fn spawn_daemon_with_repos(
+    repos: &[std::path::PathBuf],
+) -> (String, tokio::task::JoinHandle<()>) {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
     drop(listener);
 
     let repos_file = tempfile::NamedTempFile::new().unwrap();
-    std::fs::write(
-        repos_file.path(),
-        format!("{}\n", repo_root.display()),
-    )
-    .unwrap();
+    let body = repos
+        .iter()
+        .map(|p| format!("{}\n", p.display()))
+        .collect::<String>();
+    std::fs::write(repos_file.path(), body).unwrap();
 
     let args = server::ServeArgs {
         bind: addr,
@@ -62,11 +67,10 @@ async fn spawn_daemon(repo_root: &Path) -> (String, tokio::task::JoinHandle<()>)
 
     let url = format!("http://{}", addr);
     let handle = tokio::spawn(async move {
-        let _hold = repos_file; // keep the temp file alive
+        let _hold = repos_file;
         let _ = server::serve(args).await;
     });
 
-    // Wait for the server to come up.
     for _ in 0..50 {
         tokio::time::sleep(Duration::from_millis(50)).await;
         if reqwest::get(format!("{}/healthz", url)).await.is_ok() {
@@ -353,6 +357,51 @@ async fn sse_pushes_repo_rebuilt_on_head_change() {
     }
     handle.abort();
     assert!(got_event, "expected `repo_rebuilt` SSE event after HEAD change");
+}
+
+#[tokio::test]
+async fn start_plan_persists_repo_to_registry() {
+    // Override $HOME so we don't pollute the user's real ~/.trinity.
+    let fake_home = tempfile::tempdir().unwrap();
+    // SAFETY: tests run single-threaded for this assertion via the
+    // function-scope env mutation; we restore after.
+    let prev_home = std::env::var_os("HOME");
+    // SAFETY: set_var on Unix-ish; only called in tests.
+    unsafe { std::env::set_var("HOME", fake_home.path()) };
+
+    let dir = init_repo();
+    // Don't pre-register; start_plan should do it.
+    let (url, handle) = spawn_daemon_with_repos(&[]).await;
+    let client = reqwest::Client::new();
+    let req = json!({
+        "cwd": dir.path(),
+        "tool": "start_plan",
+        "arguments": { "session_id": "foo", "label": "test-agent" }
+    });
+    let resp = client
+        .post(format!("{}/internal/tool_call", url))
+        .json(&req)
+        .send()
+        .await
+        .unwrap();
+    handle.abort();
+    assert!(resp.status().is_success(), "start_plan failed: {}", resp.status());
+
+    // ~/.trinity/repos should now contain the repo path.
+    let registry_path = fake_home.path().join(".trinity/repos");
+    assert!(registry_path.exists(), "registry file should be created");
+    let body = std::fs::read_to_string(&registry_path).unwrap();
+    assert!(
+        body.lines().any(|l| std::path::Path::new(l.trim()) == dir.path()
+            || std::path::Path::new(l.trim()) == dir.path().canonicalize().unwrap()),
+        "registry should contain the repo, got: {body}"
+    );
+
+    // Restore $HOME.
+    match prev_home {
+        Some(v) => unsafe { std::env::set_var("HOME", v) },
+        None => unsafe { std::env::remove_var("HOME") },
+    }
 }
 
 #[tokio::test]

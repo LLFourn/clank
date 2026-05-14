@@ -67,6 +67,8 @@ async fn start_plan(state: &AppState, req: &ToolCallRequest) -> Result<Value, To
         .map_err(|e| ToolError::Invalid(format!("args: {e}")))?;
     let repo = resolve_repo(&req.cwd).await?;
     ensure_gitignore(&repo)?;
+    persist_repo_in_registry(&repo)
+        .map_err(|e| ToolError::Internal(anyhow::anyhow!("register repo: {e}")))?;
     let plan_rel = PathBuf::from(".trinity/plans").join(format!("{}.md", args.session_id));
     let plan_abs = repo.join(&plan_rel);
     if let Some(parent) = plan_abs.parent() {
@@ -77,6 +79,7 @@ async fn start_plan(state: &AppState, req: &ToolCallRequest) -> Result<Value, To
             .map_err(|e| ToolError::Internal(anyhow::anyhow!(e)))?;
     }
     state.runtime.add_repo_if_unknown(repo.clone()).await;
+    ensure_repo_watcher(state, repo.clone()).await;
     let committed = state
         .runtime
         .read_repo(&repo, |s| {
@@ -158,6 +161,54 @@ async fn resolve_repo(cwd: &Path) -> Result<PathBuf, ToolError> {
     }
     let s = String::from_utf8_lossy(&output.stdout).trim().to_string();
     Ok(PathBuf::from(s))
+}
+
+/// Spawn a notify watcher for `repo` if one isn't already running.
+/// Tracks watched repos in `AppState.watched_repos` to dedupe.
+async fn ensure_repo_watcher(state: &AppState, repo: PathBuf) {
+    {
+        let watched = state.watched_repos.lock().await;
+        if watched.contains(&repo) {
+            return;
+        }
+    }
+    match super::notify_bridge::start(state.runtime.clone(), repo.clone()).await {
+        Ok(handle) => {
+            state.watchers.lock().await.push(handle);
+            state.watched_repos.lock().await.insert(repo);
+        }
+        Err(err) => {
+            tracing::warn!(repo = %repo.display(), error = ?err, "watcher start failed for new repo");
+        }
+    }
+}
+
+/// Append `repo` to `~/.trinity/repos` if not already present. The file is
+/// the daemon's persistent registry of known repos; serve() reads it at
+/// startup. Missing parent dirs are created.
+fn persist_repo_in_registry(repo: &Path) -> std::io::Result<()> {
+    let Some(home) = std::env::var_os("HOME") else {
+        return Ok(()); // no $HOME; tolerate silently
+    };
+    let registry = PathBuf::from(home).join(".trinity/repos");
+    if let Some(parent) = registry.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let existing = std::fs::read_to_string(&registry).unwrap_or_default();
+    let already_present = existing
+        .lines()
+        .map(str::trim)
+        .any(|l| !l.is_empty() && std::path::Path::new(l) == repo);
+    if already_present {
+        return Ok(());
+    }
+    use std::io::Write;
+    let mut f = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&registry)?;
+    writeln!(f, "{}", repo.display())?;
+    Ok(())
 }
 
 fn ensure_gitignore(repo: &Path) -> Result<(), ToolError> {
