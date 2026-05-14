@@ -1,7 +1,4 @@
 //! Newtype wrappers for the IDs used across the filesystem-truth model.
-//! The old SQL-era reducer that used to live here was removed when the
-//! filesystem-truth rewrite landed; only the newtypes remain because
-//! the rest of the codebase imports them through this module.
 
 use std::fmt;
 

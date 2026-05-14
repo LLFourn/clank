@@ -1,9 +1,7 @@
 //! Minimal HTML rendering for the homepage + session detail page.
 //!
 //! Renders the in-memory state from `Runtime` via inline format strings.
-//! No templating engine — strings only. Intentionally bare-bones; the
-//! old SQL-era UI's polish (chime, charts, polish styling) will be
-//! ported in a follow-up.
+//! No templating engine — strings only. Intentionally bare-bones.
 
 use serde_json::Value;
 

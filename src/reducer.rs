@@ -8,7 +8,7 @@
 //! - `step` is pure. The caller supplies the current time; the caller
 //!   runs effects against the filesystem.
 //! - Effects are filesystem operations + broadcasts + a rebuild signal.
-//!   Never SQL, never git index writes, never commits, never amends.
+//!   Never git index writes, never commits, never amends.
 
 use std::path::PathBuf;
 

@@ -340,7 +340,6 @@ The existing `expected_action` field stays. It is the **caller-specific** next a
 ## Cold Start
 
 ```
-log_loudly_about_legacy_sqlite_if_present();    // never delete
 for repo in read_known_repos("~/.trinity/repos") {
     register_repo_watcher(&repo);
     rebuild_repo(&repo).await;                  // same path used for any HEAD change
@@ -442,7 +441,7 @@ One large rewrite, sequenced as six commits.
 2. **New watchers + main loop.** Recursive watcher per repo, plus `.git/HEAD` + `.git/logs/HEAD`. New main loop owns the reducer + effect runner. `HeadChanged` → `RebuildRepo`. Old watcher tree shuts off for `.trinity/` paths.
 3. **HTTP migration.** Each route reads from in-memory state. Session detail swaps to `git log --follow` + attribution map. Live SSE switches to the ring buffer; chime wiring preserved.
 4. **MCP migration.** Rewrite `start_plan`, `get_context`, `list_sessions` against in-memory state. Add `pr_hint` to `get_context`. Drop `claim_session`. Replace `tools/master.rs` + `tools/reviewer.rs` with one ~150-line `src/tools.rs`.
-5. **Rip out SQL.** Delete `migrations/`, `src/storage/`, `src/daemon/apply.rs`, `src/daemon/curator.rs`, the old `src/lifecycle.rs`, the old `src/daemon/service.rs`. Remove `sqlx` and SQL-only deps. Log loudly about legacy `~/.trinity/trinity.sqlite*` on startup; do not delete.
+5. **Rip out SQL.** Delete `migrations/`, `src/storage/`, `src/daemon/apply.rs`, `src/daemon/curator.rs`, the old `src/lifecycle.rs`, the old `src/daemon/service.rs`. Remove `sqlx` and SQL-only deps.
 6. **Rewrite tests.** SQL state assertions → filesystem or git-log assertions. Drop SQL setup helpers.
 
 ## Acceptance Criteria
@@ -469,7 +468,6 @@ One large rewrite, sequenced as six commits.
 - **Plan history follows renames.** `mv plans/<id>.md plans/done/<id>.md` + operator commit preserves history via `git log --follow`. Rename detection uses `git diff-tree -r --name-status -M`.
 - **Feedback auto-organization.** Writing `<phase>/<author>.md` flat results in Trinity moving it to `<phase>/<current-target-sha>/<author>.md` within one watcher round.
 - **`pr_hint` is unambiguous.** Both `plan_intro` and `plan_intro_parent` exposed; per-option commands run correctly.
-- **No `~/.trinity/trinity.sqlite*` deletion.** Legacy DB logged about, never mutated.
 - **Attribution overrides require amending.** Trinity offers no UI/MCP/HTTP affordance for changing a commit's session. Operators amend the commit to change which plan paths it touches.
 - **Uncommitted plan files are not sessions.** `start_plan` creates a working-tree file but the session does not appear in `list_sessions`, `get_context`, or the homepage until the file is committed and HEAD moves. `get_context` for an uncommitted session_id returns the `session_not_committed` error.
 - **Working-tree plan edits produce no observation.** Editing `<plan_path>` without committing causes no `PlanFileChanged`, no plan revision, no live event, no `RebuildRepo`.
@@ -539,13 +537,11 @@ Integration (`tests/`):
 - Restart mid-workflow: homepage + per-session views reproduce identically; ring buffer empty.
 - `mv plans/<id>.md plans/done/<id>.md` + operator commit: `git status` shows the rename in the index after operator runs `git add`; session detail page renders plan-revision history via `--follow`.
 - `pr_hint.options[*].command` produces a clean staged diff that excludes the plan when `exclude_plan_from_pr` chosen.
-- Legacy `~/.trinity/trinity.sqlite` present: startup logs about it, does not delete it, runs normally.
 - No `git add`/`git commit`/`git mv` observed in process traces during any Trinity action.
 
 ## Non-Goals
 
 - **No persistent timeline outside git.** Events ring is in-memory only. Git is the history.
-- **No backward compatibility with `.trinity/trinity.sqlite`.** Operators delete it themselves.
 - **No Trinity autocommits, amends, or index writes.** Plans are author-owned. Trinity edits files in the working tree only.
 - **No "structural feedback" table.** Feedback is files. Verdicts are markers. Targets are encoded in paths. Gates are derived.
 - **No claim concept.** To work on session X, commit a touch to X's plan. The commit is the claim.

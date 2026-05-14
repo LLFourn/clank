@@ -1,6 +1,4 @@
-//! Review verdict + gate types. The gate derivation that depended on
-//! SQL `FeedbackRecord` rows was deleted when the filesystem-truth
-//! rewrite landed; the new derivation lives in
+//! Review verdict + gate types. Gate derivation lives in
 //! `mcp_response::derive_gate_from_feedback`, working over the in-memory
 //! `Session.plan_feedback` / `impl_feedback` maps.
 
