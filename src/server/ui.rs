@@ -135,6 +135,17 @@ pub fn session_page(ctx: &Value) -> String {
         latest_plan,
     );
 
+    let plan_feedback_html = render_feedback_list(
+        ctx["plan_feedback"].as_array(),
+        "plan",
+        id,
+    );
+    let impl_feedback_html = render_feedback_list(
+        ctx["impl_feedback"].as_array(),
+        "impl",
+        id,
+    );
+
     let pr_hint_html = if let Some(hint) = ctx.get("pr_hint").filter(|v| !v.is_null()) {
         let options = hint["options"].as_array().cloned().unwrap_or_default();
         let mut s = String::new();
@@ -165,8 +176,14 @@ pub fn session_page(ctx: &Value) -> String {
          a{{color:#1d4ed8;text-decoration:none}}\
          a:hover{{text-decoration:underline}}\
          code{{background:#f3f4f6;padding:.1em .3em;border-radius:.25em;font-size:.9em}}\
-         ul.commits{{list-style:none;padding:0}}\
-         ul.commits li{{padding:.25em 0;border-bottom:1px solid #f3f4f6}}\
+         ul.commits,ul.feedback{{list-style:none;padding:0}}\
+         ul.commits li,ul.feedback li{{padding:.25em 0;border-bottom:1px solid #f3f4f6}}\
+         .verdict-approve{{display:inline-block;padding:.1em .5em;border-radius:.4em;\
+         background:#d1fae5;color:#065f46;font-weight:600;font-size:.85em}}\
+         .verdict-request{{display:inline-block;padding:.1em .5em;border-radius:.4em;\
+         background:#fee2e2;color:#991b1b;font-weight:600;font-size:.85em}}\
+         .verdict-unmarked{{display:inline-block;padding:.1em .5em;border-radius:.4em;\
+         background:#e5e7eb;color:#374151;font-style:italic;font-size:.85em}}\
          .none{{color:#6b7280;font-style:italic}}\
          h2{{margin-top:2em}}\
          </style></head><body>\
@@ -182,6 +199,8 @@ pub fn session_page(ctx: &Value) -> String {
          </dl>\
          <h2>Plan revisions</h2>{plan_revisions_html}\
          <h2>Implementation commits</h2>{impl_commits_html}\
+         <h2>Plan feedback</h2>{plan_feedback_html}\
+         <h2>Implementation feedback</h2>{impl_feedback_html}\
          {pr_hint_html}\
          <script>window.__trinity_sse = '/sessions/{id}/events';</script>\
          {LIVE_SCRIPT}\
@@ -232,6 +251,46 @@ fn html_escape(s: &str) -> String {
     s.replace('&', "&amp;")
         .replace('<', "&lt;")
         .replace('>', "&gt;")
+}
+
+/// Render the per-phase feedback list. Each entry: verdict chip + author
+/// + (clickable) target SHA. Empty list → "No feedback yet."
+fn render_feedback_list(
+    entries: Option<&Vec<Value>>,
+    phase: &str,
+    session_id: &str,
+) -> String {
+    let entries = entries.map(|v| v.as_slice()).unwrap_or(&[]);
+    if entries.is_empty() {
+        return format!("<p class=\"none\">No {phase} feedback yet.</p>");
+    }
+    let route = match phase {
+        "plan" => "plan",
+        _ => "commit",
+    };
+    let mut s = String::from("<ul class=\"feedback\">");
+    for e in entries {
+        let verdict = e["verdict"].as_str().unwrap_or("unmarked");
+        let author = e["author"].as_str().unwrap_or("?");
+        let target = e["target_sha"].as_str().unwrap_or("");
+        let short = &target[..7.min(target.len())];
+        let css = match verdict {
+            "approve" => "verdict-approve",
+            "request_changes" => "verdict-request",
+            _ => "verdict-unmarked",
+        };
+        let pretty = match verdict {
+            "approve" => "APPROVE",
+            "request_changes" => "REQUEST_CHANGES",
+            _ => "(unmarked)",
+        };
+        s.push_str(&format!(
+            "<li><span class=\"{css}\">{pretty}</span> from <strong>{author}</strong> on \
+             <a href=\"/sessions/{session_id}/{route}/{target}\"><code>{short}</code></a></li>"
+        ));
+    }
+    s.push_str("</ul>");
+    s
 }
 
 /// Render a clickable list of commit shas. `route` is `"plan"` or `"commit"`

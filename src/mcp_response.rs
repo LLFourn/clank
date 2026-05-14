@@ -130,6 +130,9 @@ pub fn get_context_response(
         None
     };
 
+    let plan_feedback = feedback_entries(&session.plan_feedback);
+    let impl_feedback = feedback_entries(&session.impl_feedback);
+
     let plan_revisions: Vec<String> = all_plan_revisions(session, &state.attribution)
         .into_iter()
         .map(|s| s.as_str().to_string())
@@ -151,8 +154,24 @@ pub fn get_context_response(
         "latest_implementation_revision": latest_impl_revision(session, &state.attribution),
         "plan_revisions": plan_revisions,
         "implementation_commits": implementation_commits,
+        "plan_feedback": plan_feedback,
+        "impl_feedback": impl_feedback,
         "pr_hint": pr_hint,
     })))
+}
+
+fn feedback_entries(
+    map: &std::collections::BTreeMap<(crate::lifecycle::CommitSha, crate::lifecycle::AgentLabel), crate::repo_state::Feedback>,
+) -> Vec<Value> {
+    map.iter()
+        .map(|((target, author), fb)| {
+            json!({
+                "target_sha": target.as_str(),
+                "author": author.as_str(),
+                "verdict": fb.verdict.as_str(),
+            })
+        })
+        .collect()
 }
 
 fn pr_hint_value(

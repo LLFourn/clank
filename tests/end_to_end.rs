@@ -413,6 +413,140 @@ async fn start_plan_persists_repo_to_registry() {
 }
 
 #[tokio::test]
+async fn branch_switch_rebuilds_repo_state() {
+    let dir = init_repo();
+    write_file(dir.path(), ".trinity/plans/foo.md", "# foo\n");
+    commit(dir.path(), "Add foo");
+
+    let (url, handle) = spawn_daemon(dir.path()).await;
+    let client = reqwest::Client::new();
+
+    // Branch off from main, add a NEW plan there
+    run_git(dir.path(), &["checkout", "-q", "-b", "feat"]);
+    write_file(dir.path(), ".trinity/plans/bar.md", "# bar\n");
+    commit(dir.path(), "Add bar plan on feat branch");
+    // Give the watcher time to fire HeadChanged + rebuild.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // list_sessions should now show both foo and bar (we're on feat).
+    let req = json!({"cwd": dir.path(), "tool": "list_sessions", "arguments": {}});
+    let v: serde_json::Value = client
+        .post(format!("{}/internal/tool_call", url))
+        .json(&req)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let ids: Vec<&str> = v["result"]["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|s| s["id"].as_str())
+        .collect();
+    assert!(ids.contains(&"foo"), "got: {:?}", ids);
+    assert!(ids.contains(&"bar"), "got: {:?}", ids);
+
+    // Switch back to main. bar's plan file doesn't exist there.
+    run_git(dir.path(), &["checkout", "-q", "main"]);
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    let v: serde_json::Value = client
+        .post(format!("{}/internal/tool_call", url))
+        .json(&req)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let ids: Vec<&str> = v["result"]["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|s| s["id"].as_str())
+        .collect();
+    handle.abort();
+    assert!(ids.contains(&"foo"));
+    assert!(
+        !ids.contains(&"bar"),
+        "bar should be gone after switching to main; got: {:?}",
+        ids
+    );
+}
+
+#[tokio::test]
+async fn feedback_renders_on_session_page() {
+    let dir = init_repo();
+    write_file(dir.path(), ".trinity/plans/foo.md", "# foo\n");
+    commit(dir.path(), "Add foo");
+
+    let (url, handle) = spawn_daemon(dir.path()).await;
+    let client = reqwest::Client::new();
+
+    // Find the plan_intro sha via get_context.
+    let req = json!({
+        "cwd": dir.path(),
+        "tool": "get_context",
+        "arguments": { "session_id": "foo" }
+    });
+    let ctx: serde_json::Value = client
+        .post(format!("{}/internal/tool_call", url))
+        .json(&req)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let intro = ctx["result"]["latest_plan_revision"]["commit_sha"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // Drop a feedback file at the canonical path.
+    let feedback_rel = format!(".trinity/feedback/foo/plan/{}/alice.md", intro);
+    write_file(dir.path(), &feedback_rel, "APPROVE\n\nlgtm\n");
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+
+    // First check via get_context that the feedback is in state.
+    let req2 = json!({
+        "cwd": dir.path(),
+        "tool": "get_context",
+        "arguments": { "session_id": "foo" }
+    });
+    let ctx2: serde_json::Value = client
+        .post(format!("{}/internal/tool_call", url))
+        .json(&req2)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let pf = ctx2["result"]["plan_feedback"].as_array().unwrap();
+    assert!(
+        !pf.is_empty(),
+        "plan_feedback should be populated; ctx: {ctx2}"
+    );
+    // Then check that the session page renders it.
+    let body = client
+        .get(format!("{}/sessions/foo", url))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    handle.abort();
+    assert!(
+        body.contains("APPROVE") && body.contains("alice"),
+        "session page should render feedback; got: {body}"
+    );
+}
+
+#[tokio::test]
 async fn done_move_endpoint_moves_plan_file() {
     let dir = init_repo();
     write_file(dir.path(), ".trinity/plans/foo.md", "# foo\n");

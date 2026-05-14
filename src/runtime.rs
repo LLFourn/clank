@@ -63,10 +63,14 @@ impl Runtime {
 
     /// Register a repo: run an initial rebuild and insert into state.
     /// Idempotent — re-calling against an existing repo re-runs the rebuild.
+    /// Canonicalizes the path so callers from different surfaces (test
+    /// tempdir vs `git rev-parse --show-toplevel` resolution) hit the same
+    /// HashMap key.
     pub async fn add_repo(&self, repo_root: PathBuf) -> Result<(), RuntimeError> {
-        let fresh = rebuild_repo(&repo_root).await?;
+        let canonical = dunce::canonicalize(&repo_root).unwrap_or(repo_root);
+        let fresh = rebuild_repo(&canonical).await?;
         let mut trinity = self.state.lock().await;
-        trinity.repos.insert(repo_root, fresh);
+        trinity.repos.insert(canonical, fresh);
         Ok(())
     }
 
@@ -74,29 +78,33 @@ impl Runtime {
     /// rebuild errors (logged), so request handlers can call this on
     /// every request without needing to special-case "already loaded."
     pub async fn add_repo_if_unknown(&self, repo_root: PathBuf) {
+        let canonical = dunce::canonicalize(&repo_root).unwrap_or(repo_root);
         {
             let trinity = self.state.lock().await;
-            if trinity.repos.contains_key(&repo_root) {
+            if trinity.repos.contains_key(&canonical) {
                 return;
             }
         }
-        if let Err(err) = self.add_repo(repo_root.clone()).await {
-            tracing::warn!(repo = %repo_root.display(), error = ?err, "add_repo_if_unknown failed");
+        if let Err(err) = self.add_repo(canonical.clone()).await {
+            tracing::warn!(repo = %canonical.display(), error = ?err, "add_repo_if_unknown failed");
         }
     }
 
     /// Read-only snapshot of a repo's state for request handlers. Holds the
-    /// mutex for the duration of the closure.
+    /// mutex for the duration of the closure. Path is canonicalized so
+    /// callers from different surfaces hit the same HashMap key.
     pub async fn read_repo<R>(
         &self,
         repo_root: &Path,
         f: impl FnOnce(&RepoState) -> R,
     ) -> Result<R, RuntimeError> {
+        let canonical = dunce::canonicalize(repo_root)
+            .unwrap_or_else(|_| repo_root.to_path_buf());
         let trinity = self.state.lock().await;
         let state = trinity
             .repos
-            .get(repo_root)
-            .ok_or_else(|| RuntimeError::UnknownRepo(repo_root.to_path_buf()))?;
+            .get(&canonical)
+            .ok_or_else(|| RuntimeError::UnknownRepo(canonical.clone()))?;
         Ok(f(state))
     }
 
@@ -154,6 +162,9 @@ impl Runtime {
         signal: FilesystemSignal,
         now: i64,
     ) -> Result<(), RuntimeError> {
+        let repo_root_canonical = dunce::canonicalize(repo_root)
+            .unwrap_or_else(|_| repo_root.to_path_buf());
+        let repo_root = repo_root_canonical.as_path();
         match signal {
             FilesystemSignal::HeadChanged => {
                 let fresh = rebuild_repo(repo_root).await?;
