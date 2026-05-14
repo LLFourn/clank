@@ -1,0 +1,593 @@
+//! MCP / HTTP response shaping over the filesystem-truth core.
+//!
+//! Pure response builders: given a `RepoState` and a request shape,
+//! return a `serde_json::Value` matching the MCP / HTTP schema. These
+//! functions are the bridge between the pure core (rebuild + projection)
+//! and the wire surface.
+//!
+//! `compute_plan_worktree_status` is the one piece that reaches into the
+//! working tree (it has to — by definition it's comparing HEAD to disk).
+//! Everything else here operates over the in-memory state.
+
+use std::path::{Path, PathBuf};
+
+use serde_json::{Value, json};
+
+use crate::disk_format::plan_path_is_done;
+use crate::lifecycle::{AgentLabel, SessionId, content_hash};
+use crate::projection::{phase, plan_worktree_status, waiting_on};
+use crate::repo_state::{PlanWorktreeStatus, RepoState, WaitingOn};
+use crate::review_state::{ReviewGateDecision, ReviewGateState, ReviewPhase};
+
+/// Compare the working-tree plan file at `session.plan_path` to HEAD's
+/// blob (already cached in `session.body_hash`). Returns the four-state
+/// `PlanWorktreeStatus`.
+///
+/// This is the only function in this module that touches the disk; it's
+/// called by `get_context_response` to produce a fresh status at request
+/// time so the response is never stale.
+pub fn compute_plan_worktree_status(
+    repo_root: &Path,
+    session: &crate::repo_state::Session,
+) -> std::io::Result<PlanWorktreeStatus> {
+    let active_path = repo_root.join(&session.plan_path);
+    let counterpart_rel = swap_active_done(&session.plan_path);
+    let counterpart_abs = counterpart_rel.as_ref().map(|p| repo_root.join(p));
+
+    let wt_hash = match std::fs::read_to_string(&active_path) {
+        Ok(body) => Some(content_hash(&body)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => return Err(e),
+    };
+    let counterpart_exists = counterpart_abs
+        .as_ref()
+        .map(|p| p.exists())
+        .unwrap_or(false);
+
+    Ok(plan_worktree_status(
+        Some(&session.body_hash),
+        wt_hash.as_ref(),
+        counterpart_exists,
+    ))
+}
+
+/// Given a plan path (relative), return its counterpart in the
+/// active↔done flip. `.trinity/plans/<id>.md` ↔ `.trinity/plans/done/<id>.md`.
+fn swap_active_done(plan_path: &Path) -> Option<PathBuf> {
+    let name = plan_path.file_name()?;
+    if plan_path_is_done(plan_path) {
+        Some(PathBuf::from(".trinity/plans").join(name))
+    } else {
+        Some(PathBuf::from(".trinity/plans/done").join(name))
+    }
+}
+
+/// `list_sessions` response over a single repo.
+///
+/// Returns an array of session summaries: id, plan_path, phase,
+/// waiting_on, plan_worktree_status. Each row is enough to drive the
+/// homepage's session table without further queries.
+pub fn list_sessions_response(repo_root: &Path, state: &RepoState) -> std::io::Result<Value> {
+    let mut sessions = Vec::with_capacity(state.sessions.len());
+    for session in state.sessions.values() {
+        let worktree_status = compute_plan_worktree_status(repo_root, session)?;
+        let session_phase = phase(session, &state.attribution);
+        let plan_gate = plan_gate_for(session, &state.attribution);
+        let impl_gate = impl_gate_for(session, &state.attribution);
+        let w = waiting_on(
+            session_phase,
+            worktree_status,
+            plan_gate.as_ref(),
+            impl_gate.as_ref(),
+        );
+        sessions.push(session_summary(session, session_phase, worktree_status, &w));
+    }
+    Ok(Value::Array(sessions))
+}
+
+fn session_summary(
+    session: &crate::repo_state::Session,
+    session_phase: crate::repo_state::Phase,
+    worktree_status: PlanWorktreeStatus,
+    w: &WaitingOn,
+) -> Value {
+    json!({
+        "id": session.id.as_str(),
+        "plan_path": session.plan_path.to_string_lossy(),
+        "phase": session_phase.as_str(),
+        "plan_worktree_status": worktree_status.as_str(),
+        "waiting_on": waiting_on_value(w),
+    })
+}
+
+/// `get_context` response for a specific session + author.
+///
+/// Returns `Ok(None)` if the session doesn't exist in HEAD (the caller
+/// should map this to `{ error: "session_not_committed", ... }`).
+pub fn get_context_response(
+    repo_root: &Path,
+    state: &RepoState,
+    session_id: &SessionId,
+    _author_label: &AgentLabel,
+) -> std::io::Result<Option<Value>> {
+    let Some(session) = state.sessions.get(session_id) else {
+        return Ok(None);
+    };
+    let worktree_status = compute_plan_worktree_status(repo_root, session)?;
+    let session_phase = phase(session, &state.attribution);
+    let plan_gate = plan_gate_for(session, &state.attribution);
+    let impl_gate = impl_gate_for(session, &state.attribution);
+    let w = waiting_on(
+        session_phase,
+        worktree_status,
+        plan_gate.as_ref(),
+        impl_gate.as_ref(),
+    );
+
+    Ok(Some(json!({
+        "session_id": session.id.as_str(),
+        "phase": session_phase.as_str(),
+        "plan_worktree_status": worktree_status.as_str(),
+        "waiting_on": waiting_on_value(&w),
+        "plan_path": session.plan_path.to_string_lossy(),
+        "review_gate": gate_value(plan_gate.as_ref(), impl_gate.as_ref(), session_phase),
+        "latest_plan_revision": latest_plan_revision(session, &state.attribution),
+        "latest_implementation_revision": latest_impl_revision(session, &state.attribution),
+    })))
+}
+
+fn waiting_on_value(w: &WaitingOn) -> Value {
+    json!({
+        "role": w.role.as_str(),
+        "reason": w.reason.as_str(),
+        "agents": w.agents.iter().map(|a| a.as_str()).collect::<Vec<_>>(),
+        "description": w.description,
+    })
+}
+
+fn gate_value(
+    plan_gate: Option<&ReviewGateDecision>,
+    impl_gate: Option<&ReviewGateDecision>,
+    session_phase: crate::repo_state::Phase,
+) -> Value {
+    let gate = match session_phase {
+        crate::repo_state::Phase::Planning => plan_gate,
+        crate::repo_state::Phase::Implementing => impl_gate,
+        crate::repo_state::Phase::Done => None,
+    };
+    match gate {
+        Some(g) => json!({
+            "state": g.state.as_str(),
+            "phase": match g.phase { ReviewPhase::Plan => "plan", ReviewPhase::Impl => "impl" },
+            "participants": g.participants.iter().map(|a| a.as_str()).collect::<Vec<_>>(),
+            "approvals": g.approvals.iter().map(|a| a.as_str()).collect::<Vec<_>>(),
+            "request_changes": g.request_changes.iter().map(|a| a.as_str()).collect::<Vec<_>>(),
+            "missing_approvals": g.missing_approvals.iter().map(|a| a.as_str()).collect::<Vec<_>>(),
+        }),
+        None => Value::Null,
+    }
+}
+
+fn latest_plan_revision(
+    session: &crate::repo_state::Session,
+    attribution: &std::collections::BTreeMap<crate::lifecycle::CommitSha, crate::repo_state::AttributionResult>,
+) -> Value {
+    // The latest plan-touching commit attributed to this session.
+    let mut latest = None;
+    for (sha, attr) in attribution {
+        if let crate::repo_state::AttributionResult::Attributed {
+            session: sid,
+            plan_touch: Some(_),
+            ..
+        } = attr
+            && sid == &session.id
+        {
+            latest = Some(sha.clone());
+        }
+    }
+    match latest {
+        Some(sha) => json!({ "commit_sha": sha.as_str() }),
+        None => Value::Null,
+    }
+}
+
+fn latest_impl_revision(
+    session: &crate::repo_state::Session,
+    attribution: &std::collections::BTreeMap<crate::lifecycle::CommitSha, crate::repo_state::AttributionResult>,
+) -> Value {
+    let mut latest = None;
+    for (sha, attr) in attribution {
+        if let crate::repo_state::AttributionResult::Attributed {
+            session: sid,
+            has_code_changes: true,
+            ..
+        } = attr
+            && sid == &session.id
+        {
+            latest = Some(sha.clone());
+        }
+    }
+    match latest {
+        Some(sha) => json!({ "commit_sha": sha.as_str() }),
+        None => Value::Null,
+    }
+}
+
+/// Build the plan-phase review gate from the session's plan_feedback
+/// against the current plan target SHA. Returns `None` if the session
+/// has no plan target yet.
+fn plan_gate_for(
+    session: &crate::repo_state::Session,
+    attribution: &std::collections::BTreeMap<crate::lifecycle::CommitSha, crate::repo_state::AttributionResult>,
+) -> Option<ReviewGateDecision> {
+    let current_target = latest_plan_touching_commit(session, attribution)?;
+    Some(derive_gate_from_feedback(
+        ReviewPhase::Plan,
+        &current_target,
+        &session.plan_feedback,
+    ))
+}
+
+fn impl_gate_for(
+    session: &crate::repo_state::Session,
+    attribution: &std::collections::BTreeMap<crate::lifecycle::CommitSha, crate::repo_state::AttributionResult>,
+) -> Option<ReviewGateDecision> {
+    let current_target = latest_impl_commit(session, attribution)?;
+    Some(derive_gate_from_feedback(
+        ReviewPhase::Impl,
+        &current_target,
+        &session.impl_feedback,
+    ))
+}
+
+fn latest_plan_touching_commit(
+    session: &crate::repo_state::Session,
+    attribution: &std::collections::BTreeMap<crate::lifecycle::CommitSha, crate::repo_state::AttributionResult>,
+) -> Option<crate::lifecycle::CommitSha> {
+    let mut latest = None;
+    for (sha, attr) in attribution {
+        if let crate::repo_state::AttributionResult::Attributed {
+            session: sid,
+            plan_touch: Some(_),
+            ..
+        } = attr
+            && sid == &session.id
+        {
+            latest = Some(sha.clone());
+        }
+    }
+    latest
+}
+
+fn latest_impl_commit(
+    session: &crate::repo_state::Session,
+    attribution: &std::collections::BTreeMap<crate::lifecycle::CommitSha, crate::repo_state::AttributionResult>,
+) -> Option<crate::lifecycle::CommitSha> {
+    let mut latest = None;
+    for (sha, attr) in attribution {
+        if let crate::repo_state::AttributionResult::Attributed {
+            session: sid,
+            has_code_changes: true,
+            ..
+        } = attr
+            && sid == &session.id
+        {
+            latest = Some(sha.clone());
+        }
+    }
+    latest
+}
+
+/// Build a `ReviewGateDecision` directly from the session's in-memory
+/// feedback map, using SHA-anchored verdicts. Bypasses
+/// `review_state::derive_gate` (which expects `FeedbackRecord` rows) so
+/// the new core doesn't have to construct those.
+fn derive_gate_from_feedback(
+    phase: ReviewPhase,
+    current_target: &crate::lifecycle::CommitSha,
+    feedback: &std::collections::BTreeMap<(crate::lifecycle::CommitSha, AgentLabel), crate::repo_state::Feedback>,
+) -> ReviewGateDecision {
+    let mut participants: Vec<AgentLabel> = Vec::new();
+    let mut approvals: Vec<AgentLabel> = Vec::new();
+    let mut request_changes: Vec<AgentLabel> = Vec::new();
+    let mut unmarked: Vec<AgentLabel> = Vec::new();
+    let mut current_approvers: std::collections::BTreeSet<AgentLabel> =
+        std::collections::BTreeSet::new();
+    let mut current_blockers: std::collections::BTreeSet<AgentLabel> =
+        std::collections::BTreeSet::new();
+
+    for ((target_sha, author), fb) in feedback {
+        // Participant set = anyone who's ever written a verdict-bearing
+        // file in this phase (across any target SHA).
+        if matches!(
+            fb.verdict,
+            crate::repo_state::Verdict::Approve | crate::repo_state::Verdict::RequestChanges
+        ) && !participants.contains(author)
+        {
+            participants.push(author.clone());
+        }
+        // Current-target votes drive the gate.
+        if target_sha == current_target {
+            match fb.verdict {
+                crate::repo_state::Verdict::Approve => {
+                    current_approvers.insert(author.clone());
+                }
+                crate::repo_state::Verdict::RequestChanges => {
+                    current_blockers.insert(author.clone());
+                }
+                crate::repo_state::Verdict::Unmarked => {
+                    if !unmarked.contains(author) {
+                        unmarked.push(author.clone());
+                    }
+                }
+            }
+        }
+    }
+
+    approvals.extend(current_approvers);
+    request_changes.extend(current_blockers);
+
+    let missing: Vec<AgentLabel> = participants
+        .iter()
+        .filter(|p| !approvals.contains(p) && !request_changes.contains(p))
+        .cloned()
+        .collect();
+
+    let state = if !request_changes.is_empty() {
+        ReviewGateState::ChangesRequested
+    } else if !approvals.is_empty() && missing.is_empty() {
+        ReviewGateState::Ready
+    } else {
+        ReviewGateState::NeedsReview
+    };
+
+    ReviewGateDecision {
+        phase,
+        state,
+        approval_rule: "all_participants",
+        participants,
+        approvals,
+        request_changes,
+        unmarked,
+        missing_approvals: missing,
+        override_status: None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::rebuild::rebuild_repo;
+    use std::path::Path;
+    use std::process::Command;
+
+    fn init_repo() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path();
+        run_git(path, &["init", "--quiet", "--initial-branch=main"]);
+        run_git(path, &["config", "user.email", "test@test"]);
+        run_git(path, &["config", "user.name", "test"]);
+        run_git(path, &["config", "commit.gpgsign", "false"]);
+        dir
+    }
+
+    fn run_git(cwd: &Path, args: &[&str]) {
+        let status = Command::new("git")
+            .arg("-C")
+            .arg(cwd)
+            .args(args)
+            .status()
+            .unwrap();
+        assert!(status.success());
+    }
+
+    fn write_file(repo: &Path, rel: &str, body: &str) {
+        let abs = repo.join(rel);
+        if let Some(parent) = abs.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        std::fs::write(abs, body).unwrap();
+    }
+
+    fn commit(repo: &Path, msg: &str) {
+        run_git(repo, &["add", "-A"]);
+        run_git(repo, &["commit", "--quiet", "-m", msg]);
+    }
+
+    #[tokio::test]
+    async fn plan_worktree_clean_after_commit() {
+        let dir = init_repo();
+        write_file(dir.path(), ".trinity/plans/foo.md", "# foo\n");
+        commit(dir.path(), "add plan");
+
+        let state = rebuild_repo(dir.path()).await.unwrap();
+        let session = state.sessions.values().next().unwrap();
+        let status = compute_plan_worktree_status(dir.path(), session).unwrap();
+        assert_eq!(status, PlanWorktreeStatus::Clean);
+    }
+
+    #[tokio::test]
+    async fn plan_worktree_body_dirty_after_edit() {
+        let dir = init_repo();
+        write_file(dir.path(), ".trinity/plans/foo.md", "# foo v1\n");
+        commit(dir.path(), "add plan v1");
+        // Edit without committing
+        write_file(dir.path(), ".trinity/plans/foo.md", "# foo v2 uncommitted\n");
+
+        let state = rebuild_repo(dir.path()).await.unwrap();
+        let session = state.sessions.values().next().unwrap();
+        let status = compute_plan_worktree_status(dir.path(), session).unwrap();
+        assert_eq!(status, PlanWorktreeStatus::BodyDirty);
+    }
+
+    #[tokio::test]
+    async fn plan_worktree_done_move_pending() {
+        let dir = init_repo();
+        write_file(dir.path(), ".trinity/plans/foo.md", "# foo\n");
+        commit(dir.path(), "add plan");
+        // Move to done without committing
+        let from = dir.path().join(".trinity/plans/foo.md");
+        let to_dir = dir.path().join(".trinity/plans/done");
+        std::fs::create_dir_all(&to_dir).unwrap();
+        std::fs::rename(from, to_dir.join("foo.md")).unwrap();
+
+        let state = rebuild_repo(dir.path()).await.unwrap();
+        let session = state.sessions.values().next().unwrap();
+        let status = compute_plan_worktree_status(dir.path(), session).unwrap();
+        assert_eq!(status, PlanWorktreeStatus::DoneMovePending);
+    }
+
+    #[tokio::test]
+    async fn plan_worktree_missing_active_file() {
+        let dir = init_repo();
+        write_file(dir.path(), ".trinity/plans/foo.md", "# foo\n");
+        commit(dir.path(), "add plan");
+        // Just rm the file without committing or moving.
+        std::fs::remove_file(dir.path().join(".trinity/plans/foo.md")).unwrap();
+
+        let state = rebuild_repo(dir.path()).await.unwrap();
+        let session = state.sessions.values().next().unwrap();
+        let status = compute_plan_worktree_status(dir.path(), session).unwrap();
+        assert_eq!(status, PlanWorktreeStatus::MissingActivePlanFile);
+    }
+
+    #[tokio::test]
+    async fn list_sessions_response_includes_waiting_on() {
+        let dir = init_repo();
+        write_file(dir.path(), ".trinity/plans/foo.md", "# foo\n");
+        commit(dir.path(), "add plan");
+
+        let state = rebuild_repo(dir.path()).await.unwrap();
+        let v = list_sessions_response(dir.path(), &state).unwrap();
+        let arr = v.as_array().unwrap();
+        assert_eq!(arr.len(), 1);
+        assert_eq!(arr[0]["id"], "foo");
+        assert_eq!(arr[0]["phase"], "planning");
+        assert_eq!(arr[0]["plan_worktree_status"], "clean");
+        // Just-committed plan with no reviews → reviewers / plan_needs_initial_review.
+        assert_eq!(arr[0]["waiting_on"]["role"], "reviewers");
+        assert_eq!(arr[0]["waiting_on"]["reason"], "plan_needs_initial_review");
+    }
+
+    #[tokio::test]
+    async fn get_context_returns_none_for_unknown_session() {
+        let dir = init_repo();
+        let state = rebuild_repo(dir.path()).await.unwrap();
+        let v = get_context_response(
+            dir.path(),
+            &state,
+            &SessionId::from("missing".to_string()),
+            &AgentLabel::from("reviewer".to_string()),
+        )
+        .unwrap();
+        assert!(v.is_none());
+    }
+
+    #[tokio::test]
+    async fn get_context_waiting_on_master_when_plan_dirty() {
+        let dir = init_repo();
+        write_file(dir.path(), ".trinity/plans/foo.md", "# v1\n");
+        commit(dir.path(), "add v1");
+        // Edit uncommitted
+        write_file(dir.path(), ".trinity/plans/foo.md", "# v2 uncommitted\n");
+
+        let state = rebuild_repo(dir.path()).await.unwrap();
+        let v = get_context_response(
+            dir.path(),
+            &state,
+            &SessionId::from("foo".to_string()),
+            &AgentLabel::from("reviewer".to_string()),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(v["plan_worktree_status"], "body_dirty");
+        assert_eq!(v["waiting_on"]["role"], "master");
+        assert_eq!(v["waiting_on"]["reason"], "commit_plan_revision");
+    }
+
+    #[tokio::test]
+    async fn get_context_phase_implementing_after_code_commit() {
+        let dir = init_repo();
+        write_file(dir.path(), ".trinity/plans/foo.md", "# foo\n");
+        commit(dir.path(), "add plan");
+        write_file(dir.path(), "src/foo.rs", "fn x() {}\n");
+        commit(dir.path(), "impl foo");
+
+        let state = rebuild_repo(dir.path()).await.unwrap();
+        let v = get_context_response(
+            dir.path(),
+            &state,
+            &SessionId::from("foo".to_string()),
+            &AgentLabel::from("reviewer".to_string()),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(v["phase"], "implementing");
+        // No impl reviews yet → reviewers / impl_needs_initial_review
+        assert_eq!(v["waiting_on"]["role"], "reviewers");
+        assert_eq!(v["waiting_on"]["reason"], "impl_needs_initial_review");
+        assert!(v["latest_implementation_revision"].is_object());
+    }
+
+    #[tokio::test]
+    async fn get_context_request_changes_routes_to_master() {
+        let dir = init_repo();
+        write_file(dir.path(), ".trinity/plans/foo.md", "# foo\n");
+        commit(dir.path(), "add plan");
+
+        let state0 = rebuild_repo(dir.path()).await.unwrap();
+        let intro = state0.sessions[&SessionId::from("foo".to_string())]
+            .plan_intro
+            .clone();
+        // Use full SHA in the feedback path. Trinity in production will
+        // tell agents the canonical (full-SHA) path via get_context;
+        // prefix resolution at ingest is a future enhancement.
+        let feedback_rel = format!(".trinity/feedback/foo/plan/{}/codex.md", intro.as_str());
+        write_file(
+            dir.path(),
+            &feedback_rel,
+            "REQUEST_CHANGES\n\nMissing X.\n",
+        );
+
+        let state = rebuild_repo(dir.path()).await.unwrap();
+        let v = get_context_response(
+            dir.path(),
+            &state,
+            &SessionId::from("foo".to_string()),
+            &AgentLabel::from("reviewer".to_string()),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(v["waiting_on"]["role"], "master");
+        assert_eq!(v["waiting_on"]["reason"], "address_plan_request_changes");
+        let agents = v["waiting_on"]["agents"].as_array().unwrap();
+        assert_eq!(agents.len(), 1);
+        assert_eq!(agents[0], "codex");
+    }
+
+    #[tokio::test]
+    async fn get_context_approve_routes_to_master_ready_to_implement() {
+        let dir = init_repo();
+        write_file(dir.path(), ".trinity/plans/foo.md", "# foo\n");
+        commit(dir.path(), "add plan");
+
+        let state0 = rebuild_repo(dir.path()).await.unwrap();
+        let intro = state0.sessions[&SessionId::from("foo".to_string())]
+            .plan_intro
+            .clone();
+        let feedback_rel = format!(".trinity/feedback/foo/plan/{}/alice.md", intro.as_str());
+        write_file(dir.path(), &feedback_rel, "APPROVE\n\nLGTM.\n");
+
+        let state = rebuild_repo(dir.path()).await.unwrap();
+        let v = get_context_response(
+            dir.path(),
+            &state,
+            &SessionId::from("foo".to_string()),
+            &AgentLabel::from("master".to_string()),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(v["waiting_on"]["role"], "master");
+        assert_eq!(v["waiting_on"]["reason"], "ready_to_implement");
+    }
+}

@@ -16,6 +16,7 @@ pub mod attribution;
 pub mod disk_format;
 pub mod fs_watcher;
 pub mod git_io;
+pub mod mcp_response;
 pub mod projection;
 pub mod rebuild;
 pub mod reducer;
