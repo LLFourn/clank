@@ -89,7 +89,7 @@ If nothing matches before `timeout_secs`, return `{ "matches": [], "timed_out": 
 - **Subscribe + re-check.** Otherwise subscribe to `Runtime::events_tx`. On each event, re-compute matches. Return on first non-empty result.
 - **Timeout.** `tokio::time::timeout` wraps the whole select. On timeout, return `timed_out: true` with `matches: []`.
 - **Role match.** Exact match on `waiting_on.role.as_str()`. `none` (terminal sessions) never matches.
-- **Multi-repo.** When `repo` is unset, match across all known repos. When set, canonicalize via `dunce::canonicalize` and compare against `Trinity.repos` keys (which are already canonical) — so `/Users/...`, `~/...`, and symlinked variants all match correctly. Non-existent paths return an empty match list (don't error).
+- **Multi-repo.** When `repo` is unset, match across all known repos. When set, canonicalize via `dunce::canonicalize` and compare against `Trinity.repos` keys (which are already canonical) — symlinks and case-normalized variants all match. **`~/...` is NOT expanded by `dunce::canonicalize`**; callers must pass absolute paths (the same convention `~/.trinity/repos` uses on the daemon side, expanded at startup). Non-existent or unresolvable paths return an empty match list (don't error).
 - **Single-session.** When `session_id` is set, only that session (and `repo` should match if both given).
 - **Author exclusion.** When `exclude_authors` is set and `role == "reviewers"`, drop matches where any of the listed authors already has a current verdict for the target (i.e. they're already in `gate.approvals` or `gate.request_changes`). Lets a reviewer poll for "anything I haven't yet reviewed" without being woken by their own work.
 - **Deduplication.** When multiple events fire in rapid succession (e.g. a rebuild), the broadcast may deliver duplicates. The match-recompute is idempotent — return shape is the same regardless of how many events fired during the wait. No internal dedup needed.
@@ -174,13 +174,27 @@ async fn compute_matches(runtime: &Runtime, args: &WaitArgs) -> Vec<Match> {
     };
     // Lock released here.
 
-    // Phase 2: per-candidate disk reads + waiting_on derivation outside lock.
+    // Phase 2: per-candidate disk reads (outside lock).
+    let with_status: Vec<(Candidate, PlanWorktreeStatus)> = candidates
+        .into_iter()
+        .map(|c| {
+            let status = compute_plan_worktree_status(&c.repo_root, &c.session_clone);
+            (c, status)
+        })
+        .collect();
+
+    // Phase 3: pure matching against the materialized inputs.
+    match_candidates(&with_status, args)
+}
+
+/// Pure inner matcher. No I/O, no locks. Takes already-resolved candidates +
+/// their `plan_worktree_status` and returns the response matches.
+fn match_candidates(input: &[(Candidate, PlanWorktreeStatus)], args: &WaitArgs) -> Vec<Match> {
     let mut out = Vec::new();
-    for cand in candidates {
-        let status = compute_plan_worktree_status(&cand.repo_root, &cand.session_clone);
+    for (cand, status) in input {
         let w = projection::waiting_on(
             cand.session_clone.phase,
-            status,
+            *status,
             cand.session_clone.plan_gate.as_ref(),
             cand.session_clone.impl_gate.as_ref(),
         );
@@ -293,12 +307,19 @@ The shim is otherwise unchanged.
 
 ## Tests
 
-Pure (compute_matches against synthetic RepoState):
-- Empty `Trinity` → no matches.
-- One session, role matches → one match.
-- One session, role doesn't match → empty.
-- Two repos, `repo` filter → only that repo's matches.
+Pure (`match_candidates` against synthetic `Vec<(Candidate, PlanWorktreeStatus)>`):
+- Empty input → no matches.
+- One candidate, role matches → one match.
+- One candidate, role doesn't match → empty.
+- Multiple candidates across two repo roots, `repo` filter pre-applied in `collect_candidates` → only that repo's matches (the pure matcher doesn't re-filter; the test exercises pass-through).
 - `exclude_authors` drops sessions where the listed author is already a participant in the current target's gate.
+- `PlanWorktreeStatus::BodyDirty` on an implementing-ready session yields the expected `commit_plan_revision` / `commit_done_move` master match (the case that motivated the disk-read split — easy to cover here since the pure matcher takes status as input).
+
+Fixture (`collect_candidates` + `compute_plan_worktree_status` together via tempdir):
+- One synthetic repo with a committed plan file and a dirty working copy → `compute_matches` returns a master match with the correct dirty-reason.
+- Clean working copy → no master dirty-reason match.
+
+These two tempdir tests verify the I/O glue once; the pure matcher gets exhaustive coverage without disk.
 
 Integration (against a running runtime + broadcast). Each test pins a single crisp transition so the wake-up cause is unambiguous:
 
