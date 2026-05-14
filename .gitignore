@@ -1,2 +1,3 @@
 /target/
-.trinity/
+.trinity/*
+!.trinity/plans/
