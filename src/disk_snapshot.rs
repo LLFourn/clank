@@ -439,4 +439,287 @@ mod tests {
         let state = derive_state(PathBuf::from("/r"), snap);
         assert_eq!(state.attribution[&sha("c1")], AttributionResult::Unattributed);
     }
+
+    // ===== Determinism / digest =====
+
+    #[test]
+    fn derive_state_is_deterministic() {
+        let snap = full_workflow_snapshot();
+        let a = derive_state(PathBuf::from("/r"), snap.clone());
+        let b = derive_state(PathBuf::from("/r"), snap);
+        assert_eq!(a.digest(), b.digest());
+    }
+
+    #[test]
+    fn digest_changes_when_head_changes() {
+        let base = full_workflow_snapshot();
+        let mut alt = base.clone();
+        alt.head = Some(sha("different"));
+        assert_ne!(
+            derive_state(PathBuf::from("/r"), base).digest(),
+            derive_state(PathBuf::from("/r"), alt).digest()
+        );
+    }
+
+    #[test]
+    fn digest_changes_when_feedback_verdict_changes() {
+        let base = full_workflow_snapshot();
+        let mut alt = base.clone();
+        // Flip alice's APPROVE to REQUEST_CHANGES.
+        for fb in alt.feedback_files.iter_mut() {
+            if fb.parsed.author.as_str() == "alice" {
+                fb.body = "REQUEST_CHANGES\n".to_string();
+            }
+        }
+        assert_ne!(
+            derive_state(PathBuf::from("/r"), base).digest(),
+            derive_state(PathBuf::from("/r"), alt).digest()
+        );
+    }
+
+    #[test]
+    fn digest_changes_when_attribution_grows() {
+        let base = full_workflow_snapshot();
+        let mut alt = base.clone();
+        alt.history.push(entry("new_impl", vec![], true));
+        assert_ne!(
+            derive_state(PathBuf::from("/r"), base).digest(),
+            derive_state(PathBuf::from("/r"), alt).digest()
+        );
+    }
+
+    #[test]
+    fn digest_changes_when_a_new_session_lands() {
+        let base = full_workflow_snapshot();
+        let mut alt = base.clone();
+        alt.plan_files.push(plan_file("bar", "b1", None, "# bar\n"));
+        assert_ne!(
+            derive_state(PathBuf::from("/r"), base).digest(),
+            derive_state(PathBuf::from("/r"), alt).digest()
+        );
+    }
+
+    #[test]
+    fn digest_stable_across_feedback_insertion_order() {
+        // Even if feedback files come in a different order in the snapshot
+        // (e.g. directory walk reorders), the digest stays the same because
+        // BTreeMap iterates by key.
+        let mut a = full_workflow_snapshot();
+        let mut b = a.clone();
+        b.feedback_files.reverse();
+        assert_eq!(
+            derive_state(PathBuf::from("/r"), a.clone()).digest(),
+            derive_state(PathBuf::from("/r"), b.clone()).digest()
+        );
+        // Sanity: the two snapshots ARE different inputs (different order).
+        a.feedback_files.sort_by(|x, y| x.body.cmp(&y.body));
+        b.feedback_files.sort_by(|x, y| x.body.cmp(&y.body));
+        assert_eq!(a, b);
+    }
+
+    // ===== Cross-cutting workflow scenarios =====
+
+    #[test]
+    fn full_workflow_state_shape() {
+        let state = derive_state(PathBuf::from("/r"), full_workflow_snapshot());
+        // Two sessions: foo (planning with one impl commit on top) and bar.
+        // Wait — full_workflow has only foo. Adjust expectations:
+        assert!(state.sessions.contains_key(&sess("foo")));
+        let foo = &state.sessions[&sess("foo")];
+        // Plan APPROVE from alice on commit c1, impl REQUEST_CHANGES from bob on c2.
+        assert_eq!(foo.plan_feedback.len(), 1);
+        assert_eq!(foo.impl_feedback.len(), 1);
+        // Attribution: c1 = plan_intro for foo, c2 = impl commit for foo.
+        assert!(matches!(
+            state.attribution[&sha("c1")],
+            AttributionResult::Attributed {
+                plan_touch: Some(PlanTouchKind::Intro),
+                ..
+            }
+        ));
+        assert!(matches!(
+            state.attribution[&sha("c2")],
+            AttributionResult::Attributed {
+                plan_touch: None,
+                has_code_changes: true,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn stale_feedback_loads_under_old_sha() {
+        // Feedback targeting an old plan revision sha is still recorded
+        // (it stays attached to its target SHA); the gate logic at the
+        // mcp_response layer is what filters it out for the current gate.
+        let snap = DiskSnapshot {
+            head: Some(sha("c3")),
+            plan_files: vec![plan_file("foo", "c1", None, "# v1\n")],
+            history: vec![
+                entry("c1", vec![touch("foo", PlanTouchKind::Intro)], false),
+                entry("c2", vec![touch("foo", PlanTouchKind::Revision)], false),
+                entry("c3", vec![], true),
+            ],
+            feedback_files: vec![feedback(
+                "foo",
+                FeedbackPhase::Plan,
+                Some("c1"),  // stale: c2 is the latest plan rev now
+                "alice",
+                "APPROVE\n",
+            )],
+        };
+        let state = derive_state(PathBuf::from("/r"), snap);
+        let foo = &state.sessions[&sess("foo")];
+        assert_eq!(foo.plan_feedback.len(), 1);
+        let key = foo.plan_feedback.keys().next().unwrap();
+        assert_eq!(key.0.as_str(), "c1", "stale feedback keeps its target");
+    }
+
+    #[test]
+    fn many_plans_one_repo() {
+        let snap = DiskSnapshot {
+            head: Some(sha("c3")),
+            plan_files: vec![
+                plan_file("alpha", "c1", None, "# alpha\n"),
+                plan_file("beta", "c2", Some("c1"), "# beta\n"),
+            ],
+            history: vec![
+                entry("c1", vec![touch("alpha", PlanTouchKind::Intro)], false),
+                entry("c2", vec![touch("beta", PlanTouchKind::Intro)], false),
+                entry("c3", vec![], true),
+            ],
+            feedback_files: vec![],
+        };
+        let state = derive_state(PathBuf::from("/r"), snap);
+        assert_eq!(state.sessions.len(), 2);
+        // c3 walks back through c2 (beta's intro), so attributes to beta.
+        match &state.attribution[&sha("c3")] {
+            AttributionResult::Attributed { session, .. } => assert_eq!(session, &sess("beta")),
+            other => panic!("c3 unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn done_session_keeps_plan_revisions_and_impl_commits() {
+        // After moving to plans/done/, the session is still present;
+        // historical commits remain attributed.
+        let mut pf = plan_file("foo", "c1", None, "# foo\n");
+        pf.plan_path = PathBuf::from(".trinity/plans/done/foo.md");
+        let snap = DiskSnapshot {
+            head: Some(sha("c4")),
+            plan_files: vec![pf],
+            history: vec![
+                entry("c1", vec![touch("foo", PlanTouchKind::Intro)], false),
+                entry("c2", vec![], true),
+                entry("c3", vec![], true),
+                entry("c4", vec![touch("foo", PlanTouchKind::DoneMove)], false),
+            ],
+            feedback_files: vec![],
+        };
+        let state = derive_state(PathBuf::from("/r"), snap);
+        let plan_touches: Vec<_> = state
+            .attribution
+            .values()
+            .filter(|a| {
+                matches!(
+                    a,
+                    AttributionResult::Attributed {
+                        plan_touch: Some(_),
+                        ..
+                    }
+                )
+            })
+            .collect();
+        assert_eq!(plan_touches.len(), 2, "intro + done_move");
+        let impl_commits: Vec<_> = state
+            .attribution
+            .values()
+            .filter(|a| {
+                matches!(
+                    a,
+                    AttributionResult::Attributed {
+                        plan_touch: None,
+                        has_code_changes: true,
+                        ..
+                    }
+                )
+            })
+            .collect();
+        assert_eq!(impl_commits.len(), 2);
+    }
+
+    #[test]
+    fn empty_body_plan_file_still_creates_session() {
+        let snap = DiskSnapshot {
+            head: Some(sha("c1")),
+            plan_files: vec![plan_file("foo", "c1", None, "")],
+            history: vec![entry("c1", vec![touch("foo", PlanTouchKind::Intro)], false)],
+            feedback_files: vec![],
+        };
+        let state = derive_state(PathBuf::from("/r"), snap);
+        assert!(state.sessions.contains_key(&sess("foo")));
+        assert_eq!(state.sessions[&sess("foo")].body, "");
+    }
+
+    #[test]
+    fn unattributed_chain_at_head_does_not_break_sessions() {
+        // The first few commits aren't attributable (pre-Trinity). When
+        // the plan-intro commit lands later, the session still gets
+        // attribution for that and subsequent walks.
+        let snap = DiskSnapshot {
+            head: Some(sha("c4")),
+            plan_files: vec![plan_file("foo", "c3", Some("c2"), "# foo\n")],
+            history: vec![
+                entry("c1", vec![], true),
+                entry("c2", vec![], true),
+                entry("c3", vec![touch("foo", PlanTouchKind::Intro)], false),
+                entry("c4", vec![], true),
+            ],
+            feedback_files: vec![],
+        };
+        let state = derive_state(PathBuf::from("/r"), snap);
+        assert_eq!(state.attribution[&sha("c1")], AttributionResult::Unattributed);
+        assert_eq!(state.attribution[&sha("c2")], AttributionResult::Unattributed);
+        assert!(matches!(
+            state.attribution[&sha("c3")],
+            AttributionResult::Attributed { plan_touch: Some(PlanTouchKind::Intro), .. }
+        ));
+        assert!(matches!(
+            state.attribution[&sha("c4")],
+            AttributionResult::Attributed {
+                plan_touch: None,
+                has_code_changes: true,
+                ..
+            }
+        ));
+    }
+
+    /// Reusable fixture: foo plan (plan_intro c1) + one impl commit c2,
+    /// plus alice's APPROVE on c1 (plan) and bob's REQUEST_CHANGES on c2 (impl).
+    fn full_workflow_snapshot() -> DiskSnapshot {
+        DiskSnapshot {
+            head: Some(sha("c2")),
+            plan_files: vec![plan_file("foo", "c1", None, "# foo\n")],
+            history: vec![
+                entry("c1", vec![touch("foo", PlanTouchKind::Intro)], false),
+                entry("c2", vec![], true),
+            ],
+            feedback_files: vec![
+                feedback(
+                    "foo",
+                    FeedbackPhase::Plan,
+                    Some("c1"),
+                    "alice",
+                    "APPROVE\n",
+                ),
+                feedback(
+                    "foo",
+                    FeedbackPhase::Impl,
+                    Some("c2"),
+                    "bob",
+                    "REQUEST_CHANGES\nstuff\n",
+                ),
+            ],
+        }
+    }
 }

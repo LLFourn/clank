@@ -177,24 +177,32 @@ impl Runtime {
         match signal {
             FilesystemSignal::HeadChanged => {
                 let fresh = rebuild_repo(repo_root).await?;
-                {
+                let fresh_digest = fresh.digest();
+                let changed = {
                     let mut trinity = self.state.lock().await;
+                    let prior_digest = trinity.repos.get(repo_root).map(|r| r.digest());
+                    let changed = prior_digest.as_ref() != Some(&fresh_digest);
                     trinity.repos.insert(repo_root.to_path_buf(), fresh);
-                    self.push_event(
-                        &mut trinity,
-                        LiveEvent {
-                            ts: now,
-                            repo: repo_root.to_path_buf(),
-                            session_id: None,
-                            kind: "repo_rebuilt",
-                            payload: serde_json::Value::Null,
-                        },
-                    );
-                }
-                // Held-feedback normalization sweep: re-dispatch any
-                // flat-drop feedback files now that the plan_worktree_status
-                // may have flipped clean.
+                    if changed {
+                        self.push_event(
+                            &mut trinity,
+                            LiveEvent {
+                                ts: now,
+                                repo: repo_root.to_path_buf(),
+                                session_id: None,
+                                kind: "repo_rebuilt",
+                                payload: serde_json::Value::Null,
+                            },
+                        );
+                    }
+                    changed
+                };
+                // Held-feedback normalization sweep runs even when nothing
+                // visibly changed in the rebuild — a watcher-induced rebuild
+                // might still need to release a flat-drop file. The sweep
+                // itself emits events only on actual file moves.
                 self.normalize_held_feedback(repo_root, now).await?;
+                let _ = changed; // tracing hook for future "rebuild was a no-op" log
             }
             FilesystemSignal::PlanFileChanged { session_id, path } => {
                 let mut trinity = self.state.lock().await;

@@ -35,6 +35,111 @@ impl RepoState {
             attribution: BTreeMap::new(),
         }
     }
+
+    /// Stable digest over every meaningful field in the state. Two states
+    /// with the same digest are observably identical to callers; equal
+    /// digests across rebuilds mean nothing changed, so the runtime can
+    /// skip the broadcast (no spurious chime).
+    ///
+    /// The digest is intentionally coarse — it doesn't tell you *what*
+    /// changed, only that something did. That matches the user's
+    /// stated need: ping on change, no diff required.
+    pub fn digest(&self) -> StateDigest {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(b"trinity-state-v1\n");
+        hasher.update(self.root.to_string_lossy().as_bytes());
+        hasher.update(b"\nhead=");
+        hasher.update(self.head.as_ref().map(|h| h.as_str()).unwrap_or("").as_bytes());
+
+        // BTreeMap iterates by key (sorted), so this is deterministic.
+        hasher.update(b"\nsessions[");
+        for (id, sess) in &self.sessions {
+            hasher.update(id.as_str().as_bytes());
+            hasher.update(b"|path=");
+            hasher.update(sess.plan_path.to_string_lossy().as_bytes());
+            hasher.update(b"|body_hash=");
+            hasher.update(sess.body_hash.as_str().as_bytes());
+            hasher.update(b"|intro=");
+            hasher.update(sess.plan_intro.as_str().as_bytes());
+            hasher.update(b"|intro_parent=");
+            hasher.update(
+                sess.plan_intro_parent
+                    .as_ref()
+                    .map(|p| p.as_str())
+                    .unwrap_or("")
+                    .as_bytes(),
+            );
+            hasher.update(b"|plan_fb=[");
+            for ((sha, author), fb) in &sess.plan_feedback {
+                hasher.update(sha.as_str().as_bytes());
+                hasher.update(b":");
+                hasher.update(author.as_str().as_bytes());
+                hasher.update(b":");
+                hasher.update(fb.verdict.as_str().as_bytes());
+                hasher.update(b";");
+            }
+            hasher.update(b"]|impl_fb=[");
+            for ((sha, author), fb) in &sess.impl_feedback {
+                hasher.update(sha.as_str().as_bytes());
+                hasher.update(b":");
+                hasher.update(author.as_str().as_bytes());
+                hasher.update(b":");
+                hasher.update(fb.verdict.as_str().as_bytes());
+                hasher.update(b";");
+            }
+            hasher.update(b"]|held=[");
+            for held in &sess.held_plan_feedback {
+                hasher.update(held.author.as_str().as_bytes());
+                hasher.update(b":");
+                hasher.update(held.reason.as_bytes());
+                hasher.update(b";");
+            }
+            hasher.update(b"]\n");
+        }
+        hasher.update(b"]\nattribution[");
+        for (sha, attr) in &self.attribution {
+            hasher.update(sha.as_str().as_bytes());
+            hasher.update(b"=");
+            match attr {
+                AttributionResult::Attributed {
+                    session,
+                    plan_touch,
+                    has_code_changes,
+                } => {
+                    hasher.update(b"A:");
+                    hasher.update(session.as_str().as_bytes());
+                    hasher.update(b":");
+                    hasher.update(
+                        plan_touch
+                            .as_ref()
+                            .map(|k| k.as_str())
+                            .unwrap_or("none")
+                            .as_bytes(),
+                    );
+                    hasher.update(b":");
+                    hasher.update(if *has_code_changes { b"code" } else { b"nocode" });
+                }
+                AttributionResult::Unattributed => {
+                    hasher.update(b"U");
+                }
+            }
+            hasher.update(b";");
+        }
+        hasher.update(b"]");
+
+        StateDigest(hasher.finalize().to_hex().to_string())
+    }
+}
+
+/// Stable hash of a `RepoState`. Used by the runtime to skip broadcasts
+/// when a rebuild produced byte-identical state.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct StateDigest(pub String);
+
+impl StateDigest {
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
