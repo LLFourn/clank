@@ -102,17 +102,48 @@ Wide reading column (~720px max for prose; full-width for diffs). Generous margi
 
 The daemon adds a small JSON-API layer at `/api/*` that wraps existing `mcp_response::*` builders + new diff endpoints. The SPA bundle is served from `/` and `/static/*`.
 
+## Multi-repo identity
+
+Trinity tracks many repos; session ids are repo-scoped (two repos may both have a `foo` session). Identity is a `(repo, session_id)` pair everywhere — API, URLs, SSE filter, store keys.
+
+**Repo identifier.** Each session response carries a `repo` field — URL-encoded absolute path of the repo root (the canonical form used as the in-memory key). Stable across requests; survives daemon restart. URL-encoded so it's safe in query strings.
+
+**URL convention.** Multi-repo identity rides as a `?repo=<encoded>` query parameter, optional only when a single repo is registered (default selection). All session links emit the parameter:
+
+- `/?repo=<path>` — homepage filtered to one repo (omit `?repo` to see all).
+- `/sessions/:id?repo=<path>` — session detail.
+- `/sessions/:id/plan/:sha?repo=<path>` — plan revision view.
+- `/sessions/:id/commit/:sha?repo=<path>` — commit diff.
+
+**Store keys.** Reactive resources key on `(repo, session_id, last_event_for_repo)`. The `EventStore` exposes `last_event_for_repo(repo) -> Memo<Option<LiveEvent>>` (filter the SSE stream by `repo`).
+
+**Collisions.** When two repos both have session `foo`, the `?repo=` param disambiguates. The homepage's session table shows the repo name (last path segment) as a column when more than one repo is registered.
+
 ## Routes (client-side)
+
+All paths serve the same `index.html` Leptos shell (see "axum routing order" below); the client router dispatches.
 
 | Path | Component | Data sources |
 |---|---|---|
-| `/` | `<Home/>` | `GET /api/sessions` |
-| `/sessions/:id` | `<SessionDetail/>` | `GET /api/sessions/:id` |
-| `/sessions/:id/plan/:sha` | `<PlanRevision/>` | `GET /api/sessions/:id/plan/:sha` |
-| `/sessions/:id/commit/:sha` | `<CommitDiff/>` | `GET /api/sessions/:id/commit/:sha` |
-| `/sessions/:id/plan/:sha/diff?vs=:other` | `<PlanDiff/>` | `GET /api/diff?from=:other&to=:sha&path=...` |
+| `/?repo=<path>` | `<Home/>` | `GET /api/sessions[?repo=<path>]` |
+| `/sessions/:id?repo=<path>` | `<SessionDetail/>` | `GET /api/sessions/:id?repo=<path>` |
+| `/sessions/:id/plan/:sha?repo=<path>` | `<PlanRevision/>` | `GET /api/sessions/:id/plan/:sha?repo=<path>` |
+| `/sessions/:id/commit/:sha?repo=<path>` | `<CommitDiff/>` | `GET /api/sessions/:id/commit/:sha?repo=<path>` |
+| `/sessions/:id/plan/:sha/diff?vs=:other&repo=<path>` | `<PlanDiff/>` | `GET /api/diff?from=:other&to=:sha&path=...&repo=<path>` |
 
-Every component subscribes to a single global SSE store; when an event for "their" repo/session arrives, the resource is invalidated and refetched.
+Every component subscribes to a single global SSE store; when an event for "their" `(repo, session_id)` arrives, the resource is invalidated and refetched.
+
+## axum routing order
+
+Concrete `Router` shape so direct-navigation deep links (`/sessions/foo/plan/sha`) work without redirects:
+
+1. `Router::new().nest("/api", api_router)` — JSON only. Returns 404 on unknown `/api/*` paths.
+2. `.nest_service("/static", ServeDir::new("frontend/dist"))` — static assets (Wasm bundle, fonts, CSS).
+3. `.route("/events", get(sse_handler))` — SSE.
+4. `.route("/internal/tool_call", post(...))` — MCP backend, unchanged.
+5. `.fallback(serve_index_html)` — every other GET serves `frontend/dist/index.html`. The Leptos router on the client side renders the right view from the URL.
+
+No redirects on app paths. No collisions: anything that doesn't match `/api/*` or `/static/*` or `/events` or `/internal/*` ends up at the SPA shell, which routes client-side.
 
 ## Component model
 
@@ -158,15 +189,33 @@ This means **no manual cache invalidation**. Adding a new component automaticall
 Minimal additions on top of the existing daemon:
 
 1. **`/api/*` JSON endpoints**. Thin wrappers around `mcp_response::*` plus:
-   - `GET /api/sessions/:id/plan/:sha` → `{ body_html, body_raw, plan_intro, plan_intro_parent, previous_sha, next_sha }`. Body is pre-rendered HTML via pulldown-cmark + ammonia.
-   - `GET /api/sessions/:id/commit/:sha` → `{ diff_files: Vec<DiffFile> }`. DiffFile is parsed from `git show` output.
-   - `GET /api/diff?from=&to=&path=` → `{ diff_files }`. For plan-rev-vs-rev.
+   - `GET /api/sessions[?repo=<path>]` → `[{ repo, session_id, plan_path, phase, worktree_status, waiting_on }]`.
+   - `GET /api/sessions/:id?repo=<path>` → the full `get_context` response shape, extended per the feedback-body addition below.
+   - `GET /api/sessions/:id/plan/:sha?repo=<path>` → `{ body_html, body_raw, plan_intro, plan_intro_parent, previous_sha, next_sha, feedback: Vec<FeedbackEntry> }`. Body is pre-rendered HTML via `pulldown-cmark` + `ammonia`. `feedback` is the entries targeting this SHA.
+   - `GET /api/sessions/:id/commit/:sha?repo=<path>` → `{ diff_files: Vec<DiffFile>, feedback: Vec<FeedbackEntry> }`. DiffFile parsed from `git show` output.
+   - `GET /api/diff?from=&to=&path=&repo=<path>` → `{ diff_files }`. For plan-rev-vs-rev.
 
-2. **`src/diff_parser.rs`**. Port the deleted parser from `a2d7b5d^:src/daemon/diff_parser.rs`. Pure Rust, no IO. Tests: ~10 cases covering add/modify/delete/rename/binary/multi-hunk.
+2. **Extended feedback shape.** The current `feedback_entries` builder emits `{ target_sha, author, verdict }` — not enough for `<FeedbackCard/>` to render the body. Extend each entry to include:
 
-3. **Static-file route**. axum `tower-http`'s `ServeDir` for `/static/` and a `/` route that serves `index.html` (the Leptos shell).
+   ```json
+   {
+     "target_sha": "abc...",
+     "author": "alice",
+     "verdict": "approve",
+     "body_raw": "APPROVE\n\nlgtm because...",
+     "body_html": "<p>lgtm because...</p>",
+     "path": ".trinity/feedback/foo/plan/abc.../alice.md",
+     "created_at": 1715666400
+   }
+   ```
 
-4. **`Feedback.created_at: i64`**. File mtime, populated in `git_io::collect_feedback_files`. Lets the client sort feedback chronologically.
+   `body_raw` is the file content verbatim; `body_html` strips the marker line and renders the rest via `pulldown-cmark` + `ammonia`. Phase-1 acceptance: the JSON for any session with feedback includes these fields. Held feedback gets the same extended shape (just no `target_sha`).
+
+3. **`src/diff_parser.rs`**. Port the deleted parser from `a2d7b5d^:src/daemon/diff_parser.rs`. Pure Rust, no IO. Tests: ~10 cases covering add/modify/delete/rename/binary/multi-hunk.
+
+4. **Static-file route**. axum `tower-http`'s `ServeDir` mounted at `/static`. Fallback route serves `frontend/dist/index.html` (see "axum routing order" above).
+
+5. **`Feedback.created_at: i64`**. File mtime, populated in `git_io::collect_feedback_files`. Lets the client sort feedback chronologically. Threaded into `DiskSnapshot::FeedbackBlob` (currently it only carries `body`).
 
 ## Workspace structure
 
@@ -198,7 +247,14 @@ trinity/
         └── route.rs
 ```
 
-Build via `trunk` (simpler than cargo-leptos for CSR-only). `trunk build --release` produces `dist/` which the daemon serves as static.
+Build via `trunk` (simpler than cargo-leptos for CSR-only). `trunk build --release` produces `frontend/dist/` which the daemon serves as static.
+
+**Toolchain.** Trunk and the `wasm32-unknown-unknown` target aren't in a stock Rust toolchain. Bootstrap requirements:
+
+1. `rustup target add wasm32-unknown-unknown`
+2. Install trunk: `cargo install --locked trunk` (or `cargo binstall trunk` for a prebuilt). Pin the version in a top-level `rust-toolchain.toml` for the wasm target + a `.tool-versions` or README line for trunk.
+
+CI runs the same two steps before `trunk build --release`. An `xtask` crate (`cargo xtask build-frontend`) wraps both for one-command local builds.
 
 ## Phases
 
@@ -249,9 +305,9 @@ Five commits, each green-buildable, each landing a usable slice.
 
 ## Acceptance criteria
 
-- `frontend/` crate builds clean via `trunk build --release` from a CI-like environment (no extra system deps beyond the Rust toolchain).
-- Daemon serves the SPA bundle from `/` and the JSON API from `/api/*`.
-- No JS or TS outside `frontend/index.html` (the Leptos bootstrap shell).
+- `frontend/` crate builds clean via `trunk build --release` after `rustup target add wasm32-unknown-unknown` and `cargo install trunk` (or `cargo binstall trunk`). No system deps beyond the Rust toolchain + these two well-known bootstrap steps; documented in README and the `xtask`.
+- Daemon serves the SPA bundle from `/` via fallback to `frontend/dist/index.html`; assets from `/static/*`; JSON API from `/api/*`; SSE from `/events`.
+- No **authored** JS or TS outside `frontend/index.html` (the Leptos bootstrap shell). Trunk's generated wasm-bindgen glue counts as build output, not authored source.
 - `src/server/ui.rs` is deleted by the end of Phase 5.
 - No inline `<style>` strings in Rust source after Phase 5.
 - Every page from the gap list in the (deleted) `frontend-restore.md` has a Leptos component.
