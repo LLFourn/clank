@@ -418,30 +418,24 @@ impl Runtime {
                 body_hash: session.body_hash.clone(),
                 plan_path: session.plan_path.clone(),
                 target: match parsed.phase {
-                    FeedbackPhase::Plan => {
-                        latest_attributed_commit(session, &state.attribution, |attr| {
-                            matches!(
-                                attr,
-                                AttributionResult::Attributed {
-                                    plan_touch: Some(_),
-                                    ..
-                                }
-                            )
-                        })
-                    }
-                    FeedbackPhase::Impl => latest_attributed_commit(
-                        session,
-                        &state.attribution,
-                        |attr| {
-                            matches!(
-                                attr,
-                                AttributionResult::Attributed {
-                                    has_code_changes: true,
-                                    ..
-                                }
-                            )
-                        },
-                    ),
+                    FeedbackPhase::Plan => latest_attributed_commit(session, state, |attr| {
+                        matches!(
+                            attr,
+                            AttributionResult::Attributed {
+                                plan_touch: Some(_),
+                                ..
+                            }
+                        )
+                    }),
+                    FeedbackPhase::Impl => latest_attributed_commit(session, state, |attr| {
+                        matches!(
+                            attr,
+                            AttributionResult::Attributed {
+                                has_code_changes: true,
+                                ..
+                            }
+                        )
+                    }),
                 },
             }
         };
@@ -450,14 +444,31 @@ impl Runtime {
             return Ok(None);
         };
 
-        // For plan-phase, hold (don't auto-organize) when worktree is dirty.
+        // Plan-phase only: hold (don't auto-organize) when the worktree
+        // is BodyDirty. Done-move-pending and missing-active-file mean
+        // the plan path is intentionally absent or migrated — the
+        // current target SHA from HEAD is still the right anchor for
+        // an incoming review.
         if matches!(parsed.phase, FeedbackPhase::Plan) {
-            let wt_path = repo_root.join(&snapshot.plan_path);
-            let dirty = match std::fs::read_to_string(&wt_path) {
-                Ok(body) => content_hash(&body) != snapshot.body_hash,
-                Err(_) => true, // missing / unreadable counts as not-clean
-            };
-            if dirty {
+            use crate::projection::plan_worktree_status;
+            use crate::repo_state::PlanWorktreeStatus;
+            let active_path = repo_root.join(&snapshot.plan_path);
+            let counterpart_rel =
+                crate::mcp_response::swap_active_done(&snapshot.plan_path);
+            let counterpart_abs = counterpart_rel.as_ref().map(|p| repo_root.join(p));
+            let wt_hash = std::fs::read_to_string(&active_path)
+                .ok()
+                .map(|b| content_hash(&b));
+            let counterpart_exists = counterpart_abs
+                .as_ref()
+                .map(|p| p.exists())
+                .unwrap_or(false);
+            let status = plan_worktree_status(
+                Some(&snapshot.body_hash),
+                wt_hash.as_ref(),
+                counterpart_exists,
+            );
+            if matches!(status, PlanWorktreeStatus::BodyDirty) {
                 return Ok(None);
             }
         }
@@ -479,19 +490,21 @@ struct FlatDropSnapshot {
     target: Option<CommitSha>,
 }
 
-/// Latest commit in `attribution` (BTreeMap order — insertion-preserving
-/// for the rebuild's commit walk) that matches `pred` and is attributed
-/// to `session.id`.
+/// Latest commit attributed to `session.id` matching `pred`, in
+/// chronological order from `RepoState::commit_order`. BTreeMap iteration
+/// over `attribution` alone is SHA-lex order, not chronological, so we
+/// walk `commit_order` and look up each entry.
 fn latest_attributed_commit(
     session: &Session,
-    attribution: &std::collections::BTreeMap<CommitSha, AttributionResult>,
+    state: &crate::repo_state::RepoState,
     pred: impl Fn(&AttributionResult) -> bool,
 ) -> Option<CommitSha> {
     let mut latest = None;
-    for (sha, attr) in attribution {
-        if let AttributionResult::Attributed {
-            session: sid, ..
-        } = attr
+    for sha in &state.commit_order {
+        let Some(attr) = state.attribution.get(sha) else {
+            continue;
+        };
+        if let AttributionResult::Attributed { session: sid, .. } = attr
             && sid == &session.id
             && pred(attr)
         {

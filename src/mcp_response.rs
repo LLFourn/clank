@@ -53,7 +53,7 @@ pub fn compute_plan_worktree_status(
 
 /// Given a plan path (relative), return its counterpart in the
 /// active↔done flip. `.trinity/plans/<id>.md` ↔ `.trinity/plans/done/<id>.md`.
-fn swap_active_done(plan_path: &Path) -> Option<PathBuf> {
+pub fn swap_active_done(plan_path: &Path) -> Option<PathBuf> {
     let name = plan_path.file_name()?;
     if plan_path_is_done(plan_path) {
         Some(PathBuf::from(".trinity/plans").join(name))
@@ -72,8 +72,8 @@ pub fn list_sessions_response(repo_root: &Path, state: &RepoState) -> std::io::R
     for session in state.sessions.values() {
         let worktree_status = compute_plan_worktree_status(repo_root, session)?;
         let session_phase = phase(session, &state.attribution);
-        let plan_gate = plan_gate_for(session, &state.attribution);
-        let impl_gate = impl_gate_for(session, &state.attribution);
+        let plan_gate = plan_gate_for(session, state);
+        let impl_gate = impl_gate_for(session, state);
         let w = waiting_on(
             session_phase,
             worktree_status,
@@ -115,8 +115,8 @@ pub fn get_context_response(
     };
     let worktree_status = compute_plan_worktree_status(repo_root, session)?;
     let session_phase = phase(session, &state.attribution);
-    let plan_gate = plan_gate_for(session, &state.attribution);
-    let impl_gate = impl_gate_for(session, &state.attribution);
+    let plan_gate = plan_gate_for(session, state);
+    let impl_gate = impl_gate_for(session, state);
     let w = waiting_on(
         session_phase,
         worktree_status,
@@ -125,7 +125,7 @@ pub fn get_context_response(
     );
 
     let pr_hint = if matches!(session_phase, crate::repo_state::Phase::Implementing) {
-        Some(pr_hint_value(session, &state.attribution))
+        Some(pr_hint_value(session, state))
     } else {
         None
     };
@@ -134,25 +134,63 @@ pub fn get_context_response(
     let impl_feedback = feedback_entries(&session.impl_feedback);
     let timeline = timeline_value(state, session_id);
 
-    let plan_revisions: Vec<String> = all_plan_revisions(session, &state.attribution)
+    let plan_revisions: Vec<String> = all_plan_revisions(session, state)
         .into_iter()
         .map(|s| s.as_str().to_string())
         .collect();
     let implementation_commits: Vec<String> =
-        all_implementation_commits(session, &state.attribution)
+        all_implementation_commits(session, state)
             .into_iter()
             .map(|s| s.as_str().to_string())
             .collect();
+
+    // Canonical write-feedback path + review_target + expected_action for
+    // the caller. Tells reviewers exactly where to drop their next file.
+    let (review_target_phase, review_target_sha) = match session_phase {
+        crate::repo_state::Phase::Planning => (
+            "plan",
+            latest_plan_touching_commit(session, state).map(|s| s.as_str().to_string()),
+        ),
+        crate::repo_state::Phase::Implementing => (
+            "impl",
+            latest_impl_commit(session, state).map(|s| s.as_str().to_string()),
+        ),
+        crate::repo_state::Phase::Done => ("plan", None),
+    };
+    let review_target = review_target_sha.as_ref().map(|sha| {
+        json!({
+            "phase": review_target_phase,
+            "commit_sha": sha,
+        })
+    });
+    let write_feedback = review_target_sha.as_ref().map(|sha| {
+        let rel = format!(
+            ".trinity/feedback/{session}/{phase}/{sha}/{author}.md",
+            session = session.id.as_str(),
+            phase = review_target_phase,
+            sha = sha,
+            author = _author_label.as_str(),
+        );
+        json!({
+            "phase": review_target_phase,
+            "target_sha": sha,
+            "path": rel,
+        })
+    });
+    let expected_action = expected_action_for(&w);
 
     Ok(Some(json!({
         "session_id": session.id.as_str(),
         "phase": session_phase.as_str(),
         "plan_worktree_status": worktree_status.as_str(),
         "waiting_on": waiting_on_value(&w),
+        "expected_action": expected_action,
+        "review_target": review_target,
+        "write_feedback": write_feedback,
         "plan_path": session.plan_path.to_string_lossy(),
         "review_gate": gate_value(plan_gate.as_ref(), impl_gate.as_ref(), session_phase),
-        "latest_plan_revision": latest_plan_revision(session, &state.attribution),
-        "latest_implementation_revision": latest_impl_revision(session, &state.attribution),
+        "latest_plan_revision": latest_plan_revision(session, state),
+        "latest_implementation_revision": latest_impl_revision(session, state),
         "plan_revisions": plan_revisions,
         "implementation_commits": implementation_commits,
         "plan_feedback": plan_feedback,
@@ -160,6 +198,26 @@ pub fn get_context_response(
         "timeline": timeline,
         "pr_hint": pr_hint,
     })))
+}
+
+/// Map `waiting_on.reason` to the caller-facing `expected_action` string
+/// that tells the agent what to actually do next.
+fn expected_action_for(w: &crate::repo_state::WaitingOn) -> &'static str {
+    use crate::repo_state::WaitingReason::*;
+    match w.reason {
+        SessionDone => "none",
+        CommitDoneMove => "commit_done_move",
+        RestoreOrCommitDoneMove => "restore_or_commit_done_move",
+        CommitPlanRevision => "commit_plan_revision",
+        AddressPlanRequestChanges => "address_plan_request_changes",
+        ReadyToImplement => "implement_and_commit",
+        PlanNeedsInitialReview => "review_plan",
+        PlanNeedsRereview => "review_plan",
+        AddressImplRequestChanges => "address_impl_request_changes",
+        ReadyToFinish => "move_to_done",
+        ImplNeedsInitialReview => "review_impl",
+        ImplNeedsRereview => "review_impl",
+    }
 }
 
 /// Serialize the per-session timeline (from `RepoState::timeline_for`)
@@ -222,20 +280,10 @@ fn feedback_entries(
         .collect()
 }
 
-fn pr_hint_value(
-    session: &crate::repo_state::Session,
-    attribution: &std::collections::BTreeMap<crate::lifecycle::CommitSha, crate::repo_state::AttributionResult>,
-) -> Value {
-    let impl_commits: Vec<String> = attribution
-        .iter()
-        .filter_map(|(sha, attr)| match attr {
-            crate::repo_state::AttributionResult::Attributed {
-                session: sid,
-                has_code_changes: true,
-                ..
-            } if sid == &session.id => Some(sha.as_str().to_string()),
-            _ => None,
-        })
+fn pr_hint_value(session: &crate::repo_state::Session, state: &RepoState) -> Value {
+    let impl_commits: Vec<String> = all_implementation_commits(session, state)
+        .into_iter()
+        .map(|s| s.as_str().to_string())
         .collect();
 
     let plan_intro = session.plan_intro.as_str();
@@ -306,63 +354,64 @@ fn gate_value(
     }
 }
 
-fn latest_plan_revision(
-    session: &crate::repo_state::Session,
-    attribution: &std::collections::BTreeMap<crate::lifecycle::CommitSha, crate::repo_state::AttributionResult>,
-) -> Value {
-    match all_plan_revisions(session, attribution).last() {
+fn latest_plan_revision(session: &crate::repo_state::Session, state: &RepoState) -> Value {
+    match all_plan_revisions(session, state).last() {
         Some(sha) => json!({ "commit_sha": sha.as_str() }),
         None => Value::Null,
     }
 }
 
-fn latest_impl_revision(
-    session: &crate::repo_state::Session,
-    attribution: &std::collections::BTreeMap<crate::lifecycle::CommitSha, crate::repo_state::AttributionResult>,
-) -> Value {
-    match all_implementation_commits(session, attribution).last() {
+fn latest_impl_revision(session: &crate::repo_state::Session, state: &RepoState) -> Value {
+    match all_implementation_commits(session, state).last() {
         Some(sha) => json!({ "commit_sha": sha.as_str() }),
         None => Value::Null,
     }
 }
 
-/// All plan-touching commits attributed to `session`, in attribution-map
-/// order (insertion order from the rebuild walk — chronological by
-/// first-parent traversal). Returned by `get_context` for the session
-/// page's plan-revisions list.
+/// All plan-touching commits attributed to `session`, in chronological
+/// order via `RepoState::commit_order` (first-parent walk, oldest first).
+/// Returned by `get_context` for the session page's plan-revisions list.
 fn all_plan_revisions(
     session: &crate::repo_state::Session,
-    attribution: &std::collections::BTreeMap<crate::lifecycle::CommitSha, crate::repo_state::AttributionResult>,
+    state: &RepoState,
 ) -> Vec<crate::lifecycle::CommitSha> {
-    attribution
+    state
+        .commit_order
         .iter()
-        .filter_map(|(sha, attr)| match attr {
-            crate::repo_state::AttributionResult::Attributed {
-                session: sid,
-                plan_touch: Some(_),
-                ..
-            } if sid == &session.id => Some(sha.clone()),
-            _ => None,
+        .filter(|sha| {
+            matches!(
+                state.attribution.get(*sha),
+                Some(crate::repo_state::AttributionResult::Attributed {
+                    session: sid,
+                    plan_touch: Some(_),
+                    ..
+                }) if sid == &session.id
+            )
         })
+        .cloned()
         .collect()
 }
 
 /// All implementation commits (has_code_changes == true) attributed to
-/// `session`, in attribution-map order.
+/// `session`, in chronological order via `commit_order`.
 fn all_implementation_commits(
     session: &crate::repo_state::Session,
-    attribution: &std::collections::BTreeMap<crate::lifecycle::CommitSha, crate::repo_state::AttributionResult>,
+    state: &RepoState,
 ) -> Vec<crate::lifecycle::CommitSha> {
-    attribution
+    state
+        .commit_order
         .iter()
-        .filter_map(|(sha, attr)| match attr {
-            crate::repo_state::AttributionResult::Attributed {
-                session: sid,
-                has_code_changes: true,
-                ..
-            } if sid == &session.id => Some(sha.clone()),
-            _ => None,
+        .filter(|sha| {
+            matches!(
+                state.attribution.get(*sha),
+                Some(crate::repo_state::AttributionResult::Attributed {
+                    session: sid,
+                    has_code_changes: true,
+                    ..
+                }) if sid == &session.id
+            )
         })
+        .cloned()
         .collect()
 }
 
@@ -371,9 +420,9 @@ fn all_implementation_commits(
 /// has no plan target yet.
 fn plan_gate_for(
     session: &crate::repo_state::Session,
-    attribution: &std::collections::BTreeMap<crate::lifecycle::CommitSha, crate::repo_state::AttributionResult>,
+    state: &RepoState,
 ) -> Option<ReviewGateDecision> {
-    let current_target = latest_plan_touching_commit(session, attribution)?;
+    let current_target = latest_plan_touching_commit(session, state)?;
     Some(derive_gate_from_feedback(
         ReviewPhase::Plan,
         &current_target,
@@ -383,9 +432,9 @@ fn plan_gate_for(
 
 fn impl_gate_for(
     session: &crate::repo_state::Session,
-    attribution: &std::collections::BTreeMap<crate::lifecycle::CommitSha, crate::repo_state::AttributionResult>,
+    state: &RepoState,
 ) -> Option<ReviewGateDecision> {
-    let current_target = latest_impl_commit(session, attribution)?;
+    let current_target = latest_impl_commit(session, state)?;
     Some(derive_gate_from_feedback(
         ReviewPhase::Impl,
         &current_target,
@@ -395,40 +444,16 @@ fn impl_gate_for(
 
 fn latest_plan_touching_commit(
     session: &crate::repo_state::Session,
-    attribution: &std::collections::BTreeMap<crate::lifecycle::CommitSha, crate::repo_state::AttributionResult>,
+    state: &RepoState,
 ) -> Option<crate::lifecycle::CommitSha> {
-    let mut latest = None;
-    for (sha, attr) in attribution {
-        if let crate::repo_state::AttributionResult::Attributed {
-            session: sid,
-            plan_touch: Some(_),
-            ..
-        } = attr
-            && sid == &session.id
-        {
-            latest = Some(sha.clone());
-        }
-    }
-    latest
+    all_plan_revisions(session, state).into_iter().last()
 }
 
 fn latest_impl_commit(
     session: &crate::repo_state::Session,
-    attribution: &std::collections::BTreeMap<crate::lifecycle::CommitSha, crate::repo_state::AttributionResult>,
+    state: &RepoState,
 ) -> Option<crate::lifecycle::CommitSha> {
-    let mut latest = None;
-    for (sha, attr) in attribution {
-        if let crate::repo_state::AttributionResult::Attributed {
-            session: sid,
-            has_code_changes: true,
-            ..
-        } = attr
-            && sid == &session.id
-        {
-            latest = Some(sha.clone());
-        }
-    }
-    latest
+    all_implementation_commits(session, state).into_iter().last()
 }
 
 /// Build a `ReviewGateDecision` directly from the session's in-memory

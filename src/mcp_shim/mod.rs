@@ -239,7 +239,7 @@ struct ToolCallEnvelope {
 /// (arguments → cache).
 fn label_arg_for(tool: &str) -> Option<&'static str> {
     match tool {
-        "register_plan_file" => Some("label"),
+        "start_plan" => Some("label"),
         "get_context" => Some("author_label"),
         _ => None,
     }
@@ -338,12 +338,11 @@ impl ServerHandler for ShimHandler {
                 icons: None,
             },
             instructions: Some(
-                "Trinity coordinates multi-agent peer review around watched plan files \
-                 and registered git commits. Start by calling `list_sessions` to discover \
-                 sessions or `register_plan_file` to create one. There is no master / \
-                 reviewer role and no per-shell session binding: any caller may call any \
-                 tool with any `session_id`. The shim caches the last `label` / \
-                 `author_label` you passed so subsequent calls don't need to repeat it."
+                "Trinity coordinates multi-agent peer review around plan files committed \
+                 to git and feedback files in the working tree. Start by calling \
+                 `list_sessions` to discover sessions or `start_plan` to create one. \
+                 The shim caches the last `label` / `author_label` you passed so \
+                 subsequent calls don't need to repeat it."
                     .into(),
             ),
         }
