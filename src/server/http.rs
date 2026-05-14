@@ -14,6 +14,7 @@ use serde_json::{Value, json};
 use super::AppState;
 use super::mcp;
 use super::ui;
+use super::wait::{WaitArgs, WaitError, wait_for_work};
 use crate::lifecycle::SessionId;
 use crate::mcp_response::{get_context_response, list_sessions_response};
 
@@ -29,7 +30,24 @@ pub fn router(state: AppState) -> Router {
         .route("/sessions/{session_id}/events", get(session_events_stream))
         .route("/internal/tools", get(list_tools))
         .route("/internal/tool_call", post(call_tool))
+        .route("/api/wait_for_work", post(api_wait_for_work))
         .with_state(state)
+}
+
+async fn api_wait_for_work(
+    State(state): State<AppState>,
+    axum::Json(args): axum::Json<WaitArgs>,
+) -> Result<axum::Json<Value>, AppError> {
+    let resp = wait_for_work(&state.runtime, args).await.map_err(|e| match e {
+        WaitError::InvalidRole(_) => AppError {
+            status: StatusCode::BAD_REQUEST,
+            msg: e.to_string(),
+        },
+        WaitError::Io(err) => AppError::io(err),
+    })?;
+    let v = serde_json::to_value(resp)
+        .map_err(|e| AppError::internal(format!("serialize wait response: {e}")))?;
+    Ok(axum::Json(v))
 }
 
 #[derive(Deserialize)]

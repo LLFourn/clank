@@ -279,11 +279,24 @@ impl ShimHandler {
             "tool": tool,
             "arguments": arguments,
         });
-        let resp = self
+        let mut req = self
             .client
             .post(format!("{}/internal/tool_call", self.daemon))
             .header("origin", "http://127.0.0.1")
-            .json(&body)
+            .json(&body);
+        // `wait_for_work` blocks up to `timeout_secs` (default 60, max 300)
+        // server-side. Override the per-request timeout so the shim doesn't
+        // cut the connection before the daemon answers. Server timeout + 30s
+        // grace.
+        if tool == "wait_for_work" {
+            let server_timeout_secs = arguments
+                .get("timeout_secs")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(60)
+                .clamp(1, 300);
+            req = req.timeout(Duration::from_secs(server_timeout_secs + 30));
+        }
+        let resp = req
             .send()
             .await
             .map_err(|e| ShimError::Transport(e.to_string()))?;
@@ -339,10 +352,14 @@ impl ServerHandler for ShimHandler {
             },
             instructions: Some(
                 "Trinity coordinates multi-agent peer review around plan files committed \
-                 to git and feedback files in the working tree. Start by calling \
-                 `list_sessions` to discover sessions or `start_plan` to create one. \
-                 The shim caches the last `label` / `author_label` you passed so \
-                 subsequent calls don't need to repeat it."
+                 to git and feedback files in the working tree. \n\n\
+                 Discover sessions with `list_sessions` or create one with `start_plan`. \
+                 To drive an agent loop, call `wait_for_work({role: \"master\" | \"reviewers\"})` — \
+                 it blocks until a session needs your role and returns minimal identifiers; \
+                 for each match, follow up with `get_context({repo, session_id})` for the \
+                 full session state. This avoids polling. \n\n\
+                 The shim caches the last `label` / `author_label` you passed so subsequent \
+                 calls don't need to repeat it."
                     .into(),
             ),
         }

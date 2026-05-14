@@ -1,15 +1,17 @@
 //! Pure projections used by MCP, HTTP, and SSE: phase derivation, plan
-//! worktree status from hash comparisons, and the `waiting_on` value.
+//! worktree status from hash comparisons, gate derivation, and the
+//! `waiting_on` value.
 //!
 //! All consumers (MCP `get_context`, HTTP routes, SSE payload construction,
-//! tests) call into these functions so the derivation logic stays in one
-//! place and can't drift between surfaces.
+//! `wait_for_work` matching, tests) call into these functions so the
+//! derivation logic stays in one place and can't drift between surfaces.
 
-use crate::lifecycle::ContentHash;
+use crate::lifecycle::{AgentLabel, ContentHash};
 use crate::repo_state::{
-    AttributionResult, Phase, PlanWorktreeStatus, Session, WaitingOn, WaitingReason, WaitingRole,
+    AttributionResult, Feedback, Phase, PlanWorktreeStatus, Session, WaitingOn, WaitingReason,
+    WaitingRole,
 };
-use crate::review_state::{ReviewGateDecision, ReviewGateState};
+use crate::review_state::{ReviewGateDecision, ReviewGateState, ReviewPhase};
 
 use std::collections::BTreeMap;
 
@@ -160,6 +162,166 @@ fn waiting_from_gate(gate: Option<&ReviewGateDecision>, phase: GatePhase) -> Wai
                 )
             }
         }
+    }
+}
+
+/// All plan-touching commits attributed to `session`, in chronological
+/// order (first-parent walk, oldest first).
+pub fn all_plan_revisions(
+    session: &Session,
+    state: &crate::repo_state::RepoState,
+) -> Vec<CommitSha> {
+    state
+        .commit_order
+        .iter()
+        .filter(|sha| {
+            matches!(
+                state.attribution.get(*sha),
+                Some(AttributionResult::Attributed {
+                    session: sid,
+                    plan_touch: Some(_),
+                    ..
+                }) if sid == &session.id
+            )
+        })
+        .cloned()
+        .collect()
+}
+
+/// All implementation commits (has_code_changes == true) attributed to
+/// `session`, in chronological order.
+pub fn all_implementation_commits(
+    session: &Session,
+    state: &crate::repo_state::RepoState,
+) -> Vec<CommitSha> {
+    state
+        .commit_order
+        .iter()
+        .filter(|sha| {
+            matches!(
+                state.attribution.get(*sha),
+                Some(AttributionResult::Attributed {
+                    session: sid,
+                    has_code_changes: true,
+                    ..
+                }) if sid == &session.id
+            )
+        })
+        .cloned()
+        .collect()
+}
+
+pub fn latest_plan_touching_commit(
+    session: &Session,
+    state: &crate::repo_state::RepoState,
+) -> Option<CommitSha> {
+    all_plan_revisions(session, state).into_iter().last()
+}
+
+pub fn latest_impl_commit(
+    session: &Session,
+    state: &crate::repo_state::RepoState,
+) -> Option<CommitSha> {
+    all_implementation_commits(session, state).into_iter().last()
+}
+
+/// Plan-phase review gate built from the session's `plan_feedback`
+/// targeting the current plan commit. Returns `None` if the session has
+/// no plan-touching commits yet.
+pub fn plan_gate_for(
+    session: &Session,
+    state: &crate::repo_state::RepoState,
+) -> Option<ReviewGateDecision> {
+    let current_target = latest_plan_touching_commit(session, state)?;
+    Some(derive_gate_from_feedback(
+        ReviewPhase::Plan,
+        &current_target,
+        &session.plan_feedback,
+    ))
+}
+
+/// Implementation-phase review gate built from the session's
+/// `impl_feedback` targeting the latest impl commit. Returns `None` if
+/// the session has no impl commits yet.
+pub fn impl_gate_for(
+    session: &Session,
+    state: &crate::repo_state::RepoState,
+) -> Option<ReviewGateDecision> {
+    let current_target = latest_impl_commit(session, state)?;
+    Some(derive_gate_from_feedback(
+        ReviewPhase::Impl,
+        &current_target,
+        &session.impl_feedback,
+    ))
+}
+
+/// Build a `ReviewGateDecision` directly from the session's in-memory
+/// feedback map, using SHA-anchored verdicts.
+fn derive_gate_from_feedback(
+    phase: ReviewPhase,
+    current_target: &CommitSha,
+    feedback: &BTreeMap<(CommitSha, AgentLabel), Feedback>,
+) -> ReviewGateDecision {
+    let mut participants: Vec<AgentLabel> = Vec::new();
+    let mut approvals: Vec<AgentLabel> = Vec::new();
+    let mut request_changes: Vec<AgentLabel> = Vec::new();
+    let mut unmarked: Vec<AgentLabel> = Vec::new();
+    let mut current_approvers: std::collections::BTreeSet<AgentLabel> =
+        std::collections::BTreeSet::new();
+    let mut current_blockers: std::collections::BTreeSet<AgentLabel> =
+        std::collections::BTreeSet::new();
+
+    for ((target_sha, author), fb) in feedback {
+        if matches!(
+            fb.verdict,
+            crate::repo_state::Verdict::Approve | crate::repo_state::Verdict::RequestChanges
+        ) && !participants.contains(author)
+        {
+            participants.push(author.clone());
+        }
+        if target_sha == current_target {
+            match fb.verdict {
+                crate::repo_state::Verdict::Approve => {
+                    current_approvers.insert(author.clone());
+                }
+                crate::repo_state::Verdict::RequestChanges => {
+                    current_blockers.insert(author.clone());
+                }
+                crate::repo_state::Verdict::Unmarked => {
+                    if !unmarked.contains(author) {
+                        unmarked.push(author.clone());
+                    }
+                }
+            }
+        }
+    }
+
+    approvals.extend(current_approvers);
+    request_changes.extend(current_blockers);
+
+    let missing: Vec<AgentLabel> = participants
+        .iter()
+        .filter(|p| !approvals.contains(p) && !request_changes.contains(p))
+        .cloned()
+        .collect();
+
+    let state = if !request_changes.is_empty() {
+        ReviewGateState::ChangesRequested
+    } else if !approvals.is_empty() && missing.is_empty() {
+        ReviewGateState::Ready
+    } else {
+        ReviewGateState::NeedsReview
+    };
+
+    ReviewGateDecision {
+        phase,
+        state,
+        approval_rule: "all_participants",
+        participants,
+        approvals,
+        request_changes,
+        unmarked,
+        missing_approvals: missing,
     }
 }
 

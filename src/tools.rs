@@ -12,7 +12,7 @@ pub struct ToolDescriptor {
     pub input_schema: Value,
 }
 
-/// Three coordination tools (plus the `echo_cwd` diagnostic stub).
+/// Four coordination tools (plus the `echo_cwd` diagnostic stub).
 ///
 /// `start_plan` creates the plan file in the working tree; the agent must
 /// then commit it before Trinity treats the session as live.
@@ -22,6 +22,10 @@ pub struct ToolDescriptor {
 ///
 /// `list_sessions` returns the in-memory session summary for one or all
 /// known repos.
+///
+/// `wait_for_work` long-polls until a session needs the caller's role,
+/// then returns minimal identifiers. Replaces poll-loops over
+/// `get_context` / `list_sessions`.
 pub fn catalog() -> Vec<ToolDescriptor> {
     vec![
         ToolDescriptor {
@@ -37,13 +41,21 @@ pub fn catalog() -> Vec<ToolDescriptor> {
         },
         ToolDescriptor {
             name: "list_sessions".to_string(),
-            description: "List Trinity sessions in the caller's repo (via \
-                          `git rev-parse --show-toplevel`). Returns each session's id, \
-                          plan_path, phase, plan_worktree_status, and waiting_on."
+            description: "List Trinity sessions. By default returns sessions in the caller's \
+                          repo (resolved via `git rev-parse --show-toplevel`). Pass `repo` \
+                          (absolute path) to target a specific watched repo instead — \
+                          required when responding to a `wait_for_work` match in a repo \
+                          outside the caller's cwd. Each row: id, plan_path, phase, \
+                          plan_worktree_status, waiting_on."
                 .to_string(),
             input_schema: json!({
                 "type": "object",
-                "properties": {},
+                "properties": {
+                    "repo": {
+                        "type": "string",
+                        "description": "Absolute repo root path. Optional; defaults to the caller's cwd-repo."
+                    }
+                },
                 "additionalProperties": false
             }),
         },
@@ -73,6 +85,80 @@ pub fn catalog() -> Vec<ToolDescriptor> {
             }),
         },
         ToolDescriptor {
+            name: "wait_for_work".to_string(),
+            description: "Block until a session in any watched repo is waiting on the caller's \
+                          role, then return the minimal identifiers needed to act. This is the \
+                          idiomatic way to drive an agent loop — replaces polling \
+                          `list_sessions` / `get_context` on a timer.\n\n\
+                          Inputs:\n\
+                          - `role` (required): `\"master\"` if you're driving the work \
+                          (committing plan revisions, addressing changes, implementing, moving \
+                          to done), `\"reviewers\"` if you're reviewing plans or impl commits.\n\
+                          - `repo` (optional absolute path): filter to one watched repo. \
+                          Default: match across all repos.\n\
+                          - `session_id` (optional): filter to one session.\n\
+                          - `exclude_authors` (optional, reviewers role only): skip sessions \
+                          where any listed author already has a current verdict on the target. \
+                          Useful so you aren't woken by your own outstanding reviews.\n\
+                          - `timeout_secs` (optional, 1–300, default 60): how long to block.\n\n\
+                          Response shape — intentionally minimal to keep loop context small:\n\
+                          ```\n\
+                          {\n\
+                            \"matches\": [{\"repo\": \"/abs/path\", \"session_id\": \"id\", \"reason\": \"impl_needs_initial_review\"}],\n\
+                            \"timed_out\": false\n\
+                          }\n\
+                          ```\n\
+                          On timeout: `{\"matches\": [], \"timed_out\": true}` — call again.\n\n\
+                          The response does NOT include full session context. For each match \
+                          you decide to act on, call `get_context({repo, session_id})` to \
+                          fetch phase, plan_worktree_status, review_gate, write_feedback path, \
+                          and timeline. This split keeps the loop's accumulated context small \
+                          even after many wake-ups.\n\n\
+                          Typical agent loop:\n\
+                          ```\n\
+                          loop {\n\
+                            let work = wait_for_work({ role: \"reviewers\" });\n\
+                            for m in work.matches {\n\
+                              let ctx = get_context({ repo: m.repo, session_id: m.session_id });\n\
+                              do_review(ctx);\n\
+                            }\n\
+                          }\n\
+                          ```"
+                .to_string(),
+            input_schema: json!({
+                "type": "object",
+                "required": ["role"],
+                "additionalProperties": false,
+                "properties": {
+                    "role": {
+                        "type": "string",
+                        "enum": ["master", "reviewers"],
+                        "description": "Which role's attention you're polling for."
+                    },
+                    "repo": {
+                        "type": "string",
+                        "description": "Absolute repo root path. Optional; defaults to matching across all watched repos."
+                    },
+                    "session_id": {
+                        "type": "string",
+                        "description": "Restrict to one session id. Optional."
+                    },
+                    "exclude_authors": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Reviewers role only: skip sessions where any listed author already has a current verdict for the review target. Lets a reviewer skip their own outstanding reviews."
+                    },
+                    "timeout_secs": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 300,
+                        "default": 60,
+                        "description": "How long to block before returning `timed_out: true`."
+                    }
+                }
+            }),
+        },
+        ToolDescriptor {
             name: "get_context".to_string(),
             description: "Returns the per-session view: phase (planning | implementing | done), \
                           plan_worktree_status (clean | body_dirty | done_move_pending | \
@@ -82,7 +168,10 @@ pub fn catalog() -> Vec<ToolDescriptor> {
                           When `session_id` doesn't correspond to a plan file in HEAD, returns \
                           an error `session_not_committed` — commit the plan to register the \
                           session.\n\n\
-                          Inputs: `session_id`; `author_label` (optional).\n\n\
+                          Inputs: `session_id`; `author_label` (optional, defaults to \
+                          last cached); `repo` (optional absolute path — pass this when \
+                          following up on a `wait_for_work` match in a repo outside your cwd, \
+                          otherwise the cwd-repo is used).\n\n\
                           Always call this before reviewing or implementing. The `waiting_on` \
                           field tells you whether the current bottleneck is master or reviewers."
                 .to_string(),
@@ -91,7 +180,11 @@ pub fn catalog() -> Vec<ToolDescriptor> {
                 "required": ["session_id"],
                 "properties": {
                     "session_id": {"type": "string"},
-                    "author_label": {"type": "string"}
+                    "author_label": {"type": "string"},
+                    "repo": {
+                        "type": "string",
+                        "description": "Absolute repo root path. Optional; defaults to the caller's cwd-repo."
+                    }
                 },
                 "additionalProperties": false
             }),

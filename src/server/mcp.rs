@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use super::AppState;
+use super::wait::{WaitArgs, WaitError, wait_for_work as run_wait_for_work};
 use crate::lifecycle::{AgentLabel, SessionId};
 use crate::mcp_response::{get_context_response, list_sessions_response};
 
@@ -39,12 +40,37 @@ pub async fn dispatch(state: &AppState, req: &ToolCallRequest) -> Result<Value, 
         "list_sessions" => list_sessions(state, req).await,
         "start_plan" => start_plan(state, req).await,
         "get_context" => get_context(state, req).await,
+        "wait_for_work" => wait_for_work(state, req).await,
         other => Err(ToolError::NotFound(format!("unknown tool: {other}"))),
     }
 }
 
+async fn wait_for_work(state: &AppState, req: &ToolCallRequest) -> Result<Value, ToolError> {
+    let args: WaitArgs = serde_json::from_value(req.arguments.clone())
+        .map_err(|e| ToolError::Invalid(format!("args: {e}")))?;
+    let resp = run_wait_for_work(&state.runtime, args)
+        .await
+        .map_err(|e| match e {
+            WaitError::InvalidRole(_) => ToolError::Invalid(e.to_string()),
+            WaitError::Io(_) => ToolError::Internal(anyhow::anyhow!(e)),
+        })?;
+    serde_json::to_value(resp).map_err(|e| ToolError::Internal(anyhow::anyhow!(e)))
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct ListSessionsArgs {
+    /// Optional absolute repo path. Falls back to req.cwd if absent.
+    repo: Option<String>,
+}
+
 async fn list_sessions(state: &AppState, req: &ToolCallRequest) -> Result<Value, ToolError> {
-    let repo = resolve_repo(&req.cwd).await?;
+    let args: ListSessionsArgs = if req.arguments.is_null() {
+        ListSessionsArgs::default()
+    } else {
+        serde_json::from_value(req.arguments.clone())
+            .map_err(|e| ToolError::Invalid(format!("args: {e}")))?
+    };
+    let repo = resolve_repo_with_override(args.repo.as_deref(), &req.cwd).await?;
     state.runtime.add_repo_if_unknown(repo.clone()).await;
     let v = state
         .runtime
@@ -112,12 +138,15 @@ async fn start_plan(state: &AppState, req: &ToolCallRequest) -> Result<Value, To
 struct GetContextArgs {
     session_id: String,
     author_label: Option<String>,
+    /// Optional absolute repo path. Falls back to req.cwd if absent.
+    /// Used when responding to a `wait_for_work` match in a different repo.
+    repo: Option<String>,
 }
 
 async fn get_context(state: &AppState, req: &ToolCallRequest) -> Result<Value, ToolError> {
     let args: GetContextArgs = serde_json::from_value(req.arguments.clone())
         .map_err(|e| ToolError::Invalid(format!("args: {e}")))?;
-    let repo = resolve_repo(&req.cwd).await?;
+    let repo = resolve_repo_with_override(args.repo.as_deref(), &req.cwd).await?;
     state.runtime.add_repo_if_unknown(repo.clone()).await;
     let session_id = SessionId::from(args.session_id.clone());
     let author = AgentLabel::from(args.author_label.unwrap_or_else(|| "anonymous".to_string()));
@@ -161,6 +190,22 @@ async fn resolve_repo(cwd: &Path) -> Result<PathBuf, ToolError> {
     }
     let s = String::from_utf8_lossy(&output.stdout).trim().to_string();
     Ok(PathBuf::from(s))
+}
+
+/// Resolve the target repo: if `override_path` is `Some`, canonicalize that
+/// (dunce, no `~` expansion — callers pass absolute paths). Otherwise fall
+/// back to `git rev-parse --show-toplevel` from the shim's cwd.
+async fn resolve_repo_with_override(
+    override_path: Option<&str>,
+    cwd: &Path,
+) -> Result<PathBuf, ToolError> {
+    match override_path {
+        Some(p) => {
+            let raw = PathBuf::from(p);
+            Ok(dunce::canonicalize(&raw).unwrap_or(raw))
+        }
+        None => resolve_repo(cwd).await,
+    }
 }
 
 /// Spawn a notify watcher for `repo` if one isn't already running.

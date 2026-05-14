@@ -14,10 +14,13 @@ use std::path::{Path, PathBuf};
 use serde_json::{Value, json};
 
 use crate::disk_format::plan_path_is_done;
-use crate::lifecycle::{AgentLabel, SessionId, content_hash};
-use crate::projection::{phase, plan_worktree_status, waiting_on};
+use crate::lifecycle::{AgentLabel, ContentHash, SessionId, content_hash};
+use crate::projection::{
+    all_implementation_commits, all_plan_revisions, impl_gate_for, latest_impl_commit,
+    latest_plan_touching_commit, phase, plan_gate_for, plan_worktree_status, waiting_on,
+};
 use crate::repo_state::{PlanWorktreeStatus, RepoState, WaitingOn};
-use crate::review_state::{ReviewGateDecision, ReviewGateState, ReviewPhase};
+use crate::review_state::{ReviewGateDecision, ReviewPhase};
 
 /// Compare the working-tree plan file at `session.plan_path` to HEAD's
 /// blob (already cached in `session.body_hash`). Returns the four-state
@@ -30,8 +33,20 @@ pub fn compute_plan_worktree_status(
     repo_root: &Path,
     session: &crate::repo_state::Session,
 ) -> std::io::Result<PlanWorktreeStatus> {
-    let active_path = repo_root.join(&session.plan_path);
-    let counterpart_rel = swap_active_done(&session.plan_path);
+    compute_plan_worktree_status_parts(repo_root, &session.plan_path, &session.body_hash)
+}
+
+/// Same as `compute_plan_worktree_status` but takes the minimum inputs
+/// directly. Used by `wait_for_work` where we snapshot the path + hash
+/// under the runtime lock and want to compute the worktree status without
+/// holding a full `Session` reference (so the lock can be released first).
+pub fn compute_plan_worktree_status_parts(
+    repo_root: &Path,
+    plan_path: &Path,
+    body_hash: &ContentHash,
+) -> std::io::Result<PlanWorktreeStatus> {
+    let active_path = repo_root.join(plan_path);
+    let counterpart_rel = swap_active_done(plan_path);
     let counterpart_abs = counterpart_rel.as_ref().map(|p| repo_root.join(p));
 
     let wt_hash = match std::fs::read_to_string(&active_path) {
@@ -45,7 +60,7 @@ pub fn compute_plan_worktree_status(
         .unwrap_or(false);
 
     Ok(plan_worktree_status(
-        Some(&session.body_hash),
+        Some(body_hash),
         wt_hash.as_ref(),
         counterpart_exists,
     ))
@@ -365,169 +380,6 @@ fn latest_impl_revision(session: &crate::repo_state::Session, state: &RepoState)
     match all_implementation_commits(session, state).last() {
         Some(sha) => json!({ "commit_sha": sha.as_str() }),
         None => Value::Null,
-    }
-}
-
-/// All plan-touching commits attributed to `session`, in chronological
-/// order via `RepoState::commit_order` (first-parent walk, oldest first).
-/// Returned by `get_context` for the session page's plan-revisions list.
-fn all_plan_revisions(
-    session: &crate::repo_state::Session,
-    state: &RepoState,
-) -> Vec<crate::lifecycle::CommitSha> {
-    state
-        .commit_order
-        .iter()
-        .filter(|sha| {
-            matches!(
-                state.attribution.get(*sha),
-                Some(crate::repo_state::AttributionResult::Attributed {
-                    session: sid,
-                    plan_touch: Some(_),
-                    ..
-                }) if sid == &session.id
-            )
-        })
-        .cloned()
-        .collect()
-}
-
-/// All implementation commits (has_code_changes == true) attributed to
-/// `session`, in chronological order via `commit_order`.
-fn all_implementation_commits(
-    session: &crate::repo_state::Session,
-    state: &RepoState,
-) -> Vec<crate::lifecycle::CommitSha> {
-    state
-        .commit_order
-        .iter()
-        .filter(|sha| {
-            matches!(
-                state.attribution.get(*sha),
-                Some(crate::repo_state::AttributionResult::Attributed {
-                    session: sid,
-                    has_code_changes: true,
-                    ..
-                }) if sid == &session.id
-            )
-        })
-        .cloned()
-        .collect()
-}
-
-/// Build the plan-phase review gate from the session's plan_feedback
-/// against the current plan target SHA. Returns `None` if the session
-/// has no plan target yet.
-fn plan_gate_for(
-    session: &crate::repo_state::Session,
-    state: &RepoState,
-) -> Option<ReviewGateDecision> {
-    let current_target = latest_plan_touching_commit(session, state)?;
-    Some(derive_gate_from_feedback(
-        ReviewPhase::Plan,
-        &current_target,
-        &session.plan_feedback,
-    ))
-}
-
-fn impl_gate_for(
-    session: &crate::repo_state::Session,
-    state: &RepoState,
-) -> Option<ReviewGateDecision> {
-    let current_target = latest_impl_commit(session, state)?;
-    Some(derive_gate_from_feedback(
-        ReviewPhase::Impl,
-        &current_target,
-        &session.impl_feedback,
-    ))
-}
-
-fn latest_plan_touching_commit(
-    session: &crate::repo_state::Session,
-    state: &RepoState,
-) -> Option<crate::lifecycle::CommitSha> {
-    all_plan_revisions(session, state).into_iter().last()
-}
-
-fn latest_impl_commit(
-    session: &crate::repo_state::Session,
-    state: &RepoState,
-) -> Option<crate::lifecycle::CommitSha> {
-    all_implementation_commits(session, state).into_iter().last()
-}
-
-/// Build a `ReviewGateDecision` directly from the session's in-memory
-/// feedback map, using SHA-anchored verdicts. Bypasses
-/// `review_state::derive_gate` (which expects `FeedbackRecord` rows) so
-/// the new core doesn't have to construct those.
-fn derive_gate_from_feedback(
-    phase: ReviewPhase,
-    current_target: &crate::lifecycle::CommitSha,
-    feedback: &std::collections::BTreeMap<(crate::lifecycle::CommitSha, AgentLabel), crate::repo_state::Feedback>,
-) -> ReviewGateDecision {
-    let mut participants: Vec<AgentLabel> = Vec::new();
-    let mut approvals: Vec<AgentLabel> = Vec::new();
-    let mut request_changes: Vec<AgentLabel> = Vec::new();
-    let mut unmarked: Vec<AgentLabel> = Vec::new();
-    let mut current_approvers: std::collections::BTreeSet<AgentLabel> =
-        std::collections::BTreeSet::new();
-    let mut current_blockers: std::collections::BTreeSet<AgentLabel> =
-        std::collections::BTreeSet::new();
-
-    for ((target_sha, author), fb) in feedback {
-        // Participant set = anyone who's ever written a verdict-bearing
-        // file in this phase (across any target SHA).
-        if matches!(
-            fb.verdict,
-            crate::repo_state::Verdict::Approve | crate::repo_state::Verdict::RequestChanges
-        ) && !participants.contains(author)
-        {
-            participants.push(author.clone());
-        }
-        // Current-target votes drive the gate.
-        if target_sha == current_target {
-            match fb.verdict {
-                crate::repo_state::Verdict::Approve => {
-                    current_approvers.insert(author.clone());
-                }
-                crate::repo_state::Verdict::RequestChanges => {
-                    current_blockers.insert(author.clone());
-                }
-                crate::repo_state::Verdict::Unmarked => {
-                    if !unmarked.contains(author) {
-                        unmarked.push(author.clone());
-                    }
-                }
-            }
-        }
-    }
-
-    approvals.extend(current_approvers);
-    request_changes.extend(current_blockers);
-
-    let missing: Vec<AgentLabel> = participants
-        .iter()
-        .filter(|p| !approvals.contains(p) && !request_changes.contains(p))
-        .cloned()
-        .collect();
-
-    let state = if !request_changes.is_empty() {
-        ReviewGateState::ChangesRequested
-    } else if !approvals.is_empty() && missing.is_empty() {
-        ReviewGateState::Ready
-    } else {
-        ReviewGateState::NeedsReview
-    };
-
-    ReviewGateDecision {
-        phase,
-        state,
-        approval_rule: "all_participants",
-        participants,
-        approvals,
-        request_changes,
-        unmarked,
-        missing_approvals: missing,
     }
 }
 

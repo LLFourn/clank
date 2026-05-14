@@ -6,6 +6,7 @@ pub mod mcp;
 pub mod notify_bridge;
 pub mod state;
 pub mod ui;
+pub mod wait;
 
 use std::collections::HashSet;
 use std::net::SocketAddr;
