@@ -19,7 +19,7 @@ Trinity reacts to **any HEAD change** (branch switch, commit, reset, rebase, mer
 
 Any non-`clean` status puts the session in a "waiting on master" state with case-specific guidance (see the Waiting On table). While `body_dirty`, plan-phase feedback is held; Trinity refuses to auto-organize plan feedback into the current target SHA's directory until the revision lands. Impl-phase feedback is unaffected (impl reviews target commit SHAs, not the working tree).
 
-`plan_worktree_status` is **never stored on `Session`**. It is computed at every `get_context` request, every rebuild, every feedback observation. Pure working-tree edits with no other event won't update the UI immediately — refresh or the next event will pick up the new status.
+`plan_worktree_status` is **never stored on `Session`**. It is computed at every `get_context` request, every rebuild, every feedback observation, and every `PlanWorktreeMaybeChanged` observation. The latter is fired by the plan-file watcher: when a user edits, saves, deletes, or moves a `.trinity/plans/<id>.md` file, the watcher emits a narrow observation that recomputes status and broadcasts an updated `waiting_on` via SSE. The watcher does **not** trigger session creation, plan-revision tracking, or `RebuildRepo` — those remain git-only. Live status updates land within one debounce window.
 
 Live activity is an in-memory ring buffer driving SSE and the existing chime; restarting drops the live feed. History lives in git and is rendered per-session on demand.
 
@@ -224,10 +224,11 @@ Per-repo, in memory. One `tokio::sync::Mutex<RepoState>` per repo.
 
 ```rust
 pub enum Observation {
-    HeadChanged,                                                  // full rebuild signal — covers all plan-related changes
+    HeadChanged,                                                  // full rebuild signal
+    PlanWorktreeMaybeChanged { session_id: SessionId },           // narrow: recompute status only; drop if no matching session
     FeedbackChanged { session_id, phase, target_sha: Option<CommitSha>, author, body, path },
     FeedbackGone { session_id, phase, target_sha: Option<CommitSha>, author },
-    OperatorMoveToDone { session_id },                            // does the working-tree mv only; HEAD change after operator commits drives the rebuild
+    OperatorMoveToDone { session_id },                            // working-tree mv only; HEAD change after operator commits drives the rebuild
 }
 
 pub enum Effect {
@@ -250,15 +251,16 @@ Self-write ring (`pending_self_writes: HashMap<PathBuf, ContentHash>`, ~20 entri
 
 ## Watchers
 
-`notify` recursive watcher per repo, rooted at `<repo>/.trinity/feedback/`. Plus `notify` on `<repo>/.git/HEAD` and `<repo>/.git/logs/HEAD`. One thread aggregates events into a single channel keyed by repo.
+`notify` recursive watcher per repo, rooted at `<repo>/.trinity/`. Plus `notify` on `<repo>/.git/HEAD` and `<repo>/.git/logs/HEAD`. One thread aggregates events into a single channel keyed by repo.
 
 Path → observation translation:
 
 - `.trinity/feedback/<session>/<plan|impl>/[<sha>/]<author>.md` write → `FeedbackChanged` (`target_sha` parsed from path, `None` for flat drops)
 - `.trinity/feedback/.../<author>.md` removed → `FeedbackGone`
+- `.trinity/plans/<session>.md` write/remove/rename → `PlanWorktreeMaybeChanged { session_id }`. **Narrow scope:** the handler looks up `session_id` against the current session set (HEAD-derived). If the session exists, recompute `plan_worktree_status` and broadcast updated `waiting_on`. If no matching session (untracked draft), drop the observation. **Never** triggers `RebuildRepo`, never creates a session, never records a plan revision.
 - `.git/HEAD` change OR `.git/logs/HEAD` change → `HeadChanged` → `RebuildRepo` effect
 
-Plan files are **not watched in the working tree**. A working-tree edit to `.trinity/plans/foo.md` produces no observation; Trinity only sees the change when the user commits and HEAD moves. Plan revisions are git-defined, not filesystem-defined.
+Plan-file watching exists **only** to keep `plan_worktree_status` fresh in the UI. Session discovery and plan-revision tracking remain git-only — a new file in `.trinity/plans/` that has no HEAD entry is a draft and is ignored by the observation handler.
 
 One watcher per repo. The per-session-per-feedback-dir explosion is gone.
 
@@ -471,7 +473,9 @@ One large rewrite, sequenced as six commits.
 - **Attribution overrides require amending.** Trinity offers no UI/MCP/HTTP affordance for changing a commit's session. Operators amend the commit to change which plan paths it touches.
 - **Uncommitted plan files are not sessions.** `start_plan` creates a working-tree file but the session does not appear in `list_sessions`, `get_context`, or the homepage until the file is committed and HEAD moves. `get_context` for an uncommitted session_id returns the `session_not_committed` error.
 - **Working-tree plan edits produce no observation.** Editing `<plan_path>` without committing causes no `PlanFileChanged`, no plan revision, no live event, no `RebuildRepo`.
-- **`plan_worktree_status` is a derived projection.** Computed at every `get_context` request, every rebuild, every feedback observation. Never stored on `Session`.
+- **`plan_worktree_status` is a derived projection.** Computed at every `get_context` request, every rebuild, every feedback observation, and every `PlanWorktreeMaybeChanged` observation. Never stored on `Session`.
+- **Live status updates within one debounce window.** A working-tree edit, save, delete, or rename of a session's plan file produces a `PlanWorktreeMaybeChanged` observation; the homepage chip and session-page banner update via SSE without page refresh. The watcher does not trigger `RebuildRepo` or session creation.
+- **Watcher narrowness for plan files.** A plan-file event on a path with no matching session in current state (i.e., an untracked draft) is dropped silently; no session is created.
 - **Plan-dirty holds plan feedback.** When `plan_worktree_status == body_dirty`, plan-phase feedback dropped during that window is held: the file is not auto-organized; it appears in `Session.held_plan_feedback` and in the session detail page's banner. Impl-phase feedback proceeds normally.
 - **Held feedback releases on plan commit.** When the operator commits and HEAD changes → rebuild fires → status flips to `clean` → the rebuild's normalization sweep emits `MoveFeedbackFile` effects for flat-path plan-phase files → files land at `<plan>/<new-target-sha>/<author>.md` → gate recomputes → banner clears. The release does not require any new filesystem event.
 - **`done_move_pending` interval has explicit waiting_on.** Between `POST /sessions/{id}/done` (working-tree `mv`) and the operator's commit, `waiting_on.role` is `master`, `reason` is `commit_done_move`. Once HEAD contains the new path, status is `clean` (plan now lives at `plans/done/<id>.md`) and `waiting_on.reason` becomes `session_done`.
@@ -500,7 +504,8 @@ Integration (`tests/`):
 
 - `start_plan` in a fresh repo: plan file created in working tree, `.gitignore` updated, repo registered. Session does NOT yet appear in `list_sessions` (file isn't committed). `get_context` on the session_id returns `session_not_committed` error.
 - Commit the plan file → HEAD changes → rebuild → session appears in `list_sessions` with phase `planning`.
-- Edit the committed plan file in the working tree without committing → no `RebuildRepo` fires; no plan revision recorded; on next `get_context` or feedback observation `plan_worktree_status` is `body_dirty`; banner appears.
+- Edit the committed plan file in the working tree without committing → `PlanWorktreeMaybeChanged` fires; no `RebuildRepo`; no plan revision recorded; `plan_worktree_status` becomes `body_dirty`; banner appears live (no page refresh required).
+- Drop a brand-new file at `.trinity/plans/<not-yet-committed>.md` → watcher fires, observation handler finds no matching session in state, observation is dropped silently. Session does not appear anywhere.
 - Drop a plan feedback file while `body_dirty`: file stays where written; `held_plan_feedback` includes it; gate is not affected; banner shows "1 held review."
 - Commit the plan revision: HEAD changes → rebuild → `plan_worktree_status` clean → rebuild's normalization sweep moves held file into `<plan/<new-target-sha>/<author>.md` → gate recomputes → banner clears.
 - Drop an impl feedback file while `body_dirty`: routes normally to `<impl/<current-impl-sha>/<author>.md`; not held.
@@ -547,7 +552,7 @@ Integration (`tests/`):
 - **No overrides.** Attribution: amend the commit. Review gate: edit the feedback file. There are no escape-hatch mechanisms beyond what's already in git or on disk.
 - **No multi-branch parallelism in a single worktree.** Trinity supports the current worktree's HEAD only. Plans on un-checked-out branches are invisible. Use separate worktrees for parallel work.
 - **No incremental attribution walk on `HeadChanged`.** Always full rebuild. Removes a whole class of consistency bugs at small cost.
-- **No filesystem-scan-based session discovery.** Trinity does not auto-detect working-tree plan files as sessions. A plan exists only when its file is in `git ls-tree HEAD`. Trinity does not watch `.trinity/plans/` in the working tree.
+- **No filesystem-scan-based session discovery.** Trinity does not auto-detect working-tree plan files as sessions. A plan exists only when its file is in `git ls-tree HEAD`. The plan-file watcher exists only to update `plan_worktree_status` for already-discovered sessions; it never creates a session or records a plan revision from a filesystem event.
 - **No new MCP tool beyond the three.** Anything that would be a fourth is either an HTTP route or a file the agent can edit directly.
 
 ## Implementation Notes
