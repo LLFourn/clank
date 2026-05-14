@@ -15,7 +15,7 @@ use tokio::sync::Mutex;
 
 use crate::disk_format::FeedbackPhase;
 use crate::fs_watcher::FilesystemSignal;
-use crate::lifecycle::{CommitSha, content_hash};
+use crate::lifecycle::{CommitSha, SessionId, content_hash};
 use crate::rebuild::{RebuildError, rebuild_repo};
 use crate::repo_state::{
     AttributionResult, Feedback, HeldFeedback, LiveEvent, RepoState, Session, Trinity,
@@ -139,18 +139,24 @@ impl Runtime {
         match signal {
             FilesystemSignal::HeadChanged => {
                 let fresh = rebuild_repo(repo_root).await?;
-                let mut trinity = self.state.lock().await;
-                trinity.repos.insert(repo_root.to_path_buf(), fresh);
-                push_event(
-                    &mut trinity.live_events,
-                    LiveEvent {
-                        ts: now,
-                        repo: repo_root.to_path_buf(),
-                        session_id: None,
-                        kind: "repo_rebuilt",
-                        payload: serde_json::Value::Null,
-                    },
-                );
+                {
+                    let mut trinity = self.state.lock().await;
+                    trinity.repos.insert(repo_root.to_path_buf(), fresh);
+                    push_event(
+                        &mut trinity.live_events,
+                        LiveEvent {
+                            ts: now,
+                            repo: repo_root.to_path_buf(),
+                            session_id: None,
+                            kind: "repo_rebuilt",
+                            payload: serde_json::Value::Null,
+                        },
+                    );
+                }
+                // Held-feedback normalization sweep: re-dispatch any
+                // flat-drop feedback files now that the plan_worktree_status
+                // may have flipped clean.
+                self.normalize_held_feedback(repo_root, now).await?;
             }
             FilesystemSignal::PlanFileChanged { session_id, path } => {
                 let mut trinity = self.state.lock().await;
@@ -290,6 +296,58 @@ struct MovePlan {
 }
 
 impl Runtime {
+    /// Re-dispatch any currently-held flat-drop feedback after a rebuild.
+    /// Each held entry is removed and forwarded back into `handle_signal`
+    /// as a `FeedbackWritten`; the dispatch path will rename + ingest the
+    /// file if the worktree is clean enough, or re-hold if it isn't.
+    pub async fn normalize_held_feedback(
+        &self,
+        repo_root: &Path,
+        now: i64,
+    ) -> Result<(), RuntimeError> {
+        let drained: Vec<(SessionId, HeldFeedback)> = {
+            let mut trinity = self.state.lock().await;
+            let Some(state) = trinity.repos.get_mut(repo_root) else {
+                return Ok(());
+            };
+            let mut out = Vec::new();
+            for (id, sess) in &mut state.sessions {
+                let held: Vec<HeldFeedback> = std::mem::take(&mut sess.held_plan_feedback);
+                for h in held {
+                    out.push((id.clone(), h));
+                }
+            }
+            out
+        };
+
+        let feedback_root = repo_root.join(".trinity/feedback");
+        for (_session_id, held) in drained {
+            let Ok(rel) = held.path.strip_prefix(&feedback_root) else {
+                continue;
+            };
+            let Some(parsed) = crate::disk_format::parse_feedback_path(rel) else {
+                continue;
+            };
+            // Only re-dispatch if the file is still on disk; if the user
+            // deleted it between the previous run and now, drop the entry.
+            if !held.path.exists() {
+                continue;
+            }
+            // Forward as a FeedbackWritten; the dispatch will auto-organize
+            // or hold according to the current worktree state.
+            if let Err(err) = Box::pin(self.handle_signal(
+                repo_root,
+                FilesystemSignal::FeedbackWritten { parsed },
+                now,
+            ))
+            .await
+            {
+                tracing::warn!(error = ?err, "normalize_held_feedback re-dispatch failed");
+            }
+        }
+        Ok(())
+    }
+
     /// Decide whether a flat-drop feedback file should be auto-organized
     /// into `<phase>/<target-sha>/<author>.md`.
     ///
@@ -835,6 +893,72 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(held_count, 1);
+    }
+
+    #[tokio::test]
+    async fn held_feedback_releases_after_plan_commit() {
+        let dir = init_repo();
+        write_file(dir.path(), ".trinity/plans/foo.md", "# foo v1\n");
+        commit(dir.path(), "add foo v1");
+        // Edit plan without committing → body_dirty
+        write_file(dir.path(), ".trinity/plans/foo.md", "# foo v2 uncommitted\n");
+
+        let rt = Runtime::new();
+        rt.add_repo(dir.path().to_path_buf()).await.unwrap();
+
+        // Drop a flat feedback file while plan is dirty → held.
+        let feedback_rel = ".trinity/feedback/foo/plan/alice.md";
+        write_file(dir.path(), feedback_rel, "APPROVE\n");
+        let parsed_rel = PathBuf::from("foo/plan/alice.md");
+        let parsed = crate::disk_format::parse_feedback_path(&parsed_rel).unwrap();
+        rt.handle_signal(
+            dir.path(),
+            FilesystemSignal::FeedbackWritten { parsed },
+            1,
+        )
+        .await
+        .unwrap();
+
+        let held_count = rt
+            .read_repo(dir.path(), |s| {
+                s.sessions[&SessionId::from("foo".to_string())]
+                    .held_plan_feedback
+                    .len()
+            })
+            .await
+            .unwrap();
+        assert_eq!(held_count, 1, "should be held while dirty");
+
+        // Commit the plan revision so it becomes clean.
+        commit(dir.path(), "revise foo to v2");
+
+        // HEAD changed → rebuild + normalize → held flat file should
+        // auto-organize into the new target SHA subdir.
+        rt.handle_signal(dir.path(), FilesystemSignal::HeadChanged, 2)
+            .await
+            .unwrap();
+
+        let (held_after, has_canonical_entry) = rt
+            .read_repo(dir.path(), |s| {
+                let sess = &s.sessions[&SessionId::from("foo".to_string())];
+                let any_entry_for_alice = sess
+                    .plan_feedback
+                    .keys()
+                    .any(|(_, author)| author.as_str() == "alice");
+                (sess.held_plan_feedback.len(), any_entry_for_alice)
+            })
+            .await
+            .unwrap();
+        assert_eq!(held_after, 0, "held should clear after rebuild");
+        assert!(
+            has_canonical_entry,
+            "alice's feedback should be in plan_feedback under the new target sha"
+        );
+        // Flat file should be gone from disk.
+        assert!(
+            !dir.path().join(feedback_rel).exists(),
+            "flat file should have been moved"
+        );
     }
 
     #[tokio::test]
