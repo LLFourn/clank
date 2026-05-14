@@ -2,97 +2,106 @@
 
 ## Summary
 
-Add a tool that **blocks until work is available for a given role**, then returns minimal identifiers for the matching session(s). Exposed identically over MCP and HTTP. The agent's loop becomes:
+Add a tool that **blocks until one named session needs the caller's role**, then returns the action to perform and the file paths to act on. Exposed identically over MCP and HTTP.
 
 ```
 loop {
-    let work = wait_for_work({ role: "reviewers" })  // blocks
-    for match in work.matches {
-        let ctx = get_context({ repo: match.repo, session_id: match.session_id })
-        do_review(ctx)
-    }
+    let r = wait_for_work({
+        role: "reviewers",
+        session_id: "my-feature",
+        author_label: "codex",
+    });
+    if r.timed_out { continue; }
+    // r.work == "review_impl"
+    // r.locations[0] == ".trinity/feedback/my-feature/impl/<sha>/codex.md"
+    // Read the impl commit + write your verdict to that path.
 }
 ```
 
-The `wait_for_work` response is intentionally minimal so a loop's accumulated context stays small even after many wake-ups; the agent fetches full session detail via `get_context` for the one they choose to act on.
+Single-session, single-repo by design: an agent has one shell, one cwd, one project. Cross-repo wake-ups aren't actionable from a single agent's POV, so the tool doesn't surface them. If an agent wants to watch multiple sessions in parallel they call `wait_for_work` once per session_id.
 
-No more polling `get_context` every few seconds. The daemon already has a `tokio::sync::broadcast::Sender<LiveEvent>` (`Runtime::events_tx`) for SSE; this tool subscribes to the same channel + checks current state on entry, returning the first match.
+No more polling `get_context` / `list_sessions` on a timer. The daemon already has a `tokio::sync::broadcast::Sender<LiveEvent>` (`Runtime::events_tx`) for SSE; this tool subscribes to the same channel + checks current state on entry.
 
-Ships before the Leptos frontend rewrite because agents need this in their loops today; the frontend will use it too (e.g. a "work queue" panel for each role).
+Ships before the Leptos frontend rewrite because agents need this in their loops today; the frontend will use it too (e.g. a "work queue" panel for a session).
 
 ## Tool shape
 
-### Contract: wake-up only, not context
+### Contract: action + locations, not full context
 
-`wait_for_work` is a thin notifier. Its response carries the **minimum data needed to identify which session to act on**. It does **not** embed `review_gate`, `review_target`, `write_feedback`, `timeline`, or any other field that `get_context` returns. Callers are expected to follow up with `get_context(session_id)` for the session they choose to work on.
+`wait_for_work` returns the **action** and the **paths to read or write**. It does NOT embed `review_gate`, `timeline`, plan body, or any other field that `get_context` returns. Callers who need richer context call `get_context({session_id, repo?})` after deciding to act.
 
-This is deliberate: long-poll agents loop and accumulate every response in their context window. A 500-token full-context payload per match becomes 5000 tokens after 10 wake-ups. The minimal shape stays under ~30 tokens per match no matter how often it fires.
+This is deliberate: long-poll agents loop and accumulate every response in their context window. A 500-token full-context payload becomes 5000 tokens after 10 wake-ups. The minimal `{work, locations}` shape stays under ~50 tokens per response no matter how often it fires.
 
-### MCP
+### MCP / HTTP request schema
 
 ```json
 {
   "name": "wait_for_work",
-  "description": "Block until a session in any watched repo is waiting on the caller's role. Returns minimal identifiers; call get_context(session_id) for full state of the chosen session. Re-call after acting.",
   "input_schema": {
     "type": "object",
-    "required": ["role"],
+    "required": ["role", "session_id", "author_label"],
     "additionalProperties": false,
     "properties": {
-      "role": { "type": "string", "enum": ["master", "reviewers"] },
-      "repo": { "type": "string", "description": "Filter to one repo (absolute path)." },
-      "session_id": { "type": "string" },
-      "exclude_authors": {
-        "type": "array",
-        "items": { "type": "string" },
-        "description": "Reviewer polling only: skip sessions where any of these authors already has a current verdict for the target."
-      },
+      "role":         { "type": "string", "enum": ["master", "reviewers"] },
+      "session_id":   { "type": "string" },
+      "author_label": { "type": "string" },
+      "repo":         { "type": "string", "description": "Optional over MCP (defaults to cwd-repo); required over HTTP." },
       "timeout_secs": { "type": "integer", "minimum": 1, "maximum": 300, "default": 60 }
     }
   }
 }
 ```
 
-**Role naming.** `role` accepts exactly the strings `master` and `reviewers` — matching the strings emitted by `waiting_on.role.as_str()`. No `reviewer` singular alias; the schema's `enum` rejects it cleanly. Example loops and prose in this plan use `reviewers` consistently.
+- `role` accepts exactly `master` or `reviewers`. The schema's `enum` rejects anything else.
+- `session_id` is required; the response is always for this one session.
+- `author_label` is required because it's baked into the canonical write path for `review_*` work (`.trinity/feedback/<sid>/<phase>/<sha>/<author>.md`). No silent `anonymous` fallback. The MCP shim caches it across calls (same mechanism `get_context` already uses), so callers usually pass it once per shim lifetime.
+- `repo` is optional over MCP — the dispatcher falls back to the caller's cwd-repo via `git rev-parse --show-toplevel`. It's required over HTTP (no cwd context to fall back on).
 
 ### HTTP
 
 `POST /api/wait_for_work` with the same JSON body. Same response shape.
 
-### Response (minimal)
+### Response
+
+Two possible shapes — an untagged enum in the JSON.
+
+Work available:
 
 ```json
 {
-  "matches": [
-    {
-      "repo": "/Users/.../trinity",
-      "session_id": "filesystem-truth-rewrite",
-      "reason": "impl_needs_initial_review"
-    }
-  ],
-  "timed_out": false
+  "work": "review_impl",
+  "locations": [".trinity/feedback/my-feature/impl/abc123/codex.md"]
 }
 ```
 
-Three fields per match:
-- `repo` — the absolute repo path. Required because session ids are repo-scoped.
-- `session_id` — the session that needs attention.
-- `reason` — the `waiting_on.reason` string (e.g., `impl_needs_initial_review`, `address_plan_request_changes`). Lets callers prioritize without a follow-up call (e.g., a master agent might process `address_*_request_changes` before `commit_done_move`).
+Timed out:
 
-Nothing else. No phase, no SHAs, no paths, no descriptions. **The agent calls `get_context({ session_id, repo })` for the session they pick.**
+```json
+{ "timed_out": true }
+```
 
-If nothing matches before `timeout_secs`, return `{ "matches": [], "timed_out": true }`. Callers treat `timed_out: true` as "no work yet; loop again." No `matched_at` field — the caller can clock-time the result themselves if they need it.
+`work` is one of the imperative actions in the [`expected_action` projection](../../src/projection.rs). `locations` is a list of repo-relative paths. Meaning depends on `work`:
+
+| `work` | `locations` |
+| --- | --- |
+| `review_plan` | `[<canonical write path for caller's plan-phase feedback>]` |
+| `review_impl` | `[<canonical write path for caller's impl-phase feedback>]` |
+| `address_plan_request_changes` | `[<each REQUEST_CHANGES feedback on current plan target>, <plan file>]` |
+| `address_impl_request_changes` | `[<each REQUEST_CHANGES feedback on current impl target>]` (no plan file — the caller is addressing in code) |
+| `commit_plan_revision` | `[<plan file>]` |
+| `commit_done_move` / `restore_or_commit_done_move` | `[<plan file>]` |
+| `implement_and_commit` | `[<plan file>]` |
+| `move_to_done` | `[<plan file>]` |
 
 ## Semantics
 
-- **Immediate return.** Compute matches on entry from the current `Trinity` state. If non-empty, return immediately — don't wait.
-- **Subscribe + re-check.** Otherwise subscribe to `Runtime::events_tx`. On each event, re-compute matches. Return on first non-empty result.
-- **Timeout.** `tokio::time::timeout` wraps the whole select. On timeout, return `timed_out: true` with `matches: []`.
-- **Role match.** Exact match on `waiting_on.role.as_str()`. `none` (terminal sessions) never matches.
-- **Multi-repo.** When `repo` is unset, match across all known repos. When set, canonicalize via `dunce::canonicalize` and compare against `Trinity.repos` keys (which are already canonical) — symlinks and case-normalized variants all match. **`~/...` is NOT expanded by `dunce::canonicalize`**; callers must pass absolute paths (the same convention `~/.trinity/repos` uses on the daemon side, expanded at startup). Non-existent or unresolvable paths return an empty match list (don't error).
-- **Single-session.** When `session_id` is set, only that session (and `repo` should match if both given).
-- **Author exclusion.** When `exclude_authors` is set and `role == "reviewers"`, drop matches where any of the listed authors already has a current verdict for the target (i.e. they're already in `gate.approvals` or `gate.request_changes`). Lets a reviewer poll for "anything I haven't yet reviewed" without being woken by their own work.
-- **Deduplication.** When multiple events fire in rapid succession (e.g. a rebuild), the broadcast may deliver duplicates. The match-recompute is idempotent — return shape is the same regardless of how many events fired during the wait. No internal dedup needed.
+- **Immediate return.** Compute the work item on entry from the current state. If a match exists, return immediately.
+- **Subscribe + re-check.** Otherwise subscribe to `Runtime::events_tx`. On each event, re-compute. Return on the first match.
+- **Timeout.** `tokio::time::timeout` wraps the whole select. On timeout, return `{timed_out: true}`.
+- **Role match.** Exact match on `waiting_on.role`. `none` (terminal sessions) never matches.
+- **Repo resolution.** When `repo` is unset on the MCP path, resolve from cwd via `git rev-parse --show-toplevel`. When set, canonicalize via `dunce::canonicalize`. `~/...` is NOT expanded; pass absolute paths. The HTTP route rejects requests without `repo` because it has no cwd context.
+- **Unknown session.** If the named `session_id` doesn't exist in the target repo, return an error (`session not found`) rather than blocking forever — the caller has a bug we should surface.
+- **Deduplication.** When multiple events fire in rapid succession (e.g. a rebuild), the broadcast may deliver duplicates. The match-recompute is idempotent — return shape is the same regardless of how many events fired during the wait.
 
 ## Why long-poll, not WebSocket / SSE
 
@@ -102,251 +111,159 @@ If nothing matches before `timeout_secs`, return `{ "matches": [], "timed_out": 
 
 ## Server implementation
 
-A new module `src/server/wait.rs` (~150 LOC) exposes:
+A new module `src/server/wait.rs` exposes:
 
 ```rust
 pub async fn wait_for_work(
     runtime: &Runtime,
     args: WaitArgs,
-) -> WaitResponse;
+) -> Result<WaitResponse, WaitError>;
 ```
 
-Implementation sketch:
+Sketch:
 
 ```rust
-pub async fn wait_for_work(runtime: &Runtime, args: WaitArgs) -> WaitResponse {
-    let timeout = Duration::from_secs(args.timeout_secs.unwrap_or(60).min(300));
-    let started_at = Instant::now();
+pub async fn wait_for_work(runtime: &Runtime, args: WaitArgs) -> Result<WaitResponse, WaitError> {
+    // ... validate role, session_id, author_label, repo ...
     let mut rx = runtime.subscribe_events();
-
-    // Immediate return path.
-    let initial = compute_matches(runtime, &args).await;
-    if !initial.is_empty() {
-        return WaitResponse { matches: initial, timed_out: false };
+    if let Some(w) = compute_match(runtime, &repo, &session_id, role, &author).await? {
+        return Ok(WaitResponse::Work { work: w.work.into(), locations: w.locations });
     }
-
-    // Block on events until match or timeout.
-    let deadline = started_at + timeout;
+    let deadline = Instant::now() + timeout;
     loop {
         let remaining = deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
-            return WaitResponse { matches: vec![], timed_out: true };
-        }
+        if remaining.is_zero() { return Ok(WaitResponse::Timeout { timed_out: true }); }
         match tokio::time::timeout(remaining, rx.recv()).await {
-            Ok(Ok(_event)) => {
-                let next = compute_matches(runtime, &args).await;
-                if !next.is_empty() {
-                    return WaitResponse { matches: next, timed_out: false };
+            Ok(Ok(_)) | Ok(Err(broadcast::error::RecvError::Lagged(_))) => {
+                if let Some(w) = compute_match(runtime, &repo, &session_id, role, &author).await? {
+                    return Ok(WaitResponse::Work { work: w.work.into(), locations: w.locations });
                 }
-                // No match yet; keep waiting.
             }
-            Ok(Err(_lagged_or_closed)) => {
-                // Lagged or closed — resubscribe and continue.
-                rx = runtime.subscribe_events();
-            }
-            Err(_elapsed) => {
-                return WaitResponse { matches: vec![], timed_out: true };
+            Ok(Err(broadcast::error::RecvError::Closed)) | Err(_) => {
+                return Ok(WaitResponse::Timeout { timed_out: true });
             }
         }
     }
 }
 ```
 
-### Lock boundary for `compute_matches`
+### Lock boundary for `compute_match`
 
-The matcher must consider `plan_worktree_status` correctly — the master waits on `commit_plan_revision` / `commit_done_move` / `restore_or_commit_done_move` are all worktree-state-driven, and missing those wakeups defeats the tool. But `plan_worktree_status` is a disk read (compare working-tree plan body to HEAD's blob hash). We can't do disk reads under the runtime mutex without blocking watchers and other handlers.
+The matcher must consider `plan_worktree_status` correctly — the master waits on `commit_plan_revision` / `commit_done_move` / `restore_or_commit_done_move` are all worktree-state-driven, and missing those wake-ups defeats the tool. But `plan_worktree_status` is a disk read (compare working-tree plan body to HEAD's blob hash). We can't do disk reads under the runtime mutex without blocking watchers and other handlers.
 
-**Solution — snapshot under lock, compute outside.** Two phases:
+**Solution — snapshot under lock, compute outside.** Three phases:
 
 ```rust
-struct Candidate {
-    repo_root: PathBuf,
-    repo_state_clone: RepoStateSummary, // small, just identifiers + gate state
-    session_id: SessionId,
-    session_clone: SessionSummary,       // body_hash, plan_path, feedback lists
-}
-
-async fn compute_matches(runtime: &Runtime, args: &WaitArgs) -> Vec<Match> {
-    // Phase 1: under lock, collect candidates + the cheap derived bits.
-    let candidates = {
+async fn compute_match(
+    runtime: &Runtime,
+    repo: &Path,
+    session_id: &SessionId,
+    role: WaitingRole,
+    author: &AgentLabel,
+) -> Result<Option<WorkItem>, WaitError> {
+    // Phase 1: under lock, snapshot the candidate.
+    let candidate = {
         let trinity = runtime.state().lock().await;
-        collect_candidates(&trinity, args)
+        collect_candidate(&trinity, repo, session_id)
     };
-    // Lock released here.
+    let Some(candidate) = candidate else { return Err(WaitError::UnknownSession(...)) };
 
-    // Phase 2: per-candidate disk reads (outside lock).
-    let with_status: Vec<(Candidate, PlanWorktreeStatus)> = candidates
-        .into_iter()
-        .map(|c| {
-            let status = compute_plan_worktree_status(&c.repo_root, &c.session_clone);
-            (c, status)
-        })
-        .collect();
+    // Phase 2: disk read (outside lock).
+    let status = compute_plan_worktree_status_parts(&candidate.repo_root, &candidate.plan_path, &candidate.body_hash)?;
 
-    // Phase 3: pure matching against the materialized inputs.
-    match_candidates(&with_status, args)
-}
-
-/// Pure inner matcher. No I/O, no locks. Takes already-resolved candidates +
-/// their `plan_worktree_status` and returns the response matches.
-fn match_candidates(input: &[(Candidate, PlanWorktreeStatus)], args: &WaitArgs) -> Vec<Match> {
-    let mut out = Vec::new();
-    for (cand, status) in input {
-        let w = projection::waiting_on(
-            cand.session_clone.phase,
-            *status,
-            cand.session_clone.plan_gate.as_ref(),
-            cand.session_clone.impl_gate.as_ref(),
-        );
-        if w.role.as_str() != args.role {
-            continue;
-        }
-        if matches!(args.role.as_str(), "reviewers")
-            && args.exclude_authors.iter().any(|a| cand.session_clone.has_current_verdict_from(a))
-        {
-            continue;
-        }
-        out.push(Match {
-            repo: cand.repo_root.to_string_lossy().into_owned(),
-            session_id: cand.session_id.as_str().to_string(),
-            reason: w.reason.as_str().to_string(),
-        });
-    }
-    out
-}
-
-fn collect_candidates(trinity: &Trinity, args: &WaitArgs) -> Vec<Candidate> {
-    let mut out = Vec::new();
-    let canonical_filter = args.repo.as_ref().map(canonical_repo_path);
-    for (repo_root, repo_state) in &trinity.repos {
-        if let Some(filter) = &canonical_filter
-            && filter != repo_root
-        {
-            continue;
-        }
-        for (session_id, session) in &repo_state.sessions {
-            if let Some(filter_sid) = &args.session_id
-                && filter_sid.as_str() != session_id.as_str()
-            {
-                continue;
-            }
-            let phase = projection::phase(session, &repo_state.attribution);
-            let plan_gate = projection::plan_gate_for(session, repo_state);
-            let impl_gate = projection::impl_gate_for(session, repo_state);
-            out.push(Candidate {
-                repo_root: repo_root.clone(),
-                session_id: session_id.clone(),
-                session_clone: SessionSummary {
-                    body_hash: session.body_hash.clone(),
-                    plan_path: session.plan_path.clone(),
-                    phase,
-                    plan_gate,
-                    impl_gate,
-                    // ...verdict-author lookups precomputed for exclude_authors
-                },
-                ..
-            });
-        }
-    }
-    out
+    // Phase 3: pure derivation.
+    let w = projection::waiting_on(candidate.session_phase, status, candidate.plan_gate.as_ref(), candidate.impl_gate.as_ref());
+    if w.role != role { return Ok(None); }
+    Ok(Some(WorkItem {
+        work: projection::expected_action(w.reason),
+        locations: derive_locations(&candidate, w.reason, author),
+    }))
 }
 ```
 
-**Lock-held cost**: one pass over `(repo, session)` pairs, plus a `plan_gate_for` / `impl_gate_for` call per session. Each gate-derivation is a small BTreeMap walk over `plan_feedback` / `impl_feedback`. For ≤10 sessions per repo, sub-millisecond. The lock is held briefly even with many repos.
+`Candidate` carries the cheap, lock-friendly fields: `repo_root`, `session_id`, `plan_path`, `body_hash`, `session_phase`, `plan_gate`, `impl_gate`, `plan_target`, `impl_target`. `derive_locations` is a pure function over the candidate + reason + author.
 
-**Outside-lock cost**: one `compute_plan_worktree_status` per candidate = one `git show HEAD:<plan_path>` (cached blob hash already on `Session`) + one `fs::read(<plan_path>)`. Both are fast (<5ms each), parallelizable if it ever matters.
+**Lock-held cost**: one repo + session lookup, plus `plan_gate_for` / `impl_gate_for` (a small BTreeMap walk over `plan_feedback` / `impl_feedback`) and the two latest-commit walks. Sub-millisecond.
 
-**Why not cache `plan_worktree_status` on `Session`?** The plan's existing rule says plan_worktree_status is a derived projection computed at every read — `Session` never stores it. Caching it on `RepoState` would invert that invariant and require explicit invalidation on file edits. The watcher's `PlanFileChanged` event already drives a broadcast that triggers `compute_matches` re-runs; the disk read is cheap enough that "recompute each time" beats "cache + invalidate."
+**Outside-lock cost**: one `compute_plan_worktree_status_parts` per poll = one `fs::read(<plan_path>)`. Fast (<5ms).
 
-**`projection` module additions.** Moving `plan_gate_for`, `impl_gate_for`, and `waiting_on` from `mcp_response.rs` to `projection.rs` is a prerequisite (code-org only, no behavior change). Part of Phase 1.
+**`projection` module additions.** `plan_gate_for`, `impl_gate_for`, `all_plan_revisions`, `all_implementation_commits`, `latest_plan_touching_commit`, `latest_impl_commit`, and `expected_action` live in `projection.rs` so `wait.rs` and `mcp_response.rs` share them.
 
-The MCP dispatcher (`src/server/mcp.rs`) gets a new tool entry that deserializes args and calls into `wait_for_work`. The HTTP route (`src/server/http.rs`) adds `POST /api/wait_for_work` that does the same.
+The MCP dispatcher (`src/server/mcp.rs`) gets a new tool entry that deserializes args, fills `repo` from cwd if absent, and calls into `wait_for_work`. The HTTP route (`src/server/http.rs`) adds `POST /api/wait_for_work` with the same body shape; it returns 400 if `repo` is absent.
 
-## Prerequisite: `repo` arg on `get_context` and `list_sessions`
+## Repo arg on `get_context`
 
-`wait_for_work` can return a match in *any* watched repo, not just the caller's cwd-repo. The agent's follow-up `get_context({ repo: match.repo, session_id: match.session_id })` requires `get_context` to accept the repo explicitly — currently it resolves the repo from `req.cwd` via `git rev-parse --show-toplevel`.
+`get_context` accepts an optional `repo` (absolute path). When set, canonicalize and look up; otherwise fall back to `req.cwd` resolution. Same `dunce::canonicalize` normalization the runtime already uses for `add_repo` / `read_repo`.
 
-Add an optional `repo` arg to both tools:
-
-- `get_context({ session_id, author_label?, repo? })` — when `repo` is provided, canonicalize and look up; otherwise fall back to `req.cwd` resolution.
-- `list_sessions({ repo? })` — when set, return only that repo's sessions; otherwise all known repos.
-
-Schema update in `src/tools.rs`; dispatcher update in `src/server/mcp.rs`. Same `dunce::canonicalize` normalization the runtime already uses for `add_repo` / `read_repo`. Phase 1 of this plan includes the change.
+`list_sessions` keeps its current cwd-repo default (a single agent works in one repo). The `repo` arg is optional for the rare case of inspecting another watched repo.
 
 ## Tool catalog update
 
-Add `wait_for_work` to `src/tools.rs` catalog so the MCP shim advertises it. Tool count goes from 4 to 5. `get_context` and `list_sessions` schemas updated to include optional `repo`.
-
-```rust
-ToolDescriptor {
-    name: "wait_for_work".to_string(),
-    description: "Block until a session needs your role's attention... [see Tool shape above].",
-    input_schema: json!({ "type": "object", "required": ["role"], "properties": { ... } }),
-}
-```
+Add `wait_for_work` to `src/tools.rs` catalog so the MCP shim advertises it. Tool count goes from 4 to 5. `get_context` updated to include optional `repo`.
 
 ## MCP shim plumbing
 
-The stdio shim already forwards arbitrary tool calls to `/internal/tool_call`. **Two concerns** for long-poll over the shim:
+The stdio shim already forwards arbitrary tool calls to `/internal/tool_call`. **Two concerns** for long-poll:
 
-1. **Default request timeout.** The shim builds a `reqwest::Client` with `Duration::from_secs(120)`. Long-poll calls can run up to 300 seconds. Bump per-tool: when `tool == "wait_for_work"`, use `arguments.timeout_secs + 30s` as the request timeout (server timeout + grace).
+1. **Default request timeout.** The shim builds a `reqwest::Client` with `Duration::from_secs(120)`. Long-poll calls can run up to 300 seconds. Per-tool override: when `tool == "wait_for_work"`, set the per-request timeout to `args.timeout_secs + 30s`.
 
-2. **MCP client timeout.** Some MCP host clients (e.g. Claude Code) have their own tool-call timeout. Document: callers can shorten `timeout_secs` to fit. Default 60s is below typical MCP client thresholds.
+2. **`author_label` autofill.** Extend `label_arg_for` so `wait_for_work` participates in the existing cache-on-first-use mechanism (same as `get_context`). Callers pass it once; subsequent calls inherit.
 
-The shim is otherwise unchanged.
+3. **MCP client timeout.** Some MCP host clients (e.g. Claude Code) have their own tool-call timeout. Document: callers can shorten `timeout_secs` to fit. Default 60s is below typical MCP client thresholds.
 
 ## Acceptance criteria
 
-- `wait_for_work` returns immediately when matching state exists at entry (no needless blocking).
-- `wait_for_work` returns within one debounce window after an event changes a session's `waiting_on.role` to the caller's role.
-- `wait_for_work` honors the `repo` and `session_id` filters strictly.
-- `wait_for_work` with `role: "reviewers"` and `exclude_authors: ["codex"]` skips sessions where codex already left a current verdict, even if other agents still need to review.
-- `timeout_secs` is honored exactly. Returns `timed_out: true` with `matches: []` on the boundary.
-- HTTP endpoint and MCP dispatch produce byte-identical JSON responses for the same inputs.
-- Concurrent waits (multiple agents polling at once) all unblock on a single event when their filters match. tokio::sync::broadcast handles fan-out.
+- `wait_for_work` returns immediately when matching state exists at entry.
+- `wait_for_work` returns within one debounce window after an event changes the named session's `waiting_on.role` to the caller's role.
+- `work` matches `expected_action(waiting_on.reason)` exactly.
+- `locations` for `review_*` is the single canonical write path with the caller's `author_label` baked in.
+- `locations` for `address_*_request_changes` lists every RC feedback file on the current target, in deterministic order; plan-phase adds the plan file at the end.
+- Unknown `session_id` returns a `not found` error (does not block).
+- Missing required fields return `400` over HTTP and the equivalent `invalid` error over MCP.
+- `timeout_secs` is honored exactly. Returns `{timed_out: true}` on the boundary.
+- HTTP endpoint and MCP dispatch produce byte-identical JSON responses for the same inputs (modulo MCP's `{result: ...}` envelope).
 
 ## Tests
 
-Pure (`match_candidates` against synthetic `Vec<(Candidate, PlanWorktreeStatus)>`):
-- Empty input → no matches.
-- One candidate, role matches → one match.
-- One candidate, role doesn't match → empty.
-- Multiple candidates across two repo roots, `repo` filter pre-applied in `collect_candidates` → only that repo's matches (the pure matcher doesn't re-filter; the test exercises pass-through).
-- `exclude_authors` drops sessions where the listed author is already a participant in the current target's gate.
-- `PlanWorktreeStatus::BodyDirty` on an implementing-ready session yields the expected `commit_plan_revision` / `commit_done_move` master match (the case that motivated the disk-read split — easy to cover here since the pure matcher takes status as input).
+Pure (`derive_locations` + `parse_role` against synthetic candidates):
+- `review_plan` returns the canonical write path with the requested author baked in.
+- `review_impl` uses the impl target SHA.
+- `review_plan` returns empty when there's no plan target (defensive).
+- `address_plan_request_changes` lists every RC author's feedback file, then the plan file.
+- `address_impl_request_changes` lists every RC author's feedback file (no plan file).
+- `commit_plan_revision` / `ready_to_finish` / `ready_to_implement` return the plan file.
+- `session_done` returns empty locations.
+- `parse_role` accepts `master` / `reviewers`, rejects everything else (including `reviewer` singular).
 
-Fixture (`collect_candidates` + `compute_plan_worktree_status` together via tempdir):
-- One synthetic repo with a committed plan file and a dirty working copy → `compute_matches` returns a master match with the correct dirty-reason.
-- Clean working copy → no master dirty-reason match.
+Integration (against a real `Runtime` over tempdir git repos):
+- **Immediate review_plan after first commit.** New session, no reviews → `review_plan` with the canonical write path.
+- **`body_dirty` yields `commit_plan_revision`.** The disk-read split exists for this case: in-memory state thinks the plan is clean, but the working copy has uncommitted edits.
+- **`address_plan_request_changes` lists RC files + plan file.** Two RC feedbacks land via `FeedbackWritten` signals; the response lists both in deterministic order then the plan file.
+- **Timeout.** Polling `master` while only reviewers have work → `{timed_out: true}` after `timeout_secs`.
+- **Wakes on `PlanFileChanged`.** Spawn the wait; while blocked, edit the plan + dispatch `PlanFileChanged`; the wait returns with `commit_plan_revision`.
+- **Unknown session** errors with `WaitError::UnknownSession`.
+- **Missing repo / author_label** errors with `WaitError::MissingRepo` / `WaitError::MissingAuthorLabel`.
 
-These two tempdir tests verify the I/O glue once; the pure matcher gets exhaustive coverage without disk.
-
-Integration (against a running runtime + broadcast). Each test pins a single crisp transition so the wake-up cause is unambiguous:
-
-- **Wake on new plan revision needing review**: state starts with one session in implementing/ready_to_finish (waiting on master). Spawn `wait_for_work({ role: "reviewers" })`. While blocked, commit a new plan revision against another session that lands it in `plan_needs_initial_review` (waiting on reviewers). Assert the wait returns within 2s with that session in `matches`.
-- **Wake on REQUEST_CHANGES moving the role to master**: state has a session in `plan_needs_initial_review`. Spawn `wait_for_work({ role: "master" })`. While blocked, drop a feedback file with `REQUEST_CHANGES` for the current plan target. Assert the wait returns within 2s with that session in `matches` and `reason: "address_plan_request_changes"`.
-- **exclude_authors skips self-reviewed sessions**: same setup as the first test, but the polling caller is alice and alice already wrote an APPROVE for the current target. Wait should NOT return for that session.
-- **Timeout**: spawn the wait, don't deliver any event. After `timeout_secs` (set to 1s), the wait returns `{ matches: [], timed_out: true }`.
-- **Fan-out**: two concurrent waits with the same filter. Deliver one event that creates a match. Both unblock with the same `matches`.
-
-End-to-end (HTTP):
-- Curl `POST /api/wait_for_work` with `timeout_secs: 1` against an idle daemon. Response = `{ matches: [], timed_out: true }` after ~1s.
+End-to-end (live daemon):
+- `POST /api/wait_for_work` with `timeout_secs: 1` against an idle daemon returns `{timed_out: true}` after ~1s.
+- Same request against a session in `ready_to_finish` returns `{work: "move_to_done", locations: [<plan file>]}`.
 
 ## Non-goals
 
-- **No push beyond what the runtime already broadcasts.** If a new event type is needed (e.g. for cross-repo notifications), add it to the broadcast separately; this tool subscribes to whatever's there.
-- **No persistent queue.** If two agents call `wait_for_work` at the same moment a single match appears, both unblock with the same match. They coordinate via "who writes the feedback file first" + Trinity's auto-organize. No reservation, no exclusive ownership.
-- **No per-agent identity.** The caller is anonymous from Trinity's POV. `exclude_authors` is a hint, not enforcement.
-- **No streaming partial matches.** One request → one response, then the caller calls again. Server doesn't push incremental updates inside a single wait.
+- **No multi-session matches.** One request → one session. Callers run multiple `wait_for_work` calls in parallel if they want to watch several sessions.
+- **No cross-repo matches.** One request → one repo. An agent's shell is repo-scoped.
+- **No push beyond what the runtime already broadcasts.** If a new event type is needed, add it to the broadcast separately; this tool subscribes to whatever's there.
+- **No persistent queue.** If two agents call `wait_for_work` at the same moment a single match appears, both unblock with the same work item. They coordinate via "who writes the feedback file first" + Trinity's auto-organize.
+- **No streaming partial matches.** One request → one response, then the caller calls again.
 - **No webhook delivery.** Agents pull; daemon doesn't push to external URLs.
 
 ## Risks
 
 - **Connection / tool-call timeouts.** The MCP host or HTTP proxy in front of the daemon may cut connections under 300s. Mitigation: default 60s; document the tradeoff.
-- **Broadcast lag.** `tokio::sync::broadcast` with a 256-slot buffer drops messages if a slow subscriber falls behind. We resubscribe on lag, then re-compute matches from current state — so we may miss intermediate events but won't miss the final state. Acceptable.
-- **Match thrash on noisy repos.** Many file watcher events firing rapidly could re-trigger compute_matches in a tight loop. Each compute is one mutex lock + small map walk; with ≤10 sessions per repo it's negligible. Add tracing if it becomes a problem.
+- **Broadcast lag.** `tokio::sync::broadcast` with a 256-slot buffer drops messages if a slow subscriber falls behind. We resubscribe on lag, then re-compute from current state — so we may miss intermediate events but won't miss the final state. Acceptable.
+- **Match thrash on noisy repos.** Many file watcher events firing rapidly could re-trigger `compute_match` in a tight loop. Each compute is one mutex lock + small map walk + one disk read; with ≤10 sessions per repo and bounded disk I/O it's negligible.
 
 ## Open questions
 
-- **Role naming.** The plan's case table uses `master` / `reviewers` / `none`. We use the same strings here. Should `none` be acceptable in the request as a way to "block until everything is idle"? Probably not — leave it out of the schema.
-- **Wake-on-no-change.** If a session was already in `master` waiting state when the agent's previous tool call ran (say, `get_context`), should the next `wait_for_work({ role: "master" })` return immediately or block waiting for a state change? **Return immediately** — the immediate-return path handles this. The agent is responsible for taking the action; if they call again without doing the work, they'll see the same match.
+- **Wake-on-no-change.** If the session is already in the caller's role state when they call `wait_for_work`, the immediate-return path fires the same work item. The caller is responsible for taking the action; if they call again without doing the work, they'll see the same response. Document, don't fight.
+- **Per-author location ordering for `address_*_request_changes`.** Today it's BTreeMap iteration order over `(target_sha, author)` keys → sorted by author name. Stable, deterministic, good enough.

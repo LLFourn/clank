@@ -325,6 +325,26 @@ fn derive_gate_from_feedback(
     }
 }
 
+/// Map a `WaitingReason` to the caller-facing action verb that names
+/// what the agent should actually do. Shared by MCP responses, the
+/// `wait_for_work` `work` field, and the web UI so the vocabulary stays
+/// in one place. All imperatives — read as "(go) X".
+pub fn expected_action(reason: WaitingReason) -> &'static str {
+    use WaitingReason::*;
+    match reason {
+        SessionDone => "none",
+        CommitDoneMove => "commit_done_move",
+        RestoreOrCommitDoneMove => "restore_or_commit_done_move",
+        CommitPlanRevision => "commit_plan_revision",
+        AddressPlanRequestChanges => "address_plan_request_changes",
+        ReadyToImplement => "implement_and_commit",
+        PlanNeedsInitialReview | PlanNeedsRereview => "review_plan",
+        AddressImplRequestChanges => "address_impl_request_changes",
+        ReadyToFinish => "move_to_done",
+        ImplNeedsInitialReview | ImplNeedsRereview => "review_impl",
+    }
+}
+
 fn make(role: WaitingRole, reason: WaitingReason, agents: Vec<crate::lifecycle::AgentLabel>) -> WaitingOn {
     let description = description_for(role, reason, &agents);
     WaitingOn {

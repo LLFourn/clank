@@ -1,27 +1,31 @@
-//! `wait_for_work` long-poll: block until a session needs the caller's role.
+//! `wait_for_work` long-poll: block until one session needs the caller's
+//! role, then return the work + locations to act on.
 //!
-//! Snapshot under the runtime mutex, release the lock, then compute the
-//! per-candidate `plan_worktree_status` from disk and run the pure matcher.
-//! This is the lock-boundary fix from the plan: status is disk-derived, so
-//! holding the mutex while we hit the filesystem would block watchers and
-//! other handlers.
+//! Single-session focus: the caller names `session_id` (and implicitly or
+//! explicitly the `repo`) so the response is always for one plan in one
+//! repo — no fan-out, no cross-repo. The response carries `work` (an
+//! imperative action verb) plus `locations` (the repo-relative paths the
+//! caller should read or write to do that work).
 //!
-//! Wire response is intentionally minimal — `{repo, session_id, reason}`
-//! per match. Agents follow up with `get_context({repo, session_id})` for
-//! the one they pick. The lean shape keeps loop context small.
+//! Lock boundary: snapshot the session's identifiers and cheap gate state
+//! under the runtime mutex, release the lock, then per-poll read
+//! `plan_worktree_status` from disk and derive `waiting_on`. Status-driven
+//! master waits (commit_plan_revision, commit_done_move, etc.) stay
+//! correct without holding the mutex across disk I/O.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast::error::RecvError;
 
-use crate::lifecycle::{ContentHash, SessionId};
+use crate::lifecycle::{AgentLabel, CommitSha, ContentHash, SessionId};
 use crate::mcp_response::compute_plan_worktree_status_parts;
-use crate::projection::{impl_gate_for, phase, plan_gate_for, waiting_on};
-use crate::repo_state::{
-    Phase, PlanWorktreeStatus, Trinity, WaitingReason, WaitingRole,
+use crate::projection::{
+    expected_action, impl_gate_for, latest_impl_commit, latest_plan_touching_commit, phase,
+    plan_gate_for, waiting_on,
 };
+use crate::repo_state::{Phase, Trinity, WaitingReason, WaitingRole};
 use crate::review_state::ReviewGateDecision;
 use crate::runtime::Runtime;
 
@@ -31,41 +35,66 @@ const MAX_TIMEOUT_SECS: u64 = 300;
 #[derive(Debug, Deserialize)]
 pub struct WaitArgs {
     pub role: String,
+    pub session_id: String,
+    pub author_label: String,
+    /// Optional. The MCP dispatcher fills it from the caller's cwd when
+    /// absent; the HTTP route rejects the request if absent.
     #[serde(default)]
     pub repo: Option<String>,
-    #[serde(default)]
-    pub session_id: Option<String>,
-    #[serde(default)]
-    pub exclude_authors: Vec<String>,
     #[serde(default)]
     pub timeout_secs: Option<u64>,
 }
 
-#[derive(Debug, Serialize)]
-pub struct WaitResponse {
-    pub matches: Vec<Match>,
-    pub timed_out: bool,
-}
-
 #[derive(Debug, Clone, Serialize)]
-pub struct Match {
-    pub repo: String,
-    pub session_id: String,
-    pub reason: String,
+#[serde(untagged)]
+pub enum WaitResponse {
+    Work {
+        /// Imperative action verb naming what the caller should do, e.g.
+        /// `review_impl`, `address_plan_request_changes`. Matches the
+        /// `expected_action` vocabulary from the projection layer.
+        work: String,
+        /// Repo-relative paths the caller should read or write. Meaning
+        /// depends on `work` — see the per-action mapping in the tool
+        /// description.
+        locations: Vec<String>,
+    },
+    Timeout {
+        timed_out: bool,
+    },
 }
 
 #[derive(Debug, thiserror::Error)]
 pub enum WaitError {
     #[error("invalid role: {0} (expected `master` or `reviewers`)")]
     InvalidRole(String),
+    #[error("session_id is required")]
+    MissingSessionId,
+    #[error("author_label is required")]
+    MissingAuthorLabel,
+    #[error("repo is required (HTTP) or could not be resolved from cwd (MCP)")]
+    MissingRepo,
+    #[error("session not found in repo: {0}")]
+    UnknownSession(String),
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
 }
 
-/// Block until at least one session needs the caller's role, then return
-/// matches. Returns `{matches: [], timed_out: true}` after `timeout_secs`.
+/// Block until the named session in the named repo needs the caller's
+/// role. Returns the work + locations to act on. After `timeout_secs`
+/// returns `{timed_out: true}` with no work.
 pub async fn wait_for_work(runtime: &Runtime, args: WaitArgs) -> Result<WaitResponse, WaitError> {
     let role = parse_role(&args.role)?;
+    if args.session_id.is_empty() {
+        return Err(WaitError::MissingSessionId);
+    }
+    if args.author_label.is_empty() {
+        return Err(WaitError::MissingAuthorLabel);
+    }
+    let repo_str = args.repo.as_ref().ok_or(WaitError::MissingRepo)?;
+    let repo = dunce::canonicalize(repo_str).unwrap_or_else(|_| PathBuf::from(repo_str));
+    let session_id = SessionId::from(args.session_id.clone());
+    let author = AgentLabel::from(args.author_label.clone());
+
     let timeout = Duration::from_secs(
         args.timeout_secs
             .unwrap_or(DEFAULT_TIMEOUT_SECS)
@@ -74,11 +103,10 @@ pub async fn wait_for_work(runtime: &Runtime, args: WaitArgs) -> Result<WaitResp
     let started_at = Instant::now();
     let mut rx = runtime.subscribe_events();
 
-    let initial = compute_matches(runtime, &args, role).await?;
-    if !initial.is_empty() {
-        return Ok(WaitResponse {
-            matches: initial,
-            timed_out: false,
+    if let Some(work) = compute_match(runtime, &repo, &session_id, role, &author).await? {
+        return Ok(WaitResponse::Work {
+            work: work.work.to_string(),
+            locations: work.locations,
         });
     }
 
@@ -86,42 +114,32 @@ pub async fn wait_for_work(runtime: &Runtime, args: WaitArgs) -> Result<WaitResp
     loop {
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
-            return Ok(WaitResponse {
-                matches: Vec::new(),
-                timed_out: true,
-            });
+            return Ok(WaitResponse::Timeout { timed_out: true });
         }
         match tokio::time::timeout(remaining, rx.recv()).await {
             Ok(Ok(_event)) => {
-                let next = compute_matches(runtime, &args, role).await?;
-                if !next.is_empty() {
-                    return Ok(WaitResponse {
-                        matches: next,
-                        timed_out: false,
+                if let Some(work) =
+                    compute_match(runtime, &repo, &session_id, role, &author).await?
+                {
+                    return Ok(WaitResponse::Work {
+                        work: work.work.to_string(),
+                        locations: work.locations,
                     });
                 }
             }
             Ok(Err(RecvError::Lagged(_))) => {
                 rx = runtime.subscribe_events();
-                let next = compute_matches(runtime, &args, role).await?;
-                if !next.is_empty() {
-                    return Ok(WaitResponse {
-                        matches: next,
-                        timed_out: false,
+                if let Some(work) =
+                    compute_match(runtime, &repo, &session_id, role, &author).await?
+                {
+                    return Ok(WaitResponse::Work {
+                        work: work.work.to_string(),
+                        locations: work.locations,
                     });
                 }
             }
-            Ok(Err(RecvError::Closed)) => {
-                return Ok(WaitResponse {
-                    matches: Vec::new(),
-                    timed_out: true,
-                });
-            }
-            Err(_elapsed) => {
-                return Ok(WaitResponse {
-                    matches: Vec::new(),
-                    timed_out: true,
-                });
+            Ok(Err(RecvError::Closed)) | Err(_) => {
+                return Ok(WaitResponse::Timeout { timed_out: true });
             }
         }
     }
@@ -135,84 +153,117 @@ fn parse_role(s: &str) -> Result<WaitingRole, WaitError> {
     }
 }
 
-/// Snapshot candidates under the runtime mutex, release it, then per-
-/// candidate compute the worktree status from disk (no lock held) and
-/// hand the materialized inputs to the pure matcher.
-async fn compute_matches(
+#[derive(Debug, Clone)]
+struct WorkItem {
+    work: &'static str,
+    locations: Vec<String>,
+}
+
+/// Snapshot the candidate under lock, release, then disk-read
+/// `plan_worktree_status` and derive the work item if any.
+async fn compute_match(
     runtime: &Runtime,
-    args: &WaitArgs,
+    repo: &Path,
+    session_id: &SessionId,
     role: WaitingRole,
-) -> Result<Vec<Match>, WaitError> {
-    let candidates = {
+    author: &AgentLabel,
+) -> Result<Option<WorkItem>, WaitError> {
+    let candidate = {
         let trinity_arc = runtime.state();
         let trinity = trinity_arc.lock().await;
-        collect_candidates(&trinity, args)
+        collect_candidate(&trinity, repo, session_id)
+    };
+    let Some(candidate) = candidate else {
+        return Err(WaitError::UnknownSession(format!(
+            "{} in {}",
+            session_id.as_str(),
+            repo.display()
+        )));
     };
 
-    let mut with_status: Vec<(Candidate, PlanWorktreeStatus)> = Vec::with_capacity(candidates.len());
-    for c in candidates {
-        let status =
-            compute_plan_worktree_status_parts(&c.repo_root, &c.plan_path, &c.body_hash)?;
-        with_status.push((c, status));
+    let status =
+        compute_plan_worktree_status_parts(&candidate.repo_root, &candidate.plan_path, &candidate.body_hash)?;
+    let w = waiting_on(
+        candidate.session_phase,
+        status,
+        candidate.plan_gate.as_ref(),
+        candidate.impl_gate.as_ref(),
+    );
+    if w.role != role {
+        return Ok(None);
     }
-
-    Ok(match_candidates(&with_status, args, role))
+    let work = expected_action(w.reason);
+    let locations = derive_locations(&candidate, w.reason, author);
+    Ok(Some(WorkItem { work, locations }))
 }
 
-/// Pure inner matcher. Decides which `(candidate, status)` pairs match
-/// the caller's filters. No I/O, no locks.
-fn match_candidates(
-    input: &[(Candidate, PlanWorktreeStatus)],
-    args: &WaitArgs,
-    role: WaitingRole,
-) -> Vec<Match> {
-    let mut out = Vec::new();
-    for (cand, status) in input {
-        let w = waiting_on(
-            cand.session_phase,
-            *status,
-            cand.plan_gate.as_ref(),
-            cand.impl_gate.as_ref(),
-        );
-        if w.role != role {
-            continue;
-        }
-        if matches!(role, WaitingRole::Reviewers)
-            && !args.exclude_authors.is_empty()
-            && excluded_author_has_current_verdict(cand, w.reason, &args.exclude_authors)
-        {
-            continue;
-        }
-        out.push(Match {
-            repo: cand.repo_root.to_string_lossy().into_owned(),
-            session_id: cand.session_id.as_str().to_string(),
-            reason: w.reason.as_str().to_string(),
-        });
-    }
-    out
-}
-
-fn excluded_author_has_current_verdict(
+/// Produce the repo-relative paths to attach to the response. Meaning
+/// per work type:
+/// - `review_plan` / `review_impl`: the canonical file the caller should
+///   create at `.trinity/feedback/<sid>/<phase>/<sha>/<author>.md`.
+/// - `address_plan_request_changes`: every RC feedback file on the
+///   current plan target, plus the plan file (which the caller will
+///   revise).
+/// - `address_impl_request_changes`: every RC feedback file on the
+///   current impl target (the caller addresses these by changing code).
+/// - `commit_plan_revision` / `commit_done_move` /
+///   `restore_or_commit_done_move` / `implement_and_commit` /
+///   `move_to_done`: the plan file itself.
+fn derive_locations(
     cand: &Candidate,
     reason: WaitingReason,
-    excluded: &[String],
-) -> bool {
-    let gate = match reason {
+    author: &AgentLabel,
+) -> Vec<String> {
+    let plan_file = cand.plan_path.to_string_lossy().into_owned();
+    let sid = cand.session_id.as_str();
+
+    match reason {
         WaitingReason::PlanNeedsInitialReview | WaitingReason::PlanNeedsRereview => {
-            cand.plan_gate.as_ref()
+            let Some(target) = &cand.plan_target else { return Vec::new() };
+            vec![feedback_path(sid, "plan", target, author.as_str())]
         }
         WaitingReason::ImplNeedsInitialReview | WaitingReason::ImplNeedsRereview => {
-            cand.impl_gate.as_ref()
+            let Some(target) = &cand.impl_target else { return Vec::new() };
+            vec![feedback_path(sid, "impl", target, author.as_str())]
         }
-        _ => return false,
-    };
-    let Some(gate) = gate else { return false };
-    excluded.iter().any(|excluded_label| {
-        gate.approvals
-            .iter()
-            .chain(gate.request_changes.iter())
-            .any(|a| a.as_str() == excluded_label)
-    })
+        WaitingReason::AddressPlanRequestChanges => {
+            let mut out = rc_feedback_paths(cand.plan_target.as_ref(), cand.plan_gate.as_ref(), sid, "plan");
+            out.push(plan_file);
+            out
+        }
+        WaitingReason::AddressImplRequestChanges => {
+            rc_feedback_paths(cand.impl_target.as_ref(), cand.impl_gate.as_ref(), sid, "impl")
+        }
+        WaitingReason::CommitDoneMove
+        | WaitingReason::RestoreOrCommitDoneMove
+        | WaitingReason::CommitPlanRevision
+        | WaitingReason::ReadyToImplement
+        | WaitingReason::ReadyToFinish => vec![plan_file],
+        WaitingReason::SessionDone => Vec::new(),
+    }
+}
+
+fn feedback_path(sid: &str, phase: &str, target: &CommitSha, author: &str) -> String {
+    format!(
+        ".trinity/feedback/{}/{}/{}/{}.md",
+        sid,
+        phase,
+        target.as_str(),
+        author
+    )
+}
+
+fn rc_feedback_paths(
+    target: Option<&CommitSha>,
+    gate: Option<&ReviewGateDecision>,
+    sid: &str,
+    phase: &str,
+) -> Vec<String> {
+    let (Some(target), Some(gate)) = (target, gate) else { return Vec::new() };
+    gate.request_changes
+        .iter()
+        .map(|author| feedback_path(sid, phase, target, author.as_str()))
+        .collect()
 }
 
 #[derive(Debug, Clone)]
@@ -224,85 +275,38 @@ struct Candidate {
     session_phase: Phase,
     plan_gate: Option<ReviewGateDecision>,
     impl_gate: Option<ReviewGateDecision>,
+    plan_target: Option<CommitSha>,
+    impl_target: Option<CommitSha>,
 }
 
-/// Collect candidates from the current `Trinity` state. Cheap derivations
-/// only — no disk reads, no heavy walks beyond what `*_gate_for` already
-/// does over the in-memory feedback maps. Holds the caller's mutex
-/// implicitly via `&Trinity`; finish quickly.
-fn collect_candidates(trinity: &Trinity, args: &WaitArgs) -> Vec<Candidate> {
-    let canonical_filter: Option<PathBuf> = args.repo.as_ref().map(|p| {
-        let raw = PathBuf::from(p);
-        dunce::canonicalize(&raw).unwrap_or(raw)
-    });
-    let session_filter: Option<SessionId> = args
-        .session_id
-        .as_ref()
-        .map(|s| SessionId::from(s.clone()));
-
-    let mut out = Vec::new();
-    for (repo_root, repo_state) in &trinity.repos {
-        if let Some(filter) = &canonical_filter
-            && filter != repo_root
-        {
-            continue;
-        }
-        for (session_id, session) in &repo_state.sessions {
-            if let Some(sid_filter) = &session_filter
-                && sid_filter != session_id
-            {
-                continue;
-            }
-            out.push(Candidate {
-                repo_root: repo_root.clone(),
-                session_id: session_id.clone(),
-                plan_path: session.plan_path.clone(),
-                body_hash: session.body_hash.clone(),
-                session_phase: phase(session, &repo_state.attribution),
-                plan_gate: plan_gate_for(session, repo_state),
-                impl_gate: impl_gate_for(session, repo_state),
-            });
-        }
-    }
-    out
+fn collect_candidate(trinity: &Trinity, repo: &Path, session_id: &SessionId) -> Option<Candidate> {
+    let repo_state = trinity.repos.get(repo)?;
+    let session = repo_state.sessions.get(session_id)?;
+    Some(Candidate {
+        repo_root: repo.to_path_buf(),
+        session_id: session_id.clone(),
+        plan_path: session.plan_path.clone(),
+        body_hash: session.body_hash.clone(),
+        session_phase: phase(session, &repo_state.attribution),
+        plan_gate: plan_gate_for(session, repo_state),
+        impl_gate: impl_gate_for(session, repo_state),
+        plan_target: latest_plan_touching_commit(session, repo_state),
+        impl_target: latest_impl_commit(session, repo_state),
+    })
 }
 
 #[cfg(test)]
 mod tests {
+    //! Pure tests over `derive_locations` + `parse_role`. Lock-bound
+    //! orchestration (snapshot under mutex → disk read → match) gets
+    //! covered by `integration_tests`.
+
     use super::*;
-    use crate::lifecycle::{AgentLabel, content_hash};
+    use crate::lifecycle::content_hash;
     use crate::review_state::{ReviewGateDecision, ReviewGateState, ReviewPhase};
 
     fn agents(labels: &[&str]) -> Vec<AgentLabel> {
         labels.iter().map(|s| AgentLabel::from(*s)).collect()
-    }
-
-    fn args_role(role: &str) -> WaitArgs {
-        WaitArgs {
-            role: role.to_string(),
-            repo: None,
-            session_id: None,
-            exclude_authors: Vec::new(),
-            timeout_secs: None,
-        }
-    }
-
-    fn candidate(
-        repo: &str,
-        sid: &str,
-        session_phase: Phase,
-        plan_gate: Option<ReviewGateDecision>,
-        impl_gate: Option<ReviewGateDecision>,
-    ) -> Candidate {
-        Candidate {
-            repo_root: PathBuf::from(repo),
-            session_id: SessionId::from(sid),
-            plan_path: PathBuf::from(format!(".trinity/plans/{sid}.md")),
-            body_hash: content_hash("x"),
-            session_phase,
-            plan_gate,
-            impl_gate,
-        }
     }
 
     fn gate(
@@ -325,144 +329,110 @@ mod tests {
         }
     }
 
-    #[test]
-    fn empty_input_yields_no_matches() {
-        let out = match_candidates(&[], &args_role("master"), WaitingRole::Master);
-        assert!(out.is_empty());
-    }
-
-    #[test]
-    fn role_match_returns_match() {
-        // Planning + no participants → reviewers / plan_needs_initial_review.
-        let g = gate(
-            ReviewPhase::Plan,
-            ReviewGateState::NeedsReview,
-            Vec::new(),
-            Vec::new(),
-            Vec::new(),
-            Vec::new(),
-        );
-        let c = candidate("/r", "s", Phase::Planning, Some(g), None);
-        let input = vec![(c, PlanWorktreeStatus::Clean)];
-        let out = match_candidates(&input, &args_role("reviewers"), WaitingRole::Reviewers);
-        assert_eq!(out.len(), 1);
-        assert_eq!(out[0].repo, "/r");
-        assert_eq!(out[0].session_id, "s");
-        assert_eq!(out[0].reason, "plan_needs_initial_review");
-    }
-
-    #[test]
-    fn role_mismatch_filtered() {
-        let g = gate(
-            ReviewPhase::Plan,
-            ReviewGateState::NeedsReview,
-            Vec::new(),
-            Vec::new(),
-            Vec::new(),
-            Vec::new(),
-        );
-        let c = candidate("/r", "s", Phase::Planning, Some(g), None);
-        let input = vec![(c, PlanWorktreeStatus::Clean)];
-        // session waiting on reviewers; caller asks for master.
-        let out = match_candidates(&input, &args_role("master"), WaitingRole::Master);
-        assert!(out.is_empty());
-    }
-
-    #[test]
-    fn body_dirty_yields_commit_plan_revision_master_match() {
-        // BodyDirty preempts gate → master / commit_plan_revision regardless
-        // of plan_gate. This is the case the disk-read split exists for.
-        let g = gate(
-            ReviewPhase::Plan,
-            ReviewGateState::Ready,
-            agents(&["alice"]),
-            agents(&["alice"]),
-            Vec::new(),
-            Vec::new(),
-        );
-        let c = candidate("/r", "dirty", Phase::Planning, Some(g), None);
-        let input = vec![(c, PlanWorktreeStatus::BodyDirty)];
-        let out = match_candidates(&input, &args_role("master"), WaitingRole::Master);
-        assert_eq!(out.len(), 1);
-        assert_eq!(out[0].reason, "commit_plan_revision");
-    }
-
-    #[test]
-    fn exclude_authors_skips_session_when_excluded_has_current_verdict() {
-        // Two participants on plan target; only one has voted (so still
-        // needs_review). Caller excludes alice (who APPROVED). Should skip.
-        let g = gate(
-            ReviewPhase::Plan,
-            ReviewGateState::NeedsReview,
-            agents(&["alice", "bob"]),
-            agents(&["alice"]),
-            Vec::new(),
-            agents(&["bob"]),
-        );
-        let c = candidate("/r", "s", Phase::Planning, Some(g), None);
-        let input = vec![(c, PlanWorktreeStatus::Clean)];
-        let args = WaitArgs {
-            role: "reviewers".to_string(),
-            repo: None,
-            session_id: None,
-            exclude_authors: vec!["alice".to_string()],
-            timeout_secs: None,
-        };
-        let out = match_candidates(&input, &args, WaitingRole::Reviewers);
-        assert!(
-            out.is_empty(),
-            "alice already voted; should not wake alice's caller"
-        );
-    }
-
-    #[test]
-    fn exclude_authors_does_not_skip_when_excluded_has_not_voted() {
-        // Bob hasn't voted yet; caller excludes bob. The session is in
-        // initial-review (no participants), so bob's vote is still needed.
-        // Returning the match is correct — bob hasn't yet acted here.
-        let g = gate(
-            ReviewPhase::Plan,
-            ReviewGateState::NeedsReview,
-            Vec::new(),
-            Vec::new(),
-            Vec::new(),
-            Vec::new(),
-        );
-        let c = candidate("/r", "fresh", Phase::Planning, Some(g), None);
-        let input = vec![(c, PlanWorktreeStatus::Clean)];
-        let args = WaitArgs {
-            role: "reviewers".to_string(),
-            repo: None,
-            session_id: None,
-            exclude_authors: vec!["bob".to_string()],
-            timeout_secs: None,
-        };
-        let out = match_candidates(&input, &args, WaitingRole::Reviewers);
-        assert_eq!(out.len(), 1);
-    }
-
-    #[test]
-    fn done_move_pending_routes_to_master() {
-        let c = candidate("/r", "moved", Phase::Planning, None, None);
-        let input = vec![(c, PlanWorktreeStatus::DoneMovePending)];
-        let out = match_candidates(&input, &args_role("master"), WaitingRole::Master);
-        assert_eq!(out.len(), 1);
-        assert_eq!(out[0].reason, "commit_done_move");
-    }
-
-    #[test]
-    fn done_phase_never_matches() {
-        let c = candidate("/r", "done", Phase::Done, None, None);
-        let input = vec![(c, PlanWorktreeStatus::Clean)];
-        for role in [WaitingRole::Master, WaitingRole::Reviewers] {
-            let role_s = match role {
-                WaitingRole::Master => "master",
-                WaitingRole::Reviewers => "reviewers",
-                WaitingRole::None => unreachable!(),
-            };
-            let out = match_candidates(&input, &args_role(role_s), role);
-            assert!(out.is_empty(), "done session must not match role={role_s}");
+    fn cand(plan_target: Option<&str>, impl_target: Option<&str>) -> Candidate {
+        Candidate {
+            repo_root: PathBuf::from("/repo"),
+            session_id: SessionId::from("sid"),
+            plan_path: PathBuf::from(".trinity/plans/sid.md"),
+            body_hash: content_hash("x"),
+            session_phase: Phase::Planning,
+            plan_gate: None,
+            impl_gate: None,
+            plan_target: plan_target.map(CommitSha::from),
+            impl_target: impl_target.map(CommitSha::from),
         }
+    }
+
+    fn me() -> AgentLabel {
+        AgentLabel::from("codex")
+    }
+
+    #[test]
+    fn review_plan_location_is_canonical_write_path_for_caller() {
+        let c = cand(Some("abc123"), None);
+        let v = derive_locations(&c, WaitingReason::PlanNeedsInitialReview, &me());
+        assert_eq!(v, vec![".trinity/feedback/sid/plan/abc123/codex.md"]);
+    }
+
+    #[test]
+    fn review_impl_location_uses_impl_target() {
+        let c = cand(None, Some("def456"));
+        let v = derive_locations(&c, WaitingReason::ImplNeedsInitialReview, &me());
+        assert_eq!(v, vec![".trinity/feedback/sid/impl/def456/codex.md"]);
+    }
+
+    #[test]
+    fn review_plan_returns_empty_when_no_plan_target() {
+        let c = cand(None, None);
+        let v = derive_locations(&c, WaitingReason::PlanNeedsRereview, &me());
+        assert!(v.is_empty());
+    }
+
+    #[test]
+    fn address_plan_request_changes_lists_rc_files_then_plan() {
+        let g = gate(
+            ReviewPhase::Plan,
+            ReviewGateState::ChangesRequested,
+            agents(&["alice", "bob"]),
+            Vec::new(),
+            agents(&["alice", "bob"]),
+            Vec::new(),
+        );
+        let mut c = cand(Some("plan1"), None);
+        c.plan_gate = Some(g);
+        let v = derive_locations(&c, WaitingReason::AddressPlanRequestChanges, &me());
+        assert_eq!(
+            v,
+            vec![
+                ".trinity/feedback/sid/plan/plan1/alice.md",
+                ".trinity/feedback/sid/plan/plan1/bob.md",
+                ".trinity/plans/sid.md",
+            ]
+        );
+    }
+
+    #[test]
+    fn address_impl_request_changes_lists_rc_files_only() {
+        let g = gate(
+            ReviewPhase::Impl,
+            ReviewGateState::ChangesRequested,
+            agents(&["dana"]),
+            Vec::new(),
+            agents(&["dana"]),
+            Vec::new(),
+        );
+        let mut c = cand(None, Some("impl9"));
+        c.impl_gate = Some(g);
+        let v = derive_locations(&c, WaitingReason::AddressImplRequestChanges, &me());
+        assert_eq!(v, vec![".trinity/feedback/sid/impl/impl9/dana.md"]);
+    }
+
+    #[test]
+    fn commit_plan_revision_location_is_plan_file() {
+        let c = cand(None, None);
+        let v = derive_locations(&c, WaitingReason::CommitPlanRevision, &me());
+        assert_eq!(v, vec![".trinity/plans/sid.md"]);
+    }
+
+    #[test]
+    fn ready_to_finish_location_is_plan_file() {
+        let c = cand(None, None);
+        let v = derive_locations(&c, WaitingReason::ReadyToFinish, &me());
+        assert_eq!(v, vec![".trinity/plans/sid.md"]);
+    }
+
+    #[test]
+    fn ready_to_implement_location_is_plan_file() {
+        let c = cand(None, None);
+        let v = derive_locations(&c, WaitingReason::ReadyToImplement, &me());
+        assert_eq!(v, vec![".trinity/plans/sid.md"]);
+    }
+
+    #[test]
+    fn session_done_yields_no_locations() {
+        let c = cand(None, None);
+        let v = derive_locations(&c, WaitingReason::SessionDone, &me());
+        assert!(v.is_empty());
     }
 
     #[test]
@@ -481,17 +451,15 @@ mod tests {
 
 #[cfg(test)]
 mod integration_tests {
-    //! End-to-end tests using a real `Runtime`, real git tempdirs, and the
-    //! broadcast channel. These cover the I/O orchestration around the
-    //! pure matcher.
+    //! End-to-end against a real `Runtime` over tempdir git repos. Covers
+    //! the lock-snapshot-then-disk-read orchestration plus the
+    //! broadcast-driven wake-up path.
 
     use super::*;
     use crate::fs_watcher::FilesystemSignal;
-    use crate::lifecycle::CommitSha;
     use crate::runtime::Runtime;
     use std::path::Path;
     use std::process::Command;
-    use std::time::Duration;
 
     fn init_repo() -> tempfile::TempDir {
         let dir = tempfile::tempdir().unwrap();
@@ -526,106 +494,161 @@ mod integration_tests {
         run_git(repo, &["commit", "--quiet", "-m", msg]);
     }
 
-    fn args(role: &str) -> WaitArgs {
+    fn args(repo: &Path, role: &str, sid: &str, author: &str) -> WaitArgs {
         WaitArgs {
             role: role.to_string(),
-            repo: None,
-            session_id: None,
-            exclude_authors: Vec::new(),
+            session_id: sid.to_string(),
+            author_label: author.to_string(),
+            repo: Some(repo.to_string_lossy().into_owned()),
             timeout_secs: Some(2),
         }
     }
 
-    #[tokio::test]
-    async fn immediate_return_when_state_already_matches() {
-        // A freshly-committed plan with no reviews is already in
-        // `reviewers / plan_needs_initial_review` — wait_for_work should
-        // return without waiting for any event.
-        let dir = init_repo();
-        write_file(dir.path(), ".trinity/plans/foo.md", "# foo\n");
-        commit(dir.path(), "add foo");
+    fn expect_work(r: WaitResponse) -> (String, Vec<String>) {
+        match r {
+            WaitResponse::Work { work, locations } => (work, locations),
+            WaitResponse::Timeout { .. } => panic!("expected work, got timeout"),
+        }
+    }
 
-        let rt = Runtime::new();
-        rt.add_repo(dir.path().to_path_buf()).await.unwrap();
-
-        let start = std::time::Instant::now();
-        let resp = wait_for_work(&rt, args("reviewers")).await.unwrap();
-        assert!(start.elapsed() < Duration::from_millis(500));
-        assert!(!resp.timed_out);
-        assert_eq!(resp.matches.len(), 1);
-        assert_eq!(resp.matches[0].session_id, "foo");
-        assert_eq!(resp.matches[0].reason, "plan_needs_initial_review");
+    fn expect_timeout(r: WaitResponse) {
+        match r {
+            WaitResponse::Timeout { timed_out } => assert!(timed_out),
+            WaitResponse::Work { work, locations } => {
+                panic!("expected timeout, got work={work} locations={locations:?}")
+            }
+        }
     }
 
     #[tokio::test]
-    async fn body_dirty_immediately_matches_master() {
-        // The disk-read split exists for this case: the in-memory state
-        // says the plan is clean (HEAD blob matches body_hash), but the
-        // working tree has an uncommitted edit. compute_matches must read
-        // disk to see body_dirty and route to master.
+    async fn immediate_review_plan_after_first_commit() {
+        let dir = init_repo();
+        write_file(dir.path(), ".trinity/plans/foo.md", "# foo\n");
+        commit(dir.path(), "add foo");
+        let rt = Runtime::new();
+        rt.add_repo(dir.path().to_path_buf()).await.unwrap();
+
+        let resp = wait_for_work(&rt, args(dir.path(), "reviewers", "foo", "codex"))
+            .await
+            .unwrap();
+        let (work, locations) = expect_work(resp);
+        assert_eq!(work, "review_plan");
+        assert_eq!(locations.len(), 1);
+        assert!(
+            locations[0].starts_with(".trinity/feedback/foo/plan/"),
+            "got: {}",
+            locations[0]
+        );
+        assert!(locations[0].ends_with("/codex.md"));
+    }
+
+    #[tokio::test]
+    async fn body_dirty_yields_commit_plan_revision_for_master() {
         let dir = init_repo();
         write_file(dir.path(), ".trinity/plans/foo.md", "# foo v1\n");
         commit(dir.path(), "add foo");
-
         let rt = Runtime::new();
         rt.add_repo(dir.path().to_path_buf()).await.unwrap();
-
-        // Edit without committing — disk diverges from HEAD.
+        // Edit but don't commit.
         write_file(dir.path(), ".trinity/plans/foo.md", "# foo v2 uncommitted\n");
 
-        let resp = wait_for_work(&rt, args("master")).await.unwrap();
-        assert!(!resp.timed_out);
-        assert_eq!(resp.matches.len(), 1);
-        assert_eq!(resp.matches[0].reason, "commit_plan_revision");
+        let resp = wait_for_work(&rt, args(dir.path(), "master", "foo", "lloyd"))
+            .await
+            .unwrap();
+        let (work, locations) = expect_work(resp);
+        assert_eq!(work, "commit_plan_revision");
+        assert_eq!(locations, vec![".trinity/plans/foo.md".to_string()]);
     }
 
     #[tokio::test]
-    async fn timeout_returns_with_empty_matches() {
+    async fn address_plan_request_changes_lists_rc_then_plan_file() {
         let dir = init_repo();
         write_file(dir.path(), ".trinity/plans/foo.md", "# foo\n");
         commit(dir.path(), "add foo");
-
         let rt = Runtime::new();
         rt.add_repo(dir.path().to_path_buf()).await.unwrap();
 
-        // Only reviewers have work — caller is master. Should time out.
-        let mut a = args("master");
-        a.timeout_secs = Some(1);
-        let start = std::time::Instant::now();
-        let resp = wait_for_work(&rt, a).await.unwrap();
-        let elapsed = start.elapsed();
-        assert!(resp.timed_out);
-        assert!(resp.matches.is_empty());
-        assert!(
-            elapsed >= Duration::from_millis(900) && elapsed < Duration::from_secs(2),
-            "expected ~1s elapsed, got {elapsed:?}"
+        let intro: CommitSha = rt
+            .read_repo(dir.path(), |s| {
+                s.sessions[&SessionId::from("foo")].plan_intro.clone()
+            })
+            .await
+            .unwrap();
+        // Two RC feedbacks at the canonical path.
+        let bob_path = format!(".trinity/feedback/foo/plan/{}/bob.md", intro.as_str());
+        let dana_path = format!(".trinity/feedback/foo/plan/{}/dana.md", intro.as_str());
+        write_file(dir.path(), &bob_path, "REQUEST_CHANGES\n");
+        write_file(dir.path(), &dana_path, "REQUEST_CHANGES\n");
+        rt.handle_signal(
+            dir.path(),
+            FilesystemSignal::FeedbackWritten {
+                parsed: crate::disk_format::parse_feedback_path(&PathBuf::from(format!(
+                    "foo/plan/{}/bob.md",
+                    intro.as_str()
+                )))
+                .unwrap(),
+            },
+            1,
+        )
+        .await
+        .unwrap();
+        rt.handle_signal(
+            dir.path(),
+            FilesystemSignal::FeedbackWritten {
+                parsed: crate::disk_format::parse_feedback_path(&PathBuf::from(format!(
+                    "foo/plan/{}/dana.md",
+                    intro.as_str()
+                )))
+                .unwrap(),
+            },
+            1,
+        )
+        .await
+        .unwrap();
+
+        let resp = wait_for_work(&rt, args(dir.path(), "master", "foo", "lloyd"))
+            .await
+            .unwrap();
+        let (work, locations) = expect_work(resp);
+        assert_eq!(work, "address_plan_request_changes");
+        assert_eq!(
+            locations,
+            vec![bob_path, dana_path, ".trinity/plans/foo.md".to_string()]
         );
     }
 
     #[tokio::test]
+    async fn timeout_returns_timed_out_shape() {
+        let dir = init_repo();
+        write_file(dir.path(), ".trinity/plans/foo.md", "# foo\n");
+        commit(dir.path(), "add foo");
+        let rt = Runtime::new();
+        rt.add_repo(dir.path().to_path_buf()).await.unwrap();
+
+        // Polling master while only reviewers have work — should time out.
+        let mut a = args(dir.path(), "master", "foo", "lloyd");
+        a.timeout_secs = Some(1);
+        let resp = wait_for_work(&rt, a).await.unwrap();
+        expect_timeout(resp);
+    }
+
+    #[tokio::test]
     async fn wakes_on_plan_file_changed_event() {
-        // Caller polls for master work; nothing matches initially. Edit
-        // the plan file (without committing) and dispatch a
-        // PlanFileChanged signal — the broadcast fires and wait_for_work
-        // re-checks, sees body_dirty, returns a master match.
         let dir = init_repo();
         write_file(dir.path(), ".trinity/plans/foo.md", "# foo v1\n");
         commit(dir.path(), "add foo");
-
         let rt = std::sync::Arc::new(Runtime::new());
         rt.add_repo(dir.path().to_path_buf()).await.unwrap();
 
         let rt2 = std::sync::Arc::clone(&rt);
+        let repo = dir.path().to_path_buf();
         let join = tokio::spawn(async move {
-            let mut a = args("master");
+            let mut a = args(&repo, "master", "foo", "lloyd");
             a.timeout_secs = Some(5);
             wait_for_work(&rt2, a).await
         });
 
-        // Give the wait task time to enter the broadcast subscribe loop.
-        tokio::time::sleep(Duration::from_millis(150)).await;
-
-        // Make the plan dirty and tell the runtime.
+        tokio::time::sleep(Duration::from_millis(200)).await;
         write_file(dir.path(), ".trinity/plans/foo.md", "# foo v2 unsaved\n");
         rt.handle_signal(
             dir.path(),
@@ -640,245 +663,51 @@ mod integration_tests {
 
         let resp = tokio::time::timeout(Duration::from_secs(3), join)
             .await
-            .expect("wait_for_work didn't return in time")
+            .expect("wait_for_work didn't return")
             .unwrap()
             .unwrap();
-        assert!(!resp.timed_out);
-        assert_eq!(resp.matches.len(), 1);
-        assert_eq!(resp.matches[0].reason, "commit_plan_revision");
+        let (work, _) = expect_work(resp);
+        assert_eq!(work, "commit_plan_revision");
     }
 
     #[tokio::test]
-    async fn wakes_on_request_changes_feedback() {
-        // Caller polls for master. Start with a fresh plan (waiting on
-        // reviewers). Write a REQUEST_CHANGES feedback file → role flips
-        // to master with address_plan_request_changes.
+    async fn unknown_session_errors() {
         let dir = init_repo();
         write_file(dir.path(), ".trinity/plans/foo.md", "# foo\n");
         commit(dir.path(), "add foo");
-
-        let rt = std::sync::Arc::new(Runtime::new());
-        rt.add_repo(dir.path().to_path_buf()).await.unwrap();
-
-        let intro: CommitSha = rt
-            .read_repo(dir.path(), |s| {
-                s.sessions[&SessionId::from("foo")].plan_intro.clone()
-            })
-            .await
-            .unwrap();
-
-        let rt2 = std::sync::Arc::clone(&rt);
-        let join = tokio::spawn(async move {
-            let mut a = args("master");
-            a.timeout_secs = Some(5);
-            wait_for_work(&rt2, a).await
-        });
-
-        tokio::time::sleep(Duration::from_millis(150)).await;
-
-        // Drop a REQUEST_CHANGES feedback file at the canonical path.
-        let feedback_rel = format!(".trinity/feedback/foo/plan/{}/bob.md", intro.as_str());
-        write_file(
-            dir.path(),
-            &feedback_rel,
-            "REQUEST_CHANGES\n\nNeeds revision.\n",
-        );
-        let parsed_rel = PathBuf::from(format!("foo/plan/{}/bob.md", intro.as_str()));
-        let parsed = crate::disk_format::parse_feedback_path(&parsed_rel).unwrap();
-        rt.handle_signal(
-            dir.path(),
-            FilesystemSignal::FeedbackWritten { parsed },
-            1,
-        )
-        .await
-        .unwrap();
-
-        let resp = tokio::time::timeout(Duration::from_secs(3), join)
-            .await
-            .expect("wait_for_work didn't return in time")
-            .unwrap()
-            .unwrap();
-        assert!(!resp.timed_out);
-        assert_eq!(resp.matches.len(), 1);
-        assert_eq!(resp.matches[0].reason, "address_plan_request_changes");
-    }
-
-    #[tokio::test]
-    async fn exclude_authors_skips_session_in_runtime() {
-        // alice already APPROVED the current plan target; bob hasn't.
-        // Polling as reviewers with exclude_authors=["alice"] must NOT
-        // return this session (alice already acted; bob still needs to).
-        // The gate is in NeedsReview because bob is a stale participant.
-        let dir = init_repo();
-        write_file(dir.path(), ".trinity/plans/foo.md", "# foo\n");
-        commit(dir.path(), "add foo");
-
         let rt = Runtime::new();
         rt.add_repo(dir.path().to_path_buf()).await.unwrap();
 
-        let intro: CommitSha = rt
-            .read_repo(dir.path(), |s| {
-                s.sessions[&SessionId::from("foo")].plan_intro.clone()
-            })
-            .await
-            .unwrap();
-
-        // Make alice a participant by approving an earlier (here: same)
-        // target.  This puts the gate in Ready, which routes the role to
-        // master — not what we want. Instead seed alice's APPROVE and
-        // bob's prior APPROVE on a different target so they're both
-        // participants, then we bump the target. Simpler: just write
-        // alice's APPROVE; gate becomes Ready → master → reviewers role
-        // won't match anyway. So the test of exclude_authors needs a
-        // stale-participant setup.
-
-        // Setup: alice approves intro, then a new plan revision lands so
-        // alice's vote is stale and bob has never voted. To exercise
-        // exclude_authors, we need both alice and bob to have voted on
-        // an EARLIER target (so they're participants), and only alice to
-        // have re-voted on the current target.
-
-        // Round 1: both vote on intro.
-        let f_alice_intro = format!(".trinity/feedback/foo/plan/{}/alice.md", intro.as_str());
-        let f_bob_intro = format!(".trinity/feedback/foo/plan/{}/bob.md", intro.as_str());
-        write_file(dir.path(), &f_alice_intro, "APPROVE\n");
-        write_file(dir.path(), &f_bob_intro, "APPROVE\n");
-
-        // Push a new plan revision so the target SHA changes.
-        write_file(dir.path(), ".trinity/plans/foo.md", "# foo v2\n");
-        commit(dir.path(), "revise foo");
-        rt.handle_signal(dir.path(), FilesystemSignal::HeadChanged, 1)
-            .await
-            .unwrap();
-
-        // After rebuild, the target SHA is the new commit. alice + bob are
-        // participants, no one has voted yet on the new target → gate is
-        // NeedsReview with missing_approvals=[alice, bob].
-        // Now alice re-approves the new target.
-        let target: CommitSha = rt
-            .read_repo(dir.path(), |s| {
-                crate::projection::latest_plan_touching_commit(
-                    &s.sessions[&SessionId::from("foo")],
-                    s,
-                )
-                .unwrap()
-            })
-            .await
-            .unwrap();
-        let f_alice_v2 = format!(".trinity/feedback/foo/plan/{}/alice.md", target.as_str());
-        write_file(dir.path(), &f_alice_v2, "APPROVE\n");
-        let parsed_rel = PathBuf::from(format!("foo/plan/{}/alice.md", target.as_str()));
-        let parsed = crate::disk_format::parse_feedback_path(&parsed_rel).unwrap();
-        rt.handle_signal(
-            dir.path(),
-            FilesystemSignal::FeedbackWritten { parsed },
-            2,
-        )
-        .await
-        .unwrap();
-
-        // Now alice has a current verdict; bob doesn't. The session is in
-        // reviewers / plan_needs_rereview.
-        // exclude_authors=["alice"] should skip the session.
-        let a = WaitArgs {
-            role: "reviewers".to_string(),
-            repo: None,
-            session_id: None,
-            exclude_authors: vec!["alice".to_string()],
-            timeout_secs: Some(1),
-        };
-        let resp = wait_for_work(&rt, a).await.unwrap();
-        assert!(
-            resp.timed_out && resp.matches.is_empty(),
-            "alice already voted on the current target; should not wake alice's caller. \
-             Got: matches={:?} timed_out={}",
-            resp.matches,
-            resp.timed_out
-        );
-
-        // Without exclude_authors, the same poll should match (bob still owes).
-        let a = WaitArgs {
-            role: "reviewers".to_string(),
-            repo: None,
-            session_id: None,
-            exclude_authors: Vec::new(),
-            timeout_secs: Some(1),
-        };
-        let resp = wait_for_work(&rt, a).await.unwrap();
-        assert_eq!(resp.matches.len(), 1);
-        assert_eq!(resp.matches[0].reason, "plan_needs_rereview");
+        let a = args(dir.path(), "reviewers", "does-not-exist", "codex");
+        let err = wait_for_work(&rt, a).await.unwrap_err();
+        assert!(matches!(err, WaitError::UnknownSession(_)));
     }
 
     #[tokio::test]
-    async fn fan_out_two_concurrent_waits_both_wake() {
-        let dir = init_repo();
-        write_file(dir.path(), ".trinity/plans/foo.md", "# foo v1\n");
-        commit(dir.path(), "add foo");
-
-        let rt = std::sync::Arc::new(Runtime::new());
-        rt.add_repo(dir.path().to_path_buf()).await.unwrap();
-
-        let rt_a = std::sync::Arc::clone(&rt);
-        let rt_b = std::sync::Arc::clone(&rt);
-        let join_a = tokio::spawn(async move {
-            let mut a = args("master");
-            a.timeout_secs = Some(5);
-            wait_for_work(&rt_a, a).await
-        });
-        let join_b = tokio::spawn(async move {
-            let mut a = args("master");
-            a.timeout_secs = Some(5);
-            wait_for_work(&rt_b, a).await
-        });
-
-        tokio::time::sleep(Duration::from_millis(200)).await;
-
-        write_file(dir.path(), ".trinity/plans/foo.md", "# foo v2 unsaved\n");
-        rt.handle_signal(
-            dir.path(),
-            FilesystemSignal::PlanFileChanged {
-                session_id: SessionId::from("foo"),
-                path: PathBuf::from(".trinity/plans/foo.md"),
-            },
-            1,
-        )
-        .await
-        .unwrap();
-
-        let resp_a = tokio::time::timeout(Duration::from_secs(3), join_a)
-            .await
-            .expect("a didn't return")
-            .unwrap()
-            .unwrap();
-        let resp_b = tokio::time::timeout(Duration::from_secs(3), join_b)
-            .await
-            .expect("b didn't return")
-            .unwrap()
-            .unwrap();
-        assert_eq!(resp_a.matches.len(), 1);
-        assert_eq!(resp_b.matches.len(), 1);
-        assert_eq!(resp_a.matches[0].session_id, resp_b.matches[0].session_id);
-    }
-
-    #[tokio::test]
-    async fn repo_filter_restricts_matches() {
-        let dir_a = init_repo();
-        write_file(dir_a.path(), ".trinity/plans/in_a.md", "# a\n");
-        commit(dir_a.path(), "add a");
-        let dir_b = init_repo();
-        write_file(dir_b.path(), ".trinity/plans/in_b.md", "# b\n");
-        commit(dir_b.path(), "add b");
-
+    async fn missing_repo_errors() {
         let rt = Runtime::new();
-        rt.add_repo(dir_a.path().to_path_buf()).await.unwrap();
-        rt.add_repo(dir_b.path().to_path_buf()).await.unwrap();
+        let a = WaitArgs {
+            role: "reviewers".to_string(),
+            session_id: "foo".to_string(),
+            author_label: "codex".to_string(),
+            repo: None,
+            timeout_secs: Some(1),
+        };
+        let err = wait_for_work(&rt, a).await.unwrap_err();
+        assert!(matches!(err, WaitError::MissingRepo));
+    }
 
-        let mut a = args("reviewers");
-        a.repo = Some(dir_b.path().to_string_lossy().into_owned());
-        a.timeout_secs = Some(1);
-        let resp = wait_for_work(&rt, a).await.unwrap();
-        assert_eq!(resp.matches.len(), 1);
-        assert_eq!(resp.matches[0].session_id, "in_b");
+    #[tokio::test]
+    async fn missing_author_label_errors() {
+        let rt = Runtime::new();
+        let a = WaitArgs {
+            role: "reviewers".to_string(),
+            session_id: "foo".to_string(),
+            author_label: String::new(),
+            repo: Some("/anywhere".to_string()),
+            timeout_secs: Some(1),
+        };
+        let err = wait_for_work(&rt, a).await.unwrap_err();
+        assert!(matches!(err, WaitError::MissingAuthorLabel));
     }
 }
-

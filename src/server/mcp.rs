@@ -46,15 +46,28 @@ pub async fn dispatch(state: &AppState, req: &ToolCallRequest) -> Result<Value, 
 }
 
 async fn wait_for_work(state: &AppState, req: &ToolCallRequest) -> Result<Value, ToolError> {
-    let args: WaitArgs = serde_json::from_value(req.arguments.clone())
+    let mut args: WaitArgs = serde_json::from_value(req.arguments.clone())
         .map_err(|e| ToolError::Invalid(format!("args: {e}")))?;
+    // MCP path: if the caller didn't pass `repo`, fall back to the shim cwd.
+    if args.repo.is_none() {
+        let repo = resolve_repo(&req.cwd).await?;
+        args.repo = Some(repo.to_string_lossy().into_owned());
+    }
     let resp = run_wait_for_work(&state.runtime, args)
         .await
-        .map_err(|e| match e {
-            WaitError::InvalidRole(_) => ToolError::Invalid(e.to_string()),
-            WaitError::Io(_) => ToolError::Internal(anyhow::anyhow!(e)),
-        })?;
+        .map_err(map_wait_error)?;
     serde_json::to_value(resp).map_err(|e| ToolError::Internal(anyhow::anyhow!(e)))
+}
+
+fn map_wait_error(e: WaitError) -> ToolError {
+    match e {
+        WaitError::InvalidRole(_)
+        | WaitError::MissingSessionId
+        | WaitError::MissingAuthorLabel
+        | WaitError::MissingRepo => ToolError::Invalid(e.to_string()),
+        WaitError::UnknownSession(_) => ToolError::NotFound(e.to_string()),
+        WaitError::Io(_) => ToolError::Internal(anyhow::anyhow!(e)),
+    }
 }
 
 #[derive(Debug, Deserialize, Default)]

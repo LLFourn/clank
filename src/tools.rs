@@ -86,48 +86,71 @@ pub fn catalog() -> Vec<ToolDescriptor> {
         },
         ToolDescriptor {
             name: "wait_for_work".to_string(),
-            description: "Block until a session in any watched repo is waiting on the caller's \
-                          role, then return the minimal identifiers needed to act. This is the \
-                          idiomatic way to drive an agent loop — replaces polling \
+            description: "Block until one named session in one repo needs the caller's role, \
+                          then return the work to do plus the file paths to act on. This is \
+                          the idiomatic way to drive an agent loop — replaces polling \
                           `list_sessions` / `get_context` on a timer.\n\n\
+                          Single-session, single-repo by design: you say which session you're \
+                          watching, the response says what to do for that session.\n\n\
                           Inputs:\n\
-                          - `role` (required): `\"master\"` if you're driving the work \
-                          (committing plan revisions, addressing changes, implementing, moving \
-                          to done), `\"reviewers\"` if you're reviewing plans or impl commits.\n\
-                          - `repo` (optional absolute path): filter to one watched repo. \
-                          Default: match across all repos.\n\
-                          - `session_id` (optional): filter to one session.\n\
-                          - `exclude_authors` (optional, reviewers role only): skip sessions \
-                          where any listed author already has a current verdict on the target. \
-                          Useful so you aren't woken by your own outstanding reviews.\n\
-                          - `timeout_secs` (optional, 1–300, default 60): how long to block.\n\n\
-                          Response shape — intentionally minimal to keep loop context small:\n\
+                          - `role` (required, `master` | `reviewers`).\n\
+                          - `session_id` (required): the session you're watching.\n\
+                          - `author_label` (required): your label. Used to construct the \
+                          canonical reviewer write path for `review_plan` / `review_impl`. \
+                          The MCP shim caches this across calls so you usually pass it once.\n\
+                          - `repo` (optional absolute path): defaults to the caller's \
+                          cwd-repo (via `git rev-parse --show-toplevel`). HTTP callers must \
+                          pass this explicitly.\n\
+                          - `timeout_secs` (optional, 1–300, default 60).\n\n\
+                          Response — one of two shapes:\n\
                           ```\n\
-                          {\n\
-                            \"matches\": [{\"repo\": \"/abs/path\", \"session_id\": \"id\", \"reason\": \"impl_needs_initial_review\"}],\n\
-                            \"timed_out\": false\n\
-                          }\n\
+                          { \"work\": \"<action>\", \"locations\": [\"<repo-relative path>\", ...] }\n\
                           ```\n\
-                          On timeout: `{\"matches\": [], \"timed_out\": true}` — call again.\n\n\
-                          The response does NOT include full session context. For each match \
-                          you decide to act on, call `get_context({repo, session_id})` to \
-                          fetch phase, plan_worktree_status, review_gate, write_feedback path, \
-                          and timeline. This split keeps the loop's accumulated context small \
-                          even after many wake-ups.\n\n\
-                          Typical agent loop:\n\
+                          or, after the timeout:\n\
+                          ```\n\
+                          { \"timed_out\": true }\n\
+                          ```\n\n\
+                          The `work` vocabulary is the imperative action you should take. \
+                          `locations` are repo-relative paths whose meaning depends on \
+                          `work`:\n\
+                          - `review_plan` → `[<canonical write path for your APPROVE / \
+                          REQUEST_CHANGES feedback file>]`. Create that file.\n\
+                          - `review_impl` → same, but for an implementation commit.\n\
+                          - `address_plan_request_changes` → `[<each REQUEST_CHANGES \
+                          feedback file on the current plan target>, <plan file>]`. Read the \
+                          feedbacks; revise the plan; commit.\n\
+                          - `address_impl_request_changes` → `[<each REQUEST_CHANGES \
+                          feedback file on the current impl target>]`. Read the feedbacks; \
+                          fix in code; commit.\n\
+                          - `commit_plan_revision` → `[<plan file>]`. The plan was edited; \
+                          commit the revision.\n\
+                          - `commit_done_move` / `restore_or_commit_done_move` → \
+                          `[<plan file>]`. Resolve the active-vs-done state.\n\
+                          - `implement_and_commit` → `[<plan file>]`. Plan is approved; \
+                          start implementing.\n\
+                          - `move_to_done` → `[<plan file>]`. Implementation approved; move \
+                          the plan to `.trinity/plans/done/` and commit.\n\n\
+                          Typical reviewer loop:\n\
                           ```\n\
                           loop {\n\
-                            let work = wait_for_work({ role: \"reviewers\" });\n\
-                            for m in work.matches {\n\
-                              let ctx = get_context({ repo: m.repo, session_id: m.session_id });\n\
-                              do_review(ctx);\n\
-                            }\n\
+                            let r = wait_for_work({\n\
+                              role: \"reviewers\",\n\
+                              session_id: \"my-feature\",\n\
+                              author_label: \"codex\"\n\
+                            });\n\
+                            if r.timed_out { continue; }\n\
+                            // r.work == \"review_impl\"\n\
+                            // r.locations[0] == \".trinity/feedback/my-feature/impl/<sha>/codex.md\"\n\
+                            // Read the impl commit, write your verdict to that path.\n\
                           }\n\
-                          ```"
+                          ```\n\n\
+                          Master loop is the same with `role: \"master\"` — the response will \
+                          tell you whether to commit a plan revision, address request_changes, \
+                          implement, or move to done."
                 .to_string(),
             input_schema: json!({
                 "type": "object",
-                "required": ["role"],
+                "required": ["role", "session_id", "author_label"],
                 "additionalProperties": false,
                 "properties": {
                     "role": {
@@ -135,18 +158,17 @@ pub fn catalog() -> Vec<ToolDescriptor> {
                         "enum": ["master", "reviewers"],
                         "description": "Which role's attention you're polling for."
                     },
-                    "repo": {
-                        "type": "string",
-                        "description": "Absolute repo root path. Optional; defaults to matching across all watched repos."
-                    },
                     "session_id": {
                         "type": "string",
-                        "description": "Restrict to one session id. Optional."
+                        "description": "The single session you're watching. Use `list_sessions` to discover ids."
                     },
-                    "exclude_authors": {
-                        "type": "array",
-                        "items": {"type": "string"},
-                        "description": "Reviewers role only: skip sessions where any listed author already has a current verdict for the review target. Lets a reviewer skip their own outstanding reviews."
+                    "author_label": {
+                        "type": "string",
+                        "description": "Your agent label. Baked into the canonical reviewer write path for review_* work. The MCP shim caches this across calls."
+                    },
+                    "repo": {
+                        "type": "string",
+                        "description": "Absolute repo root path. Optional over MCP (defaults to caller's cwd-repo); required over HTTP."
                     },
                     "timeout_secs": {
                         "type": "integer",

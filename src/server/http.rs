@@ -39,10 +39,14 @@ async fn api_wait_for_work(
     axum::Json(args): axum::Json<WaitArgs>,
 ) -> Result<axum::Json<Value>, AppError> {
     let resp = wait_for_work(&state.runtime, args).await.map_err(|e| match e {
-        WaitError::InvalidRole(_) => AppError {
+        WaitError::InvalidRole(_)
+        | WaitError::MissingSessionId
+        | WaitError::MissingAuthorLabel
+        | WaitError::MissingRepo => AppError {
             status: StatusCode::BAD_REQUEST,
             msg: e.to_string(),
         },
+        WaitError::UnknownSession(_) => AppError::not_found(e.to_string()),
         WaitError::Io(err) => AppError::io(err),
     })?;
     let v = serde_json::to_value(resp)

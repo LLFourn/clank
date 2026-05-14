@@ -16,8 +16,9 @@ use serde_json::{Value, json};
 use crate::disk_format::plan_path_is_done;
 use crate::lifecycle::{AgentLabel, ContentHash, SessionId, content_hash};
 use crate::projection::{
-    all_implementation_commits, all_plan_revisions, impl_gate_for, latest_impl_commit,
-    latest_plan_touching_commit, phase, plan_gate_for, plan_worktree_status, waiting_on,
+    all_implementation_commits, all_plan_revisions, expected_action, impl_gate_for,
+    latest_impl_commit, latest_plan_touching_commit, phase, plan_gate_for, plan_worktree_status,
+    waiting_on,
 };
 use crate::repo_state::{PlanWorktreeStatus, RepoState, WaitingOn};
 use crate::review_state::{ReviewGateDecision, ReviewPhase};
@@ -192,14 +193,14 @@ pub fn get_context_response(
             "path": rel,
         })
     });
-    let expected_action = expected_action_for(&w);
+    let expected_action_str = expected_action(w.reason);
 
     Ok(Some(json!({
         "session_id": session.id.as_str(),
         "phase": session_phase.as_str(),
         "plan_worktree_status": worktree_status.as_str(),
         "waiting_on": waiting_on_value(&w),
-        "expected_action": expected_action,
+        "expected_action": expected_action_str,
         "review_target": review_target,
         "write_feedback": write_feedback,
         "plan_path": session.plan_path.to_string_lossy(),
@@ -213,26 +214,6 @@ pub fn get_context_response(
         "timeline": timeline,
         "pr_hint": pr_hint,
     })))
-}
-
-/// Map `waiting_on.reason` to the caller-facing `expected_action` string
-/// that tells the agent what to actually do next.
-fn expected_action_for(w: &crate::repo_state::WaitingOn) -> &'static str {
-    use crate::repo_state::WaitingReason::*;
-    match w.reason {
-        SessionDone => "none",
-        CommitDoneMove => "commit_done_move",
-        RestoreOrCommitDoneMove => "restore_or_commit_done_move",
-        CommitPlanRevision => "commit_plan_revision",
-        AddressPlanRequestChanges => "address_plan_request_changes",
-        ReadyToImplement => "implement_and_commit",
-        PlanNeedsInitialReview => "review_plan",
-        PlanNeedsRereview => "review_plan",
-        AddressImplRequestChanges => "address_impl_request_changes",
-        ReadyToFinish => "move_to_done",
-        ImplNeedsInitialReview => "review_impl",
-        ImplNeedsRereview => "review_impl",
-    }
 }
 
 /// Serialize the per-session timeline (from `RepoState::timeline_for`)
