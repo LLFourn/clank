@@ -198,6 +198,124 @@ async fn mcp_list_sessions() {
 }
 
 #[tokio::test]
+async fn pr_hint_present_in_implementing_phase() {
+    let dir = init_repo();
+    write_file(dir.path(), ".trinity/plans/foo.md", "# foo\n");
+    commit(dir.path(), "Add foo plan");
+    write_file(dir.path(), "src/lib.rs", "fn main() {}\n");
+    commit(dir.path(), "Implement foo");
+
+    let (url, handle) = spawn_daemon(dir.path()).await;
+    let client = reqwest::Client::new();
+    let req = json!({
+        "cwd": dir.path(),
+        "tool": "get_context",
+        "arguments": { "session_id": "foo" }
+    });
+    let resp = client
+        .post(format!("{}/internal/tool_call", url))
+        .json(&req)
+        .send()
+        .await
+        .unwrap();
+    handle.abort();
+    let body: serde_json::Value = resp.json().await.unwrap();
+    let pr_hint = &body["result"]["pr_hint"];
+    assert!(pr_hint.is_object(), "pr_hint should be an object: {pr_hint}");
+    assert!(pr_hint["plan_intro"].is_string());
+    assert!(
+        pr_hint["plan_intro_parent"].is_null()
+            || pr_hint["plan_intro_parent"].is_string()
+    );
+    let options = pr_hint["options"].as_array().unwrap();
+    assert_eq!(options.len(), 2);
+    let names: Vec<&str> = options.iter().map(|o| o["name"].as_str().unwrap()).collect();
+    assert!(names.contains(&"keep_plan_in_pr"));
+    assert!(names.contains(&"exclude_plan_from_pr"));
+}
+
+#[tokio::test]
+async fn plan_revision_route_renders_blob() {
+    let dir = init_repo();
+    write_file(dir.path(), ".trinity/plans/foo.md", "# plan body v1\n");
+    commit(dir.path(), "Add foo plan");
+
+    let (url, handle) = spawn_daemon(dir.path()).await;
+    // Get the latest plan revision SHA via list_sessions / get_context.
+    let client = reqwest::Client::new();
+    let req = json!({
+        "cwd": dir.path(),
+        "tool": "get_context",
+        "arguments": { "session_id": "foo" }
+    });
+    let ctx: serde_json::Value = client
+        .post(format!("{}/internal/tool_call", url))
+        .json(&req)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let sha = ctx["result"]["latest_plan_revision"]["commit_sha"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let body = client
+        .get(format!("{}/sessions/foo/plan/{}", url, sha))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    handle.abort();
+    assert!(body.contains("plan body v1"), "got: {body}");
+}
+
+#[tokio::test]
+async fn commit_diff_route_renders_patch() {
+    let dir = init_repo();
+    write_file(dir.path(), ".trinity/plans/foo.md", "# foo\n");
+    commit(dir.path(), "Add foo plan");
+    write_file(dir.path(), "src/lib.rs", "fn marker_in_commit() {}\n");
+    commit(dir.path(), "Implement foo");
+
+    let (url, handle) = spawn_daemon(dir.path()).await;
+    let client = reqwest::Client::new();
+    let req = json!({
+        "cwd": dir.path(),
+        "tool": "get_context",
+        "arguments": { "session_id": "foo" }
+    });
+    let ctx: serde_json::Value = client
+        .post(format!("{}/internal/tool_call", url))
+        .json(&req)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let impl_sha = ctx["result"]["latest_implementation_revision"]["commit_sha"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let body = client
+        .get(format!("{}/sessions/foo/commit/{}", url, impl_sha))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    handle.abort();
+    assert!(body.contains("marker_in_commit"), "got: {body}");
+}
+
+#[tokio::test]
 async fn done_move_endpoint_moves_plan_file() {
     let dir = init_repo();
     write_file(dir.path(), ".trinity/plans/foo.md", "# foo\n");

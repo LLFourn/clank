@@ -49,6 +49,9 @@ pub struct Session {
     /// `plan_intro` for this session: the commit that first added the
     /// plan file. Used as the lower bound for attribution walks.
     pub plan_intro: CommitSha,
+    /// First-parent of `plan_intro`, or `None` for the root commit.
+    /// Used by `pr_hint` to suggest squash bases.
+    pub plan_intro_parent: Option<CommitSha>,
     pub plan_feedback: BTreeMap<(CommitSha, AgentLabel), Feedback>,
     pub impl_feedback: BTreeMap<(CommitSha, AgentLabel), Feedback>,
     /// Plan-phase feedback files dropped while `plan_worktree_status` was

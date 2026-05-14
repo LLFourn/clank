@@ -147,6 +147,31 @@ pub async fn show_blob(
     run_ok_raw(repo, &["show", &spec]).await
 }
 
+/// `git show <sha>` — return the full commit patch (header + diff) as text.
+/// Used by the commit-diff route to render impl commits.
+pub async fn show_commit(repo: &Path, sha: &CommitSha) -> Result<String, GitIoError> {
+    run_ok_raw(repo, &["show", "--no-color", sha.as_str()]).await
+}
+
+/// `git rev-parse <sha>^` — first parent of the given commit. Returns
+/// `Ok(None)` for the root commit (no parent).
+pub async fn parent_of(
+    repo: &Path,
+    sha: &CommitSha,
+) -> Result<Option<CommitSha>, GitIoError> {
+    let spec = format!("{}^", sha.as_str());
+    let output = run(repo, &["rev-parse", "--verify", &spec]).await?;
+    if !output.status.success() {
+        return Ok(None);
+    }
+    let s = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if s.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(CommitSha::from(s)))
+    }
+}
+
 /// `git log --diff-filter=A --follow --format=%H -- <path>` — the commit
 /// that first introduced `path` along the follow chain. Returns
 /// `Ok(None)` if no such commit exists (e.g. the path was never added,

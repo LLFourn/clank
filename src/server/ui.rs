@@ -52,6 +52,9 @@ pub fn session_page(ctx: &Value) -> String {
     let reason = ctx["waiting_on"]["reason"].as_str().unwrap_or("?");
     let desc = ctx["waiting_on"]["description"].as_str().unwrap_or("");
     let plan_path = ctx["plan_path"].as_str().unwrap_or("");
+
+    // Build plan-revisions list from pr_hint (when present, in implementing
+    // phase) or just show the latest. For planning, list latest only.
     let latest_plan = ctx["latest_plan_revision"]["commit_sha"]
         .as_str()
         .unwrap_or("—");
@@ -59,10 +62,57 @@ pub fn session_page(ctx: &Value) -> String {
         .as_str()
         .unwrap_or("—");
 
+    let mut impl_commits_html = String::new();
+    if let Some(commits) = ctx["pr_hint"]["implementation_commits"].as_array() {
+        impl_commits_html.push_str("<ul class=\"commits\">");
+        for c in commits {
+            if let Some(sha) = c.as_str() {
+                impl_commits_html.push_str(&format!(
+                    "<li><a href=\"/sessions/{id}/commit/{sha}\"><code>{short}</code></a></li>",
+                    short = &sha[..7.min(sha.len())],
+                ));
+            }
+        }
+        impl_commits_html.push_str("</ul>");
+    } else if latest_impl != "—" {
+        impl_commits_html.push_str(&format!(
+            "<ul class=\"commits\"><li><a href=\"/sessions/{id}/commit/{latest_impl}\"><code>{short}</code></a></li></ul>",
+            short = &latest_impl[..7.min(latest_impl.len())],
+        ));
+    } else {
+        impl_commits_html.push_str("<p class=\"none\">No implementation commits yet.</p>");
+    }
+
+    let plan_revisions_html = if latest_plan != "—" {
+        format!(
+            "<ul class=\"commits\"><li><a href=\"/sessions/{id}/plan/{latest_plan}\"><code>{short}</code></a> (latest)</li></ul>",
+            short = &latest_plan[..7.min(latest_plan.len())],
+        )
+    } else {
+        "<p class=\"none\">No plan revisions found.</p>".to_string()
+    };
+
+    let pr_hint_html = if let Some(hint) = ctx.get("pr_hint").filter(|v| !v.is_null()) {
+        let options = hint["options"].as_array().cloned().unwrap_or_default();
+        let mut s = String::new();
+        s.push_str("<h2>PR squash hint</h2><ul class=\"options\">");
+        for opt in options {
+            let name = opt["name"].as_str().unwrap_or("?");
+            let command = opt["command"].as_str().unwrap_or("?");
+            s.push_str(&format!(
+                "<li><strong>{name}:</strong> <code>{command}</code></li>"
+            ));
+        }
+        s.push_str("</ul>");
+        s
+    } else {
+        String::new()
+    };
+
     format!(
         "<!doctype html><html><head><title>{id} — Trinity</title>\
          <style>\
-         body{{font-family:system-ui,sans-serif;max-width:980px;margin:2em auto;padding:0 1em}}\
+         body{{font-family:system-ui,sans-serif;max-width:980px;margin:2em auto;padding:0 1em;color:#111}}\
          .banner{{padding:1em;border-radius:.5em;margin:1em 0}}\
          .banner.master{{background:#fde68a;color:#92400e}}\
          .banner.reviewers{{background:#bfdbfe;color:#1e40af}}\
@@ -71,6 +121,11 @@ pub fn session_page(ctx: &Value) -> String {
          dt{{font-weight:600}}\
          a{{color:#1d4ed8;text-decoration:none}}\
          a:hover{{text-decoration:underline}}\
+         code{{background:#f3f4f6;padding:.1em .3em;border-radius:.25em;font-size:.9em}}\
+         ul.commits{{list-style:none;padding:0}}\
+         ul.commits li{{padding:.25em 0;border-bottom:1px solid #f3f4f6}}\
+         .none{{color:#6b7280;font-style:italic}}\
+         h2{{margin-top:2em}}\
          </style></head><body>\
          <p><a href=\"/\">&larr; All sessions</a></p>\
          <h1>{id}</h1>\
@@ -81,9 +136,55 @@ pub fn session_page(ctx: &Value) -> String {
          <dt>Phase</dt><dd>{phase}</dd>\
          <dt>Plan path</dt><dd><code>{plan_path}</code></dd>\
          <dt>Worktree</dt><dd>{status}</dd>\
-         <dt>Latest plan revision</dt><dd><code>{latest_plan}</code></dd>\
-         <dt>Latest impl commit</dt><dd><code>{latest_impl}</code></dd>\
          </dl>\
+         <h2>Plan revisions</h2>{plan_revisions_html}\
+         <h2>Implementation commits</h2>{impl_commits_html}\
+         {pr_hint_html}\
          </body></html>"
     )
+}
+
+pub fn plan_revision_page(session_id: &str, sha: &str, body: &str) -> String {
+    let escaped = html_escape(body);
+    let short = &sha[..7.min(sha.len())];
+    format!(
+        "<!doctype html><html><head><title>{session_id}@{short} — Trinity</title>\
+         <style>\
+         body{{font-family:system-ui,sans-serif;max-width:980px;margin:2em auto;padding:0 1em}}\
+         pre{{background:#f3f4f6;padding:1em;border-radius:.5em;overflow-x:auto;\
+         font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:.9em;line-height:1.5}}\
+         a{{color:#1d4ed8;text-decoration:none}}\
+         a:hover{{text-decoration:underline}}\
+         </style></head><body>\
+         <p><a href=\"/sessions/{session_id}\">&larr; {session_id}</a></p>\
+         <h1>Plan @ <code>{short}</code></h1>\
+         <pre>{escaped}</pre>\
+         </body></html>"
+    )
+}
+
+pub fn commit_diff_page(session_id: &str, sha: &str, patch: &str) -> String {
+    let escaped = html_escape(patch);
+    let short = &sha[..7.min(sha.len())];
+    format!(
+        "<!doctype html><html><head><title>{session_id} commit {short} — Trinity</title>\
+         <style>\
+         body{{font-family:system-ui,sans-serif;max-width:980px;margin:2em auto;padding:0 1em}}\
+         pre{{background:#0f172a;color:#e2e8f0;padding:1em;border-radius:.5em;\
+         overflow-x:auto;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;\
+         font-size:.85em;line-height:1.5}}\
+         a{{color:#1d4ed8;text-decoration:none}}\
+         a:hover{{text-decoration:underline}}\
+         </style></head><body>\
+         <p><a href=\"/sessions/{session_id}\">&larr; {session_id}</a></p>\
+         <h1>Commit <code>{short}</code></h1>\
+         <pre>{escaped}</pre>\
+         </body></html>"
+    )
+}
+
+fn html_escape(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
 }

@@ -124,6 +124,12 @@ pub fn get_context_response(
         impl_gate.as_ref(),
     );
 
+    let pr_hint = if matches!(session_phase, crate::repo_state::Phase::Implementing) {
+        Some(pr_hint_value(session, &state.attribution))
+    } else {
+        None
+    };
+
     Ok(Some(json!({
         "session_id": session.id.as_str(),
         "phase": session_phase.as_str(),
@@ -133,7 +139,60 @@ pub fn get_context_response(
         "review_gate": gate_value(plan_gate.as_ref(), impl_gate.as_ref(), session_phase),
         "latest_plan_revision": latest_plan_revision(session, &state.attribution),
         "latest_implementation_revision": latest_impl_revision(session, &state.attribution),
+        "pr_hint": pr_hint,
     })))
+}
+
+fn pr_hint_value(
+    session: &crate::repo_state::Session,
+    attribution: &std::collections::BTreeMap<crate::lifecycle::CommitSha, crate::repo_state::AttributionResult>,
+) -> Value {
+    let impl_commits: Vec<String> = attribution
+        .iter()
+        .filter_map(|(sha, attr)| match attr {
+            crate::repo_state::AttributionResult::Attributed {
+                session: sid,
+                has_code_changes: true,
+                ..
+            } if sid == &session.id => Some(sha.as_str().to_string()),
+            _ => None,
+        })
+        .collect();
+
+    let plan_intro = session.plan_intro.as_str();
+    let plan_intro_parent = session.plan_intro_parent.as_ref().map(|s| s.as_str());
+    let base_for_squash = plan_intro_parent.unwrap_or(plan_intro);
+    let plan_path = session.plan_path.to_string_lossy().to_string();
+    let suggested = format!("Implement {}", session.id.as_str());
+
+    let mut options = Vec::with_capacity(2);
+    options.push(json!({
+        "name": "keep_plan_in_pr",
+        "base": base_for_squash,
+        "command": format!(
+            "git reset --soft {base} && git commit -m '{msg}'",
+            base = base_for_squash,
+            msg = suggested
+        ),
+    }));
+    options.push(json!({
+        "name": "exclude_plan_from_pr",
+        "base": base_for_squash,
+        "command": format!(
+            "git reset --soft {base} && git rm {plan} && git commit -m '{msg}'",
+            base = base_for_squash,
+            plan = plan_path,
+            msg = suggested
+        ),
+    }));
+
+    json!({
+        "plan_intro": plan_intro,
+        "plan_intro_parent": plan_intro_parent,
+        "implementation_commits": impl_commits,
+        "options": options,
+        "suggested_message": suggested,
+    })
 }
 
 fn waiting_on_value(w: &WaitingOn) -> Value {

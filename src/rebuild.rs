@@ -54,6 +54,7 @@ pub async fn rebuild_repo(repo_root: &Path) -> Result<RepoState, RebuildError> {
             Some(sha) => sha,
             None => continue, // shouldn't happen for an ls-tree entry
         };
+        let plan_intro_parent = git_io::parent_of(repo_root, &plan_intro).await?;
         state.sessions.insert(
             session_id.clone(),
             Session {
@@ -62,6 +63,7 @@ pub async fn rebuild_repo(repo_root: &Path) -> Result<RepoState, RebuildError> {
                 body,
                 body_hash,
                 plan_intro,
+                plan_intro_parent,
                 plan_feedback: BTreeMap::new(),
                 impl_feedback: BTreeMap::new(),
                 held_plan_feedback: Vec::new(),

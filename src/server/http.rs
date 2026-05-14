@@ -23,6 +23,8 @@ pub fn router(state: AppState) -> Router {
         .route("/", get(home))
         .route("/healthz", get(healthz))
         .route("/sessions/{session_id}", get(session_detail))
+        .route("/sessions/{session_id}/plan/{sha}", get(plan_revision_view))
+        .route("/sessions/{session_id}/commit/{sha}", get(commit_diff_view))
         .route("/sessions/{session_id}/done", post(move_to_done))
         .route("/events", get(home_events_stream))
         .route("/internal/tools", get(list_tools))
@@ -155,6 +157,65 @@ async fn home_events_stream(
 
 async fn healthz() -> &'static str {
     "ok"
+}
+
+async fn plan_revision_view(
+    State(state): State<AppState>,
+    Path((session_id, sha)): Path<(String, String)>,
+    Query(q): Query<RepoQuery>,
+) -> Result<Html<String>, AppError> {
+    let repos = repos_to_render(&state, q.repo).await;
+    for repo in repos {
+        let plan_path = state
+            .runtime
+            .read_repo(&repo, |s| {
+                s.sessions
+                    .get(&SessionId::from(session_id.clone()))
+                    .map(|sess| sess.plan_path.clone())
+            })
+            .await
+            .map_err(AppError::runtime)?;
+        let Some(plan_path) = plan_path else {
+            continue;
+        };
+        let commit_sha = crate::lifecycle::CommitSha::from(sha.clone());
+        let body = crate::git_io::show_blob(&repo, &commit_sha, &plan_path)
+            .await
+            .map_err(|e| AppError::internal(format!("git show: {e}")))?;
+        return Ok(Html(ui::plan_revision_page(&session_id, &sha, &body)));
+    }
+    Err(AppError::not_found(format!(
+        "session {session_id} not found"
+    )))
+}
+
+async fn commit_diff_view(
+    State(state): State<AppState>,
+    Path((session_id, sha)): Path<(String, String)>,
+    Query(q): Query<RepoQuery>,
+) -> Result<Html<String>, AppError> {
+    let repos = repos_to_render(&state, q.repo).await;
+    for repo in repos {
+        let exists = state
+            .runtime
+            .read_repo(&repo, |s| {
+                s.sessions
+                    .contains_key(&SessionId::from(session_id.clone()))
+            })
+            .await
+            .map_err(AppError::runtime)?;
+        if !exists {
+            continue;
+        }
+        let commit_sha = crate::lifecycle::CommitSha::from(sha.clone());
+        let patch = crate::git_io::show_commit(&repo, &commit_sha)
+            .await
+            .map_err(|e| AppError::internal(format!("git show: {e}")))?;
+        return Ok(Html(ui::commit_diff_page(&session_id, &sha, &patch)));
+    }
+    Err(AppError::not_found(format!(
+        "session {session_id} not found"
+    )))
 }
 
 async fn list_tools() -> axum::Json<Vec<crate::tools::ToolDescriptor>> {
