@@ -1,5 +1,5 @@
 use clap::{Parser, Subcommand};
-use trinity::{daemon, mcp_shim};
+use trinity::{mcp_shim, server};
 
 #[derive(Parser)]
 #[command(
@@ -14,8 +14,8 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Run the Trinity daemon (HTTP UI + internal API + watcher).
-    Serve(daemon::ServeArgs),
+    /// Run the Trinity daemon (HTTP UI + internal API + filesystem watcher).
+    Serve(server::ServeArgs),
     /// stdio MCP server. Forwards tool calls to a running `trinity serve` daemon.
     Mcp(mcp_shim::McpArgs),
 }
@@ -25,7 +25,7 @@ async fn main() -> anyhow::Result<()> {
     init_tracing();
     let cli = Cli::parse();
     match cli.command {
-        Command::Serve(args) => daemon::serve(args).await,
+        Command::Serve(args) => server::serve(args).await,
         Command::Mcp(args) => mcp_shim::run(args).await,
     }
 }

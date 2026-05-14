@@ -14,9 +14,6 @@ tower-http = { version = "0.6", features = ["trace", "validate-request"] }
 # CLI
 clap = { version = "4", features = ["derive", "env"] }
 
-# Storage
-sqlx = { version = "0.8", features = ["runtime-tokio", "sqlite", "macros", "migrate"] }
-
 # MCP
 rmcp = { version = "0.10", features = ["server", "transport-io"] }
 

@@ -51,6 +51,21 @@ impl Runtime {
         Ok(())
     }
 
+    /// Register a repo only if it isn't already known. Silently swallows
+    /// rebuild errors (logged), so request handlers can call this on
+    /// every request without needing to special-case "already loaded."
+    pub async fn add_repo_if_unknown(&self, repo_root: PathBuf) {
+        {
+            let trinity = self.state.lock().await;
+            if trinity.repos.contains_key(&repo_root) {
+                return;
+            }
+        }
+        if let Err(err) = self.add_repo(repo_root.clone()).await {
+            tracing::warn!(repo = %repo_root.display(), error = ?err, "add_repo_if_unknown failed");
+        }
+    }
+
     /// Read-only snapshot of a repo's state for request handlers. Holds the
     /// mutex for the duration of the closure.
     pub async fn read_repo<R>(

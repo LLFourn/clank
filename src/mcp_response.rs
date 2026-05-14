@@ -350,7 +350,6 @@ fn derive_gate_from_feedback(
         request_changes,
         unmarked,
         missing_approvals: missing,
-        override_status: None,
     }
 }
 

@@ -300,7 +300,6 @@ mod tests {
             request_changes,
             unmarked: Vec::new(),
             missing_approvals,
-            override_status: None,
         }
     }
 
