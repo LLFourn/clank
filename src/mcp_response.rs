@@ -132,6 +132,7 @@ pub fn get_context_response(
 
     let plan_feedback = feedback_entries(&session.plan_feedback);
     let impl_feedback = feedback_entries(&session.impl_feedback);
+    let timeline = timeline_value(state, session_id);
 
     let plan_revisions: Vec<String> = all_plan_revisions(session, &state.attribution)
         .into_iter()
@@ -156,8 +157,55 @@ pub fn get_context_response(
         "implementation_commits": implementation_commits,
         "plan_feedback": plan_feedback,
         "impl_feedback": impl_feedback,
+        "timeline": timeline,
         "pr_hint": pr_hint,
     })))
+}
+
+/// Serialize the per-session timeline (from `RepoState::timeline_for`)
+/// into the response shape. Each event becomes a `{ kind, ... }` object.
+fn timeline_value(state: &RepoState, session_id: &SessionId) -> Vec<Value> {
+    state
+        .timeline_for(session_id)
+        .into_iter()
+        .map(|e| match e {
+            crate::repo_state::TimelineEvent::Commit {
+                sha,
+                plan_touch,
+                has_code_changes,
+            } => {
+                let kind = match (plan_touch.is_some(), has_code_changes) {
+                    (true, true) => "commit_mixed",
+                    (true, false) => "commit_plan",
+                    (false, true) => "commit_impl",
+                    (false, false) => "commit_other",
+                };
+                json!({
+                    "kind": kind,
+                    "sha": sha.as_str(),
+                    "plan_touch": plan_touch.as_ref().map(|k| k.as_str()),
+                    "has_code_changes": has_code_changes,
+                })
+            }
+            crate::repo_state::TimelineEvent::Review {
+                phase,
+                target,
+                author,
+                verdict,
+            } => json!({
+                "kind": "review",
+                "phase": phase.as_str(),
+                "target": target.as_str(),
+                "author": author.as_str(),
+                "verdict": verdict.as_str(),
+            }),
+            crate::repo_state::TimelineEvent::HeldFeedback { author, reason } => json!({
+                "kind": "held_feedback",
+                "author": author.as_str(),
+                "reason": reason,
+            }),
+        })
+        .collect()
 }
 
 fn feedback_entries(

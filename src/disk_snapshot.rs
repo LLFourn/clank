@@ -102,6 +102,7 @@ pub fn derive_state(repo_root: PathBuf, snapshot: DiskSnapshot) -> RepoState {
         let result = classify(&entry.changes, current_effective.as_ref());
         current_effective = effective_session(&entry.changes, current_effective.as_ref());
         state.attribution.insert(entry.commit.clone(), result);
+        state.commit_order.push(entry.commit.clone());
     }
 
     // 3. Feedback ingestion. Files for unknown sessions are dropped
@@ -692,6 +693,244 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    // ===== Timeline =====
+
+    #[test]
+    fn timeline_unknown_session_is_empty() {
+        let state = derive_state(PathBuf::from("/r"), DiskSnapshot::default());
+        assert!(state.timeline_for(&sess("missing")).is_empty());
+    }
+
+    #[test]
+    fn timeline_walks_commits_chronologically() {
+        let snap = DiskSnapshot {
+            head: Some(sha("c3")),
+            plan_files: vec![plan_file("foo", "c1", None, "# foo\n")],
+            history: vec![
+                entry("c1", vec![touch("foo", PlanTouchKind::Intro)], false),
+                entry("c2", vec![], true),
+                entry("c3", vec![], true),
+            ],
+            feedback_files: vec![],
+        };
+        let state = derive_state(PathBuf::from("/r"), snap);
+        let timeline = state.timeline_for(&sess("foo"));
+        // Three commit events, in c1 → c2 → c3 order (not BTreeMap SHA-lex).
+        let shas: Vec<&str> = timeline
+            .iter()
+            .filter_map(|e| match e {
+                crate::repo_state::TimelineEvent::Commit { sha, .. } => Some(sha.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(shas, vec!["c1", "c2", "c3"]);
+    }
+
+    #[test]
+    fn timeline_attaches_plan_review_after_target_commit() {
+        let snap = DiskSnapshot {
+            head: Some(sha("c1")),
+            plan_files: vec![plan_file("foo", "c1", None, "# foo\n")],
+            history: vec![entry("c1", vec![touch("foo", PlanTouchKind::Intro)], false)],
+            feedback_files: vec![feedback(
+                "foo",
+                FeedbackPhase::Plan,
+                Some("c1"),
+                "alice",
+                "APPROVE\n",
+            )],
+        };
+        let state = derive_state(PathBuf::from("/r"), snap);
+        let timeline = state.timeline_for(&sess("foo"));
+        assert_eq!(timeline.len(), 2);
+        assert!(matches!(
+            timeline[0],
+            crate::repo_state::TimelineEvent::Commit {
+                plan_touch: Some(PlanTouchKind::Intro),
+                ..
+            }
+        ));
+        match &timeline[1] {
+            crate::repo_state::TimelineEvent::Review {
+                phase,
+                author,
+                verdict,
+                ..
+            } => {
+                assert_eq!(*phase, crate::repo_state::TimelinePhase::Plan);
+                assert_eq!(author.as_str(), "alice");
+                assert_eq!(*verdict, crate::repo_state::Verdict::Approve);
+            }
+            other => panic!("expected Review, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn timeline_attaches_impl_review_after_target_commit() {
+        let snap = DiskSnapshot {
+            head: Some(sha("c2")),
+            plan_files: vec![plan_file("foo", "c1", None, "# foo\n")],
+            history: vec![
+                entry("c1", vec![touch("foo", PlanTouchKind::Intro)], false),
+                entry("c2", vec![], true),
+            ],
+            feedback_files: vec![feedback(
+                "foo",
+                FeedbackPhase::Impl,
+                Some("c2"),
+                "bob",
+                "REQUEST_CHANGES\nproblem\n",
+            )],
+        };
+        let state = derive_state(PathBuf::from("/r"), snap);
+        let timeline = state.timeline_for(&sess("foo"));
+        // c1 commit, c2 commit, then bob's impl review on c2.
+        assert_eq!(timeline.len(), 3);
+        match &timeline[2] {
+            crate::repo_state::TimelineEvent::Review {
+                phase,
+                target,
+                author,
+                verdict,
+            } => {
+                assert_eq!(*phase, crate::repo_state::TimelinePhase::Impl);
+                assert_eq!(target.as_str(), "c2");
+                assert_eq!(author.as_str(), "bob");
+                assert_eq!(*verdict, crate::repo_state::Verdict::RequestChanges);
+            }
+            other => panic!("expected impl review, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn timeline_includes_held_feedback_at_end() {
+        let snap = DiskSnapshot {
+            head: Some(sha("c1")),
+            plan_files: vec![plan_file("foo", "c1", None, "# foo\n")],
+            history: vec![entry("c1", vec![touch("foo", PlanTouchKind::Intro)], false)],
+            feedback_files: vec![feedback(
+                "foo",
+                FeedbackPhase::Plan,
+                None,
+                "alice",
+                "APPROVE\n",
+            )],
+        };
+        let state = derive_state(PathBuf::from("/r"), snap);
+        let timeline = state.timeline_for(&sess("foo"));
+        // c1 commit + 1 held feedback (no review event because no target).
+        assert_eq!(timeline.len(), 2);
+        assert!(matches!(
+            timeline[1],
+            crate::repo_state::TimelineEvent::HeldFeedback { .. }
+        ));
+    }
+
+    #[test]
+    fn timeline_skips_unattributed_commits_in_session_view() {
+        // Multi-plan commits are unattributed; descendants walk through.
+        // In a single-session view, we don't show the multi-plan commit
+        // (it belongs to no one); we still show this session's own
+        // commits including the one that walks through.
+        let snap = DiskSnapshot {
+            head: Some(sha("c3")),
+            plan_files: vec![
+                plan_file("foo", "c1", None, "# foo\n"),
+                plan_file("bar", "c2", Some("c1"), "# bar\n"),
+            ],
+            history: vec![
+                entry("c1", vec![touch("foo", PlanTouchKind::Intro)], false),
+                entry(
+                    "c2",
+                    vec![
+                        touch("foo", PlanTouchKind::Revision),
+                        touch("bar", PlanTouchKind::Intro),
+                    ],
+                    false,
+                ),
+                entry("c3", vec![], true),
+            ],
+            feedback_files: vec![],
+        };
+        let state = derive_state(PathBuf::from("/r"), snap);
+        let foo_timeline = state.timeline_for(&sess("foo"));
+        let shas: Vec<&str> = foo_timeline
+            .iter()
+            .filter_map(|e| match e {
+                crate::repo_state::TimelineEvent::Commit { sha, .. } => Some(sha.as_str()),
+                _ => None,
+            })
+            .collect();
+        // c1 (foo intro) yes; c2 (multi-plan, unattributed) no; c3 walks
+        // through c2 transparently and attributes to foo, so yes.
+        assert_eq!(shas, vec!["c1", "c3"]);
+    }
+
+    #[test]
+    fn timeline_only_includes_target_session() {
+        let snap = DiskSnapshot {
+            head: Some(sha("c3")),
+            plan_files: vec![
+                plan_file("a", "c1", None, "# a\n"),
+                plan_file("b", "c2", Some("c1"), "# b\n"),
+            ],
+            history: vec![
+                entry("c1", vec![touch("a", PlanTouchKind::Intro)], false),
+                entry("c2", vec![touch("b", PlanTouchKind::Intro)], false),
+                entry("c3", vec![], true),
+            ],
+            feedback_files: vec![],
+        };
+        let state = derive_state(PathBuf::from("/r"), snap);
+        let a_tl = state.timeline_for(&sess("a"));
+        let a_shas: Vec<&str> = a_tl
+            .iter()
+            .filter_map(|e| match e {
+                crate::repo_state::TimelineEvent::Commit { sha, .. } => Some(sha.as_str()),
+                _ => None,
+            })
+            .collect();
+        let b_tl = state.timeline_for(&sess("b"));
+        let b_shas: Vec<&str> = b_tl
+            .iter()
+            .filter_map(|e| match e {
+                crate::repo_state::TimelineEvent::Commit { sha, .. } => Some(sha.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(a_shas, vec!["c1"]);
+        // b owns c2 (intro) and c3 (walks back through b).
+        assert_eq!(b_shas, vec!["c2", "c3"]);
+    }
+
+    #[test]
+    fn timeline_multiple_reviews_on_one_commit() {
+        let snap = DiskSnapshot {
+            head: Some(sha("c1")),
+            plan_files: vec![plan_file("foo", "c1", None, "# foo\n")],
+            history: vec![entry("c1", vec![touch("foo", PlanTouchKind::Intro)], false)],
+            feedback_files: vec![
+                feedback("foo", FeedbackPhase::Plan, Some("c1"), "alice", "APPROVE\n"),
+                feedback("foo", FeedbackPhase::Plan, Some("c1"), "bob", "REQUEST_CHANGES\n"),
+            ],
+        };
+        let state = derive_state(PathBuf::from("/r"), snap);
+        let timeline = state.timeline_for(&sess("foo"));
+        // 1 commit + 2 reviews
+        assert_eq!(timeline.len(), 3);
+        // Reviews are alphabetical by author (BTreeMap key order).
+        let authors: Vec<&str> = timeline
+            .iter()
+            .filter_map(|e| match e {
+                crate::repo_state::TimelineEvent::Review { author, .. } => {
+                    Some(author.as_str())
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(authors, vec!["alice", "bob"]);
     }
 
     /// Reusable fixture: foo plan (plan_intro c1) + one impl commit c2,

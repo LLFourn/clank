@@ -21,9 +21,14 @@ pub struct RepoState {
     pub root: PathBuf,
     pub sessions: BTreeMap<SessionId, Session>,
     pub head: Option<CommitSha>,
-    /// `git ls-tree HEAD`-derived ordered set of (commit_sha → attribution).
-    /// Built during rebuild by walking history past the oldest plan_intro.
+    /// (commit_sha → attribution). Lookup table; iteration order is
+    /// SHA-lex, not chronological. Use `commit_order` to walk the
+    /// history in chronological (first-parent oldest-first) order.
     pub attribution: BTreeMap<CommitSha, AttributionResult>,
+    /// Commits in chronological order (first-parent walk, oldest first).
+    /// Parallels `attribution`'s keys but preserves history order, which
+    /// `BTreeMap` does not.
+    pub commit_order: Vec<CommitSha>,
 }
 
 impl RepoState {
@@ -33,7 +38,77 @@ impl RepoState {
             sessions: BTreeMap::new(),
             head: None,
             attribution: BTreeMap::new(),
+            commit_order: Vec::new(),
         }
+    }
+
+    /// Chronological timeline of one session's activity. The renderer (web
+    /// UI, MCP responses, anything else) walks this list to display events
+    /// in order without needing to recombine attribution + feedback maps
+    /// itself.
+    ///
+    /// Order: commits attributed to `session_id` in first-parent walk
+    /// order (oldest first). Each commit is followed by the reviews
+    /// targeting it (plan reviews for plan_touch commits, impl reviews
+    /// for has_code_changes commits) sorted by author. Held flat-drop
+    /// feedback files come last with no target.
+    ///
+    /// Pure; sans-IO. Returns an empty vec if the session is unknown.
+    pub fn timeline_for(&self, session_id: &SessionId) -> Vec<TimelineEvent> {
+        let Some(session) = self.sessions.get(session_id) else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        for sha in &self.commit_order {
+            let Some(attr) = self.attribution.get(sha) else {
+                continue;
+            };
+            let AttributionResult::Attributed {
+                session: sid,
+                plan_touch,
+                has_code_changes,
+            } = attr
+            else {
+                continue;
+            };
+            if sid != session_id {
+                continue;
+            }
+            out.push(TimelineEvent::Commit {
+                sha: sha.clone(),
+                plan_touch: *plan_touch,
+                has_code_changes: *has_code_changes,
+            });
+            // Reviews targeting this commit, in (phase, author) order.
+            for ((target, author), fb) in &session.plan_feedback {
+                if target == sha {
+                    out.push(TimelineEvent::Review {
+                        phase: TimelinePhase::Plan,
+                        target: target.clone(),
+                        author: author.clone(),
+                        verdict: fb.verdict,
+                    });
+                }
+            }
+            for ((target, author), fb) in &session.impl_feedback {
+                if target == sha {
+                    out.push(TimelineEvent::Review {
+                        phase: TimelinePhase::Impl,
+                        target: target.clone(),
+                        author: author.clone(),
+                        verdict: fb.verdict,
+                    });
+                }
+            }
+        }
+        // Held flat-drop feedback last.
+        for held in &session.held_plan_feedback {
+            out.push(TimelineEvent::HeldFeedback {
+                author: held.author.clone(),
+                reason: held.reason,
+            });
+        }
+        out
     }
 
     /// Stable digest over every meaningful field in the state. Two states
@@ -128,6 +203,50 @@ impl RepoState {
         hasher.update(b"]");
 
         StateDigest(hasher.finalize().to_hex().to_string())
+    }
+}
+
+/// One row in the per-session timeline returned by
+/// `RepoState::timeline_for`. The renderer translates these to UI rows
+/// or MCP context entries; the core just emits them in order.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TimelineEvent {
+    /// A commit attributed to this session. The render layer decides
+    /// whether to label it "Plan revision" / "Implementation" / "Mixed"
+    /// based on `(plan_touch, has_code_changes)`.
+    Commit {
+        sha: CommitSha,
+        plan_touch: Option<PlanTouchKind>,
+        has_code_changes: bool,
+    },
+    /// A reviewer's verdict against a specific commit. Always follows
+    /// the `Commit` it targets in the timeline.
+    Review {
+        phase: TimelinePhase,
+        target: CommitSha,
+        author: AgentLabel,
+        verdict: Verdict,
+    },
+    /// A flat-drop feedback file that hasn't been canonicalized to a
+    /// target SHA yet. Shown at the end of the timeline.
+    HeldFeedback {
+        author: AgentLabel,
+        reason: &'static str,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TimelinePhase {
+    Plan,
+    Impl,
+}
+
+impl TimelinePhase {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            TimelinePhase::Plan => "plan",
+            TimelinePhase::Impl => "impl",
+        }
     }
 }
 

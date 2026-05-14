@@ -126,31 +126,8 @@ pub fn session_page(ctx: &Value) -> String {
         .as_str()
         .unwrap_or("—");
 
-    let impl_commits_html = render_commit_list(
-        ctx["implementation_commits"].as_array(),
-        id,
-        "commit",
-        "No implementation commits yet.",
-        latest_impl,
-    );
-    let plan_revisions_html = render_commit_list(
-        ctx["plan_revisions"].as_array(),
-        id,
-        "plan",
-        "No plan revisions found.",
-        latest_plan,
-    );
-
-    let plan_feedback_html = render_feedback_list(
-        ctx["plan_feedback"].as_array(),
-        "plan",
-        id,
-    );
-    let impl_feedback_html = render_feedback_list(
-        ctx["impl_feedback"].as_array(),
-        "impl",
-        id,
-    );
+    let timeline_html = render_timeline(ctx["timeline"].as_array(), id);
+    let _ = (latest_plan, latest_impl); // legacy hints, not displayed
 
     let pr_hint_html = if let Some(hint) = ctx.get("pr_hint").filter(|v| !v.is_null()) {
         let options = hint["options"].as_array().cloned().unwrap_or_default();
@@ -182,8 +159,20 @@ pub fn session_page(ctx: &Value) -> String {
          a{{color:#1d4ed8;text-decoration:none}}\
          a:hover{{text-decoration:underline}}\
          code{{background:#f3f4f6;padding:.1em .3em;border-radius:.25em;font-size:.9em}}\
-         ul.commits,ul.feedback{{list-style:none;padding:0}}\
+         ul.commits,ul.feedback,ol.timeline{{list-style:none;padding:0}}\
          ul.commits li,ul.feedback li{{padding:.25em 0;border-bottom:1px solid #f3f4f6}}\
+         ol.timeline{{border-left:2px solid #e5e7eb;margin-left:.5em;padding-left:1em}}\
+         ol.timeline li{{position:relative;padding:.5em .25em;margin-left:.5em}}\
+         ol.timeline li::before{{content:'';position:absolute;left:-1.6em;top:1em;\
+         width:.6em;height:.6em;border-radius:50%;background:#9ca3af}}\
+         li.tl-plan::before{{background:#3b82f6}}\
+         li.tl-impl::before{{background:#10b981}}\
+         li.tl-mixed::before{{background:#8b5cf6}}\
+         li.tl-done::before{{background:#6b7280}}\
+         li.tl-review::before{{background:#f59e0b;width:.4em;height:.4em;left:-1.5em;top:1.1em}}\
+         li.tl-held::before{{background:#e5e7eb;border:2px solid #f59e0b;left:-1.7em;top:1em}}\
+         .tl-label{{font-weight:600;margin-right:.5em}}\
+         .tl-phase{{color:#6b7280;font-size:.85em}}\
          .verdict-approve{{display:inline-block;padding:.1em .5em;border-radius:.4em;\
          background:#d1fae5;color:#065f46;font-weight:600;font-size:.85em}}\
          .verdict-request{{display:inline-block;padding:.1em .5em;border-radius:.4em;\
@@ -203,10 +192,7 @@ pub fn session_page(ctx: &Value) -> String {
          <dt>Plan path</dt><dd><code>{plan_path}</code></dd>\
          <dt>Worktree</dt><dd>{status}</dd>\
          </dl>\
-         <h2>Plan revisions</h2>{plan_revisions_html}\
-         <h2>Implementation commits</h2>{impl_commits_html}\
-         <h2>Plan feedback</h2>{plan_feedback_html}\
-         <h2>Implementation feedback</h2>{impl_feedback_html}\
+         <h2>Timeline</h2>{timeline_html}\
          {pr_hint_html}\
          <script>window.__trinity_sse = '/sessions/{id}/events';</script>\
          {LIVE_SCRIPT}\
@@ -259,8 +245,84 @@ fn html_escape(s: &str) -> String {
         .replace('>', "&gt;")
 }
 
+/// Render the unified per-session timeline. Each event is one `<li>`
+/// in an ordered list. Commits are clickable to their plan-revision or
+/// commit-diff view; reviews are indented under their target commit
+/// and carry the verdict chip + author name.
+fn render_timeline(events: Option<&Vec<Value>>, session_id: &str) -> String {
+    let events = events.map(|v| v.as_slice()).unwrap_or(&[]);
+    if events.is_empty() {
+        return "<p class=\"none\">No activity yet.</p>".to_string();
+    }
+    let mut s = String::from("<ol class=\"timeline\">");
+    for ev in events {
+        let kind = ev["kind"].as_str().unwrap_or("");
+        match kind {
+            "commit_plan" | "commit_impl" | "commit_mixed" | "commit_other" => {
+                let sha = ev["sha"].as_str().unwrap_or("");
+                let short = &sha[..7.min(sha.len())];
+                let plan_touch = ev["plan_touch"].as_str();
+                let has_code = ev["has_code_changes"].as_bool().unwrap_or(false);
+                let (label, css) = match (plan_touch, has_code) {
+                    (Some("intro"), false) => ("Plan created", "tl-plan"),
+                    (Some("intro"), true) => ("Plan created + impl", "tl-mixed"),
+                    (Some("revision"), false) => ("Plan revised", "tl-plan"),
+                    (Some("revision"), true) => ("Plan revised + impl", "tl-mixed"),
+                    (Some("done_move"), _) => ("Moved to done/", "tl-done"),
+                    (None, true) => ("Implementation", "tl-impl"),
+                    _ => ("Commit", "tl-other"),
+                };
+                // For done_move, link to the commit diff; for plan-touch
+                // (revision/intro), link to the plan body at that sha;
+                // for pure impl, link to the commit diff.
+                let route = if plan_touch == Some("done_move") {
+                    "commit"
+                } else if plan_touch.is_some() {
+                    "plan"
+                } else {
+                    "commit"
+                };
+                s.push_str(&format!(
+                    "<li class=\"tl-row {css}\"><span class=\"tl-label\">{label}</span> \
+                     <a href=\"/sessions/{session_id}/{route}/{sha}\"><code>{short}</code></a></li>"
+                ));
+            }
+            "review" => {
+                let phase = ev["phase"].as_str().unwrap_or("");
+                let author = ev["author"].as_str().unwrap_or("?");
+                let verdict = ev["verdict"].as_str().unwrap_or("unmarked");
+                let target = ev["target"].as_str().unwrap_or("");
+                let short = &target[..7.min(target.len())];
+                let (verdict_css, verdict_label) = match verdict {
+                    "approve" => ("verdict-approve", "APPROVE"),
+                    "request_changes" => ("verdict-request", "REQUEST_CHANGES"),
+                    _ => ("verdict-unmarked", "(unmarked)"),
+                };
+                let route = if phase == "plan" { "plan" } else { "commit" };
+                s.push_str(&format!(
+                    "<li class=\"tl-row tl-review\"><span class=\"{verdict_css}\">{verdict_label}</span> \
+                     <span class=\"tl-phase\">({phase})</span> from <strong>{author}</strong> on \
+                     <a href=\"/sessions/{session_id}/{route}/{target}\"><code>{short}</code></a></li>"
+                ));
+            }
+            "held_feedback" => {
+                let author = ev["author"].as_str().unwrap_or("?");
+                let reason = ev["reason"].as_str().unwrap_or("?");
+                s.push_str(&format!(
+                    "<li class=\"tl-row tl-held\"><span class=\"verdict-unmarked\">HELD</span> \
+                     from <strong>{author}</strong> <em>({reason})</em></li>"
+                ));
+            }
+            _ => {}
+        }
+    }
+    s.push_str("</ol>");
+    s
+}
+
 /// Render the per-phase feedback list. Each entry: verdict chip + author
 /// + (clickable) target SHA. Empty list → "No feedback yet."
+#[allow(dead_code)]
 fn render_feedback_list(
     entries: Option<&Vec<Value>>,
     phase: &str,
@@ -304,6 +366,7 @@ fn render_feedback_list(
 /// list is empty but `latest_fallback` is non-empty, fall back to a
 /// single-entry list with the fallback (for backward compat with older
 /// callers that only had `latest_*` data).
+#[allow(dead_code)]
 fn render_commit_list(
     commits: Option<&Vec<Value>>,
     session_id: &str,
