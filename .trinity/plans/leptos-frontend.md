@@ -1,0 +1,295 @@
+# Leptos SPA Frontend
+
+## Summary
+
+Replace `src/server/ui.rs` (raw maud HTML strings) with a Leptos SPA that talks to the existing daemon over JSON + SSE. The runtime, reducer, MCP surface, and HTTP API stay exactly as they are; this is a UI rewrite, not a daemon rewrite.
+
+The current daemon's `get_context` already returns a complete typed state shape — phase, waiting_on, timeline, review_target, write_feedback, pr_hint, feedback by phase. SSE already pushes change events. A reactive frontend is the natural shape: signals subscribe to SSE, re-fetch on event, render derived views. No htmx OOB acrobatics, no server-rendered HTML strings, no inline `<style>` per page.
+
+## Why now, not a maud restore
+
+The pre-rewrite UI lived in ~1900 LOC of maud strings + 600 LOC of CSS-in-Rust. Restoring it on the new core would be ~700 LOC of work that throws away cleanly once Leptos lands. The filesystem-truth core was designed for an SPA — pure projections, deterministic state digest, SSE on change. Leptos is the destination; jumping straight there avoids a maud detour.
+
+## Aesthetic direction
+
+**"Calm precision."** Trinity is a tool for thinking about code review, plan revisions, and commit attribution. The UI should feel like a well-edited technical journal — typographic hierarchy that breathes, generous whitespace, monospace for SHAs/diffs/code, sparing color used only for signal (verdict, phase state, waiting role). Not maximalist; not generic dashboard; closer to a refined documentation site with live data.
+
+### Typography
+
+| Use | Family | Source | Why |
+|---|---|---|---|
+| Display (h1, banners) | **Fraunces** | Google Fonts (variable, OFL) | Distinctive variable serif with soft/hard axis; sets editorial tone without being cute |
+| Body / chrome | **General Sans** | Fontshare (Indian Type Foundry, free) | Modern grotesque, very legible at small sizes, slightly warmer than Helvetica/Inter |
+| Monospace | **JetBrains Mono** | Google Fonts (OFL) | Industry-standard for code, has ligatures, opens up at small sizes |
+
+All three self-hosted from `/static/fonts/`. No CDN dependency.
+
+### Color tokens
+
+CSS custom properties, dark-by-default with a light counterpart toggled by `prefers-color-scheme: light`.
+
+```css
+:root {
+  --bg:           #0d1117;   /* deep blue-black; reads as paper at night */
+  --surface:      #161b22;   /* cards, code blocks */
+  --surface-2:    #1f2730;   /* hover state, inset wells */
+  --border:       #30363d;
+  --text:         #e6edf3;   /* warm off-white, not pure white */
+  --text-muted:   #8b949e;
+  --text-dim:     #6e7681;
+  --accent:       #d2a8ff;   /* dusty violet — Trinity's one signature color */
+  --approve:      #3fb950;   /* muted green */
+  --request:      #f85149;   /* muted red */
+  --pending:      #d29922;   /* amber for held / changes_requested */
+  --mute:         #484f58;
+}
+```
+
+The accent is used once per view as the "you are here" affordance — current SHA, active link, focused waiting_on role. Verdicts have their own colors; phase chips reuse approve/pending/mute.
+
+### Motion
+
+Subtle, signal-driven. Three rules:
+
+1. **New events pulse, don't bounce.** When SSE delivers a new commit/review, the row's left border flashes the accent color for 600ms then fades. No scale transforms.
+2. **Loading is a single skeleton.** No spinners. Lazy data slots show a 1px-wide animated gradient line (the underline trick) until they fill.
+3. **Reductive transitions.** Toggling between sessions is an instant route swap. Opening details (`<details>` for files in a diff) uses the native browser animation.
+
+### Layout
+
+A two-column reading layout for session detail (sidebar with metadata + waiting_on + gates; main column with timeline + plan body + diffs). Single-column for the homepage. The header stays sticky on scroll and shows the session id + a compact waiting_on chip when scrolled past 100px.
+
+Wide reading column (~720px max for prose; full-width for diffs). Generous margin top so the eye lands well.
+
+## Architecture
+
+```
+                   +------------------+
+                   |  Leptos SPA      |
+                   |  (WASM)          |
+                   |                  |
+   +- SSE --------->|  reactive signals|
+   |               +--------+---------+
+   |                        |
+   |                        | JSON HTTP
+   |                        v
++--+--------------------------+
+|  axum (current daemon)      |
+|  GET  /events (SSE)         |
+|  GET  /api/sessions         |
+|  GET  /api/sessions/:id     |
+|  GET  /api/sessions/:id/plan/:sha
+|  GET  /api/sessions/:id/commit/:sha
+|  GET  /api/diff?from=&to=&path=
+|  POST /sessions/:id/done    |
+|  POST /internal/tool_call   |  (MCP, unchanged)
++--+--------------------------+
+   |
+   v
++------------------+
+|  Runtime         |
+|  (in-memory)     |
++--+---------------+
+   |
+   v
++------------------+
+|  rebuild_repo    |
+|  (filesystem +   |
+|   git, sans-IO   |
+|   derive_state)  |
++------------------+
+```
+
+The daemon adds a small JSON-API layer at `/api/*` that wraps existing `mcp_response::*` builders + new diff endpoints. The SPA bundle is served from `/` and `/static/*`.
+
+## Routes (client-side)
+
+| Path | Component | Data sources |
+|---|---|---|
+| `/` | `<Home/>` | `GET /api/sessions` |
+| `/sessions/:id` | `<SessionDetail/>` | `GET /api/sessions/:id` |
+| `/sessions/:id/plan/:sha` | `<PlanRevision/>` | `GET /api/sessions/:id/plan/:sha` |
+| `/sessions/:id/commit/:sha` | `<CommitDiff/>` | `GET /api/sessions/:id/commit/:sha` |
+| `/sessions/:id/plan/:sha/diff?vs=:other` | `<PlanDiff/>` | `GET /api/diff?from=:other&to=:sha&path=...` |
+
+Every component subscribes to a single global SSE store; when an event for "their" repo/session arrives, the resource is invalidated and refetched.
+
+## Component model
+
+Top-down:
+
+- **`<App/>`** — `Router` + global `EventStore` provided via context.
+- **`<Header/>`** — sticky, fades in chip + waiting badge when scrolled past 100px.
+- **`<Home/>`** — `<SessionTable/>` for active sessions, `<SessionTable/>` for done sessions, `<ActivitySidebar/>` showing the last 40 SSE events with relative timestamps.
+- **`<SessionTable/>`** — rows of `<SessionRow/>`. Each row: session id (link), phase chip, worktree-status chip, waiting_on chip, "last activity X ago".
+- **`<SessionDetail/>`** —
+  - Sidebar: `<MetaStrip/>` (base commit, repo, plan_path, worktree status, plan-gate, impl-gate), `<WaitingBanner/>` with full description + agents list.
+  - Main: `<Timeline/>` (the unified one — Commit / Review / HeldFeedback rows), `<FeedbackList/>` (cards grouped by target SHA, collapsible), `<PrHintPanel/>` (when phase is implementing — squash command preview with copy-to-clipboard).
+- **`<PlanRevision/>`** — `<MarkdownRenderer/>` for the plan body (server-rendered HTML from `pulldown-cmark`, sanitized with `ammonia`), `<FeedbackList/>` filtered to this SHA, prev/next nav links.
+- **`<CommitDiff/>`** — `<StructuredDiff/>` (file list, fold-by-file `<details>`, line numbers, +/- coloring), `<FeedbackList/>` filtered to this SHA.
+- **`<PlanDiff/>`** — `<StructuredDiff/>` for plan body between two revisions, with a header noting "Plan: from sha_a … to sha_b".
+- **`<MarkdownRenderer/>`** — receives HTML string from server (already sanitized), wraps in `<article class="prose">` for typography.
+- **`<StructuredDiff/>`** — server-side parsed `Vec<DiffFile>` JSON; client renders. Each file: `<details open>` with `<summary>` showing path + insertions/deletions stats; body is a `<table>` of line numbers + content with class for +/- coloring.
+- **`<FeedbackCard/>`** — verdict pill, author, target SHA link, body rendered as markdown (sanitized).
+- **`<Timeline/>`** — vertical list with colored left-edge markers. New events animate the marker pulse for 600ms.
+
+## Reactive state + SSE integration
+
+A single `EventStore` resource is created once at app startup:
+
+```rust
+let store = create_rw_signal(EventStore::default());
+let _conn = create_local_resource(
+    || (),
+    move |_| {
+        let store = store.clone();
+        async move { connect_sse(store).await }
+    },
+);
+provide_context(store);
+```
+
+`connect_sse` opens `EventSource` (browser API), parses each message, and writes the event into the store's `last_event` signal. Components that depend on a specific repo's data use `create_resource` keyed on `(repo, session_id, last_event_for_that_repo)`. When a new event arrives, the resource's key changes → re-fetch → reactive views update.
+
+This means **no manual cache invalidation**. Adding a new component automatically gets live updates as long as it depends on the resource.
+
+## Server-side additions
+
+Minimal additions on top of the existing daemon:
+
+1. **`/api/*` JSON endpoints**. Thin wrappers around `mcp_response::*` plus:
+   - `GET /api/sessions/:id/plan/:sha` → `{ body_html, body_raw, plan_intro, plan_intro_parent, previous_sha, next_sha }`. Body is pre-rendered HTML via pulldown-cmark + ammonia.
+   - `GET /api/sessions/:id/commit/:sha` → `{ diff_files: Vec<DiffFile> }`. DiffFile is parsed from `git show` output.
+   - `GET /api/diff?from=&to=&path=` → `{ diff_files }`. For plan-rev-vs-rev.
+
+2. **`src/diff_parser.rs`**. Port the deleted parser from `a2d7b5d^:src/daemon/diff_parser.rs`. Pure Rust, no IO. Tests: ~10 cases covering add/modify/delete/rename/binary/multi-hunk.
+
+3. **Static-file route**. axum `tower-http`'s `ServeDir` for `/static/` and a `/` route that serves `index.html` (the Leptos shell).
+
+4. **`Feedback.created_at: i64`**. File mtime, populated in `git_io::collect_feedback_files`. Lets the client sort feedback chronologically.
+
+## Workspace structure
+
+Add a second crate to the workspace for the Leptos client:
+
+```
+trinity/
+├── Cargo.toml            # workspace
+├── src/                  # existing daemon (binary `trinity`)
+└── frontend/
+    ├── Cargo.toml        # cdylib + bin (CSR)
+    ├── index.html
+    ├── style.css
+    ├── public/
+    │   └── fonts/
+    └── src/
+        ├── main.rs
+        ├── api.rs        # typed fetch wrappers
+        ├── store.rs      # EventStore + SSE connection
+        ├── components/
+        │   ├── home.rs
+        │   ├── session_detail.rs
+        │   ├── plan_revision.rs
+        │   ├── commit_diff.rs
+        │   ├── timeline.rs
+        │   ├── feedback_card.rs
+        │   ├── structured_diff.rs
+        │   └── markdown.rs
+        └── route.rs
+```
+
+Build via `trunk` (simpler than cargo-leptos for CSR-only). `trunk build --release` produces `dist/` which the daemon serves as static.
+
+## Phases
+
+Five commits, each green-buildable, each landing a usable slice.
+
+### Phase 1 — JSON API + frontend crate scaffold (1 commit)
+
+- Add `/api/sessions`, `/api/sessions/:id`, `/api/sessions/:id/plan/:sha`, `/api/sessions/:id/commit/:sha` returning the same shapes the current HTML pages render from.
+- Restore `src/diff_parser.rs` from `a2d7b5d^` with its unit tests.
+- Pre-render markdown via `pulldown-cmark` + sanitize via `ammonia` on the server (already deps).
+- Add `Feedback.created_at` to the state model; populate via `fs::metadata`.
+- Add `frontend/` crate skeleton with a `<Home/>` that fetches `/api/sessions` and renders a basic table.
+- Daemon serves `/static/*` and `/` (Leptos shell).
+- Acceptance: `trunk build` succeeds; loading `/` in a browser shows the session list driven by the API.
+
+### Phase 2 — Session detail + timeline + feedback cards (1 commit)
+
+- `<SessionDetail/>` with sidebar + main column.
+- `<Timeline/>` rendering Commit / Review / HeldFeedback events with proper marker styling.
+- `<FeedbackCard/>` with verdict pill + author + body markdown.
+- `<MetaStrip/>` + `<WaitingBanner/>` + review-gate chips.
+- Acceptance: `/sessions/filesystem-truth-rewrite` shows all the same info as the current page, but with proper typography and a real two-column layout.
+
+### Phase 3 — Plan revision + commit diff + plan-rev-vs-rev diff (1 commit)
+
+- `<PlanRevision/>` with rendered markdown, prev/next nav, feedback filtered to this SHA.
+- `<CommitDiff/>` with structured `<details>`-per-file + line numbers + coloring.
+- `<PlanDiff/>` with the same structured-diff component over plan-body diffs.
+- Acceptance: every link in the timeline opens a rendered, readable view. A 1000-line diff is browsable (file list at top, expand-on-click).
+
+### Phase 4 — SSE-driven live updates (1 commit)
+
+- `EventStore` + `connect_sse` glue.
+- Every `create_resource` keyed on `(target, last_event_for_target)`.
+- Marker-pulse animation on row insertion.
+- Activity sidebar on the homepage subscribes to the global event stream.
+- Acceptance: commit something in a watched repo; without refreshing the browser, the timeline grows a new row with a brief accent pulse, and the activity sidebar gets a new entry at the top.
+
+### Phase 5 — Typography, color, polish (1 commit)
+
+- Self-host the three fonts under `/static/fonts/`.
+- Final CSS pass with the color tokens above and prefers-color-scheme: light counterpart.
+- Sticky header behavior.
+- Copy-to-clipboard on `pr_hint` commands.
+- Remove the old `src/server/ui.rs` (replace `home`, `session_detail`, `plan_revision_view`, `commit_diff_view` routes with redirects to the SPA).
+- Delete the inline-style chime infrastructure; reimplement in `frontend/src/store.rs` as a Web Audio call when an event arrives.
+- Acceptance: visit `/` in a fresh browser tab and the result is visibly distinct from the maud version — better typography, calmer color, no white-on-white, and instantly responsive to live events.
+
+## Acceptance criteria
+
+- `frontend/` crate builds clean via `trunk build --release` from a CI-like environment (no extra system deps beyond the Rust toolchain).
+- Daemon serves the SPA bundle from `/` and the JSON API from `/api/*`.
+- No JS or TS outside `frontend/index.html` (the Leptos bootstrap shell).
+- `src/server/ui.rs` is deleted by the end of Phase 5.
+- No inline `<style>` strings in Rust source after Phase 5.
+- Every page from the gap list in the (deleted) `frontend-restore.md` has a Leptos component.
+- SSE-driven live update on every page: dropping a feedback file or making a commit visibly updates the open page without refresh within one debounce window.
+- Typography uses the three named fonts; no system font fallback in the prose styles.
+- One signature accent color used consistently for "current focus" affordance.
+
+## Non-goals
+
+- No SSR. Pure CSR via trunk. The daemon serves JSON; the client renders.
+- No Tauri / desktop bundling. Browser-only.
+- No state-sync framework beyond plain `create_resource`. No Redux/Zustand analog.
+- No GraphQL. JSON over HTTP.
+- No icon library. SVG inline only where unavoidable (verdict markers, prev/next arrows).
+- No CSS framework. Hand-written CSS with custom properties.
+- No service worker / offline mode.
+- No comment/feedback submission form. Reviewers continue to write `.trinity/feedback/*` files directly.
+- No new auth model.
+
+## Risks
+
+- **WASM bundle size.** Leptos + a structured-diff renderer + markdown styles can push the bundle to 500KB+. Mitigation: `wasm-opt`, drop unused features, accept the gzipped size.
+- **Font loading flash.** Self-hosted fonts may FOIT/FOUT. Mitigation: `font-display: swap` + size-adjust descriptors to match metrics.
+- **SSE reconnection.** Browsers reconnect EventSource automatically on disconnect, but reconnection storms during daemon restart need backoff. Mitigation: explicit exponential backoff in `connect_sse`.
+- **Markdown injection.** Plans are author-controlled, but the author may be an LLM. Mitigation: `ammonia` defaults block scripts and most attributes; configure to allow a safe subset (headings, lists, code, links, tables, emphasis).
+- **Live activity flood.** A noisy repo could push events faster than the UI can re-render. Mitigation: debounce SSE-triggered refetches at 250ms in the store; cap activity-sidebar updates at one per second.
+- **Static fonts in repo.** Hosting fonts in git adds ~500KB to the repo. Acceptable — the alternative (CDN) breaks offline dev.
+
+## Implementation notes
+
+- Use `leptos_router` for client-side routing, `leptos_meta` for `<title>` updates per route.
+- Keep components in single files; prefer many small components over fewer large ones.
+- Type the API responses with `serde::Deserialize` structs in `frontend/src/api.rs`; share the shape definitions with the daemon by extracting them to a tiny `trinity-api` crate in the workspace, OR just duplicate them with comments noting they must stay in sync. (Defer the shared-types crate until Phase 3 when the friction shows.)
+- The `EventStore` should expose typed accessors: `store.last_for_session(id) -> Memo<Option<LiveEvent>>`, so components don't reach into raw signal state.
+- CSS lives in one file (`frontend/style.css`); no CSS-in-Rust, no styled-components analog. Discipline beats tooling.
+
+## Open questions
+
+- **Path of `index.html` in dev vs prod.** Trunk serves `dist/index.html` on its own port during dev; daemon serves the same file from `/` in prod. Need to configure CORS or a trunk proxy for dev → daemon API calls.
+- **Bundle hash / cache headers.** Production should serve immutable assets with content-hash filenames. `trunk` supports this; verify the daemon sets cache headers correctly.
+- **Light mode default vs dark default.** Defaulting to dark matches developer expectation; auto-toggle via `prefers-color-scheme` is the right move. Provide a manual override in the header via local storage.
