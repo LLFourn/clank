@@ -10,7 +10,16 @@ Trinity reacts to **any HEAD change** (branch switch, commit, reset, rebase, mer
 
 **A session exists only when its plan file is committed in `HEAD`.** Uncommitted files in `.trinity/plans/` are drafts — not sessions, not in state, not in any list, no phase, no review gate. Trinity reads plan paths via `git ls-tree HEAD -- .trinity/plans/`, never via filesystem scan. To start a session, commit the plan file. To revise a plan, commit the change. To retire a session, `mv` the plan into `plans/done/` and commit the move.
 
-**Working-tree plan edits to a committed plan are tracked as "plan dirty."** While a session's plan file in the working tree differs from the version in HEAD, plan-phase feedback is held: Trinity refuses to auto-organize plan feedback into the current target SHA's directory and surfaces the held files in the UI. Once the user commits the revision, HEAD moves, rebuild fires, and held feedback gets routed to the new target. Impl-phase feedback is unaffected (impl reviews target commit SHAs, not the working tree).
+**Working-tree state for a session's plan file is a derived projection — `plan_worktree_status`.** Computed at read time by comparing HEAD's plan blob to the working-tree path. Four states:
+
+- `clean` — working-tree body == HEAD body at the active plan path.
+- `body_dirty` — file at active path; body differs from HEAD's blob.
+- `done_move_pending` — active path absent in working tree, file present at `plans/done/<id>.md`. The operator ran `POST /sessions/{id}/done` (or did a manual `mv`) but hasn't committed.
+- `missing_active_plan_file` — active path absent in working tree, no done counterpart either. Operator deleted the file without doing a proper move.
+
+Any non-`clean` status puts the session in a "waiting on master" state with case-specific guidance (see the Waiting On table). While `body_dirty`, plan-phase feedback is held; Trinity refuses to auto-organize plan feedback into the current target SHA's directory until the revision lands. Impl-phase feedback is unaffected (impl reviews target commit SHAs, not the working tree).
+
+`plan_worktree_status` is **never stored on `Session`**. It is computed at every `get_context` request, every rebuild, every feedback observation. Pure working-tree edits with no other event won't update the UI immediately — refresh or the next event will pick up the new status.
 
 Live activity is an in-memory ring buffer driving SSE and the existing chime; restarting drops the live feed. History lives in git and is rendered per-session on demand.
 
@@ -58,11 +67,12 @@ To switch sessions on the same branch, commit a touch to the new plan file. To o
 Whenever Trinity observes a HEAD change for a repo (branch switch, new commit, reset, rebase, merge), it rebuilds that repo's in-memory state from scratch:
 
 1. `git ls-tree -r HEAD -- .trinity/plans/` to list committed plan files (active + `done/`). These — and only these — define the session set for this repo. Untracked working-tree files in `.trinity/plans/` are drafts; ignored.
-2. For each plan path, read body via `git show HEAD:<path>` (or read the working-tree file; same content for committed paths assuming the worktree matches HEAD).
+2. For each plan path, read body from HEAD's blob via `git show HEAD:<path>`.
 3. Compute `plan_intro` for each session via `git log --diff-filter=A --follow --format=%H -- <plan_path> | tail -1`.
 4. Walk reachable history from current HEAD (e.g. `git log --format=%H --first-parent <oldest_plan_intro>..HEAD`); for each commit, run `git diff-tree -r --name-status -M`, classify per the four rules, populate `attribution`.
 5. Reload feedback files (working tree) into `plan_feedback` / `impl_feedback` maps.
-6. Broadcast a single live event noting the rebuild.
+6. **Held-feedback normalization sweep.** For each session, compute `plan_worktree_status`. If now `clean` and there are flat-path plan-phase feedback files on disk (no `<sha>/` directory in the path), emit `MoveFeedbackFile` effects to relocate them to `<plan>/<current-plan-target-sha>/<author>.md`. After moves complete, the gate recomputes naturally on the next read.
+7. Broadcast a single live event noting the rebuild.
 
 No incremental walk, no `<prior_head>..<new_head>` cleverness. Always full rebuild. Cold-start cost is small enough (sub-250 ms for 10 sessions × 50 commits each) that incrementalism isn't worth the bug surface.
 
@@ -121,10 +131,17 @@ pub struct Session {
     pub plan_path: PathBuf,                    // canonical: plans/<id>.md or plans/done/<id>.md
     pub body: String,                          // body from HEAD's tree
     pub body_hash: ContentHash,                // hash of HEAD's body
-    pub plan_dirty: bool,                      // working-tree body ≠ HEAD body
     pub plan_feedback: BTreeMap<(CommitSha, AgentLabel), Feedback>,
     pub impl_feedback: BTreeMap<(CommitSha, AgentLabel), Feedback>,
-    pub held_plan_feedback: Vec<HeldFeedback>, // dropped while plan_dirty == true
+    pub held_plan_feedback: Vec<HeldFeedback>, // flat-path plan feedback held while non-clean
+}
+
+// `plan_worktree_status` is NOT stored on Session — it is computed at every read.
+pub enum PlanWorktreeStatus {
+    Clean,
+    BodyDirty,
+    DoneMovePending,            // working tree has plans/done/<id>.md, not plans/<id>.md; HEAD has the inverse
+    MissingActivePlanFile,      // working tree has neither plans/<id>.md nor plans/done/<id>.md
 }
 
 pub struct HeldFeedback {
@@ -160,7 +177,7 @@ Derivations:
 - **Implementation commits list for session X:** `Attributed { session: X, has_code_changes: true, .. }`.
 - **Mixed commit:** appears in both the plan-revisions and impl-commits lists. UI marks the row.
 - **Review gate:** derived from `plan_feedback` / `impl_feedback` against current target SHA. SHA-anchored — stale ≡ "verdict for a SHA that isn't the current target." No persistence, no overrides.
-- **`waiting_on`:** derived per session per the case table in "Waiting On — who blocks progress." Always one of `master`, `reviewers`, or `none`. Combines `plan_dirty`, phase, review-gate state, and participant set.
+- **`waiting_on`:** derived per session per the case table in "Waiting On — who blocks progress." Always one of `master`, `reviewers`, or `none`. Combines `plan_worktree_status`, phase, review-gate state, and participant set.
 
 ## Disk Format
 
@@ -186,7 +203,9 @@ First non-empty line: `APPROVE` or `REQUEST_CHANGES`. (The target SHA is in the 
 
 **History preservation.** Old feedback files for past targets stay in their `<old-sha>/` directories. The UI surfaces them as historical verdicts. Only files under the current target SHA count toward the current gate.
 
-**Plan-dirty hold.** When a session's `plan_dirty` is true, plan-phase feedback (flat or otherwise) is **not auto-organized**. The file stays where the reviewer put it and is recorded as `HeldFeedback { reason: "plan_dirty" }`. The session detail page shows: "Plan has uncommitted changes. N pending plan reviews held until the change is committed." Once the operator commits and HEAD changes → rebuild fires → `plan_dirty` flips false → held files get auto-organized to the new plan target SHA's directory. Impl-phase feedback is never held; impl reviews target commit SHAs which are unaffected by working-tree dirtiness.
+**Plan-dirty hold.** When a session's `plan_worktree_status` is `body_dirty`, plan-phase feedback (flat or otherwise) is **not auto-organized**. The file stays where the reviewer put it and is recorded as `HeldFeedback { reason: "plan_dirty" }`. The session detail page shows: "Plan has uncommitted changes. N pending plan reviews held until the change is committed." Once the operator commits and HEAD changes → rebuild fires → `plan_worktree_status` becomes `clean` → held files get auto-organized to the new plan target SHA's directory via the rebuild's normalization sweep. Impl-phase feedback is never held; impl reviews target commit SHAs which are unaffected by working-tree dirtiness.
+
+Other non-clean states (`done_move_pending`, `missing_active_plan_file`) don't hold feedback — they're operator-state-machine issues that just need a commit to resolve. The waiting_on banner tells the operator what to do; feedback arriving in this window is routed normally (against whatever plan_target_sha is current in HEAD).
 
 ### `.gitignore` setup
 
@@ -269,8 +288,10 @@ The full case table — checked top-down, first match wins:
 
 | Condition | `waiting_on.role` | `reason` | `agents` |
 |---|---|---|---|
-| Plan moved to `plans/done/` | `none` | `session_done` | — |
-| Session has uncommitted plan changes (`plan_dirty == true`) | `master` | `commit_plan_revision` | — |
+| Plan in HEAD under `plans/done/` (committed done move) | `none` | `session_done` | — |
+| `plan_worktree_status == done_move_pending` | `master` | `commit_done_move` | — |
+| `plan_worktree_status == missing_active_plan_file` | `master` | `restore_or_commit_done_move` | — |
+| `plan_worktree_status == body_dirty` | `master` | `commit_plan_revision` | — |
 | Phase = `planning`, gate = `changes_requested` | `master` | `address_plan_request_changes` | (the reviewers who requested changes, for context) |
 | Phase = `planning`, gate = `ready` | `master` | `ready_to_implement` | — |
 | Phase = `planning`, gate = `needs_review`, no participants yet | `reviewers` | `plan_needs_initial_review` | (empty — anyone) |
@@ -279,6 +300,8 @@ The full case table — checked top-down, first match wins:
 | Phase = `implementing`, gate = `ready` | `master` | `ready_to_finish` | — |
 | Phase = `implementing`, gate = `needs_review`, no participants yet | `reviewers` | `impl_needs_initial_review` | (empty — anyone) |
 | Phase = `implementing`, gate = `needs_review`, participants with stale votes | `reviewers` | `impl_needs_rereview` | (the participants with stale votes for the current impl target) |
+
+The first four rows (worktree-status-driven) preempt the gate-driven rows. A session whose worktree state diverges from HEAD always waits on master to reconcile before review state matters.
 
 Notes:
 
@@ -357,10 +380,10 @@ When the session exists, returns:
 
 - `phase` (`planning` | `implementing`), `expected_action`
 - `waiting_on`: the canonical per-session progress signal — `{ role, reason, agents, description }` per the "Waiting On" section. Always present.
-- `plan_dirty: bool` — true when the working-tree plan body differs from HEAD's plan body. When true, `waiting_on.role` is `master` with `reason: commit_plan_revision`; `expected_action` for the master matches.
+- `plan_worktree_status`: `"clean" | "body_dirty" | "done_move_pending" | "missing_active_plan_file"` — computed fresh at request time. Drives the top four rows of the waiting_on case table when non-clean.
 - `review_gate` (derived, SHA-anchored, no overrides)
 - `review_target`, `latest_plan_revision`, `latest_implementation_revision` (derived)
-- `write_feedback`: `{ kind, path: ".../<phase>/<current-target-sha>/<author>.md", status }`. When `plan_dirty` is true and the caller would be writing plan feedback, `status` is `"held_until_plan_committed"` and the caller is advised to wait.
+- `write_feedback`: `{ kind, path: ".../<phase>/<current-target-sha>/<author>.md", status }`. When `plan_worktree_status == body_dirty` and the caller would be writing plan feedback, `status` is `"held_until_plan_committed"` and the caller is advised to wait.
 - `prior_feedback`, `other_feedback_files` (each entry includes `target_sha`)
 - `held_plan_feedback`: list of currently-held plan feedback files (path, author, reason).
 - `pr_hint` (when phase = implementing):
@@ -448,9 +471,10 @@ One large rewrite, sequenced as six commits.
 - **Attribution overrides require amending.** Trinity offers no UI/MCP/HTTP affordance for changing a commit's session. Operators amend the commit to change which plan paths it touches.
 - **Uncommitted plan files are not sessions.** `start_plan` creates a working-tree file but the session does not appear in `list_sessions`, `get_context`, or the homepage until the file is committed and HEAD moves. `get_context` for an uncommitted session_id returns the `session_not_committed` error.
 - **Working-tree plan edits produce no observation.** Editing `<plan_path>` without committing causes no `PlanFileChanged`, no plan revision, no live event, no `RebuildRepo`.
-- **Plan-dirty holds plan feedback.** When a session's working-tree plan body differs from HEAD's plan body, plan-phase feedback dropped during that window is held: the file is not auto-organized into `<plan/<target-sha>/<author>.md`; it appears in `Session.held_plan_feedback` and in the session detail page's "Held reviews" banner. Impl-phase feedback proceeds normally.
-- **Held feedback releases on plan commit.** After the operator commits the plan revision and `plan_dirty` flips false, previously-held feedback files get auto-organized to the new plan target SHA within one watcher round; the held banner clears.
-- **`get_context.plan_dirty` reports working-tree vs HEAD divergence.** When dirty, `expected_action` is `commit_plan_revision` for the plan author and the response carries the exact `git add` + `git commit` invocations.
+- **`plan_worktree_status` is a derived projection.** Computed at every `get_context` request, every rebuild, every feedback observation. Never stored on `Session`.
+- **Plan-dirty holds plan feedback.** When `plan_worktree_status == body_dirty`, plan-phase feedback dropped during that window is held: the file is not auto-organized; it appears in `Session.held_plan_feedback` and in the session detail page's banner. Impl-phase feedback proceeds normally.
+- **Held feedback releases on plan commit.** When the operator commits and HEAD changes → rebuild fires → status flips to `clean` → the rebuild's normalization sweep emits `MoveFeedbackFile` effects for flat-path plan-phase files → files land at `<plan>/<new-target-sha>/<author>.md` → gate recomputes → banner clears. The release does not require any new filesystem event.
+- **`done_move_pending` interval has explicit waiting_on.** Between `POST /sessions/{id}/done` (working-tree `mv`) and the operator's commit, `waiting_on.role` is `master`, `reason` is `commit_done_move`. Once HEAD contains the new path, status is `clean` (plan now lives at `plans/done/<id>.md`) and `waiting_on.reason` becomes `session_done`.
 - **`waiting_on` is always exactly one of `master`, `reviewers`, `none`.** Computed deterministically from the case table; no session ever lacks a waiting_on value while active.
 - **`waiting_on` cases match the table precisely.** Each row of the table has integration coverage: dirty plan → master/commit_plan_revision; gate=changes_requested → master/address_*_request_changes; gate=needs_review with no participants → reviewers/initial_review; gate=needs_review with stale participants → reviewers/rereview with named agents; gate=ready → master/ready_to_*; done → none.
 - **MCP `get_context.waiting_on` matches the web UI's banner.** Both render from the same derivation; descriptions are byte-identical.
@@ -476,10 +500,13 @@ Integration (`tests/`):
 
 - `start_plan` in a fresh repo: plan file created in working tree, `.gitignore` updated, repo registered. Session does NOT yet appear in `list_sessions` (file isn't committed). `get_context` on the session_id returns `session_not_committed` error.
 - Commit the plan file → HEAD changes → rebuild → session appears in `list_sessions` with phase `planning`.
-- Edit the committed plan file in the working tree without committing → no `RebuildRepo` fires; no plan revision recorded; `plan_dirty` flips true (computed on next `get_context` or `FeedbackChanged`); banner appears.
-- Drop a plan feedback file while `plan_dirty` is true: file stays where written; `held_plan_feedback` includes it; gate is not affected; banner shows "1 held review."
-- Commit the plan revision: HEAD changes → rebuild → `plan_dirty` flips false → held file auto-organized into `<plan/<new-target-sha>/<author>.md` → gate recomputes → banner clears.
-- Drop an impl feedback file while `plan_dirty` is true: routes normally to `<impl/<current-impl-sha>/<author>.md`; not held.
+- Edit the committed plan file in the working tree without committing → no `RebuildRepo` fires; no plan revision recorded; on next `get_context` or feedback observation `plan_worktree_status` is `body_dirty`; banner appears.
+- Drop a plan feedback file while `body_dirty`: file stays where written; `held_plan_feedback` includes it; gate is not affected; banner shows "1 held review."
+- Commit the plan revision: HEAD changes → rebuild → `plan_worktree_status` clean → rebuild's normalization sweep moves held file into `<plan/<new-target-sha>/<author>.md` → gate recomputes → banner clears.
+- Drop an impl feedback file while `body_dirty`: routes normally to `<impl/<current-impl-sha>/<author>.md`; not held.
+- `POST /sessions/{id}/done`: working-tree `mv` runs; `git status` shows the rename uncommitted; `plan_worktree_status` is `done_move_pending`; `waiting_on` is `master/commit_done_move`; UI banner reflects.
+- Operator commits the done move: HEAD now contains `plans/done/<id>.md`; rebuild fires; `plan_worktree_status` is `clean`; `waiting_on` becomes `none/session_done`; session moves to the homepage's "Done" section.
+- Delete the active plan file without committing or moving: `plan_worktree_status` is `missing_active_plan_file`; `waiting_on` is `master/restore_or_commit_done_move`.
 - `waiting_on` case coverage (each row of the case table gets one integration test):
   - Plan committed, no reviews yet → `reviewers` / `plan_needs_initial_review` / `agents: []`.
   - Alice writes `APPROVE` → `master` / `ready_to_implement` (one approval, no other participants).
@@ -489,8 +516,11 @@ Integration (`tests/`):
   - First impl commit → phase implementing, `reviewers` / `impl_needs_initial_review`.
   - Alice approves impl, Bob requests changes on impl → `master` / `address_impl_request_changes` / `agents: ["bob"]`.
   - Address impl, all approve → `master` / `ready_to_finish`.
-  - `mv plans/<id>.md plans/done/<id>.md` + commit → `none` / `session_done`.
-  - Working-tree edit to plan during any planning state → `master` / `commit_plan_revision` (preempts all other states).
+  - `POST /sessions/<id>/done` (working-tree mv only) → `master` / `commit_done_move`.
+  - Operator commits the done move → `none` / `session_done`.
+  - Working-tree edit to a committed plan (body_dirty) → `master` / `commit_plan_revision` (preempts all gate-driven rows).
+  - Delete the active plan file without committing or moving → `master` / `restore_or_commit_done_move`.
+  - Precedence: a session in `body_dirty` AND with stale plan reviews → resolves to `master` / `commit_plan_revision` (worktree-status rows preempt gate-driven rows).
 - `start_plan` adopts an existing plan file without overwriting body.
 - `start_plan` in a repo with `.trinity/` wholesale-gitignored: clear error.
 - Commit the plan (`A` status); commit code: attribution map records the impl commit against the session; phase flips to implementing.
