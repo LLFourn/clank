@@ -2,14 +2,19 @@
 
 ## Summary
 
-Add a tool that **blocks until work is available for a given role**, then returns the matching session(s) with everything the caller needs to act. Exposed identically over MCP and HTTP. The agent's loop becomes:
+Add a tool that **blocks until work is available for a given role**, then returns minimal identifiers for the matching session(s). Exposed identically over MCP and HTTP. The agent's loop becomes:
 
 ```
 loop {
-    let work = wait_for_work({ role: "reviewer" })  // blocks
-    do_review(work)
+    let work = wait_for_work({ role: "reviewers" })  // blocks
+    for match in work.matches {
+        let ctx = get_context({ repo: match.repo, session_id: match.session_id })
+        do_review(ctx)
+    }
 }
 ```
+
+The `wait_for_work` response is intentionally minimal so a loop's accumulated context stays small even after many wake-ups; the agent fetches full session detail via `get_context` for the one they choose to act on.
 
 No more polling `get_context` every few seconds. The daemon already has a `tokio::sync::broadcast::Sender<LiveEvent>` (`Runtime::events_tx`) for SSE; this tool subscribes to the same channel + checks current state on entry, returning the first match.
 
@@ -17,27 +22,44 @@ Ships before the Leptos frontend rewrite because agents need this in their loops
 
 ## Tool shape
 
+### Contract: wake-up only, not context
+
+`wait_for_work` is a thin notifier. Its response carries the **minimum data needed to identify which session to act on**. It does **not** embed `review_gate`, `review_target`, `write_feedback`, `timeline`, or any other field that `get_context` returns. Callers are expected to follow up with `get_context(session_id)` for the session they choose to work on.
+
+This is deliberate: long-poll agents loop and accumulate every response in their context window. A 500-token full-context payload per match becomes 5000 tokens after 10 wake-ups. The minimal shape stays under ~30 tokens per match no matter how often it fires.
+
 ### MCP
 
 ```json
 {
   "name": "wait_for_work",
-  "description": "Block until at least one session in any watched repo is waiting on the caller's role. Returns the match(es) with the canonical write_feedback path and review_target. Re-call after acting.",
+  "description": "Block until a session in any watched repo is waiting on the caller's role. Returns minimal identifiers; call get_context(session_id) for full state of the chosen session. Re-call after acting.",
   "input_schema": {
-    "role": "master | reviewers",
-    "repo": "<path>",          // optional — filter to one repo
-    "session_id": "<id>",      // optional — filter to one session
-    "exclude_authors": ["alice"], // optional — for reviewer polling, skip sessions where caller already left a current verdict
-    "timeout_secs": 60          // optional, default 60, max 300
+    "type": "object",
+    "required": ["role"],
+    "additionalProperties": false,
+    "properties": {
+      "role": { "type": "string", "enum": ["master", "reviewers"] },
+      "repo": { "type": "string", "description": "Filter to one repo (absolute path)." },
+      "session_id": { "type": "string" },
+      "exclude_authors": {
+        "type": "array",
+        "items": { "type": "string" },
+        "description": "Reviewer polling only: skip sessions where any of these authors already has a current verdict for the target."
+      },
+      "timeout_secs": { "type": "integer", "minimum": 1, "maximum": 300, "default": 60 }
+    }
   }
 }
 ```
+
+**Role naming.** `role` accepts exactly the strings `master` and `reviewers` — matching the strings emitted by `waiting_on.role.as_str()`. No `reviewer` singular alias; the schema's `enum` rejects it cleanly. Example loops and prose in this plan use `reviewers` consistently.
 
 ### HTTP
 
 `POST /api/wait_for_work` with the same JSON body. Same response shape.
 
-### Response
+### Response (minimal)
 
 ```json
 {
@@ -45,19 +67,21 @@ Ships before the Leptos frontend rewrite because agents need this in their loops
     {
       "repo": "/Users/.../trinity",
       "session_id": "filesystem-truth-rewrite",
-      "phase": "implementing",
-      "waiting_on": { "role": "reviewers", "reason": "impl_needs_initial_review", "agents": [], "description": "..." },
-      "review_target": { "phase": "impl", "commit_sha": "0ea3e04..." },
-      "write_feedback": { "phase": "impl", "target_sha": "0ea3e04...", "path": ".trinity/feedback/filesystem-truth-rewrite/impl/0ea3e04.../codex.md" },
-      "expected_action": "review_impl"
+      "reason": "impl_needs_initial_review"
     }
   ],
-  "timed_out": false,
-  "matched_at": 1715683200
+  "timed_out": false
 }
 ```
 
-Return shape: one entry per session matching the filter. If nothing matches before `timeout_secs`, return `{ matches: [], timed_out: true }`. Caller treats `timed_out: true` as "no work yet; loop again" — they don't have to distinguish "channel closed" from "wait period ended."
+Three fields per match:
+- `repo` — the absolute repo path. Required because session ids are repo-scoped.
+- `session_id` — the session that needs attention.
+- `reason` — the `waiting_on.reason` string (e.g., `impl_needs_initial_review`, `address_plan_request_changes`). Lets callers prioritize without a follow-up call (e.g., a master agent might process `address_*_request_changes` before `commit_done_move`).
+
+Nothing else. No phase, no SHAs, no paths, no descriptions. **The agent calls `get_context({ session_id, repo })` for the session they pick.**
+
+If nothing matches before `timeout_secs`, return `{ "matches": [], "timed_out": true }`. Callers treat `timed_out: true` as "no work yet; loop again." No `matched_at` field — the caller can clock-time the result themselves if they need it.
 
 ## Semantics
 
@@ -126,7 +150,62 @@ pub async fn wait_for_work(runtime: &Runtime, args: WaitArgs) -> WaitResponse {
 }
 ```
 
-`compute_matches` reads the current `Trinity` state under the lock, iterates `(repo, session)` pairs, applies the role/repo/session/exclude_authors filter, and returns the match list (empty → `None` so we know to keep waiting).
+### Lock boundary for `compute_matches`
+
+`compute_matches` runs entirely on already-in-memory derived state — `RepoState::sessions`, `attribution`, `commit_order`, `plan_feedback`, `impl_feedback`. **It does no file I/O and no git calls.** That means it's safe to hold the runtime mutex for the duration of the match computation.
+
+Concretely:
+
+```rust
+async fn compute_matches(runtime: &Runtime, args: &WaitArgs) -> Vec<Match> {
+    let trinity = runtime.state().lock().await;
+    let mut out = Vec::new();
+    for (repo_root, repo_state) in &trinity.repos {
+        if let Some(filter_repo) = &args.repo
+            && filter_repo != repo_root
+        {
+            continue;
+        }
+        for (session_id, session) in &repo_state.sessions {
+            if let Some(filter_sid) = &args.session_id
+                && filter_sid != session_id
+            {
+                continue;
+            }
+            // Pure derivations — no IO, no git.
+            let phase = projection::phase(session, &repo_state.attribution);
+            // plan_worktree_status is NOT recomputed here. It requires a
+            // working-tree read which is IO and would violate the no-IO
+            // rule. Use the cached `clean` assumption for the role check;
+            // worktree-status-driven waiting (master / commit_plan_revision)
+            // is captured via the latest broadcast event from the watcher,
+            // which calls into the same role-derivation logic when it fires.
+            let plan_gate = projection::plan_gate_for(session, repo_state);
+            let impl_gate = projection::impl_gate_for(session, repo_state);
+            let w = projection::waiting_on(phase, PlanWorktreeStatus::Clean,
+                                            plan_gate.as_ref(), impl_gate.as_ref());
+            if w.role.as_str() != args.role { continue; }
+            if matches!(args.role.as_str(), "reviewers")
+                && args.exclude_authors.iter().any(|a| /* in current gate */)
+            {
+                continue;
+            }
+            out.push(Match {
+                repo: repo_root.to_string_lossy().into_owned(),
+                session_id: session_id.as_str().to_string(),
+                reason: w.reason.as_str().to_string(),
+            });
+        }
+    }
+    out
+}
+```
+
+**Why this is safe to hold under the lock**: each per-session computation is a small linear scan over feedback maps + attribution map. For typical Trinity scopes (< 10 sessions per repo, < 50 commits per session), the whole loop is sub-millisecond. The lock is held briefly enough that concurrent watcher updates and HTTP/MCP calls aren't blocked in practice.
+
+**What's NOT done under the lock**: any working-tree read (plan_worktree_status recompute), any git call, any rebuild. If a future change makes `compute_matches` need those, refactor to snapshot identifiers under the lock + compute outside. Add a debug assertion or a tracing span to catch lock-held durations > 5ms in dev builds.
+
+The `projection` helpers (`plan_gate_for`, `impl_gate_for`, `waiting_on`) are already sans-IO and side-effect-free; moving the gate derivations from `mcp_response.rs` to a shared `projection.rs` location is a prerequisite for this plan (purely a code-org change, no behavior change). That's part of Phase 1.
 
 The MCP dispatcher (`src/server/mcp.rs`) gets a new tool entry that deserializes args and calls into `wait_for_work`. The HTTP route (`src/server/http.rs`) adds `POST /api/wait_for_work` that does the same.
 
@@ -171,10 +250,13 @@ Pure (compute_matches against synthetic RepoState):
 - Two repos, `repo` filter → only that repo's matches.
 - `exclude_authors` drops sessions where the listed author is already a participant in the current target's gate.
 
-Integration (against a running runtime + broadcast):
-- Spawn a `wait_for_work({ role: "reviewers" })` task. State has no matches. Drop a plan-touch commit + new feedback file that makes a session need reviewer attention. Assert the wait returns within 2s.
-- Spawn the wait. Don't deliver any event. After `timeout_secs`, the wait returns `timed_out: true`.
-- Two concurrent waits with the same filter. Deliver one event. Both unblock with the same matches.
+Integration (against a running runtime + broadcast). Each test pins a single crisp transition so the wake-up cause is unambiguous:
+
+- **Wake on new plan revision needing review**: state starts with one session in implementing/ready_to_finish (waiting on master). Spawn `wait_for_work({ role: "reviewers" })`. While blocked, commit a new plan revision against another session that lands it in `plan_needs_initial_review` (waiting on reviewers). Assert the wait returns within 2s with that session in `matches`.
+- **Wake on REQUEST_CHANGES moving the role to master**: state has a session in `plan_needs_initial_review`. Spawn `wait_for_work({ role: "master" })`. While blocked, drop a feedback file with `REQUEST_CHANGES` for the current plan target. Assert the wait returns within 2s with that session in `matches` and `reason: "address_plan_request_changes"`.
+- **exclude_authors skips self-reviewed sessions**: same setup as the first test, but the polling caller is alice and alice already wrote an APPROVE for the current target. Wait should NOT return for that session.
+- **Timeout**: spawn the wait, don't deliver any event. After `timeout_secs` (set to 1s), the wait returns `{ matches: [], timed_out: true }`.
+- **Fan-out**: two concurrent waits with the same filter. Deliver one event that creates a match. Both unblock with the same `matches`.
 
 End-to-end (HTTP):
 - Curl `POST /api/wait_for_work` with `timeout_secs: 1` against an idle daemon. Response = `{ matches: [], timed_out: true }` after ~1s.
