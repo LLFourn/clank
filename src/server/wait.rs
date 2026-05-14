@@ -36,7 +36,11 @@ const MAX_TIMEOUT_SECS: u64 = 300;
 pub struct WaitArgs {
     pub role: String,
     pub session_id: String,
-    pub author_label: String,
+    /// Optional on the wire so schema-strict MCP clients allow the shim
+    /// to autofill from its cache; the daemon rejects calls that arrive
+    /// without one once autofill has had its chance.
+    #[serde(default)]
+    pub author_label: Option<String>,
     /// Optional. The MCP dispatcher fills it from the caller's cwd when
     /// absent; the HTTP route rejects the request if absent.
     #[serde(default)]
@@ -87,13 +91,16 @@ pub async fn wait_for_work(runtime: &Runtime, args: WaitArgs) -> Result<WaitResp
     if args.session_id.is_empty() {
         return Err(WaitError::MissingSessionId);
     }
-    if args.author_label.is_empty() {
-        return Err(WaitError::MissingAuthorLabel);
-    }
+    let author_label = args
+        .author_label
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .ok_or(WaitError::MissingAuthorLabel)?;
     let repo_str = args.repo.as_ref().ok_or(WaitError::MissingRepo)?;
     let repo = dunce::canonicalize(repo_str).unwrap_or_else(|_| PathBuf::from(repo_str));
     let session_id = SessionId::from(args.session_id.clone());
-    let author = AgentLabel::from(args.author_label.clone());
+    let author = AgentLabel::from(author_label);
 
     let timeout = Duration::from_secs(
         args.timeout_secs
@@ -192,9 +199,39 @@ async fn compute_match(
     if w.role != role {
         return Ok(None);
     }
+    if matches!(role, WaitingRole::Reviewers)
+        && caller_already_voted(&candidate, w.reason, author)
+    {
+        return Ok(None);
+    }
     let work = expected_action(w.reason);
     let locations = derive_locations(&candidate, w.reason, author);
     Ok(Some(WorkItem { work, locations }))
+}
+
+/// True if `author` already has a current-target verdict for the
+/// reviewer work named by `reason`. Used to keep `wait_for_work` from
+/// re-waking a reviewer for a target they've already voted on (their
+/// vote still stands; the remaining wait is on someone else).
+///
+/// Non-review reasons (anything in the master role) always return
+/// false — caller-already-voted has no meaning there.
+fn caller_already_voted(
+    cand: &Candidate,
+    reason: WaitingReason,
+    author: &AgentLabel,
+) -> bool {
+    let gate = match reason {
+        WaitingReason::PlanNeedsInitialReview | WaitingReason::PlanNeedsRereview => {
+            cand.plan_gate.as_ref()
+        }
+        WaitingReason::ImplNeedsInitialReview | WaitingReason::ImplNeedsRereview => {
+            cand.impl_gate.as_ref()
+        }
+        _ => return false,
+    };
+    let Some(gate) = gate else { return false };
+    gate.approvals.contains(author) || gate.request_changes.contains(author)
 }
 
 /// Produce the repo-relative paths to attach to the response. Meaning
@@ -498,7 +535,7 @@ mod integration_tests {
         WaitArgs {
             role: role.to_string(),
             session_id: sid.to_string(),
-            author_label: author.to_string(),
+            author_label: Some(author.to_string()),
             repo: Some(repo.to_string_lossy().into_owned()),
             timeout_secs: Some(2),
         }
@@ -618,6 +655,92 @@ mod integration_tests {
     }
 
     #[tokio::test]
+    async fn caller_already_voted_does_not_re_wake_reviewer() {
+        // Two participants on a revised plan target: codex has APPROVE'd
+        // the current target, bob is still missing. The gate is
+        // NeedsReview (waiting on reviewers) → `plan_needs_rereview`.
+        // codex's wait_for_work must time out (their vote stands).
+        // bob's wait_for_work must return review_plan.
+        let dir = init_repo();
+        write_file(dir.path(), ".trinity/plans/foo.md", "# foo v1\n");
+        commit(dir.path(), "add foo v1");
+        let rt = Runtime::new();
+        rt.add_repo(dir.path().to_path_buf()).await.unwrap();
+
+        let intro: CommitSha = rt
+            .read_repo(dir.path(), |s| {
+                s.sessions[&SessionId::from("foo")].plan_intro.clone()
+            })
+            .await
+            .unwrap();
+        // Both codex + bob approve the intro target → participants.
+        for author in ["codex", "bob"] {
+            let rel = format!(".trinity/feedback/foo/plan/{}/{}.md", intro.as_str(), author);
+            write_file(dir.path(), &rel, "APPROVE\n");
+            let parsed_rel = PathBuf::from(format!("foo/plan/{}/{}.md", intro.as_str(), author));
+            let parsed = crate::disk_format::parse_feedback_path(&parsed_rel).unwrap();
+            rt.handle_signal(
+                dir.path(),
+                FilesystemSignal::FeedbackWritten { parsed },
+                1,
+            )
+            .await
+            .unwrap();
+        }
+
+        // Revise the plan so the target SHA advances; codex re-approves
+        // the new target. bob stays a participant but hasn't re-voted.
+        write_file(dir.path(), ".trinity/plans/foo.md", "# foo v2\n");
+        commit(dir.path(), "revise foo");
+        rt.handle_signal(dir.path(), FilesystemSignal::HeadChanged, 2)
+            .await
+            .unwrap();
+        let revised: CommitSha = rt
+            .read_repo(dir.path(), |s| {
+                crate::projection::latest_plan_touching_commit(
+                    &s.sessions[&SessionId::from("foo")],
+                    s,
+                )
+                .unwrap()
+            })
+            .await
+            .unwrap();
+        let codex_rel = format!(".trinity/feedback/foo/plan/{}/codex.md", revised.as_str());
+        write_file(dir.path(), &codex_rel, "APPROVE\n");
+        let parsed = crate::disk_format::parse_feedback_path(&PathBuf::from(format!(
+            "foo/plan/{}/codex.md",
+            revised.as_str()
+        )))
+        .unwrap();
+        rt.handle_signal(
+            dir.path(),
+            FilesystemSignal::FeedbackWritten { parsed },
+            3,
+        )
+        .await
+        .unwrap();
+
+        // codex polls → already voted → times out.
+        let mut a = args(dir.path(), "reviewers", "foo", "codex");
+        a.timeout_secs = Some(1);
+        let resp = wait_for_work(&rt, a).await.unwrap();
+        expect_timeout(resp);
+
+        // bob polls → still missing → returns review work.
+        let mut a = args(dir.path(), "reviewers", "foo", "bob");
+        a.timeout_secs = Some(1);
+        let resp = wait_for_work(&rt, a).await.unwrap();
+        let (work, locations) = expect_work(resp);
+        assert_eq!(work, "review_plan");
+        assert_eq!(locations.len(), 1);
+        assert!(
+            locations[0].ends_with("/bob.md"),
+            "bob's write path should be returned, got {}",
+            locations[0]
+        );
+    }
+
+    #[tokio::test]
     async fn timeout_returns_timed_out_shape() {
         let dir = init_repo();
         write_file(dir.path(), ".trinity/plans/foo.md", "# foo\n");
@@ -689,7 +812,7 @@ mod integration_tests {
         let a = WaitArgs {
             role: "reviewers".to_string(),
             session_id: "foo".to_string(),
-            author_label: "codex".to_string(),
+            author_label: Some("codex".to_string()),
             repo: None,
             timeout_secs: Some(1),
         };
@@ -698,12 +821,26 @@ mod integration_tests {
     }
 
     #[tokio::test]
-    async fn missing_author_label_errors() {
+    async fn missing_author_label_errors_when_none() {
         let rt = Runtime::new();
         let a = WaitArgs {
             role: "reviewers".to_string(),
             session_id: "foo".to_string(),
-            author_label: String::new(),
+            author_label: None,
+            repo: Some("/anywhere".to_string()),
+            timeout_secs: Some(1),
+        };
+        let err = wait_for_work(&rt, a).await.unwrap_err();
+        assert!(matches!(err, WaitError::MissingAuthorLabel));
+    }
+
+    #[tokio::test]
+    async fn missing_author_label_errors_when_blank() {
+        let rt = Runtime::new();
+        let a = WaitArgs {
+            role: "reviewers".to_string(),
+            session_id: "foo".to_string(),
+            author_label: Some("   ".to_string()),
             repo: Some("/anywhere".to_string()),
             timeout_secs: Some(1),
         };

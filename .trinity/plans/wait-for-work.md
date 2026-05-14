@@ -54,7 +54,7 @@ This is deliberate: long-poll agents loop and accumulate every response in their
 
 - `role` accepts exactly `master` or `reviewers`. The schema's `enum` rejects anything else.
 - `session_id` is required; the response is always for this one session.
-- `author_label` is required because it's baked into the canonical write path for `review_*` work (`.trinity/feedback/<sid>/<phase>/<sha>/<author>.md`). No silent `anonymous` fallback. The MCP shim caches it across calls (same mechanism `get_context` already uses), so callers usually pass it once per shim lifetime.
+- `author_label` is required at the daemon level — baked into the canonical write path for `review_*` work (`.trinity/feedback/<sid>/<phase>/<sha>/<author>.md`); no silent `anonymous` fallback. **At the schema level it's marked optional** so schema-strict MCP clients allow the shim to autofill from its cache (the same mechanism `get_context` uses). Callers pass it once per shim lifetime; subsequent calls inherit. If a call reaches the daemon without one even after autofill, it errors with `MissingAuthorLabel`.
 - `repo` is optional over MCP — the dispatcher falls back to the caller's cwd-repo via `git rev-parse --show-toplevel`. It's required over HTTP (no cwd context to fall back on).
 
 ### HTTP
@@ -99,6 +99,7 @@ Timed out:
 - **Subscribe + re-check.** Otherwise subscribe to `Runtime::events_tx`. On each event, re-compute. Return on the first match.
 - **Timeout.** `tokio::time::timeout` wraps the whole select. On timeout, return `{timed_out: true}`.
 - **Role match.** Exact match on `waiting_on.role`. `none` (terminal sessions) never matches.
+- **Caller already voted.** For reviewer work (`review_plan` / `review_impl`), if `author_label` already appears in the current target's `approvals` or `request_changes`, skip — their vote stands; the remaining wait is on someone else. Master work never applies this check (there's only one master conceptually).
 - **Repo resolution.** When `repo` is unset on the MCP path, resolve from cwd via `git rev-parse --show-toplevel`. When set, canonicalize via `dunce::canonicalize`. `~/...` is NOT expanded; pass absolute paths. The HTTP route rejects requests without `repo` because it has no cwd context.
 - **Unknown session.** If the named `session_id` doesn't exist in the target repo, return an error (`session not found`) rather than blocking forever — the caller has a bug we should surface.
 - **Deduplication.** When multiple events fire in rapid succession (e.g. a rebuild), the broadcast may deliver duplicates. The match-recompute is idempotent — return shape is the same regardless of how many events fired during the wait.
@@ -218,6 +219,7 @@ The stdio shim already forwards arbitrary tool calls to `/internal/tool_call`. *
 - `work` matches `expected_action(waiting_on.reason)` exactly.
 - `locations` for `review_*` is the single canonical write path with the caller's `author_label` baked in.
 - `locations` for `address_*_request_changes` lists every RC feedback file on the current target, in deterministic order; plan-phase adds the plan file at the end.
+- A reviewer who already has a current verdict on the target does not get re-woken; another reviewer who still owes a verdict does.
 - Unknown `session_id` returns a `not found` error (does not block).
 - Missing required fields return `400` over HTTP and the equivalent `invalid` error over MCP.
 - `timeout_secs` is honored exactly. Returns `{timed_out: true}` on the boundary.
@@ -239,14 +241,20 @@ Integration (against a real `Runtime` over tempdir git repos):
 - **Immediate review_plan after first commit.** New session, no reviews → `review_plan` with the canonical write path.
 - **`body_dirty` yields `commit_plan_revision`.** The disk-read split exists for this case: in-memory state thinks the plan is clean, but the working copy has uncommitted edits.
 - **`address_plan_request_changes` lists RC files + plan file.** Two RC feedbacks land via `FeedbackWritten` signals; the response lists both in deterministic order then the plan file.
+- **Caller-already-voted skip.** Two participants on a revised target; codex has approved the new target, bob is missing. codex's wait times out; bob's returns `review_plan` with the bob.md write path.
 - **Timeout.** Polling `master` while only reviewers have work → `{timed_out: true}` after `timeout_secs`.
 - **Wakes on `PlanFileChanged`.** Spawn the wait; while blocked, edit the plan + dispatch `PlanFileChanged`; the wait returns with `commit_plan_revision`.
 - **Unknown session** errors with `WaitError::UnknownSession`.
 - **Missing repo / author_label** errors with `WaitError::MissingRepo` / `WaitError::MissingAuthorLabel`.
 
-End-to-end (live daemon):
-- `POST /api/wait_for_work` with `timeout_secs: 1` against an idle daemon returns `{timed_out: true}` after ~1s.
-- Same request against a session in `ready_to_finish` returns `{work: "move_to_done", locations: [<plan file>]}`.
+Wire (in-process axum router via `tower::ServiceExt::oneshot`):
+- `POST /api/wait_for_work` with an immediate match → 200 + `{work, locations}`.
+- `POST /api/wait_for_work` polling the wrong role → 200 + `{timed_out: true}`.
+- `POST /api/wait_for_work` with invalid role / missing repo / missing author_label → 400.
+- `POST /api/wait_for_work` with unknown session → 404.
+- `POST /internal/tool_call` with `tool: "wait_for_work"` and explicit repo → 200 + `{result: {work, locations}}`.
+- `POST /internal/tool_call` with no `repo` arg → dispatcher resolves from `req.cwd` via git → 200.
+- `POST /internal/tool_call` with invalid role → 400.
 
 ## Non-goals
 

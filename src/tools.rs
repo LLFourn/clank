@@ -41,11 +41,9 @@ pub fn catalog() -> Vec<ToolDescriptor> {
         },
         ToolDescriptor {
             name: "list_sessions".to_string(),
-            description: "List Trinity sessions. By default returns sessions in the caller's \
-                          repo (resolved via `git rev-parse --show-toplevel`). Pass `repo` \
-                          (absolute path) to target a specific watched repo instead — \
-                          required when responding to a `wait_for_work` match in a repo \
-                          outside the caller's cwd. Each row: id, plan_path, phase, \
+            description: "List Trinity sessions in the caller's repo. Default repo is resolved \
+                          via `git rev-parse --show-toplevel`; pass `repo` (absolute path) to \
+                          target a different watched repo. Each row: id, plan_path, phase, \
                           plan_worktree_status, waiting_on."
                 .to_string(),
             input_schema: json!({
@@ -150,7 +148,7 @@ pub fn catalog() -> Vec<ToolDescriptor> {
                 .to_string(),
             input_schema: json!({
                 "type": "object",
-                "required": ["role", "session_id", "author_label"],
+                "required": ["role", "session_id"],
                 "additionalProperties": false,
                 "properties": {
                     "role": {
@@ -164,7 +162,7 @@ pub fn catalog() -> Vec<ToolDescriptor> {
                     },
                     "author_label": {
                         "type": "string",
-                        "description": "Your agent label. Baked into the canonical reviewer write path for review_* work. The MCP shim caches this across calls."
+                        "description": "Your agent label. Required to construct the canonical reviewer write path for review_* work. The MCP shim caches this across calls — pass it on the first call and subsequent calls inherit it. Schema-optional so cache inheritance works with strict MCP clients; the daemon errors clearly if it's never been provided."
                     },
                     "repo": {
                         "type": "string",
@@ -191,9 +189,8 @@ pub fn catalog() -> Vec<ToolDescriptor> {
                           an error `session_not_committed` — commit the plan to register the \
                           session.\n\n\
                           Inputs: `session_id`; `author_label` (optional, defaults to \
-                          last cached); `repo` (optional absolute path — pass this when \
-                          following up on a `wait_for_work` match in a repo outside your cwd, \
-                          otherwise the cwd-repo is used).\n\n\
+                          last cached); `repo` (optional absolute path; defaults to the \
+                          caller's cwd-repo).\n\n\
                           Always call this before reviewing or implementing. The `waiting_on` \
                           field tells you whether the current bottleneck is master or reviewers."
                 .to_string(),

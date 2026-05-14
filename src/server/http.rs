@@ -340,3 +340,295 @@ impl IntoResponse for AppError {
         (self.status, self.msg).into_response()
     }
 }
+
+#[cfg(test)]
+mod wire_tests {
+    //! Wire-level tests against the actual axum router. Covers
+    //! `POST /api/wait_for_work` (HTTP) and `POST /internal/tool_call`
+    //! with `tool: "wait_for_work"` (MCP dispatch). Uses `tower::ServiceExt::oneshot`
+    //! to drive the router in-process without binding a port.
+
+    use super::*;
+    use crate::runtime::Runtime;
+    use axum::body::Body;
+    use axum::http::Request;
+    use http_body_util::BodyExt;
+    use serde_json::json;
+    use std::collections::HashSet;
+    use std::sync::Arc;
+    use std::path::Path;
+    use std::process::Command;
+    use tokio::sync::Mutex;
+    use tower::ServiceExt;
+
+    fn init_repo() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path();
+        run_git(path, &["init", "--quiet", "--initial-branch=main"]);
+        run_git(path, &["config", "user.email", "test@test"]);
+        run_git(path, &["config", "user.name", "test"]);
+        run_git(path, &["config", "commit.gpgsign", "false"]);
+        dir
+    }
+
+    fn run_git(cwd: &Path, args: &[&str]) {
+        let status = Command::new("git")
+            .arg("-C")
+            .arg(cwd)
+            .args(args)
+            .status()
+            .unwrap();
+        assert!(status.success());
+    }
+
+    fn write_file(repo: &Path, rel: &str, body: &str) {
+        let abs = repo.join(rel);
+        if let Some(parent) = abs.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        std::fs::write(abs, body).unwrap();
+    }
+
+    fn commit(repo: &Path, msg: &str) {
+        run_git(repo, &["add", "-A"]);
+        run_git(repo, &["commit", "--quiet", "-m", msg]);
+    }
+
+    async fn router_with_repo(dir: &tempfile::TempDir) -> axum::Router {
+        write_file(dir.path(), ".trinity/plans/foo.md", "# foo\n");
+        commit(dir.path(), "add foo");
+        let runtime = Arc::new(Runtime::new());
+        runtime.add_repo(dir.path().to_path_buf()).await.unwrap();
+        let state = AppState {
+            runtime,
+            watchers: Arc::new(Mutex::new(Vec::new())),
+            watched_repos: Arc::new(Mutex::new(HashSet::new())),
+        };
+        router(state)
+    }
+
+    async fn body_json(resp: axum::response::Response) -> serde_json::Value {
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    async fn body_text(resp: axum::response::Response) -> String {
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        String::from_utf8(bytes.to_vec()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn http_returns_work_for_immediate_match() {
+        let dir = init_repo();
+        let app = router_with_repo(&dir).await;
+        let body = json!({
+            "role": "reviewers",
+            "session_id": "foo",
+            "author_label": "codex",
+            "repo": dir.path().to_string_lossy(),
+            "timeout_secs": 1,
+        });
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/wait_for_work")
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let v = body_json(resp).await;
+        assert_eq!(v["work"], "review_plan");
+        let locations = v["locations"].as_array().unwrap();
+        assert_eq!(locations.len(), 1);
+        assert!(locations[0].as_str().unwrap().ends_with("/codex.md"));
+    }
+
+    #[tokio::test]
+    async fn http_timeout_returns_timed_out_shape() {
+        let dir = init_repo();
+        let app = router_with_repo(&dir).await;
+        // Polling master while only reviewers have work → timeout.
+        let body = json!({
+            "role": "master",
+            "session_id": "foo",
+            "author_label": "lloyd",
+            "repo": dir.path().to_string_lossy(),
+            "timeout_secs": 1,
+        });
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/wait_for_work")
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let v = body_json(resp).await;
+        assert_eq!(v["timed_out"], true);
+        assert!(v.get("work").is_none());
+        assert!(v.get("locations").is_none());
+    }
+
+    #[tokio::test]
+    async fn http_400_on_invalid_role() {
+        let dir = init_repo();
+        let app = router_with_repo(&dir).await;
+        let body = json!({
+            "role": "reviewer",
+            "session_id": "foo",
+            "author_label": "codex",
+            "repo": dir.path().to_string_lossy(),
+            "timeout_secs": 1,
+        });
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/wait_for_work")
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let msg = body_text(resp).await;
+        assert!(msg.contains("invalid role"), "got: {msg}");
+    }
+
+    #[tokio::test]
+    async fn http_400_on_missing_repo() {
+        let dir = init_repo();
+        let app = router_with_repo(&dir).await;
+        let body = json!({
+            "role": "reviewers",
+            "session_id": "foo",
+            "author_label": "codex",
+            "timeout_secs": 1,
+        });
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/wait_for_work")
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn http_400_on_missing_author_label() {
+        let dir = init_repo();
+        let app = router_with_repo(&dir).await;
+        let body = json!({
+            "role": "reviewers",
+            "session_id": "foo",
+            "repo": dir.path().to_string_lossy(),
+            "timeout_secs": 1,
+        });
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/wait_for_work")
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn http_404_on_unknown_session() {
+        let dir = init_repo();
+        let app = router_with_repo(&dir).await;
+        let body = json!({
+            "role": "reviewers",
+            "session_id": "does-not-exist",
+            "author_label": "codex",
+            "repo": dir.path().to_string_lossy(),
+            "timeout_secs": 1,
+        });
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/wait_for_work")
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn mcp_dispatch_returns_work_with_repo_arg() {
+        let dir = init_repo();
+        let app = router_with_repo(&dir).await;
+        let body = json!({
+            "cwd": dir.path().to_string_lossy(),
+            "tool": "wait_for_work",
+            "arguments": {
+                "role": "reviewers",
+                "session_id": "foo",
+                "author_label": "codex",
+                "repo": dir.path().to_string_lossy(),
+                "timeout_secs": 1,
+            },
+        });
+        let req = Request::builder()
+            .method("POST")
+            .uri("/internal/tool_call")
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let v = body_json(resp).await;
+        assert_eq!(v["result"]["work"], "review_plan");
+    }
+
+    #[tokio::test]
+    async fn mcp_dispatch_falls_back_to_cwd_when_repo_omitted() {
+        let dir = init_repo();
+        let app = router_with_repo(&dir).await;
+        // No `repo` arg — dispatcher should resolve from cwd via git
+        // rev-parse on the tempdir.
+        let body = json!({
+            "cwd": dir.path().to_string_lossy(),
+            "tool": "wait_for_work",
+            "arguments": {
+                "role": "reviewers",
+                "session_id": "foo",
+                "author_label": "codex",
+                "timeout_secs": 1,
+            },
+        });
+        let req = Request::builder()
+            .method("POST")
+            .uri("/internal/tool_call")
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let v = body_json(resp).await;
+        assert_eq!(v["result"]["work"], "review_plan");
+    }
+
+    #[tokio::test]
+    async fn mcp_dispatch_400_on_invalid_role() {
+        let dir = init_repo();
+        let app = router_with_repo(&dir).await;
+        let body = json!({
+            "cwd": dir.path().to_string_lossy(),
+            "tool": "wait_for_work",
+            "arguments": {
+                "role": "reviewer",
+                "session_id": "foo",
+                "author_label": "codex",
+                "timeout_secs": 1,
+            },
+        });
+        let req = Request::builder()
+            .method("POST")
+            .uri("/internal/tool_call")
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+}
