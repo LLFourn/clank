@@ -122,35 +122,20 @@ pub fn session_page(ctx: &Value) -> String {
         .as_str()
         .unwrap_or("—");
 
-    let mut impl_commits_html = String::new();
-    if let Some(commits) = ctx["pr_hint"]["implementation_commits"].as_array() {
-        impl_commits_html.push_str("<ul class=\"commits\">");
-        for c in commits {
-            if let Some(sha) = c.as_str() {
-                impl_commits_html.push_str(&format!(
-                    "<li><a href=\"/sessions/{id}/commit/{sha}\"><code>{short}</code></a></li>",
-                    short = &sha[..7.min(sha.len())],
-                ));
-            }
-        }
-        impl_commits_html.push_str("</ul>");
-    } else if latest_impl != "—" {
-        impl_commits_html.push_str(&format!(
-            "<ul class=\"commits\"><li><a href=\"/sessions/{id}/commit/{latest_impl}\"><code>{short}</code></a></li></ul>",
-            short = &latest_impl[..7.min(latest_impl.len())],
-        ));
-    } else {
-        impl_commits_html.push_str("<p class=\"none\">No implementation commits yet.</p>");
-    }
-
-    let plan_revisions_html = if latest_plan != "—" {
-        format!(
-            "<ul class=\"commits\"><li><a href=\"/sessions/{id}/plan/{latest_plan}\"><code>{short}</code></a> (latest)</li></ul>",
-            short = &latest_plan[..7.min(latest_plan.len())],
-        )
-    } else {
-        "<p class=\"none\">No plan revisions found.</p>".to_string()
-    };
+    let impl_commits_html = render_commit_list(
+        ctx["implementation_commits"].as_array(),
+        id,
+        "commit",
+        "No implementation commits yet.",
+        latest_impl,
+    );
+    let plan_revisions_html = render_commit_list(
+        ctx["plan_revisions"].as_array(),
+        id,
+        "plan",
+        "No plan revisions found.",
+        latest_plan,
+    );
 
     let pr_hint_html = if let Some(hint) = ctx.get("pr_hint").filter(|v| !v.is_null()) {
         let options = hint["options"].as_array().cloned().unwrap_or_default();
@@ -249,4 +234,40 @@ fn html_escape(s: &str) -> String {
     s.replace('&', "&amp;")
         .replace('<', "&lt;")
         .replace('>', "&gt;")
+}
+
+/// Render a clickable list of commit shas. `route` is `"plan"` or `"commit"`
+/// (used in the URL path). Empty list falls back to `none_text`. If the
+/// list is empty but `latest_fallback` is non-empty, fall back to a
+/// single-entry list with the fallback (for backward compat with older
+/// callers that only had `latest_*` data).
+fn render_commit_list(
+    commits: Option<&Vec<Value>>,
+    session_id: &str,
+    route: &str,
+    none_text: &str,
+    latest_fallback: &str,
+) -> String {
+    let shas: Vec<&str> = commits
+        .map(|arr| arr.iter().filter_map(|v| v.as_str()).collect())
+        .unwrap_or_default();
+    if !shas.is_empty() {
+        let mut s = String::from("<ul class=\"commits\">");
+        for (i, sha) in shas.iter().rev().enumerate() {
+            let short = &sha[..7.min(sha.len())];
+            let marker = if i == 0 { " <em>(latest)</em>" } else { "" };
+            s.push_str(&format!(
+                "<li><a href=\"/sessions/{session_id}/{route}/{sha}\"><code>{short}</code></a>{marker}</li>"
+            ));
+        }
+        s.push_str("</ul>");
+        s
+    } else if latest_fallback != "—" {
+        let short = &latest_fallback[..7.min(latest_fallback.len())];
+        format!(
+            "<ul class=\"commits\"><li><a href=\"/sessions/{session_id}/{route}/{latest_fallback}\"><code>{short}</code></a></li></ul>"
+        )
+    } else {
+        format!("<p class=\"none\">{none_text}</p>")
+    }
 }

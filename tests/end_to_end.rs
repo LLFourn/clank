@@ -60,9 +60,17 @@ async fn spawn_daemon_with_repos(
         .collect::<String>();
     std::fs::write(repos_file.path(), body).unwrap();
 
+    let lock_file = tempfile::NamedTempFile::new().unwrap();
+    // Remove the empty file so the daemon writes its own PID into it
+    // without "another daemon running" being triggered by leftover bytes.
+    let lock_path = lock_file.path().to_string_lossy().into_owned();
+    drop(lock_file);
+    let _ = std::fs::remove_file(&lock_path);
+
     let args = server::ServeArgs {
         bind: addr,
         repos: repos_file.path().to_string_lossy().into_owned(),
+        lock: lock_path,
     };
 
     let url = format!("http://{}", addr);

@@ -34,9 +34,22 @@ pub struct ServeArgs {
         env = "TRINITY_REPOS"
     )]
     pub repos: String,
+
+    /// Path to the daemon-lock pidfile. Trinity refuses to boot if this
+    /// names a still-running PID. Tests override to per-test paths to
+    /// avoid contention.
+    #[arg(
+        long,
+        default_value = "~/.trinity/daemon.lock",
+        env = "TRINITY_LOCK_FILE"
+    )]
+    pub lock: String,
 }
 
 pub async fn serve(args: ServeArgs) -> anyhow::Result<()> {
+    // Multi-process safety: refuse to boot if another daemon is alive.
+    let lock_guard = acquire_daemon_lock(&args.lock)?;
+
     let runtime = Arc::new(Runtime::new());
 
     let repos_path = expand_home(&args.repos);
@@ -84,7 +97,54 @@ pub async fn serve(args: ServeArgs) -> anyhow::Result<()> {
     tracing::info!(bind = %args.bind, "trinity listening (filesystem-truth)");
     let listener = tokio::net::TcpListener::bind(args.bind).await?;
     axum::serve(listener, app).await?;
+    drop(lock_guard);
     Ok(())
+}
+
+/// Lightweight pidfile-based lock at `~/.trinity/daemon.lock`. Refuses to
+/// boot if the file names a still-running pid. Removes the file on drop.
+struct DaemonLock {
+    path: PathBuf,
+}
+
+impl Drop for DaemonLock {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+fn acquire_daemon_lock(path_str: &str) -> anyhow::Result<DaemonLock> {
+    let path = expand_home(path_str);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    if let Ok(existing) = std::fs::read_to_string(&path) {
+        let pid_str = existing.trim();
+        if let Ok(pid) = pid_str.parse::<i32>()
+            && is_pid_alive(pid)
+        {
+            anyhow::bail!(
+                "another trinity daemon is running (pid {pid}); refusing to start. \
+                 If you are sure no daemon is running, remove {}.",
+                path.display()
+            );
+        }
+        // Stale lock from a crashed/killed daemon — overwrite.
+    }
+    let pid = std::process::id();
+    std::fs::write(&path, format!("{pid}\n"))?;
+    Ok(DaemonLock { path })
+}
+
+fn is_pid_alive(pid: i32) -> bool {
+    // `kill -0 <pid>` succeeds iff the pid exists. Unix-only — for
+    // Trinity's macOS/Linux scope, that's fine.
+    use std::process::Command;
+    Command::new("kill")
+        .args(["-0", &pid.to_string()])
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
 }
 
 fn read_repos_file(path: &std::path::Path) -> std::io::Result<Vec<PathBuf>> {

@@ -130,6 +130,16 @@ pub fn get_context_response(
         None
     };
 
+    let plan_revisions: Vec<String> = all_plan_revisions(session, &state.attribution)
+        .into_iter()
+        .map(|s| s.as_str().to_string())
+        .collect();
+    let implementation_commits: Vec<String> =
+        all_implementation_commits(session, &state.attribution)
+            .into_iter()
+            .map(|s| s.as_str().to_string())
+            .collect();
+
     Ok(Some(json!({
         "session_id": session.id.as_str(),
         "phase": session_phase.as_str(),
@@ -139,6 +149,8 @@ pub fn get_context_response(
         "review_gate": gate_value(plan_gate.as_ref(), impl_gate.as_ref(), session_phase),
         "latest_plan_revision": latest_plan_revision(session, &state.attribution),
         "latest_implementation_revision": latest_impl_revision(session, &state.attribution),
+        "plan_revisions": plan_revisions,
+        "implementation_commits": implementation_commits,
         "pr_hint": pr_hint,
     })))
 }
@@ -231,20 +243,7 @@ fn latest_plan_revision(
     session: &crate::repo_state::Session,
     attribution: &std::collections::BTreeMap<crate::lifecycle::CommitSha, crate::repo_state::AttributionResult>,
 ) -> Value {
-    // The latest plan-touching commit attributed to this session.
-    let mut latest = None;
-    for (sha, attr) in attribution {
-        if let crate::repo_state::AttributionResult::Attributed {
-            session: sid,
-            plan_touch: Some(_),
-            ..
-        } = attr
-            && sid == &session.id
-        {
-            latest = Some(sha.clone());
-        }
-    }
-    match latest {
+    match all_plan_revisions(session, attribution).last() {
         Some(sha) => json!({ "commit_sha": sha.as_str() }),
         None => Value::Null,
     }
@@ -254,22 +253,50 @@ fn latest_impl_revision(
     session: &crate::repo_state::Session,
     attribution: &std::collections::BTreeMap<crate::lifecycle::CommitSha, crate::repo_state::AttributionResult>,
 ) -> Value {
-    let mut latest = None;
-    for (sha, attr) in attribution {
-        if let crate::repo_state::AttributionResult::Attributed {
-            session: sid,
-            has_code_changes: true,
-            ..
-        } = attr
-            && sid == &session.id
-        {
-            latest = Some(sha.clone());
-        }
-    }
-    match latest {
+    match all_implementation_commits(session, attribution).last() {
         Some(sha) => json!({ "commit_sha": sha.as_str() }),
         None => Value::Null,
     }
+}
+
+/// All plan-touching commits attributed to `session`, in attribution-map
+/// order (insertion order from the rebuild walk — chronological by
+/// first-parent traversal). Returned by `get_context` for the session
+/// page's plan-revisions list.
+fn all_plan_revisions(
+    session: &crate::repo_state::Session,
+    attribution: &std::collections::BTreeMap<crate::lifecycle::CommitSha, crate::repo_state::AttributionResult>,
+) -> Vec<crate::lifecycle::CommitSha> {
+    attribution
+        .iter()
+        .filter_map(|(sha, attr)| match attr {
+            crate::repo_state::AttributionResult::Attributed {
+                session: sid,
+                plan_touch: Some(_),
+                ..
+            } if sid == &session.id => Some(sha.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// All implementation commits (has_code_changes == true) attributed to
+/// `session`, in attribution-map order.
+fn all_implementation_commits(
+    session: &crate::repo_state::Session,
+    attribution: &std::collections::BTreeMap<crate::lifecycle::CommitSha, crate::repo_state::AttributionResult>,
+) -> Vec<crate::lifecycle::CommitSha> {
+    attribution
+        .iter()
+        .filter_map(|(sha, attr)| match attr {
+            crate::repo_state::AttributionResult::Attributed {
+                session: sid,
+                has_code_changes: true,
+                ..
+            } if sid == &session.id => Some(sha.clone()),
+            _ => None,
+        })
+        .collect()
 }
 
 /// Build the plan-phase review gate from the session's plan_feedback
