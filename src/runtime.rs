@@ -260,7 +260,7 @@ impl Runtime {
                     Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
                     Err(e) => return Err(e.into()),
                 };
-                let session_id = parsed.session_id.clone();
+                let session_id = parsed.plan_key.clone();
                 // Resolve auto-organization target (if the file is a flat
                 // drop and we have a current target SHA + clean plan).
                 let move_plan: Option<MovePlan> = if parsed.target_sha.is_none() {
@@ -335,7 +335,7 @@ impl Runtime {
                 let Some(state) = trinity.repos.get_mut(repo_root) else {
                     return Err(RuntimeError::UnknownRepo(repo_root.to_path_buf()));
                 };
-                let session_id = parsed.session_id.clone();
+                let session_id = parsed.plan_key.clone();
                 let Some(session) = state.plans.get_mut(&session_id) else {
                     return Ok(());
                 };
@@ -433,7 +433,7 @@ impl Runtime {
             let Some(state) = trinity.repos.get(repo_root) else {
                 return Ok(None);
             };
-            let Some(session) = state.plans.get(&parsed.session_id) else {
+            let Some(session) = state.plans.get(&parsed.plan_key) else {
                 return Ok(None);
             };
             FlatDropSnapshot {
@@ -498,7 +498,7 @@ impl Runtime {
 
         let to = repo_root
             .join(".trinity/feedback")
-            .join(parsed.session_id.as_str())
+            .join(parsed.plan_key.as_str())
             .join(parsed.phase.as_str())
             .join(target_sha.as_str())
             .join(format!("{}.md", parsed.author.as_str()));

@@ -5,8 +5,8 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::disk_format::{FeedbackPath, parse_feedback_path, session_id_from_plan_path};
-use crate::lifecycle::SessionId;
+use crate::disk_format::{FeedbackPath, parse_feedback_path};
+use crate::lifecycle::{PlanKey, SessionId};
 
 /// Signals the watcher layer hands to the runner. The runner expands these
 /// into `Observation` values (loading file bodies, looking up known
@@ -114,7 +114,7 @@ fn plan_signal(rel: &Path, event_kind: FsEventKind) -> Option<FilesystemSignal> 
     } else {
         Path::new(".trinity/plans").join(&name_seg)
     };
-    let session_id = session_id_from_plan_path(&plan_rel)?;
+    let session_id = PlanKey::from_path(&plan_rel)?;
     // Both create/modify and remove map to PlanFileChanged. The runner's
     // plan-worktree-status recompute correctly handles either case.
     let _ = event_kind;
@@ -238,7 +238,7 @@ mod tests {
         );
         match sig {
             Some(FilesystemSignal::FeedbackWritten { parsed }) => {
-                assert_eq!(parsed.session_id.as_str(), "foo");
+                assert_eq!(parsed.plan_key.as_str(), "foo");
                 assert_eq!(parsed.author.as_str(), "alice");
                 assert_eq!(parsed.target_sha.unwrap().as_str(), "abc1234");
             }

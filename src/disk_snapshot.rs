@@ -134,7 +134,7 @@ pub fn derive_state(repo_root: PathBuf, snapshot: DiskSnapshot) -> RepoState {
     //    in `plan_feedback` / `impl_feedback`; flat drops are held with
     //    a reason key the runner uses to decide next steps.
     for fb in snapshot.feedback_files {
-        let Some(plan) = state.plans.get_mut(&fb.parsed.session_id) else {
+        let Some(plan) = state.plans.get_mut(&fb.parsed.plan_key) else {
             continue;
         };
         ingest_feedback(plan, fb);
@@ -230,7 +230,7 @@ mod tests {
         FeedbackBlob {
             abs_path: PathBuf::from(format!("/r/.trinity/feedback/{session}/...")),
             parsed: FeedbackPath {
-                session_id: sess(session),
+                plan_key: sess(session),
                 phase,
                 target_sha: target.map(sha),
                 author: AgentLabel::from(author.to_string()),

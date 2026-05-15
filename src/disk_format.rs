@@ -7,12 +7,15 @@
 
 use std::path::{Component, Path, PathBuf};
 
-use crate::lifecycle::{AgentLabel, CommitSha, SessionId};
+use crate::lifecycle::{AgentLabel, CommitSha, PlanKey};
 use crate::repo_state::Verdict;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FeedbackPath {
-    pub session_id: SessionId,
+    /// Directory name = filename stem. Same value as [`PlanKey`] from the
+    /// plan file's path; the on-disk feedback layout is keyed by stem
+    /// (see plan-path-identity §3).
+    pub plan_key: PlanKey,
     pub phase: FeedbackPhase,
     pub target_sha: Option<CommitSha>,
     pub author: AgentLabel,
@@ -80,7 +83,7 @@ pub fn parse_feedback_path(rel: &Path) -> Option<FeedbackPath> {
     };
 
     Some(FeedbackPath {
-        session_id: SessionId::from(session_str.to_string()),
+        plan_key: PlanKey::from(session_str.to_string()),
         phase,
         target_sha,
         author: AgentLabel::from(author.to_string()),
@@ -114,17 +117,6 @@ pub fn plan_path_is_done(plan_path_rel: &Path) -> bool {
         .any(|c| matches!(c, Component::Normal(s) if s == "done"))
 }
 
-/// Extract `<id>` from `.trinity/plans/<id>.md` or `.trinity/plans/done/<id>.md`.
-/// The argument is the path relative to the repo root.
-pub fn session_id_from_plan_path(plan_path_rel: &Path) -> Option<SessionId> {
-    let name = plan_path_rel.file_name()?.to_str()?;
-    let stem = name.strip_suffix(".md")?;
-    if stem.is_empty() {
-        return None;
-    }
-    Some(SessionId::from(stem.to_string()))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -136,7 +128,7 @@ mod tests {
     #[test]
     fn flat_feedback_path_no_sha() {
         let parsed = parse_feedback_path(&p("foo/plan/alice.md")).unwrap();
-        assert_eq!(parsed.session_id.as_str(), "foo");
+        assert_eq!(parsed.plan_key.as_str(), "foo");
         assert_eq!(parsed.phase, FeedbackPhase::Plan);
         assert!(parsed.target_sha.is_none());
         assert_eq!(parsed.author.as_str(), "alice");
@@ -145,7 +137,7 @@ mod tests {
     #[test]
     fn canonical_feedback_path_with_sha() {
         let parsed = parse_feedback_path(&p("foo/impl/abc1234/bob.md")).unwrap();
-        assert_eq!(parsed.session_id.as_str(), "foo");
+        assert_eq!(parsed.plan_key.as_str(), "foo");
         assert_eq!(parsed.phase, FeedbackPhase::Impl);
         assert_eq!(parsed.target_sha.unwrap().as_str(), "abc1234");
         assert_eq!(parsed.author.as_str(), "bob");
@@ -237,30 +229,5 @@ mod tests {
     #[test]
     fn plan_path_is_done_in_done_subdir() {
         assert!(plan_path_is_done(&p(".trinity/plans/done/foo.md")));
-    }
-
-    #[test]
-    fn session_id_active() {
-        assert_eq!(
-            session_id_from_plan_path(&p(".trinity/plans/foo.md"))
-                .unwrap()
-                .as_str(),
-            "foo"
-        );
-    }
-
-    #[test]
-    fn session_id_done() {
-        assert_eq!(
-            session_id_from_plan_path(&p(".trinity/plans/done/bar.md"))
-                .unwrap()
-                .as_str(),
-            "bar"
-        );
-    }
-
-    #[test]
-    fn session_id_non_md_rejected() {
-        assert!(session_id_from_plan_path(&p(".trinity/plans/foo.txt")).is_none());
     }
 }
