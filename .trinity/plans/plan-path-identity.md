@@ -2,50 +2,54 @@
 
 ## Revision note (2026-05-15)
 
-Earlier revisions of this plan (97c3e17 etc.) defined the wire identity as the
-two-component tuple `(repo_root, repo_relative_plan_path)`. That choice was
-made to keep the on-disk file path visible at every API boundary.
+The wire identity has been through several drafts:
 
-Lloyd is strongly convinced the wire identity should instead be a single
-string of the form
+1. `(repo_root, plan_path)` two-field tuple (approved at 97c3e17).
+2. `<canonical_repo_root>:<stem>.md` single string (61c20b7 → ef80833).
+3. Sanitized `<canonical_repo_root>:<stem>.md` with `/`→`_`
+   (lossy; abandoned).
+4. **Current**: `<repo_basename>/<stem>.md` — just the directory name
+   of the repo (the one containing `.git`), not the full path.
 
-```
-<repo_root>:<stem>.md
-```
+The full-path variants ran into URL-routing snags (axum wildcards must
+be terminal; sub-routes like `/plan/{*plan_id}/revision/{sha}` won't
+register), and every encoding scheme was either lossy or ugly.
 
-with active vs done as plan **state**, not part of the identity. The filename
-of this plan stays `plan-path-identity.md` for git-history continuity, but
-the design below has been rewritten around this revised identity. The repo
-root is still the load-bearing scope qualifier — there is no global plan
-namespace — but `repo:plan.md` is the single thing that names a plan
-everywhere outside the daemon's internal maps.
+The basename-only identity sidesteps all of it:
 
-The shipped Phase 1 / Phase 2 commits (`bc8efaf`, `e55aa6c`, `f4b6e10`,
-`a9e1ae9`) are partially superseded; the in-flight Phase 3 work is replaced
-by the Phase 2-revised + Phase 3-revised described below.
+- URLs are two clean segments: `/plan/{repo}/{stem_md}` and
+  `/plan/{repo}/{stem_md}/revision/{sha}`. No wildcards, no encoding.
+- Two repos with the same basename can't coexist; the second one
+  registered is refused. In practice a user keeps one checkout per
+  repo and this never collides.
+- Active vs done remains plan **state**, not identity.
 
 ## Summary
 
-Replace Trinity's two-component `(repo, plan_path)` wire identity with a
-single colon-joined string:
+Wire identity is `<repo_basename>/<stem>.md`:
 
 ```
-<repo_root>:<stem>.md
+trinity/plan-path-identity.md
+trinity/leptos-frontend.md
+frostsnap/dkg-improvement.md
 ```
 
-Examples:
+`<repo_basename>` is the directory name of the repo's working-tree
+root (the file_name of the path containing `.git`). The daemon
+maintains an internal map from basename → canonical absolute path so
+lookups resolve quickly.
 
-```
-/Users/llfourn/src/trinity:plan-path-identity.md
-/Users/llfourn/src/trinity:leptos-frontend.md
-~/src/trinity:plan-path-identity.md            (display shorthand; same identity)
-```
+A plan's identity is **stable across the active↔done move**: the same
+`PlanId` value names the plan whether the on-disk file lives at
+`.trinity/plans/<stem>.md` or `.trinity/plans/done/<stem>.md`. The
+state ("active" / "done") rides on the `Plan` record as a separate
+field and is returned to callers but never written into the wire
+identity.
 
-A plan's identity is **stable across the active↔done move**. The same
-`PlanId` value names the plan whether the on-disk file is at
-`.trinity/plans/<stem>.md` or `.trinity/plans/done/<stem>.md`. The state
-("active" / "done") rides on the `Plan` record as a separate field and is
-returned to callers but never written into the wire identity.
+Two repos with the same basename are not allowed. The daemon registers
+whichever it sees first; later attempts (via `start_plan` or the
+`~/.trinity/repos` startup loader) are rejected with
+`repo_basename_taken`.
 
 `session_id` and `PlanPath` both retire as public-facing concepts:
 
@@ -82,31 +86,42 @@ The runtime already keys by `PlanKey`. The wire should match.
 Identity is one string:
 
 ```
-PlanId := <repo_root> ":" <stem> ".md"
+PlanId := <repo_basename> "/" <stem> ".md"
 ```
 
 where:
 
-- `<repo_root>` is a canonical absolute path to the repo's working-tree
-  root (the same value used as `Trinity.repos` map keys today).
-- `<stem>` is the `PlanKey` slug — non-empty, no `/`, no `:`. Dots inside
+- `<repo_basename>` is the file_name component of the repo's
+  working-tree root — i.e. the name of the directory containing
+  `.git`. No path separators (impossible: directory names can't
+  contain `/`).
+- `<stem>` is the `PlanKey` slug — non-empty, no `/`. Dots inside
   the stem are allowed (`foo.v2`).
 - `.md` is fixed and required for parseability.
 
 Examples:
 
 ```
-/Users/llfourn/src/trinity:plan-path-identity.md
-/Users/llfourn/src/trinity:leptos-frontend.md
-/Users/llfourn/src/trinity-worktree:leptos-frontend.md   ← different identity
+trinity/plan-path-identity.md
+trinity/leptos-frontend.md
+frostsnap/dkg-improvement.md
 ```
 
-**On input** the daemon accepts either canonical or `~`-shorthand
-(`~/src/trinity:foo.md`) and normalizes via `$HOME` expansion +
-`dunce::canonicalize`. **Canonicalization is mandatory**: if it fails
-(e.g. the repo doesn't exist on disk), `PlanId::parse` returns
-`InvalidPlanId`. No raw-path fallback. Display layers compress `$HOME`
-back to `~`.
+The daemon maintains a basename → canonical absolute path index. When
+a `PlanId` is parsed, the daemon splits on the last `/` before
+`.md` to recover `(repo_basename, stem)`, looks up the basename in
+the index to find the canonical `repo_root`, then looks up the
+`PlanKey` in that repo's `plans` map. If the basename isn't in the
+index → `unknown_repo`. If the stem isn't in the repo's `plans` →
+`unknown_plan` (or `plan_conflict` if it's in `plan_conflicts`).
+
+**Repo registration** (via `start_plan`'s implicit cwd-repo resolution
+or the daemon's `~/.trinity/repos` startup loader) canonicalizes the
+repo path, takes its file_name as the basename, and refuses to
+register if another watched repo already claims that basename
+(`repo_basename_taken`). In practice this never collides — users have
+one checkout per repo name. When it does, the user resolves it by
+renaming a directory.
 
 **State** lives on the `Plan` record:
 
@@ -126,24 +141,23 @@ pub enum PlanState { Active, Done }
 include `state: "active" | "done"` and a `current_path` (repo-relative,
 e.g. `.trinity/plans/foo.md` or `.trinity/plans/done/foo.md`) so the
 UI can render the on-disk location without re-deriving it. The
-canonical identity is still `PlanId`; `current_path` is display
-material that callers can re-derive trivially from `(slug, state)`.
+canonical identity is `PlanId`; `current_path` is display material.
 
 ## Goals
 
 - One wire identifier across MCP, HTTP, SSE, log lines: `PlanId`.
 - Identity survives the active↔done move. URLs / MCP calls don't break
   when a plan transitions.
-- Drop `?repo=` from HTTP entirely. Drop `repo` as a separate field on
-  MCP plan-scoped tools. The repo is already inside the `PlanId`.
-- Conflicts (`PlanKey` collisions) still surface explicitly; the
-  identity is well-defined but resolution may return a `PlanConflict`
-  error with both file paths listed.
+- Drop `?repo=` from HTTP entirely. Drop `repo` as a separate input
+  field on MCP plan-scoped tools.
+- Conflicts (`PlanKey` collisions within a repo) still surface
+  explicitly via `plan_conflict` errors and a `conflicts` array in
+  `list_plans`.
 - No `PlanPathMismatch` variant; no counterpart-acceptance branch. The
-  same `PlanId` always resolves to the same plan or to a conflict.
-- `start_plan` still creates `.trinity/plans/<stem>.md` (always active);
-  the input is a `PlanId` whose stem becomes the filename. Done paths
-  are produced exclusively by the move-to-done lifecycle transition.
+  same `PlanId` always resolves to the same plan or to an error.
+- `start_plan` still creates `.trinity/plans/<stem>.md` (always
+  active). Done paths are produced exclusively by the move-to-done
+  lifecycle transition.
 
 ## Non-Goals
 
@@ -162,58 +176,70 @@ material that callers can re-derive trivially from `(slug, state)`.
 In `src/lifecycle.rs`:
 
 ```rust
-pub struct PlanKey(String);             // unchanged; stem only
+pub struct PlanKey(String);          // unchanged; stem only
+pub struct RepoBasename(String);     // file_name of the repo root
 
-/// Wire-form plan identity: `<canonical_repo>:<stem>.md`. Constructed
-/// from a `(repo, key)` tuple or parsed from a wire string. Display
-/// helper folds `$HOME` to `~`.
+/// Wire-form plan identity: `<repo_basename>/<stem>.md`. Two
+/// components, no canonicalization. The daemon resolves the basename
+/// against its `Trinity.repo_basenames` index to find the canonical
+/// `RepoRoot`.
 pub struct PlanId {
-    repo: PathBuf,    // canonical absolute path
+    repo: RepoBasename,
     key: PlanKey,
 }
 
 impl PlanId {
-    pub fn new(repo: impl Into<PathBuf>, key: PlanKey) -> Self { … }
+    pub fn new(repo: RepoBasename, key: PlanKey) -> Self { … }
     pub fn parse(s: &str) -> Result<Self, ParsePlanIdError> { … }
-    pub fn repo(&self) -> &Path { &self.repo }
+    pub fn repo(&self) -> &RepoBasename { &self.repo }
     pub fn key(&self) -> &PlanKey { &self.key }
-    /// Canonical wire form (absolute repo).
-    pub fn to_wire(&self) -> String { format!("{}:{}.md", self.repo.display(), self.key) }
-    /// Display form (folds $HOME to ~).
-    pub fn to_display(&self) -> String { … }
 }
 
-impl serde::Serialize for PlanId { /* serializes to_wire */ }
+impl fmt::Display for PlanId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}/{}.md", self.repo, self.key)
+    }
+}
+
+impl serde::Serialize for PlanId { /* via Display */ }
 impl serde::Deserialize for PlanId { /* via parse */ }
 ```
 
-`PlanKey::from_path` stays. `PlanPath` (the public-facing newtype Phase 1
-introduced) **is removed**; the runtime uses `PathBuf` for internal
-on-disk-path bookkeeping and `PlanId` for everything that crosses a
-boundary.
+`PlanKey::from_path` stays. `PlanPath` (the public-facing newtype
+Phase 1 introduced) **is removed**; the runtime uses `PathBuf` for
+internal on-disk-path bookkeeping and `PlanId` for everything that
+crosses a boundary.
 
-`PlanKey` grammar tightens: the stem **must not contain `:`** so the
-wire form is unambiguously parseable by splitting on the last `:`
-before the trailing `.md`. (Adds one rejection test; otherwise the grammar
-is unchanged from Phase 1.)
+`PlanKey` grammar from Phase 1 is unchanged. The stem may not contain
+`/` (already enforced) and the new wire form has no other separator
+ambiguity — the only `/` in `PlanId.to_string()` is between the
+basename and the stem.
 
 `PlanId::parse` rules:
 
-1. Accept input ending in `.md`. Strip the suffix.
-2. Find the last `:` in the remainder.
-3. Left of `:` → repo. Expand leading `~/` to `$HOME`. Apply
-   `dunce::canonicalize`. If canonicalization fails (path doesn't
-   exist, IO error, etc.), return `ParsePlanIdError`. No raw-path
-   fallback.
-4. Right of `:` → stem. Validate against `PlanKey` grammar.
-5. If any step fails, return `ParsePlanIdError` (the daemon maps to
-   `invalid_plan_id` over MCP / `400 Bad Request` over HTTP).
+1. Find the last `/` in the input.
+2. Left of `/` → `RepoBasename`. Reject empty or values containing
+   `/` (impossible after split, but defensive).
+3. Right of `/` → must end in `.md`; strip the suffix and validate the
+   stem against the `PlanKey` grammar.
+4. If any step fails, return `ParsePlanIdError` → `invalid_plan_id`.
+
+Note: `PlanId::parse` does **not** touch the filesystem. It validates
+the wire form only. The basename-to-canonical-root resolution is a
+separate step that happens against `Trinity.repo_basenames` (see §6).
+
+`Trinity` gains a basename index:
+
+```rust
+pub struct Trinity {
+    pub repos: BTreeMap<RepoRoot, RepoState>,
+    pub repo_basenames: BTreeMap<RepoBasename, RepoRoot>,
+    pub live_events: VecDeque<LiveEvent>,
+}
+```
 
 `RepoState` is unchanged: still `BTreeMap<PlanKey, Plan>` per repo, with
-`plan_conflicts: BTreeMap<PlanKey, Vec<PathBuf>>` for collisions. The
-runtime never sees a full `PlanId` internally — the dispatch layer
-splits `PlanId.repo()` to pick the `RepoState` and uses `PlanId.key()`
-to look up within it.
+`plan_conflicts: BTreeMap<PlanKey, Vec<PathBuf>>` for collisions.
 
 ### 1b. `PlanKey` uniqueness invariant + conflict handling
 
@@ -236,11 +262,11 @@ Done) rides on the `Plan` record. Moving `.trinity/plans/foo.md` to
 
 Resolution for an input `PlanId`:
 
-1. Look up `RepoState` by `plan_id.repo()`. If absent (repo not loaded)
-   → `unknown_repo` error.
-2. Look up `repo_state.plans[plan_id.key()]`. If absent: check
-   `plan_conflicts[key]` first and return `plan_conflict` with the
-   conflicting paths; otherwise return `unknown_plan`.
+1. Look up `trinity.repo_basenames[plan_id.repo()]`. If absent →
+   `unknown_repo` error.
+2. Look up `trinity.repos[<repo_root>].plans[plan_id.key()]`. If
+   absent: check `plan_conflicts[key]` first and return `plan_conflict`
+   with the conflicting paths; otherwise return `unknown_plan`.
 3. Return the `Plan`. No counterpart logic, no path comparison.
 
 This is strictly simpler than the previous revision's `resolve_plan`:
@@ -271,117 +297,101 @@ removed from every plan-scoped tool — it's encoded in the id.
 
 ```json
 {
-  "plan_id": "/abs/repo:leptos-frontend.md",
+  "plan_id": "trinity/leptos-frontend.md",
   "author_label": "codex"
 }
 ```
 
 Tools affected:
 
-- `start_plan` — accepts `plan_id`. `start_plan` is also the entry
-  point that registers a repo with the daemon: if the parsed
-  canonical repo isn't already in `Trinity.repos`, the daemon adds it
-  (matches today's `add_repo_if_unknown` + `ensure_repo_watcher`
-  behavior). The repo must already exist on disk as a git worktree;
-  if it doesn't, canonicalization fails and the daemon returns
-  `invalid_plan_id`. After parse, the daemon enforces
-  `state == active` (the input grammar can't express `done/`, so this
-  is implicit), creates the file at `<repo>/.trinity/plans/<stem>.md`,
-  and rejects when a plan with the same key already exists or sits in
-  `plan_conflicts`. Response: `{plan_id, repo, canonical_path,
-  committed, next_step}`. Errors: `invalid_plan_id`,
-  `plan_already_exists`, `plan_in_conflict`.
+- `start_plan` — accepts `{slug, label}` (and uses the shim's
+  cwd-repo). The daemon canonicalizes the cwd-repo, derives its
+  basename, registers the repo (refusing if another watched repo
+  already claims that basename: `repo_basename_taken`), then creates
+  `.trinity/plans/<slug>.md` and rejects when the slug collides with
+  an existing plan or a `plan_conflicts` entry. Response:
+  `{plan_id, repo, canonical_path, committed, next_step}`. Errors:
+  `repo_basename_taken`, `invalid_slug`, `plan_already_exists`,
+  `plan_in_conflict`. (`start_plan` is the only tool that takes a
+  bare slug — it has cwd context. The others take the full
+  `plan_id`.)
 - `get_context` — accepts `plan_id`. Errors: `invalid_plan_id`,
   `unknown_repo`, `unknown_plan`, `plan_not_committed`, `plan_conflict`.
   Response: `{plan_id, slug, state: "active"|"done", current_path,
   phase, plan_worktree_status, waiting_on, ...}`. `current_path` is
-  the plan's current repo-relative path (active vs done is the only
-  axis it varies on); agents that need it for display can read it
-  directly instead of recomputing from `(slug, state)`.
+  the plan's current repo-relative path.
 - `wait_for_work` — accepts `plan_id`. `Match`:
   `{plan_id, repo, work, locations}`. `repo` is the canonical absolute
-  path; `locations` stay repo-relative. `repo` is redundant with
-  `plan_id` (the agent could strip `:<stem>.md` to recover it) but
-  spelling it out keeps `wait_for_work` callers from having to parse
-  identifiers to do their job — the whole point of returning
-  `locations` is that the caller can act directly.
-- `list_plans` — accepts optional `repo` (still a useful filter when
-  watching multiple repos). Response: `{plans: [...], conflicts: [...]}`.
-  Each plan row: `{plan_id, slug, state, current_path, phase,
-  plan_worktree_status, waiting_on}`. Conflict row:
-  `{slug, plan_ids, paths}` (the `plan_ids` list every conflicting
-  identifier so the operator can pick which to act on; `paths` is
-  repo-relative for display).
+  path; `locations` are repo-relative. `repo` is redundant with
+  `plan_id` (the agent could look up the basename) but spelling it
+  out lets the caller act on `locations` directly.
+- `list_plans` — accepts optional `repo` (filter; the value is a
+  basename or a canonical path, both work). Response: `{plans,
+  conflicts}`. Each plan row: `{plan_id, slug, state, current_path,
+  phase, plan_worktree_status, waiting_on}`. Conflict row:
+  `{plan_id, slug, paths}` (the conflicted plan still has one
+  `plan_id` since all paths share a stem; `paths` lists every
+  conflicting on-disk path).
 
 `start_plan` keeps `label` for the agent-name autofill.
 
 Tool descriptions explicitly call out:
 
-- Input form: `<repo>:<stem>.md` (canonical) or `~/<…>:<stem>.md`
-  (shorthand).
-- Equality is on canonical form.
+- `plan_id` form is `<repo_basename>/<stem>.md`.
 - `state` is a response field; the same `plan_id` works whether the
   plan is currently active or in `done/`.
 
 ### 4b. MCP shim cache: `plan_id` is NOT cached
 
-**Unchanged in spirit, renamed in detail.** The shim caches
-`author_label`. It must not cache `plan_id`. Every plan-scoped call
-passes its own target explicitly. Tool description copy:
-`plan_id is the target of this call; pass it on every invocation`.
-
-The shim auto-prefixes the cwd-repo for ergonomic shortcut forms? **No
-auto-prefix** — the wire requires the full form, no shortcuts. If
-agents want shorthand they type `~/repo:foo.md` themselves; the daemon
-canonicalizes. This keeps the wire grammar single-form and the shim
-purely transport.
+**Unchanged in spirit.** The shim caches `author_label`. It must not
+cache `plan_id`. Every plan-scoped call passes its own target
+explicitly. Tool description copy: `plan_id is the target of this
+call; pass it on every invocation`.
 
 ### 5. UI routes + `/api/*`
 
-URL routes carry the **literal canonical `PlanId`** as the path tail.
-Axum's wildcard capture (`{*plan_id}`) takes everything after the
-prefix verbatim, no encoding/decoding. The match is byte-for-byte
-against the canonical form stored in the runtime.
-
-Examples:
-
-```
-/api/plan//Users/llfourn/src/trinity:plan-path-identity.md
-/plan//Users/llfourn/src/trinity:plan-path-identity.md
-```
-
-(The double slash is the literal `/` from the route prefix followed
-by the leading `/` of the absolute repo path. Axum captures the tail
-starting at the second `/`; the SPA's router does the same.)
+`PlanId` is two segments (`<repo_basename>`, `<stem>.md`), so routes
+use two ordinary path params — no wildcards, no encoding. Sub-routes
+work because the wildcard rule doesn't apply.
 
 Routes:
 
 ```
-GET  /                                # SPA home
-GET  /plan/{*plan_id}                 # SPA plan detail
-GET  /plan/{*plan_id}/revision/{sha}
-GET  /plan/{*plan_id}/commit/{sha}
-GET  /plan/{*plan_id}/diff/{from}...{to}
-POST /api/plan/{*plan_id}/done        # body: {}
+GET  /                                                # SPA home
+GET  /plan/{repo}/{stem_md}                           # SPA plan detail
+GET  /plan/{repo}/{stem_md}/revision/{sha}            # plan rev view
+GET  /plan/{repo}/{stem_md}/commit/{sha}              # commit diff
+GET  /plan/{repo}/{stem_md}/diff/{from}/{to}          # plan rev-vs-rev
+POST /api/plan/{repo}/{stem_md}/done                  # body: {}
 
-GET  /api/plans?repo=<repo>           # repo filter; absent = all watched repos
-GET  /api/plan/{*plan_id}
-GET  /api/plan/{*plan_id}/revision/{sha}
-GET  /api/plan/{*plan_id}/commit/{sha}
-GET  /api/plan/{*plan_id}/diff/{from}...{to}
+GET  /api/plans?repo=<basename>                       # filter; absent = all
+GET  /api/plan/{repo}/{stem_md}
+GET  /api/plan/{repo}/{stem_md}/revision/{sha}
+GET  /api/plan/{repo}/{stem_md}/commit/{sha}
+GET  /api/plan/{repo}/{stem_md}/diff/{from}/{to}
 ```
+
+Example URLs:
+
+```
+/plan/trinity/plan-path-identity.md
+/plan/trinity/plan-path-identity.md/revision/97c3e17
+/api/plan/frostsnap/dkg-improvement.md/commit/abc1234
+```
+
+The `{stem_md}` capture is the stem with the trailing `.md`
+(`foo.v2.md`, `plan-path-identity.md`). Backend handlers reconstruct
+`PlanId` from the two captures and resolve via the
+`trinity.repo_basenames` index.
 
 The SPA reads `state` from the response and renders the done badge —
 the URL doesn't change when a plan moves to done.
 
-**Handling URL-unsafe characters in repo paths:** Trinity refuses to
-watch a repo whose canonical path contains characters the HTTP path
-layer can't carry verbatim (`?`, `#`, `%`, space, control chars,
-non-UTF-8). `start_plan` rejects with `invalid_repo_path`; the daemon
-skips entries from `~/.trinity/repos` that fail the same check at
-startup (logged at WARN). The whole UI assumes URL addressability, so
-half-watching a repo we can't serve is incoherent. In practice every
-real-world repo root is a plain Unix path; the check is defensive.
+**Repo basename collisions.** Two repos with the same `file_name` of
+their canonical path can't both be watched. `start_plan` refuses with
+`repo_basename_taken`; the startup loader skips later duplicates with a
+WARN log. Naming `~/src/trinity` and `~/work/trinity` is a user
+configuration choice; the daemon doesn't try to disambiguate.
 
 Backend handlers (`api_plans`, `api_plan`, etc.) live in
 `src/server/http.rs`. The old `/api/sessions*` routes are deleted with
@@ -395,7 +405,7 @@ events). The `/events` SSE payload:
 ```json
 {
   "ts": 1715666400,
-  "plan_id": "/abs/repo:foo.md",
+  "plan_id": "trinity/foo.md",
   "slug": "foo",
   "state": "active",
   "kind": "feedback_changed",
@@ -557,89 +567,74 @@ Identity-leak checks (acceptance grep is over boundary surfaces only):
 
 Behavioral acceptance:
 
-- MCP `wait_for_work` distinguishes two plans with the same filename
-  in different repos: same stem, different repo roots → different
+- MCP `wait_for_work` distinguishes two plans with the same stem in
+  different repos: same stem, different basenames → different
   `plan_id` values → different `Match`es.
 - Duplicate `PlanKey` in one repo is detected; MCP calls return
-  `plan_conflict`; `/api/plan/{plan_id_encoded}` returns 409;
-  `/api/plans` surfaces the conflict row; the UI renders the conflict
-  on the home row. Work is NOT routed silently to either file.
+  `plan_conflict`; the corresponding `/api/plan/{repo}/{stem_md}`
+  returns 409; `/api/plans` surfaces the conflict row; the UI renders
+  the conflict on the home row. Work is NOT routed silently to either
+  file.
 - Moving `.trinity/plans/foo.md` to `.trinity/plans/done/foo.md`:
   - The `PlanId` is unchanged.
-  - URLs built from the previous active path keep working.
+  - URLs built before the move keep working.
   - `Plan.state` flips to `Done`.
   - Existing feedback under `.trinity/feedback/foo/...` still targets
-    the same plan (the key is stable).
+    the same plan.
 - The MCP shim does not autofill `plan_id`. An MCP call that omits
-  `plan_id` fails at schema validation, not silently.
+  `plan_id` fails at schema validation.
 - `start_plan` registers a previously-unknown repo (canonicalizes,
-  inserts into `Trinity.repos`, starts the watcher). `start_plan`
-  rejects: invalid `plan_id` (parse / canonicalize failure), stem
-  collides with an existing plan, stem in `plan_conflicts`.
-- `PlanId::parse` rejects raw paths that can't be canonicalized
-  (returns `invalid_plan_id`). No raw-path fallback.
-- URLs carry the canonical `PlanId` verbatim. Round-trip test: a
-  `PlanId` constructed via `start_plan`, formatted into a URL,
-  re-extracted by the route handler, and looked up returns the same
-  plan.
-- `start_plan` rejects repo paths whose canonical form contains
-  HTTP-unsafe characters (`?`, `#`, `%`, space, control chars,
-  non-UTF-8) with `invalid_repo_path`. The daemon startup loader logs
-  WARN and skips matching entries in `~/.trinity/repos`.
+  computes basename, inserts into `Trinity.repos` +
+  `Trinity.repo_basenames`, starts the watcher). It rejects:
+  invalid slug, stem collides with an existing plan or
+  `plan_conflicts` entry, basename collides with another watched
+  repo (`repo_basename_taken`).
+- The daemon startup loader skips entries in `~/.trinity/repos`
+  whose basenames collide, with a WARN log; first entry wins.
+- `PlanId::parse` validates the wire form (two segments, `.md`
+  suffix, no `/` in stem) without touching the filesystem.
+  Filesystem resolution happens in the `repo_basenames` lookup.
+- URLs are two path segments: `/api/plan/{repo}/{stem_md}` etc.
+  Round-trip: a `PlanId` constructed via `start_plan`, formatted
+  into a URL, re-extracted, and looked up returns the same plan.
 - `LiveEvent` and `/events` emit `plan_id` (nullable for repo-level
   events) plus derived `slug` + `state`. Frontend `EventStore` and
   activity sidebar consume the new shape.
 - Same-`PlanId` regression: a plan moved to `done/` keeps the URL
-  reachable through the UI without reload (state field flips on the
-  resource invalidation).
+  reachable through the UI without reload.
 - `cargo test` and `cargo clippy --lib --tests` pass.
 - `cd frontend && trunk build` succeeds.
 
 ## Resolved questions
 
-- *PlanPathMismatch handling*: removed. The single-form wire grammar
-  makes it unreachable by construction. (Previously partial: variant
-  existed but never fired.)
-- *URL encoding for plan-scoped routes*: none. The canonical `PlanId`
-  goes into the URL verbatim via an axum wildcard route. Repos with
-  HTTP-unsafe canonical paths (`?`, `#`, `%`, space, control chars)
-  are rejected at registration — Trinity refuses to watch a repo it
-  can't serve through the UI. Single-user local daemon; in practice
-  every repo path is plain.
+- *PlanPathMismatch handling*: removed. The wire grammar makes it
+  unreachable by construction.
+- *URL encoding for plan-scoped routes*: none. `PlanId` is two
+  ordinary path segments (`<repo_basename>/<stem>.md`). No wildcards,
+  no encoding, sub-routes work.
+- *Whether the wire identity carries the full repo path*: no. Just
+  the basename. Two repos with the same basename can't both be
+  watched; first registration wins.
 - *`?repo=` ergonomics*: eliminated for plan-scoped routes. Kept only
-  on `/api/plans` as an optional filter when the daemon is watching
-  multiple repos.
+  on `/api/plans` as an optional filter.
 - *Active/done identity drift*: identity is stable across the move;
-  state rides on a separate field. The `counterpart` helper is
-  internal-only or removed.
-- *Raw-path fallback when canonicalization fails*: rejected. `PlanId::parse`
-  must successfully canonicalize the repo prefix or it returns
-  `invalid_plan_id`. No fallback. (Was previously a hedge; codex flagged
-  it as breaking the "one identity" invariant.)
+  state rides on a separate field.
 - *Whether on-disk paths appear in responses*: yes for `get_context` /
-  `list_plans` as a `current_path` display field (the plan's active or
-  done repo-relative path). The internal `Plan.plan_path` is still
-  not serialized directly; `current_path` is derived from
-  `(slug, state)` at response time. Actionable filesystem locations
-  (`write_feedback.path`, `wait_for_work.locations`) are repo-relative.
-- *Should `wait_for_work` include `repo` in its response*: yes. The
-  `plan_id` carries the repo but expecting every consumer to parse it
-  just to use `locations` defeats the convenience of having
-  `locations` at all. Redundant-but-helpful.
+  `list_plans` as a `current_path` display field. The internal
+  `Plan.plan_path` is not serialized directly. Actionable filesystem
+  locations (`write_feedback.path`, `wait_for_work.locations`) are
+  repo-relative.
+- *Should `wait_for_work` include `repo` in its response*: yes —
+  redundant-but-helpful so callers can act on `locations` directly.
 
 ## Open Questions
 
-- *Whether to keep `~`-shorthand support on input*. Pro: nicer for
-  hand-written calls and URLs. Con: two input forms means more parse /
-  canonicalize surface. **Tentative answer**: keep it; the daemon
-  already canonicalizes via `dunce` so the marginal complexity is
-  small. (`~` is expanded before canonicalization; outputs are always
-  canonical.)
-- *Repo-path characters that defeat canonicalization*. `dunce::canonicalize`
-  resolves symlinks and case, but it can't materialize a repo that
-  isn't on disk. `start_plan` requires the repo exists; all other
-  tools require the repo is already loaded (it must have been loaded
-  via some prior `start_plan` or daemon-startup `~/.trinity/repos`).
+- *Sub-directories of basename-shaped repos as worktrees*. Git
+  worktrees end up in arbitrary directories; if a user puts the
+  worktree at `~/wt/trinity-pr-42` they get basename
+  `trinity-pr-42`, which doesn't collide with `trinity`. If they put
+  it at `~/wt/trinity` they collide. The user resolves this with the
+  worktree's directory name, not Trinity.
 - *Backwards-compat for already-recorded feedback*: feedback under
   `.trinity/feedback/<stem>/...` already keys by stem only and is
-  unaffected by this revision. No migration needed.
+  unaffected.
