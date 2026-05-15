@@ -1325,6 +1325,103 @@ async fn delete_repo_removes_from_state_and_registry() {
 }
 
 #[tokio::test]
+async fn delete_repo_surfaces_registry_write_error() {
+    // Wire-shape regression: when the registry rewrite fails after a
+    // successful in-memory deregistration, the response must carry
+    // `ok: false` and `registry_write_error: Some(_)` so the frontend
+    // can show a warning to the operator. Without this, the repo is
+    // gone from `Trinity.repos` but lingers in the file, and resurrects
+    // on next daemon restart with no signal.
+    //
+    // Trigger the write failure by chmod'ing the registry's parent
+    // directory read-only AFTER `start_plan` has already populated it.
+    // `remove_repo_from_registry` writes a `.repos.tmp` sibling and
+    // then renames; the tmp-write hits EACCES on a read-only dir.
+    use std::os::unix::fs::PermissionsExt;
+
+    let _home_guard = HOME_LOCK.lock().await;
+    let fake_home = tempfile::tempdir().unwrap();
+    let prev_home = std::env::var_os("HOME");
+    // SAFETY: serialized via HOME_LOCK with the other HOME-mutating tests.
+    unsafe { std::env::set_var("HOME", fake_home.path()) };
+
+    let registry_parent = tempfile::tempdir().unwrap();
+    let registry_path = registry_parent.path().join("repos");
+
+    let parent = tempfile::tempdir().unwrap();
+    let dir = parent.path().join("locked");
+    std::fs::create_dir_all(&dir).unwrap();
+    run_git(&dir, &["init", "--quiet", "--initial-branch=main"]);
+    run_git(&dir, &["config", "user.email", "test@test"]);
+    run_git(&dir, &["config", "user.name", "test"]);
+    run_git(&dir, &["config", "commit.gpgsign", "false"]);
+
+    let (url, handle) = spawn_daemon_with_repos_file(&registry_path, &[]).await;
+    let client = reqwest::Client::new();
+
+    // Register first (writable parent).
+    let req = json!({
+        "cwd": dir,
+        "tool": "start_plan",
+        "arguments": { "slug": "p", "label": "agent" }
+    });
+    let resp = client
+        .post(format!("{url}/internal/tool_call"))
+        .json(&req)
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        resp.status().is_success(),
+        "start_plan should succeed before chmod"
+    );
+
+    // Lock the registry's parent dir so the tmp-write inside
+    // remove_repo_from_registry fails with EACCES.
+    let mut perms = std::fs::metadata(registry_parent.path())
+        .unwrap()
+        .permissions();
+    let original_mode = perms.mode();
+    perms.set_mode(0o555);
+    std::fs::set_permissions(registry_parent.path(), perms).unwrap();
+
+    let resp = client
+        .delete(format!("{url}/api/repos/locked"))
+        .send()
+        .await
+        .unwrap();
+    let status = resp.status();
+    let body: serde_json::Value = resp.json().await.unwrap();
+
+    // Restore so tempdir cleanup can drop the path on Drop.
+    let mut restore = std::fs::metadata(registry_parent.path())
+        .unwrap()
+        .permissions();
+    restore.set_mode(original_mode);
+    std::fs::set_permissions(registry_parent.path(), restore).unwrap();
+    handle.abort();
+
+    assert_eq!(status, reqwest::StatusCode::OK);
+    assert_eq!(
+        body["ok"], false,
+        "registry write failure should flip ok to false; got: {body}"
+    );
+    let warning = body["registry_write_error"]
+        .as_str()
+        .unwrap_or_else(|| panic!("registry_write_error missing or not a string; body: {body}"));
+    assert!(
+        warning.contains(&*registry_path.to_string_lossy())
+            || warning.to_lowercase().contains("registry"),
+        "warning should mention the registry; got: {warning}"
+    );
+
+    match prev_home {
+        Some(v) => unsafe { std::env::set_var("HOME", v) },
+        None => unsafe { std::env::remove_var("HOME") },
+    }
+}
+
+#[tokio::test]
 async fn delete_repo_404_on_unknown_basename() {
     let dir = init_repo();
     write_file(dir.path(), ".trinity/plans/foo.md", "# foo\n");
