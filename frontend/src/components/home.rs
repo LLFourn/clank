@@ -26,9 +26,7 @@ pub fn Home() -> impl IntoView {
                                     }
                                         .into_any()
                                 }
-                                None => unreachable!(
-                                    "Suspense fallback handles the pending state",
-                                ),
+                                None => view! { <p class="loading">"Loading…"</p> }.into_any(),
                             })
                     }}
                 </Suspense>

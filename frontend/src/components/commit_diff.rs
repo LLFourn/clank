@@ -33,9 +33,7 @@ pub fn CommitDiff() -> impl IntoView {
                             view! { <p class="error">"Failed to load: " {e.to_string()}</p> }
                                 .into_any()
                         }
-                        None => unreachable!(
-                            "Suspense fallback handles the pending state",
-                        ),
+                        None => view! { <p class="loading">"Loading…"</p> }.into_any(),
                     })
             }}
         </Suspense>
