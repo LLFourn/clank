@@ -277,8 +277,7 @@ async fn api_plans(
                 .map_err(AppError::runtime)?,
         );
     }
-    let snapshot_refs: Vec<&_> = snapshots.iter().collect();
-    let v = crate::ui_response::plans_index_across(&snapshot_refs).map_err(AppError::io)?;
+    let v = crate::ui_response::plans_index_across(&snapshots).map_err(AppError::io)?;
     Ok(axum::Json(v))
 }
 

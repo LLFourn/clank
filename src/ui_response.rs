@@ -47,12 +47,12 @@ pub fn plans_index_with_reader(
 /// the merge so the sort key never gets serialized-and-re-extracted via
 /// the JSON shape — a regression on the timestamp field type would be
 /// a compile error here, not a silent sort degrade.
-pub fn plans_index_across(snapshots: &[&RepoSnapshot]) -> std::io::Result<Value> {
+pub fn plans_index_across(snapshots: &[RepoSnapshot]) -> std::io::Result<Value> {
     plans_index_across_with_reader(snapshots, &crate::mcp_response::DiskPlanStatusReader)
 }
 
 pub fn plans_index_across_with_reader(
-    snapshots: &[&RepoSnapshot],
+    snapshots: &[RepoSnapshot],
     status_reader: &impl PlanStatusReader,
 ) -> std::io::Result<Value> {
     let mut all_plans: Vec<IndexedPlanRow> = Vec::new();
