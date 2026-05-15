@@ -28,11 +28,7 @@ pub struct ServeArgs {
 
     /// Path to the repos-list file. One absolute repo root per line.
     /// Trinity loads each line at startup and starts a notify watcher.
-    #[arg(
-        long,
-        default_value = "~/.trinity/repos",
-        env = "TRINITY_REPOS"
-    )]
+    #[arg(long, default_value = "~/.trinity/repos", env = "TRINITY_REPOS")]
     pub repos: String,
 
     /// Path to the daemon-lock pidfile. Trinity refuses to boot if this

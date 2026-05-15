@@ -208,7 +208,10 @@ mod tests {
 
     #[test]
     fn parse_verdict_leading_whitespace() {
-        assert_eq!(parse_verdict("\n\n   APPROVE   \n\nbody\n"), Verdict::Approve);
+        assert_eq!(
+            parse_verdict("\n\n   APPROVE   \n\nbody\n"),
+            Verdict::Approve
+        );
     }
 
     #[test]

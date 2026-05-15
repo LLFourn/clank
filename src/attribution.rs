@@ -36,7 +36,10 @@ pub struct PlanTouch {
 /// ancestor in the parent chain. Multi-plan-touch parents transmit their
 /// own grandparent's effective session forward — this is handled by the
 /// caller, which threads `effective_session_of(commit)` through the walk.
-pub fn classify(changes: &CommitChanges, parent_effective: Option<&SessionId>) -> AttributionResult {
+pub fn classify(
+    changes: &CommitChanges,
+    parent_effective: Option<&SessionId>,
+) -> AttributionResult {
     match changes.plan_touches.len() {
         1 => {
             let touch = &changes.plan_touches[0];
@@ -210,10 +213,16 @@ mod tests {
         // Simulate a chain: plan_intro(A), impl_1(no plan), impl_2(no plan),
         // plan_revision(B), impl_3(no plan), impl_4(no plan).
         let chain = vec![
-            ("intro_a", changes(vec![touch("a", PlanTouchKind::Intro)], false)),
+            (
+                "intro_a",
+                changes(vec![touch("a", PlanTouchKind::Intro)], false),
+            ),
             ("impl_1", changes(vec![], true)),
             ("impl_2", changes(vec![], true)),
-            ("intro_b", changes(vec![touch("b", PlanTouchKind::Intro)], false)),
+            (
+                "intro_b",
+                changes(vec![touch("b", PlanTouchKind::Intro)], false),
+            ),
             ("impl_3", changes(vec![], true)),
             ("impl_4", changes(vec![], true)),
         ];
@@ -264,7 +273,10 @@ mod tests {
         // The multi-plan commit is unattributed, but the impl after it
         // should walk through to A.
         let chain = vec![
-            ("intro_a", changes(vec![touch("a", PlanTouchKind::Intro)], false)),
+            (
+                "intro_a",
+                changes(vec![touch("a", PlanTouchKind::Intro)], false),
+            ),
             (
                 "multi",
                 changes(
@@ -286,7 +298,10 @@ mod tests {
             results.push((label.to_string(), result));
         }
 
-        assert!(matches!(&results[0].1, AttributionResult::Attributed { .. }));
+        assert!(matches!(
+            &results[0].1,
+            AttributionResult::Attributed { .. }
+        ));
         assert!(matches!(&results[1].1, AttributionResult::Unattributed));
         // impl_after_multi walks through `multi` (which transmitted A's
         // effective_session forward) and lands on A.

@@ -17,8 +17,8 @@ use crate::disk_format::FeedbackPhase;
 use crate::fs_watcher::FilesystemSignal;
 use crate::lifecycle::{CommitSha, SessionId, content_hash};
 use crate::rebuild::{RebuildError, rebuild_repo};
-use crate::repo_state::{AttributionResult, Feedback, HeldFeedback, LiveEvent, Session, Trinity};
-use crate::runtime_snapshot::{RepoSnapshot, SessionSnapshotBundle};
+use crate::repo_state::{AttributionResult, Feedback, HeldFeedback, LiveEvent, Plan, Trinity};
+use crate::runtime_snapshot::{PlanSnapshotBundle, RepoSnapshot};
 
 pub struct Runtime {
     state: Arc<Mutex<Trinity>>,
@@ -101,8 +101,7 @@ impl Runtime {
     /// Clone a repo snapshot while holding the runtime lock. Callers do
     /// disk and git I/O after this returns.
     pub async fn snapshot_repo(&self, repo_root: &Path) -> Result<RepoSnapshot, RuntimeError> {
-        let canonical = dunce::canonicalize(repo_root)
-            .unwrap_or_else(|_| repo_root.to_path_buf());
+        let canonical = dunce::canonicalize(repo_root).unwrap_or_else(|_| repo_root.to_path_buf());
         let trinity = self.state.lock().await;
         let state = trinity
             .repos
@@ -117,15 +116,14 @@ impl Runtime {
         &self,
         repo_root: &Path,
         session_id: &SessionId,
-    ) -> Result<Option<SessionSnapshotBundle>, RuntimeError> {
-        let canonical = dunce::canonicalize(repo_root)
-            .unwrap_or_else(|_| repo_root.to_path_buf());
+    ) -> Result<Option<PlanSnapshotBundle>, RuntimeError> {
+        let canonical = dunce::canonicalize(repo_root).unwrap_or_else(|_| repo_root.to_path_buf());
         let trinity = self.state.lock().await;
         let state = trinity
             .repos
             .get(&canonical)
             .ok_or_else(|| RuntimeError::UnknownRepo(canonical.clone()))?;
-        Ok(SessionSnapshotBundle::from_state_for(state, session_id))
+        Ok(PlanSnapshotBundle::from_state_for(state, session_id))
     }
 
     /// Read-only in-memory access for tests. Do not call disk-aware
@@ -136,8 +134,7 @@ impl Runtime {
         repo_root: &Path,
         f: impl FnOnce(&crate::repo_state::RepoState) -> R,
     ) -> Result<R, RuntimeError> {
-        let canonical = dunce::canonicalize(repo_root)
-            .unwrap_or_else(|_| repo_root.to_path_buf());
+        let canonical = dunce::canonicalize(repo_root).unwrap_or_else(|_| repo_root.to_path_buf());
         let trinity = self.state.lock().await;
         let state = trinity
             .repos
@@ -200,8 +197,8 @@ impl Runtime {
         signal: FilesystemSignal,
         now: i64,
     ) -> Result<(), RuntimeError> {
-        let repo_root_canonical = dunce::canonicalize(repo_root)
-            .unwrap_or_else(|_| repo_root.to_path_buf());
+        let repo_root_canonical =
+            dunce::canonicalize(repo_root).unwrap_or_else(|_| repo_root.to_path_buf());
         let repo_root = repo_root_canonical.as_path();
         match signal {
             FilesystemSignal::HeadChanged => {
@@ -238,7 +235,7 @@ impl Runtime {
                 let Some(state) = trinity.repos.get(repo_root) else {
                     return Err(RuntimeError::UnknownRepo(repo_root.to_path_buf()));
                 };
-                if !state.sessions.contains_key(&session_id) {
+                if !state.plans.contains_key(&session_id) {
                     // Untracked draft — drop silently per the plan.
                     return Ok(());
                 }
@@ -254,9 +251,7 @@ impl Runtime {
                 );
             }
             FilesystemSignal::FeedbackWritten { parsed } => {
-                let abs_path = repo_root
-                    .join(".trinity/feedback")
-                    .join(&parsed.raw);
+                let abs_path = repo_root.join(".trinity/feedback").join(&parsed.raw);
                 if self.should_skip_self_write(&abs_path).await {
                     return Ok(());
                 }
@@ -287,7 +282,7 @@ impl Runtime {
                         .repos
                         .get_mut(repo_root)
                         .ok_or_else(|| RuntimeError::UnknownRepo(repo_root.to_path_buf()))?;
-                    let Some(session) = state.sessions.get_mut(&session_id) else {
+                    let Some(session) = state.plans.get_mut(&session_id) else {
                         return Ok(());
                     };
                     upsert_feedback_at_target(
@@ -316,7 +311,7 @@ impl Runtime {
                 let Some(state) = trinity.repos.get_mut(repo_root) else {
                     return Err(RuntimeError::UnknownRepo(repo_root.to_path_buf()));
                 };
-                let Some(session) = state.sessions.get_mut(&session_id) else {
+                let Some(session) = state.plans.get_mut(&session_id) else {
                     return Ok(());
                 };
                 upsert_feedback(session, abs_path, parsed, body);
@@ -332,9 +327,7 @@ impl Runtime {
                 );
             }
             FilesystemSignal::FeedbackRemoved { parsed } => {
-                let abs_path = repo_root
-                    .join(".trinity/feedback")
-                    .join(&parsed.raw);
+                let abs_path = repo_root.join(".trinity/feedback").join(&parsed.raw);
                 if self.should_skip_self_write(&abs_path).await {
                     return Ok(());
                 }
@@ -343,7 +336,7 @@ impl Runtime {
                     return Err(RuntimeError::UnknownRepo(repo_root.to_path_buf()));
                 };
                 let session_id = parsed.session_id.clone();
-                let Some(session) = state.sessions.get_mut(&session_id) else {
+                let Some(session) = state.plans.get_mut(&session_id) else {
                     return Ok(());
                 };
                 remove_feedback(session, &parsed);
@@ -386,7 +379,7 @@ impl Runtime {
                 return Ok(());
             };
             let mut out = Vec::new();
-            for (id, sess) in &mut state.sessions {
+            for (id, sess) in &mut state.plans {
                 let held: Vec<HeldFeedback> = std::mem::take(&mut sess.held_plan_feedback);
                 for h in held {
                     out.push((id.clone(), h));
@@ -440,7 +433,7 @@ impl Runtime {
             let Some(state) = trinity.repos.get(repo_root) else {
                 return Ok(None);
             };
-            let Some(session) = state.sessions.get(&parsed.session_id) else {
+            let Some(session) = state.plans.get(&parsed.session_id) else {
                 return Ok(None);
             };
             FlatDropSnapshot {
@@ -481,10 +474,11 @@ impl Runtime {
         if matches!(parsed.phase, FeedbackPhase::Plan) {
             use crate::projection::plan_worktree_status;
             use crate::repo_state::PlanWorktreeStatus;
-            let active_path = repo_root.join(&snapshot.plan_path);
-            let counterpart_rel =
-                crate::mcp_response::swap_active_done(&snapshot.plan_path);
-            let counterpart_abs = counterpart_rel.as_ref().map(|p| repo_root.join(p));
+            let active_path = repo_root.join(snapshot.plan_path.as_path());
+            let counterpart_rel = snapshot.plan_path.counterpart();
+            let counterpart_abs = counterpart_rel
+                .as_ref()
+                .map(|p| repo_root.join(p.as_path()));
             let wt_hash = std::fs::read_to_string(&active_path)
                 .ok()
                 .map(|b| content_hash(&b));
@@ -515,7 +509,7 @@ impl Runtime {
 
 struct FlatDropSnapshot {
     body_hash: crate::lifecycle::ContentHash,
-    plan_path: PathBuf,
+    plan_path: crate::lifecycle::PlanPath,
     target: Option<CommitSha>,
 }
 
@@ -524,7 +518,7 @@ struct FlatDropSnapshot {
 /// over `attribution` alone is SHA-lex order, not chronological, so we
 /// walk `commit_order` and look up each entry.
 fn latest_attributed_commit(
-    session: &Session,
+    session: &Plan,
     state: &crate::repo_state::RepoState,
     pred: impl Fn(&AttributionResult) -> bool,
 ) -> Option<CommitSha> {
@@ -544,7 +538,7 @@ fn latest_attributed_commit(
 }
 
 fn upsert_feedback_at_target(
-    session: &mut Session,
+    session: &mut Plan,
     abs_path: PathBuf,
     target_sha: CommitSha,
     phase: FeedbackPhase,
@@ -587,7 +581,7 @@ impl Runtime {
 }
 
 fn upsert_feedback(
-    session: &mut Session,
+    session: &mut Plan,
     abs_path: PathBuf,
     parsed: crate::disk_format::FeedbackPath,
     body: String,
@@ -626,7 +620,7 @@ fn upsert_feedback(
     }
 }
 
-fn remove_feedback(session: &mut Session, parsed: &crate::disk_format::FeedbackPath) {
+fn remove_feedback(session: &mut Plan, parsed: &crate::disk_format::FeedbackPath) {
     match &parsed.target_sha {
         Some(target_sha) => {
             let map = match parsed.phase {
@@ -699,10 +693,7 @@ mod tests {
         let rt = Runtime::new();
         rt.add_repo(dir.path().to_path_buf()).await.unwrap();
 
-        let count = rt
-            .read_repo(dir.path(), |s| s.sessions.len())
-            .await
-            .unwrap();
+        let count = rt.read_repo(dir.path(), |s| s.plans.len()).await.unwrap();
         assert_eq!(count, 1);
     }
 
@@ -798,7 +789,7 @@ mod tests {
 
         let intro: CommitSha = rt
             .read_repo(dir.path(), |s| {
-                s.sessions[&SessionId::from("foo".to_string())]
+                s.plans[&SessionId::from("foo".to_string())]
                     .plan_intro
                     .clone()
             })
@@ -813,13 +804,9 @@ mod tests {
         let parsed_rel = PathBuf::from(format!("foo/plan/{}/alice.md", intro.as_str()));
         let parsed = crate::disk_format::parse_feedback_path(&parsed_rel).unwrap();
 
-        rt.handle_signal(
-            dir.path(),
-            FilesystemSignal::FeedbackWritten { parsed },
-            7,
-        )
-        .await
-        .unwrap();
+        rt.handle_signal(dir.path(), FilesystemSignal::FeedbackWritten { parsed }, 7)
+            .await
+            .unwrap();
 
         // The gate should now resolve to ready_to_implement.
         let snapshot = rt
@@ -845,7 +832,7 @@ mod tests {
 
         let intro: CommitSha = rt
             .read_repo(dir.path(), |s| {
-                s.sessions[&SessionId::from("foo".to_string())]
+                s.plans[&SessionId::from("foo".to_string())]
                     .plan_intro
                     .clone()
             })
@@ -867,13 +854,9 @@ mod tests {
 
         // Remove the file and signal.
         std::fs::remove_file(dir.path().join(&feedback_rel)).unwrap();
-        rt.handle_signal(
-            dir.path(),
-            FilesystemSignal::FeedbackRemoved { parsed },
-            2,
-        )
-        .await
-        .unwrap();
+        rt.handle_signal(dir.path(), FilesystemSignal::FeedbackRemoved { parsed }, 2)
+            .await
+            .unwrap();
 
         let snapshot = rt
             .snapshot_session(dir.path(), &SessionId::from("foo".to_string()))
@@ -900,27 +883,20 @@ mod tests {
 
         let parsed_rel = PathBuf::from("foo/plan/alice.md");
         let parsed = crate::disk_format::parse_feedback_path(&parsed_rel).unwrap();
-        rt.handle_signal(
-            dir.path(),
-            FilesystemSignal::FeedbackWritten { parsed },
-            7,
-        )
-        .await
-        .unwrap();
+        rt.handle_signal(dir.path(), FilesystemSignal::FeedbackWritten { parsed }, 7)
+            .await
+            .unwrap();
 
         // The flat file should be gone; the canonical SHA-subdir file should exist.
         let intro_sha = rt
             .read_repo(dir.path(), |s| {
-                s.sessions[&SessionId::from("foo".to_string())]
+                s.plans[&SessionId::from("foo".to_string())]
                     .plan_intro
                     .clone()
             })
             .await
             .unwrap();
-        let canonical_rel = format!(
-            ".trinity/feedback/foo/plan/{}/alice.md",
-            intro_sha.as_str()
-        );
+        let canonical_rel = format!(".trinity/feedback/foo/plan/{}/alice.md", intro_sha.as_str());
         assert!(
             !dir.path().join(feedback_rel).exists(),
             "flat-drop file should be gone"
@@ -934,7 +910,7 @@ mod tests {
         // the target SHA + alice key.
         let key_present = rt
             .read_repo(dir.path(), |s| {
-                s.sessions[&SessionId::from("foo".to_string())]
+                s.plans[&SessionId::from("foo".to_string())]
                     .plan_feedback
                     .contains_key(&(intro_sha, AgentLabel::from("alice".to_string())))
             })
@@ -949,7 +925,11 @@ mod tests {
         write_file(dir.path(), ".trinity/plans/foo.md", "# foo v1\n");
         commit(dir.path(), "add foo");
         // Edit the plan without committing
-        write_file(dir.path(), ".trinity/plans/foo.md", "# foo v2 uncommitted\n");
+        write_file(
+            dir.path(),
+            ".trinity/plans/foo.md",
+            "# foo v2 uncommitted\n",
+        );
 
         let rt = Runtime::new();
         rt.add_repo(dir.path().to_path_buf()).await.unwrap();
@@ -959,13 +939,9 @@ mod tests {
 
         let parsed_rel = PathBuf::from("foo/plan/alice.md");
         let parsed = crate::disk_format::parse_feedback_path(&parsed_rel).unwrap();
-        rt.handle_signal(
-            dir.path(),
-            FilesystemSignal::FeedbackWritten { parsed },
-            1,
-        )
-        .await
-        .unwrap();
+        rt.handle_signal(dir.path(), FilesystemSignal::FeedbackWritten { parsed }, 1)
+            .await
+            .unwrap();
 
         // Flat file should still be there (held, not renamed).
         assert!(
@@ -974,7 +950,7 @@ mod tests {
         );
         let held_count = rt
             .read_repo(dir.path(), |s| {
-                s.sessions[&SessionId::from("foo".to_string())]
+                s.plans[&SessionId::from("foo".to_string())]
                     .held_plan_feedback
                     .len()
             })
@@ -989,7 +965,11 @@ mod tests {
         write_file(dir.path(), ".trinity/plans/foo.md", "# foo v1\n");
         commit(dir.path(), "add foo v1");
         // Edit plan without committing → body_dirty
-        write_file(dir.path(), ".trinity/plans/foo.md", "# foo v2 uncommitted\n");
+        write_file(
+            dir.path(),
+            ".trinity/plans/foo.md",
+            "# foo v2 uncommitted\n",
+        );
 
         let rt = Runtime::new();
         rt.add_repo(dir.path().to_path_buf()).await.unwrap();
@@ -999,17 +979,13 @@ mod tests {
         write_file(dir.path(), feedback_rel, "APPROVE\n");
         let parsed_rel = PathBuf::from("foo/plan/alice.md");
         let parsed = crate::disk_format::parse_feedback_path(&parsed_rel).unwrap();
-        rt.handle_signal(
-            dir.path(),
-            FilesystemSignal::FeedbackWritten { parsed },
-            1,
-        )
-        .await
-        .unwrap();
+        rt.handle_signal(dir.path(), FilesystemSignal::FeedbackWritten { parsed }, 1)
+            .await
+            .unwrap();
 
         let held_count = rt
             .read_repo(dir.path(), |s| {
-                s.sessions[&SessionId::from("foo".to_string())]
+                s.plans[&SessionId::from("foo".to_string())]
                     .held_plan_feedback
                     .len()
             })
@@ -1028,7 +1004,7 @@ mod tests {
 
         let (held_after, has_canonical_entry) = rt
             .read_repo(dir.path(), |s| {
-                let sess = &s.sessions[&SessionId::from("foo".to_string())];
+                let sess = &s.plans[&SessionId::from("foo".to_string())];
                 let any_entry_for_alice = sess
                     .plan_feedback
                     .keys()

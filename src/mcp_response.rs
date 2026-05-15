@@ -4,12 +4,11 @@
 //! snapshots under the runtime mutex, release it, then call these builders
 //! to do working-tree status reads and assemble MCP / HTTP JSON.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use serde_json::{Value, json};
 
-use crate::disk_format::plan_path_is_done;
-use crate::lifecycle::{AgentLabel, ContentHash, SessionId, content_hash};
+use crate::lifecycle::{AgentLabel, ContentHash, PlanPath, SessionId, content_hash};
 use crate::projection::{
     all_implementation_commits, all_plan_revisions, expected_action, impl_gate_for,
     latest_impl_commit, latest_plan_touching_commit, phase, plan_gate_for, plan_worktree_status,
@@ -17,13 +16,13 @@ use crate::projection::{
 };
 use crate::repo_state::{PlanWorktreeStatus, RepoState, WaitingOn};
 use crate::review_state::{ReviewGateDecision, ReviewPhase};
-use crate::runtime_snapshot::{RepoSnapshot, SessionSnapshotBundle};
+use crate::runtime_snapshot::{PlanSnapshotBundle, RepoSnapshot};
 
 pub trait PlanStatusReader {
     fn compute(
         &self,
         repo_root: &Path,
-        plan_path: &Path,
+        plan_path: &PlanPath,
         body_hash: &ContentHash,
     ) -> std::io::Result<PlanWorktreeStatus>;
 }
@@ -34,7 +33,7 @@ impl PlanStatusReader for DiskPlanStatusReader {
     fn compute(
         &self,
         repo_root: &Path,
-        plan_path: &Path,
+        plan_path: &PlanPath,
         body_hash: &ContentHash,
     ) -> std::io::Result<PlanWorktreeStatus> {
         compute_plan_worktree_status_parts(repo_root, plan_path, body_hash)
@@ -45,12 +44,14 @@ impl PlanStatusReader for DiskPlanStatusReader {
 /// copied snapshot fields.
 pub fn compute_plan_worktree_status_parts(
     repo_root: &Path,
-    plan_path: &Path,
+    plan_path: &PlanPath,
     body_hash: &ContentHash,
 ) -> std::io::Result<PlanWorktreeStatus> {
-    let active_path = repo_root.join(plan_path);
-    let counterpart_rel = swap_active_done(plan_path);
-    let counterpart_abs = counterpart_rel.as_ref().map(|p| repo_root.join(p));
+    let active_path = repo_root.join(plan_path.as_path());
+    let counterpart_rel = plan_path.counterpart();
+    let counterpart_abs = counterpart_rel
+        .as_ref()
+        .map(|p| repo_root.join(p.as_path()));
 
     let wt_hash = match std::fs::read_to_string(&active_path) {
         Ok(body) => Some(content_hash(&body)),
@@ -69,15 +70,11 @@ pub fn compute_plan_worktree_status_parts(
     ))
 }
 
-/// Given a plan path (relative), return its counterpart in the
-/// active↔done flip. `.trinity/plans/<id>.md` ↔ `.trinity/plans/done/<id>.md`.
-pub fn swap_active_done(plan_path: &Path) -> Option<PathBuf> {
-    let name = plan_path.file_name()?;
-    if plan_path_is_done(plan_path) {
-        Some(PathBuf::from(".trinity/plans").join(name))
-    } else {
-        Some(PathBuf::from(".trinity/plans/done").join(name))
-    }
+/// Given a plan path, return its counterpart in the active↔done flip:
+/// `.trinity/plans/<stem>.md` ↔ `.trinity/plans/done/<stem>.md`. Returns
+/// `None` if `plan_path` does not parse as a canonical plan path.
+pub fn swap_active_done(plan_path: &PlanPath) -> Option<PlanPath> {
+    plan_path.counterpart()
 }
 
 /// `list_sessions` response over a single repo.
@@ -94,10 +91,10 @@ pub(crate) fn list_sessions_response_with_status_reader(
     status_reader: &impl PlanStatusReader,
 ) -> std::io::Result<Value> {
     let state = snapshot.to_repo_state();
-    let mut sessions = Vec::with_capacity(state.sessions.len());
-    for session_snapshot in &snapshot.sessions {
+    let mut sessions = Vec::with_capacity(state.plans.len());
+    for session_snapshot in &snapshot.plans {
         let session = state
-            .sessions
+            .plans
             .get(&session_snapshot.id)
             .expect("snapshot session must be present in temporary state");
         let worktree_status = status_reader.compute(
@@ -127,7 +124,7 @@ pub(crate) fn list_sessions_response_with_status_reader(
 
 fn session_summary(
     repo_root: &Path,
-    session: &crate::repo_state::Session,
+    session: &crate::repo_state::Plan,
     session_phase: crate::repo_state::Phase,
     worktree_status: PlanWorktreeStatus,
     w: &WaitingOn,
@@ -144,21 +141,21 @@ fn session_summary(
 
 /// `get_context` response for a specific session + author.
 pub fn get_context_response(
-    snapshot: &SessionSnapshotBundle,
+    snapshot: &PlanSnapshotBundle,
     author_label: &AgentLabel,
 ) -> std::io::Result<Value> {
     get_context_response_with_status_reader(snapshot, author_label, &DiskPlanStatusReader)
 }
 
 pub(crate) fn get_context_response_with_status_reader(
-    snapshot: &SessionSnapshotBundle,
+    snapshot: &PlanSnapshotBundle,
     author_label: &AgentLabel,
     status_reader: &impl PlanStatusReader,
 ) -> std::io::Result<Value> {
     let worktree_status = status_reader.compute(
         &snapshot.root,
-        &snapshot.session.plan_path,
-        &snapshot.session.body_hash,
+        &snapshot.plan.plan_path,
+        &snapshot.plan.body_hash,
     )?;
     Ok(get_context_response_from_snapshot(
         snapshot,
@@ -168,14 +165,14 @@ pub(crate) fn get_context_response_with_status_reader(
 }
 
 pub fn get_context_response_from_snapshot(
-    snapshot: &SessionSnapshotBundle,
+    snapshot: &PlanSnapshotBundle,
     worktree_status: PlanWorktreeStatus,
     author_label: &AgentLabel,
 ) -> Value {
     let state = snapshot.to_repo_state();
-    let session_id = &snapshot.session.id;
+    let session_id = &snapshot.plan.id;
     let session = state
-        .sessions
+        .plans
         .get(session_id)
         .expect("snapshot session must be present in temporary state");
     let session_phase = phase(session, &state.attribution);
@@ -327,7 +324,7 @@ fn feedback_entries(
         .collect()
 }
 
-fn pr_hint_value(session: &crate::repo_state::Session, state: &RepoState) -> Value {
+fn pr_hint_value(session: &crate::repo_state::Plan, state: &RepoState) -> Value {
     let impl_commits: Vec<String> = all_implementation_commits(session, state)
         .into_iter()
         .map(|s| s.as_str().to_string())
@@ -401,14 +398,14 @@ fn gate_value(
     }
 }
 
-fn latest_plan_revision(session: &crate::repo_state::Session, state: &RepoState) -> Value {
+fn latest_plan_revision(session: &crate::repo_state::Plan, state: &RepoState) -> Value {
     match all_plan_revisions(session, state).last() {
         Some(sha) => json!({ "commit_sha": sha.as_str() }),
         None => Value::Null,
     }
 }
 
-fn latest_impl_revision(session: &crate::repo_state::Session, state: &RepoState) -> Value {
+fn latest_impl_revision(session: &crate::repo_state::Plan, state: &RepoState) -> Value {
     match all_implementation_commits(session, state).last() {
         Some(sha) => json!({ "commit_sha": sha.as_str() }),
         None => Value::Null,
@@ -457,13 +454,13 @@ mod tests {
         run_git(repo, &["commit", "--quiet", "-m", msg]);
     }
 
-    fn status_for_session(repo: &Path, session: &crate::repo_state::Session) -> PlanWorktreeStatus {
+    fn status_for_session(repo: &Path, session: &crate::repo_state::Plan) -> PlanWorktreeStatus {
         compute_plan_worktree_status_parts(repo, &session.plan_path, &session.body_hash).unwrap()
     }
 
     fn context_from_state(state: &RepoState, sid: &str, author: &str) -> Option<serde_json::Value> {
         let sid = SessionId::from(sid.to_string());
-        let snapshot = SessionSnapshotBundle::from_state_for(state, &sid)?;
+        let snapshot = PlanSnapshotBundle::from_state_for(state, &sid)?;
         Some(get_context_response(&snapshot, &AgentLabel::from(author.to_string())).unwrap())
     }
 
@@ -474,7 +471,7 @@ mod tests {
         commit(dir.path(), "add plan");
 
         let state = rebuild_repo(dir.path()).await.unwrap();
-        let session = state.sessions.values().next().unwrap();
+        let session = state.plans.values().next().unwrap();
         let status = status_for_session(dir.path(), session);
         assert_eq!(status, PlanWorktreeStatus::Clean);
     }
@@ -492,7 +489,7 @@ mod tests {
         );
 
         let state = rebuild_repo(dir.path()).await.unwrap();
-        let session = state.sessions.values().next().unwrap();
+        let session = state.plans.values().next().unwrap();
         let status = status_for_session(dir.path(), session);
         assert_eq!(status, PlanWorktreeStatus::BodyDirty);
     }
@@ -509,7 +506,7 @@ mod tests {
         std::fs::rename(from, to_dir.join("foo.md")).unwrap();
 
         let state = rebuild_repo(dir.path()).await.unwrap();
-        let session = state.sessions.values().next().unwrap();
+        let session = state.plans.values().next().unwrap();
         let status = status_for_session(dir.path(), session);
         assert_eq!(status, PlanWorktreeStatus::DoneMovePending);
     }
@@ -523,7 +520,7 @@ mod tests {
         std::fs::remove_file(dir.path().join(".trinity/plans/foo.md")).unwrap();
 
         let state = rebuild_repo(dir.path()).await.unwrap();
-        let session = state.sessions.values().next().unwrap();
+        let session = state.plans.values().next().unwrap();
         let status = status_for_session(dir.path(), session);
         assert_eq!(status, PlanWorktreeStatus::MissingActivePlanFile);
     }
@@ -594,7 +591,7 @@ mod tests {
         commit(dir.path(), "add plan");
 
         let state0 = rebuild_repo(dir.path()).await.unwrap();
-        let intro = state0.sessions[&SessionId::from("foo".to_string())]
+        let intro = state0.plans[&SessionId::from("foo".to_string())]
             .plan_intro
             .clone();
         // Use full SHA in the feedback path. Trinity in production will
@@ -619,7 +616,7 @@ mod tests {
         commit(dir.path(), "add plan");
 
         let state0 = rebuild_repo(dir.path()).await.unwrap();
-        let intro = state0.sessions[&SessionId::from("foo".to_string())]
+        let intro = state0.plans[&SessionId::from("foo".to_string())]
             .plan_intro
             .clone();
         let feedback_rel = format!(".trinity/feedback/foo/plan/{}/alice.md", intro.as_str());
@@ -640,7 +637,7 @@ mod tests {
         fn compute(
             &self,
             _repo_root: &Path,
-            _plan_path: &Path,
+            _plan_path: &PlanPath,
             _body_hash: &ContentHash,
         ) -> std::io::Result<PlanWorktreeStatus> {
             self.entered.send(()).unwrap();

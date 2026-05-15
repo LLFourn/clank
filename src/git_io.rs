@@ -7,9 +7,9 @@ use std::path::{Path, PathBuf};
 use tokio::process::Command;
 
 use crate::attribution::{CommitChanges, PlanTouch};
-use crate::disk_format::{parse_feedback_path, plan_path_is_done, session_id_from_plan_path};
+use crate::disk_format::{parse_feedback_path, plan_path_is_done};
 use crate::disk_snapshot::{DiskSnapshot, FeedbackBlob, HistoryEntry, PlanFileBlob};
-use crate::lifecycle::CommitSha;
+use crate::lifecycle::{CommitSha, PlanKey, PlanPath};
 use crate::repo_state::PlanTouchKind;
 
 #[derive(Debug, thiserror::Error)]
@@ -90,19 +90,10 @@ pub struct PlanEntry {
 /// `git ls-tree -r HEAD -- .trinity/plans/` parsed into structured entries.
 ///
 /// Returns an empty vec if the path doesn't exist in HEAD.
-pub async fn ls_tree_plans(
-    repo: &Path,
-    head: &CommitSha,
-) -> Result<Vec<PlanEntry>, GitIoError> {
+pub async fn ls_tree_plans(repo: &Path, head: &CommitSha) -> Result<Vec<PlanEntry>, GitIoError> {
     let output = run(
         repo,
-        &[
-            "ls-tree",
-            "-r",
-            "--",
-            head.as_str(),
-            ".trinity/plans/",
-        ],
+        &["ls-tree", "-r", "--", head.as_str(), ".trinity/plans/"],
     )
     .await?;
     // Path-not-in-tree is `exit 0` with empty output, but older git versions
@@ -181,10 +172,7 @@ pub async fn show_commit(repo: &Path, sha: &CommitSha) -> Result<String, GitIoEr
 
 /// `git rev-parse <sha>^` — first parent of the given commit. Returns
 /// `Ok(None)` for the root commit (no parent).
-pub async fn parent_of(
-    repo: &Path,
-    sha: &CommitSha,
-) -> Result<Option<CommitSha>, GitIoError> {
+pub async fn parent_of(repo: &Path, sha: &CommitSha) -> Result<Option<CommitSha>, GitIoError> {
     let spec = format!("{}^", sha.as_str());
     let output = run(repo, &["rev-parse", "--verify", &spec]).await?;
     if !output.status.success() {
@@ -206,12 +194,10 @@ pub async fn first_added_commit(
     repo: &Path,
     rel_path: &Path,
 ) -> Result<Option<CommitSha>, GitIoError> {
-    let path_str = rel_path
-        .to_str()
-        .ok_or_else(|| GitIoError::Parse {
-            context: "first_added_commit".into(),
-            detail: format!("non-utf8 path: {}", rel_path.display()),
-        })?;
+    let path_str = rel_path.to_str().ok_or_else(|| GitIoError::Parse {
+        context: "first_added_commit".into(),
+        detail: format!("non-utf8 path: {}", rel_path.display()),
+    })?;
     let s = run_ok(
         repo,
         &[
@@ -240,11 +226,7 @@ pub async fn first_added_commit(
 /// repos are small enough that walking from the root is cheap and avoids
 /// a correctness footgun.
 pub async fn first_parent_commits(repo: &Path) -> Result<Vec<CommitSha>, GitIoError> {
-    let stdout = run_ok(
-        repo,
-        &["log", "--first-parent", "--reverse", "--format=%H"],
-    )
-    .await?;
+    let stdout = run_ok(repo, &["log", "--first-parent", "--reverse", "--format=%H"]).await?;
     Ok(stdout
         .lines()
         .map(|l| l.trim())
@@ -259,10 +241,7 @@ pub async fn first_parent_commits(repo: &Path) -> Result<Vec<CommitSha>, GitIoEr
 ///
 /// For the root commit (no parent), uses `--root` form to enumerate its
 /// added files.
-pub async fn diff_tree_changes(
-    repo: &Path,
-    sha: &CommitSha,
-) -> Result<CommitChanges, GitIoError> {
+pub async fn diff_tree_changes(repo: &Path, sha: &CommitSha) -> Result<CommitChanges, GitIoError> {
     let output = run(
         repo,
         &[
@@ -330,7 +309,7 @@ fn parse_diff_tree(stdout: &str) -> Result<CommitChanges, GitIoError> {
             } else {
                 old_plan_path.as_deref().unwrap_or(&new_rel)
             };
-            let session_id = match session_id_from_plan_path(touch_path) {
+            let plan_key = match PlanKey::from_path(touch_path) {
                 Some(id) => id,
                 None => continue, // unparseable plan name; skip
             };
@@ -358,7 +337,7 @@ fn parse_diff_tree(stdout: &str) -> Result<CommitChanges, GitIoError> {
                 _ => PlanTouchKind::Revision,
             };
             plan_touches.push(PlanTouch {
-                session: session_id,
+                session: plan_key,
                 kind,
             });
         } else {
@@ -399,7 +378,7 @@ pub async fn snapshot(repo_root: &Path) -> Result<DiskSnapshot, GitIoError> {
     let entries = ls_tree_plans(repo_root, &head).await?;
     let mut plan_files = Vec::with_capacity(entries.len());
     for e in entries {
-        let Some(session_id) = session_id_from_plan_path(&e.path) else {
+        let Some(plan_key) = PlanKey::from_path(&e.path) else {
             continue;
         };
         let body = show_blob(repo_root, &head, &e.path).await?;
@@ -408,8 +387,8 @@ pub async fn snapshot(repo_root: &Path) -> Result<DiskSnapshot, GitIoError> {
         };
         let plan_intro_parent = parent_of(repo_root, &plan_intro).await?;
         plan_files.push(PlanFileBlob {
-            session_id,
-            plan_path: e.path,
+            plan_key,
+            plan_path: PlanPath::new(e.path),
             body,
             plan_intro,
             plan_intro_parent,
@@ -425,7 +404,10 @@ pub async fn snapshot(repo_root: &Path) -> Result<DiskSnapshot, GitIoError> {
         let mut out = Vec::with_capacity(shas.len());
         for sha in shas {
             let changes = diff_tree_changes(repo_root, &sha).await?;
-            out.push(HistoryEntry { commit: sha, changes });
+            out.push(HistoryEntry {
+                commit: sha,
+                changes,
+            });
         }
         out
     };
@@ -578,9 +560,7 @@ mod tests {
 
     #[test]
     fn is_not_plan_path_too_deep() {
-        assert!(!is_plan_path(&PathBuf::from(
-            ".trinity/plans/sub/foo.md"
-        )));
+        assert!(!is_plan_path(&PathBuf::from(".trinity/plans/sub/foo.md")));
     }
 
     #[test]
@@ -589,10 +569,7 @@ mod tests {
         let changes = parse_diff_tree(stdout).unwrap();
         assert_eq!(changes.plan_touches.len(), 1);
         assert_eq!(changes.plan_touches[0].session.as_str(), "foo");
-        assert!(matches!(
-            changes.plan_touches[0].kind,
-            PlanTouchKind::Intro
-        ));
+        assert!(matches!(changes.plan_touches[0].kind, PlanTouchKind::Intro));
         assert!(!changes.has_non_plan_code_changes);
     }
 
@@ -630,8 +607,7 @@ mod tests {
 
     #[test]
     fn parse_diff_tree_multi_plan_touch() {
-        let stdout =
-            "M\t.trinity/plans/foo.md\nA\t.trinity/plans/bar.md\nM\tsrc/lib.rs\n";
+        let stdout = "M\t.trinity/plans/foo.md\nA\t.trinity/plans/bar.md\nM\tsrc/lib.rs\n";
         let changes = parse_diff_tree(stdout).unwrap();
         assert_eq!(changes.plan_touches.len(), 2);
         assert!(changes.has_non_plan_code_changes);

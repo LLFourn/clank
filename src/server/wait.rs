@@ -330,7 +330,7 @@ fn rc_feedback_paths(
 struct Candidate {
     repo_root: PathBuf,
     session_id: SessionId,
-    plan_path: PathBuf,
+    plan_path: crate::lifecycle::PlanPath,
     body_hash: ContentHash,
     session_phase: Phase,
     plan_gate: Option<ReviewGateDecision>,
@@ -341,7 +341,7 @@ struct Candidate {
 
 fn collect_candidate(trinity: &Trinity, repo: &Path, session_id: &SessionId) -> Option<Candidate> {
     let repo_state = trinity.repos.get(repo)?;
-    let session = repo_state.sessions.get(session_id)?;
+    let session = repo_state.plans.get(session_id)?;
     Some(Candidate {
         repo_root: repo.to_path_buf(),
         session_id: session_id.clone(),
@@ -393,7 +393,7 @@ mod tests {
         Candidate {
             repo_root: PathBuf::from("/repo"),
             session_id: SessionId::from("sid"),
-            plan_path: PathBuf::from(".trinity/plans/sid.md"),
+            plan_path: crate::lifecycle::PlanPath::new(".trinity/plans/sid.md"),
             body_hash: content_hash("x"),
             session_phase: Phase::Planning,
             plan_gate: None,
@@ -637,7 +637,7 @@ mod integration_tests {
 
         let intro: CommitSha = rt
             .read_repo(dir.path(), |s| {
-                s.sessions[&SessionId::from("foo")].plan_intro.clone()
+                s.plans[&SessionId::from("foo")].plan_intro.clone()
             })
             .await
             .unwrap();
@@ -699,7 +699,7 @@ mod integration_tests {
 
         let intro: CommitSha = rt
             .read_repo(dir.path(), |s| {
-                s.sessions[&SessionId::from("foo")].plan_intro.clone()
+                s.plans[&SessionId::from("foo")].plan_intro.clone()
             })
             .await
             .unwrap();
@@ -727,11 +727,8 @@ mod integration_tests {
             .unwrap();
         let revised: CommitSha = rt
             .read_repo(dir.path(), |s| {
-                crate::projection::latest_plan_touching_commit(
-                    &s.sessions[&SessionId::from("foo")],
-                    s,
-                )
-                .unwrap()
+                crate::projection::latest_plan_touching_commit(&s.plans[&SessionId::from("foo")], s)
+                    .unwrap()
             })
             .await
             .unwrap();

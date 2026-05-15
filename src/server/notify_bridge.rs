@@ -44,13 +44,11 @@ pub async fn start(
         },
     )?;
 
-    debouncer
-        .watch(&trinity_dir, RecursiveMode::Recursive)?;
+    debouncer.watch(&trinity_dir, RecursiveMode::Recursive)?;
     // Watch the gitdir recursively. `.git/HEAD` lives at the root and
     // `.git/logs/HEAD` is one level deep; we need both. path_to_signal
     // filters the firehose down to the two HEAD-family files.
-    debouncer
-        .watch(&git_dir, RecursiveMode::Recursive)?;
+    debouncer.watch(&git_dir, RecursiveMode::Recursive)?;
 
     let repo_root_for_task = repo_root.clone();
     let runtime_for_task = Arc::clone(&runtime);
@@ -207,17 +205,15 @@ mod tests {
         let wt_path = wt_dir.path().join("wt1");
         run_git(
             main.path(),
-            &[
-                "worktree",
-                "add",
-                wt_path.to_str().unwrap(),
-                "-b",
-                "feat",
-            ],
+            &["worktree", "add", wt_path.to_str().unwrap(), "-b", "feat"],
         );
         let gitdir = resolve_gitdir(&wt_path).unwrap();
         // Should resolve to <main>/.git/worktrees/wt1 (or similar)
-        assert!(gitdir.is_dir(), "resolved gitdir should be a directory: {:?}", gitdir);
+        assert!(
+            gitdir.is_dir(),
+            "resolved gitdir should be a directory: {:?}",
+            gitdir
+        );
         // The gitdir's HEAD file should exist.
         assert!(gitdir.join("HEAD").exists());
     }

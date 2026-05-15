@@ -7,25 +7,26 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
-use crate::lifecycle::{AgentLabel, CommitSha, ContentHash, SessionId};
+use crate::lifecycle::{AgentLabel, CommitSha, ContentHash, PlanKey, PlanPath};
 use crate::repo_state::{
-    AttributionResult, Feedback, HeldFeedback, PlanTouchKind, RepoState, Session,
+    AttributionResult, Feedback, HeldFeedback, Plan, PlanTouchKind, RepoState,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RepoSnapshot {
     pub root: PathBuf,
     pub head: Option<CommitSha>,
-    pub sessions: Vec<SessionSnapshot>,
+    pub plans: Vec<PlanSnapshot>,
     pub attribution: BTreeMap<CommitSha, AttributionResult>,
-    pub plan_touches: BTreeMap<CommitSha, Vec<(SessionId, PlanTouchKind)>>,
+    pub plan_touches: BTreeMap<CommitSha, Vec<(PlanKey, PlanTouchKind)>>,
     pub commit_order: Vec<CommitSha>,
+    pub plan_conflicts: BTreeMap<PlanKey, Vec<PlanPath>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SessionSnapshot {
-    pub id: SessionId,
-    pub plan_path: PathBuf,
+pub struct PlanSnapshot {
+    pub id: PlanKey,
+    pub plan_path: PlanPath,
     pub body: String,
     pub body_hash: ContentHash,
     pub plan_intro: CommitSha,
@@ -36,12 +37,12 @@ pub struct SessionSnapshot {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SessionSnapshotBundle {
+pub struct PlanSnapshotBundle {
     pub root: PathBuf,
     pub head: Option<CommitSha>,
-    pub session: SessionSnapshot,
+    pub plan: PlanSnapshot,
     pub attribution: BTreeMap<CommitSha, AttributionResult>,
-    pub plan_touches: BTreeMap<CommitSha, Vec<(SessionId, PlanTouchKind)>>,
+    pub plan_touches: BTreeMap<CommitSha, Vec<(PlanKey, PlanTouchKind)>>,
     pub commit_order: Vec<CommitSha>,
 }
 
@@ -50,50 +51,48 @@ impl RepoSnapshot {
         Self {
             root: state.root.clone(),
             head: state.head.clone(),
-            sessions: state
-                .sessions
-                .values()
-                .map(SessionSnapshot::from_session)
-                .collect(),
+            plans: state.plans.values().map(PlanSnapshot::from_plan).collect(),
             attribution: state.attribution.clone(),
             plan_touches: state.plan_touches.clone(),
             commit_order: state.commit_order.clone(),
+            plan_conflicts: state.plan_conflicts.clone(),
         }
     }
 
     pub fn to_repo_state(&self) -> RepoState {
         RepoState {
             root: self.root.clone(),
-            sessions: self
-                .sessions
+            plans: self
+                .plans
                 .iter()
-                .map(|session| (session.id.clone(), session.to_session()))
+                .map(|plan| (plan.id.clone(), plan.to_plan()))
                 .collect(),
             head: self.head.clone(),
             attribution: self.attribution.clone(),
             plan_touches: self.plan_touches.clone(),
             commit_order: self.commit_order.clone(),
+            plan_conflicts: self.plan_conflicts.clone(),
         }
     }
 }
 
-impl SessionSnapshot {
-    pub fn from_session(session: &Session) -> Self {
+impl PlanSnapshot {
+    pub fn from_plan(plan: &Plan) -> Self {
         Self {
-            id: session.id.clone(),
-            plan_path: session.plan_path.clone(),
-            body: session.body.clone(),
-            body_hash: session.body_hash.clone(),
-            plan_intro: session.plan_intro.clone(),
-            plan_intro_parent: session.plan_intro_parent.clone(),
-            plan_feedback: session.plan_feedback.clone(),
-            impl_feedback: session.impl_feedback.clone(),
-            held_plan_feedback: session.held_plan_feedback.clone(),
+            id: plan.id.clone(),
+            plan_path: plan.plan_path.clone(),
+            body: plan.body.clone(),
+            body_hash: plan.body_hash.clone(),
+            plan_intro: plan.plan_intro.clone(),
+            plan_intro_parent: plan.plan_intro_parent.clone(),
+            plan_feedback: plan.plan_feedback.clone(),
+            impl_feedback: plan.impl_feedback.clone(),
+            held_plan_feedback: plan.held_plan_feedback.clone(),
         }
     }
 
-    pub fn to_session(&self) -> Session {
-        Session {
+    pub fn to_plan(&self) -> Plan {
+        Plan {
             id: self.id.clone(),
             plan_path: self.plan_path.clone(),
             body: self.body.clone(),
@@ -107,13 +106,13 @@ impl SessionSnapshot {
     }
 }
 
-impl SessionSnapshotBundle {
-    pub fn from_state_for(state: &RepoState, session_id: &SessionId) -> Option<Self> {
-        let session = state.sessions.get(session_id)?;
+impl PlanSnapshotBundle {
+    pub fn from_state_for(state: &RepoState, plan_key: &PlanKey) -> Option<Self> {
+        let plan = state.plans.get(plan_key)?;
         Some(Self {
             root: state.root.clone(),
             head: state.head.clone(),
-            session: SessionSnapshot::from_session(session),
+            plan: PlanSnapshot::from_plan(plan),
             attribution: state.attribution.clone(),
             plan_touches: state.plan_touches.clone(),
             commit_order: state.commit_order.clone(),
@@ -123,13 +122,14 @@ impl SessionSnapshotBundle {
     pub fn to_repo_state(&self) -> RepoState {
         RepoState {
             root: self.root.clone(),
-            sessions: [(self.session.id.clone(), self.session.to_session())]
+            plans: [(self.plan.id.clone(), self.plan.to_plan())]
                 .into_iter()
                 .collect(),
             head: self.head.clone(),
             attribution: self.attribution.clone(),
             plan_touches: self.plan_touches.clone(),
             commit_order: self.commit_order.clone(),
+            plan_conflicts: BTreeMap::new(),
         }
     }
 }

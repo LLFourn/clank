@@ -282,7 +282,7 @@ async fn api_plan_revision(
         // arbitrary blob in the repo could be rendered through any
         // session URL, leaking commits across session boundaries.
         let plan_revisions = crate::projection::all_plan_revisions_for(
-            &snapshot.session.id,
+            &snapshot.plan.id,
             &snapshot.commit_order,
             &snapshot.plan_touches,
         );
@@ -292,9 +292,10 @@ async fn api_plan_revision(
             )));
         };
 
-        let body_raw = crate::git_io::show_blob(&repo, &commit_sha, &snapshot.session.plan_path)
-            .await
-            .map_err(|e| AppError::internal(format!("git show: {e}")))?;
+        let body_raw =
+            crate::git_io::show_blob(&repo, &commit_sha, snapshot.plan.plan_path.as_path())
+                .await
+                .map_err(|e| AppError::internal(format!("git show: {e}")))?;
         let body_html = crate::ui_response::render_markdown(&body_raw);
 
         let previous_sha = pos
@@ -303,15 +304,15 @@ async fn api_plan_revision(
             .map(|c| c.as_str().to_string());
         let next_sha = plan_revisions.get(pos + 1).map(|c| c.as_str().to_string());
 
-        let feedback = crate::ui_response::feedback_for_target(&snapshot.session, &commit_sha);
+        let feedback = crate::ui_response::feedback_for_target(&snapshot.plan, &commit_sha);
         return Ok(axum::Json(json!({
             "repo": snapshot.root.to_string_lossy(),
-            "session_id": snapshot.session.id.as_str(),
+            "session_id": snapshot.plan.id.as_str(),
             "commit_sha": commit_sha.as_str(),
             "body_raw": body_raw,
             "body_html": body_html,
-            "plan_intro": snapshot.session.plan_intro.as_str(),
-            "plan_intro_parent": snapshot.session.plan_intro_parent.as_ref().map(|s| s.as_str()),
+            "plan_intro": snapshot.plan.plan_intro.as_str(),
+            "plan_intro_parent": snapshot.plan.plan_intro_parent.as_ref().map(|s| s.as_str()),
             "previous_sha": previous_sha,
             "next_sha": next_sha,
             "feedback": feedback,
@@ -343,7 +344,7 @@ async fn api_commit_diff(
         let belongs_to_session = matches!(
             snapshot.attribution.get(&commit_sha),
             Some(crate::repo_state::AttributionResult::Attributed { session, .. })
-                if session == &snapshot.session.id
+                if session == &snapshot.plan.id
         );
         if !belongs_to_session {
             return Err(AppError::not_found(format!(
@@ -389,10 +390,10 @@ async fn api_commit_diff(
             })
             .collect();
 
-        let feedback = crate::ui_response::feedback_for_target(&snapshot.session, &commit_sha);
+        let feedback = crate::ui_response::feedback_for_target(&snapshot.plan, &commit_sha);
         return Ok(axum::Json(json!({
             "repo": snapshot.root.to_string_lossy(),
-            "session_id": snapshot.session.id.as_str(),
+            "session_id": snapshot.plan.id.as_str(),
             "commit_sha": commit_sha.as_str(),
             "diff_files": diff_files_json,
             "feedback": feedback,
@@ -424,14 +425,15 @@ async fn api_move_to_done(
         .snapshot_session(&repo, &SessionId::from(session_id.clone()))
         .await
         .map_err(AppError::runtime)?
-        .map(|snapshot| snapshot.session.plan_path)
+        .map(|snapshot| snapshot.plan.plan_path)
         .ok_or_else(|| AppError::not_found(format!("session {session_id} not found")))?;
 
-    let from = repo.join(&plan_path_rel);
+    let from = repo.join(plan_path_rel.as_path());
     let to_dir = repo.join(".trinity/plans/done");
     std::fs::create_dir_all(&to_dir).map_err(AppError::io)?;
     let to = to_dir.join(
         plan_path_rel
+            .as_path()
             .file_name()
             .ok_or_else(|| AppError::internal("plan_path has no file name"))?,
     );
@@ -963,7 +965,7 @@ mod wire_tests {
         // as participants of the plan-phase gate.
         let intro = runtime
             .read_repo(dir.path(), |s| {
-                s.sessions[&crate::lifecycle::SessionId::from("foo")]
+                s.plans[&crate::lifecycle::SessionId::from("foo")]
                     .plan_intro
                     .clone()
             })
@@ -1005,7 +1007,7 @@ mod wire_tests {
         let revised = runtime
             .read_repo(dir.path(), |s| {
                 crate::projection::latest_plan_touching_commit(
-                    &s.sessions[&crate::lifecycle::SessionId::from("foo")],
+                    &s.plans[&crate::lifecycle::SessionId::from("foo")],
                     s,
                 )
                 .unwrap()

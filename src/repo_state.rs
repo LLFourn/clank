@@ -6,7 +6,7 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::path::PathBuf;
 
-use crate::lifecycle::{AgentLabel, CommitSha, ContentHash, SessionId};
+use crate::lifecycle::{AgentLabel, CommitSha, ContentHash, PlanKey, PlanPath};
 
 pub type RepoRoot = PathBuf;
 
@@ -19,49 +19,57 @@ pub struct Trinity {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RepoState {
     pub root: PathBuf,
-    pub sessions: BTreeMap<SessionId, Session>,
+    pub plans: BTreeMap<PlanKey, Plan>,
     pub head: Option<CommitSha>,
     /// (commit_sha → attribution). Lookup table; iteration order is
     /// SHA-lex, not chronological. Use `commit_order` to walk the
     /// history in chronological (first-parent oldest-first) order.
     pub attribution: BTreeMap<CommitSha, AttributionResult>,
     /// Per-commit plan touches, including multi-plan commits. Attribution
-    /// remains single-session for implementation ownership; this index lets
+    /// remains single-plan for implementation ownership; this index lets
     /// each touched plan still see its own revision/done_move.
-    pub plan_touches: BTreeMap<CommitSha, Vec<(SessionId, PlanTouchKind)>>,
+    pub plan_touches: BTreeMap<CommitSha, Vec<(PlanKey, PlanTouchKind)>>,
     /// Commits in chronological order (first-parent walk, oldest first).
     /// Parallels `attribution`'s keys but preserves history order, which
     /// `BTreeMap` does not.
     pub commit_order: Vec<CommitSha>,
+    /// Plans whose disk state is contradictory at rebuild time — the same
+    /// stem exists at both `.trinity/plans/<stem>.md` and
+    /// `.trinity/plans/done/<stem>.md`. Conflicting keys are omitted from
+    /// [`Self::plans`] so neither file silently wins; resolution helpers
+    /// surface the conflict so callers can flag it instead of routing
+    /// work.
+    pub plan_conflicts: BTreeMap<PlanKey, Vec<PlanPath>>,
 }
 
 impl RepoState {
     pub fn empty(root: PathBuf) -> Self {
         Self {
             root,
-            sessions: BTreeMap::new(),
+            plans: BTreeMap::new(),
             head: None,
             attribution: BTreeMap::new(),
             plan_touches: BTreeMap::new(),
             commit_order: Vec::new(),
+            plan_conflicts: BTreeMap::new(),
         }
     }
 
-    /// Chronological timeline of one session's activity. The renderer (web
+    /// Chronological timeline of one plan's activity. The renderer (web
     /// UI, MCP responses, anything else) walks this list to display events
     /// in order without needing to recombine attribution + feedback maps
     /// itself.
     ///
-    /// Order: commits touching this session's plan file or attributed to
-    /// `session_id` as implementation work, in first-parent walk order
-    /// (oldest first). Each commit is followed by the reviews targeting it
-    /// (plan reviews for plan_touch commits, impl reviews for
-    /// has_code_changes commits) sorted by author. Held flat-drop feedback
-    /// files come last with no target.
+    /// Order: commits touching the plan file or attributed to `plan_key`
+    /// as implementation work, in first-parent walk order (oldest first).
+    /// Each commit is followed by the reviews targeting it (plan reviews
+    /// for plan_touch commits, impl reviews for has_code_changes commits)
+    /// sorted by author. Held flat-drop feedback files come last with no
+    /// target.
     ///
-    /// Pure; sans-IO. Returns an empty vec if the session is unknown.
-    pub fn timeline_for(&self, session_id: &SessionId) -> Vec<TimelineEvent> {
-        let Some(session) = self.sessions.get(session_id) else {
+    /// Pure; sans-IO. Returns an empty vec if the plan is unknown.
+    pub fn timeline_for(&self, plan_key: &PlanKey) -> Vec<TimelineEvent> {
+        let Some(plan) = self.plans.get(plan_key) else {
             return Vec::new();
         };
         let mut out = Vec::new();
@@ -70,7 +78,7 @@ impl RepoState {
             let plan_touch = self
                 .plan_touches
                 .get(sha)
-                .and_then(|touches| touches.iter().find(|(sid, _)| sid == session_id))
+                .and_then(|touches| touches.iter().find(|(key, _)| key == plan_key))
                 .map(|(_, kind)| *kind);
             let has_code_changes = matches!(
                 attr,
@@ -78,7 +86,7 @@ impl RepoState {
                     session: sid,
                     has_code_changes: true,
                     ..
-                }) if sid == session_id
+                }) if sid == plan_key
             );
             if plan_touch.is_none() && !has_code_changes {
                 continue;
@@ -88,8 +96,7 @@ impl RepoState {
                 plan_touch,
                 has_code_changes,
             });
-            // Reviews targeting this commit, in (phase, author) order.
-            for ((target, author), fb) in &session.plan_feedback {
+            for ((target, author), fb) in &plan.plan_feedback {
                 if target == sha {
                     out.push(TimelineEvent::Review {
                         phase: TimelinePhase::Plan,
@@ -99,7 +106,7 @@ impl RepoState {
                     });
                 }
             }
-            for ((target, author), fb) in &session.impl_feedback {
+            for ((target, author), fb) in &plan.impl_feedback {
                 if target == sha {
                     out.push(TimelineEvent::Review {
                         phase: TimelinePhase::Impl,
@@ -110,8 +117,7 @@ impl RepoState {
                 }
             }
         }
-        // Held flat-drop feedback last.
-        for held in &session.held_plan_feedback {
+        for held in &plan.held_plan_feedback {
             out.push(TimelineEvent::HeldFeedback {
                 author: held.author.clone(),
                 reason: held.reason,
@@ -142,25 +148,25 @@ impl RepoState {
         );
 
         // BTreeMap iterates by key (sorted), so this is deterministic.
-        hasher.update(b"\nsessions[");
-        for (id, sess) in &self.sessions {
-            hasher.update(id.as_str().as_bytes());
+        hasher.update(b"\nplans[");
+        for (key, plan) in &self.plans {
+            hasher.update(key.as_str().as_bytes());
             hasher.update(b"|path=");
-            hasher.update(sess.plan_path.to_string_lossy().as_bytes());
+            hasher.update(plan.plan_path.to_string_lossy().as_bytes());
             hasher.update(b"|body_hash=");
-            hasher.update(sess.body_hash.as_str().as_bytes());
+            hasher.update(plan.body_hash.as_str().as_bytes());
             hasher.update(b"|intro=");
-            hasher.update(sess.plan_intro.as_str().as_bytes());
+            hasher.update(plan.plan_intro.as_str().as_bytes());
             hasher.update(b"|intro_parent=");
             hasher.update(
-                sess.plan_intro_parent
+                plan.plan_intro_parent
                     .as_ref()
                     .map(|p| p.as_str())
                     .unwrap_or("")
                     .as_bytes(),
             );
             hasher.update(b"|plan_fb=[");
-            for ((sha, author), fb) in &sess.plan_feedback {
+            for ((sha, author), fb) in &plan.plan_feedback {
                 hasher.update(sha.as_str().as_bytes());
                 hasher.update(b":");
                 hasher.update(author.as_str().as_bytes());
@@ -169,7 +175,7 @@ impl RepoState {
                 hasher.update(b";");
             }
             hasher.update(b"]|impl_fb=[");
-            for ((sha, author), fb) in &sess.impl_feedback {
+            for ((sha, author), fb) in &plan.impl_feedback {
                 hasher.update(sha.as_str().as_bytes());
                 hasher.update(b":");
                 hasher.update(author.as_str().as_bytes());
@@ -178,7 +184,7 @@ impl RepoState {
                 hasher.update(b";");
             }
             hasher.update(b"]|held=[");
-            for held in &sess.held_plan_feedback {
+            for held in &plan.held_plan_feedback {
                 hasher.update(held.author.as_str().as_bytes());
                 hasher.update(b":");
                 hasher.update(held.reason.as_bytes());
@@ -223,10 +229,20 @@ impl RepoState {
         for (sha, touches) in &self.plan_touches {
             hasher.update(sha.as_str().as_bytes());
             hasher.update(b"=");
-            for (session, kind) in touches {
-                hasher.update(session.as_str().as_bytes());
+            for (key, kind) in touches {
+                hasher.update(key.as_str().as_bytes());
                 hasher.update(b":");
                 hasher.update(kind.as_str().as_bytes());
+                hasher.update(b",");
+            }
+            hasher.update(b";");
+        }
+        hasher.update(b"]\nconflicts[");
+        for (key, paths) in &self.plan_conflicts {
+            hasher.update(key.as_str().as_bytes());
+            hasher.update(b"=");
+            for path in paths {
+                hasher.update(path.to_string_lossy().as_bytes());
                 hasher.update(b",");
             }
             hasher.update(b";");
@@ -235,6 +251,55 @@ impl RepoState {
 
         StateDigest(hasher.finalize().to_hex().to_string())
     }
+
+    /// Resolve a caller-supplied plan path against the repo's current
+    /// state. Phase 1 of the plan-path-identity migration: see
+    /// `.trinity/plans/plan-path-identity.md` §2 for the rules. Internal
+    /// callers go through this so all surfaces (MCP, HTTP, watcher)
+    /// classify "same stem different path" identically.
+    pub fn resolve_plan<'a>(&'a self, requested: &PlanPath) -> Result<&'a Plan, PlanLookupError> {
+        let key = PlanKey::from_path(requested.as_path())
+            .ok_or_else(|| PlanLookupError::InvalidPlanPath(requested.clone()))?;
+        if let Some(paths) = self.plan_conflicts.get(&key) {
+            return Err(PlanLookupError::PlanConflict {
+                key,
+                paths: paths.clone(),
+            });
+        }
+        let plan = self
+            .plans
+            .get(&key)
+            .ok_or_else(|| PlanLookupError::UnknownPlan(key.clone()))?;
+        if &plan.plan_path == requested {
+            return Ok(plan);
+        }
+        if let Some(counterpart) = requested.counterpart()
+            && counterpart == plan.plan_path
+        {
+            return Ok(plan);
+        }
+        Err(PlanLookupError::PlanPathMismatch {
+            current: plan.plan_path.clone(),
+            requested: requested.clone(),
+        })
+    }
+}
+
+/// Why a caller-supplied `plan_path` could not be resolved against the
+/// runtime's `plans` map. Surfaced verbatim by MCP / HTTP error responses.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum PlanLookupError {
+    #[error("invalid plan path: {0}")]
+    InvalidPlanPath(PlanPath),
+    #[error("unknown plan: {0}")]
+    UnknownPlan(PlanKey),
+    #[error("plan path mismatch: requested {requested} but the current plan path is {current}")]
+    PlanPathMismatch {
+        current: PlanPath,
+        requested: PlanPath,
+    },
+    #[error("conflict: stem `{key}` maps to multiple files on disk")]
+    PlanConflict { key: PlanKey, paths: Vec<PlanPath> },
 }
 
 /// One row in the per-session timeline returned by
@@ -293,16 +358,16 @@ impl StateDigest {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Session {
-    pub id: SessionId,
-    /// Path relative to the repo root. Either `.trinity/plans/<id>.md` or
-    /// `.trinity/plans/done/<id>.md` — never the absolute path.
-    pub plan_path: PathBuf,
+pub struct Plan {
+    pub id: PlanKey,
+    /// Repo-relative path: `.trinity/plans/<stem>.md` or
+    /// `.trinity/plans/done/<stem>.md`. Never absolute.
+    pub plan_path: PlanPath,
     /// Body from HEAD's blob, not the working tree.
     pub body: String,
     pub body_hash: ContentHash,
-    /// `plan_intro` for this session: the commit that first added the
-    /// plan file. Used as the lower bound for attribution walks.
+    /// First commit that added the plan file. Lower bound for
+    /// attribution walks.
     pub plan_intro: CommitSha,
     /// First-parent of `plan_intro`, or `None` for the root commit.
     /// Used by `pr_hint` to suggest squash bases.
@@ -404,8 +469,8 @@ impl Phase {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AttributionResult {
     Attributed {
-        session: SessionId,
-        /// Set when this commit itself touched the session's plan file
+        session: PlanKey,
+        /// Set when this commit itself touched the plan file
         /// (single-plan-touch case). `None` when the commit inherited
         /// attribution from a parent via walk-back.
         plan_touch: Option<PlanTouchKind>,
@@ -439,7 +504,7 @@ impl PlanTouchKind {
 pub struct LiveEvent {
     pub ts: i64,
     pub repo: RepoRoot,
-    pub session_id: Option<SessionId>,
+    pub session_id: Option<PlanKey>,
     pub kind: &'static str,
     pub payload: serde_json::Value,
 }

@@ -67,7 +67,7 @@ mod tests {
         let dir = init_repo();
         let state = rebuild_repo(dir.path()).await.unwrap();
         assert!(state.head.is_none());
-        assert!(state.sessions.is_empty());
+        assert!(state.plans.is_empty());
         assert!(state.attribution.is_empty());
     }
 
@@ -78,8 +78,8 @@ mod tests {
         commit(dir.path(), "Add foo plan");
 
         let state = rebuild_repo(dir.path()).await.unwrap();
-        assert_eq!(state.sessions.len(), 1);
-        let session = &state.sessions[&SessionId::from("foo".to_string())];
+        assert_eq!(state.plans.len(), 1);
+        let session = &state.plans[&SessionId::from("foo".to_string())];
         assert_eq!(session.id.as_str(), "foo");
         assert_eq!(session.body, "# foo\n");
         let intro = &session.plan_intro;
@@ -107,10 +107,16 @@ mod tests {
         let impl_attrs: Vec<_> = state
             .attribution
             .values()
-            .filter(|a| matches!(
-                a,
-                AttributionResult::Attributed { has_code_changes: true, plan_touch: None, .. }
-            ))
+            .filter(|a| {
+                matches!(
+                    a,
+                    AttributionResult::Attributed {
+                        has_code_changes: true,
+                        plan_touch: None,
+                        ..
+                    }
+                )
+            })
             .collect();
         assert_eq!(impl_attrs.len(), 1);
     }
@@ -121,14 +127,14 @@ mod tests {
         write_file(dir.path(), ".trinity/plans/foo.md", "# foo\n");
         commit(dir.path(), "Add foo plan");
         let state0 = rebuild_repo(dir.path()).await.unwrap();
-        let intro = state0.sessions[&SessionId::from("foo".to_string())]
+        let intro = state0.plans[&SessionId::from("foo".to_string())]
             .plan_intro
             .clone();
         let feedback_rel = format!(".trinity/feedback/foo/plan/{}/alice.md", intro.as_str());
         write_file(dir.path(), &feedback_rel, "APPROVE\n\nLooks good.\n");
 
         let state = rebuild_repo(dir.path()).await.unwrap();
-        let session = &state.sessions[&SessionId::from("foo".to_string())];
+        let session = &state.plans[&SessionId::from("foo".to_string())];
         let entries: Vec<_> = session.plan_feedback.values().collect();
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].verdict, crate::repo_state::Verdict::Approve);

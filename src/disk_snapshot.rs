@@ -19,8 +19,8 @@ use std::path::PathBuf;
 
 use crate::attribution::{CommitChanges, classify, effective_session};
 use crate::disk_format::{FeedbackPath, FeedbackPhase, parse_verdict};
-use crate::lifecycle::{CommitSha, SessionId, content_hash};
-use crate::repo_state::{Feedback, HeldFeedback, RepoState, Session};
+use crate::lifecycle::{CommitSha, PlanKey, PlanPath, content_hash};
+use crate::repo_state::{Feedback, HeldFeedback, Plan, RepoState};
 
 /// Everything Trinity needs to derive a repo's state, materialized into
 /// structured types. Built by `git_io::snapshot`; consumed by
@@ -43,10 +43,8 @@ pub struct DiskSnapshot {
 /// A plan file as it appears in HEAD's tree.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PlanFileBlob {
-    pub session_id: SessionId,
-    /// Path relative to repo root: `.trinity/plans/<id>.md` or
-    /// `.trinity/plans/done/<id>.md`.
-    pub plan_path: PathBuf,
+    pub plan_key: PlanKey,
+    pub plan_path: PlanPath,
     /// Body from HEAD's blob (not the working tree).
     pub body: String,
     /// First commit that added this plan path (via `git log
@@ -80,13 +78,25 @@ pub fn derive_state(repo_root: PathBuf, snapshot: DiskSnapshot) -> RepoState {
     let mut state = RepoState::empty(repo_root);
     state.head = snapshot.head;
 
-    // 1. Sessions from plan-file blobs.
+    // 1. Group plan-file blobs by PlanKey to detect collisions before
+    //    inserting. Same-key groups land in `plan_conflicts` so neither
+    //    file silently wins (see plan-path-identity §1b).
+    let mut by_key: BTreeMap<PlanKey, Vec<PlanFileBlob>> = BTreeMap::new();
     for pf in snapshot.plan_files {
+        by_key.entry(pf.plan_key.clone()).or_default().push(pf);
+    }
+    for (key, mut entries) in by_key {
+        if entries.len() >= 2 {
+            let paths: Vec<PlanPath> = entries.iter().map(|pf| pf.plan_path.clone()).collect();
+            state.plan_conflicts.insert(key, paths);
+            continue;
+        }
+        let pf = entries.pop().expect("exactly one entry");
         let body_hash = content_hash(&pf.body);
-        state.sessions.insert(
-            pf.session_id.clone(),
-            Session {
-                id: pf.session_id,
+        state.plans.insert(
+            pf.plan_key.clone(),
+            Plan {
+                id: pf.plan_key,
                 plan_path: pf.plan_path,
                 body: pf.body,
                 body_hash,
@@ -100,7 +110,7 @@ pub fn derive_state(repo_root: PathBuf, snapshot: DiskSnapshot) -> RepoState {
     }
 
     // 2. Attribution walk along the first-parent chain.
-    let mut current_effective: Option<SessionId> = None;
+    let mut current_effective: Option<PlanKey> = None;
     for entry in &snapshot.history {
         let result = classify(&entry.changes, current_effective.as_ref());
         current_effective = effective_session(&entry.changes, current_effective.as_ref());
@@ -119,28 +129,28 @@ pub fn derive_state(repo_root: PathBuf, snapshot: DiskSnapshot) -> RepoState {
         state.commit_order.push(entry.commit.clone());
     }
 
-    // 3. Feedback ingestion. Files for unknown sessions are dropped
-    //    (they'd be flagged elsewhere if needed); files with a target
-    //    SHA land in `plan_feedback` / `impl_feedback`; flat drops are
-    //    held with a reason key the runner uses to decide next steps.
+    // 3. Feedback ingestion. Files for unknown plans (including those
+    //    in `plan_conflicts`) are dropped; files with a target SHA land
+    //    in `plan_feedback` / `impl_feedback`; flat drops are held with
+    //    a reason key the runner uses to decide next steps.
     for fb in snapshot.feedback_files {
-        let Some(session) = state.sessions.get_mut(&fb.parsed.session_id) else {
+        let Some(plan) = state.plans.get_mut(&fb.parsed.session_id) else {
             continue;
         };
-        ingest_feedback(session, fb);
+        ingest_feedback(plan, fb);
     }
 
     state
 }
 
-fn ingest_feedback(session: &mut Session, fb: FeedbackBlob) {
+fn ingest_feedback(plan: &mut Plan, fb: FeedbackBlob) {
     let verdict = parse_verdict(&fb.body);
     let created_at = fb.created_at;
     match fb.parsed.target_sha {
         Some(target_sha) => {
             let map = match fb.parsed.phase {
-                FeedbackPhase::Plan => &mut session.plan_feedback,
-                FeedbackPhase::Impl => &mut session.impl_feedback,
+                FeedbackPhase::Plan => &mut plan.plan_feedback,
+                FeedbackPhase::Impl => &mut plan.impl_feedback,
             };
             map.insert(
                 (target_sha, fb.parsed.author),
@@ -157,7 +167,7 @@ fn ingest_feedback(session: &mut Session, fb: FeedbackBlob) {
                 FeedbackPhase::Plan => "plan_dirty",
                 FeedbackPhase::Impl => "impl_flat_drop",
             };
-            session.held_plan_feedback.push(HeldFeedback {
+            plan.held_plan_feedback.push(HeldFeedback {
                 path: fb.abs_path,
                 author: fb.parsed.author,
                 body: fb.body,
@@ -179,23 +189,23 @@ mod tests {
         CommitSha::from(s.to_string())
     }
 
-    fn sess(s: &str) -> SessionId {
-        SessionId::from(s.to_string())
+    fn sess(s: &str) -> PlanKey {
+        PlanKey::from(s.to_string())
     }
 
-    fn plan_file(session: &str, intro: &str, parent: Option<&str>, body: &str) -> PlanFileBlob {
+    fn plan_file(stem: &str, intro: &str, parent: Option<&str>, body: &str) -> PlanFileBlob {
         PlanFileBlob {
-            session_id: sess(session),
-            plan_path: PathBuf::from(format!(".trinity/plans/{session}.md")),
+            plan_key: sess(stem),
+            plan_path: PlanPath::new(format!(".trinity/plans/{stem}.md")),
             body: body.to_string(),
             plan_intro: sha(intro),
             plan_intro_parent: parent.map(sha),
         }
     }
 
-    fn touch(session: &str, kind: PlanTouchKind) -> PlanTouch {
+    fn touch(stem: &str, kind: PlanTouchKind) -> PlanTouch {
         PlanTouch {
-            session: sess(session),
+            session: sess(stem),
             kind,
         }
     }
@@ -234,7 +244,7 @@ mod tests {
     #[test]
     fn empty_snapshot_yields_empty_state() {
         let state = derive_state(PathBuf::from("/r"), DiskSnapshot::default());
-        assert!(state.sessions.is_empty());
+        assert!(state.plans.is_empty());
         assert!(state.attribution.is_empty());
         assert!(state.head.is_none());
     }
@@ -248,12 +258,12 @@ mod tests {
             feedback_files: vec![],
         };
         let state = derive_state(PathBuf::from("/r"), snap);
-        let s = &state.sessions[&sess("foo")];
+        let s = &state.plans[&sess("foo")];
         assert_eq!(s.body, "# foo\n");
         assert_eq!(s.body_hash, content_hash("# foo\n"));
         assert_eq!(s.plan_intro, sha("intro1"));
         assert_eq!(s.plan_intro_parent, Some(sha("parent1")));
-        assert_eq!(s.plan_path, PathBuf::from(".trinity/plans/foo.md"));
+        assert_eq!(s.plan_path, PlanPath::new(".trinity/plans/foo.md"));
     }
 
     #[test]
@@ -332,7 +342,7 @@ mod tests {
     #[test]
     fn multi_plan_touches_still_count_as_each_sessions_plan_revision() {
         let mut done = plan_file("done-one", "c1", None, "# done\n");
-        done.plan_path = PathBuf::from(".trinity/plans/done/done-one.md");
+        done.plan_path = PlanPath::new(".trinity/plans/done/done-one.md");
         let snap = DiskSnapshot {
             head: Some(sha("c3")),
             plan_files: vec![
@@ -363,11 +373,11 @@ mod tests {
             AttributionResult::Unattributed
         );
         assert_eq!(
-            crate::projection::all_plan_revisions(&state.sessions[&sess("done-one")], &state),
+            crate::projection::all_plan_revisions(&state.plans[&sess("done-one")], &state),
             vec![sha("c1"), sha("c3")]
         );
         assert_eq!(
-            crate::projection::all_plan_revisions(&state.sessions[&sess("active-one")], &state),
+            crate::projection::all_plan_revisions(&state.plans[&sess("active-one")], &state),
             vec![sha("c2"), sha("c3")]
         );
     }
@@ -406,7 +416,7 @@ mod tests {
             )],
         };
         let state = derive_state(PathBuf::from("/r"), snap);
-        let entry = state.sessions[&sess("foo")]
+        let entry = state.plans[&sess("foo")]
             .plan_feedback
             .get(&(sha("c1"), AgentLabel::from("alice".to_string())))
             .expect("alice's plan feedback");
@@ -428,7 +438,7 @@ mod tests {
             )],
         };
         let state = derive_state(PathBuf::from("/r"), snap);
-        let session = &state.sessions[&sess("foo")];
+        let session = &state.plans[&sess("foo")];
         assert!(session.plan_feedback.is_empty());
         assert_eq!(session.held_plan_feedback.len(), 1);
         assert_eq!(session.held_plan_feedback[0].reason, "plan_dirty");
@@ -452,7 +462,7 @@ mod tests {
             )],
         };
         let state = derive_state(PathBuf::from("/r"), snap);
-        let session = &state.sessions[&sess("foo")];
+        let session = &state.plans[&sess("foo")];
         assert!(session.impl_feedback.is_empty());
         assert_eq!(session.held_plan_feedback[0].reason, "impl_flat_drop");
     }
@@ -472,13 +482,13 @@ mod tests {
             )],
         };
         let state = derive_state(PathBuf::from("/r"), snap);
-        assert!(state.sessions.is_empty());
+        assert!(state.plans.is_empty());
     }
 
     #[test]
     fn session_in_done_subdir_uses_done_path() {
         let mut pf = plan_file("foo", "c1", None, "# foo\n");
-        pf.plan_path = PathBuf::from(".trinity/plans/done/foo.md");
+        pf.plan_path = PlanPath::new(".trinity/plans/done/foo.md");
         let snap = DiskSnapshot {
             head: Some(sha("c2")),
             plan_files: vec![pf],
@@ -487,8 +497,8 @@ mod tests {
         };
         let state = derive_state(PathBuf::from("/r"), snap);
         assert_eq!(
-            state.sessions[&sess("foo")].plan_path,
-            PathBuf::from(".trinity/plans/done/foo.md")
+            state.plans[&sess("foo")].plan_path,
+            PlanPath::new(".trinity/plans/done/foo.md")
         );
     }
 
@@ -591,8 +601,8 @@ mod tests {
         let state = derive_state(PathBuf::from("/r"), full_workflow_snapshot());
         // Two sessions: foo (planning with one impl commit on top) and bar.
         // Wait — full_workflow has only foo. Adjust expectations:
-        assert!(state.sessions.contains_key(&sess("foo")));
-        let foo = &state.sessions[&sess("foo")];
+        assert!(state.plans.contains_key(&sess("foo")));
+        let foo = &state.plans[&sess("foo")];
         // Plan APPROVE from alice on commit c1, impl REQUEST_CHANGES from bob on c2.
         assert_eq!(foo.plan_feedback.len(), 1);
         assert_eq!(foo.impl_feedback.len(), 1);
@@ -636,7 +646,7 @@ mod tests {
             )],
         };
         let state = derive_state(PathBuf::from("/r"), snap);
-        let foo = &state.sessions[&sess("foo")];
+        let foo = &state.plans[&sess("foo")];
         assert_eq!(foo.plan_feedback.len(), 1);
         let key = foo.plan_feedback.keys().next().unwrap();
         assert_eq!(key.0.as_str(), "c1", "stale feedback keeps its target");
@@ -658,7 +668,7 @@ mod tests {
             feedback_files: vec![],
         };
         let state = derive_state(PathBuf::from("/r"), snap);
-        assert_eq!(state.sessions.len(), 2);
+        assert_eq!(state.plans.len(), 2);
         // c3 walks back through c2 (beta's intro), so attributes to beta.
         match &state.attribution[&sha("c3")] {
             AttributionResult::Attributed { session, .. } => assert_eq!(session, &sess("beta")),
@@ -671,7 +681,7 @@ mod tests {
         // After moving to plans/done/, the session is still present;
         // historical commits remain attributed.
         let mut pf = plan_file("foo", "c1", None, "# foo\n");
-        pf.plan_path = PathBuf::from(".trinity/plans/done/foo.md");
+        pf.plan_path = PlanPath::new(".trinity/plans/done/foo.md");
         let snap = DiskSnapshot {
             head: Some(sha("c4")),
             plan_files: vec![pf],
@@ -724,8 +734,8 @@ mod tests {
             feedback_files: vec![],
         };
         let state = derive_state(PathBuf::from("/r"), snap);
-        assert!(state.sessions.contains_key(&sess("foo")));
-        assert_eq!(state.sessions[&sess("foo")].body, "");
+        assert!(state.plans.contains_key(&sess("foo")));
+        assert_eq!(state.plans[&sess("foo")].body, "");
     }
 
     #[test]
@@ -1010,6 +1020,121 @@ mod tests {
             })
             .collect();
         assert_eq!(authors, vec!["alice", "bob"]);
+    }
+
+    // ===== plan_conflicts / resolve_plan =====
+
+    fn done_plan_file(stem: &str, intro: &str, body: &str) -> PlanFileBlob {
+        PlanFileBlob {
+            plan_key: sess(stem),
+            plan_path: PlanPath::new(format!(".trinity/plans/done/{stem}.md")),
+            body: body.to_string(),
+            plan_intro: sha(intro),
+            plan_intro_parent: None,
+        }
+    }
+
+    #[test]
+    fn same_stem_active_and_done_lands_in_plan_conflicts() {
+        let snap = DiskSnapshot {
+            head: Some(sha("c2")),
+            plan_files: vec![
+                plan_file("foo", "c1", None, "# active\n"),
+                done_plan_file("foo", "c2", "# done\n"),
+            ],
+            history: vec![],
+            feedback_files: vec![],
+        };
+        let state = derive_state(PathBuf::from("/r"), snap);
+        assert!(
+            !state.plans.contains_key(&sess("foo")),
+            "conflicting plans must not be routed"
+        );
+        let paths = state
+            .plan_conflicts
+            .get(&sess("foo"))
+            .expect("conflict surfaced");
+        assert_eq!(paths.len(), 2);
+        assert!(paths.iter().any(|p| !p.is_done()));
+        assert!(paths.iter().any(|p| p.is_done()));
+    }
+
+    #[test]
+    fn resolve_plan_accepts_current_path() {
+        let snap = DiskSnapshot {
+            head: Some(sha("c1")),
+            plan_files: vec![plan_file("foo", "c1", None, "# foo\n")],
+            history: vec![],
+            feedback_files: vec![],
+        };
+        let state = derive_state(PathBuf::from("/r"), snap);
+        let resolved = state
+            .resolve_plan(&PlanPath::new(".trinity/plans/foo.md"))
+            .expect("active path resolves");
+        assert_eq!(resolved.id, sess("foo"));
+    }
+
+    #[test]
+    fn resolve_plan_accepts_active_done_counterpart() {
+        let snap = DiskSnapshot {
+            head: Some(sha("c1")),
+            plan_files: vec![done_plan_file("foo", "c1", "# foo\n")],
+            history: vec![],
+            feedback_files: vec![],
+        };
+        let state = derive_state(PathBuf::from("/r"), snap);
+        let resolved = state
+            .resolve_plan(&PlanPath::new(".trinity/plans/foo.md"))
+            .expect("active counterpart resolves to done");
+        assert!(resolved.plan_path.is_done());
+    }
+
+    #[test]
+    fn resolve_plan_rejects_unknown() {
+        let state = derive_state(PathBuf::from("/r"), DiskSnapshot::default());
+        let err = state
+            .resolve_plan(&PlanPath::new(".trinity/plans/missing.md"))
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            crate::repo_state::PlanLookupError::UnknownPlan(_)
+        ));
+    }
+
+    #[test]
+    fn resolve_plan_rejects_invalid_path() {
+        let state = derive_state(PathBuf::from("/r"), DiskSnapshot::default());
+        let err = state
+            .resolve_plan(&PlanPath::new("notes/foo.md"))
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            crate::repo_state::PlanLookupError::InvalidPlanPath(_)
+        ));
+    }
+
+    #[test]
+    fn resolve_plan_surfaces_conflict_before_unknown() {
+        let snap = DiskSnapshot {
+            head: Some(sha("c2")),
+            plan_files: vec![
+                plan_file("foo", "c1", None, "# active\n"),
+                done_plan_file("foo", "c2", "# done\n"),
+            ],
+            history: vec![],
+            feedback_files: vec![],
+        };
+        let state = derive_state(PathBuf::from("/r"), snap);
+        let err = state
+            .resolve_plan(&PlanPath::new(".trinity/plans/foo.md"))
+            .unwrap_err();
+        match err {
+            crate::repo_state::PlanLookupError::PlanConflict { key, paths } => {
+                assert_eq!(key, sess("foo"));
+                assert_eq!(paths.len(), 2);
+            }
+            other => panic!("expected PlanConflict, got {other:?}"),
+        }
     }
 
     /// Reusable fixture: foo plan (plan_intro c1) + one impl commit c2,

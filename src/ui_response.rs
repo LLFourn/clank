@@ -3,7 +3,7 @@
 //! These functions are deliberately separate from `mcp_response::*` — the
 //! web UI's shape is allowed to be richer than the MCP tool surface (it
 //! never costs an agent context-window tokens). The builders take owned
-//! snapshot types directly (`RepoSnapshot` / `SessionSnapshotBundle` from
+//! snapshot types directly (`RepoSnapshot` / `PlanSnapshotBundle` from
 //! `runtime_snapshot`) and never round-trip back into `RepoState`, so all
 //! disk I/O happens after the runtime mutex has been released.
 //!
@@ -25,7 +25,7 @@ use crate::repo_state::{
     AttributionResult, Feedback, HeldFeedback, Phase, PlanTouchKind, Verdict, WaitingOn,
 };
 use crate::review_state::{ReviewGateDecision, ReviewPhase};
-use crate::runtime_snapshot::{RepoSnapshot, SessionSnapshot, SessionSnapshotBundle};
+use crate::runtime_snapshot::{PlanSnapshot, PlanSnapshotBundle, RepoSnapshot};
 
 /// `GET /api/sessions[?repo=<path>]` — array of session index rows.
 /// Public wrapper binds the production `DiskPlanStatusReader`.
@@ -37,8 +37,8 @@ pub fn sessions_index_with_reader(
     snapshot: &RepoSnapshot,
     status_reader: &impl PlanStatusReader,
 ) -> std::io::Result<Value> {
-    let mut out = Vec::with_capacity(snapshot.sessions.len());
-    for session in &snapshot.sessions {
+    let mut out = Vec::with_capacity(snapshot.plans.len());
+    for session in &snapshot.plans {
         let session_phase = phase_for(&session.plan_path, &session.id, &snapshot.attribution);
         let plan_gate = plan_gate_for_parts(
             &session.id,
@@ -74,15 +74,15 @@ pub fn sessions_index_with_reader(
 
 /// `GET /api/sessions/:id?repo=<path>` — rich session detail.
 /// Public wrapper binds the production `DiskPlanStatusReader`.
-pub fn session_page(bundle: &SessionSnapshotBundle) -> std::io::Result<Value> {
+pub fn session_page(bundle: &PlanSnapshotBundle) -> std::io::Result<Value> {
     session_page_with_reader(bundle, &crate::mcp_response::DiskPlanStatusReader)
 }
 
 pub fn session_page_with_reader(
-    bundle: &SessionSnapshotBundle,
+    bundle: &PlanSnapshotBundle,
     status_reader: &impl PlanStatusReader,
 ) -> std::io::Result<Value> {
-    let session = &bundle.session;
+    let session = &bundle.plan;
     let worktree_status =
         status_reader.compute(&bundle.root, &session.plan_path, &session.body_hash)?;
     let session_phase = phase_for(&session.plan_path, &session.id, &bundle.attribution);
@@ -281,7 +281,7 @@ pub fn render_markdown(input: &str) -> String {
         .to_string()
 }
 
-fn pr_hint_value(session: &SessionSnapshot, impl_commits: &[String]) -> Value {
+fn pr_hint_value(session: &PlanSnapshot, impl_commits: &[String]) -> Value {
     let plan_intro = session.plan_intro.as_str();
     let plan_intro_parent = session.plan_intro_parent.as_ref().map(|s| s.as_str());
     let base_for_squash = plan_intro_parent.unwrap_or(plan_intro);
@@ -350,7 +350,7 @@ fn gate_value(
 }
 
 fn timeline_value(
-    session: &SessionSnapshot,
+    session: &PlanSnapshot,
     attribution: &BTreeMap<CommitSha, AttributionResult>,
     plan_touches: &BTreeMap<CommitSha, Vec<(SessionId, PlanTouchKind)>>,
     commit_order: &[CommitSha],
@@ -423,7 +423,7 @@ fn timeline_value(
 /// Look up feedback entries (rich form) targeting `sha` across both
 /// plan and impl feedback maps. Used by the `/api/sessions/:id/plan/:sha`
 /// and `/api/sessions/:id/commit/:sha` route handlers.
-pub fn feedback_for_target(session: &SessionSnapshot, sha: &CommitSha) -> Vec<Value> {
+pub fn feedback_for_target(session: &PlanSnapshot, sha: &CommitSha) -> Vec<Value> {
     let mut out = Vec::new();
     for ((target, author), fb) in &session.plan_feedback {
         if target == sha {
@@ -467,10 +467,11 @@ mod tests {
         RepoSnapshot {
             root: std::path::PathBuf::from("/r"),
             head: None,
-            sessions: Vec::new(),
+            plans: Vec::new(),
             attribution: BTreeMap::new(),
             plan_touches: BTreeMap::new(),
             commit_order: Vec::new(),
+            plan_conflicts: BTreeMap::new(),
         }
     }
 
@@ -480,7 +481,7 @@ mod tests {
         fn compute(
             &self,
             _repo_root: &Path,
-            _plan_path: &Path,
+            _plan_path: &crate::lifecycle::PlanPath,
             _body_hash: &crate::lifecycle::ContentHash,
         ) -> std::io::Result<PlanWorktreeStatus> {
             Ok(self.0)
@@ -543,9 +544,9 @@ mod tests {
 
     #[test]
     fn pr_hint_uses_plan_intro_parent_when_present() {
-        let session = SessionSnapshot {
+        let session = PlanSnapshot {
             id: SessionId::from("foo"),
-            plan_path: std::path::PathBuf::from(".trinity/plans/foo.md"),
+            plan_path: crate::lifecycle::PlanPath::new(".trinity/plans/foo.md"),
             body: String::new(),
             body_hash: content_hash(""),
             plan_intro: CommitSha::from("intro"),

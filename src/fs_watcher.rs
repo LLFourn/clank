@@ -22,7 +22,10 @@ pub enum FilesystemSignal {
     /// `plan_worktree_status` for already-discovered sessions. The runner
     /// looks up `session_id` against current state and drops the signal
     /// if there's no matching session (untracked draft).
-    PlanFileChanged { session_id: SessionId, path: PathBuf },
+    PlanFileChanged {
+        session_id: SessionId,
+        path: PathBuf,
+    },
 
     /// A write/modify to a feedback file. The body must still be read by
     /// the runner; this signal only encodes the structured path.
@@ -82,10 +85,7 @@ pub fn path_to_signal(
 fn matches_head_file(rel: &Path) -> bool {
     matches!(
         rel.to_str(),
-        Some(".git/HEAD")
-            | Some(".git/logs/HEAD")
-            | Some("HEAD")
-            | Some("logs/HEAD")
+        Some(".git/HEAD") | Some(".git/logs/HEAD") | Some("HEAD") | Some("logs/HEAD")
     )
 }
 
@@ -134,7 +134,11 @@ mod tests {
 
     #[test]
     fn git_head_in_worktree() {
-        let sig = path_to_signal(&repo().join(".git/HEAD"), &repo(), FsEventKind::CreatedOrModified);
+        let sig = path_to_signal(
+            &repo().join(".git/HEAD"),
+            &repo(),
+            FsEventKind::CreatedOrModified,
+        );
         assert_eq!(sig, Some(FilesystemSignal::HeadChanged));
     }
 
@@ -264,7 +268,10 @@ mod tests {
             &repo(),
             FsEventKind::Removed,
         );
-        assert!(matches!(sig, Some(FilesystemSignal::FeedbackRemoved { .. })));
+        assert!(matches!(
+            sig,
+            Some(FilesystemSignal::FeedbackRemoved { .. })
+        ));
     }
 
     #[test]
