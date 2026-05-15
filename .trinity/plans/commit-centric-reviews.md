@@ -364,11 +364,17 @@ Within the resolved repo, count active plans (`state == active`):
 
 - **Exactly one active plan** → use it. Single-active inference
   wins; no recency heuristics, no fuzzy matching.
-- **Zero active plans** → return `{timed_out: true, no_active_plans:
-  true}` (same shape family as today's timeout). The caller has
-  nothing to do.
+- **Zero active plans** → behavior splits by API:
+  - `wait_for_work` (long-poll): return
+    `{timed_out: true, no_active_plans: true}` — same shape family
+    as today's timeout, since there's nothing to wait for.
+  - `get_context` (request/response, no timeout semantics): return
+    a structured `no_active_plan` error
+    (`{ error: "no_active_plan", repo: "<resolved repo>", message:
+    "no active plans in <repo>" }`). Reusing `timed_out` here would
+    be a category error — `get_context` is not long-polling.
 - **Multiple active plans** → return an `ambiguous_plan` error with
-  the candidate list:
+  the candidate list (same shape on both APIs):
 
   ```json
   {
@@ -629,7 +635,7 @@ finishes. Skip the half-step.
    match the new readiness rule at each step. Add a cumulative-
    participant variant: a second reviewer joins at the second
    `code_only` commit and is then expected on subsequent commits.
-10. Optional `plan_id` inference covered by tests:
+10. Optional `plan_id` inference covered by tests on both APIs:
     - `wait_for_work` with no `plan_id` and exactly one active plan
       in the resolved repo → resolves to that plan.
     - `wait_for_work` with no `plan_id` and zero active plans →
@@ -637,9 +643,16 @@ finishes. Skip the half-step.
     - `wait_for_work` with no `plan_id` and multiple active plans
       → returns `ambiguous_plan` error with a candidate list whose
       entries carry `plan_id`, `current_path`, `state`, `waiting_on`.
-    - Explicit `plan_id` always overrides inference (test passes a
-      `plan_id` while multiple actives exist; the named one resolves
-      without an ambiguity error).
+    - `get_context` with no `plan_id` and exactly one active plan
+      in the resolved repo → resolves to that plan.
+    - `get_context` with no `plan_id` and zero active plans →
+      returns a `no_active_plan` error (not `timed_out`).
+    - `get_context` with no `plan_id` and multiple active plans →
+      returns the same `ambiguous_plan` error shape with the
+      candidate list.
+    - Explicit `plan_id` always overrides inference on both APIs
+      (test passes a `plan_id` while multiple actives exist; the
+      named one resolves without an ambiguity error).
 11. `caller_already_voted` semantics test: re-wake is suppressed
     for `APPROVE` and `REQUEST_CHANGES` on the latest relevant SHA,
     but NOT for `Unmarked`/ambiguous (the caller is woken so they
