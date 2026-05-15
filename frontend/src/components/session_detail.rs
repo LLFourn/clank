@@ -4,6 +4,7 @@ use leptos_router::hooks::use_params_map;
 use crate::api::{SessionDetail as SessionDetailData, fetch_session};
 use crate::components::feedback_card::{FeedbackCard, HeldFeedbackCard};
 use crate::components::meta_strip::MetaStrip;
+use crate::components::pr_hint_card::PrHintCard;
 use crate::components::timeline::Timeline;
 use crate::components::waiting_banner::WaitingBanner;
 use crate::store::EventStore;
@@ -44,6 +45,7 @@ fn detail_view(detail: SessionDetailData) -> impl IntoView {
     let impl_feedback = detail.impl_feedback.clone();
     let held_feedback = detail.held_plan_feedback.clone();
     let timeline_events = detail.timeline.clone();
+    let pr_hint = detail.pr_hint.clone();
 
     view! {
         <article class="session-page">
@@ -55,6 +57,7 @@ fn detail_view(detail: SessionDetailData) -> impl IntoView {
             <div class="session-grid">
                 <aside class="session-sidebar">
                     <MetaStrip session=detail/>
+                    {pr_hint.map(|hint| view! { <PrHintCard hint=hint/> })}
                 </aside>
                 <main class="session-main">
                     <section class="session-section">

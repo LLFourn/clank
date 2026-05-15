@@ -4,6 +4,7 @@ pub mod home;
 pub mod meta_strip;
 pub mod plan_diff;
 pub mod plan_revision;
+pub mod pr_hint_card;
 pub mod session_detail;
 pub mod structured_diff;
 pub mod timeline;

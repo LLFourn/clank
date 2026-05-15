@@ -23,6 +23,7 @@ fn App() -> impl IntoView {
     connect_sse(store);
 
     view! {
+        <MuteToggle/>
         <Router>
             <Routes fallback=NotFound>
                 <Route path=path!("/") view=components::home::Home/>
@@ -44,6 +45,25 @@ fn App() -> impl IntoView {
                 />
             </Routes>
         </Router>
+    }
+}
+
+#[component]
+fn MuteToggle() -> impl IntoView {
+    let store = expect_context::<EventStore>();
+    let on_click = move |_| store.toggle_mute();
+    let label = move || if store.muted.get() { "🔇" } else { "🔔" };
+    let title = move || {
+        if store.muted.get() {
+            "Live-event chime is muted — click to unmute"
+        } else {
+            "Live-event chime is on — click to mute"
+        }
+    };
+    view! {
+        <button class="mute-toggle" type="button" on:click=on_click title=title>
+            {label}
+        </button>
     }
 }
 

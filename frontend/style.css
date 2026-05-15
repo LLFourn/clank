@@ -1,4 +1,10 @@
-/* Phase 1 baseline — full typographic + color system lands in Phase 5. */
+/* Phase 5 typography note: the three target fonts (Fraunces / General
+ * Sans / JetBrains Mono) are intended to be self-hosted under
+ * frontend/public/fonts and referenced via @font-face. Vendoring the
+ * .woff2 binaries into git is the planned approach but the download
+ * step is deferred (see .trinity/plans/leptos-frontend.md, the
+ * "self-hosted fonts" follow-up). For now we fall back to system fonts
+ * so the page is functional without the binaries. */
 :root {
     --bg: #0d1117;
     --surface: #161b22;
@@ -12,7 +18,24 @@
     --request: #f85149;
     --pending: #d29922;
     --mute: #484f58;
-    color-scheme: dark;
+    color-scheme: dark light;
+}
+
+@media (prefers-color-scheme: light) {
+    :root {
+        --bg: #fafaf7;
+        --surface: #ffffff;
+        --surface-2: #f0eee8;
+        --border: #d8d4c8;
+        --text: #1f2328;
+        --text-muted: #57606a;
+        --text-dim: #8c959f;
+        --accent: #8250df;
+        --approve: #1a7f37;
+        --request: #cf222e;
+        --pending: #9a6700;
+        --mute: #b1b6bd;
+    }
 }
 
 html,
@@ -123,6 +146,12 @@ a:hover {
     align-items: baseline;
     gap: 1rem;
     margin-bottom: 1rem;
+    position: sticky;
+    top: 0;
+    z-index: 5;
+    background: linear-gradient(to bottom, var(--bg) 80%, transparent);
+    padding-top: 0.6rem;
+    margin-top: -0.6rem;
 }
 
 .session-header h1 {
@@ -929,4 +958,109 @@ a:hover {
     100% {
         background: transparent;
     }
+}
+
+/* ---------- Mute toggle (fixed top-right corner of every page) ---------- */
+
+.mute-toggle {
+    position: fixed;
+    top: 1rem;
+    right: 1rem;
+    z-index: 100;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    color: var(--text);
+    width: 2.4rem;
+    height: 2.4rem;
+    border-radius: 50%;
+    font-size: 1.1rem;
+    cursor: pointer;
+    transition:
+        background 0.15s ease,
+        transform 0.15s ease;
+}
+
+.mute-toggle:hover {
+    background: var(--surface-2);
+    transform: scale(1.05);
+}
+
+/* ---------- pr_hint card ---------- */
+
+.pr-hint {
+    margin-top: 1rem;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 0.5rem;
+    padding: 1rem;
+}
+
+.pr-hint h3 {
+    margin: 0 0 0.4rem;
+    font-size: 0.85rem;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    color: var(--text-muted);
+    font-weight: 500;
+}
+
+.pr-hint-suggested {
+    font-size: 0.85rem;
+    margin: 0 0 0.8rem;
+}
+
+.pr-hint-options {
+    list-style: none;
+    padding: 0;
+    margin: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 0.8rem;
+}
+
+.pr-hint-option {
+    background: var(--surface-2);
+    border-radius: 0.4rem;
+    padding: 0.6rem 0.8rem;
+}
+
+.pr-hint-label {
+    font-size: 0.8rem;
+    color: var(--text-muted);
+    margin-bottom: 0.4rem;
+}
+
+.pr-hint-command {
+    margin: 0 0 0.4rem;
+    font-size: 0.78rem;
+    padding: 0.4rem 0.6rem;
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: 0.3rem;
+    overflow-x: auto;
+    white-space: pre-wrap;
+    word-break: break-all;
+}
+
+.pr-hint-command code {
+    background: transparent;
+    padding: 0;
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+
+.copy-button {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    color: var(--text);
+    padding: 0.25rem 0.7rem;
+    border-radius: 0.3rem;
+    font-size: 0.8rem;
+    cursor: pointer;
+    transition: background 0.15s ease;
+}
+
+.copy-button:hover {
+    background: var(--accent);
+    color: var(--bg);
+    border-color: var(--accent);
 }

@@ -120,6 +120,26 @@ pub enum TimelineEvent {
 
 #[derive(Debug, Clone, Deserialize)]
 #[allow(dead_code)]
+pub struct PrHintOption {
+    pub name: String,
+    pub base: String,
+    pub command: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)]
+pub struct PrHint {
+    pub plan_intro: String,
+    pub plan_intro_parent: Option<String>,
+    #[serde(default)]
+    pub implementation_commits: Vec<String>,
+    #[serde(default)]
+    pub options: Vec<PrHintOption>,
+    pub suggested_message: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)]
 pub struct SessionDetail {
     pub repo: String,
     pub session_id: String,
@@ -144,6 +164,7 @@ pub struct SessionDetail {
     pub held_plan_feedback: Vec<HeldFeedbackEntry>,
     #[serde(default)]
     pub timeline: Vec<TimelineEvent>,
+    pub pr_hint: Option<PrHint>,
 }
 
 #[derive(Debug, Clone)]

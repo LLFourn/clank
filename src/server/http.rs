@@ -14,10 +14,8 @@ use serde_json::{Value, json};
 
 use super::AppState;
 use super::mcp;
-use super::ui;
 use super::wait::{WaitArgs, WaitError, wait_for_work};
 use crate::lifecycle::SessionId;
-use crate::mcp_response::{get_context_response, list_sessions_response};
 
 pub fn router(state: AppState) -> Router {
     // Phase 1 axum routing order (per .trinity/plans/leptos-frontend.md):
@@ -34,11 +32,9 @@ pub fn router(state: AppState) -> Router {
     let frontend_dist = state.frontend_dist.clone();
     Router::new()
         .route("/healthz", get(healthz))
-        // Phase 2: the maud GET handlers for /sessions/:id, /plan/:sha,
-        // /commit/:sha are unregistered so refreshing those URLs falls
-        // through to the SPA shell. The handler functions are kept (with
-        // #[allow(dead_code)]) until Phase 5 deletes src/server/ui.rs.
-        .route("/sessions/{session_id}/done", post(move_to_done))
+        // Phase 5: the maud /sessions/:id* handlers are gone. The SPA
+        // owns those paths via the fallback; the done action moves
+        // under /api as a structured POST.
         .route("/events", get(home_events_stream))
         .route("/sessions/{session_id}/events", get(session_events_stream))
         .route("/internal/tools", get(list_tools))
@@ -46,6 +42,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/wait_for_work", post(api_wait_for_work))
         .route("/api/sessions", get(api_sessions))
         .route("/api/sessions/{session_id}", get(api_session_detail))
+        .route("/api/sessions/{session_id}/done", post(api_move_to_done))
         .route(
             "/api/sessions/{session_id}/plan/{sha}",
             get(api_plan_revision),
@@ -102,91 +99,6 @@ async fn api_wait_for_work(
 #[derive(Deserialize)]
 struct RepoQuery {
     repo: Option<String>,
-}
-
-// Phase 2 transition: the maud `/sessions/:id*` handlers are no longer
-// wired into the router (the SPA fallback owns those paths). They stay
-// behind `#[allow(dead_code)]` until Phase 5 deletes src/server/ui.rs.
-#[allow(dead_code)]
-async fn home(
-    State(state): State<AppState>,
-    Query(q): Query<RepoQuery>,
-) -> Result<Html<String>, AppError> {
-    let repos = repos_to_render(&state, q.repo).await;
-    let mut combined: Vec<Value> = Vec::new();
-    for repo in repos {
-        let snapshot = state
-            .runtime
-            .snapshot_repo(&repo)
-            .await
-            .map_err(AppError::runtime)?;
-        let v = list_sessions_response(&snapshot).map_err(AppError::io)?;
-        if let Some(arr) = v.as_array() {
-            combined.extend(arr.iter().cloned());
-        }
-    }
-    Ok(Html(ui::home_page(&Value::Array(combined))))
-}
-
-#[allow(dead_code)]
-async fn session_detail(
-    State(state): State<AppState>,
-    Path(session_id): Path<String>,
-    Query(q): Query<RepoQuery>,
-) -> Result<Html<String>, AppError> {
-    let repos = repos_to_render(&state, q.repo).await;
-    for repo in repos {
-        let snapshot = state
-            .runtime
-            .snapshot_session(&repo, &SessionId::from(session_id.clone()))
-            .await
-            .map_err(AppError::runtime)?;
-        if let Some(snapshot) = snapshot {
-            let ctx = get_context_response(
-                &snapshot,
-                &crate::lifecycle::AgentLabel::from("web".to_string()),
-            )
-            .map_err(AppError::io)?;
-            return Ok(Html(ui::session_page(&ctx)));
-        }
-    }
-    Err(AppError::not_found(format!(
-        "session {session_id} not found"
-    )))
-}
-
-#[derive(Deserialize)]
-struct DoneArgs {
-    /// Repo root the session belongs to. Required because session ids are
-    /// repo-scoped.
-    repo: String,
-}
-
-async fn move_to_done(
-    State(state): State<AppState>,
-    Path(session_id): Path<String>,
-    axum::Form(args): axum::Form<DoneArgs>,
-) -> Result<Response, AppError> {
-    let repo = PathBuf::from(&args.repo);
-    let plan_path_rel = state
-        .runtime
-        .snapshot_session(&repo, &SessionId::from(session_id.clone()))
-        .await
-        .map_err(AppError::runtime)?
-        .map(|snapshot| snapshot.session.plan_path)
-        .ok_or_else(|| AppError::not_found(format!("session {session_id} not found")))?;
-
-    let from = repo.join(&plan_path_rel);
-    let to_dir = repo.join(".trinity/plans/done");
-    std::fs::create_dir_all(&to_dir).map_err(AppError::io)?;
-    let to = to_dir.join(
-        plan_path_rel
-            .file_name()
-            .ok_or_else(|| AppError::internal("plan_path has no file name"))?,
-    );
-    std::fs::rename(&from, &to).map_err(AppError::io)?;
-    // Don't `git add` — operator commits the move themselves per the plan.
-    Ok((StatusCode::SEE_OTHER, [(axum::http::header::LOCATION, "/")]).into_response())
 }
 
 async fn home_events_stream(
@@ -246,72 +158,6 @@ async fn event_stream(
 
 async fn healthz() -> &'static str {
     "ok"
-}
-
-#[allow(dead_code)]
-async fn plan_revision_view(
-    State(state): State<AppState>,
-    Path((session_id, sha)): Path<(String, String)>,
-    Query(q): Query<RepoQuery>,
-) -> Result<Html<String>, AppError> {
-    let repos = repos_to_render(&state, q.repo).await;
-    for repo in repos {
-        let plan_path = state
-            .runtime
-            .snapshot_session(&repo, &SessionId::from(session_id.clone()))
-            .await
-            .map_err(AppError::runtime)?
-            .map(|snapshot| snapshot.session.plan_path);
-        let Some(plan_path) = plan_path else {
-            continue;
-        };
-        let commit_sha = crate::lifecycle::CommitSha::from(sha.clone());
-        let body = crate::git_io::show_blob(&repo, &commit_sha, &plan_path)
-            .await
-            .map_err(|e| AppError::internal(format!("git show: {e}")))?;
-        return Ok(Html(ui::plan_revision_page(
-            &session_id,
-            &sha,
-            &body,
-            &repo.to_string_lossy(),
-        )));
-    }
-    Err(AppError::not_found(format!(
-        "session {session_id} not found"
-    )))
-}
-
-#[allow(dead_code)]
-async fn commit_diff_view(
-    State(state): State<AppState>,
-    Path((session_id, sha)): Path<(String, String)>,
-    Query(q): Query<RepoQuery>,
-) -> Result<Html<String>, AppError> {
-    let repos = repos_to_render(&state, q.repo).await;
-    for repo in repos {
-        let exists = state
-            .runtime
-            .snapshot_session(&repo, &SessionId::from(session_id.clone()))
-            .await
-            .map_err(AppError::runtime)?
-            .is_some();
-        if !exists {
-            continue;
-        }
-        let commit_sha = crate::lifecycle::CommitSha::from(sha.clone());
-        let patch = crate::git_io::show_commit(&repo, &commit_sha)
-            .await
-            .map_err(|e| AppError::internal(format!("git show: {e}")))?;
-        return Ok(Html(ui::commit_diff_page(
-            &session_id,
-            &sha,
-            &patch,
-            &repo.to_string_lossy(),
-        )));
-    }
-    Err(AppError::not_found(format!(
-        "session {session_id} not found"
-    )))
 }
 
 async fn list_tools() -> axum::Json<Vec<crate::tools::ToolDescriptor>> {
@@ -577,6 +423,46 @@ async fn api_commit_diff(
     Err(AppError::not_found(format!(
         "session {session_id} not found"
     )))
+}
+
+#[derive(Deserialize)]
+struct DoneBody {
+    /// Repo root the session belongs to. Required because session ids
+    /// are repo-scoped.
+    repo: String,
+}
+
+/// `POST /api/sessions/:session_id/done` — move the plan file under
+/// `.trinity/plans/done/`. Replaces the Phase-1 form-encoded
+/// `/sessions/:id/done` POST. Body is JSON.
+async fn api_move_to_done(
+    State(state): State<AppState>,
+    Path(session_id): Path<String>,
+    axum::Json(body): axum::Json<DoneBody>,
+) -> Result<axum::Json<Value>, AppError> {
+    let repo = PathBuf::from(&body.repo);
+    let plan_path_rel = state
+        .runtime
+        .snapshot_session(&repo, &SessionId::from(session_id.clone()))
+        .await
+        .map_err(AppError::runtime)?
+        .map(|snapshot| snapshot.session.plan_path)
+        .ok_or_else(|| AppError::not_found(format!("session {session_id} not found")))?;
+
+    let from = repo.join(&plan_path_rel);
+    let to_dir = repo.join(".trinity/plans/done");
+    std::fs::create_dir_all(&to_dir).map_err(AppError::io)?;
+    let to = to_dir.join(
+        plan_path_rel
+            .file_name()
+            .ok_or_else(|| AppError::internal("plan_path has no file name"))?,
+    );
+    std::fs::rename(&from, &to).map_err(AppError::io)?;
+    let new_plan_path = to.strip_prefix(&repo).unwrap_or(&to).to_path_buf();
+    Ok(axum::Json(json!({
+        "ok": true,
+        "new_plan_path": new_plan_path.to_string_lossy(),
+    })))
 }
 
 #[derive(Deserialize)]

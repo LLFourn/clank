@@ -566,23 +566,24 @@ async fn feedback_renders_on_session_page() {
 
 #[tokio::test]
 async fn done_move_endpoint_moves_plan_file() {
+    // Phase 5 moved the done action under /api as a structured JSON
+    // POST; the old form-encoded /sessions/:id/done is gone with the
+    // maud handlers.
     let dir = init_repo();
     write_file(dir.path(), ".trinity/plans/foo.md", "# foo\n");
     commit(dir.path(), "Add foo");
 
     let (url, handle) = spawn_daemon(dir.path()).await;
-    let client = reqwest::Client::builder()
-        .redirect(reqwest::redirect::Policy::none())
-        .build()
-        .unwrap();
+    let client = reqwest::Client::new();
+    let body = json!({ "repo": dir.path().to_string_lossy() });
     let resp = client
-        .post(format!("{}/sessions/foo/done", url))
-        .form(&[("repo", dir.path().to_string_lossy().into_owned())])
+        .post(format!("{}/api/sessions/foo/done", url))
+        .json(&body)
         .send()
         .await
         .unwrap();
     handle.abort();
-    assert_eq!(resp.status(), reqwest::StatusCode::SEE_OTHER);
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
     assert!(
         !dir.path().join(".trinity/plans/foo.md").exists(),
         "active path should be gone"
