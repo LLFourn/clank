@@ -181,10 +181,7 @@ pub fn all_plan_revisions_for(
     commit_order: &[CommitSha],
     plan_touches: &BTreeMap<
         CommitSha,
-        Vec<(
-            crate::lifecycle::SessionId,
-            crate::repo_state::PlanTouchKind,
-        )>,
+        Vec<(crate::lifecycle::PlanKey, crate::repo_state::PlanTouchKind)>,
     >,
 ) -> Vec<CommitSha> {
     commit_order
@@ -241,10 +238,7 @@ pub fn latest_plan_touching_commit_for(
     commit_order: &[CommitSha],
     plan_touches: &BTreeMap<
         CommitSha,
-        Vec<(
-            crate::lifecycle::SessionId,
-            crate::repo_state::PlanTouchKind,
-        )>,
+        Vec<(crate::lifecycle::PlanKey, crate::repo_state::PlanTouchKind)>,
     >,
 ) -> Option<CommitSha> {
     all_plan_revisions_for(plan_key, commit_order, plan_touches)
@@ -288,10 +282,7 @@ pub fn plan_gate_for_parts(
     commit_order: &[CommitSha],
     plan_touches: &BTreeMap<
         CommitSha,
-        Vec<(
-            crate::lifecycle::SessionId,
-            crate::repo_state::PlanTouchKind,
-        )>,
+        Vec<(crate::lifecycle::PlanKey, crate::repo_state::PlanTouchKind)>,
     >,
 ) -> Option<ReviewGateDecision> {
     let current_target = latest_plan_touching_commit_for(plan_key, commit_order, plan_touches)?;

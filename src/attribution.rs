@@ -5,7 +5,7 @@
 //! See `.trinity/plans/filesystem-truth-rewrite.md` "Commit Attribution —
 //! pure git walk" for the four rules this module enforces.
 
-use crate::lifecycle::SessionId;
+use crate::lifecycle::PlanKey;
 use crate::repo_state::{AttributionResult, PlanTouchKind};
 
 /// Per-commit summary of plan-file changes and code changes.
@@ -20,7 +20,7 @@ pub struct CommitChanges {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PlanTouch {
-    pub session: SessionId,
+    pub session: PlanKey,
     pub kind: PlanTouchKind,
 }
 
@@ -36,10 +36,7 @@ pub struct PlanTouch {
 /// ancestor in the parent chain. Multi-plan-touch parents transmit their
 /// own grandparent's effective session forward — this is handled by the
 /// caller, which threads `effective_session_of(commit)` through the walk.
-pub fn classify(
-    changes: &CommitChanges,
-    parent_effective: Option<&SessionId>,
-) -> AttributionResult {
+pub fn classify(changes: &CommitChanges, parent_effective: Option<&PlanKey>) -> AttributionResult {
     match changes.plan_touches.len() {
         1 => {
             let touch = &changes.plan_touches[0];
@@ -67,8 +64,8 @@ pub fn classify(
 /// effective session forward.
 pub fn effective_session(
     changes: &CommitChanges,
-    parent_effective: Option<&SessionId>,
-) -> Option<SessionId> {
+    parent_effective: Option<&PlanKey>,
+) -> Option<PlanKey> {
     match changes.plan_touches.len() {
         1 => Some(changes.plan_touches[0].session.clone()),
         _ => parent_effective.cloned(),
@@ -79,8 +76,8 @@ pub fn effective_session(
 mod tests {
     use super::*;
 
-    fn sess(name: &str) -> SessionId {
-        SessionId::from(name.to_string())
+    fn sess(name: &str) -> PlanKey {
+        PlanKey::from(name.to_string())
     }
 
     fn touch(name: &str, kind: PlanTouchKind) -> PlanTouch {
@@ -227,7 +224,7 @@ mod tests {
             ("impl_4", changes(vec![], true)),
         ];
 
-        let mut effective: Option<SessionId> = None;
+        let mut effective: Option<PlanKey> = None;
         let mut results = Vec::new();
         for (label, c) in &chain {
             let result = classify(c, effective.as_ref());
@@ -290,7 +287,7 @@ mod tests {
             ("impl_after_multi", changes(vec![], true)),
         ];
 
-        let mut effective: Option<SessionId> = None;
+        let mut effective: Option<PlanKey> = None;
         let mut results = Vec::new();
         for (label, c) in &chain {
             let result = classify(c, effective.as_ref());

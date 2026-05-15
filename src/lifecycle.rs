@@ -62,10 +62,6 @@ string_newtype!(AgentLabel);
 string_newtype!(PlanKey);
 string_newtype!(RepoBasename);
 
-/// Legacy alias retained while Phase 2/3 wire-level renames are still
-/// in-flight. Phase 4 removes it.
-pub type SessionId = PlanKey;
-
 impl RepoBasename {
     /// Extract the basename (final `file_name` component) of a canonical
     /// repo root. Returns `None` if the path has no usable basename.

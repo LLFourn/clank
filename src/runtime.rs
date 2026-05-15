@@ -15,7 +15,7 @@ use tokio::sync::{Mutex, broadcast};
 
 use crate::disk_format::FeedbackPhase;
 use crate::fs_watcher::FilesystemSignal;
-use crate::lifecycle::{CommitSha, SessionId, content_hash};
+use crate::lifecycle::{CommitSha, PlanKey, content_hash};
 use crate::rebuild::{RebuildError, rebuild_repo};
 use crate::repo_state::{AttributionResult, Feedback, HeldFeedback, LiveEvent, Plan, Trinity};
 use crate::runtime_snapshot::{PlanSnapshotBundle, RepoSnapshot};
@@ -134,7 +134,7 @@ impl Runtime {
     pub async fn snapshot_session(
         &self,
         repo_root: &Path,
-        session_id: &SessionId,
+        session_id: &PlanKey,
     ) -> Result<Option<PlanSnapshotBundle>, RuntimeError> {
         let canonical = dunce::canonicalize(repo_root).unwrap_or_else(|_| repo_root.to_path_buf());
         let trinity = self.state.lock().await;
@@ -404,7 +404,7 @@ impl Runtime {
         repo_root: &Path,
         now: i64,
     ) -> Result<(), RuntimeError> {
-        let drained: Vec<(SessionId, HeldFeedback)> = {
+        let drained: Vec<(PlanKey, HeldFeedback)> = {
             let mut trinity = self.state.lock().await;
             let Some(state) = trinity.repos.get_mut(repo_root) else {
                 return Ok(());
@@ -688,7 +688,7 @@ fn _hash_ref(s: &str) -> crate::lifecycle::ContentHash {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::lifecycle::{AgentLabel, CommitSha, SessionId};
+    use crate::lifecycle::{AgentLabel, CommitSha, PlanKey};
     use crate::mcp_response::{get_context_response, list_plans_response};
     use std::path::Path;
     use std::process::Command;
@@ -782,7 +782,7 @@ mod tests {
         rt.handle_signal(
             dir.path(),
             FilesystemSignal::PlanFileChanged {
-                session_id: SessionId::from("foo".to_string()),
+                session_id: PlanKey::from("foo".to_string()),
                 path: PathBuf::from(".trinity/plans/foo.md"),
             },
             42,
@@ -810,7 +810,7 @@ mod tests {
         rt.handle_signal(
             dir.path(),
             FilesystemSignal::PlanFileChanged {
-                session_id: SessionId::from("unknown".to_string()),
+                session_id: PlanKey::from("unknown".to_string()),
                 path: PathBuf::from(".trinity/plans/unknown.md"),
             },
             42,
@@ -833,7 +833,7 @@ mod tests {
 
         let intro: CommitSha = rt
             .read_repo(dir.path(), |s| {
-                s.plans[&SessionId::from("foo".to_string())]
+                s.plans[&PlanKey::from("foo".to_string())]
                     .plan_intro
                     .clone()
             })
@@ -854,7 +854,7 @@ mod tests {
 
         // The gate should now resolve to ready_to_implement.
         let snapshot = rt
-            .snapshot_session(dir.path(), &SessionId::from("foo".to_string()))
+            .snapshot_session(dir.path(), &PlanKey::from("foo".to_string()))
             .await
             .unwrap()
             .unwrap();
@@ -876,7 +876,7 @@ mod tests {
 
         let intro: CommitSha = rt
             .read_repo(dir.path(), |s| {
-                s.plans[&SessionId::from("foo".to_string())]
+                s.plans[&PlanKey::from("foo".to_string())]
                     .plan_intro
                     .clone()
             })
@@ -903,7 +903,7 @@ mod tests {
             .unwrap();
 
         let snapshot = rt
-            .snapshot_session(dir.path(), &SessionId::from("foo".to_string()))
+            .snapshot_session(dir.path(), &PlanKey::from("foo".to_string()))
             .await
             .unwrap()
             .unwrap();
@@ -934,7 +934,7 @@ mod tests {
         // The flat file should be gone; the canonical SHA-subdir file should exist.
         let intro_sha = rt
             .read_repo(dir.path(), |s| {
-                s.plans[&SessionId::from("foo".to_string())]
+                s.plans[&PlanKey::from("foo".to_string())]
                     .plan_intro
                     .clone()
             })
@@ -954,7 +954,7 @@ mod tests {
         // the target SHA + alice key.
         let key_present = rt
             .read_repo(dir.path(), |s| {
-                s.plans[&SessionId::from("foo".to_string())]
+                s.plans[&PlanKey::from("foo".to_string())]
                     .plan_feedback
                     .contains_key(&(intro_sha, AgentLabel::from("alice".to_string())))
             })
@@ -994,7 +994,7 @@ mod tests {
         );
         let held_count = rt
             .read_repo(dir.path(), |s| {
-                s.plans[&SessionId::from("foo".to_string())]
+                s.plans[&PlanKey::from("foo".to_string())]
                     .held_plan_feedback
                     .len()
             })
@@ -1029,7 +1029,7 @@ mod tests {
 
         let held_count = rt
             .read_repo(dir.path(), |s| {
-                s.plans[&SessionId::from("foo".to_string())]
+                s.plans[&PlanKey::from("foo".to_string())]
                     .held_plan_feedback
                     .len()
             })
@@ -1048,7 +1048,7 @@ mod tests {
 
         let (held_after, has_canonical_entry) = rt
             .read_repo(dir.path(), |s| {
-                let sess = &s.plans[&SessionId::from("foo".to_string())];
+                let sess = &s.plans[&PlanKey::from("foo".to_string())];
                 let any_entry_for_alice = sess
                     .plan_feedback
                     .keys()
@@ -1124,7 +1124,7 @@ mod tests {
             rt.handle_signal(
                 dir.path(),
                 FilesystemSignal::PlanFileChanged {
-                    session_id: SessionId::from("foo".to_string()),
+                    session_id: PlanKey::from("foo".to_string()),
                     path: PathBuf::from(".trinity/plans/foo.md"),
                 },
                 i,

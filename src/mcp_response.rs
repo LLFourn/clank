@@ -8,7 +8,7 @@ use std::path::Path;
 
 use serde_json::{Value, json};
 
-use crate::lifecycle::{AgentLabel, ContentHash, PlanPath, SessionId, content_hash};
+use crate::lifecycle::{AgentLabel, ContentHash, PlanKey, PlanPath, content_hash};
 use crate::projection::{
     all_implementation_commits, all_plan_revisions, expected_action, impl_gate_for,
     latest_impl_commit, latest_plan_touching_commit, phase, plan_gate_for, plan_worktree_status,
@@ -144,10 +144,14 @@ fn plan_summary(
     worktree_status: PlanWorktreeStatus,
     w: &WaitingOn,
 ) -> Value {
+    let plan_id = crate::lifecycle::RepoBasename::from_repo_root(repo_root)
+        .map(|b| crate::lifecycle::PlanId::new(b, plan.id.clone()).to_string());
     json!({
         "repo": repo_root.to_string_lossy(),
+        "plan_id": plan_id,
         "slug": plan.id.as_str(),
-        "plan_path": plan.plan_path.to_string_lossy(),
+        "state": plan.state.as_str(),
+        "current_path": plan.plan_path.to_string_lossy(),
         "phase": plan_phase.as_str(),
         "plan_worktree_status": worktree_status.as_str(),
         "waiting_on": waiting_on_value(w),
@@ -254,10 +258,15 @@ pub fn get_context_response_from_snapshot(
     });
     let expected_action_str = expected_action(w.reason);
 
+    let plan_id = crate::lifecycle::RepoBasename::from_repo_root(&snapshot.root)
+        .map(|b| crate::lifecycle::PlanId::new(b, session.id.clone()).to_string());
+
     json!({
         "repo": snapshot.root.to_string_lossy(),
-        "plan_path": session.plan_path.to_string_lossy(),
+        "plan_id": plan_id,
         "slug": session.id.as_str(),
+        "state": session.state.as_str(),
+        "current_path": session.plan_path.to_string_lossy(),
         "phase": session_phase.as_str(),
         "plan_worktree_status": worktree_status.as_str(),
         "waiting_on": waiting_on_value(&w),
@@ -278,7 +287,7 @@ pub fn get_context_response_from_snapshot(
 
 /// Serialize the per-session timeline (from `RepoState::timeline_for`)
 /// into the response shape. Each event becomes a `{ kind, ... }` object.
-fn timeline_value(state: &RepoState, session_id: &SessionId) -> Vec<Value> {
+fn timeline_value(state: &RepoState, session_id: &PlanKey) -> Vec<Value> {
     state
         .timeline_for(session_id)
         .into_iter()
@@ -474,7 +483,7 @@ mod tests {
     }
 
     fn context_from_state(state: &RepoState, sid: &str, author: &str) -> Option<serde_json::Value> {
-        let sid = SessionId::from(sid.to_string());
+        let sid = PlanKey::from(sid.to_string());
         let snapshot = PlanSnapshotBundle::from_state_for(state, &sid)?;
         Some(get_context_response(&snapshot, &AgentLabel::from(author.to_string())).unwrap())
     }
@@ -552,7 +561,8 @@ mod tests {
         let arr = v["plans"].as_array().unwrap();
         assert_eq!(arr.len(), 1);
         assert_eq!(arr[0]["slug"], "foo");
-        assert_eq!(arr[0]["plan_path"], ".trinity/plans/foo.md");
+        assert_eq!(arr[0]["current_path"], ".trinity/plans/foo.md");
+        assert_eq!(arr[0]["state"], "active");
         assert_eq!(arr[0]["phase"], "planning");
         assert_eq!(arr[0]["plan_worktree_status"], "clean");
         // Just-committed plan with no reviews → reviewers / plan_needs_initial_review.
@@ -608,7 +618,7 @@ mod tests {
         commit(dir.path(), "add plan");
 
         let state0 = rebuild_repo(dir.path()).await.unwrap();
-        let intro = state0.plans[&SessionId::from("foo".to_string())]
+        let intro = state0.plans[&PlanKey::from("foo".to_string())]
             .plan_intro
             .clone();
         // Use full SHA in the feedback path. Trinity in production will
@@ -633,7 +643,7 @@ mod tests {
         commit(dir.path(), "add plan");
 
         let state0 = rebuild_repo(dir.path()).await.unwrap();
-        let intro = state0.plans[&SessionId::from("foo".to_string())]
+        let intro = state0.plans[&PlanKey::from("foo".to_string())]
             .plan_intro
             .clone();
         let feedback_rel = format!(".trinity/feedback/foo/plan/{}/alice.md", intro.as_str());
@@ -672,7 +682,7 @@ mod tests {
         let runtime = Runtime::new();
         runtime.add_repo(dir.path().to_path_buf()).await.unwrap();
         let snapshot = runtime
-            .snapshot_session(dir.path(), &SessionId::from("foo".to_string()))
+            .snapshot_session(dir.path(), &PlanKey::from("foo".to_string()))
             .await
             .unwrap()
             .unwrap();

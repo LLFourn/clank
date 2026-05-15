@@ -6,7 +6,7 @@
 use std::path::{Path, PathBuf};
 
 use crate::disk_format::{FeedbackPath, parse_feedback_path};
-use crate::lifecycle::{PlanKey, SessionId};
+use crate::lifecycle::PlanKey;
 
 /// Signals the watcher layer hands to the runner. The runner expands these
 /// into `Observation` values (loading file bodies, looking up known
@@ -22,10 +22,7 @@ pub enum FilesystemSignal {
     /// `plan_worktree_status` for already-discovered sessions. The runner
     /// looks up `session_id` against current state and drops the signal
     /// if there's no matching session (untracked draft).
-    PlanFileChanged {
-        session_id: SessionId,
-        path: PathBuf,
-    },
+    PlanFileChanged { session_id: PlanKey, path: PathBuf },
 
     /// A write/modify to a feedback file. The body must still be read by
     /// the runner; this signal only encodes the structured path.

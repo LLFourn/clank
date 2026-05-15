@@ -14,7 +14,7 @@ use std::collections::BTreeMap;
 
 use serde_json::{Value, json};
 
-use crate::lifecycle::{AgentLabel, CommitSha, SessionId};
+use crate::lifecycle::{AgentLabel, CommitSha, PlanKey};
 use crate::mcp_response::PlanStatusReader;
 use crate::projection::{
     all_implementation_commits_for, all_plan_revisions_for, expected_action, impl_gate_for_parts,
@@ -374,7 +374,7 @@ fn gate_value(
 fn timeline_value(
     session: &PlanSnapshot,
     attribution: &BTreeMap<CommitSha, AttributionResult>,
-    plan_touches: &BTreeMap<CommitSha, Vec<(SessionId, PlanTouchKind)>>,
+    plan_touches: &BTreeMap<CommitSha, Vec<(PlanKey, PlanTouchKind)>>,
     commit_order: &[CommitSha],
 ) -> Vec<Value> {
     let mut out = Vec::new();
@@ -568,7 +568,7 @@ mod tests {
     #[test]
     fn pr_hint_uses_plan_intro_parent_when_present() {
         let session = PlanSnapshot {
-            id: SessionId::from("foo"),
+            id: PlanKey::from("foo"),
             plan_path: crate::lifecycle::PlanPath::new(".trinity/plans/foo.md"),
             state: crate::repo_state::PlanState::Active,
             body: String::new(),

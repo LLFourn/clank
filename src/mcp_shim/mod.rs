@@ -380,13 +380,14 @@ impl ServerHandler for ShimHandler {
                 "Trinity coordinates multi-agent peer review around plan files committed \
                  to git and feedback files in the working tree. \n\n\
                  Discover plans with `list_plans` or create one with `start_plan`. \
-                 To drive an agent loop, call `wait_for_work({role: \"master\" | \"reviewers\", plan_path})` — \
+                 To drive an agent loop, call `wait_for_work({role: \"master\" | \"reviewers\", plan_id})` — \
                  it blocks until the plan needs your role and returns minimal identifiers; \
-                 for each match, follow up with `get_context({repo, plan_path})` for the \
-                 full plan state. This avoids polling. \n\n\
-                 The shim caches the last `label` / `author_label` you passed so subsequent \
-                 calls don't need to repeat it. `plan_path` is NEVER cached — pass it on \
-                 every call to keep the target explicit."
+                 for each match, follow up with `get_context({plan_id})` for the full plan \
+                 state. This avoids polling. \n\n\
+                 `plan_id` is the canonical `<repo_basename>/<stem>.md` identity (e.g. \
+                 `trinity/leptos-frontend.md`). The shim caches the last `label` / \
+                 `author_label` you passed so subsequent calls don't need to repeat it. \
+                 `plan_id` is NEVER cached — pass it on every call to keep the target explicit."
                     .into(),
             ),
         }
@@ -492,7 +493,7 @@ mod tests {
         let h = handler_with_cache(Some("   "));
         let out = h.fill_label_from_cache(
             "wait_for_work",
-            serde_json::json!({"role": "reviewers", "session_id": "s"}),
+            serde_json::json!({"role": "reviewers", "plan_id": "repo/s.md"}),
         );
         // Blank cache must not poison autofill.
         assert!(out.get("author_label").is_none());
@@ -503,7 +504,7 @@ mod tests {
         let h = handler_with_cache(Some("codex"));
         let out = h.fill_label_from_cache(
             "wait_for_work",
-            serde_json::json!({"role": "reviewers", "session_id": "s", "author_label": "   "}),
+            serde_json::json!({"role": "reviewers", "plan_id": "repo/s.md", "author_label": "   "}),
         );
         // Whitespace-only caller-supplied label is overwritten with cache.
         assert_eq!(out["author_label"], "codex");
@@ -514,7 +515,7 @@ mod tests {
         let h = handler_with_cache(Some("codex"));
         let out = h.fill_label_from_cache(
             "wait_for_work",
-            serde_json::json!({"role": "reviewers", "session_id": "s", "author_label": "alice"}),
+            serde_json::json!({"role": "reviewers", "plan_id": "repo/s.md", "author_label": "alice"}),
         );
         // Caller-supplied non-blank label is preserved as-is.
         assert_eq!(out["author_label"], "alice");
@@ -529,8 +530,8 @@ mod tests {
     }
 
     #[test]
-    fn fill_label_from_cache_does_not_autofill_plan_path() {
-        // plan_path is the target of every canonical call. The shim must
+    fn fill_label_from_cache_does_not_autofill_plan_id() {
+        // plan_id is the target of every canonical call. The shim must
         // never cache or autofill it, even if a cached label exists for
         // the same tool — see plan-path-identity §4b.
         let h = handler_with_cache(Some("codex"));
@@ -539,8 +540,8 @@ mod tests {
             serde_json::json!({"role": "reviewers", "author_label": "codex"}),
         );
         assert!(
-            out.get("plan_path").is_none(),
-            "shim must never autofill plan_path"
+            out.get("plan_id").is_none(),
+            "shim must never autofill plan_id"
         );
     }
 }

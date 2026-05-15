@@ -24,7 +24,7 @@ pub async fn rebuild_repo(repo_root: &Path) -> Result<RepoState, RebuildError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::lifecycle::SessionId;
+    use crate::lifecycle::PlanKey;
     use crate::repo_state::AttributionResult;
     use std::path::Path;
     use std::process::Command;
@@ -79,7 +79,7 @@ mod tests {
 
         let state = rebuild_repo(dir.path()).await.unwrap();
         assert_eq!(state.plans.len(), 1);
-        let session = &state.plans[&SessionId::from("foo".to_string())];
+        let session = &state.plans[&PlanKey::from("foo".to_string())];
         assert_eq!(session.id.as_str(), "foo");
         assert_eq!(session.body, "# foo\n");
         let intro = &session.plan_intro;
@@ -127,14 +127,14 @@ mod tests {
         write_file(dir.path(), ".trinity/plans/foo.md", "# foo\n");
         commit(dir.path(), "Add foo plan");
         let state0 = rebuild_repo(dir.path()).await.unwrap();
-        let intro = state0.plans[&SessionId::from("foo".to_string())]
+        let intro = state0.plans[&PlanKey::from("foo".to_string())]
             .plan_intro
             .clone();
         let feedback_rel = format!(".trinity/feedback/foo/plan/{}/alice.md", intro.as_str());
         write_file(dir.path(), &feedback_rel, "APPROVE\n\nLooks good.\n");
 
         let state = rebuild_repo(dir.path()).await.unwrap();
-        let session = &state.plans[&SessionId::from("foo".to_string())];
+        let session = &state.plans[&PlanKey::from("foo".to_string())];
         let entries: Vec<_> = session.plan_feedback.values().collect();
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].verdict, crate::repo_state::Verdict::Approve);
@@ -152,14 +152,12 @@ mod tests {
 
         let state = rebuild_repo(dir.path()).await.unwrap();
         assert!(
-            !state
-                .plans
-                .contains_key(&SessionId::from("foo".to_string())),
+            !state.plans.contains_key(&PlanKey::from("foo".to_string())),
             "conflicting plan must not be routable"
         );
         let paths = state
             .plan_conflicts
-            .get(&SessionId::from("foo".to_string()))
+            .get(&PlanKey::from("foo".to_string()))
             .expect("conflict surfaced");
         assert_eq!(paths.len(), 2);
         assert!(paths.iter().any(|p| !p.is_done()));

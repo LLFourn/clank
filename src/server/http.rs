@@ -911,7 +911,7 @@ mod wire_tests {
         // as participants of the plan-phase gate.
         let intro = runtime
             .read_repo(dir.path(), |s| {
-                s.plans[&crate::lifecycle::SessionId::from("foo")]
+                s.plans[&crate::lifecycle::PlanKey::from("foo")]
                     .plan_intro
                     .clone()
             })
@@ -953,7 +953,7 @@ mod wire_tests {
         let revised = runtime
             .read_repo(dir.path(), |s| {
                 crate::projection::latest_plan_touching_commit(
-                    &s.plans[&crate::lifecycle::SessionId::from("foo")],
+                    &s.plans[&crate::lifecycle::PlanKey::from("foo")],
                     s,
                 )
                 .unwrap()
