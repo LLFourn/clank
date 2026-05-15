@@ -98,10 +98,8 @@ async fn home_renders_session_list() {
     commit(dir.path(), "Add foo");
 
     let (url, handle) = spawn_daemon(dir.path()).await;
-    let repo_param: String = url::form_urlencoded::byte_serialize(
-        dir.path().to_string_lossy().as_bytes(),
-    )
-    .collect();
+    let repo_param: String =
+        url::form_urlencoded::byte_serialize(dir.path().to_string_lossy().as_bytes()).collect();
     let body = reqwest::get(format!("{url}/api/sessions?repo={repo_param}"))
         .await
         .unwrap()
@@ -109,7 +107,10 @@ async fn home_renders_session_list() {
         .await
         .unwrap();
     handle.abort();
-    assert!(body.contains("\"foo\""), "session list should include 'foo'");
+    assert!(
+        body.contains("\"foo\""),
+        "session list should include 'foo'"
+    );
     assert!(body.contains("\"planning\""), "phase should be 'planning'");
     assert!(
         body.contains("plan_needs_initial_review"),
@@ -246,15 +247,18 @@ async fn pr_hint_present_in_implementing_phase() {
     handle.abort();
     let body: serde_json::Value = resp.json().await.unwrap();
     let pr_hint = &body["result"]["pr_hint"];
-    assert!(pr_hint.is_object(), "pr_hint should be an object: {pr_hint}");
-    assert!(pr_hint["plan_intro"].is_string());
     assert!(
-        pr_hint["plan_intro_parent"].is_null()
-            || pr_hint["plan_intro_parent"].is_string()
+        pr_hint.is_object(),
+        "pr_hint should be an object: {pr_hint}"
     );
+    assert!(pr_hint["plan_intro"].is_string());
+    assert!(pr_hint["plan_intro_parent"].is_null() || pr_hint["plan_intro_parent"].is_string());
     let options = pr_hint["options"].as_array().unwrap();
     assert_eq!(options.len(), 2);
-    let names: Vec<&str> = options.iter().map(|o| o["name"].as_str().unwrap()).collect();
+    let names: Vec<&str> = options
+        .iter()
+        .map(|o| o["name"].as_str().unwrap())
+        .collect();
     assert!(names.contains(&"keep_plan_in_pr"));
     assert!(names.contains(&"exclude_plan_from_pr"));
 }
@@ -377,7 +381,10 @@ async fn sse_pushes_repo_rebuilt_on_head_change() {
         }
     }
     handle.abort();
-    assert!(got_event, "expected `repo_rebuilt` SSE event after HEAD change");
+    assert!(
+        got_event,
+        "expected `repo_rebuilt` SSE event after HEAD change"
+    );
 }
 
 #[tokio::test]
@@ -406,15 +413,20 @@ async fn start_plan_persists_repo_to_registry() {
         .await
         .unwrap();
     handle.abort();
-    assert!(resp.status().is_success(), "start_plan failed: {}", resp.status());
+    assert!(
+        resp.status().is_success(),
+        "start_plan failed: {}",
+        resp.status()
+    );
 
     // ~/.trinity/repos should now contain the repo path.
     let registry_path = fake_home.path().join(".trinity/repos");
     assert!(registry_path.exists(), "registry file should be created");
     let body = std::fs::read_to_string(&registry_path).unwrap();
     assert!(
-        body.lines().any(|l| std::path::Path::new(l.trim()) == dir.path()
-            || std::path::Path::new(l.trim()) == dir.path().canonicalize().unwrap()),
+        body.lines()
+            .any(|l| std::path::Path::new(l.trim()) == dir.path()
+                || std::path::Path::new(l.trim()) == dir.path().canonicalize().unwrap()),
         "registry should contain the repo, got: {body}"
     );
 
@@ -582,8 +594,15 @@ async fn done_move_endpoint_moves_plan_file() {
         .send()
         .await
         .unwrap();
+    let status = resp.status();
+    let response_body: serde_json::Value = resp.json().await.unwrap();
     handle.abort();
-    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    assert_eq!(status, reqwest::StatusCode::OK);
+    assert_eq!(response_body["ok"], true);
+    assert_eq!(
+        response_body["new_plan_path"], ".trinity/plans/done/foo.md",
+        "response should advertise the new path"
+    );
     assert!(
         !dir.path().join(".trinity/plans/foo.md").exists(),
         "active path should be gone"

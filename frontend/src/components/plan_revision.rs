@@ -4,6 +4,7 @@ use leptos_router::hooks::use_params_map;
 use crate::api::{PlanRevisionPage, fetch_plan_revision};
 use crate::components::feedback_card::FeedbackCard;
 use crate::store::EventStore;
+use crate::util::short_sha;
 
 #[component]
 pub fn PlanRevision() -> impl IntoView {
@@ -40,15 +41,12 @@ fn revision_view(page: PlanRevisionPage) -> impl IntoView {
     let back_href = format!("/sessions/{session_id}");
     let short = short_sha(&page.commit_sha);
     let title = format!("Plan @ {short}");
-    let prev_link = nav_link(
+    let prev_link = nav_link(&page.session_id, page.previous_sha.as_deref(), "← previous");
+    let next_link = nav_link(&page.session_id, page.next_sha.as_deref(), "next →");
+    let compare_link = compare_link(
         &page.session_id,
+        &page.commit_sha,
         page.previous_sha.as_deref(),
-        "← previous",
-    );
-    let next_link = nav_link(
-        &page.session_id,
-        page.next_sha.as_deref(),
-        "next →",
     );
     let body_html = page.body_html.clone();
     let feedback_section = if page.feedback.is_empty() {
@@ -72,10 +70,25 @@ fn revision_view(page: PlanRevisionPage) -> impl IntoView {
                 <a href=back_href class="back-link">"← session"</a>
                 <h1>{title}</h1>
             </header>
-            <nav class="revision-nav">{prev_link}{next_link}</nav>
+            <nav class="revision-nav">{prev_link}{next_link}{compare_link}</nav>
             <section class="plan-body prose" inner_html=body_html></section>
             {feedback_section}
         </article>
+    }
+}
+
+fn compare_link(session_id: &str, this_sha: &str, previous_sha: Option<&str>) -> AnyView {
+    match previous_sha {
+        Some(prev) if !prev.is_empty() => {
+            let href = format!("/sessions/{session_id}/plan/{this_sha}/diff?vs={prev}");
+            view! {
+                <a href=href class="revision-nav-link">
+                    "diff vs previous"
+                </a>
+            }
+            .into_any()
+        }
+        _ => ().into_any(),
     }
 }
 
@@ -91,13 +104,5 @@ fn nav_link(session_id: &str, sha: Option<&str>, label: &'static str) -> AnyView
             .into_any()
         }
         _ => view! { <span class="revision-nav-link muted">{label}</span> }.into_any(),
-    }
-}
-
-fn short_sha(sha: &str) -> String {
-    if sha.len() > 8 {
-        sha[..8].to_string()
-    } else {
-        sha.to_string()
     }
 }

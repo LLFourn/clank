@@ -30,12 +30,29 @@ pub fn PrHintCard(hint: PrHint) -> impl IntoView {
 #[component]
 fn PrHintOptionRow(option: PrHintOption) -> impl IntoView {
     let label = label_for(&option.name);
-    let command_for_button = option.command.clone();
     let command_for_view = option.command.clone();
-    let copied = RwSignal::new(false);
+    let command_for_button = option.command.clone();
+    // Tri-state so the user knows whether the browser actually accepted
+    // the clipboard write (HTTPS contexts, focus, permissions all gate
+    // navigator.clipboard).
+    let state: RwSignal<CopyState> = RwSignal::new(CopyState::Idle);
     let on_click = move |_| {
-        copy_to_clipboard(&command_for_button);
-        copied.set(true);
+        let text = command_for_button.clone();
+        wasm_bindgen_futures::spawn_local(async move {
+            match copy_to_clipboard(&text).await {
+                Ok(()) => state.set(CopyState::Copied),
+                Err(()) => state.set(CopyState::Failed),
+            }
+        });
+    };
+    let button_label = move || match state.get() {
+        CopyState::Idle => "Copy",
+        CopyState::Copied => "Copied ✓",
+        CopyState::Failed => "Copy failed",
+    };
+    let button_class = move || match state.get() {
+        CopyState::Failed => "copy-button copy-button-failed",
+        _ => "copy-button",
     };
     view! {
         <li class="pr-hint-option">
@@ -43,11 +60,18 @@ fn PrHintOptionRow(option: PrHintOption) -> impl IntoView {
             <pre class="pr-hint-command">
                 <code>{command_for_view}</code>
             </pre>
-            <button class="copy-button" type="button" on:click=on_click>
-                {move || if copied.get() { "Copied ✓" } else { "Copy" }}
+            <button class=button_class type="button" on:click=on_click>
+                {button_label}
             </button>
         </li>
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CopyState {
+    Idle,
+    Copied,
+    Failed,
 }
 
 fn label_for(name: &str) -> &'static str {
@@ -58,16 +82,14 @@ fn label_for(name: &str) -> &'static str {
     }
 }
 
-/// Best-effort write to `navigator.clipboard`. Returns silently on any
-/// browser-side error (clipboard permission denied, http context, etc.).
-fn copy_to_clipboard(text: &str) {
-    let Some(window) = web_sys::window() else { return };
+/// Resolve once `navigator.clipboard.writeText` finishes, so the UI's
+/// "Copied ✓" / "Copy failed" state reflects the browser's actual
+/// answer rather than optimistic success.
+async fn copy_to_clipboard(text: &str) -> Result<(), ()> {
+    let Some(window) = web_sys::window() else {
+        return Err(());
+    };
     let clipboard = window.navigator().clipboard();
     let promise = clipboard.write_text(text);
-    // Drive the promise to completion in the background; we don't wait
-    // on it (the visible "Copied ✓" state has already been set by the
-    // caller via a signal toggle).
-    wasm_bindgen_futures::spawn_local(async move {
-        let _ = JsFuture::from(promise).await;
-    });
+    JsFuture::from(promise).await.map(|_| ()).map_err(|_| ())
 }

@@ -43,54 +43,62 @@ pub fn Home() -> impl IntoView {
 
 #[component]
 fn ActivitySidebar(store: EventStore) -> impl IntoView {
+    // `<For>` with a stable key so only newly-prepended rows animate
+    // their accent pulse. Without this, every event re-creates every
+    // <li> as a fresh DOM node and the whole sidebar flashes.
     view! {
         <aside class="activity-sidebar">
             <h3>"Recent activity"</h3>
-            <ol class="activity-list">
-                {move || {
-                    store
-                        .recent
-                        .with(|events| {
-                            if events.is_empty() {
-                                view! {
-                                    <li class="muted activity-empty">
-                                        "Waiting for live events…"
-                                    </li>
-                                }
-                                    .into_any()
-                            } else {
-                                events
-                                    .iter()
-                                    .take(20)
-                                    .map(|e| {
-                                        let session = e
-                                            .session_id
-                                            .clone()
-                                            .unwrap_or_else(|| "—".to_string());
-                                        let kind = e.kind.clone();
-                                        let kind_class = format!("activity-kind activity-{kind}");
-                                        let href = e
-                                            .session_id
-                                            .as_ref()
-                                            .map(|s| format!("/sessions/{s}"))
-                                            .unwrap_or_else(|| "#".to_string());
-                                        view! {
-                                            <li class="activity-row">
-                                                <span class=kind_class>{kind}</span>
-                                                <a href=href class="activity-session">
-                                                    {session}
-                                                </a>
-                                            </li>
-                                        }
-                                    })
-                                    .collect_view()
-                                    .into_any()
+            <Show
+                when=move || !store.recent.with(|v| v.is_empty())
+                fallback=|| {
+                    view! { <p class="muted activity-empty">"Waiting for live events…"</p> }
+                }
+            >
+                <ol class="activity-list">
+                    <For
+                        each=move || {
+                            store.recent.get().into_iter().take(20).enumerate().collect::<Vec<_>>()
+                        }
+                        key=|(_, e)| activity_key(e)
+                        children=move |(_, e)| {
+                            let session = e
+                                .session_id
+                                .clone()
+                                .unwrap_or_else(|| "—".to_string());
+                            let kind = e.kind.clone();
+                            let kind_class = format!("activity-kind activity-{kind}");
+                            let href = e
+                                .session_id
+                                .as_ref()
+                                .map(|s| format!("/sessions/{s}"))
+                                .unwrap_or_else(|| "#".to_string());
+                            view! {
+                                <li class="activity-row">
+                                    <span class=kind_class>{kind}</span>
+                                    <a href=href class="activity-session">
+                                        {session}
+                                    </a>
+                                </li>
                             }
-                        })
-                }}
-            </ol>
+                        }
+                    />
+                </ol>
+            </Show>
         </aside>
     }
+}
+
+fn activity_key(e: &crate::store::LiveEvent) -> String {
+    // ts + kind + session_id is unique-enough across the rolling
+    // 50-entry window; same ts+kind would only collide on duplicate
+    // broadcasts, which we'd want to dedupe visually anyway.
+    format!(
+        "{}:{}:{}",
+        e.ts,
+        e.kind,
+        e.session_id.as_deref().unwrap_or("-")
+    )
 }
 
 fn session_table(rows: Vec<SessionRow>) -> impl IntoView {

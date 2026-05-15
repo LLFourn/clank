@@ -5,6 +5,7 @@ use leptos_router::path;
 mod api;
 mod components;
 mod store;
+mod util;
 
 use store::{EventStore, connect_sse};
 
@@ -60,8 +61,16 @@ fn MuteToggle() -> impl IntoView {
             "Live-event chime is on — click to mute"
         }
     };
+    let aria_pressed = move || if store.muted.get() { "true" } else { "false" };
     view! {
-        <button class="mute-toggle" type="button" on:click=on_click title=title>
+        <button
+            class="mute-toggle"
+            type="button"
+            on:click=on_click
+            title=title
+            aria-label="Toggle live-event chime"
+            aria-pressed=aria_pressed
+        >
             {label}
         </button>
     }

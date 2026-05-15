@@ -4,6 +4,7 @@ use leptos_router::hooks::{use_params_map, use_query_map};
 use crate::api::{DiffPage, fetch_diff, fetch_session};
 use crate::components::structured_diff::StructuredDiff;
 use crate::store::EventStore;
+use crate::util::short_sha;
 
 /// `/sessions/:session_id/plan/:sha/diff?vs=:other` — compare two plan
 /// revisions of the same session. We resolve the plan_path via a
@@ -63,13 +64,5 @@ fn diff_view(page: DiffPage) -> impl IntoView {
             </header>
             <StructuredDiff files=page.diff_files/>
         </article>
-    }
-}
-
-fn short_sha(sha: &str) -> String {
-    if sha.len() > 8 {
-        sha[..8].to_string()
-    } else {
-        sha.to_string()
     }
 }

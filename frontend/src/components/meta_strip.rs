@@ -1,6 +1,8 @@
 use leptos::prelude::*;
 
-use crate::api::{ReviewGate, SessionDetail};
+use crate::api::{ReviewGate, SessionDetail, post_move_to_done};
+use crate::store::EventStore;
+use crate::util::short_sha;
 
 /// Sidebar block: phase / worktree-status / plan path / latest revisions
 /// / review-gate chips. The compact "everything-at-a-glance" header for
@@ -75,28 +77,79 @@ pub fn MetaStrip(session: SessionDetail) -> impl IntoView {
                 </dd>
             </dl>
             {session.review_gate.map(|gate| view! { <ReviewGateChips gate=gate/> })}
+            {move_to_done_button(
+                &session.session_id,
+                &session.repo,
+                &session.waiting_on.reason,
+            )}
         </section>
     }
+}
+
+/// Render the "Move plan to done/" action only when the master is in
+/// the `ready_to_finish` state. Posts to `/api/sessions/:id/done` and
+/// nudges the global event tick so the open page re-fetches its own
+/// state (the watcher will also fire a `repo_rebuilt` event shortly,
+/// but the local nudge avoids a perceptible delay).
+fn move_to_done_button(session_id: &str, repo: &str, reason: &str) -> AnyView {
+    if reason != "ready_to_finish" {
+        return ().into_any();
+    }
+    let store = expect_context::<EventStore>();
+    let session_id = session_id.to_string();
+    let repo = repo.to_string();
+    let status: RwSignal<DoneButtonState> = RwSignal::new(DoneButtonState::Idle);
+    let on_click = move |_| {
+        let sid = session_id.clone();
+        let repo = repo.clone();
+        status.set(DoneButtonState::Pending);
+        wasm_bindgen_futures::spawn_local(async move {
+            match post_move_to_done(sid, repo).await {
+                Ok(_) => {
+                    status.set(DoneButtonState::Done);
+                    store.tick.update(|t| *t = t.wrapping_add(1));
+                }
+                Err(e) => status.set(DoneButtonState::Failed(e.to_string())),
+            }
+        });
+    };
+    let label = move || match status.get() {
+        DoneButtonState::Idle => "Move plan to done/".to_string(),
+        DoneButtonState::Pending => "Moving…".to_string(),
+        DoneButtonState::Done => "Moved ✓".to_string(),
+        DoneButtonState::Failed(msg) => format!("Failed: {msg}"),
+    };
+    let disabled = move || {
+        matches!(
+            status.get(),
+            DoneButtonState::Pending | DoneButtonState::Done
+        )
+    };
+    view! {
+        <div class="meta-actions">
+            <button class="primary-button" type="button" on:click=on_click prop:disabled=disabled>
+                {label}
+            </button>
+        </div>
+    }
+    .into_any()
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum DoneButtonState {
+    Idle,
+    Pending,
+    Done,
+    Failed(String),
 }
 
 #[component]
 fn ReviewGateChips(gate: ReviewGate) -> impl IntoView {
     let state_class = format!("gate-state gate-state-{}", gate.state);
-    let approvals_chip = chip_view(
-        "approvals",
-        &gate.approvals,
-        "approve",
-    );
-    let request_changes_chip = chip_view(
-        "request_changes",
-        &gate.request_changes,
-        "request-changes",
-    );
-    let missing_chip = chip_view(
-        "missing",
-        &gate.missing_approvals,
-        "pending",
-    );
+    let approvals_chip = chip_view("approvals", &gate.approvals, "approve");
+    let request_changes_chip =
+        chip_view("request_changes", &gate.request_changes, "request-changes");
+    let missing_chip = chip_view("missing", &gate.missing_approvals, "pending");
     view! {
         <div class="review-gate">
             <div class="gate-header">
@@ -122,12 +175,4 @@ fn chip_view(label: &str, agents: &[String], kind: &str) -> AnyView {
         </span>
     }
     .into_any()
-}
-
-fn short_sha(sha: &str) -> String {
-    if sha.len() > 8 {
-        sha[..8].to_string()
-    } else {
-        sha.to_string()
-    }
 }

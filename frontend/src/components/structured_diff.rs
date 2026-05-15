@@ -104,14 +104,8 @@ fn HunkBlock(hunk: DiffHunk) -> impl IntoView {
 #[component]
 fn DiffLineRow(line: DiffLine) -> impl IntoView {
     let row_class = format!("diff-line diff-line-{}", line.kind);
-    let old_no = line
-        .old_lineno
-        .map(|n| n.to_string())
-        .unwrap_or_default();
-    let new_no = line
-        .new_lineno
-        .map(|n| n.to_string())
-        .unwrap_or_default();
+    let old_no = line.old_lineno.map(|n| n.to_string()).unwrap_or_default();
+    let new_no = line.new_lineno.map(|n| n.to_string()).unwrap_or_default();
     let marker = match line.kind.as_str() {
         "insert" => "+",
         "delete" => "-",
@@ -143,12 +137,6 @@ fn mode_chip(mode: &str) -> (&'static str, &'static str) {
 /// non-alphanumeric chars with `-`.
 fn slug(s: &str) -> String {
     s.chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() {
-                c
-            } else {
-                '-'
-            }
-        })
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
         .collect()
 }

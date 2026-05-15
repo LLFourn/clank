@@ -1,25 +1,51 @@
 use leptos::prelude::*;
 
 use crate::api::TimelineEvent;
+use crate::util::short_sha;
 
 /// Chronological event list for one session. Each event is one row with
 /// a phase-aware marker on the left, kind / SHA / verdict in the middle,
 /// and (for reviews) the author on the right.
+///
+/// Rendered through `<For key=...>` so SSE-driven re-fetches diff against
+/// the existing DOM instead of replacing every row — that keeps the
+/// "pulse on insertion" CSS animation from firing on rows that didn't
+/// actually change.
 #[component]
 pub fn Timeline(events: Vec<TimelineEvent>) -> impl IntoView {
     if events.is_empty() {
         return view! { <p class="muted">"No activity yet."</p> }.into_any();
     }
-    let rows = events
-        .into_iter()
-        .map(|e| view! { <TimelineRow event=e/> })
-        .collect_view();
     view! {
         <ol class="timeline">
-            {rows}
+            <For
+                each=move || events.clone().into_iter().enumerate()
+                key=|(idx, e)| timeline_key(*idx, e)
+                children=move |(_, e)| view! { <TimelineRow event=e/> }
+            />
         </ol>
     }
     .into_any()
+}
+
+/// Stable per-row key. The index is included as a tiebreaker because the
+/// same `(target, author, verdict)` can appear in multiple positions
+/// across phases. For commit rows the SHA alone is unique.
+fn timeline_key(idx: usize, e: &TimelineEvent) -> String {
+    match e {
+        TimelineEvent::CommitPlan { sha, .. }
+        | TimelineEvent::CommitImpl { sha, .. }
+        | TimelineEvent::CommitMixed { sha, .. } => format!("commit:{sha}"),
+        TimelineEvent::Review {
+            target,
+            author,
+            phase,
+            ..
+        } => format!("review:{phase}:{target}:{author}"),
+        TimelineEvent::HeldFeedback { author, reason, .. } => {
+            format!("held:{idx}:{author}:{reason}")
+        }
+    }
 }
 
 #[component]
@@ -101,14 +127,6 @@ fn TimelineRow(event: TimelineEvent) -> impl IntoView {
             }
             .into_any()
         }
-    }
-}
-
-fn short_sha(sha: &str) -> String {
-    if sha.len() > 8 {
-        sha[..8].to_string()
-    } else {
-        sha.to_string()
     }
 }
 

@@ -36,7 +36,6 @@ pub fn router(state: AppState) -> Router {
         // owns those paths via the fallback; the done action moves
         // under /api as a structured POST.
         .route("/events", get(home_events_stream))
-        .route("/sessions/{session_id}/events", get(session_events_stream))
         .route("/internal/tools", get(list_tools))
         .route("/internal/tool_call", post(call_tool))
         .route("/api/wait_for_work", post(api_wait_for_work))
@@ -104,14 +103,7 @@ struct RepoQuery {
 async fn home_events_stream(
     State(state): State<AppState>,
 ) -> Sse<impl Stream<Item = Result<sse::Event, std::convert::Infallible>>> {
-    Sse::new(event_stream(state, None).await).keep_alive(sse::KeepAlive::default())
-}
-
-async fn session_events_stream(
-    State(state): State<AppState>,
-    Path(session_id): Path<String>,
-) -> Sse<impl Stream<Item = Result<sse::Event, std::convert::Infallible>>> {
-    Sse::new(event_stream(state, Some(session_id)).await).keep_alive(sse::KeepAlive::default())
+    Sse::new(event_stream(state).await).keep_alive(sse::KeepAlive::default())
 }
 
 /// Push-driven SSE: forwards new events from the broadcast channel.
@@ -121,11 +113,8 @@ async fn session_events_stream(
 /// causing a refresh loop. The ring buffer is kept for diagnostic /
 /// future-API consumers; SSE only carries live events from the moment of
 /// subscribe forward.
-///
-/// `session_filter` (when `Some`) drops events that aren't for that session.
 async fn event_stream(
     state: AppState,
-    session_filter: Option<String>,
 ) -> impl Stream<Item = Result<sse::Event, std::convert::Infallible>> {
     use futures::stream::StreamExt;
 
@@ -133,24 +122,15 @@ async fn event_stream(
     let live_stream =
         tokio_stream::wrappers::BroadcastStream::new(rx).filter_map(|r| async move { r.ok() });
 
-    let combined = live_stream.filter_map(move |e| {
-        let session_filter = session_filter.clone();
-        async move {
-            if let Some(sid_filter) = session_filter
-                && let Some(ref event_sid) = e.session_id
-                && event_sid.as_str() != sid_filter
-            {
-                return None;
-            }
-            let payload = json!({
-                "ts": e.ts,
-                "repo": e.repo.to_string_lossy(),
-                "session_id": e.session_id.as_ref().map(|s| s.as_str()),
-                "kind": e.kind,
-                "payload": e.payload,
-            });
-            Some(Ok(sse::Event::default().data(payload.to_string())))
-        }
+    let combined = live_stream.map(|e| {
+        let payload = json!({
+            "ts": e.ts,
+            "repo": e.repo.to_string_lossy(),
+            "session_id": e.session_id.as_ref().map(|s| s.as_str()),
+            "kind": e.kind,
+            "payload": e.payload,
+        });
+        Ok(sse::Event::default().data(payload.to_string()))
     });
 
     Box::pin(combined)
@@ -321,9 +301,7 @@ async fn api_plan_revision(
             .checked_sub(1)
             .and_then(|j| plan_revisions.get(j))
             .map(|c| c.as_str().to_string());
-        let next_sha = plan_revisions
-            .get(pos + 1)
-            .map(|c| c.as_str().to_string());
+        let next_sha = plan_revisions.get(pos + 1).map(|c| c.as_str().to_string());
 
         let feedback = crate::ui_response::feedback_for_target(&snapshot.session, &commit_sha);
         return Ok(axum::Json(json!({

@@ -1,6 +1,7 @@
 use leptos::prelude::*;
 
 use crate::api::{FeedbackEntry, HeldFeedbackEntry};
+use crate::util::short_sha;
 
 /// Single feedback file as a card. Verdict pill on the left, author +
 /// timestamp + target SHA in the header, sanitized markdown body below.
@@ -56,14 +57,6 @@ fn verdict_label(verdict: &str) -> &'static str {
         "approve" => "APPROVE",
         "request_changes" => "REQUEST_CHANGES",
         _ => "UNMARKED",
-    }
-}
-
-fn short_sha(sha: &str) -> String {
-    if sha.len() > 8 {
-        sha[..8].to_string()
-    } else {
-        sha.to_string()
     }
 }
 

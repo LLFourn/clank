@@ -2,6 +2,15 @@
 //!
 //! Shapes deliberately mirror what `src/ui_response.rs` produces on the
 //! daemon side. When changing one, update the other.
+//!
+//! Several structs carry `#[allow(dead_code)]` because the SPA does not
+//! consume every JSON field yet (e.g. `expected_action`,
+//! `implementation_commits`, `plan_intro`). The allow is intentional and
+//! per-struct: we want the type to round-trip the full contract so a
+//! future component is a UI-only change rather than a coordinated
+//! daemon+SPA edit. When you add a real consumer for a field, the
+//! struct's allow shrinks naturally — the compiler stops warning about
+//! that struct entirely once every field has a use site.
 
 use serde::Deserialize;
 
@@ -315,20 +324,43 @@ pub struct DiffPage {
     pub diff_files: Vec<FileDiff>,
 }
 
-pub async fn fetch_diff(
-    from: String,
-    to: String,
-    path: String,
-) -> Result<DiffPage, FetchError> {
-    let mut params = String::new();
-    params.push_str("from=");
-    params.push_str(&urlencode(&from));
-    params.push_str("&to=");
-    params.push_str(&urlencode(&to));
-    params.push_str("&path=");
-    params.push_str(&urlencode(&path));
-    let url = format!("/api/diff?{params}");
-    let resp = gloo_net::http::Request::get(&url)
+#[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)]
+pub struct DoneResponse {
+    pub ok: bool,
+    pub new_plan_path: String,
+}
+
+/// `POST /api/sessions/:id/done` — moves the active plan file under
+/// `.trinity/plans/done/`. Returns the new repo-relative path on
+/// success.
+pub async fn post_move_to_done(
+    session_id: String,
+    repo: String,
+) -> Result<DoneResponse, FetchError> {
+    let url = format!("/api/sessions/{session_id}/done");
+    let resp = gloo_net::http::Request::post(&url)
+        .header("content-type", "application/json")
+        .body(serde_json::json!({ "repo": repo }).to_string())
+        .map_err(|e| FetchError::Network(e.to_string()))?
+        .send()
+        .await
+        .map_err(|e| FetchError::Network(e.to_string()))?;
+    if !resp.ok() {
+        return Err(FetchError::Status(resp.status()));
+    }
+    resp.json::<DoneResponse>()
+        .await
+        .map_err(|e| FetchError::Decode(e.to_string()))
+}
+
+pub async fn fetch_diff(from: String, to: String, path: String) -> Result<DiffPage, FetchError> {
+    let resp = gloo_net::http::Request::get("/api/diff")
+        .query([
+            ("from", from.as_str()),
+            ("to", to.as_str()),
+            ("path", path.as_str()),
+        ])
         .send()
         .await
         .map_err(|e| FetchError::Network(e.to_string()))?;
@@ -338,18 +370,4 @@ pub async fn fetch_diff(
     resp.json::<DiffPage>()
         .await
         .map_err(|e| FetchError::Decode(e.to_string()))
-}
-
-/// Minimal percent-encoder for query-string segments. Avoids pulling in
-/// a whole url crate just for this.
-fn urlencode(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for b in s.bytes() {
-        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'~') {
-            out.push(b as char);
-        } else {
-            out.push_str(&format!("%{b:02X}"));
-        }
-    }
-    out
 }

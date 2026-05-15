@@ -389,6 +389,16 @@ Five commits, each green-buildable, each landing a usable slice.
 - The `EventStore` should expose typed accessors: `store.last_for_session(id) -> Memo<Option<LiveEvent>>`, so components don't reach into raw signal state.
 - CSS lives in one file (`frontend/style.css`); no CSS-in-Rust, no styled-components analog. Discipline beats tooling.
 
+## Deferred from the initial implementation
+
+All five phases shipped, but a handful of plan items did not make it into the initial impl chain. They are intentional gaps, tracked here so the next reviewer / implementer doesn't think the plan is fully delivered:
+
+- **Self-hosted fonts.** Fraunces / General Sans / JetBrains Mono are referenced as aspirational; `frontend/style.css` falls back to system fonts. Vendoring the woff2 binaries under `frontend/public/fonts/` (~500KB) + adding `@font-face` declarations is a mechanical follow-up. Auto-mode blocked the CDN download during initial impl.
+- **Scroll-aware sticky header chip.** Section "Layout" promises the header shows the session id + waiting chip once scrolled past 100px. Phase 5 ships only the static sticky behaviour; the on-scroll chip swap is unwritten.
+- **Active vs done split on the homepage.** Section "Component model" describes two `<SessionTable/>` blocks (active above, done collapsed below). Phase 1 / 2 ship a single table that includes done sessions inline.
+- **`?repo=` multi-repo URL plumbing.** Section "Multi-repo identity" specifies that every route emits `?repo=<encoded path>` so multi-repo deployments deep-link cleanly. The current implementation drops `repo` from frontend URLs (the API still accepts it; the homepage falls back to "all watched repos"). Single-repo deployments aren't affected. Re-instate when a second watched repo regularly hosts a same-named session.
+- **SSE reconnect backoff.** The plan's Risks section called this out; the current `connect_sse` relies on the browser's default reconnect behaviour. For a daemon-restart flurry that's fine; under sustained outages it can hammer. Add explicit exponential backoff if it surfaces.
+
 ## Open questions
 
 - **Path of `index.html` in dev vs prod.** Trunk serves `dist/index.html` on its own port during dev; daemon serves the same file from `/` in prod. Need to configure CORS or a trunk proxy for dev → daemon API calls.

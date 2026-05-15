@@ -5,6 +5,7 @@ use crate::api::{CommitDiffPage, fetch_commit_diff};
 use crate::components::feedback_card::FeedbackCard;
 use crate::components::structured_diff::StructuredDiff;
 use crate::store::EventStore;
+use crate::util::short_sha;
 
 #[component]
 pub fn CommitDiff() -> impl IntoView {
@@ -65,13 +66,5 @@ fn commit_view(page: CommitDiffPage) -> impl IntoView {
             <StructuredDiff files=page.diff_files/>
             {feedback_section}
         </article>
-    }
-}
-
-fn short_sha(sha: &str) -> String {
-    if sha.len() > 8 {
-        sha[..8].to_string()
-    } else {
-        sha.to_string()
     }
 }

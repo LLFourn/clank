@@ -63,10 +63,16 @@ impl EventStore {
         });
     }
 
+    /// Toggle mute and use the click as a user gesture to unlock the
+    /// shared `AudioContext` (browsers gate audio playback on a gesture
+    /// — the very first chime after page load otherwise has no audio).
     pub fn toggle_mute(&self) {
         let new_value = !self.muted.get_untracked();
         self.muted.set(new_value);
         write_persisted_mute(new_value);
+        if !new_value {
+            resume_audio_ctx();
+        }
     }
 }
 
@@ -111,39 +117,73 @@ pub fn connect_sse(store: EventStore) {
     Box::leak(Box::new(es));
 }
 
+// Browsers cap concurrent AudioContexts (~6 per tab) and require a
+// user gesture before audio can play. Keep a single context, lazy-init
+// on first chime, and resume() it whenever the mute toggle is clicked
+// (a real user gesture) so subsequent chimes audible.
+thread_local! {
+    static AUDIO_CTX: std::cell::RefCell<Option<web_sys::AudioContext>>
+        = const { std::cell::RefCell::new(None) };
+}
+
+fn with_audio_ctx<F>(f: F)
+where
+    F: FnOnce(&web_sys::AudioContext),
+{
+    AUDIO_CTX.with(|cell| {
+        let mut slot = cell.borrow_mut();
+        if slot.is_none() {
+            match web_sys::AudioContext::new() {
+                Ok(ctx) => *slot = Some(ctx),
+                Err(_) => return,
+            }
+        }
+        if let Some(ctx) = slot.as_ref() {
+            f(ctx);
+        }
+    });
+}
+
+/// Resume the shared AudioContext. Call from a real user-gesture
+/// handler (mute toggle click) so the browser permits audio playback.
+fn resume_audio_ctx() {
+    with_audio_ctx(|ctx| {
+        let _ = ctx.resume();
+    });
+}
+
 /// Short sine-wave ping at 880Hz with a quick attack/decay envelope.
-/// Fire-and-forget — failures (no AudioContext support, autoplay block)
-/// are silently swallowed.
+/// Fire-and-forget — failures (no AudioContext support, autoplay block
+/// before the first user gesture) are silently swallowed. Reuses one
+/// AudioContext across the tab's lifetime.
 fn chime() {
-    let ctx = match web_sys::AudioContext::new() {
-        Ok(ctx) => ctx,
-        Err(_) => return,
-    };
+    let _ = try_chime();
+}
+
+fn try_chime() -> Result<(), wasm_bindgen::JsValue> {
+    let mut result: Result<(), wasm_bindgen::JsValue> = Ok(());
+    with_audio_ctx(|ctx| {
+        result = chime_with(ctx);
+    });
+    result
+}
+
+fn chime_with(ctx: &web_sys::AudioContext) -> Result<(), wasm_bindgen::JsValue> {
     let t = ctx.current_time();
-    let Ok(osc) = ctx.create_oscillator() else {
-        return;
-    };
-    let Ok(gain) = ctx.create_gain() else { return };
+    let osc = ctx.create_oscillator()?;
+    let gain = ctx.create_gain()?;
     osc.set_type(web_sys::OscillatorType::Sine);
-    let _ = osc.frequency().set_value_at_time(880.0, t);
-    let _ = gain.gain().set_value_at_time(0.0001, t);
-    let _ = gain
-        .gain()
-        .exponential_ramp_to_value_at_time(0.10, t + 0.01);
-    let _ = gain
-        .gain()
-        .exponential_ramp_to_value_at_time(0.0001, t + 0.15);
-    if osc.connect_with_audio_node(&gain).is_err() {
-        return;
-    }
-    if gain
-        .connect_with_audio_node(&ctx.destination())
-        .is_err()
-    {
-        return;
-    }
-    let _ = osc.start_with_when(t);
-    let _ = osc.stop_with_when(t + 0.18);
+    osc.frequency().set_value_at_time(880.0, t)?;
+    gain.gain().set_value_at_time(0.0001, t)?;
+    gain.gain()
+        .exponential_ramp_to_value_at_time(0.10, t + 0.01)?;
+    gain.gain()
+        .exponential_ramp_to_value_at_time(0.0001, t + 0.15)?;
+    osc.connect_with_audio_node(&gain)?;
+    gain.connect_with_audio_node(&ctx.destination())?;
+    osc.start_with_when(t)?;
+    osc.stop_with_when(t + 0.18)?;
+    Ok(())
 }
 
 fn performance_now() -> f64 {
