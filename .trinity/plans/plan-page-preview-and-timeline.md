@@ -166,8 +166,11 @@ section moves further down the page and behaves as it does today
 (all cards, all phases, chronological).
 
 The "latest review" card matches the existing `FeedbackCard` styling.
-No new component needed; just `feedback.first()` after sorting by
-`(target_sha == review_target.commit_sha, created_at desc)`.
+Selection is **filter then pick**: drop every entry whose
+`target_sha != review_target.commit_sha`, then take the newest of
+what remains. If filtering empties the list, render "No reviews yet"
+— a stale review against an old revision must not surface as the
+current one.
 
 ### Timeline rows
 
@@ -376,9 +379,29 @@ New endpoint family: `/api/repos`.
      `AppState.watchers` / `AppState.watched_repos`. The handles
      are `JoinHandle`s today; aborting + awaiting is the cleanup
      contract.
-  5. Rewrite `~/.trinity/repos` without this path.
+  5. Rewrite the configured repos file (see below) without this
+     path.
   6. Push a `repo_unwatched` `LiveEvent` so the SPA's
      `EventStore.tick` fires and the homepage refetches.
+
+**Registry path threading.** Today `ServeArgs.repos`
+(`--repos` / `$TRINITY_REPOS`, default `~/.trinity/repos`) drives
+the read at startup, but `persist_repo_in_registry` in
+`src/server/mcp.rs:368` hardcodes `~/.trinity/repos` for writes. So
+a daemon launched with a non-default registry already loses new
+`start_plan` registrations to the wrong file on restart; this plan
+just inherits the problem and adds a second writer (DELETE).
+
+Fix both at once: stash the expanded `repos_path: PathBuf` on
+`AppState` and have `persist_repo_in_registry` and the new
+`remove_repo_from_registry` both take it as a parameter (or as a
+method on a small `RegistryFile` newtype). The existing
+`start_plan` test that asserts `~/.trinity/repos` content already
+sets `$HOME` to a tempdir — it keeps passing because the default
+expansion still points there. A new test spawns the daemon with
+an explicit `--repos /tmp/xxx/custom-registry` and asserts both
+`start_plan` and the new DELETE write to that path, not to
+`~/.trinity/repos`.
 
 The watcher-handle bookkeeping is the only non-trivial piece. Today
 `AppState` has `watchers: Mutex<Vec<JoinHandle<()>>>` and
@@ -493,9 +516,15 @@ Files: `src/runtime.rs`, `src/server/mod.rs`, `src/server/http.rs`,
 - `Runtime::remove_repo(canonical) -> Result<RemoveOutcome, _>`
   drops the repo from `Trinity.repos` + `Trinity.repo_basenames`
   under one lock. Returns `Removed { plan_count }` or `NotPresent`.
-- `~/.trinity/repos` rewrite helper in `src/server/mcp.rs` (today
-  the `persist_repo_in_registry` function lives there). Add a
-  matching `remove_repo_from_registry(&Path)`.
+- `AppState` gains `repos_path: PathBuf` (the expanded
+  `args.repos`). Plumb it from `serve()` through
+  `AppState::new`.
+- `persist_repo_in_registry` becomes
+  `persist_repo_in_registry(registry: &Path, repo: &Path)` and
+  every caller passes `state.repos_path`. The `~/.trinity/repos`
+  hardcode goes away.
+- New `remove_repo_from_registry(registry: &Path, repo: &Path)`
+  helper in the same module, same signature shape.
 - `LiveEvent` gets a `repo_unwatched` kind; emit it from the
   remove path so SSE subscribers refetch.
 - `GET /api/repos` and `DELETE /api/repos/{basename}` handlers in
@@ -507,9 +536,14 @@ Files: `src/runtime.rs`, `src/server/mod.rs`, `src/server/http.rs`,
     `/api/repos` returns both with plan counts.
   - `delete_repo_removes_from_state_and_registry`: register repo,
     DELETE, verify subsequent `/api/plans` doesn't list its plans
-    and `~/.trinity/repos` doesn't contain the path.
+    and the configured repos file doesn't contain the path.
   - `delete_repo_404_on_unknown_basename`: DELETE against unknown
     basename returns 404.
+  - `registry_path_threads_through_start_plan_and_delete`: spawn
+    daemon with `--repos /tmp/xxx/custom-registry` (not the
+    `~/.trinity/repos` default), run `start_plan` then DELETE the
+    same repo, assert both touched the custom registry and
+    `~/.trinity/repos` is unchanged.
 
 No frontend changes in this phase either; tests verify the
 endpoints in isolation.
