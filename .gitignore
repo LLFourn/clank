@@ -4,3 +4,6 @@
 
 # Leptos frontend build output (trunk).
 /frontend/dist/
+
+# Claude Code agent state (machine-local).
+/.claude/
