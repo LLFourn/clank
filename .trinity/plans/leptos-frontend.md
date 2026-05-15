@@ -205,18 +205,29 @@ This means:
 
 The slimming of `get_context` is a separate small plan/commit — flagged here so the Leptos work doesn't accidentally re-couple to it.
 
+## Prerequisite primitives (already landed in `runtime-lock-boundaries`)
+
+`9c40457` (Implement runtime lock boundary snapshots) shipped the building blocks this plan depends on. Use them as the foundation; do not duplicate or work around them:
+
+- **`Runtime::snapshot_repo(repo) -> Result<RepoSnapshot, _>`** — clones an owned repo snapshot under the runtime mutex; caller does disk/git I/O after the lock is released.
+- **`Runtime::snapshot_session(repo, sid) -> Result<Option<SessionSnapshotBundle>, _>`** — same shape for one session plus the repo-level indexes its projections need. `Ok(None)` means the session is not committed; map to 404.
+- **`RepoSnapshot` / `SessionSnapshot` / `SessionSnapshotBundle`** (`src/runtime_snapshot.rs`) — owned mirrors of the runtime state. `SessionSnapshot` includes `body` so the UI session detail can render the plan content without a separate fetch.
+- **`PlanStatusReader` trait + `DiskPlanStatusReader`** (`src/mcp_response.rs`) — abstraction over the one disk read needed for `plan_worktree_status`. UI builders that need worktree status take a `&impl PlanStatusReader` parameter so tests can drop in a fake/blocking reader; production wires `DiskPlanStatusReader`.
+
+The new `ui_response::*` builders consume snapshots directly. They do NOT call `snapshot.to_repo_state()` to round-trip back into `RepoState` — that pattern exists in `mcp_response.rs` only because rewriting the projection helpers' `&RepoState` signatures was out of scope for the lock-boundary commit. For the UI builders being written fresh, prefer taking `&SessionSnapshotBundle` (and per-projection helpers that accept it) so the second clone falls out.
+
 ## Server-side additions
 
 Minimal additions on top of the existing daemon. None of these reshape MCP tool responses — they are UI-only endpoints with UI-only field sets.
 
-1. **`/api/*` JSON endpoints** (UI surface, not MCP). Reuse internal building blocks (`projection::*`, `git_io::*`) but compose shapes the UI actually consumes:
-   - `GET /api/sessions[?repo=<path>]` → `[{ repo, session_id, plan_path, phase, worktree_status, waiting_on }]`. Index row, matches `list_sessions` but with the `repo` field for the multi-repo home page.
-   - `GET /api/sessions/:id?repo=<path>` → **UI-only rich shape**: `{ session_id, phase, plan_path, plan_worktree_status, waiting_on, review_target, latest_plan_revision, latest_implementation_revision, plan_revisions: [...], implementation_commits: [...], plan_feedback: Vec<FeedbackEntry>, impl_feedback: Vec<FeedbackEntry>, timeline: [...], pr_hint }`. Built by a dedicated `ui_response::session_page` builder that calls into the same `projection::*` helpers as `get_context` but is free to assemble whatever the session-detail view needs without dragging `get_context` along.
+1. **`/api/*` JSON endpoints** (UI surface, not MCP). Build on the snapshot APIs above:
+   - `GET /api/sessions[?repo=<path>]` → `[{ repo, session_id, plan_path, phase, worktree_status, waiting_on }]`. Index row, matches `list_sessions` but with the `repo` field for the multi-repo home page. Handler: `Runtime::snapshot_repo` → `ui_response::sessions_index(&snapshot, &DiskPlanStatusReader)`.
+   - `GET /api/sessions/:id?repo=<path>` → **UI-only rich shape**: `{ session_id, phase, plan_path, plan_worktree_status, waiting_on, review_target, latest_plan_revision, latest_implementation_revision, plan_revisions: [...], implementation_commits: [...], plan_feedback: Vec<FeedbackEntry>, impl_feedback: Vec<FeedbackEntry>, timeline: [...], pr_hint }`. Handler: `Runtime::snapshot_session` → `ui_response::session_page(&snapshot, &DiskPlanStatusReader)`. Pure post-snapshot — no `read_repo` closures, no disk I/O under the runtime mutex.
    - `GET /api/sessions/:id/plan/:sha?repo=<path>` → `{ body_html, body_raw, plan_intro, plan_intro_parent, previous_sha, next_sha, feedback: Vec<FeedbackEntry> }`. Body is pre-rendered HTML via `pulldown-cmark` + `ammonia`. `feedback` is the entries targeting this SHA.
    - `GET /api/sessions/:id/commit/:sha?repo=<path>` → `{ diff_files: Vec<DiffFile>, feedback: Vec<FeedbackEntry> }`. DiffFile parsed from `git show` output.
    - `GET /api/diff?from=&to=&path=&repo=<path>` → `{ diff_files }`. For plan-rev-vs-rev.
 
-   Note: `/api/sessions/:id` deliberately does NOT call `get_context_response` — that's the MCP tool's shape. A separate `ui_response::session_page` builder shares the `projection::*` primitives but lives in its own module so changes to one don't ripple to the other.
+   Note: `/api/sessions/:id` deliberately does NOT call `get_context_response` — that's the MCP tool's shape. The new `ui_response::session_page` builder shares the `projection::*` primitives but lives in its own module so changes to one don't ripple to the other.
 
 2. **Extended feedback shape (UI surface only).** The MCP `plan_feedback` / `impl_feedback` arrays continue to emit `{ target_sha, author, verdict }` (and probably get dropped from `get_context` entirely in the slim-down). The UI's `FeedbackEntry` is richer:
 
@@ -295,13 +306,14 @@ Five commits, each green-buildable, each landing a usable slice.
 
 ### Phase 1 — JSON API + frontend crate scaffold (1 commit)
 
-- Add `/api/sessions`, `/api/sessions/:id`, `/api/sessions/:id/plan/:sha`, `/api/sessions/:id/commit/:sha` returning the same shapes the current HTML pages render from.
+- Add `src/ui_response.rs` module with `sessions_index(&RepoSnapshot, &impl PlanStatusReader) -> Value` and `session_page(&SessionSnapshotBundle, &impl PlanStatusReader) -> Value`. Built directly on `projection::*` primitives + the snapshot types from `runtime-lock-boundaries`. No `read_repo` closures, no disk I/O under the runtime mutex. Test seam mirrors `mcp_response.rs`: `*_with_status_reader` for tests, default wrappers bind `DiskPlanStatusReader`.
+- Add `/api/sessions`, `/api/sessions/:id`, `/api/sessions/:id/plan/:sha`, `/api/sessions/:id/commit/:sha` routes calling into `ui_response::*`. Shapes intentionally diverge from `mcp_response.rs` (richer — body, timeline, feedback bodies, pr_hint) per the surface-separation rule.
 - Restore `src/diff_parser.rs` from `a2d7b5d^` with its unit tests.
 - Pre-render markdown via `pulldown-cmark` + sanitize via `ammonia` on the server (already deps).
 - Add `Feedback.created_at` to the state model; populate via `fs::metadata`.
 - Add `frontend/` crate skeleton with a `<Home/>` that fetches `/api/sessions` and renders a basic table.
 - Daemon serves `/static/*` and `/` (Leptos shell).
-- Acceptance: `trunk build` succeeds; loading `/` in a browser shows the session list driven by the API.
+- Acceptance: `trunk build` succeeds; loading `/` in a browser shows the session list driven by the API. `rg "snapshot.to_repo_state" src/ui_response.rs` is empty — the new builders take snapshot types directly without round-tripping.
 
 ### Phase 2 — Session detail + timeline + feedback cards (1 commit)
 
