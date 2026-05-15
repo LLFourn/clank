@@ -476,6 +476,41 @@ pub async fn snapshot(repo_root: &Path) -> Result<DiskSnapshot, GitIoError> {
     // Feedback files in the working tree.
     let feedback_files = collect_feedback_files(repo_root)?;
 
+    // Fallback for plans whose intro is OFF the first-parent chain
+    // (e.g. introduced on a feature branch and merged with --no-ff).
+    // Such commits don't appear in `first_parent_commits`, so
+    // `commit_meta` lacks their author_ts. Without this fallback,
+    // `last_activity_ts_for` would return 0 for such plans and bury
+    // them at the bottom of /api/plans. Cost: one extra `git show -s`
+    // per off-chain plan_intro, executed only when the lookup misses.
+    let mut commit_meta = commit_meta;
+    for pf in &plan_files {
+        if commit_meta.contains_key(&pf.plan_intro) {
+            continue;
+        }
+        let Ok(stdout) = run_ok(
+            repo_root,
+            &["show", "-s", "--format=%at", pf.plan_intro.as_str()],
+        )
+        .await
+        else {
+            continue;
+        };
+        let Ok(ts) = stdout.trim().parse::<i64>() else {
+            continue;
+        };
+        commit_meta.insert(
+            pf.plan_intro.clone(),
+            crate::disk_snapshot::CommitMetaEntry {
+                author_ts: ts,
+                // Off-chain intros don't appear in the timeline view
+                // (which walks `commit_order`, not arbitrary commits),
+                // so the subject is never read. Empty is fine.
+                subject: String::new(),
+            },
+        );
+    }
+
     Ok(DiskSnapshot {
         head: Some(head),
         plan_files,

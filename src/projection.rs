@@ -177,12 +177,14 @@ fn waiting_from_gate(gate: Option<&ReviewGateDecision>, phase: GatePhase) -> Wai
 /// - author_ts of the newest commit attributed to (or touching) this
 ///   plan,
 /// - mtime of the newest feedback file (plan / impl / held),
-/// - author_ts of the plan_intro commit (always defined).
+/// - author_ts of the plan_intro commit.
 ///
 /// Used by `/api/plans` to sort the homepage by recency. Pure;
-/// sans-IO. Returns `0` only when none of the inputs carries a
-/// timestamp — should not happen for committed plans since
-/// plan_intro always has metadata.
+/// sans-IO. Returns `0` when `commit_meta` lacks an entry for
+/// `plan_intro` AND there's no feedback. In practice `git_io::snapshot`
+/// backfills off-first-parent intros so this fallback is rare for
+/// committed plans, but the function is defensive so callers don't
+/// have to special-case malformed snapshots.
 #[allow(clippy::too_many_arguments)]
 pub fn last_activity_ts_for(
     plan_key: &crate::lifecycle::PlanKey,

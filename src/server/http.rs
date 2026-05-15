@@ -283,6 +283,18 @@ async fn api_plans(
             all_conflicts.extend(conflicts.iter().cloned());
         }
     }
+    // Per-repo `plans_index` sorts within a repo; concatenating preserves
+    // those local orderings but loses the global descending invariant.
+    // Re-sort by `last_activity_ts` across the combined list so the
+    // homepage's newest-first ordering holds across multiple watched
+    // repos.
+    all_plans.sort_by_key(|p| {
+        std::cmp::Reverse(
+            p.get("last_activity_ts")
+                .and_then(|v| v.as_i64())
+                .unwrap_or(0),
+        )
+    });
     Ok(axum::Json(json!({
         "plans": all_plans,
         "conflicts": all_conflicts,
@@ -578,14 +590,22 @@ async fn api_repos_delete(
 
     let outcome = state.runtime.remove_repo(canonical.clone()).await;
 
-    if let Err(err) = mcp::remove_repo_from_registry(&state.repos_path, &canonical) {
-        tracing::warn!(
-            repo = %canonical.display(),
-            registry = %state.repos_path.display(),
-            error = ?err,
-            "failed to remove repo from registry file"
-        );
-    }
+    let registry_write_error = match mcp::remove_repo_from_registry(&state.repos_path, &canonical) {
+        Ok(()) => None,
+        Err(err) => {
+            tracing::warn!(
+                repo = %canonical.display(),
+                registry = %state.repos_path.display(),
+                error = ?err,
+                "failed to remove repo from registry file"
+            );
+            Some(format!(
+                "in-memory state removed, but registry file at {} could not be rewritten: {err}. \
+                 The repo will reappear on daemon restart until the file is fixed.",
+                state.repos_path.display()
+            ))
+        }
+    };
 
     let plan_count = match outcome {
         crate::runtime::RemoveOutcome::Removed { plan_count } => plan_count,
@@ -597,9 +617,10 @@ async fn api_repos_delete(
     };
 
     Ok(axum::Json(json!({
-        "ok": true,
+        "ok": registry_write_error.is_none(),
         "basename": basename,
         "removed_plan_count": plan_count,
+        "registry_write_error": registry_write_error,
     })))
 }
 

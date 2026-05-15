@@ -471,6 +471,93 @@ async fn plan_detail_carries_body_html_and_timeline_subject() {
 }
 
 #[tokio::test]
+async fn api_plans_sorts_across_repos_by_last_activity_ts() {
+    // Regression for the cross-repo sort bug: plans_index sorts within
+    // a single repo's response, but api_plans extends across repos and
+    // must re-sort the combined list.
+    let parent_a = tempfile::tempdir().unwrap();
+    let parent_b = tempfile::tempdir().unwrap();
+    let dir_a = parent_a.path().join("alpha");
+    let dir_b = parent_b.path().join("beta");
+    std::fs::create_dir_all(&dir_a).unwrap();
+    std::fs::create_dir_all(&dir_b).unwrap();
+    for d in [&dir_a, &dir_b] {
+        run_git(d, &["init", "--quiet", "--initial-branch=main"]);
+        run_git(d, &["config", "user.email", "test@test"]);
+        run_git(d, &["config", "user.name", "test"]);
+        run_git(d, &["config", "commit.gpgsign", "false"]);
+    }
+    write_file(&dir_a, ".trinity/plans/in-alpha.md", "# alpha\n");
+    commit(&dir_a, "alpha intro");
+    // Wait so beta's commit is strictly newer.
+    std::thread::sleep(Duration::from_secs(1));
+    write_file(&dir_b, ".trinity/plans/in-beta.md", "# beta\n");
+    commit(&dir_b, "beta intro");
+
+    let (url, handle) = spawn_daemon_with_repos(&[dir_a.clone(), dir_b.clone()]).await;
+    let body: serde_json::Value = reqwest::get(format!("{url}/api/plans"))
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    handle.abort();
+    let plans = body["plans"].as_array().unwrap();
+    assert_eq!(plans.len(), 2);
+    // beta committed second → its plan should appear first globally,
+    // regardless of which repo `Trinity.repos` iterated first.
+    assert_eq!(
+        plans[0]["slug"], "in-beta",
+        "cross-repo sort must put the newest plan first; got: {plans:?}"
+    );
+    assert_eq!(plans[1]["slug"], "in-alpha");
+    assert!(plans[0]["last_activity_ts"].as_i64() >= plans[1]["last_activity_ts"].as_i64());
+}
+
+#[tokio::test]
+async fn last_activity_ts_handles_off_first_parent_plan_intro() {
+    // Plan introduced on a feature branch and merged with --no-ff:
+    // plan_intro is off the first-parent chain so it's not in
+    // `commit_meta` from the batched `git log --first-parent`. The
+    // snapshot layer must backfill its author_ts so last_activity_ts
+    // doesn't sink to 0 (which would bury the plan at the bottom of
+    // /api/plans).
+    let dir = init_repo();
+    // Initial commit on main so we have a base.
+    write_file(dir.path(), "README.md", "base\n");
+    commit(dir.path(), "init");
+
+    // Branch, add plan, switch back, merge with --no-ff.
+    run_git(dir.path(), &["checkout", "-q", "-b", "feature"]);
+    write_file(dir.path(), ".trinity/plans/branchy.md", "# branchy\n");
+    commit(dir.path(), "Add branchy on feature");
+    run_git(dir.path(), &["checkout", "-q", "main"]);
+    run_git(
+        dir.path(),
+        &["merge", "--no-ff", "-q", "-m", "Merge feature", "feature"],
+    );
+
+    let (url, handle) = spawn_daemon(dir.path()).await;
+    let body: serde_json::Value = reqwest::get(format!("{url}/api/plans"))
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    handle.abort();
+    let plans = body["plans"].as_array().unwrap();
+    let branchy = plans
+        .iter()
+        .find(|p| p["slug"] == "branchy")
+        .expect("branchy plan in response");
+    let ts = branchy["last_activity_ts"].as_i64().unwrap();
+    assert!(
+        ts > 0,
+        "last_activity_ts must be backfilled for off-first-parent plan_intro; got {ts}"
+    );
+}
+
+#[tokio::test]
 async fn api_plans_carries_last_activity_ts_and_sorts_desc() {
     let dir = init_repo();
     write_file(dir.path(), ".trinity/plans/old.md", "# old\n");

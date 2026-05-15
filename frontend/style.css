@@ -1299,7 +1299,8 @@ a:hover {
 }
 
 .watched-repos-unwatch,
-.watched-repos-cancel {
+.watched-repos-cancel,
+.watched-repos-confirm {
     padding: 0.35rem 0.7rem;
     border-radius: 0.3rem;
     font-size: 0.8rem;
@@ -1312,6 +1313,19 @@ a:hover {
 .watched-repos-unwatch:hover {
     border-color: var(--request);
     color: var(--request);
+}
+
+.watched-repos-confirm {
+    border-color: var(--request);
+    color: var(--request);
+}
+
+.watched-repos-confirm:hover:not(:disabled) {
+    background: rgba(248, 81, 73, 0.1);
+}
+
+.watched-repos-activity {
+    font-size: 0.78rem;
 }
 
 .watched-repos-error {
