@@ -10,6 +10,9 @@ pub fn Home() -> impl IntoView {
         <h1>"Trinity sessions"</h1>
         <Suspense fallback=move || view! { <p class="loading">"Loading…"</p> }>
             {move || {
+                // Inside `<Suspense>`, the closure only runs once the resource
+                // has resolved — `sessions.with` returns `Some(_)`. Treat the
+                // `None` branch as unreachable.
                 sessions
                     .with(|res| match res {
                         Some(Ok(rows)) => session_table(rows.clone()).into_any(),
@@ -17,7 +20,10 @@ pub fn Home() -> impl IntoView {
                             view! { <p class="error">"Failed to load: " {e.to_string()}</p> }
                                 .into_any()
                         }
-                        None => view! { <p class="loading">"Loading…"</p> }.into_any(),
+                        None => unreachable!(
+                            "Suspense fallback handles the pending state; sessions \
+                             should always be Some here"
+                        ),
                     })
             }}
         </Suspense>
@@ -40,14 +46,15 @@ fn session_table(rows: Vec<SessionRow>) -> impl IntoView {
                 {rows
                     .into_iter()
                     .map(|s| {
-                        let waiting_class = format!("waiting waiting-{}", s.waiting_on.role);
+                        let role = s.waiting_on.role;
+                        let waiting_class = format!("waiting waiting-{role}");
                         view! {
                             <tr>
                                 <td>{s.session_id}</td>
                                 <td>{s.phase}</td>
                                 <td>{s.worktree_status}</td>
                                 <td>
-                                    <span class=waiting_class>{s.waiting_on.role.clone()}</span>
+                                    <span class=waiting_class>{role}</span>
                                 </td>
                                 <td>{s.waiting_on.description}</td>
                             </tr>

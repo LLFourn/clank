@@ -568,18 +568,9 @@ fn upsert_feedback_at_target(
     );
 }
 
-/// File mtime as unix seconds, falling back to 0 if metadata is
-/// unavailable. Used by feedback upserts so the in-memory `Feedback` /
-/// `HeldFeedback` records carry the same chronological hint that the
-/// initial-rebuild path picks up via `git_io::collect_feedback_files`.
-fn file_mtime_unix_secs(path: &Path) -> i64 {
-    std::fs::metadata(path)
-        .and_then(|m| m.modified())
-        .ok()
-        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0)
-}
+// File mtime helper lives next to its sibling rebuild-path call site
+// in `git_io`. See `git_io::file_mtime_unix_secs`.
+use crate::git_io::file_mtime_unix_secs;
 
 impl Runtime {
     /// Push a live event into the ring AND broadcast on the SSE channel.
@@ -601,10 +592,10 @@ fn upsert_feedback(
     parsed: crate::disk_format::FeedbackPath,
     body: String,
 ) {
-    let verdict = crate::disk_format::parse_verdict(&body);
     let created_at = file_mtime_unix_secs(&abs_path);
     match parsed.target_sha {
         Some(target_sha) => {
+            let verdict = crate::disk_format::parse_verdict(&body);
             let map = match parsed.phase {
                 FeedbackPhase::Plan => &mut session.plan_feedback,
                 FeedbackPhase::Impl => &mut session.impl_feedback,
@@ -631,7 +622,6 @@ fn upsert_feedback(
                 reason,
                 created_at,
             });
-            let _ = verdict;
         }
     }
 }

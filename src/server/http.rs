@@ -1,6 +1,7 @@
 //! HTTP routes backed by the filesystem-truth runtime.
 
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use axum::Router;
 use axum::extract::{Path, Query, State};
@@ -29,7 +30,8 @@ pub fn router(state: AppState) -> Router {
     //      by the old src/server/ui.rs handlers; deleted in Phase 5.
     //   7. SPA fallback     — anything else returns frontend/dist/index.html.
     let static_service = tower_http::services::ServeDir::new(state.frontend_dist.clone());
-    let fallback_index = state.frontend_dist.join("index.html");
+    let spa_shell = state.spa_shell.clone();
+    let frontend_dist = state.frontend_dist.clone();
     Router::new()
         .route("/healthz", get(healthz))
         .route("/sessions/{session_id}", get(session_detail))
@@ -52,22 +54,21 @@ pub fn router(state: AppState) -> Router {
             get(api_commit_diff),
         )
         .nest_service("/static", static_service)
-        .fallback(move || serve_spa_shell(fallback_index.clone()))
+        .fallback(move || serve_spa_shell(spa_shell.clone(), frontend_dist.clone()))
         .with_state(state)
 }
 
-/// Read the built Leptos shell from disk and return it as HTML. Used as
-/// the catch-all for non-API, non-asset, non-explicit paths so the SPA's
-/// client-side router can take over deep links.
-async fn serve_spa_shell(index_path: PathBuf) -> Response {
-    match tokio::fs::read_to_string(&index_path).await {
-        Ok(body) => Html(body).into_response(),
-        Err(err) => (
+/// Serve the cached Leptos shell (read once at boot into `AppState`).
+/// Falls back to a 503 with a build hint when the cache is empty (i.e.
+/// `frontend_dist/index.html` was missing at startup).
+async fn serve_spa_shell(shell: Option<Arc<String>>, frontend_dist: PathBuf) -> Response {
+    match shell {
+        Some(body) => Html((*body).clone()).into_response(),
+        None => (
             StatusCode::SERVICE_UNAVAILABLE,
             format!(
-                "Leptos bundle not found at {} ({}). Run `trunk build` in frontend/ or set --frontend-dist.",
-                index_path.display(),
-                err
+                "Leptos bundle not found at {}/index.html. Run `trunk build` in frontend/ or set --frontend-dist.",
+                frontend_dist.display()
             ),
         )
             .into_response(),
@@ -442,24 +443,32 @@ async fn api_plan_revision(
             .map_err(AppError::runtime)?;
         let Some(snapshot) = snapshot else { continue };
 
-        let body_raw = crate::git_io::show_blob(&repo, &commit_sha, &snapshot.session.plan_path)
-            .await
-            .map_err(|e| AppError::internal(format!("git show: {e}")))?;
-        let body_html = crate::ui_response::render_markdown(&body_raw);
-
-        // Prev/next link derivation from the per-session plan-touching
-        // commit list (chronological order, oldest first).
+        // Session-scoped endpoint: require the SHA to be one of THIS
+        // session's plan-touching commits. Without this guard, an
+        // arbitrary blob in the repo could be rendered through any
+        // session URL, leaking commits across session boundaries.
         let plan_revisions = crate::projection::all_plan_revisions_for(
             &snapshot.session.id,
             &snapshot.commit_order,
             &snapshot.plan_touches,
         );
-        let pos = plan_revisions.iter().position(|c| c == &commit_sha);
+        let Some(pos) = plan_revisions.iter().position(|c| c == &commit_sha) else {
+            return Err(AppError::not_found(format!(
+                "commit {sha} is not a plan revision of session {session_id}"
+            )));
+        };
+
+        let body_raw = crate::git_io::show_blob(&repo, &commit_sha, &snapshot.session.plan_path)
+            .await
+            .map_err(|e| AppError::internal(format!("git show: {e}")))?;
+        let body_html = crate::ui_response::render_markdown(&body_raw);
+
         let previous_sha = pos
-            .and_then(|i| i.checked_sub(1).and_then(|j| plan_revisions.get(j)))
+            .checked_sub(1)
+            .and_then(|j| plan_revisions.get(j))
             .map(|c| c.as_str().to_string());
-        let next_sha = pos
-            .and_then(|i| plan_revisions.get(i + 1))
+        let next_sha = plan_revisions
+            .get(pos + 1)
             .map(|c| c.as_str().to_string());
 
         let feedback = crate::ui_response::feedback_for_target(&snapshot.session, &commit_sha);
@@ -495,6 +504,20 @@ async fn api_commit_diff(
             .await
             .map_err(AppError::runtime)?;
         let Some(snapshot) = snapshot else { continue };
+
+        // Session-scoped endpoint: refuse to render an arbitrary commit
+        // diff unless the SHA is attributed to THIS session (covers both
+        // pure-impl and mixed plan+impl commits).
+        let belongs_to_session = matches!(
+            snapshot.attribution.get(&commit_sha),
+            Some(crate::repo_state::AttributionResult::Attributed { session, .. })
+                if session == &snapshot.session.id
+        );
+        if !belongs_to_session {
+            return Err(AppError::not_found(format!(
+                "commit {sha} is not attributed to session {session_id}"
+            )));
+        }
 
         let patch = crate::git_io::show_commit(&repo, &commit_sha)
             .await
@@ -616,6 +639,7 @@ mod wire_tests {
             watchers: Arc::new(Mutex::new(Vec::new())),
             watched_repos: Arc::new(Mutex::new(HashSet::new())),
             frontend_dist: std::path::PathBuf::from("frontend/dist"),
+            spa_shell: None,
         };
         (runtime, state)
     }

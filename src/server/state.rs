@@ -18,7 +18,11 @@ pub struct AppState {
     /// Used by `start_plan` to avoid double-watching when a new repo is
     /// registered mid-session.
     pub watched_repos: Arc<Mutex<HashSet<PathBuf>>>,
-    /// Directory containing the built Leptos bundle. Served at `/static/*`
-    /// and the fallback route returns `<dir>/index.html`.
+    /// Directory containing the built Leptos bundle. Served at `/static/*`.
     pub frontend_dist: PathBuf,
+    /// `frontend_dist/index.html` read once at boot. The SPA fallback
+    /// serves this from memory rather than touching disk on every
+    /// request. `None` if the bundle was missing at startup — fallback
+    /// returns 503 with a hint to run `trunk build`.
+    pub spa_shell: Option<Arc<String>>,
 }

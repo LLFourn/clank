@@ -11,7 +11,6 @@
 //! in a fake.
 
 use std::collections::BTreeMap;
-use std::path::Path;
 
 use serde_json::{Value, json};
 
@@ -23,8 +22,7 @@ use crate::projection::{
     waiting_on,
 };
 use crate::repo_state::{
-    AttributionResult, Feedback, HeldFeedback, Phase, PlanTouchKind, PlanWorktreeStatus,
-    Verdict, WaitingOn,
+    AttributionResult, Feedback, HeldFeedback, Phase, PlanTouchKind, Verdict, WaitingOn,
 };
 use crate::review_state::{ReviewGateDecision, ReviewPhase};
 use crate::runtime_snapshot::{RepoSnapshot, SessionSnapshot, SessionSnapshotBundle};
@@ -135,9 +133,9 @@ pub fn session_page_with_reader(
         ),
         Phase::Done => ("plan", None),
     };
-    let review_target = review_target_sha.as_ref().map(|sha| {
-        json!({ "phase": review_target_phase, "commit_sha": sha })
-    });
+    let review_target = review_target_sha
+        .as_ref()
+        .map(|sha| json!({ "phase": review_target_phase, "commit_sha": sha }));
     let latest_plan_revision = plan_revisions
         .last()
         .map(|sha| json!({ "commit_sha": sha }))
@@ -149,7 +147,12 @@ pub fn session_page_with_reader(
 
     let plan_feedback = feedback_entries(&session.plan_feedback);
     let impl_feedback = feedback_entries(&session.impl_feedback);
-    let timeline = timeline_value(session, &bundle.attribution, &bundle.plan_touches, &bundle.commit_order);
+    let timeline = timeline_value(
+        session,
+        &bundle.attribution,
+        &bundle.plan_touches,
+        &bundle.commit_order,
+    );
     let pr_hint = if matches!(session_phase, Phase::Implementing) {
         Some(pr_hint_value(session, &implementation_commits))
     } else {
@@ -182,9 +185,7 @@ pub fn session_page_with_reader(
 /// `impl_feedback` maps. Each entry carries the raw body, rendered HTML,
 /// canonical write path, and file mtime so the UI can sort and display
 /// without any further server round-trip.
-fn feedback_entries(
-    map: &BTreeMap<(CommitSha, AgentLabel), Feedback>,
-) -> Vec<Value> {
+fn feedback_entries(map: &BTreeMap<(CommitSha, AgentLabel), Feedback>) -> Vec<Value> {
     map.iter()
         .map(|((target, author), fb)| {
             json!({
@@ -238,26 +239,30 @@ fn strip_marker_line(body: &str) -> &str {
     }
     let after_leading = chars.as_str();
     if let Some(rest) = after_leading.strip_prefix("APPROVE") {
-        skip_eol(rest)
+        skip_marker_tail(rest)
     } else if let Some(rest) = after_leading.strip_prefix("REQUEST_CHANGES") {
-        skip_eol(rest)
+        skip_marker_tail(rest)
     } else {
         body
     }
 }
 
-fn skip_eol(s: &str) -> &str {
-    let mut bytes = s.as_bytes().iter().peekable();
-    let mut consumed = 0;
-    while let Some(&&b) = bytes.peek() {
-        if b == b'\r' || b == b'\n' {
-            bytes.next();
-            consumed += 1;
-            continue;
-        }
-        break;
+/// Consume any trailing horizontal whitespace (spaces / tabs) on the
+/// marker line, then up to one CR/LF run. Matches the leniency of
+/// `disk_format::parse_verdict` which trims each candidate line before
+/// matching the marker — without this, an `"APPROVE   \n\nrest"` body
+/// leaves 3 leading spaces in the rendered markdown (4+ would become an
+/// indented code block).
+fn skip_marker_tail(s: &str) -> &str {
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() && (bytes[i] == b' ' || bytes[i] == b'\t') {
+        i += 1;
     }
-    &s[consumed..]
+    while i < bytes.len() && (bytes[i] == b'\r' || bytes[i] == b'\n') {
+        i += 1;
+    }
+    &s[i..]
 }
 
 pub fn render_markdown(input: &str) -> String {
@@ -451,28 +456,12 @@ fn feedback_entry(
     })
 }
 
-/// Helper for the plan-revision / commit-diff route handlers: snapshot
-/// the worktree status for a given session. Wraps `PlanStatusReader` so
-/// callers don't have to thread a fresh `DiskPlanStatusReader` themselves.
-pub fn worktree_status_for(
-    snapshot: &SessionSnapshotBundle,
-    status_reader: &impl PlanStatusReader,
-) -> std::io::Result<PlanWorktreeStatus> {
-    status_reader.compute(
-        &snapshot.root,
-        &snapshot.session.plan_path,
-        &snapshot.session.body_hash,
-    )
-}
-
-#[allow(dead_code)]
-fn _unused_path_type_hint(_p: &Path) {}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::lifecycle::content_hash;
     use crate::repo_state::PlanWorktreeStatus;
+    use std::path::Path;
 
     fn empty_snapshot() -> RepoSnapshot {
         RepoSnapshot {
@@ -523,6 +512,20 @@ mod tests {
     #[test]
     fn strip_marker_line_leaves_unmarked_body_intact() {
         assert_eq!(strip_marker_line("some prose\nmore"), "some prose\nmore");
+    }
+
+    #[test]
+    fn strip_marker_line_consumes_trailing_whitespace() {
+        // parse_verdict trims each line; strip_marker_line must agree, or
+        // 4+ trailing spaces flip the body into an indented code block at
+        // render time.
+        assert_eq!(strip_marker_line("APPROVE   \n\nrest"), "rest");
+        assert_eq!(strip_marker_line("REQUEST_CHANGES\t  \n\nrest"), "rest");
+    }
+
+    #[test]
+    fn strip_marker_line_consumes_tab_after_marker() {
+        assert_eq!(strip_marker_line("APPROVE\trest\n"), "rest\n");
     }
 
     #[test]

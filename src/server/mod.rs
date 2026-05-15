@@ -95,11 +95,13 @@ pub async fn serve(args: ServeArgs) -> anyhow::Result<()> {
         }
     }
 
+    let spa_shell = load_spa_shell(&args.frontend_dist);
     let state = AppState {
         runtime: Arc::clone(&runtime),
         watchers: Arc::new(Mutex::new(watchers)),
         watched_repos: Arc::new(Mutex::new(watched_repos)),
         frontend_dist: args.frontend_dist.clone(),
+        spa_shell,
     };
 
     let app = http::router(state);
@@ -167,6 +169,26 @@ fn read_repos_file(path: &std::path::Path) -> std::io::Result<Vec<PathBuf>> {
         .filter(|l| !l.is_empty() && !l.starts_with('#'))
         .map(PathBuf::from)
         .collect())
+}
+
+/// Read `<frontend_dist>/index.html` once at startup. Logs a clear
+/// warning when the bundle isn't present so users discover the
+/// misconfiguration in the daemon log rather than via the SPA's 503 the
+/// first time they hit `/`.
+fn load_spa_shell(frontend_dist: &std::path::Path) -> Option<Arc<String>> {
+    let index = frontend_dist.join("index.html");
+    match std::fs::read_to_string(&index) {
+        Ok(body) => Some(Arc::new(body)),
+        Err(err) => {
+            tracing::warn!(
+                path = %index.display(),
+                error = ?err,
+                "Leptos SPA shell not found; `/` will return 503 until \
+                 `trunk build` runs in frontend/ (or set --frontend-dist)"
+            );
+            None
+        }
+    }
 }
 
 fn expand_home(s: &str) -> PathBuf {
