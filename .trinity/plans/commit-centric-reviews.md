@@ -75,9 +75,20 @@ plan/impl hint.
 Per-commit review gate:
 
 - `changes_requested` — any current feedback for this SHA opens with
-  `REQUEST_CHANGES`.
-- `approved` — at least one `APPROVE` and zero `REQUEST_CHANGES`.
-- `unreviewed` — neither.
+  `REQUEST_CHANGES`, OR any current feedback is ambiguous/unmarked,
+  OR any plan-wide participant has not responded to this SHA yet.
+- `approved` — every plan-wide participant has responded to this SHA,
+  zero responses are `REQUEST_CHANGES` or ambiguous/unmarked, and at
+  least one reviewer has responded with `APPROVE`.
+- `unreviewed` — no reviewer has responded to this SHA yet.
+
+Plan-wide participants are cumulative: any agent who has left feedback
+on any earlier or current commit in this plan's history is part of the
+participant set for later commit gates. That is the important behavior
+change from today's phase-split model: a reviewer who participated in
+plan review is still expected to respond when the next code commit
+lands. "Plan reviewer" and "implementation reviewer" are display
+labels only; participation is attached to the plan's commit stream.
 
 Session-level "what next" is a fold over commits walked newest-first:
 
@@ -157,8 +168,11 @@ Per-commit folded review state:
 ```rust
 pub struct CommitGate {
     pub state: CommitGateState,           // Unreviewed/Approved/ChangesRequested
+    pub participants: Vec<AgentLabel>,
     pub approvers: Vec<AgentLabel>,
     pub requesters: Vec<AgentLabel>,
+    pub ambiguous: Vec<AgentLabel>,
+    pub missing: Vec<AgentLabel>,
     pub feedback: BTreeMap<AgentLabel, Feedback>,
 }
 ```
@@ -167,6 +181,13 @@ pub struct CommitGate {
 `plan_feedback` and `impl_feedback`. Iteration order is SHA-lex; the
 existing `commit_order: Vec<CommitSha>` field on `RepoState` keeps
 chronological order.
+
+`CommitGate` is derived with a cumulative participant fold over
+`commit_order`: before evaluating a target commit, collect every
+agent who has left feedback on any earlier commit for the plan, then
+include any agents who responded on the target commit itself. The
+target commit is ready only when that full set has non-ambiguous,
+non-request-changes feedback on the target.
 
 ### Feedback path parsing
 
@@ -361,9 +382,10 @@ not backwards compatibility (no callers can write to the old path).
 7. Frontend timeline renders the same UX as today: commit rows with
    plan/code/mixed/done labels, feedback cards under each commit.
 8. Tests cover: `commit_kind` classification of every variant; gate
-   roll-up; readiness rule walking newest-first; `wait_for_work`
-   prompt-hint shape for each kind; collapsed-`WaitingReason`
-   coverage.
+   roll-up with cumulative plan-wide participants; ambiguous/unmarked
+   feedback blocking readiness like `REQUEST_CHANGES`; readiness rule
+   walking newest-first; `wait_for_work` prompt-hint shape for each
+   kind; collapsed-`WaitingReason` coverage.
 9. End-to-end test: start_plan → commit plan-only → review APPROVE
    → commit code → review REQUEST_CHANGES → commit fix → review
    APPROVE → done-move → committed; assert `waiting_on` transitions
