@@ -1,6 +1,10 @@
+pub mod commit_diff;
 pub mod feedback_card;
 pub mod home;
 pub mod meta_strip;
+pub mod plan_diff;
+pub mod plan_revision;
 pub mod session_detail;
+pub mod structured_diff;
 pub mod timeline;
 pub mod waiting_banner;

@@ -20,6 +20,18 @@ fn App() -> impl IntoView {
                     path=path!("/sessions/:session_id")
                     view=components::session_detail::SessionDetail
                 />
+                <Route
+                    path=path!("/sessions/:session_id/plan/:sha/diff")
+                    view=components::plan_diff::PlanDiff
+                />
+                <Route
+                    path=path!("/sessions/:session_id/plan/:sha")
+                    view=components::plan_revision::PlanRevision
+                />
+                <Route
+                    path=path!("/sessions/:session_id/commit/:sha")
+                    view=components::commit_diff::CommitDiff
+                />
             </Routes>
         </Router>
     }

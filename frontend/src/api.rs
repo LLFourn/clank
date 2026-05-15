@@ -189,3 +189,146 @@ pub async fn fetch_session(session_id: String) -> Result<SessionDetail, FetchErr
         .await
         .map_err(|e| FetchError::Decode(e.to_string()))
 }
+
+#[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)]
+pub struct PlanRevisionPage {
+    pub repo: String,
+    pub session_id: String,
+    pub commit_sha: String,
+    pub body_raw: String,
+    pub body_html: String,
+    pub plan_intro: String,
+    pub plan_intro_parent: Option<String>,
+    pub previous_sha: Option<String>,
+    pub next_sha: Option<String>,
+    #[serde(default)]
+    pub feedback: Vec<FeedbackEntry>,
+}
+
+pub async fn fetch_plan_revision(
+    session_id: String,
+    sha: String,
+) -> Result<PlanRevisionPage, FetchError> {
+    let url = format!("/api/sessions/{session_id}/plan/{sha}");
+    let resp = gloo_net::http::Request::get(&url)
+        .send()
+        .await
+        .map_err(|e| FetchError::Network(e.to_string()))?;
+    if !resp.ok() {
+        return Err(FetchError::Status(resp.status()));
+    }
+    resp.json::<PlanRevisionPage>()
+        .await
+        .map_err(|e| FetchError::Decode(e.to_string()))
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)]
+pub struct DiffLine {
+    pub kind: String,
+    pub old_lineno: Option<u64>,
+    pub new_lineno: Option<u64>,
+    pub content: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)]
+pub struct DiffHunk {
+    pub header: String,
+    pub lines: Vec<DiffLine>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)]
+pub struct FileDiff {
+    pub path: String,
+    pub old_path: Option<String>,
+    pub additions: u64,
+    pub deletions: u64,
+    pub mode: String,
+    pub binary: bool,
+    #[serde(default)]
+    pub always_folded: bool,
+    #[serde(default)]
+    pub hunks: Vec<DiffHunk>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)]
+pub struct CommitDiffPage {
+    pub repo: String,
+    pub session_id: String,
+    pub commit_sha: String,
+    #[serde(default)]
+    pub diff_files: Vec<FileDiff>,
+    #[serde(default)]
+    pub feedback: Vec<FeedbackEntry>,
+}
+
+pub async fn fetch_commit_diff(
+    session_id: String,
+    sha: String,
+) -> Result<CommitDiffPage, FetchError> {
+    let url = format!("/api/sessions/{session_id}/commit/{sha}");
+    let resp = gloo_net::http::Request::get(&url)
+        .send()
+        .await
+        .map_err(|e| FetchError::Network(e.to_string()))?;
+    if !resp.ok() {
+        return Err(FetchError::Status(resp.status()));
+    }
+    resp.json::<CommitDiffPage>()
+        .await
+        .map_err(|e| FetchError::Decode(e.to_string()))
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)]
+pub struct DiffPage {
+    pub repo: String,
+    pub from: String,
+    pub to: String,
+    pub path: String,
+    #[serde(default)]
+    pub diff_files: Vec<FileDiff>,
+}
+
+pub async fn fetch_diff(
+    from: String,
+    to: String,
+    path: String,
+) -> Result<DiffPage, FetchError> {
+    let mut params = String::new();
+    params.push_str("from=");
+    params.push_str(&urlencode(&from));
+    params.push_str("&to=");
+    params.push_str(&urlencode(&to));
+    params.push_str("&path=");
+    params.push_str(&urlencode(&path));
+    let url = format!("/api/diff?{params}");
+    let resp = gloo_net::http::Request::get(&url)
+        .send()
+        .await
+        .map_err(|e| FetchError::Network(e.to_string()))?;
+    if !resp.ok() {
+        return Err(FetchError::Status(resp.status()));
+    }
+    resp.json::<DiffPage>()
+        .await
+        .map_err(|e| FetchError::Decode(e.to_string()))
+}
+
+/// Minimal percent-encoder for query-string segments. Avoids pulling in
+/// a whole url crate just for this.
+fn urlencode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'~') {
+            out.push(b as char);
+        } else {
+            out.push_str(&format!("%{b:02X}"));
+        }
+    }
+    out
+}

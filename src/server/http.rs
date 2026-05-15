@@ -54,6 +54,7 @@ pub fn router(state: AppState) -> Router {
             "/api/sessions/{session_id}/commit/{sha}",
             get(api_commit_diff),
         )
+        .route("/api/diff", get(api_diff))
         .nest_service("/static", static_service)
         .fallback(move || serve_spa_shell(spa_shell.clone(), frontend_dist.clone()))
         .with_state(state)
@@ -576,6 +577,94 @@ async fn api_commit_diff(
     Err(AppError::not_found(format!(
         "session {session_id} not found"
     )))
+}
+
+#[derive(Deserialize)]
+struct DiffQuery {
+    from: String,
+    to: String,
+    path: String,
+    repo: Option<String>,
+}
+
+/// `GET /api/diff?from=&to=&path=&repo=` — patch between two SHAs at one
+/// file. Used by `<PlanDiff/>` to compare two plan-body revisions.
+/// Intentionally not session-scoped (the SPA only renders diffs over
+/// `session.plan_path`, but the endpoint is general).
+async fn api_diff(
+    State(state): State<AppState>,
+    Query(q): Query<DiffQuery>,
+) -> Result<axum::Json<Value>, AppError> {
+    let from = crate::lifecycle::CommitSha::from(q.from);
+    let to = crate::lifecycle::CommitSha::from(q.to);
+    let path = std::path::PathBuf::from(&q.path);
+    let repos = repos_to_render(&state, q.repo).await;
+    for repo in repos {
+        // Cheap reachability check: the snapshot ensures the repo is
+        // actually known to the runtime (saves us from spawning git
+        // against a stray query path).
+        if state
+            .runtime
+            .snapshot_repo(&repo)
+            .await
+            .map_err(AppError::runtime)
+            .is_err()
+        {
+            continue;
+        }
+        let patch = crate::git_io::diff_two_blobs(&repo, &from, &to, &path)
+            .await
+            .map_err(|e| AppError::internal(format!("git diff: {e}")))?;
+        let diff_files = crate::diff_parser::parse_diff(&patch);
+        let diff_files_json = serialize_diff_files(&diff_files);
+        return Ok(axum::Json(json!({
+            "repo": repo.to_string_lossy(),
+            "from": from.as_str(),
+            "to": to.as_str(),
+            "path": path.to_string_lossy(),
+            "diff_files": diff_files_json,
+        })));
+    }
+    Err(AppError::not_found("no matching repo".to_string()))
+}
+
+/// Shared diff_files → JSON converter used by `api_commit_diff` and
+/// `api_diff`. Returns a Vec<Value> so callers wrap it in their own
+/// envelope.
+fn serialize_diff_files(files: &[crate::diff_parser::FileDiff]) -> Vec<Value> {
+    files
+        .iter()
+        .map(|f| {
+            json!({
+                "path": f.path,
+                "old_path": f.old_path,
+                "additions": f.additions,
+                "deletions": f.deletions,
+                "mode": match f.mode {
+                    crate::diff_parser::FileDiffMode::Added => "added",
+                    crate::diff_parser::FileDiffMode::Removed => "removed",
+                    crate::diff_parser::FileDiffMode::Renamed => "renamed",
+                    crate::diff_parser::FileDiffMode::Modified => "modified",
+                },
+                "binary": f.binary,
+                "always_folded": crate::diff_parser::is_always_folded(&f.path),
+                "hunks": f.hunks.iter().map(|h| json!({
+                    "header": h.header,
+                    "lines": h.lines.iter().map(|l| json!({
+                        "kind": match l.kind {
+                            crate::diff_parser::DiffLineKind::Insert => "insert",
+                            crate::diff_parser::DiffLineKind::Delete => "delete",
+                            crate::diff_parser::DiffLineKind::Context => "context",
+                            crate::diff_parser::DiffLineKind::Meta => "meta",
+                        },
+                        "old_lineno": l.old_lineno,
+                        "new_lineno": l.new_lineno,
+                        "content": l.content,
+                    })).collect::<Vec<_>>(),
+                })).collect::<Vec<_>>(),
+            })
+        })
+        .collect()
 }
 
 #[cfg(test)]

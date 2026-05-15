@@ -150,6 +150,31 @@ pub async fn show_blob(
 
 /// `git show <sha>` — return the full commit patch (header + diff) as text.
 /// Used by the commit-diff route to render impl commits.
+/// Patch text from `git diff <from> <to> -- <path>` (unified diff form,
+/// parseable by `diff_parser::parse_diff`). Used by the plan-rev-vs-rev
+/// endpoint to compare two snapshots of one file.
+pub async fn diff_two_blobs(
+    repo: &Path,
+    from: &CommitSha,
+    to: &CommitSha,
+    path: &Path,
+) -> Result<String, GitIoError> {
+    let path_str = path.to_string_lossy();
+    run_ok_raw(
+        repo,
+        &[
+            "diff",
+            "--no-color",
+            "--no-ext-diff",
+            from.as_str(),
+            to.as_str(),
+            "--",
+            &path_str,
+        ],
+    )
+    .await
+}
+
 pub async fn show_commit(repo: &Path, sha: &CommitSha) -> Result<String, GitIoError> {
     run_ok_raw(repo, &["show", "--no-color", sha.as_str()]).await
 }
