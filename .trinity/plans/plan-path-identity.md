@@ -614,7 +614,11 @@ Behavioral acceptance:
   no encoding, sub-routes work.
 - *Whether the wire identity carries the full repo path*: no. Just
   the basename. Two repos with the same basename can't both be
-  watched; first registration wins.
+  watched; the daemon arbitrarily ignores the later one (first
+  registration wins) and logs WARN. Users hit this only with a
+  worktree dropped under the same name as its source (e.g.
+  `~/wt/trinity` shadowing `~/src/trinity`); they resolve it by
+  renaming the worktree directory.
 - *`?repo=` ergonomics*: eliminated for plan-scoped routes. Kept only
   on `/api/plans` as an optional filter.
 - *Active/done identity drift*: identity is stable across the move;
@@ -629,12 +633,6 @@ Behavioral acceptance:
 
 ## Open Questions
 
-- *Sub-directories of basename-shaped repos as worktrees*. Git
-  worktrees end up in arbitrary directories; if a user puts the
-  worktree at `~/wt/trinity-pr-42` they get basename
-  `trinity-pr-42`, which doesn't collide with `trinity`. If they put
-  it at `~/wt/trinity` they collide. The user resolves this with the
-  worktree's directory name, not Trinity.
 - *Backwards-compat for already-recorded feedback*: feedback under
   `.trinity/feedback/<stem>/...` already keys by stem only and is
   unaffected.
