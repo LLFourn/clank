@@ -85,12 +85,13 @@ async fn list_sessions(state: &AppState, req: &ToolCallRequest) -> Result<Value,
     };
     let repo = resolve_repo_with_override(args.repo.as_deref(), &req.cwd).await?;
     state.runtime.add_repo_if_unknown(repo.clone()).await;
-    let v = state
+    let snapshot = state
         .runtime
-        .read_repo(&repo, |s| list_sessions_response(&repo, s))
+        .snapshot_repo(&repo)
         .await
-        .map_err(|e| ToolError::Internal(anyhow::anyhow!(e)))?
         .map_err(|e| ToolError::Internal(anyhow::anyhow!(e)))?;
+    let v =
+        list_sessions_response(&snapshot).map_err(|e| ToolError::Internal(anyhow::anyhow!(e)))?;
     Ok(json!({"sessions": v}))
 }
 
@@ -114,19 +115,16 @@ async fn start_plan(state: &AppState, req: &ToolCallRequest) -> Result<Value, To
         std::fs::create_dir_all(parent).map_err(|e| ToolError::Internal(anyhow::anyhow!(e)))?;
     }
     if !plan_abs.exists() {
-        std::fs::write(&plan_abs, "")
-            .map_err(|e| ToolError::Internal(anyhow::anyhow!(e)))?;
+        std::fs::write(&plan_abs, "").map_err(|e| ToolError::Internal(anyhow::anyhow!(e)))?;
     }
     state.runtime.add_repo_if_unknown(repo.clone()).await;
     ensure_repo_watcher(state, repo.clone()).await;
     let committed = state
         .runtime
-        .read_repo(&repo, |s| {
-            s.sessions
-                .contains_key(&SessionId::from(args.session_id.clone()))
-        })
+        .snapshot_session(&repo, &SessionId::from(args.session_id.clone()))
         .await
-        .map_err(|e| ToolError::Internal(anyhow::anyhow!(e)))?;
+        .map_err(|e| ToolError::Internal(anyhow::anyhow!(e)))?
+        .is_some();
     let next_step = if committed {
         format!(
             "plan already committed at {}; edit and commit again to record a new revision",
@@ -163,14 +161,14 @@ async fn get_context(state: &AppState, req: &ToolCallRequest) -> Result<Value, T
     state.runtime.add_repo_if_unknown(repo.clone()).await;
     let session_id = SessionId::from(args.session_id.clone());
     let author = AgentLabel::from(args.author_label.unwrap_or_else(|| "anonymous".to_string()));
-    let v = state
+    let snapshot = state
         .runtime
-        .read_repo(&repo, |s| get_context_response(&repo, s, &session_id, &author))
+        .snapshot_session(&repo, &session_id)
         .await
-        .map_err(|e| ToolError::Internal(anyhow::anyhow!(e)))?
         .map_err(|e| ToolError::Internal(anyhow::anyhow!(e)))?;
-    match v {
-        Some(ctx) => Ok(ctx),
+    match snapshot {
+        Some(snapshot) => get_context_response(&snapshot, &author)
+            .map_err(|e| ToolError::Internal(anyhow::anyhow!(e))),
         None => {
             let plan_rel = PathBuf::from(".trinity/plans").join(format!("{}.md", args.session_id));
             let plan_abs = repo.join(&plan_rel);

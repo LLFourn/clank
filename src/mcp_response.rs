@@ -1,13 +1,8 @@
 //! MCP / HTTP response shaping over the filesystem-truth core.
 //!
-//! Pure response builders: given a `RepoState` and a request shape,
-//! return a `serde_json::Value` matching the MCP / HTTP schema. These
-//! functions are the bridge between the pure core (rebuild + projection)
-//! and the wire surface.
-//!
-//! `compute_plan_worktree_status` is the one piece that reaches into the
-//! working tree (it has to — by definition it's comparing HEAD to disk).
-//! Everything else here operates over the in-memory state.
+//! Response builders over owned runtime snapshots. Request handlers clone
+//! snapshots under the runtime mutex, release it, then call these builders
+//! to do working-tree status reads and assemble MCP / HTTP JSON.
 
 use std::path::{Path, PathBuf};
 
@@ -22,25 +17,32 @@ use crate::projection::{
 };
 use crate::repo_state::{PlanWorktreeStatus, RepoState, WaitingOn};
 use crate::review_state::{ReviewGateDecision, ReviewPhase};
+use crate::runtime_snapshot::{RepoSnapshot, SessionSnapshotBundle};
 
-/// Compare the working-tree plan file at `session.plan_path` to HEAD's
-/// blob (already cached in `session.body_hash`). Returns the four-state
-/// `PlanWorktreeStatus`.
-///
-/// This is the only function in this module that touches the disk; it's
-/// called by `get_context_response` to produce a fresh status at request
-/// time so the response is never stale.
-pub fn compute_plan_worktree_status(
-    repo_root: &Path,
-    session: &crate::repo_state::Session,
-) -> std::io::Result<PlanWorktreeStatus> {
-    compute_plan_worktree_status_parts(repo_root, &session.plan_path, &session.body_hash)
+pub trait PlanStatusReader {
+    fn compute(
+        &self,
+        repo_root: &Path,
+        plan_path: &Path,
+        body_hash: &ContentHash,
+    ) -> std::io::Result<PlanWorktreeStatus>;
 }
 
-/// Same as `compute_plan_worktree_status` but takes the minimum inputs
-/// directly. Used by `wait_for_work` where we snapshot the path + hash
-/// under the runtime lock and want to compute the worktree status without
-/// holding a full `Session` reference (so the lock can be released first).
+pub struct DiskPlanStatusReader;
+
+impl PlanStatusReader for DiskPlanStatusReader {
+    fn compute(
+        &self,
+        repo_root: &Path,
+        plan_path: &Path,
+        body_hash: &ContentHash,
+    ) -> std::io::Result<PlanWorktreeStatus> {
+        compute_plan_worktree_status_parts(repo_root, plan_path, body_hash)
+    }
+}
+
+/// Compare the working-tree plan file to HEAD's blob hash using only
+/// copied snapshot fields.
 pub fn compute_plan_worktree_status_parts(
     repo_root: &Path,
     plan_path: &Path,
@@ -83,13 +85,29 @@ pub fn swap_active_done(plan_path: &Path) -> Option<PathBuf> {
 /// Returns an array of session summaries: id, plan_path, phase,
 /// waiting_on, plan_worktree_status. Each row is enough to drive the
 /// homepage's session table without further queries.
-pub fn list_sessions_response(repo_root: &Path, state: &RepoState) -> std::io::Result<Value> {
+pub fn list_sessions_response(snapshot: &RepoSnapshot) -> std::io::Result<Value> {
+    list_sessions_response_with_status_reader(snapshot, &DiskPlanStatusReader)
+}
+
+pub(crate) fn list_sessions_response_with_status_reader(
+    snapshot: &RepoSnapshot,
+    status_reader: &impl PlanStatusReader,
+) -> std::io::Result<Value> {
+    let state = snapshot.to_repo_state();
     let mut sessions = Vec::with_capacity(state.sessions.len());
-    for session in state.sessions.values() {
-        let worktree_status = compute_plan_worktree_status(repo_root, session)?;
+    for session_snapshot in &snapshot.sessions {
+        let session = state
+            .sessions
+            .get(&session_snapshot.id)
+            .expect("snapshot session must be present in temporary state");
+        let worktree_status = status_reader.compute(
+            &snapshot.root,
+            &session_snapshot.plan_path,
+            &session_snapshot.body_hash,
+        )?;
         let session_phase = phase(session, &state.attribution);
-        let plan_gate = plan_gate_for(session, state);
-        let impl_gate = impl_gate_for(session, state);
+        let plan_gate = plan_gate_for(session, &state);
+        let impl_gate = impl_gate_for(session, &state);
         let w = waiting_on(
             session_phase,
             worktree_status,
@@ -97,7 +115,7 @@ pub fn list_sessions_response(repo_root: &Path, state: &RepoState) -> std::io::R
             impl_gate.as_ref(),
         );
         sessions.push(session_summary(
-            repo_root,
+            &snapshot.root,
             session,
             session_phase,
             worktree_status,
@@ -125,22 +143,44 @@ fn session_summary(
 }
 
 /// `get_context` response for a specific session + author.
-///
-/// Returns `Ok(None)` if the session doesn't exist in HEAD (the caller
-/// should map this to `{ error: "session_not_committed", ... }`).
 pub fn get_context_response(
-    repo_root: &Path,
-    state: &RepoState,
-    session_id: &SessionId,
-    _author_label: &AgentLabel,
-) -> std::io::Result<Option<Value>> {
-    let Some(session) = state.sessions.get(session_id) else {
-        return Ok(None);
-    };
-    let worktree_status = compute_plan_worktree_status(repo_root, session)?;
+    snapshot: &SessionSnapshotBundle,
+    author_label: &AgentLabel,
+) -> std::io::Result<Value> {
+    get_context_response_with_status_reader(snapshot, author_label, &DiskPlanStatusReader)
+}
+
+pub(crate) fn get_context_response_with_status_reader(
+    snapshot: &SessionSnapshotBundle,
+    author_label: &AgentLabel,
+    status_reader: &impl PlanStatusReader,
+) -> std::io::Result<Value> {
+    let worktree_status = status_reader.compute(
+        &snapshot.root,
+        &snapshot.session.plan_path,
+        &snapshot.session.body_hash,
+    )?;
+    Ok(get_context_response_from_snapshot(
+        snapshot,
+        worktree_status,
+        author_label,
+    ))
+}
+
+pub fn get_context_response_from_snapshot(
+    snapshot: &SessionSnapshotBundle,
+    worktree_status: PlanWorktreeStatus,
+    author_label: &AgentLabel,
+) -> Value {
+    let state = snapshot.to_repo_state();
+    let session_id = &snapshot.session.id;
+    let session = state
+        .sessions
+        .get(session_id)
+        .expect("snapshot session must be present in temporary state");
     let session_phase = phase(session, &state.attribution);
-    let plan_gate = plan_gate_for(session, state);
-    let impl_gate = impl_gate_for(session, state);
+    let plan_gate = plan_gate_for(session, &state);
+    let impl_gate = impl_gate_for(session, &state);
     let w = waiting_on(
         session_phase,
         worktree_status,
@@ -149,20 +189,20 @@ pub fn get_context_response(
     );
 
     let pr_hint = if matches!(session_phase, crate::repo_state::Phase::Implementing) {
-        Some(pr_hint_value(session, state))
+        Some(pr_hint_value(session, &state))
     } else {
         None
     };
 
     let plan_feedback = feedback_entries(&session.plan_feedback);
     let impl_feedback = feedback_entries(&session.impl_feedback);
-    let timeline = timeline_value(state, session_id);
+    let timeline = timeline_value(&state, session_id);
 
-    let plan_revisions: Vec<String> = all_plan_revisions(session, state)
+    let plan_revisions: Vec<String> = all_plan_revisions(session, &state)
         .into_iter()
         .map(|s| s.as_str().to_string())
         .collect();
-    let implementation_commits: Vec<String> = all_implementation_commits(session, state)
+    let implementation_commits: Vec<String> = all_implementation_commits(session, &state)
         .into_iter()
         .map(|s| s.as_str().to_string())
         .collect();
@@ -172,11 +212,11 @@ pub fn get_context_response(
     let (review_target_phase, review_target_sha) = match session_phase {
         crate::repo_state::Phase::Planning => (
             "plan",
-            latest_plan_touching_commit(session, state).map(|s| s.as_str().to_string()),
+            latest_plan_touching_commit(session, &state).map(|s| s.as_str().to_string()),
         ),
         crate::repo_state::Phase::Implementing => (
             "impl",
-            latest_impl_commit(session, state).map(|s| s.as_str().to_string()),
+            latest_impl_commit(session, &state).map(|s| s.as_str().to_string()),
         ),
         crate::repo_state::Phase::Done => ("plan", None),
     };
@@ -192,7 +232,7 @@ pub fn get_context_response(
             session = session.id.as_str(),
             phase = review_target_phase,
             sha = sha,
-            author = _author_label.as_str(),
+            author = author_label.as_str(),
         );
         json!({
             "phase": review_target_phase,
@@ -202,8 +242,8 @@ pub fn get_context_response(
     });
     let expected_action_str = expected_action(w.reason);
 
-    Ok(Some(json!({
-        "repo": repo_root.to_string_lossy(),
+    json!({
+        "repo": snapshot.root.to_string_lossy(),
         "session_id": session.id.as_str(),
         "phase": session_phase.as_str(),
         "plan_worktree_status": worktree_status.as_str(),
@@ -213,15 +253,15 @@ pub fn get_context_response(
         "write_feedback": write_feedback,
         "plan_path": session.plan_path.to_string_lossy(),
         "review_gate": gate_value(plan_gate.as_ref(), impl_gate.as_ref(), session_phase),
-        "latest_plan_revision": latest_plan_revision(session, state),
-        "latest_implementation_revision": latest_impl_revision(session, state),
+        "latest_plan_revision": latest_plan_revision(session, &state),
+        "latest_implementation_revision": latest_impl_revision(session, &state),
         "plan_revisions": plan_revisions,
         "implementation_commits": implementation_commits,
         "plan_feedback": plan_feedback,
         "impl_feedback": impl_feedback,
         "timeline": timeline,
         "pr_hint": pr_hint,
-    })))
+    })
 }
 
 /// Serialize the per-session timeline (from `RepoState::timeline_for`)
@@ -379,8 +419,10 @@ fn latest_impl_revision(session: &crate::repo_state::Session, state: &RepoState)
 mod tests {
     use super::*;
     use crate::rebuild::rebuild_repo;
+    use crate::runtime::Runtime;
     use std::path::Path;
     use std::process::Command;
+    use std::time::Duration;
 
     fn init_repo() -> tempfile::TempDir {
         let dir = tempfile::tempdir().unwrap();
@@ -415,6 +457,16 @@ mod tests {
         run_git(repo, &["commit", "--quiet", "-m", msg]);
     }
 
+    fn status_for_session(repo: &Path, session: &crate::repo_state::Session) -> PlanWorktreeStatus {
+        compute_plan_worktree_status_parts(repo, &session.plan_path, &session.body_hash).unwrap()
+    }
+
+    fn context_from_state(state: &RepoState, sid: &str, author: &str) -> Option<serde_json::Value> {
+        let sid = SessionId::from(sid.to_string());
+        let snapshot = SessionSnapshotBundle::from_state_for(state, &sid)?;
+        Some(get_context_response(&snapshot, &AgentLabel::from(author.to_string())).unwrap())
+    }
+
     #[tokio::test]
     async fn plan_worktree_clean_after_commit() {
         let dir = init_repo();
@@ -423,7 +475,7 @@ mod tests {
 
         let state = rebuild_repo(dir.path()).await.unwrap();
         let session = state.sessions.values().next().unwrap();
-        let status = compute_plan_worktree_status(dir.path(), session).unwrap();
+        let status = status_for_session(dir.path(), session);
         assert_eq!(status, PlanWorktreeStatus::Clean);
     }
 
@@ -441,7 +493,7 @@ mod tests {
 
         let state = rebuild_repo(dir.path()).await.unwrap();
         let session = state.sessions.values().next().unwrap();
-        let status = compute_plan_worktree_status(dir.path(), session).unwrap();
+        let status = status_for_session(dir.path(), session);
         assert_eq!(status, PlanWorktreeStatus::BodyDirty);
     }
 
@@ -458,7 +510,7 @@ mod tests {
 
         let state = rebuild_repo(dir.path()).await.unwrap();
         let session = state.sessions.values().next().unwrap();
-        let status = compute_plan_worktree_status(dir.path(), session).unwrap();
+        let status = status_for_session(dir.path(), session);
         assert_eq!(status, PlanWorktreeStatus::DoneMovePending);
     }
 
@@ -472,7 +524,7 @@ mod tests {
 
         let state = rebuild_repo(dir.path()).await.unwrap();
         let session = state.sessions.values().next().unwrap();
-        let status = compute_plan_worktree_status(dir.path(), session).unwrap();
+        let status = status_for_session(dir.path(), session);
         assert_eq!(status, PlanWorktreeStatus::MissingActivePlanFile);
     }
 
@@ -483,7 +535,8 @@ mod tests {
         commit(dir.path(), "add plan");
 
         let state = rebuild_repo(dir.path()).await.unwrap();
-        let v = list_sessions_response(dir.path(), &state).unwrap();
+        let snapshot = RepoSnapshot::from_state(&state);
+        let v = list_sessions_response(&snapshot).unwrap();
         let arr = v.as_array().unwrap();
         assert_eq!(arr.len(), 1);
         assert_eq!(arr[0]["id"], "foo");
@@ -498,13 +551,7 @@ mod tests {
     async fn get_context_returns_none_for_unknown_session() {
         let dir = init_repo();
         let state = rebuild_repo(dir.path()).await.unwrap();
-        let v = get_context_response(
-            dir.path(),
-            &state,
-            &SessionId::from("missing".to_string()),
-            &AgentLabel::from("reviewer".to_string()),
-        )
-        .unwrap();
+        let v = context_from_state(&state, "missing", "reviewer");
         assert!(v.is_none());
     }
 
@@ -517,14 +564,7 @@ mod tests {
         write_file(dir.path(), ".trinity/plans/foo.md", "# v2 uncommitted\n");
 
         let state = rebuild_repo(dir.path()).await.unwrap();
-        let v = get_context_response(
-            dir.path(),
-            &state,
-            &SessionId::from("foo".to_string()),
-            &AgentLabel::from("reviewer".to_string()),
-        )
-        .unwrap()
-        .unwrap();
+        let v = context_from_state(&state, "foo", "reviewer").unwrap();
         assert_eq!(v["plan_worktree_status"], "body_dirty");
         assert_eq!(v["waiting_on"]["role"], "master");
         assert_eq!(v["waiting_on"]["reason"], "commit_plan_revision");
@@ -539,14 +579,7 @@ mod tests {
         commit(dir.path(), "impl foo");
 
         let state = rebuild_repo(dir.path()).await.unwrap();
-        let v = get_context_response(
-            dir.path(),
-            &state,
-            &SessionId::from("foo".to_string()),
-            &AgentLabel::from("reviewer".to_string()),
-        )
-        .unwrap()
-        .unwrap();
+        let v = context_from_state(&state, "foo", "reviewer").unwrap();
         assert_eq!(v["phase"], "implementing");
         // No impl reviews yet → reviewers / impl_needs_initial_review
         assert_eq!(v["waiting_on"]["role"], "reviewers");
@@ -571,14 +604,7 @@ mod tests {
         write_file(dir.path(), &feedback_rel, "REQUEST_CHANGES\n\nMissing X.\n");
 
         let state = rebuild_repo(dir.path()).await.unwrap();
-        let v = get_context_response(
-            dir.path(),
-            &state,
-            &SessionId::from("foo".to_string()),
-            &AgentLabel::from("reviewer".to_string()),
-        )
-        .unwrap()
-        .unwrap();
+        let v = context_from_state(&state, "foo", "reviewer").unwrap();
         assert_eq!(v["waiting_on"]["role"], "master");
         assert_eq!(v["waiting_on"]["reason"], "address_plan_request_changes");
         let agents = v["waiting_on"]["agents"].as_array().unwrap();
@@ -600,15 +626,64 @@ mod tests {
         write_file(dir.path(), &feedback_rel, "APPROVE\n\nLGTM.\n");
 
         let state = rebuild_repo(dir.path()).await.unwrap();
-        let v = get_context_response(
-            dir.path(),
-            &state,
-            &SessionId::from("foo".to_string()),
-            &AgentLabel::from("master".to_string()),
-        )
-        .unwrap()
-        .unwrap();
+        let v = context_from_state(&state, "foo", "master").unwrap();
         assert_eq!(v["waiting_on"]["role"], "master");
         assert_eq!(v["waiting_on"]["reason"], "ready_to_implement");
+    }
+
+    struct BlockingStatusReader {
+        entered: std::sync::mpsc::Sender<()>,
+        release: std::sync::mpsc::Receiver<()>,
+    }
+
+    impl PlanStatusReader for BlockingStatusReader {
+        fn compute(
+            &self,
+            _repo_root: &Path,
+            _plan_path: &Path,
+            _body_hash: &ContentHash,
+        ) -> std::io::Result<PlanWorktreeStatus> {
+            self.entered.send(()).unwrap();
+            self.release.recv().unwrap();
+            Ok(PlanWorktreeStatus::Clean)
+        }
+    }
+
+    #[tokio::test]
+    async fn blocked_status_reader_does_not_hold_runtime_mutex() {
+        let dir = init_repo();
+        write_file(dir.path(), ".trinity/plans/foo.md", "# foo\n");
+        commit(dir.path(), "add plan");
+
+        let runtime = Runtime::new();
+        runtime.add_repo(dir.path().to_path_buf()).await.unwrap();
+        let snapshot = runtime
+            .snapshot_session(dir.path(), &SessionId::from("foo".to_string()))
+            .await
+            .unwrap()
+            .unwrap();
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let reader = BlockingStatusReader {
+            entered: entered_tx,
+            release: release_rx,
+        };
+        let author = AgentLabel::from("reviewer".to_string());
+
+        let handle = tokio::task::spawn_blocking(move || {
+            get_context_response_with_status_reader(&snapshot, &author, &reader).unwrap()
+        });
+        entered_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("status reader did not start");
+
+        tokio::time::timeout(Duration::from_secs(1), runtime.snapshot_repo(dir.path()))
+            .await
+            .expect("runtime mutex was held while status reader blocked")
+            .unwrap();
+
+        release_tx.send(()).unwrap();
+        let v = handle.await.unwrap();
+        assert_eq!(v["plan_worktree_status"], "clean");
     }
 }

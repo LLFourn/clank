@@ -68,12 +68,12 @@ async fn home(
     let repos = repos_to_render(&state, q.repo).await;
     let mut combined: Vec<Value> = Vec::new();
     for repo in repos {
-        let v = state
+        let snapshot = state
             .runtime
-            .read_repo(&repo, |s| list_sessions_response(&repo, s))
+            .snapshot_repo(&repo)
             .await
-            .map_err(AppError::runtime)?
-            .map_err(AppError::io)?;
+            .map_err(AppError::runtime)?;
+        let v = list_sessions_response(&snapshot).map_err(AppError::io)?;
         if let Some(arr) = v.as_array() {
             combined.extend(arr.iter().cloned());
         }
@@ -88,20 +88,17 @@ async fn session_detail(
 ) -> Result<Html<String>, AppError> {
     let repos = repos_to_render(&state, q.repo).await;
     for repo in repos {
-        let v = state
+        let snapshot = state
             .runtime
-            .read_repo(&repo, |s| {
-                get_context_response(
-                    &repo,
-                    s,
-                    &SessionId::from(session_id.clone()),
-                    &crate::lifecycle::AgentLabel::from("web".to_string()),
-                )
-            })
+            .snapshot_session(&repo, &SessionId::from(session_id.clone()))
             .await
-            .map_err(AppError::runtime)?
+            .map_err(AppError::runtime)?;
+        if let Some(snapshot) = snapshot {
+            let ctx = get_context_response(
+                &snapshot,
+                &crate::lifecycle::AgentLabel::from("web".to_string()),
+            )
             .map_err(AppError::io)?;
-        if let Some(ctx) = v {
             return Ok(Html(ui::session_page(&ctx)));
         }
     }
@@ -125,13 +122,10 @@ async fn move_to_done(
     let repo = PathBuf::from(&args.repo);
     let plan_path_rel = state
         .runtime
-        .read_repo(&repo, |s| {
-            s.sessions
-                .get(&SessionId::from(session_id.clone()))
-                .map(|sess| sess.plan_path.clone())
-        })
+        .snapshot_session(&repo, &SessionId::from(session_id.clone()))
         .await
         .map_err(AppError::runtime)?
+        .map(|snapshot| snapshot.session.plan_path)
         .ok_or_else(|| AppError::not_found(format!("session {session_id} not found")))?;
 
     let from = repo.join(&plan_path_rel);
@@ -215,13 +209,10 @@ async fn plan_revision_view(
     for repo in repos {
         let plan_path = state
             .runtime
-            .read_repo(&repo, |s| {
-                s.sessions
-                    .get(&SessionId::from(session_id.clone()))
-                    .map(|sess| sess.plan_path.clone())
-            })
+            .snapshot_session(&repo, &SessionId::from(session_id.clone()))
             .await
-            .map_err(AppError::runtime)?;
+            .map_err(AppError::runtime)?
+            .map(|snapshot| snapshot.session.plan_path);
         let Some(plan_path) = plan_path else {
             continue;
         };
@@ -250,12 +241,10 @@ async fn commit_diff_view(
     for repo in repos {
         let exists = state
             .runtime
-            .read_repo(&repo, |s| {
-                s.sessions
-                    .contains_key(&SessionId::from(session_id.clone()))
-            })
+            .snapshot_session(&repo, &SessionId::from(session_id.clone()))
             .await
-            .map_err(AppError::runtime)?;
+            .map_err(AppError::runtime)?
+            .is_some();
         if !exists {
             continue;
         }

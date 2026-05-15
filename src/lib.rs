@@ -7,6 +7,7 @@ pub mod projection;
 pub mod rebuild;
 pub mod repo_state;
 pub mod review_state;
+pub mod runtime_snapshot;
 
 // IO + runtime layers.
 pub mod fs_watcher;

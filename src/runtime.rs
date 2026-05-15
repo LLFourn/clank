@@ -4,7 +4,7 @@
 //! This module is the bridge between the pure core (rebuild + reducer)
 //! and the rest of the daemon. The notify wiring (separate, not yet
 //! written) feeds `FilesystemSignal` values into `handle_signal`;
-//! request handlers (MCP, HTTP) read state via `read_repo`.
+//! request handlers (MCP, HTTP) read state via owned snapshots.
 
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
@@ -17,9 +17,8 @@ use crate::disk_format::FeedbackPhase;
 use crate::fs_watcher::FilesystemSignal;
 use crate::lifecycle::{CommitSha, SessionId, content_hash};
 use crate::rebuild::{RebuildError, rebuild_repo};
-use crate::repo_state::{
-    AttributionResult, Feedback, HeldFeedback, LiveEvent, RepoState, Session, Trinity,
-};
+use crate::repo_state::{AttributionResult, Feedback, HeldFeedback, LiveEvent, Session, Trinity};
+use crate::runtime_snapshot::{RepoSnapshot, SessionSnapshotBundle};
 
 pub struct Runtime {
     state: Arc<Mutex<Trinity>>,
@@ -99,13 +98,43 @@ impl Runtime {
         }
     }
 
-    /// Read-only snapshot of a repo's state for request handlers. Holds the
-    /// mutex for the duration of the closure. Path is canonicalized so
-    /// callers from different surfaces hit the same HashMap key.
-    pub async fn read_repo<R>(
+    /// Clone a repo snapshot while holding the runtime lock. Callers do
+    /// disk and git I/O after this returns.
+    pub async fn snapshot_repo(&self, repo_root: &Path) -> Result<RepoSnapshot, RuntimeError> {
+        let canonical = dunce::canonicalize(repo_root)
+            .unwrap_or_else(|_| repo_root.to_path_buf());
+        let trinity = self.state.lock().await;
+        let state = trinity
+            .repos
+            .get(&canonical)
+            .ok_or_else(|| RuntimeError::UnknownRepo(canonical.clone()))?;
+        Ok(RepoSnapshot::from_state(state))
+    }
+
+    /// Clone one session plus the repo-level indexes its projections need.
+    /// `Ok(None)` means the repo is known but the session is not committed.
+    pub async fn snapshot_session(
         &self,
         repo_root: &Path,
-        f: impl FnOnce(&RepoState) -> R,
+        session_id: &SessionId,
+    ) -> Result<Option<SessionSnapshotBundle>, RuntimeError> {
+        let canonical = dunce::canonicalize(repo_root)
+            .unwrap_or_else(|_| repo_root.to_path_buf());
+        let trinity = self.state.lock().await;
+        let state = trinity
+            .repos
+            .get(&canonical)
+            .ok_or_else(|| RuntimeError::UnknownRepo(canonical.clone()))?;
+        Ok(SessionSnapshotBundle::from_state_for(state, session_id))
+    }
+
+    /// Read-only in-memory access for tests. Do not call disk-aware
+    /// helpers from the closure.
+    #[cfg(test)]
+    pub(crate) async fn read_repo<R>(
+        &self,
+        repo_root: &Path,
+        f: impl FnOnce(&crate::repo_state::RepoState) -> R,
     ) -> Result<R, RuntimeError> {
         let canonical = dunce::canonicalize(repo_root)
             .unwrap_or_else(|_| repo_root.to_path_buf());
@@ -785,19 +814,12 @@ mod tests {
         .unwrap();
 
         // The gate should now resolve to ready_to_implement.
-        let v = rt
-            .read_repo(dir.path(), |s| {
-                get_context_response(
-                    dir.path(),
-                    s,
-                    &SessionId::from("foo".to_string()),
-                    &AgentLabel::from("master".to_string()),
-                )
-            })
+        let snapshot = rt
+            .snapshot_session(dir.path(), &SessionId::from("foo".to_string()))
             .await
             .unwrap()
-            .unwrap()
             .unwrap();
+        let v = get_context_response(&snapshot, &AgentLabel::from("master".to_string())).unwrap();
         assert_eq!(v["waiting_on"]["reason"], "ready_to_implement");
 
         let events = rt.live_events_snapshot().await;
@@ -845,19 +867,12 @@ mod tests {
         .await
         .unwrap();
 
-        let v = rt
-            .read_repo(dir.path(), |s| {
-                get_context_response(
-                    dir.path(),
-                    s,
-                    &SessionId::from("foo".to_string()),
-                    &AgentLabel::from("master".to_string()),
-                )
-            })
+        let snapshot = rt
+            .snapshot_session(dir.path(), &SessionId::from("foo".to_string()))
             .await
             .unwrap()
-            .unwrap()
             .unwrap();
+        let v = get_context_response(&snapshot, &AgentLabel::from("master".to_string())).unwrap();
         // Gate falls back to no participants → reviewers / plan_needs_initial_review.
         assert_eq!(v["waiting_on"]["reason"], "plan_needs_initial_review");
     }
@@ -1037,11 +1052,8 @@ mod tests {
         let rt = Runtime::new();
         rt.add_repo(dir.path().to_path_buf()).await.unwrap();
 
-        let v = rt
-            .read_repo(dir.path(), |s| list_sessions_response(dir.path(), s))
-            .await
-            .unwrap()
-            .unwrap();
+        let snapshot = rt.snapshot_repo(dir.path()).await.unwrap();
+        let v = list_sessions_response(&snapshot).unwrap();
         let arr = v.as_array().unwrap();
         assert_eq!(arr.len(), 2);
     }
