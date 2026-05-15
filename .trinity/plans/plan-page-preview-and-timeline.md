@@ -40,8 +40,9 @@ Two pages, five changes:
    on the homepage with basename, canonical path, plan count, last
    activity. Each row has an "unwatch" button that deregisters the
    repo from the runtime, stops its filesystem watcher, and removes
-   it from `~/.trinity/repos` — without touching anything inside the
-   repo itself.
+   it from the configured repos file (`--repos` /
+   `$TRINITY_REPOS`, defaulting to `~/.trinity/repos`) — without
+   touching anything inside the repo itself.
 
 The plan-landing changes (1, 2) and the homepage changes (3, 4, 5)
 are independent — they could ship in either order — but bundle into
@@ -240,19 +241,43 @@ Two new fields on `/api/plan/{repo}/{stem_md}`:
   full" toggle should appear at all). Server-side hint, not a
   truncation — the full body is always sent.
 
-`TimelineEvent::Commit*` variants gain `subject: String`. The
-subject is the first line of the commit message (`git log -1
---format=%s <sha>`). Per-snapshot the daemon already iterates
-commits to build the timeline; subjects come from one extra git
-invocation per snapshot — or batched as `git log --first-parent
---reverse --format=%H%x00%s` so it's one process spawn per repo
-rebuild instead of per-commit.
+`TimelineEvent::Commit*` variants gain `subject: String`, and the
+snapshot model gains commit timestamps used by `last_activity_ts`
+(see homepage section). Both come from one batched git invocation
+per repo rebuild:
 
-The batched form fits the existing `commit_order` machinery in
-`git_io::list_first_parent_commits`. The subject map gets stored
-once per rebuild on `RepoState` (or `RepoSnapshot`) as
-`commit_subjects: BTreeMap<CommitSha, String>` and merged into
-timeline events at projection time. No per-request git calls.
+```
+git log --first-parent --reverse --format=%H%x00%at%x00%s
+```
+
+`%at` is author-time as unix seconds. The output is parsed into a
+single per-commit metadata struct:
+
+```rust
+pub struct CommitMeta {
+    pub sha: CommitSha,
+    pub author_ts: i64,
+    pub subject: String,
+}
+```
+
+Stored on `RepoState` (and copied into `RepoSnapshot` /
+`PlanSnapshotBundle`) as `commit_meta: BTreeMap<CommitSha,
+CommitMeta>`. The existing `commit_order: Vec<CommitSha>` is
+preserved (chronological walk order); `commit_meta` is the lookup
+table. Replaces the planned `commit_subjects` map — one batched
+fetch carries both pieces.
+
+Timeline projection threads `subject` from `commit_meta` into
+`Commit{Plan,Impl,Mixed}` events; `last_activity_ts` reads
+`author_ts` from the same map. No per-request git calls in either
+code path.
+
+Tests cover: `commit_meta` populated for plan-only revisions,
+impl commits, and mixed commits; `author_ts` parses as a positive
+integer; `last_activity_ts` for a plan with only a plan-intro
+commit equals the intro's `author_ts`; same for a plan whose most
+recent activity is feedback (mtime wins over older commit time).
 
 ### Backend — expanded commit data
 
@@ -261,10 +286,25 @@ which already exists, returns `{repo, plan_id, slug, commit_sha,
 diff_files, feedback}`. Two adjustments:
 
 - Add `subject: String` and `message_body: String` to the commit
-  response (subject is the first line, message_body is everything
-  after the first blank line). `git_io::show_commit` already
-  returns the full commit text; parsing those two pieces out is one
-  helper.
+  response. **Do NOT parse these out of `git_io::show_commit`** —
+  its output is `headers + indented message + patch`, so splitting
+  on the first blank line returns the message PLUS the patch text,
+  which would then render twice in the accordion (once in
+  `<pre>{message_body}</pre>`, once in `<StructuredDiff/>`).
+  Instead add a metadata-only helper:
+  ```rust
+  pub async fn commit_message(
+      repo: &Path,
+      sha: &CommitSha,
+  ) -> Result<(String /* subject */, String /* body */), GitIoError>
+  ```
+  implemented as `git show -s --format=%s%x00%b <sha>`. The `-s`
+  suppresses the patch; `%s` is the subject; `%b` is the body
+  without the subject; `%x00` is the null separator. Split the
+  output on the NUL byte.
+- Regression test: commit a change with a multi-paragraph extended
+  message, call the helper, assert `message_body` contains the
+  paragraphs and contains no `diff --git` substring.
 - The accordion only needs the diff once per expand; the response
   is small enough to fetch on demand without paging.
 
@@ -481,26 +521,38 @@ Files: `src/git_io.rs`, `src/repo_state.rs`, `src/runtime_snapshot.rs`,
 `src/server/http.rs`.
 
 - `list_first_parent_commits` (or its sibling) returns
-  `(CommitSha, String)` pairs via `--format=%H%x00%s`. Parse into
-  a `commit_subjects` BTreeMap stored on `RepoState`.
-- `RepoSnapshot` and `PlanSnapshotBundle` carry the subjects map.
-- Timeline projection threads subjects into `Commit{Plan,Impl,Mixed}`
-  events. The daemon's `TimelineEvent` enum (in `repo_state.rs`)
-  gains a `subject` field; projection populates it.
+  `CommitMeta { sha, author_ts, subject }` via
+  `--format=%H%x00%at%x00%s`. Parse into a `commit_meta:
+  BTreeMap<CommitSha, CommitMeta>` stored on `RepoState`.
+- `RepoSnapshot` and `PlanSnapshotBundle` carry the `commit_meta`
+  map.
+- Timeline projection threads `subject` from `commit_meta` into
+  `Commit{Plan,Impl,Mixed}` events. The daemon's `TimelineEvent`
+  enum (in `repo_state.rs`) gains a `subject` field; projection
+  populates it.
+- `last_activity_ts` per plan reads `author_ts` from `commit_meta`
+  for the newest commit attributed to the plan, taken alongside
+  the max feedback mtime and the plan-intro time.
 - `api_plan_detail` response gains `plan_body_html` (call
   `render_markdown(&snapshot.plan.body)`) and `plan_body_truncated`
   (computed against the raw length).
 - `api_commit_diff` response gains `subject` and `message_body`
-  parsed from `show_commit` output (split on the first blank line
-  after the header block).
+  via the new `git_io::commit_message` helper (`git show -s
+  --format=%s%x00%b`). The helper is metadata-only — it does NOT
+  invoke `git show <sha>` and trim the patch out, which would be
+  fragile against the headers/message/patch format.
 - `api_plans` adds `last_activity_ts` per plan row and returns
   rows sorted by it descending; conflicts likewise. Computed
   daemon-side from `max(latest_commit_time, latest_feedback_mtime,
   plan_intro_time)`.
-- Snapshot/serialization tests cover: subject populated, body_html
-  rendered, message_body parsed correctly for commits with and
-  without an extended body, `last_activity_ts` correct for commit-only
-  and feedback-only changes.
+- Snapshot/serialization tests cover: `commit_meta` populated for
+  plan-only, impl-only, and mixed commits; subject + author_ts both
+  present; `plan_body_html` rendered; commit `message_body` parsed
+  via the metadata-only `git show -s --format=%s%x00%b` helper and
+  contains no `diff --git` substring even for commits with large
+  patches; `last_activity_ts` correct when (a) only the plan_intro
+  exists, (b) the newest commit is more recent than any feedback,
+  (c) the newest feedback mtime is more recent than the last commit.
 
 No frontend changes in this phase; existing UI still works (it
 ignores the new fields).
@@ -623,7 +675,8 @@ Files: `frontend/src/api.rs`, `frontend/src/components/session_detail.rs`,
     last activity.
 14. Each repo row has an "unwatch" button; clicking it prompts
     inline for confirmation, then removes the repo from runtime
-    state, watcher set, and `~/.trinity/repos`.
+    state, watcher set, and the configured repos file
+    (`AppState.repos_path`, NOT the hardcoded `~/.trinity/repos`).
 15. After unwatch, the plans table refetches and the unwatched
     repo's plans disappear within one SSE tick — no full reload.
 
