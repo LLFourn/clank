@@ -215,7 +215,7 @@ impl Runtime {
                             LiveEvent {
                                 ts: now,
                                 repo: repo_root.to_path_buf(),
-                                session_id: None,
+                                plan_path: None,
                                 kind: "repo_rebuilt",
                                 payload: serde_json::Value::Null,
                             },
@@ -235,16 +235,17 @@ impl Runtime {
                 let Some(state) = trinity.repos.get(repo_root) else {
                     return Err(RuntimeError::UnknownRepo(repo_root.to_path_buf()));
                 };
-                if !state.plans.contains_key(&session_id) {
+                let Some(plan) = state.plans.get(&session_id) else {
                     // Untracked draft — drop silently per the plan.
                     return Ok(());
-                }
+                };
+                let plan_path = plan.plan_path.clone();
                 self.push_event(
                     &mut trinity,
                     LiveEvent {
                         ts: now,
                         repo: repo_root.to_path_buf(),
-                        session_id: Some(session_id),
+                        plan_path: Some(plan_path),
                         kind: "plan_worktree_changed",
                         payload: serde_json::json!({"path": path.to_string_lossy()}),
                     },
@@ -293,12 +294,13 @@ impl Runtime {
                         parsed.author.clone(),
                         body,
                     );
+                    let plan_path = state.plans.get(&session_id).map(|p| p.plan_path.clone());
                     self.push_event(
                         &mut trinity,
                         LiveEvent {
                             ts: now,
                             repo: repo_root.to_path_buf(),
-                            session_id: Some(session_id),
+                            plan_path,
                             kind: "feedback_changed",
                             payload: serde_json::Value::Null,
                         },
@@ -315,12 +317,13 @@ impl Runtime {
                     return Ok(());
                 };
                 upsert_feedback(session, abs_path, parsed, body);
+                let plan_path = state.plans.get(&session_id).map(|p| p.plan_path.clone());
                 self.push_event(
                     &mut trinity,
                     LiveEvent {
                         ts: now,
                         repo: repo_root.to_path_buf(),
-                        session_id: Some(session_id),
+                        plan_path,
                         kind: "feedback_changed",
                         payload: serde_json::Value::Null,
                     },
@@ -340,12 +343,13 @@ impl Runtime {
                     return Ok(());
                 };
                 remove_feedback(session, &parsed);
+                let plan_path = state.plans.get(&session_id).map(|p| p.plan_path.clone());
                 self.push_event(
                     &mut trinity,
                     LiveEvent {
                         ts: now,
                         repo: repo_root.to_path_buf(),
-                        session_id: Some(session_id),
+                        plan_path,
                         kind: "feedback_removed",
                         payload: serde_json::Value::Null,
                     },
@@ -647,7 +651,7 @@ fn _hash_ref(s: &str) -> crate::lifecycle::ContentHash {
 mod tests {
     use super::*;
     use crate::lifecycle::{AgentLabel, CommitSha, SessionId};
-    use crate::mcp_response::{get_context_response, list_sessions_response};
+    use crate::mcp_response::{get_context_response, list_plans_response};
     use std::path::Path;
     use std::process::Command;
 
@@ -749,8 +753,13 @@ mod tests {
         .unwrap();
 
         let events = rt.live_events_snapshot().await;
-        assert!(events.iter().any(|e| e.kind == "plan_worktree_changed"
-            && e.session_id.as_ref().map(|s| s.as_str()) == Some("foo")));
+        assert!(events.iter().any(|e| {
+            e.kind == "plan_worktree_changed"
+                && e.plan_path
+                    .as_ref()
+                    .map(|p| p.to_string_lossy().to_string())
+                    == Some(".trinity/plans/foo.md".to_string())
+        }));
     }
 
     #[tokio::test]
@@ -1026,7 +1035,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn list_sessions_via_runtime() {
+    async fn list_plans_via_runtime() {
         let dir = init_repo();
         write_file(dir.path(), ".trinity/plans/foo.md", "# foo\n");
         commit(dir.path(), "add foo");
@@ -1037,8 +1046,8 @@ mod tests {
         rt.add_repo(dir.path().to_path_buf()).await.unwrap();
 
         let snapshot = rt.snapshot_repo(dir.path()).await.unwrap();
-        let v = list_sessions_response(&snapshot).unwrap();
-        let arr = v.as_array().unwrap();
+        let v = list_plans_response(&snapshot).unwrap();
+        let arr = v["plans"].as_array().unwrap();
         assert_eq!(arr.len(), 2);
     }
 

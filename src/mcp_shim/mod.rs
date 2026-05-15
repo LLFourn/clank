@@ -379,13 +379,14 @@ impl ServerHandler for ShimHandler {
             instructions: Some(
                 "Trinity coordinates multi-agent peer review around plan files committed \
                  to git and feedback files in the working tree. \n\n\
-                 Discover sessions with `list_sessions` or create one with `start_plan`. \
-                 To drive an agent loop, call `wait_for_work({role: \"master\" | \"reviewers\"})` — \
-                 it blocks until a session needs your role and returns minimal identifiers; \
-                 for each match, follow up with `get_context({repo, session_id})` for the \
-                 full session state. This avoids polling. \n\n\
+                 Discover plans with `list_plans` or create one with `start_plan`. \
+                 To drive an agent loop, call `wait_for_work({role: \"master\" | \"reviewers\", plan_path})` — \
+                 it blocks until the plan needs your role and returns minimal identifiers; \
+                 for each match, follow up with `get_context({repo, plan_path})` for the \
+                 full plan state. This avoids polling. \n\n\
                  The shim caches the last `label` / `author_label` you passed so subsequent \
-                 calls don't need to repeat it."
+                 calls don't need to repeat it. `plan_path` is NEVER cached — pass it on \
+                 every call to keep the target explicit."
                     .into(),
             ),
         }
@@ -522,8 +523,24 @@ mod tests {
     #[test]
     fn fill_label_from_cache_skips_tools_without_label_arg() {
         let h = handler_with_cache(Some("codex"));
-        let out = h.fill_label_from_cache("list_sessions", serde_json::json!({"repo": "/r"}));
+        let out = h.fill_label_from_cache("list_plans", serde_json::json!({"repo": "/r"}));
         assert!(out.get("author_label").is_none());
         assert!(out.get("label").is_none());
+    }
+
+    #[test]
+    fn fill_label_from_cache_does_not_autofill_plan_path() {
+        // plan_path is the target of every canonical call. The shim must
+        // never cache or autofill it, even if a cached label exists for
+        // the same tool — see plan-path-identity §4b.
+        let h = handler_with_cache(Some("codex"));
+        let out = h.fill_label_from_cache(
+            "wait_for_work",
+            serde_json::json!({"role": "reviewers", "author_label": "codex"}),
+        );
+        assert!(
+            out.get("plan_path").is_none(),
+            "shim must never autofill plan_path"
+        );
     }
 }

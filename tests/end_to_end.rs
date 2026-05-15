@@ -154,7 +154,7 @@ async fn mcp_get_context_via_internal_tool_call() {
     let req = json!({
         "cwd": dir.path(),
         "tool": "get_context",
-        "arguments": { "session_id": "foo" }
+        "arguments": { "plan_path": ".trinity/plans/foo.md" }
     });
     let resp = client
         .post(format!("{}/internal/tool_call", url))
@@ -183,7 +183,7 @@ async fn mcp_get_context_for_uncommitted_returns_session_not_committed() {
     let req = json!({
         "cwd": dir.path(),
         "tool": "get_context",
-        "arguments": { "session_id": "foo" }
+        "arguments": { "plan_path": ".trinity/plans/foo.md" }
     });
     let resp = client
         .post(format!("{}/internal/tool_call", url))
@@ -193,7 +193,7 @@ async fn mcp_get_context_for_uncommitted_returns_session_not_committed() {
         .unwrap();
     handle.abort();
     let body: serde_json::Value = resp.json().await.unwrap();
-    assert_eq!(body["result"]["error"], "session_not_committed");
+    assert_eq!(body["result"]["error"], "plan_not_committed");
 }
 
 #[tokio::test]
@@ -208,7 +208,7 @@ async fn mcp_list_sessions() {
     let client = reqwest::Client::new();
     let req = json!({
         "cwd": dir.path(),
-        "tool": "list_sessions",
+        "tool": "list_plans",
         "arguments": {}
     });
     let resp = client
@@ -219,8 +219,8 @@ async fn mcp_list_sessions() {
         .unwrap();
     handle.abort();
     let body: serde_json::Value = resp.json().await.unwrap();
-    let sessions = body["result"]["sessions"].as_array().unwrap();
-    assert_eq!(sessions.len(), 2);
+    let plans = body["result"]["plans"].as_array().unwrap();
+    assert_eq!(plans.len(), 2);
 }
 
 #[tokio::test]
@@ -236,7 +236,7 @@ async fn pr_hint_present_in_implementing_phase() {
     let req = json!({
         "cwd": dir.path(),
         "tool": "get_context",
-        "arguments": { "session_id": "foo" }
+        "arguments": { "plan_path": ".trinity/plans/foo.md" }
     });
     let resp = client
         .post(format!("{}/internal/tool_call", url))
@@ -275,7 +275,7 @@ async fn plan_revision_route_renders_blob() {
     let req = json!({
         "cwd": dir.path(),
         "tool": "get_context",
-        "arguments": { "session_id": "foo" }
+        "arguments": { "plan_path": ".trinity/plans/foo.md" }
     });
     let ctx: serde_json::Value = client
         .post(format!("{}/internal/tool_call", url))
@@ -316,7 +316,7 @@ async fn commit_diff_route_renders_patch() {
     let req = json!({
         "cwd": dir.path(),
         "tool": "get_context",
-        "arguments": { "session_id": "foo" }
+        "arguments": { "plan_path": ".trinity/plans/foo.md" }
     });
     let ctx: serde_json::Value = client
         .post(format!("{}/internal/tool_call", url))
@@ -404,7 +404,7 @@ async fn start_plan_persists_repo_to_registry() {
     let req = json!({
         "cwd": dir.path(),
         "tool": "start_plan",
-        "arguments": { "session_id": "foo", "label": "test-agent" }
+        "arguments": { "plan_path": ".trinity/plans/foo.md", "label": "test-agent" }
     });
     let resp = client
         .post(format!("{}/internal/tool_call", url))
@@ -453,8 +453,8 @@ async fn branch_switch_rebuilds_repo_state() {
     // Give the watcher time to fire HeadChanged + rebuild.
     tokio::time::sleep(Duration::from_millis(500)).await;
 
-    // list_sessions should now show both foo and bar (we're on feat).
-    let req = json!({"cwd": dir.path(), "tool": "list_sessions", "arguments": {}});
+    // list_plans should now show both foo and bar (we're on feat).
+    let req = json!({"cwd": dir.path(), "tool": "list_plans", "arguments": {}});
     let v: serde_json::Value = client
         .post(format!("{}/internal/tool_call", url))
         .json(&req)
@@ -464,14 +464,14 @@ async fn branch_switch_rebuilds_repo_state() {
         .json()
         .await
         .unwrap();
-    let ids: Vec<&str> = v["result"]["sessions"]
+    let slugs: Vec<&str> = v["result"]["plans"]
         .as_array()
         .unwrap()
         .iter()
-        .filter_map(|s| s["id"].as_str())
+        .filter_map(|s| s["slug"].as_str())
         .collect();
-    assert!(ids.contains(&"foo"), "got: {:?}", ids);
-    assert!(ids.contains(&"bar"), "got: {:?}", ids);
+    assert!(slugs.contains(&"foo"), "got: {:?}", slugs);
+    assert!(slugs.contains(&"bar"), "got: {:?}", slugs);
 
     // Switch back to main. bar's plan file doesn't exist there.
     run_git(dir.path(), &["checkout", "-q", "main"]);
@@ -486,18 +486,18 @@ async fn branch_switch_rebuilds_repo_state() {
         .json()
         .await
         .unwrap();
-    let ids: Vec<&str> = v["result"]["sessions"]
+    let slugs: Vec<&str> = v["result"]["plans"]
         .as_array()
         .unwrap()
         .iter()
-        .filter_map(|s| s["id"].as_str())
+        .filter_map(|s| s["slug"].as_str())
         .collect();
     handle.abort();
-    assert!(ids.contains(&"foo"));
+    assert!(slugs.contains(&"foo"));
     assert!(
-        !ids.contains(&"bar"),
+        !slugs.contains(&"bar"),
         "bar should be gone after switching to main; got: {:?}",
-        ids
+        slugs
     );
 }
 
@@ -514,7 +514,7 @@ async fn feedback_renders_on_session_page() {
     let req = json!({
         "cwd": dir.path(),
         "tool": "get_context",
-        "arguments": { "session_id": "foo" }
+        "arguments": { "plan_path": ".trinity/plans/foo.md" }
     });
     let ctx: serde_json::Value = client
         .post(format!("{}/internal/tool_call", url))
@@ -539,7 +539,7 @@ async fn feedback_renders_on_session_page() {
     let req2 = json!({
         "cwd": dir.path(),
         "tool": "get_context",
-        "arguments": { "session_id": "foo" }
+        "arguments": { "plan_path": ".trinity/plans/foo.md" }
     });
     let ctx2: serde_json::Value = client
         .post(format!("{}/internal/tool_call", url))

@@ -15,17 +15,17 @@ pub struct ToolDescriptor {
 /// Four coordination tools (plus the `echo_cwd` diagnostic stub).
 ///
 /// `start_plan` creates the plan file in the working tree; the agent must
-/// then commit it before Trinity treats the session as live.
+/// then commit it before Trinity treats the plan as live.
 ///
-/// `get_context` returns the canonical per-session waiting_on, phase,
+/// `get_context` returns the canonical per-plan waiting_on, phase,
 /// plan_worktree_status, review_gate, and pr_hint. Read-only.
 ///
-/// `list_sessions` returns the in-memory session summary for one or all
-/// known repos.
+/// `list_plans` returns the in-memory plan summary for the caller's repo,
+/// including any plan-key conflicts the operator must resolve.
 ///
-/// `wait_for_work` long-polls until a session needs the caller's role,
-/// then returns minimal identifiers. Replaces poll-loops over
-/// `get_context` / `list_sessions`.
+/// `wait_for_work` long-polls until a plan needs the caller's role, then
+/// returns minimal identifiers. Replaces poll-loops over `get_context` /
+/// `list_plans`.
 pub fn catalog() -> Vec<ToolDescriptor> {
     vec![
         ToolDescriptor {
@@ -40,11 +40,14 @@ pub fn catalog() -> Vec<ToolDescriptor> {
             }),
         },
         ToolDescriptor {
-            name: "list_sessions".to_string(),
-            description: "List Trinity sessions in the caller's repo. Default repo is resolved \
+            name: "list_plans".to_string(),
+            description: "List Trinity plans in the caller's repo. Default repo is resolved \
                           via `git rev-parse --show-toplevel`; pass `repo` (absolute path) to \
-                          target a different watched repo. Each row: id, plan_path, phase, \
-                          plan_worktree_status, waiting_on."
+                          target a different watched repo. Response: `{ plans, conflicts }`. \
+                          Each plan row: `{ repo, plan_path, slug, phase, plan_worktree_status, \
+                          waiting_on }`. Each conflict row: `{ slug, paths }` — the same plan \
+                          stem maps to multiple files on disk; operator must resolve before \
+                          any feedback can route to that plan."
                 .to_string(),
             input_schema: json!({
                 "type": "object",
@@ -59,47 +62,62 @@ pub fn catalog() -> Vec<ToolDescriptor> {
         },
         ToolDescriptor {
             name: "start_plan".to_string(),
-            description: "Create a new plan file at `.trinity/plans/<session_id>.md` in the \
-                          caller's repo. Adopts an existing file (never overwrites body). \
-                          Ensures `.gitignore` excludes `.trinity/feedback/` and \
-                          `.trinity/cache/` but keeps `.trinity/plans/` tracked.\n\n\
-                          The session does NOT exist in Trinity until the file is committed. \
-                          After this call, edit the plan file body and then `git add` + \
-                          `git commit` — that commit is the plan_intro under the walk-back \
-                          attribution model.\n\n\
-                          Inputs: `session_id` (URL-safe slug, e.g. `my-plan`); `label` \
-                          (attribution name for the agent).\n\n\
+            description: "Create a new plan file at the caller-supplied `plan_path` (must be \
+                          `.trinity/plans/<stem>.md` — not nested, not under `done/`). Adopts \
+                          an existing file (never overwrites body). Ensures `.gitignore` \
+                          excludes `.trinity/feedback/` and `.trinity/cache/` but keeps \
+                          `.trinity/plans/` tracked.\n\n\
+                          The plan does NOT exist in Trinity until the file is committed. \
+                          After this call, edit the plan body and then `git add` + `git commit` \
+                          — that commit is the plan_intro under the walk-back attribution \
+                          model.\n\n\
+                          Inputs:\n\
+                          - `plan_path` (required, repo-relative): canonical path to the new \
+                            plan file. Rejected if outside `.trinity/plans/`, nested, in \
+                            `done/`, or its stem already names an existing plan or conflict.\n\
+                          - `label` (required): attribution name for the agent.\n\
+                          - `repo` (optional, absolute path): defaults to the caller's \
+                            cwd-repo.\n\n\
                           Response: `{ canonical_path, committed, next_step }`. `committed` \
                           is `false` until the user commits."
                 .to_string(),
             input_schema: json!({
                 "type": "object",
-                "required": ["session_id", "label"],
+                "required": ["plan_path", "label"],
                 "properties": {
-                    "session_id": {"type": "string"},
-                    "label": {"type": "string"}
+                    "plan_path": {
+                        "type": "string",
+                        "description": "Repo-relative path: .trinity/plans/<stem>.md"
+                    },
+                    "label": {"type": "string"},
+                    "repo": {
+                        "type": "string",
+                        "description": "Absolute repo root path. Optional; defaults to the caller's cwd-repo."
+                    }
                 },
                 "additionalProperties": false
             }),
         },
         ToolDescriptor {
             name: "wait_for_work".to_string(),
-            description: "Block until one named session in one repo needs the caller's role, \
+            description: "Block until the named plan in the named repo needs the caller's role, \
                           then return the work to do plus the file paths to act on. This is \
                           the idiomatic way to drive an agent loop — replaces polling \
-                          `list_sessions` / `get_context` on a timer.\n\n\
-                          Single-session, single-repo by design: you say which session you're \
-                          watching, the response says what to do for that session.\n\n\
+                          `list_plans` / `get_context` on a timer.\n\n\
+                          Single-plan, single-repo by design: you say which plan you're \
+                          watching (`plan_path` is the canonical target on every call), the \
+                          response says what to do.\n\n\
                           Inputs:\n\
                           - `role` (required, `master` | `reviewers`).\n\
-                          - `session_id` (required): the session you're watching.\n\
+                          - `plan_path` (required, repo-relative): the plan you're watching, \
+                          e.g. `.trinity/plans/leptos-frontend.md` or \
+                          `.trinity/plans/done/runtime-lock-boundaries.md`. The shim does \
+                          NOT cache this across calls — pass it on every invocation so the \
+                          target is always explicit.\n\
                           - `author_label` (daemon-required, schema-optional for shim \
                           autofill): your label. Used to construct the canonical reviewer \
                           write path for `review_plan` / `review_impl`. The MCP shim caches \
-                          this across calls so you usually pass it once; strict MCP clients \
-                          that validate the schema before invoking can omit it on subsequent \
-                          calls and the shim fills from cache. Daemon rejects calls that \
-                          arrive without one after autofill.\n\
+                          this across calls.\n\
                           - `repo` (optional absolute path): defaults to the caller's \
                           cwd-repo (via `git rev-parse --show-toplevel`). HTTP callers must \
                           pass this explicitly.\n\
@@ -131,28 +149,11 @@ pub fn catalog() -> Vec<ToolDescriptor> {
                           - `implement_and_commit` → `[<plan file>]`. Plan is approved; \
                           start implementing.\n\
                           - `move_to_done` → `[<plan file>]`. Implementation approved; move \
-                          the plan to `.trinity/plans/done/` and commit.\n\n\
-                          Typical reviewer loop:\n\
-                          ```\n\
-                          loop {\n\
-                            let r = wait_for_work({\n\
-                              role: \"reviewers\",\n\
-                              session_id: \"my-feature\",\n\
-                              author_label: \"codex\"\n\
-                            });\n\
-                            if r.timed_out { continue; }\n\
-                            // r.work == \"review_impl\"\n\
-                            // r.locations[0] == \".trinity/feedback/my-feature/impl/<sha>/codex.md\"\n\
-                            // Read the impl commit, write your verdict to that path.\n\
-                          }\n\
-                          ```\n\n\
-                          Master loop is the same with `role: \"master\"` — the response will \
-                          tell you whether to commit a plan revision, address request_changes, \
-                          implement, or move to done."
+                          the plan to `.trinity/plans/done/` and commit."
                 .to_string(),
             input_schema: json!({
                 "type": "object",
-                "required": ["role", "session_id"],
+                "required": ["role", "plan_path"],
                 "additionalProperties": false,
                 "properties": {
                     "role": {
@@ -160,9 +161,9 @@ pub fn catalog() -> Vec<ToolDescriptor> {
                         "enum": ["master", "reviewers"],
                         "description": "Which role's attention you're polling for."
                     },
-                    "session_id": {
+                    "plan_path": {
                         "type": "string",
-                        "description": "The single session you're watching. Use `list_sessions` to discover ids."
+                        "description": "Repo-relative path to the plan file. Pass it on every call — the shim does NOT cache plan_path. Discover plans with `list_plans`."
                     },
                     "author_label": {
                         "type": "string",
@@ -184,25 +185,32 @@ pub fn catalog() -> Vec<ToolDescriptor> {
         },
         ToolDescriptor {
             name: "get_context".to_string(),
-            description: "Returns the per-session view: phase (planning | implementing | done), \
+            description: "Returns the per-plan view: phase (planning | implementing | done), \
                           plan_worktree_status (clean | body_dirty | done_move_pending | \
                           missing_active_plan_file), waiting_on (role + reason + agents + \
                           description), review_gate (SHA-anchored), latest_plan_revision, \
                           latest_implementation_revision.\n\n\
-                          When `session_id` doesn't correspond to a plan file in HEAD, returns \
-                          an error `session_not_committed` — commit the plan to register the \
-                          session.\n\n\
-                          Inputs: `session_id`; `author_label` (optional, defaults to \
-                          last cached); `repo` (optional absolute path; defaults to the \
-                          caller's cwd-repo).\n\n\
+                          When `plan_path` doesn't correspond to a plan file in HEAD, returns \
+                          an error: `plan_not_committed` (path is canonical but no plan there \
+                          yet), `unknown_plan` (no plan with that stem), `plan_conflict` (same \
+                          stem maps to multiple files — operator must resolve), \
+                          `plan_path_mismatch` (stem matches an existing plan but the path is \
+                          neither its current path nor its active/done counterpart), or \
+                          `invalid_plan_path` (path doesn't parse).\n\n\
+                          Inputs: `plan_path` (required, repo-relative); `author_label` \
+                          (optional, defaults to last cached); `repo` (optional absolute path; \
+                          defaults to the caller's cwd-repo).\n\n\
                           Always call this before reviewing or implementing. The `waiting_on` \
                           field tells you whether the current bottleneck is master or reviewers."
                 .to_string(),
             input_schema: json!({
                 "type": "object",
-                "required": ["session_id"],
+                "required": ["plan_path"],
                 "properties": {
-                    "session_id": {"type": "string"},
+                    "plan_path": {
+                        "type": "string",
+                        "description": "Repo-relative path to the plan file. Pass it on every call — the shim does NOT cache plan_path."
+                    },
                     "author_label": {"type": "string"},
                     "repo": {
                         "type": "string",

@@ -7,8 +7,9 @@ use serde_json::{Value, json};
 
 use super::AppState;
 use super::wait::{WaitArgs, WaitError, wait_for_work as run_wait_for_work};
-use crate::lifecycle::{AgentLabel, SessionId};
-use crate::mcp_response::{get_context_response, list_sessions_response};
+use crate::lifecycle::{AgentLabel, PlanKey, PlanPath};
+use crate::mcp_response::{get_context_response, list_plans_response};
+use crate::repo_state::PlanLookupError;
 
 #[derive(Debug, Deserialize)]
 pub struct ToolCallRequest {
@@ -37,7 +38,7 @@ pub enum ToolError {
 pub async fn dispatch(state: &AppState, req: &ToolCallRequest) -> Result<Value, ToolError> {
     match req.tool.as_str() {
         "echo_cwd" => Ok(json!({"cwd": req.cwd})),
-        "list_sessions" => list_sessions(state, req).await,
+        "list_plans" => list_plans(state, req).await,
         "start_plan" => start_plan(state, req).await,
         "get_context" => get_context(state, req).await,
         "wait_for_work" => wait_for_work(state, req).await,
@@ -48,7 +49,6 @@ pub async fn dispatch(state: &AppState, req: &ToolCallRequest) -> Result<Value, 
 async fn wait_for_work(state: &AppState, req: &ToolCallRequest) -> Result<Value, ToolError> {
     let mut args: WaitArgs = serde_json::from_value(req.arguments.clone())
         .map_err(|e| ToolError::Invalid(format!("args: {e}")))?;
-    // MCP path: if the caller didn't pass `repo`, fall back to the shim cwd.
     if args.repo.is_none() {
         let repo = resolve_repo(&req.cwd).await?;
         args.repo = Some(repo.to_string_lossy().into_owned());
@@ -62,23 +62,25 @@ async fn wait_for_work(state: &AppState, req: &ToolCallRequest) -> Result<Value,
 fn map_wait_error(e: WaitError) -> ToolError {
     match e {
         WaitError::InvalidRole(_)
-        | WaitError::MissingSessionId
+        | WaitError::MissingPlanPath
         | WaitError::MissingAuthorLabel
-        | WaitError::MissingRepo => ToolError::Invalid(e.to_string()),
-        WaitError::UnknownSession(_) => ToolError::NotFound(e.to_string()),
+        | WaitError::MissingRepo
+        | WaitError::InvalidPlanPath(_) => ToolError::Invalid(e.to_string()),
+        WaitError::UnknownPlan(_)
+        | WaitError::PlanPathMismatch { .. }
+        | WaitError::PlanConflict { .. } => ToolError::NotFound(e.to_string()),
         WaitError::Io(_) => ToolError::Internal(anyhow::anyhow!(e)),
     }
 }
 
 #[derive(Debug, Deserialize, Default)]
-struct ListSessionsArgs {
-    /// Optional absolute repo path. Falls back to req.cwd if absent.
+struct ListPlansArgs {
     repo: Option<String>,
 }
 
-async fn list_sessions(state: &AppState, req: &ToolCallRequest) -> Result<Value, ToolError> {
-    let args: ListSessionsArgs = if req.arguments.is_null() {
-        ListSessionsArgs::default()
+async fn list_plans(state: &AppState, req: &ToolCallRequest) -> Result<Value, ToolError> {
+    let args: ListPlansArgs = if req.arguments.is_null() {
+        ListPlansArgs::default()
     } else {
         serde_json::from_value(req.arguments.clone())
             .map_err(|e| ToolError::Invalid(format!("args: {e}")))?
@@ -90,56 +92,97 @@ async fn list_sessions(state: &AppState, req: &ToolCallRequest) -> Result<Value,
         .snapshot_repo(&repo)
         .await
         .map_err(|e| ToolError::Internal(anyhow::anyhow!(e)))?;
-    let v =
-        list_sessions_response(&snapshot).map_err(|e| ToolError::Internal(anyhow::anyhow!(e)))?;
-    Ok(json!({"sessions": v}))
+    list_plans_response(&snapshot).map_err(|e| ToolError::Internal(anyhow::anyhow!(e)))
 }
 
 #[derive(Debug, Deserialize)]
 struct StartPlanArgs {
-    session_id: String,
+    plan_path: String,
     #[allow(dead_code)]
     label: String,
+    repo: Option<String>,
 }
 
 async fn start_plan(state: &AppState, req: &ToolCallRequest) -> Result<Value, ToolError> {
     let args: StartPlanArgs = serde_json::from_value(req.arguments.clone())
         .map_err(|e| ToolError::Invalid(format!("args: {e}")))?;
-    let repo = resolve_repo(&req.cwd).await?;
+    let repo = resolve_repo_with_override(args.repo.as_deref(), &req.cwd).await?;
+    let plan_path = PlanPath::new(&args.plan_path);
+
+    // Guard 1: valid canonical path; PlanKey::from_path enforces no nesting.
+    let plan_key = PlanKey::from_path(plan_path.as_path()).ok_or_else(|| {
+        ToolError::Invalid(format!(
+            "plan_path must be `.trinity/plans/<stem>.md` (no nesting); got {}",
+            args.plan_path
+        ))
+    })?;
+
+    // Guard 2: reject done paths — done is a lifecycle transition, not a
+    // creation surface.
+    if plan_path.is_done() {
+        return Err(ToolError::Invalid(format!(
+            "plan_path must not be under `.trinity/plans/done/`; got {}",
+            args.plan_path
+        )));
+    }
+
     ensure_gitignore(&repo)?;
     persist_repo_in_registry(&repo)
         .map_err(|e| ToolError::Internal(anyhow::anyhow!("register repo: {e}")))?;
-    let plan_rel = PathBuf::from(".trinity/plans").join(format!("{}.md", args.session_id));
-    let plan_abs = repo.join(&plan_rel);
+    state.runtime.add_repo_if_unknown(repo.clone()).await;
+    ensure_repo_watcher(state, repo.clone()).await;
+
+    // Guards 3 + 4: don't shadow an existing plan or stem-collide with a
+    // tracked conflict. Either condition fails before we touch the
+    // filesystem so a half-created stub can't reintroduce the problem.
+    {
+        let trinity = state.runtime.state();
+        let trinity = trinity.lock().await;
+        if let Some(repo_state) = trinity.repos.get(&repo) {
+            if let Some(existing) = repo_state.plans.get(&plan_key) {
+                return Err(ToolError::Forbidden(format!(
+                    "plan stem `{}` already exists at {}",
+                    plan_key.as_str(),
+                    existing.plan_path
+                )));
+            }
+            if repo_state.plan_conflicts.contains_key(&plan_key) {
+                return Err(ToolError::Forbidden(format!(
+                    "plan stem `{}` is in a conflict state; resolve before starting a new plan",
+                    plan_key.as_str()
+                )));
+            }
+        }
+    }
+
+    let plan_abs = repo.join(plan_path.as_path());
     if let Some(parent) = plan_abs.parent() {
         std::fs::create_dir_all(parent).map_err(|e| ToolError::Internal(anyhow::anyhow!(e)))?;
     }
     if !plan_abs.exists() {
         std::fs::write(&plan_abs, "").map_err(|e| ToolError::Internal(anyhow::anyhow!(e)))?;
     }
-    state.runtime.add_repo_if_unknown(repo.clone()).await;
-    ensure_repo_watcher(state, repo.clone()).await;
     let committed = state
         .runtime
-        .snapshot_session(&repo, &SessionId::from(args.session_id.clone()))
+        .snapshot_session(&repo, &plan_key)
         .await
         .map_err(|e| ToolError::Internal(anyhow::anyhow!(e)))?
         .is_some();
     let next_step = if committed {
         format!(
             "plan already committed at {}; edit and commit again to record a new revision",
-            plan_rel.display()
+            plan_path
         )
     } else {
         format!(
-            "edit {} then run: git add {} && git commit -m 'Start plan: {}'",
-            plan_rel.display(),
-            plan_rel.display(),
-            args.session_id
+            "edit {plan_path} then run: git add {plan_path} && git commit -m 'Start plan: {}'",
+            plan_key.as_str()
         )
     };
     Ok(json!({
         "canonical_path": plan_abs.to_string_lossy(),
+        "plan_path": plan_path.to_string_lossy(),
+        "slug": plan_key.as_str(),
         "committed": committed,
         "next_step": next_step,
     }))
@@ -147,10 +190,8 @@ async fn start_plan(state: &AppState, req: &ToolCallRequest) -> Result<Value, To
 
 #[derive(Debug, Deserialize)]
 struct GetContextArgs {
-    session_id: String,
+    plan_path: String,
     author_label: Option<String>,
-    /// Optional absolute repo path. Falls back to req.cwd if absent.
-    /// Used when responding to a `wait_for_work` match in a different repo.
     repo: Option<String>,
 }
 
@@ -159,30 +200,71 @@ async fn get_context(state: &AppState, req: &ToolCallRequest) -> Result<Value, T
         .map_err(|e| ToolError::Invalid(format!("args: {e}")))?;
     let repo = resolve_repo_with_override(args.repo.as_deref(), &req.cwd).await?;
     state.runtime.add_repo_if_unknown(repo.clone()).await;
-    let session_id = SessionId::from(args.session_id.clone());
+    let plan_path = PlanPath::new(&args.plan_path);
     let author = AgentLabel::from(args.author_label.unwrap_or_else(|| "anonymous".to_string()));
-    let snapshot = state
-        .runtime
-        .snapshot_session(&repo, &session_id)
-        .await
-        .map_err(|e| ToolError::Internal(anyhow::anyhow!(e)))?;
-    match snapshot {
-        Some(snapshot) => get_context_response(&snapshot, &author)
-            .map_err(|e| ToolError::Internal(anyhow::anyhow!(e))),
-        None => {
-            let plan_rel = PathBuf::from(".trinity/plans").join(format!("{}.md", args.session_id));
-            let plan_abs = repo.join(&plan_rel);
-            Ok(json!({
-                "error": "session_not_committed",
+
+    // Resolution semantics live in RepoState::resolve_plan. Do it under
+    // the lock to capture conflict / mismatch / unknown errors before
+    // building a snapshot.
+    let resolution = {
+        let trinity = state.runtime.state();
+        let trinity = trinity.lock().await;
+        let Some(repo_state) = trinity.repos.get(&repo) else {
+            return Err(ToolError::NotFound(format!(
+                "repo not loaded: {}",
+                repo.display()
+            )));
+        };
+        match repo_state.resolve_plan(&plan_path) {
+            Ok(plan) => Ok(plan.id.clone()),
+            Err(err) => Err(err),
+        }
+    };
+
+    let plan_key = match resolution {
+        Ok(k) => k,
+        Err(PlanLookupError::InvalidPlanPath(p)) => {
+            return Err(ToolError::Invalid(format!("invalid plan_path: {p}")));
+        }
+        Err(PlanLookupError::PlanPathMismatch { current, requested }) => {
+            return Ok(json!({
+                "error": "plan_path_mismatch",
+                "current": current.to_string_lossy(),
+                "requested": requested.to_string_lossy(),
+            }));
+        }
+        Err(PlanLookupError::PlanConflict { key, paths }) => {
+            return Ok(json!({
+                "error": "plan_conflict",
+                "slug": key.as_str(),
+                "paths": paths.iter().map(|p| p.to_string_lossy()).collect::<Vec<_>>(),
+            }));
+        }
+        Err(PlanLookupError::UnknownPlan(key)) => {
+            let plan_abs = repo.join(plan_path.as_path());
+            return Ok(json!({
+                "error": "plan_not_committed",
+                "slug": key.as_str(),
                 "canonical_path": plan_abs.to_string_lossy(),
                 "next_step": format!(
-                    "commit the plan file: git add {} && git commit -m 'Start plan: {}'",
-                    plan_rel.display(),
-                    args.session_id
+                    "commit the plan file: git add {plan_path} && git commit -m 'Start plan: {}'",
+                    key.as_str()
                 ),
-            }))
+            }));
         }
-    }
+    };
+
+    let snapshot = state
+        .runtime
+        .snapshot_session(&repo, &plan_key)
+        .await
+        .map_err(|e| ToolError::Internal(anyhow::anyhow!(e)))?
+        .ok_or_else(|| {
+            ToolError::Internal(anyhow::anyhow!(
+                "snapshot vanished between resolve and snapshot"
+            ))
+        })?;
+    get_context_response(&snapshot, &author).map_err(|e| ToolError::Internal(anyhow::anyhow!(e)))
 }
 
 async fn resolve_repo(cwd: &Path) -> Result<PathBuf, ToolError> {

@@ -72,9 +72,10 @@ impl PlanKey {
     /// - `.trinity/plans/<stem>.md`
     /// - `.trinity/plans/done/<stem>.md`
     ///
-    /// `<stem>` must be non-empty, must not contain path separators, and
-    /// `.md` must be the only extension. Nested paths (e.g.
-    /// `.trinity/plans/<subdir>/<stem>.md`) are rejected.
+    /// `<stem>` must be non-empty and must not contain path separators
+    /// (no nesting). Dots inside the stem are allowed — `foo.v2.md` parses
+    /// to `PlanKey("foo.v2")`. Only the trailing `.md` is treated as an
+    /// extension.
     pub fn from_path(p: &Path) -> Option<Self> {
         let segments: Vec<&std::ffi::OsStr> = p
             .components()
@@ -96,17 +97,27 @@ impl PlanKey {
         };
 
         let stem = stem_seg.strip_suffix(".md")?;
-        if stem.is_empty() || stem.contains('/') || stem.contains('.') {
+        if stem.is_empty() || stem.contains('/') {
             return None;
         }
         Some(PlanKey(stem.to_string()))
     }
 }
 
-/// Repo-relative path to a tracked plan file. Normalized to either
-/// `.trinity/plans/<stem>.md` or `.trinity/plans/done/<stem>.md`. Used as
-/// the public-facing identifier for the plan in API surfaces (MCP, HTTP,
-/// SSE, log lines). Internal map keys use [`PlanKey`].
+/// A caller-supplied or runtime-stored repo-relative plan-file path.
+///
+/// Canonical values look like `.trinity/plans/<stem>.md` or
+/// `.trinity/plans/done/<stem>.md`, and the runtime stores only canonical
+/// values (every path Trinity produces — `Plan.plan_path`, MCP responses,
+/// SSE events, the watcher discovery layer — has been validated via
+/// [`PlanKey::from_path`]). [`PlanPath::new`] is intentionally permissive
+/// so that callers can take a freeform string off the wire, hand it to
+/// [`RepoState::resolve_plan`], and get a structured rejection
+/// (`InvalidPlanPath` / `UnknownPlan` / etc.) instead of a panic. Use
+/// [`PlanPath::try_new`] when you need pre-validation without going
+/// through a resolver.
+///
+/// [`RepoState::resolve_plan`]: crate::repo_state::RepoState::resolve_plan
 #[derive(
     Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
 )]
@@ -227,9 +238,11 @@ mod tests {
     }
 
     #[test]
-    fn plan_key_rejects_dot_in_stem() {
-        // `.md` must be the only extension; `foo.bar.md` is not canonical.
-        assert!(PlanKey::from_path(&p(".trinity/plans/foo.bar.md")).is_none());
+    fn plan_key_accepts_dots_inside_stem() {
+        // `.md` is the trailing extension; dots inside the stem are part of
+        // the slug. Useful for versioning conventions like `foo.v2.md`.
+        let k = PlanKey::from_path(&p(".trinity/plans/foo.v2.md")).unwrap();
+        assert_eq!(k.as_str(), "foo.v2");
     }
 
     #[test]

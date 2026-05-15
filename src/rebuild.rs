@@ -139,4 +139,30 @@ mod tests {
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].verdict, crate::repo_state::Verdict::Approve);
     }
+
+    #[tokio::test]
+    async fn duplicate_stem_active_and_done_lands_in_plan_conflicts_via_real_git() {
+        // Sanity-check the §1b invariant against an actual git tree:
+        // `git ls-tree` plus `derive_state` together must surface the
+        // collision, not silently pick one file.
+        let dir = init_repo();
+        write_file(dir.path(), ".trinity/plans/foo.md", "# active\n");
+        write_file(dir.path(), ".trinity/plans/done/foo.md", "# done\n");
+        commit(dir.path(), "Coexisting foo paths");
+
+        let state = rebuild_repo(dir.path()).await.unwrap();
+        assert!(
+            !state
+                .plans
+                .contains_key(&SessionId::from("foo".to_string())),
+            "conflicting plan must not be routable"
+        );
+        let paths = state
+            .plan_conflicts
+            .get(&SessionId::from("foo".to_string()))
+            .expect("conflict surfaced");
+        assert_eq!(paths.len(), 2);
+        assert!(paths.iter().any(|p| !p.is_done()));
+        assert!(paths.iter().any(|p| p.is_done()));
+    }
 }

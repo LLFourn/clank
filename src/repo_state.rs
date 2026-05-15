@@ -504,7 +504,10 @@ impl PlanTouchKind {
 pub struct LiveEvent {
     pub ts: i64,
     pub repo: RepoRoot,
-    pub session_id: Option<PlanKey>,
+    /// `None` for repo-level events (`repo_rebuilt`). Plan-scoped events
+    /// (`plan_worktree_changed`, `feedback_changed`, `feedback_removed`)
+    /// carry the plan's current canonical path.
+    pub plan_path: Option<PlanPath>,
     pub kind: &'static str,
     pub payload: serde_json::Value,
 }

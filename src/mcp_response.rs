@@ -77,63 +77,78 @@ pub fn swap_active_done(plan_path: &PlanPath) -> Option<PlanPath> {
     plan_path.counterpart()
 }
 
-/// `list_sessions` response over a single repo.
+/// `list_plans` response over a single repo.
 ///
-/// Returns an array of session summaries: id, plan_path, phase,
-/// waiting_on, plan_worktree_status. Each row is enough to drive the
-/// homepage's session table without further queries.
-pub fn list_sessions_response(snapshot: &RepoSnapshot) -> std::io::Result<Value> {
-    list_sessions_response_with_status_reader(snapshot, &DiskPlanStatusReader)
+/// Returns `{ plans: [...], conflicts: [...] }`. Each plan row carries the
+/// fields the homepage / agent loop needs to drive a session table without
+/// further queries. Conflict rows surface stems that map to multiple files
+/// on disk — work is not routed through them until the operator resolves
+/// the collision (see plan-path-identity §1b).
+pub fn list_plans_response(snapshot: &RepoSnapshot) -> std::io::Result<Value> {
+    list_plans_response_with_status_reader(snapshot, &DiskPlanStatusReader)
 }
 
-pub(crate) fn list_sessions_response_with_status_reader(
+pub(crate) fn list_plans_response_with_status_reader(
     snapshot: &RepoSnapshot,
     status_reader: &impl PlanStatusReader,
 ) -> std::io::Result<Value> {
     let state = snapshot.to_repo_state();
-    let mut sessions = Vec::with_capacity(state.plans.len());
-    for session_snapshot in &snapshot.plans {
-        let session = state
+    let mut plans = Vec::with_capacity(state.plans.len());
+    for plan_snapshot in &snapshot.plans {
+        let plan = state
             .plans
-            .get(&session_snapshot.id)
-            .expect("snapshot session must be present in temporary state");
+            .get(&plan_snapshot.id)
+            .expect("snapshot plan must be present in temporary state");
         let worktree_status = status_reader.compute(
             &snapshot.root,
-            &session_snapshot.plan_path,
-            &session_snapshot.body_hash,
+            &plan_snapshot.plan_path,
+            &plan_snapshot.body_hash,
         )?;
-        let session_phase = phase(session, &state.attribution);
-        let plan_gate = plan_gate_for(session, &state);
-        let impl_gate = impl_gate_for(session, &state);
+        let plan_phase = phase(plan, &state.attribution);
+        let plan_gate = plan_gate_for(plan, &state);
+        let impl_gate = impl_gate_for(plan, &state);
         let w = waiting_on(
-            session_phase,
+            plan_phase,
             worktree_status,
             plan_gate.as_ref(),
             impl_gate.as_ref(),
         );
-        sessions.push(session_summary(
+        plans.push(plan_summary(
             &snapshot.root,
-            session,
-            session_phase,
+            plan,
+            plan_phase,
             worktree_status,
             &w,
         ));
     }
-    Ok(Value::Array(sessions))
+    let conflicts: Vec<Value> = snapshot
+        .plan_conflicts
+        .iter()
+        .map(|(key, paths)| {
+            json!({
+                "slug": key.as_str(),
+                "paths": paths.iter().map(|p| p.to_string_lossy()).collect::<Vec<_>>(),
+            })
+        })
+        .collect();
+    Ok(json!({
+        "plans": plans,
+        "conflicts": conflicts,
+    }))
 }
 
-fn session_summary(
+fn plan_summary(
     repo_root: &Path,
-    session: &crate::repo_state::Plan,
-    session_phase: crate::repo_state::Phase,
+    plan: &crate::repo_state::Plan,
+    plan_phase: crate::repo_state::Phase,
     worktree_status: PlanWorktreeStatus,
     w: &WaitingOn,
 ) -> Value {
     json!({
         "repo": repo_root.to_string_lossy(),
-        "id": session.id.as_str(),
-        "plan_path": session.plan_path.to_string_lossy(),
-        "phase": session_phase.as_str(),
+        "slug": plan.id.as_str(),
+        "plan_path": plan.plan_path.to_string_lossy(),
+        "phase": plan_phase.as_str(),
         "plan_worktree_status": worktree_status.as_str(),
         "waiting_on": waiting_on_value(w),
     })
@@ -526,22 +541,24 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn list_sessions_response_includes_waiting_on() {
+    async fn list_plans_response_includes_waiting_on() {
         let dir = init_repo();
         write_file(dir.path(), ".trinity/plans/foo.md", "# foo\n");
         commit(dir.path(), "add plan");
 
         let state = rebuild_repo(dir.path()).await.unwrap();
         let snapshot = RepoSnapshot::from_state(&state);
-        let v = list_sessions_response(&snapshot).unwrap();
-        let arr = v.as_array().unwrap();
+        let v = list_plans_response(&snapshot).unwrap();
+        let arr = v["plans"].as_array().unwrap();
         assert_eq!(arr.len(), 1);
-        assert_eq!(arr[0]["id"], "foo");
+        assert_eq!(arr[0]["slug"], "foo");
+        assert_eq!(arr[0]["plan_path"], ".trinity/plans/foo.md");
         assert_eq!(arr[0]["phase"], "planning");
         assert_eq!(arr[0]["plan_worktree_status"], "clean");
         // Just-committed plan with no reviews → reviewers / plan_needs_initial_review.
         assert_eq!(arr[0]["waiting_on"]["role"], "reviewers");
         assert_eq!(arr[0]["waiting_on"]["reason"], "plan_needs_initial_review");
+        assert_eq!(v["conflicts"], json!([]));
     }
 
     #[tokio::test]

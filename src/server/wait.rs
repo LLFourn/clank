@@ -1,14 +1,14 @@
-//! `wait_for_work` long-poll: block until one session needs the caller's
+//! `wait_for_work` long-poll: block until the named plan needs the caller's
 //! role, then return the work + locations to act on.
 //!
-//! Single-session focus: the caller names `session_id` (and implicitly or
+//! Single-plan focus: the caller names `plan_path` (and implicitly or
 //! explicitly the `repo`) so the response is always for one plan in one
 //! repo — no fan-out, no cross-repo. The response carries `work` (an
 //! imperative action verb) plus `locations` (the repo-relative paths the
 //! caller should read or write to do that work).
 //!
-//! Lock boundary: snapshot the session's identifiers and cheap gate state
-//! under the runtime mutex, release the lock, then per-poll read
+//! Lock boundary: resolve the plan and snapshot its cheap gate state under
+//! the runtime mutex, release the lock, then per-poll read
 //! `plan_worktree_status` from disk and derive `waiting_on`. Status-driven
 //! master waits (commit_plan_revision, commit_done_move, etc.) stay
 //! correct without holding the mutex across disk I/O.
@@ -19,13 +19,13 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast::error::RecvError;
 
-use crate::lifecycle::{AgentLabel, CommitSha, ContentHash, SessionId};
+use crate::lifecycle::{AgentLabel, CommitSha, ContentHash, PlanKey, PlanPath};
 use crate::mcp_response::compute_plan_worktree_status_parts;
 use crate::projection::{
     expected_action, impl_gate_for, latest_impl_commit, latest_plan_touching_commit, phase,
     plan_gate_for, waiting_on,
 };
-use crate::repo_state::{Phase, Trinity, WaitingReason, WaitingRole};
+use crate::repo_state::{Phase, PlanLookupError, Trinity, WaitingReason, WaitingRole};
 use crate::review_state::ReviewGateDecision;
 use crate::runtime::Runtime;
 
@@ -35,7 +35,7 @@ const MAX_TIMEOUT_SECS: u64 = 300;
 #[derive(Debug, Deserialize)]
 pub struct WaitArgs {
     pub role: String,
-    pub session_id: String,
+    pub plan_path: String,
     /// Optional on the wire so schema-strict MCP clients allow the shim
     /// to autofill from its cache; the daemon rejects calls that arrive
     /// without one once autofill has had its chance.
@@ -75,25 +75,34 @@ pub enum WaitResponse {
 pub enum WaitError {
     #[error("invalid role: {0} (expected `master` or `reviewers`)")]
     InvalidRole(String),
-    #[error("session_id is required")]
-    MissingSessionId,
+    #[error("plan_path is required")]
+    MissingPlanPath,
     #[error("author_label is required")]
     MissingAuthorLabel,
     #[error("repo is required (HTTP) or could not be resolved from cwd (MCP)")]
     MissingRepo,
-    #[error("session not found in repo: {0}")]
-    UnknownSession(String),
+    #[error("invalid plan_path: {0}")]
+    InvalidPlanPath(PlanPath),
+    #[error("unknown plan in repo: {0}")]
+    UnknownPlan(String),
+    #[error("plan path mismatch: current is {current}, requested {requested}")]
+    PlanPathMismatch {
+        current: PlanPath,
+        requested: PlanPath,
+    },
+    #[error("plan conflict: stem `{key}` maps to {paths:?}")]
+    PlanConflict { key: PlanKey, paths: Vec<PlanPath> },
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
 }
 
-/// Block until the named session in the named repo needs the caller's
-/// role. Returns the work + locations to act on. After `timeout_secs`
-/// returns `{timed_out: true}` with no work.
+/// Block until the named plan in the named repo needs the caller's role.
+/// Returns the work + locations to act on. After `timeout_secs` returns
+/// `{timed_out: true}` with no work.
 pub async fn wait_for_work(runtime: &Runtime, args: WaitArgs) -> Result<WaitResponse, WaitError> {
     let role = parse_role(&args.role)?;
-    if args.session_id.is_empty() {
-        return Err(WaitError::MissingSessionId);
+    if args.plan_path.is_empty() {
+        return Err(WaitError::MissingPlanPath);
     }
     let author_label = args
         .author_label
@@ -103,7 +112,7 @@ pub async fn wait_for_work(runtime: &Runtime, args: WaitArgs) -> Result<WaitResp
         .ok_or(WaitError::MissingAuthorLabel)?;
     let repo_str = args.repo.as_ref().ok_or(WaitError::MissingRepo)?;
     let repo = dunce::canonicalize(repo_str).unwrap_or_else(|_| PathBuf::from(repo_str));
-    let session_id = SessionId::from(args.session_id.clone());
+    let plan_path = PlanPath::new(&args.plan_path);
     let author = AgentLabel::from(author_label);
 
     let timeout = Duration::from_secs(
@@ -114,7 +123,7 @@ pub async fn wait_for_work(runtime: &Runtime, args: WaitArgs) -> Result<WaitResp
     let started_at = Instant::now();
     let mut rx = runtime.subscribe_events();
 
-    if let Some(work) = compute_match(runtime, &repo, &session_id, role, &author).await? {
+    if let Some(work) = compute_match(runtime, &repo, &plan_path, role, &author).await? {
         return Ok(WaitResponse::Work {
             work: work.work.to_string(),
             locations: work.locations,
@@ -129,8 +138,7 @@ pub async fn wait_for_work(runtime: &Runtime, args: WaitArgs) -> Result<WaitResp
         }
         match tokio::time::timeout(remaining, rx.recv()).await {
             Ok(Ok(_event)) => {
-                if let Some(work) =
-                    compute_match(runtime, &repo, &session_id, role, &author).await?
+                if let Some(work) = compute_match(runtime, &repo, &plan_path, role, &author).await?
                 {
                     return Ok(WaitResponse::Work {
                         work: work.work.to_string(),
@@ -140,8 +148,7 @@ pub async fn wait_for_work(runtime: &Runtime, args: WaitArgs) -> Result<WaitResp
             }
             Ok(Err(RecvError::Lagged(_))) => {
                 rx = runtime.subscribe_events();
-                if let Some(work) =
-                    compute_match(runtime, &repo, &session_id, role, &author).await?
+                if let Some(work) = compute_match(runtime, &repo, &plan_path, role, &author).await?
                 {
                     return Ok(WaitResponse::Work {
                         work: work.work.to_string(),
@@ -175,22 +182,15 @@ struct WorkItem {
 async fn compute_match(
     runtime: &Runtime,
     repo: &Path,
-    session_id: &SessionId,
+    plan_path: &PlanPath,
     role: WaitingRole,
     author: &AgentLabel,
 ) -> Result<Option<WorkItem>, WaitError> {
     let candidate = {
         let trinity_arc = runtime.state();
         let trinity = trinity_arc.lock().await;
-        collect_candidate(&trinity, repo, session_id)
-    };
-    let Some(candidate) = candidate else {
-        return Err(WaitError::UnknownSession(format!(
-            "{} in {}",
-            session_id.as_str(),
-            repo.display()
-        )));
-    };
+        collect_candidate(&trinity, repo, plan_path)
+    }?;
 
     let status = compute_plan_worktree_status_parts(
         &candidate.repo_root,
@@ -261,7 +261,7 @@ fn caller_already_voted(cand: &Candidate, reason: WaitingReason, author: &AgentL
 ///   `move_to_done`: the plan file itself.
 fn derive_locations(cand: &Candidate, reason: WaitingReason, author: &AgentLabel) -> Vec<String> {
     let plan_file = cand.plan_path.to_string_lossy().into_owned();
-    let sid = cand.session_id.as_str();
+    let sid = cand.plan_key.as_str();
 
     match reason {
         WaitingReason::PlanNeedsInitialReview | WaitingReason::PlanNeedsRereview => {
@@ -329,8 +329,8 @@ fn rc_feedback_paths(
 #[derive(Debug, Clone)]
 struct Candidate {
     repo_root: PathBuf,
-    session_id: SessionId,
-    plan_path: crate::lifecycle::PlanPath,
+    plan_key: PlanKey,
+    plan_path: PlanPath,
     body_hash: ContentHash,
     session_phase: Phase,
     plan_gate: Option<ReviewGateDecision>,
@@ -339,19 +339,40 @@ struct Candidate {
     impl_target: Option<CommitSha>,
 }
 
-fn collect_candidate(trinity: &Trinity, repo: &Path, session_id: &SessionId) -> Option<Candidate> {
-    let repo_state = trinity.repos.get(repo)?;
-    let session = repo_state.plans.get(session_id)?;
-    Some(Candidate {
+fn collect_candidate(
+    trinity: &Trinity,
+    repo: &Path,
+    plan_path: &PlanPath,
+) -> Result<Candidate, WaitError> {
+    let Some(repo_state) = trinity.repos.get(repo) else {
+        return Err(WaitError::UnknownPlan(format!(
+            "{} in {}",
+            plan_path,
+            repo.display()
+        )));
+    };
+    let plan = repo_state
+        .resolve_plan(plan_path)
+        .map_err(|err| match err {
+            PlanLookupError::InvalidPlanPath(p) => WaitError::InvalidPlanPath(p),
+            PlanLookupError::UnknownPlan(k) => {
+                WaitError::UnknownPlan(format!("{} in {}", k, repo.display()))
+            }
+            PlanLookupError::PlanPathMismatch { current, requested } => {
+                WaitError::PlanPathMismatch { current, requested }
+            }
+            PlanLookupError::PlanConflict { key, paths } => WaitError::PlanConflict { key, paths },
+        })?;
+    Ok(Candidate {
         repo_root: repo.to_path_buf(),
-        session_id: session_id.clone(),
-        plan_path: session.plan_path.clone(),
-        body_hash: session.body_hash.clone(),
-        session_phase: phase(session, &repo_state.attribution),
-        plan_gate: plan_gate_for(session, repo_state),
-        impl_gate: impl_gate_for(session, repo_state),
-        plan_target: latest_plan_touching_commit(session, repo_state),
-        impl_target: latest_impl_commit(session, repo_state),
+        plan_key: plan.id.clone(),
+        plan_path: plan.plan_path.clone(),
+        body_hash: plan.body_hash.clone(),
+        session_phase: phase(plan, &repo_state.attribution),
+        plan_gate: plan_gate_for(plan, repo_state),
+        impl_gate: impl_gate_for(plan, repo_state),
+        plan_target: latest_plan_touching_commit(plan, repo_state),
+        impl_target: latest_impl_commit(plan, repo_state),
     })
 }
 
@@ -392,8 +413,8 @@ mod tests {
     fn cand(plan_target: Option<&str>, impl_target: Option<&str>) -> Candidate {
         Candidate {
             repo_root: PathBuf::from("/repo"),
-            session_id: SessionId::from("sid"),
-            plan_path: crate::lifecycle::PlanPath::new(".trinity/plans/sid.md"),
+            plan_key: PlanKey::from("sid"),
+            plan_path: PlanPath::new(".trinity/plans/sid.md"),
             body_hash: content_hash("x"),
             session_phase: Phase::Planning,
             plan_gate: None,
@@ -560,7 +581,7 @@ mod integration_tests {
     fn args(repo: &Path, role: &str, sid: &str, author: &str) -> WaitArgs {
         WaitArgs {
             role: role.to_string(),
-            session_id: sid.to_string(),
+            plan_path: format!(".trinity/plans/{sid}.md"),
             author_label: Some(author.to_string()),
             repo: Some(repo.to_string_lossy().into_owned()),
             timeout_secs: Some(2),
@@ -637,7 +658,7 @@ mod integration_tests {
 
         let intro: CommitSha = rt
             .read_repo(dir.path(), |s| {
-                s.plans[&SessionId::from("foo")].plan_intro.clone()
+                s.plans[&PlanKey::from("foo")].plan_intro.clone()
             })
             .await
             .unwrap();
@@ -699,7 +720,7 @@ mod integration_tests {
 
         let intro: CommitSha = rt
             .read_repo(dir.path(), |s| {
-                s.plans[&SessionId::from("foo")].plan_intro.clone()
+                s.plans[&PlanKey::from("foo")].plan_intro.clone()
             })
             .await
             .unwrap();
@@ -727,7 +748,7 @@ mod integration_tests {
             .unwrap();
         let revised: CommitSha = rt
             .read_repo(dir.path(), |s| {
-                crate::projection::latest_plan_touching_commit(&s.plans[&SessionId::from("foo")], s)
+                crate::projection::latest_plan_touching_commit(&s.plans[&PlanKey::from("foo")], s)
                     .unwrap()
             })
             .await
@@ -799,7 +820,7 @@ mod integration_tests {
         rt.handle_signal(
             dir.path(),
             FilesystemSignal::PlanFileChanged {
-                session_id: SessionId::from("foo"),
+                session_id: PlanKey::from("foo"),
                 path: PathBuf::from(".trinity/plans/foo.md"),
             },
             42,
@@ -826,7 +847,7 @@ mod integration_tests {
 
         let a = args(dir.path(), "reviewers", "does-not-exist", "codex");
         let err = wait_for_work(&rt, a).await.unwrap_err();
-        assert!(matches!(err, WaitError::UnknownSession(_)));
+        assert!(matches!(err, WaitError::UnknownPlan(_)));
     }
 
     #[tokio::test]
@@ -834,7 +855,7 @@ mod integration_tests {
         let rt = Runtime::new();
         let a = WaitArgs {
             role: "reviewers".to_string(),
-            session_id: "foo".to_string(),
+            plan_path: ".trinity/plans/foo.md".to_string(),
             author_label: Some("codex".to_string()),
             repo: None,
             timeout_secs: Some(1),
@@ -848,7 +869,7 @@ mod integration_tests {
         let rt = Runtime::new();
         let a = WaitArgs {
             role: "reviewers".to_string(),
-            session_id: "foo".to_string(),
+            plan_path: ".trinity/plans/foo.md".to_string(),
             author_label: None,
             repo: Some("/anywhere".to_string()),
             timeout_secs: Some(1),
@@ -862,7 +883,7 @@ mod integration_tests {
         let rt = Runtime::new();
         let a = WaitArgs {
             role: "reviewers".to_string(),
-            session_id: "foo".to_string(),
+            plan_path: ".trinity/plans/foo.md".to_string(),
             author_label: Some("   ".to_string()),
             repo: Some("/anywhere".to_string()),
             timeout_secs: Some(1),

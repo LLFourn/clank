@@ -81,13 +81,16 @@ async fn api_wait_for_work(
         .await
         .map_err(|e| match e {
             WaitError::InvalidRole(_)
-            | WaitError::MissingSessionId
+            | WaitError::MissingPlanPath
             | WaitError::MissingAuthorLabel
-            | WaitError::MissingRepo => AppError {
+            | WaitError::MissingRepo
+            | WaitError::InvalidPlanPath(_) => AppError {
                 status: StatusCode::BAD_REQUEST,
                 msg: e.to_string(),
             },
-            WaitError::UnknownSession(_) => AppError::not_found(e.to_string()),
+            WaitError::UnknownPlan(_)
+            | WaitError::PlanPathMismatch { .. }
+            | WaitError::PlanConflict { .. } => AppError::not_found(e.to_string()),
             WaitError::Io(err) => AppError::io(err),
         })?;
     let v = serde_json::to_value(resp)
@@ -123,10 +126,15 @@ async fn event_stream(
         tokio_stream::wrappers::BroadcastStream::new(rx).filter_map(|r| async move { r.ok() });
 
     let combined = live_stream.map(|e| {
+        let slug = e
+            .plan_path
+            .as_ref()
+            .and_then(|p| crate::lifecycle::PlanKey::from_path(p.as_path()));
         let payload = json!({
             "ts": e.ts,
             "repo": e.repo.to_string_lossy(),
-            "session_id": e.session_id.as_ref().map(|s| s.as_str()),
+            "plan_path": e.plan_path.as_ref().map(|p| p.to_string_lossy()),
+            "slug": slug.as_ref().map(|k| k.as_str()),
             "kind": e.kind,
             "payload": e.payload,
         });
@@ -627,7 +635,7 @@ mod wire_tests {
         let app = router_with_repo(&dir).await;
         let body = json!({
             "role": "reviewers",
-            "session_id": "foo",
+            "plan_path": ".trinity/plans/foo.md",
             "author_label": "codex",
             "repo": dir.path().to_string_lossy(),
             "timeout_secs": 1,
@@ -654,7 +662,7 @@ mod wire_tests {
         // Polling master while only reviewers have work → timeout.
         let body = json!({
             "role": "master",
-            "session_id": "foo",
+            "plan_path": ".trinity/plans/foo.md",
             "author_label": "lloyd",
             "repo": dir.path().to_string_lossy(),
             "timeout_secs": 1,
@@ -679,7 +687,7 @@ mod wire_tests {
         let app = router_with_repo(&dir).await;
         let body = json!({
             "role": "reviewer",
-            "session_id": "foo",
+            "plan_path": ".trinity/plans/foo.md",
             "author_label": "codex",
             "repo": dir.path().to_string_lossy(),
             "timeout_secs": 1,
@@ -702,7 +710,7 @@ mod wire_tests {
         let app = router_with_repo(&dir).await;
         let body = json!({
             "role": "reviewers",
-            "session_id": "foo",
+            "plan_path": ".trinity/plans/foo.md",
             "author_label": "codex",
             "timeout_secs": 1,
         });
@@ -722,7 +730,7 @@ mod wire_tests {
         let app = router_with_repo(&dir).await;
         let body = json!({
             "role": "reviewers",
-            "session_id": "foo",
+            "plan_path": ".trinity/plans/foo.md",
             "repo": dir.path().to_string_lossy(),
             "timeout_secs": 1,
         });
@@ -742,7 +750,7 @@ mod wire_tests {
         let app = router_with_repo(&dir).await;
         let body = json!({
             "role": "reviewers",
-            "session_id": "does-not-exist",
+            "plan_path": ".trinity/plans/does-not-exist.md",
             "author_label": "codex",
             "repo": dir.path().to_string_lossy(),
             "timeout_secs": 1,
@@ -766,7 +774,7 @@ mod wire_tests {
             "tool": "wait_for_work",
             "arguments": {
                 "role": "reviewers",
-                "session_id": "foo",
+                "plan_path": ".trinity/plans/foo.md",
                 "author_label": "codex",
                 "repo": dir.path().to_string_lossy(),
                 "timeout_secs": 1,
@@ -795,7 +803,7 @@ mod wire_tests {
             "tool": "wait_for_work",
             "arguments": {
                 "role": "reviewers",
-                "session_id": "foo",
+                "plan_path": ".trinity/plans/foo.md",
                 "author_label": "codex",
                 "timeout_secs": 1,
             },
@@ -821,7 +829,7 @@ mod wire_tests {
             "tool": "wait_for_work",
             "arguments": {
                 "role": "reviewer",
-                "session_id": "foo",
+                "plan_path": ".trinity/plans/foo.md",
                 "author_label": "codex",
                 "timeout_secs": 1,
             },
@@ -848,7 +856,7 @@ mod wire_tests {
             "tool": "wait_for_work",
             "arguments": {
                 "role": "reviewers",
-                "session_id": "foo",
+                "plan_path": ".trinity/plans/foo.md",
                 "timeout_secs": 1,
             },
         });
@@ -876,7 +884,7 @@ mod wire_tests {
             "tool": "wait_for_work",
             "arguments": {
                 "role": "master",
-                "session_id": "foo",
+                "plan_path": ".trinity/plans/foo.md",
                 "author_label": "lloyd",
                 "timeout_secs": 1,
             },
@@ -908,7 +916,7 @@ mod wire_tests {
         let app = router_with_repo(&dir).await;
         let args = json!({
             "role": "reviewers",
-            "session_id": "foo",
+            "plan_path": ".trinity/plans/foo.md",
             "author_label": "codex",
             "repo": dir.path().to_string_lossy(),
             "timeout_secs": 1,
@@ -1037,7 +1045,7 @@ mod wire_tests {
         let app = router(state);
         let codex_body = json!({
             "role": "reviewers",
-            "session_id": "foo",
+            "plan_path": ".trinity/plans/foo.md",
             "author_label": "codex",
             "repo": dir.path().to_string_lossy(),
             "timeout_secs": 1,
@@ -1062,7 +1070,7 @@ mod wire_tests {
         // the guard skip everybody would also pass the codex assertion.
         let bob_body = json!({
             "role": "reviewers",
-            "session_id": "foo",
+            "plan_path": ".trinity/plans/foo.md",
             "author_label": "bob",
             "repo": dir.path().to_string_lossy(),
             "timeout_secs": 1,
