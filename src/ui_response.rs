@@ -37,8 +37,52 @@ pub fn plans_index_with_reader(
     snapshot: &RepoSnapshot,
     status_reader: &impl PlanStatusReader,
 ) -> std::io::Result<Value> {
+    let (plans_typed, conflicts) = plans_index_parts(snapshot, status_reader)?;
+    let plans: Vec<Value> = plans_typed.into_iter().map(|(_, v)| v).collect();
+    Ok(json!({ "plans": plans, "conflicts": conflicts }))
+}
+
+/// Aggregated `{ plans, conflicts }` across multiple snapshots, sorted
+/// by `last_activity_ts` desc. The typed `(i64, Value)` pairs survive
+/// the merge so the sort key never gets serialized-and-re-extracted via
+/// the JSON shape — a regression on the timestamp field type would be
+/// a compile error here, not a silent sort degrade.
+pub fn plans_index_across(snapshots: &[&RepoSnapshot]) -> std::io::Result<Value> {
+    plans_index_across_with_reader(snapshots, &crate::mcp_response::DiskPlanStatusReader)
+}
+
+pub fn plans_index_across_with_reader(
+    snapshots: &[&RepoSnapshot],
+    status_reader: &impl PlanStatusReader,
+) -> std::io::Result<Value> {
+    let mut all_plans: Vec<IndexedPlanRow> = Vec::new();
+    let mut all_conflicts: Vec<Value> = Vec::new();
+    for snapshot in snapshots {
+        let (plans_typed, conflicts) = plans_index_parts(snapshot, status_reader)?;
+        all_plans.extend(plans_typed);
+        all_conflicts.extend(conflicts);
+    }
+    all_plans.sort_by_key(|p| std::cmp::Reverse(p.0));
+    let plans: Vec<Value> = all_plans.into_iter().map(|(_, v)| v).collect();
+    Ok(json!({ "plans": plans, "conflicts": all_conflicts }))
+}
+
+/// One row from `plans_index_parts`: the `i64` is the
+/// `last_activity_ts` sort key (kept alongside the JSON row so the
+/// cross-repo merge sorts on the typed value rather than re-extracting
+/// it from the serialized shape).
+type IndexedPlanRow = (i64, Value);
+
+/// Build the per-snapshot pieces with the i64 sort key still attached
+/// to each plan row. Used by both the single-repo `plans_index` and the
+/// cross-repo `plans_index_across` so they share one source of truth
+/// for the sort key + JSON shape.
+fn plans_index_parts(
+    snapshot: &RepoSnapshot,
+    status_reader: &impl PlanStatusReader,
+) -> std::io::Result<(Vec<IndexedPlanRow>, Vec<Value>)> {
     let basename = crate::lifecycle::RepoBasename::from_repo_root(&snapshot.root);
-    let mut plans: Vec<(i64, Value)> = Vec::with_capacity(snapshot.plans.len());
+    let mut plans: Vec<IndexedPlanRow> = Vec::with_capacity(snapshot.plans.len());
     for plan in &snapshot.plans {
         let plan_phase = phase_for(&plan.plan_path, &plan.id, &snapshot.attribution);
         let plan_gate = plan_gate_for_parts(
@@ -91,7 +135,6 @@ pub fn plans_index_with_reader(
         ));
     }
     plans.sort_by_key(|p| std::cmp::Reverse(p.0));
-    let plans: Vec<Value> = plans.into_iter().map(|(_, v)| v).collect();
     let conflicts: Vec<Value> = snapshot
         .plan_conflicts
         .iter()
@@ -106,7 +149,7 @@ pub fn plans_index_with_reader(
             })
         })
         .collect();
-    Ok(json!({"plans": plans, "conflicts": conflicts}))
+    Ok((plans, conflicts))
 }
 
 /// `GET /api/plan/{repo}/{stem_md}` — rich plan detail.

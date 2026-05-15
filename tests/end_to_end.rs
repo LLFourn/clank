@@ -475,10 +475,16 @@ async fn api_plans_sorts_across_repos_by_last_activity_ts() {
     // Regression for the cross-repo sort bug: plans_index sorts within
     // a single repo's response, but api_plans extends across repos and
     // must re-sort the combined list.
-    let parent_a = tempfile::tempdir().unwrap();
-    let parent_b = tempfile::tempdir().unwrap();
-    let dir_a = parent_a.path().join("alpha");
-    let dir_b = parent_b.path().join("beta");
+    //
+    // Iteration order under `Trinity.repos: BTreeMap<PathBuf, _>` is
+    // lex-by-canonical-path. To make this test fail deterministically
+    // without the cross-repo sort, **pin the dir names** so the
+    // alphabetically-first repo also happens to have the older commit.
+    // Without the sort, that older plan would come first in the
+    // response; with the sort, the newer (beta) plan wins.
+    let parent = tempfile::tempdir().unwrap();
+    let dir_a = parent.path().join("a_alpha");
+    let dir_b = parent.path().join("z_beta");
     std::fs::create_dir_all(&dir_a).unwrap();
     std::fs::create_dir_all(&dir_b).unwrap();
     for d in [&dir_a, &dir_b] {

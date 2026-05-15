@@ -37,12 +37,18 @@ fn repos_table(repos: Vec<RepoRow>) -> impl IntoView {
     if repos.is_empty() {
         return view! { <p class="muted">"No repos watched yet."</p> }.into_any();
     }
+    // Keyed by basename so a `RepoCard` mid-confirm-unwatch survives an
+    // unrelated `EventStore.tick` bump (e.g. another repo's
+    // `repo_unwatched` event arriving while the user is staring at this
+    // row's "Confirm" UI). Without the key, every row would remount on
+    // any refetch and lose its local `confirming` signal.
     view! {
         <ul class="watched-repos-list">
-            {repos
-                .into_iter()
-                .map(|r| view! { <RepoCard row=r/> })
-                .collect_view()}
+            <For
+                each=move || repos.clone()
+                key=|r| r.basename.clone()
+                children=move |r| view! { <RepoCard row=r/> }
+            />
         </ul>
     }
     .into_any()
@@ -80,9 +86,16 @@ fn RepoCard(row: RepoRow) -> impl IntoView {
         pending.set(true);
         spawn_local(async move {
             match delete_repo(basename).await {
-                Ok(()) => {
-                    // Daemon emits `repo_unwatched`; EventStore.tick
-                    // bumps and the parent's LocalResource refetches.
+                Ok(outcome) => {
+                    // In-memory deregistration succeeded. Daemon emits
+                    // `repo_unwatched`; EventStore.tick bumps and the
+                    // parent's LocalResource refetches. If the registry
+                    // file write failed, surface it inline so the
+                    // operator knows the repo will resurrect on
+                    // daemon restart.
+                    if let Some(msg) = outcome.registry_write_error {
+                        error_msg.set(Some(msg));
+                    }
                     confirming.set(false);
                     pending.set(false);
                 }
@@ -155,6 +168,12 @@ fn format_activity(ts: i64) -> String {
         return "never".to_string();
     }
     let now = (js_sys::Date::now() / 1000.0) as i64;
+    // Clamp to 0 when the browser clock is BEHIND the daemon clock.
+    // Without this clamp, a small skew renders an "in 3m" string that
+    // is misleading; with it, the worst case is "0s ago" on a freshly
+    // updated row, which reads as a no-op and recovers on the next
+    // refetch. Skew the other way (browser AHEAD) inflates the age,
+    // which is the standard accepted behavior for relative timestamps.
     let delta = (now - ts).max(0);
     if delta < 60 {
         format!("{delta}s ago")

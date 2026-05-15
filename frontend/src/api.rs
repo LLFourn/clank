@@ -431,7 +431,21 @@ pub async fn fetch_repos() -> Result<ReposIndex, FetchError> {
         .map_err(|e| FetchError::Decode(e.to_string()))
 }
 
-pub async fn delete_repo(basename: String) -> Result<(), FetchError> {
+#[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)]
+pub struct DeleteRepoOutcome {
+    pub ok: bool,
+    pub basename: String,
+    pub removed_plan_count: u32,
+    /// `Some(msg)` when the in-memory deregistration succeeded but the
+    /// registry file rewrite failed. The repo will reappear on daemon
+    /// restart until the operator fixes the file; the frontend should
+    /// surface this so it isn't silently lost.
+    #[serde(default)]
+    pub registry_write_error: Option<String>,
+}
+
+pub async fn delete_repo(basename: String) -> Result<DeleteRepoOutcome, FetchError> {
     let url = format!("/api/repos/{basename}");
     let resp = gloo_net::http::Request::delete(&url)
         .send()
@@ -440,5 +454,7 @@ pub async fn delete_repo(basename: String) -> Result<(), FetchError> {
     if !resp.ok() {
         return Err(FetchError::Status(resp.status()));
     }
-    Ok(())
+    resp.json::<DeleteRepoOutcome>()
+        .await
+        .map_err(|e| FetchError::Decode(e.to_string()))
 }

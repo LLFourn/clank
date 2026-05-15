@@ -267,38 +267,19 @@ async fn api_plans(
     Query(q): Query<RepoQuery>,
 ) -> Result<axum::Json<Value>, AppError> {
     let repos = repos_to_render(&state, q.repo).await?;
-    let mut all_plans: Vec<Value> = Vec::new();
-    let mut all_conflicts: Vec<Value> = Vec::new();
+    let mut snapshots = Vec::with_capacity(repos.len());
     for repo in repos {
-        let snapshot = state
-            .runtime
-            .snapshot_repo(&repo)
-            .await
-            .map_err(AppError::runtime)?;
-        let v = crate::ui_response::plans_index(&snapshot).map_err(AppError::io)?;
-        if let Some(plans) = v["plans"].as_array() {
-            all_plans.extend(plans.iter().cloned());
-        }
-        if let Some(conflicts) = v["conflicts"].as_array() {
-            all_conflicts.extend(conflicts.iter().cloned());
-        }
+        snapshots.push(
+            state
+                .runtime
+                .snapshot_repo(&repo)
+                .await
+                .map_err(AppError::runtime)?,
+        );
     }
-    // Per-repo `plans_index` sorts within a repo; concatenating preserves
-    // those local orderings but loses the global descending invariant.
-    // Re-sort by `last_activity_ts` across the combined list so the
-    // homepage's newest-first ordering holds across multiple watched
-    // repos.
-    all_plans.sort_by_key(|p| {
-        std::cmp::Reverse(
-            p.get("last_activity_ts")
-                .and_then(|v| v.as_i64())
-                .unwrap_or(0),
-        )
-    });
-    Ok(axum::Json(json!({
-        "plans": all_plans,
-        "conflicts": all_conflicts,
-    })))
+    let snapshot_refs: Vec<&_> = snapshots.iter().collect();
+    let v = crate::ui_response::plans_index_across(&snapshot_refs).map_err(AppError::io)?;
+    Ok(axum::Json(v))
 }
 
 async fn api_plan_detail(
