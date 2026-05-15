@@ -27,108 +27,124 @@ use crate::repo_state::{
 use crate::review_state::{ReviewGateDecision, ReviewPhase};
 use crate::runtime_snapshot::{PlanSnapshot, PlanSnapshotBundle, RepoSnapshot};
 
-/// `GET /api/sessions[?repo=<path>]` — array of session index rows.
+/// `GET /api/plans` — `{ plans, conflicts }` for the home page.
 /// Public wrapper binds the production `DiskPlanStatusReader`.
-pub fn sessions_index(snapshot: &RepoSnapshot) -> std::io::Result<Value> {
-    sessions_index_with_reader(snapshot, &crate::mcp_response::DiskPlanStatusReader)
+pub fn plans_index(snapshot: &RepoSnapshot) -> std::io::Result<Value> {
+    plans_index_with_reader(snapshot, &crate::mcp_response::DiskPlanStatusReader)
 }
 
-pub fn sessions_index_with_reader(
+pub fn plans_index_with_reader(
     snapshot: &RepoSnapshot,
     status_reader: &impl PlanStatusReader,
 ) -> std::io::Result<Value> {
-    let mut out = Vec::with_capacity(snapshot.plans.len());
-    for session in &snapshot.plans {
-        let session_phase = phase_for(&session.plan_path, &session.id, &snapshot.attribution);
+    let basename = crate::lifecycle::RepoBasename::from_repo_root(&snapshot.root);
+    let mut plans = Vec::with_capacity(snapshot.plans.len());
+    for plan in &snapshot.plans {
+        let plan_phase = phase_for(&plan.plan_path, &plan.id, &snapshot.attribution);
         let plan_gate = plan_gate_for_parts(
-            &session.id,
-            &session.plan_feedback,
+            &plan.id,
+            &plan.plan_feedback,
             &snapshot.commit_order,
             &snapshot.plan_touches,
         );
         let impl_gate = impl_gate_for_parts(
-            &session.id,
-            &session.impl_feedback,
+            &plan.id,
+            &plan.impl_feedback,
             &snapshot.commit_order,
             &snapshot.attribution,
         );
         let worktree_status =
-            status_reader.compute(&snapshot.root, &session.plan_path, &session.body_hash)?;
+            status_reader.compute(&snapshot.root, &plan.plan_path, &plan.body_hash)?;
         let w = waiting_on(
-            session_phase,
+            plan_phase,
             worktree_status,
             plan_gate.as_ref(),
             impl_gate.as_ref(),
         );
-        out.push(json!({
+        let plan_id = basename
+            .as_ref()
+            .map(|b| crate::lifecycle::PlanId::new(b.clone(), plan.id.clone()).to_string());
+        plans.push(json!({
             "repo": snapshot.root.to_string_lossy(),
-            "session_id": session.id.as_str(),
-            "plan_path": session.plan_path.to_string_lossy(),
-            "phase": session_phase.as_str(),
+            "plan_id": plan_id,
+            "slug": plan.id.as_str(),
+            "state": plan.state.as_str(),
+            "current_path": plan.plan_path.to_string_lossy(),
+            "phase": plan_phase.as_str(),
             "worktree_status": worktree_status.as_str(),
             "waiting_on": waiting_on_value(&w),
         }));
     }
-    Ok(Value::Array(out))
+    let conflicts: Vec<Value> = snapshot
+        .plan_conflicts
+        .iter()
+        .map(|(key, paths)| {
+            let plan_id = basename
+                .as_ref()
+                .map(|b| crate::lifecycle::PlanId::new(b.clone(), key.clone()).to_string());
+            json!({
+                "plan_id": plan_id,
+                "slug": key.as_str(),
+                "paths": paths.iter().map(|p| p.to_string_lossy()).collect::<Vec<_>>(),
+            })
+        })
+        .collect();
+    Ok(json!({"plans": plans, "conflicts": conflicts}))
 }
 
-/// `GET /api/sessions/:id?repo=<path>` — rich session detail.
+/// `GET /api/plan/{repo}/{stem_md}` — rich plan detail.
 /// Public wrapper binds the production `DiskPlanStatusReader`.
-pub fn session_page(bundle: &PlanSnapshotBundle) -> std::io::Result<Value> {
-    session_page_with_reader(bundle, &crate::mcp_response::DiskPlanStatusReader)
+pub fn plan_page(bundle: &PlanSnapshotBundle) -> std::io::Result<Value> {
+    plan_page_with_reader(bundle, &crate::mcp_response::DiskPlanStatusReader)
 }
 
-pub fn session_page_with_reader(
+pub fn plan_page_with_reader(
     bundle: &PlanSnapshotBundle,
     status_reader: &impl PlanStatusReader,
 ) -> std::io::Result<Value> {
-    let session = &bundle.plan;
-    let worktree_status =
-        status_reader.compute(&bundle.root, &session.plan_path, &session.body_hash)?;
-    let session_phase = phase_for(&session.plan_path, &session.id, &bundle.attribution);
+    let plan = &bundle.plan;
+    let basename = crate::lifecycle::RepoBasename::from_repo_root(&bundle.root);
+    let worktree_status = status_reader.compute(&bundle.root, &plan.plan_path, &plan.body_hash)?;
+    let plan_phase = phase_for(&plan.plan_path, &plan.id, &bundle.attribution);
     let plan_gate = plan_gate_for_parts(
-        &session.id,
-        &session.plan_feedback,
+        &plan.id,
+        &plan.plan_feedback,
         &bundle.commit_order,
         &bundle.plan_touches,
     );
     let impl_gate = impl_gate_for_parts(
-        &session.id,
-        &session.impl_feedback,
+        &plan.id,
+        &plan.impl_feedback,
         &bundle.commit_order,
         &bundle.attribution,
     );
     let w = waiting_on(
-        session_phase,
+        plan_phase,
         worktree_status,
         plan_gate.as_ref(),
         impl_gate.as_ref(),
     );
 
     let plan_revisions: Vec<String> =
-        all_plan_revisions_for(&session.id, &bundle.commit_order, &bundle.plan_touches)
+        all_plan_revisions_for(&plan.id, &bundle.commit_order, &bundle.plan_touches)
             .into_iter()
             .map(|s| s.as_str().to_string())
             .collect();
     let implementation_commits: Vec<String> =
-        all_implementation_commits_for(&session.id, &bundle.commit_order, &bundle.attribution)
+        all_implementation_commits_for(&plan.id, &bundle.commit_order, &bundle.attribution)
             .into_iter()
             .map(|s| s.as_str().to_string())
             .collect();
 
-    let (review_target_phase, review_target_sha) = match session_phase {
+    let (review_target_phase, review_target_sha) = match plan_phase {
         Phase::Planning => (
             "plan",
-            latest_plan_touching_commit_for(
-                &session.id,
-                &bundle.commit_order,
-                &bundle.plan_touches,
-            )
-            .map(|s| s.as_str().to_string()),
+            latest_plan_touching_commit_for(&plan.id, &bundle.commit_order, &bundle.plan_touches)
+                .map(|s| s.as_str().to_string()),
         ),
         Phase::Implementing => (
             "impl",
-            latest_impl_commit_for(&session.id, &bundle.commit_order, &bundle.attribution)
+            latest_impl_commit_for(&plan.id, &bundle.commit_order, &bundle.attribution)
                 .map(|s| s.as_str().to_string()),
         ),
         Phase::Done => ("plan", None),
@@ -145,37 +161,43 @@ pub fn session_page_with_reader(
         .map(|sha| json!({ "commit_sha": sha }))
         .unwrap_or(Value::Null);
 
-    let plan_feedback = feedback_entries(&session.plan_feedback);
-    let impl_feedback = feedback_entries(&session.impl_feedback);
+    let plan_feedback = feedback_entries(&plan.plan_feedback);
+    let impl_feedback = feedback_entries(&plan.impl_feedback);
     let timeline = timeline_value(
-        session,
+        plan,
         &bundle.attribution,
         &bundle.plan_touches,
         &bundle.commit_order,
     );
-    let pr_hint = if matches!(session_phase, Phase::Implementing) {
-        Some(pr_hint_value(session, &implementation_commits))
+    let pr_hint = if matches!(plan_phase, Phase::Implementing) {
+        Some(pr_hint_value(plan, &implementation_commits))
     } else {
         None
     };
 
+    let plan_id = basename
+        .as_ref()
+        .map(|b| crate::lifecycle::PlanId::new(b.clone(), plan.id.clone()).to_string());
+
     Ok(json!({
         "repo": bundle.root.to_string_lossy(),
-        "session_id": session.id.as_str(),
-        "phase": session_phase.as_str(),
-        "plan_path": session.plan_path.to_string_lossy(),
+        "plan_id": plan_id,
+        "slug": plan.id.as_str(),
+        "state": plan.state.as_str(),
+        "current_path": plan.plan_path.to_string_lossy(),
+        "phase": plan_phase.as_str(),
         "plan_worktree_status": worktree_status.as_str(),
         "waiting_on": waiting_on_value(&w),
         "expected_action": expected_action(w.reason),
         "review_target": review_target,
-        "review_gate": gate_value(plan_gate.as_ref(), impl_gate.as_ref(), session_phase),
+        "review_gate": gate_value(plan_gate.as_ref(), impl_gate.as_ref(), plan_phase),
         "latest_plan_revision": latest_plan_revision,
         "latest_implementation_revision": latest_implementation_revision,
         "plan_revisions": plan_revisions,
         "implementation_commits": implementation_commits,
         "plan_feedback": plan_feedback,
         "impl_feedback": impl_feedback,
-        "held_plan_feedback": held_feedback_entries(&session.held_plan_feedback),
+        "held_plan_feedback": held_feedback_entries(&plan.held_plan_feedback),
         "timeline": timeline,
         "pr_hint": pr_hint,
     }))
@@ -489,11 +511,12 @@ mod tests {
     }
 
     #[test]
-    fn sessions_index_empty_snapshot_returns_empty_array() {
+    fn plans_index_empty_snapshot_returns_empty_arrays() {
         let snap = empty_snapshot();
-        let v = sessions_index_with_reader(&snap, &StaticStatusReader(PlanWorktreeStatus::Clean))
-            .unwrap();
-        assert_eq!(v, Value::Array(Vec::new()));
+        let v =
+            plans_index_with_reader(&snap, &StaticStatusReader(PlanWorktreeStatus::Clean)).unwrap();
+        assert_eq!(v["plans"], Value::Array(Vec::new()));
+        assert_eq!(v["conflicts"], Value::Array(Vec::new()));
     }
 
     #[test]

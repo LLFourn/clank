@@ -33,15 +33,16 @@ const MUTE_LS_KEY: &str = "trinity.muted";
 pub struct LiveEvent {
     pub ts: i64,
     pub repo: String,
-    /// `None` for repo-level events. Plan-scoped events carry the plan's
-    /// repo-relative path (`.trinity/plans/<stem>.md` or
-    /// `.trinity/plans/done/<stem>.md`).
+    /// `None` for repo-level events. Plan-scoped events carry the
+    /// canonical plan identity `<repo_basename>/<stem>.md`.
     #[serde(default)]
-    pub plan_path: Option<String>,
-    /// Derived helper for activity display; `PlanKey::from_path` of
-    /// `plan_path`.
+    pub plan_id: Option<String>,
+    /// Plan stem only — convenience for display.
     #[serde(default)]
     pub slug: Option<String>,
+    /// `"active"` | `"done"`, or `None` for repo-level events.
+    #[serde(default)]
+    pub state: Option<String>,
     pub kind: String,
     #[serde(default)]
     pub payload: serde_json::Value,

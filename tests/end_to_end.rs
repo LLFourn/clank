@@ -95,27 +95,22 @@ async fn spawn_daemon_with_repos(
 }
 
 #[tokio::test]
-async fn home_renders_session_list() {
-    // Post-Leptos: `/` serves the empty SPA shell; the homepage's data
-    // comes from `/api/sessions` instead.
+async fn home_renders_plan_list() {
+    // `/` serves the SPA shell; the homepage's data comes from
+    // `/api/plans`.
     let dir = init_repo();
     write_file(dir.path(), ".trinity/plans/foo.md", "# foo\n");
     commit(dir.path(), "Add foo");
 
     let (url, handle) = spawn_daemon(dir.path()).await;
-    let repo_param: String =
-        url::form_urlencoded::byte_serialize(dir.path().to_string_lossy().as_bytes()).collect();
-    let body = reqwest::get(format!("{url}/api/sessions?repo={repo_param}"))
+    let body = reqwest::get(format!("{url}/api/plans"))
         .await
         .unwrap()
         .text()
         .await
         .unwrap();
     handle.abort();
-    assert!(
-        body.contains("\"foo\""),
-        "session list should include 'foo'"
-    );
+    assert!(body.contains("\"foo\""), "plan list should include 'foo'");
     assert!(body.contains("\"planning\""), "phase should be 'planning'");
     assert!(
         body.contains("plan_needs_initial_review"),
@@ -125,26 +120,24 @@ async fn home_renders_session_list() {
 }
 
 #[tokio::test]
-async fn session_detail_renders() {
-    // Post-Leptos: /sessions/:id is owned by the SPA's client-side
-    // router (the server's fallback returns the empty shell). The
-    // session data comes from /api/sessions/:id.
+async fn plan_detail_renders() {
     let dir = init_repo();
     write_file(dir.path(), ".trinity/plans/foo.md", "# foo\n");
     commit(dir.path(), "Add foo");
 
     let (url, handle) = spawn_daemon(dir.path()).await;
-    let body = reqwest::get(format!("{}/api/sessions/foo", url))
+    let basename = dir.path().file_name().unwrap().to_str().unwrap();
+    let body = reqwest::get(format!("{url}/api/plan/{basename}/foo.md"))
         .await
         .unwrap()
         .text()
         .await
         .unwrap();
     handle.abort();
-    assert!(body.contains("\"foo\""), "session detail should include id");
+    assert!(body.contains("\"foo\""), "plan detail should include slug");
     assert!(
         body.contains("\"timeline\""),
-        "session detail should carry timeline"
+        "plan detail should carry timeline"
     );
 }
 
@@ -296,8 +289,9 @@ async fn plan_revision_route_renders_blob() {
         .unwrap()
         .to_string();
 
+    let basename = dir.path().file_name().unwrap().to_str().unwrap();
     let body = client
-        .get(format!("{}/api/sessions/foo/plan/{}", url, sha))
+        .get(format!("{url}/api/plan/{basename}/foo.md/revision/{sha}"))
         .send()
         .await
         .unwrap()
@@ -337,8 +331,11 @@ async fn commit_diff_route_renders_patch() {
         .unwrap()
         .to_string();
 
+    let basename = dir.path().file_name().unwrap().to_str().unwrap();
     let body = client
-        .get(format!("{}/api/sessions/foo/commit/{}", url, impl_sha))
+        .get(format!(
+            "{url}/api/plan/{basename}/foo.md/commit/{impl_sha}"
+        ))
         .send()
         .await
         .unwrap()
@@ -560,10 +557,11 @@ async fn feedback_renders_on_session_page() {
         !pf.is_empty(),
         "plan_feedback should be populated; ctx: {ctx2}"
     );
-    // Then check that the UI session endpoint exposes the feedback
+    // Then check that the UI plan endpoint exposes the feedback
     // including the rendered body HTML.
+    let basename = dir.path().file_name().unwrap().to_str().unwrap();
     let body = client
-        .get(format!("{}/api/sessions/foo", url))
+        .get(format!("{url}/api/plan/{basename}/foo.md"))
         .send()
         .await
         .unwrap()
@@ -573,29 +571,25 @@ async fn feedback_renders_on_session_page() {
     handle.abort();
     assert!(
         body.contains("\"alice\"") && body.contains("\"approve\""),
-        "session detail should include alice's APPROVE; got: {body}"
+        "plan detail should include alice's APPROVE; got: {body}"
     );
     assert!(
         body.contains("\"body_html\""),
-        "session detail should carry rendered feedback HTML; got: {body}"
+        "plan detail should carry rendered feedback HTML; got: {body}"
     );
 }
 
 #[tokio::test]
 async fn done_move_endpoint_moves_plan_file() {
-    // Phase 5 moved the done action under /api as a structured JSON
-    // POST; the old form-encoded /sessions/:id/done is gone with the
-    // maud handlers.
     let dir = init_repo();
     write_file(dir.path(), ".trinity/plans/foo.md", "# foo\n");
     commit(dir.path(), "Add foo");
 
     let (url, handle) = spawn_daemon(dir.path()).await;
     let client = reqwest::Client::new();
-    let body = json!({ "repo": dir.path().to_string_lossy() });
+    let basename = dir.path().file_name().unwrap().to_str().unwrap();
     let resp = client
-        .post(format!("{}/api/sessions/foo/done", url))
-        .json(&body)
+        .post(format!("{url}/api/plan/{basename}/foo.md/done"))
         .send()
         .await
         .unwrap();

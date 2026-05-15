@@ -15,42 +15,29 @@ use serde_json::{Value, json};
 use super::AppState;
 use super::mcp;
 use super::wait::{WaitArgs, WaitError, wait_for_work};
-use crate::lifecycle::SessionId;
 
 pub fn router(state: AppState) -> Router {
-    // Phase 1 axum routing order (per .trinity/plans/leptos-frontend.md):
-    //   1. /api/*           — UI surface (JSON only).
-    //   2. /static/*        — Leptos bundle assets via ServeDir.
-    //   3. /events          — SSE.
-    //   4. /internal/*      — MCP dispatch + tool catalog.
-    //   5. /healthz         — readiness probe.
-    //   6. Transitional maud routes — `/sessions/...` paths still served
-    //      by the old src/server/ui.rs handlers; deleted in Phase 5.
-    //   7. SPA fallback     — anything else returns frontend/dist/index.html.
     let static_service = tower_http::services::ServeDir::new(state.frontend_dist.clone());
     let spa_shell = state.spa_shell.clone();
     let frontend_dist = state.frontend_dist.clone();
     Router::new()
         .route("/healthz", get(healthz))
-        // Phase 5: the maud /sessions/:id* handlers are gone. The SPA
-        // owns those paths via the fallback; the done action moves
-        // under /api as a structured POST.
         .route("/events", get(home_events_stream))
         .route("/internal/tools", get(list_tools))
         .route("/internal/tool_call", post(call_tool))
         .route("/api/wait_for_work", post(api_wait_for_work))
-        .route("/api/sessions", get(api_sessions))
-        .route("/api/sessions/{session_id}", get(api_session_detail))
-        .route("/api/sessions/{session_id}/done", post(api_move_to_done))
+        .route("/api/plans", get(api_plans))
+        .route("/api/plan/{repo}/{stem_md}", get(api_plan_detail))
+        .route("/api/plan/{repo}/{stem_md}/done", post(api_move_to_done))
         .route(
-            "/api/sessions/{session_id}/plan/{sha}",
+            "/api/plan/{repo}/{stem_md}/revision/{sha}",
             get(api_plan_revision),
         )
         .route(
-            "/api/sessions/{session_id}/commit/{sha}",
+            "/api/plan/{repo}/{stem_md}/commit/{sha}",
             get(api_commit_diff),
         )
-        .route("/api/diff", get(api_diff))
+        .route("/api/plan/{repo}/{stem_md}/diff/{from}/{to}", get(api_diff))
         .nest_service("/static", static_service)
         .fallback(move || serve_spa_shell(spa_shell.clone(), frontend_dist.clone()))
         .with_state(state)
@@ -125,15 +112,15 @@ async fn event_stream(
         tokio_stream::wrappers::BroadcastStream::new(rx).filter_map(|r| async move { r.ok() });
 
     let combined = live_stream.map(|e| {
-        let slug = e
-            .plan_path
-            .as_ref()
-            .and_then(|p| crate::lifecycle::PlanKey::from_path(p.as_path()));
+        let plan_id_str = e.plan_id.as_ref().map(|p| p.to_string());
+        let slug = e.plan_id.as_ref().map(|p| p.key().as_str().to_string());
+        let state_str = e.state.as_ref().map(|s| s.as_str());
         let payload = json!({
             "ts": e.ts,
             "repo": e.repo.to_string_lossy(),
-            "plan_path": e.plan_path.as_ref().map(|p| p.to_string_lossy()),
-            "slug": slug.as_ref().map(|k| k.as_str()),
+            "plan_id": plan_id_str,
+            "slug": slug,
+            "state": state_str,
             "kind": e.kind,
             "payload": e.payload,
         });
@@ -227,213 +214,180 @@ impl IntoResponse for AppError {
 // snapshot under the runtime mutex via Runtime::snapshot_*, release the
 // lock, then build the response — no disk I/O happens under the mutex.
 
-async fn api_sessions(
+/// Resolve `{repo}/{stem_md}` into `(RepoRoot, PlanKey)` via
+/// `Trinity.repo_basenames`. Strips `.md` from `stem_md`; returns 404
+/// if the basename isn't watched.
+async fn resolve_plan_id_segments(
+    state: &AppState,
+    repo_basename: &str,
+    stem_md: &str,
+) -> Result<(PathBuf, crate::lifecycle::PlanKey), AppError> {
+    let basename = crate::lifecycle::RepoBasename::from(repo_basename);
+    let stem = stem_md
+        .strip_suffix(".md")
+        .ok_or_else(|| AppError::not_found(format!("stem must end in .md: {stem_md}")))?;
+    if stem.is_empty() || stem.contains('/') {
+        return Err(AppError::not_found(format!("invalid stem: {stem_md}")));
+    }
+    let plan_key = crate::lifecycle::PlanKey::from(stem.to_string());
+    let trinity_arc = state.runtime.state();
+    let trinity = trinity_arc.lock().await;
+    let repo_root = trinity
+        .repo_basenames
+        .get(&basename)
+        .cloned()
+        .ok_or_else(|| AppError::not_found(format!("unknown repo basename: {repo_basename}")))?;
+    Ok((repo_root, plan_key))
+}
+
+async fn api_plans(
     State(state): State<AppState>,
     Query(q): Query<RepoQuery>,
 ) -> Result<axum::Json<Value>, AppError> {
     let repos = repos_to_render(&state, q.repo).await;
-    let mut combined: Vec<Value> = Vec::new();
+    let mut all_plans: Vec<Value> = Vec::new();
+    let mut all_conflicts: Vec<Value> = Vec::new();
     for repo in repos {
         let snapshot = state
             .runtime
             .snapshot_repo(&repo)
             .await
             .map_err(AppError::runtime)?;
-        let v = crate::ui_response::sessions_index(&snapshot).map_err(AppError::io)?;
-        if let Some(arr) = v.as_array() {
-            combined.extend(arr.iter().cloned());
+        let v = crate::ui_response::plans_index(&snapshot).map_err(AppError::io)?;
+        if let Some(plans) = v["plans"].as_array() {
+            all_plans.extend(plans.iter().cloned());
+        }
+        if let Some(conflicts) = v["conflicts"].as_array() {
+            all_conflicts.extend(conflicts.iter().cloned());
         }
     }
-    Ok(axum::Json(Value::Array(combined)))
+    Ok(axum::Json(json!({
+        "plans": all_plans,
+        "conflicts": all_conflicts,
+    })))
 }
 
-async fn api_session_detail(
+async fn api_plan_detail(
     State(state): State<AppState>,
-    Path(session_id): Path<String>,
-    Query(q): Query<RepoQuery>,
+    Path((repo_basename, stem_md)): Path<(String, String)>,
 ) -> Result<axum::Json<Value>, AppError> {
-    let repos = repos_to_render(&state, q.repo).await;
-    for repo in repos {
-        let snapshot = state
-            .runtime
-            .snapshot_session(&repo, &SessionId::from(session_id.clone()))
-            .await
-            .map_err(AppError::runtime)?;
-        if let Some(snapshot) = snapshot {
-            let v = crate::ui_response::session_page(&snapshot).map_err(AppError::io)?;
-            return Ok(axum::Json(v));
-        }
-    }
-    Err(AppError::not_found(format!(
-        "session {session_id} not found"
-    )))
+    let (repo, plan_key) = resolve_plan_id_segments(&state, &repo_basename, &stem_md).await?;
+    let snapshot = state
+        .runtime
+        .snapshot_session(&repo, &plan_key)
+        .await
+        .map_err(AppError::runtime)?
+        .ok_or_else(|| AppError::not_found(format!("plan {repo_basename}/{stem_md} not found")))?;
+    let v = crate::ui_response::plan_page(&snapshot).map_err(AppError::io)?;
+    Ok(axum::Json(v))
 }
 
 async fn api_plan_revision(
     State(state): State<AppState>,
-    Path((session_id, sha)): Path<(String, String)>,
-    Query(q): Query<RepoQuery>,
+    Path((repo_basename, stem_md, sha)): Path<(String, String, String)>,
 ) -> Result<axum::Json<Value>, AppError> {
+    let (repo, plan_key) = resolve_plan_id_segments(&state, &repo_basename, &stem_md).await?;
     let commit_sha = crate::lifecycle::CommitSha::from(sha.clone());
-    let repos = repos_to_render(&state, q.repo).await;
-    for repo in repos {
-        let snapshot = state
-            .runtime
-            .snapshot_session(&repo, &SessionId::from(session_id.clone()))
-            .await
-            .map_err(AppError::runtime)?;
-        let Some(snapshot) = snapshot else { continue };
+    let snapshot = state
+        .runtime
+        .snapshot_session(&repo, &plan_key)
+        .await
+        .map_err(AppError::runtime)?
+        .ok_or_else(|| AppError::not_found(format!("plan {repo_basename}/{stem_md} not found")))?;
 
-        // Session-scoped endpoint: require the SHA to be one of THIS
-        // session's plan-touching commits. Without this guard, an
-        // arbitrary blob in the repo could be rendered through any
-        // session URL, leaking commits across session boundaries.
-        let plan_revisions = crate::projection::all_plan_revisions_for(
-            &snapshot.plan.id,
-            &snapshot.commit_order,
-            &snapshot.plan_touches,
-        );
-        let Some(pos) = plan_revisions.iter().position(|c| c == &commit_sha) else {
-            return Err(AppError::not_found(format!(
-                "commit {sha} is not a plan revision of session {session_id}"
-            )));
-        };
+    let plan_revisions = crate::projection::all_plan_revisions_for(
+        &snapshot.plan.id,
+        &snapshot.commit_order,
+        &snapshot.plan_touches,
+    );
+    let Some(pos) = plan_revisions.iter().position(|c| c == &commit_sha) else {
+        return Err(AppError::not_found(format!(
+            "commit {sha} is not a plan revision of {repo_basename}/{stem_md}"
+        )));
+    };
 
-        let body_raw =
-            crate::git_io::show_blob(&repo, &commit_sha, snapshot.plan.plan_path.as_path())
-                .await
-                .map_err(|e| AppError::internal(format!("git show: {e}")))?;
-        let body_html = crate::ui_response::render_markdown(&body_raw);
+    let body_raw = crate::git_io::show_blob(&repo, &commit_sha, snapshot.plan.plan_path.as_path())
+        .await
+        .map_err(|e| AppError::internal(format!("git show: {e}")))?;
+    let body_html = crate::ui_response::render_markdown(&body_raw);
 
-        let previous_sha = pos
-            .checked_sub(1)
-            .and_then(|j| plan_revisions.get(j))
-            .map(|c| c.as_str().to_string());
-        let next_sha = plan_revisions.get(pos + 1).map(|c| c.as_str().to_string());
+    let previous_sha = pos
+        .checked_sub(1)
+        .and_then(|j| plan_revisions.get(j))
+        .map(|c| c.as_str().to_string());
+    let next_sha = plan_revisions.get(pos + 1).map(|c| c.as_str().to_string());
 
-        let feedback = crate::ui_response::feedback_for_target(&snapshot.plan, &commit_sha);
-        return Ok(axum::Json(json!({
-            "repo": snapshot.root.to_string_lossy(),
-            "session_id": snapshot.plan.id.as_str(),
-            "commit_sha": commit_sha.as_str(),
-            "body_raw": body_raw,
-            "body_html": body_html,
-            "plan_intro": snapshot.plan.plan_intro.as_str(),
-            "plan_intro_parent": snapshot.plan.plan_intro_parent.as_ref().map(|s| s.as_str()),
-            "previous_sha": previous_sha,
-            "next_sha": next_sha,
-            "feedback": feedback,
-        })));
-    }
-    Err(AppError::not_found(format!(
-        "session {session_id} not found"
-    )))
+    let feedback = crate::ui_response::feedback_for_target(&snapshot.plan, &commit_sha);
+    Ok(axum::Json(json!({
+        "repo": snapshot.root.to_string_lossy(),
+        "plan_id": format!("{repo_basename}/{stem_md}"),
+        "slug": snapshot.plan.id.as_str(),
+        "commit_sha": commit_sha.as_str(),
+        "body_raw": body_raw,
+        "body_html": body_html,
+        "plan_intro": snapshot.plan.plan_intro.as_str(),
+        "plan_intro_parent": snapshot.plan.plan_intro_parent.as_ref().map(|s| s.as_str()),
+        "previous_sha": previous_sha,
+        "next_sha": next_sha,
+        "feedback": feedback,
+    })))
 }
 
 async fn api_commit_diff(
     State(state): State<AppState>,
-    Path((session_id, sha)): Path<(String, String)>,
-    Query(q): Query<RepoQuery>,
+    Path((repo_basename, stem_md, sha)): Path<(String, String, String)>,
 ) -> Result<axum::Json<Value>, AppError> {
+    let (repo, plan_key) = resolve_plan_id_segments(&state, &repo_basename, &stem_md).await?;
     let commit_sha = crate::lifecycle::CommitSha::from(sha.clone());
-    let repos = repos_to_render(&state, q.repo).await;
-    for repo in repos {
-        let snapshot = state
-            .runtime
-            .snapshot_session(&repo, &SessionId::from(session_id.clone()))
-            .await
-            .map_err(AppError::runtime)?;
-        let Some(snapshot) = snapshot else { continue };
+    let snapshot = state
+        .runtime
+        .snapshot_session(&repo, &plan_key)
+        .await
+        .map_err(AppError::runtime)?
+        .ok_or_else(|| AppError::not_found(format!("plan {repo_basename}/{stem_md} not found")))?;
 
-        // Session-scoped endpoint: refuse to render an arbitrary commit
-        // diff unless the SHA is attributed to THIS session (covers both
-        // pure-impl and mixed plan+impl commits).
-        let belongs_to_session = matches!(
-            snapshot.attribution.get(&commit_sha),
-            Some(crate::repo_state::AttributionResult::Attributed { session, .. })
-                if session == &snapshot.plan.id
-        );
-        if !belongs_to_session {
-            return Err(AppError::not_found(format!(
-                "commit {sha} is not attributed to session {session_id}"
-            )));
-        }
-
-        let patch = crate::git_io::show_commit(&repo, &commit_sha)
-            .await
-            .map_err(|e| AppError::internal(format!("git show: {e}")))?;
-        let diff_files = crate::diff_parser::parse_diff(&patch);
-        let diff_files_json: Vec<Value> = diff_files
-            .iter()
-            .map(|f| {
-                json!({
-                    "path": f.path,
-                    "old_path": f.old_path,
-                    "additions": f.additions,
-                    "deletions": f.deletions,
-                    "mode": match f.mode {
-                        crate::diff_parser::FileDiffMode::Added => "added",
-                        crate::diff_parser::FileDiffMode::Removed => "removed",
-                        crate::diff_parser::FileDiffMode::Renamed => "renamed",
-                        crate::diff_parser::FileDiffMode::Modified => "modified",
-                    },
-                    "binary": f.binary,
-                    "always_folded": crate::diff_parser::is_always_folded(&f.path),
-                    "hunks": f.hunks.iter().map(|h| json!({
-                        "header": h.header,
-                        "lines": h.lines.iter().map(|l| json!({
-                            "kind": match l.kind {
-                                crate::diff_parser::DiffLineKind::Insert => "insert",
-                                crate::diff_parser::DiffLineKind::Delete => "delete",
-                                crate::diff_parser::DiffLineKind::Context => "context",
-                                crate::diff_parser::DiffLineKind::Meta => "meta",
-                            },
-                            "old_lineno": l.old_lineno,
-                            "new_lineno": l.new_lineno,
-                            "content": l.content,
-                        })).collect::<Vec<_>>(),
-                    })).collect::<Vec<_>>(),
-                })
-            })
-            .collect();
-
-        let feedback = crate::ui_response::feedback_for_target(&snapshot.plan, &commit_sha);
-        return Ok(axum::Json(json!({
-            "repo": snapshot.root.to_string_lossy(),
-            "session_id": snapshot.plan.id.as_str(),
-            "commit_sha": commit_sha.as_str(),
-            "diff_files": diff_files_json,
-            "feedback": feedback,
-        })));
+    let belongs_to_plan = matches!(
+        snapshot.attribution.get(&commit_sha),
+        Some(crate::repo_state::AttributionResult::Attributed { session, .. })
+            if session == &snapshot.plan.id
+    );
+    if !belongs_to_plan {
+        return Err(AppError::not_found(format!(
+            "commit {sha} is not attributed to {repo_basename}/{stem_md}"
+        )));
     }
-    Err(AppError::not_found(format!(
-        "session {session_id} not found"
-    )))
+
+    let patch = crate::git_io::show_commit(&repo, &commit_sha)
+        .await
+        .map_err(|e| AppError::internal(format!("git show: {e}")))?;
+    let diff_files = crate::diff_parser::parse_diff(&patch);
+    let diff_files_json = serialize_diff_files(&diff_files);
+
+    let feedback = crate::ui_response::feedback_for_target(&snapshot.plan, &commit_sha);
+    Ok(axum::Json(json!({
+        "repo": snapshot.root.to_string_lossy(),
+        "plan_id": format!("{repo_basename}/{stem_md}"),
+        "slug": snapshot.plan.id.as_str(),
+        "commit_sha": commit_sha.as_str(),
+        "diff_files": diff_files_json,
+        "feedback": feedback,
+    })))
 }
 
-#[derive(Deserialize)]
-struct DoneBody {
-    /// Repo root the session belongs to. Required because session ids
-    /// are repo-scoped.
-    repo: String,
-}
-
-/// `POST /api/sessions/:session_id/done` — move the plan file under
-/// `.trinity/plans/done/`. Replaces the Phase-1 form-encoded
-/// `/sessions/:id/done` POST. Body is JSON.
+/// `POST /api/plan/{repo}/{stem_md}/done` — move the plan file under
+/// `.trinity/plans/done/`. No body.
 async fn api_move_to_done(
     State(state): State<AppState>,
-    Path(session_id): Path<String>,
-    axum::Json(body): axum::Json<DoneBody>,
+    Path((repo_basename, stem_md)): Path<(String, String)>,
 ) -> Result<axum::Json<Value>, AppError> {
-    let repo = PathBuf::from(&body.repo);
+    let (repo, plan_key) = resolve_plan_id_segments(&state, &repo_basename, &stem_md).await?;
     let plan_path_rel = state
         .runtime
-        .snapshot_session(&repo, &SessionId::from(session_id.clone()))
+        .snapshot_session(&repo, &plan_key)
         .await
         .map_err(AppError::runtime)?
         .map(|snapshot| snapshot.plan.plan_path)
-        .ok_or_else(|| AppError::not_found(format!("session {session_id} not found")))?;
+        .ok_or_else(|| AppError::not_found(format!("plan {repo_basename}/{stem_md} not found")))?;
 
     let from = repo.join(plan_path_rel.as_path());
     let to_dir = repo.join(".trinity/plans/done");
@@ -452,53 +406,36 @@ async fn api_move_to_done(
     })))
 }
 
-#[derive(Deserialize)]
-struct DiffQuery {
-    from: String,
-    to: String,
-    path: String,
-    repo: Option<String>,
-}
-
-/// `GET /api/diff?from=&to=&path=&repo=` — patch between two SHAs at one
-/// file. Used by `<PlanDiff/>` to compare two plan-body revisions.
-/// Intentionally not session-scoped (the SPA only renders diffs over
-/// `session.plan_path`, but the endpoint is general).
+/// `GET /api/plan/{repo}/{stem_md}/diff/{from}/{to}` — patch between
+/// two SHAs of this plan's file. Used by `<PlanDiff/>` to compare two
+/// plan-body revisions.
 async fn api_diff(
     State(state): State<AppState>,
-    Query(q): Query<DiffQuery>,
+    Path((repo_basename, stem_md, from, to)): Path<(String, String, String, String)>,
 ) -> Result<axum::Json<Value>, AppError> {
-    let from = crate::lifecycle::CommitSha::from(q.from);
-    let to = crate::lifecycle::CommitSha::from(q.to);
-    let path = std::path::PathBuf::from(&q.path);
-    let repos = repos_to_render(&state, q.repo).await;
-    for repo in repos {
-        // Cheap reachability check: the snapshot ensures the repo is
-        // actually known to the runtime (saves us from spawning git
-        // against a stray query path).
-        if state
-            .runtime
-            .snapshot_repo(&repo)
-            .await
-            .map_err(AppError::runtime)
-            .is_err()
-        {
-            continue;
-        }
-        let patch = crate::git_io::diff_two_blobs(&repo, &from, &to, &path)
-            .await
-            .map_err(|e| AppError::internal(format!("git diff: {e}")))?;
-        let diff_files = crate::diff_parser::parse_diff(&patch);
-        let diff_files_json = serialize_diff_files(&diff_files);
-        return Ok(axum::Json(json!({
-            "repo": repo.to_string_lossy(),
-            "from": from.as_str(),
-            "to": to.as_str(),
-            "path": path.to_string_lossy(),
-            "diff_files": diff_files_json,
-        })));
-    }
-    Err(AppError::not_found("no matching repo".to_string()))
+    let (repo, plan_key) = resolve_plan_id_segments(&state, &repo_basename, &stem_md).await?;
+    let from_sha = crate::lifecycle::CommitSha::from(from);
+    let to_sha = crate::lifecycle::CommitSha::from(to);
+    let snapshot = state
+        .runtime
+        .snapshot_session(&repo, &plan_key)
+        .await
+        .map_err(AppError::runtime)?
+        .ok_or_else(|| AppError::not_found(format!("plan {repo_basename}/{stem_md} not found")))?;
+    let path = snapshot.plan.plan_path.as_path().to_path_buf();
+    let patch = crate::git_io::diff_two_blobs(&repo, &from_sha, &to_sha, &path)
+        .await
+        .map_err(|e| AppError::internal(format!("git diff: {e}")))?;
+    let diff_files = crate::diff_parser::parse_diff(&patch);
+    let diff_files_json = serialize_diff_files(&diff_files);
+    Ok(axum::Json(json!({
+        "repo": repo.to_string_lossy(),
+        "plan_id": format!("{repo_basename}/{stem_md}"),
+        "from": from_sha.as_str(),
+        "to": to_sha.as_str(),
+        "path": path.to_string_lossy(),
+        "diff_files": diff_files_json,
+    })))
 }
 
 /// Shared diff_files → JSON converter used by `api_commit_diff` and

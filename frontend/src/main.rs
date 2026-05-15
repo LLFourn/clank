@@ -29,19 +29,19 @@ fn App() -> impl IntoView {
             <Routes fallback=NotFound>
                 <Route path=path!("/") view=components::home::Home/>
                 <Route
-                    path=path!("/sessions/:session_id")
+                    path=path!("/plan/:repo/:stem_md")
                     view=components::session_detail::SessionDetail
                 />
                 <Route
-                    path=path!("/sessions/:session_id/plan/:sha/diff")
+                    path=path!("/plan/:repo/:stem_md/diff/:from/:to")
                     view=components::plan_diff::PlanDiff
                 />
                 <Route
-                    path=path!("/sessions/:session_id/plan/:sha")
+                    path=path!("/plan/:repo/:stem_md/revision/:sha")
                     view=components::plan_revision::PlanRevision
                 />
                 <Route
-                    path=path!("/sessions/:session_id/commit/:sha")
+                    path=path!("/plan/:repo/:stem_md/commit/:sha")
                     view=components::commit_diff::CommitDiff
                 />
             </Routes>

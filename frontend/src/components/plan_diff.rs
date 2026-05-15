@@ -1,33 +1,31 @@
 use leptos::prelude::*;
-use leptos_router::hooks::{use_params_map, use_query_map};
+use leptos_router::hooks::use_params_map;
 
-use crate::api::{DiffPage, fetch_diff, fetch_session};
+use crate::api::{DiffPage, fetch_diff};
 use crate::components::structured_diff::StructuredDiff;
 use crate::store::EventStore;
 use crate::util::short_sha;
 
-/// `/sessions/:session_id/plan/:sha/diff?vs=:other` — compare two plan
-/// revisions of the same session. We resolve the plan_path via a
-/// `fetch_session` round-trip (it's the same path across revisions), then
-/// hand off to `/api/diff?from=&to=&path=`.
+/// `/plan/:repo/:stem_md/diff/:from/:to` — compare two plan
+/// revisions of the same plan. The daemon's
+/// `/api/plan/{repo}/{stem_md}/diff/{from}/{to}` knows the plan path
+/// internally; no need to round-trip the detail page first.
 #[component]
 pub fn PlanDiff() -> impl IntoView {
     let store = expect_context::<EventStore>();
     let params = use_params_map();
-    let query = use_query_map();
-    let session_id = move || params.read().get("session_id").unwrap_or_default();
-    let to_sha = move || params.read().get("sha").unwrap_or_default();
-    let from_sha = move || query.read().get("vs").unwrap_or_default();
+    let plan_id = move || {
+        let p = params.read();
+        let repo = p.get("repo").unwrap_or_default();
+        let stem = p.get("stem_md").unwrap_or_default();
+        format!("{repo}/{stem}")
+    };
+    let from_sha = move || params.read().get("from").unwrap_or_default();
+    let to_sha = move || params.read().get("to").unwrap_or_default();
 
     let resource = LocalResource::new(move || {
         let _ = store.tick.get();
-        let sid = session_id();
-        let from = from_sha();
-        let to = to_sha();
-        async move {
-            let session = fetch_session(sid).await?;
-            fetch_diff(from, to, session.plan_path).await
-        }
+        fetch_diff(plan_id(), from_sha(), to_sha())
     });
 
     view! {

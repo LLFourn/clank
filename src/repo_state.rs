@@ -537,10 +537,13 @@ impl PlanTouchKind {
 pub struct LiveEvent {
     pub ts: i64,
     pub repo: RepoRoot,
-    /// `None` for repo-level events (`repo_rebuilt`). Plan-scoped events
-    /// (`plan_worktree_changed`, `feedback_changed`, `feedback_removed`)
-    /// carry the plan's current canonical path.
-    pub plan_path: Option<PlanPath>,
+    /// `None` for repo-level events (`repo_rebuilt`). Plan-scoped
+    /// events (`plan_worktree_changed`, `feedback_changed`,
+    /// `feedback_removed`) carry the plan's canonical `PlanId` so the
+    /// SPA can build navigation URLs without re-deriving anything.
+    pub plan_id: Option<crate::lifecycle::PlanId>,
+    /// State at emit time. `None` for repo-level events.
+    pub state: Option<PlanState>,
     pub kind: &'static str,
     pub payload: serde_json::Value,
 }

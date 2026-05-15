@@ -11,11 +11,16 @@ use crate::util::short_sha;
 pub fn CommitDiff() -> impl IntoView {
     let store = expect_context::<EventStore>();
     let params = use_params_map();
-    let session_id = move || params.read().get("session_id").unwrap_or_default();
+    let plan_id = move || {
+        let p = params.read();
+        let repo = p.get("repo").unwrap_or_default();
+        let stem = p.get("stem_md").unwrap_or_default();
+        format!("{repo}/{stem}")
+    };
     let sha = move || params.read().get("sha").unwrap_or_default();
     let resource = LocalResource::new(move || {
         let _ = store.tick.get();
-        fetch_commit_diff(session_id(), sha())
+        fetch_commit_diff(plan_id(), sha())
     });
 
     view! {
@@ -38,8 +43,8 @@ pub fn CommitDiff() -> impl IntoView {
 }
 
 fn commit_view(page: CommitDiffPage) -> impl IntoView {
-    let session_id = page.session_id.clone();
-    let back_href = format!("/sessions/{session_id}");
+    let plan_id = page.plan_id.clone();
+    let back_href = format!("/plan/{plan_id}");
     let short = short_sha(&page.commit_sha);
     let title = format!("Commit {short}");
     let feedback_section = if page.feedback.is_empty() {
@@ -60,7 +65,7 @@ fn commit_view(page: CommitDiffPage) -> impl IntoView {
     view! {
         <article class="commit-diff">
             <header class="session-header">
-                <a href=back_href class="back-link">"← session"</a>
+                <a href=back_href class="back-link">"← plan"</a>
                 <h1>{title}</h1>
             </header>
             <StructuredDiff files=page.diff_files/>

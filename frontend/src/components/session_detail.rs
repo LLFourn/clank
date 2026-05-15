@@ -1,7 +1,7 @@
 use leptos::prelude::*;
 use leptos_router::hooks::use_params_map;
 
-use crate::api::{SessionDetail as SessionDetailData, fetch_session};
+use crate::api::{PlanDetail, fetch_plan};
 use crate::components::feedback_card::{FeedbackCard, HeldFeedbackCard};
 use crate::components::meta_strip::MetaStrip;
 use crate::components::pr_hint_card::PrHintCard;
@@ -13,10 +13,15 @@ use crate::store::EventStore;
 pub fn SessionDetail() -> impl IntoView {
     let store = expect_context::<EventStore>();
     let params = use_params_map();
-    let session_id = move || params.read().get("session_id").unwrap_or_default();
+    let plan_id = move || {
+        let p = params.read();
+        let repo = p.get("repo").unwrap_or_default();
+        let stem = p.get("stem_md").unwrap_or_default();
+        format!("{repo}/{stem}")
+    };
     let resource = LocalResource::new(move || {
         let _ = store.tick.get();
-        fetch_session(session_id())
+        fetch_plan(plan_id())
     });
 
     view! {
@@ -38,20 +43,25 @@ pub fn SessionDetail() -> impl IntoView {
     }
 }
 
-fn detail_view(detail: SessionDetailData) -> impl IntoView {
-    let session_id = detail.session_id.clone();
+fn detail_view(detail: PlanDetail) -> impl IntoView {
+    let plan_id = detail.plan_id.clone();
     let waiting_on = detail.waiting_on.clone();
     let plan_feedback = detail.plan_feedback.clone();
     let impl_feedback = detail.impl_feedback.clone();
     let held_feedback = detail.held_plan_feedback.clone();
     let timeline_events = detail.timeline.clone();
     let pr_hint = detail.pr_hint.clone();
+    let state_class = format!("state-chip state-{}", detail.state);
+    let state_label = detail.state.clone();
 
     view! {
         <article class="session-page">
             <header class="session-header">
-                <a href="/" class="back-link">"← sessions"</a>
-                <h1>{session_id}</h1>
+                <a href="/" class="back-link">"← plans"</a>
+                <h1>
+                    <code>{plan_id}</code>
+                    <span class=state_class>{state_label}</span>
+                </h1>
             </header>
             <WaitingBanner waiting_on=waiting_on/>
             <div class="session-grid">

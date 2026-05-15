@@ -1,28 +1,25 @@
 use leptos::prelude::*;
 
-use crate::api::{SessionRow, fetch_sessions};
+use crate::api::{PlanConflictRow, PlanRow, PlansIndex, fetch_plans};
 use crate::store::EventStore;
 
 #[component]
 pub fn Home() -> impl IntoView {
     let store = expect_context::<EventStore>();
-    // Resource keys on the global event tick — any SSE message
-    // invalidates and re-fetches. Phase 4 is coarse; per-repo /
-    // per-session keying lands later.
-    let sessions = LocalResource::new(move || {
+    let plans = LocalResource::new(move || {
         let _ = store.tick.get();
-        fetch_sessions()
+        fetch_plans()
     });
 
     view! {
         <div class="home-layout">
             <main class="home-main">
-                <h1>"Trinity sessions"</h1>
+                <h1>"Trinity plans"</h1>
                 <Suspense fallback=move || view! { <p class="loading">"Loading…"</p> }>
                     {move || {
-                        sessions
+                        plans
                             .with(|res| match res {
-                                Some(Ok(rows)) => session_table(rows.clone()).into_any(),
+                                Some(Ok(index)) => plans_view(index.clone()).into_any(),
                                 Some(Err(e)) => {
                                     view! {
                                         <p class="error">"Failed to load: " {e.to_string()}</p>
@@ -41,11 +38,17 @@ pub fn Home() -> impl IntoView {
     }
 }
 
+fn plans_view(index: PlansIndex) -> impl IntoView {
+    let plans = index.plans;
+    let conflicts = index.conflicts;
+    view! {
+        {plan_table(plans)}
+        {conflicts_section(conflicts)}
+    }
+}
+
 #[component]
 fn ActivitySidebar(store: EventStore) -> impl IntoView {
-    // `<For>` with a stable key so only newly-prepended rows animate
-    // their accent pulse. Without this, every event re-creates every
-    // <li> as a fresh DOM node and the whole sidebar flashes.
     view! {
         <aside class="activity-sidebar">
             <h3>"Recent activity"</h3>
@@ -62,22 +65,23 @@ fn ActivitySidebar(store: EventStore) -> impl IntoView {
                         }
                         key=|(_, e)| activity_key(e)
                         children=move |(_, e)| {
-                            let session = e
-                                .slug
+                            let label = e
+                                .plan_id
                                 .clone()
+                                .or_else(|| e.slug.clone())
                                 .unwrap_or_else(|| "—".to_string());
                             let kind = e.kind.clone();
                             let kind_class = format!("activity-kind activity-{kind}");
                             let href = e
-                                .slug
+                                .plan_id
                                 .as_ref()
-                                .map(|s| format!("/sessions/{s}"))
+                                .map(|p| format!("/plan/{p}"))
                                 .unwrap_or_else(|| "#".to_string());
                             view! {
                                 <li class="activity-row">
                                     <span class=kind_class>{kind}</span>
                                     <a href=href class="activity-session">
-                                        {session}
+                                        {label}
                                     </a>
                                 </li>
                             }
@@ -90,18 +94,23 @@ fn ActivitySidebar(store: EventStore) -> impl IntoView {
 }
 
 fn activity_key(e: &crate::store::LiveEvent) -> String {
-    // ts + kind + slug is unique-enough across the rolling 50-entry
-    // window; same ts+kind would only collide on duplicate broadcasts,
-    // which we'd want to dedupe visually anyway.
-    format!("{}:{}:{}", e.ts, e.kind, e.slug.as_deref().unwrap_or("-"))
+    // ts + kind + plan_id is unique-enough across the rolling 50-entry
+    // window.
+    format!(
+        "{}:{}:{}",
+        e.ts,
+        e.kind,
+        e.plan_id.as_deref().unwrap_or("-")
+    )
 }
 
-fn session_table(rows: Vec<SessionRow>) -> impl IntoView {
+fn plan_table(rows: Vec<PlanRow>) -> impl IntoView {
     view! {
         <table>
             <thead>
                 <tr>
-                    <th>"Session"</th>
+                    <th>"Plan"</th>
+                    <th>"State"</th>
                     <th>"Phase"</th>
                     <th>"Worktree"</th>
                     <th>"Waiting on"</th>
@@ -114,9 +123,19 @@ fn session_table(rows: Vec<SessionRow>) -> impl IntoView {
                     .map(|s| {
                         let role = s.waiting_on.role;
                         let waiting_class = format!("waiting waiting-{role}");
+                        let plan_id_for_href = s.plan_id.clone();
+                        let plan_id_for_text = s.plan_id.clone();
+                        let state_class = format!("state-chip state-{}", s.state);
                         view! {
                             <tr>
-                                <td>{s.session_id}</td>
+                                <td>
+                                    <a href=format!("/plan/{plan_id_for_href}")>
+                                        <code>{plan_id_for_text}</code>
+                                    </a>
+                                </td>
+                                <td>
+                                    <span class=state_class>{s.state}</span>
+                                </td>
                                 <td>{s.phase}</td>
                                 <td>{s.worktree_status}</td>
                                 <td>
@@ -130,4 +149,34 @@ fn session_table(rows: Vec<SessionRow>) -> impl IntoView {
             </tbody>
         </table>
     }
+}
+
+fn conflicts_section(conflicts: Vec<PlanConflictRow>) -> AnyView {
+    if conflicts.is_empty() {
+        return ().into_any();
+    }
+    view! {
+        <section class="home-conflicts">
+            <h2>"Plan-key conflicts"</h2>
+            <p class="muted">
+                "The same plan stem maps to multiple files on disk; resolve before any feedback can route to it."
+            </p>
+            <ul class="conflict-list">
+                {conflicts
+                    .into_iter()
+                    .map(|c| {
+                        let paths = c.paths.join(", ");
+                        view! {
+                            <li>
+                                <strong>{c.slug}</strong>
+                                ": "
+                                <code>{paths}</code>
+                            </li>
+                        }
+                    })
+                    .collect_view()}
+            </ul>
+        </section>
+    }
+    .into_any()
 }

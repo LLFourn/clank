@@ -234,7 +234,8 @@ impl Runtime {
                             LiveEvent {
                                 ts: now,
                                 repo: repo_root.to_path_buf(),
-                                plan_path: None,
+                                plan_id: None,
+                                state: None,
                                 kind: "repo_rebuilt",
                                 payload: serde_json::Value::Null,
                             },
@@ -255,16 +256,17 @@ impl Runtime {
                     return Err(RuntimeError::UnknownRepo(repo_root.to_path_buf()));
                 };
                 let Some(plan) = state.plans.get(&session_id) else {
-                    // Untracked draft — drop silently per the plan.
                     return Ok(());
                 };
-                let plan_path = plan.plan_path.clone();
+                let plan_state = plan.state;
+                let plan_id = plan_id_for(repo_root, &plan.id);
                 self.push_event(
                     &mut trinity,
                     LiveEvent {
                         ts: now,
                         repo: repo_root.to_path_buf(),
-                        plan_path: Some(plan_path),
+                        plan_id,
+                        state: Some(plan_state),
                         kind: "plan_worktree_changed",
                         payload: serde_json::json!({"path": path.to_string_lossy()}),
                     },
@@ -313,13 +315,15 @@ impl Runtime {
                         parsed.author.clone(),
                         body,
                     );
-                    let plan_path = state.plans.get(&session_id).map(|p| p.plan_path.clone());
+                    let plan_state = state.plans.get(&session_id).map(|p| p.state);
+                    let plan_id = plan_id_for(repo_root, &session_id);
                     self.push_event(
                         &mut trinity,
                         LiveEvent {
                             ts: now,
                             repo: repo_root.to_path_buf(),
-                            plan_path,
+                            plan_id,
+                            state: plan_state,
                             kind: "feedback_changed",
                             payload: serde_json::Value::Null,
                         },
@@ -336,13 +340,15 @@ impl Runtime {
                     return Ok(());
                 };
                 upsert_feedback(session, abs_path, parsed, body);
-                let plan_path = state.plans.get(&session_id).map(|p| p.plan_path.clone());
+                let plan_state = state.plans.get(&session_id).map(|p| p.state);
+                let plan_id = plan_id_for(repo_root, &session_id);
                 self.push_event(
                     &mut trinity,
                     LiveEvent {
                         ts: now,
                         repo: repo_root.to_path_buf(),
-                        plan_path,
+                        plan_id,
+                        state: plan_state,
                         kind: "feedback_changed",
                         payload: serde_json::Value::Null,
                     },
@@ -362,13 +368,15 @@ impl Runtime {
                     return Ok(());
                 };
                 remove_feedback(session, &parsed);
-                let plan_path = state.plans.get(&session_id).map(|p| p.plan_path.clone());
+                let plan_state = state.plans.get(&session_id).map(|p| p.state);
+                let plan_id = plan_id_for(repo_root, &session_id);
                 self.push_event(
                     &mut trinity,
                     LiveEvent {
                         ts: now,
                         repo: repo_root.to_path_buf(),
-                        plan_path,
+                        plan_id,
+                        state: plan_state,
                         kind: "feedback_removed",
                         payload: serde_json::Value::Null,
                     },
@@ -540,6 +548,17 @@ struct FlatDropSnapshot {
 /// chronological order from `RepoState::commit_order`. BTreeMap iteration
 /// over `attribution` alone is SHA-lex order, not chronological, so we
 /// walk `commit_order` and look up each entry.
+/// Construct a `PlanId` from a repo root + plan key. Returns `None` if
+/// the repo path lacks a usable file_name (shouldn't happen for any path
+/// the daemon actually canonicalized via `dunce`).
+fn plan_id_for(
+    repo_root: &Path,
+    plan_key: &crate::lifecycle::PlanKey,
+) -> Option<crate::lifecycle::PlanId> {
+    let basename = crate::lifecycle::RepoBasename::from_repo_root(repo_root)?;
+    Some(crate::lifecycle::PlanId::new(basename, plan_key.clone()))
+}
+
 fn latest_attributed_commit(
     session: &Plan,
     state: &crate::repo_state::RepoState,
@@ -774,10 +793,7 @@ mod tests {
         let events = rt.live_events_snapshot().await;
         assert!(events.iter().any(|e| {
             e.kind == "plan_worktree_changed"
-                && e.plan_path
-                    .as_ref()
-                    .map(|p| p.to_string_lossy().to_string())
-                    == Some(".trinity/plans/foo.md".to_string())
+                && e.plan_id.as_ref().map(|id| id.key().as_str()) == Some("foo")
         }));
     }
 

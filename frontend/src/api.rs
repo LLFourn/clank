@@ -6,11 +6,9 @@
 //! Several structs carry `#[allow(dead_code)]` because the SPA does not
 //! consume every JSON field yet (e.g. `expected_action`,
 //! `implementation_commits`, `plan_intro`). The allow is intentional and
-//! per-struct: we want the type to round-trip the full contract so a
-//! future component is a UI-only change rather than a coordinated
-//! daemon+SPA edit. When you add a real consumer for a field, the
-//! struct's allow shrinks naturally — the compiler stops warning about
-//! that struct entirely once every field has a use site.
+//! per-struct: the type round-trips the full contract so a future
+//! component is a UI-only change rather than a coordinated daemon+SPA
+//! edit.
 
 use serde::Deserialize;
 
@@ -26,13 +24,32 @@ pub struct WaitingOn {
 
 #[derive(Debug, Clone, Deserialize)]
 #[allow(dead_code)]
-pub struct SessionRow {
+pub struct PlanRow {
     pub repo: String,
-    pub session_id: String,
-    pub plan_path: String,
+    pub plan_id: String,
+    pub slug: String,
+    pub state: String,
+    pub current_path: String,
     pub phase: String,
     pub worktree_status: String,
     pub waiting_on: WaitingOn,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)]
+pub struct PlanConflictRow {
+    pub plan_id: String,
+    pub slug: String,
+    pub paths: Vec<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)]
+pub struct PlansIndex {
+    #[serde(default)]
+    pub plans: Vec<PlanRow>,
+    #[serde(default)]
+    pub conflicts: Vec<PlanConflictRow>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -149,11 +166,13 @@ pub struct PrHint {
 
 #[derive(Debug, Clone, Deserialize)]
 #[allow(dead_code)]
-pub struct SessionDetail {
+pub struct PlanDetail {
     pub repo: String,
-    pub session_id: String,
+    pub plan_id: String,
+    pub slug: String,
+    pub state: String,
+    pub current_path: String,
     pub phase: String,
-    pub plan_path: String,
     pub plan_worktree_status: String,
     pub waiting_on: WaitingOn,
     pub expected_action: String,
@@ -193,21 +212,21 @@ impl core::fmt::Display for FetchError {
     }
 }
 
-pub async fn fetch_sessions() -> Result<Vec<SessionRow>, FetchError> {
-    let resp = gloo_net::http::Request::get("/api/sessions")
+pub async fn fetch_plans() -> Result<PlansIndex, FetchError> {
+    let resp = gloo_net::http::Request::get("/api/plans")
         .send()
         .await
         .map_err(|e| FetchError::Network(e.to_string()))?;
     if !resp.ok() {
         return Err(FetchError::Status(resp.status()));
     }
-    resp.json::<Vec<SessionRow>>()
+    resp.json::<PlansIndex>()
         .await
         .map_err(|e| FetchError::Decode(e.to_string()))
 }
 
-pub async fn fetch_session(session_id: String) -> Result<SessionDetail, FetchError> {
-    let url = format!("/api/sessions/{session_id}");
+pub async fn fetch_plan(plan_id: String) -> Result<PlanDetail, FetchError> {
+    let url = format!("/api/plan/{plan_id}");
     let resp = gloo_net::http::Request::get(&url)
         .send()
         .await
@@ -215,7 +234,7 @@ pub async fn fetch_session(session_id: String) -> Result<SessionDetail, FetchErr
     if !resp.ok() {
         return Err(FetchError::Status(resp.status()));
     }
-    resp.json::<SessionDetail>()
+    resp.json::<PlanDetail>()
         .await
         .map_err(|e| FetchError::Decode(e.to_string()))
 }
@@ -224,7 +243,8 @@ pub async fn fetch_session(session_id: String) -> Result<SessionDetail, FetchErr
 #[allow(dead_code)]
 pub struct PlanRevisionPage {
     pub repo: String,
-    pub session_id: String,
+    pub plan_id: String,
+    pub slug: String,
     pub commit_sha: String,
     pub body_raw: String,
     pub body_html: String,
@@ -237,10 +257,10 @@ pub struct PlanRevisionPage {
 }
 
 pub async fn fetch_plan_revision(
-    session_id: String,
+    plan_id: String,
     sha: String,
 ) -> Result<PlanRevisionPage, FetchError> {
-    let url = format!("/api/sessions/{session_id}/plan/{sha}");
+    let url = format!("/api/plan/{plan_id}/revision/{sha}");
     let resp = gloo_net::http::Request::get(&url)
         .send()
         .await
@@ -288,7 +308,8 @@ pub struct FileDiff {
 #[allow(dead_code)]
 pub struct CommitDiffPage {
     pub repo: String,
-    pub session_id: String,
+    pub plan_id: String,
+    pub slug: String,
     pub commit_sha: String,
     #[serde(default)]
     pub diff_files: Vec<FileDiff>,
@@ -296,11 +317,8 @@ pub struct CommitDiffPage {
     pub feedback: Vec<FeedbackEntry>,
 }
 
-pub async fn fetch_commit_diff(
-    session_id: String,
-    sha: String,
-) -> Result<CommitDiffPage, FetchError> {
-    let url = format!("/api/sessions/{session_id}/commit/{sha}");
+pub async fn fetch_commit_diff(plan_id: String, sha: String) -> Result<CommitDiffPage, FetchError> {
+    let url = format!("/api/plan/{plan_id}/commit/{sha}");
     let resp = gloo_net::http::Request::get(&url)
         .send()
         .await
@@ -317,6 +335,7 @@ pub async fn fetch_commit_diff(
 #[allow(dead_code)]
 pub struct DiffPage {
     pub repo: String,
+    pub plan_id: String,
     pub from: String,
     pub to: String,
     pub path: String,
@@ -331,17 +350,14 @@ pub struct DoneResponse {
     pub new_plan_path: String,
 }
 
-/// `POST /api/sessions/:id/done` — moves the active plan file under
+/// `POST /api/plan/{plan_id}/done` — moves the active plan file under
 /// `.trinity/plans/done/`. Returns the new repo-relative path on
 /// success.
-pub async fn post_move_to_done(
-    session_id: String,
-    repo: String,
-) -> Result<DoneResponse, FetchError> {
-    let url = format!("/api/sessions/{session_id}/done");
+pub async fn post_move_to_done(plan_id: String) -> Result<DoneResponse, FetchError> {
+    let url = format!("/api/plan/{plan_id}/done");
     let resp = gloo_net::http::Request::post(&url)
         .header("content-type", "application/json")
-        .body(serde_json::json!({ "repo": repo }).to_string())
+        .body("{}")
         .map_err(|e| FetchError::Network(e.to_string()))?
         .send()
         .await
@@ -354,13 +370,9 @@ pub async fn post_move_to_done(
         .map_err(|e| FetchError::Decode(e.to_string()))
 }
 
-pub async fn fetch_diff(from: String, to: String, path: String) -> Result<DiffPage, FetchError> {
-    let resp = gloo_net::http::Request::get("/api/diff")
-        .query([
-            ("from", from.as_str()),
-            ("to", to.as_str()),
-            ("path", path.as_str()),
-        ])
+pub async fn fetch_diff(plan_id: String, from: String, to: String) -> Result<DiffPage, FetchError> {
+    let url = format!("/api/plan/{plan_id}/diff/{from}/{to}");
+    let resp = gloo_net::http::Request::get(&url)
         .send()
         .await
         .map_err(|e| FetchError::Network(e.to_string()))?;

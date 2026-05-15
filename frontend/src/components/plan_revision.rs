@@ -10,11 +10,16 @@ use crate::util::short_sha;
 pub fn PlanRevision() -> impl IntoView {
     let store = expect_context::<EventStore>();
     let params = use_params_map();
-    let session_id = move || params.read().get("session_id").unwrap_or_default();
+    let plan_id = move || {
+        let p = params.read();
+        let repo = p.get("repo").unwrap_or_default();
+        let stem = p.get("stem_md").unwrap_or_default();
+        format!("{repo}/{stem}")
+    };
     let sha = move || params.read().get("sha").unwrap_or_default();
     let resource = LocalResource::new(move || {
         let _ = store.tick.get();
-        fetch_plan_revision(session_id(), sha())
+        fetch_plan_revision(plan_id(), sha())
     });
 
     view! {
@@ -37,17 +42,13 @@ pub fn PlanRevision() -> impl IntoView {
 }
 
 fn revision_view(page: PlanRevisionPage) -> impl IntoView {
-    let session_id = page.session_id.clone();
-    let back_href = format!("/sessions/{session_id}");
+    let plan_id = page.plan_id.clone();
+    let back_href = format!("/plan/{plan_id}");
     let short = short_sha(&page.commit_sha);
     let title = format!("Plan @ {short}");
-    let prev_link = nav_link(&page.session_id, page.previous_sha.as_deref(), "← previous");
-    let next_link = nav_link(&page.session_id, page.next_sha.as_deref(), "next →");
-    let compare_link = compare_link(
-        &page.session_id,
-        &page.commit_sha,
-        page.previous_sha.as_deref(),
-    );
+    let prev_link = nav_link(&plan_id, page.previous_sha.as_deref(), "← previous");
+    let next_link = nav_link(&plan_id, page.next_sha.as_deref(), "next →");
+    let compare_link = compare_link(&plan_id, &page.commit_sha, page.previous_sha.as_deref());
     let body_html = page.body_html.clone();
     let feedback_section = if page.feedback.is_empty() {
         None
@@ -67,7 +68,7 @@ fn revision_view(page: PlanRevisionPage) -> impl IntoView {
     view! {
         <article class="plan-revision">
             <header class="session-header">
-                <a href=back_href class="back-link">"← session"</a>
+                <a href=back_href class="back-link">"← plan"</a>
                 <h1>{title}</h1>
             </header>
             <nav class="revision-nav">{prev_link}{next_link}{compare_link}</nav>
@@ -77,10 +78,10 @@ fn revision_view(page: PlanRevisionPage) -> impl IntoView {
     }
 }
 
-fn compare_link(session_id: &str, this_sha: &str, previous_sha: Option<&str>) -> AnyView {
+fn compare_link(plan_id: &str, this_sha: &str, previous_sha: Option<&str>) -> AnyView {
     match previous_sha {
         Some(prev) if !prev.is_empty() => {
-            let href = format!("/sessions/{session_id}/plan/{this_sha}/diff?vs={prev}");
+            let href = format!("/plan/{plan_id}/diff/{prev}/{this_sha}");
             view! {
                 <a href=href class="revision-nav-link">
                     "diff vs previous"
@@ -92,10 +93,10 @@ fn compare_link(session_id: &str, this_sha: &str, previous_sha: Option<&str>) ->
     }
 }
 
-fn nav_link(session_id: &str, sha: Option<&str>, label: &'static str) -> AnyView {
+fn nav_link(plan_id: &str, sha: Option<&str>, label: &'static str) -> AnyView {
     match sha {
         Some(s) if !s.is_empty() => {
-            let href = format!("/sessions/{session_id}/plan/{s}");
+            let href = format!("/plan/{plan_id}/revision/{s}");
             view! {
                 <a href=href class="revision-nav-link">
                     {label}
