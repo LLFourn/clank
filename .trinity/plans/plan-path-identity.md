@@ -374,14 +374,14 @@ GET  /api/plan/{*plan_id}/diff/{from}...{to}
 The SPA reads `state` from the response and renders the done badge —
 the URL doesn't change when a plan moves to done.
 
-**Handling URL-unsafe characters in repo paths:** any repo whose
-canonical path contains characters that the HTTP path layer mangles
-(`?`, `#`, `%`, control chars, etc.) simply isn't reachable via the
-HTTP/SPA surface. MCP and SSE still work — they pass the canonical
-`PlanId` as a JSON string and don't care. The daemon doesn't refuse
-to watch such repos; it just won't serve them through URL routes.
-Trinity is local-only and single-user; in practice every repo root
-is a plain Unix path under `~` that survives axum's path parser.
+**Handling URL-unsafe characters in repo paths:** Trinity refuses to
+watch a repo whose canonical path contains characters the HTTP path
+layer can't carry verbatim (`?`, `#`, `%`, space, control chars,
+non-UTF-8). `start_plan` rejects with `invalid_repo_path`; the daemon
+skips entries from `~/.trinity/repos` that fail the same check at
+startup (logged at WARN). The whole UI assumes URL addressability, so
+half-watching a repo we can't serve is incoherent. In practice every
+real-world repo root is a plain Unix path; the check is defensive.
 
 Backend handlers (`api_plans`, `api_plan`, etc.) live in
 `src/server/http.rs`. The old `/api/sessions*` routes are deleted with
@@ -582,11 +582,10 @@ Behavioral acceptance:
   `PlanId` constructed via `start_plan`, formatted into a URL,
   re-extracted by the route handler, and looked up returns the same
   plan.
-- HTTP-unsafe repos: a repo whose canonical path contains `?`, `#`,
-  or `%` is **still watched** (MCP and SSE serve it normally) but its
-  `/api/plan/...` and `/plan/...` URLs return 404. The test asserts
-  MCP `get_context` succeeds and the corresponding HTTP `/api/plan/`
-  route returns NotFound for the same plan.
+- `start_plan` rejects repo paths whose canonical form contains
+  HTTP-unsafe characters (`?`, `#`, `%`, space, control chars,
+  non-UTF-8) with `invalid_repo_path`. The daemon startup loader logs
+  WARN and skips matching entries in `~/.trinity/repos`.
 - `LiveEvent` and `/events` emit `plan_id` (nullable for repo-level
   events) plus derived `slug` + `state`. Frontend `EventStore` and
   activity sidebar consume the new shape.
@@ -603,11 +602,10 @@ Behavioral acceptance:
   existed but never fired.)
 - *URL encoding for plan-scoped routes*: none. The canonical `PlanId`
   goes into the URL verbatim via an axum wildcard route. Repos with
-  HTTP-unsafe canonical paths (`?`, `#`, `%`, control chars) are
-  unreachable through HTTP / the SPA but remain accessible via MCP and
-  SSE — Trinity doesn't refuse to watch them, the URL layer just
-  doesn't surface them. Single-user local daemon; in practice every
-  repo path is plain.
+  HTTP-unsafe canonical paths (`?`, `#`, `%`, space, control chars)
+  are rejected at registration — Trinity refuses to watch a repo it
+  can't serve through the UI. Single-user local daemon; in practice
+  every repo path is plain.
 - *`?repo=` ergonomics*: eliminated for plan-scoped routes. Kept only
   on `/api/plans` as an optional filter when the daemon is watching
   multiple repos.
