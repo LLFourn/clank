@@ -1202,12 +1202,12 @@ a:hover {
     border-color: var(--border);
 }
 
-/* Toggle surfaces: caret/kind on the left, subject on the right.
-   The SHA between them is a real <a> link to the dedicated commit
-   page; clicking it stops event propagation so the accordion
-   doesn't flip when the operator wanted to navigate. */
-.timeline-commit-toggle,
-.timeline-commit-subject {
+/* One toggle button spans caret + kind + subject; the SHA is a real
+   <a> sibling. Two focus stops per row instead of three. The link's
+   click handler stops propagation so navigating to the dedicated
+   commit page doesn't also flip the accordion. */
+.timeline-commit-toggle {
+    flex: 1;
     background: transparent;
     border: none;
     color: inherit;
@@ -1218,6 +1218,7 @@ a:hover {
     display: inline-flex;
     align-items: center;
     gap: 0.4rem;
+    min-width: 0;
 }
 
 .timeline-commit-subject {
@@ -1225,7 +1226,7 @@ a:hover {
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
-    display: inline-block;
+    min-width: 0;
 }
 
 .timeline-caret {
@@ -1341,12 +1342,6 @@ a:hover {
 
 .watched-repos-activity {
     font-size: 0.78rem;
-}
-
-.watched-repos-error {
-    flex-basis: 100%;
-    margin: 0.4rem 0 0;
-    font-size: 0.8rem;
 }
 
 /* Parent-owned notice stack. Persists per-basename even after the
