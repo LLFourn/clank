@@ -1,8 +1,10 @@
-# Plan Page: Preview + Timeline Expandable Commits
+# Plan Page + Homepage UX
 
 ## Summary
 
-Two changes to `/plan/{repo}/{stem_md}`:
+Two pages, five changes:
+
+**Plan landing (`/plan/{repo}/{stem_md}`):**
 
 1. **Plan preview.** Render the current plan markdown directly on the
    landing page, faded out and clipped after a fixed height with a
@@ -17,8 +19,37 @@ Two changes to `/plan/{repo}/{stem_md}`:
    accordion that expands to the full commit (message body + diff)
    without leaving the page.
 
-Both improvements stay scoped to the current plan/impl model; they
-ship before [[commit-centric-reviews]] (no model rewrite needed).
+**Homepage (`/`):**
+
+3. **Active plans only, sorted by recency.** The plans table today
+   lists every plan in every watched repo, including `done`, in
+   plan_id-lex order. Cut to active plans, sorted by most-recent
+   activity timestamp (latest commit OR latest feedback file mtime,
+   whichever is newer). Done plans stay reachable via direct URL or
+   a "show done" toggle.
+
+4. **"Waiting on" surfaces agents.** The current table has a
+   `Waiting on` column (master / reviewers role) plus a free-prose
+   `Description` column. Replace `Description` with `Who`, a chip
+   list of the agent labels Trinity is waiting on (e.g. `codex`,
+   `human`, or empty when role is `master`/`none`). The role chip
+   stays; the prose disappears.
+
+5. **Watched repos list with unwatch.** Repos are the primitive
+   Trinity tracks, not plans. Surface them as a first-class section
+   on the homepage with basename, canonical path, plan count, last
+   activity. Each row has an "unwatch" button that deregisters the
+   repo from the runtime, stops its filesystem watcher, and removes
+   it from `~/.trinity/repos` — without touching anything inside the
+   repo itself.
+
+The plan-landing changes (1, 2) and the homepage changes (3, 4, 5)
+are independent — they could ship in either order — but bundle into
+one branch because they share the backend stride (new fields on
+existing snapshots, one new endpoint family for repo management).
+
+All scoped to the current plan/impl model; ship before
+[[commit-centric-reviews]] (no model rewrite needed).
 
 ## Problem
 
@@ -53,6 +84,35 @@ Two failure modes:
   `/plan/.../commit/{sha}` works but the page swap loses your
   scroll position in the timeline and forces a re-render of everything
   else.
+
+### Homepage shows everything in one undifferentiated list
+
+The plans table mixes active and done plans (today: 4 of 7 rows are
+already done) in plan_id-lex order. Done plans push active work down
+the page; the order has no correlation with what you're likely
+looking for.
+
+The `Waiting on` column carries useful structure (role chip:
+`master` / `reviewers`), but the `Description` column repeats the
+same prose ("Plan was revised; awaiting re-review from codex.") for
+every plan in the same state. The actual signal — *which agents* —
+is buried in the prose. Operators reading the table want to scan
+for their own label.
+
+### Repos are invisible
+
+Trinity watches repos. Plans are derived. Today the homepage shows
+plans without ever showing repos, which means:
+
+- No way to know what's being watched without grepping
+  `~/.trinity/repos` or looking at the daemon logs.
+- No way to stop watching a repo from the UI. Today you have to
+  edit `~/.trinity/repos`, then restart the daemon. Friction big
+  enough that orphan repos accumulate.
+
+The "watched repos" set is the fundamental thing — plans flow from
+it. The UI should treat it as a first-class section, not an
+implementation detail.
 
 ## Target Model
 
@@ -128,6 +188,39 @@ No new component needed; just `feedback.first()` after sorting by
 - Subject text is the disclosure trigger (along with the caret) — the
   whole row is clickable; the short-SHA `<code>` remains a link
   to the dedicated commit page for users who want the full URL.
+
+### Homepage layout
+
+```
+┌─ Watched repos ─────────────────────────────────────┐
+│ trinity    /Users/llfourn/src/trinity     4 plans   │
+│            last activity 2 min ago        [unwatch] │
+│ bdk-review /Users/llfourn/src/bdk-review  1 plan    │
+│            last activity 3 hours ago      [unwatch] │
+└─────────────────────────────────────────────────────┘
+
+┌─ Active plans  [□ show done]  ──────────────────────┐
+│ Plan                          State  Phase  Worktree │
+│  Waiting on    Who                                   │
+├──────────────────────────────────────────────────────┤
+│ trinity/foo.md               active  impl   clean    │
+│  [reviewers]   codex, human                          │
+│ bdk-review/bar.md            active  plan   dirty    │
+│  [master]      —                                     │
+└──────────────────────────────────────────────────────┘
+```
+
+- Watched repos rendered as cards/rows above the plans table. One
+  per registered repo, basename as the heading, canonical path as
+  the muted subtitle.
+- "Active plans" header carries a toggle for `show done`. Default
+  off; persisted in `localStorage` so the choice survives a
+  refresh.
+- Plans sorted by most-recent-event timestamp descending. Done
+  plans (when shown) interleave by the same key.
+- The `Description` column is gone. `Waiting on` keeps the role
+  chip; new `Who` column lists agent labels as small chips. When
+  `agents` is empty, render an em-dash.
 
 ## Design
 
@@ -252,12 +345,113 @@ The plan-preview `expanded` signal survives because its parent
 component (`<SessionDetail/>`) re-uses the same DOM subtree on
 refetch — only the `body_html` prop changes.
 
+### Backend — homepage shape
+
+`/api/plans` response keeps `plans` and `conflicts`, gains:
+
+- `last_activity_ts: i64` on each plan row. Computed per plan as
+  `max(latest_commit_time, latest_feedback_mtime, plan_intro_time)`.
+  `latest_commit_time` = author-time of the newest commit in
+  `plan.commit_order ∩ commits-attributed-to-this-plan`.
+  `latest_feedback_mtime` = max `created_at` across `plan_feedback`
+  + `impl_feedback` + `held_plan_feedback`. The fold is daemon-side
+  so the frontend doesn't need to peek into per-plan internals.
+- Each plan row already carries `waiting_on.agents`; the frontend
+  consumes it directly. No backend change for the `Who` column.
+- Server returns active+done as today. Filtering active-only is a
+  frontend concern (the toggle should not require a refetch).
+- Sorting: server returns plans in `last_activity_ts` descending so
+  the homepage doesn't have to sort. Conflicts likewise.
+
+New endpoint family: `/api/repos`.
+
+- `GET /api/repos` →
+  `{ repos: [{ basename, root, plan_count, last_activity_ts }] }`.
+  Already-known data, served from a fresh runtime lock.
+- `DELETE /api/repos/{basename}` → unregister the repo:
+  1. Lock `Trinity`.
+  2. Look up the canonical root for `basename`; 404 if absent.
+  3. Remove from `Trinity.repos` and `Trinity.repo_basenames`.
+  4. Drop the matching `notify_bridge` watcher handle from
+     `AppState.watchers` / `AppState.watched_repos`. The handles
+     are `JoinHandle`s today; aborting + awaiting is the cleanup
+     contract.
+  5. Rewrite `~/.trinity/repos` without this path.
+  6. Push a `repo_unwatched` `LiveEvent` so the SPA's
+     `EventStore.tick` fires and the homepage refetches.
+
+The watcher-handle bookkeeping is the only non-trivial piece. Today
+`AppState` has `watchers: Mutex<Vec<JoinHandle<()>>>` and
+`watched_repos: Mutex<HashSet<PathBuf>>`. Need to associate handles
+with canonical paths so removal can target one. Either change
+`watchers` to `BTreeMap<PathBuf, JoinHandle<()>>`, or add a
+`watcher_handles_by_repo` map alongside. The map form is the smaller
+diff.
+
+`Runtime::remove_repo(canonical: PathBuf) -> Result<RemoveOutcome,
+RuntimeError>` owns the lock + state mutation; the HTTP handler
+threads the watcher-handle cleanup around it. `RemoveOutcome`
+distinguishes `Removed` from `NotPresent` so the handler can map to
+404 vs 200.
+
+### Frontend — homepage components
+
+`PlansIndex` (in `frontend/src/api.rs`) gains `last_activity_ts: i64`
+on each `PlanRow`. The existing `waiting_on.agents` is already
+deserialized.
+
+New `RepoRow` + `ReposIndex` types; new `fetch_repos()` helper:
+
+```rust
+pub struct RepoRow {
+    pub basename: String,
+    pub root: String,
+    pub plan_count: u32,
+    pub last_activity_ts: i64,
+}
+pub struct ReposIndex { pub repos: Vec<RepoRow> }
+pub async fn fetch_repos() -> Result<ReposIndex, FetchError> { … }
+pub async fn delete_repo(basename: String) -> Result<(), FetchError> { … }
+```
+
+New `<WatchedRepos/>` component renders above the plans table.
+Each row has an `<UnwatchButton/>` that, on click, prompts for
+confirmation (single in-row "are you sure?" — no modal dialog),
+then calls `delete_repo`. On success, `EventStore.tick` already
+fires from the daemon's `repo_unwatched` LiveEvent and the page
+refetches; on failure surface the error inline.
+
+`<Home/>` adds:
+
+- A `show_done: RwSignal<bool>` initialized from
+  `localStorage.getItem("show_done") == "true"`. Persist on change.
+- Filter `plans` by `state == "active" || show_done.get()` before
+  rendering.
+- Drop the `Description` column. Keep the `Waiting on` (role) column;
+  add a `Who` column that maps `waiting_on.agents` to chips:
+  ```html
+  <div class="waiting-who">
+    {agents.iter().map(|a| view! { <span class="agent-chip">{a}</span> }).collect_view()}
+  </div>
+  ```
+  When `agents` is empty, render `<span class="muted">"—"</span>`.
+
+### Reactivity for repos
+
+The watched-repos list is driven by a `LocalResource` keyed on
+`EventStore.tick` (same pattern as `<Home/>` for plans). Server-side
+the new `repo_unwatched` LiveEvent is broadcast through the SSE
+pipeline, the SPA bumps `tick`, the resource re-fetches. Removing a
+repo also means any plan rows from that repo vanish on the next
+plans-refetch — which is the same tick, so the UI stays consistent.
+
 ## Phases
 
-Two phases. Both are small; the split is for review cadence, not
-size.
+Three phases. They split cleanly between backend additions, repo
+management (the only piece that adds new endpoints), and the
+frontend changes that consume both.
 
-### Phase 1 — Backend: subjects + plan body HTML
+### Phase 1 — Backend additions to existing endpoints
 
 Files: `src/git_io.rs`, `src/repo_state.rs`, `src/runtime_snapshot.rs`,
 `src/projection.rs`, `src/ui_response.rs`, `src/mcp_response.rs`,
@@ -276,63 +470,137 @@ Files: `src/git_io.rs`, `src/repo_state.rs`, `src/runtime_snapshot.rs`,
 - `api_commit_diff` response gains `subject` and `message_body`
   parsed from `show_commit` output (split on the first blank line
   after the header block).
+- `api_plans` adds `last_activity_ts` per plan row and returns
+  rows sorted by it descending; conflicts likewise. Computed
+  daemon-side from `max(latest_commit_time, latest_feedback_mtime,
+  plan_intro_time)`.
 - Snapshot/serialization tests cover: subject populated, body_html
   rendered, message_body parsed correctly for commits with and
-  without an extended body.
+  without an extended body, `last_activity_ts` correct for commit-only
+  and feedback-only changes.
 
 No frontend changes in this phase; existing UI still works (it
 ignores the new fields).
 
-### Phase 2 — Frontend: preview + accordion
+### Phase 2 — Repo management endpoints
+
+Files: `src/runtime.rs`, `src/server/mod.rs`, `src/server/http.rs`,
+`src/server/notify_bridge.rs`, `tests/end_to_end.rs`.
+
+- `AppState.watchers` shape changes from `Vec<JoinHandle<()>>` to
+  `BTreeMap<PathBuf, JoinHandle<()>>` (or sibling map keyed on the
+  canonical repo root). All existing insert sites updated.
+- `Runtime::remove_repo(canonical) -> Result<RemoveOutcome, _>`
+  drops the repo from `Trinity.repos` + `Trinity.repo_basenames`
+  under one lock. Returns `Removed { plan_count }` or `NotPresent`.
+- `~/.trinity/repos` rewrite helper in `src/server/mcp.rs` (today
+  the `persist_repo_in_registry` function lives there). Add a
+  matching `remove_repo_from_registry(&Path)`.
+- `LiveEvent` gets a `repo_unwatched` kind; emit it from the
+  remove path so SSE subscribers refetch.
+- `GET /api/repos` and `DELETE /api/repos/{basename}` handlers in
+  `src/server/http.rs`. The DELETE handler aborts the watcher
+  handle, calls `Runtime::remove_repo`, calls
+  `remove_repo_from_registry`, emits the LiveEvent.
+- E2E tests:
+  - `api_repos_lists_watched`: spawn daemon with two repos, GET
+    `/api/repos` returns both with plan counts.
+  - `delete_repo_removes_from_state_and_registry`: register repo,
+    DELETE, verify subsequent `/api/plans` doesn't list its plans
+    and `~/.trinity/repos` doesn't contain the path.
+  - `delete_repo_404_on_unknown_basename`: DELETE against unknown
+    basename returns 404.
+
+No frontend changes in this phase either; tests verify the
+endpoints in isolation.
+
+### Phase 3 — Frontend: preview + accordion + homepage rework
 
 Files: `frontend/src/api.rs`, `frontend/src/components/session_detail.rs`,
 `frontend/src/components/plan_preview.rs` (new),
 `frontend/src/components/timeline.rs`, `frontend/src/components/styles.css`
-(or equivalent), `frontend/src/components/expanded_commit.rs` (new).
+(or equivalent), `frontend/src/components/expanded_commit.rs` (new),
+`frontend/src/components/home.rs`, `frontend/src/components/watched_repos.rs`
+(new), `frontend/src/store.rs`.
 
-- `PlanDetail` gains `plan_body_html: String` and
-  `plan_body_truncated: bool`.
-- `TimelineEvent::Commit{Plan,Impl,Mixed}` variants gain
-  `subject: String`.
-- `CommitDiffPage` gains `subject` and `message_body` (already
-  reused by `<CommitDiff/>` route — the existing page also wants
-  the subject; add it there too).
-- `<PlanPreview/>` mounted in `<SessionDetail/>` between meta-strip
-  and timeline (or above timeline depending on layout decision —
-  the ASCII mockup puts it above; the implementation should match
-  the user's preference once we see it).
-- `<TimelineRow/>` for commit variants becomes a button that toggles
-  `expanded`. When expanded, mount `<ExpandedCommit plan_id sha />`
-  which uses the existing `fetch_commit_diff` and renders message +
-  diff inline.
+- `PlanDetail` gains `plan_body_html` + `plan_body_truncated`.
+  `PlanRow` gains `last_activity_ts`. `TimelineEvent::Commit*`
+  variants gain `subject`. `CommitDiffPage` gains `subject` +
+  `message_body`. New `RepoRow` / `ReposIndex` types plus
+  `fetch_repos()` / `delete_repo()`. New `LiveEventKind` variant
+  on the SSE store for `repo_unwatched`.
+- `<PlanPreview/>` mounted in `<SessionDetail/>` above the
+  timeline (matches the ASCII mockup); the latest-review card sits
+  below the preview.
+- `<TimelineRow/>` for commit variants becomes a clickable
+  accordion (caret + subject); expand mounts
+  `<ExpandedCommit plan_id sha />`.
+- `<WatchedRepos/>` rendered above the plans table in `<Home/>`.
+  Unwatch button asks "Are you sure?" inline (two-click confirm,
+  no modal).
+- Plans table:
+  - Drop the `Description` column.
+  - Add a `Who` column built from `waiting_on.agents`.
+  - Filter to `state == "active"` unless `show_done` is true.
+  - Persist `show_done` in `localStorage`.
+  - Sort handled server-side; frontend just renders as received.
 - CSS for `.plan-preview`, `.plan-preview-fade`,
-  `.timeline-row.expanded`, accordion caret animation.
-- Test plan: trunk build clean; visual check of preview collapse +
-  expand and timeline row expand/collapse.
+  `.timeline-row.expanded`, accordion caret, `.watched-repos`,
+  `.agent-chip`.
+- Test plan: trunk build clean; visual check of preview
+  collapse/expand, timeline accordion, watched-repos
+  unwatch flow, show-done toggle persists across reload.
 
 ## Acceptance Criteria
 
-1. Landing page renders the current plan body at the top of the
-   right column, capped at ~480px with a visible fade, with a "see
-   full plan" button.
-2. Clicking "see full plan" expands inline; clicking again collapses
-   back. No page navigation.
-3. The latest feedback targeting the current `review_target` renders
-   as a single card under the preview; falls back to a muted "No
-   reviews yet" when empty.
+### Plan landing page
+
+1. Renders the current plan body at the top of the right column,
+   capped at ~480px with a visible fade, with a "see full plan"
+   button.
+2. Clicking "see full plan" expands inline; clicking again
+   collapses back. No page navigation.
+3. The latest feedback targeting the current `review_target`
+   renders as a single card under the preview; falls back to a
+   muted "No reviews yet" when empty.
 4. Each commit row in the timeline shows its kind, short SHA, and
    first-line subject (truncated with title hover for overflow).
 5. Clicking a commit row expands an inline panel showing the full
    commit message and the structured diff. Second click collapses.
-6. Expanded state on individual rows survives an SSE-driven rebuild
-   (timeline re-renders but keyed rows keep their state).
-7. No backend round-trip for the plan preview expand (HTML already
-   in the initial response).
+6. Expanded state on individual rows survives an SSE-driven
+   rebuild (timeline re-renders but keyed rows keep their state).
+7. No backend round-trip for the plan preview expand (HTML
+   already in the initial response).
 8. Backend round-trip on commit expand uses the existing
-   `/api/plan/{repo}/{stem_md}/commit/{sha}` endpoint with the two
-   added fields.
-9. `cargo fmt`, `cargo clippy --lib --tests -- -D warnings`,
-   `cargo test -p trinity --lib --tests`, `trunk build` all pass.
+   `/api/plan/{repo}/{stem_md}/commit/{sha}` endpoint with the
+   two added fields.
+
+### Homepage
+
+9. Plans table shows active plans only by default.
+10. A `show done` toggle reveals done plans interleaved into the
+    same table; toggle state persists in `localStorage`.
+11. Plans are sorted by `last_activity_ts` descending (newest
+    activity first), both with and without done shown.
+12. The `Description` column is gone; a `Who` column lists
+    `waiting_on.agents` as chips, em-dash when empty.
+13. A `Watched repos` section above the table shows one row per
+    registered repo with basename, canonical path, plan count, and
+    last activity.
+14. Each repo row has an "unwatch" button; clicking it prompts
+    inline for confirmation, then removes the repo from runtime
+    state, watcher set, and `~/.trinity/repos`.
+15. After unwatch, the plans table refetches and the unwatched
+    repo's plans disappear within one SSE tick — no full reload.
+
+### Quality gates
+
+16. `cargo fmt`, `cargo clippy --lib --tests -- -D warnings`,
+    `cargo test -p trinity --lib --tests`, `trunk build` all pass.
+17. New backend tests for: `last_activity_ts` computed from
+    commits and feedback; `subject` populated; `plan_body_html`
+    rendered; commit `message_body` parsed; `GET /api/repos`
+    shape; `DELETE /api/repos/{basename}` happy path + 404.
 
 ## Non-Goals
 
@@ -344,12 +612,22 @@ Files: `frontend/src/api.rs`, `frontend/src/components/session_detail.rs`,
   controls.
 - **A separate "open commit in new tab" affordance.** The short SHA
   is already a link to the commit page; that's enough.
+- **Adding repos from the UI.** `start_plan` from an agent inside
+  a repo is the registration path. The homepage is read + remove
+  only.
+- **Sorting controls on the plans table.** Server-side
+  `last_activity_ts desc` is the only order. If the user wants
+  alphabetical they can ⌘F the page.
+- **Bulk unwatch / multi-select.** One-at-a-time; orphan repos
+  shouldn't be common.
+- **Deleting the repo from disk.** Unwatch is purely a Trinity
+  side-effect; the working tree is untouched.
 
 ## Open Questions
 
 - **Preview height threshold.** 480px is a guess; the right answer
   depends on the plan font size and typical viewport. Pick during
-  Phase 2 by eyeballing the first three trinity plans.
+  Phase 3 by eyeballing the first three trinity plans.
 - **Truncation flag heuristic.** ~4000 characters covers "more than
   one screen of text"; might want to base it on rendered line count
   instead. The flag is a hint, not a hard rule — over-showing the
@@ -363,3 +641,18 @@ Files: `frontend/src/api.rs`, `frontend/src/components/session_detail.rs`,
   per-row caret. An alternative is "first row always expanded" —
   but that fights with `<For key>` reactivity since the "first
   row" changes as new commits land. Stick with explicit caret.
+- **`last_activity_ts` definition for a plan with no commits and no
+  feedback.** Default to `plan_intro_time` (the first commit that
+  added the plan file) — every committed plan has one. For
+  pre-commit plans (`plan_not_committed`), they don't appear in
+  the plans list at all, so the question doesn't arise.
+- **Unwatch confirmation UX.** Inline "Are you sure? [Confirm]
+  [Cancel]" or a single-click with toast-to-undo? The plan picks
+  inline-confirm because it's simpler and survives page-refresh
+  amnesia. Toast-to-undo would need the daemon to defer the
+  cleanup, which seems like the wrong axis to bend on.
+- **Showing repos with zero plans.** If a repo is registered but
+  has no committed plans, does it appear in the watched-repos
+  list? **Yes** — that's exactly when you most want to see it
+  (you registered it, nothing happened yet, you want to confirm
+  Trinity sees it). `plan_count: 0` is fine.
