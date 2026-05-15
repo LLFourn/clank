@@ -69,10 +69,29 @@ impl Runtime {
     /// auto-organized into `<phase>/<target-sha>/<author>.md`.
     pub async fn add_repo(&self, repo_root: PathBuf) -> Result<(), RuntimeError> {
         let canonical = dunce::canonicalize(&repo_root).unwrap_or(repo_root);
+        let basename = crate::lifecycle::RepoBasename::from_repo_root(&canonical);
         let fresh = rebuild_repo(&canonical).await?;
         {
             let mut trinity = self.state.lock().await;
+            // Basename collision: first registration wins. The shadowed
+            // repo is logged and silently dropped per plan §1 /
+            // repo_basenames invariant.
+            if let Some(name) = basename.clone()
+                && let Some(claimed_by) = trinity.repo_basenames.get(&name)
+                && claimed_by != &canonical
+            {
+                tracing::warn!(
+                    basename = %name,
+                    claimed_by = %claimed_by.display(),
+                    shadowed = %canonical.display(),
+                    "repo basename collides with an already-watched repo; shadowed repo will be ignored"
+                );
+                return Ok(());
+            }
             trinity.repos.insert(canonical.clone(), fresh);
+            if let Some(name) = basename {
+                trinity.repo_basenames.insert(name, canonical.clone());
+            }
         }
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)

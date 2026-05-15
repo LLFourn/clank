@@ -547,6 +547,7 @@ mod tests {
         let session = PlanSnapshot {
             id: SessionId::from("foo"),
             plan_path: crate::lifecycle::PlanPath::new(".trinity/plans/foo.md"),
+            state: crate::repo_state::PlanState::Active,
             body: String::new(),
             body_hash: content_hash(""),
             plan_intro: CommitSha::from("intro"),

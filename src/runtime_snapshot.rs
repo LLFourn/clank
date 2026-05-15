@@ -27,6 +27,7 @@ pub struct RepoSnapshot {
 pub struct PlanSnapshot {
     pub id: PlanKey,
     pub plan_path: PlanPath,
+    pub state: crate::repo_state::PlanState,
     pub body: String,
     pub body_hash: ContentHash,
     pub plan_intro: CommitSha,
@@ -81,6 +82,7 @@ impl PlanSnapshot {
         Self {
             id: plan.id.clone(),
             plan_path: plan.plan_path.clone(),
+            state: plan.state,
             body: plan.body.clone(),
             body_hash: plan.body_hash.clone(),
             plan_intro: plan.plan_intro.clone(),
@@ -95,6 +97,7 @@ impl PlanSnapshot {
         Plan {
             id: self.id.clone(),
             plan_path: self.plan_path.clone(),
+            state: self.state,
             body: self.body.clone(),
             body_hash: self.body_hash.clone(),
             plan_intro: self.plan_intro.clone(),

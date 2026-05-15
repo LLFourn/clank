@@ -6,13 +6,17 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::path::PathBuf;
 
-use crate::lifecycle::{AgentLabel, CommitSha, ContentHash, PlanKey, PlanPath};
+use crate::lifecycle::{AgentLabel, CommitSha, ContentHash, PlanKey, PlanPath, RepoBasename};
 
 pub type RepoRoot = PathBuf;
 
 #[derive(Debug, Default)]
 pub struct Trinity {
     pub repos: BTreeMap<RepoRoot, RepoState>,
+    /// Basename → canonical repo root index. Maintained alongside
+    /// `repos`. First registration wins on basename collision; later
+    /// registrations are dropped and the daemon logs WARN.
+    pub repo_basenames: BTreeMap<RepoBasename, RepoRoot>,
     pub live_events: VecDeque<LiveEvent>,
 }
 
@@ -361,8 +365,14 @@ impl StateDigest {
 pub struct Plan {
     pub id: PlanKey,
     /// Repo-relative path: `.trinity/plans/<stem>.md` or
-    /// `.trinity/plans/done/<stem>.md`. Never absolute.
+    /// `.trinity/plans/done/<stem>.md`. Never absolute. Internal: never
+    /// crosses an API boundary — the boundary uses `PlanId` plus
+    /// `state` and a derived `current_path`.
     pub plan_path: PlanPath,
+    /// Active vs Done lifecycle state, derived from `plan_path` at
+    /// rebuild time. Exposed on the wire as a `state` field; the
+    /// `PlanId` itself doesn't change when this flips.
+    pub state: PlanState,
     /// Body from HEAD's blob, not the working tree.
     pub body: String,
     pub body_hash: ContentHash,
@@ -378,6 +388,29 @@ pub struct Plan {
     /// `BodyDirty`. Not auto-organized into `<target-sha>/<author>.md` until
     /// the plan revision lands.
     pub held_plan_feedback: Vec<HeldFeedback>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlanState {
+    Active,
+    Done,
+}
+
+impl PlanState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            PlanState::Active => "active",
+            PlanState::Done => "done",
+        }
+    }
+
+    pub fn from_plan_path(p: &PlanPath) -> Self {
+        if p.is_done() {
+            PlanState::Done
+        } else {
+            PlanState::Active
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -93,11 +93,13 @@ pub fn derive_state(repo_root: PathBuf, snapshot: DiskSnapshot) -> RepoState {
         }
         let pf = entries.pop().expect("exactly one entry");
         let body_hash = content_hash(&pf.body);
+        let plan_state = crate::repo_state::PlanState::from_plan_path(&pf.plan_path);
         state.plans.insert(
             pf.plan_key.clone(),
             Plan {
                 id: pf.plan_key,
                 plan_path: pf.plan_path,
+                state: plan_state,
                 body: pf.body,
                 body_hash,
                 plan_intro: pf.plan_intro,

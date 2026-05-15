@@ -60,10 +60,104 @@ string_newtype!(CommitSha);
 string_newtype!(ContentHash);
 string_newtype!(AgentLabel);
 string_newtype!(PlanKey);
+string_newtype!(RepoBasename);
 
 /// Legacy alias retained while Phase 2/3 wire-level renames are still
 /// in-flight. Phase 4 removes it.
 pub type SessionId = PlanKey;
+
+impl RepoBasename {
+    /// Extract the basename (final `file_name` component) of a canonical
+    /// repo root. Returns `None` if the path has no usable basename.
+    pub fn from_repo_root(repo: &Path) -> Option<Self> {
+        let name = repo.file_name()?.to_str()?;
+        if name.is_empty() {
+            return None;
+        }
+        Some(RepoBasename(name.to_string()))
+    }
+}
+
+/// Public-facing plan identity: `<repo_basename>/<stem>.md`. Stable
+/// across the active↔done move (the file moves, the `PlanId` doesn't).
+///
+/// Parsing is filesystem-free — it only validates the wire shape. The
+/// daemon resolves the basename against `Trinity.repo_basenames` to
+/// find the canonical `RepoRoot`.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct PlanId {
+    repo: RepoBasename,
+    key: PlanKey,
+}
+
+impl PlanId {
+    pub fn new(repo: RepoBasename, key: PlanKey) -> Self {
+        Self { repo, key }
+    }
+
+    pub fn repo(&self) -> &RepoBasename {
+        &self.repo
+    }
+
+    pub fn key(&self) -> &PlanKey {
+        &self.key
+    }
+
+    /// Parse the wire form `<repo_basename>/<stem>.md`. Validates shape
+    /// only; does not touch the filesystem.
+    pub fn parse(s: &str) -> Result<Self, ParsePlanIdError> {
+        let (repo, stem_md) = s.split_once('/').ok_or(ParsePlanIdError::Malformed)?;
+        if repo.is_empty() {
+            return Err(ParsePlanIdError::EmptyRepo);
+        }
+        let stem = stem_md
+            .strip_suffix(".md")
+            .ok_or(ParsePlanIdError::MissingMdSuffix)?;
+        if stem.is_empty() {
+            return Err(ParsePlanIdError::EmptyStem);
+        }
+        if stem.contains('/') {
+            return Err(ParsePlanIdError::SlashInStem);
+        }
+        Ok(PlanId {
+            repo: RepoBasename(repo.to_string()),
+            key: PlanKey(stem.to_string()),
+        })
+    }
+}
+
+impl fmt::Display for PlanId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}/{}.md", self.repo.as_str(), self.key.as_str())
+    }
+}
+
+impl serde::Serialize for PlanId {
+    fn serialize<S: serde::Serializer>(&self, ser: S) -> Result<S::Ok, S::Error> {
+        ser.collect_str(self)
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for PlanId {
+    fn deserialize<D: serde::Deserializer<'de>>(de: D) -> Result<Self, D::Error> {
+        let s = String::deserialize(de)?;
+        PlanId::parse(&s).map_err(serde::de::Error::custom)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum ParsePlanIdError {
+    #[error("plan_id must be `<repo_basename>/<stem>.md`")]
+    Malformed,
+    #[error("plan_id is missing repo basename before `/`")]
+    EmptyRepo,
+    #[error("plan_id is missing the `.md` suffix")]
+    MissingMdSuffix,
+    #[error("plan_id stem is empty")]
+    EmptyStem,
+    #[error("plan_id stem must not contain `/`")]
+    SlashInStem,
+}
 
 impl PlanKey {
     /// Parse a repo-relative plan-file path into a `PlanKey`.
