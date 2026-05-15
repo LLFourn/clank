@@ -239,6 +239,11 @@ pub struct Trinity {
 }
 ```
 
+Basename collisions (a later registration's basename already in
+`repo_basenames`) are logged at WARN and the later repo is ignored.
+No in-state record of the shadowed repo, no API surface — the user
+sees a log line and fixes their directory layout if it matters.
+
 `RepoState` is unchanged: still `BTreeMap<PlanKey, Plan>` per repo, with
 `plan_conflicts: BTreeMap<PlanKey, Vec<PathBuf>>` for collisions.
 
@@ -327,12 +332,13 @@ Tools affected:
   `plan_id` (the agent could look up the basename) but spelling it
   out lets the caller act on `locations` directly.
 - `list_plans` — accepts optional `repo` (filter; the value is a
-  basename or a canonical path, both work). Response: `{plans,
-  conflicts}`. Each plan row: `{plan_id, slug, state, current_path,
-  phase, plan_worktree_status, waiting_on}`. Conflict row:
-  `{plan_id, slug, paths}` (the conflicted plan still has one
-  `plan_id` since all paths share a stem; `paths` lists every
-  conflicting on-disk path).
+  basename or a canonical path, both work). Response:
+  `{plans, conflicts}`.
+  - Each plan row: `{plan_id, slug, state, current_path, phase,
+    plan_worktree_status, waiting_on}`.
+  - Conflict row: `{plan_id, slug, paths}` — the conflicted plan
+    still has one `plan_id` since all paths share a stem; `paths`
+    lists every conflicting on-disk path.
 
 `start_plan` keeps `label` for the agent-name autofill.
 
@@ -479,14 +485,17 @@ again with the new identity. Phase 3 is the bulk of the new work.
 
 Already in master at `bc8efaf` + `e55aa6c`. This revision adds:
 
-- `PlanId` struct in `src/lifecycle.rs` with `parse` / `to_wire` /
-  `to_display` / serde.
+- `PlanId` and `RepoBasename` types in `src/lifecycle.rs` with
+  `parse` + `Display` + serde. `PlanId::parse` validates the wire
+  form only (two segments, `.md` suffix); it does not touch the
+  filesystem.
 - Remove `PlanPath` newtype. The internal field on `Plan` becomes
-  `plan_path: PathBuf` again (the type was load-bearing only at the
-  boundary, which the new design eliminates).
+  `plan_path: PathBuf` (the daemon's on-disk handle, never serialized
+  at the boundary).
 - Add `Plan.state: PlanState` field, derived from `plan_path` at
   rebuild time.
-- Tighten `PlanKey` grammar: reject stems containing `:`.
+- Add `Trinity.repo_basenames: BTreeMap<RepoBasename, RepoRoot>` as
+  the lookup index. Maintained alongside `Trinity.repos`.
 
 ### Phase 2 — MCP + LiveEvent re-cutover (partially shipped, needs rework)
 
@@ -494,40 +503,50 @@ Files: `src/tools.rs`, `src/server/mcp.rs`, `src/server/wait.rs`,
 `src/mcp_response.rs`, `src/repo_state.rs` (LiveEvent), `src/server/http.rs`
 (SSE).
 
-- Tool schemas: drop `repo` and `plan_path`; require `plan_id` everywhere
-  except `list_plans` (which keeps `repo` as a filter).
-- Dispatch parses `plan_id`, splits to `(repo, key)`, routes through the
-  simplified resolution (no counterpart logic).
+- Tool schemas:
+  - `start_plan` takes `{slug, label}` (cwd-repo implicit).
+  - `get_context`, `wait_for_work` take `plan_id`.
+  - `list_plans` takes optional `repo` filter (basename or path).
+  - `additionalProperties: false` enforced everywhere.
+- Dispatch parses `plan_id`, resolves via `Trinity.repo_basenames`,
+  then looks up in `RepoState.plans`.
 - `WaitArgs.plan_id` replaces `WaitArgs.plan_path` + `WaitArgs.repo`.
   New error variants: `InvalidPlanId`, `UnknownRepo`, `UnknownPlan`,
-  `PlanConflict`. **`PlanPathMismatch` removed.**
+  `PlanConflict`, `RepoBasenameTaken`. **`PlanPathMismatch` removed.**
 - `LiveEvent.plan_path` → `plan_id: Option<PlanId>` with derived
   `slug` and `state` populated at emit time.
-- `/events` payload uses the new shape.
-- `mcp_response::get_context_response` drops `session_id` and emits
-  `plan_id`, `slug`, `state`. (Addresses the prior reviewer's
-  unresolved finding.)
+- `/events` payload uses the new shape (`{ts, plan_id, slug, state,
+  kind, payload}`).
+- `mcp_response::get_context_response` drops `session_id`/`plan_path`
+  and emits `plan_id`, `slug`, `state`, `current_path`.
 
 ### Phase 3 — HTTP + Leptos route rewrite (new scope)
 
 Files: `src/server/http.rs`, `src/ui_response.rs`, `frontend/src/api.rs`,
 `frontend/src/main.rs`, `frontend/src/components/*.rs`, `frontend/src/store.rs`.
 
-- Delete `/api/sessions*` routes; add `/api/plans` + `/api/plan/{*plan_id}*`.
-- Backend handlers parse `plan_id` from the URL wildcard, dispatch via
-  the same resolve helper used by MCP.
-- Conflict response: `/api/plan/{*plan_id}` returns 409 with
-  `{error: "plan_conflict", paths: [...]}` when the stem is conflicted.
-- Frontend `api.rs` types rename: `SessionRow` → `PlanRow` with
-  `plan_id: String`, `slug: String`, `state: "active" | "done"`,
+- Delete `/api/sessions*` routes; add `/api/plans` plus the
+  two-segment `/api/plan/{repo}/{stem_md}*` family (detail, revision,
+  commit, diff, done). Same shape for SPA routes under `/plan/`.
+- Backend handlers extract `(repo, stem_md)` as two ordinary `Path`
+  params, reconstruct `PlanId`, dispatch via the same resolution
+  helper used by MCP.
+- Conflict response: `/api/plan/{repo}/{stem_md}` returns 409 with
+  `{error: "plan_conflict", paths: [...]}` when the stem is
+  conflicted.
+- Frontend `api.rs` types: `PlanRow` with `plan_id: String`,
+  `slug: String`, `state: "active" | "done"`, `current_path: String`,
   `phase`, `worktree_status`, `waiting_on`. Same for `PlanDetail`.
-- Frontend `store.rs::LiveEvent`: `plan_id: Option<String>` + `slug` +
-  `state`. Activity-sidebar deep links built from `plan_id`.
-- Leptos router: `/plan/{*plan_id}` and sub-routes. `<MetaStrip>`,
-  `<PlanRevision>`, `<CommitDiff>`, `<PlanDiff>` accept `plan_id`
-  directly; href construction is single-component.
+- Frontend `store.rs::LiveEvent`: `plan_id: Option<String>` +
+  `slug` + `state`. Activity-sidebar deep links built from `plan_id`.
+- Leptos router: `/plan/{repo}/{stem_md}` and sub-routes
+  (`/revision/{sha}`, `/commit/{sha}`, `/diff/{from}/{to}`).
+  Components accept `(repo, stem_md)` or a reconstructed `plan_id`;
+  href construction concatenates the two.
 - Conflict UI: home-row renders a conflict state for any entry in
-  `conflicts[]`.
+  `conflicts[]` (plan-key collisions within one repo). Basename
+  collisions across repos are log-only — not surfaced in any API
+  response.
 
 ### Phase 4 — Cleanup
 
@@ -591,6 +610,7 @@ Behavioral acceptance:
   repo (`repo_basename_taken`).
 - The daemon startup loader skips entries in `~/.trinity/repos`
   whose basenames collide, with a WARN log; first entry wins.
+  No in-state record of the shadowed repo, no API surface.
 - `PlanId::parse` validates the wire form (two segments, `.md`
   suffix, no `/` in stem) without touching the filesystem.
   Filesystem resolution happens in the `repo_basenames` lookup.
