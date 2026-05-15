@@ -63,13 +63,13 @@ fn ActivitySidebar(store: EventStore) -> impl IntoView {
                         key=|(_, e)| activity_key(e)
                         children=move |(_, e)| {
                             let session = e
-                                .session_id
+                                .slug
                                 .clone()
                                 .unwrap_or_else(|| "—".to_string());
                             let kind = e.kind.clone();
                             let kind_class = format!("activity-kind activity-{kind}");
                             let href = e
-                                .session_id
+                                .slug
                                 .as_ref()
                                 .map(|s| format!("/sessions/{s}"))
                                 .unwrap_or_else(|| "#".to_string());
@@ -90,15 +90,10 @@ fn ActivitySidebar(store: EventStore) -> impl IntoView {
 }
 
 fn activity_key(e: &crate::store::LiveEvent) -> String {
-    // ts + kind + session_id is unique-enough across the rolling
-    // 50-entry window; same ts+kind would only collide on duplicate
-    // broadcasts, which we'd want to dedupe visually anyway.
-    format!(
-        "{}:{}:{}",
-        e.ts,
-        e.kind,
-        e.session_id.as_deref().unwrap_or("-")
-    )
+    // ts + kind + slug is unique-enough across the rolling 50-entry
+    // window; same ts+kind would only collide on duplicate broadcasts,
+    // which we'd want to dedupe visually anyway.
+    format!("{}:{}:{}", e.ts, e.kind, e.slug.as_deref().unwrap_or("-"))
 }
 
 fn session_table(rows: Vec<SessionRow>) -> impl IntoView {
