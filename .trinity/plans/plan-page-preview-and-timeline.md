@@ -641,11 +641,6 @@ Files: `frontend/src/api.rs`, `frontend/src/components/session_detail.rs`,
   per-row caret. An alternative is "first row always expanded" —
   but that fights with `<For key>` reactivity since the "first
   row" changes as new commits land. Stick with explicit caret.
-- **`last_activity_ts` definition for a plan with no commits and no
-  feedback.** Default to `plan_intro_time` (the first commit that
-  added the plan file) — every committed plan has one. For
-  pre-commit plans (`plan_not_committed`), they don't appear in
-  the plans list at all, so the question doesn't arise.
 - **Unwatch confirmation UX.** Inline "Are you sure? [Confirm]
   [Cancel]" or a single-click with toast-to-undo? The plan picks
   inline-confirm because it's simpler and survives page-refresh
