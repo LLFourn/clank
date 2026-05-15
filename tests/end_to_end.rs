@@ -466,7 +466,9 @@ async fn start_plan_persists_repo_to_registry() {
         "registry should contain the repo, got: {body}"
     );
 
-    // Restore $HOME.
+    // Restore $HOME before dropping the lock — another HOME-mutating
+    // test may acquire next and we don't want it to observe our fake
+    // value.
     match prev_home {
         Some(v) => unsafe { std::env::set_var("HOME", v) },
         None => unsafe { std::env::remove_var("HOME") },
@@ -859,6 +861,102 @@ async fn start_plan_rejects_repo_basename_collision() {
 }
 
 #[tokio::test]
+async fn start_plan_concurrent_basename_twins_loser_does_no_disk_mutation() {
+    // Round 3 regression: two `start_plan`s from basename-twin repos
+    // fired concurrently must result in exactly one repo with a written
+    // `.gitignore` + `~/.trinity/repos` entry — the loser must not leak
+    // disk mutations between the precheck and the atomic register.
+    let _home_guard = HOME_LOCK.lock().await;
+    let fake_home = tempfile::tempdir().unwrap();
+    let prev_home = std::env::var_os("HOME");
+    // SAFETY: serialized with other HOME-mutating tests via HOME_LOCK.
+    unsafe { std::env::set_var("HOME", fake_home.path()) };
+
+    let parent_a = tempfile::tempdir().unwrap();
+    let parent_b = tempfile::tempdir().unwrap();
+    let dir_a = parent_a.path().join("twin");
+    let dir_b = parent_b.path().join("twin");
+    std::fs::create_dir_all(&dir_a).unwrap();
+    std::fs::create_dir_all(&dir_b).unwrap();
+    for d in [&dir_a, &dir_b] {
+        run_git(d, &["init", "--quiet", "--initial-branch=main"]);
+        run_git(d, &["config", "user.email", "test@test"]);
+        run_git(d, &["config", "user.name", "test"]);
+        run_git(d, &["config", "commit.gpgsign", "false"]);
+    }
+
+    let (url, handle) = spawn_daemon_with_repos(&[]).await;
+    let client = reqwest::Client::new();
+    let url_a = url.clone();
+    let url_b = url.clone();
+    let client_a = client.clone();
+    let client_b = client.clone();
+    let dir_a_clone = dir_a.clone();
+    let dir_b_clone = dir_b.clone();
+
+    let (resp_a, resp_b) = tokio::join!(
+        async move {
+            let req = json!({
+                "cwd": dir_a_clone,
+                "tool": "start_plan",
+                "arguments": { "slug": "first", "label": "agent" }
+            });
+            client_a
+                .post(format!("{url_a}/internal/tool_call"))
+                .json(&req)
+                .send()
+                .await
+                .unwrap()
+        },
+        async move {
+            let req = json!({
+                "cwd": dir_b_clone,
+                "tool": "start_plan",
+                "arguments": { "slug": "second", "label": "agent" }
+            });
+            client_b
+                .post(format!("{url_b}/internal/tool_call"))
+                .json(&req)
+                .send()
+                .await
+                .unwrap()
+        }
+    );
+    let status_a = resp_a.status();
+    let status_b = resp_b.status();
+    handle.abort();
+
+    let (winner_dir, loser_dir) = match (status_a.is_success(), status_b.is_success()) {
+        (true, false) => (&dir_a, &dir_b),
+        (false, true) => (&dir_b, &dir_a),
+        other => panic!(
+            "exactly one twin should succeed; got status_a={status_a} status_b={status_b}, ok={other:?}"
+        ),
+    };
+
+    assert!(
+        winner_dir.join(".gitignore").exists(),
+        "winning twin should have .gitignore written"
+    );
+    assert!(
+        !loser_dir.join(".gitignore").exists(),
+        "loser twin must not have .gitignore written (TOCTOU leak)"
+    );
+    let registry =
+        std::fs::read_to_string(fake_home.path().join(".trinity/repos")).unwrap_or_default();
+    let loser_str = loser_dir.to_string_lossy();
+    assert!(
+        !registry.lines().any(|l| l.trim() == loser_str),
+        "registry must not record the loser twin; registry: {registry}"
+    );
+
+    match prev_home {
+        Some(v) => unsafe { std::env::set_var("HOME", v) },
+        None => unsafe { std::env::remove_var("HOME") },
+    }
+}
+
+#[tokio::test]
 async fn api_plans_filter_by_basename() {
     let repo_a_parent = tempfile::tempdir().unwrap();
     let repo_b_parent = tempfile::tempdir().unwrap();
@@ -901,10 +999,45 @@ async fn api_plans_filter_by_basename() {
         .await
         .unwrap();
     let unknown_status = unknown.status();
-    handle.abort();
     assert_eq!(
         unknown_status,
         reqwest::StatusCode::NOT_FOUND,
         "unknown ?repo filter must 404 to match MCP error semantics"
+    );
+
+    // Path filter with `..` traversal: the route must canonicalize before
+    // matching against `Trinity.repos` (keyed on canonical paths). Without
+    // `dunce::canonicalize` in `repos_to_render`, this 404s even though
+    // the absolute path resolves to a watched repo.
+    let dir_b_canonical = dir_b.canonicalize().unwrap();
+    let beta_basename = dir_b_canonical.file_name().unwrap().to_string_lossy();
+    let parent_canonical = dir_b_canonical.parent().unwrap();
+    let parent_basename = parent_canonical.file_name().unwrap().to_string_lossy();
+    let parent_of_parent = parent_canonical.parent().unwrap().display();
+    let traversal_path =
+        format!("{parent_of_parent}/{parent_basename}/../{parent_basename}/{beta_basename}");
+    let resp = reqwest::Client::new()
+        .get(format!("{url}/api/plans"))
+        .query(&[("repo", traversal_path.as_str())])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::OK,
+        "path filter with `..` must canonicalize before lookup; full path: {traversal_path}"
+    );
+    let body: serde_json::Value = resp.json().await.unwrap();
+    let slugs: Vec<&str> = body["plans"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|p| p["slug"].as_str())
+        .collect();
+    handle.abort();
+    assert_eq!(
+        slugs,
+        vec!["in-beta"],
+        "traversal path should resolve to beta"
     );
 }

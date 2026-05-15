@@ -160,28 +160,17 @@ async fn start_plan(state: &AppState, req: &ToolCallRequest) -> Result<Value, To
     let plan_key = PlanKey::from(args.slug.clone());
     let plan_path = PathBuf::from(format!(".trinity/plans/{}.md", args.slug));
 
-    // Basename collision check: do this BEFORE any disk mutation
-    // (.gitignore, ~/.trinity/repos persistence, watcher creation). If
-    // another canonical path already claims this basename, refuse the call
-    // — the daemon can't disambiguate two repos with the same basename.
-    {
-        let trinity = state.runtime.state();
-        let trinity = trinity.lock().await;
-        if let Some(claimed_by) = trinity.repo_basenames.get(&basename)
-            && claimed_by != &repo
-        {
-            return Err(ToolError::Forbidden(format!(
-                "repo basename `{}` already claimed by {}",
-                basename,
-                claimed_by.display()
-            )));
-        }
-    }
-
+    // Atomically register this repo (or report a basename collision)
+    // BEFORE any disk mutation. `ensure_registered_or_reject` is the only
+    // place where the collision is detected under a single lock-held
+    // critical section in `Runtime::add_repo`; doing it first means two
+    // concurrent `start_plan` calls from basename-twins both lose disk
+    // mutations on the loser side (the first wins registration; the
+    // second returns Forbidden without ever touching disk).
+    ensure_registered_or_reject(state, &repo).await?;
     ensure_gitignore(&repo)?;
     persist_repo_in_registry(&repo)
         .map_err(|e| ToolError::Internal(anyhow::anyhow!("register repo: {e}")))?;
-    ensure_registered_or_reject(state, &repo).await?;
     ensure_repo_watcher(state, repo.clone()).await;
 
     {
@@ -349,9 +338,9 @@ async fn ensure_registered_or_reject(state: &AppState, repo: &Path) -> Result<()
             "repo basename collides with already-watched {}; rename the directory to disambiguate",
             claimed_by.display()
         ))),
-        Err(err) => Err(ToolError::Internal(anyhow::anyhow!(
-            "add_repo_if_unknown failed: {err}"
-        ))),
+        Err(err) => Err(ToolError::Internal(
+            anyhow::Error::new(err).context("add_repo_if_unknown failed"),
+        )),
     }
 }
 

@@ -182,6 +182,12 @@ fn waiting_from_gate(gate: Option<&ReviewGateDecision>, phase: GatePhase) -> Wai
 /// without assuming the plan file lived at its current path for the
 /// whole history.
 ///
+/// **Producer invariant:** `plan_touches[sha]` carries at most one
+/// `(plan_key, DoneMove)` entry per commit. Git's rename detection
+/// pairs one source to one destination per commit, so the upstream
+/// `parse_diff_tree` walk in `git_io` cannot emit duplicates today.
+/// If a future producer relaxes that, the XOR will silently cancel.
+///
 /// Returns `None` if `target_sha` isn't in `commit_order`.
 pub fn plan_path_at(
     plan_key: &crate::lifecycle::PlanKey,
