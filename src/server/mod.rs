@@ -45,6 +45,13 @@ pub struct ServeArgs {
         env = "TRINITY_LOCK_FILE"
     )]
     pub lock: String,
+
+    /// Path to the built Leptos SPA bundle. The daemon serves the
+    /// directory at `/static/*` and falls back to `<dir>/index.html` for
+    /// unknown routes. Default points at the in-repo `frontend/dist/`
+    /// produced by `trunk build`.
+    #[arg(long, default_value = "frontend/dist", env = "TRINITY_FRONTEND_DIST")]
+    pub frontend_dist: PathBuf,
 }
 
 pub async fn serve(args: ServeArgs) -> anyhow::Result<()> {
@@ -92,6 +99,7 @@ pub async fn serve(args: ServeArgs) -> anyhow::Result<()> {
         runtime: Arc::clone(&runtime),
         watchers: Arc::new(Mutex::new(watchers)),
         watched_repos: Arc::new(Mutex::new(watched_repos)),
+        frontend_dist: args.frontend_dist.clone(),
     };
 
     let app = http::router(state);

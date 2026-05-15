@@ -18,4 +18,7 @@ pub struct AppState {
     /// Used by `start_plan` to avoid double-watching when a new repo is
     /// registered mid-session.
     pub watched_repos: Arc<Mutex<HashSet<PathBuf>>>,
+    /// Directory containing the built Leptos bundle. Served at `/static/*`
+    /// and the fallback route returns `<dir>/index.html`.
+    pub frontend_dist: PathBuf,
 }

@@ -69,6 +69,9 @@ pub struct FeedbackBlob {
     pub abs_path: PathBuf,
     pub parsed: FeedbackPath,
     pub body: String,
+    /// Unix-seconds mtime from `fs::metadata`. Threaded into `Feedback` /
+    /// `HeldFeedback` so UI surfaces can sort feedback chronologically.
+    pub created_at: i64,
 }
 
 /// Pure derivation of `RepoState` from a snapshot. No IO. Tests in this
@@ -132,6 +135,7 @@ pub fn derive_state(repo_root: PathBuf, snapshot: DiskSnapshot) -> RepoState {
 
 fn ingest_feedback(session: &mut Session, fb: FeedbackBlob) {
     let verdict = parse_verdict(&fb.body);
+    let created_at = fb.created_at;
     match fb.parsed.target_sha {
         Some(target_sha) => {
             let map = match fb.parsed.phase {
@@ -144,6 +148,7 @@ fn ingest_feedback(session: &mut Session, fb: FeedbackBlob) {
                     path: fb.abs_path,
                     body: fb.body,
                     verdict,
+                    created_at,
                 },
             );
         }
@@ -157,6 +162,7 @@ fn ingest_feedback(session: &mut Session, fb: FeedbackBlob) {
                 author: fb.parsed.author,
                 body: fb.body,
                 reason,
+                created_at,
             });
         }
     }
@@ -221,6 +227,7 @@ mod tests {
                 raw: PathBuf::from("..."),
             },
             body: body.to_string(),
+            created_at: 0,
         }
     }
 

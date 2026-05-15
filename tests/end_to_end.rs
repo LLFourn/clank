@@ -71,6 +71,7 @@ async fn spawn_daemon_with_repos(
         bind: addr,
         repos: repos_file.path().to_string_lossy().into_owned(),
         lock: lock_path,
+        frontend_dist: std::path::PathBuf::from("frontend/dist"),
     };
 
     let url = format!("http://{}", addr);
@@ -90,23 +91,28 @@ async fn spawn_daemon_with_repos(
 
 #[tokio::test]
 async fn home_renders_session_list() {
+    // Post-Leptos: `/` serves the empty SPA shell; the homepage's data
+    // comes from `/api/sessions` instead.
     let dir = init_repo();
     write_file(dir.path(), ".trinity/plans/foo.md", "# foo\n");
     commit(dir.path(), "Add foo");
 
     let (url, handle) = spawn_daemon(dir.path()).await;
-    let body = reqwest::get(format!("{}/", url))
+    let repo_param: String = url::form_urlencoded::byte_serialize(
+        dir.path().to_string_lossy().as_bytes(),
+    )
+    .collect();
+    let body = reqwest::get(format!("{url}/api/sessions?repo={repo_param}"))
         .await
         .unwrap()
         .text()
         .await
         .unwrap();
     handle.abort();
-    assert!(body.contains("foo"), "home page should list 'foo'");
-    assert!(body.contains("planning"), "phase should be 'planning'");
+    assert!(body.contains("\"foo\""), "session list should include 'foo'");
+    assert!(body.contains("\"planning\""), "phase should be 'planning'");
     assert!(
-        body.contains("plan_needs_initial_review")
-            || body.contains("Plan is committed and awaiting"),
+        body.contains("plan_needs_initial_review"),
         "should describe waiting on reviewers; got: {}",
         body
     );

@@ -19,8 +19,18 @@ use crate::lifecycle::SessionId;
 use crate::mcp_response::{get_context_response, list_sessions_response};
 
 pub fn router(state: AppState) -> Router {
+    // Phase 1 axum routing order (per .trinity/plans/leptos-frontend.md):
+    //   1. /api/*           — UI surface (JSON only).
+    //   2. /static/*        — Leptos bundle assets via ServeDir.
+    //   3. /events          — SSE.
+    //   4. /internal/*      — MCP dispatch + tool catalog.
+    //   5. /healthz         — readiness probe.
+    //   6. Transitional maud routes — `/sessions/...` paths still served
+    //      by the old src/server/ui.rs handlers; deleted in Phase 5.
+    //   7. SPA fallback     — anything else returns frontend/dist/index.html.
+    let static_service = tower_http::services::ServeDir::new(state.frontend_dist.clone());
+    let fallback_index = state.frontend_dist.join("index.html");
     Router::new()
-        .route("/", get(home))
         .route("/healthz", get(healthz))
         .route("/sessions/{session_id}", get(session_detail))
         .route("/sessions/{session_id}/plan/{sha}", get(plan_revision_view))
@@ -31,7 +41,37 @@ pub fn router(state: AppState) -> Router {
         .route("/internal/tools", get(list_tools))
         .route("/internal/tool_call", post(call_tool))
         .route("/api/wait_for_work", post(api_wait_for_work))
+        .route("/api/sessions", get(api_sessions))
+        .route("/api/sessions/{session_id}", get(api_session_detail))
+        .route(
+            "/api/sessions/{session_id}/plan/{sha}",
+            get(api_plan_revision),
+        )
+        .route(
+            "/api/sessions/{session_id}/commit/{sha}",
+            get(api_commit_diff),
+        )
+        .nest_service("/static", static_service)
+        .fallback(move || serve_spa_shell(fallback_index.clone()))
         .with_state(state)
+}
+
+/// Read the built Leptos shell from disk and return it as HTML. Used as
+/// the catch-all for non-API, non-asset, non-explicit paths so the SPA's
+/// client-side router can take over deep links.
+async fn serve_spa_shell(index_path: PathBuf) -> Response {
+    match tokio::fs::read_to_string(&index_path).await {
+        Ok(body) => Html(body).into_response(),
+        Err(err) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            format!(
+                "Leptos bundle not found at {} ({}). Run `trunk build` in frontend/ or set --frontend-dist.",
+                index_path.display(),
+                err
+            ),
+        )
+            .into_response(),
+    }
 }
 
 async fn api_wait_for_work(
@@ -61,6 +101,7 @@ struct RepoQuery {
     repo: Option<String>,
 }
 
+#[allow(dead_code)] // Phase 1 transition: SPA fallback supersedes the maud home; removed in Phase 5.
 async fn home(
     State(state): State<AppState>,
     Query(q): Query<RepoQuery>,
@@ -338,6 +379,175 @@ impl IntoResponse for AppError {
     }
 }
 
+// ---------------------------------------------------------------------------
+// /api/* — UI-only JSON surface. Distinct shapes from mcp_response::* per the
+// surface-separation rule in .trinity/plans/leptos-frontend.md. All handlers
+// snapshot under the runtime mutex via Runtime::snapshot_*, release the
+// lock, then build the response — no disk I/O happens under the mutex.
+
+async fn api_sessions(
+    State(state): State<AppState>,
+    Query(q): Query<RepoQuery>,
+) -> Result<axum::Json<Value>, AppError> {
+    let repos = repos_to_render(&state, q.repo).await;
+    let mut combined: Vec<Value> = Vec::new();
+    for repo in repos {
+        let snapshot = state
+            .runtime
+            .snapshot_repo(&repo)
+            .await
+            .map_err(AppError::runtime)?;
+        let v = crate::ui_response::sessions_index(&snapshot).map_err(AppError::io)?;
+        if let Some(arr) = v.as_array() {
+            combined.extend(arr.iter().cloned());
+        }
+    }
+    Ok(axum::Json(Value::Array(combined)))
+}
+
+async fn api_session_detail(
+    State(state): State<AppState>,
+    Path(session_id): Path<String>,
+    Query(q): Query<RepoQuery>,
+) -> Result<axum::Json<Value>, AppError> {
+    let repos = repos_to_render(&state, q.repo).await;
+    for repo in repos {
+        let snapshot = state
+            .runtime
+            .snapshot_session(&repo, &SessionId::from(session_id.clone()))
+            .await
+            .map_err(AppError::runtime)?;
+        if let Some(snapshot) = snapshot {
+            let v = crate::ui_response::session_page(&snapshot).map_err(AppError::io)?;
+            return Ok(axum::Json(v));
+        }
+    }
+    Err(AppError::not_found(format!(
+        "session {session_id} not found"
+    )))
+}
+
+async fn api_plan_revision(
+    State(state): State<AppState>,
+    Path((session_id, sha)): Path<(String, String)>,
+    Query(q): Query<RepoQuery>,
+) -> Result<axum::Json<Value>, AppError> {
+    let commit_sha = crate::lifecycle::CommitSha::from(sha.clone());
+    let repos = repos_to_render(&state, q.repo).await;
+    for repo in repos {
+        let snapshot = state
+            .runtime
+            .snapshot_session(&repo, &SessionId::from(session_id.clone()))
+            .await
+            .map_err(AppError::runtime)?;
+        let Some(snapshot) = snapshot else { continue };
+
+        let body_raw = crate::git_io::show_blob(&repo, &commit_sha, &snapshot.session.plan_path)
+            .await
+            .map_err(|e| AppError::internal(format!("git show: {e}")))?;
+        let body_html = crate::ui_response::render_markdown(&body_raw);
+
+        // Prev/next link derivation from the per-session plan-touching
+        // commit list (chronological order, oldest first).
+        let plan_revisions = crate::projection::all_plan_revisions_for(
+            &snapshot.session.id,
+            &snapshot.commit_order,
+            &snapshot.plan_touches,
+        );
+        let pos = plan_revisions.iter().position(|c| c == &commit_sha);
+        let previous_sha = pos
+            .and_then(|i| i.checked_sub(1).and_then(|j| plan_revisions.get(j)))
+            .map(|c| c.as_str().to_string());
+        let next_sha = pos
+            .and_then(|i| plan_revisions.get(i + 1))
+            .map(|c| c.as_str().to_string());
+
+        let feedback = crate::ui_response::feedback_for_target(&snapshot.session, &commit_sha);
+        return Ok(axum::Json(json!({
+            "repo": snapshot.root.to_string_lossy(),
+            "session_id": snapshot.session.id.as_str(),
+            "commit_sha": commit_sha.as_str(),
+            "body_raw": body_raw,
+            "body_html": body_html,
+            "plan_intro": snapshot.session.plan_intro.as_str(),
+            "plan_intro_parent": snapshot.session.plan_intro_parent.as_ref().map(|s| s.as_str()),
+            "previous_sha": previous_sha,
+            "next_sha": next_sha,
+            "feedback": feedback,
+        })));
+    }
+    Err(AppError::not_found(format!(
+        "session {session_id} not found"
+    )))
+}
+
+async fn api_commit_diff(
+    State(state): State<AppState>,
+    Path((session_id, sha)): Path<(String, String)>,
+    Query(q): Query<RepoQuery>,
+) -> Result<axum::Json<Value>, AppError> {
+    let commit_sha = crate::lifecycle::CommitSha::from(sha.clone());
+    let repos = repos_to_render(&state, q.repo).await;
+    for repo in repos {
+        let snapshot = state
+            .runtime
+            .snapshot_session(&repo, &SessionId::from(session_id.clone()))
+            .await
+            .map_err(AppError::runtime)?;
+        let Some(snapshot) = snapshot else { continue };
+
+        let patch = crate::git_io::show_commit(&repo, &commit_sha)
+            .await
+            .map_err(|e| AppError::internal(format!("git show: {e}")))?;
+        let diff_files = crate::diff_parser::parse_diff(&patch);
+        let diff_files_json: Vec<Value> = diff_files
+            .iter()
+            .map(|f| {
+                json!({
+                    "path": f.path,
+                    "old_path": f.old_path,
+                    "additions": f.additions,
+                    "deletions": f.deletions,
+                    "mode": match f.mode {
+                        crate::diff_parser::FileDiffMode::Added => "added",
+                        crate::diff_parser::FileDiffMode::Removed => "removed",
+                        crate::diff_parser::FileDiffMode::Renamed => "renamed",
+                        crate::diff_parser::FileDiffMode::Modified => "modified",
+                    },
+                    "binary": f.binary,
+                    "always_folded": crate::diff_parser::is_always_folded(&f.path),
+                    "hunks": f.hunks.iter().map(|h| json!({
+                        "header": h.header,
+                        "lines": h.lines.iter().map(|l| json!({
+                            "kind": match l.kind {
+                                crate::diff_parser::DiffLineKind::Insert => "insert",
+                                crate::diff_parser::DiffLineKind::Delete => "delete",
+                                crate::diff_parser::DiffLineKind::Context => "context",
+                                crate::diff_parser::DiffLineKind::Meta => "meta",
+                            },
+                            "old_lineno": l.old_lineno,
+                            "new_lineno": l.new_lineno,
+                            "content": l.content,
+                        })).collect::<Vec<_>>(),
+                    })).collect::<Vec<_>>(),
+                })
+            })
+            .collect();
+
+        let feedback = crate::ui_response::feedback_for_target(&snapshot.session, &commit_sha);
+        return Ok(axum::Json(json!({
+            "repo": snapshot.root.to_string_lossy(),
+            "session_id": snapshot.session.id.as_str(),
+            "commit_sha": commit_sha.as_str(),
+            "diff_files": diff_files_json,
+            "feedback": feedback,
+        })));
+    }
+    Err(AppError::not_found(format!(
+        "session {session_id} not found"
+    )))
+}
+
 #[cfg(test)]
 mod wire_tests {
     //! Wire-level tests against the actual axum router. Covers
@@ -405,6 +615,7 @@ mod wire_tests {
             runtime: Arc::clone(&runtime),
             watchers: Arc::new(Mutex::new(Vec::new())),
             watched_repos: Arc::new(Mutex::new(HashSet::new())),
+            frontend_dist: std::path::PathBuf::from("frontend/dist"),
         };
         (runtime, state)
     }

@@ -1,3 +1,6 @@
 /target/
 .trinity/*
 !.trinity/plans/
+
+# Leptos frontend build output (trunk).
+/frontend/dist/

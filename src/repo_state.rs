@@ -321,6 +321,10 @@ pub struct Feedback {
     pub path: PathBuf,
     pub body: String,
     pub verdict: Verdict,
+    /// File mtime as unix seconds at the time the feedback was ingested.
+    /// Used by the UI to sort feedback chronologically when SHA + author
+    /// alone don't establish order.
+    pub created_at: i64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -347,6 +351,8 @@ pub struct HeldFeedback {
     pub body: String,
     /// Machine-readable key for the held reason. Today: `"plan_dirty"`.
     pub reason: &'static str,
+    /// File mtime as unix seconds at the time the held entry was created.
+    pub created_at: i64,
 }
 
 /// Working-tree state of a session's plan file relative to HEAD. **Never

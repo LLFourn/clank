@@ -43,9 +43,18 @@ pub fn plan_worktree_status(
 /// - `Implementing` if any attributed commit past plan_intro has code changes.
 /// - `Planning` otherwise.
 pub fn phase(session: &Session, attribution: &BTreeMap<CommitSha, AttributionResult>) -> Phase {
+    phase_for(&session.plan_path, &session.id, attribution)
+}
+
+/// Phase derivation from primitive inputs. Used by callers that hold a
+/// snapshot (e.g. `ui_response`) rather than a `&Session`.
+pub fn phase_for(
+    plan_path: &std::path::Path,
+    session_id: &crate::lifecycle::SessionId,
+    attribution: &BTreeMap<CommitSha, AttributionResult>,
+) -> Phase {
     use std::path::Component;
-    let is_done = session
-        .plan_path
+    let is_done = plan_path
         .components()
         .any(|c| matches!(c, Component::Normal(s) if s == "done"));
     if is_done {
@@ -57,7 +66,7 @@ pub fn phase(session: &Session, attribution: &BTreeMap<CommitSha, AttributionRes
             has_code_changes: true,
             ..
         } = attr
-            && sid == &session.id
+            && sid == session_id
         {
             return Phase::Implementing;
         }
@@ -170,14 +179,21 @@ pub fn all_plan_revisions(
     session: &Session,
     state: &crate::repo_state::RepoState,
 ) -> Vec<CommitSha> {
-    state
-        .commit_order
+    all_plan_revisions_for(&session.id, &state.commit_order, &state.plan_touches)
+}
+
+/// Same as `all_plan_revisions` but over primitive inputs (no `RepoState`).
+pub fn all_plan_revisions_for(
+    session_id: &crate::lifecycle::SessionId,
+    commit_order: &[CommitSha],
+    plan_touches: &BTreeMap<CommitSha, Vec<(crate::lifecycle::SessionId, crate::repo_state::PlanTouchKind)>>,
+) -> Vec<CommitSha> {
+    commit_order
         .iter()
         .filter(|sha| {
-            state
-                .plan_touches
+            plan_touches
                 .get(*sha)
-                .is_some_and(|touches| touches.iter().any(|(sid, _)| sid == &session.id))
+                .is_some_and(|touches| touches.iter().any(|(sid, _)| sid == session_id))
         })
         .cloned()
         .collect()
@@ -189,17 +205,25 @@ pub fn all_implementation_commits(
     session: &Session,
     state: &crate::repo_state::RepoState,
 ) -> Vec<CommitSha> {
-    state
-        .commit_order
+    all_implementation_commits_for(&session.id, &state.commit_order, &state.attribution)
+}
+
+/// Same as `all_implementation_commits` but over primitive inputs.
+pub fn all_implementation_commits_for(
+    session_id: &crate::lifecycle::SessionId,
+    commit_order: &[CommitSha],
+    attribution: &BTreeMap<CommitSha, AttributionResult>,
+) -> Vec<CommitSha> {
+    commit_order
         .iter()
         .filter(|sha| {
             matches!(
-                state.attribution.get(*sha),
+                attribution.get(*sha),
                 Some(AttributionResult::Attributed {
                     session: sid,
                     has_code_changes: true,
                     ..
-                }) if sid == &session.id
+                }) if sid == session_id
             )
         })
         .cloned()
@@ -213,11 +237,31 @@ pub fn latest_plan_touching_commit(
     all_plan_revisions(session, state).into_iter().last()
 }
 
+pub fn latest_plan_touching_commit_for(
+    session_id: &crate::lifecycle::SessionId,
+    commit_order: &[CommitSha],
+    plan_touches: &BTreeMap<CommitSha, Vec<(crate::lifecycle::SessionId, crate::repo_state::PlanTouchKind)>>,
+) -> Option<CommitSha> {
+    all_plan_revisions_for(session_id, commit_order, plan_touches)
+        .into_iter()
+        .last()
+}
+
 pub fn latest_impl_commit(
     session: &Session,
     state: &crate::repo_state::RepoState,
 ) -> Option<CommitSha> {
     all_implementation_commits(session, state)
+        .into_iter()
+        .last()
+}
+
+pub fn latest_impl_commit_for(
+    session_id: &crate::lifecycle::SessionId,
+    commit_order: &[CommitSha],
+    attribution: &BTreeMap<CommitSha, AttributionResult>,
+) -> Option<CommitSha> {
+    all_implementation_commits_for(session_id, commit_order, attribution)
         .into_iter()
         .last()
 }
@@ -229,11 +273,27 @@ pub fn plan_gate_for(
     session: &Session,
     state: &crate::repo_state::RepoState,
 ) -> Option<ReviewGateDecision> {
-    let current_target = latest_plan_touching_commit(session, state)?;
+    plan_gate_for_parts(
+        &session.id,
+        &session.plan_feedback,
+        &state.commit_order,
+        &state.plan_touches,
+    )
+}
+
+/// Same as `plan_gate_for` but over primitive inputs.
+pub fn plan_gate_for_parts(
+    session_id: &crate::lifecycle::SessionId,
+    plan_feedback: &BTreeMap<(CommitSha, AgentLabel), Feedback>,
+    commit_order: &[CommitSha],
+    plan_touches: &BTreeMap<CommitSha, Vec<(crate::lifecycle::SessionId, crate::repo_state::PlanTouchKind)>>,
+) -> Option<ReviewGateDecision> {
+    let current_target =
+        latest_plan_touching_commit_for(session_id, commit_order, plan_touches)?;
     Some(derive_gate_from_feedback(
         ReviewPhase::Plan,
         &current_target,
-        &session.plan_feedback,
+        plan_feedback,
     ))
 }
 
@@ -244,11 +304,27 @@ pub fn impl_gate_for(
     session: &Session,
     state: &crate::repo_state::RepoState,
 ) -> Option<ReviewGateDecision> {
-    let current_target = latest_impl_commit(session, state)?;
+    impl_gate_for_parts(
+        &session.id,
+        &session.impl_feedback,
+        &state.commit_order,
+        &state.attribution,
+    )
+}
+
+/// Same as `impl_gate_for` but over primitive inputs.
+pub fn impl_gate_for_parts(
+    session_id: &crate::lifecycle::SessionId,
+    impl_feedback: &BTreeMap<(CommitSha, AgentLabel), Feedback>,
+    commit_order: &[CommitSha],
+    attribution: &BTreeMap<CommitSha, AttributionResult>,
+) -> Option<ReviewGateDecision> {
+    let current_target =
+        latest_impl_commit_for(session_id, commit_order, attribution)?;
     Some(derive_gate_from_feedback(
         ReviewPhase::Impl,
         &current_target,
-        &session.impl_feedback,
+        impl_feedback,
     ))
 }
 

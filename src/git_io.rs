@@ -438,10 +438,17 @@ fn collect_feedback_files(repo_root: &Path) -> Result<Vec<FeedbackBlob>, GitIoEr
             context: "read feedback file".into(),
             detail: format!("{}: {e}", abs.display()),
         })?;
+        let created_at = std::fs::metadata(&abs)
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
         out.push(FeedbackBlob {
             abs_path: abs,
             parsed,
             body,
+            created_at,
         });
     }
     Ok(out)

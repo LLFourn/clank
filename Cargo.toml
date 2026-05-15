@@ -1,3 +1,6 @@
+[workspace]
+members = [".", "frontend"]
+
 [package]
 name = "trinity"
 version = "0.0.1"
@@ -9,7 +12,7 @@ tokio = { version = "1", features = ["full"] }
 
 # HTTP server + middleware
 axum = { version = "0.8", features = ["macros"] }
-tower-http = { version = "0.6", features = ["trace", "validate-request"] }
+tower-http = { version = "0.6", features = ["trace", "validate-request", "fs"] }
 
 # CLI
 clap = { version = "4", features = ["derive", "env"] }

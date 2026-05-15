@@ -552,6 +552,7 @@ fn upsert_feedback_at_target(
     body: String,
 ) {
     let verdict = crate::disk_format::parse_verdict(&body);
+    let created_at = file_mtime_unix_secs(&abs_path);
     let map = match phase {
         FeedbackPhase::Plan => &mut session.plan_feedback,
         FeedbackPhase::Impl => &mut session.impl_feedback,
@@ -562,8 +563,22 @@ fn upsert_feedback_at_target(
             path: abs_path,
             body,
             verdict,
+            created_at,
         },
     );
+}
+
+/// File mtime as unix seconds, falling back to 0 if metadata is
+/// unavailable. Used by feedback upserts so the in-memory `Feedback` /
+/// `HeldFeedback` records carry the same chronological hint that the
+/// initial-rebuild path picks up via `git_io::collect_feedback_files`.
+fn file_mtime_unix_secs(path: &Path) -> i64 {
+    std::fs::metadata(path)
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
 }
 
 impl Runtime {
@@ -587,6 +602,7 @@ fn upsert_feedback(
     body: String,
 ) {
     let verdict = crate::disk_format::parse_verdict(&body);
+    let created_at = file_mtime_unix_secs(&abs_path);
     match parsed.target_sha {
         Some(target_sha) => {
             let map = match parsed.phase {
@@ -599,6 +615,7 @@ fn upsert_feedback(
                     path: abs_path,
                     body,
                     verdict,
+                    created_at,
                 },
             );
         }
@@ -612,6 +629,7 @@ fn upsert_feedback(
                 author: parsed.author,
                 body,
                 reason,
+                created_at,
             });
             let _ = verdict;
         }
