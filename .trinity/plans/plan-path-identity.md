@@ -162,7 +162,8 @@ canonical identity is `PlanId`; `current_path` is display material.
 ## Non-Goals
 
 - No on-disk feedback layout change (still `.trinity/feedback/<stem>/...`).
-- No automatic migration of historical feedback or git commits.
+- No backwards-compat with the prior `session_id` / `plan_path` wire
+  shapes. The wire just changes; old clients break.
 - No nested plan paths in this phase. `PlanKey::from_path` still rejects
   them; nested support is a follow-up.
 - No global cross-repo identity — repo root remains a load-bearing scope.
@@ -451,23 +452,22 @@ take `PlanSnapshotBundle` as today; they emit `plan_id` (computed from
 
 ### 7. Compatibility strategy
 
-Same posture as Phase 2: breaking internal model change, no migration
-shim, no compatibility code.
+Breaking change. No migration shim, no fallback to old shapes.
 
 Concrete deltas from what's already shipped:
 
 - MCP tool schemas: `repo` field deleted from plan-scoped tools;
-  `plan_path` field renamed to `plan_id`. `additionalProperties: false`
-  rejects the old shape clearly.
+  `plan_path` field renamed to `plan_id` (basename form).
+  `additionalProperties: false` rejects the old shape clearly.
 - HTTP routes: `/api/sessions*` was retained through Phase 2 as a
-  carve-out; this revision deletes them in Phase 3.
+  carve-out; this revision deletes them in Phase 3 and replaces
+  them with two-segment `/api/plan/{repo}/{stem_md}` routes.
 - Frontend: `api.rs` DTOs rebuild around `plan_id`; route structure
-  switches from `/sessions/:id` to `/plan/{*plan_id}`.
-- The wire form is the canonical absolute repo + stem. The frontend
-  composes hrefs in canonical form (or `~`-shorthand for display).
+  switches from `/sessions/:id` to `/plan/{repo}/{stem_md}`.
 
-The disk layout under `.trinity/feedback/<stem>/...` is unchanged; no
-file moves needed.
+The disk layout under `.trinity/feedback/<stem>/...` happens to be
+unchanged (the stem is the same), so feedback files written before
+this change keep loading.
 
 ## Phases
 
@@ -633,6 +633,4 @@ Behavioral acceptance:
 
 ## Open Questions
 
-- *Backwards-compat for already-recorded feedback*: feedback under
-  `.trinity/feedback/<stem>/...` already keys by stem only and is
-  unaffected.
+None.
