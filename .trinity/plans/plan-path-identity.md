@@ -122,12 +122,12 @@ pub enum PlanState { Active, Done }
 ```
 
 `Plan.state` derives from `plan_path` (anything under
-`.trinity/plans/done/` is Done; otherwise Active). **API responses
-expose `state` (Active / Done) as a value but never expose the on-disk
-`plan_path` in their JSON.** The on-disk path stays internal; the only
-places filesystem paths cross the boundary are explicit actionable
-locations like `write_feedback.path` and `wait_for_work.locations`,
-which are repo-relative.
+`.trinity/plans/done/` is Done; otherwise Active). API responses
+include `state: "active" | "done"` and a `current_path` (repo-relative,
+e.g. `.trinity/plans/foo.md` or `.trinity/plans/done/foo.md`) so the
+UI can render the on-disk location without re-deriving it. The
+canonical identity is still `PlanId`; `current_path` is display
+material that callers can re-derive trivially from `(slug, state)`.
 
 ## Goals
 
@@ -292,20 +292,22 @@ Tools affected:
   `plan_already_exists`, `plan_in_conflict`.
 - `get_context` — accepts `plan_id`. Errors: `invalid_plan_id`,
   `unknown_repo`, `unknown_plan`, `plan_not_committed`, `plan_conflict`.
-  Response: `{plan_id, repo, slug, state: "active"|"done", phase,
-  plan_worktree_status, waiting_on, ...}`. **No `plan_path` field on
-  the response.** `repo` is included as a convenience so callers can
-  resolve any returned repo-relative paths without parsing `plan_id`.
+  Response: `{plan_id, slug, state: "active"|"done", current_path,
+  phase, plan_worktree_status, waiting_on, ...}`. `current_path` is
+  the plan's current repo-relative path (active vs done is the only
+  axis it varies on); agents that need it for display can read it
+  directly instead of recomputing from `(slug, state)`.
 - `wait_for_work` — accepts `plan_id`. `Match`:
-  `{plan_id, repo, work, locations}`. `repo` is the canonical absolute
-  path; `locations` stay repo-relative. The convenience field lets
-  agents read/write the returned paths directly without parsing
-  `plan_id`.
+  `{plan_id, work, locations}`. `locations` stay repo-relative;
+  agents resolve them against the repo by stripping `:<stem>.md` off
+  `plan_id`. No separate `repo` field — `plan_id` carries everything.
 - `list_plans` — accepts optional `repo` (still a useful filter when
   watching multiple repos). Response: `{plans: [...], conflicts: [...]}`.
-  Each plan row: `{plan_id, repo, slug, state, phase,
-  plan_worktree_status, waiting_on}`. Conflict row: `{repo, slug,
-  paths}` (paths are repo-relative for display).
+  Each plan row: `{plan_id, slug, state, current_path, phase,
+  plan_worktree_status, waiting_on}`. Conflict row:
+  `{slug, plan_ids, paths}` (the `plan_ids` list every conflicting
+  identifier so the operator can pick which to act on; `paths` is
+  repo-relative for display).
 
 `start_plan` keeps `label` for the agent-name autofill.
 
@@ -332,72 +334,96 @@ purely transport.
 
 ### 5. UI routes + `/api/*`
 
-URL routes use a percent-encoded `PlanId` as a **single path segment**
-(not a wildcard capture):
+URL routes use a sanitized `PlanId` form as a **single path segment**.
+
+**Sanitization rule:** `/` in the repo portion of the canonical
+`PlanId` is replaced with `_`. Other URL-significant bytes
+(`?`, `#`, `%`, space, control chars, non-UTF-8) are simply rejected:
+repos with those characters in their canonical path can't be addressed
+via HTTP and are refused at `start_plan` time. In practice every
+real-world repo path is `[A-Za-z0-9_.-/]+`, so the sanitization is a
+straight `/` → `_` substitution.
+
+Canonical and URL forms:
 
 ```
-GET  /                                  # SPA home
-GET  /plan/{plan_id_encoded}            # SPA plan detail
-GET  /plan/{plan_id_encoded}/revision/{sha}
-GET  /plan/{plan_id_encoded}/commit/{sha}
-GET  /plan/{plan_id_encoded}/diff/{from}...{to}
-POST /api/plan/{plan_id_encoded}/done   # body: {}
-
-GET  /api/plans?repo=<repo>             # repo filter; absent = all watched repos
-GET  /api/plan/{plan_id_encoded}
-GET  /api/plan/{plan_id_encoded}/revision/{sha}
-GET  /api/plan/{plan_id_encoded}/commit/{sha}
-GET  /api/plan/{plan_id_encoded}/diff/{from}...{to}
+canonical: /Users/llfourn/src/trinity:plan-path-identity.md
+url form:  _Users_llfourn_src_trinity:plan-path-identity.md
 ```
 
-**Encoding rule (named contract):** `plan_id_encoded` is the canonical
-`PlanId` string (after `~` expansion and `dunce::canonicalize`)
-serialized via `percent_encoding::utf8_percent_encode` with the
-`percent_encoding::NON_ALPHANUMERIC` set as the encode set. That
-percent-encodes every byte that is not an ASCII letter or digit —
-including `/`, `:`, `.`, `~`, `-`, `_`, space, `#`, `?`, `%`, `;`, and
-all UTF-8 continuation bytes. Decoding is the inverse:
-`percent_encoding::percent_decode_str` + UTF-8 validation.
-
-The encoding is intentionally aggressive (encodes more than RFC 3986
-strictly requires) so the path segment is one opaque blob: no
-filename-shaped characters survive to confuse axum's router, browsers,
-proxies, or the SPA's `<a href>` construction. URLs look like:
+Routes:
 
 ```
-/plan/%2FUsers%2Fllfourn%2Fsrc%2Ftrinity%3Aplan%2Dpath%2Didentity%2Emd
+GET  /                                # SPA home
+GET  /plan/{plan_url}                 # SPA plan detail
+GET  /plan/{plan_url}/revision/{sha}
+GET  /plan/{plan_url}/commit/{sha}
+GET  /plan/{plan_url}/diff/{from}...{to}
+POST /api/plan/{plan_url}/done        # body: {}
+
+GET  /api/plans?repo=<repo>           # repo filter; absent = all watched repos
+GET  /api/plan/{plan_url}
+GET  /api/plan/{plan_url}/revision/{sha}
+GET  /api/plan/{plan_url}/commit/{sha}
+GET  /api/plan/{plan_url}/diff/{from}...{to}
 ```
 
-That's ugly but rigorous. The SPA renders display strings using the
-unencoded `to_display()` form (with `~` shorthand) alongside the link;
-the encoded form lives only in `href` / route params.
+Single path segment captures, no wildcard. The SPA reads `state` from
+the response and renders the done badge — the URL doesn't change when
+a plan moves to done.
 
-Encoder/decoder live in `src/lifecycle.rs` next to `PlanId`:
+**Lookup is by sanitized form.** The daemon maintains the canonical
+`PlanId` internally and compares against requests by sanitizing the
+canonical form of each watched repo + plan key. So:
+`/api/plan/_Users_llfourn_src_trinity:plan-path-identity.md` looks up
+by computing `sanitize(canonical_id)` for each candidate plan and
+matching against the URL segment. There is no reverse-substitution
+that turns `_` back into `/` blindly. Two distinct repo paths that
+collide under sanitization are an error state — `start_plan` rejects
+the second one with `repo_collides_with_existing_repo`.
+
+Encoder lives in `src/lifecycle.rs` next to `PlanId`:
 
 ```rust
 impl PlanId {
-    pub fn to_url_segment(&self) -> String { … }
-    pub fn parse_url_segment(s: &str) -> Result<Self, ParsePlanIdError> { … }
+    pub fn to_url_segment(&self) -> String {
+        // Replace `/` with `_`; everything else passes through.
+        // `:` and `.` and the stem chars are URL-segment-safe.
+        format!("{}", self).replace('/', '_')
+    }
 }
 ```
 
-Backend handlers (`api_plans`, `api_plan`, etc.) call
-`PlanId::parse_url_segment` on the `{plan_id_encoded}` capture; the
-SPA's `<a href>` and `navigate` calls build URLs via `to_url_segment`.
+Reverse lookup at the dispatch layer:
 
-For active/done state in URLs: there is no `done/` segment in the URL.
-The same URL works for both states. The SPA reads `state` from the
-detail response and renders a "done" badge accordingly.
+```rust
+fn resolve_url_segment(
+    state: &Trinity,
+    seg: &str,
+) -> Result<&Plan, PlanLookupError> {
+    for (repo_root, repo_state) in &state.repos {
+        for (key, plan) in &repo_state.plans {
+            let candidate = PlanId::new(repo_root.clone(), key.clone());
+            if candidate.to_url_segment() == seg { return Ok(plan); }
+        }
+        // also check plan_conflicts so conflict rows are reachable
+    }
+    Err(PlanLookupError::UnknownPlan(seg.into()))
+}
+```
+
+(Linear scan is fine for the watched-repos-count we care about. If we
+ever care, we cache a `BTreeMap<url_segment, (repo, key)>` in
+`Trinity` and invalidate on `plans` mutations.)
 
 Acceptance tests must include at least:
 
-- A repo path with a space (e.g. `/tmp/has space/repo`).
-- A repo path with `%` and `?` (these are forbidden in canonical
-  paths the daemon can canonicalize; the test asserts they round-trip
-  cleanly when present in the unencoded form sent to
-  `PlanId::parse`).
-- Round-trip: `PlanId::parse(s).to_url_segment()` →
-  `PlanId::parse_url_segment` recovers the original `PlanId`.
+- Round-trip: `to_url_segment()` then `resolve_url_segment` recovers
+  the original plan.
+- A repo path with a space — rejected at `start_plan` registration.
+- A repo path with `?`, `#`, `%`, or non-ASCII — same.
+- Two watched repos that differ only by `_` vs `/` — second one
+  rejected at registration with `repo_collides_with_existing_repo`.
 
 Backend handlers (`api_plans`, `api_plan`, etc.) live in
 `src/server/http.rs`. The old `/api/sessions*` routes are deleted with
@@ -594,9 +620,16 @@ Behavioral acceptance:
   collides with an existing plan, stem in `plan_conflicts`.
 - `PlanId::parse` rejects raw paths that can't be canonicalized
   (returns `invalid_plan_id`). No raw-path fallback.
-- URL encoding round-trips losslessly for: a normal absolute repo
-  path; a repo path with a space; a `PlanId` with multiple dots in
-  the stem (`foo.v2.md`).
+- URL form: `PlanId::to_url_segment()` replaces `/` in the repo
+  portion with `_`; the reverse lookup matches against the sanitized
+  form of every known `PlanId` rather than blind substitution.
+  Acceptance test: a `PlanId` whose URL form is constructed and then
+  resolved recovers the original plan.
+- `start_plan` rejects repo paths whose canonical form contains
+  `?`, `#`, `%`, space, control chars, or non-UTF-8 bytes
+  (`invalid_repo_path`). It also rejects a new repo whose sanitized
+  URL form collides with an already-watched repo's
+  (`repo_collides_with_existing_repo`).
 - `LiveEvent` and `/events` emit `plan_id` (nullable for repo-level
   events) plus derived `slug` + `state`. Frontend `EventStore` and
   activity sidebar consume the new shape.
@@ -611,10 +644,13 @@ Behavioral acceptance:
 - *PlanPathMismatch handling*: removed. The single-form wire grammar
   makes it unreachable by construction. (Previously partial: variant
   existed but never fired.)
-- *URL encoding for plan-scoped routes*: specified as
-  `percent_encoding::NON_ALPHANUMERIC` over the canonical `PlanId`,
-  decoded back via `percent_decode_str`. Single path segment, opaque
-  blob. Round-trip test cases mandated in acceptance.
+- *URL encoding for plan-scoped routes*: `/` in the repo portion of
+  the canonical `PlanId` is replaced with `_` for the URL form. Other
+  URL-significant characters (`?`, `#`, `%`, space, non-UTF-8) are
+  rejected at `start_plan` time — repos with those chars in their
+  canonical path can't be addressed via HTTP. Lookup is by
+  sanitization, not by reverse substitution: the daemon sanitizes its
+  known plans and compares.
 - *`?repo=` ergonomics*: eliminated for plan-scoped routes. Kept only
   on `/api/plans` as an optional filter when the daemon is watching
   multiple repos.
@@ -625,15 +661,15 @@ Behavioral acceptance:
   must successfully canonicalize the repo prefix or it returns
   `invalid_plan_id`. No fallback. (Was previously a hedge; codex flagged
   it as breaking the "one identity" invariant.)
-- *Whether on-disk `plan_path` may appear in MCP / HTTP responses*: no.
-  Responses carry `plan_id`, `slug`, `state`, and (where useful) `repo`
-  as a convenience. The on-disk `plan_path` is internal to the daemon.
-  Actionable filesystem locations appear only in explicit
-  `write_feedback.path` / `wait_for_work.locations` fields, scoped
-  repo-relative.
-- *Should `wait_for_work` include `repo` in its response*: yes — agents
-  resolving repo-relative `locations` would otherwise have to parse
-  `plan_id` to get the repo. Convenience field, redundant with the id.
+- *Whether on-disk paths appear in responses*: yes for `get_context` /
+  `list_plans` as a `current_path` display field (the plan's active or
+  done repo-relative path). The internal `Plan.plan_path` is still
+  not serialized directly; `current_path` is derived from
+  `(slug, state)` at response time. Actionable filesystem locations
+  (`write_feedback.path`, `wait_for_work.locations`) are repo-relative.
+- *Should `wait_for_work` include `repo` in its response*: no — the
+  `plan_id` already carries the repo; agents strip `:<stem>.md` to
+  recover it. One field at a time.
 
 ## Open Questions
 
