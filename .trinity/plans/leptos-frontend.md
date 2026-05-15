@@ -205,21 +205,6 @@ This means:
 
 The slimming of `get_context` is a separate small plan/commit — flagged here so the Leptos work doesn't accidentally re-couple to it.
 
-### Lock-boundary refactor (rolled into the new UI builders)
-
-The existing `list_sessions_response` / `get_context_response` (in `mcp_response.rs`) do disk I/O (`compute_plan_worktree_status` → `fs::read`) inside the `Runtime::read_repo` closure, which holds the global `Trinity` mutex. Under activity (multiple `wait_for_work` recomputes, watcher signals, concurrent home-page renders), this serializes the daemon and the web UI freezes for the duration of the disk reads.
-
-`wait_for_work` already follows the right pattern: snapshot identifiers + cheap gate state under the lock, release, then disk-read per candidate. The new `ui_response::*` builders introduced for this Leptos refactor must use the same shape:
-
-1. Under `Runtime::read_repo` (or equivalent), snapshot every field that's purely in-memory: `plan_path`, `body_hash`, `phase`, `plan_gate`, `impl_gate`, `plan_target`, `impl_target`, the feedback maps, etc.
-2. Release the lock.
-3. Compute `plan_worktree_status` (one disk read per session) outside the lock.
-4. Assemble the JSON response.
-
-This is a side benefit of the surface separation — the new builders get the correct lock discipline for free, and the old MCP-side `list_sessions_response` / `get_context_response` (kept narrow per the slim-down above) shrink to no-disk-I/O builders that can safely live under the read_repo closure.
-
-Acceptance: the home-page render and session-detail render hold the runtime mutex for ≪10ms regardless of session count, and disk reads happen with the lock released.
-
 ## Server-side additions
 
 Minimal additions on top of the existing daemon. None of these reshape MCP tool responses — they are UI-only endpoints with UI-only field sets.
