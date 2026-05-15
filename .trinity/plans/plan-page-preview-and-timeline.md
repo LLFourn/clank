@@ -424,6 +424,27 @@ New endpoint family: `/api/repos`.
   6. Push a `repo_unwatched` `LiveEvent` so the SPA's
      `EventStore.tick` fires and the homepage refetches.
 
+**Removal must be sticky against late watcher signals.** Today
+`Runtime::handle_signal(HeadChanged, repo)` calls `rebuild_repo` and
+**inserts** into `trinity.repos` unconditionally — there's no
+"repo is known" precheck. So after DELETE, any debounced or
+in-flight `HeadChanged` from the old watcher (which may still be
+draining its `notify_bridge` task even after `handle.abort()`)
+would re-insert the repo and the unwatch silently undoes itself.
+
+Fix: `handle_signal` for `HeadChanged` becomes a no-op when
+`trinity.repos.contains_key(repo)` is false. The rule is "rebuild
+only re-populates an entry that already exists; we never resurrect
+a removed repo from a signal." `PlanFileChanged` / `FeedbackWritten`
+/ `FeedbackRemoved` get the same precheck (they already do
+`trinity.repos.get(repo)?` so removal is implicit there; verify and
+keep explicit).
+
+Regression test: pre-register a repo, call `Runtime::remove_repo`,
+then directly call `handle_signal(HeadChanged, repo, now)`; assert
+`trinity.repos` does not contain the repo afterward and no
+`repo_rebuilt` LiveEvent fires.
+
 **Registry path threading.** Today `ServeArgs.repos`
 (`--repos` / `$TRINITY_REPOS`, default `~/.trinity/repos`) drives
 the read at startup, but `persist_repo_in_registry` in
@@ -568,6 +589,12 @@ Files: `src/runtime.rs`, `src/server/mod.rs`, `src/server/http.rs`,
 - `Runtime::remove_repo(canonical) -> Result<RemoveOutcome, _>`
   drops the repo from `Trinity.repos` + `Trinity.repo_basenames`
   under one lock. Returns `Removed { plan_count }` or `NotPresent`.
+- `Runtime::handle_signal(repo, HeadChanged, _)` gains a
+  `trinity.repos.contains_key(repo)` precheck: if absent, return
+  `Ok(())` without rebuild/insert. This prevents late watcher
+  signals from resurrecting an unwatched repo. Regression test in
+  `src/runtime.rs` tests module covers this directly without going
+  through HTTP.
 - `AppState` gains `repos_path: PathBuf` (the expanded
   `args.repos`). Plumb it from `serve()` through
   `AppState::new`.
