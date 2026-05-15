@@ -150,6 +150,18 @@ impl CommitGateState {
 /// earlier reviewable commit in this plan's history); `approvers` /
 /// `requesters` / `ambiguous` are scoped to *this* SHA only.
 /// `missing` = participants \ (approvers ∪ requesters ∪ ambiguous).
+///
+/// All `Vec` fields are deduped and ordered by first-seen-in-
+/// `commit_order` (the construction loop in `projection::build_commit_gates`
+/// enforces this; the type doesn't, in deference to the UI which
+/// reads them as display lists).
+///
+/// Phase 1 omits a `feedback: BTreeMap<AgentLabel, Feedback>` field
+/// that the plan doc spec'd. Reason: gate state needs only verdicts,
+/// not bodies, and phase 1 doesn't render UI. Phase 2 adds the
+/// field when MCP responses / the SPA start rendering per-commit
+/// feedback cards. Until then, feedback bodies still live on the
+/// legacy `Plan.plan_feedback` / `Plan.impl_feedback` maps.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct CommitGate {
     pub state: CommitGateState,

@@ -640,16 +640,17 @@ pub fn commit_kind_for(
     attribution: &BTreeMap<CommitSha, AttributionResult>,
 ) -> CommitKind {
     let touches = plan_touches.get(sha);
-    let distinct_plans_touched = touches
-        .map(|ts| {
-            let mut seen: std::collections::BTreeSet<&crate::lifecycle::PlanKey> =
-                std::collections::BTreeSet::new();
-            for (k, _) in ts {
-                seen.insert(k);
-            }
-            seen.len()
-        })
-        .unwrap_or(0);
+    // Hot path: nearly every commit has 0 or 1 plan_touches, so
+    // short-circuit before building any set.
+    let distinct_plans_touched = match touches {
+        None => 0,
+        Some(ts) if ts.len() <= 1 => ts.len(),
+        Some(ts) => ts
+            .iter()
+            .map(|(k, _)| k)
+            .collect::<std::collections::BTreeSet<_>>()
+            .len(),
+    };
     let our_touch = touches.and_then(|ts| {
         ts.iter()
             .find(|(k, _)| k == plan_key)
@@ -1384,6 +1385,24 @@ mod tests {
         );
     }
 
+    #[test]
+    fn commit_kind_trinity_feedback_only_is_unattributed() {
+        // A commit that only writes review files under `.trinity/feedback/`
+        // (or `.trinity/cache/`) must never appear as work-to-be-reviewed.
+        // `git_io`'s diff walk excludes `.trinity/` from
+        // `has_non_plan_code_changes`, so attribution carries
+        // `has_code_changes: false`. Locking this in protects against a
+        // future change to that filter silently flipping the kind to
+        // `CodeOnly`.
+        let touches = BTreeMap::new();
+        let mut attribution = BTreeMap::new();
+        attribution.insert(cs("a"), attributed("foo", None, false));
+        assert_eq!(
+            commit_kind_for(&pk("foo"), &cs("a"), &touches, &attribution),
+            CommitKind::Unattributed
+        );
+    }
+
     // -------- build_commit_gates --------
 
     fn feedback_with(verdict: Verdict) -> Feedback {
@@ -1569,5 +1588,73 @@ mod tests {
         assert_eq!(g.state, CommitGateState::ChangesRequested);
         assert_eq!(g.approvers, vec![al("alice")]);
         assert_eq!(g.requesters, vec![al("bob")]);
+    }
+
+    #[test]
+    fn gates_participants_carry_across_no_feedback_commit() {
+        // A (plan_only) ← codex APPROVE → B (code_only, zero feedback)
+        // gate(B): codex still expected; state = Unreviewed; missing = [codex].
+        // Locks in: participants accumulate across reviewable commits
+        // even when the next commit has no votes yet.
+        let mut touches = BTreeMap::new();
+        touches.insert(cs("a"), touches_one("foo", PlanTouchKind::Intro));
+        let mut attribution = BTreeMap::new();
+        attribution.insert(
+            cs("a"),
+            attributed("foo", Some(PlanTouchKind::Intro), false),
+        );
+        attribution.insert(cs("b"), attributed("foo", None, true));
+        let mut plan_feedback = BTreeMap::new();
+        plan_feedback.insert((cs("a"), al("codex")), feedback_with(Verdict::Approve));
+
+        let gates = build_commit_gates(
+            &pk("foo"),
+            &[cs("a"), cs("b")],
+            &touches,
+            &attribution,
+            &plan_feedback,
+            &BTreeMap::new(),
+        );
+
+        let g_b = gates.get(&cs("b")).expect("gate for b");
+        assert_eq!(g_b.state, CommitGateState::Unreviewed);
+        assert_eq!(g_b.participants, vec![al("codex")]);
+        assert_eq!(g_b.missing, vec![al("codex")]);
+        assert!(g_b.approvers.is_empty());
+    }
+
+    #[test]
+    fn gates_participants_carry_across_unattributed_gap() {
+        // A (plan_only) ← codex APPROVE → B (Unattributed, skipped) →
+        // C (code_only, zero feedback).
+        // gate(C): codex still in participants; the Unattributed gap
+        // must not drop accumulated state. Future-proofs against
+        // someone "resetting" participants on each skip.
+        let mut touches = BTreeMap::new();
+        touches.insert(cs("a"), touches_one("foo", PlanTouchKind::Intro));
+        let mut attribution = BTreeMap::new();
+        attribution.insert(
+            cs("a"),
+            attributed("foo", Some(PlanTouchKind::Intro), false),
+        );
+        attribution.insert(cs("b"), AttributionResult::Unattributed);
+        attribution.insert(cs("c"), attributed("foo", None, true));
+        let mut plan_feedback = BTreeMap::new();
+        plan_feedback.insert((cs("a"), al("codex")), feedback_with(Verdict::Approve));
+
+        let gates = build_commit_gates(
+            &pk("foo"),
+            &[cs("a"), cs("b"), cs("c")],
+            &touches,
+            &attribution,
+            &plan_feedback,
+            &BTreeMap::new(),
+        );
+
+        assert!(!gates.contains_key(&cs("b")), "Unattributed has no gate");
+        let g_c = gates.get(&cs("c")).expect("gate for c");
+        assert_eq!(g_c.participants, vec![al("codex")]);
+        assert_eq!(g_c.missing, vec![al("codex")]);
+        assert_eq!(g_c.state, CommitGateState::Unreviewed);
     }
 }
