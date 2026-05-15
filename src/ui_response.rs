@@ -655,6 +655,7 @@ mod tests {
             plan_feedback: BTreeMap::new(),
             impl_feedback: BTreeMap::new(),
             held_plan_feedback: Vec::new(),
+            commits: BTreeMap::new(),
         };
         let v = pr_hint_value(&session, &[]);
         assert_eq!(v["plan_intro_parent"], "parent");

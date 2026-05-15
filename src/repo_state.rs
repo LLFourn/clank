@@ -362,6 +362,16 @@ pub struct Plan {
     /// `BodyDirty`. Not auto-organized into `<target-sha>/<author>.md` until
     /// the plan revision lands.
     pub held_plan_feedback: Vec<HeldFeedback>,
+    /// Per-commit gate state under the commit-centric model. Phase 1
+    /// populates this from `plan_feedback ∪ impl_feedback` so it can be
+    /// unit-tested; nothing in the runtime reads it yet. Phase 2 makes
+    /// it authoritative.
+    ///
+    /// Keys are commits whose `CommitKind` is reviewable for this plan
+    /// (`PlanOnly` | `CodeOnly` | `Mixed`). `DoneMove`, `MultiPlan`,
+    /// and `Unattributed` commits never get an entry — see
+    /// `CommitKind::is_reviewable`.
+    pub commits: BTreeMap<CommitSha, crate::review_state::CommitGate>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -504,6 +514,54 @@ impl PlanTouchKind {
             PlanTouchKind::Revision => "revision",
             PlanTouchKind::DoneMove => "done_move",
         }
+    }
+}
+
+/// Per-(plan, commit) classification under the commit-centric review
+/// model. Derived from `plan_touches` + `attribution`; see
+/// `projection::commit_kind_for`. Phase 1 uses this only for unit-test
+/// coverage and the additive `Plan.commits` map; phase 2 wires it
+/// into projections, MCP responses, and the UI.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CommitKind {
+    /// Touches exactly this plan file (single-plan-touch) and no code.
+    PlanOnly,
+    /// Touches code attributed to this plan; no plan-file touch on
+    /// this commit (attribution inherited via walk-back).
+    CodeOnly,
+    /// Touches this plan file AND code (single-plan-touch + code).
+    Mixed,
+    /// Renames this plan file into / out of `.trinity/plans/done/`.
+    /// Lifecycle-significant; never gated, never reviewable.
+    DoneMove,
+    /// Touches two or more distinct plan files on a single commit.
+    /// Surfaced in the timeline but never gated.
+    MultiPlan,
+    /// Commit has no relevance to this plan (no touch, attribution
+    /// belongs to another plan, or unattributed).
+    Unattributed,
+}
+
+impl CommitKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            CommitKind::PlanOnly => "plan_only",
+            CommitKind::CodeOnly => "code_only",
+            CommitKind::Mixed => "mixed",
+            CommitKind::DoneMove => "done_move",
+            CommitKind::MultiPlan => "multi_plan",
+            CommitKind::Unattributed => "unattributed",
+        }
+    }
+
+    /// Reviewable commits get a `CommitGate` entry in `Plan.commits`.
+    /// `DoneMove`, `MultiPlan`, and `Unattributed` are intentionally
+    /// excluded — see plan §"single done_move/multi_plan invariant".
+    pub fn is_reviewable(self) -> bool {
+        matches!(
+            self,
+            CommitKind::PlanOnly | CommitKind::CodeOnly | CommitKind::Mixed
+        )
     }
 }
 

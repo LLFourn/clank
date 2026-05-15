@@ -10,10 +10,12 @@ use std::path::Path;
 
 use crate::lifecycle::{AgentLabel, ContentHash, is_done_plan_path};
 use crate::repo_state::{
-    AttributionResult, Feedback, Phase, Plan, PlanWorktreeStatus, WaitingOn, WaitingReason,
-    WaitingRole,
+    AttributionResult, CommitKind, Feedback, Phase, Plan, PlanTouchKind, PlanWorktreeStatus,
+    Verdict, WaitingOn, WaitingReason, WaitingRole,
 };
-use crate::review_state::{ReviewGateDecision, ReviewGateState, ReviewPhase};
+use crate::review_state::{
+    CommitGate, CommitGateState, ReviewGateDecision, ReviewGateState, ReviewPhase,
+};
 
 use std::collections::BTreeMap;
 
@@ -621,6 +623,182 @@ fn description_for(
     }
 }
 
+/// Classify a single commit's relevance to one plan under the
+/// commit-centric review model. Pure; sans-IO. See plan
+/// §"`commit_kind` classification" for the decision table.
+///
+/// The single-plan invariant: a commit with `plan_touches` covering
+/// two or more distinct plans is `MultiPlan` for every plan in the
+/// touched set, and `Unattributed` for plans not in the set.
+/// `DoneMove` takes precedence over everything else for the plan
+/// being moved — even if the rename commit carries code changes, the
+/// lifecycle event wins.
+pub fn commit_kind_for(
+    plan_key: &crate::lifecycle::PlanKey,
+    sha: &CommitSha,
+    plan_touches: &BTreeMap<CommitSha, Vec<(crate::lifecycle::PlanKey, PlanTouchKind)>>,
+    attribution: &BTreeMap<CommitSha, AttributionResult>,
+) -> CommitKind {
+    let touches = plan_touches.get(sha);
+    let distinct_plans_touched = touches
+        .map(|ts| {
+            let mut seen: std::collections::BTreeSet<&crate::lifecycle::PlanKey> =
+                std::collections::BTreeSet::new();
+            for (k, _) in ts {
+                seen.insert(k);
+            }
+            seen.len()
+        })
+        .unwrap_or(0);
+    let our_touch = touches.and_then(|ts| {
+        ts.iter()
+            .find(|(k, _)| k == plan_key)
+            .map(|(_, kind)| *kind)
+    });
+
+    if let Some(PlanTouchKind::DoneMove) = our_touch {
+        return CommitKind::DoneMove;
+    }
+
+    if our_touch.is_some() {
+        if distinct_plans_touched >= 2 {
+            return CommitKind::MultiPlan;
+        }
+        let has_code = matches!(
+            attribution.get(sha),
+            Some(AttributionResult::Attributed {
+                session,
+                has_code_changes: true,
+                ..
+            }) if session == plan_key
+        );
+        return if has_code {
+            CommitKind::Mixed
+        } else {
+            CommitKind::PlanOnly
+        };
+    }
+
+    match attribution.get(sha) {
+        Some(AttributionResult::Attributed {
+            session,
+            has_code_changes: true,
+            ..
+        }) if session == plan_key => CommitKind::CodeOnly,
+        _ => CommitKind::Unattributed,
+    }
+}
+
+/// Build the per-commit `CommitGate` map for one plan under the
+/// cumulative-participant rule.
+///
+/// Walk `commit_order` chronologically. Maintain a cumulative set of
+/// plan-wide participants — anyone who has left feedback on any
+/// earlier reviewable commit for this plan. For each reviewable
+/// commit (`PlanOnly` | `CodeOnly` | `Mixed`):
+///
+/// 1. Union the feedback authors on this SHA (from
+///    `plan_feedback ∪ impl_feedback`) into the participant set.
+/// 2. Split this-SHA responders by `Verdict`: APPROVE → approvers,
+///    REQUEST_CHANGES → requesters, Unmarked → ambiguous.
+/// 3. `missing` = participants \ (approvers ∪ requesters ∪ ambiguous).
+/// 4. State: `ChangesRequested` if any requester or ambiguous;
+///    else `Approved` if at least one approver and zero missing;
+///    else `Unreviewed`.
+///
+/// `DoneMove` / `MultiPlan` / `Unattributed` commits are skipped —
+/// they never get a gate entry AND never contribute to the
+/// cumulative participant set (a reviewer leaving feedback on an
+/// unreviewable commit doesn't get auto-enrolled as a participant
+/// for the rest of the plan's history).
+pub fn build_commit_gates(
+    plan_key: &crate::lifecycle::PlanKey,
+    commit_order: &[CommitSha],
+    plan_touches: &BTreeMap<CommitSha, Vec<(crate::lifecycle::PlanKey, PlanTouchKind)>>,
+    attribution: &BTreeMap<CommitSha, AttributionResult>,
+    plan_feedback: &BTreeMap<(CommitSha, AgentLabel), Feedback>,
+    impl_feedback: &BTreeMap<(CommitSha, AgentLabel), Feedback>,
+) -> BTreeMap<CommitSha, CommitGate> {
+    let mut participants: Vec<AgentLabel> = Vec::new();
+    let mut out = BTreeMap::new();
+
+    for sha in commit_order {
+        let kind = commit_kind_for(plan_key, sha, plan_touches, attribution);
+        if !kind.is_reviewable() {
+            continue;
+        }
+
+        let mut approvers: Vec<AgentLabel> = Vec::new();
+        let mut requesters: Vec<AgentLabel> = Vec::new();
+        let mut ambiguous: Vec<AgentLabel> = Vec::new();
+
+        // Union feedback on this SHA from both legacy maps. Phase 1
+        // reads from the dual maps; phase 2 reads from one location.
+        let mut on_this_sha: Vec<(&AgentLabel, Verdict)> = Vec::new();
+        for ((target, author), fb) in plan_feedback {
+            if target == sha {
+                on_this_sha.push((author, fb.verdict));
+            }
+        }
+        for ((target, author), fb) in impl_feedback {
+            if target == sha {
+                on_this_sha.push((author, fb.verdict));
+            }
+        }
+
+        for (author, verdict) in &on_this_sha {
+            if !participants.contains(author) {
+                participants.push((*author).clone());
+            }
+            match verdict {
+                Verdict::Approve => {
+                    if !approvers.contains(author) {
+                        approvers.push((*author).clone());
+                    }
+                }
+                Verdict::RequestChanges => {
+                    if !requesters.contains(author) {
+                        requesters.push((*author).clone());
+                    }
+                }
+                Verdict::Unmarked => {
+                    if !ambiguous.contains(author) {
+                        ambiguous.push((*author).clone());
+                    }
+                }
+            }
+        }
+
+        let missing: Vec<AgentLabel> = participants
+            .iter()
+            .filter(|p| !approvers.contains(p) && !requesters.contains(p) && !ambiguous.contains(p))
+            .cloned()
+            .collect();
+
+        let state = if !requesters.is_empty() || !ambiguous.is_empty() {
+            CommitGateState::ChangesRequested
+        } else if !approvers.is_empty() && missing.is_empty() {
+            CommitGateState::Approved
+        } else {
+            CommitGateState::Unreviewed
+        };
+
+        out.insert(
+            sha.clone(),
+            CommitGate {
+                state,
+                participants: participants.clone(),
+                approvers,
+                requesters,
+                ambiguous,
+                missing,
+            },
+        );
+    }
+
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1080,5 +1258,316 @@ mod tests {
             ts, 1_000,
             "bar's later commit should not bump foo's activity"
         );
+    }
+
+    // -------- commit_kind_for --------
+
+    fn touches_one(plan: &str, kind: PlanTouchKind) -> Vec<(PlanKey, PlanTouchKind)> {
+        vec![(pk(plan), kind)]
+    }
+
+    fn attributed(plan: &str, kind: Option<PlanTouchKind>, code: bool) -> AttributionResult {
+        AttributionResult::Attributed {
+            session: pk(plan),
+            plan_touch: kind,
+            has_code_changes: code,
+        }
+    }
+
+    #[test]
+    fn commit_kind_plan_only() {
+        let mut touches = BTreeMap::new();
+        touches.insert(cs("a"), touches_one("foo", PlanTouchKind::Revision));
+        let mut attribution = BTreeMap::new();
+        attribution.insert(
+            cs("a"),
+            attributed("foo", Some(PlanTouchKind::Revision), false),
+        );
+        assert_eq!(
+            commit_kind_for(&pk("foo"), &cs("a"), &touches, &attribution),
+            CommitKind::PlanOnly
+        );
+    }
+
+    #[test]
+    fn commit_kind_mixed_when_plan_touch_plus_code() {
+        let mut touches = BTreeMap::new();
+        touches.insert(cs("a"), touches_one("foo", PlanTouchKind::Revision));
+        let mut attribution = BTreeMap::new();
+        attribution.insert(
+            cs("a"),
+            attributed("foo", Some(PlanTouchKind::Revision), true),
+        );
+        assert_eq!(
+            commit_kind_for(&pk("foo"), &cs("a"), &touches, &attribution),
+            CommitKind::Mixed
+        );
+    }
+
+    #[test]
+    fn commit_kind_code_only_when_attribution_walks_back() {
+        // No plan_touch on this commit, attribution inherited from
+        // an ancestor that touched foo's plan file.
+        let touches = BTreeMap::new();
+        let mut attribution = BTreeMap::new();
+        attribution.insert(cs("a"), attributed("foo", None, true));
+        assert_eq!(
+            commit_kind_for(&pk("foo"), &cs("a"), &touches, &attribution),
+            CommitKind::CodeOnly
+        );
+    }
+
+    #[test]
+    fn commit_kind_done_move_takes_precedence_over_code() {
+        // Even if the rename commit somehow carries code changes,
+        // DoneMove wins for the plan being moved.
+        let mut touches = BTreeMap::new();
+        touches.insert(cs("a"), touches_one("foo", PlanTouchKind::DoneMove));
+        let mut attribution = BTreeMap::new();
+        attribution.insert(
+            cs("a"),
+            attributed("foo", Some(PlanTouchKind::DoneMove), true),
+        );
+        assert_eq!(
+            commit_kind_for(&pk("foo"), &cs("a"), &touches, &attribution),
+            CommitKind::DoneMove
+        );
+    }
+
+    #[test]
+    fn commit_kind_multi_plan_for_touched_plan() {
+        // A single commit touching foo.md AND bar.md → MultiPlan for
+        // both, regardless of attribution.
+        let mut touches = BTreeMap::new();
+        touches.insert(
+            cs("a"),
+            vec![
+                (pk("foo"), PlanTouchKind::Revision),
+                (pk("bar"), PlanTouchKind::Revision),
+            ],
+        );
+        let mut attribution = BTreeMap::new();
+        attribution.insert(cs("a"), AttributionResult::Unattributed);
+        assert_eq!(
+            commit_kind_for(&pk("foo"), &cs("a"), &touches, &attribution),
+            CommitKind::MultiPlan
+        );
+        assert_eq!(
+            commit_kind_for(&pk("bar"), &cs("a"), &touches, &attribution),
+            CommitKind::MultiPlan
+        );
+    }
+
+    #[test]
+    fn commit_kind_unattributed_for_unrelated_plan() {
+        // baz isn't touched and the commit is attributed to foo.
+        let mut touches = BTreeMap::new();
+        touches.insert(cs("a"), touches_one("foo", PlanTouchKind::Revision));
+        let mut attribution = BTreeMap::new();
+        attribution.insert(
+            cs("a"),
+            attributed("foo", Some(PlanTouchKind::Revision), false),
+        );
+        assert_eq!(
+            commit_kind_for(&pk("baz"), &cs("a"), &touches, &attribution),
+            CommitKind::Unattributed
+        );
+    }
+
+    #[test]
+    fn commit_kind_unattributed_when_no_touch_and_no_attribution() {
+        let touches = BTreeMap::new();
+        let attribution = BTreeMap::new();
+        assert_eq!(
+            commit_kind_for(&pk("foo"), &cs("a"), &touches, &attribution),
+            CommitKind::Unattributed
+        );
+    }
+
+    // -------- build_commit_gates --------
+
+    fn feedback_with(verdict: Verdict) -> Feedback {
+        Feedback {
+            path: PathBuf::from("/tmp/fb"),
+            body: String::new(),
+            verdict,
+            created_at: 0,
+        }
+    }
+
+    fn al(s: &str) -> AgentLabel {
+        AgentLabel::from(s.to_string())
+    }
+
+    #[test]
+    fn gates_cumulative_participants_across_commits() {
+        // commit A (plan_only) ← codex APPROVE
+        // commit B (code_only) ← alice REQUEST_CHANGES
+        // commit C (code_only) ← alice APPROVE   (codex hasn't voted on C)
+        //   → gate(C): participants={codex, alice}, missing={codex},
+        //     state=Unreviewed
+        let mut touches = BTreeMap::new();
+        touches.insert(cs("a"), touches_one("foo", PlanTouchKind::Intro));
+        let mut attribution = BTreeMap::new();
+        attribution.insert(
+            cs("a"),
+            attributed("foo", Some(PlanTouchKind::Intro), false),
+        );
+        attribution.insert(cs("b"), attributed("foo", None, true));
+        attribution.insert(cs("c"), attributed("foo", None, true));
+        let mut plan_feedback = BTreeMap::new();
+        plan_feedback.insert((cs("a"), al("codex")), feedback_with(Verdict::Approve));
+        let mut impl_feedback = BTreeMap::new();
+        impl_feedback.insert(
+            (cs("b"), al("alice")),
+            feedback_with(Verdict::RequestChanges),
+        );
+        impl_feedback.insert((cs("c"), al("alice")), feedback_with(Verdict::Approve));
+
+        let gates = build_commit_gates(
+            &pk("foo"),
+            &[cs("a"), cs("b"), cs("c")],
+            &touches,
+            &attribution,
+            &plan_feedback,
+            &impl_feedback,
+        );
+
+        // gate(A): codex approved, only participant → Approved.
+        let g_a = gates.get(&cs("a")).expect("gate for a");
+        assert_eq!(g_a.state, CommitGateState::Approved);
+        assert_eq!(g_a.participants, vec![al("codex")]);
+        assert_eq!(g_a.approvers, vec![al("codex")]);
+
+        // gate(B): alice requested changes; codex inherits as participant.
+        let g_b = gates.get(&cs("b")).expect("gate for b");
+        assert_eq!(g_b.state, CommitGateState::ChangesRequested);
+        assert!(g_b.participants.contains(&al("codex")));
+        assert!(g_b.participants.contains(&al("alice")));
+        assert_eq!(g_b.requesters, vec![al("alice")]);
+        assert_eq!(g_b.missing, vec![al("codex")]);
+
+        // gate(C): alice approved; codex missing → Unreviewed.
+        let g_c = gates.get(&cs("c")).expect("gate for c");
+        assert_eq!(g_c.state, CommitGateState::Unreviewed);
+        assert_eq!(g_c.approvers, vec![al("alice")]);
+        assert_eq!(g_c.missing, vec![al("codex")]);
+    }
+
+    #[test]
+    fn gates_ambiguous_verdict_blocks_approval() {
+        // codex drops an Unmarked file on commit A → gate is
+        // ChangesRequested, not Approved.
+        let mut touches = BTreeMap::new();
+        touches.insert(cs("a"), touches_one("foo", PlanTouchKind::Intro));
+        let mut attribution = BTreeMap::new();
+        attribution.insert(
+            cs("a"),
+            attributed("foo", Some(PlanTouchKind::Intro), false),
+        );
+        let mut plan_feedback = BTreeMap::new();
+        plan_feedback.insert((cs("a"), al("codex")), feedback_with(Verdict::Unmarked));
+
+        let gates = build_commit_gates(
+            &pk("foo"),
+            &[cs("a")],
+            &touches,
+            &attribution,
+            &plan_feedback,
+            &BTreeMap::new(),
+        );
+
+        let g = gates.get(&cs("a")).expect("gate for a");
+        assert_eq!(g.state, CommitGateState::ChangesRequested);
+        assert_eq!(g.ambiguous, vec![al("codex")]);
+        assert!(g.approvers.is_empty());
+        assert!(g.missing.is_empty(), "ambiguous counts as having voted");
+    }
+
+    #[test]
+    fn gates_skip_done_move_and_multi_plan() {
+        // Reviewable: a (PlanOnly), c (CodeOnly).
+        // Unreviewable: b (MultiPlan), d (DoneMove).
+        let mut touches = BTreeMap::new();
+        touches.insert(cs("a"), touches_one("foo", PlanTouchKind::Intro));
+        touches.insert(
+            cs("b"),
+            vec![
+                (pk("foo"), PlanTouchKind::Revision),
+                (pk("bar"), PlanTouchKind::Revision),
+            ],
+        );
+        touches.insert(cs("d"), touches_one("foo", PlanTouchKind::DoneMove));
+        let mut attribution = BTreeMap::new();
+        attribution.insert(
+            cs("a"),
+            attributed("foo", Some(PlanTouchKind::Intro), false),
+        );
+        attribution.insert(cs("b"), AttributionResult::Unattributed);
+        attribution.insert(cs("c"), attributed("foo", None, true));
+        attribution.insert(
+            cs("d"),
+            attributed("foo", Some(PlanTouchKind::DoneMove), false),
+        );
+
+        // Reviewer leaves feedback on the unreviewable commits — those
+        // votes must NOT enroll them as cumulative participants.
+        let mut plan_feedback = BTreeMap::new();
+        plan_feedback.insert((cs("b"), al("rogue")), feedback_with(Verdict::Approve));
+        plan_feedback.insert((cs("d"), al("rogue")), feedback_with(Verdict::Approve));
+
+        let gates = build_commit_gates(
+            &pk("foo"),
+            &[cs("a"), cs("b"), cs("c"), cs("d")],
+            &touches,
+            &attribution,
+            &plan_feedback,
+            &BTreeMap::new(),
+        );
+
+        assert!(gates.contains_key(&cs("a")));
+        assert!(!gates.contains_key(&cs("b")), "multi_plan has no gate");
+        assert!(gates.contains_key(&cs("c")));
+        assert!(!gates.contains_key(&cs("d")), "done_move has no gate");
+
+        // gate(C) sees zero participants — `rogue` reviewed only
+        // unreviewable commits and so never enters the participant set.
+        let g_c = &gates[&cs("c")];
+        assert!(
+            g_c.participants.is_empty(),
+            "rogue on unreviewable commits doesn't enroll: {:?}",
+            g_c.participants
+        );
+        assert_eq!(g_c.state, CommitGateState::Unreviewed);
+    }
+
+    #[test]
+    fn gates_request_changes_overrides_approve() {
+        // Two reviewers on the same SHA: one APPROVE, one
+        // REQUEST_CHANGES → ChangesRequested.
+        let mut touches = BTreeMap::new();
+        touches.insert(cs("a"), touches_one("foo", PlanTouchKind::Intro));
+        let mut attribution = BTreeMap::new();
+        attribution.insert(
+            cs("a"),
+            attributed("foo", Some(PlanTouchKind::Intro), false),
+        );
+        let mut plan_feedback = BTreeMap::new();
+        plan_feedback.insert((cs("a"), al("alice")), feedback_with(Verdict::Approve));
+        plan_feedback.insert((cs("a"), al("bob")), feedback_with(Verdict::RequestChanges));
+
+        let gates = build_commit_gates(
+            &pk("foo"),
+            &[cs("a")],
+            &touches,
+            &attribution,
+            &plan_feedback,
+            &BTreeMap::new(),
+        );
+
+        let g = &gates[&cs("a")];
+        assert_eq!(g.state, CommitGateState::ChangesRequested);
+        assert_eq!(g.approvers, vec![al("alice")]);
+        assert_eq!(g.requesters, vec![al("bob")]);
     }
 }

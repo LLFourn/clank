@@ -123,6 +123,7 @@ pub fn derive_state(repo_root: PathBuf, snapshot: DiskSnapshot) -> RepoState {
                 plan_feedback: BTreeMap::new(),
                 impl_feedback: BTreeMap::new(),
                 held_plan_feedback: Vec::new(),
+                commits: BTreeMap::new(),
             },
         );
     }
@@ -162,6 +163,26 @@ pub fn derive_state(repo_root: PathBuf, snapshot: DiskSnapshot) -> RepoState {
     //    commits we walked above. Used by the timeline (subject) and
     //    `last_activity_ts` (author_ts).
     state.commit_meta = snapshot.commit_meta;
+
+    // 5. Commit-centric gates (phase 1 of the commit-centric cutover).
+    //    Derived from plan_feedback ∪ impl_feedback so the new map
+    //    can be tested end-to-end without touching disk format. Phase
+    //    2 makes this authoritative; phase 1 leaves the legacy maps
+    //    populated and unused-by-runtime.
+    let plan_keys: Vec<crate::lifecycle::PlanKey> = state.plans.keys().cloned().collect();
+    for key in plan_keys {
+        let commits = crate::projection::build_commit_gates(
+            &key,
+            &state.commit_order,
+            &state.plan_touches,
+            &state.attribution,
+            &state.plans[&key].plan_feedback,
+            &state.plans[&key].impl_feedback,
+        );
+        if let Some(plan) = state.plans.get_mut(&key) {
+            plan.commits = commits;
+        }
+    }
 
     state
 }

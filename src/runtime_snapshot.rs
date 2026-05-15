@@ -37,6 +37,7 @@ pub struct PlanSnapshot {
     pub plan_feedback: BTreeMap<(CommitSha, AgentLabel), Feedback>,
     pub impl_feedback: BTreeMap<(CommitSha, AgentLabel), Feedback>,
     pub held_plan_feedback: Vec<HeldFeedback>,
+    pub commits: BTreeMap<CommitSha, crate::review_state::CommitGate>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -95,6 +96,7 @@ impl PlanSnapshot {
             plan_feedback: plan.plan_feedback.clone(),
             impl_feedback: plan.impl_feedback.clone(),
             held_plan_feedback: plan.held_plan_feedback.clone(),
+            commits: plan.commits.clone(),
         }
     }
 
@@ -110,6 +112,7 @@ impl PlanSnapshot {
             plan_feedback: self.plan_feedback.clone(),
             impl_feedback: self.impl_feedback.clone(),
             held_plan_feedback: self.held_plan_feedback.clone(),
+            commits: self.commits.clone(),
         }
     }
 }
