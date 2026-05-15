@@ -228,11 +228,17 @@ target commit is `Approved` only when that full set has non-ambiguous,
 non-request-changes feedback on the target AND at least one of those
 votes is `APPROVE`.
 
-Only commits relevant to this plan get a `CommitGate` entry —
-`MultiPlan` and `Unattributed` are not added to `Plan.commits`.
-`DoneMove` gets a `CommitGate` entry only for timeline rendering;
-its gate state is forced to `Approved` so the readiness rule above
-still flows it to `SessionDone` without requiring a review.
+Only commits relevant to this plan AND reviewable get a `CommitGate`
+entry. The single invariant: **`done_move`, `multi_plan`, and
+`unattributed` never have a `CommitGate`**, never appear in
+`Plan.commits`, never contribute to the cumulative-participant set,
+and are never returned by `wait_for_work` as a review target. They
+appear in the timeline (so the UI can render them) but as commit
+events only, never with an attached review gate.
+
+The session reaches `SessionDone` via two independent signals: the
+plan path is under `.trinity/plans/done/` AND a `done_move` commit
+has been observed on the plan's history. No gate concept is involved.
 
 ### Feedback path parsing
 
@@ -312,8 +318,25 @@ CommitNeedsReview => "review_commit",
 `wait.rs::compute_match` collapses: today it picks plan_gate or
 impl_gate based on session_phase. New model picks the latest
 relevant commit's gate directly. `caller_already_voted` becomes a
-single lookup into `commits[latest_relevant].approvers ∪
-requesters` instead of the two-arm phase switch.
+single lookup into the latest relevant commit's gate with this
+explicit rule:
+
+- Author has `APPROVE` on latest relevant SHA → re-wake suppressed
+  (their vote stands; remaining wait is on someone else).
+- Author has `REQUEST_CHANGES` on latest relevant SHA → re-wake
+  suppressed (their vote stands; address-side moves to master).
+- Author has `Unmarked`/ambiguous feedback on latest relevant SHA
+  → re-wake NOT suppressed. The gate still treats them as missing
+  (their file is malformed and needs the marker fixed); they should
+  re-poll and notice.
+- Author has no feedback on latest relevant SHA → re-wake NOT
+  suppressed (they're a cumulative participant from an earlier
+  commit and the gate is asking for their vote).
+
+Concretely: `caller_already_voted` returns true iff
+`commits[latest_relevant].approvers.contains(author) ||
+commits[latest_relevant].requesters.contains(author)`. The
+`ambiguous` and `missing` sets do NOT suppress re-wake.
 
 `derive_locations` collapses similarly:
 - `CommitNeedsReview` → `[commits/<sha>/<author>.md]` (one path)
@@ -323,6 +346,54 @@ requesters` instead of the two-arm phase switch.
 - `ReadyToMoveForward` → `[<plan file>]`
 - worktree-status variants → `[<plan file>]` (unchanged)
 - `SessionDone` → `[]`
+
+### Optional `plan_id` inference
+
+The new `wait_for_work` / `get_context` contract makes `plan_id`
+optional. Resolution order:
+
+1. **Explicit `plan_id`** — if the caller passes one, use it
+   verbatim. Always overrides inference.
+2. **Explicit `repo`** — if the caller passes `repo` (basename or
+   absolute path), scope the inference to that repo.
+3. **Caller cwd** — otherwise resolve cwd via `git rev-parse
+   --show-toplevel` (same path the MCP shim already uses for
+   `start_plan`).
+
+Within the resolved repo, count active plans (`state == active`):
+
+- **Exactly one active plan** → use it. Single-active inference
+  wins; no recency heuristics, no fuzzy matching.
+- **Zero active plans** → return `{timed_out: true, no_active_plans:
+  true}` (same shape family as today's timeout). The caller has
+  nothing to do.
+- **Multiple active plans** → return an `ambiguous_plan` error with
+  the candidate list:
+
+  ```json
+  {
+    "error": "ambiguous_plan",
+    "message": "multiple active plans; pass plan_id explicitly",
+    "candidates": [
+      {
+        "plan_id": "trinity/foo.md",
+        "current_path": ".trinity/plans/foo.md",
+        "state": "active",
+        "waiting_on": { "role": "master", "reason": "...", "description": "..." }
+      },
+      { "plan_id": "trinity/bar.md", ... }
+    ]
+  }
+  ```
+
+  Recency is NOT a tiebreaker — Trinity does not pick for the
+  caller. The ambiguity error tells the caller to choose.
+
+`tools.rs` schemas for `wait_for_work` and `get_context` drop
+`plan_id` from the `required` array, add an optional `repo` field,
+and document the inference rules in the tool description. The MCP
+shim does not cache `plan_id` (today's behavior preserved). HTTP
+`/api/wait_for_work` accepts the same optional shape.
 
 ### MCP wire shape
 
@@ -345,6 +416,68 @@ requesters` instead of the two-arm phase switch.
 chronological order, plus `latest_relevant_commit` to point at the
 one that drives `waiting_on`. The old `plan_feedback` / `impl_feedback`
 arrays are gone.
+
+### Producer checklist (phase 2)
+
+Every place that produces, advertises, or asserts on a `plan/`-or-
+`impl/`-segmented feedback path must be touched in phase 2. This
+list is the punch list — if it grows during impl, add to this list
+before merging.
+
+- `src/tools.rs`: tool descriptions for `wait_for_work` (the `work`
+  vocabulary and `locations` examples) and `get_context` (the
+  feedback-shape paragraph). Schemas updated for optional `plan_id`
+  + `repo`.
+- `src/server/wait.rs`: `derive_locations`, `feedback_path`,
+  `rc_feedback_paths`, `caller_already_voted`, `Candidate`
+  (replace `plan_gate`/`impl_gate`/`plan_target`/`impl_target` with
+  one `latest_relevant_commit_gate` and `latest_relevant_target`).
+- `src/server/mcp.rs`: any tool-dispatch surfaces that mention the
+  phase axis.
+- `src/server/http.rs`: route handlers + wire tests under
+  `wire_tests`; the `/api/wait_for_work` test fixtures that assert
+  on the old `work` vocabulary.
+- `src/mcp_response.rs`: `feedback_entries`, `pr_hint_value`,
+  `review_target`, `write_feedback`, `timeline_value`, `gate_value`
+  — all currently use the plan/impl axis.
+- `src/ui_response.rs`: `feedback_entries`, `held_feedback_entries`
+  (deleted), `timeline_value`, `plan_page_with_reader`, plans-list
+  shape (`/api/plans`).
+- `src/projection.rs`: `phase`/`phase_for`/`plan_gate_for`/
+  `impl_gate_for`/`waiting_from_gate`/`expected_action`/
+  `description_for`/`last_activity_ts_for` (the held_feedback
+  parameter goes away).
+- `src/runtime.rs`: `upsert_feedback`, `upsert_feedback_at_target`,
+  `FlatDropSnapshot`, `latest_attributed_commit`, the
+  held-feedback-organize sweep (delete), all `FeedbackPhase`
+  imports.
+- `src/disk_format.rs`: `parse_feedback_path` + `FeedbackPhase`
+  enum + all unit tests.
+- `src/disk_snapshot.rs`: feedback ingest paths; the disk-snapshot
+  rebuilder.
+- `src/runtime_snapshot.rs`: `PlanSnapshot` fields (`plan_feedback`/
+  `impl_feedback`/`held_plan_feedback` → `commits`), `to_repo_state`.
+- `src/repo_state.rs`: `Plan` struct fields, `TimelineEvent::Review`
+  (drop `phase`), `TimelineEvent::HeldFeedback` (delete),
+  `TimelinePhase` (delete), `Phase` (delete), `HeldFeedback`
+  (delete), `WaitingReason` (collapse), `digest` (update digest
+  fields).
+- `src/review_state.rs`: `ReviewPhase` enum (delete),
+  `ReviewGateDecision.phase` field (delete).
+- `frontend/src/api.rs`: `PlanDetail`, `TimelineEvent::Review`
+  (drop `phase`), `TimelineEvent::HeldFeedback` (delete),
+  `FeedbackRow`, `WaitingOn` reason strings.
+- `frontend/src/components/timeline.rs`: chip-rendering moves to
+  commit row; review-row phase formatting deleted.
+- `frontend/src/components/feedback.rs` (or equivalent):
+  per-commit feedback cards; phase-keyed CSS classes renamed to
+  commit-kind-keyed.
+- `frontend/style.css`: rename phase-keyed classes to
+  commit-kind-keyed; delete `held-feedback*` blocks.
+- `tests/end_to_end.rs`: every JSON assertion on `plan_feedback`,
+  `impl_feedback`, `held_plan_feedback`, `phase`, `review_target`'s
+  `phase` field, `wait_for_work`'s old `work` vocabulary. Rewrite
+  against `commits[]` and the new wire shape.
 
 ### HTTP / SPA
 
@@ -496,6 +629,21 @@ finishes. Skip the half-step.
    match the new readiness rule at each step. Add a cumulative-
    participant variant: a second reviewer joins at the second
    `code_only` commit and is then expected on subsequent commits.
+10. Optional `plan_id` inference covered by tests:
+    - `wait_for_work` with no `plan_id` and exactly one active plan
+      in the resolved repo → resolves to that plan.
+    - `wait_for_work` with no `plan_id` and zero active plans →
+      returns `{timed_out: true, no_active_plans: true}`.
+    - `wait_for_work` with no `plan_id` and multiple active plans
+      → returns `ambiguous_plan` error with a candidate list whose
+      entries carry `plan_id`, `current_path`, `state`, `waiting_on`.
+    - Explicit `plan_id` always overrides inference (test passes a
+      `plan_id` while multiple actives exist; the named one resolves
+      without an ambiguity error).
+11. `caller_already_voted` semantics test: re-wake is suppressed
+    for `APPROVE` and `REQUEST_CHANGES` on the latest relevant SHA,
+    but NOT for `Unmarked`/ambiguous (the caller is woken so they
+    can fix the verdict marker).
 
 ## Decisions (resolved open questions)
 
