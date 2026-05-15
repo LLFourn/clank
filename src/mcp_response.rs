@@ -256,14 +256,14 @@ pub fn get_context_response_from_snapshot(
 
     json!({
         "repo": snapshot.root.to_string_lossy(),
-        "session_id": session.id.as_str(),
+        "plan_path": session.plan_path.to_string_lossy(),
+        "slug": session.id.as_str(),
         "phase": session_phase.as_str(),
         "plan_worktree_status": worktree_status.as_str(),
         "waiting_on": waiting_on_value(&w),
         "expected_action": expected_action_str,
         "review_target": review_target,
         "write_feedback": write_feedback,
-        "plan_path": session.plan_path.to_string_lossy(),
         "review_gate": gate_value(plan_gate.as_ref(), impl_gate.as_ref(), session_phase),
         "latest_plan_revision": latest_plan_revision(session, &state),
         "latest_implementation_revision": latest_impl_revision(session, &state),
