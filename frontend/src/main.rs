@@ -4,6 +4,9 @@ use leptos_router::path;
 
 mod api;
 mod components;
+mod store;
+
+use store::{EventStore, connect_sse};
 
 fn main() {
     console_error_panic_hook::set_once();
@@ -12,6 +15,13 @@ fn main() {
 
 #[component]
 fn App() -> impl IntoView {
+    // One global event store; every route's resources key on it for
+    // live invalidation. Set up the SSE connection here so it survives
+    // route changes.
+    let store = EventStore::new();
+    provide_context(store);
+    connect_sse(store);
+
     view! {
         <Router>
             <Routes fallback=NotFound>

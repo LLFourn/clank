@@ -3,14 +3,18 @@ use leptos_router::hooks::use_params_map;
 
 use crate::api::{PlanRevisionPage, fetch_plan_revision};
 use crate::components::feedback_card::FeedbackCard;
+use crate::store::EventStore;
 
 #[component]
 pub fn PlanRevision() -> impl IntoView {
+    let store = expect_context::<EventStore>();
     let params = use_params_map();
     let session_id = move || params.read().get("session_id").unwrap_or_default();
     let sha = move || params.read().get("sha").unwrap_or_default();
-    let resource =
-        LocalResource::new(move || fetch_plan_revision(session_id(), sha()));
+    let resource = LocalResource::new(move || {
+        let _ = store.tick.get();
+        fetch_plan_revision(session_id(), sha())
+    });
 
     view! {
         <Suspense fallback=move || view! { <p class="loading">"Loading…"</p> }>

@@ -6,12 +6,17 @@ use crate::components::feedback_card::{FeedbackCard, HeldFeedbackCard};
 use crate::components::meta_strip::MetaStrip;
 use crate::components::timeline::Timeline;
 use crate::components::waiting_banner::WaitingBanner;
+use crate::store::EventStore;
 
 #[component]
 pub fn SessionDetail() -> impl IntoView {
+    let store = expect_context::<EventStore>();
     let params = use_params_map();
     let session_id = move || params.read().get("session_id").unwrap_or_default();
-    let resource = LocalResource::new(move || fetch_session(session_id()));
+    let resource = LocalResource::new(move || {
+        let _ = store.tick.get();
+        fetch_session(session_id())
+    });
 
     view! {
         <Suspense fallback=move || view! { <p class="loading">"Loading…"</p> }>

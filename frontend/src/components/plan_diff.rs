@@ -3,6 +3,7 @@ use leptos_router::hooks::{use_params_map, use_query_map};
 
 use crate::api::{DiffPage, fetch_diff, fetch_session};
 use crate::components::structured_diff::StructuredDiff;
+use crate::store::EventStore;
 
 /// `/sessions/:session_id/plan/:sha/diff?vs=:other` — compare two plan
 /// revisions of the same session. We resolve the plan_path via a
@@ -10,6 +11,7 @@ use crate::components::structured_diff::StructuredDiff;
 /// hand off to `/api/diff?from=&to=&path=`.
 #[component]
 pub fn PlanDiff() -> impl IntoView {
+    let store = expect_context::<EventStore>();
     let params = use_params_map();
     let query = use_query_map();
     let session_id = move || params.read().get("session_id").unwrap_or_default();
@@ -17,12 +19,11 @@ pub fn PlanDiff() -> impl IntoView {
     let from_sha = move || query.read().get("vs").unwrap_or_default();
 
     let resource = LocalResource::new(move || {
+        let _ = store.tick.get();
         let sid = session_id();
         let from = from_sha();
         let to = to_sha();
         async move {
-            // Two fetches: the session detail to discover plan_path, then
-            // the /api/diff endpoint with that path.
             let session = fetch_session(sid).await?;
             fetch_diff(from, to, session.plan_path).await
         }

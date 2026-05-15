@@ -805,3 +805,128 @@ a:hover {
     background: rgba(72, 79, 88, 0.12);
     color: var(--text-muted);
 }
+
+/* ---------- Home layout + activity sidebar ---------- */
+
+.home-layout {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) 280px;
+    gap: 2rem;
+}
+
+@media (max-width: 900px) {
+    .home-layout {
+        grid-template-columns: 1fr;
+    }
+}
+
+.activity-sidebar {
+    position: sticky;
+    top: 1.5rem;
+    align-self: start;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 0.5rem;
+    padding: 1rem;
+    font-size: 0.85rem;
+}
+
+.activity-sidebar h3 {
+    margin: 0 0 0.6rem;
+    font-size: 0.85rem;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    color: var(--text-muted);
+    font-weight: 500;
+}
+
+.activity-list {
+    list-style: none;
+    padding: 0;
+    margin: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 0.35rem;
+}
+
+.activity-row {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    padding: 0.35rem 0.5rem;
+    border-radius: 0.35rem;
+    border-left: 2px solid transparent;
+    /* New rows pulse the accent border for 600ms after render. */
+    animation: pulse-accent 0.6s ease-out;
+}
+
+.activity-empty {
+    padding: 0.5rem;
+}
+
+@keyframes pulse-accent {
+    0% {
+        background: rgba(210, 168, 255, 0.18);
+        border-left-color: var(--accent);
+    }
+    100% {
+        background: transparent;
+        border-left-color: transparent;
+    }
+}
+
+.activity-kind {
+    font-size: 0.7rem;
+    font-weight: 500;
+    padding: 0.1em 0.4em;
+    border-radius: 0.3em;
+    background: var(--surface-2);
+    color: var(--text-muted);
+    text-transform: lowercase;
+    flex-shrink: 0;
+}
+
+.activity-repo_rebuilt {
+    background: rgba(210, 168, 255, 0.18);
+    color: var(--accent);
+}
+
+.activity-feedback_changed {
+    background: rgba(63, 185, 80, 0.18);
+    color: var(--approve);
+}
+
+.activity-feedback_removed {
+    background: rgba(248, 81, 73, 0.18);
+    color: var(--request);
+}
+
+.activity-plan_worktree_changed {
+    background: rgba(210, 153, 34, 0.18);
+    color: var(--pending);
+}
+
+.activity-session {
+    color: var(--text);
+    flex: 1;
+    overflow-wrap: anywhere;
+}
+
+.activity-session:hover {
+    color: var(--accent);
+}
+
+/* New rows in the session timeline also pulse on first render. */
+
+.timeline-row {
+    animation: pulse-row 0.6s ease-out;
+}
+
+@keyframes pulse-row {
+    0% {
+        background: rgba(210, 168, 255, 0.10);
+    }
+    100% {
+        background: transparent;
+    }
+}
