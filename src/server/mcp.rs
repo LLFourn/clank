@@ -399,11 +399,27 @@ pub(crate) fn remove_repo_from_registry(registry: &Path, repo: &Path) -> std::io
         return Ok(());
     }
     let existing = std::fs::read_to_string(registry)?;
+    // `repo` is the daemon's canonical root (from `Trinity.repo_basenames`).
+    // The registry file is human-edited and may carry equivalent
+    // non-canonical forms (`~/src/foo`, `./src/foo`, paths with
+    // intermediate `..`, symlinks resolved differently). Compare each
+    // line by its canonical form when canonicalization succeeds; fall
+    // back to a byte compare so an entry pointing at a path that no
+    // longer exists on disk can still be removed.
     let mut kept: Vec<&str> = Vec::new();
     let mut changed = false;
     for line in existing.lines() {
         let trimmed = line.trim();
-        if !trimmed.is_empty() && std::path::Path::new(trimmed) == repo {
+        let matches = if trimmed.is_empty() {
+            false
+        } else {
+            let raw = std::path::Path::new(trimmed);
+            match dunce::canonicalize(raw) {
+                Ok(canonical) => canonical == repo,
+                Err(_) => raw == repo,
+            }
+        };
+        if matches {
             changed = true;
             continue;
         }

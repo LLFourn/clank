@@ -1195,10 +1195,6 @@ a:hover {
     background: transparent;
     border: 1px solid transparent;
     border-radius: 0.3rem;
-    cursor: pointer;
-    text-align: left;
-    color: inherit;
-    font: inherit;
 }
 
 .timeline-commit-row:hover {
@@ -1206,18 +1202,37 @@ a:hover {
     border-color: var(--border);
 }
 
+/* Toggle surfaces: caret/kind on the left, subject on the right.
+   The SHA between them is a real <a> link to the dedicated commit
+   page; clicking it stops event propagation so the accordion
+   doesn't flip when the operator wanted to navigate. */
+.timeline-commit-toggle,
+.timeline-commit-subject {
+    background: transparent;
+    border: none;
+    color: inherit;
+    font: inherit;
+    cursor: pointer;
+    padding: 0;
+    text-align: left;
+    display: inline-flex;
+    align-items: center;
+    gap: 0.4rem;
+}
+
+.timeline-commit-subject {
+    flex: 1;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    display: inline-block;
+}
+
 .timeline-caret {
     color: var(--text-muted);
     font-size: 0.75rem;
     width: 1rem;
     display: inline-block;
-}
-
-.timeline-subject {
-    flex: 1;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
 }
 
 .commit-expanded {
@@ -1332,6 +1347,52 @@ a:hover {
     flex-basis: 100%;
     margin: 0.4rem 0 0;
     font-size: 0.8rem;
+}
+
+/* Parent-owned notice stack. Persists per-basename even after the
+   originating row unmounts, so a registry-write warning from a
+   successful unwatch survives the row refetch that drops the row.
+   Dismissed manually by the operator. */
+.watched-repos-notices {
+    list-style: none;
+    padding: 0;
+    margin: 0 0 0.8rem;
+    display: flex;
+    flex-direction: column;
+    gap: 0.4rem;
+}
+
+.watched-repos-notice {
+    display: flex;
+    align-items: flex-start;
+    gap: 0.6rem;
+    padding: 0.55rem 0.75rem;
+    border: 1px solid var(--request);
+    border-radius: 0.3rem;
+    background: rgba(248, 81, 73, 0.08);
+    font-size: 0.85rem;
+}
+
+.watched-repos-notice-basename {
+    flex-shrink: 0;
+}
+
+.watched-repos-notice-msg {
+    flex: 1;
+}
+
+.watched-repos-notice-dismiss {
+    background: transparent;
+    border: none;
+    color: inherit;
+    cursor: pointer;
+    font-size: 0.85rem;
+    padding: 0 0.3rem;
+    opacity: 0.7;
+}
+
+.watched-repos-notice-dismiss:hover {
+    opacity: 1;
 }
 
 /* ---------- Home toolbar (show-done toggle, etc.) ---------- */

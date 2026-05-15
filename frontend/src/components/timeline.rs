@@ -153,23 +153,44 @@ fn commit_row(
         subject.clone()
     };
     let subject_title = subject_display.clone();
-    let on_click = move |_| expanded.update(|v| *v = !*v);
+    let on_toggle = move |_| expanded.update(|v| *v = !*v);
+    let commit_href = format!("/plan/{}/commit/{}", plan_id.as_ref(), sha);
+    // Avoid <a> inside <button> (invalid HTML). The row is a div with
+    // a clickable "toggle" surface (caret + kind + subject) and a
+    // sibling <a> for the SHA. The link's click event stops
+    // propagation so navigating to the dedicated commit page doesn't
+    // also flip the accordion.
+    let on_link_click = |ev: leptos::ev::MouseEvent| ev.stop_propagation();
     view! {
         <li class=li_class>
-            <button
-                class="timeline-commit-row"
-                type="button"
-                on:click=on_click
-                title=subject_title.clone()
-            >
-                <span class="timeline-caret">{caret}</span>
-                <span class="timeline-marker"></span>
-                <span class="timeline-kind">{kind_label}</span>
-                <span class="timeline-sha">
+            <div class="timeline-commit-row">
+                <button
+                    class="timeline-commit-toggle"
+                    type="button"
+                    on:click=on_toggle
+                    title=subject_title.clone()
+                >
+                    <span class="timeline-caret">{caret}</span>
+                    <span class="timeline-marker"></span>
+                    <span class="timeline-kind">{kind_label}</span>
+                </button>
+                <a
+                    class="timeline-sha"
+                    href=commit_href
+                    on:click=on_link_click
+                    title="Open commit page"
+                >
                     <code>{short}</code>
-                </span>
-                <span class="timeline-subject">{subject_display}</span>
-            </button>
+                </a>
+                <button
+                    class="timeline-commit-subject"
+                    type="button"
+                    on:click=on_toggle
+                    title=subject_title
+                >
+                    {subject_display}
+                </button>
+            </div>
             <Show when=move || expanded.get()>
                 <ExpandedCommit
                     plan_id=plan_id_for_expand.as_ref().clone()

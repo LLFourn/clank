@@ -4,6 +4,15 @@ use leptos::task::spawn_local;
 use crate::api::{RepoRow, ReposIndex, delete_repo, fetch_repos};
 use crate::store::EventStore;
 
+/// `(basename, message)` for a sticky warning. Per-row identity so a
+/// later removal of the same basename overrides the previous warning,
+/// and a manual dismiss can target one at a time.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RepoNotice {
+    basename: String,
+    message: String,
+}
+
 #[component]
 pub fn WatchedRepos() -> impl IntoView {
     let store = expect_context::<EventStore>();
@@ -11,14 +20,32 @@ pub fn WatchedRepos() -> impl IntoView {
         let _ = store.tick.get();
         fetch_repos()
     });
+    // Hoisted out of `<RepoCard>` so a registry-write warning survives
+    // the row's unmount when the daemon's `repo_unwatched` event
+    // triggers a refetch that drops the row. Per-basename so the same
+    // operator-visible message doesn't accumulate duplicates on retry.
+    let notices: RwSignal<Vec<RepoNotice>> = RwSignal::new(Vec::new());
+    let notify = move |notice: RepoNotice| {
+        notices.update(|v| {
+            v.retain(|n| n.basename != notice.basename);
+            v.push(notice);
+        });
+    };
+    let dismiss = move |basename: String| {
+        notices.update(|v| v.retain(|n| n.basename != basename));
+    };
     view! {
         <section class="watched-repos">
             <h2>"Watched repos"</h2>
+            <NoticeStack notices=notices dismiss=dismiss/>
             <Suspense fallback=move || view! { <p class="muted">"Loading…"</p> }>
                 {move || {
+                    let notify = notify.clone();
                     resource
                         .with(|res| match res {
-                            Some(Ok(ReposIndex { repos })) => repos_table(repos.clone()).into_any(),
+                            Some(Ok(ReposIndex { repos })) => {
+                                repos_table(repos.clone(), notify).into_any()
+                            }
                             Some(Err(e)) => {
                                 view! {
                                     <p class="error">"Failed to load: " {e.to_string()}</p>
@@ -33,7 +60,51 @@ pub fn WatchedRepos() -> impl IntoView {
     }
 }
 
-fn repos_table(repos: Vec<RepoRow>) -> impl IntoView {
+#[component]
+fn NoticeStack(
+    notices: RwSignal<Vec<RepoNotice>>,
+    dismiss: impl Fn(String) + Clone + Send + Sync + 'static,
+) -> impl IntoView {
+    view! {
+        <Show when=move || !notices.with(|v| v.is_empty())>
+            <ul class="watched-repos-notices">
+                <For
+                    each=move || notices.get()
+                    key=|n| n.basename.clone()
+                    children={
+                        let dismiss = dismiss.clone();
+                        move |n| {
+                            let dismiss = dismiss.clone();
+                            let basename = n.basename.clone();
+                            let on_dismiss = move |_| dismiss(basename.clone());
+                            view! {
+                                <li class="watched-repos-notice">
+                                    <span class="watched-repos-notice-basename">
+                                        <code>{n.basename}</code>
+                                    </span>
+                                    <span class="watched-repos-notice-msg">{n.message}</span>
+                                    <button
+                                        class="watched-repos-notice-dismiss"
+                                        type="button"
+                                        on:click=on_dismiss
+                                        title="Dismiss"
+                                    >
+                                        "✕"
+                                    </button>
+                                </li>
+                            }
+                        }
+                    }
+                />
+            </ul>
+        </Show>
+    }
+}
+
+fn repos_table(
+    repos: Vec<RepoRow>,
+    notify: impl Fn(RepoNotice) + Clone + Send + Sync + 'static,
+) -> impl IntoView {
     if repos.is_empty() {
         return view! { <p class="muted">"No repos watched yet."</p> }.into_any();
     }
@@ -47,7 +118,13 @@ fn repos_table(repos: Vec<RepoRow>) -> impl IntoView {
             <For
                 each=move || repos.clone()
                 key=|r| r.basename.clone()
-                children=move |r| view! { <RepoCard row=r/> }
+                children={
+                    let notify = notify.clone();
+                    move |r| {
+                        let notify = notify.clone();
+                        view! { <RepoCard row=r notify=notify/> }
+                    }
+                }
             />
         </ul>
     }
@@ -55,16 +132,20 @@ fn repos_table(repos: Vec<RepoRow>) -> impl IntoView {
 }
 
 #[component]
-fn RepoCard(row: RepoRow) -> impl IntoView {
+fn RepoCard(
+    row: RepoRow,
+    notify: impl Fn(RepoNotice) + Clone + Send + Sync + 'static,
+) -> impl IntoView {
     let confirming = RwSignal::new(false);
     let pending = RwSignal::new(false);
-    let error_msg: RwSignal<Option<String>> = RwSignal::new(None);
     let basename = row.basename.clone();
     // StoredValue is Copy, which makes the click closure Copy. Without
     // it, capturing `String` by-move makes the closure FnOnce, and the
     // surrounding <Show> children require Fn (Show re-invokes the
     // children closure whenever `when` flips).
     let basename_stored = StoredValue::new(basename.clone());
+    // Notice handler is also stored so the click closure stays Copy.
+    let notify_stored = StoredValue::new(notify);
 
     // First click → enter confirm state. Two-click protection: the
     // initial "Unwatch" button is replaced by *different* DOM elements
@@ -83,24 +164,32 @@ fn RepoCard(row: RepoRow) -> impl IntoView {
             return;
         }
         let basename = basename_stored.get_value();
+        let notify = notify_stored.get_value();
         pending.set(true);
         spawn_local(async move {
-            match delete_repo(basename).await {
+            match delete_repo(basename.clone()).await {
                 Ok(outcome) => {
                     // In-memory deregistration succeeded. Daemon emits
                     // `repo_unwatched`; EventStore.tick bumps and the
-                    // parent's LocalResource refetches. If the registry
-                    // file write failed, surface it inline so the
-                    // operator knows the repo will resurrect on
-                    // daemon restart.
+                    // parent's LocalResource refetches, unmounting THIS
+                    // row. If the registry file write failed, push the
+                    // warning to the parent-owned notice stack so it
+                    // outlives the unmount — the original bug was that
+                    // the warning vanished with the row.
                     if let Some(msg) = outcome.registry_write_error {
-                        error_msg.set(Some(msg));
+                        notify(RepoNotice {
+                            basename: basename.clone(),
+                            message: msg,
+                        });
                     }
                     confirming.set(false);
                     pending.set(false);
                 }
                 Err(e) => {
-                    error_msg.set(Some(e.to_string()));
+                    notify(RepoNotice {
+                        basename: basename.clone(),
+                        message: format!("Unwatch failed: {e}"),
+                    });
                     pending.set(false);
                     confirming.set(false);
                 }
@@ -149,11 +238,6 @@ fn RepoCard(row: RepoRow) -> impl IntoView {
                     </button>
                 </Show>
             </div>
-            <Show when=move || error_msg.get().is_some()>
-                <p class="error watched-repos-error">
-                    {move || error_msg.get().unwrap_or_default()}
-                </p>
-            </Show>
         </li>
     }
 }

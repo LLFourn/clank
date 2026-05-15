@@ -1325,6 +1325,89 @@ async fn delete_repo_removes_from_state_and_registry() {
 }
 
 #[tokio::test]
+async fn delete_repo_removes_non_canonical_registry_lines() {
+    // Codex regression: `remove_repo_from_registry` used to compare
+    // each registry line byte-for-byte against the canonical repo
+    // root. A non-canonical-but-equivalent line (path with `..`,
+    // trailing slash, or a symlinked prefix) was kept, so DELETE
+    // returned ok:true and the repo resurrected on next daemon
+    // restart. The fix canonicalizes each line before comparing.
+    let _home_guard = HOME_LOCK.lock().await;
+    let fake_home = tempfile::tempdir().unwrap();
+    let prev_home = std::env::var_os("HOME");
+    // SAFETY: serialized via HOME_LOCK with other HOME-mutating tests.
+    unsafe { std::env::set_var("HOME", fake_home.path()) };
+
+    let registry_parent = tempfile::tempdir().unwrap();
+    let registry_path = registry_parent.path().join("repos");
+
+    let parent = tempfile::tempdir().unwrap();
+    let dir = parent.path().join("noncanon");
+    std::fs::create_dir_all(&dir).unwrap();
+    run_git(&dir, &["init", "--quiet", "--initial-branch=main"]);
+    run_git(&dir, &["config", "user.email", "test@test"]);
+    run_git(&dir, &["config", "user.name", "test"]);
+    run_git(&dir, &["config", "commit.gpgsign", "false"]);
+    write_file(&dir, ".trinity/plans/foo.md", "# foo\n");
+    commit(&dir, "add foo");
+
+    // Seed the registry with the canonical path so the daemon loads it.
+    let canonical = dir.canonicalize().unwrap();
+    let (url, handle) =
+        spawn_daemon_with_repos_file(&registry_path, std::slice::from_ref(&canonical)).await;
+    // Now rewrite the registry with a NON-canonical equivalent path
+    // that canonicalizes back to the same root but is NOT
+    // `Path::eq`-equal — `parent/dirname/../dirname`. The `..` form
+    // survives `Path::eq` because Path::components doesn't resolve
+    // parent traversals (only filesystem canonicalization does), so a
+    // naive byte/component compare misses it.
+    let dir_name = canonical.file_name().unwrap().to_string_lossy();
+    let parent_canonical = canonical.parent().unwrap();
+    let non_canonical_line = format!("{}/{dir_name}/../{dir_name}", parent_canonical.display());
+    // Sanity check: this string is NOT Path::eq to canonical
+    // (otherwise the regression would be untestable).
+    assert_ne!(
+        std::path::Path::new(&non_canonical_line),
+        canonical.as_path(),
+        "test setup: non_canonical_line must differ from canonical under Path::eq",
+    );
+    // …but it DOES canonicalize to the same root.
+    assert_eq!(
+        std::fs::canonicalize(&non_canonical_line).unwrap(),
+        canonical,
+        "test setup: non_canonical_line must resolve to the canonical root",
+    );
+    std::fs::write(&registry_path, format!("{non_canonical_line}\n")).unwrap();
+
+    let resp = reqwest::Client::new()
+        .delete(format!("{url}/api/repos/noncanon"))
+        .send()
+        .await
+        .unwrap();
+    let status = resp.status();
+    let body: serde_json::Value = resp.json().await.unwrap();
+    handle.abort();
+
+    assert_eq!(status, reqwest::StatusCode::OK);
+    assert_eq!(body["ok"], true, "delete should succeed; body: {body}");
+
+    let after = std::fs::read_to_string(&registry_path).unwrap_or_default();
+    assert!(
+        !after.lines().any(|l| l.trim() == non_canonical_line),
+        "non-canonical registry entry must be removed; got: {after}"
+    );
+    assert!(
+        after.trim().is_empty(),
+        "registry should be empty after removing the only entry; got: {after}"
+    );
+
+    match prev_home {
+        Some(v) => unsafe { std::env::set_var("HOME", v) },
+        None => unsafe { std::env::remove_var("HOME") },
+    }
+}
+
+#[tokio::test]
 async fn delete_repo_surfaces_registry_write_error() {
     // Wire-shape regression: when the registry rewrite fails after a
     // successful in-memory deregistration, the response must carry
@@ -1377,13 +1460,36 @@ async fn delete_repo_surfaces_registry_write_error() {
     );
 
     // Lock the registry's parent dir so the tmp-write inside
-    // remove_repo_from_registry fails with EACCES.
+    // remove_repo_from_registry fails with EACCES. Wrap the chmod in
+    // a Drop guard so if any subsequent `.unwrap()` panics, the
+    // tempdir can still be cleaned up rather than leaving a
+    // read-only dir behind.
+    struct ChmodGuard {
+        path: std::path::PathBuf,
+        original_mode: u32,
+    }
+    impl Drop for ChmodGuard {
+        fn drop(&mut self) {
+            if let Ok(meta) = std::fs::metadata(&self.path) {
+                let mut perms = meta.permissions();
+                perms.set_mode(self.original_mode);
+                let _ = std::fs::set_permissions(&self.path, perms);
+            }
+        }
+    }
+    let original_mode = std::fs::metadata(registry_parent.path())
+        .unwrap()
+        .permissions()
+        .mode();
     let mut perms = std::fs::metadata(registry_parent.path())
         .unwrap()
         .permissions();
-    let original_mode = perms.mode();
     perms.set_mode(0o555);
     std::fs::set_permissions(registry_parent.path(), perms).unwrap();
+    let _chmod_guard = ChmodGuard {
+        path: registry_parent.path().to_path_buf(),
+        original_mode,
+    };
 
     let resp = client
         .delete(format!("{url}/api/repos/locked"))
@@ -1393,12 +1499,9 @@ async fn delete_repo_surfaces_registry_write_error() {
     let status = resp.status();
     let body: serde_json::Value = resp.json().await.unwrap();
 
-    // Restore so tempdir cleanup can drop the path on Drop.
-    let mut restore = std::fs::metadata(registry_parent.path())
-        .unwrap()
-        .permissions();
-    restore.set_mode(original_mode);
-    std::fs::set_permissions(registry_parent.path(), restore).unwrap();
+    // Guard restores permissions on Drop; explicit restore before
+    // tempdir teardown keeps the test readable.
+    drop(_chmod_guard);
     handle.abort();
 
     assert_eq!(status, reqwest::StatusCode::OK);
