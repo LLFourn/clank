@@ -53,6 +53,18 @@ pub enum RuntimeError {
     InvalidRepoPath(PathBuf),
 }
 
+/// Outcome of `Runtime::add_repo`. The shadowed-by-other case is not an
+/// error — daemon startup keeps booting and request handlers fall back
+/// to whatever the first-registered repo at that basename serves — but
+/// callers MUST be able to distinguish it from `Registered` so they can
+/// log accurately and (for `start_plan`) refuse mutating disk on a
+/// shadowed repo.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RegisterOutcome {
+    Registered,
+    ShadowedByOther { claimed_by: PathBuf },
+}
+
 impl Runtime {
     pub fn new() -> Self {
         Self::default()
@@ -69,7 +81,7 @@ impl Runtime {
     /// HashMap key. Runs the held-feedback normalization sweep after the
     /// initial load so flat-drop feedback that pre-dated this boot gets
     /// auto-organized into `<phase>/<target-sha>/<author>.md`.
-    pub async fn add_repo(&self, repo_root: PathBuf) -> Result<(), RuntimeError> {
+    pub async fn add_repo(&self, repo_root: PathBuf) -> Result<RegisterOutcome, RuntimeError> {
         let canonical = dunce::canonicalize(&repo_root).unwrap_or(repo_root);
         let basename = crate::lifecycle::RepoBasename::from_repo_root(&canonical)
             .ok_or_else(|| RuntimeError::InvalidRepoPath(canonical.clone()))?;
@@ -77,46 +89,48 @@ impl Runtime {
         {
             let mut trinity = self.state.lock().await;
             // Basename collision: first registration wins. The shadowed
-            // repo is logged and silently dropped per plan §1 /
-            // repo_basenames invariant.
+            // repo is reported back so the caller (server startup, MCP
+            // start_plan) can log accurately and refuse work against it.
             if let Some(claimed_by) = trinity.repo_basenames.get(&basename)
                 && claimed_by != &canonical
             {
+                let claimed_by = claimed_by.clone();
                 tracing::warn!(
                     basename = %basename,
                     claimed_by = %claimed_by.display(),
                     shadowed = %canonical.display(),
                     "repo basename collides with an already-watched repo; shadowed repo will be ignored"
                 );
-                return Ok(());
+                return Ok(RegisterOutcome::ShadowedByOther { claimed_by });
             }
             trinity.repos.insert(canonical.clone(), fresh);
-            trinity
-                .repo_basenames
-                .insert(basename, canonical.clone());
+            trinity.repo_basenames.insert(basename, canonical.clone());
         }
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs() as i64)
             .unwrap_or(0);
         self.normalize_held_feedback(&canonical, now).await?;
-        Ok(())
+        Ok(RegisterOutcome::Registered)
     }
 
-    /// Register a repo only if it isn't already known. Silently swallows
-    /// rebuild errors (logged), so request handlers can call this on
-    /// every request without needing to special-case "already loaded."
-    pub async fn add_repo_if_unknown(&self, repo_root: PathBuf) {
+    /// Register a repo only if it isn't already known. Returns the
+    /// outcome so callers can distinguish a successful registration
+    /// (or a no-op against an already-known repo) from a shadowing
+    /// collision. Rebuild errors are swallowed (logged) and surface as
+    /// `Err`; callers like request handlers usually ignore them.
+    pub async fn add_repo_if_unknown(
+        &self,
+        repo_root: PathBuf,
+    ) -> Result<RegisterOutcome, RuntimeError> {
         let canonical = dunce::canonicalize(&repo_root).unwrap_or(repo_root);
         {
             let trinity = self.state.lock().await;
             if trinity.repos.contains_key(&canonical) {
-                return;
+                return Ok(RegisterOutcome::Registered);
             }
         }
-        if let Err(err) = self.add_repo(canonical.clone()).await {
-            tracing::warn!(repo = %canonical.display(), error = ?err, "add_repo_if_unknown failed");
-        }
+        self.add_repo(canonical).await
     }
 
     /// Clone a repo snapshot while holding the runtime lock. Callers do
@@ -506,8 +520,7 @@ impl Runtime {
             use crate::projection::plan_worktree_status;
             use crate::repo_state::PlanWorktreeStatus;
             let active_path = repo_root.join(&snapshot.plan_path);
-            let counterpart_rel =
-                crate::lifecycle::plan_path_counterpart(&snapshot.plan_path);
+            let counterpart_rel = crate::lifecycle::plan_path_counterpart(&snapshot.plan_path);
             let counterpart_abs = counterpart_rel.as_ref().map(|p| repo_root.join(p));
             let wt_hash = std::fs::read_to_string(&active_path)
                 .ok()

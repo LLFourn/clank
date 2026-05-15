@@ -86,7 +86,7 @@ async fn list_plans(state: &AppState, req: &ToolCallRequest) -> Result<Value, To
         Some(s) => Some(resolve_repo_filter(state, s, &req.cwd).await?),
     };
     let snapshots = if let Some(repo) = repo_filter {
-        state.runtime.add_repo_if_unknown(repo.clone()).await;
+        ensure_registered_or_reject(state, &repo).await?;
         let snap = state
             .runtime
             .snapshot_repo(&repo)
@@ -98,7 +98,7 @@ async fn list_plans(state: &AppState, req: &ToolCallRequest) -> Result<Value, To
         // aggregation isn't useful through MCP; HTTP /api/plans returns
         // the cross-repo view.)
         let repo = resolve_repo(&req.cwd).await?;
-        state.runtime.add_repo_if_unknown(repo.clone()).await;
+        ensure_registered_or_reject(state, &repo).await?;
         let snap = state
             .runtime
             .snapshot_repo(&repo)
@@ -181,7 +181,7 @@ async fn start_plan(state: &AppState, req: &ToolCallRequest) -> Result<Value, To
     ensure_gitignore(&repo)?;
     persist_repo_in_registry(&repo)
         .map_err(|e| ToolError::Internal(anyhow::anyhow!("register repo: {e}")))?;
-    state.runtime.add_repo_if_unknown(repo.clone()).await;
+    ensure_registered_or_reject(state, &repo).await?;
     ensure_repo_watcher(state, repo.clone()).await;
 
     {
@@ -334,6 +334,24 @@ async fn resolve_repo_with_override(
             Ok(dunce::canonicalize(&raw).unwrap_or(raw))
         }
         None => resolve_repo(cwd).await,
+    }
+}
+
+/// Register `repo` with the runtime if it isn't already known, and
+/// reject the caller if its basename is shadowed by another canonical
+/// path. Used by `start_plan` and `list_plans` so callers can't operate
+/// on a repo that the daemon won't actually serve.
+async fn ensure_registered_or_reject(state: &AppState, repo: &Path) -> Result<(), ToolError> {
+    use crate::runtime::RegisterOutcome;
+    match state.runtime.add_repo_if_unknown(repo.to_path_buf()).await {
+        Ok(RegisterOutcome::Registered) => Ok(()),
+        Ok(RegisterOutcome::ShadowedByOther { claimed_by }) => Err(ToolError::Forbidden(format!(
+            "repo basename collides with already-watched {}; rename the directory to disambiguate",
+            claimed_by.display()
+        ))),
+        Err(err) => Err(ToolError::Internal(anyhow::anyhow!(
+            "add_repo_if_unknown failed: {err}"
+        ))),
     }
 }
 

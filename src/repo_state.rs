@@ -257,7 +257,6 @@ impl RepoState {
 
         StateDigest(hasher.finalize().to_hex().to_string())
     }
-
 }
 
 /// One row in the per-session timeline returned by

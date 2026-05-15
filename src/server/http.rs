@@ -146,27 +146,32 @@ async fn call_tool(
     Ok(axum::Json(mcp::ToolCallResponse { result }))
 }
 
-/// Resolve `?repo=<basename-or-absolute-path>` to a list of repo roots to
-/// render. Accepts a basename (looked up against `Trinity.repo_basenames`)
-/// or an absolute canonical path. Returns all watched repos when `repo` is
-/// absent. Returns an empty list when the filter doesn't match anything —
-/// the caller surfaces an empty `plans` array, which is consistent with
-/// "no plans match this filter."
-async fn repos_to_render(state: &AppState, override_path: Option<String>) -> Vec<PathBuf> {
+/// Resolve `?repo=<basename-or-absolute-path>` to the list of repo roots
+/// the request should render against. Accepts a basename (looked up via
+/// `Trinity.repo_basenames`) or an absolute path (canonicalized via
+/// `dunce`). Returns all watched repos when `repo` is absent. Returns
+/// `AppError::not_found` when the filter doesn't match anything, mirroring
+/// the MCP `list_plans` behavior so the two surfaces agree on error
+/// semantics.
+async fn repos_to_render(
+    state: &AppState,
+    override_path: Option<String>,
+) -> Result<Vec<PathBuf>, AppError> {
     let arc = state.runtime.state();
     let trinity = arc.lock().await;
     let Some(raw) = override_path else {
-        return trinity.repos.keys().cloned().collect();
+        return Ok(trinity.repos.keys().cloned().collect());
     };
     let basename = crate::lifecycle::RepoBasename::from(raw.as_str());
     if let Some(root) = trinity.repo_basenames.get(&basename) {
-        return vec![root.clone()];
+        return Ok(vec![root.clone()]);
     }
-    let path = PathBuf::from(&raw);
-    if trinity.repos.contains_key(&path) {
-        return vec![path];
+    let raw_path = PathBuf::from(&raw);
+    let canonical = dunce::canonicalize(&raw_path).unwrap_or(raw_path);
+    if trinity.repos.contains_key(&canonical) {
+        return Ok(vec![canonical]);
     }
-    Vec::new()
+    Err(AppError::not_found(format!("unknown repo filter: {raw}")))
 }
 
 #[derive(Debug)]
@@ -256,7 +261,7 @@ async fn api_plans(
     State(state): State<AppState>,
     Query(q): Query<RepoQuery>,
 ) -> Result<axum::Json<Value>, AppError> {
-    let repos = repos_to_render(&state, q.repo).await;
+    let repos = repos_to_render(&state, q.repo).await?;
     let mut all_plans: Vec<Value> = Vec::new();
     let mut all_conflicts: Vec<Value> = Vec::new();
     for repo in repos {
@@ -441,6 +446,23 @@ async fn api_diff(
         .await
         .map_err(AppError::runtime)?
         .ok_or_else(|| AppError::not_found(format!("plan {repo_basename}/{stem_md} not found")))?;
+
+    let plan_revisions = crate::projection::all_plan_revisions_for(
+        &snapshot.plan.id,
+        &snapshot.commit_order,
+        &snapshot.plan_touches,
+    );
+    if !plan_revisions.contains(&from_sha) {
+        return Err(AppError::not_found(format!(
+            "commit {from_sha} is not a plan revision of {repo_basename}/{stem_md}"
+        )));
+    }
+    if !plan_revisions.contains(&to_sha) {
+        return Err(AppError::not_found(format!(
+            "commit {to_sha} is not a plan revision of {repo_basename}/{stem_md}"
+        )));
+    }
+
     let from_path = crate::projection::plan_path_at(
         &snapshot.plan.id,
         &from_sha,

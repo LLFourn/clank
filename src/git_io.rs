@@ -156,13 +156,7 @@ pub async fn diff_two_blobs(
     let to_spec = format!("{}:{}", to.as_str(), to_path.display());
     run_ok_raw(
         repo,
-        &[
-            "diff",
-            "--no-color",
-            "--no-ext-diff",
-            &from_spec,
-            &to_spec,
-        ],
+        &["diff", "--no-color", "--no-ext-diff", &from_spec, &to_spec],
     )
     .await
 }

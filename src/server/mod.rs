@@ -73,7 +73,17 @@ pub async fn serve(args: ServeArgs) -> anyhow::Result<()> {
             continue;
         }
         match runtime.add_repo(repo.clone()).await {
-            Ok(()) => tracing::info!(repo = %repo.display(), "repo loaded"),
+            Ok(crate::runtime::RegisterOutcome::Registered) => {
+                tracing::info!(repo = %repo.display(), "repo loaded")
+            }
+            Ok(crate::runtime::RegisterOutcome::ShadowedByOther { claimed_by }) => {
+                tracing::warn!(
+                    repo = %repo.display(),
+                    claimed_by = %claimed_by.display(),
+                    "repo skipped: basename already claimed by another watched repo",
+                );
+                continue;
+            }
             Err(err) => {
                 tracing::error!(repo = %repo.display(), error = ?err, "repo load failed");
                 continue;

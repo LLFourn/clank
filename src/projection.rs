@@ -174,10 +174,13 @@ fn waiting_from_gate(gate: Option<&ReviewGateDecision>, phase: GatePhase) -> Wai
 /// Repo-relative path of the plan file at the given commit's tree.
 ///
 /// Walks `plan_touches` along `commit_order` from the start to (and
-/// including) `target_sha`, flipping between active and done as `DoneMove`
-/// touches land. Used by revision/diff routes to look up historical blobs
-/// without assuming the plan file lived at its current path for the whole
-/// history.
+/// including) `target_sha`, toggling between active and done on every
+/// `DoneMove` touch. `DoneMove` is direction-agnostic at the producer
+/// (`git_io::classify_plan_touch` emits it for either direction), so
+/// the toggle is symmetric — an active→done→active round trip ends at
+/// active. Used by revision/diff routes to look up historical blobs
+/// without assuming the plan file lived at its current path for the
+/// whole history.
 ///
 /// Returns `None` if `target_sha` isn't in `commit_order`.
 pub fn plan_path_at(
@@ -195,10 +198,8 @@ pub fn plan_path_at(
     for sha in &commit_order[..=target_pos] {
         if let Some(touches) = plan_touches.get(sha) {
             for (k, kind) in touches {
-                if k == plan_key
-                    && matches!(kind, crate::repo_state::PlanTouchKind::DoneMove)
-                {
-                    is_done = true;
+                if k == plan_key && matches!(kind, crate::repo_state::PlanTouchKind::DoneMove) {
+                    is_done = !is_done;
                 }
             }
         }
@@ -881,6 +882,31 @@ mod tests {
         let order = vec![cs("c1")];
         let touches: BTreeMap<CommitSha, Vec<(PlanKey, PlanTouchKind)>> = BTreeMap::new();
         assert!(plan_path_at(&pk("foo"), &cs("zzz"), &order, &touches).is_none());
+    }
+
+    #[test]
+    fn plan_path_at_toggles_on_each_done_move() {
+        // The producer emits `DoneMove` for either direction. Round-trip
+        // (active→done→active) must end at active.
+        let order = vec![cs("c1"), cs("c2"), cs("c3"), cs("c4")];
+        let mut touches: BTreeMap<CommitSha, Vec<(PlanKey, PlanTouchKind)>> = BTreeMap::new();
+        touches.insert(cs("c1"), vec![(pk("foo"), PlanTouchKind::Intro)]);
+        touches.insert(cs("c2"), vec![(pk("foo"), PlanTouchKind::DoneMove)]);
+        touches.insert(cs("c4"), vec![(pk("foo"), PlanTouchKind::DoneMove)]);
+
+        assert_eq!(
+            plan_path_at(&pk("foo"), &cs("c2"), &order, &touches).unwrap(),
+            PathBuf::from(".trinity/plans/done/foo.md"),
+        );
+        assert_eq!(
+            plan_path_at(&pk("foo"), &cs("c3"), &order, &touches).unwrap(),
+            PathBuf::from(".trinity/plans/done/foo.md"),
+        );
+        assert_eq!(
+            plan_path_at(&pk("foo"), &cs("c4"), &order, &touches).unwrap(),
+            PathBuf::from(".trinity/plans/foo.md"),
+            "second DoneMove (done→active) must toggle back to active",
+        );
     }
 
     #[test]
