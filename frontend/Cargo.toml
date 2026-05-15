@@ -6,9 +6,7 @@ publish = false
 
 [dependencies]
 leptos = { version = "0.8", features = ["csr"] }
-# leptos_router and leptos_meta land in Phase 2 with multi-page routing.
-# Holding them out of the Phase 1 dep tree to keep `cargo build` fast and
-# avoid the no-op `nightly` feature on stable toolchains.
+leptos_router = "0.8"
 
 # WASM glue
 wasm-bindgen = "0.2"

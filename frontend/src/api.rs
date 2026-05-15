@@ -6,7 +6,7 @@
 use serde::Deserialize;
 
 #[derive(Debug, Clone, Deserialize)]
-#[allow(dead_code)] // fields consumed by later-phase components
+#[allow(dead_code)]
 pub struct WaitingOn {
     pub role: String,
     pub reason: String,
@@ -24,6 +24,126 @@ pub struct SessionRow {
     pub phase: String,
     pub worktree_status: String,
     pub waiting_on: WaitingOn,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)]
+pub struct ReviewTarget {
+    pub phase: String,
+    pub commit_sha: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)]
+pub struct ReviewGate {
+    pub state: String,
+    pub phase: String,
+    #[serde(default)]
+    pub participants: Vec<String>,
+    #[serde(default)]
+    pub approvals: Vec<String>,
+    #[serde(default)]
+    pub request_changes: Vec<String>,
+    #[serde(default)]
+    pub missing_approvals: Vec<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)]
+pub struct CommitRef {
+    pub commit_sha: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)]
+pub struct FeedbackEntry {
+    pub target_sha: String,
+    pub author: String,
+    pub verdict: String,
+    pub body_raw: String,
+    pub body_html: String,
+    pub path: String,
+    pub created_at: i64,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)]
+pub struct HeldFeedbackEntry {
+    pub author: String,
+    pub verdict: String,
+    pub body_raw: String,
+    pub body_html: String,
+    pub path: String,
+    pub reason: String,
+    pub created_at: i64,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(tag = "kind")]
+#[allow(dead_code)]
+pub enum TimelineEvent {
+    #[serde(rename = "commit_plan")]
+    CommitPlan {
+        sha: String,
+        plan_touch: Option<String>,
+        has_code_changes: bool,
+    },
+    #[serde(rename = "commit_impl")]
+    CommitImpl {
+        sha: String,
+        plan_touch: Option<String>,
+        has_code_changes: bool,
+    },
+    #[serde(rename = "commit_mixed")]
+    CommitMixed {
+        sha: String,
+        plan_touch: Option<String>,
+        has_code_changes: bool,
+    },
+    #[serde(rename = "review")]
+    Review {
+        phase: String,
+        target: String,
+        author: String,
+        verdict: String,
+        #[serde(default)]
+        created_at: i64,
+    },
+    #[serde(rename = "held_feedback")]
+    HeldFeedback {
+        author: String,
+        reason: String,
+        #[serde(default)]
+        created_at: i64,
+    },
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)]
+pub struct SessionDetail {
+    pub repo: String,
+    pub session_id: String,
+    pub phase: String,
+    pub plan_path: String,
+    pub plan_worktree_status: String,
+    pub waiting_on: WaitingOn,
+    pub expected_action: String,
+    pub review_target: Option<ReviewTarget>,
+    pub review_gate: Option<ReviewGate>,
+    pub latest_plan_revision: Option<CommitRef>,
+    pub latest_implementation_revision: Option<CommitRef>,
+    #[serde(default)]
+    pub plan_revisions: Vec<String>,
+    #[serde(default)]
+    pub implementation_commits: Vec<String>,
+    #[serde(default)]
+    pub plan_feedback: Vec<FeedbackEntry>,
+    #[serde(default)]
+    pub impl_feedback: Vec<FeedbackEntry>,
+    #[serde(default)]
+    pub held_plan_feedback: Vec<HeldFeedbackEntry>,
+    #[serde(default)]
+    pub timeline: Vec<TimelineEvent>,
 }
 
 #[derive(Debug, Clone)]
@@ -52,6 +172,20 @@ pub async fn fetch_sessions() -> Result<Vec<SessionRow>, FetchError> {
         return Err(FetchError::Status(resp.status()));
     }
     resp.json::<Vec<SessionRow>>()
+        .await
+        .map_err(|e| FetchError::Decode(e.to_string()))
+}
+
+pub async fn fetch_session(session_id: String) -> Result<SessionDetail, FetchError> {
+    let url = format!("/api/sessions/{session_id}");
+    let resp = gloo_net::http::Request::get(&url)
+        .send()
+        .await
+        .map_err(|e| FetchError::Network(e.to_string()))?;
+    if !resp.ok() {
+        return Err(FetchError::Status(resp.status()));
+    }
+    resp.json::<SessionDetail>()
         .await
         .map_err(|e| FetchError::Decode(e.to_string()))
 }

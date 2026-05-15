@@ -34,9 +34,10 @@ pub fn router(state: AppState) -> Router {
     let frontend_dist = state.frontend_dist.clone();
     Router::new()
         .route("/healthz", get(healthz))
-        .route("/sessions/{session_id}", get(session_detail))
-        .route("/sessions/{session_id}/plan/{sha}", get(plan_revision_view))
-        .route("/sessions/{session_id}/commit/{sha}", get(commit_diff_view))
+        // Phase 2: the maud GET handlers for /sessions/:id, /plan/:sha,
+        // /commit/:sha are unregistered so refreshing those URLs falls
+        // through to the SPA shell. The handler functions are kept (with
+        // #[allow(dead_code)]) until Phase 5 deletes src/server/ui.rs.
         .route("/sessions/{session_id}/done", post(move_to_done))
         .route("/events", get(home_events_stream))
         .route("/sessions/{session_id}/events", get(session_events_stream))
@@ -102,7 +103,10 @@ struct RepoQuery {
     repo: Option<String>,
 }
 
-#[allow(dead_code)] // Phase 1 transition: SPA fallback supersedes the maud home; removed in Phase 5.
+// Phase 2 transition: the maud `/sessions/:id*` handlers are no longer
+// wired into the router (the SPA fallback owns those paths). They stay
+// behind `#[allow(dead_code)]` until Phase 5 deletes src/server/ui.rs.
+#[allow(dead_code)]
 async fn home(
     State(state): State<AppState>,
     Query(q): Query<RepoQuery>,
@@ -123,6 +127,7 @@ async fn home(
     Ok(Html(ui::home_page(&Value::Array(combined))))
 }
 
+#[allow(dead_code)]
 async fn session_detail(
     State(state): State<AppState>,
     Path(session_id): Path<String>,
@@ -242,6 +247,7 @@ async fn healthz() -> &'static str {
     "ok"
 }
 
+#[allow(dead_code)]
 async fn plan_revision_view(
     State(state): State<AppState>,
     Path((session_id, sha)): Path<(String, String)>,
@@ -274,6 +280,7 @@ async fn plan_revision_view(
     )))
 }
 
+#[allow(dead_code)]
 async fn commit_diff_view(
     State(state): State<AppState>,
     Path((session_id, sha)): Path<(String, String)>,

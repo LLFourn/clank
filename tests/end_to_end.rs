@@ -120,19 +120,26 @@ async fn home_renders_session_list() {
 
 #[tokio::test]
 async fn session_detail_renders() {
+    // Post-Leptos: /sessions/:id is owned by the SPA's client-side
+    // router (the server's fallback returns the empty shell). The
+    // session data comes from /api/sessions/:id.
     let dir = init_repo();
     write_file(dir.path(), ".trinity/plans/foo.md", "# foo\n");
     commit(dir.path(), "Add foo");
 
     let (url, handle) = spawn_daemon(dir.path()).await;
-    let body = reqwest::get(format!("{}/sessions/foo", url))
+    let body = reqwest::get(format!("{}/api/sessions/foo", url))
         .await
         .unwrap()
         .text()
         .await
         .unwrap();
     handle.abort();
-    assert!(body.contains("foo"), "session page should show id");
+    assert!(body.contains("\"foo\""), "session detail should include id");
+    assert!(
+        body.contains("\"timeline\""),
+        "session detail should carry timeline"
+    );
 }
 
 #[tokio::test]
@@ -281,7 +288,7 @@ async fn plan_revision_route_renders_blob() {
         .to_string();
 
     let body = client
-        .get(format!("{}/sessions/foo/plan/{}", url, sha))
+        .get(format!("{}/api/sessions/foo/plan/{}", url, sha))
         .send()
         .await
         .unwrap()
@@ -322,7 +329,7 @@ async fn commit_diff_route_renders_patch() {
         .to_string();
 
     let body = client
-        .get(format!("{}/sessions/foo/commit/{}", url, impl_sha))
+        .get(format!("{}/api/sessions/foo/commit/{}", url, impl_sha))
         .send()
         .await
         .unwrap()
@@ -536,9 +543,10 @@ async fn feedback_renders_on_session_page() {
         !pf.is_empty(),
         "plan_feedback should be populated; ctx: {ctx2}"
     );
-    // Then check that the session page renders it.
+    // Then check that the UI session endpoint exposes the feedback
+    // including the rendered body HTML.
     let body = client
-        .get(format!("{}/sessions/foo", url))
+        .get(format!("{}/api/sessions/foo", url))
         .send()
         .await
         .unwrap()
@@ -547,8 +555,12 @@ async fn feedback_renders_on_session_page() {
         .unwrap();
     handle.abort();
     assert!(
-        body.contains("APPROVE") && body.contains("alice"),
-        "session page should render feedback; got: {body}"
+        body.contains("\"alice\"") && body.contains("\"approve\""),
+        "session detail should include alice's APPROVE; got: {body}"
+    );
+    assert!(
+        body.contains("\"body_html\""),
+        "session detail should carry rendered feedback HTML; got: {body}"
     );
 }
 

@@ -1,4 +1,6 @@
 use leptos::prelude::*;
+use leptos_router::components::{Route, Router, Routes};
+use leptos_router::path;
 
 mod api;
 mod components;
@@ -10,5 +12,25 @@ fn main() {
 
 #[component]
 fn App() -> impl IntoView {
-    view! { <components::home::Home/> }
+    view! {
+        <Router>
+            <Routes fallback=NotFound>
+                <Route path=path!("/") view=components::home::Home/>
+                <Route
+                    path=path!("/sessions/:session_id")
+                    view=components::session_detail::SessionDetail
+                />
+            </Routes>
+        </Router>
+    }
+}
+
+#[component]
+fn NotFound() -> impl IntoView {
+    view! {
+        <h1>"Not found"</h1>
+        <p>
+            <a href="/">"← back to sessions"</a>
+        </p>
+    }
 }
