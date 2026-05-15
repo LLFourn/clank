@@ -12,8 +12,8 @@ The plan-record (`Plan` in memory, the markdown file on disk, `PlanId`
 on the wire) survives unchanged as the anchor — it groups a sequence
 of commits and stays the unit of identity. What goes away is the
 separate `plan_feedback` / `impl_feedback` maps, the separate
-`plan_gate` / `impl_gate` derivations, and the two parallel sets of
-`waiting_on` reasons that mirror each other.
+`plan_gate` / `impl_gate` derivations, the held-feedback queue, and
+the two parallel sets of `waiting_on` reasons that mirror each other.
 
 ## Problem
 
@@ -22,7 +22,7 @@ Trinity today encodes the plan/impl distinction in five places:
 1. **Storage.** `Plan` carries `plan_feedback: BTreeMap<…>` and
    `impl_feedback: BTreeMap<…>` as separate maps, keyed by `(CommitSha,
    AgentLabel)` but indexed by which subdirectory the file lived in.
-2. **Disk layout.** `.trinity/feedback/<slug>/{plan,impl}/<sha>/<author>.md`
+2. **Disk layout.** `.trinity/feedback/<stem>/{plan,impl}/<sha>/<author>.md`
    — the `plan`/`impl` segment exists only to tell the parser which
    map to insert into.
 3. **Projection.** `phase_for(plan_path, plan_key, attribution) →
@@ -36,12 +36,11 @@ Trinity today encodes the plan/impl distinction in five places:
    `PlanNeedsRereview` / `ImplNeedsRereview`,
    `AddressPlanRequestChanges` / `AddressImplRequestChanges`.
 
-Touch one piece of plan/impl semantics and you usually touch all five.
-A grep for the dichotomy returns 134 hits across `repo_state.rs`,
-`projection.rs`, `runtime.rs`, `ui_response.rs`, `mcp_response.rs`,
-`server/wait.rs`, the frontend store, and tests. Every new feature
-asks "which side is this?" — for no reason that the storage model
-captures intrinsically.
+A grep for the dichotomy (`plan_feedback|impl_feedback|FeedbackPhase|ReviewPhase|Phase::`)
+returns >150 hits across `repo_state.rs`, `projection.rs`,
+`runtime.rs`, `ui_response.rs`, `mcp_response.rs`, `server/wait.rs`,
+the frontend store, and tests. Every new feature asks "which side is
+this?" — for no reason that the storage model captures intrinsically.
 
 The dichotomy is a label, not a structural fact. A commit either
 touches the plan file, touches code, or both. That's what `git_io`
@@ -51,7 +50,7 @@ weaker version of it ("plan phase" vs "impl phase") on every read.
 
 ## Target Model
 
-A plan is a record. The plan file at `.trinity/plans/<slug>.md` and
+A plan is a record. The plan file at `.trinity/plans/<stem>.md` and
 the move to `done/` stay the lifecycle anchors. Within a plan's
 history, every commit gets a derived `commit_kind`:
 
@@ -65,7 +64,7 @@ history, every commit gets a derived `commit_kind`:
 Feedback lives at one path:
 
 ```
-.trinity/feedback/<slug>/commits/<sha>/<author>.md
+.trinity/feedback/<stem>/commits/<sha>/<author>.md
 ```
 
 The first line is still `APPROVE` or `REQUEST_CHANGES`. The target
@@ -75,46 +74,78 @@ plan/impl hint.
 Per-commit review gate:
 
 - `changes_requested` — any current feedback for this SHA opens with
-  `REQUEST_CHANGES`, OR any current feedback is ambiguous/unmarked,
-  OR any plan-wide participant has not responded to this SHA yet.
+  `REQUEST_CHANGES`, OR any current feedback is ambiguous/unmarked.
 - `approved` — every plan-wide participant has responded to this SHA,
   zero responses are `REQUEST_CHANGES` or ambiguous/unmarked, and at
   least one reviewer has responded with `APPROVE`.
-- `unreviewed` — no reviewer has responded to this SHA yet.
+- `unreviewed` — no reviewer has responded to this SHA yet, OR at
+  least one plan-wide participant is missing on this SHA (re-review
+  pending).
 
-Plan-wide participants are cumulative: any agent who has left feedback
-on any earlier or current commit in this plan's history is part of the
-participant set for later commit gates. That is the important behavior
-change from today's phase-split model: a reviewer who participated in
-plan review is still expected to respond when the next code commit
-lands. "Plan reviewer" and "implementation reviewer" are display
-labels only; participation is attached to the plan's commit stream.
+### Cumulative-participant rule
 
-Session-level "what next" is a fold over commits walked newest-first:
+The plan-wide participant set is **cumulative**: any agent who has
+left feedback on any earlier commit in this plan's history is part of
+the participant set for every later commit's gate. That is the
+important behavior change from today's phase-split model: a reviewer
+who participated in plan review is still expected to respond when the
+next code commit lands. "Plan reviewer" and "implementation reviewer"
+are display labels only.
 
-- Latest commit is `unreviewed` → reviewers' turn.
-- Latest commit is `changes_requested` → master's turn (address).
-- Latest commit is `approved` and `code_only`/`mixed` → master's turn
-  (continue, or finish by `done_move`).
-- Latest commit is `approved` and `plan_only` → master's turn (start
-  implementation OR move to done if the plan is now done-shaped).
-- Plan file under `done/` and the move commit is approved → terminal.
+Worked example:
 
-That's the entire decision matrix. No "phase" enum. No `Plan.phase`.
+```
+commit A  plan_only   ← codex APPROVE
+commit B  code_only   ← alice REQUEST_CHANGES
+commit C  code_only   ← alice APPROVE       (codex hasn't voted on C)
+   → gate(C): participants = {codex, alice}, approvers = {alice},
+              missing = {codex}, state = Unreviewed
+              waiting_on = reviewers (codex)
+```
+
+Later when codex APPROVEs C:
+
+```
+   → gate(C): approvers = {alice, codex}, missing = {}, state = Approved
+              waiting_on = master (ReadyToMoveForward, kind = code_only)
+```
+
+### Session-level `waiting_on`
+
+Walk `commit_order` newest-first and pick the first commit whose kind
+is relevant to this plan (`plan_only` | `code_only` | `mixed` |
+`done_move`; skip `multi_plan` and `unattributed`). Branch on that
+commit's gate state and kind:
+
+- gate is `unreviewed` (target ≠ `done_move`) → reviewers' turn.
+- gate is `changes_requested` (target ≠ `done_move`) → master's turn (address).
+- gate is `approved` and kind ∈ {`plan_only`, `code_only`, `mixed`} → master's turn (`ReadyToMoveForward`).
+- target is `done_move` → `SessionDone` (terminal; `done_move`
+  does not require a review gate — it's master-only post-approval
+  bookkeeping).
+- Plan-file under `done/` and `done_move` commit observed → `SessionDone`.
+
+That's the entire decision matrix. No `Phase` enum. No `Plan.phase`.
 The UI can still display chips ("Plan", "Code", "Mixed") computed
 from `commit_kind`; agents still get prompt hints scoped to the
 commit kind. None of it is in the storage model.
+
+### Worktree-status preemption
+
+`PlanWorktreeStatus::{Clean, BodyDirty, DoneMovePending,
+MissingActivePlanFile}` survives unchanged. It always preempts
+gate-driven reasons (today and in the new model). The worktree
+states are "the operator has uncommitted intent" — orthogonal to
+review gates.
 
 ## Goals
 
 1. One feedback path per commit; no `plan/` vs `impl/` directories.
 2. One `Plan.commits: BTreeMap<CommitSha, CommitGate>` map; no
    `plan_feedback` / `impl_feedback` split.
-3. One `WaitingReason` set keyed on `(commit_kind, gate_state)`
-   instead of two mirrored sets.
-4. MCP `wait_for_work` returns `{plan_id, target_sha, commit_kind,
-   work, prompt_hint, locations}` for every review and address-action
-   case.
+3. `WaitingReason` enum collapsed (see table below).
+4. `wait_for_work` returns `{plan_id, target_sha, commit_kind,
+   work, prompt_hint, locations}` for every review and address case.
 5. Agent prompt distinctions preserved: a `plan_only` commit prompts
    "review the approach"; a `code_only` commit prompts "review the
    diff."
@@ -128,7 +159,8 @@ commit kind. None of it is in the storage model.
   stays exactly as it is. `Plan.state` (active/done) stays.
 - **Multi-plan workflows.** `multi_plan` commits get classified so
   the timeline can show them, but no new orchestration is added for
-  cross-plan reviews.
+  cross-plan reviews — they don't drive `waiting_on` or generate
+  review work.
 - **Backwards compatibility for old feedback files.** This is a
   one-shot cutover; pre-migration files in `plan/` and `impl/`
   subdirectories are ignored. Trinity-on-trinity historical reviews
@@ -157,9 +189,15 @@ pub enum CommitKind {
 }
 ```
 
-Stored on `AttributionResult::Attributed { kind: CommitKind, … }`
-(the existing `plan_touch` and `has_code_changes` fields collapse
-into `kind` since the kind subsumes them).
+`AttributionResult::Attributed` carries `kind: CommitKind` (the
+existing `plan_touch` and `has_code_changes` fields can stay on
+the type for legibility OR collapse into `kind` — caller's choice
+at impl time; either is fine since `kind` is derived from them).
+
+Commits that only mutate `.trinity/feedback/` files (i.e. review
+writes) classify as `unattributed` — they're a side-effect of the
+review pipeline, not work to be reviewed. Same rule applies to
+edits under `.trinity/cache/`.
 
 ### `CommitGate`
 
@@ -167,12 +205,12 @@ Per-commit folded review state:
 
 ```rust
 pub struct CommitGate {
-    pub state: CommitGateState,           // Unreviewed/Approved/ChangesRequested
-    pub participants: Vec<AgentLabel>,
-    pub approvers: Vec<AgentLabel>,
-    pub requesters: Vec<AgentLabel>,
-    pub ambiguous: Vec<AgentLabel>,
-    pub missing: Vec<AgentLabel>,
+    pub state: CommitGateState,           // Unreviewed | Approved | ChangesRequested
+    pub participants: Vec<AgentLabel>,    // cumulative across plan history
+    pub approvers: Vec<AgentLabel>,       // on this SHA
+    pub requesters: Vec<AgentLabel>,      // on this SHA
+    pub ambiguous: Vec<AgentLabel>,       // on this SHA, Unmarked verdict
+    pub missing: Vec<AgentLabel>,         // participant set minus responders
     pub feedback: BTreeMap<AgentLabel, Feedback>,
 }
 ```
@@ -182,30 +220,40 @@ pub struct CommitGate {
 existing `commit_order: Vec<CommitSha>` field on `RepoState` keeps
 chronological order.
 
-`CommitGate` is derived with a cumulative participant fold over
+`CommitGate` is derived with a cumulative-participant fold over
 `commit_order`: before evaluating a target commit, collect every
 agent who has left feedback on any earlier commit for the plan, then
-include any agents who responded on the target commit itself. The
-target commit is ready only when that full set has non-ambiguous,
-non-request-changes feedback on the target.
+union with agents who responded on the target commit itself. The
+target commit is `Approved` only when that full set has non-ambiguous,
+non-request-changes feedback on the target AND at least one of those
+votes is `APPROVE`.
+
+Only commits relevant to this plan get a `CommitGate` entry —
+`MultiPlan` and `Unattributed` are not added to `Plan.commits`.
+`DoneMove` gets a `CommitGate` entry only for timeline rendering;
+its gate state is forced to `Approved` so the readiness rule above
+still flows it to `SessionDone` without requiring a review.
 
 ### Feedback path parsing
 
-`.trinity/feedback/<slug>/commits/<sha>/<author>.md`. The
+`.trinity/feedback/<stem>/commits/<sha>/<author>.md`. The
 `parse_feedback_path` function loses its `FeedbackPhase` branch and
 returns `FeedbackPath { plan_key, target_sha, author }` (no phase).
-Held feedback (today's `held_plan_feedback`) goes away as a separate
-concept — a feedback file written before the target commit exists is
-just an unmatched SHA; we keep it under `commits/<sha>/` and the
-gate becomes `Unreviewed` once the commit lands. No queue, no
-re-write.
 
-Actually: with SHA-targeted writes there's nothing to "hold" — the
-author either knows the SHA they're reviewing (and writes the file)
-or doesn't (and shouldn't be writing feedback). Today's held-feedback
-mechanism exists because reviewers could drop a plan review before
-the plan was committed; in the commit-centric model the plan
-necessarily already has a SHA before any review can target it.
+Held feedback (today's `held_plan_feedback`) goes away as a separate
+concept. Today reviewers could drop a flat-drop file before a target
+SHA existed (e.g. while the plan-body was dirty) and the runtime held
+it until the revision committed, then renamed it under `<sha>/`. In
+the commit-centric model the plan necessarily already has a SHA
+before any review can target it — `wait_for_work` always returns a
+SHA, and a flat-drop file with no SHA in its path is now just a
+malformed feedback file that the parser rejects.
+
+The watcher's auto-organize sweep in `runtime.rs` (currently
+~line 487, draining `held_plan_feedback` after a plan revision
+commits) is deleted outright. The `HeldFeedback` struct, the
+`held_plan_feedback` field on `Plan`, the timeline's `HeldFeedback`
+event, and the corresponding watcher branches all go away.
 
 ### Projection collapse
 
@@ -219,33 +267,67 @@ fn waiting_on(commits: &BTreeMap<CommitSha, CommitGate>,
 
 Worktree-status preempts as today (`BodyDirty` → commit plan
 revision; `DoneMovePending` → commit done move; etc.). Then walk
-`commit_order` newest-first for the first commit whose kind is
-relevant to this plan and return based on its `CommitGate`.
+`commit_order` newest-first and return based on the latest relevant
+commit's `CommitGate`.
 
 ### `WaitingReason` collapse
 
-Twelve → six:
+Twelve → seven:
 
-| Old (plan/impl pair)                                                    | New                          |
+| Old                                                                      | New                          |
 |--------------------------------------------------------------------------|------------------------------|
 | `PlanNeedsInitialReview` / `ImplNeedsInitialReview`                      | `CommitNeedsReview`          |
-| `PlanNeedsRereview` / `ImplNeedsRereview`                                | (same — re-review is the same gate state with prior participants) |
+| `PlanNeedsRereview` / `ImplNeedsRereview`                                | `CommitNeedsReview` (same — re-review is the same gate state with more participants) |
 | `AddressPlanRequestChanges` / `AddressImplRequestChanges`                | `AddressCommitChanges`       |
-| `ReadyToImplement`                                                       | (drop — implied by approved `plan_only` + master's choice to start coding) |
-| `ReadyToFinish`                                                          | `ReadyToMoveToDone`          |
-| `CommitPlanRevision` / `CommitDoneMove` / `RestoreOrCommitDoneMove`      | (unchanged — worktree-status driven) |
+| `ReadyToImplement` / `ReadyToFinish`                                     | `ReadyToMoveForward` (description prose disambiguates by `commit_kind`) |
+| `CommitPlanRevision`                                                     | (unchanged — worktree-status driven) |
+| `CommitDoneMove`                                                         | (unchanged — worktree-status driven) |
+| `RestoreOrCommitDoneMove`                                                | (unchanged — worktree-status driven) |
 | `SessionDone`                                                            | (unchanged)                  |
 
-`waiting_on.description` continues to disambiguate via the
-commit_kind in its prose (e.g. "Plan revision awaiting review from
-codex." vs "Implementation commit awaiting review from codex." — same
-underlying reason, different rendered text).
+Final variants: `SessionDone`, `CommitDoneMove`,
+`RestoreOrCommitDoneMove`, `CommitPlanRevision`,
+`AddressCommitChanges`, `ReadyToMoveForward`, `CommitNeedsReview`.
+
+`description_for(role, reason, agents, commit_kind)` continues to
+disambiguate via the commit_kind in its prose (e.g. "Plan revision
+awaiting review from codex." vs "Implementation commit awaiting
+review from codex." — same underlying reason, different rendered
+text). `commit_kind` becomes a new parameter to `description_for`.
+
+`expected_action` map collapses correspondingly:
+
+```rust
+SessionDone => "none",
+CommitDoneMove => "commit_done_move",
+RestoreOrCommitDoneMove => "restore_or_commit_done_move",
+CommitPlanRevision => "commit_plan_revision",
+AddressCommitChanges => "address_commit_changes",
+ReadyToMoveForward => "move_forward",
+CommitNeedsReview => "review_commit",
+```
+
+### `wait_for_work` cutover
+
+`wait.rs::compute_match` collapses: today it picks plan_gate or
+impl_gate based on session_phase. New model picks the latest
+relevant commit's gate directly. `caller_already_voted` becomes a
+single lookup into `commits[latest_relevant].approvers ∪
+requesters` instead of the two-arm phase switch.
+
+`derive_locations` collapses similarly:
+- `CommitNeedsReview` → `[commits/<sha>/<author>.md]` (one path)
+- `AddressCommitChanges` → `[every RC feedback file for <sha>]`
+  plus the plan file if `commit_kind` ∈ `{plan_only, mixed}`
+  (because addressing plan-side RCs means revising the plan file)
+- `ReadyToMoveForward` → `[<plan file>]`
+- worktree-status variants → `[<plan file>]` (unchanged)
+- `SessionDone` → `[]`
 
 ### MCP wire shape
 
 `wait_for_work` response gains `target_sha`, `commit_kind`, and
-`prompt_hint`; the `locations` field still resolves to writeable
-paths but always under `commits/<sha>/`:
+`prompt_hint`:
 
 ```json
 {
@@ -261,158 +343,180 @@ paths but always under `commits/<sha>/`:
 
 `get_context` returns `commits: [{sha, kind, gate, feedback[]}]` in
 chronological order, plus `latest_relevant_commit` to point at the
-one drives `waiting_on`. The old `plan_feedback` / `impl_feedback`
+one that drives `waiting_on`. The old `plan_feedback` / `impl_feedback`
 arrays are gone.
 
 ### HTTP / SPA
 
 - `/api/plan/{repo}/{stem_md}` returns the new shape (one
-  `commits[]`, no `plan_feedback`/`impl_feedback`).
+  `commits[]`, no `plan_feedback`/`impl_feedback`/`held_plan_feedback`).
 - Revision route and commit-diff route are unchanged structurally
   — they're already commit-SHA-addressed.
 - Frontend timeline already renders commits + reviews in order;
-  the change is just consuming the unified shape and rendering
-  chips by `commit_kind`.
+  the wire change is: `TimelineEvent::Review` loses its `phase` field
+  (the phase concept is dead); chips render on the commit row, not
+  the review row.
+- `TimelineEvent::HeldFeedback` variant is deleted.
+- Frontend store gains a per-commit-kind chip palette; existing
+  `timeline-commit-plan`/`timeline-commit-impl`/`timeline-commit-mixed`
+  CSS classes survive, plus a new `timeline-commit-done-move` for the
+  `done_move` variant.
 
 ### Readiness rule edge cases
 
-The stub asks "should `plan_only` approvals be interpreted as
-'ready to implement' automatically?" The answer in this plan: no.
-After a `plan_only` commit is approved, the master is `ReadyToFinish
-| StartImplementation`-style state; making the first `code_only` /
-`mixed` commit is their next action. There's no explicit "start
-implementing" event — the act of committing code IS the event.
+After a `plan_only` commit is approved, the master is in
+`ReadyToMoveForward` (description: "Plan approved — start
+implementation, revise further, or move to done."). There's no
+explicit "start implementing" event — the act of committing code IS
+the event.
 
 What about code commits that land before any plan commit is approved?
-Today that's blocked by the impl gate being unable to fire until
-plan_intro exists with attribution. In the new model:
+Today that's not strictly enforced (the `phase` derivation flips to
+Implementing once any code commit lands regardless of plan-approval),
+but the workflow customarily blocks until plan approval. In the new
+model:
 
-- If a `code_only` commit lands while the only previous commit was
-  an unreviewed `plan_only`, the latest relevant commit is the
-  `code_only` — gate `Unreviewed`. Reviewers see it as work; the
-  prompt_hint says "this commit is implementation work on an
-  unreviewed plan" so reviewers can choose to defer or push back.
+- If a `code_only` commit lands while the latest plan commit was
+  unreviewed, the latest relevant commit is the `code_only` — gate
+  `Unreviewed`. Reviewers see it as work; the prompt_hint says "this
+  commit is implementation work on a plan that hasn't been approved
+  yet" so reviewers can choose to defer or push back.
+- A reviewer who wants to push back via "the plan itself isn't
+  approved yet" leaves `REQUEST_CHANGES` on the code commit with
+  prose, OR retroactively votes on the earlier `plan_only` commit.
+  Both are valid; the gate recomputes on either signal.
 - This is looser than today's "plan must be approved first" implicit
   gate. The trade-off is honest: Trinity stops enforcing workflow and
   surfaces it instead. Tighter enforcement can be added later as a
   separate `wait_for_work` policy flag, not a storage axis.
 
-### Worktree-status preemption
-
-`PlanWorktreeStatus::{Clean, BodyDirty, DoneMovePending,
-MissingActivePlanFile}` survives unchanged. It always preempts
-gate-driven reasons (today and in the new model). The worktree
-states are "the operator has uncommitted intent" — orthogonal to
-review gates.
-
 ## Phases
 
-Three phases, each independently shippable. Phase 1 lays the
-groundwork without changing the wire; phase 2 cuts the daemon over;
-phase 3 retires the dead paths.
+Two phases. Phase 1 lands a pure typed refactor with no disk-format
+or wire change; phase 2 cuts disk + wire + retires the dead code in
+one shot. We do not implement a read-old/write-new bridge because
+"we don't care about backwards compat" — operators with pre-cut
+disk state lose the historical reviews but keep their plans and
+commits.
 
-### Phase 1 — Internal classification + dual-write
+### Phase 1 — Internal `commit_kind` + `CommitGate` (additive)
 
-Files: `src/repo_state.rs`, `src/disk_snapshot.rs`, `src/attribution.rs`,
-`src/git_io.rs`, `src/projection.rs`, `src/runtime.rs`.
+Files: `src/repo_state.rs`, `src/git_io.rs` (or `attribution.rs` if
+present), `src/disk_snapshot.rs`, `src/projection.rs`.
 
-Add `CommitKind` enum and `CommitGate` struct. Populate
-`Plan.commits` alongside `plan_feedback` / `impl_feedback` during
-rebuild — both views derive from the same disk feedback files. The
-new `commits` map is keyed on every commit with attribution to this
-plan (whether or not feedback exists).
+- Add `CommitKind` enum + classifier function (pure, over
+  `(plan_touches[sha], attribution[sha])`).
+- Add `CommitGate` struct + `commits: BTreeMap<CommitSha, CommitGate>`
+  field on `PlanSnapshot` / `Plan`. Populate it from the **existing**
+  `plan_feedback` / `impl_feedback` maps (union, keyed by SHA) plus
+  the cumulative-participant fold.
+- Add `commit_kind_for(sha, plan_key, plan_touches, attribution) →
+  CommitKind` for use by the future projection.
+- Disk paths unchanged. Wire unchanged. Frontend untouched.
+- Tests for `CommitKind` classification of every variant and for
+  the cumulative-participant `CommitGate` fold.
 
-Read the new commit-keyed feedback path (`commits/<sha>/<author>.md`)
-in addition to the legacy `plan/<sha>/` and `impl/<sha>/` paths. The
-file watcher learns the new pattern. Feedback writes from
-`wait_for_work`'s `locations` still go to the legacy paths (no
-behavior change to callers yet).
+After phase 1, `Plan.commits` is the same information that
+`plan_feedback ∪ impl_feedback` represented, but reshaped per-commit
+with the new gate fold. Nothing reads it yet at runtime. This phase
+is a no-op for callers and exists to land the types and the gate
+algorithm in isolation so they can be tested without touching the
+hot path.
 
-No wire change in this phase. Frontend untouched. Tests for the new
-classifier added but the old tests stay green.
+### Phase 2 — Cutover (disk + wire + retire)
 
-### Phase 2 — Daemon cutover
+Files: `src/disk_format.rs`, `src/runtime.rs`, `src/server/wait.rs`,
+`src/server/mcp.rs`, `src/server/http.rs`, `src/tools.rs`,
+`src/mcp_response.rs`, `src/ui_response.rs`, `src/repo_state.rs`,
+`src/projection.rs`, `frontend/src/api.rs`, `frontend/src/store.rs`,
+`frontend/src/components/*.rs`, `tests/end_to_end.rs`.
 
-Files: `src/server/wait.rs`, `src/server/mcp.rs`, `src/server/http.rs`,
-`src/tools.rs`, `src/mcp_response.rs`, `src/ui_response.rs`,
-`frontend/src/api.rs`, `frontend/src/store.rs`,
-`frontend/src/components/*.rs`.
+In one phase:
 
-Switch all reads and writes to `commits/<sha>/`. Update tool
-descriptions and `wait_for_work` response shape. Update
-`get_context` / `plan_detail` JSON. Frontend consumes new shape.
+- `parse_feedback_path` reads only `<stem>/commits/<sha>/<author>.md`.
+  `FeedbackPhase` enum is deleted.
+- `Plan.plan_feedback` and `Plan.impl_feedback` are deleted;
+  `Plan.commits` is now the authoritative storage.
+- `Plan.held_plan_feedback`, the `HeldFeedback` struct, and the
+  watcher's auto-organize sweep are deleted.
+- `Phase` enum and `phase_for` are deleted. `ReviewPhase` is deleted.
+- `WaitingReason` collapses per the table above (twelve → seven).
+- `plan_gate_for` / `impl_gate_for` are deleted; replaced by a
+  single `latest_relevant_commit_gate(plan, state) → Option<&CommitGate>`.
+- `wait_for_work` response shape updated: `target_sha`,
+  `commit_kind`, `prompt_hint` added; `work` vocabulary updated.
+- `get_context` / `plan_detail` JSON returns `commits[]` instead of
+  split `plan_feedback` / `impl_feedback` / `held_plan_feedback`.
+- Frontend consumes new shape: `TimelineEvent::Review.phase` field
+  removed; chip-rendering moves to the commit row.
+- All tests that asserted on `plan_feedback` / `impl_feedback` /
+  `held_plan_feedback` JSON are rewritten against `commits[]`.
 
-`WaitingReason` enum trimmed per the table above. `expected_action`
-mapping updated.
-
-Legacy feedback paths are still parsed at startup so that on-disk
-data from before the cut still informs gate state — but new writes
-go only to the new path. This is the read-old / write-new bridge,
-not backwards compatibility (no callers can write to the old path).
-
-### Phase 3 — Retire phase code
-
-- Drop `plan_feedback` / `impl_feedback` from `Plan`; replace with
-  the now-populated `commits` map.
-- Drop `Phase` enum and `phase_for`. Anywhere that displayed phase
-  (UI chips, MCP response) reads from `commit_kind` of the latest
-  relevant commit.
-- Drop legacy feedback-path parsing (the `FeedbackPhase` enum, the
-  `plan` / `impl` segments in `parse_feedback_path`).
-- Drop `held_plan_feedback` and the normalization sweep that
-  rewrites flat-drop reviews.
-- Drop the six mirror `WaitingReason` variants and `plan_gate_for` /
-  `impl_gate_for`.
-- Sweep tests; rewrite anything still asserting on `plan_feedback` /
-  `impl_feedback` to use `commits[sha].feedback`.
+The cutover is one phase deliberately. The "land cutover in green,
+then retire in a separate PR" pattern would require keeping
+`plan_feedback` / `impl_feedback` alive through the cutover — which
+just doubles the work because nothing reads them after the cutover
+finishes. Skip the half-step.
 
 ## Acceptance Criteria
 
-1. `grep -rn "plan_feedback\|impl_feedback" src/ frontend/` is empty
-   outside `tests/` (and ideally there too).
-2. `find .trinity -path '*/plan/*' -o -path '*/impl/*'` finds no
+1. `grep -rn "plan_feedback\|impl_feedback\|FeedbackPhase\|ReviewPhase\|held_plan_feedback" src/ frontend/`
+   returns zero hits (test fixtures excluded).
+2. `Phase` enum and `phase_for` deleted from `repo_state.rs` and
+   `projection.rs`.
+3. `WaitingReason` enum has seven variants
+   (`SessionDone`, `CommitDoneMove`, `RestoreOrCommitDoneMove`,
+   `CommitPlanRevision`, `AddressCommitChanges`, `ReadyToMoveForward`,
+   `CommitNeedsReview`).
+4. `find .trinity -path '*/plan/*' -o -path '*/impl/*'` finds no
    live-traffic feedback files; only the `commits/<sha>/` layout is
    used.
-3. `Phase` enum removed; `phase_for` removed.
-4. `WaitingReason` enum has six variants (down from twelve).
 5. `wait_for_work` returns `commit_kind` + `prompt_hint` on every
    work response.
 6. `get_context` returns `commits[]` (with per-commit gate +
    feedback) instead of split `plan_feedback` / `impl_feedback`.
 7. Frontend timeline renders the same UX as today: commit rows with
    plan/code/mixed/done labels, feedback cards under each commit.
-8. Tests cover: `commit_kind` classification of every variant; gate
-   roll-up with cumulative plan-wide participants; ambiguous/unmarked
-   feedback blocking readiness like `REQUEST_CHANGES`; readiness rule
-   walking newest-first; `wait_for_work` prompt-hint shape for each
-   kind; collapsed-`WaitingReason` coverage.
-9. End-to-end test: start_plan → commit plan-only → review APPROVE
+   Chip-rendering happens on the commit row only; review rows carry
+   no phase indicator.
+8. Tests cover:
+   - `commit_kind` classification of every variant
+     (`plan_only`, `code_only`, `mixed`, `done_move`, `multi_plan`,
+     `unattributed`, plus the `.trinity/feedback`-only edge case);
+   - cumulative-participant gate fold (the worked example above
+     plus its `REQUEST_CHANGES` and `Unmarked` permutations);
+   - readiness rule walking newest-first, skipping `multi_plan` and
+     `unattributed`;
+   - `wait_for_work` prompt-hint shape for each kind;
+   - `done_move` short-circuits to `SessionDone` without a review gate;
+   - collapsed `WaitingReason` coverage.
+9. End-to-end test: `start_plan → commit plan-only → review APPROVE
    → commit code → review REQUEST_CHANGES → commit fix → review
-   APPROVE → done-move → committed; assert `waiting_on` transitions
-   match the new readiness rule at each step.
+   APPROVE → done-move → committed`. Assert `waiting_on` transitions
+   match the new readiness rule at each step. Add a cumulative-
+   participant variant: a second reviewer joins at the second
+   `code_only` commit and is then expected on subsequent commits.
 
-## Open Questions
+## Decisions (resolved open questions)
 
-- **Started but unfinished plan reviews.** If a user opens
-  `wait_for_work` as reviewer, sees a `code_only` commit on an
-  unreviewed plan, and wants to push back via "the plan itself isn't
-  approved yet" — what's the affordance? A `REQUEST_CHANGES` on the
-  code commit with prose? Or a backfill `APPROVE`/`REQUEST_CHANGES`
-  on the earlier `plan_only` commit, expecting the daemon to
-  recompute? I lean toward the latter — the gate is per-commit, so
-  reviews can target any SHA in the plan's history.
-- **`multi_plan` commits.** Cross-plan commits exist today (one
-  commit touching multiple plan files). The stub says "classify
-  them"; the question is whether `wait_for_work` should surface
-  them as a single piece of work per plan (one review file per plan)
-  or once collectively. Defer: classify them, render in each plan's
-  timeline, but don't generate review work for them automatically —
-  the operator manually triggers a multi-plan review if they want
-  one.
-- **Whether `plan_only` and `code_only` interleaving needs ordering
-  enforcement.** Today the implicit rule is "plan approved before
-  impl begins." The new model surfaces violations as "reviewer was
-  asked about an impl commit before the plan was approved" but
-  doesn't block them. Is "looser by default, opt-in stricter via a
-  per-plan policy flag" the right call? I'd say yes — the
-  enforcement was always advisory in practice.
+- **Started but unfinished plan reviews.** A reviewer who wants to
+  push back on "the plan itself isn't approved yet" can either
+  `REQUEST_CHANGES` on the code commit (with prose explaining the
+  reason) or retroactively vote on the earlier `plan_only` commit.
+  Both are valid; the gate is per-commit so backfill votes recompute
+  naturally.
+- **`multi_plan` commits.** Classified for timeline rendering but
+  never drive `waiting_on` or generate `wait_for_work` items. They
+  appear as a special row in each affected plan's timeline ("touched
+  multiple plans — review the diff if relevant"). No per-plan review
+  files are auto-generated. If an operator wants a multi-plan review,
+  they manually drop feedback at `commits/<sha>/<author>.md` under
+  one or more plans.
+- **Ordering enforcement.** Looser by default. The new model surfaces
+  "code commit before plan approval" via prompt-hint prose but does
+  not block it. Tighter enforcement can be added later as a per-plan
+  policy flag, not a storage axis.
+- **`done_move` review.** Not required. The act of moving the plan
+  file into `done/` is master-only post-approval bookkeeping; once
+  the latest non-`done_move` relevant commit is approved, the
+  `done_move` commit short-circuits to `SessionDone`.
