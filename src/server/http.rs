@@ -81,15 +81,14 @@ async fn api_wait_for_work(
         .await
         .map_err(|e| match e {
             WaitError::InvalidRole(_)
-            | WaitError::MissingPlanPath
+            | WaitError::MissingPlanId
             | WaitError::MissingAuthorLabel
-            | WaitError::MissingRepo
-            | WaitError::InvalidPlanPath(_) => AppError {
+            | WaitError::InvalidPlanId(_) => AppError {
                 status: StatusCode::BAD_REQUEST,
                 msg: e.to_string(),
             },
-            WaitError::UnknownPlan(_)
-            | WaitError::PlanPathMismatch { .. }
+            WaitError::UnknownRepo(_)
+            | WaitError::UnknownPlan(_)
             | WaitError::PlanConflict { .. } => AppError::not_found(e.to_string()),
             WaitError::Io(err) => AppError::io(err),
         })?;
@@ -629,15 +628,20 @@ mod wire_tests {
         String::from_utf8(bytes.to_vec()).unwrap()
     }
 
+    /// `<basename>/<slug>.md` derived from the tempdir.
+    fn plan_id_for(dir: &tempfile::TempDir, slug: &str) -> String {
+        let basename = dir.path().file_name().unwrap().to_str().unwrap();
+        format!("{basename}/{slug}.md")
+    }
+
     #[tokio::test]
     async fn http_returns_work_for_immediate_match() {
         let dir = init_repo();
         let app = router_with_repo(&dir).await;
         let body = json!({
             "role": "reviewers",
-            "plan_path": ".trinity/plans/foo.md",
+            "plan_id": plan_id_for(&dir, "foo"),
             "author_label": "codex",
-            "repo": dir.path().to_string_lossy(),
             "timeout_secs": 1,
         });
         let req = Request::builder()
@@ -662,9 +666,8 @@ mod wire_tests {
         // Polling master while only reviewers have work → timeout.
         let body = json!({
             "role": "master",
-            "plan_path": ".trinity/plans/foo.md",
+            "plan_id": plan_id_for(&dir, "foo"),
             "author_label": "lloyd",
-            "repo": dir.path().to_string_lossy(),
             "timeout_secs": 1,
         });
         let req = Request::builder()
@@ -687,9 +690,8 @@ mod wire_tests {
         let app = router_with_repo(&dir).await;
         let body = json!({
             "role": "reviewer",
-            "plan_path": ".trinity/plans/foo.md",
+            "plan_id": plan_id_for(&dir, "foo"),
             "author_label": "codex",
-            "repo": dir.path().to_string_lossy(),
             "timeout_secs": 1,
         });
         let req = Request::builder()
@@ -705,12 +707,15 @@ mod wire_tests {
     }
 
     #[tokio::test]
-    async fn http_400_on_missing_repo() {
+    async fn http_404_on_unknown_repo() {
         let dir = init_repo();
         let app = router_with_repo(&dir).await;
+        // Repo basename `no-such-repo` isn't watched — daemon returns
+        // 404 unknown_repo. (Replaces the previous missing-repo test;
+        // `repo` is no longer a separate field, it lives inside `plan_id`.)
         let body = json!({
             "role": "reviewers",
-            "plan_path": ".trinity/plans/foo.md",
+            "plan_id": "no-such-repo/foo.md",
             "author_label": "codex",
             "timeout_secs": 1,
         });
@@ -721,7 +726,7 @@ mod wire_tests {
             .body(Body::from(body.to_string()))
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]
@@ -730,8 +735,7 @@ mod wire_tests {
         let app = router_with_repo(&dir).await;
         let body = json!({
             "role": "reviewers",
-            "plan_path": ".trinity/plans/foo.md",
-            "repo": dir.path().to_string_lossy(),
+            "plan_id": plan_id_for(&dir, "foo"),
             "timeout_secs": 1,
         });
         let req = Request::builder()
@@ -750,9 +754,8 @@ mod wire_tests {
         let app = router_with_repo(&dir).await;
         let body = json!({
             "role": "reviewers",
-            "plan_path": ".trinity/plans/does-not-exist.md",
+            "plan_id": plan_id_for(&dir, "does-not-exist"),
             "author_label": "codex",
-            "repo": dir.path().to_string_lossy(),
             "timeout_secs": 1,
         });
         let req = Request::builder()
@@ -774,9 +777,8 @@ mod wire_tests {
             "tool": "wait_for_work",
             "arguments": {
                 "role": "reviewers",
-                "plan_path": ".trinity/plans/foo.md",
+                "plan_id": plan_id_for(&dir, "foo"),
                 "author_label": "codex",
-                "repo": dir.path().to_string_lossy(),
                 "timeout_secs": 1,
             },
         });
@@ -803,7 +805,7 @@ mod wire_tests {
             "tool": "wait_for_work",
             "arguments": {
                 "role": "reviewers",
-                "plan_path": ".trinity/plans/foo.md",
+                "plan_id": plan_id_for(&dir, "foo"),
                 "author_label": "codex",
                 "timeout_secs": 1,
             },
@@ -829,7 +831,7 @@ mod wire_tests {
             "tool": "wait_for_work",
             "arguments": {
                 "role": "reviewer",
-                "plan_path": ".trinity/plans/foo.md",
+                "plan_id": plan_id_for(&dir, "foo"),
                 "author_label": "codex",
                 "timeout_secs": 1,
             },
@@ -856,7 +858,7 @@ mod wire_tests {
             "tool": "wait_for_work",
             "arguments": {
                 "role": "reviewers",
-                "plan_path": ".trinity/plans/foo.md",
+                "plan_id": plan_id_for(&dir, "foo"),
                 "timeout_secs": 1,
             },
         });
@@ -884,7 +886,7 @@ mod wire_tests {
             "tool": "wait_for_work",
             "arguments": {
                 "role": "master",
-                "plan_path": ".trinity/plans/foo.md",
+                "plan_id": plan_id_for(&dir, "foo"),
                 "author_label": "lloyd",
                 "timeout_secs": 1,
             },
@@ -916,9 +918,8 @@ mod wire_tests {
         let app = router_with_repo(&dir).await;
         let args = json!({
             "role": "reviewers",
-            "plan_path": ".trinity/plans/foo.md",
+            "plan_id": plan_id_for(&dir, "foo"),
             "author_label": "codex",
-            "repo": dir.path().to_string_lossy(),
             "timeout_secs": 1,
         });
 
@@ -1045,9 +1046,8 @@ mod wire_tests {
         let app = router(state);
         let codex_body = json!({
             "role": "reviewers",
-            "plan_path": ".trinity/plans/foo.md",
+            "plan_id": plan_id_for(&dir, "foo"),
             "author_label": "codex",
-            "repo": dir.path().to_string_lossy(),
             "timeout_secs": 1,
         });
         let codex_req = Request::builder()
@@ -1070,9 +1070,8 @@ mod wire_tests {
         // the guard skip everybody would also pass the codex assertion.
         let bob_body = json!({
             "role": "reviewers",
-            "plan_path": ".trinity/plans/foo.md",
+            "plan_id": plan_id_for(&dir, "foo"),
             "author_label": "bob",
-            "repo": dir.path().to_string_lossy(),
             "timeout_secs": 1,
         });
         let bob_req = Request::builder()

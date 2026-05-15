@@ -13,7 +13,7 @@
 //! master waits (commit_plan_revision, commit_done_move, etc.) stay
 //! correct without holding the mutex across disk I/O.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
@@ -25,7 +25,7 @@ use crate::projection::{
     expected_action, impl_gate_for, latest_impl_commit, latest_plan_touching_commit, phase,
     plan_gate_for, waiting_on,
 };
-use crate::repo_state::{Phase, PlanLookupError, Trinity, WaitingReason, WaitingRole};
+use crate::repo_state::{Phase, Trinity, WaitingReason, WaitingRole};
 use crate::review_state::ReviewGateDecision;
 use crate::runtime::Runtime;
 
@@ -35,20 +35,12 @@ const MAX_TIMEOUT_SECS: u64 = 300;
 #[derive(Debug, Deserialize)]
 pub struct WaitArgs {
     pub role: String,
-    pub plan_path: String,
+    pub plan_id: String,
     /// Optional on the wire so schema-strict MCP clients allow the shim
     /// to autofill from its cache; the daemon rejects calls that arrive
     /// without one once autofill has had its chance.
     #[serde(default)]
     pub author_label: Option<String>,
-    /// Absolute repo root. The MCP dispatcher fills it from the caller's
-    /// cwd (via `git rev-parse --show-toplevel`) when absent; the HTTP
-    /// route rejects the request if absent. Canonicalized via
-    /// `dunce::canonicalize` so symlink and case-normalized variants
-    /// match the runtime's `Trinity.repos` keys. `~/…` is NOT expanded
-    /// — callers pass absolute paths.
-    #[serde(default)]
-    pub repo: Option<String>,
     #[serde(default)]
     pub timeout_secs: Option<u64>,
 }
@@ -57,13 +49,13 @@ pub struct WaitArgs {
 #[serde(untagged)]
 pub enum WaitResponse {
     Work {
-        /// Imperative action verb naming what the caller should do, e.g.
-        /// `review_impl`, `address_plan_request_changes`. Matches the
-        /// `expected_action` vocabulary from the projection layer.
+        plan_id: String,
+        /// Canonical absolute path of the repo, convenience for resolving
+        /// the repo-relative `locations` without re-parsing `plan_id`.
+        repo: String,
+        /// Imperative action verb naming what the caller should do.
         work: String,
-        /// Repo-relative paths the caller should read or write. Meaning
-        /// depends on `work` — see the per-action mapping in the tool
-        /// description.
+        /// Repo-relative paths the caller should read or write.
         locations: Vec<String>,
     },
     Timeout {
@@ -75,44 +67,38 @@ pub enum WaitResponse {
 pub enum WaitError {
     #[error("invalid role: {0} (expected `master` or `reviewers`)")]
     InvalidRole(String),
-    #[error("plan_path is required")]
-    MissingPlanPath,
+    #[error("plan_id is required")]
+    MissingPlanId,
     #[error("author_label is required")]
     MissingAuthorLabel,
-    #[error("repo is required (HTTP) or could not be resolved from cwd (MCP)")]
-    MissingRepo,
-    #[error("invalid plan_path: {0}")]
-    InvalidPlanPath(PlanPath),
-    #[error("unknown plan in repo: {0}")]
+    #[error("invalid plan_id: {0}")]
+    InvalidPlanId(String),
+    #[error("unknown repo basename: {0}")]
+    UnknownRepo(String),
+    #[error("unknown plan: {0}")]
     UnknownPlan(String),
-    #[error("plan path mismatch: current is {current}, requested {requested}")]
-    PlanPathMismatch {
-        current: PlanPath,
-        requested: PlanPath,
-    },
     #[error("plan conflict: stem `{key}` maps to {paths:?}")]
     PlanConflict { key: PlanKey, paths: Vec<PlanPath> },
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
 }
 
-/// Block until the named plan in the named repo needs the caller's role.
-/// Returns the work + locations to act on. After `timeout_secs` returns
-/// `{timed_out: true}` with no work.
+/// Block until the named plan needs the caller's role. Returns the work
+/// + locations to act on. After `timeout_secs` returns
+///   `{timed_out: true}` with no work.
 pub async fn wait_for_work(runtime: &Runtime, args: WaitArgs) -> Result<WaitResponse, WaitError> {
     let role = parse_role(&args.role)?;
-    if args.plan_path.is_empty() {
-        return Err(WaitError::MissingPlanPath);
+    if args.plan_id.is_empty() {
+        return Err(WaitError::MissingPlanId);
     }
+    let plan_id = crate::lifecycle::PlanId::parse(&args.plan_id)
+        .map_err(|e| WaitError::InvalidPlanId(e.to_string()))?;
     let author_label = args
         .author_label
         .as_deref()
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .ok_or(WaitError::MissingAuthorLabel)?;
-    let repo_str = args.repo.as_ref().ok_or(WaitError::MissingRepo)?;
-    let repo = dunce::canonicalize(repo_str).unwrap_or_else(|_| PathBuf::from(repo_str));
-    let plan_path = PlanPath::new(&args.plan_path);
     let author = AgentLabel::from(author_label);
 
     let timeout = Duration::from_secs(
@@ -123,8 +109,10 @@ pub async fn wait_for_work(runtime: &Runtime, args: WaitArgs) -> Result<WaitResp
     let started_at = Instant::now();
     let mut rx = runtime.subscribe_events();
 
-    if let Some(work) = compute_match(runtime, &repo, &plan_path, role, &author).await? {
+    if let Some(work) = compute_match(runtime, &plan_id, role, &author).await? {
         return Ok(WaitResponse::Work {
+            plan_id: plan_id.to_string(),
+            repo: work.repo,
             work: work.work.to_string(),
             locations: work.locations,
         });
@@ -138,9 +126,10 @@ pub async fn wait_for_work(runtime: &Runtime, args: WaitArgs) -> Result<WaitResp
         }
         match tokio::time::timeout(remaining, rx.recv()).await {
             Ok(Ok(_event)) => {
-                if let Some(work) = compute_match(runtime, &repo, &plan_path, role, &author).await?
-                {
+                if let Some(work) = compute_match(runtime, &plan_id, role, &author).await? {
                     return Ok(WaitResponse::Work {
+                        plan_id: plan_id.to_string(),
+                        repo: work.repo,
                         work: work.work.to_string(),
                         locations: work.locations,
                     });
@@ -148,9 +137,10 @@ pub async fn wait_for_work(runtime: &Runtime, args: WaitArgs) -> Result<WaitResp
             }
             Ok(Err(RecvError::Lagged(_))) => {
                 rx = runtime.subscribe_events();
-                if let Some(work) = compute_match(runtime, &repo, &plan_path, role, &author).await?
-                {
+                if let Some(work) = compute_match(runtime, &plan_id, role, &author).await? {
                     return Ok(WaitResponse::Work {
+                        plan_id: plan_id.to_string(),
+                        repo: work.repo,
                         work: work.work.to_string(),
                         locations: work.locations,
                     });
@@ -174,6 +164,9 @@ fn parse_role(s: &str) -> Result<WaitingRole, WaitError> {
 #[derive(Debug, Clone)]
 struct WorkItem {
     work: &'static str,
+    /// Canonical absolute path of the repo (echo'd back to the caller as
+    /// a convenience field on the response).
+    repo: String,
     locations: Vec<String>,
 }
 
@@ -181,15 +174,14 @@ struct WorkItem {
 /// `plan_worktree_status` and derive the work item if any.
 async fn compute_match(
     runtime: &Runtime,
-    repo: &Path,
-    plan_path: &PlanPath,
+    plan_id: &crate::lifecycle::PlanId,
     role: WaitingRole,
     author: &AgentLabel,
 ) -> Result<Option<WorkItem>, WaitError> {
     let candidate = {
         let trinity_arc = runtime.state();
         let trinity = trinity_arc.lock().await;
-        collect_candidate(&trinity, repo, plan_path)
+        collect_candidate(&trinity, plan_id)
     }?;
 
     let status = compute_plan_worktree_status_parts(
@@ -212,7 +204,12 @@ async fn compute_match(
     }
     let work = expected_action(w.reason);
     let locations = derive_locations(&candidate, w.reason, author);
-    Ok(Some(WorkItem { work, locations }))
+    let repo = candidate.repo_root.to_string_lossy().into_owned();
+    Ok(Some(WorkItem {
+        work,
+        repo,
+        locations,
+    }))
 }
 
 /// True if `author` already has a current-target verdict for the
@@ -341,30 +338,29 @@ struct Candidate {
 
 fn collect_candidate(
     trinity: &Trinity,
-    repo: &Path,
-    plan_path: &PlanPath,
+    plan_id: &crate::lifecycle::PlanId,
 ) -> Result<Candidate, WaitError> {
-    let Some(repo_state) = trinity.repos.get(repo) else {
-        return Err(WaitError::UnknownPlan(format!(
-            "{} in {}",
-            plan_path,
-            repo.display()
-        )));
-    };
+    let repo_root = trinity
+        .repo_basenames
+        .get(plan_id.repo())
+        .ok_or_else(|| WaitError::UnknownRepo(plan_id.repo().as_str().to_string()))?
+        .clone();
+    let repo_state = trinity
+        .repos
+        .get(&repo_root)
+        .ok_or_else(|| WaitError::UnknownRepo(plan_id.repo().as_str().to_string()))?;
+    if let Some(paths) = repo_state.plan_conflicts.get(plan_id.key()) {
+        return Err(WaitError::PlanConflict {
+            key: plan_id.key().clone(),
+            paths: paths.clone(),
+        });
+    }
     let plan = repo_state
-        .resolve_plan(plan_path)
-        .map_err(|err| match err {
-            PlanLookupError::InvalidPlanPath(p) => WaitError::InvalidPlanPath(p),
-            PlanLookupError::UnknownPlan(k) => {
-                WaitError::UnknownPlan(format!("{} in {}", k, repo.display()))
-            }
-            PlanLookupError::PlanPathMismatch { current, requested } => {
-                WaitError::PlanPathMismatch { current, requested }
-            }
-            PlanLookupError::PlanConflict { key, paths } => WaitError::PlanConflict { key, paths },
-        })?;
+        .plans
+        .get(plan_id.key())
+        .ok_or_else(|| WaitError::UnknownPlan(plan_id.to_string()))?;
     Ok(Candidate {
-        repo_root: repo.to_path_buf(),
+        repo_root,
         plan_key: plan.id.clone(),
         plan_path: plan.plan_path.clone(),
         body_hash: plan.body_hash.clone(),
@@ -579,18 +575,23 @@ mod integration_tests {
     }
 
     fn args(repo: &Path, role: &str, sid: &str, author: &str) -> WaitArgs {
+        let basename = repo
+            .file_name()
+            .and_then(|n| n.to_str())
+            .expect("tempdir has basename");
         WaitArgs {
             role: role.to_string(),
-            plan_path: format!(".trinity/plans/{sid}.md"),
+            plan_id: format!("{basename}/{sid}.md"),
             author_label: Some(author.to_string()),
-            repo: Some(repo.to_string_lossy().into_owned()),
             timeout_secs: Some(2),
         }
     }
 
     fn expect_work(r: WaitResponse) -> (String, Vec<String>) {
         match r {
-            WaitResponse::Work { work, locations } => (work, locations),
+            WaitResponse::Work {
+                work, locations, ..
+            } => (work, locations),
             WaitResponse::Timeout { .. } => panic!("expected work, got timeout"),
         }
     }
@@ -598,7 +599,9 @@ mod integration_tests {
     fn expect_timeout(r: WaitResponse) {
         match r {
             WaitResponse::Timeout { timed_out } => assert!(timed_out),
-            WaitResponse::Work { work, locations } => {
+            WaitResponse::Work {
+                work, locations, ..
+            } => {
                 panic!("expected timeout, got work={work} locations={locations:?}")
             }
         }
@@ -851,17 +854,16 @@ mod integration_tests {
     }
 
     #[tokio::test]
-    async fn missing_repo_errors() {
+    async fn unknown_repo_errors() {
         let rt = Runtime::new();
         let a = WaitArgs {
             role: "reviewers".to_string(),
-            plan_path: ".trinity/plans/foo.md".to_string(),
+            plan_id: "no-such-repo/foo.md".to_string(),
             author_label: Some("codex".to_string()),
-            repo: None,
             timeout_secs: Some(1),
         };
         let err = wait_for_work(&rt, a).await.unwrap_err();
-        assert!(matches!(err, WaitError::MissingRepo));
+        assert!(matches!(err, WaitError::UnknownRepo(_)));
     }
 
     #[tokio::test]
@@ -869,9 +871,8 @@ mod integration_tests {
         let rt = Runtime::new();
         let a = WaitArgs {
             role: "reviewers".to_string(),
-            plan_path: ".trinity/plans/foo.md".to_string(),
+            plan_id: "anywhere/foo.md".to_string(),
             author_label: None,
-            repo: Some("/anywhere".to_string()),
             timeout_secs: Some(1),
         };
         let err = wait_for_work(&rt, a).await.unwrap_err();
@@ -883,9 +884,8 @@ mod integration_tests {
         let rt = Runtime::new();
         let a = WaitArgs {
             role: "reviewers".to_string(),
-            plan_path: ".trinity/plans/foo.md".to_string(),
+            plan_id: "anywhere/foo.md".to_string(),
             author_label: Some("   ".to_string()),
-            repo: Some("/anywhere".to_string()),
             timeout_secs: Some(1),
         };
         let err = wait_for_work(&rt, a).await.unwrap_err();

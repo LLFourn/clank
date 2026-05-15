@@ -7,7 +7,7 @@ use serde_json::{Value, json};
 
 use super::AppState;
 use super::wait::{WaitArgs, WaitError, wait_for_work as run_wait_for_work};
-use crate::lifecycle::{AgentLabel, PlanKey, PlanPath};
+use crate::lifecycle::{AgentLabel, PlanId, PlanKey, PlanPath, RepoBasename};
 use crate::mcp_response::{get_context_response, list_plans_response};
 use crate::repo_state::PlanLookupError;
 
@@ -47,12 +47,8 @@ pub async fn dispatch(state: &AppState, req: &ToolCallRequest) -> Result<Value, 
 }
 
 async fn wait_for_work(state: &AppState, req: &ToolCallRequest) -> Result<Value, ToolError> {
-    let mut args: WaitArgs = serde_json::from_value(req.arguments.clone())
+    let args: WaitArgs = serde_json::from_value(req.arguments.clone())
         .map_err(|e| ToolError::Invalid(format!("args: {e}")))?;
-    if args.repo.is_none() {
-        let repo = resolve_repo(&req.cwd).await?;
-        args.repo = Some(repo.to_string_lossy().into_owned());
-    }
     let resp = run_wait_for_work(&state.runtime, args)
         .await
         .map_err(map_wait_error)?;
@@ -62,19 +58,20 @@ async fn wait_for_work(state: &AppState, req: &ToolCallRequest) -> Result<Value,
 fn map_wait_error(e: WaitError) -> ToolError {
     match e {
         WaitError::InvalidRole(_)
-        | WaitError::MissingPlanPath
+        | WaitError::MissingPlanId
         | WaitError::MissingAuthorLabel
-        | WaitError::MissingRepo
-        | WaitError::InvalidPlanPath(_) => ToolError::Invalid(e.to_string()),
-        WaitError::UnknownPlan(_)
-        | WaitError::PlanPathMismatch { .. }
-        | WaitError::PlanConflict { .. } => ToolError::NotFound(e.to_string()),
+        | WaitError::InvalidPlanId(_) => ToolError::Invalid(e.to_string()),
+        WaitError::UnknownRepo(_) | WaitError::UnknownPlan(_) | WaitError::PlanConflict { .. } => {
+            ToolError::NotFound(e.to_string())
+        }
         WaitError::Io(_) => ToolError::Internal(anyhow::anyhow!(e)),
     }
 }
 
 #[derive(Debug, Deserialize, Default)]
 struct ListPlansArgs {
+    /// Optional filter: basename or absolute repo path. Absent = all
+    /// watched repos.
     repo: Option<String>,
 }
 
@@ -85,46 +82,84 @@ async fn list_plans(state: &AppState, req: &ToolCallRequest) -> Result<Value, To
         serde_json::from_value(req.arguments.clone())
             .map_err(|e| ToolError::Invalid(format!("args: {e}")))?
     };
-    let repo = resolve_repo_with_override(args.repo.as_deref(), &req.cwd).await?;
-    state.runtime.add_repo_if_unknown(repo.clone()).await;
-    let snapshot = state
-        .runtime
-        .snapshot_repo(&repo)
-        .await
-        .map_err(|e| ToolError::Internal(anyhow::anyhow!(e)))?;
-    list_plans_response(&snapshot).map_err(|e| ToolError::Internal(anyhow::anyhow!(e)))
+    let repo_filter = match args.repo.as_deref() {
+        None => None,
+        Some(s) => Some(resolve_repo_filter(state, s, &req.cwd).await?),
+    };
+    let snapshots = if let Some(repo) = repo_filter {
+        state.runtime.add_repo_if_unknown(repo.clone()).await;
+        let snap = state
+            .runtime
+            .snapshot_repo(&repo)
+            .await
+            .map_err(|e| ToolError::Internal(anyhow::anyhow!(e)))?;
+        vec![snap]
+    } else {
+        // No filter — fall back to caller's cwd-repo. (Multi-repo
+        // aggregation isn't useful through MCP; HTTP /api/plans returns
+        // the cross-repo view.)
+        let repo = resolve_repo(&req.cwd).await?;
+        state.runtime.add_repo_if_unknown(repo.clone()).await;
+        let snap = state
+            .runtime
+            .snapshot_repo(&repo)
+            .await
+            .map_err(|e| ToolError::Internal(anyhow::anyhow!(e)))?;
+        vec![snap]
+    };
+    // Single-repo only for MCP today; combine when we add multi-repo
+    // aggregation. For now the first snapshot's response is the answer.
+    let snap = snapshots.into_iter().next().unwrap();
+    list_plans_response(&snap).map_err(|e| ToolError::Internal(anyhow::anyhow!(e)))
+}
+
+/// Resolve a `repo` arg (filter form): accept either a basename
+/// (looks it up in `Trinity.repo_basenames`) or an absolute path
+/// (canonicalize via `dunce`).
+async fn resolve_repo_filter(
+    state: &AppState,
+    raw: &str,
+    cwd: &Path,
+) -> Result<PathBuf, ToolError> {
+    if raw.contains('/') || raw.starts_with('~') {
+        // Looks like a path — fall back to old path-resolution.
+        return resolve_repo_with_override(Some(raw), cwd).await;
+    }
+    let name = RepoBasename::from(raw);
+    let trinity = state.runtime.state();
+    let trinity = trinity.lock().await;
+    trinity
+        .repo_basenames
+        .get(&name)
+        .cloned()
+        .ok_or_else(|| ToolError::NotFound(format!("unknown repo basename: {raw}")))
 }
 
 #[derive(Debug, Deserialize)]
 struct StartPlanArgs {
-    plan_path: String,
+    slug: String,
     #[allow(dead_code)]
     label: String,
-    repo: Option<String>,
 }
 
 async fn start_plan(state: &AppState, req: &ToolCallRequest) -> Result<Value, ToolError> {
     let args: StartPlanArgs = serde_json::from_value(req.arguments.clone())
         .map_err(|e| ToolError::Invalid(format!("args: {e}")))?;
-    let repo = resolve_repo_with_override(args.repo.as_deref(), &req.cwd).await?;
-    let plan_path = PlanPath::new(&args.plan_path);
-
-    // Guard 1: valid canonical path; PlanKey::from_path enforces no nesting.
-    let plan_key = PlanKey::from_path(plan_path.as_path()).ok_or_else(|| {
-        ToolError::Invalid(format!(
-            "plan_path must be `.trinity/plans/<stem>.md` (no nesting); got {}",
-            args.plan_path
-        ))
-    })?;
-
-    // Guard 2: reject done paths — done is a lifecycle transition, not a
-    // creation surface.
-    if plan_path.is_done() {
+    if args.slug.is_empty() || args.slug.contains('/') {
         return Err(ToolError::Invalid(format!(
-            "plan_path must not be under `.trinity/plans/done/`; got {}",
-            args.plan_path
+            "slug must be non-empty and contain no `/`; got `{}`",
+            args.slug
         )));
     }
+    let repo = resolve_repo(&req.cwd).await?;
+    let basename = RepoBasename::from_repo_root(&repo).ok_or_else(|| {
+        ToolError::Internal(anyhow::anyhow!(
+            "repo path has no usable basename: {}",
+            repo.display()
+        ))
+    })?;
+    let plan_key = PlanKey::from(args.slug.clone());
+    let plan_path = PlanPath::new(format!(".trinity/plans/{}.md", args.slug));
 
     ensure_gitignore(&repo)?;
     persist_repo_in_registry(&repo)
@@ -132,12 +167,21 @@ async fn start_plan(state: &AppState, req: &ToolCallRequest) -> Result<Value, To
     state.runtime.add_repo_if_unknown(repo.clone()).await;
     ensure_repo_watcher(state, repo.clone()).await;
 
-    // Guards 3 + 4: don't shadow an existing plan or stem-collide with a
-    // tracked conflict. Either condition fails before we touch the
-    // filesystem so a half-created stub can't reintroduce the problem.
+    // Basename collision: if the cwd-repo lost the registration race to
+    // another canonical path (e.g. a symlink target), refuse the call —
+    // the daemon won't watch this repo.
     {
         let trinity = state.runtime.state();
         let trinity = trinity.lock().await;
+        if let Some(claimed_by) = trinity.repo_basenames.get(&basename)
+            && claimed_by != &repo
+        {
+            return Err(ToolError::Forbidden(format!(
+                "repo basename `{}` already claimed by {}",
+                basename,
+                claimed_by.display()
+            )));
+        }
         if let Some(repo_state) = trinity.repos.get(&repo) {
             if let Some(existing) = repo_state.plans.get(&plan_key) {
                 return Err(ToolError::Forbidden(format!(
@@ -168,10 +212,10 @@ async fn start_plan(state: &AppState, req: &ToolCallRequest) -> Result<Value, To
         .await
         .map_err(|e| ToolError::Internal(anyhow::anyhow!(e)))?
         .is_some();
+    let plan_id = PlanId::new(basename, plan_key.clone());
     let next_step = if committed {
         format!(
-            "plan already committed at {}; edit and commit again to record a new revision",
-            plan_path
+            "plan already committed at {plan_path}; edit and commit again to record a new revision"
         )
     } else {
         format!(
@@ -180,8 +224,9 @@ async fn start_plan(state: &AppState, req: &ToolCallRequest) -> Result<Value, To
         )
     };
     Ok(json!({
+        "plan_id": plan_id.to_string(),
+        "repo": repo.to_string_lossy(),
         "canonical_path": plan_abs.to_string_lossy(),
-        "plan_path": plan_path.to_string_lossy(),
         "slug": plan_key.as_str(),
         "committed": committed,
         "next_step": next_step,
@@ -190,80 +235,66 @@ async fn start_plan(state: &AppState, req: &ToolCallRequest) -> Result<Value, To
 
 #[derive(Debug, Deserialize)]
 struct GetContextArgs {
-    plan_path: String,
+    plan_id: String,
     author_label: Option<String>,
-    repo: Option<String>,
 }
 
 async fn get_context(state: &AppState, req: &ToolCallRequest) -> Result<Value, ToolError> {
     let args: GetContextArgs = serde_json::from_value(req.arguments.clone())
         .map_err(|e| ToolError::Invalid(format!("args: {e}")))?;
-    let repo = resolve_repo_with_override(args.repo.as_deref(), &req.cwd).await?;
-    state.runtime.add_repo_if_unknown(repo.clone()).await;
-    let plan_path = PlanPath::new(&args.plan_path);
+    let plan_id = PlanId::parse(&args.plan_id)
+        .map_err(|e| ToolError::Invalid(format!("invalid plan_id: {e}")))?;
     let author = AgentLabel::from(args.author_label.unwrap_or_else(|| "anonymous".to_string()));
 
-    // Resolution semantics live in RepoState::resolve_plan. Do it under
-    // the lock to capture conflict / mismatch / unknown errors before
-    // building a snapshot.
-    let resolution = {
+    // Resolve repo via basename index, then look up plan within it.
+    let lookup = {
         let trinity = state.runtime.state();
         let trinity = trinity.lock().await;
-        let Some(repo_state) = trinity.repos.get(&repo) else {
-            return Err(ToolError::NotFound(format!(
-                "repo not loaded: {}",
-                repo.display()
+        let Some(repo_root) = trinity.repo_basenames.get(plan_id.repo()) else {
+            return Ok(json!({
+                "error": "unknown_repo",
+                "basename": plan_id.repo().as_str(),
+            }));
+        };
+        let Some(repo_state) = trinity.repos.get(repo_root) else {
+            return Err(ToolError::Internal(anyhow::anyhow!(
+                "repo_basenames out of sync with repos: {}",
+                repo_root.display()
             )));
         };
-        match repo_state.resolve_plan(&plan_path) {
-            Ok(plan) => Ok(plan.id.clone()),
-            Err(err) => Err(err),
-        }
-    };
-
-    let plan_key = match resolution {
-        Ok(k) => k,
-        Err(PlanLookupError::InvalidPlanPath(p)) => {
-            return Err(ToolError::Invalid(format!("invalid plan_path: {p}")));
-        }
-        Err(PlanLookupError::PlanPathMismatch { current, requested }) => {
-            return Ok(json!({
-                "error": "plan_path_mismatch",
-                "current": current.to_string_lossy(),
-                "requested": requested.to_string_lossy(),
-            }));
-        }
-        Err(PlanLookupError::PlanConflict { key, paths }) => {
+        if let Some(paths) = repo_state.plan_conflicts.get(plan_id.key()) {
             return Ok(json!({
                 "error": "plan_conflict",
-                "slug": key.as_str(),
+                "slug": plan_id.key().as_str(),
                 "paths": paths.iter().map(|p| p.to_string_lossy()).collect::<Vec<_>>(),
             }));
         }
-        Err(PlanLookupError::UnknownPlan(key)) => {
-            let plan_abs = repo.join(plan_path.as_path());
+        if !repo_state.plans.contains_key(plan_id.key()) {
             return Ok(json!({
                 "error": "plan_not_committed",
-                "slug": key.as_str(),
-                "canonical_path": plan_abs.to_string_lossy(),
+                "plan_id": plan_id.to_string(),
+                "slug": plan_id.key().as_str(),
                 "next_step": format!(
-                    "commit the plan file: git add {plan_path} && git commit -m 'Start plan: {}'",
-                    key.as_str()
+                    "commit the plan file: git add .trinity/plans/{slug}.md && git commit -m 'Start plan: {slug}'",
+                    slug = plan_id.key().as_str()
                 ),
             }));
         }
+        repo_root.clone()
     };
 
     let snapshot = state
         .runtime
-        .snapshot_session(&repo, &plan_key)
+        .snapshot_session(&lookup, plan_id.key())
         .await
         .map_err(|e| ToolError::Internal(anyhow::anyhow!(e)))?
         .ok_or_else(|| {
-            ToolError::Internal(anyhow::anyhow!(
-                "snapshot vanished between resolve and snapshot"
+            ToolError::NotFound(format!(
+                "plan vanished between resolve and snapshot: {}",
+                plan_id
             ))
         })?;
+    let _ = PlanLookupError::InvalidPlanPath(PlanPath::new(""));
     get_context_response(&snapshot, &author).map_err(|e| ToolError::Internal(anyhow::anyhow!(e)))
 }
 
@@ -286,8 +317,8 @@ async fn resolve_repo(cwd: &Path) -> Result<PathBuf, ToolError> {
 }
 
 /// Resolve the target repo: if `override_path` is `Some`, canonicalize that
-/// (dunce, no `~` expansion — callers pass absolute paths). Otherwise fall
-/// back to `git rev-parse --show-toplevel` from the shim's cwd.
+/// (dunce, no `~` expansion). Otherwise fall back to `git rev-parse
+/// --show-toplevel`.
 async fn resolve_repo_with_override(
     override_path: Option<&str>,
     cwd: &Path,
@@ -321,12 +352,10 @@ async fn ensure_repo_watcher(state: &AppState, repo: PathBuf) {
     }
 }
 
-/// Append `repo` to `~/.trinity/repos` if not already present. The file is
-/// the daemon's persistent registry of known repos; serve() reads it at
-/// startup. Missing parent dirs are created.
+/// Append `repo` to `~/.trinity/repos` if not already present.
 fn persist_repo_in_registry(repo: &Path) -> std::io::Result<()> {
     let Some(home) = std::env::var_os("HOME") else {
-        return Ok(()); // no $HOME; tolerate silently
+        return Ok(());
     };
     let registry = PathBuf::from(home).join(".trinity/repos");
     if let Some(parent) = registry.parent() {

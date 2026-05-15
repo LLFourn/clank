@@ -42,6 +42,11 @@ fn commit(repo: &Path, msg: &str) {
     run_git(repo, &["commit", "--quiet", "-m", msg]);
 }
 
+fn plan_id_for(dir: &tempfile::TempDir, slug: &str) -> String {
+    let basename = dir.path().file_name().unwrap().to_str().unwrap();
+    format!("{basename}/{slug}.md")
+}
+
 async fn spawn_daemon(repo_root: &Path) -> (String, tokio::task::JoinHandle<()>) {
     spawn_daemon_with_repos(&[repo_root.to_path_buf()]).await
 }
@@ -154,7 +159,7 @@ async fn mcp_get_context_via_internal_tool_call() {
     let req = json!({
         "cwd": dir.path(),
         "tool": "get_context",
-        "arguments": { "plan_path": ".trinity/plans/foo.md" }
+        "arguments": { "plan_id": plan_id_for(&dir, "foo") }
     });
     let resp = client
         .post(format!("{}/internal/tool_call", url))
@@ -183,7 +188,7 @@ async fn mcp_get_context_for_uncommitted_returns_session_not_committed() {
     let req = json!({
         "cwd": dir.path(),
         "tool": "get_context",
-        "arguments": { "plan_path": ".trinity/plans/foo.md" }
+        "arguments": { "plan_id": plan_id_for(&dir, "foo") }
     });
     let resp = client
         .post(format!("{}/internal/tool_call", url))
@@ -236,7 +241,7 @@ async fn pr_hint_present_in_implementing_phase() {
     let req = json!({
         "cwd": dir.path(),
         "tool": "get_context",
-        "arguments": { "plan_path": ".trinity/plans/foo.md" }
+        "arguments": { "plan_id": plan_id_for(&dir, "foo") }
     });
     let resp = client
         .post(format!("{}/internal/tool_call", url))
@@ -275,7 +280,7 @@ async fn plan_revision_route_renders_blob() {
     let req = json!({
         "cwd": dir.path(),
         "tool": "get_context",
-        "arguments": { "plan_path": ".trinity/plans/foo.md" }
+        "arguments": { "plan_id": plan_id_for(&dir, "foo") }
     });
     let ctx: serde_json::Value = client
         .post(format!("{}/internal/tool_call", url))
@@ -316,7 +321,7 @@ async fn commit_diff_route_renders_patch() {
     let req = json!({
         "cwd": dir.path(),
         "tool": "get_context",
-        "arguments": { "plan_path": ".trinity/plans/foo.md" }
+        "arguments": { "plan_id": plan_id_for(&dir, "foo") }
     });
     let ctx: serde_json::Value = client
         .post(format!("{}/internal/tool_call", url))
@@ -404,7 +409,7 @@ async fn start_plan_persists_repo_to_registry() {
     let req = json!({
         "cwd": dir.path(),
         "tool": "start_plan",
-        "arguments": { "plan_path": ".trinity/plans/foo.md", "label": "test-agent" }
+        "arguments": { "slug": "foo", "label": "test-agent" }
     });
     let resp = client
         .post(format!("{}/internal/tool_call", url))
@@ -514,7 +519,7 @@ async fn feedback_renders_on_session_page() {
     let req = json!({
         "cwd": dir.path(),
         "tool": "get_context",
-        "arguments": { "plan_path": ".trinity/plans/foo.md" }
+        "arguments": { "plan_id": plan_id_for(&dir, "foo") }
     });
     let ctx: serde_json::Value = client
         .post(format!("{}/internal/tool_call", url))
@@ -539,7 +544,7 @@ async fn feedback_renders_on_session_page() {
     let req2 = json!({
         "cwd": dir.path(),
         "tool": "get_context",
-        "arguments": { "plan_path": ".trinity/plans/foo.md" }
+        "arguments": { "plan_id": plan_id_for(&dir, "foo") }
     });
     let ctx2: serde_json::Value = client
         .post(format!("{}/internal/tool_call", url))
