@@ -251,6 +251,13 @@ fn label_arg_for(tool: &str) -> Option<&'static str> {
 /// autofill path (don't propagate cached blanks). Keeps the cache from
 /// becoming a vector for empty/whitespace strings that the daemon would
 /// reject downstream.
+///
+/// Normalizes ASCII-style whitespace per `char::is_whitespace` (so
+/// spaces, tabs, newlines, U+00A0, U+2007, etc. are stripped). It does
+/// NOT strip zero-width or bidi formatting characters (U+200B, U+200E,
+/// U+200F, …) — those would still produce a non-empty label. Trusted-
+/// agent context makes that acceptable; documented here so future
+/// reviewers can tighten if the threat model changes.
 fn normalize_label(raw: &str) -> Option<String> {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
@@ -269,8 +276,9 @@ impl ShimHandler {
         *self.cached_label.lock().unwrap() = Some(label);
     }
 
-    /// Merge the cached label into `arguments[key]` if the caller omitted
-    /// it. Returns the (possibly modified) arguments. Tools with no label
+    /// Merge the cached label into `arguments[key]` if the caller
+    /// omitted it OR supplied a whitespace-only value. Caller-supplied
+    /// non-blank values pass through unchanged. Tools with no label
     /// argument pass through unchanged. Blanks in the cache are not
     /// propagated — `normalize_label` rejects them.
     fn fill_label_from_cache(&self, tool: &str, mut arguments: Value) -> Value {
@@ -427,19 +435,18 @@ impl ServerHandler for ShimHandler {
         // Per-tool fallback: if the caller didn't supply `label` /
         // `author_label` for a tool that takes one, fill in the last value
         // we saw. No cross-session refusal.
-        let filled = self.fill_label_from_cache(&tool, arguments.clone());
+        let filled = self.fill_label_from_cache(&tool, arguments);
 
-        match self.forward(&tool, filled.clone()).await {
+        // Pull the label out before `forward` moves `filled`. `normalize_label`
+        // keeps blanks / whitespace-only values out of the cache so they
+        // can't poison later autofills.
+        let label_to_cache = label_arg_for(&tool)
+            .and_then(|key| filled.get(key).and_then(|v| v.as_str()))
+            .and_then(normalize_label);
+
+        match self.forward(&tool, filled).await {
             Ok(result) => {
-                // Cache update: store whichever label key actually went on
-                // the wire (caller-supplied or cache-supplied) so the next
-                // call inherits it. `normalize_label` keeps blanks /
-                // whitespace-only values out of the cache so they can't
-                // poison later autofills.
-                if let Some(key) = label_arg_for(&tool)
-                    && let Some(raw) = filled.get(key).and_then(|v| v.as_str())
-                    && let Some(label) = normalize_label(raw)
-                {
+                if let Some(label) = label_to_cache {
                     self.set_cached_label(label);
                 }
                 Ok(CallToolResult::structured(result))
@@ -515,10 +522,7 @@ mod tests {
     #[test]
     fn fill_label_from_cache_skips_tools_without_label_arg() {
         let h = handler_with_cache(Some("codex"));
-        let out = h.fill_label_from_cache(
-            "list_sessions",
-            serde_json::json!({"repo": "/r"}),
-        );
+        let out = h.fill_label_from_cache("list_sessions", serde_json::json!({"repo": "/r"}));
         assert!(out.get("author_label").is_none());
         assert!(out.get("label").is_none());
     }

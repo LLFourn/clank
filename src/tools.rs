@@ -93,9 +93,13 @@ pub fn catalog() -> Vec<ToolDescriptor> {
                           Inputs:\n\
                           - `role` (required, `master` | `reviewers`).\n\
                           - `session_id` (required): the session you're watching.\n\
-                          - `author_label` (required): your label. Used to construct the \
-                          canonical reviewer write path for `review_plan` / `review_impl`. \
-                          The MCP shim caches this across calls so you usually pass it once.\n\
+                          - `author_label` (daemon-required, schema-optional for shim \
+                          autofill): your label. Used to construct the canonical reviewer \
+                          write path for `review_plan` / `review_impl`. The MCP shim caches \
+                          this across calls so you usually pass it once; strict MCP clients \
+                          that validate the schema before invoking can omit it on subsequent \
+                          calls and the shim fills from cache. Daemon rejects calls that \
+                          arrive without one after autofill.\n\
                           - `repo` (optional absolute path): defaults to the caller's \
                           cwd-repo (via `git rev-parse --show-toplevel`). HTTP callers must \
                           pass this explicitly.\n\

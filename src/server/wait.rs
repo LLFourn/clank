@@ -192,8 +192,11 @@ async fn compute_match(
         )));
     };
 
-    let status =
-        compute_plan_worktree_status_parts(&candidate.repo_root, &candidate.plan_path, &candidate.body_hash)?;
+    let status = compute_plan_worktree_status_parts(
+        &candidate.repo_root,
+        &candidate.plan_path,
+        &candidate.body_hash,
+    )?;
     let w = waiting_on(
         candidate.session_phase,
         status,
@@ -203,8 +206,7 @@ async fn compute_match(
     if w.role != role {
         return Ok(None);
     }
-    if matches!(role, WaitingRole::Reviewers)
-        && caller_already_voted(&candidate, w.reason, author)
+    if matches!(role, WaitingRole::Reviewers) && caller_already_voted(&candidate, w.reason, author)
     {
         return Ok(None);
     }
@@ -219,14 +221,15 @@ async fn compute_match(
 /// vote still stands; the remaining wait is on someone else).
 ///
 /// Master-role reasons return false — caller-already-voted is a
-/// reviewer-only concept. The match is exhaustive on purpose: adding a
-/// new reviewer-role `WaitingReason` later forces a compile error here,
-/// preventing silent regressions of the self-wakeup bug this guards.
-fn caller_already_voted(
-    cand: &Candidate,
-    reason: WaitingReason,
-    author: &AgentLabel,
-) -> bool {
+/// reviewer-only concept. The match is exhaustive: adding any new
+/// `WaitingReason` forces a compile error here. **The compiler enforces
+/// totality, not arm placement** — a maintainer who adds a new
+/// reviewer-role variant must place it in the gate-lookup branch, not
+/// the `return false` branch, or the self-wakeup bug returns. The
+/// integration test `caller_already_voted_does_not_re_wake_reviewer`
+/// (and its wire counterpart in `server::http::wire_tests`) is the
+/// semantic guard for arm placement.
+fn caller_already_voted(cand: &Candidate, reason: WaitingReason, author: &AgentLabel) -> bool {
     use WaitingReason::*;
     let gate = match reason {
         PlanNeedsInitialReview | PlanNeedsRereview => cand.plan_gate.as_ref(),
@@ -256,31 +259,39 @@ fn caller_already_voted(
 /// - `commit_plan_revision` / `commit_done_move` /
 ///   `restore_or_commit_done_move` / `implement_and_commit` /
 ///   `move_to_done`: the plan file itself.
-fn derive_locations(
-    cand: &Candidate,
-    reason: WaitingReason,
-    author: &AgentLabel,
-) -> Vec<String> {
+fn derive_locations(cand: &Candidate, reason: WaitingReason, author: &AgentLabel) -> Vec<String> {
     let plan_file = cand.plan_path.to_string_lossy().into_owned();
     let sid = cand.session_id.as_str();
 
     match reason {
         WaitingReason::PlanNeedsInitialReview | WaitingReason::PlanNeedsRereview => {
-            let Some(target) = &cand.plan_target else { return Vec::new() };
+            let Some(target) = &cand.plan_target else {
+                return Vec::new();
+            };
             vec![feedback_path(sid, "plan", target, author.as_str())]
         }
         WaitingReason::ImplNeedsInitialReview | WaitingReason::ImplNeedsRereview => {
-            let Some(target) = &cand.impl_target else { return Vec::new() };
+            let Some(target) = &cand.impl_target else {
+                return Vec::new();
+            };
             vec![feedback_path(sid, "impl", target, author.as_str())]
         }
         WaitingReason::AddressPlanRequestChanges => {
-            let mut out = rc_feedback_paths(cand.plan_target.as_ref(), cand.plan_gate.as_ref(), sid, "plan");
+            let mut out = rc_feedback_paths(
+                cand.plan_target.as_ref(),
+                cand.plan_gate.as_ref(),
+                sid,
+                "plan",
+            );
             out.push(plan_file);
             out
         }
-        WaitingReason::AddressImplRequestChanges => {
-            rc_feedback_paths(cand.impl_target.as_ref(), cand.impl_gate.as_ref(), sid, "impl")
-        }
+        WaitingReason::AddressImplRequestChanges => rc_feedback_paths(
+            cand.impl_target.as_ref(),
+            cand.impl_gate.as_ref(),
+            sid,
+            "impl",
+        ),
         WaitingReason::CommitDoneMove
         | WaitingReason::RestoreOrCommitDoneMove
         | WaitingReason::CommitPlanRevision
@@ -306,7 +317,9 @@ fn rc_feedback_paths(
     sid: &str,
     phase: &str,
 ) -> Vec<String> {
-    let (Some(target), Some(gate)) = (target, gate) else { return Vec::new() };
+    let (Some(target), Some(gate)) = (target, gate) else {
+        return Vec::new();
+    };
     gate.request_changes
         .iter()
         .map(|author| feedback_path(sid, phase, target, author.as_str()))
@@ -484,7 +497,10 @@ mod tests {
 
     #[test]
     fn parse_role_rejects_unknown() {
-        assert!(matches!(parse_role("reviewer"), Err(WaitError::InvalidRole(_))));
+        assert!(matches!(
+            parse_role("reviewer"),
+            Err(WaitError::InvalidRole(_))
+        ));
         assert!(matches!(parse_role(""), Err(WaitError::InvalidRole(_))));
         assert!(matches!(parse_role("none"), Err(WaitError::InvalidRole(_))));
     }
@@ -597,7 +613,11 @@ mod integration_tests {
         let rt = Runtime::new();
         rt.add_repo(dir.path().to_path_buf()).await.unwrap();
         // Edit but don't commit.
-        write_file(dir.path(), ".trinity/plans/foo.md", "# foo v2 uncommitted\n");
+        write_file(
+            dir.path(),
+            ".trinity/plans/foo.md",
+            "# foo v2 uncommitted\n",
+        );
 
         let resp = wait_for_work(&rt, args(dir.path(), "master", "foo", "lloyd"))
             .await
@@ -685,17 +705,17 @@ mod integration_tests {
             .unwrap();
         // Both codex + bob approve the intro target → participants.
         for author in ["codex", "bob"] {
-            let rel = format!(".trinity/feedback/foo/plan/{}/{}.md", intro.as_str(), author);
+            let rel = format!(
+                ".trinity/feedback/foo/plan/{}/{}.md",
+                intro.as_str(),
+                author
+            );
             write_file(dir.path(), &rel, "APPROVE\n");
             let parsed_rel = PathBuf::from(format!("foo/plan/{}/{}.md", intro.as_str(), author));
             let parsed = crate::disk_format::parse_feedback_path(&parsed_rel).unwrap();
-            rt.handle_signal(
-                dir.path(),
-                FilesystemSignal::FeedbackWritten { parsed },
-                1,
-            )
-            .await
-            .unwrap();
+            rt.handle_signal(dir.path(), FilesystemSignal::FeedbackWritten { parsed }, 1)
+                .await
+                .unwrap();
         }
 
         // Revise the plan so the target SHA advances; codex re-approves
@@ -722,13 +742,9 @@ mod integration_tests {
             revised.as_str()
         )))
         .unwrap();
-        rt.handle_signal(
-            dir.path(),
-            FilesystemSignal::FeedbackWritten { parsed },
-            3,
-        )
-        .await
-        .unwrap();
+        rt.handle_signal(dir.path(), FilesystemSignal::FeedbackWritten { parsed }, 3)
+            .await
+            .unwrap();
 
         // codex polls → already voted → times out.
         let mut a = args(dir.path(), "reviewers", "foo", "codex");

@@ -38,17 +38,19 @@ async fn api_wait_for_work(
     State(state): State<AppState>,
     axum::Json(args): axum::Json<WaitArgs>,
 ) -> Result<axum::Json<Value>, AppError> {
-    let resp = wait_for_work(&state.runtime, args).await.map_err(|e| match e {
-        WaitError::InvalidRole(_)
-        | WaitError::MissingSessionId
-        | WaitError::MissingAuthorLabel
-        | WaitError::MissingRepo => AppError {
-            status: StatusCode::BAD_REQUEST,
-            msg: e.to_string(),
-        },
-        WaitError::UnknownSession(_) => AppError::not_found(e.to_string()),
-        WaitError::Io(err) => AppError::io(err),
-    })?;
+    let resp = wait_for_work(&state.runtime, args)
+        .await
+        .map_err(|e| match e {
+            WaitError::InvalidRole(_)
+            | WaitError::MissingSessionId
+            | WaitError::MissingAuthorLabel
+            | WaitError::MissingRepo => AppError {
+                status: StatusCode::BAD_REQUEST,
+                msg: e.to_string(),
+            },
+            WaitError::UnknownSession(_) => AppError::not_found(e.to_string()),
+            WaitError::Io(err) => AppError::io(err),
+        })?;
     let v = serde_json::to_value(resp)
         .map_err(|e| AppError::internal(format!("serialize wait response: {e}")))?;
     Ok(axum::Json(v))
@@ -142,11 +144,7 @@ async fn move_to_done(
     );
     std::fs::rename(&from, &to).map_err(AppError::io)?;
     // Don't `git add` — operator commits the move themselves per the plan.
-    Ok((
-        StatusCode::SEE_OTHER,
-        [(axum::http::header::LOCATION, "/")],
-    )
-        .into_response())
+    Ok((StatusCode::SEE_OTHER, [(axum::http::header::LOCATION, "/")]).into_response())
 }
 
 async fn home_events_stream(
@@ -178,8 +176,8 @@ async fn event_stream(
     use futures::stream::StreamExt;
 
     let rx = state.runtime.subscribe_events();
-    let live_stream = tokio_stream::wrappers::BroadcastStream::new(rx)
-        .filter_map(|r| async move { r.ok() });
+    let live_stream =
+        tokio_stream::wrappers::BroadcastStream::new(rx).filter_map(|r| async move { r.ok() });
 
     let combined = live_stream.filter_map(move |e| {
         let session_filter = session_filter.clone();
@@ -355,9 +353,9 @@ mod wire_tests {
     use http_body_util::BodyExt;
     use serde_json::json;
     use std::collections::HashSet;
-    use std::sync::Arc;
     use std::path::Path;
     use std::process::Command;
+    use std::sync::Arc;
     use tokio::sync::Mutex;
     use tower::ServiceExt;
 
@@ -394,16 +392,26 @@ mod wire_tests {
         run_git(repo, &["commit", "--quiet", "-m", msg]);
     }
 
-    async fn router_with_repo(dir: &tempfile::TempDir) -> axum::Router {
+    /// Commits a `foo` plan into `dir`, registers it with a fresh runtime,
+    /// and returns the runtime alongside an `AppState` that wraps it. The
+    /// `Arc<Runtime>` handle is for tests that need to drive
+    /// `handle_signal` / `read_repo` directly between setup and request;
+    /// the `AppState` feeds straight into `router(...)`.
+    async fn prepared_state(dir: &tempfile::TempDir) -> (Arc<Runtime>, AppState) {
         write_file(dir.path(), ".trinity/plans/foo.md", "# foo\n");
         commit(dir.path(), "add foo");
         let runtime = Arc::new(Runtime::new());
         runtime.add_repo(dir.path().to_path_buf()).await.unwrap();
         let state = AppState {
-            runtime,
+            runtime: Arc::clone(&runtime),
             watchers: Arc::new(Mutex::new(Vec::new())),
             watched_repos: Arc::new(Mutex::new(HashSet::new())),
         };
+        (runtime, state)
+    }
+
+    async fn router_with_repo(dir: &tempfile::TempDir) -> axum::Router {
+        let (_, state) = prepared_state(dir).await;
         router(state)
     }
 
@@ -696,9 +704,12 @@ mod wire_tests {
     async fn http_and_mcp_bodies_byte_identical_for_same_input() {
         // Acceptance: HTTP and MCP dispatch produce byte-identical JSON
         // responses for the same inputs (modulo MCP's {result: ...}
-        // envelope). Drive both routes with the same args; the MCP
-        // body's `result` value must equal the HTTP body.
+        // envelope). Drive both routes against the *same* router (both
+        // Router and AppState are Clone) so the underlying state — and
+        // therefore the SHA-bearing paths in `locations` — match
+        // exactly. Full Value equality, not key-set parity.
         let dir = init_repo();
+        let app = router_with_repo(&dir).await;
         let args = json!({
             "role": "reviewers",
             "session_id": "foo",
@@ -707,32 +718,20 @@ mod wire_tests {
             "timeout_secs": 1,
         });
 
-        // HTTP path.
-        let app_http = router_with_repo(&dir).await;
         let http_req = Request::builder()
             .method("POST")
             .uri("/api/wait_for_work")
             .header("content-type", "application/json")
             .body(Body::from(args.to_string()))
             .unwrap();
-        let http_resp = app_http.oneshot(http_req).await.unwrap();
+        let http_resp = app.clone().oneshot(http_req).await.unwrap();
         assert_eq!(http_resp.status(), StatusCode::OK);
         let http_body = body_json(http_resp).await;
 
-        // MCP path against a fresh repo (same setup) so the wait sees
-        // the same initial state. We can't reuse the router because
-        // oneshot consumes it.
-        let dir2 = init_repo();
-        let app_mcp = router_with_repo(&dir2).await;
-        let mcp_args = {
-            let mut a = args.clone();
-            a["repo"] = json!(dir2.path().to_string_lossy());
-            a
-        };
         let mcp_body_in = json!({
-            "cwd": dir2.path().to_string_lossy(),
+            "cwd": dir.path().to_string_lossy(),
             "tool": "wait_for_work",
-            "arguments": mcp_args,
+            "arguments": args,
         });
         let mcp_req = Request::builder()
             .method("POST")
@@ -740,51 +739,34 @@ mod wire_tests {
             .header("content-type", "application/json")
             .body(Body::from(mcp_body_in.to_string()))
             .unwrap();
-        let mcp_resp = app_mcp.oneshot(mcp_req).await.unwrap();
+        let mcp_resp = app.oneshot(mcp_req).await.unwrap();
         assert_eq!(mcp_resp.status(), StatusCode::OK);
         let mcp_body = body_json(mcp_resp).await;
 
-        // Both fresh repos surface the same review_plan match shape —
-        // the only differences are the absolute paths embedded in
-        // `locations[0]`. Strip the SHA-bearing path before comparing
-        // structure; assert the keys + work field match exactly.
-        assert_eq!(http_body["work"], mcp_body["result"]["work"]);
-        assert_eq!(http_body["work"], "review_plan");
+        // Full equality: every byte of the wait response on the HTTP
+        // side must equal the `result` value on the MCP side.
         assert_eq!(
-            http_body["locations"].as_array().unwrap().len(),
-            mcp_body["result"]["locations"].as_array().unwrap().len()
-        );
-        // Field set parity: HTTP body keys === MCP `result` keys.
-        let http_keys: std::collections::BTreeSet<&str> = http_body
-            .as_object()
-            .unwrap()
-            .keys()
-            .map(String::as_str)
-            .collect();
-        let mcp_keys: std::collections::BTreeSet<&str> = mcp_body["result"]
-            .as_object()
-            .unwrap()
-            .keys()
-            .map(String::as_str)
-            .collect();
-        assert_eq!(
-            http_keys, mcp_keys,
-            "HTTP and MCP wait_for_work bodies disagree on key set"
+            http_body, mcp_body["result"],
+            "HTTP and MCP wait_for_work bodies diverged"
         );
     }
 
     #[tokio::test]
     async fn http_caller_already_voted_regression_at_wire() {
-        // The P1 regression in commit ab71f34 was that reviewers were
-        // re-woken on targets they had already voted on. Build a real
-        // session where codex has APPROVE'd the only plan target;
-        // polling reviewers as codex over /api/wait_for_work must
-        // time out.
+        // P1 regression coverage at the wire. The guard only fires when
+        // the gate is `NeedsReview` with role `Reviewers` — i.e. there
+        // is at least one participant who hasn't voted on the current
+        // target. A single APPROVE makes the gate `Ready`, which flips
+        // the role to Master and short-circuits before the guard runs,
+        // so we have to build the same scenario as the integration
+        // test in `wait::integration_tests`: two participants, plan
+        // revised so the target SHA advances, codex re-votes on the
+        // new target, bob is missing.
         let dir = init_repo();
-        write_file(dir.path(), ".trinity/plans/foo.md", "# foo\n");
-        commit(dir.path(), "add foo");
-        let runtime = Arc::new(Runtime::new());
-        runtime.add_repo(dir.path().to_path_buf()).await.unwrap();
+        let (runtime, state) = prepared_state(&dir).await;
+
+        // Both codex + bob approve the intro target so they're recorded
+        // as participants of the plan-phase gate.
         let intro = runtime
             .read_repo(dir.path(), |s| {
                 s.sessions[&crate::lifecycle::SessionId::from("foo")]
@@ -793,46 +775,116 @@ mod wire_tests {
             })
             .await
             .unwrap();
-        let codex_rel = format!(
-            ".trinity/feedback/foo/plan/{}/codex.md",
-            intro.as_str()
-        );
+        for author in ["codex", "bob"] {
+            let rel = format!(
+                ".trinity/feedback/foo/plan/{}/{}.md",
+                intro.as_str(),
+                author
+            );
+            write_file(dir.path(), &rel, "APPROVE\n");
+            let parsed = crate::disk_format::parse_feedback_path(&std::path::PathBuf::from(
+                format!("foo/plan/{}/{}.md", intro.as_str(), author),
+            ))
+            .unwrap();
+            runtime
+                .handle_signal(
+                    dir.path(),
+                    crate::fs_watcher::FilesystemSignal::FeedbackWritten { parsed },
+                    1,
+                )
+                .await
+                .unwrap();
+        }
+
+        // Push a new plan revision so the target SHA advances; codex
+        // re-approves the new target, bob does not.
+        write_file(dir.path(), ".trinity/plans/foo.md", "# foo v2\n");
+        commit(dir.path(), "revise foo");
+        runtime
+            .handle_signal(
+                dir.path(),
+                crate::fs_watcher::FilesystemSignal::HeadChanged,
+                2,
+            )
+            .await
+            .unwrap();
+        let revised = runtime
+            .read_repo(dir.path(), |s| {
+                crate::projection::latest_plan_touching_commit(
+                    &s.sessions[&crate::lifecycle::SessionId::from("foo")],
+                    s,
+                )
+                .unwrap()
+            })
+            .await
+            .unwrap();
+        let codex_rel = format!(".trinity/feedback/foo/plan/{}/codex.md", revised.as_str());
         write_file(dir.path(), &codex_rel, "APPROVE\n");
-        let parsed = crate::disk_format::parse_feedback_path(&std::path::PathBuf::from(
-            format!("foo/plan/{}/codex.md", intro.as_str()),
-        ))
+        let parsed = crate::disk_format::parse_feedback_path(&std::path::PathBuf::from(format!(
+            "foo/plan/{}/codex.md",
+            revised.as_str()
+        )))
         .unwrap();
         runtime
             .handle_signal(
                 dir.path(),
                 crate::fs_watcher::FilesystemSignal::FeedbackWritten { parsed },
-                1,
+                3,
             )
             .await
             .unwrap();
-        let state = AppState {
-            runtime,
-            watchers: Arc::new(Mutex::new(Vec::new())),
-            watched_repos: Arc::new(Mutex::new(HashSet::new())),
-        };
+
+        // The session is now in reviewers/plan_needs_rereview with bob
+        // as the only missing approval. codex's wait_for_work must
+        // hit the caller_already_voted guard and time out; bob's must
+        // return work.
         let app = router(state);
-        let body = json!({
+        let codex_body = json!({
             "role": "reviewers",
             "session_id": "foo",
             "author_label": "codex",
             "repo": dir.path().to_string_lossy(),
             "timeout_secs": 1,
         });
-        let req = Request::builder()
+        let codex_req = Request::builder()
             .method("POST")
             .uri("/api/wait_for_work")
             .header("content-type", "application/json")
-            .body(Body::from(body.to_string()))
+            .body(Body::from(codex_body.to_string()))
             .unwrap();
-        let resp = app.oneshot(req).await.unwrap();
+        let resp = app.clone().oneshot(codex_req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
         let v = body_json(resp).await;
-        assert_eq!(v["timed_out"], true);
+        assert_eq!(
+            v["timed_out"], true,
+            "codex already voted on the revised target; guard must skip the wake-up"
+        );
         assert!(v.get("work").is_none());
+
+        // Sanity check: bob (who hasn't voted on the revised target)
+        // does get work. Without this assertion, a regression that made
+        // the guard skip everybody would also pass the codex assertion.
+        let bob_body = json!({
+            "role": "reviewers",
+            "session_id": "foo",
+            "author_label": "bob",
+            "repo": dir.path().to_string_lossy(),
+            "timeout_secs": 1,
+        });
+        let bob_req = Request::builder()
+            .method("POST")
+            .uri("/api/wait_for_work")
+            .header("content-type", "application/json")
+            .body(Body::from(bob_body.to_string()))
+            .unwrap();
+        let resp = app.oneshot(bob_req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let v = body_json(resp).await;
+        assert_eq!(v["work"], "review_plan");
+        let loc = v["locations"][0].as_str().unwrap();
+        assert!(
+            loc.ends_with("/bob.md"),
+            "expected bob's write path, got {loc}"
+        );
     }
 }

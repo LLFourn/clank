@@ -252,7 +252,7 @@ Wire (in-process axum router via `tower::ServiceExt::oneshot`):
 - `POST /api/wait_for_work` polling the wrong role → 200 + `{timed_out: true}`.
 - `POST /api/wait_for_work` with invalid role / missing repo / missing author_label → 400.
 - `POST /api/wait_for_work` with unknown session → 404.
-- `POST /api/wait_for_work` reviewer-already-voted regression: codex has APPROVE'd; polling reviewers as codex → 200 + `{timed_out: true}`.
+- `POST /api/wait_for_work` reviewer-already-voted regression: two participants (codex, bob) APPROVE'd the plan intro; a plan revision lands so the target SHA advances; codex re-approves the new target while bob does not. Polling reviewers as codex → 200 + `{timed_out: true}` (guard fires). Polling reviewers as bob → 200 + `{work: "review_plan", locations: [bob.md]}` (gate still needs bob). The single-participant version would bypass the guard via role-mismatch on `Ready` and would not actually exercise the regression.
 - `POST /internal/tool_call` with `tool: "wait_for_work"` and explicit repo → 200 + `{result: {work, locations}}`.
 - `POST /internal/tool_call` with no `repo` arg → dispatcher resolves from `req.cwd` via git → 200.
 - `POST /internal/tool_call` with invalid role / missing author_label → 400.
