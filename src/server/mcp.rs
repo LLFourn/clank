@@ -7,9 +7,8 @@ use serde_json::{Value, json};
 
 use super::AppState;
 use super::wait::{WaitArgs, WaitError, wait_for_work as run_wait_for_work};
-use crate::lifecycle::{AgentLabel, PlanId, PlanKey, PlanPath, RepoBasename};
+use crate::lifecycle::{AgentLabel, PlanId, PlanKey, RepoBasename};
 use crate::mcp_response::{get_context_response, list_plans_response};
-use crate::repo_state::PlanLookupError;
 
 #[derive(Debug, Deserialize)]
 pub struct ToolCallRequest {
@@ -153,23 +152,18 @@ async fn start_plan(state: &AppState, req: &ToolCallRequest) -> Result<Value, To
     }
     let repo = resolve_repo(&req.cwd).await?;
     let basename = RepoBasename::from_repo_root(&repo).ok_or_else(|| {
-        ToolError::Internal(anyhow::anyhow!(
+        ToolError::Invalid(format!(
             "repo path has no usable basename: {}",
             repo.display()
         ))
     })?;
     let plan_key = PlanKey::from(args.slug.clone());
-    let plan_path = PlanPath::new(format!(".trinity/plans/{}.md", args.slug));
+    let plan_path = PathBuf::from(format!(".trinity/plans/{}.md", args.slug));
 
-    ensure_gitignore(&repo)?;
-    persist_repo_in_registry(&repo)
-        .map_err(|e| ToolError::Internal(anyhow::anyhow!("register repo: {e}")))?;
-    state.runtime.add_repo_if_unknown(repo.clone()).await;
-    ensure_repo_watcher(state, repo.clone()).await;
-
-    // Basename collision: if the cwd-repo lost the registration race to
-    // another canonical path (e.g. a symlink target), refuse the call —
-    // the daemon won't watch this repo.
+    // Basename collision check: do this BEFORE any disk mutation
+    // (.gitignore, ~/.trinity/repos persistence, watcher creation). If
+    // another canonical path already claims this basename, refuse the call
+    // — the daemon can't disambiguate two repos with the same basename.
     {
         let trinity = state.runtime.state();
         let trinity = trinity.lock().await;
@@ -182,12 +176,23 @@ async fn start_plan(state: &AppState, req: &ToolCallRequest) -> Result<Value, To
                 claimed_by.display()
             )));
         }
+    }
+
+    ensure_gitignore(&repo)?;
+    persist_repo_in_registry(&repo)
+        .map_err(|e| ToolError::Internal(anyhow::anyhow!("register repo: {e}")))?;
+    state.runtime.add_repo_if_unknown(repo.clone()).await;
+    ensure_repo_watcher(state, repo.clone()).await;
+
+    {
+        let trinity = state.runtime.state();
+        let trinity = trinity.lock().await;
         if let Some(repo_state) = trinity.repos.get(&repo) {
             if let Some(existing) = repo_state.plans.get(&plan_key) {
                 return Err(ToolError::Forbidden(format!(
                     "plan stem `{}` already exists at {}",
                     plan_key.as_str(),
-                    existing.plan_path
+                    existing.plan_path.display()
                 )));
             }
             if repo_state.plan_conflicts.contains_key(&plan_key) {
@@ -199,7 +204,7 @@ async fn start_plan(state: &AppState, req: &ToolCallRequest) -> Result<Value, To
         }
     }
 
-    let plan_abs = repo.join(plan_path.as_path());
+    let plan_abs = repo.join(&plan_path);
     if let Some(parent) = plan_abs.parent() {
         std::fs::create_dir_all(parent).map_err(|e| ToolError::Internal(anyhow::anyhow!(e)))?;
     }
@@ -213,13 +218,14 @@ async fn start_plan(state: &AppState, req: &ToolCallRequest) -> Result<Value, To
         .map_err(|e| ToolError::Internal(anyhow::anyhow!(e)))?
         .is_some();
     let plan_id = PlanId::new(basename, plan_key.clone());
+    let plan_path_display = plan_path.display();
     let next_step = if committed {
         format!(
-            "plan already committed at {plan_path}; edit and commit again to record a new revision"
+            "plan already committed at {plan_path_display}; edit and commit again to record a new revision"
         )
     } else {
         format!(
-            "edit {plan_path} then run: git add {plan_path} && git commit -m 'Start plan: {}'",
+            "edit {plan_path_display} then run: git add {plan_path_display} && git commit -m 'Start plan: {}'",
             plan_key.as_str()
         )
     };
@@ -294,7 +300,6 @@ async fn get_context(state: &AppState, req: &ToolCallRequest) -> Result<Value, T
                 plan_id
             ))
         })?;
-    let _ = PlanLookupError::InvalidPlanPath(PlanPath::new(""));
     get_context_response(&snapshot, &author).map_err(|e| ToolError::Internal(anyhow::anyhow!(e)))
 }
 

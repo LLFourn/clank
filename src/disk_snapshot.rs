@@ -19,7 +19,7 @@ use std::path::PathBuf;
 
 use crate::attribution::{CommitChanges, classify, effective_session};
 use crate::disk_format::{FeedbackPath, FeedbackPhase, parse_verdict};
-use crate::lifecycle::{CommitSha, PlanKey, PlanPath, content_hash};
+use crate::lifecycle::{CommitSha, PlanKey, content_hash};
 use crate::repo_state::{Feedback, HeldFeedback, Plan, RepoState};
 
 /// Everything Trinity needs to derive a repo's state, materialized into
@@ -44,7 +44,7 @@ pub struct DiskSnapshot {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PlanFileBlob {
     pub plan_key: PlanKey,
-    pub plan_path: PlanPath,
+    pub plan_path: PathBuf,
     /// Body from HEAD's blob (not the working tree).
     pub body: String,
     /// First commit that added this plan path (via `git log
@@ -87,7 +87,7 @@ pub fn derive_state(repo_root: PathBuf, snapshot: DiskSnapshot) -> RepoState {
     }
     for (key, mut entries) in by_key {
         if entries.len() >= 2 {
-            let paths: Vec<PlanPath> = entries.iter().map(|pf| pf.plan_path.clone()).collect();
+            let paths: Vec<PathBuf> = entries.iter().map(|pf| pf.plan_path.clone()).collect();
             state.plan_conflicts.insert(key, paths);
             continue;
         }
@@ -184,7 +184,7 @@ fn ingest_feedback(plan: &mut Plan, fb: FeedbackBlob) {
 mod tests {
     use super::*;
     use crate::attribution::PlanTouch;
-    use crate::lifecycle::AgentLabel;
+    use crate::lifecycle::{AgentLabel, is_done_plan_path};
     use crate::repo_state::{AttributionResult, PlanTouchKind};
 
     fn sha(s: &str) -> CommitSha {
@@ -198,7 +198,7 @@ mod tests {
     fn plan_file(stem: &str, intro: &str, parent: Option<&str>, body: &str) -> PlanFileBlob {
         PlanFileBlob {
             plan_key: sess(stem),
-            plan_path: PlanPath::new(format!(".trinity/plans/{stem}.md")),
+            plan_path: PathBuf::from(format!(".trinity/plans/{stem}.md")),
             body: body.to_string(),
             plan_intro: sha(intro),
             plan_intro_parent: parent.map(sha),
@@ -265,7 +265,7 @@ mod tests {
         assert_eq!(s.body_hash, content_hash("# foo\n"));
         assert_eq!(s.plan_intro, sha("intro1"));
         assert_eq!(s.plan_intro_parent, Some(sha("parent1")));
-        assert_eq!(s.plan_path, PlanPath::new(".trinity/plans/foo.md"));
+        assert_eq!(s.plan_path, PathBuf::from(".trinity/plans/foo.md"));
     }
 
     #[test]
@@ -344,7 +344,7 @@ mod tests {
     #[test]
     fn multi_plan_touches_still_count_as_each_sessions_plan_revision() {
         let mut done = plan_file("done-one", "c1", None, "# done\n");
-        done.plan_path = PlanPath::new(".trinity/plans/done/done-one.md");
+        done.plan_path = PathBuf::from(".trinity/plans/done/done-one.md");
         let snap = DiskSnapshot {
             head: Some(sha("c3")),
             plan_files: vec![
@@ -490,7 +490,7 @@ mod tests {
     #[test]
     fn session_in_done_subdir_uses_done_path() {
         let mut pf = plan_file("foo", "c1", None, "# foo\n");
-        pf.plan_path = PlanPath::new(".trinity/plans/done/foo.md");
+        pf.plan_path = PathBuf::from(".trinity/plans/done/foo.md");
         let snap = DiskSnapshot {
             head: Some(sha("c2")),
             plan_files: vec![pf],
@@ -500,7 +500,7 @@ mod tests {
         let state = derive_state(PathBuf::from("/r"), snap);
         assert_eq!(
             state.plans[&sess("foo")].plan_path,
-            PlanPath::new(".trinity/plans/done/foo.md")
+            PathBuf::from(".trinity/plans/done/foo.md")
         );
     }
 
@@ -683,7 +683,7 @@ mod tests {
         // After moving to plans/done/, the session is still present;
         // historical commits remain attributed.
         let mut pf = plan_file("foo", "c1", None, "# foo\n");
-        pf.plan_path = PlanPath::new(".trinity/plans/done/foo.md");
+        pf.plan_path = PathBuf::from(".trinity/plans/done/foo.md");
         let snap = DiskSnapshot {
             head: Some(sha("c4")),
             plan_files: vec![pf],
@@ -1024,12 +1024,12 @@ mod tests {
         assert_eq!(authors, vec!["alice", "bob"]);
     }
 
-    // ===== plan_conflicts / resolve_plan =====
+    // ===== plan_conflicts =====
 
     fn done_plan_file(stem: &str, intro: &str, body: &str) -> PlanFileBlob {
         PlanFileBlob {
             plan_key: sess(stem),
-            plan_path: PlanPath::new(format!(".trinity/plans/done/{stem}.md")),
+            plan_path: PathBuf::from(format!(".trinity/plans/done/{stem}.md")),
             body: body.to_string(),
             plan_intro: sha(intro),
             plan_intro_parent: None,
@@ -1057,133 +1057,8 @@ mod tests {
             .get(&sess("foo"))
             .expect("conflict surfaced");
         assert_eq!(paths.len(), 2);
-        assert!(paths.iter().any(|p| !p.is_done()));
-        assert!(paths.iter().any(|p| p.is_done()));
-    }
-
-    #[test]
-    fn resolve_plan_accepts_current_path() {
-        let snap = DiskSnapshot {
-            head: Some(sha("c1")),
-            plan_files: vec![plan_file("foo", "c1", None, "# foo\n")],
-            history: vec![],
-            feedback_files: vec![],
-        };
-        let state = derive_state(PathBuf::from("/r"), snap);
-        let resolved = state
-            .resolve_plan(&PlanPath::new(".trinity/plans/foo.md"))
-            .expect("active path resolves");
-        assert_eq!(resolved.id, sess("foo"));
-    }
-
-    #[test]
-    fn resolve_plan_accepts_active_done_counterpart() {
-        let snap = DiskSnapshot {
-            head: Some(sha("c1")),
-            plan_files: vec![done_plan_file("foo", "c1", "# foo\n")],
-            history: vec![],
-            feedback_files: vec![],
-        };
-        let state = derive_state(PathBuf::from("/r"), snap);
-        let resolved = state
-            .resolve_plan(&PlanPath::new(".trinity/plans/foo.md"))
-            .expect("active counterpart resolves to done");
-        assert!(resolved.plan_path.is_done());
-    }
-
-    #[test]
-    fn resolve_plan_rejects_unknown() {
-        let state = derive_state(PathBuf::from("/r"), DiskSnapshot::default());
-        let err = state
-            .resolve_plan(&PlanPath::new(".trinity/plans/missing.md"))
-            .unwrap_err();
-        assert!(matches!(
-            err,
-            crate::repo_state::PlanLookupError::UnknownPlan(_)
-        ));
-    }
-
-    #[test]
-    fn resolve_plan_rejects_invalid_path() {
-        let state = derive_state(PathBuf::from("/r"), DiskSnapshot::default());
-        let err = state
-            .resolve_plan(&PlanPath::new("notes/foo.md"))
-            .unwrap_err();
-        assert!(matches!(
-            err,
-            crate::repo_state::PlanLookupError::InvalidPlanPath(_)
-        ));
-    }
-
-    #[test]
-    fn resolve_plan_rejects_path_mismatch_within_same_stem() {
-        // Construct a state where `foo` lives at the active path, but
-        // somebody hand-crafts a request for `.trinity/plans/done/foo.md`.
-        // The done variant is the counterpart, so it's accepted. Now flip
-        // the scenario: a plan whose current path is `foo.md` but the
-        // request is for a path that shares the stem but isn't its
-        // counterpart — that's impossible by construction (PlanKey takes
-        // only the stem) so we instead verify the mismatch path fires for
-        // a different stem that resolves the same.
-        //
-        // Concretely: same plan, but the runtime believes it's at the
-        // active path. A request for the active path matches; a request
-        // for the done counterpart returns the active record (counterpart
-        // acceptance). We assert the counterpart acceptance behavior
-        // explicitly and round-trip the mismatch error variant for
-        // exhaustive coverage by constructing it directly.
-        let snap = DiskSnapshot {
-            head: Some(sha("c1")),
-            plan_files: vec![plan_file("foo", "c1", None, "# foo\n")],
-            history: vec![],
-            feedback_files: vec![],
-        };
-        let state = derive_state(PathBuf::from("/r"), snap);
-
-        let counterpart_resolves = state
-            .resolve_plan(&PlanPath::new(".trinity/plans/done/foo.md"))
-            .expect("counterpart resolves to the active plan");
-        assert_eq!(counterpart_resolves.id, sess("foo"));
-
-        // PlanPathMismatch can be triggered today only if the runtime's
-        // current path is the done variant and the caller requests an
-        // entirely different stem path that happens to share the key —
-        // which is impossible. Cover the variant constructor here so a
-        // future caller that surfaces it can rely on the shape.
-        let err = crate::repo_state::PlanLookupError::PlanPathMismatch {
-            current: PlanPath::new(".trinity/plans/foo.md"),
-            requested: PlanPath::new(".trinity/plans/other.md"),
-        };
-        match err {
-            crate::repo_state::PlanLookupError::PlanPathMismatch { current, requested } => {
-                assert_ne!(current, requested);
-            }
-            _ => unreachable!(),
-        }
-    }
-
-    #[test]
-    fn resolve_plan_surfaces_conflict_before_unknown() {
-        let snap = DiskSnapshot {
-            head: Some(sha("c2")),
-            plan_files: vec![
-                plan_file("foo", "c1", None, "# active\n"),
-                done_plan_file("foo", "c2", "# done\n"),
-            ],
-            history: vec![],
-            feedback_files: vec![],
-        };
-        let state = derive_state(PathBuf::from("/r"), snap);
-        let err = state
-            .resolve_plan(&PlanPath::new(".trinity/plans/foo.md"))
-            .unwrap_err();
-        match err {
-            crate::repo_state::PlanLookupError::PlanConflict { key, paths } => {
-                assert_eq!(key, sess("foo"));
-                assert_eq!(paths.len(), 2);
-            }
-            other => panic!("expected PlanConflict, got {other:?}"),
-        }
+        assert!(paths.iter().any(|p| !is_done_plan_path(p)));
+        assert!(paths.iter().any(|p| is_done_plan_path(p)));
     }
 
     /// Reusable fixture: foo plan (plan_intro c1) + one impl commit c2,

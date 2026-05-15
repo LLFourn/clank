@@ -51,13 +51,17 @@ fn diff_view(page: DiffPage) -> impl IntoView {
     let from_short = short_sha(&page.from);
     let to_short = short_sha(&page.to);
     let title = format!("Plan diff {from_short} → {to_short}");
-    let path = page.path.clone();
+    let path_label = if page.from_path == page.to_path {
+        page.from_path.clone()
+    } else {
+        format!("{} → {}", page.from_path, page.to_path)
+    };
     view! {
         <article class="plan-diff">
             <header class="session-header">
                 <h1>{title}</h1>
                 <span class="muted">
-                    <code>{path}</code>
+                    <code>{path_label}</code>
                 </span>
             </header>
             <StructuredDiff files=page.diff_files/>

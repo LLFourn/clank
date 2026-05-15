@@ -19,7 +19,7 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast::error::RecvError;
 
-use crate::lifecycle::{AgentLabel, CommitSha, ContentHash, PlanKey, PlanPath};
+use crate::lifecycle::{AgentLabel, CommitSha, ContentHash, PlanKey};
 use crate::mcp_response::compute_plan_worktree_status_parts;
 use crate::projection::{
     expected_action, impl_gate_for, latest_impl_commit, latest_plan_touching_commit, phase,
@@ -78,7 +78,7 @@ pub enum WaitError {
     #[error("unknown plan: {0}")]
     UnknownPlan(String),
     #[error("plan conflict: stem `{key}` maps to {paths:?}")]
-    PlanConflict { key: PlanKey, paths: Vec<PlanPath> },
+    PlanConflict { key: PlanKey, paths: Vec<PathBuf> },
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
 }
@@ -327,7 +327,7 @@ fn rc_feedback_paths(
 struct Candidate {
     repo_root: PathBuf,
     plan_key: PlanKey,
-    plan_path: PlanPath,
+    plan_path: PathBuf,
     body_hash: ContentHash,
     session_phase: Phase,
     plan_gate: Option<ReviewGateDecision>,
@@ -410,7 +410,7 @@ mod tests {
         Candidate {
             repo_root: PathBuf::from("/repo"),
             plan_key: PlanKey::from("sid"),
-            plan_path: PlanPath::new(".trinity/plans/sid.md"),
+            plan_path: PathBuf::from(".trinity/plans/sid.md"),
             body_hash: content_hash("x"),
             session_phase: Phase::Planning,
             plan_gate: None,
@@ -785,6 +785,62 @@ mod integration_tests {
             "bob's write path should be returned, got {}",
             locations[0]
         );
+    }
+
+    #[tokio::test]
+    async fn same_stem_different_repos_route_to_correct_repo() {
+        // Two tempdir repos with distinct basenames + the same plan
+        // stem. wait_for_work scoped to each repo's basename must
+        // resolve to that repo's plan and return locations rooted
+        // under it — never confused across repos.
+        let parent_a = tempfile::tempdir().unwrap();
+        let parent_b = tempfile::tempdir().unwrap();
+        let dir_a = parent_a.path().join("alpha");
+        let dir_b = parent_b.path().join("beta");
+        std::fs::create_dir_all(&dir_a).unwrap();
+        std::fs::create_dir_all(&dir_b).unwrap();
+        for d in [&dir_a, &dir_b] {
+            run_git(d, &["init", "--quiet", "--initial-branch=main"]);
+            run_git(d, &["config", "user.email", "test@test"]);
+            run_git(d, &["config", "user.name", "test"]);
+            run_git(d, &["config", "commit.gpgsign", "false"]);
+        }
+        write_file(&dir_a, ".trinity/plans/shared.md", "# in alpha\n");
+        commit(&dir_a, "alpha shared");
+        write_file(&dir_b, ".trinity/plans/shared.md", "# in beta\n");
+        commit(&dir_b, "beta shared");
+
+        let rt = Runtime::new();
+        rt.add_repo(dir_a.clone()).await.unwrap();
+        rt.add_repo(dir_b.clone()).await.unwrap();
+
+        let resp_a = wait_for_work(&rt, args(&dir_a, "reviewers", "shared", "codex"))
+            .await
+            .unwrap();
+        let resp_b = wait_for_work(&rt, args(&dir_b, "reviewers", "shared", "codex"))
+            .await
+            .unwrap();
+        match (resp_a, resp_b) {
+            (
+                WaitResponse::Work {
+                    plan_id: id_a,
+                    repo: repo_a,
+                    ..
+                },
+                WaitResponse::Work {
+                    plan_id: id_b,
+                    repo: repo_b,
+                    ..
+                },
+            ) => {
+                assert_eq!(id_a, "alpha/shared.md");
+                assert_eq!(id_b, "beta/shared.md");
+                assert_ne!(repo_a, repo_b);
+                assert!(repo_a.ends_with("alpha"));
+                assert!(repo_b.ends_with("beta"));
+            }
+            other => panic!("both calls should return Work; got {other:?}"),
+        }
     }
 
     #[tokio::test]

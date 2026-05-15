@@ -49,6 +49,8 @@ pub enum RuntimeError {
     Io(#[from] std::io::Error),
     #[error("unknown repo: {0}")]
     UnknownRepo(PathBuf),
+    #[error("repo path has no usable basename: {0}")]
+    InvalidRepoPath(PathBuf),
 }
 
 impl Runtime {
@@ -69,19 +71,19 @@ impl Runtime {
     /// auto-organized into `<phase>/<target-sha>/<author>.md`.
     pub async fn add_repo(&self, repo_root: PathBuf) -> Result<(), RuntimeError> {
         let canonical = dunce::canonicalize(&repo_root).unwrap_or(repo_root);
-        let basename = crate::lifecycle::RepoBasename::from_repo_root(&canonical);
+        let basename = crate::lifecycle::RepoBasename::from_repo_root(&canonical)
+            .ok_or_else(|| RuntimeError::InvalidRepoPath(canonical.clone()))?;
         let fresh = rebuild_repo(&canonical).await?;
         {
             let mut trinity = self.state.lock().await;
             // Basename collision: first registration wins. The shadowed
             // repo is logged and silently dropped per plan §1 /
             // repo_basenames invariant.
-            if let Some(name) = basename.clone()
-                && let Some(claimed_by) = trinity.repo_basenames.get(&name)
+            if let Some(claimed_by) = trinity.repo_basenames.get(&basename)
                 && claimed_by != &canonical
             {
                 tracing::warn!(
-                    basename = %name,
+                    basename = %basename,
                     claimed_by = %claimed_by.display(),
                     shadowed = %canonical.display(),
                     "repo basename collides with an already-watched repo; shadowed repo will be ignored"
@@ -89,9 +91,9 @@ impl Runtime {
                 return Ok(());
             }
             trinity.repos.insert(canonical.clone(), fresh);
-            if let Some(name) = basename {
-                trinity.repo_basenames.insert(name, canonical.clone());
-            }
+            trinity
+                .repo_basenames
+                .insert(basename, canonical.clone());
         }
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -223,7 +225,7 @@ impl Runtime {
             FilesystemSignal::HeadChanged => {
                 let fresh = rebuild_repo(repo_root).await?;
                 let fresh_digest = fresh.digest();
-                let changed = {
+                {
                     let mut trinity = self.state.lock().await;
                     let prior_digest = trinity.repos.get(repo_root).map(|r| r.digest());
                     let changed = prior_digest.as_ref() != Some(&fresh_digest);
@@ -241,14 +243,12 @@ impl Runtime {
                             },
                         );
                     }
-                    changed
-                };
+                }
                 // Held-feedback normalization sweep runs even when nothing
                 // visibly changed in the rebuild — a watcher-induced rebuild
                 // might still need to release a flat-drop file. The sweep
                 // itself emits events only on actual file moves.
                 self.normalize_held_feedback(repo_root, now).await?;
-                let _ = changed; // tracing hook for future "rebuild was a no-op" log
             }
             FilesystemSignal::PlanFileChanged { session_id, path } => {
                 let mut trinity = self.state.lock().await;
@@ -505,11 +505,10 @@ impl Runtime {
         if matches!(parsed.phase, FeedbackPhase::Plan) {
             use crate::projection::plan_worktree_status;
             use crate::repo_state::PlanWorktreeStatus;
-            let active_path = repo_root.join(snapshot.plan_path.as_path());
-            let counterpart_rel = snapshot.plan_path.counterpart();
-            let counterpart_abs = counterpart_rel
-                .as_ref()
-                .map(|p| repo_root.join(p.as_path()));
+            let active_path = repo_root.join(&snapshot.plan_path);
+            let counterpart_rel =
+                crate::lifecycle::plan_path_counterpart(&snapshot.plan_path);
+            let counterpart_abs = counterpart_rel.as_ref().map(|p| repo_root.join(p));
             let wt_hash = std::fs::read_to_string(&active_path)
                 .ok()
                 .map(|b| content_hash(&b));
@@ -540,7 +539,7 @@ impl Runtime {
 
 struct FlatDropSnapshot {
     body_hash: crate::lifecycle::ContentHash,
-    plan_path: crate::lifecycle::PlanPath,
+    plan_path: std::path::PathBuf,
     target: Option<CommitSha>,
 }
 

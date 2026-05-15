@@ -41,9 +41,11 @@ pub fn catalog() -> Vec<ToolDescriptor> {
         },
         ToolDescriptor {
             name: "list_plans".to_string(),
-            description: "List Trinity plans across watched repos. Pass `repo` (basename or \
-                          absolute path) to scope. Response: `{ plans, conflicts }`. Each plan \
-                          row: `{ plan_id, slug, state, current_path, phase, \
+            description: "List Trinity plans in one repo. Defaults to the caller's cwd-repo; \
+                          pass `repo` (basename or absolute path) to scope to a specific watched \
+                          repo. Cross-repo aggregation is not exposed on MCP; use HTTP \
+                          `/api/plans` if you need it. Response: `{ plans, conflicts }`. Each \
+                          plan row: `{ plan_id, slug, state, current_path, phase, \
                           plan_worktree_status, waiting_on }`. `plan_id` is the canonical \
                           `<repo_basename>/<stem>.md` identifier. Each conflict row: \
                           `{ plan_id, slug, paths }` — the same plan stem maps to multiple \
@@ -54,7 +56,7 @@ pub fn catalog() -> Vec<ToolDescriptor> {
                 "properties": {
                     "repo": {
                         "type": "string",
-                        "description": "Filter by repo. Basename or absolute path. Optional; defaults to all watched repos."
+                        "description": "Filter by repo. Basename or absolute path. Optional; defaults to caller's cwd-repo."
                     }
                 },
                 "additionalProperties": false

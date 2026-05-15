@@ -338,7 +338,8 @@ pub struct DiffPage {
     pub plan_id: String,
     pub from: String,
     pub to: String,
-    pub path: String,
+    pub from_path: String,
+    pub to_path: String,
     #[serde(default)]
     pub diff_files: Vec<FileDiff>,
 }

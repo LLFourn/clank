@@ -8,7 +8,7 @@ use std::path::Path;
 
 use serde_json::{Value, json};
 
-use crate::lifecycle::{AgentLabel, ContentHash, PlanKey, PlanPath, content_hash};
+use crate::lifecycle::{AgentLabel, ContentHash, PlanKey, content_hash, plan_path_counterpart};
 use crate::projection::{
     all_implementation_commits, all_plan_revisions, expected_action, impl_gate_for,
     latest_impl_commit, latest_plan_touching_commit, phase, plan_gate_for, plan_worktree_status,
@@ -22,7 +22,7 @@ pub trait PlanStatusReader {
     fn compute(
         &self,
         repo_root: &Path,
-        plan_path: &PlanPath,
+        plan_path: &Path,
         body_hash: &ContentHash,
     ) -> std::io::Result<PlanWorktreeStatus>;
 }
@@ -33,7 +33,7 @@ impl PlanStatusReader for DiskPlanStatusReader {
     fn compute(
         &self,
         repo_root: &Path,
-        plan_path: &PlanPath,
+        plan_path: &Path,
         body_hash: &ContentHash,
     ) -> std::io::Result<PlanWorktreeStatus> {
         compute_plan_worktree_status_parts(repo_root, plan_path, body_hash)
@@ -44,14 +44,12 @@ impl PlanStatusReader for DiskPlanStatusReader {
 /// copied snapshot fields.
 pub fn compute_plan_worktree_status_parts(
     repo_root: &Path,
-    plan_path: &PlanPath,
+    plan_path: &Path,
     body_hash: &ContentHash,
 ) -> std::io::Result<PlanWorktreeStatus> {
-    let active_path = repo_root.join(plan_path.as_path());
-    let counterpart_rel = plan_path.counterpart();
-    let counterpart_abs = counterpart_rel
-        .as_ref()
-        .map(|p| repo_root.join(p.as_path()));
+    let active_path = repo_root.join(plan_path);
+    let counterpart_rel = plan_path_counterpart(plan_path);
+    let counterpart_abs = counterpart_rel.as_ref().map(|p| repo_root.join(p));
 
     let wt_hash = match std::fs::read_to_string(&active_path) {
         Ok(body) => Some(content_hash(&body)),
@@ -68,13 +66,6 @@ pub fn compute_plan_worktree_status_parts(
         wt_hash.as_ref(),
         counterpart_exists,
     ))
-}
-
-/// Given a plan path, return its counterpart in the active↔done flip:
-/// `.trinity/plans/<stem>.md` ↔ `.trinity/plans/done/<stem>.md`. Returns
-/// `None` if `plan_path` does not parse as a canonical plan path.
-pub fn swap_active_done(plan_path: &PlanPath) -> Option<PlanPath> {
-    plan_path.counterpart()
 }
 
 /// `list_plans` response over a single repo.
@@ -664,7 +655,7 @@ mod tests {
         fn compute(
             &self,
             _repo_root: &Path,
-            _plan_path: &PlanPath,
+            _plan_path: &Path,
             _body_hash: &ContentHash,
         ) -> std::io::Result<PlanWorktreeStatus> {
             self.entered.send(()).unwrap();

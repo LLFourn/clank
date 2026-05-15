@@ -194,94 +194,24 @@ impl PlanKey {
     }
 }
 
-/// A caller-supplied or runtime-stored repo-relative plan-file path.
-///
-/// Canonical values look like `.trinity/plans/<stem>.md` or
-/// `.trinity/plans/done/<stem>.md`, and the runtime stores only canonical
-/// values (every path Trinity produces — `Plan.plan_path`, MCP responses,
-/// SSE events, the watcher discovery layer — has been validated via
-/// [`PlanKey::from_path`]). [`PlanPath::new`] is intentionally permissive
-/// so that callers can take a freeform string off the wire, hand it to
-/// [`RepoState::resolve_plan`], and get a structured rejection
-/// (`InvalidPlanPath` / `UnknownPlan` / etc.) instead of a panic. Use
-/// [`PlanPath::try_new`] when you need pre-validation without going
-/// through a resolver.
-///
-/// [`RepoState::resolve_plan`]: crate::repo_state::RepoState::resolve_plan
-#[derive(
-    Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
-)]
-#[serde(transparent)]
-pub struct PlanPath(PathBuf);
-
-impl PlanPath {
-    pub fn new(p: impl Into<PathBuf>) -> Self {
-        Self(p.into())
-    }
-
-    /// Construct only if `p` matches the [`PlanKey::from_path`] grammar.
-    pub fn try_new(p: impl Into<PathBuf>) -> Option<Self> {
-        let buf: PathBuf = p.into();
-        PlanKey::from_path(&buf)?;
-        Some(Self(buf))
-    }
-
-    pub fn as_path(&self) -> &Path {
-        &self.0
-    }
-
-    pub fn into_path_buf(self) -> PathBuf {
-        self.0
-    }
-
-    pub fn to_string_lossy(&self) -> std::borrow::Cow<'_, str> {
-        self.0.to_string_lossy()
-    }
-
-    /// True when this path lies under `.trinity/plans/done/`.
-    pub fn is_done(&self) -> bool {
-        self.0
-            .components()
-            .any(|c| matches!(c, Component::Normal(s) if s == "done"))
-    }
-
-    /// The active/done counterpart: `.trinity/plans/foo.md` ↔
-    /// `.trinity/plans/done/foo.md`. Returns `None` if the path doesn't
-    /// parse as a canonical plan path.
-    pub fn counterpart(&self) -> Option<PlanPath> {
-        let key = PlanKey::from_path(&self.0)?;
-        let stem = key.as_str();
-        let buf = if self.is_done() {
-            PathBuf::from(format!(".trinity/plans/{stem}.md"))
-        } else {
-            PathBuf::from(format!(".trinity/plans/done/{stem}.md"))
-        };
-        Some(PlanPath(buf))
-    }
+/// True when `p` lies under `.trinity/plans/done/`. Pure check on the
+/// path string; doesn't touch disk.
+pub fn is_done_plan_path(p: &Path) -> bool {
+    p.components()
+        .any(|c| matches!(c, Component::Normal(s) if s == "done"))
 }
 
-impl AsRef<Path> for PlanPath {
-    fn as_ref(&self) -> &Path {
-        &self.0
-    }
-}
-
-impl fmt::Display for PlanPath {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.0.to_string_lossy())
-    }
-}
-
-impl From<PathBuf> for PlanPath {
-    fn from(p: PathBuf) -> Self {
-        Self(p)
-    }
-}
-
-impl From<&Path> for PlanPath {
-    fn from(p: &Path) -> Self {
-        Self(p.to_path_buf())
-    }
+/// Active↔done counterpart of a canonical plan path:
+/// `.trinity/plans/foo.md` ↔ `.trinity/plans/done/foo.md`. Returns `None`
+/// if `p` doesn't parse as a canonical plan path.
+pub fn plan_path_counterpart(p: &Path) -> Option<PathBuf> {
+    let key = PlanKey::from_path(p)?;
+    let stem = key.as_str();
+    Some(if is_done_plan_path(p) {
+        PathBuf::from(format!(".trinity/plans/{stem}.md"))
+    } else {
+        PathBuf::from(format!(".trinity/plans/done/{stem}.md"))
+    })
 }
 
 /// Stable content hash for a plan-file body. Identifies "is this the same
@@ -342,22 +272,84 @@ mod tests {
     }
 
     #[test]
-    fn plan_path_is_done_helper() {
-        assert!(!PlanPath::new(".trinity/plans/foo.md").is_done());
-        assert!(PlanPath::new(".trinity/plans/done/foo.md").is_done());
+    fn is_done_plan_path_helper() {
+        assert!(!is_done_plan_path(&p(".trinity/plans/foo.md")));
+        assert!(is_done_plan_path(&p(".trinity/plans/done/foo.md")));
     }
 
     #[test]
     fn plan_path_counterpart_flips_active_done() {
-        let active = PlanPath::new(".trinity/plans/foo.md");
-        let done = PlanPath::new(".trinity/plans/done/foo.md");
-        assert_eq!(active.counterpart().unwrap(), done);
-        assert_eq!(done.counterpart().unwrap(), active);
+        let active = p(".trinity/plans/foo.md");
+        let done = p(".trinity/plans/done/foo.md");
+        assert_eq!(plan_path_counterpart(&active), Some(done.clone()));
+        assert_eq!(plan_path_counterpart(&done), Some(active));
     }
 
     #[test]
-    fn plan_path_try_new_rejects_off_tree() {
-        assert!(PlanPath::try_new("plans/foo.md").is_none());
-        assert!(PlanPath::try_new(".trinity/plans/foo.md").is_some());
+    fn plan_path_counterpart_rejects_off_tree() {
+        assert!(plan_path_counterpart(&p("plans/foo.md")).is_none());
+    }
+
+    // ---- PlanId::parse ----
+
+    #[test]
+    fn plan_id_parses_canonical_form() {
+        let pid = PlanId::parse("trinity/foo.md").unwrap();
+        assert_eq!(pid.repo().as_str(), "trinity");
+        assert_eq!(pid.key().as_str(), "foo");
+        assert_eq!(pid.to_string(), "trinity/foo.md");
+    }
+
+    #[test]
+    fn plan_id_accepts_dots_in_stem() {
+        let pid = PlanId::parse("trinity/foo.v2.md").unwrap();
+        assert_eq!(pid.key().as_str(), "foo.v2");
+    }
+
+    #[test]
+    fn plan_id_malformed_without_slash() {
+        assert_eq!(
+            PlanId::parse("foo.md").unwrap_err(),
+            ParsePlanIdError::Malformed
+        );
+    }
+
+    #[test]
+    fn plan_id_empty_repo_rejected() {
+        assert_eq!(
+            PlanId::parse("/foo.md").unwrap_err(),
+            ParsePlanIdError::EmptyRepo
+        );
+    }
+
+    #[test]
+    fn plan_id_missing_md_suffix_rejected() {
+        assert_eq!(
+            PlanId::parse("trinity/foo").unwrap_err(),
+            ParsePlanIdError::MissingMdSuffix
+        );
+    }
+
+    #[test]
+    fn plan_id_empty_stem_rejected() {
+        assert_eq!(
+            PlanId::parse("trinity/.md").unwrap_err(),
+            ParsePlanIdError::EmptyStem
+        );
+    }
+
+    #[test]
+    fn plan_id_slash_in_stem_rejected() {
+        assert_eq!(
+            PlanId::parse("trinity/sub/foo.md").unwrap_err(),
+            ParsePlanIdError::SlashInStem
+        );
+    }
+
+    #[test]
+    fn plan_id_roundtrips_through_display() {
+        let original = "trinity/plan-path-identity.md";
+        let pid = PlanId::parse(original).unwrap();
+        assert_eq!(pid.to_string(), original);
     }
 }

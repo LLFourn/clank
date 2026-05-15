@@ -6,7 +6,9 @@
 //! `wait_for_work` matching, tests) call into these functions so the
 //! derivation logic stays in one place and can't drift between surfaces.
 
-use crate::lifecycle::{AgentLabel, ContentHash, PlanPath};
+use std::path::Path;
+
+use crate::lifecycle::{AgentLabel, ContentHash, is_done_plan_path};
 use crate::repo_state::{
     AttributionResult, Feedback, Phase, Plan, PlanWorktreeStatus, WaitingOn, WaitingReason,
     WaitingRole,
@@ -49,11 +51,11 @@ pub fn phase(plan: &Plan, attribution: &BTreeMap<CommitSha, AttributionResult>) 
 /// Phase derivation from primitive inputs. Used by callers that hold a
 /// snapshot (e.g. `ui_response`) rather than a `&Plan`.
 pub fn phase_for(
-    plan_path: &PlanPath,
+    plan_path: &Path,
     plan_key: &crate::lifecycle::PlanKey,
     attribution: &BTreeMap<CommitSha, AttributionResult>,
 ) -> Phase {
-    if plan_path.is_done() {
+    if is_done_plan_path(plan_path) {
         return Phase::Done;
     }
     for attr in attribution.values() {
@@ -167,6 +169,45 @@ fn waiting_from_gate(gate: Option<&ReviewGateDecision>, phase: GatePhase) -> Wai
             }
         }
     }
+}
+
+/// Repo-relative path of the plan file at the given commit's tree.
+///
+/// Walks `plan_touches` along `commit_order` from the start to (and
+/// including) `target_sha`, flipping between active and done as `DoneMove`
+/// touches land. Used by revision/diff routes to look up historical blobs
+/// without assuming the plan file lived at its current path for the whole
+/// history.
+///
+/// Returns `None` if `target_sha` isn't in `commit_order`.
+pub fn plan_path_at(
+    plan_key: &crate::lifecycle::PlanKey,
+    target_sha: &CommitSha,
+    commit_order: &[CommitSha],
+    plan_touches: &BTreeMap<
+        CommitSha,
+        Vec<(crate::lifecycle::PlanKey, crate::repo_state::PlanTouchKind)>,
+    >,
+) -> Option<std::path::PathBuf> {
+    let target_pos = commit_order.iter().position(|c| c == target_sha)?;
+    let stem = plan_key.as_str();
+    let mut is_done = false;
+    for sha in &commit_order[..=target_pos] {
+        if let Some(touches) = plan_touches.get(sha) {
+            for (k, kind) in touches {
+                if k == plan_key
+                    && matches!(kind, crate::repo_state::PlanTouchKind::DoneMove)
+                {
+                    is_done = true;
+                }
+            }
+        }
+    }
+    Some(if is_done {
+        std::path::PathBuf::from(format!(".trinity/plans/done/{stem}.md"))
+    } else {
+        std::path::PathBuf::from(format!(".trinity/plans/{stem}.md"))
+    })
 }
 
 /// All plan-touching commits attributed to `session`, in chronological
@@ -516,8 +557,10 @@ fn description_for(
 mod tests {
     use super::*;
 
-    use crate::lifecycle::AgentLabel;
+    use crate::lifecycle::{AgentLabel, PlanKey};
+    use crate::repo_state::PlanTouchKind;
     use crate::review_state::{ReviewGateDecision, ReviewGateState, ReviewPhase};
+    use std::path::PathBuf;
 
     fn hash(s: &str) -> ContentHash {
         ContentHash::from(format!("h:{s}"))
@@ -789,6 +832,66 @@ mod tests {
             w.description.contains("bob"),
             "description should reference the requesting reviewer; got: {}",
             w.description
+        );
+    }
+
+    // -------- plan_path_at --------
+
+    fn cs(s: &str) -> CommitSha {
+        CommitSha::from(s)
+    }
+
+    fn pk(s: &str) -> PlanKey {
+        PlanKey::from(s)
+    }
+
+    #[test]
+    fn plan_path_at_returns_active_before_any_done_move() {
+        let order = vec![cs("c1"), cs("c2")];
+        let mut touches: BTreeMap<CommitSha, Vec<(PlanKey, PlanTouchKind)>> = BTreeMap::new();
+        touches.insert(cs("c1"), vec![(pk("foo"), PlanTouchKind::Intro)]);
+        touches.insert(cs("c2"), vec![(pk("foo"), PlanTouchKind::Revision)]);
+        let p = plan_path_at(&pk("foo"), &cs("c2"), &order, &touches).unwrap();
+        assert_eq!(p, PathBuf::from(".trinity/plans/foo.md"));
+    }
+
+    #[test]
+    fn plan_path_at_flips_to_done_at_done_move_commit() {
+        let order = vec![cs("c1"), cs("c2"), cs("c3")];
+        let mut touches: BTreeMap<CommitSha, Vec<(PlanKey, PlanTouchKind)>> = BTreeMap::new();
+        touches.insert(cs("c1"), vec![(pk("foo"), PlanTouchKind::Intro)]);
+        touches.insert(cs("c3"), vec![(pk("foo"), PlanTouchKind::DoneMove)]);
+
+        assert_eq!(
+            plan_path_at(&pk("foo"), &cs("c1"), &order, &touches).unwrap(),
+            PathBuf::from(".trinity/plans/foo.md"),
+        );
+        assert_eq!(
+            plan_path_at(&pk("foo"), &cs("c2"), &order, &touches).unwrap(),
+            PathBuf::from(".trinity/plans/foo.md"),
+        );
+        assert_eq!(
+            plan_path_at(&pk("foo"), &cs("c3"), &order, &touches).unwrap(),
+            PathBuf::from(".trinity/plans/done/foo.md"),
+        );
+    }
+
+    #[test]
+    fn plan_path_at_unknown_sha_returns_none() {
+        let order = vec![cs("c1")];
+        let touches: BTreeMap<CommitSha, Vec<(PlanKey, PlanTouchKind)>> = BTreeMap::new();
+        assert!(plan_path_at(&pk("foo"), &cs("zzz"), &order, &touches).is_none());
+    }
+
+    #[test]
+    fn plan_path_at_ignores_other_plans_done_move() {
+        let order = vec![cs("c1"), cs("c2")];
+        let mut touches: BTreeMap<CommitSha, Vec<(PlanKey, PlanTouchKind)>> = BTreeMap::new();
+        touches.insert(cs("c1"), vec![(pk("foo"), PlanTouchKind::Intro)]);
+        touches.insert(cs("c2"), vec![(pk("bar"), PlanTouchKind::DoneMove)]);
+        assert_eq!(
+            plan_path_at(&pk("foo"), &cs("c2"), &order, &touches).unwrap(),
+            PathBuf::from(".trinity/plans/foo.md"),
         );
     }
 }

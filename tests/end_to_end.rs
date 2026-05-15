@@ -4,10 +4,18 @@
 
 use std::path::Path;
 use std::process::Command;
+use std::sync::Mutex;
 use std::time::Duration;
 
 use serde_json::json;
 use trinity::server;
+
+/// Tests that mutate `$HOME` (so the daemon's `~/.trinity/repos`
+/// registry writes land in a tempdir rather than the user's real home)
+/// must hold this mutex for the duration of the test. Otherwise they
+/// race each other and one test's persist call lands in another test's
+/// fake home.
+static HOME_LOCK: Mutex<()> = Mutex::new(());
 
 fn run_git(cwd: &Path, args: &[&str]) {
     let status = Command::new("git")
@@ -366,37 +374,59 @@ async fn sse_pushes_repo_rebuilt_on_head_change() {
 
     // The fs watcher (notify-debouncer-full, 150ms window) picks up
     // .git/logs/HEAD and emits a `repo_rebuilt` SSE event.
-    let mut got_event = false;
+    let mut payload: Option<serde_json::Value> = None;
     let timeout = tokio::time::sleep(Duration::from_secs(10));
     tokio::pin!(timeout);
+    let mut buf = String::new();
     loop {
         tokio::select! {
             _ = &mut timeout => break,
             chunk = stream.next() => {
                 let Some(Ok(bytes)) = chunk else { continue; };
-                let text = String::from_utf8_lossy(&bytes);
-                if text.contains("repo_rebuilt") {
-                    got_event = true;
+                buf.push_str(&String::from_utf8_lossy(&bytes));
+                while let Some(end) = buf.find("\n\n") {
+                    let event = buf[..end].to_string();
+                    buf.drain(..end + 2);
+                    for line in event.lines() {
+                        if let Some(data) = line.strip_prefix("data: ")
+                            && let Ok(parsed) = serde_json::from_str::<serde_json::Value>(data)
+                            && parsed["kind"] == "repo_rebuilt"
+                        {
+                            payload = Some(parsed);
+                        }
+                    }
+                    if payload.is_some() {
+                        break;
+                    }
+                }
+                if payload.is_some() {
                     break;
                 }
             }
         }
     }
     handle.abort();
+    let payload = payload.expect("expected `repo_rebuilt` SSE event after HEAD change");
+    assert_eq!(payload["kind"], "repo_rebuilt");
+    assert!(payload["ts"].is_number(), "ts should be a unix-seconds number");
+    assert!(payload["repo"].is_string(), "repo should be a string");
     assert!(
-        got_event,
-        "expected `repo_rebuilt` SSE event after HEAD change"
+        payload["plan_id"].is_null(),
+        "repo-level events carry plan_id: null; got {payload}"
+    );
+    assert!(
+        payload["state"].is_null(),
+        "repo-level events carry state: null; got {payload}"
     );
 }
 
 #[tokio::test]
 async fn start_plan_persists_repo_to_registry() {
     // Override $HOME so we don't pollute the user's real ~/.trinity.
+    let _home_guard = HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let fake_home = tempfile::tempdir().unwrap();
-    // SAFETY: tests run single-threaded for this assertion via the
-    // function-scope env mutation; we restore after.
     let prev_home = std::env::var_os("HOME");
-    // SAFETY: set_var on Unix-ish; only called in tests.
+    // SAFETY: serialized with other HOME-mutating tests via HOME_LOCK.
     unsafe { std::env::set_var("HOME", fake_home.path()) };
 
     let dir = init_repo();
@@ -610,4 +640,202 @@ async fn done_move_endpoint_moves_plan_file() {
         dir.path().join(".trinity/plans/done/foo.md").exists(),
         "done path should exist"
     );
+}
+
+#[tokio::test]
+async fn plan_id_url_stable_across_done_flip() {
+    // The headline plan-path-identity invariant: same plan_id resolves
+    // before and after the active↔done move, and the response shape
+    // flips `state` and `current_path` to track the file's new home.
+    let dir = init_repo();
+    write_file(dir.path(), ".trinity/plans/foo.md", "# foo\n");
+    commit(dir.path(), "Add foo");
+
+    let (url, handle) = spawn_daemon(dir.path()).await;
+    let client = reqwest::Client::new();
+    let basename = dir.path().file_name().unwrap().to_str().unwrap();
+
+    let before: serde_json::Value = client
+        .get(format!("{url}/api/plan/{basename}/foo.md"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(before["plan_id"], format!("{basename}/foo.md"));
+    assert_eq!(before["state"], "active");
+    assert_eq!(before["current_path"], ".trinity/plans/foo.md");
+
+    // Move + commit the move so the watcher rebuilds against a real
+    // post-move HEAD.
+    let active = dir.path().join(".trinity/plans/foo.md");
+    let done_dir = dir.path().join(".trinity/plans/done");
+    std::fs::create_dir_all(&done_dir).unwrap();
+    std::fs::rename(&active, done_dir.join("foo.md")).unwrap();
+    commit(dir.path(), "Move foo to done");
+    tokio::time::sleep(Duration::from_millis(800)).await;
+
+    let after: serde_json::Value = client
+        .get(format!("{url}/api/plan/{basename}/foo.md"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    handle.abort();
+
+    assert_eq!(after["plan_id"], format!("{basename}/foo.md"));
+    assert_eq!(
+        after["state"], "done",
+        "state should flip to done; full response: {after}"
+    );
+    assert_eq!(
+        after["current_path"], ".trinity/plans/done/foo.md",
+        "current_path should point at done variant"
+    );
+}
+
+#[tokio::test]
+async fn same_stem_different_repos_distinguishable() {
+    // Two repos with the same plan stem must resolve to different
+    // plan_ids via their basenames, and wait_for_work / list_plans must
+    // route each call to the correct repo. This is the second headline
+    // invariant of the plan-path-identity refactor.
+    let repo_a_parent = tempfile::tempdir().unwrap();
+    let repo_b_parent = tempfile::tempdir().unwrap();
+    let dir_a = repo_a_parent.path().join("alpha");
+    let dir_b = repo_b_parent.path().join("beta");
+    std::fs::create_dir_all(&dir_a).unwrap();
+    std::fs::create_dir_all(&dir_b).unwrap();
+    for d in [&dir_a, &dir_b] {
+        run_git(d, &["init", "--quiet", "--initial-branch=main"]);
+        run_git(d, &["config", "user.email", "test@test"]);
+        run_git(d, &["config", "user.name", "test"]);
+        run_git(d, &["config", "commit.gpgsign", "false"]);
+    }
+    write_file(&dir_a, ".trinity/plans/shared.md", "# in alpha\n");
+    commit(&dir_a, "alpha shared");
+    write_file(&dir_b, ".trinity/plans/shared.md", "# in beta\n");
+    commit(&dir_b, "beta shared");
+
+    let (url, handle) = spawn_daemon_with_repos(&[dir_a.clone(), dir_b.clone()]).await;
+    let plans: serde_json::Value = reqwest::get(format!("{url}/api/plans"))
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let plan_ids: Vec<&str> = plans["plans"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|p| p["plan_id"].as_str())
+        .collect();
+    assert!(
+        plan_ids.contains(&"alpha/shared.md") && plan_ids.contains(&"beta/shared.md"),
+        "both basenames should resolve their own copy of the stem; got: {plan_ids:?}"
+    );
+
+    let client = reqwest::Client::new();
+    let alpha_resp: serde_json::Value = client
+        .get(format!("{url}/api/plan/alpha/shared.md"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let beta_resp: serde_json::Value = client
+        .get(format!("{url}/api/plan/beta/shared.md"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    handle.abort();
+    let alpha_canonical = dir_a.canonicalize().unwrap().to_string_lossy().into_owned();
+    let beta_canonical = dir_b.canonicalize().unwrap().to_string_lossy().into_owned();
+    assert_eq!(alpha_resp["repo"].as_str().unwrap(), alpha_canonical);
+    assert_eq!(beta_resp["repo"].as_str().unwrap(), beta_canonical);
+    assert_ne!(alpha_resp["repo"], beta_resp["repo"]);
+}
+
+#[tokio::test]
+async fn start_plan_rejects_repo_basename_collision() {
+    // Two distinct canonical repos with the same `file_name`: the second
+    // one's `start_plan` must fail with a basename-collision error
+    // (`repo_basename_taken`) before any disk mutation.
+    let _home_guard = HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let fake_home = tempfile::tempdir().unwrap();
+    let prev_home = std::env::var_os("HOME");
+    // SAFETY: serialized with other HOME-mutating tests via HOME_LOCK.
+    unsafe { std::env::set_var("HOME", fake_home.path()) };
+
+    let parent_a = tempfile::tempdir().unwrap();
+    let parent_b = tempfile::tempdir().unwrap();
+    let dir_a = parent_a.path().join("collide");
+    let dir_b = parent_b.path().join("collide");
+    std::fs::create_dir_all(&dir_a).unwrap();
+    std::fs::create_dir_all(&dir_b).unwrap();
+    for d in [&dir_a, &dir_b] {
+        run_git(d, &["init", "--quiet", "--initial-branch=main"]);
+        run_git(d, &["config", "user.email", "test@test"]);
+        run_git(d, &["config", "user.name", "test"]);
+        run_git(d, &["config", "commit.gpgsign", "false"]);
+    }
+
+    let (url, handle) = spawn_daemon_with_repos(&[]).await;
+    let client = reqwest::Client::new();
+
+    let req_a = json!({
+        "cwd": dir_a.clone(),
+        "tool": "start_plan",
+        "arguments": { "slug": "first", "label": "agent" }
+    });
+    let resp_a = client
+        .post(format!("{url}/internal/tool_call"))
+        .json(&req_a)
+        .send()
+        .await
+        .unwrap();
+    assert!(resp_a.status().is_success(), "first start_plan should succeed");
+
+    let req_b = json!({
+        "cwd": dir_b.clone(),
+        "tool": "start_plan",
+        "arguments": { "slug": "second", "label": "agent" }
+    });
+    let resp_b = client
+        .post(format!("{url}/internal/tool_call"))
+        .json(&req_b)
+        .send()
+        .await
+        .unwrap();
+    let status_b = resp_b.status();
+    let body_b = resp_b.text().await.unwrap();
+    handle.abort();
+
+    assert_eq!(
+        status_b,
+        reqwest::StatusCode::FORBIDDEN,
+        "collision should be a 403; got status={status_b} body={body_b}"
+    );
+    assert!(
+        body_b.contains("basename") && body_b.contains("already claimed"),
+        "error should mention basename collision; got: {body_b}"
+    );
+    // The second repo must NOT have leaked partial state to its
+    // .gitignore — we rejected before any disk mutation.
+    assert!(
+        !dir_b.join(".gitignore").exists(),
+        ".gitignore must not be written when start_plan rejects on collision"
+    );
+
+    match prev_home {
+        Some(v) => unsafe { std::env::set_var("HOME", v) },
+        None => unsafe { std::env::remove_var("HOME") },
+    }
 }

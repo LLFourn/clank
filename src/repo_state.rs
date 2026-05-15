@@ -6,7 +6,9 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::path::PathBuf;
 
-use crate::lifecycle::{AgentLabel, CommitSha, ContentHash, PlanKey, PlanPath, RepoBasename};
+use crate::lifecycle::{
+    AgentLabel, CommitSha, ContentHash, PlanKey, RepoBasename, is_done_plan_path,
+};
 
 pub type RepoRoot = PathBuf;
 
@@ -43,7 +45,7 @@ pub struct RepoState {
     /// [`Self::plans`] so neither file silently wins; resolution helpers
     /// surface the conflict so callers can flag it instead of routing
     /// work.
-    pub plan_conflicts: BTreeMap<PlanKey, Vec<PlanPath>>,
+    pub plan_conflicts: BTreeMap<PlanKey, Vec<PathBuf>>,
 }
 
 impl RepoState {
@@ -256,54 +258,6 @@ impl RepoState {
         StateDigest(hasher.finalize().to_hex().to_string())
     }
 
-    /// Resolve a caller-supplied plan path against the repo's current
-    /// state. Phase 1 of the plan-path-identity migration: see
-    /// `.trinity/plans/plan-path-identity.md` §2 for the rules. Internal
-    /// callers go through this so all surfaces (MCP, HTTP, watcher)
-    /// classify "same stem different path" identically.
-    pub fn resolve_plan<'a>(&'a self, requested: &PlanPath) -> Result<&'a Plan, PlanLookupError> {
-        let key = PlanKey::from_path(requested.as_path())
-            .ok_or_else(|| PlanLookupError::InvalidPlanPath(requested.clone()))?;
-        if let Some(paths) = self.plan_conflicts.get(&key) {
-            return Err(PlanLookupError::PlanConflict {
-                key,
-                paths: paths.clone(),
-            });
-        }
-        let plan = self
-            .plans
-            .get(&key)
-            .ok_or_else(|| PlanLookupError::UnknownPlan(key.clone()))?;
-        if &plan.plan_path == requested {
-            return Ok(plan);
-        }
-        if let Some(counterpart) = requested.counterpart()
-            && counterpart == plan.plan_path
-        {
-            return Ok(plan);
-        }
-        Err(PlanLookupError::PlanPathMismatch {
-            current: plan.plan_path.clone(),
-            requested: requested.clone(),
-        })
-    }
-}
-
-/// Why a caller-supplied `plan_path` could not be resolved against the
-/// runtime's `plans` map. Surfaced verbatim by MCP / HTTP error responses.
-#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-pub enum PlanLookupError {
-    #[error("invalid plan path: {0}")]
-    InvalidPlanPath(PlanPath),
-    #[error("unknown plan: {0}")]
-    UnknownPlan(PlanKey),
-    #[error("plan path mismatch: requested {requested} but the current plan path is {current}")]
-    PlanPathMismatch {
-        current: PlanPath,
-        requested: PlanPath,
-    },
-    #[error("conflict: stem `{key}` maps to multiple files on disk")]
-    PlanConflict { key: PlanKey, paths: Vec<PlanPath> },
 }
 
 /// One row in the per-session timeline returned by
@@ -368,7 +322,7 @@ pub struct Plan {
     /// `.trinity/plans/done/<stem>.md`. Never absolute. Internal: never
     /// crosses an API boundary — the boundary uses `PlanId` plus
     /// `state` and a derived `current_path`.
-    pub plan_path: PlanPath,
+    pub plan_path: PathBuf,
     /// Active vs Done lifecycle state, derived from `plan_path` at
     /// rebuild time. Exposed on the wire as a `state` field; the
     /// `PlanId` itself doesn't change when this flips.
@@ -404,8 +358,8 @@ impl PlanState {
         }
     }
 
-    pub fn from_plan_path(p: &PlanPath) -> Self {
-        if p.is_done() {
+    pub fn from_plan_path(p: &std::path::Path) -> Self {
+        if is_done_plan_path(p) {
             PlanState::Done
         } else {
             PlanState::Active

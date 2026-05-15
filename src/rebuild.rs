@@ -24,7 +24,7 @@ pub async fn rebuild_repo(repo_root: &Path) -> Result<RepoState, RebuildError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::lifecycle::PlanKey;
+    use crate::lifecycle::{PlanKey, is_done_plan_path};
     use crate::repo_state::AttributionResult;
     use std::path::Path;
     use std::process::Command;
@@ -160,7 +160,7 @@ mod tests {
             .get(&PlanKey::from("foo".to_string()))
             .expect("conflict surfaced");
         assert_eq!(paths.len(), 2);
-        assert!(paths.iter().any(|p| !p.is_done()));
-        assert!(paths.iter().any(|p| p.is_done()));
+        assert!(paths.iter().any(|p| !is_done_plan_path(p)));
+        assert!(paths.iter().any(|p| is_done_plan_path(p)));
     }
 }

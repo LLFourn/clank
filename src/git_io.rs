@@ -9,7 +9,7 @@ use tokio::process::Command;
 use crate::attribution::{CommitChanges, PlanTouch};
 use crate::disk_format::{parse_feedback_path, plan_path_is_done};
 use crate::disk_snapshot::{DiskSnapshot, FeedbackBlob, HistoryEntry, PlanFileBlob};
-use crate::lifecycle::{CommitSha, PlanKey, PlanPath};
+use crate::lifecycle::{CommitSha, PlanKey};
 use crate::repo_state::PlanTouchKind;
 
 #[derive(Debug, thiserror::Error)]
@@ -141,26 +141,27 @@ pub async fn show_blob(
 
 /// `git show <sha>` — return the full commit patch (header + diff) as text.
 /// Used by the commit-diff route to render impl commits.
-/// Patch text from `git diff <from> <to> -- <path>` (unified diff form,
-/// parseable by `diff_parser::parse_diff`). Used by the plan-rev-vs-rev
-/// endpoint to compare two snapshots of one file.
+/// Patch text from `git diff <from>:<from_path> <to>:<to_path>` (unified
+/// diff form, parseable by `diff_parser::parse_diff`). The two paths
+/// differ when the plan file moved between active↔done somewhere between
+/// `from` and `to`; for revisions on the same side they're equal.
 pub async fn diff_two_blobs(
     repo: &Path,
     from: &CommitSha,
+    from_path: &Path,
     to: &CommitSha,
-    path: &Path,
+    to_path: &Path,
 ) -> Result<String, GitIoError> {
-    let path_str = path.to_string_lossy();
+    let from_spec = format!("{}:{}", from.as_str(), from_path.display());
+    let to_spec = format!("{}:{}", to.as_str(), to_path.display());
     run_ok_raw(
         repo,
         &[
             "diff",
             "--no-color",
             "--no-ext-diff",
-            from.as_str(),
-            to.as_str(),
-            "--",
-            &path_str,
+            &from_spec,
+            &to_spec,
         ],
     )
     .await
@@ -388,7 +389,7 @@ pub async fn snapshot(repo_root: &Path) -> Result<DiskSnapshot, GitIoError> {
         let plan_intro_parent = parent_of(repo_root, &plan_intro).await?;
         plan_files.push(PlanFileBlob {
             plan_key,
-            plan_path: PlanPath::new(e.path),
+            plan_path: e.path,
             body,
             plan_intro,
             plan_intro_parent,

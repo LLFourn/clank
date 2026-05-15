@@ -503,7 +503,7 @@ mod tests {
         fn compute(
             &self,
             _repo_root: &Path,
-            _plan_path: &crate::lifecycle::PlanPath,
+            _plan_path: &Path,
             _body_hash: &crate::lifecycle::ContentHash,
         ) -> std::io::Result<PlanWorktreeStatus> {
             Ok(self.0)
@@ -569,7 +569,7 @@ mod tests {
     fn pr_hint_uses_plan_intro_parent_when_present() {
         let session = PlanSnapshot {
             id: PlanKey::from("foo"),
-            plan_path: crate::lifecycle::PlanPath::new(".trinity/plans/foo.md"),
+            plan_path: std::path::PathBuf::from(".trinity/plans/foo.md"),
             state: crate::repo_state::PlanState::Active,
             body: String::new(),
             body_hash: content_hash(""),

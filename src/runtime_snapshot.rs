@@ -7,7 +7,7 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
-use crate::lifecycle::{AgentLabel, CommitSha, ContentHash, PlanKey, PlanPath};
+use crate::lifecycle::{AgentLabel, CommitSha, ContentHash, PlanKey};
 use crate::repo_state::{
     AttributionResult, Feedback, HeldFeedback, Plan, PlanTouchKind, RepoState,
 };
@@ -20,13 +20,13 @@ pub struct RepoSnapshot {
     pub attribution: BTreeMap<CommitSha, AttributionResult>,
     pub plan_touches: BTreeMap<CommitSha, Vec<(PlanKey, PlanTouchKind)>>,
     pub commit_order: Vec<CommitSha>,
-    pub plan_conflicts: BTreeMap<PlanKey, Vec<PlanPath>>,
+    pub plan_conflicts: BTreeMap<PlanKey, Vec<PathBuf>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PlanSnapshot {
     pub id: PlanKey,
-    pub plan_path: PlanPath,
+    pub plan_path: PathBuf,
     pub state: crate::repo_state::PlanState,
     pub body: String,
     pub body_hash: ContentHash,
@@ -122,6 +122,16 @@ impl PlanSnapshotBundle {
         })
     }
 
+    /// Synthesize a `RepoState` containing just this bundle's plan.
+    /// Callers should only invoke this when they need projections that
+    /// take `&RepoState` and they have already established the plan is
+    /// non-conflicting (e.g. `mcp_response`'s `get_context_response`).
+    ///
+    /// `plan_conflicts` is deliberately empty — conflict detection lives
+    /// upstream of single-plan bundles, so any consumer of `to_repo_state`
+    /// that reads `plan_conflicts` would mistake "we only carry one plan"
+    /// for "no plan is in conflict." If you need conflict-aware logic,
+    /// call it against `RepoSnapshot` (the full repo) instead.
     pub fn to_repo_state(&self) -> RepoState {
         RepoState {
             root: self.root.clone(),

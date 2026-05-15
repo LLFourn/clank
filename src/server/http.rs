@@ -22,7 +22,7 @@ pub fn router(state: AppState) -> Router {
     let frontend_dist = state.frontend_dist.clone();
     Router::new()
         .route("/healthz", get(healthz))
-        .route("/events", get(home_events_stream))
+        .route("/events", get(events_route))
         .route("/internal/tools", get(list_tools))
         .route("/internal/tool_call", post(call_tool))
         .route("/api/wait_for_work", post(api_wait_for_work))
@@ -89,7 +89,7 @@ struct RepoQuery {
     repo: Option<String>,
 }
 
-async fn home_events_stream(
+async fn events_route(
     State(state): State<AppState>,
 ) -> Sse<impl Stream<Item = Result<sse::Event, std::convert::Infallible>>> {
     Sse::new(event_stream(state).await).keep_alive(sse::KeepAlive::default())
@@ -146,15 +146,27 @@ async fn call_tool(
     Ok(axum::Json(mcp::ToolCallResponse { result }))
 }
 
-/// Best-effort: resolve `?repo=<path>` to a list of repo roots to render,
-/// or all known repos if `repo` is absent.
+/// Resolve `?repo=<basename-or-absolute-path>` to a list of repo roots to
+/// render. Accepts a basename (looked up against `Trinity.repo_basenames`)
+/// or an absolute canonical path. Returns all watched repos when `repo` is
+/// absent. Returns an empty list when the filter doesn't match anything —
+/// the caller surfaces an empty `plans` array, which is consistent with
+/// "no plans match this filter."
 async fn repos_to_render(state: &AppState, override_path: Option<String>) -> Vec<PathBuf> {
-    if let Some(s) = override_path {
-        return vec![PathBuf::from(s)];
-    }
     let arc = state.runtime.state();
     let trinity = arc.lock().await;
-    trinity.repos.keys().cloned().collect()
+    let Some(raw) = override_path else {
+        return trinity.repos.keys().cloned().collect();
+    };
+    let basename = crate::lifecycle::RepoBasename::from(raw.as_str());
+    if let Some(root) = trinity.repo_basenames.get(&basename) {
+        return vec![root.clone()];
+    }
+    let path = PathBuf::from(&raw);
+    if trinity.repos.contains_key(&path) {
+        return vec![path];
+    }
+    Vec::new()
 }
 
 #[derive(Debug)]
@@ -306,7 +318,14 @@ async fn api_plan_revision(
         )));
     };
 
-    let body_raw = crate::git_io::show_blob(&repo, &commit_sha, snapshot.plan.plan_path.as_path())
+    let path_at_sha = crate::projection::plan_path_at(
+        &snapshot.plan.id,
+        &commit_sha,
+        &snapshot.commit_order,
+        &snapshot.plan_touches,
+    )
+    .ok_or_else(|| AppError::internal("plan path resolution failed for known revision"))?;
+    let body_raw = crate::git_io::show_blob(&repo, &commit_sha, &path_at_sha)
         .await
         .map_err(|e| AppError::internal(format!("git show: {e}")))?;
     let body_html = crate::ui_response::render_markdown(&body_raw);
@@ -422,8 +441,21 @@ async fn api_diff(
         .await
         .map_err(AppError::runtime)?
         .ok_or_else(|| AppError::not_found(format!("plan {repo_basename}/{stem_md} not found")))?;
-    let path = snapshot.plan.plan_path.as_path().to_path_buf();
-    let patch = crate::git_io::diff_two_blobs(&repo, &from_sha, &to_sha, &path)
+    let from_path = crate::projection::plan_path_at(
+        &snapshot.plan.id,
+        &from_sha,
+        &snapshot.commit_order,
+        &snapshot.plan_touches,
+    )
+    .ok_or_else(|| AppError::not_found(format!("commit {from_sha} not in plan history")))?;
+    let to_path = crate::projection::plan_path_at(
+        &snapshot.plan.id,
+        &to_sha,
+        &snapshot.commit_order,
+        &snapshot.plan_touches,
+    )
+    .ok_or_else(|| AppError::not_found(format!("commit {to_sha} not in plan history")))?;
+    let patch = crate::git_io::diff_two_blobs(&repo, &from_sha, &from_path, &to_sha, &to_path)
         .await
         .map_err(|e| AppError::internal(format!("git diff: {e}")))?;
     let diff_files = crate::diff_parser::parse_diff(&patch);
@@ -433,7 +465,8 @@ async fn api_diff(
         "plan_id": format!("{repo_basename}/{stem_md}"),
         "from": from_sha.as_str(),
         "to": to_sha.as_str(),
-        "path": path.to_string_lossy(),
+        "from_path": from_path.to_string_lossy(),
+        "to_path": to_path.to_string_lossy(),
         "diff_files": diff_files_json,
     })))
 }
