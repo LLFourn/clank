@@ -38,6 +38,11 @@ pub fn router(state: AppState) -> Router {
             get(api_commit_diff),
         )
         .route("/api/plan/{repo}/{stem_md}/diff/{from}/{to}", get(api_diff))
+        .route("/api/repos", get(api_repos_list))
+        .route(
+            "/api/repos/{basename}",
+            axum::routing::delete(api_repos_delete),
+        )
         .nest_service("/static", static_service)
         .fallback(move || serve_spa_shell(spa_shell.clone(), frontend_dist.clone()))
         .with_state(state)
@@ -387,12 +392,18 @@ async fn api_commit_diff(
     let diff_files = crate::diff_parser::parse_diff(&patch);
     let diff_files_json = serialize_diff_files(&diff_files);
 
+    let (subject, message_body) = crate::git_io::commit_message(&repo, &commit_sha)
+        .await
+        .map_err(|e| AppError::internal(format!("git show -s: {e}")))?;
+
     let feedback = crate::ui_response::feedback_for_target(&snapshot.plan, &commit_sha);
     Ok(axum::Json(json!({
         "repo": snapshot.root.to_string_lossy(),
         "plan_id": format!("{repo_basename}/{stem_md}"),
         "slug": snapshot.plan.id.as_str(),
         "commit_sha": commit_sha.as_str(),
+        "subject": subject,
+        "message_body": message_body,
         "diff_files": diff_files_json,
         "feedback": feedback,
     })))
@@ -493,6 +504,105 @@ async fn api_diff(
     })))
 }
 
+/// `GET /api/repos` — list every watched repo with its basename,
+/// canonical path, plan count, and last activity timestamp. Returns
+/// `{repos: [...]}` sorted by `last_activity_ts` desc.
+async fn api_repos_list(State(state): State<AppState>) -> Result<axum::Json<Value>, AppError> {
+    let trinity_arc = state.runtime.state();
+    let trinity = trinity_arc.lock().await;
+    let mut repos: Vec<(i64, Value)> = Vec::with_capacity(trinity.repo_basenames.len());
+    for (basename, root) in &trinity.repo_basenames {
+        let Some(repo_state) = trinity.repos.get(root) else {
+            continue;
+        };
+        let mut last_ts: i64 = 0;
+        for plan in repo_state.plans.values() {
+            let ts = crate::projection::last_activity_ts_for(
+                &plan.id,
+                &plan.plan_intro,
+                &plan.plan_feedback,
+                &plan.impl_feedback,
+                &plan.held_plan_feedback,
+                &repo_state.commit_order,
+                &repo_state.plan_touches,
+                &repo_state.attribution,
+                &repo_state.commit_meta,
+            );
+            last_ts = last_ts.max(ts);
+        }
+        repos.push((
+            last_ts,
+            json!({
+                "basename": basename.as_str(),
+                "root": root.to_string_lossy(),
+                "plan_count": repo_state.plans.len(),
+                "last_activity_ts": last_ts,
+            }),
+        ));
+    }
+    repos.sort_by_key(|r| std::cmp::Reverse(r.0));
+    let repos: Vec<Value> = repos.into_iter().map(|(_, v)| v).collect();
+    Ok(axum::Json(json!({ "repos": repos })))
+}
+
+/// `DELETE /api/repos/{basename}` — unwatch a repo:
+///
+/// 1. Resolve `basename` to a canonical root via `Trinity.repo_basenames`.
+/// 2. Abort and drop the watcher handle for that root from
+///    `AppState.watchers`.
+/// 3. Call `Runtime::remove_repo` to drop the entries from
+///    `Trinity.repos` + `Trinity.repo_basenames` and emit a
+///    `repo_unwatched` LiveEvent.
+/// 4. Rewrite `AppState.repos_path` without this line.
+///
+/// Returns 404 when the basename isn't watched.
+async fn api_repos_delete(
+    State(state): State<AppState>,
+    Path(basename): Path<String>,
+) -> Result<axum::Json<Value>, AppError> {
+    let basename_key = crate::lifecycle::RepoBasename::from(basename.as_str());
+    let canonical = {
+        let trinity_arc = state.runtime.state();
+        let trinity = trinity_arc.lock().await;
+        trinity.repo_basenames.get(&basename_key).cloned()
+    };
+    let Some(canonical) = canonical else {
+        return Err(AppError::not_found(format!(
+            "unknown repo basename: {basename}"
+        )));
+    };
+
+    if let Some(handle) = state.watchers.lock().await.remove(&canonical) {
+        handle.abort();
+    }
+
+    let outcome = state.runtime.remove_repo(canonical.clone()).await;
+
+    if let Err(err) = mcp::remove_repo_from_registry(&state.repos_path, &canonical) {
+        tracing::warn!(
+            repo = %canonical.display(),
+            registry = %state.repos_path.display(),
+            error = ?err,
+            "failed to remove repo from registry file"
+        );
+    }
+
+    let plan_count = match outcome {
+        crate::runtime::RemoveOutcome::Removed { plan_count } => plan_count,
+        // We held the read of `repo_basenames` over a brief lock-drop
+        // before the remove call; concurrent removal is rare but harmless
+        // here. Treat as success with zero plans (the runtime already
+        // emitted no event in that branch, which is the right shape).
+        crate::runtime::RemoveOutcome::NotPresent => 0,
+    };
+
+    Ok(axum::Json(json!({
+        "ok": true,
+        "basename": basename,
+        "removed_plan_count": plan_count,
+    })))
+}
+
 /// Shared diff_files → JSON converter used by `api_commit_diff` and
 /// `api_diff`. Returns a Vec<Value> so callers wrap it in their own
 /// envelope.
@@ -545,7 +655,6 @@ mod wire_tests {
     use axum::http::Request;
     use http_body_util::BodyExt;
     use serde_json::json;
-    use std::collections::HashSet;
     use std::path::Path;
     use std::process::Command;
     use std::sync::Arc;
@@ -597,10 +706,10 @@ mod wire_tests {
         runtime.add_repo(dir.path().to_path_buf()).await.unwrap();
         let state = AppState {
             runtime: Arc::clone(&runtime),
-            watchers: Arc::new(Mutex::new(Vec::new())),
-            watched_repos: Arc::new(Mutex::new(HashSet::new())),
+            watchers: Arc::new(Mutex::new(std::collections::BTreeMap::new())),
             frontend_dist: std::path::PathBuf::from("frontend/dist"),
             spa_shell: None,
+            repos_path: std::path::PathBuf::from("/dev/null"),
         };
         (runtime, state)
     }

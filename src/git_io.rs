@@ -213,21 +213,76 @@ pub async fn first_added_commit(
 
 /// `git log --first-parent --reverse --format=%H` — all commits along
 /// the first-parent chain from the root up to HEAD, oldest first. Used
-/// for the attribution walk.
+/// for the attribution walk. Each entry carries the author timestamp
+/// (unix seconds) and the commit subject (first line), batched into one
+/// `git log` invocation so per-rebuild git overhead stays bounded.
 ///
 /// We deliberately don't try to bound by an `<intro>..HEAD` range: with
 /// multiple sessions each having their own intro, identifying the
 /// topologically earliest plan_intro requires a separate query. Trinity
 /// repos are small enough that walking from the root is cheap and avoids
 /// a correctness footgun.
-pub async fn first_parent_commits(repo: &Path) -> Result<Vec<CommitSha>, GitIoError> {
-    let stdout = run_ok(repo, &["log", "--first-parent", "--reverse", "--format=%H"]).await?;
-    Ok(stdout
-        .lines()
-        .map(|l| l.trim())
-        .filter(|l| !l.is_empty())
-        .map(|l| CommitSha::from(l.to_string()))
-        .collect())
+pub async fn first_parent_commits(repo: &Path) -> Result<Vec<CommitMeta>, GitIoError> {
+    let stdout = run_ok(
+        repo,
+        &[
+            "log",
+            "--first-parent",
+            "--reverse",
+            "--format=%H%x00%at%x00%s",
+        ],
+    )
+    .await?;
+    let mut out = Vec::new();
+    for line in stdout.lines() {
+        if line.is_empty() {
+            continue;
+        }
+        let mut parts = line.splitn(3, '\0');
+        let sha = parts.next().unwrap_or("").trim();
+        let ts = parts.next().unwrap_or("0").trim();
+        let subject = parts.next().unwrap_or("").to_string();
+        if sha.is_empty() {
+            continue;
+        }
+        let author_ts = ts.parse::<i64>().unwrap_or(0);
+        out.push(CommitMeta {
+            sha: CommitSha::from(sha.to_string()),
+            author_ts,
+            subject,
+        });
+    }
+    Ok(out)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommitMeta {
+    pub sha: CommitSha,
+    pub author_ts: i64,
+    pub subject: String,
+}
+
+/// Subject + extended message body for a single commit. Uses
+/// `git show -s --format=%s%x00%b` so the patch text is never read or
+/// returned — the caller's `message_body` is guaranteed not to contain
+/// `diff --git` markers (that would happen if we parsed `show_commit`
+/// output by hand). Subject is the first line; body is everything after
+/// the blank line that separates the subject from the message body, or
+/// empty when the commit has no extended body.
+pub async fn commit_message(repo: &Path, sha: &CommitSha) -> Result<(String, String), GitIoError> {
+    let stdout = run_ok(repo, &["show", "-s", "--format=%s%x00%b", sha.as_str()]).await?;
+    let mut parts = stdout.splitn(2, '\0');
+    let subject = parts
+        .next()
+        .unwrap_or("")
+        .trim_end_matches('\n')
+        .to_string();
+    let body = parts
+        .next()
+        .unwrap_or("")
+        .trim_end_matches('\n')
+        .to_string();
+    Ok((subject, body))
 }
 
 /// `git diff-tree -r --name-status -M --no-commit-id <sha>` parsed into a
@@ -392,19 +447,30 @@ pub async fn snapshot(repo_root: &Path) -> Result<DiskSnapshot, GitIoError> {
 
     // Commit history along the first-parent chain. Skip the walk
     // entirely if there are no sessions — there's nothing to attribute.
-    let history = if plan_files.is_empty() {
-        Vec::new()
+    let (history, commit_meta) = if plan_files.is_empty() {
+        (Vec::new(), std::collections::BTreeMap::new())
     } else {
-        let shas = first_parent_commits(repo_root).await?;
-        let mut out = Vec::with_capacity(shas.len());
-        for sha in shas {
-            let changes = diff_tree_changes(repo_root, &sha).await?;
-            out.push(HistoryEntry {
-                commit: sha,
+        let metas = first_parent_commits(repo_root).await?;
+        let mut history_out = Vec::with_capacity(metas.len());
+        let mut meta_out: std::collections::BTreeMap<
+            CommitSha,
+            crate::disk_snapshot::CommitMetaEntry,
+        > = std::collections::BTreeMap::new();
+        for meta in metas {
+            let changes = diff_tree_changes(repo_root, &meta.sha).await?;
+            meta_out.insert(
+                meta.sha.clone(),
+                crate::disk_snapshot::CommitMetaEntry {
+                    author_ts: meta.author_ts,
+                    subject: meta.subject,
+                },
+            );
+            history_out.push(HistoryEntry {
+                commit: meta.sha,
                 changes,
             });
         }
-        out
+        (history_out, meta_out)
     };
 
     // Feedback files in the working tree.
@@ -415,6 +481,7 @@ pub async fn snapshot(repo_root: &Path) -> Result<DiskSnapshot, GitIoError> {
         plan_files,
         history,
         feedback_files,
+        commit_meta,
     })
 }
 

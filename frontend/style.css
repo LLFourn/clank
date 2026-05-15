@@ -1100,3 +1100,258 @@ a:hover {
     opacity: 0.5;
     cursor: default;
 }
+
+/* ---------- Plan preview (landing-page rendered body) ---------- */
+
+.plan-preview {
+    position: relative;
+    margin: 1rem 0 1.5rem;
+    padding: 1rem 1.25rem;
+    border: 1px solid var(--border);
+    border-radius: 0.4rem;
+    background: rgba(255, 255, 255, 0.02);
+}
+
+.plan-preview-body {
+    max-height: 480px;
+    overflow: hidden;
+    transition: max-height 0.2s ease-out;
+    line-height: 1.55;
+}
+
+.plan-preview-expanded .plan-preview-body {
+    max-height: none;
+}
+
+.plan-preview-body > :first-child {
+    margin-top: 0;
+}
+
+.plan-preview-fade {
+    position: absolute;
+    left: 0;
+    right: 0;
+    bottom: 2.6rem;
+    height: 3.5rem;
+    pointer-events: none;
+    background: linear-gradient(transparent, var(--bg));
+}
+
+.plan-preview-expanded .plan-preview-fade {
+    display: none;
+}
+
+.plan-preview-actions {
+    display: flex;
+    align-items: center;
+    gap: 1rem;
+    margin-top: 0.75rem;
+    border-top: 1px dashed var(--border);
+    padding-top: 0.75rem;
+}
+
+.plan-preview-toggle {
+    background: transparent;
+    border: 1px solid var(--accent);
+    color: var(--accent);
+    padding: 0.3rem 0.75rem;
+    border-radius: 0.3rem;
+    cursor: pointer;
+    font-size: 0.85rem;
+}
+
+.plan-preview-toggle:hover {
+    background: rgba(210, 168, 255, 0.08);
+}
+
+.plan-preview-link {
+    font-size: 0.85rem;
+    text-decoration: none;
+}
+
+/* ---------- Latest review card ---------- */
+
+.latest-review {
+    margin-top: 1.25rem;
+}
+
+.latest-review h3 {
+    margin: 0 0 0.5rem;
+    font-size: 0.95rem;
+    font-weight: 600;
+    color: var(--text-muted);
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+}
+
+/* ---------- Timeline accordion (commit rows) ---------- */
+
+.timeline-commit-row {
+    display: flex;
+    align-items: center;
+    gap: 0.6rem;
+    width: 100%;
+    padding: 0.4rem 0.6rem;
+    background: transparent;
+    border: 1px solid transparent;
+    border-radius: 0.3rem;
+    cursor: pointer;
+    text-align: left;
+    color: inherit;
+    font: inherit;
+}
+
+.timeline-commit-row:hover {
+    background: rgba(255, 255, 255, 0.03);
+    border-color: var(--border);
+}
+
+.timeline-caret {
+    color: var(--text-muted);
+    font-size: 0.75rem;
+    width: 1rem;
+    display: inline-block;
+}
+
+.timeline-subject {
+    flex: 1;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.commit-expanded {
+    margin: 0.4rem 0 0.8rem 2rem;
+    padding: 0.8rem;
+    border-left: 2px solid var(--border);
+    background: rgba(255, 255, 255, 0.015);
+    border-radius: 0 0.3rem 0.3rem 0;
+}
+
+.commit-message-body {
+    margin: 0 0 0.8rem;
+    padding: 0.5rem 0.7rem;
+    background: rgba(255, 255, 255, 0.03);
+    border-radius: 0.25rem;
+    white-space: pre-wrap;
+    font-family: ui-monospace, "SF Mono", monospace;
+    font-size: 0.85rem;
+    line-height: 1.5;
+}
+
+/* ---------- Watched repos section ---------- */
+
+.watched-repos {
+    margin-bottom: 2rem;
+    padding: 1rem;
+    border: 1px solid var(--border);
+    border-radius: 0.4rem;
+}
+
+.watched-repos h2 {
+    margin: 0 0 0.8rem;
+    font-size: 1rem;
+}
+
+.watched-repos-list {
+    list-style: none;
+    padding: 0;
+    margin: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 0.5rem;
+}
+
+.watched-repos-row {
+    display: flex;
+    align-items: center;
+    gap: 1rem;
+    padding: 0.55rem 0.75rem;
+    border: 1px solid var(--border);
+    border-radius: 0.3rem;
+    background: rgba(255, 255, 255, 0.015);
+}
+
+.watched-repos-meta {
+    flex: 1;
+    display: flex;
+    align-items: baseline;
+    gap: 0.75rem;
+    flex-wrap: wrap;
+}
+
+.watched-repos-basename code {
+    font-weight: 600;
+}
+
+.watched-repos-root {
+    font-size: 0.8rem;
+}
+
+.watched-repos-count {
+    font-size: 0.8rem;
+    color: var(--text-muted);
+}
+
+.watched-repos-actions {
+    display: flex;
+    gap: 0.5rem;
+}
+
+.watched-repos-unwatch,
+.watched-repos-cancel {
+    padding: 0.35rem 0.7rem;
+    border-radius: 0.3rem;
+    font-size: 0.8rem;
+    cursor: pointer;
+    border: 1px solid var(--border);
+    background: transparent;
+    color: inherit;
+}
+
+.watched-repos-unwatch:hover {
+    border-color: var(--request);
+    color: var(--request);
+}
+
+.watched-repos-error {
+    flex-basis: 100%;
+    margin: 0.4rem 0 0;
+    font-size: 0.8rem;
+}
+
+/* ---------- Home toolbar (show-done toggle, etc.) ---------- */
+
+.plans-toolbar {
+    display: flex;
+    justify-content: flex-end;
+    margin: 0 0 0.6rem;
+    font-size: 0.85rem;
+}
+
+.show-done-toggle {
+    color: var(--text-muted);
+    cursor: pointer;
+    user-select: none;
+}
+
+.show-done-toggle input {
+    margin-right: 0.3rem;
+}
+
+/* ---------- Waiting-on Who chips ---------- */
+
+.waiting-who {
+    display: flex;
+    gap: 0.3rem;
+    flex-wrap: wrap;
+}
+
+.agent-chip {
+    padding: 0.1rem 0.5rem;
+    border-radius: 0.7rem;
+    background: rgba(210, 168, 255, 0.1);
+    color: var(--accent);
+    border: 1px solid rgba(210, 168, 255, 0.25);
+    font-size: 0.78rem;
+}

@@ -1,7 +1,10 @@
 use leptos::prelude::*;
 
 use crate::api::{PlanConflictRow, PlanRow, PlansIndex, fetch_plans};
+use crate::components::watched_repos::WatchedRepos;
 use crate::store::EventStore;
+
+const SHOW_DONE_KEY: &str = "trinity.show_done";
 
 #[component]
 pub fn Home() -> impl IntoView {
@@ -10,16 +13,36 @@ pub fn Home() -> impl IntoView {
         let _ = store.tick.get();
         fetch_plans()
     });
+    let show_done = RwSignal::new(load_show_done());
+    Effect::new(move |_| {
+        let v = show_done.get();
+        persist_show_done(v);
+    });
 
     view! {
         <div class="home-layout">
             <main class="home-main">
                 <h1>"Trinity plans"</h1>
+                <WatchedRepos/>
+                <div class="plans-toolbar">
+                    <label class="show-done-toggle">
+                        <input
+                            type="checkbox"
+                            prop:checked=move || show_done.get()
+                            on:change=move |ev| {
+                                show_done.set(event_target_checked(&ev));
+                            }
+                        />
+                        " show done"
+                    </label>
+                </div>
                 <Suspense fallback=move || view! { <p class="loading">"Loading…"</p> }>
                     {move || {
                         plans
                             .with(|res| match res {
-                                Some(Ok(index)) => plans_view(index.clone()).into_any(),
+                                Some(Ok(index)) => {
+                                    plans_view(index.clone(), show_done.get()).into_any()
+                                }
                                 Some(Err(e)) => {
                                     view! {
                                         <p class="error">"Failed to load: " {e.to_string()}</p>
@@ -36,12 +59,38 @@ pub fn Home() -> impl IntoView {
     }
 }
 
-fn plans_view(index: PlansIndex) -> impl IntoView {
-    let plans = index.plans;
+fn plans_view(index: PlansIndex, show_done: bool) -> impl IntoView {
+    let plans: Vec<PlanRow> = index
+        .plans
+        .into_iter()
+        .filter(|p| show_done || p.state != "done")
+        .collect();
     let conflicts = index.conflicts;
     view! {
         {plan_table(plans)}
         {conflicts_section(conflicts)}
+    }
+}
+
+fn event_target_checked(ev: &leptos::ev::Event) -> bool {
+    use wasm_bindgen::JsCast;
+    ev.target()
+        .and_then(|t| t.dyn_into::<web_sys::HtmlInputElement>().ok())
+        .map(|el| el.checked())
+        .unwrap_or(false)
+}
+
+fn load_show_done() -> bool {
+    web_sys::window()
+        .and_then(|w| w.local_storage().ok().flatten())
+        .and_then(|store| store.get_item(SHOW_DONE_KEY).ok().flatten())
+        .map(|v| v == "true")
+        .unwrap_or(false)
+}
+
+fn persist_show_done(v: bool) {
+    if let Some(store) = web_sys::window().and_then(|w| w.local_storage().ok().flatten()) {
+        let _ = store.set_item(SHOW_DONE_KEY, if v { "true" } else { "false" });
     }
 }
 
@@ -112,18 +161,19 @@ fn plan_table(rows: Vec<PlanRow>) -> impl IntoView {
                     <th>"Phase"</th>
                     <th>"Worktree"</th>
                     <th>"Waiting on"</th>
-                    <th>"Description"</th>
+                    <th>"Who"</th>
                 </tr>
             </thead>
             <tbody>
                 {rows
                     .into_iter()
                     .map(|s| {
-                        let role = s.waiting_on.role;
+                        let role = s.waiting_on.role.clone();
                         let waiting_class = format!("waiting waiting-{role}");
                         let plan_id_for_href = s.plan_id.clone();
                         let plan_id_for_text = s.plan_id.clone();
                         let state_class = format!("state-chip state-{}", s.state);
+                        let agents = s.waiting_on.agents.clone();
                         view! {
                             <tr>
                                 <td>
@@ -139,7 +189,7 @@ fn plan_table(rows: Vec<PlanRow>) -> impl IntoView {
                                 <td>
                                     <span class=waiting_class>{role}</span>
                                 </td>
-                                <td>{s.waiting_on.description}</td>
+                                <td>{who_cell(agents)}</td>
                             </tr>
                         }
                     })
@@ -147,6 +197,21 @@ fn plan_table(rows: Vec<PlanRow>) -> impl IntoView {
             </tbody>
         </table>
     }
+}
+
+fn who_cell(agents: Vec<String>) -> AnyView {
+    if agents.is_empty() {
+        return view! { <span class="muted">"—"</span> }.into_any();
+    }
+    view! {
+        <div class="waiting-who">
+            {agents
+                .into_iter()
+                .map(|a| view! { <span class="agent-chip">{a}</span> })
+                .collect_view()}
+        </div>
+    }
+    .into_any()
 }
 
 fn conflicts_section(conflicts: Vec<PlanConflictRow>) -> AnyView {

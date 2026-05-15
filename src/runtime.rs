@@ -65,6 +65,20 @@ pub enum RegisterOutcome {
     ShadowedByOther { claimed_by: PathBuf },
 }
 
+/// Outcome of `Runtime::remove_repo`. `NotPresent` lets the HTTP
+/// handler return 404 without needing to inspect the runtime state
+/// before the call.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RemoveOutcome {
+    Removed {
+        /// Number of plans dropped along with the repo. Used by the
+        /// `repo_unwatched` LiveEvent payload so the SPA can show a
+        /// "removed N plans" toast if it wants.
+        plan_count: usize,
+    },
+    NotPresent,
+}
+
 impl Runtime {
     pub fn new() -> Self {
         Self::default()
@@ -131,6 +145,39 @@ impl Runtime {
             }
         }
         self.add_repo(canonical).await
+    }
+
+    /// Deregister `repo_root` from in-memory state. Drops the repo from
+    /// `Trinity.repos` and any matching entries in `Trinity.repo_basenames`.
+    /// Does NOT touch the watcher set (the caller — the HTTP handler —
+    /// owns watcher-handle cleanup) and does NOT touch the on-disk
+    /// registry (the caller writes that too). The `HeadChanged`
+    /// resurrection guard in `handle_signal` ensures any in-flight
+    /// watcher signal can't re-insert the entry.
+    pub async fn remove_repo(&self, repo_root: PathBuf) -> RemoveOutcome {
+        let canonical = dunce::canonicalize(&repo_root).unwrap_or(repo_root);
+        let mut trinity = self.state.lock().await;
+        let Some(removed) = trinity.repos.remove(&canonical) else {
+            return RemoveOutcome::NotPresent;
+        };
+        let plan_count = removed.plans.len();
+        trinity.repo_basenames.retain(|_, root| root != &canonical);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        self.push_event(
+            &mut trinity,
+            LiveEvent {
+                ts: now,
+                repo: canonical,
+                plan_id: None,
+                state: None,
+                kind: "repo_unwatched",
+                payload: serde_json::json!({ "plan_count": plan_count }),
+            },
+        );
+        RemoveOutcome::Removed { plan_count }
     }
 
     /// Clone a repo snapshot while holding the runtime lock. Callers do
@@ -237,10 +284,29 @@ impl Runtime {
         let repo_root = repo_root_canonical.as_path();
         match signal {
             FilesystemSignal::HeadChanged => {
+                // Resurrection guard: if the repo was just unwatched
+                // (via `remove_repo` or daemon-startup skip), a late /
+                // debounced HeadChanged from the now-aborted watcher
+                // would re-insert it. Skip the rebuild + insert when
+                // the repo isn't already tracked. PlanFileChanged /
+                // FeedbackWritten / FeedbackRemoved get the same effect
+                // implicitly: each does `trinity.repos.get(repo_root)?`
+                // and bails when the entry is gone.
+                {
+                    let trinity = self.state.lock().await;
+                    if !trinity.repos.contains_key(repo_root) {
+                        return Ok(());
+                    }
+                }
                 let fresh = rebuild_repo(repo_root).await?;
                 let fresh_digest = fresh.digest();
                 {
                     let mut trinity = self.state.lock().await;
+                    // Re-check under the second lock acquire: removal
+                    // could have raced our rebuild.
+                    if !trinity.repos.contains_key(repo_root) {
+                        return Ok(());
+                    }
                     let prior_digest = trinity.repos.get(repo_root).map(|r| r.digest());
                     let changed = prior_digest.as_ref() != Some(&fresh_digest);
                     trinity.repos.insert(repo_root.to_path_buf(), fresh);
@@ -736,6 +802,73 @@ mod tests {
     fn commit(repo: &Path, msg: &str) {
         run_git(repo, &["add", "-A"]);
         run_git(repo, &["commit", "--quiet", "-m", msg]);
+    }
+
+    #[tokio::test]
+    async fn remove_repo_drops_state_and_basename_index() {
+        let dir = init_repo();
+        write_file(dir.path(), ".trinity/plans/foo.md", "# foo\n");
+        commit(dir.path(), "add foo");
+
+        let rt = Runtime::new();
+        rt.add_repo(dir.path().to_path_buf()).await.unwrap();
+        let canonical = dunce::canonicalize(dir.path()).unwrap();
+        let outcome = rt.remove_repo(canonical.clone()).await;
+        assert_eq!(outcome, RemoveOutcome::Removed { plan_count: 1 });
+
+        let trinity = rt.state().lock_owned().await;
+        assert!(!trinity.repos.contains_key(&canonical));
+        let basename = crate::lifecycle::RepoBasename::from_repo_root(&canonical).unwrap();
+        assert!(!trinity.repo_basenames.contains_key(&basename));
+    }
+
+    #[tokio::test]
+    async fn remove_repo_returns_not_present_when_absent() {
+        let rt = Runtime::new();
+        let outcome = rt.remove_repo(std::path::PathBuf::from("/nowhere")).await;
+        assert_eq!(outcome, RemoveOutcome::NotPresent);
+    }
+
+    #[tokio::test]
+    async fn head_changed_does_not_resurrect_removed_repo() {
+        // Late watcher signal arriving after `remove_repo` must NOT
+        // re-insert the repo. Without the guard, the prior code path
+        // unconditionally inserted the rebuild result, so an unwatch
+        // would silently undo itself the next time the watcher
+        // debounced.
+        let dir = init_repo();
+        write_file(dir.path(), ".trinity/plans/foo.md", "# foo\n");
+        commit(dir.path(), "add foo");
+
+        let rt = Runtime::new();
+        rt.add_repo(dir.path().to_path_buf()).await.unwrap();
+        let canonical = dunce::canonicalize(dir.path()).unwrap();
+        rt.remove_repo(canonical.clone()).await;
+
+        // Drain any `repo_unwatched` event from the buffer before the
+        // signal fires so we can assert no `repo_rebuilt` slips in.
+        let before = rt.live_events_snapshot().await.len();
+
+        rt.handle_signal(
+            &canonical,
+            crate::fs_watcher::FilesystemSignal::HeadChanged,
+            42,
+        )
+        .await
+        .unwrap();
+
+        let trinity = rt.state().lock_owned().await;
+        assert!(
+            !trinity.repos.contains_key(&canonical),
+            "removed repo must not resurrect on HeadChanged"
+        );
+        let after_events = trinity.live_events.clone();
+        drop(trinity);
+        let new_events: Vec<_> = after_events.iter().skip(before).collect();
+        assert!(
+            !new_events.iter().any(|e| e.kind == "repo_rebuilt"),
+            "no repo_rebuilt should fire for an unwatched repo; got events: {new_events:?}"
+        );
     }
 
     #[tokio::test]

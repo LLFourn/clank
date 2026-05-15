@@ -7,6 +7,7 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
+use crate::disk_snapshot::CommitMetaEntry;
 use crate::lifecycle::{AgentLabel, CommitSha, ContentHash, PlanKey};
 use crate::repo_state::{
     AttributionResult, Feedback, HeldFeedback, Plan, PlanTouchKind, RepoState,
@@ -21,6 +22,7 @@ pub struct RepoSnapshot {
     pub plan_touches: BTreeMap<CommitSha, Vec<(PlanKey, PlanTouchKind)>>,
     pub commit_order: Vec<CommitSha>,
     pub plan_conflicts: BTreeMap<PlanKey, Vec<PathBuf>>,
+    pub commit_meta: BTreeMap<CommitSha, CommitMetaEntry>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -45,6 +47,7 @@ pub struct PlanSnapshotBundle {
     pub attribution: BTreeMap<CommitSha, AttributionResult>,
     pub plan_touches: BTreeMap<CommitSha, Vec<(PlanKey, PlanTouchKind)>>,
     pub commit_order: Vec<CommitSha>,
+    pub commit_meta: BTreeMap<CommitSha, CommitMetaEntry>,
 }
 
 impl RepoSnapshot {
@@ -57,6 +60,7 @@ impl RepoSnapshot {
             plan_touches: state.plan_touches.clone(),
             commit_order: state.commit_order.clone(),
             plan_conflicts: state.plan_conflicts.clone(),
+            commit_meta: state.commit_meta.clone(),
         }
     }
 
@@ -73,6 +77,7 @@ impl RepoSnapshot {
             plan_touches: self.plan_touches.clone(),
             commit_order: self.commit_order.clone(),
             plan_conflicts: self.plan_conflicts.clone(),
+            commit_meta: self.commit_meta.clone(),
         }
     }
 }
@@ -119,6 +124,7 @@ impl PlanSnapshotBundle {
             attribution: state.attribution.clone(),
             plan_touches: state.plan_touches.clone(),
             commit_order: state.commit_order.clone(),
+            commit_meta: state.commit_meta.clone(),
         })
     }
 
@@ -143,6 +149,7 @@ impl PlanSnapshotBundle {
             plan_touches: self.plan_touches.clone(),
             commit_order: self.commit_order.clone(),
             plan_conflicts: BTreeMap::new(),
+            commit_meta: self.commit_meta.clone(),
         }
     }
 }

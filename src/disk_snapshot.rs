@@ -38,6 +38,22 @@ pub struct DiskSnapshot {
     /// Working-tree feedback files. Each has been path-parsed; the body
     /// is included verbatim.
     pub feedback_files: Vec<FeedbackBlob>,
+    /// Per-commit metadata (author timestamp, subject) for every commit
+    /// in `history`. One batched `git log` populates this in
+    /// `git_io::first_parent_commits`; `derive_state` carries it over to
+    /// `RepoState::commit_meta` for use by `last_activity_ts` +
+    /// timeline subject rendering.
+    pub commit_meta: BTreeMap<CommitSha, CommitMetaEntry>,
+}
+
+/// Author timestamp + subject line for one commit. Mirrors
+/// `git_io::CommitMeta` but decoupled — `git_io` is the producer; the
+/// daemon stores its own copy so the lifecycle types don't reach into
+/// the IO layer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommitMetaEntry {
+    pub author_ts: i64,
+    pub subject: String,
 }
 
 /// A plan file as it appears in HEAD's tree.
@@ -141,6 +157,11 @@ pub fn derive_state(repo_root: PathBuf, snapshot: DiskSnapshot) -> RepoState {
         };
         ingest_feedback(plan, fb);
     }
+
+    // 4. Per-commit metadata (subject + author timestamp) for the same
+    //    commits we walked above. Used by the timeline (subject) and
+    //    `last_activity_ts` (author_ts).
+    state.commit_meta = snapshot.commit_meta;
 
     state
 }
@@ -258,6 +279,7 @@ mod tests {
             plan_files: vec![plan_file("foo", "intro1", Some("parent1"), "# foo\n")],
             history: vec![],
             feedback_files: vec![],
+            commit_meta: BTreeMap::new(),
         };
         let state = derive_state(PathBuf::from("/r"), snap);
         let s = &state.plans[&sess("foo")];
@@ -279,6 +301,7 @@ mod tests {
                 entry("c3", vec![], true),
             ],
             feedback_files: vec![],
+            commit_meta: BTreeMap::new(),
         };
         let state = derive_state(PathBuf::from("/r"), snap);
         // c1: plan intro for foo
@@ -323,6 +346,7 @@ mod tests {
                 entry("c3", vec![], true),
             ],
             feedback_files: vec![],
+            commit_meta: BTreeMap::new(),
         };
         let state = derive_state(PathBuf::from("/r"), snap);
         // c2 is multi-plan → unattributed.
@@ -364,6 +388,7 @@ mod tests {
                 ),
             ],
             feedback_files: vec![],
+            commit_meta: BTreeMap::new(),
         };
         let state = derive_state(PathBuf::from("/r"), snap);
 
@@ -391,6 +416,7 @@ mod tests {
             plan_files: vec![plan_file("foo", "c1", None, "# foo\n")],
             history: vec![entry("c1", vec![touch("foo", PlanTouchKind::Intro)], true)],
             feedback_files: vec![],
+            commit_meta: BTreeMap::new(),
         };
         let state = derive_state(PathBuf::from("/r"), snap);
         match &state.attribution[&sha("c1")] {
@@ -416,6 +442,7 @@ mod tests {
                 "alice",
                 "APPROVE\n",
             )],
+            commit_meta: BTreeMap::new(),
         };
         let state = derive_state(PathBuf::from("/r"), snap);
         let entry = state.plans[&sess("foo")]
@@ -438,6 +465,7 @@ mod tests {
                 "alice",
                 "APPROVE\n",
             )],
+            commit_meta: BTreeMap::new(),
         };
         let state = derive_state(PathBuf::from("/r"), snap);
         let session = &state.plans[&sess("foo")];
@@ -462,6 +490,7 @@ mod tests {
                 "alice",
                 "APPROVE\n",
             )],
+            commit_meta: BTreeMap::new(),
         };
         let state = derive_state(PathBuf::from("/r"), snap);
         let session = &state.plans[&sess("foo")];
@@ -482,6 +511,7 @@ mod tests {
                 "alice",
                 "APPROVE\n",
             )],
+            commit_meta: BTreeMap::new(),
         };
         let state = derive_state(PathBuf::from("/r"), snap);
         assert!(state.plans.is_empty());
@@ -496,6 +526,7 @@ mod tests {
             plan_files: vec![pf],
             history: vec![],
             feedback_files: vec![],
+            commit_meta: BTreeMap::new(),
         };
         let state = derive_state(PathBuf::from("/r"), snap);
         assert_eq!(
@@ -511,6 +542,7 @@ mod tests {
             plan_files: vec![],
             history: vec![entry("c1", vec![], true)],
             feedback_files: vec![],
+            commit_meta: BTreeMap::new(),
         };
         let state = derive_state(PathBuf::from("/r"), snap);
         assert_eq!(
@@ -646,6 +678,7 @@ mod tests {
                 "alice",
                 "APPROVE\n",
             )],
+            commit_meta: BTreeMap::new(),
         };
         let state = derive_state(PathBuf::from("/r"), snap);
         let foo = &state.plans[&sess("foo")];
@@ -668,6 +701,7 @@ mod tests {
                 entry("c3", vec![], true),
             ],
             feedback_files: vec![],
+            commit_meta: BTreeMap::new(),
         };
         let state = derive_state(PathBuf::from("/r"), snap);
         assert_eq!(state.plans.len(), 2);
@@ -694,6 +728,7 @@ mod tests {
                 entry("c4", vec![touch("foo", PlanTouchKind::DoneMove)], false),
             ],
             feedback_files: vec![],
+            commit_meta: BTreeMap::new(),
         };
         let state = derive_state(PathBuf::from("/r"), snap);
         let plan_touches: Vec<_> = state
@@ -734,6 +769,7 @@ mod tests {
             plan_files: vec![plan_file("foo", "c1", None, "")],
             history: vec![entry("c1", vec![touch("foo", PlanTouchKind::Intro)], false)],
             feedback_files: vec![],
+            commit_meta: BTreeMap::new(),
         };
         let state = derive_state(PathBuf::from("/r"), snap);
         assert!(state.plans.contains_key(&sess("foo")));
@@ -755,6 +791,7 @@ mod tests {
                 entry("c4", vec![], true),
             ],
             feedback_files: vec![],
+            commit_meta: BTreeMap::new(),
         };
         let state = derive_state(PathBuf::from("/r"), snap);
         assert_eq!(
@@ -801,6 +838,7 @@ mod tests {
                 entry("c3", vec![], true),
             ],
             feedback_files: vec![],
+            commit_meta: BTreeMap::new(),
         };
         let state = derive_state(PathBuf::from("/r"), snap);
         let timeline = state.timeline_for(&sess("foo"));
@@ -828,6 +866,7 @@ mod tests {
                 "alice",
                 "APPROVE\n",
             )],
+            commit_meta: BTreeMap::new(),
         };
         let state = derive_state(PathBuf::from("/r"), snap);
         let timeline = state.timeline_for(&sess("foo"));
@@ -870,6 +909,7 @@ mod tests {
                 "bob",
                 "REQUEST_CHANGES\nproblem\n",
             )],
+            commit_meta: BTreeMap::new(),
         };
         let state = derive_state(PathBuf::from("/r"), snap);
         let timeline = state.timeline_for(&sess("foo"));
@@ -904,6 +944,7 @@ mod tests {
                 "alice",
                 "APPROVE\n",
             )],
+            commit_meta: BTreeMap::new(),
         };
         let state = derive_state(PathBuf::from("/r"), snap);
         let timeline = state.timeline_for(&sess("foo"));
@@ -939,6 +980,7 @@ mod tests {
                 entry("c3", vec![], true),
             ],
             feedback_files: vec![],
+            commit_meta: BTreeMap::new(),
         };
         let state = derive_state(PathBuf::from("/r"), snap);
         let foo_timeline = state.timeline_for(&sess("foo"));
@@ -969,6 +1011,7 @@ mod tests {
                 entry("c3", vec![], true),
             ],
             feedback_files: vec![],
+            commit_meta: BTreeMap::new(),
         };
         let state = derive_state(PathBuf::from("/r"), snap);
         let a_tl = state.timeline_for(&sess("a"));
@@ -1008,6 +1051,7 @@ mod tests {
                     "REQUEST_CHANGES\n",
                 ),
             ],
+            commit_meta: BTreeMap::new(),
         };
         let state = derive_state(PathBuf::from("/r"), snap);
         let timeline = state.timeline_for(&sess("foo"));
@@ -1046,6 +1090,7 @@ mod tests {
             ],
             history: vec![],
             feedback_files: vec![],
+            commit_meta: BTreeMap::new(),
         };
         let state = derive_state(PathBuf::from("/r"), snap);
         assert!(
@@ -1081,6 +1126,7 @@ mod tests {
                     "REQUEST_CHANGES\nstuff\n",
                 ),
             ],
+            commit_meta: BTreeMap::new(),
         }
     }
 }

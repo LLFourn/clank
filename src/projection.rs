@@ -171,6 +171,65 @@ fn waiting_from_gate(gate: Option<&ReviewGateDecision>, phase: GatePhase) -> Wai
     }
 }
 
+/// Most recent activity timestamp for one plan, computed as the
+/// maximum of:
+///
+/// - author_ts of the newest commit attributed to (or touching) this
+///   plan,
+/// - mtime of the newest feedback file (plan / impl / held),
+/// - author_ts of the plan_intro commit (always defined).
+///
+/// Used by `/api/plans` to sort the homepage by recency. Pure;
+/// sans-IO. Returns `0` only when none of the inputs carries a
+/// timestamp — should not happen for committed plans since
+/// plan_intro always has metadata.
+#[allow(clippy::too_many_arguments)]
+pub fn last_activity_ts_for(
+    plan_key: &crate::lifecycle::PlanKey,
+    plan_intro: &CommitSha,
+    plan_feedback: &BTreeMap<(CommitSha, AgentLabel), Feedback>,
+    impl_feedback: &BTreeMap<(CommitSha, AgentLabel), Feedback>,
+    held_plan_feedback: &[crate::repo_state::HeldFeedback],
+    commit_order: &[CommitSha],
+    plan_touches: &BTreeMap<
+        CommitSha,
+        Vec<(crate::lifecycle::PlanKey, crate::repo_state::PlanTouchKind)>,
+    >,
+    attribution: &BTreeMap<CommitSha, AttributionResult>,
+    commit_meta: &BTreeMap<CommitSha, crate::disk_snapshot::CommitMetaEntry>,
+) -> i64 {
+    let mut max_ts: i64 = 0;
+    for sha in commit_order {
+        let touches = plan_touches
+            .get(sha)
+            .is_some_and(|t| t.iter().any(|(k, _)| k == plan_key));
+        let code = matches!(
+            attribution.get(sha),
+            Some(AttributionResult::Attributed { session, has_code_changes: true, .. })
+                if session == plan_key
+        );
+        if !touches && !code {
+            continue;
+        }
+        if let Some(meta) = commit_meta.get(sha) {
+            max_ts = max_ts.max(meta.author_ts);
+        }
+    }
+    for fb in plan_feedback.values() {
+        max_ts = max_ts.max(fb.created_at);
+    }
+    for fb in impl_feedback.values() {
+        max_ts = max_ts.max(fb.created_at);
+    }
+    for held in held_plan_feedback {
+        max_ts = max_ts.max(held.created_at);
+    }
+    if let Some(intro_meta) = commit_meta.get(plan_intro) {
+        max_ts = max_ts.max(intro_meta.author_ts);
+    }
+    max_ts
+}
+
 /// Repo-relative path of the plan file at the given commit's tree.
 ///
 /// Walks `plan_touches` along `commit_order` from the start to (and
@@ -924,6 +983,100 @@ mod tests {
         assert_eq!(
             plan_path_at(&pk("foo"), &cs("c2"), &order, &touches).unwrap(),
             PathBuf::from(".trinity/plans/foo.md"),
+        );
+    }
+
+    // -------- last_activity_ts_for --------
+
+    fn meta(ts: i64, subject: &str) -> crate::disk_snapshot::CommitMetaEntry {
+        crate::disk_snapshot::CommitMetaEntry {
+            author_ts: ts,
+            subject: subject.to_string(),
+        }
+    }
+
+    fn fb(target: &str, author: &str, created_at: i64) -> ((CommitSha, AgentLabel), Feedback) {
+        (
+            (cs(target), AgentLabel::from(author)),
+            Feedback {
+                path: std::path::PathBuf::from("/fake"),
+                body: String::new(),
+                verdict: crate::repo_state::Verdict::Unmarked,
+                created_at,
+            },
+        )
+    }
+
+    #[test]
+    fn last_activity_ts_only_intro_commit_uses_intro_ts() {
+        let mut commit_meta = BTreeMap::new();
+        commit_meta.insert(cs("c1"), meta(1_000, "intro"));
+        let mut touches: BTreeMap<CommitSha, Vec<(PlanKey, PlanTouchKind)>> = BTreeMap::new();
+        touches.insert(cs("c1"), vec![(pk("foo"), PlanTouchKind::Intro)]);
+        let ts = last_activity_ts_for(
+            &pk("foo"),
+            &cs("c1"),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            &[],
+            &[cs("c1")],
+            &touches,
+            &BTreeMap::new(),
+            &commit_meta,
+        );
+        assert_eq!(ts, 1_000);
+    }
+
+    #[test]
+    fn last_activity_ts_picks_newer_of_commit_or_feedback() {
+        let mut commit_meta = BTreeMap::new();
+        commit_meta.insert(cs("c1"), meta(1_000, "intro"));
+        commit_meta.insert(cs("c2"), meta(2_000, "rev"));
+        let mut touches: BTreeMap<CommitSha, Vec<(PlanKey, PlanTouchKind)>> = BTreeMap::new();
+        touches.insert(cs("c1"), vec![(pk("foo"), PlanTouchKind::Intro)]);
+        touches.insert(cs("c2"), vec![(pk("foo"), PlanTouchKind::Revision)]);
+        let mut plan_fb = BTreeMap::new();
+        let (k, v) = fb("c1", "codex", 3_000);
+        plan_fb.insert(k, v);
+        let ts = last_activity_ts_for(
+            &pk("foo"),
+            &cs("c1"),
+            &plan_fb,
+            &BTreeMap::new(),
+            &[],
+            &[cs("c1"), cs("c2")],
+            &touches,
+            &BTreeMap::new(),
+            &commit_meta,
+        );
+        assert_eq!(
+            ts, 3_000,
+            "feedback mtime should win when newer than commits"
+        );
+    }
+
+    #[test]
+    fn last_activity_ts_ignores_commits_for_other_plans() {
+        let mut commit_meta = BTreeMap::new();
+        commit_meta.insert(cs("c1"), meta(1_000, "foo intro"));
+        commit_meta.insert(cs("c2"), meta(5_000, "bar intro"));
+        let mut touches: BTreeMap<CommitSha, Vec<(PlanKey, PlanTouchKind)>> = BTreeMap::new();
+        touches.insert(cs("c1"), vec![(pk("foo"), PlanTouchKind::Intro)]);
+        touches.insert(cs("c2"), vec![(pk("bar"), PlanTouchKind::Intro)]);
+        let ts = last_activity_ts_for(
+            &pk("foo"),
+            &cs("c1"),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            &[],
+            &[cs("c1"), cs("c2")],
+            &touches,
+            &BTreeMap::new(),
+            &commit_meta,
+        );
+        assert_eq!(
+            ts, 1_000,
+            "bar's later commit should not bump foo's activity"
         );
     }
 }

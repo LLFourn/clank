@@ -33,6 +33,8 @@ pub struct PlanRow {
     pub phase: String,
     pub worktree_status: String,
     pub waiting_on: WaitingOn,
+    #[serde(default)]
+    pub last_activity_ts: i64,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -113,18 +115,24 @@ pub enum TimelineEvent {
         sha: String,
         plan_touch: Option<String>,
         has_code_changes: bool,
+        #[serde(default)]
+        subject: String,
     },
     #[serde(rename = "commit_impl")]
     CommitImpl {
         sha: String,
         plan_touch: Option<String>,
         has_code_changes: bool,
+        #[serde(default)]
+        subject: String,
     },
     #[serde(rename = "commit_mixed")]
     CommitMixed {
         sha: String,
         plan_touch: Option<String>,
         has_code_changes: bool,
+        #[serde(default)]
+        subject: String,
     },
     #[serde(rename = "review")]
     Review {
@@ -190,6 +198,10 @@ pub struct PlanDetail {
     pub impl_feedback: Vec<FeedbackEntry>,
     #[serde(default)]
     pub held_plan_feedback: Vec<HeldFeedbackEntry>,
+    #[serde(default)]
+    pub plan_body_html: String,
+    #[serde(default)]
+    pub plan_body_truncated: bool,
     #[serde(default)]
     pub timeline: Vec<TimelineEvent>,
     pub pr_hint: Option<PrHint>,
@@ -312,6 +324,10 @@ pub struct CommitDiffPage {
     pub slug: String,
     pub commit_sha: String,
     #[serde(default)]
+    pub subject: String,
+    #[serde(default)]
+    pub message_body: String,
+    #[serde(default)]
     pub diff_files: Vec<FileDiff>,
     #[serde(default)]
     pub feedback: Vec<FeedbackEntry>,
@@ -383,4 +399,46 @@ pub async fn fetch_diff(plan_id: String, from: String, to: String) -> Result<Dif
     resp.json::<DiffPage>()
         .await
         .map_err(|e| FetchError::Decode(e.to_string()))
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)]
+pub struct RepoRow {
+    pub basename: String,
+    pub root: String,
+    pub plan_count: u32,
+    #[serde(default)]
+    pub last_activity_ts: i64,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)]
+pub struct ReposIndex {
+    #[serde(default)]
+    pub repos: Vec<RepoRow>,
+}
+
+pub async fn fetch_repos() -> Result<ReposIndex, FetchError> {
+    let resp = gloo_net::http::Request::get("/api/repos")
+        .send()
+        .await
+        .map_err(|e| FetchError::Network(e.to_string()))?;
+    if !resp.ok() {
+        return Err(FetchError::Status(resp.status()));
+    }
+    resp.json::<ReposIndex>()
+        .await
+        .map_err(|e| FetchError::Decode(e.to_string()))
+}
+
+pub async fn delete_repo(basename: String) -> Result<(), FetchError> {
+    let url = format!("/api/repos/{basename}");
+    let resp = gloo_net::http::Request::delete(&url)
+        .send()
+        .await
+        .map_err(|e| FetchError::Network(e.to_string()))?;
+    if !resp.ok() {
+        return Err(FetchError::Status(resp.status()));
+    }
+    Ok(())
 }

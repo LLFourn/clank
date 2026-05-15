@@ -63,16 +63,28 @@ async fn spawn_daemon(repo_root: &Path) -> (String, tokio::task::JoinHandle<()>)
 async fn spawn_daemon_with_repos(
     repos: &[std::path::PathBuf],
 ) -> (String, tokio::task::JoinHandle<()>) {
+    let repos_file = tempfile::NamedTempFile::new().unwrap();
+    let path = repos_file.path().to_path_buf();
+    drop(repos_file);
+    spawn_daemon_with_repos_file(&path, repos).await
+}
+
+async fn spawn_daemon_with_repos_file(
+    repos_path: &std::path::Path,
+    repos: &[std::path::PathBuf],
+) -> (String, tokio::task::JoinHandle<()>) {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
     drop(listener);
 
-    let repos_file = tempfile::NamedTempFile::new().unwrap();
+    if let Some(parent) = repos_path.parent() {
+        std::fs::create_dir_all(parent).unwrap();
+    }
     let body = repos
         .iter()
         .map(|p| format!("{}\n", p.display()))
         .collect::<String>();
-    std::fs::write(repos_file.path(), body).unwrap();
+    std::fs::write(repos_path, body).unwrap();
 
     let lock_file = tempfile::NamedTempFile::new().unwrap();
     // Remove the empty file so the daemon writes its own PID into it
@@ -83,14 +95,13 @@ async fn spawn_daemon_with_repos(
 
     let args = server::ServeArgs {
         bind: addr,
-        repos: repos_file.path().to_string_lossy().into_owned(),
+        repos: repos_path.to_string_lossy().into_owned(),
         lock: lock_path,
         frontend_dist: std::path::PathBuf::from("frontend/dist"),
     };
 
     let url = format!("http://{}", addr);
     let handle = tokio::spawn(async move {
-        let _hold = repos_file;
         let _ = server::serve(args).await;
     });
 
@@ -356,6 +367,140 @@ async fn commit_diff_route_renders_patch() {
 }
 
 #[tokio::test]
+async fn commit_diff_carries_subject_and_message_body_without_patch_leak() {
+    // The plan asserts that `git_io::commit_message` uses
+    // `git show -s --format=%s%x00%b` so the response's `message_body`
+    // never contains the patch text. Regression test: commit with a
+    // long message body, confirm subject + body parse separately and
+    // body has no `diff --git` substring.
+    let dir = init_repo();
+    write_file(dir.path(), ".trinity/plans/foo.md", "# foo\n");
+    commit(dir.path(), "Add foo plan");
+    write_file(dir.path(), "src/lib.rs", "fn impl_marker() {}\n");
+    run_git(dir.path(), &["add", "-A"]);
+    run_git(
+        dir.path(),
+        &[
+            "commit",
+            "--quiet",
+            "-m",
+            "Implement foo: subject line",
+            "-m",
+            "Extended body paragraph one.\n\nExtended body paragraph two.",
+        ],
+    );
+
+    let (url, handle) = spawn_daemon(dir.path()).await;
+    let client = reqwest::Client::new();
+    let req = json!({
+        "cwd": dir.path(),
+        "tool": "get_context",
+        "arguments": { "plan_id": plan_id_for(&dir, "foo") }
+    });
+    let ctx: serde_json::Value = client
+        .post(format!("{}/internal/tool_call", url))
+        .json(&req)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let impl_sha = ctx["result"]["latest_implementation_revision"]["commit_sha"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let basename = dir.path().file_name().unwrap().to_str().unwrap();
+    let body: serde_json::Value = client
+        .get(format!(
+            "{url}/api/plan/{basename}/foo.md/commit/{impl_sha}"
+        ))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    handle.abort();
+
+    assert_eq!(body["subject"], "Implement foo: subject line");
+    let message_body = body["message_body"].as_str().unwrap();
+    assert!(
+        message_body.contains("Extended body paragraph one."),
+        "message_body should carry the extended body; got: {message_body}"
+    );
+    assert!(
+        !message_body.contains("diff --git"),
+        "message_body must NOT contain patch text; got: {message_body}"
+    );
+}
+
+#[tokio::test]
+async fn plan_detail_carries_body_html_and_timeline_subject() {
+    let dir = init_repo();
+    write_file(
+        dir.path(),
+        ".trinity/plans/foo.md",
+        "# Foo Plan\n\nFirst paragraph.\n",
+    );
+    run_git(dir.path(), &["add", "-A"]);
+    run_git(
+        dir.path(),
+        &["commit", "--quiet", "-m", "Add foo plan with body"],
+    );
+
+    let (url, handle) = spawn_daemon(dir.path()).await;
+    let basename = dir.path().file_name().unwrap().to_str().unwrap();
+    let body: serde_json::Value = reqwest::get(format!("{url}/api/plan/{basename}/foo.md"))
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    handle.abort();
+
+    let body_html = body["plan_body_html"].as_str().unwrap();
+    assert!(body_html.contains("<h1>Foo Plan</h1>"), "got: {body_html}");
+    assert!(body_html.contains("First paragraph."), "got: {body_html}");
+    assert!(body["plan_body_truncated"].is_boolean());
+
+    let first = &body["timeline"][0];
+    assert_eq!(first["kind"], "commit_plan");
+    assert_eq!(first["subject"], "Add foo plan with body");
+}
+
+#[tokio::test]
+async fn api_plans_carries_last_activity_ts_and_sorts_desc() {
+    let dir = init_repo();
+    write_file(dir.path(), ".trinity/plans/old.md", "# old\n");
+    commit(dir.path(), "Add old");
+    // Sleep so the newer commit's author_ts is strictly larger.
+    std::thread::sleep(Duration::from_secs(1));
+    write_file(dir.path(), ".trinity/plans/new.md", "# new\n");
+    commit(dir.path(), "Add new");
+
+    let (url, handle) = spawn_daemon(dir.path()).await;
+    let body: serde_json::Value = reqwest::get(format!("{url}/api/plans"))
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    handle.abort();
+    let plans = body["plans"].as_array().unwrap();
+    assert_eq!(plans.len(), 2);
+    assert!(plans[0]["last_activity_ts"].is_number());
+    let first_ts = plans[0]["last_activity_ts"].as_i64().unwrap();
+    let second_ts = plans[1]["last_activity_ts"].as_i64().unwrap();
+    assert!(
+        first_ts >= second_ts,
+        "plans should be sorted by last_activity_ts desc; got {first_ts} then {second_ts}"
+    );
+    assert_eq!(plans[0]["slug"], "new", "newest plan should be first");
+}
+
+#[tokio::test]
 async fn sse_pushes_repo_rebuilt_on_head_change() {
     use futures::StreamExt;
 
@@ -434,8 +579,9 @@ async fn start_plan_persists_repo_to_registry() {
     unsafe { std::env::set_var("HOME", fake_home.path()) };
 
     let dir = init_repo();
-    // Don't pre-register; start_plan should do it.
-    let (url, handle) = spawn_daemon_with_repos(&[]).await;
+    // Use the default registry path the daemon resolves from ~/.trinity/repos.
+    let registry_path = fake_home.path().join(".trinity/repos");
+    let (url, handle) = spawn_daemon_with_repos_file(&registry_path, &[]).await;
     let client = reqwest::Client::new();
     let req = json!({
         "cwd": dir.path(),
@@ -948,6 +1094,222 @@ async fn start_plan_concurrent_basename_twins_loser_does_no_disk_mutation() {
     assert!(
         !registry.lines().any(|l| l.trim() == loser_str),
         "registry must not record the loser twin; registry: {registry}"
+    );
+
+    match prev_home {
+        Some(v) => unsafe { std::env::set_var("HOME", v) },
+        None => unsafe { std::env::remove_var("HOME") },
+    }
+}
+
+#[tokio::test]
+async fn api_repos_lists_watched_with_basename_and_plan_count() {
+    let repo_a_parent = tempfile::tempdir().unwrap();
+    let repo_b_parent = tempfile::tempdir().unwrap();
+    let dir_a = repo_a_parent.path().join("alpha");
+    let dir_b = repo_b_parent.path().join("beta");
+    std::fs::create_dir_all(&dir_a).unwrap();
+    std::fs::create_dir_all(&dir_b).unwrap();
+    for d in [&dir_a, &dir_b] {
+        run_git(d, &["init", "--quiet", "--initial-branch=main"]);
+        run_git(d, &["config", "user.email", "test@test"]);
+        run_git(d, &["config", "user.name", "test"]);
+        run_git(d, &["config", "commit.gpgsign", "false"]);
+    }
+    write_file(&dir_a, ".trinity/plans/p1.md", "# alpha plan\n");
+    commit(&dir_a, "alpha plan");
+    write_file(&dir_b, ".trinity/plans/q1.md", "# beta plan one\n");
+    commit(&dir_b, "beta one");
+    write_file(&dir_b, ".trinity/plans/q2.md", "# beta plan two\n");
+    commit(&dir_b, "beta two");
+
+    let (url, handle) = spawn_daemon_with_repos(&[dir_a.clone(), dir_b.clone()]).await;
+    let body: serde_json::Value = reqwest::get(format!("{url}/api/repos"))
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    handle.abort();
+
+    let repos = body["repos"].as_array().unwrap();
+    assert_eq!(repos.len(), 2);
+    let by_basename: std::collections::HashMap<&str, &serde_json::Value> = repos
+        .iter()
+        .filter_map(|r| r["basename"].as_str().map(|b| (b, r)))
+        .collect();
+    assert_eq!(by_basename["alpha"]["plan_count"], 1);
+    assert_eq!(by_basename["beta"]["plan_count"], 2);
+    assert!(by_basename["alpha"]["last_activity_ts"].is_number());
+    assert!(by_basename["beta"]["last_activity_ts"].is_number());
+}
+
+#[tokio::test]
+async fn delete_repo_removes_from_state_and_registry() {
+    let _home_guard = HOME_LOCK.lock().await;
+    let fake_home = tempfile::tempdir().unwrap();
+    let prev_home = std::env::var_os("HOME");
+    // SAFETY: serialized with other HOME-mutating tests via HOME_LOCK.
+    unsafe { std::env::set_var("HOME", fake_home.path()) };
+
+    let parent = tempfile::tempdir().unwrap();
+    let dir = parent.path().join("orphan");
+    std::fs::create_dir_all(&dir).unwrap();
+    run_git(&dir, &["init", "--quiet", "--initial-branch=main"]);
+    run_git(&dir, &["config", "user.email", "test@test"]);
+    run_git(&dir, &["config", "user.name", "test"]);
+    run_git(&dir, &["config", "commit.gpgsign", "false"]);
+
+    let (url, handle) = spawn_daemon_with_repos(&[]).await;
+    let client = reqwest::Client::new();
+
+    // Register via start_plan, then delete.
+    let req = json!({
+        "cwd": dir,
+        "tool": "start_plan",
+        "arguments": { "slug": "p", "label": "agent" }
+    });
+    let resp = client
+        .post(format!("{url}/internal/tool_call"))
+        .json(&req)
+        .send()
+        .await
+        .unwrap();
+    assert!(resp.status().is_success(), "start_plan should succeed");
+
+    // Now /api/repos should include `orphan`.
+    let before: serde_json::Value = reqwest::get(format!("{url}/api/repos"))
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(
+        before["repos"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|r| r["basename"] == "orphan"),
+        "orphan should be listed"
+    );
+
+    let resp = client
+        .delete(format!("{url}/api/repos/orphan"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+
+    let after: serde_json::Value = reqwest::get(format!("{url}/api/repos"))
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    handle.abort();
+    assert!(
+        !after["repos"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|r| r["basename"] == "orphan"),
+        "orphan should be gone after DELETE; got: {after}"
+    );
+
+    // Registry file should not contain the path.
+    let registry =
+        std::fs::read_to_string(fake_home.path().join(".trinity/repos")).unwrap_or_default();
+    let dir_str = dir.to_string_lossy();
+    assert!(
+        !registry.lines().any(|l| l.trim() == dir_str),
+        "registry must not contain unwatched repo; registry: {registry}"
+    );
+
+    match prev_home {
+        Some(v) => unsafe { std::env::set_var("HOME", v) },
+        None => unsafe { std::env::remove_var("HOME") },
+    }
+}
+
+#[tokio::test]
+async fn delete_repo_404_on_unknown_basename() {
+    let dir = init_repo();
+    write_file(dir.path(), ".trinity/plans/foo.md", "# foo\n");
+    commit(dir.path(), "add foo");
+    let (url, handle) = spawn_daemon(dir.path()).await;
+    let resp = reqwest::Client::new()
+        .delete(format!("{url}/api/repos/does-not-exist"))
+        .send()
+        .await
+        .unwrap();
+    handle.abort();
+    assert_eq!(resp.status(), reqwest::StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn registry_path_threads_through_start_plan_and_delete() {
+    // Use a non-default --repos path. Both start_plan (persist) and the
+    // new DELETE handler must write to THIS path, not ~/.trinity/repos.
+    let _home_guard = HOME_LOCK.lock().await;
+    let fake_home = tempfile::tempdir().unwrap();
+    let prev_home = std::env::var_os("HOME");
+    // SAFETY: serialized with other HOME-mutating tests via HOME_LOCK.
+    unsafe { std::env::set_var("HOME", fake_home.path()) };
+
+    let registry_dir = tempfile::tempdir().unwrap();
+    let registry_path = registry_dir.path().join("custom-registry");
+
+    let parent = tempfile::tempdir().unwrap();
+    let dir = parent.path().join("custom");
+    std::fs::create_dir_all(&dir).unwrap();
+    run_git(&dir, &["init", "--quiet", "--initial-branch=main"]);
+    run_git(&dir, &["config", "user.email", "test@test"]);
+    run_git(&dir, &["config", "user.name", "test"]);
+    run_git(&dir, &["config", "commit.gpgsign", "false"]);
+
+    let (url, handle) = spawn_daemon_with_repos_file(&registry_path, &[]).await;
+    let client = reqwest::Client::new();
+
+    let req = json!({
+        "cwd": dir,
+        "tool": "start_plan",
+        "arguments": { "slug": "p", "label": "agent" }
+    });
+    client
+        .post(format!("{url}/internal/tool_call"))
+        .json(&req)
+        .send()
+        .await
+        .unwrap();
+
+    // Custom registry has the path, default location does NOT.
+    let custom_body = std::fs::read_to_string(&registry_path).unwrap_or_default();
+    let default_body =
+        std::fs::read_to_string(fake_home.path().join(".trinity/repos")).unwrap_or_default();
+    // start_plan persists whatever `git rev-parse --show-toplevel`
+    // returned, which on macOS is the canonical /private/var/... form.
+    let dir_canonical = dir.canonicalize().unwrap().to_string_lossy().to_string();
+    assert!(
+        custom_body.lines().any(|l| l.trim() == dir_canonical),
+        "custom registry should contain repo after start_plan; \
+         dir_canonical={dir_canonical}; got: {custom_body}"
+    );
+    assert!(
+        !default_body.lines().any(|l| l.trim() == dir_canonical),
+        "default registry must NOT be touched when --repos is custom; got: {default_body}"
+    );
+
+    // DELETE: should clean from custom registry.
+    client
+        .delete(format!("{url}/api/repos/custom"))
+        .send()
+        .await
+        .unwrap();
+    handle.abort();
+    let after = std::fs::read_to_string(&registry_path).unwrap_or_default();
+    assert!(
+        !after.lines().any(|l| l.trim() == dir_canonical),
+        "DELETE should remove from custom registry; got: {after}"
     );
 
     match prev_home {

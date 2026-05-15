@@ -1,6 +1,9 @@
+use std::sync::Arc;
+
 use leptos::prelude::*;
 
 use crate::api::TimelineEvent;
+use crate::components::expanded_commit::ExpandedCommit;
 use crate::util::short_sha;
 
 /// Chronological event list for one session. Each event is one row with
@@ -12,16 +15,20 @@ use crate::util::short_sha;
 /// "pulse on insertion" CSS animation from firing on rows that didn't
 /// actually change.
 #[component]
-pub fn Timeline(events: Vec<TimelineEvent>) -> impl IntoView {
+pub fn Timeline(plan_id: String, events: Vec<TimelineEvent>) -> impl IntoView {
     if events.is_empty() {
         return view! { <p class="muted">"No activity yet."</p> }.into_any();
     }
+    let plan_id = std::sync::Arc::new(plan_id);
     view! {
         <ol class="timeline">
             <For
                 each=move || events.clone().into_iter().enumerate()
                 key=|(idx, e)| timeline_key(*idx, e)
-                children=move |(_, e)| view! { <TimelineRow event=e/> }
+                children=move |(_, e)| {
+                    let plan_id = plan_id.clone();
+                    view! { <TimelineRow plan_id=plan_id event=e/> }
+                }
             />
         </ol>
     }
@@ -49,47 +56,32 @@ fn timeline_key(idx: usize, e: &TimelineEvent) -> String {
 }
 
 #[component]
-fn TimelineRow(event: TimelineEvent) -> impl IntoView {
+fn TimelineRow(plan_id: std::sync::Arc<String>, event: TimelineEvent) -> impl IntoView {
     match event {
-        TimelineEvent::CommitPlan { sha, .. } => {
-            let short = short_sha(&sha);
-            view! {
-                <li class="timeline-row timeline-commit-plan">
-                    <span class="timeline-marker"></span>
-                    <span class="timeline-kind">"Plan revision"</span>
-                    <span class="timeline-sha">
-                        <code>{short}</code>
-                    </span>
-                </li>
-            }
-            .into_any()
-        }
-        TimelineEvent::CommitImpl { sha, .. } => {
-            let short = short_sha(&sha);
-            view! {
-                <li class="timeline-row timeline-commit-impl">
-                    <span class="timeline-marker"></span>
-                    <span class="timeline-kind">"Implementation"</span>
-                    <span class="timeline-sha">
-                        <code>{short}</code>
-                    </span>
-                </li>
-            }
-            .into_any()
-        }
-        TimelineEvent::CommitMixed { sha, .. } => {
-            let short = short_sha(&sha);
-            view! {
-                <li class="timeline-row timeline-commit-mixed">
-                    <span class="timeline-marker"></span>
-                    <span class="timeline-kind">"Plan + impl"</span>
-                    <span class="timeline-sha">
-                        <code>{short}</code>
-                    </span>
-                </li>
-            }
-            .into_any()
-        }
+        TimelineEvent::CommitPlan { sha, subject, .. } => commit_row(
+            plan_id,
+            sha,
+            subject,
+            "timeline-row timeline-commit-plan",
+            "Plan revision",
+        )
+        .into_any(),
+        TimelineEvent::CommitImpl { sha, subject, .. } => commit_row(
+            plan_id,
+            sha,
+            subject,
+            "timeline-row timeline-commit-impl",
+            "Implementation",
+        )
+        .into_any(),
+        TimelineEvent::CommitMixed { sha, subject, .. } => commit_row(
+            plan_id,
+            sha,
+            subject,
+            "timeline-row timeline-commit-mixed",
+            "Plan + impl",
+        )
+        .into_any(),
         TimelineEvent::Review {
             phase,
             target,
@@ -135,5 +127,55 @@ fn verdict_label(verdict: &str) -> &'static str {
         "approve" => "APPROVE",
         "request_changes" => "REQUEST_CHANGES",
         _ => "UNMARKED",
+    }
+}
+
+/// Click-to-expand commit row. Subject + caret on the top line, full
+/// commit (message body + structured diff) lazily mounted below when
+/// `expanded` is set. Each instance owns its own RwSignal so toggling
+/// is local; the `<For key>` in `<Timeline/>` is keyed by SHA so
+/// expanded state survives re-fetches that don't change row identity.
+fn commit_row(
+    plan_id: Arc<String>,
+    sha: String,
+    subject: String,
+    li_class: &'static str,
+    kind_label: &'static str,
+) -> impl IntoView {
+    let expanded = RwSignal::new(false);
+    let short = short_sha(&sha);
+    let sha_for_expand = sha.clone();
+    let plan_id_for_expand = plan_id.clone();
+    let caret = move || if expanded.get() { "▼" } else { "▸" };
+    let subject_display = if subject.is_empty() {
+        "(no message)".to_string()
+    } else {
+        subject.clone()
+    };
+    let subject_title = subject_display.clone();
+    let on_click = move |_| expanded.update(|v| *v = !*v);
+    view! {
+        <li class=li_class>
+            <button
+                class="timeline-commit-row"
+                type="button"
+                on:click=on_click
+                title=subject_title.clone()
+            >
+                <span class="timeline-caret">{caret}</span>
+                <span class="timeline-marker"></span>
+                <span class="timeline-kind">{kind_label}</span>
+                <span class="timeline-sha">
+                    <code>{short}</code>
+                </span>
+                <span class="timeline-subject">{subject_display}</span>
+            </button>
+            <Show when=move || expanded.get()>
+                <ExpandedCommit
+                    plan_id=plan_id_for_expand.as_ref().clone()
+                    sha=sha_for_expand.clone()
+                />
+            </Show>
+        </li>
     }
 }

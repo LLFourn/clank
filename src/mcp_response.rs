@@ -287,6 +287,7 @@ fn timeline_value(state: &RepoState, session_id: &PlanKey) -> Vec<Value> {
                 sha,
                 plan_touch,
                 has_code_changes,
+                subject,
             } => {
                 let kind = match (plan_touch.is_some(), has_code_changes) {
                     (true, true) => "commit_mixed",
@@ -299,6 +300,7 @@ fn timeline_value(state: &RepoState, session_id: &PlanKey) -> Vec<Value> {
                     "sha": sha.as_str(),
                     "plan_touch": plan_touch.as_ref().map(|k| k.as_str()),
                     "has_code_changes": has_code_changes,
+                    "subject": subject,
                 })
             }
             crate::repo_state::TimelineEvent::Review {

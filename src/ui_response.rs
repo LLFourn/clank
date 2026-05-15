@@ -38,7 +38,7 @@ pub fn plans_index_with_reader(
     status_reader: &impl PlanStatusReader,
 ) -> std::io::Result<Value> {
     let basename = crate::lifecycle::RepoBasename::from_repo_root(&snapshot.root);
-    let mut plans = Vec::with_capacity(snapshot.plans.len());
+    let mut plans: Vec<(i64, Value)> = Vec::with_capacity(snapshot.plans.len());
     for plan in &snapshot.plans {
         let plan_phase = phase_for(&plan.plan_path, &plan.id, &snapshot.attribution);
         let plan_gate = plan_gate_for_parts(
@@ -64,17 +64,34 @@ pub fn plans_index_with_reader(
         let plan_id = basename
             .as_ref()
             .map(|b| crate::lifecycle::PlanId::new(b.clone(), plan.id.clone()).to_string());
-        plans.push(json!({
-            "repo": snapshot.root.to_string_lossy(),
-            "plan_id": plan_id,
-            "slug": plan.id.as_str(),
-            "state": plan.state.as_str(),
-            "current_path": plan.plan_path.to_string_lossy(),
-            "phase": plan_phase.as_str(),
-            "worktree_status": worktree_status.as_str(),
-            "waiting_on": waiting_on_value(&w),
-        }));
+        let last_activity_ts = crate::projection::last_activity_ts_for(
+            &plan.id,
+            &plan.plan_intro,
+            &plan.plan_feedback,
+            &plan.impl_feedback,
+            &plan.held_plan_feedback,
+            &snapshot.commit_order,
+            &snapshot.plan_touches,
+            &snapshot.attribution,
+            &snapshot.commit_meta,
+        );
+        plans.push((
+            last_activity_ts,
+            json!({
+                "repo": snapshot.root.to_string_lossy(),
+                "plan_id": plan_id,
+                "slug": plan.id.as_str(),
+                "state": plan.state.as_str(),
+                "current_path": plan.plan_path.to_string_lossy(),
+                "phase": plan_phase.as_str(),
+                "worktree_status": worktree_status.as_str(),
+                "waiting_on": waiting_on_value(&w),
+                "last_activity_ts": last_activity_ts,
+            }),
+        ));
     }
+    plans.sort_by_key(|p| std::cmp::Reverse(p.0));
+    let plans: Vec<Value> = plans.into_iter().map(|(_, v)| v).collect();
     let conflicts: Vec<Value> = snapshot
         .plan_conflicts
         .iter()
@@ -168,6 +185,7 @@ pub fn plan_page_with_reader(
         &bundle.attribution,
         &bundle.plan_touches,
         &bundle.commit_order,
+        &bundle.commit_meta,
     );
     let pr_hint = if matches!(plan_phase, Phase::Implementing) {
         Some(pr_hint_value(plan, &implementation_commits))
@@ -178,6 +196,13 @@ pub fn plan_page_with_reader(
     let plan_id = basename
         .as_ref()
         .map(|b| crate::lifecycle::PlanId::new(b.clone(), plan.id.clone()).to_string());
+
+    let plan_body_html = render_markdown(&plan.body);
+    // Threshold is a hint to the SPA on whether to render the
+    // see-more toggle; the full body is always sent. ~4000 chars
+    // covers "more than one screen of text" for typical reading
+    // widths.
+    let plan_body_truncated = plan.body.chars().count() > 4000;
 
     Ok(json!({
         "repo": bundle.root.to_string_lossy(),
@@ -198,6 +223,8 @@ pub fn plan_page_with_reader(
         "plan_feedback": plan_feedback,
         "impl_feedback": impl_feedback,
         "held_plan_feedback": held_feedback_entries(&plan.held_plan_feedback),
+        "plan_body_html": plan_body_html,
+        "plan_body_truncated": plan_body_truncated,
         "timeline": timeline,
         "pr_hint": pr_hint,
     }))
@@ -376,6 +403,7 @@ fn timeline_value(
     attribution: &BTreeMap<CommitSha, AttributionResult>,
     plan_touches: &BTreeMap<CommitSha, Vec<(PlanKey, PlanTouchKind)>>,
     commit_order: &[CommitSha],
+    commit_meta: &BTreeMap<CommitSha, crate::disk_snapshot::CommitMetaEntry>,
 ) -> Vec<Value> {
     let mut out = Vec::new();
     for sha in commit_order {
@@ -400,11 +428,16 @@ fn timeline_value(
             (false, true) => "commit_impl",
             (false, false) => unreachable!("filtered above"),
         };
+        let subject = commit_meta
+            .get(sha)
+            .map(|m| m.subject.clone())
+            .unwrap_or_default();
         out.push(json!({
             "kind": kind,
             "sha": sha.as_str(),
             "plan_touch": plan_touch.as_ref().map(|k| k.as_str()),
             "has_code_changes": has_code_changes,
+            "subject": subject,
         }));
         for ((target, author), fb) in &session.plan_feedback {
             if target == sha {
@@ -494,6 +527,7 @@ mod tests {
             plan_touches: BTreeMap::new(),
             commit_order: Vec::new(),
             plan_conflicts: BTreeMap::new(),
+            commit_meta: BTreeMap::new(),
         }
     }
 

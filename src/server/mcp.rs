@@ -169,7 +169,7 @@ async fn start_plan(state: &AppState, req: &ToolCallRequest) -> Result<Value, To
     // second returns Forbidden without ever touching disk).
     ensure_registered_or_reject(state, &repo).await?;
     ensure_gitignore(&repo)?;
-    persist_repo_in_registry(&repo)
+    persist_repo_in_registry(&state.repos_path, &repo)
         .map_err(|e| ToolError::Internal(anyhow::anyhow!("register repo: {e}")))?;
     ensure_repo_watcher(state, repo.clone()).await;
 
@@ -345,18 +345,19 @@ async fn ensure_registered_or_reject(state: &AppState, repo: &Path) -> Result<()
 }
 
 /// Spawn a notify watcher for `repo` if one isn't already running.
-/// Tracks watched repos in `AppState.watched_repos` to dedupe.
+/// Tracks watched handles by canonical repo root in `AppState.watchers`
+/// so `delete_repo` can target and abort a specific watcher.
 async fn ensure_repo_watcher(state: &AppState, repo: PathBuf) {
+    let canonical = dunce::canonicalize(&repo).unwrap_or_else(|_| repo.clone());
     {
-        let watched = state.watched_repos.lock().await;
-        if watched.contains(&repo) {
+        let watchers = state.watchers.lock().await;
+        if watchers.contains_key(&canonical) {
             return;
         }
     }
     match super::notify_bridge::start(state.runtime.clone(), repo.clone()).await {
         Ok(handle) => {
-            state.watchers.lock().await.push(handle);
-            state.watched_repos.lock().await.insert(repo);
+            state.watchers.lock().await.insert(canonical, handle);
         }
         Err(err) => {
             tracing::warn!(repo = %repo.display(), error = ?err, "watcher start failed for new repo");
@@ -364,16 +365,16 @@ async fn ensure_repo_watcher(state: &AppState, repo: PathBuf) {
     }
 }
 
-/// Append `repo` to `~/.trinity/repos` if not already present.
-fn persist_repo_in_registry(repo: &Path) -> std::io::Result<()> {
-    let Some(home) = std::env::var_os("HOME") else {
-        return Ok(());
-    };
-    let registry = PathBuf::from(home).join(".trinity/repos");
+/// Append `repo` to the registry file if not already present. The
+/// registry path is the daemon's configured `--repos` / `$TRINITY_REPOS`
+/// value (stashed in `AppState.repos_path` at startup), NOT the
+/// hardcoded `~/.trinity/repos` — that would lose registrations for
+/// non-default deployments.
+pub(crate) fn persist_repo_in_registry(registry: &Path, repo: &Path) -> std::io::Result<()> {
     if let Some(parent) = registry.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let existing = std::fs::read_to_string(&registry).unwrap_or_default();
+    let existing = std::fs::read_to_string(registry).unwrap_or_default();
     let already_present = existing
         .lines()
         .map(str::trim)
@@ -385,8 +386,39 @@ fn persist_repo_in_registry(repo: &Path) -> std::io::Result<()> {
     let mut f = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
-        .open(&registry)?;
+        .open(registry)?;
     writeln!(f, "{}", repo.display())?;
+    Ok(())
+}
+
+/// Remove every line that resolves to `repo` from the registry file.
+/// Re-writes atomically (rename-from-temp) so a partial write can't
+/// leave the file truncated.
+pub(crate) fn remove_repo_from_registry(registry: &Path, repo: &Path) -> std::io::Result<()> {
+    if !registry.exists() {
+        return Ok(());
+    }
+    let existing = std::fs::read_to_string(registry)?;
+    let mut kept: Vec<&str> = Vec::new();
+    let mut changed = false;
+    for line in existing.lines() {
+        let trimmed = line.trim();
+        if !trimmed.is_empty() && std::path::Path::new(trimmed) == repo {
+            changed = true;
+            continue;
+        }
+        kept.push(line);
+    }
+    if !changed {
+        return Ok(());
+    }
+    let mut body = kept.join("\n");
+    if !body.is_empty() {
+        body.push('\n');
+    }
+    let tmp = registry.with_extension("repos.tmp");
+    std::fs::write(&tmp, body)?;
+    std::fs::rename(&tmp, registry)?;
     Ok(())
 }
 

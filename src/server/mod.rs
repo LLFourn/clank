@@ -7,7 +7,7 @@ pub mod notify_bridge;
 pub mod state;
 pub mod wait;
 
-use std::collections::HashSet;
+use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -65,13 +65,13 @@ pub async fn serve(args: ServeArgs) -> anyhow::Result<()> {
     }
 
     // Track the notify-bridge tasks per repo so we can detach them on drop.
-    let mut watchers = Vec::with_capacity(repos.len());
-    let mut watched_repos: HashSet<PathBuf> = HashSet::new();
+    let mut watchers: BTreeMap<PathBuf, tokio::task::JoinHandle<()>> = BTreeMap::new();
     for repo in repos {
         if !repo.exists() {
             tracing::warn!(path = %repo.display(), "configured repo does not exist; skipping");
             continue;
         }
+        let canonical = dunce::canonicalize(&repo).unwrap_or_else(|_| repo.clone());
         match runtime.add_repo(repo.clone()).await {
             Ok(crate::runtime::RegisterOutcome::Registered) => {
                 tracing::info!(repo = %repo.display(), "repo loaded")
@@ -91,8 +91,7 @@ pub async fn serve(args: ServeArgs) -> anyhow::Result<()> {
         }
         match notify_bridge::start(Arc::clone(&runtime), repo.clone()).await {
             Ok(handle) => {
-                watchers.push(handle);
-                watched_repos.insert(repo);
+                watchers.insert(canonical, handle);
             }
             Err(err) => {
                 tracing::error!(repo = %repo.display(), error = ?err, "watcher start failed");
@@ -104,9 +103,9 @@ pub async fn serve(args: ServeArgs) -> anyhow::Result<()> {
     let state = AppState {
         runtime: Arc::clone(&runtime),
         watchers: Arc::new(Mutex::new(watchers)),
-        watched_repos: Arc::new(Mutex::new(watched_repos)),
         frontend_dist: args.frontend_dist.clone(),
         spa_shell,
+        repos_path: repos_path.clone(),
     };
 
     let app = http::router(state);

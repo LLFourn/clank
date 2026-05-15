@@ -46,6 +46,17 @@ pub struct RepoState {
     /// surface the conflict so callers can flag it instead of routing
     /// work.
     pub plan_conflicts: BTreeMap<PlanKey, Vec<PathBuf>>,
+    /// Author timestamp + first-line subject for every commit in
+    /// `commit_order`. Sourced from one batched `git log` per rebuild
+    /// (`git_io::first_parent_commits`). Consumed by:
+    ///
+    /// - timeline rendering (subject column on commit rows).
+    /// - `last_activity_ts` per plan (max `author_ts` over the plan's
+    ///   attributed commits, vs feedback mtimes).
+    ///
+    /// Keyed on the same SHAs that appear in `commit_order` /
+    /// `attribution`. Lookups are infallible for known commits.
+    pub commit_meta: BTreeMap<CommitSha, crate::disk_snapshot::CommitMetaEntry>,
 }
 
 impl RepoState {
@@ -58,6 +69,7 @@ impl RepoState {
             plan_touches: BTreeMap::new(),
             commit_order: Vec::new(),
             plan_conflicts: BTreeMap::new(),
+            commit_meta: BTreeMap::new(),
         }
     }
 
@@ -97,10 +109,16 @@ impl RepoState {
             if plan_touch.is_none() && !has_code_changes {
                 continue;
             }
+            let subject = self
+                .commit_meta
+                .get(sha)
+                .map(|m| m.subject.clone())
+                .unwrap_or_default();
             out.push(TimelineEvent::Commit {
                 sha: sha.clone(),
                 plan_touch,
                 has_code_changes,
+                subject,
             });
             for ((target, author), fb) in &plan.plan_feedback {
                 if target == sha {
@@ -266,11 +284,14 @@ impl RepoState {
 pub enum TimelineEvent {
     /// A commit attributed to this session. The render layer decides
     /// whether to label it "Plan revision" / "Implementation" / "Mixed"
-    /// based on `(plan_touch, has_code_changes)`.
+    /// based on `(plan_touch, has_code_changes)`. `subject` is the
+    /// first line of the commit message — populated from
+    /// `RepoState::commit_meta` at projection time.
     Commit {
         sha: CommitSha,
         plan_touch: Option<PlanTouchKind>,
         has_code_changes: bool,
+        subject: String,
     },
     /// A reviewer's verdict against a specific commit. Always follows
     /// the `Commit` it targets in the timeline.
