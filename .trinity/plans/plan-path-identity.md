@@ -202,8 +202,9 @@ is unchanged from Phase 1.)
 1. Accept input ending in `.md`. Strip the suffix.
 2. Find the last `:` in the remainder.
 3. Left of `:` → repo. Expand leading `~/` to `$HOME`. Apply
-   `dunce::canonicalize`. (Fall back to the raw path if canonicalize
-   fails, same way today's repo arg falls back.)
+   `dunce::canonicalize`. If canonicalization fails (path doesn't
+   exist, IO error, etc.), return `ParsePlanIdError`. No raw-path
+   fallback.
 4. Right of `:` → stem. Validate against `PlanKey` grammar.
 5. If any step fails, return `ParsePlanIdError` (the daemon maps to
    `invalid_plan_id` over MCP / `400 Bad Request` over HTTP).
@@ -298,9 +299,12 @@ Tools affected:
   axis it varies on); agents that need it for display can read it
   directly instead of recomputing from `(slug, state)`.
 - `wait_for_work` — accepts `plan_id`. `Match`:
-  `{plan_id, work, locations}`. `locations` stay repo-relative;
-  agents resolve them against the repo by stripping `:<stem>.md` off
-  `plan_id`. No separate `repo` field — `plan_id` carries everything.
+  `{plan_id, repo, work, locations}`. `repo` is the canonical absolute
+  path; `locations` stay repo-relative. `repo` is redundant with
+  `plan_id` (the agent could strip `:<stem>.md` to recover it) but
+  spelling it out keeps `wait_for_work` callers from having to parse
+  identifiers to do their job — the whole point of returning
+  `locations` is that the caller can act directly.
 - `list_plans` — accepts optional `repo` (still a useful filter when
   watching multiple repos). Response: `{plans: [...], conflicts: [...]}`.
   Each plan row: `{plan_id, slug, state, current_path, phase,
@@ -334,96 +338,50 @@ purely transport.
 
 ### 5. UI routes + `/api/*`
 
-URL routes use a sanitized `PlanId` form as a **single path segment**.
+URL routes carry the **literal canonical `PlanId`** as the path tail.
+Axum's wildcard capture (`{*plan_id}`) takes everything after the
+prefix verbatim, no encoding/decoding. The match is byte-for-byte
+against the canonical form stored in the runtime.
 
-**Sanitization rule:** `/` in the repo portion of the canonical
-`PlanId` is replaced with `_`. Other URL-significant bytes
-(`?`, `#`, `%`, space, control chars, non-UTF-8) are simply rejected:
-repos with those characters in their canonical path can't be addressed
-via HTTP and are refused at `start_plan` time. In practice every
-real-world repo path is `[A-Za-z0-9_.-/]+`, so the sanitization is a
-straight `/` → `_` substitution.
-
-Canonical and URL forms:
+Examples:
 
 ```
-canonical: /Users/llfourn/src/trinity:plan-path-identity.md
-url form:  _Users_llfourn_src_trinity:plan-path-identity.md
+/api/plan//Users/llfourn/src/trinity:plan-path-identity.md
+/plan//Users/llfourn/src/trinity:plan-path-identity.md
 ```
+
+(The double slash is the literal `/` from the route prefix followed
+by the leading `/` of the absolute repo path. Axum captures the tail
+starting at the second `/`; the SPA's router does the same.)
 
 Routes:
 
 ```
 GET  /                                # SPA home
-GET  /plan/{plan_url}                 # SPA plan detail
-GET  /plan/{plan_url}/revision/{sha}
-GET  /plan/{plan_url}/commit/{sha}
-GET  /plan/{plan_url}/diff/{from}...{to}
-POST /api/plan/{plan_url}/done        # body: {}
+GET  /plan/{*plan_id}                 # SPA plan detail
+GET  /plan/{*plan_id}/revision/{sha}
+GET  /plan/{*plan_id}/commit/{sha}
+GET  /plan/{*plan_id}/diff/{from}...{to}
+POST /api/plan/{*plan_id}/done        # body: {}
 
 GET  /api/plans?repo=<repo>           # repo filter; absent = all watched repos
-GET  /api/plan/{plan_url}
-GET  /api/plan/{plan_url}/revision/{sha}
-GET  /api/plan/{plan_url}/commit/{sha}
-GET  /api/plan/{plan_url}/diff/{from}...{to}
+GET  /api/plan/{*plan_id}
+GET  /api/plan/{*plan_id}/revision/{sha}
+GET  /api/plan/{*plan_id}/commit/{sha}
+GET  /api/plan/{*plan_id}/diff/{from}...{to}
 ```
 
-Single path segment captures, no wildcard. The SPA reads `state` from
-the response and renders the done badge — the URL doesn't change when
-a plan moves to done.
+The SPA reads `state` from the response and renders the done badge —
+the URL doesn't change when a plan moves to done.
 
-**Lookup is by sanitized form.** The daemon maintains the canonical
-`PlanId` internally and compares against requests by sanitizing the
-canonical form of each watched repo + plan key. So:
-`/api/plan/_Users_llfourn_src_trinity:plan-path-identity.md` looks up
-by computing `sanitize(canonical_id)` for each candidate plan and
-matching against the URL segment. There is no reverse-substitution
-that turns `_` back into `/` blindly. Two distinct repo paths that
-collide under sanitization are an error state — `start_plan` rejects
-the second one with `repo_collides_with_existing_repo`.
-
-Encoder lives in `src/lifecycle.rs` next to `PlanId`:
-
-```rust
-impl PlanId {
-    pub fn to_url_segment(&self) -> String {
-        // Replace `/` with `_`; everything else passes through.
-        // `:` and `.` and the stem chars are URL-segment-safe.
-        format!("{}", self).replace('/', '_')
-    }
-}
-```
-
-Reverse lookup at the dispatch layer:
-
-```rust
-fn resolve_url_segment(
-    state: &Trinity,
-    seg: &str,
-) -> Result<&Plan, PlanLookupError> {
-    for (repo_root, repo_state) in &state.repos {
-        for (key, plan) in &repo_state.plans {
-            let candidate = PlanId::new(repo_root.clone(), key.clone());
-            if candidate.to_url_segment() == seg { return Ok(plan); }
-        }
-        // also check plan_conflicts so conflict rows are reachable
-    }
-    Err(PlanLookupError::UnknownPlan(seg.into()))
-}
-```
-
-(Linear scan is fine for the watched-repos-count we care about. If we
-ever care, we cache a `BTreeMap<url_segment, (repo, key)>` in
-`Trinity` and invalidate on `plans` mutations.)
-
-Acceptance tests must include at least:
-
-- Round-trip: `to_url_segment()` then `resolve_url_segment` recovers
-  the original plan.
-- A repo path with a space — rejected at `start_plan` registration.
-- A repo path with `?`, `#`, `%`, or non-ASCII — same.
-- Two watched repos that differ only by `_` vs `/` — second one
-  rejected at registration with `repo_collides_with_existing_repo`.
+**Handling URL-unsafe characters in repo paths:** any repo whose
+canonical path contains characters that the HTTP path layer mangles
+(`?`, `#`, `%`, control chars, etc.) simply isn't reachable via the
+HTTP/SPA surface. MCP and SSE still work — they pass the canonical
+`PlanId` as a JSON string and don't care. The daemon doesn't refuse
+to watch such repos; it just won't serve them through URL routes.
+Trinity is local-only and single-user; in practice every repo root
+is a plain Unix path under `~` that survives axum's path parser.
 
 Backend handlers (`api_plans`, `api_plan`, etc.) live in
 `src/server/http.rs`. The old `/api/sessions*` routes are deleted with
@@ -620,16 +578,15 @@ Behavioral acceptance:
   collides with an existing plan, stem in `plan_conflicts`.
 - `PlanId::parse` rejects raw paths that can't be canonicalized
   (returns `invalid_plan_id`). No raw-path fallback.
-- URL form: `PlanId::to_url_segment()` replaces `/` in the repo
-  portion with `_`; the reverse lookup matches against the sanitized
-  form of every known `PlanId` rather than blind substitution.
-  Acceptance test: a `PlanId` whose URL form is constructed and then
-  resolved recovers the original plan.
-- `start_plan` rejects repo paths whose canonical form contains
-  `?`, `#`, `%`, space, control chars, or non-UTF-8 bytes
-  (`invalid_repo_path`). It also rejects a new repo whose sanitized
-  URL form collides with an already-watched repo's
-  (`repo_collides_with_existing_repo`).
+- URLs carry the canonical `PlanId` verbatim. Round-trip test: a
+  `PlanId` constructed via `start_plan`, formatted into a URL,
+  re-extracted by the route handler, and looked up returns the same
+  plan.
+- HTTP-unsafe repos: a repo whose canonical path contains `?`, `#`,
+  or `%` is **still watched** (MCP and SSE serve it normally) but its
+  `/api/plan/...` and `/plan/...` URLs return 404. The test asserts
+  MCP `get_context` succeeds and the corresponding HTTP `/api/plan/`
+  route returns NotFound for the same plan.
 - `LiveEvent` and `/events` emit `plan_id` (nullable for repo-level
   events) plus derived `slug` + `state`. Frontend `EventStore` and
   activity sidebar consume the new shape.
@@ -644,13 +601,13 @@ Behavioral acceptance:
 - *PlanPathMismatch handling*: removed. The single-form wire grammar
   makes it unreachable by construction. (Previously partial: variant
   existed but never fired.)
-- *URL encoding for plan-scoped routes*: `/` in the repo portion of
-  the canonical `PlanId` is replaced with `_` for the URL form. Other
-  URL-significant characters (`?`, `#`, `%`, space, non-UTF-8) are
-  rejected at `start_plan` time — repos with those chars in their
-  canonical path can't be addressed via HTTP. Lookup is by
-  sanitization, not by reverse substitution: the daemon sanitizes its
-  known plans and compares.
+- *URL encoding for plan-scoped routes*: none. The canonical `PlanId`
+  goes into the URL verbatim via an axum wildcard route. Repos with
+  HTTP-unsafe canonical paths (`?`, `#`, `%`, control chars) are
+  unreachable through HTTP / the SPA but remain accessible via MCP and
+  SSE — Trinity doesn't refuse to watch them, the URL layer just
+  doesn't surface them. Single-user local daemon; in practice every
+  repo path is plain.
 - *`?repo=` ergonomics*: eliminated for plan-scoped routes. Kept only
   on `/api/plans` as an optional filter when the daemon is watching
   multiple repos.
@@ -667,9 +624,10 @@ Behavioral acceptance:
   not serialized directly; `current_path` is derived from
   `(slug, state)` at response time. Actionable filesystem locations
   (`write_feedback.path`, `wait_for_work.locations`) are repo-relative.
-- *Should `wait_for_work` include `repo` in its response*: no — the
-  `plan_id` already carries the repo; agents strip `:<stem>.md` to
-  recover it. One field at a time.
+- *Should `wait_for_work` include `repo` in its response*: yes. The
+  `plan_id` carries the repo but expecting every consumer to parse it
+  just to use `locations` defeats the convenience of having
+  `locations` at all. Redundant-but-helpful.
 
 ## Open Questions
 
