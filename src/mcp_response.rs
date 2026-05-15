@@ -96,18 +96,26 @@ pub fn list_sessions_response(repo_root: &Path, state: &RepoState) -> std::io::R
             plan_gate.as_ref(),
             impl_gate.as_ref(),
         );
-        sessions.push(session_summary(session, session_phase, worktree_status, &w));
+        sessions.push(session_summary(
+            repo_root,
+            session,
+            session_phase,
+            worktree_status,
+            &w,
+        ));
     }
     Ok(Value::Array(sessions))
 }
 
 fn session_summary(
+    repo_root: &Path,
     session: &crate::repo_state::Session,
     session_phase: crate::repo_state::Phase,
     worktree_status: PlanWorktreeStatus,
     w: &WaitingOn,
 ) -> Value {
     json!({
+        "repo": repo_root.to_string_lossy(),
         "id": session.id.as_str(),
         "plan_path": session.plan_path.to_string_lossy(),
         "phase": session_phase.as_str(),
@@ -154,11 +162,10 @@ pub fn get_context_response(
         .into_iter()
         .map(|s| s.as_str().to_string())
         .collect();
-    let implementation_commits: Vec<String> =
-        all_implementation_commits(session, state)
-            .into_iter()
-            .map(|s| s.as_str().to_string())
-            .collect();
+    let implementation_commits: Vec<String> = all_implementation_commits(session, state)
+        .into_iter()
+        .map(|s| s.as_str().to_string())
+        .collect();
 
     // Canonical write-feedback path + review_target + expected_action for
     // the caller. Tells reviewers exactly where to drop their next file.
@@ -196,6 +203,7 @@ pub fn get_context_response(
     let expected_action_str = expected_action(w.reason);
 
     Ok(Some(json!({
+        "repo": repo_root.to_string_lossy(),
         "session_id": session.id.as_str(),
         "phase": session_phase.as_str(),
         "plan_worktree_status": worktree_status.as_str(),
@@ -263,7 +271,10 @@ fn timeline_value(state: &RepoState, session_id: &SessionId) -> Vec<Value> {
 }
 
 fn feedback_entries(
-    map: &std::collections::BTreeMap<(crate::lifecycle::CommitSha, crate::lifecycle::AgentLabel), crate::repo_state::Feedback>,
+    map: &std::collections::BTreeMap<
+        (crate::lifecycle::CommitSha, crate::lifecycle::AgentLabel),
+        crate::repo_state::Feedback,
+    >,
 ) -> Vec<Value> {
     map.iter()
         .map(|((target, author), fb)| {
@@ -422,7 +433,11 @@ mod tests {
         write_file(dir.path(), ".trinity/plans/foo.md", "# foo v1\n");
         commit(dir.path(), "add plan v1");
         // Edit without committing
-        write_file(dir.path(), ".trinity/plans/foo.md", "# foo v2 uncommitted\n");
+        write_file(
+            dir.path(),
+            ".trinity/plans/foo.md",
+            "# foo v2 uncommitted\n",
+        );
 
         let state = rebuild_repo(dir.path()).await.unwrap();
         let session = state.sessions.values().next().unwrap();
@@ -553,11 +568,7 @@ mod tests {
         // tell agents the canonical (full-SHA) path via get_context;
         // prefix resolution at ingest is a future enhancement.
         let feedback_rel = format!(".trinity/feedback/foo/plan/{}/codex.md", intro.as_str());
-        write_file(
-            dir.path(),
-            &feedback_rel,
-            "REQUEST_CHANGES\n\nMissing X.\n",
-        );
+        write_file(dir.path(), &feedback_rel, "REQUEST_CHANGES\n\nMissing X.\n");
 
         let state = rebuild_repo(dir.path()).await.unwrap();
         let v = get_context_response(

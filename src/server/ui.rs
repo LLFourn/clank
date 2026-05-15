@@ -73,15 +73,16 @@ pub fn home_page(sessions: &Value) -> String {
     let mut rows = String::new();
     for s in &arr {
         let id = s["id"].as_str().unwrap_or("?");
+        let repo = s["repo"].as_str().unwrap_or("");
+        let repo_q = query_escape(repo);
+        let repo_html = html_escape(repo);
         let phase = s["phase"].as_str().unwrap_or("?");
         let status = s["plan_worktree_status"].as_str().unwrap_or("?");
         let role = s["waiting_on"]["role"].as_str().unwrap_or("?");
-        let desc = s["waiting_on"]["description"]
-            .as_str()
-            .unwrap_or("");
+        let desc = s["waiting_on"]["description"].as_str().unwrap_or("");
         rows.push_str(&format!(
-            "<tr><td><a href=\"/sessions/{id}\">{id}</a></td>\
-             <td>{phase}</td><td>{status}</td>\
+            "<tr><td><a href=\"/sessions/{id}?repo={repo_q}\">{id}</a></td>\
+             <td><code>{repo_html}</code></td><td>{phase}</td><td>{status}</td>\
              <td><span class=\"waiting waiting-{role}\">{role}</span></td>\
              <td>{desc}</td></tr>"
         ));
@@ -89,9 +90,10 @@ pub fn home_page(sessions: &Value) -> String {
     format!(
         "<!doctype html><html><head><title>Trinity</title>\
          <style>\
-         body{{font-family:system-ui,sans-serif;max-width:980px;margin:2em auto;padding:0 1em}}\
+         body{{font-family:system-ui,sans-serif;max-width:1180px;margin:2em auto;padding:0 1em}}\
          table{{border-collapse:collapse;width:100%}}\
          th,td{{padding:.5em;border-bottom:1px solid #eee;text-align:left;vertical-align:top}}\
+         code{{background:#f3f4f6;padding:.1em .3em;border-radius:.25em;font-size:.9em}}\
          .waiting{{padding:.1em .5em;border-radius:.5em;font-size:.85em}}\
          .waiting-master{{background:#fde68a;color:#92400e}}\
          .waiting-reviewers{{background:#bfdbfe;color:#1e40af}}\
@@ -100,7 +102,7 @@ pub fn home_page(sessions: &Value) -> String {
          </style></head><body>\
          <span id=\"mute-indicator\">🔔</span>\
          <h1>Trinity sessions</h1>\
-         <table><thead><tr><th>Session</th><th>Phase</th><th>Worktree</th>\
+         <table><thead><tr><th>Session</th><th>Repo</th><th>Phase</th><th>Worktree</th>\
          <th>Waiting on</th><th>Description</th></tr></thead>\
          <tbody>{rows}</tbody></table>\
          {LIVE_SCRIPT}\
@@ -116,6 +118,9 @@ pub fn session_page(ctx: &Value) -> String {
     let reason = ctx["waiting_on"]["reason"].as_str().unwrap_or("?");
     let desc = ctx["waiting_on"]["description"].as_str().unwrap_or("");
     let plan_path = ctx["plan_path"].as_str().unwrap_or("");
+    let repo = ctx["repo"].as_str().unwrap_or("");
+    let repo_html = html_escape(repo);
+    let repo_q = query_escape(repo);
 
     // Build plan-revisions list from pr_hint (when present, in implementing
     // phase) or just show the latest. For planning, list latest only.
@@ -126,7 +131,7 @@ pub fn session_page(ctx: &Value) -> String {
         .as_str()
         .unwrap_or("—");
 
-    let timeline_html = render_timeline(ctx["timeline"].as_array(), id);
+    let timeline_html = render_timeline(ctx["timeline"].as_array(), id, &repo_q);
     let _ = (latest_plan, latest_impl); // legacy hints, not displayed
 
     let pr_hint_html = if let Some(hint) = ctx.get("pr_hint").filter(|v| !v.is_null()) {
@@ -182,13 +187,14 @@ pub fn session_page(ctx: &Value) -> String {
          .none{{color:#6b7280;font-style:italic}}\
          h2{{margin-top:2em}}\
          </style></head><body>\
-         <p><a href=\"/\">&larr; All sessions</a></p>\
+         <p><a href=\"/?repo={repo_q}\">&larr; All sessions</a></p>\
          <h1>{id}</h1>\
          <div class=\"banner {role}\">\
          <strong>{role}</strong>: {desc} <em>({reason})</em>\
          </div>\
          <dl>\
          <dt>Phase</dt><dd>{phase}</dd>\
+         <dt>Repo root</dt><dd><code>{repo_html}</code></dd>\
          <dt>Plan path</dt><dd><code>{plan_path}</code></dd>\
          <dt>Worktree</dt><dd>{status}</dd>\
          </dl>\
@@ -200,9 +206,10 @@ pub fn session_page(ctx: &Value) -> String {
     )
 }
 
-pub fn plan_revision_page(session_id: &str, sha: &str, body: &str) -> String {
+pub fn plan_revision_page(session_id: &str, sha: &str, body: &str, repo: &str) -> String {
     let escaped = html_escape(body);
     let short = &sha[..7.min(sha.len())];
+    let repo_q = query_escape(repo);
     format!(
         "<!doctype html><html><head><title>{session_id}@{short} — Trinity</title>\
          <style>\
@@ -212,16 +219,17 @@ pub fn plan_revision_page(session_id: &str, sha: &str, body: &str) -> String {
          a{{color:#1d4ed8;text-decoration:none}}\
          a:hover{{text-decoration:underline}}\
          </style></head><body>\
-         <p><a href=\"/sessions/{session_id}\">&larr; {session_id}</a></p>\
+         <p><a href=\"/sessions/{session_id}?repo={repo_q}\">&larr; {session_id}</a></p>\
          <h1>Plan @ <code>{short}</code></h1>\
          <pre>{escaped}</pre>\
          </body></html>"
     )
 }
 
-pub fn commit_diff_page(session_id: &str, sha: &str, patch: &str) -> String {
+pub fn commit_diff_page(session_id: &str, sha: &str, patch: &str, repo: &str) -> String {
     let escaped = html_escape(patch);
     let short = &sha[..7.min(sha.len())];
+    let repo_q = query_escape(repo);
     format!(
         "<!doctype html><html><head><title>{session_id} commit {short} — Trinity</title>\
          <style>\
@@ -232,7 +240,7 @@ pub fn commit_diff_page(session_id: &str, sha: &str, patch: &str) -> String {
          a{{color:#1d4ed8;text-decoration:none}}\
          a:hover{{text-decoration:underline}}\
          </style></head><body>\
-         <p><a href=\"/sessions/{session_id}\">&larr; {session_id}</a></p>\
+         <p><a href=\"/sessions/{session_id}?repo={repo_q}\">&larr; {session_id}</a></p>\
          <h1>Commit <code>{short}</code></h1>\
          <pre>{escaped}</pre>\
          </body></html>"
@@ -245,11 +253,24 @@ fn html_escape(s: &str) -> String {
         .replace('>', "&gt;")
 }
 
+fn query_escape(s: &str) -> String {
+    let mut out = String::new();
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(char::from(b))
+            }
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
+}
+
 /// Render the unified per-session timeline. Each event is one `<li>`
 /// in an ordered list. Commits are clickable to their plan-revision or
 /// commit-diff view; reviews are indented under their target commit
 /// and carry the verdict chip + author name.
-fn render_timeline(events: Option<&Vec<Value>>, session_id: &str) -> String {
+fn render_timeline(events: Option<&Vec<Value>>, session_id: &str, repo_q: &str) -> String {
     let events = events.map(|v| v.as_slice()).unwrap_or(&[]);
     if events.is_empty() {
         return "<p class=\"none\">No activity yet.</p>".to_string();
@@ -284,7 +305,7 @@ fn render_timeline(events: Option<&Vec<Value>>, session_id: &str) -> String {
                 };
                 s.push_str(&format!(
                     "<li class=\"tl-row {css}\"><span class=\"tl-label\">{label}</span> \
-                     <a href=\"/sessions/{session_id}/{route}/{sha}\"><code>{short}</code></a></li>"
+                     <a href=\"/sessions/{session_id}/{route}/{sha}?repo={repo_q}\"><code>{short}</code></a></li>"
                 ));
             }
             "review" => {
@@ -302,7 +323,7 @@ fn render_timeline(events: Option<&Vec<Value>>, session_id: &str) -> String {
                 s.push_str(&format!(
                     "<li class=\"tl-row tl-review\"><span class=\"{verdict_css}\">{verdict_label}</span> \
                      <span class=\"tl-phase\">({phase})</span> from <strong>{author}</strong> on \
-                     <a href=\"/sessions/{session_id}/{route}/{target}\"><code>{short}</code></a></li>"
+                     <a href=\"/sessions/{session_id}/{route}/{target}?repo={repo_q}\"><code>{short}</code></a></li>"
                 ));
             }
             "held_feedback" => {
@@ -323,11 +344,7 @@ fn render_timeline(events: Option<&Vec<Value>>, session_id: &str) -> String {
 /// Render the per-phase feedback list. Each entry: verdict chip + author
 /// + (clickable) target SHA. Empty list → "No feedback yet."
 #[allow(dead_code)]
-fn render_feedback_list(
-    entries: Option<&Vec<Value>>,
-    phase: &str,
-    session_id: &str,
-) -> String {
+fn render_feedback_list(entries: Option<&Vec<Value>>, phase: &str, session_id: &str) -> String {
     let entries = entries.map(|v| v.as_slice()).unwrap_or(&[]);
     if entries.is_empty() {
         return format!("<p class=\"none\">No {phase} feedback yet.</p>");

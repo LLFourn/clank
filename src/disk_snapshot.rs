@@ -101,6 +101,17 @@ pub fn derive_state(repo_root: PathBuf, snapshot: DiskSnapshot) -> RepoState {
     for entry in &snapshot.history {
         let result = classify(&entry.changes, current_effective.as_ref());
         current_effective = effective_session(&entry.changes, current_effective.as_ref());
+        if !entry.changes.plan_touches.is_empty() {
+            state.plan_touches.insert(
+                entry.commit.clone(),
+                entry
+                    .changes
+                    .plan_touches
+                    .iter()
+                    .map(|touch| (touch.session.clone(), touch.kind))
+                    .collect(),
+            );
+        }
         state.attribution.insert(entry.commit.clone(), result);
         state.commit_order.push(entry.commit.clone());
     }
@@ -254,7 +265,10 @@ mod tests {
         // c1: plan intro for foo
         assert!(matches!(
             state.attribution[&sha("c1")],
-            AttributionResult::Attributed { plan_touch: Some(PlanTouchKind::Intro), .. }
+            AttributionResult::Attributed {
+                plan_touch: Some(PlanTouchKind::Intro),
+                ..
+            }
         ));
         // c2 + c3: walk-back inherit foo
         for c in ["c2", "c3"] {
@@ -293,7 +307,10 @@ mod tests {
         };
         let state = derive_state(PathBuf::from("/r"), snap);
         // c2 is multi-plan → unattributed.
-        assert_eq!(state.attribution[&sha("c2")], AttributionResult::Unattributed);
+        assert_eq!(
+            state.attribution[&sha("c2")],
+            AttributionResult::Unattributed
+        );
         // c3 walks back through c2 transparently → attributes to a.
         match &state.attribution[&sha("c3")] {
             AttributionResult::Attributed {
@@ -306,15 +323,54 @@ mod tests {
     }
 
     #[test]
+    fn multi_plan_touches_still_count_as_each_sessions_plan_revision() {
+        let mut done = plan_file("done-one", "c1", None, "# done\n");
+        done.plan_path = PathBuf::from(".trinity/plans/done/done-one.md");
+        let snap = DiskSnapshot {
+            head: Some(sha("c3")),
+            plan_files: vec![
+                done,
+                plan_file("active-one", "c2", Some("c1"), "# active v2\n"),
+            ],
+            history: vec![
+                entry("c1", vec![touch("done-one", PlanTouchKind::Intro)], false),
+                entry("c2", vec![touch("active-one", PlanTouchKind::Intro)], false),
+                entry(
+                    "c3",
+                    vec![
+                        touch("done-one", PlanTouchKind::DoneMove),
+                        touch("active-one", PlanTouchKind::Revision),
+                    ],
+                    false,
+                ),
+            ],
+            feedback_files: vec![],
+        };
+        let state = derive_state(PathBuf::from("/r"), snap);
+
+        // Implementation attribution is still deliberately absent for
+        // multi-plan commits, but each touched plan sees its own lifecycle
+        // event for review targets and timeline rendering.
+        assert_eq!(
+            state.attribution[&sha("c3")],
+            AttributionResult::Unattributed
+        );
+        assert_eq!(
+            crate::projection::all_plan_revisions(&state.sessions[&sess("done-one")], &state),
+            vec![sha("c1"), sha("c3")]
+        );
+        assert_eq!(
+            crate::projection::all_plan_revisions(&state.sessions[&sess("active-one")], &state),
+            vec![sha("c2"), sha("c3")]
+        );
+    }
+
+    #[test]
     fn mixed_commit_carries_both_plan_touch_and_code() {
         let snap = DiskSnapshot {
             head: Some(sha("c1")),
             plan_files: vec![plan_file("foo", "c1", None, "# foo\n")],
-            history: vec![entry(
-                "c1",
-                vec![touch("foo", PlanTouchKind::Intro)],
-                true,
-            )],
+            history: vec![entry("c1", vec![touch("foo", PlanTouchKind::Intro)], true)],
             feedback_files: vec![],
         };
         let state = derive_state(PathBuf::from("/r"), snap);
@@ -438,7 +494,10 @@ mod tests {
             feedback_files: vec![],
         };
         let state = derive_state(PathBuf::from("/r"), snap);
-        assert_eq!(state.attribution[&sha("c1")], AttributionResult::Unattributed);
+        assert_eq!(
+            state.attribution[&sha("c1")],
+            AttributionResult::Unattributed
+        );
     }
 
     // ===== Determinism / digest =====
@@ -564,7 +623,7 @@ mod tests {
             feedback_files: vec![feedback(
                 "foo",
                 FeedbackPhase::Plan,
-                Some("c1"),  // stale: c2 is the latest plan rev now
+                Some("c1"), // stale: c2 is the latest plan rev now
                 "alice",
                 "APPROVE\n",
             )],
@@ -679,11 +738,20 @@ mod tests {
             feedback_files: vec![],
         };
         let state = derive_state(PathBuf::from("/r"), snap);
-        assert_eq!(state.attribution[&sha("c1")], AttributionResult::Unattributed);
-        assert_eq!(state.attribution[&sha("c2")], AttributionResult::Unattributed);
+        assert_eq!(
+            state.attribution[&sha("c1")],
+            AttributionResult::Unattributed
+        );
+        assert_eq!(
+            state.attribution[&sha("c2")],
+            AttributionResult::Unattributed
+        );
         assert!(matches!(
             state.attribution[&sha("c3")],
-            AttributionResult::Attributed { plan_touch: Some(PlanTouchKind::Intro), .. }
+            AttributionResult::Attributed {
+                plan_touch: Some(PlanTouchKind::Intro),
+                ..
+            }
         ));
         assert!(matches!(
             state.attribution[&sha("c4")],
@@ -829,11 +897,10 @@ mod tests {
     }
 
     #[test]
-    fn timeline_skips_unattributed_commits_in_session_view() {
-        // Multi-plan commits are unattributed; descendants walk through.
-        // In a single-session view, we don't show the multi-plan commit
-        // (it belongs to no one); we still show this session's own
-        // commits including the one that walks through.
+    fn timeline_includes_multi_plan_touches_without_code_ownership() {
+        // Multi-plan commits remain unattributed for implementation
+        // ownership, but each touched plan still gets its plan-touch event
+        // in its own timeline.
         let snap = DiskSnapshot {
             head: Some(sha("c3")),
             plan_files: vec![
@@ -863,9 +930,10 @@ mod tests {
                 _ => None,
             })
             .collect();
-        // c1 (foo intro) yes; c2 (multi-plan, unattributed) no; c3 walks
-        // through c2 transparently and attributes to foo, so yes.
-        assert_eq!(shas, vec!["c1", "c3"]);
+        // c1 (foo intro) yes; c2 (multi-plan foo revision) yes; c3
+        // walks through c2 transparently and attributes implementation to
+        // foo, so yes.
+        assert_eq!(shas, vec!["c1", "c2", "c3"]);
     }
 
     #[test]
@@ -913,7 +981,13 @@ mod tests {
             history: vec![entry("c1", vec![touch("foo", PlanTouchKind::Intro)], false)],
             feedback_files: vec![
                 feedback("foo", FeedbackPhase::Plan, Some("c1"), "alice", "APPROVE\n"),
-                feedback("foo", FeedbackPhase::Plan, Some("c1"), "bob", "REQUEST_CHANGES\n"),
+                feedback(
+                    "foo",
+                    FeedbackPhase::Plan,
+                    Some("c1"),
+                    "bob",
+                    "REQUEST_CHANGES\n",
+                ),
             ],
         };
         let state = derive_state(PathBuf::from("/r"), snap);
@@ -924,9 +998,7 @@ mod tests {
         let authors: Vec<&str> = timeline
             .iter()
             .filter_map(|e| match e {
-                crate::repo_state::TimelineEvent::Review { author, .. } => {
-                    Some(author.as_str())
-                }
+                crate::repo_state::TimelineEvent::Review { author, .. } => Some(author.as_str()),
                 _ => None,
             })
             .collect();
@@ -944,13 +1016,7 @@ mod tests {
                 entry("c2", vec![], true),
             ],
             feedback_files: vec![
-                feedback(
-                    "foo",
-                    FeedbackPhase::Plan,
-                    Some("c1"),
-                    "alice",
-                    "APPROVE\n",
-                ),
+                feedback("foo", FeedbackPhase::Plan, Some("c1"), "alice", "APPROVE\n"),
                 feedback(
                     "foo",
                     FeedbackPhase::Impl,

@@ -42,10 +42,7 @@ pub fn plan_worktree_status(
 /// - `Done` if the plan_path is under `.trinity/plans/done/`.
 /// - `Implementing` if any attributed commit past plan_intro has code changes.
 /// - `Planning` otherwise.
-pub fn phase(
-    session: &Session,
-    attribution: &BTreeMap<CommitSha, AttributionResult>,
-) -> Phase {
+pub fn phase(session: &Session, attribution: &BTreeMap<CommitSha, AttributionResult>) -> Phase {
     use std::path::Component;
     let is_done = session
         .plan_path
@@ -89,7 +86,11 @@ pub fn waiting_on(
     // Worktree-status rows preempt gate-driven rows.
     match worktree_status {
         PlanWorktreeStatus::DoneMovePending => {
-            return make(WaitingRole::Master, WaitingReason::CommitDoneMove, Vec::new());
+            return make(
+                WaitingRole::Master,
+                WaitingReason::CommitDoneMove,
+                Vec::new(),
+            );
         }
         PlanWorktreeStatus::MissingActivePlanFile => {
             return make(
@@ -145,11 +146,9 @@ fn waiting_from_gate(gate: Option<&ReviewGateDecision>, phase: GatePhase) -> Wai
     };
 
     match gate.state {
-        ReviewGateState::ChangesRequested => make(
-            WaitingRole::Master,
-            rc_reason,
-            gate.request_changes.clone(),
-        ),
+        ReviewGateState::ChangesRequested => {
+            make(WaitingRole::Master, rc_reason, gate.request_changes.clone())
+        }
         ReviewGateState::Ready => make(WaitingRole::Master, ready_reason, Vec::new()),
         ReviewGateState::NeedsReview => {
             if gate.participants.is_empty() {
@@ -175,14 +174,10 @@ pub fn all_plan_revisions(
         .commit_order
         .iter()
         .filter(|sha| {
-            matches!(
-                state.attribution.get(*sha),
-                Some(AttributionResult::Attributed {
-                    session: sid,
-                    plan_touch: Some(_),
-                    ..
-                }) if sid == &session.id
-            )
+            state
+                .plan_touches
+                .get(*sha)
+                .is_some_and(|touches| touches.iter().any(|(sid, _)| sid == &session.id))
         })
         .cloned()
         .collect()
@@ -222,7 +217,9 @@ pub fn latest_impl_commit(
     session: &Session,
     state: &crate::repo_state::RepoState,
 ) -> Option<CommitSha> {
-    all_implementation_commits(session, state).into_iter().last()
+    all_implementation_commits(session, state)
+        .into_iter()
+        .last()
 }
 
 /// Plan-phase review gate built from the session's `plan_feedback`
@@ -345,7 +342,11 @@ pub fn expected_action(reason: WaitingReason) -> &'static str {
     }
 }
 
-fn make(role: WaitingRole, reason: WaitingReason, agents: Vec<crate::lifecycle::AgentLabel>) -> WaitingOn {
+fn make(
+    role: WaitingRole,
+    reason: WaitingReason,
+    agents: Vec<crate::lifecycle::AgentLabel>,
+) -> WaitingOn {
     let description = description_for(role, reason, &agents);
     WaitingOn {
         role,
@@ -373,21 +374,15 @@ fn description_for(
     };
     match (role, reason) {
         (None, SessionDone) => "Session is done.".to_string(),
-        (Master, CommitDoneMove) => {
-            "Plan was moved to `done/` but the move isn't committed yet. \
+        (Master, CommitDoneMove) => "Plan was moved to `done/` but the move isn't committed yet. \
              Stage and commit to retire the session."
-                .to_string()
-        }
-        (Master, RestoreOrCommitDoneMove) => {
-            "Active plan file is missing from the working tree. \
+            .to_string(),
+        (Master, RestoreOrCommitDoneMove) => "Active plan file is missing from the working tree. \
              Either restore it (`git checkout -- <path>`) or move it to `done/` and commit."
-                .to_string()
-        }
-        (Master, CommitPlanRevision) => {
-            "Plan has uncommitted changes. \
+            .to_string(),
+        (Master, CommitPlanRevision) => "Plan has uncommitted changes. \
              Commit the revision; held plan reviews will release."
-                .to_string()
-        }
+            .to_string(),
         (Master, AddressPlanRequestChanges) => {
             if agents.is_empty() {
                 "Plan review requested changes. Address them and commit a new revision.".to_string()
@@ -399,8 +394,7 @@ fn description_for(
             }
         }
         (Master, ReadyToImplement) => {
-            "Plan approved. Ready to start implementation; make the first impl commit."
-                .to_string()
+            "Plan approved. Ready to start implementation; make the first impl commit.".to_string()
         }
         (Reviewers, PlanNeedsInitialReview) => {
             "Plan is committed and awaiting an initial review.".to_string()
@@ -658,7 +652,12 @@ mod tests {
             Vec::new(),
             Vec::new(),
         );
-        let w = waiting_on(Phase::Implementing, PlanWorktreeStatus::Clean, None, Some(&g));
+        let w = waiting_on(
+            Phase::Implementing,
+            PlanWorktreeStatus::Clean,
+            None,
+            Some(&g),
+        );
         assert_eq!(w.role, WaitingRole::Reviewers);
         assert_eq!(w.reason, WaitingReason::ImplNeedsInitialReview);
     }
@@ -673,7 +672,12 @@ mod tests {
             agents(&["alice"]),
             Vec::new(),
         );
-        let w = waiting_on(Phase::Implementing, PlanWorktreeStatus::Clean, None, Some(&g));
+        let w = waiting_on(
+            Phase::Implementing,
+            PlanWorktreeStatus::Clean,
+            None,
+            Some(&g),
+        );
         assert_eq!(w.role, WaitingRole::Master);
         assert_eq!(w.reason, WaitingReason::AddressImplRequestChanges);
         assert_eq!(w.agents, agents(&["alice"]));
@@ -689,7 +693,12 @@ mod tests {
             Vec::new(),
             Vec::new(),
         );
-        let w = waiting_on(Phase::Implementing, PlanWorktreeStatus::Clean, None, Some(&g));
+        let w = waiting_on(
+            Phase::Implementing,
+            PlanWorktreeStatus::Clean,
+            None,
+            Some(&g),
+        );
         assert_eq!(w.role, WaitingRole::Master);
         assert_eq!(w.reason, WaitingReason::ReadyToFinish);
     }

@@ -229,7 +229,12 @@ async fn plan_revision_view(
         let body = crate::git_io::show_blob(&repo, &commit_sha, &plan_path)
             .await
             .map_err(|e| AppError::internal(format!("git show: {e}")))?;
-        return Ok(Html(ui::plan_revision_page(&session_id, &sha, &body)));
+        return Ok(Html(ui::plan_revision_page(
+            &session_id,
+            &sha,
+            &body,
+            &repo.to_string_lossy(),
+        )));
     }
     Err(AppError::not_found(format!(
         "session {session_id} not found"
@@ -258,7 +263,12 @@ async fn commit_diff_view(
         let patch = crate::git_io::show_commit(&repo, &commit_sha)
             .await
             .map_err(|e| AppError::internal(format!("git show: {e}")))?;
-        return Ok(Html(ui::commit_diff_page(&session_id, &sha, &patch)));
+        return Ok(Html(ui::commit_diff_page(
+            &session_id,
+            &sha,
+            &patch,
+            &repo.to_string_lossy(),
+        )));
     }
     Err(AppError::not_found(format!(
         "session {session_id} not found"

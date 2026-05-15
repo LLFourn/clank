@@ -4,7 +4,9 @@
 
 Replace `src/server/ui.rs` (raw maud HTML strings) with a Leptos SPA that talks to the existing daemon over JSON + SSE. The runtime, reducer, MCP surface, and HTTP API stay exactly as they are; this is a UI rewrite, not a daemon rewrite.
 
-The current daemon's `get_context` already returns a complete typed state shape — phase, waiting_on, timeline, review_target, write_feedback, pr_hint, feedback by phase. SSE already pushes change events. A reactive frontend is the natural shape: signals subscribe to SSE, re-fetch on event, render derived views. No htmx OOB acrobatics, no server-rendered HTML strings, no inline `<style>` per page.
+The daemon's `projection::*` layer (phase, waiting_on, gates, worktree status, attribution) already exposes everything the UI needs as pure functions. SSE already pushes change events. A reactive frontend is the natural shape: signals subscribe to SSE, re-fetch on event, render derived views. No htmx OOB acrobatics, no server-rendered HTML strings, no inline `<style>` per page.
+
+**The Leptos SPA does NOT consume MCP tool responses.** It talks to a dedicated UI-only API surface (`/api/sessions/*`) that composes shapes the UI wants. See "Surface separation" below — that boundary is load-bearing.
 
 ## Why now, not a maud restore
 
@@ -100,7 +102,7 @@ Wide reading column (~720px max for prose; full-width for diffs). Generous margi
 +------------------+
 ```
 
-The daemon adds a small JSON-API layer at `/api/*` that wraps existing `mcp_response::*` builders + new diff endpoints. The SPA bundle is served from `/` and `/static/*`.
+The daemon adds a dedicated UI JSON-API layer at `/api/*` built by a new `ui_response::*` module that composes the existing `projection::*` primitives + new diff endpoints. **This is not a wrapper around `mcp_response::*`** — the MCP and UI shapes are independent so neither bloats the other. The SPA bundle is served from `/` and `/static/*`.
 
 ## Multi-repo identity
 
@@ -190,18 +192,48 @@ provide_context(store);
 
 This means **no manual cache invalidation**. Adding a new component automatically gets live updates as long as it depends on the resource.
 
+## Surface separation: agent vs UI
+
+**Hard rule:** the web UI does not extend MCP tool shapes. The MCP surface (`get_context`, `list_sessions`, `wait_for_work`, …) is for agents — every field in those responses costs context-window tokens on every wake-up, forever. If the UI needs something richer, it gets its own endpoint.
+
+This means:
+
+- `get_context` is allowed to **shrink**, not grow. After `wait_for_work` lands, an agent that's been told `{work, locations}` rarely needs anything else. Target shape: `{ phase, plan_path, plan_worktree_status, waiting_on, review_target, latest_plan_revision, latest_implementation_revision }`. Drop `timeline`, `pr_hint`, full-history lists, raw `plan_feedback` / `impl_feedback` arrays, `review_gate` from the MCP response.
+- Every MCP tool keeps a parallel HTTP endpoint (byte-identical JSON, current pattern). Those are still the agent surface.
+- UI-specific endpoints live under their own namespace (this plan uses `/api/sessions/...`). They can be as rich as the UI needs — they're not part of the MCP contract, no agent ever reads them.
+- If both surfaces really need the same data, expose a building block both reuse, but don't fold UI bulk into the MCP shape.
+
+The slimming of `get_context` is a separate small plan/commit — flagged here so the Leptos work doesn't accidentally re-couple to it.
+
+### Lock-boundary refactor (rolled into the new UI builders)
+
+The existing `list_sessions_response` / `get_context_response` (in `mcp_response.rs`) do disk I/O (`compute_plan_worktree_status` → `fs::read`) inside the `Runtime::read_repo` closure, which holds the global `Trinity` mutex. Under activity (multiple `wait_for_work` recomputes, watcher signals, concurrent home-page renders), this serializes the daemon and the web UI freezes for the duration of the disk reads.
+
+`wait_for_work` already follows the right pattern: snapshot identifiers + cheap gate state under the lock, release, then disk-read per candidate. The new `ui_response::*` builders introduced for this Leptos refactor must use the same shape:
+
+1. Under `Runtime::read_repo` (or equivalent), snapshot every field that's purely in-memory: `plan_path`, `body_hash`, `phase`, `plan_gate`, `impl_gate`, `plan_target`, `impl_target`, the feedback maps, etc.
+2. Release the lock.
+3. Compute `plan_worktree_status` (one disk read per session) outside the lock.
+4. Assemble the JSON response.
+
+This is a side benefit of the surface separation — the new builders get the correct lock discipline for free, and the old MCP-side `list_sessions_response` / `get_context_response` (kept narrow per the slim-down above) shrink to no-disk-I/O builders that can safely live under the read_repo closure.
+
+Acceptance: the home-page render and session-detail render hold the runtime mutex for ≪10ms regardless of session count, and disk reads happen with the lock released.
+
 ## Server-side additions
 
-Minimal additions on top of the existing daemon:
+Minimal additions on top of the existing daemon. None of these reshape MCP tool responses — they are UI-only endpoints with UI-only field sets.
 
-1. **`/api/*` JSON endpoints**. Thin wrappers around `mcp_response::*` plus:
-   - `GET /api/sessions[?repo=<path>]` → `[{ repo, session_id, plan_path, phase, worktree_status, waiting_on }]`.
-   - `GET /api/sessions/:id?repo=<path>` → the full `get_context` response shape, extended per the feedback-body addition below.
+1. **`/api/*` JSON endpoints** (UI surface, not MCP). Reuse internal building blocks (`projection::*`, `git_io::*`) but compose shapes the UI actually consumes:
+   - `GET /api/sessions[?repo=<path>]` → `[{ repo, session_id, plan_path, phase, worktree_status, waiting_on }]`. Index row, matches `list_sessions` but with the `repo` field for the multi-repo home page.
+   - `GET /api/sessions/:id?repo=<path>` → **UI-only rich shape**: `{ session_id, phase, plan_path, plan_worktree_status, waiting_on, review_target, latest_plan_revision, latest_implementation_revision, plan_revisions: [...], implementation_commits: [...], plan_feedback: Vec<FeedbackEntry>, impl_feedback: Vec<FeedbackEntry>, timeline: [...], pr_hint }`. Built by a dedicated `ui_response::session_page` builder that calls into the same `projection::*` helpers as `get_context` but is free to assemble whatever the session-detail view needs without dragging `get_context` along.
    - `GET /api/sessions/:id/plan/:sha?repo=<path>` → `{ body_html, body_raw, plan_intro, plan_intro_parent, previous_sha, next_sha, feedback: Vec<FeedbackEntry> }`. Body is pre-rendered HTML via `pulldown-cmark` + `ammonia`. `feedback` is the entries targeting this SHA.
    - `GET /api/sessions/:id/commit/:sha?repo=<path>` → `{ diff_files: Vec<DiffFile>, feedback: Vec<FeedbackEntry> }`. DiffFile parsed from `git show` output.
    - `GET /api/diff?from=&to=&path=&repo=<path>` → `{ diff_files }`. For plan-rev-vs-rev.
 
-2. **Extended feedback shape.** The current `feedback_entries` builder emits `{ target_sha, author, verdict }` — not enough for `<FeedbackCard/>` to render the body. Extend each entry to include:
+   Note: `/api/sessions/:id` deliberately does NOT call `get_context_response` — that's the MCP tool's shape. A separate `ui_response::session_page` builder shares the `projection::*` primitives but lives in its own module so changes to one don't ripple to the other.
+
+2. **Extended feedback shape (UI surface only).** The MCP `plan_feedback` / `impl_feedback` arrays continue to emit `{ target_sha, author, verdict }` (and probably get dropped from `get_context` entirely in the slim-down). The UI's `FeedbackEntry` is richer:
 
    ```json
    {
@@ -215,7 +247,7 @@ Minimal additions on top of the existing daemon:
    }
    ```
 
-   `body_raw` is the file content verbatim; `body_html` strips the marker line and renders the rest via `pulldown-cmark` + `ammonia`. Phase-1 acceptance: the JSON for any session with feedback includes these fields. Held feedback gets the same extended shape (just no `target_sha`).
+   `body_raw` is the file content verbatim; `body_html` strips the marker line and renders the rest via `pulldown-cmark` + `ammonia`. Phase-1 acceptance: every `/api/sessions/:id` response with feedback includes these fields. Held feedback gets the same extended shape (just no `target_sha`). The MCP-side `feedback_entries` builder is untouched.
 
 3. **`src/diff_parser.rs`**. Port the deleted parser from `a2d7b5d^:src/daemon/diff_parser.rs`. Pure Rust, no IO. Tests: ~10 cases covering add/modify/delete/rename/binary/multi-hunk.
 

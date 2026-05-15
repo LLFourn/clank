@@ -25,6 +25,10 @@ pub struct RepoState {
     /// SHA-lex, not chronological. Use `commit_order` to walk the
     /// history in chronological (first-parent oldest-first) order.
     pub attribution: BTreeMap<CommitSha, AttributionResult>,
+    /// Per-commit plan touches, including multi-plan commits. Attribution
+    /// remains single-session for implementation ownership; this index lets
+    /// each touched plan still see its own revision/done_move.
+    pub plan_touches: BTreeMap<CommitSha, Vec<(SessionId, PlanTouchKind)>>,
     /// Commits in chronological order (first-parent walk, oldest first).
     /// Parallels `attribution`'s keys but preserves history order, which
     /// `BTreeMap` does not.
@@ -38,6 +42,7 @@ impl RepoState {
             sessions: BTreeMap::new(),
             head: None,
             attribution: BTreeMap::new(),
+            plan_touches: BTreeMap::new(),
             commit_order: Vec::new(),
         }
     }
@@ -47,11 +52,12 @@ impl RepoState {
     /// in order without needing to recombine attribution + feedback maps
     /// itself.
     ///
-    /// Order: commits attributed to `session_id` in first-parent walk
-    /// order (oldest first). Each commit is followed by the reviews
-    /// targeting it (plan reviews for plan_touch commits, impl reviews
-    /// for has_code_changes commits) sorted by author. Held flat-drop
-    /// feedback files come last with no target.
+    /// Order: commits touching this session's plan file or attributed to
+    /// `session_id` as implementation work, in first-parent walk order
+    /// (oldest first). Each commit is followed by the reviews targeting it
+    /// (plan reviews for plan_touch commits, impl reviews for
+    /// has_code_changes commits) sorted by author. Held flat-drop feedback
+    /// files come last with no target.
     ///
     /// Pure; sans-IO. Returns an empty vec if the session is unknown.
     pub fn timeline_for(&self, session_id: &SessionId) -> Vec<TimelineEvent> {
@@ -60,24 +66,27 @@ impl RepoState {
         };
         let mut out = Vec::new();
         for sha in &self.commit_order {
-            let Some(attr) = self.attribution.get(sha) else {
-                continue;
-            };
-            let AttributionResult::Attributed {
-                session: sid,
-                plan_touch,
-                has_code_changes,
-            } = attr
-            else {
-                continue;
-            };
-            if sid != session_id {
+            let attr = self.attribution.get(sha);
+            let plan_touch = self
+                .plan_touches
+                .get(sha)
+                .and_then(|touches| touches.iter().find(|(sid, _)| sid == session_id))
+                .map(|(_, kind)| *kind);
+            let has_code_changes = matches!(
+                attr,
+                Some(AttributionResult::Attributed {
+                    session: sid,
+                    has_code_changes: true,
+                    ..
+                }) if sid == session_id
+            );
+            if plan_touch.is_none() && !has_code_changes {
                 continue;
             }
             out.push(TimelineEvent::Commit {
                 sha: sha.clone(),
-                plan_touch: *plan_touch,
-                has_code_changes: *has_code_changes,
+                plan_touch,
+                has_code_changes,
             });
             // Reviews targeting this commit, in (phase, author) order.
             for ((target, author), fb) in &session.plan_feedback {
@@ -124,7 +133,13 @@ impl RepoState {
         hasher.update(b"trinity-state-v1\n");
         hasher.update(self.root.to_string_lossy().as_bytes());
         hasher.update(b"\nhead=");
-        hasher.update(self.head.as_ref().map(|h| h.as_str()).unwrap_or("").as_bytes());
+        hasher.update(
+            self.head
+                .as_ref()
+                .map(|h| h.as_str())
+                .unwrap_or("")
+                .as_bytes(),
+        );
 
         // BTreeMap iterates by key (sorted), so this is deterministic.
         hasher.update(b"\nsessions[");
@@ -192,11 +207,27 @@ impl RepoState {
                             .as_bytes(),
                     );
                     hasher.update(b":");
-                    hasher.update(if *has_code_changes { b"code" } else { b"nocode" });
+                    hasher.update(if *has_code_changes {
+                        b"code"
+                    } else {
+                        b"nocode"
+                    });
                 }
                 AttributionResult::Unattributed => {
                     hasher.update(b"U");
                 }
+            }
+            hasher.update(b";");
+        }
+        hasher.update(b"]\nplan_touches[");
+        for (sha, touches) in &self.plan_touches {
+            hasher.update(sha.as_str().as_bytes());
+            hasher.update(b"=");
+            for (session, kind) in touches {
+                hasher.update(session.as_str().as_bytes());
+                hasher.update(b":");
+                hasher.update(kind.as_str().as_bytes());
+                hasher.update(b",");
             }
             hasher.update(b";");
         }
