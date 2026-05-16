@@ -18,8 +18,7 @@ use crate::lifecycle::{AgentLabel, CommitSha, PlanKey};
 use crate::mcp_response::PlanStatusReader;
 use crate::projection::{
     all_implementation_commits_for, all_plan_revisions_for, expected_action, impl_gate_for_parts,
-    latest_impl_commit_for, latest_plan_touching_commit_for, phase_for, plan_gate_for_parts,
-    waiting_on,
+    phase_for, plan_gate_for_parts, waiting_on,
 };
 use crate::repo_state::{AttributionResult, Feedback, Phase, PlanTouchKind, Verdict, WaitingOn};
 use crate::review_state::ReviewGateDecision;
@@ -194,22 +193,23 @@ pub fn plan_page_with_reader(
             .map(|s| s.as_str().to_string())
             .collect();
 
-    let (review_target_phase, review_target_sha) = match plan_phase {
-        Phase::Planning => (
-            "plan",
-            latest_plan_touching_commit_for(&plan.id, &bundle.commit_order, &bundle.plan_touches)
-                .map(|s| s.as_str().to_string()),
-        ),
-        Phase::Implementing => (
-            "impl",
-            latest_impl_commit_for(&plan.id, &bundle.commit_order, &bundle.attribution)
-                .map(|s| s.as_str().to_string()),
-        ),
-        Phase::Done => ("plan", None),
+    // Single review target: the latest reviewable commit. Same SHA
+    // the gate is computed on, so the wire shape can't drift from
+    // gate state. Phase-tagged "plan"/"impl" for back-compat.
+    let review_target_sha = crate::projection::latest_reviewable_commit_for(
+        &plan.id,
+        &bundle.commit_order,
+        &bundle.plan_touches,
+        &bundle.attribution,
+    );
+    let review_target_phase = if matches!(plan_phase, Phase::Implementing) {
+        "impl"
+    } else {
+        "plan"
     };
     let review_target = review_target_sha
         .as_ref()
-        .map(|sha| json!({ "phase": review_target_phase, "commit_sha": sha }));
+        .map(|sha| json!({ "phase": review_target_phase, "commit_sha": sha.as_str() }));
     let latest_plan_revision = plan_revisions
         .last()
         .map(|sha| json!({ "commit_sha": sha }))

@@ -21,10 +21,7 @@ use tokio::sync::broadcast::error::RecvError;
 
 use crate::lifecycle::{AgentLabel, CommitSha, ContentHash, PlanKey};
 use crate::mcp_response::compute_plan_worktree_status_parts;
-use crate::projection::{
-    expected_action, impl_gate_for, latest_impl_commit, latest_plan_touching_commit, phase,
-    plan_gate_for, waiting_on,
-};
+use crate::projection::{expected_action, phase, waiting_on};
 use crate::repo_state::{Phase, Trinity, WaitingReason, WaitingRole};
 use crate::review_state::ReviewGateDecision;
 use crate::runtime::Runtime;
@@ -209,15 +206,11 @@ async fn compute_match(
         &candidate.plan_path,
         &candidate.body_hash,
     )?;
-    // Prefer impl gate when present (post-cutover this becomes a
-    // single "latest reviewable" gate lookup — phase 2.5b leaves the
-    // dual gates on Candidate intact since wait still needs both
-    // plan_target and impl_target for derive_locations).
-    let gate = candidate
-        .impl_gate
-        .as_ref()
-        .or(candidate.plan_gate.as_ref());
-    let w = waiting_on(matches!(candidate.session_phase, Phase::Done), status, gate);
+    let w = waiting_on(
+        matches!(candidate.session_phase, Phase::Done),
+        status,
+        candidate.gate.as_ref(),
+    );
     if w.role != role {
         return Ok(None);
     }
@@ -229,28 +222,19 @@ async fn compute_match(
     let locations = derive_locations(&candidate, w.reason, author);
     let repo = candidate.repo_root.to_string_lossy().into_owned();
 
-    // target_sha: the commit the work targets. For review/address
-    // reasons, that's the gate's underlying SHA (impl wins when both
-    // gates exist, matching `compute_match`'s gate pick). Worktree-
-    // status reasons and SessionDone don't carry a SHA.
+    // target_sha / commit_kind / prompt_hint all read from the same
+    // `review_target` the gate was computed on — there is no second
+    // selector. For worktree-status reasons (CommitPlanRevision /
+    // CommitDoneMove / RestoreOrCommitDoneMove) and SessionDone the
+    // target is None.
     let (target_sha, commit_kind) = match w.reason {
-        WaitingReason::CommitNeedsReview | WaitingReason::AddressCommitChanges => {
-            let sha_opt = candidate
-                .impl_target
+        WaitingReason::CommitNeedsReview | WaitingReason::AddressCommitChanges => (
+            candidate
+                .review_target
                 .as_ref()
-                .or(candidate.plan_target.as_ref())
-                .map(|s| s.as_str().to_string());
-            let kind_opt = sha_opt.as_ref().map(|sha| {
-                let kind = crate::projection::commit_kind_for(
-                    &candidate.plan_key,
-                    &crate::lifecycle::CommitSha::from(sha.clone()),
-                    &candidate.plan_touches,
-                    &candidate.attribution,
-                );
-                kind.as_str().to_string()
-            });
-            (sha_opt, kind_opt)
-        }
+                .map(|s| s.as_str().to_string()),
+            candidate.review_target_kind.map(|k| k.as_str().to_string()),
+        ),
         _ => (None, None),
     };
 
@@ -330,10 +314,11 @@ fn prompt_hint_for(
 fn caller_already_voted(cand: &Candidate, reason: WaitingReason, author: &AgentLabel) -> bool {
     use WaitingReason::*;
     let gate = match reason {
-        // CommitNeedsReview is the only reviewer-role reason. Prefer
-        // the impl gate when present (post-2.5b this becomes a single
-        // "latest reviewable" gate lookup).
-        CommitNeedsReview => cand.impl_gate.as_ref().or(cand.plan_gate.as_ref()),
+        // CommitNeedsReview is the only reviewer-role reason. The gate
+        // is the latest reviewable commit's gate — same one driving
+        // waiting_on and review_target. Master-role reasons return
+        // false; caller-already-voted is a reviewer-only concept.
+        CommitNeedsReview => cand.gate.as_ref(),
         SessionDone
         | CommitDoneMove
         | RestoreOrCommitDoneMove
@@ -345,40 +330,35 @@ fn caller_already_voted(cand: &Candidate, reason: WaitingReason, author: &AgentL
     gate.approvals.contains(author) || gate.request_changes.contains(author)
 }
 
-/// Produce the repo-relative paths to attach to the response.
+/// Produce the repo-relative paths to attach to the response. The
+/// review target (and its kind) come from `Candidate`'s pre-computed
+/// fields so this function reads from the same projection that
+/// drives `waiting_on`, `target_sha`, and `commit_kind`. No second
+/// selector.
 fn derive_locations(cand: &Candidate, reason: WaitingReason, author: &AgentLabel) -> Vec<String> {
     let plan_file = cand.plan_path.to_string_lossy().into_owned();
     let sid = cand.plan_key.as_str();
 
     match reason {
         WaitingReason::CommitNeedsReview => {
-            let target = cand.impl_target.as_ref().or(cand.plan_target.as_ref());
-            let Some(target) = target else {
+            let Some(target) = &cand.review_target else {
                 return Vec::new();
             };
             vec![feedback_path(sid, target, author.as_str())]
         }
         WaitingReason::AddressCommitChanges => {
-            let (target, gate) = if let (Some(t), Some(g)) =
-                (cand.impl_target.as_ref(), cand.impl_gate.as_ref())
-                && matches!(
-                    g.state,
-                    crate::review_state::ReviewGateState::ChangesRequested
-                ) {
-                (Some(t), Some(g))
-            } else {
-                (cand.plan_target.as_ref(), cand.plan_gate.as_ref())
-            };
-            let mut out = rc_feedback_paths(target, gate, sid);
-            // Plan-side RC: also surface the plan file. Code-side RC:
-            // address by changing code (no extra location).
-            let code_side = cand.impl_gate.as_ref().is_some_and(|g| {
-                matches!(
-                    g.state,
-                    crate::review_state::ReviewGateState::ChangesRequested
+            let mut out = rc_feedback_paths(cand.review_target.as_ref(), cand.gate.as_ref(), sid);
+            // Plan-side RC (kind is PlanOnly or Mixed) also surfaces
+            // the plan file because addressing the RC means revising
+            // the plan body. Pure code-side RC (CodeOnly) is fixed by
+            // amending code; no extra location needed.
+            let plan_side = matches!(
+                cand.review_target_kind,
+                Some(
+                    crate::repo_state::CommitKind::PlanOnly | crate::repo_state::CommitKind::Mixed
                 )
-            });
-            if !code_side {
+            );
+            if plan_side {
                 out.push(plan_file);
             }
             out
@@ -421,13 +401,18 @@ struct Candidate {
     plan_path: PathBuf,
     body_hash: ContentHash,
     session_phase: Phase,
-    plan_gate: Option<ReviewGateDecision>,
-    impl_gate: Option<ReviewGateDecision>,
-    plan_target: Option<CommitSha>,
-    impl_target: Option<CommitSha>,
-    plan_touches:
-        std::collections::BTreeMap<CommitSha, Vec<(PlanKey, crate::repo_state::PlanTouchKind)>>,
-    attribution: std::collections::BTreeMap<CommitSha, crate::repo_state::AttributionResult>,
+    /// One gate: the latest reviewable commit's gate. Folds the old
+    /// (plan_gate, impl_gate) pair into the single value that drives
+    /// waiting_on, locations, target_sha, and commit_kind.
+    gate: Option<ReviewGateDecision>,
+    /// The SHA the gate was computed on — the same SHA reviewers
+    /// should write to. Equal to `latest_reviewable_commit_for`
+    /// output, which skips MultiPlan / DoneMove / Unattributed.
+    /// `None` when no reviewable commit exists yet.
+    review_target: Option<CommitSha>,
+    /// `CommitKind` of `review_target`, threaded through so callers
+    /// don't re-derive it. `None` iff `review_target` is `None`.
+    review_target_kind: Option<crate::repo_state::CommitKind>,
 }
 
 fn collect_candidate(
@@ -453,18 +438,36 @@ fn collect_candidate(
         .plans
         .get(plan_id.key())
         .ok_or_else(|| WaitError::UnknownPlan(plan_id.to_string()))?;
+    let review_target = crate::projection::latest_reviewable_commit_for(
+        &plan.id,
+        &repo_state.commit_order,
+        &repo_state.plan_touches,
+        &repo_state.attribution,
+    );
+    let review_target_kind = review_target.as_ref().map(|sha| {
+        crate::projection::commit_kind_for(
+            &plan.id,
+            sha,
+            &repo_state.plan_touches,
+            &repo_state.attribution,
+        )
+    });
+    let gate = crate::projection::latest_reviewable_commit_gate_for(
+        &plan.id,
+        &plan.commits,
+        &repo_state.commit_order,
+        &repo_state.plan_touches,
+        &repo_state.attribution,
+    );
     Ok(Candidate {
         repo_root,
         plan_key: plan.id.clone(),
         plan_path: plan.plan_path.clone(),
         body_hash: plan.body_hash.clone(),
         session_phase: phase(plan, &repo_state.attribution),
-        plan_gate: plan_gate_for(plan, repo_state),
-        impl_gate: impl_gate_for(plan, repo_state),
-        plan_target: latest_plan_touching_commit(plan, repo_state),
-        impl_target: latest_impl_commit(plan, repo_state),
-        plan_touches: repo_state.plan_touches.clone(),
-        attribution: repo_state.attribution.clone(),
+        gate,
+        review_target,
+        review_target_kind,
     })
 }
 
@@ -500,19 +503,16 @@ mod tests {
         }
     }
 
-    fn cand(plan_target: Option<&str>, impl_target: Option<&str>) -> Candidate {
+    fn cand(target: Option<&str>, kind: Option<crate::repo_state::CommitKind>) -> Candidate {
         Candidate {
             repo_root: PathBuf::from("/repo"),
             plan_key: PlanKey::from("sid"),
             plan_path: PathBuf::from(".trinity/plans/sid.md"),
             body_hash: content_hash("x"),
             session_phase: Phase::Planning,
-            plan_gate: None,
-            impl_gate: None,
-            plan_target: plan_target.map(CommitSha::from),
-            impl_target: impl_target.map(CommitSha::from),
-            plan_touches: std::collections::BTreeMap::new(),
-            attribution: std::collections::BTreeMap::new(),
+            gate: None,
+            review_target: target.map(CommitSha::from),
+            review_target_kind: kind,
         }
     }
 
@@ -522,20 +522,26 @@ mod tests {
 
     #[test]
     fn review_plan_location_is_canonical_write_path_for_caller() {
-        let c = cand(Some("abc123"), None);
+        let c = cand(
+            Some("abc123"),
+            Some(crate::repo_state::CommitKind::PlanOnly),
+        );
         let v = derive_locations(&c, WaitingReason::CommitNeedsReview, &me());
         assert_eq!(v, vec![".trinity/feedback/sid/commits/abc123/codex.md"]);
     }
 
     #[test]
-    fn review_impl_location_uses_impl_target() {
-        let c = cand(None, Some("def456"));
+    fn review_impl_location_uses_target() {
+        let c = cand(
+            Some("def456"),
+            Some(crate::repo_state::CommitKind::CodeOnly),
+        );
         let v = derive_locations(&c, WaitingReason::CommitNeedsReview, &me());
         assert_eq!(v, vec![".trinity/feedback/sid/commits/def456/codex.md"]);
     }
 
     #[test]
-    fn review_plan_returns_empty_when_no_plan_target() {
+    fn review_returns_empty_when_no_target() {
         let c = cand(None, None);
         let v = derive_locations(&c, WaitingReason::CommitNeedsReview, &me());
         assert!(v.is_empty());
@@ -550,8 +556,8 @@ mod tests {
             agents(&["alice", "bob"]),
             Vec::new(),
         );
-        let mut c = cand(Some("plan1"), None);
-        c.plan_gate = Some(g);
+        let mut c = cand(Some("plan1"), Some(crate::repo_state::CommitKind::PlanOnly));
+        c.gate = Some(g);
         let v = derive_locations(&c, WaitingReason::AddressCommitChanges, &me());
         assert_eq!(
             v,
@@ -572,10 +578,33 @@ mod tests {
             agents(&["dana"]),
             Vec::new(),
         );
-        let mut c = cand(None, Some("impl9"));
-        c.impl_gate = Some(g);
+        let mut c = cand(Some("impl9"), Some(crate::repo_state::CommitKind::CodeOnly));
+        c.gate = Some(g);
         let v = derive_locations(&c, WaitingReason::AddressCommitChanges, &me());
         assert_eq!(v, vec![".trinity/feedback/sid/commits/impl9/dana.md"]);
+    }
+
+    #[test]
+    fn address_mixed_kind_treated_as_plan_side() {
+        // A `Mixed` commit (plan touch + code) is plan-side for the
+        // address-RC location list — the plan file goes on the end.
+        let g = gate(
+            ReviewGateState::ChangesRequested,
+            agents(&["alice"]),
+            Vec::new(),
+            agents(&["alice"]),
+            Vec::new(),
+        );
+        let mut c = cand(Some("mix7"), Some(crate::repo_state::CommitKind::Mixed));
+        c.gate = Some(g);
+        let v = derive_locations(&c, WaitingReason::AddressCommitChanges, &me());
+        assert_eq!(
+            v,
+            vec![
+                ".trinity/feedback/sid/commits/mix7/alice.md",
+                ".trinity/plans/sid.md",
+            ]
+        );
     }
 
     #[test]

@@ -10,9 +10,8 @@ use serde_json::{Value, json};
 
 use crate::lifecycle::{AgentLabel, ContentHash, PlanKey, content_hash, plan_path_counterpart};
 use crate::projection::{
-    all_implementation_commits, all_plan_revisions, expected_action, impl_gate_for,
-    latest_impl_commit, latest_plan_touching_commit, phase, plan_gate_for, plan_worktree_status,
-    waiting_on,
+    all_implementation_commits, all_plan_revisions, expected_action, impl_gate_for, phase,
+    plan_gate_for, plan_worktree_status, waiting_on,
 };
 use crate::repo_state::{PlanWorktreeStatus, RepoState, WaitingOn};
 use crate::review_state::ReviewGateDecision;
@@ -228,35 +227,38 @@ pub fn get_context_response_from_snapshot(
         .map(|s| s.as_str().to_string())
         .collect();
 
-    // Canonical write-feedback path + review_target + expected_action for
-    // the caller. Tells reviewers exactly where to drop their next file.
-    let (review_target_phase, review_target_sha) = match session_phase {
-        crate::repo_state::Phase::Planning => (
-            "plan",
-            latest_plan_touching_commit(session, &state).map(|s| s.as_str().to_string()),
-        ),
-        crate::repo_state::Phase::Implementing => (
-            "impl",
-            latest_impl_commit(session, &state).map(|s| s.as_str().to_string()),
-        ),
-        crate::repo_state::Phase::Done => ("plan", None),
+    // Canonical write-feedback path + review_target + expected_action.
+    // Reads from `latest_reviewable_commit_for` so the target SHA the
+    // wire publishes is the same SHA the gate was computed on — no
+    // chance of pointing reviewers at a non-reviewable
+    // (MultiPlan / DoneMove) commit.
+    let review_target_sha = crate::projection::latest_reviewable_commit_for(
+        &session.id,
+        &state.commit_order,
+        &state.plan_touches,
+        &state.attribution,
+    );
+    let review_target_phase = if matches!(session_phase, crate::repo_state::Phase::Implementing) {
+        "impl"
+    } else {
+        "plan"
     };
     let review_target = review_target_sha.as_ref().map(|sha| {
         json!({
             "phase": review_target_phase,
-            "commit_sha": sha,
+            "commit_sha": sha.as_str(),
         })
     });
     let write_feedback = review_target_sha.as_ref().map(|sha| {
         let rel = format!(
             ".trinity/feedback/{session}/commits/{sha}/{author}.md",
             session = session.id.as_str(),
-            sha = sha,
+            sha = sha.as_str(),
             author = author_label.as_str(),
         );
         json!({
             "phase": review_target_phase,
-            "target_sha": sha,
+            "target_sha": sha.as_str(),
             "path": rel,
         })
     });
