@@ -134,7 +134,7 @@ pub fn catalog() -> Vec<ToolDescriptor> {
                           - `address_commit_changes` → `[<each RC>, <plan file?>]`\n\
                           - `commit_plan_revision` → `[<plan file>]`\n\
                           - `commit_done_move` / `restore_or_commit_done_move` → `[<plan file>]`\n\
-                          - `move_forward` → `[<plan file>]`"
+                          - `start_implementation` → `[<plan file>]`"
                 .to_string(),
             input_schema: json!({
                 "type": "object",

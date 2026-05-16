@@ -763,7 +763,7 @@ mod tests {
             .unwrap()
             .unwrap();
         let v = get_context_response(&snapshot, &AgentLabel::from("master".to_string())).unwrap();
-        assert_eq!(v["waiting_on"]["reason"], "ready_to_move_forward");
+        assert_eq!(v["waiting_on"]["reason"], "ready_to_start_implementation");
 
         let events = rt.live_events_snapshot().await;
         assert!(events.iter().any(|e| e.kind == "feedback_changed"));

@@ -79,8 +79,8 @@ pub enum WaitResponse {
         /// Short imperative pointer for an agent: a sentence or two
         /// summarizing what to read and what to look for. Caller can
         /// override; the default is sane for the typical
-        /// `review_commit` / `address_commit_changes` / `move_forward`
-        /// flow.
+        /// `review_commit` / `address_commit_changes` /
+        /// `start_implementation` flow.
         #[serde(skip_serializing_if = "Option::is_none")]
         prompt_hint: Option<String>,
     },
@@ -301,7 +301,7 @@ fn prompt_hint_for(
             "Active plan file is missing at {plan_path_str}. Either restore it \
              (`git checkout -- {plan_path_str}`) or move it to `done/` and commit."
         ),
-        (ReadyToMoveForward, _) => "Latest commit is approved. Continue with the next \
+        (ReadyToStartImplementation, _) => "Latest commit is approved. Continue with the next \
              commit or move the plan to `done/`."
             .to_string(),
         (SessionDone, _) => return None,
@@ -335,7 +335,7 @@ fn caller_already_voted(cand: &Candidate, reason: WaitingReason, author: &AgentL
         | RestoreOrCommitDoneMove
         | CommitPlanRevision
         | AddressCommitChanges
-        | ReadyToMoveForward => return false,
+        | ReadyToStartImplementation => return false,
     };
     let Some(gate) = gate else { return false };
     gate.approvals.contains(author) || gate.request_changes.contains(author)
@@ -377,7 +377,7 @@ fn derive_locations(cand: &Candidate, reason: WaitingReason, author: &AgentLabel
         WaitingReason::CommitDoneMove
         | WaitingReason::RestoreOrCommitDoneMove
         | WaitingReason::CommitPlanRevision
-        | WaitingReason::ReadyToMoveForward => vec![plan_file],
+        | WaitingReason::ReadyToStartImplementation => vec![plan_file],
         WaitingReason::SessionDone => Vec::new(),
     }
 }
@@ -628,14 +628,14 @@ mod tests {
     #[test]
     fn ready_to_finish_location_is_plan_file() {
         let c = cand(None, None);
-        let v = derive_locations(&c, WaitingReason::ReadyToMoveForward, &me());
+        let v = derive_locations(&c, WaitingReason::ReadyToStartImplementation, &me());
         assert_eq!(v, vec![".trinity/plans/sid.md"]);
     }
 
     #[test]
     fn ready_to_implement_location_is_plan_file() {
         let c = cand(None, None);
-        let v = derive_locations(&c, WaitingReason::ReadyToMoveForward, &me());
+        let v = derive_locations(&c, WaitingReason::ReadyToStartImplementation, &me());
         assert_eq!(v, vec![".trinity/plans/sid.md"]);
     }
 

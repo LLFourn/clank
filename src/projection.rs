@@ -166,7 +166,7 @@ fn waiting_from_gate(gate: Option<&ReviewGateDecision>) -> WaitingOn {
         ),
         ReviewGateState::Ready => make(
             WaitingRole::Master,
-            WaitingReason::ReadyToMoveForward,
+            WaitingReason::ReadyToStartImplementation,
             Vec::new(),
         ),
         ReviewGateState::NeedsReview => {
@@ -523,7 +523,7 @@ pub fn expected_action(reason: WaitingReason) -> &'static str {
         RestoreOrCommitDoneMove => "restore_or_commit_done_move",
         CommitPlanRevision => "commit_plan_revision",
         AddressCommitChanges => "address_commit_changes",
-        ReadyToMoveForward => "move_forward",
+        ReadyToStartImplementation => "start_implementation",
         CommitNeedsReview => "review_commit",
     }
 }
@@ -580,7 +580,7 @@ fn description_for(
                 )
             }
         }
-        (Master, ReadyToMoveForward) => {
+        (Master, ReadyToStartImplementation) => {
             "Latest commit approved. Continue with the next commit or move the plan to `done/`."
                 .to_string()
         }
@@ -943,7 +943,7 @@ mod tests {
         );
         let w = waiting_on(false, PlanWorktreeStatus::Clean, Some(&g));
         assert_eq!(w.role, WaitingRole::Master);
-        assert_eq!(w.reason, WaitingReason::ReadyToMoveForward);
+        assert_eq!(w.reason, WaitingReason::ReadyToStartImplementation);
     }
 
     #[test]
@@ -986,7 +986,7 @@ mod tests {
         );
         let w = waiting_on(false, PlanWorktreeStatus::Clean, Some(&g));
         assert_eq!(w.role, WaitingRole::Master);
-        assert_eq!(w.reason, WaitingReason::ReadyToMoveForward);
+        assert_eq!(w.reason, WaitingReason::ReadyToStartImplementation);
     }
 
     #[test]

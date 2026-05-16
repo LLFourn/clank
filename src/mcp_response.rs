@@ -701,7 +701,7 @@ mod tests {
         let state = rebuild_repo(dir.path()).await.unwrap();
         let v = context_from_state(&state, "foo", "master").unwrap();
         assert_eq!(v["waiting_on"]["role"], "master");
-        assert_eq!(v["waiting_on"]["reason"], "ready_to_move_forward");
+        assert_eq!(v["waiting_on"]["reason"], "ready_to_start_implementation");
     }
 
     struct BlockingStatusReader {

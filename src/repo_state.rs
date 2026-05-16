@@ -587,8 +587,11 @@ pub enum WaitingReason {
     /// ReadyToImplement + ReadyToFinish. After an approved plan_only
     /// the master can start coding, revise further, or move to done;
     /// after an approved code_only/mixed the master can continue,
-    /// revise the plan, or move to done.
-    ReadyToMoveForward,
+    /// revise the plan, or move to done. The wire action is
+    /// `start_implementation` — historically named `move_forward`
+    /// until the verb was found ambiguous between "start the next
+    /// commit" and "move the plan to done/".
+    ReadyToStartImplementation,
     /// "Latest reviewable commit hasn't been reviewed yet." Replaces
     /// `PlanNeedsInitialReview` + `PlanNeedsRereview` +
     /// `ImplNeedsInitialReview` + `ImplNeedsRereview`. Initial review
@@ -605,7 +608,7 @@ impl WaitingReason {
             WaitingReason::RestoreOrCommitDoneMove => "restore_or_commit_done_move",
             WaitingReason::CommitPlanRevision => "commit_plan_revision",
             WaitingReason::AddressCommitChanges => "address_commit_changes",
-            WaitingReason::ReadyToMoveForward => "ready_to_move_forward",
+            WaitingReason::ReadyToStartImplementation => "ready_to_start_implementation",
             WaitingReason::CommitNeedsReview => "commit_needs_review",
         }
     }
