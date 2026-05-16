@@ -267,6 +267,15 @@ pub fn get_context_response_from_snapshot(
     let plan_id = crate::lifecycle::RepoBasename::from_repo_root(&snapshot.root)
         .map(|b| crate::lifecycle::PlanId::new(b, session.id.clone()).to_string());
 
+    let commits_value = commits_array(session, &state);
+    let latest_relevant_commit = crate::projection::latest_reviewable_commit_for(
+        &session.id,
+        &state.commit_order,
+        &state.plan_touches,
+        &state.attribution,
+    )
+    .map(|s| s.as_str().to_string());
+
     json!({
         "repo": snapshot.root.to_string_lossy(),
         "plan_id": plan_id,
@@ -286,9 +295,64 @@ pub fn get_context_response_from_snapshot(
         "implementation_commits": implementation_commits,
         "plan_feedback": plan_feedback,
         "impl_feedback": impl_feedback,
+        // Phase 2.7: commit-keyed wire shape, additive. Phase 2.8
+        // drops `plan_feedback`/`impl_feedback` once the frontend
+        // reads from here. `latest_relevant_commit` is the SHA the
+        // gate / waiting_on / review_target are computed against.
+        "commits": commits_value,
+        "latest_relevant_commit": latest_relevant_commit,
         "timeline": timeline,
         "pr_hint": pr_hint,
     })
+}
+
+/// Build the per-commit `commits[]` array for `get_context`. Each
+/// entry: `{sha, kind, gate, feedback[]}` in chronological
+/// (`commit_order`) order. Only commits whose kind is reviewable
+/// for this plan are emitted (`PlanOnly` | `CodeOnly` | `Mixed`);
+/// `DoneMove` / `MultiPlan` / `Unattributed` are skipped because
+/// they don't carry a gate.
+fn commits_array(plan: &crate::repo_state::Plan, state: &RepoState) -> Vec<Value> {
+    use crate::projection::commit_kind_for;
+    let mut out = Vec::new();
+    for sha in &state.commit_order {
+        let kind = commit_kind_for(&plan.id, sha, &state.plan_touches, &state.attribution);
+        if !kind.is_reviewable() {
+            continue;
+        }
+        let gate_value = plan.commits.get(sha).map(|g| {
+            json!({
+                "state": g.state.as_str(),
+                "participants": g.participants.iter().map(|a| a.as_str()).collect::<Vec<_>>(),
+                "approvers": g.approvers.iter().map(|a| a.as_str()).collect::<Vec<_>>(),
+                "requesters": g.requesters.iter().map(|a| a.as_str()).collect::<Vec<_>>(),
+                "ambiguous": g.ambiguous.iter().map(|a| a.as_str()).collect::<Vec<_>>(),
+                "missing": g.missing.iter().map(|a| a.as_str()).collect::<Vec<_>>(),
+            })
+        });
+        let feedback_array: Vec<Value> = plan
+            .commits
+            .get(sha)
+            .map(|g| {
+                g.feedback
+                    .iter()
+                    .map(|(author, fb)| {
+                        json!({
+                            "author": author.as_str(),
+                            "verdict": fb.verdict.as_str(),
+                        })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        out.push(json!({
+            "sha": sha.as_str(),
+            "kind": kind.as_str(),
+            "gate": gate_value,
+            "feedback": feedback_array,
+        }));
+    }
+    out
 }
 
 /// Serialize the per-session timeline (from `RepoState::timeline_for`)

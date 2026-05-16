@@ -245,6 +245,18 @@ pub fn plan_page_with_reader(
     // widths.
     let plan_body_truncated = plan.body.chars().count() > 4000;
 
+    // Phase 2.7: commit-keyed wire shape. Additive — `plan_feedback`
+    // / `impl_feedback` survive for legacy frontend consumers until
+    // phase 2.8 reads from `commits[]` directly.
+    let commits_value = commits_array_rich(plan, &bundle.plan_touches, &bundle.attribution);
+    let latest_relevant_commit = crate::projection::latest_reviewable_commit_for(
+        &plan.id,
+        &bundle.commit_order,
+        &bundle.plan_touches,
+        &bundle.attribution,
+    )
+    .map(|s| s.as_str().to_string());
+
     Ok(json!({
         "repo": bundle.root.to_string_lossy(),
         "plan_id": plan_id,
@@ -263,11 +275,59 @@ pub fn plan_page_with_reader(
         "implementation_commits": implementation_commits,
         "plan_feedback": plan_feedback,
         "impl_feedback": impl_feedback,
+        "commits": commits_value,
+        "latest_relevant_commit": latest_relevant_commit,
         "plan_body_html": plan_body_html,
         "plan_body_truncated": plan_body_truncated,
         "timeline": timeline,
         "pr_hint": pr_hint,
     }))
+}
+
+/// UI-flavored per-commit `commits[]` array. Like the MCP version
+/// but carries body + html + path on each feedback entry so the SPA
+/// can render cards without further round-trips.
+fn commits_array_rich(
+    plan: &PlanSnapshot,
+    plan_touches: &BTreeMap<CommitSha, Vec<(crate::lifecycle::PlanKey, PlanTouchKind)>>,
+    attribution: &BTreeMap<CommitSha, AttributionResult>,
+) -> Vec<Value> {
+    use crate::projection::commit_kind_for;
+    let mut out = Vec::new();
+    for (sha, gate) in &plan.commits {
+        let kind = commit_kind_for(&plan.id, sha, plan_touches, attribution);
+        if !kind.is_reviewable() {
+            continue;
+        }
+        let feedback_array: Vec<Value> = gate
+            .feedback
+            .iter()
+            .map(|(author, fb)| {
+                json!({
+                    "author": author.as_str(),
+                    "verdict": fb.verdict.as_str(),
+                    "body_raw": fb.body,
+                    "body_html": render_feedback_body(&fb.body, fb.verdict),
+                    "path": fb.path.to_string_lossy(),
+                    "created_at": fb.created_at,
+                })
+            })
+            .collect();
+        out.push(json!({
+            "sha": sha.as_str(),
+            "kind": kind.as_str(),
+            "gate": {
+                "state": gate.state.as_str(),
+                "participants": gate.participants.iter().map(|a| a.as_str()).collect::<Vec<_>>(),
+                "approvers": gate.approvers.iter().map(|a| a.as_str()).collect::<Vec<_>>(),
+                "requesters": gate.requesters.iter().map(|a| a.as_str()).collect::<Vec<_>>(),
+                "ambiguous": gate.ambiguous.iter().map(|a| a.as_str()).collect::<Vec<_>>(),
+                "missing": gate.missing.iter().map(|a| a.as_str()).collect::<Vec<_>>(),
+            },
+            "feedback": feedback_array,
+        }));
+    }
+    out
 }
 
 /// Pre-cutover wire shape: plan_feedback / impl_feedback as two
