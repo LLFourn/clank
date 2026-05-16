@@ -1062,11 +1062,14 @@ async fn start_plan_rejects_repo_basename_collision() {
         ".gitignore must not be written when start_plan rejects on collision"
     );
     // Same for the user-level registry: dir_b must not be persisted at
-    // all (the first repo's path is fine, that's the whole point).
+    // all (the first repo's path is fine, that's the whole point). The
+    // daemon stores canonical paths (`/private/var/...` on macOS), so
+    // canonicalize before comparing — a byte-level compare against the
+    // non-canonical form is vacuous.
     let registry = std::fs::read_to_string(&registry_path).unwrap_or_default();
-    let dir_b_str = dir_b.to_string_lossy();
+    let dir_b_canonical = dir_b.canonicalize().unwrap().to_string_lossy().to_string();
     assert!(
-        !registry.lines().any(|l| l.trim() == dir_b_str),
+        !registry.lines().any(|l| l.trim() == dir_b_canonical),
         "registry must not record dir_b on collision; registry: {registry}"
     );
 }
@@ -1151,9 +1154,13 @@ async fn start_plan_concurrent_basename_twins_loser_does_no_disk_mutation() {
         "loser twin must not have .gitignore written (TOCTOU leak)"
     );
     let registry = std::fs::read_to_string(&registry_path).unwrap_or_default();
-    let loser_str = loser_dir.to_string_lossy();
+    let loser_canonical = loser_dir
+        .canonicalize()
+        .unwrap()
+        .to_string_lossy()
+        .to_string();
     assert!(
-        !registry.lines().any(|l| l.trim() == loser_str),
+        !registry.lines().any(|l| l.trim() == loser_canonical),
         "registry must not record the loser twin; registry: {registry}"
     );
 }
@@ -1271,9 +1278,9 @@ async fn delete_repo_removes_from_state_and_registry() {
 
     // Registry file should not contain the path.
     let registry = std::fs::read_to_string(&registry_path).unwrap_or_default();
-    let dir_str = dir.to_string_lossy();
+    let dir_canonical = dir.canonicalize().unwrap().to_string_lossy().to_string();
     assert!(
-        !registry.lines().any(|l| l.trim() == dir_str),
+        !registry.lines().any(|l| l.trim() == dir_canonical),
         "registry must not contain unwatched repo; registry: {registry}"
     );
 }
