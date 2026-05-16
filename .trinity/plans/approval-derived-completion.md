@@ -195,8 +195,12 @@ the previous cycle now archived in the cycle history).
 - `api_move_to_done` HTTP endpoint deleted; SPA "Move plan to done/"
   button deleted.
 - Feedback path simplified: `.trinity/feedback/<stem>/<sha>/<agent>.md`
-  (no `commits/` segment). The mirror `.trinity/finished/` shares
-  the shape.
+  (no `commits/` segment). The `<sha>` stays in the feedback path
+  because the working-tree gate is keyed per-impl-commit. The
+  finalize snapshot has a flatter shape —
+  `.trinity/finished/<stem>/<agent>.md` — because at finalize
+  time there is one current impl, and old finalizes are recovered
+  via git history rather than parallel SHA directories in HEAD.
 - New `trinity init` command scaffolds `.trinity/` for a new repo
   (directory layout + ignore rule). `--ignore` mode appends the
   ignore rule to the repo-root `.gitignore` instead of creating
@@ -296,10 +300,11 @@ master.
   creation, `--purge` / `--squash` / `--amend` flag handling.
 
 **New core module**:
-- `src/resolution.rs` (or similar) — parser for
-  `.trinity/finished/<stem>/<sha>/<agent>.md` paths, gate-check on
-  snapshot contents, dispute detection (working-tree REQUEST_CHANGES
-  on finalize commit).
+- `src/finalize.rs` (or similar) — parser for
+  `.trinity/finished/<stem>/<agent>.md` paths (flat, no SHA
+  segment), snapshot-presence + APPROVE-count check, and the
+  newest-finalize-commit lookup that decides whether the snapshot
+  is current vs reopened by a newer impl.
 
 **Frontend**:
 - `frontend/src/api.rs:281-299` — `post_move_to_done` +
@@ -622,10 +627,26 @@ Safety:
 - Prompt for confirmation by default; `--yes` skips the prompt
   for scripted use.
 
-All 14 `--purge` edge cases from Phase 7 apply identically. The
-test suite at `tests/cli_purge.rs` re-runs every case against
-`trinity purge` to confirm the engine behaves the same standalone
-as it does behind `trinity finish --purge`.
+The `--purge` edge cases from Phase 7 mostly apply, but not all
+identically. The shared engine behaves the same; the differences
+are at the command's boundary:
+
+- Cases 1–6 and 8–13 (mixed commits, foreign-commit
+  interleaving, multi-plan rewrites, empty impl commits, dirty
+  worktree, merge-commit refusal, idempotency) apply identically.
+- Case 7 (finalize commit at HEAD) does NOT apply — `trinity
+  purge` never creates a finalize commit, so HEAD being a
+  finalize commit is an *input* condition, not the operation's
+  outcome. The Phase 8 "orphan finalize snapshot" pre-flight
+  refusal is the equivalent guard.
+- Case 14 (`--amend --purge`) maps to `trinity purge --amend`
+  with the same semantics.
+
+`tests/cli_purge.rs` covers each of these, explicitly noting
+which cases it inherits from `tests/cli_finish_purge.rs` and
+which it owns directly. Do not phrase the relationship as "all
+cases apply identically" — that overstates and creates exactly
+the spec drift codex flagged.
 
 ### Phase 9 — Wire/UI cutover
 
@@ -900,90 +921,117 @@ Mention in docs; don't restrict.
 8. Plan-only approval never produces lifecycle `finished` —
    `wait_for_work` returns `ready_to_start_implementation` for
    that plan if the current cycle has no impl yet.
+9. Plan inference excludes finished plans. `wait_for_work`,
+   `get_context`, and any other surface that resolves "the current
+   plan" when no `plan_id` is supplied treats only plans with
+   `state == active` as candidates. A repo with one active plan
+   and any number of finished plans still resolves
+   unambiguously to the active one; a `state: finished` plan is
+   visible in `list_plans` but never picked up as the inferred
+   default.
 
 ### Feedback path
 
-9. Working-tree feedback at `.trinity/feedback/<stem>/<sha>/<agent>.md`
-   is parsed; old `commits/<sha>/<agent>.md` is not.
-10. Legacy-path files in the working tree surface as a warning,
+10. Working-tree feedback at `.trinity/feedback/<stem>/<sha>/<agent>.md`
+    is parsed; old `commits/<sha>/<agent>.md` is not.
+11. Legacy-path files in the working tree surface as a warning,
     not a silent drop.
 
 ### CLI: `trinity init`
 
-11. `trinity init` in a git worktree creates `.trinity/plans/`,
-    `.trinity/feedback/`, and `.trinity/.gitignore` containing the
-    `feedback/` ignore rule.
-12. `trinity init` refuses if `.trinity/` already exists with
-    conflicting contents.
+12. `trinity init` in a git worktree creates `.trinity/plans/`
+    and (without `--ignore`) `.trinity/.gitignore` containing the
+    `feedback/` ignore rule. `.trinity/feedback/` is NOT created
+    eagerly — the daemon materialises it lazily on first feedback
+    write.
+13. `trinity init --ignore` appends `.trinity/feedback/` to the
+    repo-root `.gitignore` (creating the file if absent, deduping
+    if the line is already present) and does NOT create
+    `.trinity/.gitignore`.
+14. `trinity init` refuses if `.trinity/` already exists with
+    conflicting contents (e.g., a `.trinity/.gitignore` whose
+    contents differ from what would be written).
 
 ### CLI: `trinity finish` (core)
 
-13. `trinity finish <plan>` refuses with a clear message when the
+15. `trinity finish <plan>` refuses with a clear message when the
     live gate is not fully approved.
-14. `trinity finish <plan>` on a fully approved gate creates
-    `.trinity/finished/<stem>/<agent>.md` for each approver and
-    commits the change.
-15. `trinity finish <plan>` is idempotent on an already-finished
+16. `trinity finish <plan>` on a fully approved gate creates
+    `.trinity/finished/<stem>/<agent>.md` for each approver
+    (flat, no SHA segment) and commits the change.
+17. `trinity finish <plan>` is idempotent on an already-finished
     plan with no new impl commits.
 
 ### CLI: `trinity finish` flags
 
-16. `--amend` re-runs the finalize on HEAD when HEAD is a finalize
+18. `--amend` re-runs the finalize on HEAD when HEAD is a finalize
     commit; refuses otherwise.
-17. `--squash <msg>` collapses contiguous plan-attributed commits
+19. `--squash <msg>` collapses contiguous plan-attributed commits
     into one with the supplied message; refuses on interleaved
     foreign commits.
-18. `--squash --purge <msg>` collapses AND strips `.trinity/`
+20. `--squash --purge <msg>` collapses AND strips `.trinity/`
     content for this plan in the resulting commit.
-19. `--purge` (without `--squash`) rewrites each plan-attributed
+21. `--purge` (without `--squash`) rewrites each plan-attributed
     commit to remove `.trinity/` content for this plan, preserving
     code changes, author, message, timestamp.
-20. `--purge` keeps `.trinity/finished/<stem>/` in HEAD (proof of
+22. `--purge` keeps `.trinity/finished/<stem>/` in HEAD (proof of
     resolution); `--squash --purge` strips it.
 
 ### `--purge` edge cases (mandatory regression tests)
 
-21. Every case 1–14 in the Phase 7 `--purge` edge cases section
+23. Every case 1–14 in the Phase 7 `--purge` edge cases section
     has an explicit test in `tests/cli_finish_purge.rs` (or
     equivalent module).
 
 ### Migration
 
-22. Existing repos with `.trinity/plans/done/*.md` files surface
+24. Existing repos with `.trinity/plans/done/*.md` files surface
     those files in `plan_conflicts` with a migration message; no
     silent drop.
-23. `tests/end_to_end.rs` includes a regression test that boots a
+25. `tests/end_to_end.rs` includes a regression test that boots a
     repo containing `.trinity/plans/done/legacy.md`, verifies the
     conflict surfaces, and verifies the legacy file is not picked
     up as an active plan.
-24. Working-tree feedback at the legacy `commits/` path surfaces a
+26. Working-tree feedback at the legacy `commits/` path surfaces a
     one-shot warning per rebuild.
 
 ### `Phase` enum
 
-25. The `Phase` enum is removed from the codebase (Phase 11).
+27. The `Phase` enum is removed from the codebase (Phase 11).
     Production code computes posture from `CommitKind` via the
     `current_posture` helper rather than reading a stored variant.
     No `Phase::Done` consumer remains.
 
 ### CLI: `trinity purge`
 
-26. `trinity purge <plan>` removes that plan's `.trinity/` content
-    from history without making a finalize commit. Same history-
-    rewriting semantics as `trinity finish --purge`.
-27. `trinity purge --squash <msg>` collapses plan-attributed
+28. `trinity purge <plan>` removes that plan's `.trinity/` content
+    from history without making a finalize commit. Same
+    history-rewriting engine as `trinity finish --purge`; the
+    cases that overlap (mixed commits, foreign-commit
+    interleaving, merge-commit refusal, etc. — cases 1–6 and
+    8–13 from the Phase 7 list) behave identically.
+29. `trinity purge` adds its own pre-flight refusal: if
+    `.trinity/finished/<stem>/` exists in HEAD and neither
+    `--squash` nor `--drop-finalize` is supplied, refuse to leave
+    an orphan finalize snapshot. (Case 7 of the Phase 7 list — the
+    finalize commit at HEAD — does not apply to standalone purge
+    because standalone purge never creates a finalize commit; the
+    equivalent case here is "finalize snapshot from a prior
+    `trinity finish` lives in HEAD," covered by the orphan check.)
+30. `trinity purge --squash <msg>` collapses plan-attributed
     commits into one with the supplied message, stripping
-    `.trinity/` content for the plan.
-28. `trinity purge` refuses without explicit confirmation on
-    protected branches and on dirty working trees, and refuses to
-    leave an orphan finalize snapshot behind without `--squash` or
-    `--drop-finalize`.
+    `.trinity/` content (including any finalize snapshot) for the
+    plan.
+31. `trinity purge` refuses without explicit confirmation on
+    protected branches and on dirty working trees.
 
-### Acceptance: all `--purge` edge cases apply to both subcommands
+### Acceptance: `--purge` test suites split by subcommand
 
-29. The 14 `--purge` edge cases in the Phase 7 list apply to
-    `trinity purge` identically; `tests/cli_purge.rs` mirrors
-    every case from the `trinity finish --purge` suite.
+32. `tests/cli_purge.rs` covers `trinity purge` cases (the 12
+    cases that share semantics with `trinity finish --purge`, plus
+    the orphan-finalize-snapshot pre-flight cases). The two test
+    files do NOT claim identical assertions — each names which
+    cases are shared, which are unique.
 
 ## Out of Scope (Explicit)
 
