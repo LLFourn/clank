@@ -1135,11 +1135,11 @@ mod wire_tests {
             .unwrap();
         let revised = runtime
             .read_repo(dir.path(), |s| {
-                crate::projection::latest_plan_touching_commit(
-                    &s.plans[&crate::lifecycle::PlanKey::parse("foo").unwrap()],
-                    s,
-                )
-                .unwrap()
+                let plan = &s.plans[&crate::lifecycle::PlanKey::parse("foo").unwrap()];
+                crate::projection::all_plan_revisions(plan, s)
+                    .into_iter()
+                    .next_back()
+                    .unwrap()
             })
             .await
             .unwrap();

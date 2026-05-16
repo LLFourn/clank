@@ -890,7 +890,10 @@ mod integration_tests {
             .unwrap();
         let revised: CommitSha = rt
             .read_repo(dir.path(), |s| {
-                crate::projection::latest_plan_touching_commit(&s.plans[&PlanKey::from("foo")], s)
+                let plan = &s.plans[&PlanKey::from("foo")];
+                crate::projection::all_plan_revisions(plan, s)
+                    .into_iter()
+                    .next_back()
                     .unwrap()
             })
             .await

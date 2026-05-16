@@ -340,40 +340,6 @@ pub fn all_implementation_commits_for(
         .collect()
 }
 
-pub fn latest_plan_touching_commit(
-    plan: &Plan,
-    state: &crate::repo_state::RepoState,
-) -> Option<CommitSha> {
-    all_plan_revisions(plan, state).into_iter().last()
-}
-
-pub fn latest_plan_touching_commit_for(
-    plan_key: &crate::lifecycle::PlanKey,
-    commit_order: &[CommitSha],
-    plan_touches: &BTreeMap<
-        CommitSha,
-        Vec<(crate::lifecycle::PlanKey, crate::repo_state::PlanTouchKind)>,
-    >,
-) -> Option<CommitSha> {
-    all_plan_revisions_for(plan_key, commit_order, plan_touches)
-        .into_iter()
-        .last()
-}
-
-pub fn latest_impl_commit(plan: &Plan, state: &crate::repo_state::RepoState) -> Option<CommitSha> {
-    all_implementation_commits(plan, state).into_iter().last()
-}
-
-pub fn latest_impl_commit_for(
-    plan_key: &crate::lifecycle::PlanKey,
-    commit_order: &[CommitSha],
-    attribution: &BTreeMap<CommitSha, AttributionResult>,
-) -> Option<CommitSha> {
-    all_implementation_commits_for(plan_key, commit_order, attribution)
-        .into_iter()
-        .last()
-}
-
 /// Latest commit whose `CommitKind` is `PlanOnly` or `Mixed` for this
 /// plan, walking `commit_order` newest-first. Skips `MultiPlan`,
 /// `DoneMove`, and `Unattributed` so the gate routes to the latest
@@ -589,17 +555,14 @@ pub fn commit_kind_for(
     attribution: &BTreeMap<CommitSha, AttributionResult>,
 ) -> CommitKind {
     let touches = plan_touches.get(sha);
-    // Hot path: nearly every commit has 0 or 1 plan_touches, so
-    // short-circuit before building any set.
-    let distinct_plans_touched = match touches {
-        None => 0,
-        Some(ts) if ts.len() <= 1 => ts.len(),
-        Some(ts) => ts
-            .iter()
-            .map(|(k, _)| k)
-            .collect::<std::collections::BTreeSet<_>>()
-            .len(),
-    };
+    let distinct_plans_touched = touches
+        .map(|ts| {
+            ts.iter()
+                .map(|(k, _)| k)
+                .collect::<std::collections::BTreeSet<_>>()
+                .len()
+        })
+        .unwrap_or(0);
     let our_touch = touches.and_then(|ts| {
         ts.iter()
             .find(|(k, _)| k == plan_key)
