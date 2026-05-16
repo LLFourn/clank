@@ -210,12 +210,6 @@ pub fn get_context_response_from_snapshot(
         None
     };
 
-    // Phase 2.3: feedback is stored per-commit. The pre-cutover wire
-    // shape split feedback into "plan_feedback" and "impl_feedback" by
-    // which legacy map the disk file lived in. Map back through the
-    // commit's `CommitKind` for the same split until phase 2.5 drops
-    // the dichotomy from the wire.
-    let (plan_feedback, impl_feedback) = phase_split_feedback(session, &state);
     let timeline = timeline_value(&state, session_id);
 
     let plan_revisions: Vec<String> = all_plan_revisions(session, &state)
@@ -293,12 +287,9 @@ pub fn get_context_response_from_snapshot(
         "latest_implementation_revision": latest_impl_revision(session, &state),
         "plan_revisions": plan_revisions,
         "implementation_commits": implementation_commits,
-        "plan_feedback": plan_feedback,
-        "impl_feedback": impl_feedback,
-        // Phase 2.7: commit-keyed wire shape, additive. Phase 2.8
-        // drops `plan_feedback`/`impl_feedback` once the frontend
-        // reads from here. `latest_relevant_commit` is the SHA the
-        // gate / waiting_on / review_target are computed against.
+        // Commit-keyed wire shape. `latest_relevant_commit` is the
+        // SHA the gate / waiting_on / review_target are all computed
+        // against; agents should treat it as the canonical target.
         "commits": commits_value,
         "latest_relevant_commit": latest_relevant_commit,
         "timeline": timeline,
@@ -396,32 +387,6 @@ fn timeline_value(state: &RepoState, session_id: &PlanKey) -> Vec<Value> {
             }),
         })
         .collect()
-}
-
-fn phase_split_feedback(
-    plan: &crate::repo_state::Plan,
-    state: &RepoState,
-) -> (Vec<Value>, Vec<Value>) {
-    use crate::projection::commit_kind_for;
-    use crate::repo_state::CommitKind;
-    let mut plan_fb = Vec::new();
-    let mut impl_fb = Vec::new();
-    for (sha, gate) in &plan.commits {
-        let kind = commit_kind_for(&plan.id, sha, &state.plan_touches, &state.attribution);
-        let target = match kind {
-            CommitKind::PlanOnly => &mut plan_fb,
-            CommitKind::CodeOnly | CommitKind::Mixed => &mut impl_fb,
-            _ => continue,
-        };
-        for (author, fb) in &gate.feedback {
-            target.push(json!({
-                "target_sha": sha.as_str(),
-                "author": author.as_str(),
-                "verdict": fb.verdict.as_str(),
-            }));
-        }
-    }
-    (plan_fb, impl_fb)
 }
 
 fn pr_hint_value(session: &crate::repo_state::Plan, state: &RepoState) -> Value {

@@ -219,8 +219,6 @@ pub fn plan_page_with_reader(
         .map(|sha| json!({ "commit_sha": sha }))
         .unwrap_or(Value::Null);
 
-    let (plan_feedback, impl_feedback) =
-        phase_split_feedback_rich(plan, &bundle.plan_touches, &bundle.attribution);
     let timeline = timeline_value(
         plan,
         &bundle.attribution,
@@ -245,9 +243,7 @@ pub fn plan_page_with_reader(
     // widths.
     let plan_body_truncated = plan.body.chars().count() > 4000;
 
-    // Phase 2.7: commit-keyed wire shape. Additive — `plan_feedback`
-    // / `impl_feedback` survive for legacy frontend consumers until
-    // phase 2.8 reads from `commits[]` directly.
+    // Commit-keyed wire shape — SPA reads feedback off here.
     let commits_value = commits_array_rich(plan, &bundle.plan_touches, &bundle.attribution);
     let latest_relevant_commit = crate::projection::latest_reviewable_commit_for(
         &plan.id,
@@ -273,8 +269,6 @@ pub fn plan_page_with_reader(
         "latest_implementation_revision": latest_implementation_revision,
         "plan_revisions": plan_revisions,
         "implementation_commits": implementation_commits,
-        "plan_feedback": plan_feedback,
-        "impl_feedback": impl_feedback,
         "commits": commits_value,
         "latest_relevant_commit": latest_relevant_commit,
         "plan_body_html": plan_body_html,
@@ -328,45 +322,6 @@ fn commits_array_rich(
         }));
     }
     out
-}
-
-/// Pre-cutover wire shape: plan_feedback / impl_feedback as two
-/// separate arrays. Phase 2.3 stores feedback per-commit (via
-/// `Plan.commits`); this helper splits back into the legacy shape
-/// based on each commit's `CommitKind` so existing UI consumers keep
-/// working until phase 2.5 collapses the wire onto `commits[]`.
-fn phase_split_feedback_rich(
-    plan: &PlanSnapshot,
-    plan_touches: &BTreeMap<
-        CommitSha,
-        Vec<(crate::lifecycle::PlanKey, crate::repo_state::PlanTouchKind)>,
-    >,
-    attribution: &BTreeMap<CommitSha, crate::repo_state::AttributionResult>,
-) -> (Vec<Value>, Vec<Value>) {
-    use crate::projection::commit_kind_for;
-    use crate::repo_state::CommitKind;
-    let mut plan_fb = Vec::new();
-    let mut impl_fb = Vec::new();
-    for (sha, gate) in &plan.commits {
-        let kind = commit_kind_for(&plan.id, sha, plan_touches, attribution);
-        let target = match kind {
-            CommitKind::PlanOnly => &mut plan_fb,
-            CommitKind::CodeOnly | CommitKind::Mixed => &mut impl_fb,
-            _ => continue,
-        };
-        for (author, fb) in &gate.feedback {
-            target.push(json!({
-                "target_sha": sha.as_str(),
-                "author": author.as_str(),
-                "verdict": fb.verdict.as_str(),
-                "body_raw": fb.body,
-                "body_html": render_feedback_body(&fb.body, fb.verdict),
-                "path": fb.path.to_string_lossy(),
-                "created_at": fb.created_at,
-            }));
-        }
-    }
-    (plan_fb, impl_fb)
 }
 
 /// Strip the verdict marker line and render the rest of the body as

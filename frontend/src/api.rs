@@ -137,18 +137,6 @@ pub struct FeedbackEntry {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-#[allow(dead_code)]
-pub struct HeldFeedbackEntry {
-    pub author: String,
-    pub verdict: String,
-    pub body_raw: String,
-    pub body_html: String,
-    pub path: String,
-    pub reason: String,
-    pub created_at: i64,
-}
-
-#[derive(Debug, Clone, Deserialize)]
 #[serde(tag = "kind")]
 #[allow(dead_code)]
 pub enum TimelineEvent {
@@ -227,12 +215,6 @@ pub struct PlanDetail {
     pub plan_revisions: Vec<String>,
     #[serde(default)]
     pub implementation_commits: Vec<String>,
-    #[serde(default)]
-    pub plan_feedback: Vec<FeedbackEntry>,
-    #[serde(default)]
-    pub impl_feedback: Vec<FeedbackEntry>,
-    #[serde(default)]
-    pub held_plan_feedback: Vec<HeldFeedbackEntry>,
     #[serde(default)]
     pub commits: Vec<CommitEntry>,
     #[serde(default)]

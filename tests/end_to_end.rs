@@ -827,10 +827,19 @@ async fn feedback_renders_on_session_page() {
         .json()
         .await
         .unwrap();
-    let pf = ctx2["result"]["plan_feedback"].as_array().unwrap();
+    let commits = ctx2["result"]["commits"].as_array().unwrap();
+    let has_alice_approve = commits.iter().any(|c| {
+        c["feedback"]
+            .as_array()
+            .map(|fb| {
+                fb.iter()
+                    .any(|f| f["author"] == "alice" && f["verdict"] == "approve")
+            })
+            .unwrap_or(false)
+    });
     assert!(
-        !pf.is_empty(),
-        "plan_feedback should be populated; ctx: {ctx2}"
+        has_alice_approve,
+        "commits[] should carry alice's APPROVE; ctx: {ctx2}"
     );
     // Then check that the UI plan endpoint exposes the feedback
     // including the rendered body HTML.

@@ -175,8 +175,7 @@ pub fn catalog() -> Vec<ToolDescriptor> {
                           latest_relevant_commit, latest_plan_revision, ... }`. \
                           `state` is `active` | `done`. `current_path` is the plan's current \
                           repo-relative path. `commits[]` is the canonical per-commit gate + \
-                          feedback array; prefer it over the legacy `plan_feedback` / \
-                          `impl_feedback` arrays which will go away in a future cleanup.\n\n\
+                          feedback array — the canonical feedback shape on the wire.\n\n\
                           Errors: `invalid_plan_id`, `unknown_repo`, `unknown_plan`, \
                           `plan_not_committed`, `plan_conflict`, `no_active_plan` (inference \
                           path: zero active plans in the resolved repo), `ambiguous_plan` \

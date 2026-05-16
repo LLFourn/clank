@@ -38,30 +38,6 @@ impl ReviewVerdict {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
-pub enum ReviewPhase {
-    Plan,
-    Impl,
-}
-
-impl ReviewPhase {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            ReviewPhase::Plan => "plan",
-            ReviewPhase::Impl => "impl",
-        }
-    }
-
-    pub fn parse(s: &str) -> Option<Self> {
-        Some(match s {
-            "plan" => ReviewPhase::Plan,
-            "impl" => ReviewPhase::Impl,
-            _ => return None,
-        })
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
 pub enum ReviewGateState {
     NeedsReview,
     ChangesRequested,
