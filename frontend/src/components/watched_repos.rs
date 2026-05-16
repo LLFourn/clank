@@ -40,7 +40,6 @@ pub fn WatchedRepos() -> impl IntoView {
             <NoticeStack notices=notices dismiss=dismiss/>
             <Suspense fallback=move || view! { <p class="muted">"Loading…"</p> }>
                 {move || {
-                    let notify = notify.clone();
                     resource
                         .with(|res| match res {
                             Some(Ok(ReposIndex { repos })) => {

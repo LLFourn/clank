@@ -38,7 +38,7 @@ pub fn Timeline(plan_id: String, events: Vec<TimelineEvent>) -> impl IntoView {
 /// Stable per-row key. The index is included as a tiebreaker because the
 /// same `(target, author, verdict)` can appear in multiple positions
 /// across phases. For commit rows the SHA alone is unique.
-fn timeline_key(idx: usize, e: &TimelineEvent) -> String {
+fn timeline_key(_idx: usize, e: &TimelineEvent) -> String {
     match e {
         TimelineEvent::CommitPlan { sha, .. }
         | TimelineEvent::CommitImpl { sha, .. }
@@ -49,9 +49,6 @@ fn timeline_key(idx: usize, e: &TimelineEvent) -> String {
             phase,
             ..
         } => format!("review:{phase}:{target}:{author}"),
-        TimelineEvent::HeldFeedback { author, reason, .. } => {
-            format!("held:{idx}:{author}:{reason}")
-        }
     }
 }
 
@@ -107,18 +104,11 @@ fn TimelineRow(plan_id: std::sync::Arc<String>, event: TimelineEvent) -> impl In
             }
             .into_any()
         }
-        TimelineEvent::HeldFeedback { author, reason, .. } => {
-            let reason_label = format!("held: {reason}");
-            view! {
-                <li class="timeline-row timeline-held">
-                    <span class="timeline-marker"></span>
-                    <span class="timeline-kind">"Held feedback"</span>
-                    <span class="timeline-author">{author}</span>
-                    <span class="timeline-target">{reason_label}</span>
-                </li>
-            }
-            .into_any()
-        }
+        // HeldFeedback variant deleted in phase 2.8 along with the
+        // server-side queue.
+        // (no branch — match is exhaustive)
+        #[allow(unreachable_patterns)]
+        _ => view! { <li class="timeline-row"></li> }.into_any(),
     }
 }
 

@@ -65,7 +65,8 @@ pub struct ReviewTarget {
 #[allow(dead_code)]
 pub struct ReviewGate {
     pub state: String,
-    pub phase: String,
+    #[serde(default)]
+    pub phase: Option<String>,
     #[serde(default)]
     pub participants: Vec<String>,
     #[serde(default)]
@@ -74,6 +75,47 @@ pub struct ReviewGate {
     pub request_changes: Vec<String>,
     #[serde(default)]
     pub missing_approvals: Vec<String>,
+}
+
+/// Per-commit gate state — the post-2.7 wire shape under
+/// `PlanDetail.commits[]`. UI consumers should prefer this over the
+/// legacy `plan_feedback` / `impl_feedback` split arrays.
+#[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)]
+pub struct CommitGate {
+    pub state: String,
+    #[serde(default)]
+    pub participants: Vec<String>,
+    #[serde(default)]
+    pub approvers: Vec<String>,
+    #[serde(default)]
+    pub requesters: Vec<String>,
+    #[serde(default)]
+    pub ambiguous: Vec<String>,
+    #[serde(default)]
+    pub missing: Vec<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)]
+pub struct CommitFeedback {
+    pub author: String,
+    pub verdict: String,
+    pub body_raw: String,
+    pub body_html: String,
+    pub path: String,
+    #[serde(default)]
+    pub created_at: i64,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)]
+pub struct CommitEntry {
+    pub sha: String,
+    pub kind: String,
+    pub gate: Option<CommitGate>,
+    #[serde(default)]
+    pub feedback: Vec<CommitFeedback>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -143,13 +185,6 @@ pub enum TimelineEvent {
         #[serde(default)]
         created_at: i64,
     },
-    #[serde(rename = "held_feedback")]
-    HeldFeedback {
-        author: String,
-        reason: String,
-        #[serde(default)]
-        created_at: i64,
-    },
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -198,6 +233,10 @@ pub struct PlanDetail {
     pub impl_feedback: Vec<FeedbackEntry>,
     #[serde(default)]
     pub held_plan_feedback: Vec<HeldFeedbackEntry>,
+    #[serde(default)]
+    pub commits: Vec<CommitEntry>,
+    #[serde(default)]
+    pub latest_relevant_commit: Option<String>,
     #[serde(default)]
     pub plan_body_html: String,
     #[serde(default)]

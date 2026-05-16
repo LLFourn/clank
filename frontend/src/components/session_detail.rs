@@ -1,8 +1,8 @@
 use leptos::prelude::*;
 use leptos_router::hooks::use_params_map;
 
-use crate::api::{FeedbackEntry, PlanDetail, fetch_plan};
-use crate::components::feedback_card::{FeedbackCard, HeldFeedbackCard};
+use crate::api::{CommitEntry, CommitFeedback, FeedbackEntry, PlanDetail, fetch_plan};
+use crate::components::feedback_card::FeedbackCard;
 use crate::components::meta_strip::MetaStrip;
 use crate::components::plan_preview::PlanPreview;
 use crate::components::pr_hint_card::PrHintCard;
@@ -46,22 +46,19 @@ fn detail_view(detail: PlanDetail) -> impl IntoView {
     let plan_id = detail.plan_id.clone();
     let plan_id_for_timeline = plan_id.clone();
     let waiting_on = detail.waiting_on.clone();
-    let plan_feedback = detail.plan_feedback.clone();
-    let impl_feedback = detail.impl_feedback.clone();
-    let held_feedback = detail.held_plan_feedback.clone();
+    let commits = detail.commits.clone();
+    let latest_target_sha = detail.latest_relevant_commit.clone();
     let timeline_events = detail.timeline.clone();
     let pr_hint = detail.pr_hint.clone();
     let state_class = format!("state-chip state-{}", detail.state);
     let state_label = detail.state.clone();
     let plan_body_html = detail.plan_body_html.clone();
     let plan_body_truncated = detail.plan_body_truncated;
-    let latest_target_sha = detail.review_target.as_ref().map(|t| t.commit_sha.clone());
     let revision_link = match &detail.latest_plan_revision {
         Some(rev) => format!("/plan/{}/revision/{}", detail.plan_id, rev.commit_sha),
         None => format!("/plan/{}", detail.plan_id),
     };
-    let latest_review =
-        latest_review_for_target(&plan_feedback, &impl_feedback, latest_target_sha.as_deref());
+    let latest_review = latest_review_for_target(&commits, latest_target_sha.as_deref());
 
     view! {
         <article class="session-page">
@@ -92,34 +89,43 @@ fn detail_view(detail: PlanDetail) -> impl IntoView {
                         <h2>"Timeline"</h2>
                         <Timeline plan_id=plan_id_for_timeline events=timeline_events/>
                     </section>
-                    {feedback_section(
-                        "Plan feedback",
-                        plan_feedback,
-                        held_feedback,
-                    )}
-                    {impl_feedback_section(impl_feedback)}
+                    {commit_feedback_section(commits)}
                 </main>
             </div>
         </article>
     }
 }
 
-/// Pick the newest feedback entry whose `target_sha` matches the
-/// current review target. **Filter then sort** — sorting alone would
-/// surface stale reviews against an older target when the current one
-/// has none, which the plan explicitly forbids.
+/// Latest feedback entry on the target commit's gate. Filter to the
+/// target SHA first; sorting across all commits would surface stale
+/// reviews against an earlier target when the current one has none.
 fn latest_review_for_target(
-    plan_feedback: &[FeedbackEntry],
-    impl_feedback: &[FeedbackEntry],
+    commits: &[CommitEntry],
     target: Option<&str>,
 ) -> Option<FeedbackEntry> {
     let target = target?;
-    plan_feedback
+    let commit = commits.iter().find(|c| c.sha == target)?;
+    commit
+        .feedback
         .iter()
-        .chain(impl_feedback.iter())
-        .filter(|fb| fb.target_sha == target)
         .max_by_key(|fb| fb.created_at)
-        .cloned()
+        .map(|fb| commit_fb_to_feedback_entry(&commit.sha, &commit.kind, fb))
+}
+
+/// Convert a commit-keyed feedback entry to the legacy `FeedbackEntry`
+/// shape that `FeedbackCard` consumes. Phase 2.8 keeps `FeedbackCard`
+/// untouched so the card UI stays stable; a future cleanup can fold
+/// the two types together.
+fn commit_fb_to_feedback_entry(sha: &str, _kind: &str, fb: &CommitFeedback) -> FeedbackEntry {
+    FeedbackEntry {
+        target_sha: sha.to_string(),
+        author: fb.author.clone(),
+        verdict: fb.verdict.clone(),
+        body_raw: fb.body_raw.clone(),
+        body_html: fb.body_html.clone(),
+        path: fb.path.clone(),
+        created_at: fb.created_at,
+    }
 }
 
 fn latest_review_section(latest: Option<FeedbackEntry>) -> AnyView {
@@ -141,55 +147,60 @@ fn latest_review_section(latest: Option<FeedbackEntry>) -> AnyView {
     }
 }
 
-fn feedback_section(
-    title: &'static str,
-    plan: Vec<crate::api::FeedbackEntry>,
-    held: Vec<crate::api::HeldFeedbackEntry>,
-) -> AnyView {
-    if plan.is_empty() && held.is_empty() {
+/// One feedback section per commit, in `commits[]` order. Each commit
+/// header carries the kind (plan_only / code_only / mixed) so the
+/// reader can tell at a glance which kind of review they're looking
+/// at — no plan-vs-impl split. Empty commits (no feedback yet) are
+/// rendered with a muted "no reviews yet" line so the section
+/// communicates the gate's missing-reviewer state.
+fn commit_feedback_section(commits: Vec<CommitEntry>) -> AnyView {
+    if commits.is_empty() {
         return view! {
             <section class="session-section">
-                <h2>{title}</h2>
-                <p class="muted">"No plan-phase feedback yet."</p>
+                <h2>"Reviews"</h2>
+                <p class="muted">"No reviewable commits yet."</p>
             </section>
         }
         .into_any();
     }
     view! {
         <section class="session-section">
-            <h2>{title}</h2>
-            <div class="feedback-list">
-                {plan
+            <h2>"Reviews"</h2>
+            <div class="commit-feedback-list">
+                {commits
                     .into_iter()
-                    .map(|fb| view! { <FeedbackCard entry=fb/> })
-                    .collect_view()}
-                {held
-                    .into_iter()
-                    .map(|fb| view! { <HeldFeedbackCard entry=fb/> })
-                    .collect_view()}
-            </div>
-        </section>
-    }
-    .into_any()
-}
-
-fn impl_feedback_section(entries: Vec<crate::api::FeedbackEntry>) -> AnyView {
-    if entries.is_empty() {
-        return view! {
-            <section class="session-section">
-                <h2>"Implementation feedback"</h2>
-                <p class="muted">"No impl-phase feedback yet."</p>
-            </section>
-        }
-        .into_any();
-    }
-    view! {
-        <section class="session-section">
-            <h2>"Implementation feedback"</h2>
-            <div class="feedback-list">
-                {entries
-                    .into_iter()
-                    .map(|fb| view! { <FeedbackCard entry=fb/> })
+                    .map(|c| {
+                        let kind = c.kind.clone();
+                        let kind_class = format!("commit-kind-chip commit-kind-{kind}");
+                        let sha_short: String = c.sha.chars().take(7).collect();
+                        let cards: Vec<_> = c
+                            .feedback
+                            .iter()
+                            .map(|fb| commit_fb_to_feedback_entry(&c.sha, &c.kind, fb))
+                            .collect();
+                        view! {
+                            <div class="commit-feedback-block">
+                                <h3 class="commit-feedback-heading">
+                                    <code>{sha_short}</code>
+                                    <span class=kind_class>{kind}</span>
+                                </h3>
+                                {if cards.is_empty() {
+                                    view! {
+                                        <p class="muted">"No reviews yet."</p>
+                                    }.into_any()
+                                } else {
+                                    view! {
+                                        <div class="feedback-list">
+                                            {cards
+                                                .into_iter()
+                                                .map(|fb| view! { <FeedbackCard entry=fb/> })
+                                                .collect_view()}
+                                        </div>
+                                    }.into_any()
+                                }}
+                            </div>
+                        }
+                    })
                     .collect_view()}
             </div>
         </section>

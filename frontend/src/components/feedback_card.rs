@@ -1,6 +1,6 @@
 use leptos::prelude::*;
 
-use crate::api::{FeedbackEntry, HeldFeedbackEntry};
+use crate::api::FeedbackEntry;
 use crate::util::short_sha;
 
 /// Single feedback file as a card. Verdict pill on the left, author +
@@ -20,27 +20,6 @@ pub fn FeedbackCard(entry: FeedbackEntry) -> impl IntoView {
                 <span class="feedback-target">
                     <code>{target_label}</code>
                 </span>
-                <span class="feedback-time">{timestamp}</span>
-            </header>
-            <div class="feedback-body" inner_html=body_html></div>
-        </article>
-    }
-}
-
-/// Held-feedback variant — no target SHA yet, plus the held reason. Same
-/// visual shape as `FeedbackCard` so the timeline reads consistently.
-#[component]
-pub fn HeldFeedbackCard(entry: HeldFeedbackEntry) -> impl IntoView {
-    let verdict_class = verdict_class(&entry.verdict);
-    let timestamp = format_timestamp(entry.created_at);
-    let body_html = entry.body_html.clone();
-    let reason_label = format!("held: {}", entry.reason);
-    view! {
-        <article class="feedback-card feedback-card-held">
-            <header class="feedback-header">
-                <span class=verdict_class>{verdict_label(&entry.verdict)}</span>
-                <span class="feedback-author">{entry.author}</span>
-                <span class="feedback-target feedback-target-held">{reason_label}</span>
                 <span class="feedback-time">{timestamp}</span>
             </header>
             <div class="feedback-body" inner_html=body_html></div>
