@@ -32,7 +32,18 @@ const MAX_TIMEOUT_SECS: u64 = 300;
 #[derive(Debug, Deserialize)]
 pub struct WaitArgs {
     pub role: String,
+    /// Optional under phase 2.9. When omitted, the MCP dispatcher
+    /// infers the plan from `repo` (or the caller's cwd) — see
+    /// `resolve_plan_id`. The HTTP surface still requires a value
+    /// here because it has no cwd context; HTTP callers must pre-
+    /// resolve plan_id.
+    #[serde(default)]
     pub plan_id: String,
+    /// Optional repo filter (basename or absolute path) used by the
+    /// inference path when `plan_id` is omitted. Ignored when
+    /// `plan_id` is explicit.
+    #[serde(default)]
+    pub repo: Option<String>,
     /// Optional on the wire so schema-strict MCP clients allow the shim
     /// to autofill from its cache; the daemon rejects calls that arrive
     /// without one once autofill has had its chance.
@@ -707,6 +718,7 @@ mod integration_tests {
             plan_id: format!("{basename}/{sid}.md"),
             author_label: Some(author.to_string()),
             timeout_secs: Some(2),
+            repo: None,
         }
     }
 
@@ -1043,6 +1055,7 @@ mod integration_tests {
             plan_id: "no-such-repo/foo.md".to_string(),
             author_label: Some("codex".to_string()),
             timeout_secs: Some(1),
+            repo: None,
         };
         let err = wait_for_work(&rt, a).await.unwrap_err();
         assert!(matches!(err, WaitError::UnknownRepo(_)));
@@ -1056,6 +1069,7 @@ mod integration_tests {
             plan_id: "anywhere/foo.md".to_string(),
             author_label: None,
             timeout_secs: Some(1),
+            repo: None,
         };
         let err = wait_for_work(&rt, a).await.unwrap_err();
         assert!(matches!(err, WaitError::MissingAuthorLabel));
@@ -1069,6 +1083,7 @@ mod integration_tests {
             plan_id: "anywhere/foo.md".to_string(),
             author_label: Some("   ".to_string()),
             timeout_secs: Some(1),
+            repo: None,
         };
         let err = wait_for_work(&rt, a).await.unwrap_err();
         assert!(matches!(err, WaitError::MissingAuthorLabel));

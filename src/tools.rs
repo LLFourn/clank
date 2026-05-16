@@ -100,44 +100,45 @@ pub fn catalog() -> Vec<ToolDescriptor> {
         },
         ToolDescriptor {
             name: "wait_for_work".to_string(),
-            description: "Block until the named plan needs the caller's role, then return the \
+            description: "Block until a plan needs the caller's role, then return the \
                           work to do plus the file paths to act on. This is the idiomatic way \
                           to drive an agent loop — replaces polling `list_plans` / \
                           `get_context` on a timer.\n\n\
                           Inputs:\n\
                           - `role` (required, `master` | `reviewers`).\n\
-                          - `plan_id` (required): the plan you're watching, in the canonical \
-                            form `<repo_basename>/<stem>.md` (e.g. `trinity/leptos-frontend.md`). \
-                            The shim does NOT cache this across calls — pass it on every \
-                            invocation.\n\
+                          - `plan_id` (optional): canonical `<repo_basename>/<stem>.md`. \
+                            If omitted, the daemon infers from the caller's cwd-repo (or \
+                            `repo` below): if exactly one active plan exists, uses it; if \
+                            zero, returns `{timed_out: true, no_active_plans: true}`; if \
+                            multiple, returns `{error: \"ambiguous_plan\", candidates: [...]}`.\n\
+                          - `repo` (optional): basename or absolute path. Scopes the \
+                            plan-id inference when `plan_id` is omitted. Ignored otherwise.\n\
                           - `author_label` (daemon-required, schema-optional for shim \
                             autofill): your label. Used to construct the canonical reviewer \
-                            write path for `review_plan` / `review_impl`. The MCP shim caches \
-                            this across calls.\n\
+                            write path for `review_commit`. The MCP shim caches this.\n\
                           - `timeout_secs` (optional, 1–300, default 60).\n\n\
-                          Response — one of two shapes:\n\
+                          Response — one of:\n\
                           ```\n\
                           { \"plan_id\": \"...\", \"repo\": \"<abs path>\", \
-                          \"work\": \"<action>\", \"locations\": [\"<repo-relative path>\", ...] }\n\
+                          \"work\": \"<action>\", \"locations\": [\"<repo-relative path>\", ...], \
+                          \"target_sha\": \"...\", \"commit_kind\": \"plan_only|code_only|mixed\", \
+                          \"prompt_hint\": \"...\" }\n\
                           ```\n\
-                          or, after the timeout:\n\
                           ```\n\
                           { \"timed_out\": true }\n\
+                          { \"timed_out\": true, \"no_active_plans\": true, \"repo\": \"...\" }\n\
+                          { \"error\": \"ambiguous_plan\", \"candidates\": [{\"plan_id\":...},...] }\n\
                           ```\n\n\
-                          `repo` is the canonical absolute path so callers can resolve the \
-                          repo-relative `locations` directly without parsing `plan_id`.\n\n\
-                          The `work` vocabulary is the imperative action:\n\
-                          - `review_plan` / `review_impl` → `[<canonical write path>]`\n\
-                          - `address_plan_request_changes` → `[<each RC>, <plan file>]`\n\
-                          - `address_impl_request_changes` → `[<each RC>]`\n\
+                          The `work` vocabulary (post phase 2.5):\n\
+                          - `review_commit` → `[<canonical write path>]`\n\
+                          - `address_commit_changes` → `[<each RC>, <plan file?>]`\n\
                           - `commit_plan_revision` → `[<plan file>]`\n\
                           - `commit_done_move` / `restore_or_commit_done_move` → `[<plan file>]`\n\
-                          - `implement_and_commit` → `[<plan file>]`\n\
-                          - `move_to_done` → `[<plan file>]`"
+                          - `move_forward` → `[<plan file>]`"
                 .to_string(),
             input_schema: json!({
                 "type": "object",
-                "required": ["role", "plan_id"],
+                "required": ["role"],
                 "additionalProperties": false,
                 "properties": {
                     "role": {
@@ -147,11 +148,15 @@ pub fn catalog() -> Vec<ToolDescriptor> {
                     },
                     "plan_id": {
                         "type": "string",
-                        "description": "Canonical `<repo_basename>/<stem>.md`. Pass it on every call — the shim does NOT cache plan_id. Discover plans with `list_plans`."
+                        "description": "Canonical `<repo_basename>/<stem>.md`. Optional — if omitted, the daemon infers from cwd-repo (single active plan). Discover plans with `list_plans`."
+                    },
+                    "repo": {
+                        "type": "string",
+                        "description": "Optional repo filter for plan-id inference. Basename or absolute path."
                     },
                     "author_label": {
                         "type": "string",
-                        "description": "Your agent label. Required to construct the canonical reviewer write path for review_* work. The MCP shim caches this across calls."
+                        "description": "Your agent label. Required to construct the canonical reviewer write path for review_commit work. The MCP shim caches this across calls."
                     },
                     "timeout_secs": {
                         "type": "integer",
@@ -166,27 +171,37 @@ pub fn catalog() -> Vec<ToolDescriptor> {
         ToolDescriptor {
             name: "get_context".to_string(),
             description: "Returns the per-plan view: `{ plan_id, slug, state, current_path, \
-                          phase, plan_worktree_status, waiting_on, review_gate, \
-                          latest_plan_revision, latest_implementation_revision, ... }`. \
+                          phase, plan_worktree_status, waiting_on, review_gate, commits, \
+                          latest_relevant_commit, latest_plan_revision, ... }`. \
                           `state` is `active` | `done`. `current_path` is the plan's current \
-                          repo-relative path (`.trinity/plans/<stem>.md` or \
-                          `.trinity/plans/done/<stem>.md`).\n\n\
-                          Errors: `invalid_plan_id`, `unknown_repo` (basename not watched), \
-                          `unknown_plan` (no plan with that stem in the repo), \
-                          `plan_not_committed` (the stem hasn't been committed yet), \
-                          `plan_conflict` (same stem maps to multiple files).\n\n\
-                          Inputs: `plan_id` (required, canonical `<repo_basename>/<stem>.md`); \
-                          `author_label` (optional, defaults to last cached).\n\n\
+                          repo-relative path. `commits[]` is the canonical per-commit gate + \
+                          feedback array; prefer it over the legacy `plan_feedback` / \
+                          `impl_feedback` arrays which will go away in a future cleanup.\n\n\
+                          Errors: `invalid_plan_id`, `unknown_repo`, `unknown_plan`, \
+                          `plan_not_committed`, `plan_conflict`, `no_active_plan` (inference \
+                          path: zero active plans in the resolved repo), `ambiguous_plan` \
+                          (inference path: multiple active plans — caller must retry with \
+                          explicit `plan_id`).\n\n\
+                          Inputs:\n\
+                          - `plan_id` (optional): canonical `<repo_basename>/<stem>.md`. If \
+                            omitted, the daemon infers from `repo` (or the caller's cwd): \
+                            exactly one active plan resolves it, zero returns `no_active_plan`, \
+                            multiple returns `ambiguous_plan` with a candidate list.\n\
+                          - `repo` (optional): scopes the inference. Basename or abs path.\n\
+                          - `author_label` (optional, defaults to last cached).\n\n\
                           Always call this before reviewing or implementing. The `waiting_on` \
                           field tells you whether the current bottleneck is master or reviewers."
                 .to_string(),
             input_schema: json!({
                 "type": "object",
-                "required": ["plan_id"],
                 "properties": {
                     "plan_id": {
                         "type": "string",
-                        "description": "Canonical `<repo_basename>/<stem>.md`. Pass it on every call — the shim does NOT cache plan_id."
+                        "description": "Canonical `<repo_basename>/<stem>.md`. Optional — if omitted, the daemon infers from cwd-repo / `repo` (single active plan)."
+                    },
+                    "repo": {
+                        "type": "string",
+                        "description": "Optional repo filter for plan-id inference. Basename or absolute path."
                     },
                     "author_label": {"type": "string"}
                 },

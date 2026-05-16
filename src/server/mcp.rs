@@ -46,8 +46,35 @@ pub async fn dispatch(state: &AppState, req: &ToolCallRequest) -> Result<Value, 
 }
 
 async fn wait_for_work(state: &AppState, req: &ToolCallRequest) -> Result<Value, ToolError> {
-    let args: WaitArgs = serde_json::from_value(req.arguments.clone())
+    let mut args: WaitArgs = serde_json::from_value(req.arguments.clone())
         .map_err(|e| ToolError::Invalid(format!("args: {e}")))?;
+
+    // Phase 2.9: plan_id is optional. When empty, infer from
+    // `repo` (or the caller's cwd). NoActives → timeout-family
+    // shape `{timed_out: true, no_active_plans: true}` to match
+    // the long-poll vocabulary. Ambiguous → structured error.
+    if args.plan_id.trim().is_empty() {
+        match resolve_plan_id(state, None, args.repo.as_deref(), &req.cwd).await? {
+            PlanIdResolution::Resolved(id) => {
+                args.plan_id = id.to_string();
+            }
+            PlanIdResolution::NoActives { repo } => {
+                return Ok(json!({
+                    "timed_out": true,
+                    "no_active_plans": true,
+                    "repo": repo.to_string_lossy(),
+                }));
+            }
+            PlanIdResolution::Ambiguous { candidates } => {
+                return Ok(json!({
+                    "error": "ambiguous_plan",
+                    "message": "multiple active plans; pass plan_id explicitly",
+                    "candidates": candidates,
+                }));
+            }
+        }
+    }
+
     let resp = run_wait_for_work(&state.runtime, args)
         .await
         .map_err(map_wait_error)?;
@@ -230,16 +257,45 @@ async fn start_plan(state: &AppState, req: &ToolCallRequest) -> Result<Value, To
 
 #[derive(Debug, Deserialize)]
 struct GetContextArgs {
-    plan_id: String,
+    #[serde(default)]
+    plan_id: Option<String>,
+    #[serde(default)]
+    repo: Option<String>,
     author_label: Option<String>,
 }
 
 async fn get_context(state: &AppState, req: &ToolCallRequest) -> Result<Value, ToolError> {
     let args: GetContextArgs = serde_json::from_value(req.arguments.clone())
         .map_err(|e| ToolError::Invalid(format!("args: {e}")))?;
-    let plan_id = PlanId::parse(&args.plan_id)
-        .map_err(|e| ToolError::Invalid(format!("invalid plan_id: {e}")))?;
     let author = AgentLabel::from(args.author_label.unwrap_or_else(|| "anonymous".to_string()));
+
+    // Plan-id inference: explicit > repo+single-active > cwd+single-active.
+    // Zero actives → no_active_plan error. Multiple → ambiguous_plan with
+    // candidate list. See plan §"Optional plan_id inference".
+    let plan_id = match resolve_plan_id(
+        state,
+        args.plan_id.as_deref(),
+        args.repo.as_deref(),
+        &req.cwd,
+    )
+    .await?
+    {
+        PlanIdResolution::Resolved(id) => id,
+        PlanIdResolution::NoActives { repo } => {
+            return Ok(json!({
+                "error": "no_active_plan",
+                "repo": repo.to_string_lossy(),
+                "message": format!("no active plans in {}", repo.display()),
+            }));
+        }
+        PlanIdResolution::Ambiguous { candidates } => {
+            return Ok(json!({
+                "error": "ambiguous_plan",
+                "message": "multiple active plans; pass plan_id explicitly",
+                "candidates": candidates,
+            }));
+        }
+    };
 
     // Resolve repo via basename index, then look up plan within it.
     let lookup = {
@@ -323,6 +379,85 @@ async fn resolve_repo_with_override(
             Ok(dunce::canonicalize(&raw).unwrap_or(raw))
         }
         None => resolve_repo(cwd).await,
+    }
+}
+
+/// Result of `resolve_plan_id`. Callers translate `NoActives` /
+/// `Ambiguous` into surface-specific shapes (long-poll timeout vs
+/// structured error). `Resolved` is the happy path — every other
+/// caller in this file maps it straight to the existing lookup
+/// machinery.
+pub enum PlanIdResolution {
+    Resolved(PlanId),
+    NoActives { repo: PathBuf },
+    Ambiguous { candidates: Vec<Value> },
+}
+
+/// Inference rules per plan §"Optional `plan_id` inference":
+///
+/// 1. Explicit `plan_id` always wins. Parsed and returned as-is.
+/// 2. Otherwise resolve a repo via `repo_override` or the caller's
+///    cwd, then count active plans in that repo.
+/// 3. Exactly one active → return it.
+/// 4. Zero actives → `NoActives { repo }`. Caller decides the wire
+///    shape (timeout-style on long-poll APIs, error-style elsewhere).
+/// 5. Multiple actives → `Ambiguous` with a candidate list. Recency
+///    is NOT a tiebreaker — Trinity does not pick for the caller.
+pub async fn resolve_plan_id(
+    state: &AppState,
+    plan_id_override: Option<&str>,
+    repo_override: Option<&str>,
+    cwd: &Path,
+) -> Result<PlanIdResolution, ToolError> {
+    if let Some(raw) = plan_id_override {
+        let id =
+            PlanId::parse(raw).map_err(|e| ToolError::Invalid(format!("invalid plan_id: {e}")))?;
+        return Ok(PlanIdResolution::Resolved(id));
+    }
+
+    let repo_path = match repo_override {
+        Some(raw) => resolve_repo_filter(state, raw, cwd).await?,
+        None => resolve_repo(cwd).await?,
+    };
+
+    let trinity = state.runtime.state();
+    let trinity = trinity.lock().await;
+    let Some(repo_state) = trinity.repos.get(&repo_path) else {
+        return Ok(PlanIdResolution::NoActives { repo: repo_path });
+    };
+    let basename = crate::lifecycle::RepoBasename::from_repo_root(&repo_path).ok_or_else(|| {
+        ToolError::Internal(anyhow::anyhow!(
+            "repo path has no usable basename: {}",
+            repo_path.display()
+        ))
+    })?;
+
+    let actives: Vec<&crate::repo_state::Plan> = repo_state
+        .plans
+        .values()
+        .filter(|p| matches!(p.state, crate::repo_state::PlanState::Active))
+        .collect();
+
+    match actives.len() {
+        0 => Ok(PlanIdResolution::NoActives { repo: repo_path }),
+        1 => Ok(PlanIdResolution::Resolved(PlanId::new(
+            basename,
+            actives[0].id.clone(),
+        ))),
+        _ => {
+            let candidates: Vec<Value> = actives
+                .iter()
+                .map(|p| {
+                    let plan_id = PlanId::new(basename.clone(), p.id.clone()).to_string();
+                    json!({
+                        "plan_id": plan_id,
+                        "current_path": p.plan_path.to_string_lossy(),
+                        "state": p.state.as_str(),
+                    })
+                })
+                .collect();
+            Ok(PlanIdResolution::Ambiguous { candidates })
+        }
     }
 }
 
