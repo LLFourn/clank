@@ -257,25 +257,16 @@ impl PlanId {
     }
 
     /// Parse the wire form `<repo_basename>/<stem>.md`. Validates shape
-    /// only; does not touch the filesystem.
+    /// via `RepoBasename::parse` and `PlanKey::parse`; does not touch
+    /// the filesystem.
     pub fn parse(s: &str) -> Result<Self, ParsePlanIdError> {
         let (repo, stem_md) = s.split_once('/').ok_or(ParsePlanIdError::Malformed)?;
-        if repo.is_empty() {
-            return Err(ParsePlanIdError::EmptyRepo);
-        }
         let stem = stem_md
             .strip_suffix(".md")
             .ok_or(ParsePlanIdError::MissingMdSuffix)?;
-        if stem.is_empty() {
-            return Err(ParsePlanIdError::EmptyStem);
-        }
-        if stem.contains('/') {
-            return Err(ParsePlanIdError::SlashInStem);
-        }
-        Ok(PlanId {
-            repo: RepoBasename(repo.to_string()),
-            key: PlanKey(stem.to_string()),
-        })
+        let repo = RepoBasename::parse(repo).map_err(ParsePlanIdError::InvalidRepo)?;
+        let key = PlanKey::parse(stem).map_err(ParsePlanIdError::InvalidStem)?;
+        Ok(PlanId { repo, key })
     }
 }
 
@@ -302,14 +293,12 @@ impl<'de> serde::Deserialize<'de> for PlanId {
 pub enum ParsePlanIdError {
     #[error("plan_id must be `<repo_basename>/<stem>.md`")]
     Malformed,
-    #[error("plan_id is missing repo basename before `/`")]
-    EmptyRepo,
     #[error("plan_id is missing the `.md` suffix")]
     MissingMdSuffix,
-    #[error("plan_id stem is empty")]
-    EmptyStem,
-    #[error("plan_id stem must not contain `/`")]
-    SlashInStem,
+    #[error("plan_id repo basename invalid: {0}")]
+    InvalidRepo(IdError),
+    #[error("plan_id stem invalid: {0}")]
+    InvalidStem(IdError),
 }
 
 impl PlanKey {
@@ -344,10 +333,10 @@ impl PlanKey {
         };
 
         let stem = stem_seg.strip_suffix(".md")?;
-        if stem.is_empty() || stem.contains('/') {
-            return None;
-        }
-        Some(PlanKey(stem.to_string()))
+        // Route through PlanKey::parse so dot-segment / leading-dot /
+        // forbidden-char rules are enforced for disk discovery the
+        // same way they are for wire parsing.
+        PlanKey::parse(stem).ok()
     }
 }
 
@@ -473,10 +462,10 @@ mod tests {
 
     #[test]
     fn plan_id_empty_repo_rejected() {
-        assert_eq!(
+        assert!(matches!(
             PlanId::parse("/foo.md").unwrap_err(),
-            ParsePlanIdError::EmptyRepo
-        );
+            ParsePlanIdError::InvalidRepo(IdError::Empty { .. })
+        ));
     }
 
     #[test]
@@ -489,18 +478,36 @@ mod tests {
 
     #[test]
     fn plan_id_empty_stem_rejected() {
-        assert_eq!(
+        assert!(matches!(
             PlanId::parse("trinity/.md").unwrap_err(),
-            ParsePlanIdError::EmptyStem
-        );
+            ParsePlanIdError::InvalidStem(IdError::Empty { .. })
+        ));
     }
 
     #[test]
     fn plan_id_slash_in_stem_rejected() {
-        assert_eq!(
+        assert!(matches!(
             PlanId::parse("trinity/sub/foo.md").unwrap_err(),
-            ParsePlanIdError::SlashInStem
-        );
+            ParsePlanIdError::InvalidStem(IdError::ForbiddenChar { .. })
+        ));
+    }
+
+    #[test]
+    fn plan_id_dot_stem_rejected() {
+        // Regression for the validator-bypass codex caught: `.hidden`
+        // stems must be rejected at PlanId::parse, not silently
+        // accepted into PlanKey.
+        assert!(matches!(
+            PlanId::parse("trinity/.hidden.md").unwrap_err(),
+            ParsePlanIdError::InvalidStem(IdError::LeadingDot { .. })
+        ));
+    }
+
+    #[test]
+    fn plan_key_from_path_rejects_leading_dot() {
+        // Regression: disk discovery routes through PlanKey::parse.
+        // `.trinity/plans/.hidden.md` must NOT become a PlanKey.
+        assert!(PlanKey::from_path(&p(".trinity/plans/.hidden.md")).is_none());
     }
 
     #[test]

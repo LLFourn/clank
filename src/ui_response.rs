@@ -462,7 +462,7 @@ fn gate_value(
     };
     match gate {
         Some(g) => json!({
-            "state": g.state.as_str(),
+            "state": crate::mcp_response::legacy_gate_state_wire(g.state),
             "phase": phase_str,
             "participants": g.participants.iter().map(|a| a.as_str()).collect::<Vec<_>>(),
             "approvals": g.approvers.iter().map(|a| a.as_str()).collect::<Vec<_>>(),

@@ -457,7 +457,7 @@ fn gate_value(
     };
     match gate {
         Some(g) => json!({
-            "state": g.state.as_str(),
+            "state": legacy_gate_state_wire(g.state),
             "phase": phase_str,
             "participants": g.participants.iter().map(|a| a.as_str()).collect::<Vec<_>>(),
             "approvals": g.approvers.iter().map(|a| a.as_str()).collect::<Vec<_>>(),
@@ -465,6 +465,19 @@ fn gate_value(
             "missing_approvals": g.missing.iter().map(|a| a.as_str()).collect::<Vec<_>>(),
         }),
         None => Value::Null,
+    }
+}
+
+/// Legacy `review_gate.state` wire vocabulary, preserved across the
+/// `ReviewGateDecision` → `CommitGate` switch. The per-commit
+/// `commits[].gate.state` field uses the new `CommitGateState`
+/// vocabulary directly via `as_str()`.
+pub(crate) fn legacy_gate_state_wire(s: crate::review_state::CommitGateState) -> &'static str {
+    use crate::review_state::CommitGateState::*;
+    match s {
+        Approved => "ready",
+        Unreviewed => "needs_review",
+        ChangesRequested => "changes_requested",
     }
 }
 
@@ -699,6 +712,59 @@ mod tests {
         let v = context_from_state(&state, "foo", "master").unwrap();
         assert_eq!(v["waiting_on"]["role"], "master");
         assert_eq!(v["waiting_on"]["reason"], "ready_to_start_implementation");
+    }
+
+    /// Phase 2 regression: the wire keys on `review_gate` must stay
+    /// stable across the `ReviewGateDecision` → `CommitGate` switch,
+    /// even though the Rust fields renamed
+    /// (`approvers` / `requesters` / `missing`) and the JSON keys
+    /// did not (`approvals` / `request_changes` / `missing_approvals`).
+    /// A future "rename to match wire" refactor would silently break
+    /// downstream consumers without this assertion.
+    #[tokio::test]
+    async fn review_gate_wire_keys_stable_after_commit_gate_switch() {
+        let dir = init_repo();
+        write_file(dir.path(), ".trinity/plans/foo.md", "# foo\n");
+        commit(dir.path(), "add plan");
+
+        let state0 = rebuild_repo(dir.path()).await.unwrap();
+        let intro = state0.plans[&PlanKey::from("foo".to_string())]
+            .plan_intro
+            .clone();
+        let feedback_rel = format!(".trinity/feedback/foo/commits/{}/alice.md", intro.as_str());
+        write_file(dir.path(), &feedback_rel, "APPROVE\n\nLGTM.\n");
+
+        let state = rebuild_repo(dir.path()).await.unwrap();
+        let v = context_from_state(&state, "foo", "master").unwrap();
+        let gate = &v["review_gate"];
+        assert!(gate.is_object(), "review_gate must be an object: {gate:?}");
+        // Required keys — these are the wire contract; do NOT rename
+        // them to match the Rust field names.
+        for key in [
+            "state",
+            "phase",
+            "participants",
+            "approvals",
+            "request_changes",
+            "missing_approvals",
+        ] {
+            assert!(
+                gate.get(key).is_some(),
+                "review_gate is missing wire key `{key}`: {gate:?}"
+            );
+        }
+        // The renamed Rust fields must NOT bleed through to the wire.
+        for forbidden in ["approvers", "requesters", "missing", "ambiguous"] {
+            assert!(
+                gate.get(forbidden).is_none(),
+                "review_gate must not expose Rust field `{forbidden}`: {gate:?}"
+            );
+        }
+        // Sanity: this approved gate is populated correctly.
+        assert_eq!(gate["state"], "ready");
+        let approvals = gate["approvals"].as_array().unwrap();
+        assert_eq!(approvals.len(), 1);
+        assert_eq!(approvals[0], "alice");
     }
 
     struct BlockingStatusReader {

@@ -129,7 +129,7 @@ pub async fn wait_for_work(runtime: &Runtime, args: WaitArgs) -> Result<WaitResp
     let author = AgentLabel::parse(author_label)
         .map_err(|e| WaitError::InvalidAuthorLabel(e.to_string()))?;
 
-    let timeout = Duration::from_secs(args.timeout_secs.unwrap_or(DEFAULT_TIMEOUT_SECS).max(1));
+    let timeout = derive_timeout(args.timeout_secs);
     let started_at = Instant::now();
     let mut rx = runtime.subscribe_events();
 
@@ -160,6 +160,13 @@ pub async fn wait_for_work(runtime: &Runtime, args: WaitArgs) -> Result<WaitResp
             }
         }
     }
+}
+
+/// Derive the long-poll duration from the caller's `timeout_secs`.
+/// Defaults to `DEFAULT_TIMEOUT_SECS` (1800 / 30 min) on `None`;
+/// floors at 1s; no upper cap (phase 11).
+fn derive_timeout(timeout_secs: Option<u64>) -> Duration {
+    Duration::from_secs(timeout_secs.unwrap_or(DEFAULT_TIMEOUT_SECS).max(1))
 }
 
 fn parse_role(s: &str) -> Result<WaitingRole, WaitError> {
@@ -662,11 +669,21 @@ mod tests {
     }
 
     #[test]
-    fn timeout_secs_above_300_is_not_clamped() {
-        // No upper cap post-phase-11: a 1-hour request is honoured.
-        let raw: u64 = 3600;
-        let timeout = std::time::Duration::from_secs(raw.max(1));
-        assert_eq!(timeout, std::time::Duration::from_secs(3600));
+    fn derive_timeout_default_is_30_minutes() {
+        assert_eq!(derive_timeout(None), Duration::from_secs(1800));
+    }
+
+    #[test]
+    fn derive_timeout_above_300_is_not_clamped() {
+        // Regression for the phase-11 cap removal: reintroducing
+        // `.clamp(1, 300)` would change this output.
+        assert_eq!(derive_timeout(Some(3600)), Duration::from_secs(3600));
+        assert_eq!(derive_timeout(Some(86_400)), Duration::from_secs(86_400));
+    }
+
+    #[test]
+    fn derive_timeout_floors_at_one_second() {
+        assert_eq!(derive_timeout(Some(0)), Duration::from_secs(1));
     }
 }
 
