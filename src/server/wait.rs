@@ -23,7 +23,7 @@ use crate::lifecycle::{AgentLabel, CommitSha, ContentHash, PlanKey};
 use crate::mcp_response::compute_plan_worktree_status_parts;
 use crate::projection::{expected_action, phase, waiting_on};
 use crate::repo_state::{Phase, Trinity, WaitingReason, WaitingRole};
-use crate::review_state::ReviewGateDecision;
+use crate::review_state::CommitGate;
 use crate::runtime::Runtime;
 
 const DEFAULT_TIMEOUT_SECS: u64 = 60;
@@ -341,7 +341,7 @@ fn caller_already_voted(cand: &Candidate, reason: WaitingReason, author: &AgentL
         | ReadyToStartImplementation => return false,
     };
     let Some(gate) = gate else { return false };
-    gate.approvals.contains(author) || gate.request_changes.contains(author)
+    gate.approvers.contains(author) || gate.requesters.contains(author)
 }
 
 /// Produce the repo-relative paths to attach to the response. The
@@ -396,13 +396,13 @@ fn feedback_path(sid: &str, target: &CommitSha, author: &str) -> String {
 
 fn rc_feedback_paths(
     target: Option<&CommitSha>,
-    gate: Option<&ReviewGateDecision>,
+    gate: Option<&CommitGate>,
     sid: &str,
 ) -> Vec<String> {
     let (Some(target), Some(gate)) = (target, gate) else {
         return Vec::new();
     };
-    gate.request_changes
+    gate.requesters
         .iter()
         .map(|author| feedback_path(sid, target, author.as_str()))
         .collect()
@@ -418,7 +418,7 @@ struct Candidate {
     /// One gate: the latest reviewable commit's gate. Folds the old
     /// (plan_gate, impl_gate) pair into the single value that drives
     /// waiting_on, locations, target_sha, and commit_kind.
-    gate: Option<ReviewGateDecision>,
+    gate: Option<CommitGate>,
     /// The SHA the gate was computed on — the same SHA reviewers
     /// should write to. Equal to `latest_reviewable_commit_for`
     /// output, which skips MultiPlan / DoneMove / Unattributed.
@@ -472,7 +472,8 @@ fn collect_candidate(
         &repo_state.commit_order,
         &repo_state.plan_touches,
         &repo_state.attribution,
-    );
+    )
+    .cloned();
     Ok(Candidate {
         repo_root,
         plan_key: plan.id.clone(),
@@ -493,27 +494,27 @@ mod tests {
 
     use super::*;
     use crate::lifecycle::content_hash;
-    use crate::review_state::{ReviewGateDecision, ReviewGateState};
+    use crate::review_state::CommitGateState;
 
     fn agents(labels: &[&str]) -> Vec<AgentLabel> {
         labels.iter().map(|s| AgentLabel::from(*s)).collect()
     }
 
     fn gate(
-        state: ReviewGateState,
+        state: CommitGateState,
         participants: Vec<AgentLabel>,
-        approvals: Vec<AgentLabel>,
-        request_changes: Vec<AgentLabel>,
-        missing_approvals: Vec<AgentLabel>,
-    ) -> ReviewGateDecision {
-        ReviewGateDecision {
+        approvers: Vec<AgentLabel>,
+        requesters: Vec<AgentLabel>,
+        missing: Vec<AgentLabel>,
+    ) -> CommitGate {
+        CommitGate {
             state,
-            approval_rule: "all_participants",
             participants,
-            approvals,
-            request_changes,
-            unmarked: Vec::new(),
-            missing_approvals,
+            approvers,
+            requesters,
+            ambiguous: Vec::new(),
+            missing,
+            feedback: std::collections::BTreeMap::new(),
         }
     }
 
@@ -564,7 +565,7 @@ mod tests {
     #[test]
     fn address_plan_request_changes_lists_rc_files_then_plan() {
         let g = gate(
-            ReviewGateState::ChangesRequested,
+            CommitGateState::ChangesRequested,
             agents(&["alice", "bob"]),
             Vec::new(),
             agents(&["alice", "bob"]),
@@ -586,7 +587,7 @@ mod tests {
     #[test]
     fn address_impl_request_changes_lists_rc_files_only() {
         let g = gate(
-            ReviewGateState::ChangesRequested,
+            CommitGateState::ChangesRequested,
             agents(&["dana"]),
             Vec::new(),
             agents(&["dana"]),
@@ -603,7 +604,7 @@ mod tests {
         // A `Mixed` commit (plan touch + code) is plan-side for the
         // address-RC location list — the plan file goes on the end.
         let g = gate(
-            ReviewGateState::ChangesRequested,
+            CommitGateState::ChangesRequested,
             agents(&["alice"]),
             Vec::new(),
             agents(&["alice"]),

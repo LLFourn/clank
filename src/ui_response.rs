@@ -21,7 +21,7 @@ use crate::projection::{
     phase_for, plan_gate_for_parts, waiting_on,
 };
 use crate::repo_state::{AttributionResult, Feedback, Phase, PlanTouchKind, Verdict, WaitingOn};
-use crate::review_state::ReviewGateDecision;
+use crate::review_state::CommitGate;
 use crate::runtime_snapshot::{PlanSnapshot, PlanSnapshotBundle, RepoSnapshot};
 
 /// `GET /api/plans` — `{ plans, conflicts }` for the home page.
@@ -94,7 +94,7 @@ fn plans_index_parts(
         let w = waiting_on(
             matches!(plan.state, crate::repo_state::PlanState::Done),
             worktree_status,
-            gate.as_ref(),
+            gate,
         );
         let plan_id = basename
             .as_ref()
@@ -179,7 +179,7 @@ pub fn plan_page_with_reader(
     let w = waiting_on(
         matches!(plan.state, crate::repo_state::PlanState::Done),
         worktree_status,
-        gate.as_ref(),
+        gate,
     );
 
     let plan_revisions: Vec<String> =
@@ -269,7 +269,7 @@ pub fn plan_page_with_reader(
         "waiting_on": waiting_on_value(&w),
         "expected_action": expected_action(w.reason),
         "review_target": review_target,
-        "review_gate": gate_value(plan_gate.as_ref(), impl_gate.as_ref(), plan_phase),
+        "review_gate": gate_value(plan_gate, impl_gate, plan_phase),
         "latest_plan_revision": latest_plan_revision,
         "latest_implementation_revision": latest_implementation_revision,
         "plan_revisions": plan_revisions,
@@ -446,8 +446,8 @@ fn waiting_on_value(w: &WaitingOn) -> Value {
 }
 
 fn gate_value(
-    plan_gate: Option<&ReviewGateDecision>,
-    impl_gate: Option<&ReviewGateDecision>,
+    plan_gate: Option<&CommitGate>,
+    impl_gate: Option<&CommitGate>,
     session_phase: Phase,
 ) -> Value {
     let gate = match session_phase {
@@ -465,9 +465,9 @@ fn gate_value(
             "state": g.state.as_str(),
             "phase": phase_str,
             "participants": g.participants.iter().map(|a| a.as_str()).collect::<Vec<_>>(),
-            "approvals": g.approvals.iter().map(|a| a.as_str()).collect::<Vec<_>>(),
-            "request_changes": g.request_changes.iter().map(|a| a.as_str()).collect::<Vec<_>>(),
-            "missing_approvals": g.missing_approvals.iter().map(|a| a.as_str()).collect::<Vec<_>>(),
+            "approvals": g.approvers.iter().map(|a| a.as_str()).collect::<Vec<_>>(),
+            "request_changes": g.requesters.iter().map(|a| a.as_str()).collect::<Vec<_>>(),
+            "missing_approvals": g.missing.iter().map(|a| a.as_str()).collect::<Vec<_>>(),
         }),
         None => Value::Null,
     }

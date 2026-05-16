@@ -1,8 +1,6 @@
 //! Review verdict + gate types. The active per-commit fold lives in
 //! `projection::build_commit_gates`, operating over a single
 //! commit-keyed feedback map (see plan-doc §"`CommitGate`").
-//! `ReviewGateDecision` is a projection shape that callers like
-//! `waiting_on` consume; it does not own state.
 
 use serde::Serialize;
 
@@ -38,63 +36,9 @@ impl ReviewVerdict {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ReviewGateState {
-    NeedsReview,
-    ChangesRequested,
-    Ready,
-}
-
-impl ReviewGateState {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            ReviewGateState::NeedsReview => "needs_review",
-            ReviewGateState::ChangesRequested => "changes_requested",
-            ReviewGateState::Ready => "ready",
-        }
-    }
-
-    pub fn parse(s: &str) -> Option<Self> {
-        Some(match s {
-            "needs_review" => ReviewGateState::NeedsReview,
-            "changes_requested" => ReviewGateState::ChangesRequested,
-            "ready" => ReviewGateState::Ready,
-            _ => return None,
-        })
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct ReviewGateDecision {
-    pub state: ReviewGateState,
-    pub approval_rule: &'static str,
-    pub participants: Vec<AgentLabel>,
-    pub approvals: Vec<AgentLabel>,
-    pub request_changes: Vec<AgentLabel>,
-    pub unmarked: Vec<AgentLabel>,
-    pub missing_approvals: Vec<AgentLabel>,
-}
-
-impl ReviewGateDecision {
-    pub fn empty() -> Self {
-        Self {
-            state: ReviewGateState::NeedsReview,
-            approval_rule: "all_participants",
-            participants: Vec::new(),
-            approvals: Vec::new(),
-            request_changes: Vec::new(),
-            unmarked: Vec::new(),
-            missing_approvals: Vec::new(),
-        }
-    }
-}
-
 /// Per-commit gate state under the commit-centric review model.
 /// The authoritative store for review state — `Plan.commits` maps
-/// each reviewable commit SHA to one of these. `ReviewGateDecision`
-/// is a legacy projection shape that wraps this for the
-/// `waiting_on` pipeline.
+/// each reviewable commit SHA to one of these.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CommitGateState {

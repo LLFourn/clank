@@ -13,7 +13,7 @@ use crate::repo_state::{
     AttributionResult, CommitKind, Feedback, Phase, Plan, PlanTouchKind, PlanWorktreeStatus,
     Verdict, WaitingOn, WaitingReason, WaitingRole,
 };
-use crate::review_state::{CommitGate, CommitGateState, ReviewGateDecision, ReviewGateState};
+use crate::review_state::{CommitGate, CommitGateState};
 
 use std::collections::BTreeMap;
 
@@ -80,7 +80,7 @@ pub fn phase_for(
 pub fn waiting_on(
     is_done: bool,
     worktree_status: PlanWorktreeStatus,
-    gate: Option<&ReviewGateDecision>,
+    gate: Option<&CommitGate>,
 ) -> WaitingOn {
     if is_done {
         return make(WaitingRole::None, WaitingReason::SessionDone, Vec::new());
@@ -112,20 +112,19 @@ pub fn waiting_on(
     waiting_from_gate(gate)
 }
 
-/// Latest reviewable commit's gate for one plan, projected into the
-/// legacy `ReviewGateDecision` shape. Skips `MultiPlan`, `DoneMove`,
-/// `Unattributed` — those don't drive `waiting_on`. Returns `None`
-/// when no reviewable commit exists yet.
-pub fn latest_reviewable_commit_gate_for(
+/// Latest reviewable commit's `CommitGate` for one plan. Skips
+/// `MultiPlan`, `DoneMove`, `Unattributed` — those don't drive
+/// `waiting_on`. Returns `None` when no reviewable commit exists
+/// yet. Zero-copy: the returned reference borrows from `commits`.
+pub fn latest_reviewable_commit_gate_for<'a>(
     plan_key: &crate::lifecycle::PlanKey,
-    commits: &BTreeMap<CommitSha, CommitGate>,
+    commits: &'a BTreeMap<CommitSha, CommitGate>,
     commit_order: &[CommitSha],
     plan_touches: &BTreeMap<CommitSha, Vec<(crate::lifecycle::PlanKey, PlanTouchKind)>>,
     attribution: &BTreeMap<CommitSha, AttributionResult>,
-) -> Option<ReviewGateDecision> {
+) -> Option<&'a CommitGate> {
     let target = latest_reviewable_commit_for(plan_key, commit_order, plan_touches, attribution)?;
-    let gate = commits.get(&target)?;
-    Some(commit_gate_to_review_decision(gate))
+    commits.get(&target)
 }
 
 /// Latest commit whose `CommitKind` is reviewable (`PlanOnly`,
@@ -146,7 +145,7 @@ pub fn latest_reviewable_commit_for(
     None
 }
 
-fn waiting_from_gate(gate: Option<&ReviewGateDecision>) -> WaitingOn {
+fn waiting_from_gate(gate: Option<&CommitGate>) -> WaitingOn {
     let Some(gate) = gate else {
         // No gate yet (a plan with no reviewable commit). Initial-review
         // case with no participants — description prose says "awaiting
@@ -159,21 +158,21 @@ fn waiting_from_gate(gate: Option<&ReviewGateDecision>) -> WaitingOn {
     };
 
     match gate.state {
-        ReviewGateState::ChangesRequested => make(
+        CommitGateState::ChangesRequested => make(
             WaitingRole::Master,
             WaitingReason::AddressCommitChanges,
-            gate.request_changes.clone(),
+            gate.requesters.clone(),
         ),
-        ReviewGateState::Ready => make(
+        CommitGateState::Approved => make(
             WaitingRole::Master,
             WaitingReason::ReadyToStartImplementation,
             Vec::new(),
         ),
-        ReviewGateState::NeedsReview => {
+        CommitGateState::Unreviewed => {
             let agents = if gate.participants.is_empty() {
                 Vec::new()
             } else {
-                gate.missing_approvals.clone()
+                gate.missing.clone()
             };
             make(
                 WaitingRole::Reviewers,
@@ -425,10 +424,10 @@ fn latest_reviewable_impl_commit_for(
 /// `ReviewGateDecision`. Skips `MultiPlan` / `DoneMove` touches so
 /// the gate routes to a real reviewable target. Returns `None` when
 /// no reviewable plan commit exists yet.
-pub fn plan_gate_for(
-    plan: &Plan,
+pub fn plan_gate_for<'a>(
+    plan: &'a Plan,
     state: &crate::repo_state::RepoState,
-) -> Option<ReviewGateDecision> {
+) -> Option<&'a CommitGate> {
     plan_gate_for_parts(
         &plan.id,
         &plan.commits,
@@ -439,30 +438,29 @@ pub fn plan_gate_for(
 }
 
 /// Same as `plan_gate_for` but over primitive inputs.
-pub fn plan_gate_for_parts(
+pub fn plan_gate_for_parts<'a>(
     plan_key: &crate::lifecycle::PlanKey,
-    commits: &BTreeMap<CommitSha, CommitGate>,
+    commits: &'a BTreeMap<CommitSha, CommitGate>,
     commit_order: &[CommitSha],
     plan_touches: &BTreeMap<
         CommitSha,
         Vec<(crate::lifecycle::PlanKey, crate::repo_state::PlanTouchKind)>,
     >,
     attribution: &BTreeMap<CommitSha, AttributionResult>,
-) -> Option<ReviewGateDecision> {
+) -> Option<&'a CommitGate> {
     let current_target =
         latest_reviewable_plan_commit_for(plan_key, commit_order, plan_touches, attribution)?;
-    let gate = commits.get(&current_target)?;
-    Some(commit_gate_to_review_decision(gate))
+    commits.get(&current_target)
 }
 
-/// Implementation-phase review gate. Projects the `CommitGate` for
+/// Implementation-phase review gate. Returns the `CommitGate` for
 /// the latest reviewable code-bearing commit (`CodeOnly` or `Mixed`)
 /// attributed to this plan. Skips `MultiPlan` so a multi-plan code
 /// commit doesn't route to a missing gate entry.
-pub fn impl_gate_for(
-    plan: &Plan,
+pub fn impl_gate_for<'a>(
+    plan: &'a Plan,
     state: &crate::repo_state::RepoState,
-) -> Option<ReviewGateDecision> {
+) -> Option<&'a CommitGate> {
     impl_gate_for_parts(
         &plan.id,
         &plan.commits,
@@ -473,42 +471,19 @@ pub fn impl_gate_for(
 }
 
 /// Same as `impl_gate_for` but over primitive inputs.
-pub fn impl_gate_for_parts(
+pub fn impl_gate_for_parts<'a>(
     plan_key: &crate::lifecycle::PlanKey,
-    commits: &BTreeMap<CommitSha, CommitGate>,
+    commits: &'a BTreeMap<CommitSha, CommitGate>,
     commit_order: &[CommitSha],
     plan_touches: &BTreeMap<
         CommitSha,
         Vec<(crate::lifecycle::PlanKey, crate::repo_state::PlanTouchKind)>,
     >,
     attribution: &BTreeMap<CommitSha, AttributionResult>,
-) -> Option<ReviewGateDecision> {
+) -> Option<&'a CommitGate> {
     let current_target =
         latest_reviewable_impl_commit_for(plan_key, commit_order, plan_touches, attribution)?;
-    let gate = commits.get(&current_target)?;
-    Some(commit_gate_to_review_decision(gate))
-}
-
-/// Project a `CommitGate` into the legacy `ReviewGateDecision` shape
-/// for callers that still consume the latter. Bridge between the
-/// commit-keyed storage (`Plan.commits`) and the per-phase gate
-/// representation that `waiting_on` and the existing MCP response
-/// shape expect. Phase 2.3 will collapse callers onto `CommitGate`
-/// directly and delete this bridge.
-fn commit_gate_to_review_decision(gate: &CommitGate) -> ReviewGateDecision {
-    ReviewGateDecision {
-        state: match gate.state {
-            CommitGateState::ChangesRequested => ReviewGateState::ChangesRequested,
-            CommitGateState::Approved => ReviewGateState::Ready,
-            CommitGateState::Unreviewed => ReviewGateState::NeedsReview,
-        },
-        approval_rule: "all_participants",
-        participants: gate.participants.clone(),
-        approvals: gate.approvers.clone(),
-        request_changes: gate.requesters.clone(),
-        unmarked: gate.ambiguous.clone(),
-        missing_approvals: gate.missing.clone(),
-    }
+    commits.get(&current_target)
 }
 
 /// Map a `WaitingReason` to the caller-facing action verb that names
@@ -772,7 +747,7 @@ mod tests {
 
     use crate::lifecycle::{AgentLabel, PlanKey};
     use crate::repo_state::PlanTouchKind;
-    use crate::review_state::{ReviewGateDecision, ReviewGateState};
+    // CommitGate and CommitGateState already imported via outer use.
     use std::path::PathBuf;
 
     fn hash(s: &str) -> ContentHash {
@@ -787,20 +762,20 @@ mod tests {
     }
 
     fn gate(
-        state: ReviewGateState,
+        state: CommitGateState,
         participants: Vec<AgentLabel>,
-        approvals: Vec<AgentLabel>,
-        request_changes: Vec<AgentLabel>,
-        missing_approvals: Vec<AgentLabel>,
-    ) -> ReviewGateDecision {
-        ReviewGateDecision {
+        approvers: Vec<AgentLabel>,
+        requesters: Vec<AgentLabel>,
+        missing: Vec<AgentLabel>,
+    ) -> CommitGate {
+        CommitGate {
             state,
-            approval_rule: "all_participants",
             participants,
-            approvals,
-            request_changes,
-            unmarked: Vec::new(),
-            missing_approvals,
+            approvers,
+            requesters,
+            ambiguous: Vec::new(),
+            missing,
+            feedback: std::collections::BTreeMap::new(),
         }
     }
 
@@ -855,7 +830,7 @@ mod tests {
     #[test]
     fn waiting_commit_done_move_preempts_gate() {
         let g = gate(
-            ReviewGateState::Ready,
+            CommitGateState::Approved,
             agents(&["alice"]),
             agents(&["alice"]),
             Vec::new(),
@@ -876,7 +851,7 @@ mod tests {
     #[test]
     fn waiting_commit_plan_revision_preempts_gate() {
         let g = gate(
-            ReviewGateState::Ready,
+            CommitGateState::Approved,
             agents(&["alice"]),
             agents(&["alice"]),
             Vec::new(),
@@ -890,7 +865,7 @@ mod tests {
     #[test]
     fn waiting_plan_initial_review_no_participants() {
         let g = gate(
-            ReviewGateState::NeedsReview,
+            CommitGateState::Unreviewed,
             Vec::new(),
             Vec::new(),
             Vec::new(),
@@ -905,7 +880,7 @@ mod tests {
     #[test]
     fn waiting_plan_rereview_with_stale_participants() {
         let g = gate(
-            ReviewGateState::NeedsReview,
+            CommitGateState::Unreviewed,
             agents(&["alice", "bob"]),
             Vec::new(),
             Vec::new(),
@@ -920,7 +895,7 @@ mod tests {
     #[test]
     fn waiting_plan_request_changes_to_master() {
         let g = gate(
-            ReviewGateState::ChangesRequested,
+            CommitGateState::ChangesRequested,
             agents(&["alice", "bob"]),
             Vec::new(),
             agents(&["bob"]),
@@ -935,7 +910,7 @@ mod tests {
     #[test]
     fn waiting_plan_ready_to_implement() {
         let g = gate(
-            ReviewGateState::Ready,
+            CommitGateState::Approved,
             agents(&["alice"]),
             agents(&["alice"]),
             Vec::new(),
@@ -949,7 +924,7 @@ mod tests {
     #[test]
     fn waiting_impl_initial_review() {
         let g = gate(
-            ReviewGateState::NeedsReview,
+            CommitGateState::Unreviewed,
             Vec::new(),
             Vec::new(),
             Vec::new(),
@@ -963,7 +938,7 @@ mod tests {
     #[test]
     fn waiting_impl_request_changes() {
         let g = gate(
-            ReviewGateState::ChangesRequested,
+            CommitGateState::ChangesRequested,
             agents(&["alice"]),
             Vec::new(),
             agents(&["alice"]),
@@ -978,7 +953,7 @@ mod tests {
     #[test]
     fn waiting_impl_ready_to_finish() {
         let g = gate(
-            ReviewGateState::Ready,
+            CommitGateState::Approved,
             agents(&["alice"]),
             agents(&["alice"]),
             Vec::new(),
@@ -992,7 +967,7 @@ mod tests {
     #[test]
     fn description_includes_agent_list_when_present() {
         let g = gate(
-            ReviewGateState::ChangesRequested,
+            CommitGateState::ChangesRequested,
             agents(&["alice", "bob"]),
             Vec::new(),
             agents(&["bob"]),
@@ -1701,8 +1676,8 @@ mod tests {
             &attribution,
         )
         .expect("plan gate should resolve to A");
-        assert_eq!(gate.state, ReviewGateState::Ready);
-        assert_eq!(gate.approvals, vec![al("codex")]);
+        assert_eq!(gate.state, CommitGateState::Approved);
+        assert_eq!(gate.approvers, vec![al("codex")]);
     }
 
     #[test]
@@ -1744,6 +1719,6 @@ mod tests {
             &attribution,
         )
         .expect("plan gate should resolve to A");
-        assert_eq!(gate.state, ReviewGateState::Ready);
+        assert_eq!(gate.state, CommitGateState::Approved);
     }
 }

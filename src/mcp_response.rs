@@ -14,7 +14,7 @@ use crate::projection::{
     plan_gate_for, plan_worktree_status, waiting_on,
 };
 use crate::repo_state::{PlanWorktreeStatus, RepoState, WaitingOn};
-use crate::review_state::ReviewGateDecision;
+use crate::review_state::CommitGate;
 use crate::runtime_snapshot::{PlanSnapshotBundle, RepoSnapshot};
 
 pub trait PlanStatusReader {
@@ -105,7 +105,7 @@ pub(crate) fn list_plans_response_with_status_reader(
         let w = waiting_on(
             matches!(plan.state, crate::repo_state::PlanState::Done),
             worktree_status,
-            gate.as_ref(),
+            gate,
         );
         plans.push(plan_summary(
             &snapshot.root,
@@ -201,7 +201,7 @@ pub fn get_context_response_from_snapshot(
     let w = waiting_on(
         matches!(session.state, crate::repo_state::PlanState::Done),
         worktree_status,
-        gate.as_ref(),
+        gate,
     );
 
     let pr_hint = if matches!(session_phase, crate::repo_state::Phase::Implementing) {
@@ -282,7 +282,7 @@ pub fn get_context_response_from_snapshot(
         "expected_action": expected_action_str,
         "review_target": review_target,
         "write_feedback": write_feedback,
-        "review_gate": gate_value(plan_gate.as_ref(), impl_gate.as_ref(), session_phase),
+        "review_gate": gate_value(plan_gate, impl_gate, session_phase),
         "latest_plan_revision": latest_plan_revision(session, &state),
         "latest_implementation_revision": latest_impl_revision(session, &state),
         "plan_revisions": plan_revisions,
@@ -441,8 +441,8 @@ fn waiting_on_value(w: &WaitingOn) -> Value {
 }
 
 fn gate_value(
-    plan_gate: Option<&ReviewGateDecision>,
-    impl_gate: Option<&ReviewGateDecision>,
+    plan_gate: Option<&CommitGate>,
+    impl_gate: Option<&CommitGate>,
     session_phase: crate::repo_state::Phase,
 ) -> Value {
     let gate = match session_phase {
@@ -450,9 +450,6 @@ fn gate_value(
         crate::repo_state::Phase::Implementing => impl_gate,
         crate::repo_state::Phase::Done => None,
     };
-    // `phase` field on the wire is back-derived by the caller from
-    // the surrounding `session_phase` argument so existing consumers
-    // keep working until phase 2.8 (frontend) drops the field.
     let phase_str = match session_phase {
         crate::repo_state::Phase::Planning => "plan",
         crate::repo_state::Phase::Implementing => "impl",
@@ -463,9 +460,9 @@ fn gate_value(
             "state": g.state.as_str(),
             "phase": phase_str,
             "participants": g.participants.iter().map(|a| a.as_str()).collect::<Vec<_>>(),
-            "approvals": g.approvals.iter().map(|a| a.as_str()).collect::<Vec<_>>(),
-            "request_changes": g.request_changes.iter().map(|a| a.as_str()).collect::<Vec<_>>(),
-            "missing_approvals": g.missing_approvals.iter().map(|a| a.as_str()).collect::<Vec<_>>(),
+            "approvals": g.approvers.iter().map(|a| a.as_str()).collect::<Vec<_>>(),
+            "request_changes": g.requesters.iter().map(|a| a.as_str()).collect::<Vec<_>>(),
+            "missing_approvals": g.missing.iter().map(|a| a.as_str()).collect::<Vec<_>>(),
         }),
         None => Value::Null,
     }
