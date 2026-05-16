@@ -139,22 +139,9 @@ impl RepoState {
                 has_code_changes,
                 subject,
             });
-            // Pre-cutover the review row carried a `phase` ("plan" /
-            // "impl") derived from which feedback map the file lived
-            // in. Post-cutover the phase is implicit in the parent
-            // commit's `CommitKind` — there's only one feedback map
-            // now (per commit). Until phase 2.5 drops the field, we
-            // back-derive it: plan_touch ⇒ Plan, else Impl. Same
-            // visual result as the old code for canonical commits.
             if let Some(gate) = plan.commits.get(sha) {
-                let phase = if plan_touch.is_some() {
-                    TimelinePhase::Plan
-                } else {
-                    TimelinePhase::Impl
-                };
                 for (author, fb) in &gate.feedback {
                     out.push(TimelineEvent::Review {
-                        phase,
                         target: sha.clone(),
                         author: author.clone(),
                         verdict: fb.verdict,
@@ -298,28 +285,14 @@ pub enum TimelineEvent {
         subject: String,
     },
     /// A reviewer's verdict against a specific commit. Always follows
-    /// the `Commit` it targets in the timeline.
+    /// the `Commit` it targets in the timeline. Renderers that want a
+    /// "plan review" vs "impl review" label derive it from the
+    /// targeted commit's `CommitKind` via the wire `commits[]` field.
     Review {
-        phase: TimelinePhase,
         target: CommitSha,
         author: AgentLabel,
         verdict: Verdict,
     },
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TimelinePhase {
-    Plan,
-    Impl,
-}
-
-impl TimelinePhase {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            TimelinePhase::Plan => "plan",
-            TimelinePhase::Impl => "impl",
-        }
-    }
 }
 
 /// Stable hash of a `RepoState`. Used by the runtime to skip broadcasts

@@ -839,12 +839,8 @@ mod tests {
         ));
         match &timeline[1] {
             crate::repo_state::TimelineEvent::Review {
-                phase,
-                author,
-                verdict,
-                ..
+                author, verdict, ..
             } => {
-                assert_eq!(*phase, crate::repo_state::TimelinePhase::Plan);
                 assert_eq!(author.as_str(), "alice");
                 assert_eq!(*verdict, crate::repo_state::Verdict::Approve);
             }
@@ -870,12 +866,10 @@ mod tests {
         assert_eq!(timeline.len(), 3);
         match &timeline[2] {
             crate::repo_state::TimelineEvent::Review {
-                phase,
                 target,
                 author,
                 verdict,
             } => {
-                assert_eq!(*phase, crate::repo_state::TimelinePhase::Impl);
                 assert_eq!(target, &sha("c2c2"));
                 assert_eq!(author.as_str(), "bob");
                 assert_eq!(*verdict, crate::repo_state::Verdict::RequestChanges);

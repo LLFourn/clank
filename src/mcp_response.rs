@@ -367,17 +367,27 @@ fn timeline_value(state: &RepoState, session_id: &PlanKey) -> Vec<Value> {
                 })
             }
             crate::repo_state::TimelineEvent::Review {
-                phase,
                 target,
                 author,
                 verdict,
-            } => json!({
-                "kind": "review",
-                "phase": phase.as_str(),
-                "target": target.as_str(),
-                "author": author.as_str(),
-                "verdict": verdict.as_str(),
-            }),
+            } => {
+                // Wire `phase` is back-derived from the targeted
+                // commit's plan_touch: plan-touching commit → "plan",
+                // else → "impl". Pre-cutover this lived in the
+                // TimelinePhase enum; now it's a render concern.
+                let phase = if state.plan_touches.contains_key(&target) {
+                    "plan"
+                } else {
+                    "impl"
+                };
+                json!({
+                    "kind": "review",
+                    "phase": phase,
+                    "target": target.as_str(),
+                    "author": author.as_str(),
+                    "verdict": verdict.as_str(),
+                })
+            }
         })
         .collect()
 }
