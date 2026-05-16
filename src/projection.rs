@@ -192,6 +192,7 @@ pub fn last_activity_ts_for(
     plan_key: &crate::lifecycle::PlanKey,
     plan_intro: &CommitSha,
     commits: &BTreeMap<CommitSha, CommitGate>,
+    held_plan_feedback: &[crate::repo_state::HeldFeedback],
     commit_order: &[CommitSha],
     plan_touches: &BTreeMap<
         CommitSha,
@@ -221,6 +222,14 @@ pub fn last_activity_ts_for(
         for fb in gate.feedback.values() {
             max_ts = max_ts.max(fb.created_at);
         }
+    }
+    // Held feedback files exist while a plan revision is dirty.
+    // Their mtimes count toward "last activity" until phase 2.3
+    // deletes the held-feedback queue entirely. Without this, a
+    // new held flat-drop review would render on the plan page but
+    // fail to bump the homepage's recency sort.
+    for held in held_plan_feedback {
+        max_ts = max_ts.max(held.created_at);
     }
     if let Some(intro_meta) = commit_meta.get(plan_intro) {
         max_ts = max_ts.max(intro_meta.author_ts);
@@ -365,10 +374,56 @@ pub fn latest_impl_commit_for(
         .last()
 }
 
+/// Latest commit whose `CommitKind` is `PlanOnly` or `Mixed` for this
+/// plan, walking `commit_order` newest-first. Skips `MultiPlan`,
+/// `DoneMove`, and `Unattributed` so the gate routes to the latest
+/// commit that actually carries a reviewable plan touch. Returns
+/// `None` if no such commit exists.
+fn latest_reviewable_plan_commit_for(
+    plan_key: &crate::lifecycle::PlanKey,
+    commit_order: &[CommitSha],
+    plan_touches: &BTreeMap<
+        CommitSha,
+        Vec<(crate::lifecycle::PlanKey, crate::repo_state::PlanTouchKind)>,
+    >,
+    attribution: &BTreeMap<CommitSha, AttributionResult>,
+) -> Option<CommitSha> {
+    for sha in commit_order.iter().rev() {
+        let kind = commit_kind_for(plan_key, sha, plan_touches, attribution);
+        if matches!(kind, CommitKind::PlanOnly | CommitKind::Mixed) {
+            return Some(sha.clone());
+        }
+    }
+    None
+}
+
+/// Latest commit whose `CommitKind` is `CodeOnly` or `Mixed` for this
+/// plan, walking `commit_order` newest-first. Used by the impl gate
+/// bridge so a `MultiPlan` code commit doesn't route to a
+/// non-existent gate entry.
+fn latest_reviewable_impl_commit_for(
+    plan_key: &crate::lifecycle::PlanKey,
+    commit_order: &[CommitSha],
+    plan_touches: &BTreeMap<
+        CommitSha,
+        Vec<(crate::lifecycle::PlanKey, crate::repo_state::PlanTouchKind)>,
+    >,
+    attribution: &BTreeMap<CommitSha, AttributionResult>,
+) -> Option<CommitSha> {
+    for sha in commit_order.iter().rev() {
+        let kind = commit_kind_for(plan_key, sha, plan_touches, attribution);
+        if matches!(kind, CommitKind::CodeOnly | CommitKind::Mixed) {
+            return Some(sha.clone());
+        }
+    }
+    None
+}
+
 /// Plan-phase review gate. Projects the `CommitGate` for the latest
-/// plan-touching commit into a `ReviewGateDecision`. Returns `None`
-/// if the session has no plan-touching commits, or if the latest
-/// plan-touching commit is non-reviewable (e.g. a `done_move`).
+/// reviewable plan-touching commit (`PlanOnly` or `Mixed`) into a
+/// `ReviewGateDecision`. Skips `MultiPlan` / `DoneMove` touches so
+/// the gate routes to a real reviewable target. Returns `None` when
+/// no reviewable plan commit exists yet.
 pub fn plan_gate_for(
     plan: &Plan,
     state: &crate::repo_state::RepoState,
@@ -378,6 +433,7 @@ pub fn plan_gate_for(
         &plan.commits,
         &state.commit_order,
         &state.plan_touches,
+        &state.attribution,
     )
 }
 
@@ -390,14 +446,18 @@ pub fn plan_gate_for_parts(
         CommitSha,
         Vec<(crate::lifecycle::PlanKey, crate::repo_state::PlanTouchKind)>,
     >,
+    attribution: &BTreeMap<CommitSha, AttributionResult>,
 ) -> Option<ReviewGateDecision> {
-    let current_target = latest_plan_touching_commit_for(plan_key, commit_order, plan_touches)?;
+    let current_target =
+        latest_reviewable_plan_commit_for(plan_key, commit_order, plan_touches, attribution)?;
     let gate = commits.get(&current_target)?;
     Some(commit_gate_to_review_decision(ReviewPhase::Plan, gate))
 }
 
 /// Implementation-phase review gate. Projects the `CommitGate` for
-/// the latest code-changing commit attributed to this plan.
+/// the latest reviewable code-bearing commit (`CodeOnly` or `Mixed`)
+/// attributed to this plan. Skips `MultiPlan` so a multi-plan code
+/// commit doesn't route to a missing gate entry.
 pub fn impl_gate_for(
     plan: &Plan,
     state: &crate::repo_state::RepoState,
@@ -406,6 +466,7 @@ pub fn impl_gate_for(
         &plan.id,
         &plan.commits,
         &state.commit_order,
+        &state.plan_touches,
         &state.attribution,
     )
 }
@@ -415,9 +476,14 @@ pub fn impl_gate_for_parts(
     plan_key: &crate::lifecycle::PlanKey,
     commits: &BTreeMap<CommitSha, CommitGate>,
     commit_order: &[CommitSha],
+    plan_touches: &BTreeMap<
+        CommitSha,
+        Vec<(crate::lifecycle::PlanKey, crate::repo_state::PlanTouchKind)>,
+    >,
     attribution: &BTreeMap<CommitSha, AttributionResult>,
 ) -> Option<ReviewGateDecision> {
-    let current_target = latest_impl_commit_for(plan_key, commit_order, attribution)?;
+    let current_target =
+        latest_reviewable_impl_commit_for(plan_key, commit_order, plan_touches, attribution)?;
     let gate = commits.get(&current_target)?;
     Some(commit_gate_to_review_decision(ReviewPhase::Impl, gate))
 }
@@ -1160,6 +1226,7 @@ mod tests {
             &pk("foo"),
             &cs("c1"),
             &BTreeMap::new(),
+            &[],
             &[cs("c1")],
             &touches,
             &BTreeMap::new(),
@@ -1182,6 +1249,7 @@ mod tests {
             &pk("foo"),
             &cs("c1"),
             &commits,
+            &[],
             &[cs("c1"), cs("c2")],
             &touches,
             &BTreeMap::new(),
@@ -1205,6 +1273,7 @@ mod tests {
             &pk("foo"),
             &cs("c1"),
             &BTreeMap::new(),
+            &[],
             &[cs("c1"), cs("c2")],
             &touches,
             &BTreeMap::new(),
@@ -1214,6 +1283,37 @@ mod tests {
             ts, 1_000,
             "bar's later commit should not bump foo's activity"
         );
+    }
+
+    #[test]
+    fn last_activity_ts_counts_held_feedback() {
+        // Held flat-drop reviews exist while the plan body is dirty.
+        // Their mtimes must still count toward "last activity" or a
+        // held review can render on the plan page without bumping the
+        // homepage's recency sort. (Phase 2.3 deletes held feedback
+        // entirely, at which point this test goes with it.)
+        let mut commit_meta = BTreeMap::new();
+        commit_meta.insert(cs("c1"), meta(1_000, "intro"));
+        let mut touches: BTreeMap<CommitSha, Vec<(PlanKey, PlanTouchKind)>> = BTreeMap::new();
+        touches.insert(cs("c1"), vec![(pk("foo"), PlanTouchKind::Intro)]);
+        let held = [crate::repo_state::HeldFeedback {
+            path: std::path::PathBuf::from("/tmp/held.md"),
+            author: al("codex"),
+            body: String::new(),
+            reason: "plan_dirty",
+            created_at: 7_000,
+        }];
+        let ts = last_activity_ts_for(
+            &pk("foo"),
+            &cs("c1"),
+            &BTreeMap::new(),
+            &held,
+            &[cs("c1")],
+            &touches,
+            &BTreeMap::new(),
+            &commit_meta,
+        );
+        assert_eq!(ts, 7_000);
     }
 
     // -------- commit_kind_for --------
@@ -1736,5 +1836,97 @@ mod tests {
         let fb = g.feedback.get(&al("codex")).expect("codex feedback");
         assert_eq!(fb.verdict, Verdict::Approve);
         assert_eq!(fb.path, PathBuf::from("/abs/impl.md"));
+    }
+
+    #[test]
+    fn plan_gate_skips_multi_plan_touch_to_earlier_reviewable() {
+        // Commit A: PlanOnly intro (reviewable, codex approved).
+        // Commit B: MultiPlan touch (touches foo + bar, non-reviewable).
+        // Naive "latest plan touch" routing would land on B and find
+        // no gate entry in Plan.commits, falling through to "initial
+        // review" — wrong. The fix walks newest-first looking for a
+        // PlanOnly/Mixed commit, so the gate stays on A's Approved.
+        let mut touches = BTreeMap::new();
+        touches.insert(cs("a"), touches_one("foo", PlanTouchKind::Intro));
+        touches.insert(
+            cs("b"),
+            vec![
+                (pk("foo"), PlanTouchKind::Revision),
+                (pk("bar"), PlanTouchKind::Revision),
+            ],
+        );
+        let mut attribution = BTreeMap::new();
+        attribution.insert(
+            cs("a"),
+            attributed("foo", Some(PlanTouchKind::Intro), false),
+        );
+        attribution.insert(cs("b"), AttributionResult::Unattributed);
+
+        let mut commits = BTreeMap::new();
+        commits.insert(
+            cs("a"),
+            CommitGate {
+                state: CommitGateState::Approved,
+                participants: vec![al("codex")],
+                approvers: vec![al("codex")],
+                requesters: Vec::new(),
+                ambiguous: Vec::new(),
+                missing: Vec::new(),
+                feedback: BTreeMap::new(),
+            },
+        );
+
+        let gate = plan_gate_for_parts(
+            &pk("foo"),
+            &commits,
+            &[cs("a"), cs("b")],
+            &touches,
+            &attribution,
+        )
+        .expect("plan gate should resolve to A");
+        assert_eq!(gate.state, ReviewGateState::Ready);
+        assert_eq!(gate.approvals, vec![al("codex")]);
+    }
+
+    #[test]
+    fn plan_gate_skips_done_move_to_earlier_reviewable() {
+        // A (PlanOnly, Approved) → B (DoneMove). Plan gate should
+        // resolve to A's gate, not return None.
+        let mut touches = BTreeMap::new();
+        touches.insert(cs("a"), touches_one("foo", PlanTouchKind::Intro));
+        touches.insert(cs("b"), touches_one("foo", PlanTouchKind::DoneMove));
+        let mut attribution = BTreeMap::new();
+        attribution.insert(
+            cs("a"),
+            attributed("foo", Some(PlanTouchKind::Intro), false),
+        );
+        attribution.insert(
+            cs("b"),
+            attributed("foo", Some(PlanTouchKind::DoneMove), false),
+        );
+
+        let mut commits = BTreeMap::new();
+        commits.insert(
+            cs("a"),
+            CommitGate {
+                state: CommitGateState::Approved,
+                participants: vec![al("codex")],
+                approvers: vec![al("codex")],
+                requesters: Vec::new(),
+                ambiguous: Vec::new(),
+                missing: Vec::new(),
+                feedback: BTreeMap::new(),
+            },
+        );
+
+        let gate = plan_gate_for_parts(
+            &pk("foo"),
+            &commits,
+            &[cs("a"), cs("b")],
+            &touches,
+            &attribution,
+        )
+        .expect("plan gate should resolve to A");
+        assert_eq!(gate.state, ReviewGateState::Ready);
     }
 }

@@ -513,6 +513,7 @@ async fn api_repos_list(State(state): State<AppState>) -> Result<axum::Json<Valu
                 &plan.id,
                 &plan.plan_intro,
                 &plan.commits,
+                &plan.held_plan_feedback,
                 &repo_state.commit_order,
                 &repo_state.plan_touches,
                 &repo_state.attribution,

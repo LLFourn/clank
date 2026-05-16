@@ -90,11 +90,13 @@ fn plans_index_parts(
             &plan.commits,
             &snapshot.commit_order,
             &snapshot.plan_touches,
+            &snapshot.attribution,
         );
         let impl_gate = impl_gate_for_parts(
             &plan.id,
             &plan.commits,
             &snapshot.commit_order,
+            &snapshot.plan_touches,
             &snapshot.attribution,
         );
         let worktree_status =
@@ -112,6 +114,7 @@ fn plans_index_parts(
             &plan.id,
             &plan.plan_intro,
             &plan.commits,
+            &plan.held_plan_feedback,
             &snapshot.commit_order,
             &snapshot.plan_touches,
             &snapshot.attribution,
@@ -169,11 +172,13 @@ pub fn plan_page_with_reader(
         &plan.commits,
         &bundle.commit_order,
         &bundle.plan_touches,
+        &bundle.attribution,
     );
     let impl_gate = impl_gate_for_parts(
         &plan.id,
         &plan.commits,
         &bundle.commit_order,
+        &bundle.plan_touches,
         &bundle.attribution,
     );
     let w = waiting_on(
