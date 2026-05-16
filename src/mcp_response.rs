@@ -535,9 +535,9 @@ mod tests {
     }
 
     fn context_from_state(state: &RepoState, sid: &str, author: &str) -> Option<serde_json::Value> {
-        let sid = PlanKey::from(sid.to_string());
+        let sid = PlanKey::parse(sid).unwrap();
         let snapshot = state.single_plan(&sid)?;
-        Some(get_context_response(&snapshot, &AgentLabel::from(author.to_string())).unwrap())
+        Some(get_context_response(&snapshot, &AgentLabel::parse(author).unwrap()).unwrap())
     }
 
     #[tokio::test]
@@ -669,7 +669,7 @@ mod tests {
         commit(dir.path(), "add plan");
 
         let state0 = rebuild_repo(dir.path()).await.unwrap();
-        let intro = state0.plans[&PlanKey::from("foo".to_string())]
+        let intro = state0.plans[&PlanKey::parse("foo").unwrap()]
             .plan_intro
             .clone();
         // Use full SHA in the feedback path. Trinity in production will
@@ -694,7 +694,7 @@ mod tests {
         commit(dir.path(), "add plan");
 
         let state0 = rebuild_repo(dir.path()).await.unwrap();
-        let intro = state0.plans[&PlanKey::from("foo".to_string())]
+        let intro = state0.plans[&PlanKey::parse("foo").unwrap()]
             .plan_intro
             .clone();
         let feedback_rel = format!(".trinity/feedback/foo/commits/{}/alice.md", intro.as_str());
@@ -720,7 +720,7 @@ mod tests {
         commit(dir.path(), "add plan");
 
         let state0 = rebuild_repo(dir.path()).await.unwrap();
-        let intro = state0.plans[&PlanKey::from("foo".to_string())]
+        let intro = state0.plans[&PlanKey::parse("foo").unwrap()]
             .plan_intro
             .clone();
         let feedback_rel = format!(".trinity/feedback/foo/commits/{}/alice.md", intro.as_str());
@@ -786,7 +786,7 @@ mod tests {
         let runtime = Runtime::new();
         runtime.add_repo(dir.path().to_path_buf()).await.unwrap();
         let snapshot = runtime
-            .snapshot_session(dir.path(), &PlanKey::from("foo".to_string()))
+            .snapshot_session(dir.path(), &PlanKey::parse("foo").unwrap())
             .await
             .unwrap()
             .unwrap();
@@ -796,7 +796,7 @@ mod tests {
             entered: entered_tx,
             release: release_rx,
         };
-        let author = AgentLabel::from("reviewer".to_string());
+        let author = AgentLabel::parse("reviewer").unwrap();
 
         let handle = tokio::task::spawn_blocking(move || {
             get_context_response_with_status_reader(&snapshot, &author, &reader).unwrap()

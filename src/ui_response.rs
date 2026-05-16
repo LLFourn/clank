@@ -667,17 +667,17 @@ mod tests {
     #[test]
     fn pr_hint_uses_plan_intro_parent_when_present() {
         let session = Plan {
-            id: PlanKey::from("foo"),
+            id: PlanKey::parse("foo").unwrap(),
             plan_path: std::path::PathBuf::from(".trinity/plans/foo.md"),
             state: crate::repo_state::PlanState::Active,
             body: String::new(),
             body_hash: content_hash(""),
-            plan_intro: CommitSha::from("intro"),
-            plan_intro_parent: Some(CommitSha::from("parent")),
+            plan_intro: CommitSha::parse("dead").unwrap(),
+            plan_intro_parent: Some(CommitSha::parse("ca11").unwrap()),
             commits: BTreeMap::new(),
         };
         let v = pr_hint_value(&session, &[]);
-        assert_eq!(v["plan_intro_parent"], "parent");
+        assert_eq!(v["plan_intro_parent"], "ca11");
         // Both options use the parent as the squash base.
         let cmds: Vec<&str> = v["options"]
             .as_array()
@@ -685,6 +685,6 @@ mod tests {
             .iter()
             .map(|o| o["command"].as_str().unwrap())
             .collect();
-        assert!(cmds.iter().all(|c| c.contains("parent")));
+        assert!(cmds.iter().all(|c| c.contains("ca11")));
     }
 }

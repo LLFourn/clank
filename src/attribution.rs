@@ -77,7 +77,7 @@ mod tests {
     use super::*;
 
     fn sess(name: &str) -> PlanKey {
-        PlanKey::from(name.to_string())
+        PlanKey::parse(name).unwrap()
     }
 
     fn touch(name: &str, kind: PlanTouchKind) -> PlanTouch {

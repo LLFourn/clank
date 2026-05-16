@@ -646,7 +646,7 @@ mod tests {
         rt.handle_signal(
             dir.path(),
             FilesystemSignal::PlanFileChanged {
-                session_id: PlanKey::from("foo".to_string()),
+                session_id: PlanKey::parse("foo").unwrap(),
                 path: PathBuf::from(".trinity/plans/foo.md"),
             },
             42,
@@ -674,7 +674,7 @@ mod tests {
         rt.handle_signal(
             dir.path(),
             FilesystemSignal::PlanFileChanged {
-                session_id: PlanKey::from("unknown".to_string()),
+                session_id: PlanKey::parse("unknown").unwrap(),
                 path: PathBuf::from(".trinity/plans/unknown.md"),
             },
             42,
@@ -697,9 +697,7 @@ mod tests {
 
         let intro: CommitSha = rt
             .read_repo(dir.path(), |s| {
-                s.plans[&PlanKey::from("foo".to_string())]
-                    .plan_intro
-                    .clone()
+                s.plans[&PlanKey::parse("foo").unwrap()].plan_intro.clone()
             })
             .await
             .unwrap();
@@ -718,11 +716,11 @@ mod tests {
 
         // The gate should now resolve to ready_to_implement.
         let snapshot = rt
-            .snapshot_session(dir.path(), &PlanKey::from("foo".to_string()))
+            .snapshot_session(dir.path(), &PlanKey::parse("foo").unwrap())
             .await
             .unwrap()
             .unwrap();
-        let v = get_context_response(&snapshot, &AgentLabel::from("master".to_string())).unwrap();
+        let v = get_context_response(&snapshot, &AgentLabel::parse("master").unwrap()).unwrap();
         assert_eq!(v["waiting_on"]["reason"], "ready_to_start_implementation");
 
         let events = rt.live_events_snapshot().await;
@@ -740,9 +738,7 @@ mod tests {
 
         let intro: CommitSha = rt
             .read_repo(dir.path(), |s| {
-                s.plans[&PlanKey::from("foo".to_string())]
-                    .plan_intro
-                    .clone()
+                s.plans[&PlanKey::parse("foo").unwrap()].plan_intro.clone()
             })
             .await
             .unwrap();
@@ -767,11 +763,11 @@ mod tests {
             .unwrap();
 
         let snapshot = rt
-            .snapshot_session(dir.path(), &PlanKey::from("foo".to_string()))
+            .snapshot_session(dir.path(), &PlanKey::parse("foo").unwrap())
             .await
             .unwrap()
             .unwrap();
-        let v = get_context_response(&snapshot, &AgentLabel::from("master".to_string())).unwrap();
+        let v = get_context_response(&snapshot, &AgentLabel::parse("master").unwrap()).unwrap();
         // Gate falls back to no participants → reviewers / plan_needs_initial_review.
         assert_eq!(v["waiting_on"]["reason"], "commit_needs_review");
     }
@@ -835,7 +831,7 @@ mod tests {
             rt.handle_signal(
                 dir.path(),
                 FilesystemSignal::PlanFileChanged {
-                    session_id: PlanKey::from("foo".to_string()),
+                    session_id: PlanKey::parse("foo").unwrap(),
                     path: PathBuf::from(".trinity/plans/foo.md"),
                 },
                 i,

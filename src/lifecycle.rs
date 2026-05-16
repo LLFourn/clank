@@ -5,24 +5,11 @@ use std::path::{Component, Path, PathBuf};
 
 macro_rules! string_newtype {
     ($name:ident) => {
-        #[derive(
-            Debug,
-            Clone,
-            PartialEq,
-            Eq,
-            PartialOrd,
-            Ord,
-            Hash,
-            serde::Serialize,
-            serde::Deserialize,
-        )]
+        #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize)]
         #[serde(transparent)]
         pub struct $name(String);
 
         impl $name {
-            pub fn new(s: impl Into<String>) -> Self {
-                Self(s.into())
-            }
             pub fn as_str(&self) -> &str {
                 &self.0
             }
@@ -43,14 +30,10 @@ macro_rules! string_newtype {
             }
         }
 
-        impl From<String> for $name {
-            fn from(s: String) -> Self {
-                Self(s)
-            }
-        }
-        impl From<&str> for $name {
-            fn from(s: &str) -> Self {
-                Self(s.to_string())
+        impl<'de> serde::Deserialize<'de> for $name {
+            fn deserialize<D: serde::Deserializer<'de>>(de: D) -> Result<Self, D::Error> {
+                let s = String::deserialize(de)?;
+                Self::parse(&s).map_err(serde::de::Error::custom)
             }
         }
     };

@@ -211,11 +211,11 @@ mod tests {
     use crate::repo_state::{AttributionResult, PlanTouchKind};
 
     fn sha(s: &str) -> CommitSha {
-        CommitSha::from(s.to_string())
+        CommitSha::parse(s).unwrap_or_else(|e| panic!("invalid test SHA {s:?}: {e}"))
     }
 
     fn sess(s: &str) -> PlanKey {
-        PlanKey::from(s.to_string())
+        PlanKey::parse(s).unwrap()
     }
 
     fn plan_file(stem: &str, intro: &str, parent: Option<&str>, body: &str) -> PlanFileBlob {
@@ -253,7 +253,7 @@ mod tests {
             parsed: FeedbackPath {
                 plan_key: sess(session),
                 target_sha: sha(target),
-                author: AgentLabel::from(author.to_string()),
+                author: AgentLabel::parse(author).unwrap(),
                 raw: PathBuf::from(format!("{session}/commits/{target}/{author}.md")),
             },
             body: body.to_string(),
@@ -272,8 +272,8 @@ mod tests {
     #[test]
     fn single_plan_creates_session_with_hash_and_intro() {
         let snap = DiskSnapshot {
-            head: Some(sha("aaa")),
-            plan_files: vec![plan_file("foo", "intro1", Some("parent1"), "# foo\n")],
+            head: Some(sha("aaaa")),
+            plan_files: vec![plan_file("foo", "1231", Some("9991"), "# foo\n")],
             history: vec![],
             feedback_files: vec![],
             commit_meta: BTreeMap::new(),
@@ -282,20 +282,20 @@ mod tests {
         let s = &state.plans[&sess("foo")];
         assert_eq!(s.body, "# foo\n");
         assert_eq!(s.body_hash, content_hash("# foo\n"));
-        assert_eq!(s.plan_intro, sha("intro1"));
-        assert_eq!(s.plan_intro_parent, Some(sha("parent1")));
+        assert_eq!(s.plan_intro, sha("1231"));
+        assert_eq!(s.plan_intro_parent, Some(sha("9991")));
         assert_eq!(s.plan_path, PathBuf::from(".trinity/plans/foo.md"));
     }
 
     #[test]
     fn linear_history_attributes_per_walk_back_rules() {
         let snap = DiskSnapshot {
-            head: Some(sha("c3")),
-            plan_files: vec![plan_file("foo", "c1", None, "# foo\n")],
+            head: Some(sha("c3c3")),
+            plan_files: vec![plan_file("foo", "c1c1", None, "# foo\n")],
             history: vec![
-                entry("c1", vec![touch("foo", PlanTouchKind::Intro)], false),
-                entry("c2", vec![], true),
-                entry("c3", vec![], true),
+                entry("c1c1", vec![touch("foo", PlanTouchKind::Intro)], false),
+                entry("c2c2", vec![], true),
+                entry("c3c3", vec![], true),
             ],
             feedback_files: vec![],
             commit_meta: BTreeMap::new(),
@@ -303,14 +303,14 @@ mod tests {
         let state = derive_state(PathBuf::from("/r"), snap);
         // c1: plan intro for foo
         assert!(matches!(
-            state.attribution[&sha("c1")],
+            state.attribution[&sha("c1c1")],
             AttributionResult::Attributed {
                 plan_touch: Some(PlanTouchKind::Intro),
                 ..
             }
         ));
         // c2 + c3: walk-back inherit foo
-        for c in ["c2", "c3"] {
+        for c in ["c2c2", "c3c3"] {
             match &state.attribution[&sha(c)] {
                 AttributionResult::Attributed {
                     session,
@@ -325,22 +325,22 @@ mod tests {
     #[test]
     fn multi_plan_commit_is_unattributed_and_descendants_walk_through() {
         let snap = DiskSnapshot {
-            head: Some(sha("c3")),
+            head: Some(sha("c3c3")),
             plan_files: vec![
-                plan_file("a", "c1", None, "# a\n"),
-                plan_file("b", "c2", Some("c1"), "# b\n"),
+                plan_file("a", "c1c1", None, "# a\n"),
+                plan_file("b", "c2c2", Some("c1c1"), "# b\n"),
             ],
             history: vec![
-                entry("c1", vec![touch("a", PlanTouchKind::Intro)], false),
+                entry("c1c1", vec![touch("a", PlanTouchKind::Intro)], false),
                 entry(
-                    "c2",
+                    "c2c2",
                     vec![
                         touch("a", PlanTouchKind::Revision),
                         touch("b", PlanTouchKind::Intro),
                     ],
                     false,
                 ),
-                entry("c3", vec![], true),
+                entry("c3c3", vec![], true),
             ],
             feedback_files: vec![],
             commit_meta: BTreeMap::new(),
@@ -348,11 +348,11 @@ mod tests {
         let state = derive_state(PathBuf::from("/r"), snap);
         // c2 is multi-plan → unattributed.
         assert_eq!(
-            state.attribution[&sha("c2")],
+            state.attribution[&sha("c2c2")],
             AttributionResult::Unattributed
         );
         // c3 walks back through c2 transparently → attributes to a.
-        match &state.attribution[&sha("c3")] {
+        match &state.attribution[&sha("c3c3")] {
             AttributionResult::Attributed {
                 session,
                 plan_touch: None,
@@ -364,19 +364,23 @@ mod tests {
 
     #[test]
     fn multi_plan_touches_still_count_as_each_sessions_plan_revision() {
-        let mut done = plan_file("done-one", "c1", None, "# done\n");
+        let mut done = plan_file("done-one", "c1c1", None, "# done\n");
         done.plan_path = PathBuf::from(".trinity/plans/done/done-one.md");
         let snap = DiskSnapshot {
-            head: Some(sha("c3")),
+            head: Some(sha("c3c3")),
             plan_files: vec![
                 done,
-                plan_file("active-one", "c2", Some("c1"), "# active v2\n"),
+                plan_file("active-one", "c2c2", Some("c1c1"), "# active v2\n"),
             ],
             history: vec![
-                entry("c1", vec![touch("done-one", PlanTouchKind::Intro)], false),
-                entry("c2", vec![touch("active-one", PlanTouchKind::Intro)], false),
+                entry("c1c1", vec![touch("done-one", PlanTouchKind::Intro)], false),
                 entry(
-                    "c3",
+                    "c2c2",
+                    vec![touch("active-one", PlanTouchKind::Intro)],
+                    false,
+                ),
+                entry(
+                    "c3c3",
                     vec![
                         touch("done-one", PlanTouchKind::DoneMove),
                         touch("active-one", PlanTouchKind::Revision),
@@ -393,30 +397,34 @@ mod tests {
         // multi-plan commits, but each touched plan sees its own lifecycle
         // event for review targets and timeline rendering.
         assert_eq!(
-            state.attribution[&sha("c3")],
+            state.attribution[&sha("c3c3")],
             AttributionResult::Unattributed
         );
         assert_eq!(
             crate::projection::all_plan_revisions(&state.plans[&sess("done-one")], &state),
-            vec![sha("c1"), sha("c3")]
+            vec![sha("c1c1"), sha("c3c3")]
         );
         assert_eq!(
             crate::projection::all_plan_revisions(&state.plans[&sess("active-one")], &state),
-            vec![sha("c2"), sha("c3")]
+            vec![sha("c2c2"), sha("c3c3")]
         );
     }
 
     #[test]
     fn mixed_commit_carries_both_plan_touch_and_code() {
         let snap = DiskSnapshot {
-            head: Some(sha("c1")),
-            plan_files: vec![plan_file("foo", "c1", None, "# foo\n")],
-            history: vec![entry("c1", vec![touch("foo", PlanTouchKind::Intro)], true)],
+            head: Some(sha("c1c1")),
+            plan_files: vec![plan_file("foo", "c1c1", None, "# foo\n")],
+            history: vec![entry(
+                "c1c1",
+                vec![touch("foo", PlanTouchKind::Intro)],
+                true,
+            )],
             feedback_files: vec![],
             commit_meta: BTreeMap::new(),
         };
         let state = derive_state(PathBuf::from("/r"), snap);
-        match &state.attribution[&sha("c1")] {
+        match &state.attribution[&sha("c1c1")] {
             AttributionResult::Attributed {
                 plan_touch: Some(PlanTouchKind::Intro),
                 has_code_changes: true,
@@ -429,20 +437,24 @@ mod tests {
     #[test]
     fn feedback_with_target_sha_lands_in_phase_map() {
         let snap = DiskSnapshot {
-            head: Some(sha("c1")),
-            plan_files: vec![plan_file("foo", "c1", None, "# foo\n")],
-            history: vec![entry("c1", vec![touch("foo", PlanTouchKind::Intro)], false)],
-            feedback_files: vec![feedback("foo", "c1", "alice", "APPROVE\n")],
+            head: Some(sha("c1c1")),
+            plan_files: vec![plan_file("foo", "c1c1", None, "# foo\n")],
+            history: vec![entry(
+                "c1c1",
+                vec![touch("foo", PlanTouchKind::Intro)],
+                false,
+            )],
+            feedback_files: vec![feedback("foo", "c1c1", "alice", "APPROVE\n")],
             commit_meta: BTreeMap::new(),
         };
         let state = derive_state(PathBuf::from("/r"), snap);
         let gate = state.plans[&sess("foo")]
             .commits
-            .get(&sha("c1"))
+            .get(&sha("c1c1"))
             .expect("gate for c1");
         let entry = gate
             .feedback
-            .get(&AgentLabel::from("alice".to_string()))
+            .get(&AgentLabel::parse("alice").unwrap())
             .expect("alice's feedback on c1");
         assert_eq!(entry.verdict, crate::repo_state::Verdict::Approve);
     }
@@ -454,10 +466,10 @@ mod tests {
     #[test]
     fn feedback_for_unknown_session_is_dropped() {
         let snap = DiskSnapshot {
-            head: Some(sha("c1")),
+            head: Some(sha("c1c1")),
             plan_files: vec![],
             history: vec![],
-            feedback_files: vec![feedback("ghost", "c1", "alice", "APPROVE\n")],
+            feedback_files: vec![feedback("ghost", "c1c1", "alice", "APPROVE\n")],
             commit_meta: BTreeMap::new(),
         };
         let state = derive_state(PathBuf::from("/r"), snap);
@@ -466,10 +478,10 @@ mod tests {
 
     #[test]
     fn session_in_done_subdir_uses_done_path() {
-        let mut pf = plan_file("foo", "c1", None, "# foo\n");
+        let mut pf = plan_file("foo", "c1c1", None, "# foo\n");
         pf.plan_path = PathBuf::from(".trinity/plans/done/foo.md");
         let snap = DiskSnapshot {
-            head: Some(sha("c2")),
+            head: Some(sha("c2c2")),
             plan_files: vec![pf],
             history: vec![],
             feedback_files: vec![],
@@ -485,15 +497,15 @@ mod tests {
     #[test]
     fn root_with_no_plan_touch_is_unattributed() {
         let snap = DiskSnapshot {
-            head: Some(sha("c1")),
+            head: Some(sha("c1c1")),
             plan_files: vec![],
-            history: vec![entry("c1", vec![], true)],
+            history: vec![entry("c1c1", vec![], true)],
             feedback_files: vec![],
             commit_meta: BTreeMap::new(),
         };
         let state = derive_state(PathBuf::from("/r"), snap);
         assert_eq!(
-            state.attribution[&sha("c1")],
+            state.attribution[&sha("c1c1")],
             AttributionResult::Unattributed
         );
     }
@@ -512,7 +524,7 @@ mod tests {
     fn digest_changes_when_head_changes() {
         let base = full_workflow_snapshot();
         let mut alt = base.clone();
-        alt.head = Some(sha("different"));
+        alt.head = Some(sha("dffd"));
         assert_ne!(
             derive_state(PathBuf::from("/r"), base).digest(),
             derive_state(PathBuf::from("/r"), alt).digest()
@@ -539,7 +551,7 @@ mod tests {
     fn digest_changes_when_attribution_grows() {
         let base = full_workflow_snapshot();
         let mut alt = base.clone();
-        alt.history.push(entry("new_impl", vec![], true));
+        alt.history.push(entry("0099", vec![], true));
         assert_ne!(
             derive_state(PathBuf::from("/r"), base).digest(),
             derive_state(PathBuf::from("/r"), alt).digest()
@@ -550,7 +562,8 @@ mod tests {
     fn digest_changes_when_a_new_session_lands() {
         let base = full_workflow_snapshot();
         let mut alt = base.clone();
-        alt.plan_files.push(plan_file("bar", "b1", None, "# bar\n"));
+        alt.plan_files
+            .push(plan_file("bar", "b1b1", None, "# bar\n"));
         assert_ne!(
             derive_state(PathBuf::from("/r"), base).digest(),
             derive_state(PathBuf::from("/r"), alt).digest()
@@ -586,18 +599,18 @@ mod tests {
         let foo = &state.plans[&sess("foo")];
         // Plan APPROVE from alice on c1, impl REQUEST_CHANGES from bob on c2.
         // Both now stored under Plan.commits keyed by their SHA.
-        assert_eq!(foo.commits[&sha("c1")].feedback.len(), 1);
-        assert_eq!(foo.commits[&sha("c2")].feedback.len(), 1);
+        assert_eq!(foo.commits[&sha("c1c1")].feedback.len(), 1);
+        assert_eq!(foo.commits[&sha("c2c2")].feedback.len(), 1);
         // Attribution: c1 = plan_intro for foo, c2 = impl commit for foo.
         assert!(matches!(
-            state.attribution[&sha("c1")],
+            state.attribution[&sha("c1c1")],
             AttributionResult::Attributed {
                 plan_touch: Some(PlanTouchKind::Intro),
                 ..
             }
         ));
         assert!(matches!(
-            state.attribution[&sha("c2")],
+            state.attribution[&sha("c2c2")],
             AttributionResult::Attributed {
                 plan_touch: None,
                 has_code_changes: true,
@@ -612,37 +625,37 @@ mod tests {
         // (it stays attached to its target SHA); the gate logic at the
         // mcp_response layer is what filters it out for the current gate.
         let snap = DiskSnapshot {
-            head: Some(sha("c3")),
-            plan_files: vec![plan_file("foo", "c1", None, "# v1\n")],
+            head: Some(sha("c3c3")),
+            plan_files: vec![plan_file("foo", "c1c1", None, "# v1\n")],
             history: vec![
-                entry("c1", vec![touch("foo", PlanTouchKind::Intro)], false),
-                entry("c2", vec![touch("foo", PlanTouchKind::Revision)], false),
-                entry("c3", vec![], true),
+                entry("c1c1", vec![touch("foo", PlanTouchKind::Intro)], false),
+                entry("c2c2", vec![touch("foo", PlanTouchKind::Revision)], false),
+                entry("c3c3", vec![], true),
             ],
             // stale: c2 is the latest plan rev now
-            feedback_files: vec![feedback("foo", "c1", "alice", "APPROVE\n")],
+            feedback_files: vec![feedback("foo", "c1c1", "alice", "APPROVE\n")],
             commit_meta: BTreeMap::new(),
         };
         let state = derive_state(PathBuf::from("/r"), snap);
         let foo = &state.plans[&sess("foo")];
         // Stale feedback keeps its target SHA — now stored on the
         // gate for c1, not on a hypothetical "latest" gate.
-        let stale_gate = foo.commits.get(&sha("c1")).expect("gate for c1");
+        let stale_gate = foo.commits.get(&sha("c1c1")).expect("gate for c1");
         assert_eq!(stale_gate.feedback.len(), 1);
     }
 
     #[test]
     fn many_plans_one_repo() {
         let snap = DiskSnapshot {
-            head: Some(sha("c3")),
+            head: Some(sha("c3c3")),
             plan_files: vec![
-                plan_file("alpha", "c1", None, "# alpha\n"),
-                plan_file("beta", "c2", Some("c1"), "# beta\n"),
+                plan_file("alpha", "c1c1", None, "# alpha\n"),
+                plan_file("beta", "c2c2", Some("c1c1"), "# beta\n"),
             ],
             history: vec![
-                entry("c1", vec![touch("alpha", PlanTouchKind::Intro)], false),
-                entry("c2", vec![touch("beta", PlanTouchKind::Intro)], false),
-                entry("c3", vec![], true),
+                entry("c1c1", vec![touch("alpha", PlanTouchKind::Intro)], false),
+                entry("c2c2", vec![touch("beta", PlanTouchKind::Intro)], false),
+                entry("c3c3", vec![], true),
             ],
             feedback_files: vec![],
             commit_meta: BTreeMap::new(),
@@ -650,7 +663,7 @@ mod tests {
         let state = derive_state(PathBuf::from("/r"), snap);
         assert_eq!(state.plans.len(), 2);
         // c3 walks back through c2 (beta's intro), so attributes to beta.
-        match &state.attribution[&sha("c3")] {
+        match &state.attribution[&sha("c3c3")] {
             AttributionResult::Attributed { session, .. } => assert_eq!(session, &sess("beta")),
             other => panic!("c3 unexpected: {other:?}"),
         }
@@ -660,16 +673,16 @@ mod tests {
     fn done_session_keeps_plan_revisions_and_impl_commits() {
         // After moving to plans/done/, the session is still present;
         // historical commits remain attributed.
-        let mut pf = plan_file("foo", "c1", None, "# foo\n");
+        let mut pf = plan_file("foo", "c1c1", None, "# foo\n");
         pf.plan_path = PathBuf::from(".trinity/plans/done/foo.md");
         let snap = DiskSnapshot {
-            head: Some(sha("c4")),
+            head: Some(sha("c4c4")),
             plan_files: vec![pf],
             history: vec![
-                entry("c1", vec![touch("foo", PlanTouchKind::Intro)], false),
-                entry("c2", vec![], true),
-                entry("c3", vec![], true),
-                entry("c4", vec![touch("foo", PlanTouchKind::DoneMove)], false),
+                entry("c1c1", vec![touch("foo", PlanTouchKind::Intro)], false),
+                entry("c2c2", vec![], true),
+                entry("c3c3", vec![], true),
+                entry("c4c4", vec![touch("foo", PlanTouchKind::DoneMove)], false),
             ],
             feedback_files: vec![],
             commit_meta: BTreeMap::new(),
@@ -709,9 +722,13 @@ mod tests {
     #[test]
     fn empty_body_plan_file_still_creates_session() {
         let snap = DiskSnapshot {
-            head: Some(sha("c1")),
-            plan_files: vec![plan_file("foo", "c1", None, "")],
-            history: vec![entry("c1", vec![touch("foo", PlanTouchKind::Intro)], false)],
+            head: Some(sha("c1c1")),
+            plan_files: vec![plan_file("foo", "c1c1", None, "")],
+            history: vec![entry(
+                "c1c1",
+                vec![touch("foo", PlanTouchKind::Intro)],
+                false,
+            )],
             feedback_files: vec![],
             commit_meta: BTreeMap::new(),
         };
@@ -726,35 +743,35 @@ mod tests {
         // the plan-intro commit lands later, the session still gets
         // attribution for that and subsequent walks.
         let snap = DiskSnapshot {
-            head: Some(sha("c4")),
-            plan_files: vec![plan_file("foo", "c3", Some("c2"), "# foo\n")],
+            head: Some(sha("c4c4")),
+            plan_files: vec![plan_file("foo", "c3c3", Some("c2c2"), "# foo\n")],
             history: vec![
-                entry("c1", vec![], true),
-                entry("c2", vec![], true),
-                entry("c3", vec![touch("foo", PlanTouchKind::Intro)], false),
-                entry("c4", vec![], true),
+                entry("c1c1", vec![], true),
+                entry("c2c2", vec![], true),
+                entry("c3c3", vec![touch("foo", PlanTouchKind::Intro)], false),
+                entry("c4c4", vec![], true),
             ],
             feedback_files: vec![],
             commit_meta: BTreeMap::new(),
         };
         let state = derive_state(PathBuf::from("/r"), snap);
         assert_eq!(
-            state.attribution[&sha("c1")],
+            state.attribution[&sha("c1c1")],
             AttributionResult::Unattributed
         );
         assert_eq!(
-            state.attribution[&sha("c2")],
+            state.attribution[&sha("c2c2")],
             AttributionResult::Unattributed
         );
         assert!(matches!(
-            state.attribution[&sha("c3")],
+            state.attribution[&sha("c3c3")],
             AttributionResult::Attributed {
                 plan_touch: Some(PlanTouchKind::Intro),
                 ..
             }
         ));
         assert!(matches!(
-            state.attribution[&sha("c4")],
+            state.attribution[&sha("c4c4")],
             AttributionResult::Attributed {
                 plan_touch: None,
                 has_code_changes: true,
@@ -774,12 +791,12 @@ mod tests {
     #[test]
     fn timeline_walks_commits_chronologically() {
         let snap = DiskSnapshot {
-            head: Some(sha("c3")),
-            plan_files: vec![plan_file("foo", "c1", None, "# foo\n")],
+            head: Some(sha("c3c3")),
+            plan_files: vec![plan_file("foo", "c1c1", None, "# foo\n")],
             history: vec![
-                entry("c1", vec![touch("foo", PlanTouchKind::Intro)], false),
-                entry("c2", vec![], true),
-                entry("c3", vec![], true),
+                entry("c1c1", vec![touch("foo", PlanTouchKind::Intro)], false),
+                entry("c2c2", vec![], true),
+                entry("c3c3", vec![], true),
             ],
             feedback_files: vec![],
             commit_meta: BTreeMap::new(),
@@ -787,23 +804,27 @@ mod tests {
         let state = derive_state(PathBuf::from("/r"), snap);
         let timeline = state.timeline_for(&sess("foo"));
         // Three commit events, in c1 → c2 → c3 order (not BTreeMap SHA-lex).
-        let shas: Vec<&str> = timeline
+        let shas: Vec<CommitSha> = timeline
             .iter()
             .filter_map(|e| match e {
-                crate::repo_state::TimelineEvent::Commit { sha, .. } => Some(sha.as_str()),
+                crate::repo_state::TimelineEvent::Commit { sha, .. } => Some(sha.clone()),
                 _ => None,
             })
             .collect();
-        assert_eq!(shas, vec!["c1", "c2", "c3"]);
+        assert_eq!(shas, vec![sha("c1c1"), sha("c2c2"), sha("c3c3")]);
     }
 
     #[test]
     fn timeline_attaches_plan_review_after_target_commit() {
         let snap = DiskSnapshot {
-            head: Some(sha("c1")),
-            plan_files: vec![plan_file("foo", "c1", None, "# foo\n")],
-            history: vec![entry("c1", vec![touch("foo", PlanTouchKind::Intro)], false)],
-            feedback_files: vec![feedback("foo", "c1", "alice", "APPROVE\n")],
+            head: Some(sha("c1c1")),
+            plan_files: vec![plan_file("foo", "c1c1", None, "# foo\n")],
+            history: vec![entry(
+                "c1c1",
+                vec![touch("foo", PlanTouchKind::Intro)],
+                false,
+            )],
+            feedback_files: vec![feedback("foo", "c1c1", "alice", "APPROVE\n")],
             commit_meta: BTreeMap::new(),
         };
         let state = derive_state(PathBuf::from("/r"), snap);
@@ -834,13 +855,13 @@ mod tests {
     #[test]
     fn timeline_attaches_impl_review_after_target_commit() {
         let snap = DiskSnapshot {
-            head: Some(sha("c2")),
-            plan_files: vec![plan_file("foo", "c1", None, "# foo\n")],
+            head: Some(sha("c2c2")),
+            plan_files: vec![plan_file("foo", "c1c1", None, "# foo\n")],
             history: vec![
-                entry("c1", vec![touch("foo", PlanTouchKind::Intro)], false),
-                entry("c2", vec![], true),
+                entry("c1c1", vec![touch("foo", PlanTouchKind::Intro)], false),
+                entry("c2c2", vec![], true),
             ],
-            feedback_files: vec![feedback("foo", "c2", "bob", "REQUEST_CHANGES\nproblem\n")],
+            feedback_files: vec![feedback("foo", "c2c2", "bob", "REQUEST_CHANGES\nproblem\n")],
             commit_meta: BTreeMap::new(),
         };
         let state = derive_state(PathBuf::from("/r"), snap);
@@ -855,7 +876,7 @@ mod tests {
                 verdict,
             } => {
                 assert_eq!(*phase, crate::repo_state::TimelinePhase::Impl);
-                assert_eq!(target.as_str(), "c2");
+                assert_eq!(target, &sha("c2c2"));
                 assert_eq!(author.as_str(), "bob");
                 assert_eq!(*verdict, crate::repo_state::Verdict::RequestChanges);
             }
@@ -869,88 +890,92 @@ mod tests {
         // ownership, but each touched plan still gets its plan-touch event
         // in its own timeline.
         let snap = DiskSnapshot {
-            head: Some(sha("c3")),
+            head: Some(sha("c3c3")),
             plan_files: vec![
-                plan_file("foo", "c1", None, "# foo\n"),
-                plan_file("bar", "c2", Some("c1"), "# bar\n"),
+                plan_file("foo", "c1c1", None, "# foo\n"),
+                plan_file("bar", "c2c2", Some("c1c1"), "# bar\n"),
             ],
             history: vec![
-                entry("c1", vec![touch("foo", PlanTouchKind::Intro)], false),
+                entry("c1c1", vec![touch("foo", PlanTouchKind::Intro)], false),
                 entry(
-                    "c2",
+                    "c2c2",
                     vec![
                         touch("foo", PlanTouchKind::Revision),
                         touch("bar", PlanTouchKind::Intro),
                     ],
                     false,
                 ),
-                entry("c3", vec![], true),
+                entry("c3c3", vec![], true),
             ],
             feedback_files: vec![],
             commit_meta: BTreeMap::new(),
         };
         let state = derive_state(PathBuf::from("/r"), snap);
         let foo_timeline = state.timeline_for(&sess("foo"));
-        let shas: Vec<&str> = foo_timeline
+        let shas: Vec<CommitSha> = foo_timeline
             .iter()
             .filter_map(|e| match e {
-                crate::repo_state::TimelineEvent::Commit { sha, .. } => Some(sha.as_str()),
+                crate::repo_state::TimelineEvent::Commit { sha, .. } => Some(sha.clone()),
                 _ => None,
             })
             .collect();
         // c1 (foo intro) yes; c2 (multi-plan foo revision) yes; c3
         // walks through c2 transparently and attributes implementation to
         // foo, so yes.
-        assert_eq!(shas, vec!["c1", "c2", "c3"]);
+        assert_eq!(shas, vec![sha("c1c1"), sha("c2c2"), sha("c3c3")]);
     }
 
     #[test]
     fn timeline_only_includes_target_session() {
         let snap = DiskSnapshot {
-            head: Some(sha("c3")),
+            head: Some(sha("c3c3")),
             plan_files: vec![
-                plan_file("a", "c1", None, "# a\n"),
-                plan_file("b", "c2", Some("c1"), "# b\n"),
+                plan_file("a", "c1c1", None, "# a\n"),
+                plan_file("b", "c2c2", Some("c1c1"), "# b\n"),
             ],
             history: vec![
-                entry("c1", vec![touch("a", PlanTouchKind::Intro)], false),
-                entry("c2", vec![touch("b", PlanTouchKind::Intro)], false),
-                entry("c3", vec![], true),
+                entry("c1c1", vec![touch("a", PlanTouchKind::Intro)], false),
+                entry("c2c2", vec![touch("b", PlanTouchKind::Intro)], false),
+                entry("c3c3", vec![], true),
             ],
             feedback_files: vec![],
             commit_meta: BTreeMap::new(),
         };
         let state = derive_state(PathBuf::from("/r"), snap);
         let a_tl = state.timeline_for(&sess("a"));
-        let a_shas: Vec<&str> = a_tl
+        let a_shas: Vec<CommitSha> = a_tl
             .iter()
             .filter_map(|e| match e {
-                crate::repo_state::TimelineEvent::Commit { sha, .. } => Some(sha.as_str()),
+                crate::repo_state::TimelineEvent::Commit { sha, .. } => Some(sha.clone()),
                 _ => None,
             })
             .collect();
         let b_tl = state.timeline_for(&sess("b"));
-        let b_shas: Vec<&str> = b_tl
+        let b_shas: Vec<CommitSha> = b_tl
             .iter()
             .filter_map(|e| match e {
-                crate::repo_state::TimelineEvent::Commit { sha, .. } => Some(sha.as_str()),
+                crate::repo_state::TimelineEvent::Commit { sha, .. } => Some(sha.clone()),
                 _ => None,
             })
             .collect();
-        assert_eq!(a_shas, vec!["c1"]);
+        assert_eq!(a_shas, vec![sha("c1c1")]);
         // b owns c2 (intro) and c3 (walks back through b).
-        assert_eq!(b_shas, vec!["c2", "c3"]);
+        assert_eq!(b_shas, vec![sha("c2c2"), sha("c3c3")]);
     }
 
     #[test]
     fn timeline_multiple_reviews_on_one_commit() {
         let snap = DiskSnapshot {
-            head: Some(sha("c1")),
-            plan_files: vec![plan_file("foo", "c1", None, "# foo\n")],
-            history: vec![entry("c1", vec![touch("foo", PlanTouchKind::Intro)], false)],
+            head: Some(sha("c1c1")),
+            plan_files: vec![plan_file("foo", "c1c1", None, "# foo\n")],
+            history: vec![entry(
+                "c1c1",
+                vec![touch("foo", PlanTouchKind::Intro)],
+                false,
+            )],
             feedback_files: vec![
-                feedback("foo", "c1", "alice", "APPROVE\n"),
-                feedback("foo", "c1", "bob", "REQUEST_CHANGES\n"),
+                feedback("foo", "c1c1", "alice", "APPROVE\n"),
+                feedback("foo", "c1c1", "bob", "REQUEST_CHANGES\n"),
             ],
             commit_meta: BTreeMap::new(),
         };
@@ -984,10 +1009,10 @@ mod tests {
     #[test]
     fn same_stem_active_and_done_lands_in_plan_conflicts() {
         let snap = DiskSnapshot {
-            head: Some(sha("c2")),
+            head: Some(sha("c2c2")),
             plan_files: vec![
-                plan_file("foo", "c1", None, "# active\n"),
-                done_plan_file("foo", "c2", "# done\n"),
+                plan_file("foo", "c1c1", None, "# active\n"),
+                done_plan_file("foo", "c2c2", "# done\n"),
             ],
             history: vec![],
             feedback_files: vec![],
@@ -1011,15 +1036,15 @@ mod tests {
     /// plus alice's APPROVE on c1 (plan) and bob's REQUEST_CHANGES on c2 (impl).
     fn full_workflow_snapshot() -> DiskSnapshot {
         DiskSnapshot {
-            head: Some(sha("c2")),
-            plan_files: vec![plan_file("foo", "c1", None, "# foo\n")],
+            head: Some(sha("c2c2")),
+            plan_files: vec![plan_file("foo", "c1c1", None, "# foo\n")],
             history: vec![
-                entry("c1", vec![touch("foo", PlanTouchKind::Intro)], false),
-                entry("c2", vec![], true),
+                entry("c1c1", vec![touch("foo", PlanTouchKind::Intro)], false),
+                entry("c2c2", vec![], true),
             ],
             feedback_files: vec![
-                feedback("foo", "c1", "alice", "APPROVE\n"),
-                feedback("foo", "c2", "bob", "REQUEST_CHANGES\nstuff\n"),
+                feedback("foo", "c1c1", "alice", "APPROVE\n"),
+                feedback("foo", "c2c2", "bob", "REQUEST_CHANGES\nstuff\n"),
             ],
             commit_meta: BTreeMap::new(),
         }

@@ -714,13 +714,15 @@ mod tests {
     use std::path::PathBuf;
 
     fn hash(s: &str) -> ContentHash {
-        ContentHash::from(format!("h:{s}"))
+        // Test helper: hashes the input via blake3 to a valid
+        // ContentHash. Matches the production content_hash() shape.
+        crate::lifecycle::content_hash(s)
     }
 
     fn agents(labels: &[&str]) -> Vec<AgentLabel> {
         labels
             .iter()
-            .map(|s| AgentLabel::from(s.to_string()))
+            .map(|s| AgentLabel::parse(s).unwrap())
             .collect()
     }
 
@@ -947,71 +949,71 @@ mod tests {
     // -------- plan_path_at --------
 
     fn cs(s: &str) -> CommitSha {
-        CommitSha::from(s)
+        CommitSha::parse(s).unwrap_or_else(|e| panic!("invalid test SHA {s:?}: {e}"))
     }
 
     fn pk(s: &str) -> PlanKey {
-        PlanKey::from(s)
+        PlanKey::parse(s).unwrap_or_else(|e| panic!("invalid PlanKey test literal {s:?}: {e}"))
     }
 
     #[test]
     fn plan_path_at_returns_active_before_any_done_move() {
-        let order = vec![cs("c1"), cs("c2")];
+        let order = vec![cs("c1c1"), cs("c2c2")];
         let mut touches: BTreeMap<CommitSha, Vec<(PlanKey, PlanTouchKind)>> = BTreeMap::new();
-        touches.insert(cs("c1"), vec![(pk("foo"), PlanTouchKind::Intro)]);
-        touches.insert(cs("c2"), vec![(pk("foo"), PlanTouchKind::Revision)]);
-        let p = plan_path_at(&pk("foo"), &cs("c2"), &order, &touches).unwrap();
+        touches.insert(cs("c1c1"), vec![(pk("foo"), PlanTouchKind::Intro)]);
+        touches.insert(cs("c2c2"), vec![(pk("foo"), PlanTouchKind::Revision)]);
+        let p = plan_path_at(&pk("foo"), &cs("c2c2"), &order, &touches).unwrap();
         assert_eq!(p, PathBuf::from(".trinity/plans/foo.md"));
     }
 
     #[test]
     fn plan_path_at_flips_to_done_at_done_move_commit() {
-        let order = vec![cs("c1"), cs("c2"), cs("c3")];
+        let order = vec![cs("c1c1"), cs("c2c2"), cs("c3c3")];
         let mut touches: BTreeMap<CommitSha, Vec<(PlanKey, PlanTouchKind)>> = BTreeMap::new();
-        touches.insert(cs("c1"), vec![(pk("foo"), PlanTouchKind::Intro)]);
-        touches.insert(cs("c3"), vec![(pk("foo"), PlanTouchKind::DoneMove)]);
+        touches.insert(cs("c1c1"), vec![(pk("foo"), PlanTouchKind::Intro)]);
+        touches.insert(cs("c3c3"), vec![(pk("foo"), PlanTouchKind::DoneMove)]);
 
         assert_eq!(
-            plan_path_at(&pk("foo"), &cs("c1"), &order, &touches).unwrap(),
+            plan_path_at(&pk("foo"), &cs("c1c1"), &order, &touches).unwrap(),
             PathBuf::from(".trinity/plans/foo.md"),
         );
         assert_eq!(
-            plan_path_at(&pk("foo"), &cs("c2"), &order, &touches).unwrap(),
+            plan_path_at(&pk("foo"), &cs("c2c2"), &order, &touches).unwrap(),
             PathBuf::from(".trinity/plans/foo.md"),
         );
         assert_eq!(
-            plan_path_at(&pk("foo"), &cs("c3"), &order, &touches).unwrap(),
+            plan_path_at(&pk("foo"), &cs("c3c3"), &order, &touches).unwrap(),
             PathBuf::from(".trinity/plans/done/foo.md"),
         );
     }
 
     #[test]
     fn plan_path_at_unknown_sha_returns_none() {
-        let order = vec![cs("c1")];
+        let order = vec![cs("c1c1")];
         let touches: BTreeMap<CommitSha, Vec<(PlanKey, PlanTouchKind)>> = BTreeMap::new();
-        assert!(plan_path_at(&pk("foo"), &cs("zzz"), &order, &touches).is_none());
+        assert!(plan_path_at(&pk("foo"), &cs("ffff"), &order, &touches).is_none());
     }
 
     #[test]
     fn plan_path_at_toggles_on_each_done_move() {
         // The producer emits `DoneMove` for either direction. Round-trip
         // (active→done→active) must end at active.
-        let order = vec![cs("c1"), cs("c2"), cs("c3"), cs("c4")];
+        let order = vec![cs("c1c1"), cs("c2c2"), cs("c3c3"), cs("c4c4")];
         let mut touches: BTreeMap<CommitSha, Vec<(PlanKey, PlanTouchKind)>> = BTreeMap::new();
-        touches.insert(cs("c1"), vec![(pk("foo"), PlanTouchKind::Intro)]);
-        touches.insert(cs("c2"), vec![(pk("foo"), PlanTouchKind::DoneMove)]);
-        touches.insert(cs("c4"), vec![(pk("foo"), PlanTouchKind::DoneMove)]);
+        touches.insert(cs("c1c1"), vec![(pk("foo"), PlanTouchKind::Intro)]);
+        touches.insert(cs("c2c2"), vec![(pk("foo"), PlanTouchKind::DoneMove)]);
+        touches.insert(cs("c4c4"), vec![(pk("foo"), PlanTouchKind::DoneMove)]);
 
         assert_eq!(
-            plan_path_at(&pk("foo"), &cs("c2"), &order, &touches).unwrap(),
+            plan_path_at(&pk("foo"), &cs("c2c2"), &order, &touches).unwrap(),
             PathBuf::from(".trinity/plans/done/foo.md"),
         );
         assert_eq!(
-            plan_path_at(&pk("foo"), &cs("c3"), &order, &touches).unwrap(),
+            plan_path_at(&pk("foo"), &cs("c3c3"), &order, &touches).unwrap(),
             PathBuf::from(".trinity/plans/done/foo.md"),
         );
         assert_eq!(
-            plan_path_at(&pk("foo"), &cs("c4"), &order, &touches).unwrap(),
+            plan_path_at(&pk("foo"), &cs("c4c4"), &order, &touches).unwrap(),
             PathBuf::from(".trinity/plans/foo.md"),
             "second DoneMove (done→active) must toggle back to active",
         );
@@ -1019,12 +1021,12 @@ mod tests {
 
     #[test]
     fn plan_path_at_ignores_other_plans_done_move() {
-        let order = vec![cs("c1"), cs("c2")];
+        let order = vec![cs("c1c1"), cs("c2c2")];
         let mut touches: BTreeMap<CommitSha, Vec<(PlanKey, PlanTouchKind)>> = BTreeMap::new();
-        touches.insert(cs("c1"), vec![(pk("foo"), PlanTouchKind::Intro)]);
-        touches.insert(cs("c2"), vec![(pk("bar"), PlanTouchKind::DoneMove)]);
+        touches.insert(cs("c1c1"), vec![(pk("foo"), PlanTouchKind::Intro)]);
+        touches.insert(cs("c2c2"), vec![(pk("bar"), PlanTouchKind::DoneMove)]);
         assert_eq!(
-            plan_path_at(&pk("foo"), &cs("c2"), &order, &touches).unwrap(),
+            plan_path_at(&pk("foo"), &cs("c2c2"), &order, &touches).unwrap(),
             PathBuf::from(".trinity/plans/foo.md"),
         );
     }
@@ -1042,7 +1044,7 @@ mod tests {
         let mut feedback = BTreeMap::new();
         for (author, created_at) in items {
             feedback.insert(
-                AgentLabel::from((*author).to_string()),
+                AgentLabel::parse(author).unwrap(),
                 Feedback {
                     path: std::path::PathBuf::from("/fake"),
                     body: String::new(),
@@ -1065,14 +1067,14 @@ mod tests {
     #[test]
     fn last_activity_ts_only_intro_commit_uses_intro_ts() {
         let mut commit_meta = BTreeMap::new();
-        commit_meta.insert(cs("c1"), meta(1_000, "intro"));
+        commit_meta.insert(cs("c1c1"), meta(1_000, "intro"));
         let mut touches: BTreeMap<CommitSha, Vec<(PlanKey, PlanTouchKind)>> = BTreeMap::new();
-        touches.insert(cs("c1"), vec![(pk("foo"), PlanTouchKind::Intro)]);
+        touches.insert(cs("c1c1"), vec![(pk("foo"), PlanTouchKind::Intro)]);
         let ts = last_activity_ts_for(
             &pk("foo"),
-            &cs("c1"),
+            &cs("c1c1"),
             &BTreeMap::new(),
-            &[cs("c1")],
+            &[cs("c1c1")],
             &touches,
             &BTreeMap::new(),
             &commit_meta,
@@ -1083,18 +1085,18 @@ mod tests {
     #[test]
     fn last_activity_ts_picks_newer_of_commit_or_feedback() {
         let mut commit_meta = BTreeMap::new();
-        commit_meta.insert(cs("c1"), meta(1_000, "intro"));
-        commit_meta.insert(cs("c2"), meta(2_000, "rev"));
+        commit_meta.insert(cs("c1c1"), meta(1_000, "intro"));
+        commit_meta.insert(cs("c2c2"), meta(2_000, "rev"));
         let mut touches: BTreeMap<CommitSha, Vec<(PlanKey, PlanTouchKind)>> = BTreeMap::new();
-        touches.insert(cs("c1"), vec![(pk("foo"), PlanTouchKind::Intro)]);
-        touches.insert(cs("c2"), vec![(pk("foo"), PlanTouchKind::Revision)]);
+        touches.insert(cs("c1c1"), vec![(pk("foo"), PlanTouchKind::Intro)]);
+        touches.insert(cs("c2c2"), vec![(pk("foo"), PlanTouchKind::Revision)]);
         let mut commits = BTreeMap::new();
-        commits.insert(cs("c1"), gate_with_feedback(&[("codex", 3_000)]));
+        commits.insert(cs("c1c1"), gate_with_feedback(&[("codex", 3_000)]));
         let ts = last_activity_ts_for(
             &pk("foo"),
-            &cs("c1"),
+            &cs("c1c1"),
             &commits,
-            &[cs("c1"), cs("c2")],
+            &[cs("c1c1"), cs("c2c2")],
             &touches,
             &BTreeMap::new(),
             &commit_meta,
@@ -1108,16 +1110,16 @@ mod tests {
     #[test]
     fn last_activity_ts_ignores_commits_for_other_plans() {
         let mut commit_meta = BTreeMap::new();
-        commit_meta.insert(cs("c1"), meta(1_000, "foo intro"));
-        commit_meta.insert(cs("c2"), meta(5_000, "bar intro"));
+        commit_meta.insert(cs("c1c1"), meta(1_000, "foo intro"));
+        commit_meta.insert(cs("c2c2"), meta(5_000, "bar intro"));
         let mut touches: BTreeMap<CommitSha, Vec<(PlanKey, PlanTouchKind)>> = BTreeMap::new();
-        touches.insert(cs("c1"), vec![(pk("foo"), PlanTouchKind::Intro)]);
-        touches.insert(cs("c2"), vec![(pk("bar"), PlanTouchKind::Intro)]);
+        touches.insert(cs("c1c1"), vec![(pk("foo"), PlanTouchKind::Intro)]);
+        touches.insert(cs("c2c2"), vec![(pk("bar"), PlanTouchKind::Intro)]);
         let ts = last_activity_ts_for(
             &pk("foo"),
-            &cs("c1"),
+            &cs("c1c1"),
             &BTreeMap::new(),
-            &[cs("c1"), cs("c2")],
+            &[cs("c1c1"), cs("c2c2")],
             &touches,
             &BTreeMap::new(),
             &commit_meta,
@@ -1145,14 +1147,14 @@ mod tests {
     #[test]
     fn commit_kind_plan_only() {
         let mut touches = BTreeMap::new();
-        touches.insert(cs("a"), touches_one("foo", PlanTouchKind::Revision));
+        touches.insert(cs("aaaa"), touches_one("foo", PlanTouchKind::Revision));
         let mut attribution = BTreeMap::new();
         attribution.insert(
-            cs("a"),
+            cs("aaaa"),
             attributed("foo", Some(PlanTouchKind::Revision), false),
         );
         assert_eq!(
-            commit_kind_for(&pk("foo"), &cs("a"), &touches, &attribution),
+            commit_kind_for(&pk("foo"), &cs("aaaa"), &touches, &attribution),
             CommitKind::PlanOnly
         );
     }
@@ -1160,14 +1162,14 @@ mod tests {
     #[test]
     fn commit_kind_mixed_when_plan_touch_plus_code() {
         let mut touches = BTreeMap::new();
-        touches.insert(cs("a"), touches_one("foo", PlanTouchKind::Revision));
+        touches.insert(cs("aaaa"), touches_one("foo", PlanTouchKind::Revision));
         let mut attribution = BTreeMap::new();
         attribution.insert(
-            cs("a"),
+            cs("aaaa"),
             attributed("foo", Some(PlanTouchKind::Revision), true),
         );
         assert_eq!(
-            commit_kind_for(&pk("foo"), &cs("a"), &touches, &attribution),
+            commit_kind_for(&pk("foo"), &cs("aaaa"), &touches, &attribution),
             CommitKind::Mixed
         );
     }
@@ -1178,9 +1180,9 @@ mod tests {
         // an ancestor that touched foo's plan file.
         let touches = BTreeMap::new();
         let mut attribution = BTreeMap::new();
-        attribution.insert(cs("a"), attributed("foo", None, true));
+        attribution.insert(cs("aaaa"), attributed("foo", None, true));
         assert_eq!(
-            commit_kind_for(&pk("foo"), &cs("a"), &touches, &attribution),
+            commit_kind_for(&pk("foo"), &cs("aaaa"), &touches, &attribution),
             CommitKind::CodeOnly
         );
     }
@@ -1190,14 +1192,14 @@ mod tests {
         // Even if the rename commit somehow carries code changes,
         // DoneMove wins for the plan being moved.
         let mut touches = BTreeMap::new();
-        touches.insert(cs("a"), touches_one("foo", PlanTouchKind::DoneMove));
+        touches.insert(cs("aaaa"), touches_one("foo", PlanTouchKind::DoneMove));
         let mut attribution = BTreeMap::new();
         attribution.insert(
-            cs("a"),
+            cs("aaaa"),
             attributed("foo", Some(PlanTouchKind::DoneMove), true),
         );
         assert_eq!(
-            commit_kind_for(&pk("foo"), &cs("a"), &touches, &attribution),
+            commit_kind_for(&pk("foo"), &cs("aaaa"), &touches, &attribution),
             CommitKind::DoneMove
         );
     }
@@ -1208,20 +1210,20 @@ mod tests {
         // both, regardless of attribution.
         let mut touches = BTreeMap::new();
         touches.insert(
-            cs("a"),
+            cs("aaaa"),
             vec![
                 (pk("foo"), PlanTouchKind::Revision),
                 (pk("bar"), PlanTouchKind::Revision),
             ],
         );
         let mut attribution = BTreeMap::new();
-        attribution.insert(cs("a"), AttributionResult::Unattributed);
+        attribution.insert(cs("aaaa"), AttributionResult::Unattributed);
         assert_eq!(
-            commit_kind_for(&pk("foo"), &cs("a"), &touches, &attribution),
+            commit_kind_for(&pk("foo"), &cs("aaaa"), &touches, &attribution),
             CommitKind::MultiPlan
         );
         assert_eq!(
-            commit_kind_for(&pk("bar"), &cs("a"), &touches, &attribution),
+            commit_kind_for(&pk("bar"), &cs("aaaa"), &touches, &attribution),
             CommitKind::MultiPlan
         );
     }
@@ -1230,14 +1232,14 @@ mod tests {
     fn commit_kind_unattributed_for_unrelated_plan() {
         // baz isn't touched and the commit is attributed to foo.
         let mut touches = BTreeMap::new();
-        touches.insert(cs("a"), touches_one("foo", PlanTouchKind::Revision));
+        touches.insert(cs("aaaa"), touches_one("foo", PlanTouchKind::Revision));
         let mut attribution = BTreeMap::new();
         attribution.insert(
-            cs("a"),
+            cs("aaaa"),
             attributed("foo", Some(PlanTouchKind::Revision), false),
         );
         assert_eq!(
-            commit_kind_for(&pk("baz"), &cs("a"), &touches, &attribution),
+            commit_kind_for(&pk("baz"), &cs("aaaa"), &touches, &attribution),
             CommitKind::Unattributed
         );
     }
@@ -1247,7 +1249,7 @@ mod tests {
         let touches = BTreeMap::new();
         let attribution = BTreeMap::new();
         assert_eq!(
-            commit_kind_for(&pk("foo"), &cs("a"), &touches, &attribution),
+            commit_kind_for(&pk("foo"), &cs("aaaa"), &touches, &attribution),
             CommitKind::Unattributed
         );
     }
@@ -1263,9 +1265,9 @@ mod tests {
         // `CodeOnly`.
         let touches = BTreeMap::new();
         let mut attribution = BTreeMap::new();
-        attribution.insert(cs("a"), attributed("foo", None, false));
+        attribution.insert(cs("aaaa"), attributed("foo", None, false));
         assert_eq!(
-            commit_kind_for(&pk("foo"), &cs("a"), &touches, &attribution),
+            commit_kind_for(&pk("foo"), &cs("aaaa"), &touches, &attribution),
             CommitKind::Unattributed
         );
     }
@@ -1282,7 +1284,7 @@ mod tests {
     }
 
     fn al(s: &str) -> AgentLabel {
-        AgentLabel::from(s.to_string())
+        AgentLabel::parse(s).unwrap()
     }
 
     #[test]
@@ -1293,38 +1295,38 @@ mod tests {
         //   → gate(C): participants={codex, alice}, missing={codex},
         //     state=Unreviewed
         let mut touches = BTreeMap::new();
-        touches.insert(cs("a"), touches_one("foo", PlanTouchKind::Intro));
+        touches.insert(cs("aaaa"), touches_one("foo", PlanTouchKind::Intro));
         let mut attribution = BTreeMap::new();
         attribution.insert(
-            cs("a"),
+            cs("aaaa"),
             attributed("foo", Some(PlanTouchKind::Intro), false),
         );
-        attribution.insert(cs("b"), attributed("foo", None, true));
-        attribution.insert(cs("c"), attributed("foo", None, true));
+        attribution.insert(cs("bbbb"), attributed("foo", None, true));
+        attribution.insert(cs("cccc"), attributed("foo", None, true));
         let mut feedback = BTreeMap::new();
-        feedback.insert((cs("a"), al("codex")), feedback_with(Verdict::Approve));
+        feedback.insert((cs("aaaa"), al("codex")), feedback_with(Verdict::Approve));
         feedback.insert(
-            (cs("b"), al("alice")),
+            (cs("bbbb"), al("alice")),
             feedback_with(Verdict::RequestChanges),
         );
-        feedback.insert((cs("c"), al("alice")), feedback_with(Verdict::Approve));
+        feedback.insert((cs("cccc"), al("alice")), feedback_with(Verdict::Approve));
 
         let gates = build_commit_gates(
             &pk("foo"),
-            &[cs("a"), cs("b"), cs("c")],
+            &[cs("aaaa"), cs("bbbb"), cs("cccc")],
             &touches,
             &attribution,
             &feedback,
         );
 
         // gate(A): codex approved, only participant → Approved.
-        let g_a = gates.get(&cs("a")).expect("gate for a");
+        let g_a = gates.get(&cs("aaaa")).expect("gate for a");
         assert_eq!(g_a.state, CommitGateState::Approved);
         assert_eq!(g_a.participants, vec![al("codex")]);
         assert_eq!(g_a.approvers, vec![al("codex")]);
 
         // gate(B): alice requested changes; codex inherits as participant.
-        let g_b = gates.get(&cs("b")).expect("gate for b");
+        let g_b = gates.get(&cs("bbbb")).expect("gate for b");
         assert_eq!(g_b.state, CommitGateState::ChangesRequested);
         assert!(g_b.participants.contains(&al("codex")));
         assert!(g_b.participants.contains(&al("alice")));
@@ -1332,7 +1334,7 @@ mod tests {
         assert_eq!(g_b.missing, vec![al("codex")]);
 
         // gate(C): alice approved; codex missing → Unreviewed.
-        let g_c = gates.get(&cs("c")).expect("gate for c");
+        let g_c = gates.get(&cs("cccc")).expect("gate for c");
         assert_eq!(g_c.state, CommitGateState::Unreviewed);
         assert_eq!(g_c.approvers, vec![al("alice")]);
         assert_eq!(g_c.missing, vec![al("codex")]);
@@ -1343,24 +1345,24 @@ mod tests {
         // codex drops an Unmarked file on commit A → gate is
         // ChangesRequested, not Approved.
         let mut touches = BTreeMap::new();
-        touches.insert(cs("a"), touches_one("foo", PlanTouchKind::Intro));
+        touches.insert(cs("aaaa"), touches_one("foo", PlanTouchKind::Intro));
         let mut attribution = BTreeMap::new();
         attribution.insert(
-            cs("a"),
+            cs("aaaa"),
             attributed("foo", Some(PlanTouchKind::Intro), false),
         );
         let mut plan_feedback = BTreeMap::new();
-        plan_feedback.insert((cs("a"), al("codex")), feedback_with(Verdict::Unmarked));
+        plan_feedback.insert((cs("aaaa"), al("codex")), feedback_with(Verdict::Unmarked));
 
         let gates = build_commit_gates(
             &pk("foo"),
-            &[cs("a")],
+            &[cs("aaaa")],
             &touches,
             &attribution,
             &plan_feedback,
         );
 
-        let g = gates.get(&cs("a")).expect("gate for a");
+        let g = gates.get(&cs("aaaa")).expect("gate for a");
         assert_eq!(g.state, CommitGateState::ChangesRequested);
         assert_eq!(g.ambiguous, vec![al("codex")]);
         assert!(g.approvers.is_empty());
@@ -1372,49 +1374,49 @@ mod tests {
         // Reviewable: a (PlanOnly), c (CodeOnly).
         // Unreviewable: b (MultiPlan), d (DoneMove).
         let mut touches = BTreeMap::new();
-        touches.insert(cs("a"), touches_one("foo", PlanTouchKind::Intro));
+        touches.insert(cs("aaaa"), touches_one("foo", PlanTouchKind::Intro));
         touches.insert(
-            cs("b"),
+            cs("bbbb"),
             vec![
                 (pk("foo"), PlanTouchKind::Revision),
                 (pk("bar"), PlanTouchKind::Revision),
             ],
         );
-        touches.insert(cs("d"), touches_one("foo", PlanTouchKind::DoneMove));
+        touches.insert(cs("dddd"), touches_one("foo", PlanTouchKind::DoneMove));
         let mut attribution = BTreeMap::new();
         attribution.insert(
-            cs("a"),
+            cs("aaaa"),
             attributed("foo", Some(PlanTouchKind::Intro), false),
         );
-        attribution.insert(cs("b"), AttributionResult::Unattributed);
-        attribution.insert(cs("c"), attributed("foo", None, true));
+        attribution.insert(cs("bbbb"), AttributionResult::Unattributed);
+        attribution.insert(cs("cccc"), attributed("foo", None, true));
         attribution.insert(
-            cs("d"),
+            cs("dddd"),
             attributed("foo", Some(PlanTouchKind::DoneMove), false),
         );
 
         // Reviewer leaves feedback on the unreviewable commits — those
         // votes must NOT enroll them as cumulative participants.
         let mut plan_feedback = BTreeMap::new();
-        plan_feedback.insert((cs("b"), al("rogue")), feedback_with(Verdict::Approve));
-        plan_feedback.insert((cs("d"), al("rogue")), feedback_with(Verdict::Approve));
+        plan_feedback.insert((cs("bbbb"), al("rogue")), feedback_with(Verdict::Approve));
+        plan_feedback.insert((cs("dddd"), al("rogue")), feedback_with(Verdict::Approve));
 
         let gates = build_commit_gates(
             &pk("foo"),
-            &[cs("a"), cs("b"), cs("c"), cs("d")],
+            &[cs("aaaa"), cs("bbbb"), cs("cccc"), cs("dddd")],
             &touches,
             &attribution,
             &plan_feedback,
         );
 
-        assert!(gates.contains_key(&cs("a")));
-        assert!(!gates.contains_key(&cs("b")), "multi_plan has no gate");
-        assert!(gates.contains_key(&cs("c")));
-        assert!(!gates.contains_key(&cs("d")), "done_move has no gate");
+        assert!(gates.contains_key(&cs("aaaa")));
+        assert!(!gates.contains_key(&cs("bbbb")), "multi_plan has no gate");
+        assert!(gates.contains_key(&cs("cccc")));
+        assert!(!gates.contains_key(&cs("dddd")), "done_move has no gate");
 
         // gate(C) sees zero participants — `rogue` reviewed only
         // unreviewable commits and so never enters the participant set.
-        let g_c = &gates[&cs("c")];
+        let g_c = &gates[&cs("cccc")];
         assert!(
             g_c.participants.is_empty(),
             "rogue on unreviewable commits doesn't enroll: {:?}",
@@ -1428,25 +1430,28 @@ mod tests {
         // Two reviewers on the same SHA: one APPROVE, one
         // REQUEST_CHANGES → ChangesRequested.
         let mut touches = BTreeMap::new();
-        touches.insert(cs("a"), touches_one("foo", PlanTouchKind::Intro));
+        touches.insert(cs("aaaa"), touches_one("foo", PlanTouchKind::Intro));
         let mut attribution = BTreeMap::new();
         attribution.insert(
-            cs("a"),
+            cs("aaaa"),
             attributed("foo", Some(PlanTouchKind::Intro), false),
         );
         let mut plan_feedback = BTreeMap::new();
-        plan_feedback.insert((cs("a"), al("alice")), feedback_with(Verdict::Approve));
-        plan_feedback.insert((cs("a"), al("bob")), feedback_with(Verdict::RequestChanges));
+        plan_feedback.insert((cs("aaaa"), al("alice")), feedback_with(Verdict::Approve));
+        plan_feedback.insert(
+            (cs("aaaa"), al("bob")),
+            feedback_with(Verdict::RequestChanges),
+        );
 
         let gates = build_commit_gates(
             &pk("foo"),
-            &[cs("a")],
+            &[cs("aaaa")],
             &touches,
             &attribution,
             &plan_feedback,
         );
 
-        let g = &gates[&cs("a")];
+        let g = &gates[&cs("aaaa")];
         assert_eq!(g.state, CommitGateState::ChangesRequested);
         assert_eq!(g.approvers, vec![al("alice")]);
         assert_eq!(g.requesters, vec![al("bob")]);
@@ -1459,25 +1464,25 @@ mod tests {
         // Locks in: participants accumulate across reviewable commits
         // even when the next commit has no votes yet.
         let mut touches = BTreeMap::new();
-        touches.insert(cs("a"), touches_one("foo", PlanTouchKind::Intro));
+        touches.insert(cs("aaaa"), touches_one("foo", PlanTouchKind::Intro));
         let mut attribution = BTreeMap::new();
         attribution.insert(
-            cs("a"),
+            cs("aaaa"),
             attributed("foo", Some(PlanTouchKind::Intro), false),
         );
-        attribution.insert(cs("b"), attributed("foo", None, true));
+        attribution.insert(cs("bbbb"), attributed("foo", None, true));
         let mut plan_feedback = BTreeMap::new();
-        plan_feedback.insert((cs("a"), al("codex")), feedback_with(Verdict::Approve));
+        plan_feedback.insert((cs("aaaa"), al("codex")), feedback_with(Verdict::Approve));
 
         let gates = build_commit_gates(
             &pk("foo"),
-            &[cs("a"), cs("b")],
+            &[cs("aaaa"), cs("bbbb")],
             &touches,
             &attribution,
             &plan_feedback,
         );
 
-        let g_b = gates.get(&cs("b")).expect("gate for b");
+        let g_b = gates.get(&cs("bbbb")).expect("gate for b");
         assert_eq!(g_b.state, CommitGateState::Unreviewed);
         assert_eq!(g_b.participants, vec![al("codex")]);
         assert_eq!(g_b.missing, vec![al("codex")]);
@@ -1492,27 +1497,27 @@ mod tests {
         // must not drop accumulated state. Future-proofs against
         // someone "resetting" participants on each skip.
         let mut touches = BTreeMap::new();
-        touches.insert(cs("a"), touches_one("foo", PlanTouchKind::Intro));
+        touches.insert(cs("aaaa"), touches_one("foo", PlanTouchKind::Intro));
         let mut attribution = BTreeMap::new();
         attribution.insert(
-            cs("a"),
+            cs("aaaa"),
             attributed("foo", Some(PlanTouchKind::Intro), false),
         );
-        attribution.insert(cs("b"), AttributionResult::Unattributed);
-        attribution.insert(cs("c"), attributed("foo", None, true));
+        attribution.insert(cs("bbbb"), AttributionResult::Unattributed);
+        attribution.insert(cs("cccc"), attributed("foo", None, true));
         let mut plan_feedback = BTreeMap::new();
-        plan_feedback.insert((cs("a"), al("codex")), feedback_with(Verdict::Approve));
+        plan_feedback.insert((cs("aaaa"), al("codex")), feedback_with(Verdict::Approve));
 
         let gates = build_commit_gates(
             &pk("foo"),
-            &[cs("a"), cs("b"), cs("c")],
+            &[cs("aaaa"), cs("bbbb"), cs("cccc")],
             &touches,
             &attribution,
             &plan_feedback,
         );
 
-        assert!(!gates.contains_key(&cs("b")), "Unattributed has no gate");
-        let g_c = gates.get(&cs("c")).expect("gate for c");
+        assert!(!gates.contains_key(&cs("bbbb")), "Unattributed has no gate");
+        let g_c = gates.get(&cs("cccc")).expect("gate for c");
         assert_eq!(g_c.participants, vec![al("codex")]);
         assert_eq!(g_c.missing, vec![al("codex")]);
         assert_eq!(g_c.state, CommitGateState::Unreviewed);
@@ -1525,15 +1530,15 @@ mod tests {
         // verdict from here; the gate's vec fields are display-list
         // shorthand.
         let mut touches = BTreeMap::new();
-        touches.insert(cs("a"), touches_one("foo", PlanTouchKind::Intro));
+        touches.insert(cs("aaaa"), touches_one("foo", PlanTouchKind::Intro));
         let mut attribution = BTreeMap::new();
         attribution.insert(
-            cs("a"),
+            cs("aaaa"),
             attributed("foo", Some(PlanTouchKind::Intro), false),
         );
         let mut plan_feedback = BTreeMap::new();
         plan_feedback.insert(
-            (cs("a"), al("codex")),
+            (cs("aaaa"), al("codex")),
             Feedback {
                 path: PathBuf::from("/abs/codex.md"),
                 body: "APPROVE\n\nlooks good".to_string(),
@@ -1544,13 +1549,13 @@ mod tests {
 
         let gates = build_commit_gates(
             &pk("foo"),
-            &[cs("a")],
+            &[cs("aaaa")],
             &touches,
             &attribution,
             &plan_feedback,
         );
 
-        let g = gates.get(&cs("a")).expect("gate for a");
+        let g = gates.get(&cs("aaaa")).expect("gate for a");
         let fb = g.feedback.get(&al("codex")).expect("codex feedback");
         assert_eq!(fb.verdict, Verdict::Approve);
         assert_eq!(fb.body, "APPROVE\n\nlooks good");
@@ -1565,10 +1570,10 @@ mod tests {
         // CommitGate.feedback.
         let touches = BTreeMap::new();
         let mut attribution = BTreeMap::new();
-        attribution.insert(cs("a"), attributed("foo", None, true));
+        attribution.insert(cs("aaaa"), attributed("foo", None, true));
         let mut impl_feedback = BTreeMap::new();
         impl_feedback.insert(
-            (cs("a"), al("alice")),
+            (cs("aaaa"), al("alice")),
             Feedback {
                 path: PathBuf::from("/abs/alice.md"),
                 body: "REQUEST_CHANGES\n\nfix it".to_string(),
@@ -1579,13 +1584,13 @@ mod tests {
 
         let gates = build_commit_gates(
             &pk("foo"),
-            &[cs("a")],
+            &[cs("aaaa")],
             &touches,
             &attribution,
             &impl_feedback,
         );
 
-        let g = gates.get(&cs("a")).expect("gate for a");
+        let g = gates.get(&cs("aaaa")).expect("gate for a");
         let fb = g.feedback.get(&al("alice")).expect("alice feedback");
         assert_eq!(fb.verdict, Verdict::RequestChanges);
         assert_eq!(fb.body, "REQUEST_CHANGES\n\nfix it");
@@ -1602,9 +1607,9 @@ mod tests {
         // review" — wrong. The fix walks newest-first looking for a
         // PlanOnly/Mixed commit, so the gate stays on A's Approved.
         let mut touches = BTreeMap::new();
-        touches.insert(cs("a"), touches_one("foo", PlanTouchKind::Intro));
+        touches.insert(cs("aaaa"), touches_one("foo", PlanTouchKind::Intro));
         touches.insert(
-            cs("b"),
+            cs("bbbb"),
             vec![
                 (pk("foo"), PlanTouchKind::Revision),
                 (pk("bar"), PlanTouchKind::Revision),
@@ -1612,14 +1617,14 @@ mod tests {
         );
         let mut attribution = BTreeMap::new();
         attribution.insert(
-            cs("a"),
+            cs("aaaa"),
             attributed("foo", Some(PlanTouchKind::Intro), false),
         );
-        attribution.insert(cs("b"), AttributionResult::Unattributed);
+        attribution.insert(cs("bbbb"), AttributionResult::Unattributed);
 
         let mut commits = BTreeMap::new();
         commits.insert(
-            cs("a"),
+            cs("aaaa"),
             CommitGate {
                 state: CommitGateState::Approved,
                 participants: vec![al("codex")],
@@ -1634,7 +1639,7 @@ mod tests {
         let gate = plan_gate_for_parts(
             &pk("foo"),
             &commits,
-            &[cs("a"), cs("b")],
+            &[cs("aaaa"), cs("bbbb")],
             &touches,
             &attribution,
         )
@@ -1648,21 +1653,21 @@ mod tests {
         // A (PlanOnly, Approved) → B (DoneMove). Plan gate should
         // resolve to A's gate, not return None.
         let mut touches = BTreeMap::new();
-        touches.insert(cs("a"), touches_one("foo", PlanTouchKind::Intro));
-        touches.insert(cs("b"), touches_one("foo", PlanTouchKind::DoneMove));
+        touches.insert(cs("aaaa"), touches_one("foo", PlanTouchKind::Intro));
+        touches.insert(cs("bbbb"), touches_one("foo", PlanTouchKind::DoneMove));
         let mut attribution = BTreeMap::new();
         attribution.insert(
-            cs("a"),
+            cs("aaaa"),
             attributed("foo", Some(PlanTouchKind::Intro), false),
         );
         attribution.insert(
-            cs("b"),
+            cs("bbbb"),
             attributed("foo", Some(PlanTouchKind::DoneMove), false),
         );
 
         let mut commits = BTreeMap::new();
         commits.insert(
-            cs("a"),
+            cs("aaaa"),
             CommitGate {
                 state: CommitGateState::Approved,
                 participants: vec![al("codex")],
@@ -1677,7 +1682,7 @@ mod tests {
         let gate = plan_gate_for_parts(
             &pk("foo"),
             &commits,
-            &[cs("a"), cs("b")],
+            &[cs("aaaa"), cs("bbbb")],
             &touches,
             &attribution,
         )

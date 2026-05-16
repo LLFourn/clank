@@ -499,7 +499,10 @@ mod tests {
     use crate::review_state::CommitGateState;
 
     fn agents(labels: &[&str]) -> Vec<AgentLabel> {
-        labels.iter().map(|s| AgentLabel::from(*s)).collect()
+        labels
+            .iter()
+            .map(|s| AgentLabel::parse(s).unwrap())
+            .collect()
     }
 
     fn gate(
@@ -523,18 +526,18 @@ mod tests {
     fn cand(target: Option<&str>, kind: Option<crate::repo_state::CommitKind>) -> Candidate {
         Candidate {
             repo_root: PathBuf::from("/repo"),
-            plan_key: PlanKey::from("sid"),
+            plan_key: PlanKey::parse("sid").unwrap(),
             plan_path: PathBuf::from(".trinity/plans/sid.md"),
             body_hash: content_hash("x"),
             session_phase: Phase::Planning,
             gate: None,
-            review_target: target.map(CommitSha::from),
+            review_target: target.map(|s| CommitSha::parse(s).unwrap()),
             review_target_kind: kind,
         }
     }
 
     fn me() -> AgentLabel {
-        AgentLabel::from("codex")
+        AgentLabel::parse("codex").unwrap()
     }
 
     #[test]
@@ -573,14 +576,14 @@ mod tests {
             agents(&["alice", "bob"]),
             Vec::new(),
         );
-        let mut c = cand(Some("plan1"), Some(crate::repo_state::CommitKind::PlanOnly));
+        let mut c = cand(Some("a1a1"), Some(crate::repo_state::CommitKind::PlanOnly));
         c.gate = Some(g);
         let v = derive_locations(&c, WaitingReason::AddressCommitChanges, &me());
         assert_eq!(
             v,
             vec![
-                ".trinity/feedback/sid/commits/plan1/alice.md",
-                ".trinity/feedback/sid/commits/plan1/bob.md",
+                ".trinity/feedback/sid/commits/a1a1/alice.md",
+                ".trinity/feedback/sid/commits/a1a1/bob.md",
                 ".trinity/plans/sid.md",
             ]
         );
@@ -595,10 +598,10 @@ mod tests {
             agents(&["dana"]),
             Vec::new(),
         );
-        let mut c = cand(Some("impl9"), Some(crate::repo_state::CommitKind::CodeOnly));
+        let mut c = cand(Some("1019"), Some(crate::repo_state::CommitKind::CodeOnly));
         c.gate = Some(g);
         let v = derive_locations(&c, WaitingReason::AddressCommitChanges, &me());
-        assert_eq!(v, vec![".trinity/feedback/sid/commits/impl9/dana.md"]);
+        assert_eq!(v, vec![".trinity/feedback/sid/commits/1019/dana.md"]);
     }
 
     #[test]
@@ -612,13 +615,13 @@ mod tests {
             agents(&["alice"]),
             Vec::new(),
         );
-        let mut c = cand(Some("mix7"), Some(crate::repo_state::CommitKind::Mixed));
+        let mut c = cand(Some("3137"), Some(crate::repo_state::CommitKind::Mixed));
         c.gate = Some(g);
         let v = derive_locations(&c, WaitingReason::AddressCommitChanges, &me());
         assert_eq!(
             v,
             vec![
-                ".trinity/feedback/sid/commits/mix7/alice.md",
+                ".trinity/feedback/sid/commits/3137/alice.md",
                 ".trinity/plans/sid.md",
             ]
         );
@@ -820,7 +823,7 @@ mod integration_tests {
 
         let intro: CommitSha = rt
             .read_repo(dir.path(), |s| {
-                s.plans[&PlanKey::from("foo")].plan_intro.clone()
+                s.plans[&PlanKey::parse("foo").unwrap()].plan_intro.clone()
             })
             .await
             .unwrap();
@@ -882,7 +885,7 @@ mod integration_tests {
 
         let intro: CommitSha = rt
             .read_repo(dir.path(), |s| {
-                s.plans[&PlanKey::from("foo")].plan_intro.clone()
+                s.plans[&PlanKey::parse("foo").unwrap()].plan_intro.clone()
             })
             .await
             .unwrap();
@@ -910,7 +913,7 @@ mod integration_tests {
             .unwrap();
         let revised: CommitSha = rt
             .read_repo(dir.path(), |s| {
-                let plan = &s.plans[&PlanKey::from("foo")];
+                let plan = &s.plans[&PlanKey::parse("foo").unwrap()];
                 crate::projection::all_plan_revisions(plan, s)
                     .into_iter()
                     .next_back()
@@ -1044,7 +1047,7 @@ mod integration_tests {
         rt.handle_signal(
             dir.path(),
             FilesystemSignal::PlanFileChanged {
-                session_id: PlanKey::from("foo"),
+                session_id: PlanKey::parse("foo").unwrap(),
                 path: PathBuf::from(".trinity/plans/foo.md"),
             },
             42,

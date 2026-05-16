@@ -79,7 +79,7 @@ mod tests {
 
         let state = rebuild_repo(dir.path()).await.unwrap();
         assert_eq!(state.plans.len(), 1);
-        let session = &state.plans[&PlanKey::from("foo".to_string())];
+        let session = &state.plans[&PlanKey::parse("foo").unwrap()];
         assert_eq!(session.id.as_str(), "foo");
         assert_eq!(session.body, "# foo\n");
         let intro = &session.plan_intro;
@@ -127,14 +127,14 @@ mod tests {
         write_file(dir.path(), ".trinity/plans/foo.md", "# foo\n");
         commit(dir.path(), "Add foo plan");
         let state0 = rebuild_repo(dir.path()).await.unwrap();
-        let intro = state0.plans[&PlanKey::from("foo".to_string())]
+        let intro = state0.plans[&PlanKey::parse("foo").unwrap()]
             .plan_intro
             .clone();
         let feedback_rel = format!(".trinity/feedback/foo/commits/{}/alice.md", intro.as_str());
         write_file(dir.path(), &feedback_rel, "APPROVE\n\nLooks good.\n");
 
         let state = rebuild_repo(dir.path()).await.unwrap();
-        let session = &state.plans[&PlanKey::from("foo".to_string())];
+        let session = &state.plans[&PlanKey::parse("foo").unwrap()];
         let gate = session.commits.get(&intro).expect("gate for intro");
         let entries: Vec<_> = gate.feedback.values().collect();
         assert_eq!(entries.len(), 1);
@@ -153,12 +153,12 @@ mod tests {
 
         let state = rebuild_repo(dir.path()).await.unwrap();
         assert!(
-            !state.plans.contains_key(&PlanKey::from("foo".to_string())),
+            !state.plans.contains_key(&PlanKey::parse("foo").unwrap()),
             "conflicting plan must not be routable"
         );
         let paths = state
             .plan_conflicts
-            .get(&PlanKey::from("foo".to_string()))
+            .get(&PlanKey::parse("foo").unwrap())
             .expect("conflict surfaced");
         assert_eq!(paths.len(), 2);
         assert!(paths.iter().any(|p| !is_done_plan_path(p)));
