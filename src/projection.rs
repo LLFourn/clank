@@ -724,8 +724,7 @@ pub fn build_commit_gates(
     commit_order: &[CommitSha],
     plan_touches: &BTreeMap<CommitSha, Vec<(crate::lifecycle::PlanKey, PlanTouchKind)>>,
     attribution: &BTreeMap<CommitSha, AttributionResult>,
-    plan_feedback: &BTreeMap<(CommitSha, AgentLabel), Feedback>,
-    impl_feedback: &BTreeMap<(CommitSha, AgentLabel), Feedback>,
+    feedback: &BTreeMap<(CommitSha, AgentLabel), Feedback>,
 ) -> BTreeMap<CommitSha, CommitGate> {
     let mut participants: Vec<AgentLabel> = Vec::new();
     let mut out = BTreeMap::new();
@@ -739,30 +738,14 @@ pub fn build_commit_gates(
         let mut approvers: Vec<AgentLabel> = Vec::new();
         let mut requesters: Vec<AgentLabel> = Vec::new();
         let mut ambiguous: Vec<AgentLabel> = Vec::new();
-        let mut feedback: BTreeMap<AgentLabel, Feedback> = BTreeMap::new();
-
-        // Union feedback on this SHA from both legacy maps. Each
-        // disk file lives under exactly one of `plan/` or `impl/`,
-        // but the same (sha, author) key CAN appear in both maps if
-        // a reviewer dropped files in both subtrees (degenerate;
-        // structurally impossible after phase 2.3 collapses the disk
-        // layout). When that happens, `impl_feedback` wins by virtue
-        // of being the second insert. The pre-2.1 fold would have
-        // categorized the author into BOTH gate buckets (e.g. both
-        // `approvers` and `requesters`); the new shape collapses to
-        // one entry. Going away with the legacy maps in 2.3.
-        for ((target, author), fb) in plan_feedback {
+        let mut commit_feedback: BTreeMap<AgentLabel, Feedback> = BTreeMap::new();
+        for ((target, author), fb) in feedback {
             if target == sha {
-                feedback.insert(author.clone(), fb.clone());
-            }
-        }
-        for ((target, author), fb) in impl_feedback {
-            if target == sha {
-                feedback.insert(author.clone(), fb.clone());
+                commit_feedback.insert(author.clone(), fb.clone());
             }
         }
 
-        for (author, fb) in &feedback {
+        for (author, fb) in &commit_feedback {
             if !participants.contains(author) {
                 participants.push(author.clone());
             }
@@ -808,7 +791,7 @@ pub fn build_commit_gates(
                 requesters,
                 ambiguous,
                 missing,
-                feedback,
+                feedback: commit_feedback,
             },
         );
     }
@@ -1489,22 +1472,20 @@ mod tests {
         );
         attribution.insert(cs("b"), attributed("foo", None, true));
         attribution.insert(cs("c"), attributed("foo", None, true));
-        let mut plan_feedback = BTreeMap::new();
-        plan_feedback.insert((cs("a"), al("codex")), feedback_with(Verdict::Approve));
-        let mut impl_feedback = BTreeMap::new();
-        impl_feedback.insert(
+        let mut feedback = BTreeMap::new();
+        feedback.insert((cs("a"), al("codex")), feedback_with(Verdict::Approve));
+        feedback.insert(
             (cs("b"), al("alice")),
             feedback_with(Verdict::RequestChanges),
         );
-        impl_feedback.insert((cs("c"), al("alice")), feedback_with(Verdict::Approve));
+        feedback.insert((cs("c"), al("alice")), feedback_with(Verdict::Approve));
 
         let gates = build_commit_gates(
             &pk("foo"),
             &[cs("a"), cs("b"), cs("c")],
             &touches,
             &attribution,
-            &plan_feedback,
-            &impl_feedback,
+            &feedback,
         );
 
         // gate(A): codex approved, only participant → Approved.
@@ -1548,7 +1529,6 @@ mod tests {
             &touches,
             &attribution,
             &plan_feedback,
-            &BTreeMap::new(),
         );
 
         let g = gates.get(&cs("a")).expect("gate for a");
@@ -1596,7 +1576,6 @@ mod tests {
             &touches,
             &attribution,
             &plan_feedback,
-            &BTreeMap::new(),
         );
 
         assert!(gates.contains_key(&cs("a")));
@@ -1636,7 +1615,6 @@ mod tests {
             &touches,
             &attribution,
             &plan_feedback,
-            &BTreeMap::new(),
         );
 
         let g = &gates[&cs("a")];
@@ -1668,7 +1646,6 @@ mod tests {
             &touches,
             &attribution,
             &plan_feedback,
-            &BTreeMap::new(),
         );
 
         let g_b = gates.get(&cs("b")).expect("gate for b");
@@ -1703,7 +1680,6 @@ mod tests {
             &touches,
             &attribution,
             &plan_feedback,
-            &BTreeMap::new(),
         );
 
         assert!(!gates.contains_key(&cs("b")), "Unattributed has no gate");
@@ -1743,7 +1719,6 @@ mod tests {
             &touches,
             &attribution,
             &plan_feedback,
-            &BTreeMap::new(),
         );
 
         let g = gates.get(&cs("a")).expect("gate for a");
@@ -1778,7 +1753,6 @@ mod tests {
             &[cs("a")],
             &touches,
             &attribution,
-            &BTreeMap::new(),
             &impl_feedback,
         );
 
@@ -1788,54 +1762,6 @@ mod tests {
         assert_eq!(fb.body, "REQUEST_CHANGES\n\nfix it");
         assert_eq!(fb.path, PathBuf::from("/abs/alice.md"));
         assert_eq!(fb.created_at, 250);
-    }
-
-    #[test]
-    fn gates_feedback_collision_impl_wins() {
-        // Degenerate input: same (sha, author) in both legacy maps
-        // (a reviewer dropped two files under `plan/<sha>/` and
-        // `impl/<sha>/`). The 2.1 fold collapses to one entry per
-        // author; `impl_feedback` is inserted second and wins. This
-        // case is structurally impossible after phase 2.3 but the
-        // test pins the precedence until then so a refactor can't
-        // silently flip it.
-        let mut touches = BTreeMap::new();
-        touches.insert(cs("a"), touches_one("foo", PlanTouchKind::Intro));
-        let mut attribution = BTreeMap::new();
-        attribution.insert(cs("a"), attributed("foo", Some(PlanTouchKind::Intro), true));
-        let mut plan_feedback = BTreeMap::new();
-        plan_feedback.insert(
-            (cs("a"), al("codex")),
-            Feedback {
-                path: PathBuf::from("/abs/plan.md"),
-                body: "REQUEST_CHANGES".to_string(),
-                verdict: Verdict::RequestChanges,
-                created_at: 100,
-            },
-        );
-        let mut impl_feedback = BTreeMap::new();
-        impl_feedback.insert(
-            (cs("a"), al("codex")),
-            Feedback {
-                path: PathBuf::from("/abs/impl.md"),
-                body: "APPROVE".to_string(),
-                verdict: Verdict::Approve,
-                created_at: 200,
-            },
-        );
-
-        let gates = build_commit_gates(
-            &pk("foo"),
-            &[cs("a")],
-            &touches,
-            &attribution,
-            &plan_feedback,
-            &impl_feedback,
-        );
-        let g = gates.get(&cs("a")).expect("gate for a");
-        let fb = g.feedback.get(&al("codex")).expect("codex feedback");
-        assert_eq!(fb.verdict, Verdict::Approve);
-        assert_eq!(fb.path, PathBuf::from("/abs/impl.md"));
     }
 
     #[test]

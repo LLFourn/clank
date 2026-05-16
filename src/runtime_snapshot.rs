@@ -8,10 +8,8 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use crate::disk_snapshot::CommitMetaEntry;
-use crate::lifecycle::{AgentLabel, CommitSha, ContentHash, PlanKey};
-use crate::repo_state::{
-    AttributionResult, Feedback, HeldFeedback, Plan, PlanTouchKind, RepoState,
-};
+use crate::lifecycle::{CommitSha, ContentHash, PlanKey};
+use crate::repo_state::{AttributionResult, HeldFeedback, Plan, PlanTouchKind, RepoState};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RepoSnapshot {
@@ -34,8 +32,6 @@ pub struct PlanSnapshot {
     pub body_hash: ContentHash,
     pub plan_intro: CommitSha,
     pub plan_intro_parent: Option<CommitSha>,
-    pub plan_feedback: BTreeMap<(CommitSha, AgentLabel), Feedback>,
-    pub impl_feedback: BTreeMap<(CommitSha, AgentLabel), Feedback>,
     pub held_plan_feedback: Vec<HeldFeedback>,
     pub commits: BTreeMap<CommitSha, crate::review_state::CommitGate>,
 }
@@ -93,8 +89,6 @@ impl PlanSnapshot {
             body_hash: plan.body_hash.clone(),
             plan_intro: plan.plan_intro.clone(),
             plan_intro_parent: plan.plan_intro_parent.clone(),
-            plan_feedback: plan.plan_feedback.clone(),
-            impl_feedback: plan.impl_feedback.clone(),
             held_plan_feedback: plan.held_plan_feedback.clone(),
             commits: plan.commits.clone(),
         }
@@ -109,8 +103,6 @@ impl PlanSnapshot {
             body_hash: self.body_hash.clone(),
             plan_intro: self.plan_intro.clone(),
             plan_intro_parent: self.plan_intro_parent.clone(),
-            plan_feedback: self.plan_feedback.clone(),
-            impl_feedback: self.impl_feedback.clone(),
             held_plan_feedback: self.held_plan_feedback.clone(),
             commits: self.commits.clone(),
         }

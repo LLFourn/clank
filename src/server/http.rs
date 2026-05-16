@@ -338,7 +338,11 @@ async fn api_plan_revision(
         .map(|c| c.as_str().to_string());
     let next_sha = plan_revisions.get(pos + 1).map(|c| c.as_str().to_string());
 
-    let feedback = crate::ui_response::feedback_for_target(&snapshot.plan, &commit_sha);
+    let feedback = crate::ui_response::feedback_for_target(
+        &snapshot.plan,
+        &commit_sha,
+        &snapshot.plan_touches,
+    );
     Ok(axum::Json(json!({
         "repo": snapshot.root.to_string_lossy(),
         "plan_id": format!("{repo_basename}/{stem_md}"),
@@ -388,7 +392,11 @@ async fn api_commit_diff(
         .await
         .map_err(|e| AppError::internal(format!("git show -s: {e}")))?;
 
-    let feedback = crate::ui_response::feedback_for_target(&snapshot.plan, &commit_sha);
+    let feedback = crate::ui_response::feedback_for_target(
+        &snapshot.plan,
+        &commit_sha,
+        &snapshot.plan_touches,
+    );
     Ok(axum::Json(json!({
         "repo": snapshot.root.to_string_lossy(),
         "plan_id": format!("{repo_basename}/{stem_md}"),

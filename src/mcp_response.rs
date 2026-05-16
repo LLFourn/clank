@@ -201,8 +201,12 @@ pub fn get_context_response_from_snapshot(
         None
     };
 
-    let plan_feedback = feedback_entries(&session.plan_feedback);
-    let impl_feedback = feedback_entries(&session.impl_feedback);
+    // Phase 2.3: feedback is stored per-commit. The pre-cutover wire
+    // shape split feedback into "plan_feedback" and "impl_feedback" by
+    // which legacy map the disk file lived in. Map back through the
+    // commit's `CommitKind` for the same split until phase 2.5 drops
+    // the dichotomy from the wire.
+    let (plan_feedback, impl_feedback) = phase_split_feedback(session, &state);
     let timeline = timeline_value(&state, session_id);
 
     let plan_revisions: Vec<String> = all_plan_revisions(session, &state)
@@ -324,21 +328,30 @@ fn timeline_value(state: &RepoState, session_id: &PlanKey) -> Vec<Value> {
         .collect()
 }
 
-fn feedback_entries(
-    map: &std::collections::BTreeMap<
-        (crate::lifecycle::CommitSha, crate::lifecycle::AgentLabel),
-        crate::repo_state::Feedback,
-    >,
-) -> Vec<Value> {
-    map.iter()
-        .map(|((target, author), fb)| {
-            json!({
-                "target_sha": target.as_str(),
+fn phase_split_feedback(
+    plan: &crate::repo_state::Plan,
+    state: &RepoState,
+) -> (Vec<Value>, Vec<Value>) {
+    use crate::projection::commit_kind_for;
+    use crate::repo_state::CommitKind;
+    let mut plan_fb = Vec::new();
+    let mut impl_fb = Vec::new();
+    for (sha, gate) in &plan.commits {
+        let kind = commit_kind_for(&plan.id, sha, &state.plan_touches, &state.attribution);
+        let target = match kind {
+            CommitKind::PlanOnly => &mut plan_fb,
+            CommitKind::CodeOnly | CommitKind::Mixed => &mut impl_fb,
+            _ => continue,
+        };
+        for (author, fb) in &gate.feedback {
+            target.push(json!({
+                "target_sha": sha.as_str(),
                 "author": author.as_str(),
                 "verdict": fb.verdict.as_str(),
-            })
-        })
-        .collect()
+            }));
+        }
+    }
+    (plan_fb, impl_fb)
 }
 
 fn pr_hint_value(session: &crate::repo_state::Plan, state: &RepoState) -> Value {

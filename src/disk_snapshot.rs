@@ -19,7 +19,7 @@ use std::path::PathBuf;
 
 use crate::attribution::{CommitChanges, classify, effective_session};
 use crate::disk_format::{FeedbackPath, FeedbackPhase, parse_verdict};
-use crate::lifecycle::{CommitSha, PlanKey, content_hash};
+use crate::lifecycle::{AgentLabel, CommitSha, PlanKey, content_hash};
 use crate::repo_state::{Feedback, HeldFeedback, Plan, RepoState};
 
 /// Everything Trinity needs to derive a repo's state, materialized into
@@ -120,8 +120,6 @@ pub fn derive_state(repo_root: PathBuf, snapshot: DiskSnapshot) -> RepoState {
                 body_hash,
                 plan_intro: pf.plan_intro,
                 plan_intro_parent: pf.plan_intro_parent,
-                plan_feedback: BTreeMap::new(),
-                impl_feedback: BTreeMap::new(),
                 held_plan_feedback: Vec::new(),
                 commits: BTreeMap::new(),
             },
@@ -149,14 +147,18 @@ pub fn derive_state(repo_root: PathBuf, snapshot: DiskSnapshot) -> RepoState {
     }
 
     // 3. Feedback ingestion. Files for unknown plans (including those
-    //    in `plan_conflicts`) are dropped; files with a target SHA land
-    //    in `plan_feedback` / `impl_feedback`; flat drops are held with
-    //    a reason key the runner uses to decide next steps.
+    //    in `plan_conflicts`) are dropped; files with a target SHA
+    //    accumulate into a per-plan feedback map that feeds the gate
+    //    fold below; flat drops still push onto `Plan.held_plan_feedback`
+    //    with a reason key the runner uses to decide next steps.
+    //    Phase 2.4 will collapse held into the SHA-targeted path.
+    let mut feedback_by_plan: BTreeMap<PlanKey, BTreeMap<(CommitSha, AgentLabel), Feedback>> =
+        BTreeMap::new();
     for fb in snapshot.feedback_files {
         let Some(plan) = state.plans.get_mut(&fb.parsed.plan_key) else {
             continue;
         };
-        ingest_feedback(plan, fb);
+        ingest_feedback(plan, fb, &mut feedback_by_plan);
     }
 
     // 4. Per-commit metadata (subject + author timestamp) for the same
@@ -164,20 +166,16 @@ pub fn derive_state(repo_root: PathBuf, snapshot: DiskSnapshot) -> RepoState {
     //    `last_activity_ts` (author_ts).
     state.commit_meta = snapshot.commit_meta;
 
-    // 5. Commit-centric gates (phase 1 of the commit-centric cutover).
-    //    Derived from plan_feedback ∪ impl_feedback so the new map
-    //    can be tested end-to-end without touching disk format. Phase
-    //    2 makes this authoritative; phase 1 leaves the legacy maps
-    //    populated and unused-by-runtime.
+    // 5. Commit-centric gates. Authoritative as of phase 2.3.
     let plan_keys: Vec<crate::lifecycle::PlanKey> = state.plans.keys().cloned().collect();
     for key in plan_keys {
+        let fb_map = feedback_by_plan.remove(&key).unwrap_or_default();
         let commits = crate::projection::build_commit_gates(
             &key,
             &state.commit_order,
             &state.plan_touches,
             &state.attribution,
-            &state.plans[&key].plan_feedback,
-            &state.plans[&key].impl_feedback,
+            &fb_map,
         );
         if let Some(plan) = state.plans.get_mut(&key) {
             plan.commits = commits;
@@ -187,16 +185,18 @@ pub fn derive_state(repo_root: PathBuf, snapshot: DiskSnapshot) -> RepoState {
     state
 }
 
-fn ingest_feedback(plan: &mut Plan, fb: FeedbackBlob) {
+fn ingest_feedback(
+    plan: &mut Plan,
+    fb: FeedbackBlob,
+    feedback_by_plan: &mut BTreeMap<PlanKey, BTreeMap<(CommitSha, AgentLabel), Feedback>>,
+) {
     let verdict = parse_verdict(&fb.body);
     let created_at = fb.created_at;
+    let plan_key = plan.id.clone();
     match fb.parsed.target_sha {
         Some(target_sha) => {
-            let map = match fb.parsed.phase {
-                FeedbackPhase::Plan => &mut plan.plan_feedback,
-                FeedbackPhase::Impl => &mut plan.impl_feedback,
-            };
-            map.insert(
+            let _ = fb.parsed.phase; // phase no longer routes — see CommitKind
+            feedback_by_plan.entry(plan_key).or_default().insert(
                 (target_sha, fb.parsed.author),
                 Feedback {
                     path: fb.abs_path,
@@ -466,10 +466,14 @@ mod tests {
             commit_meta: BTreeMap::new(),
         };
         let state = derive_state(PathBuf::from("/r"), snap);
-        let entry = state.plans[&sess("foo")]
-            .plan_feedback
-            .get(&(sha("c1"), AgentLabel::from("alice".to_string())))
-            .expect("alice's plan feedback");
+        let gate = state.plans[&sess("foo")]
+            .commits
+            .get(&sha("c1"))
+            .expect("gate for c1");
+        let entry = gate
+            .feedback
+            .get(&AgentLabel::from("alice".to_string()))
+            .expect("alice's feedback on c1");
         assert_eq!(entry.verdict, crate::repo_state::Verdict::Approve);
     }
 
@@ -490,7 +494,13 @@ mod tests {
         };
         let state = derive_state(PathBuf::from("/r"), snap);
         let session = &state.plans[&sess("foo")];
-        assert!(session.plan_feedback.is_empty());
+        assert!(
+            session
+                .commits
+                .get(&sha("c1"))
+                .map(|g| g.feedback.is_empty())
+                .unwrap_or(true)
+        );
         assert_eq!(session.held_plan_feedback.len(), 1);
         assert_eq!(session.held_plan_feedback[0].reason, "plan_dirty");
     }
@@ -515,7 +525,13 @@ mod tests {
         };
         let state = derive_state(PathBuf::from("/r"), snap);
         let session = &state.plans[&sess("foo")];
-        assert!(session.impl_feedback.is_empty());
+        assert!(
+            session
+                .commits
+                .get(&sha("c2"))
+                .map(|g| g.feedback.is_empty())
+                .unwrap_or(true)
+        );
         assert_eq!(session.held_plan_feedback[0].reason, "impl_flat_drop");
     }
 
@@ -658,9 +674,10 @@ mod tests {
         // Wait — full_workflow has only foo. Adjust expectations:
         assert!(state.plans.contains_key(&sess("foo")));
         let foo = &state.plans[&sess("foo")];
-        // Plan APPROVE from alice on commit c1, impl REQUEST_CHANGES from bob on c2.
-        assert_eq!(foo.plan_feedback.len(), 1);
-        assert_eq!(foo.impl_feedback.len(), 1);
+        // Plan APPROVE from alice on c1, impl REQUEST_CHANGES from bob on c2.
+        // Both now stored under Plan.commits keyed by their SHA.
+        assert_eq!(foo.commits[&sha("c1")].feedback.len(), 1);
+        assert_eq!(foo.commits[&sha("c2")].feedback.len(), 1);
         // Attribution: c1 = plan_intro for foo, c2 = impl commit for foo.
         assert!(matches!(
             state.attribution[&sha("c1")],
@@ -703,9 +720,10 @@ mod tests {
         };
         let state = derive_state(PathBuf::from("/r"), snap);
         let foo = &state.plans[&sess("foo")];
-        assert_eq!(foo.plan_feedback.len(), 1);
-        let key = foo.plan_feedback.keys().next().unwrap();
-        assert_eq!(key.0.as_str(), "c1", "stale feedback keeps its target");
+        // Stale feedback keeps its target SHA — now stored on the
+        // gate for c1, not on a hypothetical "latest" gate.
+        let stale_gate = foo.commits.get(&sha("c1")).expect("gate for c1");
+        assert_eq!(stale_gate.feedback.len(), 1);
     }
 
     #[test]

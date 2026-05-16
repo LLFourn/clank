@@ -120,21 +120,23 @@ impl RepoState {
                 has_code_changes,
                 subject,
             });
-            for ((target, author), fb) in &plan.plan_feedback {
-                if target == sha {
+            // Pre-cutover the review row carried a `phase` ("plan" /
+            // "impl") derived from which feedback map the file lived
+            // in. Post-cutover the phase is implicit in the parent
+            // commit's `CommitKind` — there's only one feedback map
+            // now (per commit). Until phase 2.5 drops the field, we
+            // back-derive it: plan_touch ⇒ Plan, else Impl. Same
+            // visual result as the old code for canonical commits.
+            if let Some(gate) = plan.commits.get(sha) {
+                let phase = if plan_touch.is_some() {
+                    TimelinePhase::Plan
+                } else {
+                    TimelinePhase::Impl
+                };
+                for (author, fb) in &gate.feedback {
                     out.push(TimelineEvent::Review {
-                        phase: TimelinePhase::Plan,
-                        target: target.clone(),
-                        author: author.clone(),
-                        verdict: fb.verdict,
-                    });
-                }
-            }
-            for ((target, author), fb) in &plan.impl_feedback {
-                if target == sha {
-                    out.push(TimelineEvent::Review {
-                        phase: TimelinePhase::Impl,
-                        target: target.clone(),
+                        phase,
+                        target: sha.clone(),
                         author: author.clone(),
                         verdict: fb.verdict,
                     });
@@ -189,22 +191,18 @@ impl RepoState {
                     .unwrap_or("")
                     .as_bytes(),
             );
-            hasher.update(b"|plan_fb=[");
-            for ((sha, author), fb) in &plan.plan_feedback {
+            hasher.update(b"|commits=[");
+            for (sha, gate) in &plan.commits {
                 hasher.update(sha.as_str().as_bytes());
                 hasher.update(b":");
-                hasher.update(author.as_str().as_bytes());
+                hasher.update(gate.state.as_str().as_bytes());
                 hasher.update(b":");
-                hasher.update(fb.verdict.as_str().as_bytes());
-                hasher.update(b";");
-            }
-            hasher.update(b"]|impl_fb=[");
-            for ((sha, author), fb) in &plan.impl_feedback {
-                hasher.update(sha.as_str().as_bytes());
-                hasher.update(b":");
-                hasher.update(author.as_str().as_bytes());
-                hasher.update(b":");
-                hasher.update(fb.verdict.as_str().as_bytes());
+                for (author, fb) in &gate.feedback {
+                    hasher.update(author.as_str().as_bytes());
+                    hasher.update(b"=");
+                    hasher.update(fb.verdict.as_str().as_bytes());
+                    hasher.update(b",");
+                }
                 hasher.update(b";");
             }
             hasher.update(b"]|held=[");
@@ -356,16 +354,14 @@ pub struct Plan {
     /// First-parent of `plan_intro`, or `None` for the root commit.
     /// Used by `pr_hint` to suggest squash bases.
     pub plan_intro_parent: Option<CommitSha>,
-    pub plan_feedback: BTreeMap<(CommitSha, AgentLabel), Feedback>,
-    pub impl_feedback: BTreeMap<(CommitSha, AgentLabel), Feedback>,
     /// Plan-phase feedback files dropped while `plan_worktree_status` was
     /// `BodyDirty`. Not auto-organized into `<target-sha>/<author>.md` until
-    /// the plan revision lands.
+    /// the plan revision lands. Deleted by phase 2.4 along with the
+    /// flat-drop disk path.
     pub held_plan_feedback: Vec<HeldFeedback>,
-    /// Per-commit gate state under the commit-centric model. Phase 1
-    /// populates this from `plan_feedback ∪ impl_feedback` so it can be
-    /// unit-tested; nothing in the runtime reads it yet. Phase 2 makes
-    /// it authoritative.
+    /// Per-commit gate state under the commit-centric model.
+    /// Authoritative as of phase 2.3 — all feedback bodies live here
+    /// under `commits[sha].feedback`.
     ///
     /// Keys are commits whose `CommitKind` is reviewable for this plan
     /// (`PlanOnly` | `CodeOnly` | `Mixed`). `DoneMove`, `MultiPlan`,

@@ -224,8 +224,8 @@ pub fn plan_page_with_reader(
         .map(|sha| json!({ "commit_sha": sha }))
         .unwrap_or(Value::Null);
 
-    let plan_feedback = feedback_entries(&plan.plan_feedback);
-    let impl_feedback = feedback_entries(&plan.impl_feedback);
+    let (plan_feedback, impl_feedback) =
+        phase_split_feedback_rich(plan, &bundle.plan_touches, &bundle.attribution);
     let timeline = timeline_value(
         plan,
         &bundle.attribution,
@@ -276,24 +276,43 @@ pub fn plan_page_with_reader(
     }))
 }
 
-/// Build the rich UI feedback entries for one of the `plan_feedback` /
-/// `impl_feedback` maps. Each entry carries the raw body, rendered HTML,
-/// canonical write path, and file mtime so the UI can sort and display
-/// without any further server round-trip.
-fn feedback_entries(map: &BTreeMap<(CommitSha, AgentLabel), Feedback>) -> Vec<Value> {
-    map.iter()
-        .map(|((target, author), fb)| {
-            json!({
-                "target_sha": target.as_str(),
+/// Pre-cutover wire shape: plan_feedback / impl_feedback as two
+/// separate arrays. Phase 2.3 stores feedback per-commit (via
+/// `Plan.commits`); this helper splits back into the legacy shape
+/// based on each commit's `CommitKind` so existing UI consumers keep
+/// working until phase 2.5 collapses the wire onto `commits[]`.
+fn phase_split_feedback_rich(
+    plan: &PlanSnapshot,
+    plan_touches: &BTreeMap<
+        CommitSha,
+        Vec<(crate::lifecycle::PlanKey, crate::repo_state::PlanTouchKind)>,
+    >,
+    attribution: &BTreeMap<CommitSha, crate::repo_state::AttributionResult>,
+) -> (Vec<Value>, Vec<Value>) {
+    use crate::projection::commit_kind_for;
+    use crate::repo_state::CommitKind;
+    let mut plan_fb = Vec::new();
+    let mut impl_fb = Vec::new();
+    for (sha, gate) in &plan.commits {
+        let kind = commit_kind_for(&plan.id, sha, plan_touches, attribution);
+        let target = match kind {
+            CommitKind::PlanOnly => &mut plan_fb,
+            CommitKind::CodeOnly | CommitKind::Mixed => &mut impl_fb,
+            _ => continue,
+        };
+        for (author, fb) in &gate.feedback {
+            target.push(json!({
+                "target_sha": sha.as_str(),
                 "author": author.as_str(),
                 "verdict": fb.verdict.as_str(),
                 "body_raw": fb.body,
                 "body_html": render_feedback_body(&fb.body, fb.verdict),
                 "path": fb.path.to_string_lossy(),
                 "created_at": fb.created_at,
-            })
-        })
-        .collect()
+            }));
+        }
+    }
+    (plan_fb, impl_fb)
 }
 
 fn held_feedback_entries(held: &[HeldFeedback]) -> Vec<Value> {
@@ -485,24 +504,17 @@ fn timeline_value(
             "has_code_changes": has_code_changes,
             "subject": subject,
         }));
-        for ((target, author), fb) in &session.plan_feedback {
-            if target == sha {
+        // Pre-cutover review rows carried a "plan"/"impl" phase tag
+        // derived from which legacy map the file lived in. Post-cutover
+        // we back-derive the same tag from the commit's plan_touch /
+        // has_code_changes pair until phase 2.5 drops the field.
+        let phase_tag = if plan_touch.is_some() { "plan" } else { "impl" };
+        if let Some(gate) = session.commits.get(sha) {
+            for (author, fb) in &gate.feedback {
                 out.push(json!({
                     "kind": "review",
-                    "phase": "plan",
-                    "target": target.as_str(),
-                    "author": author.as_str(),
-                    "verdict": fb.verdict.as_str(),
-                    "created_at": fb.created_at,
-                }));
-            }
-        }
-        for ((target, author), fb) in &session.impl_feedback {
-            if target == sha {
-                out.push(json!({
-                    "kind": "review",
-                    "phase": "impl",
-                    "target": target.as_str(),
+                    "phase": phase_tag,
+                    "target": sha.as_str(),
                     "author": author.as_str(),
                     "verdict": fb.verdict.as_str(),
                     "created_at": fb.created_at,
@@ -521,22 +533,35 @@ fn timeline_value(
     out
 }
 
-/// Look up feedback entries (rich form) targeting `sha` across both
-/// plan and impl feedback maps. Used by the `/api/sessions/:id/plan/:sha`
-/// and `/api/sessions/:id/commit/:sha` route handlers.
-pub fn feedback_for_target(session: &PlanSnapshot, sha: &CommitSha) -> Vec<Value> {
-    let mut out = Vec::new();
-    for ((target, author), fb) in &session.plan_feedback {
-        if target == sha {
-            out.push(feedback_entry(target, author, fb, ReviewPhase::Plan));
-        }
-    }
-    for ((target, author), fb) in &session.impl_feedback {
-        if target == sha {
-            out.push(feedback_entry(target, author, fb, ReviewPhase::Impl));
-        }
-    }
-    out
+/// Look up feedback entries (rich form) targeting `sha`. Reads from
+/// `Plan.commits[sha].feedback` (the canonical per-commit store) and
+/// derives the legacy "plan"/"impl" phase tag from the commit's
+/// `plan_touch` so existing wire consumers keep working until phase
+/// 2.5. Used by the `/api/sessions/:id/plan/:sha` and `/api/sessions/
+/// :id/commit/:sha` route handlers.
+pub fn feedback_for_target(
+    session: &PlanSnapshot,
+    sha: &CommitSha,
+    plan_touches: &BTreeMap<
+        CommitSha,
+        Vec<(crate::lifecycle::PlanKey, crate::repo_state::PlanTouchKind)>,
+    >,
+) -> Vec<Value> {
+    let Some(gate) = session.commits.get(sha) else {
+        return Vec::new();
+    };
+    let has_plan_touch = plan_touches
+        .get(sha)
+        .is_some_and(|ts| ts.iter().any(|(k, _)| k == &session.id));
+    let phase = if has_plan_touch {
+        ReviewPhase::Plan
+    } else {
+        ReviewPhase::Impl
+    };
+    gate.feedback
+        .iter()
+        .map(|(author, fb)| feedback_entry(sha, author, fb, phase))
+        .collect()
 }
 
 fn feedback_entry(
@@ -655,8 +680,6 @@ mod tests {
             body_hash: content_hash(""),
             plan_intro: CommitSha::from("intro"),
             plan_intro_parent: Some(CommitSha::from("parent")),
-            plan_feedback: BTreeMap::new(),
-            impl_feedback: BTreeMap::new(),
             held_plan_feedback: Vec::new(),
             commits: BTreeMap::new(),
         };

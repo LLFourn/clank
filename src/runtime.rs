@@ -6,7 +6,7 @@
 //! written) feeds `FilesystemSignal` values into `handle_signal`;
 //! request handlers (MCP, HTTP) read state via owned snapshots.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
@@ -664,18 +664,31 @@ fn upsert_feedback_at_target(
     session: &mut Plan,
     abs_path: PathBuf,
     target_sha: CommitSha,
-    phase: FeedbackPhase,
+    _phase: FeedbackPhase,
     author: crate::lifecycle::AgentLabel,
     body: String,
 ) {
     let verdict = crate::disk_format::parse_verdict(&body);
     let created_at = file_mtime_unix_secs(&abs_path);
-    let map = match phase {
-        FeedbackPhase::Plan => &mut session.plan_feedback,
-        FeedbackPhase::Impl => &mut session.impl_feedback,
-    };
-    map.insert(
-        (target_sha, author),
+    // Storage is commit-keyed; legacy `phase` no longer routes. Insert
+    // a placeholder gate entry (state/participants will be re-derived
+    // by `refresh_commits_for` after this call). If the SHA isn't
+    // reviewable for this plan, the rebuild will drop the entry.
+    let entry =
+        session
+            .commits
+            .entry(target_sha)
+            .or_insert_with(|| crate::review_state::CommitGate {
+                state: crate::review_state::CommitGateState::Unreviewed,
+                participants: Vec::new(),
+                approvers: Vec::new(),
+                requesters: Vec::new(),
+                ambiguous: Vec::new(),
+                missing: Vec::new(),
+                feedback: std::collections::BTreeMap::new(),
+            });
+    entry.feedback.insert(
+        author,
         Feedback {
             path: abs_path,
             body,
@@ -712,19 +725,13 @@ fn upsert_feedback(
     let created_at = file_mtime_unix_secs(&abs_path);
     match parsed.target_sha {
         Some(target_sha) => {
-            let verdict = crate::disk_format::parse_verdict(&body);
-            let map = match parsed.phase {
-                FeedbackPhase::Plan => &mut session.plan_feedback,
-                FeedbackPhase::Impl => &mut session.impl_feedback,
-            };
-            map.insert(
-                (target_sha, parsed.author),
-                Feedback {
-                    path: abs_path,
-                    body,
-                    verdict,
-                    created_at,
-                },
+            upsert_feedback_at_target(
+                session,
+                abs_path,
+                target_sha,
+                parsed.phase,
+                parsed.author,
+                body,
             );
         }
         None => {
@@ -746,11 +753,9 @@ fn upsert_feedback(
 fn remove_feedback(session: &mut Plan, parsed: &crate::disk_format::FeedbackPath) {
     match &parsed.target_sha {
         Some(target_sha) => {
-            let map = match parsed.phase {
-                FeedbackPhase::Plan => &mut session.plan_feedback,
-                FeedbackPhase::Impl => &mut session.impl_feedback,
-            };
-            map.remove(&(target_sha.clone(), parsed.author.clone()));
+            if let Some(gate) = session.commits.get_mut(target_sha) {
+                gate.feedback.remove(&parsed.author);
+            }
         }
         None => {
             session
@@ -760,22 +765,36 @@ fn remove_feedback(session: &mut Plan, parsed: &crate::disk_format::FeedbackPath
     }
 }
 
-/// Rebuild `Plan.commits` for one plan from the legacy feedback maps.
-/// Called from the signal handlers after every legacy-map mutation so
-/// `Plan.commits` stays in sync between full rebuilds. Phase 2.3 will
-/// rip out the legacy maps and have these mutations write to
-/// `Plan.commits` directly — at which point this helper goes away.
+/// Flatten all SHA-targeted feedback from `Plan.commits[*].feedback`
+/// into a single `(sha, author) → Feedback` map. Used as the input
+/// to `build_commit_gates` when re-folding after a runtime signal
+/// mutates a single entry.
+fn extract_feedback(plan: &Plan) -> BTreeMap<(CommitSha, crate::lifecycle::AgentLabel), Feedback> {
+    let mut out = BTreeMap::new();
+    for (sha, gate) in &plan.commits {
+        for (author, fb) in &gate.feedback {
+            out.insert((sha.clone(), author.clone()), fb.clone());
+        }
+    }
+    out
+}
+
+/// Rebuild `Plan.commits` for one plan from its own current
+/// `commits[*].feedback`. Called from the signal handlers after every
+/// mutation so cumulative-participant state, gate roll-up, and
+/// non-reviewable filtering all re-fold consistently between full
+/// rebuilds.
 fn refresh_commits_for(state: &mut crate::repo_state::RepoState, plan_key: &PlanKey) {
     let Some(plan) = state.plans.get(plan_key) else {
         return;
     };
+    let feedback = extract_feedback(plan);
     let new_commits = crate::projection::build_commit_gates(
         plan_key,
         &state.commit_order,
         &state.plan_touches,
         &state.attribution,
-        &plan.plan_feedback,
-        &plan.impl_feedback,
+        &feedback,
     );
     if let Some(plan) = state.plans.get_mut(plan_key) {
         plan.commits = new_commits;
@@ -1120,13 +1139,18 @@ mod tests {
             "canonical file should exist at {canonical_rel}"
         );
 
-        // The session's plan_feedback map should have the entry under
-        // the target SHA + alice key.
+        // The session's Plan.commits map should carry alice's entry
+        // under the target SHA's gate.
         let key_present = rt
             .read_repo(dir.path(), |s| {
                 s.plans[&PlanKey::from("foo".to_string())]
-                    .plan_feedback
-                    .contains_key(&(intro_sha, AgentLabel::from("alice".to_string())))
+                    .commits
+                    .get(&intro_sha)
+                    .map(|g| {
+                        g.feedback
+                            .contains_key(&AgentLabel::from("alice".to_string()))
+                    })
+                    .unwrap_or(false)
             })
             .await
             .unwrap();
@@ -1220,9 +1244,9 @@ mod tests {
             .read_repo(dir.path(), |s| {
                 let sess = &s.plans[&PlanKey::from("foo".to_string())];
                 let any_entry_for_alice = sess
-                    .plan_feedback
-                    .keys()
-                    .any(|(_, author)| author.as_str() == "alice");
+                    .commits
+                    .values()
+                    .any(|g| g.feedback.keys().any(|author| author.as_str() == "alice"));
                 (sess.held_plan_feedback.len(), any_entry_for_alice)
             })
             .await
