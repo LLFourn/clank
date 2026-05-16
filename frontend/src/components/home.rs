@@ -112,18 +112,20 @@ fn ActivitySidebar(store: EventStore) -> impl IntoView {
                         }
                         key=|(_, e)| activity_key(e)
                         children=move |(_, e)| {
-                            let label = e
-                                .plan_id
-                                .clone()
-                                .or_else(|| e.slug.clone())
-                                .unwrap_or_else(|| "—".to_string());
-                            let kind = e.kind.clone();
+                            use crate::store::LiveEvent;
+                            let (label, href, kind) = match &e {
+                                LiveEvent::Plan(p) => (
+                                    p.plan_id.clone(),
+                                    format!("/plan/{}", p.plan_id),
+                                    p.kind.clone(),
+                                ),
+                                LiveEvent::Repo(r) => (
+                                    "—".to_string(),
+                                    "#".to_string(),
+                                    r.kind.clone(),
+                                ),
+                            };
                             let kind_class = format!("activity-kind activity-{kind}");
-                            let href = e
-                                .plan_id
-                                .as_ref()
-                                .map(|p| format!("/plan/{p}"))
-                                .unwrap_or_else(|| "#".to_string());
                             view! {
                                 <li class="activity-row">
                                     <span class=kind_class>{kind}</span>
@@ -141,14 +143,12 @@ fn ActivitySidebar(store: EventStore) -> impl IntoView {
 }
 
 fn activity_key(e: &crate::store::LiveEvent) -> String {
-    // ts + kind + plan_id is unique-enough across the rolling 50-entry
-    // window.
-    format!(
-        "{}:{}:{}",
-        e.ts,
-        e.kind,
-        e.plan_id.as_deref().unwrap_or("-")
-    )
+    use crate::store::LiveEvent;
+    let plan_id = match e {
+        LiveEvent::Plan(p) => p.plan_id.as_str(),
+        LiveEvent::Repo(_) => "-",
+    };
+    format!("{}:{}:{}", e.ts(), e.kind(), plan_id)
 }
 
 fn plan_table(rows: Vec<PlanRow>) -> impl IntoView {

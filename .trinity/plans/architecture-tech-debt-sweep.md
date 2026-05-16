@@ -437,8 +437,10 @@ distinct.
 - `runtime_snapshot.rs` deleted; response builders read live
   `&RepoState` directly or take narrow typed query DTOs (no
   `to_repo_state()` compat bridge).
-- Unified `PlanSelector` resolver path consumed by MCP, HTTP, and
-  tests — no per-surface bespoke plan-id resolution.
+- ~~Unified `PlanSelector` resolver path consumed by MCP, HTTP, and
+  tests — no per-surface bespoke plan-id resolution.~~
+  **Cancelled (see Phase 7).** The three resolution surfaces are
+  intentional layer boundaries.
 - Fake `Option<T>` fields (variant-tag Options on `WaitResponse`,
   timeline events, live events) replaced with typed enum variants.
   Every remaining `Option` answers a real "absence is meaningful"
@@ -447,9 +449,9 @@ distinct.
   from daemon and shim; default raised from 60s to 1800s
   (30 minutes). Trinity stops imposing a semantic timeout ceiling
   on its blocking coordination primitive.
-- `Phase` and `TimelinePhase` enums deleted (folded into
-  `CommitKind`-derived posture); coordinated with `wfw-alias §12`
-  for `PlanState::Done`.
+- `TimelinePhase` enum deleted (folded into `CommitKind`-derived
+  posture). `Phase` enum deletion deferred to `wfw-alias §12` —
+  the two halves want to land together for wire-shape stability.
 - Frontend feedback shape unified — pick `CommitFeedback`, delete
   `FeedbackEntry` and the bridge; remove blanket `#[allow(dead_code)]`
   on wire structs.
@@ -696,41 +698,29 @@ take narrow query DTOs computed on the fly.
   compat-bridge methods. No long-term `to_repo_state()` shim.
 - Delete `runtime_snapshot.rs` once all callers migrate.
 
-### Phase 7 — Unified `PlanSelector` resolver
+### Phase 7 — Unified `PlanSelector` resolver — **CANCELLED**
 
-Today the "which plan?" question resolves differently in MCP, HTTP,
-and tests:
-- MCP `wait_for_work` infers from cwd (`server/mcp.rs:48-88`).
-- HTTP `/api/wait_for_work` and core `server/wait.rs:115-121`
-  reject empty `plan_id`.
-- Tests construct their own.
+**Decision (during execution):** This phase is cancelled, not
+deferred. The three "resolution surfaces" the original framing
+treated as drift are actually intentional layer boundaries:
 
-Work:
-- Define a typed `PlanSelector` enum in a shared module (probably
-  `lifecycle.rs` or a new `plan_selector.rs`):
-  ```rust
-  pub enum PlanSelector {
-      Explicit(PlanId),
-      InferFromCwd { cwd: PathBuf },
-      InferFromRepoFilter(RepoBasename),
-  }
-  ```
-- Define one resolver:
-  `pub fn resolve(selector: &PlanSelector, trinity: &Trinity)
-   -> Result<PlanId, PlanResolutionError>` where the error variants
-  cover `NoActivePlans`, `Ambiguous { candidates }`, and
-  `RepoNotWatched`.
-- Replace every entry point's bespoke resolution logic with one
-  call to the resolver:
-  - `server/mcp.rs` `resolve_plan_id`
-  - `server/wait.rs` plan_id check
-  - HTTP `/api/wait_for_work` handler
-  - `server/mcp.rs` `get_context`
-- If HTTP truly cannot resolve from cwd (the request has no notion
-  of caller cwd), encode that in the type: HTTP handlers construct
-  `PlanSelector::Explicit(...)` only, and the type-checker
-  prevents accidentally passing a cwd-inference variant. The split
-  becomes intentional rather than accidental.
+- MCP `resolve_plan_id` infers from cwd because the MCP transport
+  is the one place we have a caller cwd.
+- HTTP `/api/wait_for_work` requires an explicit `plan_id` because
+  the request has no caller cwd. The "drift" is a feature: the
+  type-checker should not let an HTTP handler construct a
+  cwd-inference variant.
+- Tests construct what they need because they know what they need.
+
+A typed `PlanSelector` enum unifying these three would be a
+JSON-shaped variant tag wrapping three real call-sites that already
+have different inputs and different error spaces. It adds an
+abstraction layer (selector → resolver) without removing any real
+duplication. `resolve_plan_id` stays in `server/mcp.rs` where its
+cwd-inference logic is local to MCP.
+
+Acceptance Criterion 9 (one resolver path) is hereby withdrawn from
+the sweep.
 
 ### Phase 8 — Purge fake `Option<T>`
 
@@ -764,20 +754,21 @@ Concrete starting points:
 
 ### Phase 9 — Delete `Phase` and `TimelinePhase`
 
-**Ordering with `wfw-alias §12`**: `wfw-alias §12` deletes
-`PlanState::Done`. This phase deletes `Phase` and `TimelinePhase`.
-The two interact at the wire layer (both contribute to the
-"is this done?" question on the response). Recommended ordering:
+**Status (during execution):** `TimelinePhase` is deleted. Full
+`Phase` enum deletion is **deferred until `wfw-alias §12` lands**
+(which deletes `PlanState::Done`). The two interact at the wire
+layer and the cheapest sequencing is for §12 to land first.
+
+The remainder of this section describes the full work; the
+`TimelinePhase` half has shipped. The `Phase` half is queued for
+the §12 follow-up, not abandoned.
+
+Ordering:
 
 1. `wfw-alias §12` lands first, deleting `PlanState::Done` and
    reshaping the wire so `state: "active" | "done"` becomes a
    derived predicate.
-2. This phase lands second, deleting `Phase` and `TimelinePhase`.
-
-If this phase lands first, leave `Phase::Done` in place until §12
-can take it; the wire string for `phase` remains
-`"planning"`/`"implementing"`/`"done"` until both phases are
-complete.
+2. The `Phase` half of this phase lands second.
 
 Work:
 - Introduce `fn current_posture(&self) -> Posture` on `Plan` (or a
@@ -853,20 +844,32 @@ Note: client-side transport stacks (reqwest, hyper, etc.) may
 have their own timeouts. Those are outside this plan; Trinity
 itself should not impose a semantic cap.
 
-### Phase 12 — `tests/end_to_end.rs` split + injectable test home
+### Phase 12 — Injectable test HOME (file split deferred)
 
-**Mandatory**, not optional. A 1707-line e2e file plus a global
-`$HOME` mutex *is* architecture debt — exactly what this plan is
-paying down. Lands last because it's the largest churn footprint,
-but it is part of the acceptance criteria.
+**Status (during execution):** The `$HOME` mutation and the
+`HOME_LOCK` mutex are removed — that was the substantive design
+smell. The e2e file is still one file; the split into themed files
+is **deferred** as cosmetic-only.
 
-- Refactor the test harness so `$HOME` is injected via a struct
-  field rather than mutated via `std::env::set_var`. The
-  `HOME_LOCK` global mutex goes away with this.
-- Split by surface: `tests/wait_for_work.rs`, `tests/get_context.rs`,
-  `tests/feedback_ingest.rs`, `tests/multi_repo.rs`.
-- Move shared setup (`init_repo`, `write_file`, `commit`) to
-  `tests/common/mod.rs`.
+What landed:
+- `HOME_LOCK` static mutex deleted.
+- All `unsafe { std::env::set_var("HOME", ...) }` removed from the
+  e2e tests. Audit confirmed the only daemon HOME-reader is
+  `expand_home` in `server/mod.rs`, which only fires when the
+  `--repos`/`--lock` path starts with `~/`. Tests pass absolute
+  tempdir paths to both, so `expand_home` no-ops — the HOME
+  mutation was defensive against a code path that doesn't exist.
+- The unit-test SSE shape assertion was updated to match the new
+  tagged wire (`scope: "repo"` / `scope: "plan"`) introduced by
+  Phase 8's daemon-side LiveEvent enum split.
+
+What's deferred:
+- Splitting `tests/end_to_end.rs` (~1.6k lines) into themed files
+  is mechanical only. The design smell that motivated the split
+  (global $HOME mutation under a mutex) is gone; the remaining
+  ergonomic concern is file size, which can be addressed when a
+  concrete need appears (e.g. tests start sharing setup that
+  doesn't fit in one file).
 
 ## Risks
 
@@ -926,7 +929,8 @@ post-sweep tree. Reviewers should grep for each.
      `PlanSnapshotBundle::to_repo_state`, and `runtime_snapshot.rs`
      entirely removed.
    - `TimelinePhase` enum removed.
-   - `Phase` enum removed (modulo §12 coordination — see Phase 9).
+   - `Phase` enum: **deferred to `wfw-alias §12`** (the §12
+     PlanState::Done deletion is the cheapest sequencing).
 3. **No `#[allow(dead_code)]` added to preserve old shapes.** The
    sweep removes dead code; it doesn't tag it as kept-for-now.
 4. **No new compatibility shims** unless this plan names the
@@ -949,9 +953,10 @@ post-sweep tree. Reviewers should grep for each.
    `CommitSha::new("hello")`, `PlanKey::new("../etc/passwd")`,
    `AgentLabel::new("")`. JSON requests with malformed IDs fail at
    deserialize.
-9. **One resolver path.** `PlanSelector` is the only type that
-   answers "which plan?"; `server/mcp.rs`, `server/wait.rs`, and
-   HTTP wait-for-work all consume the same resolver.
+9. **Withdrawn.** `PlanSelector` unification was cancelled during
+   execution (see Phase 7). The three resolution surfaces
+   (MCP cwd-inference, HTTP explicit `plan_id`, tests) are
+   intentional layer boundaries, not drift.
 10. **`runtime.rs` `self_writes` ring deleted** along with its two
     methods.
 11. **`wait_for_work` timeout cap removed.** `MAX_TIMEOUT_SECS`
@@ -960,9 +965,10 @@ post-sweep tree. Reviewers should grep for each.
     daemon or shim. Tool description says "positive seconds,
     default 1800 (30 minutes)". Default raised to 1800. A test
     asserts a timeout above 300 is accepted without rewriting.
-12. **`tests/end_to_end.rs` split into themed files** under
-    `tests/`, with `HOME_LOCK` mutex removed in favour of an
-    injected test-home struct field.
+12. **Partially met.** The `HOME_LOCK` mutex is removed and the
+    `$HOME` mutation is gone (it was defensive against a code path
+    that doesn't exist for absolute-path inputs). The e2e file
+    split is deferred as cosmetic-only — see Phase 12 status.
 
 ## Out of Scope (Explicit)
 

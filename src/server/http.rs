@@ -118,18 +118,20 @@ async fn event_stream(
         tokio_stream::wrappers::BroadcastStream::new(rx).filter_map(|r| async move { r.ok() });
 
     let combined = live_stream.map(|e| {
-        let plan_id_str = e.plan_id.as_ref().map(|p| p.to_string());
-        let slug = e.plan_id.as_ref().map(|p| p.key().as_str().to_string());
-        let state_str = e.state.as_ref().map(|s| s.as_str());
-        let payload = json!({
-            "ts": e.ts,
-            "repo": e.repo.to_string_lossy(),
-            "plan_id": plan_id_str,
-            "slug": slug,
-            "state": state_str,
-            "kind": e.kind,
-            "payload": e.payload,
-        });
+        use crate::repo_state::LiveEvent;
+        let payload = match &e {
+            LiveEvent::Repo(re) => json!({
+                "scope": "repo",
+                "ts": re.ts,
+                "kind": re.kind.as_str(),
+            }),
+            LiveEvent::Plan(pe) => json!({
+                "scope": "plan",
+                "ts": pe.ts,
+                "plan_id": pe.plan_id.to_string(),
+                "kind": pe.kind.as_str(),
+            }),
+        };
         Ok(sse::Event::default().data(payload.to_string()))
     });
 

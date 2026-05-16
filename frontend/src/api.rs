@@ -1,19 +1,14 @@
 //! Typed fetch wrappers around the daemon's `/api/*` surface.
 //!
 //! Shapes deliberately mirror what `src/ui_response.rs` produces on the
-//! daemon side. When changing one, update the other.
-//!
-//! Several structs carry `#[allow(dead_code)]` because the SPA does not
-//! consume every JSON field yet (e.g. `expected_action`,
-//! `implementation_commits`, `plan_intro`). The allow is intentional and
-//! per-struct: the type round-trips the full contract so a future
-//! component is a UI-only change rather than a coordinated daemon+SPA
-//! edit.
+//! daemon side. When changing one, update the other. Fields the SPA
+//! does not consume are deleted, not retained behind `#[allow(dead_code)]`;
+//! the daemon may continue emitting them (serde ignores extras) but the
+//! frontend type only carries what the UI reads.
 
 use serde::Deserialize;
 
 #[derive(Debug, Clone, Deserialize)]
-#[allow(dead_code)]
 pub struct WaitingOn {
     pub role: String,
     pub reason: String,
@@ -23,30 +18,21 @@ pub struct WaitingOn {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-#[allow(dead_code)]
 pub struct PlanRow {
-    pub repo: String,
     pub plan_id: String,
-    pub slug: String,
     pub state: String,
-    pub current_path: String,
     pub phase: String,
     pub worktree_status: String,
     pub waiting_on: WaitingOn,
-    #[serde(default)]
-    pub last_activity_ts: i64,
 }
 
 #[derive(Debug, Clone, Deserialize)]
-#[allow(dead_code)]
 pub struct PlanConflictRow {
-    pub plan_id: String,
     pub slug: String,
     pub paths: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
-#[allow(dead_code)]
 pub struct PlansIndex {
     #[serde(default)]
     pub plans: Vec<PlanRow>,
@@ -55,20 +41,8 @@ pub struct PlansIndex {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-#[allow(dead_code)]
-pub struct ReviewTarget {
-    pub phase: String,
-    pub commit_sha: String,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[allow(dead_code)]
 pub struct ReviewGate {
     pub state: String,
-    #[serde(default)]
-    pub phase: Option<String>,
-    #[serde(default)]
-    pub participants: Vec<String>,
     #[serde(default)]
     pub approvals: Vec<String>,
     #[serde(default)]
@@ -77,78 +51,46 @@ pub struct ReviewGate {
     pub missing_approvals: Vec<String>,
 }
 
-/// Per-commit gate state — the canonical wire shape under
-/// `PlanDetail.commits[]`. This is where the SPA reads gate
-/// state and feedback from.
 #[derive(Debug, Clone, Deserialize)]
-#[allow(dead_code)]
-pub struct CommitGate {
-    pub state: String,
-    #[serde(default)]
-    pub participants: Vec<String>,
-    #[serde(default)]
-    pub approvers: Vec<String>,
-    #[serde(default)]
-    pub requesters: Vec<String>,
-    #[serde(default)]
-    pub ambiguous: Vec<String>,
-    #[serde(default)]
-    pub missing: Vec<String>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[allow(dead_code)]
 pub struct CommitFeedback {
     pub author: String,
     pub verdict: String,
-    pub body_raw: String,
     pub body_html: String,
-    pub path: String,
     #[serde(default)]
     pub created_at: i64,
 }
 
 #[derive(Debug, Clone, Deserialize)]
-#[allow(dead_code)]
 pub struct CommitEntry {
     pub sha: String,
     pub kind: String,
-    pub gate: Option<CommitGate>,
     #[serde(default)]
     pub feedback: Vec<CommitFeedback>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
-#[allow(dead_code)]
 pub struct CommitRef {
     pub commit_sha: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(tag = "kind")]
-#[allow(dead_code)]
 pub enum TimelineEvent {
     #[serde(rename = "commit_plan")]
     CommitPlan {
         sha: String,
-        plan_touch: Option<String>,
-        has_code_changes: bool,
         #[serde(default)]
         subject: String,
     },
     #[serde(rename = "commit_impl")]
     CommitImpl {
         sha: String,
-        plan_touch: Option<String>,
-        has_code_changes: bool,
         #[serde(default)]
         subject: String,
     },
     #[serde(rename = "commit_mixed")]
     CommitMixed {
         sha: String,
-        plan_touch: Option<String>,
-        has_code_changes: bool,
         #[serde(default)]
         subject: String,
     },
@@ -158,51 +100,33 @@ pub enum TimelineEvent {
         target: String,
         author: String,
         verdict: String,
-        #[serde(default)]
-        created_at: i64,
     },
 }
 
 #[derive(Debug, Clone, Deserialize)]
-#[allow(dead_code)]
 pub struct PrHintOption {
     pub name: String,
-    pub base: String,
     pub command: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
-#[allow(dead_code)]
 pub struct PrHint {
-    pub plan_intro: String,
-    pub plan_intro_parent: Option<String>,
-    #[serde(default)]
-    pub implementation_commits: Vec<String>,
     #[serde(default)]
     pub options: Vec<PrHintOption>,
     pub suggested_message: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
-#[allow(dead_code)]
 pub struct PlanDetail {
-    pub repo: String,
     pub plan_id: String,
-    pub slug: String,
     pub state: String,
     pub current_path: String,
     pub phase: String,
     pub plan_worktree_status: String,
     pub waiting_on: WaitingOn,
-    pub expected_action: String,
-    pub review_target: Option<ReviewTarget>,
     pub review_gate: Option<ReviewGate>,
     pub latest_plan_revision: Option<CommitRef>,
     pub latest_implementation_revision: Option<CommitRef>,
-    #[serde(default)]
-    pub plan_revisions: Vec<String>,
-    #[serde(default)]
-    pub implementation_commits: Vec<String>,
     #[serde(default)]
     pub commits: Vec<CommitEntry>,
     #[serde(default)]
@@ -261,16 +185,10 @@ pub async fn fetch_plan(plan_id: String) -> Result<PlanDetail, FetchError> {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-#[allow(dead_code)]
 pub struct PlanRevisionPage {
-    pub repo: String,
     pub plan_id: String,
-    pub slug: String,
     pub commit_sha: String,
-    pub body_raw: String,
     pub body_html: String,
-    pub plan_intro: String,
-    pub plan_intro_parent: Option<String>,
     pub previous_sha: Option<String>,
     pub next_sha: Option<String>,
     #[serde(default)]
@@ -295,7 +213,6 @@ pub async fn fetch_plan_revision(
 }
 
 #[derive(Debug, Clone, Deserialize)]
-#[allow(dead_code)]
 pub struct DiffLine {
     pub kind: String,
     pub old_lineno: Option<u64>,
@@ -304,14 +221,12 @@ pub struct DiffLine {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-#[allow(dead_code)]
 pub struct DiffHunk {
     pub header: String,
     pub lines: Vec<DiffLine>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
-#[allow(dead_code)]
 pub struct FileDiff {
     pub path: String,
     pub old_path: Option<String>,
@@ -326,14 +241,9 @@ pub struct FileDiff {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-#[allow(dead_code)]
 pub struct CommitDiffPage {
-    pub repo: String,
     pub plan_id: String,
-    pub slug: String,
     pub commit_sha: String,
-    #[serde(default)]
-    pub subject: String,
     #[serde(default)]
     pub message_body: String,
     #[serde(default)]
@@ -357,10 +267,7 @@ pub async fn fetch_commit_diff(plan_id: String, sha: String) -> Result<CommitDif
 }
 
 #[derive(Debug, Clone, Deserialize)]
-#[allow(dead_code)]
 pub struct DiffPage {
-    pub repo: String,
-    pub plan_id: String,
     pub from: String,
     pub to: String,
     pub from_path: String,
@@ -370,11 +277,7 @@ pub struct DiffPage {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-#[allow(dead_code)]
-pub struct DoneResponse {
-    pub ok: bool,
-    pub new_plan_path: String,
-}
+pub struct DoneResponse {}
 
 /// `POST /api/plan/{plan_id}/done` — moves the active plan file under
 /// `.trinity/plans/done/`. Returns the new repo-relative path on
@@ -411,7 +314,6 @@ pub async fn fetch_diff(plan_id: String, from: String, to: String) -> Result<Dif
 }
 
 #[derive(Debug, Clone, Deserialize)]
-#[allow(dead_code)]
 pub struct RepoRow {
     pub basename: String,
     pub root: String,
@@ -421,7 +323,6 @@ pub struct RepoRow {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-#[allow(dead_code)]
 pub struct ReposIndex {
     #[serde(default)]
     pub repos: Vec<RepoRow>,
@@ -441,11 +342,7 @@ pub async fn fetch_repos() -> Result<ReposIndex, FetchError> {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-#[allow(dead_code)]
 pub struct DeleteRepoOutcome {
-    pub ok: bool,
-    pub basename: String,
-    pub removed_plan_count: u32,
     /// `Some(msg)` when the in-memory deregistration succeeded but the
     /// registry file rewrite failed. The repo will reappear on daemon
     /// restart until the operator fixes the file; the frontend should

@@ -181,7 +181,7 @@ mod tests {
             .await
             .expect("timeout — watcher did not fire repo_rebuilt")
             .expect("broadcast closed");
-        assert_eq!(event.kind, "repo_rebuilt");
+        assert_eq!(event.kind_str(), "repo_rebuilt");
     }
 
     #[test]

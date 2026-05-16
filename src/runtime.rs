@@ -16,7 +16,9 @@ use crate::fs_watcher::FilesystemSignal;
 use crate::lifecycle::{CommitSha, PlanKey, content_hash};
 use crate::rebuild::{RebuildError, rebuild_repo};
 use crate::repo_state::RepoState;
-use crate::repo_state::{Feedback, LiveEvent, Plan, Trinity};
+use crate::repo_state::{
+    Feedback, LiveEvent, Plan, PlanEvent, PlanEventKind, RepoEvent, RepoEventKind, Trinity,
+};
 
 pub struct Runtime {
     state: Arc<Mutex<Trinity>>,
@@ -156,14 +158,12 @@ impl Runtime {
             .unwrap_or(0);
         self.push_event(
             &mut trinity,
-            LiveEvent {
+            LiveEvent::Repo(RepoEvent {
                 ts: now,
                 repo: canonical,
-                plan_id: None,
-                state: None,
-                kind: "repo_unwatched",
+                kind: RepoEventKind::RepoUnwatched,
                 payload: serde_json::json!({ "plan_count": plan_count }),
-            },
+            }),
         );
         RemoveOutcome::Removed { plan_count }
     }
@@ -280,14 +280,12 @@ impl Runtime {
                     if changed {
                         self.push_event(
                             &mut trinity,
-                            LiveEvent {
+                            LiveEvent::Repo(RepoEvent {
                                 ts: now,
                                 repo: repo_root.to_path_buf(),
-                                plan_id: None,
-                                state: None,
-                                kind: "repo_rebuilt",
+                                kind: RepoEventKind::RepoRebuilt,
                                 payload: serde_json::Value::Null,
-                            },
+                            }),
                         );
                     }
                 }
@@ -301,17 +299,19 @@ impl Runtime {
                     return Ok(());
                 };
                 let plan_state = plan.state;
-                let plan_id = plan_id_for(repo_root, &plan.id);
+                let Some(plan_id) = plan_id_for(repo_root, &plan.id) else {
+                    return Ok(());
+                };
                 self.push_event(
                     &mut trinity,
-                    LiveEvent {
+                    LiveEvent::Plan(PlanEvent {
                         ts: now,
                         repo: repo_root.to_path_buf(),
                         plan_id,
-                        state: Some(plan_state),
-                        kind: "plan_worktree_changed",
+                        state: plan_state,
+                        kind: PlanEventKind::PlanWorktreeChanged,
                         payload: serde_json::json!({"path": path.to_string_lossy()}),
-                    },
+                    }),
                 );
             }
             FilesystemSignal::FeedbackWritten { parsed } => {
@@ -331,18 +331,22 @@ impl Runtime {
                 };
                 upsert_feedback(session, abs_path, parsed, body);
                 refresh_commits_for(state, &session_id);
-                let plan_state = state.plans.get(&session_id).map(|p| p.state);
-                let plan_id = plan_id_for(repo_root, &session_id);
+                let Some(plan_state) = state.plans.get(&session_id).map(|p| p.state) else {
+                    return Ok(());
+                };
+                let Some(plan_id) = plan_id_for(repo_root, &session_id) else {
+                    return Ok(());
+                };
                 self.push_event(
                     &mut trinity,
-                    LiveEvent {
+                    LiveEvent::Plan(PlanEvent {
                         ts: now,
                         repo: repo_root.to_path_buf(),
                         plan_id,
                         state: plan_state,
-                        kind: "feedback_changed",
+                        kind: PlanEventKind::FeedbackChanged,
                         payload: serde_json::Value::Null,
-                    },
+                    }),
                 );
             }
             FilesystemSignal::FeedbackRemoved { parsed } => {
@@ -356,18 +360,22 @@ impl Runtime {
                 };
                 remove_feedback(session, &parsed);
                 refresh_commits_for(state, &session_id);
-                let plan_state = state.plans.get(&session_id).map(|p| p.state);
-                let plan_id = plan_id_for(repo_root, &session_id);
+                let Some(plan_state) = state.plans.get(&session_id).map(|p| p.state) else {
+                    return Ok(());
+                };
+                let Some(plan_id) = plan_id_for(repo_root, &session_id) else {
+                    return Ok(());
+                };
                 self.push_event(
                     &mut trinity,
-                    LiveEvent {
+                    LiveEvent::Plan(PlanEvent {
                         ts: now,
                         repo: repo_root.to_path_buf(),
                         plan_id,
                         state: plan_state,
-                        kind: "feedback_removed",
+                        kind: PlanEventKind::FeedbackRemoved,
                         payload: serde_json::Value::Null,
-                    },
+                    }),
                 );
             }
         }
@@ -585,7 +593,7 @@ mod tests {
         drop(trinity);
         let new_events: Vec<_> = after_events.iter().skip(before).collect();
         assert!(
-            !new_events.iter().any(|e| e.kind == "repo_rebuilt"),
+            !new_events.iter().any(|e| e.kind_str() == "repo_rebuilt"),
             "no repo_rebuilt should fire for an unwatched repo; got events: {new_events:?}"
         );
     }
@@ -631,7 +639,7 @@ mod tests {
         assert!(count1 > count0, "attribution should grow after rebuild");
 
         let events = rt.live_events_snapshot().await;
-        assert!(events.iter().any(|e| e.kind == "repo_rebuilt"));
+        assert!(events.iter().any(|e| e.kind_str() == "repo_rebuilt"));
     }
 
     #[tokio::test]
@@ -656,8 +664,8 @@ mod tests {
 
         let events = rt.live_events_snapshot().await;
         assert!(events.iter().any(|e| {
-            e.kind == "plan_worktree_changed"
-                && e.plan_id.as_ref().map(|id| id.key().as_str()) == Some("foo")
+            e.kind_str() == "plan_worktree_changed"
+                && e.plan_id().map(|id| id.key().as_str()) == Some("foo")
         }));
     }
 
@@ -683,7 +691,11 @@ mod tests {
         .unwrap();
 
         let events = rt.live_events_snapshot().await;
-        assert!(events.iter().all(|e| e.kind != "plan_worktree_changed"));
+        assert!(
+            events
+                .iter()
+                .all(|e| e.kind_str() != "plan_worktree_changed")
+        );
     }
 
     #[tokio::test]
@@ -724,7 +736,7 @@ mod tests {
         assert_eq!(v["waiting_on"]["reason"], "ready_to_start_implementation");
 
         let events = rt.live_events_snapshot().await;
-        assert!(events.iter().any(|e| e.kind == "feedback_changed"));
+        assert!(events.iter().any(|e| e.kind_str() == "feedback_changed"));
     }
 
     #[tokio::test]
@@ -815,7 +827,7 @@ mod tests {
             .await
             .expect("timeout waiting for broadcast")
             .expect("broadcast closed");
-        assert_eq!(event.kind, "repo_rebuilt");
+        assert_eq!(event.kind_str(), "repo_rebuilt");
     }
 
     #[tokio::test]

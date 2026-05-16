@@ -7,16 +7,7 @@ use std::process::Command;
 use std::time::Duration;
 
 use serde_json::json;
-use tokio::sync::Mutex;
 use trinity::server;
-
-/// Tests that mutate `$HOME` (so the daemon's `~/.trinity/repos`
-/// registry writes land in a tempdir rather than the user's real home)
-/// must hold this mutex for the duration of the test. Otherwise they
-/// race each other and one test's persist call lands in another test's
-/// fake home. `tokio::sync::Mutex` because the guard is held across
-/// `.await` points; `std::sync::Mutex` would trip `await_holding_lock`.
-static HOME_LOCK: Mutex<()> = Mutex::const_new(());
 
 fn run_git(cwd: &Path, args: &[&str]) {
     let status = Command::new("git")
@@ -647,29 +638,24 @@ async fn sse_pushes_repo_rebuilt_on_head_change() {
     handle.abort();
     let payload = payload.expect("expected `repo_rebuilt` SSE event after HEAD change");
     assert_eq!(payload["kind"], "repo_rebuilt");
+    assert_eq!(
+        payload["scope"], "repo",
+        "repo-level events carry scope: repo; got {payload}"
+    );
     assert!(
         payload["ts"].is_number(),
         "ts should be a unix-seconds number"
     );
-    assert!(payload["repo"].is_string(), "repo should be a string");
     assert!(
         payload["plan_id"].is_null(),
-        "repo-level events carry plan_id: null; got {payload}"
-    );
-    assert!(
-        payload["state"].is_null(),
-        "repo-level events carry state: null; got {payload}"
+        "repo-level events have no plan_id; got {payload}"
     );
 }
 
 #[tokio::test]
 async fn start_plan_persists_repo_to_registry() {
-    // Override $HOME so we don't pollute the user's real ~/.trinity.
-    let _home_guard = HOME_LOCK.lock().await;
+    // Daemon writes to its `--repos` path (here a tempdir), not `~/`.
     let fake_home = tempfile::tempdir().unwrap();
-    let prev_home = std::env::var_os("HOME");
-    // SAFETY: serialized with other HOME-mutating tests via HOME_LOCK.
-    unsafe { std::env::set_var("HOME", fake_home.path()) };
 
     let dir = init_repo();
     // Use the default registry path the daemon resolves from ~/.trinity/repos.
@@ -708,10 +694,6 @@ async fn start_plan_persists_repo_to_registry() {
     // Restore $HOME before dropping the lock — another HOME-mutating
     // test may acquire next and we don't want it to observe our fake
     // value.
-    match prev_home {
-        Some(v) => unsafe { std::env::set_var("HOME", v) },
-        None => unsafe { std::env::remove_var("HOME") },
-    }
 }
 
 #[tokio::test]
@@ -1022,11 +1004,7 @@ async fn start_plan_rejects_repo_basename_collision() {
     // Two distinct canonical repos with the same `file_name`: the second
     // one's `start_plan` must fail with a basename-collision error
     // (`repo_basename_taken`) before any disk mutation.
-    let _home_guard = HOME_LOCK.lock().await;
     let fake_home = tempfile::tempdir().unwrap();
-    let prev_home = std::env::var_os("HOME");
-    // SAFETY: serialized with other HOME-mutating tests via HOME_LOCK.
-    unsafe { std::env::set_var("HOME", fake_home.path()) };
 
     let parent_a = tempfile::tempdir().unwrap();
     let parent_b = tempfile::tempdir().unwrap();
@@ -1102,10 +1080,6 @@ async fn start_plan_rejects_repo_basename_collision() {
 
     // Restore HOME before dropping the lock — another HOME-mutating test
     // may acquire next and we don't want it to observe our fake value.
-    match prev_home {
-        Some(v) => unsafe { std::env::set_var("HOME", v) },
-        None => unsafe { std::env::remove_var("HOME") },
-    }
 }
 
 #[tokio::test]
@@ -1114,11 +1088,7 @@ async fn start_plan_concurrent_basename_twins_loser_does_no_disk_mutation() {
     // fired concurrently must result in exactly one repo with a written
     // `.gitignore` + `~/.trinity/repos` entry — the loser must not leak
     // disk mutations between the precheck and the atomic register.
-    let _home_guard = HOME_LOCK.lock().await;
     let fake_home = tempfile::tempdir().unwrap();
-    let prev_home = std::env::var_os("HOME");
-    // SAFETY: serialized with other HOME-mutating tests via HOME_LOCK.
-    unsafe { std::env::set_var("HOME", fake_home.path()) };
 
     let parent_a = tempfile::tempdir().unwrap();
     let parent_b = tempfile::tempdir().unwrap();
@@ -1197,11 +1167,6 @@ async fn start_plan_concurrent_basename_twins_loser_does_no_disk_mutation() {
         !registry.lines().any(|l| l.trim() == loser_str),
         "registry must not record the loser twin; registry: {registry}"
     );
-
-    match prev_home {
-        Some(v) => unsafe { std::env::set_var("HOME", v) },
-        None => unsafe { std::env::remove_var("HOME") },
-    }
 }
 
 #[tokio::test]
@@ -1248,11 +1213,7 @@ async fn api_repos_lists_watched_with_basename_and_plan_count() {
 
 #[tokio::test]
 async fn delete_repo_removes_from_state_and_registry() {
-    let _home_guard = HOME_LOCK.lock().await;
     let fake_home = tempfile::tempdir().unwrap();
-    let prev_home = std::env::var_os("HOME");
-    // SAFETY: serialized with other HOME-mutating tests via HOME_LOCK.
-    unsafe { std::env::set_var("HOME", fake_home.path()) };
 
     let parent = tempfile::tempdir().unwrap();
     let dir = parent.path().join("orphan");
@@ -1326,11 +1287,6 @@ async fn delete_repo_removes_from_state_and_registry() {
         !registry.lines().any(|l| l.trim() == dir_str),
         "registry must not contain unwatched repo; registry: {registry}"
     );
-
-    match prev_home {
-        Some(v) => unsafe { std::env::set_var("HOME", v) },
-        None => unsafe { std::env::remove_var("HOME") },
-    }
 }
 
 #[tokio::test]
@@ -1341,12 +1297,6 @@ async fn delete_repo_removes_non_canonical_registry_lines() {
     // trailing slash, or a symlinked prefix) was kept, so DELETE
     // returned ok:true and the repo resurrected on next daemon
     // restart. The fix canonicalizes each line before comparing.
-    let _home_guard = HOME_LOCK.lock().await;
-    let fake_home = tempfile::tempdir().unwrap();
-    let prev_home = std::env::var_os("HOME");
-    // SAFETY: serialized via HOME_LOCK with other HOME-mutating tests.
-    unsafe { std::env::set_var("HOME", fake_home.path()) };
-
     let registry_parent = tempfile::tempdir().unwrap();
     let registry_path = registry_parent.path().join("repos");
 
@@ -1409,11 +1359,6 @@ async fn delete_repo_removes_non_canonical_registry_lines() {
         after.trim().is_empty(),
         "registry should be empty after removing the only entry; got: {after}"
     );
-
-    match prev_home {
-        Some(v) => unsafe { std::env::set_var("HOME", v) },
-        None => unsafe { std::env::remove_var("HOME") },
-    }
 }
 
 #[tokio::test]
@@ -1430,12 +1375,6 @@ async fn delete_repo_surfaces_registry_write_error() {
     // `remove_repo_from_registry` writes a `.repos.tmp` sibling and
     // then renames; the tmp-write hits EACCES on a read-only dir.
     use std::os::unix::fs::PermissionsExt;
-
-    let _home_guard = HOME_LOCK.lock().await;
-    let fake_home = tempfile::tempdir().unwrap();
-    let prev_home = std::env::var_os("HOME");
-    // SAFETY: serialized via HOME_LOCK with the other HOME-mutating tests.
-    unsafe { std::env::set_var("HOME", fake_home.path()) };
 
     let registry_parent = tempfile::tempdir().unwrap();
     let registry_path = registry_parent.path().join("repos");
@@ -1526,11 +1465,6 @@ async fn delete_repo_surfaces_registry_write_error() {
             || warning.to_lowercase().contains("registry"),
         "warning should mention the registry; got: {warning}"
     );
-
-    match prev_home {
-        Some(v) => unsafe { std::env::set_var("HOME", v) },
-        None => unsafe { std::env::remove_var("HOME") },
-    }
 }
 
 #[tokio::test]
@@ -1552,11 +1486,7 @@ async fn delete_repo_404_on_unknown_basename() {
 async fn registry_path_threads_through_start_plan_and_delete() {
     // Use a non-default --repos path. Both start_plan (persist) and the
     // new DELETE handler must write to THIS path, not ~/.trinity/repos.
-    let _home_guard = HOME_LOCK.lock().await;
     let fake_home = tempfile::tempdir().unwrap();
-    let prev_home = std::env::var_os("HOME");
-    // SAFETY: serialized with other HOME-mutating tests via HOME_LOCK.
-    unsafe { std::env::set_var("HOME", fake_home.path()) };
 
     let registry_dir = tempfile::tempdir().unwrap();
     let registry_path = registry_dir.path().join("custom-registry");
@@ -1613,11 +1543,6 @@ async fn registry_path_threads_through_start_plan_and_delete() {
         !after.lines().any(|l| l.trim() == dir_canonical),
         "DELETE should remove from custom registry; got: {after}"
     );
-
-    match prev_home {
-        Some(v) => unsafe { std::env::set_var("HOME", v) },
-        None => unsafe { std::env::remove_var("HOME") },
-    }
 }
 
 #[tokio::test]

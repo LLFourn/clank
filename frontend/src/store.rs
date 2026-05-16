@@ -29,23 +29,39 @@ const CHIME_COALESCE_MS: f64 = 300.0;
 const MUTE_LS_KEY: &str = "trinity.muted";
 
 #[derive(Debug, Clone, Deserialize)]
-#[allow(dead_code)]
-pub struct LiveEvent {
+#[serde(tag = "scope", rename_all = "snake_case")]
+pub enum LiveEvent {
+    Repo(RepoEventPayload),
+    Plan(PlanEventPayload),
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct RepoEventPayload {
     pub ts: i64,
-    pub repo: String,
-    /// `None` for repo-level events. Plan-scoped events carry the
-    /// canonical plan identity `<repo_basename>/<stem>.md`.
-    #[serde(default)]
-    pub plan_id: Option<String>,
-    /// Plan stem only — convenience for display.
-    #[serde(default)]
-    pub slug: Option<String>,
-    /// `"active"` | `"done"`, or `None` for repo-level events.
-    #[serde(default)]
-    pub state: Option<String>,
     pub kind: String,
-    #[serde(default)]
-    pub payload: serde_json::Value,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct PlanEventPayload {
+    pub ts: i64,
+    pub plan_id: String,
+    pub kind: String,
+}
+
+impl LiveEvent {
+    pub fn ts(&self) -> i64 {
+        match self {
+            LiveEvent::Repo(e) => e.ts,
+            LiveEvent::Plan(e) => e.ts,
+        }
+    }
+
+    pub fn kind(&self) -> &str {
+        match self {
+            LiveEvent::Repo(e) => &e.kind,
+            LiveEvent::Plan(e) => &e.kind,
+        }
+    }
 }
 
 #[derive(Clone, Copy)]

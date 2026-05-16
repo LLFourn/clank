@@ -518,19 +518,79 @@ impl CommitKind {
     }
 }
 
+/// A single live activity tick from the watcher loop. Tagged enum so a
+/// repo-level event (no plan context) is structurally distinct from a
+/// plan-scoped event — no `Option<PlanId>` variant tag.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct LiveEvent {
+pub enum LiveEvent {
+    Repo(RepoEvent),
+    Plan(PlanEvent),
+}
+
+impl LiveEvent {
+    pub fn kind_str(&self) -> &'static str {
+        match self {
+            LiveEvent::Repo(e) => e.kind.as_str(),
+            LiveEvent::Plan(e) => e.kind.as_str(),
+        }
+    }
+
+    pub fn plan_id(&self) -> Option<&crate::lifecycle::PlanId> {
+        match self {
+            LiveEvent::Plan(e) => Some(&e.plan_id),
+            LiveEvent::Repo(_) => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RepoEvent {
     pub ts: i64,
     pub repo: RepoRoot,
-    /// `None` for repo-level events (`repo_rebuilt`). Plan-scoped
-    /// events (`plan_worktree_changed`, `feedback_changed`,
-    /// `feedback_removed`) carry the plan's canonical `PlanId` so the
-    /// SPA can build navigation URLs without re-deriving anything.
-    pub plan_id: Option<crate::lifecycle::PlanId>,
-    /// State at emit time. `None` for repo-level events.
-    pub state: Option<PlanState>,
-    pub kind: &'static str,
+    pub kind: RepoEventKind,
     pub payload: serde_json::Value,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RepoEventKind {
+    RepoRebuilt,
+    RepoUnwatched,
+}
+
+impl RepoEventKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RepoEventKind::RepoRebuilt => "repo_rebuilt",
+            RepoEventKind::RepoUnwatched => "repo_unwatched",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlanEvent {
+    pub ts: i64,
+    pub repo: RepoRoot,
+    pub plan_id: crate::lifecycle::PlanId,
+    pub state: PlanState,
+    pub kind: PlanEventKind,
+    pub payload: serde_json::Value,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlanEventKind {
+    PlanWorktreeChanged,
+    FeedbackChanged,
+    FeedbackRemoved,
+}
+
+impl PlanEventKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            PlanEventKind::PlanWorktreeChanged => "plan_worktree_changed",
+            PlanEventKind::FeedbackChanged => "feedback_changed",
+            PlanEventKind::FeedbackRemoved => "feedback_removed",
+        }
+    }
 }
 
 /// The `waiting_on` projection — the canonical per-session "who blocks
