@@ -74,13 +74,13 @@ into the type as-is.
 **`commit_kind_for` is recomputed on every wire-builder pass.**
 `projection.rs:610` is the pure function; `mcp_response.rs:310`,
 `ui_response.rs:302`, and `projection.rs:141/393/415/700` all call it
-each time a response is built. The kind is a deterministic function of
-data that already lives in `RepoState` (`plan_touches`, `attribution`)
-and never changes for a given (plan, sha) pair after disk-snapshot
-ingest. `RepoState` should memoize `commit_kinds:
-BTreeMap<CommitSha, BTreeMap<PlanKey, CommitKind>>` once at ingest
-time. Q1 (invariant available, not leveraged) and Q2 (repeated
-computation).
+each time a response is built. The framing here is *clarity*, not
+performance — `commit_kind_for` is microseconds and Trinity holds
+small N. The fix is to expose `Plan::commit_kind_of(&CommitSha) ->
+Option<CommitKind>` (or a free fn) so callers don't have to know
+which four arguments to pass each time. **Explicitly not proposed:
+memoizing into a `BTreeMap` cache on `RepoState`.** That would be
+premature optimization.
 
 **Three parallel phase enums.** `Phase::{Planning,Implementing,Done}`
 (`repo_state.rs:429`), `TimelinePhase::{Plan,Impl}`
@@ -187,14 +187,12 @@ restating here because it directly contradicts question 3's premise.
 A `CommitSha` that doesn't reject `"hello"` isn't doing the job a
 strong type implies.
 
-**`Trinity` god-object dual-index is fine but undocumented.**
-`repo_state.rs:16-23` holds `repos: BTreeMap<RepoRoot, RepoState>`
-plus a `repo_basenames: BTreeMap<RepoBasename, RepoRoot>` reverse
-index for basename-collision detection. This isn't a layering
-violation — it's the canonical store — but the invariant ("for every
-key in `repos` there's exactly one entry in `repo_basenames` mapping
-back to it") lives only in commit history. Worth a debug-assert on
-mutation entrypoints, or a constructor that wraps the pair.
+**`Trinity` dual-index is justified.** `repo_state.rs:16-23` holds
+`repos: BTreeMap<RepoRoot, RepoState>` plus
+`repo_basenames: BTreeMap<RepoBasename, RepoRoot>`. The reverse
+index is hit at every ID resolution (`server/http.rs:171`,
+`server/wait.rs:434`, `server/mcp.rs:165, 311`) — not speculative.
+No change proposed.
 
 ### Q4 — Design decisions that went the complicated way for no reason
 
@@ -315,10 +313,12 @@ returns zero hits inside `projection.rs`, `attribution.rs`,
 4. Self-writes ring (lines 243–264, dead)
 5. Feedback ingestion + commit refresh (lines 447–519)
 
-Reasonable extraction targets: an `event_bus` module (out of #3), a
-`signal_router` module (out of #2), a `feedback_ingest` module (out
-of #5). Splitting #1 from `Runtime` is harder — the mutex is the
-backbone — but the others can move with mechanical refactors.
+Of these, #4 is dead code (Phase 4 deletes it). The other four are
+cohesive enough that splitting into separate modules right now would
+be premature; there's no second caller, no testability gap, no
+measured maintainability problem beyond "the file is long". Flagged
+as a finding so a future plan can re-evaluate when a concrete reason
+appears (a unit test that can't reach the seam, a second caller).
 
 **Test-only layer crossing.** `mcp_response.rs:492` imports
 `crate::runtime::Runtime` inside `#[cfg(test)]`. Tests for a pure
@@ -369,16 +369,16 @@ distinct.
   deserialize. `CommitSha::new("hello")` no longer compiles.
 - One canonical `CommitGate` shape consumed everywhere; delete the
   `ReviewGateDecision` bridge.
-- Shared `test_helpers` module; eliminate the duplicated `gate` /
+- Shared `test_helpers` module (plain `#[cfg(test)]`, no feature
+  flag, no builder type); eliminate the duplicated `gate` /
   `agents` / `feedback_with` / path-format helpers.
-- `runtime.rs` under 500 lines, with `event_bus` / `signal_router` /
-  `feedback_ingest` extracted as their own modules.
-- `commit_kinds` memoized on `RepoState`, computed once at
-  disk-snapshot ingest, read everywhere else.
+- `self_writes` ring deleted. Other `runtime.rs` extractions only
+  if a concrete reason emerges.
+- Four `latest_*` delegators in `projection.rs` inlined at callers;
+  `commit_kind_for` accessible via a single-arg method on `Plan`.
 - `Phase` and `TimelinePhase` enums deleted (folded into
   `CommitKind`-derived posture); coordinated with `wfw-alias §12`
   for `PlanState::Done`.
-- `self_writes` ring deleted or revived intentionally.
 - Frontend feedback shape unified — pick `CommitFeedback`, delete
   `FeedbackEntry` and the bridge; remove blanket `#[allow(dead_code)]`
   on wire structs.
@@ -387,6 +387,34 @@ distinct.
   any other state-mutating endpoints route through `Runtime`.)
 - Test harness injects `$HOME` instead of mutating it via a global
   mutex.
+
+## Premature Optimization: Explicitly Rejected
+
+This plan deliberately does NOT propose the following, even though
+the first draft did. Future plans / reviews should also reject these
+unless a *measured* problem appears:
+
+- **Memoizing `commit_kind_for` into a cache on `RepoState`.** The
+  function is microseconds; Trinity holds small N. Recomputing is
+  fine. The clarity problem (four-arg call) is solved by an
+  accessor method, not a cache.
+- **`CommitGateBuilder` type.** Six-field struct with sane
+  defaults solves with `..CommitGate::default()` struct-update
+  syntax. A separate builder type is overkill.
+- **`from_validated` internal escape hatch on newtype
+  constructors.** Validating-on-construction is cheap; the
+  "internal-only unchecked path" exists for hypothetical perf wins
+  that don't exist. Just `parse(...).expect("invariant")`.
+- **Splitting `runtime.rs` into three modules.** 890 LOC is big
+  but cohesive; no caller or test demands the extraction. Defer
+  until a concrete reason emerges.
+- **`latest_commit_matching<F>` higher-order primitive.** Three
+  callers don't justify the abstraction. Just inline `.last()`.
+- **`test-helpers` cargo feature flag.** Nothing outside tests
+  consumes them. Plain `#[cfg(test)]` is sufficient.
+- **Debug-asserts / wrapper struct around `Trinity`'s `repos` +
+  `repo_basenames` invariant.** The invariant is local to two
+  mutation entrypoints; no need for a structural enforcer.
 
 ## Non-Goals
 
@@ -405,14 +433,12 @@ Phases form a recommended order with explicit dependencies. The
 ordering is: **Phase 1 (typed IDs) is independent and should land
 first**; **Phase 2 (retire `ReviewGateDecision`) is independent of
 Phase 1** and can run in parallel; **Phase 3 (test helpers) depends
-on Phase 1's validated parsers**; **Phase 4 (runtime extraction)
-depends on Phase 2** (the extracted `feedback_ingest` module reads
-gate types directly, easier with `ReviewGateDecision` already
-deleted); **Phase 5 (memoization + walker collapse) is independent
-of Phase 1-2**; **Phase 6 (`Phase` enum deletion) interacts with
-`wfw-alias §12` and the ordering is specified below**; **Phase 7
-(frontend feedback unification) depends on Phase 6**; **Phase 8
-(test-file split) is last, optional**.
+on Phase 1's validated parsers**; **Phase 4 (runtime dead-code
+removal) is independent of all others**; **Phase 5 (walker collapse
++ accessor) is independent**; **Phase 6 (`Phase` enum deletion)
+interacts with `wfw-alias §12` and the ordering is specified
+below**; **Phase 7 (frontend feedback unification) depends on Phase
+6**; **Phase 8 (test-file split) is last, optional**.
 
 ### Phase 1 — Strong-typed ID validation (three sub-steps)
 
@@ -420,7 +446,7 @@ This is bigger than a single commit because the unchecked `new` /
 `From<&str>` / `From<String>` constructors are used at 50+ call
 sites; the call-site sweep is the bulk of the work. Split:
 
-**1a — Add validated parsers, keep escape hatch.**
+**1a — Add validated parsers.**
 - For each type in `lifecycle.rs`, add
   `pub fn parse(s: &str) -> Result<Self, IdError>` with the
   appropriate validation:
@@ -429,11 +455,10 @@ sites; the call-site sweep is the bulk of the work. Split:
   - `RepoBasename`: non-empty, no `/`.
   - `AgentLabel`: non-empty, no `/`, no leading dot.
   - `ContentHash`: existing format (verify in code).
-- Add `pub(crate) fn from_validated(s: String) -> Self` as the
-  internal-use unchecked path, documented "only call after
-  upstream validation (e.g. disk-snapshot path parsing has
-  already accepted this)".
-- Keep `new` / `From<&str>` / `From<String>` working temporarily.
+- Keep `new` / `From<&str>` / `From<String>` working temporarily so
+  call-sites compile during the migration. No separate
+  `from_validated` escape hatch — callers that know the value is
+  valid use `parse(...).expect("invariant")`.
 
 **1b — Migrate call-sites.**
 - Every call-site that currently uses `new` / `.into()` / `From`
@@ -489,15 +514,19 @@ operations, so it's worth landing first.
 
 ### Phase 3 — Shared test helpers module (depends on 1a)
 
-- Create `src/test_helpers.rs` behind `#[cfg(any(test, feature = "test-helpers"))]`.
-  Contents:
+- Create `src/test_helpers.rs` behind plain `#[cfg(test)]`. No
+  feature flag — nothing outside tests needs these helpers.
+- Contents:
   - `pub fn al(s: &str) -> AgentLabel` / `pk(s) -> PlanKey` /
     `cs(s) -> CommitSha` short-form constructors using the
     validated parsers from Phase 1a (panic on invalid — tests
     pass literals).
   - `pub fn gate(state, participants, approvers, requesters) -> CommitGate`
-    with sensible empty defaults via a builder
-    (`CommitGateBuilder::default().approvers(...).build()`).
+    that constructs via `CommitGate { state, participants,
+    approvers, requesters, ..CommitGate::default() }`. No
+    separate `CommitGateBuilder` type — struct-update syntax
+    already gives us the "fill empty defaults" affordance.
+    Requires `impl Default for CommitGate`.
   - `pub fn feedback_with(author, verdict, target_sha) -> Feedback`.
   - `pub fn touches_one(plan, kind) -> Vec<(PlanKey, PlanTouchKind)>`.
 - Add `FeedbackPath::canonical_string(&self) -> String` in
@@ -508,45 +537,45 @@ operations, so it's worth landing first.
   `disk_snapshot.rs`, and `tests/end_to_end.rs` test code to use
   the shared helpers. Delete the local duplicates.
 
-### Phase 4 — `runtime.rs` extraction (depends on Phase 2)
+### Phase 4 — `runtime.rs` dead-code removal + light cleanup
 
-The dependency: extracted `feedback_ingest` and `signal_router`
-modules will touch `CommitGate` and gate-projection types directly.
-Doing this *after* Phase 2 means the new modules don't need to
-import or adapt to the dead `ReviewGateDecision` bridge.
+The "split runtime.rs into three modules" framing in the first draft
+was premature optimization disguised as cleanliness — 890 lines is
+big but cohesive, and there's no second caller demanding the
+extraction. Scope this phase down to mechanical wins only:
 
-- Extract `src/event_bus.rs` owning the broadcast channel,
-  `subscribe_events`, `push_event`, `LiveEvent` ring buffer.
-  `Runtime` holds `event_bus: EventBus`.
-- Extract `src/feedback_ingest.rs` owning `upsert_feedback`,
-  `remove_feedback`, `extract_feedback`, `refresh_commits_for`.
-  Takes `&mut RepoState` and writes through it; no lock awareness.
-- Extract `src/signal_router.rs` owning `handle_signal` and the
-  signal-kind dispatch. Takes `(Arc<Mutex<Trinity>>, &EventBus,
-  &FeedbackIngest)` or similar.
-- Delete the `self_writes` ring and its two methods. If it's needed
-  later, reintroduce intentionally.
-- `Runtime` ends up under ~400 lines and owns: mutex + wiring of
-  the three extracted services.
-- Risk: this is the largest behaviour-preserving refactor in the
-  sweep. Run `cargo test -p trinity --tests` and
-  `tests/end_to_end.rs` after each module extraction, not at the
-  end.
+- **Delete the `self_writes` ring and its two methods**
+  (`runtime.rs:27, 243-264`). Dead code. Won't be revived without an
+  explicit need.
+- **Inline anything else dead-allow'd** that grep surfaces in
+  `runtime.rs`.
+- **If `cargo test`'s coverage on `runtime.rs` shows the same fn
+  being tested in two different ways** (signal-routing tested via
+  full Runtime + feedback-ingest tested via direct method call),
+  that's a concrete reason to extract — and only then. Otherwise
+  leave `runtime.rs` as one module.
 
-### Phase 5 — Memoize `commit_kinds`; collapse parallel walkers
+Module extraction (`event_bus.rs`, `signal_router.rs`,
+`feedback_ingest.rs`) is **explicitly deferred** until a concrete
+reason emerges (a unit test that can't reach the seam, a second
+caller, or a measured testability problem). 890 lines isn't
+sufficient justification on its own.
 
-- Add `commit_kinds: BTreeMap<CommitSha, BTreeMap<PlanKey, CommitKind>>`
-  to `RepoState`; populate it once in `disk_snapshot::derive_state`
-  using the existing pure `commit_kind_for`. Delete the per-call
-  recomputation in `mcp_response.rs:310`, `ui_response.rs:302`,
-  `projection.rs:141/393/415/700`.
+### Phase 5 — Collapse parallel walkers (no memoization)
+
 - Replace the four `latest_*` delegators
-  (`projection.rs:351-372`) with `.last()` calls at the two or
-  three callers. Equivalently, introduce
-  `fn latest_commit_matching<F: Fn(CommitKind) -> bool>(&self, pred: F)`
-  as the single primitive.
-- Delete `commit_kind_for` from the response builders' import list
-  once `RepoState.commit_kinds` is the canonical source.
+  (`projection.rs:351-372`) with `.last()` at the two or three
+  callers. Just inline. **Don't introduce a
+  `latest_commit_matching<F>` primitive** — three callers don't
+  justify a higher-order function, and it would make the call-sites
+  less direct.
+- Add an accessor: `Plan::commit_kind_of(&CommitSha) ->
+  Option<CommitKind>` (or a free fn that takes `(&Plan, &CommitSha,
+  &Attribution)`), so callers stop having to assemble the four-arg
+  call to `commit_kind_for`. The accessor still computes on the fly.
+- **Explicitly NOT proposed**: memoizing `commit_kind_for` results
+  into a `BTreeMap` on `RepoState`. The recomputation is cheap; the
+  cache would be premature optimization.
 
 ### Phase 6 — Delete `Phase` and `TimelinePhase`
 
@@ -633,11 +662,8 @@ has already been touched once.
   this plan lands first, typed-wire-contracts inherits
   `CommitGate`-typed contracts directly, which is the better
   shape anyway. Either ordering is safe.
-- **Phase 4 (runtime extraction) is large.** `runtime.rs` is the
-  most-tested module; the extraction is mechanical (no behaviour
-  change) but the test surface is large. Run `cargo test -p
-  trinity --tests` plus `tests/end_to_end.rs` after each module
-  split, not at the end. Plan for a focused review pass.
+- **Phase 4 is now small.** Dead-code removal only, no module
+  split. Run the test suite once; no per-step coverage needed.
 - **Phase 6 ordering vs `wfw-alias §12`.** `Phase::Done` and
   `PlanState::Done` are two encodings of the same truth.
   Recommended sequence: §12 deletes `PlanState::Done` first, then
