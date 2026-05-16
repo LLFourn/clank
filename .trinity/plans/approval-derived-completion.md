@@ -44,14 +44,19 @@ Scope this plan owns:
   segment. Working-tree feedback becomes
   `.trinity/feedback/<stem>/<sha>/<agent>.md` (`<sha>` stays because
   the working-tree gate is keyed per-impl-commit).
-- New CLI commands `trinity init` and `trinity finish` (with
-  `--purge`, `--squash`, `--amend` modes) that own the ceremony.
-  The daemon does not write `finished/` files; the CLI does, under
+- New CLI commands `trinity init` (with `--ignore` to delegate
+  to the repo-root `.gitignore` instead of creating
+  `.trinity/.gitignore`) and `trinity finish` (with `--purge`,
+  `--squash`, `--amend` modes) that own the ceremony.
+- New CLI command `trinity purge` for stripping a plan's
+  `.trinity/` content from history without a finalize commit
+  (abandoned plans, post-fact cleanup). Shares the
+  history-rewriting engine with `trinity finish --purge`.
+- The daemon does not write `finished/` files; the CLI does, under
   the operator's hand.
 
-The `architecture-tech-debt-sweep` plan's Phase 9 (delete `Phase`
-enum) was deferred pending this plan; that deletion becomes a tail
-follow-up.
+The `Phase` enum deletion deferred by `architecture-tech-debt-sweep`
+(waiting on `PlanState::Done` removal) lands here as Phase 11.
 
 Source design rationale lives in
 `.trinity/stubs/approval-derived-completion.md` — this plan does
@@ -193,12 +198,20 @@ the previous cycle now archived in the cycle history).
   (no `commits/` segment). The mirror `.trinity/finished/` shares
   the shape.
 - New `trinity init` command scaffolds `.trinity/` for a new repo
-  (directory layout + `.trinity/.gitignore`).
+  (directory layout + ignore rule). `--ignore` mode appends the
+  ignore rule to the repo-root `.gitignore` instead of creating
+  `.trinity/.gitignore`, for projects where the maintainer is
+  willing to add an ignore line but doesn't want a `.trinity/`-owned
+  config file in their tree.
 - New `trinity finish` command makes the finalize commit. Supports
   `--purge` (also git-rm Trinity artifacts for this plan to hide
   Trinity's use), `--squash <message>` (collapse plan-attributed
   commits into one), and `--amend` (re-do the most recent finalize
   with different options).
+- New `trinity purge` command shares the history-rewriting engine
+  with `trinity finish --purge` but skips the finalize ceremony.
+  Strips a plan's `.trinity/` content from history at the
+  operator's request, no gate check.
 - One-time migration path for repos with existing
   `.trinity/plans/done/*.md` files that doesn't lose history.
 - One-time migration for in-flight working-tree feedback at the
@@ -210,9 +223,6 @@ the previous cycle now archived in the cycle history).
   `wfw-alias-and-post-commit-driver.md`).
 - Concurrent-review-cycles wake/projection (owned by
   `concurrent-review-cycles.md`).
-- The `Phase` enum deletion deferred from
-  `architecture-tech-debt-sweep` — that becomes a tail follow-up
-  after this plan lands, not part of this plan.
 - Typed wire contracts (owned by `typed-wire-contracts.md`).
 
 ## Touchpoints (audit)
@@ -377,15 +387,32 @@ The new `PlanLifecycle` enum exists alongside the legacy
 
 Scaffold a new repo for Trinity use.
 
-- New subcommand `trinity init [--repo <path>]`. Default is cwd.
-- Creates `.trinity/plans/`, `.trinity/feedback/`, and
-  `.trinity/.gitignore` containing at minimum:
+- New subcommand `trinity init [--repo <path>] [--ignore]`. Default
+  is cwd.
+- Always creates `.trinity/plans/`. The `.trinity/feedback/`
+  directory is created lazily by the daemon on first feedback
+  write; `trinity init` doesn't materialise it.
+- Default mode (no `--ignore`): creates `.trinity/.gitignore`
+  containing:
   ```
   # Working-tree feedback is local until `trinity finish` snapshots
   # it into .trinity/finished/.
   feedback/
   ```
-- Refuses to overwrite existing files in `.trinity/`.
+- `--ignore` mode: instead of creating `.trinity/.gitignore`,
+  appends `.trinity/feedback/` to the repo-root `.gitignore`
+  (creating the root file if absent, deduping if the line is
+  already present). This is the "maintainer is willing to ignore
+  some Trinity working state but doesn't want a `.trinity/.gitignore`
+  file in their tree" mode — useful for soft-introducing Trinity
+  into a project whose owner isn't adopting it wholesale.
+- Either mode refuses to overwrite an existing
+  `.trinity/.gitignore` with different contents (clear error
+  prompts the user to delete or merge manually).
+- Either mode warns if the repo-root `.gitignore` already contains
+  a line that ignores all of `.trinity/` — this would hide
+  Trinity's tracked artifacts (plans, finished snapshots) too, and
+  the operator probably didn't intend it.
 - Optionally calls the daemon (if running on localhost) to register
   the repo, so `start_plan` works immediately after.
 - Exits non-zero with a clear message if the path is not a git
@@ -555,7 +582,52 @@ expectation.
     HEAD's parent. Otherwise, refuse — `--amend` only rewrites
     HEAD.
 
-### Phase 8 — Wire/UI cutover
+### Phase 8 — `trinity purge` standalone command
+
+The `--purge` machinery from Phase 7 is also useful outside the
+finalize context. Operators may want to strip a plan's Trinity
+artifacts from history without making a finalize commit:
+
+- the plan was abandoned mid-flight and shouldn't leave a trace
+- the operator decided Trinity wasn't the right tool for this
+  particular work after all
+- post-finalize cleanup that the original `trinity finish` didn't
+  ask for
+
+Subcommand: `trinity purge <plan-id-or-stem>`. Same history-
+rewriting engine as `trinity finish --purge`; just no finalize
+commit and no gate check. The semantics are "remove every commit's
+.trinity/<this-plan>/ content from history; preserve code changes
+on mixed commits."
+
+Flags:
+
+- `--squash "<message>"`: collapse plan-attributed commits into one
+  (same interleaving rules as `trinity finish --squash`).
+- `--amend`: amend HEAD if HEAD already touches this plan's
+  artifacts.
+- No `--purge` flag — that's the command's whole purpose.
+
+Safety:
+
+- Refuse on dirty working tree.
+- Refuse on protected branches without `--allow-rewrite-protected`.
+- Refuse if `.trinity/finished/<stem>/` exists in HEAD and
+  `--squash` is not supplied — purging without `--squash` would
+  preserve the finalize snapshot but leave it pointing at history
+  that no longer has the impl commits, which is confusing. Either
+  also use `--squash` (which strips everything in one commit) or
+  add `--drop-finalize` (explicit opt-in to remove the finalize
+  snapshot too).
+- Prompt for confirmation by default; `--yes` skips the prompt
+  for scripted use.
+
+All 14 `--purge` edge cases from Phase 7 apply identically. The
+test suite at `tests/cli_purge.rs` re-runs every case against
+`trinity purge` to confirm the engine behaves the same standalone
+as it does behind `trinity finish --purge`.
+
+### Phase 9 — Wire/UI cutover
 
 Frontend and daemon flip together. Coordinated breaking change.
 
@@ -570,7 +642,7 @@ Frontend and daemon flip together. Coordinated breaking change.
   asserting that the URL doesn't move when a plan becomes finished
   (because the file doesn't move).
 
-### Phase 9 — Delete `PlanState::Done` and `DoneMove` types
+### Phase 10 — Delete `PlanState::Done` and `DoneMove` types
 
 Once the new lifecycle drives every response, the old types are dead.
 
@@ -591,17 +663,21 @@ Once the new lifecycle drives every response, the old types are dead.
 - Delete `disk_snapshot` test fixtures for done-move and `done/`
   plan files.
 
-### Phase 10 — `Phase` enum deletion (deferred from tech-debt-sweep)
+### Phase 11 — Delete the `Phase` enum
 
-This phase ships only after Phase 9 is solid. It is the follow-up
-the tech-debt-sweep plan was waiting on.
+Picked up from `architecture-tech-debt-sweep`, which deferred this
+piece pending the `PlanState::Done` deletion that lands in Phase 10
+of this plan. The deferral was sequencing, not scope; both halves
+land in this sweep.
 
 - Delete `Phase::Done` and the whole `Phase` enum.
-- Replace `phase_for` callers with the `current_posture(&Plan)`
-  helper proposed in the tech-debt-sweep plan (PlanOnly | Mixed →
-  Planning, CodeOnly → Implementing).
+- Replace `phase_for` callers with a `current_posture(&Plan)`
+  helper: `PlanOnly | Mixed → Planning`, `CodeOnly → Implementing`.
 - Wire `phase` field becomes a function of the latest reviewable
   commit's `CommitKind`, not a stored enum.
+- Frontend `phase: "done"` rendering is already moot after Phase 9
+  (the wire never emits it once `PlanState::Done` is gone); this
+  phase deletes the type as well.
 
 ## Migration
 
@@ -609,7 +685,7 @@ Two migrations: stale `done/` files and the feedback-path rename.
 
 ### Stale `.trinity/plans/done/` files (working tree)
 
-A repo upgrading past Phase 9 will have a `.trinity/plans/done/`
+A repo upgrading past Phase 10 will have a `.trinity/plans/done/`
 directory with files the daemon can no longer parse as plans. The
 daemon must not silently drop these from the visible plan set.
 
@@ -883,10 +959,31 @@ Mention in docs; don't restrict.
 24. Working-tree feedback at the legacy `commits/` path surfaces a
     one-shot warning per rebuild.
 
-### Follow-up (not gating this plan)
+### `Phase` enum
 
-25. `Phase` enum deletion follows the shape of Phase 10 above and
-    ships after Phase 9 is solid.
+25. The `Phase` enum is removed from the codebase (Phase 11).
+    Production code computes posture from `CommitKind` via the
+    `current_posture` helper rather than reading a stored variant.
+    No `Phase::Done` consumer remains.
+
+### CLI: `trinity purge`
+
+26. `trinity purge <plan>` removes that plan's `.trinity/` content
+    from history without making a finalize commit. Same history-
+    rewriting semantics as `trinity finish --purge`.
+27. `trinity purge --squash <msg>` collapses plan-attributed
+    commits into one with the supplied message, stripping
+    `.trinity/` content for the plan.
+28. `trinity purge` refuses without explicit confirmation on
+    protected branches and on dirty working trees, and refuses to
+    leave an orphan finalize snapshot behind without `--squash` or
+    `--drop-finalize`.
+
+### Acceptance: all `--purge` edge cases apply to both subcommands
+
+29. The 14 `--purge` edge cases in the Phase 7 list apply to
+    `trinity purge` identically; `tests/cli_purge.rs` mirrors
+    every case from the `trinity finish --purge` suite.
 
 ## Out of Scope (Explicit)
 
