@@ -62,6 +62,157 @@ string_newtype!(AgentLabel);
 string_newtype!(PlanKey);
 string_newtype!(RepoBasename);
 
+/// Validation error for the typed ID parsers.
+///
+/// All identifier newtypes (`CommitSha`, `ContentHash`, `AgentLabel`,
+/// `PlanKey`, `RepoBasename`) reject malformed input through this
+/// shared error type. `kind` is the type name so a single
+/// `match`/`Display` is enough for diagnostics.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum IdError {
+    #[error("{kind} cannot be empty")]
+    Empty { kind: &'static str },
+    #[error("{kind} must not contain `{ch}`: {value:?}")]
+    ForbiddenChar {
+        kind: &'static str,
+        ch: char,
+        value: String,
+    },
+    #[error("{kind} cannot be `.` or `..`")]
+    DotSegment { kind: &'static str },
+    #[error("{kind} must not start with `.`: {value:?}")]
+    LeadingDot { kind: &'static str, value: String },
+    #[error("{kind} must be lowercase hex; got {value:?}")]
+    NotHex { kind: &'static str, value: String },
+    #[error("{kind} length must be {min}-{max} chars; got {len}")]
+    BadLength {
+        kind: &'static str,
+        min: usize,
+        max: usize,
+        len: usize,
+    },
+}
+
+fn check_no_slash(kind: &'static str, s: &str) -> Result<(), IdError> {
+    if let Some(ch) = s.chars().find(|c| *c == '/' || *c == '\\') {
+        return Err(IdError::ForbiddenChar {
+            kind,
+            ch,
+            value: s.to_string(),
+        });
+    }
+    Ok(())
+}
+
+fn check_non_empty(kind: &'static str, s: &str) -> Result<(), IdError> {
+    if s.is_empty() {
+        return Err(IdError::Empty { kind });
+    }
+    Ok(())
+}
+
+fn check_not_dot_segment(kind: &'static str, s: &str) -> Result<(), IdError> {
+    if s == "." || s == ".." {
+        return Err(IdError::DotSegment { kind });
+    }
+    Ok(())
+}
+
+fn check_no_leading_dot(kind: &'static str, s: &str) -> Result<(), IdError> {
+    if s.starts_with('.') {
+        return Err(IdError::LeadingDot {
+            kind,
+            value: s.to_string(),
+        });
+    }
+    Ok(())
+}
+
+impl CommitSha {
+    /// Parse a git short-or-full SHA: 4–40 lowercase hex chars.
+    pub fn parse(s: &str) -> Result<Self, IdError> {
+        const KIND: &str = "CommitSha";
+        const MIN: usize = 4;
+        const MAX: usize = 40;
+        if s.len() < MIN || s.len() > MAX {
+            return Err(IdError::BadLength {
+                kind: KIND,
+                min: MIN,
+                max: MAX,
+                len: s.len(),
+            });
+        }
+        if !s.chars().all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c)) {
+            return Err(IdError::NotHex {
+                kind: KIND,
+                value: s.to_string(),
+            });
+        }
+        Ok(CommitSha(s.to_string()))
+    }
+}
+
+impl ContentHash {
+    /// Parse a blake3 content hash: exactly 64 lowercase hex chars.
+    pub fn parse(s: &str) -> Result<Self, IdError> {
+        const KIND: &str = "ContentHash";
+        const LEN: usize = 64;
+        if s.len() != LEN {
+            return Err(IdError::BadLength {
+                kind: KIND,
+                min: LEN,
+                max: LEN,
+                len: s.len(),
+            });
+        }
+        if !s.chars().all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c)) {
+            return Err(IdError::NotHex {
+                kind: KIND,
+                value: s.to_string(),
+            });
+        }
+        Ok(ContentHash(s.to_string()))
+    }
+}
+
+impl AgentLabel {
+    /// Parse an agent label: non-empty, no `/`, not `.`/`..`, no
+    /// leading `.` (avoids dotfile collisions in
+    /// `.trinity/feedback/.../<author>.md`).
+    pub fn parse(s: &str) -> Result<Self, IdError> {
+        const KIND: &str = "AgentLabel";
+        check_non_empty(KIND, s)?;
+        check_not_dot_segment(KIND, s)?;
+        check_no_leading_dot(KIND, s)?;
+        check_no_slash(KIND, s)?;
+        Ok(AgentLabel(s.to_string()))
+    }
+}
+
+impl PlanKey {
+    /// Parse a plan stem (the `<stem>` in
+    /// `.trinity/plans/<stem>.md`). Non-empty, no `/`, not `.`/`..`,
+    /// no leading `.`.
+    pub fn parse(s: &str) -> Result<Self, IdError> {
+        const KIND: &str = "PlanKey";
+        check_non_empty(KIND, s)?;
+        check_not_dot_segment(KIND, s)?;
+        check_no_leading_dot(KIND, s)?;
+        check_no_slash(KIND, s)?;
+        Ok(PlanKey(s.to_string()))
+    }
+}
+
+impl RepoBasename {
+    /// Parse a repo basename: non-empty, no `/`.
+    pub fn parse(s: &str) -> Result<Self, IdError> {
+        const KIND: &str = "RepoBasename";
+        check_non_empty(KIND, s)?;
+        check_no_slash(KIND, s)?;
+        Ok(RepoBasename(s.to_string()))
+    }
+}
+
 impl RepoBasename {
     /// Extract the basename (final `file_name` component) of a canonical
     /// repo root. Returns `None` if the path has no usable basename.
@@ -351,5 +502,163 @@ mod tests {
         let original = "trinity/plan-path-identity.md";
         let pid = PlanId::parse(original).unwrap();
         assert_eq!(pid.to_string(), original);
+    }
+
+    // ---- newtype validated parsers ----
+
+    #[test]
+    fn commit_sha_accepts_valid_hex() {
+        assert!(CommitSha::parse("abc1").is_ok());
+        assert!(CommitSha::parse("0123456789abcdef0123456789abcdef01234567").is_ok());
+    }
+
+    #[test]
+    fn commit_sha_rejects_uppercase() {
+        assert!(matches!(
+            CommitSha::parse("ABCD"),
+            Err(IdError::NotHex { .. })
+        ));
+    }
+
+    #[test]
+    fn commit_sha_rejects_non_hex() {
+        assert!(matches!(
+            CommitSha::parse("xyzw"),
+            Err(IdError::NotHex { .. })
+        ));
+    }
+
+    #[test]
+    fn commit_sha_rejects_too_short() {
+        assert!(matches!(
+            CommitSha::parse("abc"),
+            Err(IdError::BadLength { .. })
+        ));
+    }
+
+    #[test]
+    fn commit_sha_rejects_too_long() {
+        let s = "a".repeat(41);
+        assert!(matches!(
+            CommitSha::parse(&s),
+            Err(IdError::BadLength { .. })
+        ));
+    }
+
+    #[test]
+    fn content_hash_accepts_64_hex() {
+        let s = "a".repeat(64);
+        assert!(ContentHash::parse(&s).is_ok());
+    }
+
+    #[test]
+    fn content_hash_rejects_non_64() {
+        assert!(matches!(
+            ContentHash::parse(&"a".repeat(63)),
+            Err(IdError::BadLength { .. })
+        ));
+    }
+
+    #[test]
+    fn agent_label_accepts_simple() {
+        assert!(AgentLabel::parse("codex").is_ok());
+        assert!(AgentLabel::parse("claude-main").is_ok());
+    }
+
+    #[test]
+    fn agent_label_rejects_empty() {
+        assert!(matches!(
+            AgentLabel::parse(""),
+            Err(IdError::Empty { .. })
+        ));
+    }
+
+    #[test]
+    fn agent_label_rejects_slash() {
+        assert!(matches!(
+            AgentLabel::parse("a/b"),
+            Err(IdError::ForbiddenChar { .. })
+        ));
+    }
+
+    #[test]
+    fn agent_label_rejects_leading_dot() {
+        assert!(matches!(
+            AgentLabel::parse(".hidden"),
+            Err(IdError::LeadingDot { .. })
+        ));
+    }
+
+    #[test]
+    fn agent_label_rejects_dot_segments() {
+        assert!(matches!(
+            AgentLabel::parse("."),
+            Err(IdError::DotSegment { .. })
+        ));
+        assert!(matches!(
+            AgentLabel::parse(".."),
+            Err(IdError::DotSegment { .. })
+        ));
+    }
+
+    #[test]
+    fn plan_key_accepts_simple_and_dotted_stem() {
+        assert!(PlanKey::parse("foo").is_ok());
+        assert!(PlanKey::parse("foo.v2").is_ok());
+        assert!(PlanKey::parse("architecture-tech-debt-sweep").is_ok());
+    }
+
+    #[test]
+    fn plan_key_rejects_path_traversal() {
+        assert!(matches!(
+            PlanKey::parse(".."),
+            Err(IdError::DotSegment { .. })
+        ));
+        assert!(PlanKey::parse("../etc/passwd").is_err());
+    }
+
+    #[test]
+    fn plan_key_rejects_slash() {
+        assert!(matches!(
+            PlanKey::parse("team/foo"),
+            Err(IdError::ForbiddenChar { .. })
+        ));
+    }
+
+    #[test]
+    fn plan_key_rejects_empty() {
+        assert!(matches!(
+            PlanKey::parse(""),
+            Err(IdError::Empty { .. })
+        ));
+    }
+
+    #[test]
+    fn plan_key_rejects_leading_dot() {
+        assert!(matches!(
+            PlanKey::parse(".hidden"),
+            Err(IdError::LeadingDot { .. })
+        ));
+    }
+
+    #[test]
+    fn repo_basename_accepts_simple() {
+        assert!(RepoBasename::parse("trinity").is_ok());
+    }
+
+    #[test]
+    fn repo_basename_rejects_empty() {
+        assert!(matches!(
+            RepoBasename::parse(""),
+            Err(IdError::Empty { .. })
+        ));
+    }
+
+    #[test]
+    fn repo_basename_rejects_slash() {
+        assert!(matches!(
+            RepoBasename::parse("a/b"),
+            Err(IdError::ForbiddenChar { .. })
+        ));
     }
 }
