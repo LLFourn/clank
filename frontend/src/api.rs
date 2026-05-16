@@ -125,18 +125,6 @@ pub struct CommitRef {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-#[allow(dead_code)]
-pub struct FeedbackEntry {
-    pub target_sha: String,
-    pub author: String,
-    pub verdict: String,
-    pub body_raw: String,
-    pub body_html: String,
-    pub path: String,
-    pub created_at: i64,
-}
-
-#[derive(Debug, Clone, Deserialize)]
 #[serde(tag = "kind")]
 #[allow(dead_code)]
 pub enum TimelineEvent {
@@ -286,7 +274,7 @@ pub struct PlanRevisionPage {
     pub previous_sha: Option<String>,
     pub next_sha: Option<String>,
     #[serde(default)]
-    pub feedback: Vec<FeedbackEntry>,
+    pub feedback: Vec<CommitFeedback>,
 }
 
 pub async fn fetch_plan_revision(
@@ -351,7 +339,7 @@ pub struct CommitDiffPage {
     #[serde(default)]
     pub diff_files: Vec<FileDiff>,
     #[serde(default)]
-    pub feedback: Vec<FeedbackEntry>,
+    pub feedback: Vec<CommitFeedback>,
 }
 
 pub async fn fetch_commit_diff(plan_id: String, sha: String) -> Result<CommitDiffPage, FetchError> {

@@ -546,42 +546,24 @@ fn timeline_value(
 /// `plan_touch` so existing wire consumers keep working until phase
 /// 2.5. Used by the `/api/sessions/:id/plan/:sha` and `/api/sessions/
 /// :id/commit/:sha` route handlers.
-pub fn feedback_for_target(
-    session: &Plan,
-    sha: &CommitSha,
-    plan_touches: &BTreeMap<
-        CommitSha,
-        Vec<(crate::lifecycle::PlanKey, crate::repo_state::PlanTouchKind)>,
-    >,
-) -> Vec<Value> {
+pub fn feedback_for_target(session: &Plan, sha: &CommitSha) -> Vec<Value> {
     let Some(gate) = session.commits.get(sha) else {
         return Vec::new();
     };
-    let has_plan_touch = plan_touches
-        .get(sha)
-        .is_some_and(|ts| ts.iter().any(|(k, _)| k == &session.id));
-    let phase = if has_plan_touch { "plan" } else { "impl" };
     gate.feedback
         .iter()
-        .map(|(author, fb)| feedback_entry(sha, author, fb, phase))
+        .map(|(author, fb)| feedback_entry(author, fb))
         .collect()
 }
 
-fn feedback_entry(
-    target: &CommitSha,
-    author: &AgentLabel,
-    fb: &Feedback,
-    phase: &'static str,
-) -> Value {
+fn feedback_entry(author: &AgentLabel, fb: &Feedback) -> Value {
     json!({
-        "target_sha": target.as_str(),
         "author": author.as_str(),
         "verdict": fb.verdict.as_str(),
         "body_raw": fb.body,
         "body_html": render_feedback_body(&fb.body, fb.verdict),
         "path": fb.path.to_string_lossy(),
         "created_at": fb.created_at,
-        "phase": phase,
     })
 }
 

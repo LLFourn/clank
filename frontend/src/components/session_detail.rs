@@ -1,7 +1,7 @@
 use leptos::prelude::*;
 use leptos_router::hooks::use_params_map;
 
-use crate::api::{CommitEntry, CommitFeedback, FeedbackEntry, PlanDetail, fetch_plan};
+use crate::api::{CommitEntry, CommitFeedback, PlanDetail, fetch_plan};
 use crate::components::feedback_card::FeedbackCard;
 use crate::components::meta_strip::MetaStrip;
 use crate::components::plan_preview::PlanPreview;
@@ -96,44 +96,30 @@ fn detail_view(detail: PlanDetail) -> impl IntoView {
     }
 }
 
-/// Latest feedback entry on the target commit's gate. Filter to the
-/// target SHA first; sorting across all commits would surface stale
-/// reviews against an earlier target when the current one has none.
+/// Latest feedback entry on the target commit's gate, paired with the
+/// target SHA so the FeedbackCard can render its "on <sha>" header.
+/// Filter to the target SHA first; sorting across all commits would
+/// surface stale reviews against an earlier target when the current
+/// one has none.
 fn latest_review_for_target(
     commits: &[CommitEntry],
     target: Option<&str>,
-) -> Option<FeedbackEntry> {
+) -> Option<(CommitFeedback, String)> {
     let target = target?;
     let commit = commits.iter().find(|c| c.sha == target)?;
     commit
         .feedback
         .iter()
         .max_by_key(|fb| fb.created_at)
-        .map(|fb| commit_fb_to_feedback_entry(&commit.sha, &commit.kind, fb))
+        .map(|fb| (fb.clone(), commit.sha.clone()))
 }
 
-/// Convert a commit-keyed feedback entry to the legacy `FeedbackEntry`
-/// shape that `FeedbackCard` consumes. Phase 2.8 keeps `FeedbackCard`
-/// untouched so the card UI stays stable; a future cleanup can fold
-/// the two types together.
-fn commit_fb_to_feedback_entry(sha: &str, _kind: &str, fb: &CommitFeedback) -> FeedbackEntry {
-    FeedbackEntry {
-        target_sha: sha.to_string(),
-        author: fb.author.clone(),
-        verdict: fb.verdict.clone(),
-        body_raw: fb.body_raw.clone(),
-        body_html: fb.body_html.clone(),
-        path: fb.path.clone(),
-        created_at: fb.created_at,
-    }
-}
-
-fn latest_review_section(latest: Option<FeedbackEntry>) -> AnyView {
+fn latest_review_section(latest: Option<(CommitFeedback, String)>) -> AnyView {
     match latest {
-        Some(fb) => view! {
+        Some((fb, target_sha)) => view! {
             <div class="latest-review">
                 <h3>"Latest review"</h3>
-                <FeedbackCard entry=fb/>
+                <FeedbackCard entry=fb target_sha=target_sha/>
             </div>
         }
         .into_any(),
@@ -173,11 +159,8 @@ fn commit_feedback_section(commits: Vec<CommitEntry>) -> AnyView {
                         let kind = c.kind.clone();
                         let kind_class = format!("commit-kind-chip commit-kind-{kind}");
                         let sha_short: String = c.sha.chars().take(7).collect();
-                        let cards: Vec<_> = c
-                            .feedback
-                            .iter()
-                            .map(|fb| commit_fb_to_feedback_entry(&c.sha, &c.kind, fb))
-                            .collect();
+                        let target_sha = c.sha.clone();
+                        let cards: Vec<CommitFeedback> = c.feedback.clone();
                         view! {
                             <div class="commit-feedback-block">
                                 <h3 class="commit-feedback-heading">
@@ -193,7 +176,10 @@ fn commit_feedback_section(commits: Vec<CommitEntry>) -> AnyView {
                                         <div class="feedback-list">
                                             {cards
                                                 .into_iter()
-                                                .map(|fb| view! { <FeedbackCard entry=fb/> })
+                                                .map(|fb| {
+                                                    let t = target_sha.clone();
+                                                    view! { <FeedbackCard entry=fb target_sha=t/> }
+                                                })
                                                 .collect_view()}
                                         </div>
                                     }.into_any()

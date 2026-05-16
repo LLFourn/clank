@@ -363,7 +363,6 @@ async fn api_plan_revision(
             .next()
             .expect("single_plan invariant"),
         &commit_sha,
-        &snapshot.plan_touches,
     );
     Ok(axum::Json(json!({
         "repo": snapshot.root.to_string_lossy(),
@@ -422,7 +421,6 @@ async fn api_commit_diff(
             .next()
             .expect("single_plan invariant"),
         &commit_sha,
-        &snapshot.plan_touches,
     );
     Ok(axum::Json(json!({
         "repo": snapshot.root.to_string_lossy(),

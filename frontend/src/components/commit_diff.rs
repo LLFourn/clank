@@ -48,10 +48,14 @@ fn commit_view(page: CommitDiffPage) -> impl IntoView {
     let feedback_section = if page.feedback.is_empty() {
         None
     } else {
+        let target_sha = page.commit_sha.clone();
         let cards = page
             .feedback
             .into_iter()
-            .map(|fb| view! { <FeedbackCard entry=fb/> })
+            .map(|fb| {
+                let target = target_sha.clone();
+                view! { <FeedbackCard entry=fb target_sha=target/> }
+            })
             .collect_view();
         Some(view! {
             <section class="session-section">

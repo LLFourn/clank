@@ -21,7 +21,7 @@ use tokio::sync::broadcast::error::RecvError;
 
 use crate::lifecycle::{AgentLabel, CommitSha, ContentHash, PlanKey};
 use crate::mcp_response::compute_plan_worktree_status_parts;
-use crate::projection::{expected_action, phase, waiting_on};
+use crate::projection::{phase, waiting_on};
 use crate::repo_state::{Phase, Trinity, WaitingReason, WaitingRole};
 use crate::review_state::CommitGate;
 use crate::runtime::Runtime;
@@ -52,40 +52,64 @@ pub struct WaitArgs {
     pub timeout_secs: Option<u64>,
 }
 
+/// Top-level WFW response: either a `Work` payload or a `Timeout`.
+/// `untagged` so the wire keeps the field-presence discriminator
+/// (`work` vs `timed_out`) the existing consumers depend on.
 #[derive(Debug, Clone, Serialize)]
 #[serde(untagged)]
 pub enum WaitResponse {
-    Work {
-        plan_id: String,
-        /// Canonical absolute path of the repo, convenience for resolving
-        /// the repo-relative `locations` without re-parsing `plan_id`.
-        repo: String,
-        /// Imperative action verb naming what the caller should do.
-        work: String,
-        /// Repo-relative paths the caller should read or write.
-        locations: Vec<String>,
-        /// SHA of the commit this work targets. Present for every
-        /// review / address action; absent for terminal states like
-        /// `none` (`SessionDone`).
-        #[serde(skip_serializing_if = "Option::is_none")]
-        target_sha: Option<String>,
-        /// `CommitKind` (`plan_only` | `code_only` | `mixed` |
-        /// `done_move` | `multi_plan` | `unattributed`) of the target
-        /// commit. Lets agents tailor prompt language to the commit
-        /// shape without re-deriving it from `plan_touch`/code-diff.
-        #[serde(skip_serializing_if = "Option::is_none")]
-        commit_kind: Option<String>,
-        /// Short imperative pointer for an agent: a sentence or two
-        /// summarizing what to read and what to look for. Caller can
-        /// override; the default is sane for the typical
-        /// `review_commit` / `address_commit_changes` /
-        /// `start_implementation` flow.
-        #[serde(skip_serializing_if = "Option::is_none")]
-        prompt_hint: Option<String>,
+    Work(WorkPayload),
+    Timeout { timed_out: bool },
+}
+
+/// A work assignment. `plan_id` / `repo` / `locations` are always
+/// present; the action-specific fields live on the flattened
+/// [`WorkAction`] variant, so the type system enforces that
+/// `target_sha` / `commit_kind` / `prompt_hint` only exist for
+/// actions that actually need them.
+#[derive(Debug, Clone, Serialize)]
+pub struct WorkPayload {
+    pub plan_id: String,
+    /// Canonical absolute path of the repo, convenience for resolving
+    /// the repo-relative `locations` without re-parsing `plan_id`.
+    pub repo: String,
+    /// Repo-relative paths the caller should read or write.
+    pub locations: Vec<String>,
+    #[serde(flatten)]
+    pub action: WorkAction,
+}
+
+/// Tagged by the wire `work` discriminator. Variants that carry a
+/// `target_sha` also carry `commit_kind` and `prompt_hint`; variants
+/// that are pure worktree-status moves (`CommitDoneMove`,
+/// `RestoreOrCommitDoneMove`, `SessionDone`) carry only the envelope
+/// fields on `WorkPayload`.
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "work", rename_all = "snake_case")]
+pub enum WorkAction {
+    ReviewCommit {
+        target_sha: String,
+        commit_kind: String,
+        prompt_hint: String,
     },
-    Timeout {
-        timed_out: bool,
+    AddressCommitChanges {
+        target_sha: String,
+        commit_kind: String,
+        prompt_hint: String,
     },
+    CommitPlanRevision {
+        target_sha: String,
+        commit_kind: String,
+        prompt_hint: String,
+    },
+    CommitDoneMove,
+    RestoreOrCommitDoneMove,
+    StartImplementation {
+        target_sha: String,
+        commit_kind: String,
+        prompt_hint: String,
+    },
+    SessionDone,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -179,27 +203,21 @@ fn parse_role(s: &str) -> Result<WaitingRole, WaitError> {
 
 #[derive(Debug, Clone)]
 struct WorkItem {
-    work: &'static str,
     /// Canonical absolute path of the repo (echo'd back to the caller as
     /// a convenience field on the response).
     repo: String,
     locations: Vec<String>,
-    target_sha: Option<String>,
-    commit_kind: Option<String>,
-    prompt_hint: Option<String>,
+    action: WorkAction,
 }
 
 impl WorkItem {
     fn into_response(self, plan_id: String) -> WaitResponse {
-        WaitResponse::Work {
+        WaitResponse::Work(WorkPayload {
             plan_id,
             repo: self.repo,
-            work: self.work.to_string(),
             locations: self.locations,
-            target_sha: self.target_sha,
-            commit_kind: self.commit_kind,
-            prompt_hint: self.prompt_hint,
-        }
+            action: self.action,
+        })
     }
 }
 
@@ -234,36 +252,98 @@ async fn compute_match(
     {
         return Ok(None);
     }
-    let work = expected_action(w.reason);
     let locations = derive_locations(&candidate, w.reason, author);
     let repo = candidate.repo_root.to_string_lossy().into_owned();
-
-    // target_sha / commit_kind / prompt_hint all read from the same
-    // `review_target` the gate was computed on — there is no second
-    // selector. For worktree-status reasons (CommitPlanRevision /
-    // CommitDoneMove / RestoreOrCommitDoneMove) and SessionDone the
-    // target is None.
-    let (target_sha, commit_kind) = match w.reason {
-        WaitingReason::CommitNeedsReview | WaitingReason::AddressCommitChanges => (
-            candidate
-                .review_target
-                .as_ref()
-                .map(|s| s.as_str().to_string()),
-            candidate.review_target_kind.map(|k| k.as_str().to_string()),
-        ),
-        _ => (None, None),
-    };
-
-    let prompt_hint = prompt_hint_for(w.reason, commit_kind.as_deref(), &candidate.plan_path);
+    let action = build_action(w.reason, &candidate);
 
     Ok(Some(WorkItem {
-        work,
         repo,
         locations,
-        target_sha,
-        commit_kind,
-        prompt_hint,
+        action,
     }))
+}
+
+/// Build the typed `WorkAction` for one `(reason, candidate)` pair.
+/// Variants that carry a target SHA pull it (and its `commit_kind` +
+/// `prompt_hint`) from the candidate's pre-computed
+/// `review_target` / `review_target_kind`. Worktree-status moves
+/// (`CommitDoneMove`, `RestoreOrCommitDoneMove`, `SessionDone`) carry
+/// nothing else.
+fn build_action(reason: WaitingReason, candidate: &Candidate) -> WorkAction {
+    use WaitingReason::*;
+    let target_sha = || {
+        candidate
+            .review_target
+            .as_ref()
+            .map(|s| s.as_str().to_string())
+            .unwrap_or_default()
+    };
+    let commit_kind = || {
+        candidate
+            .review_target_kind
+            .map(|k| k.as_str().to_string())
+            .unwrap_or_default()
+    };
+    let prompt = |kind: Option<&str>| {
+        prompt_hint_for(reason, kind, &candidate.plan_path).unwrap_or_default()
+    };
+    match reason {
+        SessionDone => WorkAction::SessionDone,
+        CommitDoneMove => WorkAction::CommitDoneMove,
+        RestoreOrCommitDoneMove => WorkAction::RestoreOrCommitDoneMove,
+        CommitPlanRevision => {
+            let kind = commit_kind();
+            let kind_opt = if kind.is_empty() {
+                None
+            } else {
+                Some(kind.as_str())
+            };
+            WorkAction::CommitPlanRevision {
+                target_sha: target_sha(),
+                commit_kind: kind.clone(),
+                prompt_hint: prompt(kind_opt),
+            }
+        }
+        AddressCommitChanges => {
+            let kind = commit_kind();
+            let kind_opt = if kind.is_empty() {
+                None
+            } else {
+                Some(kind.as_str())
+            };
+            WorkAction::AddressCommitChanges {
+                target_sha: target_sha(),
+                commit_kind: kind.clone(),
+                prompt_hint: prompt(kind_opt),
+            }
+        }
+        ReadyToStartImplementation => {
+            let kind = commit_kind();
+            let kind_opt = if kind.is_empty() {
+                None
+            } else {
+                Some(kind.as_str())
+            };
+            WorkAction::StartImplementation {
+                target_sha: target_sha(),
+                commit_kind: kind.clone(),
+                prompt_hint: prompt(kind_opt),
+            }
+        }
+        CommitNeedsReview => {
+            let kind = commit_kind();
+            let kind_opt = if kind.is_empty() {
+                None
+            } else {
+                Some(kind.as_str())
+            };
+            WorkAction::ReviewCommit {
+                target_sha: target_sha(),
+                commit_kind: kind.clone(),
+                prompt_hint: prompt(kind_opt),
+            }
+        }
+    }
 }
 
 /// Default `prompt_hint` text for a given `(reason, commit_kind)`.
@@ -751,9 +831,7 @@ mod integration_tests {
 
     fn expect_work(r: WaitResponse) -> (String, Vec<String>) {
         match r {
-            WaitResponse::Work {
-                work, locations, ..
-            } => (work, locations),
+            WaitResponse::Work(p) => (action_tag(&p.action).to_string(), p.locations),
             WaitResponse::Timeout { .. } => panic!("expected work, got timeout"),
         }
     }
@@ -761,11 +839,25 @@ mod integration_tests {
     fn expect_timeout(r: WaitResponse) {
         match r {
             WaitResponse::Timeout { timed_out } => assert!(timed_out),
-            WaitResponse::Work {
-                work, locations, ..
-            } => {
-                panic!("expected timeout, got work={work} locations={locations:?}")
+            WaitResponse::Work(p) => {
+                panic!(
+                    "expected timeout, got work={} locations={:?}",
+                    action_tag(&p.action),
+                    p.locations
+                )
             }
+        }
+    }
+
+    fn action_tag(a: &WorkAction) -> &'static str {
+        match a {
+            WorkAction::ReviewCommit { .. } => "review_commit",
+            WorkAction::AddressCommitChanges { .. } => "address_commit_changes",
+            WorkAction::CommitPlanRevision { .. } => "commit_plan_revision",
+            WorkAction::CommitDoneMove => "commit_done_move",
+            WorkAction::RestoreOrCommitDoneMove => "restore_or_commit_done_move",
+            WorkAction::StartImplementation { .. } => "start_implementation",
+            WorkAction::SessionDone => "session_done",
         }
     }
 
@@ -989,23 +1081,12 @@ mod integration_tests {
             .await
             .unwrap();
         match (resp_a, resp_b) {
-            (
-                WaitResponse::Work {
-                    plan_id: id_a,
-                    repo: repo_a,
-                    ..
-                },
-                WaitResponse::Work {
-                    plan_id: id_b,
-                    repo: repo_b,
-                    ..
-                },
-            ) => {
-                assert_eq!(id_a, "alpha/shared.md");
-                assert_eq!(id_b, "beta/shared.md");
-                assert_ne!(repo_a, repo_b);
-                assert!(repo_a.ends_with("alpha"));
-                assert!(repo_b.ends_with("beta"));
+            (WaitResponse::Work(p_a), WaitResponse::Work(p_b)) => {
+                assert_eq!(p_a.plan_id, "alpha/shared.md");
+                assert_eq!(p_b.plan_id, "beta/shared.md");
+                assert_ne!(p_a.repo, p_b.repo);
+                assert!(p_a.repo.ends_with("alpha"));
+                assert!(p_b.repo.ends_with("beta"));
             }
             other => panic!("both calls should return Work; got {other:?}"),
         }

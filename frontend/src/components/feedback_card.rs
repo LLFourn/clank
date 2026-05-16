@@ -1,14 +1,17 @@
 use leptos::prelude::*;
 
-use crate::api::FeedbackEntry;
+use crate::api::CommitFeedback;
 use crate::util::short_sha;
 
 /// Single feedback file as a card. Verdict pill on the left, author +
 /// timestamp + target SHA in the header, sanitized markdown body below.
+/// `target_sha` is passed as a sibling prop because feedback is keyed
+/// per-commit on the wire — the SHA is parent context, not intrinsic
+/// to the feedback entry.
 #[component]
-pub fn FeedbackCard(entry: FeedbackEntry) -> impl IntoView {
+pub fn FeedbackCard(entry: CommitFeedback, target_sha: String) -> impl IntoView {
     let verdict_class = verdict_class(&entry.verdict);
-    let target_short = short_sha(&entry.target_sha);
+    let target_short = short_sha(&target_sha);
     let target_label = format!("on {target_short}");
     let timestamp = format_timestamp(entry.created_at);
     let body_html = entry.body_html.clone();
