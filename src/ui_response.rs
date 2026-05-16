@@ -2,10 +2,10 @@
 //!
 //! These functions are deliberately separate from `mcp_response::*` — the
 //! web UI's shape is allowed to be richer than the MCP tool surface (it
-//! never costs an agent context-window tokens). The builders take owned
-//! snapshot types directly (`RepoSnapshot` / `PlanSnapshotBundle` from
-//! `runtime_snapshot`) and never round-trip back into `RepoState`, so all
-//! disk I/O happens after the runtime mutex has been released.
+//! never costs an agent context-window tokens). The builders take a
+//! cloned `RepoState` directly (cloned under the runtime mutex by
+//! `Runtime::snapshot_repo` / `Runtime::snapshot_session`), so all disk
+//! I/O happens after the runtime mutex has been released.
 //!
 //! Disk reads go through the `PlanStatusReader` trait so tests can drop
 //! in a fake.
@@ -20,18 +20,19 @@ use crate::projection::{
     all_implementation_commits_for, all_plan_revisions_for, expected_action, impl_gate_for_parts,
     phase_for, plan_gate_for_parts, waiting_on,
 };
-use crate::repo_state::{AttributionResult, Feedback, Phase, PlanTouchKind, Verdict, WaitingOn};
+use crate::repo_state::{
+    AttributionResult, Feedback, Phase, Plan, PlanTouchKind, RepoState, Verdict, WaitingOn,
+};
 use crate::review_state::CommitGate;
-use crate::runtime_snapshot::{PlanSnapshot, PlanSnapshotBundle, RepoSnapshot};
 
 /// `GET /api/plans` — `{ plans, conflicts }` for the home page.
 /// Public wrapper binds the production `DiskPlanStatusReader`.
-pub fn plans_index(snapshot: &RepoSnapshot) -> std::io::Result<Value> {
+pub fn plans_index(snapshot: &RepoState) -> std::io::Result<Value> {
     plans_index_with_reader(snapshot, &crate::mcp_response::DiskPlanStatusReader)
 }
 
 pub fn plans_index_with_reader(
-    snapshot: &RepoSnapshot,
+    snapshot: &RepoState,
     status_reader: &impl PlanStatusReader,
 ) -> std::io::Result<Value> {
     let (plans_typed, conflicts) = plans_index_parts(snapshot, status_reader)?;
@@ -44,12 +45,12 @@ pub fn plans_index_with_reader(
 /// the merge so the sort key never gets serialized-and-re-extracted via
 /// the JSON shape — a regression on the timestamp field type would be
 /// a compile error here, not a silent sort degrade.
-pub fn plans_index_across(snapshots: &[RepoSnapshot]) -> std::io::Result<Value> {
+pub fn plans_index_across(snapshots: &[RepoState]) -> std::io::Result<Value> {
     plans_index_across_with_reader(snapshots, &crate::mcp_response::DiskPlanStatusReader)
 }
 
 pub fn plans_index_across_with_reader(
-    snapshots: &[RepoSnapshot],
+    snapshots: &[RepoState],
     status_reader: &impl PlanStatusReader,
 ) -> std::io::Result<Value> {
     let mut all_plans: Vec<IndexedPlanRow> = Vec::new();
@@ -75,12 +76,12 @@ type IndexedPlanRow = (i64, Value);
 /// cross-repo `plans_index_across` so they share one source of truth
 /// for the sort key + JSON shape.
 fn plans_index_parts(
-    snapshot: &RepoSnapshot,
+    snapshot: &RepoState,
     status_reader: &impl PlanStatusReader,
 ) -> std::io::Result<(Vec<IndexedPlanRow>, Vec<Value>)> {
     let basename = crate::lifecycle::RepoBasename::from_repo_root(&snapshot.root);
     let mut plans: Vec<IndexedPlanRow> = Vec::with_capacity(snapshot.plans.len());
-    for plan in &snapshot.plans {
+    for plan in snapshot.plans.values() {
         let plan_phase = phase_for(&plan.plan_path, &plan.id, &snapshot.attribution);
         let gate = crate::projection::latest_reviewable_commit_gate_for(
             &plan.id,
@@ -143,15 +144,19 @@ fn plans_index_parts(
 
 /// `GET /api/plan/{repo}/{stem_md}` — rich plan detail.
 /// Public wrapper binds the production `DiskPlanStatusReader`.
-pub fn plan_page(bundle: &PlanSnapshotBundle) -> std::io::Result<Value> {
+pub fn plan_page(bundle: &RepoState) -> std::io::Result<Value> {
     plan_page_with_reader(bundle, &crate::mcp_response::DiskPlanStatusReader)
 }
 
 pub fn plan_page_with_reader(
-    bundle: &PlanSnapshotBundle,
+    bundle: &RepoState,
     status_reader: &impl PlanStatusReader,
 ) -> std::io::Result<Value> {
-    let plan = &bundle.plan;
+    let plan = bundle
+        .plans
+        .values()
+        .next()
+        .expect("snapshot_session invariant: exactly one plan");
     let basename = crate::lifecycle::RepoBasename::from_repo_root(&bundle.root);
     let worktree_status = status_reader.compute(&bundle.root, &plan.plan_path, &plan.body_hash)?;
     let plan_phase = phase_for(&plan.plan_path, &plan.id, &bundle.attribution);
@@ -287,7 +292,7 @@ pub fn plan_page_with_reader(
 /// but carries body + html + path on each feedback entry so the SPA
 /// can render cards without further round-trips.
 fn commits_array_rich(
-    plan: &PlanSnapshot,
+    plan: &Plan,
     commit_order: &[CommitSha],
     plan_touches: &BTreeMap<CommitSha, Vec<(crate::lifecycle::PlanKey, PlanTouchKind)>>,
     attribution: &BTreeMap<CommitSha, AttributionResult>,
@@ -400,7 +405,7 @@ pub fn render_markdown(input: &str) -> String {
         .to_string()
 }
 
-fn pr_hint_value(session: &PlanSnapshot, impl_commits: &[String]) -> Value {
+fn pr_hint_value(session: &Plan, impl_commits: &[String]) -> Value {
     let plan_intro = session.plan_intro.as_str();
     let plan_intro_parent = session.plan_intro_parent.as_ref().map(|s| s.as_str());
     let base_for_squash = plan_intro_parent.unwrap_or(plan_intro);
@@ -474,7 +479,7 @@ fn gate_value(
 }
 
 fn timeline_value(
-    session: &PlanSnapshot,
+    session: &Plan,
     attribution: &BTreeMap<CommitSha, AttributionResult>,
     plan_touches: &BTreeMap<CommitSha, Vec<(PlanKey, PlanTouchKind)>>,
     commit_order: &[CommitSha],
@@ -542,7 +547,7 @@ fn timeline_value(
 /// 2.5. Used by the `/api/sessions/:id/plan/:sha` and `/api/sessions/
 /// :id/commit/:sha` route handlers.
 pub fn feedback_for_target(
-    session: &PlanSnapshot,
+    session: &Plan,
     sha: &CommitSha,
     plan_touches: &BTreeMap<
         CommitSha,
@@ -587,17 +592,8 @@ mod tests {
     use crate::repo_state::PlanWorktreeStatus;
     use std::path::Path;
 
-    fn empty_snapshot() -> RepoSnapshot {
-        RepoSnapshot {
-            root: std::path::PathBuf::from("/r"),
-            head: None,
-            plans: Vec::new(),
-            attribution: BTreeMap::new(),
-            plan_touches: BTreeMap::new(),
-            commit_order: Vec::new(),
-            plan_conflicts: BTreeMap::new(),
-            commit_meta: BTreeMap::new(),
-        }
+    fn empty_snapshot() -> RepoState {
+        RepoState::empty(std::path::PathBuf::from("/r"))
     }
 
     struct StaticStatusReader(PlanWorktreeStatus);
@@ -670,7 +666,7 @@ mod tests {
 
     #[test]
     fn pr_hint_uses_plan_intro_parent_when_present() {
-        let session = PlanSnapshot {
+        let session = Plan {
             id: PlanKey::from("foo"),
             plan_path: std::path::PathBuf::from(".trinity/plans/foo.md"),
             state: crate::repo_state::PlanState::Active,

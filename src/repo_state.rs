@@ -60,6 +60,25 @@ pub struct RepoState {
 }
 
 impl RepoState {
+    /// Clone this state with `plans` filtered to a single plan and
+    /// `plan_conflicts` cleared. Returns `None` if the plan key is
+    /// absent. Used by `Runtime::snapshot_session` to hand response
+    /// builders a `RepoState` for one specific plan without paying for
+    /// every other plan's clone.
+    pub fn single_plan(&self, key: &PlanKey) -> Option<RepoState> {
+        let plan = self.plans.get(key)?;
+        Some(RepoState {
+            root: self.root.clone(),
+            plans: [(key.clone(), plan.clone())].into_iter().collect(),
+            head: self.head.clone(),
+            attribution: self.attribution.clone(),
+            plan_touches: self.plan_touches.clone(),
+            commit_order: self.commit_order.clone(),
+            plan_conflicts: std::collections::BTreeMap::new(),
+            commit_meta: self.commit_meta.clone(),
+        })
+    }
+
     pub fn empty(root: PathBuf) -> Self {
         Self {
             root,

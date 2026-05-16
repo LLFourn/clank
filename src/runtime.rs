@@ -15,8 +15,8 @@ use tokio::sync::{Mutex, broadcast};
 use crate::fs_watcher::FilesystemSignal;
 use crate::lifecycle::{CommitSha, PlanKey, content_hash};
 use crate::rebuild::{RebuildError, rebuild_repo};
+use crate::repo_state::RepoState;
 use crate::repo_state::{Feedback, LiveEvent, Plan, Trinity};
-use crate::runtime_snapshot::{PlanSnapshotBundle, RepoSnapshot};
 
 pub struct Runtime {
     state: Arc<Mutex<Trinity>>,
@@ -168,32 +168,35 @@ impl Runtime {
         RemoveOutcome::Removed { plan_count }
     }
 
-    /// Clone a repo snapshot while holding the runtime lock. Callers do
-    /// disk and git I/O after this returns.
-    pub async fn snapshot_repo(&self, repo_root: &Path) -> Result<RepoSnapshot, RuntimeError> {
+    /// Clone the repo's `RepoState` while holding the runtime lock.
+    /// Callers do disk and git I/O after this returns.
+    pub async fn snapshot_repo(&self, repo_root: &Path) -> Result<RepoState, RuntimeError> {
         let canonical = dunce::canonicalize(repo_root).unwrap_or_else(|_| repo_root.to_path_buf());
         let trinity = self.state.lock().await;
         let state = trinity
             .repos
             .get(&canonical)
             .ok_or_else(|| RuntimeError::UnknownRepo(canonical.clone()))?;
-        Ok(RepoSnapshot::from_state(state))
+        Ok(state.clone())
     }
 
-    /// Clone one session plus the repo-level indexes its projections need.
-    /// `Ok(None)` means the repo is known but the session is not committed.
+    /// Clone a single-plan slice of `RepoState`: just the requested
+    /// plan in `plans`, with `plan_conflicts` cleared. Repo-level
+    /// indexes (`attribution`, `plan_touches`, `commit_order`,
+    /// `commit_meta`) carry through. `Ok(None)` means the repo is
+    /// known but the session is not committed.
     pub async fn snapshot_session(
         &self,
         repo_root: &Path,
         session_id: &PlanKey,
-    ) -> Result<Option<PlanSnapshotBundle>, RuntimeError> {
+    ) -> Result<Option<RepoState>, RuntimeError> {
         let canonical = dunce::canonicalize(repo_root).unwrap_or_else(|_| repo_root.to_path_buf());
         let trinity = self.state.lock().await;
         let state = trinity
             .repos
             .get(&canonical)
             .ok_or_else(|| RuntimeError::UnknownRepo(canonical.clone()))?;
-        Ok(PlanSnapshotBundle::from_state_for(state, session_id))
+        Ok(state.single_plan(session_id))
     }
 
     /// Read-only in-memory access for tests. Do not call disk-aware

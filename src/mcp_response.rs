@@ -15,7 +15,6 @@ use crate::projection::{
 };
 use crate::repo_state::{PlanWorktreeStatus, RepoState, WaitingOn};
 use crate::review_state::CommitGate;
-use crate::runtime_snapshot::{PlanSnapshotBundle, RepoSnapshot};
 
 pub trait PlanStatusReader {
     fn compute(
@@ -74,26 +73,18 @@ pub fn compute_plan_worktree_status_parts(
 /// further queries. Conflict rows surface stems that map to multiple files
 /// on disk — work is not routed through them until the operator resolves
 /// the collision (see plan-path-identity §1b).
-pub fn list_plans_response(snapshot: &RepoSnapshot) -> std::io::Result<Value> {
-    list_plans_response_with_status_reader(snapshot, &DiskPlanStatusReader)
+pub fn list_plans_response(state: &RepoState) -> std::io::Result<Value> {
+    list_plans_response_with_status_reader(state, &DiskPlanStatusReader)
 }
 
 pub(crate) fn list_plans_response_with_status_reader(
-    snapshot: &RepoSnapshot,
+    state: &RepoState,
     status_reader: &impl PlanStatusReader,
 ) -> std::io::Result<Value> {
-    let state = snapshot.to_repo_state();
     let mut plans = Vec::with_capacity(state.plans.len());
-    for plan_snapshot in &snapshot.plans {
-        let plan = state
-            .plans
-            .get(&plan_snapshot.id)
-            .expect("snapshot plan must be present in temporary state");
-        let worktree_status = status_reader.compute(
-            &snapshot.root,
-            &plan_snapshot.plan_path,
-            &plan_snapshot.body_hash,
-        )?;
+    for plan in state.plans.values() {
+        let worktree_status =
+            status_reader.compute(&state.root, &plan.plan_path, &plan.body_hash)?;
         let plan_phase = phase(plan, &state.attribution);
         let gate = crate::projection::latest_reviewable_commit_gate_for(
             &plan.id,
@@ -108,14 +99,14 @@ pub(crate) fn list_plans_response_with_status_reader(
             gate,
         );
         plans.push(plan_summary(
-            &snapshot.root,
+            &state.root,
             plan,
             plan_phase,
             worktree_status,
             &w,
         ));
     }
-    let conflicts: Vec<Value> = snapshot
+    let conflicts: Vec<Value> = state
         .plan_conflicts
         .iter()
         .map(|(key, paths)| {
@@ -154,22 +145,24 @@ fn plan_summary(
 
 /// `get_context` response for a specific session + author.
 pub fn get_context_response(
-    snapshot: &PlanSnapshotBundle,
+    snapshot: &RepoState,
     author_label: &AgentLabel,
 ) -> std::io::Result<Value> {
     get_context_response_with_status_reader(snapshot, author_label, &DiskPlanStatusReader)
 }
 
 pub(crate) fn get_context_response_with_status_reader(
-    snapshot: &PlanSnapshotBundle,
+    snapshot: &RepoState,
     author_label: &AgentLabel,
     status_reader: &impl PlanStatusReader,
 ) -> std::io::Result<Value> {
-    let worktree_status = status_reader.compute(
-        &snapshot.root,
-        &snapshot.plan.plan_path,
-        &snapshot.plan.body_hash,
-    )?;
+    let plan = snapshot
+        .plans
+        .values()
+        .next()
+        .expect("snapshot_session invariant: exactly one plan");
+    let worktree_status =
+        status_reader.compute(&snapshot.root, &plan.plan_path, &plan.body_hash)?;
     Ok(get_context_response_from_snapshot(
         snapshot,
         worktree_status,
@@ -178,19 +171,19 @@ pub(crate) fn get_context_response_with_status_reader(
 }
 
 pub fn get_context_response_from_snapshot(
-    snapshot: &PlanSnapshotBundle,
+    state: &RepoState,
     worktree_status: PlanWorktreeStatus,
     author_label: &AgentLabel,
 ) -> Value {
-    let state = snapshot.to_repo_state();
-    let session_id = &snapshot.plan.id;
     let session = state
         .plans
-        .get(session_id)
-        .expect("snapshot session must be present in temporary state");
+        .values()
+        .next()
+        .expect("snapshot_session invariant: exactly one plan");
+    let session_id = &session.id;
     let session_phase = phase(session, &state.attribution);
-    let plan_gate = plan_gate_for(session, &state);
-    let impl_gate = impl_gate_for(session, &state);
+    let plan_gate = plan_gate_for(session, state);
+    let impl_gate = impl_gate_for(session, state);
     let gate = crate::projection::latest_reviewable_commit_gate_for(
         &session.id,
         &session.commits,
@@ -205,18 +198,18 @@ pub fn get_context_response_from_snapshot(
     );
 
     let pr_hint = if matches!(session_phase, crate::repo_state::Phase::Implementing) {
-        Some(pr_hint_value(session, &state))
+        Some(pr_hint_value(session, state))
     } else {
         None
     };
 
-    let timeline = timeline_value(&state, session_id);
+    let timeline = timeline_value(state, session_id);
 
-    let plan_revisions: Vec<String> = all_plan_revisions(session, &state)
+    let plan_revisions: Vec<String> = all_plan_revisions(session, state)
         .into_iter()
         .map(|s| s.as_str().to_string())
         .collect();
-    let implementation_commits: Vec<String> = all_implementation_commits(session, &state)
+    let implementation_commits: Vec<String> = all_implementation_commits(session, state)
         .into_iter()
         .map(|s| s.as_str().to_string())
         .collect();
@@ -258,10 +251,10 @@ pub fn get_context_response_from_snapshot(
     });
     let expected_action_str = expected_action(w.reason);
 
-    let plan_id = crate::lifecycle::RepoBasename::from_repo_root(&snapshot.root)
+    let plan_id = crate::lifecycle::RepoBasename::from_repo_root(&state.root)
         .map(|b| crate::lifecycle::PlanId::new(b, session.id.clone()).to_string());
 
-    let commits_value = commits_array(session, &state);
+    let commits_value = commits_array(session, state);
     let latest_relevant_commit = crate::projection::latest_reviewable_commit_for(
         &session.id,
         &state.commit_order,
@@ -271,7 +264,7 @@ pub fn get_context_response_from_snapshot(
     .map(|s| s.as_str().to_string());
 
     json!({
-        "repo": snapshot.root.to_string_lossy(),
+        "repo": state.root.to_string_lossy(),
         "plan_id": plan_id,
         "slug": session.id.as_str(),
         "state": session.state.as_str(),
@@ -283,8 +276,8 @@ pub fn get_context_response_from_snapshot(
         "review_target": review_target,
         "write_feedback": write_feedback,
         "review_gate": gate_value(plan_gate, impl_gate, session_phase),
-        "latest_plan_revision": latest_plan_revision(session, &state),
-        "latest_implementation_revision": latest_impl_revision(session, &state),
+        "latest_plan_revision": latest_plan_revision(session, state),
+        "latest_implementation_revision": latest_impl_revision(session, state),
         "plan_revisions": plan_revisions,
         "implementation_commits": implementation_commits,
         // Commit-keyed wire shape. `latest_relevant_commit` is the
@@ -543,7 +536,7 @@ mod tests {
 
     fn context_from_state(state: &RepoState, sid: &str, author: &str) -> Option<serde_json::Value> {
         let sid = PlanKey::from(sid.to_string());
-        let snapshot = PlanSnapshotBundle::from_state_for(state, &sid)?;
+        let snapshot = state.single_plan(&sid)?;
         Some(get_context_response(&snapshot, &AgentLabel::from(author.to_string())).unwrap())
     }
 
@@ -615,8 +608,7 @@ mod tests {
         commit(dir.path(), "add plan");
 
         let state = rebuild_repo(dir.path()).await.unwrap();
-        let snapshot = RepoSnapshot::from_state(&state);
-        let v = list_plans_response(&snapshot).unwrap();
+        let v = list_plans_response(&state).unwrap();
         let arr = v["plans"].as_array().unwrap();
         assert_eq!(arr.len(), 1);
         assert_eq!(arr[0]["slug"], "foo");

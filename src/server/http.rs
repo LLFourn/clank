@@ -318,7 +318,12 @@ async fn api_plan_revision(
         .ok_or_else(|| AppError::not_found(format!("plan {repo_basename}/{stem_md} not found")))?;
 
     let plan_revisions = crate::projection::all_plan_revisions_for(
-        &snapshot.plan.id,
+        &snapshot
+            .plans
+            .values()
+            .next()
+            .expect("single_plan invariant")
+            .id,
         &snapshot.commit_order,
         &snapshot.plan_touches,
     );
@@ -329,7 +334,12 @@ async fn api_plan_revision(
     };
 
     let path_at_sha = crate::projection::plan_path_at(
-        &snapshot.plan.id,
+        &snapshot
+            .plans
+            .values()
+            .next()
+            .expect("single_plan invariant")
+            .id,
         &commit_sha,
         &snapshot.commit_order,
         &snapshot.plan_touches,
@@ -347,19 +357,23 @@ async fn api_plan_revision(
     let next_sha = plan_revisions.get(pos + 1).map(|c| c.as_str().to_string());
 
     let feedback = crate::ui_response::feedback_for_target(
-        &snapshot.plan,
+        snapshot
+            .plans
+            .values()
+            .next()
+            .expect("single_plan invariant"),
         &commit_sha,
         &snapshot.plan_touches,
     );
     Ok(axum::Json(json!({
         "repo": snapshot.root.to_string_lossy(),
         "plan_id": format!("{repo_basename}/{stem_md}"),
-        "slug": snapshot.plan.id.as_str(),
+        "slug": snapshot.plans.values().next().expect("single_plan invariant").id.as_str(),
         "commit_sha": commit_sha.as_str(),
         "body_raw": body_raw,
         "body_html": body_html,
-        "plan_intro": snapshot.plan.plan_intro.as_str(),
-        "plan_intro_parent": snapshot.plan.plan_intro_parent.as_ref().map(|s| s.as_str()),
+        "plan_intro": snapshot.plans.values().next().expect("single_plan invariant").plan_intro.as_str(),
+        "plan_intro_parent": snapshot.plans.values().next().expect("single_plan invariant").plan_intro_parent.as_ref().map(|s| s.as_str()),
         "previous_sha": previous_sha,
         "next_sha": next_sha,
         "feedback": feedback,
@@ -383,7 +397,7 @@ async fn api_commit_diff(
     let belongs_to_plan = matches!(
         snapshot.attribution.get(&commit_sha),
         Some(crate::repo_state::AttributionResult::Attributed { session, .. })
-            if session == &snapshot.plan.id
+            if session == &snapshot.plans.values().next().expect("single_plan invariant").id
     );
     if !belongs_to_plan {
         return Err(AppError::not_found(format!(
@@ -402,14 +416,18 @@ async fn api_commit_diff(
         .map_err(|e| AppError::internal(format!("git show -s: {e}")))?;
 
     let feedback = crate::ui_response::feedback_for_target(
-        &snapshot.plan,
+        snapshot
+            .plans
+            .values()
+            .next()
+            .expect("single_plan invariant"),
         &commit_sha,
         &snapshot.plan_touches,
     );
     Ok(axum::Json(json!({
         "repo": snapshot.root.to_string_lossy(),
         "plan_id": format!("{repo_basename}/{stem_md}"),
-        "slug": snapshot.plan.id.as_str(),
+        "slug": snapshot.plans.values().next().expect("single_plan invariant").id.as_str(),
         "commit_sha": commit_sha.as_str(),
         "subject": subject,
         "message_body": message_body,
@@ -430,7 +448,15 @@ async fn api_move_to_done(
         .snapshot_session(&repo, &plan_key)
         .await
         .map_err(AppError::runtime)?
-        .map(|snapshot| snapshot.plan.plan_path)
+        .map(|snapshot| {
+            snapshot
+                .plans
+                .values()
+                .next()
+                .expect("single_plan invariant")
+                .plan_path
+                .clone()
+        })
         .ok_or_else(|| AppError::not_found(format!("plan {repo_basename}/{stem_md} not found")))?;
 
     let from = repo.join(plan_path_rel.as_path());
@@ -470,7 +496,12 @@ async fn api_diff(
         .ok_or_else(|| AppError::not_found(format!("plan {repo_basename}/{stem_md} not found")))?;
 
     let plan_revisions = crate::projection::all_plan_revisions_for(
-        &snapshot.plan.id,
+        &snapshot
+            .plans
+            .values()
+            .next()
+            .expect("single_plan invariant")
+            .id,
         &snapshot.commit_order,
         &snapshot.plan_touches,
     );
@@ -486,14 +517,24 @@ async fn api_diff(
     }
 
     let from_path = crate::projection::plan_path_at(
-        &snapshot.plan.id,
+        &snapshot
+            .plans
+            .values()
+            .next()
+            .expect("single_plan invariant")
+            .id,
         &from_sha,
         &snapshot.commit_order,
         &snapshot.plan_touches,
     )
     .ok_or_else(|| AppError::not_found(format!("commit {from_sha} not in plan history")))?;
     let to_path = crate::projection::plan_path_at(
-        &snapshot.plan.id,
+        &snapshot
+            .plans
+            .values()
+            .next()
+            .expect("single_plan invariant")
+            .id,
         &to_sha,
         &snapshot.commit_order,
         &snapshot.plan_touches,
