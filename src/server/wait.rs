@@ -57,6 +57,24 @@ pub enum WaitResponse {
         work: String,
         /// Repo-relative paths the caller should read or write.
         locations: Vec<String>,
+        /// SHA of the commit this work targets. Present for every
+        /// review / address action; absent for terminal states like
+        /// `none` (`SessionDone`).
+        #[serde(skip_serializing_if = "Option::is_none")]
+        target_sha: Option<String>,
+        /// `CommitKind` (`plan_only` | `code_only` | `mixed` |
+        /// `done_move` | `multi_plan` | `unattributed`) of the target
+        /// commit. Lets agents tailor prompt language to the commit
+        /// shape without re-deriving it from `plan_touch`/code-diff.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        commit_kind: Option<String>,
+        /// Short imperative pointer for an agent: a sentence or two
+        /// summarizing what to read and what to look for. Caller can
+        /// override; the default is sane for the typical
+        /// `review_commit` / `address_commit_changes` / `move_forward`
+        /// flow.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        prompt_hint: Option<String>,
     },
     Timeout {
         timed_out: bool,
@@ -110,12 +128,7 @@ pub async fn wait_for_work(runtime: &Runtime, args: WaitArgs) -> Result<WaitResp
     let mut rx = runtime.subscribe_events();
 
     if let Some(work) = compute_match(runtime, &plan_id, role, &author).await? {
-        return Ok(WaitResponse::Work {
-            plan_id: plan_id.to_string(),
-            repo: work.repo,
-            work: work.work.to_string(),
-            locations: work.locations,
-        });
+        return Ok(work.into_response(plan_id.to_string()));
     }
 
     let deadline = started_at + timeout;
@@ -127,23 +140,13 @@ pub async fn wait_for_work(runtime: &Runtime, args: WaitArgs) -> Result<WaitResp
         match tokio::time::timeout(remaining, rx.recv()).await {
             Ok(Ok(_event)) => {
                 if let Some(work) = compute_match(runtime, &plan_id, role, &author).await? {
-                    return Ok(WaitResponse::Work {
-                        plan_id: plan_id.to_string(),
-                        repo: work.repo,
-                        work: work.work.to_string(),
-                        locations: work.locations,
-                    });
+                    return Ok(work.into_response(plan_id.to_string()));
                 }
             }
             Ok(Err(RecvError::Lagged(_))) => {
                 rx = runtime.subscribe_events();
                 if let Some(work) = compute_match(runtime, &plan_id, role, &author).await? {
-                    return Ok(WaitResponse::Work {
-                        plan_id: plan_id.to_string(),
-                        repo: work.repo,
-                        work: work.work.to_string(),
-                        locations: work.locations,
-                    });
+                    return Ok(work.into_response(plan_id.to_string()));
                 }
             }
             Ok(Err(RecvError::Closed)) | Err(_) => {
@@ -168,6 +171,23 @@ struct WorkItem {
     /// a convenience field on the response).
     repo: String,
     locations: Vec<String>,
+    target_sha: Option<String>,
+    commit_kind: Option<String>,
+    prompt_hint: Option<String>,
+}
+
+impl WorkItem {
+    fn into_response(self, plan_id: String) -> WaitResponse {
+        WaitResponse::Work {
+            plan_id,
+            repo: self.repo,
+            work: self.work.to_string(),
+            locations: self.locations,
+            target_sha: self.target_sha,
+            commit_kind: self.commit_kind,
+            prompt_hint: self.prompt_hint,
+        }
+    }
 }
 
 /// Snapshot the candidate under lock, release, then disk-read
@@ -208,11 +228,89 @@ async fn compute_match(
     let work = expected_action(w.reason);
     let locations = derive_locations(&candidate, w.reason, author);
     let repo = candidate.repo_root.to_string_lossy().into_owned();
+
+    // target_sha: the commit the work targets. For review/address
+    // reasons, that's the gate's underlying SHA (impl wins when both
+    // gates exist, matching `compute_match`'s gate pick). Worktree-
+    // status reasons and SessionDone don't carry a SHA.
+    let (target_sha, commit_kind) = match w.reason {
+        WaitingReason::CommitNeedsReview | WaitingReason::AddressCommitChanges => {
+            let sha_opt = candidate
+                .impl_target
+                .as_ref()
+                .or(candidate.plan_target.as_ref())
+                .map(|s| s.as_str().to_string());
+            let kind_opt = sha_opt.as_ref().map(|sha| {
+                let kind = crate::projection::commit_kind_for(
+                    &candidate.plan_key,
+                    &crate::lifecycle::CommitSha::from(sha.clone()),
+                    &candidate.plan_touches,
+                    &candidate.attribution,
+                );
+                kind.as_str().to_string()
+            });
+            (sha_opt, kind_opt)
+        }
+        _ => (None, None),
+    };
+
+    let prompt_hint = prompt_hint_for(w.reason, commit_kind.as_deref(), &candidate.plan_path);
+
     Ok(Some(WorkItem {
         work,
         repo,
         locations,
+        target_sha,
+        commit_kind,
+        prompt_hint,
     }))
+}
+
+/// Default `prompt_hint` text for a given `(reason, commit_kind)`.
+/// Short imperative; the agent can override. Returns `None` for
+/// terminal/no-work states.
+fn prompt_hint_for(
+    reason: WaitingReason,
+    commit_kind: Option<&str>,
+    plan_path: &std::path::Path,
+) -> Option<String> {
+    use WaitingReason::*;
+    let plan_path_str = plan_path.to_string_lossy();
+    Some(match (reason, commit_kind) {
+        (CommitNeedsReview, Some("plan_only")) => format!(
+            "This commit only changes the plan. Read the plan file at {plan_path_str} and \
+             review the proposed approach."
+        ),
+        (CommitNeedsReview, Some("code_only")) => {
+            "This commit makes implementation changes. Review the diff and check it against the \
+             approved plan."
+                .to_string()
+        }
+        (CommitNeedsReview, Some("mixed")) => format!(
+            "This commit changes both the plan and code. Read the updated plan at {plan_path_str} \
+             and review the diff together."
+        ),
+        (CommitNeedsReview, _) => "Review the latest commit on this plan.".to_string(),
+        (AddressCommitChanges, _) => "Review requested changes on the latest commit. \
+             Read each REQUEST_CHANGES file in the locations and address them with a follow-up commit."
+            .to_string(),
+        (CommitPlanRevision, _) => format!(
+            "Plan has uncommitted changes at {plan_path_str}. Commit the revision to release \
+             blocked reviews."
+        ),
+        (CommitDoneMove, _) => format!(
+            "Plan was moved to `done/` but isn't committed. Stage and commit the move \
+             (currently at {plan_path_str})."
+        ),
+        (RestoreOrCommitDoneMove, _) => format!(
+            "Active plan file is missing at {plan_path_str}. Either restore it \
+             (`git checkout -- {plan_path_str}`) or move it to `done/` and commit."
+        ),
+        (ReadyToMoveForward, _) => "Latest commit is approved. Continue with the next \
+             commit or move the plan to `done/`."
+            .to_string(),
+        (SessionDone, _) => return None,
+    })
 }
 
 /// True if `author` already has a current-target verdict for the
@@ -327,6 +425,9 @@ struct Candidate {
     impl_gate: Option<ReviewGateDecision>,
     plan_target: Option<CommitSha>,
     impl_target: Option<CommitSha>,
+    plan_touches:
+        std::collections::BTreeMap<CommitSha, Vec<(PlanKey, crate::repo_state::PlanTouchKind)>>,
+    attribution: std::collections::BTreeMap<CommitSha, crate::repo_state::AttributionResult>,
 }
 
 fn collect_candidate(
@@ -362,6 +463,8 @@ fn collect_candidate(
         impl_gate: impl_gate_for(plan, repo_state),
         plan_target: latest_plan_touching_commit(plan, repo_state),
         impl_target: latest_impl_commit(plan, repo_state),
+        plan_touches: repo_state.plan_touches.clone(),
+        attribution: repo_state.attribution.clone(),
     })
 }
 
@@ -408,6 +511,8 @@ mod tests {
             impl_gate: None,
             plan_target: plan_target.map(CommitSha::from),
             impl_target: impl_target.map(CommitSha::from),
+            plan_touches: std::collections::BTreeMap::new(),
+            attribution: std::collections::BTreeMap::new(),
         }
     }
 
