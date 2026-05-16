@@ -22,7 +22,7 @@ use crate::projection::{
     waiting_on,
 };
 use crate::repo_state::{AttributionResult, Feedback, Phase, PlanTouchKind, Verdict, WaitingOn};
-use crate::review_state::{ReviewGateDecision, ReviewPhase};
+use crate::review_state::ReviewGateDecision;
 use crate::runtime_snapshot::{PlanSnapshot, PlanSnapshotBundle, RepoSnapshot};
 
 /// `GET /api/plans` — `{ plans, conflicts }` for the home page.
@@ -83,14 +83,7 @@ fn plans_index_parts(
     let mut plans: Vec<IndexedPlanRow> = Vec::with_capacity(snapshot.plans.len());
     for plan in &snapshot.plans {
         let plan_phase = phase_for(&plan.plan_path, &plan.id, &snapshot.attribution);
-        let plan_gate = plan_gate_for_parts(
-            &plan.id,
-            &plan.commits,
-            &snapshot.commit_order,
-            &snapshot.plan_touches,
-            &snapshot.attribution,
-        );
-        let impl_gate = impl_gate_for_parts(
+        let gate = crate::projection::latest_reviewable_commit_gate_for(
             &plan.id,
             &plan.commits,
             &snapshot.commit_order,
@@ -100,10 +93,9 @@ fn plans_index_parts(
         let worktree_status =
             status_reader.compute(&snapshot.root, &plan.plan_path, &plan.body_hash)?;
         let w = waiting_on(
-            plan_phase,
+            matches!(plan.state, crate::repo_state::PlanState::Done),
             worktree_status,
-            plan_gate.as_ref(),
-            impl_gate.as_ref(),
+            gate.as_ref(),
         );
         let plan_id = basename
             .as_ref()
@@ -178,11 +170,17 @@ pub fn plan_page_with_reader(
         &bundle.plan_touches,
         &bundle.attribution,
     );
+    let gate = crate::projection::latest_reviewable_commit_gate_for(
+        &plan.id,
+        &plan.commits,
+        &bundle.commit_order,
+        &bundle.plan_touches,
+        &bundle.attribution,
+    );
     let w = waiting_on(
-        plan_phase,
+        matches!(plan.state, crate::repo_state::PlanState::Done),
         worktree_status,
-        plan_gate.as_ref(),
-        impl_gate.as_ref(),
+        gate.as_ref(),
     );
 
     let plan_revisions: Vec<String> =
@@ -429,10 +427,15 @@ fn gate_value(
         Phase::Implementing => impl_gate,
         Phase::Done => None,
     };
+    let phase_str = match session_phase {
+        Phase::Planning => "plan",
+        Phase::Implementing => "impl",
+        Phase::Done => "plan",
+    };
     match gate {
         Some(g) => json!({
             "state": g.state.as_str(),
-            "phase": match g.phase { ReviewPhase::Plan => "plan", ReviewPhase::Impl => "impl" },
+            "phase": phase_str,
             "participants": g.participants.iter().map(|a| a.as_str()).collect::<Vec<_>>(),
             "approvals": g.approvals.iter().map(|a| a.as_str()).collect::<Vec<_>>(),
             "request_changes": g.request_changes.iter().map(|a| a.as_str()).collect::<Vec<_>>(),
@@ -524,11 +527,7 @@ pub fn feedback_for_target(
     let has_plan_touch = plan_touches
         .get(sha)
         .is_some_and(|ts| ts.iter().any(|(k, _)| k == &session.id));
-    let phase = if has_plan_touch {
-        ReviewPhase::Plan
-    } else {
-        ReviewPhase::Impl
-    };
+    let phase = if has_plan_touch { "plan" } else { "impl" };
     gate.feedback
         .iter()
         .map(|(author, fb)| feedback_entry(sha, author, fb, phase))
@@ -539,7 +538,7 @@ fn feedback_entry(
     target: &CommitSha,
     author: &AgentLabel,
     fb: &Feedback,
-    phase: ReviewPhase,
+    phase: &'static str,
 ) -> Value {
     json!({
         "target_sha": target.as_str(),
@@ -549,7 +548,7 @@ fn feedback_entry(
         "body_html": render_feedback_body(&fb.body, fb.verdict),
         "path": fb.path.to_string_lossy(),
         "created_at": fb.created_at,
-        "phase": phase.as_str(),
+        "phase": phase,
     })
 }
 

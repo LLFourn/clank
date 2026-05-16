@@ -13,9 +13,7 @@ use crate::repo_state::{
     AttributionResult, CommitKind, Feedback, Phase, Plan, PlanTouchKind, PlanWorktreeStatus,
     Verdict, WaitingOn, WaitingReason, WaitingRole,
 };
-use crate::review_state::{
-    CommitGate, CommitGateState, ReviewGateDecision, ReviewGateState, ReviewPhase,
-};
+use crate::review_state::{CommitGate, CommitGateState, ReviewGateDecision, ReviewGateState};
 
 use std::collections::BTreeMap;
 
@@ -74,25 +72,19 @@ pub fn phase_for(
     Phase::Planning
 }
 
-/// Compose the `waiting_on` value for a session per the case table in the
-/// plan. Top rows (worktree-status-driven) preempt gate-driven rows.
-///
-/// The caller supplies the already-derived phase, worktree status, and the
-/// plan/impl gates (computed via `review_state::derive_gate`). This is
-/// intentional: the projection is a fold over already-computed pieces, not
-/// the place to recompute the gate.
+/// Compose the `waiting_on` value for a session. Top rows
+/// (worktree-status-driven) preempt the gate-driven row. The caller
+/// passes the latest reviewable commit's gate (via
+/// `latest_reviewable_commit_gate_for` or one of the legacy `plan_gate_for` /
+/// `impl_gate_for` wrappers that funnel into the same store).
 pub fn waiting_on(
-    phase: Phase,
+    is_done: bool,
     worktree_status: PlanWorktreeStatus,
-    plan_gate: Option<&ReviewGateDecision>,
-    impl_gate: Option<&ReviewGateDecision>,
+    gate: Option<&ReviewGateDecision>,
 ) -> WaitingOn {
-    // Top-priority: terminal done state.
-    if matches!(phase, Phase::Done) {
+    if is_done {
         return make(WaitingRole::None, WaitingReason::SessionDone, Vec::new());
     }
-
-    // Worktree-status rows preempt gate-driven rows.
     match worktree_status {
         PlanWorktreeStatus::DoneMovePending => {
             return make(
@@ -117,17 +109,41 @@ pub fn waiting_on(
         }
         PlanWorktreeStatus::Clean => {}
     }
+    waiting_from_gate(gate)
+}
 
-    // Gate-driven rows. Pick whichever gate is set (impl wins when
-    // both exist — corresponds to the post-cutover "latest relevant
-    // commit" walk landing on a code commit). Phase 2.5b will
-    // replace this branch with a single `latest_relevant_commit_gate`
-    // call.
-    match phase {
-        Phase::Planning => waiting_from_gate(plan_gate),
-        Phase::Implementing => waiting_from_gate(impl_gate),
-        Phase::Done => unreachable!("done was handled above"),
+/// Latest reviewable commit's gate for one plan, projected into the
+/// legacy `ReviewGateDecision` shape. Skips `MultiPlan`, `DoneMove`,
+/// `Unattributed` — those don't drive `waiting_on`. Returns `None`
+/// when no reviewable commit exists yet.
+pub fn latest_reviewable_commit_gate_for(
+    plan_key: &crate::lifecycle::PlanKey,
+    commits: &BTreeMap<CommitSha, CommitGate>,
+    commit_order: &[CommitSha],
+    plan_touches: &BTreeMap<CommitSha, Vec<(crate::lifecycle::PlanKey, PlanTouchKind)>>,
+    attribution: &BTreeMap<CommitSha, AttributionResult>,
+) -> Option<ReviewGateDecision> {
+    let target = latest_reviewable_commit_for(plan_key, commit_order, plan_touches, attribution)?;
+    let gate = commits.get(&target)?;
+    Some(commit_gate_to_review_decision(gate))
+}
+
+/// Latest commit whose `CommitKind` is reviewable (`PlanOnly`,
+/// `CodeOnly`, or `Mixed`) for this plan, walking `commit_order`
+/// newest-first.
+pub fn latest_reviewable_commit_for(
+    plan_key: &crate::lifecycle::PlanKey,
+    commit_order: &[CommitSha],
+    plan_touches: &BTreeMap<CommitSha, Vec<(crate::lifecycle::PlanKey, PlanTouchKind)>>,
+    attribution: &BTreeMap<CommitSha, AttributionResult>,
+) -> Option<CommitSha> {
+    for sha in commit_order.iter().rev() {
+        let kind = commit_kind_for(plan_key, sha, plan_touches, attribution);
+        if kind.is_reviewable() {
+            return Some(sha.clone());
+        }
     }
+    None
 }
 
 fn waiting_from_gate(gate: Option<&ReviewGateDecision>) -> WaitingOn {
@@ -436,7 +452,7 @@ pub fn plan_gate_for_parts(
     let current_target =
         latest_reviewable_plan_commit_for(plan_key, commit_order, plan_touches, attribution)?;
     let gate = commits.get(&current_target)?;
-    Some(commit_gate_to_review_decision(ReviewPhase::Plan, gate))
+    Some(commit_gate_to_review_decision(gate))
 }
 
 /// Implementation-phase review gate. Projects the `CommitGate` for
@@ -470,7 +486,7 @@ pub fn impl_gate_for_parts(
     let current_target =
         latest_reviewable_impl_commit_for(plan_key, commit_order, plan_touches, attribution)?;
     let gate = commits.get(&current_target)?;
-    Some(commit_gate_to_review_decision(ReviewPhase::Impl, gate))
+    Some(commit_gate_to_review_decision(gate))
 }
 
 /// Project a `CommitGate` into the legacy `ReviewGateDecision` shape
@@ -479,9 +495,8 @@ pub fn impl_gate_for_parts(
 /// representation that `waiting_on` and the existing MCP response
 /// shape expect. Phase 2.3 will collapse callers onto `CommitGate`
 /// directly and delete this bridge.
-fn commit_gate_to_review_decision(phase: ReviewPhase, gate: &CommitGate) -> ReviewGateDecision {
+fn commit_gate_to_review_decision(gate: &CommitGate) -> ReviewGateDecision {
     ReviewGateDecision {
-        phase,
         state: match gate.state {
             CommitGateState::ChangesRequested => ReviewGateState::ChangesRequested,
             CommitGateState::Approved => ReviewGateState::Ready,
@@ -757,7 +772,7 @@ mod tests {
 
     use crate::lifecycle::{AgentLabel, PlanKey};
     use crate::repo_state::PlanTouchKind;
-    use crate::review_state::{ReviewGateDecision, ReviewGateState, ReviewPhase};
+    use crate::review_state::{ReviewGateDecision, ReviewGateState};
     use std::path::PathBuf;
 
     fn hash(s: &str) -> ContentHash {
@@ -772,7 +787,6 @@ mod tests {
     }
 
     fn gate(
-        phase: ReviewPhase,
         state: ReviewGateState,
         participants: Vec<AgentLabel>,
         approvals: Vec<AgentLabel>,
@@ -780,7 +794,6 @@ mod tests {
         missing_approvals: Vec<AgentLabel>,
     ) -> ReviewGateDecision {
         ReviewGateDecision {
-            phase,
             state,
             approval_rule: "all_participants",
             participants,
@@ -834,7 +847,7 @@ mod tests {
 
     #[test]
     fn waiting_session_done_when_phase_done() {
-        let w = waiting_on(Phase::Done, PlanWorktreeStatus::Clean, None, None);
+        let w = waiting_on(true, PlanWorktreeStatus::Clean, None);
         assert_eq!(w.role, WaitingRole::None);
         assert_eq!(w.reason, WaitingReason::SessionDone);
     }
@@ -842,31 +855,20 @@ mod tests {
     #[test]
     fn waiting_commit_done_move_preempts_gate() {
         let g = gate(
-            ReviewPhase::Plan,
             ReviewGateState::Ready,
             agents(&["alice"]),
             agents(&["alice"]),
             Vec::new(),
             Vec::new(),
         );
-        let w = waiting_on(
-            Phase::Planning,
-            PlanWorktreeStatus::DoneMovePending,
-            Some(&g),
-            None,
-        );
+        let w = waiting_on(false, PlanWorktreeStatus::DoneMovePending, Some(&g));
         assert_eq!(w.role, WaitingRole::Master);
         assert_eq!(w.reason, WaitingReason::CommitDoneMove);
     }
 
     #[test]
     fn waiting_restore_or_commit_done_move() {
-        let w = waiting_on(
-            Phase::Planning,
-            PlanWorktreeStatus::MissingActivePlanFile,
-            None,
-            None,
-        );
+        let w = waiting_on(false, PlanWorktreeStatus::MissingActivePlanFile, None);
         assert_eq!(w.role, WaitingRole::Master);
         assert_eq!(w.reason, WaitingReason::RestoreOrCommitDoneMove);
     }
@@ -874,19 +876,13 @@ mod tests {
     #[test]
     fn waiting_commit_plan_revision_preempts_gate() {
         let g = gate(
-            ReviewPhase::Plan,
             ReviewGateState::Ready,
             agents(&["alice"]),
             agents(&["alice"]),
             Vec::new(),
             Vec::new(),
         );
-        let w = waiting_on(
-            Phase::Planning,
-            PlanWorktreeStatus::BodyDirty,
-            Some(&g),
-            None,
-        );
+        let w = waiting_on(false, PlanWorktreeStatus::BodyDirty, Some(&g));
         assert_eq!(w.role, WaitingRole::Master);
         assert_eq!(w.reason, WaitingReason::CommitPlanRevision);
     }
@@ -894,14 +890,13 @@ mod tests {
     #[test]
     fn waiting_plan_initial_review_no_participants() {
         let g = gate(
-            ReviewPhase::Plan,
             ReviewGateState::NeedsReview,
             Vec::new(),
             Vec::new(),
             Vec::new(),
             Vec::new(),
         );
-        let w = waiting_on(Phase::Planning, PlanWorktreeStatus::Clean, Some(&g), None);
+        let w = waiting_on(false, PlanWorktreeStatus::Clean, Some(&g));
         assert_eq!(w.role, WaitingRole::Reviewers);
         assert_eq!(w.reason, WaitingReason::CommitNeedsReview);
         assert!(w.agents.is_empty());
@@ -910,14 +905,13 @@ mod tests {
     #[test]
     fn waiting_plan_rereview_with_stale_participants() {
         let g = gate(
-            ReviewPhase::Plan,
             ReviewGateState::NeedsReview,
             agents(&["alice", "bob"]),
             Vec::new(),
             Vec::new(),
             agents(&["alice", "bob"]),
         );
-        let w = waiting_on(Phase::Planning, PlanWorktreeStatus::Clean, Some(&g), None);
+        let w = waiting_on(false, PlanWorktreeStatus::Clean, Some(&g));
         assert_eq!(w.role, WaitingRole::Reviewers);
         assert_eq!(w.reason, WaitingReason::CommitNeedsReview);
         assert_eq!(w.agents.len(), 2);
@@ -926,14 +920,13 @@ mod tests {
     #[test]
     fn waiting_plan_request_changes_to_master() {
         let g = gate(
-            ReviewPhase::Plan,
             ReviewGateState::ChangesRequested,
             agents(&["alice", "bob"]),
             Vec::new(),
             agents(&["bob"]),
             Vec::new(),
         );
-        let w = waiting_on(Phase::Planning, PlanWorktreeStatus::Clean, Some(&g), None);
+        let w = waiting_on(false, PlanWorktreeStatus::Clean, Some(&g));
         assert_eq!(w.role, WaitingRole::Master);
         assert_eq!(w.reason, WaitingReason::AddressCommitChanges);
         assert_eq!(w.agents, agents(&["bob"]));
@@ -942,14 +935,13 @@ mod tests {
     #[test]
     fn waiting_plan_ready_to_implement() {
         let g = gate(
-            ReviewPhase::Plan,
             ReviewGateState::Ready,
             agents(&["alice"]),
             agents(&["alice"]),
             Vec::new(),
             Vec::new(),
         );
-        let w = waiting_on(Phase::Planning, PlanWorktreeStatus::Clean, Some(&g), None);
+        let w = waiting_on(false, PlanWorktreeStatus::Clean, Some(&g));
         assert_eq!(w.role, WaitingRole::Master);
         assert_eq!(w.reason, WaitingReason::ReadyToMoveForward);
     }
@@ -957,19 +949,13 @@ mod tests {
     #[test]
     fn waiting_impl_initial_review() {
         let g = gate(
-            ReviewPhase::Impl,
             ReviewGateState::NeedsReview,
             Vec::new(),
             Vec::new(),
             Vec::new(),
             Vec::new(),
         );
-        let w = waiting_on(
-            Phase::Implementing,
-            PlanWorktreeStatus::Clean,
-            None,
-            Some(&g),
-        );
+        let w = waiting_on(false, PlanWorktreeStatus::Clean, Some(&g));
         assert_eq!(w.role, WaitingRole::Reviewers);
         assert_eq!(w.reason, WaitingReason::CommitNeedsReview);
     }
@@ -977,19 +963,13 @@ mod tests {
     #[test]
     fn waiting_impl_request_changes() {
         let g = gate(
-            ReviewPhase::Impl,
             ReviewGateState::ChangesRequested,
             agents(&["alice"]),
             Vec::new(),
             agents(&["alice"]),
             Vec::new(),
         );
-        let w = waiting_on(
-            Phase::Implementing,
-            PlanWorktreeStatus::Clean,
-            None,
-            Some(&g),
-        );
+        let w = waiting_on(false, PlanWorktreeStatus::Clean, Some(&g));
         assert_eq!(w.role, WaitingRole::Master);
         assert_eq!(w.reason, WaitingReason::AddressCommitChanges);
         assert_eq!(w.agents, agents(&["alice"]));
@@ -998,19 +978,13 @@ mod tests {
     #[test]
     fn waiting_impl_ready_to_finish() {
         let g = gate(
-            ReviewPhase::Impl,
             ReviewGateState::Ready,
             agents(&["alice"]),
             agents(&["alice"]),
             Vec::new(),
             Vec::new(),
         );
-        let w = waiting_on(
-            Phase::Implementing,
-            PlanWorktreeStatus::Clean,
-            None,
-            Some(&g),
-        );
+        let w = waiting_on(false, PlanWorktreeStatus::Clean, Some(&g));
         assert_eq!(w.role, WaitingRole::Master);
         assert_eq!(w.reason, WaitingReason::ReadyToMoveForward);
     }
@@ -1018,14 +992,13 @@ mod tests {
     #[test]
     fn description_includes_agent_list_when_present() {
         let g = gate(
-            ReviewPhase::Plan,
             ReviewGateState::ChangesRequested,
             agents(&["alice", "bob"]),
             Vec::new(),
             agents(&["bob"]),
             Vec::new(),
         );
-        let w = waiting_on(Phase::Planning, PlanWorktreeStatus::Clean, Some(&g), None);
+        let w = waiting_on(false, PlanWorktreeStatus::Clean, Some(&g));
         assert!(
             w.description.contains("bob"),
             "description should reference the requesting reviewer; got: {}",

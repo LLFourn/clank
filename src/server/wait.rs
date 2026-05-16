@@ -189,12 +189,15 @@ async fn compute_match(
         &candidate.plan_path,
         &candidate.body_hash,
     )?;
-    let w = waiting_on(
-        candidate.session_phase,
-        status,
-        candidate.plan_gate.as_ref(),
-        candidate.impl_gate.as_ref(),
-    );
+    // Prefer impl gate when present (post-cutover this becomes a
+    // single "latest reviewable" gate lookup — phase 2.5b leaves the
+    // dual gates on Candidate intact since wait still needs both
+    // plan_target and impl_target for derive_locations).
+    let gate = candidate
+        .impl_gate
+        .as_ref()
+        .or(candidate.plan_gate.as_ref());
+    let w = waiting_on(matches!(candidate.session_phase, Phase::Done), status, gate);
     if w.role != role {
         return Ok(None);
     }
@@ -370,14 +373,13 @@ mod tests {
 
     use super::*;
     use crate::lifecycle::content_hash;
-    use crate::review_state::{ReviewGateDecision, ReviewGateState, ReviewPhase};
+    use crate::review_state::{ReviewGateDecision, ReviewGateState};
 
     fn agents(labels: &[&str]) -> Vec<AgentLabel> {
         labels.iter().map(|s| AgentLabel::from(*s)).collect()
     }
 
     fn gate(
-        phase: ReviewPhase,
         state: ReviewGateState,
         participants: Vec<AgentLabel>,
         approvals: Vec<AgentLabel>,
@@ -385,7 +387,6 @@ mod tests {
         missing_approvals: Vec<AgentLabel>,
     ) -> ReviewGateDecision {
         ReviewGateDecision {
-            phase,
             state,
             approval_rule: "all_participants",
             participants,
@@ -438,7 +439,6 @@ mod tests {
     #[test]
     fn address_plan_request_changes_lists_rc_files_then_plan() {
         let g = gate(
-            ReviewPhase::Plan,
             ReviewGateState::ChangesRequested,
             agents(&["alice", "bob"]),
             Vec::new(),
@@ -461,7 +461,6 @@ mod tests {
     #[test]
     fn address_impl_request_changes_lists_rc_files_only() {
         let g = gate(
-            ReviewPhase::Impl,
             ReviewGateState::ChangesRequested,
             agents(&["dana"]),
             Vec::new(),

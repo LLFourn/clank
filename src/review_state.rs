@@ -89,7 +89,6 @@ impl ReviewGateState {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ReviewGateDecision {
-    pub phase: ReviewPhase,
     pub state: ReviewGateState,
     pub approval_rule: &'static str,
     pub participants: Vec<AgentLabel>,
@@ -100,9 +99,8 @@ pub struct ReviewGateDecision {
 }
 
 impl ReviewGateDecision {
-    pub fn empty(phase: ReviewPhase) -> Self {
+    pub fn empty() -> Self {
         Self {
-            phase,
             state: ReviewGateState::NeedsReview,
             approval_rule: "all_participants",
             participants: Vec::new(),
