@@ -6,10 +6,9 @@
 //! written) feeds `FilesystemSignal` values into `handle_signal`;
 //! request handlers (MCP, HTTP) read state via owned snapshots.
 
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Instant;
 
 use tokio::sync::{Mutex, broadcast};
 
@@ -21,10 +20,6 @@ use crate::runtime_snapshot::{PlanSnapshotBundle, RepoSnapshot};
 
 pub struct Runtime {
     state: Arc<Mutex<Trinity>>,
-    /// Paths Trinity recently wrote (renames during feedback
-    /// auto-organization). Watcher events on these paths are suppressed
-    /// for ~1 second so the runtime doesn't reprocess its own edits.
-    self_writes: Arc<Mutex<HashMap<PathBuf, Instant>>>,
     /// Broadcast channel for live events. SSE handlers subscribe here.
     events_tx: broadcast::Sender<LiveEvent>,
 }
@@ -34,7 +29,6 @@ impl Default for Runtime {
         let (events_tx, _) = broadcast::channel(256);
         Self {
             state: Arc::default(),
-            self_writes: Arc::default(),
             events_tx,
         }
     }
@@ -233,36 +227,6 @@ impl Runtime {
     }
 
     /// Mark paths Trinity is about to rename so the watcher loop can
-    /// suppress the resulting events. Entries expire after 1 second.
-    /// Mark paths Trinity is about to write so the watcher can
-    /// suppress the resulting event. Kept across the phase 2.4
-    /// flat-drop / held-feedback deletion: no internal caller today,
-    /// but the suppression ring is still useful for any future
-    /// rename-on-disk path (e.g. plan-file moves, done relocations).
-    #[allow(dead_code)]
-    async fn mark_self_writes(&self, paths: &[PathBuf]) {
-        let mut ring = self.self_writes.lock().await;
-        let now = Instant::now();
-        for p in paths {
-            ring.insert(p.clone(), now);
-        }
-    }
-
-    /// True if `path` was recently written by Trinity. Removes the entry
-    /// on hit (so the same path can be re-touched later by the user
-    /// and we won't keep suppressing).
-    async fn should_skip_self_write(&self, path: &Path) -> bool {
-        let mut ring = self.self_writes.lock().await;
-        // Garbage-collect expired entries opportunistically.
-        let cutoff = Instant::now() - std::time::Duration::from_secs(5);
-        ring.retain(|_, ts| *ts > cutoff);
-        if let Some(ts) = ring.remove(path) {
-            ts.elapsed() < std::time::Duration::from_secs(1)
-        } else {
-            false
-        }
-    }
-
     /// Handle one `FilesystemSignal` from the watcher layer.
     ///
     /// - `HeadChanged` → full rebuild of the repo, broadcast a single
@@ -349,9 +313,6 @@ impl Runtime {
             }
             FilesystemSignal::FeedbackWritten { parsed } => {
                 let abs_path = repo_root.join(".trinity/feedback").join(&parsed.raw);
-                if self.should_skip_self_write(&abs_path).await {
-                    return Ok(());
-                }
                 let body = match std::fs::read_to_string(&abs_path) {
                     Ok(b) => b,
                     Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
@@ -382,10 +343,6 @@ impl Runtime {
                 );
             }
             FilesystemSignal::FeedbackRemoved { parsed } => {
-                let abs_path = repo_root.join(".trinity/feedback").join(&parsed.raw);
-                if self.should_skip_self_write(&abs_path).await {
-                    return Ok(());
-                }
                 let mut trinity = self.state.lock().await;
                 let Some(state) = trinity.repos.get_mut(repo_root) else {
                     return Err(RuntimeError::UnknownRepo(repo_root.to_path_buf()));
