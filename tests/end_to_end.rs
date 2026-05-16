@@ -654,12 +654,10 @@ async fn sse_pushes_repo_rebuilt_on_head_change() {
 
 #[tokio::test]
 async fn start_plan_persists_repo_to_registry() {
-    // Daemon writes to its `--repos` path (here a tempdir), not `~/`.
-    let fake_home = tempfile::tempdir().unwrap();
+    let registry_parent = tempfile::tempdir().unwrap();
+    let registry_path = registry_parent.path().join("repos");
 
     let dir = init_repo();
-    // Use the default registry path the daemon resolves from ~/.trinity/repos.
-    let registry_path = fake_home.path().join(".trinity/repos");
     let (url, handle) = spawn_daemon_with_repos_file(&registry_path, &[]).await;
     let client = reqwest::Client::new();
     let req = json!({
@@ -680,8 +678,6 @@ async fn start_plan_persists_repo_to_registry() {
         resp.status()
     );
 
-    // ~/.trinity/repos should now contain the repo path.
-    let registry_path = fake_home.path().join(".trinity/repos");
     assert!(registry_path.exists(), "registry file should be created");
     let body = std::fs::read_to_string(&registry_path).unwrap();
     assert!(
@@ -690,10 +686,6 @@ async fn start_plan_persists_repo_to_registry() {
                 || std::path::Path::new(l.trim()) == dir.path().canonicalize().unwrap()),
         "registry should contain the repo, got: {body}"
     );
-
-    // Restore $HOME before dropping the lock — another HOME-mutating
-    // test may acquire next and we don't want it to observe our fake
-    // value.
 }
 
 #[tokio::test]
@@ -1004,7 +996,8 @@ async fn start_plan_rejects_repo_basename_collision() {
     // Two distinct canonical repos with the same `file_name`: the second
     // one's `start_plan` must fail with a basename-collision error
     // (`repo_basename_taken`) before any disk mutation.
-    let fake_home = tempfile::tempdir().unwrap();
+    let registry_parent = tempfile::tempdir().unwrap();
+    let registry_path = registry_parent.path().join("repos");
 
     let parent_a = tempfile::tempdir().unwrap();
     let parent_b = tempfile::tempdir().unwrap();
@@ -1019,7 +1012,7 @@ async fn start_plan_rejects_repo_basename_collision() {
         run_git(d, &["config", "commit.gpgsign", "false"]);
     }
 
-    let (url, handle) = spawn_daemon_with_repos(&[]).await;
+    let (url, handle) = spawn_daemon_with_repos_file(&registry_path, &[]).await;
     let client = reqwest::Client::new();
 
     let req_a = json!({
@@ -1070,25 +1063,22 @@ async fn start_plan_rejects_repo_basename_collision() {
     );
     // Same for the user-level registry: dir_b must not be persisted at
     // all (the first repo's path is fine, that's the whole point).
-    let registry =
-        std::fs::read_to_string(fake_home.path().join(".trinity/repos")).unwrap_or_default();
+    let registry = std::fs::read_to_string(&registry_path).unwrap_or_default();
     let dir_b_str = dir_b.to_string_lossy();
     assert!(
         !registry.lines().any(|l| l.trim() == dir_b_str),
         "registry must not record dir_b on collision; registry: {registry}"
     );
-
-    // Restore HOME before dropping the lock — another HOME-mutating test
-    // may acquire next and we don't want it to observe our fake value.
 }
 
 #[tokio::test]
 async fn start_plan_concurrent_basename_twins_loser_does_no_disk_mutation() {
     // Round 3 regression: two `start_plan`s from basename-twin repos
     // fired concurrently must result in exactly one repo with a written
-    // `.gitignore` + `~/.trinity/repos` entry — the loser must not leak
-    // disk mutations between the precheck and the atomic register.
-    let fake_home = tempfile::tempdir().unwrap();
+    // `.gitignore` + registry entry — the loser must not leak disk
+    // mutations between the precheck and the atomic register.
+    let registry_parent = tempfile::tempdir().unwrap();
+    let registry_path = registry_parent.path().join("repos");
 
     let parent_a = tempfile::tempdir().unwrap();
     let parent_b = tempfile::tempdir().unwrap();
@@ -1103,7 +1093,7 @@ async fn start_plan_concurrent_basename_twins_loser_does_no_disk_mutation() {
         run_git(d, &["config", "commit.gpgsign", "false"]);
     }
 
-    let (url, handle) = spawn_daemon_with_repos(&[]).await;
+    let (url, handle) = spawn_daemon_with_repos_file(&registry_path, &[]).await;
     let client = reqwest::Client::new();
     let url_a = url.clone();
     let url_b = url.clone();
@@ -1160,8 +1150,7 @@ async fn start_plan_concurrent_basename_twins_loser_does_no_disk_mutation() {
         !loser_dir.join(".gitignore").exists(),
         "loser twin must not have .gitignore written (TOCTOU leak)"
     );
-    let registry =
-        std::fs::read_to_string(fake_home.path().join(".trinity/repos")).unwrap_or_default();
+    let registry = std::fs::read_to_string(&registry_path).unwrap_or_default();
     let loser_str = loser_dir.to_string_lossy();
     assert!(
         !registry.lines().any(|l| l.trim() == loser_str),
@@ -1213,7 +1202,8 @@ async fn api_repos_lists_watched_with_basename_and_plan_count() {
 
 #[tokio::test]
 async fn delete_repo_removes_from_state_and_registry() {
-    let fake_home = tempfile::tempdir().unwrap();
+    let registry_parent = tempfile::tempdir().unwrap();
+    let registry_path = registry_parent.path().join("repos");
 
     let parent = tempfile::tempdir().unwrap();
     let dir = parent.path().join("orphan");
@@ -1223,7 +1213,7 @@ async fn delete_repo_removes_from_state_and_registry() {
     run_git(&dir, &["config", "user.name", "test"]);
     run_git(&dir, &["config", "commit.gpgsign", "false"]);
 
-    let (url, handle) = spawn_daemon_with_repos(&[]).await;
+    let (url, handle) = spawn_daemon_with_repos_file(&registry_path, &[]).await;
     let client = reqwest::Client::new();
 
     // Register via start_plan, then delete.
@@ -1280,8 +1270,7 @@ async fn delete_repo_removes_from_state_and_registry() {
     );
 
     // Registry file should not contain the path.
-    let registry =
-        std::fs::read_to_string(fake_home.path().join(".trinity/repos")).unwrap_or_default();
+    let registry = std::fs::read_to_string(&registry_path).unwrap_or_default();
     let dir_str = dir.to_string_lossy();
     assert!(
         !registry.lines().any(|l| l.trim() == dir_str),
@@ -1485,9 +1474,7 @@ async fn delete_repo_404_on_unknown_basename() {
 #[tokio::test]
 async fn registry_path_threads_through_start_plan_and_delete() {
     // Use a non-default --repos path. Both start_plan (persist) and the
-    // new DELETE handler must write to THIS path, not ~/.trinity/repos.
-    let fake_home = tempfile::tempdir().unwrap();
-
+    // DELETE handler must write to THIS path.
     let registry_dir = tempfile::tempdir().unwrap();
     let registry_path = registry_dir.path().join("custom-registry");
 
@@ -1514,10 +1501,7 @@ async fn registry_path_threads_through_start_plan_and_delete() {
         .await
         .unwrap();
 
-    // Custom registry has the path, default location does NOT.
     let custom_body = std::fs::read_to_string(&registry_path).unwrap_or_default();
-    let default_body =
-        std::fs::read_to_string(fake_home.path().join(".trinity/repos")).unwrap_or_default();
     // start_plan persists whatever `git rev-parse --show-toplevel`
     // returned, which on macOS is the canonical /private/var/... form.
     let dir_canonical = dir.canonicalize().unwrap().to_string_lossy().to_string();
@@ -1525,10 +1509,6 @@ async fn registry_path_threads_through_start_plan_and_delete() {
         custom_body.lines().any(|l| l.trim() == dir_canonical),
         "custom registry should contain repo after start_plan; \
          dir_canonical={dir_canonical}; got: {custom_body}"
-    );
-    assert!(
-        !default_body.lines().any(|l| l.trim() == dir_canonical),
-        "default registry must NOT be touched when --repos is custom; got: {default_body}"
     );
 
     // DELETE: should clean from custom registry.
