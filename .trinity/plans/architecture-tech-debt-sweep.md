@@ -124,6 +124,38 @@ representation that the sans-io direction argues against — readers
 should borrow from the live `RepoState` under the mutex, or take
 narrow typed query DTOs, not clone the whole world and rebuild it.
 
+**Fake `Option<T>` fields encode variant shape instead of using
+typed enums.** Three concrete instances:
+
+1. `server/wait.rs:71-87` — `WaitResponse::Work` carries
+   `target_sha: Option<String>`, `commit_kind: Option<String>`,
+   `prompt_hint: Option<String>` with `skip_serializing_if`.
+   `WorkItem` (`server/wait.rs:175-188`) mirrors the same three
+   Options. These aren't "really optional" — they're present for
+   every `review_commit` / `address_commit_changes` work item
+   and absent only for terminal `SessionDone`. The shape would be
+   honest as one variant per work kind:
+   `ReviewCommit { target_sha, commit_kind, prompt_hint, .. }`,
+   `AddressCommitChanges { ... }`, `CommitPlanRevision { ... }`,
+   `MoveForward { ... }`, `SessionDone`.
+2. `frontend/src/api.rs:69-79` — `ReviewGate.phase:
+   Option<String>` (it's only `None` for the now-deleted held-
+   feedback case) and timeline event structs with `phase` /
+   `plan_touch` as Options (variant-tag smell). These overlap
+   with the `Phase`/`TimelinePhase` deletion in Phase 9.
+3. `frontend/src/store.rs:38-46` — live-event struct with
+   `plan_id`, `slug`, `state` as `Option<String>` because some
+   events are "repo-level" and some are "plan-scoped". The wire
+   shape lets a repo-level event drift through the UI as if it
+   were plan-scoped with garbage fields. The honest shape is a
+   tagged event enum (`LiveEvent::Plan { plan_id, slug, state,
+   .. } | LiveEvent::Repo { .. }`).
+
+The pattern: `Option<T>` is being used as "the caller knows when
+this is present" — a JSON-assembly convenience that hides what
+should be a variant invariant. Same class of debt as fake caches
+and fake bridges.
+
 **WFW / get-context plan selection is split across surfaces.**
 The same conceptual "which plan?" question resolves differently in
 three places: MCP `wait_for_work` (`server/mcp.rs:48-88`) infers
@@ -407,6 +439,10 @@ distinct.
   `to_repo_state()` compat bridge).
 - Unified `PlanSelector` resolver path consumed by MCP, HTTP, and
   tests — no per-surface bespoke plan-id resolution.
+- Fake `Option<T>` fields (variant-tag Options on `WaitResponse`,
+  timeline events, live events) replaced with typed enum variants.
+  Every remaining `Option` answers a real "absence is meaningful"
+  question.
 - `Phase` and `TimelinePhase` enums deleted (folded into
   `CommitKind`-derived posture); coordinated with `wfw-alias §12`
   for `PlanState::Done`.
@@ -469,10 +505,13 @@ removal) is independent of all others**; **Phase 5 (walker collapse
 + accessor + strip hot-path branch) is independent**; **Phase 6
 (delete `runtime_snapshot.rs`) is independent of 1-5 but touches
 response builders**; **Phase 7 (`PlanSelector` resolver) is
-independent**; **Phase 8 (`Phase` enum deletion) interacts with
-`wfw-alias §12` and the ordering is specified below**; **Phase 9
-(frontend feedback unification) depends on Phase 8**; **Phase 10
-(test-file split, mandatory) lands last**.
+independent**; **Phase 8 (purge fake `Option<T>`) is independent
+but overlaps with Phase 9 on TimelineEvent shape — sequence 8 → 9
+to avoid touching TimelineEvent twice**; **Phase 9 (`Phase` enum
+deletion) interacts with `wfw-alias §12` and the ordering is
+specified below**; **Phase 10 (frontend feedback unification)
+depends on Phase 9**; **Phase 11 (test-file split, mandatory)
+lands last**.
 
 ### Phase 1 — Strong-typed ID validation (three sub-steps)
 
@@ -677,7 +716,37 @@ Work:
   prevents accidentally passing a cwd-inference variant. The split
   becomes intentional rather than accidental.
 
-### Phase 8 — Delete `Phase` and `TimelinePhase`
+### Phase 8 — Purge fake `Option<T>`
+
+Audit every `Option<T>` in `src/` and `frontend/src/` and ask:
+*what real absence does this model?* If the answer is "the caller
+knows by checking another field" or "this variant doesn't have
+this", that's a fake `Option`, and the model should use a typed
+variant instead.
+
+Concrete starting points:
+- `server/wait.rs:56-90` + `175-188`: split `WaitResponse::Work`
+  into per-work-kind variants. Each variant carries exactly the
+  fields it needs; no `target_sha: Option<String>` carrying
+  variant invariants implicitly. `WorkItem` similarly becomes a
+  typed enum or is deleted in favour of constructing the response
+  variant directly at each call-site.
+- `frontend/src/api.rs:69-79` and timeline event wire structs:
+  `phase: Option<String>` / `plan_touch: Option<String>` become
+  per-variant required fields on a tagged enum. Overlaps with
+  Phase 9 (`TimelinePhase` deletion); coordinate.
+- `frontend/src/store.rs:38-46`: live event struct splits into a
+  tagged enum (`LiveEvent::Plan { plan_id: PlanId, slug: PlanKey,
+  state: PlanState, .. } | LiveEvent::Repo { .. }`). Daemon-side
+  emission (`runtime.rs` / `event_bus`) updates to match.
+- Audit pass: grep for `Option<CommitSha>`, `Option<PlanKey>`,
+  `Option<PlanId>`, `Option<String>` across `src/` and
+  `frontend/src/`. Every remaining `Option<...>` after this phase
+  should answer "the absent case is a genuinely different
+  semantic state" — `head` / `parent` / `previous_sha` style.
+  Variant-tag Options get deleted in favour of typed enums.
+
+### Phase 9 — Delete `Phase` and `TimelinePhase`
 
 **Ordering with `wfw-alias §12`**: `wfw-alias §12` deletes
 `PlanState::Done`. This phase deletes `Phase` and `TimelinePhase`.
@@ -704,19 +773,19 @@ Work:
   same `Posture` value in, or (preferred) delete the field
   entirely and let the consumer derive it from the linked commit's
   kind. The frontend timeline rendering needs to follow whichever
-  choice this phase makes — coordinate with Phase 9.
+  choice this phase makes — coordinate with Phase 10.
 - Delete `Phase`, `phase_for`, `phase` from `repo_state.rs` /
   `projection.rs`; delete `TimelinePhase` from `repo_state.rs:292`.
 - Update the 12 call-sites in `mcp_response.rs`/`ui_response.rs`
   to read `posture` instead.
 
-### Phase 9 — Frontend feedback shape unification (depends on Phase 8)
+### Phase 10 — Frontend feedback shape unification (depends on Phase 9)
 
 The dependency: `TimelineEvent` row rendering touches the same
 component code as `FeedbackEntry`. Picking `CommitFeedback` as
 canonical means `target_sha` (which `FeedbackEntry` has and
 `CommitFeedback` doesn't) needs to be sourced from the commit's
-context. Doing this *after* Phase 8 means the timeline rendering
+context. Doing this *after* Phase 9 means the timeline rendering
 has already been touched once.
 
 - Pick `CommitFeedback` (`frontend/src/api.rs:101-109`) as canonical.
@@ -732,7 +801,7 @@ has already been touched once.
   `#[serde(deny_unknown_fields)]` per struct and fix any genuinely
   unused fields surfaced by `cargo check`.
 
-### Phase 10 — `tests/end_to_end.rs` split + injectable test home
+### Phase 11 — `tests/end_to_end.rs` split + injectable test home
 
 **Mandatory**, not optional. A 1707-line e2e file plus a global
 `$HOME` mutex *is* architecture debt — exactly what this plan is
@@ -773,12 +842,18 @@ but it is part of the acceptance criteria.
   If profiling later shows lock contention, revisit with a typed
   query DTO that copies only the fields needed (not the world).
   Don't reintroduce `RepoSnapshot`-style mirrors.
-- **Phase 8 ordering vs `wfw-alias §12`.** `Phase::Done` and
+- **Phase 8 (fake `Option<T>` purge) widens the wire-shape change
+  surface.** Splitting `WaitResponse::Work` into per-kind variants
+  is a breaking JSON change. Coordinate with downstream tooling
+  (the MCP shim, the frontend, any external script consuming
+  `wait_for_work`) — bump the response schema together with the
+  variant split.
+- **Phase 9 ordering vs `wfw-alias §12`.** `Phase::Done` and
   `PlanState::Done` are two encodings of the same truth.
   Recommended sequence: §12 deletes `PlanState::Done` first, then
   this phase deletes `Phase` and `TimelinePhase`. If they land in
   the other order, leave `Phase::Done` until §12 takes it.
-- **Phase 8 wire field stability.** The internal type goes away
+- **Phase 9 wire field stability.** The internal type goes away
   but the wire field stays through the transition; reviewers
   should verify the call-site migration is exhaustive and that
   the wire string output is byte-identical pre- and post-deletion.
@@ -799,7 +874,7 @@ post-sweep tree. Reviewers should grep for each.
      `PlanSnapshotBundle::to_repo_state`, and `runtime_snapshot.rs`
      entirely removed.
    - `TimelinePhase` enum removed.
-   - `Phase` enum removed (modulo §12 coordination — see Phase 8).
+   - `Phase` enum removed (modulo §12 coordination — see Phase 9).
 3. **No `#[allow(dead_code)]` added to preserve old shapes.** The
    sweep removes dead code; it doesn't tag it as kept-for-now.
 4. **No new compatibility shims** unless this plan names the
@@ -810,16 +885,24 @@ post-sweep tree. Reviewers should grep for each.
    `Hot path`, `legacy`, `bridge`, and `phase` either return no
    hits, or every remaining hit has a one-line comment justifying
    why it stays.
-7. **Strong-typed constructors validate.** `cargo build` rejects
+7. **No fake `Option<T>`.** Grep for `Option<` in every touched
+   module. Every remaining occurrence must answer "what real
+   absence does this model?" — `head` / `parent` / `previous_sha`
+   semantics are fine; variant-tag Options
+   (`WaitResponse::Work { target_sha: Option<...> }`,
+   `LiveEvent { plan_id: Option<...> }`, etc.) are not.
+   `WaitResponse` has been split into per-work-kind variants;
+   live-event struct has been split into a tagged enum.
+8. **Strong-typed constructors validate.** `cargo build` rejects
    `CommitSha::new("hello")`, `PlanKey::new("../etc/passwd")`,
    `AgentLabel::new("")`. JSON requests with malformed IDs fail at
    deserialize.
-8. **One resolver path.** `PlanSelector` is the only type that
+9. **One resolver path.** `PlanSelector` is the only type that
    answers "which plan?"; `server/mcp.rs`, `server/wait.rs`, and
    HTTP wait-for-work all consume the same resolver.
-9. **`runtime.rs` `self_writes` ring deleted** along with its two
-   methods.
-10. **`tests/end_to_end.rs` split into themed files** under
+10. **`runtime.rs` `self_writes` ring deleted** along with its two
+    methods.
+11. **`tests/end_to_end.rs` split into themed files** under
     `tests/`, with `HOME_LOCK` mutex removed in favour of an
     injected test-home struct field.
 
