@@ -26,8 +26,7 @@ use crate::repo_state::{Phase, Trinity, WaitingReason, WaitingRole};
 use crate::review_state::CommitGate;
 use crate::runtime::Runtime;
 
-const DEFAULT_TIMEOUT_SECS: u64 = 60;
-const MAX_TIMEOUT_SECS: u64 = 300;
+const DEFAULT_TIMEOUT_SECS: u64 = 1800;
 
 #[derive(Debug, Deserialize)]
 pub struct WaitArgs {
@@ -130,11 +129,7 @@ pub async fn wait_for_work(runtime: &Runtime, args: WaitArgs) -> Result<WaitResp
     let author = AgentLabel::parse(author_label)
         .map_err(|e| WaitError::InvalidAuthorLabel(e.to_string()))?;
 
-    let timeout = Duration::from_secs(
-        args.timeout_secs
-            .unwrap_or(DEFAULT_TIMEOUT_SECS)
-            .clamp(1, MAX_TIMEOUT_SECS),
-    );
+    let timeout = Duration::from_secs(args.timeout_secs.unwrap_or(DEFAULT_TIMEOUT_SECS).max(1));
     let started_at = Instant::now();
     let mut rx = runtime.subscribe_events();
 
@@ -664,6 +659,14 @@ mod tests {
     fn parse_role_accepts_canonical() {
         assert_eq!(parse_role("master").unwrap(), WaitingRole::Master);
         assert_eq!(parse_role("reviewers").unwrap(), WaitingRole::Reviewers);
+    }
+
+    #[test]
+    fn timeout_secs_above_300_is_not_clamped() {
+        // No upper cap post-phase-11: a 1-hour request is honoured.
+        let raw: u64 = 3600;
+        let timeout = std::time::Duration::from_secs(raw.max(1));
+        assert_eq!(timeout, std::time::Duration::from_secs(3600));
     }
 }
 

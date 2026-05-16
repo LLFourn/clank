@@ -310,16 +310,16 @@ impl ShimHandler {
             .post(format!("{}/internal/tool_call", self.daemon))
             .header("origin", "http://127.0.0.1")
             .json(&body);
-        // `wait_for_work` blocks up to `timeout_secs` (default 60, max 300)
-        // server-side. Override the per-request timeout so the shim doesn't
-        // cut the connection before the daemon answers. Server timeout + 30s
-        // grace.
+        // `wait_for_work` blocks up to `timeout_secs` (default 1800,
+        // no upper cap) server-side. Override the per-request timeout
+        // so the shim doesn't cut the connection before the daemon
+        // answers. Server timeout + 30s grace.
         if tool == "wait_for_work" {
             let server_timeout_secs = arguments
                 .get("timeout_secs")
                 .and_then(|v| v.as_u64())
-                .unwrap_or(60)
-                .clamp(1, 300);
+                .unwrap_or(1800)
+                .max(1);
             req = req.timeout(Duration::from_secs(server_timeout_secs + 30));
         }
         let resp = req

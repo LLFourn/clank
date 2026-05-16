@@ -116,7 +116,7 @@ pub fn catalog() -> Vec<ToolDescriptor> {
                           - `author_label` (daemon-required, schema-optional for shim \
                             autofill): your label. Used to construct the canonical reviewer \
                             write path for `review_commit`. The MCP shim caches this.\n\
-                          - `timeout_secs` (optional, 1–300, default 60).\n\n\
+                          - `timeout_secs` (optional, positive seconds, default 1800 / 30 minutes).\n\n\
                           Response — one of:\n\
                           ```\n\
                           { \"plan_id\": \"...\", \"repo\": \"<abs path>\", \
@@ -161,9 +161,8 @@ pub fn catalog() -> Vec<ToolDescriptor> {
                     "timeout_secs": {
                         "type": "integer",
                         "minimum": 1,
-                        "maximum": 300,
-                        "default": 60,
-                        "description": "How long to block before returning `timed_out: true`."
+                        "default": 1800,
+                        "description": "How long to block before returning `timed_out: true`. Default 1800 seconds (30 minutes); no upper cap."
                     }
                 }
             }),
