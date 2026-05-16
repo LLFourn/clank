@@ -156,12 +156,9 @@ impl CommitGateState {
 /// enforces this; the type doesn't, in deference to the UI which
 /// reads them as display lists).
 ///
-/// Phase 1 omits a `feedback: BTreeMap<AgentLabel, Feedback>` field
-/// that the plan doc spec'd. Reason: gate state needs only verdicts,
-/// not bodies, and phase 1 doesn't render UI. Phase 2 adds the
-/// field when MCP responses / the SPA start rendering per-commit
-/// feedback cards. Until then, feedback bodies still live on the
-/// legacy `Plan.plan_feedback` / `Plan.impl_feedback` maps.
+/// `feedback` carries the verdict-bearing files on this commit
+/// keyed by author. UI / MCP responses read bodies and rendered
+/// HTML from here. Empty for commits with no feedback yet.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct CommitGate {
     pub state: CommitGateState,
@@ -170,4 +167,6 @@ pub struct CommitGate {
     pub requesters: Vec<AgentLabel>,
     pub ambiguous: Vec<AgentLabel>,
     pub missing: Vec<AgentLabel>,
+    #[serde(skip_serializing)]
+    pub feedback: std::collections::BTreeMap<AgentLabel, crate::repo_state::Feedback>,
 }

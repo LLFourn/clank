@@ -732,39 +732,44 @@ pub fn build_commit_gates(
         let mut approvers: Vec<AgentLabel> = Vec::new();
         let mut requesters: Vec<AgentLabel> = Vec::new();
         let mut ambiguous: Vec<AgentLabel> = Vec::new();
+        let mut feedback: BTreeMap<AgentLabel, Feedback> = BTreeMap::new();
 
         // Union feedback on this SHA from both legacy maps. Phase 1
-        // reads from the dual maps; phase 2 reads from one location.
-        let mut on_this_sha: Vec<(&AgentLabel, Verdict)> = Vec::new();
+        // reads from the dual maps; phase 2 will collapse them to
+        // one disk path. If the same (sha, author) pair somehow
+        // exists in both maps (shouldn't, since each disk file lives
+        // under exactly one of `plan/` or `impl/`), the later
+        // insert wins — that's `impl_feedback` here, matching
+        // BTreeMap's insertion semantics.
         for ((target, author), fb) in plan_feedback {
             if target == sha {
-                on_this_sha.push((author, fb.verdict));
+                feedback.insert(author.clone(), fb.clone());
             }
         }
         for ((target, author), fb) in impl_feedback {
             if target == sha {
-                on_this_sha.push((author, fb.verdict));
+                feedback.insert(author.clone(), fb.clone());
             }
         }
 
-        for (author, verdict) in &on_this_sha {
+        for (author, fb) in &feedback {
             if !participants.contains(author) {
-                participants.push((*author).clone());
+                participants.push(author.clone());
             }
-            match verdict {
+            match fb.verdict {
                 Verdict::Approve => {
                     if !approvers.contains(author) {
-                        approvers.push((*author).clone());
+                        approvers.push(author.clone());
                     }
                 }
                 Verdict::RequestChanges => {
                     if !requesters.contains(author) {
-                        requesters.push((*author).clone());
+                        requesters.push(author.clone());
                     }
                 }
                 Verdict::Unmarked => {
                     if !ambiguous.contains(author) {
-                        ambiguous.push((*author).clone());
+                        ambiguous.push(author.clone());
                     }
                 }
             }
@@ -793,6 +798,7 @@ pub fn build_commit_gates(
                 requesters,
                 ambiguous,
                 missing,
+                feedback,
             },
         );
     }
@@ -1656,5 +1662,46 @@ mod tests {
         assert_eq!(g_c.participants, vec![al("codex")]);
         assert_eq!(g_c.missing, vec![al("codex")]);
         assert_eq!(g_c.state, CommitGateState::Unreviewed);
+    }
+
+    #[test]
+    fn gates_feedback_map_carries_verdicts_and_bodies() {
+        // CommitGate.feedback is the canonical home for verdict-bearing
+        // files on a commit. MCP / UI consumers read body + path +
+        // verdict from here; the gate's vec fields are display-list
+        // shorthand.
+        let mut touches = BTreeMap::new();
+        touches.insert(cs("a"), touches_one("foo", PlanTouchKind::Intro));
+        let mut attribution = BTreeMap::new();
+        attribution.insert(
+            cs("a"),
+            attributed("foo", Some(PlanTouchKind::Intro), false),
+        );
+        let mut plan_feedback = BTreeMap::new();
+        plan_feedback.insert(
+            (cs("a"), al("codex")),
+            Feedback {
+                path: PathBuf::from("/abs/codex.md"),
+                body: "APPROVE\n\nlooks good".to_string(),
+                verdict: Verdict::Approve,
+                created_at: 100,
+            },
+        );
+
+        let gates = build_commit_gates(
+            &pk("foo"),
+            &[cs("a")],
+            &touches,
+            &attribution,
+            &plan_feedback,
+            &BTreeMap::new(),
+        );
+
+        let g = gates.get(&cs("a")).expect("gate for a");
+        let fb = g.feedback.get(&al("codex")).expect("codex feedback");
+        assert_eq!(fb.verdict, Verdict::Approve);
+        assert_eq!(fb.body, "APPROVE\n\nlooks good");
+        assert_eq!(fb.path, PathBuf::from("/abs/codex.md"));
+        assert_eq!(fb.created_at, 100);
     }
 }
