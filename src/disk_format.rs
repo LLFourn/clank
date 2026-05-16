@@ -56,9 +56,9 @@ pub fn parse_feedback_path(rel: &Path) -> Option<FeedbackPath> {
     }
 
     Some(FeedbackPath {
-        plan_key: PlanKey::from(session_str.to_string()),
-        target_sha: CommitSha::from(sha_str.to_string()),
-        author: AgentLabel::from(author.to_string()),
+        plan_key: PlanKey::parse(session_str).ok()?,
+        target_sha: CommitSha::parse(sha_str).ok()?,
+        author: AgentLabel::parse(author).ok()?,
         raw: rel.to_path_buf(),
     })
 }

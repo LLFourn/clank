@@ -99,6 +99,8 @@ pub enum WaitError {
     MissingAuthorLabel,
     #[error("invalid plan_id: {0}")]
     InvalidPlanId(String),
+    #[error("invalid author_label: {0}")]
+    InvalidAuthorLabel(String),
     #[error("unknown repo basename: {0}")]
     UnknownRepo(String),
     #[error("unknown plan: {0}")]
@@ -125,7 +127,8 @@ pub async fn wait_for_work(runtime: &Runtime, args: WaitArgs) -> Result<WaitResp
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .ok_or(WaitError::MissingAuthorLabel)?;
-    let author = AgentLabel::from(author_label);
+    let author = AgentLabel::parse(author_label)
+        .map_err(|e| WaitError::InvalidAuthorLabel(e.to_string()))?;
 
     let timeout = Duration::from_secs(
         args.timeout_secs

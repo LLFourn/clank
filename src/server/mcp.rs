@@ -93,6 +93,7 @@ fn map_wait_error(e: WaitError) -> ToolError {
         WaitError::InvalidRole(_)
         | WaitError::MissingPlanId
         | WaitError::MissingAuthorLabel
+        | WaitError::InvalidAuthorLabel(_)
         | WaitError::InvalidPlanId(_) => ToolError::Invalid(e.to_string()),
         WaitError::UnknownRepo(_) | WaitError::UnknownPlan(_) | WaitError::PlanConflict { .. } => {
             ToolError::NotFound(e.to_string())
@@ -158,7 +159,8 @@ async fn resolve_repo_filter(
         // Looks like a path — fall back to old path-resolution.
         return resolve_repo_with_override(Some(raw), cwd).await;
     }
-    let name = RepoBasename::from(raw);
+    let name = RepoBasename::parse(raw)
+        .map_err(|e| ToolError::Invalid(format!("invalid repo basename: {e}")))?;
     let trinity = state.runtime.state();
     let trinity = trinity.lock().await;
     trinity
@@ -178,12 +180,8 @@ struct StartPlanArgs {
 async fn start_plan(state: &AppState, req: &ToolCallRequest) -> Result<Value, ToolError> {
     let args: StartPlanArgs = serde_json::from_value(req.arguments.clone())
         .map_err(|e| ToolError::Invalid(format!("args: {e}")))?;
-    if args.slug.is_empty() || args.slug.contains('/') {
-        return Err(ToolError::Invalid(format!(
-            "slug must be non-empty and contain no `/`; got `{}`",
-            args.slug
-        )));
-    }
+    let plan_key =
+        PlanKey::parse(&args.slug).map_err(|e| ToolError::Invalid(format!("invalid slug: {e}")))?;
     let repo = resolve_repo(&req.cwd).await?;
     let basename = RepoBasename::from_repo_root(&repo).ok_or_else(|| {
         ToolError::Invalid(format!(
@@ -191,7 +189,6 @@ async fn start_plan(state: &AppState, req: &ToolCallRequest) -> Result<Value, To
             repo.display()
         ))
     })?;
-    let plan_key = PlanKey::from(args.slug.clone());
     let plan_path = PathBuf::from(format!(".trinity/plans/{}.md", args.slug));
 
     // Atomically register this repo (or report a basename collision)
@@ -274,7 +271,9 @@ struct GetContextArgs {
 async fn get_context(state: &AppState, req: &ToolCallRequest) -> Result<Value, ToolError> {
     let args: GetContextArgs = serde_json::from_value(req.arguments.clone())
         .map_err(|e| ToolError::Invalid(format!("args: {e}")))?;
-    let author = AgentLabel::from(args.author_label.unwrap_or_else(|| "anonymous".to_string()));
+    let author_raw = args.author_label.unwrap_or_else(|| "anonymous".to_string());
+    let author = AgentLabel::parse(&author_raw)
+        .map_err(|e| ToolError::Invalid(format!("invalid author_label: {e}")))?;
 
     // Plan-id inference: explicit > repo+single-active > cwd+single-active.
     // Zero actives → no_active_plan error. Multiple → ambiguous_plan with

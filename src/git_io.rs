@@ -26,6 +26,13 @@ pub enum GitIoError {
     Parse { context: String, detail: String },
 }
 
+fn parse_sha(context: &str, s: &str) -> Result<CommitSha, GitIoError> {
+    CommitSha::parse(s).map_err(|e| GitIoError::Parse {
+        context: context.to_string(),
+        detail: e.to_string(),
+    })
+}
+
 async fn run(repo: &Path, args: &[&str]) -> Result<std::process::Output, GitIoError> {
     Command::new("git")
         .arg("-C")
@@ -75,7 +82,7 @@ pub async fn rev_parse_head(repo: &Path) -> Result<Option<CommitSha>, GitIoError
     if s.is_empty() {
         Ok(None)
     } else {
-        Ok(Some(CommitSha::from(s)))
+        Ok(Some(parse_sha("rev-parse HEAD", &s)?))
     }
 }
 
@@ -177,7 +184,7 @@ pub async fn parent_of(repo: &Path, sha: &CommitSha) -> Result<Option<CommitSha>
     if s.is_empty() {
         Ok(None)
     } else {
-        Ok(Some(CommitSha::from(s)))
+        Ok(Some(parse_sha("parent_of", &s)?))
     }
 }
 
@@ -208,7 +215,9 @@ pub async fn first_added_commit(
     // `--follow` may report multiple A commits across renames; the oldest
     // is the last line of `--format=%H` output.
     let oldest = s.lines().last().map(str::trim).filter(|s| !s.is_empty());
-    Ok(oldest.map(|s| CommitSha::from(s.to_string())))
+    oldest
+        .map(|s| parse_sha("first_added_commit", s))
+        .transpose()
 }
 
 /// `git log --first-parent --reverse --format=%H` — all commits along
@@ -247,7 +256,7 @@ pub async fn first_parent_commits(repo: &Path) -> Result<Vec<CommitMeta>, GitIoE
         }
         let author_ts = ts.parse::<i64>().unwrap_or(0);
         out.push(CommitMeta {
-            sha: CommitSha::from(sha.to_string()),
+            sha: parse_sha("first_parent_commits", sha)?,
             author_ts,
             subject,
         });

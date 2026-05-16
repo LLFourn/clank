@@ -142,7 +142,10 @@ impl CommitSha {
                 len: s.len(),
             });
         }
-        if !s.chars().all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c)) {
+        if !s
+            .chars()
+            .all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c))
+        {
             return Err(IdError::NotHex {
                 kind: KIND,
                 value: s.to_string(),
@@ -165,7 +168,10 @@ impl ContentHash {
                 len: s.len(),
             });
         }
-        if !s.chars().all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c)) {
+        if !s
+            .chars()
+            .all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c))
+        {
             return Err(IdError::NotHex {
                 kind: KIND,
                 value: s.to_string(),
@@ -567,10 +573,7 @@ mod tests {
 
     #[test]
     fn agent_label_rejects_empty() {
-        assert!(matches!(
-            AgentLabel::parse(""),
-            Err(IdError::Empty { .. })
-        ));
+        assert!(matches!(AgentLabel::parse(""), Err(IdError::Empty { .. })));
     }
 
     #[test]
@@ -627,10 +630,7 @@ mod tests {
 
     #[test]
     fn plan_key_rejects_empty() {
-        assert!(matches!(
-            PlanKey::parse(""),
-            Err(IdError::Empty { .. })
-        ));
+        assert!(matches!(PlanKey::parse(""), Err(IdError::Empty { .. })));
     }
 
     #[test]

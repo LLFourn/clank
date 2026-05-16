@@ -75,6 +75,7 @@ async fn api_wait_for_work(
             WaitError::InvalidRole(_)
             | WaitError::MissingPlanId
             | WaitError::MissingAuthorLabel
+            | WaitError::InvalidAuthorLabel(_)
             | WaitError::InvalidPlanId(_) => AppError {
                 status: StatusCode::BAD_REQUEST,
                 msg: e.to_string(),
@@ -167,8 +168,9 @@ async fn repos_to_render(
     let Some(raw) = override_path else {
         return Ok(trinity.repos.keys().cloned().collect());
     };
-    let basename = crate::lifecycle::RepoBasename::from(raw.as_str());
-    if let Some(root) = trinity.repo_basenames.get(&basename) {
+    if let Ok(basename) = crate::lifecycle::RepoBasename::parse(&raw)
+        && let Some(root) = trinity.repo_basenames.get(&basename)
+    {
         return Ok(vec![root.clone()]);
     }
     let raw_path = PathBuf::from(&raw);
@@ -210,6 +212,12 @@ impl AppError {
             msg: msg.into(),
         }
     }
+    fn bad_request(msg: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::BAD_REQUEST,
+            msg: msg.into(),
+        }
+    }
     fn tool(err: mcp::ToolError) -> Self {
         let status = match err {
             mcp::ToolError::Invalid(_) => StatusCode::BAD_REQUEST,
@@ -244,14 +252,13 @@ async fn resolve_plan_id_segments(
     repo_basename: &str,
     stem_md: &str,
 ) -> Result<(PathBuf, crate::lifecycle::PlanKey), AppError> {
-    let basename = crate::lifecycle::RepoBasename::from(repo_basename);
+    let basename = crate::lifecycle::RepoBasename::parse(repo_basename)
+        .map_err(|e| AppError::bad_request(format!("invalid repo basename: {e}")))?;
     let stem = stem_md
         .strip_suffix(".md")
-        .ok_or_else(|| AppError::not_found(format!("stem must end in .md: {stem_md}")))?;
-    if stem.is_empty() || stem.contains('/') {
-        return Err(AppError::not_found(format!("invalid stem: {stem_md}")));
-    }
-    let plan_key = crate::lifecycle::PlanKey::from(stem.to_string());
+        .ok_or_else(|| AppError::bad_request(format!("stem must end in .md: {stem_md}")))?;
+    let plan_key = crate::lifecycle::PlanKey::parse(stem)
+        .map_err(|e| AppError::bad_request(format!("invalid plan stem: {e}")))?;
     let trinity_arc = state.runtime.state();
     let trinity = trinity_arc.lock().await;
     let repo_root = trinity
@@ -301,7 +308,8 @@ async fn api_plan_revision(
     Path((repo_basename, stem_md, sha)): Path<(String, String, String)>,
 ) -> Result<axum::Json<Value>, AppError> {
     let (repo, plan_key) = resolve_plan_id_segments(&state, &repo_basename, &stem_md).await?;
-    let commit_sha = crate::lifecycle::CommitSha::from(sha.clone());
+    let commit_sha = crate::lifecycle::CommitSha::parse(&sha)
+        .map_err(|e| AppError::bad_request(format!("invalid sha: {e}")))?;
     let snapshot = state
         .runtime
         .snapshot_session(&repo, &plan_key)
@@ -363,7 +371,8 @@ async fn api_commit_diff(
     Path((repo_basename, stem_md, sha)): Path<(String, String, String)>,
 ) -> Result<axum::Json<Value>, AppError> {
     let (repo, plan_key) = resolve_plan_id_segments(&state, &repo_basename, &stem_md).await?;
-    let commit_sha = crate::lifecycle::CommitSha::from(sha.clone());
+    let commit_sha = crate::lifecycle::CommitSha::parse(&sha)
+        .map_err(|e| AppError::bad_request(format!("invalid sha: {e}")))?;
     let snapshot = state
         .runtime
         .snapshot_session(&repo, &plan_key)
@@ -449,8 +458,10 @@ async fn api_diff(
     Path((repo_basename, stem_md, from, to)): Path<(String, String, String, String)>,
 ) -> Result<axum::Json<Value>, AppError> {
     let (repo, plan_key) = resolve_plan_id_segments(&state, &repo_basename, &stem_md).await?;
-    let from_sha = crate::lifecycle::CommitSha::from(from);
-    let to_sha = crate::lifecycle::CommitSha::from(to);
+    let from_sha = crate::lifecycle::CommitSha::parse(&from)
+        .map_err(|e| AppError::bad_request(format!("invalid from sha: {e}")))?;
+    let to_sha = crate::lifecycle::CommitSha::parse(&to)
+        .map_err(|e| AppError::bad_request(format!("invalid to sha: {e}")))?;
     let snapshot = state
         .runtime
         .snapshot_session(&repo, &plan_key)
@@ -558,7 +569,8 @@ async fn api_repos_delete(
     State(state): State<AppState>,
     Path(basename): Path<String>,
 ) -> Result<axum::Json<Value>, AppError> {
-    let basename_key = crate::lifecycle::RepoBasename::from(basename.as_str());
+    let basename_key = crate::lifecycle::RepoBasename::parse(&basename)
+        .map_err(|e| AppError::bad_request(format!("invalid basename: {e}")))?;
     let canonical = {
         let trinity_arc = state.runtime.state();
         let trinity = trinity_arc.lock().await;
@@ -1082,7 +1094,7 @@ mod wire_tests {
         // as participants of the plan-phase gate.
         let intro = runtime
             .read_repo(dir.path(), |s| {
-                s.plans[&crate::lifecycle::PlanKey::from("foo")]
+                s.plans[&crate::lifecycle::PlanKey::parse("foo").unwrap()]
                     .plan_intro
                     .clone()
             })
@@ -1124,7 +1136,7 @@ mod wire_tests {
         let revised = runtime
             .read_repo(dir.path(), |s| {
                 crate::projection::latest_plan_touching_commit(
-                    &s.plans[&crate::lifecycle::PlanKey::from("foo")],
+                    &s.plans[&crate::lifecycle::PlanKey::parse("foo").unwrap()],
                     s,
                 )
                 .unwrap()
