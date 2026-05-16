@@ -239,9 +239,8 @@ pub fn get_context_response_from_snapshot(
     });
     let write_feedback = review_target_sha.as_ref().map(|sha| {
         let rel = format!(
-            ".trinity/feedback/{session}/{phase}/{sha}/{author}.md",
+            ".trinity/feedback/{session}/commits/{sha}/{author}.md",
             session = session.id.as_str(),
-            phase = review_target_phase,
             sha = sha,
             author = author_label.as_str(),
         );
@@ -318,11 +317,6 @@ fn timeline_value(state: &RepoState, session_id: &PlanKey) -> Vec<Value> {
                 "target": target.as_str(),
                 "author": author.as_str(),
                 "verdict": verdict.as_str(),
-            }),
-            crate::repo_state::TimelineEvent::HeldFeedback { author, reason } => json!({
-                "kind": "held_feedback",
-                "author": author.as_str(),
-                "reason": reason,
             }),
         })
         .collect()
@@ -630,7 +624,7 @@ mod tests {
         // Use full SHA in the feedback path. Trinity in production will
         // tell agents the canonical (full-SHA) path via get_context;
         // prefix resolution at ingest is a future enhancement.
-        let feedback_rel = format!(".trinity/feedback/foo/plan/{}/codex.md", intro.as_str());
+        let feedback_rel = format!(".trinity/feedback/foo/commits/{}/codex.md", intro.as_str());
         write_file(dir.path(), &feedback_rel, "REQUEST_CHANGES\n\nMissing X.\n");
 
         let state = rebuild_repo(dir.path()).await.unwrap();
@@ -652,7 +646,7 @@ mod tests {
         let intro = state0.plans[&PlanKey::from("foo".to_string())]
             .plan_intro
             .clone();
-        let feedback_rel = format!(".trinity/feedback/foo/plan/{}/alice.md", intro.as_str());
+        let feedback_rel = format!(".trinity/feedback/foo/commits/{}/alice.md", intro.as_str());
         write_file(dir.path(), &feedback_rel, "APPROVE\n\nLGTM.\n");
 
         let state = rebuild_repo(dir.path()).await.unwrap();

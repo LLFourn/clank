@@ -143,12 +143,6 @@ impl RepoState {
                 }
             }
         }
-        for held in &plan.held_plan_feedback {
-            out.push(TimelineEvent::HeldFeedback {
-                author: held.author.clone(),
-                reason: held.reason,
-            });
-        }
         out
     }
 
@@ -203,13 +197,6 @@ impl RepoState {
                     hasher.update(fb.verdict.as_str().as_bytes());
                     hasher.update(b",");
                 }
-                hasher.update(b";");
-            }
-            hasher.update(b"]|held=[");
-            for held in &plan.held_plan_feedback {
-                hasher.update(held.author.as_str().as_bytes());
-                hasher.update(b":");
-                hasher.update(held.reason.as_bytes());
                 hasher.update(b";");
             }
             hasher.update(b"]\n");
@@ -299,12 +286,6 @@ pub enum TimelineEvent {
         author: AgentLabel,
         verdict: Verdict,
     },
-    /// A flat-drop feedback file that hasn't been canonicalized to a
-    /// target SHA yet. Shown at the end of the timeline.
-    HeldFeedback {
-        author: AgentLabel,
-        reason: &'static str,
-    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -354,11 +335,6 @@ pub struct Plan {
     /// First-parent of `plan_intro`, or `None` for the root commit.
     /// Used by `pr_hint` to suggest squash bases.
     pub plan_intro_parent: Option<CommitSha>,
-    /// Plan-phase feedback files dropped while `plan_worktree_status` was
-    /// `BodyDirty`. Not auto-organized into `<target-sha>/<author>.md` until
-    /// the plan revision lands. Deleted by phase 2.4 along with the
-    /// flat-drop disk path.
-    pub held_plan_feedback: Vec<HeldFeedback>,
     /// Per-commit gate state under the commit-centric model.
     /// Authoritative as of phase 2.3 — all feedback bodies live here
     /// under `commits[sha].feedback`.
@@ -420,17 +396,6 @@ impl Verdict {
             Verdict::Unmarked => "unmarked",
         }
     }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct HeldFeedback {
-    pub path: PathBuf,
-    pub author: AgentLabel,
-    pub body: String,
-    /// Machine-readable key for the held reason. Today: `"plan_dirty"`.
-    pub reason: &'static str,
-    /// File mtime as unix seconds at the time the held entry was created.
-    pub created_at: i64,
 }
 
 /// Working-tree state of a session's plan file relative to HEAD. **Never

@@ -16,34 +16,20 @@ pub struct FeedbackPath {
     /// plan file's path; the on-disk feedback layout is keyed by stem
     /// (see plan-path-identity §3).
     pub plan_key: PlanKey,
-    pub phase: FeedbackPhase,
-    pub target_sha: Option<CommitSha>,
+    pub target_sha: CommitSha,
     pub author: AgentLabel,
     pub raw: PathBuf,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum FeedbackPhase {
-    Plan,
-    Impl,
-}
-
-impl FeedbackPhase {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            FeedbackPhase::Plan => "plan",
-            FeedbackPhase::Impl => "impl",
-        }
-    }
-}
-
-/// Parse a path relative to `<repo>/.trinity/feedback/` into a `FeedbackPath`.
-/// Expected shapes:
-/// - `<session>/<plan|impl>/<author>.md` — flat drop, no SHA
-/// - `<session>/<plan|impl>/<target-sha>/<author>.md` — canonical
+/// Parse a path relative to `<repo>/.trinity/feedback/` into a
+/// `FeedbackPath`. Expected shape:
 ///
-/// Returns `None` if the path doesn't match either shape (e.g. a stray file
-/// like `.DS_Store`, a directory, or extra path segments).
+/// `<plan-key>/commits/<target-sha>/<author>.md`
+///
+/// Returns `None` for any other shape (a stray `.DS_Store`, the legacy
+/// `<plan-key>/{plan,impl}/<sha>/<author>.md` layout, a flat-drop path
+/// missing the SHA segment, etc.). Phase 2.4 cut over to the
+/// commit-keyed layout; the legacy paths are not parsed.
 pub fn parse_feedback_path(rel: &Path) -> Option<FeedbackPath> {
     let segments: Vec<&std::ffi::OsStr> = rel
         .components()
@@ -53,39 +39,25 @@ pub fn parse_feedback_path(rel: &Path) -> Option<FeedbackPath> {
         })
         .collect();
 
-    let (session, phase_seg, sha_seg, file_seg) = match segments.as_slice() {
-        [session, phase, file] => (*session, *phase, None, *file),
-        [session, phase, sha, file] => (*session, *phase, Some(*sha), *file),
+    let (session, sha_seg, file_seg) = match segments.as_slice() {
+        [session, kind, sha, file] if kind.to_str() == Some("commits") => (*session, *sha, *file),
         _ => return None,
     };
 
     let session_str = session.to_str()?;
-    let phase = match phase_seg.to_str()? {
-        "plan" => FeedbackPhase::Plan,
-        "impl" => FeedbackPhase::Impl,
-        _ => return None,
-    };
     let file_str = file_seg.to_str()?;
     let author = file_str.strip_suffix(".md")?;
     if author.is_empty() {
         return None;
     }
-
-    let target_sha = match sha_seg {
-        Some(s) => {
-            let sha_str = s.to_str()?;
-            if !is_sha_segment(sha_str) {
-                return None;
-            }
-            Some(CommitSha::from(sha_str.to_string()))
-        }
-        None => None,
-    };
+    let sha_str = sha_seg.to_str()?;
+    if !is_sha_segment(sha_str) {
+        return None;
+    }
 
     Some(FeedbackPath {
         plan_key: PlanKey::from(session_str.to_string()),
-        phase,
-        target_sha,
+        target_sha: CommitSha::from(sha_str.to_string()),
         author: AgentLabel::from(author.to_string()),
         raw: rel.to_path_buf(),
     })
@@ -126,63 +98,63 @@ mod tests {
     }
 
     #[test]
-    fn flat_feedback_path_no_sha() {
-        let parsed = parse_feedback_path(&p("foo/plan/alice.md")).unwrap();
+    fn canonical_commit_keyed_path_parses() {
+        let parsed = parse_feedback_path(&p("foo/commits/abc1234/bob.md")).unwrap();
         assert_eq!(parsed.plan_key.as_str(), "foo");
-        assert_eq!(parsed.phase, FeedbackPhase::Plan);
-        assert!(parsed.target_sha.is_none());
-        assert_eq!(parsed.author.as_str(), "alice");
-    }
-
-    #[test]
-    fn canonical_feedback_path_with_sha() {
-        let parsed = parse_feedback_path(&p("foo/impl/abc1234/bob.md")).unwrap();
-        assert_eq!(parsed.plan_key.as_str(), "foo");
-        assert_eq!(parsed.phase, FeedbackPhase::Impl);
-        assert_eq!(parsed.target_sha.unwrap().as_str(), "abc1234");
+        assert_eq!(parsed.target_sha.as_str(), "abc1234");
         assert_eq!(parsed.author.as_str(), "bob");
     }
 
     #[test]
-    fn feedback_path_full_sha_accepted() {
-        let parsed =
-            parse_feedback_path(&p("foo/plan/abcdef0123456789abcdef0123456789abcdef01/x.md"))
-                .unwrap();
+    fn full_sha_accepted() {
+        let parsed = parse_feedback_path(&p(
+            "foo/commits/abcdef0123456789abcdef0123456789abcdef01/x.md",
+        ))
+        .unwrap();
         assert_eq!(
-            parsed.target_sha.unwrap().as_str(),
+            parsed.target_sha.as_str(),
             "abcdef0123456789abcdef0123456789abcdef01"
         );
     }
 
     #[test]
-    fn feedback_path_short_sha_below_minimum_rejected() {
-        // 6 hex chars — below the 7-char minimum
-        assert!(parse_feedback_path(&p("foo/plan/abc012/x.md")).is_none());
+    fn short_sha_below_minimum_rejected() {
+        assert!(parse_feedback_path(&p("foo/commits/abc012/x.md")).is_none());
     }
 
     #[test]
-    fn feedback_path_non_hex_segment_rejected() {
-        assert!(parse_feedback_path(&p("foo/plan/notasha1/x.md")).is_none());
+    fn non_hex_sha_rejected() {
+        assert!(parse_feedback_path(&p("foo/commits/notasha1/x.md")).is_none());
     }
 
     #[test]
-    fn feedback_path_too_few_segments_rejected() {
+    fn legacy_plan_segment_rejected() {
+        assert!(parse_feedback_path(&p("foo/plan/abc1234/alice.md")).is_none());
+        assert!(parse_feedback_path(&p("foo/impl/abc1234/alice.md")).is_none());
+    }
+
+    #[test]
+    fn legacy_flat_drop_rejected() {
+        // No-SHA shape is no longer parsed; flat-drop feedback has
+        // been retired with the held-feedback queue.
+        assert!(parse_feedback_path(&p("foo/plan/alice.md")).is_none());
+        assert!(parse_feedback_path(&p("foo/impl/alice.md")).is_none());
+        assert!(parse_feedback_path(&p("foo/commits/alice.md")).is_none());
+    }
+
+    #[test]
+    fn too_few_segments_rejected() {
         assert!(parse_feedback_path(&p("foo/alice.md")).is_none());
     }
 
     #[test]
-    fn feedback_path_extra_segments_rejected() {
-        assert!(parse_feedback_path(&p("foo/plan/abc1234/extra/x.md")).is_none());
+    fn extra_segments_rejected() {
+        assert!(parse_feedback_path(&p("foo/commits/abc1234/extra/x.md")).is_none());
     }
 
     #[test]
-    fn feedback_path_wrong_phase_rejected() {
-        assert!(parse_feedback_path(&p("foo/review/alice.md")).is_none());
-    }
-
-    #[test]
-    fn feedback_path_non_md_rejected() {
-        assert!(parse_feedback_path(&p("foo/plan/alice.txt")).is_none());
+    fn non_md_rejected() {
+        assert!(parse_feedback_path(&p("foo/commits/abc1234/alice.txt")).is_none());
     }
 
     #[test]

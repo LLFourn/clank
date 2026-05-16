@@ -21,9 +21,7 @@ use crate::projection::{
     latest_impl_commit_for, latest_plan_touching_commit_for, phase_for, plan_gate_for_parts,
     waiting_on,
 };
-use crate::repo_state::{
-    AttributionResult, Feedback, HeldFeedback, Phase, PlanTouchKind, Verdict, WaitingOn,
-};
+use crate::repo_state::{AttributionResult, Feedback, Phase, PlanTouchKind, Verdict, WaitingOn};
 use crate::review_state::{ReviewGateDecision, ReviewPhase};
 use crate::runtime_snapshot::{PlanSnapshot, PlanSnapshotBundle, RepoSnapshot};
 
@@ -114,7 +112,6 @@ fn plans_index_parts(
             &plan.id,
             &plan.plan_intro,
             &plan.commits,
-            &plan.held_plan_feedback,
             &snapshot.commit_order,
             &snapshot.plan_touches,
             &snapshot.attribution,
@@ -268,7 +265,6 @@ pub fn plan_page_with_reader(
         "implementation_commits": implementation_commits,
         "plan_feedback": plan_feedback,
         "impl_feedback": impl_feedback,
-        "held_plan_feedback": held_feedback_entries(&plan.held_plan_feedback),
         "plan_body_html": plan_body_html,
         "plan_body_truncated": plan_body_truncated,
         "timeline": timeline,
@@ -313,23 +309,6 @@ fn phase_split_feedback_rich(
         }
     }
     (plan_fb, impl_fb)
-}
-
-fn held_feedback_entries(held: &[HeldFeedback]) -> Vec<Value> {
-    held.iter()
-        .map(|h| {
-            let verdict = crate::disk_format::parse_verdict(&h.body);
-            json!({
-                "author": h.author.as_str(),
-                "verdict": verdict.as_str(),
-                "body_raw": h.body,
-                "body_html": render_feedback_body(&h.body, verdict),
-                "path": h.path.to_string_lossy(),
-                "reason": h.reason,
-                "created_at": h.created_at,
-            })
-        })
-        .collect()
 }
 
 /// Strip the verdict marker line and render the rest of the body as
@@ -522,14 +501,6 @@ fn timeline_value(
             }
         }
     }
-    for held in &session.held_plan_feedback {
-        out.push(json!({
-            "kind": "held_feedback",
-            "author": held.author.as_str(),
-            "reason": held.reason,
-            "created_at": held.created_at,
-        }));
-    }
     out
 }
 
@@ -680,7 +651,6 @@ mod tests {
             body_hash: content_hash(""),
             plan_intro: CommitSha::from("intro"),
             plan_intro_parent: Some(CommitSha::from("parent")),
-            held_plan_feedback: Vec::new(),
             commits: BTreeMap::new(),
         };
         let v = pr_hint_value(&session, &[]);

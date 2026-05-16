@@ -521,7 +521,6 @@ async fn api_repos_list(State(state): State<AppState>) -> Result<axum::Json<Valu
                 &plan.id,
                 &plan.plan_intro,
                 &plan.commits,
-                &plan.held_plan_feedback,
                 &repo_state.commit_order,
                 &repo_state.plan_touches,
                 &repo_state.attribution,
@@ -1091,13 +1090,13 @@ mod wire_tests {
             .unwrap();
         for author in ["codex", "bob"] {
             let rel = format!(
-                ".trinity/feedback/foo/plan/{}/{}.md",
+                ".trinity/feedback/foo/commits/{}/{}.md",
                 intro.as_str(),
                 author
             );
             write_file(dir.path(), &rel, "APPROVE\n");
             let parsed = crate::disk_format::parse_feedback_path(&std::path::PathBuf::from(
-                format!("foo/plan/{}/{}.md", intro.as_str(), author),
+                format!("foo/commits/{}/{}.md", intro.as_str(), author),
             ))
             .unwrap();
             runtime
@@ -1132,10 +1131,13 @@ mod wire_tests {
             })
             .await
             .unwrap();
-        let codex_rel = format!(".trinity/feedback/foo/plan/{}/codex.md", revised.as_str());
+        let codex_rel = format!(
+            ".trinity/feedback/foo/commits/{}/codex.md",
+            revised.as_str()
+        );
         write_file(dir.path(), &codex_rel, "APPROVE\n");
         let parsed = crate::disk_format::parse_feedback_path(&std::path::PathBuf::from(format!(
-            "foo/plan/{}/codex.md",
+            "foo/commits/{}/codex.md",
             revised.as_str()
         )))
         .unwrap();

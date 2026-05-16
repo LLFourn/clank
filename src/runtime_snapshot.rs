@@ -9,7 +9,7 @@ use std::path::PathBuf;
 
 use crate::disk_snapshot::CommitMetaEntry;
 use crate::lifecycle::{CommitSha, ContentHash, PlanKey};
-use crate::repo_state::{AttributionResult, HeldFeedback, Plan, PlanTouchKind, RepoState};
+use crate::repo_state::{AttributionResult, Plan, PlanTouchKind, RepoState};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RepoSnapshot {
@@ -32,7 +32,6 @@ pub struct PlanSnapshot {
     pub body_hash: ContentHash,
     pub plan_intro: CommitSha,
     pub plan_intro_parent: Option<CommitSha>,
-    pub held_plan_feedback: Vec<HeldFeedback>,
     pub commits: BTreeMap<CommitSha, crate::review_state::CommitGate>,
 }
 
@@ -89,7 +88,6 @@ impl PlanSnapshot {
             body_hash: plan.body_hash.clone(),
             plan_intro: plan.plan_intro.clone(),
             plan_intro_parent: plan.plan_intro_parent.clone(),
-            held_plan_feedback: plan.held_plan_feedback.clone(),
             commits: plan.commits.clone(),
         }
     }
@@ -103,7 +101,6 @@ impl PlanSnapshot {
             body_hash: self.body_hash.clone(),
             plan_intro: self.plan_intro.clone(),
             plan_intro_parent: self.plan_intro_parent.clone(),
-            held_plan_feedback: self.held_plan_feedback.clone(),
             commits: self.commits.clone(),
         }
     }

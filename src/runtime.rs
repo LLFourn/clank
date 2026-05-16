@@ -13,11 +13,10 @@ use std::time::Instant;
 
 use tokio::sync::{Mutex, broadcast};
 
-use crate::disk_format::FeedbackPhase;
 use crate::fs_watcher::FilesystemSignal;
 use crate::lifecycle::{CommitSha, PlanKey, content_hash};
 use crate::rebuild::{RebuildError, rebuild_repo};
-use crate::repo_state::{AttributionResult, Feedback, HeldFeedback, LiveEvent, Plan, Trinity};
+use crate::repo_state::{Feedback, LiveEvent, Plan, Trinity};
 use crate::runtime_snapshot::{PlanSnapshotBundle, RepoSnapshot};
 
 pub struct Runtime {
@@ -120,11 +119,6 @@ impl Runtime {
             trinity.repos.insert(canonical.clone(), fresh);
             trinity.repo_basenames.insert(basename, canonical.clone());
         }
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs() as i64)
-            .unwrap_or(0);
-        self.normalize_held_feedback(&canonical, now).await?;
         Ok(RegisterOutcome::Registered)
     }
 
@@ -240,6 +234,12 @@ impl Runtime {
 
     /// Mark paths Trinity is about to rename so the watcher loop can
     /// suppress the resulting events. Entries expire after 1 second.
+    /// Mark paths Trinity is about to write so the watcher can
+    /// suppress the resulting event. Kept across the phase 2.4
+    /// flat-drop / held-feedback deletion: no internal caller today,
+    /// but the suppression ring is still useful for any future
+    /// rename-on-disk path (e.g. plan-file moves, done relocations).
+    #[allow(dead_code)]
     async fn mark_self_writes(&self, paths: &[PathBuf]) {
         let mut ring = self.self_writes.lock().await;
         let now = Instant::now();
@@ -324,11 +324,6 @@ impl Runtime {
                         );
                     }
                 }
-                // Held-feedback normalization sweep runs even when nothing
-                // visibly changed in the rebuild — a watcher-induced rebuild
-                // might still need to release a flat-drop file. The sweep
-                // itself emits events only on actual file moves.
-                self.normalize_held_feedback(repo_root, now).await?;
             }
             FilesystemSignal::PlanFileChanged { session_id, path } => {
                 let mut trinity = self.state.lock().await;
@@ -363,56 +358,6 @@ impl Runtime {
                     Err(e) => return Err(e.into()),
                 };
                 let session_id = parsed.plan_key.clone();
-                // Resolve auto-organization target (if the file is a flat
-                // drop and we have a current target SHA + clean plan).
-                let move_plan: Option<MovePlan> = if parsed.target_sha.is_none() {
-                    self.resolve_flat_drop_target(repo_root, &parsed).await?
-                } else {
-                    None
-                };
-
-                if let Some(plan) = move_plan {
-                    // Rename on disk + suppress the resulting watcher events.
-                    if let Some(parent) = plan.to.parent() {
-                        std::fs::create_dir_all(parent)?;
-                    }
-                    self.mark_self_writes(&[abs_path.clone(), plan.to.clone()])
-                        .await;
-                    std::fs::rename(&abs_path, &plan.to)?;
-                    let mut trinity = self.state.lock().await;
-                    let state = trinity
-                        .repos
-                        .get_mut(repo_root)
-                        .ok_or_else(|| RuntimeError::UnknownRepo(repo_root.to_path_buf()))?;
-                    let Some(session) = state.plans.get_mut(&session_id) else {
-                        return Ok(());
-                    };
-                    upsert_feedback_at_target(
-                        session,
-                        plan.to.clone(),
-                        plan.target_sha,
-                        parsed.phase,
-                        parsed.author.clone(),
-                        body,
-                    );
-                    refresh_commits_for(state, &session_id);
-                    let plan_state = state.plans.get(&session_id).map(|p| p.state);
-                    let plan_id = plan_id_for(repo_root, &session_id);
-                    self.push_event(
-                        &mut trinity,
-                        LiveEvent {
-                            ts: now,
-                            repo: repo_root.to_path_buf(),
-                            plan_id,
-                            state: plan_state,
-                            kind: "feedback_changed",
-                            payload: serde_json::Value::Null,
-                        },
-                    );
-                    return Ok(());
-                }
-
-                // No auto-organize move; ingest as-is (canonical path or held).
                 let mut trinity = self.state.lock().await;
                 let Some(state) = trinity.repos.get_mut(repo_root) else {
                     return Err(RuntimeError::UnknownRepo(repo_root.to_path_buf()));
@@ -470,165 +415,6 @@ impl Runtime {
     }
 }
 
-/// Result of resolving a flat-drop feedback file's auto-organize move.
-#[derive(Debug)]
-struct MovePlan {
-    to: PathBuf,
-    target_sha: CommitSha,
-}
-
-impl Runtime {
-    /// Re-dispatch any currently-held flat-drop feedback after a rebuild.
-    /// Each held entry is removed and forwarded back into `handle_signal`
-    /// as a `FeedbackWritten`; the dispatch path will rename + ingest the
-    /// file if the worktree is clean enough, or re-hold if it isn't.
-    pub async fn normalize_held_feedback(
-        &self,
-        repo_root: &Path,
-        now: i64,
-    ) -> Result<(), RuntimeError> {
-        let drained: Vec<(PlanKey, HeldFeedback)> = {
-            let mut trinity = self.state.lock().await;
-            let Some(state) = trinity.repos.get_mut(repo_root) else {
-                return Ok(());
-            };
-            let mut out = Vec::new();
-            for (id, sess) in &mut state.plans {
-                let held: Vec<HeldFeedback> = std::mem::take(&mut sess.held_plan_feedback);
-                for h in held {
-                    out.push((id.clone(), h));
-                }
-            }
-            out
-        };
-
-        let feedback_root = repo_root.join(".trinity/feedback");
-        for (_session_id, held) in drained {
-            let Ok(rel) = held.path.strip_prefix(&feedback_root) else {
-                continue;
-            };
-            let Some(parsed) = crate::disk_format::parse_feedback_path(rel) else {
-                continue;
-            };
-            // Only re-dispatch if the file is still on disk; if the user
-            // deleted it between the previous run and now, drop the entry.
-            if !held.path.exists() {
-                continue;
-            }
-            // Forward as a FeedbackWritten; the dispatch will auto-organize
-            // or hold according to the current worktree state.
-            if let Err(err) = Box::pin(self.handle_signal(
-                repo_root,
-                FilesystemSignal::FeedbackWritten { parsed },
-                now,
-            ))
-            .await
-            {
-                tracing::warn!(error = ?err, "normalize_held_feedback re-dispatch failed");
-            }
-        }
-        Ok(())
-    }
-
-    /// Decide whether a flat-drop feedback file should be auto-organized
-    /// into `<phase>/<target-sha>/<author>.md`.
-    ///
-    /// Returns `Some(MovePlan)` when a current target SHA exists and the
-    /// session's plan is clean (for plan-phase) or always (for impl-phase).
-    /// Returns `None` to fall back to the held-feedback path.
-    async fn resolve_flat_drop_target(
-        &self,
-        repo_root: &Path,
-        parsed: &crate::disk_format::FeedbackPath,
-    ) -> Result<Option<MovePlan>, RuntimeError> {
-        // Pull the data we need out of state under one short lock.
-        let snapshot = {
-            let trinity = self.state.lock().await;
-            let Some(state) = trinity.repos.get(repo_root) else {
-                return Ok(None);
-            };
-            let Some(session) = state.plans.get(&parsed.plan_key) else {
-                return Ok(None);
-            };
-            FlatDropSnapshot {
-                body_hash: session.body_hash.clone(),
-                plan_path: session.plan_path.clone(),
-                target: match parsed.phase {
-                    FeedbackPhase::Plan => latest_attributed_commit(session, state, |attr| {
-                        matches!(
-                            attr,
-                            AttributionResult::Attributed {
-                                plan_touch: Some(_),
-                                ..
-                            }
-                        )
-                    }),
-                    FeedbackPhase::Impl => latest_attributed_commit(session, state, |attr| {
-                        matches!(
-                            attr,
-                            AttributionResult::Attributed {
-                                has_code_changes: true,
-                                ..
-                            }
-                        )
-                    }),
-                },
-            }
-        };
-
-        let Some(target_sha) = snapshot.target else {
-            return Ok(None);
-        };
-
-        // Plan-phase only: hold (don't auto-organize) when the worktree
-        // is BodyDirty. Done-move-pending and missing-active-file mean
-        // the plan path is intentionally absent or migrated — the
-        // current target SHA from HEAD is still the right anchor for
-        // an incoming review.
-        if matches!(parsed.phase, FeedbackPhase::Plan) {
-            use crate::projection::plan_worktree_status;
-            use crate::repo_state::PlanWorktreeStatus;
-            let active_path = repo_root.join(&snapshot.plan_path);
-            let counterpart_rel = crate::lifecycle::plan_path_counterpart(&snapshot.plan_path);
-            let counterpart_abs = counterpart_rel.as_ref().map(|p| repo_root.join(p));
-            let wt_hash = std::fs::read_to_string(&active_path)
-                .ok()
-                .map(|b| content_hash(&b));
-            let counterpart_exists = counterpart_abs
-                .as_ref()
-                .map(|p| p.exists())
-                .unwrap_or(false);
-            let status = plan_worktree_status(
-                Some(&snapshot.body_hash),
-                wt_hash.as_ref(),
-                counterpart_exists,
-            );
-            if matches!(status, PlanWorktreeStatus::BodyDirty) {
-                return Ok(None);
-            }
-        }
-
-        let to = repo_root
-            .join(".trinity/feedback")
-            .join(parsed.plan_key.as_str())
-            .join(parsed.phase.as_str())
-            .join(target_sha.as_str())
-            .join(format!("{}.md", parsed.author.as_str()));
-
-        Ok(Some(MovePlan { to, target_sha }))
-    }
-}
-
-struct FlatDropSnapshot {
-    body_hash: crate::lifecycle::ContentHash,
-    plan_path: std::path::PathBuf,
-    target: Option<CommitSha>,
-}
-
-/// Latest commit attributed to `session.id` matching `pred`, in
-/// chronological order from `RepoState::commit_order`. BTreeMap iteration
-/// over `attribution` alone is SHA-lex order, not chronological, so we
-/// walk `commit_order` and look up each entry.
 /// Construct a `PlanId` from a repo root + plan key. Returns `None` if
 /// the repo path lacks a usable file_name (shouldn't happen for any path
 /// the daemon actually canonicalized via `dunce`).
@@ -638,64 +424,6 @@ fn plan_id_for(
 ) -> Option<crate::lifecycle::PlanId> {
     let basename = crate::lifecycle::RepoBasename::from_repo_root(repo_root)?;
     Some(crate::lifecycle::PlanId::new(basename, plan_key.clone()))
-}
-
-fn latest_attributed_commit(
-    session: &Plan,
-    state: &crate::repo_state::RepoState,
-    pred: impl Fn(&AttributionResult) -> bool,
-) -> Option<CommitSha> {
-    let mut latest = None;
-    for sha in &state.commit_order {
-        let Some(attr) = state.attribution.get(sha) else {
-            continue;
-        };
-        if let AttributionResult::Attributed { session: sid, .. } = attr
-            && sid == &session.id
-            && pred(attr)
-        {
-            latest = Some(sha.clone());
-        }
-    }
-    latest
-}
-
-fn upsert_feedback_at_target(
-    session: &mut Plan,
-    abs_path: PathBuf,
-    target_sha: CommitSha,
-    _phase: FeedbackPhase,
-    author: crate::lifecycle::AgentLabel,
-    body: String,
-) {
-    let verdict = crate::disk_format::parse_verdict(&body);
-    let created_at = file_mtime_unix_secs(&abs_path);
-    // Storage is commit-keyed; legacy `phase` no longer routes. Insert
-    // a placeholder gate entry (state/participants will be re-derived
-    // by `refresh_commits_for` after this call). If the SHA isn't
-    // reviewable for this plan, the rebuild will drop the entry.
-    let entry =
-        session
-            .commits
-            .entry(target_sha)
-            .or_insert_with(|| crate::review_state::CommitGate {
-                state: crate::review_state::CommitGateState::Unreviewed,
-                participants: Vec::new(),
-                approvers: Vec::new(),
-                requesters: Vec::new(),
-                ambiguous: Vec::new(),
-                missing: Vec::new(),
-                feedback: std::collections::BTreeMap::new(),
-            });
-    entry.feedback.insert(
-        author,
-        Feedback {
-            path: abs_path,
-            body,
-            verdict,
-            created_at,
-        },
-    );
 }
 
 // File mtime helper lives next to its sibling rebuild-path call site
@@ -722,46 +450,33 @@ fn upsert_feedback(
     parsed: crate::disk_format::FeedbackPath,
     body: String,
 ) {
+    let verdict = crate::disk_format::parse_verdict(&body);
     let created_at = file_mtime_unix_secs(&abs_path);
-    match parsed.target_sha {
-        Some(target_sha) => {
-            upsert_feedback_at_target(
-                session,
-                abs_path,
-                target_sha,
-                parsed.phase,
-                parsed.author,
-                body,
-            );
+    let entry = session.commits.entry(parsed.target_sha).or_insert_with(|| {
+        crate::review_state::CommitGate {
+            state: crate::review_state::CommitGateState::Unreviewed,
+            participants: Vec::new(),
+            approvers: Vec::new(),
+            requesters: Vec::new(),
+            ambiguous: Vec::new(),
+            missing: Vec::new(),
+            feedback: std::collections::BTreeMap::new(),
         }
-        None => {
-            let reason = match parsed.phase {
-                FeedbackPhase::Plan => "plan_dirty",
-                FeedbackPhase::Impl => "impl_flat_drop",
-            };
-            session.held_plan_feedback.push(HeldFeedback {
-                path: abs_path,
-                author: parsed.author,
-                body,
-                reason,
-                created_at,
-            });
-        }
-    }
+    });
+    entry.feedback.insert(
+        parsed.author,
+        Feedback {
+            path: abs_path,
+            body,
+            verdict,
+            created_at,
+        },
+    );
 }
 
 fn remove_feedback(session: &mut Plan, parsed: &crate::disk_format::FeedbackPath) {
-    match &parsed.target_sha {
-        Some(target_sha) => {
-            if let Some(gate) = session.commits.get_mut(target_sha) {
-                gate.feedback.remove(&parsed.author);
-            }
-        }
-        None => {
-            session
-                .held_plan_feedback
-                .retain(|h| h.author != parsed.author);
-        }
+    if let Some(gate) = session.commits.get_mut(&parsed.target_sha) {
+        gate.feedback.remove(&parsed.author);
     }
 }
 
@@ -1030,11 +745,11 @@ mod tests {
             .unwrap();
 
         // Write feedback file on disk first.
-        let feedback_rel = format!(".trinity/feedback/foo/plan/{}/alice.md", intro.as_str());
+        let feedback_rel = format!(".trinity/feedback/foo/commits/{}/alice.md", intro.as_str());
         write_file(dir.path(), &feedback_rel, "APPROVE\n\nlgtm\n");
 
         // Build the parsed FeedbackPath manually for the signal.
-        let parsed_rel = PathBuf::from(format!("foo/plan/{}/alice.md", intro.as_str()));
+        let parsed_rel = PathBuf::from(format!("foo/commits/{}/alice.md", intro.as_str()));
         let parsed = crate::disk_format::parse_feedback_path(&parsed_rel).unwrap();
 
         rt.handle_signal(dir.path(), FilesystemSignal::FeedbackWritten { parsed }, 7)
@@ -1071,9 +786,9 @@ mod tests {
             })
             .await
             .unwrap();
-        let feedback_rel = format!(".trinity/feedback/foo/plan/{}/alice.md", intro.as_str());
+        let feedback_rel = format!(".trinity/feedback/foo/commits/{}/alice.md", intro.as_str());
         write_file(dir.path(), &feedback_rel, "APPROVE\n");
-        let parsed_rel = PathBuf::from(format!("foo/plan/{}/alice.md", intro.as_str()));
+        let parsed_rel = PathBuf::from(format!("foo/commits/{}/alice.md", intro.as_str()));
         let parsed = crate::disk_format::parse_feedback_path(&parsed_rel).unwrap();
         rt.handle_signal(
             dir.path(),
@@ -1101,167 +816,9 @@ mod tests {
         assert_eq!(v["waiting_on"]["reason"], "plan_needs_initial_review");
     }
 
-    #[tokio::test]
-    async fn flat_drop_feedback_is_auto_organized() {
-        let dir = init_repo();
-        write_file(dir.path(), ".trinity/plans/foo.md", "# foo\n");
-        commit(dir.path(), "add foo");
-
-        let rt = Runtime::new();
-        rt.add_repo(dir.path().to_path_buf()).await.unwrap();
-
-        // Drop a flat feedback file (no sha sub-dir).
-        let feedback_rel = ".trinity/feedback/foo/plan/alice.md";
-        write_file(dir.path(), feedback_rel, "APPROVE\n");
-
-        let parsed_rel = PathBuf::from("foo/plan/alice.md");
-        let parsed = crate::disk_format::parse_feedback_path(&parsed_rel).unwrap();
-        rt.handle_signal(dir.path(), FilesystemSignal::FeedbackWritten { parsed }, 7)
-            .await
-            .unwrap();
-
-        // The flat file should be gone; the canonical SHA-subdir file should exist.
-        let intro_sha = rt
-            .read_repo(dir.path(), |s| {
-                s.plans[&PlanKey::from("foo".to_string())]
-                    .plan_intro
-                    .clone()
-            })
-            .await
-            .unwrap();
-        let canonical_rel = format!(".trinity/feedback/foo/plan/{}/alice.md", intro_sha.as_str());
-        assert!(
-            !dir.path().join(feedback_rel).exists(),
-            "flat-drop file should be gone"
-        );
-        assert!(
-            dir.path().join(&canonical_rel).exists(),
-            "canonical file should exist at {canonical_rel}"
-        );
-
-        // The session's Plan.commits map should carry alice's entry
-        // under the target SHA's gate.
-        let key_present = rt
-            .read_repo(dir.path(), |s| {
-                s.plans[&PlanKey::from("foo".to_string())]
-                    .commits
-                    .get(&intro_sha)
-                    .map(|g| {
-                        g.feedback
-                            .contains_key(&AgentLabel::from("alice".to_string()))
-                    })
-                    .unwrap_or(false)
-            })
-            .await
-            .unwrap();
-        assert!(key_present);
-    }
-
-    #[tokio::test]
-    async fn flat_drop_held_when_plan_is_body_dirty() {
-        let dir = init_repo();
-        write_file(dir.path(), ".trinity/plans/foo.md", "# foo v1\n");
-        commit(dir.path(), "add foo");
-        // Edit the plan without committing
-        write_file(
-            dir.path(),
-            ".trinity/plans/foo.md",
-            "# foo v2 uncommitted\n",
-        );
-
-        let rt = Runtime::new();
-        rt.add_repo(dir.path().to_path_buf()).await.unwrap();
-
-        let feedback_rel = ".trinity/feedback/foo/plan/alice.md";
-        write_file(dir.path(), feedback_rel, "APPROVE\n");
-
-        let parsed_rel = PathBuf::from("foo/plan/alice.md");
-        let parsed = crate::disk_format::parse_feedback_path(&parsed_rel).unwrap();
-        rt.handle_signal(dir.path(), FilesystemSignal::FeedbackWritten { parsed }, 1)
-            .await
-            .unwrap();
-
-        // Flat file should still be there (held, not renamed).
-        assert!(
-            dir.path().join(feedback_rel).exists(),
-            "flat file should still exist while plan is body_dirty"
-        );
-        let held_count = rt
-            .read_repo(dir.path(), |s| {
-                s.plans[&PlanKey::from("foo".to_string())]
-                    .held_plan_feedback
-                    .len()
-            })
-            .await
-            .unwrap();
-        assert_eq!(held_count, 1);
-    }
-
-    #[tokio::test]
-    async fn held_feedback_releases_after_plan_commit() {
-        let dir = init_repo();
-        write_file(dir.path(), ".trinity/plans/foo.md", "# foo v1\n");
-        commit(dir.path(), "add foo v1");
-        // Edit plan without committing → body_dirty
-        write_file(
-            dir.path(),
-            ".trinity/plans/foo.md",
-            "# foo v2 uncommitted\n",
-        );
-
-        let rt = Runtime::new();
-        rt.add_repo(dir.path().to_path_buf()).await.unwrap();
-
-        // Drop a flat feedback file while plan is dirty → held.
-        let feedback_rel = ".trinity/feedback/foo/plan/alice.md";
-        write_file(dir.path(), feedback_rel, "APPROVE\n");
-        let parsed_rel = PathBuf::from("foo/plan/alice.md");
-        let parsed = crate::disk_format::parse_feedback_path(&parsed_rel).unwrap();
-        rt.handle_signal(dir.path(), FilesystemSignal::FeedbackWritten { parsed }, 1)
-            .await
-            .unwrap();
-
-        let held_count = rt
-            .read_repo(dir.path(), |s| {
-                s.plans[&PlanKey::from("foo".to_string())]
-                    .held_plan_feedback
-                    .len()
-            })
-            .await
-            .unwrap();
-        assert_eq!(held_count, 1, "should be held while dirty");
-
-        // Commit the plan revision so it becomes clean.
-        commit(dir.path(), "revise foo to v2");
-
-        // HEAD changed → rebuild + normalize → held flat file should
-        // auto-organize into the new target SHA subdir.
-        rt.handle_signal(dir.path(), FilesystemSignal::HeadChanged, 2)
-            .await
-            .unwrap();
-
-        let (held_after, has_canonical_entry) = rt
-            .read_repo(dir.path(), |s| {
-                let sess = &s.plans[&PlanKey::from("foo".to_string())];
-                let any_entry_for_alice = sess
-                    .commits
-                    .values()
-                    .any(|g| g.feedback.keys().any(|author| author.as_str() == "alice"));
-                (sess.held_plan_feedback.len(), any_entry_for_alice)
-            })
-            .await
-            .unwrap();
-        assert_eq!(held_after, 0, "held should clear after rebuild");
-        assert!(
-            has_canonical_entry,
-            "alice's feedback should be in plan_feedback under the new target sha"
-        );
-        // Flat file should be gone from disk.
-        assert!(
-            !dir.path().join(feedback_rel).exists(),
-            "flat file should have been moved"
-        );
-    }
+    // (flat_drop_feedback_is_auto_organized test removed in phase 2.4 —
+    // the flat-drop disk path / held-feedback / auto-organize path
+    // no longer exists; reviewers always write to commits/<sha>/.)
 
     #[tokio::test]
     async fn list_plans_via_runtime() {

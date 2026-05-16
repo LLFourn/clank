@@ -265,30 +265,23 @@ fn derive_locations(cand: &Candidate, reason: WaitingReason, author: &AgentLabel
             let Some(target) = &cand.plan_target else {
                 return Vec::new();
             };
-            vec![feedback_path(sid, "plan", target, author.as_str())]
+            vec![feedback_path(sid, target, author.as_str())]
         }
         WaitingReason::ImplNeedsInitialReview | WaitingReason::ImplNeedsRereview => {
             let Some(target) = &cand.impl_target else {
                 return Vec::new();
             };
-            vec![feedback_path(sid, "impl", target, author.as_str())]
+            vec![feedback_path(sid, target, author.as_str())]
         }
         WaitingReason::AddressPlanRequestChanges => {
-            let mut out = rc_feedback_paths(
-                cand.plan_target.as_ref(),
-                cand.plan_gate.as_ref(),
-                sid,
-                "plan",
-            );
+            let mut out =
+                rc_feedback_paths(cand.plan_target.as_ref(), cand.plan_gate.as_ref(), sid);
             out.push(plan_file);
             out
         }
-        WaitingReason::AddressImplRequestChanges => rc_feedback_paths(
-            cand.impl_target.as_ref(),
-            cand.impl_gate.as_ref(),
-            sid,
-            "impl",
-        ),
+        WaitingReason::AddressImplRequestChanges => {
+            rc_feedback_paths(cand.impl_target.as_ref(), cand.impl_gate.as_ref(), sid)
+        }
         WaitingReason::CommitDoneMove
         | WaitingReason::RestoreOrCommitDoneMove
         | WaitingReason::CommitPlanRevision
@@ -298,11 +291,10 @@ fn derive_locations(cand: &Candidate, reason: WaitingReason, author: &AgentLabel
     }
 }
 
-fn feedback_path(sid: &str, phase: &str, target: &CommitSha, author: &str) -> String {
+fn feedback_path(sid: &str, target: &CommitSha, author: &str) -> String {
     format!(
-        ".trinity/feedback/{}/{}/{}/{}.md",
+        ".trinity/feedback/{}/commits/{}/{}.md",
         sid,
-        phase,
         target.as_str(),
         author
     )
@@ -312,14 +304,13 @@ fn rc_feedback_paths(
     target: Option<&CommitSha>,
     gate: Option<&ReviewGateDecision>,
     sid: &str,
-    phase: &str,
 ) -> Vec<String> {
     let (Some(target), Some(gate)) = (target, gate) else {
         return Vec::new();
     };
     gate.request_changes
         .iter()
-        .map(|author| feedback_path(sid, phase, target, author.as_str()))
+        .map(|author| feedback_path(sid, target, author.as_str()))
         .collect()
 }
 
@@ -428,14 +419,14 @@ mod tests {
     fn review_plan_location_is_canonical_write_path_for_caller() {
         let c = cand(Some("abc123"), None);
         let v = derive_locations(&c, WaitingReason::PlanNeedsInitialReview, &me());
-        assert_eq!(v, vec![".trinity/feedback/sid/plan/abc123/codex.md"]);
+        assert_eq!(v, vec![".trinity/feedback/sid/commits/abc123/codex.md"]);
     }
 
     #[test]
     fn review_impl_location_uses_impl_target() {
         let c = cand(None, Some("def456"));
         let v = derive_locations(&c, WaitingReason::ImplNeedsInitialReview, &me());
-        assert_eq!(v, vec![".trinity/feedback/sid/impl/def456/codex.md"]);
+        assert_eq!(v, vec![".trinity/feedback/sid/commits/def456/codex.md"]);
     }
 
     #[test]
@@ -461,8 +452,8 @@ mod tests {
         assert_eq!(
             v,
             vec![
-                ".trinity/feedback/sid/plan/plan1/alice.md",
-                ".trinity/feedback/sid/plan/plan1/bob.md",
+                ".trinity/feedback/sid/commits/plan1/alice.md",
+                ".trinity/feedback/sid/commits/plan1/bob.md",
                 ".trinity/plans/sid.md",
             ]
         );
@@ -481,7 +472,7 @@ mod tests {
         let mut c = cand(None, Some("impl9"));
         c.impl_gate = Some(g);
         let v = derive_locations(&c, WaitingReason::AddressImplRequestChanges, &me());
-        assert_eq!(v, vec![".trinity/feedback/sid/impl/impl9/dana.md"]);
+        assert_eq!(v, vec![".trinity/feedback/sid/commits/impl9/dana.md"]);
     }
 
     #[test]
@@ -622,7 +613,7 @@ mod integration_tests {
         assert_eq!(work, "review_plan");
         assert_eq!(locations.len(), 1);
         assert!(
-            locations[0].starts_with(".trinity/feedback/foo/plan/"),
+            locations[0].starts_with(".trinity/feedback/foo/commits/"),
             "got: {}",
             locations[0]
         );
@@ -666,15 +657,15 @@ mod integration_tests {
             .await
             .unwrap();
         // Two RC feedbacks at the canonical path.
-        let bob_path = format!(".trinity/feedback/foo/plan/{}/bob.md", intro.as_str());
-        let dana_path = format!(".trinity/feedback/foo/plan/{}/dana.md", intro.as_str());
+        let bob_path = format!(".trinity/feedback/foo/commits/{}/bob.md", intro.as_str());
+        let dana_path = format!(".trinity/feedback/foo/commits/{}/dana.md", intro.as_str());
         write_file(dir.path(), &bob_path, "REQUEST_CHANGES\n");
         write_file(dir.path(), &dana_path, "REQUEST_CHANGES\n");
         rt.handle_signal(
             dir.path(),
             FilesystemSignal::FeedbackWritten {
                 parsed: crate::disk_format::parse_feedback_path(&PathBuf::from(format!(
-                    "foo/plan/{}/bob.md",
+                    "foo/commits/{}/bob.md",
                     intro.as_str()
                 )))
                 .unwrap(),
@@ -687,7 +678,7 @@ mod integration_tests {
             dir.path(),
             FilesystemSignal::FeedbackWritten {
                 parsed: crate::disk_format::parse_feedback_path(&PathBuf::from(format!(
-                    "foo/plan/{}/dana.md",
+                    "foo/commits/{}/dana.md",
                     intro.as_str()
                 )))
                 .unwrap(),
@@ -730,12 +721,12 @@ mod integration_tests {
         // Both codex + bob approve the intro target → participants.
         for author in ["codex", "bob"] {
             let rel = format!(
-                ".trinity/feedback/foo/plan/{}/{}.md",
+                ".trinity/feedback/foo/commits/{}/{}.md",
                 intro.as_str(),
                 author
             );
             write_file(dir.path(), &rel, "APPROVE\n");
-            let parsed_rel = PathBuf::from(format!("foo/plan/{}/{}.md", intro.as_str(), author));
+            let parsed_rel = PathBuf::from(format!("foo/commits/{}/{}.md", intro.as_str(), author));
             let parsed = crate::disk_format::parse_feedback_path(&parsed_rel).unwrap();
             rt.handle_signal(dir.path(), FilesystemSignal::FeedbackWritten { parsed }, 1)
                 .await
@@ -756,10 +747,13 @@ mod integration_tests {
             })
             .await
             .unwrap();
-        let codex_rel = format!(".trinity/feedback/foo/plan/{}/codex.md", revised.as_str());
+        let codex_rel = format!(
+            ".trinity/feedback/foo/commits/{}/codex.md",
+            revised.as_str()
+        );
         write_file(dir.path(), &codex_rel, "APPROVE\n");
         let parsed = crate::disk_format::parse_feedback_path(&PathBuf::from(format!(
-            "foo/plan/{}/codex.md",
+            "foo/commits/{}/codex.md",
             revised.as_str()
         )))
         .unwrap();

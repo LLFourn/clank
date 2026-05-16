@@ -187,12 +187,10 @@ fn waiting_from_gate(gate: Option<&ReviewGateDecision>, phase: GatePhase) -> Wai
 /// backfills off-first-parent intros so this fallback is rare for
 /// committed plans, but the function is defensive so callers don't
 /// have to special-case malformed snapshots.
-#[allow(clippy::too_many_arguments)]
 pub fn last_activity_ts_for(
     plan_key: &crate::lifecycle::PlanKey,
     plan_intro: &CommitSha,
     commits: &BTreeMap<CommitSha, CommitGate>,
-    held_plan_feedback: &[crate::repo_state::HeldFeedback],
     commit_order: &[CommitSha],
     plan_touches: &BTreeMap<
         CommitSha,
@@ -222,14 +220,6 @@ pub fn last_activity_ts_for(
         for fb in gate.feedback.values() {
             max_ts = max_ts.max(fb.created_at);
         }
-    }
-    // Held feedback files exist while a plan revision is dirty.
-    // Their mtimes count toward "last activity" until phase 2.3
-    // deletes the held-feedback queue entirely. Without this, a
-    // new held flat-drop review would render on the plan page but
-    // fail to bump the homepage's recency sort.
-    for held in held_plan_feedback {
-        max_ts = max_ts.max(held.created_at);
     }
     if let Some(intro_meta) = commit_meta.get(plan_intro) {
         max_ts = max_ts.max(intro_meta.author_ts);
@@ -1209,7 +1199,6 @@ mod tests {
             &pk("foo"),
             &cs("c1"),
             &BTreeMap::new(),
-            &[],
             &[cs("c1")],
             &touches,
             &BTreeMap::new(),
@@ -1232,7 +1221,6 @@ mod tests {
             &pk("foo"),
             &cs("c1"),
             &commits,
-            &[],
             &[cs("c1"), cs("c2")],
             &touches,
             &BTreeMap::new(),
@@ -1256,7 +1244,6 @@ mod tests {
             &pk("foo"),
             &cs("c1"),
             &BTreeMap::new(),
-            &[],
             &[cs("c1"), cs("c2")],
             &touches,
             &BTreeMap::new(),
@@ -1266,37 +1253,6 @@ mod tests {
             ts, 1_000,
             "bar's later commit should not bump foo's activity"
         );
-    }
-
-    #[test]
-    fn last_activity_ts_counts_held_feedback() {
-        // Held flat-drop reviews exist while the plan body is dirty.
-        // Their mtimes must still count toward "last activity" or a
-        // held review can render on the plan page without bumping the
-        // homepage's recency sort. (Phase 2.3 deletes held feedback
-        // entirely, at which point this test goes with it.)
-        let mut commit_meta = BTreeMap::new();
-        commit_meta.insert(cs("c1"), meta(1_000, "intro"));
-        let mut touches: BTreeMap<CommitSha, Vec<(PlanKey, PlanTouchKind)>> = BTreeMap::new();
-        touches.insert(cs("c1"), vec![(pk("foo"), PlanTouchKind::Intro)]);
-        let held = [crate::repo_state::HeldFeedback {
-            path: std::path::PathBuf::from("/tmp/held.md"),
-            author: al("codex"),
-            body: String::new(),
-            reason: "plan_dirty",
-            created_at: 7_000,
-        }];
-        let ts = last_activity_ts_for(
-            &pk("foo"),
-            &cs("c1"),
-            &BTreeMap::new(),
-            &held,
-            &[cs("c1")],
-            &touches,
-            &BTreeMap::new(),
-            &commit_meta,
-        );
-        assert_eq!(ts, 7_000);
     }
 
     // -------- commit_kind_for --------

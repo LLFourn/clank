@@ -18,9 +18,9 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use crate::attribution::{CommitChanges, classify, effective_session};
-use crate::disk_format::{FeedbackPath, FeedbackPhase, parse_verdict};
+use crate::disk_format::{FeedbackPath, parse_verdict};
 use crate::lifecycle::{AgentLabel, CommitSha, PlanKey, content_hash};
-use crate::repo_state::{Feedback, HeldFeedback, Plan, RepoState};
+use crate::repo_state::{Feedback, Plan, RepoState};
 
 /// Everything Trinity needs to derive a repo's state, materialized into
 /// structured types. Built by `git_io::snapshot`; consumed by
@@ -120,7 +120,6 @@ pub fn derive_state(repo_root: PathBuf, snapshot: DiskSnapshot) -> RepoState {
                 body_hash,
                 plan_intro: pf.plan_intro,
                 plan_intro_parent: pf.plan_intro_parent,
-                held_plan_feedback: Vec::new(),
                 commits: BTreeMap::new(),
             },
         );
@@ -193,33 +192,15 @@ fn ingest_feedback(
     let verdict = parse_verdict(&fb.body);
     let created_at = fb.created_at;
     let plan_key = plan.id.clone();
-    match fb.parsed.target_sha {
-        Some(target_sha) => {
-            let _ = fb.parsed.phase; // phase no longer routes — see CommitKind
-            feedback_by_plan.entry(plan_key).or_default().insert(
-                (target_sha, fb.parsed.author),
-                Feedback {
-                    path: fb.abs_path,
-                    body: fb.body,
-                    verdict,
-                    created_at,
-                },
-            );
-        }
-        None => {
-            let reason = match fb.parsed.phase {
-                FeedbackPhase::Plan => "plan_dirty",
-                FeedbackPhase::Impl => "impl_flat_drop",
-            };
-            plan.held_plan_feedback.push(HeldFeedback {
-                path: fb.abs_path,
-                author: fb.parsed.author,
-                body: fb.body,
-                reason,
-                created_at,
-            });
-        }
-    }
+    feedback_by_plan.entry(plan_key).or_default().insert(
+        (fb.parsed.target_sha, fb.parsed.author),
+        Feedback {
+            path: fb.abs_path,
+            body: fb.body,
+            verdict,
+            created_at,
+        },
+    );
 }
 
 #[cfg(test)]
@@ -264,21 +245,16 @@ mod tests {
         }
     }
 
-    fn feedback(
-        session: &str,
-        phase: FeedbackPhase,
-        target: Option<&str>,
-        author: &str,
-        body: &str,
-    ) -> FeedbackBlob {
+    fn feedback(session: &str, target: &str, author: &str, body: &str) -> FeedbackBlob {
         FeedbackBlob {
-            abs_path: PathBuf::from(format!("/r/.trinity/feedback/{session}/...")),
+            abs_path: PathBuf::from(format!(
+                "/r/.trinity/feedback/{session}/commits/{target}/{author}.md"
+            )),
             parsed: FeedbackPath {
                 plan_key: sess(session),
-                phase,
-                target_sha: target.map(sha),
+                target_sha: sha(target),
                 author: AgentLabel::from(author.to_string()),
-                raw: PathBuf::from("..."),
+                raw: PathBuf::from(format!("{session}/commits/{target}/{author}.md")),
             },
             body: body.to_string(),
             created_at: 0,
@@ -456,13 +432,7 @@ mod tests {
             head: Some(sha("c1")),
             plan_files: vec![plan_file("foo", "c1", None, "# foo\n")],
             history: vec![entry("c1", vec![touch("foo", PlanTouchKind::Intro)], false)],
-            feedback_files: vec![feedback(
-                "foo",
-                FeedbackPhase::Plan,
-                Some("c1"),
-                "alice",
-                "APPROVE\n",
-            )],
+            feedback_files: vec![feedback("foo", "c1", "alice", "APPROVE\n")],
             commit_meta: BTreeMap::new(),
         };
         let state = derive_state(PathBuf::from("/r"), snap);
@@ -477,63 +447,9 @@ mod tests {
         assert_eq!(entry.verdict, crate::repo_state::Verdict::Approve);
     }
 
-    #[test]
-    fn flat_drop_plan_feedback_is_held() {
-        let snap = DiskSnapshot {
-            head: Some(sha("c1")),
-            plan_files: vec![plan_file("foo", "c1", None, "# foo\n")],
-            history: vec![entry("c1", vec![touch("foo", PlanTouchKind::Intro)], false)],
-            feedback_files: vec![feedback(
-                "foo",
-                FeedbackPhase::Plan,
-                None,
-                "alice",
-                "APPROVE\n",
-            )],
-            commit_meta: BTreeMap::new(),
-        };
-        let state = derive_state(PathBuf::from("/r"), snap);
-        let session = &state.plans[&sess("foo")];
-        assert!(
-            session
-                .commits
-                .get(&sha("c1"))
-                .map(|g| g.feedback.is_empty())
-                .unwrap_or(true)
-        );
-        assert_eq!(session.held_plan_feedback.len(), 1);
-        assert_eq!(session.held_plan_feedback[0].reason, "plan_dirty");
-    }
-
-    #[test]
-    fn flat_drop_impl_feedback_is_held_with_different_reason() {
-        let snap = DiskSnapshot {
-            head: Some(sha("c2")),
-            plan_files: vec![plan_file("foo", "c1", None, "# foo\n")],
-            history: vec![
-                entry("c1", vec![touch("foo", PlanTouchKind::Intro)], false),
-                entry("c2", vec![], true),
-            ],
-            feedback_files: vec![feedback(
-                "foo",
-                FeedbackPhase::Impl,
-                None,
-                "alice",
-                "APPROVE\n",
-            )],
-            commit_meta: BTreeMap::new(),
-        };
-        let state = derive_state(PathBuf::from("/r"), snap);
-        let session = &state.plans[&sess("foo")];
-        assert!(
-            session
-                .commits
-                .get(&sha("c2"))
-                .map(|g| g.feedback.is_empty())
-                .unwrap_or(true)
-        );
-        assert_eq!(session.held_plan_feedback[0].reason, "impl_flat_drop");
-    }
+    // (Flat-drop / held-feedback tests removed in phase 2.4 — the
+    // parser no longer accepts paths without a target SHA, so the
+    // held-feedback queue went with it.)
 
     #[test]
     fn feedback_for_unknown_session_is_dropped() {
@@ -541,13 +457,7 @@ mod tests {
             head: Some(sha("c1")),
             plan_files: vec![],
             history: vec![],
-            feedback_files: vec![feedback(
-                "ghost",
-                FeedbackPhase::Plan,
-                Some("c1"),
-                "alice",
-                "APPROVE\n",
-            )],
+            feedback_files: vec![feedback("ghost", "c1", "alice", "APPROVE\n")],
             commit_meta: BTreeMap::new(),
         };
         let state = derive_state(PathBuf::from("/r"), snap);
@@ -709,13 +619,8 @@ mod tests {
                 entry("c2", vec![touch("foo", PlanTouchKind::Revision)], false),
                 entry("c3", vec![], true),
             ],
-            feedback_files: vec![feedback(
-                "foo",
-                FeedbackPhase::Plan,
-                Some("c1"), // stale: c2 is the latest plan rev now
-                "alice",
-                "APPROVE\n",
-            )],
+            // stale: c2 is the latest plan rev now
+            feedback_files: vec![feedback("foo", "c1", "alice", "APPROVE\n")],
             commit_meta: BTreeMap::new(),
         };
         let state = derive_state(PathBuf::from("/r"), snap);
@@ -898,13 +803,7 @@ mod tests {
             head: Some(sha("c1")),
             plan_files: vec![plan_file("foo", "c1", None, "# foo\n")],
             history: vec![entry("c1", vec![touch("foo", PlanTouchKind::Intro)], false)],
-            feedback_files: vec![feedback(
-                "foo",
-                FeedbackPhase::Plan,
-                Some("c1"),
-                "alice",
-                "APPROVE\n",
-            )],
+            feedback_files: vec![feedback("foo", "c1", "alice", "APPROVE\n")],
             commit_meta: BTreeMap::new(),
         };
         let state = derive_state(PathBuf::from("/r"), snap);
@@ -941,13 +840,7 @@ mod tests {
                 entry("c1", vec![touch("foo", PlanTouchKind::Intro)], false),
                 entry("c2", vec![], true),
             ],
-            feedback_files: vec![feedback(
-                "foo",
-                FeedbackPhase::Impl,
-                Some("c2"),
-                "bob",
-                "REQUEST_CHANGES\nproblem\n",
-            )],
+            feedback_files: vec![feedback("foo", "c2", "bob", "REQUEST_CHANGES\nproblem\n")],
             commit_meta: BTreeMap::new(),
         };
         let state = derive_state(PathBuf::from("/r"), snap);
@@ -968,31 +861,6 @@ mod tests {
             }
             other => panic!("expected impl review, got {other:?}"),
         }
-    }
-
-    #[test]
-    fn timeline_includes_held_feedback_at_end() {
-        let snap = DiskSnapshot {
-            head: Some(sha("c1")),
-            plan_files: vec![plan_file("foo", "c1", None, "# foo\n")],
-            history: vec![entry("c1", vec![touch("foo", PlanTouchKind::Intro)], false)],
-            feedback_files: vec![feedback(
-                "foo",
-                FeedbackPhase::Plan,
-                None,
-                "alice",
-                "APPROVE\n",
-            )],
-            commit_meta: BTreeMap::new(),
-        };
-        let state = derive_state(PathBuf::from("/r"), snap);
-        let timeline = state.timeline_for(&sess("foo"));
-        // c1 commit + 1 held feedback (no review event because no target).
-        assert_eq!(timeline.len(), 2);
-        assert!(matches!(
-            timeline[1],
-            crate::repo_state::TimelineEvent::HeldFeedback { .. }
-        ));
     }
 
     #[test]
@@ -1081,14 +949,8 @@ mod tests {
             plan_files: vec![plan_file("foo", "c1", None, "# foo\n")],
             history: vec![entry("c1", vec![touch("foo", PlanTouchKind::Intro)], false)],
             feedback_files: vec![
-                feedback("foo", FeedbackPhase::Plan, Some("c1"), "alice", "APPROVE\n"),
-                feedback(
-                    "foo",
-                    FeedbackPhase::Plan,
-                    Some("c1"),
-                    "bob",
-                    "REQUEST_CHANGES\n",
-                ),
+                feedback("foo", "c1", "alice", "APPROVE\n"),
+                feedback("foo", "c1", "bob", "REQUEST_CHANGES\n"),
             ],
             commit_meta: BTreeMap::new(),
         };
@@ -1156,14 +1018,8 @@ mod tests {
                 entry("c2", vec![], true),
             ],
             feedback_files: vec![
-                feedback("foo", FeedbackPhase::Plan, Some("c1"), "alice", "APPROVE\n"),
-                feedback(
-                    "foo",
-                    FeedbackPhase::Impl,
-                    Some("c2"),
-                    "bob",
-                    "REQUEST_CHANGES\nstuff\n",
-                ),
+                feedback("foo", "c1", "alice", "APPROVE\n"),
+                feedback("foo", "c2", "bob", "REQUEST_CHANGES\nstuff\n"),
             ],
             commit_meta: BTreeMap::new(),
         }

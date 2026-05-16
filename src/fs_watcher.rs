@@ -229,7 +229,7 @@ mod tests {
     #[test]
     fn feedback_canonical_sha_path() {
         let sig = path_to_signal(
-            &repo().join(".trinity/feedback/foo/plan/abc1234/alice.md"),
+            &repo().join(".trinity/feedback/foo/commits/abc1234/alice.md"),
             &repo(),
             FsEventKind::CreatedOrModified,
         );
@@ -237,31 +237,34 @@ mod tests {
             Some(FilesystemSignal::FeedbackWritten { parsed }) => {
                 assert_eq!(parsed.plan_key.as_str(), "foo");
                 assert_eq!(parsed.author.as_str(), "alice");
-                assert_eq!(parsed.target_sha.unwrap().as_str(), "abc1234");
+                assert_eq!(parsed.target_sha.as_str(), "abc1234");
             }
             other => panic!("expected FeedbackWritten, got {other:?}"),
         }
     }
 
     #[test]
-    fn feedback_flat_path() {
+    fn legacy_plan_segment_yields_no_signal() {
+        // Pre-2.4 paths are no longer parsed (no held-feedback queue,
+        // no flat drop). The watcher silently ignores them.
         let sig = path_to_signal(
             &repo().join(".trinity/feedback/foo/plan/alice.md"),
             &repo(),
             FsEventKind::CreatedOrModified,
         );
-        match sig {
-            Some(FilesystemSignal::FeedbackWritten { parsed }) => {
-                assert!(parsed.target_sha.is_none());
-            }
-            other => panic!("expected FeedbackWritten, got {other:?}"),
-        }
+        assert!(sig.is_none());
+        let sig = path_to_signal(
+            &repo().join(".trinity/feedback/foo/plan/abc1234/alice.md"),
+            &repo(),
+            FsEventKind::CreatedOrModified,
+        );
+        assert!(sig.is_none());
     }
 
     #[test]
     fn feedback_removed() {
         let sig = path_to_signal(
-            &repo().join(".trinity/feedback/foo/impl/def5678/bob.md"),
+            &repo().join(".trinity/feedback/foo/commits/def5678/bob.md"),
             &repo(),
             FsEventKind::Removed,
         );

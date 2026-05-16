@@ -130,7 +130,7 @@ mod tests {
         let intro = state0.plans[&PlanKey::from("foo".to_string())]
             .plan_intro
             .clone();
-        let feedback_rel = format!(".trinity/feedback/foo/plan/{}/alice.md", intro.as_str());
+        let feedback_rel = format!(".trinity/feedback/foo/commits/{}/alice.md", intro.as_str());
         write_file(dir.path(), &feedback_rel, "APPROVE\n\nLooks good.\n");
 
         let state = rebuild_repo(dir.path()).await.unwrap();
