@@ -567,7 +567,7 @@ mod tests {
         assert_eq!(arr[0]["plan_worktree_status"], "clean");
         // Just-committed plan with no reviews → reviewers / plan_needs_initial_review.
         assert_eq!(arr[0]["waiting_on"]["role"], "reviewers");
-        assert_eq!(arr[0]["waiting_on"]["reason"], "plan_needs_initial_review");
+        assert_eq!(arr[0]["waiting_on"]["reason"], "commit_needs_review");
         assert_eq!(v["conflicts"], json!([]));
     }
 
@@ -607,7 +607,7 @@ mod tests {
         assert_eq!(v["phase"], "implementing");
         // No impl reviews yet → reviewers / impl_needs_initial_review
         assert_eq!(v["waiting_on"]["role"], "reviewers");
-        assert_eq!(v["waiting_on"]["reason"], "impl_needs_initial_review");
+        assert_eq!(v["waiting_on"]["reason"], "commit_needs_review");
         assert!(v["latest_implementation_revision"].is_object());
     }
 
@@ -630,7 +630,7 @@ mod tests {
         let state = rebuild_repo(dir.path()).await.unwrap();
         let v = context_from_state(&state, "foo", "reviewer").unwrap();
         assert_eq!(v["waiting_on"]["role"], "master");
-        assert_eq!(v["waiting_on"]["reason"], "address_plan_request_changes");
+        assert_eq!(v["waiting_on"]["reason"], "address_commit_changes");
         let agents = v["waiting_on"]["agents"].as_array().unwrap();
         assert_eq!(agents.len(), 1);
         assert_eq!(agents[0], "codex");
@@ -652,7 +652,7 @@ mod tests {
         let state = rebuild_repo(dir.path()).await.unwrap();
         let v = context_from_state(&state, "foo", "master").unwrap();
         assert_eq!(v["waiting_on"]["role"], "master");
-        assert_eq!(v["waiting_on"]["reason"], "ready_to_implement");
+        assert_eq!(v["waiting_on"]["reason"], "ready_to_move_forward");
     }
 
     struct BlockingStatusReader {

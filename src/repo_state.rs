@@ -568,20 +568,33 @@ impl WaitingRole {
     }
 }
 
+/// Seven-variant collapsed reason set under the commit-centric model.
+/// The pre-2.5 axis was twelve variants (six pairs of plan/impl
+/// mirrors); the new shape uses one variant per *action* and lets
+/// `description_for` disambiguate prose by `CommitKind` of the
+/// latest relevant commit. See plan §"WaitingReason collapse".
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WaitingReason {
     SessionDone,
     CommitDoneMove,
     RestoreOrCommitDoneMove,
     CommitPlanRevision,
-    AddressPlanRequestChanges,
-    ReadyToImplement,
-    PlanNeedsInitialReview,
-    PlanNeedsRereview,
-    AddressImplRequestChanges,
-    ReadyToFinish,
-    ImplNeedsInitialReview,
-    ImplNeedsRereview,
+    /// "REQUEST_CHANGES on the latest reviewable commit; address it."
+    /// Replaces the old AddressPlanRequestChanges + AddressImplRequestChanges
+    /// pair. Description prose disambiguates by commit kind.
+    AddressCommitChanges,
+    /// "Latest reviewable commit is approved; your move." Replaces
+    /// ReadyToImplement + ReadyToFinish. After an approved plan_only
+    /// the master can start coding, revise further, or move to done;
+    /// after an approved code_only/mixed the master can continue,
+    /// revise the plan, or move to done.
+    ReadyToMoveForward,
+    /// "Latest reviewable commit hasn't been reviewed yet." Replaces
+    /// `PlanNeedsInitialReview` + `PlanNeedsRereview` +
+    /// `ImplNeedsInitialReview` + `ImplNeedsRereview`. Initial review
+    /// vs re-review is a description-prose distinction (do we have
+    /// prior participants?), not a state distinction.
+    CommitNeedsReview,
 }
 
 impl WaitingReason {
@@ -591,14 +604,9 @@ impl WaitingReason {
             WaitingReason::CommitDoneMove => "commit_done_move",
             WaitingReason::RestoreOrCommitDoneMove => "restore_or_commit_done_move",
             WaitingReason::CommitPlanRevision => "commit_plan_revision",
-            WaitingReason::AddressPlanRequestChanges => "address_plan_request_changes",
-            WaitingReason::ReadyToImplement => "ready_to_implement",
-            WaitingReason::PlanNeedsInitialReview => "plan_needs_initial_review",
-            WaitingReason::PlanNeedsRereview => "plan_needs_rereview",
-            WaitingReason::AddressImplRequestChanges => "address_impl_request_changes",
-            WaitingReason::ReadyToFinish => "ready_to_finish",
-            WaitingReason::ImplNeedsInitialReview => "impl_needs_initial_review",
-            WaitingReason::ImplNeedsRereview => "impl_needs_rereview",
+            WaitingReason::AddressCommitChanges => "address_commit_changes",
+            WaitingReason::ReadyToMoveForward => "ready_to_move_forward",
+            WaitingReason::CommitNeedsReview => "commit_needs_review",
         }
     }
 }

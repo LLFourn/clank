@@ -229,64 +229,63 @@ async fn compute_match(
 fn caller_already_voted(cand: &Candidate, reason: WaitingReason, author: &AgentLabel) -> bool {
     use WaitingReason::*;
     let gate = match reason {
-        PlanNeedsInitialReview | PlanNeedsRereview => cand.plan_gate.as_ref(),
-        ImplNeedsInitialReview | ImplNeedsRereview => cand.impl_gate.as_ref(),
+        // CommitNeedsReview is the only reviewer-role reason. Prefer
+        // the impl gate when present (post-2.5b this becomes a single
+        // "latest reviewable" gate lookup).
+        CommitNeedsReview => cand.impl_gate.as_ref().or(cand.plan_gate.as_ref()),
         SessionDone
         | CommitDoneMove
         | RestoreOrCommitDoneMove
         | CommitPlanRevision
-        | AddressPlanRequestChanges
-        | ReadyToImplement
-        | AddressImplRequestChanges
-        | ReadyToFinish => return false,
+        | AddressCommitChanges
+        | ReadyToMoveForward => return false,
     };
     let Some(gate) = gate else { return false };
     gate.approvals.contains(author) || gate.request_changes.contains(author)
 }
 
-/// Produce the repo-relative paths to attach to the response. Meaning
-/// per work type:
-/// - `review_plan` / `review_impl`: the canonical file the caller should
-///   create at `.trinity/feedback/<sid>/<phase>/<sha>/<author>.md`.
-/// - `address_plan_request_changes`: every RC feedback file on the
-///   current plan target, plus the plan file (which the caller will
-///   revise).
-/// - `address_impl_request_changes`: every RC feedback file on the
-///   current impl target (the caller addresses these by changing code).
-/// - `commit_plan_revision` / `commit_done_move` /
-///   `restore_or_commit_done_move` / `implement_and_commit` /
-///   `move_to_done`: the plan file itself.
+/// Produce the repo-relative paths to attach to the response.
 fn derive_locations(cand: &Candidate, reason: WaitingReason, author: &AgentLabel) -> Vec<String> {
     let plan_file = cand.plan_path.to_string_lossy().into_owned();
     let sid = cand.plan_key.as_str();
 
     match reason {
-        WaitingReason::PlanNeedsInitialReview | WaitingReason::PlanNeedsRereview => {
-            let Some(target) = &cand.plan_target else {
+        WaitingReason::CommitNeedsReview => {
+            let target = cand.impl_target.as_ref().or(cand.plan_target.as_ref());
+            let Some(target) = target else {
                 return Vec::new();
             };
             vec![feedback_path(sid, target, author.as_str())]
         }
-        WaitingReason::ImplNeedsInitialReview | WaitingReason::ImplNeedsRereview => {
-            let Some(target) = &cand.impl_target else {
-                return Vec::new();
+        WaitingReason::AddressCommitChanges => {
+            let (target, gate) = if let (Some(t), Some(g)) =
+                (cand.impl_target.as_ref(), cand.impl_gate.as_ref())
+                && matches!(
+                    g.state,
+                    crate::review_state::ReviewGateState::ChangesRequested
+                ) {
+                (Some(t), Some(g))
+            } else {
+                (cand.plan_target.as_ref(), cand.plan_gate.as_ref())
             };
-            vec![feedback_path(sid, target, author.as_str())]
-        }
-        WaitingReason::AddressPlanRequestChanges => {
-            let mut out =
-                rc_feedback_paths(cand.plan_target.as_ref(), cand.plan_gate.as_ref(), sid);
-            out.push(plan_file);
+            let mut out = rc_feedback_paths(target, gate, sid);
+            // Plan-side RC: also surface the plan file. Code-side RC:
+            // address by changing code (no extra location).
+            let code_side = cand.impl_gate.as_ref().is_some_and(|g| {
+                matches!(
+                    g.state,
+                    crate::review_state::ReviewGateState::ChangesRequested
+                )
+            });
+            if !code_side {
+                out.push(plan_file);
+            }
             out
-        }
-        WaitingReason::AddressImplRequestChanges => {
-            rc_feedback_paths(cand.impl_target.as_ref(), cand.impl_gate.as_ref(), sid)
         }
         WaitingReason::CommitDoneMove
         | WaitingReason::RestoreOrCommitDoneMove
         | WaitingReason::CommitPlanRevision
-        | WaitingReason::ReadyToImplement
-        | WaitingReason::ReadyToFinish => vec![plan_file],
+        | WaitingReason::ReadyToMoveForward => vec![plan_file],
         WaitingReason::SessionDone => Vec::new(),
     }
 }
@@ -418,21 +417,21 @@ mod tests {
     #[test]
     fn review_plan_location_is_canonical_write_path_for_caller() {
         let c = cand(Some("abc123"), None);
-        let v = derive_locations(&c, WaitingReason::PlanNeedsInitialReview, &me());
+        let v = derive_locations(&c, WaitingReason::CommitNeedsReview, &me());
         assert_eq!(v, vec![".trinity/feedback/sid/commits/abc123/codex.md"]);
     }
 
     #[test]
     fn review_impl_location_uses_impl_target() {
         let c = cand(None, Some("def456"));
-        let v = derive_locations(&c, WaitingReason::ImplNeedsInitialReview, &me());
+        let v = derive_locations(&c, WaitingReason::CommitNeedsReview, &me());
         assert_eq!(v, vec![".trinity/feedback/sid/commits/def456/codex.md"]);
     }
 
     #[test]
     fn review_plan_returns_empty_when_no_plan_target() {
         let c = cand(None, None);
-        let v = derive_locations(&c, WaitingReason::PlanNeedsRereview, &me());
+        let v = derive_locations(&c, WaitingReason::CommitNeedsReview, &me());
         assert!(v.is_empty());
     }
 
@@ -448,7 +447,7 @@ mod tests {
         );
         let mut c = cand(Some("plan1"), None);
         c.plan_gate = Some(g);
-        let v = derive_locations(&c, WaitingReason::AddressPlanRequestChanges, &me());
+        let v = derive_locations(&c, WaitingReason::AddressCommitChanges, &me());
         assert_eq!(
             v,
             vec![
@@ -471,7 +470,7 @@ mod tests {
         );
         let mut c = cand(None, Some("impl9"));
         c.impl_gate = Some(g);
-        let v = derive_locations(&c, WaitingReason::AddressImplRequestChanges, &me());
+        let v = derive_locations(&c, WaitingReason::AddressCommitChanges, &me());
         assert_eq!(v, vec![".trinity/feedback/sid/commits/impl9/dana.md"]);
     }
 
@@ -485,14 +484,14 @@ mod tests {
     #[test]
     fn ready_to_finish_location_is_plan_file() {
         let c = cand(None, None);
-        let v = derive_locations(&c, WaitingReason::ReadyToFinish, &me());
+        let v = derive_locations(&c, WaitingReason::ReadyToMoveForward, &me());
         assert_eq!(v, vec![".trinity/plans/sid.md"]);
     }
 
     #[test]
     fn ready_to_implement_location_is_plan_file() {
         let c = cand(None, None);
-        let v = derive_locations(&c, WaitingReason::ReadyToImplement, &me());
+        let v = derive_locations(&c, WaitingReason::ReadyToMoveForward, &me());
         assert_eq!(v, vec![".trinity/plans/sid.md"]);
     }
 
@@ -610,7 +609,7 @@ mod integration_tests {
             .await
             .unwrap();
         let (work, locations) = expect_work(resp);
-        assert_eq!(work, "review_plan");
+        assert_eq!(work, "review_commit");
         assert_eq!(locations.len(), 1);
         assert!(
             locations[0].starts_with(".trinity/feedback/foo/commits/"),
@@ -692,7 +691,7 @@ mod integration_tests {
             .await
             .unwrap();
         let (work, locations) = expect_work(resp);
-        assert_eq!(work, "address_plan_request_changes");
+        assert_eq!(work, "address_commit_changes");
         assert_eq!(
             locations,
             vec![bob_path, dana_path, ".trinity/plans/foo.md".to_string()]
@@ -772,7 +771,7 @@ mod integration_tests {
         a.timeout_secs = Some(1);
         let resp = wait_for_work(&rt, a).await.unwrap();
         let (work, locations) = expect_work(resp);
-        assert_eq!(work, "review_plan");
+        assert_eq!(work, "review_commit");
         assert_eq!(locations.len(), 1);
         assert!(
             locations[0].ends_with("/bob.md"),

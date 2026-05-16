@@ -761,7 +761,7 @@ mod wire_tests {
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
         let v = body_json(resp).await;
-        assert_eq!(v["work"], "review_plan");
+        assert_eq!(v["work"], "review_commit");
         let locations = v["locations"].as_array().unwrap();
         assert_eq!(locations.len(), 1);
         assert!(locations[0].as_str().unwrap().ends_with("/codex.md"));
@@ -899,7 +899,7 @@ mod wire_tests {
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
         let v = body_json(resp).await;
-        assert_eq!(v["result"]["work"], "review_plan");
+        assert_eq!(v["result"]["work"], "review_commit");
     }
 
     #[tokio::test]
@@ -927,7 +927,7 @@ mod wire_tests {
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
         let v = body_json(resp).await;
-        assert_eq!(v["result"]["work"], "review_plan");
+        assert_eq!(v["result"]["work"], "review_commit");
     }
 
     #[tokio::test]
@@ -1194,7 +1194,7 @@ mod wire_tests {
         let resp = app.oneshot(bob_req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
         let v = body_json(resp).await;
-        assert_eq!(v["work"], "review_plan");
+        assert_eq!(v["work"], "review_commit");
         let loc = v["locations"][0].as_str().unwrap();
         assert!(
             loc.ends_with("/bob.md"),

@@ -118,57 +118,52 @@ pub fn waiting_on(
         PlanWorktreeStatus::Clean => {}
     }
 
-    // Gate-driven rows.
+    // Gate-driven rows. Pick whichever gate is set (impl wins when
+    // both exist — corresponds to the post-cutover "latest relevant
+    // commit" walk landing on a code commit). Phase 2.5b will
+    // replace this branch with a single `latest_relevant_commit_gate`
+    // call.
     match phase {
-        Phase::Planning => waiting_from_gate(plan_gate, GatePhase::Plan),
-        Phase::Implementing => waiting_from_gate(impl_gate, GatePhase::Impl),
+        Phase::Planning => waiting_from_gate(plan_gate),
+        Phase::Implementing => waiting_from_gate(impl_gate),
         Phase::Done => unreachable!("done was handled above"),
     }
 }
 
-#[derive(Debug, Clone, Copy)]
-enum GatePhase {
-    Plan,
-    Impl,
-}
-
-fn waiting_from_gate(gate: Option<&ReviewGateDecision>, phase: GatePhase) -> WaitingOn {
-    let (rc_reason, ready_reason, initial_reason, rereview_reason) = match phase {
-        GatePhase::Plan => (
-            WaitingReason::AddressPlanRequestChanges,
-            WaitingReason::ReadyToImplement,
-            WaitingReason::PlanNeedsInitialReview,
-            WaitingReason::PlanNeedsRereview,
-        ),
-        GatePhase::Impl => (
-            WaitingReason::AddressImplRequestChanges,
-            WaitingReason::ReadyToFinish,
-            WaitingReason::ImplNeedsInitialReview,
-            WaitingReason::ImplNeedsRereview,
-        ),
-    };
-
+fn waiting_from_gate(gate: Option<&ReviewGateDecision>) -> WaitingOn {
     let Some(gate) = gate else {
-        // No gate (e.g., implementing phase with no impl commits yet —
-        // should be rare, but cover it as initial review).
-        return make(WaitingRole::Reviewers, initial_reason, Vec::new());
+        // No gate yet (a plan with no reviewable commit). Initial-review
+        // case with no participants — description prose says "awaiting
+        // initial review."
+        return make(
+            WaitingRole::Reviewers,
+            WaitingReason::CommitNeedsReview,
+            Vec::new(),
+        );
     };
 
     match gate.state {
-        ReviewGateState::ChangesRequested => {
-            make(WaitingRole::Master, rc_reason, gate.request_changes.clone())
-        }
-        ReviewGateState::Ready => make(WaitingRole::Master, ready_reason, Vec::new()),
+        ReviewGateState::ChangesRequested => make(
+            WaitingRole::Master,
+            WaitingReason::AddressCommitChanges,
+            gate.request_changes.clone(),
+        ),
+        ReviewGateState::Ready => make(
+            WaitingRole::Master,
+            WaitingReason::ReadyToMoveForward,
+            Vec::new(),
+        ),
         ReviewGateState::NeedsReview => {
-            if gate.participants.is_empty() {
-                make(WaitingRole::Reviewers, initial_reason, Vec::new())
+            let agents = if gate.participants.is_empty() {
+                Vec::new()
             } else {
-                make(
-                    WaitingRole::Reviewers,
-                    rereview_reason,
-                    gate.missing_approvals.clone(),
-                )
-            }
+                gate.missing_approvals.clone()
+            };
+            make(
+                WaitingRole::Reviewers,
+                WaitingReason::CommitNeedsReview,
+                agents,
+            )
         }
     }
 }
@@ -512,12 +507,9 @@ pub fn expected_action(reason: WaitingReason) -> &'static str {
         CommitDoneMove => "commit_done_move",
         RestoreOrCommitDoneMove => "restore_or_commit_done_move",
         CommitPlanRevision => "commit_plan_revision",
-        AddressPlanRequestChanges => "address_plan_request_changes",
-        ReadyToImplement => "implement_and_commit",
-        PlanNeedsInitialReview | PlanNeedsRereview => "review_plan",
-        AddressImplRequestChanges => "address_impl_request_changes",
-        ReadyToFinish => "move_to_done",
-        ImplNeedsInitialReview | ImplNeedsRereview => "review_impl",
+        AddressCommitChanges => "address_commit_changes",
+        ReadyToMoveForward => "move_forward",
+        CommitNeedsReview => "review_commit",
     }
 }
 
@@ -560,58 +552,28 @@ fn description_for(
              Either restore it (`git checkout -- <path>`) or move it to `done/` and commit."
             .to_string(),
         (Master, CommitPlanRevision) => "Plan has uncommitted changes. \
-             Commit the revision; held plan reviews will release."
+             Commit the revision to release any blocked reviews."
             .to_string(),
-        (Master, AddressPlanRequestChanges) => {
+        (Master, AddressCommitChanges) => {
             if agents.is_empty() {
-                "Plan review requested changes. Address them and commit a new revision.".to_string()
+                "Review requested changes on the latest commit. Address them and commit."
+                    .to_string()
             } else {
                 format!(
-                    "Plan review requested changes ({}). Address them and commit a new revision.",
+                    "Review requested changes ({}) on the latest commit. Address them and commit.",
                     agent_list()
                 )
             }
         }
-        (Master, ReadyToImplement) => {
-            "Plan approved. Ready to start implementation; make the first impl commit.".to_string()
+        (Master, ReadyToMoveForward) => {
+            "Latest commit approved. Continue with the next commit or move the plan to `done/`."
+                .to_string()
         }
-        (Reviewers, PlanNeedsInitialReview) => {
-            "Plan is committed and awaiting an initial review.".to_string()
-        }
-        (Reviewers, PlanNeedsRereview) => {
+        (Reviewers, CommitNeedsReview) => {
             if agents.is_empty() {
-                "Plan was revised; awaiting re-review.".to_string()
+                "Latest commit awaiting an initial review.".to_string()
             } else {
-                format!(
-                    "Plan was revised; awaiting re-review from {}.",
-                    agent_list()
-                )
-            }
-        }
-        (Master, AddressImplRequestChanges) => {
-            if agents.is_empty() {
-                "Implementation review requested changes. Address them and commit.".to_string()
-            } else {
-                format!(
-                    "Implementation review requested changes ({}). Address them and commit.",
-                    agent_list()
-                )
-            }
-        }
-        (Master, ReadyToFinish) => {
-            "Implementation approved. Ready to finish; move plan to `done/` and commit.".to_string()
-        }
-        (Reviewers, ImplNeedsInitialReview) => {
-            "Implementation commit awaiting an initial review.".to_string()
-        }
-        (Reviewers, ImplNeedsRereview) => {
-            if agents.is_empty() {
-                "Implementation was revised; awaiting re-review.".to_string()
-            } else {
-                format!(
-                    "Implementation was revised; awaiting re-review from {}.",
-                    agent_list()
-                )
+                format!("Latest commit awaiting review from {}.", agent_list())
             }
         }
         // Defensive — shouldn't be reachable since make() pairs role with
@@ -941,7 +903,7 @@ mod tests {
         );
         let w = waiting_on(Phase::Planning, PlanWorktreeStatus::Clean, Some(&g), None);
         assert_eq!(w.role, WaitingRole::Reviewers);
-        assert_eq!(w.reason, WaitingReason::PlanNeedsInitialReview);
+        assert_eq!(w.reason, WaitingReason::CommitNeedsReview);
         assert!(w.agents.is_empty());
     }
 
@@ -957,7 +919,7 @@ mod tests {
         );
         let w = waiting_on(Phase::Planning, PlanWorktreeStatus::Clean, Some(&g), None);
         assert_eq!(w.role, WaitingRole::Reviewers);
-        assert_eq!(w.reason, WaitingReason::PlanNeedsRereview);
+        assert_eq!(w.reason, WaitingReason::CommitNeedsReview);
         assert_eq!(w.agents.len(), 2);
     }
 
@@ -973,7 +935,7 @@ mod tests {
         );
         let w = waiting_on(Phase::Planning, PlanWorktreeStatus::Clean, Some(&g), None);
         assert_eq!(w.role, WaitingRole::Master);
-        assert_eq!(w.reason, WaitingReason::AddressPlanRequestChanges);
+        assert_eq!(w.reason, WaitingReason::AddressCommitChanges);
         assert_eq!(w.agents, agents(&["bob"]));
     }
 
@@ -989,7 +951,7 @@ mod tests {
         );
         let w = waiting_on(Phase::Planning, PlanWorktreeStatus::Clean, Some(&g), None);
         assert_eq!(w.role, WaitingRole::Master);
-        assert_eq!(w.reason, WaitingReason::ReadyToImplement);
+        assert_eq!(w.reason, WaitingReason::ReadyToMoveForward);
     }
 
     #[test]
@@ -1009,7 +971,7 @@ mod tests {
             Some(&g),
         );
         assert_eq!(w.role, WaitingRole::Reviewers);
-        assert_eq!(w.reason, WaitingReason::ImplNeedsInitialReview);
+        assert_eq!(w.reason, WaitingReason::CommitNeedsReview);
     }
 
     #[test]
@@ -1029,7 +991,7 @@ mod tests {
             Some(&g),
         );
         assert_eq!(w.role, WaitingRole::Master);
-        assert_eq!(w.reason, WaitingReason::AddressImplRequestChanges);
+        assert_eq!(w.reason, WaitingReason::AddressCommitChanges);
         assert_eq!(w.agents, agents(&["alice"]));
     }
 
@@ -1050,7 +1012,7 @@ mod tests {
             Some(&g),
         );
         assert_eq!(w.role, WaitingRole::Master);
-        assert_eq!(w.reason, WaitingReason::ReadyToFinish);
+        assert_eq!(w.reason, WaitingReason::ReadyToMoveForward);
     }
 
     #[test]

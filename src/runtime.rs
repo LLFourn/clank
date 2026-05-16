@@ -763,7 +763,7 @@ mod tests {
             .unwrap()
             .unwrap();
         let v = get_context_response(&snapshot, &AgentLabel::from("master".to_string())).unwrap();
-        assert_eq!(v["waiting_on"]["reason"], "ready_to_implement");
+        assert_eq!(v["waiting_on"]["reason"], "ready_to_move_forward");
 
         let events = rt.live_events_snapshot().await;
         assert!(events.iter().any(|e| e.kind == "feedback_changed"));
@@ -813,7 +813,7 @@ mod tests {
             .unwrap();
         let v = get_context_response(&snapshot, &AgentLabel::from("master".to_string())).unwrap();
         // Gate falls back to no participants → reviewers / plan_needs_initial_review.
-        assert_eq!(v["waiting_on"]["reason"], "plan_needs_initial_review");
+        assert_eq!(v["waiting_on"]["reason"], "commit_needs_review");
     }
 
     // (flat_drop_feedback_is_auto_organized test removed in phase 2.4 —

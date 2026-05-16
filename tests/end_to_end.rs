@@ -133,7 +133,7 @@ async fn home_renders_plan_list() {
     assert!(body.contains("\"foo\""), "plan list should include 'foo'");
     assert!(body.contains("\"planning\""), "phase should be 'planning'");
     assert!(
-        body.contains("plan_needs_initial_review"),
+        body.contains("commit_needs_review"),
         "should describe waiting on reviewers; got: {}",
         body
     );
@@ -187,7 +187,7 @@ async fn mcp_get_context_via_internal_tool_call() {
     assert_eq!(result["phase"], "planning");
     assert_eq!(result["plan_worktree_status"], "clean");
     assert_eq!(result["waiting_on"]["role"], "reviewers");
-    assert_eq!(result["waiting_on"]["reason"], "plan_needs_initial_review");
+    assert_eq!(result["waiting_on"]["reason"], "commit_needs_review");
 }
 
 #[tokio::test]
