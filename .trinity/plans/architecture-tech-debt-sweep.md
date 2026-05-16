@@ -443,6 +443,10 @@ distinct.
   timeline events, live events) replaced with typed enum variants.
   Every remaining `Option` answers a real "absence is meaningful"
   question.
+- `wait_for_work` timeout cap (`MAX_TIMEOUT_SECS = 300`) removed
+  from daemon and shim; default raised from 60s to 1800s
+  (30 minutes). Trinity stops imposing a semantic timeout ceiling
+  on its blocking coordination primitive.
 - `Phase` and `TimelinePhase` enums deleted (folded into
   `CommitKind`-derived posture); coordinated with `wfw-alias §12`
   for `PlanState::Done`.
@@ -496,6 +500,17 @@ unless a *measured* problem appears:
 
 ## Phases
 
+**Execution policy: one sweep, no per-phase pauses.** This plan
+is meant to be implemented end-to-end in a single pass. Do not
+stop for review or approval between phases. Do not request feedback
+after each phase, do not move the plan to `done/` early, and do
+not break the sweep into separately-merged PRs unless a phase
+literally cannot land without an out-of-band dependency. The
+phase numbering is a *recommended ordering* (so dependencies are
+honoured), not a checkpoint cadence. Reviewers grade the whole
+sweep against the Acceptance Criteria at the end; intermediate
+state will look incomplete by design.
+
 Phases form a recommended order with explicit dependencies. The
 ordering is: **Phase 1 (typed IDs) is independent and should land
 first**; **Phase 2 (retire `ReviewGateDecision`) is independent of
@@ -510,8 +525,9 @@ but overlaps with Phase 9 on TimelineEvent shape — sequence 8 → 9
 to avoid touching TimelineEvent twice**; **Phase 9 (`Phase` enum
 deletion) interacts with `wfw-alias §12` and the ordering is
 specified below**; **Phase 10 (frontend feedback unification)
-depends on Phase 9**; **Phase 11 (test-file split, mandatory)
-lands last**.
+depends on Phase 9**; **Phase 11 (`wait_for_work` timeout cap +
+default) is independent**; **Phase 12 (test-file split,
+mandatory) lands last**.
 
 ### Phase 1 — Strong-typed ID validation (three sub-steps)
 
@@ -801,7 +817,43 @@ has already been touched once.
   `#[serde(deny_unknown_fields)]` per struct and fix any genuinely
   unused fields surfaced by `cargo check`.
 
-### Phase 11 — `tests/end_to_end.rs` split + injectable test home
+### Phase 11 — `wait_for_work`: remove timeout cap, raise default to 30m
+
+`server/wait.rs:29-30` defines
+`const DEFAULT_TIMEOUT_SECS: u64 = 60;` and
+`const MAX_TIMEOUT_SECS: u64 = 300;`. The request handler
+`.clamp(1, MAX_TIMEOUT_SECS)`'s the caller's `timeout_secs`. The
+MCP shim repeats the same 300s limit at
+`src/mcp_shim/mod.rs:317-322`, and the tool schema text at
+`src/tools.rs:119` still documents `timeout_secs (optional,
+1–300, default 60)`. `wait_for_work` is the blocking
+coordination primitive — capping it at 5 minutes forces agents
+into pointless polling loops, and a 60-second default means
+agents fall out and re-call far more often than necessary.
+
+Work:
+- Change `DEFAULT_TIMEOUT_SECS` from `60` to `1800` (30 minutes).
+- Delete `MAX_TIMEOUT_SECS` from `server/wait.rs`.
+- Replace `.clamp(1, MAX_TIMEOUT_SECS)` with `.max(1)`.
+- Update the MCP shim's per-request transport-timeout derivation
+  (`mcp_shim/mod.rs:317-322`) to use the requested timeout
+  directly (with the same +30s transport grace) and update its
+  default-fill from `unwrap_or(60)` to `unwrap_or(1800)`.
+- Update the tool description in `src/tools.rs` to drop the
+  `1–300` text and say "positive seconds, default 1800
+  (30 minutes)".
+- Update the daemon-side schema in
+  `src/server/wait.rs` (`maximum: 300` if present in the
+  generated JSON Schema; bump default).
+- Add at least one test that passes `timeout_secs` above 300 and
+  asserts the daemon waits for the full duration rather than
+  rewriting it to 300.
+
+Note: client-side transport stacks (reqwest, hyper, etc.) may
+have their own timeouts. Those are outside this plan; Trinity
+itself should not impose a semantic cap.
+
+### Phase 12 — `tests/end_to_end.rs` split + injectable test home
 
 **Mandatory**, not optional. A 1707-line e2e file plus a global
 `$HOME` mutex *is* architecture debt — exactly what this plan is
@@ -902,7 +954,13 @@ post-sweep tree. Reviewers should grep for each.
    HTTP wait-for-work all consume the same resolver.
 10. **`runtime.rs` `self_writes` ring deleted** along with its two
     methods.
-11. **`tests/end_to_end.rs` split into themed files** under
+11. **`wait_for_work` timeout cap removed.** `MAX_TIMEOUT_SECS`
+    deleted from `server/wait.rs`; no `.clamp(1, 300)` or
+    `.clamp(1, MAX_TIMEOUT_SECS)` remains for `wait_for_work` in
+    daemon or shim. Tool description says "positive seconds,
+    default 1800 (30 minutes)". Default raised to 1800. A test
+    asserts a timeout above 300 is accepted without rewriting.
+12. **`tests/end_to_end.rs` split into themed files** under
     `tests/`, with `HOME_LOCK` mutex removed in favour of an
     injected test-home struct field.
 
