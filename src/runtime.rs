@@ -395,6 +395,7 @@ impl Runtime {
                         parsed.author.clone(),
                         body,
                     );
+                    refresh_commits_for(state, &session_id);
                     let plan_state = state.plans.get(&session_id).map(|p| p.state);
                     let plan_id = plan_id_for(repo_root, &session_id);
                     self.push_event(
@@ -420,6 +421,7 @@ impl Runtime {
                     return Ok(());
                 };
                 upsert_feedback(session, abs_path, parsed, body);
+                refresh_commits_for(state, &session_id);
                 let plan_state = state.plans.get(&session_id).map(|p| p.state);
                 let plan_id = plan_id_for(repo_root, &session_id);
                 self.push_event(
@@ -448,6 +450,7 @@ impl Runtime {
                     return Ok(());
                 };
                 remove_feedback(session, &parsed);
+                refresh_commits_for(state, &session_id);
                 let plan_state = state.plans.get(&session_id).map(|p| p.state);
                 let plan_id = plan_id_for(repo_root, &session_id);
                 self.push_event(
@@ -754,6 +757,28 @@ fn remove_feedback(session: &mut Plan, parsed: &crate::disk_format::FeedbackPath
                 .held_plan_feedback
                 .retain(|h| h.author != parsed.author);
         }
+    }
+}
+
+/// Rebuild `Plan.commits` for one plan from the legacy feedback maps.
+/// Called from the signal handlers after every legacy-map mutation so
+/// `Plan.commits` stays in sync between full rebuilds. Phase 2.3 will
+/// rip out the legacy maps and have these mutations write to
+/// `Plan.commits` directly — at which point this helper goes away.
+fn refresh_commits_for(state: &mut crate::repo_state::RepoState, plan_key: &PlanKey) {
+    let Some(plan) = state.plans.get(plan_key) else {
+        return;
+    };
+    let new_commits = crate::projection::build_commit_gates(
+        plan_key,
+        &state.commit_order,
+        &state.plan_touches,
+        &state.attribution,
+        &plan.plan_feedback,
+        &plan.impl_feedback,
+    );
+    if let Some(plan) = state.plans.get_mut(plan_key) {
+        plan.commits = new_commits;
     }
 }
 

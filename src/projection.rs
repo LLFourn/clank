@@ -191,9 +191,7 @@ fn waiting_from_gate(gate: Option<&ReviewGateDecision>, phase: GatePhase) -> Wai
 pub fn last_activity_ts_for(
     plan_key: &crate::lifecycle::PlanKey,
     plan_intro: &CommitSha,
-    plan_feedback: &BTreeMap<(CommitSha, AgentLabel), Feedback>,
-    impl_feedback: &BTreeMap<(CommitSha, AgentLabel), Feedback>,
-    held_plan_feedback: &[crate::repo_state::HeldFeedback],
+    commits: &BTreeMap<CommitSha, CommitGate>,
     commit_order: &[CommitSha],
     plan_touches: &BTreeMap<
         CommitSha,
@@ -219,14 +217,10 @@ pub fn last_activity_ts_for(
             max_ts = max_ts.max(meta.author_ts);
         }
     }
-    for fb in plan_feedback.values() {
-        max_ts = max_ts.max(fb.created_at);
-    }
-    for fb in impl_feedback.values() {
-        max_ts = max_ts.max(fb.created_at);
-    }
-    for held in held_plan_feedback {
-        max_ts = max_ts.max(held.created_at);
+    for gate in commits.values() {
+        for fb in gate.feedback.values() {
+            max_ts = max_ts.max(fb.created_at);
+        }
     }
     if let Some(intro_meta) = commit_meta.get(plan_intro) {
         max_ts = max_ts.max(intro_meta.author_ts);
@@ -371,16 +365,17 @@ pub fn latest_impl_commit_for(
         .last()
 }
 
-/// Plan-phase review gate built from the session's `plan_feedback`
-/// targeting the current plan commit. Returns `None` if the session has
-/// no plan-touching commits yet.
+/// Plan-phase review gate. Projects the `CommitGate` for the latest
+/// plan-touching commit into a `ReviewGateDecision`. Returns `None`
+/// if the session has no plan-touching commits, or if the latest
+/// plan-touching commit is non-reviewable (e.g. a `done_move`).
 pub fn plan_gate_for(
     plan: &Plan,
     state: &crate::repo_state::RepoState,
 ) -> Option<ReviewGateDecision> {
     plan_gate_for_parts(
         &plan.id,
-        &plan.plan_feedback,
+        &plan.commits,
         &state.commit_order,
         &state.plan_touches,
     )
@@ -389,7 +384,7 @@ pub fn plan_gate_for(
 /// Same as `plan_gate_for` but over primitive inputs.
 pub fn plan_gate_for_parts(
     plan_key: &crate::lifecycle::PlanKey,
-    plan_feedback: &BTreeMap<(CommitSha, AgentLabel), Feedback>,
+    commits: &BTreeMap<CommitSha, CommitGate>,
     commit_order: &[CommitSha],
     plan_touches: &BTreeMap<
         CommitSha,
@@ -397,23 +392,19 @@ pub fn plan_gate_for_parts(
     >,
 ) -> Option<ReviewGateDecision> {
     let current_target = latest_plan_touching_commit_for(plan_key, commit_order, plan_touches)?;
-    Some(derive_gate_from_feedback(
-        ReviewPhase::Plan,
-        &current_target,
-        plan_feedback,
-    ))
+    let gate = commits.get(&current_target)?;
+    Some(commit_gate_to_review_decision(ReviewPhase::Plan, gate))
 }
 
-/// Implementation-phase review gate built from the session's
-/// `impl_feedback` targeting the latest impl commit. Returns `None` if
-/// the session has no impl commits yet.
+/// Implementation-phase review gate. Projects the `CommitGate` for
+/// the latest code-changing commit attributed to this plan.
 pub fn impl_gate_for(
     plan: &Plan,
     state: &crate::repo_state::RepoState,
 ) -> Option<ReviewGateDecision> {
     impl_gate_for_parts(
         &plan.id,
-        &plan.impl_feedback,
+        &plan.commits,
         &state.commit_order,
         &state.attribution,
     )
@@ -422,85 +413,35 @@ pub fn impl_gate_for(
 /// Same as `impl_gate_for` but over primitive inputs.
 pub fn impl_gate_for_parts(
     plan_key: &crate::lifecycle::PlanKey,
-    impl_feedback: &BTreeMap<(CommitSha, AgentLabel), Feedback>,
+    commits: &BTreeMap<CommitSha, CommitGate>,
     commit_order: &[CommitSha],
     attribution: &BTreeMap<CommitSha, AttributionResult>,
 ) -> Option<ReviewGateDecision> {
     let current_target = latest_impl_commit_for(plan_key, commit_order, attribution)?;
-    Some(derive_gate_from_feedback(
-        ReviewPhase::Impl,
-        &current_target,
-        impl_feedback,
-    ))
+    let gate = commits.get(&current_target)?;
+    Some(commit_gate_to_review_decision(ReviewPhase::Impl, gate))
 }
 
-/// Build a `ReviewGateDecision` directly from the session's in-memory
-/// feedback map, using SHA-anchored verdicts.
-fn derive_gate_from_feedback(
-    phase: ReviewPhase,
-    current_target: &CommitSha,
-    feedback: &BTreeMap<(CommitSha, AgentLabel), Feedback>,
-) -> ReviewGateDecision {
-    let mut participants: Vec<AgentLabel> = Vec::new();
-    let mut approvals: Vec<AgentLabel> = Vec::new();
-    let mut request_changes: Vec<AgentLabel> = Vec::new();
-    let mut unmarked: Vec<AgentLabel> = Vec::new();
-    let mut current_approvers: std::collections::BTreeSet<AgentLabel> =
-        std::collections::BTreeSet::new();
-    let mut current_blockers: std::collections::BTreeSet<AgentLabel> =
-        std::collections::BTreeSet::new();
-
-    for ((target_sha, author), fb) in feedback {
-        if matches!(
-            fb.verdict,
-            crate::repo_state::Verdict::Approve | crate::repo_state::Verdict::RequestChanges
-        ) && !participants.contains(author)
-        {
-            participants.push(author.clone());
-        }
-        if target_sha == current_target {
-            match fb.verdict {
-                crate::repo_state::Verdict::Approve => {
-                    current_approvers.insert(author.clone());
-                }
-                crate::repo_state::Verdict::RequestChanges => {
-                    current_blockers.insert(author.clone());
-                }
-                crate::repo_state::Verdict::Unmarked => {
-                    if !unmarked.contains(author) {
-                        unmarked.push(author.clone());
-                    }
-                }
-            }
-        }
-    }
-
-    approvals.extend(current_approvers);
-    request_changes.extend(current_blockers);
-
-    let missing: Vec<AgentLabel> = participants
-        .iter()
-        .filter(|p| !approvals.contains(p) && !request_changes.contains(p))
-        .cloned()
-        .collect();
-
-    let state = if !request_changes.is_empty() {
-        ReviewGateState::ChangesRequested
-    } else if !approvals.is_empty() && missing.is_empty() {
-        ReviewGateState::Ready
-    } else {
-        ReviewGateState::NeedsReview
-    };
-
+/// Project a `CommitGate` into the legacy `ReviewGateDecision` shape
+/// for callers that still consume the latter. Bridge between the
+/// commit-keyed storage (`Plan.commits`) and the per-phase gate
+/// representation that `waiting_on` and the existing MCP response
+/// shape expect. Phase 2.3 will collapse callers onto `CommitGate`
+/// directly and delete this bridge.
+fn commit_gate_to_review_decision(phase: ReviewPhase, gate: &CommitGate) -> ReviewGateDecision {
     ReviewGateDecision {
         phase,
-        state,
+        state: match gate.state {
+            CommitGateState::ChangesRequested => ReviewGateState::ChangesRequested,
+            CommitGateState::Approved => ReviewGateState::Ready,
+            CommitGateState::Unreviewed => ReviewGateState::NeedsReview,
+        },
         approval_rule: "all_participants",
-        participants,
-        approvals,
-        request_changes,
-        unmarked,
-        missing_approvals: missing,
+        participants: gate.participants.clone(),
+        approvals: gate.approvers.clone(),
+        request_changes: gate.requesters.clone(),
+        unmarked: gate.ambiguous.clone(),
+        missing_approvals: gate.missing.clone(),
     }
 }
 
@@ -734,13 +675,16 @@ pub fn build_commit_gates(
         let mut ambiguous: Vec<AgentLabel> = Vec::new();
         let mut feedback: BTreeMap<AgentLabel, Feedback> = BTreeMap::new();
 
-        // Union feedback on this SHA from both legacy maps. Phase 1
-        // reads from the dual maps; phase 2 will collapse them to
-        // one disk path. If the same (sha, author) pair somehow
-        // exists in both maps (shouldn't, since each disk file lives
-        // under exactly one of `plan/` or `impl/`), the later
-        // insert wins — that's `impl_feedback` here, matching
-        // BTreeMap's insertion semantics.
+        // Union feedback on this SHA from both legacy maps. Each
+        // disk file lives under exactly one of `plan/` or `impl/`,
+        // but the same (sha, author) key CAN appear in both maps if
+        // a reviewer dropped files in both subtrees (degenerate;
+        // structurally impossible after phase 2.3 collapses the disk
+        // layout). When that happens, `impl_feedback` wins by virtue
+        // of being the second insert. The pre-2.1 fold would have
+        // categorized the author into BOTH gate buckets (e.g. both
+        // `approvers` and `requesters`); the new shape collapses to
+        // one entry. Going away with the legacy maps in 2.3.
         for ((target, author), fb) in plan_feedback {
             if target == sha {
                 feedback.insert(author.clone(), fb.clone());
@@ -1182,16 +1126,28 @@ mod tests {
         }
     }
 
-    fn fb(target: &str, author: &str, created_at: i64) -> ((CommitSha, AgentLabel), Feedback) {
-        (
-            (cs(target), AgentLabel::from(author)),
-            Feedback {
-                path: std::path::PathBuf::from("/fake"),
-                body: String::new(),
-                verdict: crate::repo_state::Verdict::Unmarked,
-                created_at,
-            },
-        )
+    fn gate_with_feedback(items: &[(&str, i64)]) -> CommitGate {
+        let mut feedback = BTreeMap::new();
+        for (author, created_at) in items {
+            feedback.insert(
+                AgentLabel::from((*author).to_string()),
+                Feedback {
+                    path: std::path::PathBuf::from("/fake"),
+                    body: String::new(),
+                    verdict: crate::repo_state::Verdict::Unmarked,
+                    created_at: *created_at,
+                },
+            );
+        }
+        CommitGate {
+            state: CommitGateState::Unreviewed,
+            participants: Vec::new(),
+            approvers: Vec::new(),
+            requesters: Vec::new(),
+            ambiguous: Vec::new(),
+            missing: Vec::new(),
+            feedback,
+        }
     }
 
     #[test]
@@ -1204,8 +1160,6 @@ mod tests {
             &pk("foo"),
             &cs("c1"),
             &BTreeMap::new(),
-            &BTreeMap::new(),
-            &[],
             &[cs("c1")],
             &touches,
             &BTreeMap::new(),
@@ -1222,15 +1176,12 @@ mod tests {
         let mut touches: BTreeMap<CommitSha, Vec<(PlanKey, PlanTouchKind)>> = BTreeMap::new();
         touches.insert(cs("c1"), vec![(pk("foo"), PlanTouchKind::Intro)]);
         touches.insert(cs("c2"), vec![(pk("foo"), PlanTouchKind::Revision)]);
-        let mut plan_fb = BTreeMap::new();
-        let (k, v) = fb("c1", "codex", 3_000);
-        plan_fb.insert(k, v);
+        let mut commits = BTreeMap::new();
+        commits.insert(cs("c1"), gate_with_feedback(&[("codex", 3_000)]));
         let ts = last_activity_ts_for(
             &pk("foo"),
             &cs("c1"),
-            &plan_fb,
-            &BTreeMap::new(),
-            &[],
+            &commits,
             &[cs("c1"), cs("c2")],
             &touches,
             &BTreeMap::new(),
@@ -1254,8 +1205,6 @@ mod tests {
             &pk("foo"),
             &cs("c1"),
             &BTreeMap::new(),
-            &BTreeMap::new(),
-            &[],
             &[cs("c1"), cs("c2")],
             &touches,
             &BTreeMap::new(),
@@ -1703,5 +1652,89 @@ mod tests {
         assert_eq!(fb.body, "APPROVE\n\nlooks good");
         assert_eq!(fb.path, PathBuf::from("/abs/codex.md"));
         assert_eq!(fb.created_at, 100);
+    }
+
+    #[test]
+    fn gates_feedback_map_carries_impl_feedback_too() {
+        // Symmetric to the previous test but on the impl_feedback
+        // path — both legacy maps must round-trip body/path/etc into
+        // CommitGate.feedback.
+        let touches = BTreeMap::new();
+        let mut attribution = BTreeMap::new();
+        attribution.insert(cs("a"), attributed("foo", None, true));
+        let mut impl_feedback = BTreeMap::new();
+        impl_feedback.insert(
+            (cs("a"), al("alice")),
+            Feedback {
+                path: PathBuf::from("/abs/alice.md"),
+                body: "REQUEST_CHANGES\n\nfix it".to_string(),
+                verdict: Verdict::RequestChanges,
+                created_at: 250,
+            },
+        );
+
+        let gates = build_commit_gates(
+            &pk("foo"),
+            &[cs("a")],
+            &touches,
+            &attribution,
+            &BTreeMap::new(),
+            &impl_feedback,
+        );
+
+        let g = gates.get(&cs("a")).expect("gate for a");
+        let fb = g.feedback.get(&al("alice")).expect("alice feedback");
+        assert_eq!(fb.verdict, Verdict::RequestChanges);
+        assert_eq!(fb.body, "REQUEST_CHANGES\n\nfix it");
+        assert_eq!(fb.path, PathBuf::from("/abs/alice.md"));
+        assert_eq!(fb.created_at, 250);
+    }
+
+    #[test]
+    fn gates_feedback_collision_impl_wins() {
+        // Degenerate input: same (sha, author) in both legacy maps
+        // (a reviewer dropped two files under `plan/<sha>/` and
+        // `impl/<sha>/`). The 2.1 fold collapses to one entry per
+        // author; `impl_feedback` is inserted second and wins. This
+        // case is structurally impossible after phase 2.3 but the
+        // test pins the precedence until then so a refactor can't
+        // silently flip it.
+        let mut touches = BTreeMap::new();
+        touches.insert(cs("a"), touches_one("foo", PlanTouchKind::Intro));
+        let mut attribution = BTreeMap::new();
+        attribution.insert(cs("a"), attributed("foo", Some(PlanTouchKind::Intro), true));
+        let mut plan_feedback = BTreeMap::new();
+        plan_feedback.insert(
+            (cs("a"), al("codex")),
+            Feedback {
+                path: PathBuf::from("/abs/plan.md"),
+                body: "REQUEST_CHANGES".to_string(),
+                verdict: Verdict::RequestChanges,
+                created_at: 100,
+            },
+        );
+        let mut impl_feedback = BTreeMap::new();
+        impl_feedback.insert(
+            (cs("a"), al("codex")),
+            Feedback {
+                path: PathBuf::from("/abs/impl.md"),
+                body: "APPROVE".to_string(),
+                verdict: Verdict::Approve,
+                created_at: 200,
+            },
+        );
+
+        let gates = build_commit_gates(
+            &pk("foo"),
+            &[cs("a")],
+            &touches,
+            &attribution,
+            &plan_feedback,
+            &impl_feedback,
+        );
+        let g = gates.get(&cs("a")).expect("gate for a");
+        let fb = g.feedback.get(&al("codex")).expect("codex feedback");
+        assert_eq!(fb.verdict, Verdict::Approve);
+        assert_eq!(fb.path, PathBuf::from("/abs/impl.md"));
     }
 }

@@ -512,9 +512,7 @@ async fn api_repos_list(State(state): State<AppState>) -> Result<axum::Json<Valu
             let ts = crate::projection::last_activity_ts_for(
                 &plan.id,
                 &plan.plan_intro,
-                &plan.plan_feedback,
-                &plan.impl_feedback,
-                &plan.held_plan_feedback,
+                &plan.commits,
                 &repo_state.commit_order,
                 &repo_state.plan_touches,
                 &repo_state.attribution,

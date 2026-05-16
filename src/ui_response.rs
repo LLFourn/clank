@@ -87,13 +87,13 @@ fn plans_index_parts(
         let plan_phase = phase_for(&plan.plan_path, &plan.id, &snapshot.attribution);
         let plan_gate = plan_gate_for_parts(
             &plan.id,
-            &plan.plan_feedback,
+            &plan.commits,
             &snapshot.commit_order,
             &snapshot.plan_touches,
         );
         let impl_gate = impl_gate_for_parts(
             &plan.id,
-            &plan.impl_feedback,
+            &plan.commits,
             &snapshot.commit_order,
             &snapshot.attribution,
         );
@@ -111,9 +111,7 @@ fn plans_index_parts(
         let last_activity_ts = crate::projection::last_activity_ts_for(
             &plan.id,
             &plan.plan_intro,
-            &plan.plan_feedback,
-            &plan.impl_feedback,
-            &plan.held_plan_feedback,
+            &plan.commits,
             &snapshot.commit_order,
             &snapshot.plan_touches,
             &snapshot.attribution,
@@ -168,13 +166,13 @@ pub fn plan_page_with_reader(
     let plan_phase = phase_for(&plan.plan_path, &plan.id, &bundle.attribution);
     let plan_gate = plan_gate_for_parts(
         &plan.id,
-        &plan.plan_feedback,
+        &plan.commits,
         &bundle.commit_order,
         &bundle.plan_touches,
     );
     let impl_gate = impl_gate_for_parts(
         &plan.id,
-        &plan.impl_feedback,
+        &plan.commits,
         &bundle.commit_order,
         &bundle.attribution,
     );
