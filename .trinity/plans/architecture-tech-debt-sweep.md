@@ -113,6 +113,30 @@ each `CommitGate` into the legacy `ReviewGateDecision` shape so that
 that should be deleted once callers move onto `&CommitGate` directly.
 It wasn't.
 
+**`runtime_snapshot.rs` is a parallel in-memory domain model.**
+`runtime_snapshot.rs:15` defines `RepoSnapshot` and line 27 defines
+`PlanSnapshot` — both mirror `RepoState`/`Plan` field-for-field.
+`RepoSnapshot::from_state` (line 50) clones every map while holding
+the runtime mutex; `to_repo_state` (line 63) then synthesizes a
+fake `RepoState` from the snapshot for response builders. This is
+exactly the kind of speculative defensive copy / parallel
+representation that the sans-io direction argues against — readers
+should borrow from the live `RepoState` under the mutex, or take
+narrow typed query DTOs, not clone the whole world and rebuild it.
+
+**WFW / get-context plan selection is split across surfaces.**
+The same conceptual "which plan?" question resolves differently in
+three places: MCP `wait_for_work` (`server/mcp.rs:48-88`) infers
+from caller cwd → single-active-plan; HTTP `/api/wait_for_work` and
+core `server/wait.rs:115-121` still reject empty `plan_id` outright;
+tests construct their own. The resulting bug (HTTP returns
+`plan_id is required` while MCP succeeds for the same daemon state)
+is a layering-violation symptom: the *policy* of how to resolve a
+selector is duplicated rather than centralized. Fix is a typed
+`PlanSelector` enum (`Explicit(PlanId) | InferFromCwd(Path) |
+InferFromRepoFilter(RepoBasename)`) consumed by one resolver, used
+by every entry point.
+
 ### Q2 — Repetition / ad-hoc patterns
 
 **Response builders are 95% duplicated.** The audit identified four
@@ -375,7 +399,14 @@ distinct.
 - `self_writes` ring deleted. Other `runtime.rs` extractions only
   if a concrete reason emerges.
 - Four `latest_*` delegators in `projection.rs` inlined at callers;
-  `commit_kind_for` accessible via a single-arg method on `Plan`.
+  `commit_kind_for` accessible via a single-arg method on `Plan`;
+  existing "Hot path" micro-optimization in `commit_kind_for`
+  collapsed to one clear expression.
+- `runtime_snapshot.rs` deleted; response builders read live
+  `&RepoState` directly or take narrow typed query DTOs (no
+  `to_repo_state()` compat bridge).
+- Unified `PlanSelector` resolver path consumed by MCP, HTTP, and
+  tests — no per-surface bespoke plan-id resolution.
 - `Phase` and `TimelinePhase` enums deleted (folded into
   `CommitKind`-derived posture); coordinated with `wfw-alias §12`
   for `PlanState::Done`.
@@ -386,7 +417,7 @@ distinct.
   (The `api_move_to_done` endpoint goes away with `wfw-alias §12`;
   any other state-mutating endpoints route through `Runtime`.)
 - Test harness injects `$HOME` instead of mutating it via a global
-  mutex.
+  mutex (mandatory final phase, not optional).
 
 ## Premature Optimization: Explicitly Rejected
 
@@ -435,10 +466,13 @@ first**; **Phase 2 (retire `ReviewGateDecision`) is independent of
 Phase 1** and can run in parallel; **Phase 3 (test helpers) depends
 on Phase 1's validated parsers**; **Phase 4 (runtime dead-code
 removal) is independent of all others**; **Phase 5 (walker collapse
-+ accessor) is independent**; **Phase 6 (`Phase` enum deletion)
-interacts with `wfw-alias §12` and the ordering is specified
-below**; **Phase 7 (frontend feedback unification) depends on Phase
-6**; **Phase 8 (test-file split) is last, optional**.
++ accessor + strip hot-path branch) is independent**; **Phase 6
+(delete `runtime_snapshot.rs`) is independent of 1-5 but touches
+response builders**; **Phase 7 (`PlanSelector` resolver) is
+independent**; **Phase 8 (`Phase` enum deletion) interacts with
+`wfw-alias §12` and the ordering is specified below**; **Phase 9
+(frontend feedback unification) depends on Phase 8**; **Phase 10
+(test-file split, mandatory) lands last**.
 
 ### Phase 1 — Strong-typed ID validation (three sub-steps)
 
@@ -456,9 +490,9 @@ sites; the call-site sweep is the bulk of the work. Split:
   - `AgentLabel`: non-empty, no `/`, no leading dot.
   - `ContentHash`: existing format (verify in code).
 - Keep `new` / `From<&str>` / `From<String>` working temporarily so
-  call-sites compile during the migration. No separate
-  `from_validated` escape hatch — callers that know the value is
-  valid use `parse(...).expect("invariant")`.
+  call-sites compile during the migration. Callers that know the
+  value is valid use `parse(...).expect("invariant")`. No
+  `from_validated` escape hatch.
 
 **1b — Migrate call-sites.**
 - Every call-site that currently uses `new` / `.into()` / `From`
@@ -475,8 +509,7 @@ sites; the call-site sweep is the bulk of the work. Split:
 **1c — Remove unchecked constructors; switch `serde::Deserialize`
 to validate.**
 - Delete `string_newtype!`'s `new` and `From<&str>` / `From<String>`
-  impls. The macro now produces only `parse` and the internal
-  `from_validated`.
+  impls. The macro now produces only `parse`.
 - Implement `serde::Deserialize` via `try_from = "&str"` so JSON
   inputs fail at deserialize time, not 20 lines into a handler.
 - Update `WaitArgs` (`server/wait.rs:33-54`) and any other
@@ -561,7 +594,7 @@ reason emerges (a unit test that can't reach the seam, a second
 caller, or a measured testability problem). 890 lines isn't
 sufficient justification on its own.
 
-### Phase 5 — Collapse parallel walkers (no memoization)
+### Phase 5 — Collapse parallel walkers + strip existing micro-opt
 
 - Replace the four `latest_*` delegators
   (`projection.rs:351-372`) with `.last()` at the two or three
@@ -573,11 +606,78 @@ sufficient justification on its own.
   Option<CommitKind>` (or a free fn that takes `(&Plan, &CommitSha,
   &Attribution)`), so callers stop having to assemble the four-arg
   call to `commit_kind_for`. The accessor still computes on the fly.
+- **Strip the existing "Hot path" micro-optimization in
+  `commit_kind_for`** (`projection.rs:617-621`). The
+  short-circuit-before-building-a-set branch saves microseconds
+  against a classifier that runs O(commits) per response. Collapse
+  to one expression:
+  ```rust
+  let distinct_plans_touched = touches
+      .map(|ts| ts.iter().map(|(k, _)| k)
+                  .collect::<BTreeSet<_>>().len())
+      .unwrap_or(0);
+  ```
 - **Explicitly NOT proposed**: memoizing `commit_kind_for` results
   into a `BTreeMap` on `RepoState`. The recomputation is cheap; the
   cache would be premature optimization.
 
-### Phase 6 — Delete `Phase` and `TimelinePhase`
+### Phase 6 — Delete `runtime_snapshot.rs`
+
+`RepoSnapshot` / `PlanSnapshot` / `PlanSnapshotBundle` are parallel
+domain shapes that clone the whole live state under the mutex, then
+synthesize fake `RepoState`s for response builders via
+`to_repo_state()`. The right shape is: response builders take the
+live `&RepoState` directly while holding the runtime read-lock, or
+take narrow query DTOs computed on the fly.
+
+- Move every consumer of `RepoSnapshot::from_state` /
+  `PlanSnapshotBundle::from_state_for` to take `&RepoState` (or a
+  borrowed `&Plan`) under the runtime read-lock for the duration
+  of the response build. If holding the lock across a response
+  is unacceptable, define a narrow `PlanQueryResult` typed DTO
+  (only the fields needed by that builder) and copy *just those*.
+- Delete `RepoSnapshot::to_repo_state`,
+  `PlanSnapshotBundle::to_repo_state`, and any other
+  compat-bridge methods. No long-term `to_repo_state()` shim.
+- Delete `runtime_snapshot.rs` once all callers migrate.
+
+### Phase 7 — Unified `PlanSelector` resolver
+
+Today the "which plan?" question resolves differently in MCP, HTTP,
+and tests:
+- MCP `wait_for_work` infers from cwd (`server/mcp.rs:48-88`).
+- HTTP `/api/wait_for_work` and core `server/wait.rs:115-121`
+  reject empty `plan_id`.
+- Tests construct their own.
+
+Work:
+- Define a typed `PlanSelector` enum in a shared module (probably
+  `lifecycle.rs` or a new `plan_selector.rs`):
+  ```rust
+  pub enum PlanSelector {
+      Explicit(PlanId),
+      InferFromCwd { cwd: PathBuf },
+      InferFromRepoFilter(RepoBasename),
+  }
+  ```
+- Define one resolver:
+  `pub fn resolve(selector: &PlanSelector, trinity: &Trinity)
+   -> Result<PlanId, PlanResolutionError>` where the error variants
+  cover `NoActivePlans`, `Ambiguous { candidates }`, and
+  `RepoNotWatched`.
+- Replace every entry point's bespoke resolution logic with one
+  call to the resolver:
+  - `server/mcp.rs` `resolve_plan_id`
+  - `server/wait.rs` plan_id check
+  - HTTP `/api/wait_for_work` handler
+  - `server/mcp.rs` `get_context`
+- If HTTP truly cannot resolve from cwd (the request has no notion
+  of caller cwd), encode that in the type: HTTP handlers construct
+  `PlanSelector::Explicit(...)` only, and the type-checker
+  prevents accidentally passing a cwd-inference variant. The split
+  becomes intentional rather than accidental.
+
+### Phase 8 — Delete `Phase` and `TimelinePhase`
 
 **Ordering with `wfw-alias §12`**: `wfw-alias §12` deletes
 `PlanState::Done`. This phase deletes `Phase` and `TimelinePhase`.
@@ -604,19 +704,19 @@ Work:
   same `Posture` value in, or (preferred) delete the field
   entirely and let the consumer derive it from the linked commit's
   kind. The frontend timeline rendering needs to follow whichever
-  choice this phase makes — coordinate with Phase 7.
+  choice this phase makes — coordinate with Phase 9.
 - Delete `Phase`, `phase_for`, `phase` from `repo_state.rs` /
   `projection.rs`; delete `TimelinePhase` from `repo_state.rs:292`.
 - Update the 12 call-sites in `mcp_response.rs`/`ui_response.rs`
   to read `posture` instead.
 
-### Phase 7 — Frontend feedback shape unification (depends on Phase 6)
+### Phase 9 — Frontend feedback shape unification (depends on Phase 8)
 
 The dependency: `TimelineEvent` row rendering touches the same
 component code as `FeedbackEntry`. Picking `CommitFeedback` as
 canonical means `target_sha` (which `FeedbackEntry` has and
 `CommitFeedback` doesn't) needs to be sourced from the commit's
-context. Doing this *after* Phase 6 means the timeline rendering
+context. Doing this *after* Phase 8 means the timeline rendering
 has already been touched once.
 
 - Pick `CommitFeedback` (`frontend/src/api.rs:101-109`) as canonical.
@@ -632,7 +732,12 @@ has already been touched once.
   `#[serde(deny_unknown_fields)]` per struct and fix any genuinely
   unused fields surfaced by `cargo check`.
 
-### Phase 8 — `tests/end_to_end.rs` split + injectable test home (optional)
+### Phase 10 — `tests/end_to_end.rs` split + injectable test home
+
+**Mandatory**, not optional. A 1707-line e2e file plus a global
+`$HOME` mutex *is* architecture debt — exactly what this plan is
+paying down. Lands last because it's the largest churn footprint,
+but it is part of the acceptance criteria.
 
 - Refactor the test harness so `$HOME` is injected via a struct
   field rather than mutated via `std::env::set_var`. The
@@ -641,9 +746,6 @@ has already been touched once.
   `tests/feedback_ingest.rs`, `tests/multi_repo.rs`.
 - Move shared setup (`init_repo`, `write_file`, `commit`) to
   `tests/common/mod.rs`.
-- Keep this phase last; it's pure code hygiene with no functional
-  win and a large churn footprint. The `HOME_LOCK` design smell is
-  the only structural win.
 
 ## Risks
 
@@ -664,15 +766,62 @@ has already been touched once.
   shape anyway. Either ordering is safe.
 - **Phase 4 is now small.** Dead-code removal only, no module
   split. Run the test suite once; no per-step coverage needed.
-- **Phase 6 ordering vs `wfw-alias §12`.** `Phase::Done` and
+- **Phase 6 (`runtime_snapshot.rs` deletion) widens the runtime
+  read-lock.** Today response builders take a snapshot under the
+  lock, release it, then build JSON. Switching to "build JSON
+  while holding the read-lock" lengthens the critical section.
+  If profiling later shows lock contention, revisit with a typed
+  query DTO that copies only the fields needed (not the world).
+  Don't reintroduce `RepoSnapshot`-style mirrors.
+- **Phase 8 ordering vs `wfw-alias §12`.** `Phase::Done` and
   `PlanState::Done` are two encodings of the same truth.
   Recommended sequence: §12 deletes `PlanState::Done` first, then
   this phase deletes `Phase` and `TimelinePhase`. If they land in
   the other order, leave `Phase::Done` until §12 takes it.
-- **Phase 6 wire field stability.** The internal type goes away
+- **Phase 8 wire field stability.** The internal type goes away
   but the wire field stays through the transition; reviewers
   should verify the call-site migration is exhaustive and that
   the wire string output is byte-identical pre- and post-deletion.
+
+## Acceptance Criteria
+
+The plan is not landed until all of the following hold against the
+post-sweep tree. Reviewers should grep for each.
+
+1. **No new derived caches on `RepoState`.** Specifically:
+   - No `commit_kinds: BTreeMap<...>` field or equivalent.
+   - No "kind cache", "phase cache", or memoized-projection field
+     added during the sweep.
+2. **Dead bridges deleted.**
+   - `ReviewGateDecision` (type + `commit_gate_to_review_decision`)
+     removed.
+   - `RepoSnapshot::to_repo_state`,
+     `PlanSnapshotBundle::to_repo_state`, and `runtime_snapshot.rs`
+     entirely removed.
+   - `TimelinePhase` enum removed.
+   - `Phase` enum removed (modulo §12 coordination — see Phase 8).
+3. **No `#[allow(dead_code)]` added to preserve old shapes.** The
+   sweep removes dead code; it doesn't tag it as kept-for-now.
+4. **No new compatibility shims** unless this plan names the
+   deletion phase that retires them.
+5. **No new feature flags** introduced for the test-helpers module
+   or any other component touched.
+6. **Grep checks pass** in every touched module: searches for
+   `Hot path`, `legacy`, `bridge`, and `phase` either return no
+   hits, or every remaining hit has a one-line comment justifying
+   why it stays.
+7. **Strong-typed constructors validate.** `cargo build` rejects
+   `CommitSha::new("hello")`, `PlanKey::new("../etc/passwd")`,
+   `AgentLabel::new("")`. JSON requests with malformed IDs fail at
+   deserialize.
+8. **One resolver path.** `PlanSelector` is the only type that
+   answers "which plan?"; `server/mcp.rs`, `server/wait.rs`, and
+   HTTP wait-for-work all consume the same resolver.
+9. **`runtime.rs` `self_writes` ring deleted** along with its two
+   methods.
+10. **`tests/end_to_end.rs` split into themed files** under
+    `tests/`, with `HOME_LOCK` mutex removed in favour of an
+    injected test-home struct field.
 
 ## Out of Scope (Explicit)
 
