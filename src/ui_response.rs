@@ -244,7 +244,12 @@ pub fn plan_page_with_reader(
     let plan_body_truncated = plan.body.chars().count() > 4000;
 
     // Commit-keyed wire shape — SPA reads feedback off here.
-    let commits_value = commits_array_rich(plan, &bundle.plan_touches, &bundle.attribution);
+    let commits_value = commits_array_rich(
+        plan,
+        &bundle.commit_order,
+        &bundle.plan_touches,
+        &bundle.attribution,
+    );
     let latest_relevant_commit = crate::projection::latest_reviewable_commit_for(
         &plan.id,
         &bundle.commit_order,
@@ -283,16 +288,24 @@ pub fn plan_page_with_reader(
 /// can render cards without further round-trips.
 fn commits_array_rich(
     plan: &PlanSnapshot,
+    commit_order: &[CommitSha],
     plan_touches: &BTreeMap<CommitSha, Vec<(crate::lifecycle::PlanKey, PlanTouchKind)>>,
     attribution: &BTreeMap<CommitSha, AttributionResult>,
 ) -> Vec<Value> {
     use crate::projection::commit_kind_for;
     let mut out = Vec::new();
-    for (sha, gate) in &plan.commits {
+    // Iterate `commit_order` (chronological) rather than `plan.commits`
+    // (BTreeMap, SHA-lex order). The SPA renders per-commit blocks in
+    // history order; sorting by SHA would surface them in random-looking
+    // order to the human reader.
+    for sha in commit_order {
         let kind = commit_kind_for(&plan.id, sha, plan_touches, attribution);
         if !kind.is_reviewable() {
             continue;
         }
+        let Some(gate) = plan.commits.get(sha) else {
+            continue;
+        };
         let feedback_array: Vec<Value> = gate
             .feedback
             .iter()

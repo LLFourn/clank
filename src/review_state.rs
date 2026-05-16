@@ -1,6 +1,8 @@
-//! Review verdict + gate types. Gate derivation lives in
-//! `mcp_response::derive_gate_from_feedback`, working over the in-memory
-//! `Session.plan_feedback` / `impl_feedback` maps.
+//! Review verdict + gate types. The active per-commit fold lives in
+//! `projection::build_commit_gates`, operating over a single
+//! commit-keyed feedback map (see plan-doc §"`CommitGate`").
+//! `ReviewGateDecision` is a projection shape that callers like
+//! `waiting_on` consume; it does not own state.
 
 use serde::Serialize;
 
@@ -89,10 +91,10 @@ impl ReviewGateDecision {
 }
 
 /// Per-commit gate state under the commit-centric review model.
-/// Successor to `ReviewGateDecision`: same fold idea, but keyed on a
-/// specific commit instead of "the latest plan/impl commit." Phase 1
-/// populates this from `plan_feedback ∪ impl_feedback`; phase 2 makes
-/// it authoritative.
+/// The authoritative store for review state — `Plan.commits` maps
+/// each reviewable commit SHA to one of these. `ReviewGateDecision`
+/// is a legacy projection shape that wraps this for the
+/// `waiting_on` pipeline.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CommitGateState {

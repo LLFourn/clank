@@ -83,9 +83,10 @@ pub fn MetaStrip(session: PlanDetail) -> impl IntoView {
 }
 
 /// Render the "Move plan to done/" action only when the master is in
-/// the `ready_to_finish` state. Posts to `/api/plan/{plan_id}/done`.
+/// the `ready_to_move_forward` state (renamed from `ready_to_finish`
+/// in phase 2.5a). Posts to `/api/plan/{plan_id}/done`.
 fn move_to_done_button(plan_id: &str, reason: &str) -> AnyView {
-    if reason != "ready_to_finish" {
+    if reason != "ready_to_move_forward" {
         return ().into_any();
     }
     let store = expect_context::<EventStore>();

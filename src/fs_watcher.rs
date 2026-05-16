@@ -62,7 +62,7 @@ pub fn path_to_signal(
         return Some(signal);
     }
 
-    // .trinity/feedback/<session>/<plan|impl>/[<sha>/]<author>.md
+    // .trinity/feedback/<plan-key>/commits/<sha>/<author>.md
     if let Ok(rest) = rel.strip_prefix(".trinity/feedback") {
         let parsed = parse_feedback_path(rest)?;
         return Some(match event_kind {

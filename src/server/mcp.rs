@@ -49,29 +49,36 @@ async fn wait_for_work(state: &AppState, req: &ToolCallRequest) -> Result<Value,
     let mut args: WaitArgs = serde_json::from_value(req.arguments.clone())
         .map_err(|e| ToolError::Invalid(format!("args: {e}")))?;
 
-    // Phase 2.9: plan_id is optional. When empty, infer from
-    // `repo` (or the caller's cwd). NoActives → timeout-family
-    // shape `{timed_out: true, no_active_plans: true}` to match
-    // the long-poll vocabulary. Ambiguous → structured error.
-    if args.plan_id.trim().is_empty() {
-        match resolve_plan_id(state, None, args.repo.as_deref(), &req.cwd).await? {
-            PlanIdResolution::Resolved(id) => {
-                args.plan_id = id.to_string();
-            }
-            PlanIdResolution::NoActives { repo } => {
-                return Ok(json!({
-                    "timed_out": true,
-                    "no_active_plans": true,
-                    "repo": repo.to_string_lossy(),
-                }));
-            }
-            PlanIdResolution::Ambiguous { candidates } => {
-                return Ok(json!({
-                    "error": "ambiguous_plan",
-                    "message": "multiple active plans; pass plan_id explicitly",
-                    "candidates": candidates,
-                }));
-            }
+    // Phase 2.9: plan_id is optional. `resolve_plan_id` normalizes
+    // blank → absent, so we can hand it whatever the caller sent
+    // (including `""`) without a pre-check here. NoActives →
+    // timeout-family shape `{timed_out: true, no_active_plans: true}`
+    // to match the long-poll vocabulary. Ambiguous → structured
+    // error.
+    match resolve_plan_id(
+        state,
+        Some(args.plan_id.as_str()),
+        args.repo.as_deref(),
+        &req.cwd,
+    )
+    .await?
+    {
+        PlanIdResolution::Resolved(id) => {
+            args.plan_id = id.to_string();
+        }
+        PlanIdResolution::NoActives { repo } => {
+            return Ok(json!({
+                "timed_out": true,
+                "no_active_plans": true,
+                "repo": repo.to_string_lossy(),
+            }));
+        }
+        PlanIdResolution::Ambiguous { candidates } => {
+            return Ok(json!({
+                "error": "ambiguous_plan",
+                "message": "multiple active plans; pass plan_id explicitly",
+                "candidates": candidates,
+            }));
         }
     }
 
@@ -409,11 +416,18 @@ pub async fn resolve_plan_id(
     repo_override: Option<&str>,
     cwd: &Path,
 ) -> Result<PlanIdResolution, ToolError> {
-    if let Some(raw) = plan_id_override {
+    // Normalize blank-string overrides to absent so callers can pass
+    // `args.plan_id.as_deref()` (Option<&str>) without having to
+    // pre-check the empty case. wait_for_work and get_context used to
+    // diverge on this — one trimmed, the other passed raw — and a
+    // schema-strict client sending `{"plan_id":""}` would hit
+    // `invalid_plan_id` on one and inference on the other.
+    if let Some(raw) = plan_id_override.map(str::trim).filter(|s| !s.is_empty()) {
         let id =
             PlanId::parse(raw).map_err(|e| ToolError::Invalid(format!("invalid plan_id: {e}")))?;
         return Ok(PlanIdResolution::Resolved(id));
     }
+    let repo_override = repo_override.map(str::trim).filter(|s| !s.is_empty());
 
     let repo_path = match repo_override {
         Some(raw) => resolve_repo_filter(state, raw, cwd).await?,

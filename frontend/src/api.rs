@@ -77,9 +77,9 @@ pub struct ReviewGate {
     pub missing_approvals: Vec<String>,
 }
 
-/// Per-commit gate state — the post-2.7 wire shape under
-/// `PlanDetail.commits[]`. UI consumers should prefer this over the
-/// legacy `plan_feedback` / `impl_feedback` split arrays.
+/// Per-commit gate state — the canonical wire shape under
+/// `PlanDetail.commits[]`. This is where the SPA reads gate
+/// state and feedback from.
 #[derive(Debug, Clone, Deserialize)]
 #[allow(dead_code)]
 pub struct CommitGate {
