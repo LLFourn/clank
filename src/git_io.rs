@@ -231,46 +231,6 @@ pub async fn first_added_commit(
 /// topologically earliest plan_intro requires a separate query. Trinity
 /// repos are small enough that walking from the root is cheap and avoids
 /// a correctness footgun.
-/// Plan stems that appear in `.trinity/finished/<stem>/<file>` history,
-/// regardless of whether the plan file still exists in HEAD. Used by
-/// `snapshot` to load plans that were finalized and then had their
-/// plan file deleted from HEAD; per monotone-finished those plans
-/// stay finished. The fold sets `frozen_at` and the rebuild step
-/// renders their body from that commit.
-pub async fn finalize_history_stems(
-    repo: &Path,
-) -> Result<std::collections::BTreeSet<PlanKey>, GitIoError> {
-    let stdout = run_ok(
-        repo,
-        &[
-            "log",
-            "--all",
-            "--diff-filter=A",
-            "--pretty=format:",
-            "--name-only",
-            "--",
-            ".trinity/finished/",
-        ],
-    )
-    .await?;
-    let mut out = std::collections::BTreeSet::new();
-    for line in stdout.lines() {
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
-        let path = PathBuf::from(line);
-        let Ok(rel) = path.strip_prefix(".trinity/finished") else {
-            continue;
-        };
-        let Some(parsed) = crate::disk_format::parse_finalize_path(rel) else {
-            continue;
-        };
-        out.insert(parsed.plan_key);
-    }
-    Ok(out)
-}
-
 pub async fn first_parent_commits(repo: &Path) -> Result<Vec<CommitMeta>, GitIoError> {
     let stdout = run_ok(
         repo,
@@ -578,19 +538,67 @@ pub async fn snapshot(repo_root: &Path) -> Result<DiskSnapshot, GitIoError> {
         });
     }
 
-    // History-rooted plans: stems that show up in `.trinity/finished/`
-    // history but no longer have a `.trinity/plans/<stem>.md` blob in
-    // HEAD. Per the monotone-finished invariant, a plan that was
-    // finalized stays finished even if its plan file is later deleted
-    // from HEAD. These plans are loaded with an empty body here; the
+    // Commit history along the first-parent chain. We walk it
+    // unconditionally because history-rooted finished plans
+    // (introduced + finalized + plan-file deleted) must be discovered
+    // from the same view of history the fold consumes — using
+    // `git log --all` would let stale branches leak placeholders that
+    // the first-parent fold never sees as frozen.
+    let metas = first_parent_commits(repo_root).await?;
+    let mut history: Vec<HistoryEntry> = Vec::with_capacity(metas.len());
+    let mut commit_meta: std::collections::BTreeMap<
+        CommitSha,
+        crate::disk_snapshot::CommitMetaEntry,
+    > = std::collections::BTreeMap::new();
+    for meta in metas {
+        let changes = diff_tree_changes(repo_root, &meta.sha).await?;
+        commit_meta.insert(
+            meta.sha.clone(),
+            crate::disk_snapshot::CommitMetaEntry {
+                author_ts: meta.author_ts,
+                subject: meta.subject,
+            },
+        );
+        history.push(HistoryEntry {
+            commit: meta.sha,
+            changes,
+        });
+    }
+
+    // History-rooted plans: stems that were finalized somewhere in
+    // first-parent history but no longer have a
+    // `.trinity/plans/<stem>.md` blob in HEAD. Per the
+    // monotone-finished invariant, those plans stay finished and stay
+    // visible in `list_plans`. Loaded here with empty body; the
     // rebuild step fills the body from the freeze commit's blob once
-    // the sans-IO fold sets `frozen_at`.
-    for stem in finalize_history_stems(repo_root).await? {
+    // `derive_state` sets `frozen_at`.
+    let mut history_finalize_stems: std::collections::BTreeSet<PlanKey> =
+        std::collections::BTreeSet::new();
+    for entry in &history {
+        for fc in &entry.changes.finalize_changes {
+            history_finalize_stems.insert(fc.plan_key.clone());
+        }
+    }
+    for stem in history_finalize_stems {
         if head_stems.contains(&stem) {
             continue;
         }
         let plan_path = PathBuf::from(format!(".trinity/plans/{}.md", stem.as_str()));
-        let Some(plan_intro) = first_added_commit(repo_root, &plan_path).await? else {
+        // Find the first commit in this first-parent history that
+        // introduced the plan file at the active path. Skip stems whose
+        // plan-file Intro never appears in the fold's history — those
+        // can't be sensibly anchored.
+        let Some(plan_intro) = history.iter().find_map(|entry| {
+            entry
+                .changes
+                .plan_touches
+                .iter()
+                .find(|t| {
+                    t.session == stem
+                        && matches!(t.kind, crate::repo_state::PlanTouchKind::Intro)
+                })
+                .map(|_| entry.commit.clone())
+        }) else {
             continue;
         };
         let plan_intro_parent = parent_of(repo_root, &plan_intro).await?;
@@ -602,34 +610,6 @@ pub async fn snapshot(repo_root: &Path) -> Result<DiskSnapshot, GitIoError> {
             plan_intro_parent,
         });
     }
-
-    // Commit history along the first-parent chain. Skip the walk
-    // entirely if there are no sessions — there's nothing to attribute.
-    let (history, commit_meta) = if plan_files.is_empty() {
-        (Vec::new(), std::collections::BTreeMap::new())
-    } else {
-        let metas = first_parent_commits(repo_root).await?;
-        let mut history_out = Vec::with_capacity(metas.len());
-        let mut meta_out: std::collections::BTreeMap<
-            CommitSha,
-            crate::disk_snapshot::CommitMetaEntry,
-        > = std::collections::BTreeMap::new();
-        for meta in metas {
-            let changes = diff_tree_changes(repo_root, &meta.sha).await?;
-            meta_out.insert(
-                meta.sha.clone(),
-                crate::disk_snapshot::CommitMetaEntry {
-                    author_ts: meta.author_ts,
-                    subject: meta.subject,
-                },
-            );
-            history_out.push(HistoryEntry {
-                commit: meta.sha,
-                changes,
-            });
-        }
-        (history_out, meta_out)
-    };
 
     // Feedback files in the working tree.
     let feedback_files = collect_feedback_files(repo_root)?;

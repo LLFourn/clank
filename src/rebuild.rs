@@ -202,4 +202,44 @@ mod tests {
         // Body renders from the freeze commit.
         assert_eq!(plan.body, "# foo body\n");
     }
+
+    #[tokio::test]
+    async fn finalize_on_off_chain_branch_does_not_leak_into_main() {
+        // Codex's stale-branch scenario: main adds and deletes a plan
+        // file without finalizing; an off-chain branch carries the
+        // finalize commit. The off-chain finalize must NOT discover a
+        // history-rooted placeholder for `foo` on main — main's first-
+        // parent fold never sees the freeze event, and the previous
+        // `git log --all` discovery would leak an empty-body active
+        // plan into `state.plans`.
+        let dir = init_repo();
+
+        // main: add foo, then delete foo. No finalize commit reachable
+        // from main.
+        write_file(dir.path(), ".trinity/plans/foo.md", "# foo\n");
+        commit(dir.path(), "Add foo on main");
+        std::fs::remove_file(dir.path().join(".trinity/plans/foo.md")).unwrap();
+        commit(dir.path(), "Delete foo on main");
+
+        // Sidebar branch: create a finalize commit reachable from no
+        // ancestor of main's HEAD.
+        run_git(dir.path(), &["checkout", "-q", "-b", "sidebar"]);
+        write_file(dir.path(), ".trinity/plans/foo.md", "# foo on sidebar\n");
+        commit(dir.path(), "Re-add foo on sidebar");
+        write_file(
+            dir.path(),
+            ".trinity/finished/foo/alice.md",
+            "APPROVE\n\nlgtm\n",
+        );
+        commit(dir.path(), "Finalize foo on sidebar");
+        run_git(dir.path(), &["checkout", "-q", "main"]);
+
+        let state = rebuild_repo(dir.path()).await.unwrap();
+        let key = PlanKey::parse("foo").unwrap();
+        assert!(
+            !state.plans.contains_key(&key),
+            "off-chain finalize must not leak a placeholder into main's projection; got {:?}",
+            state.plans.keys().map(|k| k.as_str()).collect::<Vec<_>>()
+        );
+    }
 }
