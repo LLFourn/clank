@@ -183,21 +183,62 @@ in `.trinity/finished/<stem>/`.
 If the plans file exists and the fold never reached a commit
 where the finalize rule held, the plan is `active`.
 
-**How to "un-finish" a plan**: you don't. Once the fold has
-frozen a plan, the daemon treats it as sealed for the life of
-the branch. To work on the same problem further:
+**How to "un-finish" a plan**: you don't, easily. Once the fold
+has frozen a plan, the daemon treats it as sealed for the life of
+the branch. The escape hatches:
 
-- give it a new name (`foo-v2.md`) — fresh plan, fresh history
-- or rewrite git history to remove the finalize commit (e.g.
-  `trinity purge --drop-finalize` or interactive rebase), at
-  which point the fold no longer sees the freeze event and the
-  plan is `active` again from a fresh rebuild
+- **Delete the plan file** (`git rm .trinity/plans/<stem>.md`).
+  The fold's plan-existence check at HEAD fails; the plan ceases
+  to exist (no `active`, no `finished`, no state). This is the
+  cleanest "this plan is over" signal — the dashboard stops
+  showing it.
+- **Give it a new name** (`foo-v2.md`) — fresh plan, fresh history,
+  fresh fold state. Original `foo` stays frozen as a historical
+  record.
+- **Rewrite history** to remove the finalize commit
+  (`trinity purge --drop-finalize` or interactive rebase). On a
+  fresh rebuild, the fold no longer sees the freeze event and
+  the plan is `active` again. Destructive — only do this on
+  branches you control.
 
 `git revert` of the finalize commit does NOT un-finish the
 plan: the revert is a new commit that removes the finished
 directory from the tree, but the original freeze event is still
 in history at the original commit. The fold replays from the
 beginning of history and freezes at the original finalize.
+
+**Snapshot content read after freeze.** The fold remembers
+`frozen_at: CommitSha` per frozen plan. When the SPA or any UI
+needs to render the finalize snapshot's contents (which reviewers
+approved? what did they write?), it reads from
+`git show <frozen_at>:.trinity/finished/<stem>/`, not from HEAD's
+working tree. This makes the rendered snapshot stable against
+post-freeze tree edits — if an operator deletes or modifies the
+snapshot files in a later commit, the daemon still shows the
+plan as `finished` (per the rule), and the UI still shows the
+original APPROVE files. HEAD's `.trinity/finished/<stem>/`
+contents are not authoritative for display once the plan is
+frozen; the freeze-time content is.
+
+**Re-finalize on a frozen plan.** `trinity finish` on a plan
+the daemon reports as `finished` MUST refuse with a clear
+message ("plan already finished; no re-finalize possible"). The
+CLI checks the daemon's projection state before doing any work.
+This is a daemon/CLI contract, captured in the trinity-cli stub
+and reflected in this plan's acceptance criteria for completeness
+(see criterion 17). A phantom finalize commit landing despite
+this — e.g., direct user `git` invocation — would be a tree
+change the fold ignores (plan already frozen at the prior
+finalize commit); no new gate, no state change, no projection
+update.
+
+**Post-freeze commits with `Implements: <frozen-plan>` trailers.**
+The fold attributes these as `CommitKind::Unattributed` — exactly
+what it does for any commit whose `Implements:` trailer points
+at an unknown plan. The commit is visible in the repo's overall
+commit history but does NOT appear in the frozen plan's timeline,
+gate, or attribution map. Same outcome the user would see today
+for a commit pointing at a nonexistent plan stem.
 
 Per-plan scope: every check is keyed on `<stem>`. A finalize for
 `foo` says nothing about `bar`.
@@ -219,14 +260,18 @@ in the cycle-history view but do not drive any waiting/gate state.
 
 The wire `state` field, currently `active | done`, becomes one of:
 
-- `active` — no finalize snapshot exists for this plan in HEAD
-- `finished` — finalize snapshot exists with at least one APPROVE
+- `active` — the fold has not frozen this plan (no prior chronological
+  commit satisfied the finalize rule)
+- `finished` — the fold has frozen this plan (`frozen_at: Some(_)`)
 
-`finished` is sticky from the daemon's perspective: once the
-snapshot is in HEAD, the plan stays `finished` until the snapshot
-is replaced (re-running `trinity finish`) or removed
-(`trinity purge` or manual deletion). New plan-attributed commits
-after a finalize do NOT auto-transition the plan back to `active`.
+Plans absent from `state.plans` (no plan file in HEAD) don't
+appear in `list_plans` at all — there's no third "deleted" wire
+state.
+
+`finished` is sticky: once the fold sets `frozen_at`, the plan
+stays `finished` for the life of the branch. Only a history
+rewrite that removes the freeze event, or deleting the plan file
+from HEAD (which removes the plan entirely), changes the state.
 The CLI is what catches "the snapshot is now stale relative to new
 work" — at the operator's request when they next run `trinity
 finish` — not the daemon.
@@ -865,9 +910,14 @@ Mention in docs; don't restrict.
      freeze happens there
    - removing `.trinity/finished/<stem>/` in a later commit
      (e.g. `git revert <finalize-sha>`) → STILL finished, NOT
-     un-frozen (monotone)
+     un-frozen (monotone). The plan-detail wire still renders
+     the snapshot contents read from `git show <frozen_at>:`
+   - modifying `.trinity/finished/<stem>/<agent>.md` in a later
+     commit (e.g. operator hand-edits the APPROVE files) → STILL
+     finished; the wire renders the freeze-time contents, not
+     HEAD's
    - removing `.trinity/plans/<stem>.md` from HEAD → plan
-     doesn't exist (no state at all)
+     doesn't exist (no state at all; absent from `list_plans`)
 9. **Sealing invariant (gating)**: once frozen, the plan is sealed
    end-to-end. Regression tests construct a repo with a freeze
    event at commit C and then add commits c1..cN after C that
@@ -918,9 +968,36 @@ Mention in docs; don't restrict.
     `current_posture` helper rather than reading a stored variant.
     No `Phase::Done` consumer remains.
 
+### CLI / daemon contract (a few items the daemon owes the CLI)
+
+17. **Re-finalize refusal exposed.** The daemon's plan-detail
+    response exposes `state: "finished"` so the CLI can refuse
+    re-finalize against an already-frozen plan. A `finish-preview`
+    endpoint (or equivalent — exact shape during implementation)
+    returns "would `trinity finish` succeed" + a structured
+    refusal reason when not, with `already_finished` as one
+    enumerated reason. Test: a frozen plan's `finish-preview`
+    returns the refusal reason; an active plan with a fully
+    approved gate returns "would succeed."
+18. **Snapshot rendering reads from `frozen_at`.** The daemon's
+    plan-detail and per-cycle endpoints render finalize-snapshot
+    file contents from `git show <frozen_at>:.trinity/finished/<stem>/`,
+    not from HEAD's tree. Test: with a frozen plan whose snapshot
+    files have been deleted from HEAD, the API still returns the
+    snapshot contents (read from `frozen_at`).
+19. **Post-freeze `Implements:` commits surface as `Unattributed`.**
+    A commit with `Implements: <frozen-plan>` after that plan
+    froze does not appear in the frozen plan's timeline or
+    attribution map. It's visible in any general-purpose commit
+    listing (where the projection emits it as
+    `CommitKind::Unattributed`), but the frozen plan's wire view
+    does not include it. Test: construct the scenario; assert
+    the frozen plan's timeline excludes the commit and its
+    attribution map does not contain a key for it.
+
 ### CLI work (separate stub)
 
-17. The CLI commands (`trinity init`, `trinity finish`,
+20. The CLI commands (`trinity init`, `trinity finish`,
     `trinity purge`), their flags, the history-rewriting engine,
     and the 14 `--purge` edge-case regression tests live in
     `.trinity/stubs/trinity-cli.md`. That stub's acceptance
