@@ -238,7 +238,7 @@ pub fn get_context_response_from_snapshot(
     });
     let write_feedback = review_target_sha.as_ref().map(|sha| {
         let rel = format!(
-            ".trinity/feedback/{session}/commits/{sha}/{author}.md",
+            ".trinity/feedback/{session}/{sha}/{author}.md",
             session = session.id.as_str(),
             sha = sha.as_str(),
             author = author_label.as_str(),
@@ -685,7 +685,7 @@ mod tests {
         // Use full SHA in the feedback path. Trinity in production will
         // tell agents the canonical (full-SHA) path via get_context;
         // prefix resolution at ingest is a future enhancement.
-        let feedback_rel = format!(".trinity/feedback/foo/commits/{}/codex.md", intro.as_str());
+        let feedback_rel = format!(".trinity/feedback/foo/{}/codex.md", intro.as_str());
         write_file(dir.path(), &feedback_rel, "REQUEST_CHANGES\n\nMissing X.\n");
 
         let state = rebuild_repo(dir.path()).await.unwrap();
@@ -707,7 +707,7 @@ mod tests {
         let intro = state0.plans[&PlanKey::parse("foo").unwrap()]
             .plan_intro
             .clone();
-        let feedback_rel = format!(".trinity/feedback/foo/commits/{}/alice.md", intro.as_str());
+        let feedback_rel = format!(".trinity/feedback/foo/{}/alice.md", intro.as_str());
         write_file(dir.path(), &feedback_rel, "APPROVE\n\nLGTM.\n");
 
         let state = rebuild_repo(dir.path()).await.unwrap();
@@ -733,7 +733,7 @@ mod tests {
         let intro = state0.plans[&PlanKey::parse("foo").unwrap()]
             .plan_intro
             .clone();
-        let feedback_rel = format!(".trinity/feedback/foo/commits/{}/alice.md", intro.as_str());
+        let feedback_rel = format!(".trinity/feedback/foo/{}/alice.md", intro.as_str());
         write_file(dir.path(), &feedback_rel, "APPROVE\n\nLGTM.\n");
 
         let state = rebuild_repo(dir.path()).await.unwrap();

@@ -1143,13 +1143,13 @@ mod wire_tests {
             .unwrap();
         for author in ["codex", "bob"] {
             let rel = format!(
-                ".trinity/feedback/foo/commits/{}/{}.md",
+                ".trinity/feedback/foo/{}/{}.md",
                 intro.as_str(),
                 author
             );
             write_file(dir.path(), &rel, "APPROVE\n");
             let parsed = crate::disk_format::parse_feedback_path(&std::path::PathBuf::from(
-                format!("foo/commits/{}/{}.md", intro.as_str(), author),
+                format!("foo/{}/{}.md", intro.as_str(), author),
             ))
             .unwrap();
             runtime
@@ -1185,12 +1185,12 @@ mod wire_tests {
             .await
             .unwrap();
         let codex_rel = format!(
-            ".trinity/feedback/foo/commits/{}/codex.md",
+            ".trinity/feedback/foo/{}/codex.md",
             revised.as_str()
         );
         write_file(dir.path(), &codex_rel, "APPROVE\n");
         let parsed = crate::disk_format::parse_feedback_path(&std::path::PathBuf::from(format!(
-            "foo/commits/{}/codex.md",
+            "foo/{}/codex.md",
             revised.as_str()
         )))
         .unwrap();

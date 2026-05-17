@@ -24,12 +24,10 @@ pub struct FeedbackPath {
 /// Parse a path relative to `<repo>/.trinity/feedback/` into a
 /// `FeedbackPath`. Expected shape:
 ///
-/// `<plan-key>/commits/<target-sha>/<author>.md`
+/// `<plan-key>/<target-sha>/<author>.md`
 ///
 /// Returns `None` for any other shape (a stray `.DS_Store`, the legacy
-/// `<plan-key>/{plan,impl}/<sha>/<author>.md` layout, a flat-drop path
-/// missing the SHA segment, etc.). Phase 2.4 cut over to the
-/// commit-keyed layout; the legacy paths are not parsed.
+/// `<plan-key>/commits/<sha>/<author>.md` layout, etc.).
 pub fn parse_feedback_path(rel: &Path) -> Option<FeedbackPath> {
     let segments: Vec<&std::ffi::OsStr> = rel
         .components()
@@ -40,7 +38,7 @@ pub fn parse_feedback_path(rel: &Path) -> Option<FeedbackPath> {
         .collect();
 
     let (session, sha_seg, file_seg) = match segments.as_slice() {
-        [session, kind, sha, file] if kind.to_str() == Some("commits") => (*session, *sha, *file),
+        [session, sha, file] => (*session, *sha, *file),
         _ => return None,
     };
 
@@ -61,6 +59,42 @@ pub fn parse_feedback_path(rel: &Path) -> Option<FeedbackPath> {
         author: AgentLabel::parse(author).ok()?,
         raw: rel.to_path_buf(),
     })
+}
+
+/// Detect the pre-event-log-and-finished feedback path shape
+/// `<plan-key>/commits/<target-sha>/<author>.md`. Used at watcher startup
+/// to surface a one-shot warning so operators don't silently lose
+/// in-flight feedback after the path rename.
+pub fn is_legacy_commits_feedback_path(rel: &Path) -> bool {
+    let segments: Vec<&std::ffi::OsStr> = rel
+        .components()
+        .filter_map(|c| match c {
+            Component::Normal(s) => Some(s),
+            _ => None,
+        })
+        .collect();
+    matches!(
+        segments.as_slice(),
+        [_session, kind, _sha, file]
+            if kind.to_str() == Some("commits")
+            && file.to_str().is_some_and(|s| s.ends_with(".md"))
+    )
+}
+
+/// Build the canonical relative feedback path
+/// `<plan-key>/<target-sha>/<author>.md` (the part under
+/// `.trinity/feedback/`).
+pub fn canonical_feedback_path(
+    plan_key: &PlanKey,
+    target_sha: &CommitSha,
+    author: &AgentLabel,
+) -> PathBuf {
+    PathBuf::from(format!(
+        "{}/{}/{}.md",
+        plan_key.as_str(),
+        target_sha.as_str(),
+        author.as_str()
+    ))
 }
 
 /// Plausible SHA-1 segment: hex string of length 7–40. Trinity accepts
@@ -98,8 +132,8 @@ mod tests {
     }
 
     #[test]
-    fn canonical_commit_keyed_path_parses() {
-        let parsed = parse_feedback_path(&p("foo/commits/abc1234/bob.md")).unwrap();
+    fn canonical_path_parses() {
+        let parsed = parse_feedback_path(&p("foo/abc1234/bob.md")).unwrap();
         assert_eq!(parsed.plan_key.as_str(), "foo");
         assert_eq!(parsed.target_sha.as_str(), "abc1234");
         assert_eq!(parsed.author.as_str(), "bob");
@@ -108,7 +142,7 @@ mod tests {
     #[test]
     fn full_sha_accepted() {
         let parsed = parse_feedback_path(&p(
-            "foo/commits/abcdef0123456789abcdef0123456789abcdef01/x.md",
+            "foo/abcdef0123456789abcdef0123456789abcdef01/x.md",
         ))
         .unwrap();
         assert_eq!(
@@ -119,27 +153,23 @@ mod tests {
 
     #[test]
     fn short_sha_below_minimum_rejected() {
-        assert!(parse_feedback_path(&p("foo/commits/abc012/x.md")).is_none());
+        assert!(parse_feedback_path(&p("foo/abc012/x.md")).is_none());
     }
 
     #[test]
     fn non_hex_sha_rejected() {
-        assert!(parse_feedback_path(&p("foo/commits/notasha1/x.md")).is_none());
+        assert!(parse_feedback_path(&p("foo/notasha1/x.md")).is_none());
     }
 
     #[test]
-    fn legacy_plan_segment_rejected() {
+    fn legacy_commits_segment_rejected() {
+        assert!(parse_feedback_path(&p("foo/commits/abc1234/alice.md")).is_none());
+    }
+
+    #[test]
+    fn legacy_plan_impl_segments_rejected() {
         assert!(parse_feedback_path(&p("foo/plan/abc1234/alice.md")).is_none());
         assert!(parse_feedback_path(&p("foo/impl/abc1234/alice.md")).is_none());
-    }
-
-    #[test]
-    fn legacy_flat_drop_rejected() {
-        // No-SHA shape is no longer parsed; flat-drop feedback has
-        // been retired with the held-feedback queue.
-        assert!(parse_feedback_path(&p("foo/plan/alice.md")).is_none());
-        assert!(parse_feedback_path(&p("foo/impl/alice.md")).is_none());
-        assert!(parse_feedback_path(&p("foo/commits/alice.md")).is_none());
     }
 
     #[test]
@@ -149,12 +179,35 @@ mod tests {
 
     #[test]
     fn extra_segments_rejected() {
-        assert!(parse_feedback_path(&p("foo/commits/abc1234/extra/x.md")).is_none());
+        assert!(parse_feedback_path(&p("foo/abc1234/extra/x.md")).is_none());
     }
 
     #[test]
     fn non_md_rejected() {
-        assert!(parse_feedback_path(&p("foo/commits/abc1234/alice.txt")).is_none());
+        assert!(parse_feedback_path(&p("foo/abc1234/alice.txt")).is_none());
+    }
+
+    #[test]
+    fn is_legacy_commits_feedback_path_detects_old_shape() {
+        assert!(is_legacy_commits_feedback_path(&p(
+            "foo/commits/abc1234/alice.md"
+        )));
+    }
+
+    #[test]
+    fn is_legacy_commits_feedback_path_rejects_new_shape() {
+        assert!(!is_legacy_commits_feedback_path(&p("foo/abc1234/alice.md")));
+    }
+
+    #[test]
+    fn canonical_feedback_path_builds_expected_shape() {
+        let key = PlanKey::parse("foo").unwrap();
+        let sha = CommitSha::parse("abc1234").unwrap();
+        let author = AgentLabel::parse("alice").unwrap();
+        assert_eq!(
+            canonical_feedback_path(&key, &sha, &author),
+            PathBuf::from("foo/abc1234/alice.md")
+        );
     }
 
     #[test]

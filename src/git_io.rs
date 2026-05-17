@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use tokio::process::Command;
 
 use crate::attribution::{CommitChanges, PlanTouch};
-use crate::disk_format::{parse_feedback_path, plan_path_is_done};
+use crate::disk_format::{is_legacy_commits_feedback_path, parse_feedback_path, plan_path_is_done};
 use crate::disk_snapshot::{DiskSnapshot, FeedbackBlob, HistoryEntry, PlanFileBlob};
 use crate::lifecycle::{CommitSha, PlanKey};
 use crate::repo_state::PlanTouchKind;
@@ -540,12 +540,21 @@ fn collect_feedback_files(repo_root: &Path) -> Result<Vec<FeedbackBlob>, GitIoEr
         detail: format!("{e}"),
     })?;
     let mut out = Vec::with_capacity(paths.len());
+    let mut legacy_count: usize = 0;
+    let mut legacy_example: Option<PathBuf> = None;
     for abs in paths {
         let Ok(rel) = abs.strip_prefix(&feedback_root) else {
             continue;
         };
-        let Some(parsed) = parse_feedback_path(rel) else {
-            continue;
+        let parsed = match parse_feedback_path(rel) {
+            Some(p) => p,
+            None => {
+                if is_legacy_commits_feedback_path(rel) {
+                    legacy_count += 1;
+                    legacy_example.get_or_insert_with(|| abs.clone());
+                }
+                continue;
+            }
         };
         let body = std::fs::read_to_string(&abs).map_err(|e| GitIoError::Parse {
             context: "read feedback file".into(),
@@ -558,6 +567,13 @@ fn collect_feedback_files(repo_root: &Path) -> Result<Vec<FeedbackBlob>, GitIoEr
             body,
             created_at,
         });
+    }
+    if legacy_count > 0 {
+        tracing::warn!(
+            count = legacy_count,
+            example = legacy_example.as_ref().map(|p| p.display().to_string()),
+            "feedback files at legacy `.trinity/feedback/<stem>/commits/<sha>/<agent>.md` path are not picked up; move to `.trinity/feedback/<stem>/<sha>/<agent>.md`"
+        );
     }
     Ok(out)
 }

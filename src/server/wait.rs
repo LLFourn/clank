@@ -468,12 +468,7 @@ fn derive_locations(cand: &Candidate, reason: WaitingReason, author: &AgentLabel
 }
 
 fn feedback_path(sid: &str, target: &CommitSha, author: &str) -> String {
-    format!(
-        ".trinity/feedback/{}/commits/{}/{}.md",
-        sid,
-        target.as_str(),
-        author
-    )
+    format!(".trinity/feedback/{}/{}/{}.md", sid, target.as_str(), author)
 }
 
 fn rc_feedback_paths(
@@ -627,7 +622,7 @@ mod tests {
             Some(crate::repo_state::CommitKind::PlanOnly),
         );
         let v = derive_locations(&c, WaitingReason::CommitNeedsReview, &me());
-        assert_eq!(v, vec![".trinity/feedback/sid/commits/abc123/codex.md"]);
+        assert_eq!(v, vec![".trinity/feedback/sid/abc123/codex.md"]);
     }
 
     #[test]
@@ -637,7 +632,7 @@ mod tests {
             Some(crate::repo_state::CommitKind::CodeOnly),
         );
         let v = derive_locations(&c, WaitingReason::CommitNeedsReview, &me());
-        assert_eq!(v, vec![".trinity/feedback/sid/commits/def456/codex.md"]);
+        assert_eq!(v, vec![".trinity/feedback/sid/def456/codex.md"]);
     }
 
     #[test]
@@ -662,8 +657,8 @@ mod tests {
         assert_eq!(
             v,
             vec![
-                ".trinity/feedback/sid/commits/a1a1/alice.md",
-                ".trinity/feedback/sid/commits/a1a1/bob.md",
+                ".trinity/feedback/sid/a1a1/alice.md",
+                ".trinity/feedback/sid/a1a1/bob.md",
                 ".trinity/plans/sid.md",
             ]
         );
@@ -681,7 +676,7 @@ mod tests {
         let mut c = cand(Some("1019"), Some(crate::repo_state::CommitKind::CodeOnly));
         c.gate = Some(g);
         let v = derive_locations(&c, WaitingReason::AddressCommitChanges, &me());
-        assert_eq!(v, vec![".trinity/feedback/sid/commits/1019/dana.md"]);
+        assert_eq!(v, vec![".trinity/feedback/sid/1019/dana.md"]);
     }
 
     #[test]
@@ -701,7 +696,7 @@ mod tests {
         assert_eq!(
             v,
             vec![
-                ".trinity/feedback/sid/commits/3137/alice.md",
+                ".trinity/feedback/sid/3137/alice.md",
                 ".trinity/plans/sid.md",
             ]
         );
@@ -876,7 +871,7 @@ mod integration_tests {
         assert_eq!(work, "review_commit");
         assert_eq!(locations.len(), 1);
         assert!(
-            locations[0].starts_with(".trinity/feedback/foo/commits/"),
+            locations[0].starts_with(".trinity/feedback/foo/"),
             "got: {}",
             locations[0]
         );
@@ -920,15 +915,15 @@ mod integration_tests {
             .await
             .unwrap();
         // Two RC feedbacks at the canonical path.
-        let bob_path = format!(".trinity/feedback/foo/commits/{}/bob.md", intro.as_str());
-        let dana_path = format!(".trinity/feedback/foo/commits/{}/dana.md", intro.as_str());
+        let bob_path = format!(".trinity/feedback/foo/{}/bob.md", intro.as_str());
+        let dana_path = format!(".trinity/feedback/foo/{}/dana.md", intro.as_str());
         write_file(dir.path(), &bob_path, "REQUEST_CHANGES\n");
         write_file(dir.path(), &dana_path, "REQUEST_CHANGES\n");
         rt.handle_signal(
             dir.path(),
             FilesystemSignal::FeedbackWritten {
                 parsed: crate::disk_format::parse_feedback_path(&PathBuf::from(format!(
-                    "foo/commits/{}/bob.md",
+                    "foo/{}/bob.md",
                     intro.as_str()
                 )))
                 .unwrap(),
@@ -941,7 +936,7 @@ mod integration_tests {
             dir.path(),
             FilesystemSignal::FeedbackWritten {
                 parsed: crate::disk_format::parse_feedback_path(&PathBuf::from(format!(
-                    "foo/commits/{}/dana.md",
+                    "foo/{}/dana.md",
                     intro.as_str()
                 )))
                 .unwrap(),
@@ -984,12 +979,12 @@ mod integration_tests {
         // Both codex + bob approve the intro target → participants.
         for author in ["codex", "bob"] {
             let rel = format!(
-                ".trinity/feedback/foo/commits/{}/{}.md",
+                ".trinity/feedback/foo/{}/{}.md",
                 intro.as_str(),
                 author
             );
             write_file(dir.path(), &rel, "APPROVE\n");
-            let parsed_rel = PathBuf::from(format!("foo/commits/{}/{}.md", intro.as_str(), author));
+            let parsed_rel = PathBuf::from(format!("foo/{}/{}.md", intro.as_str(), author));
             let parsed = crate::disk_format::parse_feedback_path(&parsed_rel).unwrap();
             rt.handle_signal(dir.path(), FilesystemSignal::FeedbackWritten { parsed }, 1)
                 .await
@@ -1014,12 +1009,12 @@ mod integration_tests {
             .await
             .unwrap();
         let codex_rel = format!(
-            ".trinity/feedback/foo/commits/{}/codex.md",
+            ".trinity/feedback/foo/{}/codex.md",
             revised.as_str()
         );
         write_file(dir.path(), &codex_rel, "APPROVE\n");
         let parsed = crate::disk_format::parse_feedback_path(&PathBuf::from(format!(
-            "foo/commits/{}/codex.md",
+            "foo/{}/codex.md",
             revised.as_str()
         )))
         .unwrap();

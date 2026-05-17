@@ -715,11 +715,11 @@ mod tests {
             .unwrap();
 
         // Write feedback file on disk first.
-        let feedback_rel = format!(".trinity/feedback/foo/commits/{}/alice.md", intro.as_str());
+        let feedback_rel = format!(".trinity/feedback/foo/{}/alice.md", intro.as_str());
         write_file(dir.path(), &feedback_rel, "APPROVE\n\nlgtm\n");
 
         // Build the parsed FeedbackPath manually for the signal.
-        let parsed_rel = PathBuf::from(format!("foo/commits/{}/alice.md", intro.as_str()));
+        let parsed_rel = PathBuf::from(format!("foo/{}/alice.md", intro.as_str()));
         let parsed = crate::disk_format::parse_feedback_path(&parsed_rel).unwrap();
 
         rt.handle_signal(dir.path(), FilesystemSignal::FeedbackWritten { parsed }, 7)
@@ -754,9 +754,9 @@ mod tests {
             })
             .await
             .unwrap();
-        let feedback_rel = format!(".trinity/feedback/foo/commits/{}/alice.md", intro.as_str());
+        let feedback_rel = format!(".trinity/feedback/foo/{}/alice.md", intro.as_str());
         write_file(dir.path(), &feedback_rel, "APPROVE\n");
-        let parsed_rel = PathBuf::from(format!("foo/commits/{}/alice.md", intro.as_str()));
+        let parsed_rel = PathBuf::from(format!("foo/{}/alice.md", intro.as_str()));
         let parsed = crate::disk_format::parse_feedback_path(&parsed_rel).unwrap();
         rt.handle_signal(
             dir.path(),
@@ -784,9 +784,6 @@ mod tests {
         assert_eq!(v["waiting_on"]["reason"], "commit_needs_review");
     }
 
-    // (flat_drop_feedback_is_auto_organized test removed in phase 2.4 —
-    // the flat-drop disk path / held-feedback / auto-organize path
-    // no longer exists; reviewers always write to commits/<sha>/.)
 
     #[tokio::test]
     async fn list_plans_via_runtime() {

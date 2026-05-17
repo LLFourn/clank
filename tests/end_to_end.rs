@@ -782,7 +782,7 @@ async fn feedback_renders_on_session_page() {
         .to_string();
 
     // Drop a feedback file at the canonical path.
-    let feedback_rel = format!(".trinity/feedback/foo/commits/{}/alice.md", intro);
+    let feedback_rel = format!(".trinity/feedback/foo/{}/alice.md", intro);
     write_file(dir.path(), &feedback_rel, "APPROVE\n\nlgtm\n");
     tokio::time::sleep(Duration::from_millis(1500)).await;
 

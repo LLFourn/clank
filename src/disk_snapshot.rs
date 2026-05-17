@@ -248,13 +248,13 @@ mod tests {
     fn feedback(session: &str, target: &str, author: &str, body: &str) -> FeedbackBlob {
         FeedbackBlob {
             abs_path: PathBuf::from(format!(
-                "/r/.trinity/feedback/{session}/commits/{target}/{author}.md"
+                "/r/.trinity/feedback/{session}/{target}/{author}.md"
             )),
             parsed: FeedbackPath {
                 plan_key: sess(session),
                 target_sha: sha(target),
                 author: AgentLabel::parse(author).unwrap(),
-                raw: PathBuf::from(format!("{session}/commits/{target}/{author}.md")),
+                raw: PathBuf::from(format!("{session}/{target}/{author}.md")),
             },
             body: body.to_string(),
             created_at: 0,

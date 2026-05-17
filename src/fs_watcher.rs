@@ -62,7 +62,7 @@ pub fn path_to_signal(
         return Some(signal);
     }
 
-    // .trinity/feedback/<plan-key>/commits/<sha>/<author>.md
+    // .trinity/feedback/<plan-key>/<sha>/<author>.md
     if let Ok(rest) = rel.strip_prefix(".trinity/feedback") {
         let parsed = parse_feedback_path(rest)?;
         return Some(match event_kind {
@@ -229,7 +229,7 @@ mod tests {
     #[test]
     fn feedback_canonical_sha_path() {
         let sig = path_to_signal(
-            &repo().join(".trinity/feedback/foo/commits/abc1234/alice.md"),
+            &repo().join(".trinity/feedback/foo/abc1234/alice.md"),
             &repo(),
             FsEventKind::CreatedOrModified,
         );
@@ -244,9 +244,17 @@ mod tests {
     }
 
     #[test]
+    fn legacy_commits_segment_yields_no_signal() {
+        let sig = path_to_signal(
+            &repo().join(".trinity/feedback/foo/commits/abc1234/alice.md"),
+            &repo(),
+            FsEventKind::CreatedOrModified,
+        );
+        assert!(sig.is_none());
+    }
+
+    #[test]
     fn legacy_plan_segment_yields_no_signal() {
-        // Pre-2.4 paths are no longer parsed (no held-feedback queue,
-        // no flat drop). The watcher silently ignores them.
         let sig = path_to_signal(
             &repo().join(".trinity/feedback/foo/plan/alice.md"),
             &repo(),
@@ -264,7 +272,7 @@ mod tests {
     #[test]
     fn feedback_removed() {
         let sig = path_to_signal(
-            &repo().join(".trinity/feedback/foo/commits/def5678/bob.md"),
+            &repo().join(".trinity/feedback/foo/def5678/bob.md"),
             &repo(),
             FsEventKind::Removed,
         );
