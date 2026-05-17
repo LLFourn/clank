@@ -8,7 +8,7 @@ use tokio::process::Command;
 
 use crate::attribution::{CommitChanges, FinalizeChange, FinalizeChangeKind, PlanTouch};
 use crate::disk_format::{parse_feedback_path, parse_finalize_path};
-use crate::disk_snapshot::{DiskSnapshot, FeedbackBlob, HistoryEntry, PlanFileBlob};
+use crate::disk_snapshot::{CommitEvent, DiskSnapshot, FeedbackBlob};
 use crate::lifecycle::{CommitSha, PlanKey};
 use crate::repo_state::PlanTouchKind;
 
@@ -305,11 +305,17 @@ pub async fn commit_message(repo: &Path, sha: &CommitSha) -> Result<(String, Str
 /// shells out to `git show <sha>:<path>` to capture the body's first
 /// non-empty line (what the finalize rule's APPROVE check reads).
 pub async fn diff_tree_changes(repo: &Path, sha: &CommitSha) -> Result<CommitChanges, GitIoError> {
+    // `-m --first-parent`: for merge commits, emit the diff against
+    // the first parent (otherwise diff-tree suppresses merges,
+    // hiding plan/finalize touches that landed via --no-ff). `--root`
+    // is for the initial commit's "diff against the empty tree."
     let output = run(
         repo,
         &[
             "diff-tree",
             "-r",
+            "-m",
+            "--first-parent",
             "--root",
             "--no-commit-id",
             "--name-status",
@@ -346,6 +352,16 @@ pub async fn diff_tree_changes(repo: &Path, sha: &CommitSha) -> Result<CommitCha
             kind: FinalizeChangeKind::Upsert { first_line },
         });
     }
+    // Pre-fetch plan-file bodies for Add/Modify touches so the sans-IO
+    // fold has the body needed to populate `state.plans` and to
+    // capture body-at-freeze. The path-index pairing above stays
+    // aligned with `changes.plan_touches` because `parse_diff_tree`
+    // pushes plan_touches in stdout order and `plan_body_paths` is
+    // built from the same loop in that same order.
+    for (touch_idx, path) in parsed.plan_body_paths.into_iter() {
+        let body = show_blob(repo, sha, &path).await?;
+        changes.plan_touches[touch_idx].new_body = Some(body);
+    }
     Ok(changes)
 }
 
@@ -355,6 +371,12 @@ struct ParsedDiffTree {
     /// resolves each one's first-body-line via a `git show` call after
     /// parsing.
     finalize_upserts: Vec<FinalizeUpsertPath>,
+    /// (plan_touch_index, path) pairs for plan-file touches whose
+    /// `new_body` needs filling. The caller fetches each body via
+    /// `git show <sha>:<path>` and writes it back into
+    /// `changes.plan_touches[index].new_body`. Deletion touches are
+    /// omitted (their `new_body` stays `None`).
+    plan_body_paths: Vec<(usize, PathBuf)>,
 }
 
 struct FinalizeUpsertPath {
@@ -367,6 +389,7 @@ fn parse_diff_tree(stdout: &str) -> Result<ParsedDiffTree, GitIoError> {
     let mut has_non_plan_code_changes = false;
     let mut finalize_changes: Vec<FinalizeChange> = Vec::new();
     let mut finalize_upserts: Vec<FinalizeUpsertPath> = Vec::new();
+    let mut plan_body_paths: Vec<(usize, PathBuf)> = Vec::new();
 
     for line in stdout.lines() {
         let line = line.trim_end_matches('\r');
@@ -417,16 +440,22 @@ fn parse_diff_tree(stdout: &str) -> Result<ParsedDiffTree, GitIoError> {
                 'A' => PlanTouchKind::Intro,
                 _ => PlanTouchKind::Revision,
             };
-            let new_path_for_touch = if status_char == 'D' && !is_rename {
+            let is_deletion = status_char == 'D' && !is_rename;
+            let new_path_for_touch = if is_deletion {
                 None
             } else {
                 Some(new_rel.clone())
             };
+            let touch_index = plan_touches.len();
             plan_touches.push(PlanTouch {
                 session: plan_key,
                 kind,
                 new_path: new_path_for_touch,
+                new_body: None,
             });
+            if !is_deletion {
+                plan_body_paths.push((touch_index, new_rel.clone()));
+            }
         } else if new_finalize.is_some() || old_finalize.is_some() {
             // Finalize-snapshot file. A rename whose <stem>/<file> differs
             // is modelled as Remove(old) + Upsert(new); a pure 'D' is a
@@ -481,6 +510,7 @@ fn parse_diff_tree(stdout: &str) -> Result<ParsedDiffTree, GitIoError> {
             finalize_changes,
         },
         finalize_upserts,
+        plan_body_paths,
     })
 }
 
@@ -495,166 +525,41 @@ fn parse_finalize_subpath(rel: &Path) -> Option<(PlanKey, String)> {
     Some((parsed.plan_key, file_name))
 }
 
-/// Gather a `DiskSnapshot` for `repo_root`. This is the IO half of the
-/// rebuild flow; `disk_snapshot::derive_state` consumes the result and
-/// is the pure half.
+/// Gather a `DiskSnapshot` for `repo_root`. IO half of the rebuild
+/// flow; `disk_snapshot::derive_state` consumes the result as a fold.
 ///
-/// Steps:
-/// 1. `git rev-parse HEAD` (empty repo → snapshot with `head=None`).
-/// 2. `git ls-tree -r HEAD -- .trinity/plans/` for session discovery;
-///    for each blob, fetch its body via `git show HEAD:<path>`, its
-///    plan_intro via `--diff-filter=A --follow`, and the intro's
-///    first-parent via `rev-parse <intro>^`.
-/// 3. `git log --first-parent --reverse --format=%H` for the commit
-///    chain; for each commit, `git diff-tree -r --name-status -M`
-///    → `CommitChanges`.
-/// 4. Walk `<repo>/.trinity/feedback/` for working-tree feedback files.
+/// Three IO steps in order:
+/// 1. `git rev-parse HEAD` (empty repo → empty snapshot).
+/// 2. Per-commit walk along HEAD's first-parent chain. For each
+///    commit: `git diff-tree` for the diff structure; `git show` per
+///    plan-file Add/Modify (body) and per finalize-file upsert (first
+///    line) so each `CommitEvent` carries everything the fold needs.
+/// 3. Walk `<repo>/.trinity/feedback/` for working-tree feedback
+///    (NOT in git).
 pub async fn snapshot(repo_root: &Path) -> Result<DiskSnapshot, GitIoError> {
     let head = rev_parse_head(repo_root).await?;
     let Some(head) = head else {
         return Ok(DiskSnapshot::default());
     };
 
-    // Plan files in HEAD.
-    let entries = ls_tree_plans(repo_root, &head).await?;
-    let mut plan_files = Vec::with_capacity(entries.len());
-    let mut head_stems: std::collections::BTreeSet<PlanKey> = std::collections::BTreeSet::new();
-    for e in entries {
-        let Some(plan_key) = PlanKey::from_path(&e.path) else {
-            continue;
-        };
-        let body = show_blob(repo_root, &head, &e.path).await?;
-        let Some(plan_intro) = first_added_commit(repo_root, &e.path).await? else {
-            continue;
-        };
-        let plan_intro_parent = parent_of(repo_root, &plan_intro).await?;
-        head_stems.insert(plan_key.clone());
-        plan_files.push(PlanFileBlob {
-            plan_key,
-            plan_path: e.path,
-            body,
-            plan_intro,
-            plan_intro_parent,
-        });
-    }
-
-    // Commit history along the first-parent chain. We walk it
-    // unconditionally because history-rooted finished plans
-    // (introduced + finalized + plan-file deleted) must be discovered
-    // from the same view of history the fold consumes — using
-    // `git log --all` would let stale branches leak placeholders that
-    // the first-parent fold never sees as frozen.
     let metas = first_parent_commits(repo_root).await?;
-    let mut history: Vec<HistoryEntry> = Vec::with_capacity(metas.len());
-    let mut commit_meta: std::collections::BTreeMap<
-        CommitSha,
-        crate::disk_snapshot::CommitMetaEntry,
-    > = std::collections::BTreeMap::new();
+    let mut history: Vec<CommitEvent> = Vec::with_capacity(metas.len());
     for meta in metas {
         let changes = diff_tree_changes(repo_root, &meta.sha).await?;
-        commit_meta.insert(
-            meta.sha.clone(),
-            crate::disk_snapshot::CommitMetaEntry {
-                author_ts: meta.author_ts,
-                subject: meta.subject,
-            },
-        );
-        history.push(HistoryEntry {
+        history.push(CommitEvent {
             commit: meta.sha,
+            author_ts: meta.author_ts,
+            subject: meta.subject,
             changes,
         });
     }
 
-    // History-rooted plans: stems that were finalized somewhere in
-    // first-parent history but no longer have a
-    // `.trinity/plans/<stem>.md` blob in HEAD. Per the
-    // monotone-finished invariant, those plans stay finished and stay
-    // visible in `list_plans`. Loaded here with empty body; the
-    // rebuild step fills the body from the freeze commit's blob once
-    // `derive_state` sets `frozen_at`.
-    let mut history_finalize_stems: std::collections::BTreeSet<PlanKey> =
-        std::collections::BTreeSet::new();
-    for entry in &history {
-        for fc in &entry.changes.finalize_changes {
-            history_finalize_stems.insert(fc.plan_key.clone());
-        }
-    }
-    for stem in history_finalize_stems {
-        if head_stems.contains(&stem) {
-            continue;
-        }
-        let plan_path = PathBuf::from(format!(".trinity/plans/{}.md", stem.as_str()));
-        // Find the first commit in this first-parent history that
-        // introduced the plan file at the active path. Skip stems whose
-        // plan-file Intro never appears in the fold's history — those
-        // can't be sensibly anchored.
-        let Some(plan_intro) = history.iter().find_map(|entry| {
-            entry
-                .changes
-                .plan_touches
-                .iter()
-                .find(|t| {
-                    t.session == stem
-                        && matches!(t.kind, crate::repo_state::PlanTouchKind::Intro)
-                })
-                .map(|_| entry.commit.clone())
-        }) else {
-            continue;
-        };
-        let plan_intro_parent = parent_of(repo_root, &plan_intro).await?;
-        plan_files.push(PlanFileBlob {
-            plan_key: stem,
-            plan_path,
-            body: String::new(),
-            plan_intro,
-            plan_intro_parent,
-        });
-    }
-
-    // Feedback files in the working tree.
     let feedback_files = collect_feedback_files(repo_root)?;
-
-    // Fallback for plans whose intro is OFF the first-parent chain
-    // (e.g. introduced on a feature branch and merged with --no-ff).
-    // Such commits don't appear in `first_parent_commits`, so
-    // `commit_meta` lacks their author_ts. Without this fallback,
-    // `last_activity_ts_for` would return 0 for such plans and bury
-    // them at the bottom of /api/plans. Cost: one extra `git show -s`
-    // per off-chain plan_intro, executed only when the lookup misses.
-    let mut commit_meta = commit_meta;
-    for pf in &plan_files {
-        if commit_meta.contains_key(&pf.plan_intro) {
-            continue;
-        }
-        let Ok(stdout) = run_ok(
-            repo_root,
-            &["show", "-s", "--format=%at", pf.plan_intro.as_str()],
-        )
-        .await
-        else {
-            continue;
-        };
-        let Ok(ts) = stdout.trim().parse::<i64>() else {
-            continue;
-        };
-        commit_meta.insert(
-            pf.plan_intro.clone(),
-            crate::disk_snapshot::CommitMetaEntry {
-                author_ts: ts,
-                // Off-chain intros don't appear in the timeline view
-                // (which walks `commit_order`, not arbitrary commits),
-                // so the subject is never read. Empty is fine.
-                subject: String::new(),
-            },
-        );
-    }
 
     Ok(DiskSnapshot {
         head: Some(head),
-        plan_files,
         history,
         feedback_files,
-        commit_meta,
     })
 }
 

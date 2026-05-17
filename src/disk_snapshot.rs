@@ -1,18 +1,23 @@
 //! The sans-IO boundary for repo-state derivation.
 //!
-//! `DiskSnapshot` is a structural representation of everything Trinity
-//! reads from disk + git for one repo at one point in time: HEAD, the
-//! plan files in HEAD's tree, the commit history along the first-parent
-//! chain, and the feedback files in the working tree.
+//! `DiskSnapshot` is a list of per-commit events along HEAD's
+//! first-parent chain plus the working-tree feedback files (which
+//! aren't in git). Each `CommitEvent` carries everything the fold
+//! needs from that commit's diff: plan touches with bodies, finalize
+//! changes with first lines, code-change flag, author timestamp,
+//! subject.
 //!
-//! `derive_state` is a pure function from `(repo_root, DiskSnapshot)`
-//! to `RepoState`. No git, no filesystem, no async — synthetic snapshots
-//! make the whole derivation testable in isolation.
+//! `derive_state` is a pure function: start with empty `RepoState`,
+//! apply each `CommitEvent` in order, then apply feedback by target
+//! SHA. State at the end represents the repo: which plans exist
+//! (currently in tree or ever-frozen), what they say, who's waiting
+//! on what. No HEAD-tree side data, no `--all` queries, no
+//! topological `parent_of` calls — the chronological fold IS the
+//! lifecycle.
 //!
-//! The IO layer (`git_io::snapshot`) builds a `DiskSnapshot` by running
-//! `git ls-tree`, `git show`, `git log`, `git diff-tree`, and walking
-//! `<repo>/.trinity/feedback/`. `rebuild::rebuild_repo` glues the two
-//! together.
+//! The IO layer (`git_io::snapshot`) builds the `DiskSnapshot` by
+//! running one `git log --first-parent` and per-commit `git diff-tree`
+//! + `git show` reads. `rebuild::rebuild_repo` glues the two.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
@@ -27,59 +32,47 @@ use crate::repo_state::{
 };
 use crate::review_state::{CommitGate, CommitGateState};
 
-/// Everything Trinity needs to derive a repo's state, materialized into
-/// structured types. Built by `git_io::snapshot`; consumed by
-/// `derive_state`.
+/// Everything Trinity needs to derive a repo's state, materialized
+/// from a single sequential walk of HEAD's first-parent chain.
+/// `git_io::snapshot` builds it; `derive_state` consumes it as a fold.
+///
+/// Strictly one shape of input: a list of commit events plus the
+/// on-disk working-tree feedback. No HEAD-tree side data, no
+/// pre-built plan-files snapshot — `derive_state` builds
+/// `state.plans` by applying each commit's event in order.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct DiskSnapshot {
     pub head: Option<CommitSha>,
-    /// One entry per `git ls-tree HEAD -- .trinity/plans/` blob whose
-    /// basename parses as a session id. Order is preserved from ls-tree.
-    pub plan_files: Vec<PlanFileBlob>,
     /// First-parent commit chain from the root to HEAD, oldest-first.
-    /// Each entry carries the structured diff against its parent (or
-    /// against the empty tree for the root commit).
-    pub history: Vec<HistoryEntry>,
-    /// Working-tree feedback files. Each has been path-parsed; the body
-    /// is included verbatim.
+    /// Each event carries the per-commit data the fold needs:
+    /// structured diff against parent + author timestamp + subject.
+    pub history: Vec<CommitEvent>,
+    /// Working-tree feedback files (NOT in git). Each is keyed by its
+    /// target commit SHA; the fold applies it when it processes that
+    /// commit.
     pub feedback_files: Vec<FeedbackBlob>,
-    /// Per-commit metadata (author timestamp, subject) for every commit
-    /// in `history`. One batched `git log` populates this in
-    /// `git_io::first_parent_commits`; `derive_state` carries it over to
-    /// `RepoState::commit_meta` for use by `last_activity_ts` +
-    /// timeline subject rendering.
-    pub commit_meta: BTreeMap<CommitSha, CommitMetaEntry>,
 }
 
-/// Author timestamp + subject line for one commit. Mirrors
-/// `git_io::CommitMeta` but decoupled — `git_io` is the producer; the
-/// daemon stores its own copy so the lifecycle types don't reach into
-/// the IO layer.
+/// One first-parent commit's contribution to repo state: the diff
+/// against its parent (plan touches with bodies, finalize-file
+/// changes, code-change flag) plus author timestamp and subject. The
+/// fold applies these in chronological order.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommitEvent {
+    pub commit: CommitSha,
+    pub author_ts: i64,
+    pub subject: String,
+    pub changes: CommitChanges,
+}
+
+/// Author timestamp + subject for one commit. Stored on `RepoState`
+/// (keyed by SHA) so the projection layer can render timelines and
+/// compute `last_activity_ts` without reaching into git. Derived
+/// per-commit from `CommitEvent` during the fold.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CommitMetaEntry {
     pub author_ts: i64,
     pub subject: String,
-}
-
-/// A plan file as it appears in HEAD's tree.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PlanFileBlob {
-    pub plan_key: PlanKey,
-    pub plan_path: PathBuf,
-    /// Body from HEAD's blob (not the working tree).
-    pub body: String,
-    /// First commit that added this plan path (via `git log
-    /// --diff-filter=A --follow`).
-    pub plan_intro: CommitSha,
-    /// First-parent of `plan_intro`, or `None` for the root commit.
-    pub plan_intro_parent: Option<CommitSha>,
-}
-
-/// One commit in the first-parent chain plus its diff against the parent.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct HistoryEntry {
-    pub commit: CommitSha,
-    pub changes: CommitChanges,
 }
 
 /// One feedback file in the working tree.
@@ -107,16 +100,13 @@ pub fn derive_state(repo_root: PathBuf, snapshot: DiskSnapshot) -> RepoState {
     let mut state = RepoState::empty(repo_root);
     state.head = snapshot.head;
 
-    init_plans_from_head(&mut state, snapshot.plan_files);
-    let plan_keys: Vec<PlanKey> = state.plans.keys().cloned().collect();
-
-    // Pre-index feedback per plan: (target_sha, author) -> Feedback.
+    // Pre-index feedback by plan_key. Filtering against state.plans
+    // (which doesn't exist yet) is deferred to per-commit application,
+    // so we keep ALL parseable feedback here regardless of whether the
+    // plan currently exists.
     let mut feedback_by_plan: BTreeMap<PlanKey, BTreeMap<(CommitSha, AgentLabel), Feedback>> =
         BTreeMap::new();
     for fb in snapshot.feedback_files {
-        if !state.plans.contains_key(&fb.parsed.plan_key) {
-            continue;
-        }
         let verdict = parse_verdict(&fb.body);
         feedback_by_plan
             .entry(fb.parsed.plan_key.clone())
@@ -134,12 +124,17 @@ pub fn derive_state(repo_root: PathBuf, snapshot: DiskSnapshot) -> RepoState {
 
     // Per-plan carry-along state for the fold.
     let mut current_effective: Option<PlanKey> = None;
-    let mut plan_at_active_path: BTreeSet<PlanKey> = BTreeSet::new();
+    // `current_plan_in_tree` mirrors which `.trinity/plans/<stem>.md`
+    // blobs exist in the running tree state. Populated from
+    // `PlanTouch.new_path`. At fold end it should match HEAD's tree.
+    let mut current_plan_in_tree: BTreeSet<PlanKey> = BTreeSet::new();
+    // `current_plan_bodies` mirrors the body of each plan file at the
+    // running tree state. Populated from `PlanTouch.new_body`. Used at
+    // freeze time to capture the plan body from the freeze commit
+    // rather than HEAD — monotone-finished semantics.
+    let mut current_plan_bodies: BTreeMap<PlanKey, String> = BTreeMap::new();
     let mut finalize_tree: BTreeMap<PlanKey, BTreeMap<String, String>> = BTreeMap::new();
-    let mut gate_participants: BTreeMap<PlanKey, Vec<AgentLabel>> = plan_keys
-        .iter()
-        .map(|k| (k.clone(), Vec::new()))
-        .collect();
+    let mut gate_participants: BTreeMap<PlanKey, Vec<AgentLabel>> = BTreeMap::new();
 
     for entry in &snapshot.history {
         // Drop any current_effective that points at a now-frozen plan.
@@ -153,6 +148,13 @@ pub fn derive_state(repo_root: PathBuf, snapshot: DiskSnapshot) -> RepoState {
         // touches under their key). commit_order grows unconditionally.
         let commit_sha = entry.commit.clone();
         state.commit_order.push(commit_sha.clone());
+        state.commit_meta.insert(
+            commit_sha.clone(),
+            CommitMetaEntry {
+                author_ts: entry.author_ts,
+                subject: entry.subject.clone(),
+            },
+        );
 
         let raw_attr = classify(&entry.changes, current_effective.as_ref());
         current_effective = effective_session(&entry.changes, current_effective.as_ref());
@@ -178,19 +180,96 @@ pub fn derive_state(repo_root: PathBuf, snapshot: DiskSnapshot) -> RepoState {
                 if !is_frozen(&state, &touch.session) {
                     filtered.push((touch.session.clone(), touch.kind));
                 }
-                // Track plan-file-at-active-path from new_path. The
-                // producer (`git_io::parse_diff_tree`) sets new_path =
-                // None only for a real `D` (delete) diff. `Some(_)`
-                // is always at the active path because git_io's
-                // `is_plan_path` rejects nested paths. Synthetic test
-                // fixtures that pass None never carry finalize_changes
-                // so the freeze-rule check never fires for them.
-                match &touch.new_path {
-                    Some(_) => {
-                        plan_at_active_path.insert(touch.session.clone());
+                // Mirror tree state from kind / new_path / new_body.
+                //
+                // Producer rules (`git_io::parse_diff_tree`):
+                //   - Real `D` (delete) → kind=Revision, new_path=None.
+                //   - Real `A` (add) → kind=Intro, new_path=Some(_).
+                //   - Real `M`/`R` (modify/rename) → kind=Revision,
+                //     new_path=Some(_).
+                //   - `new_body` populated for production paths (real
+                //     git fetches it via `show_blob`); synthetic tests
+                //     may leave it `None`.
+                //
+                // A synthetic test fixture passing kind=Intro with
+                // new_path=None means "this commit introduces the
+                // plan, body/path elided" — treat as a tree insert.
+                // Only the Revision + None pair (the real delete
+                // signal) removes from the tree.
+                let is_delete = matches!(touch.kind, PlanTouchKind::Revision)
+                    && touch.new_path.is_none();
+                if is_delete {
+                    current_plan_in_tree.remove(&touch.session);
+                    current_plan_bodies.remove(&touch.session);
+                } else {
+                    current_plan_in_tree.insert(touch.session.clone());
+                    if let Some(body) = &touch.new_body {
+                        current_plan_bodies.insert(touch.session.clone(), body.clone());
                     }
-                    None => {
-                        plan_at_active_path.remove(&touch.session);
+                }
+                // On a fresh Intro of a stem not yet in state.plans
+                // (history-rooted: HEAD's `snapshot.plan_files` didn't
+                // include it because the plan was deleted from HEAD by
+                // a later commit), create the entry now. `or_insert`
+                // is a no-op for HEAD-rooted plans already seeded from
+                // `snapshot.plan_files`.
+                if matches!(touch.kind, PlanTouchKind::Intro)
+                    && touch.new_path.is_some()
+                    && !state.plans.contains_key(&touch.session)
+                {
+                    let plan_path = touch
+                        .new_path
+                        .clone()
+                        .expect("new_path is Some per the match above");
+                    let body = current_plan_bodies
+                        .get(&touch.session)
+                        .cloned()
+                        .unwrap_or_default();
+                    let body_hash = content_hash(&body);
+                    // First-parent parent = the commit just before the
+                    // current one in chronological order, which has
+                    // already been pushed onto commit_order before this
+                    // block runs. `None` for the root commit.
+                    let plan_intro_parent =
+                        if state.commit_order.len() >= 2 {
+                            state
+                                .commit_order
+                                .get(state.commit_order.len() - 2)
+                                .cloned()
+                        } else {
+                            None
+                        };
+                    state.plans.insert(
+                        touch.session.clone(),
+                        Plan {
+                            id: touch.session.clone(),
+                            plan_path,
+                            body,
+                            body_hash,
+                            plan_intro: commit_sha.clone(),
+                            plan_intro_parent,
+                            commits: BTreeMap::new(),
+                            frozen_at: None,
+                            freeze_events: Vec::new(),
+                            archived_cycles: Vec::new(),
+                        },
+                    );
+                    gate_participants
+                        .entry(touch.session.clone())
+                        .or_default();
+                }
+                // On Revision of a not-yet-frozen plan, keep its body
+                // tracking what's in HEAD. Frozen plans are sealed —
+                // their body was captured at freeze time.
+                if matches!(touch.kind, PlanTouchKind::Revision)
+                    && touch.new_path.is_some()
+                    && !is_frozen(&state, &touch.session)
+                {
+                    if let (Some(plan), Some(body)) =
+                        (state.plans.get_mut(&touch.session), &touch.new_body)
+                    {
+                        plan.body = body.clone();
+                        plan.body_hash = content_hash(body);
                     }
                 }
             }
@@ -220,9 +299,10 @@ pub fn derive_state(repo_root: PathBuf, snapshot: DiskSnapshot) -> RepoState {
         }
 
         // Finalize-rule check: for each maybe-affected plan that isn't
-        // frozen and whose plan file is at the active path now, fire if
+        // frozen and whose plan file is currently in the tree, fire if
         // the finalize tree contains ≥1 file and all first lines start
-        // with APPROVE.
+        // with APPROVE. On freeze, capture body from
+        // `current_plan_bodies` (the body at this commit's tree).
         for plan_key in &maybe_affected {
             if !state.plans.contains_key(plan_key) {
                 continue;
@@ -230,13 +310,18 @@ pub fn derive_state(repo_root: PathBuf, snapshot: DiskSnapshot) -> RepoState {
             if is_frozen(&state, plan_key) {
                 continue;
             }
-            if !plan_at_active_path.contains(plan_key) {
+            if !current_plan_in_tree.contains(plan_key) {
                 continue;
             }
             let files = finalize_tree.get(plan_key);
             if finalize_rule_satisfied(files) {
                 let approver_count = files.map(|m| m.len()).unwrap_or(0) as u32;
+                let captured_body = current_plan_bodies.get(plan_key).cloned();
                 if let Some(plan) = state.plans.get_mut(plan_key) {
+                    if let Some(body) = captured_body {
+                        plan.body_hash = content_hash(&body);
+                        plan.body = body;
+                    }
                     plan.frozen_at = Some(commit_sha.clone());
                     plan.freeze_events.push(commit_sha.clone());
                     plan.archived_cycles
@@ -250,7 +335,10 @@ pub fn derive_state(repo_root: PathBuf, snapshot: DiskSnapshot) -> RepoState {
 
         // Per-plan gate carry: extend participants + build gate entry
         // for this commit (if reviewable). Skip frozen plans entirely.
-        for plan_key in &plan_keys {
+        // Iterates the *current* state.plans keys so plans added
+        // mid-fold (history-rooted) participate too.
+        let current_plan_keys: Vec<PlanKey> = state.plans.keys().cloned().collect();
+        for plan_key in &current_plan_keys {
             if is_frozen(&state, plan_key) {
                 continue;
             }
@@ -266,7 +354,7 @@ pub fn derive_state(repo_root: PathBuf, snapshot: DiskSnapshot) -> RepoState {
             ) {
                 continue;
             }
-            let participants = gate_participants.get_mut(plan_key).expect("init above");
+            let participants = gate_participants.entry(plan_key.clone()).or_default();
             let fb_map = feedback_by_plan.get(plan_key);
             let gate = build_gate_step(&commit_sha, fb_map, participants);
             if let Some(plan) = state.plans.get_mut(plan_key) {
@@ -275,39 +363,21 @@ pub fn derive_state(repo_root: PathBuf, snapshot: DiskSnapshot) -> RepoState {
         }
     }
 
-    state.commit_meta = snapshot.commit_meta;
-    state
-}
+    // Post-fold prune: a plan exists iff (a) its plan file is in
+    // HEAD's tree OR (b) it was ever frozen. Plans that fail both
+    // (Intro'd then deleted without freezing) have no historical
+    // anchor and must not surface as ghost active plans.
+    let stale_keys: Vec<PlanKey> = state
+        .plans
+        .iter()
+        .filter(|(k, plan)| plan.frozen_at.is_none() && !current_plan_in_tree.contains(*k))
+        .map(|(k, _)| k.clone())
+        .collect();
+    for k in stale_keys {
+        state.plans.remove(&k);
+    }
 
-fn init_plans_from_head(state: &mut RepoState, plan_files: Vec<PlanFileBlob>) {
-    let mut by_key: BTreeMap<PlanKey, Vec<PlanFileBlob>> = BTreeMap::new();
-    for pf in plan_files {
-        by_key.entry(pf.plan_key.clone()).or_default().push(pf);
-    }
-    for (key, mut entries) in by_key {
-        if entries.len() >= 2 {
-            let paths: Vec<PathBuf> = entries.iter().map(|pf| pf.plan_path.clone()).collect();
-            state.plan_conflicts.insert(key, paths);
-            continue;
-        }
-        let pf = entries.pop().expect("exactly one entry");
-        let body_hash = content_hash(&pf.body);
-        state.plans.insert(
-            pf.plan_key.clone(),
-            Plan {
-                id: pf.plan_key,
-                plan_path: pf.plan_path,
-                body: pf.body,
-                body_hash,
-                plan_intro: pf.plan_intro,
-                plan_intro_parent: pf.plan_intro_parent,
-                commits: BTreeMap::new(),
-                frozen_at: None,
-                freeze_events: Vec::new(),
-                archived_cycles: Vec::new(),
-            },
-        );
-    }
+    state
 }
 
 fn is_frozen(state: &RepoState, plan_key: &PlanKey) -> bool {
@@ -408,44 +478,77 @@ mod tests {
         PlanKey::parse(s).unwrap()
     }
 
-    fn plan_file(stem: &str, intro: &str, parent: Option<&str>, body: &str) -> PlanFileBlob {
-        PlanFileBlob {
-            plan_key: sess(stem),
-            plan_path: PathBuf::from(format!(".trinity/plans/{stem}.md")),
-            body: body.to_string(),
-            plan_intro: sha(intro),
-            plan_intro_parent: parent.map(sha),
-        }
-    }
-
+    /// Synthetic `PlanTouch` at the active path with no body. Tests
+    /// use this when they don't care about the plan body (e.g. they
+    /// only assert on attribution / plan_touches). Always at active
+    /// path so the fold's prune step doesn't read it as a deletion.
     fn touch(stem: &str, kind: PlanTouchKind) -> PlanTouch {
         PlanTouch {
             session: sess(stem),
             kind,
-            new_path: None,
+            new_path: Some(PathBuf::from(format!(".trinity/plans/{stem}.md"))),
+            new_body: None,
         }
     }
 
+    /// Synthetic `PlanTouch` at the active path with no body.
     fn touch_at_active(stem: &str, kind: PlanTouchKind) -> PlanTouch {
         PlanTouch {
             session: sess(stem),
             kind,
             new_path: Some(PathBuf::from(format!(".trinity/plans/{stem}.md"))),
+            new_body: None,
         }
     }
 
-    fn entry(commit: &str, touches: Vec<PlanTouch>, code: bool) -> HistoryEntry {
-        HistoryEntry {
+    /// Synthetic `PlanTouch` that mirrors a real `A` (add) diff: at
+    /// the active path with a body. Use at the Intro commit; the fold
+    /// inserts the plan into `state.plans` on this touch.
+    fn intro_with_body(stem: &str, body: &str) -> PlanTouch {
+        PlanTouch {
+            session: sess(stem),
+            kind: PlanTouchKind::Intro,
+            new_path: Some(PathBuf::from(format!(".trinity/plans/{stem}.md"))),
+            new_body: Some(body.to_string()),
+        }
+    }
+
+    fn event_at(
+        commit: &str,
+        touches: Vec<PlanTouch>,
+        code: bool,
+        finalize_changes: Vec<crate::attribution::FinalizeChange>,
+    ) -> CommitEvent {
+        CommitEvent {
             commit: sha(commit),
+            author_ts: 0,
+            subject: String::new(),
             changes: CommitChanges {
                 plan_touches: touches,
                 has_non_plan_code_changes: code,
-                finalize_changes: Vec::new(),
+                finalize_changes,
             },
         }
     }
 
-    fn upsert_finalize(stem: &str, file: &str, first_line: &str) -> crate::attribution::FinalizeChange {
+    fn entry(commit: &str, touches: Vec<PlanTouch>, code: bool) -> CommitEvent {
+        event_at(commit, touches, code, Vec::new())
+    }
+
+    fn finalize_entry(
+        commit: &str,
+        touches: Vec<PlanTouch>,
+        code: bool,
+        finalize_changes: Vec<crate::attribution::FinalizeChange>,
+    ) -> CommitEvent {
+        event_at(commit, touches, code, finalize_changes)
+    }
+
+    fn upsert_finalize(
+        stem: &str,
+        file: &str,
+        first_line: &str,
+    ) -> crate::attribution::FinalizeChange {
         crate::attribution::FinalizeChange {
             plan_key: sess(stem),
             file_name: file.to_string(),
@@ -460,22 +563,6 @@ mod tests {
             plan_key: sess(stem),
             file_name: file.to_string(),
             kind: FinalizeChangeKind::Remove,
-        }
-    }
-
-    fn finalize_entry(
-        commit: &str,
-        touches: Vec<PlanTouch>,
-        code: bool,
-        finalize_changes: Vec<crate::attribution::FinalizeChange>,
-    ) -> HistoryEntry {
-        HistoryEntry {
-            commit: sha(commit),
-            changes: CommitChanges {
-                plan_touches: touches,
-                has_non_plan_code_changes: code,
-                finalize_changes,
-            },
         }
     }
 
@@ -505,12 +592,16 @@ mod tests {
 
     #[test]
     fn single_plan_creates_session_with_hash_and_intro() {
+        // Intro at the second commit; plan_intro = 1231,
+        // plan_intro_parent = 9991 (the previous entry in
+        // first-parent order).
         let snap = DiskSnapshot {
-            head: Some(sha("aaaa")),
-            plan_files: vec![plan_file("foo", "1231", Some("9991"), "# foo\n")],
-            history: vec![],
+            head: Some(sha("1231")),
+            history: vec![
+                entry("9991", vec![], true),
+                entry("1231", vec![intro_with_body("foo", "# foo\n")], false),
+            ],
             feedback_files: vec![],
-            commit_meta: BTreeMap::new(),
         };
         let state = derive_state(PathBuf::from("/r"), snap);
         let s = &state.plans[&sess("foo")];
@@ -525,14 +616,12 @@ mod tests {
     fn linear_history_attributes_per_walk_back_rules() {
         let snap = DiskSnapshot {
             head: Some(sha("c3c3")),
-            plan_files: vec![plan_file("foo", "c1c1", None, "# foo\n")],
             history: vec![
-                entry("c1c1", vec![touch("foo", PlanTouchKind::Intro)], false),
+                entry("c1c1", vec![intro_with_body("foo", "# foo\n")], false),
                 entry("c2c2", vec![], true),
                 entry("c3c3", vec![], true),
             ],
             feedback_files: vec![],
-            commit_meta: BTreeMap::new(),
         };
         let state = derive_state(PathBuf::from("/r"), snap);
         // c1: plan intro for foo
@@ -560,24 +649,19 @@ mod tests {
     fn multi_plan_commit_is_unattributed_and_descendants_walk_through() {
         let snap = DiskSnapshot {
             head: Some(sha("c3c3")),
-            plan_files: vec![
-                plan_file("a", "c1c1", None, "# a\n"),
-                plan_file("b", "c2c2", Some("c1c1"), "# b\n"),
-            ],
             history: vec![
-                entry("c1c1", vec![touch("a", PlanTouchKind::Intro)], false),
+                entry("c1c1", vec![intro_with_body("a", "# a\n")], false),
                 entry(
                     "c2c2",
                     vec![
                         touch("a", PlanTouchKind::Revision),
-                        touch("b", PlanTouchKind::Intro),
+                        intro_with_body("b", "# b\n"),
                     ],
                     false,
                 ),
                 entry("c3c3", vec![], true),
             ],
             feedback_files: vec![],
-            commit_meta: BTreeMap::new(),
         };
         let state = derive_state(PathBuf::from("/r"), snap);
         // c2 is multi-plan → unattributed.
@@ -600,15 +684,11 @@ mod tests {
     fn multi_plan_touches_still_count_as_each_sessions_plan_revision() {
         let snap = DiskSnapshot {
             head: Some(sha("c3c3")),
-            plan_files: vec![
-                plan_file("first-one", "c1c1", None, "# one\n"),
-                plan_file("active-one", "c2c2", Some("c1c1"), "# active v2\n"),
-            ],
             history: vec![
-                entry("c1c1", vec![touch("first-one", PlanTouchKind::Intro)], false),
+                entry("c1c1", vec![intro_with_body("first-one", "# one\n")], false),
                 entry(
                     "c2c2",
-                    vec![touch("active-one", PlanTouchKind::Intro)],
+                    vec![intro_with_body("active-one", "# active v2\n")],
                     false,
                 ),
                 entry(
@@ -621,7 +701,6 @@ mod tests {
                 ),
             ],
             feedback_files: vec![],
-            commit_meta: BTreeMap::new(),
         };
         let state = derive_state(PathBuf::from("/r"), snap);
 
@@ -646,14 +725,12 @@ mod tests {
     fn mixed_commit_carries_both_plan_touch_and_code() {
         let snap = DiskSnapshot {
             head: Some(sha("c1c1")),
-            plan_files: vec![plan_file("foo", "c1c1", None, "# foo\n")],
             history: vec![entry(
                 "c1c1",
-                vec![touch("foo", PlanTouchKind::Intro)],
+                vec![intro_with_body("foo", "# foo\n")],
                 true,
             )],
             feedback_files: vec![],
-            commit_meta: BTreeMap::new(),
         };
         let state = derive_state(PathBuf::from("/r"), snap);
         match &state.attribution[&sha("c1c1")] {
@@ -670,14 +747,12 @@ mod tests {
     fn feedback_with_target_sha_lands_in_phase_map() {
         let snap = DiskSnapshot {
             head: Some(sha("c1c1")),
-            plan_files: vec![plan_file("foo", "c1c1", None, "# foo\n")],
             history: vec![entry(
                 "c1c1",
-                vec![touch("foo", PlanTouchKind::Intro)],
+                vec![intro_with_body("foo", "# foo\n")],
                 false,
             )],
             feedback_files: vec![feedback("foo", "c1c1", "alice", "APPROVE\n")],
-            commit_meta: BTreeMap::new(),
         };
         let state = derive_state(PathBuf::from("/r"), snap);
         let gate = state.plans[&sess("foo")]
@@ -699,41 +774,19 @@ mod tests {
     fn feedback_for_unknown_session_is_dropped() {
         let snap = DiskSnapshot {
             head: Some(sha("c1c1")),
-            plan_files: vec![],
             history: vec![],
             feedback_files: vec![feedback("ghost", "c1c1", "alice", "APPROVE\n")],
-            commit_meta: BTreeMap::new(),
         };
         let state = derive_state(PathBuf::from("/r"), snap);
         assert!(state.plans.is_empty());
     }
 
     #[test]
-    fn session_in_done_subdir_uses_done_path() {
-        let mut pf = plan_file("foo", "c1c1", None, "# foo\n");
-        pf.plan_path = PathBuf::from(".trinity/plans/done/foo.md");
-        let snap = DiskSnapshot {
-            head: Some(sha("c2c2")),
-            plan_files: vec![pf],
-            history: vec![],
-            feedback_files: vec![],
-            commit_meta: BTreeMap::new(),
-        };
-        let state = derive_state(PathBuf::from("/r"), snap);
-        assert_eq!(
-            state.plans[&sess("foo")].plan_path,
-            PathBuf::from(".trinity/plans/done/foo.md")
-        );
-    }
-
-    #[test]
     fn root_with_no_plan_touch_is_unattributed() {
         let snap = DiskSnapshot {
             head: Some(sha("c1c1")),
-            plan_files: vec![],
             history: vec![entry("c1c1", vec![], true)],
             feedback_files: vec![],
-            commit_meta: BTreeMap::new(),
         };
         let state = derive_state(PathBuf::from("/r"), snap);
         assert_eq!(
@@ -794,8 +847,13 @@ mod tests {
     fn digest_changes_when_a_new_session_lands() {
         let base = full_workflow_snapshot();
         let mut alt = base.clone();
-        alt.plan_files
-            .push(plan_file("bar", "b1b1", None, "# bar\n"));
+        // Add a new plan via history (its own Intro commit). Pick a
+        // SHA that's not already in base's history.
+        alt.history.push(entry(
+            "b1b1",
+            vec![intro_with_body("bar", "# bar\n")],
+            false,
+        ));
         assert_ne!(
             derive_state(PathBuf::from("/r"), base).digest(),
             derive_state(PathBuf::from("/r"), alt).digest()
@@ -858,15 +916,13 @@ mod tests {
         // mcp_response layer is what filters it out for the current gate.
         let snap = DiskSnapshot {
             head: Some(sha("c3c3")),
-            plan_files: vec![plan_file("foo", "c1c1", None, "# v1\n")],
             history: vec![
-                entry("c1c1", vec![touch("foo", PlanTouchKind::Intro)], false),
+                entry("c1c1", vec![intro_with_body("foo", "# foo\n")], false),
                 entry("c2c2", vec![touch("foo", PlanTouchKind::Revision)], false),
                 entry("c3c3", vec![], true),
             ],
             // stale: c2 is the latest plan rev now
             feedback_files: vec![feedback("foo", "c1c1", "alice", "APPROVE\n")],
-            commit_meta: BTreeMap::new(),
         };
         let state = derive_state(PathBuf::from("/r"), snap);
         let foo = &state.plans[&sess("foo")];
@@ -880,17 +936,12 @@ mod tests {
     fn many_plans_one_repo() {
         let snap = DiskSnapshot {
             head: Some(sha("c3c3")),
-            plan_files: vec![
-                plan_file("alpha", "c1c1", None, "# alpha\n"),
-                plan_file("beta", "c2c2", Some("c1c1"), "# beta\n"),
-            ],
             history: vec![
-                entry("c1c1", vec![touch("alpha", PlanTouchKind::Intro)], false),
-                entry("c2c2", vec![touch("beta", PlanTouchKind::Intro)], false),
+                entry("c1c1", vec![intro_with_body("alpha", "# alpha\n")], false),
+                entry("c2c2", vec![intro_with_body("beta", "# beta\n")], false),
                 entry("c3c3", vec![], true),
             ],
             feedback_files: vec![],
-            commit_meta: BTreeMap::new(),
         };
         let state = derive_state(PathBuf::from("/r"), snap);
         assert_eq!(state.plans.len(), 2);
@@ -907,7 +958,6 @@ mod tests {
         // attributed — the freeze seals subsequent commits, not earlier ones.
         let snap = DiskSnapshot {
             head: Some(sha("c4c4")),
-            plan_files: vec![plan_file("foo", "c1c1", None, "# foo\n")],
             history: vec![
                 entry("c1c1", vec![touch_at_active("foo", PlanTouchKind::Intro)], false),
                 entry("c2c2", vec![], true),
@@ -920,7 +970,6 @@ mod tests {
                 ),
             ],
             feedback_files: vec![],
-            commit_meta: BTreeMap::new(),
         };
         let state = derive_state(PathBuf::from("/r"), snap);
         assert_eq!(state.plans[&sess("foo")].frozen_at, Some(sha("c4c4")));
@@ -959,14 +1008,8 @@ mod tests {
     fn empty_body_plan_file_still_creates_session() {
         let snap = DiskSnapshot {
             head: Some(sha("c1c1")),
-            plan_files: vec![plan_file("foo", "c1c1", None, "")],
-            history: vec![entry(
-                "c1c1",
-                vec![touch("foo", PlanTouchKind::Intro)],
-                false,
-            )],
+            history: vec![entry("c1c1", vec![intro_with_body("foo", "")], false)],
             feedback_files: vec![],
-            commit_meta: BTreeMap::new(),
         };
         let state = derive_state(PathBuf::from("/r"), snap);
         assert!(state.plans.contains_key(&sess("foo")));
@@ -980,15 +1023,13 @@ mod tests {
         // attribution for that and subsequent walks.
         let snap = DiskSnapshot {
             head: Some(sha("c4c4")),
-            plan_files: vec![plan_file("foo", "c3c3", Some("c2c2"), "# foo\n")],
             history: vec![
                 entry("c1c1", vec![], true),
                 entry("c2c2", vec![], true),
-                entry("c3c3", vec![touch("foo", PlanTouchKind::Intro)], false),
+                entry("c3c3", vec![intro_with_body("foo", "# foo\n")], false),
                 entry("c4c4", vec![], true),
             ],
             feedback_files: vec![],
-            commit_meta: BTreeMap::new(),
         };
         let state = derive_state(PathBuf::from("/r"), snap);
         assert_eq!(
@@ -1028,14 +1069,12 @@ mod tests {
     fn timeline_walks_commits_chronologically() {
         let snap = DiskSnapshot {
             head: Some(sha("c3c3")),
-            plan_files: vec![plan_file("foo", "c1c1", None, "# foo\n")],
             history: vec![
-                entry("c1c1", vec![touch("foo", PlanTouchKind::Intro)], false),
+                entry("c1c1", vec![intro_with_body("foo", "# foo\n")], false),
                 entry("c2c2", vec![], true),
                 entry("c3c3", vec![], true),
             ],
             feedback_files: vec![],
-            commit_meta: BTreeMap::new(),
         };
         let state = derive_state(PathBuf::from("/r"), snap);
         let timeline = state.timeline_for(&sess("foo"));
@@ -1054,14 +1093,12 @@ mod tests {
     fn timeline_attaches_plan_review_after_target_commit() {
         let snap = DiskSnapshot {
             head: Some(sha("c1c1")),
-            plan_files: vec![plan_file("foo", "c1c1", None, "# foo\n")],
             history: vec![entry(
                 "c1c1",
-                vec![touch("foo", PlanTouchKind::Intro)],
+                vec![intro_with_body("foo", "# foo\n")],
                 false,
             )],
             feedback_files: vec![feedback("foo", "c1c1", "alice", "APPROVE\n")],
-            commit_meta: BTreeMap::new(),
         };
         let state = derive_state(PathBuf::from("/r"), snap);
         let timeline = state.timeline_for(&sess("foo"));
@@ -1088,13 +1125,11 @@ mod tests {
     fn timeline_attaches_impl_review_after_target_commit() {
         let snap = DiskSnapshot {
             head: Some(sha("c2c2")),
-            plan_files: vec![plan_file("foo", "c1c1", None, "# foo\n")],
             history: vec![
-                entry("c1c1", vec![touch("foo", PlanTouchKind::Intro)], false),
+                entry("c1c1", vec![intro_with_body("foo", "# foo\n")], false),
                 entry("c2c2", vec![], true),
             ],
             feedback_files: vec![feedback("foo", "c2c2", "bob", "REQUEST_CHANGES\nproblem\n")],
-            commit_meta: BTreeMap::new(),
         };
         let state = derive_state(PathBuf::from("/r"), snap);
         let timeline = state.timeline_for(&sess("foo"));
@@ -1121,24 +1156,19 @@ mod tests {
         // in its own timeline.
         let snap = DiskSnapshot {
             head: Some(sha("c3c3")),
-            plan_files: vec![
-                plan_file("foo", "c1c1", None, "# foo\n"),
-                plan_file("bar", "c2c2", Some("c1c1"), "# bar\n"),
-            ],
             history: vec![
-                entry("c1c1", vec![touch("foo", PlanTouchKind::Intro)], false),
+                entry("c1c1", vec![intro_with_body("foo", "# foo\n")], false),
                 entry(
                     "c2c2",
                     vec![
                         touch("foo", PlanTouchKind::Revision),
-                        touch("bar", PlanTouchKind::Intro),
+                        intro_with_body("bar", "# bar\n"),
                     ],
                     false,
                 ),
                 entry("c3c3", vec![], true),
             ],
             feedback_files: vec![],
-            commit_meta: BTreeMap::new(),
         };
         let state = derive_state(PathBuf::from("/r"), snap);
         let foo_timeline = state.timeline_for(&sess("foo"));
@@ -1159,17 +1189,12 @@ mod tests {
     fn timeline_only_includes_target_session() {
         let snap = DiskSnapshot {
             head: Some(sha("c3c3")),
-            plan_files: vec![
-                plan_file("a", "c1c1", None, "# a\n"),
-                plan_file("b", "c2c2", Some("c1c1"), "# b\n"),
-            ],
             history: vec![
-                entry("c1c1", vec![touch("a", PlanTouchKind::Intro)], false),
-                entry("c2c2", vec![touch("b", PlanTouchKind::Intro)], false),
+                entry("c1c1", vec![intro_with_body("a", "# a\n")], false),
+                entry("c2c2", vec![intro_with_body("b", "# b\n")], false),
                 entry("c3c3", vec![], true),
             ],
             feedback_files: vec![],
-            commit_meta: BTreeMap::new(),
         };
         let state = derive_state(PathBuf::from("/r"), snap);
         let a_tl = state.timeline_for(&sess("a"));
@@ -1197,17 +1222,15 @@ mod tests {
     fn timeline_multiple_reviews_on_one_commit() {
         let snap = DiskSnapshot {
             head: Some(sha("c1c1")),
-            plan_files: vec![plan_file("foo", "c1c1", None, "# foo\n")],
             history: vec![entry(
                 "c1c1",
-                vec![touch("foo", PlanTouchKind::Intro)],
+                vec![intro_with_body("foo", "# foo\n")],
                 false,
             )],
             feedback_files: vec![
                 feedback("foo", "c1c1", "alice", "APPROVE\n"),
                 feedback("foo", "c1c1", "bob", "REQUEST_CHANGES\n"),
             ],
-            commit_meta: BTreeMap::new(),
         };
         let state = derive_state(PathBuf::from("/r"), snap);
         let timeline = state.timeline_for(&sess("foo"));
@@ -1235,16 +1258,14 @@ mod tests {
     fn full_workflow_snapshot() -> DiskSnapshot {
         DiskSnapshot {
             head: Some(sha("c2c2")),
-            plan_files: vec![plan_file("foo", "c1c1", None, "# foo\n")],
             history: vec![
-                entry("c1c1", vec![touch("foo", PlanTouchKind::Intro)], false),
+                entry("c1c1", vec![intro_with_body("foo", "# foo\n")], false),
                 entry("c2c2", vec![], true),
             ],
             feedback_files: vec![
                 feedback("foo", "c1c1", "alice", "APPROVE\n"),
                 feedback("foo", "c2c2", "bob", "REQUEST_CHANGES\nstuff\n"),
             ],
-            commit_meta: BTreeMap::new(),
         }
     }
 
@@ -1255,13 +1276,11 @@ mod tests {
     // monotone-after-freeze behaviour, and split-fold equivalence.
     // ===================================================================
 
-    fn freeze_snap(history: Vec<HistoryEntry>) -> DiskSnapshot {
+    fn freeze_snap(history: Vec<CommitEvent>) -> DiskSnapshot {
         DiskSnapshot {
             head: history.last().map(|e| e.commit.clone()),
-            plan_files: vec![plan_file("foo", "c1c1", None, "# foo\n")],
             history,
             feedback_files: vec![],
-            commit_meta: BTreeMap::new(),
         }
     }
 
@@ -1455,7 +1474,6 @@ mod tests {
         // received feedback before the freeze stay.
         let snap = DiskSnapshot {
             head: Some(sha("c3c3")),
-            plan_files: vec![plan_file("foo", "c1c1", None, "# foo\n")],
             history: vec![
                 entry("c1c1", vec![touch_at_active("foo", PlanTouchKind::Intro)], false),
                 finalize_entry(
@@ -1474,7 +1492,6 @@ mod tests {
                 // nowhere to land — silently dropped.
                 feedback("foo", "c3c3", "bob", "REQUEST_CHANGES\n"),
             ],
-            commit_meta: BTreeMap::new(),
         };
         let state = derive_state(PathBuf::from("/r"), snap);
         let plan = &state.plans[&sess("foo")];
@@ -1493,7 +1510,6 @@ mod tests {
         // the caching property the fold is structured to support.
         let full = DiskSnapshot {
             head: Some(sha("c3c3")),
-            plan_files: vec![plan_file("foo", "c1c1", None, "# foo\n")],
             history: vec![
                 entry("c1c1", vec![touch_at_active("foo", PlanTouchKind::Intro)], false),
                 finalize_entry(
@@ -1505,14 +1521,11 @@ mod tests {
                 entry("c3c3", vec![], true),
             ],
             feedback_files: vec![],
-            commit_meta: BTreeMap::new(),
         };
         let prefix_only = DiskSnapshot {
             head: Some(sha("c2c2")),
-            plan_files: full.plan_files.clone(),
             history: full.history[..2].to_vec(),
             feedback_files: vec![],
-            commit_meta: BTreeMap::new(),
         };
         let full_state = derive_state(PathBuf::from("/r"), full);
         let prefix_state = derive_state(PathBuf::from("/r"), prefix_only);

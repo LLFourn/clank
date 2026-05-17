@@ -6,7 +6,6 @@ use std::path::Path;
 
 use crate::disk_snapshot::derive_state;
 use crate::git_io::{self, GitIoError};
-use crate::lifecycle::content_hash;
 use crate::repo_state::RepoState;
 
 #[derive(Debug, thiserror::Error)]
@@ -18,28 +17,12 @@ pub enum RebuildError {
 /// Build a fresh `RepoState` from disk + git for `repo_root`. Empty
 /// repos (no commits) produce an empty state.
 ///
-/// Two-phase: git_io builds a `DiskSnapshot`, `derive_state` runs the
-/// chronological fold (setting `frozen_at` for finished plans), then a
-/// post-fold pass fetches the plan body from the freeze commit for
-/// any frozen plan whose `.trinity/plans/<stem>.md` is absent from
-/// HEAD. Monotone-finished plans render from their freeze SHA, not
-/// HEAD.
+/// Two-phase: `git_io::snapshot` builds a `DiskSnapshot` (a sequence
+/// of per-commit events plus working-tree feedback);
+/// `derive_state` folds it into `RepoState`.
 pub async fn rebuild_repo(repo_root: &Path) -> Result<RepoState, RebuildError> {
     let snapshot = git_io::snapshot(repo_root).await?;
-    let mut state = derive_state(repo_root.to_path_buf(), snapshot);
-    for plan in state.plans.values_mut() {
-        let Some(frozen_at) = plan.frozen_at.clone() else {
-            continue;
-        };
-        if !plan.body.is_empty() {
-            continue;
-        }
-        let plan_path = plan.plan_path.clone();
-        let body = git_io::show_blob(repo_root, &frozen_at, &plan_path).await?;
-        plan.body_hash = content_hash(&body);
-        plan.body = body;
-    }
-    Ok(state)
+    Ok(derive_state(repo_root.to_path_buf(), snapshot))
 }
 
 #[cfg(test)]
@@ -201,6 +184,36 @@ mod tests {
         );
         // Body renders from the freeze commit.
         assert_eq!(plan.body, "# foo body\n");
+    }
+
+    #[tokio::test]
+    async fn request_changes_in_finished_then_plan_delete_does_not_leak_a_ghost() {
+        // Codex's on-chain repro for the prior placeholder design:
+        // c1 adds foo. c2 adds .trinity/finished/foo/alice.md with
+        // first line `REQUEST_CHANGES` (rule does not hold). c3
+        // deletes the plan file. The plan never froze and HEAD has no
+        // plan file, so the plan must not surface in `state.plans`.
+        let dir = init_repo();
+        write_file(dir.path(), ".trinity/plans/foo.md", "# foo\n");
+        commit(dir.path(), "Add foo");
+        write_file(
+            dir.path(),
+            ".trinity/finished/foo/alice.md",
+            "REQUEST_CHANGES\n\nneeds work\n",
+        );
+        commit(dir.path(), "Reviewer request");
+        std::fs::remove_file(dir.path().join(".trinity/plans/foo.md")).unwrap();
+        commit(dir.path(), "Delete foo");
+
+        let state = rebuild_repo(dir.path()).await.unwrap();
+        let key = PlanKey::parse("foo").unwrap();
+        assert!(
+            !state.plans.contains_key(&key),
+            "REQUEST_CHANGES in finished/ never freezes; \
+             after plan-file deletion the plan has no anchor and must not surface; \
+             got {:?}",
+            state.plans.keys().map(|k| k.as_str()).collect::<Vec<_>>()
+        );
     }
 
     #[tokio::test]

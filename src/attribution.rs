@@ -33,10 +33,19 @@ pub struct PlanTouch {
     pub session: PlanKey,
     pub kind: PlanTouchKind,
     /// The plan file's path after this commit's diff applies, or
-    /// `None` if the file was deleted by this commit. Synthetic test
-    /// fixtures may also leave this `None`; the fold then falls back
-    /// to the HEAD path from `DiskSnapshot::plan_files`.
+    /// `None` if the file was deleted by this commit.
     pub new_path: Option<PathBuf>,
+    /// The plan file's body at this commit's tree (after the diff
+    /// applies), or `None` if the file was deleted or the body
+    /// couldn't be fetched. Pre-fetched in `git_io::diff_tree_changes`
+    /// so the sans-IO fold has everything it needs to build
+    /// `state.plans` without re-querying git: on Intro touches the
+    /// fold inserts a `Plan` with this body; on freeze the fold
+    /// captures `current_plan_bodies[stem]` (built from these
+    /// new_body values) as the frozen body. Synthetic test fixtures
+    /// may leave this `None`; production paths from `git_io`
+    /// populate it.
+    pub new_body: Option<String>,
 }
 
 /// One change to a file under `.trinity/finished/<stem>/` in a single
@@ -123,6 +132,7 @@ mod tests {
             session: sess(name),
             kind,
             new_path: None,
+            new_body: None,
         }
     }
 
