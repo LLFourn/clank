@@ -1,4 +1,8 @@
-# Approval-Derived Completion
+# Event-Log Projection and Finished Rule
+
+(Formerly drafted as "Approval-Derived Completion"; renamed when
+CLI scope split off to `trinity-cli` and the event-log sans-io
+restructure landed as Phase 2.)
 
 ## Summary
 
@@ -32,12 +36,12 @@ Scope this plan owns:
   by git itself (the commit log of `.trinity/finished/<stem>/`).
 - The daemon's finished rule is: a plan file exists at
   `.trinity/plans/<stem>.md` AND `.trinity/finished/<stem>/`
-  contains at least one well-formed APPROVE file, both in HEAD's
-  tree. That is the entire rule. No ordering constraints, no
-  impl-commit requirement, no checks on which commits introduced
-  which file. The plan and the finished entry can be added in the
-  same commit, in different commits, in any order. The daemon
-  doesn't care.
+  contains ≥1 file AND every file in that directory has its first
+  line starting with `APPROVE`, all in HEAD's tree. That is the
+  entire rule. No ordering constraints, no impl-commit requirement,
+  no checks on which commits introduced which file. The plan and
+  the finished entry can be added in the same commit, in different
+  commits, in any order. The daemon doesn't care.
 - All sophisticated validation (gate is genuinely approved, working
   tree is clean, reviewer files match real reviewer authors, etc.)
   lives in the `trinity finish` CLI — at mutation time, before
@@ -62,10 +66,10 @@ Scope this plan owns:
   the operator's hand.
 
 The `Phase` enum deletion deferred by `architecture-tech-debt-sweep`
-(waiting on `PlanState::Done` removal) lands here as Phase 11.
+(waiting on `PlanState::Done` removal) lands here as Phase 7.
 
 Source design rationale lives in
-`.trinity/stubs/approval-derived-completion.md` — this plan does
+`.trinity/stubs/event-log-and-finished.md` — this plan does
 not duplicate the rationale, only the implementation.
 
 ## Definitions
@@ -140,16 +144,34 @@ automatically.
 A plan is **finished** iff, in HEAD's tree:
 
 1. `.trinity/plans/<stem>.md` exists, and
-2. `.trinity/finished/<stem>/` contains at least one well-formed
-   APPROVE feedback file (per the existing feedback-file format —
-   first line `APPROVE` or `APPROVE\n…body`).
+2. `.trinity/finished/<stem>/` contains at least one file AND
+   every file in that directory has its first line starting with
+   `APPROVE`.
 
-That's the entire rule. No ordering constraints, no requirement
-that any specific commit introduced either file, no requirement
-that an impl commit exists, no requirement that the snapshot's
-authors match any prior `.trinity/feedback/` reviewer set. The two
-files can land in the same commit, in different commits, in
-unrelated order, by different authors. The daemon doesn't care.
+That's the entire rule. No requirement that an impl commit exists,
+no requirement that the snapshot's authors match any prior
+`.trinity/feedback/` reviewer set, no content inspection beyond
+the first line of each file.
+
+Implementation note (weak preference, pick whichever is easier in
+the actual code): the natural HEAD-tree check is "both files
+present, all snapshot files start with APPROVE." If the rebuild
+path is more naturally framed as event-log mutation (commit X adds
+the plan → active; commit Y adds the snapshot → finished), that
+yields the same answer in practice with a "finish commit applies
+to the plan if the plan already existed at that point in history"
+rule. Both produce identical results on any sequence of commits
+that landed in chronological order via `trinity finish` — which is
+the only way the CLI ever produces a finish commit.
+
+The first-line APPROVE check is the only content inspection: file
+bodies after the first line are not parsed, file names don't
+matter beyond being readable, file count doesn't matter beyond
+non-zero. A directory with any non-APPROVE file present (e.g., a
+stray REQUEST_CHANGES dropped in) makes the plan NOT finished —
+the rule is "every file is APPROVE," not "any file is APPROVE."
+That keeps the operator from accidentally finishing a plan by
+leaving a contradictory file in the snapshot dir.
 
 If `.trinity/plans/<stem>.md` is absent, the plan doesn't exist
 (no `active`, no `finished`). If the plans file is present but
@@ -218,21 +240,11 @@ plan-level `state` wire field.
   `.trinity/finished/<stem>/<agent>.md` — because at finalize
   time there is one current impl, and old finalizes are recovered
   via git history rather than parallel SHA directories in HEAD.
-- New `trinity init` command scaffolds `.trinity/` for a new repo
-  (directory layout + ignore rule). `--ignore` mode appends the
-  ignore rule to the repo-root `.gitignore` instead of creating
-  `.trinity/.gitignore`, for projects where the maintainer is
-  willing to add an ignore line but doesn't want a `.trinity/`-owned
-  config file in their tree.
-- New `trinity finish` command makes the finalize commit. Supports
-  `--purge` (also git-rm Trinity artifacts for this plan to hide
-  Trinity's use), `--squash <message>` (collapse plan-attributed
-  commits into one), and `--amend` (re-do the most recent finalize
-  with different options).
-- New `trinity purge` command shares the history-rewriting engine
-  with `trinity finish --purge` but skips the finalize ceremony.
-  Strips a plan's `.trinity/` content from history at the
-  operator's request, no gate check.
+- The CLI tooling (`trinity init`, `trinity finish`,
+  `trinity purge`, the history-rewriting engine) is out of scope
+  for this plan and owned by `.trinity/stubs/trinity-cli.md`. The
+  CLI depends on this plan landing first (finalize-snapshot reader,
+  event-log sans-io fold).
 - One-time migration path for repos with existing
   `.trinity/plans/done/*.md` files that doesn't lose history.
 - One-time migration for in-flight working-tree feedback at the
@@ -246,65 +258,24 @@ plan-level `state` wire field.
   `concurrent-review-cycles.md`).
 - Typed wire contracts (owned by `typed-wire-contracts.md`).
 
-## CLI / Daemon Split
+## Daemon Responsibilities (CLI in a separate stub)
 
-The CLI (`trinity init`, `trinity finish`, `trinity purge`) follows
-this separation:
+The CLI tooling (`trinity init`, `trinity finish`, `trinity purge`)
+lives in `.trinity/stubs/trinity-cli.md`. Two daemon-side
+consequences of that split are in scope here:
 
-- **Trinity-projected state (the daemon's derived view): via daemon
-  HTTP.** "Is this plan finished?" / "what's the gate state for the
-  latest impl?" / "which commits are attributed to this plan?" —
-  the CLI calls daemon endpoints rather than re-deriving from disk.
-  The daemon's projection is the single source of truth for any
-  state that involves attribution, gate computation, or
-  finished-ness. Avoids parallel implementations of the same logic.
-- **Raw filesystem inspection: direct reads are fine.** Does
-  `.gitignore` already cover `feedback/`? Does
-  `.trinity/finished/<stem>/` exist in HEAD? What's in
-  `.trinity/feedback/<stem>/<sha>/<agent>.md`? The CLI can answer
-  these by reading files (or `git cat-file`, `git ls-tree`)
-  directly. These aren't "Trinity-projected state" — they're file
-  facts the CLI can read without re-implementing the daemon.
-- **Mutations (git operations): 100% local.** The CLI does its own
-  `git` subprocess calls for everything that creates/rewrites
-  commits or modifies the working tree. The daemon's watcher picks
-  up changes on the next filesystem signal — the same path used by
-  any other git client touching the repo. The daemon never writes
-  Trinity artifacts.
-
-Rule of thumb: if the question is "what does the projection say?"
-ask the daemon. If the question is "what does this file/path
-say?" read it.
-
-Consequences:
-
-- The CLI requires a running daemon for projection-state queries
-  (finish-preview, gate state, plan list). If the daemon is not
-  reachable, `trinity finish`/`trinity purge` refuse with a clear
-  error pointing at `trinity serve`. Filesystem-only operations
-  like `trinity init` work without a daemon.
-- The daemon never writes to `.trinity/finished/`,
-  `.trinity/plans/`, or any committed Trinity artifact. The
-  existing `api_move_to_done` violation goes away with the rest of
-  this plan; no new daemon-side mutation surfaces are introduced.
-- The CLI's invariant checks read daemon state via HTTP, then
-  decide locally. Race window: the daemon's state could shift
-  between the read and the commit (a reviewer posts feedback in
-  the gap). This is the same race any human user has with a
-  shared daemon; the CLI doesn't try to lock. If the post-commit
-  state shows the snapshot is now misleading, the operator
-  re-runs `trinity finish`.
-- New HTTP endpoints this plan adds (TBD during implementation):
-  whatever the CLI needs that isn't covered by the existing UI
-  API. Likely at least `GET /api/plan/<id>/finish-preview` that
-  reports "would `trinity finish` succeed right now, and if not,
-  what's missing." Frontend can also use this for a future
-  pre-flight UI.
-
-This shape keeps the daemon read-only for Trinity-owned state and
-the CLI's git mutations auditable as normal commits in history,
-without forcing the CLI through an HTTP round-trip for questions
-that are just "what's in this file?"
+- **The daemon never writes Trinity artifacts.** No new
+  state-mutating endpoints; the existing `api_move_to_done`
+  violation goes away in Phase 5 (Wire/UI cutover). The CLI does
+  all git mutations locally; the daemon's watcher picks up changes
+  on the next filesystem signal.
+- **New HTTP read endpoints expose what the CLI will need.** This
+  plan adds at least `GET /api/plan/<id>/finish-preview` (would
+  `trinity finish` succeed right now? if not, what's missing?) so
+  the CLI doesn't re-derive projection state from disk. Exact
+  endpoint surface is sized when the stub is implemented; this plan
+  commits to "no parallel projection logic in the CLI" as the
+  invariant.
 
 ## Touchpoints (audit)
 
@@ -366,16 +337,6 @@ master.
   string builder (new), finalize-path canonical string builder
   (new).
 
-**New CLI module**:
-- `src/cli/` — new module tree for `trinity init` and
-  `trinity finish` subcommands. Wire into the existing CLI dispatch
-  in `src/main.rs` (or wherever `trinity serve` is parsed).
-- `src/cli/init.rs` — scaffolds `.trinity/plans/`,
-  `.trinity/.gitignore`, optionally registers the repo with a
-  running daemon.
-- `src/cli/finish.rs` — invariant checks, snapshot copy, commit
-  creation, `--purge` / `--squash` / `--amend` flag handling.
-
 **New core module**:
 - `src/finalize.rs` (or similar) — parser for
   `.trinity/finished/<stem>/<agent>.md` paths (flat, no SHA
@@ -395,15 +356,18 @@ master.
 **Tests**:
 - `tests/end_to_end.rs` — `plan_id_url_stable_across_done_flip`,
   `move_to_done` flows, anything asserting `state: "done"`. New
-  tests for `trinity finish` invariant rejection, `finished/`
-  snapshot rendering, snapshot-overrides-live-feedback behavior,
-  `--purge` / `--squash` / `--amend` modes.
+  tests for `finished/` snapshot rendering and
+  snapshot-overrides-live-feedback behaviour.
 - `src/disk_snapshot.rs` unit tests — `done_move` rename cases,
-  `done_counterpart_exists` cases; new finalize-snapshot ingestion.
+  `done_counterpart_exists` cases; new finalize-snapshot ingestion;
+  the event-log fold regression suite (all existing tests pass
+  unchanged plus monotone-freeze + split-fold equivalence cases
+  per Phase 2).
 - `src/projection.rs` unit tests — `plan_path_at_*` cases,
   `waiting_*_done_move`, `commit_kind_for` done-move case; new
-  cycle-derivation tests including post-finalize feedback
-  (must not unfinish).
+  per-commit attribution tests that assert frozen plans ignore
+  subsequent mutations.
+- CLI tests (`tests/cli_*`) are owned by the trinity-cli stub.
 
 ## Phases
 
@@ -428,7 +392,110 @@ Migration note: in-flight working-tree feedback at the old path is
 not picked up. Add a one-shot warning when `rebuild_repo` detects
 files under the legacy `commits/` segment.
 
-### Phase 2 — Finalize snapshot reader (additive)
+### Phase 2 — Sans-io core: event-log fold restructure
+
+Foundational restructure of `disk_snapshot::derive_state`. The
+current implementation is mostly a bulk-pass: it computes plans,
+attribution, plan_touches, feedback maps separately, then per-plan
+runs `build_commit_gates` to walk commits with carry-along state.
+
+The new shape is a single chronological commit fold:
+
+```text
+fn derive_state(snapshot) -> RepoState:
+    state = empty
+    feedback_by_target = index_feedback_by_target_sha(snapshot.feedback_files)
+    plans_from_head = group_plan_files(snapshot.plan_files)
+    finished_from_head = group_finalize_snapshots(snapshot.finalize_files)
+    state.plans = init plans from plans_from_head and finished_from_head
+
+    for entry in snapshot.history (chronological order):
+        apply_commit(state, entry)
+        if entry's tree contains a newly-satisfying finalize for any
+        plan: mark that plan frozen (sets state.plans[p].frozen_at =
+        Some(entry.commit)).
+        for fb in feedback_by_target.get(entry.commit) (ingest in
+        deterministic order, e.g. sorted by author label):
+            if state.plans[fb.plan_key].frozen_at.is_some(): skip
+            else: apply_feedback(state, fb)
+    return state
+```
+
+Per-commit mutations (`apply_commit`):
+
+- Update `commit_order`, `attribution`, `plan_touches`,
+  `commit_meta` (same logic as today, just per-commit instead of
+  bulk).
+- For each plan touched: if frozen, skip — no new attribution
+  entry for this plan, no plan_touches entry under this plan's
+  key (other plans the same commit touches still get their
+  entries). Frozen plans are invisible to subsequent mutations.
+- For each gate-relevant commit: extend the carry-along
+  participant set for the plan (the logic currently in
+  `build_commit_gates`), build the commit's gate entry. Skip
+  entirely for frozen plans.
+
+Why this matters:
+
+- **Monotone semantics fall out naturally.** Once `frozen_at` is
+  set for a plan, the fold skips it everywhere. No "search for
+  the finalize commit, then filter commits after it" — the freeze
+  is checked inline and forward-only.
+- **Future state-caching becomes trivial.** A cached `RepoState`
+  at commit C is just the fold's accumulator after processing
+  the first C+1 commits. Resuming a fold from a cached state means
+  setting `state = cached` and starting the loop at the next
+  commit. This plan does NOT implement caching, but the shape
+  must make it a 10-line addition rather than a rewrite.
+- **Event-log thinking.** Each commit is an event; the projection
+  is a fold over events. Future monotone rules (retired plans,
+  plan locks, anything else with "once X, always X" semantics)
+  fit the same shape without restructuring.
+
+Scope:
+
+- Rewrite `src/disk_snapshot.rs::derive_state` as the fold above.
+- Move `build_commit_gates`'s per-commit walk inline into the
+  fold; the existing function becomes `apply_gate_step(&mut
+  PlanGateState, &CommitGate-event)` — or its body merges into
+  the fold and the public function deletes.
+- Pre-index feedback by target SHA at the start of the fold.
+- Add `frozen_at: Option<CommitSha>` to `Plan` (recomputed each
+  rebuild, not persisted).
+- Update `attribution.rs` if it has any bulk-pass that needs to
+  become per-commit.
+- Preserve every existing observable behaviour: a repo with no
+  finalize snapshots produces the same `RepoState` as before. The
+  existing unit tests are the regression suite.
+
+Acceptance:
+
+- All existing `disk_snapshot` / `projection` tests pass
+  unchanged.
+- New tests assert monotone behaviour: frozen plan ignores
+  subsequent attribution, plan_touches, feedback for that plan
+  (verified via constructed `DiskSnapshot` fixtures).
+- New test: the fold can be split — running the fold over commits
+  `[c1..cN]` then continuing with `[cN+1..cM]` produces the same
+  state as running it over `[c1..cM]` in one pass. (Validates the
+  caching property without implementing the cache.)
+
+Risk:
+
+- Largest single mechanical change in this plan. Probably
+  300–500 LOC moved/rewritten in `disk_snapshot.rs` and
+  `projection.rs`.
+- The current bulk-pass + per-plan-gate-walk structure is
+  well-tested; care needed to preserve every edge case (the
+  existing tests are the spec).
+- Could be tempting to ship Phase 3+ before Phase 2 since
+  approval-derived-completion's user-facing behaviour doesn't
+  *require* the restructure. Don't. The whole point is a clean
+  core; bolting the snapshot reader onto the existing bulk-pass
+  and restructuring later is exactly the kind of "we'll fix it
+  next sprint" that never happens.
+
+### Phase 3 — Finalize snapshot reader (additive)
 
 Introduce the new `.trinity/finished/<stem>/` reader without
 removing any existing done-move code.
@@ -444,26 +511,28 @@ removing any existing done-move code.
   history is a separate code path used only by display, not by
   `is_finished`.
 - Projection: new `is_finished(&Plan) -> bool` that returns true
-  iff the plan file exists in HEAD AND the snapshot contains at
-  least one `FinalizeEntry` with verdict APPROVE. No relationship
-  checks against commits, attribution, or live feedback.
+  iff the plan file exists in HEAD AND `.trinity/finished/<stem>/`
+  contains ≥1 file AND every file in that directory starts with
+  `APPROVE`. No relationship checks against commits, attribution,
+  or live feedback.
 - Wire: new `state: "finished"` value in projection output for
   plans where `is_finished` returns true.
 - Tests:
-  - plan file + snapshot with APPROVE → finished
-  - plan file + snapshot with no APPROVE → active
-  - plan file + empty snapshot dir → active
-  - plan file + no snapshot dir → active
-  - no plan file + snapshot present → plan doesn't exist (not
+  - plan file + dir with 1 APPROVE → finished
+  - plan file + dir with 2 APPROVE → finished
+  - plan file + dir with 1 APPROVE + 1 REQUEST_CHANGES → active
+    (mixed = not finished)
+  - plan file + empty dir → active
+  - plan file + no dir → active
+  - no plan file + dir with APPROVE → plan doesn't exist (not
     finished, not active)
-  - plan file + snapshot with APPROVE + later impl commit on the
-    plan → STILL finished (the rule doesn't care about commit
-    ordering)
-  - plan file + snapshot with APPROVE + later REQUEST_CHANGES
-    feedback in working tree → STILL finished (live feedback
-    doesn't affect finished-ness)
+  - plan file + dir with APPROVE + later impl commit on the plan
+    → STILL finished (the rule doesn't care about commit ordering)
+  - plan file + dir with APPROVE + later REQUEST_CHANGES in
+    working-tree feedback → STILL finished (live feedback doesn't
+    affect finished-ness)
 
-### Phase 3 — Lifecycle state derivation (additive)
+### Phase 4 — Lifecycle state derivation (additive)
 
 The new `PlanLifecycle` enum exists alongside the legacy
 `PlanState::Done`, so behavior can be diffed.
@@ -486,339 +555,15 @@ The new `PlanLifecycle` enum exists alongside the legacy
   existing `state` field. Tests assert both are present and
   consistent.
 
-### Phase 4 — `trinity init` CLI
+> **CLI work split off.** The original draft had Phases 5–8
+> implementing `trinity init`, `trinity finish`, `trinity purge`,
+> and the history-rewriting engine. That scope is now owned by
+> `.trinity/stubs/trinity-cli.md`, which depends on this plan
+> landing first (it needs the finalize-snapshot reader from Phase 3
+> and the event-log fold from Phase 2). Splitting keeps this plan
+> focused on the daemon-side lifecycle change.
 
-Scaffold a new repo for Trinity use.
-
-- New subcommand `trinity init [--repo <path>] [--ignore]`. Default
-  is cwd.
-- Always creates `.trinity/plans/`. The `.trinity/feedback/`
-  directory is created lazily by the daemon on first feedback
-  write; `trinity init` doesn't materialise it.
-- Default mode (no `--ignore`): creates `.trinity/.gitignore`
-  containing:
-  ```
-  # Working-tree feedback is local until `trinity finish` snapshots
-  # it into .trinity/finished/.
-  feedback/
-  ```
-- `--ignore` mode: instead of creating `.trinity/.gitignore`,
-  appends `.trinity/feedback/` to the repo-root `.gitignore`
-  (creating the root file if absent, deduping if the line is
-  already present). This is the "maintainer is willing to ignore
-  some Trinity working state but doesn't want a `.trinity/.gitignore`
-  file in their tree" mode — useful for soft-introducing Trinity
-  into a project whose owner isn't adopting it wholesale.
-- Either mode refuses to overwrite an existing
-  `.trinity/.gitignore` with different contents (clear error
-  prompts the user to delete or merge manually).
-- Dedupe / pre-flight check before adding any rule (both `--ignore`
-  and default modes): run `git check-ignore -v .trinity/feedback/x`
-  to determine whether the path is already ignored by any
-  source — repo-root `.gitignore`, `.git/info/exclude`, or the
-  user's `core.excludesFile` (typically `~/.gitignore_global`). If
-  already covered, skip the rule add and print which source covers
-  it. This prevents a tracked `.gitignore` rule the project owner
-  didn't want when their global excludes already handle it.
-- Either mode warns if any active ignore source already excludes
-  all of `.trinity/` — this would hide Trinity's tracked artifacts
-  (plans, finished snapshots) too, and the operator probably
-  didn't intend it. Detection via the same `git check-ignore -v`
-  call.
-- Optionally calls the daemon (if running on localhost) to register
-  the repo, so `start_plan` works immediately after.
-- Exits non-zero with a clear message if the path is not a git
-  worktree.
-
-### Phase 5 — `trinity finish` CLI (no flags)
-
-The core finalize ceremony. No `--purge`/`--squash`/`--amend` yet.
-
-The CLI does all the sophisticated validation that the daemon
-deliberately skips. The daemon's rule is just "plan file +
-APPROVE in finished/ = finished" (per Definitions). The CLI's
-job is to make sure the APPROVE that lands in `finished/` is one
-the operator would actually stand behind.
-
-- New subcommand `trinity finish <plan-id-or-stem>`. Argument is
-  optional if invoked from a directory under a Trinity-registered
-  repo with exactly one in-flight active plan.
-- Pre-commit invariant checks (refuse to proceed if any fail;
-  each failure prints what's missing):
-  - Repo has a Trinity-registered plan with this id, and the
-    plan file exists in HEAD.
-  - There is at least one reviewable commit attributed to this
-    plan (`PlanOnly`, `CodeOnly`, or `Mixed`). Plan-only is fine
-    — if you want to finish a plan that has no impl yet, that's
-    the operator's call. The CLI doesn't enforce a "must have
-    impl" rule.
-  - The live working-tree gate for the latest reviewable commit
-    is fully approved (≥1 APPROVE, 0 REQUEST_CHANGES, no
-    unmarked/ambiguous, every participant who has voted has
-    approved).
-  - The reviewers in the live gate are well-known Trinity
-    participants (the feedback files parse, the author labels are
-    valid, no reserved names misused).
-  - Working tree is clean enough to commit
-    (`.trinity/finished/<stem>/` writes won't conflict with
-    uncommitted changes).
-  - The daemon is reachable (CLI queries it for projection
-    state).
-- If checks pass:
-  - Remove any existing `.trinity/finished/<stem>/` contents.
-  - Copy each working-tree feedback file from
-    `.trinity/feedback/<stem>/<latest-reviewable-sha>/*.md` into
-    `.trinity/finished/<stem>/<agent>.md`. The copy contains only
-    the verdict + body (Trinity's parsed feedback format) — no SHA
-    metadata.
-  - `git add .trinity/finished/<stem>/`.
-  - `git commit -m "Finish <plan-stem>"` (commit message
-    customizable via `-m`).
-- Idempotent: re-running `trinity finish` on an already-finished
-  plan when no new reviewable commits have landed since the last
-  finalize is a no-op (prints "already finished"). With new
-  reviewable commits, it makes a new finalize commit overwriting
-  the snapshot with the latest reviewer feedback.
-
-### Phase 6 — `trinity finish` flags: `--amend`, `--squash --purge`
-
-These two are tractable: `--amend` rewrites a single commit at HEAD,
-and `--squash --purge` collapses history into one commit and
-removes Trinity artifacts in the same operation (no per-commit
-history rewrite needed).
-
-**`--amend`**: HEAD must be a finalize commit (i.e., it most
-recently touched `.trinity/finished/<stem>/`). `git commit --amend`
-carrying the same logic as Phase 5 plus any combined flags. Used
-when you ran `trinity finish` and realised you wanted `--squash`
-or `--purge` after all.
-
-**`--squash "<message>"`**: walk back to find the earliest commit
-attributed to this plan. Verify no foreign commits are interleaved
-between that commit and HEAD; refuse with a clear error if there
-are. Soft-reset to the parent of the earliest plan-attributed
-commit and re-commit the entire diff with the supplied message. The
-result is one commit containing all plan-attributed work.
-
-A **foreign commit** for `trinity finish foo --squash` is any
-commit in the range that is not exclusively attributed to plan
-`foo`. That includes:
-
-- Commits attributed to a different plan only (e.g., plan `bar`).
-- Commits attributed to no plan at all (`Unattributed`).
-- **Cross-plan mixed commits** (e.g., touches both
-  `.trinity/plans/foo.md` and `.trinity/plans/bar.md`, or
-  attributed to `foo` but also touching `bar`'s feedback/finished
-  artifacts).
-
-The history-rewriting engine in Phase 7 can handle cross-plan mixed
-commits (rewrite to keep `bar`'s content, strip `foo`'s). But
-`--squash` cannot — squash collapses a contiguous range into one
-commit, and you can't selectively keep one plan's content while
-collapsing another's. So `--squash` refuses on any cross-plan
-mixed commit in the range, with an error explaining the
-alternative: use plain `--purge` (which CAN rewrite cross-plan
-mixed commits) if you want this plan's content gone but `bar`'s
-preserved.
-
-**`--squash --purge`**: same as `--squash`, but the recommitted tree
-omits everything under `.trinity/` for this plan (no `<stem>.md`,
-no `.trinity/finished/<stem>/`, no feedback artifacts). Net effect:
-one commit containing only the code changes the plan produced, with
-no externally visible trace that Trinity was used.
-
-### Phase 7 — `trinity finish --purge` (history rewriting)
-
-`--purge` without `--squash` is the hard mode: preserve the
-per-commit history of the plan, but rewrite each plan-attributed
-commit to strip its `.trinity/` content. Mixed commits (code +
-plan-revision in one commit) need special handling — keep the code,
-drop the `.trinity/` paths, preserve the commit message and author.
-
-Implementation approach (call out as a deliberate decision):
-
-- Walk `commit_order` for the range from the earliest plan-attributed
-  commit to HEAD.
-- For each commit in the range, decide one of:
-  - **Drop**: commit's tree only changed `.trinity/` paths for this
-    plan. Skip the commit entirely (parent chain skips over it).
-  - **Keep verbatim**: commit didn't touch `.trinity/` for this plan
-    (foreign commit, or pure code commit). Reuse as-is.
-  - **Rewrite**: commit touched both `.trinity/` (for this plan)
-    and other paths. Build a new tree omitting the plan's
-    `.trinity/` entries, but keeping everything else. Reuse the
-    author, message, and timestamp. New parent is the previous
-    rewritten commit (or its dropped predecessor).
-- Implementation via the same subprocess approach the rest of
-  Trinity uses (`tokio::process::Command` wrapping git plumbing) —
-  Trinity has no libgit2/gix dependency and adding one is out of
-  scope. Construct each rewritten commit with `git ls-tree` +
-  `git mktree` (or `git read-tree` + `git write-tree` against a
-  scratch index) to build the new tree object, then `git commit-tree`
-  to create the commit pointing at that tree with the chosen parent.
-  Update the branch with `git update-ref` at the end of the walk.
-  All operations happen via `git_io`'s existing subprocess wrappers.
-  Avoid `git filter-branch` (deprecated) and `git filter-repo`
-  (external dep).
-
-Refuse to proceed (clear error message in each case) if:
-- The range contains a merge commit (handling merges correctly
-  through a tree rewrite is out of scope).
-- The working tree is dirty.
-- The current branch is not the same as where the plan was started
-  (we don't want to rewrite shared branches).
-- The branch is protected (operator opt-in via
-  `--allow-rewrite-protected` is fine; default is refuse).
-
-#### `--purge` edge cases (mandatory test coverage in Phase 7)
-
-The complexity of `--purge` justifies a dedicated test list. Every
-case below must have an explicit regression test. Each test
-constructs a small repo with the named commit shape, runs
-`trinity finish --purge`, and asserts the final history matches
-expectation.
-
-1. **Pure plan-only commit**: commit touched only
-   `.trinity/plans/<stem>.md`. Result: dropped from history.
-2. **Pure code commit, plan-attributed**: commit touched only
-   non-`.trinity/` paths but was attributed to this plan via
-   `Implements: <stem>` trailer (or equivalent). Result: kept
-   verbatim, included in the post-purge history.
-3. **Mixed commit (code + plan revision)**: commit touched both
-   `.trinity/plans/<stem>.md` and code. Result: rewritten — code
-   changes preserved, plan-file change removed. Commit message,
-   author, timestamp preserved. SHA changes (necessarily).
-4. **Multiple mixed commits in sequence**: c1 mixed, c2 mixed, c3
-   pure-code. Result: c1 and c2 each rewritten independently; c3
-   kept verbatim; parent chain links c1' → c2' → c3' correctly.
-5. **Interleaved foreign commit**: c1 plan, c2 (foreign, touches
-   unrelated code), c3 mixed. Result: c1 dropped, c2 kept (foreign
-   commits are never rewritten), c3 rewritten. New chain: c2 →
-   c3'. The foreign commit's parent is c1's parent (since c1 was
-   dropped).
-6. **Foreign commit between plan-only and finalize**: c1 plan, c2
-   foreign, c3 impl, c4 finalize. Result: c1 dropped, c2 kept, c3
-   kept verbatim (pure code, no .trinity touches), c4 kept
-   verbatim (the finalize snapshot is preserved under `--purge`;
-   only `--squash --purge` strips it — see case 7).
-7. **The finalize commit at HEAD**: commit touched only
-   `.trinity/finished/<stem>/`. Under `--purge`, the finalize
-   snapshot is the durable record and is kept. Under
-   `--squash --purge`, the finalize snapshot is dropped along with
-   everything else under `.trinity/` for this plan, leaving one
-   code-only commit. This split is the plan's intentional choice:
-   `--purge` preserves auditability of the resolution;
-   `--squash --purge` is the "Trinity used internally, externally
-   invisible" mode.
-8. **Multiple plans in the repo**: plan `foo` and plan `bar` both
-   active. Running `trinity finish foo --purge` only rewrites
-   commits that touched `.trinity/plans/foo.md` or
-   `.trinity/feedback/foo/` or `.trinity/finished/foo/`. Commits
-   that only touched `bar`'s artifacts are foreign (kept as-is).
-   Mixed `foo`+`bar` commits are rewritten to strip foo but keep
-   bar.
-9. **Empty `git commit --allow-empty` impl commit**: a deliberately
-   empty commit attributed to this plan (used in the no-impl-
-   workflow workaround). Result: kept verbatim (still attributable,
-   no .trinity to strip).
-10. **Plan intro commit also creates the `.trinity/plans/`
-    directory**: the first plan commit ever. Result: drop the
-    plan file; the directory itself stays in the working tree as
-    long as some other artifact references it.
-11. **Working tree dirty**: refuse before any rewriting begins.
-    Original branch state untouched.
-12. **Merge commit in range**: refuse with clear message
-    ("`--purge` cannot rewrite history containing merge commits;
-    rebase first or use `--squash` instead").
-13. **Re-running `--purge` after `--purge`**: idempotent. If the
-    plan's history already has no .trinity touches, the rewrite is
-    a no-op.
-14. **`--amend --purge` on a finalize commit**: amend HEAD finalize
-    to also strip the most-recent plan-touching commit if it's
-    HEAD's parent. Otherwise, refuse — `--amend` only rewrites
-    HEAD.
-
-### Phase 8 — `trinity purge` standalone command
-
-The `--purge` machinery from Phase 7 is also useful outside the
-finalize context. Operators may want to strip a plan's Trinity
-artifacts from history without making a finalize commit:
-
-- the plan was abandoned mid-flight and shouldn't leave a trace
-- the operator decided Trinity wasn't the right tool for this
-  particular work after all
-- post-finalize cleanup that the original `trinity finish` didn't
-  ask for
-
-Subcommand: `trinity purge <plan-id-or-stem>`. Same history-
-rewriting engine as `trinity finish --purge`; just no finalize
-commit and no gate check. The semantics are "remove every commit's
-.trinity/<this-plan>/ content from history; preserve code changes
-on mixed commits."
-
-Flags:
-
-- `--squash "<message>"`: collapse plan-attributed commits into one
-  (same interleaving rules as `trinity finish --squash`).
-- `--amend`: amend HEAD if HEAD already touches this plan's
-  artifacts.
-- No `--purge` flag — that's the command's whole purpose.
-
-Flags:
-
-- `--squash "<message>"` — covered above.
-- `--amend` — covered above.
-- `--drop-finalize` — when `.trinity/finished/<stem>/` exists in
-  HEAD, also remove it as part of the purge. Implementation: the
-  history-rewriting engine adds `.trinity/finished/<plan>/` to its
-  per-commit strip set (it normally only strips `.trinity/plans/`
-  and `.trinity/feedback/` for `trinity purge`). The result is one
-  rewritten history with no Trinity artifacts for this plan
-  anywhere, including the snapshot. Interaction with `--amend`:
-  legal — amends HEAD's tree to also drop the finalize snapshot.
-  Interaction with `--squash`: redundant (squash already strips
-  everything), no-op flag in that combination.
-- `--yes` — skips the interactive confirmation prompt for scripted
-  use.
-- `--allow-rewrite-protected` — opt-in to rewriting a protected
-  branch.
-
-Safety:
-
-- Refuse on dirty working tree.
-- Refuse on protected branches without `--allow-rewrite-protected`.
-- Refuse if `.trinity/finished/<stem>/` exists in HEAD and neither
-  `--squash` nor `--drop-finalize` is supplied. Bare `--purge` in
-  that state would preserve the snapshot but leave it pointing at
-  history that no longer has the impl commits — an orphan that
-  looks finished but has no provenance. The user must opt in
-  explicitly to one of the two unambiguous outcomes (squash
-  everything into one, or drop the snapshot too).
-- Prompt for confirmation by default; `--yes` skips the prompt
-  for scripted use.
-
-The `--purge` edge cases from Phase 7 mostly apply, but not all
-identically. The shared engine behaves the same; the differences
-are at the command's boundary:
-
-- Cases 1–6 and 8–13 (mixed commits, foreign-commit
-  interleaving, multi-plan rewrites, empty impl commits, dirty
-  worktree, merge-commit refusal, idempotency) apply identically.
-- Case 7 (finalize commit at HEAD) does NOT apply — `trinity
-  purge` never creates a finalize commit, so HEAD being a
-  finalize commit is an *input* condition, not the operation's
-  outcome. The Phase 8 "orphan finalize snapshot" pre-flight
-  refusal is the equivalent guard.
-- Case 14 (`--amend --purge`) maps to `trinity purge --amend`
-  with the same semantics.
-
-`tests/cli_purge.rs` covers each of these, explicitly noting
-which cases it inherits from `tests/cli_finish_purge.rs` and
-which it owns directly. Do not phrase the relationship as "all
-cases apply identically" — that overstates and creates exactly
-the spec drift codex flagged.
-
-### Phase 9 — Wire/UI cutover
+### Phase 5 — Wire/UI cutover
 
 Frontend and daemon flip together. Coordinated breaking change.
 
@@ -833,7 +578,7 @@ Frontend and daemon flip together. Coordinated breaking change.
   asserting that the URL doesn't move when a plan becomes finished
   (because the file doesn't move).
 
-### Phase 10 — Delete `PlanState::Done` and `DoneMove` types
+### Phase 6 — Delete `PlanState::Done` and `DoneMove` types
 
 Once the new lifecycle drives every response, the old types are dead.
 
@@ -854,10 +599,10 @@ Once the new lifecycle drives every response, the old types are dead.
 - Delete `disk_snapshot` test fixtures for done-move and `done/`
   plan files.
 
-### Phase 11 — Delete the `Phase` enum
+### Phase 7 — Delete the `Phase` enum
 
 Picked up from `architecture-tech-debt-sweep`, which deferred this
-piece pending the `PlanState::Done` deletion that lands in Phase 10
+piece pending the `PlanState::Done` deletion that lands in Phase 6
 of this plan. The deferral was sequencing, not scope; both halves
 land in this sweep.
 
@@ -866,7 +611,7 @@ land in this sweep.
   helper: `PlanOnly | Mixed → Planning`, `CodeOnly → Implementing`.
 - Wire `phase` field becomes a function of the latest reviewable
   commit's `CommitKind`, not a stored enum.
-- Frontend `phase: "done"` rendering is already moot after Phase 9
+- Frontend `phase: "done"` rendering is already moot after Phase 5
   (the wire never emits it once `PlanState::Done` is gone); this
   phase deletes the type as well.
 
@@ -876,7 +621,7 @@ Two migrations: stale `done/` files and the feedback-path rename.
 
 ### Stale `.trinity/plans/done/` files (working tree)
 
-A repo upgrading past Phase 10 will have a `.trinity/plans/done/`
+A repo upgrading past Phase 6 will have a `.trinity/plans/done/`
 directory with files the daemon can no longer parse as plans. The
 daemon must not silently drop these from the visible plan set.
 
@@ -1065,21 +810,26 @@ Mention in docs; don't restrict.
    Plan-level `archived` is not emitted.
 7. `archived_cycles` field on plan detail wire carries per-cycle
    metadata sourced from `git log .trinity/finished/<stem>/`.
-8. **Daemon finished rule is exactly two checks** (regression
+8. **Daemon finished rule is exactly the file checks** (regression
    test): the daemon returns `state: "finished"` iff
    `.trinity/plans/<stem>.md` exists in HEAD AND
-   `.trinity/finished/<stem>/` in HEAD contains at least one
-   well-formed APPROVE feedback file. No other inputs influence
-   the result. Tests assert:
+   `.trinity/finished/<stem>/` in HEAD contains ≥1 file AND every
+   file in that directory has its first line starting with
+   `APPROVE`. Tests assert:
    - presence of impl commit doesn't matter (plan-only finish
      works)
-   - commit-ordering doesn't matter (finished entry committed
-     before the plan file → still finished)
    - post-finalize REQUEST_CHANGES in working-tree feedback →
      still finished
    - post-finalize impl commit → still finished
+   - mixed-verdict directory (≥1 APPROVE + ≥1 non-APPROVE) →
+     active, NOT finished
    - removing `.trinity/finished/<stem>/` → back to active
    - removing `.trinity/plans/<stem>.md` → plan doesn't exist
+   - the pathological "snapshot committed before plan" history
+     case is unspecified; the CLI never produces it, and either
+     "finished" or "active" is acceptable depending on whether
+     the implementation reads HEAD or replays events. Test
+     coverage skips this case.
 9. Plan inference excludes finished plans. `wait_for_work`,
    `get_context`, and any other surface that resolves "the current
    plan" when no `plan_id` is supplied treats only plans with
@@ -1096,101 +846,33 @@ Mention in docs; don't restrict.
 11. Legacy-path files in the working tree surface as a warning,
     not a silent drop.
 
-### CLI: `trinity init`
-
-12. `trinity init` in a git worktree creates `.trinity/plans/`
-    and (without `--ignore`) `.trinity/.gitignore` containing the
-    `feedback/` ignore rule. `.trinity/feedback/` is NOT created
-    eagerly — the daemon materialises it lazily on first feedback
-    write.
-13. `trinity init --ignore` appends `.trinity/feedback/` to the
-    repo-root `.gitignore` (creating the file if absent, deduping
-    if the line is already present) and does NOT create
-    `.trinity/.gitignore`.
-14. `trinity init` refuses if `.trinity/` already exists with
-    conflicting contents (e.g., a `.trinity/.gitignore` whose
-    contents differ from what would be written).
-
-### CLI: `trinity finish` (core)
-
-15. `trinity finish <plan>` refuses with a clear message when the
-    live gate is not fully approved.
-16. `trinity finish <plan>` on a fully approved gate creates
-    `.trinity/finished/<stem>/<agent>.md` for each approver
-    (flat, no SHA segment) and commits the change.
-17. `trinity finish <plan>` is idempotent on an already-finished
-    plan with no new impl commits.
-
-### CLI: `trinity finish` flags
-
-18. `--amend` re-runs the finalize on HEAD when HEAD is a finalize
-    commit; refuses otherwise.
-19. `--squash <msg>` collapses contiguous plan-attributed commits
-    into one with the supplied message; refuses on interleaved
-    foreign commits.
-20. `--squash --purge <msg>` collapses AND strips `.trinity/`
-    content for this plan in the resulting commit.
-21. `--purge` (without `--squash`) rewrites each plan-attributed
-    commit to remove `.trinity/` content for this plan, preserving
-    code changes, author, message, timestamp.
-22. `--purge` keeps `.trinity/finished/<stem>/` in HEAD (proof of
-    resolution); `--squash --purge` strips it.
-
-### `--purge` edge cases (mandatory regression tests)
-
-23. Every case 1–14 in the Phase 7 `--purge` edge cases section
-    has an explicit test in `tests/cli_finish_purge.rs` (or
-    equivalent module).
-
 ### Migration
 
-24. Existing repos with `.trinity/plans/done/*.md` files surface
+12. Existing repos with `.trinity/plans/done/*.md` files surface
     those files in `plan_conflicts` with a migration message; no
     silent drop.
-25. `tests/end_to_end.rs` includes a regression test that boots a
+13. `tests/end_to_end.rs` includes a regression test that boots a
     repo containing `.trinity/plans/done/legacy.md`, verifies the
     conflict surfaces, and verifies the legacy file is not picked
     up as an active plan.
-26. Working-tree feedback at the legacy `commits/` path surfaces a
+14. Working-tree feedback at the legacy `commits/` path surfaces a
     one-shot warning per rebuild.
 
 ### `Phase` enum
 
-27. The `Phase` enum is removed from the codebase (Phase 11).
+15. The `Phase` enum is removed from the codebase (Phase 7).
     Production code computes posture from `CommitKind` via the
     `current_posture` helper rather than reading a stored variant.
     No `Phase::Done` consumer remains.
 
-### CLI: `trinity purge`
+### CLI work (separate stub)
 
-28. `trinity purge <plan>` removes that plan's `.trinity/` content
-    from history without making a finalize commit. Same
-    history-rewriting engine as `trinity finish --purge`; the
-    cases that overlap (mixed commits, foreign-commit
-    interleaving, merge-commit refusal, etc. — cases 1–6 and
-    8–13 from the Phase 7 list) behave identically.
-29. `trinity purge` adds its own pre-flight refusal: if
-    `.trinity/finished/<stem>/` exists in HEAD and neither
-    `--squash` nor `--drop-finalize` is supplied, refuse to leave
-    an orphan finalize snapshot. (Case 7 of the Phase 7 list — the
-    finalize commit at HEAD — does not apply to standalone purge
-    because standalone purge never creates a finalize commit; the
-    equivalent case here is "finalize snapshot from a prior
-    `trinity finish` lives in HEAD," covered by the orphan check.)
-30. `trinity purge --squash <msg>` collapses plan-attributed
-    commits into one with the supplied message, stripping
-    `.trinity/` content (including any finalize snapshot) for the
-    plan.
-31. `trinity purge` refuses without explicit confirmation on
-    protected branches and on dirty working trees.
-
-### Acceptance: `--purge` test suites split by subcommand
-
-32. `tests/cli_purge.rs` covers `trinity purge` cases (the 12
-    cases that share semantics with `trinity finish --purge`, plus
-    the orphan-finalize-snapshot pre-flight cases). The two test
-    files do NOT claim identical assertions — each names which
-    cases are shared, which are unique.
+16. The CLI commands (`trinity init`, `trinity finish`,
+    `trinity purge`), their flags, the history-rewriting engine,
+    and the 14 `--purge` edge-case regression tests live in
+    `.trinity/stubs/trinity-cli.md`. That stub's acceptance
+    criteria are not gating this plan; this plan delivers the
+    daemon-side machinery the CLI will read.
 
 ## Out of Scope (Explicit)
 
