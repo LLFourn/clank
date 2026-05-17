@@ -201,6 +201,15 @@ pub fn derive_state(repo_root: PathBuf, snapshot: DiskSnapshot) -> RepoState {
                 if is_delete {
                     current_plan_in_tree.remove(&touch.session);
                     current_plan_bodies.remove(&touch.session);
+                    // Monotone-finished: frozen plans stay in
+                    // `state.plans` regardless of subsequent
+                    // deletions (their body was captured at freeze
+                    // time). Unfrozen plans have no anchor once their
+                    // plan file is gone, so this commit removes them.
+                    if !is_frozen(&state, &touch.session) {
+                        state.plans.remove(&touch.session);
+                        gate_participants.remove(&touch.session);
+                    }
                 } else {
                     current_plan_in_tree.insert(touch.session.clone());
                     if let Some(body) = &touch.new_body {
@@ -361,20 +370,6 @@ pub fn derive_state(repo_root: PathBuf, snapshot: DiskSnapshot) -> RepoState {
                 plan.commits.insert(commit_sha.clone(), gate);
             }
         }
-    }
-
-    // Post-fold prune: a plan exists iff (a) its plan file is in
-    // HEAD's tree OR (b) it was ever frozen. Plans that fail both
-    // (Intro'd then deleted without freezing) have no historical
-    // anchor and must not surface as ghost active plans.
-    let stale_keys: Vec<PlanKey> = state
-        .plans
-        .iter()
-        .filter(|(k, plan)| plan.frozen_at.is_none() && !current_plan_in_tree.contains(*k))
-        .map(|(k, _)| k.clone())
-        .collect();
-    for k in stale_keys {
-        state.plans.remove(&k);
     }
 
     state
