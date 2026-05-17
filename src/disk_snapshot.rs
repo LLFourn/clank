@@ -14,13 +14,18 @@
 //! `<repo>/.trinity/feedback/`. `rebuild::rebuild_repo` glues the two
 //! together.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 
-use crate::attribution::{CommitChanges, classify, effective_session};
-use crate::disk_format::{FeedbackPath, parse_verdict};
+use crate::attribution::{CommitChanges, FinalizeChangeKind, classify, effective_session};
+use crate::disk_format::{
+    FeedbackPath, finalize_first_line_starts_with_approve, parse_verdict, plan_path_is_done,
+};
 use crate::lifecycle::{AgentLabel, CommitSha, PlanKey, content_hash};
-use crate::repo_state::{Feedback, Plan, RepoState};
+use crate::repo_state::{
+    AttributionResult, CommitKind, Feedback, Plan, PlanTouchKind, RepoState, Verdict,
+};
+use crate::review_state::{CommitGate, CommitGateState};
 
 /// Everything Trinity needs to derive a repo's state, materialized into
 /// structured types. Built by `git_io::snapshot`; consumed by
@@ -88,17 +93,194 @@ pub struct FeedbackBlob {
     pub created_at: i64,
 }
 
-/// Pure derivation of `RepoState` from a snapshot. No IO. Tests in this
-/// module construct synthetic snapshots and assert on the result.
+/// Pure derivation of `RepoState` from a snapshot. No IO.
+///
+/// Single chronological commit fold: for each commit in
+/// `snapshot.history` (oldest-first), update attribution and
+/// plan_touches, replay finalize-snapshot changes into a running
+/// per-plan tree state, check the finalize rule (and set
+/// `frozen_at` monotonically), then build per-plan gate entries
+/// applying the working-tree feedback for that commit. Frozen plans
+/// are skipped end-to-end for subsequent commits: no new attribution,
+/// plan_touches, gates, or lifecycle change.
 pub fn derive_state(repo_root: PathBuf, snapshot: DiskSnapshot) -> RepoState {
     let mut state = RepoState::empty(repo_root);
     state.head = snapshot.head;
 
-    // 1. Group plan-file blobs by PlanKey to detect collisions before
-    //    inserting. Same-key groups land in `plan_conflicts` so neither
-    //    file silently wins (see plan-path-identity §1b).
+    init_plans_from_head(&mut state, snapshot.plan_files);
+    let plan_keys: Vec<PlanKey> = state.plans.keys().cloned().collect();
+
+    // Pre-index feedback per plan: (target_sha, author) -> Feedback.
+    let mut feedback_by_plan: BTreeMap<PlanKey, BTreeMap<(CommitSha, AgentLabel), Feedback>> =
+        BTreeMap::new();
+    for fb in snapshot.feedback_files {
+        if !state.plans.contains_key(&fb.parsed.plan_key) {
+            continue;
+        }
+        let verdict = parse_verdict(&fb.body);
+        feedback_by_plan
+            .entry(fb.parsed.plan_key.clone())
+            .or_default()
+            .insert(
+                (fb.parsed.target_sha, fb.parsed.author),
+                Feedback {
+                    path: fb.abs_path,
+                    body: fb.body,
+                    verdict,
+                    created_at: fb.created_at,
+                },
+            );
+    }
+
+    // Per-plan carry-along state for the fold.
+    let mut current_effective: Option<PlanKey> = None;
+    let mut plan_at_active_path: BTreeSet<PlanKey> = BTreeSet::new();
+    let mut finalize_tree: BTreeMap<PlanKey, BTreeMap<String, String>> = BTreeMap::new();
+    let mut gate_participants: BTreeMap<PlanKey, Vec<AgentLabel>> = plan_keys
+        .iter()
+        .map(|k| (k.clone(), Vec::new()))
+        .collect();
+
+    for entry in &snapshot.history {
+        // Drop any current_effective that points at a now-frozen plan.
+        if let Some(k) = &current_effective {
+            if is_frozen(&state, k) {
+                current_effective = None;
+            }
+        }
+
+        // Apply commit: attribution + plan_touches (skipping frozen-plan
+        // touches under their key). commit_order grows unconditionally.
+        let commit_sha = entry.commit.clone();
+        state.commit_order.push(commit_sha.clone());
+
+        let raw_attr = classify(&entry.changes, current_effective.as_ref());
+        current_effective = effective_session(&entry.changes, current_effective.as_ref());
+        // If raw_attr points at a frozen plan, downgrade to Unattributed —
+        // the plan is sealed; post-freeze code commits don't attribute to it.
+        let attr = match &raw_attr {
+            AttributionResult::Attributed { session, .. } if is_frozen(&state, session) => {
+                AttributionResult::Unattributed
+            }
+            _ => raw_attr,
+        };
+        // Same filter on current_effective for future inheritance.
+        if let Some(k) = &current_effective {
+            if is_frozen(&state, k) {
+                current_effective = None;
+            }
+        }
+        state.attribution.insert(commit_sha.clone(), attr);
+
+        if !entry.changes.plan_touches.is_empty() {
+            let mut filtered: Vec<(PlanKey, PlanTouchKind)> = Vec::new();
+            for touch in &entry.changes.plan_touches {
+                if !is_frozen(&state, &touch.session) {
+                    filtered.push((touch.session.clone(), touch.kind));
+                }
+                // Track plan-file-at-active-path from new_path. None ==
+                // deletion (or test fixture without explicit path).
+                match &touch.new_path {
+                    Some(p) if !plan_path_is_done(p) => {
+                        plan_at_active_path.insert(touch.session.clone());
+                    }
+                    Some(_) => {
+                        plan_at_active_path.remove(&touch.session);
+                    }
+                    None => {
+                        // Fixture didn't specify; fall back to HEAD's
+                        // plan_path so synthetic tests without finalize
+                        // changes still behave as before.
+                        if let Some(plan) = state.plans.get(&touch.session) {
+                            if !plan_path_is_done(&plan.plan_path) {
+                                plan_at_active_path.insert(touch.session.clone());
+                            }
+                        }
+                    }
+                }
+            }
+            if !filtered.is_empty() {
+                state.plan_touches.insert(commit_sha.clone(), filtered);
+            }
+        }
+
+        // Apply finalize_changes to the running per-plan finalize tree.
+        // Collect the set of plans potentially affected (so we only check
+        // the rule when a touched commit could plausibly have changed it).
+        let mut maybe_affected: BTreeSet<PlanKey> = BTreeSet::new();
+        for fc in &entry.changes.finalize_changes {
+            let files = finalize_tree.entry(fc.plan_key.clone()).or_default();
+            match &fc.kind {
+                FinalizeChangeKind::Upsert { first_line } => {
+                    files.insert(fc.file_name.clone(), first_line.clone());
+                }
+                FinalizeChangeKind::Remove => {
+                    files.remove(&fc.file_name);
+                }
+            }
+            maybe_affected.insert(fc.plan_key.clone());
+        }
+        for touch in &entry.changes.plan_touches {
+            maybe_affected.insert(touch.session.clone());
+        }
+
+        // Finalize-rule check: for each maybe-affected plan that isn't
+        // frozen and whose plan file is at the active path now, fire if
+        // the finalize tree contains ≥1 file and all first lines start
+        // with APPROVE.
+        for plan_key in &maybe_affected {
+            if !state.plans.contains_key(plan_key) {
+                continue;
+            }
+            if is_frozen(&state, plan_key) {
+                continue;
+            }
+            if !plan_at_active_path.contains(plan_key) {
+                continue;
+            }
+            let files = finalize_tree.get(plan_key);
+            if finalize_rule_satisfied(files) {
+                if let Some(plan) = state.plans.get_mut(plan_key) {
+                    plan.frozen_at = Some(commit_sha.clone());
+                    plan.freeze_events.push(commit_sha.clone());
+                }
+            }
+        }
+
+        // Per-plan gate carry: extend participants + build gate entry
+        // for this commit (if reviewable). Skip frozen plans entirely.
+        for plan_key in &plan_keys {
+            if is_frozen(&state, plan_key) {
+                continue;
+            }
+            let kind = crate::projection::commit_kind_for(
+                plan_key,
+                &commit_sha,
+                &state.plan_touches,
+                &state.attribution,
+            );
+            if !matches!(
+                kind,
+                CommitKind::PlanOnly | CommitKind::CodeOnly | CommitKind::Mixed
+            ) {
+                continue;
+            }
+            let participants = gate_participants.get_mut(plan_key).expect("init above");
+            let fb_map = feedback_by_plan.get(plan_key);
+            let gate = build_gate_step(&commit_sha, fb_map, participants);
+            if let Some(plan) = state.plans.get_mut(plan_key) {
+                plan.commits.insert(commit_sha.clone(), gate);
+            }
+        }
+    }
+
+    state.commit_meta = snapshot.commit_meta;
+    state
+}
+
+fn init_plans_from_head(state: &mut RepoState, plan_files: Vec<PlanFileBlob>) {
     let mut by_key: BTreeMap<PlanKey, Vec<PlanFileBlob>> = BTreeMap::new();
-    for pf in snapshot.plan_files {
+    for pf in plan_files {
         by_key.entry(pf.plan_key.clone()).or_default().push(pf);
     }
     for (key, mut entries) in by_key {
@@ -121,86 +303,94 @@ pub fn derive_state(repo_root: PathBuf, snapshot: DiskSnapshot) -> RepoState {
                 plan_intro: pf.plan_intro,
                 plan_intro_parent: pf.plan_intro_parent,
                 commits: BTreeMap::new(),
+                frozen_at: None,
+                freeze_events: Vec::new(),
             },
         );
     }
-
-    // 2. Attribution walk along the first-parent chain.
-    let mut current_effective: Option<PlanKey> = None;
-    for entry in &snapshot.history {
-        let result = classify(&entry.changes, current_effective.as_ref());
-        current_effective = effective_session(&entry.changes, current_effective.as_ref());
-        if !entry.changes.plan_touches.is_empty() {
-            state.plan_touches.insert(
-                entry.commit.clone(),
-                entry
-                    .changes
-                    .plan_touches
-                    .iter()
-                    .map(|touch| (touch.session.clone(), touch.kind))
-                    .collect(),
-            );
-        }
-        state.attribution.insert(entry.commit.clone(), result);
-        state.commit_order.push(entry.commit.clone());
-    }
-
-    // 3. Feedback ingestion. Files for unknown plans (including those
-    //    in `plan_conflicts`) are dropped; files with a target SHA
-    //    accumulate into a per-plan feedback map that feeds the gate
-    //    fold below; flat drops still push onto `Plan.held_plan_feedback`
-    //    with a reason key the runner uses to decide next steps.
-    //    Phase 2.4 will collapse held into the SHA-targeted path.
-    let mut feedback_by_plan: BTreeMap<PlanKey, BTreeMap<(CommitSha, AgentLabel), Feedback>> =
-        BTreeMap::new();
-    for fb in snapshot.feedback_files {
-        let Some(plan) = state.plans.get_mut(&fb.parsed.plan_key) else {
-            continue;
-        };
-        ingest_feedback(plan, fb, &mut feedback_by_plan);
-    }
-
-    // 4. Per-commit metadata (subject + author timestamp) for the same
-    //    commits we walked above. Used by the timeline (subject) and
-    //    `last_activity_ts` (author_ts).
-    state.commit_meta = snapshot.commit_meta;
-
-    // 5. Commit-centric gates. Authoritative as of phase 2.3.
-    let plan_keys: Vec<crate::lifecycle::PlanKey> = state.plans.keys().cloned().collect();
-    for key in plan_keys {
-        let fb_map = feedback_by_plan.remove(&key).unwrap_or_default();
-        let commits = crate::projection::build_commit_gates(
-            &key,
-            &state.commit_order,
-            &state.plan_touches,
-            &state.attribution,
-            &fb_map,
-        );
-        if let Some(plan) = state.plans.get_mut(&key) {
-            plan.commits = commits;
-        }
-    }
-
-    state
 }
 
-fn ingest_feedback(
-    plan: &mut Plan,
-    fb: FeedbackBlob,
-    feedback_by_plan: &mut BTreeMap<PlanKey, BTreeMap<(CommitSha, AgentLabel), Feedback>>,
-) {
-    let verdict = parse_verdict(&fb.body);
-    let created_at = fb.created_at;
-    let plan_key = plan.id.clone();
-    feedback_by_plan.entry(plan_key).or_default().insert(
-        (fb.parsed.target_sha, fb.parsed.author),
-        Feedback {
-            path: fb.abs_path,
-            body: fb.body,
-            verdict,
-            created_at,
-        },
-    );
+fn is_frozen(state: &RepoState, plan_key: &PlanKey) -> bool {
+    state
+        .plans
+        .get(plan_key)
+        .map(|p| p.frozen_at.is_some())
+        .unwrap_or(false)
+}
+
+/// True iff the plan's finalize tree contains ≥1 file and every file's
+/// first line starts with `APPROVE`. None / empty → false.
+fn finalize_rule_satisfied(files: Option<&BTreeMap<String, String>>) -> bool {
+    let Some(files) = files else {
+        return false;
+    };
+    !files.is_empty()
+        && files
+            .values()
+            .all(|first_line| finalize_first_line_starts_with_approve(first_line))
+}
+
+/// Build a single commit's `CommitGate`, extending `participants` with
+/// any new authors. Pulls feedback for `commit_sha` from `fb_map`.
+fn build_gate_step(
+    commit_sha: &CommitSha,
+    fb_map: Option<&BTreeMap<(CommitSha, AgentLabel), Feedback>>,
+    participants: &mut Vec<AgentLabel>,
+) -> CommitGate {
+    let mut approvers: Vec<AgentLabel> = Vec::new();
+    let mut requesters: Vec<AgentLabel> = Vec::new();
+    let mut ambiguous: Vec<AgentLabel> = Vec::new();
+    let mut commit_feedback: BTreeMap<AgentLabel, Feedback> = BTreeMap::new();
+    if let Some(map) = fb_map {
+        for ((target, author), fb) in map {
+            if target == commit_sha {
+                commit_feedback.insert(author.clone(), fb.clone());
+            }
+        }
+    }
+    for (author, fb) in &commit_feedback {
+        if !participants.contains(author) {
+            participants.push(author.clone());
+        }
+        match fb.verdict {
+            Verdict::Approve => {
+                if !approvers.contains(author) {
+                    approvers.push(author.clone());
+                }
+            }
+            Verdict::RequestChanges => {
+                if !requesters.contains(author) {
+                    requesters.push(author.clone());
+                }
+            }
+            Verdict::Unmarked => {
+                if !ambiguous.contains(author) {
+                    ambiguous.push(author.clone());
+                }
+            }
+        }
+    }
+    let missing: Vec<AgentLabel> = participants
+        .iter()
+        .filter(|p| !approvers.contains(p) && !requesters.contains(p) && !ambiguous.contains(p))
+        .cloned()
+        .collect();
+    let state = if !requesters.is_empty() || !ambiguous.is_empty() {
+        CommitGateState::ChangesRequested
+    } else if !approvers.is_empty() && missing.is_empty() {
+        CommitGateState::Approved
+    } else {
+        CommitGateState::Unreviewed
+    };
+    CommitGate {
+        state,
+        participants: participants.clone(),
+        approvers,
+        requesters,
+        ambiguous,
+        missing,
+        feedback: commit_feedback,
+    }
 }
 
 #[cfg(test)]
@@ -232,6 +422,15 @@ mod tests {
         PlanTouch {
             session: sess(stem),
             kind,
+            new_path: None,
+        }
+    }
+
+    fn touch_at_active(stem: &str, kind: PlanTouchKind) -> PlanTouch {
+        PlanTouch {
+            session: sess(stem),
+            kind,
+            new_path: Some(PathBuf::from(format!(".trinity/plans/{stem}.md"))),
         }
     }
 
@@ -241,6 +440,41 @@ mod tests {
             changes: CommitChanges {
                 plan_touches: touches,
                 has_non_plan_code_changes: code,
+                finalize_changes: Vec::new(),
+            },
+        }
+    }
+
+    fn upsert_finalize(stem: &str, file: &str, first_line: &str) -> crate::attribution::FinalizeChange {
+        crate::attribution::FinalizeChange {
+            plan_key: sess(stem),
+            file_name: file.to_string(),
+            kind: FinalizeChangeKind::Upsert {
+                first_line: first_line.to_string(),
+            },
+        }
+    }
+
+    fn remove_finalize(stem: &str, file: &str) -> crate::attribution::FinalizeChange {
+        crate::attribution::FinalizeChange {
+            plan_key: sess(stem),
+            file_name: file.to_string(),
+            kind: FinalizeChangeKind::Remove,
+        }
+    }
+
+    fn finalize_entry(
+        commit: &str,
+        touches: Vec<PlanTouch>,
+        code: bool,
+        finalize_changes: Vec<crate::attribution::FinalizeChange>,
+    ) -> HistoryEntry {
+        HistoryEntry {
+            commit: sha(commit),
+            changes: CommitChanges {
+                plan_touches: touches,
+                has_non_plan_code_changes: code,
+                finalize_changes,
             },
         }
     }
@@ -1042,5 +1276,313 @@ mod tests {
             ],
             commit_meta: BTreeMap::new(),
         }
+    }
+
+    // ===================================================================
+    // Phase 2: event-log fold + finalize snapshot reader.
+    // Tests for the finalize rule (freeze on first commit whose tree
+    // satisfies plan-file + .trinity/finished/<stem>/ APPROVE files),
+    // monotone-after-freeze behaviour, and split-fold equivalence.
+    // ===================================================================
+
+    fn freeze_snap(history: Vec<HistoryEntry>) -> DiskSnapshot {
+        DiskSnapshot {
+            head: history.last().map(|e| e.commit.clone()),
+            plan_files: vec![plan_file("foo", "c1c1", None, "# foo\n")],
+            history,
+            feedback_files: vec![],
+            commit_meta: BTreeMap::new(),
+        }
+    }
+
+    #[test]
+    fn freeze_plan_only_finish_with_one_approve() {
+        let snap = freeze_snap(vec![
+            entry("c1c1", vec![touch_at_active("foo", PlanTouchKind::Intro)], false),
+            finalize_entry(
+                "c2c2",
+                vec![],
+                false,
+                vec![upsert_finalize("foo", "alice.md", "APPROVE")],
+            ),
+        ]);
+        let state = derive_state(PathBuf::from("/r"), snap);
+        let plan = &state.plans[&sess("foo")];
+        assert_eq!(plan.frozen_at, Some(sha("c2c2")));
+        assert_eq!(plan.freeze_events, vec![sha("c2c2")]);
+    }
+
+    #[test]
+    fn freeze_with_two_approve_files() {
+        let snap = freeze_snap(vec![
+            entry("c1c1", vec![touch_at_active("foo", PlanTouchKind::Intro)], false),
+            finalize_entry(
+                "c2c2",
+                vec![],
+                false,
+                vec![
+                    upsert_finalize("foo", "alice.md", "APPROVE"),
+                    upsert_finalize("foo", "bob.md", "APPROVE — lgtm"),
+                ],
+            ),
+        ]);
+        let state = derive_state(PathBuf::from("/r"), snap);
+        assert_eq!(state.plans[&sess("foo")].frozen_at, Some(sha("c2c2")));
+    }
+
+    #[test]
+    fn mixed_verdict_does_not_freeze() {
+        let snap = freeze_snap(vec![
+            entry("c1c1", vec![touch_at_active("foo", PlanTouchKind::Intro)], false),
+            finalize_entry(
+                "c2c2",
+                vec![],
+                false,
+                vec![
+                    upsert_finalize("foo", "alice.md", "APPROVE"),
+                    upsert_finalize("foo", "bob.md", "REQUEST_CHANGES"),
+                ],
+            ),
+        ]);
+        let state = derive_state(PathBuf::from("/r"), snap);
+        assert_eq!(state.plans[&sess("foo")].frozen_at, None);
+    }
+
+    #[test]
+    fn mixed_verdict_then_cleanup_freezes_at_cleanup() {
+        let snap = freeze_snap(vec![
+            entry("c1c1", vec![touch_at_active("foo", PlanTouchKind::Intro)], false),
+            finalize_entry(
+                "c2c2",
+                vec![],
+                false,
+                vec![
+                    upsert_finalize("foo", "alice.md", "APPROVE"),
+                    upsert_finalize("foo", "bob.md", "REQUEST_CHANGES"),
+                ],
+            ),
+            finalize_entry(
+                "c3c3",
+                vec![],
+                false,
+                vec![remove_finalize("foo", "bob.md")],
+            ),
+        ]);
+        let state = derive_state(PathBuf::from("/r"), snap);
+        assert_eq!(state.plans[&sess("foo")].frozen_at, Some(sha("c3c3")));
+    }
+
+    #[test]
+    fn empty_finished_dir_does_not_freeze() {
+        // No finalize_changes applied → tree has no files → rule fails.
+        let snap = freeze_snap(vec![entry(
+            "c1c1",
+            vec![touch_at_active("foo", PlanTouchKind::Intro)],
+            false,
+        )]);
+        let state = derive_state(PathBuf::from("/r"), snap);
+        assert_eq!(state.plans[&sess("foo")].frozen_at, None);
+    }
+
+    #[test]
+    fn finalize_added_before_plan_file_freezes_when_plan_appears() {
+        // c1 only adds finalize; the plan file doesn't exist yet → no freeze.
+        // c2 adds the plan file → rule first holds at c2.
+        let snap = freeze_snap(vec![
+            finalize_entry(
+                "c1c1",
+                vec![],
+                false,
+                vec![upsert_finalize("foo", "alice.md", "APPROVE")],
+            ),
+            entry("c2c2", vec![touch_at_active("foo", PlanTouchKind::Intro)], false),
+        ]);
+        let state = derive_state(PathBuf::from("/r"), snap);
+        assert_eq!(state.plans[&sess("foo")].frozen_at, Some(sha("c2c2")));
+    }
+
+    #[test]
+    fn revert_of_finalize_keeps_plan_frozen() {
+        // c1: plan intro. c2: finalize. c3: revert removes finalize files.
+        // The fold freezes at c2; c3's removal does not un-freeze.
+        let snap = freeze_snap(vec![
+            entry("c1c1", vec![touch_at_active("foo", PlanTouchKind::Intro)], false),
+            finalize_entry(
+                "c2c2",
+                vec![],
+                false,
+                vec![upsert_finalize("foo", "alice.md", "APPROVE")],
+            ),
+            finalize_entry(
+                "c3c3",
+                vec![],
+                false,
+                vec![remove_finalize("foo", "alice.md")],
+            ),
+        ]);
+        let state = derive_state(PathBuf::from("/r"), snap);
+        assert_eq!(state.plans[&sess("foo")].frozen_at, Some(sha("c2c2")));
+    }
+
+    #[test]
+    fn post_freeze_code_commit_is_unattributed_for_frozen_plan() {
+        let snap = freeze_snap(vec![
+            entry("c1c1", vec![touch_at_active("foo", PlanTouchKind::Intro)], false),
+            finalize_entry(
+                "c2c2",
+                vec![],
+                false,
+                vec![upsert_finalize("foo", "alice.md", "APPROVE")],
+            ),
+            entry("c3c3", vec![], true),
+        ]);
+        let state = derive_state(PathBuf::from("/r"), snap);
+        assert_eq!(state.plans[&sess("foo")].frozen_at, Some(sha("c2c2")));
+        assert_eq!(
+            state.attribution[&sha("c3c3")],
+            AttributionResult::Unattributed
+        );
+        // c3 is not a plan_touch and is not attributed to foo, so it
+        // doesn't appear in foo.commits.
+        assert!(!state.plans[&sess("foo")].commits.contains_key(&sha("c3c3")));
+    }
+
+    #[test]
+    fn post_freeze_plan_revision_is_skipped_under_frozen_plan_key() {
+        let snap = freeze_snap(vec![
+            entry("c1c1", vec![touch_at_active("foo", PlanTouchKind::Intro)], false),
+            finalize_entry(
+                "c2c2",
+                vec![],
+                false,
+                vec![upsert_finalize("foo", "alice.md", "APPROVE")],
+            ),
+            entry("c3c3", vec![touch_at_active("foo", PlanTouchKind::Revision)], false),
+        ]);
+        let state = derive_state(PathBuf::from("/r"), snap);
+        // No plan_touches entry under foo for c3c3 (filtered).
+        assert!(
+            state
+                .plan_touches
+                .get(&sha("c3c3"))
+                .map_or(true, |touches| touches
+                    .iter()
+                    .all(|(k, _)| k != &sess("foo")))
+        );
+    }
+
+    #[test]
+    fn post_freeze_working_tree_feedback_on_pre_freeze_sha_is_dropped_for_frozen_plan() {
+        // Working-tree feedback targeting c1c1 (pre-freeze) is applied at
+        // c1c1 during the chronological fold. At c1c1 the plan isn't
+        // frozen yet, so the gate would include it — EXCEPT we filter
+        // the per-plan gate step on `is_frozen(plan)`. At c1c1 the plan
+        // isn't frozen, so the gate step runs and the gate gets the
+        // feedback. The freeze happens at c2c2 (subsequent).
+        //
+        // This test documents the *sealing* behaviour: post-freeze
+        // commits skip gate construction entirely. Pre-freeze gates that
+        // received feedback before the freeze stay.
+        let snap = DiskSnapshot {
+            head: Some(sha("c3c3")),
+            plan_files: vec![plan_file("foo", "c1c1", None, "# foo\n")],
+            history: vec![
+                entry("c1c1", vec![touch_at_active("foo", PlanTouchKind::Intro)], false),
+                finalize_entry(
+                    "c2c2",
+                    vec![],
+                    false,
+                    vec![upsert_finalize("foo", "alice.md", "APPROVE")],
+                ),
+                entry("c3c3", vec![], true),
+            ],
+            feedback_files: vec![
+                // Pre-freeze feedback on c1c1 — should land in foo.commits[c1c1].
+                feedback("foo", "c1c1", "alice", "APPROVE\n"),
+                // Post-freeze feedback on c3c3 (post-freeze SHA). c3c3's
+                // gate is skipped (plan frozen), so this feedback has
+                // nowhere to land — silently dropped.
+                feedback("foo", "c3c3", "bob", "REQUEST_CHANGES\n"),
+            ],
+            commit_meta: BTreeMap::new(),
+        };
+        let state = derive_state(PathBuf::from("/r"), snap);
+        let plan = &state.plans[&sess("foo")];
+        assert_eq!(plan.frozen_at, Some(sha("c2c2")));
+        // c1c1 has alice's APPROVE in its gate.
+        let c1_gate = plan.commits.get(&sha("c1c1")).expect("c1 gate");
+        assert!(c1_gate.feedback.contains_key(&AgentLabel::parse("alice").unwrap()));
+        // c3c3 has no gate (skipped — frozen).
+        assert!(!plan.commits.contains_key(&sha("c3c3")));
+    }
+
+    #[test]
+    fn split_fold_equivalence_pre_freeze_only() {
+        // Running the fold over the full history equals running it over a
+        // prefix plus the suffix, for the frozen plan's slice. Validates
+        // the caching property the fold is structured to support.
+        let full = DiskSnapshot {
+            head: Some(sha("c3c3")),
+            plan_files: vec![plan_file("foo", "c1c1", None, "# foo\n")],
+            history: vec![
+                entry("c1c1", vec![touch_at_active("foo", PlanTouchKind::Intro)], false),
+                finalize_entry(
+                    "c2c2",
+                    vec![],
+                    false,
+                    vec![upsert_finalize("foo", "alice.md", "APPROVE")],
+                ),
+                entry("c3c3", vec![], true),
+            ],
+            feedback_files: vec![],
+            commit_meta: BTreeMap::new(),
+        };
+        let prefix_only = DiskSnapshot {
+            head: Some(sha("c2c2")),
+            plan_files: full.plan_files.clone(),
+            history: full.history[..2].to_vec(),
+            feedback_files: vec![],
+            commit_meta: BTreeMap::new(),
+        };
+        let full_state = derive_state(PathBuf::from("/r"), full);
+        let prefix_state = derive_state(PathBuf::from("/r"), prefix_only);
+        let full_plan = &full_state.plans[&sess("foo")];
+        let prefix_plan = &prefix_state.plans[&sess("foo")];
+        // The frozen plan's slice is byte-identical between the two
+        // folds — see plan §criterion 9.
+        assert_eq!(full_plan.frozen_at, prefix_plan.frozen_at);
+        assert_eq!(full_plan.freeze_events, prefix_plan.freeze_events);
+        assert_eq!(full_plan.commits, prefix_plan.commits);
+    }
+
+    #[test]
+    fn archived_cycles_overcount_regression_via_freeze_events() {
+        // freeze at C, then post-freeze deletion, then phantom re-finalize
+        // (snapshot files written again) -> freeze_events.len() == 1.
+        let snap = freeze_snap(vec![
+            entry("c1c1", vec![touch_at_active("foo", PlanTouchKind::Intro)], false),
+            finalize_entry(
+                "c2c2",
+                vec![],
+                false,
+                vec![upsert_finalize("foo", "alice.md", "APPROVE")],
+            ),
+            finalize_entry(
+                "c3c3",
+                vec![],
+                false,
+                vec![remove_finalize("foo", "alice.md")],
+            ),
+            finalize_entry(
+                "c4c4",
+                vec![],
+                false,
+                vec![upsert_finalize("foo", "bob.md", "APPROVE")],
+            ),
+        ]);
+        let state = derive_state(PathBuf::from("/r"), snap);
+        let plan = &state.plans[&sess("foo")];
+        assert_eq!(plan.frozen_at, Some(sha("c2c2")));
+        assert_eq!(plan.freeze_events, vec![sha("c2c2")]);
     }
 }

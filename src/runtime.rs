@@ -471,6 +471,10 @@ fn refresh_commits_for(state: &mut crate::repo_state::RepoState, plan_key: &Plan
     let Some(plan) = state.plans.get(plan_key) else {
         return;
     };
+    if plan.frozen_at.is_some() {
+        // Sealed plan: no gate updates from live feedback signals.
+        return;
+    }
     let feedback = extract_feedback(plan);
     let new_commits = crate::projection::build_commit_gates(
         plan_key,

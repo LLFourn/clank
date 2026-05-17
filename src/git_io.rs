@@ -6,8 +6,10 @@ use std::path::{Path, PathBuf};
 
 use tokio::process::Command;
 
-use crate::attribution::{CommitChanges, PlanTouch};
-use crate::disk_format::{is_legacy_commits_feedback_path, parse_feedback_path, plan_path_is_done};
+use crate::attribution::{CommitChanges, FinalizeChange, FinalizeChangeKind, PlanTouch};
+use crate::disk_format::{
+    is_legacy_commits_feedback_path, parse_feedback_path, parse_finalize_path, plan_path_is_done,
+};
 use crate::disk_snapshot::{DiskSnapshot, FeedbackBlob, HistoryEntry, PlanFileBlob};
 use crate::lifecycle::{CommitSha, PlanKey};
 use crate::repo_state::PlanTouchKind;
@@ -300,6 +302,10 @@ pub async fn commit_message(repo: &Path, sha: &CommitSha) -> Result<(String, Str
 ///
 /// For the root commit (no parent), uses `--root` form to enumerate its
 /// added files.
+///
+/// For added/modified `.trinity/finished/<stem>/<file>` paths this also
+/// shells out to `git show <sha>:<path>` to capture the body's first
+/// non-empty line (what the finalize rule's APPROVE check reads).
 pub async fn diff_tree_changes(repo: &Path, sha: &CommitSha) -> Result<CommitChanges, GitIoError> {
     let output = run(
         repo,
@@ -321,12 +327,48 @@ pub async fn diff_tree_changes(repo: &Path, sha: &CommitSha) -> Result<CommitCha
             stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
         });
     }
-    parse_diff_tree(&String::from_utf8_lossy(&output.stdout))
+    let parsed = parse_diff_tree(&String::from_utf8_lossy(&output.stdout))?;
+    let mut changes = parsed.changes;
+    for upsert in parsed.finalize_upserts {
+        let path = format!(
+            ".trinity/finished/{}/{}",
+            upsert.plan_key.as_str(),
+            upsert.file_name
+        );
+        let body = run_ok(repo, &["show", &format!("{}:{}", sha.as_str(), path)]).await?;
+        let first_line = body
+            .lines()
+            .map(str::trim_end)
+            .find(|l| !l.is_empty())
+            .unwrap_or("")
+            .to_string();
+        changes.finalize_changes.push(FinalizeChange {
+            plan_key: upsert.plan_key,
+            file_name: upsert.file_name,
+            kind: FinalizeChangeKind::Upsert { first_line },
+        });
+    }
+    Ok(changes)
 }
 
-fn parse_diff_tree(stdout: &str) -> Result<CommitChanges, GitIoError> {
+struct ParsedDiffTree {
+    changes: CommitChanges,
+    /// Finalize paths added or modified in this commit. The caller
+    /// resolves each one's first-body-line via a `git show` call after
+    /// parsing.
+    finalize_upserts: Vec<FinalizeUpsertPath>,
+}
+
+struct FinalizeUpsertPath {
+    plan_key: PlanKey,
+    file_name: String,
+}
+
+fn parse_diff_tree(stdout: &str) -> Result<ParsedDiffTree, GitIoError> {
     let mut plan_touches: Vec<PlanTouch> = Vec::new();
     let mut has_non_plan_code_changes = false;
+    let mut finalize_changes: Vec<FinalizeChange> = Vec::new();
+    let mut finalize_upserts: Vec<FinalizeUpsertPath> = Vec::new();
 
     for line in stdout.lines() {
         let line = line.trim_end_matches('\r');
@@ -344,7 +386,6 @@ fn parse_diff_tree(stdout: &str) -> Result<CommitChanges, GitIoError> {
         })?;
         let second_path = parts.next();
 
-        // Rename / Copy entries: `R<score>` or `C<score>` with two paths.
         let is_rename = status.starts_with('R') || status.starts_with('C');
         let new_path = if is_rename {
             second_path.unwrap_or(first_path)
@@ -352,6 +393,7 @@ fn parse_diff_tree(stdout: &str) -> Result<CommitChanges, GitIoError> {
             first_path
         };
         let old_path = if is_rename { Some(first_path) } else { None };
+        let status_char = status.chars().next().unwrap_or(' ');
 
         let new_rel = PathBuf::from(new_path);
         let new_is_plan = is_plan_path(&new_rel);
@@ -359,9 +401,10 @@ fn parse_diff_tree(stdout: &str) -> Result<CommitChanges, GitIoError> {
             .map(|p| is_plan_path(&PathBuf::from(p)))
             .unwrap_or(false);
 
+        let new_finalize = parse_finalize_subpath(&new_rel);
+        let old_finalize = old_path.and_then(|p| parse_finalize_subpath(&PathBuf::from(p)));
+
         if new_is_plan || old_is_plan {
-            // Pick the path for session-id derivation: new path if it's
-            // still in `plans/`, otherwise the old path (rename-out case).
             let old_plan_path = old_path.map(PathBuf::from);
             let touch_path: &Path = if new_is_plan {
                 &new_rel
@@ -370,19 +413,11 @@ fn parse_diff_tree(stdout: &str) -> Result<CommitChanges, GitIoError> {
             };
             let plan_key = match PlanKey::from_path(touch_path) {
                 Some(id) => id,
-                None => continue, // unparseable plan name; skip
+                None => continue,
             };
-            let kind = match status.chars().next().unwrap_or(' ') {
-                'A' => {
-                    // First-time add. We can't tell intro-vs-recreate at this
-                    // layer (need history). Caller can cross-check against
-                    // first_added_commit; for classification today, treat any
-                    // A as Intro and let the caller refine if desired.
-                    PlanTouchKind::Intro
-                }
+            let kind = match status_char {
+                'A' => PlanTouchKind::Intro,
                 'R' | 'C' => {
-                    // Rename: classify based on whether it crosses the
-                    // active/done boundary.
                     let was_done = old_path
                         .map(|p| plan_path_is_done(&PathBuf::from(p)))
                         .unwrap_or(false);
@@ -393,24 +428,85 @@ fn parse_diff_tree(stdout: &str) -> Result<CommitChanges, GitIoError> {
                         PlanTouchKind::Revision
                     }
                 }
+                'D' => PlanTouchKind::Revision,
                 _ => PlanTouchKind::Revision,
+            };
+            let new_path_for_touch = if status_char == 'D' && !is_rename {
+                None
+            } else {
+                Some(new_rel.clone())
             };
             plan_touches.push(PlanTouch {
                 session: plan_key,
                 kind,
+                new_path: new_path_for_touch,
             });
-        } else {
-            // Non-plan path. Check if it's outside `.trinity/` for code-change.
-            if !new_rel.starts_with(".trinity") {
-                has_non_plan_code_changes = true;
+        } else if new_finalize.is_some() || old_finalize.is_some() {
+            // Finalize-snapshot file. A rename whose <stem>/<file> differs
+            // is modelled as Remove(old) + Upsert(new); a pure 'D' is a
+            // Remove of the path in `new_rel` (git's name-status puts the
+            // deleted path there for non-rename deletes).
+            if status_char == 'D' && !is_rename {
+                if let Some((plan_key, file_name)) = new_finalize.clone() {
+                    finalize_changes.push(FinalizeChange {
+                        plan_key,
+                        file_name,
+                        kind: FinalizeChangeKind::Remove,
+                    });
+                }
+            } else if is_rename {
+                if let Some((old_key, old_file)) = old_finalize.clone() {
+                    let same = matches!(
+                        &new_finalize,
+                        Some((nk, nf)) if nk == &old_key && nf == &old_file
+                    );
+                    if !same {
+                        finalize_changes.push(FinalizeChange {
+                            plan_key: old_key,
+                            file_name: old_file,
+                            kind: FinalizeChangeKind::Remove,
+                        });
+                    }
+                }
+                if let Some((plan_key, file_name)) = new_finalize {
+                    finalize_upserts.push(FinalizeUpsertPath {
+                        plan_key,
+                        file_name,
+                    });
+                }
+            } else {
+                // 'A' or 'M' (or any other non-D, non-rename status).
+                if let Some((plan_key, file_name)) = new_finalize {
+                    finalize_upserts.push(FinalizeUpsertPath {
+                        plan_key,
+                        file_name,
+                    });
+                }
             }
+        } else if !new_rel.starts_with(".trinity") {
+            has_non_plan_code_changes = true;
         }
     }
 
-    Ok(CommitChanges {
-        plan_touches,
-        has_non_plan_code_changes,
+    Ok(ParsedDiffTree {
+        changes: CommitChanges {
+            plan_touches,
+            has_non_plan_code_changes,
+            finalize_changes,
+        },
+        finalize_upserts,
     })
+}
+
+fn parse_finalize_subpath(rel: &Path) -> Option<(PlanKey, String)> {
+    let under = rel.strip_prefix(".trinity/finished").ok()?;
+    let parsed = parse_finalize_path(under)?;
+    let file_name = parsed
+        .raw
+        .file_name()
+        .and_then(|s| s.to_str())
+        .map(|s| s.to_string())?;
+    Some((parsed.plan_key, file_name))
 }
 
 /// Gather a `DiskSnapshot` for `repo_root`. This is the IO half of the
@@ -688,17 +784,23 @@ mod tests {
     #[test]
     fn parse_diff_tree_single_plan_intro() {
         let stdout = "A\t.trinity/plans/foo.md\n";
-        let changes = parse_diff_tree(stdout).unwrap();
+        let parsed = parse_diff_tree(stdout).unwrap();
+        let changes = &parsed.changes;
         assert_eq!(changes.plan_touches.len(), 1);
         assert_eq!(changes.plan_touches[0].session.as_str(), "foo");
         assert!(matches!(changes.plan_touches[0].kind, PlanTouchKind::Intro));
+        assert_eq!(
+            changes.plan_touches[0].new_path.as_deref(),
+            Some(Path::new(".trinity/plans/foo.md"))
+        );
         assert!(!changes.has_non_plan_code_changes);
     }
 
     #[test]
     fn parse_diff_tree_plan_revision_with_code() {
         let stdout = "M\t.trinity/plans/foo.md\nM\tsrc/lib.rs\n";
-        let changes = parse_diff_tree(stdout).unwrap();
+        let parsed = parse_diff_tree(stdout).unwrap();
+        let changes = &parsed.changes;
         assert_eq!(changes.plan_touches.len(), 1);
         assert!(matches!(
             changes.plan_touches[0].kind,
@@ -710,7 +812,8 @@ mod tests {
     #[test]
     fn parse_diff_tree_pure_code() {
         let stdout = "M\tsrc/foo.rs\nA\ttests/bar.rs\n";
-        let changes = parse_diff_tree(stdout).unwrap();
+        let parsed = parse_diff_tree(stdout).unwrap();
+        let changes = &parsed.changes;
         assert!(changes.plan_touches.is_empty());
         assert!(changes.has_non_plan_code_changes);
     }
@@ -718,30 +821,63 @@ mod tests {
     #[test]
     fn parse_diff_tree_done_move() {
         let stdout = "R100\t.trinity/plans/foo.md\t.trinity/plans/done/foo.md\n";
-        let changes = parse_diff_tree(stdout).unwrap();
+        let parsed = parse_diff_tree(stdout).unwrap();
+        let changes = &parsed.changes;
         assert_eq!(changes.plan_touches.len(), 1);
         assert!(matches!(
             changes.plan_touches[0].kind,
             PlanTouchKind::DoneMove
         ));
         assert_eq!(changes.plan_touches[0].session.as_str(), "foo");
+        assert_eq!(
+            changes.plan_touches[0].new_path.as_deref(),
+            Some(Path::new(".trinity/plans/done/foo.md"))
+        );
     }
 
     #[test]
     fn parse_diff_tree_multi_plan_touch() {
         let stdout = "M\t.trinity/plans/foo.md\nA\t.trinity/plans/bar.md\nM\tsrc/lib.rs\n";
-        let changes = parse_diff_tree(stdout).unwrap();
+        let parsed = parse_diff_tree(stdout).unwrap();
+        let changes = &parsed.changes;
         assert_eq!(changes.plan_touches.len(), 2);
         assert!(changes.has_non_plan_code_changes);
     }
 
     #[test]
     fn parse_diff_tree_ignores_other_trinity_paths() {
-        // Feedback files are gitignored in practice, but if any sneak in,
-        // they should count as neither plan nor code change.
         let stdout = "A\t.trinity/feedback/foo/plan/alice.md\n";
-        let changes = parse_diff_tree(stdout).unwrap();
+        let parsed = parse_diff_tree(stdout).unwrap();
+        let changes = &parsed.changes;
         assert!(changes.plan_touches.is_empty());
         assert!(!changes.has_non_plan_code_changes);
+        assert!(changes.finalize_changes.is_empty());
+    }
+
+    #[test]
+    fn parse_diff_tree_finalize_added_queues_upsert() {
+        let stdout = "A\t.trinity/finished/foo/alice.md\n";
+        let parsed = parse_diff_tree(stdout).unwrap();
+        assert!(parsed.changes.plan_touches.is_empty());
+        assert!(!parsed.changes.has_non_plan_code_changes);
+        assert!(parsed.changes.finalize_changes.is_empty());
+        assert_eq!(parsed.finalize_upserts.len(), 1);
+        assert_eq!(parsed.finalize_upserts[0].plan_key.as_str(), "foo");
+        assert_eq!(parsed.finalize_upserts[0].file_name, "alice.md");
+    }
+
+    #[test]
+    fn parse_diff_tree_finalize_deleted_emits_remove() {
+        let stdout = "D\t.trinity/finished/foo/alice.md\n";
+        let parsed = parse_diff_tree(stdout).unwrap();
+        assert_eq!(parsed.changes.finalize_changes.len(), 1);
+        match &parsed.changes.finalize_changes[0] {
+            fc @ FinalizeChange { kind, .. } => {
+                assert_eq!(fc.plan_key.as_str(), "foo");
+                assert_eq!(fc.file_name, "alice.md");
+                assert!(matches!(kind, FinalizeChangeKind::Remove));
+            }
+        }
+        assert!(parsed.finalize_upserts.is_empty());
     }
 }

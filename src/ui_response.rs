@@ -657,6 +657,8 @@ mod tests {
             plan_intro: CommitSha::parse("dead").unwrap(),
             plan_intro_parent: Some(CommitSha::parse("ca11").unwrap()),
             commits: BTreeMap::new(),
+            frozen_at: None,
+            freeze_events: Vec::new(),
         };
         let v = pr_hint_value(&session, &[]);
         assert_eq!(v["plan_intro_parent"], "ca11");

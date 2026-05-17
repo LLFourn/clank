@@ -336,6 +336,18 @@ pub struct Plan {
     /// and `Unattributed` commits never get an entry — see
     /// `CommitKind::is_reviewable`.
     pub commits: BTreeMap<CommitSha, crate::review_state::CommitGate>,
+    /// First commit (chronological) whose tree satisfied the finalize
+    /// rule (plan file present + `.trinity/finished/<stem>/` with ≥1
+    /// file all starting with `APPROVE`). `Some(_)` ⇒ the plan is
+    /// finished. Set monotonically by the sans-IO fold; never cleared.
+    pub frozen_at: Option<CommitSha>,
+    /// Commits at which this plan transitioned to frozen, in
+    /// chronological order. Equivalent to "the chain of finalize
+    /// events." The last entry == `frozen_at` (when set); earlier
+    /// entries can only appear if a future implementation supports
+    /// reopening a frozen plan via history rewrite mid-fold — which
+    /// today never happens, so the list has length 0 or 1.
+    pub freeze_events: Vec<CommitSha>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

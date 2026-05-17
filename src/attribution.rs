@@ -5,23 +5,61 @@
 //! See `.trinity/plans/filesystem-truth-rewrite.md` "Commit Attribution —
 //! pure git walk" for the four rules this module enforces.
 
+use std::path::PathBuf;
+
 use crate::lifecycle::PlanKey;
 use crate::repo_state::{AttributionResult, PlanTouchKind};
 
-/// Per-commit summary of plan-file changes and code changes.
+/// Per-commit summary of plan-file changes, code changes, and finalize
+/// snapshot changes.
 ///
-/// Built from `git diff-tree -r --name-status -M <sha>` in the IO layer.
+/// Built from `git diff-tree -r --name-status -M <sha>` plus follow-up
+/// `git show` reads for the body first lines of newly-added/modified
+/// finalize files (see `git_io::diff_tree_changes`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CommitChanges {
     pub plan_touches: Vec<PlanTouch>,
     /// True if any non-`.trinity/` file was modified.
     pub has_non_plan_code_changes: bool,
+    /// Changes to `.trinity/finished/<stem>/<file>` paths in this
+    /// commit. The fold replays these to maintain a running
+    /// finalize-tree state and to check the finalize rule
+    /// chronologically.
+    pub finalize_changes: Vec<FinalizeChange>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PlanTouch {
     pub session: PlanKey,
     pub kind: PlanTouchKind,
+    /// The plan file's path after this commit's diff applies, or
+    /// `None` if the file was deleted by this commit. Synthetic test
+    /// fixtures may also leave this `None`; the fold then falls back
+    /// to the HEAD path from `DiskSnapshot::plan_files`.
+    pub new_path: Option<PathBuf>,
+}
+
+/// One change to a file under `.trinity/finished/<stem>/` in a single
+/// commit's diff. The fold replays these to maintain a running
+/// per-plan map of `<file-name> -> first-line-of-body`, which the
+/// finalize rule reads.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FinalizeChange {
+    pub plan_key: PlanKey,
+    /// Last path segment, e.g. `alice.md`. The full path is
+    /// `.trinity/finished/<plan_key>/<file_name>`.
+    pub file_name: String,
+    pub kind: FinalizeChangeKind,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FinalizeChangeKind {
+    /// File was added or modified in this commit. `first_line` is the
+    /// trimmed first non-empty line of the body (what the APPROVE
+    /// check reads).
+    Upsert { first_line: String },
+    /// File was deleted in this commit.
+    Remove,
 }
 
 /// Classify a commit into an `AttributionResult` given its diff summary and
@@ -84,6 +122,7 @@ mod tests {
         PlanTouch {
             session: sess(name),
             kind,
+            new_path: None,
         }
     }
 
@@ -91,6 +130,7 @@ mod tests {
         CommitChanges {
             plan_touches: touches,
             has_non_plan_code_changes: code,
+            finalize_changes: Vec::new(),
         }
     }
 
