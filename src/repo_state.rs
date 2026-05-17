@@ -445,19 +445,21 @@ impl PlanWorktreeStatus {
     }
 }
 
+/// Current activity posture for a plan, derived from the latest
+/// reviewable commit's `CommitKind`. `PlanOnly | Mixed → Planning`,
+/// `CodeOnly → Implementing`. Surfaced on the wire as `phase` (legacy
+/// name) for one release. Computed by `projection::current_posture`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Phase {
+pub enum Posture {
     Planning,
     Implementing,
-    Done,
 }
 
-impl Phase {
+impl Posture {
     pub fn as_str(self) -> &'static str {
         match self {
-            Phase::Planning => "planning",
-            Phase::Implementing => "implementing",
-            Phase::Done => "done",
+            Posture::Planning => "planning",
+            Posture::Implementing => "implementing",
         }
     }
 }

@@ -21,8 +21,8 @@ use tokio::sync::broadcast::error::RecvError;
 
 use crate::lifecycle::{AgentLabel, CommitSha, ContentHash, PlanKey};
 use crate::mcp_response::compute_plan_worktree_status_parts;
-use crate::projection::{phase, waiting_on};
-use crate::repo_state::{Phase, Trinity, WaitingReason, WaitingRole};
+use crate::projection::waiting_on;
+use crate::repo_state::{Trinity, WaitingReason, WaitingRole};
 use crate::review_state::CommitGate;
 use crate::runtime::Runtime;
 
@@ -239,11 +239,7 @@ async fn compute_match(
         &candidate.plan_path,
         &candidate.body_hash,
     )?;
-    let w = waiting_on(
-        matches!(candidate.session_phase, Phase::Done),
-        status,
-        candidate.gate.as_ref(),
-    );
+    let w = waiting_on(candidate.is_finished, status, candidate.gate.as_ref());
     if w.role != role {
         return Ok(None);
     }
@@ -483,7 +479,7 @@ struct Candidate {
     plan_key: PlanKey,
     plan_path: PathBuf,
     body_hash: ContentHash,
-    session_phase: Phase,
+    is_finished: bool,
     /// One gate: the latest reviewable commit's gate. Folds the old
     /// (plan_gate, impl_gate) pair into the single value that drives
     /// waiting_on, locations, target_sha, and commit_kind.
@@ -548,7 +544,7 @@ fn collect_candidate(
         plan_key: plan.id.clone(),
         plan_path: plan.plan_path.clone(),
         body_hash: plan.body_hash.clone(),
-        session_phase: phase(plan, &repo_state.attribution),
+        is_finished: plan.frozen_at.is_some(),
         gate,
         review_target,
         review_target_kind,
@@ -596,7 +592,7 @@ mod tests {
             plan_key: PlanKey::parse("sid").unwrap(),
             plan_path: PathBuf::from(".trinity/plans/sid.md"),
             body_hash: content_hash("x"),
-            session_phase: Phase::Planning,
+            is_finished: false,
             gate: None,
             review_target: target.map(|s| CommitSha::parse(s).unwrap()),
             review_target_kind: kind,

@@ -18,10 +18,10 @@ use crate::lifecycle::{AgentLabel, CommitSha, PlanKey};
 use crate::mcp_response::PlanStatusReader;
 use crate::projection::{
     all_implementation_commits_for, all_plan_revisions_for, expected_action, impl_gate_for_parts,
-    phase_for, plan_gate_for_parts, waiting_on,
+    current_posture_for, plan_gate_for_parts, waiting_on,
 };
 use crate::repo_state::{
-    AttributionResult, Feedback, Phase, Plan, PlanTouchKind, RepoState, Verdict, WaitingOn,
+    AttributionResult, Feedback, Posture, Plan, PlanTouchKind, RepoState, Verdict, WaitingOn,
 };
 use crate::review_state::CommitGate;
 
@@ -82,7 +82,12 @@ fn plans_index_parts(
     let basename = crate::lifecycle::RepoBasename::from_repo_root(&snapshot.root);
     let mut plans: Vec<IndexedPlanRow> = Vec::with_capacity(snapshot.plans.len());
     for plan in snapshot.plans.values() {
-        let plan_phase = phase_for(&plan.plan_path, &plan.id, &snapshot.attribution);
+        let plan_phase = current_posture_for(
+            &plan.id,
+            &snapshot.commit_order,
+            &snapshot.plan_touches,
+            &snapshot.attribution,
+        );
         let gate = crate::projection::latest_reviewable_commit_gate_for(
             &plan.id,
             &plan.commits,
@@ -161,7 +166,12 @@ pub fn plan_page_with_reader(
         .expect("snapshot_session invariant: exactly one plan");
     let basename = crate::lifecycle::RepoBasename::from_repo_root(&bundle.root);
     let worktree_status = status_reader.compute(&bundle.root, &plan.plan_path, &plan.body_hash)?;
-    let plan_phase = phase_for(&plan.plan_path, &plan.id, &bundle.attribution);
+    let plan_phase = current_posture_for(
+        &plan.id,
+        &bundle.commit_order,
+        &bundle.plan_touches,
+        &bundle.attribution,
+    );
     let plan_gate = plan_gate_for_parts(
         &plan.id,
         &plan.commits,
@@ -198,14 +208,14 @@ pub fn plan_page_with_reader(
 
     // Single review target: the latest reviewable commit. Same SHA
     // the gate is computed on, so the wire shape can't drift from
-    // gate state. Phase-tagged "plan"/"impl" for back-compat.
+    // gate state. Posture-tagged "plan"/"impl" for back-compat.
     let review_target_sha = crate::projection::latest_reviewable_commit_for(
         &plan.id,
         &bundle.commit_order,
         &bundle.plan_touches,
         &bundle.attribution,
     );
-    let review_target_phase = if matches!(plan_phase, Phase::Implementing) {
+    let review_target_phase = if matches!(plan_phase, Posture::Implementing) {
         "impl"
     } else {
         "plan"
@@ -229,7 +239,7 @@ pub fn plan_page_with_reader(
         &bundle.commit_order,
         &bundle.commit_meta,
     );
-    let pr_hint = if matches!(plan_phase, Phase::Implementing) {
+    let pr_hint = if matches!(plan_phase, Posture::Implementing) {
         Some(pr_hint_value(plan, &implementation_commits))
     } else {
         None
@@ -464,17 +474,15 @@ fn waiting_on_value(w: &WaitingOn) -> Value {
 fn gate_value(
     plan_gate: Option<&CommitGate>,
     impl_gate: Option<&CommitGate>,
-    session_phase: Phase,
+    session_phase: Posture,
 ) -> Value {
     let gate = match session_phase {
-        Phase::Planning => plan_gate,
-        Phase::Implementing => impl_gate,
-        Phase::Done => None,
+        Posture::Planning => plan_gate,
+        Posture::Implementing => impl_gate,
     };
     let phase_str = match session_phase {
-        Phase::Planning => "plan",
-        Phase::Implementing => "impl",
-        Phase::Done => "plan",
+        Posture::Planning => "plan",
+        Posture::Implementing => "impl",
     };
     match gate {
         Some(g) => json!({

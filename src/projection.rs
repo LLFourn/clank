@@ -6,11 +6,9 @@
 //! `wait_for_work` matching, tests) call into these functions so the
 //! derivation logic stays in one place and can't drift between surfaces.
 
-use std::path::Path;
-
 use crate::lifecycle::{AgentLabel, ContentHash};
 use crate::repo_state::{
-    AttributionResult, CommitKind, Feedback, Phase, Plan, PlanTouchKind, PlanWorktreeStatus,
+    AttributionResult, CommitKind, Feedback, Plan, PlanTouchKind, PlanWorktreeStatus, Posture,
     Verdict, WaitingOn, WaitingReason, WaitingRole,
 };
 use crate::review_state::{CommitGate, CommitGateState};
@@ -37,33 +35,38 @@ pub fn plan_worktree_status(
     }
 }
 
-/// Phase per session, derived from attribution map.
-///
-/// - `Implementing` if any attributed commit past plan_intro has code changes.
-/// - `Planning` otherwise.
-pub fn phase(plan: &Plan, attribution: &BTreeMap<CommitSha, AttributionResult>) -> Phase {
-    phase_for(&plan.plan_path, &plan.id, attribution)
+/// Current posture for a plan: `Planning` while the master is iterating
+/// on the plan body (`PlanOnly | Mixed` latest reviewable commit, or
+/// nothing reviewable yet), `Implementing` once the master is shipping
+/// code (`CodeOnly`). Replaces the legacy `Phase` enum's stored
+/// variant — computed from the per-commit `CommitKind`.
+pub fn current_posture(plan: &Plan, state: &crate::repo_state::RepoState) -> Posture {
+    current_posture_for(
+        &plan.id,
+        &state.commit_order,
+        &state.plan_touches,
+        &state.attribution,
+    )
 }
 
-/// Phase derivation from primitive inputs. Used by callers that hold a
-/// snapshot (e.g. `ui_response`) rather than a `&Plan`.
-pub fn phase_for(
-    _plan_path: &Path,
+/// `current_posture` for callers that hold primitive inputs rather
+/// than a `&Plan` + `&RepoState`.
+pub fn current_posture_for(
     plan_key: &crate::lifecycle::PlanKey,
+    commit_order: &[CommitSha],
+    plan_touches: &BTreeMap<CommitSha, Vec<(crate::lifecycle::PlanKey, PlanTouchKind)>>,
     attribution: &BTreeMap<CommitSha, AttributionResult>,
-) -> Phase {
-    for attr in attribution.values() {
-        if let AttributionResult::Attributed {
-            session: sid,
-            has_code_changes: true,
-            ..
-        } = attr
-            && sid == plan_key
-        {
-            return Phase::Implementing;
-        }
+) -> Posture {
+    let Some(latest) =
+        latest_reviewable_commit_for(plan_key, commit_order, plan_touches, attribution)
+    else {
+        return Posture::Planning;
+    };
+    let kind = commit_kind_for(plan_key, &latest, plan_touches, attribution);
+    match kind {
+        CommitKind::CodeOnly => Posture::Implementing,
+        _ => Posture::Planning,
     }
-    Phase::Planning
 }
 
 /// Compose the `waiting_on` value for a session. Top rows

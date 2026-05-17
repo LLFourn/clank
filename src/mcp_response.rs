@@ -10,8 +10,8 @@ use serde_json::{Value, json};
 
 use crate::lifecycle::{AgentLabel, ContentHash, PlanKey, content_hash};
 use crate::projection::{
-    all_implementation_commits, all_plan_revisions, expected_action, impl_gate_for, phase,
-    plan_gate_for, plan_worktree_status, waiting_on,
+    all_implementation_commits, all_plan_revisions, current_posture, expected_action,
+    impl_gate_for, plan_gate_for, plan_worktree_status, waiting_on,
 };
 use crate::repo_state::{PlanWorktreeStatus, RepoState, WaitingOn};
 use crate::review_state::CommitGate;
@@ -75,7 +75,7 @@ pub(crate) fn list_plans_response_with_status_reader(
     for plan in state.plans.values() {
         let worktree_status =
             status_reader.compute(&state.root, &plan.plan_path, &plan.body_hash)?;
-        let plan_phase = phase(plan, &state.attribution);
+        let plan_phase = current_posture(plan, state);
         let gate = crate::projection::latest_reviewable_commit_gate_for(
             &plan.id,
             &plan.commits,
@@ -111,7 +111,7 @@ pub(crate) fn list_plans_response_with_status_reader(
 fn plan_summary(
     repo_root: &Path,
     plan: &crate::repo_state::Plan,
-    plan_phase: crate::repo_state::Phase,
+    plan_phase: crate::repo_state::Posture,
     worktree_status: PlanWorktreeStatus,
     w: &WaitingOn,
 ) -> Value {
@@ -180,7 +180,7 @@ pub fn get_context_response_from_snapshot(
         .next()
         .expect("snapshot_session invariant: exactly one plan");
     let session_id = &session.id;
-    let session_phase = phase(session, &state.attribution);
+    let session_phase = current_posture(session, state);
     let plan_gate = plan_gate_for(session, state);
     let impl_gate = impl_gate_for(session, state);
     let gate = crate::projection::latest_reviewable_commit_gate_for(
@@ -192,7 +192,7 @@ pub fn get_context_response_from_snapshot(
     );
     let w = waiting_on(session.frozen_at.is_some(), worktree_status, gate);
 
-    let pr_hint = if matches!(session_phase, crate::repo_state::Phase::Implementing) {
+    let pr_hint = if matches!(session_phase, crate::repo_state::Posture::Implementing) {
         Some(pr_hint_value(session, state))
     } else {
         None
@@ -220,7 +220,7 @@ pub fn get_context_response_from_snapshot(
         &state.plan_touches,
         &state.attribution,
     );
-    let review_target_phase = if matches!(session_phase, crate::repo_state::Phase::Implementing) {
+    let review_target_phase = if matches!(session_phase, crate::repo_state::Posture::Implementing) {
         "impl"
     } else {
         "plan"
@@ -455,17 +455,15 @@ fn waiting_on_value(w: &WaitingOn) -> Value {
 fn gate_value(
     plan_gate: Option<&CommitGate>,
     impl_gate: Option<&CommitGate>,
-    session_phase: crate::repo_state::Phase,
+    session_phase: crate::repo_state::Posture,
 ) -> Value {
     let gate = match session_phase {
-        crate::repo_state::Phase::Planning => plan_gate,
-        crate::repo_state::Phase::Implementing => impl_gate,
-        crate::repo_state::Phase::Done => None,
+        crate::repo_state::Posture::Planning => plan_gate,
+        crate::repo_state::Posture::Implementing => impl_gate,
     };
     let phase_str = match session_phase {
-        crate::repo_state::Phase::Planning => "plan",
-        crate::repo_state::Phase::Implementing => "impl",
-        crate::repo_state::Phase::Done => "plan",
+        crate::repo_state::Posture::Planning => "plan",
+        crate::repo_state::Posture::Implementing => "impl",
     };
     match gate {
         Some(g) => json!({
