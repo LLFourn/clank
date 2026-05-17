@@ -24,7 +24,7 @@ pub async fn rebuild_repo(repo_root: &Path) -> Result<RepoState, RebuildError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::lifecycle::{PlanKey, is_done_plan_path};
+    use crate::lifecycle::PlanKey;
     use crate::repo_state::AttributionResult;
     use std::path::Path;
     use std::process::Command;
@@ -141,27 +141,7 @@ mod tests {
         assert_eq!(entries[0].verdict, crate::repo_state::Verdict::Approve);
     }
 
-    #[tokio::test]
-    async fn duplicate_stem_active_and_done_lands_in_plan_conflicts_via_real_git() {
-        // Sanity-check the §1b invariant against an actual git tree:
-        // `git ls-tree` plus `derive_state` together must surface the
-        // collision, not silently pick one file.
-        let dir = init_repo();
-        write_file(dir.path(), ".trinity/plans/foo.md", "# active\n");
-        write_file(dir.path(), ".trinity/plans/done/foo.md", "# done\n");
-        commit(dir.path(), "Coexisting foo paths");
-
-        let state = rebuild_repo(dir.path()).await.unwrap();
-        assert!(
-            !state.plans.contains_key(&PlanKey::parse("foo").unwrap()),
-            "conflicting plan must not be routable"
-        );
-        let paths = state
-            .plan_conflicts
-            .get(&PlanKey::parse("foo").unwrap())
-            .expect("conflict surfaced");
-        assert_eq!(paths.len(), 2);
-        assert!(paths.iter().any(|p| !is_done_plan_path(p)));
-        assert!(paths.iter().any(|p| is_done_plan_path(p)));
-    }
+    // `duplicate_stem_active_and_done_lands_in_plan_conflicts_via_real_git`
+    // retired with `.trinity/plans/done/` (Phase 5, event-log-and-finished).
+    // Plan paths under done/ no longer parse as plan keys at all.
 }

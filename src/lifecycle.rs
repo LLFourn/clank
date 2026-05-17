@@ -1,7 +1,7 @@
 //! Newtype wrappers for the IDs used across the filesystem-truth model.
 
 use std::fmt;
-use std::path::{Component, Path, PathBuf};
+use std::path::{Component, Path};
 
 macro_rules! string_newtype {
     ($name:ident) => {
@@ -287,13 +287,10 @@ pub enum ParsePlanIdError {
 impl PlanKey {
     /// Parse a repo-relative plan-file path into a `PlanKey`.
     ///
-    /// Accepts exactly:
-    /// - `.trinity/plans/<stem>.md`
-    /// - `.trinity/plans/done/<stem>.md`
-    ///
-    /// `<stem>` must be non-empty and must not contain path separators
-    /// (no nesting). Dots inside the stem are allowed — `foo.v2.md` parses
-    /// to `PlanKey("foo.v2")`. Only the trailing `.md` is treated as an
+    /// Accepts exactly `.trinity/plans/<stem>.md`. `<stem>` must be
+    /// non-empty and must not contain path separators (no nesting).
+    /// Dots inside the stem are allowed — `foo.v2.md` parses to
+    /// `PlanKey("foo.v2")`. Only the trailing `.md` is treated as an
     /// extension.
     pub fn from_path(p: &Path) -> Option<Self> {
         let segments: Vec<&std::ffi::OsStr> = p
@@ -311,7 +308,6 @@ impl PlanKey {
             .as_slice()
         {
             [".trinity", "plans", name] => *name,
-            [".trinity", "plans", "done", name] => *name,
             _ => return None,
         };
 
@@ -323,26 +319,6 @@ impl PlanKey {
     }
 }
 
-/// True when `p` lies under `.trinity/plans/done/`. Pure check on the
-/// path string; doesn't touch disk.
-pub fn is_done_plan_path(p: &Path) -> bool {
-    p.components()
-        .any(|c| matches!(c, Component::Normal(s) if s == "done"))
-}
-
-/// Active↔done counterpart of a canonical plan path:
-/// `.trinity/plans/foo.md` ↔ `.trinity/plans/done/foo.md`. Returns `None`
-/// if `p` doesn't parse as a canonical plan path.
-pub fn plan_path_counterpart(p: &Path) -> Option<PathBuf> {
-    let key = PlanKey::from_path(p)?;
-    let stem = key.as_str();
-    Some(if is_done_plan_path(p) {
-        PathBuf::from(format!(".trinity/plans/{stem}.md"))
-    } else {
-        PathBuf::from(format!(".trinity/plans/done/{stem}.md"))
-    })
-}
-
 /// Stable content hash for a plan-file body. Identifies "is this the same
 /// plan or a new one?" in the rebuild + worktree-status logic.
 pub fn content_hash(body: &str) -> ContentHash {
@@ -352,6 +328,7 @@ pub fn content_hash(body: &str) -> ContentHash {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
 
     fn p(s: &str) -> PathBuf {
         PathBuf::from(s)
@@ -360,12 +337,6 @@ mod tests {
     #[test]
     fn plan_key_active_path() {
         let k = PlanKey::from_path(&p(".trinity/plans/foo.md")).unwrap();
-        assert_eq!(k.as_str(), "foo");
-    }
-
-    #[test]
-    fn plan_key_done_path() {
-        let k = PlanKey::from_path(&p(".trinity/plans/done/foo.md")).unwrap();
         assert_eq!(k.as_str(), "foo");
     }
 
@@ -401,22 +372,8 @@ mod tests {
     }
 
     #[test]
-    fn is_done_plan_path_helper() {
-        assert!(!is_done_plan_path(&p(".trinity/plans/foo.md")));
-        assert!(is_done_plan_path(&p(".trinity/plans/done/foo.md")));
-    }
-
-    #[test]
-    fn plan_path_counterpart_flips_active_done() {
-        let active = p(".trinity/plans/foo.md");
-        let done = p(".trinity/plans/done/foo.md");
-        assert_eq!(plan_path_counterpart(&active), Some(done.clone()));
-        assert_eq!(plan_path_counterpart(&done), Some(active));
-    }
-
-    #[test]
-    fn plan_path_counterpart_rejects_off_tree() {
-        assert!(plan_path_counterpart(&p("plans/foo.md")).is_none());
+    fn plan_key_rejects_done_subdir() {
+        assert!(PlanKey::from_path(&p(".trinity/plans/done/foo.md")).is_none());
     }
 
     // ---- PlanId::parse ----

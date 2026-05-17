@@ -298,7 +298,7 @@ impl Runtime {
                 let Some(plan) = state.plans.get(&session_id) else {
                     return Ok(());
                 };
-                let plan_state = plan.state;
+                let lifecycle = crate::repo_state::PlanLifecycle::from_plan(plan);
                 let Some(plan_id) = plan_id_for(repo_root, &plan.id) else {
                     return Ok(());
                 };
@@ -308,7 +308,7 @@ impl Runtime {
                         ts: now,
                         repo: repo_root.to_path_buf(),
                         plan_id,
-                        state: plan_state,
+                        lifecycle,
                         kind: PlanEventKind::PlanWorktreeChanged,
                         payload: serde_json::json!({"path": path.to_string_lossy()}),
                     }),
@@ -331,7 +331,11 @@ impl Runtime {
                 };
                 upsert_feedback(session, abs_path, parsed, body);
                 refresh_commits_for(state, &session_id);
-                let Some(plan_state) = state.plans.get(&session_id).map(|p| p.state) else {
+                let Some(lifecycle) = state
+                    .plans
+                    .get(&session_id)
+                    .map(crate::repo_state::PlanLifecycle::from_plan)
+                else {
                     return Ok(());
                 };
                 let Some(plan_id) = plan_id_for(repo_root, &session_id) else {
@@ -343,7 +347,7 @@ impl Runtime {
                         ts: now,
                         repo: repo_root.to_path_buf(),
                         plan_id,
-                        state: plan_state,
+                        lifecycle,
                         kind: PlanEventKind::FeedbackChanged,
                         payload: serde_json::Value::Null,
                     }),
@@ -360,7 +364,11 @@ impl Runtime {
                 };
                 remove_feedback(session, &parsed);
                 refresh_commits_for(state, &session_id);
-                let Some(plan_state) = state.plans.get(&session_id).map(|p| p.state) else {
+                let Some(lifecycle) = state
+                    .plans
+                    .get(&session_id)
+                    .map(crate::repo_state::PlanLifecycle::from_plan)
+                else {
                     return Ok(());
                 };
                 let Some(plan_id) = plan_id_for(repo_root, &session_id) else {
@@ -372,7 +380,7 @@ impl Runtime {
                         ts: now,
                         repo: repo_root.to_path_buf(),
                         plan_id,
-                        state: plan_state,
+                        lifecycle,
                         kind: PlanEventKind::FeedbackRemoved,
                         payload: serde_json::Value::Null,
                     }),

@@ -297,13 +297,11 @@ fn init_plans_from_head(state: &mut RepoState, plan_files: Vec<PlanFileBlob>) {
         }
         let pf = entries.pop().expect("exactly one entry");
         let body_hash = content_hash(&pf.body);
-        let plan_state = crate::repo_state::PlanState::from_plan_path(&pf.plan_path);
         state.plans.insert(
             pf.plan_key.clone(),
             Plan {
                 id: pf.plan_key,
                 plan_path: pf.plan_path,
-                state: plan_state,
                 body: pf.body,
                 body_hash,
                 plan_intro: pf.plan_intro,
@@ -404,7 +402,7 @@ fn build_gate_step(
 mod tests {
     use super::*;
     use crate::attribution::PlanTouch;
-    use crate::lifecycle::{AgentLabel, is_done_plan_path};
+    use crate::lifecycle::AgentLabel;
     use crate::repo_state::{AttributionResult, PlanTouchKind};
 
     fn sha(s: &str) -> CommitSha {
@@ -605,16 +603,14 @@ mod tests {
 
     #[test]
     fn multi_plan_touches_still_count_as_each_sessions_plan_revision() {
-        let mut done = plan_file("done-one", "c1c1", None, "# done\n");
-        done.plan_path = PathBuf::from(".trinity/plans/done/done-one.md");
         let snap = DiskSnapshot {
             head: Some(sha("c3c3")),
             plan_files: vec![
-                done,
+                plan_file("first-one", "c1c1", None, "# one\n"),
                 plan_file("active-one", "c2c2", Some("c1c1"), "# active v2\n"),
             ],
             history: vec![
-                entry("c1c1", vec![touch("done-one", PlanTouchKind::Intro)], false),
+                entry("c1c1", vec![touch("first-one", PlanTouchKind::Intro)], false),
                 entry(
                     "c2c2",
                     vec![touch("active-one", PlanTouchKind::Intro)],
@@ -623,7 +619,7 @@ mod tests {
                 entry(
                     "c3c3",
                     vec![
-                        touch("done-one", PlanTouchKind::DoneMove),
+                        touch("first-one", PlanTouchKind::Revision),
                         touch("active-one", PlanTouchKind::Revision),
                     ],
                     false,
@@ -642,7 +638,7 @@ mod tests {
             AttributionResult::Unattributed
         );
         assert_eq!(
-            crate::projection::all_plan_revisions(&state.plans[&sess("done-one")], &state),
+            crate::projection::all_plan_revisions(&state.plans[&sess("first-one")], &state),
             vec![sha("c1c1"), sha("c3c3")]
         );
         assert_eq!(
@@ -911,24 +907,28 @@ mod tests {
     }
 
     #[test]
-    fn done_session_keeps_plan_revisions_and_impl_commits() {
-        // After moving to plans/done/, the session is still present;
-        // historical commits remain attributed.
-        let mut pf = plan_file("foo", "c1c1", None, "# foo\n");
-        pf.plan_path = PathBuf::from(".trinity/plans/done/foo.md");
+    fn finished_plan_keeps_plan_revisions_and_impl_commits() {
+        // Historical commits attributed before a finalize commit stay
+        // attributed — the freeze seals subsequent commits, not earlier ones.
         let snap = DiskSnapshot {
             head: Some(sha("c4c4")),
-            plan_files: vec![pf],
+            plan_files: vec![plan_file("foo", "c1c1", None, "# foo\n")],
             history: vec![
-                entry("c1c1", vec![touch("foo", PlanTouchKind::Intro)], false),
+                entry("c1c1", vec![touch_at_active("foo", PlanTouchKind::Intro)], false),
                 entry("c2c2", vec![], true),
                 entry("c3c3", vec![], true),
-                entry("c4c4", vec![touch("foo", PlanTouchKind::DoneMove)], false),
+                finalize_entry(
+                    "c4c4",
+                    vec![],
+                    false,
+                    vec![upsert_finalize("foo", "alice.md", "APPROVE")],
+                ),
             ],
             feedback_files: vec![],
             commit_meta: BTreeMap::new(),
         };
         let state = derive_state(PathBuf::from("/r"), snap);
+        assert_eq!(state.plans[&sess("foo")].frozen_at, Some(sha("c4c4")));
         let plan_touches: Vec<_> = state
             .attribution
             .values()
@@ -942,7 +942,7 @@ mod tests {
                 )
             })
             .collect();
-        assert_eq!(plan_touches.len(), 2, "intro + done_move");
+        assert_eq!(plan_touches.len(), 1, "only the intro");
         let impl_commits: Vec<_> = state
             .attribution
             .values()
@@ -1229,43 +1229,11 @@ mod tests {
         assert_eq!(authors, vec!["alice", "bob"]);
     }
 
-    // ===== plan_conflicts =====
-
-    fn done_plan_file(stem: &str, intro: &str, body: &str) -> PlanFileBlob {
-        PlanFileBlob {
-            plan_key: sess(stem),
-            plan_path: PathBuf::from(format!(".trinity/plans/done/{stem}.md")),
-            body: body.to_string(),
-            plan_intro: sha(intro),
-            plan_intro_parent: None,
-        }
-    }
-
-    #[test]
-    fn same_stem_active_and_done_lands_in_plan_conflicts() {
-        let snap = DiskSnapshot {
-            head: Some(sha("c2c2")),
-            plan_files: vec![
-                plan_file("foo", "c1c1", None, "# active\n"),
-                done_plan_file("foo", "c2c2", "# done\n"),
-            ],
-            history: vec![],
-            feedback_files: vec![],
-            commit_meta: BTreeMap::new(),
-        };
-        let state = derive_state(PathBuf::from("/r"), snap);
-        assert!(
-            !state.plans.contains_key(&sess("foo")),
-            "conflicting plans must not be routed"
-        );
-        let paths = state
-            .plan_conflicts
-            .get(&sess("foo"))
-            .expect("conflict surfaced");
-        assert_eq!(paths.len(), 2);
-        assert!(paths.iter().any(|p| !is_done_plan_path(p)));
-        assert!(paths.iter().any(|p| is_done_plan_path(p)));
-    }
+    // The `same_stem_active_and_done_lands_in_plan_conflicts` test +
+    // its `done_plan_file` fixture were retired with the
+    // `.trinity/plans/done/` directory in Phase 5
+    // (event-log-and-finished). `PlanKey::from_path` now rejects the
+    // done/ variant outright.
 
     /// Reusable fixture: foo plan (plan_intro c1) + one impl commit c2,
     /// plus alice's APPROVE on c1 (plan) and bob's REQUEST_CHANGES on c2 (impl).

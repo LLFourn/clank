@@ -8,7 +8,7 @@ use tokio::process::Command;
 
 use crate::attribution::{CommitChanges, FinalizeChange, FinalizeChangeKind, PlanTouch};
 use crate::disk_format::{
-    is_legacy_commits_feedback_path, parse_feedback_path, parse_finalize_path, plan_path_is_done,
+    is_legacy_commits_feedback_path, parse_feedback_path, parse_finalize_path,
 };
 use crate::disk_snapshot::{DiskSnapshot, FeedbackBlob, HistoryEntry, PlanFileBlob};
 use crate::lifecycle::{CommitSha, PlanKey};
@@ -417,18 +417,6 @@ fn parse_diff_tree(stdout: &str) -> Result<ParsedDiffTree, GitIoError> {
             };
             let kind = match status_char {
                 'A' => PlanTouchKind::Intro,
-                'R' | 'C' => {
-                    let was_done = old_path
-                        .map(|p| plan_path_is_done(&PathBuf::from(p)))
-                        .unwrap_or(false);
-                    let is_done = plan_path_is_done(&new_rel);
-                    if was_done != is_done {
-                        PlanTouchKind::DoneMove
-                    } else {
-                        PlanTouchKind::Revision
-                    }
-                }
-                'D' => PlanTouchKind::Revision,
                 _ => PlanTouchKind::Revision,
             };
             let new_path_for_touch = if status_char == 'D' && !is_rename {
@@ -724,7 +712,7 @@ fn walk_files(root: &Path, max_depth: usize, out: &mut Vec<PathBuf>) -> std::io:
 }
 
 fn is_plan_path(rel: &Path) -> bool {
-    // `.trinity/plans/<name>.md` or `.trinity/plans/done/<name>.md`.
+    // `.trinity/plans/<name>.md` (no nested subdirs).
     let mut comps = rel.components().filter_map(|c| match c {
         std::path::Component::Normal(s) => s.to_str(),
         _ => None,
@@ -735,19 +723,11 @@ fn is_plan_path(rel: &Path) -> bool {
     if comps.next() != Some("plans") {
         return false;
     }
-    // Either <name>.md (depth 3) or done/<name>.md (depth 4).
     let third = match comps.next() {
         Some(s) => s,
         None => return false,
     };
-    if third == "done" {
-        match comps.next() {
-            Some(name) => comps.next().is_none() && name.ends_with(".md"),
-            None => false,
-        }
-    } else {
-        comps.next().is_none() && third.ends_with(".md")
-    }
+    comps.next().is_none() && third.ends_with(".md")
 }
 
 #[cfg(test)]
@@ -760,8 +740,8 @@ mod tests {
     }
 
     #[test]
-    fn is_plan_path_done() {
-        assert!(is_plan_path(&PathBuf::from(".trinity/plans/done/foo.md")));
+    fn is_plan_path_rejects_done_subdir() {
+        assert!(!is_plan_path(&PathBuf::from(".trinity/plans/done/foo.md")));
     }
 
     #[test]
@@ -816,23 +796,6 @@ mod tests {
         let changes = &parsed.changes;
         assert!(changes.plan_touches.is_empty());
         assert!(changes.has_non_plan_code_changes);
-    }
-
-    #[test]
-    fn parse_diff_tree_done_move() {
-        let stdout = "R100\t.trinity/plans/foo.md\t.trinity/plans/done/foo.md\n";
-        let parsed = parse_diff_tree(stdout).unwrap();
-        let changes = &parsed.changes;
-        assert_eq!(changes.plan_touches.len(), 1);
-        assert!(matches!(
-            changes.plan_touches[0].kind,
-            PlanTouchKind::DoneMove
-        ));
-        assert_eq!(changes.plan_touches[0].session.as_str(), "foo");
-        assert_eq!(
-            changes.plan_touches[0].new_path.as_deref(),
-            Some(Path::new(".trinity/plans/done/foo.md"))
-        );
     }
 
     #[test]

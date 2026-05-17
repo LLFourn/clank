@@ -448,7 +448,7 @@ pub async fn resolve_plan_id(
     let actives: Vec<&crate::repo_state::Plan> = repo_state
         .plans
         .values()
-        .filter(|p| matches!(p.state, crate::repo_state::PlanState::Active))
+        .filter(|p| p.frozen_at.is_none())
         .collect();
 
     match actives.len() {
@@ -465,7 +465,7 @@ pub async fn resolve_plan_id(
                     json!({
                         "plan_id": plan_id,
                         "current_path": p.plan_path.to_string_lossy(),
-                        "state": p.state.as_str(),
+                        "state": crate::repo_state::PlanLifecycle::from_plan(p).as_str(),
                     })
                 })
                 .collect();

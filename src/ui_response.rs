@@ -93,7 +93,7 @@ fn plans_index_parts(
         let worktree_status =
             status_reader.compute(&snapshot.root, &plan.plan_path, &plan.body_hash)?;
         let w = waiting_on(
-            matches!(plan.state, crate::repo_state::PlanState::Done),
+            plan.frozen_at.is_some(),
             worktree_status,
             gate,
         );
@@ -183,11 +183,7 @@ pub fn plan_page_with_reader(
         &bundle.plan_touches,
         &bundle.attribution,
     );
-    let w = waiting_on(
-        matches!(plan.state, crate::repo_state::PlanState::Done),
-        worktree_status,
-        gate,
-    );
+    let w = waiting_on(plan.frozen_at.is_some(), worktree_status, gate);
 
     let plan_revisions: Vec<String> =
         all_plan_revisions_for(&plan.id, &bundle.commit_order, &bundle.plan_touches)
@@ -666,7 +662,6 @@ mod tests {
         let session = Plan {
             id: PlanKey::parse("foo").unwrap(),
             plan_path: std::path::PathBuf::from(".trinity/plans/foo.md"),
-            state: crate::repo_state::PlanState::Active,
             body: String::new(),
             body_hash: content_hash(""),
             plan_intro: CommitSha::parse("dead").unwrap(),

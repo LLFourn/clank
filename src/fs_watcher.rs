@@ -86,35 +86,16 @@ fn matches_head_file(rel: &Path) -> bool {
     )
 }
 
-fn plan_signal(rel: &Path, event_kind: FsEventKind) -> Option<FilesystemSignal> {
+fn plan_signal(rel: &Path, _event_kind: FsEventKind) -> Option<FilesystemSignal> {
     let plans_rel = rel.strip_prefix(".trinity/plans").ok()?;
-    // plans_rel is either `<id>.md` or `done/<id>.md`.
-    let (under_done, name_seg) = {
-        let mut comps = plans_rel.components();
-        let first = comps.next()?;
-        let first_str = first.as_os_str().to_str()?;
-        if first_str == "done" {
-            let second = comps.next()?;
-            if comps.next().is_some() {
-                return None; // too deep
-            }
-            (true, second.as_os_str().to_str()?.to_string())
-        } else {
-            if comps.next().is_some() {
-                return None; // too deep
-            }
-            (false, first_str.to_string())
-        }
-    };
-    let plan_rel = if under_done {
-        Path::new(".trinity/plans/done").join(&name_seg)
-    } else {
-        Path::new(".trinity/plans").join(&name_seg)
-    };
+    let mut comps = plans_rel.components();
+    let first = comps.next()?;
+    let name_seg = first.as_os_str().to_str()?;
+    if comps.next().is_some() {
+        return None; // too deep (e.g. .trinity/plans/done/foo.md)
+    }
+    let plan_rel = Path::new(".trinity/plans").join(name_seg);
     let session_id = PlanKey::from_path(&plan_rel)?;
-    // Both create/modify and remove map to PlanFileChanged. The runner's
-    // plan-worktree-status recompute correctly handles either case.
-    let _ = event_kind;
     Some(FilesystemSignal::PlanFileChanged {
         session_id,
         path: plan_rel,
@@ -175,19 +156,13 @@ mod tests {
     }
 
     #[test]
-    fn done_plan_file_emits_signal_with_done_path() {
+    fn done_plan_file_is_ignored() {
         let sig = path_to_signal(
             &repo().join(".trinity/plans/done/foo.md"),
             &repo(),
             FsEventKind::CreatedOrModified,
         );
-        match sig {
-            Some(FilesystemSignal::PlanFileChanged { session_id, path }) => {
-                assert_eq!(session_id.as_str(), "foo");
-                assert_eq!(path, PathBuf::from(".trinity/plans/done/foo.md"));
-            }
-            other => panic!("expected PlanFileChanged, got {other:?}"),
-        }
+        assert!(sig.is_none(), "done/ subdir is no longer tracked");
     }
 
     #[test]

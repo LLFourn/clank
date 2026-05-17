@@ -8,7 +8,7 @@ use std::path::Path;
 
 use serde_json::{Value, json};
 
-use crate::lifecycle::{AgentLabel, ContentHash, PlanKey, content_hash, plan_path_counterpart};
+use crate::lifecycle::{AgentLabel, ContentHash, PlanKey, content_hash};
 use crate::projection::{
     all_implementation_commits, all_plan_revisions, expected_action, impl_gate_for, phase,
     plan_gate_for, plan_worktree_status, waiting_on,
@@ -46,24 +46,14 @@ pub fn compute_plan_worktree_status_parts(
     body_hash: &ContentHash,
 ) -> std::io::Result<PlanWorktreeStatus> {
     let active_path = repo_root.join(plan_path);
-    let counterpart_rel = plan_path_counterpart(plan_path);
-    let counterpart_abs = counterpart_rel.as_ref().map(|p| repo_root.join(p));
 
     let wt_hash = match std::fs::read_to_string(&active_path) {
         Ok(body) => Some(content_hash(&body)),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
         Err(e) => return Err(e),
     };
-    let counterpart_exists = counterpart_abs
-        .as_ref()
-        .map(|p| p.exists())
-        .unwrap_or(false);
 
-    Ok(plan_worktree_status(
-        Some(body_hash),
-        wt_hash.as_ref(),
-        counterpart_exists,
-    ))
+    Ok(plan_worktree_status(Some(body_hash), wt_hash.as_ref()))
 }
 
 /// `list_plans` response over a single repo.
@@ -93,11 +83,7 @@ pub(crate) fn list_plans_response_with_status_reader(
             &state.plan_touches,
             &state.attribution,
         );
-        let w = waiting_on(
-            matches!(plan.state, crate::repo_state::PlanState::Done),
-            worktree_status,
-            gate,
-        );
+        let w = waiting_on(plan.frozen_at.is_some(), worktree_status, gate);
         plans.push(plan_summary(
             &state.root,
             plan,
@@ -204,11 +190,7 @@ pub fn get_context_response_from_snapshot(
         &state.plan_touches,
         &state.attribution,
     );
-    let w = waiting_on(
-        matches!(session.state, crate::repo_state::PlanState::Done),
-        worktree_status,
-        gate,
-    );
+    let w = waiting_on(session.frozen_at.is_some(), worktree_status, gate);
 
     let pr_hint = if matches!(session_phase, crate::repo_state::Phase::Implementing) {
         Some(pr_hint_value(session, state))
@@ -608,34 +590,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn plan_worktree_done_move_pending() {
+    async fn plan_worktree_plan_file_missing() {
         let dir = init_repo();
         write_file(dir.path(), ".trinity/plans/foo.md", "# foo\n");
         commit(dir.path(), "add plan");
-        // Move to done without committing
-        let from = dir.path().join(".trinity/plans/foo.md");
-        let to_dir = dir.path().join(".trinity/plans/done");
-        std::fs::create_dir_all(&to_dir).unwrap();
-        std::fs::rename(from, to_dir.join("foo.md")).unwrap();
-
-        let state = rebuild_repo(dir.path()).await.unwrap();
-        let session = state.plans.values().next().unwrap();
-        let status = status_for_session(dir.path(), session);
-        assert_eq!(status, PlanWorktreeStatus::DoneMovePending);
-    }
-
-    #[tokio::test]
-    async fn plan_worktree_missing_active_file() {
-        let dir = init_repo();
-        write_file(dir.path(), ".trinity/plans/foo.md", "# foo\n");
-        commit(dir.path(), "add plan");
-        // Just rm the file without committing or moving.
+        // Just rm the file without committing.
         std::fs::remove_file(dir.path().join(".trinity/plans/foo.md")).unwrap();
 
         let state = rebuild_repo(dir.path()).await.unwrap();
         let session = state.plans.values().next().unwrap();
         let status = status_for_session(dir.path(), session);
-        assert_eq!(status, PlanWorktreeStatus::MissingActivePlanFile);
+        assert_eq!(status, PlanWorktreeStatus::PlanFileMissing);
     }
 
     #[tokio::test]

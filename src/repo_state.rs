@@ -7,7 +7,7 @@ use std::collections::{BTreeMap, VecDeque};
 use std::path::PathBuf;
 
 use crate::lifecycle::{
-    AgentLabel, CommitSha, ContentHash, PlanKey, RepoBasename, is_done_plan_path,
+    AgentLabel, CommitSha, ContentHash, PlanKey, RepoBasename,
 };
 
 pub type RepoRoot = PathBuf;
@@ -309,15 +309,10 @@ impl StateDigest {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Plan {
     pub id: PlanKey,
-    /// Repo-relative path: `.trinity/plans/<stem>.md` or
-    /// `.trinity/plans/done/<stem>.md`. Never absolute. Internal: never
-    /// crosses an API boundary — the boundary uses `PlanId` plus
-    /// `state` and a derived `current_path`.
+    /// Repo-relative path: `.trinity/plans/<stem>.md`. Never absolute.
+    /// Internal: never crosses an API boundary — the boundary uses
+    /// `PlanId` plus a derived `current_path`.
     pub plan_path: PathBuf,
-    /// Active vs Done lifecycle state, derived from `plan_path` at
-    /// rebuild time. Exposed on the wire as a `state` field; the
-    /// `PlanId` itself doesn't change when this flips.
-    pub state: PlanState,
     /// Body from HEAD's blob, not the working tree.
     pub body: String,
     pub body_hash: ContentHash,
@@ -357,33 +352,9 @@ pub struct Plan {
     pub archived_cycles: Vec<ArchivedCycleSummary>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PlanState {
-    Active,
-    Done,
-}
-
-impl PlanState {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            PlanState::Active => "active",
-            PlanState::Done => "done",
-        }
-    }
-
-    pub fn from_plan_path(p: &std::path::Path) -> Self {
-        if is_done_plan_path(p) {
-            PlanState::Done
-        } else {
-            PlanState::Active
-        }
-    }
-}
-
 /// Plan lifecycle as projected from the event-log fold. Replaces the
-/// legacy `PlanState` (which mirrors the `done/` directory move) at
-/// the wire boundary in Phase 4. Derived from `Plan.frozen_at` —
-/// never stored.
+/// legacy `PlanState` (which mirrored the `done/` directory move).
+/// Derived from `Plan.frozen_at` — never stored.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PlanLifecycle {
     Active,
@@ -450,20 +421,18 @@ impl Verdict {
     }
 }
 
-/// Working-tree state of a session's plan file relative to HEAD. **Never
-/// stored on `Session`** — always recomputed at read time.
+/// Working-tree state of a plan's plan file relative to HEAD. **Never
+/// stored on `Plan`** — always recomputed at read time.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PlanWorktreeStatus {
     /// Working tree matches HEAD's plan blob.
     Clean,
     /// File exists at the active path with a different body.
     BodyDirty,
-    /// Active path is missing from the working tree but the done counterpart
-    /// is present — operator ran `mv` but hasn't committed.
-    DoneMovePending,
-    /// Active path missing and no done counterpart — operator deleted the
-    /// file without doing the proper move.
-    MissingActivePlanFile,
+    /// Plan file is missing from the working tree but still present in
+    /// HEAD — operator made an uncommitted deletion. Action: restore
+    /// it from HEAD or commit the deletion.
+    PlanFileMissing,
 }
 
 impl PlanWorktreeStatus {
@@ -471,8 +440,7 @@ impl PlanWorktreeStatus {
         match self {
             PlanWorktreeStatus::Clean => "clean",
             PlanWorktreeStatus::BodyDirty => "body_dirty",
-            PlanWorktreeStatus::DoneMovePending => "done_move_pending",
-            PlanWorktreeStatus::MissingActivePlanFile => "missing_active_plan_file",
+            PlanWorktreeStatus::PlanFileMissing => "plan_file_missing",
         }
     }
 }
@@ -517,7 +485,6 @@ pub enum AttributionResult {
 pub enum PlanTouchKind {
     Intro,
     Revision,
-    DoneMove,
 }
 
 impl PlanTouchKind {
@@ -525,7 +492,6 @@ impl PlanTouchKind {
         match self {
             PlanTouchKind::Intro => "intro",
             PlanTouchKind::Revision => "revision",
-            PlanTouchKind::DoneMove => "done_move",
         }
     }
 }
@@ -544,9 +510,6 @@ pub enum CommitKind {
     CodeOnly,
     /// Touches this plan file AND code (single-plan-touch + code).
     Mixed,
-    /// Renames this plan file into / out of `.trinity/plans/done/`.
-    /// Lifecycle-significant; never gated, never reviewable.
-    DoneMove,
     /// Touches two or more distinct plan files on a single commit.
     /// Surfaced in the timeline but never gated.
     MultiPlan,
@@ -561,15 +524,13 @@ impl CommitKind {
             CommitKind::PlanOnly => "plan_only",
             CommitKind::CodeOnly => "code_only",
             CommitKind::Mixed => "mixed",
-            CommitKind::DoneMove => "done_move",
             CommitKind::MultiPlan => "multi_plan",
             CommitKind::Unattributed => "unattributed",
         }
     }
 
     /// Reviewable commits get a `CommitGate` entry in `Plan.commits`.
-    /// `DoneMove`, `MultiPlan`, and `Unattributed` are intentionally
-    /// excluded — see plan §"single done_move/multi_plan invariant".
+    /// `MultiPlan` and `Unattributed` are intentionally excluded.
     pub fn is_reviewable(self) -> bool {
         matches!(
             self,
@@ -631,7 +592,7 @@ pub struct PlanEvent {
     pub ts: i64,
     pub repo: RepoRoot,
     pub plan_id: crate::lifecycle::PlanId,
-    pub state: PlanState,
+    pub lifecycle: PlanLifecycle,
     pub kind: PlanEventKind,
     pub payload: serde_json::Value,
 }
@@ -687,9 +648,13 @@ impl WaitingRole {
 /// latest relevant commit. See plan §"WaitingReason collapse".
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WaitingReason {
-    SessionDone,
-    CommitDoneMove,
-    RestoreOrCommitDoneMove,
+    /// Plan is frozen (`Plan.frozen_at` is `Some`). Nothing to do for
+    /// either role; the plan is sealed.
+    SessionFinished,
+    /// Plan file is missing from the working tree but still present in
+    /// HEAD. The master should restore it from HEAD or commit the
+    /// deletion.
+    RestoreOrCommitPlanFile,
     CommitPlanRevision,
     /// "REQUEST_CHANGES on the latest reviewable commit; address it."
     /// Replaces the old AddressPlanRequestChanges + AddressImplRequestChanges
@@ -715,9 +680,8 @@ pub enum WaitingReason {
 impl WaitingReason {
     pub fn as_str(self) -> &'static str {
         match self {
-            WaitingReason::SessionDone => "session_done",
-            WaitingReason::CommitDoneMove => "commit_done_move",
-            WaitingReason::RestoreOrCommitDoneMove => "restore_or_commit_done_move",
+            WaitingReason::SessionFinished => "session_finished",
+            WaitingReason::RestoreOrCommitPlanFile => "restore_or_commit_plan_file",
             WaitingReason::CommitPlanRevision => "commit_plan_revision",
             WaitingReason::AddressCommitChanges => "address_commit_changes",
             WaitingReason::ReadyToStartImplementation => "ready_to_start_implementation",

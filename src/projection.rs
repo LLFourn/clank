@@ -8,7 +8,7 @@
 
 use std::path::Path;
 
-use crate::lifecycle::{AgentLabel, ContentHash, is_done_plan_path};
+use crate::lifecycle::{AgentLabel, ContentHash};
 use crate::repo_state::{
     AttributionResult, CommitKind, Feedback, Phase, Plan, PlanTouchKind, PlanWorktreeStatus,
     Verdict, WaitingOn, WaitingReason, WaitingRole,
@@ -22,26 +22,23 @@ use crate::lifecycle::CommitSha;
 /// `plan_worktree_status` from hash comparisons + filesystem existence.
 ///
 /// Inputs are gathered by the IO layer (one `git show HEAD:<path>` for the
-/// blob hash, one `fs::read` for the working-tree body, one `fs::exists`
-/// for the done counterpart). The function itself is pure.
+/// blob hash, one `fs::read` for the working-tree body). The function
+/// itself is pure.
 pub fn plan_worktree_status(
     head_blob_hash: Option<&ContentHash>,
     worktree_body_hash: Option<&ContentHash>,
-    done_counterpart_exists: bool,
 ) -> PlanWorktreeStatus {
     match (head_blob_hash, worktree_body_hash) {
         (Some(h), Some(w)) if h == w => PlanWorktreeStatus::Clean,
         (Some(_), Some(_)) => PlanWorktreeStatus::BodyDirty,
-        (Some(_), None) if done_counterpart_exists => PlanWorktreeStatus::DoneMovePending,
-        (Some(_), None) => PlanWorktreeStatus::MissingActivePlanFile,
-        // Session has no HEAD blob (shouldn't happen for tracked sessions).
+        (Some(_), None) => PlanWorktreeStatus::PlanFileMissing,
+        // Plan has no HEAD blob (shouldn't happen for tracked plans).
         (None, _) => PlanWorktreeStatus::Clean,
     }
 }
 
-/// Phase per session, derived from path + attribution map.
+/// Phase per session, derived from attribution map.
 ///
-/// - `Done` if the plan_path is under `.trinity/plans/done/`.
 /// - `Implementing` if any attributed commit past plan_intro has code changes.
 /// - `Planning` otherwise.
 pub fn phase(plan: &Plan, attribution: &BTreeMap<CommitSha, AttributionResult>) -> Phase {
@@ -51,13 +48,10 @@ pub fn phase(plan: &Plan, attribution: &BTreeMap<CommitSha, AttributionResult>) 
 /// Phase derivation from primitive inputs. Used by callers that hold a
 /// snapshot (e.g. `ui_response`) rather than a `&Plan`.
 pub fn phase_for(
-    plan_path: &Path,
+    _plan_path: &Path,
     plan_key: &crate::lifecycle::PlanKey,
     attribution: &BTreeMap<CommitSha, AttributionResult>,
 ) -> Phase {
-    if is_done_plan_path(plan_path) {
-        return Phase::Done;
-    }
     for attr in attribution.values() {
         if let AttributionResult::Attributed {
             session: sid,
@@ -78,25 +72,18 @@ pub fn phase_for(
 /// `latest_reviewable_commit_gate_for` or one of the legacy `plan_gate_for` /
 /// `impl_gate_for` wrappers that funnel into the same store).
 pub fn waiting_on(
-    is_done: bool,
+    is_finished: bool,
     worktree_status: PlanWorktreeStatus,
     gate: Option<&CommitGate>,
 ) -> WaitingOn {
-    if is_done {
-        return make(WaitingRole::None, WaitingReason::SessionDone, Vec::new());
+    if is_finished {
+        return make(WaitingRole::None, WaitingReason::SessionFinished, Vec::new());
     }
     match worktree_status {
-        PlanWorktreeStatus::DoneMovePending => {
+        PlanWorktreeStatus::PlanFileMissing => {
             return make(
                 WaitingRole::Master,
-                WaitingReason::CommitDoneMove,
-                Vec::new(),
-            );
-        }
-        PlanWorktreeStatus::MissingActivePlanFile => {
-            return make(
-                WaitingRole::Master,
-                WaitingReason::RestoreOrCommitDoneMove,
+                WaitingReason::RestoreOrCommitPlanFile,
                 Vec::new(),
             );
         }
@@ -240,47 +227,24 @@ pub fn last_activity_ts_for(
 /// Repo-relative path of the plan file at the given commit's tree.
 ///
 /// Walks `plan_touches` along `commit_order` from the start to (and
-/// including) `target_sha`, toggling between active and done on every
-/// `DoneMove` touch. `DoneMove` is direction-agnostic at the producer
-/// (`git_io::classify_plan_touch` emits it for either direction), so
-/// the toggle is symmetric — an active→done→active round trip ends at
-/// active. Used by revision/diff routes to look up historical blobs
-/// without assuming the plan file lived at its current path for the
-/// whole history.
-///
-/// **Producer invariant:** `plan_touches[sha]` carries at most one
-/// `(plan_key, DoneMove)` entry per commit. Git's rename detection
-/// pairs one source to one destination per commit, so the upstream
-/// `parse_diff_tree` walk in `git_io` cannot emit duplicates today.
-/// If a future producer relaxes that, the XOR will silently cancel.
-///
-/// Returns `None` if `target_sha` isn't in `commit_order`.
+/// Plan file path at `target_sha`. With `done/` retired, the plan file
+/// no longer moves over its history; this always returns
+/// `.trinity/plans/<stem>.md`. Returns `None` if `target_sha` isn't in
+/// `commit_order`.
 pub fn plan_path_at(
     plan_key: &crate::lifecycle::PlanKey,
     target_sha: &CommitSha,
     commit_order: &[CommitSha],
-    plan_touches: &BTreeMap<
+    _plan_touches: &BTreeMap<
         CommitSha,
         Vec<(crate::lifecycle::PlanKey, crate::repo_state::PlanTouchKind)>,
     >,
 ) -> Option<std::path::PathBuf> {
-    let target_pos = commit_order.iter().position(|c| c == target_sha)?;
-    let stem = plan_key.as_str();
-    let mut is_done = false;
-    for sha in &commit_order[..=target_pos] {
-        if let Some(touches) = plan_touches.get(sha) {
-            for (k, kind) in touches {
-                if k == plan_key && matches!(kind, crate::repo_state::PlanTouchKind::DoneMove) {
-                    is_done = !is_done;
-                }
-            }
-        }
-    }
-    Some(if is_done {
-        std::path::PathBuf::from(format!(".trinity/plans/done/{stem}.md"))
-    } else {
-        std::path::PathBuf::from(format!(".trinity/plans/{stem}.md"))
-    })
+    commit_order.iter().position(|c| c == target_sha)?;
+    Some(std::path::PathBuf::from(format!(
+        ".trinity/plans/{}.md",
+        plan_key.as_str()
+    )))
 }
 
 /// All plan-touching commits attributed to `session`, in chronological
@@ -459,9 +423,8 @@ pub fn impl_gate_for_parts<'a>(
 pub fn expected_action(reason: WaitingReason) -> &'static str {
     use WaitingReason::*;
     match reason {
-        SessionDone => "none",
-        CommitDoneMove => "commit_done_move",
-        RestoreOrCommitDoneMove => "restore_or_commit_done_move",
+        SessionFinished => "none",
+        RestoreOrCommitPlanFile => "restore_or_commit_plan_file",
         CommitPlanRevision => "commit_plan_revision",
         AddressCommitChanges => "address_commit_changes",
         ReadyToStartImplementation => "start_implementation",
@@ -500,12 +463,9 @@ fn description_for(
             .join(", ")
     };
     match (role, reason) {
-        (None, SessionDone) => "Session is done.".to_string(),
-        (Master, CommitDoneMove) => "Plan was moved to `done/` but the move isn't committed yet. \
-             Stage and commit to retire the session."
-            .to_string(),
-        (Master, RestoreOrCommitDoneMove) => "Active plan file is missing from the working tree. \
-             Either restore it (`git checkout -- <path>`) or move it to `done/` and commit."
+        (None, SessionFinished) => "Plan is finished.".to_string(),
+        (Master, RestoreOrCommitPlanFile) => "Plan file is missing from the working tree. \
+             Either restore it (`git checkout -- <path>`) or commit the deletion."
             .to_string(),
         (Master, CommitPlanRevision) => "Plan has uncommitted changes. \
              Commit the revision to release any blocked reviews."
@@ -522,7 +482,7 @@ fn description_for(
             }
         }
         (Master, ReadyToStartImplementation) => {
-            "Latest commit approved. Continue with the next commit or move the plan to `done/`."
+            "Latest commit approved. Continue with the next commit or finalize the plan."
                 .to_string()
         }
         (Reviewers, CommitNeedsReview) => {
@@ -568,10 +528,6 @@ pub fn commit_kind_for(
             .find(|(k, _)| k == plan_key)
             .map(|(_, kind)| *kind)
     });
-
-    if let Some(PlanTouchKind::DoneMove) = our_touch {
-        return CommitKind::DoneMove;
-    }
 
     if our_touch.is_some() {
         if distinct_plans_touched >= 2 {
@@ -750,7 +706,7 @@ mod tests {
     fn worktree_clean_when_hashes_match() {
         let h = hash("a");
         assert_eq!(
-            plan_worktree_status(Some(&h), Some(&h), false),
+            plan_worktree_status(Some(&h), Some(&h)),
             PlanWorktreeStatus::Clean
         );
     }
@@ -760,57 +716,34 @@ mod tests {
         let h1 = hash("a");
         let h2 = hash("b");
         assert_eq!(
-            plan_worktree_status(Some(&h1), Some(&h2), false),
+            plan_worktree_status(Some(&h1), Some(&h2)),
             PlanWorktreeStatus::BodyDirty
         );
     }
 
     #[test]
-    fn worktree_done_move_pending_when_active_missing_done_exists() {
+    fn worktree_plan_file_missing_when_worktree_missing() {
         let h = hash("a");
         assert_eq!(
-            plan_worktree_status(Some(&h), None, true),
-            PlanWorktreeStatus::DoneMovePending
-        );
-    }
-
-    #[test]
-    fn worktree_missing_active_when_both_missing() {
-        let h = hash("a");
-        assert_eq!(
-            plan_worktree_status(Some(&h), None, false),
-            PlanWorktreeStatus::MissingActivePlanFile
+            plan_worktree_status(Some(&h), None),
+            PlanWorktreeStatus::PlanFileMissing
         );
     }
 
     // -------- waiting_on --------
 
     #[test]
-    fn waiting_session_done_when_phase_done() {
+    fn waiting_session_finished_when_plan_is_finished() {
         let w = waiting_on(true, PlanWorktreeStatus::Clean, None);
         assert_eq!(w.role, WaitingRole::None);
-        assert_eq!(w.reason, WaitingReason::SessionDone);
+        assert_eq!(w.reason, WaitingReason::SessionFinished);
     }
 
     #[test]
-    fn waiting_commit_done_move_preempts_gate() {
-        let g = gate(
-            CommitGateState::Approved,
-            agents(&["alice"]),
-            agents(&["alice"]),
-            Vec::new(),
-            Vec::new(),
-        );
-        let w = waiting_on(false, PlanWorktreeStatus::DoneMovePending, Some(&g));
+    fn waiting_restore_or_commit_plan_file() {
+        let w = waiting_on(false, PlanWorktreeStatus::PlanFileMissing, None);
         assert_eq!(w.role, WaitingRole::Master);
-        assert_eq!(w.reason, WaitingReason::CommitDoneMove);
-    }
-
-    #[test]
-    fn waiting_restore_or_commit_done_move() {
-        let w = waiting_on(false, PlanWorktreeStatus::MissingActivePlanFile, None);
-        assert_eq!(w.role, WaitingRole::Master);
-        assert_eq!(w.reason, WaitingReason::RestoreOrCommitDoneMove);
+        assert_eq!(w.reason, WaitingReason::RestoreOrCommitPlanFile);
     }
 
     #[test]
@@ -967,68 +900,10 @@ mod tests {
     }
 
     #[test]
-    fn plan_path_at_flips_to_done_at_done_move_commit() {
-        let order = vec![cs("c1c1"), cs("c2c2"), cs("c3c3")];
-        let mut touches: BTreeMap<CommitSha, Vec<(PlanKey, PlanTouchKind)>> = BTreeMap::new();
-        touches.insert(cs("c1c1"), vec![(pk("foo"), PlanTouchKind::Intro)]);
-        touches.insert(cs("c3c3"), vec![(pk("foo"), PlanTouchKind::DoneMove)]);
-
-        assert_eq!(
-            plan_path_at(&pk("foo"), &cs("c1c1"), &order, &touches).unwrap(),
-            PathBuf::from(".trinity/plans/foo.md"),
-        );
-        assert_eq!(
-            plan_path_at(&pk("foo"), &cs("c2c2"), &order, &touches).unwrap(),
-            PathBuf::from(".trinity/plans/foo.md"),
-        );
-        assert_eq!(
-            plan_path_at(&pk("foo"), &cs("c3c3"), &order, &touches).unwrap(),
-            PathBuf::from(".trinity/plans/done/foo.md"),
-        );
-    }
-
-    #[test]
     fn plan_path_at_unknown_sha_returns_none() {
         let order = vec![cs("c1c1")];
         let touches: BTreeMap<CommitSha, Vec<(PlanKey, PlanTouchKind)>> = BTreeMap::new();
         assert!(plan_path_at(&pk("foo"), &cs("ffff"), &order, &touches).is_none());
-    }
-
-    #[test]
-    fn plan_path_at_toggles_on_each_done_move() {
-        // The producer emits `DoneMove` for either direction. Round-trip
-        // (active→done→active) must end at active.
-        let order = vec![cs("c1c1"), cs("c2c2"), cs("c3c3"), cs("c4c4")];
-        let mut touches: BTreeMap<CommitSha, Vec<(PlanKey, PlanTouchKind)>> = BTreeMap::new();
-        touches.insert(cs("c1c1"), vec![(pk("foo"), PlanTouchKind::Intro)]);
-        touches.insert(cs("c2c2"), vec![(pk("foo"), PlanTouchKind::DoneMove)]);
-        touches.insert(cs("c4c4"), vec![(pk("foo"), PlanTouchKind::DoneMove)]);
-
-        assert_eq!(
-            plan_path_at(&pk("foo"), &cs("c2c2"), &order, &touches).unwrap(),
-            PathBuf::from(".trinity/plans/done/foo.md"),
-        );
-        assert_eq!(
-            plan_path_at(&pk("foo"), &cs("c3c3"), &order, &touches).unwrap(),
-            PathBuf::from(".trinity/plans/done/foo.md"),
-        );
-        assert_eq!(
-            plan_path_at(&pk("foo"), &cs("c4c4"), &order, &touches).unwrap(),
-            PathBuf::from(".trinity/plans/foo.md"),
-            "second DoneMove (done→active) must toggle back to active",
-        );
-    }
-
-    #[test]
-    fn plan_path_at_ignores_other_plans_done_move() {
-        let order = vec![cs("c1c1"), cs("c2c2")];
-        let mut touches: BTreeMap<CommitSha, Vec<(PlanKey, PlanTouchKind)>> = BTreeMap::new();
-        touches.insert(cs("c1c1"), vec![(pk("foo"), PlanTouchKind::Intro)]);
-        touches.insert(cs("c2c2"), vec![(pk("bar"), PlanTouchKind::DoneMove)]);
-        assert_eq!(
-            plan_path_at(&pk("foo"), &cs("c2c2"), &order, &touches).unwrap(),
-            PathBuf::from(".trinity/plans/foo.md"),
-        );
     }
 
     // -------- last_activity_ts_for --------
@@ -1184,23 +1059,6 @@ mod tests {
         assert_eq!(
             commit_kind_for(&pk("foo"), &cs("aaaa"), &touches, &attribution),
             CommitKind::CodeOnly
-        );
-    }
-
-    #[test]
-    fn commit_kind_done_move_takes_precedence_over_code() {
-        // Even if the rename commit somehow carries code changes,
-        // DoneMove wins for the plan being moved.
-        let mut touches = BTreeMap::new();
-        touches.insert(cs("aaaa"), touches_one("foo", PlanTouchKind::DoneMove));
-        let mut attribution = BTreeMap::new();
-        attribution.insert(
-            cs("aaaa"),
-            attributed("foo", Some(PlanTouchKind::DoneMove), true),
-        );
-        assert_eq!(
-            commit_kind_for(&pk("foo"), &cs("aaaa"), &touches, &attribution),
-            CommitKind::DoneMove
         );
     }
 
@@ -1370,9 +1228,9 @@ mod tests {
     }
 
     #[test]
-    fn gates_skip_done_move_and_multi_plan() {
+    fn gates_skip_multi_plan() {
         // Reviewable: a (PlanOnly), c (CodeOnly).
-        // Unreviewable: b (MultiPlan), d (DoneMove).
+        // Unreviewable: b (MultiPlan).
         let mut touches = BTreeMap::new();
         touches.insert(cs("aaaa"), touches_one("foo", PlanTouchKind::Intro));
         touches.insert(
@@ -1382,7 +1240,6 @@ mod tests {
                 (pk("bar"), PlanTouchKind::Revision),
             ],
         );
-        touches.insert(cs("dddd"), touches_one("foo", PlanTouchKind::DoneMove));
         let mut attribution = BTreeMap::new();
         attribution.insert(
             cs("aaaa"),
@@ -1390,20 +1247,15 @@ mod tests {
         );
         attribution.insert(cs("bbbb"), AttributionResult::Unattributed);
         attribution.insert(cs("cccc"), attributed("foo", None, true));
-        attribution.insert(
-            cs("dddd"),
-            attributed("foo", Some(PlanTouchKind::DoneMove), false),
-        );
 
-        // Reviewer leaves feedback on the unreviewable commits — those
+        // Reviewer leaves feedback on the unreviewable commit — those
         // votes must NOT enroll them as cumulative participants.
         let mut plan_feedback = BTreeMap::new();
         plan_feedback.insert((cs("bbbb"), al("rogue")), feedback_with(Verdict::Approve));
-        plan_feedback.insert((cs("dddd"), al("rogue")), feedback_with(Verdict::Approve));
 
         let gates = build_commit_gates(
             &pk("foo"),
-            &[cs("aaaa"), cs("bbbb"), cs("cccc"), cs("dddd")],
+            &[cs("aaaa"), cs("bbbb"), cs("cccc")],
             &touches,
             &attribution,
             &plan_feedback,
@@ -1412,7 +1264,6 @@ mod tests {
         assert!(gates.contains_key(&cs("aaaa")));
         assert!(!gates.contains_key(&cs("bbbb")), "multi_plan has no gate");
         assert!(gates.contains_key(&cs("cccc")));
-        assert!(!gates.contains_key(&cs("dddd")), "done_move has no gate");
 
         // gate(C) sees zero participants — `rogue` reviewed only
         // unreviewable commits and so never enters the participant set.
@@ -1648,45 +1499,4 @@ mod tests {
         assert_eq!(gate.approvers, vec![al("codex")]);
     }
 
-    #[test]
-    fn plan_gate_skips_done_move_to_earlier_reviewable() {
-        // A (PlanOnly, Approved) → B (DoneMove). Plan gate should
-        // resolve to A's gate, not return None.
-        let mut touches = BTreeMap::new();
-        touches.insert(cs("aaaa"), touches_one("foo", PlanTouchKind::Intro));
-        touches.insert(cs("bbbb"), touches_one("foo", PlanTouchKind::DoneMove));
-        let mut attribution = BTreeMap::new();
-        attribution.insert(
-            cs("aaaa"),
-            attributed("foo", Some(PlanTouchKind::Intro), false),
-        );
-        attribution.insert(
-            cs("bbbb"),
-            attributed("foo", Some(PlanTouchKind::DoneMove), false),
-        );
-
-        let mut commits = BTreeMap::new();
-        commits.insert(
-            cs("aaaa"),
-            CommitGate {
-                state: CommitGateState::Approved,
-                participants: vec![al("codex")],
-                approvers: vec![al("codex")],
-                requesters: Vec::new(),
-                ambiguous: Vec::new(),
-                missing: Vec::new(),
-                feedback: BTreeMap::new(),
-            },
-        );
-
-        let gate = plan_gate_for_parts(
-            &pk("foo"),
-            &commits,
-            &[cs("aaaa"), cs("bbbb")],
-            &touches,
-            &attribution,
-        )
-        .expect("plan gate should resolve to A");
-        assert_eq!(gate.state, CommitGateState::Approved);
-    }
 }

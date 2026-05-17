@@ -81,9 +81,9 @@ pub struct WorkPayload {
 
 /// Tagged by the wire `work` discriminator. Variants that carry a
 /// `target_sha` also carry `commit_kind` and `prompt_hint`; variants
-/// that are pure worktree-status moves (`CommitDoneMove`,
-/// `RestoreOrCommitDoneMove`, `SessionDone`) carry only the envelope
-/// fields on `WorkPayload`.
+/// that are pure worktree-status moves (`RestoreOrCommitPlanFile`,
+/// `SessionFinished`) carry only the envelope fields on
+/// `WorkPayload`.
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "work", rename_all = "snake_case")]
 pub enum WorkAction {
@@ -102,14 +102,13 @@ pub enum WorkAction {
         commit_kind: String,
         prompt_hint: String,
     },
-    CommitDoneMove,
-    RestoreOrCommitDoneMove,
+    RestoreOrCommitPlanFile,
     StartImplementation {
         target_sha: String,
         commit_kind: String,
         prompt_hint: String,
     },
-    SessionDone,
+    SessionFinished,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -288,9 +287,8 @@ fn build_action(reason: WaitingReason, candidate: &Candidate) -> WorkAction {
         prompt_hint_for(reason, kind, &candidate.plan_path).unwrap_or_default()
     };
     match reason {
-        SessionDone => WorkAction::SessionDone,
-        CommitDoneMove => WorkAction::CommitDoneMove,
-        RestoreOrCommitDoneMove => WorkAction::RestoreOrCommitDoneMove,
+        SessionFinished => WorkAction::SessionFinished,
+        RestoreOrCommitPlanFile => WorkAction::RestoreOrCommitPlanFile,
         CommitPlanRevision => {
             let kind = commit_kind();
             let kind_opt = if kind.is_empty() {
@@ -378,18 +376,14 @@ fn prompt_hint_for(
             "Plan has uncommitted changes at {plan_path_str}. Commit the revision to release \
              blocked reviews."
         ),
-        (CommitDoneMove, _) => format!(
-            "Plan was moved to `done/` but isn't committed. Stage and commit the move \
-             (currently at {plan_path_str})."
-        ),
-        (RestoreOrCommitDoneMove, _) => format!(
-            "Active plan file is missing at {plan_path_str}. Either restore it \
-             (`git checkout -- {plan_path_str}`) or move it to `done/` and commit."
+        (RestoreOrCommitPlanFile, _) => format!(
+            "Plan file is missing at {plan_path_str}. Either restore it \
+             (`git checkout -- {plan_path_str}`) or commit the deletion."
         ),
         (ReadyToStartImplementation, _) => "Latest commit is approved. Continue with the next \
-             commit or move the plan to `done/`."
+             commit or finalize the plan."
             .to_string(),
-        (SessionDone, _) => return None,
+        (SessionFinished, _) => return None,
     })
 }
 
@@ -415,9 +409,8 @@ fn caller_already_voted(cand: &Candidate, reason: WaitingReason, author: &AgentL
         // waiting_on and review_target. Master-role reasons return
         // false; caller-already-voted is a reviewer-only concept.
         CommitNeedsReview => cand.gate.as_ref(),
-        SessionDone
-        | CommitDoneMove
-        | RestoreOrCommitDoneMove
+        SessionFinished
+        | RestoreOrCommitPlanFile
         | CommitPlanRevision
         | AddressCommitChanges
         | ReadyToStartImplementation => return false,
@@ -459,11 +452,10 @@ fn derive_locations(cand: &Candidate, reason: WaitingReason, author: &AgentLabel
             }
             out
         }
-        WaitingReason::CommitDoneMove
-        | WaitingReason::RestoreOrCommitDoneMove
+        WaitingReason::RestoreOrCommitPlanFile
         | WaitingReason::CommitPlanRevision
         | WaitingReason::ReadyToStartImplementation => vec![plan_file],
-        WaitingReason::SessionDone => Vec::new(),
+        WaitingReason::SessionFinished => Vec::new(),
     }
 }
 
@@ -726,7 +718,7 @@ mod tests {
     #[test]
     fn session_done_yields_no_locations() {
         let c = cand(None, None);
-        let v = derive_locations(&c, WaitingReason::SessionDone, &me());
+        let v = derive_locations(&c, WaitingReason::SessionFinished, &me());
         assert!(v.is_empty());
     }
 
@@ -849,10 +841,9 @@ mod integration_tests {
             WorkAction::ReviewCommit { .. } => "review_commit",
             WorkAction::AddressCommitChanges { .. } => "address_commit_changes",
             WorkAction::CommitPlanRevision { .. } => "commit_plan_revision",
-            WorkAction::CommitDoneMove => "commit_done_move",
-            WorkAction::RestoreOrCommitDoneMove => "restore_or_commit_done_move",
+            WorkAction::RestoreOrCommitPlanFile => "restore_or_commit_plan_file",
             WorkAction::StartImplementation { .. } => "start_implementation",
-            WorkAction::SessionDone => "session_done",
+            WorkAction::SessionFinished => "session_finished",
         }
     }
 
