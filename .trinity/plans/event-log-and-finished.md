@@ -247,13 +247,22 @@ later commit that touches `.trinity/finished/<stem>/` (adds,
 modifies, or removes files) does not trigger anything. The fold
 ignores frozen plans for the rest of the walk; no new freeze
 event, no projection update. The same applies to any other
-post-freeze tree change attributable to the plan (`Implements:`
-trailer, plan-file edit, working-tree feedback). All such
-commits land as `CommitKind::Unattributed` from the projection's
-perspective — identical to today's behaviour for commits whose
-attribution trailer points at an unknown plan. They're visible
-in the repo's overall commit history but don't appear in the
-frozen plan's timeline, gate, or attribution.
+post-freeze *commit* attributable to the plan (`Implements:`
+trailer, plan-file edit). All such commits land as
+`CommitKind::Unattributed` from the projection's perspective —
+identical to today's behaviour for commits whose attribution
+trailer points at an unknown plan. They're visible in the repo's
+overall commit history but don't appear in the frozen plan's
+timeline, gate, or attribution.
+
+Working-tree feedback files (under `.trinity/feedback/<stem>/<sha>/`)
+are not commits and follow a different rule: they're applied at
+their target SHA during the fold's per-commit step. If that target
+SHA is in the plan's pre-freeze history, the feedback is rendered
+in the timeline (display only — see §Finished plan's
+"display-only feedback" paragraph). If the target SHA is post-freeze
+(or doesn't exist), the fold's frozen-plan skip path drops it
+and no gate or attribution is computed.
 
 Per-plan scope: every check is keyed on `<stem>`. A finalize for
 `foo` says nothing about `bar`.
@@ -266,11 +275,15 @@ read time.
 
 ### Archived cycle
 
-A cycle whose closer (finalize commit) is not the most recent
-finalize commit for the plan. Archived cycles are recovered by
-walking the commit log for changes to `.trinity/finished/<plan>/`
-and reading each historical revision via `git show`. They appear
-in the cycle-history view but do not drive any waiting/gate state.
+A cycle whose closer (freeze event) is not the most recent freeze
+event for the plan. Archived cycles are recovered from the fold's
+`freeze_events: Vec<CommitSha>` side-output — every entry except
+the last one is an archived cycle. Each archived cycle's snapshot
+content is read via `git show <freeze-sha>:.trinity/finished/<stem>/`.
+They appear in the cycle-history view but do not drive any
+waiting/gate state. Raw `git log` over the snapshot path is not
+used; it over-counts (post-freeze deletions, phantom re-finalizes,
+hand edits all touch the path but are not cycle boundaries).
 
 ### Plan lifecycle state (wire)
 
@@ -903,9 +916,14 @@ behaviour.
    - no new gate entries land on the plan
    - `wait_for_work` does not surface the plan for any role
    - the plan is excluded from omitted-`plan_id` inference
-   - the daemon's projection state is byte-identical to a fold
-     that stopped at C (validates the freeze semantically equals
-     "the plan ends at C from the projection's perspective")
+   - the frozen plan's slice of the projection (its `Plan`
+     record: `attribution`, `plan_touches`, gates, `frozen_at`,
+     `lifecycle`) is byte-identical to the same plan's slice
+     produced by a fold that stopped at C (validates the freeze
+     semantically equals "the plan ends at C from the projection's
+     perspective"). Other plans in the same repo legitimately
+     differ between the two folds; the invariant is scoped to the
+     frozen plan.
 
    **Late working-tree feedback on pre-freeze commits is displayed,
    not sealed out.** Sealing covers state transitions (attribution,
