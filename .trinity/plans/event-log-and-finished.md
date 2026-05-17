@@ -87,11 +87,17 @@ cleanly. They are not in the stub; they are this plan's contribution.
 ### Plan cycle (display-only)
 
 A **plan cycle** is a historical range of plan-attributed commits
-between two consecutive finalize commits (or between the start of
-the plan's history and its first finalize commit). Cycles do not
-drive any projection state — they're a UI/CLI concept recovered by
-walking `git log .trinity/finished/<plan>/`. The daemon's finished
-rule (below) doesn't reference cycles.
+ending at a real freeze event. Cycles do not drive any projection
+state — they're a UI/CLI concept derived from the same event-log
+fold that decides `frozen_at`. During replay the fold records each
+commit at which a plan freezes (the same commit it would write to
+`frozen_at` if seen for the first time at HEAD); the cycle list is
+the sequence of those freeze events. Raw `git log
+.trinity/finished/<stem>/` over-counts — it enumerates every
+commit that touched the snapshot path, including post-freeze
+edits, deletions, reverts, and phantom re-finalizes that are not
+cycle boundaries. The daemon's finished rule (below) doesn't
+reference cycles.
 
 ### Latest reviewable commit (CLI policy)
 
@@ -124,10 +130,13 @@ the snapshot is the archival commitment at the close.
 
 There is one snapshot per plan in HEAD at any time. Each new
 finalize commit overwrites the prior contents. The history of
-past finalize commits is preserved by git itself — `git log
-.trinity/finished/<stem>/` enumerates every commit that touched
-the snapshot, and `git show <sha>:.trinity/finished/<stem>/`
-recovers any archived cycle's snapshot.
+past finalize commits is recovered from the event-log fold's
+recorded freeze events: each freeze event's commit SHA is what
+`git show <sha>:.trinity/finished/<stem>/` reads to render that
+cycle's snapshot. The raw `git log .trinity/finished/<stem>/`
+walk is not the source of truth — it includes non-freeze touches
+(deletions, phantom re-finalizes, edits) that the fold has
+already discarded.
 
 ### Finalize commit
 
@@ -160,13 +169,23 @@ satisfies the finalize rule:
 
 Once `frozen_at` is set, the fold treats the plan as sealed for
 every subsequent commit: no new attribution, no new plan_touches
-entries under this plan's key, no new gate entries, no feedback
-ingestion for any commit in this plan's history. The plan stays
-`finished` even if later commits remove files from
-`.trinity/finished/<stem>/`, modify the plan file, add code under
-`Implements: <stem>`, or write new working-tree feedback. The
-projection is monotone: finished is a one-way state transition
-under git operations.
+entries under this plan's key, no new gate entries, no lifecycle
+change. The plan stays `finished` even if later commits remove
+files from `.trinity/finished/<stem>/`, modify the plan file, add
+code under `Implements: <stem>`, or write new working-tree
+feedback. The projection is monotone: finished is a one-way state
+transition under git operations.
+
+**Display-only feedback on a frozen plan's history.** Sealing
+covers state transitions, not disk-state rendering. Working-tree
+feedback files at `.trinity/feedback/<stem>/<sha>/` for any `<sha>`
+in the plan's history are still parsed and displayed in the
+timeline — they're just current disk state, not events that change
+the plan's lifecycle or gate-waiting computations. A reviewer who
+writes a late `REQUEST_CHANGES` targeting a pre-freeze commit
+leaves a visible note in the timeline; the plan remains
+`finished`, no waiting-for-work is generated, no new gate state
+is computed.
 
 The first-line APPROVE check is the only content inspection: file
 bodies after the first line are not parsed, file names don't
@@ -273,10 +292,10 @@ The CLI is what catches "the snapshot is now stale relative to new
 work" — at the operator's request when they next run `trinity
 finish` — not the daemon.
 
-`archived` is **not** a plan-level state. Archived cycles are an
-artifact of git history (`git log .trinity/finished/<stem>/`)
-surfaced in the cycle-history UI view; they don't appear in the
-plan-level `state` wire field.
+`archived` is **not** a plan-level state. Archived cycles are
+derived from the fold's recorded freeze events surfaced in the
+cycle-history UI view; they don't appear in the plan-level `state`
+wire field.
 
 ## Goals
 
@@ -503,9 +522,11 @@ The finalize reader is the supporting parser + tree-checker used by
   commit's tree-diff touched either `.trinity/plans/<stem>.md` or
   `.trinity/finished/<stem>/`); other commits don't trigger the
   check.
-- The `git log .trinity/finished/<stem>/` walk for archived-cycle
-  history is a separate display-only code path used by the UI, not
-  by the fold.
+- The fold emits a per-plan `freeze_events: Vec<CommitSha>` side
+  output (one entry per commit where that plan transitioned to
+  frozen). Archived-cycle display reads from this list, not from a
+  raw `git log` over the snapshot path; raw `git log` includes
+  non-freeze touches the fold has already discarded.
 
 Per-commit mutations (`apply_commit`):
 
@@ -624,15 +645,15 @@ The new `PlanLifecycle` enum exists alongside the legacy
   stored.
 - New struct `ArchivedCycleSummary { closer: CommitSha,
   approver_count: u32 }`. Stored on `Plan` as `archived_cycles:
-  Vec<ArchivedCycleSummary>` (walked from git log of
-  `.trinity/finished/<stem>/`).
-- **Cost note**: `archived_cycles` is recomputed every rebuild by
-  shelling out to `git log -- .trinity/finished/<stem>/`. This is
-  O(history-depth-touching-this-path) per plan per rebuild. At
-  Trinity's current scale (small repos, low plan counts, infrequent
-  rebuilds triggered by FS signals) this is acceptable. A cache
-  would be premature optimization; do not add one without a
-  measured problem.
+  Vec<ArchivedCycleSummary>`. Sourced from the fold's recorded
+  freeze events (the fold emits a `freeze_events:
+  Vec<CommitSha>` side-output during replay; one entry per commit
+  where a plan transitioned to frozen). Approver count for each
+  cycle is read from `git show <freeze-sha>:.trinity/finished/<stem>/`.
+- **Cost note**: `archived_cycles` is recomputed from the fold's
+  freeze-event list plus one `git show` per cycle. This is
+  O(freeze-events-for-this-plan) per rebuild — typically 0 or 1.
+  No separate `git log` walk is needed.
 - Response builders gain a `lifecycle` field on wire alongside the
   existing `state` field. Tests assert both are present and
   consistent.
@@ -772,8 +793,9 @@ new cycle is `active` (with `archived_cycles: [cycle-1]`), not
 This plan resolves the ambiguity by:
 - Plan-level wire `state`: `active | finished` only.
 - Cycle list on the wire: `archived_cycles:
-  Vec<ArchivedCycleSummary>` (derived from `git log
-  .trinity/finished/<stem>/`).
+  Vec<ArchivedCycleSummary>` (derived from the fold's
+  `freeze_events` side-output, not from raw `git log` of the
+  snapshot path).
 - UI's "Archived" chip is per-cycle in the cycle history view,
   not in the main plan list.
 
@@ -833,7 +855,13 @@ behaviour.
 6. Wire `state` field emits one of `active | finished`.
    Plan-level `archived` is not emitted.
 7. `archived_cycles` field on plan detail wire carries per-cycle
-   metadata sourced from `git log .trinity/finished/<stem>/`.
+   metadata sourced from the fold's `freeze_events` side-output
+   (one entry per commit at which a plan transitioned to frozen),
+   not from raw `git log` over the snapshot path. Regression test
+   constructs a frozen plan, then commits a post-freeze deletion
+   of `.trinity/finished/<stem>/`, then commits a phantom
+   re-finalize (snapshot files written again). Assert
+   `archived_cycles.len() == 1` — only the original freeze counts.
 8. **Daemon finished rule is event-log truth** (regression test):
    the daemon returns `state: "finished"` iff the fold's
    `frozen_at: Option<CommitSha>` is `Some(_)` at HEAD. The fold
@@ -878,6 +906,21 @@ behaviour.
    - the daemon's projection state is byte-identical to a fold
      that stopped at C (validates the freeze semantically equals
      "the plan ends at C from the projection's perspective")
+
+   **Late working-tree feedback on pre-freeze commits is displayed,
+   not sealed out.** Sealing covers state transitions (attribution,
+   plan_touches, gates, lifecycle), not disk-state rendering. A
+   regression test writes a working-tree feedback file at
+   `.trinity/feedback/<stem>/<pre-freeze-sha>/<agent>.md` AFTER the
+   finalize commit lands. Assert: the plan remains `state:
+   "finished"`, the feedback appears in the plan's timeline render
+   for that commit (because it's just disk state at that path), no
+   new gate entry is computed for the frozen plan, and
+   `wait_for_work` still does not surface the plan. This is the
+   correct semantics for working-tree feedback as a *location* (a
+   note about commit X) rather than as an *event* with a wall-clock
+   ordering: the fold has no clock for working-tree files, only git
+   does, and the file's logical position is the SHA it targets.
 10. Plan inference excludes finished plans. `wait_for_work`,
    `get_context`, and any other surface that resolves "the current
    plan" when no `plan_id` is supplied treats only plans with
