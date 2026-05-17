@@ -426,35 +426,64 @@ fn parse_diff_tree(stdout: &str) -> Result<ParsedDiffTree, GitIoError> {
         let old_finalize = old_path.and_then(|p| parse_finalize_subpath(&PathBuf::from(p)));
 
         if new_is_plan || old_is_plan {
-            let old_plan_path = old_path.map(PathBuf::from);
-            let touch_path: &Path = if new_is_plan {
-                &new_rel
+            // Resolve the plan key on each side. With nested-path
+            // rejection (Phase 5 of event-log-and-finished), every
+            // `.trinity/plans/X.md` path uniquely identifies stem X,
+            // so old and new keys differ iff the rename crosses
+            // stems.
+            let new_key = if new_is_plan {
+                PlanKey::from_path(&new_rel)
             } else {
-                old_plan_path.as_deref().unwrap_or(&new_rel)
-            };
-            let plan_key = match PlanKey::from_path(touch_path) {
-                Some(id) => id,
-                None => continue,
-            };
-            let kind = match status_char {
-                'A' => PlanTouchKind::Intro,
-                _ => PlanTouchKind::Revision,
-            };
-            let is_deletion = status_char == 'D' && !is_rename;
-            let new_path_for_touch = if is_deletion {
                 None
-            } else {
-                Some(new_rel.clone())
             };
-            let touch_index = plan_touches.len();
-            plan_touches.push(PlanTouch {
-                session: plan_key,
-                kind,
-                new_path: new_path_for_touch,
-                new_body: None,
-            });
-            if !is_deletion {
+            let old_key = old_path.and_then(|p| PlanKey::from_path(&PathBuf::from(p)));
+
+            let is_deletion = status_char == 'D' && !is_rename;
+
+            if is_rename && old_key.is_some() && new_key.is_some() && old_key != new_key {
+                // Cross-stem rename `git mv .trinity/plans/foo.md
+                // .trinity/plans/bar.md`. Model as two events: delete
+                // `foo` + intro `bar`. The fold then removes `foo`
+                // from state.plans (if not frozen) and creates `bar`.
+                plan_touches.push(PlanTouch {
+                    session: old_key.expect("old_key is Some"),
+                    kind: PlanTouchKind::Revision,
+                    new_path: None,
+                    new_body: None,
+                });
+                let new_key = new_key.expect("new_key is Some");
+                let touch_index = plan_touches.len();
+                plan_touches.push(PlanTouch {
+                    session: new_key,
+                    kind: PlanTouchKind::Intro,
+                    new_path: Some(new_rel.clone()),
+                    new_body: None,
+                });
                 plan_body_paths.push((touch_index, new_rel.clone()));
+            } else {
+                let plan_key = match new_key.or(old_key) {
+                    Some(id) => id,
+                    None => continue,
+                };
+                let kind = match status_char {
+                    'A' => PlanTouchKind::Intro,
+                    _ => PlanTouchKind::Revision,
+                };
+                let new_path_for_touch = if is_deletion {
+                    None
+                } else {
+                    Some(new_rel.clone())
+                };
+                let touch_index = plan_touches.len();
+                plan_touches.push(PlanTouch {
+                    session: plan_key,
+                    kind,
+                    new_path: new_path_for_touch,
+                    new_body: None,
+                });
+                if !is_deletion {
+                    plan_body_paths.push((touch_index, new_rel.clone()));
+                }
             }
         } else if new_finalize.is_some() || old_finalize.is_some() {
             // Finalize-snapshot file. A rename whose <stem>/<file> differs

@@ -29,7 +29,6 @@ pub async fn rebuild_repo(repo_root: &Path) -> Result<RepoState, RebuildError> {
 mod tests {
     use super::*;
     use crate::lifecycle::PlanKey;
-    use crate::repo_state::AttributionResult;
     use std::path::Path;
     use std::process::Command;
 
@@ -72,7 +71,6 @@ mod tests {
         let state = rebuild_repo(dir.path()).await.unwrap();
         assert!(state.head.is_none());
         assert!(state.plans.is_empty());
-        assert!(state.attribution.is_empty());
     }
 
     #[tokio::test]
@@ -86,16 +84,8 @@ mod tests {
         let session = &state.plans[&PlanKey::parse("foo").unwrap()];
         assert_eq!(session.id.as_str(), "foo");
         assert_eq!(session.body, "# foo\n");
-        let intro = &session.plan_intro;
-        let attr = state.attribution.get(intro).expect("intro in attribution");
-        assert!(matches!(
-            attr,
-            AttributionResult::Attributed {
-                session,
-                plan_touch: Some(_),
-                has_code_changes: false
-            } if session.as_str() == "foo"
-        ));
+        assert_eq!(session.plan_revisions, vec![session.plan_intro.clone()]);
+        assert!(session.implementation_commits.is_empty());
     }
 
     #[tokio::test]
@@ -107,20 +97,11 @@ mod tests {
         commit(dir.path(), "Implement foo");
 
         let state = rebuild_repo(dir.path()).await.unwrap();
-        assert_eq!(state.attribution.len(), 2);
-        let impl_attrs: Vec<_> = state
-            .attribution
-            .values()
-            .filter(|a| {
-                matches!(
-                    a,
-                    AttributionResult::Attributed {
-                        has_code_changes: true,
-                        plan_touch: None,
-                        ..
-                    }
-                )
-            })
+        let plan = &state.plans[&PlanKey::parse("foo").unwrap()];
+        assert_eq!(plan.implementation_commits.len(), 1);
+        let impl_attrs: Vec<_> = plan
+            .implementation_commits
+            .iter()
             .collect();
         assert_eq!(impl_attrs.len(), 1);
     }
@@ -213,6 +194,49 @@ mod tests {
              after plan-file deletion the plan has no anchor and must not surface; \
              got {:?}",
             state.plans.keys().map(|k| k.as_str()).collect::<Vec<_>>()
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_then_readd_same_stem_does_not_leak_prior_history() {
+        // Same-stem re-add: the original foo gets deleted (unfrozen,
+        // no anchor), then a fresh foo is introduced at a later
+        // commit. The new Plan record has `plan_intro = re-add commit`.
+        // Projections must scope to commits >= plan_intro so the
+        // pre-deletion plan_touches / attribution entries (which are
+        // still in state — they correctly record what happened then)
+        // don't leak into the new plan's revisions / impl list.
+        let dir = init_repo();
+        write_file(dir.path(), ".trinity/plans/foo.md", "# foo v1\n");
+        commit(dir.path(), "Add foo v1");
+        write_file(dir.path(), "src/lib.rs", "fn old() {}\n");
+        commit(dir.path(), "Impl on foo v1");
+        std::fs::remove_file(dir.path().join(".trinity/plans/foo.md")).unwrap();
+        commit(dir.path(), "Delete foo");
+        write_file(dir.path(), ".trinity/plans/foo.md", "# foo v2 (fresh)\n");
+        commit(dir.path(), "Re-add foo v2");
+
+        let state = rebuild_repo(dir.path()).await.unwrap();
+        let key = PlanKey::parse("foo").unwrap();
+        let plan = state
+            .plans
+            .get(&key)
+            .expect("re-added foo must exist in state");
+        assert_eq!(plan.body, "# foo v2 (fresh)\n");
+
+        let revisions = crate::projection::all_plan_revisions(plan, &state);
+        assert_eq!(
+            revisions.len(),
+            1,
+            "only the re-add commit is a plan revision of the fresh foo; \
+             pre-deletion history must not leak. got: {revisions:?}"
+        );
+
+        let impls = crate::projection::all_implementation_commits(plan, &state);
+        assert!(
+            impls.is_empty(),
+            "the impl commit happened during the deleted foo; \
+             the fresh foo has no impl commits yet. got: {impls:?}"
         );
     }
 

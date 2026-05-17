@@ -456,25 +456,12 @@ fn remove_feedback(session: &mut Plan, parsed: &crate::disk_format::FeedbackPath
     }
 }
 
-/// Flatten all SHA-targeted feedback from `Plan.commits[*].feedback`
-/// into a single `(sha, author) → Feedback` map. Used as the input
-/// to `build_commit_gates` when re-folding after a runtime signal
-/// mutates a single entry.
-fn extract_feedback(plan: &Plan) -> BTreeMap<(CommitSha, crate::lifecycle::AgentLabel), Feedback> {
-    let mut out = BTreeMap::new();
-    for (sha, gate) in &plan.commits {
-        for (author, fb) in &gate.feedback {
-            out.insert((sha.clone(), author.clone()), fb.clone());
-        }
-    }
-    out
-}
-
-/// Rebuild `Plan.commits` for one plan from its own current
-/// `commits[*].feedback`. Called from the signal handlers after every
-/// mutation so cumulative-participant state, gate roll-up, and
-/// non-reviewable filtering all re-fold consistently between full
-/// rebuilds.
+/// Re-fold this plan's `commits` gates from `plan.reviewable_commits`
+/// in chronological order, replaying the cumulative-participant
+/// carry-along over `plan.commits[*].feedback`. Called after every
+/// feedback-file mutation so the participant set, missing-approvals,
+/// and gate-state stay consistent between full rebuilds. Read-only on
+/// every map outside `state.plans[plan_key].commits`.
 fn refresh_commits_for(state: &mut crate::repo_state::RepoState, plan_key: &PlanKey) {
     let Some(plan) = state.plans.get(plan_key) else {
         return;
@@ -483,16 +470,77 @@ fn refresh_commits_for(state: &mut crate::repo_state::RepoState, plan_key: &Plan
         // Sealed plan: no gate updates from live feedback signals.
         return;
     }
-    let feedback = extract_feedback(plan);
-    let new_commits = crate::projection::build_commit_gates(
-        plan_key,
-        &state.commit_order,
-        &state.plan_touches,
-        &state.attribution,
-        &feedback,
-    );
+    let reviewable: Vec<CommitSha> = plan.reviewable_commits.clone();
+    // Pre-extract per-commit feedback maps for the replay.
+    let mut feedback_at: BTreeMap<CommitSha, BTreeMap<crate::lifecycle::AgentLabel, Feedback>> =
+        BTreeMap::new();
+    for sha in &reviewable {
+        if let Some(gate) = plan.commits.get(sha) {
+            feedback_at.insert(sha.clone(), gate.feedback.clone());
+        }
+    }
+    let mut participants: Vec<crate::lifecycle::AgentLabel> = Vec::new();
+    let mut new_gates: BTreeMap<CommitSha, crate::review_state::CommitGate> = BTreeMap::new();
+    let mut latest = None;
+    for sha in &reviewable {
+        let empty = BTreeMap::new();
+        let fb_for = feedback_at.get(sha).unwrap_or(&empty);
+        let mut approvers = Vec::new();
+        let mut requesters = Vec::new();
+        let mut ambiguous = Vec::new();
+        for (author, fb) in fb_for {
+            if !participants.contains(author) {
+                participants.push(author.clone());
+            }
+            match fb.verdict {
+                crate::repo_state::Verdict::Approve => {
+                    if !approvers.contains(author) {
+                        approvers.push(author.clone());
+                    }
+                }
+                crate::repo_state::Verdict::RequestChanges => {
+                    if !requesters.contains(author) {
+                        requesters.push(author.clone());
+                    }
+                }
+                crate::repo_state::Verdict::Unmarked => {
+                    if !ambiguous.contains(author) {
+                        ambiguous.push(author.clone());
+                    }
+                }
+            }
+        }
+        let missing: Vec<_> = participants
+            .iter()
+            .filter(|p| {
+                !approvers.contains(p) && !requesters.contains(p) && !ambiguous.contains(p)
+            })
+            .cloned()
+            .collect();
+        let gate_state = if !requesters.is_empty() || !ambiguous.is_empty() {
+            crate::review_state::CommitGateState::ChangesRequested
+        } else if !approvers.is_empty() && missing.is_empty() {
+            crate::review_state::CommitGateState::Approved
+        } else {
+            crate::review_state::CommitGateState::Unreviewed
+        };
+        new_gates.insert(
+            sha.clone(),
+            crate::review_state::CommitGate {
+                state: gate_state,
+                participants: participants.clone(),
+                approvers,
+                requesters,
+                ambiguous,
+                missing,
+                feedback: fb_for.clone(),
+            },
+        );
+        latest = Some(sha.clone());
+    }
     if let Some(plan) = state.plans.get_mut(plan_key) {
-        plan.commits = new_commits;
+        plan.commits = new_gates;
+        plan.latest_reviewable_commit = latest;
     }
 }
 
@@ -632,7 +680,12 @@ mod tests {
         let rt = Runtime::new();
         rt.add_repo(dir.path().to_path_buf()).await.unwrap();
         let count0 = rt
-            .read_repo(dir.path(), |s| s.attribution.len())
+            .read_repo(dir.path(), |s| {
+                s.plans
+                    .values()
+                    .map(|p| p.plan_revisions.len())
+                    .sum::<usize>()
+            })
             .await
             .unwrap();
 
@@ -645,10 +698,18 @@ mod tests {
             .unwrap();
 
         let count1 = rt
-            .read_repo(dir.path(), |s| s.attribution.len())
+            .read_repo(dir.path(), |s| {
+                s.plans
+                    .values()
+                    .map(|p| p.plan_revisions.len())
+                    .sum::<usize>()
+            })
             .await
             .unwrap();
-        assert!(count1 > count0, "attribution should grow after rebuild");
+        assert!(
+            count1 > count0,
+            "plan_revisions count should grow after rebuild"
+        );
 
         let events = rt.live_events_snapshot().await;
         assert!(events.iter().any(|e| e.kind_str() == "repo_rebuilt"));

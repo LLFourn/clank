@@ -22,41 +22,23 @@ pub struct Trinity {
     pub live_events: VecDeque<LiveEvent>,
 }
 
+/// Repo-level reduced state. Everything here is the *result* of
+/// applying a series of commits in order — nothing in this struct is
+/// a list of commits to be searched later. Per-commit / per-plan
+/// information lives on [`Plan`].
+///
+/// The fold's only public entry point is `apply_commit(state, event)`
+/// (see `disk_snapshot::apply_commit`); `derive_state` is just a
+/// loop over `apply_commit`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RepoState {
     pub root: PathBuf,
     pub plans: BTreeMap<PlanKey, Plan>,
     pub head: Option<CommitSha>,
-    /// (commit_sha → attribution). Lookup table; iteration order is
-    /// SHA-lex, not chronological. Use `commit_order` to walk the
-    /// history in chronological (first-parent oldest-first) order.
-    pub attribution: BTreeMap<CommitSha, AttributionResult>,
-    /// Per-commit plan touches, including multi-plan commits. Attribution
-    /// remains single-plan for implementation ownership; this index lets
-    /// each touched plan still see its own revision/done_move.
-    pub plan_touches: BTreeMap<CommitSha, Vec<(PlanKey, PlanTouchKind)>>,
-    /// Commits in chronological order (first-parent walk, oldest first).
-    /// Parallels `attribution`'s keys but preserves history order, which
-    /// `BTreeMap` does not.
-    pub commit_order: Vec<CommitSha>,
-    /// Plans whose disk state is contradictory at rebuild time — the same
-    /// stem exists at both `.trinity/plans/<stem>.md` and
-    /// `.trinity/plans/done/<stem>.md`. Conflicting keys are omitted from
-    /// [`Self::plans`] so neither file silently wins; resolution helpers
-    /// surface the conflict so callers can flag it instead of routing
-    /// work.
+    /// Plans whose disk state is contradictory at rebuild time. Today
+    /// effectively unused (path-parser rejects `.trinity/plans/done/`),
+    /// but kept on the type for future stem-collision surfacing.
     pub plan_conflicts: BTreeMap<PlanKey, Vec<PathBuf>>,
-    /// Author timestamp + first-line subject for every commit in
-    /// `commit_order`. Sourced from one batched `git log` per rebuild
-    /// (`git_io::first_parent_commits`). Consumed by:
-    ///
-    /// - timeline rendering (subject column on commit rows).
-    /// - `last_activity_ts` per plan (max `author_ts` over the plan's
-    ///   attributed commits, vs feedback mtimes).
-    ///
-    /// Keyed on the same SHAs that appear in `commit_order` /
-    /// `attribution`. Lookups are infallible for known commits.
-    pub commit_meta: BTreeMap<CommitSha, crate::disk_snapshot::CommitMetaEntry>,
 }
 
 impl RepoState {
@@ -71,11 +53,7 @@ impl RepoState {
             root: self.root.clone(),
             plans: [(key.clone(), plan.clone())].into_iter().collect(),
             head: self.head.clone(),
-            attribution: self.attribution.clone(),
-            plan_touches: self.plan_touches.clone(),
-            commit_order: self.commit_order.clone(),
             plan_conflicts: std::collections::BTreeMap::new(),
-            commit_meta: self.commit_meta.clone(),
         })
     }
 
@@ -84,11 +62,7 @@ impl RepoState {
             root,
             plans: BTreeMap::new(),
             head: None,
-            attribution: BTreeMap::new(),
-            plan_touches: BTreeMap::new(),
-            commit_order: Vec::new(),
             plan_conflicts: BTreeMap::new(),
-            commit_meta: BTreeMap::new(),
         }
     }
 
@@ -109,26 +83,58 @@ impl RepoState {
         let Some(plan) = self.plans.get(plan_key) else {
             return Vec::new();
         };
+        // Chronological merge of plan_revisions (touch commits) and
+        // implementation_commits (code commits). Both lists are
+        // sorted in the order the fold appended them, so a two-
+        // pointer merge produces the chronological union with one
+        // entry per commit.
         let mut out = Vec::new();
-        for sha in &self.commit_order {
-            let attr = self.attribution.get(sha);
-            let plan_touch = self
-                .plan_touches
-                .get(sha)
-                .and_then(|touches| touches.iter().find(|(key, _)| key == plan_key))
-                .map(|(_, kind)| *kind);
-            let has_code_changes = matches!(
-                attr,
-                Some(AttributionResult::Attributed {
-                    session: sid,
-                    has_code_changes: true,
-                    ..
-                }) if sid == plan_key
-            );
-            if plan_touch.is_none() && !has_code_changes {
-                continue;
-            }
-            let subject = self
+        let mut revs = plan.plan_revisions.iter().peekable();
+        let mut impls = plan.implementation_commits.iter().peekable();
+        loop {
+            // Take the next chronological SHA. Mixed commits appear in
+            // BOTH lists at the same fold step, so advance both.
+            let sha = match (revs.peek().copied(), impls.peek().copied()) {
+                (None, None) => break,
+                (Some(s), None) => {
+                    revs.next();
+                    s
+                }
+                (None, Some(s)) => {
+                    impls.next();
+                    s
+                }
+                (Some(a), Some(b)) if a == b => {
+                    revs.next();
+                    impls.next();
+                    a
+                }
+                (Some(a), Some(_)) => {
+                    // Distinct SHAs at the heads: since both lists are
+                    // append-only in fold order, the lower-index one
+                    // came first. We don't store indices; instead use
+                    // the fact that the next chronological commit is
+                    // either at revs or impls. Probe via reviewable
+                    // list (which has every reviewable commit). Fall
+                    // back to revs.
+                    revs.next();
+                    a
+                }
+            };
+            let plan_touch = plan
+                .plan_revisions
+                .iter()
+                .position(|s| s == sha)
+                .and(Some(PlanTouchKind::Revision));
+            // `Intro` vs `Revision` distinction: plan_intro is the
+            // intro commit; any other touch is a revision.
+            let plan_touch = if sha == &plan.plan_intro {
+                Some(PlanTouchKind::Intro)
+            } else {
+                plan_touch
+            };
+            let has_code_changes = plan.implementation_commits.iter().any(|s| s == sha);
+            let subject = plan
                 .commit_meta
                 .get(sha)
                 .map(|m| m.subject.clone())
@@ -191,6 +197,24 @@ impl RepoState {
                     .unwrap_or("")
                     .as_bytes(),
             );
+            hasher.update(b"|revs=[");
+            for sha in &plan.plan_revisions {
+                hasher.update(sha.as_str().as_bytes());
+                hasher.update(b",");
+            }
+            hasher.update(b"]|impls=[");
+            for sha in &plan.implementation_commits {
+                hasher.update(sha.as_str().as_bytes());
+                hasher.update(b",");
+            }
+            hasher.update(b"]|frozen=");
+            hasher.update(
+                plan.frozen_at
+                    .as_ref()
+                    .map(|s| s.as_str())
+                    .unwrap_or("")
+                    .as_bytes(),
+            );
             hasher.update(b"|commits=[");
             for (sha, gate) in &plan.commits {
                 hasher.update(sha.as_str().as_bytes());
@@ -206,51 +230,6 @@ impl RepoState {
                 hasher.update(b";");
             }
             hasher.update(b"]\n");
-        }
-        hasher.update(b"]\nattribution[");
-        for (sha, attr) in &self.attribution {
-            hasher.update(sha.as_str().as_bytes());
-            hasher.update(b"=");
-            match attr {
-                AttributionResult::Attributed {
-                    session,
-                    plan_touch,
-                    has_code_changes,
-                } => {
-                    hasher.update(b"A:");
-                    hasher.update(session.as_str().as_bytes());
-                    hasher.update(b":");
-                    hasher.update(
-                        plan_touch
-                            .as_ref()
-                            .map(|k| k.as_str())
-                            .unwrap_or("none")
-                            .as_bytes(),
-                    );
-                    hasher.update(b":");
-                    hasher.update(if *has_code_changes {
-                        b"code"
-                    } else {
-                        b"nocode"
-                    });
-                }
-                AttributionResult::Unattributed => {
-                    hasher.update(b"U");
-                }
-            }
-            hasher.update(b";");
-        }
-        hasher.update(b"]\nplan_touches[");
-        for (sha, touches) in &self.plan_touches {
-            hasher.update(sha.as_str().as_bytes());
-            hasher.update(b"=");
-            for (key, kind) in touches {
-                hasher.update(key.as_str().as_bytes());
-                hasher.update(b":");
-                hasher.update(kind.as_str().as_bytes());
-                hasher.update(b",");
-            }
-            hasher.update(b";");
         }
         hasher.update(b"]\nconflicts[");
         for (key, paths) in &self.plan_conflicts {
@@ -313,23 +292,46 @@ pub struct Plan {
     /// Internal: never crosses an API boundary — the boundary uses
     /// `PlanId` plus a derived `current_path`.
     pub plan_path: PathBuf,
-    /// Body from HEAD's blob, not the working tree.
+    /// Plan-file body. For unfrozen plans, this tracks HEAD. For
+    /// frozen plans, this is the body at the freeze commit.
     pub body: String,
     pub body_hash: ContentHash,
-    /// First commit that added the plan file. Lower bound for
-    /// attribution walks.
+    /// First commit that introduced the plan file (in this plan
+    /// instance's life — if a same-stem plan was deleted and
+    /// re-introduced, `plan_intro` is the re-introduction commit).
     pub plan_intro: CommitSha,
     /// First-parent of `plan_intro`, or `None` for the root commit.
     /// Used by `pr_hint` to suggest squash bases.
     pub plan_intro_parent: Option<CommitSha>,
+    /// Chronological list of commits where this plan was touched
+    /// (`Intro` or `Revision`), including MultiPlan commits where
+    /// this plan was one of several touched. Accumulated by the
+    /// fold; no scanning required for projection queries.
+    pub plan_revisions: Vec<CommitSha>,
+    /// Chronological list of attributed implementation commits
+    /// (`has_code_changes && session == this plan`).
+    pub implementation_commits: Vec<CommitSha>,
+    /// Chronological list of reviewable commits (CommitKind
+    /// `PlanOnly | CodeOnly | Mixed` for this plan). Subset of
+    /// `plan_revisions ∪ implementation_commits`. `MultiPlan` /
+    /// `Unattributed` are excluded.
+    pub reviewable_commits: Vec<CommitSha>,
+    /// Author timestamp + first-line subject for each commit this
+    /// plan accumulated (`plan_revisions ∪ implementation_commits ∪
+    /// {plan_intro}`). Lookups O(log n) for timeline rendering.
+    pub commit_meta: BTreeMap<CommitSha, CommitMetaPlan>,
+    /// `max(author_ts of attributed commits, mtime of feedback
+    /// files)`. Powers the /api/plans sort order. Updated
+    /// incrementally — never a max-walk.
+    pub last_activity_ts: i64,
+    /// Cached latest reviewable commit. Set whenever the fold builds
+    /// a gate entry for a reviewable commit. None if the plan has
+    /// no reviewable commits yet.
+    pub latest_reviewable_commit: Option<CommitSha>,
     /// Per-commit gate state under the commit-centric model.
-    /// Authoritative as of phase 2.3 — all feedback bodies live here
-    /// under `commits[sha].feedback`.
-    ///
-    /// Keys are commits whose `CommitKind` is reviewable for this plan
-    /// (`PlanOnly` | `CodeOnly` | `Mixed`). `DoneMove`, `MultiPlan`,
-    /// and `Unattributed` commits never get an entry — see
-    /// `CommitKind::is_reviewable`.
+    /// Authoritative as of phase 2.3 — all feedback bodies live
+    /// here under `commits[sha].feedback`. Keys are exactly the
+    /// entries in `reviewable_commits`.
     pub commits: BTreeMap<CommitSha, crate::review_state::CommitGate>,
     /// First commit (chronological) whose tree satisfied the finalize
     /// rule (plan file present + `.trinity/finished/<stem>/` with ≥1
@@ -350,6 +352,16 @@ pub struct Plan {
     /// (deletions, phantom re-finalizes, hand edits) are intentionally
     /// excluded — see plan §Archived cycle.
     pub archived_cycles: Vec<ArchivedCycleSummary>,
+}
+
+/// Per-commit metadata accumulated on each `Plan`. Same shape as the
+/// global `CommitMetaEntry` used to be, but scoped per-plan: only
+/// the commits this plan cares about get stored, and entries
+/// disappear with the plan when it's deleted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommitMetaPlan {
+    pub author_ts: i64,
+    pub subject: String,
 }
 
 /// Plan lifecycle as projected from the event-log fold. Replaces the

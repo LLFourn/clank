@@ -10,19 +10,20 @@
 //! Disk reads go through the `PlanStatusReader` trait so tests can drop
 //! in a fake.
 
+#[cfg(test)]
 use std::collections::BTreeMap;
 
 use serde_json::{Value, json};
 
-use crate::lifecycle::{AgentLabel, CommitSha, PlanKey};
+use crate::lifecycle::{AgentLabel, CommitSha};
+#[cfg(test)]
+use crate::lifecycle::PlanKey;
 use crate::mcp_response::PlanStatusReader;
 use crate::projection::{
-    all_implementation_commits_for, all_plan_revisions_for, expected_action, impl_gate_for_parts,
-    current_posture_for, plan_gate_for_parts, waiting_on,
+    all_implementation_commits, all_plan_revisions, current_posture, expected_action, impl_gate_for,
+    plan_gate_for, waiting_on,
 };
-use crate::repo_state::{
-    AttributionResult, Feedback, Posture, Plan, PlanTouchKind, RepoState, Verdict, WaitingOn,
-};
+use crate::repo_state::{Feedback, Plan, PlanTouchKind, Posture, RepoState, Verdict, WaitingOn};
 use crate::review_state::CommitGate;
 
 /// `GET /api/plans` — `{ plans, conflicts }` for the home page.
@@ -82,38 +83,15 @@ fn plans_index_parts(
     let basename = crate::lifecycle::RepoBasename::from_repo_root(&snapshot.root);
     let mut plans: Vec<IndexedPlanRow> = Vec::with_capacity(snapshot.plans.len());
     for plan in snapshot.plans.values() {
-        let plan_phase = current_posture_for(
-            &plan.id,
-            &snapshot.commit_order,
-            &snapshot.plan_touches,
-            &snapshot.attribution,
-        );
-        let gate = crate::projection::latest_reviewable_commit_gate_for(
-            &plan.id,
-            &plan.commits,
-            &snapshot.commit_order,
-            &snapshot.plan_touches,
-            &snapshot.attribution,
-        );
+        let plan_phase = current_posture(plan, snapshot);
+        let gate = crate::projection::latest_reviewable_commit_gate_for(plan);
         let worktree_status =
             status_reader.compute(&snapshot.root, &plan.plan_path, &plan.body_hash)?;
-        let w = waiting_on(
-            plan.frozen_at.is_some(),
-            worktree_status,
-            gate,
-        );
+        let w = waiting_on(plan.frozen_at.is_some(), worktree_status, gate);
         let plan_id = basename
             .as_ref()
             .map(|b| crate::lifecycle::PlanId::new(b.clone(), plan.id.clone()).to_string());
-        let last_activity_ts = crate::projection::last_activity_ts_for(
-            &plan.id,
-            &plan.plan_intro,
-            &plan.commits,
-            &snapshot.commit_order,
-            &snapshot.plan_touches,
-            &snapshot.attribution,
-            &snapshot.commit_meta,
-        );
+        let last_activity_ts = crate::projection::last_activity_ts_for(plan);
         let lifecycle = crate::repo_state::PlanLifecycle::from_plan(plan);
         plans.push((
             last_activity_ts,
@@ -166,55 +144,25 @@ pub fn plan_page_with_reader(
         .expect("snapshot_session invariant: exactly one plan");
     let basename = crate::lifecycle::RepoBasename::from_repo_root(&bundle.root);
     let worktree_status = status_reader.compute(&bundle.root, &plan.plan_path, &plan.body_hash)?;
-    let plan_phase = current_posture_for(
-        &plan.id,
-        &bundle.commit_order,
-        &bundle.plan_touches,
-        &bundle.attribution,
-    );
-    let plan_gate = plan_gate_for_parts(
-        &plan.id,
-        &plan.commits,
-        &bundle.commit_order,
-        &bundle.plan_touches,
-        &bundle.attribution,
-    );
-    let impl_gate = impl_gate_for_parts(
-        &plan.id,
-        &plan.commits,
-        &bundle.commit_order,
-        &bundle.plan_touches,
-        &bundle.attribution,
-    );
-    let gate = crate::projection::latest_reviewable_commit_gate_for(
-        &plan.id,
-        &plan.commits,
-        &bundle.commit_order,
-        &bundle.plan_touches,
-        &bundle.attribution,
-    );
+    let plan_phase = current_posture(plan, bundle);
+    let plan_gate = plan_gate_for(plan, bundle);
+    let impl_gate = impl_gate_for(plan, bundle);
+    let gate = crate::projection::latest_reviewable_commit_gate_for(plan);
     let w = waiting_on(plan.frozen_at.is_some(), worktree_status, gate);
 
-    let plan_revisions: Vec<String> =
-        all_plan_revisions_for(&plan.id, &bundle.commit_order, &bundle.plan_touches)
-            .into_iter()
-            .map(|s| s.as_str().to_string())
-            .collect();
-    let implementation_commits: Vec<String> =
-        all_implementation_commits_for(&plan.id, &bundle.commit_order, &bundle.attribution)
-            .into_iter()
-            .map(|s| s.as_str().to_string())
-            .collect();
+    let plan_revisions: Vec<String> = all_plan_revisions(plan, bundle)
+        .into_iter()
+        .map(|s| s.as_str().to_string())
+        .collect();
+    let implementation_commits: Vec<String> = all_implementation_commits(plan, bundle)
+        .into_iter()
+        .map(|s| s.as_str().to_string())
+        .collect();
 
     // Single review target: the latest reviewable commit. Same SHA
     // the gate is computed on, so the wire shape can't drift from
     // gate state. Posture-tagged "plan"/"impl" for back-compat.
-    let review_target_sha = crate::projection::latest_reviewable_commit_for(
-        &plan.id,
-        &bundle.commit_order,
-        &bundle.plan_touches,
-        &bundle.attribution,
-    );
+    let review_target_sha = crate::projection::latest_reviewable_commit_for(plan);
     let review_target_phase = if matches!(plan_phase, Posture::Implementing) {
         "impl"
     } else {
@@ -232,13 +180,7 @@ pub fn plan_page_with_reader(
         .map(|sha| json!({ "commit_sha": sha }))
         .unwrap_or(Value::Null);
 
-    let timeline = timeline_value(
-        plan,
-        &bundle.attribution,
-        &bundle.plan_touches,
-        &bundle.commit_order,
-        &bundle.commit_meta,
-    );
+    let timeline = timeline_value(plan);
     let pr_hint = if matches!(plan_phase, Posture::Implementing) {
         Some(pr_hint_value(plan, &implementation_commits))
     } else {
@@ -257,19 +199,9 @@ pub fn plan_page_with_reader(
     let plan_body_truncated = plan.body.chars().count() > 4000;
 
     // Commit-keyed wire shape — SPA reads feedback off here.
-    let commits_value = commits_array_rich(
-        plan,
-        &bundle.commit_order,
-        &bundle.plan_touches,
-        &bundle.attribution,
-    );
-    let latest_relevant_commit = crate::projection::latest_reviewable_commit_for(
-        &plan.id,
-        &bundle.commit_order,
-        &bundle.plan_touches,
-        &bundle.attribution,
-    )
-    .map(|s| s.as_str().to_string());
+    let commits_value = commits_array_rich(plan);
+    let latest_relevant_commit =
+        crate::projection::latest_reviewable_commit_for(plan).map(|s| s.as_str().to_string());
 
     let lifecycle = crate::repo_state::PlanLifecycle::from_plan(plan);
     let archived_cycles: Vec<Value> = plan
@@ -312,20 +244,14 @@ pub fn plan_page_with_reader(
 /// UI-flavored per-commit `commits[]` array. Like the MCP version
 /// but carries body + html + path on each feedback entry so the SPA
 /// can render cards without further round-trips.
-fn commits_array_rich(
-    plan: &Plan,
-    commit_order: &[CommitSha],
-    plan_touches: &BTreeMap<CommitSha, Vec<(crate::lifecycle::PlanKey, PlanTouchKind)>>,
-    attribution: &BTreeMap<CommitSha, AttributionResult>,
-) -> Vec<Value> {
+fn commits_array_rich(plan: &Plan) -> Vec<Value> {
     use crate::projection::commit_kind_for;
     let mut out = Vec::new();
-    // Iterate `commit_order` (chronological) rather than `plan.commits`
-    // (BTreeMap, SHA-lex order). The SPA renders per-commit blocks in
-    // history order; sorting by SHA would surface them in random-looking
-    // order to the human reader.
-    for sha in commit_order {
-        let kind = commit_kind_for(&plan.id, sha, plan_touches, attribution);
+    // Iterate this plan's reviewable_commits (chronological — appended
+    // by the fold in that order). plan.commits is a BTreeMap keyed by
+    // SHA so direct iteration would surface SHA-lex order, not history.
+    for sha in &plan.reviewable_commits {
+        let kind = commit_kind_for(plan, sha);
         if !kind.is_reviewable() {
             continue;
         }
@@ -497,37 +423,56 @@ fn gate_value(
     }
 }
 
-fn timeline_value(
-    session: &Plan,
-    attribution: &BTreeMap<CommitSha, AttributionResult>,
-    plan_touches: &BTreeMap<CommitSha, Vec<(PlanKey, PlanTouchKind)>>,
-    commit_order: &[CommitSha],
-    commit_meta: &BTreeMap<CommitSha, crate::disk_snapshot::CommitMetaEntry>,
-) -> Vec<Value> {
+fn timeline_value(session: &Plan) -> Vec<Value> {
+    // Two-pointer chronological merge of plan_revisions and
+    // implementation_commits — both already sorted by the fold.
     let mut out = Vec::new();
-    for sha in commit_order {
-        let plan_touch = plan_touches
-            .get(sha)
-            .and_then(|touches| touches.iter().find(|(sid, _)| sid == &session.id))
-            .map(|(_, kind)| *kind);
-        let has_code_changes = matches!(
-            attribution.get(sha),
-            Some(AttributionResult::Attributed {
-                session: sid,
-                has_code_changes: true,
-                ..
-            }) if sid == &session.id
-        );
-        if plan_touch.is_none() && !has_code_changes {
-            continue;
-        }
-        let kind = match (plan_touch.is_some(), has_code_changes) {
+    let mut revs = session.plan_revisions.iter().peekable();
+    let mut impls = session.implementation_commits.iter().peekable();
+    loop {
+        let sha = match (revs.peek().copied(), impls.peek().copied()) {
+            (None, None) => break,
+            (Some(s), None) => {
+                revs.next();
+                s
+            }
+            (None, Some(s)) => {
+                impls.next();
+                s
+            }
+            (Some(a), Some(b)) if a == b => {
+                revs.next();
+                impls.next();
+                a
+            }
+            (Some(a), Some(_)) => {
+                // Mixed commits appear at the same chronological index
+                // in both lists; differing heads mean revs is the
+                // earlier one (it was pushed first by the fold's per-
+                // commit step). Advance revs only.
+                revs.next();
+                a
+            }
+        };
+        let touched = session.plan_revisions.iter().any(|s| s == sha);
+        let has_code_changes = session.implementation_commits.iter().any(|s| s == sha);
+        let kind = match (touched, has_code_changes) {
             (true, true) => "commit_mixed",
             (true, false) => "commit_plan",
             (false, true) => "commit_impl",
-            (false, false) => unreachable!("filtered above"),
+            (false, false) => continue,
         };
-        let subject = commit_meta
+        let plan_touch = if touched {
+            if sha == &session.plan_intro {
+                Some(PlanTouchKind::Intro)
+            } else {
+                Some(PlanTouchKind::Revision)
+            }
+        } else {
+            None
+        };
+        let subject = session
+            .commit_meta
             .get(sha)
             .map(|m| m.subject.clone())
             .unwrap_or_default();
@@ -538,11 +483,7 @@ fn timeline_value(
             "has_code_changes": has_code_changes,
             "subject": subject,
         }));
-        // Pre-cutover review rows carried a "plan"/"impl" phase tag
-        // derived from which legacy map the file lived in. Post-cutover
-        // we back-derive the same tag from the commit's plan_touch /
-        // has_code_changes pair until phase 2.5 drops the field.
-        let phase_tag = if plan_touch.is_some() { "plan" } else { "impl" };
+        let phase_tag = if touched { "plan" } else { "impl" };
         if let Some(gate) = session.commits.get(sha) {
             for (author, fb) in &gate.feedback {
                 out.push(json!({
@@ -674,6 +615,12 @@ mod tests {
             body_hash: content_hash(""),
             plan_intro: CommitSha::parse("dead").unwrap(),
             plan_intro_parent: Some(CommitSha::parse("ca11").unwrap()),
+            plan_revisions: Vec::new(),
+            implementation_commits: Vec::new(),
+            reviewable_commits: Vec::new(),
+            commit_meta: BTreeMap::new(),
+            last_activity_ts: 0,
+            latest_reviewable_commit: None,
             commits: BTreeMap::new(),
             frozen_at: None,
             freeze_events: Vec::new(),

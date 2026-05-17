@@ -517,28 +517,11 @@ fn collect_candidate(
         .plans
         .get(plan_id.key())
         .ok_or_else(|| WaitError::UnknownPlan(plan_id.to_string()))?;
-    let review_target = crate::projection::latest_reviewable_commit_for(
-        &plan.id,
-        &repo_state.commit_order,
-        &repo_state.plan_touches,
-        &repo_state.attribution,
-    );
-    let review_target_kind = review_target.as_ref().map(|sha| {
-        crate::projection::commit_kind_for(
-            &plan.id,
-            sha,
-            &repo_state.plan_touches,
-            &repo_state.attribution,
-        )
-    });
-    let gate = crate::projection::latest_reviewable_commit_gate_for(
-        &plan.id,
-        &plan.commits,
-        &repo_state.commit_order,
-        &repo_state.plan_touches,
-        &repo_state.attribution,
-    )
-    .cloned();
+    let review_target = crate::projection::latest_reviewable_commit_for(plan);
+    let review_target_kind = review_target
+        .as_ref()
+        .map(|sha| crate::projection::commit_kind_for(plan, sha));
+    let gate = crate::projection::latest_reviewable_commit_gate_for(plan).cloned();
     Ok(Candidate {
         repo_root,
         plan_key: plan.id.clone(),

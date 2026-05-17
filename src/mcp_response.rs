@@ -76,13 +76,7 @@ pub(crate) fn list_plans_response_with_status_reader(
         let worktree_status =
             status_reader.compute(&state.root, &plan.plan_path, &plan.body_hash)?;
         let plan_phase = current_posture(plan, state);
-        let gate = crate::projection::latest_reviewable_commit_gate_for(
-            &plan.id,
-            &plan.commits,
-            &state.commit_order,
-            &state.plan_touches,
-            &state.attribution,
-        );
+        let gate = crate::projection::latest_reviewable_commit_gate_for(plan);
         let w = waiting_on(plan.frozen_at.is_some(), worktree_status, gate);
         plans.push(plan_summary(
             &state.root,
@@ -183,13 +177,7 @@ pub fn get_context_response_from_snapshot(
     let session_phase = current_posture(session, state);
     let plan_gate = plan_gate_for(session, state);
     let impl_gate = impl_gate_for(session, state);
-    let gate = crate::projection::latest_reviewable_commit_gate_for(
-        &session.id,
-        &session.commits,
-        &state.commit_order,
-        &state.plan_touches,
-        &state.attribution,
-    );
+    let gate = crate::projection::latest_reviewable_commit_gate_for(session);
     let w = waiting_on(session.frozen_at.is_some(), worktree_status, gate);
 
     let pr_hint = if matches!(session_phase, crate::repo_state::Posture::Implementing) {
@@ -214,12 +202,7 @@ pub fn get_context_response_from_snapshot(
     // wire publishes is the same SHA the gate was computed on — no
     // chance of pointing reviewers at a non-reviewable
     // (MultiPlan / DoneMove) commit.
-    let review_target_sha = crate::projection::latest_reviewable_commit_for(
-        &session.id,
-        &state.commit_order,
-        &state.plan_touches,
-        &state.attribution,
-    );
+    let review_target_sha = crate::projection::latest_reviewable_commit_for(session);
     let review_target_phase = if matches!(session_phase, crate::repo_state::Posture::Implementing) {
         "impl"
     } else {
@@ -250,13 +233,8 @@ pub fn get_context_response_from_snapshot(
         .map(|b| crate::lifecycle::PlanId::new(b, session.id.clone()).to_string());
 
     let commits_value = commits_array(session, state);
-    let latest_relevant_commit = crate::projection::latest_reviewable_commit_for(
-        &session.id,
-        &state.commit_order,
-        &state.plan_touches,
-        &state.attribution,
-    )
-    .map(|s| s.as_str().to_string());
+    let latest_relevant_commit =
+        crate::projection::latest_reviewable_commit_for(session).map(|s| s.as_str().to_string());
 
     let lifecycle = crate::repo_state::PlanLifecycle::from_plan(session);
     let archived_cycles: Vec<Value> = session
@@ -305,11 +283,14 @@ pub fn get_context_response_from_snapshot(
 /// for this plan are emitted (`PlanOnly` | `CodeOnly` | `Mixed`);
 /// `DoneMove` / `MultiPlan` / `Unattributed` are skipped because
 /// they don't carry a gate.
-fn commits_array(plan: &crate::repo_state::Plan, state: &RepoState) -> Vec<Value> {
+fn commits_array(plan: &crate::repo_state::Plan, _state: &RepoState) -> Vec<Value> {
     use crate::projection::commit_kind_for;
     let mut out = Vec::new();
-    for sha in &state.commit_order {
-        let kind = commit_kind_for(&plan.id, sha, &state.plan_touches, &state.attribution);
+    // Walk this plan's reviewable commits in chronological order
+    // (the fold accumulates them in that order); commit_kind_for is
+    // an O(plan-local) lookup, not a global scan.
+    for sha in &plan.reviewable_commits {
+        let kind = commit_kind_for(plan, sha);
         if !kind.is_reviewable() {
             continue;
         }
@@ -382,10 +363,14 @@ fn timeline_value(state: &RepoState, session_id: &PlanKey) -> Vec<Value> {
             } => {
                 // Wire `phase` is back-derived from the targeted
                 // commit's plan_touch: plan-touching commit → "plan",
-                // else → "impl". Pre-cutover this lived in the
-                // TimelinePhase enum; now it's a render concern.
-                let phase = if state.plan_touches.contains_key(&target) {
-                    "plan"
+                // else → "impl". Plan-side check is plan-local, not
+                // global.
+                let phase = if let Some(plan) = state.plans.get(session_id) {
+                    if plan.plan_revisions.iter().any(|s| s == &target) {
+                        "plan"
+                    } else {
+                        "impl"
+                    }
                 } else {
                     "impl"
                 };
