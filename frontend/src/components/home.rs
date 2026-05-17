@@ -63,7 +63,7 @@ fn plans_view(index: PlansIndex, show_done: bool) -> impl IntoView {
     let plans: Vec<PlanRow> = index
         .plans
         .into_iter()
-        .filter(|p| show_done || p.state != "done")
+        .filter(|p| show_done || p.state != "finished")
         .collect();
     let conflicts = index.conflicts;
     view! {

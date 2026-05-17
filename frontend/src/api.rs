@@ -276,29 +276,6 @@ pub struct DiffPage {
     pub diff_files: Vec<FileDiff>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
-pub struct DoneResponse {}
-
-/// `POST /api/plan/{plan_id}/done` — moves the active plan file under
-/// `.trinity/plans/done/`. Returns the new repo-relative path on
-/// success.
-pub async fn post_move_to_done(plan_id: String) -> Result<DoneResponse, FetchError> {
-    let url = format!("/api/plan/{plan_id}/done");
-    let resp = gloo_net::http::Request::post(&url)
-        .header("content-type", "application/json")
-        .body("{}")
-        .map_err(|e| FetchError::Network(e.to_string()))?
-        .send()
-        .await
-        .map_err(|e| FetchError::Network(e.to_string()))?;
-    if !resp.ok() {
-        return Err(FetchError::Status(resp.status()));
-    }
-    resp.json::<DoneResponse>()
-        .await
-        .map_err(|e| FetchError::Decode(e.to_string()))
-}
-
 pub async fn fetch_diff(plan_id: String, from: String, to: String) -> Result<DiffPage, FetchError> {
     let url = format!("/api/plan/{plan_id}/diff/{from}/{to}");
     let resp = gloo_net::http::Request::get(&url)

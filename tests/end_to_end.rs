@@ -838,43 +838,11 @@ async fn feedback_renders_on_session_page() {
 }
 
 #[tokio::test]
-async fn done_move_endpoint_moves_plan_file() {
-    let dir = init_repo();
-    write_file(dir.path(), ".trinity/plans/foo.md", "# foo\n");
-    commit(dir.path(), "Add foo");
-
-    let (url, handle) = spawn_daemon(dir.path()).await;
-    let client = reqwest::Client::new();
-    let basename = dir.path().file_name().unwrap().to_str().unwrap();
-    let resp = client
-        .post(format!("{url}/api/plan/{basename}/foo.md/done"))
-        .send()
-        .await
-        .unwrap();
-    let status = resp.status();
-    let response_body: serde_json::Value = resp.json().await.unwrap();
-    handle.abort();
-    assert_eq!(status, reqwest::StatusCode::OK);
-    assert_eq!(response_body["ok"], true);
-    assert_eq!(
-        response_body["new_plan_path"], ".trinity/plans/done/foo.md",
-        "response should advertise the new path"
-    );
-    assert!(
-        !dir.path().join(".trinity/plans/foo.md").exists(),
-        "active path should be gone"
-    );
-    assert!(
-        dir.path().join(".trinity/plans/done/foo.md").exists(),
-        "done path should exist"
-    );
-}
-
-#[tokio::test]
-async fn plan_id_url_stable_across_done_flip() {
-    // The headline plan-path-identity invariant: same plan_id resolves
-    // before and after the active↔done move, and the response shape
-    // flips `state` and `current_path` to track the file's new home.
+async fn plan_id_url_stable_across_finish_flip() {
+    // The plan_id / URL doesn't move when a plan becomes finished
+    // because the file doesn't move — finalize is event-log truth, not
+    // a filesystem rename. `state` flips to `finished`,
+    // `current_path` stays put.
     let dir = init_repo();
     write_file(dir.path(), ".trinity/plans/foo.md", "# foo\n");
     commit(dir.path(), "Add foo");
@@ -895,13 +863,13 @@ async fn plan_id_url_stable_across_done_flip() {
     assert_eq!(before["state"], "active");
     assert_eq!(before["current_path"], ".trinity/plans/foo.md");
 
-    // Move + commit the move so the watcher rebuilds against a real
-    // post-move HEAD.
-    let active = dir.path().join(".trinity/plans/foo.md");
-    let done_dir = dir.path().join(".trinity/plans/done");
-    std::fs::create_dir_all(&done_dir).unwrap();
-    std::fs::rename(&active, done_dir.join("foo.md")).unwrap();
-    commit(dir.path(), "Move foo to done");
+    // Commit a finalize snapshot — plan file stays at the same path.
+    write_file(
+        dir.path(),
+        ".trinity/finished/foo/alice.md",
+        "APPROVE\n\nlgtm\n",
+    );
+    commit(dir.path(), "Finalize foo");
     tokio::time::sleep(Duration::from_millis(800)).await;
 
     let after: serde_json::Value = client
@@ -916,12 +884,12 @@ async fn plan_id_url_stable_across_done_flip() {
 
     assert_eq!(after["plan_id"], format!("{basename}/foo.md"));
     assert_eq!(
-        after["state"], "done",
-        "state should flip to done; full response: {after}"
+        after["state"], "finished",
+        "state should flip to finished; full response: {after}"
     );
     assert_eq!(
-        after["current_path"], ".trinity/plans/done/foo.md",
-        "current_path should point at done variant"
+        after["current_path"], ".trinity/plans/foo.md",
+        "current_path should not move — plan file stays at the active path"
     );
 }
 

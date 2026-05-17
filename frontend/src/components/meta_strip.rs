@@ -1,7 +1,6 @@
 use leptos::prelude::*;
 
-use crate::api::{PlanDetail, ReviewGate, post_move_to_done};
-use crate::store::EventStore;
+use crate::api::{PlanDetail, ReviewGate};
 use crate::util::short_sha;
 
 /// Sidebar block: phase / worktree-status / current path / latest
@@ -77,63 +76,8 @@ pub fn MetaStrip(session: PlanDetail) -> impl IntoView {
                 </dd>
             </dl>
             {session.review_gate.map(|gate| view! { <ReviewGateChips gate=gate/> })}
-            {move_to_done_button(&session.plan_id, &session.waiting_on.reason)}
         </section>
     }
-}
-
-/// Render the "Move plan to done/" action only when the master is in
-/// the `ready_to_start_implementation` state (renamed from
-/// `ready_to_finish` → `ready_to_move_forward` → current). Posts to
-/// `/api/plan/{plan_id}/done`.
-fn move_to_done_button(plan_id: &str, reason: &str) -> AnyView {
-    if reason != "ready_to_start_implementation" {
-        return ().into_any();
-    }
-    let store = expect_context::<EventStore>();
-    let plan_id = plan_id.to_string();
-    let status: RwSignal<DoneButtonState> = RwSignal::new(DoneButtonState::Idle);
-    let on_click = move |_| {
-        let id = plan_id.clone();
-        status.set(DoneButtonState::Pending);
-        wasm_bindgen_futures::spawn_local(async move {
-            match post_move_to_done(id).await {
-                Ok(_) => {
-                    status.set(DoneButtonState::Done);
-                    store.tick.update(|t| *t = t.wrapping_add(1));
-                }
-                Err(e) => status.set(DoneButtonState::Failed(e.to_string())),
-            }
-        });
-    };
-    let label = move || match status.get() {
-        DoneButtonState::Idle => "Move plan to done/".to_string(),
-        DoneButtonState::Pending => "Moving…".to_string(),
-        DoneButtonState::Done => "Moved ✓".to_string(),
-        DoneButtonState::Failed(msg) => format!("Failed: {msg}"),
-    };
-    let disabled = move || {
-        matches!(
-            status.get(),
-            DoneButtonState::Pending | DoneButtonState::Done
-        )
-    };
-    view! {
-        <div class="meta-actions">
-            <button class="primary-button" type="button" on:click=on_click prop:disabled=disabled>
-                {label}
-            </button>
-        </div>
-    }
-    .into_any()
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum DoneButtonState {
-    Idle,
-    Pending,
-    Done,
-    Failed(String),
 }
 
 #[component]

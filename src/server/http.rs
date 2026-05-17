@@ -28,7 +28,6 @@ pub fn router(state: AppState) -> Router {
         .route("/api/wait_for_work", post(api_wait_for_work))
         .route("/api/plans", get(api_plans))
         .route("/api/plan/{repo}/{stem_md}", get(api_plan_detail))
-        .route("/api/plan/{repo}/{stem_md}/done", post(api_move_to_done))
         .route(
             "/api/plan/{repo}/{stem_md}/revision/{sha}",
             get(api_plan_revision),
@@ -433,46 +432,6 @@ async fn api_commit_diff(
         "message_body": message_body,
         "diff_files": diff_files_json,
         "feedback": feedback,
-    })))
-}
-
-/// `POST /api/plan/{repo}/{stem_md}/done` — move the plan file under
-/// `.trinity/plans/done/`. No body.
-async fn api_move_to_done(
-    State(state): State<AppState>,
-    Path((repo_basename, stem_md)): Path<(String, String)>,
-) -> Result<axum::Json<Value>, AppError> {
-    let (repo, plan_key) = resolve_plan_id_segments(&state, &repo_basename, &stem_md).await?;
-    let plan_path_rel = state
-        .runtime
-        .snapshot_session(&repo, &plan_key)
-        .await
-        .map_err(AppError::runtime)?
-        .map(|snapshot| {
-            snapshot
-                .plans
-                .values()
-                .next()
-                .expect("single_plan invariant")
-                .plan_path
-                .clone()
-        })
-        .ok_or_else(|| AppError::not_found(format!("plan {repo_basename}/{stem_md} not found")))?;
-
-    let from = repo.join(plan_path_rel.as_path());
-    let to_dir = repo.join(".trinity/plans/done");
-    std::fs::create_dir_all(&to_dir).map_err(AppError::io)?;
-    let to = to_dir.join(
-        plan_path_rel
-            .as_path()
-            .file_name()
-            .ok_or_else(|| AppError::internal("plan_path has no file name"))?,
-    );
-    std::fs::rename(&from, &to).map_err(AppError::io)?;
-    let new_plan_path = to.strip_prefix(&repo).unwrap_or(&to).to_path_buf();
-    Ok(axum::Json(json!({
-        "ok": true,
-        "new_plan_path": new_plan_path.to_string_lossy(),
     })))
 }
 
