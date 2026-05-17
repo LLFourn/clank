@@ -106,26 +106,6 @@ pub fn finalize_first_line_starts_with_approve(first_line: &str) -> bool {
     first_line.trim_start().starts_with("APPROVE")
 }
 
-/// Detect the pre-event-log-and-finished feedback path shape
-/// `<plan-key>/commits/<target-sha>/<author>.md`. Used at watcher startup
-/// to surface a one-shot warning so operators don't silently lose
-/// in-flight feedback after the path rename.
-pub fn is_legacy_commits_feedback_path(rel: &Path) -> bool {
-    let segments: Vec<&std::ffi::OsStr> = rel
-        .components()
-        .filter_map(|c| match c {
-            Component::Normal(s) => Some(s),
-            _ => None,
-        })
-        .collect();
-    matches!(
-        segments.as_slice(),
-        [_session, kind, _sha, file]
-            if kind.to_str() == Some("commits")
-            && file.to_str().is_some_and(|s| s.ends_with(".md"))
-    )
-}
-
 /// Build the canonical relative feedback path
 /// `<plan-key>/<target-sha>/<author>.md` (the part under
 /// `.trinity/feedback/`).
@@ -158,14 +138,6 @@ pub fn parse_verdict(body: &str) -> Verdict {
         Some("REQUEST_CHANGES") => Verdict::RequestChanges,
         _ => Verdict::Unmarked,
     }
-}
-
-/// Determine whether a plan file's path indicates the session is "done"
-/// (under `.trinity/plans/done/`).
-pub fn plan_path_is_done(plan_path_rel: &Path) -> bool {
-    plan_path_rel
-        .components()
-        .any(|c| matches!(c, Component::Normal(s) if s == "done"))
 }
 
 #[cfg(test)]
@@ -207,14 +179,9 @@ mod tests {
     }
 
     #[test]
-    fn legacy_commits_segment_rejected() {
-        assert!(parse_feedback_path(&p("foo/commits/abc1234/alice.md")).is_none());
-    }
-
-    #[test]
-    fn legacy_plan_impl_segments_rejected() {
-        assert!(parse_feedback_path(&p("foo/plan/abc1234/alice.md")).is_none());
-        assert!(parse_feedback_path(&p("foo/impl/abc1234/alice.md")).is_none());
+    fn three_segment_paths_reject_unknown_middle_segment() {
+        assert!(parse_feedback_path(&p("foo/plan/alice.md")).is_none());
+        assert!(parse_feedback_path(&p("foo/impl/alice.md")).is_none());
     }
 
     #[test]
@@ -230,18 +197,6 @@ mod tests {
     #[test]
     fn non_md_rejected() {
         assert!(parse_feedback_path(&p("foo/abc1234/alice.txt")).is_none());
-    }
-
-    #[test]
-    fn is_legacy_commits_feedback_path_detects_old_shape() {
-        assert!(is_legacy_commits_feedback_path(&p(
-            "foo/commits/abc1234/alice.md"
-        )));
-    }
-
-    #[test]
-    fn is_legacy_commits_feedback_path_rejects_new_shape() {
-        assert!(!is_legacy_commits_feedback_path(&p("foo/abc1234/alice.md")));
     }
 
     #[test]
@@ -329,13 +284,4 @@ mod tests {
         assert_eq!(parse_verdict(""), Verdict::Unmarked);
     }
 
-    #[test]
-    fn plan_path_is_done_active() {
-        assert!(!plan_path_is_done(&p(".trinity/plans/foo.md")));
-    }
-
-    #[test]
-    fn plan_path_is_done_in_done_subdir() {
-        assert!(plan_path_is_done(&p(".trinity/plans/done/foo.md")));
-    }
 }

@@ -19,7 +19,7 @@ use std::path::PathBuf;
 
 use crate::attribution::{CommitChanges, FinalizeChangeKind, classify, effective_session};
 use crate::disk_format::{
-    FeedbackPath, finalize_first_line_starts_with_approve, parse_verdict, plan_path_is_done,
+    FeedbackPath, finalize_first_line_starts_with_approve, parse_verdict,
 };
 use crate::lifecycle::{AgentLabel, CommitSha, PlanKey, content_hash};
 use crate::repo_state::{
@@ -178,24 +178,19 @@ pub fn derive_state(repo_root: PathBuf, snapshot: DiskSnapshot) -> RepoState {
                 if !is_frozen(&state, &touch.session) {
                     filtered.push((touch.session.clone(), touch.kind));
                 }
-                // Track plan-file-at-active-path from new_path. None ==
-                // deletion (or test fixture without explicit path).
+                // Track plan-file-at-active-path from new_path. The
+                // producer (`git_io::parse_diff_tree`) sets new_path =
+                // None only for a real `D` (delete) diff. `Some(_)`
+                // is always at the active path because git_io's
+                // `is_plan_path` rejects nested paths. Synthetic test
+                // fixtures that pass None never carry finalize_changes
+                // so the freeze-rule check never fires for them.
                 match &touch.new_path {
-                    Some(p) if !plan_path_is_done(p) => {
+                    Some(_) => {
                         plan_at_active_path.insert(touch.session.clone());
                     }
-                    Some(_) => {
-                        plan_at_active_path.remove(&touch.session);
-                    }
                     None => {
-                        // Fixture didn't specify; fall back to HEAD's
-                        // plan_path so synthetic tests without finalize
-                        // changes still behave as before.
-                        if let Some(plan) = state.plans.get(&touch.session) {
-                            if !plan_path_is_done(&plan.plan_path) {
-                                plan_at_active_path.insert(touch.session.clone());
-                            }
-                        }
+                        plan_at_active_path.remove(&touch.session);
                     }
                 }
             }

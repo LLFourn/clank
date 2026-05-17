@@ -7,9 +7,7 @@ use std::path::{Path, PathBuf};
 use tokio::process::Command;
 
 use crate::attribution::{CommitChanges, FinalizeChange, FinalizeChangeKind, PlanTouch};
-use crate::disk_format::{
-    is_legacy_commits_feedback_path, parse_feedback_path, parse_finalize_path,
-};
+use crate::disk_format::{parse_feedback_path, parse_finalize_path};
 use crate::disk_snapshot::{DiskSnapshot, FeedbackBlob, HistoryEntry, PlanFileBlob};
 use crate::lifecycle::{CommitSha, PlanKey};
 use crate::repo_state::PlanTouchKind;
@@ -233,6 +231,46 @@ pub async fn first_added_commit(
 /// topologically earliest plan_intro requires a separate query. Trinity
 /// repos are small enough that walking from the root is cheap and avoids
 /// a correctness footgun.
+/// Plan stems that appear in `.trinity/finished/<stem>/<file>` history,
+/// regardless of whether the plan file still exists in HEAD. Used by
+/// `snapshot` to load plans that were finalized and then had their
+/// plan file deleted from HEAD; per monotone-finished those plans
+/// stay finished. The fold sets `frozen_at` and the rebuild step
+/// renders their body from that commit.
+pub async fn finalize_history_stems(
+    repo: &Path,
+) -> Result<std::collections::BTreeSet<PlanKey>, GitIoError> {
+    let stdout = run_ok(
+        repo,
+        &[
+            "log",
+            "--all",
+            "--diff-filter=A",
+            "--pretty=format:",
+            "--name-only",
+            "--",
+            ".trinity/finished/",
+        ],
+    )
+    .await?;
+    let mut out = std::collections::BTreeSet::new();
+    for line in stdout.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let path = PathBuf::from(line);
+        let Ok(rel) = path.strip_prefix(".trinity/finished") else {
+            continue;
+        };
+        let Some(parsed) = crate::disk_format::parse_finalize_path(rel) else {
+            continue;
+        };
+        out.insert(parsed.plan_key);
+    }
+    Ok(out)
+}
+
 pub async fn first_parent_commits(repo: &Path) -> Result<Vec<CommitMeta>, GitIoError> {
     let stdout = run_ok(
         repo,
@@ -520,6 +558,7 @@ pub async fn snapshot(repo_root: &Path) -> Result<DiskSnapshot, GitIoError> {
     // Plan files in HEAD.
     let entries = ls_tree_plans(repo_root, &head).await?;
     let mut plan_files = Vec::with_capacity(entries.len());
+    let mut head_stems: std::collections::BTreeSet<PlanKey> = std::collections::BTreeSet::new();
     for e in entries {
         let Some(plan_key) = PlanKey::from_path(&e.path) else {
             continue;
@@ -529,10 +568,36 @@ pub async fn snapshot(repo_root: &Path) -> Result<DiskSnapshot, GitIoError> {
             continue;
         };
         let plan_intro_parent = parent_of(repo_root, &plan_intro).await?;
+        head_stems.insert(plan_key.clone());
         plan_files.push(PlanFileBlob {
             plan_key,
             plan_path: e.path,
             body,
+            plan_intro,
+            plan_intro_parent,
+        });
+    }
+
+    // History-rooted plans: stems that show up in `.trinity/finished/`
+    // history but no longer have a `.trinity/plans/<stem>.md` blob in
+    // HEAD. Per the monotone-finished invariant, a plan that was
+    // finalized stays finished even if its plan file is later deleted
+    // from HEAD. These plans are loaded with an empty body here; the
+    // rebuild step fills the body from the freeze commit's blob once
+    // the sans-IO fold sets `frozen_at`.
+    for stem in finalize_history_stems(repo_root).await? {
+        if head_stems.contains(&stem) {
+            continue;
+        }
+        let plan_path = PathBuf::from(format!(".trinity/plans/{}.md", stem.as_str()));
+        let Some(plan_intro) = first_added_commit(repo_root, &plan_path).await? else {
+            continue;
+        };
+        let plan_intro_parent = parent_of(repo_root, &plan_intro).await?;
+        plan_files.push(PlanFileBlob {
+            plan_key: stem,
+            plan_path,
+            body: String::new(),
             plan_intro,
             plan_intro_parent,
         });
@@ -624,21 +689,12 @@ fn collect_feedback_files(repo_root: &Path) -> Result<Vec<FeedbackBlob>, GitIoEr
         detail: format!("{e}"),
     })?;
     let mut out = Vec::with_capacity(paths.len());
-    let mut legacy_count: usize = 0;
-    let mut legacy_example: Option<PathBuf> = None;
     for abs in paths {
         let Ok(rel) = abs.strip_prefix(&feedback_root) else {
             continue;
         };
-        let parsed = match parse_feedback_path(rel) {
-            Some(p) => p,
-            None => {
-                if is_legacy_commits_feedback_path(rel) {
-                    legacy_count += 1;
-                    legacy_example.get_or_insert_with(|| abs.clone());
-                }
-                continue;
-            }
+        let Some(parsed) = parse_feedback_path(rel) else {
+            continue;
         };
         let body = std::fs::read_to_string(&abs).map_err(|e| GitIoError::Parse {
             context: "read feedback file".into(),
@@ -651,13 +707,6 @@ fn collect_feedback_files(repo_root: &Path) -> Result<Vec<FeedbackBlob>, GitIoEr
             body,
             created_at,
         });
-    }
-    if legacy_count > 0 {
-        tracing::warn!(
-            count = legacy_count,
-            example = legacy_example.as_ref().map(|p| p.display().to_string()),
-            "feedback files at legacy `.trinity/feedback/<stem>/commits/<sha>/<agent>.md` path are not picked up; move to `.trinity/feedback/<stem>/<sha>/<agent>.md`"
-        );
     }
     Ok(out)
 }

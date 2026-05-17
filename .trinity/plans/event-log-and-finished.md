@@ -196,25 +196,32 @@ that commit — the fold doesn't freeze. If a later commit cleans
 up the non-APPROVE file and the rule then holds, that later
 commit is where freeze happens.
 
-If `.trinity/plans/<stem>.md` is absent from HEAD, the plan
-doesn't exist (no `active`, no `finished`) regardless of what's
-in `.trinity/finished/<stem>/`.
+A plan exists if (a) `.trinity/plans/<stem>.md` is present in
+HEAD, or (b) the plan was ever frozen (the fold recorded a freeze
+event for it). Case (b) is the monotone-finished anchor: once
+frozen, the plan persists in `list_plans` even if HEAD later
+loses the plan file. Plan body for case (b) is rendered from
+`git show <frozen_at>:.trinity/plans/<stem>.md`, not HEAD.
 
-If the plans file exists and the fold never reached a commit
-where the finalize rule held, the plan is `active`.
+If the plan file exists in HEAD and the fold never reached a
+commit where the finalize rule held, the plan is `active`. If the
+plan file is absent from HEAD and the plan was never frozen, the
+plan doesn't exist at all (no historical anchor).
 
 **Daemon's perspective on transitioning a frozen plan**: there
-are exactly two git-state transitions that change a frozen plan's
-projection:
+is exactly one git-state transition that can un-finish a frozen
+plan:
 
-- **Delete the plan file from HEAD** — the fold's plan-existence
-  check at HEAD fails; the plan ceases to exist (no `active`, no
-  `finished`, no state; absent from `list_plans`). The dashboard
-  stops showing it.
 - **Remove the finalize commit from reachable history** (via any
   history rewrite — `git reset`, `git rebase -i`, a CLI rewriter,
   etc.). On a fresh rebuild, the fold no longer sees the freeze
-  event and the plan is `active` again.
+  event and the plan is `active` again (or doesn't exist, if the
+  plan-file blob is also unreachable post-rewrite).
+
+Deleting `.trinity/plans/<stem>.md` from HEAD does **not**
+un-finish the plan. The freeze event is still in reachable
+history; the fold replays it and sets `frozen_at`. The plan stays
+in `list_plans`, body renders from the freeze commit.
 
 `git revert` of the finalize commit does NOT un-finish the plan.
 The revert is a new commit that removes the snapshot directory
@@ -482,9 +489,9 @@ Drop the `commits/` segment from feedback paths everywhere.
   paths updated.
 - This phase is purely a path rename. No semantic changes.
 
-Migration note: in-flight working-tree feedback at the old path is
-not picked up. Add a one-shot warning when `rebuild_repo` detects
-files under the legacy `commits/` segment.
+Operators with in-flight feedback at the old path move or
+re-create the files; the daemon doesn't warn or migrate. The
+old shape is forgotten end-to-end.
 
 ### Phase 2 — Sans-io core: event-log fold + finalize snapshot reader
 
@@ -774,16 +781,10 @@ read-side handling:
 Phase 1 changes the feedback path from
 `.trinity/feedback/<plan>/commits/<sha>/<agent>.md` to
 `.trinity/feedback/<plan>/<sha>/<agent>.md`. Working-tree feedback
-files at the old path are not picked up after the rename.
-
-Approach:
-- `rebuild_repo` detects files under the legacy `commits/` segment
-  and emits a one-shot warning ("in-flight feedback at legacy
-  path; move or commit before continuing").
-- No automatic migration — let the operator `git mv` or rename. If
-  the feedback wasn't committed (default), `mv` in the working
-  tree is enough.
-- After 2 release cycles, the legacy-path detector drops.
+files at the old path are silently ignored (the parser drops them
+along with any other unrecognised shape). The daemon has no
+knowledge of the legacy layout; operators handle in-flight files
+themselves (move or delete).
 
 ## Risks and Tensions
 
@@ -903,8 +904,15 @@ behaviour.
      commit (e.g. operator hand-edits the APPROVE files) → STILL
      finished; the wire renders the freeze-time contents, not
      HEAD's
-   - removing `.trinity/plans/<stem>.md` from HEAD → plan
-     doesn't exist (no state at all; absent from `list_plans`)
+   - removing `.trinity/plans/<stem>.md` from HEAD AFTER a freeze
+     → STILL finished. The plan stays in `list_plans` with
+     `frozen_at = Some(_)`; body renders from
+     `git show <frozen_at>:.trinity/plans/<stem>.md`, not HEAD.
+     (Monotone-finished applies to plan-file deletion too: once
+     frozen, no subsequent commit can hide or unfinish the plan.)
+   - removing `.trinity/plans/<stem>.md` from HEAD with NO freeze
+     event ever recorded → plan doesn't exist (no historical
+     anchor; absent from `list_plans`).
 9. **Sealing invariant (gating)**: once frozen, the plan is sealed
    end-to-end. Regression tests construct a repo with a freeze
    event at commit C and then add commits c1..cN after C that
@@ -951,21 +959,10 @@ behaviour.
 ### Feedback path
 
 11. Working-tree feedback at `.trinity/feedback/<stem>/<sha>/<agent>.md`
-    is parsed; old `commits/<sha>/<agent>.md` is not.
-12. Legacy-path files in the working tree surface as a warning,
-    not a silent drop.
-
-### Migration
-
-13. Existing repos with `.trinity/plans/done/*.md` files surface
-    those files in `plan_conflicts` with a migration message; no
-    silent drop.
-14. `tests/end_to_end.rs` includes a regression test that boots a
-    repo containing `.trinity/plans/done/legacy.md`, verifies the
-    conflict surfaces, and verifies the legacy file is not picked
-    up as an active plan.
-15. Working-tree feedback at the legacy `commits/` path surfaces a
-    one-shot warning per rebuild.
+    is parsed; the legacy `commits/<sha>/<agent>.md` shape is
+    silently ignored (drops to the same fate as any unrecognised
+    file under `.trinity/feedback/`). No warning, no detector —
+    Trinity has forgotten the legacy layout existed.
 
 ### `Phase` enum
 

@@ -6,6 +6,7 @@ use std::path::Path;
 
 use crate::disk_snapshot::derive_state;
 use crate::git_io::{self, GitIoError};
+use crate::lifecycle::content_hash;
 use crate::repo_state::RepoState;
 
 #[derive(Debug, thiserror::Error)]
@@ -16,9 +17,29 @@ pub enum RebuildError {
 
 /// Build a fresh `RepoState` from disk + git for `repo_root`. Empty
 /// repos (no commits) produce an empty state.
+///
+/// Two-phase: git_io builds a `DiskSnapshot`, `derive_state` runs the
+/// chronological fold (setting `frozen_at` for finished plans), then a
+/// post-fold pass fetches the plan body from the freeze commit for
+/// any frozen plan whose `.trinity/plans/<stem>.md` is absent from
+/// HEAD. Monotone-finished plans render from their freeze SHA, not
+/// HEAD.
 pub async fn rebuild_repo(repo_root: &Path) -> Result<RepoState, RebuildError> {
     let snapshot = git_io::snapshot(repo_root).await?;
-    Ok(derive_state(repo_root.to_path_buf(), snapshot))
+    let mut state = derive_state(repo_root.to_path_buf(), snapshot);
+    for plan in state.plans.values_mut() {
+        let Some(frozen_at) = plan.frozen_at.clone() else {
+            continue;
+        };
+        if !plan.body.is_empty() {
+            continue;
+        }
+        let plan_path = plan.plan_path.clone();
+        let body = git_io::show_blob(repo_root, &frozen_at, &plan_path).await?;
+        plan.body_hash = content_hash(&body);
+        plan.body = body;
+    }
+    Ok(state)
 }
 
 #[cfg(test)]
@@ -144,4 +165,41 @@ mod tests {
     // `duplicate_stem_active_and_done_lands_in_plan_conflicts_via_real_git`
     // retired with `.trinity/plans/done/` (Phase 5, event-log-and-finished).
     // Plan paths under done/ no longer parse as plan keys at all.
+
+    #[tokio::test]
+    async fn finished_plan_survives_plan_file_deletion_from_head() {
+        // Monotone-finished: once frozen, deleting the plan file from
+        // HEAD does NOT unfinish or hide the plan. Body renders from
+        // the freeze commit, not HEAD.
+        let dir = init_repo();
+        write_file(dir.path(), ".trinity/plans/foo.md", "# foo body\n");
+        commit(dir.path(), "Add foo");
+        write_file(
+            dir.path(),
+            ".trinity/finished/foo/alice.md",
+            "APPROVE\n\nlgtm\n",
+        );
+        commit(dir.path(), "Finalize foo");
+
+        let frozen_state = rebuild_repo(dir.path()).await.unwrap();
+        let key = PlanKey::parse("foo").unwrap();
+        assert!(frozen_state.plans[&key].frozen_at.is_some());
+        assert_eq!(frozen_state.plans[&key].body, "# foo body\n");
+
+        // Delete the plan file from HEAD.
+        std::fs::remove_file(dir.path().join(".trinity/plans/foo.md")).unwrap();
+        commit(dir.path(), "Delete foo");
+
+        let after = rebuild_repo(dir.path()).await.unwrap();
+        let plan = after
+            .plans
+            .get(&key)
+            .expect("finished plan must survive its plan-file deletion");
+        assert!(
+            plan.frozen_at.is_some(),
+            "plan must still be frozen after HEAD-deletion"
+        );
+        // Body renders from the freeze commit.
+        assert_eq!(plan.body, "# foo body\n");
+    }
 }
