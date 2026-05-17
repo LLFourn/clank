@@ -17,11 +17,12 @@ committed to git but feedback lives in the working tree, so a fresh
 `git clone` cannot see which plans are finished. The current `done/`
 directory IS that signal, but it's one master can forge unilaterally
 (just `git mv` the file). The new model puts the finish signal in
-git via a deliberate **finalize commit** made by the `trinity finish`
-CLI command after the CLI verifies the live gate. The CLI never
-cheats — invariant checks pass before the commit lands. A
-semi-malicious or confused master agent can still forge a finalize
-commit by writing fake APPROVE files directly, but at that point
+git via a deliberate **finalize commit** — a commit that adds files
+under `.trinity/finished/<stem>/`. How those files get there
+(operator workflow, CLI tool, future automation) is out of scope
+for this plan; the daemon trusts what's in HEAD. A semi-malicious
+or confused master agent can still forge a finalize commit by
+writing fake APPROVE files directly, but at that point
 the operator has bigger problems than this artifact. Trinity is not
 trying to be a tamper-proof attestation system, only to make
 resolution require explicit, visible action instead of a silent
@@ -32,7 +33,7 @@ Scope this plan owns:
 - Snapshot-on-finalize: `.trinity/finished/<stem>/` carries a
   committed copy of the reviewer feedback files at finish time. No
   per-SHA subdirectory — there is one snapshot per plan in HEAD,
-  and each new `trinity finish` overwrites it. History is preserved
+  and each new finalize commit overwrites it. History is preserved
   by git itself (the commit log of `.trinity/finished/<stem>/`).
 - The daemon's finished rule is event-log truth: walk commits in
   chronological order; the first commit whose tree contains the
@@ -99,51 +100,51 @@ The most recent commit in `commit_order` whose `CommitKind` is
 finish` at mutation time to decide which feedback directory to
 snapshot. NOT used by the daemon's finished-ness derivation.
 
-### Current gate participant (CLI policy)
+### Current gate participant
 
 Anyone who has written a feedback file under
 `.trinity/feedback/<plan-stem>/<target-sha>/` (note: post-simplification
-path; the legacy `commits/` segment is gone). Used by the live-gate
-view (current working-tree review status) and by `trinity finish`'s
-pre-commit invariant check. NOT used by the daemon's
-finished-ness derivation.
+path; the legacy `commits/` segment is gone). Used by the daemon's
+live-gate view (current working-tree review status for the latest
+reviewable commit). NOT used by the daemon's finished-ness
+derivation.
 
 ### Finalize snapshot
 
 A `.trinity/finished/<plan-stem>/` directory in HEAD's tree
-containing reviewer feedback files (one per approving reviewer,
-verdict + body copied by `trinity finish` from the working-tree
-feedback for the latest reviewable commit at finalize time). Flat
-— no per-SHA subdirectory. The presence of this directory is the
-only git-visible signal that a plan cycle was deliberately closed.
+containing reviewer feedback files — one per approving reviewer,
+verdict + body. Flat: no per-SHA subdirectory. The presence of
+this directory is the only git-visible signal that a plan cycle
+was deliberately closed. How the files got there is out of scope
+for this plan; the daemon trusts what's in HEAD.
 
 The snapshot does not replace the working-tree feedback files; both
 coexist. The working-tree files remain the live, async surface;
 the snapshot is the archival commitment at the close.
 
 There is one snapshot per plan in HEAD at any time. Each new
-finalize overwrites the prior contents. The history of past
-finalizes is preserved by git itself — `git log
-.trinity/finished/<stem>/` enumerates every finalize commit, and
-`git show <sha>:.trinity/finished/<stem>/` recovers any archived
-cycle's snapshot.
+finalize commit overwrites the prior contents. The history of
+past finalize commits is preserved by git itself — `git log
+.trinity/finished/<stem>/` enumerates every commit that touched
+the snapshot, and `git show <sha>:.trinity/finished/<stem>/`
+recovers any archived cycle's snapshot.
 
 ### Finalize commit
 
 A commit that creates or modifies `.trinity/finished/<plan-stem>/`.
-Made by `trinity finish`, under the operator's hand. The finalize
-commit is a normal commit: it shows up in the timeline, reviewers
-can still post feedback on it. But late feedback does *not*
-unfinish the cycle — the snapshot is authoritative once landed.
+The finalize commit is a normal commit: it shows up in the timeline,
+reviewers can still post feedback on it. But late feedback does
+*not* unfinish the cycle — the snapshot is authoritative once
+landed.
 
-Trust model: `trinity finish` runs the live-gate invariant check
-locally before making the commit, so an honest run never produces
-a forged snapshot. A semi-malicious or confused master that
-bypasses the CLI and writes fake APPROVE files into `finished/`
-directly is out of scope for the trust model. Late reviewers who
-notice the discrepancy can flag it via the normal feedback
-mechanism, but Trinity does not invalidate the snapshot
-automatically.
+Trust model: the daemon does not validate snapshot contents at
+read time beyond the file checks in §Finished plan. Any process
+with commit access can write a snapshot directly into git;
+ensuring those files reflect genuine reviewer approval is the
+job of whichever tool produces the finalize commit (see
+`trinity-cli` stub). Late reviewers who notice a discrepancy can
+flag it via the normal feedback mechanism, but Trinity does not
+auto-invalidate the snapshot.
 
 ### Finished plan
 
@@ -183,70 +184,66 @@ in `.trinity/finished/<stem>/`.
 If the plans file exists and the fold never reached a commit
 where the finalize rule held, the plan is `active`.
 
-**How to "un-finish" a plan**: you don't, easily. Once the fold
-has frozen a plan, the daemon treats it as sealed for the life of
-the branch. The escape hatches:
+**Daemon's perspective on transitioning a frozen plan**: there
+are exactly two git-state transitions that change a frozen plan's
+projection:
 
-- **Delete the plan file** (`git rm .trinity/plans/<stem>.md`).
-  The fold's plan-existence check at HEAD fails; the plan ceases
-  to exist (no `active`, no `finished`, no state). This is the
-  cleanest "this plan is over" signal — the dashboard stops
-  showing it.
-- **Give it a new name** (`foo-v2.md`) — fresh plan, fresh history,
-  fresh fold state. Original `foo` stays frozen as a historical
-  record.
-- **Rewrite history** to remove the finalize commit
-  (`trinity purge --drop-finalize` or interactive rebase). On a
-  fresh rebuild, the fold no longer sees the freeze event and
-  the plan is `active` again. Destructive — only do this on
-  branches you control.
+- **Delete the plan file from HEAD** — the fold's plan-existence
+  check at HEAD fails; the plan ceases to exist (no `active`, no
+  `finished`, no state; absent from `list_plans`). The dashboard
+  stops showing it.
+- **Remove the finalize commit from reachable history** (via any
+  history rewrite — `git reset`, `git rebase -i`, a CLI rewriter,
+  etc.). On a fresh rebuild, the fold no longer sees the freeze
+  event and the plan is `active` again.
 
-`git revert` of the finalize commit does NOT un-finish the
-plan: the revert is a new commit that removes the finished
-directory from the tree, but the original freeze event is still
-in history at the original commit. The fold replays from the
-beginning of history and freezes at the original finalize.
+`git revert` of the finalize commit does NOT un-finish the plan.
+The revert is a new commit that removes the snapshot directory
+from the tree, but the original freeze event is still in history
+at the original commit. The fold replays from the beginning of
+history and freezes at the original finalize. Trinity does not
+parse commit messages or otherwise treat reverts specially — a
+revert is just another commit whose patch undoes earlier tree
+content.
+
+Equivalently, starting a fresh plan with a different name (a new
+`<stem>.md` file) sidesteps the question entirely: a new fold
+state, no finalized predecessor to inherit. The original frozen
+plan stays as a historical record.
 
 **Snapshot content read after freeze.** The fold remembers
 `frozen_at: CommitSha` per frozen plan. When the SPA or any UI
 needs to render the finalize snapshot's contents (which reviewers
 approved? what did they write?), it reads from
 `git show <frozen_at>:.trinity/finished/<stem>/`, not from HEAD's
-working tree. This makes the rendered snapshot stable against
-post-freeze tree edits — if an operator deletes or modifies the
-snapshot files in a later commit, the daemon still shows the
-plan as `finished` (per the rule), and the UI still shows the
-original APPROVE files. HEAD's `.trinity/finished/<stem>/`
-contents are not authoritative for display once the plan is
-frozen; the freeze-time content is.
+tree. This makes the rendered snapshot stable against post-freeze
+tree edits — if a later commit deletes or modifies the snapshot
+files, the daemon still shows the plan as `finished` (per the
+rule), and the UI still shows the original APPROVE files. HEAD's
+`.trinity/finished/<stem>/` contents are not authoritative for
+display once the plan is frozen; the freeze-time content is.
 
-**Re-finalize on a frozen plan.** `trinity finish` on a plan
-the daemon reports as `finished` MUST refuse with a clear
-message ("plan already finished; no re-finalize possible"). The
-CLI checks the daemon's projection state before doing any work.
-This is a daemon/CLI contract, captured in the trinity-cli stub
-and reflected in this plan's acceptance criteria for completeness
-(see criterion 17). A phantom finalize commit landing despite
-this — e.g., direct user `git` invocation — would be a tree
-change the fold ignores (plan already frozen at the prior
-finalize commit); no new gate, no state change, no projection
-update.
-
-**Post-freeze commits with `Implements: <frozen-plan>` trailers.**
-The fold attributes these as `CommitKind::Unattributed` — exactly
-what it does for any commit whose `Implements:` trailer points
-at an unknown plan. The commit is visible in the repo's overall
-commit history but does NOT appear in the frozen plan's timeline,
-gate, or attribution map. Same outcome the user would see today
-for a commit pointing at a nonexistent plan stem.
+**Post-freeze tree changes that look like new finalizes.** A
+later commit that touches `.trinity/finished/<stem>/` (adds,
+modifies, or removes files) does not trigger anything. The fold
+ignores frozen plans for the rest of the walk; no new freeze
+event, no projection update. The same applies to any other
+post-freeze tree change attributable to the plan (`Implements:`
+trailer, plan-file edit, working-tree feedback). All such
+commits land as `CommitKind::Unattributed` from the projection's
+perspective — identical to today's behaviour for commits whose
+attribution trailer points at an unknown plan. They're visible
+in the repo's overall commit history but don't appear in the
+frozen plan's timeline, gate, or attribution.
 
 Per-plan scope: every check is keyed on `<stem>`. A finalize for
 `foo` says nothing about `bar`.
 
 All sophisticated validation — the live working-tree gate is
 genuinely approved, the snapshot authors are real reviewers, the
-working tree is clean — lives in `trinity finish` at mutation
-time. The daemon does none of it at read time.
+working tree is clean — is whoever-produces-the-finalize-commit's
+problem (see `trinity-cli` stub). The daemon does none of it at
+read time.
 
 ### Archived cycle
 
@@ -402,10 +399,13 @@ master.
 **New core module**:
 - `src/finalize.rs` (or similar) — parser for
   `.trinity/finished/<stem>/<agent>.md` paths (flat, no SHA
-  segment) and the `is_finished(&Plan)` check (plan file present
-  + at least one well-formed APPROVE in the snapshot dir). No
-  commit-ordering logic; finished-ness is a pure read of HEAD's
-  tree.
+  segment) and the `finalize_rule_now_satisfied(tree, plan)`
+  helper the Phase 2 fold uses on each commit. The fold sets
+  per-plan `frozen_at: Option<CommitSha>` when the rule first
+  holds in chronological order; `is_finished(&Plan) -> bool` is
+  just `plan.frozen_at.is_some()`. No HEAD-tree-only check —
+  finished-ness is determined by the fold's history walk, not by
+  re-inspecting HEAD's tree at read time.
 
 **Frontend**:
 - `frontend/src/api.rs:281-299` — `post_move_to_done` +
@@ -587,11 +587,15 @@ Acceptance:
     `snapshot.feedback_files` for non-frozen plans only; frozen
     plans skip feedback application)
   - finalize commit revert (c1 plan, c2 finalize, c3 reverts c2
-    removing the finalize dir) → active (the fold sees the
-    finalize dir present at c2 and frozen, then at c3 the dir is
-    gone; this is the one case where a frozen plan can re-open,
-    and only via tree state, not via mutation requests — see
-    §Finished plan for the operator workflow)
+    removing the finalize dir) → **STILL finished**. The revert
+    is just another commit whose patch undoes earlier tree
+    content; the fold sees the freeze event at c2 and never
+    un-freezes. Trinity does not parse commit messages or
+    otherwise treat reverts specially. The only way to make the
+    plan `active` again is to remove the finalize commit from
+    reachable history (any history rewrite — `git reset`,
+    `git rebase -i`, etc.) so a fresh rebuild's fold never sees
+    the freeze event.
 
 Risk:
 
@@ -710,8 +714,9 @@ Approach:
   `RepoState.plan_conflicts`) with a message: "this file is a
   leftover from the pre-approval-derived-completion workflow. Move
   it back to `.trinity/plans/<stem>.md` if you want it tracked,
-  delete it if it's purely historical, or run `trinity finish` on
-  the active equivalent if you want a proper finalize snapshot."
+  delete it if it's purely historical, or commit a finalize
+  snapshot at `.trinity/finished/<stem>/` for the active
+  equivalent."
 - The UI surfaces this in the conflicts section it already renders.
 
 ### Git history with `done_move` renames
@@ -779,71 +784,24 @@ finished and not being iterated on), this is a separate concept
 
 ### T2 — `PlanWorktreeStatus::MissingActivePlanFile` semantics shift
 
-Today this status fires when the plan file is gone AND the done
-counterpart is also gone. With `done/` gone, it just means "plan
-file deleted from worktree." This is still a meaningful state —
-something's wrong, master should know — but the
-`RestoreOrCommitDoneMove` action loses its second leg.
+Today this status fires when the plan file is gone from the
+worktree AND the done counterpart is also gone. With `done/` gone,
+it just means "plan file deleted from worktree but still in HEAD."
+This is still a meaningful state — operator made an uncommitted
+deletion — but the `RestoreOrCommitDoneMove` action loses its
+second leg.
 
 Resolution: rename `MissingActivePlanFile` → `PlanFileMissing`,
 keep the watcher state, swap the action to a generic "restore the
-plan file from HEAD or revert your local change."
+plan file from HEAD or commit the deletion."
 
-After `--purge` (which deletes the plan file), this status will
-fire if the daemon is still watching the plan as active. The
-daemon should detect "this plan's last commit was a finalize that
-removed the plan file" and treat that as `finished` rather than
-`PlanFileMissing`. Open question: does the daemon need a separate
-"`finished-and-purged`" recognition, or is this handled by the
-existing finished detection (presence of
-`.trinity/finished/<stem>/`)?
+If the plan file is deleted from HEAD outright (committed
+deletion, not a worktree-only edit), the plan ceases to exist
+per the Finished plan section — absent from `list_plans`, no
+state. The `PlanFileMissing` worktree status doesn't fire because
+the plan isn't being tracked anymore.
 
-### T3 — Finalize commit forgery
-
-`trinity finish` validates the live gate locally before making the
-finalize commit, so an honest run never produces a forged
-snapshot. But the snapshot itself is just files in a git tree:
-master can write fake APPROVE files directly into
-`.trinity/finished/<stem>/` and commit them, bypassing the CLI's
-checks.
-
-Trinity is not trying to be tamper-proof; the goal is to make
-unilateral resolution require explicit, visible action instead of
-a silent `git mv`. A forged finalize commit is visible in the
-timeline; reviewers can spot it on their next wake. If you have a
-master agent maliciously forging finalize commits, you have a
-bigger problem than this plan can solve in code.
-
-Worth naming in the docs so users understand the threat model.
-
-### T4 — `--purge` history rewriting changes SHAs
-
-`trinity finish --purge` rewrites commit history to strip
-`.trinity/` content from mixed commits. This changes the SHAs of
-every rewritten commit. Anyone who has the pre-rewrite branch
-checked out, has open PRs against those commits, or has built CI
-artifacts referencing those SHAs will see breakage.
-
-This is intentional — `--purge` is a deliberate operation. The
-CLI should warn loudly before doing the rewrite, and refuse on
-protected branches without explicit opt-in.
-
-### T5 — `--squash` with interleaved foreign commits
-
-`--squash` refuses when foreign commits are interleaved between
-the plan's earliest commit and HEAD. The "interleaved" check is
-strict: any non-plan-attributed commit in the range is foreign.
-
-Operators may find this restrictive. The escape hatch is to
-rebase the plan's commits to be contiguous before squashing, or
-to just `git reset --soft` + `git commit` manually.
-
-Open question: should `--squash` have a `--allow-foreign-commits`
-mode that places foreign commits before or after the squashed
-result? The plan tentatively says no — keep it strict, push the
-user to use plain git for messy cases.
-
-### T6 — Wire compatibility window
+### T3 — Wire compatibility window
 
 The cutover removes `state: "done"`, `phase: "done"`, the
 `api_move_to_done` endpoint, and a frontend button. Any external
@@ -853,22 +811,10 @@ it doesn't share types) sees the breaking change at once.
 Trinity is single-tenant and the SPA is co-versioned. The MCP shim
 already shares types with the daemon. Acceptable risk.
 
-### T7 — `--purge` keeps finalize snapshot but loses plan body
-
-Per case 7 in the `--purge` test list, plain `--purge` strips the
-plan file and the working-tree feedback but keeps the finalize
-snapshot. A cloner sees `.trinity/finished/<stem>/<agent>.md` with
-APPROVE verdicts but no `.trinity/plans/<stem>.md` to know what
-the plan was about.
-
-For most use cases this is fine — the finalize commit's message
-typically references the plan stem, and the archived feedback
-files mention the work done. For users who want richer
-provenance, `--squash` (without `--purge`) preserves the plan
-body in the squashed commit's message via the original plan-file
-contents.
-
-Mention in docs; don't restrict.
+CLI-side tensions (forgery, history-rewrite SHA churn, squash
+with foreign commits, plan-body retention after purge) live in
+`.trinity/stubs/trinity-cli.md`. They don't affect daemon
+behaviour.
 
 ## Acceptance Criteria
 
