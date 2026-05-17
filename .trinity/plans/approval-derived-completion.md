@@ -142,20 +142,31 @@ automatically.
 
 ### Finished cycle
 
-A cycle is **finished** iff:
+A plan is **finished** iff:
 
 - `.trinity/finished/<plan-stem>/` exists in HEAD's tree, and
 - the directory contains at least one file with verdict APPROVE,
   and
-- the most recent commit that touched `.trinity/finished/<plan-stem>/`
-  is at or after the latest impl-bearing commit for this plan in
-  `commit_order`.
+- there are no plan-attributed commits (`PlanOnly`, `CodeOnly`, or
+  `Mixed` for this plan) in `commit_order` after the latest
+  finalize commit. The finalize commit itself is not
+  plan-attributed (it only touches `.trinity/finished/`).
 
 That's the entire rule. No checks against the live working-tree
 gate. No participant-count check. No post-finalize feedback
-override. A reopened cycle (new impl after the latest finalize)
-makes the snapshot stale and the cycle is `active` again until a
-new finalize lands.
+override.
+
+Two ways the plan reopens to `active`:
+
+- **New impl after finalize**: a `CodeOnly` or `Mixed`
+  plan-attributed commit lands after the latest finalize. The
+  cycle is back open and needs a new finalize for the new impl.
+- **New plan revision after finalize**: a `PlanOnly` or `Mixed`
+  plan-attributed commit lands after the latest finalize. The
+  previous cycle is archived; a new cycle has begun with this
+  plan-touching commit as its opener. The plan is `active` and
+  awaiting either implementation (if the new commit is plan-only)
+  or review (if it's mixed).
 
 Plan-only commits never finish a cycle. A plan-only-approved cycle
 is `ready_to_start_implementation`, not finished.
@@ -929,6 +940,15 @@ Mention in docs; don't restrict.
    unambiguously to the active one; a `state: finished` plan is
    visible in `list_plans` but never picked up as the inferred
    default.
+9a. **Reopen via plan-only revision** (regression test): a plan
+    that has been finalized and then receives a `PlanOnly` or
+    `Mixed` commit transitions back to `state: active`. The
+    previous cycle moves to the archived list. The plan is
+    eligible for omitted-`plan_id` inference again. A snapshot
+    in `.trinity/finished/<stem>/` from the prior cycle remains
+    on disk but does not keep the plan `finished` once any
+    plan-attributed commit (impl or plan-only) lands after the
+    finalize.
 
 ### Feedback path
 
