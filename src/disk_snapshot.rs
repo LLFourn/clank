@@ -240,9 +240,15 @@ pub fn derive_state(repo_root: PathBuf, snapshot: DiskSnapshot) -> RepoState {
             }
             let files = finalize_tree.get(plan_key);
             if finalize_rule_satisfied(files) {
+                let approver_count = files.map(|m| m.len()).unwrap_or(0) as u32;
                 if let Some(plan) = state.plans.get_mut(plan_key) {
                     plan.frozen_at = Some(commit_sha.clone());
                     plan.freeze_events.push(commit_sha.clone());
+                    plan.archived_cycles
+                        .push(crate::repo_state::ArchivedCycleSummary {
+                            closer: commit_sha.clone(),
+                            approver_count,
+                        });
                 }
             }
         }
@@ -305,6 +311,7 @@ fn init_plans_from_head(state: &mut RepoState, plan_files: Vec<PlanFileBlob>) {
                 commits: BTreeMap::new(),
                 frozen_at: None,
                 freeze_events: Vec::new(),
+                archived_cycles: Vec::new(),
             },
         );
     }

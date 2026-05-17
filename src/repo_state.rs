@@ -348,6 +348,13 @@ pub struct Plan {
     /// reopening a frozen plan via history rewrite mid-fold — which
     /// today never happens, so the list has length 0 or 1.
     pub freeze_events: Vec<CommitSha>,
+    /// Per-cycle summaries derived from the fold's freeze events (one
+    /// entry per freeze). Today the monotone rule means this has
+    /// length 0 or 1. Surfaced in the plan-detail wire as
+    /// `archived_cycles`; non-freeze touches of the snapshot path
+    /// (deletions, phantom re-finalizes, hand edits) are intentionally
+    /// excluded — see plan §Archived cycle.
+    pub archived_cycles: Vec<ArchivedCycleSummary>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -371,6 +378,47 @@ impl PlanState {
             PlanState::Active
         }
     }
+}
+
+/// Plan lifecycle as projected from the event-log fold. Replaces the
+/// legacy `PlanState` (which mirrors the `done/` directory move) at
+/// the wire boundary in Phase 4. Derived from `Plan.frozen_at` —
+/// never stored.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlanLifecycle {
+    Active,
+    Finished,
+}
+
+impl PlanLifecycle {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            PlanLifecycle::Active => "active",
+            PlanLifecycle::Finished => "finished",
+        }
+    }
+
+    pub fn from_plan(plan: &Plan) -> Self {
+        if plan.frozen_at.is_some() {
+            PlanLifecycle::Finished
+        } else {
+            PlanLifecycle::Active
+        }
+    }
+}
+
+/// Per-cycle summary surfaced in the plan-detail UI's cycle-history
+/// view. Sourced from the fold's `freeze_events` side-output; the
+/// last entry of `freeze_events` is the current cycle, earlier
+/// entries are archived. Today the rule is monotone so the list has
+/// length 0 or 1; the shape scales to richer histories.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArchivedCycleSummary {
+    /// The commit at which the cycle was closed (the freeze event).
+    pub closer: CommitSha,
+    /// Number of approving-reviewer files in
+    /// `.trinity/finished/<stem>/` at that freeze commit's tree.
+    pub approver_count: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

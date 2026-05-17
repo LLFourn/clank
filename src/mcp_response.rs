@@ -131,15 +131,28 @@ fn plan_summary(
 ) -> Value {
     let plan_id = crate::lifecycle::RepoBasename::from_repo_root(repo_root)
         .map(|b| crate::lifecycle::PlanId::new(b, plan.id.clone()).to_string());
+    let lifecycle = crate::repo_state::PlanLifecycle::from_plan(plan);
+    let archived_cycles: Vec<Value> = plan
+        .archived_cycles
+        .iter()
+        .map(|c| {
+            json!({
+                "closer": c.closer.as_str(),
+                "approver_count": c.approver_count,
+            })
+        })
+        .collect();
     json!({
         "repo": repo_root.to_string_lossy(),
         "plan_id": plan_id,
         "slug": plan.id.as_str(),
         "state": plan.state.as_str(),
+        "lifecycle": lifecycle.as_str(),
         "current_path": plan.plan_path.to_string_lossy(),
         "phase": plan_phase.as_str(),
         "plan_worktree_status": worktree_status.as_str(),
         "waiting_on": waiting_on_value(w),
+        "archived_cycles": archived_cycles,
     })
 }
 
@@ -263,11 +276,24 @@ pub fn get_context_response_from_snapshot(
     )
     .map(|s| s.as_str().to_string());
 
+    let lifecycle = crate::repo_state::PlanLifecycle::from_plan(session);
+    let archived_cycles: Vec<Value> = session
+        .archived_cycles
+        .iter()
+        .map(|c| {
+            json!({
+                "closer": c.closer.as_str(),
+                "approver_count": c.approver_count,
+            })
+        })
+        .collect();
+
     json!({
         "repo": state.root.to_string_lossy(),
         "plan_id": plan_id,
         "slug": session.id.as_str(),
         "state": session.state.as_str(),
+        "lifecycle": lifecycle.as_str(),
         "current_path": session.plan_path.to_string_lossy(),
         "phase": session_phase.as_str(),
         "plan_worktree_status": worktree_status.as_str(),
@@ -287,6 +313,7 @@ pub fn get_context_response_from_snapshot(
         "latest_relevant_commit": latest_relevant_commit,
         "timeline": timeline,
         "pr_hint": pr_hint,
+        "archived_cycles": archived_cycles,
     })
 }
 
@@ -823,5 +850,37 @@ mod tests {
         release_tx.send(()).unwrap();
         let v = handle.await.unwrap();
         assert_eq!(v["plan_worktree_status"], "clean");
+    }
+
+    #[tokio::test]
+    async fn list_plans_lifecycle_active_for_unfrozen_plan() {
+        let dir = init_repo();
+        write_file(dir.path(), ".trinity/plans/foo.md", "# foo\n");
+        commit(dir.path(), "Add foo");
+        let state = rebuild_repo(dir.path()).await.unwrap();
+        let v = list_plans_response(&state).unwrap();
+        let plans = v["plans"].as_array().unwrap();
+        assert_eq!(plans[0]["lifecycle"], "active");
+        assert_eq!(plans[0]["archived_cycles"].as_array().unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn list_plans_lifecycle_finished_after_finalize_commit() {
+        let dir = init_repo();
+        write_file(dir.path(), ".trinity/plans/foo.md", "# foo\n");
+        commit(dir.path(), "Add foo");
+        write_file(
+            dir.path(),
+            ".trinity/finished/foo/alice.md",
+            "APPROVE\n\nlgtm\n",
+        );
+        commit(dir.path(), "Finalize foo");
+        let state = rebuild_repo(dir.path()).await.unwrap();
+        let v = list_plans_response(&state).unwrap();
+        let plans = v["plans"].as_array().unwrap();
+        assert_eq!(plans[0]["lifecycle"], "finished");
+        let archived = plans[0]["archived_cycles"].as_array().unwrap();
+        assert_eq!(archived.len(), 1);
+        assert_eq!(archived[0]["approver_count"], 1);
     }
 }

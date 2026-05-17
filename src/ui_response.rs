@@ -109,6 +109,7 @@ fn plans_index_parts(
             &snapshot.attribution,
             &snapshot.commit_meta,
         );
+        let lifecycle = crate::repo_state::PlanLifecycle::from_plan(plan);
         plans.push((
             last_activity_ts,
             json!({
@@ -116,6 +117,7 @@ fn plans_index_parts(
                 "plan_id": plan_id,
                 "slug": plan.id.as_str(),
                 "state": plan.state.as_str(),
+                "lifecycle": lifecycle.as_str(),
                 "current_path": plan.plan_path.to_string_lossy(),
                 "phase": plan_phase.as_str(),
                 "worktree_status": worktree_status.as_str(),
@@ -263,11 +265,23 @@ pub fn plan_page_with_reader(
     )
     .map(|s| s.as_str().to_string());
 
+    let lifecycle = crate::repo_state::PlanLifecycle::from_plan(plan);
+    let archived_cycles: Vec<Value> = plan
+        .archived_cycles
+        .iter()
+        .map(|c| {
+            json!({
+                "closer": c.closer.as_str(),
+                "approver_count": c.approver_count,
+            })
+        })
+        .collect();
     Ok(json!({
         "repo": bundle.root.to_string_lossy(),
         "plan_id": plan_id,
         "slug": plan.id.as_str(),
         "state": plan.state.as_str(),
+        "lifecycle": lifecycle.as_str(),
         "current_path": plan.plan_path.to_string_lossy(),
         "phase": plan_phase.as_str(),
         "plan_worktree_status": worktree_status.as_str(),
@@ -285,6 +299,7 @@ pub fn plan_page_with_reader(
         "plan_body_truncated": plan_body_truncated,
         "timeline": timeline,
         "pr_hint": pr_hint,
+        "archived_cycles": archived_cycles,
     }))
 }
 
@@ -659,6 +674,7 @@ mod tests {
             commits: BTreeMap::new(),
             frozen_at: None,
             freeze_events: Vec::new(),
+            archived_cycles: Vec::new(),
         };
         let v = pr_hint_value(&session, &[]);
         assert_eq!(v["plan_intro_parent"], "ca11");
