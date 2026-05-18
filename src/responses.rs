@@ -3,15 +3,10 @@
 //! Every HTTP route and every MCP tool that returns a response
 //! shape comes through here. The wire crate (`trinity_core::api`)
 //! owns the type definitions; this module owns the per-endpoint
-//! field selection.
-//!
-//! After `wasm-markdown-rendering.md` Phase 2, `Feedback` and
-//! `CommitGate` projections collapse to identity — the wasm
-//! frontend renders markdown at display time, so the wire ships
-//! raw markdown. The `render_markdown` helper survives until
-//! Phase 4 only because `plan_body_html`,
-//! `PlanRevisionResponse.body_html`, and `FinalizeApproval.body_html`
-//! still cross the wire (Phase 3 drops them too).
+//! field selection. After `wasm-markdown-rendering.md`, that
+//! selection is essentially identity — the wire ships raw
+//! markdown and the wasm frontend renders at display time, so
+//! `Feedback` and `CommitGate` projections are clones.
 //!
 //! Disk reads go through the [`PlanStatusReader`] trait so tests
 //! can drop in a fake.
@@ -739,32 +734,6 @@ fn build_review_gate(
             .map(|a| a.as_str().to_string())
             .collect(),
     })
-}
-
-// ============================================================
-// Markdown rendering (server-side — Phase 3 + 4 retire it)
-// ============================================================
-//
-// Feedback bodies render in the wasm frontend as of Phase 2; the
-// helpers below survive only because `plan_body_html`,
-// `PlanRevisionResponse.body_html`, and `FinalizeApproval.body_html`
-// still cross the wire. Phase 3 drops those fields; Phase 4 deletes
-// `render_markdown` along with the `pulldown-cmark` / `ammonia` deps.
-
-pub fn render_markdown(input: &str) -> String {
-    use pulldown_cmark::{Options, Parser, html};
-    let mut opts = Options::empty();
-    opts.insert(Options::ENABLE_TABLES);
-    opts.insert(Options::ENABLE_STRIKETHROUGH);
-    opts.insert(Options::ENABLE_TASKLISTS);
-    opts.insert(Options::ENABLE_FOOTNOTES);
-    let parser = Parser::new_ext(input, opts);
-    let mut raw = String::new();
-    html::push_html(&mut raw, parser);
-    ammonia::Builder::default()
-        .add_generic_attributes(["class"])
-        .clean(&raw)
-        .to_string()
 }
 
 /// Look up feedback entries (rich form) targeting `sha`. Reads from
