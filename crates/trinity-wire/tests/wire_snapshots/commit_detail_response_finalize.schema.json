@@ -1,0 +1,19 @@
+{
+  "commit_sha": "string",
+  "diff_files": [
+    "<empty>"
+  ],
+  "kind": "string",
+  "message_body": "string",
+  "plan_id": "string",
+  "repo": "string",
+  "slug": "string",
+  "snapshot": [
+    {
+      "author": "string",
+      "body_html": "string",
+      "filename": "string"
+    }
+  ],
+  "subject": "string"
+}

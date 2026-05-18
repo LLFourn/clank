@@ -1,0 +1,11 @@
+{
+  "commit_kind": "string",
+  "locations": [
+    "string"
+  ],
+  "plan_id": "string",
+  "prompt_hint": "string",
+  "repo": "string",
+  "target_sha": "string",
+  "work": "string"
+}

@@ -1,0 +1,8 @@
+{
+  "kind": "string",
+  "lifecycle": "string",
+  "path": "string",
+  "plan_id": "string",
+  "scope": "string",
+  "ts": "integer"
+}

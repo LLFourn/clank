@@ -1,0 +1,6 @@
+{
+  "kind": "string",
+  "plan_count": "integer",
+  "scope": "string",
+  "ts": "integer"
+}

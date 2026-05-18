@@ -1,0 +1,37 @@
+{
+  "conflicts": [
+    {
+      "paths": [
+        "string"
+      ],
+      "plan_id": "string",
+      "slug": "string"
+    }
+  ],
+  "plans": [
+    {
+      "archived_cycles": [
+        {
+          "approver_count": "integer",
+          "closer": "string"
+        }
+      ],
+      "current_path": "string",
+      "last_activity_ts": "integer",
+      "lifecycle": "string",
+      "phase": "string",
+      "plan_id": "string",
+      "plan_worktree_status": "string",
+      "repo": "string",
+      "slug": "string",
+      "waiting_on": {
+        "agents": [
+          "string"
+        ],
+        "description": "string",
+        "reason": "string",
+        "role": "string"
+      }
+    }
+  ]
+}

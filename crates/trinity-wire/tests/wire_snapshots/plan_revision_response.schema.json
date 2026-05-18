@@ -1,0 +1,22 @@
+{
+  "body_html": "string",
+  "body_raw": "string",
+  "commit_sha": "string",
+  "feedback": [
+    {
+      "author": "string",
+      "body_html": "string",
+      "body_raw": "string",
+      "created_at": "integer",
+      "path": "string",
+      "verdict": "string"
+    }
+  ],
+  "next_sha": "string",
+  "plan_id": "string",
+  "plan_intro": "string",
+  "plan_intro_parent": "string",
+  "previous_sha": "null",
+  "repo": "string",
+  "slug": "string"
+}

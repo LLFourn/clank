@@ -1,0 +1,6 @@
+{
+  "basename": "string",
+  "ok": "bool",
+  "plan_count": "integer",
+  "registry_write_error": "null"
+}

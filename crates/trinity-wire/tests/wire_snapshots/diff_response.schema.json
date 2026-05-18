@@ -1,0 +1,30 @@
+{
+  "diff_files": [
+    {
+      "additions": "integer",
+      "always_folded": "bool",
+      "binary": "bool",
+      "deletions": "integer",
+      "hunks": [
+        {
+          "header": "string",
+          "lines": [
+            {
+              "content": "string",
+              "kind": "string",
+              "new_lineno": "integer",
+              "old_lineno": "integer"
+            }
+          ]
+        }
+      ],
+      "mode": "string",
+      "old_path": "string",
+      "path": "string"
+    }
+  ],
+  "from": "string",
+  "from_path": "string",
+  "to": "string",
+  "to_path": "string"
+}

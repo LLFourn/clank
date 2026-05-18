@@ -1,0 +1,10 @@
+{
+  "repos": [
+    {
+      "basename": "string",
+      "last_activity_ts": "integer",
+      "plan_count": "integer",
+      "root": "string"
+    }
+  ]
+}

@@ -1,0 +1,43 @@
+{
+  "commit_sha": "string",
+  "diff_files": [
+    {
+      "additions": "integer",
+      "always_folded": "bool",
+      "binary": "bool",
+      "deletions": "integer",
+      "hunks": [
+        {
+          "header": "string",
+          "lines": [
+            {
+              "content": "string",
+              "kind": "string",
+              "new_lineno": "integer",
+              "old_lineno": "integer"
+            }
+          ]
+        }
+      ],
+      "mode": "string",
+      "old_path": "string",
+      "path": "string"
+    }
+  ],
+  "feedback": [
+    {
+      "author": "string",
+      "body_html": "string",
+      "body_raw": "string",
+      "created_at": "integer",
+      "path": "string",
+      "verdict": "string"
+    }
+  ],
+  "kind": "string",
+  "message_body": "string",
+  "plan_id": "string",
+  "repo": "string",
+  "slug": "string",
+  "subject": "string"
+}

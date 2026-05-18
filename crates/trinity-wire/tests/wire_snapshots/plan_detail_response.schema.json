@@ -1,0 +1,126 @@
+{
+  "archived_cycles": [
+    {
+      "approver_count": "integer",
+      "closer": "string"
+    }
+  ],
+  "commits": [
+    {
+      "feedback": [
+        {
+          "author": "string",
+          "body_html": "string",
+          "body_raw": "string",
+          "created_at": "integer",
+          "path": "string",
+          "verdict": "string"
+        }
+      ],
+      "gate": {
+        "ambiguous": [
+          "<empty>"
+        ],
+        "approvers": [
+          "string"
+        ],
+        "feedback": {
+          "alice": {
+            "author": "string",
+            "body_html": "string",
+            "body_raw": "string",
+            "created_at": "integer",
+            "path": "string",
+            "verdict": "string"
+          }
+        },
+        "missing": [
+          "<empty>"
+        ],
+        "participants": [
+          "string"
+        ],
+        "requesters": [
+          "<empty>"
+        ],
+        "state": "string"
+      },
+      "kind": "string",
+      "sha": "string"
+    }
+  ],
+  "current_path": "string",
+  "expected_action": "string",
+  "implementation_commits": [
+    "<empty>"
+  ],
+  "latest_implementation_revision": "null",
+  "latest_plan_revision": {
+    "commit_sha": "string"
+  },
+  "latest_relevant_commit": "string",
+  "lifecycle": "string",
+  "phase": "string",
+  "plan_body_html": "string",
+  "plan_body_truncated": "bool",
+  "plan_id": "string",
+  "plan_revisions": [
+    "string"
+  ],
+  "plan_worktree_status": "string",
+  "pr_hint": {
+    "implementation_commits": [
+      "string"
+    ],
+    "options": [
+      {
+        "base": "string",
+        "command": "string",
+        "name": "string"
+      }
+    ],
+    "plan_intro": "string",
+    "plan_intro_parent": "string",
+    "suggested_message": "string"
+  },
+  "repo": "string",
+  "review_gate": {
+    "approvals": [
+      "string"
+    ],
+    "missing_approvals": [
+      "<empty>"
+    ],
+    "participants": [
+      "string"
+    ],
+    "phase": "string",
+    "request_changes": [
+      "<empty>"
+    ],
+    "state": "string"
+  },
+  "review_target": {
+    "commit_sha": "string",
+    "phase": "string"
+  },
+  "slug": "string",
+  "timeline": [
+    {
+      "author": "string",
+      "created_at": "integer",
+      "kind": "string",
+      "phase": "string",
+      "target": "string",
+      "verdict": "string"
+    }
+  ],
+  "waiting_on": {
+    "agents": [
+      "string"
+    ],
+    "description": "string",
+    "reason": "string",
+    "role": "string"
+  }
+}
