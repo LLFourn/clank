@@ -127,9 +127,10 @@ fn assert_allowlist(observed: BTreeMap<String, usize>, expected: &[(&str, usize)
     let mut report = String::new();
     report.push_str(&format!(
         "\n=== {guard}: allowlist mismatch ===\n\
-         Update the allowlist in tests/wire_contract_guards.rs AND \
-         the audit at .trinity/stubs/purge-stringly-typed-audit.md\n\
-         when you intentionally change these counts.\n\n"
+         Update the per-file allowlist in tests/wire_contract_guards.rs\n\
+         when you intentionally change these counts. The trailing\n\
+         comment on each row names the phase that drains it; delete\n\
+         the row once it hits zero.\n\n"
     ));
     for (file, observed_count) in &observed {
         match expected_map.get(file) {
@@ -205,23 +206,9 @@ fn guard_a_dynamic_json_sites_match_allowlist() {
 /// the field's type changes from `String` to the corresponding
 /// enum (Phase 6), the count drops.
 const GUARD_B_ALLOWLIST: &[(&str, usize)] = &[
-    // Frontend DTOs: 11 `pub <vocab>: String` fields the scanner
-    // catches across PlanRow / ReviewGate / CommitFeedback /
-    // CommitRow / PlanDetail / CommitDiffPage / WaitingOn. Drain
-    // in Phase 6 once the daemon emits the trinity-wire DTOs and
-    // the frontend imports them.
-    ("frontend/src/api.rs", 11),
     // SSE event kind: String — two repo/plan event payloads.
     // Drain in Phase 7 (typed SSE events).
     ("frontend/src/store.rs", 2),
-    // `page.kind == "finalize"` equality on the commit-detail
-    // page and inline expansion. Drains in Phase 6 once the wire
-    // crate's tagged CommitDetail enum lands.
-    ("frontend/src/components/commit_diff.rs", 1),
-    ("frontend/src/components/expanded_commit.rs", 1),
-    // `match line.kind.as_str() { "addition" => ... }` —
-    // diff-line kind. Closed vocab; drain in Phase 6.
-    ("frontend/src/components/structured_diff.rs", 1),
     // `match req.tool.as_str() { "list_plans" => ... }` — tool
     // name dispatch. Protocol identifier, not domain state.
     // Phase 4 decides whether to introduce a typed ToolName enum

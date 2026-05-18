@@ -1,7 +1,7 @@
 use leptos::prelude::*;
 use leptos_router::hooks::use_params_map;
 
-use crate::api::{CommitEntry, CommitFeedback, PlanDetail, fetch_plan};
+use crate::api::{CommitFeedback, CommitRowDetail, PlanDetail, fetch_plan};
 use crate::components::feedback_card::FeedbackCard;
 use crate::components::meta_strip::MetaStrip;
 use crate::components::plan_preview::PlanPreview;
@@ -43,7 +43,7 @@ pub fn SessionDetail() -> impl IntoView {
 }
 
 fn detail_view(detail: PlanDetail) -> impl IntoView {
-    let plan_id = detail.plan_id.clone();
+    let plan_id = detail.plan_id.clone().unwrap_or_default();
     let plan_id_for_timeline = plan_id.clone();
     let waiting_on = detail.waiting_on.clone();
     let commits = detail.commits.clone();
@@ -51,12 +51,12 @@ fn detail_view(detail: PlanDetail) -> impl IntoView {
     let timeline_events = detail.timeline.clone();
     let pr_hint = detail.pr_hint.clone();
     let state_class = format!("state-chip state-{}", detail.state);
-    let state_label = detail.state.clone();
+    let state_label = detail.state.to_string();
     let plan_body_html = detail.plan_body_html.clone();
     let plan_body_truncated = detail.plan_body_truncated;
     let revision_link = match &detail.latest_plan_revision {
-        Some(rev) => format!("/plan/{}/revision/{}", detail.plan_id, rev.commit_sha),
-        None => format!("/plan/{}", detail.plan_id),
+        Some(rev) => format!("/plan/{}/revision/{}", plan_id, rev.commit_sha),
+        None => format!("/plan/{}", plan_id),
     };
     let latest_review = latest_review_for_target(&commits, latest_target_sha.as_deref());
 
@@ -102,7 +102,7 @@ fn detail_view(detail: PlanDetail) -> impl IntoView {
 /// surface stale reviews against an earlier target when the current
 /// one has none.
 fn latest_review_for_target(
-    commits: &[CommitEntry],
+    commits: &[CommitRowDetail],
     target: Option<&str>,
 ) -> Option<(CommitFeedback, String)> {
     let target = target?;
@@ -139,7 +139,7 @@ fn latest_review_section(latest: Option<(CommitFeedback, String)>) -> AnyView {
 /// at — no plan-vs-impl split. Empty commits (no feedback yet) are
 /// rendered with a muted "no reviews yet" line so the section
 /// communicates the gate's missing-reviewer state.
-fn commit_feedback_section(commits: Vec<CommitEntry>) -> AnyView {
+fn commit_feedback_section(commits: Vec<CommitRowDetail>) -> AnyView {
     if commits.is_empty() {
         return view! {
             <section class="session-section">
@@ -156,7 +156,7 @@ fn commit_feedback_section(commits: Vec<CommitEntry>) -> AnyView {
                 {commits
                     .into_iter()
                     .map(|c| {
-                        let kind = c.kind.clone();
+                        let kind = c.kind;
                         let kind_class = format!("commit-kind-chip commit-kind-{kind}");
                         let sha_short: String = c.sha.chars().take(7).collect();
                         let target_sha = c.sha.clone();
@@ -165,7 +165,7 @@ fn commit_feedback_section(commits: Vec<CommitEntry>) -> AnyView {
                             <div class="commit-feedback-block">
                                 <h3 class="commit-feedback-heading">
                                     <code>{sha_short}</code>
-                                    <span class=kind_class>{kind}</span>
+                                    <span class=kind_class>{kind.to_string()}</span>
                                 </h3>
                                 {if cards.is_empty() {
                                     view! {

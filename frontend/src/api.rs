@@ -1,149 +1,24 @@
 //! Typed fetch wrappers around the daemon's `/api/*` surface.
 //!
-//! Shapes deliberately mirror what `src/ui_response.rs` produces on the
-//! daemon side. When changing one, update the other. Fields the SPA
-//! does not consume are deleted, not retained behind `#[allow(dead_code)]`;
-//! the daemon may continue emitting them (serde ignores extras) but the
-//! frontend type only carries what the UI reads.
+//! DTOs are imported from `trinity-wire` — the single shared
+//! definition of every public response shape across daemon and
+//! frontend. A rename like `WaitingReason::CommitNeedsReview ->
+//! NeedsReview` fails at compile time everywhere it matters.
+//!
+//! This module owns only the FETCH machinery — URL construction,
+//! `gloo-net` wrappers, and the `FetchError` enum. Wire-shape
+//! changes happen in `trinity-wire`, not here.
 
-use serde::Deserialize;
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct WaitingOn {
-    pub role: String,
-    #[serde(default)]
-    pub agents: Vec<String>,
-    pub description: String,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct PlanRow {
-    pub plan_id: String,
-    pub state: String,
-    pub phase: String,
-    pub worktree_status: String,
-    pub waiting_on: WaitingOn,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct PlanConflictRow {
-    pub slug: String,
-    pub paths: Vec<String>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct PlansIndex {
-    #[serde(default)]
-    pub plans: Vec<PlanRow>,
-    #[serde(default)]
-    pub conflicts: Vec<PlanConflictRow>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct ReviewGate {
-    pub state: String,
-    #[serde(default)]
-    pub approvals: Vec<String>,
-    #[serde(default)]
-    pub request_changes: Vec<String>,
-    #[serde(default)]
-    pub missing_approvals: Vec<String>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct CommitFeedback {
-    pub author: String,
-    pub verdict: String,
-    pub body_html: String,
-    #[serde(default)]
-    pub created_at: i64,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct CommitEntry {
-    pub sha: String,
-    pub kind: String,
-    #[serde(default)]
-    pub feedback: Vec<CommitFeedback>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct CommitRef {
-    pub commit_sha: String,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(tag = "kind")]
-pub enum TimelineEvent {
-    #[serde(rename = "commit_plan")]
-    CommitPlan {
-        sha: String,
-        #[serde(default)]
-        subject: String,
-    },
-    #[serde(rename = "commit_impl")]
-    CommitImpl {
-        sha: String,
-        #[serde(default)]
-        subject: String,
-    },
-    #[serde(rename = "commit_mixed")]
-    CommitMixed {
-        sha: String,
-        #[serde(default)]
-        subject: String,
-    },
-    #[serde(rename = "commit_finalize")]
-    CommitFinalize {
-        sha: String,
-        #[serde(default)]
-        subject: String,
-    },
-    #[serde(rename = "review")]
-    Review {
-        phase: String,
-        target: String,
-        author: String,
-        verdict: String,
-    },
-}
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct PrHintOption {
-    pub name: String,
-    pub command: String,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct PrHint {
-    #[serde(default)]
-    pub options: Vec<PrHintOption>,
-    pub suggested_message: String,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct PlanDetail {
-    pub plan_id: String,
-    pub state: String,
-    pub current_path: String,
-    pub phase: String,
-    pub plan_worktree_status: String,
-    pub waiting_on: WaitingOn,
-    pub review_gate: Option<ReviewGate>,
-    pub latest_plan_revision: Option<CommitRef>,
-    pub latest_implementation_revision: Option<CommitRef>,
-    #[serde(default)]
-    pub commits: Vec<CommitEntry>,
-    #[serde(default)]
-    pub latest_relevant_commit: Option<String>,
-    #[serde(default)]
-    pub plan_body_html: String,
-    #[serde(default)]
-    pub plan_body_truncated: bool,
-    #[serde(default)]
-    pub timeline: Vec<TimelineEvent>,
-    pub pr_hint: Option<PrHint>,
-}
+// Type aliases preserve the historical frontend-local names where
+// they don't match the wire crate's naming.
+pub use trinity_wire::dto::{
+    CommitDetail, CommitDetailResponse, CommitRowDetail, DiffHunk, DiffLine,
+    DiffResponse as DiffPage, Feedback as CommitFeedback, FileDiff, FileDiffMode, FinalizeApproval,
+    ListPlansResponse as PlansIndex, PlanConflict as PlanConflictRow,
+    PlanDetailResponse as PlanDetail, PlanRevisionResponse as PlanRevisionPage, PlanRow, PrHint,
+    PrHintOption, RepoListResponse as ReposIndex, RepoRow, ReviewGate, TimelineEvent, WaitingOn,
+};
+pub use trinity_wire::vocab::{DiffLineKind, PlanLifecycle, Verdict, WaitingRole};
 
 #[derive(Debug, Clone)]
 pub enum FetchError {
@@ -189,17 +64,6 @@ pub async fn fetch_plan(plan_id: String) -> Result<PlanDetail, FetchError> {
         .map_err(|e| FetchError::Decode(e.to_string()))
 }
 
-#[derive(Debug, Clone, Deserialize)]
-pub struct PlanRevisionPage {
-    pub plan_id: String,
-    pub commit_sha: String,
-    pub body_html: String,
-    pub previous_sha: Option<String>,
-    pub next_sha: Option<String>,
-    #[serde(default)]
-    pub feedback: Vec<CommitFeedback>,
-}
-
 pub async fn fetch_plan_revision(
     plan_id: String,
     sha: String,
@@ -217,68 +81,10 @@ pub async fn fetch_plan_revision(
         .map_err(|e| FetchError::Decode(e.to_string()))
 }
 
-#[derive(Debug, Clone, Deserialize)]
-pub struct DiffLine {
-    pub kind: String,
-    pub old_lineno: Option<u64>,
-    pub new_lineno: Option<u64>,
-    pub content: String,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct DiffHunk {
-    pub header: String,
-    pub lines: Vec<DiffLine>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct FileDiff {
-    pub path: String,
-    pub old_path: Option<String>,
-    pub additions: u64,
-    pub deletions: u64,
-    pub mode: String,
-    pub binary: bool,
-    #[serde(default)]
-    pub always_folded: bool,
-    #[serde(default)]
-    pub hunks: Vec<DiffHunk>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct CommitDiffPage {
-    pub plan_id: String,
-    pub commit_sha: String,
-    /// Daemon-side `CommitKind::as_str()` — `plan_only` / `code_only`
-    /// / `mixed` / `multi_plan` / `finalize`. The UI keys finalize
-    /// rendering off `"finalize"`. Required: every commit-detail
-    /// response carries it. No `#[serde(default)]` — wire drift
-    /// surfaces as a decode error rather than silently rendering
-    /// as a non-finalize commit.
-    pub kind: String,
-    #[serde(default)]
-    pub message_body: String,
-    #[serde(default)]
-    pub diff_files: Vec<FileDiff>,
-    /// Live reviewer feedback on this commit. Always present on the
-    /// wire as a (possibly empty) array; the daemon emits `[]` for
-    /// finalize commits.
-    pub feedback: Vec<CommitFeedback>,
-    /// Approval snapshot for finalize commits: the `.trinity/finished/
-    /// <stem>/` directory contents at the freeze commit's tree.
-    /// Always present on the wire as a (possibly empty) array; the
-    /// daemon emits `[]` for non-finalize commits.
-    pub finalize_snapshot: Vec<FinalizeApproval>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct FinalizeApproval {
-    pub author: String,
-    pub filename: String,
-    pub body_html: String,
-}
-
-pub async fn fetch_commit_diff(plan_id: String, sha: String) -> Result<CommitDiffPage, FetchError> {
+pub async fn fetch_commit_diff(
+    plan_id: String,
+    sha: String,
+) -> Result<CommitDetailResponse, FetchError> {
     let url = format!("/api/plan/{plan_id}/commit/{sha}");
     let resp = gloo_net::http::Request::get(&url)
         .send()
@@ -287,19 +93,9 @@ pub async fn fetch_commit_diff(plan_id: String, sha: String) -> Result<CommitDif
     if !resp.ok() {
         return Err(FetchError::Status(resp.status()));
     }
-    resp.json::<CommitDiffPage>()
+    resp.json::<CommitDetailResponse>()
         .await
         .map_err(|e| FetchError::Decode(e.to_string()))
-}
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct DiffPage {
-    pub from: String,
-    pub to: String,
-    pub from_path: String,
-    pub to_path: String,
-    #[serde(default)]
-    pub diff_files: Vec<FileDiff>,
 }
 
 pub async fn fetch_diff(plan_id: String, from: String, to: String) -> Result<DiffPage, FetchError> {
@@ -316,21 +112,6 @@ pub async fn fetch_diff(plan_id: String, from: String, to: String) -> Result<Dif
         .map_err(|e| FetchError::Decode(e.to_string()))
 }
 
-#[derive(Debug, Clone, Deserialize)]
-pub struct RepoRow {
-    pub basename: String,
-    pub root: String,
-    pub plan_count: u32,
-    #[serde(default)]
-    pub last_activity_ts: i64,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct ReposIndex {
-    #[serde(default)]
-    pub repos: Vec<RepoRow>,
-}
-
 pub async fn fetch_repos() -> Result<ReposIndex, FetchError> {
     let resp = gloo_net::http::Request::get("/api/repos")
         .send()
@@ -344,17 +125,9 @@ pub async fn fetch_repos() -> Result<ReposIndex, FetchError> {
         .map_err(|e| FetchError::Decode(e.to_string()))
 }
 
-#[derive(Debug, Clone, Deserialize)]
-pub struct DeleteRepoOutcome {
-    /// `Some(msg)` when the in-memory deregistration succeeded but the
-    /// registry file rewrite failed. The repo will reappear on daemon
-    /// restart until the operator fixes the file; the frontend should
-    /// surface this so it isn't silently lost.
-    #[serde(default)]
-    pub registry_write_error: Option<String>,
-}
-
-pub async fn delete_repo(basename: String) -> Result<DeleteRepoOutcome, FetchError> {
+pub async fn delete_repo(
+    basename: String,
+) -> Result<trinity_wire::dto::DeleteRepoOutcome, FetchError> {
     let url = format!("/api/repos/{basename}");
     let resp = gloo_net::http::Request::delete(&url)
         .send()
@@ -363,99 +136,108 @@ pub async fn delete_repo(basename: String) -> Result<DeleteRepoOutcome, FetchErr
     if !resp.ok() {
         return Err(FetchError::Status(resp.status()));
     }
-    resp.json::<DeleteRepoOutcome>()
+    resp.json::<trinity_wire::dto::DeleteRepoOutcome>()
         .await
         .map_err(|e| FetchError::Decode(e.to_string()))
 }
 
 #[cfg(test)]
 mod dto_roundtrip_tests {
-    //! DTO contract tests for `/api/plan/.../commit/{sha}`. The
-    //! daemon's response shape is hand-maintained in
-    //! `src/server/http.rs::api_commit_diff`; the frontend DTO
-    //! (`CommitDiffPage`) must round-trip every shape the daemon
-    //! emits. Without these tests, a backend that emits `null` for
-    //! an array-typed field silently breaks every commit page on
-    //! the live daemon — the kind of regression ruthless caught in
-    //! 055d387.
+    //! DTO contract tests. These are the same tests that caught the
+    //! `finalize_snapshot: null` regression in commit `055d387`,
+    //! kept here as a sanity check that the wire-crate types still
+    //! handle the daemon's current emission shape. Most coverage
+    //! now lives in `crates/trinity-wire/tests/round_trip.rs`.
     use super::*;
-
-    #[test]
-    fn reviewable_commit_response_decodes() {
-        // Daemon emits empty `finalize_snapshot: []` for a
-        // non-finalize commit; the DTO's `Vec<FinalizeApproval>`
-        // must accept it.
-        let wire = r#"{
-            "plan_id": "trinity/foo.md",
-            "commit_sha": "abcdef",
-            "kind": "plan_only",
-            "subject": "Plan revision",
-            "message_body": "",
-            "diff_files": [],
-            "feedback": [],
-            "finalize_snapshot": []
-        }"#;
-        let page: CommitDiffPage = serde_json::from_str(wire).expect("decode reviewable commit");
-        assert_eq!(page.kind, "plan_only");
-        assert!(page.finalize_snapshot.is_empty());
-        assert!(page.feedback.is_empty());
-    }
+    use trinity_wire::vocab::CommitKind;
 
     #[test]
     fn finalize_commit_response_decodes() {
         let wire = r#"{
+            "repo": "/r",
             "plan_id": "trinity/foo.md",
+            "slug": "foo",
             "commit_sha": "abcdef",
-            "kind": "finalize",
             "subject": "Finalize foo",
             "message_body": "",
             "diff_files": [],
-            "feedback": [],
-            "finalize_snapshot": [
+            "kind": "finalize",
+            "snapshot": [
                 {"author": "alice", "filename": "alice.md", "body_html": "<p>lgtm</p>"}
             ]
         }"#;
-        let page: CommitDiffPage = serde_json::from_str(wire).expect("decode finalize commit");
-        assert_eq!(page.kind, "finalize");
-        assert_eq!(page.finalize_snapshot.len(), 1);
-        assert_eq!(page.finalize_snapshot[0].author, "alice");
+        let page: CommitDetailResponse =
+            serde_json::from_str(wire).expect("decode finalize commit");
+        match page.detail {
+            CommitDetail::Finalize { snapshot } => {
+                assert_eq!(snapshot.len(), 1);
+                assert_eq!(snapshot[0].author, "alice");
+            }
+            _ => panic!("expected Finalize variant"),
+        }
     }
 
     #[test]
-    fn null_finalize_snapshot_fails_to_decode() {
-        // Regression: prior to the fix, the daemon emitted `null`
-        // for non-finalize commits. This test pins the failure
-        // mode so a future "be lenient" change doesn't reintroduce
-        // the silent-degrade bug.
+    fn reviewable_commit_response_decodes() {
         let wire = r#"{
+            "repo": "/r",
             "plan_id": "trinity/foo.md",
+            "slug": "foo",
             "commit_sha": "abcdef",
+            "subject": "Plan revision",
+            "message_body": "",
+            "diff_files": [],
             "kind": "plan_only",
-            "feedback": [],
-            "finalize_snapshot": null
+            "feedback": []
         }"#;
-        let result: Result<CommitDiffPage, _> = serde_json::from_str(wire);
-        assert!(
-            result.is_err(),
-            "null finalize_snapshot must fail to decode (daemon must emit `[]`); got: {result:?}"
-        );
+        let page: CommitDetailResponse =
+            serde_json::from_str(wire).expect("decode reviewable commit");
+        assert!(matches!(page.detail, CommitDetail::PlanOnly { .. }));
     }
 
     #[test]
     fn missing_kind_fails_to_decode() {
-        // Without `#[serde(default)]` on `kind`, wire drift surfaces
-        // as a decode error rather than silently rendering as a
-        // non-finalize commit.
         let wire = r#"{
+            "repo": "/r",
             "plan_id": "trinity/foo.md",
+            "slug": "foo",
             "commit_sha": "abcdef",
-            "feedback": [],
-            "finalize_snapshot": []
+            "subject": "",
+            "message_body": "",
+            "diff_files": [],
+            "feedback": []
         }"#;
-        let result: Result<CommitDiffPage, _> = serde_json::from_str(wire);
-        assert!(
-            result.is_err(),
-            "missing `kind` must fail to decode; got: {result:?}"
-        );
+        let result: Result<CommitDetailResponse, _> = serde_json::from_str(wire);
+        assert!(result.is_err(), "missing kind must fail; got {result:?}");
+    }
+
+    /// Pin that the tagged-enum unknown-kind fails. Equivalent to the
+    /// `null_finalize_snapshot_fails_to_decode` test in `055d387` but
+    /// for the new wire shape.
+    #[test]
+    fn unknown_kind_fails_to_decode() {
+        let wire = r#"{
+            "repo": "/r",
+            "plan_id": "trinity/foo.md",
+            "slug": "foo",
+            "commit_sha": "abcdef",
+            "subject": "",
+            "message_body": "",
+            "diff_files": [],
+            "kind": "donemove",
+            "feedback": []
+        }"#;
+        let result: Result<CommitDetailResponse, _> = serde_json::from_str(wire);
+        assert!(result.is_err(), "unknown kind must fail; got {result:?}");
+    }
+
+    /// CommitKind enum can be passed around as a value, e.g. for
+    /// matching in components.
+    #[test]
+    fn commit_kind_enum_round_trip() {
+        let v = serde_json::to_value(CommitKind::PlanOnly).unwrap();
+        assert_eq!(v.as_str(), Some("plan_only"));
+        let back: CommitKind = serde_json::from_value(v).unwrap();
+        assert_eq!(back, CommitKind::PlanOnly);
     }
 }

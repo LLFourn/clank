@@ -8,7 +8,7 @@ use crate::util::short_sha;
 /// header for the plan detail page.
 #[component]
 pub fn MetaStrip(session: PlanDetail) -> impl IntoView {
-    let phase = session.phase.clone();
+    let phase = session.phase;
     let phase_class = format!("phase-chip phase-{phase}");
     let status_class = format!("status-chip status-{}", session.plan_worktree_status);
 
@@ -20,19 +20,19 @@ pub fn MetaStrip(session: PlanDetail) -> impl IntoView {
         .latest_implementation_revision
         .as_ref()
         .map(|r| r.commit_sha.clone());
-    let plan_id_for_plan = session.plan_id.clone();
-    let plan_id_for_impl = session.plan_id.clone();
+    let plan_id_for_plan = session.plan_id.clone().unwrap_or_default();
+    let plan_id_for_impl = session.plan_id.clone().unwrap_or_default();
 
     view! {
         <section class="meta-strip">
             <dl class="meta-grid">
                 <dt>"Phase"</dt>
                 <dd>
-                    <span class=phase_class>{phase}</span>
+                    <span class=phase_class>{phase.to_string()}</span>
                 </dd>
                 <dt>"Worktree"</dt>
                 <dd>
-                    <span class=status_class>{session.plan_worktree_status}</span>
+                    <span class=status_class>{session.plan_worktree_status.to_string()}</span>
                 </dd>
                 <dt>"Plan file"</dt>
                 <dd>

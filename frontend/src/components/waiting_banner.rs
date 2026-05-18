@@ -1,12 +1,12 @@
 use leptos::prelude::*;
 
-use crate::api::WaitingOn;
+use crate::api::{WaitingOn, WaitingRole};
 
 #[component]
 pub fn WaitingBanner(waiting_on: WaitingOn) -> impl IntoView {
-    let role = waiting_on.role.clone();
+    let role = waiting_on.role;
     let class = format!("waiting-banner waiting-banner-{role}");
-    let role_label = role_label(&role).to_string();
+    let role_label = role_label(role).to_string();
     view! {
         <aside class=class>
             <span class="waiting-banner-role">{role_label}</span>
@@ -15,10 +15,10 @@ pub fn WaitingBanner(waiting_on: WaitingOn) -> impl IntoView {
     }
 }
 
-fn role_label(role: &str) -> &'static str {
+fn role_label(role: WaitingRole) -> &'static str {
     match role {
-        "master" => "Waiting on master",
-        "reviewers" => "Waiting on reviewers",
-        _ => "Idle",
+        WaitingRole::Master => "Waiting on master",
+        WaitingRole::Reviewers => "Waiting on reviewers",
+        WaitingRole::None => "Idle",
     }
 }

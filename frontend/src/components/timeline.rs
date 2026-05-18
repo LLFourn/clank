@@ -43,6 +43,7 @@ fn timeline_key(_idx: usize, e: &TimelineEvent) -> String {
         TimelineEvent::CommitPlan { sha, .. }
         | TimelineEvent::CommitImpl { sha, .. }
         | TimelineEvent::CommitMixed { sha, .. }
+        | TimelineEvent::CommitMultiPlan { sha, .. }
         | TimelineEvent::CommitFinalize { sha, .. } => format!("commit:{sha}"),
         TimelineEvent::Review {
             target,
@@ -80,6 +81,14 @@ fn TimelineRow(plan_id: std::sync::Arc<String>, event: TimelineEvent) -> impl In
             "Plan + impl",
         )
         .into_any(),
+        TimelineEvent::CommitMultiPlan { sha, subject, .. } => commit_row(
+            plan_id,
+            sha,
+            subject,
+            "timeline-row timeline-commit-plan",
+            "Multi-plan",
+        )
+        .into_any(),
         TimelineEvent::CommitFinalize { sha, subject, .. } => commit_row(
             plan_id,
             sha,
@@ -99,7 +108,7 @@ fn TimelineRow(plan_id: std::sync::Arc<String>, event: TimelineEvent) -> impl In
             let target_label = format!("on {short_target}");
             let verdict_class = format!("verdict-pill verdict-pill-sm verdict-{verdict}");
             let phase_label = format!("{phase} review");
-            let verdict_label_text = verdict_label(&verdict).to_string();
+            let verdict_label_text = verdict_label(verdict).to_string();
             view! {
                 <li class="timeline-row timeline-review">
                     <span class="timeline-marker"></span>
@@ -121,11 +130,12 @@ fn TimelineRow(plan_id: std::sync::Arc<String>, event: TimelineEvent) -> impl In
     }
 }
 
-fn verdict_label(verdict: &str) -> &'static str {
+fn verdict_label(verdict: crate::api::Verdict) -> &'static str {
+    use crate::api::Verdict;
     match verdict {
-        "approve" => "APPROVE",
-        "request_changes" => "REQUEST_CHANGES",
-        _ => "UNMARKED",
+        Verdict::Approve => "APPROVE",
+        Verdict::RequestChanges => "REQUEST_CHANGES",
+        Verdict::Unmarked => "UNMARKED",
     }
 }
 

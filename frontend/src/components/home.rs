@@ -60,10 +60,11 @@ pub fn Home() -> impl IntoView {
 }
 
 fn plans_view(index: PlansIndex, show_done: bool) -> impl IntoView {
+    use crate::api::PlanLifecycle;
     let plans: Vec<PlanRow> = index
         .plans
         .into_iter()
-        .filter(|p| show_done || p.state != "finished")
+        .filter(|p| show_done || p.state != PlanLifecycle::Finished)
         .collect();
     let conflicts = index.conflicts;
     view! {
@@ -168,26 +169,25 @@ fn plan_table(rows: Vec<PlanRow>) -> impl IntoView {
                 {rows
                     .into_iter()
                     .map(|s| {
-                        let role = s.waiting_on.role.clone();
+                        let role = s.waiting_on.role;
                         let waiting_class = format!("waiting waiting-{role}");
-                        let plan_id_for_href = s.plan_id.clone();
-                        let plan_id_for_text = s.plan_id.clone();
+                        let plan_id = s.plan_id.clone().unwrap_or_default();
                         let state_class = format!("state-chip state-{}", s.state);
                         let agents = s.waiting_on.agents.clone();
                         view! {
                             <tr>
                                 <td>
-                                    <a href=format!("/plan/{plan_id_for_href}")>
-                                        <code>{plan_id_for_text}</code>
+                                    <a href=format!("/plan/{plan_id}")>
+                                        <code>{plan_id.clone()}</code>
                                     </a>
                                 </td>
                                 <td>
-                                    <span class=state_class>{s.state}</span>
+                                    <span class=state_class>{s.state.to_string()}</span>
                                 </td>
-                                <td>{s.phase}</td>
-                                <td>{s.worktree_status}</td>
+                                <td>{s.phase.to_string()}</td>
+                                <td>{s.worktree_status.to_string()}</td>
                                 <td>
-                                    <span class=waiting_class>{role}</span>
+                                    <span class=waiting_class>{role.to_string()}</span>
                                 </td>
                                 <td>{who_cell(agents)}</td>
                             </tr>

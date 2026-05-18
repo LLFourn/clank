@@ -12,6 +12,23 @@
 
 use serde::{Deserialize, Serialize};
 
+/// Implement `std::fmt::Display` for an enum by delegating to its
+/// `as_str(self) -> &'static str` inherent method. The wire string
+/// is the right Display form — log lines, format strings, and SPA
+/// `{enum}` interpolation all see the same snake_case text serde
+/// produces.
+macro_rules! impl_display_via_as_str {
+    ($($ty:ty),+ $(,)?) => {
+        $(
+            impl ::core::fmt::Display for $ty {
+                fn fmt(&self, f: &mut ::core::fmt::Formatter<'_>) -> ::core::fmt::Result {
+                    f.write_str(self.as_str())
+                }
+            }
+        )+
+    };
+}
+
 // ============================================================
 // Plan lifecycle / posture / worktree status
 // ============================================================
@@ -370,4 +387,21 @@ impl DiffLineKind {
             DiffLineKind::Meta => "meta",
         }
     }
+}
+
+impl_display_via_as_str! {
+    PlanLifecycle,
+    Posture,
+    PlanWorktreeStatus,
+    CommitKind,
+    PlanTouchKind,
+    ReviewTargetPhase,
+    Verdict,
+    CommitGateState,
+    WaitingRole,
+    WaitingReason,
+    ExpectedAction,
+    RepoEventKind,
+    PlanEventKind,
+    DiffLineKind,
 }

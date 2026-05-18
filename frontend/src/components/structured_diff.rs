@@ -1,6 +1,6 @@
 use leptos::prelude::*;
 
-use crate::api::{DiffHunk, DiffLine, FileDiff};
+use crate::api::{DiffHunk, DiffLine, DiffLineKind, FileDiff, FileDiffMode};
 
 /// Render a list of `FileDiff`s as collapsible per-file sections with a
 /// line-number gutter and insert/delete coloring. Empty input renders a
@@ -47,7 +47,7 @@ pub fn StructuredDiff(files: Vec<FileDiff>) -> impl IntoView {
 fn FileDiffBlock(file: FileDiff) -> impl IntoView {
     let anchor = format!("diff-{}", slug(&file.path));
     let counts = format!("+{} -{}", file.additions, file.deletions);
-    let mode_chip = mode_chip(&file.mode);
+    let mode_chip = mode_chip(file.mode);
     let summary_path = match &file.old_path {
         Some(old) if !old.is_empty() && old != &file.path => {
             format!("{} → {}", old, file.path)
@@ -106,11 +106,11 @@ fn DiffLineRow(line: DiffLine) -> impl IntoView {
     let row_class = format!("diff-line diff-line-{}", line.kind);
     let old_no = line.old_lineno.map(|n| n.to_string()).unwrap_or_default();
     let new_no = line.new_lineno.map(|n| n.to_string()).unwrap_or_default();
-    let marker = match line.kind.as_str() {
-        "insert" => "+",
-        "delete" => "-",
-        "meta" => "@",
-        _ => " ",
+    let marker = match line.kind {
+        DiffLineKind::Insert => "+",
+        DiffLineKind::Delete => "-",
+        DiffLineKind::Meta => "@",
+        DiffLineKind::Context => " ",
     };
     view! {
         <tr class=row_class>
@@ -124,12 +124,12 @@ fn DiffLineRow(line: DiffLine) -> impl IntoView {
     }
 }
 
-fn mode_chip(mode: &str) -> (&'static str, &'static str) {
+fn mode_chip(mode: FileDiffMode) -> (&'static str, &'static str) {
     match mode {
-        "added" => ("file-mode file-mode-added", "ADDED"),
-        "removed" => ("file-mode file-mode-removed", "REMOVED"),
-        "renamed" => ("file-mode file-mode-renamed", "RENAMED"),
-        _ => ("file-mode file-mode-modified", "MODIFIED"),
+        FileDiffMode::Added => ("file-mode file-mode-added", "ADDED"),
+        FileDiffMode::Removed => ("file-mode file-mode-removed", "REMOVED"),
+        FileDiffMode::Renamed => ("file-mode file-mode-renamed", "RENAMED"),
+        FileDiffMode::Modified => ("file-mode file-mode-modified", "MODIFIED"),
     }
 }
 

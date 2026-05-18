@@ -1,6 +1,6 @@
 use leptos::prelude::*;
 
-use crate::api::CommitFeedback;
+use crate::api::{CommitFeedback, Verdict};
 use crate::util::short_sha;
 
 /// Single feedback file as a card. Verdict pill on the left, author +
@@ -10,7 +10,7 @@ use crate::util::short_sha;
 /// to the feedback entry.
 #[component]
 pub fn FeedbackCard(entry: CommitFeedback, target_sha: String) -> impl IntoView {
-    let verdict_class = verdict_class(&entry.verdict);
+    let verdict_class = verdict_class(entry.verdict);
     let target_short = short_sha(&target_sha);
     let target_label = format!("on {target_short}");
     let timestamp = format_timestamp(entry.created_at);
@@ -18,7 +18,7 @@ pub fn FeedbackCard(entry: CommitFeedback, target_sha: String) -> impl IntoView 
     view! {
         <article class="feedback-card">
             <header class="feedback-header">
-                <span class=verdict_class>{verdict_label(&entry.verdict)}</span>
+                <span class=verdict_class>{verdict_label(entry.verdict)}</span>
                 <span class="feedback-author">{entry.author}</span>
                 <span class="feedback-target">
                     <code>{target_label}</code>
@@ -30,15 +30,15 @@ pub fn FeedbackCard(entry: CommitFeedback, target_sha: String) -> impl IntoView 
     }
 }
 
-fn verdict_class(verdict: &str) -> String {
+fn verdict_class(verdict: Verdict) -> String {
     format!("verdict-pill verdict-{verdict}")
 }
 
-fn verdict_label(verdict: &str) -> &'static str {
+fn verdict_label(verdict: Verdict) -> &'static str {
     match verdict {
-        "approve" => "APPROVE",
-        "request_changes" => "REQUEST_CHANGES",
-        _ => "UNMARKED",
+        Verdict::Approve => "APPROVE",
+        Verdict::RequestChanges => "REQUEST_CHANGES",
+        Verdict::Unmarked => "UNMARKED",
     }
 }
 
