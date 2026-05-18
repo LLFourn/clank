@@ -11,8 +11,9 @@ parallel response modules (`src/ui_response.rs` + `src/mcp_response.rs`,
 1458 LOC total) into one `src/responses.rs` that has a single
 projection path from `model` to `api`.
 
-Server-side markdown rendering stays as-is. Wire JSON shape is
-byte-stable across the migration. The deletion is structural, not
+Server-side markdown rendering stays as-is. Wire-shape changes
+are allowed where they improve the model; each is enumerated in
+"Wire-shape changes" below. The deletion is structural, not
 behavioral.
 
 Result: ~1000 LOC removed; the silent divergence-bug class between
@@ -112,8 +113,9 @@ After this plan, the following statements are simultaneously true:
   projection path. Total ~200 LOC, down from 1458. No `build_*`
   helpers.
 - The frontend imports `trinity_core::api` types directly. Wire
-  format is byte-stable; existing e2e tests pass without
-  modification.
+  format is stable EXCEPT for the small intentional improvements
+  enumerated in "Wire-shape changes" below; e2e tests update only
+  where those changes land.
 - The two guard tests from `purge-stringly-typed` continue to pass
   with drained allowlists.
 
@@ -179,17 +181,61 @@ the wire, not for storage. The daemon does not store them.
   `WriteFeedback`, `ReviewTarget`, `TimelineEvent` (the wire
   shape — distinct from `model::PlanTimelineEvent`).
 - The "rendered" wire `Feedback` shape: an `api::Feedback`
-  carries `body_html` (rendered server-side from `model::Feedback.body`).
-  The projection module is the only renderer.
+  carries `body_html` (rendered server-side from
+  `model::Feedback.body`). The projection module is the only
+  renderer.
 
 `CommitRow` and the prior `CommitRowDetail` collapse into one
-`api::CommitRow` carrying `feedback: Vec<api::Feedback>`. MCP
-endpoints that today emit summary feedback (`CommitRow` with
-`{author, verdict}` only) now emit the full rendered shape — the
-projection cost is one extra markdown render per feedback, which
-the daemon already does for the UI path. If MCP token cost
-becomes a concern, the projection module can build a summary
-variant; do not bake the variance into the wire types prematurely.
+`api::CommitRow` carrying `feedback: Vec<api::Feedback>`. The
+MCP `commits[].feedback` shape gains `body_raw` + `body_html`
+fields that today only the UI carries (`FeedbackSummary` had
+`{author, verdict}` only). **This is an intentional wire-shape
+improvement** — see "Wire-shape changes" below. `FeedbackSummary`
+is deleted from `trinity-core` entirely; there is no consumer of
+the summary-only shape now that body rendering is centralized
+and the size delta is small.
+
+## Wire-shape changes (enumerated)
+
+Wire-shape changes are allowed in this plan where they improve
+the model. The complete set:
+
+1. **MCP `commits[].feedback` carries full feedback bodies.** Today
+   MCP returns `FeedbackSummary { author, verdict }`; after this
+   plan it returns the same `api::Feedback { author, verdict,
+   body_raw, body_html, path, created_at }` shape the UI gets.
+   Reason: the parallel-builder bug class came directly from MCP
+   and UI having different per-commit feedback shapes. Collapsing
+   to one shape eliminates the bug class structurally. The size
+   delta is small (one extra render per feedback, which the daemon
+   already does for the UI path; the bytes are markdown + sanitized
+   HTML). `FeedbackSummary` is deleted from `trinity-core`.
+
+2. **MCP `gate.feedback[author].body_html` is non-empty.** Today
+   the MCP builder inlines `body_html: String::new()`; after the
+   collapse to one projection path, body_html is rendered for
+   both surfaces by the same function. This is an intentional
+   correction of the silent-divergence bug ruthless flagged.
+
+3. **`PrHintOption.name: String` → `kind: PrHintOptionKind` enum.**
+   Closed vocabulary becomes typed (Phase 6). On the wire the
+   field is renamed `name` → `kind` so the discriminator name
+   matches the type. Frontend's `_ => "Option"` fallback goes away.
+
+4. **MCP error responses get a typed envelope** (Phase 6). The five
+   ad-hoc `json!({"error": "...", ...})` shapes in
+   `src/server/mcp.rs` become variants of `api::McpErrorPayload`
+   (`#[serde(tag = "error", rename_all = "snake_case")]`). The
+   shapes are identical to today's `json!` output; the change is
+   that they're now produced by typed constructors. Schema stable;
+   producer typed.
+
+Every other wire shape is preserved byte-identically. The Phase 0
+snapshots split into two files per endpoint: a **schema snapshot**
+(field names + types; must be stable except for changes 1, 3, and
+4 above, which update the schema baseline once) and a **value
+regression snapshot** (golden outputs from a fixture state; must
+match exactly except for change 2 above, which updates one value).
 
 ## Rules
 
@@ -200,11 +246,9 @@ must hold at every phase boundary:
 - The guard tests from `purge-stringly-typed` continue to pass.
   Their allowlists are expected to shrink as parallel definitions
   go away — that's the success signal, not a regression.
-- **Wire JSON format is BYTE-STABLE across the migration.** Every
-  shape currently produced by the daemon (per existing snapshot
-  tests + e2e tests) produces identical JSON after the rename
-  and re-architecture. The only way the wire format would change
-  is if a struct gained or lost a field; this plan does neither.
+- Wire shape is preserved EXCEPT for the four changes enumerated
+  in "Wire-shape changes" above. Any other shape change is a bug
+  in the migration; the Phase 0 schema snapshots catch it.
 - Validated newtypes (`AgentLabel`, `PlanKey`, …) retain their
   validation. Moving them to `trinity-core::model` does NOT mean
   weakening their constructors.
@@ -230,10 +274,21 @@ Before any rename, run two checks:
 - `cargo test --workspace` to capture the baseline. Note any
   flaky tests so they don't get blamed on the migration.
 
-Snapshot every endpoint's current JSON output into a
-`tests/wire_snapshots/` directory (one file per endpoint, one
-fixture per nontrivial response). These pin byte-stability across
-the migration. After Phase 5 the snapshots must be unchanged.
+Snapshot every endpoint's current JSON output into
+`tests/wire_snapshots/`, split into two files per endpoint:
+
+- `<endpoint>.schema.json` — field-presence + types only (e.g.
+  via `serde_json::Value` walked to a structural skeleton). This
+  is the schema baseline. It updates ONCE per enumerated
+  wire-shape change (#1, #3, #4 in "Wire-shape changes"); any
+  other diff is a migration bug.
+- `<endpoint>.values.json` — golden output for a deterministic
+  fixture state. Must match byte-identically except for the
+  `body_html` correction (change #2) on MCP commit-gate output.
+
+After Phase 5 (and Phase 6 for the renames), the schema files
+update to the new baseline once and stay frozen; the value files
+update once for the `body_html` correction and stay frozen.
 
 ### Phase 1: Rename `trinity-wire → trinity-core`
 
@@ -310,8 +365,9 @@ Phase 3b — `Plan` and `Feedback`:
 
 After Phase 3: daemon-side `Plan`, `Feedback`, `WaitingOn`,
 `ArchivedCycle` are all `pub use trinity_core::Foo` re-exports.
-The wire snapshots remain byte-stable because the daemon-side
-projection logic still adds `body_html` at the wire boundary.
+Wire snapshots are unchanged through Phase 3 — the daemon-side
+projection still adds `body_html` at the wire boundary and the
+`CommitRow` shape change has not happened yet.
 
 ### Phase 4: Introduce the `model` / `api` split
 
@@ -370,8 +426,10 @@ helpers used inside are shared. No `Option<...>` shared struct
 with endpoint-dependent fills.
 
 After Phase 5: ~1458 LOC of two parallel modules becomes ~200-300
-LOC of one projection module. The byte-identity wire snapshots
-from Phase 0 confirm no shape regression.
+LOC of one projection module. The Phase 0 schema snapshots
+register two intentional updates (CommitRow collapse, the value
+correction on MCP `body_html`); every other endpoint's shape and
+values are unchanged.
 
 ### Phase 6: Fix the residual stringly leaks ruthless flagged
 
@@ -457,8 +515,11 @@ required ruthless review to spot.
 - `cargo check -p trinity-core --target wasm32-unknown-unknown`
 - The existing wire-contract guards (`tests/wire_contract_guards.rs`)
   continue to pass; their allowlists shrink phase-by-phase.
-- The wire snapshots from Phase 0 confirm byte-stable JSON across
-  the migration for every endpoint.
+- The Phase 0 schema snapshots match across the migration except
+  for the three schema updates enumerated in "Wire-shape changes"
+  (CommitRow collapse, PrHintOption rename, McpError envelope);
+  the value snapshots match except for the `body_html` correction
+  on MCP commit-gate output.
 - The Phase 8 divergence-property tests pin that the structural
   unification eliminates the bug class.
 
@@ -483,8 +544,10 @@ required ruthless review to spot.
   both HTTP and MCP endpoints.
 - The total LOC in the daemon's response-building code is under
   ~300, down from 1458.
-- Wire JSON is byte-stable across the migration, verified by the
-  Phase 0 snapshots replayed unchanged after Phase 5.
+- Wire shape changes match the enumerated set in "Wire-shape
+  changes": Phase 0 schema snapshots update once for items 1 / 3
+  / 4 and value snapshots update once for item 2; no other
+  per-endpoint diffs exist.
 - `PrHintOption.name` is a typed enum on the wire.
 - MCP error envelope payloads in `src/server/mcp.rs` are typed
   variants of `api::McpErrorPayload`.
@@ -501,8 +564,8 @@ required ruthless review to spot.
 ## Non-Goals
 
 - No transport change. Still JSON over HTTP, SSE, and MCP.
-- No wire-shape change. The wire JSON every endpoint emits today
-  is byte-stable across this plan.
+- No wire-shape changes BEYOND the four enumerated in "Wire-shape
+  changes". Any other diff is a migration bug.
 - No move of markdown rendering off the daemon. Server-side
   rendering stays. `body_html` continues to appear on wire
   `Feedback` shapes. (A separate plan may revisit this once the
