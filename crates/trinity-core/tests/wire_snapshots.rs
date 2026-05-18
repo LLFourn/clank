@@ -50,22 +50,25 @@ fn snapshots_dir() -> PathBuf {
 
 fn assert_schema(name: &str, value: &Value) {
     let dir = snapshots_dir();
-    fs::create_dir_all(&dir).expect("create wire_snapshots dir");
     let path = dir.join(format!("{name}.schema.json"));
     let actual = serde_json::to_string_pretty(&skeleton(value)).unwrap();
 
     if std::env::var("UPDATE_SNAPSHOTS").is_ok() {
+        fs::create_dir_all(&dir).expect("create wire_snapshots dir");
         fs::write(&path, format!("{actual}\n")).expect("write snapshot");
         return;
     }
 
-    let expected = match fs::read_to_string(&path) {
-        Ok(s) => s,
-        Err(_) => {
-            fs::write(&path, format!("{actual}\n")).expect("write snapshot");
-            return;
-        }
-    };
+    // Missing baseline is a hard failure — silently writing it would
+    // let a deleted (or never-committed) snapshot pass CI.
+    let expected = fs::read_to_string(&path).unwrap_or_else(|_| {
+        panic!(
+            "wire snapshot missing: {}\n\
+             If this is a new wire shape, generate it with:\n  \
+               UPDATE_SNAPSHOTS=1 cargo test -p trinity-core --test wire_snapshots",
+            path.display(),
+        )
+    });
     assert_eq!(
         actual.trim(),
         expected.trim(),

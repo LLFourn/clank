@@ -59,23 +59,27 @@ string_newtype!(RepoBasename);
 /// `PlanKey`, `RepoBasename`) reject malformed input through this
 /// shared error type. `kind` is the type name so a single
 /// `match`/`Display` is enough for diagnostics.
-#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum IdError {
-    #[error("{kind} cannot be empty")]
-    Empty { kind: &'static str },
-    #[error("{kind} must not contain `{ch}`: {value:?}")]
+    Empty {
+        kind: &'static str,
+    },
     ForbiddenChar {
         kind: &'static str,
         ch: char,
         value: String,
     },
-    #[error("{kind} cannot be `.` or `..`")]
-    DotSegment { kind: &'static str },
-    #[error("{kind} must not start with `.`: {value:?}")]
-    LeadingDot { kind: &'static str, value: String },
-    #[error("{kind} must be lowercase hex; got {value:?}")]
-    NotHex { kind: &'static str, value: String },
-    #[error("{kind} length must be {min}-{max} chars; got {len}")]
+    DotSegment {
+        kind: &'static str,
+    },
+    LeadingDot {
+        kind: &'static str,
+        value: String,
+    },
+    NotHex {
+        kind: &'static str,
+        value: String,
+    },
     BadLength {
         kind: &'static str,
         min: usize,
@@ -83,6 +87,32 @@ pub enum IdError {
         len: usize,
     },
 }
+
+impl fmt::Display for IdError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            IdError::Empty { kind } => write!(f, "{kind} cannot be empty"),
+            IdError::ForbiddenChar { kind, ch, value } => {
+                write!(f, "{kind} must not contain `{ch}`: {value:?}")
+            }
+            IdError::DotSegment { kind } => write!(f, "{kind} cannot be `.` or `..`"),
+            IdError::LeadingDot { kind, value } => {
+                write!(f, "{kind} must not start with `.`: {value:?}")
+            }
+            IdError::NotHex { kind, value } => {
+                write!(f, "{kind} must be lowercase hex; got {value:?}")
+            }
+            IdError::BadLength {
+                kind,
+                min,
+                max,
+                len,
+            } => write!(f, "{kind} length must be {min}-{max} chars; got {len}"),
+        }
+    }
+}
+
+impl std::error::Error for IdError {}
 
 fn check_no_slash(kind: &'static str, s: &str) -> Result<(), IdError> {
     if let Some(ch) = s.chars().find(|c| *c == '/' || *c == '\\') {
@@ -316,16 +346,34 @@ impl<'de> serde::Deserialize<'de> for PlanId {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ParsePlanIdError {
-    #[error("plan_id must be `<repo_basename>/<stem>.md`")]
     Malformed,
-    #[error("plan_id is missing the `.md` suffix")]
     MissingMdSuffix,
-    #[error("plan_id repo basename invalid: {0}")]
     InvalidRepo(IdError),
-    #[error("plan_id stem invalid: {0}")]
     InvalidStem(IdError),
+}
+
+impl fmt::Display for ParsePlanIdError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ParsePlanIdError::Malformed => {
+                f.write_str("plan_id must be `<repo_basename>/<stem>.md`")
+            }
+            ParsePlanIdError::MissingMdSuffix => f.write_str("plan_id is missing the `.md` suffix"),
+            ParsePlanIdError::InvalidRepo(e) => write!(f, "plan_id repo basename invalid: {e}"),
+            ParsePlanIdError::InvalidStem(e) => write!(f, "plan_id stem invalid: {e}"),
+        }
+    }
+}
+
+impl std::error::Error for ParsePlanIdError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            ParsePlanIdError::InvalidRepo(e) | ParsePlanIdError::InvalidStem(e) => Some(e),
+            _ => None,
+        }
+    }
 }
 
 #[cfg(test)]

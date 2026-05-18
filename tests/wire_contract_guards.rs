@@ -90,7 +90,7 @@ fn count_pattern(haystack: &str, needles: &[&str]) -> usize {
     needles.iter().map(|n| body.matches(n).count()).sum()
 }
 
-/// Returns the production source roots the guards scan. `trinity-wire`
+/// Returns the production source roots the guards scan. `trinity-core`
 /// is included because the canonical wire contracts live there — a
 /// stringly DTO field defined in the shared crate would silently
 /// pollute both daemon and frontend boundaries.
@@ -99,15 +99,24 @@ fn production_roots() -> Vec<PathBuf> {
     vec![
         root.join("src"),
         root.join("frontend").join("src"),
-        root.join("crates").join("trinity-wire").join("src"),
+        root.join("crates").join("trinity-core").join("src"),
     ]
 }
 
 /// Map { file -> total pattern count } for the patterns named by
 /// `needles`. Files with zero hits are omitted.
+///
+/// Panics if a configured root is missing — a misnamed path that
+/// silently scanned zero files would let a stringly leak land in
+/// the shared crate without tripping the guard.
 fn scan(needles: &[&str]) -> BTreeMap<String, usize> {
     let mut out = BTreeMap::new();
     for root in production_roots() {
+        assert!(
+            root.is_dir(),
+            "wire_contract_guards: production root missing: {}",
+            root.display(),
+        );
         for path in rust_files(&root) {
             let body = match fs::read_to_string(&path) {
                 Ok(b) => b,
@@ -243,6 +252,11 @@ fn guard_b_stringly_control_flow_sites_match_allowlist() {
 
     let mut observed: BTreeMap<String, usize> = BTreeMap::new();
     for root in production_roots() {
+        assert!(
+            root.is_dir(),
+            "wire_contract_guards: production root missing: {}",
+            root.display(),
+        );
         for path in rust_files(&root) {
             let body = match fs::read_to_string(&path) {
                 Ok(b) => b,
