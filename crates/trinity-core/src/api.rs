@@ -4,12 +4,20 @@
 //! daemon (producer) and the frontend (consumer) round-trip
 //! through one shared definition.
 //!
-//! All string-valued closed-vocabulary fields are typed enums from
-//! [`crate::vocab`]. Validated newtype identifiers (commit SHAs,
-//! plan keys, agent labels, repo basenames) surface as their
-//! `crate::ids` newtypes — serde-transparent over `String`, so
-//! the wire form is unchanged from "plain string" but both ends
-//! validate on parse / deserialize.
+//! Closed-vocabulary fields use typed enums from [`crate::vocab`].
+//! Shared `model`/`api` structs (`Feedback`, `CommitGate`, `Plan`,
+//! `PlanTimelineEvent`, `WaitingOn`, `ArchivedCycle`) reach for
+//! `crate::ids` newtypes (`AgentLabel`, `CommitSha`, etc.) where
+//! they OWN validated identity — serde-transparent over `String`,
+//! so the wire form is unchanged from "plain string" but both
+//! ends validate on parse / deserialize.
+//!
+//! Many endpoint-only fields remain plain `String` because they
+//! are opaque to the daemon (commit SHAs received as URL path
+//! segments, repo paths echoed back as-is, etc.). The rule is
+//! "type it as `crate::ids` when this struct OWNS the identity
+//! invariant; leave it as `String` when it's just a wire-level
+//! echo."
 //!
 //! Tagged enums use `#[serde(tag = "kind")]` so kind-dependent
 //! response shapes have ONE discriminator in the type system AND
@@ -42,10 +50,11 @@ pub use crate::model::Feedback;
 pub use crate::model::CommitGate;
 
 /// One row in `commits[]` — same shape for MCP and HTTP. Carries
-/// the per-author feedback bodies (rendered HTML included) so a
-/// single response covers both agent and SPA consumers. `gate` is
-/// `Some` for reviewable kinds (PlanOnly, CodeOnly, Mixed); `None`
-/// for non-reviewable kinds (MultiPlan, Finalize).
+/// the per-author feedback bodies (raw markdown — the wasm
+/// frontend renders to HTML at display time) so a single response
+/// covers both agent and SPA consumers. `gate` is `Some` for
+/// reviewable kinds (PlanOnly, CodeOnly, Mixed); `None` for
+/// non-reviewable kinds (MultiPlan, Finalize).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CommitRow {
     pub sha: String,

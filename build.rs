@@ -28,11 +28,14 @@ fn main() {
         return;
     }
 
-    // `--locked` keeps the frontend's own Cargo.lock honest; the daemon
-    // build should not silently bump frontend deps.
+    // Trunk's CLI mishandles `NO_COLOR=1` ("invalid value '1' for
+    // '--no-color'"). Cargo + clippy + various CI harnesses set
+    // it. Strip the var when invoking trunk so daemon builds work
+    // in any environment.
     let status = Command::new("trunk")
         .args(["build", "--release"])
         .current_dir(&frontend_dir)
+        .env_remove("NO_COLOR")
         .status();
 
     match status {
