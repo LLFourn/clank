@@ -823,7 +823,10 @@ mod tests {
         let v = get_context_response(&snapshot, &AgentLabel::parse("master").unwrap())
             .unwrap()
             .expect("plan visible");
-        assert_eq!(v["waiting_on"]["reason"], "ready_to_start_implementation");
+        assert_eq!(
+            v.waiting_on.reason,
+            trinity_wire::WaitingReason::ReadyToStartImplementation
+        );
 
         let events = rt.live_events_snapshot().await;
         assert!(events.iter().any(|e| e.kind_str() == "feedback_changed"));
@@ -873,7 +876,10 @@ mod tests {
             .unwrap()
             .expect("plan visible");
         // Gate falls back to no participants → reviewers / plan_needs_initial_review.
-        assert_eq!(v["waiting_on"]["reason"], "commit_needs_review");
+        assert_eq!(
+            v.waiting_on.reason,
+            trinity_wire::WaitingReason::CommitNeedsReview
+        );
     }
 
     #[tokio::test]
@@ -889,8 +895,7 @@ mod tests {
 
         let snapshot = rt.snapshot_repo(dir.path()).await.unwrap();
         let v = list_plans_response(&snapshot).unwrap();
-        let arr = v["plans"].as_array().unwrap();
-        assert_eq!(arr.len(), 2);
+        assert_eq!(v.plans.len(), 2);
     }
 
     #[tokio::test]

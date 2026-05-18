@@ -144,7 +144,9 @@ async fn list_plans(state: &AppState, req: &ToolCallRequest) -> Result<Value, To
     // Single-repo only for MCP today; combine when we add multi-repo
     // aggregation. For now the first snapshot's response is the answer.
     let snap = snapshots.into_iter().next().unwrap();
-    list_plans_response(&snap).map_err(|e| ToolError::Internal(anyhow::anyhow!(e)))
+    let response =
+        list_plans_response(&snap).map_err(|e| ToolError::Internal(anyhow::anyhow!(e)))?;
+    serde_json::to_value(response).map_err(|e| ToolError::Internal(anyhow::anyhow!(e)))
 }
 
 /// Resolve a `repo` arg (filter form): accept either a basename
@@ -351,7 +353,7 @@ async fn get_context(state: &AppState, req: &ToolCallRequest) -> Result<Value, T
                 plan_id
             ))
         })?;
-    get_context_response(&snapshot, &author)
+    let response = get_context_response(&snapshot, &author)
         .map_err(|e| ToolError::Internal(anyhow::anyhow!(e)))?
         .ok_or_else(|| {
             // Plan is hidden: its file is missing from the working
@@ -362,7 +364,8 @@ async fn get_context(state: &AppState, req: &ToolCallRequest) -> Result<Value, T
                 "plan {} is hidden: plan file missing from working tree",
                 plan_id
             ))
-        })
+        })?;
+    serde_json::to_value(response).map_err(|e| ToolError::Internal(anyhow::anyhow!(e)))
 }
 
 async fn resolve_repo(cwd: &Path) -> Result<PathBuf, ToolError> {

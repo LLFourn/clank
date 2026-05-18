@@ -820,7 +820,12 @@ mod wire_tests {
     }
 
     #[tokio::test]
-    async fn http_400_on_invalid_role() {
+    async fn http_4xx_on_invalid_role() {
+        // The wire's `WaitArgs.role` is the typed `WaitingRole`
+        // enum (Phase 4 conversion). Unknown role strings fail at
+        // axum's `Json<WaitArgs>` body deserializer, which returns
+        // 422 Unprocessable Entity — the correct status for
+        // "well-formed JSON, invalid value."
         let dir = init_repo();
         let app = router_with_repo(&dir).await;
         let body = json!({
@@ -836,9 +841,12 @@ mod wire_tests {
             .body(Body::from(body.to_string()))
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
-        let msg = body_text(resp).await;
-        assert!(msg.contains("invalid role"), "got: {msg}");
+        assert!(
+            resp.status().is_client_error(),
+            "expected 4xx, got {}",
+            resp.status()
+        );
+        assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
     }
 
     #[tokio::test]

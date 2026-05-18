@@ -279,12 +279,19 @@ pub struct PlanConflict {
 // Top-level response DTOs
 // ============================================================
 
-/// One row in `/api/plans` and MCP `list_plans`.
+/// One row in MCP `list_plans` (and, via a Phase 5 conversion,
+/// `/api/plans`). The legacy `state` field is a duplicate of
+/// `lifecycle` carried for wire back-compat through Phase 7;
+/// Phase 8 drops it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PlanRow {
     pub repo: String,
     pub plan_id: Option<String>,
     pub slug: String,
+    /// Legacy alias for `lifecycle` — same value, kept so the
+    /// frontend's `state: String` reader keeps working until
+    /// Phase 6. Phase 8 drops this field.
+    pub state: PlanLifecycle,
     pub lifecycle: PlanLifecycle,
     pub current_path: String,
     pub phase: Posture,
@@ -313,6 +320,8 @@ pub struct GetContextResponse {
     pub repo: String,
     pub plan_id: Option<String>,
     pub slug: String,
+    /// Legacy alias for `lifecycle`. Drop in Phase 8.
+    pub state: PlanLifecycle,
     pub lifecycle: PlanLifecycle,
     pub current_path: String,
     pub phase: Posture,
@@ -340,6 +349,8 @@ pub struct PlanDetailResponse {
     pub repo: String,
     pub plan_id: Option<String>,
     pub slug: String,
+    /// Legacy alias for `lifecycle`. Drop in Phase 8.
+    pub state: PlanLifecycle,
     pub lifecycle: PlanLifecycle,
     pub current_path: String,
     pub phase: Posture,
@@ -470,8 +481,13 @@ pub enum WaitForWorkResponse {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WaitTimeout {
     pub timed_out: bool,
-    #[serde(default)]
+    /// Set on the timeout path that fires when MCP `wait_for_work`
+    /// inference finds zero active plans. Omitted when false.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub no_active_plans: bool,
+    /// Repo that the inference scoped to when `no_active_plans`
+    /// fires. Omitted on the regular-timeout path.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub repo: Option<String>,
 }
 

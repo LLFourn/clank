@@ -16,7 +16,7 @@
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use tokio::sync::broadcast::error::RecvError;
 
 use crate::lifecycle::{AgentLabel, CommitSha, ContentHash, PlanKey};
@@ -25,12 +25,14 @@ use crate::projection::waiting_on;
 use crate::repo_state::{Trinity, WaitingReason, WaitingRole};
 use crate::review_state::CommitGate;
 use crate::runtime::Runtime;
+use trinity_wire::dto::{WaitTimeout, WorkAction, WorkPayload};
+use trinity_wire::vocab::CommitKind;
 
 const DEFAULT_TIMEOUT_SECS: u64 = 1800;
 
 #[derive(Debug, Deserialize)]
 pub struct WaitArgs {
-    pub role: String,
+    pub role: WaitingRole,
     /// Optional under phase 2.9. When omitted, the MCP dispatcher
     /// infers the plan from `repo` (or the caller's cwd) — see
     /// `resolve_plan_id`. The HTTP surface still requires a value
@@ -52,61 +54,10 @@ pub struct WaitArgs {
     pub timeout_secs: Option<u64>,
 }
 
-/// Top-level WFW response: either a `Work` payload or a `Timeout`.
-/// `untagged` so the wire keeps the field-presence discriminator
-/// (`work` vs `timed_out`) the existing consumers depend on.
-#[derive(Debug, Clone, Serialize)]
-#[serde(untagged)]
-pub enum WaitResponse {
-    Work(WorkPayload),
-    Timeout { timed_out: bool },
-}
-
-/// A work assignment. `plan_id` / `repo` / `locations` are always
-/// present; the action-specific fields live on the flattened
-/// [`WorkAction`] variant, so the type system enforces that
-/// `target_sha` / `commit_kind` / `prompt_hint` only exist for
-/// actions that actually need them.
-#[derive(Debug, Clone, Serialize)]
-pub struct WorkPayload {
-    pub plan_id: String,
-    /// Canonical absolute path of the repo, convenience for resolving
-    /// the repo-relative `locations` without re-parsing `plan_id`.
-    pub repo: String,
-    /// Repo-relative paths the caller should read or write.
-    pub locations: Vec<String>,
-    #[serde(flatten)]
-    pub action: WorkAction,
-}
-
-/// Tagged by the wire `work` discriminator. Variants that carry a
-/// `target_sha` also carry `commit_kind` and `prompt_hint`;
-/// `SessionFinished` is the only no-target variant.
-#[derive(Debug, Clone, Serialize)]
-#[serde(tag = "work", rename_all = "snake_case")]
-pub enum WorkAction {
-    ReviewCommit {
-        target_sha: String,
-        commit_kind: String,
-        prompt_hint: String,
-    },
-    AddressCommitChanges {
-        target_sha: String,
-        commit_kind: String,
-        prompt_hint: String,
-    },
-    CommitPlanRevision {
-        target_sha: String,
-        commit_kind: String,
-        prompt_hint: String,
-    },
-    StartImplementation {
-        target_sha: String,
-        commit_kind: String,
-        prompt_hint: String,
-    },
-    SessionFinished,
-}
+/// Re-export `WaitForWorkResponse` from the wire crate as `WaitResponse`
+/// so existing call sites need no rename. The wire shape is identical;
+/// this module is now a thin builder over the typed DTO.
+pub use trinity_wire::dto::WaitForWorkResponse as WaitResponse;
 
 #[derive(Debug, thiserror::Error)]
 pub enum WaitError {
@@ -134,7 +85,7 @@ pub enum WaitError {
 /// + locations to act on. After `timeout_secs` returns
 ///   `{timed_out: true}` with no work.
 pub async fn wait_for_work(runtime: &Runtime, args: WaitArgs) -> Result<WaitResponse, WaitError> {
-    let role = parse_role(&args.role)?;
+    let role = args.role;
     if args.plan_id.is_empty() {
         return Err(WaitError::MissingPlanId);
     }
@@ -161,7 +112,11 @@ pub async fn wait_for_work(runtime: &Runtime, args: WaitArgs) -> Result<WaitResp
     loop {
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
-            return Ok(WaitResponse::Timeout { timed_out: true });
+            return Ok(WaitResponse::Timeout(WaitTimeout {
+                timed_out: true,
+                no_active_plans: false,
+                repo: None,
+            }));
         }
         match tokio::time::timeout(remaining, rx.recv()).await {
             Ok(Ok(_event)) => {
@@ -176,7 +131,11 @@ pub async fn wait_for_work(runtime: &Runtime, args: WaitArgs) -> Result<WaitResp
                 }
             }
             Ok(Err(RecvError::Closed)) | Err(_) => {
-                return Ok(WaitResponse::Timeout { timed_out: true });
+                return Ok(WaitResponse::Timeout(WaitTimeout {
+                    timed_out: true,
+                    no_active_plans: false,
+                    repo: None,
+                }));
             }
         }
     }
@@ -187,14 +146,6 @@ pub async fn wait_for_work(runtime: &Runtime, args: WaitArgs) -> Result<WaitResp
 /// floors at 1s; no upper cap (phase 11).
 fn derive_timeout(timeout_secs: Option<u64>) -> Duration {
     Duration::from_secs(timeout_secs.unwrap_or(DEFAULT_TIMEOUT_SECS).max(1))
-}
-
-fn parse_role(s: &str) -> Result<WaitingRole, WaitError> {
-    match s {
-        "master" => Ok(WaitingRole::Master),
-        "reviewers" => Ok(WaitingRole::Reviewers),
-        other => Err(WaitError::InvalidRole(other.to_string())),
-    }
 }
 
 #[derive(Debug, Clone)]
@@ -280,67 +231,48 @@ fn build_action(reason: WaitingReason, candidate: &Candidate) -> WorkAction {
             .map(|s| s.as_str().to_string())
             .unwrap_or_default()
     };
+    // When no review-target commit exists yet (e.g. `CommitPlanRevision`
+    // on a plan with no committed revision yet), default to
+    // `Unattributed` — the wire-typed "no relevance" variant.
     let commit_kind = || {
         candidate
             .review_target_kind
-            .map(|k| k.as_str().to_string())
-            .unwrap_or_default()
+            .unwrap_or(CommitKind::Unattributed)
     };
-    let prompt = |kind: Option<&str>| {
-        prompt_hint_for(reason, kind, &candidate.plan_path).unwrap_or_default()
-    };
+    let prompt =
+        |kind: CommitKind| prompt_hint_for(reason, kind, &candidate.plan_path).unwrap_or_default();
     match reason {
         SessionFinished => WorkAction::SessionFinished,
         CommitPlanRevision => {
             let kind = commit_kind();
-            let kind_opt = if kind.is_empty() {
-                None
-            } else {
-                Some(kind.as_str())
-            };
             WorkAction::CommitPlanRevision {
                 target_sha: target_sha(),
-                commit_kind: kind.clone(),
-                prompt_hint: prompt(kind_opt),
+                commit_kind: kind,
+                prompt_hint: prompt(kind),
             }
         }
         AddressCommitChanges => {
             let kind = commit_kind();
-            let kind_opt = if kind.is_empty() {
-                None
-            } else {
-                Some(kind.as_str())
-            };
             WorkAction::AddressCommitChanges {
                 target_sha: target_sha(),
-                commit_kind: kind.clone(),
-                prompt_hint: prompt(kind_opt),
+                commit_kind: kind,
+                prompt_hint: prompt(kind),
             }
         }
         ReadyToStartImplementation => {
             let kind = commit_kind();
-            let kind_opt = if kind.is_empty() {
-                None
-            } else {
-                Some(kind.as_str())
-            };
             WorkAction::StartImplementation {
                 target_sha: target_sha(),
-                commit_kind: kind.clone(),
-                prompt_hint: prompt(kind_opt),
+                commit_kind: kind,
+                prompt_hint: prompt(kind),
             }
         }
         CommitNeedsReview => {
             let kind = commit_kind();
-            let kind_opt = if kind.is_empty() {
-                None
-            } else {
-                Some(kind.as_str())
-            };
             WorkAction::ReviewCommit {
                 target_sha: target_sha(),
-                commit_kind: kind.clone(),
-                prompt_hint: prompt(kind_opt),
+                commit_kind: kind,
+                prompt_hint: prompt(kind),
             }
         }
     }
@@ -351,22 +283,22 @@ fn build_action(reason: WaitingReason, candidate: &Candidate) -> WorkAction {
 /// terminal/no-work states.
 fn prompt_hint_for(
     reason: WaitingReason,
-    commit_kind: Option<&str>,
+    commit_kind: CommitKind,
     plan_path: &std::path::Path,
 ) -> Option<String> {
     use WaitingReason::*;
     let plan_path_str = plan_path.to_string_lossy();
     Some(match (reason, commit_kind) {
-        (CommitNeedsReview, Some("plan_only")) => format!(
+        (CommitNeedsReview, CommitKind::PlanOnly) => format!(
             "This commit only changes the plan. Read the plan file at {plan_path_str} and \
              review the proposed approach."
         ),
-        (CommitNeedsReview, Some("code_only")) => {
+        (CommitNeedsReview, CommitKind::CodeOnly) => {
             "This commit makes implementation changes. Review the diff and check it against the \
              approved plan."
                 .to_string()
         }
-        (CommitNeedsReview, Some("mixed")) => format!(
+        (CommitNeedsReview, CommitKind::Mixed) => format!(
             "This commit changes both the plan and code. Read the updated plan at {plan_path_str} \
              and review the diff together."
         ),
@@ -709,20 +641,36 @@ mod tests {
         assert!(v.is_empty());
     }
 
+    /// `role` is now a typed `WaitingRole` on `WaitArgs`, so unknown
+    /// values fail at the serde deserialize step (before the daemon
+    /// ever sees a `WaitArgs`). These tests pin that contract.
     #[test]
-    fn parse_role_rejects_unknown() {
-        assert!(matches!(
-            parse_role("reviewer"),
-            Err(WaitError::InvalidRole(_))
-        ));
-        assert!(matches!(parse_role(""), Err(WaitError::InvalidRole(_))));
-        assert!(matches!(parse_role("none"), Err(WaitError::InvalidRole(_))));
+    fn role_unknown_strings_fail_to_deserialize() {
+        for bad in ["reviewer", "", "MASTER", "Reviewers"] {
+            let wire = serde_json::json!({
+                "role": bad,
+                "plan_id": "trinity/foo.md",
+                "author_label": "alice",
+            });
+            let result: Result<WaitArgs, _> = serde_json::from_value(wire);
+            assert!(result.is_err(), "role={bad:?} must fail to decode");
+        }
     }
 
     #[test]
-    fn parse_role_accepts_canonical() {
-        assert_eq!(parse_role("master").unwrap(), WaitingRole::Master);
-        assert_eq!(parse_role("reviewers").unwrap(), WaitingRole::Reviewers);
+    fn role_canonical_strings_deserialize_to_enum() {
+        for (input, want) in [
+            ("master", WaitingRole::Master),
+            ("reviewers", WaitingRole::Reviewers),
+        ] {
+            let wire = serde_json::json!({
+                "role": input,
+                "plan_id": "trinity/foo.md",
+                "author_label": "alice",
+            });
+            let args: WaitArgs = serde_json::from_value(wire).unwrap();
+            assert_eq!(args.role, want);
+        }
     }
 
     #[test]
@@ -789,13 +737,13 @@ mod integration_tests {
         run_git(repo, &["commit", "--quiet", "-m", msg]);
     }
 
-    fn args(repo: &Path, role: &str, sid: &str, author: &str) -> WaitArgs {
+    fn args(repo: &Path, role: WaitingRole, sid: &str, author: &str) -> WaitArgs {
         let basename = repo
             .file_name()
             .and_then(|n| n.to_str())
             .expect("tempdir has basename");
         WaitArgs {
-            role: role.to_string(),
+            role,
             plan_id: format!("{basename}/{sid}.md"),
             author_label: Some(author.to_string()),
             timeout_secs: Some(2),
@@ -812,7 +760,7 @@ mod integration_tests {
 
     fn expect_timeout(r: WaitResponse) {
         match r {
-            WaitResponse::Timeout { timed_out } => assert!(timed_out),
+            WaitResponse::Timeout(t) => assert!(t.timed_out),
             WaitResponse::Work(p) => {
                 panic!(
                     "expected timeout, got work={} locations={:?}",
@@ -841,9 +789,12 @@ mod integration_tests {
         let rt = Runtime::new();
         rt.add_repo(dir.path().to_path_buf()).await.unwrap();
 
-        let resp = wait_for_work(&rt, args(dir.path(), "reviewers", "foo", "codex"))
-            .await
-            .unwrap();
+        let resp = wait_for_work(
+            &rt,
+            args(dir.path(), WaitingRole::Reviewers, "foo", "codex"),
+        )
+        .await
+        .unwrap();
         let (work, locations) = expect_work(resp);
         assert_eq!(work, "review_commit");
         assert_eq!(locations.len(), 1);
@@ -869,7 +820,7 @@ mod integration_tests {
             "# foo v2 uncommitted\n",
         );
 
-        let resp = wait_for_work(&rt, args(dir.path(), "master", "foo", "lloyd"))
+        let resp = wait_for_work(&rt, args(dir.path(), WaitingRole::Master, "foo", "lloyd"))
             .await
             .unwrap();
         let (work, locations) = expect_work(resp);
@@ -923,7 +874,7 @@ mod integration_tests {
         .await
         .unwrap();
 
-        let resp = wait_for_work(&rt, args(dir.path(), "master", "foo", "lloyd"))
+        let resp = wait_for_work(&rt, args(dir.path(), WaitingRole::Master, "foo", "lloyd"))
             .await
             .unwrap();
         let (work, locations) = expect_work(resp);
@@ -993,13 +944,13 @@ mod integration_tests {
             .unwrap();
 
         // codex polls → already voted → times out.
-        let mut a = args(dir.path(), "reviewers", "foo", "codex");
+        let mut a = args(dir.path(), WaitingRole::Reviewers, "foo", "codex");
         a.timeout_secs = Some(1);
         let resp = wait_for_work(&rt, a).await.unwrap();
         expect_timeout(resp);
 
         // bob polls → still missing → returns review work.
-        let mut a = args(dir.path(), "reviewers", "foo", "bob");
+        let mut a = args(dir.path(), WaitingRole::Reviewers, "foo", "bob");
         a.timeout_secs = Some(1);
         let resp = wait_for_work(&rt, a).await.unwrap();
         let (work, locations) = expect_work(resp);
@@ -1039,10 +990,10 @@ mod integration_tests {
         rt.add_repo(dir_a.clone()).await.unwrap();
         rt.add_repo(dir_b.clone()).await.unwrap();
 
-        let resp_a = wait_for_work(&rt, args(&dir_a, "reviewers", "shared", "codex"))
+        let resp_a = wait_for_work(&rt, args(&dir_a, WaitingRole::Reviewers, "shared", "codex"))
             .await
             .unwrap();
-        let resp_b = wait_for_work(&rt, args(&dir_b, "reviewers", "shared", "codex"))
+        let resp_b = wait_for_work(&rt, args(&dir_b, WaitingRole::Reviewers, "shared", "codex"))
             .await
             .unwrap();
         match (resp_a, resp_b) {
@@ -1066,7 +1017,7 @@ mod integration_tests {
         rt.add_repo(dir.path().to_path_buf()).await.unwrap();
 
         // Polling master while only reviewers have work — should time out.
-        let mut a = args(dir.path(), "master", "foo", "lloyd");
+        let mut a = args(dir.path(), WaitingRole::Master, "foo", "lloyd");
         a.timeout_secs = Some(1);
         let resp = wait_for_work(&rt, a).await.unwrap();
         expect_timeout(resp);
@@ -1083,7 +1034,7 @@ mod integration_tests {
         let rt2 = std::sync::Arc::clone(&rt);
         let repo = dir.path().to_path_buf();
         let join = tokio::spawn(async move {
-            let mut a = args(&repo, "master", "foo", "lloyd");
+            let mut a = args(&repo, WaitingRole::Master, "foo", "lloyd");
             a.timeout_secs = Some(5);
             wait_for_work(&rt2, a).await
         });
@@ -1118,7 +1069,12 @@ mod integration_tests {
         let rt = Runtime::new();
         rt.add_repo(dir.path().to_path_buf()).await.unwrap();
 
-        let a = args(dir.path(), "reviewers", "does-not-exist", "codex");
+        let a = args(
+            dir.path(),
+            WaitingRole::Reviewers,
+            "does-not-exist",
+            "codex",
+        );
         let err = wait_for_work(&rt, a).await.unwrap_err();
         assert!(matches!(err, WaitError::UnknownPlan(_)));
     }
@@ -1127,7 +1083,7 @@ mod integration_tests {
     async fn unknown_repo_errors() {
         let rt = Runtime::new();
         let a = WaitArgs {
-            role: "reviewers".to_string(),
+            role: WaitingRole::Reviewers,
             plan_id: "no-such-repo/foo.md".to_string(),
             author_label: Some("codex".to_string()),
             timeout_secs: Some(1),
@@ -1141,7 +1097,7 @@ mod integration_tests {
     async fn missing_author_label_errors_when_none() {
         let rt = Runtime::new();
         let a = WaitArgs {
-            role: "reviewers".to_string(),
+            role: WaitingRole::Reviewers,
             plan_id: "anywhere/foo.md".to_string(),
             author_label: None,
             timeout_secs: Some(1),
@@ -1155,7 +1111,7 @@ mod integration_tests {
     async fn missing_author_label_errors_when_blank() {
         let rt = Runtime::new();
         let a = WaitArgs {
-            role: "reviewers".to_string(),
+            role: WaitingRole::Reviewers,
             plan_id: "anywhere/foo.md".to_string(),
             author_label: Some("   ".to_string()),
             timeout_secs: Some(1),

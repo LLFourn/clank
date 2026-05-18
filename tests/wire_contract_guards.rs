@@ -74,78 +74,20 @@ fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
     }
 }
 
-/// Count occurrences of any of `needles` in `haystack`, NOT scanning
-/// inside `//` line comments or `/* ... */` block comments. Simple
-/// state machine — good enough for production Rust files where we
-/// don't expect adversarial commenting.
-fn count_outside_comments(haystack: &str, needles: &[&str]) -> usize {
-    let bytes = haystack.as_bytes();
-    let mut count = 0usize;
-    let mut i = 0;
-    let mut in_line_comment = false;
-    let mut in_block_comment = false;
-    let mut in_string = false;
-    while i < bytes.len() {
-        let b = bytes[i];
-        if in_line_comment {
-            if b == b'\n' {
-                in_line_comment = false;
-            }
-            i += 1;
-            continue;
-        }
-        if in_block_comment {
-            if b == b'*' && i + 1 < bytes.len() && bytes[i + 1] == b'/' {
-                in_block_comment = false;
-                i += 2;
-                continue;
-            }
-            i += 1;
-            continue;
-        }
-        if in_string {
-            if b == b'\\' && i + 1 < bytes.len() {
-                i += 2;
-                continue;
-            }
-            if b == b'"' {
-                in_string = false;
-            }
-            i += 1;
-            continue;
-        }
-        if b == b'/' && i + 1 < bytes.len() {
-            if bytes[i + 1] == b'/' {
-                in_line_comment = true;
-                i += 2;
-                continue;
-            }
-            if bytes[i + 1] == b'*' {
-                in_block_comment = true;
-                i += 2;
-                continue;
-            }
-        }
-        // Only track `"` strings — Rust lifetimes (`'static`,
-        // `'a`) look like character-literal openers but never
-        // close in lifetime contexts, which would falsely put the
-        // scanner into "string" mode forever.
-        if b == b'"' {
-            in_string = true;
-            i += 1;
-            continue;
-        }
-        for needle in needles {
-            let n = needle.as_bytes();
-            if bytes[i..].starts_with(n) {
-                count += 1;
-                i += n.len();
-                continue;
-            }
-        }
-        i += 1;
-    }
-    count
+/// Count substring occurrences of every needle in production code.
+///
+/// Truncates the file at the first `#[cfg(test)]\nmod` so test
+/// fixtures don't inflate the production allowlist. Doesn't try to
+/// distinguish strings / comments from real source — the guard's
+/// job is to PIN the current count and notice when it changes, so
+/// false positives from doc comments mentioning `json!(` get
+/// absorbed into the allowlist once and stay stable.
+fn count_pattern(haystack: &str, needles: &[&str]) -> usize {
+    let body = haystack
+        .split_once("#[cfg(test)]\nmod ")
+        .map(|(prod, _)| prod)
+        .unwrap_or(haystack);
+    needles.iter().map(|n| body.matches(n).count()).sum()
 }
 
 /// Returns the production source roots the guards scan.
@@ -164,7 +106,7 @@ fn scan(needles: &[&str]) -> BTreeMap<String, usize> {
                 Ok(b) => b,
                 Err(_) => continue,
             };
-            let n = count_outside_comments(&body, needles);
+            let n = count_pattern(&body, needles);
             if n > 0 {
                 out.insert(relative(&path), n);
             }
@@ -227,13 +169,10 @@ fn assert_allowlist(observed: BTreeMap<String, usize>, expected: &[(&str, usize)
 /// row names the phase that drains it; if a row hits zero before
 /// its phase, delete the entry.
 const GUARD_A_ALLOWLIST: &[(&str, usize)] = &[
-    // Public response builders for `get_context`, `list_plans`,
-    // `plan_summary`. Drains to typed DTOs in Phase 4.
-    ("src/mcp_response.rs", 22),
     // 1 production body builder (autofill on raw Value because the
-    // shim doesn't know per-tool arg shapes) + 5 test fixtures.
-    // Phase 4 decides typed-per-tool vs leave-as-Value.
-    ("src/mcp_shim/mod.rs", 6),
+    // shim doesn't know per-tool arg shapes). Phase 4 decides
+    // typed-per-tool vs leave-as-Value.
+    ("src/mcp_shim/mod.rs", 1),
     // `payload: Value` field type on RepoEvent + PlanEvent. Drains
     // in Phase 7 (typed event payloads).
     ("src/repo_state.rs", 2),
@@ -241,7 +180,7 @@ const GUARD_A_ALLOWLIST: &[(&str, usize)] = &[
     ("src/runtime.rs", 5),
     // Route handlers returning `axum::Json<Value>` + json! body
     // construction. Drain to `axum::Json<T>` in Phase 5.
-    ("src/server/http.rs", 36),
+    ("src/server/http.rs", 20),
     // MCP protocol envelope (allowed exception) + tool-arg parsing
     // via Value. Phase 4 keeps the envelope, types the args.
     ("src/server/mcp.rs", 10),
@@ -288,9 +227,6 @@ const GUARD_B_ALLOWLIST: &[(&str, usize)] = &[
     // `match line.kind.as_str() { "addition" => ... }` —
     // diff-line kind. Closed vocab; drain in Phase 6.
     ("frontend/src/components/structured_diff.rs", 1),
-    // `WaitArgs.role: String` on the daemon side. Drain in
-    // Phase 4 alongside MCP arg typing.
-    ("src/server/wait.rs", 1),
     // `match req.tool.as_str() { "list_plans" => ... }` — tool
     // name dispatch. Protocol identifier, not domain state.
     // Phase 4 decides whether to introduce a typed ToolName enum
@@ -333,9 +269,9 @@ fn guard_b_stringly_control_flow_sites_match_allowlist() {
                 Err(_) => continue,
             };
             let mut total = 0usize;
-            total += count_outside_comments(&body, dto_field_needles);
-            total += count_outside_comments(&body, match_needles);
-            total += count_outside_comments(&body, eq_needles);
+            total += count_pattern(&body, dto_field_needles);
+            total += count_pattern(&body, match_needles);
+            total += count_pattern(&body, eq_needles);
             if total > 0 {
                 observed.insert(relative(&path), total);
             }
