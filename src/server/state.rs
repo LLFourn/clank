@@ -8,6 +8,22 @@ use tokio::sync::Mutex;
 
 use crate::runtime::Runtime;
 
+/// Where the daemon reads the Leptos SPA bundle from.
+///
+/// `Embedded` is the production / default path — `build.rs` ran
+/// `trunk build --release` and `include_dir!` baked the result into
+/// the binary, so daemon and frontend versions cannot drift.
+///
+/// `Disk(path)` is a developer escape hatch enabled by the
+/// `TRINITY_FRONTEND_DIST_OVERRIDE` env var or `--frontend-dist`
+/// CLI flag. Useful when running `trunk watch` in another terminal
+/// for fast frontend iteration without rebuilding the daemon.
+#[derive(Clone)]
+pub enum Bundle {
+    Embedded(&'static include_dir::Dir<'static>),
+    Disk(PathBuf),
+}
+
 #[derive(Clone)]
 pub struct AppState {
     pub runtime: Arc<Runtime>,
@@ -16,13 +32,10 @@ pub struct AppState {
     /// double-watching. Dropped when the server stops; tasks abort
     /// with the runtime.
     pub watchers: Arc<Mutex<BTreeMap<PathBuf, tokio::task::JoinHandle<()>>>>,
-    /// Directory containing the built Leptos bundle. Served at `/static/*`.
-    pub frontend_dist: PathBuf,
-    /// `frontend_dist/index.html` read once at boot. The SPA fallback
-    /// serves this from memory rather than touching disk on every
-    /// request. `None` if the bundle was missing at startup — fallback
-    /// returns 503 with a hint to run `trunk build`.
-    pub spa_shell: Option<Arc<String>>,
+    /// Source of the SPA bundle — usually the embedded dist baked
+    /// into this binary; optionally a disk path for `trunk watch`
+    /// dev loops.
+    pub bundle: Bundle,
     /// Expanded path of the repos registry file (`--repos` /
     /// `$TRINITY_REPOS`, defaulting to `~/.trinity/repos`). Both
     /// `start_plan` (persist) and the new `delete_repo` handler write

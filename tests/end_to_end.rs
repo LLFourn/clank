@@ -88,7 +88,7 @@ async fn spawn_daemon_with_repos_file(
         bind: addr,
         repos: repos_path.to_string_lossy().into_owned(),
         lock: lock_path,
-        frontend_dist: std::path::PathBuf::from("frontend/dist"),
+        frontend_dist: None,
     };
 
     let url = format!("http://{}", addr);

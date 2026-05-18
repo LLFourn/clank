@@ -1,11 +1,11 @@
 //! HTTP routes backed by the filesystem-truth runtime.
 
 use std::path::PathBuf;
-use std::sync::Arc;
 
 use axum::Router;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
+use axum::http::header;
 use axum::response::{Html, IntoResponse, Response, Sse, sse};
 use axum::routing::{get, post};
 use futures::stream::Stream;
@@ -13,12 +13,10 @@ use serde::Deserialize;
 
 use super::AppState;
 use super::mcp;
+use super::state::Bundle;
 use super::wait::{WaitArgs, WaitError, wait_for_work};
 
 pub fn router(state: AppState) -> Router {
-    let static_service = tower_http::services::ServeDir::new(state.frontend_dist.clone());
-    let spa_shell = state.spa_shell.clone();
-    let frontend_dist = state.frontend_dist.clone();
     Router::new()
         .route("/healthz", get(healthz))
         .route("/events", get(events_route))
@@ -41,25 +39,79 @@ pub fn router(state: AppState) -> Router {
             "/api/repos/{basename}",
             axum::routing::delete(api_repos_delete),
         )
-        .nest_service("/static", static_service)
-        .fallback(move || serve_spa_shell(spa_shell.clone(), frontend_dist.clone()))
+        .route("/static/{*path}", get(serve_static_asset))
+        .fallback(get(serve_spa_shell))
         .with_state(state)
 }
 
-/// Serve the cached Leptos shell (read once at boot into `AppState`).
-/// Falls back to a 503 with a build hint when the cache is empty (i.e.
-/// `frontend_dist/index.html` was missing at startup).
-async fn serve_spa_shell(shell: Option<Arc<String>>, frontend_dist: PathBuf) -> Response {
-    match shell {
-        Some(body) => Html((*body).clone()).into_response(),
+/// Resolve `/static/<path>` against the daemon's `Bundle`. Embedded
+/// mode reads from the binary's `include_dir!` table; Disk mode
+/// re-reads from the filesystem on every request so `trunk watch`
+/// reload loops work without restarting the daemon.
+async fn serve_static_asset(State(state): State<AppState>, Path(path): Path<String>) -> Response {
+    match &state.bundle {
+        Bundle::Embedded(dir) => match dir.get_file(&path) {
+            Some(file) => {
+                let mime = mime_for(&path);
+                ([(header::CONTENT_TYPE, mime)], file.contents()).into_response()
+            }
+            None => StatusCode::NOT_FOUND.into_response(),
+        },
+        Bundle::Disk(dir) => {
+            let full = dir.join(&path);
+            match tokio::fs::read(&full).await {
+                Ok(bytes) => {
+                    let mime = mime_for(&path);
+                    ([(header::CONTENT_TYPE, mime)], bytes).into_response()
+                }
+                Err(_) => StatusCode::NOT_FOUND.into_response(),
+            }
+        }
+    }
+}
+
+/// SPA fallback: serve `index.html` for any unmatched route so the
+/// Leptos router handles in-app navigation client-side.
+async fn serve_spa_shell(State(state): State<AppState>) -> Response {
+    let bytes = match &state.bundle {
+        Bundle::Embedded(dir) => dir.get_file("index.html").map(|f| f.contents().to_vec()),
+        Bundle::Disk(dir) => tokio::fs::read(dir.join("index.html")).await.ok(),
+    };
+    match bytes {
+        Some(body) => Html(body).into_response(),
         None => (
             StatusCode::SERVICE_UNAVAILABLE,
-            format!(
-                "Leptos bundle not found at {}/index.html. Run `trunk build` in frontend/ or set --frontend-dist.",
-                frontend_dist.display()
-            ),
+            "Leptos bundle missing index.html. The embedded bundle is built by \
+             `build.rs`; if you set --frontend-dist, run `trunk build` in frontend/.",
         )
             .into_response(),
+    }
+}
+
+/// MIME type for a few extensions the SPA actually serves. `axum`'s
+/// default static-file pipeline (via `tower-http`) is heavier-weight
+/// than we need; this table covers the trunk output set.
+fn mime_for(path: &str) -> &'static str {
+    if path.ends_with(".wasm") {
+        "application/wasm"
+    } else if path.ends_with(".js") {
+        "application/javascript; charset=utf-8"
+    } else if path.ends_with(".css") {
+        "text/css; charset=utf-8"
+    } else if path.ends_with(".html") {
+        "text/html; charset=utf-8"
+    } else if path.ends_with(".json") {
+        "application/json"
+    } else if path.ends_with(".svg") {
+        "image/svg+xml"
+    } else if path.ends_with(".png") {
+        "image/png"
+    } else if path.ends_with(".ico") {
+        "image/x-icon"
+    } else if path.ends_with(".woff2") {
+        "font/woff2"
+    } else {
+        "application/octet-stream"
     }
 }
 
@@ -638,8 +690,10 @@ mod wire_tests {
         let state = AppState {
             runtime: Arc::clone(&runtime),
             watchers: Arc::new(Mutex::new(std::collections::BTreeMap::new())),
-            frontend_dist: std::path::PathBuf::from("frontend/dist"),
-            spa_shell: None,
+            // Tests never hit the SPA-serving routes; point at a
+            // bogus disk path so the variant is constructed without
+            // requiring an actual bundle on disk.
+            bundle: Bundle::Disk(std::path::PathBuf::from("/dev/null")),
             repos_path: std::path::PathBuf::from("/dev/null"),
         };
         (runtime, state)

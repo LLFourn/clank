@@ -5,6 +5,7 @@ members = [".", "frontend", "crates/trinity-core"]
 name = "trinity"
 version = "0.0.1"
 edition = "2024"
+build = "build.rs"
 
 [dependencies]
 # Runtime
@@ -68,6 +69,11 @@ tokio-stream = { version = "0.1", features = ["sync"] }
 
 # Text diff for plan revisions
 similar = "2"
+
+# Embed the Leptos SPA bundle into the daemon binary so there's no
+# version-skew between the running daemon and the wasm bundle on
+# disk. See `build.rs` and `server::state::Bundle`.
+include_dir = "0.7"
 
 [dev-dependencies]
 tempfile = "3"

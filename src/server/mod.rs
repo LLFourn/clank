@@ -41,13 +41,24 @@ pub struct ServeArgs {
     )]
     pub lock: String,
 
-    /// Path to the built Leptos SPA bundle. The daemon serves the
-    /// directory at `/static/*` and falls back to `<dir>/index.html` for
-    /// unknown routes. Default points at the in-repo `frontend/dist/`
-    /// produced by `trunk build`.
-    #[arg(long, default_value = "frontend/dist", env = "TRINITY_FRONTEND_DIST")]
-    pub frontend_dist: PathBuf,
+    /// Developer escape hatch: serve the Leptos SPA bundle from a
+    /// disk directory instead of the binary-embedded one. Set this
+    /// when running `trunk watch` in another terminal for fast
+    /// frontend iteration without rebuilding the daemon.
+    ///
+    /// Default (unset) is "use the embedded bundle." The embedded
+    /// bundle is rebuilt by `build.rs` whenever frontend source
+    /// changes, so version skew between daemon and SPA is impossible
+    /// in the default workflow.
+    #[arg(long, env = "TRINITY_FRONTEND_DIST")]
+    pub frontend_dist: Option<PathBuf>,
 }
+
+/// Bundle embedded by `build.rs` running `trunk build --release`.
+/// The `include_dir!` macro walks `frontend/dist/` at compile time
+/// and bakes every file into the binary.
+static EMBEDDED_BUNDLE: include_dir::Dir<'static> =
+    include_dir::include_dir!("$CARGO_MANIFEST_DIR/frontend/dist");
 
 pub async fn serve(args: ServeArgs) -> anyhow::Result<()> {
     // Multi-process safety: refuse to boot if another daemon is alive.
@@ -99,12 +110,20 @@ pub async fn serve(args: ServeArgs) -> anyhow::Result<()> {
         }
     }
 
-    let spa_shell = load_spa_shell(&args.frontend_dist);
+    let bundle = match &args.frontend_dist {
+        Some(path) => {
+            tracing::info!(
+                path = %path.display(),
+                "serving SPA bundle from disk (frontend dev mode)"
+            );
+            state::Bundle::Disk(path.clone())
+        }
+        None => state::Bundle::Embedded(&EMBEDDED_BUNDLE),
+    };
     let state = AppState {
         runtime: Arc::clone(&runtime),
         watchers: Arc::new(Mutex::new(watchers)),
-        frontend_dist: args.frontend_dist.clone(),
-        spa_shell,
+        bundle,
         repos_path: repos_path.clone(),
     };
 
@@ -173,26 +192,6 @@ fn read_repos_file(path: &std::path::Path) -> std::io::Result<Vec<PathBuf>> {
         .filter(|l| !l.is_empty() && !l.starts_with('#'))
         .map(PathBuf::from)
         .collect())
-}
-
-/// Read `<frontend_dist>/index.html` once at startup. Logs a clear
-/// warning when the bundle isn't present so users discover the
-/// misconfiguration in the daemon log rather than via the SPA's 503 the
-/// first time they hit `/`.
-fn load_spa_shell(frontend_dist: &std::path::Path) -> Option<Arc<String>> {
-    let index = frontend_dist.join("index.html");
-    match std::fs::read_to_string(&index) {
-        Ok(body) => Some(Arc::new(body)),
-        Err(err) => {
-            tracing::warn!(
-                path = %index.display(),
-                error = ?err,
-                "Leptos SPA shell not found; `/` will return 503 until \
-                 `trunk build` runs in frontend/ (or set --frontend-dist)"
-            );
-            None
-        }
-    }
 }
 
 fn expand_home(s: &str) -> PathBuf {
