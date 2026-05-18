@@ -227,6 +227,124 @@ const GUARD_B_ALLOWLIST: &[(&str, usize)] = &[
     ("src/server/mcp.rs", 1),
 ];
 
+// ============================================================
+// Guard C — approved-string-field allowlist
+// ============================================================
+
+/// Positive allowlist of every `pub <name>: String` field that may
+/// appear in `trinity_core::api` and `trinity_core::model`. Adding
+/// a new String-typed field requires a deliberate addition here
+/// with a comment explaining why it isn't a closed vocabulary.
+///
+/// The Guard B per-vocab needle list (above) caught only the
+/// historical vocab names (`kind`, `state`, `phase`, …). A
+/// stringly-typed `name` or `category` field would slip through.
+/// This guard inverts that — any unlisted field is a hard fail.
+const APPROVED_STRING_FIELDS: &[(&str, &str)] = &[
+    // Open-vocab identifiers carried as opaque strings on the wire.
+    // The daemon validates these into newtypes at parse boundaries;
+    // the wire form is the raw user input.
+    ("author", "AgentLabel surfaced as String on api shapes"),
+    ("basename", "RepoBasename surfaced as String"),
+    ("commit_sha", "CommitSha surfaced as String"),
+    ("plan_id", "PlanId surfaced as String"),
+    ("plan_intro", "CommitSha for the plan-intro commit"),
+    ("repo", "absolute repo root path"),
+    ("root", "absolute repo root path on RepoRow"),
+    ("sha", "CommitSha on CommitRow / TimelineEvent variants"),
+    ("slug", "PlanKey surfaced as String"),
+    ("target", "CommitSha on TimelineEvent::Review"),
+    ("target_sha", "CommitSha on ReviewTarget / WriteFeedback"),
+    // Free-form / open-vocab text.
+    ("base", "git ref for PR base"),
+    ("body", "raw markdown body (model side)"),
+    ("body_html", "rendered HTML (api side)"),
+    ("body_raw", "raw markdown body (api side)"),
+    ("canonical_path", "absolute filesystem path"),
+    ("command", "shell command suggestion text"),
+    ("content", "diff line content"),
+    ("current_path", "repo-relative plan file path"),
+    ("description", "human-readable explanation"),
+    ("filename", "approval-file basename"),
+    ("from", "git SHA for diff range start"),
+    ("from_path", "repo-relative path for diff range start"),
+    ("header", "diff hunk header"),
+    ("message", "human-readable message"),
+    ("message_body", "commit message body"),
+    ("next_step", "human-readable suggestion"),
+    ("path", "filesystem path"),
+    ("plan_body_html", "rendered plan markdown"),
+    ("plan_path", "repo-relative path on model::Plan"),
+    ("subject", "commit subject line"),
+    ("suggested_message", "PR commit message suggestion"),
+    ("to", "git SHA for diff range end"),
+    ("to_path", "repo-relative path for diff range end"),
+];
+
+#[test]
+fn guard_c_approved_string_fields_in_core() {
+    let core_root = workspace_root()
+        .join("crates")
+        .join("trinity-core")
+        .join("src");
+    assert!(
+        core_root.is_dir(),
+        "guard_c: trinity-core/src missing: {}",
+        core_root.display()
+    );
+    let approved: std::collections::BTreeSet<&str> =
+        APPROVED_STRING_FIELDS.iter().map(|(n, _)| *n).collect();
+    let mut observed: std::collections::BTreeMap<String, std::collections::BTreeSet<String>> =
+        std::collections::BTreeMap::new();
+    for path in rust_files(&core_root) {
+        let body = match fs::read_to_string(&path) {
+            Ok(b) => b,
+            Err(_) => continue,
+        };
+        let prod = body
+            .split_once("#[cfg(test)]\nmod ")
+            .map(|(p, _)| p)
+            .unwrap_or(&body);
+        for line in prod.lines() {
+            let trimmed = line.trim_start();
+            // Match `pub <name>: String` (terminated by `,`, whitespace, or end).
+            if let Some(rest) = trimmed.strip_prefix("pub ")
+                && let Some((name, tail)) = rest.split_once(':')
+            {
+                let name = name.trim();
+                let tail = tail.trim_start();
+                if (tail.starts_with("String,") || tail == "String" || tail.starts_with("String "))
+                    && name.chars().all(|c| c.is_ascii_lowercase() || c == '_')
+                {
+                    observed
+                        .entry(relative(&path))
+                        .or_default()
+                        .insert(name.to_string());
+                }
+            }
+        }
+    }
+    let mut violations: Vec<String> = Vec::new();
+    for (file, fields) in &observed {
+        for field in fields {
+            if !approved.contains(field.as_str()) {
+                violations.push(format!("  {file}: pub {field}: String"));
+            }
+        }
+    }
+    if !violations.is_empty() {
+        panic!(
+            "\n=== Guard C: unapproved `pub <name>: String` field in trinity-core ===\n\
+             A new String-typed field on a wire DTO is almost always a closed\n\
+             vocabulary that should be a typed enum or newtype. If the field\n\
+             is genuinely open-vocab text, add it to APPROVED_STRING_FIELDS\n\
+             in tests/wire_contract_guards.rs with a one-line justification.\n\n\
+             Offending sites:\n{}\n",
+            violations.join("\n")
+        );
+    }
+}
+
 #[test]
 fn guard_b_stringly_control_flow_sites_match_allowlist() {
     // Patterns:
