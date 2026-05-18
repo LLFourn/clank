@@ -664,3 +664,97 @@ pub fn feedback_for_target(plan: &Plan, sha: &CommitSha) -> Vec<Feedback> {
         .map(|(author, fb)| build_feedback(author, fb))
         .collect()
 }
+
+#[cfg(test)]
+mod divergence_tests {
+    //! Phase 8 regression tests pinning the architectural property
+    //! Phase 5 delivered: there is ONE projection path from `model`
+    //! to `api`, so the daemon cannot emit divergent shapes between
+    //! MCP and HTTP for the same underlying plan state.
+    //!
+    //! Previously two parallel response modules silently disagreed
+    //! on `body_html` (MCP empty, UI rendered) and on `MultiPlan`-
+    //! with-gate handling (MCP mapped to Plan phase, UI debug_assert!).
+    //! After the collapse those bugs are structurally impossible —
+    //! these tests pin that invariant.
+    use super::*;
+    use trinity_core::api::Feedback as ApiFeedback;
+    use trinity_core::ids::AgentLabel;
+
+    /// Construct a minimal `CommitGate` with one feedback entry; the
+    /// daemon never builds these directly from the wire but the
+    /// shape mirrors what disk_snapshot constructs.
+    fn fixture_gate() -> CommitGate {
+        let alice = AgentLabel::parse("alice").unwrap();
+        let fb = crate::repo_state::Feedback {
+            verdict: Verdict::Approve,
+            body: "APPROVE\n\nlooks good\n".into(),
+            path: "alice.md".into(),
+            created_at: 1_700_000_000,
+        };
+        CommitGate {
+            state: trinity_core::CommitGateState::Approved,
+            participants: vec![alice.clone()],
+            approvers: vec![alice.clone()],
+            requesters: vec![],
+            ambiguous: vec![],
+            missing: vec![],
+            feedback: std::collections::BTreeMap::from([(alice, fb)]),
+        }
+    }
+
+    /// `build_feedback` is the single rendering entry point — both
+    /// the `commits[].feedback[]` array and the `commits[].gate
+    /// .feedback{}` map flow through it. Verifies the rendered
+    /// `body_html` is non-empty and matches across both surfaces.
+    #[test]
+    fn body_html_is_one_renderer_across_both_surfaces() {
+        let gate = fixture_gate();
+        // The same call site that builds commit-row feedback…
+        let from_row: Vec<ApiFeedback> = gate
+            .feedback
+            .iter()
+            .map(|(a, fb)| build_feedback(a, fb))
+            .collect();
+        // …and the gate's keyed map…
+        let from_gate_api = build_commit_gate(&gate);
+        let from_gate: Vec<ApiFeedback> = from_gate_api.feedback.values().cloned().collect();
+
+        assert_eq!(from_row.len(), 1);
+        assert_eq!(from_gate.len(), 1);
+        // …produce the SAME rendered body. Pre-Phase-5 the MCP path
+        // inlined `body_html: String::new()` here.
+        assert_eq!(from_row[0].body_html, from_gate[0].body_html);
+        assert!(!from_row[0].body_html.is_empty());
+    }
+
+    /// `build_timeline` is the single timeline projector. Verifies
+    /// that a `MultiPlan` event with NO gate is rendered as a
+    /// `CommitMultiPlan` row (the pre-Phase-5 divergence: MCP would
+    /// have mapped a MultiPlan-with-gate to ReviewTargetPhase::Plan,
+    /// UI would have debug_assert!ed. Today both go through one
+    /// function with one branch).
+    #[test]
+    fn multi_plan_event_renders_as_multi_plan_row() {
+        let plan = trinity_core::model::Plan {
+            id: trinity_core::ids::PlanKey::parse("foo").unwrap(),
+            plan_path: ".trinity/plans/foo.md".into(),
+            body: String::new(),
+            body_hash: trinity_core::ids::ContentHash::from_hex_unchecked("a".repeat(64)),
+            plan_intro: trinity_core::ids::CommitSha::parse("abc1").unwrap(),
+            plan_intro_parent: None,
+            last_activity_ts: 0,
+            timeline: vec![trinity_core::model::PlanTimelineEvent {
+                sha: trinity_core::ids::CommitSha::parse("def1").unwrap(),
+                kind: trinity_core::CommitKind::MultiPlan,
+                author_ts: 1_700_000_000,
+                subject: "Touch two plans".into(),
+                gate: None,
+            }],
+            archived_cycles: vec![],
+        };
+        let timeline = build_timeline(&plan);
+        assert_eq!(timeline.len(), 1);
+        assert!(matches!(timeline[0], TimelineEvent::CommitMultiPlan { .. }));
+    }
+}

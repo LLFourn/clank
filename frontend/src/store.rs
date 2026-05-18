@@ -36,10 +36,10 @@ pub fn live_event_ts(e: &LiveEvent) -> i64 {
     }
 }
 
-pub fn live_event_kind_str(e: &LiveEvent) -> &'static str {
+pub fn live_event_kind_str(e: &LiveEvent) -> String {
     match e {
-        LiveEvent::Repo(r) => r.payload.kind_str(),
-        LiveEvent::Plan(p) => p.payload.kind_str(),
+        LiveEvent::Repo(r) => r.payload.to_string(),
+        LiveEvent::Plan(p) => p.payload.to_string(),
     }
 }
 

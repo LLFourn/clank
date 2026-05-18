@@ -601,12 +601,12 @@ pub enum RepoEventPayload {
     RepoUnwatched { plan_count: usize },
 }
 
-impl RepoEventPayload {
-    pub fn kind_str(&self) -> &'static str {
-        match self {
+impl std::fmt::Display for RepoEventPayload {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
             RepoEventPayload::RepoRebuilt {} => "repo_rebuilt",
             RepoEventPayload::RepoUnwatched { .. } => "repo_unwatched",
-        }
+        })
     }
 }
 
@@ -627,12 +627,12 @@ pub enum PlanEventPayload {
     FeedbackRemoved {},
 }
 
-impl PlanEventPayload {
-    pub fn kind_str(&self) -> &'static str {
-        match self {
+impl std::fmt::Display for PlanEventPayload {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
             PlanEventPayload::PlanWorktreeChanged { .. } => "plan_worktree_changed",
             PlanEventPayload::FeedbackChanged {} => "feedback_changed",
             PlanEventPayload::FeedbackRemoved {} => "feedback_removed",
-        }
+        })
     }
 }

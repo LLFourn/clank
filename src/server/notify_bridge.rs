@@ -181,7 +181,11 @@ mod tests {
             .await
             .expect("timeout — watcher did not fire repo_rebuilt")
             .expect("broadcast closed");
-        assert_eq!(event.kind_str(), "repo_rebuilt");
+        assert!(matches!(
+            event,
+            crate::repo_state::LiveEvent::Repo(re)
+                if matches!(re.payload, trinity_core::api::RepoEventPayload::RepoRebuilt {..})
+        ));
     }
 
     #[test]

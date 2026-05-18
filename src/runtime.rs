@@ -640,7 +640,7 @@ mod tests {
         drop(trinity);
         let new_events: Vec<_> = after_events.iter().skip(before).collect();
         assert!(
-            !new_events.iter().any(|e| e.kind_str() == "repo_rebuilt"),
+            !new_events.iter().any(|e| matches!(e, LiveEvent::Repo(re) if matches!(re.payload, trinity_core::api::RepoEventPayload::RepoRebuilt {..}))),
             "no repo_rebuilt should fire for an unwatched repo; got events: {new_events:?}"
         );
     }
@@ -723,7 +723,7 @@ mod tests {
         );
 
         let events = rt.live_events_snapshot().await;
-        assert!(events.iter().any(|e| e.kind_str() == "repo_rebuilt"));
+        assert!(events.iter().any(|e| matches!(e, LiveEvent::Repo(re) if matches!(re.payload, trinity_core::api::RepoEventPayload::RepoRebuilt {..}))));
     }
 
     #[tokio::test]
@@ -748,7 +748,7 @@ mod tests {
 
         let events = rt.live_events_snapshot().await;
         assert!(events.iter().any(|e| {
-            e.kind_str() == "plan_worktree_changed"
+            matches!(e, LiveEvent::Plan(pe) if matches!(pe.payload, trinity_core::api::PlanEventPayload::PlanWorktreeChanged {..}))
                 && e.plan_id().map(|id| id.key().as_str()) == Some("foo")
         }));
     }
@@ -778,7 +778,7 @@ mod tests {
         assert!(
             events
                 .iter()
-                .all(|e| e.kind_str() != "plan_worktree_changed")
+                .all(|e| !matches!(e, LiveEvent::Plan(pe) if matches!(pe.payload, trinity_core::api::PlanEventPayload::PlanWorktreeChanged {..})))
         );
     }
 
@@ -825,7 +825,7 @@ mod tests {
         );
 
         let events = rt.live_events_snapshot().await;
-        assert!(events.iter().any(|e| e.kind_str() == "feedback_changed"));
+        assert!(events.iter().any(|e| matches!(e, LiveEvent::Plan(pe) if matches!(pe.payload, trinity_core::api::PlanEventPayload::FeedbackChanged {..}))));
     }
 
     #[tokio::test]
@@ -916,7 +916,11 @@ mod tests {
             .await
             .expect("timeout waiting for broadcast")
             .expect("broadcast closed");
-        assert_eq!(event.kind_str(), "repo_rebuilt");
+        assert!(matches!(
+            event,
+            LiveEvent::Repo(re)
+                if matches!(re.payload, trinity_core::api::RepoEventPayload::RepoRebuilt {..})
+        ));
     }
 
     #[tokio::test]

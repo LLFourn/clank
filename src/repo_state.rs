@@ -272,13 +272,6 @@ pub enum LiveEvent {
 }
 
 impl LiveEvent {
-    pub fn kind_str(&self) -> &'static str {
-        match self {
-            LiveEvent::Repo(e) => e.payload.kind_str(),
-            LiveEvent::Plan(e) => e.payload.kind_str(),
-        }
-    }
-
     pub fn plan_id(&self) -> Option<&crate::lifecycle::PlanId> {
         match self {
             LiveEvent::Plan(e) => Some(&e.plan_id),
