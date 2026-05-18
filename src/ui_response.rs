@@ -92,7 +92,7 @@ fn plans_index_parts(
             .as_ref()
             .map(|b| crate::lifecycle::PlanId::new(b.clone(), plan.id.clone()).to_string());
         let last_activity_ts = crate::projection::last_activity_ts_for(plan);
-        let lifecycle = crate::repo_state::PlanLifecycle::from_plan(plan);
+        let lifecycle = plan.lifecycle();
         plans.push((
             last_activity_ts,
             json!({
@@ -208,7 +208,7 @@ pub fn plan_page_with_reader(
     let latest_relevant_commit =
         crate::projection::latest_reviewable_commit_for(plan).map(|s| s.as_str().to_string());
 
-    let lifecycle = crate::repo_state::PlanLifecycle::from_plan(plan);
+    let lifecycle = plan.lifecycle();
     let archived_cycles: Vec<Value> = plan
         .archived_cycles
         .iter()

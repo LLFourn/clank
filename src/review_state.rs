@@ -1,70 +1,14 @@
-//! Review verdict + gate types. The active per-commit fold lives in
-//! `projection::build_commit_gates`, operating over a single
-//! commit-keyed feedback map (see plan-doc §"`CommitGate`").
+//! Daemon-internal review gate type. The closed-vocab enums
+//! (`Verdict`, `CommitGateState`) live in `trinity_wire`; this
+//! module re-exports them for ergonomic local use and owns the
+//! `CommitGate` struct (which holds daemon-internal `AgentLabel`
+//! identifiers, so it can't be in the wire crate as-is).
 
 use serde::Serialize;
 
 use crate::lifecycle::AgentLabel;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ReviewVerdict {
-    Approve,
-    RequestChanges,
-    Unmarked,
-}
-
-impl ReviewVerdict {
-    pub fn marker(self) -> &'static str {
-        match self {
-            ReviewVerdict::Approve => "APPROVE",
-            ReviewVerdict::RequestChanges => "REQUEST_CHANGES",
-            ReviewVerdict::Unmarked => "UNMARKED",
-        }
-    }
-
-    pub fn css_class(self) -> &'static str {
-        match self {
-            ReviewVerdict::Approve => "approve",
-            ReviewVerdict::RequestChanges => "request-changes",
-            ReviewVerdict::Unmarked => "unmarked",
-        }
-    }
-
-    pub fn is_verdict_bearing(self) -> bool {
-        matches!(self, ReviewVerdict::Approve | ReviewVerdict::RequestChanges)
-    }
-}
-
-/// Per-commit gate state under the commit-centric review model.
-/// Each reviewable `PlanTimelineEvent` (i.e. one whose `kind` is
-/// `PlanOnly` / `CodeOnly` / `Mixed`) carries an `Option<CommitGate>`;
-/// non-reviewable kinds (`MultiPlan` / `Finalize`) leave it `None`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum CommitGateState {
-    /// At least one cumulative participant is missing on this commit,
-    /// OR no APPROVE has landed yet.
-    Unreviewed,
-    /// All cumulative participants have responded with APPROVE on
-    /// this commit; no `REQUEST_CHANGES` or `Unmarked` outstanding.
-    Approved,
-    /// At least one responder is `REQUEST_CHANGES` or `Unmarked` on
-    /// this commit. Ambiguous/unmarked counts here so the master is
-    /// prompted to fix the verdict marker rather than silently
-    /// stalling.
-    ChangesRequested,
-}
-
-impl CommitGateState {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            CommitGateState::Unreviewed => "unreviewed",
-            CommitGateState::Approved => "approved",
-            CommitGateState::ChangesRequested => "changes_requested",
-        }
-    }
-}
+pub use trinity_wire::CommitGateState;
 
 /// Folded review state for one commit. `participants` is the
 /// cumulative plan-wide set (everyone who left feedback on any

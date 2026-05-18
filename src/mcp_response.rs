@@ -117,7 +117,7 @@ fn plan_summary(
 ) -> Value {
     let plan_id = crate::lifecycle::RepoBasename::from_repo_root(repo_root)
         .map(|b| crate::lifecycle::PlanId::new(b, plan.id.clone()).to_string());
-    let lifecycle = crate::repo_state::PlanLifecycle::from_plan(plan);
+    let lifecycle = plan.lifecycle();
     let archived_cycles: Vec<Value> = plan
         .archived_cycles
         .iter()
@@ -249,7 +249,7 @@ pub fn get_context_response_from_snapshot(
     let latest_relevant_commit =
         crate::projection::latest_reviewable_commit_for(session).map(|s| s.as_str().to_string());
 
-    let lifecycle = crate::repo_state::PlanLifecycle::from_plan(session);
+    let lifecycle = session.lifecycle();
     let archived_cycles: Vec<Value> = session
         .archived_cycles
         .iter()

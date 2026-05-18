@@ -298,6 +298,20 @@ impl Plan {
         self.frozen_at().is_some()
     }
 
+    /// Lifecycle derived from `is_frozen()`. Replaces the legacy
+    /// `PlanLifecycle::from_plan(&Plan)` constructor — now that
+    /// `PlanLifecycle` lives in `trinity_wire`, the daemon owns
+    /// this projection as a method on the daemon's own struct
+    /// (Rust's orphan rule forbids inherent impl blocks on
+    /// externally-defined enums).
+    pub fn lifecycle(&self) -> PlanLifecycle {
+        if self.is_frozen() {
+            PlanLifecycle::Finished
+        } else {
+            PlanLifecycle::Active
+        }
+    }
+
     /// True iff this plan should surface across Trinity's response
     /// shapes given the current `worktree_status`. A plan is HIDDEN
     /// (returns false) when its file is missing from the working
@@ -326,31 +340,11 @@ pub struct PlanTimelineEvent {
     pub gate: Option<CommitGate>,
 }
 
-/// Plan lifecycle as projected from the event-log fold. Replaces the
-/// legacy `PlanState` (which mirrored the `done/` directory move).
-/// Derived from `Plan.frozen_at` — never stored.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PlanLifecycle {
-    Active,
-    Finished,
-}
-
-impl PlanLifecycle {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            PlanLifecycle::Active => "active",
-            PlanLifecycle::Finished => "finished",
-        }
-    }
-
-    pub fn from_plan(plan: &Plan) -> Self {
-        if plan.is_frozen() {
-            PlanLifecycle::Finished
-        } else {
-            PlanLifecycle::Active
-        }
-    }
-}
+/// Plan lifecycle: re-exported from `trinity_wire` so the daemon
+/// and the frontend branch on one definition. Derived from
+/// `Plan::is_frozen()`; see [`Plan::lifecycle`] for the daemon-side
+/// constructor.
+pub use trinity_wire::PlanLifecycle;
 
 /// Per-cycle summary surfaced in the plan-detail UI's cycle-history
 /// view. Sourced from the fold's `freeze_events` side-output; the
@@ -378,65 +372,9 @@ pub struct Feedback {
     pub created_at: i64,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Verdict {
-    Approve,
-    RequestChanges,
-    Unmarked,
-}
+pub use trinity_wire::Verdict;
 
-impl Verdict {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Verdict::Approve => "approve",
-            Verdict::RequestChanges => "request_changes",
-            Verdict::Unmarked => "unmarked",
-        }
-    }
-}
-
-/// Working-tree state of a plan's plan file relative to HEAD. **Never
-/// stored on `Plan`** — always recomputed at read time.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PlanWorktreeStatus {
-    /// Working tree matches HEAD's plan blob.
-    Clean,
-    /// File exists at the active path with a different body.
-    BodyDirty,
-    /// Plan file is missing from the working tree but still present in
-    /// HEAD — operator made an uncommitted deletion. Action: restore
-    /// it from HEAD or commit the deletion.
-    PlanFileMissing,
-}
-
-impl PlanWorktreeStatus {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            PlanWorktreeStatus::Clean => "clean",
-            PlanWorktreeStatus::BodyDirty => "body_dirty",
-            PlanWorktreeStatus::PlanFileMissing => "plan_file_missing",
-        }
-    }
-}
-
-/// Current activity posture for a plan, derived from the latest
-/// reviewable commit's `CommitKind`. `PlanOnly | Mixed → Planning`,
-/// `CodeOnly → Implementing`. Surfaced on the wire as `phase` (legacy
-/// name) for one release. Computed by `projection::current_posture`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Posture {
-    Planning,
-    Implementing,
-}
-
-impl Posture {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Posture::Planning => "planning",
-            Posture::Implementing => "implementing",
-        }
-    }
-}
+pub use trinity_wire::{PlanWorktreeStatus, Posture};
 
 /// Per-commit attribution result. See `.trinity/plans/filesystem-truth-rewrite.md`
 /// "Commit Attribution — pure git walk" for the four classification rules.
@@ -457,71 +395,7 @@ pub enum AttributionResult {
     Unattributed,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PlanTouchKind {
-    Intro,
-    Revision,
-}
-
-impl PlanTouchKind {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            PlanTouchKind::Intro => "intro",
-            PlanTouchKind::Revision => "revision",
-        }
-    }
-}
-
-/// Per-(plan, commit) classification carried on each
-/// `PlanTimelineEvent`. Set by `disk_snapshot::apply_commit` when the
-/// fold appends the event; consumed by projections to drive
-/// reviewable / waiting-on / phase decisions.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CommitKind {
-    /// Touches exactly this plan file (single-plan-touch) and no code.
-    PlanOnly,
-    /// Touches code attributed to this plan; no plan-file touch on
-    /// this commit (attribution inherited via walk-back).
-    CodeOnly,
-    /// Touches this plan file AND code (single-plan-touch + code).
-    Mixed,
-    /// Touches two or more distinct plan files on a single commit.
-    /// Surfaced in the timeline but never gated.
-    MultiPlan,
-    /// The lifecycle commit that froze the plan — `.trinity/finished/
-    /// <stem>/` satisfied the finalize rule at this commit's tree.
-    /// Visible in the timeline as a clickable boundary; not a review
-    /// target, no `CommitGate`, no effect on `waiting_on`. The
-    /// approval files live in `.trinity/finished/<stem>/` at this
-    /// commit, not as live feedback.
-    Finalize,
-    /// Commit has no relevance to this plan (no touch, attribution
-    /// belongs to another plan, or unattributed). Never appears on a
-    /// plan's timeline.
-    Unattributed,
-}
-
-impl CommitKind {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            CommitKind::PlanOnly => "plan_only",
-            CommitKind::CodeOnly => "code_only",
-            CommitKind::Mixed => "mixed",
-            CommitKind::MultiPlan => "multi_plan",
-            CommitKind::Finalize => "finalize",
-            CommitKind::Unattributed => "unattributed",
-        }
-    }
-
-    /// Reviewable kinds carry a `CommitGate` on their timeline event.
-    /// `MultiPlan` / `Finalize` / `Unattributed` are excluded.
-    pub fn is_reviewable(self) -> bool {
-        matches!(
-            self,
-            CommitKind::PlanOnly | CommitKind::CodeOnly | CommitKind::Mixed
-        )
-    }
-}
+pub use trinity_wire::{CommitKind, PlanTouchKind};
 
 /// A single live activity tick from the watcher loop. Tagged enum so a
 /// repo-level event (no plan context) is structurally distinct from a
@@ -556,20 +430,7 @@ pub struct RepoEvent {
     pub payload: serde_json::Value,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RepoEventKind {
-    RepoRebuilt,
-    RepoUnwatched,
-}
-
-impl RepoEventKind {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            RepoEventKind::RepoRebuilt => "repo_rebuilt",
-            RepoEventKind::RepoUnwatched => "repo_unwatched",
-        }
-    }
-}
+pub use trinity_wire::RepoEventKind;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PlanEvent {
@@ -581,22 +442,7 @@ pub struct PlanEvent {
     pub payload: serde_json::Value,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PlanEventKind {
-    PlanWorktreeChanged,
-    FeedbackChanged,
-    FeedbackRemoved,
-}
-
-impl PlanEventKind {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            PlanEventKind::PlanWorktreeChanged => "plan_worktree_changed",
-            PlanEventKind::FeedbackChanged => "feedback_changed",
-            PlanEventKind::FeedbackRemoved => "feedback_removed",
-        }
-    }
-}
+pub use trinity_wire::PlanEventKind;
 
 /// The `waiting_on` projection — the canonical per-session "who blocks
 /// progress" signal surfaced in MCP context and the web UI.
@@ -608,63 +454,4 @@ pub struct WaitingOn {
     pub description: String,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum WaitingRole {
-    Master,
-    Reviewers,
-    None,
-}
-
-impl WaitingRole {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            WaitingRole::Master => "master",
-            WaitingRole::Reviewers => "reviewers",
-            WaitingRole::None => "none",
-        }
-    }
-}
-
-/// Seven-variant collapsed reason set under the commit-centric model.
-/// The pre-2.5 axis was twelve variants (six pairs of plan/impl
-/// mirrors); the new shape uses one variant per *action* and lets
-/// `description_for` disambiguate prose by `CommitKind` of the
-/// latest relevant commit. See plan §"WaitingReason collapse".
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum WaitingReason {
-    /// Plan is frozen (`Plan::is_frozen()` is true). Nothing to do
-    /// for either role; the plan is sealed.
-    SessionFinished,
-    CommitPlanRevision,
-    /// "REQUEST_CHANGES on the latest reviewable commit; address it."
-    /// Replaces the old AddressPlanRequestChanges + AddressImplRequestChanges
-    /// pair. Description prose disambiguates by commit kind.
-    AddressCommitChanges,
-    /// "Latest reviewable commit is approved; your move." Replaces
-    /// ReadyToImplement + ReadyToFinish. After an approved plan_only
-    /// the master can start coding, revise further, or move to done;
-    /// after an approved code_only/mixed the master can continue,
-    /// revise the plan, or move to done. The wire action is
-    /// `start_implementation` — historically named `move_forward`
-    /// until the verb was found ambiguous between "start the next
-    /// commit" and "move the plan to done/".
-    ReadyToStartImplementation,
-    /// "Latest reviewable commit hasn't been reviewed yet." Replaces
-    /// `PlanNeedsInitialReview` + `PlanNeedsRereview` +
-    /// `ImplNeedsInitialReview` + `ImplNeedsRereview`. Initial review
-    /// vs re-review is a description-prose distinction (do we have
-    /// prior participants?), not a state distinction.
-    CommitNeedsReview,
-}
-
-impl WaitingReason {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            WaitingReason::SessionFinished => "session_finished",
-            WaitingReason::CommitPlanRevision => "commit_plan_revision",
-            WaitingReason::AddressCommitChanges => "address_commit_changes",
-            WaitingReason::ReadyToStartImplementation => "ready_to_start_implementation",
-            WaitingReason::CommitNeedsReview => "commit_needs_review",
-        }
-    }
-}
+pub use trinity_wire::{WaitingReason, WaitingRole};

@@ -37,6 +37,10 @@ blake3 = "1"
 # Path canonicalization
 dunce = "1"
 
+# Shared wire contracts (closed-vocab enums + DTOs). See
+# `.trinity/plans/purge-stringly-typed.md`.
+trinity-wire = { path = "crates/trinity-wire" }
+
 # JSON / schemas
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

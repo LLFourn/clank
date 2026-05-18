@@ -297,7 +297,7 @@ impl Runtime {
                 let Some(plan) = state.plans.get(&session_id) else {
                     return Ok(());
                 };
-                let lifecycle = crate::repo_state::PlanLifecycle::from_plan(plan);
+                let lifecycle = plan.lifecycle();
                 let Some(plan_id) = plan_id_for(repo_root, &plan.id) else {
                     return Ok(());
                 };
@@ -330,11 +330,7 @@ impl Runtime {
                 };
                 upsert_feedback(session, abs_path, parsed, body);
                 refresh_commits_for(state, &session_id);
-                let Some(lifecycle) = state
-                    .plans
-                    .get(&session_id)
-                    .map(crate::repo_state::PlanLifecycle::from_plan)
-                else {
+                let Some(lifecycle) = state.plans.get(&session_id).map(|p| p.lifecycle()) else {
                     return Ok(());
                 };
                 let Some(plan_id) = plan_id_for(repo_root, &session_id) else {
@@ -363,11 +359,7 @@ impl Runtime {
                 };
                 remove_feedback(session, &parsed);
                 refresh_commits_for(state, &session_id);
-                let Some(lifecycle) = state
-                    .plans
-                    .get(&session_id)
-                    .map(crate::repo_state::PlanLifecycle::from_plan)
-                else {
+                let Some(lifecycle) = state.plans.get(&session_id).map(|p| p.lifecycle()) else {
                     return Ok(());
                 };
                 let Some(plan_id) = plan_id_for(repo_root, &session_id) else {

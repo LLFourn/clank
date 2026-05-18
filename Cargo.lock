@@ -3310,6 +3310,7 @@ dependencies = [
  "tower-http",
  "tracing",
  "tracing-subscriber",
+ "trinity-wire",
  "url",
 ]
 

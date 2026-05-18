@@ -85,7 +85,6 @@ fn count_outside_comments(haystack: &str, needles: &[&str]) -> usize {
     let mut in_line_comment = false;
     let mut in_block_comment = false;
     let mut in_string = false;
-    let mut string_char = b'"';
     while i < bytes.len() {
         let b = bytes[i];
         if in_line_comment {
@@ -109,7 +108,7 @@ fn count_outside_comments(haystack: &str, needles: &[&str]) -> usize {
                 i += 2;
                 continue;
             }
-            if b == string_char {
+            if b == b'"' {
                 in_string = false;
             }
             i += 1;
@@ -127,9 +126,12 @@ fn count_outside_comments(haystack: &str, needles: &[&str]) -> usize {
                 continue;
             }
         }
-        if b == b'"' || b == b'\'' {
+        // Only track `"` strings — Rust lifetimes (`'static`,
+        // `'a`) look like character-literal openers but never
+        // close in lifetime contexts, which would falsely put the
+        // scanner into "string" mode forever.
+        if b == b'"' {
             in_string = true;
-            string_char = b;
             i += 1;
             continue;
         }
@@ -227,14 +229,14 @@ fn assert_allowlist(observed: BTreeMap<String, usize>, expected: &[(&str, usize)
 const GUARD_A_ALLOWLIST: &[(&str, usize)] = &[
     // Public response builders for `get_context`, `list_plans`,
     // `plan_summary`. Drains to typed DTOs in Phase 4.
-    ("src/mcp_response.rs", 19),
+    ("src/mcp_response.rs", 22),
     // 1 production body builder (autofill on raw Value because the
     // shim doesn't know per-tool arg shapes) + 5 test fixtures.
     // Phase 4 decides typed-per-tool vs leave-as-Value.
     ("src/mcp_shim/mod.rs", 6),
-    // `payload: Value` field type on RepoEvent. Drains in Phase 7
-    // (typed event payloads).
-    ("src/repo_state.rs", 1),
+    // `payload: Value` field type on RepoEvent + PlanEvent. Drains
+    // in Phase 7 (typed event payloads).
+    ("src/repo_state.rs", 2),
     // LiveEvent payload construction call sites. Drain in Phase 7.
     ("src/runtime.rs", 5),
     // Route handlers returning `axum::Json<Value>` + json! body
@@ -269,11 +271,12 @@ fn guard_a_dynamic_json_sites_match_allowlist() {
 /// the field's type changes from `String` to the corresponding
 /// enum (Phase 6), the count drops.
 const GUARD_B_ALLOWLIST: &[(&str, usize)] = &[
-    // Frontend DTOs: 9 `pub <vocab>: String` fields the scanner
+    // Frontend DTOs: 11 `pub <vocab>: String` fields the scanner
     // catches across PlanRow / ReviewGate / CommitFeedback /
     // CommitRow / PlanDetail / CommitDiffPage / WaitingOn. Drain
-    // in Phase 6 once the wire crate exposes the enums.
-    ("frontend/src/api.rs", 9),
+    // in Phase 6 once the daemon emits the trinity-wire DTOs and
+    // the frontend imports them.
+    ("frontend/src/api.rs", 11),
     // SSE event kind: String — two repo/plan event payloads.
     // Drain in Phase 7 (typed SSE events).
     ("frontend/src/store.rs", 2),
