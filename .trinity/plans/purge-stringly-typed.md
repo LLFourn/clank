@@ -186,13 +186,13 @@ pub struct CommitDetailResponse {
     pub subject: String,
     pub message_body: String,
     pub diff_files: Vec<FileDiff>,
-    pub kind: CommitKind,
-    pub payload: CommitDetailPayload,
+    #[serde(flatten)]
+    pub detail: CommitDetail,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
-pub enum CommitDetailPayload {
+pub enum CommitDetail {
     PlanOnly { feedback: Vec<Feedback> },
     CodeOnly { feedback: Vec<Feedback> },
     Mixed { feedback: Vec<Feedback> },
@@ -201,8 +201,34 @@ pub enum CommitDetailPayload {
 }
 ```
 
-The frontend's `match payload { ... }` is exhaustive at compile
-time. The null bug becomes unrepresentable.
+Serialized wire shape — ONE `kind` field, set of fields after that
+is governed by the variant:
+
+```json
+{
+  "plan_id": "trinity/foo.md",
+  "commit_sha": "abc...",
+  "subject": "Finalize foo",
+  "message_body": "",
+  "diff_files": [],
+  "kind": "finalize",
+  "snapshot": [{"author": "alice", "filename": "alice.md", "body_html": "..."}]
+}
+```
+
+`#[serde(flatten)]` is the load-bearing detail. It hoists the
+tagged enum's discriminator AND its variant fields up to the
+outer object, so there is exactly ONE `kind` on the wire and
+exactly ONE discriminator in the type. The frontend's
+`match resp.detail { ... }` is exhaustive at compile time. No
+outer `kind` + inner `kind` mismatch is representable.
+
+Apply this pattern anywhere a response's field set varies by
+kind: `LiveEvent`, `WorkAction` (already a tagged enum on the
+wire — restate it in `trinity-wire`), `TimelineEvent` (above),
+and any future kind-dependent shape. NEVER carry an outer
+discriminator alongside a tagged-enum payload — that's two
+sources of truth for one fact.
 
 ## Rules
 
