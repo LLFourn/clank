@@ -23,6 +23,7 @@
 
 use serde_json::json;
 use trinity_core::dto::*;
+use trinity_core::ids::*;
 use trinity_core::vocab::*;
 
 // ============================================================
@@ -467,4 +468,46 @@ fn timeline_event_missing_kind_fails_to_decode() {
     });
     let result: Result<TimelineEvent, _> = serde_json::from_value(wire);
     assert!(result.is_err(), "timeline event must carry `kind`");
+}
+
+// ============================================================
+// Identifier newtypes — serde-transparent and validate-on-deserialize
+// ============================================================
+
+#[test]
+fn ids_serialize_as_plain_strings() {
+    let agent = AgentLabel::parse("alice").unwrap();
+    let v = serde_json::to_value(&agent).unwrap();
+    assert_eq!(v, json!("alice"));
+
+    let key = PlanKey::parse("foo").unwrap();
+    let v = serde_json::to_value(&key).unwrap();
+    assert_eq!(v, json!("foo"));
+
+    let sha = CommitSha::parse("abc123").unwrap();
+    let v = serde_json::to_value(&sha).unwrap();
+    assert_eq!(v, json!("abc123"));
+
+    let repo = RepoBasename::parse("trinity").unwrap();
+    let v = serde_json::to_value(&repo).unwrap();
+    assert_eq!(v, json!("trinity"));
+
+    let pid = PlanId::parse("trinity/foo.md").unwrap();
+    let v = serde_json::to_value(&pid).unwrap();
+    assert_eq!(v, json!("trinity/foo.md"));
+}
+
+#[test]
+fn ids_validate_on_deserialize() {
+    let bad: Result<AgentLabel, _> = serde_json::from_value(json!("a/b"));
+    assert!(bad.is_err(), "deserialize must enforce no-slash");
+
+    let bad: Result<CommitSha, _> = serde_json::from_value(json!("XYZ123"));
+    assert!(bad.is_err(), "deserialize must enforce lowercase hex");
+
+    let bad: Result<PlanKey, _> = serde_json::from_value(json!(".hidden"));
+    assert!(bad.is_err(), "deserialize must enforce no-leading-dot");
+
+    let bad: Result<PlanId, _> = serde_json::from_value(json!("trinity/.hidden.md"));
+    assert!(bad.is_err(), "PlanId must reject leading-dot stems");
 }

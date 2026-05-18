@@ -7,6 +7,7 @@ description = "Shared core types (closed-vocab enums + response DTOs + identifie
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
+thiserror = "2"
 
 [dev-dependencies]
 serde_json = "1"

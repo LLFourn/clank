@@ -23,6 +23,7 @@
 //! through identical types.
 
 pub mod dto;
+pub mod ids;
 pub mod vocab;
 
 // Re-export the closed-vocab enums at crate root for ergonomic
@@ -31,4 +32,9 @@ pub use vocab::{
     CommitGateState, CommitKind, DiffLineKind, ExpectedAction, PlanLifecycle, PlanTouchKind,
     PlanWorktreeStatus, Posture, ReviewGateState, ReviewTargetPhase, Verdict, WaitingReason,
     WaitingRole,
+};
+
+// Re-export the identifier newtypes at crate root.
+pub use ids::{
+    AgentLabel, CommitSha, ContentHash, IdError, ParsePlanIdError, PlanId, PlanKey, RepoBasename,
 };
