@@ -90,10 +90,17 @@ fn count_pattern(haystack: &str, needles: &[&str]) -> usize {
     needles.iter().map(|n| body.matches(n).count()).sum()
 }
 
-/// Returns the production source roots the guards scan.
+/// Returns the production source roots the guards scan. `trinity-wire`
+/// is included because the canonical wire contracts live there — a
+/// stringly DTO field defined in the shared crate would silently
+/// pollute both daemon and frontend boundaries.
 fn production_roots() -> Vec<PathBuf> {
     let root = workspace_root();
-    vec![root.join("src"), root.join("frontend").join("src")]
+    vec![
+        root.join("src"),
+        root.join("frontend").join("src"),
+        root.join("crates").join("trinity-wire").join("src"),
+    ]
 }
 
 /// Map { file -> total pattern count } for the patterns named by

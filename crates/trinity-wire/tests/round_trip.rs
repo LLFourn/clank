@@ -94,6 +94,29 @@ fn commit_gate_state_wire_strings() {
 }
 
 #[test]
+fn review_gate_state_wire_strings() {
+    assert_wire(ReviewGateState::Ready, "ready");
+    assert_wire(ReviewGateState::NeedsReview, "needs_review");
+    assert_wire(ReviewGateState::ChangesRequested, "changes_requested");
+}
+
+#[test]
+fn review_gate_state_maps_commit_gate_state() {
+    assert_eq!(
+        ReviewGateState::from(CommitGateState::Approved),
+        ReviewGateState::Ready
+    );
+    assert_eq!(
+        ReviewGateState::from(CommitGateState::Unreviewed),
+        ReviewGateState::NeedsReview
+    );
+    assert_eq!(
+        ReviewGateState::from(CommitGateState::ChangesRequested),
+        ReviewGateState::ChangesRequested
+    );
+}
+
+#[test]
 fn waiting_role_wire_strings() {
     assert_wire(WaitingRole::Master, "master");
     assert_wire(WaitingRole::Reviewers, "reviewers");

@@ -26,5 +26,6 @@ pub mod vocab;
 // imports (`use trinity_wire::CommitKind;`).
 pub use vocab::{
     CommitGateState, CommitKind, DiffLineKind, ExpectedAction, PlanLifecycle, PlanTouchKind,
-    PlanWorktreeStatus, Posture, ReviewTargetPhase, Verdict, WaitingReason, WaitingRole,
+    PlanWorktreeStatus, Posture, ReviewGateState, ReviewTargetPhase, Verdict, WaitingReason,
+    WaitingRole,
 };

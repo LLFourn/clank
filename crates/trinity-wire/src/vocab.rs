@@ -237,6 +237,38 @@ impl CommitGateState {
     }
 }
 
+/// Pre-projected review-gate state used by the plan-page `ReviewGate`
+/// shape. Aliases the per-commit `CommitGateState` vocabulary for the
+/// historical plan/impl-tagged wire shape: `Approved` maps to
+/// `Ready`, `Unreviewed` to `NeedsReview`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReviewGateState {
+    Ready,
+    NeedsReview,
+    ChangesRequested,
+}
+
+impl ReviewGateState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ReviewGateState::Ready => "ready",
+            ReviewGateState::NeedsReview => "needs_review",
+            ReviewGateState::ChangesRequested => "changes_requested",
+        }
+    }
+}
+
+impl From<CommitGateState> for ReviewGateState {
+    fn from(g: CommitGateState) -> Self {
+        match g {
+            CommitGateState::Approved => ReviewGateState::Ready,
+            CommitGateState::Unreviewed => ReviewGateState::NeedsReview,
+            CommitGateState::ChangesRequested => ReviewGateState::ChangesRequested,
+        }
+    }
+}
+
 // ============================================================
 // Waiting-on / work-action
 // ============================================================
@@ -356,6 +388,7 @@ impl_display_via_as_str! {
     ReviewTargetPhase,
     Verdict,
     CommitGateState,
+    ReviewGateState,
     WaitingRole,
     WaitingReason,
     ExpectedAction,

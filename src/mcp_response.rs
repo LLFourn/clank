@@ -21,7 +21,7 @@ use trinity_wire::dto::{
     PlanConflict, PlanRow, PrHint, PrHintOption, ReviewGate, ReviewTarget, TimelineEvent,
     WaitingOn as WireWaitingOn, WriteFeedback,
 };
-use trinity_wire::vocab::{CommitGateState, CommitKind, PlanTouchKind, ReviewTargetPhase};
+use trinity_wire::vocab::{CommitKind, PlanTouchKind, ReviewTargetPhase};
 
 pub trait PlanStatusReader {
     fn compute(
@@ -447,7 +447,7 @@ fn build_review_gate(
         crate::repo_state::Posture::Implementing => impl_gate,
     }?;
     Some(ReviewGate {
-        state: legacy_gate_state_wire(gate.state).to_string(),
+        state: gate.state.into(),
         phase,
         participants: gate
             .participants
@@ -470,19 +470,6 @@ fn build_review_gate(
             .map(|a| a.as_str().to_string())
             .collect(),
     })
-}
-
-/// Legacy `review_gate.state` wire vocabulary — `ready`,
-/// `needs_review`, `changes_requested`. Preserved across the
-/// `ReviewGateDecision` → `CommitGate` switch. The per-commit
-/// `commits[].gate.state` field uses the `CommitGateState` enum
-/// directly (snake_case → `approved`/`unreviewed`/`changes_requested`).
-pub(crate) fn legacy_gate_state_wire(s: CommitGateState) -> &'static str {
-    match s {
-        CommitGateState::Approved => "ready",
-        CommitGateState::Unreviewed => "needs_review",
-        CommitGateState::ChangesRequested => "changes_requested",
-    }
 }
 
 #[cfg(test)]
@@ -736,7 +723,7 @@ mod tests {
         let gate = v
             .review_gate
             .expect("approved plan must have a review_gate");
-        assert_eq!(gate.state, "ready");
+        assert_eq!(gate.state, trinity_wire::vocab::ReviewGateState::Ready);
         assert_eq!(gate.phase, ReviewTargetPhase::Plan);
         assert_eq!(gate.approvals, vec!["alice".to_string()]);
         assert!(gate.request_changes.is_empty());

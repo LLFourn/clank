@@ -23,7 +23,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::vocab::{
     CommitGateState, CommitKind, DiffLineKind, ExpectedAction, PlanLifecycle, PlanTouchKind,
-    PlanWorktreeStatus, Posture, ReviewTargetPhase, Verdict, WaitingReason, WaitingRole,
+    PlanWorktreeStatus, Posture, ReviewGateState, ReviewTargetPhase, Verdict, WaitingReason,
+    WaitingRole,
 };
 
 // ============================================================
@@ -203,14 +204,11 @@ pub struct WriteFeedback {
 }
 
 /// Plan + impl review gates pre-projected for the legacy
-/// plan/impl-tagged wire shape.
+/// plan/impl-tagged wire shape. The daemon constructs this from a
+/// `CommitGateState` via `ReviewGateState::from(...)`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReviewGate {
-    /// Wire-string state — `ready` / `needs_review` /
-    /// `changes_requested`. This is a legacy mapping of
-    /// `CommitGateState`; daemon converts via
-    /// `legacy_gate_state_wire`.
-    pub state: String,
+    pub state: ReviewGateState,
     pub phase: ReviewTargetPhase,
     pub participants: Vec<String>,
     pub approvals: Vec<String>,

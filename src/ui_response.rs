@@ -414,7 +414,7 @@ fn build_review_gate(
         Posture::Implementing => impl_gate,
     }?;
     Some(ReviewGate {
-        state: crate::mcp_response::legacy_gate_state_wire(gate.state).to_string(),
+        state: gate.state.into(),
         phase,
         participants: gate
             .participants

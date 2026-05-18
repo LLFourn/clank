@@ -83,6 +83,7 @@ pub fn MetaStrip(session: PlanDetail) -> impl IntoView {
 #[component]
 fn ReviewGateChips(gate: ReviewGate) -> impl IntoView {
     let state_class = format!("gate-state gate-state-{}", gate.state);
+    let state_label = gate.state.to_string();
     let approvals_chip = chip_view("approvals", &gate.approvals, "approve");
     let request_changes_chip =
         chip_view("request_changes", &gate.request_changes, "request-changes");
@@ -95,7 +96,7 @@ fn ReviewGateChips(gate: ReviewGate) -> impl IntoView {
         <div class="review-gate">
             <div class="gate-header">
                 <span class="gate-phase">"Review gate"</span>
-                <span class=state_class>{gate.state}</span>
+                <span class=state_class>{state_label}</span>
             </div>
             <div class="gate-chips">{approvals_chip}{request_changes_chip}{missing_chip}</div>
         </div>
