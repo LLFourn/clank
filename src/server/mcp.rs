@@ -67,11 +67,14 @@ async fn wait_for_work(state: &AppState, req: &ToolCallRequest) -> Result<Value,
             args.plan_id = id.to_string();
         }
         PlanIdResolution::NoActives { repo } => {
-            return Ok(json!({
-                "timed_out": true,
-                "no_active_plans": true,
-                "repo": repo.to_string_lossy(),
-            }));
+            let timeout =
+                trinity_core::api::WaitForWorkResponse::Timeout(trinity_core::api::WaitTimeout {
+                    timed_out: true,
+                    no_active_plans: true,
+                    repo: Some(repo.to_string_lossy().into_owned()),
+                });
+            return serde_json::to_value(timeout)
+                .map_err(|e| ToolError::Internal(anyhow::anyhow!(e)));
         }
         PlanIdResolution::Ambiguous { candidates } => {
             return mcp_error(trinity_core::api::McpErrorPayload::AmbiguousPlan {

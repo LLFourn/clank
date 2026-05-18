@@ -442,6 +442,74 @@ fn schema_live_event_plan() {
 }
 
 #[test]
+fn schema_mcp_error_no_active_plan() {
+    let v = serde_json::to_value(McpErrorPayload::NoActivePlan {
+        repo: "/r".into(),
+        message: "no active plans in /r".into(),
+    })
+    .unwrap();
+    assert_schema("mcp_error_no_active_plan", &v);
+}
+
+#[test]
+fn schema_mcp_error_ambiguous_plan() {
+    let v = serde_json::to_value(McpErrorPayload::AmbiguousPlan {
+        message: "multiple active plans".into(),
+        candidates: vec![PlanCandidate {
+            plan_id: "trinity/foo.md".into(),
+            current_path: ".trinity/plans/foo.md".into(),
+            lifecycle: PlanLifecycle::Active,
+        }],
+    })
+    .unwrap();
+    assert_schema("mcp_error_ambiguous_plan", &v);
+}
+
+#[test]
+fn schema_mcp_error_unknown_repo() {
+    let v = serde_json::to_value(McpErrorPayload::UnknownRepo {
+        basename: "r".into(),
+    })
+    .unwrap();
+    assert_schema("mcp_error_unknown_repo", &v);
+}
+
+#[test]
+fn schema_mcp_error_plan_conflict() {
+    let v = serde_json::to_value(McpErrorPayload::PlanConflict {
+        slug: "foo".into(),
+        paths: vec![".trinity/plans/foo.md".into()],
+    })
+    .unwrap();
+    assert_schema("mcp_error_plan_conflict", &v);
+}
+
+#[test]
+fn schema_mcp_error_plan_not_committed() {
+    let v = serde_json::to_value(McpErrorPayload::PlanNotCommitted {
+        plan_id: "trinity/foo.md".into(),
+        slug: "foo".into(),
+        next_step: "commit it".into(),
+    })
+    .unwrap();
+    assert_schema("mcp_error_plan_not_committed", &v);
+}
+
+#[test]
+fn schema_start_plan_response() {
+    let v = serde_json::to_value(StartPlanResponse {
+        plan_id: "trinity/foo.md".into(),
+        repo: "/r".into(),
+        canonical_path: "/r/.trinity/plans/foo.md".into(),
+        slug: "foo".into(),
+        committed: false,
+        next_step: "edit then commit".into(),
+    })
+    .unwrap();
+    assert_schema("start_plan_response", &v);
+}
+
+#[test]
 fn skeleton_sanity_check() {
     let v = json!({
         "kind": "x",

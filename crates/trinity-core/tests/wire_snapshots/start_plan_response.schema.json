@@ -1,0 +1,8 @@
+{
+  "canonical_path": "string",
+  "committed": "bool",
+  "next_step": "string",
+  "plan_id": "string",
+  "repo": "string",
+  "slug": "string"
+}

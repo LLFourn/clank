@@ -1,14 +1,13 @@
-//! Daemon-side fold-state types. The shapes the daemon stores
-//! in memory live here; the daemon also publishes them on the
-//! wire — newtypes serialize transparently, so daemon-side
-//! validation survives round-trip.
+//! Daemon-side fold-state types. The shapes the daemon stores in
+//! memory live here; the daemon also publishes them on the wire —
+//! newtypes serialize transparently, so daemon-side validation
+//! survives round-trip.
 //!
 //! Wire-only fields (today: `body_html` on `api::Feedback`) are
-//! NOT on these types. Phase 4 of `trinity-core-unification.md`
-//! formalises the model/api split — until then `api::Feedback`
-//! and `api::CommitGate` continue to carry rendered HTML, and
-//! the daemon's response projection builds those from the
-//! storage shapes here.
+//! NOT on these types. `api::Feedback` and `api::CommitGate`
+//! continue to carry rendered HTML, and the daemon's response
+//! projection (`src/responses.rs`) builds those from the storage
+//! shapes here.
 
 use std::collections::BTreeMap;
 

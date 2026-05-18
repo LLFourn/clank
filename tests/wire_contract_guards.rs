@@ -191,12 +191,12 @@ const GUARD_A_ALLOWLIST: &[(&str, usize)] = &[
     // the shim is a transport, not a domain producer.
     ("src/mcp_shim/mod.rs", 1),
     // MCP protocol envelope: `ToolCallRequest.arguments: Value`
-    // (open-vocab tool dispatch) plus one `echo_cwd` ack. Phase 6
-    // of trinity-core-unification dropped every other dynamic-JSON
-    // site by introducing `api::McpErrorPayload` +
-    // `api::StartPlanResponse`; the remaining count is the true
-    // protocol envelope.
-    ("src/server/mcp.rs", 2),
+    // (open-vocab tool dispatch). Phase 6 + the codex follow-up
+    // typed every other dynamic-JSON site
+    // (`api::McpErrorPayload`, `api::StartPlanResponse`, and the
+    // `WaitForWorkResponse::Timeout` shape for inferred-no-actives);
+    // what remains is the true protocol envelope.
+    ("src/server/mcp.rs", 1),
     // Tool input-schema JSON. Allowed exception per plan §"Allowed
     // exceptions"; typed schema builder is out of scope.
     ("src/tools.rs", 5),

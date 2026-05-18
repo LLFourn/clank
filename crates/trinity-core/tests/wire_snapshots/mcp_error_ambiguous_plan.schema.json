@@ -1,0 +1,11 @@
+{
+  "candidates": [
+    {
+      "current_path": "string",
+      "lifecycle": "string",
+      "plan_id": "string"
+    }
+  ],
+  "error": "string",
+  "message": "string"
+}

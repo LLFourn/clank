@@ -368,38 +368,21 @@ async fn api_plan_revision(
     let body_raw = crate::git_io::show_blob(&repo, &commit_sha, &path_at_sha)
         .await
         .map_err(|e| AppError::internal(format!("git show: {e}")))?;
-    let body_html = crate::responses::render_markdown(&body_raw);
-
-    let previous_sha = pos
-        .checked_sub(1)
-        .and_then(|j| plan_revisions.get(j))
-        .map(|c| c.as_str().to_string());
-    let next_sha = plan_revisions.get(pos + 1).map(|c| c.as_str().to_string());
-
-    let feedback = crate::responses::feedback_for_target(plan, &commit_sha);
-    Ok(axum::Json(trinity_core::api::PlanRevisionResponse {
-        repo: snapshot.root.to_string_lossy().to_string(),
-        plan_id: format!("{repo_basename}/{stem_md}"),
-        slug: plan.id.as_str().to_string(),
-        commit_sha: commit_sha.as_str().to_string(),
+    Ok(axum::Json(crate::responses::build_plan_revision_response(
+        &snapshot,
+        plan,
+        format!("{repo_basename}/{stem_md}"),
+        &commit_sha,
         body_raw,
-        body_html,
-        plan_intro: plan.plan_intro.as_str().to_string(),
-        plan_intro_parent: plan
-            .plan_intro_parent
-            .as_ref()
-            .map(|s| s.as_str().to_string()),
-        previous_sha,
-        next_sha,
-        feedback,
-    }))
+        &plan_revisions,
+        pos,
+    )))
 }
 
 async fn api_commit_diff(
     State(state): State<AppState>,
     Path((repo_basename, stem_md, sha)): Path<(String, String, String)>,
 ) -> Result<axum::Json<trinity_core::api::CommitDetailResponse>, AppError> {
-    use trinity_core::api::{CommitDetail, CommitDetailResponse, FinalizeApproval};
     use trinity_core::vocab::CommitKind;
 
     let (repo, plan_key) = resolve_plan_id_segments(&state, &repo_basename, &stem_md).await?;
@@ -423,6 +406,11 @@ async fn api_commit_diff(
             "commit {sha} is not attributed to {repo_basename}/{stem_md}"
         ))
     })?;
+    if matches!(event.kind, CommitKind::Unattributed) {
+        return Err(AppError::not_found(format!(
+            "commit {sha} is unattributed for {repo_basename}/{stem_md}"
+        )));
+    }
     let stem = plan.id.as_str().to_string();
 
     let patch = crate::git_io::show_commit(&repo, &commit_sha)
@@ -434,62 +422,25 @@ async fn api_commit_diff(
         .await
         .map_err(|e| AppError::internal(format!("git show -s: {e}")))?;
 
-    // Finalize events expose the `.trinity/finished/<stem>/`
-    // snapshot at the freeze commit's tree. Reviewable events
-    // expose live feedback. The tagged `CommitDetail` enum models
-    // the kind-dependent shape — one wire-level `kind`, exhaustive
-    // pattern-match on the frontend.
-    let detail = match event.kind {
-        CommitKind::Finalize => {
-            let files = crate::git_io::read_finalize_snapshot(&repo, &commit_sha, &stem)
-                .await
-                .map_err(|e| AppError::internal(format!("read finalize snapshot: {e}")))?;
-            let snapshot_entries = files
-                .into_iter()
-                .map(|(filename, body)| {
-                    let author = filename
-                        .strip_suffix(".md")
-                        .unwrap_or(&filename)
-                        .to_string();
-                    let body_html = crate::responses::render_markdown(&body);
-                    FinalizeApproval {
-                        author,
-                        filename,
-                        body_html,
-                    }
-                })
-                .collect();
-            CommitDetail::Finalize {
-                snapshot: snapshot_entries,
-            }
-        }
-        CommitKind::PlanOnly => CommitDetail::PlanOnly {
-            feedback: crate::responses::feedback_for_target(plan, &commit_sha),
-        },
-        CommitKind::CodeOnly => CommitDetail::CodeOnly {
-            feedback: crate::responses::feedback_for_target(plan, &commit_sha),
-        },
-        CommitKind::Mixed => CommitDetail::Mixed {
-            feedback: crate::responses::feedback_for_target(plan, &commit_sha),
-        },
-        CommitKind::MultiPlan => CommitDetail::MultiPlan {},
-        CommitKind::Unattributed => {
-            return Err(AppError::not_found(format!(
-                "commit {sha} is unattributed for {repo_basename}/{stem_md}"
-            )));
-        }
+    let finalize_files = if matches!(event.kind, CommitKind::Finalize) {
+        crate::git_io::read_finalize_snapshot(&repo, &commit_sha, &stem)
+            .await
+            .map_err(|e| AppError::internal(format!("read finalize snapshot: {e}")))?
+    } else {
+        Vec::new()
     };
 
-    Ok(axum::Json(CommitDetailResponse {
-        repo: snapshot.root.to_string_lossy().to_string(),
-        plan_id: format!("{repo_basename}/{stem_md}"),
-        slug: stem,
-        commit_sha: commit_sha.as_str().to_string(),
+    Ok(axum::Json(crate::responses::build_commit_detail_response(
+        &snapshot,
+        plan,
+        format!("{repo_basename}/{stem_md}"),
+        &commit_sha,
+        event,
         subject,
         message_body,
         diff_files,
-        detail,
-    }))
+        finalize_files,
+    )))
 }
 
 /// `GET /api/plan/{repo}/{stem_md}/diff/{from}/{to}` — patch between
@@ -536,14 +487,9 @@ async fn api_diff(
         .await
         .map_err(|e| AppError::internal(format!("git diff: {e}")))?;
     let diff_files = crate::diff_parser::parse_diff(&patch);
-    let _ = repo; // canonical path no longer surfaced on this response
-    Ok(axum::Json(trinity_core::api::DiffResponse {
-        from: from_sha.as_str().to_string(),
-        to: to_sha.as_str().to_string(),
-        from_path: from_path.to_string_lossy().to_string(),
-        to_path: to_path.to_string_lossy().to_string(),
-        diff_files,
-    }))
+    Ok(axum::Json(crate::responses::build_diff_response(
+        &from_sha, &to_sha, &from_path, &to_path, diff_files,
+    )))
 }
 
 /// `GET /api/repos` — list every watched repo with its basename,
@@ -554,29 +500,9 @@ async fn api_repos_list(
 ) -> Result<axum::Json<trinity_core::api::RepoListResponse>, AppError> {
     let trinity_arc = state.runtime.state();
     let trinity = trinity_arc.lock().await;
-    let mut rows: Vec<(i64, trinity_core::api::RepoRow)> =
-        Vec::with_capacity(trinity.repo_basenames.len());
-    for (basename, root) in &trinity.repo_basenames {
-        let Some(repo_state) = trinity.repos.get(root) else {
-            continue;
-        };
-        let mut last_ts: i64 = 0;
-        for plan in repo_state.plans.values() {
-            last_ts = last_ts.max(crate::projection::last_activity_ts_for(plan));
-        }
-        rows.push((
-            last_ts,
-            trinity_core::api::RepoRow {
-                basename: basename.as_str().to_string(),
-                root: root.to_string_lossy().to_string(),
-                plan_count: repo_state.plans.len(),
-                last_activity_ts: last_ts,
-            },
-        ));
-    }
-    rows.sort_by_key(|r| std::cmp::Reverse(r.0));
-    let repos = rows.into_iter().map(|(_, v)| v).collect();
-    Ok(axum::Json(trinity_core::api::RepoListResponse { repos }))
+    Ok(axum::Json(crate::responses::build_repo_list_response(
+        &trinity,
+    )))
 }
 
 /// `DELETE /api/repos/{basename}` — unwatch a repo:
