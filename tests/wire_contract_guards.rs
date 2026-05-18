@@ -257,9 +257,7 @@ const APPROVED_STRING_FIELDS: &[(&str, &str)] = &[
     ("target_sha", "CommitSha on ReviewTarget / WriteFeedback"),
     // Free-form / open-vocab text.
     ("base", "git ref for PR base"),
-    ("body", "raw markdown body (model side)"),
-    ("body_html", "rendered HTML (api side)"),
-    ("body_raw", "raw markdown body (api side)"),
+    ("body", "raw markdown body"),
     ("canonical_path", "absolute filesystem path"),
     ("command", "shell command suggestion text"),
     ("content", "diff line content"),

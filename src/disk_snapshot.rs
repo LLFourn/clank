@@ -124,24 +124,17 @@ impl FoldCarry {
             BTreeMap::new();
         for fb in feedback_files {
             let verdict = parse_verdict(&fb.body);
-            let author = fb.parsed.author.clone();
             let feedback = Feedback {
-                author: author.clone(),
+                author: fb.parsed.author.clone(),
                 verdict,
                 body: fb.body,
                 path: fb.abs_path.to_string_lossy().into_owned(),
                 created_at: fb.created_at,
             };
-            // Invariant: when `Feedback` is stored under
-            // `CommitGate.feedback[author]`, the value's `author`
-            // field equals the map key. The redundancy is bounded
-            // — this is the one writer where the gate is built from
-            // disk; downstream readers can rely on the invariant.
-            debug_assert_eq!(&feedback.author, &author);
             feedback_by_plan
                 .entry(fb.parsed.plan_key.clone())
                 .or_default()
-                .insert((fb.parsed.target_sha, fb.parsed.author), feedback);
+                .insert((fb.parsed.target_sha, feedback.author.clone()), feedback);
         }
         Self {
             current_effective: None,
@@ -449,9 +442,9 @@ fn build_gate_step(
     let mut ambiguous: Vec<AgentLabel> = Vec::new();
     let mut commit_feedback: BTreeMap<AgentLabel, Feedback> = BTreeMap::new();
     if let Some(map) = fb_map {
-        for ((target, author), fb) in map {
+        for ((target, _key_author), fb) in map {
             if target == commit_sha {
-                commit_feedback.insert(author.clone(), fb.clone());
+                commit_feedback.insert(fb.author.clone(), fb.clone());
             }
         }
     }

@@ -1,14 +1,9 @@
 //! Wasm-side markdown → sanitized HTML rendering.
 //!
-//! Matches the daemon's previous server-side renderer byte-for-byte
-//! (same `pulldown-cmark` options, same `ammonia::Builder::default()`
-//! plus the one allowed extra attribute). Phase 4 of
-//! `wasm-markdown-rendering.md` deletes the daemon's renderer once
-//! every consumer is on this path.
-
-// Phase 1 adds the renderer module; Phase 2 wires components to it.
-// Until then nothing in the production view tree calls these.
-#![allow(dead_code)]
+//! `pulldown-cmark` for parse + `ammonia::Builder::default()` for
+//! sanitization, plus one allowed `class` attribute. The daemon
+//! ships raw markdown; rendering happens here, synchronously, at
+//! display time.
 
 use pulldown_cmark::{Options, Parser, html};
 use trinity_core::vocab::Verdict;

@@ -91,7 +91,8 @@ pub struct ArchivedCycle {
 
 /// One plan's full fold state. The daemon stores this directly and
 /// the wire response shape is built by projecting selected fields
-/// (plus `body_html` rendering) at the boundary.
+/// at the boundary. Markdown stays raw on the wire; the wasm
+/// frontend renders at display time.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Plan {
     pub id: PlanKey,

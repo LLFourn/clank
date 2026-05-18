@@ -162,11 +162,9 @@ impl StateDigest {
 /// here AND on `api::*` so daemon storage and wire response are
 /// one struct each. Rendered HTML lives in the wasm frontend
 /// (`frontend::markdown`), not on these types and not on the wire.
-pub use trinity_core::model::{Feedback, Plan, PlanTimelineEvent};
+pub use trinity_core::model::{ArchivedCycle, Feedback, Plan, PlanTimelineEvent};
 
 pub use trinity_core::PlanLifecycle;
-
-pub use trinity_core::api::ArchivedCycle;
 
 pub use trinity_core::Verdict;
 

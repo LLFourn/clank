@@ -745,38 +745,30 @@ pub fn feedback_for_target(plan: &Plan, sha: &CommitSha) -> Vec<Feedback> {
 
 #[cfg(test)]
 mod divergence_tests {
-    //! Phase 8 regression tests pinning the architectural property
-    //! Phase 5 delivered: there is ONE projection path from `model`
-    //! to `api`, so the daemon cannot emit divergent shapes between
-    //! MCP and HTTP for the same underlying plan state.
+    //! Regression tests pinning the single-projection-path invariant
+    //! the trinity-core-unification refactor delivered: ONE projection
+    //! path from `model` to `api`, so the daemon cannot emit divergent
+    //! shapes between MCP and HTTP for the same underlying plan state.
     //!
-    //! Previously two parallel response modules silently disagreed
-    //! on `body_html` (MCP empty, UI rendered) and on `MultiPlan`-
-    //! with-gate handling (MCP mapped to Plan phase, UI debug_assert!).
-    //! After the collapse those bugs are structurally impossible —
-    //! these tests pin that invariant.
+    //! Concretely: a `MultiPlan` event with a stray gate must NOT
+    //! emit any `Review` rows on the wire. Pre-collapse the two
+    //! parallel response modules disagreed on this — MCP mapped
+    //! MultiPlan-with-gate to `ReviewTargetPhase::Plan`; UI
+    //! debug_asserted. After collapse the inner match's
+    //! `_ => continue` arm handles non-reviewable kinds uniformly.
+    //!
+    //! (An earlier sibling test pinned that `body_html` was emitted
+    //! identically across surfaces. That test became meaningless when
+    //! wasm-markdown-rendering dropped `body_html` from the wire
+    //! entirely; the MultiPlan invariant is independent and survives.)
     use super::*;
     use trinity_core::ids::AgentLabel;
     use trinity_core::vocab::Verdict;
 
-    /// Strict version of the regression: a `MultiPlan` event MUST
-    /// emit a `CommitMultiPlan` timeline row, AND if a gate ever
-    /// sneaks onto a non-reviewable kind (a fold-invariant
-    /// violation that the daemon must never produce), the gate's
-    /// feedback MUST NOT surface as a `Review` row on the wire.
-    ///
-    /// Pre-Phase-5 the MCP timeline builder mapped MultiPlan-with-gate
-    /// to `ReviewTargetPhase::Plan` and emitted Reviews; the UI
-    /// debug_asserted. Today there is one builder and the inner
-    /// match falls into the `_ => continue` arm for non-reviewable
-    /// kinds, so wire output stays consistent regardless of which
-    /// surface called.
-    ///
-    /// (The earlier `body_html_is_one_renderer_across_both_surfaces`
-    /// regression became meaningless when wasm-markdown-rendering
-    /// Phase 2 dropped `body_html` from the wire — there is no
-    /// rendered HTML on the wire to compare across surfaces. The
-    /// MultiPlan invariant is independent and stays here.)
+    /// A `MultiPlan` event must emit a `CommitMultiPlan` timeline row,
+    /// and if a gate ever sneaks onto a non-reviewable kind (a
+    /// fold-invariant violation), the gate's feedback must NOT surface
+    /// as a `Review` row on the wire.
     #[test]
     fn multi_plan_event_never_emits_review_rows() {
         let alice = AgentLabel::parse("alice").unwrap();
