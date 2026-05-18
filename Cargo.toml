@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "frontend"]
+members = [".", "frontend", "crates/trinity-wire"]
 
 [package]
 name = "trinity"

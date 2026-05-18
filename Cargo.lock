@@ -3330,6 +3330,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "trinity-wire"
+version = "0.0.1"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "try-lock"
 version = "0.2.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"

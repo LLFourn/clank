@@ -1,0 +1,429 @@
+//! Phase 2 contract tests for `trinity-wire`.
+//!
+//! Three categories:
+//!
+//! 1. **Wire-string pinning.** For every closed-vocab enum, every
+//!    variant serializes to an exact snake_case string. A
+//!    developer who renames `WaitingReason::CommitNeedsReview`
+//!    to `WaitingReason::NeedsReview` flips the wire string from
+//!    `"commit_needs_review"` to `"needs_review"` — this test
+//!    fails at the renamer's commit.
+//!
+//! 2. **Tagged-enum round-trip.** Every variant of every
+//!    `#[serde(tag = "kind")]` enum round-trips through
+//!    `to_value` → `from_value`. Catches drift between the tag
+//!    string and the Rust variant name.
+//!
+//! 3. **Decode-failure regression.** Representative malformed
+//!    payloads (null on a required field, missing kind on a
+//!    tagged enum, unknown variant string) fail to decode. The
+//!    daemon's null-bug regression from `055d387` is the
+//!    template — pinned here so the wire crate enforces the
+//!    invariant.
+
+use serde_json::json;
+use trinity_wire::dto::*;
+use trinity_wire::vocab::*;
+
+// ============================================================
+// Wire-string pinning
+// ============================================================
+
+fn assert_wire(value: impl serde::Serialize, expected: &str) {
+    let v = serde_json::to_value(&value).expect("serialize");
+    assert_eq!(
+        v.as_str(),
+        Some(expected),
+        "wire string drift: expected {expected:?}, got {v}"
+    );
+}
+
+#[test]
+fn plan_lifecycle_wire_strings() {
+    assert_wire(PlanLifecycle::Active, "active");
+    assert_wire(PlanLifecycle::Finished, "finished");
+}
+
+#[test]
+fn posture_wire_strings() {
+    assert_wire(Posture::Planning, "planning");
+    assert_wire(Posture::Implementing, "implementing");
+}
+
+#[test]
+fn plan_worktree_status_wire_strings() {
+    assert_wire(PlanWorktreeStatus::Clean, "clean");
+    assert_wire(PlanWorktreeStatus::BodyDirty, "body_dirty");
+    assert_wire(PlanWorktreeStatus::PlanFileMissing, "plan_file_missing");
+}
+
+#[test]
+fn commit_kind_wire_strings() {
+    assert_wire(CommitKind::PlanOnly, "plan_only");
+    assert_wire(CommitKind::CodeOnly, "code_only");
+    assert_wire(CommitKind::Mixed, "mixed");
+    assert_wire(CommitKind::MultiPlan, "multi_plan");
+    assert_wire(CommitKind::Finalize, "finalize");
+    assert_wire(CommitKind::Unattributed, "unattributed");
+}
+
+#[test]
+fn plan_touch_kind_wire_strings() {
+    assert_wire(PlanTouchKind::Intro, "intro");
+    assert_wire(PlanTouchKind::Revision, "revision");
+}
+
+#[test]
+fn review_target_phase_wire_strings() {
+    assert_wire(ReviewTargetPhase::Plan, "plan");
+    assert_wire(ReviewTargetPhase::Impl, "impl");
+}
+
+#[test]
+fn verdict_wire_strings() {
+    assert_wire(Verdict::Approve, "approve");
+    assert_wire(Verdict::RequestChanges, "request_changes");
+    assert_wire(Verdict::Unmarked, "unmarked");
+}
+
+#[test]
+fn commit_gate_state_wire_strings() {
+    assert_wire(CommitGateState::Unreviewed, "unreviewed");
+    assert_wire(CommitGateState::Approved, "approved");
+    assert_wire(CommitGateState::ChangesRequested, "changes_requested");
+}
+
+#[test]
+fn waiting_role_wire_strings() {
+    assert_wire(WaitingRole::Master, "master");
+    assert_wire(WaitingRole::Reviewers, "reviewers");
+    assert_wire(WaitingRole::None, "none");
+}
+
+#[test]
+fn waiting_reason_wire_strings() {
+    assert_wire(WaitingReason::SessionFinished, "session_finished");
+    assert_wire(WaitingReason::CommitPlanRevision, "commit_plan_revision");
+    assert_wire(
+        WaitingReason::AddressCommitChanges,
+        "address_commit_changes",
+    );
+    assert_wire(
+        WaitingReason::ReadyToStartImplementation,
+        "ready_to_start_implementation",
+    );
+    assert_wire(WaitingReason::CommitNeedsReview, "commit_needs_review");
+}
+
+#[test]
+fn expected_action_wire_strings() {
+    assert_wire(ExpectedAction::None, "none");
+    assert_wire(ExpectedAction::CommitPlanRevision, "commit_plan_revision");
+    assert_wire(
+        ExpectedAction::AddressCommitChanges,
+        "address_commit_changes",
+    );
+    assert_wire(ExpectedAction::StartImplementation, "start_implementation");
+    assert_wire(ExpectedAction::ReviewCommit, "review_commit");
+}
+
+#[test]
+fn repo_event_kind_wire_strings() {
+    assert_wire(RepoEventKind::RepoRebuilt, "repo_rebuilt");
+    assert_wire(RepoEventKind::RepoUnwatched, "repo_unwatched");
+}
+
+#[test]
+fn plan_event_kind_wire_strings() {
+    assert_wire(PlanEventKind::PlanWorktreeChanged, "plan_worktree_changed");
+    assert_wire(PlanEventKind::FeedbackChanged, "feedback_changed");
+    assert_wire(PlanEventKind::FeedbackRemoved, "feedback_removed");
+}
+
+#[test]
+fn diff_line_kind_wire_strings() {
+    assert_wire(DiffLineKind::Context, "context");
+    assert_wire(DiffLineKind::Addition, "addition");
+    assert_wire(DiffLineKind::Deletion, "deletion");
+}
+
+// ============================================================
+// `as_str` agrees with wire string
+// ============================================================
+
+#[test]
+fn as_str_agrees_with_wire() {
+    macro_rules! check {
+        ($variant:expr) => {
+            assert_eq!(
+                serde_json::to_value(&$variant).unwrap().as_str().unwrap(),
+                $variant.as_str(),
+                "as_str disagrees with serde wire form for {:?}",
+                $variant,
+            );
+        };
+    }
+    check!(PlanLifecycle::Active);
+    check!(PlanLifecycle::Finished);
+    check!(Posture::Planning);
+    check!(Posture::Implementing);
+    check!(CommitKind::PlanOnly);
+    check!(CommitKind::Finalize);
+    check!(Verdict::Approve);
+    check!(WaitingReason::CommitNeedsReview);
+    check!(WaitingRole::Master);
+    check!(ExpectedAction::ReviewCommit);
+    check!(CommitGateState::ChangesRequested);
+    check!(PlanWorktreeStatus::PlanFileMissing);
+    check!(PlanTouchKind::Revision);
+    check!(ReviewTargetPhase::Impl);
+    check!(RepoEventKind::RepoUnwatched);
+    check!(PlanEventKind::FeedbackRemoved);
+    check!(DiffLineKind::Addition);
+}
+
+// ============================================================
+// Tagged-enum round-trip
+// ============================================================
+
+#[test]
+fn timeline_event_commit_plan_round_trips() {
+    let event = TimelineEvent::CommitPlan {
+        sha: "abc123".into(),
+        subject: "Plan revision: add foo".into(),
+        plan_touch: PlanTouchKind::Revision,
+    };
+    let v = serde_json::to_value(&event).unwrap();
+    assert_eq!(v["kind"], "commit_plan");
+    assert_eq!(v["plan_touch"], "revision");
+    let back: TimelineEvent = serde_json::from_value(v).unwrap();
+    assert_eq!(event, back);
+}
+
+#[test]
+fn timeline_event_commit_finalize_round_trips() {
+    let event = TimelineEvent::CommitFinalize {
+        sha: "deadbeef".into(),
+        subject: "Finalize foo".into(),
+    };
+    let v = serde_json::to_value(&event).unwrap();
+    assert_eq!(v["kind"], "commit_finalize");
+    let back: TimelineEvent = serde_json::from_value(v).unwrap();
+    assert_eq!(event, back);
+}
+
+#[test]
+fn timeline_event_review_round_trips() {
+    let event = TimelineEvent::Review {
+        target: "abc123".into(),
+        author: "codex".into(),
+        verdict: Verdict::Approve,
+        phase: ReviewTargetPhase::Plan,
+        created_at: 1700000000,
+    };
+    let v = serde_json::to_value(&event).unwrap();
+    assert_eq!(v["kind"], "review");
+    assert_eq!(v["verdict"], "approve");
+    assert_eq!(v["phase"], "plan");
+    let back: TimelineEvent = serde_json::from_value(v).unwrap();
+    assert_eq!(event, back);
+}
+
+#[test]
+fn commit_detail_finalize_flattens_kind_to_root() {
+    let response = CommitDetailResponse {
+        repo: "/r".into(),
+        plan_id: "trinity/foo.md".into(),
+        slug: "foo".into(),
+        commit_sha: "abc".into(),
+        subject: "Finalize foo".into(),
+        message_body: "".into(),
+        diff_files: vec![],
+        detail: CommitDetail::Finalize {
+            snapshot: vec![FinalizeApproval {
+                author: "alice".into(),
+                filename: "alice.md".into(),
+                body_html: "<p>ok</p>".into(),
+            }],
+        },
+    };
+    let v = serde_json::to_value(&response).unwrap();
+    // Critical: ONE `kind` at the top level, not nested under
+    // `detail`. `#[serde(flatten)]` over the tagged enum hoists
+    // it.
+    assert_eq!(v["kind"], "finalize");
+    assert!(v.get("detail").is_none(), "expected flatten, got nested");
+    assert!(v["snapshot"].is_array());
+    let back: CommitDetailResponse = serde_json::from_value(v).unwrap();
+    assert_eq!(response, back);
+}
+
+#[test]
+fn commit_detail_plan_only_round_trips() {
+    let response = CommitDetailResponse {
+        repo: "/r".into(),
+        plan_id: "trinity/foo.md".into(),
+        slug: "foo".into(),
+        commit_sha: "abc".into(),
+        subject: "Plan revision".into(),
+        message_body: "".into(),
+        diff_files: vec![],
+        detail: CommitDetail::PlanOnly { feedback: vec![] },
+    };
+    let v = serde_json::to_value(&response).unwrap();
+    assert_eq!(v["kind"], "plan_only");
+    assert!(v["feedback"].is_array());
+    let back: CommitDetailResponse = serde_json::from_value(v).unwrap();
+    assert_eq!(response, back);
+}
+
+#[test]
+fn live_event_repo_rebuilt_round_trips() {
+    let ev = LiveEvent::Repo(RepoEvent {
+        ts: 1700000000,
+        kind: RepoEventKind::RepoRebuilt,
+    });
+    let v = serde_json::to_value(&ev).unwrap();
+    assert_eq!(v["scope"], "repo");
+    assert_eq!(v["kind"], "repo_rebuilt");
+    let back: LiveEvent = serde_json::from_value(v).unwrap();
+    assert_eq!(ev, back);
+}
+
+#[test]
+fn live_event_plan_worktree_changed_round_trips() {
+    let ev = LiveEvent::Plan(PlanEvent {
+        ts: 1700000000,
+        plan_id: "trinity/foo.md".into(),
+        lifecycle: PlanLifecycle::Active,
+        kind: PlanEventKind::PlanWorktreeChanged,
+    });
+    let v = serde_json::to_value(&ev).unwrap();
+    assert_eq!(v["scope"], "plan");
+    assert_eq!(v["kind"], "plan_worktree_changed");
+    let back: LiveEvent = serde_json::from_value(v).unwrap();
+    assert_eq!(ev, back);
+}
+
+#[test]
+fn work_action_review_commit_round_trips_with_typed_kind() {
+    let payload = WorkPayload {
+        plan_id: "trinity/foo.md".into(),
+        repo: "/r".into(),
+        locations: vec![".trinity/feedback/foo/abc/codex.md".into()],
+        action: WorkAction::ReviewCommit {
+            target_sha: "abc".into(),
+            commit_kind: CommitKind::PlanOnly,
+            prompt_hint: "Review the plan.".into(),
+        },
+    };
+    let v = serde_json::to_value(&payload).unwrap();
+    assert_eq!(v["work"], "review_commit");
+    // commit_kind is the enum's wire string, not a hand-written one.
+    assert_eq!(v["commit_kind"], "plan_only");
+    let back: WorkPayload = serde_json::from_value(v).unwrap();
+    assert_eq!(payload, back);
+}
+
+#[test]
+fn work_action_session_finished_round_trips() {
+    let payload = WorkPayload {
+        plan_id: "trinity/foo.md".into(),
+        repo: "/r".into(),
+        locations: vec![],
+        action: WorkAction::SessionFinished,
+    };
+    let v = serde_json::to_value(&payload).unwrap();
+    assert_eq!(v["work"], "session_finished");
+    let back: WorkPayload = serde_json::from_value(v).unwrap();
+    assert_eq!(payload, back);
+}
+
+// ============================================================
+// Decode-failure regressions
+// ============================================================
+
+#[test]
+fn unknown_lifecycle_string_fails_to_decode() {
+    let wire = json!("closed");
+    let result: Result<PlanLifecycle, _> = serde_json::from_value(wire);
+    assert!(
+        result.is_err(),
+        "renamed variant string must fail to decode; got {result:?}"
+    );
+}
+
+#[test]
+fn unknown_waiting_reason_fails_to_decode() {
+    let wire = json!("needs_review");
+    let result: Result<WaitingReason, _> = serde_json::from_value(wire);
+    assert!(
+        result.is_err(),
+        "wire-string drift (commit_needs_review → needs_review) must fail; got {result:?}"
+    );
+}
+
+#[test]
+fn commit_detail_missing_kind_fails_to_decode() {
+    let wire = json!({
+        "repo": "/r",
+        "plan_id": "trinity/foo.md",
+        "slug": "foo",
+        "commit_sha": "abc",
+        "subject": "",
+        "message_body": "",
+        "diff_files": [],
+        "feedback": []
+    });
+    let result: Result<CommitDetailResponse, _> = serde_json::from_value(wire);
+    assert!(
+        result.is_err(),
+        "missing `kind` discriminator must fail; got {result:?}"
+    );
+}
+
+#[test]
+fn commit_detail_null_kind_fails_to_decode() {
+    let wire = json!({
+        "repo": "/r",
+        "plan_id": "trinity/foo.md",
+        "slug": "foo",
+        "commit_sha": "abc",
+        "subject": "",
+        "message_body": "",
+        "diff_files": [],
+        "kind": null
+    });
+    let result: Result<CommitDetailResponse, _> = serde_json::from_value(wire);
+    assert!(result.is_err(), "null `kind` must fail; got {result:?}");
+}
+
+#[test]
+fn commit_detail_unknown_kind_fails_to_decode() {
+    let wire = json!({
+        "repo": "/r",
+        "plan_id": "trinity/foo.md",
+        "slug": "foo",
+        "commit_sha": "abc",
+        "subject": "",
+        "message_body": "",
+        "diff_files": [],
+        "kind": "donemove"
+    });
+    let result: Result<CommitDetailResponse, _> = serde_json::from_value(wire);
+    assert!(
+        result.is_err(),
+        "unknown variant string must fail; got {result:?}"
+    );
+}
+
+#[test]
+fn timeline_event_missing_kind_fails_to_decode() {
+    let wire = json!({
+        "sha": "abc",
+        "subject": "x",
+        "plan_touch": "revision"
+    });
+    let result: Result<TimelineEvent, _> = serde_json::from_value(wire);
+    assert!(result.is_err(), "timeline event must carry `kind`");
+}
