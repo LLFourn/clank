@@ -350,8 +350,6 @@ pub fn plan_page_with_reader(
     };
 
     let plan_id = plan_id_string(&bundle.root, &plan.id);
-    let plan_body_html = render_markdown(&plan.body);
-    let plan_body_truncated = plan.body.chars().count() > 4000;
     let commits = build_commits_array(plan);
     let latest_relevant_commit = review_target_sha
         .as_ref()
@@ -376,8 +374,7 @@ pub fn plan_page_with_reader(
         implementation_commits,
         commits,
         latest_relevant_commit,
-        plan_body_html,
-        plan_body_truncated,
+        plan_body: plan.body.clone(),
         timeline,
         pr_hint,
         archived_cycles: plan.archived_cycles.clone(),
@@ -401,11 +398,10 @@ pub fn build_plan_revision_response(
     plan: &Plan,
     plan_id_str: String,
     commit_sha: &CommitSha,
-    body_raw: String,
+    body: String,
     plan_revisions: &[CommitSha],
     pos: usize,
 ) -> trinity_core::api::PlanRevisionResponse {
-    let body_html = render_markdown(&body_raw);
     let previous_sha = pos
         .checked_sub(1)
         .and_then(|j| plan_revisions.get(j))
@@ -417,8 +413,7 @@ pub fn build_plan_revision_response(
         plan_id: plan_id_str,
         slug: plan.id.as_str().to_string(),
         commit_sha: commit_sha.as_str().to_string(),
-        body_raw,
-        body_html,
+        body,
         plan_intro: plan.plan_intro.as_str().to_string(),
         plan_intro_parent: plan
             .plan_intro_parent
@@ -483,7 +478,7 @@ pub fn build_commit_detail_response(
                     FinalizeApproval {
                         author,
                         filename,
-                        body_html: render_markdown(&body),
+                        body,
                     }
                 })
                 .collect();

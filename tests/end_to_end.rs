@@ -428,7 +428,7 @@ async fn commit_diff_carries_subject_and_message_body_without_patch_leak() {
 }
 
 #[tokio::test]
-async fn plan_detail_carries_body_html_and_timeline_subject() {
+async fn plan_detail_carries_body_and_timeline_subject() {
     let dir = init_repo();
     write_file(
         dir.path(),
@@ -451,10 +451,20 @@ async fn plan_detail_carries_body_html_and_timeline_subject() {
         .unwrap();
     handle.abort();
 
-    let body_html = body["plan_body_html"].as_str().unwrap();
-    assert!(body_html.contains("<h1>Foo Plan</h1>"), "got: {body_html}");
-    assert!(body_html.contains("First paragraph."), "got: {body_html}");
-    assert!(body["plan_body_truncated"].is_boolean());
+    // Phase 3 of wasm-markdown-rendering: the wire ships raw
+    // markdown; the wasm frontend renders. `plan_body_html` /
+    // `plan_body_truncated` are gone.
+    let plan_body = body["plan_body"].as_str().unwrap();
+    assert!(plan_body.contains("# Foo Plan"), "got: {plan_body}");
+    assert!(plan_body.contains("First paragraph."), "got: {plan_body}");
+    assert!(
+        body["plan_body_html"].is_null(),
+        "plan_body_html must NOT cross the wire: {body}"
+    );
+    assert!(
+        body["plan_body_truncated"].is_null(),
+        "plan_body_truncated must NOT cross the wire: {body}"
+    );
 
     let first = &body["timeline"][0];
     assert_eq!(first["kind"], "commit_plan");
@@ -1680,10 +1690,16 @@ async fn finalize_commit_endpoint_returns_full_snapshot_not_just_diff() {
     assert!(authors.contains(&"alice"), "alice must be in snapshot");
     assert!(authors.contains(&"bob"), "bob must be in snapshot");
     let alice = snapshot.iter().find(|e| e["author"] == "alice").unwrap();
-    let alice_html = alice["body_html"].as_str().unwrap();
+    // Phase 3 of wasm-markdown-rendering: FinalizeApproval ships
+    // raw markdown via `body`; the frontend renders.
+    let alice_body = alice["body"].as_str().unwrap();
     assert!(
-        alice_html.contains("Looks good"),
-        "alice's rendered body must carry her approval text; got: {alice_html}"
+        alice_body.contains("Looks good"),
+        "alice's raw body must carry her approval text; got: {alice_body}"
+    );
+    assert!(
+        alice["body_html"].is_null(),
+        "body_html must NOT cross the wire on FinalizeApproval"
     );
     // Finalize events are not gated — the tagged enum doesn't even
     // carry a `feedback` field for the Finalize variant.

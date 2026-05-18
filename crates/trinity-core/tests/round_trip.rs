@@ -253,7 +253,7 @@ fn commit_detail_finalize_flattens_kind_to_root() {
             snapshot: vec![FinalizeApproval {
                 author: "alice".into(),
                 filename: "alice.md".into(),
-                body_html: "<p>ok</p>".into(),
+                body: "APPROVE\n\nlgtm\n".into(),
             }],
         },
     };

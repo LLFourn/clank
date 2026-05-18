@@ -1,6 +1,5 @@
 {
-  "body_html": "string",
-  "body_raw": "string",
+  "body": "string",
   "commit_sha": "string",
   "feedback": [
     {

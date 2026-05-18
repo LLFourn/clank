@@ -113,14 +113,14 @@ pub use crate::model::ArchivedCycle;
 
 /// Approval snapshot file under `.trinity/finished/<stem>/<agent>.md`
 /// at the freeze commit's tree. Surfaced on `CommitDetailResponse`
-/// when the commit's kind is `Finalize`.
+/// when the commit's kind is `Finalize`. `body` is raw markdown;
+/// the wasm frontend renders to HTML at display time.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FinalizeApproval {
     /// Filename's `<author>` segment (without the `.md`).
     pub author: String,
     pub filename: String,
-    /// Sanitized HTML rendering of the approval body.
-    pub body_html: String,
+    pub body: String,
 }
 
 /// What's blocking progress on a plan + who's responsible.
@@ -328,12 +328,12 @@ pub struct PlanDetailResponse {
     pub implementation_commits: Vec<String>,
     pub commits: Vec<CommitRow>,
     pub latest_relevant_commit: Option<String>,
-    /// Sanitized HTML of the plan body. For `lifecycle == Finished`
-    /// this is the body at the freeze commit (captured by the
-    /// fold); for `Active` it's the body at HEAD.
-    pub plan_body_html: String,
-    /// Hint to the SPA on whether to render a see-more toggle.
-    pub plan_body_truncated: bool,
+    /// Raw plan-file markdown. For `lifecycle == Finished` this is
+    /// the body at the freeze commit (captured by the fold); for
+    /// `Active` it's the body at HEAD. The wasm frontend renders
+    /// to HTML and decides truncation locally — neither the
+    /// rendered HTML nor a truncation flag cross the wire.
+    pub plan_body: String,
     pub timeline: Vec<TimelineEvent>,
     pub pr_hint: Option<PrHint>,
     pub archived_cycles: Vec<ArchivedCycle>,
@@ -370,15 +370,15 @@ pub enum CommitDetail {
 }
 
 /// `/api/plan/{repo}/{stem_md}/revision/{sha}` response body.
-/// Returns the plan-file body AT THAT SHA (not HEAD).
+/// Returns the plan-file body AT THAT SHA (not HEAD). Raw markdown
+/// — the wasm frontend renders to HTML at display time.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PlanRevisionResponse {
     pub repo: String,
     pub plan_id: String,
     pub slug: String,
     pub commit_sha: String,
-    pub body_raw: String,
-    pub body_html: String,
+    pub body: String,
     pub plan_intro: String,
     pub plan_intro_parent: Option<String>,
     pub previous_sha: Option<String>,

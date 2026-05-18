@@ -163,7 +163,7 @@ mod dto_roundtrip_tests {
             "diff_files": [],
             "kind": "finalize",
             "snapshot": [
-                {"author": "alice", "filename": "alice.md", "body_html": "<p>lgtm</p>"}
+                {"author": "alice", "filename": "alice.md", "body": "APPROVE\n\nlgtm\n"}
             ]
         }"#;
         let page: CommitDetailResponse =

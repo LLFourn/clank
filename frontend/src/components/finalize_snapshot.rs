@@ -1,6 +1,7 @@
 use leptos::prelude::*;
 
 use crate::api::FinalizeApproval;
+use crate::markdown;
 
 /// Render the `.trinity/finished/<stem>/` approval snapshot sealed
 /// by a finalize commit. This is NOT live feedback — it's the
@@ -61,8 +62,9 @@ fn FinalizeApprovalCard(approval: FinalizeApproval) -> impl IntoView {
     let FinalizeApproval {
         author,
         filename,
-        body_html,
+        body,
     } = approval;
+    let body_html = markdown::render(&body);
     view! {
         <article class="finalize-approval-card">
             <header class="finalize-approval-card-header">

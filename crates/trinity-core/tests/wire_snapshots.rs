@@ -281,8 +281,7 @@ fn schema_plan_detail_response() {
         implementation_commits: vec![],
         commits: vec![commit_row_fixture()],
         latest_relevant_commit: Some("abc".into()),
-        plan_body_html: "<p>hi</p>".into(),
-        plan_body_truncated: false,
+        plan_body: "# hi\n".into(),
         timeline: vec![timeline_review_fixture()],
         pr_hint: Some(pr_hint_fixture()),
         archived_cycles: vec![archived_fixture()],
@@ -323,7 +322,7 @@ fn schema_commit_detail_response_finalize() {
             snapshot: vec![FinalizeApproval {
                 author: "alice".into(),
                 filename: "alice.md".into(),
-                body_html: "<p>lgtm</p>".into(),
+                body: "APPROVE\n\nlgtm\n".into(),
             }],
         },
     })
@@ -338,8 +337,7 @@ fn schema_plan_revision_response() {
         plan_id: "trinity/foo.md".into(),
         slug: "foo".into(),
         commit_sha: "abc".into(),
-        body_raw: "# plan".into(),
-        body_html: "<h1>plan</h1>".into(),
+        body: "# plan\n".into(),
         plan_intro: "def".into(),
         plan_intro_parent: Some("123".into()),
         previous_sha: None,

@@ -3,6 +3,7 @@ use leptos_router::hooks::use_params_map;
 
 use crate::api::{PlanRevisionPage, fetch_plan_revision};
 use crate::components::feedback_card::FeedbackCard;
+use crate::markdown;
 use crate::store::EventStore;
 use crate::util::short_sha;
 
@@ -47,7 +48,7 @@ fn revision_view(page: PlanRevisionPage) -> impl IntoView {
     let prev_link = nav_link(&plan_id, page.previous_sha.as_deref(), "← previous");
     let next_link = nav_link(&plan_id, page.next_sha.as_deref(), "next →");
     let compare_link = compare_link(&plan_id, &page.commit_sha, page.previous_sha.as_deref());
-    let body_html = page.body_html.clone();
+    let body_html = markdown::render(&page.body);
     let feedback_section = if page.feedback.is_empty() {
         None
     } else {

@@ -11,7 +11,7 @@
   "snapshot": [
     {
       "author": "string",
-      "body_html": "string",
+      "body": "string",
       "filename": "string"
     }
   ],

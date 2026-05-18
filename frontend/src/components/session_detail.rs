@@ -52,8 +52,7 @@ fn detail_view(detail: PlanDetail) -> impl IntoView {
     let pr_hint = detail.pr_hint.clone();
     let state_class = format!("state-chip state-{}", detail.lifecycle);
     let state_label = detail.lifecycle.to_string();
-    let plan_body_html = detail.plan_body_html.clone();
-    let plan_body_truncated = detail.plan_body_truncated;
+    let plan_body = detail.plan_body.clone();
     let revision_link = match &detail.latest_plan_revision {
         Some(rev) => format!("/plan/{}/revision/{}", plan_id, rev.commit_sha),
         None => format!("/plan/{}", plan_id),
@@ -78,11 +77,7 @@ fn detail_view(detail: PlanDetail) -> impl IntoView {
                 <main class="session-main">
                     <section class="session-section">
                         <h2>"Plan"</h2>
-                        <PlanPreview
-                            body_html=plan_body_html
-                            truncated=plan_body_truncated
-                            revision_link=revision_link
-                        />
+                        <PlanPreview plan_body=plan_body revision_link=revision_link/>
                         {latest_review_section(latest_review)}
                     </section>
                     <section class="session-section">

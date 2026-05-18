@@ -1,11 +1,15 @@
 use leptos::prelude::*;
 
+use crate::markdown;
+
 /// Inline preview of the current plan body, capped to a fixed height
-/// with a CSS fade. The `truncated` hint comes from the server (set
-/// when the body exceeds ~4000 chars) and controls whether the
-/// see-more toggle renders at all.
+/// with a CSS fade. The wasm frontend renders the raw markdown
+/// body locally and decides truncation locally (no `body_html` or
+/// `plan_body_truncated` field crosses the wire).
 #[component]
-pub fn PlanPreview(body_html: String, truncated: bool, revision_link: String) -> impl IntoView {
+pub fn PlanPreview(plan_body: String, revision_link: String) -> impl IntoView {
+    let truncated = plan_body.chars().count() > 4000;
+    let body_html = markdown::render(&plan_body);
     let expanded = RwSignal::new(false);
     let class = move || {
         if expanded.get() {

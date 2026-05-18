@@ -59,8 +59,7 @@
   "latest_relevant_commit": "string",
   "lifecycle": "string",
   "phase": "string",
-  "plan_body_html": "string",
-  "plan_body_truncated": "bool",
+  "plan_body": "string",
   "plan_id": "string",
   "plan_revisions": [
     "string"

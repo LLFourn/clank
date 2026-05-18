@@ -273,7 +273,7 @@ const APPROVED_STRING_FIELDS: &[(&str, &str)] = &[
     ("message_body", "commit message body"),
     ("next_step", "human-readable suggestion"),
     ("path", "filesystem path"),
-    ("plan_body_html", "rendered plan markdown"),
+    ("plan_body", "raw plan-file markdown (wasm renders to HTML)"),
     ("plan_path", "repo-relative path on model::Plan"),
     ("subject", "commit subject line"),
     ("suggested_message", "PR commit message suggestion"),
