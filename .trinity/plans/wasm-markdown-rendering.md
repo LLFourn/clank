@@ -12,7 +12,13 @@ The architectural payoff:
 - `api::Feedback` and `model::Feedback` are ONE type (~50 LOC of
   projection deleted in `responses.rs`).
 - `api::CommitGate` and `model::CommitGate` are ONE type.
-- Daemon storage IS wire shape, full stop — no carve-outs.
+- The remaining model/api duality from `trinity-core-unification.md`
+  (server-side `body_html` rendering) goes away. The narrower
+  invariant after this plan: domain state is the canonical typed
+  model; wire responses don't carry rendered HTML or duplicate
+  semantic concepts; small endpoint-shape wrappers are still fine
+  when a response position genuinely needs extra context (none
+  remain after Issue 1's resolution, but the door is left open).
 - Daemon `Cargo.toml` loses `pulldown-cmark` and `ammonia`.
 - No new endpoint to maintain; no daemon-side cache; no
   per-render round trips.
@@ -46,10 +52,48 @@ The bundle cost is real but not blocking. The architectural
 upside (smaller daemon, one type per concept, no new endpoint)
 outweighs the +1MB.
 
+## Resolving the `author` ownership
+
+`model::Feedback` today has no `author` field — author identity
+is the map key in `CommitGate.feedback: BTreeMap<AgentLabel,
+Feedback>`. `api::Feedback` carries `author: String` because
+response positions like `CommitRow.feedback: Vec<api::Feedback>`,
+`CommitDetail::{PlanOnly, CodeOnly, Mixed}.feedback`, and
+`PlanRevisionResponse.feedback` need the author name without a
+map context to read it from.
+
+Dropping `body_html` alone is not enough to collapse the two
+types — author ownership has to be resolved.
+
+**Decision**: add `author: AgentLabel` to `model::Feedback`.
+
+- Storage becomes `BTreeMap<AgentLabel, Feedback>` where every
+  value's `author` field equals its map key. The redundancy is
+  bounded — there is exactly one writer
+  (`disk_snapshot.rs::apply_commit`, which builds the gate from
+  feedback files on disk) and one consumer of the read path
+  (`responses.rs::feedback_for_target` and the `build_*` helpers
+  it calls, before they're deleted). Both can `debug_assert!` the
+  invariant.
+- The wire is already redundant here — the existing
+  `api::CommitGate.feedback: BTreeMap<String, api::Feedback>` has
+  the same map-key/value-field duplication. No new wire shape;
+  storage just stops being the odd one out.
+- After this change, `model::Feedback` and `api::Feedback` ARE
+  the same type. One Feedback. No wrapper struct, no keyed-map
+  vs vec ambiguity.
+
+The alternatives (a `AuthoredFeedback { author, feedback }`
+wrapper for Vec positions; or moving Vec positions to maps) were
+considered. The wrapper adds a type for one redundancy, and the
+map move changes wire shape from JSON array to JSON object — both
+are more change for less clarity than just paying the redundancy.
+
 ## Wire-shape changes (enumerated)
 
 1. **`api::Feedback`** drops `body_html`. Renames `body_raw → body`
-   to match the model side. Collapses with `model::Feedback`.
+   to match the model side. Collapses with `model::Feedback`
+   (which gains `author: AgentLabel` per the resolution above).
 
 2. **`api::CommitGate`** collapses with `model::CommitGate` via
    the unified `Feedback`.
@@ -67,8 +111,10 @@ outweighs the +1MB.
 6. **`api::TimelineEvent::Review`** drops `body_html` if it
    carries one. Audit during Phase 2.
 
-Every change is a field removal or rename. Schema snapshots
-register the changes once per affected endpoint.
+Every change is a field removal, rename, or (for #1) a
+storage-side field addition that already exists on the wire.
+Schema snapshots register the wire changes once per affected
+endpoint.
 
 ## What goes where after this plan
 
@@ -149,8 +195,10 @@ includes the deps.
   changes diff.
 - Verify `model::Feedback` and `api::Feedback` resolve to the
   same type (`pub use` re-export confirms at compile time).
-- Update `trinity-core-unification.md`'s footer noting the
-  body_html-on-wire caveat is resolved.
+- `trinity-core-unification.md` is already finished; this plan
+  does NOT touch it. The body_html-on-wire caveat noted in that
+  plan's commentary becomes outdated by this plan's existence,
+  not by edits to its file.
 
 ## Rules
 
