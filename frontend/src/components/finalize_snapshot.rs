@@ -9,6 +9,26 @@ use crate::api::FinalizeApproval;
 /// timeline expansion.
 #[component]
 pub fn FinalizeSnapshot(approvals: Vec<FinalizeApproval>) -> impl IntoView {
+    // Freeze rule requires ≥1 approver — an empty snapshot here
+    // means either (a) the backend's read_finalize_snapshot
+    // failed silently and ate the result, or (b) wire drift. Tell
+    // the user which side is broken rather than rendering a blank
+    // "0 approving reviews" panel.
+    if approvals.is_empty() {
+        return view! {
+            <section class="finalize-snapshot">
+                <header class="finalize-snapshot-header">
+                    <h2>"Finalized"</h2>
+                </header>
+                <p class="finalize-snapshot-note muted">
+                    "(No approval files in this snapshot. The plan froze but the daemon could \
+                     not read .trinity/finished/ at this commit — likely a wire-shape \
+                     regression or a stale daemon build.)"
+                </p>
+            </section>
+        }
+        .into_any();
+    }
     let n = approvals.len();
     let cards = approvals
         .into_iter()
@@ -33,6 +53,7 @@ pub fn FinalizeSnapshot(approvals: Vec<FinalizeApproval>) -> impl IntoView {
             <div class="finalize-snapshot-list">{cards}</div>
         </section>
     }
+    .into_any()
 }
 
 #[component]

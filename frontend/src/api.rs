@@ -251,19 +251,23 @@ pub struct CommitDiffPage {
     pub commit_sha: String,
     /// Daemon-side `CommitKind::as_str()` — `plan_only` / `code_only`
     /// / `mixed` / `multi_plan` / `finalize`. The UI keys finalize
-    /// rendering off `"finalize"`.
-    #[serde(default)]
+    /// rendering off `"finalize"`. Required: every commit-detail
+    /// response carries it. No `#[serde(default)]` — wire drift
+    /// surfaces as a decode error rather than silently rendering
+    /// as a non-finalize commit.
     pub kind: String,
     #[serde(default)]
     pub message_body: String,
     #[serde(default)]
     pub diff_files: Vec<FileDiff>,
-    #[serde(default)]
+    /// Live reviewer feedback on this commit. Always present on the
+    /// wire as a (possibly empty) array; the daemon emits `[]` for
+    /// finalize commits.
     pub feedback: Vec<CommitFeedback>,
     /// Approval snapshot for finalize commits: the `.trinity/finished/
-    /// <stem>/` directory contents at the freeze commit's tree. Empty
-    /// for non-finalize commits.
-    #[serde(default)]
+    /// <stem>/` directory contents at the freeze commit's tree.
+    /// Always present on the wire as a (possibly empty) array; the
+    /// daemon emits `[]` for non-finalize commits.
     pub finalize_snapshot: Vec<FinalizeApproval>,
 }
 
@@ -362,4 +366,96 @@ pub async fn delete_repo(basename: String) -> Result<DeleteRepoOutcome, FetchErr
     resp.json::<DeleteRepoOutcome>()
         .await
         .map_err(|e| FetchError::Decode(e.to_string()))
+}
+
+#[cfg(test)]
+mod dto_roundtrip_tests {
+    //! DTO contract tests for `/api/plan/.../commit/{sha}`. The
+    //! daemon's response shape is hand-maintained in
+    //! `src/server/http.rs::api_commit_diff`; the frontend DTO
+    //! (`CommitDiffPage`) must round-trip every shape the daemon
+    //! emits. Without these tests, a backend that emits `null` for
+    //! an array-typed field silently breaks every commit page on
+    //! the live daemon — the kind of regression ruthless caught in
+    //! 055d387.
+    use super::*;
+
+    #[test]
+    fn reviewable_commit_response_decodes() {
+        // Daemon emits empty `finalize_snapshot: []` for a
+        // non-finalize commit; the DTO's `Vec<FinalizeApproval>`
+        // must accept it.
+        let wire = r#"{
+            "plan_id": "trinity/foo.md",
+            "commit_sha": "abcdef",
+            "kind": "plan_only",
+            "subject": "Plan revision",
+            "message_body": "",
+            "diff_files": [],
+            "feedback": [],
+            "finalize_snapshot": []
+        }"#;
+        let page: CommitDiffPage = serde_json::from_str(wire).expect("decode reviewable commit");
+        assert_eq!(page.kind, "plan_only");
+        assert!(page.finalize_snapshot.is_empty());
+        assert!(page.feedback.is_empty());
+    }
+
+    #[test]
+    fn finalize_commit_response_decodes() {
+        let wire = r#"{
+            "plan_id": "trinity/foo.md",
+            "commit_sha": "abcdef",
+            "kind": "finalize",
+            "subject": "Finalize foo",
+            "message_body": "",
+            "diff_files": [],
+            "feedback": [],
+            "finalize_snapshot": [
+                {"author": "alice", "filename": "alice.md", "body_html": "<p>lgtm</p>"}
+            ]
+        }"#;
+        let page: CommitDiffPage = serde_json::from_str(wire).expect("decode finalize commit");
+        assert_eq!(page.kind, "finalize");
+        assert_eq!(page.finalize_snapshot.len(), 1);
+        assert_eq!(page.finalize_snapshot[0].author, "alice");
+    }
+
+    #[test]
+    fn null_finalize_snapshot_fails_to_decode() {
+        // Regression: prior to the fix, the daemon emitted `null`
+        // for non-finalize commits. This test pins the failure
+        // mode so a future "be lenient" change doesn't reintroduce
+        // the silent-degrade bug.
+        let wire = r#"{
+            "plan_id": "trinity/foo.md",
+            "commit_sha": "abcdef",
+            "kind": "plan_only",
+            "feedback": [],
+            "finalize_snapshot": null
+        }"#;
+        let result: Result<CommitDiffPage, _> = serde_json::from_str(wire);
+        assert!(
+            result.is_err(),
+            "null finalize_snapshot must fail to decode (daemon must emit `[]`); got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn missing_kind_fails_to_decode() {
+        // Without `#[serde(default)]` on `kind`, wire drift surfaces
+        // as a decode error rather than silently rendering as a
+        // non-finalize commit.
+        let wire = r#"{
+            "plan_id": "trinity/foo.md",
+            "commit_sha": "abcdef",
+            "feedback": [],
+            "finalize_snapshot": []
+        }"#;
+        let result: Result<CommitDiffPage, _> = serde_json::from_str(wire);
+        assert!(
+            result.is_err(),
+            "missing `kind` must fail to decode; got: {result:?}"
+        );
+    }
 }

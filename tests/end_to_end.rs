@@ -1673,7 +1673,11 @@ async fn finalize_commit_endpoint_returns_full_snapshot_not_just_diff() {
     assert!(authors.contains(&"bob"), "bob must be in snapshot");
     // Alice's body is unchanged by the freeze commit — diff would miss it.
     let alice = snapshot.iter().find(|e| e["author"] == "alice").unwrap();
-    assert!(alice["body_raw"].as_str().unwrap().contains("Looks good"));
+    let alice_html = alice["body_html"].as_str().unwrap();
+    assert!(
+        alice_html.contains("Looks good"),
+        "alice's rendered body must carry her approval text; got: {alice_html}"
+    );
     // Finalize events are not gated, no live feedback.
     assert_eq!(
         body["feedback"].as_array().unwrap().len(),

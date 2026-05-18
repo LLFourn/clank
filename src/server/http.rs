@@ -440,30 +440,34 @@ async fn api_commit_diff(
     // insufficient — it only shows files this commit changed, but
     // the snapshot is the full directory contents at the freeze.
     // Reviewable events expose live feedback as before.
+    // Both `feedback` and `finalize_snapshot` are ALWAYS arrays on
+    // the wire — emitting null on the negative branch breaks the
+    // frontend DTO's `Vec<...>` deserializer (`#[serde(default)]`
+    // covers missing, not explicit null). One of the arrays is
+    // empty depending on `kind`.
     let (feedback, finalize_snapshot) = if is_finalize {
         let files = crate::git_io::read_finalize_snapshot(&repo, &commit_sha, &stem)
             .await
             .map_err(|e| AppError::internal(format!("read finalize snapshot: {e}")))?;
         let entries: Vec<Value> = files
             .into_iter()
-            .map(|(filename, body_raw)| {
+            .map(|(filename, body)| {
                 let author = filename
                     .strip_suffix(".md")
                     .unwrap_or(&filename)
                     .to_string();
-                let body_html = crate::ui_response::render_markdown(&body_raw);
+                let body_html = crate::ui_response::render_markdown(&body);
                 json!({
                     "author": author,
                     "filename": filename,
-                    "body_raw": body_raw,
                     "body_html": body_html,
                 })
             })
             .collect();
-        (Vec::new(), Value::Array(entries))
+        (Vec::new(), entries)
     } else {
         let fb = crate::ui_response::feedback_for_target(plan, &commit_sha);
-        (fb, Value::Null)
+        (fb, Vec::new())
     };
     Ok(axum::Json(json!({
         "repo": snapshot.root.to_string_lossy(),
