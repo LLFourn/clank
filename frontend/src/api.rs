@@ -249,12 +249,29 @@ pub struct FileDiff {
 pub struct CommitDiffPage {
     pub plan_id: String,
     pub commit_sha: String,
+    /// Daemon-side `CommitKind::as_str()` — `plan_only` / `code_only`
+    /// / `mixed` / `multi_plan` / `finalize`. The UI keys finalize
+    /// rendering off `"finalize"`.
+    #[serde(default)]
+    pub kind: String,
     #[serde(default)]
     pub message_body: String,
     #[serde(default)]
     pub diff_files: Vec<FileDiff>,
     #[serde(default)]
     pub feedback: Vec<CommitFeedback>,
+    /// Approval snapshot for finalize commits: the `.trinity/finished/
+    /// <stem>/` directory contents at the freeze commit's tree. Empty
+    /// for non-finalize commits.
+    #[serde(default)]
+    pub finalize_snapshot: Vec<FinalizeApproval>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct FinalizeApproval {
+    pub author: String,
+    pub filename: String,
+    pub body_html: String,
 }
 
 pub async fn fetch_commit_diff(plan_id: String, sha: String) -> Result<CommitDiffPage, FetchError> {

@@ -1,6 +1,7 @@
 use leptos::prelude::*;
 
 use crate::api::{CommitDiffPage, fetch_commit_diff};
+use crate::components::finalize_snapshot::FinalizeSnapshot;
 use crate::components::structured_diff::StructuredDiff;
 
 /// Inline accordion body for one timeline commit row. Lazily fetches
@@ -40,10 +41,17 @@ pub fn ExpandedCommit(plan_id: String, sha: String) -> impl IntoView {
 fn commit_panel(page: CommitDiffPage) -> impl IntoView {
     let body = page.message_body.clone();
     let has_body = !body.trim().is_empty();
+    let is_finalize = page.kind == "finalize";
+    let finalize_section = if is_finalize {
+        Some(view! { <FinalizeSnapshot approvals=page.finalize_snapshot/> })
+    } else {
+        None
+    };
     view! {
         <Show when=move || has_body>
             <pre class="commit-message-body">{body.clone()}</pre>
         </Show>
+        {finalize_section}
         <StructuredDiff files=page.diff_files/>
     }
 }

@@ -1,6 +1,7 @@
 pub mod commit_diff;
 pub mod expanded_commit;
 pub mod feedback_card;
+pub mod finalize_snapshot;
 pub mod home;
 pub mod meta_strip;
 pub mod plan_diff;

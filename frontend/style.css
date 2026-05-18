@@ -491,6 +491,79 @@ a:hover {
     border-left: 3px solid var(--pending);
 }
 
+/* Finalize snapshot: visually distinct from live feedback. Sealed,
+   not interactive. Uses --approve as the accent (same as gate ready)
+   to telegraph "this is the chain of approvals that closed the
+   plan." */
+.finalize-snapshot {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-left: 3px solid var(--approve);
+    border-radius: 0.5rem;
+    padding: 1rem 1.2rem;
+    margin: 1.5rem 0;
+}
+
+.finalize-snapshot-header {
+    display: flex;
+    align-items: baseline;
+    gap: 0.6rem;
+    margin-bottom: 0.4rem;
+}
+
+.finalize-snapshot-header h2 {
+    margin: 0;
+    font-size: 1.1rem;
+}
+
+.finalize-snapshot-meta {
+    color: var(--text-muted);
+    font-size: 0.85rem;
+}
+
+.finalize-snapshot-note {
+    margin: 0 0 1rem 0;
+    font-size: 0.85rem;
+}
+
+.finalize-snapshot-list {
+    display: flex;
+    flex-direction: column;
+    gap: 0.8rem;
+}
+
+.finalize-approval-card {
+    background: var(--surface-2);
+    border: 1px solid var(--border);
+    border-radius: 0.4rem;
+    padding: 0.8rem 1rem;
+}
+
+.finalize-approval-card-header {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.6rem;
+    align-items: center;
+    margin-bottom: 0.5rem;
+    font-size: 0.85rem;
+}
+
+.finalize-approval-author {
+    font-weight: 500;
+}
+
+.finalize-approval-filename {
+    font-family: var(--mono, monospace);
+    font-size: 0.8rem;
+}
+
+.finalize-approval-body :first-child {
+    margin-top: 0;
+}
+.finalize-approval-body :last-child {
+    margin-bottom: 0;
+}
+
 .feedback-header {
     display: flex;
     flex-wrap: wrap;

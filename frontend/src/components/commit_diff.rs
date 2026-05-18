@@ -3,6 +3,7 @@ use leptos_router::hooks::use_params_map;
 
 use crate::api::{CommitDiffPage, fetch_commit_diff};
 use crate::components::feedback_card::FeedbackCard;
+use crate::components::finalize_snapshot::FinalizeSnapshot;
 use crate::components::structured_diff::StructuredDiff;
 use crate::store::EventStore;
 use crate::util::short_sha;
@@ -44,10 +45,21 @@ fn commit_view(page: CommitDiffPage) -> impl IntoView {
     let plan_id = page.plan_id.clone();
     let back_href = format!("/plan/{plan_id}");
     let short = short_sha(&page.commit_sha);
-    let title = format!("Commit {short}");
-    let feedback_section = if page.feedback.is_empty() {
-        None
+    let is_finalize = page.kind == "finalize";
+    let title = if is_finalize {
+        format!("Finalize {short}")
     } else {
+        format!("Commit {short}")
+    };
+    // Finalize commits show the approval snapshot (the
+    // .trinity/finished/ directory contents at the freeze tree)
+    // instead of live feedback. Reviewable commits show feedback.
+    let finalize_section = if is_finalize {
+        Some(view! { <FinalizeSnapshot approvals=page.finalize_snapshot/> })
+    } else {
+        None
+    };
+    let feedback_section = if !is_finalize && !page.feedback.is_empty() {
         let target_sha = page.commit_sha.clone();
         let cards = page
             .feedback
@@ -63,6 +75,8 @@ fn commit_view(page: CommitDiffPage) -> impl IntoView {
                 <div class="feedback-list">{cards}</div>
             </section>
         })
+    } else {
+        None
     };
     view! {
         <article class="commit-diff">
@@ -70,6 +84,7 @@ fn commit_view(page: CommitDiffPage) -> impl IntoView {
                 <a href=back_href class="back-link">"← plan"</a>
                 <h1>{title}</h1>
             </header>
+            {finalize_section}
             <StructuredDiff files=page.diff_files/>
             {feedback_section}
         </article>
