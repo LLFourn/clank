@@ -35,14 +35,11 @@ pub fn plan_worktree_status(
 /// Current posture for a plan: `Planning` while the master is
 /// iterating on the plan body (`PlanOnly | Mixed` latest reviewable
 /// commit, or nothing reviewable yet), `Implementing` once the master
-/// is shipping code (`CodeOnly`). Field read on `Plan`.
+/// is shipping code (`CodeOnly`). Reverse-scan over `plan.timeline`.
 pub fn current_posture(plan: &Plan, _state: &crate::repo_state::RepoState) -> Posture {
-    match plan.latest_reviewable_commit.as_ref() {
-        Some(sha) => match commit_kind_for(plan, sha) {
-            CommitKind::CodeOnly => Posture::Implementing,
-            _ => Posture::Planning,
-        },
-        None => Posture::Planning,
+    match plan.latest_reviewable_event() {
+        Some(event) if matches!(event.kind, CommitKind::CodeOnly) => Posture::Implementing,
+        _ => Posture::Planning,
     }
 }
 
@@ -56,7 +53,11 @@ pub fn waiting_on(
     gate: Option<&CommitGate>,
 ) -> WaitingOn {
     if is_finished {
-        return make(WaitingRole::None, WaitingReason::SessionFinished, Vec::new());
+        return make(
+            WaitingRole::None,
+            WaitingReason::SessionFinished,
+            Vec::new(),
+        );
     }
     match worktree_status {
         PlanWorktreeStatus::PlanFileMissing => {
@@ -78,19 +79,17 @@ pub fn waiting_on(
     waiting_from_gate(gate)
 }
 
-/// Latest reviewable commit's `CommitGate` for one plan. O(1) — reads
-/// the cached `latest_reviewable_commit` and looks up its gate.
-/// Returns `None` when no reviewable commit exists yet.
+/// Latest reviewable commit's `CommitGate` for one plan. Reverse-scan
+/// over `plan.timeline`. Returns `None` when no reviewable commit
+/// exists yet.
 pub fn latest_reviewable_commit_gate_for(plan: &Plan) -> Option<&CommitGate> {
-    plan.latest_reviewable_commit
-        .as_ref()
-        .and_then(|sha| plan.commits.get(sha))
+    plan.latest_reviewable_event().and_then(|e| e.gate.as_ref())
 }
 
-/// Latest commit whose `CommitKind` is reviewable for this plan. O(1)
-/// field read.
+/// Latest commit whose `CommitKind` is reviewable for this plan.
+/// Reverse-scan over `plan.timeline`.
 pub fn latest_reviewable_commit_for(plan: &Plan) -> Option<CommitSha> {
-    plan.latest_reviewable_commit.clone()
+    plan.latest_reviewable_event().map(|e| e.sha.clone())
 }
 
 fn waiting_from_gate(gate: Option<&CommitGate>) -> WaitingOn {
@@ -146,19 +145,31 @@ pub fn plan_path_at(plan: &Plan, _target_sha: &CommitSha) -> Option<std::path::P
 }
 
 /// All plan-touching commits for this plan, in chronological order.
-/// Read from the per-plan field; no global scan.
+/// Filter over `plan.timeline`.
 pub fn all_plan_revisions(plan: &Plan, _state: &crate::repo_state::RepoState) -> Vec<CommitSha> {
-    plan.plan_revisions.clone()
+    plan.timeline
+        .iter()
+        .filter(|e| {
+            matches!(
+                e.kind,
+                CommitKind::PlanOnly | CommitKind::Mixed | CommitKind::MultiPlan
+            )
+        })
+        .map(|e| e.sha.clone())
+        .collect()
 }
 
 /// All implementation commits attributed to this plan, in
-/// chronological order. Read from the per-plan field; no global
-/// scan.
+/// chronological order. Filter over `plan.timeline`.
 pub fn all_implementation_commits(
     plan: &Plan,
     _state: &crate::repo_state::RepoState,
 ) -> Vec<CommitSha> {
-    plan.implementation_commits.clone()
+    plan.timeline
+        .iter()
+        .filter(|e| matches!(e.kind, CommitKind::CodeOnly | CommitKind::Mixed))
+        .map(|e| e.sha.clone())
+        .collect()
 }
 
 /// Plan-side review gate: the latest reviewable plan-touching commit
@@ -169,14 +180,11 @@ pub fn plan_gate_for<'a>(
     plan: &'a Plan,
     _state: &crate::repo_state::RepoState,
 ) -> Option<&'a CommitGate> {
-    // Walk plan_revisions newest-first; the first one that's also in
-    // reviewable_commits is the latest reviewable plan-touch. (Some
-    // plan_revisions are MultiPlan and therefore not reviewable.)
-    plan.plan_revisions
+    plan.timeline
         .iter()
         .rev()
-        .find(|sha| plan.reviewable_commits.iter().any(|s| s == *sha))
-        .and_then(|sha| plan.commits.get(sha))
+        .find(|e| matches!(e.kind, CommitKind::PlanOnly | CommitKind::Mixed))
+        .and_then(|e| e.gate.as_ref())
 }
 
 /// Implementation-side review gate: the latest reviewable code-bearing
@@ -185,12 +193,11 @@ pub fn impl_gate_for<'a>(
     plan: &'a Plan,
     _state: &crate::repo_state::RepoState,
 ) -> Option<&'a CommitGate> {
-    // All entries in implementation_commits are reviewable (CodeOnly
-    // and Mixed are both reviewable). Walk newest-first.
-    plan.implementation_commits
+    plan.timeline
         .iter()
-        .next_back()
-        .and_then(|sha| plan.commits.get(sha))
+        .rev()
+        .find(|e| matches!(e.kind, CommitKind::CodeOnly | CommitKind::Mixed))
+        .and_then(|e| e.gate.as_ref())
 }
 
 /// Map a `WaitingReason` to the caller-facing action verb that names
@@ -272,22 +279,12 @@ fn description_for(
     }
 }
 
-/// Classify a single commit's relevance to one plan. Pure; derived
-/// from per-plan accumulated state.
+/// Classify a single commit's relevance to one plan. The fold stored
+/// the kind on the timeline event when it appended it; this just looks
+/// it up. Returns `Unattributed` when the commit isn't on this plan's
+/// timeline at all.
 pub fn commit_kind_for(plan: &Plan, sha: &CommitSha) -> CommitKind {
-    let touched = plan.plan_revisions.iter().any(|s| s == sha);
-    let coded = plan.implementation_commits.iter().any(|s| s == sha);
-    let reviewable = plan.reviewable_commits.iter().any(|s| s == sha);
-    // A touch that's NOT in reviewable_commits = MultiPlan (the fold
-    // appended to plan_revisions but skipped reviewable_commits for
-    // multi-plan touches).
-    if touched && !reviewable {
-        return CommitKind::MultiPlan;
-    }
-    match (touched, coded) {
-        (true, true) => CommitKind::Mixed,
-        (true, false) => CommitKind::PlanOnly,
-        (false, true) => CommitKind::CodeOnly,
-        (false, false) => CommitKind::Unattributed,
-    }
+    plan.event_for(sha)
+        .map(|e| e.kind)
+        .unwrap_or(CommitKind::Unattributed)
 }

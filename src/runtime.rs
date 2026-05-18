@@ -6,14 +6,14 @@
 //! written) feeds `FilesystemSignal` values into `handle_signal`;
 //! request handlers (MCP, HTTP) read state via owned snapshots.
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use tokio::sync::{Mutex, broadcast};
 
 use crate::fs_watcher::FilesystemSignal;
-use crate::lifecycle::{CommitSha, PlanKey, content_hash};
+use crate::lifecycle::{PlanKey, content_hash};
 use crate::rebuild::{RebuildError, rebuild_repo};
 use crate::repo_state::RepoState;
 use crate::repo_state::{
@@ -428,8 +428,15 @@ fn upsert_feedback(
 ) {
     let verdict = crate::disk_format::parse_verdict(&body);
     let created_at = file_mtime_unix_secs(&abs_path);
-    let entry = session.commits.entry(parsed.target_sha).or_insert_with(|| {
-        crate::review_state::CommitGate {
+    let Some(event) = session.event_for_mut(&parsed.target_sha) else {
+        // Feedback targets a SHA that's not on this plan's timeline
+        // (target not yet seen by the fold, or unattributed/frozen).
+        // Drop silently; the next full rebuild will re-attribute.
+        return;
+    };
+    let gate = event
+        .gate
+        .get_or_insert_with(|| crate::review_state::CommitGate {
             state: crate::review_state::CommitGateState::Unreviewed,
             participants: Vec::new(),
             approvers: Vec::new(),
@@ -437,9 +444,8 @@ fn upsert_feedback(
             ambiguous: Vec::new(),
             missing: Vec::new(),
             feedback: std::collections::BTreeMap::new(),
-        }
-    });
-    entry.feedback.insert(
+        });
+    gate.feedback.insert(
         parsed.author,
         Feedback {
             path: abs_path,
@@ -451,44 +457,40 @@ fn upsert_feedback(
 }
 
 fn remove_feedback(session: &mut Plan, parsed: &crate::disk_format::FeedbackPath) {
-    if let Some(gate) = session.commits.get_mut(&parsed.target_sha) {
+    if let Some(event) = session.event_for_mut(&parsed.target_sha)
+        && let Some(gate) = event.gate.as_mut()
+    {
         gate.feedback.remove(&parsed.author);
     }
 }
 
-/// Re-fold this plan's `commits` gates from `plan.reviewable_commits`
-/// in chronological order, replaying the cumulative-participant
-/// carry-along over `plan.commits[*].feedback`. Called after every
+/// Re-fold this plan's per-event gates from `plan.timeline` in
+/// chronological order, replaying the cumulative-participant carry
+/// over each reviewable event's feedback. Called after every
 /// feedback-file mutation so the participant set, missing-approvals,
-/// and gate-state stay consistent between full rebuilds. Read-only on
-/// every map outside `state.plans[plan_key].commits`.
+/// and gate-state stay consistent between full rebuilds.
 fn refresh_commits_for(state: &mut crate::repo_state::RepoState, plan_key: &PlanKey) {
-    let Some(plan) = state.plans.get(plan_key) else {
+    let Some(plan) = state.plans.get_mut(plan_key) else {
         return;
     };
     if plan.frozen_at.is_some() {
         // Sealed plan: no gate updates from live feedback signals.
         return;
     }
-    let reviewable: Vec<CommitSha> = plan.reviewable_commits.clone();
-    // Pre-extract per-commit feedback maps for the replay.
-    let mut feedback_at: BTreeMap<CommitSha, BTreeMap<crate::lifecycle::AgentLabel, Feedback>> =
-        BTreeMap::new();
-    for sha in &reviewable {
-        if let Some(gate) = plan.commits.get(sha) {
-            feedback_at.insert(sha.clone(), gate.feedback.clone());
-        }
-    }
     let mut participants: Vec<crate::lifecycle::AgentLabel> = Vec::new();
-    let mut new_gates: BTreeMap<CommitSha, crate::review_state::CommitGate> = BTreeMap::new();
-    let mut latest = None;
-    for sha in &reviewable {
-        let empty = BTreeMap::new();
-        let fb_for = feedback_at.get(sha).unwrap_or(&empty);
+    for event in plan.timeline.iter_mut() {
+        if !event.kind.is_reviewable() {
+            continue;
+        }
+        let fb_for = event
+            .gate
+            .as_ref()
+            .map(|g| g.feedback.clone())
+            .unwrap_or_default();
         let mut approvers = Vec::new();
         let mut requesters = Vec::new();
         let mut ambiguous = Vec::new();
-        for (author, fb) in fb_for {
+        for (author, fb) in &fb_for {
             if !participants.contains(author) {
                 participants.push(author.clone());
             }
@@ -512,9 +514,7 @@ fn refresh_commits_for(state: &mut crate::repo_state::RepoState, plan_key: &Plan
         }
         let missing: Vec<_> = participants
             .iter()
-            .filter(|p| {
-                !approvers.contains(p) && !requesters.contains(p) && !ambiguous.contains(p)
-            })
+            .filter(|p| !approvers.contains(p) && !requesters.contains(p) && !ambiguous.contains(p))
             .cloned()
             .collect();
         let gate_state = if !requesters.is_empty() || !ambiguous.is_empty() {
@@ -524,23 +524,15 @@ fn refresh_commits_for(state: &mut crate::repo_state::RepoState, plan_key: &Plan
         } else {
             crate::review_state::CommitGateState::Unreviewed
         };
-        new_gates.insert(
-            sha.clone(),
-            crate::review_state::CommitGate {
-                state: gate_state,
-                participants: participants.clone(),
-                approvers,
-                requesters,
-                ambiguous,
-                missing,
-                feedback: fb_for.clone(),
-            },
-        );
-        latest = Some(sha.clone());
-    }
-    if let Some(plan) = state.plans.get_mut(plan_key) {
-        plan.commits = new_gates;
-        plan.latest_reviewable_commit = latest;
+        event.gate = Some(crate::review_state::CommitGate {
+            state: gate_state,
+            participants: participants.clone(),
+            approvers,
+            requesters,
+            ambiguous,
+            missing,
+            feedback: fb_for,
+        });
     }
 }
 
@@ -683,7 +675,19 @@ mod tests {
             .read_repo(dir.path(), |s| {
                 s.plans
                     .values()
-                    .map(|p| p.plan_revisions.len())
+                    .map(|p| {
+                        p.timeline
+                            .iter()
+                            .filter(|e| {
+                                matches!(
+                                    e.kind,
+                                    crate::repo_state::CommitKind::PlanOnly
+                                        | crate::repo_state::CommitKind::Mixed
+                                        | crate::repo_state::CommitKind::MultiPlan
+                                )
+                            })
+                            .count()
+                    })
                     .sum::<usize>()
             })
             .await
@@ -701,7 +705,19 @@ mod tests {
             .read_repo(dir.path(), |s| {
                 s.plans
                     .values()
-                    .map(|p| p.plan_revisions.len())
+                    .map(|p| {
+                        p.timeline
+                            .iter()
+                            .filter(|e| {
+                                matches!(
+                                    e.kind,
+                                    crate::repo_state::CommitKind::PlanOnly
+                                        | crate::repo_state::CommitKind::Mixed
+                                        | crate::repo_state::CommitKind::MultiPlan
+                                )
+                            })
+                            .count()
+                    })
                     .sum::<usize>()
             })
             .await
@@ -856,7 +872,6 @@ mod tests {
         // Gate falls back to no participants → reviewers / plan_needs_initial_review.
         assert_eq!(v["waiting_on"]["reason"], "commit_needs_review");
     }
-
 
     #[tokio::test]
     async fn list_plans_via_runtime() {

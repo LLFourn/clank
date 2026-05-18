@@ -158,10 +158,8 @@ mod tests {
 
     #[test]
     fn full_sha_accepted() {
-        let parsed = parse_feedback_path(&p(
-            "foo/abcdef0123456789abcdef0123456789abcdef01/x.md",
-        ))
-        .unwrap();
+        let parsed =
+            parse_feedback_path(&p("foo/abcdef0123456789abcdef0123456789abcdef01/x.md")).unwrap();
         assert_eq!(
             parsed.target_sha.as_str(),
             "abcdef0123456789abcdef0123456789abcdef01"
@@ -224,15 +222,15 @@ mod tests {
     #[test]
     fn finalize_first_line_approve_passes() {
         assert!(finalize_first_line_starts_with_approve("APPROVE"));
-        assert!(finalize_first_line_starts_with_approve("APPROVE — looks good"));
+        assert!(finalize_first_line_starts_with_approve(
+            "APPROVE — looks good"
+        ));
         assert!(finalize_first_line_starts_with_approve("  APPROVE"));
     }
 
     #[test]
     fn finalize_first_line_other_fails() {
-        assert!(!finalize_first_line_starts_with_approve(
-            "REQUEST_CHANGES"
-        ));
+        assert!(!finalize_first_line_starts_with_approve("REQUEST_CHANGES"));
         assert!(!finalize_first_line_starts_with_approve("approve"));
         assert!(!finalize_first_line_starts_with_approve(""));
     }
@@ -283,5 +281,4 @@ mod tests {
     fn parse_verdict_empty_body() {
         assert_eq!(parse_verdict(""), Verdict::Unmarked);
     }
-
 }

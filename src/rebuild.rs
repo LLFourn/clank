@@ -84,8 +84,10 @@ mod tests {
         let session = &state.plans[&PlanKey::parse("foo").unwrap()];
         assert_eq!(session.id.as_str(), "foo");
         assert_eq!(session.body, "# foo\n");
-        assert_eq!(session.plan_revisions, vec![session.plan_intro.clone()]);
-        assert!(session.implementation_commits.is_empty());
+        let revs = crate::projection::all_plan_revisions(session, &state);
+        let impls = crate::projection::all_implementation_commits(session, &state);
+        assert_eq!(revs, vec![session.plan_intro.clone()]);
+        assert!(impls.is_empty());
     }
 
     #[tokio::test]
@@ -98,12 +100,8 @@ mod tests {
 
         let state = rebuild_repo(dir.path()).await.unwrap();
         let plan = &state.plans[&PlanKey::parse("foo").unwrap()];
-        assert_eq!(plan.implementation_commits.len(), 1);
-        let impl_attrs: Vec<_> = plan
-            .implementation_commits
-            .iter()
-            .collect();
-        assert_eq!(impl_attrs.len(), 1);
+        let impls = crate::projection::all_implementation_commits(plan, &state);
+        assert_eq!(impls.len(), 1);
     }
 
     #[tokio::test]
@@ -120,7 +118,8 @@ mod tests {
 
         let state = rebuild_repo(dir.path()).await.unwrap();
         let session = &state.plans[&PlanKey::parse("foo").unwrap()];
-        let gate = session.commits.get(&intro).expect("gate for intro");
+        let event = session.event_for(&intro).expect("event for intro");
+        let gate = event.gate.as_ref().expect("gate for intro");
         let entries: Vec<_> = gate.feedback.values().collect();
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].verdict, crate::repo_state::Verdict::Approve);

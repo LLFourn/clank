@@ -440,21 +440,22 @@ fn parse_diff_tree(stdout: &str) -> Result<ParsedDiffTree, GitIoError> {
 
             let is_deletion = status_char == 'D' && !is_rename;
 
-            if is_rename && old_key.is_some() && new_key.is_some() && old_key != new_key {
+            if let (true, Some(old_k), Some(new_k)) = (is_rename, &old_key, &new_key)
+                && old_k != new_k
+            {
                 // Cross-stem rename `git mv .trinity/plans/foo.md
                 // .trinity/plans/bar.md`. Model as two events: delete
                 // `foo` + intro `bar`. The fold then removes `foo`
                 // from state.plans (if not frozen) and creates `bar`.
                 plan_touches.push(PlanTouch {
-                    session: old_key.expect("old_key is Some"),
+                    session: old_k.clone(),
                     kind: PlanTouchKind::Revision,
                     new_path: None,
                     new_body: None,
                 });
-                let new_key = new_key.expect("new_key is Some");
                 let touch_index = plan_touches.len();
                 plan_touches.push(PlanTouch {
-                    session: new_key,
+                    session: new_k.clone(),
                     kind: PlanTouchKind::Intro,
                     new_path: Some(new_rel.clone()),
                     new_body: None,
@@ -797,13 +798,10 @@ mod tests {
         let stdout = "D\t.trinity/finished/foo/alice.md\n";
         let parsed = parse_diff_tree(stdout).unwrap();
         assert_eq!(parsed.changes.finalize_changes.len(), 1);
-        match &parsed.changes.finalize_changes[0] {
-            fc @ FinalizeChange { kind, .. } => {
-                assert_eq!(fc.plan_key.as_str(), "foo");
-                assert_eq!(fc.file_name, "alice.md");
-                assert!(matches!(kind, FinalizeChangeKind::Remove));
-            }
-        }
+        let fc = &parsed.changes.finalize_changes[0];
+        assert_eq!(fc.plan_key.as_str(), "foo");
+        assert_eq!(fc.file_name, "alice.md");
+        assert!(matches!(fc.kind, FinalizeChangeKind::Remove));
         assert!(parsed.finalize_upserts.is_empty());
     }
 }

@@ -10,18 +10,15 @@
 //! Disk reads go through the `PlanStatusReader` trait so tests can drop
 //! in a fake.
 
-#[cfg(test)]
-use std::collections::BTreeMap;
-
 use serde_json::{Value, json};
 
-use crate::lifecycle::{AgentLabel, CommitSha};
 #[cfg(test)]
 use crate::lifecycle::PlanKey;
+use crate::lifecycle::{AgentLabel, CommitSha};
 use crate::mcp_response::PlanStatusReader;
 use crate::projection::{
-    all_implementation_commits, all_plan_revisions, current_posture, expected_action, impl_gate_for,
-    plan_gate_for, waiting_on,
+    all_implementation_commits, all_plan_revisions, current_posture, expected_action,
+    impl_gate_for, plan_gate_for, waiting_on,
 };
 use crate::repo_state::{Feedback, Plan, PlanTouchKind, Posture, RepoState, Verdict, WaitingOn};
 use crate::review_state::CommitGate;
@@ -245,17 +242,12 @@ pub fn plan_page_with_reader(
 /// but carries body + html + path on each feedback entry so the SPA
 /// can render cards without further round-trips.
 fn commits_array_rich(plan: &Plan) -> Vec<Value> {
-    use crate::projection::commit_kind_for;
     let mut out = Vec::new();
-    // Iterate this plan's reviewable_commits (chronological — appended
-    // by the fold in that order). plan.commits is a BTreeMap keyed by
-    // SHA so direct iteration would surface SHA-lex order, not history.
-    for sha in &plan.reviewable_commits {
-        let kind = commit_kind_for(plan, sha);
-        if !kind.is_reviewable() {
+    for event in &plan.timeline {
+        if !event.kind.is_reviewable() {
             continue;
         }
-        let Some(gate) = plan.commits.get(sha) else {
+        let Some(gate) = event.gate.as_ref() else {
             continue;
         };
         let feedback_array: Vec<Value> = gate
@@ -273,8 +265,8 @@ fn commits_array_rich(plan: &Plan) -> Vec<Value> {
             })
             .collect();
         out.push(json!({
-            "sha": sha.as_str(),
-            "kind": kind.as_str(),
+            "sha": event.sha.as_str(),
+            "kind": event.kind.as_str(),
             "gate": {
                 "state": gate.state.as_str(),
                 "participants": gate.participants.iter().map(|a| a.as_str()).collect::<Vec<_>>(),
@@ -424,38 +416,14 @@ fn gate_value(
 }
 
 fn timeline_value(session: &Plan) -> Vec<Value> {
-    // Two-pointer chronological merge of plan_revisions and
-    // implementation_commits — both already sorted by the fold.
-    let mut out = Vec::new();
-    let mut revs = session.plan_revisions.iter().peekable();
-    let mut impls = session.implementation_commits.iter().peekable();
-    loop {
-        let sha = match (revs.peek().copied(), impls.peek().copied()) {
-            (None, None) => break,
-            (Some(s), None) => {
-                revs.next();
-                s
-            }
-            (None, Some(s)) => {
-                impls.next();
-                s
-            }
-            (Some(a), Some(b)) if a == b => {
-                revs.next();
-                impls.next();
-                a
-            }
-            (Some(a), Some(_)) => {
-                // Mixed commits appear at the same chronological index
-                // in both lists; differing heads mean revs is the
-                // earlier one (it was pushed first by the fold's per-
-                // commit step). Advance revs only.
-                revs.next();
-                a
-            }
-        };
-        let touched = session.plan_revisions.iter().any(|s| s == sha);
-        let has_code_changes = session.implementation_commits.iter().any(|s| s == sha);
+    use crate::repo_state::CommitKind;
+    let mut out = Vec::with_capacity(session.timeline.len() * 2);
+    for event in &session.timeline {
+        let touched = matches!(
+            event.kind,
+            CommitKind::PlanOnly | CommitKind::Mixed | CommitKind::MultiPlan
+        );
+        let has_code_changes = matches!(event.kind, CommitKind::CodeOnly | CommitKind::Mixed);
         let kind = match (touched, has_code_changes) {
             (true, true) => "commit_mixed",
             (true, false) => "commit_plan",
@@ -463,7 +431,7 @@ fn timeline_value(session: &Plan) -> Vec<Value> {
             (false, false) => continue,
         };
         let plan_touch = if touched {
-            if sha == &session.plan_intro {
+            if event.sha == session.plan_intro {
                 Some(PlanTouchKind::Intro)
             } else {
                 Some(PlanTouchKind::Revision)
@@ -471,25 +439,20 @@ fn timeline_value(session: &Plan) -> Vec<Value> {
         } else {
             None
         };
-        let subject = session
-            .commit_meta
-            .get(sha)
-            .map(|m| m.subject.clone())
-            .unwrap_or_default();
         out.push(json!({
             "kind": kind,
-            "sha": sha.as_str(),
+            "sha": event.sha.as_str(),
             "plan_touch": plan_touch.as_ref().map(|k| k.as_str()),
             "has_code_changes": has_code_changes,
-            "subject": subject,
+            "subject": event.subject,
         }));
         let phase_tag = if touched { "plan" } else { "impl" };
-        if let Some(gate) = session.commits.get(sha) {
+        if let Some(gate) = event.gate.as_ref() {
             for (author, fb) in &gate.feedback {
                 out.push(json!({
                     "kind": "review",
                     "phase": phase_tag,
-                    "target": sha.as_str(),
+                    "target": event.sha.as_str(),
                     "author": author.as_str(),
                     "verdict": fb.verdict.as_str(),
                     "created_at": fb.created_at,
@@ -507,7 +470,10 @@ fn timeline_value(session: &Plan) -> Vec<Value> {
 /// 2.5. Used by the `/api/sessions/:id/plan/:sha` and `/api/sessions/
 /// :id/commit/:sha` route handlers.
 pub fn feedback_for_target(session: &Plan, sha: &CommitSha) -> Vec<Value> {
-    let Some(gate) = session.commits.get(sha) else {
+    let Some(event) = session.event_for(sha) else {
+        return Vec::new();
+    };
+    let Some(gate) = event.gate.as_ref() else {
         return Vec::new();
     };
     gate.feedback
@@ -615,13 +581,8 @@ mod tests {
             body_hash: content_hash(""),
             plan_intro: CommitSha::parse("dead").unwrap(),
             plan_intro_parent: Some(CommitSha::parse("ca11").unwrap()),
-            plan_revisions: Vec::new(),
-            implementation_commits: Vec::new(),
-            reviewable_commits: Vec::new(),
-            commit_meta: BTreeMap::new(),
             last_activity_ts: 0,
-            latest_reviewable_commit: None,
-            commits: BTreeMap::new(),
+            timeline: Vec::new(),
             frozen_at: None,
             freeze_events: Vec::new(),
             archived_cycles: Vec::new(),

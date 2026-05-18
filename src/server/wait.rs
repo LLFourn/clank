@@ -456,7 +456,12 @@ fn derive_locations(cand: &Candidate, reason: WaitingReason, author: &AgentLabel
 }
 
 fn feedback_path(sid: &str, target: &CommitSha, author: &str) -> String {
-    format!(".trinity/feedback/{}/{}/{}.md", sid, target.as_str(), author)
+    format!(
+        ".trinity/feedback/{}/{}/{}.md",
+        sid,
+        target.as_str(),
+        author
+    )
 }
 
 fn rc_feedback_paths(
@@ -948,11 +953,7 @@ mod integration_tests {
             .unwrap();
         // Both codex + bob approve the intro target → participants.
         for author in ["codex", "bob"] {
-            let rel = format!(
-                ".trinity/feedback/foo/{}/{}.md",
-                intro.as_str(),
-                author
-            );
+            let rel = format!(".trinity/feedback/foo/{}/{}.md", intro.as_str(), author);
             write_file(dir.path(), &rel, "APPROVE\n");
             let parsed_rel = PathBuf::from(format!("foo/{}/{}.md", intro.as_str(), author));
             let parsed = crate::disk_format::parse_feedback_path(&parsed_rel).unwrap();
@@ -978,10 +979,7 @@ mod integration_tests {
             })
             .await
             .unwrap();
-        let codex_rel = format!(
-            ".trinity/feedback/foo/{}/codex.md",
-            revised.as_str()
-        );
+        let codex_rel = format!(".trinity/feedback/foo/{}/codex.md", revised.as_str());
         write_file(dir.path(), &codex_rel, "APPROVE\n");
         let parsed = crate::disk_format::parse_feedback_path(&PathBuf::from(format!(
             "foo/{}/codex.md",

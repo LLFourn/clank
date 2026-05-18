@@ -278,23 +278,17 @@ pub fn get_context_response_from_snapshot(
 }
 
 /// Build the per-commit `commits[]` array for `get_context`. Each
-/// entry: `{sha, kind, gate, feedback[]}` in chronological
-/// (`commit_order`) order. Only commits whose kind is reviewable
-/// for this plan are emitted (`PlanOnly` | `CodeOnly` | `Mixed`);
-/// `DoneMove` / `MultiPlan` / `Unattributed` are skipped because
-/// they don't carry a gate.
+/// entry: `{sha, kind, gate, feedback[]}` in chronological order
+/// (the fold appended events in that order). Only reviewable kinds
+/// are emitted (`PlanOnly` | `CodeOnly` | `Mixed`); `MultiPlan`
+/// events have no gate.
 fn commits_array(plan: &crate::repo_state::Plan, _state: &RepoState) -> Vec<Value> {
-    use crate::projection::commit_kind_for;
     let mut out = Vec::new();
-    // Walk this plan's reviewable commits in chronological order
-    // (the fold accumulates them in that order); commit_kind_for is
-    // an O(plan-local) lookup, not a global scan.
-    for sha in &plan.reviewable_commits {
-        let kind = commit_kind_for(plan, sha);
-        if !kind.is_reviewable() {
+    for event in &plan.timeline {
+        if !event.kind.is_reviewable() {
             continue;
         }
-        let gate_value = plan.commits.get(sha).map(|g| {
+        let gate_value = event.gate.as_ref().map(|g| {
             json!({
                 "state": g.state.as_str(),
                 "participants": g.participants.iter().map(|a| a.as_str()).collect::<Vec<_>>(),
@@ -304,9 +298,9 @@ fn commits_array(plan: &crate::repo_state::Plan, _state: &RepoState) -> Vec<Valu
                 "missing": g.missing.iter().map(|a| a.as_str()).collect::<Vec<_>>(),
             })
         });
-        let feedback_array: Vec<Value> = plan
-            .commits
-            .get(sha)
+        let feedback_array: Vec<Value> = event
+            .gate
+            .as_ref()
             .map(|g| {
                 g.feedback
                     .iter()
@@ -320,8 +314,8 @@ fn commits_array(plan: &crate::repo_state::Plan, _state: &RepoState) -> Vec<Valu
             })
             .unwrap_or_default();
         out.push(json!({
-            "sha": sha.as_str(),
-            "kind": kind.as_str(),
+            "sha": event.sha.as_str(),
+            "kind": event.kind.as_str(),
             "gate": gate_value,
             "feedback": feedback_array,
         }));
@@ -362,18 +356,25 @@ fn timeline_value(state: &RepoState, session_id: &PlanKey) -> Vec<Value> {
                 verdict,
             } => {
                 // Wire `phase` is back-derived from the targeted
-                // commit's plan_touch: plan-touching commit → "plan",
-                // else → "impl". Plan-side check is plan-local, not
-                // global.
-                let phase = if let Some(plan) = state.plans.get(session_id) {
-                    if plan.plan_revisions.iter().any(|s| s == &target) {
-                        "plan"
-                    } else {
-                        "impl"
-                    }
-                } else {
-                    "impl"
-                };
+                // commit's kind: a plan-touching kind → "plan",
+                // otherwise "impl".
+                let phase = state
+                    .plans
+                    .get(session_id)
+                    .and_then(|plan| plan.event_for(&target))
+                    .map(|e| {
+                        if matches!(
+                            e.kind,
+                            crate::repo_state::CommitKind::PlanOnly
+                                | crate::repo_state::CommitKind::Mixed
+                                | crate::repo_state::CommitKind::MultiPlan
+                        ) {
+                            "plan"
+                        } else {
+                            "impl"
+                        }
+                    })
+                    .unwrap_or("impl");
                 json!({
                     "kind": "review",
                     "phase": phase,

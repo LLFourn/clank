@@ -384,11 +384,7 @@ async fn api_commit_diff(
         .values()
         .next()
         .expect("single_plan invariant");
-    let belongs_to_plan = plan
-        .implementation_commits
-        .iter()
-        .any(|s| s == &commit_sha)
-        || plan.plan_revisions.iter().any(|s| s == &commit_sha);
+    let belongs_to_plan = plan.event_for(&commit_sha).is_some();
     if !belongs_to_plan {
         return Err(AppError::not_found(format!(
             "commit {sha} is not attributed to {repo_basename}/{stem_md}"
@@ -1057,11 +1053,7 @@ mod wire_tests {
             .await
             .unwrap();
         for author in ["codex", "bob"] {
-            let rel = format!(
-                ".trinity/feedback/foo/{}/{}.md",
-                intro.as_str(),
-                author
-            );
+            let rel = format!(".trinity/feedback/foo/{}/{}.md", intro.as_str(), author);
             write_file(dir.path(), &rel, "APPROVE\n");
             let parsed = crate::disk_format::parse_feedback_path(&std::path::PathBuf::from(
                 format!("foo/{}/{}.md", intro.as_str(), author),
@@ -1099,10 +1091,7 @@ mod wire_tests {
             })
             .await
             .unwrap();
-        let codex_rel = format!(
-            ".trinity/feedback/foo/{}/codex.md",
-            revised.as_str()
-        );
+        let codex_rel = format!(".trinity/feedback/foo/{}/codex.md", revised.as_str());
         write_file(dir.path(), &codex_rel, "APPROVE\n");
         let parsed = crate::disk_format::parse_feedback_path(&std::path::PathBuf::from(format!(
             "foo/{}/codex.md",

@@ -23,12 +23,10 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 
 use crate::attribution::{CommitChanges, FinalizeChangeKind, classify, effective_session};
-use crate::disk_format::{
-    FeedbackPath, finalize_first_line_starts_with_approve, parse_verdict,
-};
+use crate::disk_format::{FeedbackPath, finalize_first_line_starts_with_approve, parse_verdict};
 use crate::lifecycle::{AgentLabel, CommitSha, PlanKey, content_hash};
 use crate::repo_state::{
-    AttributionResult, CommitKind, CommitMetaPlan, Feedback, Plan, PlanTouchKind, RepoState,
+    AttributionResult, CommitKind, Feedback, Plan, PlanTimelineEvent, PlanTouchKind, RepoState,
     Verdict,
 };
 use crate::review_state::{CommitGate, CommitGateState};
@@ -64,16 +62,6 @@ pub struct CommitEvent {
     pub author_ts: i64,
     pub subject: String,
     pub changes: CommitChanges,
-}
-
-/// Author timestamp + subject for one commit. Stored on `RepoState`
-/// (keyed by SHA) so the projection layer can render timelines and
-/// compute `last_activity_ts` without reaching into git. Derived
-/// per-commit from `CommitEvent` during the fold.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CommitMetaEntry {
-    pub author_ts: i64,
-    pub subject: String,
 }
 
 /// One feedback file in the working tree.
@@ -132,10 +120,8 @@ pub struct FoldCarry {
 
 impl FoldCarry {
     pub fn new(feedback_files: Vec<FeedbackBlob>) -> Self {
-        let mut feedback_by_plan: BTreeMap<
-            PlanKey,
-            BTreeMap<(CommitSha, AgentLabel), Feedback>,
-        > = BTreeMap::new();
+        let mut feedback_by_plan: BTreeMap<PlanKey, BTreeMap<(CommitSha, AgentLabel), Feedback>> =
+            BTreeMap::new();
         for fb in feedback_files {
             let verdict = parse_verdict(&fb.body);
             feedback_by_plan
@@ -172,10 +158,10 @@ pub fn apply_commit(state: &mut RepoState, carry: &mut FoldCarry, event: &Commit
 
     // 1. Walk-back attribution. Filter frozen-plan touches BEFORE
     //    classify / effective_session — sealing applies to inheritance.
-    if let Some(k) = &carry.current_effective {
-        if is_frozen(state, k) {
-            carry.current_effective = None;
-        }
+    if let Some(k) = &carry.current_effective
+        && is_frozen(state, k)
+    {
+        carry.current_effective = None;
     }
     let active_changes = if event
         .changes
@@ -202,8 +188,7 @@ pub fn apply_commit(state: &mut RepoState, carry: &mut FoldCarry, event: &Commit
 
     // 2. Apply plan_touches: tree state + Plan create/delete.
     for touch in &event.changes.plan_touches {
-        let is_delete =
-            matches!(touch.kind, PlanTouchKind::Revision) && touch.new_path.is_none();
+        let is_delete = matches!(touch.kind, PlanTouchKind::Revision) && touch.new_path.is_none();
         if is_delete {
             carry.plan_in_tree.remove(&touch.session);
             carry.plan_bodies.remove(&touch.session);
@@ -217,7 +202,9 @@ pub fn apply_commit(state: &mut RepoState, carry: &mut FoldCarry, event: &Commit
         } else {
             carry.plan_in_tree.insert(touch.session.clone());
             if let Some(body) = &touch.new_body {
-                carry.plan_bodies.insert(touch.session.clone(), body.clone());
+                carry
+                    .plan_bodies
+                    .insert(touch.session.clone(), body.clone());
             }
             // Intro of a stem not in `state.plans` creates the
             // entry. `plan_intro` is this commit; `plan_intro_parent`
@@ -246,13 +233,8 @@ pub fn apply_commit(state: &mut RepoState, carry: &mut FoldCarry, event: &Commit
                         body_hash,
                         plan_intro: commit_sha.clone(),
                         plan_intro_parent: carry.previous_commit.clone(),
-                        plan_revisions: Vec::new(),
-                        implementation_commits: Vec::new(),
-                        reviewable_commits: Vec::new(),
-                        commit_meta: BTreeMap::new(),
                         last_activity_ts: 0,
-                        latest_reviewable_commit: None,
-                        commits: BTreeMap::new(),
+                        timeline: Vec::new(),
                         frozen_at: None,
                         freeze_events: Vec::new(),
                         archived_cycles: Vec::new(),
@@ -268,13 +250,11 @@ pub fn apply_commit(state: &mut RepoState, carry: &mut FoldCarry, event: &Commit
             if matches!(touch.kind, PlanTouchKind::Revision)
                 && touch.new_path.is_some()
                 && !is_frozen(state, &touch.session)
-            {
-                if let (Some(plan), Some(body)) =
+                && let (Some(plan), Some(body)) =
                     (state.plans.get_mut(&touch.session), &touch.new_body)
-                {
-                    plan.body = body.clone();
-                    plan.body_hash = content_hash(body);
-                }
+            {
+                plan.body = body.clone();
+                plan.body_hash = content_hash(body);
             }
         }
     }
@@ -331,14 +311,18 @@ pub fn apply_commit(state: &mut RepoState, carry: &mut FoldCarry, event: &Commit
         }
     }
 
-    // 5. Per-plan classification + accumulation. For each non-frozen
+    // 5. Per-plan classification + timeline append. For each non-frozen
     //    plan, decide this commit's kind FOR THAT PLAN (PlanOnly /
-    //    CodeOnly / Mixed / MultiPlan / Unattributed) and update its
-    //    accumulated lists + commit_meta + last_activity_ts. For
-    //    reviewable commits, build the gate entry and update
-    //    latest_reviewable_commit.
-    let distinct_plans_touched = event
-        .changes
+    //    CodeOnly / Mixed / MultiPlan) and append a single
+    //    `PlanTimelineEvent` carrying the kind, author_ts, subject,
+    //    and (for reviewable kinds) the computed gate. `Unattributed`
+    //    is not part of any plan's timeline and is skipped.
+    //
+    //    `active_changes` (not raw `event.changes`) drives this so a
+    //    commit touching both a frozen and an active plan does not
+    //    flip the active plan's classification to MultiPlan — sealing
+    //    must hide the frozen plan from per-plan classification too.
+    let distinct_plans_touched = active_changes
         .plan_touches
         .iter()
         .map(|t| &t.session)
@@ -358,8 +342,7 @@ pub fn apply_commit(state: &mut RepoState, carry: &mut FoldCarry, event: &Commit
         if is_frozen(state, plan_key) {
             continue;
         }
-        let our_touch = event
-            .changes
+        let our_touch = active_changes
             .plan_touches
             .iter()
             .find(|t| &t.session == plan_key);
@@ -380,56 +363,30 @@ pub fn apply_commit(state: &mut RepoState, carry: &mut FoldCarry, event: &Commit
         if matches!(kind, CommitKind::Unattributed) {
             continue;
         }
+        let gate = if kind.is_reviewable() {
+            let participants = carry.gate_participants.entry(plan_key.clone()).or_default();
+            let fb_map = carry.feedback_by_plan.get(plan_key);
+            Some(build_gate_step(&commit_sha, fb_map, participants))
+        } else {
+            None
+        };
         let plan = state.plans.get_mut(plan_key).expect("just verified");
-        let touched = matches!(
-            kind,
-            CommitKind::PlanOnly | CommitKind::Mixed | CommitKind::MultiPlan
-        );
-        let implemented = matches!(kind, CommitKind::CodeOnly | CommitKind::Mixed);
-        let reviewable = matches!(
-            kind,
-            CommitKind::PlanOnly | CommitKind::CodeOnly | CommitKind::Mixed
-        );
-        if touched {
-            plan.plan_revisions.push(commit_sha.clone());
-        }
-        if implemented {
-            plan.implementation_commits.push(commit_sha.clone());
-        }
-        if reviewable {
-            plan.reviewable_commits.push(commit_sha.clone());
-        }
-        plan.commit_meta.insert(
-            commit_sha.clone(),
-            CommitMetaPlan {
-                author_ts: event.author_ts,
-                subject: event.subject.clone(),
-            },
-        );
         if event.author_ts > plan.last_activity_ts {
             plan.last_activity_ts = event.author_ts;
         }
-        if reviewable {
-            let participants = carry
-                .gate_participants
-                .entry(plan_key.clone())
-                .or_default();
-            let fb_map = carry.feedback_by_plan.get(plan_key);
-            let gate = build_gate_step(&commit_sha, fb_map, participants);
-            // Feedback ts also feeds last_activity_ts (handed back from
-            // working-tree mtime; max wins).
-            let feedback_ts = gate
-                .feedback
-                .values()
-                .map(|f| f.created_at)
-                .max()
-                .unwrap_or(0);
+        if let Some(g) = &gate {
+            let feedback_ts = g.feedback.values().map(|f| f.created_at).max().unwrap_or(0);
             if feedback_ts > plan.last_activity_ts {
                 plan.last_activity_ts = feedback_ts;
             }
-            plan.commits.insert(commit_sha.clone(), gate);
-            plan.latest_reviewable_commit = Some(commit_sha.clone());
         }
+        plan.timeline.push(PlanTimelineEvent {
+            sha: commit_sha.clone(),
+            kind,
+            author_ts: event.author_ts,
+            subject: event.subject.clone(),
+            gate,
+        });
     }
 
     // 6. Carry forward.
@@ -518,8 +475,6 @@ fn build_gate_step(
         feedback: commit_feedback,
     }
 }
-
-#[cfg(test)]
 
 #[cfg(test)]
 mod tests {
@@ -659,8 +614,13 @@ mod tests {
         assert_eq!(plan.body, "# foo\n");
         assert_eq!(plan.plan_intro, sha("bbbb"));
         assert_eq!(plan.plan_intro_parent, Some(sha("aaaa")));
-        assert_eq!(plan.plan_revisions, vec![sha("bbbb")]);
-        assert!(plan.implementation_commits.is_empty());
+        let shas: Vec<_> = plan.timeline.iter().map(|e| e.sha.clone()).collect();
+        assert_eq!(shas, vec![sha("bbbb")]);
+        assert!(
+            plan.timeline
+                .iter()
+                .all(|e| matches!(e.kind, CommitKind::PlanOnly))
+        );
     }
 
     #[test]
@@ -674,7 +634,8 @@ mod tests {
         );
         let plan = &state.plans[&sess("foo")];
         assert_eq!(plan.body, "# v2\n");
-        assert_eq!(plan.plan_revisions, vec![sha("c1c1"), sha("c2c2")]);
+        let shas: Vec<_> = plan.timeline.iter().map(|e| e.sha.clone()).collect();
+        assert_eq!(shas, vec![sha("c1c1"), sha("c2c2")]);
     }
 
     #[test]
@@ -687,7 +648,13 @@ mod tests {
             ]),
         );
         let plan = &state.plans[&sess("foo")];
-        assert_eq!(plan.implementation_commits, vec![sha("c2c2")]);
+        let impls: Vec<_> = plan
+            .timeline
+            .iter()
+            .filter(|e| matches!(e.kind, CommitKind::CodeOnly | CommitKind::Mixed))
+            .map(|e| e.sha.clone())
+            .collect();
+        assert_eq!(impls, vec![sha("c2c2")]);
     }
 
     #[test]
@@ -712,15 +679,18 @@ mod tests {
         );
         let a = &state.plans[&sess("a")];
         let b = &state.plans[&sess("b")];
-        assert!(a.plan_revisions.contains(&sha("c2c2")));
-        assert!(b.plan_revisions.contains(&sha("c2c2")));
-        // c2 is in both plans' plan_revisions but NOT in reviewable_commits
-        // (MultiPlan is not reviewable).
-        assert!(!a.reviewable_commits.contains(&sha("c2c2")));
-        assert!(!b.reviewable_commits.contains(&sha("c2c2")));
+        // c2 appears in both plans' timelines, as MultiPlan (no gate).
+        let c2 = sha("c2c2");
+        let a_c2 = a.event_for(&c2).expect("a has c2");
+        let b_c2 = b.event_for(&c2).expect("b has c2");
+        assert!(matches!(a_c2.kind, CommitKind::MultiPlan));
+        assert!(matches!(b_c2.kind, CommitKind::MultiPlan));
+        assert!(a_c2.gate.is_none());
+        assert!(b_c2.gate.is_none());
         // c3 walks back to a (oldest single-plan-touch ancestor).
-        assert_eq!(a.implementation_commits, vec![sha("c3c3")]);
-        assert!(b.implementation_commits.is_empty());
+        let a_c3 = a.event_for(&sha("c3c3")).expect("a has c3");
+        assert!(matches!(a_c3.kind, CommitKind::CodeOnly));
+        assert!(b.event_for(&sha("c3c3")).is_none());
     }
 
     #[test]
@@ -749,10 +719,15 @@ mod tests {
         let plan = &state.plans[&sess("foo")];
         assert_eq!(plan.body, "# v2 fresh\n");
         assert_eq!(plan.plan_intro, sha("c4c4"));
-        // The fresh foo's plan_revisions only contains c4 — c1 belongs
+        // The fresh foo's timeline only contains c4 — c1 belongs
         // to the deleted-and-gone old foo.
-        assert_eq!(plan.plan_revisions, vec![sha("c4c4")]);
-        assert!(plan.implementation_commits.is_empty());
+        let shas: Vec<_> = plan.timeline.iter().map(|e| e.sha.clone()).collect();
+        assert_eq!(shas, vec![sha("c4c4")]);
+        assert!(
+            plan.timeline
+                .iter()
+                .all(|e| !matches!(e.kind, CommitKind::CodeOnly | CommitKind::Mixed))
+        );
     }
 
     // ============================================================
@@ -801,7 +776,11 @@ mod tests {
                 event("c1c1", vec![intro_with_body("foo", "# v1\n")], false),
                 event("c2c2", vec![revise_with_body("foo", "# v2\n")], false),
                 event_with_finalize("c3c3", vec![], vec![upsert("foo", "alice.md", "APPROVE")]),
-                event("c4c4", vec![revise_with_body("foo", "# v3 ignored\n")], false),
+                event(
+                    "c4c4",
+                    vec![revise_with_body("foo", "# v3 ignored\n")],
+                    false,
+                ),
             ]),
         );
         let plan = &state.plans[&sess("foo")];
@@ -861,10 +840,91 @@ mod tests {
             ),
         );
         let plan = &state.plans[&sess("foo")];
-        let gate = plan.commits.get(&sha("c1c1")).expect("gate for c1");
-        let entry = gate.feedback.get(&AgentLabel::parse("alice").unwrap()).unwrap();
+        let event = plan.event_for(&sha("c1c1")).expect("event for c1");
+        let gate = event.gate.as_ref().expect("gate for c1");
+        let entry = gate
+            .feedback
+            .get(&AgentLabel::parse("alice").unwrap())
+            .unwrap();
         assert_eq!(entry.verdict, crate::repo_state::Verdict::Approve);
-        assert_eq!(plan.latest_reviewable_commit, Some(sha("c1c1")));
+        assert_eq!(
+            plan.latest_reviewable_event().map(|e| e.sha.clone()),
+            Some(sha("c1c1"))
+        );
+    }
+
+    #[test]
+    fn timeline_order_preserves_intro_impl_revision_sequence() {
+        // Codex regression: intro (c1) → impl (c2) → revision (c3)
+        // must surface in that exact order. The prior split-bucket
+        // model with the broken two-pointer merge produced
+        // [c1, c3, c2]. The first-class timeline preserves fold
+        // order by construction.
+        let state = derive_state(
+            PathBuf::from("/r"),
+            snap(vec![
+                event("c1c1", vec![intro_with_body("foo", "# v1\n")], false),
+                event("c2c2", vec![], true),
+                event("c3c3", vec![revise_with_body("foo", "# v2\n")], false),
+            ]),
+        );
+        let plan = &state.plans[&sess("foo")];
+        let shas: Vec<_> = plan.timeline.iter().map(|e| e.sha.clone()).collect();
+        assert_eq!(shas, vec![sha("c1c1"), sha("c2c2"), sha("c3c3")]);
+        let timeline = state.timeline_for(&sess("foo"));
+        let commit_shas: Vec<_> = timeline
+            .iter()
+            .filter_map(|t| match t {
+                crate::repo_state::TimelineEvent::Commit { sha, .. } => Some(sha.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(commit_shas, vec![sha("c1c1"), sha("c2c2"), sha("c3c3")]);
+    }
+
+    #[test]
+    fn frozen_plan_touch_does_not_flip_active_plan_to_multiplan() {
+        // Codex regression: a single commit touching both a frozen
+        // plan and an active plan should classify the active plan
+        // as PlanOnly (sealing hides the frozen plan from per-plan
+        // classification). The prior code read raw event.changes,
+        // so the active plan got marked MultiPlan.
+        //
+        // Setup:
+        //   c1: intro `frozen` → freeze it at c2.
+        //   c3: touches both `frozen` (no-op, sealed) and `active` (intro).
+        //   For `active`, kind must be PlanOnly (not MultiPlan).
+        let state = derive_state(
+            PathBuf::from("/r"),
+            snap(vec![
+                event(
+                    "c1c1",
+                    vec![intro_with_body("frozen", "# frozen\n")],
+                    false,
+                ),
+                event_with_finalize(
+                    "c2c2",
+                    vec![],
+                    vec![upsert("frozen", "alice.md", "APPROVE")],
+                ),
+                event(
+                    "c3c3",
+                    vec![
+                        revise_with_body("frozen", "# ignored\n"),
+                        intro_with_body("active", "# active\n"),
+                    ],
+                    false,
+                ),
+            ]),
+        );
+        let active = &state.plans[&sess("active")];
+        let c3 = active.event_for(&sha("c3c3")).expect("active has c3");
+        assert!(
+            matches!(c3.kind, CommitKind::PlanOnly),
+            "expected PlanOnly, got {:?}",
+            c3.kind
+        );
+        assert!(c3.gate.is_some(), "reviewable PlanOnly must have a gate");
     }
 
     #[test]
