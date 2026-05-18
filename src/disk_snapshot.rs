@@ -304,11 +304,10 @@ pub fn apply_commit(state: &mut RepoState, carry: &mut FoldCarry, event: &Commit
                     plan.body_hash = content_hash(&body);
                     plan.body = body;
                 }
-                plan.archived_cycles
-                    .push(crate::repo_state::ArchivedCycleSummary {
-                        closer: commit_sha.clone(),
-                        approver_count,
-                    });
+                plan.archived_cycles.push(crate::repo_state::ArchivedCycle {
+                    closer: commit_sha.clone(),
+                    approver_count,
+                });
                 // Append the Finalize event last — this is what makes
                 // `plan.frozen_at()` return Some(commit_sha). The
                 // monotone rule guarantees no further events on this

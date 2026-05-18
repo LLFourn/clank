@@ -263,7 +263,7 @@ pub struct Plan {
     /// `archived_cycles`; non-freeze touches of the snapshot path
     /// (deletions, phantom re-finalizes, hand edits) are intentionally
     /// excluded — see plan §Archived cycle.
-    pub archived_cycles: Vec<ArchivedCycleSummary>,
+    pub archived_cycles: Vec<ArchivedCycle>,
 }
 
 impl Plan {
@@ -351,14 +351,10 @@ pub use trinity_core::PlanLifecycle;
 /// last entry of `freeze_events` is the current cycle, earlier
 /// entries are archived. Today the rule is monotone so the list has
 /// length 0 or 1; the shape scales to richer histories.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ArchivedCycleSummary {
-    /// The commit at which the cycle was closed (the freeze event).
-    pub closer: CommitSha,
-    /// Number of approving-reviewer files in
-    /// `.trinity/finished/<stem>/` at that freeze commit's tree.
-    pub approver_count: u32,
-}
+///
+/// Now shared with the wire crate — `archived_cycles` on the wire is
+/// the same `Vec<ArchivedCycle>` the daemon stores.
+pub use trinity_core::dto::ArchivedCycle;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Feedback {
@@ -439,13 +435,8 @@ pub struct PlanEvent {
 }
 
 /// The `waiting_on` projection — the canonical per-session "who blocks
-/// progress" signal surfaced in MCP context and the web UI.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct WaitingOn {
-    pub role: WaitingRole,
-    pub reason: WaitingReason,
-    pub agents: Vec<AgentLabel>,
-    pub description: String,
-}
-
+/// progress" signal surfaced in MCP context and the web UI. Now
+/// shared with the wire crate so daemon-side projection state and
+/// wire response shape are one definition.
+pub use trinity_core::dto::WaitingOn;
 pub use trinity_core::{WaitingReason, WaitingRole};

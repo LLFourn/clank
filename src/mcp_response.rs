@@ -248,19 +248,11 @@ fn plan_id_string(repo_root: &Path, plan_key: &crate::lifecycle::PlanKey) -> Opt
 }
 
 fn build_waiting_on(w: &crate::repo_state::WaitingOn) -> WireWaitingOn {
-    WireWaitingOn {
-        role: w.role,
-        reason: w.reason,
-        agents: w.agents.iter().map(|a| a.as_str().to_string()).collect(),
-        description: w.description.clone(),
-    }
+    w.clone()
 }
 
-fn build_archived(c: &crate::repo_state::ArchivedCycleSummary) -> ArchivedCycle {
-    ArchivedCycle {
-        closer: c.closer.as_str().to_string(),
-        approver_count: c.approver_count,
-    }
+fn build_archived(c: &crate::repo_state::ArchivedCycle) -> ArchivedCycle {
+    c.clone()
 }
 
 fn posture_to_review_target_phase(p: crate::repo_state::Posture) -> ReviewTargetPhase {
@@ -681,7 +673,10 @@ mod tests {
         let v = context_from_state(&state, "foo", "reviewer").unwrap();
         assert_eq!(v.waiting_on.role, WaitingRole::Master);
         assert_eq!(v.waiting_on.reason, WaitingReason::AddressCommitChanges);
-        assert_eq!(v.waiting_on.agents, vec!["codex".to_string()]);
+        assert_eq!(
+            v.waiting_on.agents,
+            vec![AgentLabel::parse("codex").unwrap()]
+        );
     }
 
     #[tokio::test]

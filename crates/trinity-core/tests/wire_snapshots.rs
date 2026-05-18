@@ -13,6 +13,7 @@ use std::path::PathBuf;
 
 use serde_json::{Value, json};
 use trinity_core::dto::*;
+use trinity_core::ids::*;
 use trinity_core::vocab::*;
 
 /// Skeleton of a JSON value: object → ordered keys + recursive skeletons;
@@ -128,14 +129,14 @@ fn waiting_on_fixture() -> WaitingOn {
     WaitingOn {
         role: WaitingRole::Reviewers,
         reason: WaitingReason::CommitNeedsReview,
-        agents: vec!["alice".into()],
+        agents: vec![AgentLabel::parse("alice").unwrap()],
         description: "alice has not voted".into(),
     }
 }
 
 fn archived_fixture() -> ArchivedCycle {
     ArchivedCycle {
-        closer: "alice".into(),
+        closer: CommitSha::parse("abc1234").unwrap(),
         approver_count: 2,
     }
 }

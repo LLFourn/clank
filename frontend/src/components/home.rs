@@ -203,7 +203,7 @@ fn plan_table(rows: Vec<PlanRow>) -> impl IntoView {
     }
 }
 
-fn who_cell(agents: Vec<String>) -> AnyView {
+fn who_cell(agents: Vec<trinity_core::AgentLabel>) -> AnyView {
     if agents.is_empty() {
         return view! { <span class="muted">"—"</span> }.into_any();
     }
@@ -211,7 +211,7 @@ fn who_cell(agents: Vec<String>) -> AnyView {
         <div class="waiting-who">
             {agents
                 .into_iter()
-                .map(|a| view! { <span class="agent-chip">{a}</span> })
+                .map(|a| view! { <span class="agent-chip">{a.into_inner()}</span> })
                 .collect_view()}
         </div>
     }

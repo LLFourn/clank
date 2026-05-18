@@ -155,7 +155,10 @@ pub enum TimelineEvent {
 /// `archived_cycles`. One entry per freeze event (today: 0 or 1).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ArchivedCycle {
-    pub closer: String,
+    /// The commit at which the cycle was closed (the freeze event).
+    pub closer: crate::ids::CommitSha,
+    /// Number of approving-reviewer files in
+    /// `.trinity/finished/<stem>/` at that freeze commit's tree.
     pub approver_count: u32,
 }
 
@@ -177,8 +180,11 @@ pub struct WaitingOn {
     pub role: WaitingRole,
     pub reason: WaitingReason,
     /// Specific agent names tied to the reason (e.g. the requesters
-    /// for `AddressCommitChanges`). May be empty.
-    pub agents: Vec<String>,
+    /// for `AddressCommitChanges`). May be empty. Newtype is
+    /// `#[serde(transparent)]` so the wire form is a JSON string
+    /// array — identical to the prior `Vec<String>` shape — while
+    /// the daemon retains parse-time validation on every value.
+    pub agents: Vec<crate::ids::AgentLabel>,
     /// Human-readable explanation. Daemon-side text; the wire crate
     /// just carries the string.
     pub description: String,

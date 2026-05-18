@@ -220,19 +220,11 @@ pub fn plan_page_with_reader(
 // ============================================================
 
 fn build_waiting_on(w: &crate::repo_state::WaitingOn) -> WaitingOn {
-    WaitingOn {
-        role: w.role,
-        reason: w.reason,
-        agents: w.agents.iter().map(|a| a.as_str().to_string()).collect(),
-        description: w.description.clone(),
-    }
+    w.clone()
 }
 
-fn build_archived(c: &crate::repo_state::ArchivedCycleSummary) -> ArchivedCycle {
-    ArchivedCycle {
-        closer: c.closer.as_str().to_string(),
-        approver_count: c.approver_count,
-    }
+fn build_archived(c: &crate::repo_state::ArchivedCycle) -> ArchivedCycle {
+    c.clone()
 }
 
 fn posture_to_review_target_phase(p: Posture) -> ReviewTargetPhase {
