@@ -66,6 +66,19 @@ pub struct PlanTimelineEvent {
     pub gate: Option<CommitGate>,
 }
 
+/// Per-cycle summary surfaced in the plan-detail wire under
+/// `archived_cycles`. One entry per freeze event (today: 0 or 1).
+/// Lives in `model` because the fold-state stores it directly on
+/// `Plan.archived_cycles`; api response shapes re-export it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ArchivedCycle {
+    /// The commit at which the cycle was closed (the freeze event).
+    pub closer: CommitSha,
+    /// Number of approving-reviewer files in
+    /// `.trinity/finished/<stem>/` at that freeze commit's tree.
+    pub approver_count: u32,
+}
+
 /// One plan's full fold state. The daemon stores this directly and
 /// the wire response shape is built by projecting selected fields
 /// (plus `body_html` rendering) at the boundary.
@@ -98,7 +111,7 @@ pub struct Plan {
     /// Per-cycle summaries derived from the fold's freeze events
     /// (one entry per freeze). Today the monotone rule means this
     /// has length 0 or 1.
-    pub archived_cycles: Vec<crate::dto::ArchivedCycle>,
+    pub archived_cycles: Vec<ArchivedCycle>,
 }
 
 impl Plan {

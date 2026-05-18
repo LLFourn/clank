@@ -11,7 +11,7 @@
 
 // Type aliases preserve the historical frontend-local names where
 // they don't match the wire crate's naming.
-pub use trinity_core::dto::{
+pub use trinity_core::api::{
     CommitDetail, CommitDetailResponse, CommitRowDetail, DiffHunk, DiffLine,
     DiffResponse as DiffPage, Feedback as CommitFeedback, FileDiff, FileDiffMode, FinalizeApproval,
     ListPlansResponse as PlansIndex, PlanConflict as PlanConflictRow,
@@ -127,7 +127,7 @@ pub async fn fetch_repos() -> Result<ReposIndex, FetchError> {
 
 pub async fn delete_repo(
     basename: String,
-) -> Result<trinity_core::dto::DeleteRepoOutcome, FetchError> {
+) -> Result<trinity_core::api::DeleteRepoOutcome, FetchError> {
     let url = format!("/api/repos/{basename}");
     let resp = gloo_net::http::Request::delete(&url)
         .send()
@@ -136,7 +136,7 @@ pub async fn delete_repo(
     if !resp.ok() {
         return Err(FetchError::Status(resp.status()));
     }
-    resp.json::<trinity_core::dto::DeleteRepoOutcome>()
+    resp.json::<trinity_core::api::DeleteRepoOutcome>()
         .await
         .map_err(|e| FetchError::Decode(e.to_string()))
 }

@@ -66,7 +66,7 @@ async fn serve_spa_shell(shell: Option<Arc<String>>, frontend_dist: PathBuf) -> 
 async fn api_wait_for_work(
     State(state): State<AppState>,
     axum::Json(args): axum::Json<WaitArgs>,
-) -> Result<axum::Json<trinity_core::dto::WaitForWorkResponse>, AppError> {
+) -> Result<axum::Json<trinity_core::api::WaitForWorkResponse>, AppError> {
     let resp = wait_for_work(&state.runtime, args)
         .await
         .map_err(|e| match e {
@@ -117,13 +117,13 @@ async fn event_stream(
         use crate::repo_state::LiveEvent as DaemonLiveEvent;
         let wire_event = match e {
             DaemonLiveEvent::Repo(re) => {
-                trinity_core::dto::LiveEvent::Repo(trinity_core::dto::RepoEvent {
+                trinity_core::api::LiveEvent::Repo(trinity_core::api::RepoEvent {
                     ts: re.ts,
                     payload: re.payload,
                 })
             }
             DaemonLiveEvent::Plan(pe) => {
-                trinity_core::dto::LiveEvent::Plan(trinity_core::dto::PlanEvent {
+                trinity_core::api::LiveEvent::Plan(trinity_core::api::PlanEvent {
                     ts: pe.ts,
                     plan_id: pe.plan_id.to_string(),
                     lifecycle: pe.lifecycle,
@@ -275,7 +275,7 @@ async fn resolve_plan_id_segments(
 async fn api_plans(
     State(state): State<AppState>,
     Query(q): Query<RepoQuery>,
-) -> Result<axum::Json<trinity_core::dto::ListPlansResponse>, AppError> {
+) -> Result<axum::Json<trinity_core::api::ListPlansResponse>, AppError> {
     let repos = repos_to_render(&state, q.repo).await?;
     let mut snapshots = Vec::with_capacity(repos.len());
     for repo in repos {
@@ -322,7 +322,7 @@ fn enforce_plan_visible(
 async fn api_plan_detail(
     State(state): State<AppState>,
     Path((repo_basename, stem_md)): Path<(String, String)>,
-) -> Result<axum::Json<trinity_core::dto::PlanDetailResponse>, AppError> {
+) -> Result<axum::Json<trinity_core::api::PlanDetailResponse>, AppError> {
     let (repo, plan_key) = resolve_plan_id_segments(&state, &repo_basename, &stem_md).await?;
     let snapshot = state
         .runtime
@@ -340,7 +340,7 @@ async fn api_plan_detail(
 async fn api_plan_revision(
     State(state): State<AppState>,
     Path((repo_basename, stem_md, sha)): Path<(String, String, String)>,
-) -> Result<axum::Json<trinity_core::dto::PlanRevisionResponse>, AppError> {
+) -> Result<axum::Json<trinity_core::api::PlanRevisionResponse>, AppError> {
     let (repo, plan_key) = resolve_plan_id_segments(&state, &repo_basename, &stem_md).await?;
     let commit_sha = crate::lifecycle::CommitSha::parse(&sha)
         .map_err(|e| AppError::bad_request(format!("invalid sha: {e}")))?;
@@ -377,7 +377,7 @@ async fn api_plan_revision(
     let next_sha = plan_revisions.get(pos + 1).map(|c| c.as_str().to_string());
 
     let feedback = crate::ui_response::feedback_for_target(plan, &commit_sha);
-    Ok(axum::Json(trinity_core::dto::PlanRevisionResponse {
+    Ok(axum::Json(trinity_core::api::PlanRevisionResponse {
         repo: snapshot.root.to_string_lossy().to_string(),
         plan_id: format!("{repo_basename}/{stem_md}"),
         slug: plan.id.as_str().to_string(),
@@ -398,8 +398,8 @@ async fn api_plan_revision(
 async fn api_commit_diff(
     State(state): State<AppState>,
     Path((repo_basename, stem_md, sha)): Path<(String, String, String)>,
-) -> Result<axum::Json<trinity_core::dto::CommitDetailResponse>, AppError> {
-    use trinity_core::dto::{CommitDetail, CommitDetailResponse, FinalizeApproval};
+) -> Result<axum::Json<trinity_core::api::CommitDetailResponse>, AppError> {
+    use trinity_core::api::{CommitDetail, CommitDetailResponse, FinalizeApproval};
     use trinity_core::vocab::CommitKind;
 
     let (repo, plan_key) = resolve_plan_id_segments(&state, &repo_basename, &stem_md).await?;
@@ -498,7 +498,7 @@ async fn api_commit_diff(
 async fn api_diff(
     State(state): State<AppState>,
     Path((repo_basename, stem_md, from, to)): Path<(String, String, String, String)>,
-) -> Result<axum::Json<trinity_core::dto::DiffResponse>, AppError> {
+) -> Result<axum::Json<trinity_core::api::DiffResponse>, AppError> {
     let (repo, plan_key) = resolve_plan_id_segments(&state, &repo_basename, &stem_md).await?;
     let from_sha = crate::lifecycle::CommitSha::parse(&from)
         .map_err(|e| AppError::bad_request(format!("invalid from sha: {e}")))?;
@@ -537,7 +537,7 @@ async fn api_diff(
         .map_err(|e| AppError::internal(format!("git diff: {e}")))?;
     let diff_files = parsed_to_wire_diff_files(&crate::diff_parser::parse_diff(&patch));
     let _ = repo; // canonical path no longer surfaced on this response
-    Ok(axum::Json(trinity_core::dto::DiffResponse {
+    Ok(axum::Json(trinity_core::api::DiffResponse {
         from: from_sha.as_str().to_string(),
         to: to_sha.as_str().to_string(),
         from_path: from_path.to_string_lossy().to_string(),
@@ -551,10 +551,10 @@ async fn api_diff(
 /// `{repos: [...]}` sorted by `last_activity_ts` desc.
 async fn api_repos_list(
     State(state): State<AppState>,
-) -> Result<axum::Json<trinity_core::dto::RepoListResponse>, AppError> {
+) -> Result<axum::Json<trinity_core::api::RepoListResponse>, AppError> {
     let trinity_arc = state.runtime.state();
     let trinity = trinity_arc.lock().await;
-    let mut rows: Vec<(i64, trinity_core::dto::RepoRow)> =
+    let mut rows: Vec<(i64, trinity_core::api::RepoRow)> =
         Vec::with_capacity(trinity.repo_basenames.len());
     for (basename, root) in &trinity.repo_basenames {
         let Some(repo_state) = trinity.repos.get(root) else {
@@ -566,7 +566,7 @@ async fn api_repos_list(
         }
         rows.push((
             last_ts,
-            trinity_core::dto::RepoRow {
+            trinity_core::api::RepoRow {
                 basename: basename.as_str().to_string(),
                 root: root.to_string_lossy().to_string(),
                 plan_count: repo_state.plans.len(),
@@ -576,7 +576,7 @@ async fn api_repos_list(
     }
     rows.sort_by_key(|r| std::cmp::Reverse(r.0));
     let repos = rows.into_iter().map(|(_, v)| v).collect();
-    Ok(axum::Json(trinity_core::dto::RepoListResponse { repos }))
+    Ok(axum::Json(trinity_core::api::RepoListResponse { repos }))
 }
 
 /// `DELETE /api/repos/{basename}` — unwatch a repo:
@@ -593,7 +593,7 @@ async fn api_repos_list(
 async fn api_repos_delete(
     State(state): State<AppState>,
     Path(basename): Path<String>,
-) -> Result<axum::Json<trinity_core::dto::DeleteRepoOutcome>, AppError> {
+) -> Result<axum::Json<trinity_core::api::DeleteRepoOutcome>, AppError> {
     let basename_key = crate::lifecycle::RepoBasename::parse(&basename)
         .map_err(|e| AppError::bad_request(format!("invalid basename: {e}")))?;
     let canonical = {
@@ -639,7 +639,7 @@ async fn api_repos_delete(
         crate::runtime::RemoveOutcome::NotPresent => 0,
     };
 
-    Ok(axum::Json(trinity_core::dto::DeleteRepoOutcome {
+    Ok(axum::Json(trinity_core::api::DeleteRepoOutcome {
         ok: registry_write_error.is_none(),
         basename,
         plan_count,
@@ -651,8 +651,8 @@ async fn api_repos_delete(
 /// Used by `api_commit_diff` and `api_diff`.
 fn parsed_to_wire_diff_files(
     files: &[crate::diff_parser::FileDiff],
-) -> Vec<trinity_core::dto::FileDiff> {
-    use trinity_core::dto::{DiffHunk, DiffLine, FileDiff, FileDiffMode};
+) -> Vec<trinity_core::api::FileDiff> {
+    use trinity_core::api::{DiffHunk, DiffLine, FileDiff, FileDiffMode};
     use trinity_core::vocab::DiffLineKind;
     files
         .iter()

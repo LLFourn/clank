@@ -25,7 +25,7 @@ use crate::projection::waiting_on;
 use crate::repo_state::{Trinity, WaitingReason, WaitingRole};
 use crate::review_state::CommitGate;
 use crate::runtime::Runtime;
-use trinity_core::dto::{WaitTimeout, WorkAction, WorkPayload};
+use trinity_core::api::{WaitTimeout, WorkAction, WorkPayload};
 use trinity_core::vocab::CommitKind;
 
 const DEFAULT_TIMEOUT_SECS: u64 = 1800;
@@ -57,7 +57,7 @@ pub struct WaitArgs {
 /// Re-export `WaitForWorkResponse` from the wire crate as `WaitResponse`
 /// so existing call sites need no rename. The wire shape is identical;
 /// this module is now a thin builder over the typed DTO.
-pub use trinity_core::dto::WaitForWorkResponse as WaitResponse;
+pub use trinity_core::api::WaitForWorkResponse as WaitResponse;
 
 #[derive(Debug, thiserror::Error)]
 pub enum WaitError {

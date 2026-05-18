@@ -17,7 +17,7 @@ use crate::lifecycle::{PlanKey, content_hash};
 use crate::rebuild::{RebuildError, rebuild_repo};
 use crate::repo_state::RepoState;
 use crate::repo_state::{Feedback, LiveEvent, Plan, PlanEvent, RepoEvent, Trinity};
-use trinity_core::dto::{PlanEventPayload, RepoEventPayload};
+use trinity_core::api::{PlanEventPayload, RepoEventPayload};
 
 pub struct Runtime {
     state: Arc<Mutex<Trinity>>,

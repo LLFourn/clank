@@ -22,7 +22,7 @@
 //!    invariant.
 
 use serde_json::json;
-use trinity_core::dto::*;
+use trinity_core::api::*;
 use trinity_core::ids::*;
 use trinity_core::vocab::*;
 

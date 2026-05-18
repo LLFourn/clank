@@ -235,7 +235,7 @@ pub use trinity_core::model::{Feedback, Plan, PlanTimelineEvent};
 
 pub use trinity_core::PlanLifecycle;
 
-pub use trinity_core::dto::ArchivedCycle;
+pub use trinity_core::api::ArchivedCycle;
 
 pub use trinity_core::Verdict;
 
@@ -291,7 +291,7 @@ impl LiveEvent {
 pub struct RepoEvent {
     pub ts: i64,
     pub repo: RepoRoot,
-    pub payload: trinity_core::dto::RepoEventPayload,
+    pub payload: trinity_core::api::RepoEventPayload,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -300,12 +300,12 @@ pub struct PlanEvent {
     pub repo: RepoRoot,
     pub plan_id: crate::lifecycle::PlanId,
     pub lifecycle: PlanLifecycle,
-    pub payload: trinity_core::dto::PlanEventPayload,
+    pub payload: trinity_core::api::PlanEventPayload,
 }
 
 /// The `waiting_on` projection — the canonical per-session "who blocks
 /// progress" signal surfaced in MCP context and the web UI. Now
 /// shared with the wire crate so daemon-side projection state and
 /// wire response shape are one definition.
-pub use trinity_core::dto::WaitingOn;
+pub use trinity_core::api::WaitingOn;
 pub use trinity_core::{WaitingReason, WaitingRole};

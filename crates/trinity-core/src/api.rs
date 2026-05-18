@@ -151,16 +151,10 @@ pub enum TimelineEvent {
     },
 }
 
-/// Per-cycle summary surfaced in the plan-detail wire under
-/// `archived_cycles`. One entry per freeze event (today: 0 or 1).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ArchivedCycle {
-    /// The commit at which the cycle was closed (the freeze event).
-    pub closer: crate::ids::CommitSha,
-    /// Number of approving-reviewer files in
-    /// `.trinity/finished/<stem>/` at that freeze commit's tree.
-    pub approver_count: u32,
-}
+// `ArchivedCycle` lives in [`crate::model`] because daemon storage
+// (`model::Plan.archived_cycles`) holds it directly. Response
+// shapes here re-export it at use sites.
+pub use crate::model::ArchivedCycle;
 
 /// Approval snapshot file under `.trinity/finished/<stem>/<agent>.md`
 /// at the freeze commit's tree. Surfaced on `CommitDetailResponse`

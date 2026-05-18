@@ -13,16 +13,23 @@
 //!
 //! - [`vocab`] — closed-vocabulary enums (`PlanLifecycle`,
 //!   `CommitKind`, `WaitingReason`, etc.). Wire form is snake_case.
-//! - [`dto`] — public response DTOs (`GetContextResponse`,
-//!   `CommitDetailResponse`, etc.) and the structs that compose
-//!   them (`Feedback`, `CommitGate`, `TimelineEvent`). Phase 4
-//!   splits this into `model` + `api`.
+//! - [`ids`] — validated identifier newtypes (`AgentLabel`,
+//!   `PlanKey`, `CommitSha`, `RepoBasename`, `ContentHash`,
+//!   `PlanId`). Serde-transparent over String with parse-time
+//!   validation enforced on deserialize.
+//! - [`model`] — daemon fold-state types (`Plan`,
+//!   `PlanTimelineEvent`, `CommitGate`, `Feedback`,
+//!   `ArchivedCycle`). The daemon stores these directly.
+//! - [`api`] — public response DTOs (`GetContextResponse`,
+//!   `CommitDetailResponse`, etc.) plus projection-only structs
+//!   (`PlanRow`, `CommitRow`, `PrHint`, etc.). Wire shapes that
+//!   the daemon's response projection builds from `model` types.
 //!
-//! Every DTO derives both `Serialize` and `Deserialize` so the
+//! Every type derives both `Serialize` and `Deserialize` so the
 //! daemon (producer) and the frontend (consumer) round-trip
-//! through identical types.
+//! through identical definitions.
 
-pub mod dto;
+pub mod api;
 pub mod ids;
 pub mod model;
 pub mod vocab;

@@ -18,7 +18,7 @@ use crate::projection::{
 };
 use crate::repo_state::{Plan, RepoState};
 use crate::review_state::CommitGate;
-use trinity_core::dto::{
+use trinity_core::api::{
     ArchivedCycle, CommitRef, CommitRowDetail, Feedback, ListPlansResponse, PlanConflict,
     PlanDetailResponse, PlanRow, PrHint, PrHintOption, ReviewGate, ReviewTarget, TimelineEvent,
     WaitingOn,
@@ -259,8 +259,8 @@ fn build_commits_array_rich(plan: &Plan) -> Vec<CommitRowDetail> {
     out
 }
 
-fn build_commit_gate(g: &CommitGate) -> trinity_core::dto::CommitGate {
-    trinity_core::dto::CommitGate {
+fn build_commit_gate(g: &CommitGate) -> trinity_core::api::CommitGate {
+    trinity_core::api::CommitGate {
         state: g.state,
         participants: g
             .participants

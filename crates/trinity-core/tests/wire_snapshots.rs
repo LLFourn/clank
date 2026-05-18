@@ -12,7 +12,7 @@ use std::fs;
 use std::path::PathBuf;
 
 use serde_json::{Value, json};
-use trinity_core::dto::*;
+use trinity_core::api::*;
 use trinity_core::ids::*;
 use trinity_core::vocab::*;
 

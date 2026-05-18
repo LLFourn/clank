@@ -16,7 +16,7 @@ use crate::projection::{
 };
 use crate::repo_state::{Plan, PlanWorktreeStatus, RepoState};
 use crate::review_state::CommitGate;
-use trinity_core::dto::{
+use trinity_core::api::{
     ArchivedCycle, CommitRef, CommitRow, FeedbackSummary, GetContextResponse, ListPlansResponse,
     PlanConflict, PlanRow, PrHint, PrHintOption, ReviewGate, ReviewTarget, TimelineEvent,
     WaitingOn as WireWaitingOn, WriteFeedback,
@@ -295,8 +295,8 @@ fn build_commits_array(plan: &Plan) -> Vec<CommitRow> {
     out
 }
 
-fn build_commit_gate(g: &CommitGate) -> trinity_core::dto::CommitGate {
-    trinity_core::dto::CommitGate {
+fn build_commit_gate(g: &CommitGate) -> trinity_core::api::CommitGate {
+    trinity_core::api::CommitGate {
         state: g.state,
         participants: g
             .participants
@@ -317,7 +317,7 @@ fn build_commit_gate(g: &CommitGate) -> trinity_core::dto::CommitGate {
             .map(|(author, fb)| {
                 (
                     author.as_str().to_string(),
-                    trinity_core::dto::Feedback {
+                    trinity_core::api::Feedback {
                         author: author.as_str().to_string(),
                         verdict: fb.verdict,
                         body_raw: fb.body.clone(),
@@ -473,7 +473,7 @@ mod tests {
     use std::path::Path;
     use std::process::Command;
     use std::time::Duration;
-    use trinity_core::dto::PlanRow;
+    use trinity_core::api::PlanRow;
     use trinity_core::vocab::{
         PlanLifecycle, PlanWorktreeStatus as Pws, Posture, WaitingReason, WaitingRole,
     };
