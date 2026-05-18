@@ -27,7 +27,7 @@ pub trait PlanStatusReader {
     fn compute(
         &self,
         repo_root: &Path,
-        plan_path: &Path,
+        plan_path: &str,
         body_hash: &ContentHash,
     ) -> std::io::Result<PlanWorktreeStatus>;
 }
@@ -38,7 +38,7 @@ impl PlanStatusReader for DiskPlanStatusReader {
     fn compute(
         &self,
         repo_root: &Path,
-        plan_path: &Path,
+        plan_path: &str,
         body_hash: &ContentHash,
     ) -> std::io::Result<PlanWorktreeStatus> {
         compute_plan_worktree_status_parts(repo_root, plan_path, body_hash)
@@ -49,7 +49,7 @@ impl PlanStatusReader for DiskPlanStatusReader {
 /// copied snapshot fields.
 pub fn compute_plan_worktree_status_parts(
     repo_root: &Path,
-    plan_path: &Path,
+    plan_path: &str,
     body_hash: &ContentHash,
 ) -> std::io::Result<PlanWorktreeStatus> {
     let active_path = repo_root.join(plan_path);
@@ -115,7 +115,7 @@ fn build_plan_row(
         plan_id: plan_id_string(repo_root, &plan.id),
         slug: plan.id.as_str().to_string(),
         lifecycle,
-        current_path: plan.plan_path.to_string_lossy().to_string(),
+        current_path: plan.plan_path.clone(),
         phase: plan_phase,
         plan_worktree_status: worktree_status,
         waiting_on: build_waiting_on(&w),
@@ -209,7 +209,7 @@ pub fn get_context_response_from_snapshot(
         plan_id: plan_id_string(&state.root, &session.id),
         slug: session.id.as_str().to_string(),
         lifecycle,
-        current_path: session.plan_path.to_string_lossy().to_string(),
+        current_path: session.plan_path.clone(),
         phase: session_phase,
         plan_worktree_status: worktree_status,
         waiting_on: build_waiting_on(&w),
@@ -322,7 +322,7 @@ fn build_commit_gate(g: &CommitGate) -> trinity_core::dto::CommitGate {
                         verdict: fb.verdict,
                         body_raw: fb.body.clone(),
                         body_html: String::new(),
-                        path: fb.path.to_string_lossy().to_string(),
+                        path: fb.path.clone(),
                         created_at: fb.created_at,
                     },
                 )
@@ -403,7 +403,7 @@ fn build_pr_hint(session: &Plan, state: &RepoState) -> PrHint {
     let base_for_squash = plan_intro_parent
         .clone()
         .unwrap_or_else(|| plan_intro.clone());
-    let plan_path = session.plan_path.to_string_lossy().to_string();
+    let plan_path = session.plan_path.clone();
     let suggested = format!("Implement {}", session.id.as_str());
     let options = vec![
         PrHintOption {
@@ -753,7 +753,7 @@ mod tests {
         fn compute(
             &self,
             _repo_root: &Path,
-            _plan_path: &Path,
+            _plan_path: &str,
             _body_hash: &ContentHash,
         ) -> std::io::Result<PlanWorktreeStatus> {
             self.entered.send(()).unwrap();

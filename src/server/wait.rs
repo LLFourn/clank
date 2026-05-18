@@ -284,10 +284,10 @@ fn build_action(reason: WaitingReason, candidate: &Candidate) -> WorkAction {
 fn prompt_hint_for(
     reason: WaitingReason,
     commit_kind: CommitKind,
-    plan_path: &std::path::Path,
+    plan_path: &str,
 ) -> Option<String> {
     use WaitingReason::*;
-    let plan_path_str = plan_path.to_string_lossy();
+    let plan_path_str = plan_path;
     Some(match (reason, commit_kind) {
         (CommitNeedsReview, CommitKind::PlanOnly) => format!(
             "This commit only changes the plan. Read the plan file at {plan_path_str} and \
@@ -356,7 +356,7 @@ fn caller_already_voted(cand: &Candidate, reason: WaitingReason, author: &AgentL
 /// drives `waiting_on`, `target_sha`, and `commit_kind`. No second
 /// selector.
 fn derive_locations(cand: &Candidate, reason: WaitingReason, author: &AgentLabel) -> Vec<String> {
-    let plan_file = cand.plan_path.to_string_lossy().into_owned();
+    let plan_file = cand.plan_path.clone();
     let sid = cand.plan_key.as_str();
 
     match reason {
@@ -417,7 +417,7 @@ fn rc_feedback_paths(
 struct Candidate {
     repo_root: PathBuf,
     plan_key: PlanKey,
-    plan_path: PathBuf,
+    plan_path: String,
     body_hash: ContentHash,
     is_finished: bool,
     /// One gate: the latest reviewable commit's gate. Folds the old
@@ -513,7 +513,7 @@ mod tests {
         Candidate {
             repo_root: PathBuf::from("/repo"),
             plan_key: PlanKey::parse("sid").unwrap(),
-            plan_path: PathBuf::from(".trinity/plans/sid.md"),
+            plan_path: ".trinity/plans/sid.md".to_string(),
             body_hash: content_hash("x"),
             is_finished: false,
             gate: None,

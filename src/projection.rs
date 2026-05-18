@@ -144,7 +144,7 @@ pub fn last_activity_ts_for(plan: &Plan) -> i64 {
 /// no longer moves over its history; this always returns the plan's
 /// canonical path.
 pub fn plan_path_at(plan: &Plan, _target_sha: &CommitSha) -> Option<std::path::PathBuf> {
-    Some(plan.plan_path.clone())
+    Some(std::path::PathBuf::from(&plan.plan_path))
 }
 
 /// All plan-touching commits for this plan, in chronological order.

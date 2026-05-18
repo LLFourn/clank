@@ -130,7 +130,7 @@ impl FoldCarry {
                 .insert(
                     (fb.parsed.target_sha, fb.parsed.author),
                     Feedback {
-                        path: fb.abs_path,
+                        path: fb.abs_path.to_string_lossy().into_owned(),
                         body: fb.body,
                         verdict,
                         created_at: fb.created_at,
@@ -217,7 +217,9 @@ pub fn apply_commit(state: &mut RepoState, carry: &mut FoldCarry, event: &Commit
                 let plan_path = touch
                     .new_path
                     .clone()
-                    .expect("new_path is Some per outer guard");
+                    .expect("new_path is Some per outer guard")
+                    .to_string_lossy()
+                    .into_owned();
                 let body = carry
                     .plan_bodies
                     .get(&touch.session)

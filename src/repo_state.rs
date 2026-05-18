@@ -6,8 +6,7 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::path::PathBuf;
 
-use crate::lifecycle::{AgentLabel, CommitSha, ContentHash, PlanKey, RepoBasename};
-use crate::review_state::CommitGate;
+use crate::lifecycle::{AgentLabel, CommitSha, PlanKey, RepoBasename};
 
 pub type RepoRoot = PathBuf;
 
@@ -132,7 +131,7 @@ impl RepoState {
         for (key, plan) in &self.plans {
             hasher.update(key.as_str().as_bytes());
             hasher.update(b"|path=");
-            hasher.update(plan.plan_path.to_string_lossy().as_bytes());
+            hasher.update(plan.plan_path.as_bytes());
             hasher.update(b"|body_hash=");
             hasher.update(plan.body_hash.as_str().as_bytes());
             hasher.update(b"|intro=");
@@ -227,146 +226,16 @@ impl StateDigest {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Plan {
-    pub id: PlanKey,
-    /// Repo-relative path: `.trinity/plans/<stem>.md`. Never absolute.
-    /// Internal: never crosses an API boundary — the boundary uses
-    /// `PlanId` plus a derived `current_path`.
-    pub plan_path: PathBuf,
-    /// Plan-file body. For unfrozen plans, this tracks HEAD. For
-    /// frozen plans, this is the body at the freeze commit.
-    pub body: String,
-    pub body_hash: ContentHash,
-    /// First commit that introduced the plan file (in this plan
-    /// instance's life — if a same-stem plan was deleted and
-    /// re-introduced, `plan_intro` is the re-introduction commit).
-    pub plan_intro: CommitSha,
-    /// First-parent of `plan_intro`, or `None` for the root commit.
-    /// Used by `pr_hint` to suggest squash bases.
-    pub plan_intro_parent: Option<CommitSha>,
-    /// `max(author_ts of attributed commits, mtime of feedback
-    /// files)`. Powers the /api/plans sort order. Updated
-    /// incrementally — never a max-walk.
-    pub last_activity_ts: i64,
-    /// Chronological per-commit log of this plan's life — appended
-    /// by `disk_snapshot::apply_commit` as the fold sees each
-    /// relevant commit. The single source of truth for plan
-    /// revisions, implementation commits, reviewable commits,
-    /// per-commit gates, and per-commit metadata. All projection
-    /// queries (`projection::*`) are filters or reverse-scans over
-    /// this list — no parallel buckets to keep in sync.
-    pub timeline: Vec<PlanTimelineEvent>,
-    /// Per-cycle summaries derived from the fold's freeze events (one
-    /// entry per freeze). Today the monotone rule means this has
-    /// length 0 or 1. Surfaced in the plan-detail wire as
-    /// `archived_cycles`; non-freeze touches of the snapshot path
-    /// (deletions, phantom re-finalizes, hand edits) are intentionally
-    /// excluded — see plan §Archived cycle.
-    pub archived_cycles: Vec<ArchivedCycle>,
-}
+/// Plan, PlanTimelineEvent, Feedback are the daemon's fold-state
+/// types — defined once in `trinity_core::model` and shared with
+/// the wire. `body_html`-bearing wire shapes (`dto::Feedback`,
+/// `dto::CommitGate`) are still built by the response projection
+/// step from these model types.
+pub use trinity_core::model::{Feedback, Plan, PlanTimelineEvent};
 
-impl Plan {
-    /// Find the timeline event for a SHA, if this plan has one.
-    pub fn event_for(&self, sha: &CommitSha) -> Option<&PlanTimelineEvent> {
-        self.timeline.iter().find(|e| &e.sha == sha)
-    }
-
-    pub fn event_for_mut(&mut self, sha: &CommitSha) -> Option<&mut PlanTimelineEvent> {
-        self.timeline.iter_mut().find(|e| &e.sha == sha)
-    }
-
-    /// The latest reviewable commit event, if any. Reverse scan.
-    pub fn latest_reviewable_event(&self) -> Option<&PlanTimelineEvent> {
-        self.timeline.iter().rev().find(|e| e.kind.is_reviewable())
-    }
-
-    /// The freeze commit's SHA, if this plan has frozen. Derived from
-    /// the timeline — the last `CommitKind::Finalize` event is the
-    /// freeze. `Some(_)` ⇒ plan is finished. Once set the fold never
-    /// appends further events on this plan (step 5 short-circuits on
-    /// frozen plans), so this scan is at-most-once-per-plan-life.
-    pub fn frozen_at(&self) -> Option<&CommitSha> {
-        self.timeline
-            .iter()
-            .rev()
-            .find_map(|e| matches!(e.kind, CommitKind::Finalize).then_some(&e.sha))
-    }
-
-    /// True iff the plan has frozen. Sugar for `frozen_at().is_some()`.
-    pub fn is_frozen(&self) -> bool {
-        self.frozen_at().is_some()
-    }
-
-    /// Lifecycle derived from `is_frozen()`. Replaces the legacy
-    /// `PlanLifecycle::from_plan(&Plan)` constructor — now that
-    /// `PlanLifecycle` lives in `trinity_core`, the daemon owns
-    /// this projection as a method on the daemon's own struct
-    /// (Rust's orphan rule forbids inherent impl blocks on
-    /// externally-defined enums).
-    pub fn lifecycle(&self) -> PlanLifecycle {
-        if self.is_frozen() {
-            PlanLifecycle::Finished
-        } else {
-            PlanLifecycle::Active
-        }
-    }
-
-    /// True iff this plan should surface across Trinity's response
-    /// shapes given the current `worktree_status`. A plan is HIDDEN
-    /// (returns false) when its file is missing from the working
-    /// tree AND it has not frozen: the operator has uncommitted-
-    /// deleted it, so Trinity respects that decision until they
-    /// either restore the file or commit the deletion. Frozen plans
-    /// stay visible regardless — their body is captured at freeze
-    /// and `.trinity/finished/` is sealed.
-    pub fn is_visible(&self, worktree_status: PlanWorktreeStatus) -> bool {
-        self.is_frozen() || !matches!(worktree_status, PlanWorktreeStatus::PlanFileMissing)
-    }
-}
-
-/// One commit in a plan's life as observed by the fold. The `kind` is
-/// the per-plan classification (`PlanOnly | CodeOnly | Mixed | MultiPlan
-/// | Finalize` — `Unattributed` is never appended because such commits
-/// are not part of this plan's timeline). `gate` is `Some` for
-/// reviewable kinds (`PlanOnly | CodeOnly | Mixed`) and `None` for
-/// non-reviewable kinds (`MultiPlan`, `Finalize`).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PlanTimelineEvent {
-    pub sha: CommitSha,
-    pub kind: CommitKind,
-    pub author_ts: i64,
-    pub subject: String,
-    pub gate: Option<CommitGate>,
-}
-
-/// Plan lifecycle: re-exported from `trinity_core` so the daemon
-/// and the frontend branch on one definition. Derived from
-/// `Plan::is_frozen()`; see [`Plan::lifecycle`] for the daemon-side
-/// constructor.
 pub use trinity_core::PlanLifecycle;
 
-/// Per-cycle summary surfaced in the plan-detail UI's cycle-history
-/// view. Sourced from the fold's `freeze_events` side-output; the
-/// last entry of `freeze_events` is the current cycle, earlier
-/// entries are archived. Today the rule is monotone so the list has
-/// length 0 or 1; the shape scales to richer histories.
-///
-/// Now shared with the wire crate — `archived_cycles` on the wire is
-/// the same `Vec<ArchivedCycle>` the daemon stores.
 pub use trinity_core::dto::ArchivedCycle;
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Feedback {
-    /// Absolute path on disk for the feedback file.
-    pub path: PathBuf,
-    pub body: String,
-    pub verdict: Verdict,
-    /// File mtime as unix seconds at the time the feedback was ingested.
-    /// Used by the UI to sort feedback chronologically when SHA + author
-    /// alone don't establish order.
-    pub created_at: i64,
-}
 
 pub use trinity_core::Verdict;
 

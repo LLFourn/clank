@@ -443,7 +443,7 @@ fn upsert_feedback(
     gate.feedback.insert(
         parsed.author,
         Feedback {
-            path: abs_path,
+            path: abs_path.to_string_lossy().into_owned(),
             body,
             verdict,
             created_at,

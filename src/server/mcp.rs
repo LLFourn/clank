@@ -214,7 +214,7 @@ async fn start_plan(state: &AppState, req: &ToolCallRequest) -> Result<Value, To
                 return Err(ToolError::Forbidden(format!(
                     "plan stem `{}` already exists at {}",
                     plan_key.as_str(),
-                    existing.plan_path.display()
+                    existing.plan_path
                 )));
             }
             if repo_state.plan_conflicts.contains_key(&plan_key) {
@@ -478,7 +478,7 @@ pub async fn resolve_plan_id(
                     let plan_id = PlanId::new(basename.clone(), p.id.clone()).to_string();
                     json!({
                         "plan_id": plan_id,
-                        "current_path": p.plan_path.to_string_lossy(),
+                        "current_path": &p.plan_path,
                         "lifecycle": p.lifecycle().as_str(),
                     })
                 })

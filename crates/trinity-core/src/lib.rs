@@ -24,6 +24,7 @@
 
 pub mod dto;
 pub mod ids;
+pub mod model;
 pub mod vocab;
 
 // Re-export the closed-vocab enums at crate root for ergonomic
