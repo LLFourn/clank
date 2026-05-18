@@ -205,9 +205,12 @@ pub struct CommitRef {
 }
 
 /// Suggested squash command alternatives for the PR landing flow.
+/// The `kind` discriminator is a closed vocabulary (see
+/// [`PrHintOptionKind`]); the frontend matches on it exhaustively
+/// to choose the option's display label.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PrHintOption {
-    pub name: String,
+    pub kind: crate::vocab::PrHintOptionKind,
     pub base: String,
     pub command: String,
 }
@@ -463,6 +466,56 @@ pub struct DeleteRepoOutcome {
 pub enum WaitForWorkResponse {
     Work(WorkPayload),
     Timeout(WaitTimeout),
+}
+
+/// Typed MCP-tool error payload. Each variant lifts one of the
+/// previously ad-hoc `{"error": "...", ...}` dynamic-JSON shapes
+/// in `server::mcp` so a rename of a variant fails compilation at
+/// the producer AND any structured consumer.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "error", rename_all = "snake_case")]
+pub enum McpErrorPayload {
+    /// `wait_for_work` / `get_context`: caller passed `plan_id`
+    /// omitted (or blank) and the daemon couldn't infer a single
+    /// active plan in the scoped repo.
+    NoActivePlan { repo: String, message: String },
+    /// Plan-id inference found multiple active plans. Each
+    /// candidate carries the shape the historical JSON emitted.
+    AmbiguousPlan {
+        message: String,
+        candidates: Vec<PlanCandidate>,
+    },
+    /// `plan_id` referred to a basename Trinity isn't watching.
+    UnknownRepo { basename: String },
+    /// Two `.trinity/plans/` files with the same stem; daemon
+    /// refuses to route work until the operator resolves.
+    PlanConflict { slug: String, paths: Vec<String> },
+    /// `plan_id` matches a watched repo but the plan file hasn't
+    /// been committed yet (still untracked / staged).
+    PlanNotCommitted {
+        plan_id: String,
+        slug: String,
+        next_step: String,
+    },
+}
+
+/// One row in `AmbiguousPlan.candidates`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PlanCandidate {
+    pub plan_id: String,
+    pub current_path: String,
+    pub lifecycle: PlanLifecycle,
+}
+
+/// `start_plan` happy-path response.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StartPlanResponse {
+    pub plan_id: String,
+    pub repo: String,
+    pub canonical_path: String,
+    pub slug: String,
+    pub committed: bool,
+    pub next_step: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

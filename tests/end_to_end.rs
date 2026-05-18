@@ -264,12 +264,12 @@ async fn pr_hint_present_in_implementing_phase() {
     assert!(pr_hint["plan_intro_parent"].is_null() || pr_hint["plan_intro_parent"].is_string());
     let options = pr_hint["options"].as_array().unwrap();
     assert_eq!(options.len(), 2);
-    let names: Vec<&str> = options
+    let kinds: Vec<&str> = options
         .iter()
-        .map(|o| o["name"].as_str().unwrap())
+        .map(|o| o["kind"].as_str().unwrap())
         .collect();
-    assert!(names.contains(&"keep_plan_in_pr"));
-    assert!(names.contains(&"exclude_plan_from_pr"));
+    assert!(kinds.contains(&"keep_plan_in_pr"));
+    assert!(kinds.contains(&"exclude_plan_from_pr"));
 }
 
 #[tokio::test]

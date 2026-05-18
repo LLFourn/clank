@@ -74,7 +74,7 @@
       {
         "base": "string",
         "command": "string",
-        "name": "string"
+        "kind": "string"
       }
     ],
     "plan_intro": "string",

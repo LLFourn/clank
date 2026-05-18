@@ -38,8 +38,8 @@ pub mod vocab;
 // imports (`use trinity_core::CommitKind;`).
 pub use vocab::{
     CommitGateState, CommitKind, DiffLineKind, ExpectedAction, PlanLifecycle, PlanTouchKind,
-    PlanWorktreeStatus, Posture, ReviewGateState, ReviewTargetPhase, Verdict, WaitingReason,
-    WaitingRole,
+    PlanWorktreeStatus, Posture, PrHintOptionKind, ReviewGateState, ReviewTargetPhase, Verdict,
+    WaitingReason, WaitingRole,
 };
 
 // Re-export the identifier newtypes at crate root.

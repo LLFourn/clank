@@ -528,12 +528,12 @@ fn build_pr_hint(plan: &Plan, impl_commits: &[String]) -> PrHint {
     let suggested = format!("Implement {}", plan.id.as_str());
     let options = vec![
         PrHintOption {
-            name: "keep_plan_in_pr".to_string(),
+            kind: trinity_core::PrHintOptionKind::KeepPlanInPr,
             base: base_for_squash.clone(),
             command: format!("git reset --soft {base_for_squash} && git commit -m '{suggested}'"),
         },
         PrHintOption {
-            name: "exclude_plan_from_pr".to_string(),
+            kind: trinity_core::PrHintOptionKind::ExcludePlanFromPr,
             base: base_for_squash.clone(),
             command: format!(
                 "git reset --soft {base_for_squash} && git rm {plan_path} && git commit -m '{suggested}'"

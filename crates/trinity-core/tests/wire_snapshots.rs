@@ -111,7 +111,7 @@ fn pr_hint_fixture() -> PrHint {
         plan_intro_parent: Some("123".into()),
         implementation_commits: vec!["abc".into()],
         options: vec![PrHintOption {
-            name: "keep_plan_in_pr".into(),
+            kind: PrHintOptionKind::KeepPlanInPr,
             base: "main".into(),
             command: "git merge --squash trinity/foo".into(),
         }],

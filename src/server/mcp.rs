@@ -74,11 +74,10 @@ async fn wait_for_work(state: &AppState, req: &ToolCallRequest) -> Result<Value,
             }));
         }
         PlanIdResolution::Ambiguous { candidates } => {
-            return Ok(json!({
-                "error": "ambiguous_plan",
-                "message": "multiple active plans; pass plan_id explicitly",
-                "candidates": candidates,
-            }));
+            return mcp_error(trinity_core::api::McpErrorPayload::AmbiguousPlan {
+                message: "multiple active plans; pass plan_id explicitly".into(),
+                candidates,
+            });
         }
     }
 
@@ -251,14 +250,23 @@ async fn start_plan(state: &AppState, req: &ToolCallRequest) -> Result<Value, To
             plan_key.as_str()
         )
     };
-    Ok(json!({
-        "plan_id": plan_id.to_string(),
-        "repo": repo.to_string_lossy(),
-        "canonical_path": plan_abs.to_string_lossy(),
-        "slug": plan_key.as_str(),
-        "committed": committed,
-        "next_step": next_step,
-    }))
+    let response = trinity_core::api::StartPlanResponse {
+        plan_id: plan_id.to_string(),
+        repo: repo.to_string_lossy().into_owned(),
+        canonical_path: plan_abs.to_string_lossy().into_owned(),
+        slug: plan_key.as_str().to_string(),
+        committed,
+        next_step,
+    };
+    serde_json::to_value(response).map_err(|e| ToolError::Internal(anyhow::anyhow!(e)))
+}
+
+/// Serialize a typed [`McpErrorPayload`] into the dispatch result.
+/// Used by every `Err(structured-shape)`-style return in this module
+/// — kept as a helper so the json-to-Value step is one line per call
+/// site instead of repeated inline.
+fn mcp_error(payload: trinity_core::api::McpErrorPayload) -> Result<Value, ToolError> {
+    serde_json::to_value(payload).map_err(|e| ToolError::Internal(anyhow::anyhow!(e)))
 }
 
 #[derive(Debug, Deserialize)]
@@ -290,18 +298,16 @@ async fn get_context(state: &AppState, req: &ToolCallRequest) -> Result<Value, T
     {
         PlanIdResolution::Resolved(id) => id,
         PlanIdResolution::NoActives { repo } => {
-            return Ok(json!({
-                "error": "no_active_plan",
-                "repo": repo.to_string_lossy(),
-                "message": format!("no active plans in {}", repo.display()),
-            }));
+            return mcp_error(trinity_core::api::McpErrorPayload::NoActivePlan {
+                repo: repo.to_string_lossy().into_owned(),
+                message: format!("no active plans in {}", repo.display()),
+            });
         }
         PlanIdResolution::Ambiguous { candidates } => {
-            return Ok(json!({
-                "error": "ambiguous_plan",
-                "message": "multiple active plans; pass plan_id explicitly",
-                "candidates": candidates,
-            }));
+            return mcp_error(trinity_core::api::McpErrorPayload::AmbiguousPlan {
+                message: "multiple active plans; pass plan_id explicitly".into(),
+                candidates,
+            });
         }
     };
 
@@ -310,10 +316,9 @@ async fn get_context(state: &AppState, req: &ToolCallRequest) -> Result<Value, T
         let trinity = state.runtime.state();
         let trinity = trinity.lock().await;
         let Some(repo_root) = trinity.repo_basenames.get(plan_id.repo()) else {
-            return Ok(json!({
-                "error": "unknown_repo",
-                "basename": plan_id.repo().as_str(),
-            }));
+            return mcp_error(trinity_core::api::McpErrorPayload::UnknownRepo {
+                basename: plan_id.repo().as_str().to_string(),
+            });
         };
         let Some(repo_state) = trinity.repos.get(repo_root) else {
             return Err(ToolError::Internal(anyhow::anyhow!(
@@ -322,22 +327,23 @@ async fn get_context(state: &AppState, req: &ToolCallRequest) -> Result<Value, T
             )));
         };
         if let Some(paths) = repo_state.plan_conflicts.get(plan_id.key()) {
-            return Ok(json!({
-                "error": "plan_conflict",
-                "slug": plan_id.key().as_str(),
-                "paths": paths.iter().map(|p| p.to_string_lossy()).collect::<Vec<_>>(),
-            }));
+            return mcp_error(trinity_core::api::McpErrorPayload::PlanConflict {
+                slug: plan_id.key().as_str().to_string(),
+                paths: paths
+                    .iter()
+                    .map(|p| p.to_string_lossy().into_owned())
+                    .collect(),
+            });
         }
         if !repo_state.plans.contains_key(plan_id.key()) {
-            return Ok(json!({
-                "error": "plan_not_committed",
-                "plan_id": plan_id.to_string(),
-                "slug": plan_id.key().as_str(),
-                "next_step": format!(
+            return mcp_error(trinity_core::api::McpErrorPayload::PlanNotCommitted {
+                plan_id: plan_id.to_string(),
+                slug: plan_id.key().as_str().to_string(),
+                next_step: format!(
                     "commit the plan file: git add .trinity/plans/{slug}.md && git commit -m 'Start plan: {slug}'",
                     slug = plan_id.key().as_str()
                 ),
-            }));
+            });
         }
         repo_root.clone()
     };
@@ -409,8 +415,12 @@ async fn resolve_repo_with_override(
 /// machinery.
 pub enum PlanIdResolution {
     Resolved(PlanId),
-    NoActives { repo: PathBuf },
-    Ambiguous { candidates: Vec<Value> },
+    NoActives {
+        repo: PathBuf,
+    },
+    Ambiguous {
+        candidates: Vec<trinity_core::api::PlanCandidate>,
+    },
 }
 
 /// Inference rules per plan §"Optional `plan_id` inference":
@@ -472,15 +482,12 @@ pub async fn resolve_plan_id(
             actives[0].id.clone(),
         ))),
         _ => {
-            let candidates: Vec<Value> = actives
+            let candidates = actives
                 .iter()
-                .map(|p| {
-                    let plan_id = PlanId::new(basename.clone(), p.id.clone()).to_string();
-                    json!({
-                        "plan_id": plan_id,
-                        "current_path": &p.plan_path,
-                        "lifecycle": p.lifecycle().as_str(),
-                    })
+                .map(|p| trinity_core::api::PlanCandidate {
+                    plan_id: PlanId::new(basename.clone(), p.id.clone()).to_string(),
+                    current_path: p.plan_path.clone(),
+                    lifecycle: p.lifecycle(),
                 })
                 .collect();
             Ok(PlanIdResolution::Ambiguous { candidates })

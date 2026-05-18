@@ -379,6 +379,26 @@ impl DiffLineKind {
     }
 }
 
+/// Suggested PR-landing option kind. Closed vocabulary for
+/// `api::PrHintOption.kind` — eliminates the prior stringly-typed
+/// `name: String` field that the frontend matched on with a `_ =>
+/// "Option"` fallback.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PrHintOptionKind {
+    KeepPlanInPr,
+    ExcludePlanFromPr,
+}
+
+impl PrHintOptionKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            PrHintOptionKind::KeepPlanInPr => "keep_plan_in_pr",
+            PrHintOptionKind::ExcludePlanFromPr => "exclude_plan_from_pr",
+        }
+    }
+}
+
 impl_display_via_as_str! {
     PlanLifecycle,
     Posture,
@@ -393,4 +413,5 @@ impl_display_via_as_str! {
     WaitingReason,
     ExpectedAction,
     DiffLineKind,
+    PrHintOptionKind,
 }

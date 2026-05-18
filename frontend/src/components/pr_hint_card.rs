@@ -29,7 +29,7 @@ pub fn PrHintCard(hint: PrHint) -> impl IntoView {
 
 #[component]
 fn PrHintOptionRow(option: PrHintOption) -> impl IntoView {
-    let label = label_for(&option.name);
+    let label = label_for(option.kind);
     let command_for_view = option.command.clone();
     let command_for_button = option.command.clone();
     // Tri-state so the user knows whether the browser actually accepted
@@ -74,11 +74,11 @@ enum CopyState {
     Failed,
 }
 
-fn label_for(name: &str) -> &'static str {
-    match name {
-        "keep_plan_in_pr" => "Keep plan in PR",
-        "exclude_plan_from_pr" => "Exclude plan from PR",
-        _ => "Option",
+fn label_for(kind: trinity_core::PrHintOptionKind) -> &'static str {
+    use trinity_core::PrHintOptionKind::*;
+    match kind {
+        KeepPlanInPr => "Keep plan in PR",
+        ExcludePlanFromPr => "Exclude plan from PR",
     }
 }
 
