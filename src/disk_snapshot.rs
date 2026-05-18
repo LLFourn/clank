@@ -235,8 +235,6 @@ pub fn apply_commit(state: &mut RepoState, carry: &mut FoldCarry, event: &Commit
                         plan_intro_parent: carry.previous_commit.clone(),
                         last_activity_ts: 0,
                         timeline: Vec::new(),
-                        frozen_at: None,
-                        freeze_events: Vec::new(),
                         archived_cycles: Vec::new(),
                     },
                 );
@@ -306,13 +304,16 @@ pub fn apply_commit(state: &mut RepoState, carry: &mut FoldCarry, event: &Commit
                     plan.body_hash = content_hash(&body);
                     plan.body = body;
                 }
-                plan.frozen_at = Some(commit_sha.clone());
-                plan.freeze_events.push(commit_sha.clone());
                 plan.archived_cycles
                     .push(crate::repo_state::ArchivedCycleSummary {
                         closer: commit_sha.clone(),
                         approver_count,
                     });
+                // Append the Finalize event last — this is what makes
+                // `plan.frozen_at()` return Some(commit_sha). The
+                // monotone rule guarantees no further events on this
+                // plan's timeline (step 5 short-circuits on frozen
+                // plans).
                 plan.timeline.push(PlanTimelineEvent {
                     sha: commit_sha.clone(),
                     kind: CommitKind::Finalize,
@@ -413,7 +414,7 @@ fn is_frozen(state: &RepoState, plan_key: &PlanKey) -> bool {
     state
         .plans
         .get(plan_key)
-        .map(|p| p.frozen_at.is_some())
+        .map(|p| p.is_frozen())
         .unwrap_or(false)
 }
 
@@ -760,7 +761,7 @@ mod tests {
             ]),
         );
         let plan = &state.plans[&sess("foo")];
-        assert_eq!(plan.frozen_at, Some(sha("c2c2")));
+        assert_eq!(plan.frozen_at(), Some(&sha("c2c2")));
         assert_eq!(plan.body, "# foo\n");
     }
 
@@ -780,7 +781,7 @@ mod tests {
                 ),
             ]),
         );
-        assert!(state.plans[&sess("foo")].frozen_at.is_none());
+        assert!(state.plans[&sess("foo")].frozen_at().is_none());
     }
 
     #[test]
@@ -800,7 +801,7 @@ mod tests {
             ]),
         );
         let plan = &state.plans[&sess("foo")];
-        assert_eq!(plan.frozen_at, Some(sha("c3c3")));
+        assert_eq!(plan.frozen_at(), Some(&sha("c3c3")));
         assert_eq!(plan.body, "# v2\n");
     }
 
@@ -816,7 +817,7 @@ mod tests {
             ]),
         );
         let plan = &state.plans[&sess("foo")];
-        assert_eq!(plan.frozen_at, Some(sha("c2c2")));
+        assert_eq!(plan.frozen_at(), Some(&sha("c2c2")));
         assert_eq!(plan.body, "# foo\n");
     }
 
@@ -885,7 +886,7 @@ mod tests {
             ]),
         );
         let plan = &state.plans[&sess("foo")];
-        assert_eq!(plan.frozen_at, Some(sha("c2c2")));
+        assert_eq!(plan.frozen_at(), Some(&sha("c2c2")));
         let kinds: Vec<_> = plan
             .timeline
             .iter()
@@ -907,6 +908,101 @@ mod tests {
             plan.latest_reviewable_event().map(|e| e.sha.clone()),
             Some(sha("c1c1")),
             "latest reviewable skips Finalize"
+        );
+    }
+
+    #[test]
+    fn finalize_commit_with_bundled_code_change_does_not_emit_codeonly_event() {
+        // Pin-down for ruthless review §1: a single commit that
+        // BOTH lands `.trinity/finished/foo/...` AND modifies code
+        // is fully absorbed into the Finalize event. The bundled
+        // code changes do not surface as a `CodeOnly` event on
+        // foo's timeline. This is deliberate: post-freeze the plan
+        // is sealed end-to-end and cannot accumulate further
+        // reviewable work, even on the freeze commit itself.
+        //
+        // Trinity does not enforce that finalize commits touch only
+        // `.trinity/finished/`; producing clean finalize commits is
+        // the responsibility of whatever tool writes the finalize
+        // (see `trinity-cli` stub in the plan). If this test starts
+        // failing, the architectural decision has changed — update
+        // the plan §"Finalize commit" before "fixing" the test.
+        let state = derive_state(
+            PathBuf::from("/r"),
+            snap(vec![
+                event("c1c1", vec![intro_with_body("foo", "# foo\n")], false),
+                CommitEvent {
+                    commit: sha("c2c2"),
+                    author_ts: 0,
+                    subject: String::new(),
+                    changes: CommitChanges {
+                        plan_touches: vec![],
+                        has_non_plan_code_changes: true,
+                        finalize_changes: vec![upsert("foo", "alice.md", "APPROVE")],
+                    },
+                },
+            ]),
+        );
+        let plan = &state.plans[&sess("foo")];
+        let c2 = plan.event_for(&sha("c2c2")).expect("c2 on timeline");
+        assert!(
+            matches!(c2.kind, CommitKind::Finalize),
+            "freeze commit must be Finalize, not CodeOnly: {:?}",
+            c2.kind
+        );
+        assert!(
+            c2.gate.is_none(),
+            "Finalize must not carry a gate even when bundled with code changes"
+        );
+        assert!(
+            !plan
+                .timeline
+                .iter()
+                .any(|e| matches!(e.kind, CommitKind::CodeOnly)),
+            "bundled code changes must not produce a CodeOnly event on a frozen plan"
+        );
+    }
+
+    #[test]
+    fn finalize_commit_bundled_with_plan_body_revision_emits_only_finalize() {
+        // Pin-down for ruthless review §2: a single commit that
+        // revises plan body AND freezes produces ONE Finalize
+        // timeline event for that SHA — not two events (PlanOnly +
+        // Finalize). The body change is captured at the freeze
+        // moment (per the freeze rule: body = carry.plan_bodies at
+        // freeze time), so the semantic content is preserved in
+        // `plan.body`. The timeline shape is intentional —
+        // `event_for(sha)` returns a single event per SHA, so the
+        // API contract stays simple.
+        let state = derive_state(
+            PathBuf::from("/r"),
+            snap(vec![
+                event("c1c1", vec![intro_with_body("foo", "# v1\n")], false),
+                CommitEvent {
+                    commit: sha("c2c2"),
+                    author_ts: 0,
+                    subject: String::new(),
+                    changes: CommitChanges {
+                        plan_touches: vec![revise_with_body("foo", "# v2 final\n")],
+                        has_non_plan_code_changes: false,
+                        finalize_changes: vec![upsert("foo", "alice.md", "APPROVE")],
+                    },
+                },
+            ]),
+        );
+        let plan = &state.plans[&sess("foo")];
+        assert_eq!(plan.body, "# v2 final\n");
+        let kinds: Vec<_> = plan
+            .timeline
+            .iter()
+            .map(|e| (e.sha.clone(), e.kind))
+            .collect();
+        assert_eq!(
+            kinds,
+            vec![
+                (sha("c1c1"), CommitKind::PlanOnly),
+                (sha("c2c2"), CommitKind::Finalize),
+            ]
         );
     }
 

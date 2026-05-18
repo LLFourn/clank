@@ -77,7 +77,7 @@ pub(crate) fn list_plans_response_with_status_reader(
             status_reader.compute(&state.root, &plan.plan_path, &plan.body_hash)?;
         let plan_phase = current_posture(plan, state);
         let gate = crate::projection::latest_reviewable_commit_gate_for(plan);
-        let w = waiting_on(plan.frozen_at.is_some(), worktree_status, gate);
+        let w = waiting_on(plan.is_frozen(), worktree_status, gate);
         plans.push(plan_summary(
             &state.root,
             plan,
@@ -178,7 +178,7 @@ pub fn get_context_response_from_snapshot(
     let plan_gate = plan_gate_for(session, state);
     let impl_gate = impl_gate_for(session, state);
     let gate = crate::projection::latest_reviewable_commit_gate_for(session);
-    let w = waiting_on(session.frozen_at.is_some(), worktree_status, gate);
+    let w = waiting_on(session.is_frozen(), worktree_status, gate);
 
     let pr_hint = if matches!(session_phase, crate::repo_state::Posture::Implementing) {
         Some(pr_hint_value(session, state))

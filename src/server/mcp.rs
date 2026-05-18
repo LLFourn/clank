@@ -448,7 +448,7 @@ pub async fn resolve_plan_id(
     let actives: Vec<&crate::repo_state::Plan> = repo_state
         .plans
         .values()
-        .filter(|p| p.frozen_at.is_none())
+        .filter(|p| !p.is_frozen())
         .collect();
 
     match actives.len() {

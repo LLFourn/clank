@@ -480,7 +480,7 @@ fn refresh_commits_for(state: &mut crate::repo_state::RepoState, plan_key: &Plan
     let Some(plan) = state.plans.get_mut(plan_key) else {
         return;
     };
-    if plan.frozen_at.is_some() {
+    if plan.is_frozen() {
         // Sealed plan: no gate updates from live feedback signals.
         return;
     }

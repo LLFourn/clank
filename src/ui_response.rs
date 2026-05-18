@@ -84,7 +84,7 @@ fn plans_index_parts(
         let gate = crate::projection::latest_reviewable_commit_gate_for(plan);
         let worktree_status =
             status_reader.compute(&snapshot.root, &plan.plan_path, &plan.body_hash)?;
-        let w = waiting_on(plan.frozen_at.is_some(), worktree_status, gate);
+        let w = waiting_on(plan.is_frozen(), worktree_status, gate);
         let plan_id = basename
             .as_ref()
             .map(|b| crate::lifecycle::PlanId::new(b.clone(), plan.id.clone()).to_string());
@@ -145,7 +145,7 @@ pub fn plan_page_with_reader(
     let plan_gate = plan_gate_for(plan, bundle);
     let impl_gate = impl_gate_for(plan, bundle);
     let gate = crate::projection::latest_reviewable_commit_gate_for(plan);
-    let w = waiting_on(plan.frozen_at.is_some(), worktree_status, gate);
+    let w = waiting_on(plan.is_frozen(), worktree_status, gate);
 
     let plan_revisions: Vec<String> = all_plan_revisions(plan, bundle)
         .into_iter()
@@ -447,8 +447,24 @@ fn timeline_value(session: &Plan) -> Vec<Value> {
             "has_code_changes": has_code_changes,
             "subject": event.subject,
         }));
-        let phase_tag = if touched { "plan" } else { "impl" };
+        // Reviews can only be attached to reviewable events (gate is
+        // Some). Encode that invariant in the match so a future kind
+        // (e.g. an `Abandoned` lifecycle marker) is forced to declare
+        // its review-tag intent rather than silently inheriting
+        // "impl".
         if let Some(gate) = event.gate.as_ref() {
+            let phase_tag = match event.kind {
+                CommitKind::PlanOnly | CommitKind::Mixed => "plan",
+                CommitKind::CodeOnly => "impl",
+                CommitKind::MultiPlan | CommitKind::Finalize | CommitKind::Unattributed => {
+                    debug_assert!(
+                        false,
+                        "non-reviewable kind carries a gate: {:?}",
+                        event.kind
+                    );
+                    continue;
+                }
+            };
             for (author, fb) in &gate.feedback {
                 out.push(json!({
                     "kind": "review",
@@ -583,8 +599,6 @@ mod tests {
             plan_intro_parent: Some(CommitSha::parse("ca11").unwrap()),
             last_activity_ts: 0,
             timeline: Vec::new(),
-            frozen_at: None,
-            freeze_events: Vec::new(),
             archived_cycles: Vec::new(),
         };
         let v = pr_hint_value(&session, &[]);

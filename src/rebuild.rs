@@ -146,7 +146,7 @@ mod tests {
 
         let frozen_state = rebuild_repo(dir.path()).await.unwrap();
         let key = PlanKey::parse("foo").unwrap();
-        assert!(frozen_state.plans[&key].frozen_at.is_some());
+        assert!(frozen_state.plans[&key].is_frozen());
         assert_eq!(frozen_state.plans[&key].body, "# foo body\n");
 
         // Delete the plan file from HEAD.
@@ -159,7 +159,7 @@ mod tests {
             .get(&key)
             .expect("finished plan must survive its plan-file deletion");
         assert!(
-            plan.frozen_at.is_some(),
+            plan.is_frozen(),
             "plan must still be frozen after HEAD-deletion"
         );
         // Body renders from the freeze commit.

@@ -147,8 +147,7 @@ impl RepoState {
             );
             hasher.update(b"|frozen=");
             hasher.update(
-                plan.frozen_at
-                    .as_ref()
+                plan.frozen_at()
                     .map(|s| s.as_str())
                     .unwrap_or("")
                     .as_bytes(),
@@ -258,18 +257,6 @@ pub struct Plan {
     /// queries (`projection::*`) are filters or reverse-scans over
     /// this list — no parallel buckets to keep in sync.
     pub timeline: Vec<PlanTimelineEvent>,
-    /// First commit (chronological) whose tree satisfied the finalize
-    /// rule (plan file present + `.trinity/finished/<stem>/` with ≥1
-    /// file all starting with `APPROVE`). `Some(_)` ⇒ the plan is
-    /// finished. Set monotonically by the sans-IO fold; never cleared.
-    pub frozen_at: Option<CommitSha>,
-    /// Commits at which this plan transitioned to frozen, in
-    /// chronological order. Equivalent to "the chain of finalize
-    /// events." The last entry == `frozen_at` (when set); earlier
-    /// entries can only appear if a future implementation supports
-    /// reopening a frozen plan via history rewrite mid-fold — which
-    /// today never happens, so the list has length 0 or 1.
-    pub freeze_events: Vec<CommitSha>,
     /// Per-cycle summaries derived from the fold's freeze events (one
     /// entry per freeze). Today the monotone rule means this has
     /// length 0 or 1. Surfaced in the plan-detail wire as
@@ -293,14 +280,31 @@ impl Plan {
     pub fn latest_reviewable_event(&self) -> Option<&PlanTimelineEvent> {
         self.timeline.iter().rev().find(|e| e.kind.is_reviewable())
     }
+
+    /// The freeze commit's SHA, if this plan has frozen. Derived from
+    /// the timeline — the last `CommitKind::Finalize` event is the
+    /// freeze. `Some(_)` ⇒ plan is finished. Once set the fold never
+    /// appends further events on this plan (step 5 short-circuits on
+    /// frozen plans), so this scan is at-most-once-per-plan-life.
+    pub fn frozen_at(&self) -> Option<&CommitSha> {
+        self.timeline
+            .iter()
+            .rev()
+            .find_map(|e| matches!(e.kind, CommitKind::Finalize).then_some(&e.sha))
+    }
+
+    /// True iff the plan has frozen. Sugar for `frozen_at().is_some()`.
+    pub fn is_frozen(&self) -> bool {
+        self.frozen_at().is_some()
+    }
 }
 
 /// One commit in a plan's life as observed by the fold. The `kind` is
-/// the per-plan classification (`PlanOnly | CodeOnly | Mixed | MultiPlan`
-/// — `Unattributed` is never appended because such commits are not part
-/// of this plan's timeline). `gate` is `Some` for reviewable kinds
-/// (`PlanOnly | CodeOnly | Mixed`) and `None` for `MultiPlan` (which
-/// can't be gated).
+/// the per-plan classification (`PlanOnly | CodeOnly | Mixed | MultiPlan
+/// | Finalize` — `Unattributed` is never appended because such commits
+/// are not part of this plan's timeline). `gate` is `Some` for
+/// reviewable kinds (`PlanOnly | CodeOnly | Mixed`) and `None` for
+/// non-reviewable kinds (`MultiPlan`, `Finalize`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PlanTimelineEvent {
     pub sha: CommitSha,
@@ -328,7 +332,7 @@ impl PlanLifecycle {
     }
 
     pub fn from_plan(plan: &Plan) -> Self {
-        if plan.frozen_at.is_some() {
+        if plan.is_frozen() {
             PlanLifecycle::Finished
         } else {
             PlanLifecycle::Active

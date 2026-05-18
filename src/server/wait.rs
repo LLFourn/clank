@@ -532,7 +532,7 @@ fn collect_candidate(
         plan_key: plan.id.clone(),
         plan_path: plan.plan_path.clone(),
         body_hash: plan.body_hash.clone(),
-        is_finished: plan.frozen_at.is_some(),
+        is_finished: plan.is_frozen(),
         gate,
         review_target,
         review_target_kind,
