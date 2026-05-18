@@ -12,7 +12,7 @@
 // Type aliases preserve the historical frontend-local names where
 // they don't match the wire crate's naming.
 pub use trinity_core::api::{
-    CommitDetail, CommitDetailResponse, CommitRow as CommitRowDetail, DiffHunk, DiffLine,
+    CommitDetail, CommitDetailResponse, CommitRow, DiffHunk, DiffLine,
     DiffResponse as DiffPage, Feedback as CommitFeedback, FileDiff, FileDiffMode, FinalizeApproval,
     ListPlansResponse as PlansIndex, PlanConflict as PlanConflictRow,
     PlanDetailResponse as PlanDetail, PlanRevisionResponse as PlanRevisionPage, PlanRow, PrHint,

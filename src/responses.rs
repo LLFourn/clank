@@ -422,23 +422,47 @@ pub fn build_plan_revision_response(
     }
 }
 
+/// Inputs to [`build_commit_detail_response`]. Groups the
+/// handler's IO results so the builder signature stays narrow
+/// even as the wire shape composes more daemon-side resolutions.
+pub struct CommitDetailInputs<'a> {
+    pub snapshot: &'a RepoState,
+    pub plan: &'a Plan,
+    pub plan_id_str: String,
+    pub commit_sha: &'a CommitSha,
+    pub event: &'a trinity_core::model::PlanTimelineEvent,
+    pub subject: String,
+    pub message_body: String,
+    pub diff_files: Vec<trinity_core::api::FileDiff>,
+    /// `(filename, body)` pairs from the freeze commit's
+    /// `.trinity/finished/<stem>/` tree. Empty for non-Finalize
+    /// events.
+    pub finalize_files: Vec<(String, String)>,
+}
+
 /// `GET /api/plan/<id>/commit/<sha>` — wire shape construction
 /// after the handler has resolved the commit message, structured
 /// diff, and (for Finalize) the approval snapshot files.
-#[allow(clippy::too_many_arguments)]
+///
+/// Panics on `CommitKind::Unattributed` — the handler MUST reject
+/// that case before calling this builder. The daemon never emits
+/// a `CommitDetailResponse` for an unattributed commit.
 pub fn build_commit_detail_response(
-    snapshot: &RepoState,
-    plan: &Plan,
-    plan_id_str: String,
-    commit_sha: &CommitSha,
-    event: &trinity_core::model::PlanTimelineEvent,
-    subject: String,
-    message_body: String,
-    diff_files: Vec<trinity_core::api::FileDiff>,
-    finalize_files: Vec<(String, String)>,
+    inputs: CommitDetailInputs<'_>,
 ) -> trinity_core::api::CommitDetailResponse {
     use trinity_core::api::{CommitDetail, CommitDetailResponse, FinalizeApproval};
     use trinity_core::vocab::CommitKind;
+    let CommitDetailInputs {
+        snapshot,
+        plan,
+        plan_id_str,
+        commit_sha,
+        event,
+        subject,
+        message_body,
+        diff_files,
+        finalize_files,
+    } = inputs;
     let detail = match event.kind {
         CommitKind::Finalize => {
             let snapshot_entries = finalize_files
@@ -469,9 +493,10 @@ pub fn build_commit_detail_response(
             feedback: feedback_for_target(plan, commit_sha),
         },
         CommitKind::MultiPlan => CommitDetail::MultiPlan {},
-        // `Unattributed` is rejected by the handler before reaching
-        // this builder; the daemon never emits CommitDetail for it.
-        CommitKind::Unattributed => CommitDetail::MultiPlan {},
+        CommitKind::Unattributed => unreachable!(
+            "build_commit_detail_response called with Unattributed kind; \
+             the handler must reject this before reaching the builder"
+        ),
     };
     CommitDetailResponse {
         repo: snapshot.root.to_string_lossy().to_string(),

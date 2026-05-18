@@ -1,7 +1,7 @@
 use leptos::prelude::*;
 use leptos_router::hooks::use_params_map;
 
-use crate::api::{CommitFeedback, CommitRowDetail, PlanDetail, fetch_plan};
+use crate::api::{CommitFeedback, CommitRow, PlanDetail, fetch_plan};
 use crate::components::feedback_card::FeedbackCard;
 use crate::components::meta_strip::MetaStrip;
 use crate::components::plan_preview::PlanPreview;
@@ -102,7 +102,7 @@ fn detail_view(detail: PlanDetail) -> impl IntoView {
 /// surface stale reviews against an earlier target when the current
 /// one has none.
 fn latest_review_for_target(
-    commits: &[CommitRowDetail],
+    commits: &[CommitRow],
     target: Option<&str>,
 ) -> Option<(CommitFeedback, String)> {
     let target = target?;
@@ -139,7 +139,7 @@ fn latest_review_section(latest: Option<(CommitFeedback, String)>) -> AnyView {
 /// at — no plan-vs-impl split. Empty commits (no feedback yet) are
 /// rendered with a muted "no reviews yet" line so the section
 /// communicates the gate's missing-reviewer state.
-fn commit_feedback_section(commits: Vec<CommitRowDetail>) -> AnyView {
+fn commit_feedback_section(commits: Vec<CommitRow>) -> AnyView {
     if commits.is_empty() {
         return view! {
             <section class="session-section">

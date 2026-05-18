@@ -483,15 +483,17 @@ async fn api_commit_diff(
     };
 
     Ok(axum::Json(crate::responses::build_commit_detail_response(
-        &snapshot,
-        plan,
-        format!("{repo_basename}/{stem_md}"),
-        &commit_sha,
-        event,
-        subject,
-        message_body,
-        diff_files,
-        finalize_files,
+        crate::responses::CommitDetailInputs {
+            snapshot: &snapshot,
+            plan,
+            plan_id_str: format!("{repo_basename}/{stem_md}"),
+            commit_sha: &commit_sha,
+            event,
+            subject,
+            message_body,
+            diff_files,
+            finalize_files,
+        },
     )))
 }
 
