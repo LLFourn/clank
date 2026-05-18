@@ -6,7 +6,7 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::path::PathBuf;
 
-use crate::lifecycle::{AgentLabel, CommitSha, PlanKey, RepoBasename};
+use crate::lifecycle::{CommitSha, PlanKey, RepoBasename};
 
 pub type RepoRoot = PathBuf;
 
@@ -62,47 +62,6 @@ impl RepoState {
             head: None,
             plan_conflicts: BTreeMap::new(),
         }
-    }
-
-    /// Chronological timeline rows for one plan's activity. The renderer
-    /// (web UI, MCP responses) walks the returned rows to display events
-    /// in order. Each `PlanTimelineEvent` in `plan.timeline` becomes one
-    /// `Commit` row followed by `Review` rows for its gate feedback.
-    ///
-    /// Returns an empty vec if the plan is unknown.
-    pub fn timeline_for(&self, plan_key: &PlanKey) -> Vec<TimelineEvent> {
-        let Some(plan) = self.plans.get(plan_key) else {
-            return Vec::new();
-        };
-        let mut out = Vec::with_capacity(plan.timeline.len() * 2);
-        for event in &plan.timeline {
-            let plan_touch = match event.kind {
-                CommitKind::PlanOnly | CommitKind::Mixed | CommitKind::MultiPlan => {
-                    if event.sha == plan.plan_intro {
-                        Some(PlanTouchKind::Intro)
-                    } else {
-                        Some(PlanTouchKind::Revision)
-                    }
-                }
-                CommitKind::CodeOnly | CommitKind::Finalize | CommitKind::Unattributed => None,
-            };
-            out.push(TimelineEvent::Commit {
-                sha: event.sha.clone(),
-                kind: event.kind,
-                plan_touch,
-                subject: event.subject.clone(),
-            });
-            if let Some(gate) = &event.gate {
-                for (author, fb) in &gate.feedback {
-                    out.push(TimelineEvent::Review {
-                        target: event.sha.clone(),
-                        author: author.clone(),
-                        verdict: fb.verdict,
-                    });
-                }
-            }
-        }
-        out
     }
 
     /// Stable digest over every meaningful field in the state. Two states
@@ -187,34 +146,6 @@ impl RepoState {
     }
 }
 
-/// One row in the per-session timeline returned by
-/// `RepoState::timeline_for`. The renderer translates these to UI rows
-/// or MCP context entries; the core just emits them in order.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum TimelineEvent {
-    /// A commit on this plan's timeline. `kind` is the per-plan
-    /// classification copied from the underlying `PlanTimelineEvent`;
-    /// renderers exhaustive-match on it to emit the wire kind string
-    /// (`commit_plan` / `commit_impl` / `commit_mixed` /
-    /// `commit_finalize`). `plan_touch` distinguishes intro vs
-    /// revision; `subject` is the commit's first line.
-    Commit {
-        sha: CommitSha,
-        kind: CommitKind,
-        plan_touch: Option<PlanTouchKind>,
-        subject: String,
-    },
-    /// A reviewer's verdict against a specific commit. Always follows
-    /// the `Commit` it targets in the timeline. Renderers that want a
-    /// "plan review" vs "impl review" label derive it from the
-    /// targeted commit's `CommitKind` via the wire `commits[]` field.
-    Review {
-        target: CommitSha,
-        author: AgentLabel,
-        verdict: Verdict,
-    },
-}
-
 /// Stable hash of a `RepoState`. Used by the runtime to skip broadcasts
 /// when a rebuild produced byte-identical state.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -228,8 +159,8 @@ impl StateDigest {
 
 /// Plan, PlanTimelineEvent, Feedback are the daemon's fold-state
 /// types — defined once in `trinity_core::model` and shared with
-/// the wire. `body_html`-bearing wire shapes (`dto::Feedback`,
-/// `dto::CommitGate`) are still built by the response projection
+/// the wire. `body_html`-bearing wire shapes (`api::Feedback`,
+/// `api::CommitGate`) are still built by the response projection
 /// step from these model types.
 pub use trinity_core::model::{Feedback, Plan, PlanTimelineEvent};
 

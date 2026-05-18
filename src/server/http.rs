@@ -428,7 +428,7 @@ async fn api_commit_diff(
     let patch = crate::git_io::show_commit(&repo, &commit_sha)
         .await
         .map_err(|e| AppError::internal(format!("git show: {e}")))?;
-    let diff_files = parsed_to_wire_diff_files(&crate::diff_parser::parse_diff(&patch));
+    let diff_files = crate::diff_parser::parse_diff(&patch);
 
     let (subject, message_body) = crate::git_io::commit_message(&repo, &commit_sha)
         .await
@@ -535,7 +535,7 @@ async fn api_diff(
     let patch = crate::git_io::diff_two_blobs(&repo, &from_sha, &from_path, &to_sha, &to_path)
         .await
         .map_err(|e| AppError::internal(format!("git diff: {e}")))?;
-    let diff_files = parsed_to_wire_diff_files(&crate::diff_parser::parse_diff(&patch));
+    let diff_files = crate::diff_parser::parse_diff(&patch);
     let _ = repo; // canonical path no longer surfaced on this response
     Ok(axum::Json(trinity_core::api::DiffResponse {
         from: from_sha.as_str().to_string(),
@@ -645,54 +645,6 @@ async fn api_repos_delete(
         plan_count,
         registry_write_error,
     }))
-}
-
-/// Convert daemon-side diff_parser output to wire-typed FileDiff.
-/// Used by `api_commit_diff` and `api_diff`.
-fn parsed_to_wire_diff_files(
-    files: &[crate::diff_parser::FileDiff],
-) -> Vec<trinity_core::api::FileDiff> {
-    use trinity_core::api::{DiffHunk, DiffLine, FileDiff, FileDiffMode};
-    use trinity_core::vocab::DiffLineKind;
-    files
-        .iter()
-        .map(|f| FileDiff {
-            path: f.path.clone(),
-            old_path: f.old_path.clone(),
-            additions: f.additions,
-            deletions: f.deletions,
-            mode: match f.mode {
-                crate::diff_parser::FileDiffMode::Added => FileDiffMode::Added,
-                crate::diff_parser::FileDiffMode::Removed => FileDiffMode::Removed,
-                crate::diff_parser::FileDiffMode::Renamed => FileDiffMode::Renamed,
-                crate::diff_parser::FileDiffMode::Modified => FileDiffMode::Modified,
-            },
-            binary: f.binary,
-            always_folded: crate::diff_parser::is_always_folded(&f.path),
-            hunks: f
-                .hunks
-                .iter()
-                .map(|h| DiffHunk {
-                    header: h.header.clone(),
-                    lines: h
-                        .lines
-                        .iter()
-                        .map(|l| DiffLine {
-                            kind: match l.kind {
-                                crate::diff_parser::DiffLineKind::Insert => DiffLineKind::Insert,
-                                crate::diff_parser::DiffLineKind::Delete => DiffLineKind::Delete,
-                                crate::diff_parser::DiffLineKind::Context => DiffLineKind::Context,
-                                crate::diff_parser::DiffLineKind::Meta => DiffLineKind::Meta,
-                            },
-                            content: l.content.clone(),
-                            old_lineno: l.old_lineno,
-                            new_lineno: l.new_lineno,
-                        })
-                        .collect(),
-                })
-                .collect(),
-        })
-        .collect()
 }
 
 #[cfg(test)]

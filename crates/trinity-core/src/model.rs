@@ -3,10 +3,10 @@
 //! wire — newtypes serialize transparently, so daemon-side
 //! validation survives round-trip.
 //!
-//! Wire-only fields (today: `body_html` on `dto::Feedback`) are
+//! Wire-only fields (today: `body_html` on `api::Feedback`) are
 //! NOT on these types. Phase 4 of `trinity-core-unification.md`
-//! formalises the model/api split — until then `dto::Feedback`
-//! and `dto::CommitGate` continue to carry rendered HTML, and
+//! formalises the model/api split — until then `api::Feedback`
+//! and `api::CommitGate` continue to carry rendered HTML, and
 //! the daemon's response projection builds those from the
 //! storage shapes here.
 
@@ -20,7 +20,7 @@ use crate::vocab::{CommitGateState, CommitKind, PlanLifecycle, PlanWorktreeStatu
 /// One reviewer's verdict file as the daemon stores it. `body` is
 /// raw markdown (matches the wire's `body_raw`; the wire renames
 /// to make space for `body_html`). Rendered HTML lives on
-/// `dto::Feedback` and is computed at projection time.
+/// `api::Feedback` and is computed at projection time.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Feedback {
     pub verdict: crate::vocab::Verdict,

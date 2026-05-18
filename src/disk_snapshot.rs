@@ -1025,15 +1025,6 @@ mod tests {
         let plan = &state.plans[&sess("foo")];
         let shas: Vec<_> = plan.timeline.iter().map(|e| e.sha.clone()).collect();
         assert_eq!(shas, vec![sha("c1c1"), sha("c2c2"), sha("c3c3")]);
-        let timeline = state.timeline_for(&sess("foo"));
-        let commit_shas: Vec<_> = timeline
-            .iter()
-            .filter_map(|t| match t {
-                crate::repo_state::TimelineEvent::Commit { sha, .. } => Some(sha.clone()),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(commit_shas, vec![sha("c1c1"), sha("c2c2"), sha("c3c3")]);
     }
 
     #[test]
