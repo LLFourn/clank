@@ -10,8 +10,7 @@
       "feedback": [
         {
           "author": "string",
-          "body_html": "string",
-          "body_raw": "string",
+          "body": "string",
           "created_at": "integer",
           "path": "string",
           "verdict": "string"
@@ -27,8 +26,7 @@
         "feedback": {
           "alice": {
             "author": "string",
-            "body_html": "string",
-            "body_raw": "string",
+            "body": "string",
             "created_at": "integer",
             "path": "string",
             "verdict": "string"

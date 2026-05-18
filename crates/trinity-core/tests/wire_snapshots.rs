@@ -83,10 +83,9 @@ fn assert_schema(name: &str, value: &Value) {
 
 fn feedback_fixture() -> Feedback {
     Feedback {
-        author: "alice".into(),
+        author: AgentLabel::parse("alice").unwrap(),
         verdict: Verdict::Approve,
-        body_raw: "APPROVE\n\nlgtm\n".into(),
-        body_html: "<p>lgtm</p>".into(),
+        body: "APPROVE\n\nlgtm\n".into(),
         path: ".trinity/feedback/foo/abc/alice.md".into(),
         created_at: 1_700_000_000,
     }

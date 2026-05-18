@@ -17,64 +17,28 @@
 //! `kind` field is at the response root — see plan §"Tagged enums
 //! where shape varies by kind".
 
-use std::collections::BTreeMap;
-
 use serde::{Deserialize, Serialize};
 
 use crate::vocab::{
-    CommitGateState, CommitKind, DiffLineKind, ExpectedAction, PlanLifecycle, PlanTouchKind,
-    PlanWorktreeStatus, Posture, ReviewGateState, ReviewTargetPhase, Verdict, WaitingReason,
-    WaitingRole,
+    CommitKind, DiffLineKind, ExpectedAction, PlanLifecycle, PlanTouchKind, PlanWorktreeStatus,
+    Posture, ReviewGateState, ReviewTargetPhase, Verdict, WaitingReason, WaitingRole,
 };
 
 // ============================================================
 // Composing structs
 // ============================================================
 
-/// One reviewer's verdict file (`.trinity/feedback/<stem>/<sha>/
-/// <author>.md`) surfaced on the wire. `body_html` is sanitized
-/// markdown; `body_raw` is included for the UI cards that render
-/// the rendered HTML AND need access to the raw text (e.g. to
-/// strip the verdict marker prefix).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Feedback {
-    pub author: String,
-    pub verdict: Verdict,
-    /// Raw markdown body. May include the verdict marker prefix.
-    pub body_raw: String,
-    /// Sanitized HTML rendering of `body_raw`.
-    pub body_html: String,
-    /// Repo-relative path of the feedback file. For UI copy-link
-    /// affordances.
-    pub path: String,
-    /// File mtime as unix seconds, for chronological sort when SHA
-    /// + author alone don't establish order.
-    pub created_at: i64,
-}
+/// Wire representation of a feedback file. Same type as
+/// [`crate::model::Feedback`] — daemon storage and wire response
+/// carry one struct. The wasm frontend renders `body` (raw
+/// markdown) to HTML at display time; no `body_html` field
+/// crosses the wire.
+pub use crate::model::Feedback;
 
-/// One commit's review gate. Cumulative-participant set plus the
-/// per-commit verdict breakdown plus each participant's rendered
-/// feedback body. Empty `feedback` map means no reviewer has
-/// posted yet. AgentLabel is serde-transparent so the wire form
-/// of the `Vec<AgentLabel>` fields is `[String]` — identical to
-/// the prior `Vec<String>` shape.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct CommitGate {
-    pub state: CommitGateState,
-    /// Every reviewer who has ever posted on any reviewable commit
-    /// of this plan (cumulative).
-    pub participants: Vec<crate::ids::AgentLabel>,
-    /// Approvers ON THIS COMMIT.
-    pub approvers: Vec<crate::ids::AgentLabel>,
-    /// Requesters of changes ON THIS COMMIT.
-    pub requesters: Vec<crate::ids::AgentLabel>,
-    /// Authors who posted Unmarked verdicts on this commit.
-    pub ambiguous: Vec<crate::ids::AgentLabel>,
-    /// Participants who haven't voted on this commit yet.
-    pub missing: Vec<crate::ids::AgentLabel>,
-    /// Feedback bodies on this commit, keyed by author.
-    pub feedback: BTreeMap<crate::ids::AgentLabel, Feedback>,
-}
+/// Wire representation of a commit's review gate. Same type as
+/// [`crate::model::CommitGate`] now that `Feedback` is unified —
+/// daemon storage and wire response carry one struct.
+pub use crate::model::CommitGate;
 
 /// One row in `commits[]` — same shape for MCP and HTTP. Carries
 /// the per-author feedback bodies (rendered HTML included) so a

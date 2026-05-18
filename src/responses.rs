@@ -22,7 +22,7 @@ use trinity_core::api::{
     PlanDetailResponse, PlanRow, PrHint, PrHintOption, ReviewGate, ReviewTarget, TimelineEvent,
     WriteFeedback,
 };
-use trinity_core::vocab::{CommitKind, PlanTouchKind, Posture, ReviewTargetPhase, Verdict};
+use trinity_core::vocab::{CommitKind, PlanTouchKind, Posture, ReviewTargetPhase};
 
 // ============================================================
 // PlanStatusReader trait — disk reads through here so tests fake
@@ -584,11 +584,7 @@ fn build_commits_array(plan: &Plan) -> Vec<CommitRow> {
         let Some(gate) = event.gate.as_ref() else {
             continue;
         };
-        let feedback: Vec<Feedback> = gate
-            .feedback
-            .iter()
-            .map(|(author, fb)| build_feedback(author, fb))
-            .collect();
+        let feedback: Vec<Feedback> = gate.feedback.values().cloned().collect();
         out.push(CommitRow {
             sha: event.sha.as_str().to_string(),
             kind: event.kind,
@@ -599,35 +595,11 @@ fn build_commits_array(plan: &Plan) -> Vec<CommitRow> {
     out
 }
 
-/// model::CommitGate → api::CommitGate. AgentLabel is serde-
-/// transparent so the wire form of participants/etc. is unchanged
-/// from the prior `Vec<String>`; the only real translation here is
-/// the per-author Feedback projection (raw markdown → rendered).
+// `model::CommitGate` IS `api::CommitGate` now that `Feedback` is
+// one type. The projection is a clone; the wire shape and the
+// storage shape are byte-identical.
 fn build_commit_gate(g: &CommitGate) -> trinity_core::api::CommitGate {
-    trinity_core::api::CommitGate {
-        state: g.state,
-        participants: g.participants.clone(),
-        approvers: g.approvers.clone(),
-        requesters: g.requesters.clone(),
-        ambiguous: g.ambiguous.clone(),
-        missing: g.missing.clone(),
-        feedback: g
-            .feedback
-            .iter()
-            .map(|(author, fb)| (author.clone(), build_feedback(author, fb)))
-            .collect(),
-    }
-}
-
-fn build_feedback(author: &AgentLabel, fb: &crate::repo_state::Feedback) -> Feedback {
-    Feedback {
-        author: author.as_str().to_string(),
-        verdict: fb.verdict,
-        body_raw: fb.body.clone(),
-        body_html: render_feedback_body(&fb.body, fb.verdict),
-        path: fb.path.clone(),
-        created_at: fb.created_at,
-    }
+    g.clone()
 }
 
 fn build_timeline(plan: &Plan) -> Vec<TimelineEvent> {
@@ -767,51 +739,14 @@ fn build_review_gate(
 }
 
 // ============================================================
-// Markdown / feedback rendering
+// Markdown rendering (server-side — Phase 3 + 4 retire it)
 // ============================================================
-
-fn render_feedback_body(body: &str, verdict: Verdict) -> String {
-    let stripped = match verdict {
-        Verdict::Approve | Verdict::RequestChanges => strip_marker_line(body),
-        Verdict::Unmarked => body,
-    };
-    render_markdown(stripped)
-}
-
-fn strip_marker_line(body: &str) -> &str {
-    let mut chars = body.char_indices();
-    while let Some((_, c)) = chars.clone().next() {
-        if c.is_whitespace() {
-            chars.next();
-            continue;
-        }
-        break;
-    }
-    let after_leading = chars.as_str();
-    if let Some(rest) = after_leading.strip_prefix("APPROVE") {
-        skip_marker_tail(rest)
-    } else if let Some(rest) = after_leading.strip_prefix("REQUEST_CHANGES") {
-        skip_marker_tail(rest)
-    } else {
-        body
-    }
-}
-
-/// Consume any trailing horizontal whitespace (spaces / tabs) on
-/// the marker line, then up to one CR/LF run. Matches the leniency
-/// of `disk_format::parse_verdict` which trims each candidate line
-/// before matching the marker.
-fn skip_marker_tail(s: &str) -> &str {
-    let bytes = s.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() && (bytes[i] == b' ' || bytes[i] == b'\t') {
-        i += 1;
-    }
-    while i < bytes.len() && (bytes[i] == b'\r' || bytes[i] == b'\n') {
-        i += 1;
-    }
-    &s[i..]
-}
+//
+// Feedback bodies render in the wasm frontend as of Phase 2; the
+// helpers below survive only because `plan_body_html`,
+// `PlanRevisionResponse.body_html`, and `FinalizeApproval.body_html`
+// still cross the wire. Phase 3 drops those fields; Phase 4 deletes
+// `render_markdown` along with the `pulldown-cmark` / `ammonia` deps.
 
 pub fn render_markdown(input: &str) -> String {
     use pulldown_cmark::{Options, Parser, html};
@@ -840,10 +775,7 @@ pub fn feedback_for_target(plan: &Plan, sha: &CommitSha) -> Vec<Feedback> {
     let Some(gate) = event.gate.as_ref() else {
         return Vec::new();
     };
-    gate.feedback
-        .iter()
-        .map(|(author, fb)| build_feedback(author, fb))
-        .collect()
+    gate.feedback.values().cloned().collect()
 }
 
 #[cfg(test)]
@@ -859,55 +791,8 @@ mod divergence_tests {
     //! After the collapse those bugs are structurally impossible —
     //! these tests pin that invariant.
     use super::*;
-    use trinity_core::api::Feedback as ApiFeedback;
     use trinity_core::ids::AgentLabel;
-
-    /// Construct a minimal `CommitGate` with one feedback entry; the
-    /// daemon never builds these directly from the wire but the
-    /// shape mirrors what disk_snapshot constructs.
-    fn fixture_gate() -> CommitGate {
-        let alice = AgentLabel::parse("alice").unwrap();
-        let fb = crate::repo_state::Feedback {
-            verdict: Verdict::Approve,
-            body: "APPROVE\n\nlooks good\n".into(),
-            path: "alice.md".into(),
-            created_at: 1_700_000_000,
-        };
-        CommitGate {
-            state: trinity_core::CommitGateState::Approved,
-            participants: vec![alice.clone()],
-            approvers: vec![alice.clone()],
-            requesters: vec![],
-            ambiguous: vec![],
-            missing: vec![],
-            feedback: std::collections::BTreeMap::from([(alice, fb)]),
-        }
-    }
-
-    /// `build_feedback` is the single rendering entry point — both
-    /// the `commits[].feedback[]` array and the `commits[].gate
-    /// .feedback{}` map flow through it. Verifies the rendered
-    /// `body_html` is non-empty and matches across both surfaces.
-    #[test]
-    fn body_html_is_one_renderer_across_both_surfaces() {
-        let gate = fixture_gate();
-        // The same call site that builds commit-row feedback…
-        let from_row: Vec<ApiFeedback> = gate
-            .feedback
-            .iter()
-            .map(|(a, fb)| build_feedback(a, fb))
-            .collect();
-        // …and the gate's keyed map…
-        let from_gate_api = build_commit_gate(&gate);
-        let from_gate: Vec<ApiFeedback> = from_gate_api.feedback.values().cloned().collect();
-
-        assert_eq!(from_row.len(), 1);
-        assert_eq!(from_gate.len(), 1);
-        // …produce the SAME rendered body. Pre-Phase-5 the MCP path
-        // inlined `body_html: String::new()` here.
-        assert_eq!(from_row[0].body_html, from_gate[0].body_html);
-        assert!(!from_row[0].body_html.is_empty());
-    }
+    use trinity_core::vocab::Verdict;
 
     /// Strict version of the regression: a `MultiPlan` event MUST
     /// emit a `CommitMultiPlan` timeline row, AND if a gate ever
@@ -921,10 +806,17 @@ mod divergence_tests {
     /// match falls into the `_ => continue` arm for non-reviewable
     /// kinds, so wire output stays consistent regardless of which
     /// surface called.
+    ///
+    /// (The earlier `body_html_is_one_renderer_across_both_surfaces`
+    /// regression became meaningless when wasm-markdown-rendering
+    /// Phase 2 dropped `body_html` from the wire — there is no
+    /// rendered HTML on the wire to compare across surfaces. The
+    /// MultiPlan invariant is independent and stays here.)
     #[test]
     fn multi_plan_event_never_emits_review_rows() {
         let alice = AgentLabel::parse("alice").unwrap();
         let fb = crate::repo_state::Feedback {
+            author: alice.clone(),
             verdict: Verdict::Approve,
             body: "APPROVE\n".into(),
             path: "alice.md".into(),

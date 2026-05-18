@@ -832,8 +832,12 @@ async fn feedback_renders_on_session_page() {
         "plan detail should include alice's APPROVE; got: {body}"
     );
     assert!(
-        body.contains("\"body_html\""),
-        "plan detail should carry rendered feedback HTML; got: {body}"
+        body.contains("\"body\""),
+        "plan detail should carry raw feedback body; got: {body}"
+    );
+    assert!(
+        !body.contains("\"body_html\""),
+        "Phase 2 of wasm-markdown-rendering: body_html must NOT cross the wire on feedback; got: {body}"
     );
 }
 

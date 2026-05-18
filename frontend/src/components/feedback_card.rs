@@ -1,6 +1,7 @@
 use leptos::prelude::*;
 
 use crate::api::{CommitFeedback, Verdict};
+use crate::markdown;
 use crate::util::short_sha;
 
 /// Single feedback file as a card. Verdict pill on the left, author +
@@ -8,18 +9,22 @@ use crate::util::short_sha;
 /// `target_sha` is passed as a sibling prop because feedback is keyed
 /// per-commit on the wire — the SHA is parent context, not intrinsic
 /// to the feedback entry.
+///
+/// Markdown rendering happens in this component (wasm-side) — the
+/// wire ships only `body` (raw markdown); `body_html` is gone.
 #[component]
 pub fn FeedbackCard(entry: CommitFeedback, target_sha: String) -> impl IntoView {
     let verdict_class = verdict_class(entry.verdict);
     let target_short = short_sha(&target_sha);
     let target_label = format!("on {target_short}");
     let timestamp = format_timestamp(entry.created_at);
-    let body_html = entry.body_html.clone();
+    let body_html = markdown::render_feedback(&entry.body, entry.verdict);
+    let author = entry.author.to_string();
     view! {
         <article class="feedback-card">
             <header class="feedback-header">
                 <span class=verdict_class>{verdict_label(entry.verdict)}</span>
-                <span class="feedback-author">{entry.author}</span>
+                <span class="feedback-author">{author}</span>
                 <span class="feedback-target">
                     <code>{target_label}</code>
                 </span>

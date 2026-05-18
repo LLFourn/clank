@@ -124,15 +124,17 @@ impl FoldCarry {
             BTreeMap::new();
         for fb in feedback_files {
             let verdict = parse_verdict(&fb.body);
+            let author = fb.parsed.author.clone();
             feedback_by_plan
                 .entry(fb.parsed.plan_key.clone())
                 .or_default()
                 .insert(
                     (fb.parsed.target_sha, fb.parsed.author),
                     Feedback {
-                        path: fb.abs_path.to_string_lossy().into_owned(),
-                        body: fb.body,
+                        author,
                         verdict,
+                        body: fb.body,
+                        path: fb.abs_path.to_string_lossy().into_owned(),
                         created_at: fb.created_at,
                     },
                 );

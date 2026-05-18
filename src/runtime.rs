@@ -440,12 +440,14 @@ fn upsert_feedback(
             missing: Vec::new(),
             feedback: std::collections::BTreeMap::new(),
         });
+    let author = parsed.author.clone();
     gate.feedback.insert(
         parsed.author,
         Feedback {
-            path: abs_path.to_string_lossy().into_owned(),
-            body,
+            author,
             verdict,
+            body,
+            path: abs_path.to_string_lossy().into_owned(),
             created_at,
         },
     );

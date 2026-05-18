@@ -16,12 +16,23 @@ use serde::{Deserialize, Serialize};
 use crate::ids::{AgentLabel, CommitSha, ContentHash, PlanKey};
 use crate::vocab::{CommitGateState, CommitKind, PlanLifecycle, PlanWorktreeStatus};
 
-/// One reviewer's verdict file as the daemon stores it. `body` is
-/// raw markdown (matches the wire's `body_raw`; the wire renames
-/// to make space for `body_html`). Rendered HTML lives on
-/// `api::Feedback` and is computed at projection time.
+/// One reviewer's verdict file. Single canonical Feedback type —
+/// `api::Feedback` re-exports this, so daemon storage and wire
+/// response carry the same shape.
+///
+/// The `author` field is redundant with the `CommitGate.feedback`
+/// map key (`BTreeMap<AgentLabel, Feedback>` where the key always
+/// equals the value's `author`). The redundancy is bounded — one
+/// writer (`disk_snapshot::apply_commit` building the gate from
+/// feedback files) enforces the invariant; reads can rely on it.
+/// The wire has already been carrying this redundancy under
+/// `api::Feedback`; storage just stops being the odd one out.
+///
+/// `body` is raw markdown. The wasm frontend renders to HTML at
+/// display time — no `body_html` field on the wire.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Feedback {
+    pub author: AgentLabel,
     pub verdict: crate::vocab::Verdict,
     pub body: String,
     /// Repo-relative path of the feedback file.
