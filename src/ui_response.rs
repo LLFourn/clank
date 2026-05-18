@@ -1,6 +1,6 @@
 //! UI-only response builders for the Leptos SPA's `/api/*` surface.
 //!
-//! Each builder constructs a typed `trinity_wire` DTO from the
+//! Each builder constructs a typed `trinity_core` DTO from the
 //! daemon's internal state. HTTP route handlers in `server::http`
 //! return `axum::Json<TypedDto>` — no `json!` / `Value` in the
 //! response shape. UI-flavored DTOs (`CommitRowDetail`,
@@ -18,12 +18,12 @@ use crate::projection::{
 };
 use crate::repo_state::{Plan, RepoState};
 use crate::review_state::CommitGate;
-use trinity_wire::dto::{
+use trinity_core::dto::{
     ArchivedCycle, CommitRef, CommitRowDetail, Feedback, ListPlansResponse, PlanConflict,
     PlanDetailResponse, PlanRow, PrHint, PrHintOption, ReviewGate, ReviewTarget, TimelineEvent,
     WaitingOn,
 };
-use trinity_wire::vocab::{CommitKind, PlanTouchKind, Posture, ReviewTargetPhase, Verdict};
+use trinity_core::vocab::{CommitKind, PlanTouchKind, Posture, ReviewTargetPhase, Verdict};
 
 /// `GET /api/plans` — `{ plans, conflicts }` for the home page.
 pub fn plans_index(snapshot: &RepoState) -> std::io::Result<ListPlansResponse> {
@@ -267,8 +267,8 @@ fn build_commits_array_rich(plan: &Plan) -> Vec<CommitRowDetail> {
     out
 }
 
-fn build_commit_gate(g: &CommitGate) -> trinity_wire::dto::CommitGate {
-    trinity_wire::dto::CommitGate {
+fn build_commit_gate(g: &CommitGate) -> trinity_core::dto::CommitGate {
+    trinity_core::dto::CommitGate {
         state: g.state,
         participants: g
             .participants
@@ -527,7 +527,7 @@ mod tests {
     use super::*;
     use crate::lifecycle::{PlanKey, content_hash};
     use std::path::Path;
-    use trinity_wire::vocab::PlanWorktreeStatus;
+    use trinity_core::vocab::PlanWorktreeStatus;
 
     fn empty_snapshot() -> RepoState {
         RepoState::empty(std::path::PathBuf::from("/r"))

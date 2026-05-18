@@ -1,6 +1,6 @@
 //! MCP / HTTP response shaping over the filesystem-truth core.
 //!
-//! Response builders construct typed `trinity_wire` DTOs from the
+//! Response builders construct typed `trinity_core` DTOs from the
 //! daemon's internal state. The MCP dispatch (`server::mcp`) is
 //! the single point where these DTOs hit the protocol envelope
 //! via `serde_json::to_value`. UI response builders
@@ -16,12 +16,12 @@ use crate::projection::{
 };
 use crate::repo_state::{Plan, PlanWorktreeStatus, RepoState};
 use crate::review_state::CommitGate;
-use trinity_wire::dto::{
+use trinity_core::dto::{
     ArchivedCycle, CommitRef, CommitRow, FeedbackSummary, GetContextResponse, ListPlansResponse,
     PlanConflict, PlanRow, PrHint, PrHintOption, ReviewGate, ReviewTarget, TimelineEvent,
     WaitingOn as WireWaitingOn, WriteFeedback,
 };
-use trinity_wire::vocab::{CommitKind, PlanTouchKind, ReviewTargetPhase};
+use trinity_core::vocab::{CommitKind, PlanTouchKind, ReviewTargetPhase};
 
 pub trait PlanStatusReader {
     fn compute(
@@ -303,8 +303,8 @@ fn build_commits_array(plan: &Plan) -> Vec<CommitRow> {
     out
 }
 
-fn build_commit_gate(g: &CommitGate) -> trinity_wire::dto::CommitGate {
-    trinity_wire::dto::CommitGate {
+fn build_commit_gate(g: &CommitGate) -> trinity_core::dto::CommitGate {
+    trinity_core::dto::CommitGate {
         state: g.state,
         participants: g
             .participants
@@ -325,7 +325,7 @@ fn build_commit_gate(g: &CommitGate) -> trinity_wire::dto::CommitGate {
             .map(|(author, fb)| {
                 (
                     author.as_str().to_string(),
-                    trinity_wire::dto::Feedback {
+                    trinity_core::dto::Feedback {
                         author: author.as_str().to_string(),
                         verdict: fb.verdict,
                         body_raw: fb.body.clone(),
@@ -481,8 +481,8 @@ mod tests {
     use std::path::Path;
     use std::process::Command;
     use std::time::Duration;
-    use trinity_wire::dto::PlanRow;
-    use trinity_wire::vocab::{
+    use trinity_core::dto::PlanRow;
+    use trinity_core::vocab::{
         PlanLifecycle, PlanWorktreeStatus as Pws, Posture, WaitingReason, WaitingRole,
     };
 
@@ -723,7 +723,7 @@ mod tests {
         let gate = v
             .review_gate
             .expect("approved plan must have a review_gate");
-        assert_eq!(gate.state, trinity_wire::vocab::ReviewGateState::Ready);
+        assert_eq!(gate.state, trinity_core::vocab::ReviewGateState::Ready);
         assert_eq!(gate.phase, ReviewTargetPhase::Plan);
         assert_eq!(gate.approvals, vec!["alice".to_string()]);
         assert!(gate.request_changes.is_empty());

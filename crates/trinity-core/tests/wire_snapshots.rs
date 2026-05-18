@@ -12,8 +12,8 @@ use std::fs;
 use std::path::PathBuf;
 
 use serde_json::{Value, json};
-use trinity_wire::dto::*;
-use trinity_wire::vocab::*;
+use trinity_core::dto::*;
+use trinity_core::vocab::*;
 
 /// Skeleton of a JSON value: object → ordered keys + recursive skeletons;
 /// array → first-element skeleton (we assume homogeneous arrays); leaves

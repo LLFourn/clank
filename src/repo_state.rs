@@ -300,7 +300,7 @@ impl Plan {
 
     /// Lifecycle derived from `is_frozen()`. Replaces the legacy
     /// `PlanLifecycle::from_plan(&Plan)` constructor — now that
-    /// `PlanLifecycle` lives in `trinity_wire`, the daemon owns
+    /// `PlanLifecycle` lives in `trinity_core`, the daemon owns
     /// this projection as a method on the daemon's own struct
     /// (Rust's orphan rule forbids inherent impl blocks on
     /// externally-defined enums).
@@ -340,11 +340,11 @@ pub struct PlanTimelineEvent {
     pub gate: Option<CommitGate>,
 }
 
-/// Plan lifecycle: re-exported from `trinity_wire` so the daemon
+/// Plan lifecycle: re-exported from `trinity_core` so the daemon
 /// and the frontend branch on one definition. Derived from
 /// `Plan::is_frozen()`; see [`Plan::lifecycle`] for the daemon-side
 /// constructor.
-pub use trinity_wire::PlanLifecycle;
+pub use trinity_core::PlanLifecycle;
 
 /// Per-cycle summary surfaced in the plan-detail UI's cycle-history
 /// view. Sourced from the fold's `freeze_events` side-output; the
@@ -372,9 +372,9 @@ pub struct Feedback {
     pub created_at: i64,
 }
 
-pub use trinity_wire::Verdict;
+pub use trinity_core::Verdict;
 
-pub use trinity_wire::{PlanWorktreeStatus, Posture};
+pub use trinity_core::{PlanWorktreeStatus, Posture};
 
 /// Per-commit attribution result. See `.trinity/plans/filesystem-truth-rewrite.md`
 /// "Commit Attribution — pure git walk" for the four classification rules.
@@ -395,7 +395,7 @@ pub enum AttributionResult {
     Unattributed,
 }
 
-pub use trinity_wire::{CommitKind, PlanTouchKind};
+pub use trinity_core::{CommitKind, PlanTouchKind};
 
 /// A single live activity tick from the watcher loop. Tagged enum so a
 /// repo-level event (no plan context) is structurally distinct from a
@@ -426,7 +426,7 @@ impl LiveEvent {
 pub struct RepoEvent {
     pub ts: i64,
     pub repo: RepoRoot,
-    pub payload: trinity_wire::dto::RepoEventPayload,
+    pub payload: trinity_core::dto::RepoEventPayload,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -435,7 +435,7 @@ pub struct PlanEvent {
     pub repo: RepoRoot,
     pub plan_id: crate::lifecycle::PlanId,
     pub lifecycle: PlanLifecycle,
-    pub payload: trinity_wire::dto::PlanEventPayload,
+    pub payload: trinity_core::dto::PlanEventPayload,
 }
 
 /// The `waiting_on` projection — the canonical per-session "who blocks
@@ -448,4 +448,4 @@ pub struct WaitingOn {
     pub description: String,
 }
 
-pub use trinity_wire::{WaitingReason, WaitingRole};
+pub use trinity_core::{WaitingReason, WaitingRole};

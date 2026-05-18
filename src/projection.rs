@@ -205,9 +205,9 @@ pub fn impl_gate_for<'a>(
 
 /// Map a `WaitingReason` to the caller-facing action verb that names
 /// what the agent should actually do.
-pub fn expected_action(reason: WaitingReason) -> trinity_wire::ExpectedAction {
+pub fn expected_action(reason: WaitingReason) -> trinity_core::ExpectedAction {
     use WaitingReason::*;
-    use trinity_wire::ExpectedAction as A;
+    use trinity_core::ExpectedAction as A;
     match reason {
         SessionFinished => A::None,
         CommitPlanRevision => A::CommitPlanRevision,

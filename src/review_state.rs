@@ -1,5 +1,5 @@
 //! Daemon-internal review gate type. The closed-vocab enums
-//! (`Verdict`, `CommitGateState`) live in `trinity_wire`; this
+//! (`Verdict`, `CommitGateState`) live in `trinity_core`; this
 //! module re-exports them for ergonomic local use and owns the
 //! `CommitGate` struct (which holds daemon-internal `AgentLabel`
 //! identifiers, so it can't be in the wire crate as-is).
@@ -8,7 +8,7 @@ use serde::Serialize;
 
 use crate::lifecycle::AgentLabel;
 
-pub use trinity_wire::CommitGateState;
+pub use trinity_core::CommitGateState;
 
 /// Folded review state for one commit. `participants` is the
 /// cumulative plan-wide set (everyone who left feedback on any

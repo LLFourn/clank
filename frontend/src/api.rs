@@ -1,24 +1,24 @@
 //! Typed fetch wrappers around the daemon's `/api/*` surface.
 //!
-//! DTOs are imported from `trinity-wire` — the single shared
+//! DTOs are imported from `trinity-core` — the single shared
 //! definition of every public response shape across daemon and
 //! frontend. A rename like `WaitingReason::CommitNeedsReview ->
 //! NeedsReview` fails at compile time everywhere it matters.
 //!
 //! This module owns only the FETCH machinery — URL construction,
 //! `gloo-net` wrappers, and the `FetchError` enum. Wire-shape
-//! changes happen in `trinity-wire`, not here.
+//! changes happen in `trinity-core`, not here.
 
 // Type aliases preserve the historical frontend-local names where
 // they don't match the wire crate's naming.
-pub use trinity_wire::dto::{
+pub use trinity_core::dto::{
     CommitDetail, CommitDetailResponse, CommitRowDetail, DiffHunk, DiffLine,
     DiffResponse as DiffPage, Feedback as CommitFeedback, FileDiff, FileDiffMode, FinalizeApproval,
     ListPlansResponse as PlansIndex, PlanConflict as PlanConflictRow,
     PlanDetailResponse as PlanDetail, PlanRevisionResponse as PlanRevisionPage, PlanRow, PrHint,
     PrHintOption, RepoListResponse as ReposIndex, RepoRow, ReviewGate, TimelineEvent, WaitingOn,
 };
-pub use trinity_wire::vocab::{DiffLineKind, PlanLifecycle, Verdict, WaitingRole};
+pub use trinity_core::vocab::{DiffLineKind, PlanLifecycle, Verdict, WaitingRole};
 
 #[derive(Debug, Clone)]
 pub enum FetchError {
@@ -127,7 +127,7 @@ pub async fn fetch_repos() -> Result<ReposIndex, FetchError> {
 
 pub async fn delete_repo(
     basename: String,
-) -> Result<trinity_wire::dto::DeleteRepoOutcome, FetchError> {
+) -> Result<trinity_core::dto::DeleteRepoOutcome, FetchError> {
     let url = format!("/api/repos/{basename}");
     let resp = gloo_net::http::Request::delete(&url)
         .send()
@@ -136,7 +136,7 @@ pub async fn delete_repo(
     if !resp.ok() {
         return Err(FetchError::Status(resp.status()));
     }
-    resp.json::<trinity_wire::dto::DeleteRepoOutcome>()
+    resp.json::<trinity_core::dto::DeleteRepoOutcome>()
         .await
         .map_err(|e| FetchError::Decode(e.to_string()))
 }
@@ -147,9 +147,9 @@ mod dto_roundtrip_tests {
     //! `finalize_snapshot: null` regression in commit `055d387`,
     //! kept here as a sanity check that the wire-crate types still
     //! handle the daemon's current emission shape. Most coverage
-    //! now lives in `crates/trinity-wire/tests/round_trip.rs`.
+    //! now lives in `crates/trinity-core/tests/round_trip.rs`.
     use super::*;
-    use trinity_wire::vocab::CommitKind;
+    use trinity_core::vocab::CommitKind;
 
     #[test]
     fn finalize_commit_response_decodes() {

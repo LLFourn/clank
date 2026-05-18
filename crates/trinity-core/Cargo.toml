@@ -1,0 +1,12 @@
+[package]
+name = "trinity-core"
+version = "0.0.1"
+edition = "2024"
+publish = false
+description = "Shared core types (closed-vocab enums + response DTOs + identifiers) between the Trinity daemon and the Leptos frontend. Pure data — no daemon, runtime, or framework dependencies. Compiles to wasm32 unchanged."
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+
+[dev-dependencies]
+serde_json = "1"

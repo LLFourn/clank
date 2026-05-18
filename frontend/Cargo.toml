@@ -16,9 +16,9 @@ js-sys = "0.3"
 # HTTP client for /api/* fetches. gloo-net wraps the browser fetch API.
 gloo-net = { version = "0.6", default-features = false, features = ["http"] }
 
-# Shared wire contracts (closed-vocab enums + DTOs). See
-# `.trinity/plans/purge-stringly-typed.md`.
-trinity-wire = { path = "../crates/trinity-wire" }
+# Shared core types (closed-vocab enums, identifiers, response
+# DTOs). See `.trinity/plans/trinity-core-unification.md`.
+trinity-core = { path = "../crates/trinity-core" }
 
 # JSON deserialization for API responses.
 serde = { version = "1", features = ["derive"] }

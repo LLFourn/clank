@@ -8,3 +8,5 @@
 
 # Claude Code agent state (machine-local).
 /.claude/
+.trinity/feedback/
+.trinity/cache/

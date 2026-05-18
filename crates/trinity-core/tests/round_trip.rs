@@ -1,4 +1,4 @@
-//! Phase 2 contract tests for `trinity-wire`.
+//! Phase 2 contract tests for `trinity-core`.
 //!
 //! Three categories:
 //!
@@ -22,8 +22,8 @@
 //!    invariant.
 
 use serde_json::json;
-use trinity_wire::dto::*;
-use trinity_wire::vocab::*;
+use trinity_core::dto::*;
+use trinity_core::vocab::*;
 
 // ============================================================
 // Wire-string pinning

@@ -23,7 +23,7 @@ use leptos::prelude::*;
 use wasm_bindgen::JsCast;
 use wasm_bindgen::closure::Closure;
 
-pub use trinity_wire::dto::LiveEvent;
+pub use trinity_core::dto::LiveEvent;
 
 const RECENT_CAP: usize = 50;
 const CHIME_COALESCE_MS: f64 = 300.0;
