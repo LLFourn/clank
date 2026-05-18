@@ -50,8 +50,8 @@ fn detail_view(detail: PlanDetail) -> impl IntoView {
     let latest_target_sha = detail.latest_relevant_commit.clone();
     let timeline_events = detail.timeline.clone();
     let pr_hint = detail.pr_hint.clone();
-    let state_class = format!("state-chip state-{}", detail.state);
-    let state_label = detail.state.to_string();
+    let state_class = format!("state-chip state-{}", detail.lifecycle);
+    let state_label = detail.lifecycle.to_string();
     let plan_body_html = detail.plan_body_html.clone();
     let plan_body_truncated = detail.plan_body_truncated;
     let revision_link = match &detail.latest_plan_revision {

@@ -114,12 +114,10 @@ fn build_plan_row(
         repo: repo_root.to_string_lossy().to_string(),
         plan_id: plan_id_string(repo_root, &plan.id),
         slug: plan.id.as_str().to_string(),
-        state: lifecycle,
         lifecycle,
         current_path: plan.plan_path.to_string_lossy().to_string(),
         phase: plan_phase,
         plan_worktree_status: worktree_status,
-        worktree_status,
         waiting_on: build_waiting_on(&w),
         archived_cycles: plan.archived_cycles.iter().map(build_archived).collect(),
         last_activity_ts: crate::projection::last_activity_ts_for(plan),
@@ -210,7 +208,6 @@ pub fn get_context_response_from_snapshot(
         repo: state.root.to_string_lossy().to_string(),
         plan_id: plan_id_string(&state.root, &session.id),
         slug: session.id.as_str().to_string(),
-        state: lifecycle,
         lifecycle,
         current_path: session.plan_path.to_string_lossy().to_string(),
         phase: session_phase,
@@ -639,7 +636,6 @@ mod tests {
         assert_eq!(row.slug, "foo");
         assert_eq!(row.current_path, ".trinity/plans/foo.md");
         assert_eq!(row.lifecycle, PlanLifecycle::Active);
-        assert_eq!(row.state, PlanLifecycle::Active); // legacy alias
         assert_eq!(row.phase, Posture::Planning);
         assert_eq!(row.plan_worktree_status, Pws::Clean);
         assert_eq!(row.waiting_on.role, WaitingRole::Reviewers);

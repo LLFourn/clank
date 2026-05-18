@@ -479,7 +479,7 @@ pub async fn resolve_plan_id(
                     json!({
                         "plan_id": plan_id,
                         "current_path": p.plan_path.to_string_lossy(),
-                        "state": p.lifecycle().as_str(),
+                        "lifecycle": p.lifecycle().as_str(),
                     })
                 })
                 .collect();

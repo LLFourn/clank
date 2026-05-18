@@ -297,29 +297,16 @@ pub struct PlanConflict {
 // Top-level response DTOs
 // ============================================================
 
-/// One row in MCP `list_plans` (and, via a Phase 5 conversion,
-/// `/api/plans`). The legacy `state` field is a duplicate of
-/// `lifecycle` carried for wire back-compat through Phase 7;
-/// Phase 8 drops it.
+/// One row in MCP `list_plans` and HTTP `/api/plans`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PlanRow {
     pub repo: String,
     pub plan_id: Option<String>,
     pub slug: String,
-    /// Legacy alias for `lifecycle` — same value, kept so the
-    /// frontend's `state: String` reader keeps working until
-    /// Phase 6. Phase 8 drops this field.
-    pub state: PlanLifecycle,
     pub lifecycle: PlanLifecycle,
     pub current_path: String,
     pub phase: Posture,
     pub plan_worktree_status: PlanWorktreeStatus,
-    /// Legacy alias for `plan_worktree_status` — the UI's `/api/plans`
-    /// historically emitted this name; MCP `list_plans` emits the
-    /// `plan_` prefix. Both are populated with the same value through
-    /// Phase 6's frontend cutover. Phase 8 drops this field.
-    #[serde(default)]
-    pub worktree_status: PlanWorktreeStatus,
     pub waiting_on: WaitingOn,
     #[serde(default)]
     pub archived_cycles: Vec<ArchivedCycle>,
@@ -344,8 +331,6 @@ pub struct GetContextResponse {
     pub repo: String,
     pub plan_id: Option<String>,
     pub slug: String,
-    /// Legacy alias for `lifecycle`. Drop in Phase 8.
-    pub state: PlanLifecycle,
     pub lifecycle: PlanLifecycle,
     pub current_path: String,
     pub phase: Posture,
@@ -373,8 +358,6 @@ pub struct PlanDetailResponse {
     pub repo: String,
     pub plan_id: Option<String>,
     pub slug: String,
-    /// Legacy alias for `lifecycle`. Drop in Phase 8.
-    pub state: PlanLifecycle,
     pub lifecycle: PlanLifecycle,
     pub current_path: String,
     pub phase: Posture,

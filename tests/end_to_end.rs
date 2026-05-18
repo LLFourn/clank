@@ -860,7 +860,7 @@ async fn plan_id_url_stable_across_finish_flip() {
         .await
         .unwrap();
     assert_eq!(before["plan_id"], format!("{basename}/foo.md"));
-    assert_eq!(before["state"], "active");
+    assert_eq!(before["lifecycle"], "active");
     assert_eq!(before["current_path"], ".trinity/plans/foo.md");
 
     // Commit a finalize snapshot — plan file stays at the same path.
@@ -884,8 +884,8 @@ async fn plan_id_url_stable_across_finish_flip() {
 
     assert_eq!(after["plan_id"], format!("{basename}/foo.md"));
     assert_eq!(
-        after["state"], "finished",
-        "state should flip to finished; full response: {after}"
+        after["lifecycle"], "finished",
+        "lifecycle should flip to finished; full response: {after}"
     );
     assert_eq!(
         after["current_path"], ".trinity/plans/foo.md",

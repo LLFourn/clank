@@ -64,7 +64,7 @@ fn plans_view(index: PlansIndex, show_done: bool) -> impl IntoView {
     let plans: Vec<PlanRow> = index
         .plans
         .into_iter()
-        .filter(|p| show_done || p.state != PlanLifecycle::Finished)
+        .filter(|p| show_done || p.lifecycle != PlanLifecycle::Finished)
         .collect();
     let conflicts = index.conflicts;
     view! {
@@ -176,7 +176,7 @@ fn plan_table(rows: Vec<PlanRow>) -> impl IntoView {
                         let role = s.waiting_on.role;
                         let waiting_class = format!("waiting waiting-{role}");
                         let plan_id = s.plan_id.clone().unwrap_or_default();
-                        let state_class = format!("state-chip state-{}", s.state);
+                        let state_class = format!("state-chip state-{}", s.lifecycle);
                         let agents = s.waiting_on.agents.clone();
                         view! {
                             <tr>
@@ -186,10 +186,10 @@ fn plan_table(rows: Vec<PlanRow>) -> impl IntoView {
                                     </a>
                                 </td>
                                 <td>
-                                    <span class=state_class>{s.state.to_string()}</span>
+                                    <span class=state_class>{s.lifecycle.to_string()}</span>
                                 </td>
                                 <td>{s.phase.to_string()}</td>
-                                <td>{s.worktree_status.to_string()}</td>
+                                <td>{s.plan_worktree_status.to_string()}</td>
                                 <td>
                                     <span class=waiting_class>{role.to_string()}</span>
                                 </td>
