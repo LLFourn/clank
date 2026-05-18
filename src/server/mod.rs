@@ -54,9 +54,10 @@ pub struct ServeArgs {
     pub frontend_dist: Option<PathBuf>,
 }
 
-/// Bundle embedded by `build.rs` running `trunk build --release`.
-/// The `include_dir!` macro walks `frontend/dist/` at compile time
-/// and bakes every file into the binary.
+/// Bundle baked into the daemon at compile time. The justfile
+/// (`just build`) builds `frontend/dist/` via trunk first; the
+/// `include_dir!` macro then walks that directory and embeds
+/// every file into the binary.
 static EMBEDDED_BUNDLE: include_dir::Dir<'static> =
     include_dir::include_dir!("$CARGO_MANIFEST_DIR/frontend/dist");
 

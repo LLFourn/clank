@@ -1,38 +1,49 @@
 default:
     @just --list
 
-# Build the release daemon. build.rs runs `trunk build --release`
-# in frontend/ and bakes the resulting dist/ into the binary, so
-# daemon and SPA versions cannot drift.
-build:
+# --- Frontend ---
+
+# Build the wasm bundle (release). Required before any cargo build
+# of the daemon — build.rs embeds frontend/dist/ via include_dir!.
+build-frontend:
+    cd frontend && trunk build --release
+
+# Debug wasm bundle. Faster; used by build-dev / test / serve-dev.
+build-frontend-dev:
+    cd frontend && trunk build
+
+# Watch frontend; auto-rebuild dist/ on change. Pair with serve-dev.
+frontend-watch:
+    cd frontend && trunk watch
+
+# --- Daemon ---
+
+# Release daemon with the freshly-built frontend embedded.
+build: build-frontend
     cargo build --release -p trinity
 
-# Build everything for development (debug).
-build-dev:
-    TRINITY_SKIP_FRONTEND_BUILD=1 cargo build --workspace
-    cd frontend && trunk build
+# Debug build of everything.
+build-dev: build-frontend-dev
+    cargo build --workspace
 
-# Full test suite.
-test:
-    TRINITY_SKIP_FRONTEND_BUILD=1 cargo test --workspace --exclude trinity-frontend
+# --- Test / CI ---
 
-# Everything CI checks (fmt, clippy, tests, wasm-clean, trunk).
-# Mirrors the verification commands in the plan files.
-check:
+test: build-frontend-dev
+    cargo test --workspace --exclude trinity-frontend
+
+# Everything CI checks (fmt, clippy, tests, wasm-clean, frontend).
+check: build-frontend
     cargo fmt -- --check
-    TRINITY_SKIP_FRONTEND_BUILD=1 cargo clippy --workspace --all-targets -- -D warnings
+    cargo clippy --workspace --all-targets -- -D warnings
     cargo check -p trinity-core --target wasm32-unknown-unknown
-    TRINITY_SKIP_FRONTEND_BUILD=1 cargo test --workspace --exclude trinity-frontend
-    cd frontend && trunk build
+    cargo test --workspace --exclude trinity-frontend
 
-# Run the release daemon. Rebuilds first; the build.rs guarantee
-# means the embedded SPA matches this binary.
+# --- Run ---
+
 serve: build
     ./target/release/trinity serve
 
-# Restart the running daemon: kill the old one, rebuild, start
-# fresh in the background. Used after editing daemon or frontend
-# source so the next page load gets the fresh wasm.
+# Kill the running daemon, rebuild, restart in background.
 restart: build
     -pkill -f "target/release/trinity serve"
     sleep 1
@@ -40,20 +51,15 @@ restart: build
     sleep 2
     curl -sf http://127.0.0.1:7777/healthz && echo " — trinity running"
 
-# Frontend dev loop: keep daemon running with --frontend-dist set
-# to frontend/dist, then run `trunk watch` in another terminal.
-# Frontend changes flow through without rebuilding the daemon.
-serve-dev:
-    cd frontend && trunk build
-    TRINITY_SKIP_FRONTEND_BUILD=1 cargo run --release -p trinity -- \
+# Frontend dev loop: daemon serves frontend/dist/ from disk, so
+# `just frontend-watch` in another terminal flows through without
+# rebuilding the daemon.
+serve-dev: build-frontend-dev
+    cargo run --release -p trinity -- \
         serve --frontend-dist frontend/dist
 
-# Watch frontend; auto-rebuild dist/ on change. Pair with
-# `just serve-dev` in another terminal.
-frontend-watch:
-    cd frontend && trunk watch
+# --- Cleanup ---
 
-# Wipe build artifacts and the embedded frontend dist.
 clean:
     cargo clean
     rm -rf frontend/dist

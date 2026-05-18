@@ -10,9 +10,10 @@ use crate::runtime::Runtime;
 
 /// Where the daemon reads the Leptos SPA bundle from.
 ///
-/// `Embedded` is the production / default path — `build.rs` ran
-/// `trunk build --release` and `include_dir!` baked the result into
-/// the binary, so daemon and frontend versions cannot drift.
+/// `Embedded` is the production / default path — the justfile
+/// builds `frontend/dist/` via trunk and `include_dir!` bakes the
+/// result into the binary, so daemon and frontend versions cannot
+/// drift on a `just build`.
 ///
 /// `Disk(path)` is a developer escape hatch enabled by the
 /// `TRINITY_FRONTEND_DIST_OVERRIDE` env var or `--frontend-dist`

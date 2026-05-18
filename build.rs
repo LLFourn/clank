@@ -1,60 +1,33 @@
-//! Rebuild the Leptos SPA bundle before the daemon compiles so the
-//! resulting binary embeds a fresh `frontend/dist/`. Eliminates the
-//! "stale release daemon serves index.html that points at deleted
-//! wasm hashes" footgun.
+//! The daemon binary embeds `frontend/dist/` at compile time via
+//! `include_dir!`. This build script doesn't run trunk — that's the
+//! justfile's job. It only:
 //!
-//! Skip the trunk invocation by setting `TRINITY_SKIP_FRONTEND_BUILD=1`
-//! (CI artifacts where the dist is pre-staged, or fast iteration on
-//! daemon-only code where the existing `frontend/dist/` is fine).
+//! 1. Emits `rerun-if-changed` so a fresh `trunk build` invalidates
+//!    the daemon's cached compile.
+//! 2. Sanity-checks that `frontend/dist/index.html` exists, so a bare
+//!    `cargo build` (without a prior trunk run) fails fast with a
+//!    useful pointer instead of a cryptic `include_dir!` error.
 
 use std::path::Path;
-use std::process::Command;
 
 fn main() {
     let workspace_root = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let frontend_dir = workspace_root.join("frontend");
+    let dist = workspace_root.join("frontend/dist");
 
-    println!("cargo:rerun-if-changed=frontend/Cargo.toml");
-    println!("cargo:rerun-if-changed=frontend/index.html");
-    println!("cargo:rerun-if-changed=frontend/Trunk.toml");
-    println!("cargo:rerun-if-env-changed=TRINITY_SKIP_FRONTEND_BUILD");
-    rerun_if_dir_changed(&workspace_root.join("frontend/src"));
-    rerun_if_dir_changed(&workspace_root.join("frontend/style"));
-    rerun_if_dir_changed(&workspace_root.join("frontend/assets"));
-    rerun_if_dir_changed(&workspace_root.join("crates/trinity-core/src"));
+    println!("cargo:rerun-if-changed=frontend/dist/index.html");
+    rerun_if_dir_changed(&dist);
 
-    if std::env::var("TRINITY_SKIP_FRONTEND_BUILD").is_ok() {
-        println!("cargo:warning=TRINITY_SKIP_FRONTEND_BUILD set; reusing existing frontend/dist/");
-        return;
-    }
-
-    // Trunk's CLI mishandles `NO_COLOR=1` ("invalid value '1' for
-    // '--no-color'"). Cargo + clippy + various CI harnesses set
-    // it. Strip the var when invoking trunk so daemon builds work
-    // in any environment.
-    let status = Command::new("trunk")
-        .args(["build", "--release"])
-        .current_dir(&frontend_dir)
-        .env_remove("NO_COLOR")
-        .status();
-
-    match status {
-        Ok(s) if s.success() => {}
-        Ok(s) => panic!(
-            "`trunk build --release` failed with status {s}; \
-             set TRINITY_SKIP_FRONTEND_BUILD=1 to bypass when iterating \
-             on daemon-only changes"
-        ),
-        Err(e) => panic!(
-            "could not run `trunk build --release` (is trunk installed? \
-             `cargo install trunk`): {e}"
-        ),
+    if !dist.join("index.html").is_file() {
+        panic!(
+            "frontend/dist/index.html missing — the daemon embeds the wasm bundle \
+             at compile time. Build the frontend first:\n\n\
+             \tjust build           # release bundle + daemon\n\
+             \tjust build-frontend  # frontend only\n\n\
+             Or directly:  cd frontend && trunk build --release"
+        );
     }
 }
 
-/// Walk `dir` and emit a `cargo:rerun-if-changed=<path>` for every
-/// file (so cargo invalidates this build.rs when frontend source
-/// content changes, not just when files appear or disappear).
 fn rerun_if_dir_changed(dir: &Path) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
@@ -62,7 +35,7 @@ fn rerun_if_dir_changed(dir: &Path) {
     for entry in entries.flatten() {
         let path = entry.path();
         let name = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
-        if name.starts_with('.') || name == "target" {
+        if name.starts_with('.') {
             continue;
         }
         if path.is_dir() {
