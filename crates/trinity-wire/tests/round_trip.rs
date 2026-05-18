@@ -142,9 +142,10 @@ fn plan_event_kind_wire_strings() {
 
 #[test]
 fn diff_line_kind_wire_strings() {
+    assert_wire(DiffLineKind::Insert, "insert");
+    assert_wire(DiffLineKind::Delete, "delete");
     assert_wire(DiffLineKind::Context, "context");
-    assert_wire(DiffLineKind::Addition, "addition");
-    assert_wire(DiffLineKind::Deletion, "deletion");
+    assert_wire(DiffLineKind::Meta, "meta");
 }
 
 // ============================================================
@@ -179,7 +180,7 @@ fn as_str_agrees_with_wire() {
     check!(ReviewTargetPhase::Impl);
     check!(RepoEventKind::RepoUnwatched);
     check!(PlanEventKind::FeedbackRemoved);
-    check!(DiffLineKind::Addition);
+    check!(DiffLineKind::Insert);
 }
 
 // ============================================================

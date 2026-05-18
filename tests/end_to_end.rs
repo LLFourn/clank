@@ -1654,11 +1654,15 @@ async fn finalize_commit_endpoint_returns_full_snapshot_not_just_diff() {
         .unwrap();
     handle.abort();
 
+    // Phase 5b: CommitDetailResponse uses `#[serde(flatten)]` over
+    // the tagged `CommitDetail` enum, so a Finalize commit's wire
+    // shape has `"kind": "finalize"` at the top level and the
+    // variant's `snapshot: [...]` field next to it. The old
+    // `finalize_snapshot` field name is gone.
     assert_eq!(body["kind"], "finalize");
-    let snapshot = body["finalize_snapshot"].as_array().expect(
-        "finalize commit endpoint must carry finalize_snapshot; \
-         got body: {body:?}",
-    );
+    let snapshot = body["snapshot"]
+        .as_array()
+        .unwrap_or_else(|| panic!("finalize commit body must carry snapshot; got {body:?}"));
     assert_eq!(
         snapshot.len(),
         2,
@@ -1671,17 +1675,16 @@ async fn finalize_commit_endpoint_returns_full_snapshot_not_just_diff() {
         .collect();
     assert!(authors.contains(&"alice"), "alice must be in snapshot");
     assert!(authors.contains(&"bob"), "bob must be in snapshot");
-    // Alice's body is unchanged by the freeze commit — diff would miss it.
     let alice = snapshot.iter().find(|e| e["author"] == "alice").unwrap();
     let alice_html = alice["body_html"].as_str().unwrap();
     assert!(
         alice_html.contains("Looks good"),
         "alice's rendered body must carry her approval text; got: {alice_html}"
     );
-    // Finalize events are not gated, no live feedback.
-    assert_eq!(
-        body["feedback"].as_array().unwrap().len(),
-        0,
-        "finalize commit must not surface live feedback"
+    // Finalize events are not gated — the tagged enum doesn't even
+    // carry a `feedback` field for the Finalize variant.
+    assert!(
+        body.get("feedback").is_none(),
+        "finalize variant must not carry `feedback` field; got: {body:?}"
     );
 }

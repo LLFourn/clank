@@ -178,12 +178,6 @@ const GUARD_A_ALLOWLIST: &[(&str, usize)] = &[
     ("src/repo_state.rs", 2),
     // LiveEvent payload construction call sites. Drain in Phase 7.
     ("src/runtime.rs", 5),
-    // Route handlers returning `axum::Json<Value>` + json! body
-    // construction. Remaining: api_plan_revision, api_commit_diff,
-    // api_diff, api_repos_list/delete, SSE event_stream, diff
-    // file serializer. Drains in Phase 5b once the wire crate's
-    // FileDiff family is adjusted to match daemon emission.
-    ("src/server/http.rs", 17),
     // MCP protocol envelope (allowed exception) + tool-arg parsing
     // via Value. Phase 4 keeps the envelope, types the args.
     ("src/server/mcp.rs", 10),

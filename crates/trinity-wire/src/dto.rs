@@ -245,26 +245,31 @@ pub struct PrHint {
 }
 
 /// One file's diff inside a structured-diff payload. Mirrors what
-/// `diff_parser::parse_diff` produces.
+/// the daemon's `diff_parser::parse_diff` produces.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FileDiff {
-    pub old_path: String,
-    pub new_path: String,
-    pub status: String,
-    pub mode: String,
+    pub path: String,
+    #[serde(default)]
+    pub old_path: Option<String>,
+    pub additions: usize,
+    pub deletions: usize,
+    pub mode: FileDiffMode,
     pub binary: bool,
-    #[serde(default)]
     pub always_folded: bool,
-    #[serde(default)]
     pub hunks: Vec<DiffHunk>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FileDiffMode {
+    Added,
+    Removed,
+    Renamed,
+    Modified,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DiffHunk {
-    pub old_start: u32,
-    pub old_lines: u32,
-    pub new_start: u32,
-    pub new_lines: u32,
     pub header: String,
     pub lines: Vec<DiffLine>,
 }
@@ -273,8 +278,10 @@ pub struct DiffHunk {
 pub struct DiffLine {
     pub kind: DiffLineKind,
     pub content: String,
-    pub old_line: Option<u32>,
-    pub new_line: Option<u32>,
+    #[serde(default)]
+    pub old_lineno: Option<usize>,
+    #[serde(default)]
+    pub new_lineno: Option<usize>,
 }
 
 /// One conflict row: a plan stem with multiple paths on disk.
@@ -456,8 +463,9 @@ pub struct DiffResponse {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RepoRow {
     pub basename: String,
-    pub path: String,
+    pub root: String,
     pub plan_count: usize,
+    pub last_activity_ts: i64,
 }
 
 /// `/api/repos` response body.

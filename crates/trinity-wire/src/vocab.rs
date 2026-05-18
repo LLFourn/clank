@@ -352,17 +352,22 @@ impl PlanEventKind {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DiffLineKind {
+    Insert,
+    Delete,
     Context,
-    Addition,
-    Deletion,
+    /// Meta lines (hunk header, file mode change notice, etc.) —
+    /// the daemon's parser emits these for renderer rows that
+    /// shouldn't be colored as additions or deletions.
+    Meta,
 }
 
 impl DiffLineKind {
     pub fn as_str(self) -> &'static str {
         match self {
+            DiffLineKind::Insert => "insert",
+            DiffLineKind::Delete => "delete",
             DiffLineKind::Context => "context",
-            DiffLineKind::Addition => "addition",
-            DiffLineKind::Deletion => "deletion",
+            DiffLineKind::Meta => "meta",
         }
     }
 }

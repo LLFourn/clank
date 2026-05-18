@@ -10,7 +10,6 @@ use axum::response::{Html, IntoResponse, Response, Sse, sse};
 use axum::routing::{get, post};
 use futures::stream::Stream;
 use serde::Deserialize;
-use serde_json::{Value, json};
 
 use super::AppState;
 use super::mcp;
@@ -115,21 +114,26 @@ async fn event_stream(
         tokio_stream::wrappers::BroadcastStream::new(rx).filter_map(|r| async move { r.ok() });
 
     let combined = live_stream.map(|e| {
-        use crate::repo_state::LiveEvent;
-        let payload = match &e {
-            LiveEvent::Repo(re) => json!({
-                "scope": "repo",
-                "ts": re.ts,
-                "kind": re.kind.as_str(),
-            }),
-            LiveEvent::Plan(pe) => json!({
-                "scope": "plan",
-                "ts": pe.ts,
-                "plan_id": pe.plan_id.to_string(),
-                "kind": pe.kind.as_str(),
-            }),
+        use crate::repo_state::LiveEvent as DaemonLiveEvent;
+        let wire_event = match &e {
+            DaemonLiveEvent::Repo(re) => {
+                trinity_wire::dto::LiveEvent::Repo(trinity_wire::dto::RepoEvent {
+                    ts: re.ts,
+                    kind: re.kind,
+                })
+            }
+            DaemonLiveEvent::Plan(pe) => {
+                trinity_wire::dto::LiveEvent::Plan(trinity_wire::dto::PlanEvent {
+                    ts: pe.ts,
+                    plan_id: pe.plan_id.to_string(),
+                    lifecycle: pe.lifecycle,
+                    kind: pe.kind,
+                })
+            }
         };
-        Ok(sse::Event::default().data(payload.to_string()))
+        let payload = serde_json::to_string(&wire_event)
+            .unwrap_or_else(|_| String::from("{\"error\":\"sse_serialize\"}"));
+        Ok(sse::Event::default().data(payload))
     });
 
     Box::pin(combined)
@@ -336,7 +340,7 @@ async fn api_plan_detail(
 async fn api_plan_revision(
     State(state): State<AppState>,
     Path((repo_basename, stem_md, sha)): Path<(String, String, String)>,
-) -> Result<axum::Json<Value>, AppError> {
+) -> Result<axum::Json<trinity_wire::dto::PlanRevisionResponse>, AppError> {
     let (repo, plan_key) = resolve_plan_id_segments(&state, &repo_basename, &stem_md).await?;
     let commit_sha = crate::lifecycle::CommitSha::parse(&sha)
         .map_err(|e| AppError::bad_request(format!("invalid sha: {e}")))?;
@@ -372,33 +376,32 @@ async fn api_plan_revision(
         .map(|c| c.as_str().to_string());
     let next_sha = plan_revisions.get(pos + 1).map(|c| c.as_str().to_string());
 
-    let feedback = crate::ui_response::feedback_for_target(
-        snapshot
-            .plans
-            .values()
-            .next()
-            .expect("single_plan invariant"),
-        &commit_sha,
-    );
-    Ok(axum::Json(json!({
-        "repo": snapshot.root.to_string_lossy(),
-        "plan_id": format!("{repo_basename}/{stem_md}"),
-        "slug": snapshot.plans.values().next().expect("single_plan invariant").id.as_str(),
-        "commit_sha": commit_sha.as_str(),
-        "body_raw": body_raw,
-        "body_html": body_html,
-        "plan_intro": snapshot.plans.values().next().expect("single_plan invariant").plan_intro.as_str(),
-        "plan_intro_parent": snapshot.plans.values().next().expect("single_plan invariant").plan_intro_parent.as_ref().map(|s| s.as_str()),
-        "previous_sha": previous_sha,
-        "next_sha": next_sha,
-        "feedback": feedback,
-    })))
+    let feedback = crate::ui_response::feedback_for_target(plan, &commit_sha);
+    Ok(axum::Json(trinity_wire::dto::PlanRevisionResponse {
+        repo: snapshot.root.to_string_lossy().to_string(),
+        plan_id: format!("{repo_basename}/{stem_md}"),
+        slug: plan.id.as_str().to_string(),
+        commit_sha: commit_sha.as_str().to_string(),
+        body_raw,
+        body_html,
+        plan_intro: plan.plan_intro.as_str().to_string(),
+        plan_intro_parent: plan
+            .plan_intro_parent
+            .as_ref()
+            .map(|s| s.as_str().to_string()),
+        previous_sha,
+        next_sha,
+        feedback,
+    }))
 }
 
 async fn api_commit_diff(
     State(state): State<AppState>,
     Path((repo_basename, stem_md, sha)): Path<(String, String, String)>,
-) -> Result<axum::Json<Value>, AppError> {
+) -> Result<axum::Json<trinity_wire::dto::CommitDetailResponse>, AppError> {
+    use trinity_wire::dto::{CommitDetail, CommitDetailResponse, FinalizeApproval};
+    use trinity_wire::vocab::CommitKind;
+
     let (repo, plan_key) = resolve_plan_id_segments(&state, &repo_basename, &stem_md).await?;
     let commit_sha = crate::lifecycle::CommitSha::parse(&sha)
         .map_err(|e| AppError::bad_request(format!("invalid sha: {e}")))?;
@@ -420,65 +423,73 @@ async fn api_commit_diff(
             "commit {sha} is not attributed to {repo_basename}/{stem_md}"
         ))
     })?;
-    let is_finalize = matches!(event.kind, crate::repo_state::CommitKind::Finalize);
     let stem = plan.id.as_str().to_string();
 
     let patch = crate::git_io::show_commit(&repo, &commit_sha)
         .await
         .map_err(|e| AppError::internal(format!("git show: {e}")))?;
-    let diff_files = crate::diff_parser::parse_diff(&patch);
-    let diff_files_json = serialize_diff_files(&diff_files);
+    let diff_files = parsed_to_wire_diff_files(&crate::diff_parser::parse_diff(&patch));
 
     let (subject, message_body) = crate::git_io::commit_message(&repo, &commit_sha)
         .await
         .map_err(|e| AppError::internal(format!("git show -s: {e}")))?;
 
-    // Finalize events expose the .trinity/finished/<stem>/ snapshot
-    // AT THE FREEZE COMMIT, not live feedback. The diff alone is
-    // insufficient — it only shows files this commit changed, but
-    // the snapshot is the full directory contents at the freeze.
-    // Reviewable events expose live feedback as before.
-    // Both `feedback` and `finalize_snapshot` are ALWAYS arrays on
-    // the wire — emitting null on the negative branch breaks the
-    // frontend DTO's `Vec<...>` deserializer (`#[serde(default)]`
-    // covers missing, not explicit null). One of the arrays is
-    // empty depending on `kind`.
-    let (feedback, finalize_snapshot) = if is_finalize {
-        let files = crate::git_io::read_finalize_snapshot(&repo, &commit_sha, &stem)
-            .await
-            .map_err(|e| AppError::internal(format!("read finalize snapshot: {e}")))?;
-        let entries: Vec<Value> = files
-            .into_iter()
-            .map(|(filename, body)| {
-                let author = filename
-                    .strip_suffix(".md")
-                    .unwrap_or(&filename)
-                    .to_string();
-                let body_html = crate::ui_response::render_markdown(&body);
-                json!({
-                    "author": author,
-                    "filename": filename,
-                    "body_html": body_html,
+    // Finalize events expose the `.trinity/finished/<stem>/`
+    // snapshot at the freeze commit's tree. Reviewable events
+    // expose live feedback. The tagged `CommitDetail` enum models
+    // the kind-dependent shape — one wire-level `kind`, exhaustive
+    // pattern-match on the frontend.
+    let detail = match event.kind {
+        CommitKind::Finalize => {
+            let files = crate::git_io::read_finalize_snapshot(&repo, &commit_sha, &stem)
+                .await
+                .map_err(|e| AppError::internal(format!("read finalize snapshot: {e}")))?;
+            let snapshot_entries = files
+                .into_iter()
+                .map(|(filename, body)| {
+                    let author = filename
+                        .strip_suffix(".md")
+                        .unwrap_or(&filename)
+                        .to_string();
+                    let body_html = crate::ui_response::render_markdown(&body);
+                    FinalizeApproval {
+                        author,
+                        filename,
+                        body_html,
+                    }
                 })
-            })
-            .collect();
-        (Vec::new(), entries)
-    } else {
-        let fb = crate::ui_response::feedback_for_target(plan, &commit_sha);
-        (fb, Vec::new())
+                .collect();
+            CommitDetail::Finalize {
+                snapshot: snapshot_entries,
+            }
+        }
+        CommitKind::PlanOnly => CommitDetail::PlanOnly {
+            feedback: crate::ui_response::feedback_for_target(plan, &commit_sha),
+        },
+        CommitKind::CodeOnly => CommitDetail::CodeOnly {
+            feedback: crate::ui_response::feedback_for_target(plan, &commit_sha),
+        },
+        CommitKind::Mixed => CommitDetail::Mixed {
+            feedback: crate::ui_response::feedback_for_target(plan, &commit_sha),
+        },
+        CommitKind::MultiPlan => CommitDetail::MultiPlan {},
+        CommitKind::Unattributed => {
+            return Err(AppError::not_found(format!(
+                "commit {sha} is unattributed for {repo_basename}/{stem_md}"
+            )));
+        }
     };
-    Ok(axum::Json(json!({
-        "repo": snapshot.root.to_string_lossy(),
-        "plan_id": format!("{repo_basename}/{stem_md}"),
-        "slug": stem,
-        "commit_sha": commit_sha.as_str(),
-        "kind": event.kind.as_str(),
-        "subject": subject,
-        "message_body": message_body,
-        "diff_files": diff_files_json,
-        "feedback": feedback,
-        "finalize_snapshot": finalize_snapshot,
-    })))
+
+    Ok(axum::Json(CommitDetailResponse {
+        repo: snapshot.root.to_string_lossy().to_string(),
+        plan_id: format!("{repo_basename}/{stem_md}"),
+        slug: stem,
+        commit_sha: commit_sha.as_str().to_string(),
+        subject,
+        message_body,
+        diff_files,
+        detail,
+    }))
 }
 
 /// `GET /api/plan/{repo}/{stem_md}/diff/{from}/{to}` — patch between
@@ -487,7 +498,7 @@ async fn api_commit_diff(
 async fn api_diff(
     State(state): State<AppState>,
     Path((repo_basename, stem_md, from, to)): Path<(String, String, String, String)>,
-) -> Result<axum::Json<Value>, AppError> {
+) -> Result<axum::Json<trinity_wire::dto::DiffResponse>, AppError> {
     let (repo, plan_key) = resolve_plan_id_segments(&state, &repo_basename, &stem_md).await?;
     let from_sha = crate::lifecycle::CommitSha::parse(&from)
         .map_err(|e| AppError::bad_request(format!("invalid from sha: {e}")))?;
@@ -524,26 +535,27 @@ async fn api_diff(
     let patch = crate::git_io::diff_two_blobs(&repo, &from_sha, &from_path, &to_sha, &to_path)
         .await
         .map_err(|e| AppError::internal(format!("git diff: {e}")))?;
-    let diff_files = crate::diff_parser::parse_diff(&patch);
-    let diff_files_json = serialize_diff_files(&diff_files);
-    Ok(axum::Json(json!({
-        "repo": repo.to_string_lossy(),
-        "plan_id": format!("{repo_basename}/{stem_md}"),
-        "from": from_sha.as_str(),
-        "to": to_sha.as_str(),
-        "from_path": from_path.to_string_lossy(),
-        "to_path": to_path.to_string_lossy(),
-        "diff_files": diff_files_json,
-    })))
+    let diff_files = parsed_to_wire_diff_files(&crate::diff_parser::parse_diff(&patch));
+    let _ = repo; // canonical path no longer surfaced on this response
+    Ok(axum::Json(trinity_wire::dto::DiffResponse {
+        from: from_sha.as_str().to_string(),
+        to: to_sha.as_str().to_string(),
+        from_path: from_path.to_string_lossy().to_string(),
+        to_path: to_path.to_string_lossy().to_string(),
+        diff_files,
+    }))
 }
 
 /// `GET /api/repos` — list every watched repo with its basename,
 /// canonical path, plan count, and last activity timestamp. Returns
 /// `{repos: [...]}` sorted by `last_activity_ts` desc.
-async fn api_repos_list(State(state): State<AppState>) -> Result<axum::Json<Value>, AppError> {
+async fn api_repos_list(
+    State(state): State<AppState>,
+) -> Result<axum::Json<trinity_wire::dto::RepoListResponse>, AppError> {
     let trinity_arc = state.runtime.state();
     let trinity = trinity_arc.lock().await;
-    let mut repos: Vec<(i64, Value)> = Vec::with_capacity(trinity.repo_basenames.len());
+    let mut rows: Vec<(i64, trinity_wire::dto::RepoRow)> =
+        Vec::with_capacity(trinity.repo_basenames.len());
     for (basename, root) in &trinity.repo_basenames {
         let Some(repo_state) = trinity.repos.get(root) else {
             continue;
@@ -552,19 +564,19 @@ async fn api_repos_list(State(state): State<AppState>) -> Result<axum::Json<Valu
         for plan in repo_state.plans.values() {
             last_ts = last_ts.max(crate::projection::last_activity_ts_for(plan));
         }
-        repos.push((
+        rows.push((
             last_ts,
-            json!({
-                "basename": basename.as_str(),
-                "root": root.to_string_lossy(),
-                "plan_count": repo_state.plans.len(),
-                "last_activity_ts": last_ts,
-            }),
+            trinity_wire::dto::RepoRow {
+                basename: basename.as_str().to_string(),
+                root: root.to_string_lossy().to_string(),
+                plan_count: repo_state.plans.len(),
+                last_activity_ts: last_ts,
+            },
         ));
     }
-    repos.sort_by_key(|r| std::cmp::Reverse(r.0));
-    let repos: Vec<Value> = repos.into_iter().map(|(_, v)| v).collect();
-    Ok(axum::Json(json!({ "repos": repos })))
+    rows.sort_by_key(|r| std::cmp::Reverse(r.0));
+    let repos = rows.into_iter().map(|(_, v)| v).collect();
+    Ok(axum::Json(trinity_wire::dto::RepoListResponse { repos }))
 }
 
 /// `DELETE /api/repos/{basename}` — unwatch a repo:
@@ -581,7 +593,7 @@ async fn api_repos_list(State(state): State<AppState>) -> Result<axum::Json<Valu
 async fn api_repos_delete(
     State(state): State<AppState>,
     Path(basename): Path<String>,
-) -> Result<axum::Json<Value>, AppError> {
+) -> Result<axum::Json<trinity_wire::dto::DeleteRepoOutcome>, AppError> {
     let basename_key = crate::lifecycle::RepoBasename::parse(&basename)
         .map_err(|e| AppError::bad_request(format!("invalid basename: {e}")))?;
     let canonical = {
@@ -627,49 +639,58 @@ async fn api_repos_delete(
         crate::runtime::RemoveOutcome::NotPresent => 0,
     };
 
-    Ok(axum::Json(json!({
-        "ok": registry_write_error.is_none(),
-        "basename": basename,
-        "removed_plan_count": plan_count,
-        "registry_write_error": registry_write_error,
-    })))
+    Ok(axum::Json(trinity_wire::dto::DeleteRepoOutcome {
+        ok: registry_write_error.is_none(),
+        basename,
+        plan_count,
+        registry_write_error,
+    }))
 }
 
-/// Shared diff_files → JSON converter used by `api_commit_diff` and
-/// `api_diff`. Returns a Vec<Value> so callers wrap it in their own
-/// envelope.
-fn serialize_diff_files(files: &[crate::diff_parser::FileDiff]) -> Vec<Value> {
+/// Convert daemon-side diff_parser output to wire-typed FileDiff.
+/// Used by `api_commit_diff` and `api_diff`.
+fn parsed_to_wire_diff_files(
+    files: &[crate::diff_parser::FileDiff],
+) -> Vec<trinity_wire::dto::FileDiff> {
+    use trinity_wire::dto::{DiffHunk, DiffLine, FileDiff, FileDiffMode};
+    use trinity_wire::vocab::DiffLineKind;
     files
         .iter()
-        .map(|f| {
-            json!({
-                "path": f.path,
-                "old_path": f.old_path,
-                "additions": f.additions,
-                "deletions": f.deletions,
-                "mode": match f.mode {
-                    crate::diff_parser::FileDiffMode::Added => "added",
-                    crate::diff_parser::FileDiffMode::Removed => "removed",
-                    crate::diff_parser::FileDiffMode::Renamed => "renamed",
-                    crate::diff_parser::FileDiffMode::Modified => "modified",
-                },
-                "binary": f.binary,
-                "always_folded": crate::diff_parser::is_always_folded(&f.path),
-                "hunks": f.hunks.iter().map(|h| json!({
-                    "header": h.header,
-                    "lines": h.lines.iter().map(|l| json!({
-                        "kind": match l.kind {
-                            crate::diff_parser::DiffLineKind::Insert => "insert",
-                            crate::diff_parser::DiffLineKind::Delete => "delete",
-                            crate::diff_parser::DiffLineKind::Context => "context",
-                            crate::diff_parser::DiffLineKind::Meta => "meta",
-                        },
-                        "old_lineno": l.old_lineno,
-                        "new_lineno": l.new_lineno,
-                        "content": l.content,
-                    })).collect::<Vec<_>>(),
-                })).collect::<Vec<_>>(),
-            })
+        .map(|f| FileDiff {
+            path: f.path.clone(),
+            old_path: f.old_path.clone(),
+            additions: f.additions,
+            deletions: f.deletions,
+            mode: match f.mode {
+                crate::diff_parser::FileDiffMode::Added => FileDiffMode::Added,
+                crate::diff_parser::FileDiffMode::Removed => FileDiffMode::Removed,
+                crate::diff_parser::FileDiffMode::Renamed => FileDiffMode::Renamed,
+                crate::diff_parser::FileDiffMode::Modified => FileDiffMode::Modified,
+            },
+            binary: f.binary,
+            always_folded: crate::diff_parser::is_always_folded(&f.path),
+            hunks: f
+                .hunks
+                .iter()
+                .map(|h| DiffHunk {
+                    header: h.header.clone(),
+                    lines: h
+                        .lines
+                        .iter()
+                        .map(|l| DiffLine {
+                            kind: match l.kind {
+                                crate::diff_parser::DiffLineKind::Insert => DiffLineKind::Insert,
+                                crate::diff_parser::DiffLineKind::Delete => DiffLineKind::Delete,
+                                crate::diff_parser::DiffLineKind::Context => DiffLineKind::Context,
+                                crate::diff_parser::DiffLineKind::Meta => DiffLineKind::Meta,
+                            },
+                            content: l.content.clone(),
+                            old_lineno: l.old_lineno,
+                            new_lineno: l.new_lineno,
+                        })
+                        .collect(),
+                })
+                .collect(),
         })
         .collect()
 }
