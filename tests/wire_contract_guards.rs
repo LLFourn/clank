@@ -179,16 +179,17 @@ const GUARD_A_ALLOWLIST: &[(&str, usize)] = &[
     // LiveEvent payload construction call sites. Drain in Phase 7.
     ("src/runtime.rs", 5),
     // Route handlers returning `axum::Json<Value>` + json! body
-    // construction. Drain to `axum::Json<T>` in Phase 5.
-    ("src/server/http.rs", 20),
+    // construction. Remaining: api_plan_revision, api_commit_diff,
+    // api_diff, api_repos_list/delete, SSE event_stream, diff
+    // file serializer. Drains in Phase 5b once the wire crate's
+    // FileDiff family is adjusted to match daemon emission.
+    ("src/server/http.rs", 17),
     // MCP protocol envelope (allowed exception) + tool-arg parsing
     // via Value. Phase 4 keeps the envelope, types the args.
     ("src/server/mcp.rs", 10),
     // Tool input-schema JSON. Allowed exception per plan §"Allowed
     // exceptions"; typed schema builder is out of scope.
     ("src/tools.rs", 5),
-    // Leptos /api/* response builders. Drain in Phase 5.
-    ("src/ui_response.rs", 19),
 ];
 
 #[test]

@@ -56,10 +56,11 @@ impl Posture {
 
 /// Working-tree state of a plan's plan file relative to HEAD's
 /// blob. Recomputed at read time — never stored on `Plan`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PlanWorktreeStatus {
     /// Working-tree body hash matches HEAD's blob hash.
+    #[default]
     Clean,
     /// File exists at the active path with a different body.
     BodyDirty,

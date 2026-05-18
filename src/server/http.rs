@@ -67,7 +67,7 @@ async fn serve_spa_shell(shell: Option<Arc<String>>, frontend_dist: PathBuf) -> 
 async fn api_wait_for_work(
     State(state): State<AppState>,
     axum::Json(args): axum::Json<WaitArgs>,
-) -> Result<axum::Json<Value>, AppError> {
+) -> Result<axum::Json<trinity_wire::dto::WaitForWorkResponse>, AppError> {
     let resp = wait_for_work(&state.runtime, args)
         .await
         .map_err(|e| match e {
@@ -84,9 +84,7 @@ async fn api_wait_for_work(
             | WaitError::PlanConflict { .. } => AppError::not_found(e.to_string()),
             WaitError::Io(err) => AppError::io(err),
         })?;
-    let v = serde_json::to_value(resp)
-        .map_err(|e| AppError::internal(format!("serialize wait response: {e}")))?;
-    Ok(axum::Json(v))
+    Ok(axum::Json(resp))
 }
 
 #[derive(Deserialize)]
@@ -273,7 +271,7 @@ async fn resolve_plan_id_segments(
 async fn api_plans(
     State(state): State<AppState>,
     Query(q): Query<RepoQuery>,
-) -> Result<axum::Json<Value>, AppError> {
+) -> Result<axum::Json<trinity_wire::dto::ListPlansResponse>, AppError> {
     let repos = repos_to_render(&state, q.repo).await?;
     let mut snapshots = Vec::with_capacity(repos.len());
     for repo in repos {
@@ -320,7 +318,7 @@ fn enforce_plan_visible(
 async fn api_plan_detail(
     State(state): State<AppState>,
     Path((repo_basename, stem_md)): Path<(String, String)>,
-) -> Result<axum::Json<Value>, AppError> {
+) -> Result<axum::Json<trinity_wire::dto::PlanDetailResponse>, AppError> {
     let (repo, plan_key) = resolve_plan_id_segments(&state, &repo_basename, &stem_md).await?;
     let snapshot = state
         .runtime

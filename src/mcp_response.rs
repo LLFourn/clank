@@ -119,6 +119,7 @@ fn build_plan_row(
         current_path: plan.plan_path.to_string_lossy().to_string(),
         phase: plan_phase,
         plan_worktree_status: worktree_status,
+        worktree_status,
         waiting_on: build_waiting_on(&w),
         archived_cycles: plan.archived_cycles.iter().map(build_archived).collect(),
         last_activity_ts: crate::projection::last_activity_ts_for(plan),

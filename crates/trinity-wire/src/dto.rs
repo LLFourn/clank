@@ -73,19 +73,31 @@ pub struct CommitGate {
     pub feedback: BTreeMap<String, Feedback>,
 }
 
-/// Per-commit row in `commits[]` on the rich plan-detail / context
-/// response. `gate` is `Some` for reviewable kinds (PlanOnly,
-/// CodeOnly, Mixed); `None` for non-reviewable kinds (MultiPlan,
-/// Finalize).
+/// Per-commit row on the MCP `commits[]` response. `gate` is `Some`
+/// for reviewable kinds (PlanOnly, CodeOnly, Mixed); `None` for
+/// non-reviewable kinds (MultiPlan, Finalize). `feedback` is the
+/// compact `{author, verdict}` summary form for agent consumers.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CommitRow {
     pub sha: String,
     pub kind: CommitKind,
     pub gate: Option<CommitGate>,
     /// Verdict-summary list per author for this commit. Subset of
-    /// `gate.feedback` projection; provided as a convenience for
-    /// MCP consumers that don't want the full body.
+    /// `gate.feedback` projection; the MCP `commits[]` consumer
+    /// (agents) only need author + verdict.
     pub feedback: Vec<FeedbackSummary>,
+}
+
+/// Per-commit row on the UI's `/api/plan/...` response. Same
+/// classification as `CommitRow`, but `feedback` carries full
+/// bodies (body_raw + body_html + path + created_at) so the SPA
+/// can render feedback cards without further round-trips.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CommitRowDetail {
+    pub sha: String,
+    pub kind: CommitKind,
+    pub gate: Option<CommitGate>,
+    pub feedback: Vec<Feedback>,
 }
 
 /// `{ author, verdict }` summary — the compact form on the MCP
@@ -296,6 +308,12 @@ pub struct PlanRow {
     pub current_path: String,
     pub phase: Posture,
     pub plan_worktree_status: PlanWorktreeStatus,
+    /// Legacy alias for `plan_worktree_status` — the UI's `/api/plans`
+    /// historically emitted this name; MCP `list_plans` emits the
+    /// `plan_` prefix. Both are populated with the same value through
+    /// Phase 6's frontend cutover. Phase 8 drops this field.
+    #[serde(default)]
+    pub worktree_status: PlanWorktreeStatus,
     pub waiting_on: WaitingOn,
     #[serde(default)]
     pub archived_cycles: Vec<ArchivedCycle>,
@@ -363,7 +381,7 @@ pub struct PlanDetailResponse {
     pub latest_implementation_revision: Option<CommitRef>,
     pub plan_revisions: Vec<String>,
     pub implementation_commits: Vec<String>,
-    pub commits: Vec<CommitRow>,
+    pub commits: Vec<CommitRowDetail>,
     pub latest_relevant_commit: Option<String>,
     /// Sanitized HTML of the plan body. For `lifecycle == Finished`
     /// this is the body at the freeze commit (captured by the

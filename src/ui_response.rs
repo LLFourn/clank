@@ -1,84 +1,73 @@
 //! UI-only response builders for the Leptos SPA's `/api/*` surface.
 //!
-//! These functions are deliberately separate from `mcp_response::*` — the
-//! web UI's shape is allowed to be richer than the MCP tool surface (it
-//! never costs an agent context-window tokens). The builders take a
-//! cloned `RepoState` directly (cloned under the runtime mutex by
-//! `Runtime::snapshot_repo` / `Runtime::snapshot_session`), so all disk
-//! I/O happens after the runtime mutex has been released.
+//! Each builder constructs a typed `trinity_wire` DTO from the
+//! daemon's internal state. HTTP route handlers in `server::http`
+//! return `axum::Json<TypedDto>` — no `json!` / `Value` in the
+//! response shape. UI-flavored DTOs (`CommitRowDetail`,
+//! `PlanDetailResponse`) carry richer per-feedback data than the
+//! MCP equivalents.
 //!
-//! Disk reads go through the `PlanStatusReader` trait so tests can drop
-//! in a fake.
+//! Disk reads go through the `PlanStatusReader` trait so tests can
+//! drop in a fake.
 
-use serde_json::{Value, json};
-
-#[cfg(test)]
-use crate::lifecycle::PlanKey;
 use crate::lifecycle::{AgentLabel, CommitSha};
 use crate::mcp_response::PlanStatusReader;
 use crate::projection::{
     all_implementation_commits, all_plan_revisions, current_posture, expected_action,
     impl_gate_for, plan_gate_for, waiting_on,
 };
-use crate::repo_state::{Feedback, Plan, PlanTouchKind, Posture, RepoState, Verdict, WaitingOn};
+use crate::repo_state::{Plan, RepoState};
 use crate::review_state::CommitGate;
+use trinity_wire::dto::{
+    ArchivedCycle, CommitRef, CommitRowDetail, Feedback, ListPlansResponse, PlanConflict,
+    PlanDetailResponse, PlanRow, PrHint, PrHintOption, ReviewGate, ReviewTarget, TimelineEvent,
+    WaitingOn,
+};
+use trinity_wire::vocab::{CommitKind, PlanTouchKind, Posture, ReviewTargetPhase, Verdict};
 
 /// `GET /api/plans` — `{ plans, conflicts }` for the home page.
-/// Public wrapper binds the production `DiskPlanStatusReader`.
-pub fn plans_index(snapshot: &RepoState) -> std::io::Result<Value> {
+pub fn plans_index(snapshot: &RepoState) -> std::io::Result<ListPlansResponse> {
     plans_index_with_reader(snapshot, &crate::mcp_response::DiskPlanStatusReader)
 }
 
 pub fn plans_index_with_reader(
     snapshot: &RepoState,
     status_reader: &impl PlanStatusReader,
-) -> std::io::Result<Value> {
-    let (plans_typed, conflicts) = plans_index_parts(snapshot, status_reader)?;
-    let plans: Vec<Value> = plans_typed.into_iter().map(|(_, v)| v).collect();
-    Ok(json!({ "plans": plans, "conflicts": conflicts }))
+) -> std::io::Result<ListPlansResponse> {
+    let (plans, conflicts) = plans_index_parts(snapshot, status_reader)?;
+    Ok(ListPlansResponse { plans, conflicts })
 }
 
-/// Aggregated `{ plans, conflicts }` across multiple snapshots, sorted
-/// by `last_activity_ts` desc. The typed `(i64, Value)` pairs survive
-/// the merge so the sort key never gets serialized-and-re-extracted via
-/// the JSON shape — a regression on the timestamp field type would be
-/// a compile error here, not a silent sort degrade.
-pub fn plans_index_across(snapshots: &[RepoState]) -> std::io::Result<Value> {
+/// Aggregated `{ plans, conflicts }` across multiple snapshots,
+/// sorted by `last_activity_ts` desc.
+pub fn plans_index_across(snapshots: &[RepoState]) -> std::io::Result<ListPlansResponse> {
     plans_index_across_with_reader(snapshots, &crate::mcp_response::DiskPlanStatusReader)
 }
 
 pub fn plans_index_across_with_reader(
     snapshots: &[RepoState],
     status_reader: &impl PlanStatusReader,
-) -> std::io::Result<Value> {
-    let mut all_plans: Vec<IndexedPlanRow> = Vec::new();
-    let mut all_conflicts: Vec<Value> = Vec::new();
+) -> std::io::Result<ListPlansResponse> {
+    let mut all_plans: Vec<PlanRow> = Vec::new();
+    let mut all_conflicts: Vec<PlanConflict> = Vec::new();
     for snapshot in snapshots {
-        let (plans_typed, conflicts) = plans_index_parts(snapshot, status_reader)?;
-        all_plans.extend(plans_typed);
+        let (plans, conflicts) = plans_index_parts(snapshot, status_reader)?;
+        all_plans.extend(plans);
         all_conflicts.extend(conflicts);
     }
-    all_plans.sort_by_key(|p| std::cmp::Reverse(p.0));
-    let plans: Vec<Value> = all_plans.into_iter().map(|(_, v)| v).collect();
-    Ok(json!({ "plans": plans, "conflicts": all_conflicts }))
+    all_plans.sort_by_key(|p| std::cmp::Reverse(p.last_activity_ts));
+    Ok(ListPlansResponse {
+        plans: all_plans,
+        conflicts: all_conflicts,
+    })
 }
 
-/// One row from `plans_index_parts`: the `i64` is the
-/// `last_activity_ts` sort key (kept alongside the JSON row so the
-/// cross-repo merge sorts on the typed value rather than re-extracting
-/// it from the serialized shape).
-type IndexedPlanRow = (i64, Value);
-
-/// Build the per-snapshot pieces with the i64 sort key still attached
-/// to each plan row. Used by both the single-repo `plans_index` and the
-/// cross-repo `plans_index_across` so they share one source of truth
-/// for the sort key + JSON shape.
 fn plans_index_parts(
     snapshot: &RepoState,
     status_reader: &impl PlanStatusReader,
-) -> std::io::Result<(Vec<IndexedPlanRow>, Vec<Value>)> {
+) -> std::io::Result<(Vec<PlanRow>, Vec<PlanConflict>)> {
     let basename = crate::lifecycle::RepoBasename::from_repo_root(&snapshot.root);
-    let mut plans: Vec<IndexedPlanRow> = Vec::with_capacity(snapshot.plans.len());
+    let mut plans: Vec<PlanRow> = Vec::with_capacity(snapshot.plans.len());
     for plan in snapshot.plans.values() {
         let worktree_status =
             status_reader.compute(&snapshot.root, &plan.plan_path, &plan.body_hash)?;
@@ -91,37 +80,38 @@ fn plans_index_parts(
         let plan_id = basename
             .as_ref()
             .map(|b| crate::lifecycle::PlanId::new(b.clone(), plan.id.clone()).to_string());
-        let last_activity_ts = crate::projection::last_activity_ts_for(plan);
         let lifecycle = plan.lifecycle();
-        plans.push((
-            last_activity_ts,
-            json!({
-                "repo": snapshot.root.to_string_lossy(),
-                "plan_id": plan_id,
-                "slug": plan.id.as_str(),
-                "state": lifecycle.as_str(),
-                "lifecycle": lifecycle.as_str(),
-                "current_path": plan.plan_path.to_string_lossy(),
-                "phase": plan_phase.as_str(),
-                "worktree_status": worktree_status.as_str(),
-                "waiting_on": waiting_on_value(&w),
-                "last_activity_ts": last_activity_ts,
-            }),
-        ));
+        plans.push(PlanRow {
+            repo: snapshot.root.to_string_lossy().to_string(),
+            plan_id,
+            slug: plan.id.as_str().to_string(),
+            state: lifecycle,
+            lifecycle,
+            current_path: plan.plan_path.to_string_lossy().to_string(),
+            phase: plan_phase,
+            plan_worktree_status: worktree_status,
+            worktree_status,
+            waiting_on: build_waiting_on(&w),
+            archived_cycles: plan.archived_cycles.iter().map(build_archived).collect(),
+            last_activity_ts: crate::projection::last_activity_ts_for(plan),
+        });
     }
-    plans.sort_by_key(|p| std::cmp::Reverse(p.0));
-    let conflicts: Vec<Value> = snapshot
+    plans.sort_by_key(|p| std::cmp::Reverse(p.last_activity_ts));
+    let conflicts: Vec<PlanConflict> = snapshot
         .plan_conflicts
         .iter()
         .map(|(key, paths)| {
             let plan_id = basename
                 .as_ref()
                 .map(|b| crate::lifecycle::PlanId::new(b.clone(), key.clone()).to_string());
-            json!({
-                "plan_id": plan_id,
-                "slug": key.as_str(),
-                "paths": paths.iter().map(|p| p.to_string_lossy()).collect::<Vec<_>>(),
-            })
+            PlanConflict {
+                plan_id,
+                slug: key.as_str().to_string(),
+                paths: paths
+                    .iter()
+                    .map(|p| p.to_string_lossy().to_string())
+                    .collect(),
+            }
         })
         .collect();
     Ok((plans, conflicts))
@@ -130,15 +120,14 @@ fn plans_index_parts(
 /// `GET /api/plan/{repo}/{stem_md}` — rich plan detail. Returns
 /// `Ok(None)` when the plan is hidden (active + plan file missing
 /// from the working tree); the HTTP handler maps that to a 404.
-/// Public wrapper binds the production `DiskPlanStatusReader`.
-pub fn plan_page(bundle: &RepoState) -> std::io::Result<Option<Value>> {
+pub fn plan_page(bundle: &RepoState) -> std::io::Result<Option<PlanDetailResponse>> {
     plan_page_with_reader(bundle, &crate::mcp_response::DiskPlanStatusReader)
 }
 
 pub fn plan_page_with_reader(
     bundle: &RepoState,
     status_reader: &impl PlanStatusReader,
-) -> std::io::Result<Option<Value>> {
+) -> std::io::Result<Option<PlanDetailResponse>> {
     let plan = bundle
         .plans
         .values()
@@ -154,6 +143,7 @@ pub fn plan_page_with_reader(
     let impl_gate = impl_gate_for(plan, bundle);
     let gate = crate::projection::latest_reviewable_commit_gate_for(plan);
     let w = waiting_on(plan.is_frozen(), worktree_status, gate);
+    let review_target_phase = posture_to_review_target_phase(plan_phase);
 
     let plan_revisions: Vec<String> = all_plan_revisions(plan, bundle)
         .into_iter()
@@ -164,30 +154,21 @@ pub fn plan_page_with_reader(
         .map(|s| s.as_str().to_string())
         .collect();
 
-    // Single review target: the latest reviewable commit. Same SHA
-    // the gate is computed on, so the wire shape can't drift from
-    // gate state. Posture-tagged "plan"/"impl" for back-compat.
     let review_target_sha = crate::projection::latest_reviewable_commit_for(plan);
-    let review_target_phase = if matches!(plan_phase, Posture::Implementing) {
-        "impl"
-    } else {
-        "plan"
-    };
-    let review_target = review_target_sha
-        .as_ref()
-        .map(|sha| json!({ "phase": review_target_phase, "commit_sha": sha.as_str() }));
-    let latest_plan_revision = plan_revisions
-        .last()
-        .map(|sha| json!({ "commit_sha": sha }))
-        .unwrap_or(Value::Null);
-    let latest_implementation_revision = implementation_commits
-        .last()
-        .map(|sha| json!({ "commit_sha": sha }))
-        .unwrap_or(Value::Null);
+    let review_target = review_target_sha.as_ref().map(|sha| ReviewTarget {
+        commit_sha: sha.as_str().to_string(),
+        phase: review_target_phase,
+    });
+    let latest_plan_revision = plan_revisions.last().map(|sha| CommitRef {
+        commit_sha: sha.clone(),
+    });
+    let latest_implementation_revision = implementation_commits.last().map(|sha| CommitRef {
+        commit_sha: sha.clone(),
+    });
 
-    let timeline = timeline_value(plan);
+    let timeline = build_timeline(plan);
     let pr_hint = if matches!(plan_phase, Posture::Implementing) {
-        Some(pr_hint_value(plan, &implementation_commits))
+        Some(build_pr_hint(plan, &implementation_commits))
     } else {
         None
     };
@@ -203,53 +184,69 @@ pub fn plan_page_with_reader(
     // widths.
     let plan_body_truncated = plan.body.chars().count() > 4000;
 
-    // Commit-keyed wire shape — SPA reads feedback off here.
-    let commits_value = commits_array_rich(plan);
+    let commits = build_commits_array_rich(plan);
     let latest_relevant_commit =
         crate::projection::latest_reviewable_commit_for(plan).map(|s| s.as_str().to_string());
 
     let lifecycle = plan.lifecycle();
-    let archived_cycles: Vec<Value> = plan
-        .archived_cycles
-        .iter()
-        .map(|c| {
-            json!({
-                "closer": c.closer.as_str(),
-                "approver_count": c.approver_count,
-            })
-        })
-        .collect();
-    Ok(Some(json!({
-        "repo": bundle.root.to_string_lossy(),
-        "plan_id": plan_id,
-        "slug": plan.id.as_str(),
-        "state": lifecycle.as_str(),
-        "lifecycle": lifecycle.as_str(),
-        "current_path": plan.plan_path.to_string_lossy(),
-        "phase": plan_phase.as_str(),
-        "plan_worktree_status": worktree_status.as_str(),
-        "waiting_on": waiting_on_value(&w),
-        "expected_action": expected_action(w.reason),
-        "review_target": review_target,
-        "review_gate": gate_value(plan_gate, impl_gate, plan_phase),
-        "latest_plan_revision": latest_plan_revision,
-        "latest_implementation_revision": latest_implementation_revision,
-        "plan_revisions": plan_revisions,
-        "implementation_commits": implementation_commits,
-        "commits": commits_value,
-        "latest_relevant_commit": latest_relevant_commit,
-        "plan_body_html": plan_body_html,
-        "plan_body_truncated": plan_body_truncated,
-        "timeline": timeline,
-        "pr_hint": pr_hint,
-        "archived_cycles": archived_cycles,
-    })))
+    let archived_cycles = plan.archived_cycles.iter().map(build_archived).collect();
+
+    Ok(Some(PlanDetailResponse {
+        repo: bundle.root.to_string_lossy().to_string(),
+        plan_id,
+        slug: plan.id.as_str().to_string(),
+        state: lifecycle,
+        lifecycle,
+        current_path: plan.plan_path.to_string_lossy().to_string(),
+        phase: plan_phase,
+        plan_worktree_status: worktree_status,
+        waiting_on: build_waiting_on(&w),
+        expected_action: expected_action(w.reason),
+        review_target,
+        review_gate: build_review_gate(plan_gate, impl_gate, plan_phase),
+        latest_plan_revision,
+        latest_implementation_revision,
+        plan_revisions,
+        implementation_commits,
+        commits,
+        latest_relevant_commit,
+        plan_body_html,
+        plan_body_truncated,
+        timeline,
+        pr_hint,
+        archived_cycles,
+    }))
 }
 
-/// UI-flavored per-commit `commits[]` array. Like the MCP version
-/// but carries body + html + path on each feedback entry so the SPA
-/// can render cards without further round-trips.
-fn commits_array_rich(plan: &Plan) -> Vec<Value> {
+// ============================================================
+// Composing helpers
+// ============================================================
+
+fn build_waiting_on(w: &crate::repo_state::WaitingOn) -> WaitingOn {
+    WaitingOn {
+        role: w.role,
+        reason: w.reason,
+        agents: w.agents.iter().map(|a| a.as_str().to_string()).collect(),
+        description: w.description.clone(),
+    }
+}
+
+fn build_archived(c: &crate::repo_state::ArchivedCycleSummary) -> ArchivedCycle {
+    ArchivedCycle {
+        closer: c.closer.as_str().to_string(),
+        approver_count: c.approver_count,
+    }
+}
+
+fn posture_to_review_target_phase(p: Posture) -> ReviewTargetPhase {
+    match p {
+        Posture::Planning => ReviewTargetPhase::Plan,
+        Posture::Implementing => ReviewTargetPhase::Impl,
+    }
+}
+
+/// Per-commit `commits[]` array (UI flavor, full feedback bodies).
+fn build_commits_array_rich(plan: &Plan) -> Vec<CommitRowDetail> {
     let mut out = Vec::new();
     for event in &plan.timeline {
         if !event.kind.is_reviewable() {
@@ -258,39 +255,197 @@ fn commits_array_rich(plan: &Plan) -> Vec<Value> {
         let Some(gate) = event.gate.as_ref() else {
             continue;
         };
-        let feedback_array: Vec<Value> = gate
+        let feedback: Vec<Feedback> = gate
             .feedback
             .iter()
-            .map(|(author, fb)| {
-                json!({
-                    "author": author.as_str(),
-                    "verdict": fb.verdict.as_str(),
-                    "body_raw": fb.body,
-                    "body_html": render_feedback_body(&fb.body, fb.verdict),
-                    "path": fb.path.to_string_lossy(),
-                    "created_at": fb.created_at,
-                })
-            })
+            .map(|(author, fb)| build_rich_feedback(author, fb))
             .collect();
-        out.push(json!({
-            "sha": event.sha.as_str(),
-            "kind": event.kind.as_str(),
-            "gate": {
-                "state": gate.state.as_str(),
-                "participants": gate.participants.iter().map(|a| a.as_str()).collect::<Vec<_>>(),
-                "approvers": gate.approvers.iter().map(|a| a.as_str()).collect::<Vec<_>>(),
-                "requesters": gate.requesters.iter().map(|a| a.as_str()).collect::<Vec<_>>(),
-                "ambiguous": gate.ambiguous.iter().map(|a| a.as_str()).collect::<Vec<_>>(),
-                "missing": gate.missing.iter().map(|a| a.as_str()).collect::<Vec<_>>(),
-            },
-            "feedback": feedback_array,
-        }));
+        out.push(CommitRowDetail {
+            sha: event.sha.as_str().to_string(),
+            kind: event.kind,
+            gate: Some(build_commit_gate(gate)),
+            feedback,
+        });
     }
     out
 }
 
-/// Strip the verdict marker line and render the rest of the body as
-/// sanitized HTML.
+fn build_commit_gate(g: &CommitGate) -> trinity_wire::dto::CommitGate {
+    trinity_wire::dto::CommitGate {
+        state: g.state,
+        participants: g
+            .participants
+            .iter()
+            .map(|a| a.as_str().to_string())
+            .collect(),
+        approvers: g.approvers.iter().map(|a| a.as_str().to_string()).collect(),
+        requesters: g
+            .requesters
+            .iter()
+            .map(|a| a.as_str().to_string())
+            .collect(),
+        ambiguous: g.ambiguous.iter().map(|a| a.as_str().to_string()).collect(),
+        missing: g.missing.iter().map(|a| a.as_str().to_string()).collect(),
+        feedback: g
+            .feedback
+            .iter()
+            .map(|(author, fb)| (author.as_str().to_string(), build_rich_feedback(author, fb)))
+            .collect(),
+    }
+}
+
+fn build_rich_feedback(author: &AgentLabel, fb: &crate::repo_state::Feedback) -> Feedback {
+    Feedback {
+        author: author.as_str().to_string(),
+        verdict: fb.verdict,
+        body_raw: fb.body.clone(),
+        body_html: render_feedback_body(&fb.body, fb.verdict),
+        path: fb.path.to_string_lossy().to_string(),
+        created_at: fb.created_at,
+    }
+}
+
+fn build_timeline(session: &Plan) -> Vec<TimelineEvent> {
+    let mut out = Vec::with_capacity(session.timeline.len() * 2);
+    for event in &session.timeline {
+        let sha = event.sha.as_str().to_string();
+        let subject = event.subject.clone();
+        let plan_touch = if event.sha == session.plan_intro {
+            PlanTouchKind::Intro
+        } else {
+            PlanTouchKind::Revision
+        };
+        let row = match event.kind {
+            CommitKind::PlanOnly => TimelineEvent::CommitPlan {
+                sha: sha.clone(),
+                subject,
+                plan_touch,
+            },
+            CommitKind::CodeOnly => TimelineEvent::CommitImpl {
+                sha: sha.clone(),
+                subject,
+            },
+            CommitKind::Mixed => TimelineEvent::CommitMixed {
+                sha: sha.clone(),
+                subject,
+                plan_touch,
+            },
+            CommitKind::MultiPlan => TimelineEvent::CommitMultiPlan {
+                sha: sha.clone(),
+                subject,
+                plan_touch,
+            },
+            CommitKind::Finalize => TimelineEvent::CommitFinalize {
+                sha: sha.clone(),
+                subject,
+            },
+            CommitKind::Unattributed => continue,
+        };
+        out.push(row);
+        if let Some(gate) = event.gate.as_ref() {
+            // Reviews can only be attached to reviewable events; the
+            // match below makes a future non-reviewable-with-gate
+            // combination a compile error.
+            let phase = match event.kind {
+                CommitKind::PlanOnly | CommitKind::Mixed => ReviewTargetPhase::Plan,
+                CommitKind::CodeOnly => ReviewTargetPhase::Impl,
+                CommitKind::MultiPlan | CommitKind::Finalize | CommitKind::Unattributed => {
+                    debug_assert!(
+                        false,
+                        "non-reviewable kind carries a gate: {:?}",
+                        event.kind
+                    );
+                    continue;
+                }
+            };
+            for (author, fb) in &gate.feedback {
+                out.push(TimelineEvent::Review {
+                    target: sha.clone(),
+                    author: author.as_str().to_string(),
+                    verdict: fb.verdict,
+                    phase,
+                    created_at: fb.created_at,
+                });
+            }
+        }
+    }
+    out
+}
+
+fn build_pr_hint(session: &Plan, impl_commits: &[String]) -> PrHint {
+    let plan_intro = session.plan_intro.as_str().to_string();
+    let plan_intro_parent = session
+        .plan_intro_parent
+        .as_ref()
+        .map(|s| s.as_str().to_string());
+    let base_for_squash = plan_intro_parent
+        .clone()
+        .unwrap_or_else(|| plan_intro.clone());
+    let plan_path = session.plan_path.to_string_lossy().to_string();
+    let suggested = format!("Implement {}", session.id.as_str());
+    let options = vec![
+        PrHintOption {
+            name: "keep_plan_in_pr".to_string(),
+            base: base_for_squash.clone(),
+            command: format!("git reset --soft {base_for_squash} && git commit -m '{suggested}'"),
+        },
+        PrHintOption {
+            name: "exclude_plan_from_pr".to_string(),
+            base: base_for_squash.clone(),
+            command: format!(
+                "git reset --soft {base_for_squash} && git rm {plan_path} && git commit -m '{suggested}'"
+            ),
+        },
+    ];
+    PrHint {
+        plan_intro,
+        plan_intro_parent,
+        implementation_commits: impl_commits.to_vec(),
+        options,
+        suggested_message: suggested,
+    }
+}
+
+fn build_review_gate(
+    plan_gate: Option<&CommitGate>,
+    impl_gate: Option<&CommitGate>,
+    session_phase: Posture,
+) -> Option<ReviewGate> {
+    let phase = posture_to_review_target_phase(session_phase);
+    let gate = match session_phase {
+        Posture::Planning => plan_gate,
+        Posture::Implementing => impl_gate,
+    }?;
+    Some(ReviewGate {
+        state: crate::mcp_response::legacy_gate_state_wire(gate.state).to_string(),
+        phase,
+        participants: gate
+            .participants
+            .iter()
+            .map(|a| a.as_str().to_string())
+            .collect(),
+        approvals: gate
+            .approvers
+            .iter()
+            .map(|a| a.as_str().to_string())
+            .collect(),
+        request_changes: gate
+            .requesters
+            .iter()
+            .map(|a| a.as_str().to_string())
+            .collect(),
+        missing_approvals: gate
+            .missing
+            .iter()
+            .map(|a| a.as_str().to_string())
+            .collect(),
+    })
+}
+
+// ============================================================
+// Markdown / feedback rendering
+// ============================================================
+
 fn render_feedback_body(body: &str, verdict: Verdict) -> String {
     let stripped = match verdict {
         Verdict::Approve | Verdict::RequestChanges => strip_marker_line(body),
@@ -352,148 +507,12 @@ pub fn render_markdown(input: &str) -> String {
         .to_string()
 }
 
-fn pr_hint_value(session: &Plan, impl_commits: &[String]) -> Value {
-    let plan_intro = session.plan_intro.as_str();
-    let plan_intro_parent = session.plan_intro_parent.as_ref().map(|s| s.as_str());
-    let base_for_squash = plan_intro_parent.unwrap_or(plan_intro);
-    let plan_path = session.plan_path.to_string_lossy().to_string();
-    let suggested = format!("Implement {}", session.id.as_str());
-    let options = vec![
-        json!({
-            "name": "keep_plan_in_pr",
-            "base": base_for_squash,
-            "command": format!(
-                "git reset --soft {base} && git commit -m '{msg}'",
-                base = base_for_squash,
-                msg = suggested
-            ),
-        }),
-        json!({
-            "name": "exclude_plan_from_pr",
-            "base": base_for_squash,
-            "command": format!(
-                "git reset --soft {base} && git rm {plan} && git commit -m '{msg}'",
-                base = base_for_squash,
-                plan = plan_path,
-                msg = suggested
-            ),
-        }),
-    ];
-    json!({
-        "plan_intro": plan_intro,
-        "plan_intro_parent": plan_intro_parent,
-        "implementation_commits": impl_commits,
-        "options": options,
-        "suggested_message": suggested,
-    })
-}
-
-fn waiting_on_value(w: &WaitingOn) -> Value {
-    json!({
-        "role": w.role.as_str(),
-        "reason": w.reason.as_str(),
-        "agents": w.agents.iter().map(|a| a.as_str()).collect::<Vec<_>>(),
-        "description": w.description,
-    })
-}
-
-fn gate_value(
-    plan_gate: Option<&CommitGate>,
-    impl_gate: Option<&CommitGate>,
-    session_phase: Posture,
-) -> Value {
-    let gate = match session_phase {
-        Posture::Planning => plan_gate,
-        Posture::Implementing => impl_gate,
-    };
-    let phase_str = match session_phase {
-        Posture::Planning => "plan",
-        Posture::Implementing => "impl",
-    };
-    match gate {
-        Some(g) => json!({
-            "state": crate::mcp_response::legacy_gate_state_wire(g.state),
-            "phase": phase_str,
-            "participants": g.participants.iter().map(|a| a.as_str()).collect::<Vec<_>>(),
-            "approvals": g.approvers.iter().map(|a| a.as_str()).collect::<Vec<_>>(),
-            "request_changes": g.requesters.iter().map(|a| a.as_str()).collect::<Vec<_>>(),
-            "missing_approvals": g.missing.iter().map(|a| a.as_str()).collect::<Vec<_>>(),
-        }),
-        None => Value::Null,
-    }
-}
-
-fn timeline_value(session: &Plan) -> Vec<Value> {
-    use crate::repo_state::CommitKind;
-    let mut out = Vec::with_capacity(session.timeline.len() * 2);
-    for event in &session.timeline {
-        let wire_kind = match event.kind {
-            CommitKind::PlanOnly | CommitKind::MultiPlan => "commit_plan",
-            CommitKind::CodeOnly => "commit_impl",
-            CommitKind::Mixed => "commit_mixed",
-            CommitKind::Finalize => "commit_finalize",
-            CommitKind::Unattributed => continue,
-        };
-        let touched = matches!(
-            event.kind,
-            CommitKind::PlanOnly | CommitKind::Mixed | CommitKind::MultiPlan
-        );
-        let has_code_changes = matches!(event.kind, CommitKind::CodeOnly | CommitKind::Mixed);
-        let plan_touch = if touched {
-            if event.sha == session.plan_intro {
-                Some(PlanTouchKind::Intro)
-            } else {
-                Some(PlanTouchKind::Revision)
-            }
-        } else {
-            None
-        };
-        out.push(json!({
-            "kind": wire_kind,
-            "sha": event.sha.as_str(),
-            "plan_touch": plan_touch.as_ref().map(|k| k.as_str()),
-            "has_code_changes": has_code_changes,
-            "subject": event.subject,
-        }));
-        // Reviews can only be attached to reviewable events (gate is
-        // Some). Encode that invariant in the match so a future kind
-        // (e.g. an `Abandoned` lifecycle marker) is forced to declare
-        // its review-tag intent rather than silently inheriting
-        // "impl".
-        if let Some(gate) = event.gate.as_ref() {
-            let phase_tag = match event.kind {
-                CommitKind::PlanOnly | CommitKind::Mixed => "plan",
-                CommitKind::CodeOnly => "impl",
-                CommitKind::MultiPlan | CommitKind::Finalize | CommitKind::Unattributed => {
-                    debug_assert!(
-                        false,
-                        "non-reviewable kind carries a gate: {:?}",
-                        event.kind
-                    );
-                    continue;
-                }
-            };
-            for (author, fb) in &gate.feedback {
-                out.push(json!({
-                    "kind": "review",
-                    "phase": phase_tag,
-                    "target": event.sha.as_str(),
-                    "author": author.as_str(),
-                    "verdict": fb.verdict.as_str(),
-                    "created_at": fb.created_at,
-                }));
-            }
-        }
-    }
-    out
-}
-
 /// Look up feedback entries (rich form) targeting `sha`. Reads from
 /// the targeted `PlanTimelineEvent`'s gate. Used by the
-/// `/api/sessions/:id/plan/:sha` and `/api/sessions/:id/commit/:sha`
+/// `/api/plan/.../revision/{sha}` and `/api/plan/.../commit/{sha}`
 /// route handlers. Returns empty if the SHA isn't on this plan's
 /// timeline or the event is non-reviewable (no gate).
-pub fn feedback_for_target(session: &Plan, sha: &CommitSha) -> Vec<Value> {
+pub fn feedback_for_target(session: &Plan, sha: &CommitSha) -> Vec<Feedback> {
     let Some(event) = session.event_for(sha) else {
         return Vec::new();
     };
@@ -502,27 +521,16 @@ pub fn feedback_for_target(session: &Plan, sha: &CommitSha) -> Vec<Value> {
     };
     gate.feedback
         .iter()
-        .map(|(author, fb)| feedback_entry(author, fb))
+        .map(|(author, fb)| build_rich_feedback(author, fb))
         .collect()
-}
-
-fn feedback_entry(author: &AgentLabel, fb: &Feedback) -> Value {
-    json!({
-        "author": author.as_str(),
-        "verdict": fb.verdict.as_str(),
-        "body_raw": fb.body,
-        "body_html": render_feedback_body(&fb.body, fb.verdict),
-        "path": fb.path.to_string_lossy(),
-        "created_at": fb.created_at,
-    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::lifecycle::content_hash;
-    use crate::repo_state::PlanWorktreeStatus;
+    use crate::lifecycle::{PlanKey, content_hash};
     use std::path::Path;
+    use trinity_wire::vocab::PlanWorktreeStatus;
 
     fn empty_snapshot() -> RepoState {
         RepoState::empty(std::path::PathBuf::from("/r"))
@@ -544,10 +552,10 @@ mod tests {
     #[test]
     fn plans_index_empty_snapshot_returns_empty_arrays() {
         let snap = empty_snapshot();
-        let v =
+        let resp =
             plans_index_with_reader(&snap, &StaticStatusReader(PlanWorktreeStatus::Clean)).unwrap();
-        assert_eq!(v["plans"], Value::Array(Vec::new()));
-        assert_eq!(v["conflicts"], Value::Array(Vec::new()));
+        assert!(resp.plans.is_empty());
+        assert!(resp.conflicts.is_empty());
     }
 
     #[test]
@@ -571,9 +579,6 @@ mod tests {
 
     #[test]
     fn strip_marker_line_consumes_trailing_whitespace() {
-        // parse_verdict trims each line; strip_marker_line must agree, or
-        // 4+ trailing spaces flip the body into an indented code block at
-        // render time.
         assert_eq!(strip_marker_line("APPROVE   \n\nrest"), "rest");
         assert_eq!(strip_marker_line("REQUEST_CHANGES\t  \n\nrest"), "rest");
     }
@@ -609,15 +614,8 @@ mod tests {
             timeline: Vec::new(),
             archived_cycles: Vec::new(),
         };
-        let v = pr_hint_value(&session, &[]);
-        assert_eq!(v["plan_intro_parent"], "ca11");
-        // Both options use the parent as the squash base.
-        let cmds: Vec<&str> = v["options"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|o| o["command"].as_str().unwrap())
-            .collect();
-        assert!(cmds.iter().all(|c| c.contains("ca11")));
+        let hint = build_pr_hint(&session, &[]);
+        assert_eq!(hint.plan_intro_parent.as_deref(), Some("ca11"));
+        assert!(hint.options.iter().all(|o| o.command.contains("ca11")));
     }
 }
