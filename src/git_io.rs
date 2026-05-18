@@ -146,6 +146,48 @@ pub async fn show_blob(
     run_ok_raw(repo, &["show", &spec]).await
 }
 
+/// List `(filename, content)` pairs under `.trinity/finished/<stem>/`
+/// in the tree at `rev`. Returned in lexicographic filename order.
+/// Empty when the directory doesn't exist at that rev. Used to surface
+/// the approval snapshot a finalize commit sealed.
+pub async fn read_finalize_snapshot(
+    repo: &Path,
+    rev: &CommitSha,
+    stem: &str,
+) -> Result<Vec<(String, String)>, GitIoError> {
+    let dir = format!(".trinity/finished/{stem}/");
+    let output = run(repo, &["ls-tree", "-r", "--", rev.as_str(), &dir]).await?;
+    if !output.status.success() {
+        return Ok(Vec::new());
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut paths: Vec<PathBuf> = Vec::new();
+    for line in stdout.lines() {
+        let (head_part, path) = match line.split_once('\t') {
+            Some(p) => p,
+            None => continue,
+        };
+        let mut tokens = head_part.split_ascii_whitespace();
+        let _mode = tokens.next();
+        let kind = tokens.next();
+        if kind != Some("blob") {
+            continue;
+        }
+        paths.push(PathBuf::from(path));
+    }
+    paths.sort();
+    let mut out = Vec::with_capacity(paths.len());
+    for path in paths {
+        let body = show_blob(repo, rev, &path).await?;
+        let filename = path
+            .file_name()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_default();
+        out.push((filename, body));
+    }
+    Ok(out)
+}
+
 /// `git show <sha>` — return the full commit patch (header + diff) as text.
 /// Used by the commit-diff route to render impl commits.
 /// Patch text from `git diff <from>:<from_path> <to>:<to_path>` (unified

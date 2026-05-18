@@ -174,20 +174,23 @@ re-examine the work) — they cannot rescind the freeze.
 
 ### Finished plan
 
-A plan is **finished** iff the event-log fold's per-plan
-`frozen_at: Option<CommitSha>` is `Some(_)` at HEAD. The fold sets
-`frozen_at` on the first commit in chronological order whose tree
-satisfies the finalize rule:
+A plan is **finished** iff its `timeline` contains a
+`CommitKind::Finalize` event. `Plan::frozen_at()` reverse-scans the
+timeline for that event; `Plan::is_frozen()` is sugar for
+`frozen_at().is_some()`. The fold appends the Finalize event on
+the first commit in chronological order whose tree satisfies the
+finalize rule:
 
 1. `.trinity/plans/<stem>.md` exists in that commit's tree, and
 2. `.trinity/finished/<stem>/` in that commit's tree contains at
    least one file AND every file in that directory has its first
    line starting with `APPROVE`.
 
-Once `frozen_at` is set, the fold treats the plan as sealed for
-every subsequent commit: no new attribution, no new plan_touches
-entries under this plan's key, no new gate entries, no lifecycle
-change. The plan stays `finished` even if later commits remove
+Once the Finalize event is appended, the fold treats the plan as
+sealed for every subsequent commit: no new timeline events are
+appended (step 5 short-circuits on `is_frozen`), no live feedback
+synthesizes a gate (`upsert_feedback` refuses non-reviewable
+events). The plan stays `finished` even if later commits remove
 files from `.trinity/finished/<stem>/`, modify the plan file, add
 code under `Implements: <stem>`, or write new working-tree
 feedback. The projection is monotone: finished is a one-way state
@@ -519,65 +522,70 @@ commit makes a plan finished — that requires the finalize-snapshot
 parser. Splitting them creates a Phase 2 that can't be implemented
 or tested in isolation.
 
-The current `derive_state` is mostly a bulk-pass: it computes plans,
-attribution, plan_touches, feedback maps separately, then per-plan
-runs `build_commit_gates` to walk commits with carry-along state.
-
-The new shape is a single chronological commit fold:
+The shape is a single chronological commit fold. The fold's only
+public entry point is `apply_commit(state, carry, event)`;
+`derive_state` is just a loop. The per-plan reduction is the
+`Plan::timeline: Vec<PlanTimelineEvent>` field — a chronological log
+of events the plan has accumulated. There are NO global per-commit
+maps (`commit_order`, `attribution`, `plan_touches`, `commit_meta`)
+and no separate per-plan buckets (`plan_revisions`,
+`implementation_commits`, `commits`); all projection queries are
+filters or reverse-scans over `timeline`.
 
 ```text
 fn derive_state(snapshot) -> RepoState:
     state = empty
-    feedback_by_target = index_feedback_by_target_sha(snapshot.feedback_files)
-    finalize_by_plan_per_commit = index_finalize_files(snapshot.finalize_files)
-    state.plans = init plans from snapshot.plan_files
-
-    for entry in snapshot.history (chronological order):
-        apply_commit(state, entry)
-        for plan_key in plans potentially affected by entry's tree:
-            if finalize_rule_now_satisfied(state, plan_key, entry):
-                mark plan frozen (state.plans[plan_key].frozen_at = Some(entry.commit))
-        for fb in feedback_by_target.get(entry.commit) (ingest in
-        deterministic order, e.g. sorted by author label):
-            if state.plans[fb.plan_key].frozen_at.is_some(): skip
-            else: apply_feedback(state, fb)
+    carry = FoldCarry::new(snapshot.feedback_files)
+    for event in snapshot.history (chronological order):
+        apply_commit(state, carry, event)
     return state
+
+fn apply_commit(state, carry, event):
+    1. Walk-back attribution (filtered against frozen plans).
+    2. Apply plan_touches: tree state + Plan create/delete.
+    3. Apply finalize_changes to the running finalize tree.
+    4. Freeze rule: for any plan that now satisfies the rule,
+       append a PlanTimelineEvent { kind: Finalize, gate: None }
+       to its timeline (this is what `Plan::frozen_at()` reads).
+    5. Per-plan classification + timeline append: for each non-
+       frozen plan, decide this commit's kind (PlanOnly | CodeOnly
+       | Mixed | MultiPlan) and append a PlanTimelineEvent. Build
+       the gate for reviewable kinds (PlanOnly | CodeOnly | Mixed);
+       leave gate=None for MultiPlan.
+    6. Carry-forward `previous_commit` for the next event's
+       `plan_intro_parent`.
 ```
 
-The finalize reader is the supporting parser + tree-checker used by
-`finalize_rule_now_satisfied`:
+The finalize reader is the supporting parser + tree-checker:
 
-- New `disk_format::parse_finalize_path` recognises
+- `disk_format::parse_finalize_path` recognises
   `.trinity/finished/<stem>/<agent>.md` (flat, no SHA segment).
-- `disk_snapshot` ingests finalize-snapshot files alongside
-  feedback files into the per-commit index used by the fold.
-- `finalize_rule_now_satisfied(state, plan_key, entry)` returns true
-  iff, at this entry's tree: the plan file exists AND
-  `.trinity/finished/<stem>/` contains ≥1 file AND every file
-  starts with `APPROVE`. The fold only checks the rule when the
-  current commit could plausibly have changed the answer (the
-  commit's tree-diff touched either `.trinity/plans/<stem>.md` or
-  `.trinity/finished/<stem>/`); other commits don't trigger the
-  check.
-- The fold emits a per-plan `freeze_events: Vec<CommitSha>` side
-  output (one entry per commit where that plan transitioned to
-  frozen). Archived-cycle display reads from this list, not from a
-  raw `git log` over the snapshot path; raw `git log` includes
-  non-freeze touches the fold has already discarded.
+- `git_io::snapshot` carries `FinalizeChange { plan_key, file_name,
+  kind: Upsert{first_line} | Remove }` on each `CommitEvent`. The
+  fold maintains a per-plan `finalize_tree: BTreeMap<String,
+  String>` in `FoldCarry` (file name → first line); on each commit
+  it applies the diff and then re-checks the rule.
+- The rule fires when the plan file is present in this commit's
+  tree AND `.trinity/finished/<stem>/` has ≥1 file AND every file's
+  first line starts with `APPROVE`.
 
-Per-commit mutations (`apply_commit`):
+Per-plan accumulation:
 
-- Update `commit_order`, `attribution`, `plan_touches`,
-  `commit_meta` (same logic as today, just per-commit instead of
-  bulk).
-- For each plan touched: if frozen, skip — no new attribution
-  entry for this plan, no plan_touches entry under this plan's
-  key (other plans the same commit touches still get their
-  entries). Frozen plans are invisible to subsequent mutations.
-- For each gate-relevant commit: extend the carry-along
-  participant set for the plan (the logic currently in
-  `build_commit_gates`), build the commit's gate entry. Skip
-  entirely for frozen plans.
+- The fold appends to `plan.timeline` only — no other per-plan
+  bucket exists. `plan_revisions`, `implementation_commits`,
+  `reviewable_commits`, `commit_meta`, `latest_reviewable_commit`,
+  `commits` are all derived (`projection::*`) as filters or
+  reverse-scans.
+- For each plan touched: if frozen, the per-plan classification
+  step short-circuits — the plan accumulates no further timeline
+  events. Other plans the same commit touches are classified
+  normally, with `active_changes.plan_touches` (sealed-filtered)
+  used so a frozen plan doesn't flip an active plan to MultiPlan.
+- Gate carry-along: a per-plan cumulative-participant `Vec` in
+  `FoldCarry` is threaded through each reviewable event's
+  `build_gate_step` call. After the full fold, `refresh_commits_for`
+  replays the same carry over `plan.timeline` when live feedback
+  files mutate between full rebuilds.
 
 Why this matters:
 

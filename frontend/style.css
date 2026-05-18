@@ -433,6 +433,14 @@ a:hover {
     background: linear-gradient(135deg, var(--accent) 50%, var(--approve) 50%);
 }
 
+/* Lifecycle boundary: distinct marker so finalize rows read as
+   sealed, not as a normal reviewable commit. Uses --approve to
+   echo the approval semantics of the snapshot. */
+.timeline-commit-finalize .timeline-marker {
+    background: var(--approve);
+    box-shadow: 0 0 0 2px var(--surface-2), 0 0 0 3px var(--approve);
+}
+
 .timeline-review .timeline-marker {
     background: var(--surface-2);
     border: 2px solid var(--text-muted);

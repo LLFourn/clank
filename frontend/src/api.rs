@@ -11,7 +11,6 @@ use serde::Deserialize;
 #[derive(Debug, Clone, Deserialize)]
 pub struct WaitingOn {
     pub role: String,
-    pub reason: String,
     #[serde(default)]
     pub agents: Vec<String>,
     pub description: String,
@@ -90,6 +89,12 @@ pub enum TimelineEvent {
     },
     #[serde(rename = "commit_mixed")]
     CommitMixed {
+        sha: String,
+        #[serde(default)]
+        subject: String,
+    },
+    #[serde(rename = "commit_finalize")]
+    CommitFinalize {
         sha: String,
         #[serde(default)]
         subject: String,

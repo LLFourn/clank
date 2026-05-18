@@ -297,6 +297,18 @@ impl Plan {
     pub fn is_frozen(&self) -> bool {
         self.frozen_at().is_some()
     }
+
+    /// True iff this plan should surface across Trinity's response
+    /// shapes given the current `worktree_status`. A plan is HIDDEN
+    /// (returns false) when its file is missing from the working
+    /// tree AND it has not frozen: the operator has uncommitted-
+    /// deleted it, so Trinity respects that decision until they
+    /// either restore the file or commit the deletion. Frozen plans
+    /// stay visible regardless — their body is captured at freeze
+    /// and `.trinity/finished/` is sealed.
+    pub fn is_visible(&self, worktree_status: PlanWorktreeStatus) -> bool {
+        self.is_frozen() || !matches!(worktree_status, PlanWorktreeStatus::PlanFileMissing)
+    }
 }
 
 /// One commit in a plan's life as observed by the fold. The `kind` is
@@ -620,13 +632,9 @@ impl WaitingRole {
 /// latest relevant commit. See plan §"WaitingReason collapse".
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WaitingReason {
-    /// Plan is frozen (`Plan.frozen_at` is `Some`). Nothing to do for
-    /// either role; the plan is sealed.
+    /// Plan is frozen (`Plan::is_frozen()` is true). Nothing to do
+    /// for either role; the plan is sealed.
     SessionFinished,
-    /// Plan file is missing from the working tree but still present in
-    /// HEAD. The master should restore it from HEAD or commit the
-    /// deletion.
-    RestoreOrCommitPlanFile,
     CommitPlanRevision,
     /// "REQUEST_CHANGES on the latest reviewable commit; address it."
     /// Replaces the old AddressPlanRequestChanges + AddressImplRequestChanges
@@ -653,7 +661,6 @@ impl WaitingReason {
     pub fn as_str(self) -> &'static str {
         match self {
             WaitingReason::SessionFinished => "session_finished",
-            WaitingReason::RestoreOrCommitPlanFile => "restore_or_commit_plan_file",
             WaitingReason::CommitPlanRevision => "commit_plan_revision",
             WaitingReason::AddressCommitChanges => "address_commit_changes",
             WaitingReason::ReadyToStartImplementation => "ready_to_start_implementation",

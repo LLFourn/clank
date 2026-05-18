@@ -289,6 +289,34 @@ async fn api_plans(
     Ok(axum::Json(v))
 }
 
+/// 404 the request if the plan in this single-plan snapshot is
+/// hidden (active + plan file missing from the working tree). See
+/// `Plan::is_visible`. Every plan-scoped route calls this before
+/// doing further work so the response shape is uniform.
+fn enforce_plan_visible(
+    snapshot: &crate::repo_state::RepoState,
+    repo_basename: &str,
+    stem_md: &str,
+) -> Result<(), AppError> {
+    let plan = snapshot
+        .plans
+        .values()
+        .next()
+        .expect("single_plan invariant");
+    let status = crate::mcp_response::compute_plan_worktree_status_parts(
+        &snapshot.root,
+        &plan.plan_path,
+        &plan.body_hash,
+    )
+    .map_err(AppError::io)?;
+    if !plan.is_visible(status) {
+        return Err(AppError::not_found(format!(
+            "plan {repo_basename}/{stem_md} is hidden: plan file missing from working tree"
+        )));
+    }
+    Ok(())
+}
+
 async fn api_plan_detail(
     State(state): State<AppState>,
     Path((repo_basename, stem_md)): Path<(String, String)>,
@@ -300,7 +328,10 @@ async fn api_plan_detail(
         .await
         .map_err(AppError::runtime)?
         .ok_or_else(|| AppError::not_found(format!("plan {repo_basename}/{stem_md} not found")))?;
-    let v = crate::ui_response::plan_page(&snapshot).map_err(AppError::io)?;
+    enforce_plan_visible(&snapshot, &repo_basename, &stem_md)?;
+    let v = crate::ui_response::plan_page(&snapshot)
+        .map_err(AppError::io)?
+        .expect("plan_page returns Some after enforce_plan_visible");
     Ok(axum::Json(v))
 }
 
@@ -317,6 +348,7 @@ async fn api_plan_revision(
         .await
         .map_err(AppError::runtime)?
         .ok_or_else(|| AppError::not_found(format!("plan {repo_basename}/{stem_md} not found")))?;
+    enforce_plan_visible(&snapshot, &repo_basename, &stem_md)?;
 
     let plan = snapshot
         .plans
@@ -378,18 +410,20 @@ async fn api_commit_diff(
         .await
         .map_err(AppError::runtime)?
         .ok_or_else(|| AppError::not_found(format!("plan {repo_basename}/{stem_md} not found")))?;
+    enforce_plan_visible(&snapshot, &repo_basename, &stem_md)?;
 
     let plan = snapshot
         .plans
         .values()
         .next()
         .expect("single_plan invariant");
-    let belongs_to_plan = plan.event_for(&commit_sha).is_some();
-    if !belongs_to_plan {
-        return Err(AppError::not_found(format!(
+    let event = plan.event_for(&commit_sha).ok_or_else(|| {
+        AppError::not_found(format!(
             "commit {sha} is not attributed to {repo_basename}/{stem_md}"
-        )));
-    }
+        ))
+    })?;
+    let is_finalize = matches!(event.kind, crate::repo_state::CommitKind::Finalize);
+    let stem = plan.id.as_str().to_string();
 
     let patch = crate::git_io::show_commit(&repo, &commit_sha)
         .await
@@ -401,23 +435,47 @@ async fn api_commit_diff(
         .await
         .map_err(|e| AppError::internal(format!("git show -s: {e}")))?;
 
-    let feedback = crate::ui_response::feedback_for_target(
-        snapshot
-            .plans
-            .values()
-            .next()
-            .expect("single_plan invariant"),
-        &commit_sha,
-    );
+    // Finalize events expose the .trinity/finished/<stem>/ snapshot
+    // AT THE FREEZE COMMIT, not live feedback. The diff alone is
+    // insufficient — it only shows files this commit changed, but
+    // the snapshot is the full directory contents at the freeze.
+    // Reviewable events expose live feedback as before.
+    let (feedback, finalize_snapshot) = if is_finalize {
+        let files = crate::git_io::read_finalize_snapshot(&repo, &commit_sha, &stem)
+            .await
+            .map_err(|e| AppError::internal(format!("read finalize snapshot: {e}")))?;
+        let entries: Vec<Value> = files
+            .into_iter()
+            .map(|(filename, body_raw)| {
+                let author = filename
+                    .strip_suffix(".md")
+                    .unwrap_or(&filename)
+                    .to_string();
+                let body_html = crate::ui_response::render_markdown(&body_raw);
+                json!({
+                    "author": author,
+                    "filename": filename,
+                    "body_raw": body_raw,
+                    "body_html": body_html,
+                })
+            })
+            .collect();
+        (Vec::new(), Value::Array(entries))
+    } else {
+        let fb = crate::ui_response::feedback_for_target(plan, &commit_sha);
+        (fb, Value::Null)
+    };
     Ok(axum::Json(json!({
         "repo": snapshot.root.to_string_lossy(),
         "plan_id": format!("{repo_basename}/{stem_md}"),
-        "slug": snapshot.plans.values().next().expect("single_plan invariant").id.as_str(),
+        "slug": stem,
         "commit_sha": commit_sha.as_str(),
+        "kind": event.kind.as_str(),
         "subject": subject,
         "message_body": message_body,
         "diff_files": diff_files_json,
         "feedback": feedback,
+        "finalize_snapshot": finalize_snapshot,
     })))
 }
 
@@ -439,6 +497,7 @@ async fn api_diff(
         .await
         .map_err(AppError::runtime)?
         .ok_or_else(|| AppError::not_found(format!("plan {repo_basename}/{stem_md} not found")))?;
+    enforce_plan_visible(&snapshot, &repo_basename, &stem_md)?;
 
     let plan = snapshot
         .plans

@@ -80,10 +80,8 @@ pub struct WorkPayload {
 }
 
 /// Tagged by the wire `work` discriminator. Variants that carry a
-/// `target_sha` also carry `commit_kind` and `prompt_hint`; variants
-/// that are pure worktree-status moves (`RestoreOrCommitPlanFile`,
-/// `SessionFinished`) carry only the envelope fields on
-/// `WorkPayload`.
+/// `target_sha` also carry `commit_kind` and `prompt_hint`;
+/// `SessionFinished` is the only no-target variant.
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "work", rename_all = "snake_case")]
 pub enum WorkAction {
@@ -102,7 +100,6 @@ pub enum WorkAction {
         commit_kind: String,
         prompt_hint: String,
     },
-    RestoreOrCommitPlanFile,
     StartImplementation {
         target_sha: String,
         commit_kind: String,
@@ -239,6 +236,17 @@ async fn compute_match(
         &candidate.plan_path,
         &candidate.body_hash,
     )?;
+    if !candidate.is_finished
+        && matches!(
+            status,
+            crate::repo_state::PlanWorktreeStatus::PlanFileMissing
+        )
+    {
+        // Active plan with its file uncommitted-deleted is hidden
+        // (Plan::is_visible). No work for either role until the
+        // operator restores or commits the deletion.
+        return Ok(None);
+    }
     let w = waiting_on(candidate.is_finished, status, candidate.gate.as_ref());
     if w.role != role {
         return Ok(None);
@@ -261,9 +269,8 @@ async fn compute_match(
 /// Build the typed `WorkAction` for one `(reason, candidate)` pair.
 /// Variants that carry a target SHA pull it (and its `commit_kind` +
 /// `prompt_hint`) from the candidate's pre-computed
-/// `review_target` / `review_target_kind`. Worktree-status moves
-/// (`CommitDoneMove`, `RestoreOrCommitDoneMove`, `SessionDone`) carry
-/// nothing else.
+/// `review_target` / `review_target_kind`. `SessionFinished` is the
+/// only no-target variant.
 fn build_action(reason: WaitingReason, candidate: &Candidate) -> WorkAction {
     use WaitingReason::*;
     let target_sha = || {
@@ -284,7 +291,6 @@ fn build_action(reason: WaitingReason, candidate: &Candidate) -> WorkAction {
     };
     match reason {
         SessionFinished => WorkAction::SessionFinished,
-        RestoreOrCommitPlanFile => WorkAction::RestoreOrCommitPlanFile,
         CommitPlanRevision => {
             let kind = commit_kind();
             let kind_opt = if kind.is_empty() {
@@ -372,10 +378,6 @@ fn prompt_hint_for(
             "Plan has uncommitted changes at {plan_path_str}. Commit the revision to release \
              blocked reviews."
         ),
-        (RestoreOrCommitPlanFile, _) => format!(
-            "Plan file is missing at {plan_path_str}. Either restore it \
-             (`git checkout -- {plan_path_str}`) or commit the deletion."
-        ),
         (ReadyToStartImplementation, _) => "Latest commit is approved. Continue with the next \
              commit or finalize the plan."
             .to_string(),
@@ -406,10 +408,11 @@ fn caller_already_voted(cand: &Candidate, reason: WaitingReason, author: &AgentL
         // false; caller-already-voted is a reviewer-only concept.
         CommitNeedsReview => cand.gate.as_ref(),
         SessionFinished
-        | RestoreOrCommitPlanFile
         | CommitPlanRevision
         | AddressCommitChanges
-        | ReadyToStartImplementation => return false,
+        | ReadyToStartImplementation => {
+            return false;
+        }
     };
     let Some(gate) = gate else { return false };
     gate.approvers.contains(author) || gate.requesters.contains(author)
@@ -448,9 +451,9 @@ fn derive_locations(cand: &Candidate, reason: WaitingReason, author: &AgentLabel
             }
             out
         }
-        WaitingReason::RestoreOrCommitPlanFile
-        | WaitingReason::CommitPlanRevision
-        | WaitingReason::ReadyToStartImplementation => vec![plan_file],
+        WaitingReason::CommitPlanRevision | WaitingReason::ReadyToStartImplementation => {
+            vec![plan_file]
+        }
         WaitingReason::SessionFinished => Vec::new(),
     }
 }
@@ -825,7 +828,6 @@ mod integration_tests {
             WorkAction::ReviewCommit { .. } => "review_commit",
             WorkAction::AddressCommitChanges { .. } => "address_commit_changes",
             WorkAction::CommitPlanRevision { .. } => "commit_plan_revision",
-            WorkAction::RestoreOrCommitPlanFile => "restore_or_commit_plan_file",
             WorkAction::StartImplementation { .. } => "start_implementation",
             WorkAction::SessionFinished => "session_finished",
         }

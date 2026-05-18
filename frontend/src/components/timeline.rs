@@ -42,7 +42,8 @@ fn timeline_key(_idx: usize, e: &TimelineEvent) -> String {
     match e {
         TimelineEvent::CommitPlan { sha, .. }
         | TimelineEvent::CommitImpl { sha, .. }
-        | TimelineEvent::CommitMixed { sha, .. } => format!("commit:{sha}"),
+        | TimelineEvent::CommitMixed { sha, .. }
+        | TimelineEvent::CommitFinalize { sha, .. } => format!("commit:{sha}"),
         TimelineEvent::Review {
             target,
             author,
@@ -77,6 +78,14 @@ fn TimelineRow(plan_id: std::sync::Arc<String>, event: TimelineEvent) -> impl In
             subject,
             "timeline-row timeline-commit-mixed",
             "Plan + impl",
+        )
+        .into_any(),
+        TimelineEvent::CommitFinalize { sha, subject, .. } => commit_row(
+            plan_id,
+            sha,
+            subject,
+            "timeline-row timeline-commit-finalize",
+            "Finalized",
         )
         .into_any(),
         TimelineEvent::Review {

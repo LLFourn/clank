@@ -80,10 +80,13 @@ fn plans_index_parts(
     let basename = crate::lifecycle::RepoBasename::from_repo_root(&snapshot.root);
     let mut plans: Vec<IndexedPlanRow> = Vec::with_capacity(snapshot.plans.len());
     for plan in snapshot.plans.values() {
-        let plan_phase = current_posture(plan, snapshot);
-        let gate = crate::projection::latest_reviewable_commit_gate_for(plan);
         let worktree_status =
             status_reader.compute(&snapshot.root, &plan.plan_path, &plan.body_hash)?;
+        if !plan.is_visible(worktree_status) {
+            continue;
+        }
+        let plan_phase = current_posture(plan, snapshot);
+        let gate = crate::projection::latest_reviewable_commit_gate_for(plan);
         let w = waiting_on(plan.is_frozen(), worktree_status, gate);
         let plan_id = basename
             .as_ref()
@@ -124,16 +127,18 @@ fn plans_index_parts(
     Ok((plans, conflicts))
 }
 
-/// `GET /api/plan/{repo}/{stem_md}` — rich plan detail.
+/// `GET /api/plan/{repo}/{stem_md}` — rich plan detail. Returns
+/// `Ok(None)` when the plan is hidden (active + plan file missing
+/// from the working tree); the HTTP handler maps that to a 404.
 /// Public wrapper binds the production `DiskPlanStatusReader`.
-pub fn plan_page(bundle: &RepoState) -> std::io::Result<Value> {
+pub fn plan_page(bundle: &RepoState) -> std::io::Result<Option<Value>> {
     plan_page_with_reader(bundle, &crate::mcp_response::DiskPlanStatusReader)
 }
 
 pub fn plan_page_with_reader(
     bundle: &RepoState,
     status_reader: &impl PlanStatusReader,
-) -> std::io::Result<Value> {
+) -> std::io::Result<Option<Value>> {
     let plan = bundle
         .plans
         .values()
@@ -141,6 +146,9 @@ pub fn plan_page_with_reader(
         .expect("snapshot_session invariant: exactly one plan");
     let basename = crate::lifecycle::RepoBasename::from_repo_root(&bundle.root);
     let worktree_status = status_reader.compute(&bundle.root, &plan.plan_path, &plan.body_hash)?;
+    if !plan.is_visible(worktree_status) {
+        return Ok(None);
+    }
     let plan_phase = current_posture(plan, bundle);
     let plan_gate = plan_gate_for(plan, bundle);
     let impl_gate = impl_gate_for(plan, bundle);
@@ -211,7 +219,7 @@ pub fn plan_page_with_reader(
             })
         })
         .collect();
-    Ok(json!({
+    Ok(Some(json!({
         "repo": bundle.root.to_string_lossy(),
         "plan_id": plan_id,
         "slug": plan.id.as_str(),
@@ -235,7 +243,7 @@ pub fn plan_page_with_reader(
         "timeline": timeline,
         "pr_hint": pr_hint,
         "archived_cycles": archived_cycles,
-    }))
+    })))
 }
 
 /// UI-flavored per-commit `commits[]` array. Like the MCP version

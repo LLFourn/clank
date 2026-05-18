@@ -1585,3 +1585,99 @@ async fn api_plans_filter_by_basename() {
         "traversal path should resolve to beta"
     );
 }
+
+#[tokio::test]
+async fn finalize_commit_endpoint_returns_full_snapshot_not_just_diff() {
+    // Codex's regression scenario: snapshot has TWO approval files
+    // (alice + bob) but the freeze commit only changes ONE of them
+    // (bob's file flips from REQUEST_CHANGES → APPROVE). The
+    // /api/plan/.../commit/{sha} endpoint must return BOTH approval
+    // files for the finalize event, not just bob's diff.
+    let dir = init_repo();
+    write_file(dir.path(), ".trinity/plans/foo.md", "# foo\n");
+    commit(dir.path(), "Add foo");
+    // c2: alice approves, bob requests changes — does not freeze.
+    write_file(
+        dir.path(),
+        ".trinity/finished/foo/alice.md",
+        "APPROVE\n\nLooks good to me.\n",
+    );
+    write_file(
+        dir.path(),
+        ".trinity/finished/foo/bob.md",
+        "REQUEST_CHANGES\n\nNeeds more work.\n",
+    );
+    commit(dir.path(), "First reviewer round");
+    // c3: bob flips to APPROVE — THIS is the freeze commit. The
+    // commit only changes bob.md; alice.md is unchanged.
+    write_file(
+        dir.path(),
+        ".trinity/finished/foo/bob.md",
+        "APPROVE\n\nAddressed. Ship it.\n",
+    );
+    commit(dir.path(), "Bob's approval lands");
+
+    let (url, handle) = spawn_daemon(dir.path()).await;
+    let client = reqwest::Client::new();
+
+    let req = json!({
+        "cwd": dir.path(),
+        "tool": "get_context",
+        "arguments": { "plan_id": plan_id_for(&dir, "foo") }
+    });
+    let ctx: serde_json::Value = client
+        .post(format!("{}/internal/tool_call", url))
+        .json(&req)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let timeline = ctx["result"]["timeline"].as_array().unwrap();
+    let finalize_event = timeline
+        .iter()
+        .find(|e| e["kind"] == "commit_finalize")
+        .expect("timeline must carry a commit_finalize event");
+    let finalize_sha = finalize_event["sha"].as_str().unwrap().to_string();
+
+    let basename = dir.path().file_name().unwrap().to_str().unwrap();
+    let body: serde_json::Value = client
+        .get(format!(
+            "{url}/api/plan/{basename}/foo.md/commit/{finalize_sha}"
+        ))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    handle.abort();
+
+    assert_eq!(body["kind"], "finalize");
+    let snapshot = body["finalize_snapshot"].as_array().expect(
+        "finalize commit endpoint must carry finalize_snapshot; \
+         got body: {body:?}",
+    );
+    assert_eq!(
+        snapshot.len(),
+        2,
+        "snapshot must include BOTH approval files (alice + bob), \
+         not just the file touched by this freeze commit. got: {snapshot:?}"
+    );
+    let authors: Vec<&str> = snapshot
+        .iter()
+        .map(|e| e["author"].as_str().unwrap())
+        .collect();
+    assert!(authors.contains(&"alice"), "alice must be in snapshot");
+    assert!(authors.contains(&"bob"), "bob must be in snapshot");
+    // Alice's body is unchanged by the freeze commit — diff would miss it.
+    let alice = snapshot.iter().find(|e| e["author"] == "alice").unwrap();
+    assert!(alice["body_raw"].as_str().unwrap().contains("Looks good"));
+    // Finalize events are not gated, no live feedback.
+    assert_eq!(
+        body["feedback"].as_array().unwrap().len(),
+        0,
+        "finalize commit must not surface live feedback"
+    );
+}

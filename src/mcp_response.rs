@@ -75,6 +75,12 @@ pub(crate) fn list_plans_response_with_status_reader(
     for plan in state.plans.values() {
         let worktree_status =
             status_reader.compute(&state.root, &plan.plan_path, &plan.body_hash)?;
+        if !plan.is_visible(worktree_status) {
+            // Active plan whose file has been uncommitted-deleted —
+            // totally hidden until the operator restores or commits
+            // the deletion. See Plan::is_visible.
+            continue;
+        }
         let plan_phase = current_posture(plan, state);
         let gate = crate::projection::latest_reviewable_commit_gate_for(plan);
         let w = waiting_on(plan.is_frozen(), worktree_status, gate);
@@ -136,11 +142,15 @@ fn plan_summary(
     })
 }
 
-/// `get_context` response for a specific session + author.
+/// `get_context` response for a specific session + author. Returns
+/// `Ok(None)` when the plan is hidden (active + plan file missing
+/// from the working tree) — the operator has uncommitted-deleted it
+/// and Trinity treats it as nonexistent until they restore or
+/// commit the deletion. Callers map `None` to a 404-equivalent.
 pub fn get_context_response(
     snapshot: &RepoState,
     author_label: &AgentLabel,
-) -> std::io::Result<Value> {
+) -> std::io::Result<Option<Value>> {
     get_context_response_with_status_reader(snapshot, author_label, &DiskPlanStatusReader)
 }
 
@@ -148,7 +158,7 @@ pub(crate) fn get_context_response_with_status_reader(
     snapshot: &RepoState,
     author_label: &AgentLabel,
     status_reader: &impl PlanStatusReader,
-) -> std::io::Result<Value> {
+) -> std::io::Result<Option<Value>> {
     let plan = snapshot
         .plans
         .values()
@@ -156,11 +166,14 @@ pub(crate) fn get_context_response_with_status_reader(
         .expect("snapshot_session invariant: exactly one plan");
     let worktree_status =
         status_reader.compute(&snapshot.root, &plan.plan_path, &plan.body_hash)?;
-    Ok(get_context_response_from_snapshot(
+    if !plan.is_visible(worktree_status) {
+        return Ok(None);
+    }
+    Ok(Some(get_context_response_from_snapshot(
         snapshot,
         worktree_status,
         author_label,
-    ))
+    )))
 }
 
 pub fn get_context_response_from_snapshot(
@@ -543,7 +556,7 @@ mod tests {
     fn context_from_state(state: &RepoState, sid: &str, author: &str) -> Option<serde_json::Value> {
         let sid = PlanKey::parse(sid).unwrap();
         let snapshot = state.single_plan(&sid)?;
-        Some(get_context_response(&snapshot, &AgentLabel::parse(author).unwrap()).unwrap())
+        get_context_response(&snapshot, &AgentLabel::parse(author).unwrap()).unwrap()
     }
 
     #[tokio::test]
@@ -588,6 +601,58 @@ mod tests {
         let session = state.plans.values().next().unwrap();
         let status = status_for_session(dir.path(), session);
         assert_eq!(status, PlanWorktreeStatus::PlanFileMissing);
+    }
+
+    #[tokio::test]
+    async fn unfrozen_plan_with_missing_worktree_file_is_hidden_from_list_plans() {
+        // Plan file is in HEAD but the operator uncommitted-deleted
+        // it. Trinity treats it as nonexistent: list_plans omits it,
+        // get_context returns None.
+        let dir = init_repo();
+        write_file(dir.path(), ".trinity/plans/foo.md", "# foo\n");
+        commit(dir.path(), "add plan");
+        std::fs::remove_file(dir.path().join(".trinity/plans/foo.md")).unwrap();
+
+        let state = rebuild_repo(dir.path()).await.unwrap();
+        let v = list_plans_response(&state).unwrap();
+        let arr = v["plans"].as_array().unwrap();
+        assert!(
+            arr.is_empty(),
+            "active plan with missing worktree file must be hidden; got {arr:?}"
+        );
+
+        let snapshot = state.single_plan(&PlanKey::parse("foo").unwrap()).unwrap();
+        let ctx = get_context_response(&snapshot, &AgentLabel::parse("master").unwrap()).unwrap();
+        assert!(
+            ctx.is_none(),
+            "get_context must return None for a hidden plan; got {ctx:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn frozen_plan_with_missing_worktree_file_stays_visible() {
+        // Codex's monotone-finished spec: once frozen, the plan
+        // stays visible even after its file is deleted from HEAD
+        // (and a fortiori from the working tree). The hide rule
+        // applies ONLY to active plans.
+        let dir = init_repo();
+        write_file(dir.path(), ".trinity/plans/foo.md", "# foo\n");
+        commit(dir.path(), "add plan");
+        write_file(
+            dir.path(),
+            ".trinity/finished/foo/alice.md",
+            "APPROVE\n\nlgtm\n",
+        );
+        commit(dir.path(), "Finalize foo");
+        // Now uncommitted-delete the plan file. Plan is frozen
+        // already, so this should NOT hide it.
+        std::fs::remove_file(dir.path().join(".trinity/plans/foo.md")).unwrap();
+
+        let state = rebuild_repo(dir.path()).await.unwrap();
+        let v = list_plans_response(&state).unwrap();
+        let arr = v["plans"].as_array().unwrap();
+        assert_eq!(arr.len(), 1, "frozen plan must stay visible: {arr:?}");
+        assert_eq!(arr[0]["lifecycle"], "finished");
     }
 
     #[tokio::test]
@@ -788,7 +853,9 @@ mod tests {
         let author = AgentLabel::parse("reviewer").unwrap();
 
         let handle = tokio::task::spawn_blocking(move || {
-            get_context_response_with_status_reader(&snapshot, &author, &reader).unwrap()
+            get_context_response_with_status_reader(&snapshot, &author, &reader)
+                .unwrap()
+                .expect("plan visible")
         });
         entered_rx
             .recv_timeout(Duration::from_secs(2))

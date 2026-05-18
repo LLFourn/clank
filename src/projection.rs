@@ -61,11 +61,14 @@ pub fn waiting_on(
     }
     match worktree_status {
         PlanWorktreeStatus::PlanFileMissing => {
-            return make(
-                WaitingRole::Master,
-                WaitingReason::RestoreOrCommitPlanFile,
-                Vec::new(),
-            );
+            // Unreachable in normal flow: an active plan with its
+            // working-tree file missing is hidden via `Plan::is_visible`
+            // before any caller reaches `waiting_on`. If this fires,
+            // a surface forgot to filter.
+            unreachable!(
+                "active plan with missing worktree file must be hidden via Plan::is_visible \
+                 before reaching waiting_on"
+            )
         }
         PlanWorktreeStatus::BodyDirty => {
             return make(
@@ -206,7 +209,6 @@ pub fn expected_action(reason: WaitingReason) -> &'static str {
     use WaitingReason::*;
     match reason {
         SessionFinished => "none",
-        RestoreOrCommitPlanFile => "restore_or_commit_plan_file",
         CommitPlanRevision => "commit_plan_revision",
         AddressCommitChanges => "address_commit_changes",
         ReadyToStartImplementation => "start_implementation",
@@ -245,9 +247,6 @@ fn description_for(
     };
     match (role, reason) {
         (None, SessionFinished) => "Plan is finished.".to_string(),
-        (Master, RestoreOrCommitPlanFile) => "Plan file is missing from the working tree. \
-             Either restore it (`git checkout -- <path>`) or commit the deletion."
-            .to_string(),
         (Master, CommitPlanRevision) => "Plan has uncommitted changes. \
              Commit the revision to release any blocked reviews."
             .to_string(),

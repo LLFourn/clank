@@ -133,7 +133,6 @@ pub fn catalog() -> Vec<ToolDescriptor> {
                           - `review_commit` → `[<canonical write path>]`\n\
                           - `address_commit_changes` → `[<each RC>, <plan file?>]`\n\
                           - `commit_plan_revision` → `[<plan file>]`\n\
-                          - `restore_or_commit_plan_file` → `[<plan file>]`\n\
                           - `start_implementation` → `[<plan file>]`"
                 .to_string(),
             input_schema: json!({

@@ -828,7 +828,9 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        let v = get_context_response(&snapshot, &AgentLabel::parse("master").unwrap()).unwrap();
+        let v = get_context_response(&snapshot, &AgentLabel::parse("master").unwrap())
+            .unwrap()
+            .expect("plan visible");
         assert_eq!(v["waiting_on"]["reason"], "ready_to_start_implementation");
 
         let events = rt.live_events_snapshot().await;
@@ -875,7 +877,9 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        let v = get_context_response(&snapshot, &AgentLabel::parse("master").unwrap()).unwrap();
+        let v = get_context_response(&snapshot, &AgentLabel::parse("master").unwrap())
+            .unwrap()
+            .expect("plan visible");
         // Gate falls back to no participants → reviewers / plan_needs_initial_review.
         assert_eq!(v["waiting_on"]["reason"], "commit_needs_review");
     }

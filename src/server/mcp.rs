@@ -351,7 +351,18 @@ async fn get_context(state: &AppState, req: &ToolCallRequest) -> Result<Value, T
                 plan_id
             ))
         })?;
-    get_context_response(&snapshot, &author).map_err(|e| ToolError::Internal(anyhow::anyhow!(e)))
+    get_context_response(&snapshot, &author)
+        .map_err(|e| ToolError::Internal(anyhow::anyhow!(e)))?
+        .ok_or_else(|| {
+            // Plan is hidden: its file is missing from the working
+            // tree and it isn't frozen. Trinity treats it as
+            // nonexistent until the operator restores or commits
+            // the deletion (see Plan::is_visible).
+            ToolError::NotFound(format!(
+                "plan {} is hidden: plan file missing from working tree",
+                plan_id
+            ))
+        })
 }
 
 async fn resolve_repo(cwd: &Path) -> Result<PathBuf, ToolError> {
