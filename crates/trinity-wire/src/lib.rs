@@ -25,7 +25,6 @@ pub mod vocab;
 // Re-export the closed-vocab enums at crate root for ergonomic
 // imports (`use trinity_wire::CommitKind;`).
 pub use vocab::{
-    CommitGateState, CommitKind, DiffLineKind, ExpectedAction, PlanEventKind, PlanLifecycle,
-    PlanTouchKind, PlanWorktreeStatus, Posture, RepoEventKind, ReviewTargetPhase, Verdict,
-    WaitingReason, WaitingRole,
+    CommitGateState, CommitKind, DiffLineKind, ExpectedAction, PlanLifecycle, PlanTouchKind,
+    PlanWorktreeStatus, Posture, ReviewTargetPhase, Verdict, WaitingReason, WaitingRole,
 };

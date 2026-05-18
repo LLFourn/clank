@@ -113,19 +113,18 @@ fn ActivitySidebar(store: EventStore) -> impl IntoView {
                         }
                         key=|(_, e)| activity_key(e)
                         children=move |(_, e)| {
-                            use crate::store::LiveEvent;
-                            let (label, href, kind) = match &e {
+                            use crate::store::{LiveEvent, live_event_kind_str};
+                            let (label, href) = match &e {
                                 LiveEvent::Plan(p) => (
                                     p.plan_id.clone(),
                                     format!("/plan/{}", p.plan_id),
-                                    p.kind.clone(),
                                 ),
-                                LiveEvent::Repo(r) => (
+                                LiveEvent::Repo(_) => (
                                     "—".to_string(),
                                     "#".to_string(),
-                                    r.kind.clone(),
                                 ),
                             };
+                            let kind = live_event_kind_str(&e);
                             let kind_class = format!("activity-kind activity-{kind}");
                             view! {
                                 <li class="activity-row">
@@ -144,12 +143,17 @@ fn ActivitySidebar(store: EventStore) -> impl IntoView {
 }
 
 fn activity_key(e: &crate::store::LiveEvent) -> String {
-    use crate::store::LiveEvent;
+    use crate::store::{LiveEvent, live_event_kind_str, live_event_ts};
     let plan_id = match e {
         LiveEvent::Plan(p) => p.plan_id.as_str(),
         LiveEvent::Repo(_) => "-",
     };
-    format!("{}:{}:{}", e.ts(), e.kind(), plan_id)
+    format!(
+        "{}:{}:{}",
+        live_event_ts(e),
+        live_event_kind_str(e),
+        plan_id
+    )
 }
 
 fn plan_table(rows: Vec<PlanRow>) -> impl IntoView {

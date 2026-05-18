@@ -128,19 +128,6 @@ fn expected_action_wire_strings() {
 }
 
 #[test]
-fn repo_event_kind_wire_strings() {
-    assert_wire(RepoEventKind::RepoRebuilt, "repo_rebuilt");
-    assert_wire(RepoEventKind::RepoUnwatched, "repo_unwatched");
-}
-
-#[test]
-fn plan_event_kind_wire_strings() {
-    assert_wire(PlanEventKind::PlanWorktreeChanged, "plan_worktree_changed");
-    assert_wire(PlanEventKind::FeedbackChanged, "feedback_changed");
-    assert_wire(PlanEventKind::FeedbackRemoved, "feedback_removed");
-}
-
-#[test]
 fn diff_line_kind_wire_strings() {
     assert_wire(DiffLineKind::Insert, "insert");
     assert_wire(DiffLineKind::Delete, "delete");
@@ -178,8 +165,6 @@ fn as_str_agrees_with_wire() {
     check!(PlanWorktreeStatus::PlanFileMissing);
     check!(PlanTouchKind::Revision);
     check!(ReviewTargetPhase::Impl);
-    check!(RepoEventKind::RepoUnwatched);
-    check!(PlanEventKind::FeedbackRemoved);
     check!(DiffLineKind::Insert);
 }
 
@@ -282,7 +267,7 @@ fn commit_detail_plan_only_round_trips() {
 fn live_event_repo_rebuilt_round_trips() {
     let ev = LiveEvent::Repo(RepoEvent {
         ts: 1700000000,
-        kind: RepoEventKind::RepoRebuilt,
+        payload: RepoEventPayload::RepoRebuilt {},
     });
     let v = serde_json::to_value(&ev).unwrap();
     assert_eq!(v["scope"], "repo");
@@ -292,16 +277,48 @@ fn live_event_repo_rebuilt_round_trips() {
 }
 
 #[test]
-fn live_event_plan_worktree_changed_round_trips() {
+fn live_event_repo_unwatched_carries_plan_count() {
+    let ev = LiveEvent::Repo(RepoEvent {
+        ts: 1700000000,
+        payload: RepoEventPayload::RepoUnwatched { plan_count: 4 },
+    });
+    let v = serde_json::to_value(&ev).unwrap();
+    assert_eq!(v["scope"], "repo");
+    assert_eq!(v["kind"], "repo_unwatched");
+    assert_eq!(v["plan_count"], 4);
+    let back: LiveEvent = serde_json::from_value(v).unwrap();
+    assert_eq!(ev, back);
+}
+
+#[test]
+fn live_event_plan_worktree_changed_carries_path() {
     let ev = LiveEvent::Plan(PlanEvent {
         ts: 1700000000,
         plan_id: "trinity/foo.md".into(),
         lifecycle: PlanLifecycle::Active,
-        kind: PlanEventKind::PlanWorktreeChanged,
+        payload: PlanEventPayload::PlanWorktreeChanged {
+            path: ".trinity/plans/foo.md".into(),
+        },
     });
     let v = serde_json::to_value(&ev).unwrap();
     assert_eq!(v["scope"], "plan");
     assert_eq!(v["kind"], "plan_worktree_changed");
+    assert_eq!(v["path"], ".trinity/plans/foo.md");
+    let back: LiveEvent = serde_json::from_value(v).unwrap();
+    assert_eq!(ev, back);
+}
+
+#[test]
+fn live_event_plan_feedback_changed_has_no_extra_fields() {
+    let ev = LiveEvent::Plan(PlanEvent {
+        ts: 1700000000,
+        plan_id: "trinity/foo.md".into(),
+        lifecycle: PlanLifecycle::Active,
+        payload: PlanEventPayload::FeedbackChanged {},
+    });
+    let v = serde_json::to_value(&ev).unwrap();
+    assert_eq!(v["scope"], "plan");
+    assert_eq!(v["kind"], "feedback_changed");
     let back: LiveEvent = serde_json::from_value(v).unwrap();
     assert_eq!(ev, back);
 }

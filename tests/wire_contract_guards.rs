@@ -171,16 +171,11 @@ fn assert_allowlist(observed: BTreeMap<String, usize>, expected: &[(&str, usize)
 /// its phase, delete the entry.
 const GUARD_A_ALLOWLIST: &[(&str, usize)] = &[
     // 1 production body builder (autofill on raw Value because the
-    // shim doesn't know per-tool arg shapes). Phase 4 decides
-    // typed-per-tool vs leave-as-Value.
+    // shim doesn't know per-tool arg shapes). Allowed exception:
+    // the shim is a transport, not a domain producer.
     ("src/mcp_shim/mod.rs", 1),
-    // `payload: Value` field type on RepoEvent + PlanEvent. Drains
-    // in Phase 7 (typed event payloads).
-    ("src/repo_state.rs", 2),
-    // LiveEvent payload construction call sites. Drain in Phase 7.
-    ("src/runtime.rs", 5),
     // MCP protocol envelope (allowed exception) + tool-arg parsing
-    // via Value. Phase 4 keeps the envelope, types the args.
+    // via Value. Phase 4 typed the args; the envelope stays.
     ("src/server/mcp.rs", 10),
     // Tool input-schema JSON. Allowed exception per plan §"Allowed
     // exceptions"; typed schema builder is out of scope.
@@ -206,13 +201,9 @@ fn guard_a_dynamic_json_sites_match_allowlist() {
 /// the field's type changes from `String` to the corresponding
 /// enum (Phase 6), the count drops.
 const GUARD_B_ALLOWLIST: &[(&str, usize)] = &[
-    // SSE event kind: String — two repo/plan event payloads.
-    // Drain in Phase 7 (typed SSE events).
-    ("frontend/src/store.rs", 2),
     // `match req.tool.as_str() { "list_plans" => ... }` — tool
     // name dispatch. Protocol identifier, not domain state.
-    // Phase 4 decides whether to introduce a typed ToolName enum
-    // or leave as the dispatch boundary.
+    // Allowed exception per plan §"Allowed exceptions".
     ("src/server/mcp.rs", 1),
 ];
 

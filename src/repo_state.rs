@@ -409,8 +409,8 @@ pub enum LiveEvent {
 impl LiveEvent {
     pub fn kind_str(&self) -> &'static str {
         match self {
-            LiveEvent::Repo(e) => e.kind.as_str(),
-            LiveEvent::Plan(e) => e.kind.as_str(),
+            LiveEvent::Repo(e) => e.payload.kind_str(),
+            LiveEvent::Plan(e) => e.payload.kind_str(),
         }
     }
 
@@ -426,11 +426,8 @@ impl LiveEvent {
 pub struct RepoEvent {
     pub ts: i64,
     pub repo: RepoRoot,
-    pub kind: RepoEventKind,
-    pub payload: serde_json::Value,
+    pub payload: trinity_wire::dto::RepoEventPayload,
 }
-
-pub use trinity_wire::RepoEventKind;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PlanEvent {
@@ -438,11 +435,8 @@ pub struct PlanEvent {
     pub repo: RepoRoot,
     pub plan_id: crate::lifecycle::PlanId,
     pub lifecycle: PlanLifecycle,
-    pub kind: PlanEventKind,
-    pub payload: serde_json::Value,
+    pub payload: trinity_wire::dto::PlanEventPayload,
 }
-
-pub use trinity_wire::PlanEventKind;
 
 /// The `waiting_on` projection — the canonical per-session "who blocks
 /// progress" signal surfaced in MCP context and the web UI.

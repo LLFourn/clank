@@ -20,47 +20,26 @@
 //! event). The mute state is read on boot and written through on toggle.
 
 use leptos::prelude::*;
-use serde::Deserialize;
 use wasm_bindgen::JsCast;
 use wasm_bindgen::closure::Closure;
+
+pub use trinity_wire::dto::LiveEvent;
 
 const RECENT_CAP: usize = 50;
 const CHIME_COALESCE_MS: f64 = 300.0;
 const MUTE_LS_KEY: &str = "trinity.muted";
 
-#[derive(Debug, Clone, Deserialize)]
-#[serde(tag = "scope", rename_all = "snake_case")]
-pub enum LiveEvent {
-    Repo(RepoEventPayload),
-    Plan(PlanEventPayload),
-}
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct RepoEventPayload {
-    pub ts: i64,
-    pub kind: String,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct PlanEventPayload {
-    pub ts: i64,
-    pub plan_id: String,
-    pub kind: String,
-}
-
-impl LiveEvent {
-    pub fn ts(&self) -> i64 {
-        match self {
-            LiveEvent::Repo(e) => e.ts,
-            LiveEvent::Plan(e) => e.ts,
-        }
+pub fn live_event_ts(e: &LiveEvent) -> i64 {
+    match e {
+        LiveEvent::Repo(r) => r.ts,
+        LiveEvent::Plan(p) => p.ts,
     }
+}
 
-    pub fn kind(&self) -> &str {
-        match self {
-            LiveEvent::Repo(e) => &e.kind,
-            LiveEvent::Plan(e) => &e.kind,
-        }
+pub fn live_event_kind_str(e: &LiveEvent) -> &'static str {
+    match e {
+        LiveEvent::Repo(r) => r.payload.kind_str(),
+        LiveEvent::Plan(p) => p.payload.kind_str(),
     }
 }
 

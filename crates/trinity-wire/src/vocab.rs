@@ -318,48 +318,6 @@ impl ExpectedAction {
 }
 
 // ============================================================
-// Live events (SSE)
-// ============================================================
-
-/// Repo-level live event kinds. Carried in the SSE `LiveEvent::Repo`
-/// variant.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum RepoEventKind {
-    RepoRebuilt,
-    RepoUnwatched,
-}
-
-impl RepoEventKind {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            RepoEventKind::RepoRebuilt => "repo_rebuilt",
-            RepoEventKind::RepoUnwatched => "repo_unwatched",
-        }
-    }
-}
-
-/// Plan-scoped live event kinds. Carried in the SSE
-/// `LiveEvent::Plan` variant.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum PlanEventKind {
-    PlanWorktreeChanged,
-    FeedbackChanged,
-    FeedbackRemoved,
-}
-
-impl PlanEventKind {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            PlanEventKind::PlanWorktreeChanged => "plan_worktree_changed",
-            PlanEventKind::FeedbackChanged => "feedback_changed",
-            PlanEventKind::FeedbackRemoved => "feedback_removed",
-        }
-    }
-}
-
-// ============================================================
 // Diff rendering
 // ============================================================
 
@@ -401,7 +359,5 @@ impl_display_via_as_str! {
     WaitingRole,
     WaitingReason,
     ExpectedAction,
-    RepoEventKind,
-    PlanEventKind,
     DiffLineKind,
 }

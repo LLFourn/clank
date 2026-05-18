@@ -115,11 +115,11 @@ async fn event_stream(
 
     let combined = live_stream.map(|e| {
         use crate::repo_state::LiveEvent as DaemonLiveEvent;
-        let wire_event = match &e {
+        let wire_event = match e {
             DaemonLiveEvent::Repo(re) => {
                 trinity_wire::dto::LiveEvent::Repo(trinity_wire::dto::RepoEvent {
                     ts: re.ts,
-                    kind: re.kind,
+                    payload: re.payload,
                 })
             }
             DaemonLiveEvent::Plan(pe) => {
@@ -127,7 +127,7 @@ async fn event_stream(
                     ts: pe.ts,
                     plan_id: pe.plan_id.to_string(),
                     lifecycle: pe.lifecycle,
-                    kind: pe.kind,
+                    payload: pe.payload,
                 })
             }
         };

@@ -22,9 +22,8 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 
 use crate::vocab::{
-    CommitGateState, CommitKind, DiffLineKind, ExpectedAction, PlanEventKind, PlanLifecycle,
-    PlanTouchKind, PlanWorktreeStatus, Posture, RepoEventKind, ReviewTargetPhase, Verdict,
-    WaitingReason, WaitingRole,
+    CommitGateState, CommitKind, DiffLineKind, ExpectedAction, PlanLifecycle, PlanTouchKind,
+    PlanWorktreeStatus, Posture, ReviewTargetPhase, Verdict, WaitingReason, WaitingRole,
 };
 
 // ============================================================
@@ -561,12 +560,11 @@ pub enum WorkAction {
 // SSE live events
 // ============================================================
 
-/// One SSE event. Tagged by `scope` so the wire's
-/// (`repo` / `plan`)-shaped payload distinction is structural,
-/// not conventional. Today the wire carries only the event kind
-/// and identifying fields — Phase 7 of the purge plan adds typed
-/// kind-dependent payloads via a flattened tagged enum on
-/// `RepoEvent` / `PlanEvent`.
+/// One SSE event. Tagged by `scope` so the (`repo` / `plan`)-shaped
+/// distinction is structural, not conventional. The kind-dependent
+/// payload is carried by a flattened tagged enum on `RepoEvent` /
+/// `PlanEvent` — `kind` is the discriminator, and any kind-specific
+/// fields appear alongside the common ones on the wire.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "scope", rename_all = "snake_case")]
 pub enum LiveEvent {
@@ -577,7 +575,24 @@ pub enum LiveEvent {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RepoEvent {
     pub ts: i64,
-    pub kind: RepoEventKind,
+    #[serde(flatten)]
+    pub payload: RepoEventPayload,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum RepoEventPayload {
+    RepoRebuilt {},
+    RepoUnwatched { plan_count: usize },
+}
+
+impl RepoEventPayload {
+    pub fn kind_str(&self) -> &'static str {
+        match self {
+            RepoEventPayload::RepoRebuilt {} => "repo_rebuilt",
+            RepoEventPayload::RepoUnwatched { .. } => "repo_unwatched",
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -585,5 +600,24 @@ pub struct PlanEvent {
     pub ts: i64,
     pub plan_id: String,
     pub lifecycle: PlanLifecycle,
-    pub kind: PlanEventKind,
+    #[serde(flatten)]
+    pub payload: PlanEventPayload,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum PlanEventPayload {
+    PlanWorktreeChanged { path: String },
+    FeedbackChanged {},
+    FeedbackRemoved {},
+}
+
+impl PlanEventPayload {
+    pub fn kind_str(&self) -> &'static str {
+        match self {
+            PlanEventPayload::PlanWorktreeChanged { .. } => "plan_worktree_changed",
+            PlanEventPayload::FeedbackChanged {} => "feedback_changed",
+            PlanEventPayload::FeedbackRemoved {} => "feedback_removed",
+        }
+    }
 }

@@ -16,9 +16,8 @@ use crate::fs_watcher::FilesystemSignal;
 use crate::lifecycle::{PlanKey, content_hash};
 use crate::rebuild::{RebuildError, rebuild_repo};
 use crate::repo_state::RepoState;
-use crate::repo_state::{
-    Feedback, LiveEvent, Plan, PlanEvent, PlanEventKind, RepoEvent, RepoEventKind, Trinity,
-};
+use crate::repo_state::{Feedback, LiveEvent, Plan, PlanEvent, RepoEvent, Trinity};
+use trinity_wire::dto::{PlanEventPayload, RepoEventPayload};
 
 pub struct Runtime {
     state: Arc<Mutex<Trinity>>,
@@ -161,8 +160,7 @@ impl Runtime {
             LiveEvent::Repo(RepoEvent {
                 ts: now,
                 repo: canonical,
-                kind: RepoEventKind::RepoUnwatched,
-                payload: serde_json::json!({ "plan_count": plan_count }),
+                payload: RepoEventPayload::RepoUnwatched { plan_count },
             }),
         );
         RemoveOutcome::Removed { plan_count }
@@ -282,8 +280,7 @@ impl Runtime {
                             LiveEvent::Repo(RepoEvent {
                                 ts: now,
                                 repo: repo_root.to_path_buf(),
-                                kind: RepoEventKind::RepoRebuilt,
-                                payload: serde_json::Value::Null,
+                                payload: RepoEventPayload::RepoRebuilt {},
                             }),
                         );
                     }
@@ -308,8 +305,9 @@ impl Runtime {
                         repo: repo_root.to_path_buf(),
                         plan_id,
                         lifecycle,
-                        kind: PlanEventKind::PlanWorktreeChanged,
-                        payload: serde_json::json!({"path": path.to_string_lossy()}),
+                        payload: PlanEventPayload::PlanWorktreeChanged {
+                            path: path.to_string_lossy().into_owned(),
+                        },
                     }),
                 );
             }
@@ -343,8 +341,7 @@ impl Runtime {
                         repo: repo_root.to_path_buf(),
                         plan_id,
                         lifecycle,
-                        kind: PlanEventKind::FeedbackChanged,
-                        payload: serde_json::Value::Null,
+                        payload: PlanEventPayload::FeedbackChanged {},
                     }),
                 );
             }
@@ -372,8 +369,7 @@ impl Runtime {
                         repo: repo_root.to_path_buf(),
                         plan_id,
                         lifecycle,
-                        kind: PlanEventKind::FeedbackRemoved,
-                        payload: serde_json::Value::Null,
+                        payload: PlanEventPayload::FeedbackRemoved {},
                     }),
                 );
             }
