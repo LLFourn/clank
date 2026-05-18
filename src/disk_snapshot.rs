@@ -125,19 +125,23 @@ impl FoldCarry {
         for fb in feedback_files {
             let verdict = parse_verdict(&fb.body);
             let author = fb.parsed.author.clone();
+            let feedback = Feedback {
+                author: author.clone(),
+                verdict,
+                body: fb.body,
+                path: fb.abs_path.to_string_lossy().into_owned(),
+                created_at: fb.created_at,
+            };
+            // Invariant: when `Feedback` is stored under
+            // `CommitGate.feedback[author]`, the value's `author`
+            // field equals the map key. The redundancy is bounded
+            // — this is the one writer where the gate is built from
+            // disk; downstream readers can rely on the invariant.
+            debug_assert_eq!(&feedback.author, &author);
             feedback_by_plan
                 .entry(fb.parsed.plan_key.clone())
                 .or_default()
-                .insert(
-                    (fb.parsed.target_sha, fb.parsed.author),
-                    Feedback {
-                        author,
-                        verdict,
-                        body: fb.body,
-                        path: fb.abs_path.to_string_lossy().into_owned(),
-                        created_at: fb.created_at,
-                    },
-                );
+                .insert((fb.parsed.target_sha, fb.parsed.author), feedback);
         }
         Self {
             current_effective: None,
@@ -1085,5 +1089,42 @@ mod tests {
         let state = derive_state(PathBuf::from("/r"), snap(vec![event_at("c1c1", 100)]));
         let plan = &state.plans[&sess("foo")];
         assert_eq!(plan.last_activity_ts, 100);
+    }
+
+    /// `wasm-markdown-rendering.md` Phase 2 made `Feedback` carry
+    /// an `author` field redundant with the `CommitGate.feedback`
+    /// map key. Pin the invariant at the fold/ingest boundary:
+    /// every key equals its value's `author`. If a future writer
+    /// drifts the redundancy, this regression catches it before
+    /// projection / wire code starts trusting the wrong half.
+    #[test]
+    fn commit_gate_feedback_key_matches_value_author() {
+        let state = derive_state(
+            PathBuf::from("/r"),
+            snap_with_feedback(
+                vec![event(
+                    "c1c1",
+                    vec![intro_with_body("foo", "# foo\n")],
+                    false,
+                )],
+                vec![
+                    feedback("foo", "c1c1", "alice", "APPROVE\n\nlgtm\n"),
+                    feedback("foo", "c1c1", "bob", "REQUEST_CHANGES\n\nbug\n"),
+                ],
+            ),
+        );
+        let plan = &state.plans[&sess("foo")];
+        let gate = plan
+            .timeline
+            .iter()
+            .find_map(|e| e.gate.as_ref())
+            .expect("foo's intro commit must carry a gate after fold");
+        assert!(!gate.feedback.is_empty(), "gate should have feedback");
+        for (key, value) in &gate.feedback {
+            assert_eq!(
+                key, &value.author,
+                "CommitGate.feedback invariant: map key must equal value.author"
+            );
+        }
     }
 }

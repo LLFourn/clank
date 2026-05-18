@@ -3,11 +3,11 @@
 //! newtypes serialize transparently, so daemon-side validation
 //! survives round-trip.
 //!
-//! Wire-only fields (today: `body_html` on `api::Feedback`) are
-//! NOT on these types. `api::Feedback` and `api::CommitGate`
-//! continue to carry rendered HTML, and the daemon's response
-//! projection (`src/responses.rs`) builds those from the storage
-//! shapes here.
+//! After `wasm-markdown-rendering.md` Phase 2, `model::Feedback`
+//! and `model::CommitGate` are re-exported as `api::Feedback` /
+//! `api::CommitGate` — one type per concept, no projection step.
+//! Rendered HTML lives in the wasm frontend (`frontend::markdown`);
+//! the wire ships raw markdown only.
 
 use std::collections::BTreeMap;
 

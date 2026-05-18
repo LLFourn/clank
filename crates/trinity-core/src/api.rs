@@ -6,9 +6,10 @@
 //!
 //! All string-valued closed-vocabulary fields are typed enums from
 //! [`crate::vocab`]. Validated newtype identifiers (commit SHAs,
-//! plan keys, agent labels, repo basenames) surface here as
-//! `String` — the daemon validates on parse, the frontend treats
-//! them opaquely.
+//! plan keys, agent labels, repo basenames) surface as their
+//! `crate::ids` newtypes — serde-transparent over `String`, so
+//! the wire form is unchanged from "plain string" but both ends
+//! validate on parse / deserialize.
 //!
 //! Tagged enums use `#[serde(tag = "kind")]` so kind-dependent
 //! response shapes have ONE discriminator in the type system AND

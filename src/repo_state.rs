@@ -158,10 +158,10 @@ impl StateDigest {
 }
 
 /// Plan, PlanTimelineEvent, Feedback are the daemon's fold-state
-/// types — defined once in `trinity_core::model` and shared with
-/// the wire. `body_html`-bearing wire shapes (`api::Feedback`,
-/// `api::CommitGate`) are still built by the response projection
-/// step from these model types.
+/// types — defined once in `trinity_core::model` and re-exported
+/// here AND on `api::*` so daemon storage and wire response are
+/// one struct each. Rendered HTML lives in the wasm frontend
+/// (`frontend::markdown`), not on these types and not on the wire.
 pub use trinity_core::model::{Feedback, Plan, PlanTimelineEvent};
 
 pub use trinity_core::PlanLifecycle;

@@ -3,7 +3,15 @@
 //! Every HTTP route and every MCP tool that returns a response
 //! shape comes through here. The wire crate (`trinity_core::api`)
 //! owns the type definitions; this module owns the per-endpoint
-//! field selection plus the body_html rendering for `Feedback`.
+//! field selection.
+//!
+//! After `wasm-markdown-rendering.md` Phase 2, `Feedback` and
+//! `CommitGate` projections collapse to identity — the wasm
+//! frontend renders markdown at display time, so the wire ships
+//! raw markdown. The `render_markdown` helper survives until
+//! Phase 4 only because `plan_body_html`,
+//! `PlanRevisionResponse.body_html`, and `FinalizeApproval.body_html`
+//! still cross the wire (Phase 3 drops them too).
 //!
 //! Disk reads go through the [`PlanStatusReader`] trait so tests
 //! can drop in a fake.

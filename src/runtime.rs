@@ -441,16 +441,18 @@ fn upsert_feedback(
             feedback: std::collections::BTreeMap::new(),
         });
     let author = parsed.author.clone();
-    gate.feedback.insert(
-        parsed.author,
-        Feedback {
-            author,
-            verdict,
-            body,
-            path: abs_path.to_string_lossy().into_owned(),
-            created_at,
-        },
-    );
+    let feedback = Feedback {
+        author: author.clone(),
+        verdict,
+        body,
+        path: abs_path.to_string_lossy().into_owned(),
+        created_at,
+    };
+    // Same invariant as `disk_snapshot::apply_commit`: the
+    // gate's map key equals the value's `author` field. Two
+    // writers, one rule.
+    debug_assert_eq!(&feedback.author, &parsed.author);
+    gate.feedback.insert(parsed.author, feedback);
 }
 
 fn remove_feedback(session: &mut Plan, parsed: &crate::disk_format::FeedbackPath) {
