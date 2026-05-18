@@ -287,25 +287,52 @@ Even allowed exceptions stay out of core domain logic.
 
 ## Implementation Phases
 
-### Phase 1: Inventory + Guard Test
+### Phase 1: Inventory + Guard Tests
 
-Output is two things:
+The acceptance criteria below name TWO invariants — "no `json!` /
+`Value` in production response paths" AND "no production code
+branches on serialized strings for closed vocabularies." Those are
+different checks. Phase 1 produces TWO guards, one per invariant.
 
-1. **A guard test** that fails CI when production response modules
-   gain new `json!` or `serde_json::Value` usage outside an
-   allowlist. The allowlist starts at "every current site"; phases
-   2-7 drain it. Implementation: a `#[test]` that greps the
-   workspace for the offending tokens and asserts the count
-   matches the allowlist length. The point is that NEW dynamic-
-   JSON sites land with a CI failure and a justification, not
-   silently.
+**Guard A — dynamic-JSON guard.** A `#[test]` that greps the
+workspace for `json!(`, `serde_json::Value` return types,
+`axum::Json<Value>`, and `Value` field types in production
+modules. The set of currently-present sites becomes the
+allowlist; the test asserts the count matches the allowlist
+length. New unapproved sites fail CI.
 
-2. **A short audit document** classifying each existing site:
-   public response builder / protocol envelope / schema document
-   / runtime event payload / test-only / debug-only. This drives
-   the conversion order in phases 3-6.
+**Guard B — stringly-control-flow guard.** A second `#[test]`
+that fails CI on patterns the type system can't catch:
 
-No behavior changes in Phase 1.
+- `match <expr>.as_str() {` followed by string literals matching
+  known closed-vocab variants (`"finished"`, `"active"`,
+  `"commit_needs_review"`, `"request_changes"`, `"finalize"`,
+  `"plan_only"`, `"code_only"`, `"mixed"`, `"multi_plan"`,
+  `"reviewers"`, `"master"`, etc.);
+- `<expr> == "<known-vocab-string>"` outside the wire crate's
+  own snake-case-rename tests;
+- DTO struct fields named `kind | state | phase | reason | role |
+  verdict | lifecycle | posture | worktree_status` typed as
+  `String` rather than the corresponding enum;
+- Frontend code matching on string literals for the same
+  vocabularies.
+
+Same allowlist mechanism: every current site is recorded with a
+short reason; phases 4-6 drain it; new unapproved sites fail CI.
+
+**Output documents.**
+
+- An audit classifying every existing dynamic-JSON site (public
+  response builder / protocol envelope / schema document /
+  runtime event payload / test-only / debug-only). Drives the
+  conversion order in phases 4-7.
+- An audit classifying every existing stringly-control-flow site
+  with the same dimensions. Drives Phase 3's enum-unification
+  and the conversion order for matches in phases 4-6.
+
+No behavior changes in Phase 1. Both guards START failing
+nothing — they pin the current state. Phases 2-8 drain both
+allowlists.
 
 ### Phase 2: Add `trinity-wire`
 
@@ -328,25 +355,57 @@ build and test it.
 
 ### Phase 3: Domain enum unification
 
-This is the architectural step that defines whether we have one
-source of truth or two.
+This is the architectural step that delivers one source of truth.
 
-- Re-route the daemon's domain enums (`PlanLifecycle`, `Posture`,
+- Move the daemon's domain enums (`PlanLifecycle`, `Posture`,
   `WaitingRole`, `WaitingReason`, `CommitKind`, `Verdict`,
-  `PlanWorktreeStatus`, `PlanTouchKind`) to the definitions in
-  `trinity-wire`. Either re-export via `pub use trinity_wire::*`
-  in `src/repo_state.rs`, or delete the daemon's parallel
-  definitions and update imports to point at the wire crate.
-- Keep the daemon's enum-specific impl blocks (helpers like
-  `CommitKind::is_reviewable()`, `PlanLifecycle::from_plan(&Plan)`)
-  in the daemon — `trinity-wire` stays free of domain logic.
+  `PlanWorktreeStatus`, `PlanTouchKind`) into `trinity-wire`.
+  `src/repo_state.rs` removes the type definitions and either
+  imports directly (`use trinity_wire::CommitKind;`) or
+  re-exports (`pub use trinity_wire::CommitKind;`) so existing
+  call sites compile unchanged.
+
+**Where the enum-related helper functions live.** The orphan
+rule forbids the daemon from adding inherent `impl Foo { ... }`
+blocks for a `Foo` defined in another crate, so each existing
+helper has to land on one side of the boundary:
+
+- **Pure enum semantics** (no daemon types in the signature)
+  belong on the enum, defined in `trinity-wire`:
+  - `CommitKind::as_str() -> &'static str`
+  - `CommitKind::is_reviewable() -> bool`
+  - `PlanLifecycle::as_str() -> &'static str`
+  - `Posture::as_str() -> &'static str`
+  - `WaitingRole::as_str() -> &'static str`
+  - `WaitingReason::as_str() -> &'static str`
+  - `Verdict::as_str() -> &'static str`
+  - `PlanWorktreeStatus::as_str() -> &'static str`
+  - `PlanTouchKind::as_str() -> &'static str`
+
+- **Daemon-dependent helpers** (signatures mention `Plan`,
+  `Trinity`, runtime state, anything not in `trinity-wire`)
+  become methods on the daemon-owned struct or free functions
+  in `projection`. Specifically:
+  - `PlanLifecycle::from_plan(plan: &Plan) -> PlanLifecycle`
+    becomes `impl Plan { pub fn lifecycle(&self) -> PlanLifecycle }`
+    in the daemon. Same call site ergonomics, no orphan-rule
+    violation.
+
+The general pattern: if the helper's signature only mentions
+types defined in `trinity-wire` (or stdlib), it lives in
+`trinity-wire`. If it mentions any daemon-only type, it moves to
+that daemon-side struct (`impl Plan { ... }`) or a free function
+in `projection`. The daemon-internal `as_str()` use sites stay
+identical because the methods stay reachable through the
+re-exported enum type.
+
 - Validated-newtype identifiers (`PlanKey`, `CommitSha`,
-  `AgentLabel`) stay in `trinity::lifecycle`. They surface as
-  `String` on the wire.
+  `AgentLabel`, `RepoBasename`, `ContentHash`) stay in
+  `trinity::lifecycle`. They surface as `String` on the wire.
 
 After Phase 3, the workspace has ONE definition of each closed-
-vocabulary enum, used by both daemon domain code and wire
-serialization.
+vocabulary enum, and every existing helper has a clear home that
+respects the orphan rule.
 
 ### Phase 4: Convert MCP responses
 
