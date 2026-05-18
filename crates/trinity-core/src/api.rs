@@ -53,59 +53,40 @@ pub struct Feedback {
 }
 
 /// One commit's review gate. Cumulative-participant set plus the
-/// per-commit verdict breakdown plus each participant's feedback
-/// body. Empty `feedback` map means no reviewer has posted yet.
+/// per-commit verdict breakdown plus each participant's rendered
+/// feedback body. Empty `feedback` map means no reviewer has
+/// posted yet. AgentLabel is serde-transparent so the wire form
+/// of the `Vec<AgentLabel>` fields is `[String]` — identical to
+/// the prior `Vec<String>` shape.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CommitGate {
     pub state: CommitGateState,
     /// Every reviewer who has ever posted on any reviewable commit
     /// of this plan (cumulative).
-    pub participants: Vec<String>,
+    pub participants: Vec<crate::ids::AgentLabel>,
     /// Approvers ON THIS COMMIT.
-    pub approvers: Vec<String>,
+    pub approvers: Vec<crate::ids::AgentLabel>,
     /// Requesters of changes ON THIS COMMIT.
-    pub requesters: Vec<String>,
+    pub requesters: Vec<crate::ids::AgentLabel>,
     /// Authors who posted Unmarked verdicts on this commit.
-    pub ambiguous: Vec<String>,
+    pub ambiguous: Vec<crate::ids::AgentLabel>,
     /// Participants who haven't voted on this commit yet.
-    pub missing: Vec<String>,
+    pub missing: Vec<crate::ids::AgentLabel>,
     /// Feedback bodies on this commit, keyed by author.
-    pub feedback: BTreeMap<String, Feedback>,
+    pub feedback: BTreeMap<crate::ids::AgentLabel, Feedback>,
 }
 
-/// Per-commit row on the MCP `commits[]` response. `gate` is `Some`
-/// for reviewable kinds (PlanOnly, CodeOnly, Mixed); `None` for
-/// non-reviewable kinds (MultiPlan, Finalize). `feedback` is the
-/// compact `{author, verdict}` summary form for agent consumers.
+/// One row in `commits[]` — same shape for MCP and HTTP. Carries
+/// the per-author feedback bodies (rendered HTML included) so a
+/// single response covers both agent and SPA consumers. `gate` is
+/// `Some` for reviewable kinds (PlanOnly, CodeOnly, Mixed); `None`
+/// for non-reviewable kinds (MultiPlan, Finalize).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CommitRow {
     pub sha: String,
     pub kind: CommitKind,
     pub gate: Option<CommitGate>,
-    /// Verdict-summary list per author for this commit. Subset of
-    /// `gate.feedback` projection; the MCP `commits[]` consumer
-    /// (agents) only need author + verdict.
-    pub feedback: Vec<FeedbackSummary>,
-}
-
-/// Per-commit row on the UI's `/api/plan/...` response. Same
-/// classification as `CommitRow`, but `feedback` carries full
-/// bodies (body_raw + body_html + path + created_at) so the SPA
-/// can render feedback cards without further round-trips.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct CommitRowDetail {
-    pub sha: String,
-    pub kind: CommitKind,
-    pub gate: Option<CommitGate>,
     pub feedback: Vec<Feedback>,
-}
-
-/// `{ author, verdict }` summary — the compact form on the MCP
-/// `commits[]` array. Full bodies are on the matching `CommitGate`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct FeedbackSummary {
-    pub author: String,
-    pub verdict: Verdict,
 }
 
 /// One row in a plan's per-session timeline. Kind-dependent shape
@@ -368,7 +349,7 @@ pub struct PlanDetailResponse {
     pub latest_implementation_revision: Option<CommitRef>,
     pub plan_revisions: Vec<String>,
     pub implementation_commits: Vec<String>,
-    pub commits: Vec<CommitRowDetail>,
+    pub commits: Vec<CommitRow>,
     pub latest_relevant_commit: Option<String>,
     /// Sanitized HTML of the plan body. For `lifecycle == Finished`
     /// this is the body at the freeze commit (captured by the

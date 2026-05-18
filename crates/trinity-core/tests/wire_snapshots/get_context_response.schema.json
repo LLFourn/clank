@@ -10,6 +10,10 @@
       "feedback": [
         {
           "author": "string",
+          "body_html": "string",
+          "body_raw": "string",
+          "created_at": "integer",
+          "path": "string",
           "verdict": "string"
         }
       ],

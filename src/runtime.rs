@@ -541,7 +541,7 @@ fn _hash_ref(s: &str) -> crate::lifecycle::ContentHash {
 mod tests {
     use super::*;
     use crate::lifecycle::{AgentLabel, CommitSha, PlanKey};
-    use crate::mcp_response::{get_context_response, list_plans_response};
+    use crate::responses::{get_context_response, list_plans_response};
     use std::path::Path;
     use std::process::Command;
 

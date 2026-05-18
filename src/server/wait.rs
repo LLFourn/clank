@@ -20,9 +20,9 @@ use serde::Deserialize;
 use tokio::sync::broadcast::error::RecvError;
 
 use crate::lifecycle::{AgentLabel, CommitSha, ContentHash, PlanKey};
-use crate::mcp_response::compute_plan_worktree_status_parts;
 use crate::projection::waiting_on;
 use crate::repo_state::{Trinity, WaitingReason, WaitingRole};
+use crate::responses::compute_plan_worktree_status_parts;
 use crate::review_state::CommitGate;
 use crate::runtime::Runtime;
 use trinity_core::api::{WaitTimeout, WorkAction, WorkPayload};

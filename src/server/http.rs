@@ -287,7 +287,7 @@ async fn api_plans(
                 .map_err(AppError::runtime)?,
         );
     }
-    let v = crate::ui_response::plans_index_across(&snapshots).map_err(AppError::io)?;
+    let v = crate::responses::plans_index_across(&snapshots).map_err(AppError::io)?;
     Ok(axum::Json(v))
 }
 
@@ -305,7 +305,7 @@ fn enforce_plan_visible(
         .values()
         .next()
         .expect("single_plan invariant");
-    let status = crate::mcp_response::compute_plan_worktree_status_parts(
+    let status = crate::responses::compute_plan_worktree_status_parts(
         &snapshot.root,
         &plan.plan_path,
         &plan.body_hash,
@@ -331,7 +331,7 @@ async fn api_plan_detail(
         .map_err(AppError::runtime)?
         .ok_or_else(|| AppError::not_found(format!("plan {repo_basename}/{stem_md} not found")))?;
     enforce_plan_visible(&snapshot, &repo_basename, &stem_md)?;
-    let v = crate::ui_response::plan_page(&snapshot)
+    let v = crate::responses::plan_page(&snapshot)
         .map_err(AppError::io)?
         .expect("plan_page returns Some after enforce_plan_visible");
     Ok(axum::Json(v))
@@ -368,7 +368,7 @@ async fn api_plan_revision(
     let body_raw = crate::git_io::show_blob(&repo, &commit_sha, &path_at_sha)
         .await
         .map_err(|e| AppError::internal(format!("git show: {e}")))?;
-    let body_html = crate::ui_response::render_markdown(&body_raw);
+    let body_html = crate::responses::render_markdown(&body_raw);
 
     let previous_sha = pos
         .checked_sub(1)
@@ -376,7 +376,7 @@ async fn api_plan_revision(
         .map(|c| c.as_str().to_string());
     let next_sha = plan_revisions.get(pos + 1).map(|c| c.as_str().to_string());
 
-    let feedback = crate::ui_response::feedback_for_target(plan, &commit_sha);
+    let feedback = crate::responses::feedback_for_target(plan, &commit_sha);
     Ok(axum::Json(trinity_core::api::PlanRevisionResponse {
         repo: snapshot.root.to_string_lossy().to_string(),
         plan_id: format!("{repo_basename}/{stem_md}"),
@@ -451,7 +451,7 @@ async fn api_commit_diff(
                         .strip_suffix(".md")
                         .unwrap_or(&filename)
                         .to_string();
-                    let body_html = crate::ui_response::render_markdown(&body);
+                    let body_html = crate::responses::render_markdown(&body);
                     FinalizeApproval {
                         author,
                         filename,
@@ -464,13 +464,13 @@ async fn api_commit_diff(
             }
         }
         CommitKind::PlanOnly => CommitDetail::PlanOnly {
-            feedback: crate::ui_response::feedback_for_target(plan, &commit_sha),
+            feedback: crate::responses::feedback_for_target(plan, &commit_sha),
         },
         CommitKind::CodeOnly => CommitDetail::CodeOnly {
-            feedback: crate::ui_response::feedback_for_target(plan, &commit_sha),
+            feedback: crate::responses::feedback_for_target(plan, &commit_sha),
         },
         CommitKind::Mixed => CommitDetail::Mixed {
-            feedback: crate::ui_response::feedback_for_target(plan, &commit_sha),
+            feedback: crate::responses::feedback_for_target(plan, &commit_sha),
         },
         CommitKind::MultiPlan => CommitDetail::MultiPlan {},
         CommitKind::Unattributed => {

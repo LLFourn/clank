@@ -92,22 +92,16 @@ fn feedback_fixture() -> Feedback {
     }
 }
 
-fn feedback_summary_fixture() -> FeedbackSummary {
-    FeedbackSummary {
-        author: "alice".into(),
-        verdict: Verdict::Approve,
-    }
-}
-
 fn commit_gate_fixture() -> CommitGate {
+    let alice = AgentLabel::parse("alice").unwrap();
     CommitGate {
         state: CommitGateState::Approved,
-        participants: vec!["alice".into()],
-        approvers: vec!["alice".into()],
+        participants: vec![alice.clone()],
+        approvers: vec![alice.clone()],
         requesters: vec![],
         ambiguous: vec![],
         missing: vec![],
-        feedback: BTreeMap::from([("alice".to_string(), feedback_fixture())]),
+        feedback: BTreeMap::from([(alice, feedback_fixture())]),
     }
 }
 
@@ -143,15 +137,6 @@ fn archived_fixture() -> ArchivedCycle {
 
 fn commit_row_fixture() -> CommitRow {
     CommitRow {
-        sha: "abc".into(),
-        kind: CommitKind::PlanOnly,
-        gate: Some(commit_gate_fixture()),
-        feedback: vec![feedback_summary_fixture()],
-    }
-}
-
-fn commit_row_detail_fixture() -> CommitRowDetail {
-    CommitRowDetail {
         sha: "abc".into(),
         kind: CommitKind::PlanOnly,
         gate: Some(commit_gate_fixture()),
@@ -295,7 +280,7 @@ fn schema_plan_detail_response() {
         latest_implementation_revision: None,
         plan_revisions: vec!["abc".into()],
         implementation_commits: vec![],
-        commits: vec![commit_row_detail_fixture()],
+        commits: vec![commit_row_fixture()],
         latest_relevant_commit: Some("abc".into()),
         plan_body_html: "<p>hi</p>".into(),
         plan_body_truncated: false,

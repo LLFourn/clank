@@ -12,9 +12,8 @@ pub mod review_state;
 // IO + runtime layers.
 pub mod fs_watcher;
 pub mod git_io;
-pub mod mcp_response;
+pub mod responses;
 pub mod runtime;
-pub mod ui_response;
 
 // The MCP stdio shim — forwards tool calls to the daemon's HTTP endpoint.
 pub mod mcp_shim;

@@ -8,7 +8,7 @@ use serde_json::{Value, json};
 use super::AppState;
 use super::wait::{WaitArgs, WaitError, wait_for_work as run_wait_for_work};
 use crate::lifecycle::{AgentLabel, PlanId, PlanKey, RepoBasename};
-use crate::mcp_response::{get_context_response, list_plans_response};
+use crate::responses::{get_context_response, list_plans_response};
 
 #[derive(Debug, Deserialize)]
 pub struct ToolCallRequest {
