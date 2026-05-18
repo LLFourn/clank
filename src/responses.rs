@@ -586,18 +586,11 @@ fn build_commits_array(plan: &Plan) -> Vec<CommitRow> {
         out.push(CommitRow {
             sha: event.sha.as_str().to_string(),
             kind: event.kind,
-            gate: Some(build_commit_gate(gate)),
+            gate: Some(gate.clone()),
             feedback,
         });
     }
     out
-}
-
-// `model::CommitGate` IS `api::CommitGate` now that `Feedback` is
-// one type. The projection is a clone; the wire shape and the
-// storage shape are byte-identical.
-fn build_commit_gate(g: &CommitGate) -> trinity_core::api::CommitGate {
-    g.clone()
 }
 
 fn build_timeline(plan: &Plan) -> Vec<TimelineEvent> {
