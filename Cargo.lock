@@ -3346,11 +3346,13 @@ dependencies = [
 name = "trinity-frontend"
 version = "0.0.1"
 dependencies = [
+ "ammonia",
  "console_error_panic_hook",
  "gloo-net",
  "js-sys",
  "leptos",
  "leptos_router",
+ "pulldown-cmark",
  "serde",
  "serde_json",
  "trinity-core",
