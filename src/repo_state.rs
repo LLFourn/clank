@@ -85,13 +85,12 @@ impl RepoState {
                         Some(PlanTouchKind::Revision)
                     }
                 }
-                CommitKind::CodeOnly | CommitKind::Unattributed => None,
+                CommitKind::CodeOnly | CommitKind::Finalize | CommitKind::Unattributed => None,
             };
-            let has_code_changes = matches!(event.kind, CommitKind::CodeOnly | CommitKind::Mixed);
             out.push(TimelineEvent::Commit {
                 sha: event.sha.clone(),
+                kind: event.kind,
                 plan_touch,
-                has_code_changes,
                 subject: event.subject.clone(),
             });
             if let Some(gate) = &event.gate {
@@ -195,15 +194,16 @@ impl RepoState {
 /// or MCP context entries; the core just emits them in order.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TimelineEvent {
-    /// A commit attributed to this session. The render layer decides
-    /// whether to label it "Plan revision" / "Implementation" / "Mixed"
-    /// based on `(plan_touch, has_code_changes)`. `subject` is the
-    /// first line of the commit message — populated from
-    /// `RepoState::commit_meta` at projection time.
+    /// A commit on this plan's timeline. `kind` is the per-plan
+    /// classification copied from the underlying `PlanTimelineEvent`;
+    /// renderers exhaustive-match on it to emit the wire kind string
+    /// (`commit_plan` / `commit_impl` / `commit_mixed` /
+    /// `commit_finalize`). `plan_touch` distinguishes intro vs
+    /// revision; `subject` is the commit's first line.
     Commit {
         sha: CommitSha,
+        kind: CommitKind,
         plan_touch: Option<PlanTouchKind>,
-        has_code_changes: bool,
         subject: String,
     },
     /// A reviewer's verdict against a specific commit. Always follows
@@ -456,11 +456,10 @@ impl PlanTouchKind {
     }
 }
 
-/// Per-(plan, commit) classification under the commit-centric review
-/// model. Derived from `plan_touches` + `attribution`; see
-/// `projection::commit_kind_for`. Phase 1 uses this only for unit-test
-/// coverage and the additive `Plan.commits` map; phase 2 wires it
-/// into projections, MCP responses, and the UI.
+/// Per-(plan, commit) classification carried on each
+/// `PlanTimelineEvent`. Set by `disk_snapshot::apply_commit` when the
+/// fold appends the event; consumed by projections to drive
+/// reviewable / waiting-on / phase decisions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CommitKind {
     /// Touches exactly this plan file (single-plan-touch) and no code.
@@ -473,8 +472,16 @@ pub enum CommitKind {
     /// Touches two or more distinct plan files on a single commit.
     /// Surfaced in the timeline but never gated.
     MultiPlan,
+    /// The lifecycle commit that froze the plan — `.trinity/finished/
+    /// <stem>/` satisfied the finalize rule at this commit's tree.
+    /// Visible in the timeline as a clickable boundary; not a review
+    /// target, no `CommitGate`, no effect on `waiting_on`. The
+    /// approval files live in `.trinity/finished/<stem>/` at this
+    /// commit, not as live feedback.
+    Finalize,
     /// Commit has no relevance to this plan (no touch, attribution
-    /// belongs to another plan, or unattributed).
+    /// belongs to another plan, or unattributed). Never appears on a
+    /// plan's timeline.
     Unattributed,
 }
 
@@ -485,12 +492,13 @@ impl CommitKind {
             CommitKind::CodeOnly => "code_only",
             CommitKind::Mixed => "mixed",
             CommitKind::MultiPlan => "multi_plan",
+            CommitKind::Finalize => "finalize",
             CommitKind::Unattributed => "unattributed",
         }
     }
 
-    /// Reviewable commits get a `CommitGate` entry in `Plan.commits`.
-    /// `MultiPlan` and `Unattributed` are intentionally excluded.
+    /// Reviewable kinds carry a `CommitGate` on their timeline event.
+    /// `MultiPlan` / `Finalize` / `Unattributed` are excluded.
     pub fn is_reviewable(self) -> bool {
         matches!(
             self,

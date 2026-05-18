@@ -332,18 +332,21 @@ fn timeline_value(state: &RepoState, session_id: &PlanKey) -> Vec<Value> {
         .map(|e| match e {
             crate::repo_state::TimelineEvent::Commit {
                 sha,
+                kind,
                 plan_touch,
-                has_code_changes,
                 subject,
             } => {
-                let kind = match (plan_touch.is_some(), has_code_changes) {
-                    (true, true) => "commit_mixed",
-                    (true, false) => "commit_plan",
-                    (false, true) => "commit_impl",
-                    (false, false) => "commit_other",
+                use crate::repo_state::CommitKind;
+                let wire_kind = match kind {
+                    CommitKind::PlanOnly | CommitKind::MultiPlan => "commit_plan",
+                    CommitKind::CodeOnly => "commit_impl",
+                    CommitKind::Mixed => "commit_mixed",
+                    CommitKind::Finalize => "commit_finalize",
+                    CommitKind::Unattributed => "commit_other",
                 };
+                let has_code_changes = matches!(kind, CommitKind::CodeOnly | CommitKind::Mixed);
                 json!({
-                    "kind": kind,
+                    "kind": wire_kind,
                     "sha": sha.as_str(),
                     "plan_touch": plan_touch.as_ref().map(|k| k.as_str()),
                     "has_code_changes": has_code_changes,

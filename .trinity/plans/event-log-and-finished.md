@@ -141,19 +141,36 @@ already discarded.
 ### Finalize commit
 
 A commit that creates or modifies `.trinity/finished/<plan-stem>/`.
-The finalize commit is a normal commit: it shows up in the timeline,
-reviewers can still post feedback on it. But late feedback does
-*not* unfinish the cycle — the snapshot is authoritative once
-landed.
+The finalize commit is a **lifecycle boundary**, not a review
+target:
+
+- It is visible in the timeline as a clickable `commit_finalize`
+  row.
+- It is NOT a review target — Trinity does NOT create a
+  `CommitGate` for it and live `.trinity/feedback/...` writes
+  targeting its SHA are dropped (`upsert_feedback` refuses
+  non-reviewable events). The finalize event always has
+  `gate: None`.
+- It does not feed `waiting_on`. Once the plan freezes, the
+  master/reviewer waiting machinery is sealed end-to-end.
+- Clicking it shows the `.trinity/finished/<stem>/` approval
+  snapshot from the freeze commit's tree (read at render time
+  via `git show <frozen_at>:.trinity/finished/<stem>/...`), not
+  live feedback.
+
+`.trinity/feedback/<stem>/<sha>/<agent>.md` is live review
+feedback for reviewable plan/impl commits.
+`.trinity/finished/<stem>/<agent>.md` is the finalized approval
+snapshot. They are never conflated in gate logic.
 
 Trust model: the daemon does not validate snapshot contents at
 read time beyond the file checks in §Finished plan. Any process
 with commit access can write a snapshot directly into git;
 ensuring those files reflect genuine reviewer approval is the
 job of whichever tool produces the finalize commit (see
-`trinity-cli` stub). Late reviewers who notice a discrepancy can
-flag it via the normal feedback mechanism, but Trinity does not
-auto-invalidate the snapshot.
+`trinity-cli` stub). Late reviewers who notice a discrepancy
+must address it via a future plan (e.g. open a new plan to
+re-examine the work) — they cannot rescind the freeze.
 
 ### Finished plan
 

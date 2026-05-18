@@ -37,8 +37,9 @@ impl ReviewVerdict {
 }
 
 /// Per-commit gate state under the commit-centric review model.
-/// The authoritative store for review state — `Plan.commits` maps
-/// each reviewable commit SHA to one of these.
+/// Each reviewable `PlanTimelineEvent` (i.e. one whose `kind` is
+/// `PlanOnly` / `CodeOnly` / `Mixed`) carries an `Option<CommitGate>`;
+/// non-reviewable kinds (`MultiPlan` / `Finalize`) leave it `None`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CommitGateState {
@@ -71,10 +72,11 @@ impl CommitGateState {
 /// `requesters` / `ambiguous` are scoped to *this* SHA only.
 /// `missing` = participants \ (approvers ∪ requesters ∪ ambiguous).
 ///
-/// All `Vec` fields are deduped and ordered by first-seen-in-
-/// `commit_order` (the construction loop in `projection::build_commit_gates`
-/// enforces this; the type doesn't, in deference to the UI which
-/// reads them as display lists).
+/// All `Vec` fields are deduped and ordered by first-seen across
+/// the plan's `timeline` (the fold walks events in chronological
+/// order and threads the cumulative-participant carry through
+/// `build_gate_step`; the type doesn't enforce order, in deference
+/// to the UI which reads them as display lists).
 ///
 /// `feedback` carries the verdict-bearing files on this commit
 /// keyed by author. UI / MCP responses read bodies and rendered

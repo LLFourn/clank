@@ -181,9 +181,8 @@ impl Runtime {
     }
 
     /// Clone a single-plan slice of `RepoState`: just the requested
-    /// plan in `plans`, with `plan_conflicts` cleared. Repo-level
-    /// indexes (`attribution`, `plan_touches`, `commit_order`,
-    /// `commit_meta`) carry through. `Ok(None)` means the repo is
+    /// plan in `plans`, with `plan_conflicts` cleared. The plan's
+    /// `timeline` carries through. `Ok(None)` means the repo is
     /// known but the session is not committed.
     pub async fn snapshot_session(
         &self,
@@ -434,6 +433,14 @@ fn upsert_feedback(
         // Drop silently; the next full rebuild will re-attribute.
         return;
     };
+    if !event.kind.is_reviewable() {
+        // Non-reviewable events (Finalize / MultiPlan) never carry a
+        // gate. Live feedback targeting them is not actionable and
+        // must NOT synthesize gate state. Drop silently — the UI
+        // surfaces the snapshot for Finalize via .trinity/finished/
+        // at the freeze commit, not via the gate.
+        return;
+    }
     let gate = event
         .gate
         .get_or_insert_with(|| crate::review_state::CommitGate {

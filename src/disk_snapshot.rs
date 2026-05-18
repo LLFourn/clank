@@ -280,7 +280,13 @@ pub fn apply_commit(state: &mut RepoState, carry: &mut FoldCarry, event: &Commit
         maybe_affected.insert(touch.session.clone());
     }
 
-    // 4. Freeze rule.
+    // 4. Freeze rule. When fired, set `frozen_at` AND append a
+    //    `Finalize` timeline event so the lifecycle boundary is
+    //    visible/clickable in the timeline. Finalize events carry
+    //    `gate: None` — they are never review targets and don't feed
+    //    `waiting_on`. The approving files live in
+    //    `.trinity/finished/<stem>/` at this commit (a snapshot, not
+    //    live feedback).
     for plan_key in &maybe_affected {
         if !state.plans.contains_key(plan_key) {
             continue;
@@ -307,6 +313,16 @@ pub fn apply_commit(state: &mut RepoState, carry: &mut FoldCarry, event: &Commit
                         closer: commit_sha.clone(),
                         approver_count,
                     });
+                plan.timeline.push(PlanTimelineEvent {
+                    sha: commit_sha.clone(),
+                    kind: CommitKind::Finalize,
+                    author_ts: event.author_ts,
+                    subject: event.subject.clone(),
+                    gate: None,
+                });
+                if event.author_ts > plan.last_activity_ts {
+                    plan.last_activity_ts = event.author_ts;
+                }
             }
         }
     }
@@ -854,6 +870,47 @@ mod tests {
     }
 
     #[test]
+    fn finalize_commit_appears_as_visible_non_reviewable_timeline_event() {
+        // Codex regression: finalize is a lifecycle marker, not a
+        // review target. After a finalize-only commit, the plan must
+        // (a) have frozen_at set, (b) carry a Finalize timeline
+        // event for the freeze commit, (c) leave that event's gate
+        // as None, and (d) keep `latest_reviewable_event` pointing
+        // at the prior reviewable commit (not the freeze).
+        let state = derive_state(
+            PathBuf::from("/r"),
+            snap(vec![
+                event("c1c1", vec![intro_with_body("foo", "# foo\n")], false),
+                event_with_finalize("c2c2", vec![], vec![upsert("foo", "alice.md", "APPROVE")]),
+            ]),
+        );
+        let plan = &state.plans[&sess("foo")];
+        assert_eq!(plan.frozen_at, Some(sha("c2c2")));
+        let kinds: Vec<_> = plan
+            .timeline
+            .iter()
+            .map(|e| (e.sha.clone(), e.kind))
+            .collect();
+        assert_eq!(
+            kinds,
+            vec![
+                (sha("c1c1"), CommitKind::PlanOnly),
+                (sha("c2c2"), CommitKind::Finalize),
+            ]
+        );
+        let finalize_event = plan.event_for(&sha("c2c2")).expect("c2 on timeline");
+        assert!(
+            finalize_event.gate.is_none(),
+            "Finalize must not carry a gate"
+        );
+        assert_eq!(
+            plan.latest_reviewable_event().map(|e| e.sha.clone()),
+            Some(sha("c1c1")),
+            "latest reviewable skips Finalize"
+        );
+    }
+
+    #[test]
     fn timeline_order_preserves_intro_impl_revision_sequence() {
         // Codex regression: intro (c1) → impl (c2) → revision (c3)
         // must surface in that exact order. The prior split-bucket
@@ -897,11 +954,7 @@ mod tests {
         let state = derive_state(
             PathBuf::from("/r"),
             snap(vec![
-                event(
-                    "c1c1",
-                    vec![intro_with_body("frozen", "# frozen\n")],
-                    false,
-                ),
+                event("c1c1", vec![intro_with_body("frozen", "# frozen\n")], false),
                 event_with_finalize(
                     "c2c2",
                     vec![],

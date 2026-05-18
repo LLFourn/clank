@@ -419,17 +419,18 @@ fn timeline_value(session: &Plan) -> Vec<Value> {
     use crate::repo_state::CommitKind;
     let mut out = Vec::with_capacity(session.timeline.len() * 2);
     for event in &session.timeline {
+        let wire_kind = match event.kind {
+            CommitKind::PlanOnly | CommitKind::MultiPlan => "commit_plan",
+            CommitKind::CodeOnly => "commit_impl",
+            CommitKind::Mixed => "commit_mixed",
+            CommitKind::Finalize => "commit_finalize",
+            CommitKind::Unattributed => continue,
+        };
         let touched = matches!(
             event.kind,
             CommitKind::PlanOnly | CommitKind::Mixed | CommitKind::MultiPlan
         );
         let has_code_changes = matches!(event.kind, CommitKind::CodeOnly | CommitKind::Mixed);
-        let kind = match (touched, has_code_changes) {
-            (true, true) => "commit_mixed",
-            (true, false) => "commit_plan",
-            (false, true) => "commit_impl",
-            (false, false) => continue,
-        };
         let plan_touch = if touched {
             if event.sha == session.plan_intro {
                 Some(PlanTouchKind::Intro)
@@ -440,7 +441,7 @@ fn timeline_value(session: &Plan) -> Vec<Value> {
             None
         };
         out.push(json!({
-            "kind": kind,
+            "kind": wire_kind,
             "sha": event.sha.as_str(),
             "plan_touch": plan_touch.as_ref().map(|k| k.as_str()),
             "has_code_changes": has_code_changes,
@@ -464,11 +465,10 @@ fn timeline_value(session: &Plan) -> Vec<Value> {
 }
 
 /// Look up feedback entries (rich form) targeting `sha`. Reads from
-/// `Plan.commits[sha].feedback` (the canonical per-commit store) and
-/// derives the legacy "plan"/"impl" phase tag from the commit's
-/// `plan_touch` so existing wire consumers keep working until phase
-/// 2.5. Used by the `/api/sessions/:id/plan/:sha` and `/api/sessions/
-/// :id/commit/:sha` route handlers.
+/// the targeted `PlanTimelineEvent`'s gate. Used by the
+/// `/api/sessions/:id/plan/:sha` and `/api/sessions/:id/commit/:sha`
+/// route handlers. Returns empty if the SHA isn't on this plan's
+/// timeline or the event is non-reviewable (no gate).
 pub fn feedback_for_target(session: &Plan, sha: &CommitSha) -> Vec<Value> {
     let Some(event) = session.event_for(sha) else {
         return Vec::new();
