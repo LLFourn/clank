@@ -9,10 +9,13 @@ changes; one architectural goal.
 The MCP surface today mixes three different jobs:
 
 1. **Coordination** (`wait_for_work` — the real value).
-2. **Content transport**: `get_context` returns the daemon's
-   full per-plan fold — `commits[]` with all gates and feedback
-   bodies, full plan markdown, archived cycles, every timeline
-   event. The most recent `get_context` call in this session
+2. **Content transport**: `GetContextResponse` (the MCP shape;
+   distinct from the UI's `PlanDetailResponse`, which also
+   carries the plan body markdown) returns the per-plan fold's
+   bulky slices — `commits[]` with every gate and feedback body,
+   the full `timeline[]`, `plan_revisions[]`,
+   `implementation_commits[]`, `archived_cycles[]`, and a
+   `pr_hint`. The most recent `get_context` call in this session
    returned an 80 KB response that the harness had to spool to
    disk because it didn't fit in a tool-result.
 3. **Mixed-concern bootstrap**: `start_plan` does TWO things —
@@ -56,29 +59,41 @@ commits with gates and feedback, plan body markdown,
 shape.
 
 The new `work_context` response is just enough to act on the
-latest WFW result:
+latest WFW result. It preserves the typed coordination fields
+that today's `GetContextResponse` already carries — agents (and
+particularly reviewers) need them as first-class outputs, not
+loose pieces to reassemble:
 
 ```rust
 pub struct WorkContextResponse {
     pub plan_id: String,
     pub repo: String,
     pub current_path: String,
-    pub phase: PlanPhase,
+    pub lifecycle: PlanLifecycle,
+    pub phase: Posture,
+    pub plan_worktree_status: PlanWorktreeStatus,
     pub waiting_on: WaitingOn,
-    pub latest_relevant_commit: Option<CommitSha>,
-    pub review_target: Option<ReviewTarget>,  // sha + kind
-    pub feedback_locations: Vec<FeedbackLocation>,
-}
-
-pub struct FeedbackLocation {
-    pub path: String,           // ".trinity/feedback/foo/abc/codex.md"
-    pub role: FeedbackRole,     // Read | Write
+    pub expected_action: ExpectedAction,
+    pub review_target: Option<ReviewTarget>,
+    pub write_feedback: Option<WriteFeedback>,
+    pub latest_relevant_commit: Option<String>,
 }
 ```
 
-Dropped: `commits[]`, `latest_plan_revision`, `archived_cycles`,
-`plan_body`, full timeline. UI consumers keep using the
-`/api/plan/<id>` HTTP endpoint, which is unchanged.
+Preserved (already on `GetContextResponse`): `expected_action`
+(the typed work-action enum that maps to WFW), `write_feedback`
+(the canonical reviewer write path with target SHA + author),
+`review_target`, `waiting_on`, `phase`, `lifecycle`,
+`plan_worktree_status`, `current_path`, `latest_relevant_commit`.
+These are the coordination outputs.
+
+Dropped: `commits[]`, `timeline[]`, `plan_revisions[]`,
+`implementation_commits[]`, `archived_cycles[]`, `review_gate`,
+`latest_plan_revision`, `latest_implementation_revision`,
+`pr_hint`. These are UI / browse-all-content fields. The
+`/api/plan/<id>` HTTP endpoint (which projects from
+`PlanDetailResponse`, including `plan_body`) is unchanged for UI
+consumers.
 
 Rename `get_context` → `work_context`. No backward-compat alias;
 the only consumers are agents we control.
@@ -105,12 +120,32 @@ set_active_work { repo?, plan_id, author_label? } → { ok: true }
 clear_active_work { repo?, author_label? } → { ok: true }
 ```
 
-WFW's plan_id inference (already implemented at
-`src/server/wait.rs::compute_match` / the upstream resolver)
-consults this BEFORE raising `ambiguous_plan`. If a selection
-exists for the resolved `(repo, author_label)` pair, use it.
+Selection lookup is consulted at the **plan-id resolver**, not
+at `compute_match`. The resolver today is
+`src/server/mcp.rs::resolve_plan_id` (called from `get_context`
+at line 294 and from the WFW handler before
+`run_wait_for_work`). The new logic sits inside `resolve_plan_id`
+in this exact order:
 
-Storage: in-memory only on `Runtime`. Indexed by `(repo,
+1. If `plan_id` is explicit → use it (unchanged).
+2. Resolve `repo` (explicit `repo` arg, else cwd).
+3. **Consult `set_active_work` selection for `(repo,
+   author_label)`. If present AND the selected plan is still
+   active+visible in `repo`, return it.**
+4. Otherwise count active plans in `repo`:
+   - 1 active → return it (unchanged).
+   - 0 active → `NoActives` (unchanged).
+   - 2+ active → `Ambiguous` with candidates (unchanged).
+
+Stale-selection rule: at consult time, validate that the
+selected plan exists in the resolved repo's `plans` map, is not
+frozen (finished), and passes `is_visible`
+(`!frozen && !PlanFileMissing`). Any failure → drop the
+selection from memory and fall through to normal counting. This
+prevents selections from resurrecting finalized/deleted plans
+and recreating lifecycle bugs.
+
+Storage: in-memory only on `Runtime`. Indexed by `(RepoBasename,
 AgentLabel)`. Cleared on daemon restart. This is operational
 state — the same agent could legitimately want different active
 plans across sessions, and persisting would surprise more than
@@ -120,8 +155,7 @@ Must NOT:
 - Create plan files.
 - Change review gates.
 - Emit timeline events.
-- Reach `is_visible` projections (the selection is
-  inference-side, not display-side).
+- Bypass `is_visible` (validated at consult time, not stored).
 
 If the cleared/missing selection still results in
 `ambiguous_plan`, the error message lists candidate `plan_id`s
@@ -148,10 +182,18 @@ watch_repo { path? }
   → { repo, basename, watched: true|already_watching }
 ```
 
-`watch_repo` does steps 1–3. `path` defaults to the caller's
-cwd; explicit `path` (basename or absolute) supports the rare
-"watch a repo I'm not in" case. Idempotent — already-watching is
-a non-error.
+`watch_repo` does steps 1–3. `path` semantics:
+
+- absent → caller's cwd (the same flow `start_plan` uses today).
+- absolute path → canonicalize and register that root.
+- relative path → resolved against cwd, then canonicalized.
+- basename-only is NOT accepted for registration (an unknown
+  basename has no root to resolve to). Existing tools' `repo`
+  field already uses basename for lookup of already-watched
+  repos; that semantics stays separate.
+
+Idempotent — already-watching is a non-error
+(`watched: already_watching` in the response).
 
 Plan creation becomes a filesystem convention: write
 `.trinity/plans/<slug>.md`, commit it. The fold pipeline picks
@@ -185,23 +227,34 @@ flow. The other three phases land cleanly without it.
 ## Files touched (sketch)
 
 - `src/tools.rs` — drop `echo_cwd` entry, rename `get_context` →
-  `work_context`, drop `start_plan`'s description verbosity (add
-  the deprecation note), add `watch_repo`, `set_active_work`,
-  `clear_active_work` entries.
+  `work_context` (and tighten its description to match the
+  narrowed shape), drop `start_plan`'s description verbosity (add
+  the deprecation note pointing at `watch_repo` +
+  `.trinity/plans/<slug>.md`), add `watch_repo`,
+  `set_active_work`, `clear_active_work` entries.
 - `src/server/mcp.rs` — rename dispatcher branch
   `get_context` → `work_context`, add dispatcher branches for
   the three new tools. Keep `echo_cwd` branch (no catalog
-  advertisement but curl-able).
+  advertisement but curl-able). Inside `resolve_plan_id`, consult
+  the `set_active_work` selection at the right point with the
+  stale-validation rule above.
+- `src/mcp_shim/mod.rs` — autofill key map at line ~243 changes
+  `"get_context"` → `"work_context"`, adds entries for the three
+  new tools that take `author_label`. The instruction text at
+  line ~385 currently tells agents "follow up with
+  `get_context({plan_id})`" — rename to `work_context`. Any
+  other hard-coded references in the shim's tool-description
+  copy update accordingly.
 - `crates/trinity-core/src/api.rs` — new `WorkContextResponse`
-  shape; the old `PlanDetailResponse` stays for HTTP.
-- `src/server/mcp_shim/mod.rs` — autofill keys (line ~244)
-  update if the new tools take `author_label`.
-- `src/server/wait.rs` (or wherever inference lives) — consult
-  `set_active_work` selection before raising `ambiguous_plan`.
+  shape (the narrowed fields enumerated in Phase 2); the old
+  `GetContextResponse` is gone. `PlanDetailResponse` (HTTP)
+  unchanged.
+- `src/responses.rs` — `get_context_response*` builders become
+  `work_context_response*` and project only the new fields.
 - `src/runtime.rs` — `BTreeMap<(RepoBasename, AgentLabel),
   PlanKey>` for ephemeral selections; `set_active_work` /
-  `clear_active_work` mutators; `resolve_active_plan` lookup
-  used by inference.
+  `clear_active_work` mutators; `lookup_active_plan` accessor
+  used by the resolver.
 
 ## Testing
 
@@ -232,8 +285,13 @@ flow. The other three phases land cleanly without it.
 - `work_context` response carries only the narrowed fields
   enumerated above. A serde-deny-unknown round-trip test pins
   the shape.
-- `set_active_work` + WFW infers correctly: with a selection,
-  multiple-active-plans does NOT raise `ambiguous_plan`.
+- `set_active_work` + WFW infers correctly: with a valid
+  selection, multiple-active-plans does NOT raise
+  `ambiguous_plan`. With a stale selection (frozen / missing /
+  wrong repo), the resolver drops it and falls through to the
+  normal counting path.
+- `mcp_shim` autofill + instruction text reference
+  `work_context` (not `get_context`) after the rename.
 - `watch_repo` registers a fresh repo; re-watching is idempotent.
 - `start_plan` still works (deprecated label, same behavior).
 - HTTP `/api/plan/<id>` shape is unchanged; UI tests pass.
