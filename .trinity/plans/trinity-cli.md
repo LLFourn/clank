@@ -324,37 +324,85 @@ snapshot documents).
 
 ## Dry-run mode (`--dry`)
 
-Phase 4 implements `--dry` on `trinity purge`. The finish-side
-variants (`trinity finish --squash`/`--purge` etc.) land in
-Phase 5 and will share the same dry-run shape.
+`--dry` emits a `git rebase --interactive` todo list — the
+operator inspects it, optionally edits it, then runs git
+themselves. This replaces the earlier human-readable listing
+(strictly more useful: the operator can pipe it to git and
+execute the rewrite manually, or just read it as a preview).
 
-Output shape:
+Output format for `trinity purge --all --dry`:
 
 ```text
-trinity finish foo --squash "Implement foo" --dry
+# trinity purge --all preview for branch <current>
+# range: <intro_short>..<head_short> (N commits in rewrite range)
+# After running this rebase, your branch will have all .trinity/
+# paths stripped. Strip steps appear as `edit` so you can inspect
+# each commit's resulting tree before continuing.
+#
+# Run with:
+#   GIT_SEQUENCE_EDITOR="cp <this-file>" \
+#     git rebase --interactive --keep-empty <intro>^
 
-would squash 4 commits into 1:
-  abc1234  PlanOnly       Plan: foo
-  def5678  Mixed          Plan revision: address codex on abc1234
-  9012abc  CodeOnly       Implement foo
-  3456def  PlanOnly       (finalize tree would land here)
-
-resulting commit:
-  message: Implement foo
-  tree:    same as HEAD, plus .trinity/finished/foo/<author>.md
-
-would NOT touch:
-  - any commit before abc1234 (parent: parent-of-abc1234)
-  - any branch other than master
+drop  <intro_sha>    Plan: foo
+edit  <sha>          Phase 2 of trinity-cli
+# strip: .trinity/plans/foo.md
+# run: git rm --cached .trinity/plans/foo.md && \
+#      git commit --amend --no-edit --allow-empty && \
+#      git rebase --continue
+pick  <sha>          later code
+edit  <sha>          Address codex review
+# strip: .trinity/plans/foo.md, .trinity/.gitignore
+# run: git rm --cached .trinity/plans/foo.md .trinity/.gitignore && \
+#      git commit --amend --no-edit --allow-empty && \
+#      git rebase --continue
+drop  <sha>          Finalize
 ```
 
-For `--purge` mode, the listing shows per-commit disposition
-(`drop` / `keep verbatim` / `rewrite`) and the resulting
-parent chain. The engine builds its full rewrite plan; `--dry`
-just stops before any `git commit-tree` / `git update-ref`
-call. Best-effort — if a step would fail (e.g. dirty worktree,
-foreign commit in range), the dry-run reports the same failure
-the live run would, just earlier.
+Mapping from the daemon's manifest:
+
+- **Drop** → `drop <sha> <subject>`
+- **KeepVerbatim** → `pick <sha> <subject>`
+- **Rewrite** → `edit <sha> <subject>` with comment lines
+  showing the strip command. `edit` halts the rebase so the
+  operator can `git rm`/inspect/amend before `git rebase
+  --continue`. The strip command in the comment is
+  copy-pasteable but not auto-executed.
+
+The `# range:` header reports the commit count in the slice
+the engine would rewrite (intro → HEAD). Pre-intro commits
+don't appear — they're outside the rewrite range.
+
+Blockers (merge commit, dirty worktree, branch-already-exists)
+appear as `# BLOCKER: …` comment lines at the top of the
+output before any todo entries. The operator can still inspect
+the todo, but the live run would refuse.
+
+Caveats called out at the top of the output:
+
+- No `--into-branch` parity. To inspect on a side branch, the
+  operator does `git checkout -b scratch && git rebase --interactive --keep-empty <intro>^`.
+- The conditional `update-ref <expected>` guard the engine uses
+  isn't present in `git rebase`. The operator is responsible
+  for not racing other commits.
+- `--keep-empty` is required so commits whose entire diff was
+  Trinity (and which become empty after strip) aren't dropped
+  silently — they become explicit empty commits the operator
+  can review and decide to drop.
+
+For `trinity finish --squash`/`--purge` etc., the same
+rebase-todo format applies, with the finalize tree write
+emitted as a trailing `exec` line:
+
+```text
+exec mkdir -p .trinity/finished/foo && \
+     printf '%s' "<approval body>" > .trinity/finished/foo/codex.md && \
+     git add .trinity/finished/foo && \
+     git commit -m "Finalize foo"
+```
+
+Plain `trinity finish` (no purge/squash) doesn't use the todo
+format — it's a single commit and goes through the existing
+`finish_preview` flow.
 
 ## History-rewriting engine (shared)
 
@@ -501,19 +549,28 @@ later work.
   `cache/`; refuses to overwrite a different existing
   `.trinity/.gitignore`; warns on `.trinity/` already being
   globally excluded.
-- `trinity finish` performs the bare ceremony from an approved
-  gate to a committed finalize tree, with `--amend`. The
-  `--squash`, `--squash --purge`, and `--purge` variants are
-  deferred to a follow-up phase (Phase 5; see below).
-- `trinity purge` runs the history-rewriting engine without a
-  finalize commit, accepts plan id or stem, supports
-  `--into-branch`, `--dry`, and `--yes`. The `--drop-finalize`,
-  `--amend`, and `--squash` flags are wire-reserved (they
-  appear in `--help`) but explicitly bail with "not yet
-  implemented" — they land in Phase 5.
-- `--dry` on the implemented mutating commands prints the
-  planned action shape and exits 0 with no commits and no ref
-  updates.
+- `trinity finish` performs the full ceremony from an approved
+  gate to a committed finalize tree, with `--amend`,
+  `--squash`, `--squash --purge`, and `--purge` variants.
+- `trinity purge` runs the history-rewriting engine, accepts
+  plan id or stem (or `--all`), supports `--into-branch`,
+  `--dry`, `--yes`, `--squash`, `--amend`, `--drop-finalize`,
+  and `--allow-rewrite-protected`.
+- `--dry` on every mutating command emits a `git rebase
+  --interactive` todo list (the rebase-todo format described
+  above). No commits, no ref updates. Operator can pipe the
+  output to git via `GIT_SEQUENCE_EDITOR`.
+- Protected-branch refusal: `trinity purge` and `trinity finish
+  --squash`/`--purge` refuse to rewrite `main`/`master` (or any
+  branch matched by `branch.<name>.protect` or similar git
+  config) unless `--allow-rewrite-protected` is passed.
+  `--into-branch <name>` bypasses the protected check because
+  it doesn't touch the protected branch.
+- Orphan-finalize refusal: `trinity purge` against a HEAD that
+  contains `.trinity/finished/<stem>/` (a finalize snapshot)
+  refuses with a clear "snapshot would be orphaned" message
+  unless `--squash` or `--drop-finalize` is passed (both
+  remove the snapshot too, eliminating the orphan).
 - The CLI never re-derives projection state — every "is this
   plan finished?" / "what's the latest reviewable sha?" /
   "give me the plan's commit range" question is answered by
@@ -572,12 +629,39 @@ manifest. `--squash`, `--amend`, `--drop-finalize` and
 wire-reserved but bail with "not yet implemented" — they
 land in Phase 5.
 
-**Phase 5 — Remaining purge/squash surface (follow-up).**
-`trinity finish --squash`, `trinity finish --purge`, `trinity
-finish --squash --purge`, `trinity purge --squash`, `trinity
-purge --amend`, `trinity purge --drop-finalize`. Protected-
-branch detection + `--allow-rewrite-protected`. Orphan-finalize
-refusal. The remaining "Range/flag cases" 6, 7, 8, 9 in the
-Testing section. Scoped to a follow-up because the Phase 4
-engine + `--into-branch` covers the safe-by-default path and
-ships the working spine sooner.
+**Phase 5 — Replace `--dry` with rebase-todo output.** Rip out
+the human-readable `--dry` listing and replace it with the
+rebase-todo format described above. Same data sources (the
+existing `RewritePreviewResponse` / `PurgeAllPreviewResponse`),
+just a different printer. The printer is small (~80 lines).
+Blockers become `# BLOCKER:` comment lines at the top instead
+of bailing — the operator wants to see the planned actions even
+if the live run would refuse. Tests assert the format is
+parseable as `git rebase --interactive` would consume it.
+
+**Phase 6 — `trinity purge --squash` / `--amend` /
+`--drop-finalize`.** Three flags on `trinity purge` that change
+how the rewrite engine consumes the manifest. `--squash
+"<msg>"` collapses all `pick`/`edit` commits in the range into
+one commit (same range walk, but the engine concatenates trees
+rather than chaining). Refuses when foreign commits sit in the
+range (foreign-bit on `RewriteCommit`). `--amend` requires HEAD
+to be a finalize commit and amends HEAD's tree to also strip.
+`--drop-finalize` extends the strip set to include
+`.trinity/finished/<stem>/`.
+
+**Phase 7 — `trinity finish --purge` / `--squash` /
+`--squash --purge`.** Composite of Phase 2's finish ceremony +
+the rewrite engine. `--purge`: do the finalize THEN run the
+engine on the just-committed range so the finalize commit's
+tree drops everything `.trinity/`. `--squash`: collapse plan-
+attributed commits into one + finalize tree. `--squash --purge`:
+both. Shares the rewrite-todo dry-run with the purge variants.
+
+**Phase 8 — Protected-branch + orphan-finalize refusals.**
+Detect `main`/`master` (or matching `branch.<name>.protect`
+git config) and refuse to rewrite without
+`--allow-rewrite-protected`. `--into-branch` is exempt. Refuse
+bare `trinity purge` against a HEAD that contains
+`.trinity/finished/<stem>/` (would orphan the snapshot) —
+operator must explicitly pass `--squash` or `--drop-finalize`.
