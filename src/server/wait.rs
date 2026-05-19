@@ -107,8 +107,8 @@ pub async fn wait_for_work(runtime: &Runtime, args: WaitArgs) -> Result<WaitResp
     let started_at = Instant::now();
     let mut rx = runtime.subscribe_events();
 
-    if let Some((work, repo_root)) = compute_match(runtime, &plan_id, role, &author).await? {
-        let payload = enrich_for_wait(runtime, work, &repo_root, &author).await;
+    if let Some(m) = compute_match(runtime, &plan_id, role, &author).await? {
+        let payload = enrich_for_wait(runtime, m, role, &author).await;
         return Ok(WaitResponse::Work(payload));
     }
 
@@ -124,19 +124,15 @@ pub async fn wait_for_work(runtime: &Runtime, args: WaitArgs) -> Result<WaitResp
         }
         match tokio::time::timeout(remaining, rx.recv()).await {
             Ok(Ok(_event)) => {
-                if let Some((work, repo_root)) =
-                    compute_match(runtime, &plan_id, role, &author).await?
-                {
-                    let payload = enrich_for_wait(runtime, work, &repo_root, &author).await;
+                if let Some(m) = compute_match(runtime, &plan_id, role, &author).await? {
+                    let payload = enrich_for_wait(runtime, m, role, &author).await;
                     return Ok(WaitResponse::Work(payload));
                 }
             }
             Ok(Err(RecvError::Lagged(_))) => {
                 rx = runtime.subscribe_events();
-                if let Some((work, repo_root)) =
-                    compute_match(runtime, &plan_id, role, &author).await?
-                {
-                    let payload = enrich_for_wait(runtime, work, &repo_root, &author).await;
+                if let Some(m) = compute_match(runtime, &plan_id, role, &author).await? {
+                    let payload = enrich_for_wait(runtime, m, role, &author).await;
                     return Ok(WaitResponse::Work(payload));
                 }
             }
@@ -158,17 +154,34 @@ fn derive_timeout(timeout_secs: Option<u64>) -> Duration {
     Duration::from_secs(timeout_secs.unwrap_or(DEFAULT_TIMEOUT_SECS).max(1))
 }
 
+/// What `compute_match` returns: the projected work payload plus the
+/// post-projection bits `enrich_for_wait` needs (canonical repo root
+/// for cache keying, plan key for stale-review timeline walking). The
+/// payload itself carries plan-id as a string; we hand back the parsed
+/// `PlanKey` here so callers don't re-parse.
+pub(crate) struct WaitMatch {
+    pub payload: WorkPayload,
+    pub repo_root: std::path::PathBuf,
+    pub plan_key: PlanKey,
+    /// SHA of the latest reviewable commit, when one exists. This is
+    /// the single source of truth for "current target": current-cycle
+    /// reviews target it, stale reviews are everything but it. Used
+    /// directly by `collect_stale_reviews` so no second timeline scan
+    /// can disagree with `candidate.review_target`.
+    pub current_target_sha: Option<CommitSha>,
+}
+
 /// Snapshot the candidate under lock, release, then disk-read
 /// `plan_worktree_status` and derive the work payload if any.
-/// Returns the payload alongside the canonical repo root so callers
-/// can key the opportunistic-body cache off the same `PathBuf`
+/// Returns the canonical repo root and plan key alongside the
+/// payload so enrichment can key caches off the same path object
 /// `add_repo` stored — no wire-string round-trip.
 async fn compute_match(
     runtime: &Runtime,
     plan_id: &crate::lifecycle::PlanId,
     role: WaitingRole,
     author: &AgentLabel,
-) -> Result<Option<(WorkPayload, std::path::PathBuf)>, WaitError> {
+) -> Result<Option<WaitMatch>, WaitError> {
     let candidate = {
         let trinity_arc = runtime.state();
         let trinity = trinity_arc.lock().await;
@@ -225,7 +238,12 @@ async fn compute_match(
         requesters: &requesters,
         author,
     });
-    Ok(Some((payload, candidate.repo_root)))
+    Ok(Some(WaitMatch {
+        payload,
+        repo_root: candidate.repo_root,
+        plan_key: candidate.plan_key,
+        current_target_sha: candidate.review_target,
+    }))
 }
 
 /// Cap for inlined body content. Larger files emit `content:
@@ -234,43 +252,138 @@ async fn compute_match(
 const MAX_INLINE_BODY: usize = 64 * 1024;
 
 /// Wrap `WorkPayload` in `WaitWorkPayload`, opportunistically
-/// filling `plan_file.content` (for `WriteFeedback`) and
-/// per-review `content` (for `AddressChanges`) on first
-/// encounter by `(repo-root, agent, path, content-hash)`.
+/// filling current-cycle `content` (first-encounter, hash-keyed) and
+/// collecting the master-only `stale_reviews` sidecar (one-shot,
+/// path-keyed).
 ///
-/// Lock discipline: file reads + hashing run OUTSIDE the
-/// runtime mutex. Cache query/mark take the lock briefly.
-/// Concurrent pollers for the same key are idempotent — both
-/// may read and mark; both deliver `content`. Don't try to
-/// serialize the disk read; that would re-lock during I/O.
-/// Phase 3 will collect stale reviews here too; currently the
-/// sidecar is always empty.
+/// Lock discipline: file reads + hashing run OUTSIDE the runtime
+/// mutex. Cache query/mark take the lock briefly. Concurrent pollers
+/// for the same key are idempotent — both may read and mark; both
+/// deliver `content`. Don't serialize the disk read; that would
+/// re-lock during I/O.
+///
+/// `stale_reviews` rides along on legitimate master wakeups only —
+/// it never wakes WFW on its own. Reviewer-bound wakeups get an
+/// empty sidecar; SessionFinished delivered to a reviewer also gets
+/// an empty sidecar (stale reviews are a master concern).
 async fn enrich_for_wait(
     runtime: &Runtime,
-    mut work: trinity_core::api::WorkPayload,
-    repo_root: &std::path::Path,
+    m: WaitMatch,
+    role: WaitingRole,
     author: &AgentLabel,
 ) -> trinity_core::api::WaitWorkPayload {
     use trinity_core::api::ExpectedAction as A;
+    let WaitMatch {
+        mut payload,
+        repo_root,
+        plan_key,
+        current_target_sha,
+    } = m;
 
-    match &mut work.action {
+    match &mut payload.action {
         A::WriteFeedback { plan_file, .. } => {
             let trinity_core::api::PlanFile { path, content } = plan_file;
-            opportunistic_fill(runtime, repo_root, author, path, content).await;
+            opportunistic_fill(runtime, &repo_root, author, path, content).await;
         }
         A::AddressChanges { reviews, .. } => {
             for r in reviews.iter_mut() {
                 let trinity_core::api::CurrentReview { path, content, .. } = r;
-                opportunistic_fill(runtime, repo_root, author, path, content).await;
+                opportunistic_fill(runtime, &repo_root, author, path, content).await;
             }
         }
         A::CommitPlanRevision { .. } | A::StartImplementation { .. } | A::SessionFinished => {}
     }
 
+    let stale_reviews = if matches!(role, WaitingRole::Master) {
+        collect_stale_reviews(
+            runtime,
+            &repo_root,
+            &plan_key,
+            current_target_sha.as_ref(),
+            author,
+        )
+        .await
+    } else {
+        Vec::new()
+    };
+
     trinity_core::api::WaitWorkPayload {
-        work,
-        stale_reviews: Vec::new(),
+        work: payload,
+        stale_reviews,
     }
+}
+
+/// Walk the plan timeline for feedback against superseded (non-
+/// current-target) commits and emit each one exactly once to
+/// `author`. Path-keyed cache: post-delivery edits don't re-surface
+/// historical reviews. Body inlined when it fits 64 KB; oversized
+/// entries deliver `content: None` and are still marked seen.
+async fn collect_stale_reviews(
+    runtime: &Runtime,
+    repo_root: &std::path::Path,
+    plan_key: &PlanKey,
+    current_target_sha: Option<&CommitSha>,
+    author: &AgentLabel,
+) -> Vec<trinity_core::api::StaleReview> {
+    let candidates: Vec<(String, AgentLabel, trinity_core::Verdict, String)> = {
+        let trinity_arc = runtime.state();
+        let trinity = trinity_arc.lock().await;
+        let Some(plan) = trinity
+            .repos
+            .get(repo_root)
+            .and_then(|s| s.plans.get(plan_key))
+        else {
+            return Vec::new();
+        };
+        let current_target = current_target_sha.map(CommitSha::as_str);
+        let mut out = Vec::new();
+        for event in &plan.timeline {
+            let sha = event.sha().as_str();
+            if Some(sha) == current_target {
+                continue;
+            }
+            let Some(gate) = event.gate() else {
+                continue;
+            };
+            for (review_author, feedback) in &gate.feedback {
+                if review_author == author {
+                    continue;
+                }
+                let path = crate::disk_format::feedback_path_wire(plan_key, sha, review_author);
+                let key = (repo_root.to_path_buf(), author.clone(), path.clone());
+                if trinity.seen_stale_reviews.contains(&key) {
+                    continue;
+                }
+                out.push((
+                    path,
+                    review_author.clone(),
+                    feedback.verdict,
+                    sha.to_string(),
+                ));
+            }
+        }
+        out
+    };
+
+    let mut result = Vec::with_capacity(candidates.len());
+    for (path, review_author, verdict, target_sha) in candidates {
+        let abs = repo_root.join(&path);
+        let content = match tokio::fs::read_to_string(&abs).await {
+            Ok(body) if body.len() <= MAX_INLINE_BODY => Some(body),
+            _ => None,
+        };
+        runtime
+            .mark_stale_review_seen(repo_root.to_path_buf(), author.clone(), path.clone())
+            .await;
+        result.push(trinity_core::api::StaleReview {
+            path,
+            author: review_author,
+            verdict,
+            target_sha,
+            content,
+        });
+    }
+    result
 }
 
 /// Read the file at `repo_root/path`, hash it, check the
@@ -1197,6 +1310,302 @@ mod integration_tests {
                 .await,
             "oversize body should still be marked seen so we don't re-read on every poll"
         );
+    }
+
+    /// Master polling sees an RC on a superseded commit exactly
+    /// once in `stale_reviews`; the next poll has an empty sidecar.
+    /// Reviewer polling never receives the sidecar.
+    #[tokio::test]
+    async fn master_gets_stale_review_once_then_suppressed() {
+        let dir = init_repo();
+        write_file(dir.path(), ".trinity/plans/foo.md", "# foo v1\n");
+        commit(dir.path(), "add foo");
+        let rt = Runtime::new();
+        rt.add_repo(dir.path().to_path_buf()).await.unwrap();
+
+        let intro: CommitSha = rt
+            .read_repo(dir.path(), |s| {
+                s.plans[&PlanKey::parse("foo").unwrap()].plan_intro.clone()
+            })
+            .await
+            .unwrap();
+        let stale_path = format!(".trinity/feedback/foo/{}/codex.md", intro.as_str());
+        write_file(dir.path(), &stale_path, "REQUEST_CHANGES\nfix it\n");
+        rt.handle_signal(
+            dir.path(),
+            FilesystemSignal::FeedbackWritten {
+                parsed: crate::disk_format::parse_feedback_path(&PathBuf::from(format!(
+                    "foo/{}/codex.md",
+                    intro.as_str()
+                )))
+                .unwrap(),
+            },
+            1,
+        )
+        .await
+        .unwrap();
+
+        write_file(dir.path(), ".trinity/plans/foo.md", "# foo v2\n");
+        commit(dir.path(), "revise foo");
+        rt.handle_signal(dir.path(), FilesystemSignal::HeadChanged, 2)
+            .await
+            .unwrap();
+        let new_head: CommitSha = rt
+            .read_repo(dir.path(), |s| s.head.clone().expect("head"))
+            .await
+            .unwrap();
+        let current_path = format!(".trinity/feedback/foo/{}/codex.md", new_head.as_str());
+        write_file(dir.path(), &current_path, "REQUEST_CHANGES\nstill broken\n");
+        rt.handle_signal(
+            dir.path(),
+            FilesystemSignal::FeedbackWritten {
+                parsed: crate::disk_format::parse_feedback_path(&PathBuf::from(format!(
+                    "foo/{}/codex.md",
+                    new_head.as_str()
+                )))
+                .unwrap(),
+            },
+            3,
+        )
+        .await
+        .unwrap();
+
+        let mut a = args(dir.path(), WaitingRole::Master, "foo", "lloyd");
+        a.timeout_secs = Some(1);
+        let resp = wait_for_work(&rt, a).await.unwrap();
+        let p1 = match resp {
+            WaitResponse::Work(p) => p,
+            _ => panic!("expected work"),
+        };
+        assert_eq!(p1.stale_reviews.len(), 1, "first poll should carry stale");
+        let stale = &p1.stale_reviews[0];
+        assert_eq!(stale.path, stale_path);
+        assert_eq!(stale.target_sha, intro.as_str());
+        assert_eq!(stale.author.as_str(), "codex");
+        assert_eq!(
+            stale.content.as_deref(),
+            Some("REQUEST_CHANGES\nfix it\n"),
+            "stale review content should be inlined on first delivery"
+        );
+
+        let mut a2 = args(dir.path(), WaitingRole::Master, "foo", "lloyd");
+        a2.timeout_secs = Some(1);
+        let resp2 = wait_for_work(&rt, a2).await.unwrap();
+        let p2 = match resp2 {
+            WaitResponse::Work(p) => p,
+            _ => panic!("expected work"),
+        };
+        assert!(
+            p2.stale_reviews.is_empty(),
+            "second poll should suppress stale review; got: {:?}",
+            p2.stale_reviews
+        );
+    }
+
+    /// Path-keyed semantics: editing a stale feedback file between
+    /// polls must NOT re-surface it. Stale reviews are one-shot per
+    /// `(repo, agent, path)`; only `opportunistic_bodies` is
+    /// hash-keyed.
+    #[tokio::test]
+    async fn stale_review_path_keyed_not_hash_keyed() {
+        let dir = init_repo();
+        write_file(dir.path(), ".trinity/plans/foo.md", "# foo v1\n");
+        commit(dir.path(), "add foo");
+        let rt = Runtime::new();
+        rt.add_repo(dir.path().to_path_buf()).await.unwrap();
+
+        let intro: CommitSha = rt
+            .read_repo(dir.path(), |s| {
+                s.plans[&PlanKey::parse("foo").unwrap()].plan_intro.clone()
+            })
+            .await
+            .unwrap();
+        let stale_path = format!(".trinity/feedback/foo/{}/codex.md", intro.as_str());
+        write_file(dir.path(), &stale_path, "REQUEST_CHANGES\nv1\n");
+        rt.handle_signal(
+            dir.path(),
+            FilesystemSignal::FeedbackWritten {
+                parsed: crate::disk_format::parse_feedback_path(&PathBuf::from(format!(
+                    "foo/{}/codex.md",
+                    intro.as_str()
+                )))
+                .unwrap(),
+            },
+            1,
+        )
+        .await
+        .unwrap();
+
+        write_file(dir.path(), ".trinity/plans/foo.md", "# foo v2\n");
+        commit(dir.path(), "revise foo");
+        rt.handle_signal(dir.path(), FilesystemSignal::HeadChanged, 2)
+            .await
+            .unwrap();
+        let head: CommitSha = rt
+            .read_repo(dir.path(), |s| s.head.clone().expect("head"))
+            .await
+            .unwrap();
+        let current_path = format!(".trinity/feedback/foo/{}/codex.md", head.as_str());
+        write_file(dir.path(), &current_path, "REQUEST_CHANGES\nstill\n");
+        rt.handle_signal(
+            dir.path(),
+            FilesystemSignal::FeedbackWritten {
+                parsed: crate::disk_format::parse_feedback_path(&PathBuf::from(format!(
+                    "foo/{}/codex.md",
+                    head.as_str()
+                )))
+                .unwrap(),
+            },
+            3,
+        )
+        .await
+        .unwrap();
+
+        let mut a = args(dir.path(), WaitingRole::Master, "foo", "lloyd");
+        a.timeout_secs = Some(1);
+        let resp = wait_for_work(&rt, a).await.unwrap();
+        let p1 = match resp {
+            WaitResponse::Work(p) => p,
+            _ => panic!("expected work"),
+        };
+        assert_eq!(p1.stale_reviews.len(), 1);
+
+        write_file(dir.path(), &stale_path, "REQUEST_CHANGES\nv1 rewritten\n");
+
+        let mut a2 = args(dir.path(), WaitingRole::Master, "foo", "lloyd");
+        a2.timeout_secs = Some(1);
+        let resp2 = wait_for_work(&rt, a2).await.unwrap();
+        let p2 = match resp2 {
+            WaitResponse::Work(p) => p,
+            _ => panic!("expected work"),
+        };
+        assert!(
+            p2.stale_reviews.is_empty(),
+            "edited stale feedback must NOT re-surface (path-keyed cache); got: {:?}",
+            p2.stale_reviews
+        );
+    }
+
+    /// Three-commit timeline with feedback on two superseded shas
+    /// and the third sha current. The sidecar carries exactly the
+    /// two stale entries; current-target feedback rides on
+    /// `reviews[]`, not on `stale_reviews`.
+    #[tokio::test]
+    async fn stale_reviews_multi_commit_timeline() {
+        let dir = init_repo();
+        write_file(dir.path(), ".trinity/plans/foo.md", "# v1\n");
+        commit(dir.path(), "v1");
+        let rt = Runtime::new();
+        rt.add_repo(dir.path().to_path_buf()).await.unwrap();
+
+        let sha1: CommitSha = rt
+            .read_repo(dir.path(), |s| {
+                s.plans[&PlanKey::parse("foo").unwrap()].plan_intro.clone()
+            })
+            .await
+            .unwrap();
+        let p1_fb = format!(".trinity/feedback/foo/{}/codex.md", sha1.as_str());
+        write_file(dir.path(), &p1_fb, "REQUEST_CHANGES\non v1\n");
+        rt.handle_signal(
+            dir.path(),
+            FilesystemSignal::FeedbackWritten {
+                parsed: crate::disk_format::parse_feedback_path(&PathBuf::from(format!(
+                    "foo/{}/codex.md",
+                    sha1.as_str()
+                )))
+                .unwrap(),
+            },
+            1,
+        )
+        .await
+        .unwrap();
+
+        write_file(dir.path(), ".trinity/plans/foo.md", "# v2\n");
+        commit(dir.path(), "v2");
+        rt.handle_signal(dir.path(), FilesystemSignal::HeadChanged, 2)
+            .await
+            .unwrap();
+        let sha2: CommitSha = rt
+            .read_repo(dir.path(), |s| s.head.clone().expect("head"))
+            .await
+            .unwrap();
+        let p2_fb = format!(".trinity/feedback/foo/{}/codex.md", sha2.as_str());
+        write_file(dir.path(), &p2_fb, "REQUEST_CHANGES\non v2\n");
+        rt.handle_signal(
+            dir.path(),
+            FilesystemSignal::FeedbackWritten {
+                parsed: crate::disk_format::parse_feedback_path(&PathBuf::from(format!(
+                    "foo/{}/codex.md",
+                    sha2.as_str()
+                )))
+                .unwrap(),
+            },
+            3,
+        )
+        .await
+        .unwrap();
+
+        write_file(dir.path(), ".trinity/plans/foo.md", "# v3\n");
+        commit(dir.path(), "v3");
+        rt.handle_signal(dir.path(), FilesystemSignal::HeadChanged, 4)
+            .await
+            .unwrap();
+        let sha3: CommitSha = rt
+            .read_repo(dir.path(), |s| s.head.clone().expect("head"))
+            .await
+            .unwrap();
+        let p3_fb = format!(".trinity/feedback/foo/{}/codex.md", sha3.as_str());
+        write_file(dir.path(), &p3_fb, "REQUEST_CHANGES\non v3\n");
+        rt.handle_signal(
+            dir.path(),
+            FilesystemSignal::FeedbackWritten {
+                parsed: crate::disk_format::parse_feedback_path(&PathBuf::from(format!(
+                    "foo/{}/codex.md",
+                    sha3.as_str()
+                )))
+                .unwrap(),
+            },
+            5,
+        )
+        .await
+        .unwrap();
+
+        let mut a = args(dir.path(), WaitingRole::Master, "foo", "lloyd");
+        a.timeout_secs = Some(1);
+        let resp = wait_for_work(&rt, a).await.unwrap();
+        let p = match resp {
+            WaitResponse::Work(p) => p,
+            _ => panic!("expected work"),
+        };
+        let mut got: Vec<(&str, &str)> = p
+            .stale_reviews
+            .iter()
+            .map(|s| (s.path.as_str(), s.target_sha.as_str()))
+            .collect();
+        got.sort();
+        let mut want = vec![
+            (p1_fb.as_str(), sha1.as_str()),
+            (p2_fb.as_str(), sha2.as_str()),
+        ];
+        want.sort();
+        assert_eq!(got, want, "expected exactly two stale entries (v1, v2)");
+
+        match &p.work.action {
+            trinity_core::api::ExpectedAction::AddressChanges {
+                reviews,
+                target_sha,
+                ..
+            } => {
+                assert_eq!(target_sha, sha3.as_str());
+                assert_eq!(reviews.len(), 1);
+                assert_eq!(reviews[0].path, p3_fb);
+                assert!(
+                    !p.stale_reviews.iter().any(|s| s.path == p3_fb),
+                    "current-target feedback must not appear in stale_reviews"
+                );
+            }
+            other => panic!("expected AddressChanges, got {other:?}"),
+        }
     }
 
     /// `work_context` never populates `plan_file.content`.

@@ -122,6 +122,21 @@ pub fn canonical_feedback_path(
     ))
 }
 
+/// Build the repo-relative wire-form feedback path
+/// `.trinity/feedback/<plan-key>/<sha>/<author>.md`. This is the
+/// string that lives on `WorkPayload` action variants and on
+/// `StaleReview.path`. Single source of truth for the wire shape so
+/// projection (`responses::build_work_payload`) and the stale-review
+/// collector cannot drift.
+pub fn feedback_path_wire(plan_key: &PlanKey, sha: &str, author: &AgentLabel) -> String {
+    format!(
+        ".trinity/feedback/{}/{}/{}.md",
+        plan_key.as_str(),
+        sha,
+        author.as_str()
+    )
+}
+
 /// Plausible SHA-1 segment: hex string of length 7–40. Trinity accepts
 /// shortened SHAs in path segments since git accepts them and reviewers
 /// commonly paste short SHAs.

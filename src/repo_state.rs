@@ -33,6 +33,14 @@ pub struct Trinity {
     /// the next poll re-sends.
     pub opportunistic_bodies:
         BTreeMap<(RepoRoot, AgentLabel, String), crate::lifecycle::ContentHash>,
+    /// Per-agent stale-review one-shot delivery cache. Records "agent
+    /// X has been delivered the stale review at path Y" so a stale
+    /// review surfaces exactly once per agent. Key is `(canonical
+    /// repo root, agent, repo-relative feedback path)`. Path-keyed
+    /// (not hash-keyed): stale-review content drifting after delivery
+    /// does NOT re-surface the entry — stale reviews are historical
+    /// and informational.
+    pub seen_stale_reviews: std::collections::BTreeSet<(RepoRoot, AgentLabel, String)>,
 }
 
 /// Repo-level reduced state. Everything here is the *result* of

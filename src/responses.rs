@@ -279,14 +279,6 @@ pub fn build_work_payload(inputs: WorkPayloadInputs<'_>) -> trinity_core::api::W
         inputs.review_target_kind,
         Some(CommitKind::PlanOnly | CommitKind::Mixed)
     );
-    let feedback_path_for = |sha: &str, author: &str| -> String {
-        format!(
-            ".trinity/feedback/{session}/{sha}/{author}.md",
-            session = inputs.plan_key.as_str(),
-            sha = sha,
-            author = author,
-        )
-    };
     let action = match inputs.waiting.reason {
         R::CommitNeedsReview => {
             let sha = inputs
@@ -295,7 +287,7 @@ pub fn build_work_payload(inputs: WorkPayloadInputs<'_>) -> trinity_core::api::W
                 .as_str()
                 .to_string();
             A::WriteFeedback {
-                path: feedback_path_for(&sha, inputs.author.as_str()),
+                path: crate::disk_format::feedback_path_wire(inputs.plan_key, &sha, inputs.author),
                 target_sha: sha,
                 plan_file: trinity_core::api::PlanFile {
                     path: inputs.plan_path.to_string(),
@@ -312,8 +304,9 @@ pub fn build_work_payload(inputs: WorkPayloadInputs<'_>) -> trinity_core::api::W
             let reviews = inputs
                 .requesters
                 .iter()
+                .filter(|a| *a != inputs.author)
                 .map(|author| trinity_core::api::CurrentReview {
-                    path: feedback_path_for(&sha, author.as_str()),
+                    path: crate::disk_format::feedback_path_wire(inputs.plan_key, &sha, author),
                     author: author.clone(),
                     verdict: trinity_core::vocab::Verdict::RequestChanges,
                     content: None,
