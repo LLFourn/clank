@@ -509,21 +509,50 @@ async fn set_active_work(state: &AppState, req: &ToolCallRequest) -> Result<Valu
     }
 
     // Snapshot the candidate under lock; release; disk-read; decide.
+    // Early-return for `UnknownRepo` and `PlanNotCommitted` happens
+    // inside the lock; the remaining fields are validated outside so
+    // the typed error variants don't get tangled with lock state.
+    enum SnapshotOutcome {
+        Ok {
+            repo_root: PathBuf,
+            plan_path: String,
+            body_hash: crate::lifecycle::ContentHash,
+            is_frozen: bool,
+        },
+        UnknownRepo,
+        PlanNotCommitted,
+    }
     let snapshot = {
         let trinity = state.runtime.state();
         let trinity = trinity.lock().await;
-        let Some(repo_root) = trinity.repo_basenames.get(plan_id.repo()) else {
+        match trinity.repo_basenames.get(plan_id.repo()) {
+            None => SnapshotOutcome::UnknownRepo,
+            Some(repo_root) => {
+                let Some(repo_state) = trinity.repos.get(repo_root) else {
+                    return Err(ToolError::Internal(anyhow::anyhow!(
+                        "repo_basenames out of sync with repos: {}",
+                        repo_root.display()
+                    )));
+                };
+                match repo_state.plans.get(plan_id.key()) {
+                    None => SnapshotOutcome::PlanNotCommitted,
+                    Some(plan) => SnapshotOutcome::Ok {
+                        repo_root: repo_root.clone(),
+                        plan_path: plan.plan_path.clone(),
+                        body_hash: plan.body_hash.clone(),
+                        is_frozen: plan.is_frozen(),
+                    },
+                }
+            }
+        }
+    };
+    let (repo_root, plan_path, body_hash, is_frozen) = match snapshot {
+        SnapshotOutcome::UnknownRepo => {
             return mcp_error(trinity_core::api::McpErrorPayload::UnknownRepo {
                 basename: plan_id.repo().as_str().to_string(),
             });
-        };
-        let Some(repo_state) = trinity.repos.get(repo_root) else {
-            return Err(ToolError::Internal(anyhow::anyhow!(
-                "repo_basenames out of sync with repos: {}",
-                repo_root.display()
-            )));
-        };
-        let Some(plan) = repo_state.plans.get(plan_id.key()) else {
+        }
+        SnapshotOutcome::PlanNotCommitted => {
             return mcp_error(trinity_core::api::McpErrorPayload::PlanNotCommitted {
                 plan_id: plan_id.to_string(),
                 slug: plan_id.key().as_str().to_string(),
@@ -532,20 +561,20 @@ async fn set_active_work(state: &AppState, req: &ToolCallRequest) -> Result<Valu
                     slug = plan_id.key().as_str()
                 ),
             });
-        };
-        if plan.is_frozen() {
-            return Err(ToolError::Invalid(format!(
-                "plan {} is frozen; cannot set as active work",
-                plan_id
-            )));
         }
-        (
-            repo_root.clone(),
-            plan.plan_path.clone(),
-            plan.body_hash.clone(),
-        )
+        SnapshotOutcome::Ok {
+            repo_root,
+            plan_path,
+            body_hash,
+            is_frozen,
+        } => (repo_root, plan_path, body_hash, is_frozen),
     };
-    let (repo_root, plan_path, body_hash) = snapshot;
+    if is_frozen {
+        return mcp_error(trinity_core::api::McpErrorPayload::PlanNotActive {
+            plan_id: plan_id.to_string(),
+            message: format!("plan {plan_id} is finalized; cannot select as active work"),
+        });
+    }
     let status =
         crate::responses::compute_plan_worktree_status_parts(&repo_root, &plan_path, &body_hash)
             .map_err(|e| ToolError::Internal(anyhow::anyhow!(e)))?;
@@ -553,10 +582,12 @@ async fn set_active_work(state: &AppState, req: &ToolCallRequest) -> Result<Valu
         status,
         crate::repo_state::PlanWorktreeStatus::PlanFileMissing
     ) {
-        return Err(ToolError::NotFound(format!(
-            "plan {} is hidden: plan file missing from working tree",
-            plan_id
-        )));
+        return mcp_error(trinity_core::api::McpErrorPayload::PlanHidden {
+            plan_id: plan_id.to_string(),
+            message: format!(
+                "plan {plan_id} is hidden: plan file missing from working tree; restore or commit the deletion"
+            ),
+        });
     }
 
     state

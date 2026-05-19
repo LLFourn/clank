@@ -519,6 +519,26 @@ fn schema_mcp_error_plan_not_committed() {
 }
 
 #[test]
+fn schema_mcp_error_plan_not_active() {
+    let v = serde_json::to_value(McpErrorPayload::PlanNotActive {
+        plan_id: "trinity/foo.md".into(),
+        message: "plan trinity/foo.md is finalized".into(),
+    })
+    .unwrap();
+    assert_schema("mcp_error_plan_not_active", &v);
+}
+
+#[test]
+fn schema_mcp_error_plan_hidden() {
+    let v = serde_json::to_value(McpErrorPayload::PlanHidden {
+        plan_id: "trinity/foo.md".into(),
+        message: "plan file missing from working tree".into(),
+    })
+    .unwrap();
+    assert_schema("mcp_error_plan_hidden", &v);
+}
+
+#[test]
 fn schema_start_plan_response() {
     let v = serde_json::to_value(StartPlanResponse {
         plan_id: "trinity/foo.md".into(),

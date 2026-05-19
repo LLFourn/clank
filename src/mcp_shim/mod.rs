@@ -381,15 +381,23 @@ impl ServerHandler for ShimHandler {
             instructions: Some(
                 "Trinity coordinates multi-agent peer review around plan files committed \
                  to git and feedback files in the working tree. \n\n\
-                 Discover plans with `list_plans` or create one with `start_plan`. \
-                 To drive an agent loop, call `wait_for_work({role: \"master\" | \"reviewers\", plan_id})` — \
-                 it blocks until the plan needs your role and returns minimal identifiers; \
-                 for each match, follow up with `work_context({plan_id})` for the narrow \
-                 coordination view. This avoids polling. \n\n\
+                 Discover plans with `list_plans`. Register a repo with `watch_repo` (or \
+                 `start_plan` if you also want to create a new plan file at the same time). \
+                 To drive an agent loop, call `wait_for_work({role: \"master\" | \"reviewers\"})` — \
+                 it blocks until your role has work and returns minimal identifiers; for \
+                 each match, follow up with `work_context()` for the narrow coordination \
+                 view. This avoids polling. \n\n\
                  `plan_id` is the canonical `<repo_basename>/<stem>.md` identity (e.g. \
-                 `trinity/leptos-frontend.md`). The shim caches the last `label` / \
-                 `author_label` you passed so subsequent calls don't need to repeat it. \
-                 `plan_id` is NEVER cached — pass it on every call to keep the target explicit."
+                 `trinity/leptos-frontend.md`) but is OPTIONAL on `wait_for_work` and \
+                 `work_context`. Omit it when the cwd-repo has exactly one active visible \
+                 plan; the daemon infers the target. When multiple plans are active, the \
+                 daemon returns an `ambiguous_plan` error with candidates — call \
+                 `set_active_work({plan_id, author_label})` once to pick one and subsequent \
+                 inferred calls route to it. `clear_active_work({author_label})` drops the \
+                 selection. Pass an explicit `plan_id` only when you intentionally want to \
+                 override the inferred / selected target. \n\n\
+                 The shim caches the last `label` / `author_label` you passed so subsequent \
+                 calls don't need to repeat it. `plan_id` is NEVER cached."
                     .into(),
             ),
         }

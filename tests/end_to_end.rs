@@ -945,9 +945,118 @@ async fn watch_repo_registers_fresh_repo_and_is_idempotent() {
         .json()
         .await
         .unwrap();
-    handle.abort();
     assert_eq!(second["result"]["status"], "already_watching");
     assert_eq!(first["result"]["repo"], second["result"]["repo"]);
+
+    // Watcher is live: write + commit a new plan, observe the
+    // daemon picks it up without restart. This pins the bootstrap's
+    // watcher-spawn half, not just the response shape.
+    write_file(dir.path(), ".trinity/plans/foo.md", "# foo\n");
+    commit(dir.path(), "Add foo plan");
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+
+    let basename = dir.path().file_name().unwrap().to_str().unwrap();
+    let plan_detail: PlanDetailResponse = client
+        .get(format!("{url}/api/plan/{basename}/foo.md"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    handle.abort();
+    assert_eq!(plan_detail.slug, "foo");
+    assert_eq!(
+        plan_detail.lifecycle,
+        trinity_core::vocab::PlanLifecycle::Active
+    );
+}
+
+/// `set_active_work` against a frozen (finalized) plan must reject
+/// with the typed `plan_not_active` error variant. Selecting a
+/// finalized plan would route every WFW call to a terminal state.
+#[tokio::test]
+async fn set_active_work_rejects_frozen_plan_with_typed_error() {
+    let dir = init_repo();
+    write_file(dir.path(), ".trinity/plans/foo.md", "# foo\n");
+    commit(dir.path(), "Add foo");
+    // Finalize the plan via the same shape the daemon would
+    // produce: write an approving file under .trinity/finished/.
+    write_file(
+        dir.path(),
+        ".trinity/finished/foo/codex.md",
+        "APPROVE\n\nlgtm\n",
+    );
+    commit(dir.path(), "Finalize foo");
+
+    let (url, handle) = spawn_daemon(dir.path()).await;
+    let client = reqwest::Client::new();
+    let resp: serde_json::Value = client
+        .post(format!("{}/internal/tool_call", url))
+        .json(&json!({
+            "cwd": dir.path(),
+            "tool": "set_active_work",
+            "arguments": {
+                "plan_id": plan_id_for(&dir, "foo"),
+                "author_label": "alice"
+            }
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    handle.abort();
+    assert_eq!(
+        resp["result"]["error"], "plan_not_active",
+        "frozen plan rejection should be typed, not Invalid; got: {resp}"
+    );
+    assert_eq!(
+        resp["result"]["plan_id"].as_str().unwrap(),
+        plan_id_for(&dir, "foo")
+    );
+}
+
+/// `set_active_work` against a plan whose worktree file is missing
+/// must reject with the typed `plan_hidden` error variant.
+#[tokio::test]
+async fn set_active_work_rejects_hidden_plan_with_typed_error() {
+    let dir = init_repo();
+    write_file(dir.path(), ".trinity/plans/foo.md", "# foo\n");
+    commit(dir.path(), "Add foo");
+    // Delete the worktree file so the plan is hidden (still tracked
+    // in HEAD, but `Plan::is_visible` returns false because the
+    // working-tree file is missing).
+    std::fs::remove_file(dir.path().join(".trinity/plans/foo.md")).unwrap();
+
+    let (url, handle) = spawn_daemon(dir.path()).await;
+    let client = reqwest::Client::new();
+    let resp: serde_json::Value = client
+        .post(format!("{}/internal/tool_call", url))
+        .json(&json!({
+            "cwd": dir.path(),
+            "tool": "set_active_work",
+            "arguments": {
+                "plan_id": plan_id_for(&dir, "foo"),
+                "author_label": "alice"
+            }
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    handle.abort();
+    assert_eq!(
+        resp["result"]["error"], "plan_hidden",
+        "hidden plan rejection should be typed, not NotFound; got: {resp}"
+    );
+    assert_eq!(
+        resp["result"]["plan_id"].as_str().unwrap(),
+        plan_id_for(&dir, "foo")
+    );
 }
 
 /// `wait_for_work` is the ambiguity-prone surface in practice. Two

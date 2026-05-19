@@ -500,6 +500,14 @@ pub enum McpErrorPayload {
         slug: String,
         next_step: String,
     },
+    /// `set_active_work` rejected because the target plan is
+    /// already finalized — selecting a frozen plan would make WFW
+    /// route to a terminal state every call.
+    PlanNotActive { plan_id: String, message: String },
+    /// `set_active_work` rejected because the plan's worktree file
+    /// is missing (the plan is hidden via `Plan::is_visible`).
+    /// Restore or commit the deletion before selecting.
+    PlanHidden { plan_id: String, message: String },
 }
 
 /// One row in `AmbiguousPlan.candidates`.
