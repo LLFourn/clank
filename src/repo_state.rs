@@ -25,6 +25,14 @@ pub struct Trinity {
     /// fold (selected plan must exist, be non-frozen, and have its
     /// worktree file present).
     pub active_selections: BTreeMap<(RepoBasename, AgentLabel), PlanKey>,
+    /// Per-agent opportunistic-body cache. Records "agent X has been
+    /// sent path Y at content hash Z" so subsequent `wait_for_work`
+    /// polls can omit content the agent already has. Key is
+    /// `(canonical repo root, agent, repo-relative path)`; value is
+    /// the content hash sent last. Hash-keyed: if the file changes,
+    /// the next poll re-sends.
+    pub opportunistic_bodies:
+        BTreeMap<(RepoRoot, AgentLabel, String), crate::lifecycle::ContentHash>,
 }
 
 /// Repo-level reduced state. Everything here is the *result* of

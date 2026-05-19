@@ -1004,12 +1004,17 @@ mod wire_tests {
 
     #[tokio::test]
     async fn http_and_mcp_bodies_byte_identical_for_same_input() {
-        // Acceptance: HTTP and MCP dispatch produce byte-identical JSON
+        // Acceptance: HTTP and MCP dispatch produce equivalent JSON
         // responses for the same inputs (modulo MCP's {result: ...}
         // envelope). Drive both routes against the *same* router (both
-        // Router and AppState are Clone) so the underlying state — and
-        // therefore the SHA-bearing paths in `locations` — match
-        // exactly. Full Value equality, not key-set parity.
+        // Router and AppState are Clone) so the underlying state
+        // matches.
+        //
+        // Note: the WFW opportunistic-content cache means the first
+        // request gets `plan_file.content` populated, the second does
+        // not. Strip that field from both bodies before comparing —
+        // the test pins the non-opportunistic shape parity, not the
+        // wait-only enrichment.
         let dir = init_repo();
         let app = router_with_repo(&dir).await;
         let args = json!({
@@ -1027,7 +1032,7 @@ mod wire_tests {
             .unwrap();
         let http_resp = app.clone().oneshot(http_req).await.unwrap();
         assert_eq!(http_resp.status(), StatusCode::OK);
-        let http_body = body_json(http_resp).await;
+        let mut http_body = body_json(http_resp).await;
 
         let mcp_body_in = json!({
             "cwd": dir.path().to_string_lossy(),
@@ -1042,14 +1047,37 @@ mod wire_tests {
             .unwrap();
         let mcp_resp = app.oneshot(mcp_req).await.unwrap();
         assert_eq!(mcp_resp.status(), StatusCode::OK);
-        let mcp_body = body_json(mcp_resp).await;
+        let mut mcp_body = body_json(mcp_resp).await;
 
-        // Full equality: every byte of the wait response on the HTTP
-        // side must equal the `result` value on the MCP side.
+        strip_opportunistic_content(&mut http_body);
+        strip_opportunistic_content(&mut mcp_body["result"]);
+
         assert_eq!(
             http_body, mcp_body["result"],
-            "HTTP and MCP wait_for_work bodies diverged"
+            "HTTP and MCP wait_for_work bodies diverged outside opportunistic content"
         );
+    }
+
+    /// Drop opportunistic inline content (the wait-only enrichment) so
+    /// HTTP and MCP responses can be compared on their projection-only
+    /// fields.
+    fn strip_opportunistic_content(v: &mut serde_json::Value) {
+        if let Some(obj) = v.as_object_mut() {
+            if let Some(pf) = obj.get_mut("plan_file")
+                && let Some(pf_obj) = pf.as_object_mut()
+            {
+                pf_obj.remove("content");
+            }
+            if let Some(reviews) = obj.get_mut("reviews")
+                && let Some(arr) = reviews.as_array_mut()
+            {
+                for r in arr {
+                    if let Some(r_obj) = r.as_object_mut() {
+                        r_obj.remove("content");
+                    }
+                }
+            }
+        }
     }
 
     #[tokio::test]

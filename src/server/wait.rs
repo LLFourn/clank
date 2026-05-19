@@ -107,11 +107,9 @@ pub async fn wait_for_work(runtime: &Runtime, args: WaitArgs) -> Result<WaitResp
     let started_at = Instant::now();
     let mut rx = runtime.subscribe_events();
 
-    if let Some(work) = compute_match(runtime, &plan_id, role, &author).await? {
-        return Ok(WaitResponse::Work(trinity_core::api::WaitWorkPayload {
-            work,
-            stale_reviews: Vec::new(),
-        }));
+    if let Some((work, repo_root)) = compute_match(runtime, &plan_id, role, &author).await? {
+        let payload = enrich_for_wait(runtime, work, &repo_root, &author).await;
+        return Ok(WaitResponse::Work(payload));
     }
 
     let deadline = started_at + timeout;
@@ -126,20 +124,20 @@ pub async fn wait_for_work(runtime: &Runtime, args: WaitArgs) -> Result<WaitResp
         }
         match tokio::time::timeout(remaining, rx.recv()).await {
             Ok(Ok(_event)) => {
-                if let Some(work) = compute_match(runtime, &plan_id, role, &author).await? {
-                    return Ok(WaitResponse::Work(trinity_core::api::WaitWorkPayload {
-                        work,
-                        stale_reviews: Vec::new(),
-                    }));
+                if let Some((work, repo_root)) =
+                    compute_match(runtime, &plan_id, role, &author).await?
+                {
+                    let payload = enrich_for_wait(runtime, work, &repo_root, &author).await;
+                    return Ok(WaitResponse::Work(payload));
                 }
             }
             Ok(Err(RecvError::Lagged(_))) => {
                 rx = runtime.subscribe_events();
-                if let Some(work) = compute_match(runtime, &plan_id, role, &author).await? {
-                    return Ok(WaitResponse::Work(trinity_core::api::WaitWorkPayload {
-                        work,
-                        stale_reviews: Vec::new(),
-                    }));
+                if let Some((work, repo_root)) =
+                    compute_match(runtime, &plan_id, role, &author).await?
+                {
+                    let payload = enrich_for_wait(runtime, work, &repo_root, &author).await;
+                    return Ok(WaitResponse::Work(payload));
                 }
             }
             Ok(Err(RecvError::Closed)) | Err(_) => {
@@ -162,12 +160,15 @@ fn derive_timeout(timeout_secs: Option<u64>) -> Duration {
 
 /// Snapshot the candidate under lock, release, then disk-read
 /// `plan_worktree_status` and derive the work payload if any.
+/// Returns the payload alongside the canonical repo root so callers
+/// can key the opportunistic-body cache off the same `PathBuf`
+/// `add_repo` stored — no wire-string round-trip.
 async fn compute_match(
     runtime: &Runtime,
     plan_id: &crate::lifecycle::PlanId,
     role: WaitingRole,
     author: &AgentLabel,
-) -> Result<Option<WorkPayload>, WaitError> {
+) -> Result<Option<(WorkPayload, std::path::PathBuf)>, WaitError> {
     let candidate = {
         let trinity_arc = runtime.state();
         let trinity = trinity_arc.lock().await;
@@ -224,7 +225,88 @@ async fn compute_match(
         requesters: &requesters,
         author,
     });
-    Ok(Some(payload))
+    Ok(Some((payload, candidate.repo_root)))
+}
+
+/// Cap for inlined body content. Larger files emit `content:
+/// None` and rely on the agent to `Read` separately. Hash is
+/// still cached so subsequent polls don't re-evaluate.
+const MAX_INLINE_BODY: usize = 64 * 1024;
+
+/// Wrap `WorkPayload` in `WaitWorkPayload`, opportunistically
+/// filling `plan_file.content` (for `WriteFeedback`) and
+/// per-review `content` (for `AddressChanges`) on first
+/// encounter by `(repo-root, agent, path, content-hash)`.
+///
+/// Lock discipline: file reads + hashing run OUTSIDE the
+/// runtime mutex. Cache query/mark take the lock briefly.
+/// Concurrent pollers for the same key are idempotent — both
+/// may read and mark; both deliver `content`. Don't try to
+/// serialize the disk read; that would re-lock during I/O.
+/// Phase 3 will collect stale reviews here too; currently the
+/// sidecar is always empty.
+async fn enrich_for_wait(
+    runtime: &Runtime,
+    mut work: trinity_core::api::WorkPayload,
+    repo_root: &std::path::Path,
+    author: &AgentLabel,
+) -> trinity_core::api::WaitWorkPayload {
+    use trinity_core::api::ExpectedAction as A;
+
+    match &mut work.action {
+        A::WriteFeedback { plan_file, .. } => {
+            let trinity_core::api::PlanFile { path, content } = plan_file;
+            opportunistic_fill(runtime, repo_root, author, path, content).await;
+        }
+        A::AddressChanges { reviews, .. } => {
+            for r in reviews.iter_mut() {
+                let trinity_core::api::CurrentReview { path, content, .. } = r;
+                opportunistic_fill(runtime, repo_root, author, path, content).await;
+            }
+        }
+        A::CommitPlanRevision { .. } | A::StartImplementation { .. } | A::SessionFinished => {}
+    }
+
+    trinity_core::api::WaitWorkPayload {
+        work,
+        stale_reviews: Vec::new(),
+    }
+}
+
+/// Read the file at `repo_root/path`, hash it, check the
+/// opportunistic-body cache. On cache hit (same hash already
+/// sent) leave `content` `None`. On miss or hash mismatch, fill
+/// `content` (subject to the inline cap) and mark sent.
+async fn opportunistic_fill(
+    runtime: &Runtime,
+    repo_root: &std::path::Path,
+    author: &AgentLabel,
+    path: &str,
+    content: &mut Option<String>,
+) {
+    let abs = repo_root.join(path);
+    let body = match tokio::fs::read_to_string(&abs).await {
+        Ok(b) => b,
+        Err(_) => return,
+    };
+    let hash = crate::lifecycle::content_hash(&body);
+    if runtime
+        .opportunistic_body_seen(repo_root, author, path, &hash)
+        .await
+    {
+        return;
+    }
+    if body.len() <= MAX_INLINE_BODY {
+        *content = Some(body);
+    }
+    runtime
+        .mark_opportunistic_body_sent(
+            repo_root.to_path_buf(),
+            author.clone(),
+            path.to_string(),
+            hash,
+        )
+        .await;
 }
 
 /// True if `author` already has a current-target verdict for the
@@ -972,8 +1054,179 @@ mod integration_tests {
             .unwrap()
             .expect("foo is visible");
 
-        // Identical work-prefix.
-        assert_eq!(wfw_payload.work, wc.work);
+        // The projection (`build_work_payload`) is shared, so
+        // the underlying `WorkPayload` is identical. WFW's
+        // wait-only enrichment populates `plan_file.content`
+        // / `review.content` opportunistically; for the
+        // cross-surface invariant we strip those before
+        // comparing.
+        let mut wfw_work = wfw_payload.work.clone();
+        strip_inline_content(&mut wfw_work.action);
+        assert_eq!(wfw_work, wc.work);
+    }
+
+    /// Drop opportunistic inline `content` so a content-aware
+    /// payload can be equality-compared with a content-stripped
+    /// (e.g. work_context) one. Mutates in place.
+    fn strip_inline_content(a: &mut trinity_core::api::ExpectedAction) {
+        use trinity_core::api::ExpectedAction::*;
+        match a {
+            WriteFeedback { plan_file, .. } => plan_file.content = None,
+            AddressChanges { reviews, .. } => {
+                for r in reviews.iter_mut() {
+                    r.content = None;
+                }
+            }
+            CommitPlanRevision { .. } | StartImplementation { .. } | SessionFinished => {}
+        }
+    }
+
+    fn poll_reviewer(dir: &std::path::Path) -> WaitArgs {
+        let mut a = args(dir, WaitingRole::Reviewers, "foo", "codex");
+        a.timeout_secs = Some(1);
+        a
+    }
+
+    /// First poll for a reviewer carries `plan_file.content`; second
+    /// poll for the same agent omits it (cache hit).
+    #[tokio::test]
+    async fn write_feedback_plan_file_content_opportunistic() {
+        let dir = init_repo();
+        write_file(dir.path(), ".trinity/plans/foo.md", "# foo plan v1\n");
+        commit(dir.path(), "add foo");
+        let rt = Runtime::new();
+        rt.add_repo(dir.path().to_path_buf()).await.unwrap();
+
+        let resp = wait_for_work(&rt, poll_reviewer(dir.path())).await.unwrap();
+        let p1 = match resp {
+            WaitResponse::Work(p) => p,
+            _ => panic!("expected work"),
+        };
+        match &p1.work.action {
+            trinity_core::api::ExpectedAction::WriteFeedback { plan_file, .. } => {
+                assert_eq!(
+                    plan_file.content.as_deref(),
+                    Some("# foo plan v1\n"),
+                    "first poll should carry plan_file.content"
+                );
+            }
+            other => panic!("expected WriteFeedback, got {other:?}"),
+        }
+
+        let resp2 = wait_for_work(&rt, poll_reviewer(dir.path())).await.unwrap();
+        let p2 = match resp2 {
+            WaitResponse::Work(p) => p,
+            _ => panic!("expected work"),
+        };
+        match &p2.work.action {
+            trinity_core::api::ExpectedAction::WriteFeedback { plan_file, .. } => {
+                assert!(
+                    plan_file.content.is_none(),
+                    "second poll should omit plan_file.content; got: {plan_file:?}"
+                );
+            }
+            other => panic!("expected WriteFeedback, got {other:?}"),
+        }
+    }
+
+    /// Plan body changes → hash changes → next poll re-sends content.
+    #[tokio::test]
+    async fn write_feedback_content_resends_on_hash_change() {
+        let dir = init_repo();
+        write_file(dir.path(), ".trinity/plans/foo.md", "# v1\n");
+        commit(dir.path(), "add foo");
+        let rt = Runtime::new();
+        rt.add_repo(dir.path().to_path_buf()).await.unwrap();
+
+        let _ = wait_for_work(&rt, poll_reviewer(dir.path())).await.unwrap();
+        write_file(dir.path(), ".trinity/plans/foo.md", "# v2\n");
+        commit(dir.path(), "revise foo");
+        rt.handle_signal(dir.path(), FilesystemSignal::HeadChanged, 1)
+            .await
+            .unwrap();
+        let resp = wait_for_work(&rt, poll_reviewer(dir.path())).await.unwrap();
+        let p = match resp {
+            WaitResponse::Work(p) => p,
+            _ => panic!("expected work"),
+        };
+        match &p.work.action {
+            trinity_core::api::ExpectedAction::WriteFeedback { plan_file, .. } => {
+                assert_eq!(
+                    plan_file.content.as_deref(),
+                    Some("# v2\n"),
+                    "hash mismatch should re-send content"
+                );
+            }
+            other => panic!("expected WriteFeedback, got {other:?}"),
+        }
+    }
+
+    /// Files larger than `MAX_INLINE_BODY` get `content: None`,
+    /// but the cache is marked anyway so we don't re-read on every
+    /// poll. Second poll re-reads the file but short-circuits on
+    /// cache hit before considering the cap.
+    #[tokio::test]
+    async fn write_feedback_oversize_skips_content_and_marks_seen() {
+        let dir = init_repo();
+        let oversize = "x".repeat(super::MAX_INLINE_BODY + 1);
+        write_file(dir.path(), ".trinity/plans/foo.md", &oversize);
+        commit(dir.path(), "add foo");
+        let rt = Runtime::new();
+        rt.add_repo(dir.path().to_path_buf()).await.unwrap();
+
+        let resp = wait_for_work(&rt, poll_reviewer(dir.path())).await.unwrap();
+        let p1 = match resp {
+            WaitResponse::Work(p) => p,
+            _ => panic!("expected work"),
+        };
+        match &p1.work.action {
+            trinity_core::api::ExpectedAction::WriteFeedback { plan_file, .. } => {
+                assert!(
+                    plan_file.content.is_none(),
+                    "oversize file should omit content"
+                );
+            }
+            other => panic!("expected WriteFeedback, got {other:?}"),
+        }
+
+        let author = AgentLabel::parse("codex").unwrap();
+        let canonical = dunce::canonicalize(dir.path()).unwrap();
+        let hash = crate::lifecycle::content_hash(&oversize);
+        assert!(
+            rt.opportunistic_body_seen(&canonical, &author, ".trinity/plans/foo.md", &hash)
+                .await,
+            "oversize body should still be marked seen so we don't re-read on every poll"
+        );
+    }
+
+    /// `work_context` never populates `plan_file.content`.
+    #[tokio::test]
+    async fn work_context_omits_opportunistic_content() {
+        let dir = init_repo();
+        write_file(dir.path(), ".trinity/plans/foo.md", "# foo\n");
+        commit(dir.path(), "add foo");
+        let rt = Runtime::new();
+        rt.add_repo(dir.path().to_path_buf()).await.unwrap();
+
+        let snapshot = rt
+            .snapshot_session(dir.path(), &PlanKey::parse("foo").unwrap())
+            .await
+            .unwrap()
+            .expect("foo snapshot");
+        let author = AgentLabel::parse("codex").unwrap();
+        let wc = crate::responses::work_context_response(&snapshot, &author)
+            .unwrap()
+            .expect("foo is visible");
+
+        match &wc.work.action {
+            trinity_core::api::ExpectedAction::WriteFeedback { plan_file, .. } => {
+                assert!(
+                    plan_file.content.is_none(),
+                    "work_context must not populate plan_file.content"
+                );
+            }
+            other => panic!("expected WriteFeedback, got {other:?}"),
+        }
     }
 
     #[tokio::test]

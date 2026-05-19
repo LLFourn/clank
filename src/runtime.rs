@@ -250,6 +250,41 @@ impl Runtime {
             .remove(&(basename.clone(), author.clone()));
     }
 
+    /// Check the opportunistic-body cache: returns `true` if the
+    /// agent has already been sent this file at this exact content
+    /// hash (so the caller should leave content empty), `false` if
+    /// it's fresh or hash-mismatched (the caller should inline +
+    /// mark sent). Brief lock acquire only.
+    pub async fn opportunistic_body_seen(
+        &self,
+        repo_root: &std::path::Path,
+        agent: &crate::lifecycle::AgentLabel,
+        path: &str,
+        hash: &crate::lifecycle::ContentHash,
+    ) -> bool {
+        let trinity = self.state.lock().await;
+        trinity
+            .opportunistic_bodies
+            .get(&(repo_root.to_path_buf(), agent.clone(), path.to_string()))
+            .is_some_and(|h| h == hash)
+    }
+
+    /// Record that an opportunistic body has been sent (or skipped
+    /// due to size cap) for `(repo, agent, path)`. Hash-keyed so
+    /// file changes naturally invalidate the entry on the next poll.
+    pub async fn mark_opportunistic_body_sent(
+        &self,
+        repo_root: std::path::PathBuf,
+        agent: crate::lifecycle::AgentLabel,
+        path: String,
+        hash: crate::lifecycle::ContentHash,
+    ) {
+        let mut trinity = self.state.lock().await;
+        trinity
+            .opportunistic_bodies
+            .insert((repo_root, agent, path), hash);
+    }
+
     /// Subscribe to the live event broadcast channel. SSE handlers use
     /// this to receive new events as they're appended (no polling).
     pub fn subscribe_events(&self) -> broadcast::Receiver<LiveEvent> {
