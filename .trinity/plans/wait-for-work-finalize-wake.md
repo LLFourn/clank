@@ -39,23 +39,38 @@ The role gate is the only thing in the way.
 
 ## What
 
-Two-line code change in `src/server/wait.rs::compute_match`:
+Three-line code change in `src/server/wait.rs::compute_match`:
 
 ```rust
 let w = waiting_on(candidate.is_finished, status, candidate.gate.as_ref());
 // SessionFinished is terminal for every participant — wake any
-// role. Other states gate on a role match.
-if !candidate.is_finished && w.role != role {
+// role. Key the exception off the projected reason, not the raw
+// candidate flag, so `wait_for_work` has a single source of
+// truth (`waiting_on`) for what work exists.
+let terminal = matches!(w.reason, WaitingReason::SessionFinished);
+if !terminal && w.role != role {
     return Ok(None);
 }
 ```
 
-Plus a regression test in `src/server/wait.rs::tests` that:
+Plus a regression test that exercises the **blocked-waiter path**
+(the actual bug), not just the "already-finished" entry path. The
+shape:
 
-- Builds a finalized plan via the existing test harness.
-- Calls `wait_for_work` for both `Master` and `Reviewers`.
-- Asserts both return `WorkAction::SessionFinished` (not Timeout,
-  not None).
+- Build an active plan with at least one approved commit (so
+  Finalize is a legal next operation in the harness).
+- Spawn `wait_for_work({role: Master, plan_id})` as a tokio task
+  with a generous deadline. It blocks.
+- Commit the Finalize move on the master thread (`git commit`
+  adding `.trinity/finished/<slug>/<reviewer>.md`).
+- `await` the wait_for_work task with a tight timeout (say 5 s).
+  Assert it returns `WorkAction::SessionFinished`, not a Timeout.
+- Repeat for `role: Reviewers`.
+
+Both role cases pin the broadcast-wakes-the-waiter path through
+the new role-gate exception. An "already finished before the
+call" assertion is fine to add too as a smoke test, but the
+blocked-waiter case is the one that catches regressions.
 
 ## Files touched
 
@@ -64,14 +79,19 @@ Plus a regression test in `src/server/wait.rs::tests` that:
 
 ## Acceptance criteria
 
-- `wait_for_work({role: master, plan_id: X})` returns
-  `{work: "session_finished", ...}` immediately after `X`
-  finalizes (no timeout wait).
+- A `wait_for_work({role: master, plan_id: X})` call that
+  blocks on an active plan returns `{work: "session_finished",
+  ...}` promptly (sub-second) after `X` finalizes — the
+  broadcast wakes the long-poll and the new role-gate exception
+  lets it through.
 - Same for `role: reviewers`.
 - Existing behavior unchanged for active plans: master-role
   reasons still gate on Master; reviewer-role reasons still
-  gate on Reviewers.
-- The regression test pins both role cases.
+  gate on Reviewers. The exception keys off
+  `waiting_on(...).reason == SessionFinished`, not a second
+  independent finish check.
+- The regression test exercises the blocked-waiter path for both
+  roles.
 - `cargo test -p trinity --test end_to_end` and the
   `src/server/wait.rs` unit tests pass.
 
