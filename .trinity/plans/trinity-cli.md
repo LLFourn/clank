@@ -374,8 +374,42 @@ unreachable error case.
 `cargo test --workspace --exclude trinity-frontend`,
 `cargo clippy --all-targets`, `cargo fmt -- --check`.
 
+## Dev workflow: dogfood via `cargo install`
+
+Once Phase 1 lands, switch the dev loop from "`cargo run --
+init`" to `cargo install --path . && trinity init`. The CLI is
+the tool we want to use; running it through `cargo run` keeps
+us from noticing UX cliff-edges. Concretely:
+
+- **Bump `Cargo.toml`'s `version` on every phase ship**, minor
+  (`0.0.1` → `0.1.0` → `0.2.0` …). Patch bumps for follow-up
+  fixes on the same phase. This is the user-visible signal
+  that a `cargo install` is worth running.
+- **`trinity --version` is a real flag.** Phase 1 wires it via
+  `clap`'s built-in version support (reads `CARGO_PKG_VERSION`).
+  Cheap, no maintenance.
+- **Operator playbook (in the README) after pulling:**
+
+  ```sh
+  trinity --version              # what's installed?
+  grep '^version' Cargo.toml     # what's in the tree?
+  # mismatch → cargo install --path . --locked
+  just restart                   # restart daemon to pick up server changes
+  ```
+
+  The `just restart` step is for the daemon (`trinity serve`);
+  CLI binary updates need the reinstall step but not a daemon
+  restart. The README should call this out.
+
+Not part of the plan: a CI publish to crates.io, a homebrew
+formula, anything `cargo install` from a non-`--path` source.
+Dogfooding the local binary is the goal; public packaging is
+later work.
+
 ## Acceptance criteria
 
+- `trinity --version` reports the installed `Cargo.toml`
+  version. Each phase ships with a minor-version bump.
 - `trinity init` scaffolds `.trinity/plans/` and
   `.trinity/.gitignore` with the documented content; refuses
   to overwrite a different existing `.trinity/.gitignore`;
@@ -399,7 +433,9 @@ unreachable error case.
 **Phase 1 — Wiring and init.** Add `init`/`finish`/`purge`
 subcommands to `src/main.rs`, scaffold `src/cli/`, implement
 `trinity init` end-to-end with the gitignore detection
-pre-flight. Add the `finish_preview` HTTP endpoint.
+pre-flight. Wire `--version`. Add the `finish_preview` HTTP
+endpoint. Bump `Cargo.toml` to `0.1.0` and update the README
+with the `cargo install --path .` dev-loop note.
 
 **Phase 2 — Finish (bare + amend).** Implement `trinity
 finish` and `trinity finish --amend` against the new
