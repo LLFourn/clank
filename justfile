@@ -48,8 +48,7 @@ restart: build
     -pkill -f "target/release/trinity serve"
     sleep 1
     nohup ./target/release/trinity serve > /tmp/trinity-serve.log 2>&1 &
-    sleep 2
-    curl -sf http://127.0.0.1:7777/healthz && echo " — trinity running"
+    @bash -c 'for _ in $(seq 60); do curl -sf http://127.0.0.1:7777/healthz > /dev/null && { echo " — trinity running"; exit 0; }; sleep 0.5; done; echo "trinity did not come up in 30s; see /tmp/trinity-serve.log"; exit 1'
 
 # Frontend dev loop: daemon serves frontend/dist/ from disk, so
 # `just frontend-watch` in another terminal flows through without
