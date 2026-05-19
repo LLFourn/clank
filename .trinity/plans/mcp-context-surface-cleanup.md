@@ -150,16 +150,37 @@ convenience; missing author is not an error here. Errors only
 arise if a downstream operation (e.g. WFW's reviewer write path)
 actually needs the label and doesn't have one.
 
-Active-visible consistency (codex point 4): today's
-`resolve_plan_id` counts `!p.is_frozen()` plans without checking
-`PlanWorktreeStatus`. That's a latent bug — a non-frozen plan
-whose file is missing from the worktree is `!is_visible` and
-should not count as an active candidate. Phase 3 aligns both
-paths on the same active-visible rule: a candidate is
+Active-visible consistency: today's `resolve_plan_id` counts
+`!p.is_frozen()` plans without checking `PlanWorktreeStatus`.
+That's a latent bug — a non-frozen plan whose file is missing
+from the worktree is `!is_visible` and should not count as an
+active candidate. Phase 3 aligns both paths on the same
+active-visible rule: a candidate is
 `!is_frozen && plan_worktree_status != PlanFileMissing`. Both
 selection validation and normal counting use this rule. If the
 behavior change to normal counting breaks any test, that test
 was depending on the bug; update it.
+
+Because the rule now requires a disk read for every candidate,
+**normal inference must follow the same lock-then-disk-read
+pattern as selection validation**. Both paths share one
+implementation shape:
+
+1. Under `runtime.state().lock()`: collect candidate plans'
+   `{plan_key, plan_path, body_hash, is_frozen}` into a small
+   `Vec`. Drop the lock.
+2. Drop the lock. For each non-frozen candidate, call
+   `compute_plan_worktree_status_parts` to obtain
+   `PlanWorktreeStatus`. Filter out `PlanFileMissing`.
+3. With the filtered list in hand, decide:
+   - 1 candidate → resolve it.
+   - 0 → `NoActives`.
+   - 2+ → `Ambiguous`.
+
+This keeps `resolve_plan_id` from holding the runtime mutex
+across any disk I/O — the long-mutex / disk-I/O issue we've been
+removing elsewhere — and the selection validator reuses the
+same pattern for free.
 
 Stale-selection rule (the validation in step 3):
 
@@ -252,8 +273,9 @@ loose ad-hoc values.
   field already uses basename for lookup of already-watched
   repos; that semantics stays separate.
 
-Idempotent — already-watching is a non-error
-(`watched: already_watching` in the response).
+Idempotent — re-registering an already-watched repo is a
+non-error and returns
+`{ repo, basename, status: "already_watching" }`.
 
 Plan creation becomes a filesystem convention: write
 `.trinity/plans/<slug>.md`, commit it. The fold pipeline picks
@@ -279,7 +301,8 @@ flow. The other three phases land cleanly without it.
 - `set_active_work` selection is ephemeral. Don't persist it
   unless we hit a concrete pain point.
 - `watch_repo` is idempotent. Re-watching an already-watched
-  repo returns `already_watching: true`, not an error.
+  repo returns `status: "already_watching"` (typed enum, not a
+  stringly value), not an error.
 - No backward-compat aliases for renamed tools. There are no
   third-party MCP clients; the agents we control update with the
   rename.
