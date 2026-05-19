@@ -489,3 +489,202 @@ fn ids_validate_on_deserialize() {
     let bad: Result<PlanId, _> = serde_json::from_value(json!("trinity/.hidden.md"));
     assert!(bad.is_err(), "PlanId must reject leading-dot stems");
 }
+
+// ============================================================
+// Tagged-enum round-trips for the three tagged-enums-for-non-
+// orthogonal-fields conversions. The previously-prose invariants
+// (e.g. "old_lineno is Some iff non-Insert/non-Meta") are now
+// structural — these round-trips pin the wire shape for each
+// variant.
+// ============================================================
+
+#[test]
+fn diff_line_insert_round_trips() {
+    let line = DiffLine::Insert {
+        content: " hi".into(),
+        new_lineno: 7,
+    };
+    let v = serde_json::to_value(&line).unwrap();
+    assert_eq!(v["kind"], "insert");
+    assert_eq!(v["new_lineno"], 7);
+    assert!(v.get("old_lineno").is_none());
+    let back: DiffLine = serde_json::from_value(v).unwrap();
+    assert_eq!(line, back);
+}
+
+#[test]
+fn diff_line_delete_round_trips() {
+    let line = DiffLine::Delete {
+        content: " bye".into(),
+        old_lineno: 3,
+    };
+    let v = serde_json::to_value(&line).unwrap();
+    assert_eq!(v["kind"], "delete");
+    assert_eq!(v["old_lineno"], 3);
+    assert!(v.get("new_lineno").is_none());
+    let back: DiffLine = serde_json::from_value(v).unwrap();
+    assert_eq!(line, back);
+}
+
+#[test]
+fn diff_line_context_round_trips() {
+    let line = DiffLine::Context {
+        content: " ctx".into(),
+        old_lineno: 1,
+        new_lineno: 1,
+    };
+    let v = serde_json::to_value(&line).unwrap();
+    assert_eq!(v["kind"], "context");
+    assert_eq!(v["old_lineno"], 1);
+    assert_eq!(v["new_lineno"], 1);
+    let back: DiffLine = serde_json::from_value(v).unwrap();
+    assert_eq!(line, back);
+}
+
+#[test]
+fn diff_line_meta_round_trips() {
+    let line = DiffLine::Meta {
+        content: "@@ -1,1 +1,1 @@".into(),
+    };
+    let v = serde_json::to_value(&line).unwrap();
+    assert_eq!(v["kind"], "meta");
+    assert!(v.get("old_lineno").is_none());
+    assert!(v.get("new_lineno").is_none());
+    let back: DiffLine = serde_json::from_value(v).unwrap();
+    assert_eq!(line, back);
+}
+
+fn commit_row_gate_fixture() -> CommitGate {
+    use crate::CommitGateState;
+    let alice = AgentLabel::parse("alice").unwrap();
+    CommitGate {
+        state: CommitGateState::Approved,
+        participants: vec![alice.clone()],
+        approvers: vec![alice.clone()],
+        requesters: vec![],
+        ambiguous: vec![],
+        missing: vec![],
+        feedback: std::collections::BTreeMap::new(),
+    }
+}
+
+#[test]
+fn commit_row_plan_only_round_trips() {
+    let row = CommitRow::PlanOnly {
+        sha: "abc".into(),
+        gate: commit_row_gate_fixture(),
+        feedback: vec![],
+    };
+    let v = serde_json::to_value(&row).unwrap();
+    assert_eq!(v["kind"], "plan_only");
+    assert!(v["gate"].is_object());
+    let back: CommitRow = serde_json::from_value(v).unwrap();
+    assert_eq!(row, back);
+}
+
+#[test]
+fn commit_row_code_only_round_trips() {
+    let row = CommitRow::CodeOnly {
+        sha: "abc".into(),
+        gate: commit_row_gate_fixture(),
+        feedback: vec![],
+    };
+    let v = serde_json::to_value(&row).unwrap();
+    assert_eq!(v["kind"], "code_only");
+    let back: CommitRow = serde_json::from_value(v).unwrap();
+    assert_eq!(row, back);
+}
+
+#[test]
+fn commit_row_mixed_round_trips() {
+    let row = CommitRow::Mixed {
+        sha: "abc".into(),
+        gate: commit_row_gate_fixture(),
+        feedback: vec![],
+    };
+    let v = serde_json::to_value(&row).unwrap();
+    assert_eq!(v["kind"], "mixed");
+    let back: CommitRow = serde_json::from_value(v).unwrap();
+    assert_eq!(row, back);
+}
+
+fn timeline_event_sha_fixture() -> CommitSha {
+    CommitSha::parse("abcd1234").unwrap()
+}
+
+#[test]
+fn plan_timeline_event_plan_only_round_trips() {
+    let event = trinity_core::model::PlanTimelineEvent::PlanOnly {
+        sha: timeline_event_sha_fixture(),
+        author_ts: 1_700_000_000,
+        subject: "Plan revision".into(),
+        gate: commit_row_gate_fixture(),
+    };
+    let v = serde_json::to_value(&event).unwrap();
+    assert_eq!(v["kind"], "plan_only");
+    assert!(v["gate"].is_object());
+    let back: trinity_core::model::PlanTimelineEvent = serde_json::from_value(v).unwrap();
+    assert_eq!(event, back);
+}
+
+#[test]
+fn plan_timeline_event_code_only_round_trips() {
+    let event = trinity_core::model::PlanTimelineEvent::CodeOnly {
+        sha: timeline_event_sha_fixture(),
+        author_ts: 1_700_000_000,
+        subject: "Implement foo".into(),
+        gate: commit_row_gate_fixture(),
+    };
+    let v = serde_json::to_value(&event).unwrap();
+    assert_eq!(v["kind"], "code_only");
+    let back: trinity_core::model::PlanTimelineEvent = serde_json::from_value(v).unwrap();
+    assert_eq!(event, back);
+}
+
+#[test]
+fn plan_timeline_event_mixed_round_trips() {
+    let event = trinity_core::model::PlanTimelineEvent::Mixed {
+        sha: timeline_event_sha_fixture(),
+        author_ts: 1_700_000_000,
+        subject: "Plan + code change".into(),
+        gate: commit_row_gate_fixture(),
+    };
+    let v = serde_json::to_value(&event).unwrap();
+    assert_eq!(v["kind"], "mixed");
+    let back: trinity_core::model::PlanTimelineEvent = serde_json::from_value(v).unwrap();
+    assert_eq!(event, back);
+}
+
+#[test]
+fn plan_timeline_event_multi_plan_round_trips() {
+    let event = trinity_core::model::PlanTimelineEvent::MultiPlan {
+        sha: timeline_event_sha_fixture(),
+        author_ts: 1_700_000_000,
+        subject: "Touch two plans".into(),
+    };
+    let v = serde_json::to_value(&event).unwrap();
+    assert_eq!(v["kind"], "multi_plan");
+    assert!(
+        v.get("gate").is_none(),
+        "MultiPlan must not carry gate on the wire"
+    );
+    let back: trinity_core::model::PlanTimelineEvent = serde_json::from_value(v).unwrap();
+    assert_eq!(event, back);
+}
+
+#[test]
+fn plan_timeline_event_finalize_round_trips() {
+    let event = trinity_core::model::PlanTimelineEvent::Finalize {
+        sha: timeline_event_sha_fixture(),
+        author_ts: 1_700_000_000,
+        subject: "Finalize foo".into(),
+    };
+    let v = serde_json::to_value(&event).unwrap();
+    assert_eq!(v["kind"], "finalize");
+    assert!(
+        v.get("gate").is_none(),
+        "Finalize must not carry gate on the wire"
+    );
+    let back: trinity_core::model::PlanTimelineEvent = serde_json::from_value(v).unwrap();
+    assert_eq!(event, back);
+}
