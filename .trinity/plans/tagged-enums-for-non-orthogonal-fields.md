@@ -63,30 +63,31 @@ enum drops the null entries.
 Three tagged enums replacing three flat structs. Naming chosen to
 match each variant's role on the wire (snake_case).
 
-### 1. `CommitRow` → tagged enum
+### 1. `CommitRow` → tagged enum (reviewable kinds only)
 
 ```rust
 #[derive(...)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum CommitRow {
-    PlanOnly  { sha: String, gate: CommitGate, feedback: Vec<Feedback> },
-    CodeOnly  { sha: String, gate: CommitGate, feedback: Vec<Feedback> },
-    Mixed     { sha: String, gate: CommitGate, feedback: Vec<Feedback> },
-    MultiPlan { sha: String },
-    Finalize  { sha: String },
+    PlanOnly { sha: String, gate: CommitGate, feedback: Vec<Feedback> },
+    CodeOnly { sha: String, gate: CommitGate, feedback: Vec<Feedback> },
+    Mixed    { sha: String, gate: CommitGate, feedback: Vec<Feedback> },
 }
 ```
 
-Yes, the three reviewable variants share the same payload shape.
-That's the honest model: those three CommitKinds carry a gate +
-feedback; the other two don't. Keeping five variants preserves
-the kind distinction on the wire (still `"kind":"plan_only"` vs
-`"kind":"code_only"`) without splitting `CommitKind` into a
-sub-enum.
+Three variants, not five. `build_commits_array` already filters
+non-reviewable events at `src/responses.rs:583`
+(`if !event.kind.is_reviewable() { continue }`), so MultiPlan /
+Finalize rows would be dead. The wire surface (`commits[]` on
+plan-detail / commit-detail responses) is "reviewable commits with
+gates and feedback"; adding non-reviewable variants would either
+ship dead enum cases or silently expand `commits[]` to duplicate
+information that already lives in `timeline`.
 
-Note that `CommitGate` becomes non-Option inside the reviewable
-variants — the "is_reviewable implies Some" invariant is now
-structural.
+`CommitGate` is non-Option inside every variant — the
+"is_reviewable implies Some" invariant is now structural. The
+three variants share the same payload shape; that's the honest
+model (those three CommitKinds carry a gate + feedback).
 
 ### 2. `PlanTimelineEvent` → tagged enum
 
@@ -112,6 +113,33 @@ projection functions that walk `plan.timeline` (event_for,
 event_for_mut, frozen_at, latest_reviewable_commit_for, etc.),
 plus every test that constructs a fixture event.
 
+**Accessor methods**. The enum carries fields shared across
+variants (`sha`, `author_ts`, `subject`) plus the kind-specific
+`gate`. Without accessors, every projection that wants "the SHA"
+or "is this event's kind Finalize?" has to spell out a five-arm
+match. To keep projection code readable and centralize the
+variant→value-form mapping, the enum impl block grows the
+following methods:
+
+```rust
+impl PlanTimelineEvent {
+    pub fn sha(&self) -> &CommitSha;
+    pub fn author_ts(&self) -> i64;
+    pub fn subject(&self) -> &str;
+    pub fn kind(&self) -> CommitKind;
+    pub fn is_reviewable(&self) -> bool { self.kind().is_reviewable() }
+    pub fn gate(&self) -> Option<&CommitGate>;
+    pub fn gate_mut(&mut self) -> Option<&mut CommitGate>;
+}
+```
+
+`kind()` returns the closed-vocab `CommitKind` value for callers
+that want to filter / count / display by kind without unpacking
+the variant. Projection code does `event.kind() == ...` or
+`event.gate()` instead of inlining a match. Variant matching is
+still available for the rare case where the caller needs the
+variant-specific payload directly.
+
 ### 3. `DiffLine` → tagged enum
 
 ```rust
@@ -134,12 +162,13 @@ hunk-header / file-header strings).
 `vocab::DiffLineKind` is fully consumable into the tagged
 `DiffLine` — delete it.
 
-`CommitKind` stays for `Plan::frozen_at`'s scan
-(`matches!(e.kind, CommitKind::Finalize)`) and any other
-projection that matches across all five kinds without caring
-about the per-kind payload. The tagged enums replace its USE as
-a struct field on `CommitRow` / `PlanTimelineEvent`, not the
-closed-vocab enum itself.
+`CommitKind` stays. Callers that want the value form (e.g.
+`Plan::frozen_at`'s scan, attribution walks, anywhere matching
+across all five kinds without unpacking variant payload) call
+`event.kind()` on `PlanTimelineEvent` instead of reading a flat
+field. The tagged enums replace `CommitKind`'s USE as a struct
+field on `CommitRow` / `PlanTimelineEvent`, not the closed-vocab
+enum itself.
 
 ## Files touched (sketch)
 
@@ -218,6 +247,13 @@ closed-vocab enum itself.
 
 - `CommitRow`, `PlanTimelineEvent`, `DiffLine` are all
   tagged enums (`#[serde(tag = "kind", rename_all = "snake_case")]`).
+- `CommitRow` has three variants (`PlanOnly`, `CodeOnly`,
+  `Mixed`) — matches the existing "reviewable commits only"
+  filter at the builder.
+- `PlanTimelineEvent` exposes accessor methods (`sha`,
+  `author_ts`, `subject`, `kind`, `is_reviewable`, `gate`,
+  `gate_mut`) so projection code reads the value form without
+  spreading variant matches.
 - No `Option<T>` field on the new enums whose Some-ness is
   determined by the variant — the data is structurally inside
   the variant or not at all.
@@ -252,14 +288,20 @@ families (commit detail, plan detail, diff response). The shapes
 are all also-typed in frontend code, so the Rust compiler catches
 every consumer. No deserialize-time silent breakage on our side.
 
-The smaller call: tagged-enum variants for the three reviewable
-CommitKinds carry identical payload (`{sha, gate, feedback}`).
-Could be modeled as `Reviewable { kind, sha, gate, feedback }`
-sub-enum + `NonReviewable { kind, sha }`. Decided against:
-keeping five variants makes the wire form symmetric with
-`CommitKind` and avoids inventing a sub-vocabulary just to
-deduplicate payload definitions. Repetition in the type def is
-fine; the alternative obscures the kind on the wire.
+The smaller call: `CommitRow`'s three reviewable variants
+(`PlanOnly`, `CodeOnly`, `Mixed`) carry identical payload
+(`{sha, gate, feedback}`). Could be modeled as
+`Reviewable { kind: ReviewableKind, sha, gate, feedback }` (a
+single variant carrying a sub-vocabulary `ReviewableKind` enum).
+Decided against: three variants keep the wire form symmetric
+with `CommitKind`'s snake_case names (`plan_only`, `code_only`,
+`mixed`) and avoid inventing a sub-vocabulary just to dedupe
+payload definitions. Repetition in the type def is fine; the
+alternative obscures the kind on the wire.
+
+`PlanTimelineEvent` has five variants (it tracks all timeline
+events, not just reviewable ones), with the non-reviewable two
+omitting the `gate` field.
 
 `PlanTimelineEvent` is the most cross-cutting of the three —
 it's daemon fold-state, not just a response DTO. Replacing it
