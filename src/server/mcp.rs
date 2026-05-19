@@ -8,7 +8,7 @@ use serde_json::{Value, json};
 use super::AppState;
 use super::wait::{WaitArgs, WaitError, wait_for_work as run_wait_for_work};
 use crate::lifecycle::{AgentLabel, PlanId, PlanKey, RepoBasename};
-use crate::responses::{get_context_response, list_plans_response};
+use crate::responses::{list_plans_response, work_context_response};
 
 #[derive(Debug, Deserialize)]
 pub struct ToolCallRequest {
@@ -39,7 +39,7 @@ pub async fn dispatch(state: &AppState, req: &ToolCallRequest) -> Result<Value, 
         "echo_cwd" => Ok(json!({"cwd": req.cwd})),
         "list_plans" => list_plans(state, req).await,
         "start_plan" => start_plan(state, req).await,
-        "get_context" => get_context(state, req).await,
+        "work_context" => work_context(state, req).await,
         "wait_for_work" => wait_for_work(state, req).await,
         other => Err(ToolError::NotFound(format!("unknown tool: {other}"))),
     }
@@ -273,7 +273,7 @@ fn mcp_error(payload: trinity_core::api::McpErrorPayload) -> Result<Value, ToolE
 }
 
 #[derive(Debug, Deserialize)]
-struct GetContextArgs {
+struct WorkContextArgs {
     #[serde(default)]
     plan_id: Option<String>,
     #[serde(default)]
@@ -281,8 +281,8 @@ struct GetContextArgs {
     author_label: Option<String>,
 }
 
-async fn get_context(state: &AppState, req: &ToolCallRequest) -> Result<Value, ToolError> {
-    let args: GetContextArgs = serde_json::from_value(req.arguments.clone())
+async fn work_context(state: &AppState, req: &ToolCallRequest) -> Result<Value, ToolError> {
+    let args: WorkContextArgs = serde_json::from_value(req.arguments.clone())
         .map_err(|e| ToolError::Invalid(format!("args: {e}")))?;
     let author_raw = args.author_label.unwrap_or_else(|| "anonymous".to_string());
     let author = AgentLabel::parse(&author_raw)
@@ -362,7 +362,7 @@ async fn get_context(state: &AppState, req: &ToolCallRequest) -> Result<Value, T
                 plan_id
             ))
         })?;
-    let response = get_context_response(&snapshot, &author)
+    let response = work_context_response(&snapshot, &author)
         .map_err(|e| ToolError::Internal(anyhow::anyhow!(e)))?
         .ok_or_else(|| {
             // Plan is hidden: its file is missing from the working
@@ -444,7 +444,7 @@ pub async fn resolve_plan_id(
 ) -> Result<PlanIdResolution, ToolError> {
     // Normalize blank-string overrides to absent so callers can pass
     // `args.plan_id.as_deref()` (Option<&str>) without having to
-    // pre-check the empty case. wait_for_work and get_context used to
+    // pre-check the empty case. wait_for_work and work_context used to
     // diverge on this — one trimmed, the other passed raw — and a
     // schema-strict client sending `{"plan_id":""}` would hit
     // `invalid_plan_id` on one and inference on the other.

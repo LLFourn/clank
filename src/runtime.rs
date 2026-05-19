@@ -540,7 +540,7 @@ fn _hash_ref(s: &str) -> crate::lifecycle::ContentHash {
 mod tests {
     use super::*;
     use crate::lifecycle::{AgentLabel, CommitSha, PlanKey};
-    use crate::responses::{get_context_response, list_plans_response};
+    use crate::responses::{list_plans_response, work_context_response};
     use std::path::Path;
     use std::process::Command;
 
@@ -815,7 +815,7 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        let v = get_context_response(&snapshot, &AgentLabel::parse("master").unwrap())
+        let v = work_context_response(&snapshot, &AgentLabel::parse("master").unwrap())
             .unwrap()
             .expect("plan visible");
         assert_eq!(
@@ -867,7 +867,7 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        let v = get_context_response(&snapshot, &AgentLabel::parse("master").unwrap())
+        let v = work_context_response(&snapshot, &AgentLabel::parse("master").unwrap())
             .unwrap()
             .expect("plan visible");
         // Gate falls back to no participants → reviewers / plan_needs_initial_review.

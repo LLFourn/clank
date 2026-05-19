@@ -278,33 +278,26 @@ pub struct ListPlansResponse {
     pub conflicts: Vec<PlanConflict>,
 }
 
-/// MCP `get_context` response body. Rich per-plan view used to
-/// drive the agent loop. Most fields are also present on
-/// `PlanDetailResponse` (the UI's richer shape with plan body
-/// included).
+/// MCP `work_context` response body. The narrow coordination
+/// view: just enough to act on the latest `wait_for_work` result.
+///
+/// Anything that needs the full per-plan fold (timeline, all
+/// commits with feedback bodies, archived cycles, plan body
+/// markdown, PR hints) reads HTTP `/api/plan/<id>` instead. MCP
+/// coordinates work; HTTP transports content.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct GetContextResponse {
+pub struct WorkContextResponse {
+    pub plan_id: String,
     pub repo: String,
-    pub plan_id: Option<String>,
-    pub slug: String,
-    pub lifecycle: PlanLifecycle,
     pub current_path: String,
+    pub lifecycle: PlanLifecycle,
     pub phase: Posture,
     pub plan_worktree_status: PlanWorktreeStatus,
     pub waiting_on: WaitingOn,
     pub expected_action: ExpectedAction,
     pub review_target: Option<ReviewTarget>,
     pub write_feedback: Option<WriteFeedback>,
-    pub review_gate: Option<ReviewGate>,
-    pub latest_plan_revision: Option<CommitRef>,
-    pub latest_implementation_revision: Option<CommitRef>,
-    pub plan_revisions: Vec<String>,
-    pub implementation_commits: Vec<String>,
-    pub commits: Vec<CommitRow>,
     pub latest_relevant_commit: Option<String>,
-    pub timeline: Vec<TimelineEvent>,
-    pub pr_hint: Option<PrHint>,
-    pub archived_cycles: Vec<ArchivedCycle>,
 }
 
 /// `/api/plan/{repo}/{stem_md}` response body — the UI's richer

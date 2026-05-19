@@ -8,6 +8,7 @@ use std::time::Duration;
 
 use serde_json::json;
 use trinity::server;
+use trinity_core::api::PlanDetailResponse;
 
 fn run_git(cwd: &Path, args: &[&str]) {
     let status = Command::new("git")
@@ -45,6 +46,28 @@ fn commit(repo: &Path, msg: &str) {
 fn plan_id_for(dir: &tempfile::TempDir, slug: &str) -> String {
     let basename = dir.path().file_name().unwrap().to_str().unwrap();
     format!("{basename}/{slug}.md")
+}
+
+/// Fetch the HTTP `/api/plan/<basename>/<slug>.md` response as the
+/// typed `PlanDetailResponse`. Useful in tests that need fields the
+/// MCP `work_context` coordination view intentionally drops
+/// (`pr_hint`, `latest_plan_revision`,
+/// `latest_implementation_revision`, `commits[]`, etc.).
+async fn fetch_plan_detail(
+    client: &reqwest::Client,
+    url: &str,
+    dir: &tempfile::TempDir,
+    slug: &str,
+) -> PlanDetailResponse {
+    let basename = dir.path().file_name().unwrap().to_str().unwrap();
+    client
+        .get(format!("{url}/api/plan/{basename}/{slug}.md"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap()
 }
 
 async fn spawn_daemon(repo_root: &Path) -> (String, tokio::task::JoinHandle<()>) {
@@ -153,7 +176,7 @@ async fn plan_detail_renders() {
 }
 
 #[tokio::test]
-async fn mcp_get_context_via_internal_tool_call() {
+async fn mcp_work_context_via_internal_tool_call() {
     let dir = init_repo();
     write_file(dir.path(), ".trinity/plans/foo.md", "# foo\n");
     commit(dir.path(), "Add foo");
@@ -162,7 +185,7 @@ async fn mcp_get_context_via_internal_tool_call() {
     let client = reqwest::Client::new();
     let req = json!({
         "cwd": dir.path(),
-        "tool": "get_context",
+        "tool": "work_context",
         "arguments": { "plan_id": plan_id_for(&dir, "foo") }
     });
     let resp = client
@@ -182,7 +205,7 @@ async fn mcp_get_context_via_internal_tool_call() {
 }
 
 #[tokio::test]
-async fn mcp_get_context_for_uncommitted_returns_session_not_committed() {
+async fn mcp_work_context_for_uncommitted_returns_plan_not_committed() {
     let dir = init_repo();
     write_file(dir.path(), ".trinity/plans/foo.md", "# foo\n");
     // Don't commit.
@@ -191,7 +214,7 @@ async fn mcp_get_context_for_uncommitted_returns_session_not_committed() {
     let client = reqwest::Client::new();
     let req = json!({
         "cwd": dir.path(),
-        "tool": "get_context",
+        "tool": "work_context",
         "arguments": { "plan_id": plan_id_for(&dir, "foo") }
     });
     let resp = client
@@ -242,34 +265,15 @@ async fn pr_hint_present_in_implementing_phase() {
 
     let (url, handle) = spawn_daemon(dir.path()).await;
     let client = reqwest::Client::new();
-    let req = json!({
-        "cwd": dir.path(),
-        "tool": "get_context",
-        "arguments": { "plan_id": plan_id_for(&dir, "foo") }
-    });
-    let resp = client
-        .post(format!("{}/internal/tool_call", url))
-        .json(&req)
-        .send()
-        .await
-        .unwrap();
+    let body = fetch_plan_detail(&client, &url, &dir, "foo").await;
     handle.abort();
-    let body: serde_json::Value = resp.json().await.unwrap();
-    let pr_hint = &body["result"]["pr_hint"];
-    assert!(
-        pr_hint.is_object(),
-        "pr_hint should be an object: {pr_hint}"
-    );
-    assert!(pr_hint["plan_intro"].is_string());
-    assert!(pr_hint["plan_intro_parent"].is_null() || pr_hint["plan_intro_parent"].is_string());
-    let options = pr_hint["options"].as_array().unwrap();
-    assert_eq!(options.len(), 2);
-    let kinds: Vec<&str> = options
-        .iter()
-        .map(|o| o["kind"].as_str().unwrap())
-        .collect();
-    assert!(kinds.contains(&"keep_plan_in_pr"));
-    assert!(kinds.contains(&"exclude_plan_from_pr"));
+    let pr_hint = body.pr_hint.expect("pr_hint should be present");
+    assert!(!pr_hint.plan_intro.is_empty());
+    let kinds: Vec<_> = pr_hint.options.iter().map(|o| o.kind).collect();
+    assert_eq!(kinds.len(), 2);
+    use trinity_core::vocab::PrHintOptionKind::*;
+    assert!(kinds.contains(&KeepPlanInPr));
+    assert!(kinds.contains(&ExcludePlanFromPr));
 }
 
 #[tokio::test]
@@ -279,26 +283,12 @@ async fn plan_revision_route_renders_blob() {
     commit(dir.path(), "Add foo plan");
 
     let (url, handle) = spawn_daemon(dir.path()).await;
-    // Get the latest plan revision SHA via list_sessions / get_context.
     let client = reqwest::Client::new();
-    let req = json!({
-        "cwd": dir.path(),
-        "tool": "get_context",
-        "arguments": { "plan_id": plan_id_for(&dir, "foo") }
-    });
-    let ctx: serde_json::Value = client
-        .post(format!("{}/internal/tool_call", url))
-        .json(&req)
-        .send()
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
-    let sha = ctx["result"]["latest_plan_revision"]["commit_sha"]
-        .as_str()
-        .unwrap()
-        .to_string();
+    let plan = fetch_plan_detail(&client, &url, &dir, "foo").await;
+    let sha = plan
+        .latest_plan_revision
+        .expect("plan should have an intro revision")
+        .commit_sha;
 
     let basename = dir.path().file_name().unwrap().to_str().unwrap();
     let body = client
@@ -323,24 +313,11 @@ async fn commit_diff_route_renders_patch() {
 
     let (url, handle) = spawn_daemon(dir.path()).await;
     let client = reqwest::Client::new();
-    let req = json!({
-        "cwd": dir.path(),
-        "tool": "get_context",
-        "arguments": { "plan_id": plan_id_for(&dir, "foo") }
-    });
-    let ctx: serde_json::Value = client
-        .post(format!("{}/internal/tool_call", url))
-        .json(&req)
-        .send()
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
-    let impl_sha = ctx["result"]["latest_implementation_revision"]["commit_sha"]
-        .as_str()
-        .unwrap()
-        .to_string();
+    let plan = fetch_plan_detail(&client, &url, &dir, "foo").await;
+    let impl_sha = plan
+        .latest_implementation_revision
+        .expect("plan should have an implementation commit")
+        .commit_sha;
 
     let basename = dir.path().file_name().unwrap().to_str().unwrap();
     let body = client
@@ -383,24 +360,11 @@ async fn commit_diff_carries_subject_and_message_body_without_patch_leak() {
 
     let (url, handle) = spawn_daemon(dir.path()).await;
     let client = reqwest::Client::new();
-    let req = json!({
-        "cwd": dir.path(),
-        "tool": "get_context",
-        "arguments": { "plan_id": plan_id_for(&dir, "foo") }
-    });
-    let ctx: serde_json::Value = client
-        .post(format!("{}/internal/tool_call", url))
-        .json(&req)
-        .send()
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
-    let impl_sha = ctx["result"]["latest_implementation_revision"]["commit_sha"]
-        .as_str()
-        .unwrap()
-        .to_string();
+    let plan = fetch_plan_detail(&client, &url, &dir, "foo").await;
+    let impl_sha = plan
+        .latest_implementation_revision
+        .expect("plan should have an implementation commit")
+        .commit_sha;
 
     let basename = dir.path().file_name().unwrap().to_str().unwrap();
     let body: serde_json::Value = client
@@ -771,60 +735,27 @@ async fn feedback_renders_on_session_page() {
     let (url, handle) = spawn_daemon(dir.path()).await;
     let client = reqwest::Client::new();
 
-    // Find the plan_intro sha via get_context.
-    let req = json!({
-        "cwd": dir.path(),
-        "tool": "get_context",
-        "arguments": { "plan_id": plan_id_for(&dir, "foo") }
-    });
-    let ctx: serde_json::Value = client
-        .post(format!("{}/internal/tool_call", url))
-        .json(&req)
-        .send()
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
-    let intro = ctx["result"]["latest_plan_revision"]["commit_sha"]
-        .as_str()
-        .unwrap()
-        .to_string();
+    let plan = fetch_plan_detail(&client, &url, &dir, "foo").await;
+    let intro = plan
+        .latest_plan_revision
+        .as_ref()
+        .expect("plan should have an intro revision")
+        .commit_sha
+        .clone();
 
     // Drop a feedback file at the canonical path.
     let feedback_rel = format!(".trinity/feedback/foo/{}/alice.md", intro);
     write_file(dir.path(), &feedback_rel, "APPROVE\n\nlgtm\n");
     tokio::time::sleep(Duration::from_millis(1500)).await;
 
-    // First check via get_context that the feedback is in state.
-    let req2 = json!({
-        "cwd": dir.path(),
-        "tool": "get_context",
-        "arguments": { "plan_id": plan_id_for(&dir, "foo") }
+    let plan2 = fetch_plan_detail(&client, &url, &dir, "foo").await;
+    let has_alice_approve = plan2.commits.iter().any(|c| {
+        c.feedback.iter().any(|f| {
+            f.author.as_str() == "alice"
+                && matches!(f.verdict, trinity_core::vocab::Verdict::Approve)
+        })
     });
-    let ctx2: serde_json::Value = client
-        .post(format!("{}/internal/tool_call", url))
-        .json(&req2)
-        .send()
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
-    let commits = ctx2["result"]["commits"].as_array().unwrap();
-    let has_alice_approve = commits.iter().any(|c| {
-        c["feedback"]
-            .as_array()
-            .map(|fb| {
-                fb.iter()
-                    .any(|f| f["author"] == "alice" && f["verdict"] == "approve")
-            })
-            .unwrap_or(false)
-    });
-    assert!(
-        has_alice_approve,
-        "commits[] should carry alice's APPROVE; ctx: {ctx2}"
-    );
+    assert!(has_alice_approve, "commits[] should carry alice's APPROVE");
     // Then check that the UI plan endpoint exposes the feedback
     // including the rendered body HTML.
     let basename = dir.path().file_name().unwrap().to_str().unwrap();
@@ -1634,26 +1565,15 @@ async fn finalize_commit_endpoint_returns_full_snapshot_not_just_diff() {
     let (url, handle) = spawn_daemon(dir.path()).await;
     let client = reqwest::Client::new();
 
-    let req = json!({
-        "cwd": dir.path(),
-        "tool": "get_context",
-        "arguments": { "plan_id": plan_id_for(&dir, "foo") }
-    });
-    let ctx: serde_json::Value = client
-        .post(format!("{}/internal/tool_call", url))
-        .json(&req)
-        .send()
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
-    let timeline = ctx["result"]["timeline"].as_array().unwrap();
-    let finalize_event = timeline
+    let plan = fetch_plan_detail(&client, &url, &dir, "foo").await;
+    let finalize_sha = plan
+        .timeline
         .iter()
-        .find(|e| e["kind"] == "commit_finalize")
+        .find_map(|e| match e {
+            trinity_core::api::TimelineEvent::CommitFinalize { sha, .. } => Some(sha.clone()),
+            _ => None,
+        })
         .expect("timeline must carry a commit_finalize event");
-    let finalize_sha = finalize_event["sha"].as_str().unwrap().to_string();
 
     let basename = dir.path().file_name().unwrap().to_str().unwrap();
     let body: serde_json::Value = client

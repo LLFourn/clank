@@ -199,7 +199,7 @@ const GUARD_A_ALLOWLIST: &[(&str, usize)] = &[
     ("src/server/mcp.rs", 1),
     // Tool input-schema JSON. Allowed exception per plan §"Allowed
     // exceptions"; typed schema builder is out of scope.
-    ("src/tools.rs", 5),
+    ("src/tools.rs", 4),
 ];
 
 #[test]

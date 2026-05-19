@@ -21,8 +21,8 @@ use crate::projection::{
 use crate::repo_state::{Plan, PlanWorktreeStatus, RepoState};
 use crate::review_state::CommitGate;
 use trinity_core::api::{
-    CommitRef, CommitRow, Feedback, GetContextResponse, ListPlansResponse, PlanConflict,
-    PlanDetailResponse, PlanRow, PrHint, PrHintOption, ReviewGate, ReviewTarget, TimelineEvent,
+    CommitRef, CommitRow, Feedback, ListPlansResponse, PlanConflict, PlanDetailResponse, PlanRow,
+    PrHint, PrHintOption, ReviewGate, ReviewTarget, TimelineEvent, WorkContextResponse,
     WriteFeedback,
 };
 use trinity_core::vocab::{CommitKind, PlanTouchKind, Posture, ReviewTargetPhase};
@@ -167,21 +167,21 @@ fn build_plan_row(
 }
 
 // ============================================================
-// get_context (MCP)
+// work_context (MCP)
 // ============================================================
 
-pub fn get_context_response(
+pub fn work_context_response(
     snapshot: &RepoState,
     author_label: &AgentLabel,
-) -> std::io::Result<Option<GetContextResponse>> {
-    get_context_response_with_reader(snapshot, author_label, &DiskPlanStatusReader)
+) -> std::io::Result<Option<WorkContextResponse>> {
+    work_context_response_with_reader(snapshot, author_label, &DiskPlanStatusReader)
 }
 
-pub fn get_context_response_with_reader(
+pub fn work_context_response_with_reader(
     snapshot: &RepoState,
     author_label: &AgentLabel,
     status_reader: &impl PlanStatusReader,
-) -> std::io::Result<Option<GetContextResponse>> {
+) -> std::io::Result<Option<WorkContextResponse>> {
     let plan = snapshot
         .plans
         .values()
@@ -192,26 +192,24 @@ pub fn get_context_response_with_reader(
     if !plan.is_visible(worktree_status) {
         return Ok(None);
     }
-    Ok(Some(get_context_response_from_snapshot(
+    Ok(Some(work_context_response_from_snapshot(
         snapshot,
         worktree_status,
         author_label,
     )))
 }
 
-pub fn get_context_response_from_snapshot(
+pub fn work_context_response_from_snapshot(
     state: &RepoState,
     worktree_status: PlanWorktreeStatus,
     author_label: &AgentLabel,
-) -> GetContextResponse {
+) -> WorkContextResponse {
     let plan = state
         .plans
         .values()
         .next()
         .expect("snapshot_session invariant: exactly one plan");
     let plan_phase = current_posture(plan, state);
-    let plan_gate = plan_gate_for(plan, state);
-    let impl_gate = impl_gate_for(plan, state);
     let gate = crate::projection::latest_reviewable_commit_gate_for(plan);
     let w = waiting_on(plan.is_frozen(), worktree_status, gate);
     let review_target_phase = posture_to_review_target_phase(plan_phase);
@@ -231,60 +229,22 @@ pub fn get_context_response_from_snapshot(
             author = author_label.as_str(),
         ),
     });
-    let plan_revisions: Vec<String> = all_plan_revisions(plan, state)
-        .into_iter()
-        .map(|s| s.as_str().to_string())
-        .collect();
-    let implementation_commits: Vec<String> = all_implementation_commits(plan, state)
-        .into_iter()
-        .map(|s| s.as_str().to_string())
-        .collect();
-    let lifecycle = plan.lifecycle();
-    let pr_hint = if matches!(plan_phase, Posture::Implementing) {
-        Some(build_pr_hint(
-            plan,
-            &all_implementation_commits(plan, state)
-                .into_iter()
-                .map(|s| s.as_str().to_string())
-                .collect::<Vec<_>>(),
-        ))
-    } else {
-        None
-    };
-
-    let commits = build_commits_array(plan);
     let latest_relevant_commit = review_target_sha
         .as_ref()
         .map(|sha| sha.as_str().to_string());
-    let timeline = build_timeline(plan);
-    let review_gate = build_review_gate(plan_gate, impl_gate, plan_phase);
 
-    GetContextResponse {
+    WorkContextResponse {
+        plan_id: plan_id_string(&state.root, &plan.id).expect("active plan must have a plan_id"),
         repo: state.root.to_string_lossy().to_string(),
-        plan_id: plan_id_string(&state.root, &plan.id),
-        slug: plan.id.as_str().to_string(),
-        lifecycle,
         current_path: plan.plan_path.clone(),
+        lifecycle: plan.lifecycle(),
         phase: plan_phase,
         plan_worktree_status: worktree_status,
         expected_action: expected_action(w.reason),
         waiting_on: w,
         review_target,
         write_feedback,
-        review_gate,
-        latest_plan_revision: plan_revisions.last().map(|s: &String| CommitRef {
-            commit_sha: s.clone(),
-        }),
-        latest_implementation_revision: implementation_commits.last().map(|s: &String| CommitRef {
-            commit_sha: s.clone(),
-        }),
-        plan_revisions,
-        implementation_commits,
-        commits,
         latest_relevant_commit,
-        timeline,
-        pr_hint,
-        archived_cycles: plan.archived_cycles.clone(),
     }
 }
 

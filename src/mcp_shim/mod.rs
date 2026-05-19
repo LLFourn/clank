@@ -240,7 +240,7 @@ struct ToolCallEnvelope {
 fn label_arg_for(tool: &str) -> Option<&'static str> {
     match tool {
         "start_plan" => Some("label"),
-        "get_context" => Some("author_label"),
+        "work_context" => Some("author_label"),
         "wait_for_work" => Some("author_label"),
         _ => None,
     }
@@ -382,8 +382,8 @@ impl ServerHandler for ShimHandler {
                  Discover plans with `list_plans` or create one with `start_plan`. \
                  To drive an agent loop, call `wait_for_work({role: \"master\" | \"reviewers\", plan_id})` — \
                  it blocks until the plan needs your role and returns minimal identifiers; \
-                 for each match, follow up with `get_context({plan_id})` for the full plan \
-                 state. This avoids polling. \n\n\
+                 for each match, follow up with `work_context({plan_id})` for the narrow \
+                 coordination view. This avoids polling. \n\n\
                  `plan_id` is the canonical `<repo_basename>/<stem>.md` identity (e.g. \
                  `trinity/leptos-frontend.md`). The shim caches the last `label` / \
                  `author_label` you passed so subsequent calls don't need to repeat it. \

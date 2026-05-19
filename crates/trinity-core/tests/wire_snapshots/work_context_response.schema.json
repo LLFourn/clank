@@ -1,0 +1,27 @@
+{
+  "current_path": "string",
+  "expected_action": "string",
+  "latest_relevant_commit": "string",
+  "lifecycle": "string",
+  "phase": "string",
+  "plan_id": "string",
+  "plan_worktree_status": "string",
+  "repo": "string",
+  "review_target": {
+    "commit_sha": "string",
+    "phase": "string"
+  },
+  "waiting_on": {
+    "agents": [
+      "string"
+    ],
+    "description": "string",
+    "reason": "string",
+    "role": "string"
+  },
+  "write_feedback": {
+    "path": "string",
+    "phase": "string",
+    "target_sha": "string"
+  }
+}

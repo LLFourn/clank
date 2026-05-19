@@ -219,13 +219,12 @@ fn schema_list_plans_response() {
 }
 
 #[test]
-fn schema_get_context_response() {
-    let v = serde_json::to_value(GetContextResponse {
+fn schema_work_context_response() {
+    let v = serde_json::to_value(WorkContextResponse {
+        plan_id: "trinity/foo.md".into(),
         repo: "/r".into(),
-        plan_id: Some("trinity/foo.md".into()),
-        slug: "foo".into(),
-        lifecycle: PlanLifecycle::Active,
         current_path: ".trinity/plans/foo.md".into(),
+        lifecycle: PlanLifecycle::Active,
         phase: Posture::Planning,
         plan_worktree_status: PlanWorktreeStatus::Clean,
         waiting_on: waiting_on_fixture(),
@@ -239,21 +238,10 @@ fn schema_get_context_response() {
             target_sha: "abc".into(),
             path: ".trinity/feedback/foo/abc/alice.md".into(),
         }),
-        review_gate: Some(review_gate_fixture()),
-        latest_plan_revision: Some(CommitRef {
-            commit_sha: "abc".into(),
-        }),
-        latest_implementation_revision: None,
-        plan_revisions: vec!["abc".into()],
-        implementation_commits: vec![],
-        commits: vec![commit_row_fixture()],
         latest_relevant_commit: Some("abc".into()),
-        timeline: vec![timeline_review_fixture()],
-        pr_hint: Some(pr_hint_fixture()),
-        archived_cycles: vec![archived_fixture()],
     })
     .unwrap();
-    assert_schema("get_context_response", &v);
+    assert_schema("work_context_response", &v);
 }
 
 #[test]

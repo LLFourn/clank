@@ -17,14 +17,15 @@ pub struct ToolDescriptor {
 /// `start_plan` creates the plan file in the working tree; the agent must
 /// then commit it before Trinity treats the plan as live.
 ///
-/// `get_context` returns the canonical per-plan waiting_on, phase,
-/// plan_worktree_status, review_gate, and pr_hint. Read-only.
+/// `work_context` returns the narrow coordination view for one plan:
+/// `waiting_on`, `phase`, `expected_action`, `review_target`,
+/// `write_feedback`, plus identity fields. Read-only.
 ///
 /// `list_plans` returns the in-memory plan summary for the caller's repo,
 /// including any plan-key conflicts the operator must resolve.
 ///
 /// `wait_for_work` long-polls until a plan needs the caller's role, then
-/// returns minimal identifiers. Replaces poll-loops over `get_context` /
+/// returns minimal identifiers. Replaces poll-loops over `work_context` /
 /// `list_plans`.
 ///
 /// The `echo_cwd` diagnostic remains in the dispatcher
@@ -96,7 +97,7 @@ pub fn catalog() -> Vec<ToolDescriptor> {
             description: "Block until a plan needs the caller's role, then return the \
                           work to do plus the file paths to act on. This is the idiomatic way \
                           to drive an agent loop — replaces polling `list_plans` / \
-                          `get_context` on a timer.\n\n\
+                          `work_context` on a timer.\n\n\
                           Inputs:\n\
                           - `role` (required, `master` | `reviewers`).\n\
                           - `plan_id` (optional): canonical `<repo_basename>/<stem>.md`. \
@@ -160,13 +161,16 @@ pub fn catalog() -> Vec<ToolDescriptor> {
             }),
         },
         ToolDescriptor {
-            name: "get_context".to_string(),
-            description: "Returns the per-plan view: `{ plan_id, slug, state, current_path, \
-                          phase, plan_worktree_status, waiting_on, review_gate, commits, \
-                          latest_relevant_commit, latest_plan_revision, ... }`. \
-                          `state` is `active` | `done`. `current_path` is the plan's current \
-                          repo-relative path. `commits[]` is the canonical per-commit gate + \
-                          feedback array — the canonical feedback shape on the wire.\n\n\
+            name: "work_context".to_string(),
+            description: "Returns the narrow coordination view for one plan: `{ plan_id, repo, \
+                          current_path, lifecycle, phase, plan_worktree_status, waiting_on, \
+                          expected_action, review_target, write_feedback, \
+                          latest_relevant_commit }`. Enough to act on the latest \
+                          `wait_for_work` result. Read-only.\n\n\
+                          This is intentionally smaller than the HTTP `/api/plan/<id>` shape — \
+                          it omits `commits[]`, full timelines, archived cycles, plan body \
+                          markdown, and PR hints. Those are UI-content surfaces; MCP only \
+                          coordinates work. Read HTTP if you need them.\n\n\
                           Errors: `invalid_plan_id`, `unknown_repo`, `unknown_plan`, \
                           `plan_not_committed`, `plan_conflict`, `no_active_plan` (inference \
                           path: zero active plans in the resolved repo), `ambiguous_plan` \
@@ -175,12 +179,14 @@ pub fn catalog() -> Vec<ToolDescriptor> {
                           Inputs:\n\
                           - `plan_id` (optional): canonical `<repo_basename>/<stem>.md`. If \
                             omitted, the daemon infers from `repo` (or the caller's cwd): \
-                            exactly one active plan resolves it, zero returns `no_active_plan`, \
-                            multiple returns `ambiguous_plan` with a candidate list.\n\
+                            exactly one active+visible plan resolves it, zero returns \
+                            `no_active_plan`, multiple returns `ambiguous_plan` with a \
+                            candidate list.\n\
                           - `repo` (optional): scopes the inference. Basename or abs path.\n\
                           - `author_label` (optional, defaults to last cached).\n\n\
-                          Always call this before reviewing or implementing. The `waiting_on` \
-                          field tells you whether the current bottleneck is master or reviewers."
+                          The `waiting_on` field tells you whether the current bottleneck is \
+                          master or reviewers; `write_feedback.path` is the canonical \
+                          reviewer write location when applicable."
                 .to_string(),
             input_schema: json!({
                 "type": "object",

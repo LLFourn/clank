@@ -2,7 +2,7 @@
 //! plan worktree status from hash comparisons, gate derivation, and
 //! the `waiting_on` value.
 //!
-//! All consumers (MCP `get_context`, HTTP routes, SSE payload
+//! All consumers (MCP `work_context`, HTTP routes, SSE payload
 //! construction, `wait_for_work` matching) call into these functions.
 //!
 //! Everything here is O(1) or O(plan-local) on per-plan fields the
