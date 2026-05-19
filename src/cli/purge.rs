@@ -19,8 +19,10 @@ pub async fn run(args: PurgeArgs) -> anyhow::Result<()> {
     if args.amend {
         anyhow::bail!("--amend is not yet implemented in this phase");
     }
-    if args.squash.is_some() {
-        anyhow::bail!("--squash is not yet implemented in this phase");
+    if args.squash.is_some() && args.all {
+        // Squashing every plan's history into one commit would
+        // lose per-plan boundaries; refuse rather than try.
+        anyhow::bail!("--squash is not supported with --all");
     }
 
     if args.all && args.plan.is_some() {
@@ -58,6 +60,7 @@ async fn run_single(
         into_branch: args.into_branch.as_deref(),
         dry: args.dry,
         allow_rewrite_protected: args.allow_rewrite_protected,
+        squash: args.squash.as_deref(),
     })
     .await?;
 
@@ -104,6 +107,7 @@ async fn run_all(
         into_branch: args.into_branch.as_deref(),
         dry: args.dry,
         allow_rewrite_protected: args.allow_rewrite_protected,
+        squash: args.squash.as_deref(),
     })
     .await?;
 

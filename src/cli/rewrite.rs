@@ -40,6 +40,13 @@ pub struct RewriteOpts<'a> {
     /// Permit rewriting a protected branch (`main`/`master`/etc.)
     /// in place. Ignored when `into_branch` is set.
     pub allow_rewrite_protected: bool,
+    /// `Some(msg)` collapses every commit in the range into one
+    /// commit on top of `intro_parent`, with the supplied message.
+    /// Refuses if any commit in the range is marked `foreign`
+    /// (squash can't selectively preserve interleaved foreign
+    /// work). The resulting tree is HEAD's tree minus the union
+    /// of all strip_paths from the manifest.
+    pub squash: Option<&'a str>,
 }
 
 #[derive(Debug, Default)]
@@ -72,6 +79,22 @@ pub async fn run(opts: RewriteOpts<'_>) -> anyhow::Result<RewriteOutcome> {
 
     let blockers = collect_blockers(&opts)?;
 
+    // Squash adds one more blocker: foreign commits in the range.
+    // Squash can't selectively preserve interleaved foreign work;
+    // the operator must `--purge` first if they want to handle
+    // them.
+    let mut blockers = blockers;
+    if opts.squash.is_some() {
+        let foreign = plan.steps.iter().filter(|s| s.foreign).count();
+        if foreign > 0 {
+            blockers.push(format!(
+                "--squash refuses {foreign} foreign commit(s) in the rewrite \
+                 range. Use `trinity purge` without `--squash` first, then \
+                 retry."
+            ));
+        }
+    }
+
     if opts.dry {
         print_rebase_todo(&opts, &plan, &blockers);
         return Ok(RewriteOutcome::default());
@@ -90,7 +113,18 @@ pub async fn run(opts: RewriteOpts<'_>) -> anyhow::Result<RewriteOutcome> {
         .expect("blockers would have caught a missing intro");
     let _ = intro;
 
-    let new_tip = apply_plan(opts.repo, &plan, intro_parent.as_deref()).await?;
+    let new_tip = if let Some(message) = opts.squash {
+        apply_squash(
+            opts.repo,
+            opts.head_sha,
+            &plan,
+            intro_parent.as_deref(),
+            message,
+        )
+        .await?
+    } else {
+        apply_plan(opts.repo, &plan, intro_parent.as_deref()).await?
+    };
     let updated_branch = match opts.into_branch {
         Some(name) => {
             // Atomic "must not already exist": all-zero old value
@@ -407,6 +441,100 @@ async fn apply_plan(
     } else {
         parent.ok_or_else(|| anyhow::anyhow!("rewrite produced commits but lost the tip"))
     }
+}
+
+/// Collapse the rewrite range into ONE commit on top of
+/// `intro_parent`. Tree = HEAD's tree minus the union of all
+/// strip_paths across the manifest. Foreign-commit refusal lives
+/// in `run()`'s blocker check; this function assumes the range
+/// is clean.
+async fn apply_squash(
+    repo: &Path,
+    head_sha: &CommitSha,
+    plan: &ExecutionPlan,
+    intro_parent: Option<&str>,
+    message: &str,
+) -> anyhow::Result<String> {
+    let mut strip_union: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
+    for step in &plan.steps {
+        for p in &step.strip_paths {
+            strip_union.insert(p.as_str());
+        }
+    }
+    let strip: Vec<String> = strip_union.iter().map(|s| s.to_string()).collect();
+    // Build the squashed tree from HEAD's tree (the union of
+    // everything the range produced) with the strip paths removed.
+    // Paths in the strip set but absent from HEAD's tree are no-ops
+    // for `update-index --force-remove` — added-then-deleted in the
+    // range, already gone.
+    let head_str = head_sha.as_str();
+    let new_tree = build_stripped_tree_from_sha(repo, head_str, &strip)?;
+    // Author/timestamp: prefer HEAD's so the squashed commit
+    // doesn't look like a fresh authorship event from now.
+    // Committer-side fields will refresh.
+    let mut cmd = std::process::Command::new("git");
+    cmd.arg("-C").arg(repo);
+    let author = git_capture(repo, &["show", "-s", "--format=%an <%ae>", head_str])?;
+    let author_date = git_capture(repo, &["show", "-s", "--format=%aI", head_str])?;
+    if let Some((name, email)) = parse_author(author.trim()) {
+        cmd.env("GIT_AUTHOR_NAME", name);
+        cmd.env("GIT_AUTHOR_EMAIL", email);
+    }
+    cmd.env("GIT_AUTHOR_DATE", author_date.trim());
+    cmd.args(["commit-tree", &new_tree]);
+    if let Some(p) = intro_parent {
+        cmd.args(["-p", p]);
+    }
+    cmd.arg("-m").arg(message);
+    let output = cmd.output()?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "git commit-tree failed for squash: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(String::from_utf8(output.stdout)?.trim().to_string())
+}
+
+/// Like `build_stripped_tree` but takes a sha that we look up
+/// `^{tree}` for. Used by squash where we work from HEAD's tree
+/// directly.
+fn build_stripped_tree_from_sha(
+    repo: &Path,
+    sha: &str,
+    strip_paths: &[String],
+) -> anyhow::Result<String> {
+    let scratch_dir = repo.join(".git").join("trinity-rewrite");
+    std::fs::create_dir_all(&scratch_dir)?;
+    let unique = format!(
+        "squash-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0),
+    );
+    let index_path = scratch_dir.join(unique);
+    let _ = std::fs::remove_file(&index_path);
+
+    let result = (|| -> anyhow::Result<String> {
+        git_run_with_index(
+            repo,
+            &index_path,
+            &["read-tree", &format!("{sha}^{{tree}}")],
+        )?;
+        for path in strip_paths {
+            git_run_with_index(
+                repo,
+                &index_path,
+                &["update-index", "--remove", "--force-remove", path],
+            )?;
+        }
+        let tree = git_capture_with_index(repo, &index_path, &["write-tree"])?;
+        Ok(tree.trim().to_string())
+    })();
+    let _ = std::fs::remove_file(&index_path);
+    result
 }
 
 /// Build a new tree object from `<sha>`'s tree by removing each path
@@ -745,6 +873,7 @@ mod tests {
             into_branch: Some("purged"),
             dry: false,
             allow_rewrite_protected: false,
+            squash: None,
         })
         .await
         .unwrap();
@@ -794,6 +923,7 @@ mod tests {
             into_branch: Some("dry-target"),
             dry: true,
             allow_rewrite_protected: false,
+            squash: None,
         })
         .await
         .unwrap();
@@ -837,6 +967,7 @@ mod tests {
             into_branch: Some("already-exists"),
             dry: false,
             allow_rewrite_protected: false,
+            squash: None,
         })
         .await
         .unwrap_err();
@@ -884,6 +1015,7 @@ mod tests {
             into_branch: Some("purged"),
             dry: false,
             allow_rewrite_protected: false,
+            squash: None,
         })
         .await
         .unwrap();
@@ -930,6 +1062,7 @@ mod tests {
             // assertion is about the in-place race, not protected-branch
             // policy.
             allow_rewrite_protected: true,
+            squash: None,
         })
         .await
         .unwrap_err();
@@ -990,6 +1123,7 @@ mod tests {
             into_branch: Some("scrubbed"),
             dry: false,
             allow_rewrite_protected: false,
+            squash: None,
         })
         .await
         .unwrap();
@@ -1048,6 +1182,7 @@ mod tests {
             into_branch: Some("scrubbed"),
             dry: false,
             allow_rewrite_protected: false,
+            squash: None,
         })
         .await
         .unwrap();
@@ -1073,6 +1208,108 @@ mod tests {
         assert_eq!(shell_quote("simple/path.md"), "simple/path.md");
         assert_eq!(shell_quote("a b.md"), "'a b.md'");
         assert_eq!(shell_quote("isn't.md"), r"'isn'\''t.md'");
+    }
+
+    #[tokio::test]
+    async fn rewrite_squash_collapses_range_into_one_commit() {
+        let dir = init_repo();
+        write(dir.path(), "README.md", "seed\n");
+        let _seed = commit(dir.path(), "seed");
+        write(dir.path(), ".trinity/plans/foo.md", "# foo\n");
+        let intro = commit(dir.path(), "plan: foo");
+        write(dir.path(), ".trinity/plans/foo.md", "# foo v2\n");
+        write(dir.path(), "src/lib.rs", "// code v1\n");
+        let _mixed = commit(dir.path(), "plan revision + code");
+        write(dir.path(), "src/main.rs", "fn main() {}\n");
+        let code = commit(dir.path(), "more code");
+
+        let preview = mk_preview(
+            &intro,
+            &code,
+            vec![
+                (
+                    intro.clone(),
+                    "plan: foo".into(),
+                    RewriteDisposition::Drop,
+                    false,
+                    vec![],
+                ),
+                (
+                    _mixed.clone(),
+                    "plan revision + code".into(),
+                    RewriteDisposition::Rewrite,
+                    false,
+                    vec![".trinity/plans/foo.md".into()],
+                ),
+                (
+                    code.clone(),
+                    "more code".into(),
+                    RewriteDisposition::Rewrite,
+                    false,
+                    vec![".trinity/plans/foo.md".into()],
+                ),
+            ],
+        );
+        super::run(RewriteOpts {
+            repo: dir.path(),
+            intro_sha: preview.intro_sha.as_ref(),
+            head_sha: &preview.head_sha,
+            linear: preview.linear,
+            commits: &preview.commits,
+            into_branch: Some("squashed"),
+            dry: false,
+            allow_rewrite_protected: false,
+            squash: Some("Implement foo"),
+        })
+        .await
+        .unwrap();
+
+        // The squashed branch should be: seed → ONE squash commit
+        // containing src/lib.rs + src/main.rs + README.md but no
+        // .trinity/plans/foo.md.
+        let chain = rev_list(dir.path(), "squashed");
+        assert_eq!(chain.len(), 2, "seed + one squash commit; got {chain:?}");
+        let squash_tip = chain.last().unwrap();
+        assert_eq!(show_subject(dir.path(), squash_tip), "Implement foo");
+        assert!(tree_has(dir.path(), squash_tip, "src/lib.rs"));
+        assert!(tree_has(dir.path(), squash_tip, "src/main.rs"));
+        assert!(tree_has(dir.path(), squash_tip, "README.md"));
+        assert!(!tree_has(dir.path(), squash_tip, ".trinity/plans/foo.md"));
+    }
+
+    #[tokio::test]
+    async fn rewrite_squash_refuses_foreign_commit_in_range() {
+        let dir = init_repo();
+        write(dir.path(), "README.md", "seed\n");
+        let _seed = commit(dir.path(), "seed");
+        write(dir.path(), ".trinity/plans/foo.md", "# foo\n");
+        let intro = commit(dir.path(), "plan: foo");
+        let preview = mk_preview(
+            &intro,
+            &intro,
+            vec![(
+                intro.clone(),
+                "plan: foo".into(),
+                RewriteDisposition::Drop,
+                true, // foreign
+                vec![],
+            )],
+        );
+        let err = super::run(RewriteOpts {
+            repo: dir.path(),
+            intro_sha: preview.intro_sha.as_ref(),
+            head_sha: &preview.head_sha,
+            linear: preview.linear,
+            commits: &preview.commits,
+            into_branch: Some("squashed"),
+            dry: false,
+            allow_rewrite_protected: false,
+            squash: Some("collapse"),
+        })
+        .await
+        .unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("foreign"), "got: {msg}");
     }
 
     #[tokio::test]
@@ -1104,6 +1341,7 @@ mod tests {
             into_branch: None, // in-place
             dry: false,
             allow_rewrite_protected: false,
+            squash: None,
         })
         .await
         .unwrap_err();
@@ -1143,6 +1381,7 @@ mod tests {
             into_branch: Some("scrubbed"),
             dry: false,
             allow_rewrite_protected: false,
+            squash: None,
         })
         .await
         .unwrap();
@@ -1170,6 +1409,7 @@ mod tests {
             into_branch: Some("x"),
             dry: false,
             allow_rewrite_protected: false,
+            squash: None,
         })
         .await
         .unwrap_err();
