@@ -326,35 +326,35 @@ fn live_event_plan_feedback_changed_has_no_extra_fields() {
 }
 
 #[test]
-fn work_action_review_commit_round_trips_with_typed_kind() {
+fn work_payload_write_feedback_round_trips() {
     let payload = WorkPayload {
         plan_id: "trinity/foo.md".into(),
         repo: "/r".into(),
-        locations: vec![".trinity/feedback/foo/abc/codex.md".into()],
-        action: WorkAction::ReviewCommit {
+        action: ExpectedAction::WriteFeedback {
+            path: ".trinity/feedback/foo/abc/codex.md".into(),
             target_sha: "abc".into(),
-            commit_kind: CommitKind::PlanOnly,
-            prompt_hint: "Review the plan.".into(),
         },
     };
     let v = serde_json::to_value(&payload).unwrap();
-    assert_eq!(v["work"], "review_commit");
-    // commit_kind is the enum's wire string, not a hand-written one.
-    assert_eq!(v["commit_kind"], "plan_only");
+    // The action is flatten'd into WorkPayload — `kind` sits at the
+    // top level alongside plan_id / repo, not nested under `action`.
+    assert_eq!(v["plan_id"], "trinity/foo.md");
+    assert_eq!(v["kind"], "write_feedback");
+    assert_eq!(v["target_sha"], "abc");
+    assert_eq!(v["path"], ".trinity/feedback/foo/abc/codex.md");
     let back: WorkPayload = serde_json::from_value(v).unwrap();
     assert_eq!(payload, back);
 }
 
 #[test]
-fn work_action_session_finished_round_trips() {
+fn work_payload_session_finished_round_trips() {
     let payload = WorkPayload {
         plan_id: "trinity/foo.md".into(),
         repo: "/r".into(),
-        locations: vec![],
-        action: WorkAction::SessionFinished,
+        action: ExpectedAction::SessionFinished,
     };
     let v = serde_json::to_value(&payload).unwrap();
-    assert_eq!(v["work"], "session_finished");
+    assert_eq!(v["kind"], "session_finished");
     let back: WorkPayload = serde_json::from_value(v).unwrap();
     assert_eq!(payload, back);
 }

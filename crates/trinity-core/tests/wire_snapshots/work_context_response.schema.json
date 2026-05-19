@@ -1,15 +1,13 @@
 {
   "current_path": "string",
-  "expected_action": {
-    "kind": "string",
-    "path": "string",
-    "target_sha": "string"
-  },
+  "kind": "string",
   "lifecycle": "string",
+  "path": "string",
   "phase": "string",
   "plan_id": "string",
   "plan_worktree_status": "string",
   "repo": "string",
+  "target_sha": "string",
   "waiting_on": {
     "agents": [
       "string"

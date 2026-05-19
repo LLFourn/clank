@@ -348,14 +348,16 @@ pub struct ListPlansResponse {
 /// coordinates work; HTTP transports content.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkContextResponse {
-    pub plan_id: String,
-    pub repo: String,
+    /// The work prefix — same shape as `wait_for_work`'s happy
+    /// path. `plan_id`, `repo`, and the action's fields surface
+    /// at the top level via `#[serde(flatten)]`.
+    #[serde(flatten)]
+    pub work: WorkPayload,
     pub current_path: String,
     pub lifecycle: PlanLifecycle,
     pub phase: Posture,
     pub plan_worktree_status: PlanWorktreeStatus,
     pub waiting_on: WaitingOn,
-    pub expected_action: ExpectedAction,
 }
 
 /// The action the caller should take next, tagged-enum form.
@@ -377,17 +379,27 @@ pub enum ExpectedAction {
     WriteFeedback { path: String, target_sha: String },
     /// Master: address the request-changes feedback at `rc_paths`
     /// against `target_sha` and follow up with a fix commit.
+    /// `plan_path` is `Some` when the RC is plan-side (commit
+    /// kind `PlanOnly | Mixed`) — meaning the master needs to
+    /// revise the plan body as part of the fix-up commit.
+    /// `None` for code-side RCs (`CodeOnly`).
     AddressChanges {
         target_sha: String,
         rc_paths: Vec<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        plan_path: Option<String>,
     },
-    /// Master: the plan file is dirty in the worktree. Commit
-    /// the revision (at `WorkContextResponse.current_path`) to
-    /// release blocked reviews.
-    CommitPlanRevision,
+    /// Master: the plan file at `plan_path` is dirty in the
+    /// worktree. Commit the revision to release blocked reviews.
+    CommitPlanRevision { plan_path: String },
     /// Master: latest commit at `previous_commit` is approved.
+    /// `plan_path` is the plan file (provided so the agent has
+    /// the plan body without reconstructing it from `plan_id`).
     /// Write the next implementation commit.
-    StartImplementation { previous_commit: String },
+    StartImplementation {
+        previous_commit: String,
+        plan_path: String,
+    },
     /// Plan is finalized; no further action.
     SessionFinished,
 }
@@ -633,44 +645,18 @@ pub struct WaitTimeout {
     pub repo: Option<String>,
 }
 
-/// One work assignment from `wait_for_work`. Action-specific fields
-/// live on the flattened [`WorkAction`] variant.
+/// The work to do, with the surrounding identity. Used flat on
+/// `wait_for_work` (as `WaitForWorkResponse::Work(WorkPayload)`)
+/// and flatten-embedded into `WorkContextResponse`. The
+/// work-prefix of `work_context`'s response is the same shape
+/// as `wait_for_work`'s happy path — both surfaces share the
+/// same projection (`responses::build_work_payload`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkPayload {
     pub plan_id: String,
     pub repo: String,
-    pub locations: Vec<String>,
     #[serde(flatten)]
-    pub action: WorkAction,
-}
-
-/// Tagged by the wire `work` discriminator. Variants that carry a
-/// target SHA also carry `commit_kind` (`CommitKind` enum) and
-/// `prompt_hint`. `SessionFinished` is the only no-target variant.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "work", rename_all = "snake_case")]
-pub enum WorkAction {
-    ReviewCommit {
-        target_sha: String,
-        commit_kind: CommitKind,
-        prompt_hint: String,
-    },
-    AddressCommitChanges {
-        target_sha: String,
-        commit_kind: CommitKind,
-        prompt_hint: String,
-    },
-    CommitPlanRevision {
-        target_sha: String,
-        commit_kind: CommitKind,
-        prompt_hint: String,
-    },
-    StartImplementation {
-        target_sha: String,
-        commit_kind: CommitKind,
-        prompt_hint: String,
-    },
-    SessionFinished,
+    pub action: ExpectedAction,
 }
 
 // ============================================================

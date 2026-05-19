@@ -1,17 +1,21 @@
 //! `wait_for_work` long-poll: block until the named plan needs the caller's
-//! role, then return the work + locations to act on.
+//! role, then return a `WorkPayload` — the same shape `work_context`
+//! embeds as its `work` prefix. Both surfaces project state through
+//! `crate::responses::build_work_payload`, so the work-half is identical
+//! by construction.
 //!
-//! Single-plan focus: the caller names `plan_path` (and implicitly or
-//! explicitly the `repo`) so the response is always for one plan in one
-//! repo — no fan-out, no cross-repo. The response carries `work` (an
-//! imperative action verb) plus `locations` (the repo-relative paths the
-//! caller should read or write to do that work).
+//! Single-plan focus: the caller names `plan_id` (or lets the daemon
+//! infer it from cwd-repo when there's exactly one active visible plan)
+//! so the response is always for one plan in one repo — no fan-out, no
+//! cross-repo. The response is one of the `ExpectedAction` variants
+//! (tagged by `kind` on the wire), with action-specific paths /
+//! target_sha on the variant payload itself — no separate `locations`
+//! array.
 //!
 //! Lock boundary: resolve the plan and snapshot its cheap gate state under
 //! the runtime mutex, release the lock, then per-poll read
 //! `plan_worktree_status` from disk and derive `waiting_on`. Status-driven
-//! master waits (commit_plan_revision, commit_done_move, etc.) stay
-//! correct without holding the mutex across disk I/O.
+//! master waits stay correct without holding the mutex across disk I/O.
 
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -25,8 +29,7 @@ use crate::repo_state::{Trinity, WaitingReason, WaitingRole};
 use crate::responses::compute_plan_worktree_status_parts;
 use crate::review_state::CommitGate;
 use crate::runtime::Runtime;
-use trinity_core::api::{WaitTimeout, WorkAction, WorkPayload};
-use trinity_core::vocab::CommitKind;
+use trinity_core::api::{WaitTimeout, WorkPayload};
 
 const DEFAULT_TIMEOUT_SECS: u64 = 1800;
 
@@ -105,7 +108,7 @@ pub async fn wait_for_work(runtime: &Runtime, args: WaitArgs) -> Result<WaitResp
     let mut rx = runtime.subscribe_events();
 
     if let Some(work) = compute_match(runtime, &plan_id, role, &author).await? {
-        return Ok(work.into_response(plan_id.to_string()));
+        return Ok(WaitResponse::Work(work));
     }
 
     let deadline = started_at + timeout;
@@ -121,13 +124,13 @@ pub async fn wait_for_work(runtime: &Runtime, args: WaitArgs) -> Result<WaitResp
         match tokio::time::timeout(remaining, rx.recv()).await {
             Ok(Ok(_event)) => {
                 if let Some(work) = compute_match(runtime, &plan_id, role, &author).await? {
-                    return Ok(work.into_response(plan_id.to_string()));
+                    return Ok(WaitResponse::Work(work));
                 }
             }
             Ok(Err(RecvError::Lagged(_))) => {
                 rx = runtime.subscribe_events();
                 if let Some(work) = compute_match(runtime, &plan_id, role, &author).await? {
-                    return Ok(work.into_response(plan_id.to_string()));
+                    return Ok(WaitResponse::Work(work));
                 }
             }
             Ok(Err(RecvError::Closed)) | Err(_) => {
@@ -148,34 +151,14 @@ fn derive_timeout(timeout_secs: Option<u64>) -> Duration {
     Duration::from_secs(timeout_secs.unwrap_or(DEFAULT_TIMEOUT_SECS).max(1))
 }
 
-#[derive(Debug, Clone)]
-struct WorkItem {
-    /// Canonical absolute path of the repo (echo'd back to the caller as
-    /// a convenience field on the response).
-    repo: String,
-    locations: Vec<String>,
-    action: WorkAction,
-}
-
-impl WorkItem {
-    fn into_response(self, plan_id: String) -> WaitResponse {
-        WaitResponse::Work(WorkPayload {
-            plan_id,
-            repo: self.repo,
-            locations: self.locations,
-            action: self.action,
-        })
-    }
-}
-
 /// Snapshot the candidate under lock, release, then disk-read
-/// `plan_worktree_status` and derive the work item if any.
+/// `plan_worktree_status` and derive the work payload if any.
 async fn compute_match(
     runtime: &Runtime,
     plan_id: &crate::lifecycle::PlanId,
     role: WaitingRole,
     author: &AgentLabel,
-) -> Result<Option<WorkItem>, WaitError> {
+) -> Result<Option<WorkPayload>, WaitError> {
     let candidate = {
         let trinity_arc = runtime.state();
         let trinity = trinity_arc.lock().await;
@@ -211,115 +194,28 @@ async fn compute_match(
     {
         return Ok(None);
     }
-    let locations = derive_locations(&candidate, w.reason, author);
-    let repo = candidate.repo_root.to_string_lossy().into_owned();
-    let action = build_action(w.reason, &candidate);
 
-    Ok(Some(WorkItem {
-        repo,
-        locations,
-        action,
-    }))
-}
-
-/// Build the typed `WorkAction` for one `(reason, candidate)` pair.
-/// Variants that carry a target SHA pull it (and its `commit_kind` +
-/// `prompt_hint`) from the candidate's pre-computed
-/// `review_target` / `review_target_kind`. `SessionFinished` is the
-/// only no-target variant.
-fn build_action(reason: WaitingReason, candidate: &Candidate) -> WorkAction {
-    use WaitingReason::*;
-    let target_sha = || {
-        candidate
-            .review_target
-            .as_ref()
-            .map(|s| s.as_str().to_string())
-            .unwrap_or_default()
-    };
-    // When no review-target commit exists yet (e.g. `CommitPlanRevision`
-    // on a plan with no committed revision yet), default to
-    // `Unattributed` — the wire-typed "no relevance" variant.
-    let commit_kind = || {
-        candidate
-            .review_target_kind
-            .unwrap_or(CommitKind::Unattributed)
-    };
-    let prompt =
-        |kind: CommitKind| prompt_hint_for(reason, kind, &candidate.plan_path).unwrap_or_default();
-    match reason {
-        SessionFinished => WorkAction::SessionFinished,
-        CommitPlanRevision => {
-            let kind = commit_kind();
-            WorkAction::CommitPlanRevision {
-                target_sha: target_sha(),
-                commit_kind: kind,
-                prompt_hint: prompt(kind),
-            }
-        }
-        AddressCommitChanges => {
-            let kind = commit_kind();
-            WorkAction::AddressCommitChanges {
-                target_sha: target_sha(),
-                commit_kind: kind,
-                prompt_hint: prompt(kind),
-            }
-        }
-        ReadyToStartImplementation => {
-            let kind = commit_kind();
-            WorkAction::StartImplementation {
-                target_sha: target_sha(),
-                commit_kind: kind,
-                prompt_hint: prompt(kind),
-            }
-        }
-        CommitNeedsReview => {
-            let kind = commit_kind();
-            WorkAction::ReviewCommit {
-                target_sha: target_sha(),
-                commit_kind: kind,
-                prompt_hint: prompt(kind),
-            }
-        }
-    }
-}
-
-/// Default `prompt_hint` text for a given `(reason, commit_kind)`.
-/// Short imperative; the agent can override. Returns `None` for
-/// terminal/no-work states.
-fn prompt_hint_for(
-    reason: WaitingReason,
-    commit_kind: CommitKind,
-    plan_path: &str,
-) -> Option<String> {
-    use WaitingReason::*;
-    let plan_path_str = plan_path;
-    Some(match (reason, commit_kind) {
-        (CommitNeedsReview, CommitKind::PlanOnly) => format!(
-            "This commit only changes the plan. Read the plan file at {plan_path_str} and \
-             review the proposed approach."
-        ),
-        (CommitNeedsReview, CommitKind::CodeOnly) => {
-            "This commit makes implementation changes. Review the diff and check it against the \
-             approved plan."
-                .to_string()
-        }
-        (CommitNeedsReview, CommitKind::Mixed) => format!(
-            "This commit changes both the plan and code. Read the updated plan at {plan_path_str} \
-             and review the diff together."
-        ),
-        (CommitNeedsReview, _) => "Review the latest commit on this plan.".to_string(),
-        (AddressCommitChanges, _) => "Review requested changes on the latest commit. \
-             Read each REQUEST_CHANGES file in the locations and address them with a follow-up commit."
-            .to_string(),
-        (CommitPlanRevision, _) => format!(
-            "Plan has uncommitted changes at {plan_path_str}. Commit the revision to release \
-             blocked reviews."
-        ),
-        (ReadyToStartImplementation, _) => "Latest commit is approved. Continue with the next \
-             commit or finalize the plan."
-            .to_string(),
-        (SessionFinished, _) => return None,
-    })
+    // Shared builder: `wait_for_work` and `work_context` both call
+    // `responses::build_work_payload` so the work-prefix shape is
+    // identical by construction. Candidate fields feed
+    // `WorkPayloadInputs` directly.
+    let requesters: Vec<AgentLabel> = candidate
+        .gate
+        .as_ref()
+        .map(|g| g.requesters.clone())
+        .unwrap_or_default();
+    let payload = crate::responses::build_work_payload(crate::responses::WorkPayloadInputs {
+        plan_id: &plan_id.to_string(),
+        repo_root: &candidate.repo_root,
+        plan_key: &candidate.plan_key,
+        plan_path: &candidate.plan_path,
+        waiting: &w,
+        review_target_sha: candidate.review_target.as_ref(),
+        review_target_kind: candidate.review_target_kind,
+        requesters: &requesters,
+        author,
+    });
+    Ok(Some(payload))
 }
 
 /// True if `author` already has a current-target verdict for the
@@ -353,69 +249,6 @@ fn caller_already_voted(cand: &Candidate, reason: WaitingReason, author: &AgentL
     };
     let Some(gate) = gate else { return false };
     gate.approvers.contains(author) || gate.requesters.contains(author)
-}
-
-/// Produce the repo-relative paths to attach to the response. The
-/// review target (and its kind) come from `Candidate`'s pre-computed
-/// fields so this function reads from the same projection that
-/// drives `waiting_on`, `target_sha`, and `commit_kind`. No second
-/// selector.
-fn derive_locations(cand: &Candidate, reason: WaitingReason, author: &AgentLabel) -> Vec<String> {
-    let plan_file = cand.plan_path.clone();
-    let sid = cand.plan_key.as_str();
-
-    match reason {
-        WaitingReason::CommitNeedsReview => {
-            let Some(target) = &cand.review_target else {
-                return Vec::new();
-            };
-            vec![feedback_path(sid, target, author.as_str())]
-        }
-        WaitingReason::AddressCommitChanges => {
-            let mut out = rc_feedback_paths(cand.review_target.as_ref(), cand.gate.as_ref(), sid);
-            // Plan-side RC (kind is PlanOnly or Mixed) also surfaces
-            // the plan file because addressing the RC means revising
-            // the plan body. Pure code-side RC (CodeOnly) is fixed by
-            // amending code; no extra location needed.
-            let plan_side = matches!(
-                cand.review_target_kind,
-                Some(
-                    crate::repo_state::CommitKind::PlanOnly | crate::repo_state::CommitKind::Mixed
-                )
-            );
-            if plan_side {
-                out.push(plan_file);
-            }
-            out
-        }
-        WaitingReason::CommitPlanRevision | WaitingReason::ReadyToStartImplementation => {
-            vec![plan_file]
-        }
-        WaitingReason::SessionFinished => Vec::new(),
-    }
-}
-
-fn feedback_path(sid: &str, target: &CommitSha, author: &str) -> String {
-    format!(
-        ".trinity/feedback/{}/{}/{}.md",
-        sid,
-        target.as_str(),
-        author
-    )
-}
-
-fn rc_feedback_paths(
-    target: Option<&CommitSha>,
-    gate: Option<&CommitGate>,
-    sid: &str,
-) -> Vec<String> {
-    let (Some(target), Some(gate)) = (target, gate) else {
-        return Vec::new();
-    };
-    gate.requesters
-        .iter()
-        .map(|author| feedback_path(sid, target, author.as_str()))
-        .collect()
 }
 
 #[derive(Debug, Clone)]
@@ -531,6 +364,58 @@ mod tests {
         AgentLabel::parse("codex").unwrap()
     }
 
+    /// Test helper: build a `WorkPayload` from a `Candidate` + reason
+    /// via the shared production builder, then extract the
+    /// action-specific paths as a flat `Vec<String>` matching the
+    /// shape the old `derive_locations` returned. Lets the
+    /// path-derivation tests keep their assertion form.
+    fn derive_locations(
+        cand: &Candidate,
+        reason: WaitingReason,
+        author: &AgentLabel,
+    ) -> Vec<String> {
+        use trinity_core::api::ExpectedAction::*;
+        let w = trinity_core::api::WaitingOn {
+            role: WaitingRole::Master,
+            reason,
+            agents: Vec::new(),
+            description: String::new(),
+        };
+        let requesters: Vec<AgentLabel> = cand
+            .gate
+            .as_ref()
+            .map(|g| g.requesters.clone())
+            .unwrap_or_default();
+        let payload = crate::responses::build_work_payload(crate::responses::WorkPayloadInputs {
+            plan_id: "trinity/sid.md",
+            repo_root: &cand.repo_root,
+            plan_key: &cand.plan_key,
+            plan_path: &cand.plan_path,
+            waiting: &w,
+            review_target_sha: cand.review_target.as_ref(),
+            review_target_kind: cand.review_target_kind,
+            requesters: &requesters,
+            author,
+        });
+        match payload.action {
+            WriteFeedback { path, .. } => vec![path],
+            AddressChanges {
+                rc_paths,
+                plan_path,
+                ..
+            } => {
+                let mut out = rc_paths;
+                if let Some(p) = plan_path {
+                    out.push(p);
+                }
+                out
+            }
+            CommitPlanRevision { plan_path } => vec![plan_path],
+            StartImplementation { plan_path, .. } => vec![plan_path],
+            SessionFinished => Vec::new(),
+        }
+    }
+
     #[test]
     fn review_plan_location_is_canonical_write_path_for_caller() {
         let c = cand(
@@ -549,13 +434,6 @@ mod tests {
         );
         let v = derive_locations(&c, WaitingReason::CommitNeedsReview, &me());
         assert_eq!(v, vec![".trinity/feedback/sid/def456/codex.md"]);
-    }
-
-    #[test]
-    fn review_returns_empty_when_no_target() {
-        let c = cand(None, None);
-        let v = derive_locations(&c, WaitingReason::CommitNeedsReview, &me());
-        assert!(v.is_empty());
     }
 
     #[test]
@@ -626,15 +504,12 @@ mod tests {
     }
 
     #[test]
-    fn ready_to_finish_location_is_plan_file() {
-        let c = cand(None, None);
-        let v = derive_locations(&c, WaitingReason::ReadyToStartImplementation, &me());
-        assert_eq!(v, vec![".trinity/plans/sid.md"]);
-    }
-
-    #[test]
     fn ready_to_implement_location_is_plan_file() {
-        let c = cand(None, None);
+        // ReadyToStartImplementation implies an approved previous
+        // commit (the production projection never produces this
+        // reason without a target); the new builder requires it
+        // structurally. Pass an arbitrary SHA for the test.
+        let c = cand(Some("abc1"), Some(crate::repo_state::CommitKind::CodeOnly));
         let v = derive_locations(&c, WaitingReason::ReadyToStartImplementation, &me());
         assert_eq!(v, vec![".trinity/plans/sid.md"]);
     }
@@ -758,7 +633,11 @@ mod integration_tests {
 
     fn expect_work(r: WaitResponse) -> (String, Vec<String>) {
         match r {
-            WaitResponse::Work(p) => (action_tag(&p.action).to_string(), p.locations),
+            WaitResponse::Work(p) => {
+                let kind = action_kind(&p.action).to_string();
+                let locations = action_locations(&p.action);
+                (kind, locations)
+            }
             WaitResponse::Timeout { .. } => panic!("expected work, got timeout"),
         }
     }
@@ -769,20 +648,46 @@ mod integration_tests {
             WaitResponse::Work(p) => {
                 panic!(
                     "expected timeout, got work={} locations={:?}",
-                    action_tag(&p.action),
-                    p.locations
+                    action_kind(&p.action),
+                    action_locations(&p.action)
                 )
             }
         }
     }
 
-    fn action_tag(a: &WorkAction) -> &'static str {
+    fn action_kind(a: &trinity_core::api::ExpectedAction) -> &'static str {
+        use trinity_core::api::ExpectedAction::*;
         match a {
-            WorkAction::ReviewCommit { .. } => "review_commit",
-            WorkAction::AddressCommitChanges { .. } => "address_commit_changes",
-            WorkAction::CommitPlanRevision { .. } => "commit_plan_revision",
-            WorkAction::StartImplementation { .. } => "start_implementation",
-            WorkAction::SessionFinished => "session_finished",
+            WriteFeedback { .. } => "write_feedback",
+            AddressChanges { .. } => "address_changes",
+            CommitPlanRevision { .. } => "commit_plan_revision",
+            StartImplementation { .. } => "start_implementation",
+            SessionFinished => "session_finished",
+        }
+    }
+
+    /// Translate variant-specific path payloads into the flat
+    /// `Vec<String>` the existing tests assert against. Lets the old
+    /// `expect_work() == ("write_feedback", [path])` shape keep working
+    /// across the wire-payload reshape.
+    fn action_locations(a: &trinity_core::api::ExpectedAction) -> Vec<String> {
+        use trinity_core::api::ExpectedAction::*;
+        match a {
+            WriteFeedback { path, .. } => vec![path.clone()],
+            AddressChanges {
+                rc_paths,
+                plan_path,
+                ..
+            } => {
+                let mut out = rc_paths.clone();
+                if let Some(p) = plan_path {
+                    out.push(p.clone());
+                }
+                out
+            }
+            CommitPlanRevision { plan_path } => vec![plan_path.clone()],
+            StartImplementation { plan_path, .. } => vec![plan_path.clone()],
+            SessionFinished => Vec::new(),
         }
     }
 
@@ -801,7 +706,7 @@ mod integration_tests {
         .await
         .unwrap();
         let (work, locations) = expect_work(resp);
-        assert_eq!(work, "review_commit");
+        assert_eq!(work, "write_feedback");
         assert_eq!(locations.len(), 1);
         assert!(
             locations[0].starts_with(".trinity/feedback/foo/"),
@@ -883,7 +788,7 @@ mod integration_tests {
             .await
             .unwrap();
         let (work, locations) = expect_work(resp);
-        assert_eq!(work, "address_commit_changes");
+        assert_eq!(work, "address_changes");
         assert_eq!(
             locations,
             vec![bob_path, dana_path, ".trinity/plans/foo.md".to_string()]
@@ -959,7 +864,7 @@ mod integration_tests {
         a.timeout_secs = Some(1);
         let resp = wait_for_work(&rt, a).await.unwrap();
         let (work, locations) = expect_work(resp);
-        assert_eq!(work, "review_commit");
+        assert_eq!(work, "write_feedback");
         assert_eq!(locations.len(), 1);
         assert!(
             locations[0].ends_with("/bob.md"),
@@ -1026,6 +931,44 @@ mod integration_tests {
         a.timeout_secs = Some(1);
         let resp = wait_for_work(&rt, a).await.unwrap();
         expect_timeout(resp);
+    }
+
+    /// Cross-surface invariant: for the same `(snapshot, author)`,
+    /// `wait_for_work` and `work_context` MUST produce the same
+    /// `WorkPayload`. Both surfaces call
+    /// `responses::build_work_payload`; this test guards against any
+    /// future regression that adds a second projection path.
+    #[tokio::test]
+    async fn wait_for_work_and_work_context_agree_on_work_payload() {
+        let dir = init_repo();
+        write_file(dir.path(), ".trinity/plans/foo.md", "# foo v1\n");
+        commit(dir.path(), "add foo");
+        let rt = Runtime::new();
+        rt.add_repo(dir.path().to_path_buf()).await.unwrap();
+
+        // wait_for_work as reviewer — the initial-review state.
+        let mut a = args(dir.path(), WaitingRole::Reviewers, "foo", "codex");
+        a.timeout_secs = Some(1);
+        let wfw = wait_for_work(&rt, a).await.unwrap();
+        let wfw_payload = match wfw {
+            WaitResponse::Work(p) => p,
+            WaitResponse::Timeout(_) => panic!("expected work, got timeout"),
+        };
+
+        // work_context for the same plan / author. It carries the
+        // same `WorkPayload` embedded as `work`.
+        let snapshot = rt
+            .snapshot_session(dir.path(), &PlanKey::parse("foo").unwrap())
+            .await
+            .unwrap()
+            .expect("foo snapshot");
+        let author = AgentLabel::parse("codex").unwrap();
+        let wc = crate::responses::work_context_response(&snapshot, &author)
+            .unwrap()
+            .expect("foo is visible");
+
+        // Identical work-prefix.
+        assert_eq!(wfw_payload, wc.work);
     }
 
     #[tokio::test]

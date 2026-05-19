@@ -18,8 +18,10 @@ pub struct ToolDescriptor {
 /// then commit it before Trinity treats the plan as live.
 ///
 /// `work_context` returns the narrow coordination view for one plan:
-/// `waiting_on`, `phase`, `expected_action`, `review_target`,
-/// `write_feedback`, plus identity fields. Read-only.
+/// the same `WorkPayload` shape `wait_for_work` returns (flattened
+/// `{plan_id, repo, kind, ...action fields}`) plus state context
+/// (`current_path`, `lifecycle`, `phase`, `plan_worktree_status`,
+/// `waiting_on`). Read-only and synchronous.
 ///
 /// `list_plans` returns the in-memory plan summary for the caller's repo,
 /// including any plan-key conflicts the operator must resolve.
@@ -129,10 +131,12 @@ pub fn catalog() -> Vec<ToolDescriptor> {
         },
         ToolDescriptor {
             name: "wait_for_work".to_string(),
-            description: "Block until a plan needs the caller's role, then return the \
-                          work to do plus the file paths to act on. This is the idiomatic way \
-                          to drive an agent loop — replaces polling `list_plans` / \
-                          `work_context` on a timer.\n\n\
+            description: "Block until a plan needs the caller's role, then return the work \
+                          to do as a flat payload. This is the idiomatic way to drive an \
+                          agent loop — replaces polling `list_plans` / `work_context` on a \
+                          timer. The happy-path response carries `{ plan_id, repo, kind, \
+                          ...action-specific fields }` with the action variant flattened to \
+                          the top level — the same shape `work_context` embeds.\n\n\
                           Inputs:\n\
                           - `role` (required, `master` | `reviewers`).\n\
                           - `plan_id` (optional): canonical `<repo_basename>/<stem>.md`. \
@@ -144,25 +148,28 @@ pub fn catalog() -> Vec<ToolDescriptor> {
                             plan-id inference when `plan_id` is omitted. Ignored otherwise.\n\
                           - `author_label` (daemon-required, schema-optional for shim \
                             autofill): your label. Used to construct the canonical reviewer \
-                            write path for `review_commit`. The MCP shim caches this.\n\
+                            write path for `write_feedback`. The MCP shim caches this.\n\
                           - `timeout_secs` (optional, positive seconds, default 1800 / 30 minutes).\n\n\
-                          Response — one of:\n\
-                          ```\n\
-                          { \"plan_id\": \"...\", \"repo\": \"<abs path>\", \
-                          \"work\": \"<action>\", \"locations\": [\"<repo-relative path>\", ...], \
-                          \"target_sha\": \"...\", \"commit_kind\": \"plan_only|code_only|mixed\", \
-                          \"prompt_hint\": \"...\" }\n\
-                          ```\n\
+                          Action variants (tagged by `kind` on the wire):\n\
+                          - `write_feedback { path, target_sha }` — reviewer: write your \
+                            verdict markdown (`APPROVE\\n...` / `REQUEST_CHANGES\\n...`) to \
+                            `path` against the commit at `target_sha`.\n\
+                          - `address_changes { target_sha, rc_paths, plan_path? }` — \
+                            master: read each RC file at `rc_paths` and follow up with a \
+                            fix commit. `plan_path` is present when the RC is plan-side \
+                            (PlanOnly/Mixed) — revise the plan body too.\n\
+                          - `commit_plan_revision { plan_path }` — master: the plan file \
+                            is dirty in the worktree. Commit the revision.\n\
+                          - `start_implementation { previous_commit, plan_path }` — \
+                            master: the previous commit is approved; write the next \
+                            implementation commit.\n\
+                          - `session_finished` — plan is finalized; no further action.\n\n\
+                          Timeout responses:\n\
                           ```\n\
                           { \"timed_out\": true }\n\
                           { \"timed_out\": true, \"no_active_plans\": true, \"repo\": \"...\" }\n\
                           { \"error\": \"ambiguous_plan\", \"candidates\": [{\"plan_id\":...},...] }\n\
-                          ```\n\n\
-                          The `work` vocabulary (post phase 2.5):\n\
-                          - `review_commit` → `[<canonical write path>]`\n\
-                          - `address_commit_changes` → `[<each RC>, <plan file?>]`\n\
-                          - `commit_plan_revision` → `[<plan file>]`\n\
-                          - `start_implementation` → `[<plan file>]`"
+                          ```"
                 .to_string(),
             input_schema: json!({
                 "type": "object",
@@ -184,7 +191,7 @@ pub fn catalog() -> Vec<ToolDescriptor> {
                     },
                     "author_label": {
                         "type": "string",
-                        "description": "Your agent label. Required to construct the canonical reviewer write path for review_commit work. The MCP shim caches this across calls."
+                        "description": "Your agent label. Required to construct the canonical reviewer write path for write_feedback work. The MCP shim caches this across calls."
                     },
                     "timeout_secs": {
                         "type": "integer",
@@ -197,11 +204,12 @@ pub fn catalog() -> Vec<ToolDescriptor> {
         },
         ToolDescriptor {
             name: "work_context".to_string(),
-            description: "Returns the narrow coordination view for one plan: `{ plan_id, repo, \
-                          current_path, lifecycle, phase, plan_worktree_status, waiting_on, \
-                          expected_action, review_target, write_feedback, \
-                          latest_relevant_commit }`. Enough to act on the latest \
-                          `wait_for_work` result. Read-only.\n\n\
+            description: "Returns the narrow coordination view for one plan: the work \
+                          payload (same shape as `wait_for_work`'s happy path — `plan_id`, \
+                          `repo`, `kind`, plus action-specific fields flattened to the top \
+                          level) plus state context (`current_path`, `lifecycle`, `phase`, \
+                          `plan_worktree_status`, `waiting_on`). Read-only. Synchronous \
+                          (no blocking — use `wait_for_work` if you want to block).\n\n\
                           This is intentionally smaller than the HTTP `/api/plan/<id>` shape — \
                           it omits `commits[]`, full timelines, archived cycles, plan body \
                           markdown, and PR hints. Those are UI-content surfaces; MCP only \

@@ -211,85 +211,132 @@ pub fn work_context_response_from_snapshot(
     let plan_phase = current_posture(plan, state);
     let gate = crate::projection::latest_reviewable_commit_gate_for(plan);
     let w = waiting_on(plan.is_frozen(), worktree_status, gate);
+    let plan_id = plan_id_string(&state.root, &plan.id).expect("active plan must have a plan_id");
     let review_target_sha = crate::projection::latest_reviewable_commit_for(plan);
-    let expected_action = build_expected_action(plan, &w, review_target_sha.as_ref(), author_label);
+    let review_target_event = review_target_sha
+        .as_ref()
+        .and_then(|sha| plan.event_for(sha));
+    let review_target_kind = review_target_event.map(|e| e.kind());
+    let requesters: Vec<AgentLabel> = review_target_event
+        .and_then(|e| e.gate())
+        .map(|g| g.requesters.clone())
+        .unwrap_or_default();
+    let work = build_work_payload(WorkPayloadInputs {
+        plan_id: &plan_id,
+        repo_root: &state.root,
+        plan_key: &plan.id,
+        plan_path: &plan.plan_path,
+        waiting: &w,
+        review_target_sha: review_target_sha.as_ref(),
+        review_target_kind,
+        requesters: &requesters,
+        author: author_label,
+    });
 
     WorkContextResponse {
-        plan_id: plan_id_string(&state.root, &plan.id).expect("active plan must have a plan_id"),
-        repo: state.root.to_string_lossy().to_string(),
+        work,
         current_path: plan.plan_path.clone(),
         lifecycle: plan.lifecycle(),
         phase: plan_phase,
         plan_worktree_status: worktree_status,
-        expected_action,
         waiting_on: w,
     }
 }
 
-/// Project the per-plan state into the tagged `ExpectedAction`.
-/// Variant payloads come from the snapshot's gate + projected
-/// review-target, so each variant carries exactly the data the
-/// caller needs to act on it without re-querying.
-fn build_expected_action(
-    plan: &Plan,
-    w: &trinity_core::api::WaitingOn,
-    review_target_sha: Option<&crate::lifecycle::CommitSha>,
-    author_label: &AgentLabel,
-) -> trinity_core::api::ExpectedAction {
+/// Inputs to [`build_work_payload`]. Carries everything the
+/// projection needs without forcing the caller to hold a `Plan`
+/// reference across lock boundaries.
+///
+/// `wait_for_work` constructs this from its `Candidate`
+/// snapshot; `work_context` constructs it from the per-plan
+/// `Plan` it has in hand. Both routes funnel into the same
+/// builder so the work-prefix on both surfaces stays identical
+/// by construction.
+pub struct WorkPayloadInputs<'a> {
+    pub plan_id: &'a str,
+    pub repo_root: &'a Path,
+    pub plan_key: &'a crate::lifecycle::PlanKey,
+    pub plan_path: &'a str,
+    pub waiting: &'a trinity_core::api::WaitingOn,
+    pub review_target_sha: Option<&'a crate::lifecycle::CommitSha>,
+    pub review_target_kind: Option<CommitKind>,
+    /// Authors of REQUEST_CHANGES feedback at the review target —
+    /// used to build `rc_paths` for `AddressChanges`. Empty for
+    /// non-AddressChanges reasons.
+    pub requesters: &'a [AgentLabel],
+    pub author: &'a AgentLabel,
+}
+
+/// Project the per-plan state into a `WorkPayload`. **Sole**
+/// constructor — `wait_for_work` and `work_context` both call
+/// this so the work-prefix on both surfaces stays identical by
+/// construction. If you find yourself building a `WorkPayload`
+/// elsewhere, route through this instead.
+pub fn build_work_payload(inputs: WorkPayloadInputs<'_>) -> trinity_core::api::WorkPayload {
     use trinity_core::api::ExpectedAction as A;
     use trinity_core::vocab::WaitingReason as R;
-    match w.reason {
+    let plan_side = matches!(
+        inputs.review_target_kind,
+        Some(CommitKind::PlanOnly | CommitKind::Mixed)
+    );
+    let feedback_path_for = |sha: &str, author: &str| -> String {
+        format!(
+            ".trinity/feedback/{session}/{sha}/{author}.md",
+            session = inputs.plan_key.as_str(),
+            sha = sha,
+            author = author,
+        )
+    };
+    let action = match inputs.waiting.reason {
         R::CommitNeedsReview => {
-            let sha = review_target_sha
+            let sha = inputs
+                .review_target_sha
                 .expect("CommitNeedsReview implies a review target")
                 .as_str()
                 .to_string();
-            let path = format!(
-                ".trinity/feedback/{session}/{sha}/{author}.md",
-                session = plan.id.as_str(),
-                sha = sha,
-                author = author_label.as_str(),
-            );
             A::WriteFeedback {
-                path,
+                path: feedback_path_for(&sha, inputs.author.as_str()),
                 target_sha: sha,
             }
         }
         R::AddressCommitChanges => {
-            let sha = review_target_sha
+            let sha = inputs
+                .review_target_sha
                 .expect("AddressCommitChanges implies a review target")
                 .as_str()
                 .to_string();
-            let rc_paths = plan
-                .event_for(review_target_sha.expect("checked above"))
-                .and_then(|e| e.gate())
-                .map(|gate| {
-                    gate.requesters
-                        .iter()
-                        .map(|author| {
-                            format!(
-                                ".trinity/feedback/{session}/{sha}/{author}.md",
-                                session = plan.id.as_str(),
-                                sha = sha,
-                                author = author.as_str(),
-                            )
-                        })
-                        .collect::<Vec<_>>()
-                })
-                .unwrap_or_default();
+            let rc_paths = inputs
+                .requesters
+                .iter()
+                .map(|author| feedback_path_for(&sha, author.as_str()))
+                .collect();
             A::AddressChanges {
                 target_sha: sha,
                 rc_paths,
+                plan_path: if plan_side {
+                    Some(inputs.plan_path.to_string())
+                } else {
+                    None
+                },
             }
         }
-        R::CommitPlanRevision => A::CommitPlanRevision,
+        R::CommitPlanRevision => A::CommitPlanRevision {
+            plan_path: inputs.plan_path.to_string(),
+        },
         R::ReadyToStartImplementation => A::StartImplementation {
-            previous_commit: review_target_sha
+            previous_commit: inputs
+                .review_target_sha
                 .expect("ReadyToStartImplementation implies a previous commit")
                 .as_str()
                 .to_string(),
+            plan_path: inputs.plan_path.to_string(),
         },
         R::SessionFinished => A::SessionFinished,
+    };
+    trinity_core::api::WorkPayload {
+        plan_id: inputs.plan_id.to_string(),
+        repo: inputs.repo_root.to_string_lossy().into_owned(),
+        action,
     }
 }
 

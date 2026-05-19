@@ -219,17 +219,19 @@ fn schema_list_plans_response() {
 #[test]
 fn schema_work_context_response() {
     let v = serde_json::to_value(WorkContextResponse {
-        plan_id: "trinity/foo.md".into(),
-        repo: "/r".into(),
+        work: WorkPayload {
+            plan_id: "trinity/foo.md".into(),
+            repo: "/r".into(),
+            action: ExpectedAction::WriteFeedback {
+                path: ".trinity/feedback/foo/abc/alice.md".into(),
+                target_sha: "abc".into(),
+            },
+        },
         current_path: ".trinity/plans/foo.md".into(),
         lifecycle: PlanLifecycle::Active,
         phase: Posture::Planning,
         plan_worktree_status: PlanWorktreeStatus::Clean,
         waiting_on: waiting_on_fixture(),
-        expected_action: ExpectedAction::WriteFeedback {
-            path: ".trinity/feedback/foo/abc/alice.md".into(),
-            target_sha: "abc".into(),
-        },
     })
     .unwrap();
     assert_schema("work_context_response", &v);
@@ -408,11 +410,9 @@ fn schema_wait_for_work_work() {
     let v = serde_json::to_value(WaitForWorkResponse::Work(WorkPayload {
         plan_id: "trinity/foo.md".into(),
         repo: "/r".into(),
-        locations: vec![".trinity/feedback/foo/abc/alice.md".into()],
-        action: WorkAction::ReviewCommit {
+        action: ExpectedAction::WriteFeedback {
+            path: ".trinity/feedback/foo/abc/alice.md".into(),
             target_sha: "abc".into(),
-            commit_kind: CommitKind::PlanOnly,
-            prompt_hint: "review please".into(),
         },
     }))
     .unwrap();
