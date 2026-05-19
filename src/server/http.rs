@@ -593,10 +593,15 @@ async fn api_rewrite_preview(
             crate::git_io::tree_plan_paths(&repo, &meta.sha, plan_key.as_str(), q.include_finalize)
                 .await
                 .map_err(|e| AppError::internal(format!("git ls-tree: {e}")))?;
-        // Contribution check: did THIS commit's diff add anything
-        // outside this plan's strip predicate? Non-Trinity code
-        // counts. Other-plan `.trinity/` paths and this plan's
+        // Contribution check: did THIS commit's diff mutate any
+        // path outside this plan's strip predicate? Non-Trinity
+        // code counts. Other-plan `.trinity/` paths and this plan's
         // finalize files (when include_finalize=false) also count.
+        // Use `trinity_paths_touched` (bidirectional: includes
+        // delete sources) so a commit that DELETES a preserved
+        // path — e.g. removes `.trinity/plans/bar.md` under
+        // `purge foo` — survives. Without this, the delete-only
+        // commit gets dropped and bar resurrects from the parent.
         let strip_predicate_for_diff = |p: &str| -> bool {
             p == format!(".trinity/plans/{}.md", plan_key.as_str())
                 || (q.include_finalize
@@ -604,7 +609,7 @@ async fn api_rewrite_preview(
         };
         let contributes_non_strippable = changes.has_non_plan_code_changes
             || changes
-                .trinity_paths
+                .trinity_paths_touched
                 .iter()
                 .any(|p| !strip_predicate_for_diff(p));
         let attributed_to_this_plan = native_shas.contains(&meta.sha);
@@ -719,14 +724,16 @@ async fn api_rewrite_preview_all(
                     .collect();
                 // For all-plans purge: anything under `.trinity/`
                 // is strippable EXCEPT `.trinity/finished/` paths
-                // when include_finalize=false. So this commit
-                // contributes a preserved path iff it added a
-                // non-`.trinity/` path OR (include_finalize=false
-                // AND it added a `.trinity/finished/` path).
+                // when include_finalize=false. Contribution check
+                // uses `trinity_paths_touched` (bidirectional) so
+                // a commit that DELETES a preserved
+                // `.trinity/finished/` path survives — otherwise
+                // dropping the delete resurrects the finalize file
+                // from the parent.
                 let contributes_non_strippable = changes.has_non_plan_code_changes
                     || (!q.include_finalize
                         && changes
-                            .trinity_paths
+                            .trinity_paths_touched
                             .iter()
                             .any(|p| p.starts_with(".trinity/finished/")));
                 let (disposition, strip_paths) =
@@ -1920,6 +1927,102 @@ mod wire_tests {
         assert_eq!(
             commits[1]["foreign"], true,
             "cross-plan commit must be foreign"
+        );
+    }
+
+    #[tokio::test]
+    async fn rewrite_preview_preserves_other_plan_deletion_under_single_plan_purge() {
+        // Codex blocker: `trinity purge foo` was dropping commits
+        // that DELETED preserved paths because `trinity_paths`
+        // is destination-only. A commit that removed
+        // .trinity/plans/bar.md would vanish, and bar would
+        // resurrect from the rewritten parent.
+        let dir = init_repo();
+        write_file(dir.path(), ".trinity/plans/foo.md", "# foo\n");
+        commit(dir.path(), "add foo");
+        write_file(dir.path(), ".trinity/plans/bar.md", "# bar\n");
+        commit(dir.path(), "add bar");
+        std::fs::remove_file(dir.path().join(".trinity/plans/bar.md")).unwrap();
+        commit(dir.path(), "remove bar");
+        let runtime = Arc::new(Runtime::new());
+        runtime.add_repo(dir.path().to_path_buf()).await.unwrap();
+        let state = AppState {
+            runtime: Arc::clone(&runtime),
+            watchers: Arc::new(Mutex::new(std::collections::BTreeMap::new())),
+            bundle: Bundle::Disk(std::path::PathBuf::from("/dev/null")),
+            repos_path: std::path::PathBuf::from("/dev/null"),
+        };
+        let app = router(state);
+        let url = format!("/api/plan/{}/rewrite_preview", plan_id_for(&dir, "foo"));
+        let req = Request::builder()
+            .method("GET")
+            .uri(&url)
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let v = body_json(resp).await;
+        let commits = v["commits"].as_array().unwrap();
+        assert_eq!(commits.len(), 3);
+        assert_eq!(commits[0]["subject"], "add foo");
+        assert_eq!(commits[0]["disposition"], "drop");
+        // commit 2 (add bar) is a preserved contribution — it
+        // touched a non-foo path. Tree has foo.md (strippable)
+        // AND bar.md (preserved). → Rewrite (strip foo).
+        assert_eq!(commits[1]["subject"], "add bar");
+        assert_eq!(commits[1]["disposition"], "rewrite");
+        // commit 3 (remove bar) is a deletion of a preserved
+        // path. Must NOT Drop — otherwise bar resurrects.
+        assert_eq!(commits[2]["subject"], "remove bar");
+        assert_ne!(
+            commits[2]["disposition"], "drop",
+            "delete-bar commit must survive: dropping it would \
+             resurrect bar from the rewritten parent"
+        );
+    }
+
+    #[tokio::test]
+    async fn rewrite_preview_all_preserves_finalize_deletion_when_include_finalize_false() {
+        // Same shape, all-plans variant: a commit that deletes a
+        // preserved `.trinity/finished/` path must survive when
+        // include_finalize=false.
+        let dir = init_repo();
+        write_file(dir.path(), ".trinity/plans/foo.md", "# foo\n");
+        commit(dir.path(), "add foo");
+        write_file(dir.path(), ".trinity/finished/foo/codex.md", "APPROVE\n");
+        commit(dir.path(), "Finalize foo");
+        std::fs::remove_file(dir.path().join(".trinity/finished/foo/codex.md")).unwrap();
+        commit(dir.path(), "remove finalize");
+        let runtime = Arc::new(Runtime::new());
+        runtime.add_repo(dir.path().to_path_buf()).await.unwrap();
+        let state = AppState {
+            runtime,
+            watchers: Arc::new(Mutex::new(std::collections::BTreeMap::new())),
+            bundle: Bundle::Disk(std::path::PathBuf::from("/dev/null")),
+            repos_path: std::path::PathBuf::from("/dev/null"),
+        };
+        let app = router(state);
+        let basename = repo_basename(&dir);
+        // include_finalize=false: finalize files are preserved,
+        // so the delete of a finalize file is a contribution.
+        let url = format!("/api/repos/{basename}/rewrite_preview_all?include_finalize=false");
+        let req = Request::builder()
+            .method("GET")
+            .uri(&url)
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let v = body_json(resp).await;
+        let commits = v["commits"].as_array().unwrap();
+        let remove_finalize = commits
+            .iter()
+            .find(|c| c["subject"] == "remove finalize")
+            .expect("remove-finalize commit in range");
+        assert_ne!(
+            remove_finalize["disposition"], "drop",
+            "delete of preserved finalize file must survive when \
+             include_finalize=false"
         );
     }
 

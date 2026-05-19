@@ -19,8 +19,8 @@ pub async fn run(args: PurgeArgs) -> anyhow::Result<()> {
     if args.amend {
         anyhow::bail!("--amend is not yet implemented in this phase");
     }
-    if args.squash.is_some() && args.all {
-        anyhow::bail!("--squash is not supported with --all");
+    if args.squash.is_some() {
+        anyhow::bail!("--squash is not yet implemented in this phase");
     }
 
     if args.all && args.plan.is_some() {

@@ -552,6 +552,7 @@ fn parse_diff_tree(stdout: &str) -> Result<ParsedDiffTree, GitIoError> {
     let mut finalize_upserts: Vec<FinalizeUpsertPath> = Vec::new();
     let mut plan_body_paths: Vec<(usize, PathBuf)> = Vec::new();
     let mut trinity_paths: Vec<String> = Vec::new();
+    let mut trinity_paths_touched: Vec<String> = Vec::new();
     let mut touched_trinity = false;
 
     for line in stdout.lines() {
@@ -595,10 +596,23 @@ fn parse_diff_tree(stdout: &str) -> Result<ParsedDiffTree, GitIoError> {
         // `.trinity/`). The all-plans classifier uses this to make
         // a delete-only Trinity commit `Drop` instead of
         // `KeepVerbatim`.
-        if new_rel.starts_with(".trinity")
-            || old_rel.as_ref().is_some_and(|p| p.starts_with(".trinity"))
-        {
+        let new_in_trinity = new_rel.starts_with(".trinity");
+        let old_in_trinity = old_rel.as_ref().is_some_and(|p| p.starts_with(".trinity"));
+        if new_in_trinity || old_in_trinity {
             touched_trinity = true;
+        }
+        // Bidirectional path list: every `.trinity/`-prefixed path
+        // this commit's diff touched on either side. Captures
+        // destinations of adds/modifies/renames AND sources of
+        // deletes/renames-out. Used by the contribution check so a
+        // commit that deletes a preserved path (e.g. removing
+        // another plan's file under a single-plan purge) isn't
+        // silently dropped.
+        if new_in_trinity {
+            trinity_paths_touched.push(new_path.to_string());
+        }
+        if old_in_trinity && let Some(old) = old_path {
+            trinity_paths_touched.push(old.to_string());
         }
         let new_is_plan = is_plan_path(&new_rel);
         let old_is_plan = old_path
@@ -718,6 +732,8 @@ fn parse_diff_tree(stdout: &str) -> Result<ParsedDiffTree, GitIoError> {
 
     trinity_paths.sort();
     trinity_paths.dedup();
+    trinity_paths_touched.sort();
+    trinity_paths_touched.dedup();
     Ok(ParsedDiffTree {
         changes: CommitChanges {
             plan_touches,
@@ -725,6 +741,7 @@ fn parse_diff_tree(stdout: &str) -> Result<ParsedDiffTree, GitIoError> {
             finalize_changes,
             trinity_paths,
             touched_trinity,
+            trinity_paths_touched,
         },
         finalize_upserts,
         plan_body_paths,

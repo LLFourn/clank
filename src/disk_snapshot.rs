@@ -180,6 +180,7 @@ pub fn apply_commit(state: &mut RepoState, carry: &mut FoldCarry, event: &Commit
             finalize_changes: event.changes.finalize_changes.clone(),
             trinity_paths: event.changes.trinity_paths.clone(),
             touched_trinity: event.changes.touched_trinity,
+            trinity_paths_touched: event.changes.trinity_paths_touched.clone(),
         }
     } else {
         event.changes.clone()
@@ -574,6 +575,7 @@ mod tests {
                 finalize_changes: Vec::new(),
                 trinity_paths: Vec::new(),
                 touched_trinity: false,
+                trinity_paths_touched: Vec::new(),
             },
         }
     }
@@ -593,6 +595,7 @@ mod tests {
                 finalize_changes: finalize,
                 trinity_paths: Vec::new(),
                 touched_trinity: false,
+                trinity_paths_touched: Vec::new(),
             },
         }
     }
@@ -973,6 +976,7 @@ mod tests {
                         finalize_changes: vec![upsert("foo", "alice.md", "APPROVE")],
                         trinity_paths: Vec::new(),
                         touched_trinity: false,
+                        trinity_paths_touched: Vec::new(),
                     },
                 },
             ]),
@@ -1022,6 +1026,7 @@ mod tests {
                         finalize_changes: vec![upsert("foo", "alice.md", "APPROVE")],
                         trinity_paths: Vec::new(),
                         touched_trinity: false,
+                        trinity_paths_touched: Vec::new(),
                     },
                 },
             ]),
@@ -1115,6 +1120,7 @@ mod tests {
                 finalize_changes: Vec::new(),
                 trinity_paths: Vec::new(),
                 touched_trinity: false,
+                trinity_paths_touched: Vec::new(),
             },
         };
         let state = derive_state(PathBuf::from("/r"), snap(vec![event_at("c1c1", 100)]));

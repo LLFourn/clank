@@ -42,6 +42,15 @@ pub struct CommitChanges {
     /// a delete-only commit (e.g. removing `.trinity/stubs/foo.md`)
     /// should disappear under `--all`.
     pub touched_trinity: bool,
+    /// Every `.trinity/`-prefixed path this commit's diff touched
+    /// on EITHER side — destinations of adds/modifies/renames-into,
+    /// PLUS sources of deletes/renames-out. Used by the
+    /// contribution check: a commit that deletes a path the rewrite
+    /// wants to preserve (e.g. `.trinity/plans/bar.md` under
+    /// `purge foo`) must survive even though its diff has no
+    /// destination path. Sorted, deduped. Superset of
+    /// `trinity_paths` for non-delete cases.
+    pub trinity_paths_touched: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -159,6 +168,7 @@ mod tests {
             finalize_changes: Vec::new(),
             trinity_paths: Vec::new(),
             touched_trinity: false,
+            trinity_paths_touched: Vec::new(),
         }
     }
 
