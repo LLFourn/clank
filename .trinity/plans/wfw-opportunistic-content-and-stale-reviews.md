@@ -8,8 +8,9 @@ drift class plus prevent lost reviews:
    first encounter (per agent, by content hash) and are omitted
    on subsequent polls.
 2. **Stale-review sidecar** (master-only) that one-shot-delivers
-   reviews against superseded commits so no review is silently
-   lost when the master rebases past it.
+   reviews against superseded commits the next time master WFW
+   wakes legitimately. Riding-along delivery, not an
+   independent wakeup.
 
 The variants reshape on both surfaces (they share
 `WorkPayload`), but inline `content` populating and the
@@ -52,9 +53,11 @@ The RC on `aaa` is no longer surfaced anywhere by WFW.
 Result: master never reads codex's concern. Codex's RC was
 silently dropped from the agent loop.
 
-Fix: a master-only sidecar that delivers stale reviews exactly
-once. Once master has been shown the stale review, it's marked
-seen and never re-surfaces.
+Fix: a master-only sidecar that piggybacks on any master WFW
+wakeup, one-shot-delivering unseen stale reviews. Doesn't wake
+master independently (avoids misleading-action-payload
+problems); just rides along whenever master would wake
+anyway.
 
 ## What
 
@@ -168,25 +171,27 @@ adds the master-only `stale_reviews` sidecar.
 
 ```rust
 // In Trinity:
-opportunistic_bodies: BTreeMap<(RepoBasename, AgentLabel, String), ContentHash>,
-seen_stale_reviews: BTreeSet<(RepoBasename, AgentLabel, String)>,
+opportunistic_bodies: BTreeMap<(PathBuf, AgentLabel, String), ContentHash>,
+seen_stale_reviews: BTreeSet<(PathBuf, AgentLabel, String)>,
 ```
 
-- `opportunistic_bodies`: keyed by `(repo basename, agent,
-  repo-relative path)`, value is the content hash last sent to
-  that agent. Used for `plan_file.content` and
+- `opportunistic_bodies`: keyed by `(canonical repo root,
+  agent, repo-relative path)`, value is the content hash last
+  sent. Used for `plan_file.content` and
   `current_review.content`. Hash-keyed: reviewer rewrites and
   plan revisions naturally re-send.
-- `seen_stale_reviews`: keyed by `(repo basename, agent,
+- `seen_stale_reviews`: keyed by `(canonical repo root, agent,
   repo-relative path)`. Strictly one-shot — once a stale review
-  has been delivered to an agent, it never re-surfaces in
-  `stale_reviews`.
+  has been delivered, it never re-surfaces in `stale_reviews`.
 
-Repo basename is part of the key because Trinity watches
-multiple repos and the same repo-relative path
-(`.trinity/plans/foo.md`, `.trinity/feedback/foo/<sha>/codex.md`)
-exists in many of them. Without repo identity, `foo` plans
-across repos would share cache state.
+Canonical repo root is the cache identity (not the basename)
+because Trinity watches multiple repos and the same
+repo-relative path exists in many of them. Using the
+canonicalized `PathBuf` avoids relying on the
+basename-uniqueness invariant — even if two repos with the
+same basename were ever transiently watched (shadowed
+registration during startup), their cache state stays
+distinct.
 
 Both cleared on daemon restart. No persistence.
 
@@ -211,41 +216,36 @@ in `src/server/wait.rs` post-processes:
      If absent → read content, append as `StaleReview`, mark
      seen.
 
-### Wakeup rule for stale reviews
+### Sidecar attachment rule
 
-A naïve master-role WFW only returns when
-`waiting_on.role == Master` (or `SessionFinished`). That means
-in the common pattern "master commits → reviewer reviews → if
-RC, master addresses; if approve, master implements next", the
-master is asleep most of the time when stale reviews exist.
-The sidecar would arrive only on the next master-side wakeup,
-which is fine for "didn't lose data" but bad for "master sees
-it before doing more work."
+`stale_reviews` is a true sidecar: it does NOT wake master WFW
+on its own. The role gate stays unchanged — master WFW returns
+only when `waiting_on.role == Master` (or `SessionFinished`).
 
-Rule: **master WFW wakes on any state change that produces a
-new unseen stale review for this `(repo, agent)`.** Concretely:
+Attachment: whenever master WFW *does* legitimately wake (any
+master action), the sidecar populates with any unseen stale
+reviews for `(repo, agent)`. Each delivered entry is marked
+seen and never re-surfaces.
 
-- The existing role-gate exception for `SessionFinished` keeps
-  working.
-- Add a second gate exception: if the master-role caller has
-  any unseen stale reviews for this `(repo, agent)` AND the
-  current `waiting_on.role` is `Reviewers` (master would
-  normally stay asleep), still emit a response. The action
-  variant emitted in that case is whatever the projection
-  produces (likely the previous "your work is X" — there's no
-  new work; the master is being delivered the sidecar). This
-  is the only case where master WFW returns when
-  `waiting_on.role == Reviewers`.
+What this means in practice:
 
-This guarantees: any review filed against ANY commit is
-delivered to the master in their next WFW response, regardless
-of whether the current gate is waiting on them. After
-delivery, the review is marked seen and the master goes back
-to sleep on the normal wakeup rule.
+- Master commits `bbb` after rebasing past an RC on `aaa`.
+- State is now `Reviewers` waiting on `bbb`. Master WFW sleeps.
+- Reviewer votes on `bbb`:
+  - If RC → master wakes for `AddressChanges` on `bbb`. The
+    `stale_reviews` sidecar carries the unseen `aaa` RC alongside
+    the current `bbb` reviews.
+  - If approve → master wakes for `StartImplementation` (or
+    `ReadyToStartImplementation`). The sidecar still carries
+    the unseen `aaa` RC.
+- The stale RC reaches the master at the next legitimate
+  master wakeup — no separate "stale-only" wakeup, no
+  misleading reviewer-shaped action delivered to a master
+  caller.
 
-The wakeup itself triggers off the same broadcast that wakes
-the WFW loop today (commit lands → repo rebuilt → broadcast
-event). The check happens at `compute_match` time.
+If master never re-engages with the plan, the stale review
+never surfaces. That's acceptable — master has left the work;
+historical RCs against superseded commits are not urgent.
 
 `work_context_response_from_snapshot` skips both steps. Content
 fields stay `None`; no sidecar.
