@@ -15,15 +15,14 @@ use std::path::Path;
 
 use crate::lifecycle::{AgentLabel, CommitSha, ContentHash, PlanId, RepoBasename, content_hash};
 use crate::projection::{
-    all_implementation_commits, all_plan_revisions, current_posture, expected_action,
-    impl_gate_for, plan_gate_for, plan_worktree_status, waiting_on,
+    all_implementation_commits, all_plan_revisions, current_posture, impl_gate_for, plan_gate_for,
+    plan_worktree_status, waiting_on,
 };
 use crate::repo_state::{Plan, PlanWorktreeStatus, RepoState};
 use crate::review_state::CommitGate;
 use trinity_core::api::{
     CommitRef, CommitRow, Feedback, ListPlansResponse, PlanConflict, PlanDetailResponse, PlanRow,
     PrHint, PrHintOption, ReviewGate, ReviewTarget, TimelineEvent, WorkContextResponse,
-    WriteFeedback,
 };
 use trinity_core::vocab::{CommitKind, PlanTouchKind, Posture, ReviewTargetPhase};
 
@@ -212,26 +211,8 @@ pub fn work_context_response_from_snapshot(
     let plan_phase = current_posture(plan, state);
     let gate = crate::projection::latest_reviewable_commit_gate_for(plan);
     let w = waiting_on(plan.is_frozen(), worktree_status, gate);
-    let review_target_phase = posture_to_review_target_phase(plan_phase);
-
     let review_target_sha = crate::projection::latest_reviewable_commit_for(plan);
-    let review_target = review_target_sha.as_ref().map(|sha| ReviewTarget {
-        commit_sha: sha.as_str().to_string(),
-        phase: review_target_phase,
-    });
-    let write_feedback = review_target_sha.as_ref().map(|sha| WriteFeedback {
-        phase: review_target_phase,
-        target_sha: sha.as_str().to_string(),
-        path: format!(
-            ".trinity/feedback/{session}/{sha}/{author}.md",
-            session = plan.id.as_str(),
-            sha = sha.as_str(),
-            author = author_label.as_str(),
-        ),
-    });
-    let latest_relevant_commit = review_target_sha
-        .as_ref()
-        .map(|sha| sha.as_str().to_string());
+    let expected_action = build_expected_action(plan, &w, review_target_sha.as_ref(), author_label);
 
     WorkContextResponse {
         plan_id: plan_id_string(&state.root, &plan.id).expect("active plan must have a plan_id"),
@@ -240,11 +221,75 @@ pub fn work_context_response_from_snapshot(
         lifecycle: plan.lifecycle(),
         phase: plan_phase,
         plan_worktree_status: worktree_status,
-        expected_action: expected_action(w.reason),
+        expected_action,
         waiting_on: w,
-        review_target,
-        write_feedback,
-        latest_relevant_commit,
+    }
+}
+
+/// Project the per-plan state into the tagged `ExpectedAction`.
+/// Variant payloads come from the snapshot's gate + projected
+/// review-target, so each variant carries exactly the data the
+/// caller needs to act on it without re-querying.
+fn build_expected_action(
+    plan: &Plan,
+    w: &trinity_core::api::WaitingOn,
+    review_target_sha: Option<&crate::lifecycle::CommitSha>,
+    author_label: &AgentLabel,
+) -> trinity_core::api::ExpectedAction {
+    use trinity_core::api::ExpectedAction as A;
+    use trinity_core::vocab::WaitingReason as R;
+    match w.reason {
+        R::CommitNeedsReview => {
+            let sha = review_target_sha
+                .expect("CommitNeedsReview implies a review target")
+                .as_str()
+                .to_string();
+            let path = format!(
+                ".trinity/feedback/{session}/{sha}/{author}.md",
+                session = plan.id.as_str(),
+                sha = sha,
+                author = author_label.as_str(),
+            );
+            A::WriteFeedback {
+                path,
+                target_sha: sha,
+            }
+        }
+        R::AddressCommitChanges => {
+            let sha = review_target_sha
+                .expect("AddressCommitChanges implies a review target")
+                .as_str()
+                .to_string();
+            let rc_paths = plan
+                .event_for(review_target_sha.expect("checked above"))
+                .and_then(|e| e.gate.as_ref())
+                .map(|gate| {
+                    gate.requesters
+                        .iter()
+                        .map(|author| {
+                            format!(
+                                ".trinity/feedback/{session}/{sha}/{author}.md",
+                                session = plan.id.as_str(),
+                                sha = sha,
+                                author = author.as_str(),
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            A::AddressChanges {
+                target_sha: sha,
+                rc_paths,
+            }
+        }
+        R::CommitPlanRevision => A::CommitPlanRevision,
+        R::ReadyToStartImplementation => A::StartImplementation {
+            previous_commit: review_target_sha
+                .expect("ReadyToStartImplementation implies a previous commit")
+                .as_str()
+                .to_string(),
+        },
+        R::SessionFinished => A::SessionFinished,
     }
 }
 
@@ -319,7 +364,6 @@ pub fn plan_page_with_reader(
         current_path: plan.plan_path.clone(),
         phase: plan_phase,
         plan_worktree_status: worktree_status,
-        expected_action: expected_action(w.reason),
         waiting_on: w,
         review_target,
         review_gate,

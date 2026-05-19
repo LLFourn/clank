@@ -228,17 +228,10 @@ fn schema_work_context_response() {
         phase: Posture::Planning,
         plan_worktree_status: PlanWorktreeStatus::Clean,
         waiting_on: waiting_on_fixture(),
-        expected_action: ExpectedAction::ReviewCommit,
-        review_target: Some(ReviewTarget {
-            commit_sha: "abc".into(),
-            phase: ReviewTargetPhase::Plan,
-        }),
-        write_feedback: Some(WriteFeedback {
-            phase: ReviewTargetPhase::Plan,
-            target_sha: "abc".into(),
+        expected_action: ExpectedAction::WriteFeedback {
             path: ".trinity/feedback/foo/abc/alice.md".into(),
-        }),
-        latest_relevant_commit: Some("abc".into()),
+            target_sha: "abc".into(),
+        },
     })
     .unwrap();
     assert_schema("work_context_response", &v);
@@ -293,7 +286,6 @@ fn schema_plan_detail_response() {
         phase: Posture::Planning,
         plan_worktree_status: PlanWorktreeStatus::Clean,
         waiting_on: waiting_on_fixture(),
-        expected_action: ExpectedAction::ReviewCommit,
         review_target: Some(ReviewTarget {
             commit_sha: "abc".into(),
             phase: ReviewTargetPhase::Plan,

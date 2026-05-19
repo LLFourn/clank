@@ -29,8 +29,8 @@
 use serde::{Deserialize, Serialize};
 
 use crate::vocab::{
-    CommitKind, DiffLineKind, ExpectedAction, PlanLifecycle, PlanTouchKind, PlanWorktreeStatus,
-    Posture, ReviewGateState, ReviewTargetPhase, Verdict, WaitingReason, WaitingRole,
+    CommitKind, DiffLineKind, PlanLifecycle, PlanTouchKind, PlanWorktreeStatus, Posture,
+    ReviewGateState, ReviewTargetPhase, Verdict, WaitingReason, WaitingRole,
 };
 
 // ============================================================
@@ -295,9 +295,40 @@ pub struct WorkContextResponse {
     pub plan_worktree_status: PlanWorktreeStatus,
     pub waiting_on: WaitingOn,
     pub expected_action: ExpectedAction,
-    pub review_target: Option<ReviewTarget>,
-    pub write_feedback: Option<WriteFeedback>,
-    pub latest_relevant_commit: Option<String>,
+}
+
+/// The action the caller should take next, tagged-enum form.
+/// Each variant carries exactly the data needed to perform it —
+/// reviewers get the canonical write path directly instead of
+/// reconstructing it from sha + author_label; masters get the
+/// RC paths to read directly instead of walking the gate.
+///
+/// Serialized as `{ "kind": "<variant>", <payload> }`. Variant
+/// names are imperative ("write the feedback", "commit the
+/// revision") — they're directives, not states. The state
+/// half lives on `WaitingOn` (role / reason / description /
+/// agents).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ExpectedAction {
+    /// Reviewer: write an `APPROVE\n...` / `REQUEST_CHANGES\n...`
+    /// markdown file to `path` against the commit at `target_sha`.
+    WriteFeedback { path: String, target_sha: String },
+    /// Master: address the request-changes feedback at `rc_paths`
+    /// against `target_sha` and follow up with a fix commit.
+    AddressChanges {
+        target_sha: String,
+        rc_paths: Vec<String>,
+    },
+    /// Master: the plan file is dirty in the worktree. Commit
+    /// the revision (at `WorkContextResponse.current_path`) to
+    /// release blocked reviews.
+    CommitPlanRevision,
+    /// Master: latest commit at `previous_commit` is approved.
+    /// Write the next implementation commit.
+    StartImplementation { previous_commit: String },
+    /// Plan is finalized; no further action.
+    SessionFinished,
 }
 
 /// MCP `set_active_work` response. The selection is recorded in
@@ -348,7 +379,6 @@ pub struct PlanDetailResponse {
     pub phase: Posture,
     pub plan_worktree_status: PlanWorktreeStatus,
     pub waiting_on: WaitingOn,
-    pub expected_action: ExpectedAction,
     pub review_target: Option<ReviewTarget>,
     pub review_gate: Option<ReviewGate>,
     pub latest_plan_revision: Option<CommitRef>,

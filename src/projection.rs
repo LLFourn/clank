@@ -203,20 +203,6 @@ pub fn impl_gate_for<'a>(
         .and_then(|e| e.gate.as_ref())
 }
 
-/// Map a `WaitingReason` to the caller-facing action verb that names
-/// what the agent should actually do.
-pub fn expected_action(reason: WaitingReason) -> trinity_core::ExpectedAction {
-    use WaitingReason::*;
-    use trinity_core::ExpectedAction as A;
-    match reason {
-        SessionFinished => A::None,
-        CommitPlanRevision => A::CommitPlanRevision,
-        AddressCommitChanges => A::AddressCommitChanges,
-        ReadyToStartImplementation => A::StartImplementation,
-        CommitNeedsReview => A::ReviewCommit,
-    }
-}
-
 fn make(
     role: WaitingRole,
     reason: WaitingReason,

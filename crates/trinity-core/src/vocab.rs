@@ -323,32 +323,6 @@ impl WaitingReason {
     }
 }
 
-/// The VERB form of `WaitingReason` — what to actually do.
-/// Wire-serialized under `expected_action`. Distinct vocabulary
-/// from `WaitingReason`: `ReadyToStartImplementation` →
-/// `start_implementation`, `CommitNeedsReview` → `review_commit`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ExpectedAction {
-    None,
-    CommitPlanRevision,
-    AddressCommitChanges,
-    StartImplementation,
-    ReviewCommit,
-}
-
-impl ExpectedAction {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            ExpectedAction::None => "none",
-            ExpectedAction::CommitPlanRevision => "commit_plan_revision",
-            ExpectedAction::AddressCommitChanges => "address_commit_changes",
-            ExpectedAction::StartImplementation => "start_implementation",
-            ExpectedAction::ReviewCommit => "review_commit",
-        }
-    }
-}
-
 // ============================================================
 // Diff rendering
 // ============================================================
@@ -411,7 +385,6 @@ impl_display_via_as_str! {
     ReviewGateState,
     WaitingRole,
     WaitingReason,
-    ExpectedAction,
     DiffLineKind,
     PrHintOptionKind,
 }

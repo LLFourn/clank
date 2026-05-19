@@ -140,18 +140,6 @@ fn waiting_reason_wire_strings() {
 }
 
 #[test]
-fn expected_action_wire_strings() {
-    assert_wire(ExpectedAction::None, "none");
-    assert_wire(ExpectedAction::CommitPlanRevision, "commit_plan_revision");
-    assert_wire(
-        ExpectedAction::AddressCommitChanges,
-        "address_commit_changes",
-    );
-    assert_wire(ExpectedAction::StartImplementation, "start_implementation");
-    assert_wire(ExpectedAction::ReviewCommit, "review_commit");
-}
-
-#[test]
 fn diff_line_kind_wire_strings() {
     assert_wire(DiffLineKind::Insert, "insert");
     assert_wire(DiffLineKind::Delete, "delete");
@@ -184,7 +172,6 @@ fn as_str_agrees_with_wire() {
     check!(Verdict::Approve);
     check!(WaitingReason::CommitNeedsReview);
     check!(WaitingRole::Master);
-    check!(ExpectedAction::ReviewCommit);
     check!(CommitGateState::ChangesRequested);
     check!(PlanWorktreeStatus::PlanFileMissing);
     check!(PlanTouchKind::Revision);

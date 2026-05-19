@@ -48,7 +48,6 @@
     }
   ],
   "current_path": "string",
-  "expected_action": "string",
   "implementation_commits": [
     "<empty>"
   ],
