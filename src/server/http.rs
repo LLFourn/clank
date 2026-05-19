@@ -618,11 +618,11 @@ async fn api_rewrite_preview_all(
         .await
         .map_err(|e| AppError::internal(format!("git first-parent walk: {e}")))?;
 
-    // Two-pass: first walk to find the intro (earliest .trinity/
-    // touch) so we can slice the manifest at intro→HEAD. Including
-    // pre-intro commits would feed them to the rewrite engine,
-    // which replays everything in `commits` on top of
-    // `intro_parent` — duplicating the prefix of the branch.
+    // Two-pass: first find the intro (earliest `.trinity/` touch)
+    // so we can slice at intro→HEAD. Pre-intro commits stay out of
+    // the manifest entirely — feeding them to the engine would
+    // make it replay code commits on top of `intro_parent`,
+    // duplicating the branch prefix.
     let mut linear = true;
     let mut intro_pos: Option<usize> = None;
     let mut per_commit: Vec<(crate::git_io::CommitMeta, crate::attribution::CommitChanges)> =
@@ -654,21 +654,27 @@ async fn api_rewrite_preview_all(
     let (intro_sha, commits) = match intro_pos {
         Some(start) => {
             let intro_sha = Some(per_commit[start].0.sha.clone());
-            let commits = per_commit[start..]
-                .iter()
-                .map(|(meta, changes)| {
-                    let (disposition, strip_paths) =
-                        classify_rewrite_all(changes, q.include_finalize);
-                    trinity_core::api::RewriteCommit {
-                        sha: meta.sha.clone(),
-                        subject: meta.subject.clone(),
-                        disposition,
-                        // No per-plan attribution for the all-plans case.
-                        foreign: false,
-                        strip_paths,
-                    }
-                })
-                .collect();
+            // Second pass over the sliced range: for each commit
+            // look up the TREE's `.trinity/` paths (not the diff's).
+            // The engine rewrites tree state, so the source of
+            // truth for "what survives" is `git ls-tree`, not
+            // "what this commit's diff touched."
+            let mut commits = Vec::with_capacity(per_commit.len() - start);
+            for (meta, changes) in &per_commit[start..] {
+                let tree_trinity = crate::git_io::tree_trinity_paths(&repo_root, &meta.sha)
+                    .await
+                    .map_err(|e| AppError::internal(format!("git ls-tree: {e}")))?;
+                let (disposition, strip_paths) =
+                    classify_rewrite_all_from_tree(changes, &tree_trinity, q.include_finalize);
+                commits.push(trinity_core::api::RewriteCommit {
+                    sha: meta.sha.clone(),
+                    subject: meta.subject.clone(),
+                    disposition,
+                    // No per-plan attribution for the all-plans case.
+                    foreign: false,
+                    strip_paths,
+                });
+            }
             (intro_sha, commits)
         }
         None => (None, Vec::new()),
@@ -684,64 +690,63 @@ async fn api_rewrite_preview_all(
     }))
 }
 
-/// All-plans variant of `classify_rewrite`. Uses
-/// `CommitChanges.trinity_paths` as the source of truth for
-/// "this plan's strippable paths" — captures plan files,
-/// finalize files, AND non-plan Trinity metadata like
-/// `.trinity/.gitignore` and `.trinity/stubs/*`.
-fn classify_rewrite_all(
+/// All-plans classifier using TREE state as the source of truth,
+/// not the commit's diff. The rewrite engine produces new trees,
+/// and a post-intro pure-code commit's tree still inherits
+/// `.trinity/` content from its parent — that content must be
+/// stripped on the rewrite even though the commit's diff never
+/// touched `.trinity/`.
+///
+/// `tree_trinity_paths` is `git ls-tree -r <sha> -- .trinity/`:
+/// every `.trinity/`-prefixed path that exists in this commit's
+/// resulting tree. Applies the `include_finalize` filter at the
+/// strip-path level so finalize files can be preserved when
+/// requested.
+fn classify_rewrite_all_from_tree(
     changes: &crate::attribution::CommitChanges,
+    tree_trinity_paths: &[String],
     include_finalize: bool,
 ) -> (trinity_core::api::RewriteDisposition, Vec<String>) {
     use trinity_core::api::RewriteDisposition;
 
-    // Apply the include_finalize filter at the strip-path level:
-    // when finalize is excluded, drop entries under
-    // `.trinity/finished/` from the strip set. The disposition
-    // still uses the full set — a commit that only touched
-    // finalize files is still touching `.trinity/`, just
-    // strippable depends on the flag.
-    let trinity_paths_filtered: Vec<String> = changes
-        .trinity_paths
+    // Three buckets of tree state, derived from `git ls-tree`:
+    //   - strippable: paths we WILL remove (`.trinity/**`, with
+    //     `.trinity/finished/` excluded when include_finalize=false)
+    //   - unstrippable_trinity: `.trinity/**` paths preserved
+    //     (only non-empty when include_finalize=false — the
+    //     finalize-snapshot contents stay)
+    //   - touched_other_paths: this commit's diff added/modified
+    //     non-`.trinity/` content
+    let (strippable, unstrippable_trinity): (Vec<String>, Vec<String>) = tree_trinity_paths
         .iter()
-        .filter(|p| include_finalize || !p.starts_with(".trinity/finished/"))
         .cloned()
-        .collect();
-
+        .partition(|p| include_finalize || !p.starts_with(".trinity/finished/"));
+    let has_strippable = !strippable.is_empty();
+    let has_unstrippable_trinity = !unstrippable_trinity.is_empty();
     let touched_other_paths = changes.has_non_plan_code_changes;
-    // Three signals, each with a distinct meaning:
-    //   - touched_trinity: any `.trinity/` path appeared on EITHER
-    //     side of the diff (includes pure deletes and renames out).
-    //   - has_trinity_dest: any `.trinity/` path survived to the
-    //     new tree (excludes pure deletes).
-    //   - has_strippable: of those destinations, any remained
-    //     after the `include_finalize` filter.
-    let touched_trinity = changes.touched_trinity;
-    let has_trinity_dest = !changes.trinity_paths.is_empty();
-    let has_strippable = !trinity_paths_filtered.is_empty();
 
-    let disposition = if !touched_trinity {
-        // Pure code/non-Trinity commit.
+    let disposition = if has_strippable {
+        if touched_other_paths || has_unstrippable_trinity {
+            // Tree has strippable content + something to preserve
+            // (non-Trinity code, or finalize-snapshot content
+            // surviving the `include_finalize=false` filter).
+            RewriteDisposition::Rewrite
+        } else {
+            // Tree has only strippable Trinity. Drop the commit;
+            // there's nothing to keep.
+            RewriteDisposition::Drop
+        }
+    } else if touched_other_paths || has_unstrippable_trinity {
+        // No strippable content in the tree. KeepVerbatim — the
+        // tree is already scrubbed and there's content to keep.
         RewriteDisposition::KeepVerbatim
-    } else if !has_trinity_dest {
-        // Delete-only Trinity commit — the commit existed solely
-        // to remove Trinity state. Under --all, it disappears.
-        RewriteDisposition::Drop
-    } else if !has_strippable {
-        // Destinations exist but the include_finalize filter
-        // excluded them all (e.g. finalize-only commit with
-        // include_finalize=false). Keep verbatim so the
-        // un-stripped Trinity content survives.
-        RewriteDisposition::KeepVerbatim
-    } else if touched_other_paths {
-        RewriteDisposition::Rewrite
     } else {
-        // Only `.trinity/` paths, all strippable.
+        // Empty/no-op commit relative to the rewritten branch.
         RewriteDisposition::Drop
     };
 
     let strip_paths = if matches!(disposition, RewriteDisposition::Rewrite) {
-        trinity_paths_filtered
+        strippable
     } else {
         Vec::new()
     };
@@ -2007,7 +2012,18 @@ mod wire_tests {
         let commits = v["commits"].as_array().unwrap();
         assert_eq!(commits.len(), 2);
         assert_eq!(commits[0]["disposition"], "drop");
-        assert_eq!(commits[1]["disposition"], "keep_verbatim");
+        // The pure-code commit's TREE still contains
+        // .trinity/plans/foo.md (inherited from intro), so it
+        // must Rewrite (not KeepVerbatim) — otherwise the rewrite
+        // engine would reintroduce the plan file.
+        assert_eq!(commits[1]["disposition"], "rewrite");
+        let strip: Vec<&str> = commits[1]["strip_paths"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        assert!(strip.contains(&".trinity/plans/foo.md"));
         assert_eq!(v["plans_touched"].as_array().unwrap().len(), 1);
         assert_eq!(v["plans_touched"][0], "foo");
     }
@@ -2176,6 +2192,101 @@ mod wire_tests {
     }
 
     #[tokio::test]
+    async fn rewrite_preview_all_strips_inherited_trinity_from_keep_verbatim() {
+        // The codex-flagged bug: a pure-code commit AFTER the
+        // intro inherits .trinity/plans/foo.md from its parent.
+        // KeepVerbatim with the original tree leaks the plan file
+        // into the rewritten branch. Tree-based classification
+        // must promote it to Rewrite.
+        let dir = init_repo();
+        write_file(dir.path(), "README.md", "seed\n");
+        commit(dir.path(), "seed");
+        write_file(dir.path(), ".trinity/plans/foo.md", "# foo\n");
+        commit(dir.path(), "plan: foo");
+        write_file(dir.path(), "src/main.rs", "fn main() {}\n");
+        commit(dir.path(), "later code");
+        let runtime = Arc::new(Runtime::new());
+        runtime.add_repo(dir.path().to_path_buf()).await.unwrap();
+        let state = AppState {
+            runtime,
+            watchers: Arc::new(Mutex::new(std::collections::BTreeMap::new())),
+            bundle: Bundle::Disk(std::path::PathBuf::from("/dev/null")),
+            repos_path: std::path::PathBuf::from("/dev/null"),
+        };
+        let app = router(state);
+        let basename = repo_basename(&dir);
+        let req = Request::builder()
+            .method("GET")
+            .uri(format!("/api/repos/{basename}/rewrite_preview_all"))
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let v = body_json(resp).await;
+        let commits = v["commits"].as_array().unwrap();
+        assert_eq!(commits.len(), 2);
+        assert_eq!(commits[0]["disposition"], "drop", "plan commit drops");
+        assert_eq!(
+            commits[1]["disposition"], "rewrite",
+            "later-code commit must Rewrite (tree still contains .trinity/plans/foo.md)"
+        );
+        let strip: Vec<&str> = commits[1]["strip_paths"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        assert!(
+            strip.contains(&".trinity/plans/foo.md"),
+            "later-code commit's strip_paths must include the inherited plan file: {strip:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn rewrite_preview_all_delete_only_plus_code_keeps_code() {
+        // Codex's "smaller bug": a commit that deletes a Trinity
+        // path AND edits non-Trinity code must not Drop — the
+        // code edit needs to survive. With tree-based logic this
+        // falls out: if the tree (after the delete) still has
+        // Trinity content, it's Rewrite; if not, KeepVerbatim;
+        // either way the code is preserved.
+        let dir = init_repo();
+        write_file(dir.path(), ".trinity/stubs/foo.md", "# stub\n");
+        commit(dir.path(), "add stub");
+        std::fs::remove_file(dir.path().join(".trinity/stubs/foo.md")).unwrap();
+        write_file(dir.path(), "src/lib.rs", "// code\n");
+        commit(dir.path(), "remove stub + add code");
+        let runtime = Arc::new(Runtime::new());
+        runtime.add_repo(dir.path().to_path_buf()).await.unwrap();
+        let state = AppState {
+            runtime,
+            watchers: Arc::new(Mutex::new(std::collections::BTreeMap::new())),
+            bundle: Bundle::Disk(std::path::PathBuf::from("/dev/null")),
+            repos_path: std::path::PathBuf::from("/dev/null"),
+        };
+        let app = router(state);
+        let basename = repo_basename(&dir);
+        let req = Request::builder()
+            .method("GET")
+            .uri(format!("/api/repos/{basename}/rewrite_preview_all"))
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let v = body_json(resp).await;
+        let commits = v["commits"].as_array().unwrap();
+        assert_eq!(commits.len(), 2);
+        assert_eq!(commits[0]["disposition"], "drop");
+        // The second commit's tree has src/lib.rs but no Trinity
+        // (the stub was just deleted). KeepVerbatim is correct —
+        // the code edit survives.
+        assert_eq!(
+            commits[1]["disposition"], "keep_verbatim",
+            "delete-only-Trinity + code commit must preserve code, not Drop"
+        );
+    }
+
+    #[tokio::test]
     async fn rewrite_preview_all_finalize_toggle_changes_disposition() {
         // Reproduces the codex-flagged contract: include_finalize
         // must default to true on the all-plans endpoint, and
@@ -2219,8 +2330,10 @@ mod wire_tests {
             "finalize commit Drops when include_finalize defaults true"
         );
 
-        // Explicit include_finalize=false: finalize commit is
-        // KeepVerbatim (the finalize files survive in the new tree).
+        // Explicit include_finalize=false: the finalize commit's
+        // tree contains both the plan file (strippable) AND the
+        // finalize-snapshot file (preserved). Must Rewrite —
+        // strip the plan, keep the snapshot.
         let req = Request::builder()
             .method("GET")
             .uri(format!(
@@ -2233,8 +2346,20 @@ mod wire_tests {
         let v = body_json(resp).await;
         let commits = v["commits"].as_array().unwrap();
         assert_eq!(
-            commits[1]["disposition"], "keep_verbatim",
-            "finalize commit kept verbatim when include_finalize=false"
+            commits[1]["disposition"], "rewrite",
+            "finalize commit must Rewrite when include_finalize=false: \
+             strip the inherited plan file but keep the finalize snapshot"
+        );
+        let strip: Vec<&str> = commits[1]["strip_paths"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        assert!(strip.contains(&".trinity/plans/foo.md"));
+        assert!(
+            !strip.iter().any(|p| p.starts_with(".trinity/finished/")),
+            "include_finalize=false must keep finalize paths out of strip_paths: {strip:?}"
         );
     }
 

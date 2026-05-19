@@ -780,6 +780,73 @@ mod tests {
         assert_eq!(chain.last().unwrap(), &raced_commit);
     }
 
+    /// End-to-end: simulate an all-plans purge across an intro
+    /// commit + a pure-code commit. Asserts that with strip_paths
+    /// populated on the KeepVerbatim-equivalent step, the
+    /// rewritten branch's final tree does NOT contain the plan
+    /// file even though that commit's diff didn't touch it.
+    #[tokio::test]
+    async fn rewrite_strips_inherited_trinity_from_later_pure_code() {
+        let dir = init_repo();
+        write(dir.path(), "README.md", "seed\n");
+        let _seed = commit(dir.path(), "seed");
+        write(dir.path(), ".trinity/plans/foo.md", "# foo\n");
+        let intro = commit(dir.path(), "plan: foo");
+        write(dir.path(), "src/main.rs", "fn main() {}\n");
+        let code = commit(dir.path(), "later code");
+
+        // Manifest mirrors what api_rewrite_preview_all would
+        // emit with tree-based classification: intro Drops, the
+        // pure-code commit Rewrites with the inherited
+        // .trinity/plans/foo.md in strip_paths.
+        let preview = mk_preview(
+            &intro,
+            &code,
+            vec![
+                (
+                    intro.clone(),
+                    "plan: foo".into(),
+                    RewriteDisposition::Drop,
+                    false,
+                    vec![],
+                ),
+                (
+                    code.clone(),
+                    "later code".into(),
+                    RewriteDisposition::Rewrite,
+                    false,
+                    vec![".trinity/plans/foo.md".into()],
+                ),
+            ],
+        );
+        super::run(RewriteOpts {
+            repo: dir.path(),
+            intro_sha: preview.intro_sha.as_ref(),
+            head_sha: &preview.head_sha,
+            linear: preview.linear,
+            commits: &preview.commits,
+            into_branch: Some("scrubbed"),
+            dry: false,
+        })
+        .await
+        .unwrap();
+
+        // The scrubbed branch's tip must contain src/main.rs but
+        // NOT .trinity/plans/foo.md.
+        assert!(
+            !tree_has(dir.path(), "scrubbed", ".trinity/plans/foo.md"),
+            "plan file leaked into rewritten branch"
+        );
+        assert!(
+            tree_has(dir.path(), "scrubbed", "src/main.rs"),
+            "code file lost from rewritten branch"
+        );
+        assert!(
+            tree_has(dir.path(), "scrubbed", "README.md"),
+            "seed file lost from rewritten branch"
+        );
+    }
+
     #[tokio::test]
     async fn rewrite_refuses_non_linear_range() {
         let dir = init_repo();

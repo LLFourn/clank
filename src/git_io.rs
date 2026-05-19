@@ -273,6 +273,39 @@ pub async fn first_added_commit(
 /// topologically earliest plan_intro requires a separate query. Trinity
 /// repos are small enough that walking from the root is cheap and avoids
 /// a correctness footgun.
+/// List every blob path under `.trinity/` in the tree at `sha`.
+/// Returned sorted. Empty when the tree has no `.trinity/` paths.
+/// Used by the all-plans rewrite preview to compute strip_paths
+/// from what's actually IN the tree, not what the commit's diff
+/// touched — because every post-intro commit's tree inherits
+/// `.trinity/` content from its parent even when the commit's diff
+/// didn't touch `.trinity/`.
+pub async fn tree_trinity_paths(repo: &Path, sha: &CommitSha) -> Result<Vec<String>, GitIoError> {
+    let output = run(
+        repo,
+        &[
+            "ls-tree",
+            "-r",
+            "--name-only",
+            "--",
+            sha.as_str(),
+            ".trinity/",
+        ],
+    )
+    .await?;
+    if !output.status.success() {
+        return Ok(Vec::new());
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut paths: Vec<String> = stdout
+        .lines()
+        .filter(|l| !l.is_empty())
+        .map(|s| s.to_string())
+        .collect();
+    paths.sort();
+    Ok(paths)
+}
+
 /// Number of parents on `sha`. Two or more = merge commit.
 pub async fn commit_parent_count(repo: &Path, sha: &CommitSha) -> Result<usize, GitIoError> {
     let stdout = run_ok(repo, &["show", "-s", "--format=%P", sha.as_str()]).await?;
