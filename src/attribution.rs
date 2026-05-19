@@ -34,6 +34,14 @@ pub struct CommitChanges {
     /// `.trinity/**` paths). Deletions are absent because they
     /// don't put anything in the new tree to strip. Sorted, deduped.
     pub trinity_paths: Vec<String>,
+    /// True if this commit's diff touched ANY `.trinity/` path —
+    /// adds, modifies, renames, AND deletes (either side). Distinct
+    /// from `trinity_paths` because deletes don't contribute strip
+    /// targets but DO mean the commit existed to mutate Trinity
+    /// state. The all-plans classifier uses this to decide whether
+    /// a delete-only commit (e.g. removing `.trinity/stubs/foo.md`)
+    /// should disappear under `--all`.
+    pub touched_trinity: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -150,6 +158,7 @@ mod tests {
             has_non_plan_code_changes: code,
             finalize_changes: Vec::new(),
             trinity_paths: Vec::new(),
+            touched_trinity: false,
         }
     }
 

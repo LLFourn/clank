@@ -480,6 +480,7 @@ fn parse_diff_tree(stdout: &str) -> Result<ParsedDiffTree, GitIoError> {
     let mut finalize_upserts: Vec<FinalizeUpsertPath> = Vec::new();
     let mut plan_body_paths: Vec<(usize, PathBuf)> = Vec::new();
     let mut trinity_paths: Vec<String> = Vec::new();
+    let mut touched_trinity = false;
 
     for line in stdout.lines() {
         let line = line.trim_end_matches('\r');
@@ -507,16 +508,25 @@ fn parse_diff_tree(stdout: &str) -> Result<ParsedDiffTree, GitIoError> {
         let status_char = status.chars().next().unwrap_or(' ');
 
         let new_rel = PathBuf::from(new_path);
-        // Track every `.trinity/`-prefixed destination path the
-        // commit added/modified/renamed. This is the source of
-        // truth for the all-plans purge endpoint — captures plan
-        // files, finalize files, AND non-plan Trinity paths
-        // (`.trinity/.gitignore`, stubs, anything else). Skip pure
-        // deletions: their "new path" is absent from the resulting
-        // tree, so there's nothing to strip.
+        let old_rel = old_path.map(PathBuf::from);
+        // Track every `.trinity/`-prefixed DESTINATION path the
+        // commit added/modified/renamed into existence. Source of
+        // truth for the all-plans purge endpoint's strip_paths.
+        // Skip pure deletions: their "new path" is absent from the
+        // resulting tree, so there's nothing to strip there.
         let is_pure_delete = status_char == 'D' && !is_rename;
         if new_rel.starts_with(".trinity") && !is_pure_delete {
             trinity_paths.push(new_path.to_string());
+        }
+        // Track whether the commit touched ANY `.trinity/` path on
+        // either side (including pure deletes and renames out of
+        // `.trinity/`). The all-plans classifier uses this to make
+        // a delete-only Trinity commit `Drop` instead of
+        // `KeepVerbatim`.
+        if new_rel.starts_with(".trinity")
+            || old_rel.as_ref().is_some_and(|p| p.starts_with(".trinity"))
+        {
+            touched_trinity = true;
         }
         let new_is_plan = is_plan_path(&new_rel);
         let old_is_plan = old_path
@@ -642,6 +652,7 @@ fn parse_diff_tree(stdout: &str) -> Result<ParsedDiffTree, GitIoError> {
             has_non_plan_code_changes,
             finalize_changes,
             trinity_paths,
+            touched_trinity,
         },
         finalize_upserts,
         plan_body_paths,

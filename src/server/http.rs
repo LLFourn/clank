@@ -618,12 +618,18 @@ async fn api_rewrite_preview_all(
         .await
         .map_err(|e| AppError::internal(format!("git first-parent walk: {e}")))?;
 
+    // Two-pass: first walk to find the intro (earliest .trinity/
+    // touch) so we can slice the manifest at intro→HEAD. Including
+    // pre-intro commits would feed them to the rewrite engine,
+    // which replays everything in `commits` on top of
+    // `intro_parent` — duplicating the prefix of the branch.
     let mut linear = true;
-    let mut intro_sha: Option<crate::lifecycle::CommitSha> = None;
-    let mut commits = Vec::with_capacity(metas.len());
+    let mut intro_pos: Option<usize> = None;
+    let mut per_commit: Vec<(crate::git_io::CommitMeta, crate::attribution::CommitChanges)> =
+        Vec::with_capacity(metas.len());
     let mut plans_seen: std::collections::BTreeSet<crate::lifecycle::PlanKey> =
         std::collections::BTreeSet::new();
-    for meta in metas {
+    for (idx, meta) in metas.into_iter().enumerate() {
         let parent_count = crate::git_io::commit_parent_count(&repo_root, &meta.sha)
             .await
             .map_err(|e| AppError::internal(format!("git show parents: {e}")))?;
@@ -639,20 +645,34 @@ async fn api_rewrite_preview_all(
         for fc in &changes.finalize_changes {
             plans_seen.insert(fc.plan_key.clone());
         }
-        let (disposition, strip_paths) = classify_rewrite_all(&changes, q.include_finalize);
-        let touched_any_trinity = !changes.trinity_paths.is_empty();
-        if intro_sha.is_none() && touched_any_trinity {
-            intro_sha = Some(meta.sha.clone());
+        if intro_pos.is_none() && changes.touched_trinity {
+            intro_pos = Some(idx);
         }
-        commits.push(trinity_core::api::RewriteCommit {
-            sha: meta.sha.clone(),
-            subject: meta.subject.clone(),
-            disposition,
-            // No per-plan attribution for the all-plans case.
-            foreign: false,
-            strip_paths,
-        });
+        per_commit.push((meta, changes));
     }
+
+    let (intro_sha, commits) = match intro_pos {
+        Some(start) => {
+            let intro_sha = Some(per_commit[start].0.sha.clone());
+            let commits = per_commit[start..]
+                .iter()
+                .map(|(meta, changes)| {
+                    let (disposition, strip_paths) =
+                        classify_rewrite_all(changes, q.include_finalize);
+                    trinity_core::api::RewriteCommit {
+                        sha: meta.sha.clone(),
+                        subject: meta.subject.clone(),
+                        disposition,
+                        // No per-plan attribution for the all-plans case.
+                        foreign: false,
+                        strip_paths,
+                    }
+                })
+                .collect();
+            (intro_sha, commits)
+        }
+        None => (None, Vec::new()),
+    };
 
     Ok(axum::Json(trinity_core::api::PurgeAllPreviewResponse {
         repo: repo_basename.clone(),
@@ -688,20 +708,35 @@ fn classify_rewrite_all(
         .cloned()
         .collect();
 
-    let touched_any_trinity = !changes.trinity_paths.is_empty();
     let touched_other_paths = changes.has_non_plan_code_changes;
-    // Edge case: a commit that ONLY touched `.trinity/finished/`
-    // when `include_finalize=false` has no strippable paths but
-    // still touched `.trinity/`. Treat as KeepVerbatim — there's
-    // nothing to strip, and dropping the commit would mean losing
-    // the finalize snapshot.
+    // Three signals, each with a distinct meaning:
+    //   - touched_trinity: any `.trinity/` path appeared on EITHER
+    //     side of the diff (includes pure deletes and renames out).
+    //   - has_trinity_dest: any `.trinity/` path survived to the
+    //     new tree (excludes pure deletes).
+    //   - has_strippable: of those destinations, any remained
+    //     after the `include_finalize` filter.
+    let touched_trinity = changes.touched_trinity;
+    let has_trinity_dest = !changes.trinity_paths.is_empty();
     let has_strippable = !trinity_paths_filtered.is_empty();
 
-    let disposition = if !touched_any_trinity || !has_strippable {
+    let disposition = if !touched_trinity {
+        // Pure code/non-Trinity commit.
+        RewriteDisposition::KeepVerbatim
+    } else if !has_trinity_dest {
+        // Delete-only Trinity commit — the commit existed solely
+        // to remove Trinity state. Under --all, it disappears.
+        RewriteDisposition::Drop
+    } else if !has_strippable {
+        // Destinations exist but the include_finalize filter
+        // excluded them all (e.g. finalize-only commit with
+        // include_finalize=false). Keep verbatim so the
+        // un-stripped Trinity content survives.
         RewriteDisposition::KeepVerbatim
     } else if touched_other_paths {
         RewriteDisposition::Rewrite
     } else {
+        // Only `.trinity/` paths, all strippable.
         RewriteDisposition::Drop
     };
 
@@ -2056,6 +2091,88 @@ mod wire_tests {
         for c in commits {
             assert_eq!(c["disposition"], "keep_verbatim");
         }
+    }
+
+    #[tokio::test]
+    async fn rewrite_preview_all_slices_at_first_trinity_touch() {
+        // Codex correctness fix: the manifest must start at the
+        // first `.trinity/`-touching commit, not at the repo's
+        // first-parent root. Otherwise pre-intro code commits get
+        // replayed on top of `intro_parent`, duplicating the
+        // branch prefix.
+        let dir = init_repo();
+        write_file(dir.path(), "README.md", "seed\n");
+        commit(dir.path(), "seed");
+        write_file(dir.path(), "src/main.rs", "fn main() {}\n");
+        commit(dir.path(), "early code");
+        write_file(dir.path(), ".trinity/plans/foo.md", "# foo\n");
+        commit(dir.path(), "add foo");
+        write_file(dir.path(), "src/lib.rs", "// later code\n");
+        commit(dir.path(), "later code");
+        let runtime = Arc::new(Runtime::new());
+        runtime.add_repo(dir.path().to_path_buf()).await.unwrap();
+        let state = AppState {
+            runtime,
+            watchers: Arc::new(Mutex::new(std::collections::BTreeMap::new())),
+            bundle: Bundle::Disk(std::path::PathBuf::from("/dev/null")),
+            repos_path: std::path::PathBuf::from("/dev/null"),
+        };
+        let app = router(state);
+        let basename = repo_basename(&dir);
+        let req = Request::builder()
+            .method("GET")
+            .uri(format!("/api/repos/{basename}/rewrite_preview_all"))
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let v = body_json(resp).await;
+        let commits = v["commits"].as_array().unwrap();
+        assert_eq!(
+            commits.len(),
+            2,
+            "should slice at intro: foo + later-code (2), NOT seed + early + foo + later (4)"
+        );
+        assert_eq!(commits[0]["subject"], "add foo");
+        assert_eq!(commits[1]["subject"], "later code");
+    }
+
+    #[tokio::test]
+    async fn rewrite_preview_all_drops_delete_only_trinity_commit() {
+        // Codex correctness fix: a commit that only deletes a
+        // `.trinity/` path must Drop under --all, not survive as
+        // KeepVerbatim. trinity_paths is destinations-only (delete
+        // has no destination); touched_trinity catches this.
+        let dir = init_repo();
+        write_file(dir.path(), ".trinity/stubs/foo.md", "# stub\n");
+        commit(dir.path(), "add stub");
+        std::fs::remove_file(dir.path().join(".trinity/stubs/foo.md")).unwrap();
+        commit(dir.path(), "remove stub");
+        let runtime = Arc::new(Runtime::new());
+        runtime.add_repo(dir.path().to_path_buf()).await.unwrap();
+        let state = AppState {
+            runtime,
+            watchers: Arc::new(Mutex::new(std::collections::BTreeMap::new())),
+            bundle: Bundle::Disk(std::path::PathBuf::from("/dev/null")),
+            repos_path: std::path::PathBuf::from("/dev/null"),
+        };
+        let app = router(state);
+        let basename = repo_basename(&dir);
+        let req = Request::builder()
+            .method("GET")
+            .uri(format!("/api/repos/{basename}/rewrite_preview_all"))
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let v = body_json(resp).await;
+        let commits = v["commits"].as_array().unwrap();
+        assert_eq!(commits.len(), 2);
+        assert_eq!(commits[0]["disposition"], "drop", "add-stub commit");
+        assert_eq!(
+            commits[1]["disposition"], "drop",
+            "delete-only Trinity commit must Drop, not KeepVerbatim",
+        );
     }
 
     #[tokio::test]
