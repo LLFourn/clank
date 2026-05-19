@@ -26,6 +26,14 @@ pub struct CommitChanges {
     /// finalize-tree state and to check the finalize rule
     /// chronologically.
     pub finalize_changes: Vec<FinalizeChange>,
+    /// Every repo-relative path under `.trinity/` this commit's
+    /// diff added/modified/renamed into existence. Source of truth
+    /// for "all-plans purge" strip_paths — captures the union of
+    /// plan files, finalize snapshots, AND non-plan Trinity
+    /// metadata (`.trinity/.gitignore`, stubs, any future
+    /// `.trinity/**` paths). Deletions are absent because they
+    /// don't put anything in the new tree to strip. Sorted, deduped.
+    pub trinity_paths: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -141,6 +149,7 @@ mod tests {
             plan_touches: touches,
             has_non_plan_code_changes: code,
             finalize_changes: Vec::new(),
+            trinity_paths: Vec::new(),
         }
     }
 

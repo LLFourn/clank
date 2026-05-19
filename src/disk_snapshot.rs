@@ -178,6 +178,7 @@ pub fn apply_commit(state: &mut RepoState, carry: &mut FoldCarry, event: &Commit
                 .collect(),
             has_non_plan_code_changes: event.changes.has_non_plan_code_changes,
             finalize_changes: event.changes.finalize_changes.clone(),
+            trinity_paths: event.changes.trinity_paths.clone(),
         }
     } else {
         event.changes.clone()
@@ -570,6 +571,7 @@ mod tests {
                 plan_touches: touches,
                 has_non_plan_code_changes: has_code,
                 finalize_changes: Vec::new(),
+                trinity_paths: Vec::new(),
             },
         }
     }
@@ -587,6 +589,7 @@ mod tests {
                 plan_touches: touches,
                 has_non_plan_code_changes: false,
                 finalize_changes: finalize,
+                trinity_paths: Vec::new(),
             },
         }
     }
@@ -965,6 +968,7 @@ mod tests {
                         plan_touches: vec![],
                         has_non_plan_code_changes: true,
                         finalize_changes: vec![upsert("foo", "alice.md", "APPROVE")],
+                        trinity_paths: Vec::new(),
                     },
                 },
             ]),
@@ -1012,6 +1016,7 @@ mod tests {
                         plan_touches: vec![revise_with_body("foo", "# v2 final\n")],
                         has_non_plan_code_changes: false,
                         finalize_changes: vec![upsert("foo", "alice.md", "APPROVE")],
+                        trinity_paths: Vec::new(),
                     },
                 },
             ]),
@@ -1103,6 +1108,7 @@ mod tests {
                 plan_touches: vec![intro_with_body("foo", "# foo\n")],
                 has_non_plan_code_changes: false,
                 finalize_changes: Vec::new(),
+                trinity_paths: Vec::new(),
             },
         };
         let state = derive_state(PathBuf::from("/r"), snap(vec![event_at("c1c1", 100)]));

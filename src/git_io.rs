@@ -479,6 +479,7 @@ fn parse_diff_tree(stdout: &str) -> Result<ParsedDiffTree, GitIoError> {
     let mut finalize_changes: Vec<FinalizeChange> = Vec::new();
     let mut finalize_upserts: Vec<FinalizeUpsertPath> = Vec::new();
     let mut plan_body_paths: Vec<(usize, PathBuf)> = Vec::new();
+    let mut trinity_paths: Vec<String> = Vec::new();
 
     for line in stdout.lines() {
         let line = line.trim_end_matches('\r');
@@ -506,6 +507,17 @@ fn parse_diff_tree(stdout: &str) -> Result<ParsedDiffTree, GitIoError> {
         let status_char = status.chars().next().unwrap_or(' ');
 
         let new_rel = PathBuf::from(new_path);
+        // Track every `.trinity/`-prefixed destination path the
+        // commit added/modified/renamed. This is the source of
+        // truth for the all-plans purge endpoint — captures plan
+        // files, finalize files, AND non-plan Trinity paths
+        // (`.trinity/.gitignore`, stubs, anything else). Skip pure
+        // deletions: their "new path" is absent from the resulting
+        // tree, so there's nothing to strip.
+        let is_pure_delete = status_char == 'D' && !is_rename;
+        if new_rel.starts_with(".trinity") && !is_pure_delete {
+            trinity_paths.push(new_path.to_string());
+        }
         let new_is_plan = is_plan_path(&new_rel);
         let old_is_plan = old_path
             .map(|p| is_plan_path(&PathBuf::from(p)))
@@ -622,11 +634,14 @@ fn parse_diff_tree(stdout: &str) -> Result<ParsedDiffTree, GitIoError> {
         }
     }
 
+    trinity_paths.sort();
+    trinity_paths.dedup();
     Ok(ParsedDiffTree {
         changes: CommitChanges {
             plan_touches,
             has_non_plan_code_changes,
             finalize_changes,
+            trinity_paths,
         },
         finalize_upserts,
         plan_body_paths,

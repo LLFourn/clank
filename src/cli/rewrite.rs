@@ -9,15 +9,29 @@
 
 use std::path::Path;
 
-use trinity_core::api::{RewriteCommit, RewriteDisposition, RewritePreviewResponse};
+use trinity_core::api::{RewriteCommit, RewriteDisposition};
+use trinity_core::ids::CommitSha;
 
-/// Engine inputs. `dry == true` makes the engine compute everything
-/// up to the first `commit-tree` / `update-ref` call and then exit
-/// without producing any git objects or moving refs.
+/// Engine inputs. Unpacked fields so both single-plan and all-plans
+/// preview responses can feed the same engine. `dry == true` makes
+/// the engine compute everything up to the first `commit-tree` /
+/// `update-ref` call and then exit without producing any git
+/// objects or moving refs.
 #[derive(Debug)]
 pub struct RewriteOpts<'a> {
     pub repo: &'a Path,
-    pub preview: &'a RewritePreviewResponse,
+    /// Earliest commit in the rewrite range. `None` is treated as
+    /// "nothing to rewrite" — the engine refuses; callers should
+    /// short-circuit before invoking.
+    pub intro_sha: Option<&'a CommitSha>,
+    /// Branch tip the preview was computed against. Used as the
+    /// expected-old-value for the conditional in-place update-ref.
+    pub head_sha: &'a CommitSha,
+    /// False if the range contains a merge commit. Engine refuses
+    /// in that case.
+    pub linear: bool,
+    /// Per-commit manifest, in chronological order.
+    pub commits: &'a [RewriteCommit],
     /// `None` rewrites the current branch in place; `Some(name)`
     /// writes the rewritten chain to a fresh branch. Refuses if the
     /// branch already exists.
@@ -38,16 +52,14 @@ pub struct RewriteOutcome {
 /// - dirty working tree
 /// - `--into-branch` pointing at an existing branch
 pub async fn run(opts: RewriteOpts<'_>) -> anyhow::Result<RewriteOutcome> {
-    let preview = opts.preview;
-
-    if !preview.linear {
+    if !opts.linear {
         anyhow::bail!(
             "range contains a merge commit; refusing to rewrite (merge-tree \
              rewriting is out of scope)",
         );
     }
-    let Some(intro) = preview.intro_sha.as_ref() else {
-        anyhow::bail!("plan has no intro commit; nothing to rewrite");
+    let Some(intro) = opts.intro_sha else {
+        anyhow::bail!("rewrite range is empty; nothing to do");
     };
 
     if working_tree_dirty(opts.repo)? {
@@ -64,20 +76,19 @@ pub async fn run(opts: RewriteOpts<'_>) -> anyhow::Result<RewriteOutcome> {
     }
 
     let intro_parent = parent_of(opts.repo, intro.as_str())?;
-    let plan = build_plan(&preview.commits, intro_parent.as_deref());
+    let plan = build_plan(opts.commits, intro_parent.as_deref());
 
     if opts.dry {
-        print_dry_run(preview, &plan);
+        print_dry_run(opts.intro_sha, opts.head_sha, &plan);
         return Ok(RewriteOutcome::default());
     }
 
     let new_tip = apply_plan(opts.repo, &plan, intro_parent.as_deref()).await?;
     let updated_branch = match opts.into_branch {
         Some(name) => {
-            // Atomic "must not already exist": `update-ref -Z`-style
-            // syntax with the all-zero old value tells git to refuse
-            // if the ref exists. We already checked once above, but
-            // this closes the race between check and update.
+            // Atomic "must not already exist": all-zero old value
+            // tells git to refuse if the ref exists. Closes the
+            // race between `branch_exists` and `update-ref`.
             git_run(
                 opts.repo,
                 &[
@@ -101,7 +112,7 @@ pub async fn run(opts: RewriteOpts<'_>) -> anyhow::Result<RewriteOutcome> {
                     "update-ref",
                     &format!("refs/heads/{current}"),
                     &new_tip,
-                    preview.head_sha.as_str(),
+                    opts.head_sha.as_str(),
                 ],
             )
             .map_err(|e| {
@@ -109,7 +120,7 @@ pub async fn run(opts: RewriteOpts<'_>) -> anyhow::Result<RewriteOutcome> {
                     "branch `{current}` moved between preview and rewrite \
                      (expected {}); aborting to avoid losing commits — re-run \
                      to refresh the preview. underlying: {e}",
-                    short(preview.head_sha.as_str()),
+                    short(opts.head_sha.as_str()),
                 )
             })?;
             // Re-sync the worktree to the new tip.
@@ -155,16 +166,14 @@ fn build_plan(commits: &[RewriteCommit], intro_parent: Option<&str>) -> Executio
     }
 }
 
-fn print_dry_run(preview: &RewritePreviewResponse, plan: &ExecutionPlan) {
+fn print_dry_run(intro_sha: Option<&CommitSha>, head_sha: &CommitSha, plan: &ExecutionPlan) {
     println!(
         "dry-run: would rewrite {} commit(s) from {} to {}",
         plan.steps.len(),
-        preview
-            .intro_sha
-            .as_ref()
+        intro_sha
             .map(|s| short(s.as_str()))
             .unwrap_or_else(|| "(none)".into()),
-        short(preview.head_sha.as_str()),
+        short(head_sha.as_str()),
     );
     println!(
         "starting parent: {}",
@@ -576,7 +585,10 @@ mod tests {
         );
         let outcome = super::run(RewriteOpts {
             repo: dir.path(),
-            preview: &preview,
+            intro_sha: preview.intro_sha.as_ref(),
+            head_sha: &preview.head_sha,
+            linear: preview.linear,
+            commits: &preview.commits,
             into_branch: Some("purged"),
             dry: false,
         })
@@ -621,7 +633,10 @@ mod tests {
         );
         let outcome = super::run(RewriteOpts {
             repo: dir.path(),
-            preview: &preview,
+            intro_sha: preview.intro_sha.as_ref(),
+            head_sha: &preview.head_sha,
+            linear: preview.linear,
+            commits: &preview.commits,
             into_branch: Some("dry-target"),
             dry: true,
         })
@@ -660,7 +675,10 @@ mod tests {
         );
         let err = super::run(RewriteOpts {
             repo: dir.path(),
-            preview: &preview,
+            intro_sha: preview.intro_sha.as_ref(),
+            head_sha: &preview.head_sha,
+            linear: preview.linear,
+            commits: &preview.commits,
             into_branch: Some("already-exists"),
             dry: false,
         })
@@ -703,7 +721,10 @@ mod tests {
         );
         let outcome = super::run(RewriteOpts {
             repo: dir.path(),
-            preview: &preview,
+            intro_sha: preview.intro_sha.as_ref(),
+            head_sha: &preview.head_sha,
+            linear: preview.linear,
+            commits: &preview.commits,
             into_branch: Some("purged"),
             dry: false,
         })
@@ -741,7 +762,10 @@ mod tests {
 
         let err = super::run(RewriteOpts {
             repo: dir.path(),
-            preview: &preview,
+            intro_sha: preview.intro_sha.as_ref(),
+            head_sha: &preview.head_sha,
+            linear: preview.linear,
+            commits: &preview.commits,
             into_branch: None, // in-place — triggers the conditional update
             dry: false,
         })
@@ -771,7 +795,10 @@ mod tests {
         };
         let err = super::run(RewriteOpts {
             repo: dir.path(),
-            preview: &preview,
+            intro_sha: preview.intro_sha.as_ref(),
+            head_sha: &preview.head_sha,
+            linear: preview.linear,
+            commits: &preview.commits,
             into_branch: Some("x"),
             dry: false,
         })

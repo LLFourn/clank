@@ -36,7 +36,10 @@ pub async fn run(args: PurgeArgs) -> anyhow::Result<()> {
 
     let outcome = run_rewrite(RewriteOpts {
         repo: &repo,
-        preview: &preview,
+        intro_sha: preview.intro_sha.as_ref(),
+        head_sha: &preview.head_sha,
+        linear: preview.linear,
+        commits: &preview.commits,
         into_branch: args.into_branch.as_deref(),
         dry: args.dry,
     })
