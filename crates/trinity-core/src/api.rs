@@ -478,7 +478,7 @@ pub enum WaitForWorkResponse {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "error", rename_all = "snake_case")]
 pub enum McpErrorPayload {
-    /// `wait_for_work` / `get_context`: caller passed `plan_id`
+    /// `wait_for_work` / `work_context`: caller passed `plan_id`
     /// omitted (or blank) and the daemon couldn't infer a single
     /// active plan in the scoped repo.
     NoActivePlan { repo: String, message: String },

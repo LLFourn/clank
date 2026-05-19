@@ -190,27 +190,17 @@ async fn start_plan(state: &AppState, req: &ToolCallRequest) -> Result<Value, To
         .map_err(|e| ToolError::Invalid(format!("args: {e}")))?;
     let plan_key =
         PlanKey::parse(&args.slug).map_err(|e| ToolError::Invalid(format!("invalid slug: {e}")))?;
-    let repo = resolve_repo(&req.cwd).await?;
-    let basename = RepoBasename::from_repo_root(&repo).ok_or_else(|| {
-        ToolError::Invalid(format!(
-            "repo path has no usable basename: {}",
-            repo.display()
-        ))
-    })?;
+    let repo_initial = resolve_repo(&req.cwd).await?;
     let plan_path = PathBuf::from(format!(".trinity/plans/{}.md", args.slug));
 
-    // Atomically register this repo (or report a basename collision)
-    // BEFORE any disk mutation. `ensure_registered_or_reject` is the only
-    // place where the collision is detected under a single lock-held
-    // critical section in `Runtime::add_repo`; doing it first means two
-    // concurrent `start_plan` calls from basename-twins both lose disk
-    // mutations on the loser side (the first wins registration; the
-    // second returns Forbidden without ever touching disk).
-    ensure_registered_or_reject(state, &repo).await?;
-    ensure_gitignore(&repo)?;
-    persist_repo_in_registry(&state.repos_path, &repo)
-        .map_err(|e| ToolError::Internal(anyhow::anyhow!("register repo: {e}")))?;
-    ensure_repo_watcher(state, repo.clone()).await;
+    // Run the once-per-repo bootstrap (canonicalize + register +
+    // .gitignore + registry-persist + watcher-spawn) atomically
+    // BEFORE any plan-file mutation. The collision check inside
+    // `ensure_registered_or_reject` is the only place where two
+    // concurrent `start_plan` calls from basename-twins both lose
+    // disk mutations on the loser side (the first wins registration;
+    // the second returns Forbidden without touching plan files).
+    let BootstrappedRepo { repo, basename, .. } = bootstrap_repo(state, repo_initial).await?;
 
     {
         let trinity = state.runtime.state();
@@ -393,6 +383,45 @@ struct WatchRepoArgs {
     path: Option<String>,
 }
 
+/// Result of `bootstrap_repo`. Carries the canonical repo path and
+/// whether the registration was already in the watched set when the
+/// call started.
+struct BootstrappedRepo {
+    repo: PathBuf,
+    basename: RepoBasename,
+    already_watched: bool,
+}
+
+/// Run the full once-per-repo bootstrap: register with the runtime
+/// (basename-collision-safe via `ensure_registered_or_reject`), write
+/// the `.gitignore` entries, persist the on-disk registry, and spawn
+/// the notify watcher. Used by `watch_repo` (returns the outcome to
+/// the caller) and `start_plan` (which then creates a plan file on
+/// top of the bootstrapped repo).
+async fn bootstrap_repo(state: &AppState, repo: PathBuf) -> Result<BootstrappedRepo, ToolError> {
+    let basename = RepoBasename::from_repo_root(&repo).ok_or_else(|| {
+        ToolError::Invalid(format!(
+            "repo path has no usable basename: {}",
+            repo.display()
+        ))
+    })?;
+    let already_watched = {
+        let trinity = state.runtime.state();
+        let trinity = trinity.lock().await;
+        trinity.repos.contains_key(&repo)
+    };
+    ensure_registered_or_reject(state, &repo).await?;
+    ensure_gitignore(&repo)?;
+    persist_repo_in_registry(&state.repos_path, &repo)
+        .map_err(|e| ToolError::Internal(anyhow::anyhow!("register repo: {e}")))?;
+    ensure_repo_watcher(state, repo.clone()).await;
+    Ok(BootstrappedRepo {
+        repo,
+        basename,
+        already_watched,
+    })
+}
+
 async fn watch_repo(state: &AppState, req: &ToolCallRequest) -> Result<Value, ToolError> {
     let args: WatchRepoArgs = if req.arguments.is_null() {
         WatchRepoArgs { path: None }
@@ -421,44 +450,11 @@ async fn watch_repo(state: &AppState, req: &ToolCallRequest) -> Result<Value, To
             dunce::canonicalize(&abs).unwrap_or(abs)
         }
     };
-    let basename = RepoBasename::from_repo_root(&repo).ok_or_else(|| {
-        ToolError::Invalid(format!(
-            "repo path has no usable basename: {}",
-            repo.display()
-        ))
-    })?;
-
-    // Check whether this repo was already in the watched set so we
-    // can report it back as `already_watching` vs `registered`. The
-    // brief race between this check and `add_repo_if_unknown` is
-    // cosmetic for the response shape; the registration itself is
-    // idempotent.
-    let already_known = {
-        let trinity = state.runtime.state();
-        let trinity = trinity.lock().await;
-        trinity.repos.contains_key(&repo)
-    };
-
-    match state
-        .runtime
-        .add_repo_if_unknown(repo.clone())
-        .await
-        .map_err(|e| ToolError::Internal(anyhow::anyhow!(e)))?
-    {
-        crate::runtime::RegisterOutcome::Registered => {}
-        crate::runtime::RegisterOutcome::ShadowedByOther { claimed_by } => {
-            return Err(ToolError::Forbidden(format!(
-                "repo basename `{}` is already watched at {}; rename one to disambiguate",
-                basename.as_str(),
-                claimed_by.display()
-            )));
-        }
-    }
-
+    let outcome = bootstrap_repo(state, repo).await?;
     let response = trinity_core::api::WatchRepoResponse {
-        repo: repo.to_string_lossy().into_owned(),
-        basename: basename.as_str().to_string(),
-        status: if already_known {
+        repo: outcome.repo.to_string_lossy().into_owned(),
+        basename: outcome.basename.as_str().to_string(),
+        status: if outcome.already_watched {
             trinity_core::api::WatchRepoStatus::AlreadyWatching
         } else {
             trinity_core::api::WatchRepoStatus::Registered
@@ -666,7 +662,17 @@ struct CandidateSnapshot {
     plan_key: PlanKey,
     plan_path: String,
     body_hash: crate::lifecycle::ContentHash,
-    lifecycle: trinity_core::vocab::PlanLifecycle,
+    is_frozen: bool,
+}
+
+/// Three-way outcome of consulting `active_selections` under the
+/// runtime lock. `MissingFromPlans` and a stale `Present` both
+/// trigger a stale-selection drop in `resolve_plan_id`; `NotSelected`
+/// is the no-op (nothing to drop, nothing to validate).
+enum SelectionConsult {
+    NotSelected,
+    MissingFromPlans,
+    Present(CandidateSnapshot),
 }
 
 /// Inference rules:
@@ -727,26 +733,38 @@ pub async fn resolve_plan_id(
 
     // Snapshot the repo's candidate plans + any active-work selection
     // under the runtime mutex, then drop the lock before disk reads.
-    let (selection_snapshot, candidates) = {
+    //
+    // The three-way `SelectionConsult` distinguishes "no selection
+    // exists" (don't try to drop anything) from "selection exists but
+    // its plan is gone from the fold" (drop the stale entry) from
+    // "selection points at a real plan; validate it on disk."
+    let (selection_consult, candidates) = {
         let trinity = state.runtime.state();
         let trinity = trinity.lock().await;
         let Some(repo_state) = trinity.repos.get(&repo_path) else {
             return Ok(PlanIdResolution::NoActives { repo: repo_path });
         };
-        let selection_snapshot = author
-            .as_ref()
-            .and_then(|a| {
-                trinity
+        let selection_consult = match author.as_ref() {
+            None => SelectionConsult::NotSelected,
+            Some(a) => {
+                let key = trinity
                     .active_selections
                     .get(&(basename.clone(), a.clone()))
-            })
-            .and_then(|key| repo_state.plans.get(key))
-            .map(|plan| CandidateSnapshot {
-                plan_key: plan.id.clone(),
-                plan_path: plan.plan_path.clone(),
-                body_hash: plan.body_hash.clone(),
-                lifecycle: plan.lifecycle(),
-            });
+                    .cloned();
+                match key {
+                    None => SelectionConsult::NotSelected,
+                    Some(key) => match repo_state.plans.get(&key) {
+                        None => SelectionConsult::MissingFromPlans,
+                        Some(plan) => SelectionConsult::Present(CandidateSnapshot {
+                            plan_key: plan.id.clone(),
+                            plan_path: plan.plan_path.clone(),
+                            body_hash: plan.body_hash.clone(),
+                            is_frozen: plan.is_frozen(),
+                        }),
+                    },
+                }
+            }
+        };
         let candidates: Vec<CandidateSnapshot> = repo_state
             .plans
             .values()
@@ -755,39 +773,46 @@ pub async fn resolve_plan_id(
                 plan_key: p.id.clone(),
                 plan_path: p.plan_path.clone(),
                 body_hash: p.body_hash.clone(),
-                lifecycle: p.lifecycle(),
+                is_frozen: p.is_frozen(),
             })
             .collect();
-        (selection_snapshot, candidates)
+        (selection_consult, candidates)
     };
 
     // Consult the active-work selection first. Validation requires a
-    // disk read but the snapshot is already in hand.
-    if let Some(selection) = selection_snapshot {
-        let status = crate::responses::compute_plan_worktree_status_parts(
-            &repo_path,
-            &selection.plan_path,
-            &selection.body_hash,
-        )
-        .map_err(|e| ToolError::Internal(anyhow::anyhow!(e)))?;
-        let is_visible = selection.lifecycle == trinity_core::vocab::PlanLifecycle::Active
-            && status != crate::repo_state::PlanWorktreeStatus::PlanFileMissing;
-        if is_visible {
-            return Ok(PlanIdResolution::Resolved(PlanId::new(
-                basename,
-                selection.plan_key,
-            )));
+    // disk read but the snapshot is already in hand. Both
+    // "missing from plans" and "stale on disk" fall through to normal
+    // counting AND drop the stale entry from memory.
+    let mut drop_selection = false;
+    match selection_consult {
+        SelectionConsult::NotSelected => {}
+        SelectionConsult::MissingFromPlans => {
+            drop_selection = true;
         }
-        // Stale: drop it under a brief lock so a parallel reader
-        // doesn't keep observing the invalid selection.
-        if let Some(a) = author.as_ref() {
-            let trinity = state.runtime.state();
-            let mut trinity = trinity.lock().await;
-            trinity
-                .active_selections
-                .remove(&(basename.clone(), a.clone()));
+        SelectionConsult::Present(selection) => {
+            let status = crate::responses::compute_plan_worktree_status_parts(
+                &repo_path,
+                &selection.plan_path,
+                &selection.body_hash,
+            )
+            .map_err(|e| ToolError::Internal(anyhow::anyhow!(e)))?;
+            let is_visible = !selection.is_frozen
+                && status != crate::repo_state::PlanWorktreeStatus::PlanFileMissing;
+            if is_visible {
+                return Ok(PlanIdResolution::Resolved(PlanId::new(
+                    basename,
+                    selection.plan_key,
+                )));
+            }
+            drop_selection = true;
         }
-        // Fall through to normal counting.
+    }
+    if drop_selection && let Some(a) = author.as_ref() {
+        let trinity = state.runtime.state();
+        let mut trinity = trinity.lock().await;
+        trinity
+            .active_selections
+            .remove(&(basename.clone(), a.clone()));
     }
 
     // Active-visible filter on the snapshot candidates. Each
@@ -817,7 +842,11 @@ pub async fn resolve_plan_id(
                 .map(|c| trinity_core::api::PlanCandidate {
                     plan_id: PlanId::new(basename.clone(), c.plan_key).to_string(),
                     current_path: c.plan_path,
-                    lifecycle: c.lifecycle,
+                    lifecycle: if c.is_frozen {
+                        trinity_core::vocab::PlanLifecycle::Finished
+                    } else {
+                        trinity_core::vocab::PlanLifecycle::Active
+                    },
                 })
                 .collect();
             Ok(PlanIdResolution::Ambiguous { candidates })

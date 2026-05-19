@@ -950,6 +950,159 @@ async fn watch_repo_registers_fresh_repo_and_is_idempotent() {
     assert_eq!(first["result"]["repo"], second["result"]["repo"]);
 }
 
+/// `wait_for_work` is the ambiguity-prone surface in practice. Two
+/// active plans + a `set_active_work` selection → WFW resolves to
+/// the selected plan instead of returning `ambiguous_plan`. Without
+/// the selection, the same call raises ambiguous.
+#[tokio::test]
+async fn set_active_work_routes_wait_for_work_through_selection() {
+    let dir = init_repo();
+    write_file(dir.path(), ".trinity/plans/foo.md", "# foo\n");
+    commit(dir.path(), "Add foo");
+    write_file(dir.path(), ".trinity/plans/bar.md", "# bar\n");
+    commit(dir.path(), "Add bar");
+
+    let (url, handle) = spawn_daemon(dir.path()).await;
+    let client = reqwest::Client::new();
+
+    // Baseline: WFW without plan_id is ambiguous.
+    let ambiguous: serde_json::Value = client
+        .post(format!("{}/internal/tool_call", url))
+        .json(&json!({
+            "cwd": dir.path(),
+            "tool": "wait_for_work",
+            "arguments": {
+                "role": "reviewers",
+                "author_label": "alice",
+                "timeout_secs": 1
+            }
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(ambiguous["result"]["error"], "ambiguous_plan");
+
+    // Set selection → WFW now resolves to foo and returns work for it.
+    client
+        .post(format!("{}/internal/tool_call", url))
+        .json(&json!({
+            "cwd": dir.path(),
+            "tool": "set_active_work",
+            "arguments": {
+                "plan_id": plan_id_for(&dir, "foo"),
+                "author_label": "alice"
+            }
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    let resolved: serde_json::Value = client
+        .post(format!("{}/internal/tool_call", url))
+        .json(&json!({
+            "cwd": dir.path(),
+            "tool": "wait_for_work",
+            "arguments": {
+                "role": "reviewers",
+                "author_label": "alice",
+                "timeout_secs": 1
+            }
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    handle.abort();
+    assert_eq!(
+        resolved["result"]["plan_id"].as_str().unwrap(),
+        plan_id_for(&dir, "foo"),
+        "WFW should route to the selected plan; got: {resolved}"
+    );
+}
+
+/// Stale-selection drop: select a plan, delete its file from the
+/// worktree, then resolve. Resolver must fall through to the other
+/// active plan, AND the selection must be cleared from memory so
+/// subsequent calls don't keep re-validating a doomed entry.
+#[tokio::test]
+async fn stale_active_work_selection_drops_and_falls_through() {
+    let dir = init_repo();
+    write_file(dir.path(), ".trinity/plans/foo.md", "# foo\n");
+    commit(dir.path(), "Add foo");
+    write_file(dir.path(), ".trinity/plans/bar.md", "# bar\n");
+    commit(dir.path(), "Add bar");
+
+    let (url, handle) = spawn_daemon(dir.path()).await;
+    let client = reqwest::Client::new();
+
+    // Select foo.
+    client
+        .post(format!("{}/internal/tool_call", url))
+        .json(&json!({
+            "cwd": dir.path(),
+            "tool": "set_active_work",
+            "arguments": {
+                "plan_id": plan_id_for(&dir, "foo"),
+                "author_label": "alice"
+            }
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    // Render foo invisible by deleting its worktree file.
+    std::fs::remove_file(dir.path().join(".trinity/plans/foo.md")).unwrap();
+
+    // work_context without plan_id should fall through to bar (the
+    // only active+visible plan).
+    let resolved: serde_json::Value = client
+        .post(format!("{}/internal/tool_call", url))
+        .json(&json!({
+            "cwd": dir.path(),
+            "tool": "work_context",
+            "arguments": { "author_label": "alice" }
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        resolved["result"]["plan_id"].as_str().unwrap(),
+        plan_id_for(&dir, "bar"),
+        "resolver should drop stale selection and route to bar; got: {resolved}"
+    );
+
+    // Restore foo's file. The selection should be gone (dropped on
+    // the previous call), so resolution is ambiguous again, not
+    // sticky-on-foo.
+    write_file(dir.path(), ".trinity/plans/foo.md", "# foo\n");
+    let after_restore: serde_json::Value = client
+        .post(format!("{}/internal/tool_call", url))
+        .json(&json!({
+            "cwd": dir.path(),
+            "tool": "work_context",
+            "arguments": { "author_label": "alice" }
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    handle.abort();
+    assert_eq!(
+        after_restore["result"]["error"], "ambiguous_plan",
+        "stale selection must have been cleared; got: {after_restore}"
+    );
+}
+
 #[tokio::test]
 async fn set_active_work_lets_wfw_resolve_amid_multiple_active_plans() {
     // Two active plans in one repo. Without a selection, work_context
