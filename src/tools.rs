@@ -57,11 +57,46 @@ pub fn catalog() -> Vec<ToolDescriptor> {
             }),
         },
         ToolDescriptor {
+            name: "watch_repo".to_string(),
+            description: "Register a git repo with the trinity daemon. Idempotent — \
+                          re-registering an already-watched repo returns \
+                          `status: \"already_watching\"`.\n\n\
+                          This is the modern bootstrap primitive: it does ONLY the \
+                          repo-watching work (resolve canonical path, derive basename, add \
+                          to the watched set). Plan-file creation is a filesystem convention: \
+                          write `.trinity/plans/<slug>.md` and `git commit` it; the daemon's \
+                          fold pipeline picks it up automatically.\n\n\
+                          Inputs:\n\
+                          - `path` (optional): absent uses the caller's cwd-repo (`git \
+                            rev-parse --show-toplevel`); absolute path uses it as-is; \
+                            relative path is resolved against cwd. Basename-only is NOT \
+                            accepted for registration — an unknown basename has no root to \
+                            resolve to.\n\n\
+                          Response: `{ repo, basename, status }` where `status` is \
+                          `\"registered\"` or `\"already_watching\"`.\n\n\
+                          Errors: `Forbidden` when the basename is shadowed by a different \
+                          canonical path already in the watched set."
+                .to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "Optional repo path. Absolute or relative-from-cwd. Absent = cwd."
+                    }
+                },
+                "additionalProperties": false
+            }),
+        },
+        ToolDescriptor {
             name: "start_plan".to_string(),
             description: "Create a new plan file at `.trinity/plans/<slug>.md` in the caller's \
                           cwd-repo. The daemon resolves the cwd-repo via `git rev-parse \
                           --show-toplevel`, canonicalizes it, and registers it with the \
                           basename derived from the working-tree root directory.\n\n\
+                          Prefer `watch_repo` + a filesystem write to \
+                          `.trinity/plans/<slug>.md` for new plans — `start_plan` remains as \
+                          a convenience wrapper that combines both.\n\n\
                           Adopts an existing file (never overwrites body). Ensures \
                           `.gitignore` excludes `.trinity/feedback/` and `.trinity/cache/` \
                           but keeps `.trinity/plans/` tracked.\n\n\

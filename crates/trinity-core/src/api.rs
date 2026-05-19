@@ -309,6 +309,25 @@ pub struct SetActiveWorkResponse {
     pub plan_id: String,
 }
 
+/// MCP `watch_repo` outcome. `Registered` means the daemon
+/// learned about this repo as a result of the call; `AlreadyWatching`
+/// is the idempotent no-op when the repo is already in the watched
+/// set.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WatchRepoStatus {
+    Registered,
+    AlreadyWatching,
+}
+
+/// MCP `watch_repo` response.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WatchRepoResponse {
+    pub repo: String,
+    pub basename: String,
+    pub status: WatchRepoStatus,
+}
+
 /// MCP `clear_active_work` response. Idempotent — `ok: true`
 /// regardless of whether a selection was present.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

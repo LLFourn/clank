@@ -261,6 +261,28 @@ fn schema_clear_active_work_response() {
 }
 
 #[test]
+fn schema_watch_repo_response_registered() {
+    let v = serde_json::to_value(WatchRepoResponse {
+        repo: "/abs/path/to/repo".into(),
+        basename: "repo".into(),
+        status: WatchRepoStatus::Registered,
+    })
+    .unwrap();
+    assert_schema("watch_repo_response_registered", &v);
+}
+
+#[test]
+fn schema_watch_repo_response_already_watching() {
+    let v = serde_json::to_value(WatchRepoResponse {
+        repo: "/abs/path/to/repo".into(),
+        basename: "repo".into(),
+        status: WatchRepoStatus::AlreadyWatching,
+    })
+    .unwrap();
+    assert_schema("watch_repo_response_already_watching", &v);
+}
+
+#[test]
 fn schema_plan_detail_response() {
     let v = serde_json::to_value(PlanDetailResponse {
         repo: "/r".into(),

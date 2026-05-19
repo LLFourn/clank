@@ -38,6 +38,7 @@ pub async fn dispatch(state: &AppState, req: &ToolCallRequest) -> Result<Value, 
     match req.tool.as_str() {
         "echo_cwd" => Ok(json!({"cwd": req.cwd})),
         "list_plans" => list_plans(state, req).await,
+        "watch_repo" => watch_repo(state, req).await,
         "start_plan" => start_plan(state, req).await,
         "work_context" => work_context(state, req).await,
         "set_active_work" => set_active_work(state, req).await,
@@ -383,6 +384,86 @@ async fn work_context(state: &AppState, req: &ToolCallRequest) -> Result<Value, 
                 plan_id
             ))
         })?;
+    serde_json::to_value(response).map_err(|e| ToolError::Internal(anyhow::anyhow!(e)))
+}
+
+#[derive(Debug, Deserialize)]
+struct WatchRepoArgs {
+    #[serde(default)]
+    path: Option<String>,
+}
+
+async fn watch_repo(state: &AppState, req: &ToolCallRequest) -> Result<Value, ToolError> {
+    let args: WatchRepoArgs = if req.arguments.is_null() {
+        WatchRepoArgs { path: None }
+    } else {
+        serde_json::from_value(req.arguments.clone())
+            .map_err(|e| ToolError::Invalid(format!("args: {e}")))?
+    };
+    // Path semantics:
+    //   absent      → caller's cwd via `git rev-parse --show-toplevel`
+    //   absolute    → use as-is, canonicalize
+    //   relative    → resolve against cwd, canonicalize
+    let repo = match args
+        .path
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        None => resolve_repo(&req.cwd).await?,
+        Some(raw) => {
+            let raw_path = PathBuf::from(raw);
+            let abs = if raw_path.is_absolute() {
+                raw_path
+            } else {
+                req.cwd.join(raw_path)
+            };
+            dunce::canonicalize(&abs).unwrap_or(abs)
+        }
+    };
+    let basename = RepoBasename::from_repo_root(&repo).ok_or_else(|| {
+        ToolError::Invalid(format!(
+            "repo path has no usable basename: {}",
+            repo.display()
+        ))
+    })?;
+
+    // Check whether this repo was already in the watched set so we
+    // can report it back as `already_watching` vs `registered`. The
+    // brief race between this check and `add_repo_if_unknown` is
+    // cosmetic for the response shape; the registration itself is
+    // idempotent.
+    let already_known = {
+        let trinity = state.runtime.state();
+        let trinity = trinity.lock().await;
+        trinity.repos.contains_key(&repo)
+    };
+
+    match state
+        .runtime
+        .add_repo_if_unknown(repo.clone())
+        .await
+        .map_err(|e| ToolError::Internal(anyhow::anyhow!(e)))?
+    {
+        crate::runtime::RegisterOutcome::Registered => {}
+        crate::runtime::RegisterOutcome::ShadowedByOther { claimed_by } => {
+            return Err(ToolError::Forbidden(format!(
+                "repo basename `{}` is already watched at {}; rename one to disambiguate",
+                basename.as_str(),
+                claimed_by.display()
+            )));
+        }
+    }
+
+    let response = trinity_core::api::WatchRepoResponse {
+        repo: repo.to_string_lossy().into_owned(),
+        basename: basename.as_str().to_string(),
+        status: if already_known {
+            trinity_core::api::WatchRepoStatus::AlreadyWatching
+        } else {
+            trinity_core::api::WatchRepoStatus::Registered
+        },
+    };
     serde_json::to_value(response).map_err(|e| ToolError::Internal(anyhow::anyhow!(e)))
 }
 

@@ -905,6 +905,52 @@ async fn same_stem_different_repos_distinguishable() {
 }
 
 #[tokio::test]
+async fn watch_repo_registers_fresh_repo_and_is_idempotent() {
+    let dir = init_repo();
+    // Don't add the repo via spawn_daemon_with_repos so watch_repo
+    // is the first registration.
+    let (url, handle) = spawn_daemon_with_repos(&[]).await;
+    let client = reqwest::Client::new();
+
+    let first: serde_json::Value = client
+        .post(format!("{}/internal/tool_call", url))
+        .json(&json!({
+            "cwd": dir.path(),
+            "tool": "watch_repo",
+            "arguments": {}
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(first["result"]["status"], "registered");
+    assert!(
+        first["result"]["basename"].as_str().is_some(),
+        "basename should be present: {first}"
+    );
+
+    // Second call is the idempotent no-op.
+    let second: serde_json::Value = client
+        .post(format!("{}/internal/tool_call", url))
+        .json(&json!({
+            "cwd": dir.path(),
+            "tool": "watch_repo",
+            "arguments": {}
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    handle.abort();
+    assert_eq!(second["result"]["status"], "already_watching");
+    assert_eq!(first["result"]["repo"], second["result"]["repo"]);
+}
+
+#[tokio::test]
 async fn set_active_work_lets_wfw_resolve_amid_multiple_active_plans() {
     // Two active plans in one repo. Without a selection, work_context
     // (which calls resolve_plan_id under the hood) raises
