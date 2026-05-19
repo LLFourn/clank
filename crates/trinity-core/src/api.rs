@@ -725,6 +725,14 @@ pub struct RewritePreviewResponse {
     /// In chronological order from `intro_sha` to `head_sha`
     /// (inclusive). Empty when `intro_sha` is `None`.
     pub commits: Vec<RewriteCommit>,
+    /// Strippable paths at HEAD's resulting tree. Used by squash
+    /// mode to compute the correct collapsed tree (HEAD's tree
+    /// minus these paths). The per-commit `strip_paths` values
+    /// in `commits` are NOT sufficient — Drop commits have empty
+    /// `strip_paths` even when they added content that survives
+    /// to HEAD and needs stripping there.
+    #[serde(default)]
+    pub head_strip_paths: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -784,6 +792,11 @@ pub struct PurgeAllPreviewResponse {
     /// commit `strip_paths`).
     pub plans_touched: Vec<crate::ids::PlanKey>,
     pub commits: Vec<RewriteCommit>,
+    /// Strippable paths at HEAD's resulting tree. Source of truth
+    /// for squash mode's collapsed tree. See doc on
+    /// `RewritePreviewResponse.head_strip_paths`.
+    #[serde(default)]
+    pub head_strip_paths: Vec<String>,
 }
 
 // ============================================================

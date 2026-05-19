@@ -51,9 +51,15 @@ async fn run_post_finalize_rewrite(
     stem: &str,
     args: FinishArgs,
 ) -> anyhow::Result<()> {
-    // Refresh the rewrite preview against the new HEAD (which
-    // includes the just-landed finalize commit).
-    let preview = fetch_rewrite_preview(daemon, basename, stem).await?;
+    // `--purge` semantics: strip the plan's `.trinity/` paths from
+    // history (including the just-landed finalize snapshot). Use
+    // include_finalize=true so the snapshot is in the strip set.
+    //
+    // `--squash` without `--purge`: collapse plan-revision commits
+    // into one but PRESERVE the finalize snapshot. Use
+    // include_finalize=false so the snapshot survives the squash.
+    let include_finalize = args.purge;
+    let preview = fetch_rewrite_preview(daemon, basename, stem, include_finalize).await?;
     crate::cli::rewrite::run(crate::cli::rewrite::RewriteOpts {
         repo,
         intro_sha: preview.intro_sha.as_ref(),
@@ -61,11 +67,15 @@ async fn run_post_finalize_rewrite(
         linear: preview.linear,
         commits: &preview.commits,
         into_branch: args.into_branch.as_deref(),
-        dry: false,
+        dry: args.dry,
         allow_rewrite_protected: args.allow_rewrite_protected,
         squash: args.squash.as_deref(),
+        head_strip_paths: &preview.head_strip_paths,
     })
     .await?;
+    if args.dry {
+        return Ok(());
+    }
     if let Some(branch) = args.into_branch.as_deref() {
         println!("rewritten history on branch `{branch}`");
     } else if args.squash.is_some() {
@@ -80,9 +90,11 @@ async fn fetch_rewrite_preview(
     daemon: &str,
     basename: &str,
     stem: &str,
+    include_finalize: bool,
 ) -> anyhow::Result<trinity_core::api::RewritePreviewResponse> {
-    let url =
-        format!("{daemon}/api/plan/{basename}/{stem}.md/rewrite_preview?include_finalize=true",);
+    let url = format!(
+        "{daemon}/api/plan/{basename}/{stem}.md/rewrite_preview?include_finalize={include_finalize}",
+    );
     let resp = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(60))
         .build()?

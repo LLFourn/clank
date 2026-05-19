@@ -624,6 +624,13 @@ async fn api_rewrite_preview(
         });
     }
 
+    // Strip set at HEAD's tree — squash mode's source of truth.
+    // Same predicate as per-commit, computed once against HEAD.
+    let head_strip_paths =
+        crate::git_io::tree_plan_paths(&repo, &head_sha, plan_key.as_str(), q.include_finalize)
+            .await
+            .map_err(|e| AppError::internal(format!("git ls-tree HEAD: {e}")))?;
+
     Ok(axum::Json(trinity_core::api::RewritePreviewResponse {
         plan_id,
         plan_stem,
@@ -631,6 +638,7 @@ async fn api_rewrite_preview(
         head_sha,
         linear,
         commits,
+        head_strip_paths,
     }))
 }
 
@@ -752,6 +760,14 @@ async fn api_rewrite_preview_all(
         None => (None, Vec::new()),
     };
 
+    // Strip set at HEAD's tree for squash mode.
+    let head_strip_paths: Vec<String> = crate::git_io::tree_trinity_paths(&repo_root, &head_sha)
+        .await
+        .map_err(|e| AppError::internal(format!("git ls-tree HEAD: {e}")))?
+        .into_iter()
+        .filter(|p| q.include_finalize || !p.starts_with(".trinity/finished/"))
+        .collect();
+
     Ok(axum::Json(trinity_core::api::PurgeAllPreviewResponse {
         repo: repo_basename.clone(),
         head_sha,
@@ -759,6 +775,7 @@ async fn api_rewrite_preview_all(
         intro_sha,
         plans_touched: plans_seen.into_iter().collect(),
         commits,
+        head_strip_paths,
     }))
 }
 

@@ -61,6 +61,11 @@ pub struct FinishArgs {
     /// combined with `--purge`/`--squash`.
     #[arg(long)]
     pub allow_rewrite_protected: bool,
+    /// Dry-run for `--purge`/`--squash`: emit the rebase-todo
+    /// without creating the finalize commit or moving any refs.
+    /// Ignored on plain `trinity finish`.
+    #[arg(long)]
+    pub dry: bool,
 }
 
 #[derive(Args, Debug)]

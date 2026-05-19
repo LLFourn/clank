@@ -16,6 +16,9 @@ pub async fn run(args: PurgeArgs) -> anyhow::Result<()> {
     let basename = repo_basename(&repo)?;
     let daemon = args.daemon.trim_end_matches('/').to_string();
 
+    if args.all && args.plan.is_some() {
+        anyhow::bail!("--all and a plan argument are mutually exclusive; pass one or the other",);
+    }
     if args.squash.is_some() && args.all {
         // Squashing every plan's history into one commit would
         // lose per-plan boundaries; refuse rather than try.
@@ -30,10 +33,6 @@ pub async fn run(args: PurgeArgs) -> anyhow::Result<()> {
 
     if args.amend {
         return run_amend(&repo, &basename, &daemon, &args).await;
-    }
-
-    if args.all && args.plan.is_some() {
-        anyhow::bail!("--all and a plan argument are mutually exclusive; pass one or the other",);
     }
 
     if args.all {
@@ -68,6 +67,7 @@ async fn run_single(
         dry: args.dry,
         allow_rewrite_protected: args.allow_rewrite_protected,
         squash: args.squash.as_deref(),
+        head_strip_paths: &preview.head_strip_paths,
     })
     .await?;
 
@@ -115,6 +115,7 @@ async fn run_all(
         dry: args.dry,
         allow_rewrite_protected: args.allow_rewrite_protected,
         squash: args.squash.as_deref(),
+        head_strip_paths: &preview.head_strip_paths,
     })
     .await?;
 
@@ -214,6 +215,61 @@ async fn run_amend(
 
     if strip_paths.is_empty() {
         println!("HEAD's tree has no strippable Trinity paths; nothing to amend");
+        return Ok(());
+    }
+
+    // Pre-flights mirror the engine's: dirty worktree and
+    // protected-branch refusal. --amend mutates HEAD in place, so
+    // it gets the same safety constraints as in-place rewrite.
+    let status_out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["status", "--porcelain"])
+        .output()?;
+    if !status_out.status.success()
+        || !String::from_utf8_lossy(&status_out.stdout)
+            .trim()
+            .is_empty()
+    {
+        anyhow::bail!("working tree dirty; commit or stash first");
+    }
+    if !args.allow_rewrite_protected {
+        let current = std::process::Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(["symbolic-ref", "--short", "HEAD"])
+            .output()?;
+        let branch = String::from_utf8_lossy(&current.stdout).trim().to_string();
+        let protected_by_name = matches!(branch.as_str(), "main" | "master");
+        let protected_by_config = std::process::Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(["config", "--get", &format!("branch.{branch}.protect")])
+            .output()
+            .map(|o| {
+                o.status.success()
+                    && matches!(
+                        String::from_utf8_lossy(&o.stdout).trim(),
+                        "true" | "1" | "yes" | "on"
+                    )
+            })
+            .unwrap_or(false);
+        if protected_by_name || protected_by_config {
+            anyhow::bail!(
+                "refusing to amend protected branch `{branch}`. \
+                 Pass `--allow-rewrite-protected` to override."
+            );
+        }
+    }
+
+    if args.dry {
+        println!("# trinity purge --amend preview");
+        println!("# HEAD: {head_sha_str}");
+        println!("# would strip from HEAD's tree:");
+        for p in &strip_paths {
+            println!("#   - {p}");
+        }
+        println!("# (--dry: no commits, no refs touched)");
         return Ok(());
     }
 

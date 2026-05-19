@@ -44,9 +44,16 @@ pub struct RewriteOpts<'a> {
     /// commit on top of `intro_parent`, with the supplied message.
     /// Refuses if any commit in the range is marked `foreign`
     /// (squash can't selectively preserve interleaved foreign
-    /// work). The resulting tree is HEAD's tree minus the union
-    /// of all strip_paths from the manifest.
+    /// work). The resulting tree is HEAD's tree minus
+    /// `head_strip_paths` — Drop commits don't carry per-commit
+    /// `strip_paths`, so unioning the manifest's strip_paths
+    /// would leak content the per-commit replay would have
+    /// removed by skipping.
     pub squash: Option<&'a str>,
+    /// Strippable paths at HEAD's tree (from the daemon's
+    /// preview). The squash mode's source of truth for what to
+    /// strip from the collapsed tree. Empty when not squashing.
+    pub head_strip_paths: &'a [String],
 }
 
 #[derive(Debug, Default)]
@@ -117,7 +124,7 @@ pub async fn run(opts: RewriteOpts<'_>) -> anyhow::Result<RewriteOutcome> {
         apply_squash(
             opts.repo,
             opts.head_sha,
-            &plan,
+            opts.head_strip_paths,
             intro_parent.as_deref(),
             message,
         )
@@ -451,17 +458,17 @@ async fn apply_plan(
 async fn apply_squash(
     repo: &Path,
     head_sha: &CommitSha,
-    plan: &ExecutionPlan,
+    head_strip_paths: &[String],
     intro_parent: Option<&str>,
     message: &str,
 ) -> anyhow::Result<String> {
-    let mut strip_union: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
-    for step in &plan.steps {
-        for p in &step.strip_paths {
-            strip_union.insert(p.as_str());
-        }
-    }
-    let strip: Vec<String> = strip_union.iter().map(|s| s.to_string()).collect();
+    // The strip set is `head_strip_paths` from the daemon's preview
+    // — NOT the union of per-commit strip_paths. Per-commit strips
+    // only fire for `Rewrite`, but `Drop` commits add content that
+    // would be removed by skipping them. For squash, we collapse
+    // to a single commit, so the strip set must reflect every
+    // path the per-commit replay would have removed at HEAD time.
+    let strip: Vec<String> = head_strip_paths.to_vec();
     // Build the squashed tree from HEAD's tree (the union of
     // everything the range produced) with the strip paths removed.
     // Paths in the strip set but absent from HEAD's tree are no-ops
@@ -819,6 +826,7 @@ mod tests {
             intro_sha: Some(CommitSha::parse(intro).unwrap()),
             head_sha: CommitSha::parse(head).unwrap(),
             linear: true,
+            head_strip_paths: Vec::new(),
             commits: commits
                 .into_iter()
                 .map(|(sha, subj, disp, foreign, strip)| RewriteCommit {
@@ -874,6 +882,7 @@ mod tests {
             dry: false,
             allow_rewrite_protected: false,
             squash: None,
+            head_strip_paths: &[],
         })
         .await
         .unwrap();
@@ -924,6 +933,7 @@ mod tests {
             dry: true,
             allow_rewrite_protected: false,
             squash: None,
+            head_strip_paths: &[],
         })
         .await
         .unwrap();
@@ -968,6 +978,7 @@ mod tests {
             dry: false,
             allow_rewrite_protected: false,
             squash: None,
+            head_strip_paths: &[],
         })
         .await
         .unwrap_err();
@@ -1016,6 +1027,7 @@ mod tests {
             dry: false,
             allow_rewrite_protected: false,
             squash: None,
+            head_strip_paths: &[],
         })
         .await
         .unwrap();
@@ -1063,6 +1075,7 @@ mod tests {
             // policy.
             allow_rewrite_protected: true,
             squash: None,
+            head_strip_paths: &[],
         })
         .await
         .unwrap_err();
@@ -1124,6 +1137,7 @@ mod tests {
             dry: false,
             allow_rewrite_protected: false,
             squash: None,
+            head_strip_paths: &[],
         })
         .await
         .unwrap();
@@ -1183,6 +1197,7 @@ mod tests {
             dry: false,
             allow_rewrite_protected: false,
             squash: None,
+            head_strip_paths: &[],
         })
         .await
         .unwrap();
@@ -1260,6 +1275,7 @@ mod tests {
             dry: false,
             allow_rewrite_protected: false,
             squash: Some("Implement foo"),
+            head_strip_paths: &[".trinity/plans/foo.md".to_string()],
         })
         .await
         .unwrap();
@@ -1275,6 +1291,52 @@ mod tests {
         assert!(tree_has(dir.path(), squash_tip, "src/main.rs"));
         assert!(tree_has(dir.path(), squash_tip, "README.md"));
         assert!(!tree_has(dir.path(), squash_tip, ".trinity/plans/foo.md"));
+    }
+
+    #[tokio::test]
+    async fn rewrite_squash_strips_drop_only_paths_via_head_strip() {
+        // The codex-flagged Drop-only leak: a range of Drop-only
+        // commits has empty per-commit strip_paths, so the OLD
+        // squash logic (union of per-step strips) would strip
+        // nothing and leak the plan file into the squashed tree.
+        // Tree-based head_strip_paths captures it.
+        let dir = init_repo();
+        write(dir.path(), "README.md", "seed\n");
+        let _seed = commit(dir.path(), "seed");
+        write(dir.path(), ".trinity/plans/foo.md", "# foo\n");
+        let intro = commit(dir.path(), "plan: foo");
+
+        let preview = mk_preview(
+            &intro,
+            &intro,
+            vec![(
+                intro.clone(),
+                "plan: foo".into(),
+                RewriteDisposition::Drop,
+                false,
+                vec![], // Drop has empty strip_paths by design
+            )],
+        );
+        super::run(RewriteOpts {
+            repo: dir.path(),
+            intro_sha: preview.intro_sha.as_ref(),
+            head_sha: &preview.head_sha,
+            linear: preview.linear,
+            commits: &preview.commits,
+            into_branch: Some("squashed"),
+            dry: false,
+            allow_rewrite_protected: false,
+            squash: Some("squashed plan"),
+            // Daemon provides head_strip_paths — the squash uses
+            // these, NOT the union of per-step strip_paths.
+            head_strip_paths: &[".trinity/plans/foo.md".to_string()],
+        })
+        .await
+        .unwrap();
+        assert!(
+            !tree_has(dir.path(), "squashed", ".trinity/plans/foo.md"),
+            "Drop-only squash must strip the plan file via head_strip_paths"
+        );
     }
 
     #[tokio::test]
@@ -1305,6 +1367,7 @@ mod tests {
             dry: false,
             allow_rewrite_protected: false,
             squash: Some("collapse"),
+            head_strip_paths: &[],
         })
         .await
         .unwrap_err();
@@ -1342,6 +1405,7 @@ mod tests {
             dry: false,
             allow_rewrite_protected: false,
             squash: None,
+            head_strip_paths: &[],
         })
         .await
         .unwrap_err();
@@ -1382,6 +1446,7 @@ mod tests {
             dry: false,
             allow_rewrite_protected: false,
             squash: None,
+            head_strip_paths: &[],
         })
         .await
         .unwrap();
@@ -1399,6 +1464,7 @@ mod tests {
             head_sha: CommitSha::parse(&seed).unwrap(),
             linear: false,
             commits: Vec::new(),
+            head_strip_paths: Vec::new(),
         };
         let err = super::run(RewriteOpts {
             repo: dir.path(),
@@ -1410,6 +1476,7 @@ mod tests {
             dry: false,
             allow_rewrite_protected: false,
             squash: None,
+            head_strip_paths: &[],
         })
         .await
         .unwrap_err();
