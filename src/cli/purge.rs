@@ -16,13 +16,20 @@ pub async fn run(args: PurgeArgs) -> anyhow::Result<()> {
     let basename = repo_basename(&repo)?;
     let daemon = args.daemon.trim_end_matches('/').to_string();
 
-    if args.amend {
-        anyhow::bail!("--amend is not yet implemented in this phase");
-    }
     if args.squash.is_some() && args.all {
         // Squashing every plan's history into one commit would
         // lose per-plan boundaries; refuse rather than try.
         anyhow::bail!("--squash is not supported with --all");
+    }
+    if args.amend && args.squash.is_some() {
+        anyhow::bail!("--amend and --squash are mutually exclusive");
+    }
+    if args.amend && args.into_branch.is_some() {
+        anyhow::bail!("--amend and --into-branch are mutually exclusive");
+    }
+
+    if args.amend {
+        return run_amend(&repo, &basename, &daemon, &args).await;
     }
 
     if args.all && args.plan.is_some() {
@@ -121,6 +128,124 @@ async fn run_all(
             tip,
         );
     }
+    Ok(())
+}
+
+/// `--amend`: strip the plan's `.trinity/` paths from HEAD's tree
+/// and amend HEAD (no chain rewrite). Useful when the operator
+/// has just landed a commit and wants to retroactively scrub the
+/// plan's artifacts from HEAD's tree without rewriting earlier
+/// history.
+async fn run_amend(
+    repo: &std::path::Path,
+    basename: &str,
+    daemon: &str,
+    args: &PurgeArgs,
+) -> anyhow::Result<()> {
+    let stem = if args.all {
+        None
+    } else {
+        Some(super::finish::resolve_stem_or_infer_for_purge(&args.plan, basename, daemon).await?)
+    };
+
+    // Get HEAD sha and the strippable set in HEAD's tree.
+    let head_sha = std::process::Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["rev-parse", "HEAD"])
+        .output()?;
+    if !head_sha.status.success() {
+        anyhow::bail!("git rev-parse HEAD failed");
+    }
+    let head_sha_str = String::from_utf8(head_sha.stdout)?.trim().to_string();
+
+    let strip_paths: Vec<String> = match stem.as_deref() {
+        Some(s) => {
+            // Single-plan: ls-tree for this plan's paths
+            // (always include finalize).
+            let out = std::process::Command::new("git")
+                .arg("-C")
+                .arg(repo)
+                .args([
+                    "ls-tree",
+                    "-r",
+                    "--name-only",
+                    "--",
+                    &head_sha_str,
+                    &format!(".trinity/plans/{s}.md"),
+                    &format!(".trinity/finished/{s}/"),
+                ])
+                .output()?;
+            if !out.status.success() {
+                Vec::new()
+            } else {
+                String::from_utf8_lossy(&out.stdout)
+                    .lines()
+                    .filter(|l| !l.is_empty())
+                    .map(str::to_string)
+                    .collect()
+            }
+        }
+        None => {
+            // All-plans: every `.trinity/` path in HEAD's tree.
+            let out = std::process::Command::new("git")
+                .arg("-C")
+                .arg(repo)
+                .args([
+                    "ls-tree",
+                    "-r",
+                    "--name-only",
+                    "--",
+                    &head_sha_str,
+                    ".trinity/",
+                ])
+                .output()?;
+            if !out.status.success() {
+                Vec::new()
+            } else {
+                String::from_utf8_lossy(&out.stdout)
+                    .lines()
+                    .filter(|l| !l.is_empty())
+                    .map(str::to_string)
+                    .collect()
+            }
+        }
+    };
+
+    if strip_paths.is_empty() {
+        println!("HEAD's tree has no strippable Trinity paths; nothing to amend");
+        return Ok(());
+    }
+
+    if !args.yes
+        && !confirm_with(&format!(
+            "About to amend HEAD: strip {} path(s) from HEAD's tree.",
+            strip_paths.len()
+        ))?
+    {
+        anyhow::bail!("aborted");
+    }
+
+    // Remove each path from the index and amend.
+    for p in &strip_paths {
+        let status = std::process::Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(["rm", "--cached", "-q", p])
+            .status()?;
+        if !status.success() {
+            anyhow::bail!("git rm --cached {p} failed");
+        }
+    }
+    let status = std::process::Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["commit", "--amend", "--no-edit", "--allow-empty"])
+        .status()?;
+    if !status.success() {
+        anyhow::bail!("git commit --amend failed");
+    }
+    println!("amended HEAD: stripped {} path(s)", strip_paths.len());
     Ok(())
 }
 
