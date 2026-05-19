@@ -199,7 +199,12 @@ async fn compute_match(
         return Ok(None);
     }
     let w = waiting_on(candidate.is_finished, status, candidate.gate.as_ref());
-    if w.role != role {
+    // SessionFinished is terminal for every participant — wake any
+    // role. Keyed off the projected reason (not a second
+    // finished-ness check) so `waiting_on` stays the single source
+    // of truth for what work exists.
+    let terminal = matches!(w.reason, WaitingReason::SessionFinished);
+    if !terminal && w.role != role {
         return Ok(None);
     }
     if matches!(role, WaitingRole::Reviewers) && caller_already_voted(&candidate, w.reason, author)
@@ -1091,6 +1096,113 @@ mod integration_tests {
         };
         let err = wait_for_work(&rt, a).await.unwrap_err();
         assert!(matches!(err, WaitError::UnknownRepo(_)));
+    }
+
+    /// `WaitingRole::None` is the projected role for finalized plans
+    /// (terminal state, nobody is blocking). The role-gate exception
+    /// in `compute_match` lets `SessionFinished` through regardless
+    /// of the caller's requested role. Without it, a long-poll caller
+    /// blocked before the Finalize commit lands would sleep through
+    /// the broadcast wakeup and time out — the exact bug this plan
+    /// fixes.
+    ///
+    /// Master and reviewer cases need different setups: master blocks
+    /// naturally on `add foo` (waiting_on=reviewers); a reviewer would
+    /// get review_commit immediately, so we pre-approve from `bob` so
+    /// waiting_on flips to `{role:Master, reason:ReadyToStartImpl}`
+    /// and `bob`'s wait_for_work blocks on role-mismatch.
+
+    #[tokio::test]
+    async fn finalize_wakes_blocked_master() {
+        let dir = init_repo();
+        write_file(dir.path(), ".trinity/plans/foo.md", "# foo\n");
+        commit(dir.path(), "add foo");
+        let rt = std::sync::Arc::new(Runtime::new());
+        rt.add_repo(dir.path().to_path_buf()).await.unwrap();
+
+        let rt2 = std::sync::Arc::clone(&rt);
+        let repo = dir.path().to_path_buf();
+        let join = tokio::spawn(async move {
+            let mut a = args(&repo, WaitingRole::Master, "foo", "lloyd");
+            a.timeout_secs = Some(5);
+            wait_for_work(&rt2, a).await
+        });
+
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        write_file(
+            dir.path(),
+            ".trinity/finished/foo/codex.md",
+            "APPROVE\n\nlgtm\n",
+        );
+        commit(dir.path(), "Finalize foo");
+        rt.handle_signal(dir.path(), FilesystemSignal::HeadChanged, 1)
+            .await
+            .unwrap();
+
+        let resp = tokio::time::timeout(Duration::from_secs(3), join)
+            .await
+            .expect("wait_for_work didn't return after finalize")
+            .unwrap()
+            .unwrap();
+        let (work, locations) = expect_work(resp);
+        assert_eq!(work, "session_finished");
+        assert!(locations.is_empty());
+    }
+
+    #[tokio::test]
+    async fn finalize_wakes_blocked_reviewer() {
+        let dir = init_repo();
+        write_file(dir.path(), ".trinity/plans/foo.md", "# foo\n");
+        commit(dir.path(), "add foo");
+        let rt = std::sync::Arc::new(Runtime::new());
+        rt.add_repo(dir.path().to_path_buf()).await.unwrap();
+
+        // bob approves the intro, flipping waiting_on to master-side
+        // so bob's reviewer wait_for_work blocks on role-mismatch.
+        let intro: CommitSha = rt
+            .read_repo(dir.path(), |s| {
+                s.plans[&PlanKey::parse("foo").unwrap()].plan_intro.clone()
+            })
+            .await
+            .unwrap();
+        let rel = format!(".trinity/feedback/foo/{}/bob.md", intro.as_str());
+        write_file(dir.path(), &rel, "APPROVE\n");
+        let parsed = crate::disk_format::parse_feedback_path(&PathBuf::from(format!(
+            "foo/{}/bob.md",
+            intro.as_str()
+        )))
+        .unwrap();
+        rt.handle_signal(dir.path(), FilesystemSignal::FeedbackWritten { parsed }, 1)
+            .await
+            .unwrap();
+
+        let rt2 = std::sync::Arc::clone(&rt);
+        let repo = dir.path().to_path_buf();
+        let join = tokio::spawn(async move {
+            let mut a = args(&repo, WaitingRole::Reviewers, "foo", "bob");
+            a.timeout_secs = Some(5);
+            wait_for_work(&rt2, a).await
+        });
+
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        write_file(
+            dir.path(),
+            ".trinity/finished/foo/codex.md",
+            "APPROVE\n\nlgtm\n",
+        );
+        commit(dir.path(), "Finalize foo");
+        rt.handle_signal(dir.path(), FilesystemSignal::HeadChanged, 2)
+            .await
+            .unwrap();
+
+        let resp = tokio::time::timeout(Duration::from_secs(3), join)
+            .await
+            .expect("wait_for_work didn't return after finalize")
+            .unwrap()
+            .unwrap();
+        let (work, locations) = expect_work(resp);
+        assert_eq!(work, "session_finished");
+        assert!(locations.is_empty());
     }
 
     #[tokio::test]
