@@ -34,7 +34,70 @@ pub async fn run(args: FinishArgs) -> anyhow::Result<()> {
     } else {
         println!("finalized `{stem}`");
     }
+
+    // Composite modes: --purge and --squash run the rewrite
+    // engine on the just-extended range so the finalize commit
+    // itself can be collapsed/stripped.
+    if args.purge || args.squash.is_some() {
+        run_post_finalize_rewrite(&repo, &basename, &daemon, &stem, args).await?;
+    }
     Ok(())
+}
+
+async fn run_post_finalize_rewrite(
+    repo: &std::path::Path,
+    basename: &str,
+    daemon: &str,
+    stem: &str,
+    args: FinishArgs,
+) -> anyhow::Result<()> {
+    // Refresh the rewrite preview against the new HEAD (which
+    // includes the just-landed finalize commit).
+    let preview = fetch_rewrite_preview(daemon, basename, stem).await?;
+    crate::cli::rewrite::run(crate::cli::rewrite::RewriteOpts {
+        repo,
+        intro_sha: preview.intro_sha.as_ref(),
+        head_sha: &preview.head_sha,
+        linear: preview.linear,
+        commits: &preview.commits,
+        into_branch: args.into_branch.as_deref(),
+        dry: false,
+        allow_rewrite_protected: args.allow_rewrite_protected,
+        squash: args.squash.as_deref(),
+    })
+    .await?;
+    if let Some(branch) = args.into_branch.as_deref() {
+        println!("rewritten history on branch `{branch}`");
+    } else if args.squash.is_some() {
+        println!("squashed `{stem}` in place");
+    } else {
+        println!("purged `{stem}` from history");
+    }
+    Ok(())
+}
+
+async fn fetch_rewrite_preview(
+    daemon: &str,
+    basename: &str,
+    stem: &str,
+) -> anyhow::Result<trinity_core::api::RewritePreviewResponse> {
+    let url =
+        format!("{daemon}/api/plan/{basename}/{stem}.md/rewrite_preview?include_finalize=true",);
+    let resp = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(60))
+        .build()?
+        .get(&url)
+        .send()
+        .await
+        .map_err(|e| anyhow::anyhow!("daemon unreachable at {daemon}: {e}"))?;
+    let status = resp.status();
+    if !status.is_success() {
+        let body = resp.text().await.unwrap_or_default();
+        anyhow::bail!("daemon returned {status} for {url}: {body}");
+    }
+    Ok(resp
+        .json::<trinity_core::api::RewritePreviewResponse>()
+        .await?)
 }
 
 /// Public for `cli::purge` (same parsing rules across both

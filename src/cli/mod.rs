@@ -43,6 +43,24 @@ pub struct FinishArgs {
     /// Override the default `Finalize <stem>` commit message.
     #[arg(short = 'm', long)]
     pub message: Option<String>,
+    /// After finalize, strip the plan's `.trinity/` artifacts
+    /// from history (runs the rewrite engine on the just-extended
+    /// range). The finalize snapshot is included in the strip.
+    #[arg(long)]
+    pub purge: bool,
+    /// After finalize, collapse the plan's commits into one with
+    /// the supplied message. Combine with `--purge` to also strip
+    /// the plan's `.trinity/` artifacts.
+    #[arg(long, value_name = "MSG")]
+    pub squash: Option<String>,
+    /// Write the rewritten history to a fresh branch instead of
+    /// in-place. Only meaningful with `--purge`/`--squash`.
+    #[arg(long, value_name = "NAME")]
+    pub into_branch: Option<String>,
+    /// Permit rewriting a protected branch (`main`/`master`) when
+    /// combined with `--purge`/`--squash`.
+    #[arg(long)]
+    pub allow_rewrite_protected: bool,
 }
 
 #[derive(Args, Debug)]
