@@ -1,5 +1,5 @@
 use clap::{Parser, Subcommand};
-use trinity::{mcp_shim, server};
+use trinity::{cli, mcp_shim, server};
 
 #[derive(Parser)]
 #[command(
@@ -18,15 +18,25 @@ enum Command {
     Serve(server::ServeArgs),
     /// stdio MCP server. Forwards tool calls to a running `trinity serve` daemon.
     Mcp(mcp_shim::McpArgs),
+    /// Scaffold `.trinity/` in a repo (creates `plans/` and `.gitignore`).
+    Init(cli::InitArgs),
+    /// Finalize an approved plan: seal the approving feedback into
+    /// `.trinity/finished/<stem>/` and commit.
+    Finish(cli::FinishArgs),
+    /// Strip a plan's `.trinity/` artifacts from history.
+    Purge(cli::PurgeArgs),
 }
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     init_tracing();
-    let cli = Cli::parse();
-    match cli.command {
+    let cli_args = Cli::parse();
+    match cli_args.command {
         Command::Serve(args) => server::serve(args).await,
         Command::Mcp(args) => mcp_shim::run(args).await,
+        Command::Init(args) => cli::init::run(args).await,
+        Command::Finish(args) => cli::finish(args).await,
+        Command::Purge(args) => cli::purge(args).await,
     }
 }
 

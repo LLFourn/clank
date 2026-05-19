@@ -610,6 +610,96 @@ pub struct DeleteRepoOutcome {
     pub registry_write_error: Option<String>,
 }
 
+/// `finish_preview` response — everything `trinity finish` needs to
+/// validate before sealing. Returned by
+/// `GET /api/plan/{repo}/{stem}.md/finish_preview`.
+///
+/// **The CLI consumes `readiness` and nothing else for the
+/// finalize/abort decision.** Raw fields (`gate_state`,
+/// `plan_worktree_status`, …) are exposed for human display only
+/// (e.g. `trinity finish --dry`) and must not be recombined into a
+/// CLI-side ready/blocked decision. Projecting the readiness once
+/// in the daemon keeps the CLI from disagreeing with itself across
+/// invocations.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FinishPreviewResponse {
+    pub plan_id: String,
+    pub plan_path: String,
+    /// The daemon's typed finalize decision. Single source of truth
+    /// for "can `trinity finish` proceed?"
+    pub readiness: FinalizeReadiness,
+    /// Raw current gate. For display only.
+    pub gate_state: crate::vocab::CommitGateState,
+    /// SHA of the latest reviewable commit. For display only.
+    /// `None` when the plan has no reviewable commits yet.
+    pub latest_reviewable_sha: Option<crate::ids::CommitSha>,
+    /// Worktree status of the plan file. For display only.
+    pub plan_worktree_status: crate::vocab::PlanWorktreeStatus,
+    /// True if the plan has already been finalized. For display
+    /// only; `readiness == AlreadyFinished` carries the same info.
+    pub is_finished: bool,
+    /// Exact approval files the CLI is allowed to seal when
+    /// `readiness == Ready`. Each entry's `body_hash` was computed
+    /// from `feedback.body` (the daemon's UTF-8 in-memory copy,
+    /// loaded via `std::fs::read_to_string`). The CLI must re-read
+    /// each `source_path` via `std::fs::read_to_string` and re-hash
+    /// the body before copying — any drift aborts the seal.
+    pub sealed_approvals: Vec<SealedApproval>,
+}
+
+/// The daemon's typed finalize decision. The CLI dispatches on this
+/// and only this for "can we proceed?"
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum FinalizeReadiness {
+    /// All pre-flights pass; the CLI may seal `sealed_approvals`
+    /// and commit.
+    Ready,
+    /// Plan is already finalized — `trinity finish` exits 0 with
+    /// "already finished" without writing anything.
+    AlreadyFinished,
+    /// One or more pre-flights failed. Each reason is independent
+    /// human-readable + machine-tagged so the CLI can report all
+    /// of them at once rather than fail-fast.
+    Blocked { reasons: Vec<FinalizeBlockReason> },
+}
+
+/// One specific reason `trinity finish` cannot proceed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum FinalizeBlockReason {
+    /// No reviewable commit attributed to the plan yet.
+    NoReviewableCommit,
+    /// Gate is not `Approved` (still unreviewed, or has RC/unmarked).
+    GateNotApproved {
+        state: crate::vocab::CommitGateState,
+    },
+    /// Plan file is missing from the worktree.
+    PlanFileMissing,
+    /// Plan file's worktree body differs from HEAD's blob.
+    PlanFileDirty,
+}
+
+/// One approving feedback the daemon has projected as part of the
+/// approved gate. The CLI re-reads `source_path`, hashes the body,
+/// and aborts if `body_hash` doesn't match — that catches feedback
+/// edits between preview and commit.
+///
+/// The daemon's `body_hash` is computed via `content_hash` over the
+/// UTF-8 bytes of `feedback.body`, which was loaded from disk via
+/// `std::fs::read_to_string`. The CLI MUST use the same load path
+/// (`read_to_string`) so the comparison is byte-for-byte; reading
+/// raw bytes would diverge on invalid UTF-8 (which the daemon
+/// would have rejected anyway).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SealedApproval {
+    pub author: crate::ids::AgentLabel,
+    /// Repo-relative path: `.trinity/feedback/<stem>/<sha>/<author>.md`.
+    pub source_path: String,
+    /// Hash of the body the daemon projected.
+    pub body_hash: crate::ids::ContentHash,
+}
+
 // ============================================================
 // wait_for_work response
 // ============================================================

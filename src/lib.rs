@@ -15,6 +15,10 @@ pub mod git_io;
 pub mod responses;
 pub mod runtime;
 
+// Operator CLI subcommands (init / finish / purge). Mutations
+// live here; the daemon stays read-only.
+pub mod cli;
+
 // The MCP stdio shim — forwards tool calls to the daemon's HTTP endpoint.
 pub mod mcp_shim;
 

@@ -26,6 +26,10 @@ pub fn router(state: AppState) -> Router {
         .route("/api/plans", get(api_plans))
         .route("/api/plan/{repo}/{stem_md}", get(api_plan_detail))
         .route(
+            "/api/plan/{repo}/{stem_md}/finish_preview",
+            get(api_finish_preview),
+        )
+        .route(
             "/api/plan/{repo}/{stem_md}/revision/{sha}",
             get(api_plan_revision),
         )
@@ -387,6 +391,120 @@ async fn api_plan_detail(
         .map_err(AppError::io)?
         .expect("plan_page returns Some after enforce_plan_visible");
     Ok(axum::Json(v))
+}
+
+async fn api_finish_preview(
+    State(state): State<AppState>,
+    Path((repo_basename, stem_md)): Path<(String, String)>,
+) -> Result<axum::Json<trinity_core::api::FinishPreviewResponse>, AppError> {
+    let (repo, plan_key) = resolve_plan_id_segments(&state, &repo_basename, &stem_md).await?;
+    let snapshot = state
+        .runtime
+        .snapshot_session(&repo, &plan_key)
+        .await
+        .map_err(AppError::runtime)?
+        .ok_or_else(|| AppError::not_found(format!("plan {repo_basename}/{stem_md} not found")))?;
+    enforce_plan_visible(&snapshot, &repo_basename, &stem_md)?;
+
+    let plan = snapshot
+        .plans
+        .values()
+        .next()
+        .expect("single_plan invariant");
+    let plan_id = format!("{repo_basename}/{stem_md}");
+    let worktree_status = crate::responses::compute_plan_worktree_status_parts(
+        &snapshot.root,
+        &plan.plan_path,
+        &plan.body_hash,
+    )
+    .map_err(AppError::io)?;
+    let latest_reviewable_sha = crate::projection::latest_reviewable_commit_for(plan);
+    let latest_event = latest_reviewable_sha
+        .as_ref()
+        .and_then(|sha| plan.event_for(sha));
+    let gate = latest_event.and_then(|e| e.gate());
+    let gate_state = gate
+        .map(|g| g.state)
+        .unwrap_or(trinity_core::vocab::CommitGateState::Unreviewed);
+    let is_finished = plan.is_frozen();
+
+    let sealed_approvals = match gate {
+        Some(g) if g.state == trinity_core::vocab::CommitGateState::Approved => {
+            let target_sha = latest_reviewable_sha
+                .as_ref()
+                .expect("Approved gate implies a reviewable sha");
+            g.feedback
+                .iter()
+                .filter(|(_, fb)| fb.verdict == trinity_core::Verdict::Approve)
+                .map(|(author, fb)| trinity_core::api::SealedApproval {
+                    author: author.clone(),
+                    source_path: crate::disk_format::feedback_path_wire(
+                        &plan.id,
+                        target_sha.as_str(),
+                        author,
+                    ),
+                    body_hash: crate::lifecycle::content_hash(&fb.body),
+                })
+                .collect()
+        }
+        _ => Vec::new(),
+    };
+
+    let readiness = compute_finalize_readiness(
+        is_finished,
+        latest_reviewable_sha.as_ref(),
+        gate_state,
+        worktree_status,
+    );
+
+    Ok(axum::Json(trinity_core::api::FinishPreviewResponse {
+        plan_id,
+        plan_path: plan.plan_path.clone(),
+        readiness,
+        gate_state,
+        latest_reviewable_sha,
+        plan_worktree_status: worktree_status,
+        is_finished,
+        sealed_approvals,
+    }))
+}
+
+/// Project the typed finalize decision. Single source of truth for
+/// "can the CLI proceed?" — the CLI dispatches on this and nothing
+/// else.
+fn compute_finalize_readiness(
+    is_finished: bool,
+    latest_reviewable_sha: Option<&crate::lifecycle::CommitSha>,
+    gate_state: trinity_core::vocab::CommitGateState,
+    worktree_status: trinity_core::vocab::PlanWorktreeStatus,
+) -> trinity_core::api::FinalizeReadiness {
+    use trinity_core::api::{FinalizeBlockReason, FinalizeReadiness};
+    use trinity_core::vocab::{CommitGateState, PlanWorktreeStatus};
+
+    if is_finished {
+        return FinalizeReadiness::AlreadyFinished;
+    }
+    let mut reasons = Vec::new();
+    if latest_reviewable_sha.is_none() {
+        reasons.push(FinalizeBlockReason::NoReviewableCommit);
+    }
+    if gate_state != CommitGateState::Approved {
+        reasons.push(FinalizeBlockReason::GateNotApproved { state: gate_state });
+    }
+    match worktree_status {
+        PlanWorktreeStatus::PlanFileMissing => {
+            reasons.push(FinalizeBlockReason::PlanFileMissing);
+        }
+        PlanWorktreeStatus::BodyDirty => {
+            reasons.push(FinalizeBlockReason::PlanFileDirty);
+        }
+        PlanWorktreeStatus::Clean => {}
+    }
+    if reasons.is_empty() {
+        FinalizeReadiness::Ready
+    } else {
+        FinalizeReadiness::Blocked { reasons }
+    }
 }
 
 async fn api_plan_revision(
@@ -1209,5 +1327,141 @@ mod wire_tests {
             loc.ends_with("/bob.md"),
             "expected bob's write path, got {loc}"
         );
+    }
+
+    #[tokio::test]
+    async fn finish_preview_unreviewed_blocks_with_gate_not_approved() {
+        let dir = init_repo();
+        let app = router_with_repo(&dir).await;
+        let url = format!("/api/plan/{}/finish_preview", plan_id_for(&dir, "foo"));
+        let req = Request::builder()
+            .method("GET")
+            .uri(&url)
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let v = body_json(resp).await;
+        assert_eq!(v["gate_state"], "unreviewed");
+        assert_eq!(v["is_finished"], false);
+        assert_eq!(v["sealed_approvals"].as_array().unwrap().len(), 0);
+        assert_eq!(v["plan_path"], ".trinity/plans/foo.md");
+        assert!(v["latest_reviewable_sha"].as_str().is_some());
+        assert_eq!(v["readiness"]["kind"], "blocked");
+        let reasons = v["readiness"]["reasons"].as_array().unwrap();
+        assert!(reasons.iter().any(|r| r["kind"] == "gate_not_approved"));
+    }
+
+    #[tokio::test]
+    async fn finish_preview_approved_returns_sealed_approvals_with_hashes() {
+        let dir = init_repo();
+        let (runtime, state) = prepared_state(&dir).await;
+        let app = router(state);
+
+        let intro: crate::lifecycle::CommitSha = runtime
+            .read_repo(dir.path(), |s| {
+                s.plans[&crate::lifecycle::PlanKey::parse("foo").unwrap()]
+                    .plan_intro
+                    .clone()
+            })
+            .await
+            .unwrap();
+        let codex_body = "APPROVE\n\nLooks good.\n";
+        let codex_fb = format!(".trinity/feedback/foo/{}/codex.md", intro.as_str());
+        write_file(dir.path(), &codex_fb, codex_body);
+        runtime
+            .handle_signal(
+                dir.path(),
+                crate::fs_watcher::FilesystemSignal::FeedbackWritten {
+                    parsed: crate::disk_format::parse_feedback_path(&std::path::PathBuf::from(
+                        format!("foo/{}/codex.md", intro.as_str()),
+                    ))
+                    .unwrap(),
+                },
+                1,
+            )
+            .await
+            .unwrap();
+
+        let url = format!("/api/plan/{}/finish_preview", plan_id_for(&dir, "foo"));
+        let req = Request::builder()
+            .method("GET")
+            .uri(&url)
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let v = body_json(resp).await;
+        assert_eq!(v["gate_state"], "approved");
+        assert_eq!(v["is_finished"], false);
+        assert_eq!(v["readiness"]["kind"], "ready");
+        let approvals = v["sealed_approvals"].as_array().unwrap();
+        assert_eq!(approvals.len(), 1);
+        assert_eq!(approvals[0]["author"], "codex");
+        assert_eq!(approvals[0]["source_path"], codex_fb);
+        let expected_hash = crate::lifecycle::content_hash(codex_body);
+        assert_eq!(approvals[0]["body_hash"], expected_hash.as_str());
+    }
+
+    #[tokio::test]
+    async fn finish_preview_request_changes_returns_empty_approvals() {
+        let dir = init_repo();
+        let (runtime, state) = prepared_state(&dir).await;
+        let app = router(state);
+        let intro: crate::lifecycle::CommitSha = runtime
+            .read_repo(dir.path(), |s| {
+                s.plans[&crate::lifecycle::PlanKey::parse("foo").unwrap()]
+                    .plan_intro
+                    .clone()
+            })
+            .await
+            .unwrap();
+        write_file(
+            dir.path(),
+            &format!(".trinity/feedback/foo/{}/codex.md", intro.as_str()),
+            "REQUEST_CHANGES\n\nNo.\n",
+        );
+        runtime
+            .handle_signal(
+                dir.path(),
+                crate::fs_watcher::FilesystemSignal::FeedbackWritten {
+                    parsed: crate::disk_format::parse_feedback_path(&std::path::PathBuf::from(
+                        format!("foo/{}/codex.md", intro.as_str()),
+                    ))
+                    .unwrap(),
+                },
+                1,
+            )
+            .await
+            .unwrap();
+
+        let url = format!("/api/plan/{}/finish_preview", plan_id_for(&dir, "foo"));
+        let req = Request::builder()
+            .method("GET")
+            .uri(&url)
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let v = body_json(resp).await;
+        assert_eq!(v["gate_state"], "changes_requested");
+        assert_eq!(v["sealed_approvals"].as_array().unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn finish_preview_unknown_plan_404s() {
+        let dir = init_repo();
+        let app = router_with_repo(&dir).await;
+        let basename = dir.path().file_name().unwrap().to_str().unwrap();
+        let req = Request::builder()
+            .method("GET")
+            .uri(format!(
+                "/api/plan/{}/nonexistent.md/finish_preview",
+                basename
+            ))
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 }

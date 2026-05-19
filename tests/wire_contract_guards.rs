@@ -273,6 +273,10 @@ const APPROVED_STRING_FIELDS: &[(&str, &str)] = &[
     ("path", "filesystem path"),
     ("plan_body", "raw plan-file markdown (wasm renders to HTML)"),
     ("plan_path", "repo-relative path on model::Plan"),
+    (
+        "source_path",
+        "repo-relative feedback path on SealedApproval",
+    ),
     ("subject", "commit subject line"),
     ("suggested_message", "PR commit message suggestion"),
     ("to", "git SHA for diff range end"),
