@@ -35,7 +35,7 @@ async fn main() -> anyhow::Result<()> {
         Command::Serve(args) => server::serve(args).await,
         Command::Mcp(args) => mcp_shim::run(args).await,
         Command::Init(args) => cli::init::run(args).await,
-        Command::Finish(args) => cli::finish(args).await,
+        Command::Finish(args) => cli::finish::run(args).await,
         Command::Purge(args) => cli::purge(args).await,
     }
 }

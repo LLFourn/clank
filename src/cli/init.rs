@@ -1,8 +1,8 @@
 //! `trinity init` — scaffold `.trinity/` in a new repo.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
-use super::InitArgs;
+use super::{InitArgs, resolve_repo};
 
 /// The single canonical content of `.trinity/.gitignore`.
 const GITIGNORE_BODY: &str = "feedback/\ncache/\n";
@@ -12,25 +12,6 @@ pub async fn run(args: InitArgs) -> anyhow::Result<()> {
     write_scaffold(&repo)?;
     warn_if_globally_excluded(&repo);
     Ok(())
-}
-
-fn resolve_repo(explicit: Option<&Path>) -> anyhow::Result<PathBuf> {
-    let raw = if let Some(p) = explicit {
-        p.to_path_buf()
-    } else {
-        let output = std::process::Command::new("git")
-            .args(["rev-parse", "--show-toplevel"])
-            .output()?;
-        if !output.status.success() {
-            anyhow::bail!(
-                "no --repo given and `git rev-parse --show-toplevel` failed: {}",
-                String::from_utf8_lossy(&output.stderr).trim()
-            );
-        }
-        let root = String::from_utf8(output.stdout)?.trim().to_string();
-        PathBuf::from(root)
-    };
-    Ok(dunce::canonicalize(&raw)?)
 }
 
 fn write_scaffold(repo: &Path) -> anyhow::Result<()> {
