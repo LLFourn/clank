@@ -149,6 +149,40 @@ async fn run_amend(
         Some(super::finish::resolve_stem_or_infer_for_purge(&args.plan, basename, daemon).await?)
     };
 
+    // Plan rule: `--amend` requires HEAD to be a finalize commit
+    // for the named plan (or for any plan under `--all`). HEAD is
+    // a finalize commit iff every changed path lies under
+    // `.trinity/finished/<stem>/` (single-plan) or
+    // `.trinity/finished/` (all-plans).
+    let head_files = std::process::Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["diff-tree", "--no-commit-id", "--name-only", "-r", "HEAD"])
+        .output()?;
+    let head_lines: Vec<String> = if head_files.status.success() {
+        String::from_utf8_lossy(&head_files.stdout)
+            .lines()
+            .filter(|l| !l.is_empty())
+            .map(str::to_string)
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let prefix: String = match stem.as_deref() {
+        Some(s) => format!(".trinity/finished/{s}/"),
+        None => ".trinity/finished/".to_string(),
+    };
+    let head_is_finalize =
+        !head_lines.is_empty() && head_lines.iter().all(|l| l.starts_with(&prefix));
+    if !head_is_finalize {
+        anyhow::bail!(
+            "--amend requires HEAD to be a finalize commit \
+             (every changed path under `{prefix}`). Run `trinity finish` \
+             without `--amend` to create the finalize commit first, or \
+             use `trinity purge` without `--amend` to rewrite the chain."
+        );
+    }
+
     // Get HEAD sha and the strippable set in HEAD's tree.
     let head_sha = std::process::Command::new("git")
         .arg("-C")

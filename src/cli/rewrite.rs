@@ -103,7 +103,11 @@ pub async fn run(opts: RewriteOpts<'_>) -> anyhow::Result<RewriteOutcome> {
     }
 
     if opts.dry {
-        print_rebase_todo(&opts, &plan, &blockers);
+        if let Some(msg) = opts.squash {
+            print_squash_dry_run(&opts, &plan, &blockers, msg);
+        } else {
+            print_rebase_todo(&opts, &plan, &blockers);
+        }
         return Ok(RewriteOutcome::default());
     }
 
@@ -383,6 +387,60 @@ fn print_rebase_todo(opts: &RewriteOpts<'_>, plan: &ExecutionPlan, blockers: &[S
             }
         }
     }
+}
+
+/// Squash-mode dry-run: emit a description, NOT a rebase-todo.
+/// The collapsed-into-one shape doesn't map cleanly to git
+/// rebase's directives, so we present the target as a one-commit
+/// summary that's explicitly not pipeable to git. Operator runs
+/// the live command if they want to execute it.
+fn print_squash_dry_run(
+    opts: &RewriteOpts<'_>,
+    plan: &ExecutionPlan,
+    blockers: &[String],
+    msg: &str,
+) {
+    println!("# trinity rewrite --squash preview");
+    if let Some(intro) = opts.intro_sha {
+        println!(
+            "# range: {}..{} ({} commit(s) would collapse into one)",
+            short(intro.as_str()),
+            short(opts.head_sha.as_str()),
+            plan.steps.len(),
+        );
+    } else {
+        println!("# range: (empty — no .trinity/ history)");
+    }
+    println!(
+        "# starting parent: {}",
+        plan.intro_parent.as_deref().unwrap_or("(root)"),
+    );
+    let target = match opts.into_branch {
+        Some(b) => format!("a NEW branch `{b}` (current branch untouched)"),
+        None => "the CURRENT branch (in place)".into(),
+    };
+    println!("# target: {target}");
+    println!("#");
+    println!("# would create ONE commit on top of starting parent:");
+    println!("#   message: {msg}");
+    if opts.head_strip_paths.is_empty() {
+        println!("#   tree: HEAD's tree, unchanged");
+    } else {
+        println!("#   tree: HEAD's tree MINUS:");
+        for p in opts.head_strip_paths {
+            println!("#     - {p}");
+        }
+    }
+    println!("#");
+    if !blockers.is_empty() {
+        println!("# BLOCKERS (live run would refuse):");
+        for b in blockers {
+            println!("#   - {b}");
+        }
+        println!("#");
+    }
+    println!("# Squash mode is NOT pipeable to git rebase. Run the live command");
+    println!("# without --dry to materialize the squashed commit.");
 }
 
 /// POSIX-style single-quote escaping for paths that might contain

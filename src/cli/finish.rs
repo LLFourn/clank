@@ -27,6 +27,13 @@ pub async fn run(args: FinishArgs) -> anyhow::Result<()> {
         );
     }
 
+    // Dry-run for composite modes must NOT create the finalize
+    // commit. Build a planned-action preview from the existing
+    // state and exit before any mutation.
+    if args.dry && (args.purge || args.squash.is_some()) {
+        return dry_run_finish_composite(&repo, &basename, &daemon, &stem, &preview, &args).await;
+    }
+
     finalize(&repo, &stem, &preview, args.amend, args.message.as_deref()).await?;
 
     if args.amend {
@@ -41,6 +48,59 @@ pub async fn run(args: FinishArgs) -> anyhow::Result<()> {
     if args.purge || args.squash.is_some() {
         run_post_finalize_rewrite(&repo, &basename, &daemon, &stem, args).await?;
     }
+    Ok(())
+}
+
+/// Dry-run preview for `finish --purge`/`--squash`. The finalize
+/// commit hasn't been created yet, so we emit a description of
+/// the planned action without calling `finalize()` or
+/// `rewrite_preview`. Pipe-to-git isn't possible here because
+/// the finalize commit doesn't exist — operator must run the
+/// live command to materialize it before any rebase.
+async fn dry_run_finish_composite(
+    _repo: &std::path::Path,
+    _basename: &str,
+    _daemon: &str,
+    stem: &str,
+    preview: &FinishPreviewResponse,
+    args: &FinishArgs,
+) -> anyhow::Result<()> {
+    println!("# trinity finish --dry preview");
+    println!("# plan: {}", preview.plan_id);
+    println!("# would create finalize commit:");
+    let msg = args
+        .message
+        .as_deref()
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("Finalize {stem}"));
+    println!("#   message: {msg}");
+    let approvers: Vec<&str> = preview
+        .sealed_approvals
+        .iter()
+        .map(|a| a.author.as_str())
+        .collect();
+    println!("#   sealed approvals: {}", approvers.join(", "));
+    println!("#");
+    if args.purge && args.squash.is_some() {
+        println!(
+            "# would then squash plan history into one commit and strip the finalize snapshot."
+        );
+        println!(
+            "#   squash message: {}",
+            args.squash.as_deref().unwrap_or("")
+        );
+    } else if args.squash.is_some() {
+        println!(
+            "# would then squash plan-attributed commits into one (finalize snapshot preserved)."
+        );
+        println!(
+            "#   squash message: {}",
+            args.squash.as_deref().unwrap_or("")
+        );
+    } else if args.purge {
+        println!("# would then strip the plan's `.trinity/` artifacts from history.");
+    }
+    println!("# (--dry: no commits, no refs updated)");
     Ok(())
 }
 
