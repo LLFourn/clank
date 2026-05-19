@@ -376,16 +376,27 @@ pub struct WorkContextResponse {
 pub enum ExpectedAction {
     /// Reviewer: write an `APPROVE\n...` / `REQUEST_CHANGES\n...`
     /// markdown file to `path` against the commit at `target_sha`.
-    WriteFeedback { path: String, target_sha: String },
-    /// Master: address the request-changes feedback at `rc_paths`
-    /// against `target_sha` and follow up with a fix commit.
+    /// `plan_file` is what the reviewer reads to compose their
+    /// verdict (master wrote it). On `wait_for_work` the
+    /// `plan_file.content` is populated opportunistically on
+    /// first encounter; on `work_context` it's always omitted.
+    WriteFeedback {
+        path: String,
+        target_sha: String,
+        plan_file: PlanFile,
+    },
+    /// Master: address the request-changes / unmarked feedback in
+    /// `reviews` against `target_sha` and follow up with a fix
+    /// commit. Each review carries the author, verdict, and
+    /// opportunistic `content` (populated on first encounter by
+    /// `wait_for_work`; absent on `work_context`).
     /// `plan_path` is `Some` when the RC is plan-side (commit
     /// kind `PlanOnly | Mixed`) — meaning the master needs to
     /// revise the plan body as part of the fix-up commit.
     /// `None` for code-side RCs (`CodeOnly`).
     AddressChanges {
         target_sha: String,
-        rc_paths: Vec<String>,
+        reviews: Vec<CurrentReview>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         plan_path: Option<String>,
     },
@@ -402,6 +413,46 @@ pub enum ExpectedAction {
     },
     /// Plan is finalized; no further action.
     SessionFinished,
+}
+
+/// A plan file the caller may want to read. `content` is
+/// populated opportunistically on `wait_for_work` first
+/// encounter (per `(canonical-repo-root, agent, path)` keyed by
+/// content hash); omitted on subsequent polls. `work_context`
+/// never populates it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PlanFile {
+    pub path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content: Option<String>,
+}
+
+/// One reviewer's feedback at the current review target.
+/// `target_sha` is implicit (it's `AddressChanges.target_sha`).
+/// `content` follows the same opportunistic rule as
+/// `PlanFile.content`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CurrentReview {
+    pub path: String,
+    pub author: crate::ids::AgentLabel,
+    pub verdict: Verdict,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content: Option<String>,
+}
+
+/// A review against a superseded commit, surfaced to the master
+/// exactly once. Carries its own `target_sha` (different from
+/// the current target). `content` is `None` only when the file
+/// exceeds the inline cap — in that case the metadata still
+/// reaches the master and the entry is marked seen.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StaleReview {
+    pub path: String,
+    pub author: crate::ids::AgentLabel,
+    pub verdict: Verdict,
+    pub target_sha: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content: Option<String>,
 }
 
 /// MCP `set_active_work` response. The selection is recorded in
@@ -564,14 +615,31 @@ pub struct DeleteRepoOutcome {
 // ============================================================
 
 /// `wait_for_work` response: either work to do or a timeout
-/// notice. Untagged so the wire keeps the field-presence
-/// discriminator (`work` vs `timed_out`) the existing consumers
-/// depend on.
+/// notice. Untagged so the wire's field-presence
+/// discriminator (`kind` vs `timed_out`) keeps the existing
+/// consumer shape.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum WaitForWorkResponse {
-    Work(WorkPayload),
+    Work(WaitWorkPayload),
     Timeout(WaitTimeout),
+}
+
+/// `wait_for_work` happy-path payload. Wraps the projection
+/// `WorkPayload` (the shape `work_context` also embeds) with a
+/// WFW-only master sidecar `stale_reviews` carrying any unseen
+/// reviews against superseded targets.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WaitWorkPayload {
+    #[serde(flatten)]
+    pub work: WorkPayload,
+    /// Master-only sidecar: reviews against superseded commits
+    /// the agent hasn't been sent yet. Riding-along delivery —
+    /// the sidecar attaches to any legitimate master wakeup;
+    /// it does NOT independently wake master WFW. Empty on
+    /// reviewer variants and after every entry's been emitted.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub stale_reviews: Vec<StaleReview>,
 }
 
 /// Typed MCP-tool error payload. Each variant lifts one of the

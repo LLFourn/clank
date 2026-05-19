@@ -1,6 +1,9 @@
 {
   "kind": "string",
   "path": "string",
+  "plan_file": {
+    "path": "string"
+  },
   "plan_id": "string",
   "repo": "string",
   "target_sha": "string"

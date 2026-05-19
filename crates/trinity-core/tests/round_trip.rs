@@ -333,6 +333,10 @@ fn work_payload_write_feedback_round_trips() {
         action: ExpectedAction::WriteFeedback {
             path: ".trinity/feedback/foo/abc/codex.md".into(),
             target_sha: "abc".into(),
+            plan_file: PlanFile {
+                path: ".trinity/plans/foo.md".into(),
+                content: None,
+            },
         },
     };
     let v = serde_json::to_value(&payload).unwrap();
@@ -342,6 +346,8 @@ fn work_payload_write_feedback_round_trips() {
     assert_eq!(v["kind"], "write_feedback");
     assert_eq!(v["target_sha"], "abc");
     assert_eq!(v["path"], ".trinity/feedback/foo/abc/codex.md");
+    assert_eq!(v["plan_file"]["path"], ".trinity/plans/foo.md");
+    assert!(v["plan_file"].get("content").is_none());
     let back: WorkPayload = serde_json::from_value(v).unwrap();
     assert_eq!(payload, back);
 }

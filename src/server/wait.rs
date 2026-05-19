@@ -108,7 +108,10 @@ pub async fn wait_for_work(runtime: &Runtime, args: WaitArgs) -> Result<WaitResp
     let mut rx = runtime.subscribe_events();
 
     if let Some(work) = compute_match(runtime, &plan_id, role, &author).await? {
-        return Ok(WaitResponse::Work(work));
+        return Ok(WaitResponse::Work(trinity_core::api::WaitWorkPayload {
+            work,
+            stale_reviews: Vec::new(),
+        }));
     }
 
     let deadline = started_at + timeout;
@@ -124,13 +127,19 @@ pub async fn wait_for_work(runtime: &Runtime, args: WaitArgs) -> Result<WaitResp
         match tokio::time::timeout(remaining, rx.recv()).await {
             Ok(Ok(_event)) => {
                 if let Some(work) = compute_match(runtime, &plan_id, role, &author).await? {
-                    return Ok(WaitResponse::Work(work));
+                    return Ok(WaitResponse::Work(trinity_core::api::WaitWorkPayload {
+                        work,
+                        stale_reviews: Vec::new(),
+                    }));
                 }
             }
             Ok(Err(RecvError::Lagged(_))) => {
                 rx = runtime.subscribe_events();
                 if let Some(work) = compute_match(runtime, &plan_id, role, &author).await? {
-                    return Ok(WaitResponse::Work(work));
+                    return Ok(WaitResponse::Work(trinity_core::api::WaitWorkPayload {
+                        work,
+                        stale_reviews: Vec::new(),
+                    }));
                 }
             }
             Ok(Err(RecvError::Closed)) | Err(_) => {
@@ -400,11 +409,9 @@ mod tests {
         match payload.action {
             WriteFeedback { path, .. } => vec![path],
             AddressChanges {
-                rc_paths,
-                plan_path,
-                ..
+                reviews, plan_path, ..
             } => {
-                let mut out = rc_paths;
+                let mut out: Vec<String> = reviews.into_iter().map(|r| r.path).collect();
                 if let Some(p) = plan_path {
                     out.push(p);
                 }
@@ -634,8 +641,8 @@ mod integration_tests {
     fn expect_work(r: WaitResponse) -> (String, Vec<String>) {
         match r {
             WaitResponse::Work(p) => {
-                let kind = action_kind(&p.action).to_string();
-                let locations = action_locations(&p.action);
+                let kind = action_kind(&p.work.action).to_string();
+                let locations = action_locations(&p.work.action);
                 (kind, locations)
             }
             WaitResponse::Timeout { .. } => panic!("expected work, got timeout"),
@@ -648,8 +655,8 @@ mod integration_tests {
             WaitResponse::Work(p) => {
                 panic!(
                     "expected timeout, got work={} locations={:?}",
-                    action_kind(&p.action),
-                    action_locations(&p.action)
+                    action_kind(&p.work.action),
+                    action_locations(&p.work.action)
                 )
             }
         }
@@ -675,11 +682,9 @@ mod integration_tests {
         match a {
             WriteFeedback { path, .. } => vec![path.clone()],
             AddressChanges {
-                rc_paths,
-                plan_path,
-                ..
+                reviews, plan_path, ..
             } => {
-                let mut out = rc_paths.clone();
+                let mut out: Vec<String> = reviews.iter().map(|r| r.path.clone()).collect();
                 if let Some(p) = plan_path {
                     out.push(p.clone());
                 }
@@ -908,11 +913,11 @@ mod integration_tests {
             .unwrap();
         match (resp_a, resp_b) {
             (WaitResponse::Work(p_a), WaitResponse::Work(p_b)) => {
-                assert_eq!(p_a.plan_id, "alpha/shared.md");
-                assert_eq!(p_b.plan_id, "beta/shared.md");
-                assert_ne!(p_a.repo, p_b.repo);
-                assert!(p_a.repo.ends_with("alpha"));
-                assert!(p_b.repo.ends_with("beta"));
+                assert_eq!(p_a.work.plan_id, "alpha/shared.md");
+                assert_eq!(p_b.work.plan_id, "beta/shared.md");
+                assert_ne!(p_a.work.repo, p_b.work.repo);
+                assert!(p_a.work.repo.ends_with("alpha"));
+                assert!(p_b.work.repo.ends_with("beta"));
             }
             other => panic!("both calls should return Work; got {other:?}"),
         }
@@ -968,7 +973,7 @@ mod integration_tests {
             .expect("foo is visible");
 
         // Identical work-prefix.
-        assert_eq!(wfw_payload, wc.work);
+        assert_eq!(wfw_payload.work, wc.work);
     }
 
     #[tokio::test]

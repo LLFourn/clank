@@ -4,6 +4,9 @@
   "lifecycle": "string",
   "path": "string",
   "phase": "string",
+  "plan_file": {
+    "path": "string"
+  },
   "plan_id": "string",
   "plan_worktree_status": "string",
   "repo": "string",

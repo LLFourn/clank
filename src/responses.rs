@@ -297,6 +297,10 @@ pub fn build_work_payload(inputs: WorkPayloadInputs<'_>) -> trinity_core::api::W
             A::WriteFeedback {
                 path: feedback_path_for(&sha, inputs.author.as_str()),
                 target_sha: sha,
+                plan_file: trinity_core::api::PlanFile {
+                    path: inputs.plan_path.to_string(),
+                    content: None,
+                },
             }
         }
         R::AddressCommitChanges => {
@@ -305,14 +309,19 @@ pub fn build_work_payload(inputs: WorkPayloadInputs<'_>) -> trinity_core::api::W
                 .expect("AddressCommitChanges implies a review target")
                 .as_str()
                 .to_string();
-            let rc_paths = inputs
+            let reviews = inputs
                 .requesters
                 .iter()
-                .map(|author| feedback_path_for(&sha, author.as_str()))
+                .map(|author| trinity_core::api::CurrentReview {
+                    path: feedback_path_for(&sha, author.as_str()),
+                    author: author.clone(),
+                    verdict: trinity_core::vocab::Verdict::RequestChanges,
+                    content: None,
+                })
                 .collect();
             A::AddressChanges {
                 target_sha: sha,
-                rc_paths,
+                reviews,
                 plan_path: if plan_side {
                     Some(inputs.plan_path.to_string())
                 } else {

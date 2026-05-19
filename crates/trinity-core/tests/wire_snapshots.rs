@@ -225,6 +225,10 @@ fn schema_work_context_response() {
             action: ExpectedAction::WriteFeedback {
                 path: ".trinity/feedback/foo/abc/alice.md".into(),
                 target_sha: "abc".into(),
+                plan_file: PlanFile {
+                    path: ".trinity/plans/foo.md".into(),
+                    content: None,
+                },
             },
         },
         current_path: ".trinity/plans/foo.md".into(),
@@ -407,13 +411,20 @@ fn schema_delete_repo_outcome() {
 
 #[test]
 fn schema_wait_for_work_work() {
-    let v = serde_json::to_value(WaitForWorkResponse::Work(WorkPayload {
-        plan_id: "trinity/foo.md".into(),
-        repo: "/r".into(),
-        action: ExpectedAction::WriteFeedback {
-            path: ".trinity/feedback/foo/abc/alice.md".into(),
-            target_sha: "abc".into(),
+    let v = serde_json::to_value(WaitForWorkResponse::Work(WaitWorkPayload {
+        work: WorkPayload {
+            plan_id: "trinity/foo.md".into(),
+            repo: "/r".into(),
+            action: ExpectedAction::WriteFeedback {
+                path: ".trinity/feedback/foo/abc/alice.md".into(),
+                target_sha: "abc".into(),
+                plan_file: PlanFile {
+                    path: ".trinity/plans/foo.md".into(),
+                    content: None,
+                },
+            },
         },
+        stale_reviews: Vec::new(),
     }))
     .unwrap();
     assert_schema("wait_for_work_response_work", &v);
