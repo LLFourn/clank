@@ -376,10 +376,16 @@ unreachable error case.
 
 ## Dev workflow: dogfood via `cargo install`
 
-Once Phase 1 lands, switch the dev loop from "`cargo run --
-init`" to `cargo install --path . && trinity init`. The CLI is
-the tool we want to use; running it through `cargo run` keeps
-us from noticing UX cliff-edges. Concretely:
+The dogfood loop starts **before** Phase 1 implementation
+begins, not after it ships. First action: kill the running
+`trinity serve` daemon, `cargo install --path . --locked`,
+restart the daemon, and confirm `trinity --version` reports
+something. From that point every phase commit is followed by
+the same cycle: bump `Cargo.toml`, `cargo install`, restart
+the daemon if `serve` changed.
+
+The CLI is the tool we want to use; running it through `cargo
+run` keeps us from noticing UX cliff-edges. Concretely:
 
 - **Bump `Cargo.toml`'s `version` on every phase ship**, minor
   (`0.0.1` → `0.1.0` → `0.2.0` …). Patch bumps for follow-up
@@ -430,12 +436,19 @@ later work.
 
 ## Phases
 
+**Phase 0 — Bootstrap the dogfood loop.** Before any code:
+stop the running `trinity serve`, `cargo install --path .
+--locked`, restart, confirm `trinity --version` (will report
+whatever's in `Cargo.toml` today — the value doesn't matter
+yet). Update the README with the cargo-install dev loop. This
+is a single small commit that proves the workflow before we
+start relying on it.
+
 **Phase 1 — Wiring and init.** Add `init`/`finish`/`purge`
 subcommands to `src/main.rs`, scaffold `src/cli/`, implement
 `trinity init` end-to-end with the gitignore detection
-pre-flight. Wire `--version`. Add the `finish_preview` HTTP
-endpoint. Bump `Cargo.toml` to `0.1.0` and update the README
-with the `cargo install --path .` dev-loop note.
+pre-flight. Wire `--version` via clap's built-in. Add the
+`finish_preview` HTTP endpoint. Bump `Cargo.toml` to `0.1.0`.
 
 **Phase 2 — Finish (bare + amend).** Implement `trinity
 finish` and `trinity finish --amend` against the new
