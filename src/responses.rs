@@ -198,6 +198,30 @@ pub fn work_context_response_with_reader(
     )))
 }
 
+/// Project a gate's blocking-author set into typed current-review
+/// rows. Includes both `requesters` (REQUEST_CHANGES) and `ambiguous`
+/// (UNMARKED) — both states put the gate in `ChangesRequested` and
+/// must surface to the master as work to address. Sorted alphabetically
+/// by author so the wire order is stable.
+pub fn current_reviews_from_gate(
+    gate: &crate::review_state::CommitGate,
+) -> Vec<(AgentLabel, trinity_core::Verdict)> {
+    let mut rows: Vec<(AgentLabel, trinity_core::Verdict)> = gate
+        .requesters
+        .iter()
+        .cloned()
+        .map(|a| (a, trinity_core::Verdict::RequestChanges))
+        .chain(
+            gate.ambiguous
+                .iter()
+                .cloned()
+                .map(|a| (a, trinity_core::Verdict::Unmarked)),
+        )
+        .collect();
+    rows.sort_by(|a, b| a.0.as_str().cmp(b.0.as_str()));
+    rows
+}
+
 pub fn work_context_response_from_snapshot(
     state: &RepoState,
     worktree_status: PlanWorktreeStatus,
@@ -217,9 +241,9 @@ pub fn work_context_response_from_snapshot(
         .as_ref()
         .and_then(|sha| plan.event_for(sha));
     let review_target_kind = review_target_event.map(|e| e.kind());
-    let requesters: Vec<AgentLabel> = review_target_event
+    let current_reviews = review_target_event
         .and_then(|e| e.gate())
-        .map(|g| g.requesters.clone())
+        .map(current_reviews_from_gate)
         .unwrap_or_default();
     let work = build_work_payload(WorkPayloadInputs {
         plan_id: &plan_id,
@@ -229,7 +253,7 @@ pub fn work_context_response_from_snapshot(
         waiting: &w,
         review_target_sha: review_target_sha.as_ref(),
         review_target_kind,
-        requesters: &requesters,
+        current_reviews: &current_reviews,
         author: author_label,
     });
 
@@ -260,10 +284,12 @@ pub struct WorkPayloadInputs<'a> {
     pub waiting: &'a trinity_core::api::WaitingOn,
     pub review_target_sha: Option<&'a crate::lifecycle::CommitSha>,
     pub review_target_kind: Option<CommitKind>,
-    /// Authors of REQUEST_CHANGES feedback at the review target —
-    /// used to build `rc_paths` for `AddressChanges`. Empty for
-    /// non-AddressChanges reasons.
-    pub requesters: &'a [AgentLabel],
+    /// Typed current-review rows at the review target: each
+    /// blocking author (RequestChanges OR Unmarked) with their
+    /// real verdict. Both verdicts put the gate in
+    /// `ChangesRequested`, so master must address either kind. Empty
+    /// for non-AddressChanges reasons.
+    pub current_reviews: &'a [(AgentLabel, trinity_core::Verdict)],
     pub author: &'a AgentLabel,
 }
 
@@ -302,13 +328,13 @@ pub fn build_work_payload(inputs: WorkPayloadInputs<'_>) -> trinity_core::api::W
                 .as_str()
                 .to_string();
             let reviews = inputs
-                .requesters
+                .current_reviews
                 .iter()
-                .filter(|a| *a != inputs.author)
-                .map(|author| trinity_core::api::CurrentReview {
+                .filter(|(a, _)| a != inputs.author)
+                .map(|(author, verdict)| trinity_core::api::CurrentReview {
                     path: crate::disk_format::feedback_path_wire(inputs.plan_key, &sha, author),
                     author: author.clone(),
-                    verdict: trinity_core::vocab::Verdict::RequestChanges,
+                    verdict: *verdict,
                     content: None,
                 })
                 .collect();

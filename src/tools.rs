@@ -150,20 +150,37 @@ pub fn catalog() -> Vec<ToolDescriptor> {
                             autofill): your label. Used to construct the canonical reviewer \
                             write path for `write_feedback`. The MCP shim caches this.\n\
                           - `timeout_secs` (optional, positive seconds, default 1800 / 30 minutes).\n\n\
+                          The work payload is wrapped: `{ ...work fields..., \
+                          stale_reviews: [...] }`. `stale_reviews` is a master-only \
+                          sidecar listing reviews against superseded commits (one-shot \
+                          per agent; empty `[]` for reviewers). See action variants \
+                          below.\n\n\
                           Action variants (tagged by `kind` on the wire):\n\
-                          - `write_feedback { path, target_sha }` — reviewer: write your \
-                            verdict markdown (`APPROVE\\n...` / `REQUEST_CHANGES\\n...`) to \
-                            `path` against the commit at `target_sha`.\n\
-                          - `address_changes { target_sha, rc_paths, plan_path? }` — \
-                            master: read each RC file at `rc_paths` and follow up with a \
-                            fix commit. `plan_path` is present when the RC is plan-side \
-                            (PlanOnly/Mixed) — revise the plan body too.\n\
+                          - `write_feedback { path, target_sha, plan_file: { path, \
+                            content? } }` — reviewer: write your verdict markdown \
+                            (`APPROVE\\n...` / `REQUEST_CHANGES\\n...`) to `path` against \
+                            the commit at `target_sha`. `plan_file.content` is inlined \
+                            on first encounter of this plan file by this agent at this \
+                            content hash; absent on subsequent polls and for files >64 KB.\n\
+                          - `address_changes { target_sha, reviews: [{ path, author, \
+                            verdict, content? }, ...], plan_path? }` — master: each \
+                            entry in `reviews` is a blocking review (request_changes or \
+                            unmarked) you must address. `content` is inlined on first \
+                            encounter per (agent, path, hash). `plan_path` is present \
+                            when the review is plan-side (PlanOnly/Mixed) — revise the \
+                            plan body too.\n\
                           - `commit_plan_revision { plan_path }` — master: the plan file \
                             is dirty in the worktree. Commit the revision.\n\
                           - `start_implementation { previous_commit, plan_path }` — \
                             master: the previous commit is approved; write the next \
                             implementation commit.\n\
                           - `session_finished` — plan is finalized; no further action.\n\n\
+                          Stale reviews (master-only sidecar):\n\
+                          `stale_reviews: [{ path, author, verdict, target_sha, content? }, \
+                          ...]` — reviews recorded against a non-current target. Delivered \
+                          exactly once per (agent, path); rides on a legitimate master \
+                          wakeup (does NOT independently wake master). Reviewer-bound \
+                          responses always have `stale_reviews: []`.\n\n\
                           Timeout responses:\n\
                           ```\n\
                           { \"timed_out\": true }\n\

@@ -285,38 +285,6 @@ impl Runtime {
             .insert((repo_root, agent, path), hash);
     }
 
-    /// True if the stale-review sidecar for `(repo, agent, path)` has
-    /// already been delivered once. Strictly one-shot — path-keyed
-    /// (no content hash) so post-delivery edits don't re-surface
-    /// historical reviews.
-    pub async fn stale_review_seen(
-        &self,
-        repo_root: &std::path::Path,
-        agent: &crate::lifecycle::AgentLabel,
-        path: &str,
-    ) -> bool {
-        let trinity = self.state.lock().await;
-        trinity.seen_stale_reviews.contains(&(
-            repo_root.to_path_buf(),
-            agent.clone(),
-            path.to_string(),
-        ))
-    }
-
-    /// Record that the stale-review sidecar entry for `(repo, agent,
-    /// path)` was delivered (or attempted with `content: None` past
-    /// the 64 KB cap). "Marked seen" means the metadata reached the
-    /// agent, not that body bytes were delivered.
-    pub async fn mark_stale_review_seen(
-        &self,
-        repo_root: std::path::PathBuf,
-        agent: crate::lifecycle::AgentLabel,
-        path: String,
-    ) {
-        let mut trinity = self.state.lock().await;
-        trinity.seen_stale_reviews.insert((repo_root, agent, path));
-    }
-
     /// Subscribe to the live event broadcast channel. SSE handlers use
     /// this to receive new events as they're appended (no polling).
     pub fn subscribe_events(&self) -> broadcast::Receiver<LiveEvent> {

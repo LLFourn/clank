@@ -222,10 +222,10 @@ async fn compute_match(
     // `responses::build_work_payload` so the work-prefix shape is
     // identical by construction. Candidate fields feed
     // `WorkPayloadInputs` directly.
-    let requesters: Vec<AgentLabel> = candidate
+    let current_reviews = candidate
         .gate
         .as_ref()
-        .map(|g| g.requesters.clone())
+        .map(crate::responses::current_reviews_from_gate)
         .unwrap_or_default();
     let payload = crate::responses::build_work_payload(crate::responses::WorkPayloadInputs {
         plan_id: &plan_id.to_string(),
@@ -235,7 +235,7 @@ async fn compute_match(
         waiting: &w,
         review_target_sha: candidate.review_target.as_ref(),
         review_target_kind: candidate.review_target_kind,
-        requesters: &requesters,
+        current_reviews: &current_reviews,
         author,
     });
     Ok(Some(WaitMatch {
@@ -247,8 +247,10 @@ async fn compute_match(
 }
 
 /// Cap for inlined body content. Larger files emit `content:
-/// None` and rely on the agent to `Read` separately. Hash is
-/// still cached so subsequent polls don't re-evaluate.
+/// None` and rely on the agent to `Read` separately. The hash is
+/// still cached so the file's seen-state survives — subsequent polls
+/// still read and hash to detect changes, but skip re-sending content
+/// when the hash matches.
 const MAX_INLINE_BODY: usize = 64 * 1024;
 
 /// Wrap `WorkPayload` in `WaitWorkPayload`, opportunistically
@@ -315,9 +317,14 @@ async fn enrich_for_wait(
 
 /// Walk the plan timeline for feedback against superseded (non-
 /// current-target) commits and emit each one exactly once to
-/// `author`. Path-keyed cache: post-delivery edits don't re-surface
-/// historical reviews. Body inlined when it fits 64 KB; oversized
-/// entries deliver `content: None` and are still marked seen.
+/// `author`. Reservation is atomic with the check: each candidate's
+/// cache key goes into `seen_stale_reviews` via `BTreeSet::insert`
+/// while we still hold the runtime lock. If `insert` returns false
+/// the entry was already claimed (by a prior poll OR a concurrent
+/// poll), so we skip it. Disk reads happen outside the lock; a
+/// reservation that later fails to read just yields
+/// `content: None` — "delivered with metadata, body unreadable" is
+/// the same outcome as "oversized" by design.
 async fn collect_stale_reviews(
     runtime: &Runtime,
     repo_root: &std::path::Path,
@@ -327,39 +334,44 @@ async fn collect_stale_reviews(
 ) -> Vec<trinity_core::api::StaleReview> {
     let candidates: Vec<(String, AgentLabel, trinity_core::Verdict, String)> = {
         let trinity_arc = runtime.state();
-        let trinity = trinity_arc.lock().await;
-        let Some(plan) = trinity
+        let mut trinity = trinity_arc.lock().await;
+        let timeline_snapshot: Vec<_> = match trinity
             .repos
             .get(repo_root)
             .and_then(|s| s.plans.get(plan_key))
-        else {
-            return Vec::new();
+        {
+            Some(plan) => plan
+                .timeline
+                .iter()
+                .filter_map(|event| {
+                    let sha = event.sha().as_str().to_string();
+                    let gate = event.gate()?;
+                    let feedback: Vec<_> = gate
+                        .feedback
+                        .iter()
+                        .map(|(a, fb)| (a.clone(), fb.verdict))
+                        .collect();
+                    Some((sha, feedback))
+                })
+                .collect(),
+            None => return Vec::new(),
         };
         let current_target = current_target_sha.map(CommitSha::as_str);
         let mut out = Vec::new();
-        for event in &plan.timeline {
-            let sha = event.sha().as_str();
-            if Some(sha) == current_target {
+        for (sha, feedback) in timeline_snapshot {
+            if Some(sha.as_str()) == current_target {
                 continue;
             }
-            let Some(gate) = event.gate() else {
-                continue;
-            };
-            for (review_author, feedback) in &gate.feedback {
-                if review_author == author {
+            for (review_author, verdict) in feedback {
+                if &review_author == author {
                     continue;
                 }
-                let path = crate::disk_format::feedback_path_wire(plan_key, sha, review_author);
+                let path = crate::disk_format::feedback_path_wire(plan_key, &sha, &review_author);
                 let key = (repo_root.to_path_buf(), author.clone(), path.clone());
-                if trinity.seen_stale_reviews.contains(&key) {
+                if !trinity.seen_stale_reviews.insert(key) {
                     continue;
                 }
-                out.push((
-                    path,
-                    review_author.clone(),
-                    feedback.verdict,
-                    sha.to_string(),
-                ));
+                out.push((path, review_author, verdict, sha.clone()));
             }
         }
         out
@@ -372,9 +384,6 @@ async fn collect_stale_reviews(
             Ok(body) if body.len() <= MAX_INLINE_BODY => Some(body),
             _ => None,
         };
-        runtime
-            .mark_stale_review_seen(repo_root.to_path_buf(), author.clone(), path.clone())
-            .await;
         result.push(trinity_core::api::StaleReview {
             path,
             author: review_author,
@@ -452,7 +461,9 @@ fn caller_already_voted(cand: &Candidate, reason: WaitingReason, author: &AgentL
         }
     };
     let Some(gate) = gate else { return false };
-    gate.approvers.contains(author) || gate.requesters.contains(author)
+    gate.approvers.contains(author)
+        || gate.requesters.contains(author)
+        || gate.ambiguous.contains(author)
 }
 
 #[derive(Debug, Clone)]
@@ -585,10 +596,10 @@ mod tests {
             agents: Vec::new(),
             description: String::new(),
         };
-        let requesters: Vec<AgentLabel> = cand
+        let current_reviews = cand
             .gate
             .as_ref()
-            .map(|g| g.requesters.clone())
+            .map(crate::responses::current_reviews_from_gate)
             .unwrap_or_default();
         let payload = crate::responses::build_work_payload(crate::responses::WorkPayloadInputs {
             plan_id: "trinity/sid.md",
@@ -598,7 +609,7 @@ mod tests {
             waiting: &w,
             review_target_sha: cand.review_target.as_ref(),
             review_target_kind: cand.review_target_kind,
-            requesters: &requesters,
+            current_reviews: &current_reviews,
             author,
         });
         match payload.action {
@@ -1400,6 +1411,116 @@ mod integration_tests {
             "second poll should suppress stale review; got: {:?}",
             p2.stale_reviews
         );
+    }
+
+    /// Master `AddressChanges`: first poll inlines per-review content
+    /// (mixed RC + Unmarked rows), second poll omits same-hash content.
+    /// Locks down both the opportunistic-fill behavior for reviews[]
+    /// and the verdict preservation (Unmarked must surface, not be
+    /// silently coerced to RequestChanges).
+    #[tokio::test]
+    async fn address_changes_reviews_content_opportunistic_with_mixed_verdicts() {
+        let dir = init_repo();
+        write_file(dir.path(), ".trinity/plans/foo.md", "# foo\n");
+        commit(dir.path(), "add foo");
+        let rt = Runtime::new();
+        rt.add_repo(dir.path().to_path_buf()).await.unwrap();
+
+        let intro: CommitSha = rt
+            .read_repo(dir.path(), |s| {
+                s.plans[&PlanKey::parse("foo").unwrap()].plan_intro.clone()
+            })
+            .await
+            .unwrap();
+        let bob_path = format!(".trinity/feedback/foo/{}/bob.md", intro.as_str());
+        let dana_path = format!(".trinity/feedback/foo/{}/dana.md", intro.as_str());
+        write_file(dir.path(), &bob_path, "REQUEST_CHANGES\nbob says fix\n");
+        write_file(dir.path(), &dana_path, "no verdict marker here\n");
+        rt.handle_signal(
+            dir.path(),
+            FilesystemSignal::FeedbackWritten {
+                parsed: crate::disk_format::parse_feedback_path(&PathBuf::from(format!(
+                    "foo/{}/bob.md",
+                    intro.as_str()
+                )))
+                .unwrap(),
+            },
+            1,
+        )
+        .await
+        .unwrap();
+        rt.handle_signal(
+            dir.path(),
+            FilesystemSignal::FeedbackWritten {
+                parsed: crate::disk_format::parse_feedback_path(&PathBuf::from(format!(
+                    "foo/{}/dana.md",
+                    intro.as_str()
+                )))
+                .unwrap(),
+            },
+            1,
+        )
+        .await
+        .unwrap();
+
+        let mut a1 = args(dir.path(), WaitingRole::Master, "foo", "lloyd");
+        a1.timeout_secs = Some(1);
+        let resp = wait_for_work(&rt, a1).await.unwrap();
+        let p1 = match resp {
+            WaitResponse::Work(p) => p,
+            _ => panic!("expected work"),
+        };
+        match &p1.work.action {
+            trinity_core::api::ExpectedAction::AddressChanges { reviews, .. } => {
+                assert_eq!(reviews.len(), 2);
+                let bob = reviews
+                    .iter()
+                    .find(|r| r.author.as_str() == "bob")
+                    .expect("bob");
+                assert_eq!(bob.verdict, trinity_core::Verdict::RequestChanges);
+                assert_eq!(
+                    bob.content.as_deref(),
+                    Some("REQUEST_CHANGES\nbob says fix\n"),
+                    "RC content must be inlined on first poll"
+                );
+                let dana = reviews
+                    .iter()
+                    .find(|r| r.author.as_str() == "dana")
+                    .expect("dana");
+                assert_eq!(
+                    dana.verdict,
+                    trinity_core::Verdict::Unmarked,
+                    "Unmarked verdict must surface (not be coerced)"
+                );
+                assert_eq!(
+                    dana.content.as_deref(),
+                    Some("no verdict marker here\n"),
+                    "Unmarked content must be inlined on first poll"
+                );
+            }
+            other => panic!("expected AddressChanges, got {other:?}"),
+        }
+
+        let mut a2 = args(dir.path(), WaitingRole::Master, "foo", "lloyd");
+        a2.timeout_secs = Some(1);
+        let resp2 = wait_for_work(&rt, a2).await.unwrap();
+        let p2 = match resp2 {
+            WaitResponse::Work(p) => p,
+            _ => panic!("expected work"),
+        };
+        match &p2.work.action {
+            trinity_core::api::ExpectedAction::AddressChanges { reviews, .. } => {
+                for r in reviews {
+                    assert!(
+                        r.content.is_none(),
+                        "second poll must omit content for {} (cache hit); got {:?}",
+                        r.author.as_str(),
+                        r.content
+                    );
+                }
+            }
+            other => panic!("expected AddressChanges, got {other:?}"),
+        }
     }
 
     /// Path-keyed semantics: editing a stale feedback file between
