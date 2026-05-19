@@ -19,11 +19,8 @@ pub async fn run(args: PurgeArgs) -> anyhow::Result<()> {
     if args.amend {
         anyhow::bail!("--amend is not yet implemented in this phase");
     }
-    if args.squash.is_some() {
-        anyhow::bail!("--squash is not yet implemented in this phase");
-    }
-    if args.drop_finalize {
-        anyhow::bail!("--drop-finalize is not yet implemented in this phase");
+    if args.squash.is_some() && args.all {
+        anyhow::bail!("--squash is not supported with --all");
     }
 
     if args.all && args.plan.is_some() {
@@ -44,7 +41,9 @@ async fn run_single(
     args: &PurgeArgs,
 ) -> anyhow::Result<()> {
     let stem = super::finish::resolve_stem_or_infer_for_purge(&args.plan, basename, daemon).await?;
-    let preview = fetch_rewrite_preview(daemon, basename, &stem, args.drop_finalize).await?;
+    // Always strip the finalize snapshot too — if anyone wants to
+    // preserve the audit trail, we can add `--keep-finalize` later.
+    let preview = fetch_rewrite_preview(daemon, basename, &stem, true).await?;
 
     if !args.dry && !args.yes && !confirm_single(&stem, args.into_branch.as_deref())? {
         anyhow::bail!("aborted");
@@ -221,7 +220,6 @@ mod tests {
             yes: true,
             squash: None,
             amend: false,
-            drop_finalize: false,
         };
         let err = run(args).await.unwrap_err();
         let msg = format!("{err}");

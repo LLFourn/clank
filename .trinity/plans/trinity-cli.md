@@ -106,9 +106,11 @@ CLI needs:
   owns the classification model; the CLI owns the
   side-effects.
 
-  `--include_finalize` toggles whether the latest finalize
-  commit is in the strip set (controls `--purge` vs `--squash
-  --purge` vs `--drop-finalize`).
+  `--include_finalize` is a daemon-internal query parameter:
+  the CLI always passes `true` (every `trinity purge` strips
+  the finalize snapshot too). A future `--keep-finalize` CLI
+  flag could flip this back if anyone needs the audit-trail
+  preservation behavior.
 
 ## CLI binary wiring
 
@@ -250,11 +252,16 @@ The `--purge` machinery without a finalize commit.
 
 ```text
 trinity purge [<plan>] [--squash <msg>] [--amend]
-              [--drop-finalize]
               [--into-branch <name>]
               [--dry]
               [--yes] [--allow-rewrite-protected]
 ```
+
+`trinity purge` always strips the finalize snapshot
+(`.trinity/finished/<stem>/`) along with the plan file. No
+`--drop-finalize` flag — if anyone needs the
+preserve-the-audit-trail behavior we can add `--keep-finalize`
+later.
 
 Use cases:
 
@@ -299,7 +306,6 @@ implemented" in Phase 4):
 - `--squash "<message>"`: collapse plan-attributed commits into
   one (same interleaving rules as `trinity finish --squash`).
 - `--amend`: amend HEAD if HEAD touches this plan's artifacts.
-- `--drop-finalize`: also strip `.trinity/finished/<stem>/`.
 - `--allow-rewrite-protected`: opt-in for protected branches
   (the corresponding detection lands in Phase 5).
 
@@ -502,12 +508,11 @@ Per-commit shape cases:
 
 Range/flag cases:
 
-6. Finalize commit at HEAD under `--purge` → kept; under
-   `--squash --purge` → dropped; under `trinity purge
-   --drop-finalize` → dropped.
-7. Two active plans (foo, bar). `trinity finish foo --purge`
-   leaves bar's commits verbatim; mixed foo+bar commits
-   rewritten to strip only foo.
+6. Finalize commit at HEAD under `trinity purge foo` →
+   dropped (we always strip the snapshot too).
+7. Two active plans (foo, bar). `trinity purge foo` leaves
+   bar's commits verbatim; mixed foo+bar commits rewritten
+   to strip only foo's paths.
 8. Re-running `--purge` after `--purge` → idempotent.
 9. `--amend --purge` on a finalize commit → amends HEAD to
    also strip HEAD's parent if it's a plan-touching commit;
@@ -520,8 +525,6 @@ Refusal cases:
 
 11. Working tree dirty → refuse.
 12. Merge commit in range → refuse with clear message.
-13. Orphan-finalize-snapshot under bare `trinity purge` →
-    refuse, suggest `--squash` or `--drop-finalize`.
 
 Dry-run cases:
 
@@ -588,8 +591,9 @@ later work.
   `--squash`, `--squash --purge`, and `--purge` variants.
 - `trinity purge` runs the history-rewriting engine, accepts
   plan id or stem (or `--all`), supports `--into-branch`,
-  `--dry`, `--yes`, `--squash`, `--amend`, `--drop-finalize`,
-  and `--allow-rewrite-protected`.
+  `--dry`, `--yes`, `--squash`, `--amend`, and
+  `--allow-rewrite-protected`. Always strips the finalize
+  snapshot (`.trinity/finished/<stem>/`) — no flag.
 - `--dry` on every mutating command emits a `git rebase
   --interactive` todo list (the rebase-todo format described
   above). No commits, no ref updates. Operator can pipe the
@@ -600,11 +604,8 @@ later work.
   config) unless `--allow-rewrite-protected` is passed.
   `--into-branch <name>` bypasses the protected check because
   it doesn't touch the protected branch.
-- Orphan-finalize refusal: `trinity purge` against a HEAD that
-  contains `.trinity/finished/<stem>/` (a finalize snapshot)
-  refuses with a clear "snapshot would be orphaned" message
-  unless `--squash` or `--drop-finalize` is passed (both
-  remove the snapshot too, eliminating the orphan).
+- Orphan-finalize refusal is moot — `trinity purge` always
+  strips the snapshot, so there's no orphan to refuse.
 - The CLI never re-derives projection state — every "is this
   plan finished?" / "what's the latest reviewable sha?" /
   "give me the plan's commit range" question is answered by
@@ -658,10 +659,9 @@ previewed tip so a race between preview and commit aborts
 cleanly). All-Drop case moves the branch to `intro_parent`
 (refuses cleanly if intro is the root commit). `trinity purge
 [<plan>] [--into-branch <name>] [--dry] [--yes]` consumes the
-manifest. `--squash`, `--amend`, `--drop-finalize` and
-`trinity finish`'s `--squash`/`--purge` flags are
-wire-reserved but bail with "not yet implemented" — they
-land in Phase 5.
+manifest. `--squash`, `--amend`, and `trinity finish`'s
+`--squash`/`--purge` flags are wire-reserved but bail with
+"not yet implemented" — they land in Phase 6.
 
 **Phase 5 — Replace `--dry` with rebase-todo output.** Rip out
 the human-readable `--dry` listing and replace it with the
@@ -673,16 +673,19 @@ of bailing — the operator wants to see the planned actions even
 if the live run would refuse. Tests assert the format is
 parseable as `git rebase --interactive` would consume it.
 
-**Phase 6 — `trinity purge --squash` / `--amend` /
-`--drop-finalize`.** Three flags on `trinity purge` that change
-how the rewrite engine consumes the manifest. `--squash
-"<msg>"` collapses all `pick`/`edit` commits in the range into
-one commit (same range walk, but the engine concatenates trees
-rather than chaining). Refuses when foreign commits sit in the
-range (foreign-bit on `RewriteCommit`). `--amend` requires HEAD
-to be a finalize commit and amends HEAD's tree to also strip.
-`--drop-finalize` extends the strip set to include
-`.trinity/finished/<stem>/`.
+**Phase 6 — `trinity purge --squash` / `--amend`.** Two flags
+on `trinity purge` that change how the rewrite engine consumes
+the manifest. `--squash "<msg>"` collapses all `pick`/`edit`
+commits in the range into one commit (same range walk, but the
+engine produces a single commit on top of `intro_parent`).
+Refuses when foreign commits sit in the range (foreign-bit on
+`RewriteCommit`). `--amend` requires HEAD to be a finalize
+commit and amends HEAD's tree to also strip.
+
+The finalize snapshot is always stripped — no
+`--drop-finalize` flag. A future `--keep-finalize` could flip
+this back if anyone needs the audit-trail preservation
+behavior.
 
 **Phase 7 — `trinity finish --purge` / `--squash` /
 `--squash --purge`.** Composite of Phase 2's finish ceremony +
@@ -692,10 +695,11 @@ tree drops everything `.trinity/`. `--squash`: collapse plan-
 attributed commits into one + finalize tree. `--squash --purge`:
 both. Shares the rewrite-todo dry-run with the purge variants.
 
-**Phase 8 — Protected-branch + orphan-finalize refusals.**
-Detect `main`/`master` (or matching `branch.<name>.protect`
-git config) and refuse to rewrite without
-`--allow-rewrite-protected`. `--into-branch` is exempt. Refuse
-bare `trinity purge` against a HEAD that contains
-`.trinity/finished/<stem>/` (would orphan the snapshot) —
-operator must explicitly pass `--squash` or `--drop-finalize`.
+**Phase 8 — Protected-branch refusal.** Detect `main`/`master`
+(or matching `branch.<name>.protect` git config) and refuse to
+rewrite without `--allow-rewrite-protected`. `--into-branch`
+is exempt because it doesn't touch the protected branch.
+
+Orphan-finalize refusal is no longer needed — `trinity purge`
+always strips the finalize snapshot, so there's no orphan
+case to refuse.

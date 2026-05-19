@@ -85,10 +85,6 @@ pub struct PurgeArgs {
     /// a new chain.
     #[arg(long)]
     pub amend: bool,
-    /// Reserved for a future phase: also strip
-    /// `.trinity/finished/<stem>/` from history.
-    #[arg(long)]
-    pub drop_finalize: bool,
 }
 
 /// Resolve the repo root: explicit `--repo` path wins, otherwise
