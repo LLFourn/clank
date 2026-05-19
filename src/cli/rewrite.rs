@@ -70,14 +70,7 @@ pub async fn run(opts: RewriteOpts<'_>) -> anyhow::Result<RewriteOutcome> {
     let blockers = collect_blockers(&opts)?;
 
     if opts.dry {
-        print_dry_run(opts.intro_sha, opts.head_sha, &plan);
-        if !blockers.is_empty() {
-            println!();
-            println!("would FAIL on a live run because:");
-            for b in &blockers {
-                println!("  - {b}");
-            }
-        }
+        print_rebase_todo(&opts, &plan, &blockers);
         return Ok(RewriteOutcome::default());
     }
 
@@ -205,45 +198,119 @@ fn collect_blockers(opts: &RewriteOpts<'_>) -> anyhow::Result<Vec<String>> {
     Ok(blockers)
 }
 
-fn print_dry_run(intro_sha: Option<&CommitSha>, head_sha: &CommitSha, plan: &ExecutionPlan) {
+/// Emit a `git rebase --interactive` todo list. The operator can
+/// pipe it to git via `GIT_SEQUENCE_EDITOR='cp <file>' git rebase
+/// --interactive --keep-empty <intro>^`, or just read it as a
+/// preview. When ANY blocker is present every todo command is
+/// commented out so the file isn't pipeable unchanged — `git`
+/// ignores `#` lines, so a blocked output that left commands
+/// uncommented would let the operator execute a rewrite the live
+/// command would refuse.
+fn print_rebase_todo(opts: &RewriteOpts<'_>, plan: &ExecutionPlan, blockers: &[String]) {
+    let cmt = if blockers.is_empty() { "" } else { "# " };
+
+    println!("# trinity rewrite preview");
+    if let Some(intro) = opts.intro_sha {
+        println!(
+            "# range: {}..{} ({} commits in rewrite range)",
+            short(intro.as_str()),
+            short(opts.head_sha.as_str()),
+            plan.steps.len(),
+        );
+    } else {
+        println!("# range: (empty — no .trinity/ history)");
+    }
     println!(
-        "dry-run: would rewrite {} commit(s) from {} to {}",
-        plan.steps.len(),
-        intro_sha
+        "# starting parent: {}",
+        plan.intro_parent.as_deref().unwrap_or("(root)"),
+    );
+    let target = match opts.into_branch {
+        Some(b) => format!("a NEW branch `{b}` (current branch untouched)"),
+        None => "the CURRENT branch (in place)".into(),
+    };
+    println!("# target: {target}");
+    println!("#");
+    if !blockers.is_empty() {
+        println!("# BLOCKERS (live run would refuse):");
+        for b in blockers {
+            println!("#   - {b}");
+        }
+        println!("#");
+        println!("# Every todo command below is commented out because of");
+        println!("# the blockers above. Address them, re-run `--dry`,");
+        println!("# and only then pipe to git.");
+        println!("#");
+    } else {
+        println!("# Run with:");
+        println!("#   GIT_SEQUENCE_EDITOR='cp <this-file>' \\");
+        let intro_anchor = opts
+            .intro_sha
             .map(|s| short(s.as_str()))
-            .unwrap_or_else(|| "(none)".into()),
-        short(head_sha.as_str()),
-    );
-    println!(
-        "starting parent: {}",
-        plan.intro_parent.as_deref().unwrap_or("(root)")
-    );
+            .unwrap_or_else(|| "<intro>".into());
+        println!(
+            "#     git rebase --interactive --keep-empty {intro_anchor}^"
+        );
+        println!("#");
+        println!("# Caveats:");
+        println!("#   - `--into-branch` isn't supported by git rebase. To");
+        println!("#     preview on a side branch: `git checkout -b scratch`");
+        println!("#     before running the rebase.");
+        println!("#   - No `<expected-old>` ref-update guard like the live");
+        println!("#     engine. Don't race other branch updates.");
+        println!("#   - `--keep-empty` is required so commits that become");
+        println!("#     empty after strip stay visible for review.");
+        println!("#");
+    }
+
     let foreign_count = plan.steps.iter().filter(|s| s.foreign).count();
     if foreign_count > 0 {
-        println!(
-            "  warning: {foreign_count} commit(s) in range are NOT attributed to this plan; \
-             they will be kept verbatim (or rewritten if cross-plan mixed)"
-        );
+        println!("# {foreign_count} commit(s) in the range are foreign to this plan");
+        println!("# (they appear here so the parent chain is contiguous).");
+        println!("#");
     }
+
     for step in &plan.steps {
-        let action = match step.disposition {
-            RewriteDisposition::Drop => "drop",
-            RewriteDisposition::KeepVerbatim => "keep verbatim",
-            RewriteDisposition::Rewrite => "rewrite",
-        };
-        let foreign_tag = if step.foreign { " (foreign)" } else { "" };
-        println!(
-            "  {} {}{}  {}",
-            short(&step.sha),
-            action,
-            foreign_tag,
-            step.subject
-        );
-        for path in &step.strip_paths {
-            println!("    - strip {path}");
+        let foreign_tag = if step.foreign { " [foreign]" } else { "" };
+        match step.disposition {
+            RewriteDisposition::Drop => {
+                println!("{cmt}drop  {} {}{}", short(&step.sha), step.subject, foreign_tag);
+            }
+            RewriteDisposition::KeepVerbatim => {
+                println!("{cmt}pick  {} {}{}", short(&step.sha), step.subject, foreign_tag);
+            }
+            RewriteDisposition::Rewrite => {
+                println!("{cmt}edit  {} {}{}", short(&step.sha), step.subject, foreign_tag);
+                let joined = step
+                    .strip_paths
+                    .iter()
+                    .map(|p| shell_quote(p))
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                println!("{cmt}# strip: {}", step.strip_paths.join(", "));
+                println!(
+                    "{cmt}# run: git rm --cached {joined} && \\"
+                );
+                println!("{cmt}#      git commit --amend --no-edit --allow-empty && \\");
+                println!("{cmt}#      git rebase --continue");
+            }
         }
     }
-    println!("(dry-run: no commits created, no refs updated)");
+}
+
+/// POSIX-style single-quote escaping for paths that might contain
+/// spaces or shell metacharacters. Operators copy-paste these into
+/// a shell so they need to be safe.
+fn shell_quote(s: &str) -> String {
+    if s.chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '/' | '.' | '_' | '-'))
+    {
+        s.to_string()
+    } else {
+        // Wrap in single quotes; escape any existing single quotes
+        // with the standard `'\''` dance.
+        let escaped = s.replace('\'', r"'\''");
+        format!("'{escaped}'")
+    }
 }
 
 /// Walk `plan.steps` in order, producing a new tip SHA. When every
@@ -941,6 +1008,13 @@ mod tests {
             tree_has(dir.path(), "scrubbed", "README.md"),
             "seed file lost from rewritten branch"
         );
+    }
+
+    #[test]
+    fn shell_quote_handles_metachars() {
+        assert_eq!(shell_quote("simple/path.md"), "simple/path.md");
+        assert_eq!(shell_quote("a b.md"), "'a b.md'");
+        assert_eq!(shell_quote("isn't.md"), r"'isn'\''t.md'");
     }
 
     #[tokio::test]
