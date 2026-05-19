@@ -145,22 +145,62 @@ projection paths (`prompt_hint_for`, `derive_locations`,
 `build_action` in `src/server/wait.rs`) go away. `ExpectedAction`
 is the sole "what to do" enum.
 
-### Variant payloads (recap)
+### Variant payloads — extended
 
-`ExpectedAction` already exists from the previous plan:
+`ExpectedAction` exists from the previous plan but its variants
+currently lack paths that `src/server/wait.rs::derive_locations`
+returns for WFW. Extend each variant so the payload is
+actionable without a parallel `locations` list:
 
 ```rust
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ExpectedAction {
-    WriteFeedback { path: String, target_sha: String },
-    AddressChanges { target_sha: String, rc_paths: Vec<String> },
-    CommitPlanRevision,
-    StartImplementation { previous_commit: String },
+    /// Reviewer: write verdict markdown to `path` against the
+    /// commit at `target_sha`.
+    WriteFeedback {
+        path: String,
+        target_sha: String,
+    },
+    /// Master: address RC feedback. `rc_paths` are the
+    /// request-changes files to read; `plan_path` is `Some`
+    /// when the RC is plan-side (kind `PlanOnly | Mixed`),
+    /// meaning the master needs to revise the plan body as
+    /// part of the fix-up commit. `None` for code-side
+    /// (`CodeOnly`) RCs.
+    AddressChanges {
+        target_sha: String,
+        rc_paths: Vec<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        plan_path: Option<String>,
+    },
+    /// Master: commit the dirty plan file at `plan_path`.
+    CommitPlanRevision {
+        plan_path: String,
+    },
+    /// Master: write the next implementation commit. `plan_path`
+    /// is provided so the agent has the plan body to hand without
+    /// reconstructing the path from `plan_id`. `previous_commit`
+    /// is the SHA of the approved commit being built on.
+    StartImplementation {
+        previous_commit: String,
+        plan_path: String,
+    },
+    /// Plan is finalized; no further action.
     SessionFinished,
 }
 ```
 
-Five variants, no shared-payload smell. WFW returns these too.
+Each variant carries exactly the paths/SHAs the agent needs to
+act. The pre-existing `locations` field on `WorkPayload`
+disappears because every path that used to live there is now in
+the variant where it's relevant.
+
+`current_path` on `WorkContextResponse` stays — that's the
+always-on "where this plan's file lives" pointer, useful for
+`SessionFinished` displays and surface routing. It's allowed to
+duplicate `plan_path` inside an action variant; the variant
+payload is what the agent acts on, `current_path` is the
+identity pointer.
 
 ## Files touched (sketch)
 
@@ -171,14 +211,82 @@ Five variants, no shared-payload smell. WFW returns these too.
 - `crates/trinity-core/src/vocab.rs` — `CommitKind` stays (used
   elsewhere). No deletions here this round.
 - `src/server/wait.rs` — gut the WFW projection. The
-  `build_action`/`derive_locations`/`prompt_hint_for` triplet
-  collapses to one builder that takes the candidate snapshot
-  and emits `WorkPayload { plan_id, repo, action: ExpectedAction }`.
-  Most of the per-variant `(target_sha, commit_kind, prompt_hint)`
-  threading vanishes.
+  `build_action` / `derive_locations` / `prompt_hint_for`
+  triplet collapses into the new shared builder (see below).
 - `src/responses.rs::work_context_response_from_snapshot` —
-  build the `WorkPayload` (sharing the new builder with WFW
-  if cheap) and embed it in the response struct.
+  builds `WorkPayload` via the SAME shared builder, then
+  flatten-embeds it alongside the state-context fields.
+
+### Shared builder (mandatory, not "if cheap")
+
+The whole point of this plan is preventing two parallel
+"what's the work" hierarchies from drifting. One projection
+function:
+
+```rust
+// In src/responses.rs (or wherever — the goal is that BOTH
+// surfaces call this; no second implementation).
+pub fn build_work_payload(
+    plan_id: &PlanId,
+    repo_root: &Path,
+    plan_path: &str,         // canonical plan file path
+    waiting: &WaitingOn,     // gives us the reason
+    review_target: Option<&CommitSha>,
+    review_target_kind: Option<CommitKind>,
+    gate: Option<&CommitGate>,
+    author: &AgentLabel,
+) -> WorkPayload {
+    let action = match waiting.reason {
+        WaitingReason::CommitNeedsReview => {
+            let sha = review_target.expect(...).as_str().to_string();
+            ExpectedAction::WriteFeedback {
+                path: format!(".trinity/feedback/{}/{}/{}.md", plan_id.key(), sha, author),
+                target_sha: sha,
+            }
+        }
+        WaitingReason::AddressCommitChanges => {
+            let sha = review_target.expect(...).as_str().to_string();
+            let rc_paths = gate.map(|g| g.requesters.iter().map(|a|
+                format!(".trinity/feedback/{}/{}/{}.md", plan_id.key(), sha, a)
+            ).collect()).unwrap_or_default();
+            let plan_side = matches!(review_target_kind,
+                Some(CommitKind::PlanOnly | CommitKind::Mixed));
+            ExpectedAction::AddressChanges {
+                target_sha: sha,
+                rc_paths,
+                plan_path: if plan_side { Some(plan_path.to_string()) } else { None },
+            }
+        }
+        WaitingReason::CommitPlanRevision => {
+            ExpectedAction::CommitPlanRevision { plan_path: plan_path.to_string() }
+        }
+        WaitingReason::ReadyToStartImplementation => {
+            ExpectedAction::StartImplementation {
+                previous_commit: review_target.expect(...).as_str().to_string(),
+                plan_path: plan_path.to_string(),
+            }
+        }
+        WaitingReason::SessionFinished => ExpectedAction::SessionFinished,
+    };
+    WorkPayload {
+        plan_id: plan_id.to_string(),
+        repo: repo_root.to_string_lossy().into_owned(),
+        action,
+    }
+}
+```
+
+Both `src/server/wait.rs::wait_for_work` and
+`src/responses.rs::work_context_response_from_snapshot` MUST
+call this exact function. No parallel "build the action" code
+in either surface.
+
+Cross-surface invariant test (mandatory acceptance criterion):
+a unit test fixtures a `(Candidate / RepoState snapshot, author)`
+and asserts the `WorkPayload` returned by the WFW path equals the
+`work_context` path's. Same state in, same payload out. If they
+ever diverge, the test fails at compile time (the types are
+literally the same) or at runtime (the values must match).
 - `src/server/wait.rs::integration_tests` — update existing
   tests that destructure `WorkAction::ReviewCommit { ... }` etc.
   Action match arms reshape onto `ExpectedAction` variants.
@@ -192,7 +300,18 @@ Five variants, no shared-payload smell. WFW returns these too.
 - `crates/trinity-core/tests/round_trip.rs` — drop the old
   `work_action_*_round_trips` tests; the `ExpectedAction`
   round-trips from the previous plan already cover the action
-  half.
+  half. Add round-trips for the new payload fields
+  (`AddressChanges.plan_path`, `CommitPlanRevision.plan_path`,
+  `StartImplementation.plan_path`).
+- `src/tools.rs` — rewrite the `wait_for_work` and
+  `work_context` tool descriptions to reflect the new flat
+  shape. Today's docs advertise `work`, `locations`,
+  `commit_kind`, `prompt_hint` for WFW and `expected_action`
+  for `work_context`; both become misleading after the wire
+  change.
+- `src/mcp_shim/mod.rs` — the bootstrap instruction text
+  references both tools; check it doesn't promise the old
+  shape.
 
 ## Rules
 
@@ -234,6 +353,17 @@ Five variants, no shared-payload smell. WFW returns these too.
 - `WorkPayload` is defined and used by both surfaces.
 - Existing integration tests in `src/server/wait.rs` updated
   to match the new variant shapes.
+- One shared `build_work_payload` function exists and is the
+  ONLY constructor of `WorkPayload`. Both `wait_for_work` and
+  `work_context` call it.
+- A cross-surface equality test asserts that, for the same
+  `(snapshot, author)`, the `WorkPayload` returned by the WFW
+  path equals the one embedded in `WorkContextResponse`.
+- `src/tools.rs` descriptions and `src/mcp_shim/mod.rs`
+  instruction text both describe the new flat shape — no
+  lingering references to `work`, `locations`, `commit_kind`,
+  `prompt_hint`, or the old nested `expected_action` field
+  layout.
 - All workspace + frontend tests green.
 
 ## Non-goals
