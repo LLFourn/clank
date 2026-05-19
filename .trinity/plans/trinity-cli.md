@@ -34,14 +34,21 @@ It also unlocks the other two commands:
 
 ## Non-goals
 
-- Anything daemon-side. The daemon already exposes everything
-  the CLI needs to read (see "Dependencies" below). The CLI is
-  pure operator surface.
+- **Daemon-side mutations.** The daemon adds read-only typed
+  projection endpoints (`finish_preview`, `rewrite_preview`)
+  but never writes Trinity artifacts, never runs mutating git
+  operations, and never edits the working tree. All
+  mutations — file copies, `git add`, `git commit`, tree
+  rewrites, ref updates — happen in the CLI from data the
+  daemon previewed.
 - A `trinity wfw` CLI — separate stub `trinity-wfw-cli.md`.
 - Integrating the CLI into post-commit hooks or auto-WFW —
   separate stub `agent-automation-hooks.md`.
 - Persistent CLI configuration. Every invocation reads the live
   daemon state and worktree.
+- A historical-attribution endpoint for plans no longer
+  visible in the fold (see `--recover-from-history` note
+  under `trinity purge`).
 
 ## Dependencies
 
@@ -82,14 +89,26 @@ CLI needs:
   - resulting parent chain shape
   - target-branch operation: `update_current | new_branch`
 
-  Plain projection over `attribution.rs` + the plan's commit
-  range — no I/O outside what the fold already knows. The CLI
-  is a thin executor of this manifest.
+  **Data sources.** Attribution comes from the fold
+  (`attribution.rs`). The strip-path set for `rewrite`
+  commits requires per-commit tree inspection — which entries
+  under `.trinity/` for this plan exist in that commit's
+  tree — and the fold doesn't store full tree contents, so
+  the endpoint performs **read-only git inspection at request
+  time** (`git ls-tree`, `git diff-tree`) for the in-range
+  shas. The classification rules themselves (drop/keep/
+  rewrite, foreign-commit definition, what counts as a
+  plan-`.trinity/` path) live in typed code that's
+  unit-testable against fixture commit data — no daemon-side
+  branch state, no working-tree dependence.
 
-  The classification rules (drop/keep/rewrite) live in the
-  daemon. `--include_finalize` toggles whether the latest
-  finalize commit is in the strip set (controls `--purge` vs
-  `--squash --purge` vs `--drop-finalize`).
+  The CLI is a thin executor of this manifest. The daemon
+  owns the classification model; the CLI owns the
+  side-effects.
+
+  `--include_finalize` toggles whether the latest finalize
+  commit is in the strip set (controls `--purge` vs `--squash
+  --purge` vs `--drop-finalize`).
 
 ## CLI binary wiring
 
@@ -515,12 +534,16 @@ No history rewriting yet; no squash. Covers the common case
 (the ceremony I bungled in this session).
 
 **Phase 3 — rewrite_preview endpoint.** Implement the
-`rewrite_preview` HTTP endpoint as pure projection over
-existing fold state: commit range, per-commit disposition,
-foreign-commit detection, strip-path set, target-branch
-operation. No CLI changes — the endpoint is consumed in
-Phase 4. Tests cover the per-commit classification rules
-end-to-end without touching git.
+`rewrite_preview` HTTP endpoint: attribution + commit-range
+from the fold, per-commit strip-path set via read-only `git
+ls-tree`/`git diff-tree` at request time. Classification
+rules (drop/keep/rewrite, foreign-commit definition, plan-
+`.trinity/` path predicate) are typed code with unit tests
+that work against fixture commit data — no working-tree
+dependence in the rule layer. Integration tests exercise the
+endpoint against small fixture repos so the git-I/O glue is
+covered too. No CLI changes — the endpoint is consumed in
+Phase 4.
 
 **Phase 4 — Rewriting engine + purge/squash + --dry.**
 History-rewriting engine, `trinity finish
