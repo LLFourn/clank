@@ -18,7 +18,7 @@ pub use trinity_core::api::{
     PlanDetailResponse as PlanDetail, PlanRevisionResponse as PlanRevisionPage, PlanRow, PrHint,
     PrHintOption, RepoListResponse as ReposIndex, RepoRow, ReviewGate, TimelineEvent, WaitingOn,
 };
-pub use trinity_core::vocab::{DiffLineKind, PlanLifecycle, Verdict, WaitingRole};
+pub use trinity_core::vocab::{PlanLifecycle, Verdict, WaitingRole};
 
 #[derive(Debug, Clone)]
 pub enum FetchError {

@@ -7,7 +7,6 @@
 //! here as the parser sets `FileDiff.always_folded`.
 
 use trinity_core::api::{DiffHunk, DiffLine, FileDiff, FileDiffMode};
-use trinity_core::vocab::DiffLineKind;
 
 pub fn parse_diff(raw: &str) -> Vec<FileDiff> {
     let mut files = Vec::new();
@@ -78,37 +77,29 @@ pub fn parse_diff(raw: &str) -> Vec<FileDiff> {
         };
 
         if let Some(content) = line.strip_prefix('+') {
-            hunk.lines.push(DiffLine {
-                kind: DiffLineKind::Insert,
-                old_lineno: None,
-                new_lineno: Some(new_lineno),
+            hunk.lines.push(DiffLine::Insert {
+                new_lineno,
                 content: content.to_string(),
             });
             file.additions += 1;
             new_lineno += 1;
         } else if let Some(content) = line.strip_prefix('-') {
-            hunk.lines.push(DiffLine {
-                kind: DiffLineKind::Delete,
-                old_lineno: Some(old_lineno),
-                new_lineno: None,
+            hunk.lines.push(DiffLine::Delete {
+                old_lineno,
                 content: content.to_string(),
             });
             file.deletions += 1;
             old_lineno += 1;
         } else if let Some(content) = line.strip_prefix(' ') {
-            hunk.lines.push(DiffLine {
-                kind: DiffLineKind::Context,
-                old_lineno: Some(old_lineno),
-                new_lineno: Some(new_lineno),
+            hunk.lines.push(DiffLine::Context {
+                old_lineno,
+                new_lineno,
                 content: content.to_string(),
             });
             old_lineno += 1;
             new_lineno += 1;
         } else {
-            hunk.lines.push(DiffLine {
-                kind: DiffLineKind::Meta,
-                old_lineno: None,
-                new_lineno: None,
+            hunk.lines.push(DiffLine::Meta {
                 content: line.to_string(),
             });
         }

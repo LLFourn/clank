@@ -139,14 +139,6 @@ fn waiting_reason_wire_strings() {
     assert_wire(WaitingReason::CommitNeedsReview, "commit_needs_review");
 }
 
-#[test]
-fn diff_line_kind_wire_strings() {
-    assert_wire(DiffLineKind::Insert, "insert");
-    assert_wire(DiffLineKind::Delete, "delete");
-    assert_wire(DiffLineKind::Context, "context");
-    assert_wire(DiffLineKind::Meta, "meta");
-}
-
 // ============================================================
 // `as_str` agrees with wire string
 // ============================================================
@@ -176,7 +168,6 @@ fn as_str_agrees_with_wire() {
     check!(PlanWorktreeStatus::PlanFileMissing);
     check!(PlanTouchKind::Revision);
     check!(ReviewTargetPhase::Impl);
-    check!(DiffLineKind::Insert);
 }
 
 // ============================================================

@@ -1,6 +1,6 @@
 use leptos::prelude::*;
 
-use crate::api::{DiffHunk, DiffLine, DiffLineKind, FileDiff, FileDiffMode};
+use crate::api::{DiffHunk, DiffLine, FileDiff, FileDiffMode};
 
 /// Render a list of `FileDiff`s as collapsible per-file sections with a
 /// line-number gutter and insert/delete coloring. Empty input renders a
@@ -103,22 +103,48 @@ fn HunkBlock(hunk: DiffHunk) -> impl IntoView {
 
 #[component]
 fn DiffLineRow(line: DiffLine) -> impl IntoView {
-    let row_class = format!("diff-line diff-line-{}", line.kind);
-    let old_no = line.old_lineno.map(|n| n.to_string()).unwrap_or_default();
-    let new_no = line.new_lineno.map(|n| n.to_string()).unwrap_or_default();
-    let marker = match line.kind {
-        DiffLineKind::Insert => "+",
-        DiffLineKind::Delete => "-",
-        DiffLineKind::Meta => "@",
-        DiffLineKind::Context => " ",
+    let (kind, marker, old_no, new_no, content) = match line {
+        DiffLine::Insert {
+            new_lineno,
+            content,
+        } => (
+            "insert",
+            "+",
+            String::new(),
+            new_lineno.to_string(),
+            content,
+        ),
+        DiffLine::Delete {
+            old_lineno,
+            content,
+        } => (
+            "delete",
+            "-",
+            old_lineno.to_string(),
+            String::new(),
+            content,
+        ),
+        DiffLine::Context {
+            old_lineno,
+            new_lineno,
+            content,
+        } => (
+            "context",
+            " ",
+            old_lineno.to_string(),
+            new_lineno.to_string(),
+            content,
+        ),
+        DiffLine::Meta { content } => ("meta", "@", String::new(), String::new(), content),
     };
+    let row_class = format!("diff-line diff-line-{kind}");
     view! {
         <tr class=row_class>
             <td class="diff-num diff-num-old">{old_no}</td>
             <td class="diff-num diff-num-new">{new_no}</td>
             <td class="diff-marker">{marker}</td>
             <td class="diff-content">
-                <code>{line.content}</code>
+                <code>{content}</code>
             </td>
         </tr>
     }

@@ -29,8 +29,8 @@
 use serde::{Deserialize, Serialize};
 
 use crate::vocab::{
-    CommitKind, DiffLineKind, PlanLifecycle, PlanTouchKind, PlanWorktreeStatus, Posture,
-    ReviewGateState, ReviewTargetPhase, Verdict, WaitingReason, WaitingRole,
+    CommitKind, PlanLifecycle, PlanTouchKind, PlanWorktreeStatus, Posture, ReviewGateState,
+    ReviewTargetPhase, Verdict, WaitingReason, WaitingRole,
 };
 
 // ============================================================
@@ -229,14 +229,30 @@ pub struct DiffHunk {
     pub lines: Vec<DiffLine>,
 }
 
+/// One line inside a `DiffHunk`. Tagged by `kind` on the wire;
+/// each variant carries exactly the lineno fields valid for it
+/// — no `null` placeholders.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct DiffLine {
-    pub kind: DiffLineKind,
-    pub content: String,
-    #[serde(default)]
-    pub old_lineno: Option<usize>,
-    #[serde(default)]
-    pub new_lineno: Option<usize>,
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum DiffLine {
+    Insert {
+        content: String,
+        new_lineno: usize,
+    },
+    Delete {
+        content: String,
+        old_lineno: usize,
+    },
+    Context {
+        content: String,
+        old_lineno: usize,
+        new_lineno: usize,
+    },
+    /// Hunk-header / file-header line (`@@ ... @@`, `+++ ...`,
+    /// etc.). No lineno; content is the raw header text.
+    Meta {
+        content: String,
+    },
 }
 
 /// One conflict row: a plan stem with multiple paths on disk.

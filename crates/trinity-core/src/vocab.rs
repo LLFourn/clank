@@ -323,36 +323,6 @@ impl WaitingReason {
     }
 }
 
-// ============================================================
-// Diff rendering
-// ============================================================
-
-/// Line classification inside a parsed structured diff hunk.
-/// Used by the diff renderer (`structured_diff` component) to
-/// color-code lines.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum DiffLineKind {
-    Insert,
-    Delete,
-    Context,
-    /// Meta lines (hunk header, file mode change notice, etc.) —
-    /// the daemon's parser emits these for renderer rows that
-    /// shouldn't be colored as additions or deletions.
-    Meta,
-}
-
-impl DiffLineKind {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            DiffLineKind::Insert => "insert",
-            DiffLineKind::Delete => "delete",
-            DiffLineKind::Context => "context",
-            DiffLineKind::Meta => "meta",
-        }
-    }
-}
-
 /// Suggested PR-landing option kind. Closed vocabulary for
 /// `api::PrHintOption.kind` — eliminates the prior stringly-typed
 /// `name: String` field that the frontend matched on with a `_ =>
@@ -385,6 +355,5 @@ impl_display_via_as_str! {
     ReviewGateState,
     WaitingRole,
     WaitingReason,
-    DiffLineKind,
     PrHintOptionKind,
 }

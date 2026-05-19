@@ -190,11 +190,10 @@ fn file_diff_fixture() -> FileDiff {
         always_folded: false,
         hunks: vec![DiffHunk {
             header: "@@ -1,1 +1,1 @@".into(),
-            lines: vec![DiffLine {
-                kind: DiffLineKind::Context,
+            lines: vec![DiffLine::Context {
                 content: " hi".into(),
-                old_lineno: Some(1),
-                new_lineno: Some(1),
+                old_lineno: 1,
+                new_lineno: 1,
             }],
         }],
     }
