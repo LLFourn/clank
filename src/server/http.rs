@@ -458,7 +458,7 @@ async fn api_commit_diff(
             "commit {sha} is not attributed to {repo_basename}/{stem_md}"
         ))
     })?;
-    if matches!(event.kind, CommitKind::Unattributed) {
+    if matches!(event.kind(), CommitKind::Unattributed) {
         return Err(AppError::not_found(format!(
             "commit {sha} is unattributed for {repo_basename}/{stem_md}"
         )));
@@ -474,7 +474,7 @@ async fn api_commit_diff(
         .await
         .map_err(|e| AppError::internal(format!("git show -s: {e}")))?;
 
-    let finalize_files = if matches!(event.kind, CommitKind::Finalize) {
+    let finalize_files = if matches!(event.kind(), CommitKind::Finalize) {
         crate::git_io::read_finalize_snapshot(&repo, &commit_sha, &stem)
             .await
             .map_err(|e| AppError::internal(format!("read finalize snapshot: {e}")))?

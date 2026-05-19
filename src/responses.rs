@@ -262,7 +262,7 @@ fn build_expected_action(
                 .to_string();
             let rc_paths = plan
                 .event_for(review_target_sha.expect("checked above"))
-                .and_then(|e| e.gate.as_ref())
+                .and_then(|e| e.gate())
                 .map(|gate| {
                     gate.requesters
                         .iter()
@@ -465,7 +465,7 @@ pub fn build_commit_detail_response(
         diff_files,
         finalize_files,
     } = inputs;
-    let detail = match event.kind {
+    let detail = match event.kind() {
         CommitKind::Finalize => {
             let snapshot_entries = finalize_files
                 .into_iter()
@@ -580,13 +580,13 @@ fn posture_to_review_target_phase(p: Posture) -> ReviewTargetPhase {
 fn build_commits_array(plan: &Plan) -> Vec<CommitRow> {
     let mut out = Vec::new();
     for event in &plan.timeline {
-        let Some(gate) = event.gate.as_ref() else {
+        let Some(gate) = event.gate() else {
             continue;
         };
-        let sha = event.sha.as_str().to_string();
+        let sha = event.sha().as_str().to_string();
         let feedback: Vec<Feedback> = gate.feedback.values().cloned().collect();
         let gate = gate.clone();
-        let row = match event.kind {
+        let row = match event.kind() {
             CommitKind::PlanOnly => CommitRow::PlanOnly {
                 sha,
                 gate,
@@ -612,14 +612,14 @@ fn build_commits_array(plan: &Plan) -> Vec<CommitRow> {
 fn build_timeline(plan: &Plan) -> Vec<TimelineEvent> {
     let mut out = Vec::with_capacity(plan.timeline.len() * 2);
     for event in &plan.timeline {
-        let sha = event.sha.as_str().to_string();
-        let subject = event.subject.clone();
-        let plan_touch = if event.sha == plan.plan_intro {
+        let sha = event.sha().as_str().to_string();
+        let subject = event.subject().to_string();
+        let plan_touch = if event.sha() == &plan.plan_intro {
             PlanTouchKind::Intro
         } else {
             PlanTouchKind::Revision
         };
-        let row = match event.kind {
+        let row = match event.kind() {
             CommitKind::PlanOnly => TimelineEvent::CommitPlan {
                 sha: sha.clone(),
                 subject,
@@ -646,19 +646,15 @@ fn build_timeline(plan: &Plan) -> Vec<TimelineEvent> {
             CommitKind::Unattributed => continue,
         };
         out.push(row);
-        if let Some(gate) = event.gate.as_ref() {
-            // Reviews can only attach to reviewable events; an
-            // unreviewable kind here is a fold-invariant violation.
-            let phase = match event.kind {
+        if let Some(gate) = event.gate() {
+            // `gate()` returns Some only for reviewable variants
+            // (PlanOnly, CodeOnly, Mixed) — the invariant is now
+            // structural.
+            let phase = match event.kind() {
                 CommitKind::PlanOnly | CommitKind::Mixed => ReviewTargetPhase::Plan,
                 CommitKind::CodeOnly => ReviewTargetPhase::Impl,
                 CommitKind::MultiPlan | CommitKind::Finalize | CommitKind::Unattributed => {
-                    debug_assert!(
-                        false,
-                        "non-reviewable kind carries a gate: {:?}",
-                        event.kind
-                    );
-                    continue;
+                    unreachable!("event.gate() is Some only for reviewable kinds")
                 }
             };
             for (author, fb) in &gate.feedback {
@@ -753,113 +749,8 @@ pub fn feedback_for_target(plan: &Plan, sha: &CommitSha) -> Vec<Feedback> {
     let Some(event) = plan.event_for(sha) else {
         return Vec::new();
     };
-    let Some(gate) = event.gate.as_ref() else {
+    let Some(gate) = event.gate() else {
         return Vec::new();
     };
     gate.feedback.values().cloned().collect()
-}
-
-#[cfg(test)]
-mod divergence_tests {
-    //! Regression tests pinning the single-projection-path invariant
-    //! the trinity-core-unification refactor delivered: ONE projection
-    //! path from `model` to `api`, so the daemon cannot emit divergent
-    //! shapes between MCP and HTTP for the same underlying plan state.
-    //!
-    //! Concretely: a `MultiPlan` event with a stray gate must NOT
-    //! emit any `Review` rows on the wire. Pre-collapse the two
-    //! parallel response modules disagreed on this — MCP mapped
-    //! MultiPlan-with-gate to `ReviewTargetPhase::Plan`; UI
-    //! debug_asserted. After collapse the inner match's
-    //! `_ => continue` arm handles non-reviewable kinds uniformly.
-    //!
-    //! (An earlier sibling test pinned that `body_html` was emitted
-    //! identically across surfaces. That test became meaningless when
-    //! wasm-markdown-rendering dropped `body_html` from the wire
-    //! entirely; the MultiPlan invariant is independent and survives.)
-    use super::*;
-    use trinity_core::ids::AgentLabel;
-    use trinity_core::vocab::Verdict;
-
-    /// A `MultiPlan` event must emit a `CommitMultiPlan` timeline row,
-    /// and if a gate ever sneaks onto a non-reviewable kind (a
-    /// fold-invariant violation), the gate's feedback must NOT surface
-    /// as a `Review` row on the wire.
-    #[test]
-    fn multi_plan_event_never_emits_review_rows() {
-        let alice = AgentLabel::parse("alice").unwrap();
-        let fb = crate::repo_state::Feedback {
-            author: alice.clone(),
-            verdict: Verdict::Approve,
-            body: "APPROVE\n".into(),
-            path: "alice.md".into(),
-            created_at: 1_700_000_000,
-        };
-        let plan = trinity_core::model::Plan {
-            id: trinity_core::ids::PlanKey::parse("foo").unwrap(),
-            plan_path: ".trinity/plans/foo.md".into(),
-            body: String::new(),
-            body_hash: trinity_core::ids::ContentHash::from_hex_unchecked("a".repeat(64)),
-            plan_intro: trinity_core::ids::CommitSha::parse("abc1").unwrap(),
-            plan_intro_parent: None,
-            last_activity_ts: 0,
-            timeline: vec![trinity_core::model::PlanTimelineEvent {
-                sha: trinity_core::ids::CommitSha::parse("def1").unwrap(),
-                kind: trinity_core::CommitKind::MultiPlan,
-                author_ts: 1_700_000_000,
-                subject: "Touch two plans".into(),
-                gate: Some(CommitGate {
-                    state: trinity_core::CommitGateState::Approved,
-                    participants: vec![alice.clone()],
-                    approvers: vec![alice.clone()],
-                    requesters: vec![],
-                    ambiguous: vec![],
-                    missing: vec![],
-                    feedback: std::collections::BTreeMap::from([(alice, fb)]),
-                }),
-            }],
-            archived_cycles: vec![],
-        };
-        let timeline = build_timeline_no_assert(&plan);
-        assert_eq!(timeline.len(), 1);
-        assert!(
-            matches!(timeline[0], TimelineEvent::CommitMultiPlan { .. }),
-            "MultiPlan must emit one CommitMultiPlan row, not a Review row"
-        );
-        assert!(
-            !timeline
-                .iter()
-                .any(|t| matches!(t, TimelineEvent::Review { .. })),
-            "Review rows must not appear for non-reviewable kinds"
-        );
-    }
-
-    /// Test-only wrapper that calls `build_timeline` without
-    /// tripping the `debug_assert!` on non-reviewable-with-gate.
-    /// The wire-shape invariant we're pinning is that the gate is
-    /// *ignored* on the wire — not that we panic in debug. (The
-    /// debug_assert is a daemon-side invariant guard, not part of
-    /// the response shape.)
-    fn build_timeline_no_assert(plan: &Plan) -> Vec<TimelineEvent> {
-        // The production `build_timeline` debug_asserts on a
-        // MultiPlan-with-gate; that's a daemon-internal invariant
-        // assertion. For the response-shape test we want to verify
-        // the release-build path (the `continue` arm), so we shadow
-        // the assertion by catching the panic. `std::panic::catch_unwind`
-        // requires `UnwindSafe`, which closures over `&Plan` provide.
-        let result =
-            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| build_timeline(plan)));
-        result.unwrap_or_else(|_| {
-            // In debug, the debug_assert panics. The release path
-            // would `continue` past the gate without emitting Review
-            // rows; emulate that by re-running with the gate cleared.
-            let mut plan = plan.clone();
-            for event in &mut plan.timeline {
-                if !event.kind.is_reviewable() {
-                    event.gate = None;
-                }
-            }
-            build_timeline(&plan)
-        })
-    }
 }

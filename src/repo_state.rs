@@ -119,11 +119,11 @@ impl RepoState {
             );
             hasher.update(b"|timeline=[");
             for event in &plan.timeline {
-                hasher.update(event.sha.as_str().as_bytes());
+                hasher.update(event.sha().as_str().as_bytes());
                 hasher.update(b":");
-                hasher.update(event.kind.as_str().as_bytes());
+                hasher.update(event.kind().as_str().as_bytes());
                 hasher.update(b":");
-                if let Some(gate) = &event.gate {
+                if let Some(gate) = event.gate() {
                     hasher.update(gate.state.as_str().as_bytes());
                     hasher.update(b":");
                     for (author, fb) in &gate.feedback {

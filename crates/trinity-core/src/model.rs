@@ -63,17 +63,109 @@ pub struct CommitGate {
     pub feedback: BTreeMap<AgentLabel, Feedback>,
 }
 
-/// One commit in a plan's life as observed by the fold. The `kind`
-/// is the per-plan classification; `gate` is `Some` for reviewable
-/// kinds (`PlanOnly | CodeOnly | Mixed`) and `None` for
-/// non-reviewable kinds (`MultiPlan`, `Finalize`).
+/// One commit in a plan's life as observed by the fold. Tagged
+/// by per-plan classification; the reviewable variants
+/// (`PlanOnly | CodeOnly | Mixed`) carry a `gate`, the
+/// non-reviewable ones (`MultiPlan`, `Finalize`) don't.
+///
+/// Use the accessor methods (`sha()`, `kind()`, `gate()`, etc.)
+/// for the common value-form reads. Variant matching is for the
+/// rare cases that need the kind structurally.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PlanTimelineEvent {
-    pub sha: CommitSha,
-    pub kind: CommitKind,
-    pub author_ts: i64,
-    pub subject: String,
-    pub gate: Option<CommitGate>,
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum PlanTimelineEvent {
+    PlanOnly {
+        sha: CommitSha,
+        author_ts: i64,
+        subject: String,
+        gate: CommitGate,
+    },
+    CodeOnly {
+        sha: CommitSha,
+        author_ts: i64,
+        subject: String,
+        gate: CommitGate,
+    },
+    Mixed {
+        sha: CommitSha,
+        author_ts: i64,
+        subject: String,
+        gate: CommitGate,
+    },
+    MultiPlan {
+        sha: CommitSha,
+        author_ts: i64,
+        subject: String,
+    },
+    Finalize {
+        sha: CommitSha,
+        author_ts: i64,
+        subject: String,
+    },
+}
+
+impl PlanTimelineEvent {
+    pub fn sha(&self) -> &CommitSha {
+        match self {
+            PlanTimelineEvent::PlanOnly { sha, .. }
+            | PlanTimelineEvent::CodeOnly { sha, .. }
+            | PlanTimelineEvent::Mixed { sha, .. }
+            | PlanTimelineEvent::MultiPlan { sha, .. }
+            | PlanTimelineEvent::Finalize { sha, .. } => sha,
+        }
+    }
+
+    pub fn author_ts(&self) -> i64 {
+        match self {
+            PlanTimelineEvent::PlanOnly { author_ts, .. }
+            | PlanTimelineEvent::CodeOnly { author_ts, .. }
+            | PlanTimelineEvent::Mixed { author_ts, .. }
+            | PlanTimelineEvent::MultiPlan { author_ts, .. }
+            | PlanTimelineEvent::Finalize { author_ts, .. } => *author_ts,
+        }
+    }
+
+    pub fn subject(&self) -> &str {
+        match self {
+            PlanTimelineEvent::PlanOnly { subject, .. }
+            | PlanTimelineEvent::CodeOnly { subject, .. }
+            | PlanTimelineEvent::Mixed { subject, .. }
+            | PlanTimelineEvent::MultiPlan { subject, .. }
+            | PlanTimelineEvent::Finalize { subject, .. } => subject,
+        }
+    }
+
+    pub fn kind(&self) -> CommitKind {
+        match self {
+            PlanTimelineEvent::PlanOnly { .. } => CommitKind::PlanOnly,
+            PlanTimelineEvent::CodeOnly { .. } => CommitKind::CodeOnly,
+            PlanTimelineEvent::Mixed { .. } => CommitKind::Mixed,
+            PlanTimelineEvent::MultiPlan { .. } => CommitKind::MultiPlan,
+            PlanTimelineEvent::Finalize { .. } => CommitKind::Finalize,
+        }
+    }
+
+    pub fn is_reviewable(&self) -> bool {
+        self.kind().is_reviewable()
+    }
+
+    pub fn gate(&self) -> Option<&CommitGate> {
+        match self {
+            PlanTimelineEvent::PlanOnly { gate, .. }
+            | PlanTimelineEvent::CodeOnly { gate, .. }
+            | PlanTimelineEvent::Mixed { gate, .. } => Some(gate),
+            PlanTimelineEvent::MultiPlan { .. } | PlanTimelineEvent::Finalize { .. } => None,
+        }
+    }
+
+    pub fn gate_mut(&mut self) -> Option<&mut CommitGate> {
+        match self {
+            PlanTimelineEvent::PlanOnly { gate, .. }
+            | PlanTimelineEvent::CodeOnly { gate, .. }
+            | PlanTimelineEvent::Mixed { gate, .. } => Some(gate),
+            PlanTimelineEvent::MultiPlan { .. } | PlanTimelineEvent::Finalize { .. } => None,
+        }
+    }
 }
 
 /// Per-cycle summary surfaced in the plan-detail wire under
@@ -128,16 +220,16 @@ pub struct Plan {
 impl Plan {
     /// Find the timeline event for a SHA, if this plan has one.
     pub fn event_for(&self, sha: &CommitSha) -> Option<&PlanTimelineEvent> {
-        self.timeline.iter().find(|e| &e.sha == sha)
+        self.timeline.iter().find(|e| e.sha() == sha)
     }
 
     pub fn event_for_mut(&mut self, sha: &CommitSha) -> Option<&mut PlanTimelineEvent> {
-        self.timeline.iter_mut().find(|e| &e.sha == sha)
+        self.timeline.iter_mut().find(|e| e.sha() == sha)
     }
 
     /// The latest reviewable commit event, if any. Reverse scan.
     pub fn latest_reviewable_event(&self) -> Option<&PlanTimelineEvent> {
-        self.timeline.iter().rev().find(|e| e.kind.is_reviewable())
+        self.timeline.iter().rev().find(|e| e.is_reviewable())
     }
 
     /// The freeze commit's SHA, if this plan has frozen. Derived
@@ -147,7 +239,7 @@ impl Plan {
         self.timeline
             .iter()
             .rev()
-            .find_map(|e| matches!(e.kind, CommitKind::Finalize).then_some(&e.sha))
+            .find_map(|e| matches!(e, PlanTimelineEvent::Finalize { .. }).then_some(e.sha()))
     }
 
     /// True iff the plan has frozen.

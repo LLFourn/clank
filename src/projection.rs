@@ -38,7 +38,7 @@ pub fn plan_worktree_status(
 /// is shipping code (`CodeOnly`). Reverse-scan over `plan.timeline`.
 pub fn current_posture(plan: &Plan, _state: &crate::repo_state::RepoState) -> Posture {
     match plan.latest_reviewable_event() {
-        Some(event) if matches!(event.kind, CommitKind::CodeOnly) => Posture::Implementing,
+        Some(event) if event.kind() == CommitKind::CodeOnly => Posture::Implementing,
         _ => Posture::Planning,
     }
 }
@@ -86,13 +86,13 @@ pub fn waiting_on(
 /// over `plan.timeline`. Returns `None` when no reviewable commit
 /// exists yet.
 pub fn latest_reviewable_commit_gate_for(plan: &Plan) -> Option<&CommitGate> {
-    plan.latest_reviewable_event().and_then(|e| e.gate.as_ref())
+    plan.latest_reviewable_event().and_then(|e| e.gate())
 }
 
 /// Latest commit whose `CommitKind` is reviewable for this plan.
 /// Reverse-scan over `plan.timeline`.
 pub fn latest_reviewable_commit_for(plan: &Plan) -> Option<CommitSha> {
-    plan.latest_reviewable_event().map(|e| e.sha.clone())
+    plan.latest_reviewable_event().map(|e| e.sha().clone())
 }
 
 fn waiting_from_gate(gate: Option<&CommitGate>) -> WaitingOn {
@@ -154,11 +154,11 @@ pub fn all_plan_revisions(plan: &Plan, _state: &crate::repo_state::RepoState) ->
         .iter()
         .filter(|e| {
             matches!(
-                e.kind,
+                e.kind(),
                 CommitKind::PlanOnly | CommitKind::Mixed | CommitKind::MultiPlan
             )
         })
-        .map(|e| e.sha.clone())
+        .map(|e| e.sha().clone())
         .collect()
 }
 
@@ -170,8 +170,8 @@ pub fn all_implementation_commits(
 ) -> Vec<CommitSha> {
     plan.timeline
         .iter()
-        .filter(|e| matches!(e.kind, CommitKind::CodeOnly | CommitKind::Mixed))
-        .map(|e| e.sha.clone())
+        .filter(|e| matches!(e.kind(), CommitKind::CodeOnly | CommitKind::Mixed))
+        .map(|e| e.sha().clone())
         .collect()
 }
 
@@ -186,8 +186,8 @@ pub fn plan_gate_for<'a>(
     plan.timeline
         .iter()
         .rev()
-        .find(|e| matches!(e.kind, CommitKind::PlanOnly | CommitKind::Mixed))
-        .and_then(|e| e.gate.as_ref())
+        .find(|e| matches!(e.kind(), CommitKind::PlanOnly | CommitKind::Mixed))
+        .and_then(|e| e.gate())
 }
 
 /// Implementation-side review gate: the latest reviewable code-bearing
@@ -199,8 +199,8 @@ pub fn impl_gate_for<'a>(
     plan.timeline
         .iter()
         .rev()
-        .find(|e| matches!(e.kind, CommitKind::CodeOnly | CommitKind::Mixed))
-        .and_then(|e| e.gate.as_ref())
+        .find(|e| matches!(e.kind(), CommitKind::CodeOnly | CommitKind::Mixed))
+        .and_then(|e| e.gate())
 }
 
 fn make(
@@ -271,6 +271,6 @@ fn description_for(
 /// timeline at all.
 pub fn commit_kind_for(plan: &Plan, sha: &CommitSha) -> CommitKind {
     plan.event_for(sha)
-        .map(|e| e.kind)
+        .map(|e| e.kind())
         .unwrap_or(CommitKind::Unattributed)
 }

@@ -314,12 +314,10 @@ pub fn apply_commit(state: &mut RepoState, carry: &mut FoldCarry, event: &Commit
                 // monotone rule guarantees no further events on this
                 // plan's timeline (step 5 short-circuits on frozen
                 // plans).
-                plan.timeline.push(PlanTimelineEvent {
+                plan.timeline.push(PlanTimelineEvent::Finalize {
                     sha: commit_sha.clone(),
-                    kind: CommitKind::Finalize,
                     author_ts: event.author_ts,
                     subject: event.subject.clone(),
-                    gate: None,
                 });
                 if event.author_ts > plan.last_activity_ts {
                     plan.last_activity_ts = event.author_ts;
@@ -397,13 +395,41 @@ pub fn apply_commit(state: &mut RepoState, carry: &mut FoldCarry, event: &Commit
                 plan.last_activity_ts = feedback_ts;
             }
         }
-        plan.timeline.push(PlanTimelineEvent {
-            sha: commit_sha.clone(),
-            kind,
-            author_ts: event.author_ts,
-            subject: event.subject.clone(),
-            gate,
-        });
+        let sha = commit_sha.clone();
+        let author_ts = event.author_ts;
+        let subject = event.subject.clone();
+        let timeline_event = match kind {
+            CommitKind::PlanOnly => PlanTimelineEvent::PlanOnly {
+                sha,
+                author_ts,
+                subject,
+                gate: gate.expect("PlanOnly is reviewable and always has a gate"),
+            },
+            CommitKind::CodeOnly => PlanTimelineEvent::CodeOnly {
+                sha,
+                author_ts,
+                subject,
+                gate: gate.expect("CodeOnly is reviewable and always has a gate"),
+            },
+            CommitKind::Mixed => PlanTimelineEvent::Mixed {
+                sha,
+                author_ts,
+                subject,
+                gate: gate.expect("Mixed is reviewable and always has a gate"),
+            },
+            CommitKind::MultiPlan => PlanTimelineEvent::MultiPlan {
+                sha,
+                author_ts,
+                subject,
+            },
+            CommitKind::Finalize => {
+                unreachable!("Finalize is handled in step 4; should not reach the per-plan append")
+            }
+            CommitKind::Unattributed => {
+                unreachable!("Unattributed is filtered out of the per-plan classifier")
+            }
+        };
+        plan.timeline.push(timeline_event);
     }
 
     // 6. Carry forward.
@@ -631,12 +657,12 @@ mod tests {
         assert_eq!(plan.body, "# foo\n");
         assert_eq!(plan.plan_intro, sha("bbbb"));
         assert_eq!(plan.plan_intro_parent, Some(sha("aaaa")));
-        let shas: Vec<_> = plan.timeline.iter().map(|e| e.sha.clone()).collect();
+        let shas: Vec<_> = plan.timeline.iter().map(|e| e.sha().clone()).collect();
         assert_eq!(shas, vec![sha("bbbb")]);
         assert!(
             plan.timeline
                 .iter()
-                .all(|e| matches!(e.kind, CommitKind::PlanOnly))
+                .all(|e| matches!(e.kind(), CommitKind::PlanOnly))
         );
     }
 
@@ -651,7 +677,7 @@ mod tests {
         );
         let plan = &state.plans[&sess("foo")];
         assert_eq!(plan.body, "# v2\n");
-        let shas: Vec<_> = plan.timeline.iter().map(|e| e.sha.clone()).collect();
+        let shas: Vec<_> = plan.timeline.iter().map(|e| e.sha().clone()).collect();
         assert_eq!(shas, vec![sha("c1c1"), sha("c2c2")]);
     }
 
@@ -668,8 +694,8 @@ mod tests {
         let impls: Vec<_> = plan
             .timeline
             .iter()
-            .filter(|e| matches!(e.kind, CommitKind::CodeOnly | CommitKind::Mixed))
-            .map(|e| e.sha.clone())
+            .filter(|e| matches!(e.kind(), CommitKind::CodeOnly | CommitKind::Mixed))
+            .map(|e| e.sha().clone())
             .collect();
         assert_eq!(impls, vec![sha("c2c2")]);
     }
@@ -700,13 +726,13 @@ mod tests {
         let c2 = sha("c2c2");
         let a_c2 = a.event_for(&c2).expect("a has c2");
         let b_c2 = b.event_for(&c2).expect("b has c2");
-        assert!(matches!(a_c2.kind, CommitKind::MultiPlan));
-        assert!(matches!(b_c2.kind, CommitKind::MultiPlan));
-        assert!(a_c2.gate.is_none());
-        assert!(b_c2.gate.is_none());
+        assert!(matches!(a_c2.kind(), CommitKind::MultiPlan));
+        assert!(matches!(b_c2.kind(), CommitKind::MultiPlan));
+        assert!(a_c2.gate().is_none());
+        assert!(b_c2.gate().is_none());
         // c3 walks back to a (oldest single-plan-touch ancestor).
         let a_c3 = a.event_for(&sha("c3c3")).expect("a has c3");
-        assert!(matches!(a_c3.kind, CommitKind::CodeOnly));
+        assert!(matches!(a_c3.kind(), CommitKind::CodeOnly));
         assert!(b.event_for(&sha("c3c3")).is_none());
     }
 
@@ -738,12 +764,12 @@ mod tests {
         assert_eq!(plan.plan_intro, sha("c4c4"));
         // The fresh foo's timeline only contains c4 — c1 belongs
         // to the deleted-and-gone old foo.
-        let shas: Vec<_> = plan.timeline.iter().map(|e| e.sha.clone()).collect();
+        let shas: Vec<_> = plan.timeline.iter().map(|e| e.sha().clone()).collect();
         assert_eq!(shas, vec![sha("c4c4")]);
         assert!(
             plan.timeline
                 .iter()
-                .all(|e| !matches!(e.kind, CommitKind::CodeOnly | CommitKind::Mixed))
+                .all(|e| !matches!(e.kind(), CommitKind::CodeOnly | CommitKind::Mixed))
         );
     }
 
@@ -858,14 +884,14 @@ mod tests {
         );
         let plan = &state.plans[&sess("foo")];
         let event = plan.event_for(&sha("c1c1")).expect("event for c1");
-        let gate = event.gate.as_ref().expect("gate for c1");
+        let gate = event.gate().expect("gate for c1");
         let entry = gate
             .feedback
             .get(&AgentLabel::parse("alice").unwrap())
             .unwrap();
         assert_eq!(entry.verdict, crate::repo_state::Verdict::Approve);
         assert_eq!(
-            plan.latest_reviewable_event().map(|e| e.sha.clone()),
+            plan.latest_reviewable_event().map(|e| e.sha().clone()),
             Some(sha("c1c1"))
         );
     }
@@ -890,7 +916,7 @@ mod tests {
         let kinds: Vec<_> = plan
             .timeline
             .iter()
-            .map(|e| (e.sha.clone(), e.kind))
+            .map(|e| (e.sha().clone(), e.kind()))
             .collect();
         assert_eq!(
             kinds,
@@ -901,11 +927,11 @@ mod tests {
         );
         let finalize_event = plan.event_for(&sha("c2c2")).expect("c2 on timeline");
         assert!(
-            finalize_event.gate.is_none(),
+            finalize_event.gate().is_none(),
             "Finalize must not carry a gate"
         );
         assert_eq!(
-            plan.latest_reviewable_event().map(|e| e.sha.clone()),
+            plan.latest_reviewable_event().map(|e| e.sha().clone()),
             Some(sha("c1c1")),
             "latest reviewable skips Finalize"
         );
@@ -946,19 +972,19 @@ mod tests {
         let plan = &state.plans[&sess("foo")];
         let c2 = plan.event_for(&sha("c2c2")).expect("c2 on timeline");
         assert!(
-            matches!(c2.kind, CommitKind::Finalize),
+            matches!(c2.kind(), CommitKind::Finalize),
             "freeze commit must be Finalize, not CodeOnly: {:?}",
-            c2.kind
+            c2.kind()
         );
         assert!(
-            c2.gate.is_none(),
+            c2.gate().is_none(),
             "Finalize must not carry a gate even when bundled with code changes"
         );
         assert!(
             !plan
                 .timeline
                 .iter()
-                .any(|e| matches!(e.kind, CommitKind::CodeOnly)),
+                .any(|e| matches!(e.kind(), CommitKind::CodeOnly)),
             "bundled code changes must not produce a CodeOnly event on a frozen plan"
         );
     }
@@ -995,7 +1021,7 @@ mod tests {
         let kinds: Vec<_> = plan
             .timeline
             .iter()
-            .map(|e| (e.sha.clone(), e.kind))
+            .map(|e| (e.sha().clone(), e.kind()))
             .collect();
         assert_eq!(
             kinds,
@@ -1022,7 +1048,7 @@ mod tests {
             ]),
         );
         let plan = &state.plans[&sess("foo")];
-        let shas: Vec<_> = plan.timeline.iter().map(|e| e.sha.clone()).collect();
+        let shas: Vec<_> = plan.timeline.iter().map(|e| e.sha().clone()).collect();
         assert_eq!(shas, vec![sha("c1c1"), sha("c2c2"), sha("c3c3")]);
     }
 
@@ -1060,11 +1086,11 @@ mod tests {
         let active = &state.plans[&sess("active")];
         let c3 = active.event_for(&sha("c3c3")).expect("active has c3");
         assert!(
-            matches!(c3.kind, CommitKind::PlanOnly),
+            matches!(c3.kind(), CommitKind::PlanOnly),
             "expected PlanOnly, got {:?}",
-            c3.kind
+            c3.kind()
         );
-        assert!(c3.gate.is_some(), "reviewable PlanOnly must have a gate");
+        assert!(c3.gate().is_some(), "reviewable PlanOnly must have a gate");
     }
 
     #[test]
@@ -1110,7 +1136,7 @@ mod tests {
         let gate = plan
             .timeline
             .iter()
-            .find_map(|e| e.gate.as_ref())
+            .find_map(|e| e.gate())
             .expect("foo's intro commit must carry a gate after fold");
         assert!(!gate.feedback.is_empty(), "gate should have feedback");
         for (key, value) in &gate.feedback {

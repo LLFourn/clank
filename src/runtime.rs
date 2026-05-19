@@ -451,7 +451,7 @@ fn upsert_feedback(
         // Drop silently; the next full rebuild will re-attribute.
         return;
     };
-    if !event.kind.is_reviewable() {
+    if !event.kind().is_reviewable() {
         // Non-reviewable events (Finalize / MultiPlan) never carry a
         // gate. Live feedback targeting them is not actionable and
         // must NOT synthesize gate state. Drop silently — the UI
@@ -459,17 +459,11 @@ fn upsert_feedback(
         // at the freeze commit, not via the gate.
         return;
     }
+    // Reviewable variants of PlanTimelineEvent structurally carry a
+    // gate; the is_reviewable() check above guarantees we're in one.
     let gate = event
-        .gate
-        .get_or_insert_with(|| crate::review_state::CommitGate {
-            state: crate::review_state::CommitGateState::Unreviewed,
-            participants: Vec::new(),
-            approvers: Vec::new(),
-            requesters: Vec::new(),
-            ambiguous: Vec::new(),
-            missing: Vec::new(),
-            feedback: std::collections::BTreeMap::new(),
-        });
+        .gate_mut()
+        .expect("is_reviewable() implies a gate (structural)");
     let feedback = Feedback {
         author: parsed.author.clone(),
         verdict,
@@ -482,7 +476,7 @@ fn upsert_feedback(
 
 fn remove_feedback(session: &mut Plan, parsed: &crate::disk_format::FeedbackPath) {
     if let Some(event) = session.event_for_mut(&parsed.target_sha)
-        && let Some(gate) = event.gate.as_mut()
+        && let Some(gate) = event.gate_mut()
     {
         gate.feedback.remove(&parsed.author);
     }
@@ -503,14 +497,10 @@ fn refresh_commits_for(state: &mut crate::repo_state::RepoState, plan_key: &Plan
     }
     let mut participants: Vec<crate::lifecycle::AgentLabel> = Vec::new();
     for event in plan.timeline.iter_mut() {
-        if !event.kind.is_reviewable() {
+        if !event.kind().is_reviewable() {
             continue;
         }
-        let fb_for = event
-            .gate
-            .as_ref()
-            .map(|g| g.feedback.clone())
-            .unwrap_or_default();
+        let fb_for = event.gate().map(|g| g.feedback.clone()).unwrap_or_default();
         let mut approvers = Vec::new();
         let mut requesters = Vec::new();
         let mut ambiguous = Vec::new();
@@ -548,7 +538,12 @@ fn refresh_commits_for(state: &mut crate::repo_state::RepoState, plan_key: &Plan
         } else {
             crate::review_state::CommitGateState::Unreviewed
         };
-        event.gate = Some(crate::review_state::CommitGate {
+        // Reviewable variant: gate is structurally present, mutate in
+        // place rather than reassigning the field.
+        let gate = event
+            .gate_mut()
+            .expect("is_reviewable() implies a gate (structural)");
+        *gate = crate::review_state::CommitGate {
             state: gate_state,
             participants: participants.clone(),
             approvers,
@@ -556,7 +551,7 @@ fn refresh_commits_for(state: &mut crate::repo_state::RepoState, plan_key: &Plan
             ambiguous,
             missing,
             feedback: fb_for,
-        });
+        };
     }
 }
 
@@ -704,7 +699,7 @@ mod tests {
                             .iter()
                             .filter(|e| {
                                 matches!(
-                                    e.kind,
+                                    e.kind(),
                                     crate::repo_state::CommitKind::PlanOnly
                                         | crate::repo_state::CommitKind::Mixed
                                         | crate::repo_state::CommitKind::MultiPlan
@@ -734,7 +729,7 @@ mod tests {
                             .iter()
                             .filter(|e| {
                                 matches!(
-                                    e.kind,
+                                    e.kind(),
                                     crate::repo_state::CommitKind::PlanOnly
                                         | crate::repo_state::CommitKind::Mixed
                                         | crate::repo_state::CommitKind::MultiPlan
