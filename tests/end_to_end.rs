@@ -905,6 +905,109 @@ async fn same_stem_different_repos_distinguishable() {
 }
 
 #[tokio::test]
+async fn set_active_work_lets_wfw_resolve_amid_multiple_active_plans() {
+    // Two active plans in one repo. Without a selection, work_context
+    // (which calls resolve_plan_id under the hood) raises
+    // `ambiguous_plan`. After set_active_work, the resolver routes to
+    // the selected plan instead.
+    let dir = init_repo();
+    write_file(dir.path(), ".trinity/plans/foo.md", "# foo\n");
+    commit(dir.path(), "Add foo");
+    write_file(dir.path(), ".trinity/plans/bar.md", "# bar\n");
+    commit(dir.path(), "Add bar");
+
+    let (url, handle) = spawn_daemon(dir.path()).await;
+    let client = reqwest::Client::new();
+
+    // Baseline: omitting plan_id raises ambiguous_plan.
+    let baseline: serde_json::Value = client
+        .post(format!("{}/internal/tool_call", url))
+        .json(&json!({
+            "cwd": dir.path(),
+            "tool": "work_context",
+            "arguments": { "author_label": "alice" }
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(baseline["result"]["error"], "ambiguous_plan");
+
+    // Select foo.
+    let set_resp: serde_json::Value = client
+        .post(format!("{}/internal/tool_call", url))
+        .json(&json!({
+            "cwd": dir.path(),
+            "tool": "set_active_work",
+            "arguments": {
+                "plan_id": plan_id_for(&dir, "foo"),
+                "author_label": "alice"
+            }
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(set_resp["result"]["ok"], true);
+
+    // Now work_context without plan_id should resolve foo.
+    let resolved: serde_json::Value = client
+        .post(format!("{}/internal/tool_call", url))
+        .json(&json!({
+            "cwd": dir.path(),
+            "tool": "work_context",
+            "arguments": { "author_label": "alice" }
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        resolved["result"]["plan_id"].as_str().unwrap(),
+        plan_id_for(&dir, "foo")
+    );
+
+    // Clear and confirm ambiguity returns.
+    let clear_resp: serde_json::Value = client
+        .post(format!("{}/internal/tool_call", url))
+        .json(&json!({
+            "cwd": dir.path(),
+            "tool": "clear_active_work",
+            "arguments": { "author_label": "alice" }
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(clear_resp["result"]["ok"], true);
+
+    let after_clear: serde_json::Value = client
+        .post(format!("{}/internal/tool_call", url))
+        .json(&json!({
+            "cwd": dir.path(),
+            "tool": "work_context",
+            "arguments": { "author_label": "alice" }
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(after_clear["result"]["error"], "ambiguous_plan");
+
+    handle.abort();
+}
+
+#[tokio::test]
 async fn start_plan_rejects_repo_basename_collision() {
     // Two distinct canonical repos with the same `file_name`: the second
     // one's `start_plan` must fail with a basename-collision error

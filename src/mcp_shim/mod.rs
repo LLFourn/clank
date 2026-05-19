@@ -241,6 +241,8 @@ fn label_arg_for(tool: &str) -> Option<&'static str> {
     match tool {
         "start_plan" => Some("label"),
         "work_context" => Some("author_label"),
+        "set_active_work" => Some("author_label"),
+        "clear_active_work" => Some("author_label"),
         "wait_for_work" => Some("author_label"),
         _ => None,
     }

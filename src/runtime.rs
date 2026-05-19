@@ -220,6 +220,36 @@ impl Runtime {
         trinity.live_events.clone()
     }
 
+    /// Record an ephemeral active-plan selection for one
+    /// `(basename, author)`. Overwrites any prior selection for that
+    /// pair. Consulted by `resolve_plan_id` before raising
+    /// `ambiguous_plan`. Stale selections (frozen / missing-worktree
+    /// plan) are validated at use time and silently dropped — see
+    /// `resolve_plan_id`.
+    pub async fn set_active_work(
+        &self,
+        basename: crate::lifecycle::RepoBasename,
+        author: crate::lifecycle::AgentLabel,
+        plan_key: crate::lifecycle::PlanKey,
+    ) {
+        let mut trinity = self.state.lock().await;
+        trinity
+            .active_selections
+            .insert((basename, author), plan_key);
+    }
+
+    /// Drop the active-plan selection for `(basename, author)`, if any.
+    pub async fn clear_active_work(
+        &self,
+        basename: &crate::lifecycle::RepoBasename,
+        author: &crate::lifecycle::AgentLabel,
+    ) {
+        let mut trinity = self.state.lock().await;
+        trinity
+            .active_selections
+            .remove(&(basename.clone(), author.clone()));
+    }
+
     /// Subscribe to the live event broadcast channel. SSE handlers use
     /// this to receive new events as they're appended (no polling).
     pub fn subscribe_events(&self) -> broadcast::Receiver<LiveEvent> {
@@ -946,5 +976,46 @@ mod tests {
 
         let events = rt.live_events_snapshot().await;
         assert!(events.len() <= 200);
+    }
+
+    #[tokio::test]
+    async fn active_work_selection_set_clear_round_trip() {
+        let rt = Runtime::new();
+        let basename = crate::lifecycle::RepoBasename::parse("trinity").unwrap();
+        let author = AgentLabel::parse("alice").unwrap();
+        let plan_key = PlanKey::parse("foo").unwrap();
+
+        // Empty by default.
+        {
+            let state = rt.state();
+            let trinity = state.lock().await;
+            assert!(
+                !trinity
+                    .active_selections
+                    .contains_key(&(basename.clone(), author.clone()))
+            );
+        }
+
+        // Set, observe.
+        rt.set_active_work(basename.clone(), author.clone(), plan_key.clone())
+            .await;
+        {
+            let state = rt.state();
+            let trinity = state.lock().await;
+            assert_eq!(
+                trinity
+                    .active_selections
+                    .get(&(basename.clone(), author.clone())),
+                Some(&plan_key)
+            );
+        }
+
+        // Clear, observe.
+        rt.clear_active_work(&basename, &author).await;
+        {
+            let state = rt.state();
+            let trinity = state.lock().await;
+            assert!(!trinity.active_selections.contains_key(&(basename, author)));
+        }
     }
 }

@@ -245,6 +245,22 @@ fn schema_work_context_response() {
 }
 
 #[test]
+fn schema_set_active_work_response() {
+    let v = serde_json::to_value(SetActiveWorkResponse {
+        ok: true,
+        plan_id: "trinity/foo.md".into(),
+    })
+    .unwrap();
+    assert_schema("set_active_work_response", &v);
+}
+
+#[test]
+fn schema_clear_active_work_response() {
+    let v = serde_json::to_value(ClearActiveWorkResponse { ok: true }).unwrap();
+    assert_schema("clear_active_work_response", &v);
+}
+
+#[test]
 fn schema_plan_detail_response() {
     let v = serde_json::to_value(PlanDetailResponse {
         repo: "/r".into(),

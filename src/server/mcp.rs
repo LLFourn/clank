@@ -40,6 +40,8 @@ pub async fn dispatch(state: &AppState, req: &ToolCallRequest) -> Result<Value, 
         "list_plans" => list_plans(state, req).await,
         "start_plan" => start_plan(state, req).await,
         "work_context" => work_context(state, req).await,
+        "set_active_work" => set_active_work(state, req).await,
+        "clear_active_work" => clear_active_work(state, req).await,
         "wait_for_work" => wait_for_work(state, req).await,
         other => Err(ToolError::NotFound(format!("unknown tool: {other}"))),
     }
@@ -59,6 +61,7 @@ async fn wait_for_work(state: &AppState, req: &ToolCallRequest) -> Result<Value,
         state,
         Some(args.plan_id.as_str()),
         args.repo.as_deref(),
+        args.author_label.as_deref(),
         &req.cwd,
     )
     .await?
@@ -284,17 +287,23 @@ struct WorkContextArgs {
 async fn work_context(state: &AppState, req: &ToolCallRequest) -> Result<Value, ToolError> {
     let args: WorkContextArgs = serde_json::from_value(req.arguments.clone())
         .map_err(|e| ToolError::Invalid(format!("args: {e}")))?;
-    let author_raw = args.author_label.unwrap_or_else(|| "anonymous".to_string());
+    let author_raw = args
+        .author_label
+        .as_deref()
+        .unwrap_or("anonymous")
+        .to_string();
     let author = AgentLabel::parse(&author_raw)
         .map_err(|e| ToolError::Invalid(format!("invalid author_label: {e}")))?;
 
-    // Plan-id inference: explicit > repo+single-active > cwd+single-active.
-    // Zero actives → no_active_plan error. Multiple → ambiguous_plan with
-    // candidate list. See plan §"Optional plan_id inference".
+    // Plan-id inference: explicit > active-work selection >
+    // repo+single-active-visible > cwd+single-active-visible.
+    // Zero actives → no_active_plan error. Multiple → ambiguous_plan
+    // with candidate list.
     let plan_id = match resolve_plan_id(
         state,
         args.plan_id.as_deref(),
         args.repo.as_deref(),
+        args.author_label.as_deref(),
         &req.cwd,
     )
     .await?
@@ -377,6 +386,149 @@ async fn work_context(state: &AppState, req: &ToolCallRequest) -> Result<Value, 
     serde_json::to_value(response).map_err(|e| ToolError::Internal(anyhow::anyhow!(e)))
 }
 
+#[derive(Debug, Deserialize)]
+struct SetActiveWorkArgs {
+    plan_id: String,
+    #[serde(default)]
+    repo: Option<String>,
+    author_label: Option<String>,
+}
+
+async fn set_active_work(state: &AppState, req: &ToolCallRequest) -> Result<Value, ToolError> {
+    let args: SetActiveWorkArgs = serde_json::from_value(req.arguments.clone())
+        .map_err(|e| ToolError::Invalid(format!("args: {e}")))?;
+    let author_raw = args
+        .author_label
+        .as_deref()
+        .ok_or_else(|| ToolError::Invalid("author_label is required".into()))?;
+    let author = AgentLabel::parse(author_raw)
+        .map_err(|e| ToolError::Invalid(format!("invalid author_label: {e}")))?;
+    let plan_id = PlanId::parse(&args.plan_id)
+        .map_err(|e| ToolError::Invalid(format!("invalid plan_id: {e}")))?;
+
+    // If `repo` arg is supplied, validate it resolves to the same
+    // basename as plan_id's repo segment.
+    if let Some(repo_arg) = args
+        .repo
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        let resolved = resolve_repo_filter(state, repo_arg, &req.cwd).await?;
+        let resolved_basename = RepoBasename::from_repo_root(&resolved).ok_or_else(|| {
+            ToolError::Internal(anyhow::anyhow!(
+                "resolved repo has no usable basename: {}",
+                resolved.display()
+            ))
+        })?;
+        if resolved_basename != *plan_id.repo() {
+            return Err(ToolError::Invalid(format!(
+                "repo arg `{}` resolves to basename `{}` but plan_id basename is `{}`",
+                repo_arg,
+                resolved_basename.as_str(),
+                plan_id.repo().as_str()
+            )));
+        }
+    }
+
+    // Snapshot the candidate under lock; release; disk-read; decide.
+    let snapshot = {
+        let trinity = state.runtime.state();
+        let trinity = trinity.lock().await;
+        let Some(repo_root) = trinity.repo_basenames.get(plan_id.repo()) else {
+            return mcp_error(trinity_core::api::McpErrorPayload::UnknownRepo {
+                basename: plan_id.repo().as_str().to_string(),
+            });
+        };
+        let Some(repo_state) = trinity.repos.get(repo_root) else {
+            return Err(ToolError::Internal(anyhow::anyhow!(
+                "repo_basenames out of sync with repos: {}",
+                repo_root.display()
+            )));
+        };
+        let Some(plan) = repo_state.plans.get(plan_id.key()) else {
+            return mcp_error(trinity_core::api::McpErrorPayload::PlanNotCommitted {
+                plan_id: plan_id.to_string(),
+                slug: plan_id.key().as_str().to_string(),
+                next_step: format!(
+                    "commit the plan file: git add .trinity/plans/{slug}.md && git commit -m 'Start plan: {slug}'",
+                    slug = plan_id.key().as_str()
+                ),
+            });
+        };
+        if plan.is_frozen() {
+            return Err(ToolError::Invalid(format!(
+                "plan {} is frozen; cannot set as active work",
+                plan_id
+            )));
+        }
+        (
+            repo_root.clone(),
+            plan.plan_path.clone(),
+            plan.body_hash.clone(),
+        )
+    };
+    let (repo_root, plan_path, body_hash) = snapshot;
+    let status =
+        crate::responses::compute_plan_worktree_status_parts(&repo_root, &plan_path, &body_hash)
+            .map_err(|e| ToolError::Internal(anyhow::anyhow!(e)))?;
+    if matches!(
+        status,
+        crate::repo_state::PlanWorktreeStatus::PlanFileMissing
+    ) {
+        return Err(ToolError::NotFound(format!(
+            "plan {} is hidden: plan file missing from working tree",
+            plan_id
+        )));
+    }
+
+    state
+        .runtime
+        .set_active_work(plan_id.repo().clone(), author, plan_id.key().clone())
+        .await;
+    let response = trinity_core::api::SetActiveWorkResponse {
+        ok: true,
+        plan_id: plan_id.to_string(),
+    };
+    serde_json::to_value(response).map_err(|e| ToolError::Internal(anyhow::anyhow!(e)))
+}
+
+#[derive(Debug, Deserialize)]
+struct ClearActiveWorkArgs {
+    #[serde(default)]
+    repo: Option<String>,
+    author_label: Option<String>,
+}
+
+async fn clear_active_work(state: &AppState, req: &ToolCallRequest) -> Result<Value, ToolError> {
+    let args: ClearActiveWorkArgs = serde_json::from_value(req.arguments.clone())
+        .map_err(|e| ToolError::Invalid(format!("args: {e}")))?;
+    let author_raw = args
+        .author_label
+        .as_deref()
+        .ok_or_else(|| ToolError::Invalid("author_label is required".into()))?;
+    let author = AgentLabel::parse(author_raw)
+        .map_err(|e| ToolError::Invalid(format!("invalid author_label: {e}")))?;
+    let repo_path = match args
+        .repo
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        Some(raw) => resolve_repo_filter(state, raw, &req.cwd).await?,
+        None => resolve_repo(&req.cwd).await?,
+    };
+    let basename = RepoBasename::from_repo_root(&repo_path).ok_or_else(|| {
+        ToolError::Internal(anyhow::anyhow!(
+            "repo path has no usable basename: {}",
+            repo_path.display()
+        ))
+    })?;
+    state.runtime.clear_active_work(&basename, &author).await;
+    let response = trinity_core::api::ClearActiveWorkResponse { ok: true };
+    serde_json::to_value(response).map_err(|e| ToolError::Internal(anyhow::anyhow!(e)))
+}
+
 async fn resolve_repo(cwd: &Path) -> Result<PathBuf, ToolError> {
     let output = tokio::process::Command::new("git")
         .arg("-C")
@@ -426,20 +578,42 @@ pub enum PlanIdResolution {
     },
 }
 
-/// Inference rules per plan §"Optional `plan_id` inference":
+/// Snapshot of one plan candidate. Used by `resolve_plan_id` to
+/// carry just-enough state out of the runtime mutex so the disk
+/// read for `PlanWorktreeStatus` happens outside the lock.
+struct CandidateSnapshot {
+    plan_key: PlanKey,
+    plan_path: String,
+    body_hash: crate::lifecycle::ContentHash,
+    lifecycle: trinity_core::vocab::PlanLifecycle,
+}
+
+/// Inference rules:
 ///
 /// 1. Explicit `plan_id` always wins. Parsed and returned as-is.
 /// 2. Otherwise resolve a repo via `repo_override` or the caller's
-///    cwd, then count active plans in that repo.
-/// 3. Exactly one active → return it.
-/// 4. Zero actives → `NoActives { repo }`. Caller decides the wire
-///    shape (timeout-style on long-poll APIs, error-style elsewhere).
-/// 5. Multiple actives → `Ambiguous` with a candidate list. Recency
-///    is NOT a tiebreaker — Trinity does not pick for the caller.
+///    cwd.
+/// 3. If `author_label` is present and a `set_active_work` selection
+///    exists for `(basename, author_label)`, validate it (must be
+///    non-frozen and have its worktree file present). Valid → resolve
+///    to the selected plan. Invalid → drop the selection and fall
+///    through to step 4.
+/// 4. Count *active + visible* plans in the repo. A plan is active
+///    when `!is_frozen()`; visible when its worktree file is not
+///    missing (matches `Plan::is_visible` semantics).
+///    - 1 candidate → return it.
+///    - 0 candidates → `NoActives { repo }`.
+///    - 2+ candidates → `Ambiguous` with the candidate list.
+///
+/// Lock-boundary discipline: candidate metadata is snapshotted under
+/// the runtime mutex into `CandidateSnapshot` values, then the lock
+/// is released before any `compute_plan_worktree_status_parts` call.
+/// Stale selection drops happen behind a brief second lock-acquire.
 pub async fn resolve_plan_id(
     state: &AppState,
     plan_id_override: Option<&str>,
     repo_override: Option<&str>,
+    author_label: Option<&str>,
     cwd: &Path,
 ) -> Result<PlanIdResolution, ToolError> {
     // Normalize blank-string overrides to absent so callers can pass
@@ -459,38 +633,110 @@ pub async fn resolve_plan_id(
         Some(raw) => resolve_repo_filter(state, raw, cwd).await?,
         None => resolve_repo(cwd).await?,
     };
-
-    let trinity = state.runtime.state();
-    let trinity = trinity.lock().await;
-    let Some(repo_state) = trinity.repos.get(&repo_path) else {
-        return Ok(PlanIdResolution::NoActives { repo: repo_path });
-    };
-    let basename = crate::lifecycle::RepoBasename::from_repo_root(&repo_path).ok_or_else(|| {
+    let basename = RepoBasename::from_repo_root(&repo_path).ok_or_else(|| {
         ToolError::Internal(anyhow::anyhow!(
             "repo path has no usable basename: {}",
             repo_path.display()
         ))
     })?;
+    let author = author_label
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .and_then(|s| AgentLabel::parse(s).ok());
 
-    let actives: Vec<&crate::repo_state::Plan> = repo_state
-        .plans
-        .values()
-        .filter(|p| !p.is_frozen())
-        .collect();
+    // Snapshot the repo's candidate plans + any active-work selection
+    // under the runtime mutex, then drop the lock before disk reads.
+    let (selection_snapshot, candidates) = {
+        let trinity = state.runtime.state();
+        let trinity = trinity.lock().await;
+        let Some(repo_state) = trinity.repos.get(&repo_path) else {
+            return Ok(PlanIdResolution::NoActives { repo: repo_path });
+        };
+        let selection_snapshot = author
+            .as_ref()
+            .and_then(|a| {
+                trinity
+                    .active_selections
+                    .get(&(basename.clone(), a.clone()))
+            })
+            .and_then(|key| repo_state.plans.get(key))
+            .map(|plan| CandidateSnapshot {
+                plan_key: plan.id.clone(),
+                plan_path: plan.plan_path.clone(),
+                body_hash: plan.body_hash.clone(),
+                lifecycle: plan.lifecycle(),
+            });
+        let candidates: Vec<CandidateSnapshot> = repo_state
+            .plans
+            .values()
+            .filter(|p| !p.is_frozen())
+            .map(|p| CandidateSnapshot {
+                plan_key: p.id.clone(),
+                plan_path: p.plan_path.clone(),
+                body_hash: p.body_hash.clone(),
+                lifecycle: p.lifecycle(),
+            })
+            .collect();
+        (selection_snapshot, candidates)
+    };
 
-    match actives.len() {
+    // Consult the active-work selection first. Validation requires a
+    // disk read but the snapshot is already in hand.
+    if let Some(selection) = selection_snapshot {
+        let status = crate::responses::compute_plan_worktree_status_parts(
+            &repo_path,
+            &selection.plan_path,
+            &selection.body_hash,
+        )
+        .map_err(|e| ToolError::Internal(anyhow::anyhow!(e)))?;
+        let is_visible = selection.lifecycle == trinity_core::vocab::PlanLifecycle::Active
+            && status != crate::repo_state::PlanWorktreeStatus::PlanFileMissing;
+        if is_visible {
+            return Ok(PlanIdResolution::Resolved(PlanId::new(
+                basename,
+                selection.plan_key,
+            )));
+        }
+        // Stale: drop it under a brief lock so a parallel reader
+        // doesn't keep observing the invalid selection.
+        if let Some(a) = author.as_ref() {
+            let trinity = state.runtime.state();
+            let mut trinity = trinity.lock().await;
+            trinity
+                .active_selections
+                .remove(&(basename.clone(), a.clone()));
+        }
+        // Fall through to normal counting.
+    }
+
+    // Active-visible filter on the snapshot candidates. Each
+    // surviving candidate requires its own disk read.
+    let mut visible: Vec<CandidateSnapshot> = Vec::with_capacity(candidates.len());
+    for c in candidates {
+        let status = crate::responses::compute_plan_worktree_status_parts(
+            &repo_path,
+            &c.plan_path,
+            &c.body_hash,
+        )
+        .map_err(|e| ToolError::Internal(anyhow::anyhow!(e)))?;
+        if status != crate::repo_state::PlanWorktreeStatus::PlanFileMissing {
+            visible.push(c);
+        }
+    }
+
+    match visible.len() {
         0 => Ok(PlanIdResolution::NoActives { repo: repo_path }),
         1 => Ok(PlanIdResolution::Resolved(PlanId::new(
             basename,
-            actives[0].id.clone(),
+            visible.into_iter().next().unwrap().plan_key,
         ))),
         _ => {
-            let candidates = actives
-                .iter()
-                .map(|p| trinity_core::api::PlanCandidate {
-                    plan_id: PlanId::new(basename.clone(), p.id.clone()).to_string(),
-                    current_path: p.plan_path.clone(),
-                    lifecycle: p.lifecycle(),
+            let candidates = visible
+                .into_iter()
+                .map(|c| trinity_core::api::PlanCandidate {
+                    plan_id: PlanId::new(basename.clone(), c.plan_key).to_string(),
+                    current_path: c.plan_path,
+                    lifecycle: c.lifecycle,
                 })
                 .collect();
             Ok(PlanIdResolution::Ambiguous { candidates })

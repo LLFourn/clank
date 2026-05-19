@@ -300,8 +300,25 @@ pub struct WorkContextResponse {
     pub latest_relevant_commit: Option<String>,
 }
 
+/// MCP `set_active_work` response. The selection is recorded in
+/// the runtime's in-memory selection map; the plan_id echo
+/// confirms which plan the daemon understood.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SetActiveWorkResponse {
+    pub ok: bool,
+    pub plan_id: String,
+}
+
+/// MCP `clear_active_work` response. Idempotent — `ok: true`
+/// regardless of whether a selection was present.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClearActiveWorkResponse {
+    pub ok: bool,
+}
+
 /// `/api/plan/{repo}/{stem_md}` response body — the UI's richer
-/// per-plan shape. Adds the plan body markdown to `GetContextResponse`.
+/// per-plan shape with full timeline, commits, archived cycles,
+/// and the plan body markdown.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PlanDetailResponse {
     pub repo: String,

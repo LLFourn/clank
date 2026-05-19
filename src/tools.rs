@@ -204,5 +204,61 @@ pub fn catalog() -> Vec<ToolDescriptor> {
                 "additionalProperties": false
             }),
         },
+        ToolDescriptor {
+            name: "set_active_work".to_string(),
+            description: "Record an ephemeral active-plan selection for the current agent. \
+                          `wait_for_work` and `work_context` consult this when the caller \
+                          omits `plan_id` and the resolved repo has multiple active plans — \
+                          instead of raising `ambiguous_plan`, the resolver uses the selection.\n\n\
+                          The selection is in-memory only: it does not create plan files, \
+                          change review gates, emit timeline events, or persist across daemon \
+                          restart. Stale selections (the plan is frozen, missing from the \
+                          worktree, or in the wrong repo) are dropped on first consult.\n\n\
+                          Inputs:\n\
+                          - `plan_id` (required): canonical `<repo_basename>/<stem>.md`.\n\
+                          - `repo` (optional): if present, must resolve to the same basename \
+                            as `plan_id`. Mismatch is an invalid-args error.\n\
+                          - `author_label` (daemon-required, schema-optional for shim autofill).\n\n\
+                          Errors: `unknown_repo`, `plan_not_committed`, plus `Invalid` when \
+                          plan is frozen or when `repo` arg disagrees with the plan_id basename."
+                .to_string(),
+            input_schema: json!({
+                "type": "object",
+                "required": ["plan_id"],
+                "properties": {
+                    "plan_id": {
+                        "type": "string",
+                        "description": "Canonical `<repo_basename>/<stem>.md`."
+                    },
+                    "repo": {
+                        "type": "string",
+                        "description": "Optional. If present, must match plan_id's basename."
+                    },
+                    "author_label": {"type": "string"}
+                },
+                "additionalProperties": false
+            }),
+        },
+        ToolDescriptor {
+            name: "clear_active_work".to_string(),
+            description: "Drop the ephemeral active-plan selection for the current agent in \
+                          the resolved repo, if any. Idempotent — clearing an absent selection \
+                          is a non-error.\n\n\
+                          Inputs:\n\
+                          - `repo` (optional): basename or absolute path; defaults to caller's cwd-repo.\n\
+                          - `author_label` (daemon-required, schema-optional for shim autofill)."
+                .to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "repo": {
+                        "type": "string",
+                        "description": "Optional repo filter. Basename or absolute path."
+                    },
+                    "author_label": {"type": "string"}
+                },
+                "additionalProperties": false
+            }),
+        },
     ]
 }

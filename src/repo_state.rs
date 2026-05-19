@@ -6,7 +6,7 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::path::PathBuf;
 
-use crate::lifecycle::{CommitSha, PlanKey, RepoBasename};
+use crate::lifecycle::{AgentLabel, CommitSha, PlanKey, RepoBasename};
 
 pub type RepoRoot = PathBuf;
 
@@ -18,6 +18,13 @@ pub struct Trinity {
     /// registrations are dropped and the daemon logs WARN.
     pub repo_basenames: BTreeMap<RepoBasename, RepoRoot>,
     pub live_events: VecDeque<LiveEvent>,
+    /// Ephemeral per-agent active-plan selections. Populated by
+    /// `set_active_work`, cleared by `clear_active_work`, dropped on
+    /// daemon restart. Consulted by `resolve_plan_id` before raising
+    /// `ambiguous_plan`, validated at use time against the current
+    /// fold (selected plan must exist, be non-frozen, and have its
+    /// worktree file present).
+    pub active_selections: BTreeMap<(RepoBasename, AgentLabel), PlanKey>,
 }
 
 /// Repo-level reduced state. Everything here is the *result* of
