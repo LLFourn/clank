@@ -37,6 +37,15 @@ pub async fn run(args: FinishArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Public for `cli::purge` (same parsing rules across both
+/// subcommands).
+pub(crate) fn resolve_stem_for_purge(
+    plan: &Option<String>,
+    expected_basename: &str,
+) -> anyhow::Result<String> {
+    resolve_stem(plan, expected_basename)
+}
+
 /// Parse the `<plan>` CLI argument into a plan stem the wire form
 /// expects. Accepts `<basename>/<stem>.md` (full plan id; must
 /// address the repo `--repo`/cwd resolves to), `<stem>.md`, or

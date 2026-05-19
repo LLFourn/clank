@@ -11,6 +11,8 @@ use std::path::{Path, PathBuf};
 
 pub mod finish;
 pub mod init;
+pub mod purge;
+pub mod rewrite;
 
 /// Default daemon URL — matches `trinity serve`'s loopback bind +
 /// the MCP shim's default.
@@ -46,11 +48,40 @@ pub struct FinishArgs {
 #[derive(Args, Debug)]
 pub struct PurgeArgs {
     /// Plan to purge. Accepts `<repo>/<stem>.md` or just `<stem>`.
+    /// For abandoned-plan purges where no in-flight plan exists,
+    /// the plan id is mandatory (the CLI can't infer).
     pub plan: Option<String>,
-}
-
-pub async fn purge(_args: PurgeArgs) -> anyhow::Result<()> {
-    anyhow::bail!("trinity purge is not yet implemented (lands in Phase 4)")
+    /// Repo root. Defaults to the cwd's git toplevel.
+    #[arg(long, value_name = "PATH")]
+    pub repo: Option<PathBuf>,
+    /// Daemon HTTP base URL.
+    #[arg(long, default_value = DEFAULT_DAEMON, env = "TRINITY_DAEMON")]
+    pub daemon: String,
+    /// Write the rewritten chain to a fresh branch instead of
+    /// rewriting the current branch in place. Safer — the operator
+    /// can inspect / cherry-pick / diff before deciding what to do
+    /// with it. Refuses if `<name>` already exists.
+    #[arg(long, value_name = "NAME")]
+    pub into_branch: Option<String>,
+    /// Print the planned rewrite and exit 0 without creating any
+    /// commits or moving any refs.
+    #[arg(long)]
+    pub dry: bool,
+    /// Skip the interactive confirmation prompt.
+    #[arg(long)]
+    pub yes: bool,
+    /// Reserved for a future phase: squash plan-attributed
+    /// commits into a single commit with the supplied message.
+    #[arg(long, value_name = "MSG")]
+    pub squash: Option<String>,
+    /// Reserved for a future phase: amend HEAD instead of building
+    /// a new chain.
+    #[arg(long)]
+    pub amend: bool,
+    /// Reserved for a future phase: also strip
+    /// `.trinity/finished/<stem>/` from history.
+    #[arg(long)]
+    pub drop_finalize: bool,
 }
 
 /// Resolve the repo root: explicit `--repo` path wins, otherwise
