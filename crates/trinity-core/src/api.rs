@@ -700,6 +700,66 @@ pub struct SealedApproval {
     pub body_hash: crate::ids::ContentHash,
 }
 
+/// `rewrite_preview` response — the typed manifest `trinity purge`
+/// and `trinity finish --squash`/`--purge` execute. Returned by
+/// `GET /api/plan/{repo}/{stem}.md/rewrite_preview`.
+///
+/// The CLI is a thin executor of this manifest. The classification
+/// rules (drop/keep_verbatim/rewrite, foreign-commit definition,
+/// what counts as a plan-`.trinity/` path) live in the daemon's
+/// projection — the CLI walks `commits` in order and applies the
+/// per-commit disposition without re-deriving Trinity attribution.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RewritePreviewResponse {
+    pub plan_id: String,
+    pub plan_stem: crate::ids::PlanKey,
+    /// The plan's intro commit — the earliest sha attributed to the
+    /// plan. `None` only for plans with no commits yet (which the
+    /// CLI should refuse before reaching this endpoint).
+    pub intro_sha: Option<crate::ids::CommitSha>,
+    pub head_sha: crate::ids::CommitSha,
+    /// True if the range `[intro_sha, head_sha]` is first-parent
+    /// linear (no merge commits). False means the engine refuses
+    /// to rewrite — merge-tree rewriting is out of scope.
+    pub linear: bool,
+    /// In chronological order from `intro_sha` to `head_sha`
+    /// (inclusive). Empty when `intro_sha` is `None`.
+    pub commits: Vec<RewriteCommit>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RewriteCommit {
+    pub sha: crate::ids::CommitSha,
+    pub subject: String,
+    pub disposition: RewriteDisposition,
+    /// True if the commit is NOT attributed to this plan (another
+    /// plan's commit, unattributed, or cross-plan mixed). `--squash`
+    /// refuses cleanly when this is true for any commit in the
+    /// range; `--purge` handles it.
+    pub foreign: bool,
+    /// Repo-relative paths to strip from the rewritten tree for
+    /// this commit. Empty for `Drop` (the commit goes away anyway)
+    /// and `KeepVerbatim` (we don't change the tree). Non-empty
+    /// only for `Rewrite`.
+    pub strip_paths: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RewriteDisposition {
+    /// Commit touched ONLY this plan's `.trinity/` paths. The
+    /// rewrite engine skips it entirely; the parent chain hops over.
+    Drop,
+    /// Commit didn't touch any of this plan's `.trinity/` paths.
+    /// Reuse the SHA verbatim in the rewritten chain.
+    KeepVerbatim,
+    /// Commit touched this plan's `.trinity/` paths AND other
+    /// paths. The engine builds a new tree omitting
+    /// `strip_paths`, then commit-tree's it with the original
+    /// author/message/timestamp.
+    Rewrite,
+}
+
 // ============================================================
 // wait_for_work response
 // ============================================================

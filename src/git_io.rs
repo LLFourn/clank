@@ -273,6 +273,12 @@ pub async fn first_added_commit(
 /// topologically earliest plan_intro requires a separate query. Trinity
 /// repos are small enough that walking from the root is cheap and avoids
 /// a correctness footgun.
+/// Number of parents on `sha`. Two or more = merge commit.
+pub async fn commit_parent_count(repo: &Path, sha: &CommitSha) -> Result<usize, GitIoError> {
+    let stdout = run_ok(repo, &["show", "-s", "--format=%P", sha.as_str()]).await?;
+    Ok(stdout.split_whitespace().count())
+}
+
 pub async fn first_parent_commits(repo: &Path) -> Result<Vec<CommitMeta>, GitIoError> {
     let stdout = run_ok(
         repo,

@@ -30,6 +30,10 @@ pub fn router(state: AppState) -> Router {
             get(api_finish_preview),
         )
         .route(
+            "/api/plan/{repo}/{stem_md}/rewrite_preview",
+            get(api_rewrite_preview),
+        )
+        .route(
             "/api/plan/{repo}/{stem_md}/revision/{sha}",
             get(api_plan_revision),
         )
@@ -467,6 +471,166 @@ async fn api_finish_preview(
         is_finished,
         sealed_approvals,
     }))
+}
+
+#[derive(Deserialize)]
+struct RewritePreviewQuery {
+    #[serde(default)]
+    include_finalize: bool,
+}
+
+async fn api_rewrite_preview(
+    State(state): State<AppState>,
+    Path((repo_basename, stem_md)): Path<(String, String)>,
+    Query(q): Query<RewritePreviewQuery>,
+) -> Result<axum::Json<trinity_core::api::RewritePreviewResponse>, AppError> {
+    let (repo, plan_key) = resolve_plan_id_segments(&state, &repo_basename, &stem_md).await?;
+    let snapshot = state
+        .runtime
+        .snapshot_session(&repo, &plan_key)
+        .await
+        .map_err(AppError::runtime)?
+        .ok_or_else(|| AppError::not_found(format!("plan {repo_basename}/{stem_md} not found")))?;
+    enforce_plan_visible(&snapshot, &repo_basename, &stem_md)?;
+    let plan = snapshot
+        .plans
+        .values()
+        .next()
+        .expect("single_plan invariant");
+    let plan_id = format!("{repo_basename}/{stem_md}");
+    let plan_stem = plan_key.clone();
+
+    let head_sha = snapshot
+        .head
+        .clone()
+        .ok_or_else(|| AppError::not_found(format!("repo {repo_basename} has no HEAD")))?;
+    let intro_sha = Some(plan.plan_intro.clone());
+
+    let metas = crate::git_io::first_parent_commits(&repo)
+        .await
+        .map_err(|e| AppError::internal(format!("git first-parent walk: {e}")))?;
+    let start = metas
+        .iter()
+        .position(|m| m.sha == plan.plan_intro)
+        .ok_or_else(|| {
+            AppError::internal(format!(
+                "plan intro {} not in first-parent walk from HEAD",
+                plan.plan_intro.as_str()
+            ))
+        })?;
+    let range = &metas[start..];
+
+    let plan_timeline_shas: std::collections::BTreeSet<crate::lifecycle::CommitSha> =
+        plan.timeline.iter().map(|e| e.sha().clone()).collect();
+
+    let mut linear = true;
+    let mut commits = Vec::with_capacity(range.len());
+    for meta in range {
+        let parent_count = crate::git_io::commit_parent_count(&repo, &meta.sha)
+            .await
+            .map_err(|e| AppError::internal(format!("git show parents: {e}")))?;
+        if parent_count > 1 {
+            linear = false;
+        }
+        let changes = crate::git_io::diff_tree_changes(&repo, &meta.sha)
+            .await
+            .map_err(|e| AppError::internal(format!("git diff-tree: {e}")))?;
+        let attributed_to_this_plan = plan_timeline_shas.contains(&meta.sha);
+        let (disposition, strip_paths) = classify_rewrite(&changes, &plan_key, q.include_finalize);
+        commits.push(trinity_core::api::RewriteCommit {
+            sha: meta.sha.clone(),
+            subject: meta.subject.clone(),
+            disposition,
+            foreign: !attributed_to_this_plan,
+            strip_paths,
+        });
+    }
+
+    Ok(axum::Json(trinity_core::api::RewritePreviewResponse {
+        plan_id,
+        plan_stem,
+        intro_sha,
+        head_sha,
+        linear,
+        commits,
+    }))
+}
+
+/// Classify a single commit's disposition for the rewrite engine,
+/// derived purely from its `CommitChanges` and whether finalize-tree
+/// entries are in the strip set. The fold's per-commit `CommitChanges`
+/// is the data layer; classification is the typed projection.
+fn classify_rewrite(
+    changes: &crate::attribution::CommitChanges,
+    plan_key: &crate::lifecycle::PlanKey,
+    include_finalize: bool,
+) -> (trinity_core::api::RewriteDisposition, Vec<String>) {
+    use trinity_core::api::RewriteDisposition;
+
+    let this_plan_touches: Vec<&crate::attribution::PlanTouch> = changes
+        .plan_touches
+        .iter()
+        .filter(|t| &t.session == plan_key)
+        .collect();
+    let other_plan_touches = changes.plan_touches.iter().any(|t| &t.session != plan_key);
+
+    let this_finalize: Vec<&crate::attribution::FinalizeChange> = changes
+        .finalize_changes
+        .iter()
+        .filter(|f| &f.plan_key == plan_key)
+        .collect();
+    let other_finalize = changes
+        .finalize_changes
+        .iter()
+        .any(|f| &f.plan_key != plan_key);
+
+    let touched_this_plan_strippable =
+        !this_plan_touches.is_empty() || (include_finalize && !this_finalize.is_empty());
+    let touched_other_paths = changes.has_non_plan_code_changes
+        || other_plan_touches
+        || other_finalize
+        || (!include_finalize && !this_finalize.is_empty());
+
+    let mut strip_paths = Vec::new();
+    if touched_this_plan_strippable {
+        for touch in &this_plan_touches {
+            if let Some(p) = &touch.new_path {
+                strip_paths.push(p.to_string_lossy().into_owned());
+            }
+        }
+        if include_finalize {
+            for fc in &this_finalize {
+                if matches!(
+                    fc.kind,
+                    crate::attribution::FinalizeChangeKind::Upsert { .. }
+                ) {
+                    strip_paths.push(format!(
+                        ".trinity/finished/{}/{}",
+                        plan_key.as_str(),
+                        fc.file_name
+                    ));
+                }
+            }
+        }
+        strip_paths.sort();
+        strip_paths.dedup();
+    }
+
+    let disposition = if !touched_this_plan_strippable {
+        RewriteDisposition::KeepVerbatim
+    } else if touched_other_paths {
+        RewriteDisposition::Rewrite
+    } else {
+        RewriteDisposition::Drop
+    };
+
+    // strip_paths is moot for Drop (the commit goes away) and
+    // KeepVerbatim (we don't change the tree). Only Rewrite uses it.
+    if !matches!(disposition, RewriteDisposition::Rewrite) {
+        strip_paths.clear();
+    }
+
+    (disposition, strip_paths)
 }
 
 /// Project the typed finalize decision. Single source of truth for
@@ -1446,6 +1610,130 @@ mod wire_tests {
         let v = body_json(resp).await;
         assert_eq!(v["gate_state"], "changes_requested");
         assert_eq!(v["sealed_approvals"].as_array().unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn rewrite_preview_drops_plan_only_commit() {
+        let dir = init_repo();
+        let (_runtime, state) = prepared_state(&dir).await;
+        let app = router(state);
+        let url = format!("/api/plan/{}/rewrite_preview", plan_id_for(&dir, "foo"));
+        let req = Request::builder()
+            .method("GET")
+            .uri(&url)
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let v = body_json(resp).await;
+        assert_eq!(v["plan_stem"], "foo");
+        assert_eq!(v["linear"], true);
+        let commits = v["commits"].as_array().unwrap();
+        assert_eq!(commits.len(), 1);
+        assert_eq!(commits[0]["disposition"], "drop");
+        assert_eq!(commits[0]["foreign"], false);
+        assert!(commits[0]["strip_paths"].as_array().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn rewrite_preview_keeps_pure_code_commit_verbatim() {
+        let dir = init_repo();
+        write_file(dir.path(), ".trinity/plans/foo.md", "# foo\n");
+        commit(dir.path(), "add foo");
+        write_file(dir.path(), "src/main.rs", "fn main() {}\n");
+        commit(dir.path(), "code commit");
+        let runtime = Arc::new(Runtime::new());
+        runtime.add_repo(dir.path().to_path_buf()).await.unwrap();
+        let state = AppState {
+            runtime: Arc::clone(&runtime),
+            watchers: Arc::new(Mutex::new(std::collections::BTreeMap::new())),
+            bundle: Bundle::Disk(std::path::PathBuf::from("/dev/null")),
+            repos_path: std::path::PathBuf::from("/dev/null"),
+        };
+        let app = router(state);
+        let url = format!("/api/plan/{}/rewrite_preview", plan_id_for(&dir, "foo"));
+        let req = Request::builder()
+            .method("GET")
+            .uri(&url)
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let v = body_json(resp).await;
+        let commits = v["commits"].as_array().unwrap();
+        assert_eq!(commits.len(), 2);
+        assert_eq!(commits[0]["disposition"], "drop", "plan intro commit");
+        assert_eq!(commits[1]["disposition"], "keep_verbatim", "code commit");
+        assert_eq!(
+            commits[1]["foreign"], false,
+            "code commit is attributed via walk-back"
+        );
+    }
+
+    #[tokio::test]
+    async fn rewrite_preview_rewrites_mixed_commit() {
+        let dir = init_repo();
+        write_file(dir.path(), ".trinity/plans/foo.md", "# foo\n");
+        commit(dir.path(), "add foo");
+        write_file(dir.path(), ".trinity/plans/foo.md", "# foo v2\n");
+        write_file(dir.path(), "src/lib.rs", "// code\n");
+        commit(dir.path(), "mixed: revise foo + code");
+        let runtime = Arc::new(Runtime::new());
+        runtime.add_repo(dir.path().to_path_buf()).await.unwrap();
+        let state = AppState {
+            runtime: Arc::clone(&runtime),
+            watchers: Arc::new(Mutex::new(std::collections::BTreeMap::new())),
+            bundle: Bundle::Disk(std::path::PathBuf::from("/dev/null")),
+            repos_path: std::path::PathBuf::from("/dev/null"),
+        };
+        let app = router(state);
+        let url = format!("/api/plan/{}/rewrite_preview", plan_id_for(&dir, "foo"));
+        let req = Request::builder()
+            .method("GET")
+            .uri(&url)
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let v = body_json(resp).await;
+        let commits = v["commits"].as_array().unwrap();
+        assert_eq!(commits.len(), 2);
+        assert_eq!(commits[1]["disposition"], "rewrite");
+        let strip = commits[1]["strip_paths"].as_array().unwrap();
+        assert_eq!(strip.len(), 1);
+        assert_eq!(strip[0], ".trinity/plans/foo.md");
+    }
+
+    #[tokio::test]
+    async fn rewrite_preview_marks_other_plan_commit_foreign() {
+        let dir = init_repo();
+        write_file(dir.path(), ".trinity/plans/foo.md", "# foo\n");
+        commit(dir.path(), "add foo");
+        write_file(dir.path(), ".trinity/plans/bar.md", "# bar\n");
+        commit(dir.path(), "add bar");
+        let runtime = Arc::new(Runtime::new());
+        runtime.add_repo(dir.path().to_path_buf()).await.unwrap();
+        let state = AppState {
+            runtime: Arc::clone(&runtime),
+            watchers: Arc::new(Mutex::new(std::collections::BTreeMap::new())),
+            bundle: Bundle::Disk(std::path::PathBuf::from("/dev/null")),
+            repos_path: std::path::PathBuf::from("/dev/null"),
+        };
+        let app = router(state);
+        let url = format!("/api/plan/{}/rewrite_preview", plan_id_for(&dir, "foo"));
+        let req = Request::builder()
+            .method("GET")
+            .uri(&url)
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let v = body_json(resp).await;
+        let commits = v["commits"].as_array().unwrap();
+        assert_eq!(commits.len(), 2);
+        assert_eq!(commits[0]["foreign"], false);
+        assert_eq!(commits[1]["disposition"], "keep_verbatim");
+        assert_eq!(commits[1]["foreign"], true, "bar commit is foreign to foo");
     }
 
     #[tokio::test]
