@@ -332,4 +332,141 @@ mod tests {
         let msg = format!("{err}");
         assert!(msg.contains("plan argument required"), "got: {msg}");
     }
+
+    // ---- finalize() tests (direct, no HTTP) ----
+
+    use trinity_core::api::{FinalizeReadiness, FinishPreviewResponse, SealedApproval};
+    use trinity_core::ids::AgentLabel;
+    use trinity_core::vocab::{CommitGateState, PlanWorktreeStatus};
+
+    fn init_repo() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        run_git(dir.path(), &["init", "--quiet", "--initial-branch=main"]);
+        run_git(dir.path(), &["config", "user.email", "test@test"]);
+        run_git(dir.path(), &["config", "user.name", "test"]);
+        run_git(dir.path(), &["config", "commit.gpgsign", "false"]);
+        dir
+    }
+
+    fn run_git(cwd: &Path, args: &[&str]) {
+        let status = std::process::Command::new("git")
+            .arg("-C")
+            .arg(cwd)
+            .args(args)
+            .status()
+            .unwrap();
+        assert!(status.success(), "git {args:?} failed");
+    }
+
+    fn write_at(repo: &Path, rel: &str, body: &str) {
+        let p = repo.join(rel);
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(p, body).unwrap();
+    }
+
+    fn mk_preview_ready(approval_path: &str, body: &str) -> FinishPreviewResponse {
+        FinishPreviewResponse {
+            plan_id: "trinity/foo.md".into(),
+            plan_path: ".trinity/plans/foo.md".into(),
+            readiness: FinalizeReadiness::Ready,
+            gate_state: CommitGateState::Approved,
+            latest_reviewable_sha: None,
+            plan_worktree_status: PlanWorktreeStatus::Clean,
+            is_finished: false,
+            sealed_approvals: vec![SealedApproval {
+                author: AgentLabel::parse("codex").unwrap(),
+                source_path: approval_path.to_string(),
+                body_hash: crate::lifecycle::content_hash(body),
+            }],
+        }
+    }
+
+    #[tokio::test]
+    async fn finalize_writes_approver_file_and_commits() {
+        let dir = init_repo();
+        write_at(dir.path(), "README.md", "seed\n");
+        run_git(dir.path(), &["add", "-A"]);
+        run_git(dir.path(), &["commit", "--quiet", "-m", "seed"]);
+
+        let approval = ".trinity/feedback/foo/abcdef/codex.md";
+        let body = "APPROVE\n\nlgtm\n";
+        write_at(dir.path(), approval, body);
+
+        let preview = mk_preview_ready(approval, body);
+        finalize(dir.path(), "foo", &preview, false, None)
+            .await
+            .unwrap();
+
+        let dest = dir.path().join(".trinity/finished/foo/codex.md");
+        assert_eq!(std::fs::read_to_string(&dest).unwrap(), body);
+        // A finalize commit landed.
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir.path())
+            .args(["log", "-1", "--format=%s"])
+            .output()
+            .unwrap();
+        assert_eq!(
+            String::from_utf8(out.stdout).unwrap().trim(),
+            "Finalize foo"
+        );
+    }
+
+    #[tokio::test]
+    async fn finalize_aborts_on_hash_drift_without_touching_existing_snapshot() {
+        let dir = init_repo();
+        write_at(dir.path(), "README.md", "seed\n");
+        run_git(dir.path(), &["add", "-A"]);
+        run_git(dir.path(), &["commit", "--quiet", "-m", "seed"]);
+
+        // Pre-existing finalize snapshot (e.g. from a prior run).
+        let stale_snapshot = ".trinity/finished/foo/codex.md";
+        write_at(dir.path(), stale_snapshot, "OLD APPROVE\n");
+
+        let approval = ".trinity/feedback/foo/abcdef/codex.md";
+        write_at(dir.path(), approval, "APPROVE\n\non-disk body\n");
+        // Preview expects a different body — the daemon's projection
+        // is stale relative to disk.
+        let preview = mk_preview_ready(approval, "APPROVE\n\nDAEMON BELIEVED THIS\n");
+
+        let err = finalize(dir.path(), "foo", &preview, false, None)
+            .await
+            .unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("drifted"), "got: {msg}");
+
+        // The pre-existing snapshot is intact — abort happened BEFORE
+        // mutation.
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join(stale_snapshot)).unwrap(),
+            "OLD APPROVE\n",
+            "drift abort must not touch the existing finalize snapshot",
+        );
+    }
+
+    #[tokio::test]
+    async fn finalize_aborts_on_missing_source_without_touching_existing_snapshot() {
+        let dir = init_repo();
+        write_at(dir.path(), "README.md", "seed\n");
+        run_git(dir.path(), &["add", "-A"]);
+        run_git(dir.path(), &["commit", "--quiet", "-m", "seed"]);
+
+        let stale_snapshot = ".trinity/finished/foo/codex.md";
+        write_at(dir.path(), stale_snapshot, "OLD APPROVE\n");
+
+        // Approval file does NOT exist on disk.
+        let preview = mk_preview_ready(".trinity/feedback/foo/abcdef/codex.md", "APPROVE\n");
+
+        let err = finalize(dir.path(), "foo", &preview, false, None)
+            .await
+            .unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("failed to read"), "got: {msg}");
+
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join(stale_snapshot)).unwrap(),
+            "OLD APPROVE\n",
+            "missing-source abort must not touch the existing finalize snapshot",
+        );
+    }
 }

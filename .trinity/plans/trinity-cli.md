@@ -280,46 +280,53 @@ common case (recently-abandoned plans still in HEAD's tree
 or in the recent commit-graph) is supported; the recovery
 case is a follow-up.
 
-Flags:
+Flags (Phase 4):
 
-- `--squash "<message>"`: collapse plan-attributed commits into
-  one (same interleaving rules as `trinity finish --squash`).
-- `--amend`: amend HEAD if HEAD touches this plan's artifacts.
-- `--drop-finalize`: also strip `.trinity/finished/<stem>/` if
-  HEAD contains it. The engine adds the finished path to the
-  per-commit strip set. Legal with `--amend`; redundant with
-  `--squash` (squash already strips everything `.trinity/`).
 - `--into-branch <name>`: don't rewrite the current branch.
   Build the rewritten history on a new branch named `<name>`
   starting from the same root, then leave the current branch
   alone. Safest mode — the operator can diff/inspect/cherry-
   pick before deciding to overwrite the current branch. Creates
-  the branch atomically with `git update-ref refs/heads/<name>
-  <new-tip>`; refuses if the branch already exists.
+  the branch via atomic `git update-ref refs/heads/<name>
+  <new-tip> 0000…`; refuses if the branch already exists.
+- `--dry`: print the planned rewrite and exit 0 without
+  creating any commits or moving any refs.
 - `--yes`: skip interactive confirmation.
-- `--allow-rewrite-protected`: opt-in for branches the CLI's
-  protected-branch detection refuses by default (`main`,
-  `master`, branches matched by `branch.<name>.protect` or
-  similar — exact heuristic TBD during impl).
 
-Safety pre-flights:
+Flags (Phase 5; wire-reserved but bail with "not yet
+implemented" in Phase 4):
+
+- `--squash "<message>"`: collapse plan-attributed commits into
+  one (same interleaving rules as `trinity finish --squash`).
+- `--amend`: amend HEAD if HEAD touches this plan's artifacts.
+- `--drop-finalize`: also strip `.trinity/finished/<stem>/`.
+- `--allow-rewrite-protected`: opt-in for protected branches
+  (the corresponding detection lands in Phase 5).
+
+Safety pre-flights (Phase 4):
 
 - Refuse on dirty working tree.
-- Refuse on protected branch without
-  `--allow-rewrite-protected` (unless `--into-branch` is set —
-  that mode doesn't touch the protected branch).
-- Refuse if `.trinity/finished/<stem>/` exists in HEAD and
-  neither `--squash` nor `--drop-finalize` is supplied — bare
-  purge in that state strips the history the snapshot
-  documents and leaves the snapshot orphaned. Operator must
-  opt in explicitly.
-- Prompt for confirmation by default; `--yes` skips.
+- Refuse on non-linear range (merge commit in
+  `[intro_sha, head_sha]`).
+- In-place ref update is conditional on the previewed
+  `head_sha` — if the branch moved between preview and
+  rewrite, abort cleanly.
+- `--into-branch` ref creation uses zero-sha old value
+  (atomic "must not already exist").
+- Prompt for confirmation by default; `--yes` and `--dry`
+  skip the prompt.
+
+Phase 5 will add: protected-branch refusal (with
+`--allow-rewrite-protected` escape hatch) and orphan-finalize
+refusal (bare `trinity purge` against a HEAD that contains
+`.trinity/finished/<stem>/` would strip the history the
+snapshot documents).
 
 ## Dry-run mode (`--dry`)
 
-`--dry` works on every command that would mutate (`finish`,
-`finish --amend`, `finish --squash`, `finish --purge`, `finish
---squash --purge`, `purge`, `purge --squash`, etc.).
+Phase 4 implements `--dry` on `trinity purge`. The finish-side
+variants (`trinity finish --squash`/`--purge` etc.) land in
+Phase 5 and will share the same dry-run shape.
 
 Output shape:
 
