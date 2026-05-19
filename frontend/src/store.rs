@@ -4,20 +4,23 @@
 //! consumed by route components that need live invalidation:
 //!
 //! - `tick: RwSignal<u64>` increments on every event; resources key on it
-//!   to invalidate. Coarse-grained for Phase 4 — every event invalidates
-//!   every subscribed resource.
+//!   to invalidate. Coarse-grained — every event invalidates every
+//!   subscribed resource.
 //! - `recent: RwSignal<Vec<LiveEvent>>` is the rolling log feeding the
 //!   homepage activity sidebar.
 //! - `muted: RwSignal<bool>` controls the chime, persisted to
 //!   `localStorage`.
+//! - `connected: RwSignal<bool>` mirrors the EventSource's open state.
+//!   The app shell renders a "reconnecting…" badge while this is false.
 //!
 //! `connect_sse` opens an `EventSource` to `/events`, parses each message
 //! into a `LiveEvent`, and pushes into the store. The browser handles
-//! reconnection automatically.
+//! transport-level reconnection automatically; `ReconnectState` decides
+//! when a reconnect should bump `tick` to force resources to re-fetch.
 //!
-//! Phase 5 replaces the inline maud chime: every event now plays a short
-//! Web Audio ping (unless muted, or coalesced within 300ms of the previous
-//! event). The mute state is read on boot and written through on toggle.
+//! Each event plays a short Web Audio ping (unless muted, or coalesced
+//! within 300 ms of the previous event). The mute state is read on boot
+//! and written through on toggle.
 
 use leptos::prelude::*;
 use wasm_bindgen::JsCast;
@@ -48,6 +51,7 @@ pub struct EventStore {
     pub tick: RwSignal<u64>,
     pub recent: RwSignal<Vec<LiveEvent>>,
     pub muted: RwSignal<bool>,
+    pub connected: RwSignal<bool>,
 }
 
 impl EventStore {
@@ -56,6 +60,7 @@ impl EventStore {
             tick: RwSignal::new(0),
             recent: RwSignal::new(Vec::new()),
             muted: RwSignal::new(read_persisted_mute()),
+            connected: RwSignal::new(true),
         }
     }
 
@@ -80,20 +85,52 @@ impl EventStore {
     }
 }
 
+/// State machine for SSE reconnects. The DOM-touching `connect_sse`
+/// wraps this in `Rc<RefCell<_>>` and threads it through the `onopen`
+/// + `onerror` closures; tests exercise it directly.
+///
+/// `was_disconnected` is a **consumed** flag: `on_open` reads-and-clears
+/// it. So the very first open after page load (no prior error) returns
+/// `false` from `on_open`, while every open that follows at least one
+/// error returns `true` exactly once.
+#[derive(Default, Debug)]
+pub struct ReconnectState {
+    was_disconnected: bool,
+}
+
+impl ReconnectState {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn on_error(&mut self) {
+        self.was_disconnected = true;
+    }
+
+    /// Returns `true` if the caller should bump `tick` (this open is a
+    /// recovery from a previous error). Subsequent calls without an
+    /// intervening `on_error` return `false`.
+    pub fn on_open(&mut self) -> bool {
+        std::mem::replace(&mut self.was_disconnected, false)
+    }
+}
+
 /// Open an `EventSource` against the daemon's `/events` endpoint and
 /// pipe every message into the store. Also plays a short Web Audio
-/// chime per event (coalesced + mute-aware). The EventSource handle
-/// and onmessage closure intentionally leak — they live for the
-/// lifetime of the tab.
+/// chime per event (coalesced + mute-aware) and drives the connection
+/// indicator. The EventSource handle and the closures intentionally
+/// leak — they live for the lifetime of the tab.
 pub fn connect_sse(store: EventStore) {
     let es = match web_sys::EventSource::new("/events") {
         Ok(es) => es,
-        Err(_) => return,
+        Err(_) => {
+            store.connected.set(false);
+            return;
+        }
     };
-    // Last-chime timestamp; closed over by the onmessage closure to
-    // coalesce flurries. Wrapped in Rc<Cell<_>> because the closure
-    // is FnMut.
+    let reconnect = std::rc::Rc::new(std::cell::RefCell::new(ReconnectState::new()));
     let last_chime = std::rc::Rc::new(std::cell::Cell::new(0.0_f64));
+
     let onmessage_state = (store, last_chime.clone());
     let onmessage =
         Closure::<dyn FnMut(web_sys::MessageEvent)>::new(move |ev: web_sys::MessageEvent| {
@@ -118,6 +155,28 @@ pub fn connect_sse(store: EventStore) {
         });
     es.set_onmessage(Some(onmessage.as_ref().unchecked_ref()));
     onmessage.forget();
+
+    let onopen_state = (store, reconnect.clone());
+    let onopen = Closure::<dyn FnMut(web_sys::Event)>::new(move |_: web_sys::Event| {
+        let (store, reconnect) = &onopen_state;
+        let needs_refresh = reconnect.borrow_mut().on_open();
+        store.connected.set(true);
+        if needs_refresh {
+            store.tick.update(|t| *t = t.wrapping_add(1));
+        }
+    });
+    es.set_onopen(Some(onopen.as_ref().unchecked_ref()));
+    onopen.forget();
+
+    let onerror_state = (store, reconnect);
+    let onerror = Closure::<dyn FnMut(web_sys::Event)>::new(move |_: web_sys::Event| {
+        let (store, reconnect) = &onerror_state;
+        reconnect.borrow_mut().on_error();
+        store.connected.set(false);
+    });
+    es.set_onerror(Some(onerror.as_ref().unchecked_ref()));
+    onerror.forget();
+
     Box::leak(Box::new(es));
 }
 
@@ -217,4 +276,39 @@ fn write_persisted_mute(muted: bool) {
     };
     let value = if muted { "1" } else { "0" };
     let _ = storage.set_item(MUTE_LS_KEY, value);
+}
+
+#[cfg(test)]
+mod reconnect_tests {
+    use super::ReconnectState;
+
+    #[test]
+    fn first_open_does_not_refresh() {
+        let mut s = ReconnectState::new();
+        assert!(!s.on_open());
+    }
+
+    #[test]
+    fn error_then_open_refreshes_once() {
+        let mut s = ReconnectState::new();
+        s.on_error();
+        assert!(s.on_open());
+    }
+
+    #[test]
+    fn duplicate_open_without_error_does_not_refresh() {
+        let mut s = ReconnectState::new();
+        s.on_error();
+        assert!(s.on_open());
+        assert!(!s.on_open());
+    }
+
+    #[test]
+    fn two_errors_then_one_open_refreshes_once() {
+        let mut s = ReconnectState::new();
+        s.on_error();
+        s.on_error();
+        assert!(s.on_open());
+        assert!(!s.on_open());
+    }
 }

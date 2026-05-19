@@ -1066,6 +1066,23 @@ a:hover {
     transform: scale(1.05);
 }
 
+/* ---------- Connection badge (sits next to the mute toggle) ---------- */
+
+.connection-badge {
+    position: fixed;
+    top: 1rem;
+    right: 4rem;
+    z-index: 100;
+    padding: 0.4rem 0.8rem;
+    background: var(--warn-bg, #4a2a14);
+    color: var(--warn-text, #f0c674);
+    border: 1px solid var(--warn-border, #8c5a2a);
+    border-radius: 999px;
+    font-size: 0.85rem;
+    font-weight: 500;
+    pointer-events: none;
+}
+
 /* ---------- pr_hint card ---------- */
 
 .pr-hint {

@@ -25,6 +25,7 @@ fn App() -> impl IntoView {
     connect_sse(store);
 
     view! {
+        <ConnectionBadge/>
         <MuteToggle/>
         <Router>
             <Routes fallback=NotFound>
@@ -74,6 +75,23 @@ fn MuteToggle() -> impl IntoView {
         >
             {label}
         </button>
+    }
+}
+
+#[component]
+fn ConnectionBadge() -> impl IntoView {
+    let store = expect_context::<EventStore>();
+    view! {
+        <Show when=move || !store.connected.get()>
+            <div
+                class="connection-badge"
+                role="status"
+                aria-live="polite"
+                title="Lost connection to the trinity daemon — retrying"
+            >
+                "reconnecting…"
+            </div>
+        </Show>
     }
 }
 
