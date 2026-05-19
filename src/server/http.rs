@@ -623,19 +623,19 @@ async fn api_rewrite_preview_all(
     // the manifest entirely — feeding them to the engine would
     // make it replay code commits on top of `intro_parent`,
     // duplicating the branch prefix.
-    let mut linear = true;
     let mut intro_pos: Option<usize> = None;
-    let mut per_commit: Vec<(crate::git_io::CommitMeta, crate::attribution::CommitChanges)> =
-        Vec::with_capacity(metas.len());
+    let mut per_commit: Vec<(
+        crate::git_io::CommitMeta,
+        crate::attribution::CommitChanges,
+        bool, // is_merge
+    )> = Vec::with_capacity(metas.len());
     let mut plans_seen: std::collections::BTreeSet<crate::lifecycle::PlanKey> =
         std::collections::BTreeSet::new();
     for (idx, meta) in metas.into_iter().enumerate() {
         let parent_count = crate::git_io::commit_parent_count(&repo_root, &meta.sha)
             .await
             .map_err(|e| AppError::internal(format!("git show parents: {e}")))?;
-        if parent_count > 1 {
-            linear = false;
-        }
+        let is_merge = parent_count > 1;
         let changes = crate::git_io::diff_tree_changes(&repo_root, &meta.sha)
             .await
             .map_err(|e| AppError::internal(format!("git diff-tree: {e}")))?;
@@ -648,8 +648,20 @@ async fn api_rewrite_preview_all(
         if intro_pos.is_none() && changes.touched_trinity {
             intro_pos = Some(idx);
         }
-        per_commit.push((meta, changes));
+        per_commit.push((meta, changes, is_merge));
     }
+
+    // `linear` applies to the rewrite range only — a merge commit
+    // that lives BEFORE the plan intro is irrelevant; we're not
+    // rewriting it. The previous logic flagged any merge in the
+    // full first-parent walk, which made `--all` unusable on real
+    // repos with historical merges before the first plan landed.
+    let linear = match intro_pos {
+        Some(start) => !per_commit[start..].iter().any(|(_, _, is_merge)| *is_merge),
+        // No `.trinity/` history at all → no range to rewrite.
+        // Linear is moot but `true` is the natural default.
+        None => true,
+    };
 
     let (intro_sha, commits) = match intro_pos {
         Some(start) => {
@@ -660,7 +672,7 @@ async fn api_rewrite_preview_all(
             // truth for "what survives" is `git ls-tree`, not
             // "what this commit's diff touched."
             let mut commits = Vec::with_capacity(per_commit.len() - start);
-            for (meta, changes) in &per_commit[start..] {
+            for (meta, changes, _) in &per_commit[start..] {
                 let tree_trinity = crate::git_io::tree_trinity_paths(&repo_root, &meta.sha)
                     .await
                     .map_err(|e| AppError::internal(format!("git ls-tree: {e}")))?;
@@ -2391,5 +2403,58 @@ mod wire_tests {
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn rewrite_preview_all_ignores_pre_intro_merge_commit() {
+        // The user-reported bug: a repo has a merge commit in its
+        // history BEFORE Trinity was introduced. The all-plans
+        // walk should ignore pre-intro merges — they aren't in
+        // the rewrite range. Previously `linear` flipped false
+        // for any merge in the full first-parent walk, making
+        // `trinity purge --all` unusable on real repos with
+        // historical merges.
+        let dir = init_repo();
+        write_file(dir.path(), "README.md", "seed\n");
+        commit(dir.path(), "seed");
+        // Create a side branch and merge it (no fast-forward) so
+        // the merge commit lands in main's first-parent walk
+        // BEFORE we introduce any Trinity content.
+        run_git(dir.path(), &["checkout", "-q", "-b", "side"]);
+        write_file(dir.path(), "side.txt", "side\n");
+        commit(dir.path(), "side work");
+        run_git(dir.path(), &["checkout", "-q", "main"]);
+        run_git(dir.path(), &["merge", "--no-ff", "--no-edit", "-q", "side"]);
+        // NOW the first Trinity touch lands.
+        write_file(dir.path(), ".trinity/plans/foo.md", "# foo\n");
+        commit(dir.path(), "add foo");
+        let runtime = Arc::new(Runtime::new());
+        runtime.add_repo(dir.path().to_path_buf()).await.unwrap();
+        let state = AppState {
+            runtime,
+            watchers: Arc::new(Mutex::new(std::collections::BTreeMap::new())),
+            bundle: Bundle::Disk(std::path::PathBuf::from("/dev/null")),
+            repos_path: std::path::PathBuf::from("/dev/null"),
+        };
+        let app = router(state);
+        let basename = repo_basename(&dir);
+        let req = Request::builder()
+            .method("GET")
+            .uri(format!("/api/repos/{basename}/rewrite_preview_all"))
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let v = body_json(resp).await;
+        assert_eq!(
+            v["linear"], true,
+            "merge commit before intro must not flag linear=false"
+        );
+        let commits = v["commits"].as_array().unwrap();
+        assert_eq!(
+            commits.len(),
+            1,
+            "only the post-intro commit should be in the manifest"
+        );
     }
 }

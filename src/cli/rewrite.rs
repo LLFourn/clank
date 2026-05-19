@@ -51,37 +51,48 @@ pub struct RewriteOutcome {
 /// - non-linear range (merge commit in [`intro_sha`, `head_sha`])
 /// - dirty working tree
 /// - `--into-branch` pointing at an existing branch
+///
+/// In `--dry` mode the engine prints the planned listing FIRST,
+/// then reports any blockers as a footer — the operator wants the
+/// commit-by-commit shape even when a blocker would prevent the
+/// live run.
 pub async fn run(opts: RewriteOpts<'_>) -> anyhow::Result<RewriteOutcome> {
-    if !opts.linear {
-        anyhow::bail!(
-            "range contains a merge commit; refusing to rewrite (merge-tree \
-             rewriting is out of scope)",
-        );
-    }
-    let Some(intro) = opts.intro_sha else {
-        anyhow::bail!("rewrite range is empty; nothing to do");
+    // Build the execution plan from inputs we always have (commits
+    // + maybe-intro_parent). Pre-flight checks below decide whether
+    // to enforce or just report.
+    let intro_parent = if let Some(intro) = opts.intro_sha {
+        parent_of(opts.repo, intro.as_str())?
+    } else {
+        None
     };
-
-    if working_tree_dirty(opts.repo)? {
-        anyhow::bail!("working tree dirty; commit or stash first");
-    }
-
-    if let Some(branch) = opts.into_branch
-        && branch_exists(opts.repo, branch)?
-    {
-        anyhow::bail!(
-            "branch `{branch}` already exists; refusing to overwrite. \
-             Pick a different name or delete it first.",
-        );
-    }
-
-    let intro_parent = parent_of(opts.repo, intro.as_str())?;
     let plan = build_plan(opts.commits, intro_parent.as_deref());
+
+    let blockers = collect_blockers(&opts)?;
 
     if opts.dry {
         print_dry_run(opts.intro_sha, opts.head_sha, &plan);
+        if !blockers.is_empty() {
+            println!();
+            println!("would FAIL on a live run because:");
+            for b in &blockers {
+                println!("  - {b}");
+            }
+        }
         return Ok(RewriteOutcome::default());
     }
+
+    if let Some(first) = blockers.first() {
+        // Live run: bail on the first blocker with the same
+        // message --dry would have reported.
+        anyhow::bail!("{first}");
+    }
+    // Re-prove intro exists since the live path uses it for the
+    // conditional ref update — the blockers list already caught
+    // the None case, this re-check is just for the type system.
+    let intro = opts
+        .intro_sha
+        .expect("blockers would have caught a missing intro");
+    let _ = intro;
 
     let new_tip = apply_plan(opts.repo, &plan, intro_parent.as_deref()).await?;
     let updated_branch = match opts.into_branch {
@@ -164,6 +175,34 @@ fn build_plan(commits: &[RewriteCommit], intro_parent: Option<&str>) -> Executio
             })
             .collect(),
     }
+}
+
+/// Pre-flight diagnostics. Live run bails on the first; `--dry`
+/// reports the full list as a footer after the listing.
+fn collect_blockers(opts: &RewriteOpts<'_>) -> anyhow::Result<Vec<String>> {
+    let mut blockers = Vec::new();
+    if !opts.linear {
+        blockers.push(
+            "range contains a merge commit; refusing to rewrite (merge-tree \
+             rewriting is out of scope)"
+                .to_string(),
+        );
+    }
+    if opts.intro_sha.is_none() {
+        blockers.push("rewrite range is empty; nothing to do".to_string());
+    }
+    if working_tree_dirty(opts.repo)? {
+        blockers.push("working tree dirty; commit or stash first".to_string());
+    }
+    if let Some(branch) = opts.into_branch
+        && branch_exists(opts.repo, branch)?
+    {
+        blockers.push(format!(
+            "branch `{branch}` already exists; refusing to overwrite. \
+             Pick a different name or delete it first."
+        ));
+    }
+    Ok(blockers)
 }
 
 fn print_dry_run(intro_sha: Option<&CommitSha>, head_sha: &CommitSha, plan: &ExecutionPlan) {
