@@ -52,11 +52,14 @@ Trivial; sets the tone for the rest.
 ### Phase 2: Narrow + rename `get_context` → `work_context`
 
 The wire-shape change is the substantive part. Today's
-`/mcp__trinity__get_context` returns `PlanDetailResponse` (the
-same DTO HTTP `/api/plan/<id>` returns) — full timeline, all
-commits with gates and feedback, plan body markdown,
-`archived_cycles`, etc. That's a UI shape, not a coordination
-shape.
+`/mcp__trinity__get_context` returns `GetContextResponse` — a
+near-superset of the per-plan fold's bulky slices:
+`commits[]` with every gate and feedback body, the full
+`timeline[]`, `plan_revisions[]`, `implementation_commits[]`,
+`archived_cycles[]`, plus `pr_hint`, `review_gate`, etc.
+`PlanDetailResponse` (the UI's `/api/plan/<id>` shape) adds
+`plan_body` markdown on top, but MCP doesn't carry that today.
+Both are too rich for a coordination call.
 
 The new `work_context` response is just enough to act on the
 latest WFW result. It preserves the typed coordination fields
@@ -129,21 +132,72 @@ in this exact order:
 
 1. If `plan_id` is explicit → use it (unchanged).
 2. Resolve `repo` (explicit `repo` arg, else cwd).
-3. **Consult `set_active_work` selection for `(repo,
-   author_label)`. If present AND the selected plan is still
-   active+visible in `repo`, return it.**
-4. Otherwise count active plans in `repo`:
-   - 1 active → return it (unchanged).
-   - 0 active → `NoActives` (unchanged).
-   - 2+ active → `Ambiguous` with candidates (unchanged).
+3. If `author_label` is present (after shim autofill) AND a
+   `set_active_work` selection exists for `(repo,
+   author_label)`: validate it (rule below). If valid, return
+   the selected plan. If invalid, drop the entry from memory
+   and fall through.
+4. Otherwise count *active + visible* plans in `repo`:
+   - 1 candidate → return it.
+   - 0 candidates → `NoActives`.
+   - 2+ candidates → `Ambiguous` with the candidate list.
 
-Stale-selection rule: at consult time, validate that the
-selected plan exists in the resolved repo's `plans` map, is not
-frozen (finished), and passes `is_visible`
-(`!frozen && !PlanFileMissing`). Any failure → drop the
-selection from memory and fall through to normal counting. This
-prevents selections from resurrecting finalized/deleted plans
-and recreating lifecycle bugs.
+`author_label` semantics: schema-optional (shim autofills from
+its cache), daemon-side **not** required. If the resolver reaches
+step 3 with no `author_label`, **skip** the selection consult
+silently and proceed to step 4. Selection is an ergonomic
+convenience; missing author is not an error here. Errors only
+arise if a downstream operation (e.g. WFW's reviewer write path)
+actually needs the label and doesn't have one.
+
+Active-visible consistency (codex point 4): today's
+`resolve_plan_id` counts `!p.is_frozen()` plans without checking
+`PlanWorktreeStatus`. That's a latent bug — a non-frozen plan
+whose file is missing from the worktree is `!is_visible` and
+should not count as an active candidate. Phase 3 aligns both
+paths on the same active-visible rule: a candidate is
+`!is_frozen && plan_worktree_status != PlanFileMissing`. Both
+selection validation and normal counting use this rule. If the
+behavior change to normal counting breaks any test, that test
+was depending on the bug; update it.
+
+Stale-selection rule (the validation in step 3):
+
+- The selected plan exists in the resolved repo's `plans` map.
+- The plan is not frozen.
+- The plan passes the active-visible check above
+  (`plan_worktree_status != PlanFileMissing`).
+
+Any failure → drop the selection from memory and fall through
+to step 4.
+
+Lock-boundary discipline (codex point 3): validating the
+selection requires `PlanWorktreeStatus`, which reads disk. The
+implementation must NOT hold the runtime mutex across disk I/O.
+The pattern (mirroring `src/server/wait.rs::compute_match`):
+
+1. Under `runtime.state().lock()`: copy the selected plan's
+   `{plan_key, plan_path, body_hash, is_frozen}` into a small
+   value and drop the lock.
+2. Drop the lock. Call `compute_plan_worktree_status_parts`
+   on the copied path/hash.
+3. With the disk result in hand, decide use-or-clear. If
+   clearing, re-acquire the lock briefly to mutate the
+   selection map.
+
+`set_active_work` validation at set time:
+
+- If `repo` arg is supplied alongside `plan_id`, `repo` must
+  resolve to the same `RepoBasename` that `plan_id` names.
+  Mismatch → invalid-args error.
+- The plan must exist in that repo's `plans` map, be
+  non-frozen, and pass the active-visible check. Failure →
+  typed error
+  (`UnknownPlan` / `PlanNotCommitted` / `PlanNotActive` /
+  `PlanHidden` — pick the matching existing variant). No
+  silent acceptance of a doomed selection.
+- The same active-visible check at set time uses the same
+  lock-then-disk-read pattern.
 
 Storage: in-memory only on `Runtime`. Indexed by `(RepoBasename,
 AgentLabel)`. Cleared on daemon restart. This is operational
@@ -179,8 +233,14 @@ Split:
 
 ```text
 watch_repo { path? }
-  → { repo, basename, watched: true|already_watching }
+  → { repo, basename, status: WatchRepoStatus }
+
+WatchRepoStatus = "registered" | "already_watching"
 ```
+
+`status` is a typed enum on the wire (serde `rename_all =
+"snake_case"`), not a stringly-typed bool/string union. No
+loose ad-hoc values.
 
 `watch_repo` does steps 1–3. `path` semantics:
 
@@ -292,7 +352,17 @@ flow. The other three phases land cleanly without it.
   normal counting path.
 - `mcp_shim` autofill + instruction text reference
   `work_context` (not `get_context`) after the rename.
-- `watch_repo` registers a fresh repo; re-watching is idempotent.
+- `watch_repo` registers a fresh repo; re-watching returns
+  `status: "already_watching"` (typed enum, not a stringly
+  value).
+- `set_active_work` rejects a `repo` arg that doesn't match the
+  `plan_id`'s basename, rejects a plan that is frozen / hidden /
+  unknown, and otherwise records the selection. Stale entries
+  are dropped at use time.
+- Normal `resolve_plan_id` counting uses the same
+  active-visible rule as the selection validator
+  (`!is_frozen && !PlanFileMissing`). Hidden plans no longer
+  count as candidates in either path.
 - `start_plan` still works (deprecated label, same behavior).
 - HTTP `/api/plan/<id>` shape is unchanged; UI tests pass.
 - Existing `wait_for_work` behavior is unchanged.
