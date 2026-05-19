@@ -85,6 +85,14 @@ pub struct PurgeArgs {
     /// a new chain.
     #[arg(long)]
     pub amend: bool,
+    /// Permit rewriting a protected branch (`main`/`master` or any
+    /// branch matched by `branch.<name>.protect` in git config).
+    /// Without this flag, the engine refuses to rewrite a
+    /// protected branch in place. `--into-branch` bypasses the
+    /// protection check because it doesn't touch the protected
+    /// branch.
+    #[arg(long)]
+    pub allow_rewrite_protected: bool,
 }
 
 /// Resolve the repo root: explicit `--repo` path wins, otherwise

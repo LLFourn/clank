@@ -57,6 +57,7 @@ async fn run_single(
         commits: &preview.commits,
         into_branch: args.into_branch.as_deref(),
         dry: args.dry,
+        allow_rewrite_protected: args.allow_rewrite_protected,
     })
     .await?;
 
@@ -102,6 +103,7 @@ async fn run_all(
         commits: &preview.commits,
         into_branch: args.into_branch.as_deref(),
         dry: args.dry,
+        allow_rewrite_protected: args.allow_rewrite_protected,
     })
     .await?;
 
@@ -220,6 +222,7 @@ mod tests {
             yes: true,
             squash: None,
             amend: false,
+            allow_rewrite_protected: false,
         };
         let err = run(args).await.unwrap_err();
         let msg = format!("{err}");

@@ -37,6 +37,9 @@ pub struct RewriteOpts<'a> {
     /// branch already exists.
     pub into_branch: Option<&'a str>,
     pub dry: bool,
+    /// Permit rewriting a protected branch (`main`/`master`/etc.)
+    /// in place. Ignored when `into_branch` is set.
+    pub allow_rewrite_protected: bool,
 }
 
 #[derive(Debug, Default)]
@@ -195,7 +198,40 @@ fn collect_blockers(opts: &RewriteOpts<'_>) -> anyhow::Result<Vec<String>> {
              Pick a different name or delete it first."
         ));
     }
+    // Protected-branch refusal — only relevant for in-place
+    // rewrites; --into-branch never touches the protected ref.
+    if opts.into_branch.is_none() && !opts.allow_rewrite_protected {
+        let current = current_branch(opts.repo)?;
+        if is_protected_branch(opts.repo, &current)? {
+            blockers.push(format!(
+                "refusing to rewrite protected branch `{current}` in place. \
+                 Pass `--allow-rewrite-protected` to override, or use \
+                 `--into-branch <name>` to write the rewritten history to a \
+                 fresh branch."
+            ));
+        }
+    }
     Ok(blockers)
+}
+
+/// True if `branch` is `main`, `master`, or matched by
+/// `branch.<name>.protect = true` in the repo's git config. The
+/// engine refuses to rewrite protected branches in place without
+/// `--allow-rewrite-protected`.
+fn is_protected_branch(repo: &Path, branch: &str) -> anyhow::Result<bool> {
+    if matches!(branch, "main" | "master") {
+        return Ok(true);
+    }
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["config", "--get", &format!("branch.{branch}.protect")])
+        .output()?;
+    if !output.status.success() {
+        return Ok(false);
+    }
+    let val = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    Ok(matches!(val.as_str(), "true" | "1" | "yes" | "on"))
 }
 
 /// Emit a `git rebase --interactive` todo list. The operator can
@@ -708,6 +744,7 @@ mod tests {
             commits: &preview.commits,
             into_branch: Some("purged"),
             dry: false,
+            allow_rewrite_protected: false,
         })
         .await
         .unwrap();
@@ -756,6 +793,7 @@ mod tests {
             commits: &preview.commits,
             into_branch: Some("dry-target"),
             dry: true,
+            allow_rewrite_protected: false,
         })
         .await
         .unwrap();
@@ -798,6 +836,7 @@ mod tests {
             commits: &preview.commits,
             into_branch: Some("already-exists"),
             dry: false,
+            allow_rewrite_protected: false,
         })
         .await
         .unwrap_err();
@@ -844,6 +883,7 @@ mod tests {
             commits: &preview.commits,
             into_branch: Some("purged"),
             dry: false,
+            allow_rewrite_protected: false,
         })
         .await
         .unwrap();
@@ -885,6 +925,11 @@ mod tests {
             commits: &preview.commits,
             into_branch: None, // in-place — triggers the conditional update
             dry: false,
+            // The test's repo uses the default `main` branch, which the new
+            // protected-branch check refuses. Override here — the test's
+            // assertion is about the in-place race, not protected-branch
+            // policy.
+            allow_rewrite_protected: true,
         })
         .await
         .unwrap_err();
@@ -944,6 +989,7 @@ mod tests {
             commits: &preview.commits,
             into_branch: Some("scrubbed"),
             dry: false,
+            allow_rewrite_protected: false,
         })
         .await
         .unwrap();
@@ -1001,6 +1047,7 @@ mod tests {
             commits: &preview.commits,
             into_branch: Some("scrubbed"),
             dry: false,
+            allow_rewrite_protected: false,
         })
         .await
         .unwrap();
@@ -1029,6 +1076,79 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn rewrite_refuses_protected_branch_in_place() {
+        // The default `main` branch is protected; in-place
+        // rewrites refuse without --allow-rewrite-protected.
+        let dir = init_repo();
+        write(dir.path(), "README.md", "seed\n");
+        let _seed = commit(dir.path(), "seed");
+        write(dir.path(), ".trinity/plans/foo.md", "# foo\n");
+        let intro = commit(dir.path(), "plan: foo");
+        let preview = mk_preview(
+            &intro,
+            &intro,
+            vec![(
+                intro.clone(),
+                "plan: foo".into(),
+                RewriteDisposition::Drop,
+                false,
+                vec![],
+            )],
+        );
+        let err = super::run(RewriteOpts {
+            repo: dir.path(),
+            intro_sha: preview.intro_sha.as_ref(),
+            head_sha: &preview.head_sha,
+            linear: preview.linear,
+            commits: &preview.commits,
+            into_branch: None, // in-place
+            dry: false,
+            allow_rewrite_protected: false,
+        })
+        .await
+        .unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("protected branch"),
+            "expected protected-branch refusal, got: {msg}"
+        );
+        assert!(msg.contains("main"), "msg should name the branch: {msg}");
+    }
+
+    #[tokio::test]
+    async fn rewrite_protected_branch_bypassed_by_into_branch() {
+        let dir = init_repo();
+        write(dir.path(), "README.md", "seed\n");
+        let _seed = commit(dir.path(), "seed");
+        write(dir.path(), ".trinity/plans/foo.md", "# foo\n");
+        let intro = commit(dir.path(), "plan: foo");
+        let preview = mk_preview(
+            &intro,
+            &intro,
+            vec![(
+                intro.clone(),
+                "plan: foo".into(),
+                RewriteDisposition::Drop,
+                false,
+                vec![],
+            )],
+        );
+        // --into-branch bypasses protected check; this should succeed.
+        super::run(RewriteOpts {
+            repo: dir.path(),
+            intro_sha: preview.intro_sha.as_ref(),
+            head_sha: &preview.head_sha,
+            linear: preview.linear,
+            commits: &preview.commits,
+            into_branch: Some("scrubbed"),
+            dry: false,
+            allow_rewrite_protected: false,
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
     async fn rewrite_refuses_non_linear_range() {
         let dir = init_repo();
         write(dir.path(), "README.md", "seed\n");
@@ -1049,6 +1169,7 @@ mod tests {
             commits: &preview.commits,
             into_branch: Some("x"),
             dry: false,
+            allow_rewrite_protected: false,
         })
         .await
         .unwrap_err();
