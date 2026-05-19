@@ -12,7 +12,7 @@ pub struct ToolDescriptor {
     pub input_schema: Value,
 }
 
-/// Four coordination tools (plus the `echo_cwd` diagnostic stub).
+/// Four coordination tools.
 ///
 /// `start_plan` creates the plan file in the working tree; the agent must
 /// then commit it before Trinity treats the plan as live.
@@ -26,19 +26,12 @@ pub struct ToolDescriptor {
 /// `wait_for_work` long-polls until a plan needs the caller's role, then
 /// returns minimal identifiers. Replaces poll-loops over `get_context` /
 /// `list_plans`.
+///
+/// The `echo_cwd` diagnostic remains in the dispatcher
+/// (`src/server/mcp.rs`) for hand-rolled `tools/call` debugging but is not
+/// advertised here.
 pub fn catalog() -> Vec<ToolDescriptor> {
     vec![
-        ToolDescriptor {
-            name: "echo_cwd".to_string(),
-            description: "Diagnostic stub. Returns the cwd captured by the stdio shim at \
-                          launch."
-                .to_string(),
-            input_schema: json!({
-                "type": "object",
-                "properties": {},
-                "additionalProperties": false
-            }),
-        },
         ToolDescriptor {
             name: "list_plans".to_string(),
             description: "List Trinity plans in one repo. Defaults to the caller's cwd-repo; \
