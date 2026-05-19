@@ -587,31 +587,29 @@ async fn api_rewrite_preview(
     // `.trinity/`.
     let mut commits = Vec::with_capacity(per_commit.len());
     for (meta, changes, _) in &per_commit {
-        // Strippable: THIS plan's paths (always plan file;
-        // include_finalize gates the finalize-snapshot dir).
-        let strippable =
+        // Strippable: THIS plan's paths in the tree (always plan
+        // file; include_finalize gates the finalize-snapshot dir).
+        let strippable_in_tree =
             crate::git_io::tree_plan_paths(&repo, &meta.sha, plan_key.as_str(), q.include_finalize)
                 .await
                 .map_err(|e| AppError::internal(format!("git ls-tree: {e}")))?;
-        // Unstrippable: every OTHER `.trinity/` path in the tree.
-        // For a single-plan purge, other plans' files, non-plan
-        // metadata (`.trinity/.gitignore`), and (when
-        // include_finalize=false) THIS plan's finalize snapshot
-        // all survive. The tree-level signal that "the rewritten
-        // tree still has Trinity content worth keeping" is what
-        // promotes a commit to KeepVerbatim vs Drop when there's
-        // no non-Trinity code in the commit.
-        let strippable_set: std::collections::BTreeSet<&str> =
-            strippable.iter().map(String::as_str).collect();
-        let all_trinity = crate::git_io::tree_trinity_paths(&repo, &meta.sha)
-            .await
-            .map_err(|e| AppError::internal(format!("git ls-tree: {e}")))?;
-        let unstrippable: Vec<String> = all_trinity
-            .into_iter()
-            .filter(|p| !strippable_set.contains(p.as_str()))
-            .collect();
+        // Contribution check: did THIS commit's diff add anything
+        // outside this plan's strip predicate? Non-Trinity code
+        // counts. Other-plan `.trinity/` paths and this plan's
+        // finalize files (when include_finalize=false) also count.
+        let strip_predicate_for_diff = |p: &str| -> bool {
+            p == format!(".trinity/plans/{}.md", plan_key.as_str())
+                || (q.include_finalize
+                    && p.starts_with(&format!(".trinity/finished/{}/", plan_key.as_str())))
+        };
+        let contributes_non_strippable = changes.has_non_plan_code_changes
+            || changes
+                .trinity_paths
+                .iter()
+                .any(|p| !strip_predicate_for_diff(p));
         let attributed_to_this_plan = native_shas.contains(&meta.sha);
-        let (disposition, strip_paths) = classify_from_tree(changes, &strippable, &unstrippable);
+        let (disposition, strip_paths) =
+            classify_from_tree(contributes_non_strippable, &strippable_in_tree);
         commits.push(trinity_core::api::RewriteCommit {
             sha: meta.sha.clone(),
             subject: meta.subject.clone(),
@@ -715,11 +713,24 @@ async fn api_rewrite_preview_all(
                 let tree_trinity = crate::git_io::tree_trinity_paths(&repo_root, &meta.sha)
                     .await
                     .map_err(|e| AppError::internal(format!("git ls-tree: {e}")))?;
-                let (strippable, unstrippable): (Vec<String>, Vec<String>) = tree_trinity
+                let strippable_in_tree: Vec<String> = tree_trinity
                     .into_iter()
-                    .partition(|p| q.include_finalize || !p.starts_with(".trinity/finished/"));
+                    .filter(|p| q.include_finalize || !p.starts_with(".trinity/finished/"))
+                    .collect();
+                // For all-plans purge: anything under `.trinity/`
+                // is strippable EXCEPT `.trinity/finished/` paths
+                // when include_finalize=false. So this commit
+                // contributes a preserved path iff it added a
+                // non-`.trinity/` path OR (include_finalize=false
+                // AND it added a `.trinity/finished/` path).
+                let contributes_non_strippable = changes.has_non_plan_code_changes
+                    || (!q.include_finalize
+                        && changes
+                            .trinity_paths
+                            .iter()
+                            .any(|p| p.starts_with(".trinity/finished/")));
                 let (disposition, strip_paths) =
-                    classify_from_tree(changes, &strippable, &unstrippable);
+                    classify_from_tree(contributes_non_strippable, &strippable_in_tree);
                 commits.push(trinity_core::api::RewriteCommit {
                     sha: meta.sha.clone(),
                     subject: meta.subject.clone(),
@@ -756,51 +767,40 @@ async fn api_rewrite_preview_all(
 /// resulting tree. Applies the `include_finalize` filter at the
 /// strip-path level so finalize files can be preserved when
 /// requested.
-/// The unified tree-based classifier. Both the all-plans and
-/// single-plan rewrite previews funnel through this — they only
-/// differ in HOW they compute `strippable` and `unstrippable`
-/// (which paths in the tree are "this purge's targets" vs
-/// "preserved"). Once the per-commit tree's paths are split into
-/// those two buckets, the disposition follows from this matrix.
+/// Unified tree-based classifier. Two independent signals:
+///
+/// 1. `contributes_non_strippable`: does THIS commit's diff add or
+///    modify any path the rewrite wants to preserve? Non-Trinity
+///    code always counts; unstrippable Trinity paths added by
+///    this commit count too. Inherited content from earlier
+///    commits does NOT count — it already lives on the rewritten
+///    parent, so a commit that only added strippable content has
+///    nothing left to contribute after the strip.
+///
+/// 2. `strippable_in_tree`: paths under the strip-predicate that
+///    exist in the commit's RESULTING tree (from `git ls-tree`).
+///    Includes inherited paths.
+///
+/// Disposition matrix:
+/// - `!contributes_non_strippable` → Drop. The commit's only
+///   contribution was strippable content; after stripping it's a
+///   no-op vs the rewritten parent. Also handles empty commits.
+/// - contributes + strippable in tree → Rewrite (strip those).
+/// - contributes + no strippable in tree → KeepVerbatim.
 fn classify_from_tree(
-    changes: &crate::attribution::CommitChanges,
-    strippable: &[String],
-    unstrippable: &[String],
+    contributes_non_strippable: bool,
+    strippable_in_tree: &[String],
 ) -> (trinity_core::api::RewriteDisposition, Vec<String>) {
     use trinity_core::api::RewriteDisposition;
 
-    let has_strippable = !strippable.is_empty();
-    let has_unstrippable = !unstrippable.is_empty();
-    let touched_other_paths = changes.has_non_plan_code_changes;
-
-    let disposition = if has_strippable {
-        if touched_other_paths || has_unstrippable {
-            // Tree has strippable content + something to preserve
-            // (non-Trinity code, or unstrippable content surviving
-            // the filter).
-            RewriteDisposition::Rewrite
-        } else {
-            // Tree has only strippable content. Drop.
-            RewriteDisposition::Drop
-        }
-    } else if touched_other_paths || has_unstrippable {
-        // No strippable content in the tree. KeepVerbatim — the
-        // tree is already scrubbed and there's content to keep.
-        // The engine still recommits with the rewritten parent;
-        // the original SHA is not reused.
-        RewriteDisposition::KeepVerbatim
+    if !contributes_non_strippable {
+        return (RewriteDisposition::Drop, Vec::new());
+    }
+    if strippable_in_tree.is_empty() {
+        (RewriteDisposition::KeepVerbatim, Vec::new())
     } else {
-        // Empty/no-op commit relative to the rewritten branch.
-        RewriteDisposition::Drop
-    };
-
-    let strip_paths = if matches!(disposition, RewriteDisposition::Rewrite) {
-        strippable.to_vec()
-    } else {
-        Vec::new()
-    };
-
-    (disposition, strip_paths)
+        (RewriteDisposition::Rewrite, strippable_in_tree.to_vec())
+    }
 }
 
 /// Project the typed finalize decision. Single source of truth for
@@ -1920,6 +1920,48 @@ mod wire_tests {
         assert_eq!(
             commits[1]["foreign"], true,
             "cross-plan commit must be foreign"
+        );
+    }
+
+    #[tokio::test]
+    async fn rewrite_preview_pure_target_plan_commit_drops_not_rewrites() {
+        // Codex's flagged edge: tree has unstrippable inherited
+        // content, but THIS commit's only contribution was the
+        // target plan's strippable file. classify_from_tree must
+        // see "no preserved contribution" and Drop the commit
+        // instead of recreating an empty `Plan: foo` commit.
+        let dir = init_repo();
+        write_file(dir.path(), ".trinity/plans/bar.md", "# bar\n");
+        commit(dir.path(), "add bar");
+        write_file(dir.path(), ".trinity/plans/foo.md", "# foo\n");
+        commit(dir.path(), "add foo");
+        let runtime = Arc::new(Runtime::new());
+        runtime.add_repo(dir.path().to_path_buf()).await.unwrap();
+        let state = AppState {
+            runtime: Arc::clone(&runtime),
+            watchers: Arc::new(Mutex::new(std::collections::BTreeMap::new())),
+            bundle: Bundle::Disk(std::path::PathBuf::from("/dev/null")),
+            repos_path: std::path::PathBuf::from("/dev/null"),
+        };
+        let app = router(state);
+        let url = format!("/api/plan/{}/rewrite_preview", plan_id_for(&dir, "foo"));
+        let req = Request::builder()
+            .method("GET")
+            .uri(&url)
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let v = body_json(resp).await;
+        let commits = v["commits"].as_array().unwrap();
+        // foo's range starts at its intro (the "add foo" commit).
+        // "add bar" is excluded from the range.
+        assert_eq!(commits.len(), 1);
+        assert_eq!(commits[0]["subject"], "add foo");
+        assert_eq!(
+            commits[0]["disposition"], "drop",
+            "pure target-plan commit must Drop, not Rewrite (which would \
+             leave an empty `Plan: foo` commit in history)"
         );
     }
 

@@ -247,9 +247,7 @@ fn print_rebase_todo(opts: &RewriteOpts<'_>, plan: &ExecutionPlan, blockers: &[S
             .intro_sha
             .map(|s| short(s.as_str()))
             .unwrap_or_else(|| "<intro>".into());
-        println!(
-            "#     git rebase --interactive --keep-empty {intro_anchor}^"
-        );
+        println!("#     git rebase --interactive --keep-empty {intro_anchor}^");
         println!("#");
         println!("# Caveats:");
         println!("#   - `--into-branch` isn't supported by git rebase. To");
@@ -273,13 +271,28 @@ fn print_rebase_todo(opts: &RewriteOpts<'_>, plan: &ExecutionPlan, blockers: &[S
         let foreign_tag = if step.foreign { " [foreign]" } else { "" };
         match step.disposition {
             RewriteDisposition::Drop => {
-                println!("{cmt}drop  {} {}{}", short(&step.sha), step.subject, foreign_tag);
+                println!(
+                    "{cmt}drop  {} {}{}",
+                    short(&step.sha),
+                    step.subject,
+                    foreign_tag
+                );
             }
             RewriteDisposition::KeepVerbatim => {
-                println!("{cmt}pick  {} {}{}", short(&step.sha), step.subject, foreign_tag);
+                println!(
+                    "{cmt}pick  {} {}{}",
+                    short(&step.sha),
+                    step.subject,
+                    foreign_tag
+                );
             }
             RewriteDisposition::Rewrite => {
-                println!("{cmt}edit  {} {}{}", short(&step.sha), step.subject, foreign_tag);
+                println!(
+                    "{cmt}edit  {} {}{}",
+                    short(&step.sha),
+                    step.subject,
+                    foreign_tag
+                );
                 let joined = step
                     .strip_paths
                     .iter()
@@ -287,9 +300,7 @@ fn print_rebase_todo(opts: &RewriteOpts<'_>, plan: &ExecutionPlan, blockers: &[S
                     .collect::<Vec<_>>()
                     .join(" ");
                 println!("{cmt}# strip: {}", step.strip_paths.join(", "));
-                println!(
-                    "{cmt}# run: git rm --cached {joined} && \\"
-                );
+                println!("{cmt}# run: git rm --cached {joined} && \\");
                 println!("{cmt}#      git commit --amend --no-edit --allow-empty && \\");
                 println!("{cmt}#      git rebase --continue");
             }
