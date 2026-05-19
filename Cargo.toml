@@ -3,7 +3,7 @@ members = [".", "frontend", "crates/trinity-core"]
 
 [package]
 name = "trinity"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2024"
 build = "build.rs"
 
