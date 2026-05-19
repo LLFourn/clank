@@ -760,6 +760,32 @@ pub enum RewriteDisposition {
     Rewrite,
 }
 
+/// Response shape for the all-plans purge preview. Returned by
+/// `GET /api/repos/{basename}/rewrite_preview_all`.
+///
+/// Same `commits` shape as `RewritePreviewResponse` so the CLI's
+/// rewrite engine consumes one type. `foreign` is always false in
+/// the all-plans case (the "is this commit's attribution mine"
+/// question doesn't apply when "mine" is "every plan").
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PurgeAllPreviewResponse {
+    pub repo: String,
+    pub head_sha: crate::ids::CommitSha,
+    pub linear: bool,
+    /// Earliest commit in the first-parent walk that touched ANY
+    /// `.trinity/` path. `None` when no commit ever touched
+    /// `.trinity/` — the CLI short-circuits with "nothing to purge"
+    /// in that case.
+    pub intro_sha: Option<crate::ids::CommitSha>,
+    /// Distinct plan stems whose plan/finalize artifacts appear
+    /// anywhere in the walk. Sorted, deduped. For the
+    /// confirmation prompt's "N plans touched" rendering — NOT
+    /// the source of truth for what gets stripped (that's per-
+    /// commit `strip_paths`).
+    pub plans_touched: Vec<crate::ids::PlanKey>,
+    pub commits: Vec<RewriteCommit>,
+}
+
 // ============================================================
 // wait_for_work response
 // ============================================================

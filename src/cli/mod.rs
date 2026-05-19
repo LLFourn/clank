@@ -48,9 +48,16 @@ pub struct FinishArgs {
 #[derive(Args, Debug)]
 pub struct PurgeArgs {
     /// Plan to purge. Accepts `<repo>/<stem>.md` or just `<stem>`.
-    /// For abandoned-plan purges where no in-flight plan exists,
-    /// the plan id is mandatory (the CLI can't infer).
+    /// Omit to infer the single active in-flight plan, or pass
+    /// `--all` to strip every `.trinity/` path. Mutually exclusive
+    /// with `--all`.
     pub plan: Option<String>,
+    /// Strip EVERY `.trinity/` path from history (plan files,
+    /// finalize snapshots, AND non-plan Trinity metadata like
+    /// `.trinity/.gitignore` and `.trinity/stubs/*`). Cannot be
+    /// combined with a plan argument.
+    #[arg(long)]
+    pub all: bool,
     /// Repo root. Defaults to the cwd's git toplevel.
     #[arg(long, value_name = "PATH")]
     pub repo: Option<PathBuf>,
