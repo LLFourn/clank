@@ -273,6 +273,45 @@ pub async fn first_added_commit(
 /// topologically earliest plan_intro requires a separate query. Trinity
 /// repos are small enough that walking from the root is cheap and avoids
 /// a correctness footgun.
+/// List a single plan's strippable `.trinity/` paths in the tree
+/// at `sha`: `.trinity/plans/<stem>.md` (when present) plus, when
+/// `include_finalize` is true, every path under
+/// `.trinity/finished/<stem>/`. Sorted. Used by the single-plan
+/// rewrite preview so classification can be tree-based instead of
+/// diff-touch based.
+pub async fn tree_plan_paths(
+    repo: &Path,
+    sha: &CommitSha,
+    stem: &str,
+    include_finalize: bool,
+) -> Result<Vec<String>, GitIoError> {
+    let mut pathspecs: Vec<String> = vec![format!(".trinity/plans/{stem}.md")];
+    if include_finalize {
+        pathspecs.push(format!(".trinity/finished/{stem}/"));
+    }
+    let mut args: Vec<String> = vec![
+        "ls-tree".into(),
+        "-r".into(),
+        "--name-only".into(),
+        "--".into(),
+        sha.as_str().to_string(),
+    ];
+    args.extend(pathspecs);
+    let args_ref: Vec<&str> = args.iter().map(String::as_str).collect();
+    let output = run(repo, &args_ref).await?;
+    if !output.status.success() {
+        return Ok(Vec::new());
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut paths: Vec<String> = stdout
+        .lines()
+        .filter(|l| !l.is_empty())
+        .map(|s| s.to_string())
+        .collect();
+    paths.sort();
+    Ok(paths)
+}
+
 /// List every blob path under `.trinity/` in the tree at `sha`.
 /// Returned sorted. Empty when the tree has no `.trinity/` paths.
 /// Used by the all-plans rewrite preview to compute strip_paths

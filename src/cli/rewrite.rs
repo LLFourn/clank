@@ -819,6 +819,63 @@ mod tests {
         assert_eq!(chain.last().unwrap(), &raced_commit);
     }
 
+    /// End-to-end single-plan purge: codex's specific request.
+    /// `trinity purge foo --into-branch scrubbed` on
+    /// `seed → plan → code` must produce a `scrubbed` branch that
+    /// contains `src/main.rs` and does NOT contain
+    /// `.trinity/plans/foo.md`. The previous diff-touch
+    /// classification would have marked `code` as KeepVerbatim and
+    /// leaked the inherited plan file.
+    #[tokio::test]
+    async fn rewrite_single_plan_strips_inherited_plan_file() {
+        let dir = init_repo();
+        write(dir.path(), "README.md", "seed\n");
+        let _seed = commit(dir.path(), "seed");
+        write(dir.path(), ".trinity/plans/foo.md", "# foo\n");
+        let intro = commit(dir.path(), "plan: foo");
+        write(dir.path(), "src/main.rs", "fn main() {}\n");
+        let code = commit(dir.path(), "later code");
+
+        // Manifest as the (corrected) single-plan endpoint would
+        // emit it: intro Drop, code Rewrite with strip_paths=[foo.md].
+        let preview = mk_preview(
+            &intro,
+            &code,
+            vec![
+                (
+                    intro.clone(),
+                    "plan: foo".into(),
+                    RewriteDisposition::Drop,
+                    false,
+                    vec![],
+                ),
+                (
+                    code.clone(),
+                    "later code".into(),
+                    RewriteDisposition::Rewrite,
+                    false,
+                    vec![".trinity/plans/foo.md".into()],
+                ),
+            ],
+        );
+        super::run(RewriteOpts {
+            repo: dir.path(),
+            intro_sha: preview.intro_sha.as_ref(),
+            head_sha: &preview.head_sha,
+            linear: preview.linear,
+            commits: &preview.commits,
+            into_branch: Some("scrubbed"),
+            dry: false,
+        })
+        .await
+        .unwrap();
+        assert!(
+            !tree_has(dir.path(), "scrubbed", ".trinity/plans/foo.md"),
+            "inherited plan file leaked into scrubbed branch"
+        );
+        assert!(tree_has(dir.path(), "scrubbed", "src/main.rs"));
+    }
+
     /// End-to-end: simulate an all-plans purge across an intro
     /// commit + a pure-code commit. Asserts that with strip_paths
     /// populated on the KeepVerbatim-equivalent step, the

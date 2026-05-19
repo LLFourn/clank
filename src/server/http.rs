@@ -559,20 +559,59 @@ async fn api_rewrite_preview(
         })
         .collect();
 
-    let mut linear = true;
-    let mut commits = Vec::with_capacity(range.len());
+    // Two-pass: collect per-commit data first, then evaluate
+    // linearity over the rewrite range only. Merges BEFORE the
+    // plan intro are outside the range and shouldn't block.
+    let mut per_commit: Vec<(
+        &crate::git_io::CommitMeta,
+        crate::attribution::CommitChanges,
+        bool, // is_merge
+    )> = Vec::with_capacity(range.len());
     for meta in range {
         let parent_count = crate::git_io::commit_parent_count(&repo, &meta.sha)
             .await
             .map_err(|e| AppError::internal(format!("git show parents: {e}")))?;
-        if parent_count > 1 {
-            linear = false;
-        }
         let changes = crate::git_io::diff_tree_changes(&repo, &meta.sha)
             .await
             .map_err(|e| AppError::internal(format!("git diff-tree: {e}")))?;
+        per_commit.push((meta, changes, parent_count > 1));
+    }
+    let linear = !per_commit.iter().any(|(_, _, is_merge)| *is_merge);
+
+    // Tree-based classification. For each commit, look up the
+    // plan's strippable paths AND (when include_finalize=false)
+    // its unstrippable finalize-snapshot paths in the commit's
+    // resulting tree. A pure-code commit inherits
+    // `.trinity/plans/<stem>.md` from its parent, so it must
+    // Rewrite (strip) even when the diff didn't touch
+    // `.trinity/`.
+    let mut commits = Vec::with_capacity(per_commit.len());
+    for (meta, changes, _) in &per_commit {
+        // Strippable: THIS plan's paths (always plan file;
+        // include_finalize gates the finalize-snapshot dir).
+        let strippable =
+            crate::git_io::tree_plan_paths(&repo, &meta.sha, plan_key.as_str(), q.include_finalize)
+                .await
+                .map_err(|e| AppError::internal(format!("git ls-tree: {e}")))?;
+        // Unstrippable: every OTHER `.trinity/` path in the tree.
+        // For a single-plan purge, other plans' files, non-plan
+        // metadata (`.trinity/.gitignore`), and (when
+        // include_finalize=false) THIS plan's finalize snapshot
+        // all survive. The tree-level signal that "the rewritten
+        // tree still has Trinity content worth keeping" is what
+        // promotes a commit to KeepVerbatim vs Drop when there's
+        // no non-Trinity code in the commit.
+        let strippable_set: std::collections::BTreeSet<&str> =
+            strippable.iter().map(String::as_str).collect();
+        let all_trinity = crate::git_io::tree_trinity_paths(&repo, &meta.sha)
+            .await
+            .map_err(|e| AppError::internal(format!("git ls-tree: {e}")))?;
+        let unstrippable: Vec<String> = all_trinity
+            .into_iter()
+            .filter(|p| !strippable_set.contains(p.as_str()))
+            .collect();
         let attributed_to_this_plan = native_shas.contains(&meta.sha);
-        let (disposition, strip_paths) = classify_rewrite(&changes, &plan_key, q.include_finalize);
+        let (disposition, strip_paths) = classify_from_tree(changes, &strippable, &unstrippable);
         commits.push(trinity_core::api::RewriteCommit {
             sha: meta.sha.clone(),
             subject: meta.subject.clone(),
@@ -676,8 +715,11 @@ async fn api_rewrite_preview_all(
                 let tree_trinity = crate::git_io::tree_trinity_paths(&repo_root, &meta.sha)
                     .await
                     .map_err(|e| AppError::internal(format!("git ls-tree: {e}")))?;
+                let (strippable, unstrippable): (Vec<String>, Vec<String>) = tree_trinity
+                    .into_iter()
+                    .partition(|p| q.include_finalize || !p.starts_with(".trinity/finished/"));
                 let (disposition, strip_paths) =
-                    classify_rewrite_all_from_tree(changes, &tree_trinity, q.include_finalize);
+                    classify_from_tree(changes, &strippable, &unstrippable);
                 commits.push(trinity_core::api::RewriteCommit {
                     sha: meta.sha.clone(),
                     subject: meta.subject.clone(),
@@ -714,43 +756,38 @@ async fn api_rewrite_preview_all(
 /// resulting tree. Applies the `include_finalize` filter at the
 /// strip-path level so finalize files can be preserved when
 /// requested.
-fn classify_rewrite_all_from_tree(
+/// The unified tree-based classifier. Both the all-plans and
+/// single-plan rewrite previews funnel through this — they only
+/// differ in HOW they compute `strippable` and `unstrippable`
+/// (which paths in the tree are "this purge's targets" vs
+/// "preserved"). Once the per-commit tree's paths are split into
+/// those two buckets, the disposition follows from this matrix.
+fn classify_from_tree(
     changes: &crate::attribution::CommitChanges,
-    tree_trinity_paths: &[String],
-    include_finalize: bool,
+    strippable: &[String],
+    unstrippable: &[String],
 ) -> (trinity_core::api::RewriteDisposition, Vec<String>) {
     use trinity_core::api::RewriteDisposition;
 
-    // Three buckets of tree state, derived from `git ls-tree`:
-    //   - strippable: paths we WILL remove (`.trinity/**`, with
-    //     `.trinity/finished/` excluded when include_finalize=false)
-    //   - unstrippable_trinity: `.trinity/**` paths preserved
-    //     (only non-empty when include_finalize=false — the
-    //     finalize-snapshot contents stay)
-    //   - touched_other_paths: this commit's diff added/modified
-    //     non-`.trinity/` content
-    let (strippable, unstrippable_trinity): (Vec<String>, Vec<String>) = tree_trinity_paths
-        .iter()
-        .cloned()
-        .partition(|p| include_finalize || !p.starts_with(".trinity/finished/"));
     let has_strippable = !strippable.is_empty();
-    let has_unstrippable_trinity = !unstrippable_trinity.is_empty();
+    let has_unstrippable = !unstrippable.is_empty();
     let touched_other_paths = changes.has_non_plan_code_changes;
 
     let disposition = if has_strippable {
-        if touched_other_paths || has_unstrippable_trinity {
+        if touched_other_paths || has_unstrippable {
             // Tree has strippable content + something to preserve
-            // (non-Trinity code, or finalize-snapshot content
-            // surviving the `include_finalize=false` filter).
+            // (non-Trinity code, or unstrippable content surviving
+            // the filter).
             RewriteDisposition::Rewrite
         } else {
-            // Tree has only strippable Trinity. Drop the commit;
-            // there's nothing to keep.
+            // Tree has only strippable content. Drop.
             RewriteDisposition::Drop
         }
-    } else if touched_other_paths || has_unstrippable_trinity {
+    } else if touched_other_paths || has_unstrippable {
         // No strippable content in the tree. KeepVerbatim — the
         // tree is already scrubbed and there's content to keep.
+        // The engine still recommits with the rewritten parent;
+        // the original SHA is not reused.
         RewriteDisposition::KeepVerbatim
     } else {
         // Empty/no-op commit relative to the rewritten branch.
@@ -758,87 +795,10 @@ fn classify_rewrite_all_from_tree(
     };
 
     let strip_paths = if matches!(disposition, RewriteDisposition::Rewrite) {
-        strippable
+        strippable.to_vec()
     } else {
         Vec::new()
     };
-
-    (disposition, strip_paths)
-}
-
-/// Classify a single commit's disposition for the rewrite engine,
-/// derived purely from its `CommitChanges` and whether finalize-tree
-/// entries are in the strip set. The fold's per-commit `CommitChanges`
-/// is the data layer; classification is the typed projection.
-fn classify_rewrite(
-    changes: &crate::attribution::CommitChanges,
-    plan_key: &crate::lifecycle::PlanKey,
-    include_finalize: bool,
-) -> (trinity_core::api::RewriteDisposition, Vec<String>) {
-    use trinity_core::api::RewriteDisposition;
-
-    let this_plan_touches: Vec<&crate::attribution::PlanTouch> = changes
-        .plan_touches
-        .iter()
-        .filter(|t| &t.session == plan_key)
-        .collect();
-    let other_plan_touches = changes.plan_touches.iter().any(|t| &t.session != plan_key);
-
-    let this_finalize: Vec<&crate::attribution::FinalizeChange> = changes
-        .finalize_changes
-        .iter()
-        .filter(|f| &f.plan_key == plan_key)
-        .collect();
-    let other_finalize = changes
-        .finalize_changes
-        .iter()
-        .any(|f| &f.plan_key != plan_key);
-
-    let touched_this_plan_strippable =
-        !this_plan_touches.is_empty() || (include_finalize && !this_finalize.is_empty());
-    let touched_other_paths = changes.has_non_plan_code_changes
-        || other_plan_touches
-        || other_finalize
-        || (!include_finalize && !this_finalize.is_empty());
-
-    let mut strip_paths = Vec::new();
-    if touched_this_plan_strippable {
-        for touch in &this_plan_touches {
-            if let Some(p) = &touch.new_path {
-                strip_paths.push(p.to_string_lossy().into_owned());
-            }
-        }
-        if include_finalize {
-            for fc in &this_finalize {
-                if matches!(
-                    fc.kind,
-                    crate::attribution::FinalizeChangeKind::Upsert { .. }
-                ) {
-                    strip_paths.push(format!(
-                        ".trinity/finished/{}/{}",
-                        plan_key.as_str(),
-                        fc.file_name
-                    ));
-                }
-            }
-        }
-        strip_paths.sort();
-        strip_paths.dedup();
-    }
-
-    let disposition = if !touched_this_plan_strippable {
-        RewriteDisposition::KeepVerbatim
-    } else if touched_other_paths {
-        RewriteDisposition::Rewrite
-    } else {
-        RewriteDisposition::Drop
-    };
-
-    // strip_paths is moot for Drop (the commit goes away) and
-    // KeepVerbatim (we don't change the tree). Only Rewrite uses it.
-    if !matches!(disposition, RewriteDisposition::Rewrite) {
-        strip_paths.clear();
-    }
 
     (disposition, strip_paths)
 }
@@ -1873,7 +1833,19 @@ mod wire_tests {
         let commits = v["commits"].as_array().unwrap();
         assert_eq!(commits.len(), 2);
         assert_eq!(commits[0]["disposition"], "drop", "plan intro commit");
-        assert_eq!(commits[1]["disposition"], "keep_verbatim", "code commit");
+        // The code commit's TREE still contains .trinity/plans/foo.md
+        // (inherited from intro). Tree-based classification promotes
+        // it to Rewrite — the previous diff-touch logic would have
+        // said KeepVerbatim and leaked the plan file into the
+        // rewritten branch.
+        assert_eq!(commits[1]["disposition"], "rewrite", "code commit");
+        let strip: Vec<&str> = commits[1]["strip_paths"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        assert!(strip.contains(&".trinity/plans/foo.md"));
         assert_eq!(
             commits[1]["foreign"], false,
             "code commit is attributed via walk-back"
@@ -1979,7 +1951,22 @@ mod wire_tests {
         let commits = v["commits"].as_array().unwrap();
         assert_eq!(commits.len(), 2);
         assert_eq!(commits[0]["foreign"], false);
-        assert_eq!(commits[1]["disposition"], "keep_verbatim");
+        // bar commit's tree contains foo.md (inherited) AND
+        // bar.md. For purge-foo, foo.md is strippable, bar.md is
+        // unstrippable other-plan content → Rewrite, strip just
+        // foo.md.
+        assert_eq!(commits[1]["disposition"], "rewrite");
+        let strip: Vec<&str> = commits[1]["strip_paths"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        assert!(strip.contains(&".trinity/plans/foo.md"));
+        assert!(
+            !strip.contains(&".trinity/plans/bar.md"),
+            "bar's plan file must NOT be stripped under purge foo: {strip:?}"
+        );
         assert_eq!(commits[1]["foreign"], true, "bar commit is foreign to foo");
     }
 
