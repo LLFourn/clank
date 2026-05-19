@@ -372,10 +372,17 @@ The `# range:` header reports the commit count in the slice
 the engine would rewrite (intro → HEAD). Pre-intro commits
 don't appear — they're outside the rewrite range.
 
-Blockers (merge commit, dirty worktree, branch-already-exists)
-appear as `# BLOCKER: …` comment lines at the top of the
-output before any todo entries. The operator can still inspect
-the todo, but the live run would refuse.
+Blockers (merge commit, dirty worktree, branch-already-exists,
+protected branch, orphan-finalize) appear as `# BLOCKER: …`
+comment lines at the top. **When ANY blocker is present, every
+todo line is also prefixed with `#`** so the file is
+inspection-only and CANNOT be piped to git unchanged.
+Otherwise an operator following the "pipe to git" workflow
+could execute a rewrite the live `trinity purge` would refuse.
+The blocked output reads as a complete commented-out todo
+plus the explicit reasons; the operator can manually uncomment
+the lines after they understand the risk (e.g. after passing
+`--allow-rewrite-protected` and re-running `--dry`).
 
 Caveats called out at the top of the output:
 
@@ -410,17 +417,35 @@ format — it's a single commit and goes through the existing
 and `trinity purge` share one engine.
 
 Walk the plan's commit range (intro → HEAD or intro →
-`<branch tip>`). For each commit:
+`<branch tip>`). Classification is **tree-based, not
+diff-touch-based** — the engine produces new trees, and a
+post-intro commit's tree inherits Trinity content from its
+parent even when the commit's own diff didn't touch
+`.trinity/`. For each commit, look up its strippable-paths
+set via `git ls-tree -r <sha> -- <plan-paths>` (filtered to
+the named plan's `.trinity/plans/<stem>.md` and, when
+include_finalize is on, `.trinity/finished/<stem>/`):
 
-- **Drop**: tree only changed `.trinity/` paths for this plan.
-  Skip entirely; parent chain hops over it.
-- **Keep verbatim**: didn't touch `.trinity/` for this plan.
-  Reuse SHA as-is in the parent chain.
-- **Rewrite**: touched both `.trinity/` (for this plan) and
-  non-`.trinity/` (or other plans' `.trinity/`). Build a new
-  tree object omitting this plan's `.trinity/` entries; reuse
-  author, message, timestamp; parent is the previous rewritten
-  commit.
+- **Drop**: tree contains only the plan's strippable paths,
+  no non-`.trinity/` content this commit contributes. Skip;
+  parent chain hops over.
+- **Keep verbatim**: tree has none of the plan's strippable
+  paths AND the commit added non-Trinity content. The engine
+  preserves the commit's tree + metadata but recreates it
+  with the (possibly-rewritten) parent — original SHA is
+  abandoned because its parent chain is gone.
+- **Rewrite**: tree has strippable paths AND the commit added
+  non-Trinity content (whether or not the diff itself touched
+  `.trinity/`). Build a new tree omitting the strippable
+  paths; reuse author/message/timestamp; parent is the
+  previous rewritten commit.
+
+The single-plan endpoint uses the same tree-based model as
+the all-plans endpoint (`tree_trinity_paths`), filtered to
+the named plan's path predicate instead of all `.trinity/**`.
+The all-plans variant's `classify_rewrite_all_from_tree`
+helper is generalized so both endpoints share the
+classification.
 
 Implementation: `tokio::process::Command` wrapping git
 plumbing — same shape as the rest of the daemon's git I/O. No
@@ -458,13 +483,22 @@ Per-commit shape cases:
 
 1. Pure plan-only commit → dropped.
 2. Pure code commit, plan-attributed via walk-back inheritance
-   from a plan-touching parent → kept verbatim.
+   from a plan-touching parent → **rewritten** (the tree
+   still contains the inherited plan file; strip it).
+   Critical regression: after `trinity purge foo
+   --into-branch scrubbed` on `seed → plan → code` (code's
+   diff doesn't touch `.trinity/`), `scrubbed` contains
+   `src/main.rs` AND does NOT contain
+   `.trinity/plans/foo.md`.
 3. Mixed (code + plan revision) → rewritten: code preserved,
    plan-file removed, message/author/timestamp preserved.
-4. Sequence of two mixed commits then one pure-code commit →
-   c1' → c2' → c3 (c3 verbatim).
+4. Pure code commit after the plan file was deleted from
+   the tree (e.g. plan moved or removed earlier) →
+   kept verbatim (tree has nothing strippable).
 5. Interleaved foreign commit (c1 plan, c2 foreign, c3 mixed)
-   → c1 dropped, c2 kept (parent = c1's parent), c3 rewritten.
+   → c1 dropped; c2's tree inherits c1's plan file, so c2
+   is also rewritten (strip plan file, keep foreign content);
+   c3 rewritten.
 
 Range/flag cases:
 
