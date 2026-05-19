@@ -58,13 +58,38 @@ Existing daemon surface, all already shipped:
   — commit ranges per plan.
 - HTTP `/api/plan/{repo}/{stem}.md` — gate state, worktree status.
 
-One small new endpoint is the only daemon-side work:
+Two new daemon endpoints — both **pure projections over the
+existing fold**, no new fold state — provide everything the
+CLI needs:
 
-- `GET /api/plan/{repo}/{stem}.md/finish_preview` — returns the
-  pre-flight bundle the CLI needs to validate before committing
-  (current gate, latest reviewable sha, feedback files at that
-  sha, plan finished-ness, dirty-worktree status). Pure
-  projection over existing state, no new fold logic.
+- `GET /api/plan/{repo}/{stem}.md/finish_preview` — gate state,
+  latest reviewable sha, dirty-worktree status, plan
+  finished-ness, AND the **exact sealed-approval set** to
+  copy: `[{author, source_path, verdict, body_hash}]`. The CLI
+  copies only these files, re-reading each and checking the
+  hash before sealing. A feedback file changing between
+  preview and commit fails the hash check and aborts.
+
+- `GET /api/plan/{repo}/{stem}.md/rewrite_preview?include_finalize=…`
+  — the full operation manifest for `purge` / `squash` /
+  `--dry` modes:
+  - commit range (intro sha → end sha) walked
+  - per-commit disposition: `drop | keep_verbatim | rewrite`
+  - foreign commits in the range (so `--squash` can refuse
+    cleanly)
+  - per-`rewrite` commit: the strip-path set (what gets
+    removed from the new tree)
+  - resulting parent chain shape
+  - target-branch operation: `update_current | new_branch`
+
+  Plain projection over `attribution.rs` + the plan's commit
+  range — no I/O outside what the fold already knows. The CLI
+  is a thin executor of this manifest.
+
+  The classification rules (drop/keep/rewrite) live in the
+  daemon. `--include_finalize` toggles whether the latest
+  finalize commit is in the strip set (controls `--purge` vs
+  `--squash --purge` vs `--drop-finalize`).
 
 ## CLI binary wiring
 
@@ -93,7 +118,12 @@ Creates, in this order:
 2. `.trinity/.gitignore` containing:
    ```
    feedback/
+   cache/
    ```
+
+   Mirrors the existing convention (see the repo-root
+   `.gitignore` in this tree). Drift between init output and
+   established convention would be confusing.
 
 That's it. No `--ignore` mode appending to the repo-root
 gitignore — pick one shape and ship it. Trinity's own
@@ -145,12 +175,19 @@ Pre-flight (all checked against the daemon's `finish_preview`):
 On success:
 
 - Wipe any existing `.trinity/finished/<stem>/` contents.
-- For each working-tree feedback file at
-  `.trinity/feedback/<stem>/<latest-reviewable-sha>/*.md`, copy
-  to `.trinity/finished/<stem>/<author>.md` (body only — no SHA
-  metadata layer).
+- For each entry in `finish_preview.sealed_approvals`
+  `{author, source_path, body_hash}`: re-read the source file,
+  recompute the hash, abort with a clear error if the hash
+  drifted (someone edited feedback between preview and commit
+  — the operator should re-poll), otherwise copy the body to
+  `.trinity/finished/<stem>/<author>.md`.
 - `git add .trinity/finished/<stem>/`.
 - `git commit -m "Finalize <stem>"` (override with `-m`).
+
+The hash check is what makes "the approval the operator would
+stand behind" mean anything stronger than "whatever's on
+disk." The daemon already projected the gate as approved with
+specific file contents; the CLI seals exactly that set.
 
 Idempotent: invoking on an already-finished plan with no new
 reviewable commits prints "already finished" and exits 0.
@@ -208,9 +245,21 @@ Use cases:
 - exporting code without `.trinity/` for an external consumer
 
 Plan argument resolution matches `trinity finish`: id or stem,
-optional if cwd-repo has exactly one in-flight plan. **For
-abandoned-plan purges where no in-flight plan exists, the plan
-id is mandatory** — the CLI can't infer.
+optional if cwd-repo has exactly one in-flight plan.
+
+**Scope of purge by plan id**: only plans the daemon can still
+project — i.e. the plan file is present at HEAD or in the
+fold's recent commit-attribution walk. The daemon's
+`rewrite_preview` is the source of truth here. If the plan
+was fully deleted from HEAD and pre-dates the fold's
+attribution window, `purge` refuses with a clear "this plan
+is not projectable; use `trinity purge --recover-from-history
+<intro-sha>`" message. **`--recover-from-history` is out of
+scope for this plan** — adding it means a daemon historical-
+attribution endpoint that walks git outside the fold. The
+common case (recently-abandoned plans still in HEAD's tree
+or in the recent commit-graph) is supported; the recovery
+case is a follow-up.
 
 Flags:
 
@@ -313,8 +362,13 @@ Engine pre-flight refusals:
 - Range contains a merge commit (merge tree rewriting is out
   of scope).
 - Working tree dirty.
-- Current branch differs from the plan's start branch (would
-  be ambiguous which range to walk).
+- Plan's intro commit (from the daemon's `rewrite_preview`)
+  is not reachable from the current branch's tip
+  (`git merge-base --is-ancestor <intro> HEAD`). This is the
+  git-checkable replacement for "plan start branch" — the
+  daemon's fold doesn't track which branch a plan was started
+  on, so we phrase the refusal in terms the operator's git
+  state can answer.
 
 In `--into-branch` mode the engine writes the rewritten chain
 to a fresh branch ref instead of `update-ref`-ing the current
@@ -329,8 +383,8 @@ the post-rewrite history.
 Per-commit shape cases:
 
 1. Pure plan-only commit → dropped.
-2. Pure code commit, plan-attributed via `Implements:` trailer
-   → kept verbatim.
+2. Pure code commit, plan-attributed via walk-back inheritance
+   from a plan-touching parent → kept verbatim.
 3. Mixed (code + plan revision) → rewritten: code preserved,
    plan-file removed, message/author/timestamp preserved.
 4. Sequence of two mixed commits then one pure-code commit →
@@ -417,9 +471,10 @@ later work.
 - `trinity --version` reports the installed `Cargo.toml`
   version. Each phase ships with a minor-version bump.
 - `trinity init` scaffolds `.trinity/plans/` and
-  `.trinity/.gitignore` with the documented content; refuses
-  to overwrite a different existing `.trinity/.gitignore`;
-  warns on `.trinity/` already being globally excluded.
+  `.trinity/.gitignore` containing both `feedback/` and
+  `cache/`; refuses to overwrite a different existing
+  `.trinity/.gitignore`; warns on `.trinity/` already being
+  globally excluded.
 - `trinity finish` performs the full ceremony from an approved
   gate to a committed finalize tree, with `--amend`,
   `--squash`, `--squash --purge`, and `--purge` variants.
@@ -444,20 +499,33 @@ yet). Update the README with the cargo-install dev loop. This
 is a single small commit that proves the workflow before we
 start relying on it.
 
-**Phase 1 — Wiring and init.** Add `init`/`finish`/`purge`
-subcommands to `src/main.rs`, scaffold `src/cli/`, implement
-`trinity init` end-to-end with the gitignore detection
-pre-flight. Wire `--version` via clap's built-in. Add the
-`finish_preview` HTTP endpoint. Bump `Cargo.toml` to `0.1.0`.
+**Phase 1 — Wiring, init, finish_preview endpoint.** Add
+`init`/`finish`/`purge` subcommands to `src/main.rs`,
+scaffold `src/cli/`, implement `trinity init` end-to-end with
+the gitignore detection pre-flight. Wire `--version` via
+clap's built-in. Implement the `finish_preview` HTTP
+endpoint, including the sealed-approval list with body
+hashes. Bump `Cargo.toml` to `0.1.0`.
 
 **Phase 2 — Finish (bare + amend).** Implement `trinity
-finish` and `trinity finish --amend` against the new
-`finish_preview` endpoint. No history rewriting yet; no
-squash. Covers the common case (the ceremony I bungled in
-this session).
+finish` and `trinity finish --amend` against
+`finish_preview`. The CLI re-reads each sealed-approval
+source, verifies the body hash matches, and aborts on drift.
+No history rewriting yet; no squash. Covers the common case
+(the ceremony I bungled in this session).
 
-**Phase 3 — Rewriting engine.** History-rewriting engine,
-`trinity finish --squash`/`--purge`/`--squash --purge`,
-`trinity purge` and all its flags including `--into-branch`
-and `--dry`. The hard phase — the engine is what every
-purge/squash variant funnels through.
+**Phase 3 — rewrite_preview endpoint.** Implement the
+`rewrite_preview` HTTP endpoint as pure projection over
+existing fold state: commit range, per-commit disposition,
+foreign-commit detection, strip-path set, target-branch
+operation. No CLI changes — the endpoint is consumed in
+Phase 4. Tests cover the per-commit classification rules
+end-to-end without touching git.
+
+**Phase 4 — Rewriting engine + purge/squash + --dry.**
+History-rewriting engine, `trinity finish
+--squash`/`--purge`/`--squash --purge`, `trinity purge` and
+all its flags including `--into-branch` and `--dry`. The
+engine is a thin executor of `rewrite_preview`'s manifest.
+The hard phase — the engine is what every purge/squash
+variant funnels through.
