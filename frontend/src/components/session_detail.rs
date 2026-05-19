@@ -101,12 +101,12 @@ fn latest_review_for_target(
     target: Option<&str>,
 ) -> Option<(CommitFeedback, String)> {
     let target = target?;
-    let commit = commits.iter().find(|c| c.sha == target)?;
+    let commit = commits.iter().find(|c| c.sha() == target)?;
     commit
-        .feedback
+        .feedback()
         .iter()
         .max_by_key(|fb| fb.created_at)
-        .map(|fb| (fb.clone(), commit.sha.clone()))
+        .map(|fb| (fb.clone(), commit.sha().to_string()))
 }
 
 fn latest_review_section(latest: Option<(CommitFeedback, String)>) -> AnyView {
@@ -151,11 +151,11 @@ fn commit_feedback_section(commits: Vec<CommitRow>) -> AnyView {
                 {commits
                     .into_iter()
                     .map(|c| {
-                        let kind = c.kind;
+                        let kind = c.kind();
                         let kind_class = format!("commit-kind-chip commit-kind-{kind}");
-                        let sha_short: String = c.sha.chars().take(7).collect();
-                        let target_sha = c.sha.clone();
-                        let cards: Vec<CommitFeedback> = c.feedback.clone();
+                        let sha_short: String = c.sha().chars().take(7).collect();
+                        let target_sha = c.sha().to_string();
+                        let cards: Vec<CommitFeedback> = c.feedback().to_vec();
                         view! {
                             <div class="commit-feedback-block">
                                 <h3 class="commit-feedback-heading">

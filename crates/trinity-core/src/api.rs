@@ -49,18 +49,63 @@ pub use crate::model::Feedback;
 /// daemon storage and wire response carry one struct.
 pub use crate::model::CommitGate;
 
-/// One row in `commits[]` — same shape for MCP and HTTP. Carries
-/// the per-author feedback bodies (raw markdown — the wasm
-/// frontend renders to HTML at display time) so a single response
-/// covers both agent and SPA consumers. `gate` is `Some` for
-/// reviewable kinds (PlanOnly, CodeOnly, Mixed); `None` for
-/// non-reviewable kinds (MultiPlan, Finalize).
+/// One row in `commits[]` — same shape for MCP and HTTP. Tagged
+/// by `kind` on the wire; the daemon's `build_commits_array`
+/// filter only emits rows for reviewable commit kinds so all
+/// variants carry `gate` and `feedback` directly. Feedback bodies
+/// are raw markdown — the wasm frontend renders at display time.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct CommitRow {
-    pub sha: String,
-    pub kind: CommitKind,
-    pub gate: Option<CommitGate>,
-    pub feedback: Vec<Feedback>,
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum CommitRow {
+    PlanOnly {
+        sha: String,
+        gate: CommitGate,
+        feedback: Vec<Feedback>,
+    },
+    CodeOnly {
+        sha: String,
+        gate: CommitGate,
+        feedback: Vec<Feedback>,
+    },
+    Mixed {
+        sha: String,
+        gate: CommitGate,
+        feedback: Vec<Feedback>,
+    },
+}
+
+impl CommitRow {
+    pub fn sha(&self) -> &str {
+        match self {
+            CommitRow::PlanOnly { sha, .. }
+            | CommitRow::CodeOnly { sha, .. }
+            | CommitRow::Mixed { sha, .. } => sha,
+        }
+    }
+
+    pub fn kind(&self) -> CommitKind {
+        match self {
+            CommitRow::PlanOnly { .. } => CommitKind::PlanOnly,
+            CommitRow::CodeOnly { .. } => CommitKind::CodeOnly,
+            CommitRow::Mixed { .. } => CommitKind::Mixed,
+        }
+    }
+
+    pub fn gate(&self) -> &CommitGate {
+        match self {
+            CommitRow::PlanOnly { gate, .. }
+            | CommitRow::CodeOnly { gate, .. }
+            | CommitRow::Mixed { gate, .. } => gate,
+        }
+    }
+
+    pub fn feedback(&self) -> &[Feedback] {
+        match self {
+            CommitRow::PlanOnly { feedback, .. }
+            | CommitRow::CodeOnly { feedback, .. }
+            | CommitRow::Mixed { feedback, .. } => feedback,
+        }
+    }
 }
 
 /// One row in a plan's per-session timeline. Kind-dependent shape

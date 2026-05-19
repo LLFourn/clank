@@ -750,7 +750,7 @@ async fn feedback_renders_on_session_page() {
 
     let plan2 = fetch_plan_detail(&client, &url, &dir, "foo").await;
     let has_alice_approve = plan2.commits.iter().any(|c| {
-        c.feedback.iter().any(|f| {
+        c.feedback().iter().any(|f| {
             f.author.as_str() == "alice"
                 && matches!(f.verdict, trinity_core::vocab::Verdict::Approve)
         })

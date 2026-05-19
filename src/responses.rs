@@ -580,19 +580,31 @@ fn posture_to_review_target_phase(p: Posture) -> ReviewTargetPhase {
 fn build_commits_array(plan: &Plan) -> Vec<CommitRow> {
     let mut out = Vec::new();
     for event in &plan.timeline {
-        if !event.kind.is_reviewable() {
-            continue;
-        }
         let Some(gate) = event.gate.as_ref() else {
             continue;
         };
+        let sha = event.sha.as_str().to_string();
         let feedback: Vec<Feedback> = gate.feedback.values().cloned().collect();
-        out.push(CommitRow {
-            sha: event.sha.as_str().to_string(),
-            kind: event.kind,
-            gate: Some(gate.clone()),
-            feedback,
-        });
+        let gate = gate.clone();
+        let row = match event.kind {
+            CommitKind::PlanOnly => CommitRow::PlanOnly {
+                sha,
+                gate,
+                feedback,
+            },
+            CommitKind::CodeOnly => CommitRow::CodeOnly {
+                sha,
+                gate,
+                feedback,
+            },
+            CommitKind::Mixed => CommitRow::Mixed {
+                sha,
+                gate,
+                feedback,
+            },
+            CommitKind::MultiPlan | CommitKind::Finalize | CommitKind::Unattributed => continue,
+        };
+        out.push(row);
     }
     out
 }

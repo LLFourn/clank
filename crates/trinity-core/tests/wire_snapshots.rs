@@ -135,10 +135,9 @@ fn archived_fixture() -> ArchivedCycle {
 }
 
 fn commit_row_fixture() -> CommitRow {
-    CommitRow {
+    CommitRow::PlanOnly {
         sha: "abc".into(),
-        kind: CommitKind::PlanOnly,
-        gate: Some(commit_gate_fixture()),
+        gate: commit_gate_fixture(),
         feedback: vec![feedback_fixture()],
     }
 }
