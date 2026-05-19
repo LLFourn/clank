@@ -14,8 +14,9 @@ use trinity_core::api::RewritePreviewResponse;
 pub async fn run(args: PurgeArgs) -> anyhow::Result<()> {
     let repo = resolve_repo(args.repo.as_deref())?;
     let basename = repo_basename(&repo)?;
-    let stem = super::finish::resolve_stem_for_purge(&args.plan, &basename)?;
     let daemon = args.daemon.trim_end_matches('/').to_string();
+    let stem =
+        super::finish::resolve_stem_or_infer_for_purge(&args.plan, &basename, &daemon).await?;
 
     if args.amend {
         anyhow::bail!("--amend is not yet implemented in this phase");

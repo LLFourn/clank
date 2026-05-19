@@ -279,6 +279,47 @@ pub async fn commit_parent_count(repo: &Path, sha: &CommitSha) -> Result<usize, 
     Ok(stdout.split_whitespace().count())
 }
 
+/// First-parent walk pinned to a specific tip SHA. Unlike
+/// `first_parent_commits` (which walks live HEAD), this anchors to
+/// the caller's snapshot so the resulting range never disagrees
+/// with a value the daemon already projected.
+pub async fn first_parent_commits_to(
+    repo: &Path,
+    tip: &CommitSha,
+) -> Result<Vec<CommitMeta>, GitIoError> {
+    let stdout = run_ok(
+        repo,
+        &[
+            "log",
+            "--first-parent",
+            "--reverse",
+            "--format=%H%x00%at%x00%s",
+            tip.as_str(),
+        ],
+    )
+    .await?;
+    let mut out = Vec::new();
+    for line in stdout.lines() {
+        if line.is_empty() {
+            continue;
+        }
+        let mut parts = line.splitn(3, '\0');
+        let sha = parts.next().unwrap_or("").trim();
+        let ts = parts.next().unwrap_or("0").trim();
+        let subject = parts.next().unwrap_or("").to_string();
+        if sha.is_empty() {
+            continue;
+        }
+        let author_ts = ts.parse::<i64>().unwrap_or(0);
+        out.push(CommitMeta {
+            sha: parse_sha("first_parent_commits_to", sha)?,
+            author_ts,
+            subject,
+        });
+    }
+    Ok(out)
+}
+
 pub async fn first_parent_commits(repo: &Path) -> Result<Vec<CommitMeta>, GitIoError> {
     let stdout = run_ok(
         repo,

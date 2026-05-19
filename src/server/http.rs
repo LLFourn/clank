@@ -506,7 +506,7 @@ async fn api_rewrite_preview(
         .ok_or_else(|| AppError::not_found(format!("repo {repo_basename} has no HEAD")))?;
     let intro_sha = Some(plan.plan_intro.clone());
 
-    let metas = crate::git_io::first_parent_commits(&repo)
+    let metas = crate::git_io::first_parent_commits_to(&repo, &head_sha)
         .await
         .map_err(|e| AppError::internal(format!("git first-parent walk: {e}")))?;
     let start = metas
@@ -520,8 +520,25 @@ async fn api_rewrite_preview(
         })?;
     let range = &metas[start..];
 
-    let plan_timeline_shas: std::collections::BTreeSet<crate::lifecycle::CommitSha> =
-        plan.timeline.iter().map(|e| e.sha().clone()).collect();
+    // Map each in-range sha to its timeline-event kind for this
+    // plan, when present. `MultiPlan` events ARE in this plan's
+    // timeline (they touched it) but a cross-plan commit must
+    // still be flagged `foreign: true` — `--squash` refuses on it,
+    // `--purge` rewrites it. Treat PlanOnly/CodeOnly/Mixed/Finalize
+    // as "native to this plan"; everything else (MultiPlan, absent)
+    // is foreign.
+    use trinity_core::model::PlanTimelineEvent;
+    let native_shas: std::collections::BTreeSet<crate::lifecycle::CommitSha> = plan
+        .timeline
+        .iter()
+        .filter_map(|e| match e {
+            PlanTimelineEvent::PlanOnly { sha, .. }
+            | PlanTimelineEvent::CodeOnly { sha, .. }
+            | PlanTimelineEvent::Mixed { sha, .. }
+            | PlanTimelineEvent::Finalize { sha, .. } => Some(sha.clone()),
+            PlanTimelineEvent::MultiPlan { .. } => None,
+        })
+        .collect();
 
     let mut linear = true;
     let mut commits = Vec::with_capacity(range.len());
@@ -535,7 +552,7 @@ async fn api_rewrite_preview(
         let changes = crate::git_io::diff_tree_changes(&repo, &meta.sha)
             .await
             .map_err(|e| AppError::internal(format!("git diff-tree: {e}")))?;
-        let attributed_to_this_plan = plan_timeline_shas.contains(&meta.sha);
+        let attributed_to_this_plan = native_shas.contains(&meta.sha);
         let (disposition, strip_paths) = classify_rewrite(&changes, &plan_key, q.include_finalize);
         commits.push(trinity_core::api::RewriteCommit {
             sha: meta.sha.clone(),
@@ -1702,6 +1719,43 @@ mod wire_tests {
         let strip = commits[1]["strip_paths"].as_array().unwrap();
         assert_eq!(strip.len(), 1);
         assert_eq!(strip[0], ".trinity/plans/foo.md");
+    }
+
+    #[tokio::test]
+    async fn rewrite_preview_marks_multi_plan_commit_foreign() {
+        let dir = init_repo();
+        write_file(dir.path(), ".trinity/plans/foo.md", "# foo\n");
+        commit(dir.path(), "add foo");
+        // One commit touching BOTH foo and bar — this is the
+        // MultiPlan / cross-plan case. It will appear in foo's
+        // timeline as a MultiPlan event but must be `foreign: true`.
+        write_file(dir.path(), ".trinity/plans/foo.md", "# foo v2\n");
+        write_file(dir.path(), ".trinity/plans/bar.md", "# bar\n");
+        commit(dir.path(), "cross-plan: foo + bar");
+        let runtime = Arc::new(Runtime::new());
+        runtime.add_repo(dir.path().to_path_buf()).await.unwrap();
+        let state = AppState {
+            runtime: Arc::clone(&runtime),
+            watchers: Arc::new(Mutex::new(std::collections::BTreeMap::new())),
+            bundle: Bundle::Disk(std::path::PathBuf::from("/dev/null")),
+            repos_path: std::path::PathBuf::from("/dev/null"),
+        };
+        let app = router(state);
+        let url = format!("/api/plan/{}/rewrite_preview", plan_id_for(&dir, "foo"));
+        let req = Request::builder()
+            .method("GET")
+            .uri(&url)
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let v = body_json(resp).await;
+        let commits = v["commits"].as_array().unwrap();
+        assert_eq!(commits.len(), 2);
+        assert_eq!(
+            commits[1]["foreign"], true,
+            "cross-plan commit must be foreign"
+        );
     }
 
     #[tokio::test]

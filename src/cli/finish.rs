@@ -14,8 +14,8 @@ use trinity_core::api::{FinalizeBlockReason, FinalizeReadiness, FinishPreviewRes
 pub async fn run(args: FinishArgs) -> anyhow::Result<()> {
     let repo = resolve_repo(args.repo.as_deref())?;
     let basename = repo_basename(&repo)?;
-    let stem = resolve_stem(&args.plan, &basename)?;
     let daemon = args.daemon.trim_end_matches('/').to_string();
+    let stem = resolve_stem_or_infer(&args.plan, &basename, &daemon).await?;
 
     let preview = fetch_preview(&daemon, &basename, &stem).await?;
     dispatch_readiness(&preview)?;
@@ -38,12 +38,73 @@ pub async fn run(args: FinishArgs) -> anyhow::Result<()> {
 }
 
 /// Public for `cli::purge` (same parsing rules across both
-/// subcommands).
-pub(crate) fn resolve_stem_for_purge(
+/// subcommands). Falls back to single-active-plan inference when
+/// the operator passed no plan arg.
+pub(crate) async fn resolve_stem_or_infer_for_purge(
     plan: &Option<String>,
     expected_basename: &str,
+    daemon: &str,
 ) -> anyhow::Result<String> {
-    resolve_stem(plan, expected_basename)
+    resolve_stem_or_infer(plan, expected_basename, daemon).await
+}
+
+/// Plan-arg resolution with inference. If `plan` is `Some`, parse
+/// it. If `None`, ask the daemon for the repo's active in-flight
+/// plans and require exactly one.
+async fn resolve_stem_or_infer(
+    plan: &Option<String>,
+    expected_basename: &str,
+    daemon: &str,
+) -> anyhow::Result<String> {
+    if plan.is_some() {
+        return resolve_stem(plan, expected_basename);
+    }
+    infer_single_active_plan(daemon, expected_basename).await
+}
+
+async fn infer_single_active_plan(daemon: &str, basename: &str) -> anyhow::Result<String> {
+    let url = format!("{daemon}/api/plans?repo={basename}");
+    let resp = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()?
+        .get(&url)
+        .send()
+        .await
+        .map_err(|e| anyhow::anyhow!("daemon unreachable at {daemon}: {e}"))?;
+    let status = resp.status();
+    if !status.is_success() {
+        let body = resp.text().await.unwrap_or_default();
+        anyhow::bail!("daemon returned {status} for {url}: {body}");
+    }
+    let response = resp.json::<trinity_core::api::ListPlansResponse>().await?;
+    let active: Vec<&trinity_core::api::PlanRow> = response
+        .plans
+        .iter()
+        .filter(|row| row.lifecycle == trinity_core::vocab::PlanLifecycle::Active)
+        .filter(|row| {
+            row.plan_id
+                .as_deref()
+                .and_then(|pid| pid.split_once('/'))
+                .map(|(b, _)| b == basename)
+                .unwrap_or(false)
+        })
+        .collect();
+    match active.as_slice() {
+        [one] => Ok(one.slug.clone()),
+        [] => anyhow::bail!(
+            "no active in-flight plan to infer; pass a plan id explicitly. \
+             repo: `{basename}`",
+        ),
+        many => {
+            let candidates: Vec<&str> = many.iter().filter_map(|p| p.plan_id.as_deref()).collect();
+            anyhow::bail!(
+                "ambiguous: {} active plans in `{basename}`; pass one explicitly. \
+                 candidates: {}",
+                many.len(),
+                candidates.join(", "),
+            )
+        }
+    }
 }
 
 /// Parse the `<plan>` CLI argument into a plan stem the wire form
@@ -53,9 +114,7 @@ pub(crate) fn resolve_stem_for_purge(
 /// the caller re-adds it when building wire paths.
 fn resolve_stem(plan: &Option<String>, expected_basename: &str) -> anyhow::Result<String> {
     let Some(raw) = plan else {
-        anyhow::bail!(
-            "plan argument required (single-active-plan inference lands in a later phase)"
-        );
+        anyhow::bail!("plan argument required");
     };
     let raw = raw.trim();
     if raw.is_empty() {
@@ -129,9 +188,11 @@ fn reason_to_msg(reason: &FinalizeBlockReason) -> String {
     }
 }
 
-/// Wipe `.trinity/finished/<stem>/`, copy each `sealed_approvals`
-/// entry from its `source_path` (with a body-hash re-verify), then
-/// `git add` + `git commit`.
+/// Read+hash every approval into memory BEFORE touching
+/// `.trinity/finished/<stem>/`. If any read fails or any hash
+/// drifts, we abort cleanly and the operator's existing finalize
+/// snapshot is untouched. Especially important for `--amend`: a
+/// failure must not strand the operator between snapshots.
 async fn finalize(
     repo: &Path,
     stem: &str,
@@ -139,18 +200,13 @@ async fn finalize(
     amend: bool,
     message: Option<&str>,
 ) -> anyhow::Result<()> {
-    let finished_dir = repo.join(".trinity/finished").join(stem);
-    if finished_dir.exists() {
-        std::fs::remove_dir_all(&finished_dir)?;
-    }
-    std::fs::create_dir_all(&finished_dir)?;
-
     if preview.sealed_approvals.is_empty() {
         anyhow::bail!(
             "daemon returned readiness=Ready but no sealed approvals — refusing to seal an empty set"
         );
     }
 
+    let mut verified: Vec<(String, String)> = Vec::with_capacity(preview.sealed_approvals.len());
     for approval in &preview.sealed_approvals {
         let source = repo.join(&approval.source_path);
         let body = std::fs::read_to_string(&source).map_err(|e| {
@@ -170,8 +226,16 @@ async fn finalize(
                 observed.as_str(),
             );
         }
-        let dest = finished_dir.join(format!("{}.md", approval.author.as_str()));
-        std::fs::write(&dest, &body)?;
+        verified.push((format!("{}.md", approval.author.as_str()), body));
+    }
+
+    let finished_dir = repo.join(".trinity/finished").join(stem);
+    if finished_dir.exists() {
+        std::fs::remove_dir_all(&finished_dir)?;
+    }
+    std::fs::create_dir_all(&finished_dir)?;
+    for (name, body) in &verified {
+        std::fs::write(finished_dir.join(name), body)?;
     }
 
     let rel_finished = format!(".trinity/finished/{stem}");
@@ -261,7 +325,9 @@ mod tests {
     }
 
     #[test]
-    fn resolve_stem_rejects_missing_arg() {
+    fn resolve_stem_rejects_missing_arg_at_parse_layer() {
+        // resolve_stem itself bails on None; the inference fallback
+        // lives one layer up in `resolve_stem_or_infer`.
         let err = resolve_stem(&None, "trinity").unwrap_err();
         let msg = format!("{err}");
         assert!(msg.contains("plan argument required"), "got: {msg}");

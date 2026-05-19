@@ -34,7 +34,7 @@ pub struct FinishArgs {
     #[arg(long, value_name = "PATH")]
     pub repo: Option<PathBuf>,
     /// Daemon HTTP base URL.
-    #[arg(long, default_value = DEFAULT_DAEMON, env = "TRINITY_DAEMON")]
+    #[arg(long, default_value = DEFAULT_DAEMON, env = "TRINITY_DAEMON_URL")]
     pub daemon: String,
     /// Amend HEAD instead of creating a new finalize commit. HEAD
     /// must already be a finalize commit for this plan.
@@ -55,7 +55,7 @@ pub struct PurgeArgs {
     #[arg(long, value_name = "PATH")]
     pub repo: Option<PathBuf>,
     /// Daemon HTTP base URL.
-    #[arg(long, default_value = DEFAULT_DAEMON, env = "TRINITY_DAEMON")]
+    #[arg(long, default_value = DEFAULT_DAEMON, env = "TRINITY_DAEMON_URL")]
     pub daemon: String,
     /// Write the rewritten chain to a fresh branch instead of
     /// rewriting the current branch in place. Safer — the operator

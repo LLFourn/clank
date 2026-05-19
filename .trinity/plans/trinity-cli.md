@@ -494,15 +494,19 @@ later work.
   `cache/`; refuses to overwrite a different existing
   `.trinity/.gitignore`; warns on `.trinity/` already being
   globally excluded.
-- `trinity finish` performs the full ceremony from an approved
-  gate to a committed finalize tree, with `--amend`,
-  `--squash`, `--squash --purge`, and `--purge` variants.
+- `trinity finish` performs the bare ceremony from an approved
+  gate to a committed finalize tree, with `--amend`. The
+  `--squash`, `--squash --purge`, and `--purge` variants are
+  deferred to a follow-up phase (Phase 5; see below).
 - `trinity purge` runs the history-rewriting engine without a
   finalize commit, accepts plan id or stem, supports
-  `--into-branch`, `--drop-finalize`, `--amend`, `--squash`,
-  and `--dry`.
-- `--dry` on any mutating command prints the planned action
-  shape and exits 0 with no commits and no ref updates.
+  `--into-branch`, `--dry`, and `--yes`. The `--drop-finalize`,
+  `--amend`, and `--squash` flags are wire-reserved (they
+  appear in `--help`) but explicitly bail with "not yet
+  implemented" — they land in Phase 5.
+- `--dry` on the implemented mutating commands prints the
+  planned action shape and exits 0 with no commits and no ref
+  updates.
 - The CLI never re-derives projection state — every "is this
   plan finished?" / "what's the latest reviewable sha?" /
   "give me the plan's commit range" question is answered by
@@ -545,10 +549,28 @@ endpoint against small fixture repos so the git-I/O glue is
 covered too. No CLI changes — the endpoint is consumed in
 Phase 4.
 
-**Phase 4 — Rewriting engine + purge/squash + --dry.**
-History-rewriting engine, `trinity finish
---squash`/`--purge`/`--squash --purge`, `trinity purge` and
-all its flags including `--into-branch` and `--dry`. The
-engine is a thin executor of `rewrite_preview`'s manifest.
-The hard phase — the engine is what every purge/squash
-variant funnels through.
+**Phase 4 — Rewriting engine + minimum-viable purge.**
+History-rewriting engine in `src/cli/rewrite.rs`: thin executor
+of `rewrite_preview`'s manifest. Engine pre-flights: non-linear
+range refusal (merge commit in `[intro, head]`), dirty-worktree
+refusal, `--into-branch` collision refusal via atomic
+`update-ref` with zero-sha old value, in-place ref update via
+`update-ref <new> <preview.head_sha>` (conditional on the
+previewed tip so a race between preview and commit aborts
+cleanly). All-Drop case moves the branch to `intro_parent`
+(refuses cleanly if intro is the root commit). `trinity purge
+[<plan>] [--into-branch <name>] [--dry] [--yes]` consumes the
+manifest. `--squash`, `--amend`, `--drop-finalize` and
+`trinity finish`'s `--squash`/`--purge` flags are
+wire-reserved but bail with "not yet implemented" — they
+land in Phase 5.
+
+**Phase 5 — Remaining purge/squash surface (follow-up).**
+`trinity finish --squash`, `trinity finish --purge`, `trinity
+finish --squash --purge`, `trinity purge --squash`, `trinity
+purge --amend`, `trinity purge --drop-finalize`. Protected-
+branch detection + `--allow-rewrite-protected`. Orphan-finalize
+refusal. The remaining "Range/flag cases" 6, 7, 8, 9 in the
+Testing section. Scoped to a follow-up because the Phase 4
+engine + `--into-branch` covers the safe-by-default path and
+ships the working spine sooner.

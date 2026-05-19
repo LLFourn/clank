@@ -71,23 +71,48 @@ pub async fn run(opts: RewriteOpts<'_>) -> anyhow::Result<RewriteOutcome> {
         return Ok(RewriteOutcome::default());
     }
 
-    let new_tip = apply_plan(opts.repo, &plan).await?;
+    let new_tip = apply_plan(opts.repo, &plan, intro_parent.as_deref()).await?;
     let updated_branch = match opts.into_branch {
         Some(name) => {
+            // Atomic "must not already exist": `update-ref -Z`-style
+            // syntax with the all-zero old value tells git to refuse
+            // if the ref exists. We already checked once above, but
+            // this closes the race between check and update.
             git_run(
                 opts.repo,
-                &["update-ref", &format!("refs/heads/{name}"), &new_tip],
+                &[
+                    "update-ref",
+                    &format!("refs/heads/{name}"),
+                    &new_tip,
+                    "0000000000000000000000000000000000000000",
+                ],
             )?;
             name.to_string()
         }
         None => {
             let current = current_branch(opts.repo)?;
+            // Conditional update: expected old value is the head we
+            // previewed against. If the branch moved between preview
+            // and now, refuse — we'd be silently throwing away
+            // commits that arrived after preview.
             git_run(
                 opts.repo,
-                &["update-ref", &format!("refs/heads/{current}"), &new_tip],
-            )?;
-            // Re-sync the worktree to the new tip without losing
-            // anything (we already refused on dirty above).
+                &[
+                    "update-ref",
+                    &format!("refs/heads/{current}"),
+                    &new_tip,
+                    preview.head_sha.as_str(),
+                ],
+            )
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "branch `{current}` moved between preview and rewrite \
+                     (expected {}); aborting to avoid losing commits — re-run \
+                     to refresh the preview. underlying: {e}",
+                    short(preview.head_sha.as_str()),
+                )
+            })?;
+            // Re-sync the worktree to the new tip.
             git_run(opts.repo, &["reset", "--hard", "HEAD"])?;
             current
         }
@@ -173,36 +198,53 @@ fn print_dry_run(preview: &RewritePreviewResponse, plan: &ExecutionPlan) {
     println!("(dry-run: no commits created, no refs updated)");
 }
 
-/// Walk `plan.steps` in order, producing a new tip SHA. Returns the
-/// final tip (parent of the next-to-be-rewritten commit, or the
-/// intro_parent if every step was dropped).
-async fn apply_plan(repo: &Path, plan: &ExecutionPlan) -> anyhow::Result<String> {
+/// Walk `plan.steps` in order, producing a new tip SHA. When every
+/// step is `Drop`, the branch should move to `intro_parent` — that's
+/// "plan abandoned mid-flight, leave no trace." When `intro_parent`
+/// is `None` (intro is the root commit), there's no valid SHA to
+/// point the branch at, so we error with a clear message: the
+/// operator must keep at least one commit or delete the branch
+/// outright.
+async fn apply_plan(
+    repo: &Path,
+    plan: &ExecutionPlan,
+    intro_parent: Option<&str>,
+) -> anyhow::Result<String> {
     let mut parent: Option<String> = plan.intro_parent.clone();
+    let mut produced_any = false;
     for step in &plan.steps {
         match step.disposition {
             RewriteDisposition::Drop => {
                 // Parent chain hops over this commit.
             }
             RewriteDisposition::KeepVerbatim => {
-                // Re-commit with the same tree but our running parent
-                // (since predecessors may have shifted). If our parent
-                // equals this commit's natural parent, we could reuse
-                // the SHA — but rebuilding is uniformly correct and
-                // costs one commit-tree call.
                 let tree = git_capture(repo, &["rev-parse", &format!("{}^{{tree}}", step.sha)])?;
                 let new_sha =
                     commit_tree_preserving_meta(repo, &step.sha, &tree, parent.as_deref())?;
                 parent = Some(new_sha);
+                produced_any = true;
             }
             RewriteDisposition::Rewrite => {
                 let new_tree = build_stripped_tree(repo, &step.sha, &step.strip_paths)?;
                 let new_sha =
                     commit_tree_preserving_meta(repo, &step.sha, &new_tree, parent.as_deref())?;
                 parent = Some(new_sha);
+                produced_any = true;
             }
         }
     }
-    parent.ok_or_else(|| anyhow::anyhow!("rewrite produced no commits (every step dropped?)"))
+    if !produced_any {
+        match intro_parent {
+            Some(p) => Ok(p.to_string()),
+            None => anyhow::bail!(
+                "every commit in range would be dropped AND the plan's intro is a root commit — \
+                 cannot point a branch at 'nothing'. Use `git branch -D` to delete the branch \
+                 outright if that's what you want.",
+            ),
+        }
+    } else {
+        parent.ok_or_else(|| anyhow::anyhow!("rewrite produced commits but lost the tip"))
+    }
 }
 
 /// Build a new tree object from `<sha>`'s tree by removing each path
@@ -627,6 +669,91 @@ mod tests {
         let msg = format!("{err}");
         assert!(msg.contains("already-exists"), "got: {msg}");
         assert!(msg.contains("already exists"), "got: {msg}");
+    }
+
+    #[tokio::test]
+    async fn rewrite_all_drop_points_branch_at_intro_parent() {
+        let dir = init_repo();
+        write(dir.path(), "README.md", "seed\n");
+        let seed = commit(dir.path(), "seed");
+        write(dir.path(), ".trinity/plans/foo.md", "# foo\n");
+        let intro = commit(dir.path(), "plan: foo");
+        write(dir.path(), ".trinity/plans/foo.md", "# foo v2\n");
+        let revision = commit(dir.path(), "plan: foo v2");
+
+        let preview = mk_preview(
+            &intro,
+            &revision,
+            vec![
+                (
+                    intro.clone(),
+                    "plan: foo".into(),
+                    RewriteDisposition::Drop,
+                    false,
+                    vec![],
+                ),
+                (
+                    revision.clone(),
+                    "plan: foo v2".into(),
+                    RewriteDisposition::Drop,
+                    false,
+                    vec![],
+                ),
+            ],
+        );
+        let outcome = super::run(RewriteOpts {
+            repo: dir.path(),
+            preview: &preview,
+            into_branch: Some("purged"),
+            dry: false,
+        })
+        .await
+        .unwrap();
+        assert_eq!(outcome.new_tip.as_deref(), Some(seed.as_str()));
+        let chain = rev_list(dir.path(), "purged");
+        assert_eq!(chain, vec![seed]);
+    }
+
+    #[tokio::test]
+    async fn rewrite_conditional_in_place_update_refuses_if_branch_moved() {
+        let dir = init_repo();
+        write(dir.path(), "README.md", "seed\n");
+        let _seed = commit(dir.path(), "seed");
+        write(dir.path(), ".trinity/plans/foo.md", "# foo\n");
+        let intro = commit(dir.path(), "plan: foo");
+
+        // Simulate: preview was fetched against `intro`, then a new
+        // commit landed.
+        write(dir.path(), "src/main.rs", "fn main() {}\n");
+        let raced_commit = commit(dir.path(), "raced commit after preview");
+
+        let preview = mk_preview(
+            &intro,
+            &intro, // stale head_sha
+            vec![(
+                intro.clone(),
+                "plan: foo".into(),
+                RewriteDisposition::Drop,
+                false,
+                vec![],
+            )],
+        );
+
+        let err = super::run(RewriteOpts {
+            repo: dir.path(),
+            preview: &preview,
+            into_branch: None, // in-place — triggers the conditional update
+            dry: false,
+        })
+        .await
+        .unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("moved between preview"), "got: {msg}");
+
+        // Branch tip is still the raced commit; the engine did not
+        // clobber it.
+        let chain = rev_list(dir.path(), "main");
+        assert_eq!(chain.last().unwrap(), &raced_commit);
     }
 
     #[tokio::test]
