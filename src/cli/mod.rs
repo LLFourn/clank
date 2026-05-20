@@ -102,12 +102,15 @@ pub struct PurgeArgs {
     /// Skip the interactive confirmation prompt.
     #[arg(long)]
     pub yes: bool,
-    /// Reserved for a future phase: squash plan-attributed
-    /// commits into a single commit with the supplied message.
+    /// Collapse the plan-attributed range into a single commit
+    /// with the supplied message. Not pipeable to `git rebase` —
+    /// see `--dry` output for the planned target tree.
     #[arg(long, value_name = "MSG")]
     pub squash: Option<String>,
-    /// Reserved for a future phase: amend HEAD instead of building
-    /// a new chain.
+    /// Amend HEAD instead of building a new chain. HEAD must
+    /// already be a finalize commit (every changed path under
+    /// `.trinity/finished/<stem>/`, or under `.trinity/finished/`
+    /// for `--all`).
     #[arg(long)]
     pub amend: bool,
     /// Permit rewriting a protected branch (`main`/`master` or any
