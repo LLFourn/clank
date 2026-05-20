@@ -190,7 +190,7 @@ config changes require a restart (which re-folds), so policy
 never goes stale relative to the snapshot it was computed from.
 
 ```rust
-pub enum ReviewPolicy<'a> {
+pub enum ReviewPolicy {
     Blocking { participants: NonEmptyVec<AgentLabel> },
     NonBlocking { reason: NonBlockingReason },
 }
@@ -207,7 +207,7 @@ pub enum NonBlockingReason {
 
 impl CommitNode {
     pub fn review_policy(&self, config: &Config, state: &RepoState)
-        -> ReviewPolicy<'_>;
+        -> ReviewPolicy;
 }
 ```
 
@@ -536,12 +536,16 @@ Method shape:
 
 ```rust
 impl RepoState {
-    /// Commits associated with `plan` in fold order.
+    /// Commits associated with `plan` in fold order. Returns a
+    /// `DoubleEndedIterator` so reverse-scans (latest-first)
+    /// stay cheap. The underlying `commit_order` is a `Vec`, and
+    /// every adapter in the chain (`filter_map`, `filter`)
+    /// preserves the double-ended bound.
     pub fn commits_for_plan(&self, plan: &PlanKey)
-        -> impl Iterator<Item = &CommitNode>;
+        -> impl DoubleEndedIterator<Item = &CommitNode>;
 
     /// Latest reviewable commit attributed to `plan` (reverse
-    /// scan over `commit_order`).
+    /// scan over `commits_for_plan`).
     pub fn latest_reviewable_for_plan(&self, plan: &PlanKey)
         -> Option<&CommitNode>;
 
@@ -592,7 +596,7 @@ impl CommitBody {
 
 impl RepoState {
     pub fn commits_for_plan(&self, plan: &PlanKey)
-        -> impl Iterator<Item = &CommitNode>
+        -> impl DoubleEndedIterator<Item = &CommitNode>
     {
         self.commit_order
             .iter()
@@ -606,7 +610,7 @@ impl RepoState {
         -> Option<&CommitNode>
     {
         self.commits_for_plan(plan)
-            .filter(|n| matches!(n.body, CommitBody::Plan(_)))
+            .filter(|n| matches!(&n.body, CommitBody::Plan(_)))
             .next_back()
     }
 
