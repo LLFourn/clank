@@ -11,6 +11,7 @@ use std::path::{Path, PathBuf};
 
 pub mod finish;
 pub mod init;
+pub mod plan_resolve;
 pub mod purge;
 pub mod rewrite;
 
