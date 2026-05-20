@@ -52,15 +52,15 @@ async fn wait_for_work(state: &AppState, req: &ToolCallRequest) -> Result<Value,
     let mut args: WaitArgs = serde_json::from_value(req.arguments.clone())
         .map_err(|e| ToolError::Invalid(format!("args: {e}")))?;
 
-    if args.plan_id.trim().is_empty() {
-        // Phase 3 of commit-first-review-model: empty plan_id is a
+    let supplied_plan_id = args.plan_id.clone();
+    if supplied_plan_id.is_none() {
+        // Phase 3 of commit-first-review-model: missing plan_id is a
         // repo-scope wait. Resolve the repo once (from `args.repo` or
         // the caller's cwd) and hand the matcher a single concept of
         // optional plan_id. No `resolve_plan_id` / AmbiguousPlan path
         // here — multi-plan repos are the normal shape; the matcher
-        // fans out and returns the first plan needing the caller's
-        // role. NoActives is now expressed by the matcher itself
-        // returning a timeout (no plans matched within the deadline).
+        // walks the commit stream and returns the next reviewable
+        // commit needing the caller's role.
         let repo_root = match args.repo.as_deref() {
             Some(s) if !s.trim().is_empty() => resolve_repo_filter(state, s, &req.cwd).await?,
             _ => resolve_repo(&req.cwd).await?,
@@ -72,15 +72,15 @@ async fn wait_for_work(state: &AppState, req: &ToolCallRequest) -> Result<Value,
             ))
         })?;
         args.repo = Some(basename.as_str().to_string());
-        args.plan_id = String::new();
+        args.plan_id = None;
     } else {
         // Explicit plan_id supplied. Use the legacy resolver so the
         // shim's autofill / active-selection paths still work for
         // single-plan callers. Repo-scope cannot reach this branch
-        // because we already swallowed the empty case above.
+        // because we already swallowed the absent case above.
         match resolve_plan_id(
             state,
-            Some(args.plan_id.as_str()),
+            supplied_plan_id.as_deref(),
             args.repo.as_deref(),
             args.author_label.as_deref(),
             &req.cwd,
@@ -88,7 +88,7 @@ async fn wait_for_work(state: &AppState, req: &ToolCallRequest) -> Result<Value,
         .await?
         {
             PlanIdResolution::Resolved(id) => {
-                args.plan_id = id.to_string();
+                args.plan_id = Some(id.to_string());
             }
             PlanIdResolution::NoActives { repo } => {
                 let timeout = trinity_core::api::WaitForWorkResponse::Timeout(

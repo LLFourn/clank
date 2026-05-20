@@ -17,6 +17,7 @@
 //! `plan_worktree_status` from disk and derive `waiting_on`. Status-driven
 //! master waits stay correct without holding the mutex across disk I/O.
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
@@ -37,17 +38,21 @@ const DEFAULT_TIMEOUT_SECS: u64 = 1800;
 pub struct WaitArgs {
     pub role: WaitingRole,
     /// Optional plan filter. Phase 3 of `commit-first-review-model`
-    /// makes this a filter rather than the primary key: when omitted
-    /// (empty string), the matcher walks all active visible plans in
-    /// the resolved repo and returns the first plan needing the
-    /// caller's role. When supplied, the matcher filters to that
-    /// plan exclusively.
-    #[serde(default)]
-    pub plan_id: String,
-    /// Optional repo scope. Required when `plan_id` is empty so the
-    /// matcher knows which repo to fan out across. Accepted as a
-    /// basename or absolute path (canonical lookup happens via
-    /// `repo_basenames` on the daemon side).
+    /// makes this a real filter, not the primary matching key: when
+    /// `None`, the matcher walks `RepoState.commits` chronologically
+    /// and returns the next reviewable commit needing the caller's
+    /// role. When `Some(p)`, the same chronological walk applies but
+    /// only commits whose `CommitNode.plans` contains `p` count.
+    ///
+    /// Empty-string values are coerced to `None` for wire
+    /// compatibility (the existing shim contract serializes the
+    /// missing case as `""`).
+    #[serde(default, deserialize_with = "deserialize_empty_as_none")]
+    pub plan_id: Option<String>,
+    /// Optional repo scope. Required when `plan_id` is `None` so the
+    /// matcher knows which repo to walk. Accepted as a basename
+    /// (looked up in `repo_basenames`) or an absolute path
+    /// (canonicalized via `dunce`).
     #[serde(default)]
     pub repo: Option<String>,
     /// Optional on the wire so schema-strict MCP clients allow the shim
@@ -57,6 +62,18 @@ pub struct WaitArgs {
     pub author_label: Option<String>,
     #[serde(default)]
     pub timeout_secs: Option<u64>,
+}
+
+/// Coerce `""` to `None` at deserialization. Lets the wire keep
+/// emitting `""` for "no plan filter" (shim back-compat) while the
+/// Rust model uses a clean `Option<String>` with no empty-string
+/// sentinel.
+fn deserialize_empty_as_none<'de, D>(d: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let opt = Option::<String>::deserialize(d)?;
+    Ok(opt.filter(|s| !s.trim().is_empty()))
 }
 
 /// Re-export `WaitForWorkResponse` from the wire crate as `WaitResponse`
@@ -105,7 +122,7 @@ pub async fn wait_for_work(runtime: &Runtime, args: WaitArgs) -> Result<WaitResp
     let started_at = Instant::now();
     let mut rx = runtime.subscribe_events();
 
-    if let Some(m) = compute_match(runtime, plan_filter.as_ref(), role, &author).await? {
+    if let Some(m) = compute_match(runtime, &plan_filter, role, &author).await? {
         let payload = enrich_for_wait(runtime, m, role, &author).await;
         return Ok(WaitResponse::Work(payload));
     }
@@ -122,16 +139,14 @@ pub async fn wait_for_work(runtime: &Runtime, args: WaitArgs) -> Result<WaitResp
         }
         match tokio::time::timeout(remaining, rx.recv()).await {
             Ok(Ok(_event)) => {
-                if let Some(m) = compute_match(runtime, plan_filter.as_ref(), role, &author).await?
-                {
+                if let Some(m) = compute_match(runtime, &plan_filter, role, &author).await? {
                     let payload = enrich_for_wait(runtime, m, role, &author).await;
                     return Ok(WaitResponse::Work(payload));
                 }
             }
             Ok(Err(RecvError::Lagged(_))) => {
                 rx = runtime.subscribe_events();
-                if let Some(m) = compute_match(runtime, plan_filter.as_ref(), role, &author).await?
-                {
+                if let Some(m) = compute_match(runtime, &plan_filter, role, &author).await? {
                     let payload = enrich_for_wait(runtime, m, role, &author).await;
                     return Ok(WaitResponse::Work(payload));
                 }
@@ -147,28 +162,31 @@ pub async fn wait_for_work(runtime: &Runtime, args: WaitArgs) -> Result<WaitResp
     }
 }
 
-/// Resolve the (plan_id, repo) inputs into a `PlanFilter`.
+/// Resolve the (plan_id, repo) inputs into a `PlanFilter`. Returns
+/// `PlanFilter` directly — no `Option<PlanFilter>` masquerading as
+/// "maybe absent" since the matcher always operates against a
+/// concrete scope.
 ///
-/// - `plan_id` present → `PlanFilter::Plan(parsed_id)`.
-/// - `plan_id` empty, `repo` present → `PlanFilter::RepoScope(repo_ref)`.
-/// - both empty → `WaitError::MissingRepoForRepoScope`.
-fn parse_plan_filter(args: &WaitArgs) -> Result<Option<PlanFilter>, WaitError> {
-    if !args.plan_id.is_empty() {
-        let id = crate::lifecycle::PlanId::parse(&args.plan_id)
+/// - `plan_id` present → `PlanFilter::Plan(parsed_id)`. (The plan id
+///   itself carries the repo via `<basename>/<stem>.md`.)
+/// - `plan_id` absent, `repo` present → `PlanFilter::RepoScope`.
+/// - both absent → `WaitError::MissingRepoForRepoScope`.
+fn parse_plan_filter(args: &WaitArgs) -> Result<PlanFilter, WaitError> {
+    if let Some(s) = args.plan_id.as_deref() {
+        let id = crate::lifecycle::PlanId::parse(s)
             .map_err(|e| WaitError::InvalidPlanId(e.to_string()))?;
-        return Ok(Some(PlanFilter::Plan(id)));
+        return Ok(PlanFilter::Plan(id));
     }
     match args.repo.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
-        Some(repo) => Ok(Some(PlanFilter::RepoScope(repo.to_string()))),
+        Some(repo) => Ok(PlanFilter::RepoScope(repo.to_string())),
         None => Err(WaitError::MissingRepoForRepoScope),
     }
 }
 
 /// Where the matcher should look for work. Phase 3 of
-/// `commit-first-review-model` distinguishes a single-plan filter
-/// from a repo-wide scan; Phase 4 will add an `AdHoc` ad-hoc-commits
-/// scope (today repo-scope already includes them once they become
-/// reviewable).
+/// `commit-first-review-model` makes this a real two-variant
+/// `enum` rather than an `Option<PlanFilter>`: every wait targets
+/// either one specific plan or the whole repo's commit stream.
 #[derive(Debug, Clone)]
 pub(crate) enum PlanFilter {
     Plan(crate::lifecycle::PlanId),
@@ -199,28 +217,33 @@ pub(crate) struct WaitMatch {
     pub current_target_sha: Option<CommitSha>,
 }
 
-/// Snapshot candidate(s) under lock, release, then per-candidate
-/// derive worktree status + build the work payload. Returns the
-/// first plan needing the caller's role.
+/// Walk the repo's commit stream chronologically and return the
+/// first commit whose gate needs the caller's role (and that the
+/// caller has not already voted on, for reviewer waits). Phase 3 of
+/// `commit-first-review-model`: the reviewable unit is the commit,
+/// not the plan, so the matcher iterates `RepoState.commits` by
+/// `author_ts` instead of fanning out over plans by name.
 ///
-/// - `PlanFilter::Plan(id)` → behavior unchanged from pre-Phase-3:
-///   one candidate, return it if it produces a match.
-/// - `PlanFilter::RepoScope(repo)` → enumerate all active visible
-///   plans in the resolved repo, try matching each (in plan-key
-///   order), return the first one that produces work. Today's
-///   ordering matches the BTreeMap iteration over `plans`; the
-///   per-commit chronological-walk Phase 4 introduces only changes
-///   how ad hoc commits join the candidate stream.
+/// - `PlanFilter::Plan(id)` filters the same chronological walk to
+///   only commits whose `CommitNode.plans` contains `id.key()`.
+/// - `PlanFilter::RepoScope(repo)` walks every commit in the
+///   resolved repo.
+///
+/// Per-plan supersession is preserved: within a plan, only the
+/// LATEST reviewable commit's gate drives work. The walk implements
+/// this by tracking which plans we've already surfaced and skipping
+/// older commits on the same plan in a reverse-chronological
+/// pre-pass; see `collect_active_commit_candidates`.
 async fn compute_match(
     runtime: &Runtime,
-    filter: Option<&PlanFilter>,
+    filter: &PlanFilter,
     role: WaitingRole,
     author: &AgentLabel,
 ) -> Result<Option<WaitMatch>, WaitError> {
     let candidates = {
         let trinity_arc = runtime.state();
         let trinity = trinity_arc.lock().await;
-        collect_candidates(&trinity, filter)?
+        collect_active_commit_candidates(&trinity, filter)?
     };
 
     for candidate in candidates {
@@ -529,18 +552,31 @@ struct Candidate {
     review_target_kind: Option<crate::repo_state::CommitKind>,
 }
 
-fn collect_candidates(
+/// Build the chronologically-ordered candidate stream for `filter`.
+///
+/// For the per-plan filter, this is exactly the legacy behavior:
+/// one candidate built from that plan's latest reviewable commit.
+///
+/// For the repo-scope filter, the algorithm walks the repo's commit
+/// map and returns one candidate per active plan, ordered by the
+/// timestamp of THAT plan's latest reviewable commit (oldest-first).
+/// Per-plan supersession is preserved (a plan with multiple
+/// reviewable commits is represented once, by its latest), and
+/// across plans the order is commit-chronological rather than
+/// plan-key-alphabetical. Frozen plans and plan conflicts are
+/// skipped: a long-frozen plan's SessionFinished result must not
+/// starve real active work.
+fn collect_active_commit_candidates(
     trinity: &Trinity,
-    filter: Option<&PlanFilter>,
+    filter: &PlanFilter,
 ) -> Result<Vec<Candidate>, WaitError> {
     match filter {
-        Some(PlanFilter::Plan(plan_id)) => Ok(vec![collect_candidate_by_plan(trinity, plan_id)?]),
-        Some(PlanFilter::RepoScope(repo)) => collect_candidates_for_repo(trinity, repo),
-        None => Err(WaitError::MissingRepoForRepoScope),
+        PlanFilter::Plan(plan_id) => Ok(vec![collect_candidate_by_plan(trinity, plan_id)?]),
+        PlanFilter::RepoScope(repo) => collect_repo_scope_candidates(trinity, repo),
     }
 }
 
-fn collect_candidates_for_repo(
+fn collect_repo_scope_candidates(
     trinity: &Trinity,
     repo_ref: &str,
 ) -> Result<Vec<Candidate>, WaitError> {
@@ -549,23 +585,53 @@ fn collect_candidates_for_repo(
         .repos
         .get(&repo_root)
         .ok_or_else(|| WaitError::UnknownRepo(repo_ref.to_string()))?;
-    Ok(repo_state
-        .plans
-        .iter()
-        .filter(|(key, plan)| {
-            // Repo-scope "what next?" excludes terminal plans so a
-            // single SessionFinished result for a long-frozen plan
-            // doesn't starve real active work in the same repo. The
-            // explicit-plan path still lets callers see
-            // SessionFinished on a specific plan when they ask for it
-            // by id. Plan conflicts and uncommitted-deleted plans are
-            // skipped here for the same reason: they're never
-            // actionable repo-scope.
-            !repo_state.plan_conflicts.contains_key(*key) && !plan.is_frozen()
-        })
-        .map(|(key, plan)| {
-            let plan_id = crate::lifecycle::PlanId::new(basename.clone(), key.clone());
-            build_candidate(repo_root.clone(), plan_id, plan, repo_state)
+
+    // Walk the commit map. For each reviewable commit attributed to
+    // a single non-frozen plan, record `(plan_key, author_ts, sha)`.
+    // After the walk, keep only the LATEST reviewable commit per
+    // plan (supersession), then order by that commit's author_ts so
+    // chronologically-earlier plans surface first.
+    let mut per_plan_latest: BTreeMap<PlanKey, (i64, CommitSha)> = BTreeMap::new();
+    for (sha, node) in &repo_state.commits {
+        if node.gate.is_none() {
+            continue;
+        }
+        let plan_key = match &node.attribution {
+            crate::repo_state::CommitAttribution::Plan { plan } => plan.clone(),
+            _ => continue,
+        };
+        if repo_state.plan_conflicts.contains_key(&plan_key) {
+            continue;
+        }
+        let Some(plan) = repo_state.plans.get(&plan_key) else {
+            continue;
+        };
+        if plan.is_frozen() {
+            continue;
+        }
+        match per_plan_latest.get(&plan_key) {
+            Some((ts, _)) if *ts >= node.author_ts => {}
+            _ => {
+                per_plan_latest.insert(plan_key, (node.author_ts, sha.clone()));
+            }
+        }
+    }
+
+    // Sort plans by their latest-reviewable-commit timestamp
+    // ascending, ties broken by plan key for determinism. This is
+    // the chronological order codex's review pins.
+    let mut ordered: Vec<(PlanKey, i64, CommitSha)> = per_plan_latest
+        .into_iter()
+        .map(|(key, (ts, sha))| (key, ts, sha))
+        .collect();
+    ordered.sort_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.as_str().cmp(b.0.as_str())));
+
+    Ok(ordered
+        .into_iter()
+        .filter_map(|(plan_key, _ts, _sha)| {
+            let plan = repo_state.plans.get(&plan_key)?;
+            let plan_id = crate::lifecycle::PlanId::new(basename.clone(), plan_key);
+            Some(build_candidate(repo_root.clone(), plan_id, plan, repo_state))
         })
         .collect())
 }
@@ -961,7 +1027,7 @@ mod integration_tests {
             .expect("tempdir has basename");
         WaitArgs {
             role,
-            plan_id: format!("{basename}/{sid}.md"),
+            plan_id: Some(format!("{basename}/{sid}.md")),
             author_label: Some(author.to_string()),
             timeout_secs: Some(2),
             repo: None,
@@ -1073,7 +1139,7 @@ mod integration_tests {
             .to_string();
         let repo_scope_args = WaitArgs {
             role: WaitingRole::Reviewers,
-            plan_id: String::new(),
+            plan_id: None,
             repo: Some(basename.clone()),
             author_label: Some("codex".to_string()),
             timeout_secs: Some(2),
@@ -1090,6 +1156,52 @@ mod integration_tests {
         );
     }
 
+    /// Phase 3 (commit-first-review-model) architectural regression:
+    /// repo-scope walks the COMMIT STREAM chronologically, not the
+    /// alphabetical plan map. Codex's example: introduce plan `zzz`
+    /// FIRST and plan `aaa` SECOND. Both have a reviewable plan_intro
+    /// needing the same reviewer. The plan-key-alphabetical order
+    /// would return aaa@commit-2, but the chronological order must
+    /// return zzz@commit-1.
+    #[tokio::test]
+    async fn repo_scope_returns_chronologically_earliest_plan_not_alphabetical() {
+        let dir = init_repo();
+        // Introduce zzz FIRST so its plan_intro has the older
+        // author_ts. Sleep a beat so author_ts differs deterministically.
+        write_file(dir.path(), ".trinity/plans/zzz.md", "# zzz\n");
+        commit(dir.path(), "intro zzz");
+        std::thread::sleep(std::time::Duration::from_secs(1));
+        write_file(dir.path(), ".trinity/plans/aaa.md", "# aaa\n");
+        commit(dir.path(), "intro aaa");
+        let rt = Runtime::new();
+        rt.add_repo(dir.path().to_path_buf()).await.unwrap();
+
+        let basename = dir
+            .path()
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap()
+            .to_string();
+        let args = WaitArgs {
+            role: WaitingRole::Reviewers,
+            plan_id: None,
+            repo: Some(basename),
+            author_label: Some("codex".to_string()),
+            timeout_secs: Some(2),
+        };
+        let resp = wait_for_work(&rt, args).await.unwrap();
+        let payload = match resp {
+            WaitResponse::Work(p) => p,
+            WaitResponse::Timeout(_) => panic!("expected work, got timeout"),
+        };
+        assert!(
+            payload.work.plans.iter().any(|p| p.ends_with("zzz.md")),
+            "repo-scope must return chronologically-earliest plan zzz first; \
+             got plans={:?} (this regresses to plan-key-alphabetical fan-out)",
+            payload.work.plans
+        );
+    }
+
     /// Phase 3 regression: empty plan_id + empty repo must error
     /// (the matcher needs a scope).
     #[tokio::test]
@@ -1102,7 +1214,7 @@ mod integration_tests {
 
         let no_scope_args = WaitArgs {
             role: WaitingRole::Reviewers,
-            plan_id: String::new(),
+            plan_id: None,
             repo: None,
             author_label: Some("codex".to_string()),
             timeout_secs: Some(2),
@@ -2004,7 +2116,7 @@ mod integration_tests {
         let rt = Runtime::new();
         let a = WaitArgs {
             role: WaitingRole::Reviewers,
-            plan_id: "no-such-repo/foo.md".to_string(),
+            plan_id: Some("no-such-repo/foo.md".to_string()),
             author_label: Some("codex".to_string()),
             timeout_secs: Some(1),
             repo: None,
@@ -2125,7 +2237,7 @@ mod integration_tests {
         let rt = Runtime::new();
         let a = WaitArgs {
             role: WaitingRole::Reviewers,
-            plan_id: "anywhere/foo.md".to_string(),
+            plan_id: Some("anywhere/foo.md".to_string()),
             author_label: None,
             timeout_secs: Some(1),
             repo: None,
@@ -2139,7 +2251,7 @@ mod integration_tests {
         let rt = Runtime::new();
         let a = WaitArgs {
             role: WaitingRole::Reviewers,
-            plan_id: "anywhere/foo.md".to_string(),
+            plan_id: Some("anywhere/foo.md".to_string()),
             author_label: Some("   ".to_string()),
             timeout_secs: Some(1),
             repo: None,
