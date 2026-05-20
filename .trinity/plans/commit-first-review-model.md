@@ -191,21 +191,58 @@ Config knob `review.require_commit_prefix` (bool, default
 
 ### Attribution algorithm (final)
 
+The order preserves today's "implementation commits inherit
+the active plan" behavior; the prefix is a stronger signal
+when present.
+
 For each commit during the fold:
 
-1. Parse the title for a `[...]` prefix.
-2. If prefix is `[misc]` → `AdHoc`.
-3. If prefix is `[name]` or `[name1,name2,…]` and every
-   name matches a known plan → `Plan(_)` / `MultiPlan(_)`.
-4. If prefix is `[name…]` with at least one unknown name
-   → `AdHoc` + warning attached to the commit's gate
-   (surfaced on next master wake; non-blocking).
-5. No prefix → file-touched attribution:
-   - touches exactly one plan file → `Plan(_)`
-   - touches >1 plan file → `MultiPlan(_)`
-   - touches no plan file → `AdHoc`
-6. Strict mode: any path through (4) or (5) instead emits
-   the synthetic `FixCommitTitle` master work item.
+1. **Explicit prefix wins.** Parse the title for `[…]`.
+   - `[misc]` → `AdHoc`. Overrides incidental plan-file
+     touches (e.g. a typo fix on a plan file titled `[misc]`
+     stays AdHoc).
+   - `[name]` / `[name1,name2,…]` with every name matching
+     a known plan → `Plan(_)` / `MultiPlan(_)`.
+   - `[name…]` with at least one unknown name → `AdHoc` +
+     warning attached to the gate. NOT a hard error.
+2. **No prefix, touches plan files** → `Plan(_)` /
+   `MultiPlan(_)` from the touched files. Non-strict mode
+   warns ("commit `abc1234` touches plan-a but no `[plan-a]`
+   prefix; consider amending the title").
+3. **No prefix, touches no plan file, unambiguous
+   active/last-touched plan context** → attributed to that
+   plan. This is today's behavior; impl commits in the
+   middle of a plan keep inheriting the plan they belong
+   to. "Unambiguous" = exactly one plan is currently active
+   (visible, not frozen) AND/OR the most recently touched
+   plan in the chain is clearly the working context. The
+   exact predicate is the one the existing attribution
+   module uses today; the rename to `CommitAttribution`
+   doesn't change it.
+4. **No prefix, no plan-file touch, ambiguous or missing
+   context** → `AdHoc`. The commit is genuinely not tied
+   to any plan and the fold has no way to infer one.
+
+### Strict mode (`require_commit_prefix=true`)
+
+Strict mode does NOT erase the fallback logic — it shifts
+the consequence. The classifier still runs (1–4) to compute
+the inferred attribution and an explanation, then:
+
+- Step 2 fallback (touched plan files, no matching prefix) →
+  `FixCommitTitle { sha, suggested_prefix:
+  "[<touched-plans>]" }`.
+- Step 3 fallback (active/last-touched plan inferred) →
+  `FixCommitTitle { sha, suggested_prefix: "[<that-plan>]" }`.
+- Step 4 (genuine ad hoc, unambiguous) → `FixCommitTitle`
+  with `suggested_prefix: "[misc]"`.
+- Ambiguous case (multiple plausible plans, no prefix) →
+  master work explaining the ambiguity and asking for
+  `[plan]`, `[plan-one,plan-two]`, or `[misc]`. No
+  suggested_prefix; the model can't pick.
+
+Reviewers do not wake on any commit while a
+`FixCommitTitle` is outstanding for it.
 
 The warning + the `FixCommitTitle` synthetic work item are
 the only NEW outputs this section adds; everything else is
@@ -368,13 +405,25 @@ refactor can land in one chunk and the wire changes follow.
   that incidentally touches a plan file classifies as
   `AdHoc`; a commit prefixed `[plan-a]` that touches only
   unrelated files classifies as `Plan(plan-a)`.
+- Unit: unprefixed impl commit (no plan-file touch) with
+  exactly one active/last-touched plan → `Plan(that-plan)`.
+  This guards today's behavior.
+- Unit: unprefixed commit, no plan-file touch, no plan
+  context (fresh repo or all plans frozen) → `AdHoc`.
+- Unit: unprefixed commit with ambiguous plan context →
+  non-strict mode warns; strict mode surfaces master work
+  asking for an explicit `[plan]` / `[plan-list]` /
+  `[misc]` (no `suggested_prefix` in the ambiguous case).
 - Integration: an unknown-plan prefix produces an
   `AdHoc`-classified gate AND a warning that rides along on
-  the next master wake.
-- Integration: `require_commit_prefix=true` causes a
-  prefix-less commit to surface as
-  `WorkAction::FixCommitTitle` for the master, and reviewers
-  do NOT wake on the commit until the title is amended.
+  the next master wake. NOT a hard fold error.
+- Integration: `require_commit_prefix=true` →
+  - unprefixed commit with inferred active plan →
+    `FixCommitTitle { suggested_prefix: "[that-plan]" }`;
+  - unprefixed commit with no plan context →
+    `FixCommitTitle { suggested_prefix: "[misc]" }`;
+  - reviewers do NOT wake on the commit until the title
+    is amended.
 - Regression: every existing per-plan `wait_for_work` test
   continues to pass with `plan_id` supplied.
 
