@@ -762,6 +762,7 @@ pub fn apply_commit(state: &mut RepoState, carry: &mut FoldCarry, event: &Commit
     //    one authoritative-per-commit attribution. The existing matcher
     //    still reads `Plan.timeline`; Phase 2 makes this map
     //    authoritative.
+    let known_plans: BTreeSet<PlanKey> = state.plans.keys().cloned().collect();
     let commit_node = build_commit_node(
         &commit_sha,
         event,
@@ -771,6 +772,7 @@ pub fn apply_commit(state: &mut RepoState, carry: &mut FoldCarry, event: &Commit
         &plans_finalized_here,
         single_plan_kind.as_ref(),
         single_plan_gate,
+        &known_plans,
     );
     state.commits.insert(commit_sha.clone(), commit_node);
     state.commit_order.push(commit_sha.clone());
@@ -801,6 +803,7 @@ fn build_commit_node(
     plans_finalized_here: &BTreeSet<PlanKey>,
     single_plan_kind: Option<&(PlanKey, CommitKind)>,
     single_plan_gate: Option<CommitGate>,
+    known_plans: &BTreeSet<PlanKey>,
 ) -> CommitNode {
     let touched_plans: BTreeSet<PlanKey> = active_changes
         .plan_touches
@@ -812,7 +815,14 @@ fn build_commit_node(
     plans.extend(plans_with_event.iter().cloned());
     plans.extend(plans_finalized_here.iter().cloned());
 
-    let attribution = if touched_plans.len() >= 2 {
+    // Phase 5 of `commit-first-review-model`: parse the commit
+    // subject's `[…]` prefix. Explicit `[misc]` forces AdHoc;
+    // `[plan-name]` / `[plan-one,plan-two]` forces the named
+    // attribution. Unknown plan names degrade to AdHoc with a
+    // warning. No prefix falls through to file/active-plan
+    // inference.
+    let prefix = parse_title_prefix(&event.subject);
+    let inferred = if touched_plans.len() >= 2 {
         CommitAttribution::MultiPlan {
             plans: touched_plans.clone(),
         }
@@ -826,6 +836,8 @@ fn build_commit_node(
     } else {
         CommitAttribution::AdHoc
     };
+
+    let (attribution, attribution_warning) = apply_prefix(prefix, inferred, known_plans);
 
     let (kind, gate) = match &attribution {
         CommitAttribution::Plan { .. } => {
@@ -848,6 +860,95 @@ fn build_commit_node(
         attribution,
         plans,
         gate,
+        attribution_warning,
+    }
+}
+
+/// Parsed commit-title prefix per Phase 5 of
+/// `commit-first-review-model`. A subject like `[plan-a] doing X`
+/// returns `Some(Plans(["plan-a"]))`; `[misc]` returns `Some(Misc)`;
+/// anything else returns `None`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TitlePrefix {
+    /// Explicit out-of-plan marker. Overrides file inference.
+    Misc,
+    /// One or more plan names listed in the prefix. May contain
+    /// invalid names; the classifier degrades to AdHoc + warning
+    /// when any name doesn't match a known plan.
+    Plans(Vec<String>),
+}
+
+/// Parse a `[xxx]` prefix off the start of `subject`. Returns
+/// `None` if the subject doesn't start with `[`. The prefix's
+/// content is comma-split; `[misc]` (case-insensitive) is special.
+pub fn parse_title_prefix(subject: &str) -> Option<TitlePrefix> {
+    let trimmed = subject.trim_start();
+    let rest = trimmed.strip_prefix('[')?;
+    let close = rest.find(']')?;
+    let inner = &rest[..close];
+    if inner.is_empty() {
+        return None;
+    }
+    let names: Vec<String> = inner
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+    if names.is_empty() {
+        return None;
+    }
+    if names.len() == 1 && names[0].eq_ignore_ascii_case("misc") {
+        return Some(TitlePrefix::Misc);
+    }
+    Some(TitlePrefix::Plans(names))
+}
+
+/// Apply the parsed prefix to the inferred attribution per the
+/// 4-step algorithm in the plan. The prefix wins when present and
+/// valid; unknown plan names degrade to AdHoc with a warning;
+/// `[misc]` forces AdHoc; no prefix preserves the inferred result.
+fn apply_prefix(
+    prefix: Option<TitlePrefix>,
+    inferred: CommitAttribution,
+    known_plans: &BTreeSet<PlanKey>,
+) -> (CommitAttribution, Option<String>) {
+    let prefix = match prefix {
+        Some(p) => p,
+        None => return (inferred, None),
+    };
+    match prefix {
+        TitlePrefix::Misc => (CommitAttribution::AdHoc, None),
+        TitlePrefix::Plans(names) => {
+            let parsed: Vec<Result<PlanKey, String>> = names
+                .iter()
+                .map(|n| PlanKey::parse(n).map_err(|_| n.clone()))
+                .collect();
+            let unknown: Vec<String> = parsed
+                .iter()
+                .filter_map(|r| match r {
+                    Ok(k) if known_plans.contains(k) => None,
+                    Ok(k) => Some(k.as_str().to_string()),
+                    Err(s) => Some(s.clone()),
+                })
+                .collect();
+            if !unknown.is_empty() {
+                let warning = format!(
+                    "commit-title prefix names unknown plan(s): {}; treated as ad hoc — amend to `[misc]` or a known plan name to silence",
+                    unknown.join(", ")
+                );
+                return (CommitAttribution::AdHoc, Some(warning));
+            }
+            let valid_keys: BTreeSet<PlanKey> = parsed.into_iter().flatten().collect();
+            if valid_keys.len() == 1 {
+                let plan = valid_keys.into_iter().next().unwrap();
+                (CommitAttribution::Plan { plan }, None)
+            } else {
+                (
+                    CommitAttribution::MultiPlan { plans: valid_keys },
+                    None,
+                )
+            }
+        }
     }
 }
 

@@ -245,7 +245,7 @@ async fn compute_match(
     role: WaitingRole,
     author: &AgentLabel,
 ) -> Result<Option<WaitMatch>, WaitError> {
-    let (candidates, config) = {
+    let (candidates, config, prefix_violations) = {
         let trinity_arc = runtime.state();
         let trinity = trinity_arc.lock().await;
         let candidates = collect_active_commit_candidates(&trinity, filter)?;
@@ -253,12 +253,44 @@ async fn compute_match(
         // candidates share a repo by construction). Empty candidate
         // list → no matches anyway; config doesn't matter.
         let repo_root = candidates.first().map(|c| c.repo_root.clone());
-        let config = match repo_root {
-            Some(root) => crate::cli::config::load(&root),
+        let config = match repo_root.as_ref() {
+            Some(root) => crate::cli::config::load(root),
             None => crate::cli::config::Config::default(),
         };
-        (candidates, config)
+        // Phase 5: collect strict-mode prefix violations (commits
+        // with an attribution_warning OR an inferred attribution
+        // from no-prefix subjects). Walked once here so the matcher
+        // surfaces master FixCommitTitle work BEFORE any per-plan
+        // reviewer wakes; reviewers do not wake on commits with a
+        // strict-mode violation until the master amends.
+        let prefix_violations: Vec<PrefixViolation> = if config.review.require_commit_prefix {
+            repo_root
+                .as_ref()
+                .and_then(|root| trinity.repos.get(root))
+                .map(|state| collect_prefix_violations(state))
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        (candidates, config, prefix_violations)
     };
+
+    // Strict-mode FixCommitTitle takes priority over all other work
+    // — both master and reviewer waits return a master action so
+    // the agent loop addresses the title first. Reviewers do NOT
+    // wake while violations exist; the master must amend.
+    if !prefix_violations.is_empty() && matches!(role, WaitingRole::Master) {
+        if let Some(first) = prefix_violations.first() {
+            return Ok(Some(build_fix_commit_title_match(first)));
+        }
+    }
+    // Reviewer waits also block on outstanding violations, but
+    // they return no work (the master should amend before the
+    // reviewer can vote). Timeout is the right outcome — no
+    // partial work surfaces.
+    if !prefix_violations.is_empty() && matches!(role, WaitingRole::Reviewers) {
+        return Ok(None);
+    }
 
     for candidate in candidates {
         if let Some(m) = try_match_candidate(candidate, role, author, &config)? {
@@ -266,6 +298,87 @@ async fn compute_match(
         }
     }
     Ok(None)
+}
+
+/// One commit's prefix-convention violation under strict mode.
+/// Populated from `CommitNode.attribution_warning` (unknown plan in
+/// prefix) OR from inferred no-prefix attribution (any commit
+/// whose subject lacks a `[…]` prefix and would otherwise be
+/// classified by file/active-plan inference).
+struct PrefixViolation {
+    repo_root: std::path::PathBuf,
+    sha: CommitSha,
+    suggested_prefix: Option<String>,
+}
+
+fn collect_prefix_violations(state: &crate::repo_state::RepoState) -> Vec<PrefixViolation> {
+    let mut out = Vec::new();
+    for sha in &state.commit_order {
+        let Some(node) = state.commits.get(sha) else {
+            continue;
+        };
+        // Skip non-reviewable kinds that don't have attribution
+        // meaning (e.g. Finalize commits, MultiPlan). Strict mode
+        // governs commits that COULD be attributed.
+        if matches!(
+            node.kind,
+            crate::repo_state::CommitKind::Finalize | crate::repo_state::CommitKind::MultiPlan
+        ) {
+            continue;
+        }
+        let has_prefix =
+            crate::disk_snapshot::parse_title_prefix(&node.subject).is_some();
+        if has_prefix && node.attribution_warning.is_none() {
+            continue;
+        }
+        if has_prefix && node.attribution_warning.is_some() {
+            // Prefix was present but named an unknown plan; the
+            // suggested_prefix can't be derived without
+            // ambiguity. Caller-side: the master should choose.
+            out.push(PrefixViolation {
+                repo_root: state.root.clone(),
+                sha: sha.clone(),
+                suggested_prefix: None,
+            });
+            continue;
+        }
+        // No prefix. Suggest based on the inferred attribution.
+        let suggested = match &node.attribution {
+            crate::repo_state::CommitAttribution::Plan { plan } => {
+                Some(format!("[{}]", plan.as_str()))
+            }
+            crate::repo_state::CommitAttribution::AdHoc => Some("[misc]".to_string()),
+            crate::repo_state::CommitAttribution::MultiPlan { plans } => {
+                let names: Vec<&str> = plans.iter().map(|p| p.as_str()).collect();
+                Some(format!("[{}]", names.join(",")))
+            }
+            crate::repo_state::CommitAttribution::Finalize { .. } => continue,
+        };
+        out.push(PrefixViolation {
+            repo_root: state.root.clone(),
+            sha: sha.clone(),
+            suggested_prefix: suggested,
+        });
+    }
+    out
+}
+
+fn build_fix_commit_title_match(violation: &PrefixViolation) -> WaitMatch {
+    let payload = trinity_core::api::WorkPayload {
+        plans: Vec::new(),
+        plan_id: String::new(),
+        repo: violation.repo_root.to_string_lossy().into_owned(),
+        action: trinity_core::api::ExpectedAction::FixCommitTitle {
+            target_sha: violation.sha.as_str().to_string(),
+            suggested_prefix: violation.suggested_prefix.clone(),
+        },
+    };
+    WaitMatch {
+        payload,
+        repo_root: violation.repo_root.clone(),
+        plan_key: None,
+        current_target_sha: Some(violation.sha.clone()),
+    }
 }
 
 /// Per-candidate matching: status check, role gate, caller-already-
@@ -505,7 +618,10 @@ async fn enrich_for_wait(
                 opportunistic_fill(runtime, &repo_root, author, path, content).await;
             }
         }
-        A::CommitPlanRevision { .. } | A::StartImplementation { .. } | A::SessionFinished => {}
+        A::CommitPlanRevision { .. }
+        | A::StartImplementation { .. }
+        | A::SessionFinished
+        | A::FixCommitTitle { .. } => {}
     }
 
     // Stale-review walks are plan-scoped (they walk the plan's
@@ -1063,6 +1179,7 @@ mod tests {
             CommitPlanRevision { plan_path } => vec![plan_path],
             StartImplementation { plan_path, .. } => vec![plan_path],
             SessionFinished => Vec::new(),
+            FixCommitTitle { .. } => Vec::new(),
         }
     }
 
@@ -1313,6 +1430,7 @@ mod integration_tests {
             CommitPlanRevision { .. } => "commit_plan_revision",
             StartImplementation { .. } => "start_implementation",
             SessionFinished => "session_finished",
+            FixCommitTitle { .. } => "fix_commit_title",
         }
     }
 
@@ -1336,6 +1454,7 @@ mod integration_tests {
             CommitPlanRevision { plan_path } => vec![plan_path.clone()],
             StartImplementation { plan_path, .. } => vec![plan_path.clone()],
             SessionFinished => Vec::new(),
+            FixCommitTitle { .. } => Vec::new(),
         }
     }
 
@@ -1582,6 +1701,150 @@ mod integration_tests {
             payload.work.plans.is_empty(),
             "ad hoc work has no plan attribution; got plans={:?}",
             payload.work.plans
+        );
+    }
+
+    /// Phase 5 of commit-first-review-model: `[misc]` prefix
+    /// overrides file-based inference. A commit that touches a plan
+    /// file but has subject `[misc] ...` classifies as `AdHoc`.
+    #[tokio::test]
+    async fn title_prefix_misc_overrides_plan_file_touch() {
+        let dir = init_repo();
+        write_file(dir.path(), ".trinity/plans/foo.md", "# foo\n");
+        // Note: the [misc] prefix is on the COMMIT subject, even
+        // though the diff touches a plan file.
+        run_git(dir.path(), &["add", "-A"]);
+        run_git(
+            dir.path(),
+            &["commit", "--quiet", "-m", "[misc] add typo fix"],
+        );
+        let rt = Runtime::new();
+        rt.add_repo(dir.path().to_path_buf()).await.unwrap();
+        let attribution = rt
+            .read_repo(dir.path(), |s| {
+                let sha = s.head.as_ref().unwrap().clone();
+                s.commits[&sha].attribution.clone()
+            })
+            .await
+            .unwrap();
+        assert!(
+            matches!(attribution, crate::repo_state::CommitAttribution::AdHoc),
+            "[misc] must force AdHoc; got {attribution:?}"
+        );
+    }
+
+    /// Phase 5: unknown plan name in prefix degrades to AdHoc with
+    /// a warning. NOT a hard fold error.
+    #[tokio::test]
+    async fn title_prefix_unknown_plan_degrades_to_ad_hoc_with_warning() {
+        let dir = init_repo();
+        write_file(dir.path(), "src.rs", "fn main() {}\n");
+        run_git(dir.path(), &["add", "-A"]);
+        run_git(
+            dir.path(),
+            &[
+                "commit",
+                "--quiet",
+                "-m",
+                "[no-such-plan] do stuff",
+            ],
+        );
+        let rt = Runtime::new();
+        rt.add_repo(dir.path().to_path_buf()).await.unwrap();
+        let (attribution, warning) = rt
+            .read_repo(dir.path(), |s| {
+                let sha = s.head.as_ref().unwrap().clone();
+                let node = &s.commits[&sha];
+                (node.attribution.clone(), node.attribution_warning.clone())
+            })
+            .await
+            .unwrap();
+        assert!(
+            matches!(attribution, crate::repo_state::CommitAttribution::AdHoc),
+            "unknown plan in prefix → AdHoc; got {attribution:?}"
+        );
+        let warning = warning.expect("attribution_warning must be set");
+        assert!(
+            warning.contains("no-such-plan"),
+            "warning must mention the unknown plan name; got {warning:?}"
+        );
+    }
+
+    /// Phase 5 strict mode: `require_commit_prefix=true` plus an
+    /// unprefixed commit → master gets `FixCommitTitle` with the
+    /// inferred plan as the suggested prefix; reviewer waits time
+    /// out until the master amends.
+    #[tokio::test]
+    async fn strict_mode_emits_fix_commit_title_for_unprefixed_commit() {
+        let dir = init_repo();
+        write_file(
+            dir.path(),
+            ".trinity/config.json",
+            r#"{"review": {"require_commit_prefix": true}}"#,
+        );
+        write_file(dir.path(), ".trinity/plans/foo.md", "# foo\n");
+        // Unprefixed subject — strict mode flags this.
+        run_git(dir.path(), &["add", "-A"]);
+        run_git(dir.path(), &["commit", "--quiet", "-m", "intro foo"]);
+        let rt = Runtime::new();
+        rt.add_repo(dir.path().to_path_buf()).await.unwrap();
+
+        let basename = dir
+            .path()
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap()
+            .to_string();
+
+        // Master gets FixCommitTitle.
+        let resp = wait_for_work(
+            &rt,
+            WaitArgs {
+                role: WaitingRole::Master,
+                plan_id: None,
+                repo: Some(basename.clone()),
+                author_label: Some("lloyd".to_string()),
+                timeout_secs: Some(1),
+            },
+        )
+        .await
+        .unwrap();
+        match resp {
+            WaitResponse::Work(p) => {
+                use trinity_core::api::ExpectedAction;
+                match p.work.action {
+                    ExpectedAction::FixCommitTitle {
+                        target_sha,
+                        suggested_prefix,
+                    } => {
+                        assert!(!target_sha.is_empty());
+                        let prefix = suggested_prefix.expect("inferred prefix");
+                        assert_eq!(prefix, "[foo]");
+                    }
+                    other => {
+                        panic!("expected FixCommitTitle in strict mode; got {other:?}")
+                    }
+                }
+            }
+            WaitResponse::Timeout(_) => panic!("expected FixCommitTitle work, got timeout"),
+        }
+
+        // Reviewer wait MUST time out — no review until amend.
+        let resp = wait_for_work(
+            &rt,
+            WaitArgs {
+                role: WaitingRole::Reviewers,
+                plan_id: None,
+                repo: Some(basename),
+                author_label: Some("codex".to_string()),
+                timeout_secs: Some(1),
+            },
+        )
+        .await
+        .unwrap();
+        assert!(
+            matches!(resp, WaitResponse::Timeout(_)),
+            "reviewer must not wake while FixCommitTitle is outstanding; got {resp:?}"
         );
     }
 
@@ -2033,7 +2296,10 @@ mod integration_tests {
                     r.content = None;
                 }
             }
-            CommitPlanRevision { .. } | StartImplementation { .. } | SessionFinished => {}
+            CommitPlanRevision { .. }
+            | StartImplementation { .. }
+            | SessionFinished
+            | FixCommitTitle { .. } => {}
         }
     }
 

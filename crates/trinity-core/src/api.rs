@@ -453,6 +453,21 @@ pub enum ExpectedAction {
     },
     /// Plan is finalized; no further action.
     SessionFinished,
+    /// Phase 5 of `commit-first-review-model`: under strict mode
+    /// (`review.require_commit_prefix=true`) a commit lacking a
+    /// valid `[plan]` / `[plan-one,plan-two]` / `[misc]` title
+    /// prefix surfaces this as master work. The master is expected
+    /// to `git commit --amend` (or rebase) to add the prefix.
+    /// Reviewers do not wake on the commit until the prefix lands.
+    /// `suggested_prefix` is the classifier's best guess (the
+    /// inferred plan's name, or `[misc]` for genuine ad hoc with
+    /// no plan context). `None` only for the ambiguous case where
+    /// the classifier can't pick.
+    FixCommitTitle {
+        target_sha: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        suggested_prefix: Option<String>,
+    },
 }
 
 /// A plan file the caller may want to read. `content` is

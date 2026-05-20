@@ -691,6 +691,7 @@ mod tests {
             attribution: CommitAttribution::Plan { plan: foo.clone() },
             plans: [foo.clone()].into_iter().collect(),
             gate: Some(gate),
+            attribution_warning: None,
         };
         state.commits.insert(sha.clone(), node);
 
