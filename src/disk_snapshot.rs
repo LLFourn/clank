@@ -467,6 +467,15 @@ pub fn apply_commit(state: &mut RepoState, carry: &mut FoldCarry, event: &Commit
     let attr = classify(&active_changes, carry.current_effective.as_ref());
     carry.current_effective = effective_session(&active_changes, carry.current_effective.as_ref());
 
+    // Phase 5 of `commit-first-review-model`: parse the commit-
+    // title prefix BEFORE per-plan timeline construction so the
+    // prefix drives classification consistently. File-touch /
+    // walk-back inference becomes the fallback when no prefix is
+    // present. A `[plan-x]` prefix that names a known plan
+    // overrides `current_effective` so descendants of this commit
+    // inherit plan-x's chain even if they're unprefixed code.
+    let title_prefix = parse_title_prefix(&event.subject);
+
     // 2. Apply plan_touches: tree state + Plan create/delete.
     for touch in &event.changes.plan_touches {
         let is_delete = matches!(touch.kind, PlanTouchKind::Revision) && touch.new_path.is_none();
@@ -605,77 +614,59 @@ pub fn apply_commit(state: &mut RepoState, carry: &mut FoldCarry, event: &Commit
         }
     }
 
-    // 5. Per-plan classification + timeline append. For each non-frozen
-    //    plan, decide this commit's kind FOR THAT PLAN (PlanOnly /
-    //    CodeOnly / Mixed / MultiPlan) and append a single
-    //    `PlanTimelineEvent` carrying the kind, author_ts, subject,
-    //    and (for reviewable kinds) the computed gate. `Unattributed`
-    //    is not part of any plan's timeline and is skipped.
-    //
-    //    `active_changes` (not raw `event.changes`) drives this so a
-    //    commit touching both a frozen and an active plan does not
-    //    flip the active plan's classification to MultiPlan — sealing
-    //    must hide the frozen plan from per-plan classification too.
-    let distinct_plans_touched = active_changes
-        .plan_touches
-        .iter()
-        .map(|t| &t.session)
-        .collect::<BTreeSet<_>>()
-        .len();
-    let attr_session: Option<&PlanKey> = match &attr {
-        AttributionResult::Attributed {
-            session,
-            has_code_changes: true,
-            ..
-        } => Some(session),
-        _ => None,
-    };
+    // 5. Per-plan classification + timeline append. Phase 5 of
+    //    `commit-first-review-model` makes the title prefix the
+    //    primary signal: prefix-named plans become the attributed
+    //    set, file-touch/walk-back is the fallback. The same
+    //    classification drives both the per-plan timeline appends
+    //    AND CommitNode — no late override.
+    let known_plans: BTreeSet<PlanKey> = state.plans.keys().cloned().collect();
+    let classification = classify_effective(
+        title_prefix.as_ref(),
+        &active_changes,
+        &attr,
+        &plans_finalized_here,
+        &known_plans,
+    );
 
-    // Track which plans this commit ends up attributed-to (per-plan timeline
-    // event of any kind). Combined with `plans_finalized_here` below to build
-    // the repo-wide `CommitNode.plans` set.
+    // If the prefix named a known plan that today's effective_session
+    // didn't track, propagate it forward so unprefixed descendants
+    // inherit the prefix-chosen chain.
+    if let CommitAttribution::Plan { plan } = &classification.attribution
+        && carry.current_effective.as_ref() != Some(plan)
+        && title_prefix.is_some()
+    {
+        carry.current_effective = Some(plan.clone());
+    }
+
     let mut plans_with_event: BTreeSet<PlanKey> = plans_finalized_here.clone();
-    // The per-plan kind for whichever plan owns this commit's reviewable
-    // event — used as the repo-wide `CommitNode.kind` when attribution is
-    // single-plan. `None` when the commit produced no reviewable per-plan
-    // event.
     let mut single_plan_kind: Option<(PlanKey, CommitKind)> = None;
-    // The single-plan gate (Phase 2 of commit-first-review-model). When
-    // exactly one plan claims this commit as a reviewable event, the
-    // gate lands on `CommitNode.gate` indexed by SHA. MultiPlan / multi-
-    // touch commits leave this `None`.
     let mut single_plan_gate: Option<CommitGate> = None;
 
-    let plan_keys: Vec<PlanKey> = state.plans.keys().cloned().collect();
-    for plan_key in &plan_keys {
+    for plan_key in &classification.plans_in_scope {
         if is_frozen(state, plan_key) {
+            continue;
+        }
+        if !state.plans.contains_key(plan_key) {
+            // Prefix named a known plan whose entry was deleted in
+            // this commit (rare). Skip silently — the timeline
+            // anchor is gone.
             continue;
         }
         let our_touch = active_changes
             .plan_touches
             .iter()
             .find(|t| &t.session == plan_key);
-        let has_code_for_plan = attr_session == Some(plan_key);
-        let kind = if our_touch.is_some() {
-            if distinct_plans_touched >= 2 {
-                CommitKind::MultiPlan
-            } else if has_code_for_plan {
-                CommitKind::Mixed
-            } else {
-                CommitKind::PlanOnly
-            }
-        } else if has_code_for_plan {
-            CommitKind::CodeOnly
-        } else {
-            CommitKind::Unattributed
-        };
+        let kind = per_plan_kind_for(
+            &classification.attribution,
+            plan_key,
+            our_touch,
+            active_changes.has_non_plan_code_changes,
+        );
         if matches!(kind, CommitKind::Unattributed) {
             continue;
         }
         let gate = if kind.is_reviewable() {
-            // Base fold: gates have no feedback yet. `attach_live_feedback`
-            // fills them in via `rebuild_plan_gates`. The state is
-            // Unreviewed with empty participant/approver/missing sets.
             Some(CommitGate {
                 state: CommitGateState::Unreviewed,
                 participants: Vec::new(),
@@ -692,24 +683,16 @@ pub fn apply_commit(state: &mut RepoState, carry: &mut FoldCarry, event: &Commit
         if event.author_ts > plan.last_activity_ts {
             plan.last_activity_ts = event.author_ts;
         }
-        // Feedback timestamps no longer enter here; `attach_live_feedback`
-        // bumps `last_activity_ts` from feedback mtimes after the base
-        // fold completes.
         let sha = commit_sha.clone();
         let author_ts = event.author_ts;
         let subject = event.subject.clone();
-        // Phase 2 of commit-first-review-model: the gate lives on the
-        // RepoState.commits map, not on the timeline event. The per-
-        // plan timeline retains its chronological role as a SHA list
-        // filtered by attribution; gate lookups thread through
-        // `state.gate_for(sha)`. Carry the gate forward to step 6.
         if let Some(g) = gate {
             if single_plan_gate.is_some() {
-                // Belt-and-braces: a commit reaching this branch for >1
-                // plan would be the MultiPlan case from step 5, whose
-                // kind isn't reviewable — so `gate` should be None here.
-                // If we somehow have two gates, drop them rather than
-                // pretend the commit has one canonical gate.
+                // Defensive: with a single-plan attribution, only one
+                // gate should be produced. If we hit two (shouldn't
+                // happen post-Phase 5 because plans_in_scope is
+                // {plan_x} for Plan(plan_x)), drop both rather than
+                // claim a canonical gate.
                 single_plan_gate = None;
             } else {
                 single_plan_gate = Some(g);
@@ -740,16 +723,11 @@ pub fn apply_commit(state: &mut RepoState, carry: &mut FoldCarry, event: &Commit
                 unreachable!("Finalize is handled in step 4; should not reach the per-plan append")
             }
             CommitKind::Unattributed => {
-                unreachable!("Unattributed is filtered out of the per-plan classifier")
+                unreachable!("Unattributed is filtered out by per_plan_kind_for")
             }
         };
         plan.timeline.push(timeline_event);
         plans_with_event.insert(plan_key.clone());
-        // Record the per-plan kind so step 6 can pick it up for the
-        // repo-wide CommitNode. A commit attributed to exactly one
-        // active plan via step 5 has a unique kind; for MultiPlan or
-        // Finalize-only commits this stays None and the step-6
-        // classifier picks the correct repo-wide kind on its own.
         if single_plan_kind.is_none() {
             single_plan_kind = Some((plan_key.clone(), kind));
         } else {
@@ -757,23 +735,42 @@ pub fn apply_commit(state: &mut RepoState, carry: &mut FoldCarry, event: &Commit
         }
     }
 
-    // 6. Build the repo-wide CommitNode. Phase 1 of
-    //    `commit-first-review-model`: shadow the per-plan timeline with
-    //    one authoritative-per-commit attribution. The existing matcher
-    //    still reads `Plan.timeline`; Phase 2 makes this map
-    //    authoritative.
-    let known_plans: BTreeSet<PlanKey> = state.plans.keys().cloned().collect();
-    let commit_node = build_commit_node(
-        &commit_sha,
-        event,
-        &active_changes,
-        &attr,
-        &plans_with_event,
-        &plans_finalized_here,
-        single_plan_kind.as_ref(),
-        single_plan_gate,
-        &known_plans,
-    );
+    // 6. Build the repo-wide CommitNode from the same effective
+    //    classification used for per-plan timeline appends. No late
+    //    override.
+    let kind_for_node = match &classification.attribution {
+        CommitAttribution::Plan { .. } => single_plan_kind
+            .as_ref()
+            .map(|(_, k)| *k)
+            .unwrap_or(CommitKind::Unattributed),
+        CommitAttribution::MultiPlan { .. } => CommitKind::MultiPlan,
+        CommitAttribution::Finalize { .. } => CommitKind::Finalize,
+        CommitAttribution::AdHoc => CommitKind::Unattributed,
+    };
+    let gate_for_node = match &classification.attribution {
+        CommitAttribution::Plan { .. } => single_plan_gate,
+        _ => None,
+    };
+    let mut commit_plans: BTreeSet<PlanKey> = BTreeSet::new();
+    commit_plans.extend(plans_with_event.iter().cloned());
+    commit_plans.extend(plans_finalized_here.iter().cloned());
+    // Plan-touched files always appear in CommitNode.plans even
+    // when the prefix excludes them from attribution (e.g.
+    // `[misc]` touching plan-foo.md still means foo's body
+    // tracked the new content in step 2 — record the touch).
+    for touch in &active_changes.plan_touches {
+        commit_plans.insert(touch.session.clone());
+    }
+    let commit_node = CommitNode {
+        sha: commit_sha.clone(),
+        author_ts: event.author_ts,
+        subject: event.subject.clone(),
+        kind: kind_for_node,
+        attribution: classification.attribution.clone(),
+        plans: commit_plans,
+        gate: gate_for_node,
+        attribution_warning: classification.warning,
+    };
     state.commits.insert(commit_sha.clone(), commit_node);
     state.commit_order.push(commit_sha.clone());
 
@@ -794,73 +791,149 @@ pub fn apply_commit(state: &mut RepoState, carry: &mut FoldCarry, event: &Commit
 /// got a reviewable event, and every plan that froze on this commit.
 /// `gate` mirrors the single-plan timeline event when attribution is
 /// `Plan(_)`; otherwise `None`.
-fn build_commit_node(
-    commit_sha: &CommitSha,
-    event: &CommitEvent,
+/// Effective classification for one commit, produced once at the
+/// top of `apply_commit` and consumed by both per-plan timeline
+/// construction and `CommitNode`. Phase 5 architectural fix
+/// (codex review on 94f1e5a): the prefix drives this; file-touch
+/// and walk-back inference is the fallback. Nothing downstream
+/// overrides the result.
+struct EffectiveClassification {
+    /// The CommitAttribution that goes on CommitNode.
+    attribution: CommitAttribution,
+    /// Plans whose timeline gets an event for this commit. Empty
+    /// for AdHoc; one entry for Plan(_); the full set for
+    /// MultiPlan/Finalize.
+    plans_in_scope: BTreeSet<PlanKey>,
+    /// Optional non-blocking warning attached to
+    /// `CommitNode.attribution_warning`. Set when the prefix
+    /// named at least one unknown plan and we degraded to AdHoc.
+    warning: Option<String>,
+}
+
+fn classify_effective(
+    prefix: Option<&TitlePrefix>,
     active_changes: &CommitChanges,
     attr: &AttributionResult,
-    plans_with_event: &BTreeSet<PlanKey>,
     plans_finalized_here: &BTreeSet<PlanKey>,
-    single_plan_kind: Option<&(PlanKey, CommitKind)>,
-    single_plan_gate: Option<CommitGate>,
     known_plans: &BTreeSet<PlanKey>,
-) -> CommitNode {
+) -> EffectiveClassification {
+    // Explicit prefix wins. Falls through to file-touch / walk-back
+    // when no prefix is present.
+    if let Some(prefix) = prefix {
+        match prefix {
+            TitlePrefix::Misc => {
+                return EffectiveClassification {
+                    attribution: CommitAttribution::AdHoc,
+                    plans_in_scope: BTreeSet::new(),
+                    warning: None,
+                };
+            }
+            TitlePrefix::Plans(names) => {
+                let parsed: Vec<Result<PlanKey, String>> = names
+                    .iter()
+                    .map(|n| PlanKey::parse(n).map_err(|_| n.clone()))
+                    .collect();
+                let unknown: Vec<String> = parsed
+                    .iter()
+                    .filter_map(|r| match r {
+                        Ok(k) if known_plans.contains(k) => None,
+                        Ok(k) => Some(k.as_str().to_string()),
+                        Err(s) => Some(s.clone()),
+                    })
+                    .collect();
+                if !unknown.is_empty() {
+                    let warning = format!(
+                        "commit-title prefix names unknown plan(s): {}; treated as ad hoc — amend to `[misc]` or a known plan name to silence",
+                        unknown.join(", ")
+                    );
+                    return EffectiveClassification {
+                        attribution: CommitAttribution::AdHoc,
+                        plans_in_scope: BTreeSet::new(),
+                        warning: Some(warning),
+                    };
+                }
+                let valid: BTreeSet<PlanKey> = parsed.into_iter().flatten().collect();
+                if valid.len() == 1 {
+                    let plan = valid.iter().next().cloned().unwrap();
+                    return EffectiveClassification {
+                        attribution: CommitAttribution::Plan { plan: plan.clone() },
+                        plans_in_scope: [plan].into_iter().collect(),
+                        warning: None,
+                    };
+                }
+                return EffectiveClassification {
+                    attribution: CommitAttribution::MultiPlan {
+                        plans: valid.clone(),
+                    },
+                    plans_in_scope: valid,
+                    warning: None,
+                };
+            }
+        }
+    }
+
+    // No prefix → fall through to today's file-touch /
+    // walk-back inference.
     let touched_plans: BTreeSet<PlanKey> = active_changes
         .plan_touches
         .iter()
         .map(|t| t.session.clone())
         .collect();
-    let mut plans: BTreeSet<PlanKey> = BTreeSet::new();
-    plans.extend(touched_plans.iter().cloned());
-    plans.extend(plans_with_event.iter().cloned());
-    plans.extend(plans_finalized_here.iter().cloned());
-
-    // Phase 5 of `commit-first-review-model`: parse the commit
-    // subject's `[…]` prefix. Explicit `[misc]` forces AdHoc;
-    // `[plan-name]` / `[plan-one,plan-two]` forces the named
-    // attribution. Unknown plan names degrade to AdHoc with a
-    // warning. No prefix falls through to file/active-plan
-    // inference.
-    let prefix = parse_title_prefix(&event.subject);
-    let inferred = if touched_plans.len() >= 2 {
-        CommitAttribution::MultiPlan {
-            plans: touched_plans.clone(),
-        }
-    } else if plans_finalized_here.len() == 1 && single_plan_kind.is_none() {
+    if touched_plans.len() >= 2 {
+        return EffectiveClassification {
+            attribution: CommitAttribution::MultiPlan {
+                plans: touched_plans.clone(),
+            },
+            plans_in_scope: touched_plans,
+            warning: None,
+        };
+    }
+    // Single-plan freeze (and only freeze) → Finalize.
+    if plans_finalized_here.len() == 1 && touched_plans.is_empty() {
         let plan = plans_finalized_here.iter().next().cloned().unwrap();
-        CommitAttribution::Finalize { plan }
-    } else if let AttributionResult::Attributed { session, .. } = attr {
-        CommitAttribution::Plan {
-            plan: session.clone(),
-        }
-    } else {
-        CommitAttribution::AdHoc
-    };
+        return EffectiveClassification {
+            attribution: CommitAttribution::Finalize { plan: plan.clone() },
+            plans_in_scope: [plan].into_iter().collect(),
+            warning: None,
+        };
+    }
+    if let AttributionResult::Attributed { session, .. } = attr {
+        let plan = session.clone();
+        return EffectiveClassification {
+            attribution: CommitAttribution::Plan { plan: plan.clone() },
+            plans_in_scope: [plan].into_iter().collect(),
+            warning: None,
+        };
+    }
+    EffectiveClassification {
+        attribution: CommitAttribution::AdHoc,
+        plans_in_scope: BTreeSet::new(),
+        warning: None,
+    }
+}
 
-    let (attribution, attribution_warning) = apply_prefix(prefix, inferred, known_plans);
-
-    let (kind, gate) = match &attribution {
-        CommitAttribution::Plan { .. } => {
-            let kind = single_plan_kind
-                .as_ref()
-                .map(|(_, k)| *k)
-                .unwrap_or(CommitKind::Unattributed);
-            (kind, single_plan_gate)
-        }
-        CommitAttribution::MultiPlan { .. } => (CommitKind::MultiPlan, None),
-        CommitAttribution::Finalize { .. } => (CommitKind::Finalize, None),
-        CommitAttribution::AdHoc => (CommitKind::Unattributed, None),
-    };
-
-    CommitNode {
-        sha: commit_sha.clone(),
-        author_ts: event.author_ts,
-        subject: event.subject.clone(),
-        kind,
-        attribution,
-        plans,
-        gate,
-        attribution_warning,
+/// Per-plan kind for a single plan given the effective
+/// attribution. The plan is known to be in
+/// `classification.plans_in_scope` so we always emit a non-
+/// Unattributed kind unless attribution is AdHoc.
+fn per_plan_kind_for(
+    attribution: &CommitAttribution,
+    plan_key: &PlanKey,
+    our_touch: Option<&crate::attribution::PlanTouch>,
+    has_non_plan_code: bool,
+) -> CommitKind {
+    match attribution {
+        CommitAttribution::MultiPlan { .. } => CommitKind::MultiPlan,
+        CommitAttribution::Finalize { plan } if plan == plan_key => CommitKind::Finalize,
+        CommitAttribution::Finalize { .. } => CommitKind::Unattributed,
+        CommitAttribution::Plan { plan } if plan == plan_key => match (our_touch, has_non_plan_code) {
+            (Some(_), true) => CommitKind::Mixed,
+            (Some(_), false) => CommitKind::PlanOnly,
+            (None, true) => CommitKind::CodeOnly,
+            (None, false) => CommitKind::Unattributed,
+        },
+        CommitAttribution::Plan { .. } => CommitKind::Unattributed,
+        CommitAttribution::AdHoc => CommitKind::Unattributed,
     }
 }
 
@@ -901,55 +974,6 @@ pub fn parse_title_prefix(subject: &str) -> Option<TitlePrefix> {
         return Some(TitlePrefix::Misc);
     }
     Some(TitlePrefix::Plans(names))
-}
-
-/// Apply the parsed prefix to the inferred attribution per the
-/// 4-step algorithm in the plan. The prefix wins when present and
-/// valid; unknown plan names degrade to AdHoc with a warning;
-/// `[misc]` forces AdHoc; no prefix preserves the inferred result.
-fn apply_prefix(
-    prefix: Option<TitlePrefix>,
-    inferred: CommitAttribution,
-    known_plans: &BTreeSet<PlanKey>,
-) -> (CommitAttribution, Option<String>) {
-    let prefix = match prefix {
-        Some(p) => p,
-        None => return (inferred, None),
-    };
-    match prefix {
-        TitlePrefix::Misc => (CommitAttribution::AdHoc, None),
-        TitlePrefix::Plans(names) => {
-            let parsed: Vec<Result<PlanKey, String>> = names
-                .iter()
-                .map(|n| PlanKey::parse(n).map_err(|_| n.clone()))
-                .collect();
-            let unknown: Vec<String> = parsed
-                .iter()
-                .filter_map(|r| match r {
-                    Ok(k) if known_plans.contains(k) => None,
-                    Ok(k) => Some(k.as_str().to_string()),
-                    Err(s) => Some(s.clone()),
-                })
-                .collect();
-            if !unknown.is_empty() {
-                let warning = format!(
-                    "commit-title prefix names unknown plan(s): {}; treated as ad hoc — amend to `[misc]` or a known plan name to silence",
-                    unknown.join(", ")
-                );
-                return (CommitAttribution::AdHoc, Some(warning));
-            }
-            let valid_keys: BTreeSet<PlanKey> = parsed.into_iter().flatten().collect();
-            if valid_keys.len() == 1 {
-                let plan = valid_keys.into_iter().next().unwrap();
-                (CommitAttribution::Plan { plan }, None)
-            } else {
-                (
-                    CommitAttribution::MultiPlan { plans: valid_keys },
-                    None,
-                )
-            }
-        }
-    }
 }
 
 fn is_frozen(state: &RepoState, plan_key: &PlanKey) -> bool {

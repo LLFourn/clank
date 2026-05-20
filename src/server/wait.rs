@@ -248,26 +248,26 @@ async fn compute_match(
     let (candidates, config, prefix_violations) = {
         let trinity_arc = runtime.state();
         let trinity = trinity_arc.lock().await;
-        let candidates = collect_active_commit_candidates(&trinity, filter)?;
-        // Resolve the repo root from the first candidate (all
-        // candidates share a repo by construction). Empty candidate
-        // list → no matches anyway; config doesn't matter.
-        let repo_root = candidates.first().map(|c| c.repo_root.clone());
+        // Resolve the repo BEFORE candidate filtering. Strict-mode
+        // prefix enforcement is a commit-level hygiene rule, not a
+        // review-gate rule — codex on 94f1e5a. We need the repo
+        // state independent of whether any reviewable candidates
+        // exist (a fresh repo with one unprefixed code commit and
+        // no feedback authors must still get master FixCommitTitle).
+        let repo_root = resolve_repo_root_from_filter(&trinity, filter)?;
         let config = match repo_root.as_ref() {
             Some(root) => crate::cli::config::load(root),
             None => crate::cli::config::Config::default(),
         };
-        // Phase 5: collect strict-mode prefix violations (commits
-        // with an attribution_warning OR an inferred attribution
-        // from no-prefix subjects). Walked once here so the matcher
-        // surfaces master FixCommitTitle work BEFORE any per-plan
-        // reviewer wakes; reviewers do not wake on commits with a
-        // strict-mode violation until the master amends.
+        let candidates = collect_active_commit_candidates(&trinity, filter)?;
+        // Phase 5: collect strict-mode prefix violations directly
+        // from repo state (not from candidates) so commits without
+        // gates are still considered.
         let prefix_violations: Vec<PrefixViolation> = if config.review.require_commit_prefix {
             repo_root
                 .as_ref()
                 .and_then(|root| trinity.repos.get(root))
-                .map(|state| collect_prefix_violations(state))
+                .map(collect_prefix_violations)
                 .unwrap_or_default()
         } else {
             Vec::new()
@@ -317,13 +317,9 @@ fn collect_prefix_violations(state: &crate::repo_state::RepoState) -> Vec<Prefix
         let Some(node) = state.commits.get(sha) else {
             continue;
         };
-        // Skip non-reviewable kinds that don't have attribution
-        // meaning (e.g. Finalize commits, MultiPlan). Strict mode
-        // governs commits that COULD be attributed.
-        if matches!(
-            node.kind,
-            crate::repo_state::CommitKind::Finalize | crate::repo_state::CommitKind::MultiPlan
-        ) {
+        // Finalize commits aren't subject to the convention —
+        // their subject is a freeze marker, not a content commit.
+        if matches!(node.kind, crate::repo_state::CommitKind::Finalize) {
             continue;
         }
         let has_prefix =
@@ -343,6 +339,10 @@ fn collect_prefix_violations(state: &crate::repo_state::RepoState) -> Vec<Prefix
             continue;
         }
         // No prefix. Suggest based on the inferred attribution.
+        // MultiPlan (no prefix, multi-touch) ALSO needs a fix —
+        // the master should explicitly choose `[plan-a,plan-b]`
+        // or `[misc]`; the suggested_prefix lists the inferred
+        // plans so the master can amend with one keystroke.
         let suggested = match &node.attribution {
             crate::repo_state::CommitAttribution::Plan { plan } => {
                 Some(format!("[{}]", plan.as_str()))
@@ -361,6 +361,30 @@ fn collect_prefix_violations(state: &crate::repo_state::RepoState) -> Vec<Prefix
         });
     }
     out
+}
+
+/// Resolve the filter's repo root from `Trinity` state without
+/// going through candidate filtering. Used by strict-mode prefix
+/// enforcement so commits without review gates are still scanned
+/// for title hygiene.
+fn resolve_repo_root_from_filter(
+    trinity: &Trinity,
+    filter: &PlanFilter,
+) -> Result<Option<PathBuf>, WaitError> {
+    match filter {
+        PlanFilter::Plan(plan_id) => {
+            let root = trinity
+                .repo_basenames
+                .get(plan_id.repo())
+                .cloned()
+                .ok_or_else(|| WaitError::UnknownRepo(plan_id.repo().as_str().to_string()))?;
+            Ok(Some(root))
+        }
+        PlanFilter::RepoScope(repo_ref) => {
+            let (_, root) = resolve_repo_ref(trinity, repo_ref)?;
+            Ok(Some(root))
+        }
+    }
 }
 
 fn build_fix_commit_title_match(violation: &PrefixViolation) -> WaitMatch {
@@ -642,10 +666,46 @@ async fn enrich_for_wait(
         _ => Vec::new(),
     };
 
+    // Phase 5 of commit-first-review-model: surface non-strict
+    // unknown-plan-prefix warnings on master wakes. Warnings from
+    // every commit in the repo that has an attribution_warning
+    // ride along; reviewers see none (the warnings are a master
+    // concern).
+    let attribution_warnings = if matches!(role, WaitingRole::Master) {
+        collect_attribution_warnings(runtime, &repo_root).await
+    } else {
+        Vec::new()
+    };
+
     trinity_core::api::WaitWorkPayload {
         work: payload,
         stale_reviews,
+        attribution_warnings,
     }
+}
+
+async fn collect_attribution_warnings(
+    runtime: &Runtime,
+    repo_root: &std::path::Path,
+) -> Vec<trinity_core::api::AttributionWarning> {
+    let trinity_arc = runtime.state();
+    let trinity = trinity_arc.lock().await;
+    let Some(state) = trinity.repos.get(repo_root) else {
+        return Vec::new();
+    };
+    state
+        .commit_order
+        .iter()
+        .filter_map(|sha| {
+            let node = state.commits.get(sha)?;
+            let message = node.attribution_warning.as_ref()?.clone();
+            Some(trinity_core::api::AttributionWarning {
+                sha: sha.as_str().to_string(),
+                subject: node.subject.clone(),
+                message,
+            })
+        })
+        .collect()
 }
 
 /// Walk the plan timeline for feedback against superseded (non-
@@ -1845,6 +1905,129 @@ mod integration_tests {
         assert!(
             matches!(resp, WaitResponse::Timeout(_)),
             "reviewer must not wake while FixCommitTitle is outstanding; got {resp:?}"
+        );
+    }
+
+    /// Phase 5 regression for codex on 94f1e5a: strict mode must
+    /// catch unprefixed commits even when no review gate exists
+    /// for them (no feedback authors → no ad hoc gate → no
+    /// candidate). Fresh repo + one unprefixed code commit +
+    /// require_commit_prefix=true → master must still get
+    /// FixCommitTitle with `[misc]` suggestion.
+    #[tokio::test]
+    async fn strict_mode_catches_gateless_unprefixed_commit() {
+        let dir = init_repo();
+        write_file(
+            dir.path(),
+            ".trinity/config.json",
+            r#"{"review": {"require_commit_prefix": true}}"#,
+        );
+        write_file(dir.path(), "src.rs", "fn main() {}\n");
+        run_git(dir.path(), &["add", "-A"]);
+        run_git(dir.path(), &["commit", "--quiet", "-m", "code only"]);
+        let rt = Runtime::new();
+        rt.add_repo(dir.path().to_path_buf()).await.unwrap();
+
+        let basename = dir
+            .path()
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap()
+            .to_string();
+        let resp = wait_for_work(
+            &rt,
+            WaitArgs {
+                role: WaitingRole::Master,
+                plan_id: None,
+                repo: Some(basename),
+                author_label: Some("lloyd".to_string()),
+                timeout_secs: Some(1),
+            },
+        )
+        .await
+        .unwrap();
+        match resp {
+            WaitResponse::Work(p) => {
+                use trinity_core::api::ExpectedAction;
+                match p.work.action {
+                    ExpectedAction::FixCommitTitle {
+                        suggested_prefix, ..
+                    } => assert_eq!(suggested_prefix.as_deref(), Some("[misc]")),
+                    other => panic!("expected FixCommitTitle in strict mode; got {other:?}"),
+                }
+            }
+            WaitResponse::Timeout(_) => {
+                panic!("strict mode must catch unprefixed gateless commit; got timeout")
+            }
+        }
+    }
+
+    /// Phase 5 regression for codex on 94f1e5a: non-strict
+    /// unknown-plan-prefix warnings must ride along on master
+    /// `wait_for_work` responses as `attribution_warnings`. A
+    /// commit prefixed `[no-such-plan]` produces an AdHoc node
+    /// with `attribution_warning` set; the next master wake (here
+    /// driven by a plan revision's CommitNeedsReview) must carry
+    /// the warning.
+    #[tokio::test]
+    async fn unknown_prefix_warning_rides_along_on_master_wake() {
+        let dir = init_repo();
+        // Create an active plan so we have something to drive a
+        // master wake (worktree-dirty plan_intro → CommitPlanRevision).
+        write_file(dir.path(), ".trinity/plans/foo.md", "# foo v1\n");
+        run_git(dir.path(), &["add", "-A"]);
+        run_git(dir.path(), &["commit", "--quiet", "-m", "[foo] intro"]);
+        // Drop an unknown-prefix commit alongside.
+        write_file(dir.path(), "src.rs", "fn main() {}\n");
+        run_git(dir.path(), &["add", "-A"]);
+        run_git(
+            dir.path(),
+            &[
+                "commit",
+                "--quiet",
+                "-m",
+                "[no-such-plan] do stuff",
+            ],
+        );
+        // Make the plan file dirty so master wakes on
+        // CommitPlanRevision.
+        write_file(dir.path(), ".trinity/plans/foo.md", "# foo v2\n");
+        let rt = Runtime::new();
+        rt.add_repo(dir.path().to_path_buf()).await.unwrap();
+
+        let basename = dir
+            .path()
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap()
+            .to_string();
+        let resp = wait_for_work(
+            &rt,
+            WaitArgs {
+                role: WaitingRole::Master,
+                plan_id: None,
+                repo: Some(basename),
+                author_label: Some("lloyd".to_string()),
+                timeout_secs: Some(1),
+            },
+        )
+        .await
+        .unwrap();
+        let payload = match resp {
+            WaitResponse::Work(p) => p,
+            WaitResponse::Timeout(_) => panic!("expected master wake, got timeout"),
+        };
+        assert!(
+            !payload.attribution_warnings.is_empty(),
+            "master wake must carry attribution_warnings; got {:?}",
+            payload.attribution_warnings
+        );
+        assert!(
+            payload.attribution_warnings[0]
+                .message
+                .contains("no-such-plan"),
+            "warning text must name the unknown plan; got {:?}",
+            payload.attribution_warnings
         );
     }
 

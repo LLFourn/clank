@@ -884,6 +884,25 @@ pub struct WaitWorkPayload {
     /// reviewer variants and after every entry's been emitted.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub stale_reviews: Vec<StaleReview>,
+    /// Phase 5 non-strict warnings sidecar: when commits in the
+    /// repo have an unknown-plan title prefix, their warning text
+    /// rides along on the next master wake. Empty in strict mode
+    /// (those commits surface as `FixCommitTitle` work instead)
+    /// and empty on reviewer wakes (the warnings are a master
+    /// concern).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attribution_warnings: Vec<AttributionWarning>,
+}
+
+/// One commit's attribution warning. Phase 5 of
+/// `commit-first-review-model`: surfaced on master `wait_for_work`
+/// responses (non-strict mode) so the master can decide whether
+/// to amend the prefix.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AttributionWarning {
+    pub sha: String,
+    pub subject: String,
+    pub message: String,
 }
 
 /// Typed MCP-tool error payload. Each variant lifts one of the

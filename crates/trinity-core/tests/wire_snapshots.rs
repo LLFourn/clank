@@ -429,6 +429,7 @@ fn schema_wait_for_work_work() {
             },
         },
         stale_reviews: Vec::new(),
+        attribution_warnings: Vec::new(),
     }))
     .unwrap();
     assert_schema("wait_for_work_response_work", &v);
