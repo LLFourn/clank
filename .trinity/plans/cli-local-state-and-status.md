@@ -87,32 +87,40 @@ canonical preview module; both HTTP and CLI become thin callers.
 Exposed surface:
 
 ```rust
-pub fn build_finish_preview(
+pub async fn build_finish_preview(
     repo_root: &Path,
     state: &RepoState,
     plan_key: &PlanKey,
 ) -> Result<FinishPreviewResponse, PreviewError>;
 
-pub fn build_rewrite_preview(
+pub async fn build_rewrite_preview(
     repo_root: &Path,
     state: &RepoState,
     plan_key: &PlanKey,
     include_finalize: bool,
 ) -> Result<RewritePreviewResponse, PreviewError>;
 
-pub fn build_rewrite_preview_all(
+pub async fn build_rewrite_preview_all(
     repo_root: &Path,
     state: &RepoState,
     include_finalize: bool,
 ) -> Result<PurgeAllPreviewResponse, PreviewError>;
 ```
 
+The builders are async because they invoke git plumbing
+(`tree_plan_paths`, `commit_parent_count`, `first_parent_commits_to`,
+`diff_tree_changes`) which already runs `git` as a subprocess via
+async helpers in `src/git_io.rs`. There is no synchronous shortcut;
+the existing HTTP implementation already awaits these calls.
+
 `repo_basename` is derived inside the builder from `repo_root` —
 callers don't pass it.
 
-`PreviewError` is a typed enum in `trinity-core::api` (alongside the
-response types it pairs with) so the CLI can match on it and emit
-specific error messages.
+`PreviewError` is a typed enum in the app crate (alongside
+`src/preview.rs`, not in `trinity-core::api`). It wraps git/IO
+specifics and is consumed in-process by both the CLI and the HTTP
+adapters; HTTP maps variants to status codes at the edge. Wire
+DTOs in `trinity-core::api` stay free of operational error types.
 
 `build_finish_preview` owns readiness, latest-reviewable resolution,
 gate check, worktree-status, and sealed-approval projection.
