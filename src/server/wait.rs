@@ -217,23 +217,25 @@ pub(crate) struct WaitMatch {
     pub current_target_sha: Option<CommitSha>,
 }
 
-/// Walk the repo's commit stream chronologically and return the
-/// first commit whose gate needs the caller's role (and that the
-/// caller has not already voted on, for reviewer waits). Phase 3 of
-/// `commit-first-review-model`: the reviewable unit is the commit,
-/// not the plan, so the matcher iterates `RepoState.commits` by
-/// `author_ts` instead of fanning out over plans by name.
+/// Walk the repo's commit stream in fold order (the first-parent
+/// sequence the fold built — never derived from `author_ts`) and
+/// return the first commit whose gate needs the caller's role
+/// (and that the caller has not already voted on, for reviewer
+/// waits). Phase 3 of `commit-first-review-model`: the reviewable
+/// unit is the commit, not the plan, so the matcher iterates
+/// `RepoState.commit_order` instead of fanning out over plans by
+/// name.
 ///
-/// - `PlanFilter::Plan(id)` filters the same chronological walk to
-///   only commits whose `CommitNode.plans` contains `id.key()`.
-/// - `PlanFilter::RepoScope(repo)` walks every commit in the
-///   resolved repo.
+/// - `PlanFilter::Plan(id)` requests a single-plan candidate from
+///   that plan's latest reviewable commit.
+/// - `PlanFilter::RepoScope(repo)` walks the full commit_order
+///   stream and emits one candidate per active plan at its latest
+///   reviewable commit, ordered by fold position.
 ///
-/// Per-plan supersession is preserved: within a plan, only the
-/// LATEST reviewable commit's gate drives work. The walk implements
-/// this by tracking which plans we've already surfaced and skipping
-/// older commits on the same plan in a reverse-chronological
-/// pre-pass; see `collect_active_commit_candidates`.
+/// Per-plan supersession is enforced inside
+/// `collect_repo_scope_candidates`: within a plan, only the
+/// LATEST reviewable commit's gate drives work. The
+/// supersession rule is documented inline there.
 async fn compute_match(
     runtime: &Runtime,
     filter: &PlanFilter,

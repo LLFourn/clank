@@ -55,12 +55,12 @@ pub struct Trinity {
 pub struct RepoState {
     pub root: PathBuf,
     pub plans: BTreeMap<PlanKey, Plan>,
-    /// Repo-wide commit stream indexed by SHA. Phase 1 of
-    /// `commit-first-review-model`: populated alongside per-plan
-    /// timelines so the commit-first matcher can walk one
-    /// chronological stream and the per-plan view becomes a
-    /// projection over it. Phase 2 makes `CommitNode.gate`
-    /// authoritative; Phase 1 shadows it.
+    /// Repo-wide commit nodes indexed by SHA. The authoritative
+    /// per-commit data for the commit-first model — each
+    /// `CommitNode` carries kind, attribution, plan set, and the
+    /// `Option<CommitGate>` that drives review state. Iteration
+    /// order is SHA-keyed and must NOT be relied on for chronology;
+    /// use [`commit_order`](Self::commit_order) for that.
     pub commits: BTreeMap<CommitSha, CommitNode>,
     /// The fold's first-parent commit order, oldest-first. The
     /// commit-first matcher walks this directly instead of
@@ -201,6 +201,11 @@ impl RepoState {
                 hasher.update(b";");
             }
             hasher.update(b"]\n");
+        }
+        hasher.update(b"]\ncommit_order[");
+        for sha in &self.commit_order {
+            hasher.update(sha.as_str().as_bytes());
+            hasher.update(b",");
         }
         hasher.update(b"]\ncommits[");
         for (sha, node) in &self.commits {
@@ -394,3 +399,29 @@ pub struct PlanEvent {
 /// wire response shape are one definition.
 pub use trinity_core::api::WaitingOn;
 pub use trinity_core::{WaitingReason, WaitingRole};
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::lifecycle::CommitSha;
+
+    /// Codex on 62cd0e5: `commit_order` affects observable behavior
+    /// (repo-scope WFW iterates it), so the state digest must see
+    /// it. Two states with identical plans + commits but different
+    /// commit_order MUST hash differently — otherwise the runtime
+    /// can skip a broadcast that should fire.
+    #[test]
+    fn digest_distinguishes_commit_order() {
+        let sha_a = CommitSha::parse("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa").unwrap();
+        let sha_b = CommitSha::parse("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb").unwrap();
+        let mut s1 = RepoState::empty(PathBuf::from("/r"));
+        s1.commit_order = vec![sha_a.clone(), sha_b.clone()];
+        let mut s2 = RepoState::empty(PathBuf::from("/r"));
+        s2.commit_order = vec![sha_b, sha_a];
+        assert_ne!(
+            s1.digest(),
+            s2.digest(),
+            "commit_order reorder must produce a different digest"
+        );
+    }
+}

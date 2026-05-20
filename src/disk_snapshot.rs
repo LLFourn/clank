@@ -93,13 +93,17 @@ pub fn derive_base_state(repo_root: PathBuf, snapshot: CommitSnapshot) -> BaseRe
 ///
 /// 1. Build a per-plan feedback index keyed by `(plan, target_sha,
 ///    author)`.
-/// 2. Write each feedback entry into the matching reviewable
-///    timeline event's `gate.feedback` map.
+/// 2. Write each feedback entry into the matching commit's gate
+///    on `RepoState.commits[target_sha].gate.feedback`. The
+///    ownership invariant (`CommitAttribution::Plan(plan)` must
+///    match the feedback path's plan_key) is enforced before any
+///    mutation; mismatches drop silently.
 /// 3. Call [`rebuild_plan_gates`] to recompute every reviewable
 ///    gate's participants / approvers / requesters / missing /
-///    state chronologically. **Cumulative participants propagate
-///    forward** — a feedback file on commit A makes the reviewer a
-///    participant for every later reviewable gate in that plan.
+///    state chronologically over the plan's timeline SHAs.
+///    **Cumulative participants propagate forward** — a feedback
+///    file on commit A makes the reviewer a participant for every
+///    later reviewable gate in that plan.
 /// 4. Bump `plan.last_activity_ts` to include feedback mtimes.
 ///
 /// Finished plans are sealed: live feedback targeting their
