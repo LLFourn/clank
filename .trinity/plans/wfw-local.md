@@ -273,11 +273,21 @@ that consumes it:
    `--no-cache` must also pass and must not touch
    `.trinity/cache/repo-state/` (I3 regression guard).
 
-7. **HEAD-pin under flap.** Start `cli::wfw::run`. From a
-   second task, flap HEAD (commit, then revert) several
-   times before letting it settle on a known SHA. Assert
-   the final work payload's `target_sha` matches the
-   settled SHA, never a transient.
+7. **HEAD-pin per fold (no settle semantics).** wfw does NOT
+   wait for HEAD to stop moving — a repo-scoped reviewer
+   wait that wakes on commit A can legitimately return work
+   for A even if HEAD later moves to B before the caller
+   reads the terminal output. The test verifies the
+   pinning-per-fold invariant directly, not settle:
+   - Unit: pin SHA A. Move HEAD to SHA B before or during
+     the fold. Assert the fold's `RepoState` output is
+     still for A (the fold did not silently follow HEAD).
+   - Integration: trigger a HEAD-change wake. Inside the
+     rebuild, move HEAD again before it completes. Assert
+     the returned `WaitResponse::Work.target_sha` is the
+     SHA the rebuild pinned, AND every projection in the
+     payload is internally consistent with that pinned SHA
+     (no field reflects a later HEAD).
 
 ## Acceptance
 
@@ -299,7 +309,9 @@ that consumes it:
   (I3 regression test).
 - `--json` emits a parseable `WaitResponse` JSON document.
 - Race-window regression test passes (I2 guard).
-- HEAD-pin invariant holds under flap (I1 guard).
+- HEAD-pin invariant holds: each rebuild targets one
+  captured SHA and does not observe a moving HEAD mid-fold
+  (I1 guard).
 - Existing `trinity serve` daemon still works untouched.
 
 ## Out of scope (deferred to follow-up OMEGA plans)
