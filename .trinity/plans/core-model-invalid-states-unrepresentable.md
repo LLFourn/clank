@@ -98,7 +98,7 @@ stringly-typed sidecar:
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum AttributionWarning {
     /// Commit subject's `[…]` prefix names plan(s) that don't
-    /// exist. Classifier degrades to AdHoc.
+    /// exist at fold time. Classifier degrades to AdHoc.
     UnknownPlanPrefix { unknown_names: Vec<String> },
     /// No `[…]` prefix on the subject. Classifier inferred
     /// attribution from file touches or walk-back. The inferred
@@ -108,8 +108,20 @@ pub enum AttributionWarning {
     /// that can't be disambiguated without operator input. The
     /// classifier has no single suggested fix.
     AmbiguousPrefix,
+    /// Emitted by projection helpers when a commit's
+    /// `touch.plan()` (or `Plan(plan)` from CodeOnly) names a
+    /// plan that no longer exists in `state.plans`. Not a fold-
+    /// time warning — the fold doesn't know about future
+    /// deletions; the projection layer surfaces it on each
+    /// affected commit.
+    DanglingPlanRef { plan: PlanKey },
 }
 ```
+
+The enum is the single closed vocabulary for attribution
+warnings; projection renderers exhaustively match on it to
+produce wire/UI strings. Adding a variant forces a compile
+error at every renderer call site.
 
 `api::AttributionWarning` (the wire shape) is built by
 projection: `{ sha, subject, message }` where `message` is a
