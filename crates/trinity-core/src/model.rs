@@ -753,6 +753,370 @@ pub struct ReviewReadiness {
     pub missing: Vec<AgentLabel>,
 }
 
+/// Phase 2 of `core-model-invalid-states-unrepresentable`: the
+/// classifier's output. Single source of truth for body variant +
+/// warnings + walk-back update. The fold's caller (`apply_commit`)
+/// reads from this, never from a parallel inference.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClassifiedCommit {
+    pub body: CommitBody,
+    pub warnings: Vec<AttributionWarning>,
+    /// What the walk-back chain becomes after this commit. The
+    /// fold's `carry.current_effective` should be assigned this
+    /// value verbatim — no separate `effective_session()`
+    /// computation.
+    pub next_effective_plan: Option<PlanKey>,
+}
+
+/// Inputs to `classify`. Daemon-side fold builds this from the
+/// commit's diff summary + current fold carry; the classifier is
+/// then a pure function over the bundle.
+#[derive(Debug, Clone)]
+pub struct ClassifierInputs<'a> {
+    pub subject: &'a str,
+    /// Plan files this commit touched. Order doesn't matter
+    /// semantically; the classifier inspects keys and counts.
+    pub plan_touches: &'a [PlanTouchSummary],
+    /// True if this commit modified any non-`.trinity/` file.
+    pub has_non_plan_code: bool,
+    /// Plans that fire the freeze rule on this commit. Computed
+    /// by the fold's finalize-tree walker (step 4 of
+    /// `apply_commit`); the classifier doesn't recompute it.
+    pub plans_finalized_here: &'a std::collections::BTreeSet<PlanKey>,
+    /// Approver counts per plan-key for any plan freezing on
+    /// this commit. Used to populate `FinalizeCommit.approver_count`
+    /// without re-walking the finalize tree.
+    pub finalize_approver_counts: &'a std::collections::BTreeMap<PlanKey, u32>,
+    /// Walk-back state coming into this commit: the active plan
+    /// chain from the parent. `None` at the root or after a
+    /// MultiPlan/AdHoc-with-no-parent break.
+    pub current_effective: Option<&'a PlanKey>,
+    /// Plans known to exist as of this commit's parent state.
+    /// Used to validate `[plan-x]` prefix names.
+    pub known_plans: &'a std::collections::BTreeSet<PlanKey>,
+}
+
+/// Title-prefix vocabulary the classifier recognizes on
+/// `subject`. `parse_title_prefix` is the only entry point; it
+/// returns `None` for "no recognized prefix" and the classifier
+/// falls back to file-touch / walk-back inference.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TitlePrefix {
+    /// `[misc]` — explicit opt-out from plan attribution.
+    Misc,
+    /// `[plan-a]` or `[plan-a,plan-b]` — explicit plan list.
+    /// Whether the names are valid plan keys is checked in
+    /// `classify`, not in the parser.
+    Plans(Vec<String>),
+}
+
+/// Pure prefix parser. Recognizes `[…]` at the start of the
+/// subject; trims whitespace inside the brackets; treats `misc`
+/// (case-insensitive) as the dedicated `Misc` variant.
+pub fn parse_title_prefix(subject: &str) -> Option<TitlePrefix> {
+    let trimmed = subject.trim_start();
+    let rest = trimmed.strip_prefix('[')?;
+    let close = rest.find(']')?;
+    let inner = &rest[..close];
+    if inner.is_empty() {
+        return None;
+    }
+    let names: Vec<String> = inner
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+    if names.is_empty() {
+        return None;
+    }
+    if names.len() == 1 && names[0].eq_ignore_ascii_case("misc") {
+        return Some(TitlePrefix::Misc);
+    }
+    Some(TitlePrefix::Plans(names))
+}
+
+/// Pure classifier. Phase 2 of
+/// `core-model-invalid-states-unrepresentable`: one function
+/// produces the entire `ClassifiedCommit`. The fold reads body /
+/// warnings / next_effective_plan from this output; no second
+/// pass reinterprets the result.
+///
+/// Attribution priority (matches the plan's "Attribution
+/// algorithm (final)" section):
+/// 1. Explicit prefix wins: `[misc]` → AdHoc; `[plan]` /
+///    `[plans,...]` with all known → Plan / MultiPlan; unknown
+///    names → AdHoc + warning.
+/// 2. No prefix, ≥1 finalize firing → FinalizeCommit.
+/// 3. No prefix, ≥2 distinct plan-file touches → MultiPlanCommit.
+/// 4. No prefix, exactly 1 plan-file touch → PlanCommit (PlanOnly
+///    or Mixed based on `has_non_plan_code`).
+/// 5. No prefix, no touches, code-only, walk-back has effective
+///    plan → PlanCommit::CodeOnly attributed to that plan.
+/// 6. No prefix, no plan context → AdHoc.
+///
+/// Walk-back: `[plan-x]` seeds plan-x as the next effective.
+/// `[misc]` / unknown prefix preserve the parent's chain (the
+/// operator opted out for THIS commit, not for descendants).
+/// Single-plan inference seeds that plan. MultiPlan / Finalize /
+/// AdHoc preserve the parent verbatim.
+pub fn classify(inputs: ClassifierInputs<'_>) -> ClassifiedCommit {
+    let prefix = parse_title_prefix(inputs.subject);
+    let mut warnings: Vec<AttributionWarning> = Vec::new();
+
+    // 1. Finalize commits sit OUTSIDE the prefix grammar — they're
+    // identified by the freeze rule (step 4 of apply_commit). When
+    // a finalize fires and the same commit doesn't ALSO touch plan
+    // files for a different plan, classify as Finalize. The
+    // existing fold's freeze rule is "exactly one plan finalizes"
+    // in practice; if multiple plans finalize on one commit,
+    // classify the FIRST (in BTreeSet order) and treat the rest
+    // as a future-work edge case.
+    if !inputs.plans_finalized_here.is_empty() && inputs.plan_touches.is_empty() {
+        let plan = inputs
+            .plans_finalized_here
+            .iter()
+            .next()
+            .cloned()
+            .expect("non-empty checked");
+        let approver_count = inputs
+            .finalize_approver_counts
+            .get(&plan)
+            .copied()
+            .unwrap_or(0);
+        return ClassifiedCommit {
+            body: CommitBody::Finalize(FinalizeCommit {
+                plan,
+                approver_count,
+                reviews: CommitReviews::default(),
+            }),
+            warnings,
+            // Finalize doesn't change the walk-back chain.
+            next_effective_plan: inputs.current_effective.cloned(),
+        };
+    }
+
+    // 2. Explicit prefix wins for non-finalize commits.
+    if let Some(p) = prefix {
+        return classify_with_prefix(p, &inputs, &mut warnings);
+    }
+
+    // 3. No prefix → inference path, with a MissingPrefix warning
+    // when inference produces a plan attribution (operator can
+    // amend to silence; not blocking).
+    classify_without_prefix(&inputs, &mut warnings)
+}
+
+fn classify_with_prefix(
+    prefix: TitlePrefix,
+    inputs: &ClassifierInputs<'_>,
+    warnings: &mut Vec<AttributionWarning>,
+) -> ClassifiedCommit {
+    match prefix {
+        TitlePrefix::Misc => ClassifiedCommit {
+            body: CommitBody::AdHoc(AdHocCommit::default()),
+            warnings: std::mem::take(warnings),
+            next_effective_plan: inputs.current_effective.cloned(),
+        },
+        TitlePrefix::Plans(names) => {
+            let parsed: Vec<Result<PlanKey, String>> = names
+                .iter()
+                .map(|n| PlanKey::parse(n).map_err(|_| n.clone()))
+                .collect();
+            let unknown: Vec<String> = parsed
+                .iter()
+                .filter_map(|r| match r {
+                    Ok(k) if inputs.known_plans.contains(k) => None,
+                    Ok(k) => Some(k.as_str().to_string()),
+                    Err(s) => Some(s.clone()),
+                })
+                .collect();
+            if !unknown.is_empty() {
+                warnings.push(AttributionWarning::UnknownPlanPrefix {
+                    unknown_names: unknown,
+                });
+                return ClassifiedCommit {
+                    body: CommitBody::AdHoc(AdHocCommit::default()),
+                    warnings: std::mem::take(warnings),
+                    next_effective_plan: inputs.current_effective.cloned(),
+                };
+            }
+            let valid: std::collections::BTreeSet<PlanKey> =
+                parsed.into_iter().flatten().collect();
+            if valid.len() == 1 {
+                let plan = valid.iter().next().cloned().expect("len==1");
+                let body =
+                    plan_commit_for(plan.clone(), inputs.plan_touches, inputs.has_non_plan_code);
+                return ClassifiedCommit {
+                    body: CommitBody::Plan(body),
+                    warnings: std::mem::take(warnings),
+                    next_effective_plan: Some(plan),
+                };
+            }
+            // Multi-plan from the prefix. Build a MultiPlanTouches
+            // from the commit's plan_touches filtered to the
+            // prefix-named plans. If the commit didn't actually
+            // touch >=2 of the prefix-named plans, fall back to
+            // a synthetic touch list. (The fold today derives
+            // PlanTouchSummary from CommitChanges; the prefix
+            // might name plans not touched by this commit. For
+            // Phase 2's pure-classifier scope, that edge case
+            // surfaces as the unknown-prefix path above; valid
+            // multi-plan prefixes always correspond to touched
+            // plans.)
+            let multi_touches: Vec<PlanTouchSummary> = inputs
+                .plan_touches
+                .iter()
+                .filter(|t| valid.contains(t.plan()))
+                .cloned()
+                .collect();
+            // Defensive: if the prefix names plans the commit
+            // didn't actually touch, we can't form a valid
+            // MultiPlanTouches (≥2 distinct). Degrade to AdHoc
+            // with an AmbiguousPrefix warning rather than panic.
+            let multi = match MultiPlanTouches::new(multi_touches) {
+                Ok(m) => m,
+                Err(_) => {
+                    warnings.push(AttributionWarning::AmbiguousPrefix);
+                    return ClassifiedCommit {
+                        body: CommitBody::AdHoc(AdHocCommit::default()),
+                        warnings: std::mem::take(warnings),
+                        next_effective_plan: inputs.current_effective.cloned(),
+                    };
+                }
+            };
+            ClassifiedCommit {
+                body: CommitBody::MultiPlan(MultiPlanCommit {
+                    touches: multi,
+                    reviews: CommitReviews::default(),
+                }),
+                warnings: std::mem::take(warnings),
+                // MultiPlan is transparent to walk-back.
+                next_effective_plan: inputs.current_effective.cloned(),
+            }
+        }
+    }
+}
+
+fn classify_without_prefix(
+    inputs: &ClassifierInputs<'_>,
+    warnings: &mut Vec<AttributionWarning>,
+) -> ClassifiedCommit {
+    let distinct_touched: std::collections::BTreeSet<&PlanKey> =
+        inputs.plan_touches.iter().map(|t| t.plan()).collect();
+
+    if distinct_touched.len() >= 2 {
+        let touches = inputs.plan_touches.to_vec();
+        let multi = MultiPlanTouches::new(touches).expect("≥2 distinct checked");
+        let suggested = format!(
+            "[{}]",
+            distinct_touched
+                .iter()
+                .map(|p| p.as_str())
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+        warnings.push(AttributionWarning::MissingPrefix {
+            suggested_prefix: suggested,
+        });
+        return ClassifiedCommit {
+            body: CommitBody::MultiPlan(MultiPlanCommit {
+                touches: multi,
+                reviews: CommitReviews::default(),
+            }),
+            warnings: std::mem::take(warnings),
+            next_effective_plan: inputs.current_effective.cloned(),
+        };
+    }
+
+    if distinct_touched.len() == 1 {
+        let touch = inputs
+            .plan_touches
+            .iter()
+            .find(|t| distinct_touched.contains(t.plan()))
+            .cloned()
+            .expect("non-empty checked");
+        let plan = touch.plan().clone();
+        let suggested = format!("[{}]", plan.as_str());
+        warnings.push(AttributionWarning::MissingPrefix {
+            suggested_prefix: suggested,
+        });
+        let body = if inputs.has_non_plan_code {
+            PlanCommit::Mixed {
+                touch,
+                reviews: CommitReviews::default(),
+            }
+        } else {
+            PlanCommit::PlanOnly {
+                touch,
+                reviews: CommitReviews::default(),
+            }
+        };
+        return ClassifiedCommit {
+            body: CommitBody::Plan(body),
+            warnings: std::mem::take(warnings),
+            next_effective_plan: Some(plan),
+        };
+    }
+
+    // No plan touches.
+    if inputs.has_non_plan_code
+        && let Some(parent) = inputs.current_effective
+    {
+        let plan = parent.clone();
+        let suggested = format!("[{}]", plan.as_str());
+        warnings.push(AttributionWarning::MissingPrefix {
+            suggested_prefix: suggested,
+        });
+        return ClassifiedCommit {
+            body: CommitBody::Plan(PlanCommit::CodeOnly {
+                plan: plan.clone(),
+                reviews: CommitReviews::default(),
+            }),
+            warnings: std::mem::take(warnings),
+            next_effective_plan: Some(plan),
+        };
+    }
+
+    // Genuine ad hoc: no prefix, no touches, no walk-back chain.
+    ClassifiedCommit {
+        body: CommitBody::AdHoc(AdHocCommit::default()),
+        warnings: std::mem::take(warnings),
+        next_effective_plan: inputs.current_effective.cloned(),
+    }
+}
+
+fn plan_commit_for(
+    plan: PlanKey,
+    plan_touches: &[PlanTouchSummary],
+    has_non_plan_code: bool,
+) -> PlanCommit {
+    let our_touch = plan_touches.iter().find(|t| t.plan() == &plan).cloned();
+    match (our_touch, has_non_plan_code) {
+        (Some(touch), true) => PlanCommit::Mixed {
+            touch,
+            reviews: CommitReviews::default(),
+        },
+        (Some(touch), false) => PlanCommit::PlanOnly {
+            touch,
+            reviews: CommitReviews::default(),
+        },
+        (None, true) => PlanCommit::CodeOnly {
+            plan,
+            reviews: CommitReviews::default(),
+        },
+        (None, false) => {
+            // Prefix names a plan but the commit neither touches
+            // the plan file nor carries code. Rare — treat as
+            // CodeOnly with no body update; the projection will
+            // emit zero-content events.
+            PlanCommit::CodeOnly {
+                plan,
+                reviews: CommitReviews::default(),
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod phase1_invariant_tests {
     use super::*;
@@ -869,5 +1233,257 @@ mod phase1_invariant_tests {
         let dual = serde_json::to_string(&vec![touch("foo"), touch("bar")]).unwrap();
         let ok: MultiPlanTouches = serde_json::from_str(&dual).unwrap();
         assert_eq!(ok.plans().len(), 2);
+    }
+
+    // ============================================================
+    // Phase 2: classifier tests
+    // ============================================================
+
+    use std::collections::{BTreeMap, BTreeSet};
+
+    fn known(names: &[&str]) -> BTreeSet<PlanKey> {
+        names.iter().map(|n| plan(n)).collect()
+    }
+
+    fn empty_finalize() -> BTreeSet<PlanKey> {
+        BTreeSet::new()
+    }
+    fn empty_approvers() -> BTreeMap<PlanKey, u32> {
+        BTreeMap::new()
+    }
+
+    fn classify_with(
+        subject: &str,
+        plan_touches: Vec<PlanTouchSummary>,
+        has_non_plan_code: bool,
+        current_effective: Option<PlanKey>,
+        known_plans: BTreeSet<PlanKey>,
+    ) -> ClassifiedCommit {
+        let finalize_set = empty_finalize();
+        let approvers = empty_approvers();
+        classify(ClassifierInputs {
+            subject,
+            plan_touches: &plan_touches,
+            has_non_plan_code,
+            plans_finalized_here: &finalize_set,
+            finalize_approver_counts: &approvers,
+            current_effective: current_effective.as_ref(),
+            known_plans: &known_plans,
+        })
+    }
+
+    #[test]
+    fn classify_misc_prefix_with_plan_touch_is_ad_hoc() {
+        // [misc] commit touching plan-foo's file → AdHoc.
+        // current_effective is preserved (parent's chain).
+        let r = classify_with(
+            "[misc] doc fix",
+            vec![touch("foo")],
+            false,
+            Some(plan("parent")),
+            known(&["foo", "parent"]),
+        );
+        assert!(matches!(r.body, CommitBody::AdHoc(_)));
+        assert!(r.warnings.is_empty());
+        assert_eq!(r.next_effective_plan, Some(plan("parent")));
+    }
+
+    #[test]
+    fn classify_plan_prefix_code_only() {
+        // [plan-foo] code-only commit → PlanCommit::CodeOnly.
+        let r = classify_with(
+            "[foo] implement",
+            vec![],
+            true,
+            None,
+            known(&["foo"]),
+        );
+        match &r.body {
+            CommitBody::Plan(PlanCommit::CodeOnly { plan: p, .. }) => {
+                assert_eq!(p, &plan("foo"));
+            }
+            other => panic!("expected CodeOnly, got {other:?}"),
+        }
+        assert!(r.warnings.is_empty());
+        assert_eq!(r.next_effective_plan, Some(plan("foo")));
+    }
+
+    #[test]
+    fn classify_plan_prefix_plan_file_touch_only() {
+        let r = classify_with(
+            "[foo] intro",
+            vec![touch("foo")],
+            false,
+            None,
+            known(&["foo"]),
+        );
+        assert!(matches!(
+            r.body,
+            CommitBody::Plan(PlanCommit::PlanOnly { .. })
+        ));
+        assert!(r.warnings.is_empty());
+        assert_eq!(r.next_effective_plan, Some(plan("foo")));
+    }
+
+    #[test]
+    fn classify_plan_prefix_mixed() {
+        let r = classify_with(
+            "[foo] revise + code",
+            vec![touch("foo")],
+            true,
+            None,
+            known(&["foo"]),
+        );
+        assert!(matches!(r.body, CommitBody::Plan(PlanCommit::Mixed { .. })));
+        assert!(r.warnings.is_empty());
+    }
+
+    #[test]
+    fn classify_unknown_prefix_is_ad_hoc_with_warning() {
+        let r = classify_with(
+            "[no-such] thing",
+            vec![],
+            true,
+            Some(plan("parent")),
+            known(&["foo", "parent"]),
+        );
+        assert!(matches!(r.body, CommitBody::AdHoc(_)));
+        assert_eq!(r.warnings.len(), 1);
+        assert!(matches!(
+            &r.warnings[0],
+            AttributionWarning::UnknownPlanPrefix { unknown_names }
+                if unknown_names == &vec!["no-such".to_string()]
+        ));
+        // Parent's chain preserved — [unknown] is an opt-out attempt.
+        assert_eq!(r.next_effective_plan, Some(plan("parent")));
+    }
+
+    #[test]
+    fn classify_no_prefix_single_touch_is_plan_only_with_missing_prefix_warning() {
+        let r = classify_with(
+            "intro foo",
+            vec![touch("foo")],
+            false,
+            None,
+            known(&["foo"]),
+        );
+        assert!(matches!(
+            r.body,
+            CommitBody::Plan(PlanCommit::PlanOnly { .. })
+        ));
+        assert_eq!(r.warnings.len(), 1);
+        assert!(matches!(
+            &r.warnings[0],
+            AttributionWarning::MissingPrefix { suggested_prefix }
+                if suggested_prefix == "[foo]"
+        ));
+        assert_eq!(r.next_effective_plan, Some(plan("foo")));
+    }
+
+    #[test]
+    fn classify_no_prefix_code_with_walkback_attributes_to_parent() {
+        let r = classify_with(
+            "implement",
+            vec![],
+            true,
+            Some(plan("foo")),
+            known(&["foo"]),
+        );
+        match &r.body {
+            CommitBody::Plan(PlanCommit::CodeOnly { plan: p, .. }) => {
+                assert_eq!(p, &plan("foo"));
+            }
+            other => panic!("expected CodeOnly, got {other:?}"),
+        }
+        // MissingPrefix warning still fires — operator should amend.
+        assert!(matches!(
+            r.warnings.first(),
+            Some(AttributionWarning::MissingPrefix { .. })
+        ));
+        assert_eq!(r.next_effective_plan, Some(plan("foo")));
+    }
+
+    #[test]
+    fn classify_no_prefix_no_context_is_ad_hoc_no_warning() {
+        let r = classify_with("random code", vec![], true, None, known(&[]));
+        assert!(matches!(r.body, CommitBody::AdHoc(_)));
+        assert!(r.warnings.is_empty());
+        assert_eq!(r.next_effective_plan, None);
+    }
+
+    #[test]
+    fn classify_no_prefix_multi_touch_is_multi_plan_with_warning() {
+        let r = classify_with(
+            "double touch",
+            vec![touch("foo"), touch("bar")],
+            false,
+            None,
+            known(&["foo", "bar"]),
+        );
+        assert!(matches!(r.body, CommitBody::MultiPlan(_)));
+        assert_eq!(r.warnings.len(), 1);
+    }
+
+    #[test]
+    fn classify_finalize_event_returns_finalize_commit() {
+        let mut finalize: BTreeSet<PlanKey> = BTreeSet::new();
+        finalize.insert(plan("foo"));
+        let mut approvers: BTreeMap<PlanKey, u32> = BTreeMap::new();
+        approvers.insert(plan("foo"), 2);
+        let r = classify(ClassifierInputs {
+            subject: "Finalize foo",
+            plan_touches: &[],
+            has_non_plan_code: false,
+            plans_finalized_here: &finalize,
+            finalize_approver_counts: &approvers,
+            current_effective: Some(&plan("foo")),
+            known_plans: &known(&["foo"]),
+        });
+        match &r.body {
+            CommitBody::Finalize(f) => {
+                assert_eq!(f.plan, plan("foo"));
+                assert_eq!(f.approver_count, 2);
+            }
+            other => panic!("expected Finalize, got {other:?}"),
+        }
+        // Finalize is transparent to walk-back.
+        assert_eq!(r.next_effective_plan, Some(plan("foo")));
+    }
+
+    #[test]
+    fn classify_misc_prefix_preserves_walkback_through_misc_chain() {
+        // Sequence: A=[foo] intro, B=[misc] doc, C=unprefixed code.
+        // After A, effective=foo. After B (misc, no touches), effective
+        // stays foo. After C (code, no prefix, parent=foo), should
+        // inherit foo.
+        let after_a = classify_with(
+            "[foo] intro",
+            vec![touch("foo")],
+            false,
+            None,
+            known(&["foo"]),
+        );
+        assert_eq!(after_a.next_effective_plan, Some(plan("foo")));
+        let after_b = classify_with(
+            "[misc] doc fix",
+            vec![],
+            true,
+            after_a.next_effective_plan.clone(),
+            known(&["foo"]),
+        );
+        assert_eq!(after_b.next_effective_plan, Some(plan("foo")));
+        let after_c = classify_with(
+            "implement",
+            vec![],
+            true,
+            after_b.next_effective_plan.clone(),
+            known(&["foo"]),
+        );
+        match &after_c.body {
+            CommitBody::Plan(PlanCommit::CodeOnly { plan: p, .. }) => {
+                assert_eq!(p, &plan("foo"), "C should inherit foo from A through B");
+            }
+            other => panic!("expected CodeOnly(foo), got {other:?}"),
+        }
     }
 }
