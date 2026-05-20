@@ -2,146 +2,149 @@
 
 Make the operator CLI derive Trinity state directly from the local
 repository instead of querying `trinity serve`, then add
-`trinity status` as the first user-facing command built on that local
-state path.
+`trinity status` as the first user-facing read command built on that
+local state path.
 
 ## Why
 
-The current CLI split is backwards for mutating commands. The daemon
-is useful as a cache, watcher, web UI, and coordination server, but it
-should not be required for commands like `trinity finish` and
-`trinity purge`. Those commands mutate the user's git repository; at
-the moment of mutation the most trustworthy source of truth is the
-repository and `.trinity/` files on disk, folded freshly in the process
-that is about to mutate git.
+The current CLI is structured backwards for mutating commands. The
+daemon is useful as a cache, file watcher, web UI, and coordination
+server, but it should not be required for commands that mutate the
+user's git repository. At the moment of mutation the most trustworthy
+source of truth is the repository plus the `.trinity/` files on disk,
+folded freshly in the same process that is about to mutate git.
 
-This also removes a frustrating operational dependency: an operator can
-be in a perfectly valid git repo with all plan and feedback files on
-disk, but the CLI fails if the daemon is down, stale, watching an old
-worktree, or briefly unreachable. That violates the filesystem-truth
-direction of the architecture.
+This also removes a frustrating operational dependency: an operator
+can be in a perfectly valid repo with all plan and feedback files on
+disk, but `trinity finish` / `trinity purge` fail if the daemon is
+down, stale, watching an old worktree, or briefly unreachable. That
+violates the filesystem-truth direction the rest of the architecture
+already commits to.
 
-The better model:
+The correct model:
 
 - source of truth: git history plus `.trinity/` files on disk
 - pure fold: canonical derivation of `RepoState`
-- CLI: rebuilds state locally before mutating git
-- daemon: cache, UI, file watcher, wait-for-work coordinator
+- CLI: rebuilds state locally inside the process that mutates git
+- daemon: cache, web UI, file watcher, MCP coordination
 
-No CLI command should ask the daemon for projection state.
+No CLI mutation should ask the daemon for projection state.
 
 ## Current State
 
-The code already has most of the right primitives:
+The fold and projection primitives already exist:
 
 - `src/rebuild.rs::rebuild_repo(repo_root)` runs
   `git_io::snapshot(repo_root)` and `disk_snapshot::derive_state`.
 - `src/disk_snapshot.rs::derive_state` is the pure chronological fold.
-- `src/responses.rs` contains reusable `RepoState -> api` projection
-  helpers for plan lists and work context.
+- `src/responses.rs` projects `RepoState` into the wire shapes used by
+  list plans / work context.
 - `src/server/http.rs` still owns the finish/rewrite preview builders
   inline in the HTTP handlers.
 - `src/cli/finish.rs` and `src/cli/purge.rs` call daemon HTTP endpoints
-  with `reqwest` and then execute local git mutations.
+  with `reqwest` and then run local git mutations.
 
-This plan extracts the preview builders out of HTTP and makes both HTTP
-and CLI call the same local projection code.
+The remaining work is to lift the preview builders out of the HTTP
+layer so both HTTP and CLI invoke the same projection code, and to
+remove the HTTP round trip from the CLI mutation paths.
 
 ## Non-Goals
 
-- No daemon fallback path for CLI. The goal is not "try daemon, then
-  fold locally"; the goal is "CLI never queries daemon".
-- No new database or persistent CLI cache.
-- No change to MCP or web UI semantics, except that their HTTP handlers
-  call the extracted preview builders.
-- No redesign of dry-run/live rewrite parity. That is the separate stub
-  `.trinity/stubs/dry-run-executes-rendered-program.md`.
+- No daemon fallback for the CLI. The goal is not "try daemon, then
+  fold locally"; the goal is "CLI never queries the daemon".
+- No new persistent CLI cache.
+- No redesign of dry-run vs. live rewrite parity. That is the separate
+  stub `.trinity/stubs/dry-run-executes-rendered-program.md`.
+- No change to MCP or web UI semantics. `wait_for_work`, `start_plan`,
+  SSE, and the web SPA stay daemon-coupled — this plan only touches
+  the operator-mutating CLI surfaces and the read-only `status`
+  command.
+- No compatibility shim for the removed `--daemon` flag on
+  `finish`/`purge`. Heavy-dev mode: clean break, hard error if anyone
+  passes it.
 
 ## Design
 
-### Local CLI State Entry Point
+### Local State In CLI Commands
 
-Add a small CLI-facing state module, for example `src/cli/state.rs`:
+CLI subcommands that need Trinity state call `rebuild::rebuild_repo`
+directly after resolving the repo root with `resolve_repo` (the
+existing `git rev-parse --show-toplevel` helper in `src/cli/mod.rs`).
 
-```rust
-pub async fn load_repo_state(repo: &Path) -> anyhow::Result<RepoState> {
-    crate::rebuild::rebuild_repo(repo).await.map_err(...)
-}
-```
+No new wrapper module — `rebuild_repo` already returns a `RepoState`
+and is the canonical fold. Adding `src/cli/state.rs` to call one
+function is noise.
 
-All CLI subcommands that need Trinity state go through this function
-after resolving the repo root with the same `git rev-parse
---show-toplevel` behavior as today.
-
-This should be a thin wrapper, not another state model. The CLI should
-not cache, partially rebuild, or invent a faster path. It folds the
-repo it is about to mutate.
+The CLI must not cache, partially rebuild, or invent a faster path.
+It folds the repo it is about to mutate, every time.
 
 ### Shared Preview Builders
 
-Move the logic currently embedded in HTTP handlers into reusable
-projection functions. Suggested module names:
+Move the finish/rewrite projection logic currently inlined in
+`src/server/http.rs` into a new module `src/preview.rs`. This is the
+canonical preview module; both HTTP and CLI become thin callers.
 
-- `src/operation_preview.rs`
-- or `src/cli_preview.rs`
-
-The module should expose typed functions along these lines:
+Exposed surface:
 
 ```rust
-pub async fn finish_preview_from_state(
+pub fn build_finish_preview(
     repo_root: &Path,
-    repo_basename: &str,
     state: &RepoState,
     plan_key: &PlanKey,
 ) -> Result<FinishPreviewResponse, PreviewError>;
 
-pub async fn rewrite_preview_from_state(
+pub fn build_rewrite_preview(
     repo_root: &Path,
-    repo_basename: &str,
     state: &RepoState,
     plan_key: &PlanKey,
     include_finalize: bool,
 ) -> Result<RewritePreviewResponse, PreviewError>;
 
-pub async fn rewrite_preview_all_from_repo(
+pub fn build_rewrite_preview_all(
     repo_root: &Path,
-    repo_basename: &str,
+    state: &RepoState,
     include_finalize: bool,
 ) -> Result<PurgeAllPreviewResponse, PreviewError>;
 ```
 
-`finish_preview_from_state` should contain the current readiness,
-latest-reviewable, gate, worktree-status, and sealed-approval logic.
+`repo_basename` is derived inside the builder from `repo_root` —
+callers don't pass it.
 
-`rewrite_preview_from_state` should contain the current single-plan
-range, native/foreign classification, tree-based strip-path lookup,
-linearity check, and `head_strip_paths` logic.
+`PreviewError` is a typed enum in `trinity-core::api` (alongside the
+response types it pairs with) so the CLI can match on it and emit
+specific error messages.
 
-`rewrite_preview_all_from_repo` can rebuild or take a state argument if
-useful, but it must remain local and daemon-free. The all-plans variant
-currently does more git inspection than state projection; that is fine
-as long as the shared builder is used by both CLI and HTTP.
+`build_finish_preview` owns readiness, latest-reviewable resolution,
+gate check, worktree-status, and sealed-approval projection.
 
-The HTTP routes become adapters:
+`build_rewrite_preview` owns the single-plan range, native/foreign
+classification, tree-based strip-path lookup, linearity check, and
+`head_strip_paths` projection.
+
+`build_rewrite_preview_all` owns the all-plans variant. It currently
+does more git inspection than state projection; both still go through
+this single builder.
+
+HTTP routes become adapters:
 
 1. Resolve repo/plan from daemon runtime state.
 2. Call the shared builder.
-3. Serialize the returned typed response.
+3. Serialize the typed response.
 
-The CLI commands become adapters:
+CLI commands become adapters:
 
 1. Resolve repo from `--repo` or cwd.
 2. Rebuild local `RepoState`.
-3. Resolve plan locally.
+3. Resolve plan locally (see below).
 4. Call the shared builder.
-5. Execute local git mutation.
+5. Execute the local git mutation.
 
-No duplicate preview logic is allowed.
+No duplicate preview logic is allowed to remain in either layer.
 
 ### Local Plan Resolution
 
 Replace daemon-based plan inference with local inference from
-`RepoState`.
+`RepoState`. Live in `src/cli/plan_resolve.rs`.
 
 Rules:
 
@@ -149,48 +152,52 @@ Rules:
   - accept `<repo>/<stem>.md`
   - accept `<stem>`
   - reject repo basename mismatch
-  - reject missing/ambiguous plan
+  - reject missing/ambiguous plan with a clear error listing
+    candidates
 - If no plan argument is provided:
   - inspect visible active plans in the local `RepoState`
   - require exactly one
   - on zero or many, print a clear error with candidate plan ids
 
-This should share the same visibility/lifecycle rules used by list
-plans/status, not ad hoc string filters.
+"Active" must use the same visibility/lifecycle rules used by
+`list_plans` and the upcoming `trinity status`, not ad-hoc string
+filters.
 
-### Remove Daemon Arguments From CLI Commands
+### Remove Daemon Arguments From CLI Mutations
 
 Delete `--daemon` / `TRINITY_DAEMON_URL` from:
 
 - `trinity finish`
 - `trinity purge`
 
-Keep daemon configuration only where a command is explicitly about
-daemon coordination. `trinity init`, `finish`, `purge`, and `status`
-should work with no running daemon.
+`trinity init` is already daemon-free; confirm and add a regression
+test.
 
-This is an intentional CLI wire break. Acknowledge it in help text and
-tests; do not keep compatibility shims just to preserve an option that
-should no longer exist.
+`TRINITY_DAEMON_URL` remains valid for the MCP shim and any explicit
+daemon-coordination commands. Just not for these mutating CLIs.
 
-### Hash Checks Still Matter
+This is an intentional CLI wire break. No compat shim, no deprecation
+window. Help text and tests reflect the new shape directly.
 
-`trinity finish` currently protects against daemon/watch lag by
-re-reading sealed approval files and checking their body hashes against
-the daemon preview. Preserve that invariant, but now the hash comes
-from the locally rebuilt state.
+### Hash Drift Checks Stay
 
-The sequence is:
+`trinity finish` already protects against daemon/watch lag by
+re-reading sealed approval files and comparing their body hashes to
+the preview snapshot before writing `.trinity/finished/<stem>/`.
+Preserve that invariant — the hash now comes from the locally
+rebuilt state instead of an HTTP response.
+
+Sequence:
 
 1. Fold repo locally.
-2. Build finish preview with sealed approval paths and body hashes.
+2. Build finish preview with sealed-approval paths and body hashes.
 3. Before writing `.trinity/finished/<stem>/`, re-read each feedback
    file.
 4. Recompute hash.
 5. Abort on drift.
 
-This still protects against a reviewer editing feedback during the CLI
-run.
+This continues to protect against a reviewer editing feedback during
+the CLI run.
 
 ### `trinity status`
 
@@ -200,65 +207,72 @@ After CLI state is local, add:
 trinity status [--repo <path>] [--json]
 ```
 
-Default repo resolution matches `git status`: start from cwd and use
-`git rev-parse --show-toplevel`.
+Default repo resolution matches `git status`: start from cwd, walk to
+the git toplevel.
 
-Human output should be compact and operational:
+Human output is compact and scannable. Sketch:
 
 ```text
-repo: /Users/llfourn/src/trinity
-head: 0a0f6de Bump trinity to 0.5.0 for Phases 5-8 ship
+repo  /Users/llfourn/src/trinity (master @ 0a0f6de)
 
-plans:
-  active:
-    trinity/local-cli-state-and-status.md
-      path: .trinity/plans/cli-local-state-and-status.md
-      phase: planning
-      waiting_on: reviewers
-      latest: plan 0a0f6de
-      gate: approved 2/2
-  finished:
-    trinity/trinity-cli.md
-      finished_at: 0a0f6de
+active plans:
+  trinity/cli-local-state-and-status.md
+    phase    intro
+    waiting  reviewers
+    latest   0a0f6de  Bump trinity to 0.5.0 for Phases 5-8 ship
+    gate     0/2
+
+finished plans:
+  trinity/trinity-cli.md         @ 064ddf0
 ```
 
-Exact formatting can be adjusted, but it must expose:
+Exact formatting may be adjusted during implementation, but the
+output must surface:
 
-- canonical repo root
-- HEAD sha and subject
-- visible plans grouped by lifecycle
+- canonical repo root, current branch, HEAD short-sha + subject
+- visible plans grouped by lifecycle (active / finished)
 - plan id and repo-relative plan path
-- current posture/phase
-- worktree status
+- current phase / posture
+- waiting-on role
 - latest reviewable commit, if any
-- gate state / waiting-on summary
-- feedback write path for the current reviewer only if an
-  `--author-label` flag is later added; do not invent a default author
-  in this plan
+- gate state
+- worktree dirty / clean indicator (compact, e.g. trailing `*` on
+  the head line)
 
-`--json` should emit a typed response shape from `trinity-core::api`.
-Prefer reusing or lightly extending `ListPlansResponse` plus repo
-metadata over adding stringly-typed JSON. If a new wire type is needed,
-put it in `trinity-core`.
+No author-specific output in this plan. A future `--author-label`
+flag can add "your next action" later; do not invent a default
+author here.
+
+`--json` emits a typed response from `trinity-core::api`. Prefer
+extending `ListPlansResponse` with repo metadata over coining a new
+stringly-typed shape. If a new wire type is genuinely needed, it
+lives in `trinity-core`.
 
 ## Testing
 
-Add tests that prove the CLI no longer depends on the daemon:
+Tests must prove the CLI no longer touches the daemon:
 
-1. `trinity finish` succeeds in a fixture repo with no daemon running.
-2. `trinity finish` rejects unapproved gates using only local state.
-3. `trinity purge --dry` succeeds in a fixture repo with no daemon
+1. `trinity finish` succeeds in a fixture repo with no daemon
    running.
-4. `trinity purge --into-branch` succeeds in a fixture repo with no
+2. `trinity finish` rejects an unapproved gate using only local
+   state.
+3. `trinity finish` aborts on feedback-body-hash drift detected
+   between the local fold and the on-disk file at write time.
+4. `trinity purge --dry` succeeds in a fixture repo with no daemon
+   running.
+5. `trinity purge --into-branch` succeeds in a fixture repo with no
    daemon running.
-5. Plan inference with no plan arg uses local active plans and reports
-   useful zero/many errors.
-6. `trinity status` from a nested cwd resolves the repo root like git.
-7. `trinity status --json` round-trips through the typed API shape.
-8. HTTP `finish_preview` and CLI-local preview builder produce the same
-   `FinishPreviewResponse` for the same fixture.
-9. HTTP `rewrite_preview` and CLI-local preview builder produce the same
-   `RewritePreviewResponse` for the same fixture.
+6. `trinity init` works with no daemon running (regression).
+7. Plan inference with no plan arg uses local active plans and
+   reports useful zero/many errors.
+8. `trinity status` from a nested cwd resolves the repo root like
+   `git status`.
+9. `trinity status --json` round-trips through the typed API shape
+   in `trinity-core`.
+10. HTTP `finish_preview` and the shared builder produce the same
+    `FinishPreviewResponse` for the same fixture.
+11. HTTP `rewrite_preview` and the shared builder produce the same
+    `RewritePreviewResponse` for the same fixture.
 
 Run:
 
@@ -272,49 +286,53 @@ cargo fmt -- --check
 
 ### Phase 1: Extract Preview Builders
 
-Move finish/rewrite/all-rewrite preview construction out of
-`server/http.rs` and into shared code. HTTP behavior should remain
-unchanged. Add parity tests around the extracted functions.
+Lift finish / rewrite / all-rewrite preview construction out of
+`server/http.rs` into `src/preview.rs`. HTTP behavior unchanged. Add
+parity tests around the extracted functions and the typed
+`PreviewError`.
 
 ### Phase 2: Local CLI Plan Resolution
 
-Add CLI-local repo-state loading and local plan inference. Remove the
-daemon query from plan resolution. Existing CLI commands may still call
-HTTP for preview until Phase 3, but plan selection itself should be
-local.
+Add `src/cli/plan_resolve.rs` and the local plan-inference rules.
+Remove daemon queries from plan selection. Existing CLI commands may
+still call HTTP for preview at this point — only plan selection is
+moved local.
 
 ### Phase 3: Remove Daemon Queries From `finish`
 
 Switch `trinity finish` and `finish --amend` to use local state plus
-the shared finish preview builder. Remove `--daemon` from `FinishArgs`.
-Preserve approval body hash drift checks.
+the shared finish preview builder. Remove `--daemon` from
+`FinishArgs`. Preserve approval body hash drift checks.
 
 ### Phase 4: Remove Daemon Queries From `purge`
 
-Switch single-plan purge, all-plans purge, squash, amend, and finish
-composite rewrite preview calls to local state/shared builders. Remove
-`--daemon` from `PurgeArgs`.
+Switch single-plan purge, all-plans purge, squash, amend, and the
+finish composite rewrite preview to local state / shared builders.
+Remove `--daemon` from `PurgeArgs`.
 
 ### Phase 5: Add `trinity status`
 
-Add the status command and typed JSON output. Use it as the visible
-proof that the CLI can fold and project the current repo without a
-daemon.
+Ship the status command and its typed JSON output. This is the
+visible proof that the CLI can fold and project the current repo
+without a daemon.
 
-### Phase 6: Documentation And Cleanup
+### Phase 6: Cleanup
 
-Update CLI help/docs to say the daemon is not required for
-`init`/`status`/`finish`/`purge`. Remove dead reqwest imports and any
-CLI-only daemon plumbing made obsolete by this plan.
+Drop dead `reqwest` use from CLI mutation paths. Update CLI help and
+any inline docs to say the daemon is not required for
+`init`/`status`/`finish`/`purge`. Remove any CLI-only daemon plumbing
+made obsolete.
 
 ## Acceptance Criteria
 
-- `trinity finish`, `trinity purge`, and `trinity status` do not make
-  HTTP requests and do not accept a daemon URL.
-- The daemon can be stopped and the CLI still works against the current
-  repo.
+- The daemon process can be fully stopped and
+  `trinity init`/`status`/`finish`/`purge` still work against the
+  current repo.
+- `trinity finish`, `trinity purge`, and `trinity status` make no
+  HTTP requests and do not accept a daemon URL or env var.
 - HTTP preview endpoints and CLI commands share the same preview
-  builders.
-- `trinity status` reports the current repo from cwd without any daemon
-  process.
-- No duplicate finish/rewrite projection logic remains in CLI and HTTP.
+  builders. No duplicate finish/rewrite projection logic remains.
+- `trinity status` resolves the current repo from cwd without any
+  daemon process.
+- MCP coordination (`wait_for_work`, `start_plan`) and the web UI
+  continue to function unchanged; this plan does not regress them.
