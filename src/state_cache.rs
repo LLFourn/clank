@@ -50,8 +50,10 @@ const CACHE_MAGIC: &[u8] = b"TRINITY-BASE-STATE\n";
 /// Format-version bumps:
 ///  - v1: original `BaseStatePayload { plans }`.
 ///  - v2: adds repo-wide `commits` map (Phase 1 of
-///    commit-first-review-model). Older caches are invalidated.
-const CACHE_FORMAT_VERSION: u32 = 2;
+///    commit-first-review-model).
+///  - v3: adds `commit_order: Vec<CommitSha>` to encode the
+///    first-parent fold sequence. Older caches are invalidated.
+const CACHE_FORMAT_VERSION: u32 = 3;
 
 /// Trinity binary identity. Bump on incompatible changes that
 /// would make decoded state semantically invalid even if it
@@ -101,6 +103,7 @@ pub enum CacheError {
 struct BaseStatePayload {
     plans: BTreeMap<PlanKey, Plan>,
     commits: BTreeMap<crate::lifecycle::CommitSha, crate::repo_state::CommitNode>,
+    commit_order: Vec<crate::lifecycle::CommitSha>,
 }
 
 impl BaseStatePayload {
@@ -108,6 +111,7 @@ impl BaseStatePayload {
         Self {
             plans: state.plans.clone(),
             commits: state.commits.clone(),
+            commit_order: state.commit_order.clone(),
         }
     }
 
@@ -119,6 +123,7 @@ impl BaseStatePayload {
             root,
             plans: self.plans,
             commits: self.commits,
+            commit_order: self.commit_order,
             head: Some(head),
             plan_conflicts: BTreeMap::new(),
         };

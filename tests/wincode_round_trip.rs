@@ -33,6 +33,7 @@ use wincode::{SchemaRead, SchemaWrite};
 struct BaseStatePayloadFixture {
     plans: BTreeMap<CorePlanKey, Plan>,
     commits: BTreeMap<CommitSha, CommitNode>,
+    commit_order: Vec<CommitSha>,
 }
 
 fn run_git(cwd: &Path, args: &[&str]) {
@@ -81,6 +82,7 @@ fn payload_from_base(base: &BaseRepoState) -> BaseStatePayloadFixture {
     BaseStatePayloadFixture {
         plans: base.plans.clone(),
         commits: base.commits.clone(),
+        commit_order: base.commit_order.clone(),
     }
 }
 

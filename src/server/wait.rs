@@ -576,6 +576,22 @@ fn collect_active_commit_candidates(
     }
 }
 
+/// Walk `RepoState.commit_order` (the fold's true first-parent
+/// sequence — never reconstructed from `author_ts`) and emit one
+/// candidate per active plan, ordered by where that plan's LATEST
+/// reviewable commit sits in the fold sequence.
+///
+/// **Supersession rule (documented):** repo-scope considers ONLY
+/// each active plan's latest reviewable commit. A plan with three
+/// reviewable commits — plan_intro at fold-index 1, revision at
+/// fold-index 4, impl at fold-index 7 — surfaces ONCE as
+/// "needs work on fold-index 7." The earlier reviewable commits
+/// on that plan are historical: reviews exist on them, but the
+/// gate that drives "what should I do next?" is the latest.
+/// Phase 4 ad hoc reviewable commits join this stream as their own
+/// nodes; they have no supersession (every ad hoc commit is its
+/// own review unit). The explicit-plan path keeps the same rule
+/// for symmetry.
 fn collect_repo_scope_candidates(
     trinity: &Trinity,
     repo_ref: &str,
@@ -586,13 +602,15 @@ fn collect_repo_scope_candidates(
         .get(&repo_root)
         .ok_or_else(|| WaitError::UnknownRepo(repo_ref.to_string()))?;
 
-    // Walk the commit map. For each reviewable commit attributed to
-    // a single non-frozen plan, record `(plan_key, author_ts, sha)`.
-    // After the walk, keep only the LATEST reviewable commit per
-    // plan (supersession), then order by that commit's author_ts so
-    // chronologically-earlier plans surface first.
-    let mut per_plan_latest: BTreeMap<PlanKey, (i64, CommitSha)> = BTreeMap::new();
-    for (sha, node) in &repo_state.commits {
+    // Single pass over commit_order: for each reviewable
+    // Plan(p)-attributed commit, overwrite the per-plan latest
+    // entry. Because we walk in fold order, the last write wins
+    // and naturally captures the latest reviewable commit per plan.
+    let mut latest_per_plan: BTreeMap<PlanKey, CommitSha> = BTreeMap::new();
+    for sha in &repo_state.commit_order {
+        let Some(node) = repo_state.commits.get(sha) else {
+            continue;
+        };
         if node.gate.is_none() {
             continue;
         }
@@ -609,31 +627,37 @@ fn collect_repo_scope_candidates(
         if plan.is_frozen() {
             continue;
         }
-        match per_plan_latest.get(&plan_key) {
-            Some((ts, _)) if *ts >= node.author_ts => {}
-            _ => {
-                per_plan_latest.insert(plan_key, (node.author_ts, sha.clone()));
-            }
-        }
+        latest_per_plan.insert(plan_key, sha.clone());
     }
 
-    // Sort plans by their latest-reviewable-commit timestamp
-    // ascending, ties broken by plan key for determinism. This is
-    // the chronological order codex's review pins.
-    let mut ordered: Vec<(PlanKey, i64, CommitSha)> = per_plan_latest
-        .into_iter()
-        .map(|(key, (ts, sha))| (key, ts, sha))
-        .collect();
-    ordered.sort_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.as_str().cmp(b.0.as_str())));
-
-    Ok(ordered
-        .into_iter()
-        .filter_map(|(plan_key, _ts, _sha)| {
-            let plan = repo_state.plans.get(&plan_key)?;
+    // Walk commit_order AGAIN forward, emitting candidates only for
+    // the SHAs that ARE the latest-reviewable for their plan. This
+    // preserves the fold's chronology AND deduplicates plans (each
+    // plan appears at most once in the candidate stream).
+    let latest_set: std::collections::BTreeSet<&CommitSha> = latest_per_plan.values().collect();
+    let mut candidates = Vec::new();
+    for sha in &repo_state.commit_order {
+        if !latest_set.contains(sha) {
+            continue;
+        }
+        let Some(node) = repo_state.commits.get(sha) else {
+            continue;
+        };
+        let plan_key = match &node.attribution {
+            crate::repo_state::CommitAttribution::Plan { plan } => plan.clone(),
+            _ => continue,
+        };
+        if let Some(plan) = repo_state.plans.get(&plan_key) {
             let plan_id = crate::lifecycle::PlanId::new(basename.clone(), plan_key);
-            Some(build_candidate(repo_root.clone(), plan_id, plan, repo_state))
-        })
-        .collect())
+            candidates.push(build_candidate(
+                repo_root.clone(),
+                plan_id,
+                plan,
+                repo_state,
+            ));
+        }
+    }
+    Ok(candidates)
 }
 
 /// Resolve a `repo` argument (basename `frostsnap` OR absolute path
@@ -1157,20 +1181,18 @@ mod integration_tests {
     }
 
     /// Phase 3 (commit-first-review-model) architectural regression:
-    /// repo-scope walks the COMMIT STREAM chronologically, not the
-    /// alphabetical plan map. Codex's example: introduce plan `zzz`
+    /// repo-scope walks the COMMIT STREAM by fold order, not
+    /// alphabetical plan keys. Codex's example: introduce plan `zzz`
     /// FIRST and plan `aaa` SECOND. Both have a reviewable plan_intro
     /// needing the same reviewer. The plan-key-alphabetical order
-    /// would return aaa@commit-2, but the chronological order must
-    /// return zzz@commit-1.
+    /// would return aaa@commit-2, but the fold-order walk returns
+    /// zzz@commit-1.
     #[tokio::test]
     async fn repo_scope_returns_chronologically_earliest_plan_not_alphabetical() {
         let dir = init_repo();
-        // Introduce zzz FIRST so its plan_intro has the older
-        // author_ts. Sleep a beat so author_ts differs deterministically.
+        // Introduce zzz FIRST.
         write_file(dir.path(), ".trinity/plans/zzz.md", "# zzz\n");
         commit(dir.path(), "intro zzz");
-        std::thread::sleep(std::time::Duration::from_secs(1));
         write_file(dir.path(), ".trinity/plans/aaa.md", "# aaa\n");
         commit(dir.path(), "intro aaa");
         let rt = Runtime::new();
@@ -1198,6 +1220,73 @@ mod integration_tests {
             payload.work.plans.iter().any(|p| p.ends_with("zzz.md")),
             "repo-scope must return chronologically-earliest plan zzz first; \
              got plans={:?} (this regresses to plan-key-alphabetical fan-out)",
+            payload.work.plans
+        );
+    }
+
+    /// Phase 3 architectural regression for codex on 0da8236:
+    /// repo-scope MUST use the fold's first-parent commit order, not
+    /// derived `author_ts` sorting. Pin the invariant by committing
+    /// two plan_intros with an IDENTICAL author timestamp but
+    /// distinct fold positions. The fold-order walk surfaces the
+    /// one that came first in the chain; a timestamp-only sort would
+    /// be non-deterministic.
+    #[tokio::test]
+    async fn repo_scope_walks_fold_order_not_author_ts() {
+        let dir = init_repo();
+        // Force both commits to share an author timestamp.
+        let fixed_ts = "Mon Jan 1 00:00:00 2024 +0000";
+        write_file(dir.path(), ".trinity/plans/first.md", "# first\n");
+        run_git(dir.path(), &["add", "-A"]);
+        run_git(
+            dir.path(),
+            &[
+                "commit",
+                "--quiet",
+                "--date",
+                fixed_ts,
+                "-m",
+                "intro first",
+            ],
+        );
+        write_file(dir.path(), ".trinity/plans/second.md", "# second\n");
+        run_git(dir.path(), &["add", "-A"]);
+        run_git(
+            dir.path(),
+            &[
+                "commit",
+                "--quiet",
+                "--date",
+                fixed_ts,
+                "-m",
+                "intro second",
+            ],
+        );
+        let rt = Runtime::new();
+        rt.add_repo(dir.path().to_path_buf()).await.unwrap();
+
+        let basename = dir
+            .path()
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap()
+            .to_string();
+        let args = WaitArgs {
+            role: WaitingRole::Reviewers,
+            plan_id: None,
+            repo: Some(basename),
+            author_label: Some("codex".to_string()),
+            timeout_secs: Some(2),
+        };
+        let resp = wait_for_work(&rt, args).await.unwrap();
+        let payload = match resp {
+            WaitResponse::Work(p) => p,
+            WaitResponse::Timeout(_) => panic!("expected work, got timeout"),
+        };
+        assert!(
+            payload.work.plans.iter().any(|p| p.ends_with("first.md")),
+            "fold-order walk must return `first` (the earlier commit), even \
+             when both commits share the same author_ts; got plans={:?}",
             payload.work.plans
         );
     }

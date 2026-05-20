@@ -62,6 +62,13 @@ pub struct RepoState {
     /// projection over it. Phase 2 makes `CommitNode.gate`
     /// authoritative; Phase 1 shadows it.
     pub commits: BTreeMap<CommitSha, CommitNode>,
+    /// The fold's first-parent commit order, oldest-first. The
+    /// commit-first matcher walks this directly instead of
+    /// reconstructing chronology from `CommitNode.author_ts`,
+    /// which is unreliable (timestamps can be edited, ties exist).
+    /// Always populated by `disk_snapshot::apply_commit` and
+    /// survives the cache.
+    pub commit_order: Vec<CommitSha>,
     pub head: Option<CommitSha>,
     /// Plans whose disk state is contradictory at rebuild time. Today
     /// effectively unused (path-parser rejects `.trinity/plans/done/`),
@@ -77,16 +84,23 @@ impl RepoState {
     /// every other plan's clone.
     pub fn single_plan(&self, key: &PlanKey) -> Option<RepoState> {
         let plan = self.plans.get(key)?;
-        let commits = self
+        let commits: BTreeMap<CommitSha, CommitNode> = self
             .commits
             .iter()
             .filter(|(_, node)| node.plans.contains(key))
             .map(|(sha, node)| (sha.clone(), node.clone()))
             .collect();
+        let commit_order = self
+            .commit_order
+            .iter()
+            .filter(|sha| commits.contains_key(*sha))
+            .cloned()
+            .collect();
         Some(RepoState {
             root: self.root.clone(),
             plans: [(key.clone(), plan.clone())].into_iter().collect(),
             commits,
+            commit_order,
             head: self.head.clone(),
             plan_conflicts: std::collections::BTreeMap::new(),
         })
@@ -97,6 +111,7 @@ impl RepoState {
             root,
             plans: BTreeMap::new(),
             commits: BTreeMap::new(),
+            commit_order: Vec::new(),
             head: None,
             plan_conflicts: BTreeMap::new(),
         }

@@ -616,6 +616,7 @@ pub fn apply_commit(state: &mut RepoState, carry: &mut FoldCarry, event: &Commit
         single_plan_gate,
     );
     state.commits.insert(commit_sha.clone(), commit_node);
+    state.commit_order.push(commit_sha.clone());
 
     // 7. Carry forward.
     carry.previous_commit = Some(commit_sha);
