@@ -334,3 +334,523 @@ pub struct CommitNode {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub attribution_warning: Option<String>,
 }
+
+// ============================================================
+// Phase 1 of `core-model-invalid-states-unrepresentable`:
+// new canonical types living alongside the legacy `CommitNode`
+// + `Plan.timeline` shape. Phase 2 wires the classifier to
+// emit them; Phase 3 swaps `RepoState.commits` and deletes the
+// old fields. Until then these are compile-only — no fold path
+// produces or consumes them.
+// ============================================================
+
+/// A `Vec` that cannot be empty. The only constructor returns
+/// `Err` for empty inputs. Used where the type's purpose demands
+/// at least one element (`ReviewPolicy::Blocking` participants).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(
+    feature = "cache-encoding",
+    derive(wincode::SchemaWrite, wincode::SchemaRead)
+)]
+#[serde(
+    bound(
+        serialize = "T: Clone + Serialize",
+        deserialize = "T: Clone + Deserialize<'de>"
+    ),
+    try_from = "Vec<T>",
+    into = "Vec<T>"
+)]
+pub struct NonEmptyVec<T>
+where
+    T: Clone,
+{
+    inner: Vec<T>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NonEmptyVecError;
+
+impl std::fmt::Display for NonEmptyVecError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("NonEmptyVec cannot be constructed from an empty Vec")
+    }
+}
+
+impl std::error::Error for NonEmptyVecError {}
+
+impl<T> NonEmptyVec<T>
+where
+    T: Clone,
+{
+    pub fn new(items: Vec<T>) -> Result<Self, NonEmptyVecError> {
+        if items.is_empty() {
+            Err(NonEmptyVecError)
+        } else {
+            Ok(Self { inner: items })
+        }
+    }
+    pub fn first(&self) -> &T {
+        &self.inner[0]
+    }
+    pub fn as_slice(&self) -> &[T] {
+        &self.inner
+    }
+    pub fn iter(&self) -> std::slice::Iter<'_, T> {
+        self.inner.iter()
+    }
+    pub fn len(&self) -> usize {
+        self.inner.len()
+    }
+}
+
+impl<T> TryFrom<Vec<T>> for NonEmptyVec<T>
+where
+    T: Clone,
+{
+    type Error = NonEmptyVecError;
+    fn try_from(v: Vec<T>) -> Result<Self, Self::Error> {
+        NonEmptyVec::new(v)
+    }
+}
+
+impl<T> From<NonEmptyVec<T>> for Vec<T>
+where
+    T: Clone,
+{
+    fn from(v: NonEmptyVec<T>) -> Vec<T> {
+        v.inner
+    }
+}
+
+/// Plan-file body + content hash that can never disagree. The
+/// only constructor computes the hash from the body text.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(
+    feature = "cache-encoding",
+    derive(wincode::SchemaWrite, wincode::SchemaRead)
+)]
+pub struct PlanBody {
+    text: String,
+    hash: ContentHash,
+}
+
+impl PlanBody {
+    pub fn new(text: String) -> Self {
+        let hash =
+            ContentHash::from_hex_unchecked(blake3::hash(text.as_bytes()).to_hex().to_string());
+        Self { text, hash }
+    }
+    pub fn text(&self) -> &str {
+        &self.text
+    }
+    pub fn hash(&self) -> &ContentHash {
+        &self.hash
+    }
+}
+
+/// One reviewer's feedback body. The legacy `Feedback.author`
+/// field is removed here — the canonical
+/// `CommitReviews.feedback` map key IS the author.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(
+    feature = "cache-encoding",
+    derive(wincode::SchemaWrite, wincode::SchemaRead)
+)]
+pub struct FeedbackBody {
+    pub verdict: crate::vocab::Verdict,
+    pub body: String,
+    pub created_at: i64,
+}
+
+/// Canonical review activity for a commit: who wrote what.
+/// Files on disk are truth; this mirrors them once.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(
+    feature = "cache-encoding",
+    derive(wincode::SchemaWrite, wincode::SchemaRead)
+)]
+pub struct CommitReviews {
+    pub feedback: BTreeMap<AgentLabel, FeedbackBody>,
+}
+
+/// One plan file's touch within a commit's diff.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(
+    feature = "cache-encoding",
+    derive(wincode::SchemaWrite, wincode::SchemaRead)
+)]
+pub struct PlanTouchSummary {
+    plan: PlanKey,
+    pub kind: crate::vocab::PlanTouchKind,
+    pub new_body: Option<String>,
+}
+
+impl PlanTouchSummary {
+    pub fn new(
+        plan: PlanKey,
+        kind: crate::vocab::PlanTouchKind,
+        new_body: Option<String>,
+    ) -> Self {
+        Self {
+            plan,
+            kind,
+            new_body,
+        }
+    }
+    pub fn plan(&self) -> &PlanKey {
+        &self.plan
+    }
+}
+
+/// Validated container: ≥2 touches naming ≥2 distinct plan keys.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(
+    feature = "cache-encoding",
+    derive(wincode::SchemaWrite, wincode::SchemaRead)
+)]
+#[serde(try_from = "Vec<PlanTouchSummary>", into = "Vec<PlanTouchSummary>")]
+pub struct MultiPlanTouches {
+    touches: Vec<PlanTouchSummary>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MultiPlanTouchesError {
+    NotMultiPlan,
+}
+
+impl std::fmt::Display for MultiPlanTouchesError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            MultiPlanTouchesError::NotMultiPlan => {
+                f.write_str("MultiPlanTouches requires at least two distinct plan keys")
+            }
+        }
+    }
+}
+
+impl std::error::Error for MultiPlanTouchesError {}
+
+impl MultiPlanTouches {
+    pub fn new(touches: Vec<PlanTouchSummary>) -> Result<Self, MultiPlanTouchesError> {
+        let distinct: std::collections::BTreeSet<&PlanKey> =
+            touches.iter().map(|t| t.plan()).collect();
+        if distinct.len() < 2 {
+            return Err(MultiPlanTouchesError::NotMultiPlan);
+        }
+        Ok(Self { touches })
+    }
+    pub fn as_slice(&self) -> &[PlanTouchSummary] {
+        &self.touches
+    }
+    pub fn iter(&self) -> std::slice::Iter<'_, PlanTouchSummary> {
+        self.touches.iter()
+    }
+    pub fn plans(&self) -> std::collections::BTreeSet<&PlanKey> {
+        self.touches.iter().map(|t| t.plan()).collect()
+    }
+}
+
+impl TryFrom<Vec<PlanTouchSummary>> for MultiPlanTouches {
+    type Error = MultiPlanTouchesError;
+    fn try_from(v: Vec<PlanTouchSummary>) -> Result<Self, Self::Error> {
+        MultiPlanTouches::new(v)
+    }
+}
+
+impl From<MultiPlanTouches> for Vec<PlanTouchSummary> {
+    fn from(m: MultiPlanTouches) -> Vec<PlanTouchSummary> {
+        m.touches
+    }
+}
+
+/// Tagged commit-attribution warning. Replaces the legacy
+/// stringly-typed `attribution_warning: Option<String>`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(
+    feature = "cache-encoding",
+    derive(wincode::SchemaWrite, wincode::SchemaRead)
+)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum AttributionWarning {
+    UnknownPlanPrefix { unknown_names: Vec<String> },
+    MissingPrefix { suggested_prefix: String },
+    AmbiguousPrefix,
+    DanglingPlanRef { plan: PlanKey },
+}
+
+/// Per-commit metadata shared across every variant.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(
+    feature = "cache-encoding",
+    derive(wincode::SchemaWrite, wincode::SchemaRead)
+)]
+pub struct CommitMeta {
+    pub sha: CommitSha,
+    pub author_ts: i64,
+    pub subject: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<AttributionWarning>,
+}
+
+/// Plan-scope commit variants. Each carries the minimum set of
+/// canonical facts; the plan key for `PlanOnly` / `Mixed` is
+/// projected from `touch.plan()`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(
+    feature = "cache-encoding",
+    derive(wincode::SchemaWrite, wincode::SchemaRead)
+)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum PlanCommit {
+    PlanOnly {
+        touch: PlanTouchSummary,
+        reviews: CommitReviews,
+    },
+    CodeOnly {
+        plan: PlanKey,
+        reviews: CommitReviews,
+    },
+    Mixed {
+        touch: PlanTouchSummary,
+        reviews: CommitReviews,
+    },
+}
+
+impl PlanCommit {
+    pub fn plan(&self) -> &PlanKey {
+        match self {
+            PlanCommit::PlanOnly { touch, .. } | PlanCommit::Mixed { touch, .. } => touch.plan(),
+            PlanCommit::CodeOnly { plan, .. } => plan,
+        }
+    }
+    pub fn reviews(&self) -> &CommitReviews {
+        match self {
+            PlanCommit::PlanOnly { reviews, .. }
+            | PlanCommit::CodeOnly { reviews, .. }
+            | PlanCommit::Mixed { reviews, .. } => reviews,
+        }
+    }
+    pub fn reviews_mut(&mut self) -> &mut CommitReviews {
+        match self {
+            PlanCommit::PlanOnly { reviews, .. }
+            | PlanCommit::CodeOnly { reviews, .. }
+            | PlanCommit::Mixed { reviews, .. } => reviews,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(
+    feature = "cache-encoding",
+    derive(wincode::SchemaWrite, wincode::SchemaRead)
+)]
+pub struct MultiPlanCommit {
+    pub touches: MultiPlanTouches,
+    pub reviews: CommitReviews,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(
+    feature = "cache-encoding",
+    derive(wincode::SchemaWrite, wincode::SchemaRead)
+)]
+pub struct AdHocCommit {
+    pub reviews: CommitReviews,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(
+    feature = "cache-encoding",
+    derive(wincode::SchemaWrite, wincode::SchemaRead)
+)]
+pub struct FinalizeCommit {
+    pub plan: PlanKey,
+    pub approver_count: u32,
+    pub reviews: CommitReviews,
+}
+
+/// Tagged enum of all commit-body shapes. The `scope`
+/// discriminator is distinct from the inner `kind` on
+/// `PlanCommit` to avoid the internally-tagged-enum collision.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(
+    feature = "cache-encoding",
+    derive(wincode::SchemaWrite, wincode::SchemaRead)
+)]
+#[serde(tag = "scope", rename_all = "snake_case")]
+pub enum CommitBody {
+    Plan(PlanCommit),
+    MultiPlan(MultiPlanCommit),
+    AdHoc(AdHocCommit),
+    Finalize(FinalizeCommit),
+}
+
+impl CommitBody {
+    /// Plans this commit appears in. Each variant computes from
+    /// its canonical fields — no stored sidecar set.
+    pub fn associated_plans(&self) -> std::collections::BTreeSet<&PlanKey> {
+        match self {
+            CommitBody::Plan(p) => [p.plan()].into_iter().collect(),
+            CommitBody::MultiPlan(m) => m.touches.plans(),
+            CommitBody::Finalize(f) => [&f.plan].into_iter().collect(),
+            CommitBody::AdHoc(_) => std::collections::BTreeSet::new(),
+        }
+    }
+    pub fn reviews(&self) -> &CommitReviews {
+        match self {
+            CommitBody::Plan(p) => p.reviews(),
+            CommitBody::MultiPlan(m) => &m.reviews,
+            CommitBody::AdHoc(a) => &a.reviews,
+            CommitBody::Finalize(f) => &f.reviews,
+        }
+    }
+    pub fn reviews_mut(&mut self) -> &mut CommitReviews {
+        match self {
+            CommitBody::Plan(p) => p.reviews_mut(),
+            CommitBody::MultiPlan(m) => &mut m.reviews,
+            CommitBody::AdHoc(a) => &mut a.reviews,
+            CommitBody::Finalize(f) => &mut f.reviews,
+        }
+    }
+}
+
+/// Why a commit doesn't block master. Projection-time only —
+/// never stored on a commit variant.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "reason", rename_all = "snake_case")]
+pub enum NonBlockingReason {
+    NoParticipants,
+    ConfigDisabledPlanReview,
+    ConfigDisabledMiscReview,
+    StructurallyNonReviewable,
+}
+
+/// Projection: the review policy for a commit, derived from
+/// snapshotted config + variant + state. Never stored.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ReviewPolicy {
+    Blocking {
+        participants: NonEmptyVec<AgentLabel>,
+    },
+    NonBlocking {
+        reason: NonBlockingReason,
+    },
+}
+
+/// Projection: the full derived gate view that replaces the
+/// stored `CommitGate`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReviewReadiness {
+    pub state: CommitGateState,
+    pub participants: Vec<AgentLabel>,
+    pub approvers: Vec<AgentLabel>,
+    pub requesters: Vec<AgentLabel>,
+    pub ambiguous: Vec<AgentLabel>,
+    pub missing: Vec<AgentLabel>,
+}
+
+#[cfg(test)]
+mod phase1_invariant_tests {
+    use super::*;
+
+    fn plan(s: &str) -> PlanKey {
+        PlanKey::parse(s).unwrap()
+    }
+    fn touch(plan_str: &str) -> PlanTouchSummary {
+        PlanTouchSummary::new(plan(plan_str), crate::vocab::PlanTouchKind::Intro, None)
+    }
+
+    #[test]
+    fn nonempty_vec_rejects_empty() {
+        let r: Result<NonEmptyVec<i32>, _> = NonEmptyVec::new(Vec::new());
+        assert!(r.is_err());
+    }
+
+    #[test]
+    fn nonempty_vec_accepts_one() {
+        let nv: NonEmptyVec<i32> = NonEmptyVec::new(vec![1]).unwrap();
+        assert_eq!(nv.len(), 1);
+        assert_eq!(nv.first(), &1);
+    }
+
+    #[test]
+    fn multi_plan_touches_rejects_single_plan() {
+        let r = MultiPlanTouches::new(vec![touch("foo")]);
+        assert_eq!(r, Err(MultiPlanTouchesError::NotMultiPlan));
+    }
+
+    #[test]
+    fn multi_plan_touches_rejects_duplicate_plan() {
+        let r = MultiPlanTouches::new(vec![touch("foo"), touch("foo")]);
+        assert_eq!(r, Err(MultiPlanTouchesError::NotMultiPlan));
+    }
+
+    #[test]
+    fn multi_plan_touches_accepts_two_distinct_plans() {
+        let m = MultiPlanTouches::new(vec![touch("foo"), touch("bar")]).unwrap();
+        let plans = m.plans();
+        assert_eq!(plans.len(), 2);
+        assert!(plans.contains(&plan("foo")));
+        assert!(plans.contains(&plan("bar")));
+    }
+
+    #[test]
+    fn plan_body_hash_matches_text() {
+        let pb = PlanBody::new("# foo\n".to_string());
+        let pb2 = PlanBody::new("# foo\n".to_string());
+        assert_eq!(pb.hash(), pb2.hash());
+        let pb3 = PlanBody::new("# bar\n".to_string());
+        assert_ne!(pb.hash(), pb3.hash());
+    }
+
+    #[test]
+    fn commit_body_associated_plans_plan_only() {
+        let body = CommitBody::Plan(PlanCommit::PlanOnly {
+            touch: touch("foo"),
+            reviews: CommitReviews::default(),
+        });
+        let plans = body.associated_plans();
+        assert_eq!(plans.len(), 1);
+        assert!(plans.contains(&plan("foo")));
+    }
+
+    #[test]
+    fn commit_body_associated_plans_code_only() {
+        let body = CommitBody::Plan(PlanCommit::CodeOnly {
+            plan: plan("foo"),
+            reviews: CommitReviews::default(),
+        });
+        let plans = body.associated_plans();
+        assert_eq!(plans.len(), 1);
+        assert!(plans.contains(&plan("foo")));
+    }
+
+    #[test]
+    fn commit_body_associated_plans_ad_hoc_is_empty() {
+        let body = CommitBody::AdHoc(AdHocCommit::default());
+        assert!(body.associated_plans().is_empty());
+    }
+
+    #[test]
+    fn commit_body_associated_plans_multi_plan() {
+        let body = CommitBody::MultiPlan(MultiPlanCommit {
+            touches: MultiPlanTouches::new(vec![touch("foo"), touch("bar")]).unwrap(),
+            reviews: CommitReviews::default(),
+        });
+        let plans = body.associated_plans();
+        assert_eq!(plans.len(), 2);
+    }
+
+    #[test]
+    fn commit_body_associated_plans_finalize() {
+        let body = CommitBody::Finalize(FinalizeCommit {
+            plan: plan("foo"),
+            approver_count: 1,
+            reviews: CommitReviews::default(),
+        });
+        let plans = body.associated_plans();
+        assert_eq!(plans.len(), 1);
+        assert!(plans.contains(&plan("foo")));
+    }
+}

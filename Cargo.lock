@@ -3348,6 +3348,7 @@ dependencies = [
 name = "trinity-core"
 version = "0.0.1"
 dependencies = [
+ "blake3",
  "serde",
  "serde_json",
  "wincode",

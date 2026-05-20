@@ -158,6 +158,10 @@ impl CommitKind {
 /// Plan-touch flavor: was this commit the introduction of the plan
 /// file or a later revision?
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg_attr(
+    feature = "cache-encoding",
+    derive(wincode::SchemaWrite, wincode::SchemaRead)
+)]
 #[serde(rename_all = "snake_case")]
 pub enum PlanTouchKind {
     Intro,
