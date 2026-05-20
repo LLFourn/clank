@@ -12,6 +12,7 @@ pub mod review_state;
 // IO + runtime layers.
 pub mod fs_watcher;
 pub mod git_io;
+pub mod preview;
 pub mod responses;
 pub mod runtime;
 

@@ -285,6 +285,18 @@ impl AppError {
             msg: msg.into(),
         }
     }
+    fn preview(err: crate::preview::PreviewError) -> Self {
+        use crate::preview::PreviewError;
+        match err {
+            PreviewError::UnknownRepo(_)
+            | PreviewError::PlanNotFound(_)
+            | PreviewError::NoHead(_) => Self::not_found(err.to_string()),
+            PreviewError::PlanHidden(_) => Self::not_found(err.to_string()),
+            PreviewError::IntroNotInWalk { .. } | PreviewError::Io(_) | PreviewError::Git(_) => {
+                Self::internal(err.to_string())
+            }
+        }
+    }
     fn tool(err: mcp::ToolError) -> Self {
         let status = match err {
             mcp::ToolError::Invalid(_) => StatusCode::BAD_REQUEST,
@@ -412,69 +424,10 @@ async fn api_finish_preview(
         .await
         .map_err(AppError::runtime)?
         .ok_or_else(|| AppError::not_found(format!("plan {repo_basename}/{stem_md} not found")))?;
-    enforce_plan_visible(&snapshot, &repo_basename, &stem_md)?;
-
-    let plan = snapshot
-        .plans
-        .values()
-        .next()
-        .expect("single_plan invariant");
-    let plan_id = format!("{repo_basename}/{stem_md}");
-    let worktree_status = crate::responses::compute_plan_worktree_status_parts(
-        &snapshot.root,
-        &plan.plan_path,
-        &plan.body_hash,
-    )
-    .map_err(AppError::io)?;
-    let latest_reviewable_sha = crate::projection::latest_reviewable_commit_for(plan);
-    let latest_event = latest_reviewable_sha
-        .as_ref()
-        .and_then(|sha| plan.event_for(sha));
-    let gate = latest_event.and_then(|e| e.gate());
-    let gate_state = gate
-        .map(|g| g.state)
-        .unwrap_or(trinity_core::vocab::CommitGateState::Unreviewed);
-    let is_finished = plan.is_frozen();
-
-    let sealed_approvals = match gate {
-        Some(g) if g.state == trinity_core::vocab::CommitGateState::Approved => {
-            let target_sha = latest_reviewable_sha
-                .as_ref()
-                .expect("Approved gate implies a reviewable sha");
-            g.feedback
-                .iter()
-                .filter(|(_, fb)| fb.verdict == trinity_core::Verdict::Approve)
-                .map(|(author, fb)| trinity_core::api::SealedApproval {
-                    author: author.clone(),
-                    source_path: crate::disk_format::feedback_path_wire(
-                        &plan.id,
-                        target_sha.as_str(),
-                        author,
-                    ),
-                    body_hash: crate::lifecycle::content_hash(&fb.body),
-                })
-                .collect()
-        }
-        _ => Vec::new(),
-    };
-
-    let readiness = compute_finalize_readiness(
-        is_finished,
-        latest_reviewable_sha.as_ref(),
-        gate_state,
-        worktree_status,
-    );
-
-    Ok(axum::Json(trinity_core::api::FinishPreviewResponse {
-        plan_id,
-        plan_path: plan.plan_path.clone(),
-        readiness,
-        gate_state,
-        latest_reviewable_sha,
-        plan_worktree_status: worktree_status,
-        is_finished,
-        sealed_approvals,
-    }))
+    let resp = crate::preview::build_finish_preview(&repo, &snapshot, &plan_key)
+        .await
+        .map_err(AppError::preview)?;
+    Ok(axum::Json(resp))
 }
 
 #[derive(Deserialize)]
@@ -510,136 +463,11 @@ async fn api_rewrite_preview(
         .await
         .map_err(AppError::runtime)?
         .ok_or_else(|| AppError::not_found(format!("plan {repo_basename}/{stem_md} not found")))?;
-    enforce_plan_visible(&snapshot, &repo_basename, &stem_md)?;
-    let plan = snapshot
-        .plans
-        .values()
-        .next()
-        .expect("single_plan invariant");
-    let plan_id = format!("{repo_basename}/{stem_md}");
-    let plan_stem = plan_key.clone();
-
-    let head_sha = snapshot
-        .head
-        .clone()
-        .ok_or_else(|| AppError::not_found(format!("repo {repo_basename} has no HEAD")))?;
-    let intro_sha = Some(plan.plan_intro.clone());
-
-    let metas = crate::git_io::first_parent_commits_to(&repo, &head_sha)
-        .await
-        .map_err(|e| AppError::internal(format!("git first-parent walk: {e}")))?;
-    let start = metas
-        .iter()
-        .position(|m| m.sha == plan.plan_intro)
-        .ok_or_else(|| {
-            AppError::internal(format!(
-                "plan intro {} not in first-parent walk from HEAD",
-                plan.plan_intro.as_str()
-            ))
-        })?;
-    let range = &metas[start..];
-
-    // Map each in-range sha to its timeline-event kind for this
-    // plan, when present. `MultiPlan` events ARE in this plan's
-    // timeline (they touched it) but a cross-plan commit must
-    // still be flagged `foreign: true` — `--squash` refuses on it,
-    // `--purge` rewrites it. Treat PlanOnly/CodeOnly/Mixed/Finalize
-    // as "native to this plan"; everything else (MultiPlan, absent)
-    // is foreign.
-    use trinity_core::model::PlanTimelineEvent;
-    let native_shas: std::collections::BTreeSet<crate::lifecycle::CommitSha> = plan
-        .timeline
-        .iter()
-        .filter_map(|e| match e {
-            PlanTimelineEvent::PlanOnly { sha, .. }
-            | PlanTimelineEvent::CodeOnly { sha, .. }
-            | PlanTimelineEvent::Mixed { sha, .. }
-            | PlanTimelineEvent::Finalize { sha, .. } => Some(sha.clone()),
-            PlanTimelineEvent::MultiPlan { .. } => None,
-        })
-        .collect();
-
-    // Two-pass: collect per-commit data first, then evaluate
-    // linearity over the rewrite range only. Merges BEFORE the
-    // plan intro are outside the range and shouldn't block.
-    let mut per_commit: Vec<(
-        &crate::git_io::CommitMeta,
-        crate::attribution::CommitChanges,
-        bool, // is_merge
-    )> = Vec::with_capacity(range.len());
-    for meta in range {
-        let parent_count = crate::git_io::commit_parent_count(&repo, &meta.sha)
+    let resp =
+        crate::preview::build_rewrite_preview(&repo, &snapshot, &plan_key, q.include_finalize)
             .await
-            .map_err(|e| AppError::internal(format!("git show parents: {e}")))?;
-        let changes = crate::git_io::diff_tree_changes(&repo, &meta.sha)
-            .await
-            .map_err(|e| AppError::internal(format!("git diff-tree: {e}")))?;
-        per_commit.push((meta, changes, parent_count > 1));
-    }
-    let linear = !per_commit.iter().any(|(_, _, is_merge)| *is_merge);
-
-    // Tree-based classification. For each commit, look up the
-    // plan's strippable paths AND (when include_finalize=false)
-    // its unstrippable finalize-snapshot paths in the commit's
-    // resulting tree. A pure-code commit inherits
-    // `.trinity/plans/<stem>.md` from its parent, so it must
-    // Rewrite (strip) even when the diff didn't touch
-    // `.trinity/`.
-    let mut commits = Vec::with_capacity(per_commit.len());
-    for (meta, changes, _) in &per_commit {
-        // Strippable: THIS plan's paths in the tree (always plan
-        // file; include_finalize gates the finalize-snapshot dir).
-        let strippable_in_tree =
-            crate::git_io::tree_plan_paths(&repo, &meta.sha, plan_key.as_str(), q.include_finalize)
-                .await
-                .map_err(|e| AppError::internal(format!("git ls-tree: {e}")))?;
-        // Contribution check: did THIS commit's diff mutate any
-        // path outside this plan's strip predicate? Non-Trinity
-        // code counts. Other-plan `.trinity/` paths and this plan's
-        // finalize files (when include_finalize=false) also count.
-        // Use `trinity_paths_touched` (bidirectional: includes
-        // delete sources) so a commit that DELETES a preserved
-        // path — e.g. removes `.trinity/plans/bar.md` under
-        // `purge foo` — survives. Without this, the delete-only
-        // commit gets dropped and bar resurrects from the parent.
-        let strip_predicate_for_diff = |p: &str| -> bool {
-            p == format!(".trinity/plans/{}.md", plan_key.as_str())
-                || (q.include_finalize
-                    && p.starts_with(&format!(".trinity/finished/{}/", plan_key.as_str())))
-        };
-        let contributes_non_strippable = changes.has_non_plan_code_changes
-            || changes
-                .trinity_paths_touched
-                .iter()
-                .any(|p| !strip_predicate_for_diff(p));
-        let attributed_to_this_plan = native_shas.contains(&meta.sha);
-        let (disposition, strip_paths) =
-            classify_from_tree(contributes_non_strippable, &strippable_in_tree);
-        commits.push(trinity_core::api::RewriteCommit {
-            sha: meta.sha.clone(),
-            subject: meta.subject.clone(),
-            disposition,
-            foreign: !attributed_to_this_plan,
-            strip_paths,
-        });
-    }
-
-    // Strip set at HEAD's tree — squash mode's source of truth.
-    // Same predicate as per-commit, computed once against HEAD.
-    let head_strip_paths =
-        crate::git_io::tree_plan_paths(&repo, &head_sha, plan_key.as_str(), q.include_finalize)
-            .await
-            .map_err(|e| AppError::internal(format!("git ls-tree HEAD: {e}")))?;
-
-    Ok(axum::Json(trinity_core::api::RewritePreviewResponse {
-        plan_id,
-        plan_stem,
-        intro_sha,
-        head_sha,
-        linear,
-        commits,
-        head_strip_paths,
-    }))
+            .map_err(AppError::preview)?;
+    Ok(axum::Json(resp))
 }
 
 async fn api_rewrite_preview_all(
@@ -658,125 +486,15 @@ async fn api_rewrite_preview_all(
             .cloned()
             .ok_or_else(|| AppError::not_found(format!("unknown repo basename: {repo_basename}")))?
     };
-
-    let head_sha = crate::git_io::rev_parse_head(&repo_root)
+    let snapshot = state
+        .runtime
+        .snapshot_repo(&repo_root)
         .await
-        .map_err(|e| AppError::internal(format!("git rev-parse HEAD: {e}")))?
-        .ok_or_else(|| AppError::not_found(format!("repo {repo_basename} has no HEAD")))?;
-
-    let metas = crate::git_io::first_parent_commits_to(&repo_root, &head_sha)
+        .map_err(AppError::runtime)?;
+    let resp = crate::preview::build_rewrite_preview_all(&repo_root, &snapshot, q.include_finalize)
         .await
-        .map_err(|e| AppError::internal(format!("git first-parent walk: {e}")))?;
-
-    // Two-pass: first find the intro (earliest `.trinity/` touch)
-    // so we can slice at intro→HEAD. Pre-intro commits stay out of
-    // the manifest entirely — feeding them to the engine would
-    // make it replay code commits on top of `intro_parent`,
-    // duplicating the branch prefix.
-    let mut intro_pos: Option<usize> = None;
-    let mut per_commit: Vec<(
-        crate::git_io::CommitMeta,
-        crate::attribution::CommitChanges,
-        bool, // is_merge
-    )> = Vec::with_capacity(metas.len());
-    let mut plans_seen: std::collections::BTreeSet<crate::lifecycle::PlanKey> =
-        std::collections::BTreeSet::new();
-    for (idx, meta) in metas.into_iter().enumerate() {
-        let parent_count = crate::git_io::commit_parent_count(&repo_root, &meta.sha)
-            .await
-            .map_err(|e| AppError::internal(format!("git show parents: {e}")))?;
-        let is_merge = parent_count > 1;
-        let changes = crate::git_io::diff_tree_changes(&repo_root, &meta.sha)
-            .await
-            .map_err(|e| AppError::internal(format!("git diff-tree: {e}")))?;
-        for touch in &changes.plan_touches {
-            plans_seen.insert(touch.session.clone());
-        }
-        for fc in &changes.finalize_changes {
-            plans_seen.insert(fc.plan_key.clone());
-        }
-        if intro_pos.is_none() && changes.touched_trinity {
-            intro_pos = Some(idx);
-        }
-        per_commit.push((meta, changes, is_merge));
-    }
-
-    // `linear` applies to the rewrite range only — a merge commit
-    // that lives BEFORE the plan intro is irrelevant; we're not
-    // rewriting it. The previous logic flagged any merge in the
-    // full first-parent walk, which made `--all` unusable on real
-    // repos with historical merges before the first plan landed.
-    let linear = match intro_pos {
-        Some(start) => !per_commit[start..].iter().any(|(_, _, is_merge)| *is_merge),
-        // No `.trinity/` history at all → no range to rewrite.
-        // Linear is moot but `true` is the natural default.
-        None => true,
-    };
-
-    let (intro_sha, commits) = match intro_pos {
-        Some(start) => {
-            let intro_sha = Some(per_commit[start].0.sha.clone());
-            // Second pass over the sliced range: for each commit
-            // look up the TREE's `.trinity/` paths (not the diff's).
-            // The engine rewrites tree state, so the source of
-            // truth for "what survives" is `git ls-tree`, not
-            // "what this commit's diff touched."
-            let mut commits = Vec::with_capacity(per_commit.len() - start);
-            for (meta, changes, _) in &per_commit[start..] {
-                let tree_trinity = crate::git_io::tree_trinity_paths(&repo_root, &meta.sha)
-                    .await
-                    .map_err(|e| AppError::internal(format!("git ls-tree: {e}")))?;
-                let strippable_in_tree: Vec<String> = tree_trinity
-                    .into_iter()
-                    .filter(|p| q.include_finalize || !p.starts_with(".trinity/finished/"))
-                    .collect();
-                // For all-plans purge: anything under `.trinity/`
-                // is strippable EXCEPT `.trinity/finished/` paths
-                // when include_finalize=false. Contribution check
-                // uses `trinity_paths_touched` (bidirectional) so
-                // a commit that DELETES a preserved
-                // `.trinity/finished/` path survives — otherwise
-                // dropping the delete resurrects the finalize file
-                // from the parent.
-                let contributes_non_strippable = changes.has_non_plan_code_changes
-                    || (!q.include_finalize
-                        && changes
-                            .trinity_paths_touched
-                            .iter()
-                            .any(|p| p.starts_with(".trinity/finished/")));
-                let (disposition, strip_paths) =
-                    classify_from_tree(contributes_non_strippable, &strippable_in_tree);
-                commits.push(trinity_core::api::RewriteCommit {
-                    sha: meta.sha.clone(),
-                    subject: meta.subject.clone(),
-                    disposition,
-                    // No per-plan attribution for the all-plans case.
-                    foreign: false,
-                    strip_paths,
-                });
-            }
-            (intro_sha, commits)
-        }
-        None => (None, Vec::new()),
-    };
-
-    // Strip set at HEAD's tree for squash mode.
-    let head_strip_paths: Vec<String> = crate::git_io::tree_trinity_paths(&repo_root, &head_sha)
-        .await
-        .map_err(|e| AppError::internal(format!("git ls-tree HEAD: {e}")))?
-        .into_iter()
-        .filter(|p| q.include_finalize || !p.starts_with(".trinity/finished/"))
-        .collect();
-
-    Ok(axum::Json(trinity_core::api::PurgeAllPreviewResponse {
-        repo: repo_basename.clone(),
-        head_sha,
-        linear,
-        intro_sha,
-        plans_touched: plans_seen.into_iter().collect(),
-        commits,
-        head_strip_paths,
-    }))
+        .map_err(AppError::preview)?;
+    Ok(axum::Json(resp))
 }
 
 /// All-plans classifier using TREE state as the source of truth,
@@ -791,80 +509,6 @@ async fn api_rewrite_preview_all(
 /// resulting tree. Applies the `include_finalize` filter at the
 /// strip-path level so finalize files can be preserved when
 /// requested.
-/// Unified tree-based classifier. Two independent signals:
-///
-/// 1. `contributes_non_strippable`: does THIS commit's diff add or
-///    modify any path the rewrite wants to preserve? Non-Trinity
-///    code always counts; unstrippable Trinity paths added by
-///    this commit count too. Inherited content from earlier
-///    commits does NOT count — it already lives on the rewritten
-///    parent, so a commit that only added strippable content has
-///    nothing left to contribute after the strip.
-///
-/// 2. `strippable_in_tree`: paths under the strip-predicate that
-///    exist in the commit's RESULTING tree (from `git ls-tree`).
-///    Includes inherited paths.
-///
-/// Disposition matrix:
-/// - `!contributes_non_strippable` → Drop. The commit's only
-///   contribution was strippable content; after stripping it's a
-///   no-op vs the rewritten parent. Also handles empty commits.
-/// - contributes + strippable in tree → Rewrite (strip those).
-/// - contributes + no strippable in tree → KeepVerbatim.
-fn classify_from_tree(
-    contributes_non_strippable: bool,
-    strippable_in_tree: &[String],
-) -> (trinity_core::api::RewriteDisposition, Vec<String>) {
-    use trinity_core::api::RewriteDisposition;
-
-    if !contributes_non_strippable {
-        return (RewriteDisposition::Drop, Vec::new());
-    }
-    if strippable_in_tree.is_empty() {
-        (RewriteDisposition::KeepVerbatim, Vec::new())
-    } else {
-        (RewriteDisposition::Rewrite, strippable_in_tree.to_vec())
-    }
-}
-
-/// Project the typed finalize decision. Single source of truth for
-/// "can the CLI proceed?" — the CLI dispatches on this and nothing
-/// else.
-fn compute_finalize_readiness(
-    is_finished: bool,
-    latest_reviewable_sha: Option<&crate::lifecycle::CommitSha>,
-    gate_state: trinity_core::vocab::CommitGateState,
-    worktree_status: trinity_core::vocab::PlanWorktreeStatus,
-) -> trinity_core::api::FinalizeReadiness {
-    use trinity_core::api::{FinalizeBlockReason, FinalizeReadiness};
-    use trinity_core::vocab::{CommitGateState, PlanWorktreeStatus};
-
-    if is_finished {
-        return FinalizeReadiness::AlreadyFinished;
-    }
-    let mut reasons = Vec::new();
-    if latest_reviewable_sha.is_none() {
-        reasons.push(FinalizeBlockReason::NoReviewableCommit);
-    }
-    if gate_state != CommitGateState::Approved {
-        reasons.push(FinalizeBlockReason::GateNotApproved { state: gate_state });
-    }
-    match worktree_status {
-        PlanWorktreeStatus::PlanFileMissing => {
-            reasons.push(FinalizeBlockReason::PlanFileMissing);
-        }
-        PlanWorktreeStatus::BodyDirty => {
-            reasons.push(FinalizeBlockReason::PlanFileDirty);
-        }
-        PlanWorktreeStatus::Clean => {}
-    }
-    if reasons.is_empty() {
-        FinalizeReadiness::Ready
-    } else {
-        FinalizeReadiness::Blocked { reasons }
-    }
-}
-
 async fn api_plan_revision(
     State(state): State<AppState>,
     Path((repo_basename, stem_md, sha)): Path<(String, String, String)>,
