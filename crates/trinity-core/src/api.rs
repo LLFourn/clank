@@ -29,8 +29,8 @@
 use serde::{Deserialize, Serialize};
 
 use crate::vocab::{
-    CommitKind, PlanLifecycle, PlanTouchKind, PlanWorktreeStatus, Posture, ReviewGateState,
-    ReviewTargetPhase, Verdict, WaitingReason, WaitingRole,
+    CommitGateState, CommitKind, PlanLifecycle, PlanTouchKind, PlanWorktreeStatus, Posture,
+    ReviewGateState, ReviewTargetPhase, Verdict, WaitingReason, WaitingRole,
 };
 
 // ============================================================
@@ -325,6 +325,17 @@ pub struct PlanRow {
     pub phase: Posture,
     pub plan_worktree_status: PlanWorktreeStatus,
     pub waiting_on: WaitingOn,
+    /// Latest reviewable commit on the plan's timeline, when one
+    /// exists. The CommitGate that resolves over this commit is
+    /// what `gate_state` reflects.
+    #[serde(default)]
+    pub latest_reviewable_sha: Option<crate::ids::CommitSha>,
+    /// State of the gate over `latest_reviewable_sha`. `None`
+    /// means there is no reviewable commit yet (initial-review
+    /// posture). Distinct from `Some(Unreviewed)` which means a
+    /// commit exists but no verdicts have landed.
+    #[serde(default)]
+    pub gate_state: Option<CommitGateState>,
     #[serde(default)]
     pub archived_cycles: Vec<ArchivedCycle>,
     /// Powers the homepage sort.

@@ -160,6 +160,8 @@ fn build_plan_row(
         phase: plan_phase,
         plan_worktree_status: worktree_status,
         waiting_on: w,
+        latest_reviewable_sha: crate::projection::latest_reviewable_commit_for(plan),
+        gate_state: gate.map(|g| g.state),
         archived_cycles: plan.archived_cycles.clone(),
         last_activity_ts: crate::projection::last_activity_ts_for(plan),
     }

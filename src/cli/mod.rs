@@ -29,7 +29,7 @@ pub struct StatusArgs {
     #[arg(long, value_name = "PATH")]
     pub repo: Option<PathBuf>,
     /// Emit JSON (typed `StatusResponse` from `trinity-core::api`).
-    #[arg(long)]
+    #[arg(short = 'j', long)]
     pub json: bool,
 }
 

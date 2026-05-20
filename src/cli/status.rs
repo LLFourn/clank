@@ -155,6 +155,13 @@ fn print_row(row: &PlanRow) {
     println!("    phase:    {}", row.phase.as_str());
     println!("    waiting:  {}", waiting_summary(&row.waiting_on));
     println!("    path:     {}", row.current_path);
+    if let Some(sha) = &row.latest_reviewable_sha {
+        println!("    latest:   {}", short_sha(sha.as_str()));
+    }
+    match row.gate_state {
+        Some(s) => println!("    gate:     {}", s.as_str()),
+        None => println!("    gate:     (no reviewable commit yet)"),
+    }
     if row.plan_worktree_status != trinity_core::vocab::PlanWorktreeStatus::Clean {
         println!("    worktree: {:?}", row.plan_worktree_status);
     }

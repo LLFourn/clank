@@ -162,6 +162,8 @@ fn plan_row_fixture() -> PlanRow {
         phase: Posture::Planning,
         plan_worktree_status: PlanWorktreeStatus::Clean,
         waiting_on: waiting_on_fixture(),
+        latest_reviewable_sha: Some(CommitSha::parse("abc1234").unwrap()),
+        gate_state: Some(trinity_core::vocab::CommitGateState::Unreviewed),
         archived_cycles: vec![archived_fixture()],
         last_activity_ts: 1_700_000_000,
     }
