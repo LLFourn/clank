@@ -55,6 +55,13 @@ pub struct Trinity {
 pub struct RepoState {
     pub root: PathBuf,
     pub plans: BTreeMap<PlanKey, Plan>,
+    /// Repo-wide commit stream indexed by SHA. Phase 1 of
+    /// `commit-first-review-model`: populated alongside per-plan
+    /// timelines so the commit-first matcher can walk one
+    /// chronological stream and the per-plan view becomes a
+    /// projection over it. Phase 2 makes `CommitNode.gate`
+    /// authoritative; Phase 1 shadows it.
+    pub commits: BTreeMap<CommitSha, CommitNode>,
     pub head: Option<CommitSha>,
     /// Plans whose disk state is contradictory at rebuild time. Today
     /// effectively unused (path-parser rejects `.trinity/plans/done/`),
@@ -70,9 +77,16 @@ impl RepoState {
     /// every other plan's clone.
     pub fn single_plan(&self, key: &PlanKey) -> Option<RepoState> {
         let plan = self.plans.get(key)?;
+        let commits = self
+            .commits
+            .iter()
+            .filter(|(_, node)| node.plans.contains(key))
+            .map(|(sha, node)| (sha.clone(), node.clone()))
+            .collect();
         Some(RepoState {
             root: self.root.clone(),
             plans: [(key.clone(), plan.clone())].into_iter().collect(),
+            commits,
             head: self.head.clone(),
             plan_conflicts: std::collections::BTreeMap::new(),
         })
@@ -82,6 +96,7 @@ impl RepoState {
         Self {
             root,
             plans: BTreeMap::new(),
+            commits: BTreeMap::new(),
             head: None,
             plan_conflicts: BTreeMap::new(),
         }
@@ -97,7 +112,7 @@ impl RepoState {
     /// stated need: ping on change, no diff required.
     pub fn digest(&self) -> StateDigest {
         let mut hasher = blake3::Hasher::new();
-        hasher.update(b"trinity-state-v1\n");
+        hasher.update(b"trinity-state-v2\n");
         hasher.update(self.root.to_string_lossy().as_bytes());
         hasher.update(b"\nhead=");
         hasher.update(
@@ -152,6 +167,24 @@ impl RepoState {
                 hasher.update(b";");
             }
             hasher.update(b"]\n");
+        }
+        hasher.update(b"]\ncommits[");
+        for (sha, node) in &self.commits {
+            hasher.update(sha.as_str().as_bytes());
+            hasher.update(b":");
+            hasher.update(node.kind.as_str().as_bytes());
+            hasher.update(b":");
+            hasher.update(commit_attribution_tag(&node.attribution).as_bytes());
+            hasher.update(b":plans=");
+            for plan in &node.plans {
+                hasher.update(plan.as_str().as_bytes());
+                hasher.update(b",");
+            }
+            if let Some(gate) = &node.gate {
+                hasher.update(b":gate=");
+                hasher.update(gate.state.as_str().as_bytes());
+            }
+            hasher.update(b";");
         }
         hasher.update(b"]\nconflicts[");
         for (key, paths) in &self.plan_conflicts {
@@ -242,12 +275,23 @@ impl StateDigest {
     }
 }
 
+fn commit_attribution_tag(attr: &CommitAttribution) -> &'static str {
+    match attr {
+        CommitAttribution::Plan { .. } => "plan",
+        CommitAttribution::MultiPlan { .. } => "multi_plan",
+        CommitAttribution::AdHoc => "ad_hoc",
+        CommitAttribution::Finalize { .. } => "finalize",
+    }
+}
+
 /// Plan, PlanTimelineEvent, Feedback are the daemon's fold-state
 /// types — defined once in `trinity_core::model` and re-exported
 /// here AND on `api::*` so daemon storage and wire response are
 /// one struct each. Rendered HTML lives in the wasm frontend
 /// (`frontend::markdown`), not on these types and not on the wire.
-pub use trinity_core::model::{ArchivedCycle, Feedback, Plan, PlanTimelineEvent};
+pub use trinity_core::model::{
+    ArchivedCycle, CommitAttribution, CommitNode, Feedback, Plan, PlanTimelineEvent,
+};
 
 pub use trinity_core::PlanLifecycle;
 

@@ -47,7 +47,11 @@ const CACHE_MAGIC: &[u8] = b"TRINITY-BASE-STATE\n";
 /// Cache file layout version. Bump when the wincode body shape
 /// changes incompatibly (a field added/removed from
 /// [`BaseStatePayload`] or its transitive types).
-const CACHE_FORMAT_VERSION: u32 = 1;
+/// Format-version bumps:
+///  - v1: original `BaseStatePayload { plans }`.
+///  - v2: adds repo-wide `commits` map (Phase 1 of
+///    commit-first-review-model). Older caches are invalidated.
+const CACHE_FORMAT_VERSION: u32 = 2;
 
 /// Trinity binary identity. Bump on incompatible changes that
 /// would make decoded state semantically invalid even if it
@@ -96,12 +100,14 @@ pub enum CacheError {
 #[derive(Debug, Clone, PartialEq, Eq, SchemaWrite, SchemaRead)]
 struct BaseStatePayload {
     plans: BTreeMap<PlanKey, Plan>,
+    commits: BTreeMap<crate::lifecycle::CommitSha, crate::repo_state::CommitNode>,
 }
 
 impl BaseStatePayload {
     fn from_state(state: &RepoState) -> Self {
         Self {
             plans: state.plans.clone(),
+            commits: state.commits.clone(),
         }
     }
 
@@ -112,6 +118,7 @@ impl BaseStatePayload {
         let state = RepoState {
             root,
             plans: self.plans,
+            commits: self.commits,
             head: Some(head),
             plan_conflicts: BTreeMap::new(),
         };

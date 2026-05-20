@@ -25,8 +25,8 @@ use crate::attribution::{CommitChanges, FinalizeChangeKind, classify, effective_
 use crate::disk_format::{FeedbackPath, finalize_first_line_starts_with_approve, parse_verdict};
 use crate::lifecycle::{AgentLabel, CommitSha, PlanKey, content_hash};
 use crate::repo_state::{
-    AttributionResult, BaseRepoState, CommitKind, Feedback, LiveRepoState, Plan, PlanTimelineEvent,
-    PlanTouchKind, RepoState, Verdict,
+    AttributionResult, BaseRepoState, CommitAttribution, CommitKind, CommitNode, Feedback,
+    LiveRepoState, Plan, PlanTimelineEvent, PlanTouchKind, RepoState, Verdict,
 };
 use crate::review_state::{CommitGate, CommitGateState};
 
@@ -380,6 +380,7 @@ pub fn apply_commit(state: &mut RepoState, carry: &mut FoldCarry, event: &Commit
     //    `waiting_on`. The approving files live in
     //    `.trinity/finished/<stem>/` at this commit (a snapshot, not
     //    live feedback).
+    let mut plans_finalized_here: BTreeSet<PlanKey> = BTreeSet::new();
     for plan_key in &maybe_affected {
         if !state.plans.contains_key(plan_key) {
             continue;
@@ -416,6 +417,7 @@ pub fn apply_commit(state: &mut RepoState, carry: &mut FoldCarry, event: &Commit
                 if event.author_ts > plan.last_activity_ts {
                     plan.last_activity_ts = event.author_ts;
                 }
+                plans_finalized_here.insert(plan_key.clone());
             }
         }
     }
@@ -445,6 +447,16 @@ pub fn apply_commit(state: &mut RepoState, carry: &mut FoldCarry, event: &Commit
         } => Some(session),
         _ => None,
     };
+
+    // Track which plans this commit ends up attributed-to (per-plan timeline
+    // event of any kind). Combined with `plans_finalized_here` below to build
+    // the repo-wide `CommitNode.plans` set.
+    let mut plans_with_event: BTreeSet<PlanKey> = plans_finalized_here.clone();
+    // The per-plan kind for whichever plan owns this commit's reviewable
+    // event — used as the repo-wide `CommitNode.kind` when attribution is
+    // single-plan. `None` when the commit produced no reviewable per-plan
+    // event.
+    let mut single_plan_kind: Option<(PlanKey, CommitKind)> = None;
 
     let plan_keys: Vec<PlanKey> = state.plans.keys().cloned().collect();
     for plan_key in &plan_keys {
@@ -530,10 +542,117 @@ pub fn apply_commit(state: &mut RepoState, carry: &mut FoldCarry, event: &Commit
             }
         };
         plan.timeline.push(timeline_event);
+        plans_with_event.insert(plan_key.clone());
+        // Record the per-plan kind so step 6 can pick it up for the
+        // repo-wide CommitNode. A commit attributed to exactly one
+        // active plan via step 5 has a unique kind; for MultiPlan or
+        // Finalize-only commits this stays None and the step-6
+        // classifier picks the correct repo-wide kind on its own.
+        if single_plan_kind.is_none() {
+            single_plan_kind = Some((plan_key.clone(), kind));
+        } else {
+            single_plan_kind = Some((plan_key.clone(), CommitKind::MultiPlan));
+        }
     }
 
-    // 6. Carry forward.
+    // 6. Build the repo-wide CommitNode. Phase 1 of
+    //    `commit-first-review-model`: shadow the per-plan timeline with
+    //    one authoritative-per-commit attribution. The existing matcher
+    //    still reads `Plan.timeline`; Phase 2 makes this map
+    //    authoritative.
+    let commit_node = build_commit_node(
+        &commit_sha,
+        event,
+        &active_changes,
+        &attr,
+        &plans_with_event,
+        &plans_finalized_here,
+        single_plan_kind.as_ref(),
+        state,
+    );
+    state.commits.insert(commit_sha.clone(), commit_node);
+
+    // 7. Carry forward.
     carry.previous_commit = Some(commit_sha);
+}
+
+/// Build a `CommitNode` for this commit. Attribution priority:
+///
+/// 1. Multi-plan touch (>= 2 distinct plan files) → `MultiPlan`.
+/// 2. Single freeze fire (commit fires the finalize rule for exactly
+///    one plan and produces no other per-plan reviewable event) →
+///    `Finalize(plan)`.
+/// 3. `AttributionResult::Attributed { session, .. }` → `Plan(session)`.
+/// 4. Otherwise → `AdHoc` (legacy `Unattributed`).
+///
+/// The `plans` set is the union of every plan touched, every plan that
+/// got a reviewable event, and every plan that froze on this commit.
+/// `gate` mirrors the single-plan timeline event when attribution is
+/// `Plan(_)`; otherwise `None`.
+fn build_commit_node(
+    commit_sha: &CommitSha,
+    event: &CommitEvent,
+    active_changes: &CommitChanges,
+    attr: &AttributionResult,
+    plans_with_event: &BTreeSet<PlanKey>,
+    plans_finalized_here: &BTreeSet<PlanKey>,
+    single_plan_kind: Option<&(PlanKey, CommitKind)>,
+    state: &RepoState,
+) -> CommitNode {
+    let touched_plans: BTreeSet<PlanKey> = active_changes
+        .plan_touches
+        .iter()
+        .map(|t| t.session.clone())
+        .collect();
+    let mut plans: BTreeSet<PlanKey> = BTreeSet::new();
+    plans.extend(touched_plans.iter().cloned());
+    plans.extend(plans_with_event.iter().cloned());
+    plans.extend(plans_finalized_here.iter().cloned());
+
+    let attribution = if touched_plans.len() >= 2 {
+        CommitAttribution::MultiPlan {
+            plans: touched_plans.clone(),
+        }
+    } else if plans_finalized_here.len() == 1 && single_plan_kind.is_none() {
+        let plan = plans_finalized_here.iter().next().cloned().unwrap();
+        CommitAttribution::Finalize { plan }
+    } else if let AttributionResult::Attributed { session, .. } = attr {
+        CommitAttribution::Plan {
+            plan: session.clone(),
+        }
+    } else {
+        CommitAttribution::AdHoc
+    };
+
+    let (kind, gate) = match &attribution {
+        CommitAttribution::Plan { plan } => {
+            // Mirror the single per-plan kind + gate so the shadow
+            // matches the live timeline.
+            let kind = single_plan_kind
+                .as_ref()
+                .map(|(_, k)| *k)
+                .unwrap_or(CommitKind::Unattributed);
+            let gate = state
+                .plans
+                .get(plan)
+                .and_then(|p| p.event_for(commit_sha))
+                .and_then(|e| e.gate().cloned());
+            (kind, gate)
+        }
+        CommitAttribution::MultiPlan { .. } => (CommitKind::MultiPlan, None),
+        CommitAttribution::Finalize { .. } => (CommitKind::Finalize, None),
+        CommitAttribution::AdHoc => (CommitKind::Unattributed, None),
+    };
+
+    CommitNode {
+        sha: commit_sha.clone(),
+        author_ts: event.author_ts,
+        subject: event.subject.clone(),
+        kind,
+        attribution,
+        plans,
+        gate,
+    }
 }
 
 fn is_frozen(state: &RepoState, plan_key: &PlanKey) -> bool {
@@ -1391,5 +1510,113 @@ mod tests {
             "frozen plan should not absorb live feedback; got {:?}",
             gate.feedback.keys().collect::<Vec<_>>(),
         );
+    }
+
+    // ============================================================
+    // Phase 1 (commit-first-review-model): repo-wide CommitNode map.
+    // ============================================================
+
+    #[test]
+    fn commits_map_records_plan_intro_node() {
+        let state = derive_state(
+            PathBuf::from("/r"),
+            snap(vec![event("c1c1", vec![intro_with_body("foo", "# foo\n")], false)]),
+        );
+        let node = state.commits.get(&sha("c1c1")).expect("commit node");
+        assert!(
+            matches!(&node.attribution, CommitAttribution::Plan { plan } if plan == &sess("foo")),
+            "intro should be Plan(foo), got {:?}",
+            node.attribution
+        );
+        assert_eq!(node.kind, CommitKind::PlanOnly);
+        assert!(node.plans.contains(&sess("foo")));
+        assert!(node.gate.is_some(), "PlanOnly is reviewable; gate expected");
+    }
+
+    #[test]
+    fn commits_map_records_codeonly_as_plan_via_walkback() {
+        let state = derive_state(
+            PathBuf::from("/r"),
+            snap(vec![
+                event("c1c1", vec![intro_with_body("foo", "# foo\n")], false),
+                event("c2c2", vec![], true),
+            ]),
+        );
+        let node = state.commits.get(&sha("c2c2")).expect("c2c2 node");
+        assert!(
+            matches!(&node.attribution, CommitAttribution::Plan { plan } if plan == &sess("foo")),
+            "code-only walkback should attribute to active plan; got {:?}",
+            node.attribution
+        );
+        assert_eq!(node.kind, CommitKind::CodeOnly);
+        assert!(node.gate.is_some());
+    }
+
+    #[test]
+    fn commits_map_records_ad_hoc_when_no_plan_context() {
+        let state = derive_state(
+            PathBuf::from("/r"),
+            snap(vec![event("c1c1", vec![], true)]),
+        );
+        let node = state.commits.get(&sha("c1c1")).expect("c1c1 node");
+        assert!(
+            matches!(node.attribution, CommitAttribution::AdHoc),
+            "no plan context → AdHoc; got {:?}",
+            node.attribution
+        );
+        assert!(node.plans.is_empty());
+        assert!(node.gate.is_none(), "AdHoc commits are non-reviewable until Phase 4");
+    }
+
+    #[test]
+    fn commits_map_records_multi_plan_touch() {
+        let state = derive_state(
+            PathBuf::from("/r"),
+            snap(vec![
+                event("c1c1", vec![intro_with_body("foo", "# foo\n")], false),
+                event("c2c2", vec![intro_with_body("bar", "# bar\n")], false),
+                event(
+                    "c3c3",
+                    vec![
+                        revise_with_body("foo", "# foo v2\n"),
+                        revise_with_body("bar", "# bar v2\n"),
+                    ],
+                    false,
+                ),
+            ]),
+        );
+        let node = state.commits.get(&sha("c3c3")).expect("c3c3 node");
+        match &node.attribution {
+            CommitAttribution::MultiPlan { plans } => {
+                assert!(plans.contains(&sess("foo")));
+                assert!(plans.contains(&sess("bar")));
+                assert_eq!(plans.len(), 2);
+            }
+            other => panic!("expected MultiPlan, got {other:?}"),
+        }
+        assert_eq!(node.kind, CommitKind::MultiPlan);
+        assert!(node.gate.is_none());
+    }
+
+    #[test]
+    fn commits_map_records_finalize_attribution() {
+        // intro foo, then finalize commit lands an APPROVE file under
+        // .trinity/finished/foo/. The finalize commit has no plan_touch
+        // and no code change, so attribution-classify returns
+        // Unattributed via walk-back stop — but plans_finalized_here
+        // catches it and Finalize wins.
+        let history = vec![
+            event("c1c1", vec![intro_with_body("foo", "# foo\n")], false),
+            event_with_finalize("c2c2", vec![], vec![upsert("foo", "alice.md", "APPROVE")]),
+        ];
+        let state = derive_state(PathBuf::from("/r"), snap(history));
+        let node = state.commits.get(&sha("c2c2")).expect("c2c2 node");
+        match &node.attribution {
+            CommitAttribution::Finalize { plan } => assert_eq!(plan, &sess("foo")),
+            other => panic!("expected Finalize(foo), got {other:?}"),
+        }
+        assert_eq!(node.kind, CommitKind::Finalize);
+        assert!(node.gate.is_none());
+        assert!(node.plans.contains(&sess("foo")));
     }
 }

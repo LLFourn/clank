@@ -105,6 +105,10 @@ impl PlanWorktreeStatus {
 /// `Unattributed` never appears on a plan's timeline (commits with
 /// no relevance to a plan are simply absent).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg_attr(
+    feature = "cache-encoding",
+    derive(wincode::SchemaWrite, wincode::SchemaRead)
+)]
 #[serde(rename_all = "snake_case")]
 pub enum CommitKind {
     /// Touches exactly this plan file (single-plan-touch) and no code.

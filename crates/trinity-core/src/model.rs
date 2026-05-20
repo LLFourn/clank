@@ -284,3 +284,63 @@ impl Plan {
         self.is_frozen() || !matches!(worktree_status, PlanWorktreeStatus::PlanFileMissing)
     }
 }
+
+/// How a commit relates to plans in the repo. Phase 1 of
+/// `commit-first-review-model` adds this alongside the existing
+/// per-plan timeline so the fold can carry one
+/// authoritative-per-commit attribution value. Reviewable variants
+/// in the (Phase-2-onwards) commit-first matcher key off this.
+///
+/// `AdHoc` replaces the legacy `Unattributed` category: today's
+/// `Unattributed` commits (no plan touch, no inherited parent) are
+/// the same set the commit-first model surfaces as ad hoc.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(
+    feature = "cache-encoding",
+    derive(wincode::SchemaWrite, wincode::SchemaRead)
+)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum CommitAttribution {
+    /// Single-plan commit. `PlanOnly | CodeOnly | Mixed` kinds
+    /// reviewable; the gate lives on the matching `CommitNode`.
+    Plan { plan: PlanKey },
+    /// Commit touched more than one plan (file-level). Non-
+    /// reviewable: per-plan reviewer sets would conflict.
+    MultiPlan { plans: std::collections::BTreeSet<PlanKey> },
+    /// Commit touched no plan and inherited no active/last-touched
+    /// plan context. First-class reviewable category once Phase 4
+    /// lands; non-reviewable until then.
+    AdHoc,
+    /// Freeze commit for a plan. Non-reviewable; the approving
+    /// files snapshot lives at the commit's tree under
+    /// `.trinity/finished/<stem>/`.
+    Finalize { plan: PlanKey },
+}
+
+/// One commit in the repo-wide chronological stream. Phase 1 of
+/// `commit-first-review-model` builds this map alongside the per-
+/// plan timeline; the existing matcher continues to read
+/// `Plan.timeline`. Phase 2 makes `CommitNode.gate` authoritative
+/// and rewrites `PlanTimelineEvent` to carry a SHA pointer instead
+/// of an owned gate.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(
+    feature = "cache-encoding",
+    derive(wincode::SchemaWrite, wincode::SchemaRead)
+)]
+pub struct CommitNode {
+    pub sha: CommitSha,
+    pub author_ts: i64,
+    pub subject: String,
+    pub kind: CommitKind,
+    pub attribution: CommitAttribution,
+    /// Plans this commit appears in (via touches, attribution, or
+    /// finalize). Superset of any single plan named by
+    /// `attribution`. Empty for `AdHoc` until Phase 4 attaches
+    /// ad hoc participant sets.
+    pub plans: std::collections::BTreeSet<PlanKey>,
+    /// Per-commit review gate. `Some` iff `kind.is_reviewable()`
+    /// AND `attribution` names exactly one plan (`Plan(_)`). All
+    /// other variants are non-reviewable and carry `None`.
+    pub gate: Option<CommitGate>,
+}
