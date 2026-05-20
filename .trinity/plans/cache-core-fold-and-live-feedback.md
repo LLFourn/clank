@@ -91,17 +91,33 @@ and a fixture with working-tree feedback files present produces
 the same `BaseRepoState` whether or not those files exist.
 
 `attach_live_feedback` is the only stage that reads mutable
-`.trinity/feedback/` data. It:
+`.trinity/feedback/` data. It must rebuild gates **chronologically
+per active plan**, the same way `build_gate_step` does today —
+participants are cumulative across reviewable commits, so a
+feedback file on an earlier commit semantically affects every
+later reviewable gate through the carried participant set.
 
-- indexes feedback by `(plan_key, target_sha)`
-- attaches feedback to existing reviewable timeline events for
-  non-finished plans
-- recomputes each affected gate state, participants, and missing
-  lists
-- updates `last_activity_ts` from feedback mtimes
+Algorithm:
 
-Finished plans are sealed. Live feedback that targets commits in
-a finished plan is ignored at this stage — finished-state
+1. Index feedback by `(plan_key, target_sha)`.
+2. For each active (non-frozen) plan, clear any
+   feedback-derived contents from gates currently in the base
+   state. Commit-derived sealed approvals from
+   `.trinity/finished/<stem>/` stay.
+3. Walk that plan's reviewable timeline oldest-to-newest. For
+   every reviewable event, rebuild the full `CommitGate` from
+   the carried cumulative participant set plus the feedback
+   files targeting that specific commit.
+4. Update `last_activity_ts` to the max of commit author
+   timestamps and attached feedback file mtimes.
+
+A test pins this: a fixture with feedback on commit A and a
+later reviewable commit B in the same plan must produce a gate
+on B whose `missing_approvals` includes A's reviewer. Patching
+only B (without the chronological walk) would fail.
+
+Finished plans are sealed. Live feedback targeting commits in a
+finished plan is ignored at this stage — finished-state
 semantics are commit-derived only.
 
 ### Cacheable / Live Newtypes
@@ -180,15 +196,35 @@ head_sha: 40 bytes ASCII
 The header IS the validation check. Filename version is for
 debugging; do not trust the filename to imply the body shape.
 
+**`RepoState.root` is NOT serialized into the body.** An absolute
+path baked into a cache payload survives a directory move and
+would silently report a stale root in projections that read it
+(status, finish_preview, rewrite_preview). On decode, the cache
+module injects the *current canonical repo root* into the
+deserialized base state; the on-disk payload only carries
+commit-derived fields. Either:
+
+- the on-disk body uses a derived "rootless" form of `RepoState`
+  (an internal `BaseRepoStatePayload` struct with the same fields
+  minus `root`), and `load_or_build_base_state` constructs the
+  `BaseRepoState(RepoState { root: <current>, ..decoded })`; or
+- the body serializes the full `RepoState` but `root` is
+  unconditionally overwritten on decode with the current repo
+  root.
+
+Pick whichever is cleaner during implementation — the invariant
+is what matters: a moved cache file cannot leak a stale absolute
+root into runtime state.
+
 Encoder: **bincode 2.x with serde**. No spike. Bincode is the
 boring, stable choice. The model types already derive
 `Serialize`/`Deserialize`; bincode's `serde` feature consumes
 those. No hand-written stringly mappers; no parallel cache schema.
 
-`trinity-core` adds bincode as a dep behind a default feature
-(or unconditional — it's small) and the model types remain
-serde-only. The cache lives in the app crate and calls
-`bincode::serde::encode_to_vec` / `decode_from_slice`.
+Bincode lives **in the app crate only**, behind `src/state_cache.rs`.
+`trinity-core` stays serde-only — no encoding-format dep there.
+The cache module calls `bincode::serde::encode_to_vec` /
+`decode_from_slice` over the serde-derived core types.
 
 Add `.trinity/cache/` to `.trinity/.gitignore` (the
 committed-into-repo gitignore that ships with `trinity init`) so
@@ -268,23 +304,33 @@ model:
    `BaseRepoState` regardless of what `.trinity/feedback/` holds.
 2. `attach_live_feedback` attaches a feedback file to the
    matching non-finished plan/commit and updates the gate state.
-3. Editing a feedback file changes the resulting `LiveRepoState`
+3. **Cumulative participants survive the split.** Fixture: plan
+   with reviewable commits A and B, feedback on A from reviewer
+   `alice`. After `attach_live_feedback`, gate B's
+   `missing_approvals` lists `alice`. This is the core invariant
+   the chronological per-plan walk protects.
+4. Editing a feedback file changes the resulting `LiveRepoState`
    without changing the bytes of the cached `BaseRepoState`.
-4. Live feedback targeting a commit in a finished plan does NOT
+5. Live feedback targeting a commit in a finished plan does NOT
    alter the finished-plan lifecycle or gate.
-5. `attach_live_feedback(load_from_cache(), feedback)` matches
+6. `attach_live_feedback(load_from_cache(), feedback)` matches
    `attach_live_feedback(derive_base_state(snap), feedback)` for
    active-plan projections — full bincode round-trip equivalence.
-6. Corrupt cache files (mangled header, garbage body) are ignored
-   and replaced on next write; the rebuild succeeds.
-7. Cache entries with mismatched HEAD or format version are
+7. **Moved cache injects current root.** Build a cache at one
+   path, copy the `.trinity/cache/` dir to a renamed/relocated
+   repo, load. The resulting `BaseRepoState.root` reports the
+   new canonical root, not the original. Pins the no-stale-root
+   invariant from the design.
+8. Corrupt cache files (mangled header, garbage body) are
+   ignored and replaced on next write; the rebuild succeeds.
+9. Cache entries with mismatched HEAD or format version are
    rejected by the header check.
-8. **Cache-hit path skips the fold.** Wire a counter (or
-   feature-gated assertion) into `derive_base_state`. Test asserts
-   first `rebuild_repo` increments it, second `rebuild_repo` at
-   the same HEAD does not. This replaces a wall-clock perf
-   assertion — wall-clock thresholds in CI are flaky and don't
-   actually prove the cache was hit.
+10. **Cache-hit path skips the fold.** Wire a counter (or
+    feature-gated assertion) into `derive_base_state`. Test
+    asserts first `rebuild_repo` increments it, second
+    `rebuild_repo` at the same HEAD does not. This replaces a
+    wall-clock perf assertion — wall-clock thresholds in CI are
+    flaky and don't actually prove the cache was hit.
 
 Run:
 
@@ -358,3 +404,12 @@ or a commit refold.
   test, not wall-clock).
 - Existing daemon and CLI projections keep their behavior;
   `LiveRepoState` derefs to `&RepoState` for read-only callers.
+- Cumulative-participant semantics survive the split: a
+  reviewable commit gate lists earlier reviewers in
+  `missing_approvals` even when no feedback file targets that
+  later commit.
+- Cached payloads do not carry an absolute repo root that
+  survives a directory move; `BaseRepoState.root` is always the
+  current canonical root post-load.
+- `trinity-core` does not depend on bincode; encoding lives in
+  the app crate.
