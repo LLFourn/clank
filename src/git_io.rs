@@ -8,7 +8,7 @@ use tokio::process::Command;
 
 use crate::attribution::{CommitChanges, FinalizeChange, FinalizeChangeKind, PlanTouch};
 use crate::disk_format::{parse_feedback_path, parse_finalize_path};
-use crate::disk_snapshot::{CommitEvent, DiskSnapshot, FeedbackBlob};
+use crate::disk_snapshot::{CommitEvent, CommitSnapshot, FeedbackBlob};
 use crate::lifecycle::{CommitSha, PlanKey};
 use crate::repo_state::PlanTouchKind;
 
@@ -759,21 +759,25 @@ fn parse_finalize_subpath(rel: &Path) -> Option<(PlanKey, String)> {
     Some((parsed.plan_key, file_name))
 }
 
-/// Gather a `DiskSnapshot` for `repo_root`. IO half of the rebuild
-/// flow; `disk_snapshot::derive_state` consumes the result as a fold.
+/// Gather a `CommitSnapshot` for `repo_root`. IO half of the
+/// commit-derived rebuild; `disk_snapshot::derive_base_state`
+/// consumes the result as a feedback-blind fold.
 ///
-/// Three IO steps in order:
+/// Two IO steps in order:
 /// 1. `git rev-parse HEAD` (empty repo → empty snapshot).
 /// 2. Per-commit walk along HEAD's first-parent chain. For each
-///    commit: `git diff-tree` for the diff structure; `git show` per
-///    plan-file Add/Modify (body) and per finalize-file upsert (first
-///    line) so each `CommitEvent` carries everything the fold needs.
-/// 3. Walk `<repo>/.trinity/feedback/` for working-tree feedback
-///    (NOT in git).
-pub async fn snapshot(repo_root: &Path) -> Result<DiskSnapshot, GitIoError> {
+///    commit: `git diff-tree` for the diff structure; `git show`
+///    per plan-file Add/Modify (body) and per finalize-file upsert
+///    (first line) so each `CommitEvent` carries everything the
+///    fold needs.
+///
+/// Working-tree feedback is gathered separately via
+/// [`collect_feedback_files`] and applied by
+/// `disk_snapshot::attach_live_feedback`.
+pub async fn snapshot(repo_root: &Path) -> Result<CommitSnapshot, GitIoError> {
     let head = rev_parse_head(repo_root).await?;
     let Some(head) = head else {
-        return Ok(DiskSnapshot::default());
+        return Ok(CommitSnapshot::default());
     };
 
     let metas = first_parent_commits(repo_root).await?;
@@ -788,16 +792,17 @@ pub async fn snapshot(repo_root: &Path) -> Result<DiskSnapshot, GitIoError> {
         });
     }
 
-    let feedback_files = collect_feedback_files(repo_root)?;
-
-    Ok(DiskSnapshot {
+    Ok(CommitSnapshot {
         head: Some(head),
         history,
-        feedback_files,
     })
 }
 
-fn collect_feedback_files(repo_root: &Path) -> Result<Vec<FeedbackBlob>, GitIoError> {
+/// Walk `<repo>/.trinity/feedback/` and return every well-formed
+/// feedback file with its body and mtime. Public for the live
+/// overlay path in `rebuild_repo` and any caller that wants the
+/// raw feedback set.
+pub fn collect_feedback_files(repo_root: &Path) -> Result<Vec<FeedbackBlob>, GitIoError> {
     let feedback_root = repo_root.join(".trinity").join("feedback");
     if !feedback_root.exists() {
         return Ok(Vec::new());

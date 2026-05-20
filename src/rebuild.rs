@@ -1,12 +1,20 @@
-//! Cold-start / HEAD-change rebuild. Composes `git_io::snapshot` (IO)
-//! with `disk_snapshot::derive_state` (pure) into a single async entry
-//! point used by the runtime.
+//! Cold-start / HEAD-change rebuild. Composes the three-phase
+//! pipeline into a single async entry point:
+//!
+//! 1. `git_io::snapshot` → `CommitSnapshot` (IO, commit-derived only)
+//! 2. `disk_snapshot::derive_base_state` → `BaseRepoState` (pure)
+//! 3. `git_io::collect_feedback_files` + `attach_live_feedback` →
+//!    `LiveRepoState` (working-tree overlay)
+//!
+//! Future cache layer slots in at step 2 — `BaseRepoState` is the
+//! cacheable boundary. See
+//! `.trinity/plans/cache-core-fold-and-live-feedback.md`.
 
 use std::path::Path;
 
-use crate::disk_snapshot::derive_state;
+use crate::disk_snapshot::{attach_live_feedback, derive_base_state};
 use crate::git_io::{self, GitIoError};
-use crate::repo_state::RepoState;
+use crate::repo_state::LiveRepoState;
 
 #[derive(Debug, thiserror::Error)]
 pub enum RebuildError {
@@ -14,15 +22,13 @@ pub enum RebuildError {
     Git(#[from] GitIoError),
 }
 
-/// Build a fresh `RepoState` from disk + git for `repo_root`. Empty
-/// repos (no commits) produce an empty state.
-///
-/// Two-phase: `git_io::snapshot` builds a `DiskSnapshot` (a sequence
-/// of per-commit events plus working-tree feedback);
-/// `derive_state` folds it into `RepoState`.
-pub async fn rebuild_repo(repo_root: &Path) -> Result<RepoState, RebuildError> {
+/// Build a fresh `LiveRepoState` from disk + git for `repo_root`.
+/// Empty repos (no commits) produce an empty state.
+pub async fn rebuild_repo(repo_root: &Path) -> Result<LiveRepoState, RebuildError> {
     let snapshot = git_io::snapshot(repo_root).await?;
-    Ok(derive_state(repo_root.to_path_buf(), snapshot))
+    let base = derive_base_state(repo_root.to_path_buf(), snapshot);
+    let feedback = git_io::collect_feedback_files(repo_root)?;
+    Ok(attach_live_feedback(base, feedback))
 }
 
 #[cfg(test)]

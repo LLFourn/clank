@@ -111,7 +111,7 @@ impl Runtime {
                 );
                 return Ok(RegisterOutcome::ShadowedByOther { claimed_by });
             }
-            trinity.repos.insert(canonical.clone(), fresh);
+            trinity.repos.insert(canonical.clone(), fresh.into_inner());
             trinity.repo_basenames.insert(basename, canonical.clone());
         }
         Ok(RegisterOutcome::Registered)
@@ -338,7 +338,9 @@ impl Runtime {
                     }
                     let prior_digest = trinity.repos.get(repo_root).map(|r| r.digest());
                     let changed = prior_digest.as_ref() != Some(&fresh_digest);
-                    trinity.repos.insert(repo_root.to_path_buf(), fresh);
+                    trinity
+                        .repos
+                        .insert(repo_root.to_path_buf(), fresh.into_inner());
                     if changed {
                         self.push_event(
                             &mut trinity,
@@ -517,77 +519,18 @@ fn remove_feedback(session: &mut Plan, parsed: &crate::disk_format::FeedbackPath
     }
 }
 
-/// Re-fold this plan's per-event gates from `plan.timeline` in
-/// chronological order, replaying the cumulative-participant carry
-/// over each reviewable event's feedback. Called after every
-/// feedback-file mutation so the participant set, missing-approvals,
-/// and gate-state stay consistent between full rebuilds.
+/// Re-fold this plan's per-event gates after a live feedback
+/// mutation. Delegates to `disk_snapshot::rebuild_plan_gates` —
+/// the single chronological-walk impl that the bulk
+/// `attach_live_feedback` path also uses. Both paths must call
+/// the same code; duplicating the cumulative-participant
+/// algorithm is exactly how the cache path and live daemon path
+/// would drift.
 fn refresh_commits_for(state: &mut crate::repo_state::RepoState, plan_key: &PlanKey) {
     let Some(plan) = state.plans.get_mut(plan_key) else {
         return;
     };
-    if plan.is_frozen() {
-        // Sealed plan: no gate updates from live feedback signals.
-        return;
-    }
-    let mut participants: Vec<crate::lifecycle::AgentLabel> = Vec::new();
-    for event in plan.timeline.iter_mut() {
-        if !event.kind().is_reviewable() {
-            continue;
-        }
-        let fb_for = event.gate().map(|g| g.feedback.clone()).unwrap_or_default();
-        let mut approvers = Vec::new();
-        let mut requesters = Vec::new();
-        let mut ambiguous = Vec::new();
-        for (author, fb) in &fb_for {
-            if !participants.contains(author) {
-                participants.push(author.clone());
-            }
-            match fb.verdict {
-                crate::repo_state::Verdict::Approve => {
-                    if !approvers.contains(author) {
-                        approvers.push(author.clone());
-                    }
-                }
-                crate::repo_state::Verdict::RequestChanges => {
-                    if !requesters.contains(author) {
-                        requesters.push(author.clone());
-                    }
-                }
-                crate::repo_state::Verdict::Unmarked => {
-                    if !ambiguous.contains(author) {
-                        ambiguous.push(author.clone());
-                    }
-                }
-            }
-        }
-        let missing: Vec<_> = participants
-            .iter()
-            .filter(|p| !approvers.contains(p) && !requesters.contains(p) && !ambiguous.contains(p))
-            .cloned()
-            .collect();
-        let gate_state = if !requesters.is_empty() || !ambiguous.is_empty() {
-            crate::review_state::CommitGateState::ChangesRequested
-        } else if !approvers.is_empty() && missing.is_empty() {
-            crate::review_state::CommitGateState::Approved
-        } else {
-            crate::review_state::CommitGateState::Unreviewed
-        };
-        // Reviewable variant: gate is structurally present, mutate in
-        // place rather than reassigning the field.
-        let gate = event
-            .gate_mut()
-            .expect("is_reviewable() implies a gate (structural)");
-        *gate = crate::review_state::CommitGate {
-            state: gate_state,
-            participants: participants.clone(),
-            approvers,
-            requesters,
-            ambiguous,
-            missing,
-            feedback: fb_for,
-        };
-    }
+    crate::disk_snapshot::rebuild_plan_gates(plan);
 }
 
 // Silence dead-code warnings on imports only used in specific branches.

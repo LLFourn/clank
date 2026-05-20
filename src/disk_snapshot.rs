@@ -1,23 +1,22 @@
 //! The sans-IO boundary for repo-state derivation.
 //!
-//! `DiskSnapshot` is a list of per-commit events along HEAD's
-//! first-parent chain plus the working-tree feedback files (which
-//! aren't in git). Each `CommitEvent` carries everything the fold
-//! needs from that commit's diff: plan touches with bodies, finalize
-//! changes with first lines, code-change flag, author timestamp,
-//! subject.
+//! `CommitSnapshot` is a list of per-commit events along HEAD's
+//! first-parent chain. Each `CommitEvent` carries everything the
+//! fold needs from that commit's diff: plan touches with bodies,
+//! finalize changes with first lines, code-change flag, author
+//! timestamp, subject. Working-tree feedback is **not** in
+//! `CommitSnapshot` — it's collected separately by
+//! `git_io::collect_feedback_files` and applied in the live overlay.
 //!
-//! `derive_state` is a pure function: start with empty `RepoState`,
-//! apply each `CommitEvent` in order, then apply feedback by target
-//! SHA. State at the end represents the repo: which plans exist
-//! (currently in tree or ever-frozen), what they say, who's waiting
-//! on what. No HEAD-tree side data, no `--all` queries, no
-//! topological `parent_of` calls — the chronological fold IS the
-//! lifecycle.
+//! `derive_base_state` is a pure function: start with empty
+//! `RepoState`, apply each `CommitEvent` in order. The result is a
+//! `BaseRepoState` whose gates have empty feedback and `Unreviewed`
+//! state — those are filled in by `attach_live_feedback`.
 //!
-//! The IO layer (`git_io::snapshot`) builds the `DiskSnapshot` by
-//! running one `git log --first-parent` and per-commit `git diff-tree`
-//! + `git show` reads. `rebuild::rebuild_repo` glues the two.
+//! The split is the architectural contract from
+//! `.trinity/plans/cache-core-fold-and-live-feedback.md`: only the
+//! commit-derived `BaseRepoState` is cacheable, because only it is a
+//! pure function of HEAD's commit DAG.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
@@ -26,30 +25,19 @@ use crate::attribution::{CommitChanges, FinalizeChangeKind, classify, effective_
 use crate::disk_format::{FeedbackPath, finalize_first_line_starts_with_approve, parse_verdict};
 use crate::lifecycle::{AgentLabel, CommitSha, PlanKey, content_hash};
 use crate::repo_state::{
-    AttributionResult, CommitKind, Feedback, Plan, PlanTimelineEvent, PlanTouchKind, RepoState,
-    Verdict,
+    AttributionResult, BaseRepoState, CommitKind, Feedback, LiveRepoState, Plan, PlanTimelineEvent,
+    PlanTouchKind, RepoState, Verdict,
 };
 use crate::review_state::{CommitGate, CommitGateState};
 
-/// Everything Trinity needs to derive a repo's state, materialized
-/// from a single sequential walk of HEAD's first-parent chain.
-/// `git_io::snapshot` builds it; `derive_state` consumes it as a fold.
-///
-/// Strictly one shape of input: a list of commit events plus the
-/// on-disk working-tree feedback. No HEAD-tree side data, no
-/// pre-built plan-files snapshot — `derive_state` builds
-/// `state.plans` by applying each commit's event in order.
+/// Commit-derived input to the fold. Strictly a function of HEAD's
+/// first-parent commit DAG — no working-tree state. `git_io::snapshot`
+/// produces it; `derive_base_state` folds it into a `BaseRepoState`.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub struct DiskSnapshot {
+pub struct CommitSnapshot {
     pub head: Option<CommitSha>,
     /// First-parent commit chain from the root to HEAD, oldest-first.
-    /// Each event carries the per-commit data the fold needs:
-    /// structured diff against parent + author timestamp + subject.
     pub history: Vec<CommitEvent>,
-    /// Working-tree feedback files (NOT in git). Each is keyed by its
-    /// target commit SHA; the fold applies it when it processes that
-    /// commit.
-    pub feedback_files: Vec<FeedbackBlob>,
 }
 
 /// One first-parent commit's contribution to repo state: the diff
@@ -75,54 +63,81 @@ pub struct FeedbackBlob {
     pub created_at: i64,
 }
 
-/// Pure derivation of `RepoState` from a snapshot. No IO.
+/// Pure derivation of `BaseRepoState` from a commit snapshot. No
+/// IO and no working-tree access — feedback-blind. The resulting
+/// reviewable gates carry empty `feedback` maps and `Unreviewed`
+/// state; [`attach_live_feedback`] fills those in.
 ///
 /// Single chronological commit fold: for each commit in
 /// `snapshot.history` (oldest-first), update attribution and
 /// plan_touches, replay finalize-snapshot changes into a running
 /// per-plan tree state, check the finalize rule (and set
-/// `frozen_at` monotonically), then build per-plan gate entries
-/// applying the working-tree feedback for that commit. Frozen plans
-/// are skipped end-to-end for subsequent commits: no new attribution,
-/// plan_touches, gates, or lifecycle change.
-pub fn derive_state(repo_root: PathBuf, snapshot: DiskSnapshot) -> RepoState {
+/// `frozen_at` monotonically), then append per-plan timeline
+/// events. Frozen plans are skipped end-to-end for subsequent
+/// commits.
+pub fn derive_base_state(repo_root: PathBuf, snapshot: CommitSnapshot) -> BaseRepoState {
     let mut state = RepoState::empty(repo_root);
     state.head = snapshot.head;
-    let mut carry = FoldCarry::new(snapshot.feedback_files);
+    let mut carry = FoldCarry::new();
     for event in &snapshot.history {
         apply_commit(&mut state, &mut carry, event);
     }
-    state
+    BaseRepoState::new(state)
 }
 
-/// Transient fold state carried between `apply_commit` calls. Holds
-/// just enough to apply the next commit without rebuilding from the
-/// past — the running tree state (which plan files exist + their
-/// bodies), the running finalize-tree (which APPROVE files each plan
-/// has), the walk-back attribution carry, the cumulative gate
-/// participants, the pre-indexed working-tree feedback, and the
-/// previous commit's SHA (for `plan_intro_parent` of plans
-/// introduced at the next commit).
+/// Apply working-tree feedback files on top of a `BaseRepoState`.
+/// This is the only stage that reads mutable `.trinity/feedback/`
+/// data — the cache layer never sees it.
 ///
-/// Constructed by `FoldCarry::new(feedback_files)` (which indexes the
-/// on-disk feedback once) and then threaded through every
-/// `apply_commit` call. None of these fields belong on `RepoState` —
-/// they're scratch state for the fold, not facts about the repo.
-pub struct FoldCarry {
-    current_effective: Option<PlanKey>,
-    plan_in_tree: BTreeSet<PlanKey>,
-    plan_bodies: BTreeMap<PlanKey, String>,
-    finalize_tree: BTreeMap<PlanKey, BTreeMap<String, String>>,
-    gate_participants: BTreeMap<PlanKey, Vec<AgentLabel>>,
-    previous_commit: Option<CommitSha>,
-    feedback_by_plan: BTreeMap<PlanKey, BTreeMap<(CommitSha, AgentLabel), Feedback>>,
-}
+/// Algorithm (per active plan, oldest-to-newest):
+///
+/// 1. Build a per-plan feedback index keyed by `(plan, target_sha,
+///    author)`.
+/// 2. Write each feedback entry into the matching reviewable
+///    timeline event's `gate.feedback` map.
+/// 3. Call [`rebuild_plan_gates`] to recompute every reviewable
+///    gate's participants / approvers / requesters / missing /
+///    state chronologically. **Cumulative participants propagate
+///    forward** — a feedback file on commit A makes the reviewer a
+///    participant for every later reviewable gate in that plan.
+/// 4. Bump `plan.last_activity_ts` to include feedback mtimes.
+///
+/// Finished plans are sealed: live feedback targeting their
+/// commits is ignored at this stage.
+pub fn attach_live_feedback(
+    base: BaseRepoState,
+    feedback_files: Vec<FeedbackBlob>,
+) -> LiveRepoState {
+    let mut state = base.into_inner();
 
-impl FoldCarry {
-    pub fn new(feedback_files: Vec<FeedbackBlob>) -> Self {
-        let mut feedback_by_plan: BTreeMap<PlanKey, BTreeMap<(CommitSha, AgentLabel), Feedback>> =
-            BTreeMap::new();
-        for fb in feedback_files {
+    // Index feedback by plan. Per-plan we'll walk the timeline once.
+    let mut by_plan: BTreeMap<PlanKey, Vec<FeedbackBlob>> = BTreeMap::new();
+    for fb in feedback_files {
+        by_plan
+            .entry(fb.parsed.plan_key.clone())
+            .or_default()
+            .push(fb);
+    }
+
+    for (plan_key, blobs) in by_plan {
+        let Some(plan) = state.plans.get_mut(&plan_key) else {
+            continue;
+        };
+        if plan.is_frozen() {
+            // Sealed plans don't accept live feedback — finished
+            // semantics are commit-derived only.
+            continue;
+        }
+
+        // Write each blob into the matching event's gate.feedback.
+        // Drop silently if the target SHA isn't on this plan's
+        // timeline (e.g. unattributed commit) or the event is not
+        // reviewable.
+        let mut max_feedback_ts: i64 = 0;
+        for fb in blobs {
+            if fb.created_at > max_feedback_ts {
+                max_feedback_ts = fb.created_at;
+            }
             let verdict = parse_verdict(&fb.body);
             let feedback = Feedback {
                 author: fb.parsed.author.clone(),
@@ -131,20 +146,93 @@ impl FoldCarry {
                 path: fb.abs_path.to_string_lossy().into_owned(),
                 created_at: fb.created_at,
             };
-            feedback_by_plan
-                .entry(fb.parsed.plan_key.clone())
-                .or_default()
-                .insert((fb.parsed.target_sha, feedback.author.clone()), feedback);
+            let Some(event) = plan.event_for_mut(&fb.parsed.target_sha) else {
+                continue;
+            };
+            if !event.kind().is_reviewable() {
+                continue;
+            }
+            if let Some(gate) = event.gate_mut() {
+                gate.feedback.insert(feedback.author.clone(), feedback);
+            }
         }
+
+        rebuild_plan_gates(plan);
+        if max_feedback_ts > plan.last_activity_ts {
+            plan.last_activity_ts = max_feedback_ts;
+        }
+    }
+
+    LiveRepoState::new(state)
+}
+
+/// Rebuild every reviewable gate on `plan.timeline` from the
+/// feedback already stored in `gate.feedback`, walking
+/// oldest-to-newest with cumulative participants.
+///
+/// **The single source of truth for live-feedback gate composition.**
+/// Called from both [`attach_live_feedback`] (bulk rebuild from
+/// disk) and the runtime's `upsert_feedback` / `remove_feedback`
+/// watcher path (incremental in-memory update). Duplicating the
+/// chronological-walk algorithm is exactly how the cache path and
+/// live daemon path would drift; keep one impl.
+///
+/// Frozen plans are no-ops.
+pub fn rebuild_plan_gates(plan: &mut Plan) {
+    if plan.is_frozen() {
+        return;
+    }
+    let mut participants: Vec<AgentLabel> = Vec::new();
+    for event in plan.timeline.iter_mut() {
+        if !event.kind().is_reviewable() {
+            continue;
+        }
+        let sha = event.sha().clone();
+        let commit_feedback = event.gate().map(|g| g.feedback.clone()).unwrap_or_default();
+        let gate = compose_gate(&sha, commit_feedback, &mut participants);
+        if let Some(g) = event.gate_mut() {
+            *g = gate;
+        }
+    }
+}
+
+/// Transient fold state carried between `apply_commit` calls. Holds
+/// just enough to apply the next commit without rebuilding from the
+/// past — the running tree state (which plan files exist + their
+/// bodies), the running finalize-tree (which APPROVE files each
+/// plan has), the walk-back attribution carry, and the previous
+/// commit's SHA (for `plan_intro_parent` of plans introduced at
+/// the next commit).
+///
+/// Constructed by `FoldCarry::new()` and threaded through every
+/// `apply_commit` call. None of these fields belong on `RepoState`
+/// — they're scratch state for the fold, not facts about the repo.
+/// Feedback is **not** carried here any more; gates are filled
+/// with empty feedback by the base fold and rebuilt by
+/// [`attach_live_feedback`].
+pub struct FoldCarry {
+    current_effective: Option<PlanKey>,
+    plan_in_tree: BTreeSet<PlanKey>,
+    plan_bodies: BTreeMap<PlanKey, String>,
+    finalize_tree: BTreeMap<PlanKey, BTreeMap<String, String>>,
+    previous_commit: Option<CommitSha>,
+}
+
+impl FoldCarry {
+    pub fn new() -> Self {
         Self {
             current_effective: None,
             plan_in_tree: BTreeSet::new(),
             plan_bodies: BTreeMap::new(),
             finalize_tree: BTreeMap::new(),
-            gate_participants: BTreeMap::new(),
             previous_commit: None,
-            feedback_by_plan,
         }
+    }
+}
+
+impl Default for FoldCarry {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -199,7 +287,6 @@ pub fn apply_commit(state: &mut RepoState, carry: &mut FoldCarry, event: &Commit
             // at freeze). Unfrozen plans have no anchor → remove.
             if !is_frozen(state, &touch.session) {
                 state.plans.remove(&touch.session);
-                carry.gate_participants.remove(&touch.session);
             }
         } else {
             carry.plan_in_tree.insert(touch.session.clone());
@@ -242,10 +329,6 @@ pub fn apply_commit(state: &mut RepoState, carry: &mut FoldCarry, event: &Commit
                         archived_cycles: Vec::new(),
                     },
                 );
-                carry
-                    .gate_participants
-                    .entry(touch.session.clone())
-                    .or_default();
             }
             // Revision of a non-frozen plan tracks HEAD body. Frozen
             // plans are sealed — body stays at freeze-time.
@@ -382,9 +465,18 @@ pub fn apply_commit(state: &mut RepoState, carry: &mut FoldCarry, event: &Commit
             continue;
         }
         let gate = if kind.is_reviewable() {
-            let participants = carry.gate_participants.entry(plan_key.clone()).or_default();
-            let fb_map = carry.feedback_by_plan.get(plan_key);
-            Some(build_gate_step(&commit_sha, fb_map, participants))
+            // Base fold: gates have no feedback yet. `attach_live_feedback`
+            // fills them in via `rebuild_plan_gates`. The state is
+            // Unreviewed with empty participant/approver/missing sets.
+            Some(CommitGate {
+                state: CommitGateState::Unreviewed,
+                participants: Vec::new(),
+                approvers: Vec::new(),
+                requesters: Vec::new(),
+                ambiguous: Vec::new(),
+                missing: Vec::new(),
+                feedback: BTreeMap::new(),
+            })
         } else {
             None
         };
@@ -392,12 +484,9 @@ pub fn apply_commit(state: &mut RepoState, carry: &mut FoldCarry, event: &Commit
         if event.author_ts > plan.last_activity_ts {
             plan.last_activity_ts = event.author_ts;
         }
-        if let Some(g) = &gate {
-            let feedback_ts = g.feedback.values().map(|f| f.created_at).max().unwrap_or(0);
-            if feedback_ts > plan.last_activity_ts {
-                plan.last_activity_ts = feedback_ts;
-            }
-        }
+        // Feedback timestamps no longer enter here; `attach_live_feedback`
+        // bumps `last_activity_ts` from feedback mtimes after the base
+        // fold completes.
         let sha = commit_sha.clone();
         let author_ts = event.author_ts;
         let subject = event.subject.clone();
@@ -459,24 +548,21 @@ fn finalize_rule_satisfied(files: Option<&BTreeMap<String, String>>) -> bool {
             .all(|first_line| finalize_first_line_starts_with_approve(first_line))
 }
 
-/// Build a single commit's `CommitGate`, extending `participants` with
-/// any new authors. Pulls feedback for `commit_sha` from `fb_map`.
-fn build_gate_step(
-    commit_sha: &CommitSha,
-    fb_map: Option<&BTreeMap<(CommitSha, AgentLabel), Feedback>>,
+/// Compose a single commit's `CommitGate` from its already-known
+/// `commit_feedback` map plus the cumulative `participants` carry.
+/// Extends `participants` with any author not already in it, then
+/// derives approvers / requesters / ambiguous / missing / state.
+///
+/// Pure function — no IO, no globals. Used by [`rebuild_plan_gates`]
+/// when walking a plan's timeline oldest-to-newest.
+fn compose_gate(
+    _commit_sha: &CommitSha,
+    commit_feedback: BTreeMap<AgentLabel, Feedback>,
     participants: &mut Vec<AgentLabel>,
 ) -> CommitGate {
     let mut approvers: Vec<AgentLabel> = Vec::new();
     let mut requesters: Vec<AgentLabel> = Vec::new();
     let mut ambiguous: Vec<AgentLabel> = Vec::new();
-    let mut commit_feedback: BTreeMap<AgentLabel, Feedback> = BTreeMap::new();
-    if let Some(map) = fb_map {
-        for ((target, _key_author), fb) in map {
-            if target == commit_sha {
-                commit_feedback.insert(fb.author.clone(), fb.clone());
-            }
-        }
-    }
     for (author, fb) in &commit_feedback {
         if !participants.contains(author) {
             participants.push(author.clone());
@@ -626,20 +712,26 @@ mod tests {
         }
     }
 
-    fn snap(history: Vec<CommitEvent>) -> DiskSnapshot {
-        DiskSnapshot {
+    fn snap(history: Vec<CommitEvent>) -> CommitSnapshot {
+        CommitSnapshot {
             head: history.last().map(|e| e.commit.clone()),
             history,
-            feedback_files: Vec::new(),
         }
     }
 
-    fn snap_with_feedback(history: Vec<CommitEvent>, fb: Vec<FeedbackBlob>) -> DiskSnapshot {
-        DiskSnapshot {
-            head: history.last().map(|e| e.commit.clone()),
-            history,
-            feedback_files: fb,
-        }
+    /// Test helper: replay the full pipeline (base fold + live
+    /// feedback attach) and return the underlying `RepoState`.
+    fn derive_state(repo: PathBuf, snap: CommitSnapshot) -> RepoState {
+        attach_live_feedback(derive_base_state(repo, snap), Vec::new()).into_inner()
+    }
+
+    /// Test helper with feedback overlay.
+    fn derive_state_with_feedback(
+        repo: PathBuf,
+        snap: CommitSnapshot,
+        fb: Vec<FeedbackBlob>,
+    ) -> RepoState {
+        attach_live_feedback(derive_base_state(repo, snap), fb).into_inner()
     }
 
     // ============================================================
@@ -648,7 +740,7 @@ mod tests {
 
     #[test]
     fn empty_snapshot_yields_empty_state() {
-        let state = derive_state(PathBuf::from("/r"), DiskSnapshot::default());
+        let state = derive_state(PathBuf::from("/r"), CommitSnapshot::default());
         assert!(state.plans.is_empty());
         assert!(state.head.is_none());
     }
@@ -880,16 +972,14 @@ mod tests {
 
     #[test]
     fn feedback_lands_in_gate_for_reviewable_commit() {
-        let state = derive_state(
+        let state = derive_state_with_feedback(
             PathBuf::from("/r"),
-            snap_with_feedback(
-                vec![event(
-                    "c1c1",
-                    vec![intro_with_body("foo", "# foo\n")],
-                    false,
-                )],
-                vec![feedback("foo", "c1c1", "alice", "APPROVE\n")],
-            ),
+            snap(vec![event(
+                "c1c1",
+                vec![intro_with_body("foo", "# foo\n")],
+                false,
+            )]),
+            vec![feedback("foo", "c1c1", "alice", "APPROVE\n")],
         );
         let plan = &state.plans[&sess("foo")];
         let event = plan.event_for(&sha("c1c1")).expect("event for c1");
@@ -1136,19 +1226,17 @@ mod tests {
     /// projection / wire code starts trusting the wrong half.
     #[test]
     fn commit_gate_feedback_key_matches_value_author() {
-        let state = derive_state(
+        let state = derive_state_with_feedback(
             PathBuf::from("/r"),
-            snap_with_feedback(
-                vec![event(
-                    "c1c1",
-                    vec![intro_with_body("foo", "# foo\n")],
-                    false,
-                )],
-                vec![
-                    feedback("foo", "c1c1", "alice", "APPROVE\n\nlgtm\n"),
-                    feedback("foo", "c1c1", "bob", "REQUEST_CHANGES\n\nbug\n"),
-                ],
-            ),
+            snap(vec![event(
+                "c1c1",
+                vec![intro_with_body("foo", "# foo\n")],
+                false,
+            )]),
+            vec![
+                feedback("foo", "c1c1", "alice", "APPROVE\n\nlgtm\n"),
+                feedback("foo", "c1c1", "bob", "REQUEST_CHANGES\n\nbug\n"),
+            ],
         );
         let plan = &state.plans[&sess("foo")];
         let gate = plan
@@ -1163,5 +1251,98 @@ mod tests {
                 "CommitGate.feedback invariant: map key must equal value.author"
             );
         }
+    }
+
+    // ============================================================
+    // Phase 1 invariants for `.trinity/plans/cache-core-fold-and-
+    // live-feedback.md`. Pin the boundary the cache will rely on.
+    // ============================================================
+
+    /// Test 1: `derive_base_state` is feedback-blind. The same
+    /// `CommitSnapshot` produces a `BaseRepoState` with empty,
+    /// `Unreviewed` gates regardless of what feedback exists on
+    /// disk — because it never reads disk.
+    #[test]
+    fn derive_base_state_is_feedback_blind() {
+        let snap = snap(vec![event(
+            "c1c1",
+            vec![intro_with_body("foo", "# foo\n")],
+            false,
+        )]);
+        let base = derive_base_state(PathBuf::from("/r"), snap.clone());
+        let plan = &base.plans[&sess("foo")];
+        let intro = plan.event_for(&sha("c1c1")).expect("intro event");
+        let gate = intro.gate().expect("intro is reviewable");
+        assert_eq!(gate.state, CommitGateState::Unreviewed);
+        assert!(gate.feedback.is_empty());
+        assert!(gate.participants.is_empty());
+        assert!(gate.missing.is_empty());
+    }
+
+    /// Test 3: cumulative participants survive the split. Feedback
+    /// on commit A from `alice` must mark her as missing on a later
+    /// reviewable commit B in the same plan. This is the
+    /// architectural invariant `rebuild_plan_gates` exists to
+    /// preserve; patching only the target gate would lose it.
+    #[test]
+    fn cumulative_participants_propagate_across_reviewable_events() {
+        // Two reviewable commits on plan `foo`: c1 (intro, PlanOnly)
+        // and c2 (Mixed: revision + code).
+        let history = vec![
+            event("c1c1", vec![intro_with_body("foo", "# v1\n")], false),
+            event("c2c2", vec![revise_with_body("foo", "# v2\n")], true),
+        ];
+        // Feedback only on c1.
+        let fb = vec![feedback("foo", "c1c1", "alice", "APPROVE\n")];
+        let state = derive_state_with_feedback(PathBuf::from("/r"), snap(history), fb);
+        let plan = &state.plans[&sess("foo")];
+
+        let c2 = plan.event_for(&sha("c2c2")).expect("c2 event");
+        let gate_c2 = c2.gate().expect("c2 is reviewable");
+        let alice = AgentLabel::parse("alice").unwrap();
+        assert!(
+            gate_c2.participants.contains(&alice),
+            "alice should be a cumulative participant at c2; got {:?}",
+            gate_c2.participants,
+        );
+        assert!(
+            gate_c2.missing.contains(&alice),
+            "alice voted on c1 but not c2 → must be `missing` at c2; got {:?}",
+            gate_c2.missing,
+        );
+        assert_eq!(gate_c2.state, CommitGateState::Unreviewed);
+    }
+
+    /// Test 5: live feedback targeting a finished plan does not
+    /// re-open the lifecycle. Once frozen, the plan is sealed and
+    /// `attach_live_feedback` skips it.
+    #[test]
+    fn finished_plan_ignores_live_feedback() {
+        let history = vec![
+            event("c1c1", vec![intro_with_body("foo", "# foo\n")], false),
+            event_with_finalize(
+                "c2c2",
+                vec![],
+                vec![crate::attribution::FinalizeChange {
+                    plan_key: sess("foo"),
+                    file_name: "alice.md".into(),
+                    kind: crate::attribution::FinalizeChangeKind::Upsert {
+                        first_line: "APPROVE".into(),
+                    },
+                }],
+            ),
+        ];
+        // Late feedback "after" finalize, targeting the intro.
+        let fb = vec![feedback("foo", "c1c1", "bob", "REQUEST_CHANGES\n\nlate\n")];
+        let state = derive_state_with_feedback(PathBuf::from("/r"), snap(history), fb);
+        let plan = &state.plans[&sess("foo")];
+        assert!(plan.is_frozen(), "plan should still be frozen");
+        let intro = plan.event_for(&sha("c1c1")).expect("intro event");
+        let gate = intro.gate().expect("intro is reviewable");
+        assert!(
+            gate.feedback.is_empty(),
+            "frozen plan should not absorb live feedback; got {:?}",
+            gate.feedback.keys().collect::<Vec<_>>(),
+        );
     }
 }

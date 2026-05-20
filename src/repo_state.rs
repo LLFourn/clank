@@ -169,6 +169,68 @@ impl RepoState {
     }
 }
 
+/// `RepoState` derived purely from committed git history — no live
+/// feedback applied yet. Produced by `disk_snapshot::derive_base_state`,
+/// consumed by `disk_snapshot::attach_live_feedback`. Cacheable: the
+/// content is a function of HEAD's commit DAG alone, so it can be
+/// persisted under `.trinity/cache/repo-state/<head>.v<n>.bin` and
+/// reloaded on the next rebuild at the same HEAD.
+///
+/// The newtype exists to police construction: only `derive_base_state`
+/// (and the cache loader, which produces an equivalent shape) builds
+/// one, and only `attach_live_feedback` consumes one. Read-only
+/// projections still go through `&RepoState` via `Deref`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BaseRepoState(RepoState);
+
+impl BaseRepoState {
+    pub fn new(state: RepoState) -> Self {
+        Self(state)
+    }
+    pub fn into_inner(self) -> RepoState {
+        self.0
+    }
+    pub fn as_ref_inner(&self) -> &RepoState {
+        &self.0
+    }
+}
+
+impl std::ops::Deref for BaseRepoState {
+    type Target = RepoState;
+    fn deref(&self) -> &RepoState {
+        &self.0
+    }
+}
+
+/// `RepoState` after `attach_live_feedback` has folded in
+/// working-tree `.trinity/feedback/` files. This is what the rest of
+/// the codebase actually projects from. The newtype prevents the
+/// cache layer from accidentally serializing a live state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LiveRepoState(RepoState);
+
+impl LiveRepoState {
+    pub fn new(state: RepoState) -> Self {
+        Self(state)
+    }
+    pub fn into_inner(self) -> RepoState {
+        self.0
+    }
+}
+
+impl std::ops::Deref for LiveRepoState {
+    type Target = RepoState;
+    fn deref(&self) -> &RepoState {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for LiveRepoState {
+    fn deref_mut(&mut self) -> &mut RepoState {
+        &mut self.0
+    }
+}
+
 /// Stable hash of a `RepoState`. Used by the runtime to skip broadcasts
 /// when a rebuild produced byte-identical state.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
