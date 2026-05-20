@@ -1,20 +1,20 @@
 //! `trinity purge` — strip a plan's `.trinity/` artifacts from
 //! history.
 //!
-//! The CLI fetches `rewrite_preview` from the daemon and feeds the
-//! typed manifest to the shared rewrite engine (`cli::rewrite`).
-//! All git plumbing lives there.
+//! Fully local: folds the repo with `rebuild::rebuild_repo`, builds
+//! a typed rewrite preview via `crate::preview`, then feeds the
+//! manifest to the shared rewrite engine (`cli::rewrite`). No
+//! daemon required.
 
 use std::io::Write;
 
 use super::{PurgeArgs, repo_basename, resolve_repo};
 use crate::cli::rewrite::{RewriteOpts, run as run_rewrite};
-use trinity_core::api::{PurgeAllPreviewResponse, RewritePreviewResponse};
+use crate::lifecycle::PlanKey;
 
 pub async fn run(args: PurgeArgs) -> anyhow::Result<()> {
     let repo = resolve_repo(args.repo.as_deref())?;
     let basename = repo_basename(&repo)?;
-    let daemon = args.daemon.trim_end_matches('/').to_string();
 
     if args.all && args.plan.is_some() {
         anyhow::bail!("--all and a plan argument are mutually exclusive; pass one or the other",);
@@ -32,26 +32,32 @@ pub async fn run(args: PurgeArgs) -> anyhow::Result<()> {
     }
 
     if args.amend {
-        return run_amend(&repo, &basename, &daemon, &args).await;
+        return run_amend(&repo, &basename, &args).await;
     }
 
     if args.all {
-        run_all(&repo, &basename, &daemon, &args).await
+        run_all(&repo, &basename, &args).await
     } else {
-        run_single(&repo, &basename, &daemon, &args).await
+        run_single(&repo, &basename, &args).await
     }
 }
 
 async fn run_single(
     repo: &std::path::Path,
     basename: &str,
-    daemon: &str,
     args: &PurgeArgs,
 ) -> anyhow::Result<()> {
-    let stem = super::finish::resolve_stem_or_infer_for_purge(&args.plan, basename, daemon).await?;
+    let state = crate::rebuild::rebuild_repo(repo)
+        .await
+        .map_err(|e| anyhow::anyhow!("failed to fold repo `{}`: {e}", repo.display()))?;
+    let plan_key = crate::cli::plan_resolve::resolve_plan(&state, basename, args.plan.as_deref())?;
+    let stem = plan_key.as_str().to_string();
+
     // Always strip the finalize snapshot too — if anyone wants to
     // preserve the audit trail, we can add `--keep-finalize` later.
-    let preview = fetch_rewrite_preview(daemon, basename, &stem, true).await?;
+    let preview = crate::preview::build_rewrite_preview(repo, &state, &plan_key, true)
+        .await
+        .map_err(|e| anyhow::anyhow!("rewrite preview failed: {e}"))?;
 
     if !args.dry && !args.yes && !confirm_single(&stem, args.into_branch.as_deref())? {
         anyhow::bail!("aborted");
@@ -84,13 +90,13 @@ async fn run_single(
     Ok(())
 }
 
-async fn run_all(
-    repo: &std::path::Path,
-    basename: &str,
-    daemon: &str,
-    args: &PurgeArgs,
-) -> anyhow::Result<()> {
-    let preview = fetch_all_preview(daemon, basename).await?;
+async fn run_all(repo: &std::path::Path, basename: &str, args: &PurgeArgs) -> anyhow::Result<()> {
+    let state = crate::rebuild::rebuild_repo(repo)
+        .await
+        .map_err(|e| anyhow::anyhow!("failed to fold repo `{}`: {e}", repo.display()))?;
+    let preview = crate::preview::build_rewrite_preview_all(repo, &state, true)
+        .await
+        .map_err(|e| anyhow::anyhow!("all-rewrite preview failed: {e}"))?;
     if preview.intro_sha.is_none() {
         println!("no .trinity/ history found in `{basename}`; nothing to purge.");
         return Ok(());
@@ -137,16 +143,18 @@ async fn run_all(
 /// has just landed a commit and wants to retroactively scrub the
 /// plan's artifacts from HEAD's tree without rewriting earlier
 /// history.
-async fn run_amend(
-    repo: &std::path::Path,
-    basename: &str,
-    daemon: &str,
-    args: &PurgeArgs,
-) -> anyhow::Result<()> {
-    let stem = if args.all {
+async fn run_amend(repo: &std::path::Path, basename: &str, args: &PurgeArgs) -> anyhow::Result<()> {
+    let plan_key: Option<PlanKey> = if args.all {
         None
     } else {
-        Some(super::finish::resolve_stem_or_infer_for_purge(&args.plan, basename, daemon).await?)
+        let state = crate::rebuild::rebuild_repo(repo)
+            .await
+            .map_err(|e| anyhow::anyhow!("failed to fold repo `{}`: {e}", repo.display()))?;
+        Some(crate::cli::plan_resolve::resolve_plan(
+            &state,
+            basename,
+            args.plan.as_deref(),
+        )?)
     };
 
     // Plan rule: `--amend` requires HEAD to be a finalize commit
@@ -168,8 +176,8 @@ async fn run_amend(
     } else {
         Vec::new()
     };
-    let prefix: String = match stem.as_deref() {
-        Some(s) => format!(".trinity/finished/{s}/"),
+    let prefix: String = match plan_key.as_ref() {
+        Some(k) => format!(".trinity/finished/{}/", k.as_str()),
         None => ".trinity/finished/".to_string(),
     };
     let head_is_finalize =
@@ -194,10 +202,11 @@ async fn run_amend(
     }
     let head_sha_str = String::from_utf8(head_sha.stdout)?.trim().to_string();
 
-    let strip_paths: Vec<String> = match stem.as_deref() {
-        Some(s) => {
+    let strip_paths: Vec<String> = match plan_key.as_ref() {
+        Some(k) => {
             // Single-plan: ls-tree for this plan's paths
             // (always include finalize).
+            let s = k.as_str();
             let out = std::process::Command::new("git")
                 .arg("-C")
                 .arg(repo)
@@ -339,50 +348,6 @@ async fn run_amend(
     Ok(())
 }
 
-async fn fetch_all_preview(
-    daemon: &str,
-    basename: &str,
-) -> anyhow::Result<PurgeAllPreviewResponse> {
-    let url = format!("{daemon}/api/repos/{basename}/rewrite_preview_all?include_finalize=true");
-    let resp = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(60))
-        .build()?
-        .get(&url)
-        .send()
-        .await
-        .map_err(|e| anyhow::anyhow!("daemon unreachable at {daemon}: {e}"))?;
-    let status = resp.status();
-    if !status.is_success() {
-        let body = resp.text().await.unwrap_or_default();
-        anyhow::bail!("daemon returned {status} for {url}: {body}");
-    }
-    Ok(resp.json::<PurgeAllPreviewResponse>().await?)
-}
-
-async fn fetch_rewrite_preview(
-    daemon: &str,
-    basename: &str,
-    stem: &str,
-    include_finalize: bool,
-) -> anyhow::Result<RewritePreviewResponse> {
-    let url = format!(
-        "{daemon}/api/plan/{basename}/{stem}.md/rewrite_preview?include_finalize={include_finalize}",
-    );
-    let resp = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(60))
-        .build()?
-        .get(&url)
-        .send()
-        .await
-        .map_err(|e| anyhow::anyhow!("daemon unreachable at {daemon}: {e}"))?;
-    let status = resp.status();
-    if !status.is_success() {
-        let body = resp.text().await.unwrap_or_default();
-        anyhow::bail!("daemon returned {status} for {url}: {body}");
-    }
-    Ok(resp.json::<RewritePreviewResponse>().await?)
-}
-
 fn confirm_single(stem: &str, into_branch: Option<&str>) -> anyhow::Result<bool> {
     let target = match into_branch {
         Some(b) => format!("a NEW branch `{b}` (current branch left untouched)"),
@@ -428,14 +393,11 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn all_with_plan_arg_errors_before_http() {
+    async fn all_with_plan_arg_errors_before_fold() {
         let args = PurgeArgs {
             plan: Some("foo".into()),
             all: true,
             repo: Some(std::env::current_dir().unwrap()),
-            // Bogus daemon URL — if we reached HTTP we'd see a connection
-            // refused; the mutual-exclusion check should fire first.
-            daemon: "http://127.0.0.1:1".into(),
             into_branch: None,
             dry: false,
             yes: true,

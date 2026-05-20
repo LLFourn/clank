@@ -1,10 +1,10 @@
 //! `trinity finish` — finalize an approved plan.
 //!
-//! The CLI never re-derives projection state. It calls the daemon's
-//! `finish_preview` endpoint, dispatches on the typed `readiness`
-//! field, re-reads each sealed approval (verifying the body hash
-//! matches the daemon's projection), then makes a single
-//! `Finalize <stem>` commit.
+//! Fully local: folds the repo with `rebuild::rebuild_repo`, builds
+//! a typed `FinishPreviewResponse` via `crate::preview`, dispatches
+//! on `readiness`, re-reads each sealed approval (verifying its
+//! body hash against the local projection), then makes a single
+//! `Finalize <stem>` commit. No daemon required.
 
 use std::path::Path;
 
@@ -14,10 +14,15 @@ use trinity_core::api::{FinalizeBlockReason, FinalizeReadiness, FinishPreviewRes
 pub async fn run(args: FinishArgs) -> anyhow::Result<()> {
     let repo = resolve_repo(args.repo.as_deref())?;
     let basename = repo_basename(&repo)?;
-    let daemon = args.daemon.trim_end_matches('/').to_string();
-    let stem = resolve_stem_or_infer(&args.plan, &basename, &daemon).await?;
+    let state = crate::rebuild::rebuild_repo(&repo)
+        .await
+        .map_err(|e| anyhow::anyhow!("failed to fold repo `{}`: {e}", repo.display()))?;
+    let plan_key = crate::cli::plan_resolve::resolve_plan(&state, &basename, args.plan.as_deref())?;
+    let stem = plan_key.as_str().to_string();
 
-    let preview = fetch_preview(&daemon, &basename, &stem).await?;
+    let preview = crate::preview::build_finish_preview(&repo, &state, &plan_key)
+        .await
+        .map_err(|e| anyhow::anyhow!("finish preview failed: {e}"))?;
     dispatch_readiness(&preview)?;
 
     if args.amend && !head_is_finalize_for(&repo, &stem)? {
@@ -27,11 +32,8 @@ pub async fn run(args: FinishArgs) -> anyhow::Result<()> {
         );
     }
 
-    // Dry-run for composite modes must NOT create the finalize
-    // commit. Build a planned-action preview from the existing
-    // state and exit before any mutation.
     if args.dry && (args.purge || args.squash.is_some()) {
-        return dry_run_finish_composite(&repo, &basename, &daemon, &stem, &preview, &args).await;
+        return dry_run_finish_composite(&stem, &preview, &args);
     }
 
     finalize(&repo, &stem, &preview, args.amend, args.message.as_deref()).await?;
@@ -42,25 +44,19 @@ pub async fn run(args: FinishArgs) -> anyhow::Result<()> {
         println!("finalized `{stem}`");
     }
 
-    // Composite modes: --purge and --squash run the rewrite
-    // engine on the just-extended range so the finalize commit
-    // itself can be collapsed/stripped.
     if args.purge || args.squash.is_some() {
-        run_post_finalize_rewrite(&repo, &basename, &daemon, &stem, args).await?;
+        run_post_finalize_rewrite(&repo, &plan_key, args).await?;
     }
     Ok(())
 }
 
 /// Dry-run preview for `finish --purge`/`--squash`. The finalize
 /// commit hasn't been created yet, so we emit a description of
-/// the planned action without calling `finalize()` or
-/// `rewrite_preview`. Pipe-to-git isn't possible here because
-/// the finalize commit doesn't exist — operator must run the
-/// live command to materialize it before any rebase.
-async fn dry_run_finish_composite(
-    _repo: &std::path::Path,
-    _basename: &str,
-    _daemon: &str,
+/// the planned action without calling `finalize()` or running the
+/// rewrite engine. Pipe-to-git isn't possible here because the
+/// finalize commit doesn't exist — operator must run the live
+/// command to materialize it before any rebase.
+fn dry_run_finish_composite(
     stem: &str,
     preview: &FinishPreviewResponse,
     args: &FinishArgs,
@@ -106,9 +102,7 @@ async fn dry_run_finish_composite(
 
 async fn run_post_finalize_rewrite(
     repo: &std::path::Path,
-    basename: &str,
-    daemon: &str,
-    stem: &str,
+    plan_key: &crate::lifecycle::PlanKey,
     args: FinishArgs,
 ) -> anyhow::Result<()> {
     // `--purge` semantics: strip the plan's `.trinity/` paths from
@@ -119,7 +113,13 @@ async fn run_post_finalize_rewrite(
     // into one but PRESERVE the finalize snapshot. Use
     // include_finalize=false so the snapshot survives the squash.
     let include_finalize = args.purge;
-    let preview = fetch_rewrite_preview(daemon, basename, stem, include_finalize).await?;
+    let state = crate::rebuild::rebuild_repo(repo)
+        .await
+        .map_err(|e| anyhow::anyhow!("failed to fold repo `{}`: {e}", repo.display()))?;
+    let preview = crate::preview::build_rewrite_preview(repo, &state, plan_key, include_finalize)
+        .await
+        .map_err(|e| anyhow::anyhow!("rewrite preview failed: {e}"))?;
+    let stem = plan_key.as_str();
     crate::cli::rewrite::run(crate::cli::rewrite::RewriteOpts {
         repo,
         intro_sha: preview.intro_sha.as_ref(),
@@ -144,148 +144,6 @@ async fn run_post_finalize_rewrite(
         println!("purged `{stem}` from history");
     }
     Ok(())
-}
-
-async fn fetch_rewrite_preview(
-    daemon: &str,
-    basename: &str,
-    stem: &str,
-    include_finalize: bool,
-) -> anyhow::Result<trinity_core::api::RewritePreviewResponse> {
-    let url = format!(
-        "{daemon}/api/plan/{basename}/{stem}.md/rewrite_preview?include_finalize={include_finalize}",
-    );
-    let resp = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(60))
-        .build()?
-        .get(&url)
-        .send()
-        .await
-        .map_err(|e| anyhow::anyhow!("daemon unreachable at {daemon}: {e}"))?;
-    let status = resp.status();
-    if !status.is_success() {
-        let body = resp.text().await.unwrap_or_default();
-        anyhow::bail!("daemon returned {status} for {url}: {body}");
-    }
-    Ok(resp
-        .json::<trinity_core::api::RewritePreviewResponse>()
-        .await?)
-}
-
-/// Public for `cli::purge` (same parsing rules across both
-/// subcommands). Falls back to single-active-plan inference when
-/// the operator passed no plan arg.
-pub(crate) async fn resolve_stem_or_infer_for_purge(
-    plan: &Option<String>,
-    expected_basename: &str,
-    daemon: &str,
-) -> anyhow::Result<String> {
-    resolve_stem_or_infer(plan, expected_basename, daemon).await
-}
-
-/// Plan-arg resolution with inference. If `plan` is `Some`, parse
-/// it. If `None`, ask the daemon for the repo's active in-flight
-/// plans and require exactly one.
-async fn resolve_stem_or_infer(
-    plan: &Option<String>,
-    expected_basename: &str,
-    daemon: &str,
-) -> anyhow::Result<String> {
-    if plan.is_some() {
-        return resolve_stem(plan, expected_basename);
-    }
-    infer_single_active_plan(daemon, expected_basename).await
-}
-
-async fn infer_single_active_plan(daemon: &str, basename: &str) -> anyhow::Result<String> {
-    let url = format!("{daemon}/api/plans?repo={basename}");
-    let resp = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(30))
-        .build()?
-        .get(&url)
-        .send()
-        .await
-        .map_err(|e| anyhow::anyhow!("daemon unreachable at {daemon}: {e}"))?;
-    let status = resp.status();
-    if !status.is_success() {
-        let body = resp.text().await.unwrap_or_default();
-        anyhow::bail!("daemon returned {status} for {url}: {body}");
-    }
-    let response = resp.json::<trinity_core::api::ListPlansResponse>().await?;
-    let active: Vec<&trinity_core::api::PlanRow> = response
-        .plans
-        .iter()
-        .filter(|row| row.lifecycle == trinity_core::vocab::PlanLifecycle::Active)
-        .filter(|row| {
-            row.plan_id
-                .as_deref()
-                .and_then(|pid| pid.split_once('/'))
-                .map(|(b, _)| b == basename)
-                .unwrap_or(false)
-        })
-        .collect();
-    match active.as_slice() {
-        [one] => Ok(one.slug.clone()),
-        [] => anyhow::bail!(
-            "no active in-flight plan to infer; pass a plan id explicitly. \
-             repo: `{basename}`",
-        ),
-        many => {
-            let candidates: Vec<&str> = many.iter().filter_map(|p| p.plan_id.as_deref()).collect();
-            anyhow::bail!(
-                "ambiguous: {} active plans in `{basename}`; pass one explicitly. \
-                 candidates: {}",
-                many.len(),
-                candidates.join(", "),
-            )
-        }
-    }
-}
-
-/// Parse the `<plan>` CLI argument into a plan stem the wire form
-/// expects. Accepts `<basename>/<stem>.md` (full plan id; must
-/// address the repo `--repo`/cwd resolves to), `<stem>.md`, or
-/// `<stem>`. The stem returned never includes the `.md` extension;
-/// the caller re-adds it when building wire paths.
-fn resolve_stem(plan: &Option<String>, expected_basename: &str) -> anyhow::Result<String> {
-    let Some(raw) = plan else {
-        anyhow::bail!("plan argument required");
-    };
-    let raw = raw.trim();
-    if raw.is_empty() {
-        anyhow::bail!("plan argument is empty");
-    }
-    if let Some((basename, rest)) = raw.split_once('/') {
-        if basename != expected_basename {
-            anyhow::bail!(
-                "plan id `{raw}` names repo `{basename}` but we're operating on `{expected_basename}` \
-                 — pass `--repo` to override, or invoke from inside the right repo",
-            );
-        }
-        return Ok(rest.trim_end_matches(".md").to_string());
-    }
-    Ok(raw.trim_end_matches(".md").to_string())
-}
-
-async fn fetch_preview(
-    daemon: &str,
-    basename: &str,
-    stem: &str,
-) -> anyhow::Result<FinishPreviewResponse> {
-    let url = format!("{daemon}/api/plan/{basename}/{stem}.md/finish_preview");
-    let resp = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(30))
-        .build()?
-        .get(&url)
-        .send()
-        .await
-        .map_err(|e| anyhow::anyhow!("daemon unreachable at {daemon}: {e}"))?;
-    let status = resp.status();
-    if !status.is_success() {
-        let body = resp.text().await.unwrap_or_default();
-        anyhow::bail!("daemon returned {status} for {url}: {body}");
-    }
-    Ok(resp.json::<FinishPreviewResponse>().await?)
 }
 
 /// The CLI's one dispatch on the daemon's typed decision. Anything
@@ -424,51 +282,7 @@ fn git_run(repo: &Path, args: &[&str]) -> anyhow::Result<()> {
 mod tests {
     use super::*;
 
-    #[test]
-    fn resolve_stem_accepts_bare_stem() {
-        assert_eq!(resolve_stem(&Some("foo".into()), "trinity").unwrap(), "foo");
-    }
-
-    #[test]
-    fn resolve_stem_strips_dot_md() {
-        assert_eq!(
-            resolve_stem(&Some("foo.md".into()), "trinity").unwrap(),
-            "foo"
-        );
-    }
-
-    #[test]
-    fn resolve_stem_accepts_full_id_when_basename_matches() {
-        assert_eq!(
-            resolve_stem(&Some("trinity/foo.md".into()), "trinity").unwrap(),
-            "foo"
-        );
-    }
-
-    #[test]
-    fn resolve_stem_rejects_full_id_with_wrong_basename() {
-        let err = resolve_stem(&Some("other/foo.md".into()), "trinity").unwrap_err();
-        let msg = format!("{err}");
-        assert!(msg.contains("other"), "unexpected error: {msg}");
-        assert!(msg.contains("trinity"), "unexpected error: {msg}");
-    }
-
-    #[test]
-    fn resolve_stem_rejects_empty_arg() {
-        assert!(resolve_stem(&Some("   ".into()), "trinity").is_err());
-        assert!(resolve_stem(&Some("".into()), "trinity").is_err());
-    }
-
-    #[test]
-    fn resolve_stem_rejects_missing_arg_at_parse_layer() {
-        // resolve_stem itself bails on None; the inference fallback
-        // lives one layer up in `resolve_stem_or_infer`.
-        let err = resolve_stem(&None, "trinity").unwrap_err();
-        let msg = format!("{err}");
-        assert!(msg.contains("plan argument required"), "got: {msg}");
-    }
-
-    // ---- finalize() tests (direct, no HTTP) ----
+    // Plan-arg parsing tests live in `crate::cli::plan_resolve`.
 
     use trinity_core::api::{FinalizeReadiness, FinishPreviewResponse, SealedApproval};
     use trinity_core::ids::AgentLabel;

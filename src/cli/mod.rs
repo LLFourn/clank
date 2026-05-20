@@ -15,10 +15,6 @@ pub mod plan_resolve;
 pub mod purge;
 pub mod rewrite;
 
-/// Default daemon URL — matches `trinity serve`'s loopback bind +
-/// the MCP shim's default.
-pub const DEFAULT_DAEMON: &str = "http://127.0.0.1:7777";
-
 #[derive(Args, Debug)]
 pub struct InitArgs {
     /// Repo root. Defaults to the cwd's git toplevel.
@@ -34,9 +30,6 @@ pub struct FinishArgs {
     /// Repo root. Defaults to the cwd's git toplevel.
     #[arg(long, value_name = "PATH")]
     pub repo: Option<PathBuf>,
-    /// Daemon HTTP base URL.
-    #[arg(long, default_value = DEFAULT_DAEMON, env = "TRINITY_DAEMON_URL")]
-    pub daemon: String,
     /// Amend HEAD instead of creating a new finalize commit. HEAD
     /// must already be a finalize commit for this plan.
     #[arg(long)]
@@ -85,9 +78,6 @@ pub struct PurgeArgs {
     /// Repo root. Defaults to the cwd's git toplevel.
     #[arg(long, value_name = "PATH")]
     pub repo: Option<PathBuf>,
-    /// Daemon HTTP base URL.
-    #[arg(long, default_value = DEFAULT_DAEMON, env = "TRINITY_DAEMON_URL")]
-    pub daemon: String,
     /// Write the rewritten chain to a fresh branch instead of
     /// rewriting the current branch in place. Safer — the operator
     /// can inspect / cherry-pick / diff before deciding what to do

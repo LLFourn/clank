@@ -43,9 +43,7 @@ pub fn resolve_plan(
 /// Visible active plan iterator. A plan is eligible for inference
 /// when it isn't frozen and its worktree file is present (matches
 /// `Plan::is_visible` semantics — see crates/trinity-core/src/model.rs).
-fn visible_active_plans<'a>(
-    state: &'a RepoState,
-) -> std::io::Result<Vec<&'a trinity_core::model::Plan>> {
+fn visible_active_plans(state: &RepoState) -> std::io::Result<Vec<&trinity_core::model::Plan>> {
     let mut out = Vec::new();
     for plan in state.plans.values() {
         if plan.is_frozen() {
