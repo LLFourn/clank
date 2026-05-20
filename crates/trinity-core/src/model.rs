@@ -31,6 +31,10 @@ use crate::vocab::{CommitGateState, CommitKind, PlanLifecycle, PlanWorktreeStatu
 /// `body` is raw markdown. The wasm frontend renders to HTML at
 /// display time — no `body_html` field on the wire.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(
+    feature = "cache-encoding",
+    derive(wincode::SchemaWrite, wincode::SchemaRead)
+)]
 pub struct Feedback {
     pub author: AgentLabel,
     pub verdict: crate::vocab::Verdict,
@@ -46,6 +50,10 @@ pub struct Feedback {
 /// Folded review state for one commit. Cumulative-participant set
 /// + per-commit verdict breakdown + each participant's feedback.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(
+    feature = "cache-encoding",
+    derive(wincode::SchemaWrite, wincode::SchemaRead)
+)]
 pub struct CommitGate {
     pub state: CommitGateState,
     /// Every reviewer who has ever posted on any reviewable commit
@@ -73,6 +81,10 @@ pub struct CommitGate {
 /// rare cases that need the kind structurally.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
+#[cfg_attr(
+    feature = "cache-encoding",
+    derive(wincode::SchemaWrite, wincode::SchemaRead)
+)]
 pub enum PlanTimelineEvent {
     PlanOnly {
         sha: CommitSha,
@@ -173,6 +185,10 @@ impl PlanTimelineEvent {
 /// Lives in `model` because the fold-state stores it directly on
 /// `Plan.archived_cycles`; api response shapes re-export it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(
+    feature = "cache-encoding",
+    derive(wincode::SchemaWrite, wincode::SchemaRead)
+)]
 pub struct ArchivedCycle {
     /// The commit at which the cycle was closed (the freeze event).
     pub closer: CommitSha,
@@ -186,6 +202,10 @@ pub struct ArchivedCycle {
 /// at the boundary. Markdown stays raw on the wire; the wasm
 /// frontend renders at display time.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(
+    feature = "cache-encoding",
+    derive(wincode::SchemaWrite, wincode::SchemaRead)
+)]
 pub struct Plan {
     pub id: PlanKey,
     /// Repo-relative path: `.trinity/plans/<stem>.md`. The daemon

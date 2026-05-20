@@ -133,27 +133,35 @@ pub fn attach_live_feedback(
         // Drop silently if the target SHA isn't on this plan's
         // timeline (e.g. unattributed commit) or the event is not
         // reviewable.
+        //
+        // `max_feedback_ts` is only bumped after a successful
+        // insert. A stale feedback file with a target SHA that no
+        // longer exists in this plan's timeline (deleted-then-readded
+        // stem, off-chain commit, etc.) must NOT make the plan look
+        // recently active.
         let mut max_feedback_ts: i64 = 0;
         for fb in blobs {
-            if fb.created_at > max_feedback_ts {
-                max_feedback_ts = fb.created_at;
-            }
-            let verdict = parse_verdict(&fb.body);
-            let feedback = Feedback {
-                author: fb.parsed.author.clone(),
-                verdict,
-                body: fb.body,
-                path: fb.abs_path.to_string_lossy().into_owned(),
-                created_at: fb.created_at,
-            };
             let Some(event) = plan.event_for_mut(&fb.parsed.target_sha) else {
                 continue;
             };
             if !event.kind().is_reviewable() {
                 continue;
             }
-            if let Some(gate) = event.gate_mut() {
-                gate.feedback.insert(feedback.author.clone(), feedback);
+            let Some(gate) = event.gate_mut() else {
+                continue;
+            };
+            let verdict = parse_verdict(&fb.body);
+            let created_at = fb.created_at;
+            let feedback = Feedback {
+                author: fb.parsed.author.clone(),
+                verdict,
+                body: fb.body,
+                path: fb.abs_path.to_string_lossy().into_owned(),
+                created_at,
+            };
+            gate.feedback.insert(feedback.author.clone(), feedback);
+            if created_at > max_feedback_ts {
+                max_feedback_ts = created_at;
             }
         }
 
@@ -1311,6 +1319,45 @@ mod tests {
             gate_c2.missing,
         );
         assert_eq!(gate_c2.state, CommitGateState::Unreviewed);
+    }
+
+    /// Regression for codex's Phase 1 review on 44e5bd0:
+    /// `last_activity_ts` must NOT be bumped by a feedback file
+    /// whose target SHA is missing from the plan's current timeline
+    /// (deleted-then-readded stem, off-chain commit, etc.). Such
+    /// feedback is dropped silently — and silently means without
+    /// activity-timestamp side effects.
+    #[test]
+    fn dropped_feedback_does_not_bump_last_activity_ts() {
+        // Plan exists with one reviewable intro at c1. Feedback
+        // targets c2 (not on the timeline).
+        let history = vec![event(
+            "c1c1",
+            vec![intro_with_body("foo", "# foo\n")],
+            false,
+        )];
+        let mut blob = feedback("foo", "c2c2", "alice", "APPROVE\n");
+        blob.created_at = 9_999_999_999; // far future
+        let state = derive_state_with_feedback(PathBuf::from("/r"), snap(history), vec![blob]);
+        let plan = &state.plans[&sess("foo")];
+
+        // Feedback must not appear in any gate.
+        let intro_gate = plan
+            .event_for(&sha("c1c1"))
+            .and_then(|e| e.gate())
+            .expect("intro gate");
+        assert!(
+            intro_gate.feedback.is_empty(),
+            "feedback for unknown target SHA must not attach",
+        );
+
+        // last_activity_ts must be commit-derived (0 here — the
+        // fixture used author_ts: 0), NOT the future feedback mtime.
+        assert_eq!(
+            plan.last_activity_ts, 0,
+            "stale feedback must not bump last_activity_ts; got {}",
+            plan.last_activity_ts,
+        );
     }
 
     /// Test 5: live feedback targeting a finished plan does not

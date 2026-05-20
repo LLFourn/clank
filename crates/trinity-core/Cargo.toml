@@ -5,8 +5,17 @@ edition = "2024"
 publish = false
 description = "Shared core types (closed-vocab enums + response DTOs + identifiers) between the Trinity daemon and the Leptos frontend. Pure data — no daemon, runtime, or framework dependencies. Compiles to wasm32 unchanged."
 
+[features]
+default = []
+# Enables wincode SchemaWrite/SchemaRead derives on the model types
+# so the app crate's state_cache module can binary-encode a rootless
+# `BaseRepoState` payload. Off by default — frontend wasm builds and
+# any non-cache consumer don't need it.
+cache-encoding = ["dep:wincode"]
+
 [dependencies]
 serde = { version = "1", features = ["derive"] }
+wincode = { version = "0.5", features = ["derive"], optional = true }
 
 [dev-dependencies]
 serde_json = "1"
