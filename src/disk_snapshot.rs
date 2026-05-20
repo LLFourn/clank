@@ -299,35 +299,47 @@ fn build_ad_hoc_gates(state: &mut RepoState, participants: &[AgentLabel]) {
     }
 }
 
-/// After ad hoc feedback has been written into per-commit gates,
-/// recompute each gate's approvers/requesters/ambiguous/missing/
-/// state from its accumulated feedback. Unlike per-plan gates, ad
+/// Recompute one ad hoc commit's gate from its accumulated feedback
+/// + the gate's fixed participant set. Unlike per-plan gates, ad
 /// hoc commits do NOT carry cumulative participants — each commit
 /// is its own review unit.
+///
+/// **The single source of truth for ad hoc gate recomposition.**
+/// Called from both [`attach_live_feedback_with_config`] (bulk
+/// rebuild from disk) and the runtime's `upsert_feedback` /
+/// `remove_feedback` watcher path (incremental in-memory update).
+/// Duplicating the recompose logic between bulk and live paths is
+/// exactly how the cache and live daemon would drift — keep one
+/// impl, just like `rebuild_plan_gates` for plan commits.
+pub fn rebuild_ad_hoc_gate(node: &mut CommitNode) {
+    if !matches!(node.attribution, CommitAttribution::AdHoc) {
+        return;
+    }
+    let Some(gate) = node.gate.as_mut() else {
+        return;
+    };
+    let participants = gate.participants.clone();
+    let feedback = gate.feedback.clone();
+    let mut participants_carry = participants.clone();
+    let recomposed = compose_gate(&node.sha, feedback, &mut participants_carry);
+    *gate = CommitGate {
+        state: recomposed.state,
+        participants,
+        approvers: recomposed.approvers,
+        requesters: recomposed.requesters,
+        ambiguous: recomposed.ambiguous,
+        missing: recomposed.missing,
+        feedback: recomposed.feedback,
+    };
+}
+
+/// After ad hoc feedback has been written into per-commit gates,
+/// recompute every ad hoc commit's gate. Used by the bulk attach
+/// path; the live watcher path calls [`rebuild_ad_hoc_gate`] on the
+/// single mutated node.
 fn rebuild_ad_hoc_gates(state: &mut RepoState) {
     for node in state.commits.values_mut() {
-        if !matches!(node.attribution, CommitAttribution::AdHoc) {
-            continue;
-        }
-        let Some(gate) = node.gate.as_mut() else {
-            continue;
-        };
-        let participants = gate.participants.clone();
-        let feedback = gate.feedback.clone();
-        // compose_gate appends new feedback authors to participants;
-        // for ad hoc we want a FIXED participant set, so we recompose
-        // without participant mutation by snapshotting + restoring.
-        let mut participants_carry = participants.clone();
-        let recomposed = compose_gate(&node.sha, feedback, &mut participants_carry);
-        *gate = CommitGate {
-            state: recomposed.state,
-            participants,
-            approvers: recomposed.approvers,
-            requesters: recomposed.requesters,
-            ambiguous: recomposed.ambiguous,
-            missing: recomposed.missing,
-            feedback: recomposed.feedback,
-        };
+        rebuild_ad_hoc_gate(node);
     }
 }
 

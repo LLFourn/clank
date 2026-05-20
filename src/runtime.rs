@@ -390,6 +390,7 @@ impl Runtime {
                     return Err(RuntimeError::UnknownRepo(repo_root.to_path_buf()));
                 };
                 let target = parsed.target.clone();
+                let target_sha = parsed.target_sha.clone();
                 upsert_feedback(state, abs_path, parsed, body);
                 match target {
                     crate::disk_format::FeedbackTarget::Plan(session_id) => {
@@ -417,14 +418,13 @@ impl Runtime {
                         );
                     }
                     crate::disk_format::FeedbackTarget::AdHoc => {
-                        // Ad hoc feedback writes go to the targeted
-                        // CommitNode's gate directly (no per-plan
-                        // timeline to refresh). The matcher walks
-                        // commit_order and will pick up the new
-                        // verdict on the next compute_match. Phase
-                        // 4 ships the basic write path; a follow-up
-                        // can add a repo-level SSE event for ad hoc
-                        // feedback if the UI needs it.
+                        // Recompose the targeted CommitNode's gate so
+                        // approvers / missing / state reflect the new
+                        // verdict. Shared with the bulk attach path —
+                        // see `disk_snapshot::rebuild_ad_hoc_gate`.
+                        if let Some(node) = state.commits.get_mut(&target_sha) {
+                            crate::disk_snapshot::rebuild_ad_hoc_gate(node);
+                        }
                     }
                 }
             }
@@ -434,12 +434,18 @@ impl Runtime {
                     return Err(RuntimeError::UnknownRepo(repo_root.to_path_buf()));
                 };
                 let target = parsed.target.clone();
+                let target_sha = parsed.target_sha.clone();
                 remove_feedback(state, &parsed);
                 let session_id = match target {
                     crate::disk_format::FeedbackTarget::Plan(s) => s,
                     crate::disk_format::FeedbackTarget::AdHoc => {
-                        // Ad hoc removal: gate cleared in place; no
-                        // per-plan timeline to refresh.
+                        // Ad hoc removal: recompose the targeted gate
+                        // so approvers/missing/state reflect the
+                        // removed verdict. Shared with bulk attach
+                        // path — see `disk_snapshot::rebuild_ad_hoc_gate`.
+                        if let Some(node) = state.commits.get_mut(&target_sha) {
+                            crate::disk_snapshot::rebuild_ad_hoc_gate(node);
+                        }
                         return Ok(());
                     }
                 };

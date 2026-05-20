@@ -90,6 +90,11 @@ pub enum IdError {
         max: usize,
         len: usize,
     },
+    Reserved {
+        kind: &'static str,
+        value: String,
+        reason: &'static str,
+    },
 }
 
 impl fmt::Display for IdError {
@@ -112,6 +117,11 @@ impl fmt::Display for IdError {
                 max,
                 len,
             } => write!(f, "{kind} length must be {min}-{max} chars; got {len}"),
+            IdError::Reserved {
+                kind,
+                value,
+                reason,
+            } => write!(f, "{kind} `{value}` is reserved: {reason}"),
         }
     }
 }
@@ -230,13 +240,23 @@ impl AgentLabel {
 impl PlanKey {
     /// Parse a plan stem (the `<stem>` in
     /// `.trinity/plans/<stem>.md`). Non-empty, no `/`, not `.`/`..`,
-    /// no leading `.`.
+    /// no leading `.`, and not the literal reserved segment `_`
+    /// (Phase 4 of `commit-first-review-model` reserves `_` as the
+    /// ad-hoc-feedback path segment; allowing a real plan named `_`
+    /// would shadow that path).
     pub fn parse(s: &str) -> Result<Self, IdError> {
         const KIND: &str = "PlanKey";
         check_non_empty(KIND, s)?;
         check_not_dot_segment(KIND, s)?;
         check_no_leading_dot(KIND, s)?;
         check_no_slash(KIND, s)?;
+        if s == "_" {
+            return Err(IdError::Reserved {
+                kind: KIND,
+                value: s.to_string(),
+                reason: "`_` is reserved as the ad-hoc feedback path segment",
+            });
+        }
         Ok(PlanKey(s.to_string()))
     }
 
@@ -393,6 +413,19 @@ mod tests {
     fn plan_key_active_path() {
         let k = PlanKey::from_path(&p(".trinity/plans/foo.md")).unwrap();
         assert_eq!(k.as_str(), "foo");
+    }
+
+    #[test]
+    fn plan_key_rejects_reserved_ad_hoc_segment() {
+        // `_` is reserved for the ad-hoc feedback path segment;
+        // PlanKey::parse must reject it so no plan can shadow that path.
+        let err = PlanKey::parse("_").unwrap_err();
+        assert!(
+            matches!(err, IdError::Reserved { kind: "PlanKey", .. }),
+            "expected IdError::Reserved for `_`; got {err:?}"
+        );
+        // from_path routes through parse, so the rejection is inherited.
+        assert!(PlanKey::from_path(&p(".trinity/plans/_.md")).is_none());
     }
 
     #[test]

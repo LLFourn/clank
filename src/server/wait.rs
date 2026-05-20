@@ -202,13 +202,16 @@ fn derive_timeout(timeout_secs: Option<u64>) -> Duration {
 
 /// What `compute_match` returns: the projected work payload plus the
 /// post-projection bits `enrich_for_wait` needs (canonical repo root
-/// for cache keying, plan key for stale-review timeline walking). The
-/// payload itself carries plan-id as a string; we hand back the parsed
-/// `PlanKey` here so callers don't re-parse.
+/// for cache keying, plan key for stale-review timeline walking).
+///
+/// `plan_key` is `None` for ad hoc matches: ad hoc commits have no
+/// plan key (the `_` reserved feedback segment isn't a plan key),
+/// and downstream plan-only enrichment (stale-review walks etc.)
+/// must skip them by construction rather than by synthetic identity.
 pub(crate) struct WaitMatch {
     pub payload: WorkPayload,
     pub repo_root: std::path::PathBuf,
-    pub plan_key: PlanKey,
+    pub plan_key: Option<PlanKey>,
     /// SHA of the latest reviewable commit, when one exists. This is
     /// the single source of truth for "current target": current-cycle
     /// reviews target it, stale reviews are everything but it. Used
@@ -242,14 +245,23 @@ async fn compute_match(
     role: WaitingRole,
     author: &AgentLabel,
 ) -> Result<Option<WaitMatch>, WaitError> {
-    let candidates = {
+    let (candidates, config) = {
         let trinity_arc = runtime.state();
         let trinity = trinity_arc.lock().await;
-        collect_active_commit_candidates(&trinity, filter)?
+        let candidates = collect_active_commit_candidates(&trinity, filter)?;
+        // Resolve the repo root from the first candidate (all
+        // candidates share a repo by construction). Empty candidate
+        // list → no matches anyway; config doesn't matter.
+        let repo_root = candidates.first().map(|c| c.repo_root.clone());
+        let config = match repo_root {
+            Some(root) => crate::cli::config::load(&root),
+            None => crate::cli::config::Config::default(),
+        };
+        (candidates, config)
     };
 
     for candidate in candidates {
-        if let Some(m) = try_match_candidate(candidate, role, author)? {
+        if let Some(m) = try_match_candidate(candidate, role, author, &config)? {
             return Ok(Some(m));
         }
     }
@@ -263,6 +275,7 @@ fn try_match_candidate(
     candidate: Candidate,
     role: WaitingRole,
     author: &AgentLabel,
+    config: &crate::cli::config::Config,
 ) -> Result<Option<WaitMatch>, WaitError> {
     match candidate.kind.clone() {
         CandidateKind::Plan {
@@ -282,10 +295,9 @@ fn try_match_candidate(
             review_target_kind,
             role,
             author,
+            config,
         ),
-        CandidateKind::AdHoc { sha } => {
-            try_match_ad_hoc_candidate(candidate, sha, role, author)
-        }
+        CandidateKind::AdHoc { sha } => try_match_ad_hoc_candidate(candidate, sha, role, author),
     }
 }
 
@@ -300,6 +312,7 @@ fn try_match_plan_candidate(
     review_target_kind: Option<crate::repo_state::CommitKind>,
     role: WaitingRole,
     author: &AgentLabel,
+    config: &crate::cli::config::Config,
 ) -> Result<Option<WaitMatch>, WaitError> {
     let status = compute_plan_worktree_status_parts(&candidate.repo_root, &plan_path, &body_hash)?;
     if !is_finished
@@ -317,6 +330,19 @@ fn try_match_plan_candidate(
     }
     if matches!(role, WaitingRole::Reviewers)
         && caller_already_voted(candidate.gate.as_ref(), w.reason, author)
+    {
+        return Ok(None);
+    }
+    // Phase 4 of commit-first-review-model: when
+    // `force_review_on_plan_commits=false`, master is not blocked on
+    // plan-commit review. The matcher swallows the master-side
+    // AddressCommitChanges wake for plan commits; reviewers still
+    // wake on Unreviewed gates so reviews CAN happen, just not
+    // blocking. Reviewer wakes route through waiting_on's
+    // CommitNeedsReview reason which is unaffected here.
+    if matches!(role, WaitingRole::Master)
+        && !config.review.force_review_on_plan_commits
+        && matches!(w.reason, WaitingReason::AddressCommitChanges)
     {
         return Ok(None);
     }
@@ -340,7 +366,7 @@ fn try_match_plan_candidate(
     Ok(Some(WaitMatch {
         payload,
         repo_root: candidate.repo_root,
-        plan_key,
+        plan_key: Some(plan_key),
         current_target_sha: candidate.review_target,
     }))
 }
@@ -385,15 +411,10 @@ fn try_match_ad_hoc_candidate(
                 plan_file: None,
             },
         };
-        // Synthetic plan_key for the WaitMatch metadata. The ad
-        // hoc reserved segment `_` is rejected by PlanKey::parse,
-        // so we use a sentinel key constructed from the SHA prefix.
-        // Downstream consumers shouldn't care for ad hoc matches.
-        let plan_key = synth_ad_hoc_plan_key(&sha);
         return Ok(Some(WaitMatch {
             payload,
             repo_root: candidate.repo_root,
-            plan_key,
+            plan_key: None,
             current_target_sha: Some(sha),
         }));
     }
@@ -427,29 +448,12 @@ fn try_match_ad_hoc_candidate(
             plan_path: None,
         },
     };
-    let plan_key = synth_ad_hoc_plan_key(&sha);
     Ok(Some(WaitMatch {
         payload,
         repo_root: candidate.repo_root,
-        plan_key,
+        plan_key: None,
         current_target_sha: Some(sha),
     }))
-}
-
-/// Construct a synthetic `PlanKey` for ad hoc commits' `WaitMatch`
-/// metadata. Ad hoc commits have no real plan key (the on-disk
-/// segment `_` is reserved and rejected by `PlanKey::parse`); the
-/// match metadata is only consumed by downstream enrichment that
-/// today is plan-scoped — we won't synthesize stale-review or
-/// opportunistic-body lookups against ad hoc commits in Phase 4.
-fn synth_ad_hoc_plan_key(sha: &CommitSha) -> PlanKey {
-    // Prefix with `adhoc-` to make stem-collision with a real plan
-    // mathematically impossible (real plan stems can't start with
-    // `adhoc-` because nobody would name a plan that, and even if
-    // they did the SHA suffix differentiates).
-    let stem = format!("adhoc-{}", &sha.as_str()[..7]);
-    PlanKey::parse(&stem)
-        .unwrap_or_else(|e| panic!("synthetic ad hoc plan_key `{stem}` must parse: {e}"))
 }
 
 /// Cap for inlined body content. Larger files emit `content:
@@ -504,17 +508,22 @@ async fn enrich_for_wait(
         A::CommitPlanRevision { .. } | A::StartImplementation { .. } | A::SessionFinished => {}
     }
 
-    let stale_reviews = if matches!(role, WaitingRole::Master) {
-        collect_stale_reviews(
-            runtime,
-            &repo_root,
-            &plan_key,
-            current_target_sha.as_ref(),
-            author,
-        )
-        .await
-    } else {
-        Vec::new()
+    // Stale-review walks are plan-scoped (they walk the plan's
+    // timeline of reviewable commits). Ad hoc matches have
+    // `plan_key: None` and are skipped by construction — codex's
+    // architectural correction.
+    let stale_reviews = match (role, plan_key.as_ref()) {
+        (WaitingRole::Master, Some(plan_key)) => {
+            collect_stale_reviews(
+                runtime,
+                &repo_root,
+                plan_key,
+                current_target_sha.as_ref(),
+                author,
+            )
+            .await
+        }
+        _ => Vec::new(),
     };
 
     trinity_core::api::WaitWorkPayload {
@@ -1573,6 +1582,155 @@ mod integration_tests {
             payload.work.plans.is_empty(),
             "ad hoc work has no plan attribution; got plans={:?}",
             payload.work.plans
+        );
+    }
+
+    /// Phase 4 regression for codex on 8f8d99d: the live watcher
+    /// path must recompute ad hoc gates (not just write feedback).
+    /// After alice writes APPROVE via a FeedbackWritten event, her
+    /// reviewer WFW must NOT re-wake on the same commit — the gate
+    /// state must transition to Approved and her entry must move
+    /// from `missing` to `approvers`.
+    #[tokio::test]
+    async fn ad_hoc_gate_refreshes_on_live_feedback_write() {
+        use crate::fs_watcher::FilesystemSignal;
+        use crate::review_state::CommitGateState;
+
+        let dir = init_repo();
+        write_file(
+            dir.path(),
+            ".trinity/config.json",
+            r#"{"review": {"ad_hoc_reviewers": ["alice"]}}"#,
+        );
+        write_file(dir.path(), "src.rs", "fn main() {}\n");
+        commit(dir.path(), "root code commit");
+        let rt = Runtime::new();
+        rt.add_repo(dir.path().to_path_buf()).await.unwrap();
+
+        // Find the ad hoc commit's SHA via runtime read.
+        let ad_hoc_sha: CommitSha = rt
+            .read_repo(dir.path(), |s| {
+                s.commit_order
+                    .iter()
+                    .find(|sha| {
+                        matches!(
+                            s.commits.get(*sha).map(|n| &n.attribution),
+                            Some(crate::repo_state::CommitAttribution::AdHoc)
+                        )
+                    })
+                    .expect("ad hoc commit present")
+                    .clone()
+            })
+            .await
+            .unwrap();
+
+        // Alice writes APPROVE via the live filesystem path.
+        let fb_rel = format!(
+            "{}/{}/alice.md",
+            crate::disk_format::AD_HOC_FEEDBACK_KEY,
+            ad_hoc_sha.as_str()
+        );
+        write_file(
+            dir.path(),
+            &format!(".trinity/feedback/{fb_rel}"),
+            "APPROVE\n",
+        );
+        let parsed = crate::disk_format::parse_feedback_path(std::path::Path::new(&fb_rel))
+            .expect("ad hoc feedback path parses");
+        let canonical = dunce::canonicalize(dir.path()).unwrap();
+        rt.handle_signal(
+            &canonical,
+            FilesystemSignal::FeedbackWritten { parsed },
+            0,
+        )
+        .await
+        .unwrap();
+
+        // Gate must now be Approved with alice in approvers
+        // (NOT still Unreviewed with alice in missing).
+        let gate_state = rt
+            .read_repo(dir.path(), |s| s.gate_for(&ad_hoc_sha).unwrap().clone())
+            .await
+            .unwrap();
+        assert_eq!(
+            gate_state.state,
+            CommitGateState::Approved,
+            "live ad hoc feedback must drive gate to Approved"
+        );
+        assert!(
+            gate_state.approvers.iter().any(|a| a.as_str() == "alice"),
+            "alice must be in approvers; got {:?}",
+            gate_state.approvers
+        );
+        assert!(
+            !gate_state.missing.iter().any(|a| a.as_str() == "alice"),
+            "alice must NOT remain in missing; got {:?}",
+            gate_state.missing
+        );
+
+        // Reviewer WFW for alice must NOT re-wake.
+        let basename = dir
+            .path()
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap()
+            .to_string();
+        let resp = wait_for_work(
+            &rt,
+            WaitArgs {
+                role: WaitingRole::Reviewers,
+                plan_id: None,
+                repo: Some(basename),
+                author_label: Some("alice".to_string()),
+                timeout_secs: Some(1),
+            },
+        )
+        .await
+        .unwrap();
+        assert!(
+            matches!(resp, WaitResponse::Timeout(_)),
+            "reviewer must not re-wake after writing approve; got {resp:?}"
+        );
+    }
+
+    /// Phase 4 regression for codex on 8f8d99d: with
+    /// `force_review_on_plan_commits=false`, master must not be
+    /// blocked on plan-commit AddressCommitChanges. Reviewer wakes
+    /// still fire so reviews can happen, just not blocking.
+    #[tokio::test]
+    async fn force_review_on_plan_commits_false_unblocks_master() {
+        let dir = init_repo();
+        write_file(
+            dir.path(),
+            ".trinity/config.json",
+            r#"{"review": {"force_review_on_plan_commits": false}}"#,
+        );
+        write_file(dir.path(), ".trinity/plans/foo.md", "# foo\n");
+        commit(dir.path(), "intro foo");
+        let rt = Runtime::new();
+        rt.add_repo(dir.path().to_path_buf()).await.unwrap();
+        let intro: CommitSha = rt
+            .read_repo(dir.path(), |s| {
+                s.plans[&PlanKey::parse("foo").unwrap()].plan_intro.clone()
+            })
+            .await
+            .unwrap();
+        // Plant alice's REQUEST_CHANGES — the gate goes to
+        // ChangesRequested, which would normally block master.
+        write_file(
+            dir.path(),
+            &format!(".trinity/feedback/foo/{}/alice.md", intro.as_str()),
+            "REQUEST_CHANGES\n\nNo.\n",
+        );
+        rt.add_repo(dir.path().to_path_buf()).await.unwrap();
+
+        // Master wait MUST timeout (force_review_on_plan_commits=false).
+        let resp = wait_for_work(&rt, args(dir.path(), WaitingRole::Master, "foo", "lloyd"))
+            .await
+            .unwrap();
+        assert!(
+            matches!(resp, WaitResponse::Timeout(_)),
+            "master must not block on plan-commit review when config disables it; got {resp:?}"
         );
     }
 
