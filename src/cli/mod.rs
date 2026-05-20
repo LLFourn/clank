@@ -147,10 +147,11 @@ pub(crate) fn resolve_repo(explicit: Option<&Path>) -> anyhow::Result<PathBuf> {
 }
 
 /// Derive the repo basename — the segment Trinity uses to address
-/// plans on the wire (`/api/plan/<basename>/<stem>.md`).
+/// plans on the wire (`/api/plan/<basename>/<stem>.md`). Wraps
+/// `RepoBasename::from_repo_root` so the validation rule lives in
+/// one place.
 pub(crate) fn repo_basename(repo: &Path) -> anyhow::Result<String> {
-    repo.file_name()
-        .and_then(|s| s.to_str())
-        .map(|s| s.to_string())
+    trinity_core::ids::RepoBasename::from_repo_root(repo)
+        .map(|b| b.as_str().to_string())
         .ok_or_else(|| anyhow::anyhow!("repo path has no usable basename: {}", repo.display()))
 }

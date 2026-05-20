@@ -18,7 +18,7 @@ pub async fn run(args: StatusArgs) -> anyhow::Result<()> {
     let plans = crate::responses::list_plans_response(&state)?;
 
     let (current_branch, head_sha, head_subject) = head_info(&repo);
-    let worktree_dirty = worktree_dirty(&repo);
+    let worktree_dirty = worktree_dirty(&repo)?;
 
     let response = StatusResponse {
         repo_root: repo.display().to_string(),
@@ -38,6 +38,14 @@ pub async fn run(args: StatusArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// `symbolic-ref --short HEAD` failing means detached HEAD (or no
+/// commits yet) — that's a normal state we render as `(detached)`.
+/// `log -1` failing only happens in an empty repo, where `None`s
+/// are also a normal render. Genuine git invocation errors (binary
+/// missing, permission denied) are vanishingly rare for an
+/// already-resolved repo root and would surface as `None` here;
+/// `worktree_dirty` is the only signal where swallowing a real
+/// failure would be misleading, so it's `Result` below.
 fn head_info(repo: &Path) -> (Option<String>, Option<String>, Option<String>) {
     let branch = std::process::Command::new("git")
         .arg("-C")
@@ -68,15 +76,20 @@ fn head_info(repo: &Path) -> (Option<String>, Option<String>, Option<String>) {
     (branch, sha, subject)
 }
 
-fn worktree_dirty(repo: &Path) -> bool {
-    std::process::Command::new("git")
+fn worktree_dirty(repo: &Path) -> anyhow::Result<bool> {
+    let out = std::process::Command::new("git")
         .arg("-C")
         .arg(repo)
         .args(["status", "--porcelain"])
-        .output()
-        .ok()
-        .map(|o| o.status.success() && !o.stdout.iter().all(|b| b.is_ascii_whitespace()))
-        .unwrap_or(false)
+        .output()?;
+    if !out.status.success() {
+        anyhow::bail!(
+            "git status --porcelain failed (exit {}): {}",
+            out.status.code().unwrap_or(-1),
+            String::from_utf8_lossy(&out.stderr).trim(),
+        );
+    }
+    Ok(!out.stdout.iter().all(|b| b.is_ascii_whitespace()))
 }
 
 fn render_human(s: &StatusResponse) {

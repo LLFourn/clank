@@ -227,14 +227,8 @@ pub async fn build_rewrite_preview(
 /// All-plans rewrite preview. Walks first-parent from HEAD, slices
 /// at the earliest `.trinity/` touch (the all-plans "intro"), then
 /// classifies each commit in the range using tree-state.
-///
-/// The `state` parameter is currently unused but kept in the
-/// signature for symmetry with the single-plan builder and to give
-/// future logic a place to consult fold-derived data without
-/// breaking callers.
 pub async fn build_rewrite_preview_all(
     repo_root: &Path,
-    _state: &RepoState,
     include_finalize: bool,
 ) -> Result<PurgeAllPreviewResponse, PreviewError> {
     let basename = RepoBasename::from_repo_root(repo_root)

@@ -486,12 +486,7 @@ async fn api_rewrite_preview_all(
             .cloned()
             .ok_or_else(|| AppError::not_found(format!("unknown repo basename: {repo_basename}")))?
     };
-    let snapshot = state
-        .runtime
-        .snapshot_repo(&repo_root)
-        .await
-        .map_err(AppError::runtime)?;
-    let resp = crate::preview::build_rewrite_preview_all(&repo_root, &snapshot, q.include_finalize)
+    let resp = crate::preview::build_rewrite_preview_all(&repo_root, q.include_finalize)
         .await
         .map_err(AppError::preview)?;
     Ok(axum::Json(resp))

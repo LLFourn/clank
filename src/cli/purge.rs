@@ -91,10 +91,7 @@ async fn run_single(
 }
 
 async fn run_all(repo: &std::path::Path, basename: &str, args: &PurgeArgs) -> anyhow::Result<()> {
-    let state = crate::rebuild::rebuild_repo(repo)
-        .await
-        .map_err(|e| anyhow::anyhow!("failed to fold repo `{}`: {e}", repo.display()))?;
-    let preview = crate::preview::build_rewrite_preview_all(repo, &state, true)
+    let preview = crate::preview::build_rewrite_preview_all(repo, true)
         .await
         .map_err(|e| anyhow::anyhow!("all-rewrite preview failed: {e}"))?;
     if preview.intro_sha.is_none() {

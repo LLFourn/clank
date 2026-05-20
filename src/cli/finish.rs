@@ -23,7 +23,9 @@ pub async fn run(args: FinishArgs) -> anyhow::Result<()> {
     let preview = crate::preview::build_finish_preview(&repo, &state, &plan_key)
         .await
         .map_err(|e| anyhow::anyhow!("finish preview failed: {e}"))?;
-    dispatch_readiness(&preview)?;
+    if !dispatch_readiness(&preview)? {
+        return Ok(());
+    }
 
     if args.amend && !head_is_finalize_for(&repo, &stem)? {
         anyhow::bail!(
@@ -146,14 +148,16 @@ async fn run_post_finalize_rewrite(
     Ok(())
 }
 
-/// The CLI's one dispatch on the daemon's typed decision. Anything
-/// past this point assumes `readiness == Ready`.
-fn dispatch_readiness(preview: &FinishPreviewResponse) -> anyhow::Result<()> {
+/// The CLI's one dispatch on the typed decision. Returns `true`
+/// when the caller should continue with finalize, `false` for the
+/// no-op "already finished" case (so the caller can return cleanly
+/// without `std::process::exit` cutting tokio's shutdown short).
+fn dispatch_readiness(preview: &FinishPreviewResponse) -> anyhow::Result<bool> {
     match &preview.readiness {
-        FinalizeReadiness::Ready => Ok(()),
+        FinalizeReadiness::Ready => Ok(true),
         FinalizeReadiness::AlreadyFinished => {
             println!("`{}` is already finished; nothing to do", preview.plan_id);
-            std::process::exit(0);
+            Ok(false)
         }
         FinalizeReadiness::Blocked { reasons } => {
             let lines: Vec<String> = reasons.iter().map(reason_to_msg).collect();
@@ -195,7 +199,7 @@ async fn finalize(
 ) -> anyhow::Result<()> {
     if preview.sealed_approvals.is_empty() {
         anyhow::bail!(
-            "daemon returned readiness=Ready but no sealed approvals — refusing to seal an empty set"
+            "readiness=Ready but no sealed approvals to write — refusing to seal an empty set"
         );
     }
 
@@ -231,8 +235,13 @@ async fn finalize(
         std::fs::write(finished_dir.join(name), body)?;
     }
 
+    // `-A` so that approver files removed from the new set are
+    // staged as deletions. Plain `git add <dir>` only stages
+    // additions/modifications; an --amend would otherwise inherit
+    // the prior commit's approver list and silently keep a stale
+    // file when the new approver set is a strict subset.
     let rel_finished = format!(".trinity/finished/{stem}");
-    git_run(repo, &["add", &rel_finished])?;
+    git_run(repo, &["add", "-A", "--", &rel_finished])?;
 
     let default_msg = format!("Finalize {stem}");
     let msg = message.unwrap_or(&default_msg);
@@ -417,5 +426,96 @@ mod tests {
             "OLD APPROVE\n",
             "missing-source abort must not touch the existing finalize snapshot",
         );
+    }
+
+    #[tokio::test]
+    async fn finalize_amend_removes_approver_no_longer_in_set() {
+        let dir = init_repo();
+        write_at(dir.path(), "README.md", "seed\n");
+        run_git(dir.path(), &["add", "-A"]);
+        run_git(dir.path(), &["commit", "--quiet", "-m", "seed"]);
+
+        // First finalize: two approvers.
+        let codex_approval = ".trinity/feedback/foo/abcdef/codex.md";
+        let claude_approval = ".trinity/feedback/foo/abcdef/claude.md";
+        write_at(dir.path(), codex_approval, "APPROVE codex\n");
+        write_at(dir.path(), claude_approval, "APPROVE claude\n");
+
+        let first = FinishPreviewResponse {
+            plan_id: "trinity/foo.md".into(),
+            plan_path: ".trinity/plans/foo.md".into(),
+            readiness: FinalizeReadiness::Ready,
+            gate_state: CommitGateState::Approved,
+            latest_reviewable_sha: None,
+            plan_worktree_status: PlanWorktreeStatus::Clean,
+            is_finished: false,
+            sealed_approvals: vec![
+                SealedApproval {
+                    author: AgentLabel::parse("codex").unwrap(),
+                    source_path: codex_approval.into(),
+                    body_hash: crate::lifecycle::content_hash("APPROVE codex\n"),
+                },
+                SealedApproval {
+                    author: AgentLabel::parse("claude").unwrap(),
+                    source_path: claude_approval.into(),
+                    body_hash: crate::lifecycle::content_hash("APPROVE claude\n"),
+                },
+            ],
+        };
+        finalize(dir.path(), "foo", &first, false, None)
+            .await
+            .unwrap();
+
+        // Sanity: both files in HEAD's tree.
+        let ls = std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir.path())
+            .args([
+                "ls-tree",
+                "-r",
+                "--name-only",
+                "HEAD",
+                ".trinity/finished/foo/",
+            ])
+            .output()
+            .unwrap();
+        let listed = String::from_utf8(ls.stdout).unwrap();
+        assert!(listed.contains("codex.md"));
+        assert!(listed.contains("claude.md"));
+
+        // Amend with a strict subset (claude only). The codex approver
+        // file must be staged as a deletion and disappear from HEAD's
+        // tree — otherwise `git add <dir>` would leave the stale file
+        // around.
+        let second = FinishPreviewResponse {
+            sealed_approvals: vec![SealedApproval {
+                author: AgentLabel::parse("claude").unwrap(),
+                source_path: claude_approval.into(),
+                body_hash: crate::lifecycle::content_hash("APPROVE claude\n"),
+            }],
+            ..first
+        };
+        finalize(dir.path(), "foo", &second, true, None)
+            .await
+            .unwrap();
+
+        let ls = std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir.path())
+            .args([
+                "ls-tree",
+                "-r",
+                "--name-only",
+                "HEAD",
+                ".trinity/finished/foo/",
+            ])
+            .output()
+            .unwrap();
+        let listed = String::from_utf8(ls.stdout).unwrap();
+        assert!(
+            !listed.contains("codex.md"),
+            "codex approver should be removed after amend; got:\n{listed}"
+        );
+        assert!(listed.contains("claude.md"));
     }
 }
