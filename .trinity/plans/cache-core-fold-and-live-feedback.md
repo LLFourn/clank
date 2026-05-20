@@ -6,60 +6,58 @@ commit-keyed binary cache for the expensive part of `trinity status`.
 
 ## Why
 
-`trinity status` now rebuilds state locally, which is the right source
-of truth for daemon-free CLI commands, but it is slow because every
-invocation walks the full first-parent history and replays every
-commit from scratch.
+`trinity status` now rebuilds state locally — the right source of
+truth for daemon-free CLI commands, but slow: every invocation
+walks the full first-parent history and replays every commit from
+scratch.
 
-The obvious cache boundary is HEAD:
+The natural cache boundary is HEAD:
 
 - fold git history up to commit `X`
 - serialize that commit-derived state under `.trinity/cache/<X>`
 - on the next command at the same `X`, load it instead of replaying
-  history
 
-The current model is not ready for that because the fold also reads
-working-tree feedback files and attaches them to gates while each
-commit is processed. That makes the folded state depend on mutable,
-uncommitted files under `.trinity/feedback/`, so caching the whole
-`RepoState` under a commit hash would be wrong: editing feedback would
-require invalidating a cache entry whose key did not change.
+The current model can't be cached as-is because the fold reads
+working-tree feedback files and attaches them to gates DURING
+commit replay. The folded `RepoState` therefore depends on
+mutable, uncommitted files under `.trinity/feedback/`. A
+HEAD-keyed cache of that state would be wrong: editing feedback
+would have to invalidate a cache entry whose key did not change.
 
 The architecture needs a clean split:
 
-- cacheable state: facts derived from git commits only
-- live overlay: mutable feedback files for unfinished plans, attached
-  after loading or deriving the cacheable state
+- **base state**: facts derived from git commits only — cacheable
+- **live overlay**: mutable feedback files for unfinished plans,
+  attached on top of the base state
 
-Committed finalize approvals under `.trinity/finished/<stem>/` remain
-part of the commit fold. They are in git history and are safe to cache.
+Committed finalize approvals under `.trinity/finished/<stem>/`
+stay in the commit fold. They live in git history and are safe to
+cache.
 
 ## Current State
 
-- `src/git_io.rs::snapshot` collects both first-parent commit events
-  and working-tree feedback files.
-- `src/disk_snapshot.rs::DiskSnapshot` contains
+- `src/git_io.rs::snapshot` collects both first-parent commit
+  events AND working-tree feedback files.
+- `src/disk_snapshot.rs::DiskSnapshot` carries
   `feedback_files: Vec<FeedbackBlob>`.
-- `src/disk_snapshot.rs::derive_state` builds `FoldCarry` from those
-  feedback files before replaying commits.
-- `FoldCarry` holds `feedback_by_plan`, and `build_gate` pulls
+- `src/disk_snapshot.rs::derive_state` builds `FoldCarry` from
+  those feedback files before replaying commits.
+- `FoldCarry` holds `feedback_by_plan`; `build_gate` pulls
   feedback into each reviewable commit as the commit is folded.
 - `RepoState`, `Plan`, `PlanTimelineEvent`, `CommitGate`, and
-  `Feedback` live in `trinity-core` and already derive serde
-  `Serialize` / `Deserialize`, but they currently represent a
-  post-feedback state.
+  `Feedback` already derive `Serialize` / `Deserialize` in
+  `trinity-core`, but they currently represent a post-feedback
+  state.
 
-This means there is no stable "git-only state" value to cache.
+There is no stable "git-only state" value to cache today.
 
 ## Non-Goals
 
-- Do not cache live `.trinity/feedback/` files for active plans.
-- Do not invent partial-history checkpointing in this plan. Cache by
-  exact HEAD commit first.
-- Do not make the daemon the source of truth for CLI status.
-- Do not optimize by hiding correctness problems behind broad cache
-  invalidation.
-- Do not change finalized approval semantics. `.trinity/finished/`
+- No cache of live `.trinity/feedback/` files for active plans.
+- No partial-history checkpointing. Cache by exact HEAD commit.
+- No making the daemon the source of truth for CLI status.
+- No optimization that hides correctness behind broad invalidation.
+- No change to finalized approval semantics. `.trinity/finished/`
   files committed in git are still folded normally.
 
 ## Design
@@ -69,43 +67,69 @@ This means there is no stable "git-only state" value to cache.
 Split the fold into two explicit stages:
 
 ```rust
-pub fn derive_base_state(repo_root: PathBuf, snapshot: CommitSnapshot) -> RepoState;
+pub fn derive_base_state(
+    repo_root: PathBuf,
+    snapshot: CommitSnapshot,
+) -> BaseRepoState;
 
 pub fn attach_live_feedback(
-    state: &mut RepoState,
+    base: BaseRepoState,
     feedback_files: Vec<FeedbackBlob>,
-);
+) -> LiveRepoState;
 ```
 
-`derive_base_state` consumes only commit-derived data:
+`derive_base_state` consumes ONLY commit-derived data:
 
 - `head`
 - chronological `CommitEvent`s
 - committed plan file changes
 - committed finalize snapshot changes
 
-It must not read or accept working-tree feedback files.
-
-The base state still includes reviewable timeline events and gates,
-but those gates have no live feedback attached yet. They may still
-contain data derived from committed finalize snapshots through the
-existing finish/frozen-plan path.
+It must not read or accept working-tree feedback files. A unit
+test pins this: the function signature only takes `CommitSnapshot`,
+and a fixture with working-tree feedback files present produces
+the same `BaseRepoState` whether or not those files exist.
 
 `attach_live_feedback` is the only stage that reads mutable
-`.trinity/feedback/` data. It attaches feedback to existing
-reviewable timeline events for non-finished plans, updates the gate
-state, updates participant/missing lists, and updates
-`last_activity_ts` from feedback mtimes.
+`.trinity/feedback/` data. It:
 
-Finished plans are sealed. Live feedback that targets commits in a
-finished plan may remain visible as informational metadata if current
-surfaces already show it, but it must not change finished-state
-semantics. Prefer keeping the first implementation conservative:
-only active plans receive live gate updates.
+- indexes feedback by `(plan_key, target_sha)`
+- attaches feedback to existing reviewable timeline events for
+  non-finished plans
+- recomputes each affected gate state, participants, and missing
+  lists
+- updates `last_activity_ts` from feedback mtimes
+
+Finished plans are sealed. Live feedback that targets commits in
+a finished plan is ignored at this stage — finished-state
+semantics are commit-derived only.
+
+### Cacheable / Live Newtypes
+
+Model the boundary explicitly from the start:
+
+```rust
+pub struct BaseRepoState(RepoState);
+pub struct LiveRepoState(RepoState);
+```
+
+Both newtypes wrap the existing `RepoState`. They exist so the
+type system makes the cache contract impossible to subvert:
+
+- only `BaseRepoState` is written to the cache
+- only `LiveRepoState` is handed to the projections that drive
+  `list_plans`, `finish_preview`, `rewrite_preview`, etc.
+- a `&LiveRepoState` deref to `&RepoState` is fine for read-only
+  projections; the wrappers exist to police construction, not
+  read access
+
+This is the same trade-off the plan made in earlier projects: a
+trivial newtype that prevents a real class of mistakes is worth
+the ten lines of `impl Deref`.
 
 ### Snapshot Types
 
-Rename the current overloaded snapshot shape:
+Rename the current overloaded snapshot:
 
 ```rust
 pub struct CommitSnapshot {
@@ -114,130 +138,153 @@ pub struct CommitSnapshot {
 }
 ```
 
-Move working-tree feedback collection out of `git_io::snapshot`.
-Expose it separately:
+Move working-tree feedback collection out of `git_io::snapshot`:
 
 ```rust
-pub fn collect_feedback_files(repo_root: &Path) -> Result<Vec<FeedbackBlob>, GitIoError>;
+pub async fn collect_feedback_files(
+    repo_root: &Path,
+) -> Result<Vec<FeedbackBlob>, GitIoError>;
 ```
 
-Then rebuild becomes:
+Then the local rebuild becomes:
 
 ```rust
 let base = load_or_build_base_state(repo_root).await?;
-let feedback = git_io::collect_feedback_files(repo_root)?;
-let mut state = base;
-attach_live_feedback(&mut state, feedback);
+let feedback = git_io::collect_feedback_files(repo_root).await?;
+let state = attach_live_feedback(base, feedback);
 ```
 
-This makes the cache boundary obvious and testable.
+This is the only sequence callers see; the cache hit/miss is an
+implementation detail of `load_or_build_base_state`.
 
 ### Binary Cache
 
-Add a small cache module, for example `src/state_cache.rs`.
-
-Cache key:
+Add `src/state_cache.rs`. Cache layout:
 
 ```text
-.trinity/cache/repo-state/<head-sha>.<format-version>.bin
+.trinity/cache/repo-state/<head-sha>.v<format-version>.bin
 ```
 
-The cache payload is the git-only `RepoState` after
-`derive_base_state`, before live feedback attachment.
+The cache file's first bytes carry a magic+version header that is
+verified before deserialization:
 
-The cache must include enough metadata to reject stale entries:
+```text
+magic: b"TRINITY-BASE-STATE\n"
+format_version: u32 (little-endian)
+trinity_version: u32 (little-endian)  -- bumped on incompatible
+                                         changes to the model
+head_sha: 40 bytes ASCII
+-- followed by the bincode body
+```
 
-- cache format version
-- Trinity binary/cache schema version
-- repo root or repo basename, if needed for sanity checking
-- HEAD SHA
+The header IS the validation check. Filename version is for
+debugging; do not trust the filename to imply the body shape.
 
-Use a binary encoder that is boring and easy to maintain. `bincode`
-is the default choice unless a small spike shows `wincode` is a
-materially better fit for stable Rust, serde/newtype support, and
-maintenance. Do not let encoder selection become a design project.
+Encoder: **bincode 2.x with serde**. No spike. Bincode is the
+boring, stable choice. The model types already derive
+`Serialize`/`Deserialize`; bincode's `serde` feature consumes
+those. No hand-written stringly mappers; no parallel cache schema.
 
-`trinity-core` model types should be made encodable/decodable by the
-chosen encoder. Keep derives centralized on the core model types; do
-not introduce hand-written stringly mappers for the cache format.
+`trinity-core` adds bincode as a dep behind a default feature
+(or unconditional — it's small) and the model types remain
+serde-only. The cache lives in the app crate and calls
+`bincode::serde::encode_to_vec` / `decode_from_slice`.
+
+Add `.trinity/cache/` to `.trinity/.gitignore` (the
+committed-into-repo gitignore that ships with `trinity init`) so
+operators don't accidentally commit cache binaries. Existing
+repos that don't have this line get it via a one-line addition;
+no migration path needed for a directory that doesn't exist yet.
 
 ### Cache Lifecycle
 
-On `trinity status` and other local CLI state reads:
+On any local rebuild path:
 
-1. Resolve repo root.
-2. Read HEAD SHA.
-3. Try `.trinity/cache/repo-state/<head>.<version>.bin`.
-4. If it loads and validates, use it.
-5. Otherwise fold commit history with `derive_base_state`.
-6. Write the cache atomically.
-7. Collect live feedback files.
-8. Attach live feedback.
-9. Project status output.
+1. Resolve repo root, read HEAD.
+2. Try `.trinity/cache/repo-state/<head>.v<version>.bin`.
+3. If header validates and body deserializes, use the cached
+   `BaseRepoState`.
+4. Otherwise fold history with `derive_base_state` and write the
+   cache:
+   - serialize to bytes
+   - write to a sibling tempfile in the same directory
+   - rename into place (atomic on same-filesystem POSIX rename)
+   - on write failure, log a warning and continue with the
+     freshly-folded state — never block the operator on a cache
+     write
+5. Collect live feedback files.
+6. Attach live feedback.
+7. Return `LiveRepoState`.
 
-Atomic write should be best-effort but real:
+**Concurrent invocations.** Two `trinity status` calls at the
+same HEAD must not corrupt each other. Because writes go through
+`<unique-tempfile> → atomic rename`, the worst case is one
+invocation overwriting the other's cache file — both bodies are
+byte-identical at the same HEAD, so the rename race is safe. Do
+not add file locks.
 
-- write to a temp path under `.trinity/cache/repo-state/`
-- fsync is optional for now
-- rename into place
-- on write failure, warn and continue with the freshly folded state
-
-Prune policy should be intentionally simple. Keep a small fixed number
-of recent cache files per repo, such as 8 or 16, sorted by mtime. No
-LRU database.
+**Prune.** Intentionally simple. After a successful write, list
+the cache directory; if more than 16 entries exist, delete the
+oldest by mtime. No LRU database, no manifest file.
 
 ### Runtime And Watcher
 
-The daemon can use the same cache path on cold start and HEAD-change
-rebuilds, but live feedback updates from the watcher must still apply
-in memory immediately.
+The daemon uses the same cache path on cold start and on
+HEAD-change rebuilds. Live feedback updates from the watcher
+still apply in memory immediately.
 
 After the split:
 
-- `Runtime::add_repo` / `head_changed` loads or builds base state,
-  then attaches current feedback files.
-- `FeedbackWritten` and `FeedbackRemoved` continue to update in-memory
-  gates without requiring a full commit fold.
-- The runtime should not write live-feedback-bearing `RepoState` into
-  the commit cache.
+- `Runtime::add_repo` / `head_changed` calls
+  `load_or_build_base_state`, attaches current feedback files in
+  memory, and stores the resulting `LiveRepoState`.
+- `FeedbackWritten` / `FeedbackRemoved` events continue to update
+  in-memory gates without re-folding commits. They mutate the
+  live overlay, never the base.
+- The runtime never writes a `LiveRepoState` (or any state with
+  feedback attached) into the commit cache.
 
 ### API Boundary
 
-Most response code should continue to consume ordinary `RepoState`.
-The distinction is internal:
+Most response code keeps consuming `&RepoState` via `Deref<Target=RepoState>`
+on `LiveRepoState`. The newtypes police construction at the
+fold/cache boundary; reads are unchanged.
 
-- `RepoState` after `derive_base_state`: cacheable base
-- `RepoState` after `attach_live_feedback`: full live state for
-  current projections
+The two entry points the rest of the codebase calls:
 
-If this distinction is too easy to misuse, add lightweight newtypes:
-
-```rust
-pub struct BaseRepoState(RepoState);
-pub struct LiveRepoState(RepoState);
-```
-
-Use them only if they prevent real mistakes; do not create wrapper
-ceremony for its own sake.
+- `rebuild_repo(repo)` — folds (or loads), attaches, returns
+  `LiveRepoState`. The async signature stays the same; only the
+  return type narrows from `RepoState` to `LiveRepoState`.
+- `state_cache::load_or_build_base_state(repo)` — internal helper
+  used by `rebuild_repo`. Public only inside the crate.
 
 ## Testing
 
-Add focused tests before broad integration tests:
+Focused, not broad. Each test pins one invariant in the new
+model:
 
-1. `derive_base_state` does not accept or attach working-tree
-   feedback.
-2. `attach_live_feedback` attaches feedback to the matching
-   non-finished plan commit and updates gate state.
-3. Editing a feedback file changes the live state after attachment
-   without changing or invalidating the base cache key.
-4. Finished plans do not have their lifecycle changed by live
-   feedback files.
-5. A cached base state plus feedback attachment matches a full
-   uncached rebuild for active-plan projections.
-6. Corrupt cache files are ignored and replaced.
-7. Cache entries for the wrong HEAD or format version are ignored.
-8. `trinity status` is measurably faster on a warm cache in a fixture
-   with enough commits to exercise the path.
+1. `derive_base_state` is feedback-blind: same input
+   `CommitSnapshot` produces byte-identical (via bincode round-trip)
+   `BaseRepoState` regardless of what `.trinity/feedback/` holds.
+2. `attach_live_feedback` attaches a feedback file to the
+   matching non-finished plan/commit and updates the gate state.
+3. Editing a feedback file changes the resulting `LiveRepoState`
+   without changing the bytes of the cached `BaseRepoState`.
+4. Live feedback targeting a commit in a finished plan does NOT
+   alter the finished-plan lifecycle or gate.
+5. `attach_live_feedback(load_from_cache(), feedback)` matches
+   `attach_live_feedback(derive_base_state(snap), feedback)` for
+   active-plan projections — full bincode round-trip equivalence.
+6. Corrupt cache files (mangled header, garbage body) are ignored
+   and replaced on next write; the rebuild succeeds.
+7. Cache entries with mismatched HEAD or format version are
+   rejected by the header check.
+8. **Cache-hit path skips the fold.** Wire a counter (or
+   feature-gated assertion) into `derive_base_state`. Test asserts
+   first `rebuild_repo` increments it, second `rebuild_repo` at
+   the same HEAD does not. This replaces a wall-clock perf
+   assertion — wall-clock thresholds in CI are flaky and don't
+   actually prove the cache was hit.
 
 Run:
 
@@ -249,54 +296,65 @@ cargo fmt -- --check
 
 ## Phases
 
-### Phase 1: Split Snapshot And Fold Inputs
+### Phase 1: Split Fold From Live Attach
 
-Introduce `CommitSnapshot` and move feedback collection out of
-`git_io::snapshot`. Keep behavior unchanged by calling
-`derive_base_state` followed immediately by `attach_live_feedback`.
+Introduce `CommitSnapshot`, the `BaseRepoState` / `LiveRepoState`
+newtypes, `derive_base_state`, and `attach_live_feedback`. Move
+feedback indexing, verdict parsing, gate recomputation, and
+feedback-driven `last_activity_ts` updates out of `FoldCarry`
+into `attach_live_feedback`. Move feedback collection out of
+`git_io::snapshot` into `collect_feedback_files`. Wire
+`rebuild_repo` to call both stages back-to-back so external
+behavior is unchanged.
 
-### Phase 2: Live Feedback Attachment
+Phase 1 ships the architectural model in one piece — the old
+plan's Phase 1+2 were inseparable (Phase 1 couldn't claim
+"behavior unchanged" without Phase 2's `attach_live_feedback`).
 
-Move feedback indexing, verdict parsing, gate recomputation, and
-feedback-driven `last_activity_ts` updates out of `FoldCarry` into
-`attach_live_feedback`. Remove `feedback_by_plan` from the commit
-fold carry.
+### Phase 2: Binary Round-Trip For Core Types
 
-### Phase 3: Binary Encoding
+Verify bincode round-trips `BaseRepoState` across the model's
+variants: plan-only, code-only, mixed, multi-plan, finalize. Add
+the round-trip tests; if a type needs explicit serde adjustment,
+do it here. No cache yet.
 
-Make the core model types encodable with the selected binary encoder.
-Add round-trip tests for representative `RepoState` values including
-plan-only, code-only, mixed, multi-plan, and finalize timeline events.
+### Phase 3: Cache Module
 
-### Phase 4: Cache Module
+Add `src/state_cache.rs` with magic-header-stamped load,
+validate, atomic write, and prune helpers. Cache only
+`BaseRepoState` keyed by HEAD + format version. Unit tests for
+the corrupt-file and wrong-HEAD paths.
 
-Add `state_cache` with load, validate, atomic write, and prune
-helpers. Cache only base states keyed by HEAD and format version.
+### Phase 4: Use Cache In Local CLI Rebuilds
 
-### Phase 5: Use Cache In Local Rebuilds
+Wire `state_cache` into `rebuild_repo`. `trinity status` is the
+first beneficiary; `trinity finish` and `trinity purge` also flip
+on since they share the same entry point. Confirm the cache-hit
+counter test (#8) passes.
 
-Switch `rebuild_repo` or a new `rebuild_repo_cached` entrypoint to
-load/build the base state, attach live feedback, and return the live
-state. Use it from `trinity status` first, then from other local CLI
-commands if the semantics are identical.
+### Phase 5: Daemon Adoption
 
-### Phase 6: Daemon Adoption
-
-Let daemon cold-start and HEAD-change rebuilds use the same cached
-base-state path. Keep watcher feedback updates as incremental
-in-memory live overlays.
+Daemon cold-start and HEAD-change rebuilds use the same cached
+base path. Watcher events for feedback continue as incremental
+in-memory live overlays — they must NOT trigger a cache write
+or a commit refold.
 
 ## Acceptance Criteria
 
-- The commit fold is independent of mutable `.trinity/feedback/`
-  files.
-- Live feedback is attached in an explicit post-fold stage.
-- Base repo state can be binary-encoded and decoded without losing
-  typed core invariants.
-- `.trinity/cache/` stores base states keyed by HEAD and cache format
-  version.
-- Editing feedback changes current projections without requiring a
-  commit refold and without poisoning the HEAD-keyed cache.
-- `trinity status` uses the cache and remains correct when feedback is
-  edited between invocations.
-- Existing daemon and CLI projections keep their behavior.
+- The commit fold (`derive_base_state`) is independent of
+  mutable `.trinity/feedback/` files. Pinning unit test exists.
+- Live feedback is attached in an explicit post-fold stage
+  (`attach_live_feedback`).
+- `BaseRepoState` round-trips through bincode without losing
+  typed core invariants (newtype identity, enum tags).
+- `.trinity/cache/repo-state/` stores base states keyed by HEAD
+  and cache format version, with a magic+version header.
+- `.trinity/.gitignore` excludes `.trinity/cache/`.
+- Editing feedback changes current projections without requiring
+  a commit refold and without poisoning the HEAD-keyed cache.
+- `trinity status` uses the cache and remains correct when
+  feedback is edited between invocations.
+- Cache-hit path provably skips `derive_base_state` (counter
+  test, not wall-clock).
+- Existing daemon and CLI projections keep their behavior;
+  `LiveRepoState` derefs to `&RepoState` for read-only callers.
