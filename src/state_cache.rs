@@ -26,6 +26,7 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime};
 
 use wincode::{SchemaRead, SchemaWrite};
@@ -33,6 +34,11 @@ use wincode::{SchemaRead, SchemaWrite};
 use crate::lifecycle::{CommitSha, PlanKey};
 use crate::repo_state::{BaseRepoState, RepoState};
 use trinity_core::model::Plan;
+
+/// Per-process counter mixed into cache tempfile names so two
+/// concurrent same-process rebuild tasks writing the same
+/// `(repo, head)` cannot collide on the temp path.
+static TEMP_NONCE: AtomicU64 = AtomicU64::new(0);
 
 /// Magic bytes prefixing every cache file. Bumped iff the on-disk
 /// layout itself (header shape) ever changes.
@@ -78,32 +84,35 @@ pub enum CacheError {
     Encode,
 }
 
-/// Rootless cache payload — `RepoState` minus `root` and minus
-/// the unused `plan_conflicts` field. Wincode-encoded into the
-/// cache file body. The current canonical repo root is injected
-/// at load time.
+/// Rootless cache payload — `RepoState` minus `root`, `head`,
+/// and `plan_conflicts`. Wincode-encoded into the cache file body.
+///
+/// `root` and `head` are NOT serialized: both are runtime
+/// identity that must come from outside the payload at load
+/// time. `root` is injected from the current canonical repo
+/// path (so a relocated cache doesn't leak a stale absolute
+/// path); `head` is the value validated in the file header (so
+/// the body can't claim a different HEAD than the header).
 #[derive(Debug, Clone, PartialEq, Eq, SchemaWrite, SchemaRead)]
 struct BaseStatePayload {
-    head: Option<CommitSha>,
     plans: BTreeMap<PlanKey, Plan>,
 }
 
 impl BaseStatePayload {
     fn from_state(state: &RepoState) -> Self {
         Self {
-            head: state.head.clone(),
             plans: state.plans.clone(),
         }
     }
 
-    fn into_base(self, root: PathBuf) -> BaseRepoState {
+    fn into_base(self, root: PathBuf, head: CommitSha) -> BaseRepoState {
         // plan_conflicts is intentionally not cached — see field
-        // comment in repo_state.rs ("Today effectively unused"). If
-        // it ever carries data, bump CACHE_FORMAT_VERSION.
+        // comment in repo_state.rs ("Today effectively unused").
+        // If it ever carries data, bump CACHE_FORMAT_VERSION.
         let state = RepoState {
             root,
             plans: self.plans,
-            head: self.head,
+            head: Some(head),
             plan_conflicts: BTreeMap::new(),
         };
         BaseRepoState::new(state)
@@ -168,10 +177,14 @@ pub fn try_load(repo_root: &Path, head: &CommitSha) -> Result<Option<BaseRepoSta
     }
 
     let payload: BaseStatePayload = wincode::deserialize(body).map_err(|_| CacheError::Decode)?;
-    // Inject the CURRENT canonical root — never the path the cache
-    // was originally written under. A relocated `.trinity/cache/`
-    // dir must not leak a stale absolute root into runtime state.
-    Ok(Some(payload.into_base(repo_root.to_path_buf())))
+    // Inject the CURRENT canonical root and the header-validated
+    // HEAD. Both are runtime identity; we do not trust the body
+    // to carry them (root because a moved cache dir would leak a
+    // stale path; head because the file header is the source of
+    // truth for which commit this payload describes).
+    Ok(Some(
+        payload.into_base(repo_root.to_path_buf(), head.clone()),
+    ))
 }
 
 /// Write `base` to the cache, atomically. Returns `Ok(())` on
@@ -205,15 +218,22 @@ pub fn write(repo_root: &Path, base: &BaseRepoState) -> Result<(), CacheError> {
     buf.extend_from_slice(&body);
 
     // tempfile-in-same-dir + atomic rename. Two concurrent
-    // `trinity status` calls at the same HEAD will race, but the
-    // payload bytes are deterministic at a given HEAD so the
+    // rebuild tasks for the same `(repo, head)` will race, but
+    // the payload bytes are deterministic at a given HEAD so the
     // winner doesn't matter.
+    //
+    // Uniqueness: pid alone isn't enough — two same-process tasks
+    // (e.g. two daemon rebuild jobs racing on the same head)
+    // would collide. Mix in a monotonic atomic counter so every
+    // call to `write` gets a distinct temp path.
     let final_path = cache_file_for(repo_root, head);
+    let nonce = TEMP_NONCE.fetch_add(1, Ordering::Relaxed);
     let tmp_path = dir.join(format!(
-        ".{}.v{}.tmp.{}",
+        ".{}.v{}.tmp.{}.{}",
         head.as_str(),
         CACHE_FORMAT_VERSION,
         std::process::id(),
+        nonce,
     ));
     {
         let mut tmp = fs::File::create(&tmp_path)?;
@@ -422,6 +442,102 @@ mod tests {
             }
         }
         Ok(())
+    }
+
+    /// Regression for codex's review on 552894d: two writes for
+    /// the same `(repo, head)` in one process must not collide on
+    /// the temp file path. The nonce makes every temp path
+    /// distinct.
+    #[test]
+    fn concurrent_same_process_writes_do_not_collide() {
+        let dir = fresh_repo();
+        let base = synth_base(dir.path());
+        // Spawn N parallel writes; if any temp file rename
+        // failed mid-flight the call would error out.
+        let threads: Vec<_> = (0..8)
+            .map(|_| {
+                let path = dir.path().to_path_buf();
+                let base = base.clone();
+                std::thread::spawn(move || write(&path, &base))
+            })
+            .collect();
+        for t in threads {
+            t.join().unwrap().expect("concurrent write must succeed");
+        }
+        // The final file is well-formed (one winner of the rename).
+        let loaded = try_load(dir.path(), base.head.as_ref().unwrap())
+            .unwrap()
+            .expect("cache file should exist");
+        assert_eq!(loaded.head, base.head);
+
+        // No stray temp files left behind. Atomic rename on a
+        // POSIX filesystem replaces the target if it exists, so
+        // the temp file must be gone post-rename for every winner.
+        let cache = cache_dir(dir.path());
+        let strays: Vec<PathBuf> = fs::read_dir(&cache)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .filter(|p| {
+                p.file_name()
+                    .and_then(|n| n.to_str())
+                    .map(|n| n.starts_with('.') && n.contains(".tmp."))
+                    .unwrap_or(false)
+            })
+            .collect();
+        assert!(
+            strays.is_empty(),
+            "no stray temp files allowed after concurrent writes; got {strays:?}",
+        );
+    }
+
+    /// Regression for codex's review on 552894d: HEAD is not
+    /// trusted from the payload. A maliciously (or accidentally)
+    /// swapped body must not be returned under the wrong head.
+    ///
+    /// Construction: write a cache for head A, copy the file to
+    /// head B's filename, then patch the header's sha bytes so
+    /// they spell head B. `try_load(repo, B)` validates header
+    /// matches, decodes the body, then injects head B (from the
+    /// header) — NOT whatever the body might have claimed. Since
+    /// `head` is no longer in the payload, this is structurally
+    /// impossible to subvert.
+    #[test]
+    fn head_injected_from_header_not_payload() {
+        let dir = fresh_repo();
+        let head_a = CommitSha::parse("0123456789abcdef0123456789abcdef01234567").unwrap();
+        let head_b = CommitSha::parse("abcdef0123456789abcdef0123456789abcdef01").unwrap();
+        let base_a = {
+            let snap = CommitSnapshot {
+                head: Some(head_a.clone()),
+                history: Vec::new(),
+            };
+            derive_base_state(dir.path().to_path_buf(), snap)
+        };
+        write(dir.path(), &base_a).unwrap();
+
+        // Copy the file for head A to head B's path, and rewrite
+        // the header's sha bytes to spell head B.
+        let src = cache_file_for(dir.path(), &head_a);
+        let dst = cache_file_for(dir.path(), &head_b);
+        let mut bytes = fs::read(&src).unwrap();
+        // Header layout: CACHE_MAGIC (19) + u32 format + u32 generation,
+        // then 40-byte sha at offset CACHE_MAGIC.len() + 8.
+        let sha_offset = CACHE_MAGIC.len() + 8;
+        bytes[sha_offset..sha_offset + 40].copy_from_slice(head_b.as_str().as_bytes());
+        fs::write(&dst, &bytes).unwrap();
+
+        // Loading at head_b succeeds (header matches), and the
+        // resulting BaseRepoState.head is head_b (from header),
+        // not anything claimed by the payload body.
+        let loaded = try_load(dir.path(), &head_b)
+            .unwrap()
+            .expect("file at head_b path should load");
+        assert_eq!(
+            loaded.head.as_ref().unwrap().as_str(),
+            head_b.as_str(),
+            "loaded head must come from the header, not the body",
+        );
     }
 
     #[test]
