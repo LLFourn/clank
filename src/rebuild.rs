@@ -3,18 +3,19 @@
 //!
 //! 1. `git_io::snapshot` → `CommitSnapshot` (IO, commit-derived only)
 //! 2. `disk_snapshot::derive_base_state` → `BaseRepoState` (pure)
+//!    — or, when a valid cache hit is available, load directly from
+//!    `state_cache` and skip the commit fold entirely.
 //! 3. `git_io::collect_feedback_files` + `attach_live_feedback` →
 //!    `LiveRepoState` (working-tree overlay)
 //!
-//! Future cache layer slots in at step 2 — `BaseRepoState` is the
-//! cacheable boundary. See
-//! `.trinity/plans/cache-core-fold-and-live-feedback.md`.
+//! See `.trinity/plans/cache-core-fold-and-live-feedback.md`.
 
 use std::path::Path;
 
 use crate::disk_snapshot::{attach_live_feedback, derive_base_state};
 use crate::git_io::{self, GitIoError};
-use crate::repo_state::LiveRepoState;
+use crate::repo_state::{BaseRepoState, LiveRepoState};
+use crate::state_cache;
 
 #[derive(Debug, thiserror::Error)]
 pub enum RebuildError {
@@ -22,13 +23,112 @@ pub enum RebuildError {
     Git(#[from] GitIoError),
 }
 
+/// Caching policy. `Use` is the default — read the on-disk cache
+/// if available and write on miss. `Bypass` is the `--no-cache`
+/// escape hatch: skip read AND write entirely.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CachePolicy {
+    Use,
+    Bypass,
+}
+
+/// Per-call rebuild diagnostics. Used by integration tests to
+/// prove the cache-hit path skipped the fold; can be ignored at
+/// runtime.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct RebuildDiagnostics {
+    /// True iff the base state came from the on-disk cache. False
+    /// when the fold ran (cache miss, bypass, empty repo, or
+    /// cache load error fallback).
+    pub cache_hit: bool,
+}
+
 /// Build a fresh `LiveRepoState` from disk + git for `repo_root`.
-/// Empty repos (no commits) produce an empty state.
+/// Empty repos (no commits) produce an empty state. Uses the
+/// `.trinity/cache/repo-state/` cache for the commit fold when
+/// possible.
 pub async fn rebuild_repo(repo_root: &Path) -> Result<LiveRepoState, RebuildError> {
+    rebuild_repo_with_policy(repo_root, CachePolicy::Use).await
+}
+
+/// `rebuild_repo` variant that honors an explicit cache policy.
+/// The `--no-cache` CLI flag wires through here.
+pub async fn rebuild_repo_with_policy(
+    repo_root: &Path,
+    policy: CachePolicy,
+) -> Result<LiveRepoState, RebuildError> {
+    let (state, _diag) = rebuild_with_diagnostics(repo_root, policy).await?;
+    Ok(state)
+}
+
+/// `rebuild_repo` variant returning per-call diagnostics. Same
+/// behavior as `rebuild_repo_with_policy`; integration tests use
+/// the diagnostics to assert cache-hit vs fold paths instead of
+/// relying on a process-global counter.
+pub async fn rebuild_with_diagnostics(
+    repo_root: &Path,
+    policy: CachePolicy,
+) -> Result<(LiveRepoState, RebuildDiagnostics), RebuildError> {
+    let (base, diag) = load_or_build_base_state(repo_root, policy).await?;
+    let feedback = git_io::collect_feedback_files(repo_root)?;
+    Ok((attach_live_feedback(base, feedback), diag))
+}
+
+/// Try the cache first when policy allows; fall back to the
+/// commit fold. On a fresh build (cache miss + policy=Use), write
+/// the result to the cache before returning. Cache write failures
+/// are logged and swallowed — never block the operator on a
+/// cache write.
+async fn load_or_build_base_state(
+    repo_root: &Path,
+    policy: CachePolicy,
+) -> Result<(BaseRepoState, RebuildDiagnostics), RebuildError> {
+    // We need HEAD to key the cache lookup. `git_io::snapshot`
+    // also reads HEAD as its first step; rather than duplicate
+    // that work, ask for HEAD once and pass the rest to
+    // `derive_base_state` if we miss.
+    let head = git_io::rev_parse_head(repo_root).await?;
+
+    if policy == CachePolicy::Use
+        && let Some(ref h) = head
+    {
+        match state_cache::try_load(repo_root, h) {
+            Ok(Some(base)) => return Ok((base, RebuildDiagnostics { cache_hit: true })),
+            Ok(None) => {} // missing file — fall through to fold
+            Err(e) => {
+                tracing::warn!(
+                    repo = %repo_root.display(),
+                    head = %h,
+                    error = ?e,
+                    "state cache load failed; falling back to fold",
+                );
+            }
+        }
+    }
+
+    // Cache miss / bypass / empty repo: do the commit fold.
     let snapshot = git_io::snapshot(repo_root).await?;
     let base = derive_base_state(repo_root.to_path_buf(), snapshot);
-    let feedback = git_io::collect_feedback_files(repo_root)?;
-    Ok(attach_live_feedback(base, feedback))
+
+    if policy == CachePolicy::Use {
+        if let Err(e) = state_cache::write(repo_root, &base) {
+            tracing::warn!(
+                repo = %repo_root.display(),
+                error = ?e,
+                "state cache write failed; continuing with freshly folded state",
+            );
+        }
+        // Best-effort prune. Same swallow-on-error policy.
+        if let Err(e) = state_cache::prune(repo_root) {
+            tracing::warn!(
+                repo = %repo_root.display(),
+                error = ?e,
+                "state cache prune failed",
+            );
+        }
+    }
+
+    Ok((base, RebuildDiagnostics { cache_hit: false }))
 }
 
 #[cfg(test)]
@@ -77,6 +177,73 @@ mod tests {
         let state = rebuild_repo(dir.path()).await.unwrap();
         assert!(state.head.is_none());
         assert!(state.plans.is_empty());
+    }
+
+    /// Plan test #10: cache-hit path skips the fold. A warm
+    /// `rebuild_repo` at the same HEAD must report
+    /// `cache_hit == true`. This is the wall-clock-free proof
+    /// that the cache is actually doing work.
+    #[tokio::test]
+    async fn warm_cache_skips_the_fold() {
+        let dir = init_repo();
+        write_file(dir.path(), ".trinity/plans/foo.md", "# foo\n");
+        write_file(dir.path(), "src/lib.rs", "fn one() {}\n");
+        commit(dir.path(), "Intro foo");
+        write_file(dir.path(), "src/lib.rs", "fn two() {}\n");
+        commit(dir.path(), "Iterate");
+
+        // Cold call: cache miss → fold runs, cache file is written.
+        let (_cold, diag) = rebuild_with_diagnostics(dir.path(), CachePolicy::Use)
+            .await
+            .unwrap();
+        assert!(!diag.cache_hit, "cold rebuild must NOT report a cache hit",);
+
+        // Warm call at the same HEAD: cache hit → fold is skipped.
+        let (_warm, diag) = rebuild_with_diagnostics(dir.path(), CachePolicy::Use)
+            .await
+            .unwrap();
+        assert!(
+            diag.cache_hit,
+            "warm rebuild at same HEAD must report a cache hit",
+        );
+
+        // CachePolicy::Bypass forces the fold path even with a
+        // cache file on disk.
+        let (_bypass, diag) = rebuild_with_diagnostics(dir.path(), CachePolicy::Bypass)
+            .await
+            .unwrap();
+        assert!(
+            !diag.cache_hit,
+            "Bypass must always run the fold (no cache_hit)",
+        );
+    }
+
+    /// `--no-cache` is non-mutating: a Bypass call must not write
+    /// a cache file. (If it did, a subsequent Use call would
+    /// accidentally see a stale cache from a Bypass that ran
+    /// against a slightly different state.)
+    #[tokio::test]
+    async fn no_cache_does_not_write_cache_file() {
+        let dir = init_repo();
+        write_file(dir.path(), ".trinity/plans/foo.md", "# foo\n");
+        commit(dir.path(), "Intro foo");
+
+        let _ = rebuild_repo_with_policy(dir.path(), CachePolicy::Bypass)
+            .await
+            .unwrap();
+        let cache_dir = dir.path().join(".trinity/cache/repo-state");
+        if cache_dir.exists() {
+            let entries: Vec<_> = std::fs::read_dir(&cache_dir)
+                .unwrap()
+                .filter_map(|e| e.ok())
+                .filter(|e| e.path().is_file())
+                .collect();
+            assert!(
+                entries.is_empty(),
+                "Bypass must not write any cache file; got {:?}",
+                entries.iter().map(|e| e.path()).collect::<Vec<_>>(),
+            );
+        }
     }
 
     #[tokio::test]

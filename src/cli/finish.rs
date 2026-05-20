@@ -14,7 +14,12 @@ use trinity_core::api::{FinalizeBlockReason, FinalizeReadiness, FinishPreviewRes
 pub async fn run(args: FinishArgs) -> anyhow::Result<()> {
     let repo = resolve_repo(args.repo.as_deref())?;
     let basename = repo_basename(&repo)?;
-    let state = crate::rebuild::rebuild_repo(&repo)
+    let policy = if args.no_cache {
+        crate::rebuild::CachePolicy::Bypass
+    } else {
+        crate::rebuild::CachePolicy::Use
+    };
+    let state = crate::rebuild::rebuild_repo_with_policy(&repo, policy)
         .await
         .map_err(|e| anyhow::anyhow!("failed to fold repo `{}`: {e}", repo.display()))?;
     let plan_key = crate::cli::plan_resolve::resolve_plan(&state, &basename, args.plan.as_deref())?;
@@ -115,7 +120,12 @@ async fn run_post_finalize_rewrite(
     // into one but PRESERVE the finalize snapshot. Use
     // include_finalize=false so the snapshot survives the squash.
     let include_finalize = args.purge;
-    let state = crate::rebuild::rebuild_repo(repo)
+    let policy = if args.no_cache {
+        crate::rebuild::CachePolicy::Bypass
+    } else {
+        crate::rebuild::CachePolicy::Use
+    };
+    let state = crate::rebuild::rebuild_repo_with_policy(repo, policy)
         .await
         .map_err(|e| anyhow::anyhow!("failed to fold repo `{}`: {e}", repo.display()))?;
     let preview = crate::preview::build_rewrite_preview(repo, &state, plan_key, include_finalize)

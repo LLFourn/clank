@@ -31,6 +31,11 @@ pub struct StatusArgs {
     /// Emit JSON (typed `StatusResponse` from `trinity-core::api`).
     #[arg(short = 'j', long)]
     pub json: bool,
+    /// Skip the on-disk state cache: don't read it, don't write it.
+    /// Useful for real-world A/B timing against a warm cache and as
+    /// a debug escape hatch.
+    #[arg(long)]
+    pub no_cache: bool,
 }
 
 #[derive(Args, Debug)]
@@ -71,6 +76,9 @@ pub struct FinishArgs {
     /// Ignored on plain `trinity finish`.
     #[arg(long)]
     pub dry: bool,
+    /// Skip the on-disk state cache: don't read it, don't write it.
+    #[arg(long)]
+    pub no_cache: bool,
 }
 
 #[derive(Args, Debug)]
@@ -121,6 +129,9 @@ pub struct PurgeArgs {
     /// branch.
     #[arg(long)]
     pub allow_rewrite_protected: bool,
+    /// Skip the on-disk state cache: don't read it, don't write it.
+    #[arg(long)]
+    pub no_cache: bool,
 }
 
 /// Resolve the repo root: explicit `--repo` path wins, otherwise

@@ -11,6 +11,15 @@ use std::io::Write;
 use super::{PurgeArgs, repo_basename, resolve_repo};
 use crate::cli::rewrite::{RewriteOpts, run as run_rewrite};
 use crate::lifecycle::PlanKey;
+use crate::rebuild::CachePolicy;
+
+fn cache_policy(args: &PurgeArgs) -> CachePolicy {
+    if args.no_cache {
+        CachePolicy::Bypass
+    } else {
+        CachePolicy::Use
+    }
+}
 
 pub async fn run(args: PurgeArgs) -> anyhow::Result<()> {
     let repo = resolve_repo(args.repo.as_deref())?;
@@ -47,7 +56,7 @@ async fn run_single(
     basename: &str,
     args: &PurgeArgs,
 ) -> anyhow::Result<()> {
-    let state = crate::rebuild::rebuild_repo(repo)
+    let state = crate::rebuild::rebuild_repo_with_policy(repo, cache_policy(args))
         .await
         .map_err(|e| anyhow::anyhow!("failed to fold repo `{}`: {e}", repo.display()))?;
     let plan_key = crate::cli::plan_resolve::resolve_plan(&state, basename, args.plan.as_deref())?;
@@ -144,7 +153,7 @@ async fn run_amend(repo: &std::path::Path, basename: &str, args: &PurgeArgs) -> 
     let plan_key: Option<PlanKey> = if args.all {
         None
     } else {
-        let state = crate::rebuild::rebuild_repo(repo)
+        let state = crate::rebuild::rebuild_repo_with_policy(repo, cache_policy(args))
             .await
             .map_err(|e| anyhow::anyhow!("failed to fold repo `{}`: {e}", repo.display()))?;
         Some(crate::cli::plan_resolve::resolve_plan(
@@ -401,6 +410,7 @@ mod tests {
             squash: None,
             amend: false,
             allow_rewrite_protected: false,
+            no_cache: false,
         };
         let err = run(args).await.unwrap_err();
         let msg = format!("{err}");

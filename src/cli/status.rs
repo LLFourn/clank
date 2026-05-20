@@ -12,7 +12,12 @@ use trinity_core::vocab::PlanLifecycle;
 pub async fn run(args: StatusArgs) -> anyhow::Result<()> {
     let repo = resolve_repo(args.repo.as_deref())?;
     let basename = repo_basename(&repo)?;
-    let state = crate::rebuild::rebuild_repo(&repo)
+    let policy = if args.no_cache {
+        crate::rebuild::CachePolicy::Bypass
+    } else {
+        crate::rebuild::CachePolicy::Use
+    };
+    let state = crate::rebuild::rebuild_repo_with_policy(&repo, policy)
         .await
         .map_err(|e| anyhow::anyhow!("failed to fold repo `{}`: {e}", repo.display()))?;
     let plans = crate::responses::list_plans_response(&state)?;
