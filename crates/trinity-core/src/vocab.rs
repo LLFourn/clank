@@ -196,6 +196,10 @@ impl ReviewTargetPhase {
 /// `RequestChanges`, anything else → `Unmarked`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[cfg_attr(
+    feature = "cache-encoding",
+    derive(wincode::SchemaWrite, wincode::SchemaRead)
+)]
 pub enum Verdict {
     Approve,
     RequestChanges,
@@ -221,6 +225,10 @@ impl Verdict {
 /// THIS commit.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[cfg_attr(
+    feature = "cache-encoding",
+    derive(wincode::SchemaWrite, wincode::SchemaRead)
+)]
 pub enum CommitGateState {
     Unreviewed,
     Approved,

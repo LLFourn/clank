@@ -14,6 +14,10 @@ use std::path::{Component, Path};
 macro_rules! string_newtype {
     ($name:ident) => {
         #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize)]
+        #[cfg_attr(
+            feature = "cache-encoding",
+            derive(wincode::SchemaWrite, wincode::SchemaRead)
+        )]
         #[serde(transparent)]
         pub struct $name(String);
 

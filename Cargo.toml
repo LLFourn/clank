@@ -37,7 +37,8 @@ dunce = "1"
 # Shared core types (closed-vocab enums, identifiers, response
 # DTOs) consumed by daemon and frontend. See
 # `.trinity/plans/trinity-core-unification.md`.
-trinity-core = { path = "crates/trinity-core" }
+trinity-core = { path = "crates/trinity-core", features = ["cache-encoding"] }
+wincode = { version = "0.5", features = ["derive"] }
 
 # JSON / schemas
 serde = { version = "1", features = ["derive"] }

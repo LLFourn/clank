@@ -3330,6 +3330,7 @@ dependencies = [
  "tracing-subscriber",
  "trinity-core",
  "url",
+ "wincode",
 ]
 
 [[package]]

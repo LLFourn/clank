@@ -225,13 +225,24 @@ No hand-written stringly mappers; no parallel cache schema.
 
 The cache module (`src/state_cache.rs`) calls
 `wincode::serialize` / `wincode::deserialize` on the rootless
-cache payload type defined in that same module. That payload
-type carries `SchemaWrite` / `SchemaRead` derives. Because the
-payload is app-local, wincode lives **in the app crate only**
-— `trinity-core` stays free of any encoding-format dep. If a
-future change forces the payload into `trinity-core` (e.g. to
-share with another crate), wincode follows it; the boundary
-move is the trigger, not preemptive placement.
+cache payload type defined in that same module. The payload
+itself stays app-local, but wincode's derive model requires the
+`SchemaWrite`/`SchemaRead` traits on every transitive field
+type — `Plan`, `CommitGate`, `PlanTimelineEvent`, `Feedback`,
+`ArchivedCycle`, the id newtypes, `Verdict`, `CommitGateState` —
+which all live in `trinity-core`.
+
+So wincode goes into `trinity-core` as an **optional dep behind
+a `cache-encoding` feature**, off by default. The app crate
+enables it; the wasm frontend and any non-cache consumer build
+trinity-core without wincode and pay nothing. Derives are gated
+with `#[cfg_attr(feature = "cache-encoding", derive(...))]`.
+
+This is what codex's earlier review anticipated: "wincode lives
+wherever the derives need it. If cache payload types live in
+trinity-core, then trinity-core can depend on wincode for these
+derives." Serde stays the wire contract; wincode is the cache
+contract; they don't overlap.
 
 Add `.trinity/cache/` to `.trinity/.gitignore` (the
 committed-into-repo gitignore that ships with `trinity init`) so
@@ -508,8 +519,9 @@ or a commit refold.
 - Cached payloads do not carry an absolute repo root that
   survives a directory move; `BaseRepoState.root` is always the
   current canonical root post-load.
-- `trinity-core` does not depend on wincode; encoding lives in
-  the app crate alongside the rootless cache payload type.
+- `trinity-core` depends on wincode only through the optional
+  `cache-encoding` feature (off by default). Wasm frontend
+  builds don't compile wincode at all.
 - Cache retention follows a logarithmic-thinning policy: a
   fresh window keeps every recent entry, and the gap between
   retained older entries roughly doubles with age.
