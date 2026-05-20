@@ -216,15 +216,22 @@ Pick whichever is cleaner during implementation — the invariant
 is what matters: a moved cache file cannot leak a stale absolute
 root into runtime state.
 
-Encoder: **bincode 2.x with serde**. No spike. Bincode is the
-boring, stable choice. The model types already derive
-`Serialize`/`Deserialize`; bincode's `serde` feature consumes
-those. No hand-written stringly mappers; no parallel cache schema.
+Encoder: **wincode** with its `derive` feature. The cache is an
+internal Trinity format — there's no wire compatibility argument
+for routing it through serde. Wincode's own `SchemaWrite` /
+`SchemaRead` derives own the encoding contract directly; serde
+derives stay reserved for HTTP/MCP wire DTOs in `trinity-core`.
+No hand-written stringly mappers; no parallel cache schema.
 
-Bincode lives **in the app crate only**, behind `src/state_cache.rs`.
-`trinity-core` stays serde-only — no encoding-format dep there.
-The cache module calls `bincode::serde::encode_to_vec` /
-`decode_from_slice` over the serde-derived core types.
+The cache module (`src/state_cache.rs`) calls
+`wincode::serialize` / `wincode::deserialize` on the rootless
+cache payload type defined in that same module. That payload
+type carries `SchemaWrite` / `SchemaRead` derives. Because the
+payload is app-local, wincode lives **in the app crate only**
+— `trinity-core` stays free of any encoding-format dep. If a
+future change forces the payload into `trinity-core` (e.g. to
+share with another crate), wincode follows it; the boundary
+move is the trigger, not preemptive placement.
 
 Add `.trinity/cache/` to `.trinity/.gitignore` (the
 committed-into-repo gitignore that ships with `trinity init`) so
@@ -301,6 +308,17 @@ After the split:
 - The runtime never writes a `LiveRepoState` (or any state with
   feedback attached) into the commit cache.
 
+**Single source of truth for chronological gate rebuilds.** The
+per-plan oldest-to-newest walk that `attach_live_feedback` does
+is the same walk a single `FeedbackWritten` event needs to
+perform when it lands on commit A and affects gates on later
+commits B, C, ... — cumulative participants propagate the same
+way. Both paths must call the same `rebuild_plan_gates(plan,
+feedback_index)` helper. Duplicating this logic is exactly how
+the cache path and the live daemon path will drift; the
+plan-required test #3 only catches the bulk-attach path, not
+the watcher path.
+
 ### API Boundary
 
 Most response code keeps consuming `&RepoState` via `Deref<Target=RepoState>`
@@ -321,15 +339,16 @@ Focused, not broad. Each test pins one invariant in the new
 model:
 
 1. `derive_base_state` is feedback-blind: same input
-   `CommitSnapshot` produces byte-identical (via bincode round-trip)
-   `BaseRepoState` regardless of what `.trinity/feedback/` holds.
+   `CommitSnapshot` produces byte-identical (via wincode
+   round-trip) `BaseRepoState` regardless of what
+   `.trinity/feedback/` holds.
 2. `attach_live_feedback` attaches a feedback file to the
    matching non-finished plan/commit and updates the gate state.
 3. **Cumulative participants survive the split.** Fixture: plan
    with reviewable commits A and B, feedback on A from reviewer
-   `alice`. After `attach_live_feedback`, gate B's
-   `missing_approvals` lists `alice`. This is the core invariant
-   the chronological per-plan walk protects.
+   `alice`. After `attach_live_feedback`, gate B's `missing`
+   field lists `alice`. This is the core invariant the
+   chronological per-plan walk protects.
 4. Editing a feedback file changes the resulting `LiveRepoState`
    without changing the bytes of the cached `BaseRepoState`.
 5. Live feedback targeting a commit in a finished plan does NOT
@@ -387,10 +406,13 @@ plan's Phase 1+2 were inseparable (Phase 1 couldn't claim
 
 ### Phase 2: Binary Round-Trip For Core Types
 
-Verify bincode round-trips `BaseRepoState` across the model's
-variants: plan-only, code-only, mixed, multi-plan, finalize. Add
-the round-trip tests; if a type needs explicit serde adjustment,
-do it here. No cache yet.
+Add `SchemaWrite` / `SchemaRead` derives to the rootless cache
+payload type and any of its constituent types that aren't yet
+covered. Verify wincode round-trips `BaseRepoState` across the
+model's variants: plan-only, code-only, mixed, multi-plan,
+finalize. Add the round-trip tests; if a type needs explicit
+schema adjustment, do it here. No cache write/read yet — just
+the encode/decode primitives.
 
 ### Phase 3: Cache Module
 
@@ -419,7 +441,7 @@ or a commit refold.
   mutable `.trinity/feedback/` files. Pinning unit test exists.
 - Live feedback is attached in an explicit post-fold stage
   (`attach_live_feedback`).
-- `BaseRepoState` round-trips through bincode without losing
+- `BaseRepoState` round-trips through wincode without losing
   typed core invariants (newtype identity, enum tags).
 - `.trinity/cache/repo-state/` stores base states keyed by HEAD
   and cache format version, with a magic+version header.
@@ -439,8 +461,8 @@ or a commit refold.
 - Cached payloads do not carry an absolute repo root that
   survives a directory move; `BaseRepoState.root` is always the
   current canonical root post-load.
-- `trinity-core` does not depend on bincode; encoding lives in
-  the app crate.
+- `trinity-core` does not depend on wincode; encoding lives in
+  the app crate alongside the rootless cache payload type.
 - Cache retention follows a logarithmic-thinning policy: a
   fresh window keeps every recent entry, and the gap between
   retained older entries roughly doubles with age.
