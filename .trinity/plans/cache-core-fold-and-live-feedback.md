@@ -259,9 +259,30 @@ invocation overwriting the other's cache file — both bodies are
 byte-identical at the same HEAD, so the rename race is safe. Do
 not add file locks.
 
-**Prune.** Intentionally simple. After a successful write, list
-the cache directory; if more than 16 entries exist, delete the
-oldest by mtime. No LRU database, no manifest file.
+**Prune — logarithmic thinning.** After a successful write,
+walk the cache directory and apply this policy by file mtime:
+
+1. **Fresh window**: keep every entry with `age < FRESH_HOURS`
+   (default 24h). No thinning here — operators working at HEAD
+   often have a handful of recent HEADs they ping back to (branch
+   tips, just-amended commits).
+
+2. **Thinned region** (`age >= FRESH_HOURS`): bucket each entry
+   by `floor(log2(age_hours))`. Keep only the newest entry in
+   each bucket; delete the rest.
+
+3. **Floor**: delete any entry with `bucket > MAX_BUCKET`
+   (default 16 → ~7.5 years).
+
+The doubling-gap property the user asked for emerges naturally:
+bucket N covers ages 2^N to 2^(N+1) hours, so the gap between
+retained caches roughly doubles as you go back. Steady-state
+total ≈ `FRESH_WINDOW_entries + MAX_BUCKET` (≈ a few dozen).
+
+No LRU database, no manifest file — `mtime` from the filesystem
+is the only source of truth. The whole prune is one directory
+listing plus a `HashSet<u32>` of "buckets seen". Concrete
+constants live in `state_cache.rs` so they're easy to tune.
 
 ### Runtime And Watcher
 
@@ -331,6 +352,13 @@ model:
     `rebuild_repo` at the same HEAD does not. This replaces a
     wall-clock perf assertion — wall-clock thresholds in CI are
     flaky and don't actually prove the cache was hit.
+11. **Logarithmic thinning retains coverage at all timescales.**
+    Fixture: write N synthetic cache files with `mtime`s
+    spanning hours-to-years (touch the files to backdate).
+    Run prune. Assert: every entry in the fresh window
+    survives; in the thinned region, each `log2(age_hours)`
+    bucket contains exactly one survivor; entries beyond
+    `MAX_BUCKET` are gone.
 
 Run:
 
@@ -413,3 +441,6 @@ or a commit refold.
   current canonical root post-load.
 - `trinity-core` does not depend on bincode; encoding lives in
   the app crate.
+- Cache retention follows a logarithmic-thinning policy: a
+  fresh window keeps every recent entry, and the gap between
+  retained older entries roughly doubles with age.
