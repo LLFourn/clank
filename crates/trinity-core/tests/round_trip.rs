@@ -624,11 +624,9 @@ fn plan_timeline_event_plan_only_round_trips() {
         sha: timeline_event_sha_fixture(),
         author_ts: 1_700_000_000,
         subject: "Plan revision".into(),
-        gate: commit_row_gate_fixture(),
     };
     let v = serde_json::to_value(&event).unwrap();
     assert_eq!(v["kind"], "plan_only");
-    assert!(v["gate"].is_object());
     let back: trinity_core::model::PlanTimelineEvent = serde_json::from_value(v).unwrap();
     assert_eq!(event, back);
 }
@@ -639,7 +637,6 @@ fn plan_timeline_event_code_only_round_trips() {
         sha: timeline_event_sha_fixture(),
         author_ts: 1_700_000_000,
         subject: "Implement foo".into(),
-        gate: commit_row_gate_fixture(),
     };
     let v = serde_json::to_value(&event).unwrap();
     assert_eq!(v["kind"], "code_only");
@@ -653,7 +650,6 @@ fn plan_timeline_event_mixed_round_trips() {
         sha: timeline_event_sha_fixture(),
         author_ts: 1_700_000_000,
         subject: "Plan + code change".into(),
-        gate: commit_row_gate_fixture(),
     };
     let v = serde_json::to_value(&event).unwrap();
     assert_eq!(v["kind"], "mixed");

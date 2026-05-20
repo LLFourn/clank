@@ -120,7 +120,7 @@ pub fn attach_live_feedback(
     }
 
     for (plan_key, blobs) in by_plan {
-        let Some(plan) = state.plans.get_mut(&plan_key) else {
+        let Some(plan) = state.plans.get(&plan_key) else {
             continue;
         };
         if plan.is_frozen() {
@@ -129,25 +129,35 @@ pub fn attach_live_feedback(
             continue;
         }
 
-        // Write each blob into the matching event's gate.feedback.
-        // Drop silently if the target SHA isn't on this plan's
-        // timeline (e.g. unattributed commit) or the event is not
-        // reviewable.
+        // Write each blob into the matching commit's gate.feedback.
+        // Phase 2 of commit-first-review-model: the gate lives on
+        // RepoState.commits[sha], indexed by SHA. Drop silently if
+        // the target SHA isn't a reviewable commit attributed to
+        // this plan.
         //
         // `max_feedback_ts` is only bumped after a successful
         // insert. A stale feedback file with a target SHA that no
-        // longer exists in this plan's timeline (deleted-then-readded
-        // stem, off-chain commit, etc.) must NOT make the plan look
-        // recently active.
+        // longer exists must NOT make the plan look recently active.
         let mut max_feedback_ts: i64 = 0;
         for fb in blobs {
-            let Some(event) = plan.event_for_mut(&fb.parsed.target_sha) else {
+            let target = fb.parsed.target_sha.clone();
+            let Some(node) = state.commits.get_mut(&target) else {
                 continue;
             };
-            if !event.kind().is_reviewable() {
+            // The commit's attribution must include this plan for the
+            // feedback to land — otherwise the path is malformed
+            // (e.g. typo, ad hoc commit's feedback being filed under
+            // a real plan key). Phase 4 routes ad hoc feedback via
+            // the `_` reserved key, not a plan key, so this gate is
+            // strict by design.
+            let belongs_to_plan = match &node.attribution {
+                CommitAttribution::Plan { plan } => plan == &plan_key,
+                _ => false,
+            };
+            if !belongs_to_plan {
                 continue;
             }
-            let Some(gate) = event.gate_mut() else {
+            let Some(gate) = node.gate.as_mut() else {
                 continue;
             };
             let verdict = parse_verdict(&fb.body);
@@ -165,8 +175,10 @@ pub fn attach_live_feedback(
             }
         }
 
-        rebuild_plan_gates(plan);
-        if max_feedback_ts > plan.last_activity_ts {
+        rebuild_plan_gates(&mut state, &plan_key);
+        if let Some(plan) = state.plans.get_mut(&plan_key)
+            && max_feedback_ts > plan.last_activity_ts
+        {
             plan.last_activity_ts = max_feedback_ts;
         }
     }
@@ -174,33 +186,47 @@ pub fn attach_live_feedback(
     LiveRepoState::new(state)
 }
 
-/// Rebuild every reviewable gate on `plan.timeline` from the
-/// feedback already stored in `gate.feedback`, walking
-/// oldest-to-newest with cumulative participants.
+/// Rebuild every reviewable gate that belongs to `plan_key`, walking
+/// chronologically with cumulative participants.
+///
+/// Phase 2 of `commit-first-review-model`: gates live on
+/// `RepoState.commits`, so this helper takes `&mut RepoState` and a
+/// plan key. The walk order is the plan's `timeline` (chronological
+/// SHA list); for each reviewable SHA, look up `state.commits[sha]`
+/// and recompose its gate from its accumulated feedback +
+/// cumulative-participant carry.
 ///
 /// **The single source of truth for live-feedback gate composition.**
-/// Called from both [`attach_live_feedback`] (bulk rebuild from
-/// disk) and the runtime's `upsert_feedback` / `remove_feedback`
-/// watcher path (incremental in-memory update). Duplicating the
-/// chronological-walk algorithm is exactly how the cache path and
-/// live daemon path would drift; keep one impl.
+/// Called from both [`attach_live_feedback`] (bulk rebuild from disk)
+/// and the runtime's `upsert_feedback` / `remove_feedback` watcher
+/// path (incremental in-memory update). Duplicating the chronological-
+/// walk algorithm is exactly how the cache path and live daemon path
+/// would drift; keep one impl.
 ///
 /// Frozen plans are no-ops.
-pub fn rebuild_plan_gates(plan: &mut Plan) {
+pub fn rebuild_plan_gates(state: &mut RepoState, plan_key: &PlanKey) {
+    let Some(plan) = state.plans.get(plan_key) else {
+        return;
+    };
     if plan.is_frozen() {
         return;
     }
+    let sha_seq: Vec<CommitSha> = plan
+        .timeline
+        .iter()
+        .filter(|e| e.is_reviewable())
+        .map(|e| e.sha().clone())
+        .collect();
     let mut participants: Vec<AgentLabel> = Vec::new();
-    for event in plan.timeline.iter_mut() {
-        if !event.kind().is_reviewable() {
+    for sha in &sha_seq {
+        let Some(node) = state.commits.get_mut(sha) else {
             continue;
-        }
-        let sha = event.sha().clone();
-        let commit_feedback = event.gate().map(|g| g.feedback.clone()).unwrap_or_default();
-        let gate = compose_gate(&sha, commit_feedback, &mut participants);
-        if let Some(g) = event.gate_mut() {
-            *g = gate;
-        }
+        };
+        let Some(gate) = node.gate.as_mut() else {
+            continue;
+        };
+        let commit_feedback = gate.feedback.clone();
+        *gate = compose_gate(sha, commit_feedback, &mut participants);
     }
 }
 
@@ -457,6 +483,11 @@ pub fn apply_commit(state: &mut RepoState, carry: &mut FoldCarry, event: &Commit
     // single-plan. `None` when the commit produced no reviewable per-plan
     // event.
     let mut single_plan_kind: Option<(PlanKey, CommitKind)> = None;
+    // The single-plan gate (Phase 2 of commit-first-review-model). When
+    // exactly one plan claims this commit as a reviewable event, the
+    // gate lands on `CommitNode.gate` indexed by SHA. MultiPlan / multi-
+    // touch commits leave this `None`.
+    let mut single_plan_gate: Option<CommitGate> = None;
 
     let plan_keys: Vec<PlanKey> = state.plans.keys().cloned().collect();
     for plan_key in &plan_keys {
@@ -510,24 +541,38 @@ pub fn apply_commit(state: &mut RepoState, carry: &mut FoldCarry, event: &Commit
         let sha = commit_sha.clone();
         let author_ts = event.author_ts;
         let subject = event.subject.clone();
+        // Phase 2 of commit-first-review-model: the gate lives on the
+        // RepoState.commits map, not on the timeline event. The per-
+        // plan timeline retains its chronological role as a SHA list
+        // filtered by attribution; gate lookups thread through
+        // `state.gate_for(sha)`. Carry the gate forward to step 6.
+        if let Some(g) = gate {
+            if single_plan_gate.is_some() {
+                // Belt-and-braces: a commit reaching this branch for >1
+                // plan would be the MultiPlan case from step 5, whose
+                // kind isn't reviewable — so `gate` should be None here.
+                // If we somehow have two gates, drop them rather than
+                // pretend the commit has one canonical gate.
+                single_plan_gate = None;
+            } else {
+                single_plan_gate = Some(g);
+            }
+        }
         let timeline_event = match kind {
             CommitKind::PlanOnly => PlanTimelineEvent::PlanOnly {
                 sha,
                 author_ts,
                 subject,
-                gate: gate.expect("PlanOnly is reviewable and always has a gate"),
             },
             CommitKind::CodeOnly => PlanTimelineEvent::CodeOnly {
                 sha,
                 author_ts,
                 subject,
-                gate: gate.expect("CodeOnly is reviewable and always has a gate"),
             },
             CommitKind::Mixed => PlanTimelineEvent::Mixed {
                 sha,
                 author_ts,
                 subject,
-                gate: gate.expect("Mixed is reviewable and always has a gate"),
             },
             CommitKind::MultiPlan => PlanTimelineEvent::MultiPlan {
                 sha,
@@ -568,7 +613,7 @@ pub fn apply_commit(state: &mut RepoState, carry: &mut FoldCarry, event: &Commit
         &plans_with_event,
         &plans_finalized_here,
         single_plan_kind.as_ref(),
-        state,
+        single_plan_gate,
     );
     state.commits.insert(commit_sha.clone(), commit_node);
 
@@ -597,7 +642,7 @@ fn build_commit_node(
     plans_with_event: &BTreeSet<PlanKey>,
     plans_finalized_here: &BTreeSet<PlanKey>,
     single_plan_kind: Option<&(PlanKey, CommitKind)>,
-    state: &RepoState,
+    single_plan_gate: Option<CommitGate>,
 ) -> CommitNode {
     let touched_plans: BTreeSet<PlanKey> = active_changes
         .plan_touches
@@ -625,19 +670,12 @@ fn build_commit_node(
     };
 
     let (kind, gate) = match &attribution {
-        CommitAttribution::Plan { plan } => {
-            // Mirror the single per-plan kind + gate so the shadow
-            // matches the live timeline.
+        CommitAttribution::Plan { .. } => {
             let kind = single_plan_kind
                 .as_ref()
                 .map(|(_, k)| *k)
                 .unwrap_or(CommitKind::Unattributed);
-            let gate = state
-                .plans
-                .get(plan)
-                .and_then(|p| p.event_for(commit_sha))
-                .and_then(|e| e.gate().cloned());
-            (kind, gate)
+            (kind, single_plan_gate)
         }
         CommitAttribution::MultiPlan { .. } => (CommitKind::MultiPlan, None),
         CommitAttribution::Finalize { .. } => (CommitKind::Finalize, None),
@@ -956,8 +994,7 @@ mod tests {
         let b_c2 = b.event_for(&c2).expect("b has c2");
         assert!(matches!(a_c2.kind(), CommitKind::MultiPlan));
         assert!(matches!(b_c2.kind(), CommitKind::MultiPlan));
-        assert!(a_c2.gate().is_none());
-        assert!(b_c2.gate().is_none());
+        assert!(state.gate_for(&c2).is_none());
         // c3 walks back to a (oldest single-plan-touch ancestor).
         let a_c3 = a.event_for(&sha("c3c3")).expect("a has c3");
         assert!(matches!(a_c3.kind(), CommitKind::CodeOnly));
@@ -1109,8 +1146,8 @@ mod tests {
             vec![feedback("foo", "c1c1", "alice", "APPROVE\n")],
         );
         let plan = &state.plans[&sess("foo")];
-        let event = plan.event_for(&sha("c1c1")).expect("event for c1");
-        let gate = event.gate().expect("gate for c1");
+        let _event = plan.event_for(&sha("c1c1")).expect("event for c1");
+        let gate = state.gate_for(&sha("c1c1")).expect("gate for c1");
         let entry = gate
             .feedback
             .get(&AgentLabel::parse("alice").unwrap())
@@ -1151,9 +1188,9 @@ mod tests {
                 (sha("c2c2"), CommitKind::Finalize),
             ]
         );
-        let finalize_event = plan.event_for(&sha("c2c2")).expect("c2 on timeline");
+        let _finalize_event = plan.event_for(&sha("c2c2")).expect("c2 on timeline");
         assert!(
-            finalize_event.gate().is_none(),
+            state.gate_for(&sha("c2c2")).is_none(),
             "Finalize must not carry a gate"
         );
         assert_eq!(
@@ -1206,7 +1243,7 @@ mod tests {
             c2.kind()
         );
         assert!(
-            c2.gate().is_none(),
+            state.gate_for(&sha("c2c2")).is_none(),
             "Finalize must not carry a gate even when bundled with code changes"
         );
         assert!(
@@ -1322,7 +1359,10 @@ mod tests {
             "expected PlanOnly, got {:?}",
             c3.kind()
         );
-        assert!(c3.gate().is_some(), "reviewable PlanOnly must have a gate");
+        assert!(
+            state.gate_for(&sha("c3c3")).is_some(),
+            "reviewable PlanOnly must have a gate"
+        );
     }
 
     #[test]
@@ -1369,7 +1409,7 @@ mod tests {
         let gate = plan
             .timeline
             .iter()
-            .find_map(|e| e.gate())
+            .find_map(|e| state.gate_for(e.sha()))
             .expect("foo's intro commit must carry a gate after fold");
         assert!(!gate.feedback.is_empty(), "gate should have feedback");
         for (key, value) in &gate.feedback {
@@ -1398,8 +1438,8 @@ mod tests {
         )]);
         let base = derive_base_state(PathBuf::from("/r"), snap.clone());
         let plan = &base.plans[&sess("foo")];
-        let intro = plan.event_for(&sha("c1c1")).expect("intro event");
-        let gate = intro.gate().expect("intro is reviewable");
+        let _intro = plan.event_for(&sha("c1c1")).expect("intro event");
+        let gate = base.gate_for(&sha("c1c1")).expect("intro is reviewable");
         assert_eq!(gate.state, CommitGateState::Unreviewed);
         assert!(gate.feedback.is_empty());
         assert!(gate.participants.is_empty());
@@ -1424,8 +1464,8 @@ mod tests {
         let state = derive_state_with_feedback(PathBuf::from("/r"), snap(history), fb);
         let plan = &state.plans[&sess("foo")];
 
-        let c2 = plan.event_for(&sha("c2c2")).expect("c2 event");
-        let gate_c2 = c2.gate().expect("c2 is reviewable");
+        let _c2 = plan.event_for(&sha("c2c2")).expect("c2 event");
+        let gate_c2 = state.gate_for(&sha("c2c2")).expect("c2 is reviewable");
         let alice = AgentLabel::parse("alice").unwrap();
         assert!(
             gate_c2.participants.contains(&alice),
@@ -1461,10 +1501,7 @@ mod tests {
         let plan = &state.plans[&sess("foo")];
 
         // Feedback must not appear in any gate.
-        let intro_gate = plan
-            .event_for(&sha("c1c1"))
-            .and_then(|e| e.gate())
-            .expect("intro gate");
+        let intro_gate = state.gate_for(&sha("c1c1")).expect("intro gate");
         assert!(
             intro_gate.feedback.is_empty(),
             "feedback for unknown target SHA must not attach",
@@ -1503,8 +1540,8 @@ mod tests {
         let state = derive_state_with_feedback(PathBuf::from("/r"), snap(history), fb);
         let plan = &state.plans[&sess("foo")];
         assert!(plan.is_frozen(), "plan should still be frozen");
-        let intro = plan.event_for(&sha("c1c1")).expect("intro event");
-        let gate = intro.gate().expect("intro is reviewable");
+        let _intro = plan.event_for(&sha("c1c1")).expect("intro event");
+        let gate = state.gate_for(&sha("c1c1")).expect("intro is reviewable");
         assert!(
             gate.feedback.is_empty(),
             "frozen plan should not absorb live feedback; got {:?}",

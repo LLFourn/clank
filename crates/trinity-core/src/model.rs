@@ -90,19 +90,16 @@ pub enum PlanTimelineEvent {
         sha: CommitSha,
         author_ts: i64,
         subject: String,
-        gate: CommitGate,
     },
     CodeOnly {
         sha: CommitSha,
         author_ts: i64,
         subject: String,
-        gate: CommitGate,
     },
     Mixed {
         sha: CommitSha,
         author_ts: i64,
         subject: String,
-        gate: CommitGate,
     },
     MultiPlan {
         sha: CommitSha,
@@ -159,24 +156,6 @@ impl PlanTimelineEvent {
 
     pub fn is_reviewable(&self) -> bool {
         self.kind().is_reviewable()
-    }
-
-    pub fn gate(&self) -> Option<&CommitGate> {
-        match self {
-            PlanTimelineEvent::PlanOnly { gate, .. }
-            | PlanTimelineEvent::CodeOnly { gate, .. }
-            | PlanTimelineEvent::Mixed { gate, .. } => Some(gate),
-            PlanTimelineEvent::MultiPlan { .. } | PlanTimelineEvent::Finalize { .. } => None,
-        }
-    }
-
-    pub fn gate_mut(&mut self) -> Option<&mut CommitGate> {
-        match self {
-            PlanTimelineEvent::PlanOnly { gate, .. }
-            | PlanTimelineEvent::CodeOnly { gate, .. }
-            | PlanTimelineEvent::Mixed { gate, .. } => Some(gate),
-            PlanTimelineEvent::MultiPlan { .. } | PlanTimelineEvent::Finalize { .. } => None,
-        }
     }
 }
 

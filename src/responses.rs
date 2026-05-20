@@ -148,7 +148,7 @@ fn build_plan_row(
     state: &RepoState,
 ) -> PlanRow {
     let plan_phase = current_posture(plan, state);
-    let gate = crate::projection::latest_reviewable_commit_gate_for(plan);
+    let gate = crate::projection::latest_reviewable_commit_gate_for(plan, state);
     let w = waiting_on(plan.is_frozen(), worktree_status, gate);
     let lifecycle = plan.lifecycle();
     PlanRow {
@@ -235,7 +235,7 @@ pub fn work_context_response_from_snapshot(
         .next()
         .expect("snapshot_session invariant: exactly one plan");
     let plan_phase = current_posture(plan, state);
-    let gate = crate::projection::latest_reviewable_commit_gate_for(plan);
+    let gate = crate::projection::latest_reviewable_commit_gate_for(plan, state);
     let w = waiting_on(plan.is_frozen(), worktree_status, gate);
     let plan_id = plan_id_string(&state.root, &plan.id).expect("active plan must have a plan_id");
     let review_target_sha = crate::projection::latest_reviewable_commit_for(plan);
@@ -243,8 +243,9 @@ pub fn work_context_response_from_snapshot(
         .as_ref()
         .and_then(|sha| plan.event_for(sha));
     let review_target_kind = review_target_event.map(|e| e.kind());
-    let current_reviews = review_target_event
-        .and_then(|e| e.gate())
+    let current_reviews = review_target_sha
+        .as_ref()
+        .and_then(|sha| state.gate_for(sha))
         .map(current_reviews_from_gate)
         .unwrap_or_default();
     let work = build_work_payload(WorkPayloadInputs {
@@ -394,7 +395,7 @@ pub fn plan_page_with_reader(
     let plan_phase = current_posture(plan, bundle);
     let plan_gate = plan_gate_for(plan, bundle);
     let impl_gate = impl_gate_for(plan, bundle);
-    let gate = crate::projection::latest_reviewable_commit_gate_for(plan);
+    let gate = crate::projection::latest_reviewable_commit_gate_for(plan, bundle);
     let w = waiting_on(plan.is_frozen(), worktree_status, gate);
     let review_target_phase = posture_to_review_target_phase(plan_phase);
 
@@ -419,7 +420,7 @@ pub fn plan_page_with_reader(
         commit_sha: sha.clone(),
     });
 
-    let timeline = build_timeline(plan);
+    let timeline = build_timeline(plan, bundle);
     let pr_hint = if matches!(plan_phase, Posture::Implementing) {
         Some(build_pr_hint(plan, &implementation_commits))
     } else {
@@ -427,7 +428,7 @@ pub fn plan_page_with_reader(
     };
 
     let plan_id = plan_id_string(&bundle.root, &plan.id);
-    let commits = build_commits_array(plan);
+    let commits = build_commits_array(plan, bundle);
     let latest_relevant_commit = review_target_sha
         .as_ref()
         .map(|sha| sha.as_str().to_string());
@@ -483,7 +484,7 @@ pub fn build_plan_revision_response(
         .and_then(|j| plan_revisions.get(j))
         .map(|c| c.as_str().to_string());
     let next_sha = plan_revisions.get(pos + 1).map(|c| c.as_str().to_string());
-    let feedback = feedback_for_target(plan, commit_sha);
+    let feedback = feedback_for_target(snapshot, commit_sha);
     trinity_core::api::PlanRevisionResponse {
         repo: snapshot.root.to_string_lossy().to_string(),
         plan_id: plan_id_str,
@@ -563,13 +564,13 @@ pub fn build_commit_detail_response(
             }
         }
         CommitKind::PlanOnly => CommitDetail::PlanOnly {
-            feedback: feedback_for_target(plan, commit_sha),
+            feedback: feedback_for_target(snapshot, commit_sha),
         },
         CommitKind::CodeOnly => CommitDetail::CodeOnly {
-            feedback: feedback_for_target(plan, commit_sha),
+            feedback: feedback_for_target(snapshot, commit_sha),
         },
         CommitKind::Mixed => CommitDetail::Mixed {
-            feedback: feedback_for_target(plan, commit_sha),
+            feedback: feedback_for_target(snapshot, commit_sha),
         },
         CommitKind::MultiPlan => CommitDetail::MultiPlan {},
         CommitKind::Unattributed => unreachable!(
@@ -654,10 +655,10 @@ fn posture_to_review_target_phase(p: Posture) -> ReviewTargetPhase {
 /// Per-commit `commits[]` array. Both MCP and HTTP get the same
 /// shape with full feedback bodies — the wire collapse plan moved
 /// MCP from a `{author, verdict}` summary to the full shape.
-fn build_commits_array(plan: &Plan) -> Vec<CommitRow> {
+fn build_commits_array(plan: &Plan, state: &RepoState) -> Vec<CommitRow> {
     let mut out = Vec::new();
     for event in &plan.timeline {
-        let Some(gate) = event.gate() else {
+        let Some(gate) = state.gate_for(event.sha()) else {
             continue;
         };
         let sha = event.sha().as_str().to_string();
@@ -686,7 +687,7 @@ fn build_commits_array(plan: &Plan) -> Vec<CommitRow> {
     out
 }
 
-fn build_timeline(plan: &Plan) -> Vec<TimelineEvent> {
+fn build_timeline(plan: &Plan, state: &RepoState) -> Vec<TimelineEvent> {
     let mut out = Vec::with_capacity(plan.timeline.len() * 2);
     for event in &plan.timeline {
         let sha = event.sha().as_str().to_string();
@@ -723,10 +724,10 @@ fn build_timeline(plan: &Plan) -> Vec<TimelineEvent> {
             CommitKind::Unattributed => continue,
         };
         out.push(row);
-        if let Some(gate) = event.gate() {
-            // `gate()` returns Some only for reviewable variants
-            // (PlanOnly, CodeOnly, Mixed) — the invariant is now
-            // structural.
+        if let Some(gate) = state.gate_for(event.sha()) {
+            // `gate_for(sha)` returns Some only for reviewable variants
+            // (PlanOnly, CodeOnly, Mixed) — the invariant is structural
+            // via CommitAttribution + Option<CommitGate> on CommitNode.
             let phase = match event.kind() {
                 CommitKind::PlanOnly | CommitKind::Mixed => ReviewTargetPhase::Plan,
                 CommitKind::CodeOnly => ReviewTargetPhase::Impl,
@@ -822,12 +823,9 @@ fn build_review_gate(
 /// the targeted `PlanTimelineEvent`'s gate. Used by the
 /// `/api/plan/.../revision/{sha}` and `/api/plan/.../commit/{sha}`
 /// route handlers.
-pub fn feedback_for_target(plan: &Plan, sha: &CommitSha) -> Vec<Feedback> {
-    let Some(event) = plan.event_for(sha) else {
-        return Vec::new();
-    };
-    let Some(gate) = event.gate() else {
-        return Vec::new();
-    };
-    gate.feedback.values().cloned().collect()
+pub fn feedback_for_target(state: &RepoState, sha: &CommitSha) -> Vec<Feedback> {
+    state
+        .gate_for(sha)
+        .map(|g| g.feedback.values().cloned().collect())
+        .unwrap_or_default()
 }

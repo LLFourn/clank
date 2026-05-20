@@ -291,8 +291,8 @@ mod tests {
 
         let state = rebuild_repo(dir.path()).await.unwrap();
         let session = &state.plans[&PlanKey::parse("foo").unwrap()];
-        let event = session.event_for(&intro).expect("event for intro");
-        let gate = event.gate().expect("gate for intro");
+        let _event = session.event_for(&intro).expect("event for intro");
+        let gate = state.gate_for(&intro).expect("gate for intro");
         let entries: Vec<_> = gate.feedback.values().collect();
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].verdict, crate::repo_state::Verdict::Approve);

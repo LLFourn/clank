@@ -83,10 +83,15 @@ pub fn waiting_on(
 }
 
 /// Latest reviewable commit's `CommitGate` for one plan. Reverse-scan
-/// over `plan.timeline`. Returns `None` when no reviewable commit
-/// exists yet.
-pub fn latest_reviewable_commit_gate_for(plan: &Plan) -> Option<&CommitGate> {
-    plan.latest_reviewable_event().and_then(|e| e.gate())
+/// over `plan.timeline` for the SHA; Phase 2 of
+/// `commit-first-review-model` puts the gate on `RepoState.commits`,
+/// so the lookup threads through `state.gate_for(sha)`.
+pub fn latest_reviewable_commit_gate_for<'a>(
+    plan: &Plan,
+    state: &'a crate::repo_state::RepoState,
+) -> Option<&'a CommitGate> {
+    let sha = plan.latest_reviewable_event()?.sha();
+    state.gate_for(sha)
 }
 
 /// Latest commit whose `CommitKind` is reviewable for this plan.
@@ -180,27 +185,31 @@ pub fn all_implementation_commits(
 /// commit exists. Used by the legacy plan/impl-tagged wire shape;
 /// the new shape uses `latest_reviewable_commit_gate_for` directly.
 pub fn plan_gate_for<'a>(
-    plan: &'a Plan,
-    _state: &crate::repo_state::RepoState,
+    plan: &Plan,
+    state: &'a crate::repo_state::RepoState,
 ) -> Option<&'a CommitGate> {
-    plan.timeline
+    let sha = plan
+        .timeline
         .iter()
         .rev()
-        .find(|e| matches!(e.kind(), CommitKind::PlanOnly | CommitKind::Mixed))
-        .and_then(|e| e.gate())
+        .find(|e| matches!(e.kind(), CommitKind::PlanOnly | CommitKind::Mixed))?
+        .sha();
+    state.gate_for(sha)
 }
 
 /// Implementation-side review gate: the latest reviewable code-bearing
 /// commit (`CodeOnly` or `Mixed`) attributed to this plan.
 pub fn impl_gate_for<'a>(
-    plan: &'a Plan,
-    _state: &crate::repo_state::RepoState,
+    plan: &Plan,
+    state: &'a crate::repo_state::RepoState,
 ) -> Option<&'a CommitGate> {
-    plan.timeline
+    let sha = plan
+        .timeline
         .iter()
         .rev()
-        .find(|e| matches!(e.kind(), CommitKind::CodeOnly | CommitKind::Mixed))
-        .and_then(|e| e.gate())
+        .find(|e| matches!(e.kind(), CommitKind::CodeOnly | CommitKind::Mixed))?
+        .sha();
+    state.gate_for(sha)
 }
 
 fn make(

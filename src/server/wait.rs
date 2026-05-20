@@ -335,25 +335,24 @@ async fn collect_stale_reviews(
     let candidates: Vec<(String, AgentLabel, trinity_core::Verdict, String)> = {
         let trinity_arc = runtime.state();
         let mut trinity = trinity_arc.lock().await;
-        let timeline_snapshot: Vec<_> = match trinity
-            .repos
-            .get(repo_root)
-            .and_then(|s| s.plans.get(plan_key))
-        {
-            Some(plan) => plan
-                .timeline
-                .iter()
-                .filter_map(|event| {
-                    let sha = event.sha().as_str().to_string();
-                    let gate = event.gate()?;
-                    let feedback: Vec<_> = gate
-                        .feedback
-                        .iter()
-                        .map(|(a, fb)| (a.clone(), fb.verdict))
-                        .collect();
-                    Some((sha, feedback))
-                })
-                .collect(),
+        let timeline_snapshot: Vec<_> = match trinity.repos.get(repo_root) {
+            Some(state) => match state.plans.get(plan_key) {
+                Some(plan) => plan
+                    .timeline
+                    .iter()
+                    .filter_map(|event| {
+                        let sha = event.sha();
+                        let gate = state.gate_for(sha)?;
+                        let feedback: Vec<_> = gate
+                            .feedback
+                            .iter()
+                            .map(|(a, fb)| (a.clone(), fb.verdict))
+                            .collect();
+                        Some((sha.as_str().to_string(), feedback))
+                    })
+                    .collect(),
+                None => return Vec::new(),
+            },
             None => return Vec::new(),
         };
         let current_target = current_target_sha.map(CommitSha::as_str);
@@ -514,7 +513,7 @@ fn collect_candidate(
     let review_target_kind = review_target
         .as_ref()
         .map(|sha| crate::projection::commit_kind_for(plan, sha));
-    let gate = crate::projection::latest_reviewable_commit_gate_for(plan).cloned();
+    let gate = crate::projection::latest_reviewable_commit_gate_for(plan, repo_state).cloned();
     Ok(Candidate {
         repo_root,
         plan_key: plan.id.clone(),

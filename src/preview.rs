@@ -69,10 +69,9 @@ pub async fn build_finish_preview(
     }
 
     let latest_reviewable_sha = crate::projection::latest_reviewable_commit_for(plan);
-    let latest_event = latest_reviewable_sha
+    let gate = latest_reviewable_sha
         .as_ref()
-        .and_then(|sha| plan.event_for(sha));
-    let gate = latest_event.and_then(|e| e.gate());
+        .and_then(|sha| state.gate_for(sha));
     let gate_state = gate.map(|g| g.state).unwrap_or(CommitGateState::Unreviewed);
     let is_finished = plan.is_frozen();
 

@@ -390,10 +390,10 @@ impl Runtime {
                 let Some(state) = trinity.repos.get_mut(repo_root) else {
                     return Err(RuntimeError::UnknownRepo(repo_root.to_path_buf()));
                 };
-                let Some(session) = state.plans.get_mut(&session_id) else {
+                if !state.plans.contains_key(&session_id) {
                     return Ok(());
-                };
-                upsert_feedback(session, abs_path, parsed, body);
+                }
+                upsert_feedback(state, abs_path, parsed, body);
                 refresh_commits_for(state, &session_id);
                 let Some(lifecycle) = state.plans.get(&session_id).map(|p| p.lifecycle()) else {
                     return Ok(());
@@ -418,10 +418,10 @@ impl Runtime {
                     return Err(RuntimeError::UnknownRepo(repo_root.to_path_buf()));
                 };
                 let session_id = parsed.plan_key.clone();
-                let Some(session) = state.plans.get_mut(&session_id) else {
+                if !state.plans.contains_key(&session_id) {
                     return Ok(());
-                };
-                remove_feedback(session, &parsed);
+                }
+                remove_feedback(state, &parsed);
                 refresh_commits_for(state, &session_id);
                 let Some(lifecycle) = state.plans.get(&session_id).map(|p| p.lifecycle()) else {
                     return Ok(());
@@ -475,32 +475,38 @@ impl Runtime {
 }
 
 fn upsert_feedback(
-    session: &mut Plan,
+    state: &mut crate::repo_state::RepoState,
     abs_path: PathBuf,
     parsed: crate::disk_format::FeedbackPath,
     body: String,
 ) {
     let verdict = crate::disk_format::parse_verdict(&body);
     let created_at = file_mtime_unix_secs(&abs_path);
-    let Some(event) = session.event_for_mut(&parsed.target_sha) else {
-        // Feedback targets a SHA that's not on this plan's timeline
-        // (target not yet seen by the fold, or unattributed/frozen).
-        // Drop silently; the next full rebuild will re-attribute.
+    let Some(node) = state.commits.get_mut(&parsed.target_sha) else {
+        // Feedback targets a SHA that's not in this repo's commit
+        // stream (target not yet seen by the fold, or commit outside
+        // this branch's first-parent history). Drop silently; the
+        // next full rebuild will re-attribute.
         return;
     };
-    if !event.kind().is_reviewable() {
-        // Non-reviewable events (Finalize / MultiPlan) never carry a
-        // gate. Live feedback targeting them is not actionable and
-        // must NOT synthesize gate state. Drop silently — the UI
-        // surfaces the snapshot for Finalize via .trinity/finished/
-        // at the freeze commit, not via the gate.
+    // Phase 2 of commit-first-review-model: the gate lives on the
+    // commit, not the per-plan timeline event. Verify the commit
+    // belongs to the plan named in the feedback path; otherwise
+    // we're being asked to write a plan's feedback to a different
+    // plan's (or ad hoc) commit — refuse rather than silently
+    // mis-attribute.
+    let belongs_to_plan = match &node.attribution {
+        crate::repo_state::CommitAttribution::Plan { plan } => plan == &parsed.plan_key,
+        _ => false,
+    };
+    if !belongs_to_plan {
         return;
     }
-    // Reviewable variants of PlanTimelineEvent structurally carry a
-    // gate; the is_reviewable() check above guarantees we're in one.
-    let gate = event
-        .gate_mut()
-        .expect("is_reviewable() implies a gate (structural)");
+    let Some(gate) = node.gate.as_mut() else {
+        // Non-reviewable variants (MultiPlan / Finalize / AdHoc
+        // pre-Phase-4) never carry a gate. Drop silently.
+        return;
+    };
     let feedback = Feedback {
         author: parsed.author.clone(),
         verdict,
@@ -511,10 +517,11 @@ fn upsert_feedback(
     gate.feedback.insert(feedback.author.clone(), feedback);
 }
 
-fn remove_feedback(session: &mut Plan, parsed: &crate::disk_format::FeedbackPath) {
-    if let Some(event) = session.event_for_mut(&parsed.target_sha)
-        && let Some(gate) = event.gate_mut()
-    {
+fn remove_feedback(
+    state: &mut crate::repo_state::RepoState,
+    parsed: &crate::disk_format::FeedbackPath,
+) {
+    if let Some(gate) = state.gate_for_mut(&parsed.target_sha) {
         gate.feedback.remove(&parsed.author);
     }
 }
@@ -527,10 +534,7 @@ fn remove_feedback(session: &mut Plan, parsed: &crate::disk_format::FeedbackPath
 /// algorithm is exactly how the cache path and live daemon path
 /// would drift.
 fn refresh_commits_for(state: &mut crate::repo_state::RepoState, plan_key: &PlanKey) {
-    let Some(plan) = state.plans.get_mut(plan_key) else {
-        return;
-    };
-    crate::disk_snapshot::rebuild_plan_gates(plan);
+    crate::disk_snapshot::rebuild_plan_gates(state, plan_key);
 }
 
 // Silence dead-code warnings on imports only used in specific branches.

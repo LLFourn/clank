@@ -102,6 +102,25 @@ impl RepoState {
         }
     }
 
+    /// Borrow the per-commit gate for `sha`, if the commit exists in
+    /// this state's commit map and is a reviewable variant whose gate
+    /// has been computed. Phase 2 of `commit-first-review-model`
+    /// shifts the gate's home from `PlanTimelineEvent` to
+    /// `CommitNode`; callers use this helper instead of the now-
+    /// removed `event.gate()` accessor.
+    pub fn gate_for(&self, sha: &CommitSha) -> Option<&crate::review_state::CommitGate> {
+        self.commits.get(sha).and_then(|n| n.gate.as_ref())
+    }
+
+    /// Mutable counterpart to [`gate_for`]. Used by the live-feedback
+    /// overlay and the watcher's incremental upsert/remove path.
+    pub fn gate_for_mut(
+        &mut self,
+        sha: &CommitSha,
+    ) -> Option<&mut crate::review_state::CommitGate> {
+        self.commits.get_mut(sha).and_then(|n| n.gate.as_mut())
+    }
+
     /// Stable digest over every meaningful field in the state. Two states
     /// with the same digest are observably identical to callers; equal
     /// digests across rebuilds mean nothing changed, so the runtime can
@@ -154,7 +173,7 @@ impl RepoState {
                 hasher.update(b":");
                 hasher.update(event.kind().as_str().as_bytes());
                 hasher.update(b":");
-                if let Some(gate) = event.gate() {
+                if let Some(gate) = self.gate_for(event.sha()) {
                     hasher.update(gate.state.as_str().as_bytes());
                     hasher.update(b":");
                     for (author, fb) in &gate.feedback {

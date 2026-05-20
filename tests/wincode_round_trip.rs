@@ -18,7 +18,7 @@ use trinity::git_io;
 use trinity::lifecycle::PlanKey;
 use trinity::repo_state::BaseRepoState;
 use trinity_core::ids::{AgentLabel, CommitSha, PlanKey as CorePlanKey};
-use trinity_core::model::Plan;
+use trinity_core::model::{CommitNode, Plan};
 use wincode::{SchemaRead, SchemaWrite};
 
 /// Mirror of the production cache payload defined in
@@ -31,8 +31,8 @@ use wincode::{SchemaRead, SchemaWrite};
 /// change in lockstep.
 #[derive(Debug, Clone, PartialEq, Eq, SchemaWrite, SchemaRead)]
 struct BaseStatePayloadFixture {
-    head: Option<CommitSha>,
     plans: BTreeMap<CorePlanKey, Plan>,
+    commits: BTreeMap<CommitSha, CommitNode>,
 }
 
 fn run_git(cwd: &Path, args: &[&str]) {
@@ -79,8 +79,8 @@ async fn build_base(repo: &Path) -> BaseRepoState {
 
 fn payload_from_base(base: &BaseRepoState) -> BaseStatePayloadFixture {
     BaseStatePayloadFixture {
-        head: base.head.clone(),
         plans: base.plans.clone(),
+        commits: base.commits.clone(),
     }
 }
 
@@ -173,7 +173,7 @@ async fn live_feedback_does_not_enter_base_payload() {
     let gate = plan
         .timeline
         .iter()
-        .find_map(|e| e.gate())
+        .find_map(|e| base.gate_for(e.sha()))
         .expect("intro is reviewable");
     assert!(
         gate.feedback.is_empty(),
