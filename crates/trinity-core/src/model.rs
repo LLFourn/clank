@@ -347,11 +347,17 @@ pub struct CommitNode {
 /// A `Vec` that cannot be empty. The only constructor returns
 /// `Err` for empty inputs. Used where the type's purpose demands
 /// at least one element (`ReviewPolicy::Blocking` participants).
+///
+/// Serde decoding goes through `TryFrom<Vec<T>>` so the invariant
+/// holds across the wire. Cache (wincode) encoding is
+/// **intentionally not derived**: wincode-derive bypasses the
+/// validating constructor by reading the private `inner` field
+/// directly. NonEmptyVec is only used by `ReviewPolicy`, which
+/// is a projection and never enters the cache, so the gap
+/// doesn't matter in practice. If a future change stores a
+/// `NonEmptyVec` in the cache, the cache loader must validate at
+/// the boundary (Phase 3's responsibility — codex on 0ec224d).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[cfg_attr(
-    feature = "cache-encoding",
-    derive(wincode::SchemaWrite, wincode::SchemaRead)
-)]
 #[serde(
     bound(
         serialize = "T: Clone + Serialize",
@@ -422,31 +428,21 @@ where
     }
 }
 
-/// Plan-file body + content hash that can never disagree. The
-/// only constructor computes the hash from the body text.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[cfg_attr(
-    feature = "cache-encoding",
-    derive(wincode::SchemaWrite, wincode::SchemaRead)
-)]
-pub struct PlanBody {
-    text: String,
-    hash: ContentHash,
-}
-
-impl PlanBody {
-    pub fn new(text: String) -> Self {
-        let hash =
-            ContentHash::from_hex_unchecked(blake3::hash(text.as_bytes()).to_hex().to_string());
-        Self { text, hash }
-    }
-    pub fn text(&self) -> &str {
-        &self.text
-    }
-    pub fn hash(&self) -> &ContentHash {
-        &self.hash
-    }
-}
+// PlanBody (text + hash newtype) was sketched in Phase 1 but
+// removed before landing. The hash field would have been
+// duplicate canonical state — serde/wincode derives can
+// reconstruct `PlanBody { text, hash }` without going through
+// the validating constructor, so the "text and hash never
+// disagree" invariant doesn't survive the decode path. Codex on
+// 0ec224d caught this.
+//
+// Resolution: drop the hash from canonical state entirely. The
+// new `Plan` (introduced in Phase 3) stores `body: String`.
+// Hash comparisons (worktree-vs-HEAD body checks) recompute the
+// hash on demand — the cost is microseconds on plan-size
+// markdown files, and git's commit/blob identity already
+// handles durable content identity. `blake3` is no longer a
+// `trinity-core` dependency.
 
 /// One reviewer's feedback body. The legacy `Feedback.author`
 /// field is removed here — the canonical
@@ -503,11 +499,18 @@ impl PlanTouchSummary {
 }
 
 /// Validated container: ≥2 touches naming ≥2 distinct plan keys.
+///
+/// Serde decoding goes through `TryFrom<Vec<PlanTouchSummary>>`
+/// so the invariant holds on the wire. Cache (wincode) encoding
+/// is **intentionally not derived** — wincode-derive would
+/// reconstruct `MultiPlanTouches { touches }` from raw bytes,
+/// bypassing `new()`. `MultiPlanCommit` (which contains this)
+/// therefore also can't be cache-derived, and so on up to
+/// `CommitBody`. Phase 3's cache integration is where this gets
+/// resolved (either custom validated wincode impls, or a
+/// flatter cache shape with validation at the loader boundary —
+/// codex on 0ec224d).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[cfg_attr(
-    feature = "cache-encoding",
-    derive(wincode::SchemaWrite, wincode::SchemaRead)
-)]
 #[serde(try_from = "Vec<PlanTouchSummary>", into = "Vec<PlanTouchSummary>")]
 pub struct MultiPlanTouches {
     touches: Vec<PlanTouchSummary>,
@@ -639,11 +642,11 @@ impl PlanCommit {
     }
 }
 
+/// Transitively excluded from `cache-encoding` because it
+/// contains `MultiPlanTouches` whose invariant isn't preserved
+/// by wincode-derive. See `MultiPlanTouches` doc; resolved in
+/// Phase 3 alongside the cache integration.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[cfg_attr(
-    feature = "cache-encoding",
-    derive(wincode::SchemaWrite, wincode::SchemaRead)
-)]
 pub struct MultiPlanCommit {
     pub touches: MultiPlanTouches,
     pub reviews: CommitReviews,
@@ -672,11 +675,11 @@ pub struct FinalizeCommit {
 /// Tagged enum of all commit-body shapes. The `scope`
 /// discriminator is distinct from the inner `kind` on
 /// `PlanCommit` to avoid the internally-tagged-enum collision.
+///
+/// Transitively excluded from `cache-encoding` via
+/// `MultiPlanCommit` → `MultiPlanTouches`. Resolved in Phase 3
+/// when the cache integration lands.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[cfg_attr(
-    feature = "cache-encoding",
-    derive(wincode::SchemaWrite, wincode::SchemaRead)
-)]
 #[serde(tag = "scope", rename_all = "snake_case")]
 pub enum CommitBody {
     Plan(PlanCommit),
@@ -796,15 +799,6 @@ mod phase1_invariant_tests {
     }
 
     #[test]
-    fn plan_body_hash_matches_text() {
-        let pb = PlanBody::new("# foo\n".to_string());
-        let pb2 = PlanBody::new("# foo\n".to_string());
-        assert_eq!(pb.hash(), pb2.hash());
-        let pb3 = PlanBody::new("# bar\n".to_string());
-        assert_ne!(pb.hash(), pb3.hash());
-    }
-
-    #[test]
     fn commit_body_associated_plans_plan_only() {
         let body = CommitBody::Plan(PlanCommit::PlanOnly {
             touch: touch("foo"),
@@ -852,5 +846,28 @@ mod phase1_invariant_tests {
         let plans = body.associated_plans();
         assert_eq!(plans.len(), 1);
         assert!(plans.contains(&plan("foo")));
+    }
+
+    /// Serde decoding of `NonEmptyVec` must go through the
+    /// validating `TryFrom<Vec<T>>` so wire-level invalid values
+    /// are rejected, not silently accepted.
+    #[test]
+    fn nonempty_vec_serde_rejects_empty_vec() {
+        let r: Result<NonEmptyVec<i32>, _> = serde_json::from_str("[]");
+        assert!(r.is_err());
+        let ok: NonEmptyVec<i32> = serde_json::from_str("[1, 2]").unwrap();
+        assert_eq!(ok.len(), 2);
+    }
+
+    /// Serde decoding of `MultiPlanTouches` must reject a single-plan
+    /// list at the wire boundary too.
+    #[test]
+    fn multi_plan_touches_serde_rejects_single_plan() {
+        let single = serde_json::to_string(&vec![touch("foo")]).unwrap();
+        let r: Result<MultiPlanTouches, _> = serde_json::from_str(&single);
+        assert!(r.is_err());
+        let dual = serde_json::to_string(&vec![touch("foo"), touch("bar")]).unwrap();
+        let ok: MultiPlanTouches = serde_json::from_str(&dual).unwrap();
+        assert_eq!(ok.plans().len(), 2);
     }
 }

@@ -16,11 +16,6 @@ cache-encoding = ["dep:wincode"]
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 wincode = { version = "0.5", features = ["derive"], optional = true }
-# Hash function used by `PlanBody::new` to enforce the
-# text↔hash invariant inside the canonical type. blake3 is
-# wasm-compatible and pure-computation, so it fits the crate's
-# "pure data, no framework / runtime" rule.
-blake3 = "1"
 
 [dev-dependencies]
 serde_json = "1"
