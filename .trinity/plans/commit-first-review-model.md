@@ -145,6 +145,72 @@ rejects it; `disk_format` parses `_` into a dedicated
 `FeedbackTarget::AdHoc { sha, author }` variant alongside the
 existing `FeedbackTarget::Plan { plan_key, sha, author }`.
 
+## Commit-title convention
+
+Repo-scoped wfw needs a clear signal for which commits belong
+to which plan. The model uses a commit-title prefix as a hint;
+attribution falls back to touched-file inference when the
+prefix is missing.
+
+### Prefix grammar
+
+- `[plan-name] subject` — hint that this commit belongs to
+  `plan-name`. Validated against existing plans in the repo.
+- `[plan-one,plan-two] subject` — explicit multi-plan list
+  for the (rare) commit that intentionally spans plans.
+- `[misc] subject` — explicit out-of-plan marker. Classifies
+  the commit as `AdHoc` even if it incidentally touches a
+  plan file (e.g. a docs typo fix).
+- `[<unknown>] subject` — name doesn't match any plan.
+  Classified as `AdHoc` by default, with a warning surfaced
+  on the next master wake ("commit `abc1234` titled
+  `[foo] …`; `foo` is not a known plan; treated as ad
+  hoc — amend or add `[misc]` to silence"). NOT a hard
+  model error.
+- No prefix → fall back to the existing file-based
+  attribution rules (touched plan files →
+  `Plan(_)` / `MultiPlan(_)`; otherwise `AdHoc`). Warn on
+  ambiguity (file-side and any prefix disagree).
+
+### Strict mode
+
+Config knob `review.require_commit_prefix` (bool, default
+`false`):
+
+- `false` (default) — convention is advisory. Missing or
+  unrecognized prefixes warn but never block.
+- `true` — convention is mandatory. A commit landing
+  without a valid `[plan-name]` / `[misc]` / `[plans-list]`
+  prefix gets a synthetic master work item:
+  `WorkAction::FixCommitTitle { sha, suggested_prefix }`.
+  The master is expected to `git commit --amend` (or
+  rebase) to add the prefix; reviewers do not wake on the
+  commit until the prefix lands. This is the only path
+  where strict mode blocks the workflow; the model never
+  rewrites history on the caller's behalf.
+
+### Attribution algorithm (final)
+
+For each commit during the fold:
+
+1. Parse the title for a `[...]` prefix.
+2. If prefix is `[misc]` → `AdHoc`.
+3. If prefix is `[name]` or `[name1,name2,…]` and every
+   name matches a known plan → `Plan(_)` / `MultiPlan(_)`.
+4. If prefix is `[name…]` with at least one unknown name
+   → `AdHoc` + warning attached to the commit's gate
+   (surfaced on next master wake; non-blocking).
+5. No prefix → file-touched attribution:
+   - touches exactly one plan file → `Plan(_)`
+   - touches >1 plan file → `MultiPlan(_)`
+   - touches no plan file → `AdHoc`
+6. Strict mode: any path through (4) or (5) instead emits
+   the synthetic `FixCommitTitle` master work item.
+
+The warning + the `FixCommitTitle` synthetic work item are
+the only NEW outputs this section adds; everything else is
+classification logic on inputs the fold already has.
+
 ## Config
 
 Two layers, deep-merged:
@@ -160,7 +226,8 @@ Schema (v1):
   "review": {
     "force_review_on_misc_commits": true,
     "force_review_on_plan_commits": true,
-    "ad_hoc_reviewers": null
+    "ad_hoc_reviewers": null,
+    "require_commit_prefix": false
   }
 }
 ```
@@ -175,6 +242,12 @@ Schema (v1):
 - `ad_hoc_reviewers` (`null` or `["alice", "bob"]`) — explicit
   reviewer set for ad hoc commits. `null` → derive from the
   branch's feedback authors (Q1).
+- `require_commit_prefix` (bool, default `false`) — when
+  `true`, commits without a valid `[plan]` / `[misc]` /
+  `[plans-list]` title prefix synthesize a master
+  `FixCommitTitle` work item instead of being classified.
+  Reviewers do not wake on those commits until the master
+  amends the title. See "Commit-title convention" above.
 
 `force_review_on_misc_commits=false` short-circuits ad hoc
 gates to `NoParticipants` regardless of config, so the
@@ -247,7 +320,22 @@ refactor can land in one chunk and the wire changes follow.
   `NoParticipants`-equivalent for master matching (reviewer
   wakes still fire; master just doesn't wait).
 
-### Phase 5 — `start_plan` lifts the start-of-plan restriction
+### Phase 5 — commit-title convention + strict mode
+
+- `attribution::classify` learns the title-prefix grammar.
+- Unknown plan names in a prefix → `AdHoc` + warning attached
+  to the gate. Surfaced on the next master wake; non-blocking.
+- New synthetic `WorkAction::FixCommitTitle { sha,
+  suggested_prefix }`. Emitted only under
+  `require_commit_prefix=true` for commits failing the
+  classification check. The matcher emits it ahead of any
+  per-plan review work so the master fixes the title first.
+- Tests: prefix parsing (single / multi / misc / unknown),
+  attribution priority (prefix > file inference), strict mode
+  emits `FixCommitTitle`, warnings ride along on non-strict
+  wakes.
+
+### Phase 6 — `start_plan` lifts the start-of-plan restriction
 
 - Today `start_plan` requires that the cwd-repo has no other
   active plan in the same basename, etc. With ad hoc commits
@@ -273,6 +361,20 @@ refactor can land in one chunk and the wire changes follow.
 - Integration: `force_review_on_misc_commits=false` →
   master is not blocked by an ad hoc commit with pending
   reviewers; reviewer wakes still fire.
+- Unit: title-prefix parsing for `[plan]`, `[plan-one,
+  plan-two]`, `[misc]`, `[<unknown>]`, no prefix. Each maps
+  to the documented attribution outcome.
+- Unit: prefix > file inference. A commit prefixed `[misc]`
+  that incidentally touches a plan file classifies as
+  `AdHoc`; a commit prefixed `[plan-a]` that touches only
+  unrelated files classifies as `Plan(plan-a)`.
+- Integration: an unknown-plan prefix produces an
+  `AdHoc`-classified gate AND a warning that rides along on
+  the next master wake.
+- Integration: `require_commit_prefix=true` causes a
+  prefix-less commit to surface as
+  `WorkAction::FixCommitTitle` for the master, and reviewers
+  do NOT wake on the commit until the title is amended.
 - Regression: every existing per-plan `wait_for_work` test
   continues to pass with `plan_id` supplied.
 
@@ -286,9 +388,14 @@ refactor can land in one chunk and the wire changes follow.
 - A commit touching no plan files appears in repo-scoped
   reviewer waits, with a feedback path under
   `.trinity/feedback/_/<sha>/<author>.md`.
-- Both config knobs are read from
+- All config knobs (`force_review_on_misc_commits`,
+  `force_review_on_plan_commits`, `ad_hoc_reviewers`,
+  `require_commit_prefix`) are read from
   `~/.trinity/config.json` + `<repo>/.trinity/config.json`
   with documented layering.
+- The title-prefix convention is honored: prefixes drive
+  attribution; unknown plans degrade to `AdHoc` with a
+  warning; strict mode emits `FixCommitTitle` master work.
 - Tests above all green.
 
 ## Out of scope
