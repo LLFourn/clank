@@ -626,6 +626,49 @@ async fn sse_pushes_repo_rebuilt_on_head_change() {
     );
 }
 
+/// Phase 6 of `commit-first-review-model`: start_plan must reject
+/// the reserved slug `_`. Otherwise a user could create
+/// `.trinity/plans/_.md` and shadow the ad-hoc feedback path
+/// segment, which `disk_format::parse_feedback_path` interprets as
+/// `FeedbackTarget::AdHoc`. The PlanKey::parse rejection (added in
+/// the Phase 4 followup) is the structural guard; this end-to-end
+/// test pins start_plan's plumbing to the same rule.
+#[tokio::test]
+async fn start_plan_rejects_reserved_ad_hoc_slug() {
+    let dir = init_repo();
+    let (url, handle) = spawn_daemon(dir.path()).await;
+    let client = reqwest::Client::new();
+    let req = json!({
+        "cwd": dir.path(),
+        "tool": "start_plan",
+        "arguments": { "slug": "_", "label": "test-agent" }
+    });
+    let resp = client
+        .post(format!("{}/internal/tool_call", url))
+        .json(&req)
+        .send()
+        .await
+        .unwrap();
+    let status = resp.status();
+    let body = resp.text().await.unwrap_or_default();
+    handle.abort();
+    // The dispatch must reject this slug — either via a 4xx HTTP
+    // status OR a JSON error envelope. Either way the body must
+    // mention "reserved" (the IdError::Reserved variant) or
+    // "invalid slug" (the MCP dispatcher's wrapper).
+    let body_lc = body.to_lowercase();
+    assert!(
+        status.is_client_error()
+            || body_lc.contains("reserved")
+            || body_lc.contains("invalid slug"),
+        "start_plan with slug `_` must reject; status={status}, body={body}"
+    );
+    assert!(
+        body_lc.contains("reserved") || body_lc.contains("invalid"),
+        "rejection must mention 'reserved' or 'invalid'; status={status}, body={body}"
+    );
+}
+
 #[tokio::test]
 async fn start_plan_persists_repo_to_registry() {
     let registry_parent = tempfile::tempdir().unwrap();
