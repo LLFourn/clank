@@ -1059,12 +1059,14 @@ async fn set_active_work_rejects_hidden_plan_with_typed_error() {
     );
 }
 
-/// `wait_for_work` is the ambiguity-prone surface in practice. Two
-/// active plans + a `set_active_work` selection → WFW resolves to
-/// the selected plan instead of returning `ambiguous_plan`. Without
-/// the selection, the same call raises ambiguous.
+/// Phase 3 of commit-first-review-model collapses the ambiguous-
+/// plan path: a `wait_for_work` call with an empty `plan_id` now
+/// fans out across active plans in the cwd-repo and returns work
+/// for the first one needing the caller's role. `set_active_work`
+/// still works for explicit single-plan callers but is no longer
+/// the disambiguation route for empty plan_id — repo-scope is.
 #[tokio::test]
-async fn set_active_work_routes_wait_for_work_through_selection() {
+async fn wfw_empty_plan_id_returns_repo_scope_work_not_ambiguous() {
     let dir = init_repo();
     write_file(dir.path(), ".trinity/plans/foo.md", "# foo\n");
     commit(dir.path(), "Add foo");
@@ -1074,42 +1076,10 @@ async fn set_active_work_routes_wait_for_work_through_selection() {
     let (url, handle) = spawn_daemon(dir.path()).await;
     let client = reqwest::Client::new();
 
-    // Baseline: WFW without plan_id is ambiguous.
-    let ambiguous: serde_json::Value = client
-        .post(format!("{}/internal/tool_call", url))
-        .json(&json!({
-            "cwd": dir.path(),
-            "tool": "wait_for_work",
-            "arguments": {
-                "role": "reviewers",
-                "author_label": "alice",
-                "timeout_secs": 1
-            }
-        }))
-        .send()
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
-    assert_eq!(ambiguous["result"]["error"], "ambiguous_plan");
-
-    // Set selection → WFW now resolves to foo and returns work for it.
-    client
-        .post(format!("{}/internal/tool_call", url))
-        .json(&json!({
-            "cwd": dir.path(),
-            "tool": "set_active_work",
-            "arguments": {
-                "plan_id": plan_id_for(&dir, "foo"),
-                "author_label": "alice"
-            }
-        }))
-        .send()
-        .await
-        .unwrap();
-
-    let resolved: serde_json::Value = client
+    // Empty plan_id with multiple active plans must NOT return
+    // ambiguous_plan; the repo-scope matcher picks the first plan
+    // needing the caller's role.
+    let resp: serde_json::Value = client
         .post(format!("{}/internal/tool_call", url))
         .json(&json!({
             "cwd": dir.path(),
@@ -1127,10 +1097,17 @@ async fn set_active_work_routes_wait_for_work_through_selection() {
         .await
         .unwrap();
     handle.abort();
-    assert_eq!(
-        resolved["result"]["plan_id"].as_str().unwrap(),
-        plan_id_for(&dir, "foo"),
-        "WFW should route to the selected plan; got: {resolved}"
+
+    assert!(
+        resp["result"]["error"].is_null(),
+        "repo-scope WFW must not error with ambiguous_plan; got: {resp}"
+    );
+    let plan_id = resp["result"]["plan_id"]
+        .as_str()
+        .expect("repo-scope WFW must return work payload with plan_id");
+    assert!(
+        plan_id == plan_id_for(&dir, "foo") || plan_id == plan_id_for(&dir, "bar"),
+        "expected work for one of foo/bar; got plan_id={plan_id}"
     );
 }
 

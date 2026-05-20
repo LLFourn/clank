@@ -5,10 +5,10 @@
 //! All consumers (MCP `work_context`, HTTP routes, SSE payload
 //! construction, `wait_for_work` matching) call into these functions.
 //!
-//! Everything here is O(1) or O(plan-local) on per-plan fields the
-//! fold (`disk_snapshot::apply_commit`) has already accumulated. No
-//! function in this module walks a global commit list or per-commit
-//! lookup map — `RepoState` doesn't carry those anymore.
+//! Each function takes `&Plan` + `&RepoState`: the plan's timeline
+//! supplies the chronological SHA list, and `RepoState::gate_for(sha)`
+//! returns the per-commit gate from the authoritative
+//! `RepoState.commits` map (Phase 2 of `commit-first-review-model`).
 
 use crate::lifecycle::ContentHash;
 use crate::repo_state::{

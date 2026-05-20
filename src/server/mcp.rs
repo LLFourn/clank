@@ -52,39 +52,61 @@ async fn wait_for_work(state: &AppState, req: &ToolCallRequest) -> Result<Value,
     let mut args: WaitArgs = serde_json::from_value(req.arguments.clone())
         .map_err(|e| ToolError::Invalid(format!("args: {e}")))?;
 
-    // Phase 2.9: plan_id is optional. `resolve_plan_id` normalizes
-    // blank → absent, so we can hand it whatever the caller sent
-    // (including `""`) without a pre-check here. NoActives →
-    // timeout-family shape `{timed_out: true, no_active_plans: true}`
-    // to match the long-poll vocabulary. Ambiguous → structured
-    // error.
-    match resolve_plan_id(
-        state,
-        Some(args.plan_id.as_str()),
-        args.repo.as_deref(),
-        args.author_label.as_deref(),
-        &req.cwd,
-    )
-    .await?
-    {
-        PlanIdResolution::Resolved(id) => {
-            args.plan_id = id.to_string();
-        }
-        PlanIdResolution::NoActives { repo } => {
-            let timeout =
-                trinity_core::api::WaitForWorkResponse::Timeout(trinity_core::api::WaitTimeout {
-                    timed_out: true,
-                    no_active_plans: true,
-                    repo: Some(repo.to_string_lossy().into_owned()),
+    if args.plan_id.trim().is_empty() {
+        // Phase 3 of commit-first-review-model: empty plan_id is a
+        // repo-scope wait. Resolve the repo once (from `args.repo` or
+        // the caller's cwd) and hand the matcher a single concept of
+        // optional plan_id. No `resolve_plan_id` / AmbiguousPlan path
+        // here — multi-plan repos are the normal shape; the matcher
+        // fans out and returns the first plan needing the caller's
+        // role. NoActives is now expressed by the matcher itself
+        // returning a timeout (no plans matched within the deadline).
+        let repo_root = match args.repo.as_deref() {
+            Some(s) if !s.trim().is_empty() => resolve_repo_filter(state, s, &req.cwd).await?,
+            _ => resolve_repo(&req.cwd).await?,
+        };
+        let basename = RepoBasename::from_repo_root(&repo_root).ok_or_else(|| {
+            ToolError::Invalid(format!(
+                "repo path has no usable basename: {}",
+                repo_root.display()
+            ))
+        })?;
+        args.repo = Some(basename.as_str().to_string());
+        args.plan_id = String::new();
+    } else {
+        // Explicit plan_id supplied. Use the legacy resolver so the
+        // shim's autofill / active-selection paths still work for
+        // single-plan callers. Repo-scope cannot reach this branch
+        // because we already swallowed the empty case above.
+        match resolve_plan_id(
+            state,
+            Some(args.plan_id.as_str()),
+            args.repo.as_deref(),
+            args.author_label.as_deref(),
+            &req.cwd,
+        )
+        .await?
+        {
+            PlanIdResolution::Resolved(id) => {
+                args.plan_id = id.to_string();
+            }
+            PlanIdResolution::NoActives { repo } => {
+                let timeout = trinity_core::api::WaitForWorkResponse::Timeout(
+                    trinity_core::api::WaitTimeout {
+                        timed_out: true,
+                        no_active_plans: true,
+                        repo: Some(repo.to_string_lossy().into_owned()),
+                    },
+                );
+                return serde_json::to_value(timeout)
+                    .map_err(|e| ToolError::Internal(anyhow::anyhow!(e)));
+            }
+            PlanIdResolution::Ambiguous { candidates } => {
+                return mcp_error(trinity_core::api::McpErrorPayload::AmbiguousPlan {
+                    message: "multiple active plans; pass plan_id explicitly".into(),
+                    candidates,
                 });
-            return serde_json::to_value(timeout)
-                .map_err(|e| ToolError::Internal(anyhow::anyhow!(e)));
-        }
-        PlanIdResolution::Ambiguous { candidates } => {
-            return mcp_error(trinity_core::api::McpErrorPayload::AmbiguousPlan {
-                message: "multiple active plans; pass plan_id explicitly".into(),
-                candidates,
-            });
+            }
         }
     }
 

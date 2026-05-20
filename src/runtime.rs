@@ -16,7 +16,7 @@ use crate::fs_watcher::FilesystemSignal;
 use crate::lifecycle::{PlanKey, content_hash};
 use crate::rebuild::{RebuildError, rebuild_repo};
 use crate::repo_state::RepoState;
-use crate::repo_state::{Feedback, LiveEvent, Plan, PlanEvent, RepoEvent, Trinity};
+use crate::repo_state::{Feedback, LiveEvent, PlanEvent, RepoEvent, Trinity};
 use trinity_core::api::{PlanEventPayload, RepoEventPayload};
 
 pub struct Runtime {
@@ -521,7 +521,24 @@ fn remove_feedback(
     state: &mut crate::repo_state::RepoState,
     parsed: &crate::disk_format::FeedbackPath,
 ) {
-    if let Some(gate) = state.gate_for_mut(&parsed.target_sha) {
+    let Some(node) = state.commits.get_mut(&parsed.target_sha) else {
+        return;
+    };
+    // Symmetric ownership check with upsert_feedback. A removed
+    // feedback file's path encodes which plan it belongs to; if that
+    // plan does not own the commit (or the commit is non-reviewable),
+    // the remove event is stale or malformed and must not touch the
+    // owning plan's gate. Without this guard a `FeedbackRemoved` for
+    // `.trinity/feedback/other-plan/<sha>/alice.md` could delete
+    // Alice's real feedback from a commit owned by `this-plan`.
+    let belongs_to_plan = match &node.attribution {
+        crate::repo_state::CommitAttribution::Plan { plan } => plan == &parsed.plan_key,
+        _ => false,
+    };
+    if !belongs_to_plan {
+        return;
+    }
+    if let Some(gate) = node.gate.as_mut() {
         gate.feedback.remove(&parsed.author);
     }
 }
@@ -582,6 +599,83 @@ mod tests {
     fn commit(repo: &Path, msg: &str) {
         run_git(repo, &["add", "-A"]);
         run_git(repo, &["commit", "--quiet", "-m", msg]);
+    }
+
+    /// Phase 2 carry-forward regression: `remove_feedback` must
+    /// validate ownership the same way `upsert_feedback` does. A
+    /// `FeedbackRemoved` event for a feedback path under one plan
+    /// (`other-plan/<sha>/alice.md`) must not delete Alice's feedback
+    /// from the same SHA when that SHA is attributed to a different
+    /// plan.
+    #[tokio::test]
+    async fn remove_feedback_respects_plan_ownership() {
+        use crate::disk_format::FeedbackPath;
+        use crate::repo_state::CommitAttribution;
+        use std::path::PathBuf;
+
+        // Build a state with one commit attributed to plan "foo" whose
+        // gate has Alice's feedback. We synthesize the state directly
+        // rather than driving notify_bridge: the test is about the
+        // remove_feedback function's ownership check, not the watcher
+        // wiring.
+        let mut state = crate::repo_state::RepoState::empty(PathBuf::from("/r"));
+        let sha = CommitSha::parse("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa").unwrap();
+        let alice = AgentLabel::parse("alice").unwrap();
+        let foo = PlanKey::parse("foo").unwrap();
+        let other = PlanKey::parse("other").unwrap();
+        let mut gate = crate::review_state::CommitGate {
+            state: crate::review_state::CommitGateState::Unreviewed,
+            participants: vec![alice.clone()],
+            approvers: vec![alice.clone()],
+            requesters: Vec::new(),
+            ambiguous: Vec::new(),
+            missing: Vec::new(),
+            feedback: Default::default(),
+        };
+        gate.feedback.insert(
+            alice.clone(),
+            crate::repo_state::Feedback {
+                author: alice.clone(),
+                verdict: crate::repo_state::Verdict::Approve,
+                body: "APPROVE".into(),
+                path: ".trinity/feedback/foo/aaa/alice.md".into(),
+                created_at: 0,
+            },
+        );
+        let node = crate::repo_state::CommitNode {
+            sha: sha.clone(),
+            author_ts: 0,
+            subject: "intro".into(),
+            kind: crate::repo_state::CommitKind::PlanOnly,
+            attribution: CommitAttribution::Plan { plan: foo.clone() },
+            plans: [foo.clone()].into_iter().collect(),
+            gate: Some(gate),
+        };
+        state.commits.insert(sha.clone(), node);
+
+        // Synthesize the malformed remove event: a FeedbackPath
+        // claiming the feedback file belongs to a DIFFERENT plan
+        // ("other") but targeting the same SHA + author.
+        let parsed = FeedbackPath {
+            plan_key: other.clone(),
+            target_sha: sha.clone(),
+            author: alice.clone(),
+            raw: PathBuf::from("other/aaa/alice.md"),
+        };
+        remove_feedback(&mut state, &parsed);
+
+        // Alice's feedback on foo's commit must still be present.
+        let preserved = state
+            .gate_for(&sha)
+            .expect("gate present")
+            .feedback
+            .contains_key(&alice);
+        assert!(
+            preserved,
+            "remove_feedback for plan `other` must not delete \
+             alice's feedback when the commit is attributed to \
+             plan `foo`"
+        );
     }
 
     #[tokio::test]

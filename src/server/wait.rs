@@ -544,27 +544,60 @@ fn collect_candidates_for_repo(
     trinity: &Trinity,
     repo_ref: &str,
 ) -> Result<Vec<Candidate>, WaitError> {
-    let basename = crate::lifecycle::RepoBasename::parse(repo_ref)
-        .map_err(|_| WaitError::UnknownRepo(repo_ref.to_string()))?;
-    let repo_root = trinity
-        .repo_basenames
-        .get(&basename)
-        .ok_or_else(|| WaitError::UnknownRepo(repo_ref.to_string()))?
-        .clone();
+    let (basename, repo_root) = resolve_repo_ref(trinity, repo_ref)?;
     let repo_state = trinity
         .repos
         .get(&repo_root)
         .ok_or_else(|| WaitError::UnknownRepo(repo_ref.to_string()))?;
     Ok(repo_state
         .plans
-        .keys()
-        .filter(|key| !repo_state.plan_conflicts.contains_key(*key))
-        .filter_map(|key| {
-            let plan = repo_state.plans.get(key)?;
+        .iter()
+        .filter(|(key, plan)| {
+            // Repo-scope "what next?" excludes terminal plans so a
+            // single SessionFinished result for a long-frozen plan
+            // doesn't starve real active work in the same repo. The
+            // explicit-plan path still lets callers see
+            // SessionFinished on a specific plan when they ask for it
+            // by id. Plan conflicts and uncommitted-deleted plans are
+            // skipped here for the same reason: they're never
+            // actionable repo-scope.
+            !repo_state.plan_conflicts.contains_key(*key) && !plan.is_frozen()
+        })
+        .map(|(key, plan)| {
             let plan_id = crate::lifecycle::PlanId::new(basename.clone(), key.clone());
-            Some(build_candidate(repo_root.clone(), plan_id, plan, repo_state))
+            build_candidate(repo_root.clone(), plan_id, plan, repo_state)
         })
         .collect())
+}
+
+/// Resolve a `repo` argument (basename `frostsnap` OR absolute path
+/// `/Users/llfourn/src/frostsnap`) into a `(RepoBasename, repo_root)`
+/// pair. Both spellings must map to the same underlying repo state;
+/// HTTP callers commonly use absolute paths, MCP callers basename.
+///
+/// The function intentionally tries basename FIRST (the more common
+/// form), then absolute-path canonicalization. An empty `repo_ref`
+/// or one that maps to no watched repo returns `UnknownRepo`.
+fn resolve_repo_ref(
+    trinity: &Trinity,
+    repo_ref: &str,
+) -> Result<(crate::lifecycle::RepoBasename, PathBuf), WaitError> {
+    if let Ok(basename) = crate::lifecycle::RepoBasename::parse(repo_ref) {
+        if let Some(root) = trinity.repo_basenames.get(&basename) {
+            return Ok((basename, root.clone()));
+        }
+    }
+    // Treat as absolute path.
+    let canonical = dunce::canonicalize(repo_ref).map_err(|_| {
+        // Path doesn't exist or isn't canonicalizable — treat as unknown.
+        WaitError::UnknownRepo(repo_ref.to_string())
+    })?;
+    if let Some(basename) = crate::lifecycle::RepoBasename::from_repo_root(&canonical) {
+        if trinity.repo_basenames.get(&basename) == Some(&canonical) {
+            return Ok((basename, canonical));
+        }
+    }
+    Err(WaitError::UnknownRepo(repo_ref.to_string()))
 }
 
 fn collect_candidate_by_plan(

@@ -204,11 +204,13 @@ pub struct Plan {
     /// `max(author_ts of attributed commits, mtime of feedback
     /// files)`. Powers the /api/plans sort order.
     pub last_activity_ts: i64,
-    /// Chronological per-commit log of this plan's life — the
-    /// single source of truth for plan revisions, implementation
-    /// commits, reviewable commits, per-commit gates, and per-
-    /// commit metadata. All projection queries are filters or
-    /// reverse-scans over this list — no parallel buckets.
+    /// Chronological per-commit log of this plan's life. Carries
+    /// the SHA + per-plan kind for each commit attributed to this
+    /// plan; the authoritative per-commit gate (Phase 2 of
+    /// `commit-first-review-model`) lives on
+    /// `RepoState.commits[sha].gate`. Use this list to enumerate the
+    /// plan's chronological commit history, then call
+    /// `RepoState::gate_for(sha)` for the gate.
     pub timeline: Vec<PlanTimelineEvent>,
     /// Per-cycle summaries derived from the fold's freeze events
     /// (one entry per freeze). Today the monotone rule means this

@@ -143,8 +143,10 @@ impl CommitKind {
         }
     }
 
-    /// Reviewable kinds carry a `CommitGate` on their timeline event.
-    /// `MultiPlan` / `Finalize` / `Unattributed` are excluded.
+    /// Reviewable kinds have a `Some(CommitGate)` on their
+    /// `CommitNode` in `RepoState.commits` (Phase 2 of
+    /// `commit-first-review-model`). `MultiPlan` / `Finalize` /
+    /// `Unattributed` are excluded.
     pub fn is_reviewable(self) -> bool {
         matches!(
             self,
