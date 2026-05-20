@@ -113,7 +113,7 @@ Algorithm:
 
 A test pins this: a fixture with feedback on commit A and a
 later reviewable commit B in the same plan must produce a gate
-on B whose `missing_approvals` includes A's reviewer. Patching
+on B whose `missing` field includes A's reviewer. Patching
 only B (without the chronological walk) would fail.
 
 Finished plans are sealed. Live feedback targeting commits in a
@@ -190,7 +190,7 @@ format_version: u32 (little-endian)
 trinity_version: u32 (little-endian)  -- bumped on incompatible
                                          changes to the model
 head_sha: 40 bytes ASCII
--- followed by the bincode body
+-- followed by the wincode body
 ```
 
 The header IS the validation check. Filename version is for
@@ -355,7 +355,7 @@ model:
    alter the finished-plan lifecycle or gate.
 6. `attach_live_feedback(load_from_cache(), feedback)` matches
    `attach_live_feedback(derive_base_state(snap), feedback)` for
-   active-plan projections — full bincode round-trip equivalence.
+   active-plan projections — full wincode round-trip equivalence.
 7. **Moved cache injects current root.** Build a cache at one
    path, copy the `.trinity/cache/` dir to a renamed/relocated
    repo, load. The resulting `BaseRepoState.root` reports the
@@ -456,7 +456,7 @@ or a commit refold.
   `LiveRepoState` derefs to `&RepoState` for read-only callers.
 - Cumulative-participant semantics survive the split: a
   reviewable commit gate lists earlier reviewers in
-  `missing_approvals` even when no feedback file targets that
+  `missing` even when no feedback file targets that
   later commit.
 - Cached payloads do not carry an absolute repo root that
   survives a directory move; `BaseRepoState.root` is always the
