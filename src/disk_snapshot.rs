@@ -21,7 +21,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 
-use crate::attribution::{CommitChanges, FinalizeChangeKind, classify, effective_session};
+use crate::attribution::{CommitChanges, FinalizeChangeKind, classify};
 use crate::disk_format::{FeedbackPath, finalize_first_line_starts_with_approve, parse_verdict};
 use crate::lifecycle::{AgentLabel, CommitSha, PlanKey, content_hash};
 use crate::disk_format::FeedbackTarget;
@@ -465,15 +465,18 @@ pub fn apply_commit(state: &mut RepoState, carry: &mut FoldCarry, event: &Commit
         event.changes.clone()
     };
     let attr = classify(&active_changes, carry.current_effective.as_ref());
-    carry.current_effective = effective_session(&active_changes, carry.current_effective.as_ref());
+    // current_effective is updated AFTER prefix-aware classification
+    // (later in step 5) so explicit `[misc]` / unknown-prefix → AdHoc
+    // doesn't seed an incidental file-touched plan as the active
+    // chain. Without this, today's raw effective_session would flip
+    // current_effective to a plan that the commit explicitly opted
+    // out of via prefix — codex on ad9c147.
 
     // Phase 5 of `commit-first-review-model`: parse the commit-
     // title prefix BEFORE per-plan timeline construction so the
     // prefix drives classification consistently. File-touch /
     // walk-back inference becomes the fallback when no prefix is
-    // present. A `[plan-x]` prefix that names a known plan
-    // overrides `current_effective` so descendants of this commit
-    // inherit plan-x's chain even if they're unprefixed code.
+    // present.
     let title_prefix = parse_title_prefix(&event.subject);
 
     // 2. Apply plan_touches: tree state + Plan create/delete.
@@ -629,15 +632,41 @@ pub fn apply_commit(state: &mut RepoState, carry: &mut FoldCarry, event: &Commit
         &known_plans,
     );
 
-    // If the prefix named a known plan that today's effective_session
-    // didn't track, propagate it forward so unprefixed descendants
-    // inherit the prefix-chosen chain.
-    if let CommitAttribution::Plan { plan } = &classification.attribution
-        && carry.current_effective.as_ref() != Some(plan)
-        && title_prefix.is_some()
-    {
-        carry.current_effective = Some(plan.clone());
-    }
+    // Drive `current_effective` from the effective classification.
+    // Phase 5 of `commit-first-review-model`: the prefix-aware
+    // result owns the walk-back chain, not the raw file-touch
+    // rule. This is what makes `[misc]` touching plan-bar NOT seed
+    // bar as the active plan for unprefixed descendants — codex on
+    // ad9c147.
+    //
+    // - `Plan(plan)` → seed plan as the active chain.
+    // - `MultiPlan(_)` → transparent; preserve parent's chain
+    //   (matches today's effective_session behavior for multi-touch).
+    // - `Finalize(_)` → transparent; finalize doesn't claim future
+    //   commits' attribution.
+    // - `AdHoc` → preserve parent's chain. An explicit `[misc]` (or
+    //   unknown prefix degrading to ad hoc) must not switch the
+    //   active plan via incidental file touches.
+    carry.current_effective = match &classification.attribution {
+        CommitAttribution::Plan { plan } => Some(plan.clone()),
+        CommitAttribution::MultiPlan { .. } | CommitAttribution::Finalize { .. } => {
+            carry.current_effective.clone()
+        }
+        CommitAttribution::AdHoc => {
+            // When the AdHoc came from an EXPLICIT prefix
+            // (`[misc]` or unknown), preserve the parent's chain
+            // verbatim — the operator opted out of plan
+            // attribution for this one commit and unprefixed
+            // descendants should inherit what was active before.
+            //
+            // When the AdHoc came from genuine no-context
+            // inference (no prefix, no touched plans, no parent
+            // effective), the walk-back chain stays empty —
+            // effective_session would return None too. Either
+            // way, preserve the parent's value.
+            carry.current_effective.clone()
+        }
+    };
 
     let mut plans_with_event: BTreeSet<PlanKey> = plans_finalized_here.clone();
     let mut single_plan_kind: Option<(PlanKey, CommitKind)> = None;
@@ -873,19 +902,30 @@ fn classify_effective(
     }
 
     // No prefix → fall through to today's file-touch /
-    // walk-back inference.
+    // walk-back inference. Phase 5 of `commit-first-review-model`:
+    // commits that infer a plan attribution without an explicit
+    // prefix get a missing-prefix warning so non-strict mode can
+    // surface "touches plan-a but no `[plan-a]` prefix; consider
+    // amending" to the master.
     let touched_plans: BTreeSet<PlanKey> = active_changes
         .plan_touches
         .iter()
         .map(|t| t.session.clone())
         .collect();
+    let missing_prefix_warning = |suggested: &str| {
+        format!(
+            "commit subject missing convention prefix; inferred attribution suggests `{suggested}` — amend the title to silence"
+        )
+    };
     if touched_plans.len() >= 2 {
+        let names: Vec<&str> = touched_plans.iter().map(|p| p.as_str()).collect();
+        let suggested = format!("[{}]", names.join(","));
         return EffectiveClassification {
             attribution: CommitAttribution::MultiPlan {
                 plans: touched_plans.clone(),
             },
             plans_in_scope: touched_plans,
-            warning: None,
+            warning: Some(missing_prefix_warning(&suggested)),
         };
     }
     // Single-plan freeze (and only freeze) → Finalize.
@@ -899,10 +939,11 @@ fn classify_effective(
     }
     if let AttributionResult::Attributed { session, .. } = attr {
         let plan = session.clone();
+        let suggested = format!("[{}]", plan.as_str());
         return EffectiveClassification {
             attribution: CommitAttribution::Plan { plan: plan.clone() },
             plans_in_scope: [plan].into_iter().collect(),
-            warning: None,
+            warning: Some(missing_prefix_warning(&suggested)),
         };
     }
     EffectiveClassification {

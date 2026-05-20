@@ -262,12 +262,18 @@ async fn compute_match(
         let candidates = collect_active_commit_candidates(&trinity, filter)?;
         // Phase 5: collect strict-mode prefix violations directly
         // from repo state (not from candidates) so commits without
-        // gates are still considered.
+        // gates are still considered. Plan-scoped WFW only sees
+        // violations on commits associated with that plan; repo-
+        // scoped WFW sees the full set. Codex on ad9c147.
         let prefix_violations: Vec<PrefixViolation> = if config.review.require_commit_prefix {
+            let plan_filter_key = match filter {
+                PlanFilter::Plan(plan_id) => Some(plan_id.key().clone()),
+                PlanFilter::RepoScope(_) => None,
+            };
             repo_root
                 .as_ref()
                 .and_then(|root| trinity.repos.get(root))
-                .map(collect_prefix_violations)
+                .map(|state| collect_prefix_violations(state, plan_filter_key.as_ref()))
                 .unwrap_or_default()
         } else {
             Vec::new()
@@ -311,12 +317,22 @@ struct PrefixViolation {
     suggested_prefix: Option<String>,
 }
 
-fn collect_prefix_violations(state: &crate::repo_state::RepoState) -> Vec<PrefixViolation> {
+fn collect_prefix_violations(
+    state: &crate::repo_state::RepoState,
+    plan_filter: Option<&PlanKey>,
+) -> Vec<PrefixViolation> {
     let mut out = Vec::new();
     for sha in &state.commit_order {
         let Some(node) = state.commits.get(sha) else {
             continue;
         };
+        // Plan-scoped WFW only surfaces violations on commits
+        // associated with that plan. Repo-scope sees everything.
+        if let Some(key) = plan_filter
+            && !node.plans.contains(key)
+        {
+            continue;
+        }
         // Finalize commits aren't subject to the convention —
         // their subject is a freeze marker, not a content commit.
         if matches!(node.kind, crate::repo_state::CommitKind::Finalize) {
@@ -1905,6 +1921,174 @@ mod integration_tests {
         assert!(
             matches!(resp, WaitResponse::Timeout(_)),
             "reviewer must not wake while FixCommitTitle is outstanding; got {resp:?}"
+        );
+    }
+
+    /// Phase 5 regression for codex on ad9c147: explicit `[misc]`
+    /// must not seed the active plan via incidental plan-file
+    /// touches. Sequence: A intros `foo`, B is `[misc]` touching
+    /// `bar`'s plan file, C is unprefixed code. C must inherit
+    /// `foo` (from before B), NOT `bar`.
+    #[tokio::test]
+    async fn misc_prefix_does_not_seed_active_plan_via_file_touch() {
+        let dir = init_repo();
+        // A: intro foo (sets active_effective = foo).
+        write_file(dir.path(), ".trinity/plans/foo.md", "# foo\n");
+        run_git(dir.path(), &["add", "-A"]);
+        run_git(dir.path(), &["commit", "--quiet", "-m", "[foo] intro"]);
+        // B: touches bar's plan file but prefixed [misc].
+        // Despite the touch, bar should not become the active
+        // chain — the operator opted out via the prefix.
+        write_file(dir.path(), ".trinity/plans/bar.md", "# bar\n");
+        run_git(dir.path(), &["add", "-A"]);
+        run_git(
+            dir.path(),
+            &["commit", "--quiet", "-m", "[misc] add bar plan"],
+        );
+        // C: unprefixed code. Must inherit foo (the chain
+        // active BEFORE B), not bar.
+        write_file(dir.path(), "src.rs", "fn main() {}\n");
+        run_git(dir.path(), &["add", "-A"]);
+        run_git(dir.path(), &["commit", "--quiet", "-m", "more code"]);
+
+        let rt = Runtime::new();
+        rt.add_repo(dir.path().to_path_buf()).await.unwrap();
+        let attribution = rt
+            .read_repo(dir.path(), |s| {
+                let head = s.head.as_ref().unwrap().clone();
+                s.commits[&head].attribution.clone()
+            })
+            .await
+            .unwrap();
+        match attribution {
+            crate::repo_state::CommitAttribution::Plan { plan } => {
+                assert_eq!(
+                    plan.as_str(),
+                    "foo",
+                    "unprefixed code commit after [misc] must inherit foo, not bar"
+                );
+            }
+            other => panic!("expected Plan(foo); got {other:?}"),
+        }
+    }
+
+    /// Phase 5 regression for codex on ad9c147: plan-scoped WFW
+    /// must not surface FixCommitTitle for commits associated with
+    /// a different plan. Strict mode + caller passes plan_id=foo +
+    /// unprefixed commit on plan `bar` → master WFW for foo must
+    /// timeout (or return foo-scoped work), not a bar
+    /// FixCommitTitle.
+    #[tokio::test]
+    async fn strict_mode_plan_scoped_ignores_other_plans_violations() {
+        let dir = init_repo();
+        write_file(
+            dir.path(),
+            ".trinity/config.json",
+            r#"{"review": {"require_commit_prefix": true}}"#,
+        );
+        // Plan foo introduced with a proper prefix → no violation.
+        write_file(dir.path(), ".trinity/plans/foo.md", "# foo\n");
+        run_git(dir.path(), &["add", "-A"]);
+        run_git(dir.path(), &["commit", "--quiet", "-m", "[foo] intro"]);
+        // Plan bar introduced without a prefix → violation on bar.
+        write_file(dir.path(), ".trinity/plans/bar.md", "# bar\n");
+        run_git(dir.path(), &["add", "-A"]);
+        run_git(dir.path(), &["commit", "--quiet", "-m", "intro bar"]);
+        let rt = Runtime::new();
+        rt.add_repo(dir.path().to_path_buf()).await.unwrap();
+
+        // Plan-scoped WFW for foo: no foo violation exists, so
+        // master should not get a FixCommitTitle for bar.
+        let basename = dir
+            .path()
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap()
+            .to_string();
+        let resp = wait_for_work(
+            &rt,
+            WaitArgs {
+                role: WaitingRole::Master,
+                plan_id: Some(format!("{basename}/foo.md")),
+                repo: None,
+                author_label: Some("lloyd".to_string()),
+                timeout_secs: Some(1),
+            },
+        )
+        .await
+        .unwrap();
+        if let WaitResponse::Work(p) = resp {
+            use trinity_core::api::ExpectedAction;
+            if let ExpectedAction::FixCommitTitle { target_sha, .. } = &p.work.action {
+                // If a FixCommitTitle DOES come back, it must be
+                // for a foo commit (the only foo commit is the
+                // properly-prefixed `[foo] intro`, which has no
+                // violation — so no FixCommitTitle is the only
+                // valid outcome here).
+                panic!(
+                    "plan-scoped foo WFW returned FixCommitTitle, presumably for bar: target_sha={target_sha}"
+                );
+            }
+        }
+        // Either Timeout or some foo-scoped work — both fine for
+        // this regression. The point is: NO bar FixCommitTitle.
+    }
+
+    /// Phase 5 regression for codex on ad9c147: non-strict
+    /// missing-prefix warnings ride along on master wakes.
+    /// Sequence: properly-prefixed `[foo] intro`, then an
+    /// unprefixed code commit (attributes to foo via walk-back),
+    /// then dirty foo's plan file to drive a master
+    /// CommitPlanRevision wake. The wake must include an
+    /// `attribution_warning` for the unprefixed commit.
+    #[tokio::test]
+    async fn missing_prefix_warning_rides_along_on_master_wake() {
+        let dir = init_repo();
+        write_file(dir.path(), ".trinity/plans/foo.md", "# foo v1\n");
+        run_git(dir.path(), &["add", "-A"]);
+        run_git(dir.path(), &["commit", "--quiet", "-m", "[foo] intro"]);
+        // Unprefixed code commit — should attribute to foo via
+        // walk-back AND get a missing-prefix warning.
+        write_file(dir.path(), "src.rs", "fn main() {}\n");
+        run_git(dir.path(), &["add", "-A"]);
+        run_git(
+            dir.path(),
+            &["commit", "--quiet", "-m", "implement main"],
+        );
+        // Dirty the plan file to drive a master CommitPlanRevision wake.
+        write_file(dir.path(), ".trinity/plans/foo.md", "# foo v2\n");
+        let rt = Runtime::new();
+        rt.add_repo(dir.path().to_path_buf()).await.unwrap();
+
+        let basename = dir
+            .path()
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap()
+            .to_string();
+        let resp = wait_for_work(
+            &rt,
+            WaitArgs {
+                role: WaitingRole::Master,
+                plan_id: None,
+                repo: Some(basename),
+                author_label: Some("lloyd".to_string()),
+                timeout_secs: Some(1),
+            },
+        )
+        .await
+        .unwrap();
+        let payload = match resp {
+            WaitResponse::Work(p) => p,
+            WaitResponse::Timeout(_) => panic!("expected master wake, got timeout"),
+        };
+        assert!(
+            payload
+                .attribution_warnings
+                .iter()
+                .any(|w| w.message.contains("missing convention prefix")),
+            "missing-prefix warning must ride along on master wake; got {:?}",
+            payload.attribution_warnings
         );
     }
 
