@@ -281,9 +281,14 @@ This eliminates:
 
 ### Multi-Plan Commits
 
+The structural invariant for "multi-plan" is "touches at least
+two DISTINCT plans" — not "non-empty list of touches." Encode
+that in the type via a `MultiPlanTouches` wrapper whose only
+constructor validates the invariant:
+
 ```rust
 pub struct MultiPlanCommit {
-    pub touches: Vec<PlanTouchSummary>,   // canonical
+    pub touches: MultiPlanTouches,   // canonical, validated
     /// Late feedback files written against a multi-plan commit
     /// are preserved (the file IS truth); the policy projection
     /// returns `NonBlocking { StructurallyNonReviewable }` for
@@ -291,17 +296,43 @@ pub struct MultiPlanCommit {
     pub reviews: CommitReviews,
 }
 
-impl MultiPlanCommit {
-    /// Projection of the touched plans. No stored sidecar set.
+/// Validated container: holds ≥2 touches naming ≥2 distinct
+/// plan keys. The only constructor enforces both invariants;
+/// there's no way to mutate it into an invalid state.
+pub struct MultiPlanTouches {
+    touches: Vec<PlanTouchSummary>,
+}
+
+impl MultiPlanTouches {
+    pub fn new(touches: Vec<PlanTouchSummary>)
+        -> Result<Self, MultiPlanTouchesError>
+    {
+        let distinct: BTreeSet<&PlanKey> =
+            touches.iter().map(|t| t.plan()).collect();
+        if distinct.len() < 2 {
+            return Err(MultiPlanTouchesError::NotMultiPlan);
+        }
+        Ok(Self { touches })
+    }
+    pub fn as_slice(&self) -> &[PlanTouchSummary] { &self.touches }
     pub fn plans(&self) -> BTreeSet<&PlanKey> {
         self.touches.iter().map(|t| t.plan()).collect()
     }
 }
+
+impl MultiPlanCommit {
+    /// Sugar over `touches.plans()`. No stored sidecar set.
+    pub fn plans(&self) -> BTreeSet<&PlanKey> { self.touches.plans() }
+}
 ```
 
 No `plans` set field — `touches` is the canonical fact; the
-plan-set is a projection. No `policy` field — the variant encodes
-non-reviewability structurally.
+plan-set is a projection. No `policy` field — the variant
+encodes non-reviewability structurally. The classifier
+constructs `MultiPlanTouches::new(...)` and falls back to
+`PlanCommit`/`AdHocCommit`/`FinalizeCommit` if the result would
+have fewer than 2 distinct plans — making "MultiPlan with one
+plan" unrepresentable.
 
 ### Ad Hoc Commits
 
@@ -756,12 +787,20 @@ the consumer migrations don't survive intermediate states.
   - constructing `PlanCommit::PlanOnly` without a touch.
   - constructing `PlanCommit::CodeOnly` with a touch (the
     variant has no `touch` field).
-  - constructing `MultiPlanCommit` from an empty touches list
-    (use `NonEmptyVec`).
+  - constructing `MultiPlanCommit` without going through
+    `MultiPlanTouches::new(...)` (the field is private; no
+    direct-field-init bypass).
   - constructing `ReviewPolicy::Blocking` with empty
     participants (use `NonEmptyVec`).
   - creating a `PlanBody` whose hash doesn't match the text
     (the only constructor computes the hash).
+- **Runtime invariants** verified by unit tests:
+  - `MultiPlanTouches::new(vec![single_touch])` returns
+    `Err(NotMultiPlan)` — one-plan "multi-plan" is rejected.
+  - `MultiPlanTouches::new(vec![t_a, t_a_again])` returns
+    `Err(NotMultiPlan)` — two touches naming the same plan is
+    rejected.
+  - `MultiPlanTouches::new(vec![t_a, t_b])` succeeds.
 - Fixture builders: `CommitFixture::plan_only(touch).reviews(...)`
   — no public construction path that bypasses variant
   requirements.
@@ -836,19 +875,25 @@ silently regress.
 - `CommitNode` stores `meta` + `body`. No `kind`, no
   `attribution`, no `plans`, no `gate`, no `attribution_warning`
   field. Warnings are on `meta.warnings` (typed enum).
-- Reviewability is encoded by *variant existence* in
-  `PlanCommit` and `AdHocCommit`. `MultiPlanCommit` and
-  `FinalizeCommit` exist as variants but their policy
-  projection returns `NonBlocking { StructurallyNonReviewable }`.
+- Review storage is universal: every commit variant carries
+  `CommitReviews`. Whether a commit blocks master is determined
+  by `node.review_policy(&config, &state)`, NOT by whether the
+  variant has a `gate` field. `MultiPlanCommit` and
+  `FinalizeCommit` exist but their policy projection returns
+  `NonBlocking { StructurallyNonReviewable }`.
 - Policy is a projection method `node.review_policy(&config,
   &state)`, NOT a stored field. Config snapshotted at trinity
   startup; restart re-folds.
 - `ReviewReadiness` is the derived projection type that replaces
   the old `CommitGate` sidecar. No canonical `CommitGate` field
   on any struct.
-- Feedback files attach unconditionally to
-  `commit.reviews.feedback`. Variant decides policy; never
-  rejects attachment.
+- Feedback files attach when the SHA exists AND the feedback
+  path's target scope matches the commit's variant/plan. After
+  attachment, the policy projection decides whether that
+  feedback affects readiness; "non-blocking" or "structurally
+  non-reviewable" is never a reason to hide or drop well-
+  targeted feedback. Path/scope mismatches are dropped (the
+  path encodes the wrong commit).
 - WFW, response projection, feedback attachment, and lifecycle
   derivation all read through `CommitBody` variants and
   `node.review_policy(...)` / `node.readiness(...)`.
