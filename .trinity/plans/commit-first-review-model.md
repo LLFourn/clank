@@ -149,8 +149,11 @@ existing `FeedbackTarget::Plan { plan_key, sha, author }`.
 
 Repo-scoped wfw needs a clear signal for which commits belong
 to which plan. The model uses a commit-title prefix as a hint;
-attribution falls back to touched-file inference when the
-prefix is missing.
+when the prefix is missing, attribution falls back through
+touched plan files, then unambiguous active/last-touched plan
+context, and only classifies the commit as `AdHoc` when no
+plan context can be inferred. See "Attribution algorithm
+(final)" below for the full order.
 
 ### Prefix grammar
 
@@ -167,10 +170,12 @@ prefix is missing.
   `[foo] …`; `foo` is not a known plan; treated as ad
   hoc — amend or add `[misc]` to silence"). NOT a hard
   model error.
-- No prefix → fall back to the existing file-based
-  attribution rules (touched plan files →
-  `Plan(_)` / `MultiPlan(_)`; otherwise `AdHoc`). Warn on
-  ambiguity (file-side and any prefix disagree).
+- No prefix → fall back through the ordered no-prefix
+  chain documented in "Attribution algorithm (final)":
+  touched plan files first, then unambiguous
+  active/last-touched plan context, then `AdHoc` only when
+  no plan context can be inferred. Warn on ambiguity
+  (file-side and any prefix disagree).
 
 ### Strict mode
 
@@ -384,8 +389,10 @@ refactor can land in one chunk and the wire changes follow.
 ## Tests
 
 - Unit: `attribution::classify` returns `AdHoc` for a
-  no-plan-touching commit; participant derivation pulls from
-  branch feedback history.
+  no-plan-touching commit ONLY when there is no
+  unambiguous active/last-touched plan context to fall back
+  on (the genuine ad-hoc case); participant derivation
+  pulls from branch feedback history.
 - Unit: matcher repo-scope returns the chronologically
   earliest reviewable commit needing the caller's role.
 - Unit: matcher per-plan-scope returns only commits whose
