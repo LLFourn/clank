@@ -386,8 +386,16 @@ must not rebuild a second persistent model with different facts.
   reviewable variants.
 - Bump `state_cache::CACHE_FORMAT_VERSION` so the on-disk
   `BaseStatePayload` schema change invalidates older caches.
-  `Plan.timeline` is still present in the v3 payload; Phase 4
+  `Plan.timeline` is still present in the v4 payload; Phase 4
   bumps again when that field disappears.
+- Cache-read error semantics: any `try_load` error (bad magic,
+  format-version mismatch, trinity-generation mismatch,
+  head mismatch, decode failure) must delete the offending file
+  before falling back to a full fold. Today the fallback is
+  silent but the stale file rots in the cache dir; bake the
+  delete-on-error rule into the loader so the cache is
+  self-cleaning. Cache thinning is best-effort housekeeping,
+  not correctness — every error path must clean up after itself.
 
 ### Phase 4 — Remove Canonical `Plan.timeline`
 
