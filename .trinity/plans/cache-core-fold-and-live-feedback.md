@@ -239,6 +239,33 @@ operators don't accidentally commit cache binaries. Existing
 repos that don't have this line get it via a one-line addition;
 no migration path needed for a directory that doesn't exist yet.
 
+### CLI Escape Hatch (`--no-cache`)
+
+`trinity status` (and the other local CLI rebuilds in Phase 4)
+take a `--no-cache` flag. With the flag set:
+
+- the cache file is not consulted on read
+- the cache file is not written on miss
+- everything else (live feedback attach, projection) is identical
+
+This is the operator-facing escape hatch for three scenarios:
+
+1. **Real-world A/B timing.** `time trinity status` vs
+   `time trinity status --no-cache` in any repo gives an
+   honest before/after measurement on real history. Unit-level
+   counters prove the cache was hit; this proves the user
+   actually feels the difference.
+2. **Debug.** If a cache file is suspected of misbehaving and
+   the operator hasn't deleted it yet, `--no-cache` produces a
+   ground-truth result without forcing a hand-delete.
+3. **CI / fixture tests.** Integration tests can force a
+   no-cache run as the oracle to compare a cached run against.
+
+`--no-cache` is intentionally a runtime opt-out, not a config
+flag. There's no scenario where a user wants caching disabled
+permanently — that would be a bug in the cache, not a
+preference.
+
 ### Cache Lifecycle
 
 On any local rebuild path:
@@ -423,10 +450,30 @@ the corrupt-file and wrong-HEAD paths.
 
 ### Phase 4: Use Cache In Local CLI Rebuilds
 
-Wire `state_cache` into `rebuild_repo`. `trinity status` is the
-first beneficiary; `trinity finish` and `trinity purge` also flip
-on since they share the same entry point. Confirm the cache-hit
-counter test (#8) passes.
+Wire `state_cache` into `rebuild_repo`. Add the `--no-cache`
+flag to `trinity status`, `trinity finish`, `trinity purge` (all
+the local CLI rebuild paths). `trinity status` is the first
+beneficiary; the others flip on automatically since they share
+the same entry point. Confirm the cache-hit counter test
+passes.
+
+Real-repo smoke verification at the end of this phase (not a
+committed CI test — a manual sanity step the implementor runs
+before declaring Phase 4 done):
+
+```sh
+# Cold: blow away any existing cache
+rm -rf .trinity/cache
+time trinity status --no-cache
+time trinity status                 # cold path (writes cache)
+time trinity status                 # warm path (hits cache)
+time trinity status --no-cache      # bypass again, should match cold
+```
+
+The warm `trinity status` should be visibly faster than
+`--no-cache` on the trinity repo itself (which now has ~150
+commits with `.trinity/` history). If it isn't, something is
+wrong with the implementation, not the test.
 
 ### Phase 5: Daemon Adoption
 
@@ -466,3 +513,6 @@ or a commit refold.
 - Cache retention follows a logarithmic-thinning policy: a
   fresh window keeps every recent entry, and the gap between
   retained older entries roughly doubles with age.
+- `trinity status --no-cache` (and the equivalent on `finish`
+  and `purge`) bypasses both cache read and write, producing
+  the same result as a cache-free run.
