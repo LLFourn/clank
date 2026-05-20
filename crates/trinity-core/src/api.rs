@@ -339,6 +339,30 @@ pub struct ListPlansResponse {
     pub conflicts: Vec<PlanConflict>,
 }
 
+/// `trinity status --json` response body. Repo identity + a folded
+/// plans list. Consumed by humans (CLI renderer) and any scripting
+/// caller that wants the same shape the daemon would have served.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StatusResponse {
+    /// Canonical repo root (the `dunce::canonicalize`-resolved
+    /// path that Trinity uses as the repo identity).
+    pub repo_root: String,
+    /// Trailing path segment of `repo_root`. The same basename
+    /// that anchors `plan_id` (`<basename>/<stem>.md`).
+    pub repo_basename: String,
+    /// `git symbolic-ref --short HEAD`, when on a branch.
+    pub current_branch: Option<String>,
+    /// `git rev-parse HEAD`, when the repo has a commit.
+    pub head_sha: Option<String>,
+    /// Subject line of HEAD (first line of the commit message).
+    pub head_subject: Option<String>,
+    /// True iff `git status --porcelain` produced any output.
+    pub worktree_dirty: bool,
+    /// Same shape as `ListPlansResponse` — visible plans grouped
+    /// by lifecycle on the consumer side.
+    pub plans: ListPlansResponse,
+}
+
 /// MCP `work_context` response body. The narrow coordination
 /// view: just enough to act on the latest `wait_for_work` result.
 ///

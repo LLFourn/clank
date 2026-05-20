@@ -25,6 +25,9 @@ enum Command {
     Finish(cli::FinishArgs),
     /// Strip a plan's `.trinity/` artifacts from history.
     Purge(cli::PurgeArgs),
+    /// Print the repo's Trinity state (HEAD, plans, phases) without
+    /// contacting the daemon.
+    Status(cli::StatusArgs),
 }
 
 #[tokio::main]
@@ -37,6 +40,7 @@ async fn main() -> anyhow::Result<()> {
         Command::Init(args) => cli::init::run(args).await,
         Command::Finish(args) => cli::finish::run(args).await,
         Command::Purge(args) => cli::purge::run(args).await,
+        Command::Status(args) => cli::status::run(args).await,
     }
 }
 

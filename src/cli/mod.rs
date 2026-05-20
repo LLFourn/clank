@@ -14,12 +14,23 @@ pub mod init;
 pub mod plan_resolve;
 pub mod purge;
 pub mod rewrite;
+pub mod status;
 
 #[derive(Args, Debug)]
 pub struct InitArgs {
     /// Repo root. Defaults to the cwd's git toplevel.
     #[arg(long, value_name = "PATH")]
     pub repo: Option<PathBuf>,
+}
+
+#[derive(Args, Debug)]
+pub struct StatusArgs {
+    /// Repo root. Defaults to the cwd's git toplevel.
+    #[arg(long, value_name = "PATH")]
+    pub repo: Option<PathBuf>,
+    /// Emit JSON (typed `StatusResponse` from `trinity-core::api`).
+    #[arg(long)]
+    pub json: bool,
 }
 
 #[derive(Args, Debug)]

@@ -250,6 +250,11 @@ const APPROVED_STRING_FIELDS: &[(&str, &str)] = &[
     ("plan_id", "PlanId surfaced as String"),
     ("plan_intro", "CommitSha for the plan-intro commit"),
     ("repo", "absolute repo root path"),
+    (
+        "repo_basename",
+        "RepoBasename surfaced as String on StatusResponse",
+    ),
+    ("repo_root", "absolute repo root path on StatusResponse"),
     ("root", "absolute repo root path on RepoRow"),
     ("sha", "CommitSha on CommitRow / TimelineEvent variants"),
     ("slug", "PlanKey surfaced as String"),
