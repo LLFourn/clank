@@ -43,8 +43,13 @@ After this plan:
   the commit stream.
 - `CommitNode` is not a flat struct with `kind`, `attribution`,
   `plans`, and `gate: Option<_>`.
-- A reviewable commit cannot exist without a `CommitGate`.
-- A non-reviewable commit cannot carry a `CommitGate`.
+- A reviewable commit's review state is computed from
+  `(commit.reviews, commit.review_policy(&config, &state))`,
+  not from a stored gate sidecar that can drift.
+- A non-reviewable commit (`MultiPlan` / `Finalize`) can still
+  carry feedback files (they're truth), but the policy
+  projection returns `NonBlocking { StructurallyNonReviewable }`
+  so they don't gate master.
 - A plan-only commit cannot exist without plan-touch data.
 - A code-only commit cannot carry plan-touch data.
 - A mixed commit must carry both the plan touch and the non-plan
@@ -83,6 +88,35 @@ Warnings are shared metadata because any commit can carry
 operator-facing warnings such as "unknown plan prefix" or "missing
 commit-title prefix".
 
+### Attribution Warnings — Tagged
+
+`AttributionWarning` today is a single `Option<String>` blob. An
+"invalid states unrepresentable" plan should not introduce a new
+stringly-typed sidecar:
+
+```rust
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum AttributionWarning {
+    /// Commit subject's `[…]` prefix names plan(s) that don't
+    /// exist. Classifier degrades to AdHoc.
+    UnknownPlanPrefix { unknown_names: Vec<String> },
+    /// No `[…]` prefix on the subject. Classifier inferred
+    /// attribution from file touches or walk-back. The inferred
+    /// suggestion is what the master would amend the title to.
+    MissingPrefix { suggested_prefix: String },
+    /// Strict-mode placeholder: prefix names a multi-plan list
+    /// that can't be disambiguated without operator input. The
+    /// classifier has no single suggested fix.
+    AmbiguousPrefix,
+}
+```
+
+`api::AttributionWarning` (the wire shape) is built by
+projection: `{ sha, subject, message }` where `message` is a
+human-readable rendering of the model variant. The model type is
+the canonical truth; the wire string is one render of it. There
+is exactly one place that knows how to render each variant.
+
 ### Commit Body
 
 The body is where invalid combinations become unrepresentable.
@@ -104,7 +138,7 @@ pub enum CommitBody {
 The wire shape becomes `{"scope": "plan", "kind": "plan_only",
 "plan": "...", ...}` — operator-readable and conflict-free.
 
-### Review Storage — Minimal Truth, Derived Readiness
+### Review Storage — Minimal Truth, Derived Everything
 
 `CommitGate` today is a flat derived-state bag: `state`,
 `participants`, `approvers`, `requesters`, `ambiguous`,
@@ -113,132 +147,179 @@ as the commit fields do (`state = Approved` with non-empty
 `requesters`, or `missing` that doesn't match
 `participants - voters`).
 
-Replace it with two minimal-truth structures:
+The canonical fact about a commit's review activity is exactly
+one thing — who wrote what feedback file on disk:
 
 ```rust
 pub struct CommitReviews {
-    /// Only canonical fact: who wrote what on this commit.
-    /// Feedback files on disk are truth; we mirror them once.
-    pub feedback: BTreeMap<AgentLabel, Feedback>,
+    /// Canonical: the map key IS truth for author identity.
+    /// `FeedbackBody` carries the verdict + body + mtime, NOT a
+    /// duplicated author field.
+    pub feedback: BTreeMap<AgentLabel, FeedbackBody>,
 }
 
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub enum ReviewPolicy {
-    /// Master is blocked until the participant set's verdicts
-    /// resolve. Default for plan commits and (when configured)
-    /// for ad hoc commits with a discovered reviewer set.
-    Blocking { participants: Vec<AgentLabel> },
-    /// Reviews can be written and surface in the UI, but they
-    /// don't gate the master. Used when
-    /// `force_review_on_misc_commits = false` or
-    /// `force_review_on_plan_commits = false`.
-    NonBlocking { reason: NonBlockingReason },
-    /// The commit's variant doesn't carry review semantics
-    /// (multi-plan, finalize). Feedback files written against
-    /// it are preserved structurally — operators can still
-    /// inspect them — but they have no policy effect.
-    NotReviewable { reason: NotReviewableReason },
+pub struct FeedbackBody {
+    pub verdict: Verdict,
+    pub body: String,
+    pub created_at: i64,
 }
 ```
 
+The feedback file's repo-relative path is derived from
+`(target, sha, author)` at projection time; it's not stored on
+`FeedbackBody`.
+
+**Policy is a projection, not a stored field.** Whether master is
+blocked on a commit depends on (a) which variant the commit is
+and (b) the trinity-startup config snapshot — both inputs to a
+method, not a fold-time decision baked into the commit. The
+config is read once at trinity startup and held in the runtime;
+config changes require a restart (which re-folds), so policy
+never goes stale relative to the snapshot it was computed from.
+
+```rust
+pub enum ReviewPolicy<'a> {
+    Blocking { participants: NonEmptyVec<AgentLabel> },
+    NonBlocking { reason: NonBlockingReason },
+}
+
+pub enum NonBlockingReason {
+    NoParticipants,
+    ConfigDisabledPlanReview,
+    ConfigDisabledMiscReview,
+    /// The commit's variant is structurally non-reviewable
+    /// (`MultiPlan` / `Finalize`). Method projection returns
+    /// this for those variants.
+    StructurallyNonReviewable,
+}
+
+impl CommitNode {
+    pub fn review_policy(&self, config: &Config, state: &RepoState)
+        -> ReviewPolicy<'_>;
+}
+```
+
+`Blocking` uses `NonEmptyVec` so "blocking with empty
+participants" is unrepresentable. When the discovered participant
+set is empty, the projection returns `NonBlocking { NoParticipants }`
+instead.
+
+`participants` is also a projection — for plan commits it's
+"distinct feedback authors across this plan's chronological
+chain up to and including this commit"; for ad hoc commits it's
+"branch feedback authors at fold time, or the config override
+`ad_hoc_reviewers` if set." Neither is stored canonically.
+
 `state` / `approvers` / `requesters` / `ambiguous` / `missing`
-are method outputs over `(CommitReviews, ReviewPolicy)`, NOT
-stored fields. This eliminates the `state = Approved && requesters
-!= []` class of contradiction by construction.
+are all method outputs over `(reviews, policy)` — never stored.
+This eliminates the `state = Approved && requesters != []` class
+of contradiction by construction.
 
 **Separation of storage and gating.** Feedback files on disk are
 always truth; they attach to the commit's `CommitReviews`
-regardless of `ReviewPolicy`. Late feedback on a
-`NotReviewable` (multi-plan/finalize) commit is preserved as
-informational metadata — the UI can show it; readiness
-projections just ignore it. This removes the old "non-blocking
-means the file is invisible" bug class.
+unconditionally — every variant, including `MultiPlan` and
+`Finalize`. The policy projection decides whether they gate
+anything. Late feedback on a `MultiPlan` or `Finalize` commit is
+preserved (the file IS truth) and surfaces in the UI; it just
+returns `StructurallyNonReviewable` from `review_policy()`, so it
+doesn't block master. This removes the old "non-blocking means
+the file is invisible" bug class.
 
 ### Plan Commits
 
 Use nested variants, not `PlanCommit { kind: PlanCommitKind, ... }`.
-The variants imply different data. Each reviewable plan commit
-carries both `reviews` (canonical) and `policy` (configurable);
-together they project the gate.
+Each variant carries the *minimum* set of canonical facts; the
+plan key for `PlanOnly` and `Mixed` is *projected* out of `touch`
+because the touch already names it. Storing both fields would
+reintroduce the parallel-truth problem this plan exists to remove.
 
 ```rust
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum PlanCommit {
     PlanOnly {
-        plan: PlanKey,
-        touch: PlanTouchSummary,
+        touch: PlanTouchSummary,   // touch.plan is the plan key
         reviews: CommitReviews,
-        policy: ReviewPolicy,
     },
     CodeOnly {
-        plan: PlanKey,
+        plan: PlanKey,             // no touch; key must be stored
         reviews: CommitReviews,
-        policy: ReviewPolicy,
     },
     Mixed {
-        plan: PlanKey,
-        touch: PlanTouchSummary,
+        touch: PlanTouchSummary,   // touch.plan is the plan key
         reviews: CommitReviews,
-        policy: ReviewPolicy,
     },
 }
+
+impl PlanCommit {
+    /// Single source of plan identity per variant.
+    pub fn plan(&self) -> &PlanKey {
+        match self {
+            PlanCommit::PlanOnly { touch, .. }
+            | PlanCommit::Mixed { touch, .. } => touch.plan(),
+            PlanCommit::CodeOnly { plan, .. } => plan,
+        }
+    }
+}
 ```
+
+No `policy` field on PlanCommit variants. Policy is a projection
+method on `CommitNode` driven by the snapshotted config (see
+"Review Storage" above and "Convenience Methods" below).
 
 This eliminates:
 
 - `kind == PlanOnly` but no plan touch.
 - `kind == CodeOnly` but a plan touch exists.
 - The reviewable-but-no-gate / non-reviewable-with-gate split
-  (variants enforce reviewability).
+  (variants enforce reviewability via their existence in
+  `PlanCommit` and `AdHocCommit`).
 - Gate-field contradictions (`state = Approved` with non-empty
   `requesters`, etc.) — those are now projection outputs, not
   stored fields.
+- Plan-key / plan-touch disagreement — there's one canonical
+  source per variant.
 
 ### Multi-Plan Commits
 
 ```rust
 pub struct MultiPlanCommit {
-    pub plans: BTreeSet<PlanKey>,
-    pub touches: Vec<PlanTouchSummary>,
+    pub touches: Vec<PlanTouchSummary>,   // canonical
     /// Late feedback files written against a multi-plan commit
-    /// are preserved (the file IS truth) but have no policy
-    /// effect — `policy` is implicitly `NotReviewable { reason:
-    /// MultiPlan }` and never carried explicitly.
+    /// are preserved (the file IS truth); the policy projection
+    /// returns `NonBlocking { StructurallyNonReviewable }` for
+    /// the variant, so they're informational only.
     pub reviews: CommitReviews,
+}
+
+impl MultiPlanCommit {
+    /// Projection of the touched plans. No stored sidecar set.
+    pub fn plans(&self) -> BTreeSet<&PlanKey> {
+        self.touches.iter().map(|t| t.plan()).collect()
+    }
 }
 ```
 
-No `policy` field — the variant itself encodes
-`NotReviewable { reason: MultiPlan }`. If a future plan makes
-multi-plan commits reviewable, it must introduce a new explicit
-variant with a `policy` field and a defined reviewer-set model.
-Do not smuggle reviewability in through `Option<CommitGate>`.
+No `plans` set field — `touches` is the canonical fact; the
+plan-set is a projection. No `policy` field — the variant encodes
+non-reviewability structurally.
 
 ### Ad Hoc Commits
 
 Ad hoc commits are first-class. Their `reviews` always exist
-(feedback files on disk are truth); their `policy` is what
-configuration decides:
+(feedback files on disk are truth); reviewability/policy is a
+method projection from the snapshotted config:
 
 ```rust
 pub struct AdHocCommit {
     pub reviews: CommitReviews,
-    pub policy: ReviewPolicy,
 }
 ```
 
-`policy` may be `Blocking { participants }` (default when an
-ad-hoc reviewer set is discovered or pinned),
-`NonBlocking { reason: ConfigDisabled }` (when
-`force_review_on_misc_commits = false`), or
-`NonBlocking { reason: NoParticipants }` (when no reviewer set
-can be derived AND no override). Either way, feedback files
-written manually against the commit are preserved in
-`reviews.feedback` — invisible-feedback is the bug we're
-removing.
-
-Ad hoc commits do not carry `PlanKey`s. Plan association for the
-UI is always empty.
+Nothing else. Ad hoc commits do not carry `PlanKey`s; plan
+association for the UI is always empty. The discovered
+participant set (from branch feedback authors) and the policy
+(blocking vs non-blocking) are method outputs over
+`(reviews, config, branch_state)`, not stored fields.
 
 ### Finalize Commits
 
@@ -247,20 +328,20 @@ pub struct FinalizeCommit {
     pub plan: PlanKey,
     pub approver_count: u32,
     /// As with multi-plan: late feedback files written against
-    /// the freeze commit are preserved but have no policy effect.
+    /// the freeze commit are preserved but project as
+    /// `NonBlocking { StructurallyNonReviewable }`.
     pub reviews: CommitReviews,
 }
 ```
 
-No `policy`. The variant implies
-`NotReviewable { reason: Finalize }`. The approving files
-themselves remain viewable by loading `.trinity/finished/<stem>/`
-from the finalize commit tree.
+The variant implies non-reviewability structurally. The approving
+files themselves remain viewable by loading
+`.trinity/finished/<stem>/` from the finalize commit tree.
 
 ### Convenience Methods
 
-Add methods on `CommitNode` / `CommitBody` for value-form reads so
-projection code stays simple without reintroducing parallel fields:
+Methods on `CommitNode` / `CommitBody` give projection code
+ergonomic reads without reintroducing parallel fields:
 
 ```rust
 impl CommitNode {
@@ -268,16 +349,62 @@ impl CommitNode {
     pub fn subject(&self) -> &str;
     pub fn associated_plans(&self) -> BTreeSet<&PlanKey>;
     pub fn primary_plan(&self) -> Option<&PlanKey>;
-    pub fn gate(&self) -> Option<&CommitGate>;
-    pub fn gate_mut(&mut self) -> Option<&mut CommitGate>;
+
+    /// Canonical review activity (feedback files). Always present
+    /// on every variant.
+    pub fn reviews(&self) -> &CommitReviews;
+    pub fn reviews_mut(&mut self) -> &mut CommitReviews;
+
+    /// Policy projection from (variant, snapshotted config,
+    /// participant discovery). Always callable; the return value
+    /// determines whether this commit blocks master.
+    pub fn review_policy(&self, config: &Config, state: &RepoState)
+        -> ReviewPolicy;
+
+    /// True iff `review_policy(...)` returns `Blocking`. Sugar
+    /// over `review_policy()`; never inspects stored fields
+    /// directly.
+    pub fn blocks_master(&self, config: &Config, state: &RepoState)
+        -> bool;
+
+    /// Full derived gate view: state, approvers, requesters,
+    /// ambiguous, missing — all computed from `(reviews,
+    /// review_policy(...))`. Replaces the old `CommitGate`
+    /// stored sidecar.
+    pub fn readiness(&self, config: &Config, state: &RepoState)
+        -> ReviewReadiness;
+
     pub fn commit_kind(&self) -> CommitKind; // value-form only
-    pub fn is_reviewable(&self) -> bool;
 }
 ```
 
+The readiness projection's output type:
+
+```rust
+pub struct ReviewReadiness {
+    pub state: CommitGateState,
+    pub participants: Vec<AgentLabel>,
+    pub approvers: Vec<AgentLabel>,
+    pub requesters: Vec<AgentLabel>,
+    pub ambiguous: Vec<AgentLabel>,
+    pub missing: Vec<AgentLabel>,
+}
+```
+
+This is the wire/UI shape today's `api::CommitGate` is, *rebuilt
+on demand* from the canonical `(reviews, policy)` pair. The
+existing `api::CommitGate` type either becomes `ReviewReadiness`
+(rename) or is built by projection from it — but there is no
+stored field of either shape on `CommitNode`. Old call sites
+that used `node.gate()` migrate to `node.readiness(&config,
+&state)`; the projection is cheap (handful of AgentLabel
+comparisons per commit).
+
 `CommitKind` may remain as a value-form vocabulary for filtering,
-display, tests, and wire compatibility. It must not be stored next
-to a variant that already determines the kind.
+display, tests, and wire compatibility — but only as a method
+return. **It must not appear as a `pub kind:` field on any
+canonical struct.** The acceptance criteria below mechanize this
+with a grep test.
 
 ## Plan State
 
@@ -291,7 +418,11 @@ pub struct Plan {
     pub plan_path: String,
     pub body: PlanBody,
     pub plan_intro: CommitSha,
-    pub plan_intro_parent: Option<CommitSha>,
+    // No `plan_intro_parent` — derive from `commit_order` via
+    // `RepoState::parent_of(&plan_intro)`. It's the commit
+    // immediately before `plan_intro` in fold order (or `None`
+    // when plan_intro is the root commit). Same parallel-truth
+    // logic that killed `last_activity_ts`.
 }
 
 /// Body + hash that can never disagree. The only constructor
@@ -318,12 +449,36 @@ impl PlanBody {
 - `last_activity_ts: i64` — call
   `RepoState::last_activity_for(&plan)`; walks commits +
   feedback mtimes at projection time.
+- `plan_intro_parent: Option<CommitSha>` — call
+  `RepoState::parent_of(&plan_intro)`; the commit immediately
+  before `plan_intro` in `commit_order`.
 - `archived_cycles: Vec<ArchivedCycle>` — derived from the
   Finalize commit variant on the commit stream.
 
 None of these become a stored sidecar. See "Direct Projections"
 below for the method shapes; no indexes get added until
 profiling demonstrates a hot path.
+
+### Stale Plan References
+
+When a `[plan-x]` prefix names a plan and that plan is later
+deleted (its file removed from a non-frozen state), the historical
+`PlanCommit::*` variants keep their `touch.plan() == plan-x`
+attribution. The fold is forward-only and history is immutable;
+no retroactive downgrade happens.
+
+Projection-time behavior:
+
+- `state.commits_for_plan(plan-x)` returns those historical
+  commits even though `state.plans.get(plan-x).is_none()`.
+- The UI / WFW must treat "plan key with no entry in
+  `state.plans`" as a soft signal — surface the commits but
+  don't try to look up the plan body. A future plan can decide
+  whether to render this as a warning or hide the dangling key.
+- `attribution_warning::DanglingPlanRef { plan: PlanKey }` is
+  emitted by the relevant projection helpers when the lookup
+  fails, NOT stored on the commit. The commit's `touch.plan()`
+  remains the canonical fact.
 
 ## Direct Projections (No Indexes)
 
@@ -352,6 +507,11 @@ impl RepoState {
 
     /// Max(commit.author_ts, feedback.created_at) for `plan`.
     pub fn last_activity_for(&self, plan: &PlanKey) -> i64;
+
+    /// First-parent of `sha` in fold order, or `None` when `sha`
+    /// is the root commit / not in this state. Replaces
+    /// `Plan.plan_intro_parent` as a stored field.
+    pub fn parent_of(&self, sha: &CommitSha) -> Option<&CommitSha>;
 }
 ```
 
@@ -410,181 +570,293 @@ membership, or reviewability from a different source.
 
 ## Feedback Attachment
 
-Feedback attachment should pattern-match on commit variants:
+Feedback files on disk are truth and attach **unconditionally**
+to the matching commit's `reviews.feedback`. The variant
+determines whether that feedback affects readiness — never
+whether it's stored.
 
-- Plan feedback may attach only to
-  `CommitBody::Plan(PlanCommit::{PlanOnly, CodeOnly, Mixed})`
-  whose `plan` matches the feedback path.
-- Ad hoc feedback may attach only to
-  `CommitBody::AdHoc(AdHocCommit::Reviewable { .. })`.
-- Multi-plan and finalize commits reject live feedback
-  structurally.
+- Plan-target feedback (path `.trinity/feedback/<plan>/<sha>/<author>.md`)
+  attaches to `CommitBody::Plan(_)` whose `plan()` matches the
+  path's plan key. If the SHA's variant is `MultiPlan` or
+  `Finalize`, attachment ALSO succeeds (the file is truth), but
+  the readiness projection ignores it. If the SHA is `AdHoc` or
+  doesn't exist, attachment is dropped — the path encodes the
+  wrong scope.
+- Ad-hoc-target feedback (path `.trinity/feedback/_/<sha>/<author>.md`)
+  attaches to `CommitBody::AdHoc(_)`. Plan-attributed SHAs reject
+  ad-hoc-target feedback (wrong scope, not "not gating").
+- The path/scope mismatch checks happen once at attach time. No
+  downstream consumer re-verifies; if it's in
+  `commit.reviews.feedback`, it's authoritative.
 
 This removes the current ownership check that has to compare
 `FeedbackTarget`, `CommitAttribution`, `CommitKind`, and
-`gate.is_some()`.
+`gate.is_some()`. It also removes the "non-blocking means
+invisible" bug class — late feedback on a multi-plan or finalize
+commit is visible in the UI and the per-commit detail view.
 
 ## Wait-For-Work Projection
 
-WFW candidate collection should walk `commit_order` and inspect
-`CommitBody`:
+WFW candidate collection walks `commit_order` and inspects each
+commit's *policy projection*, not a variant-encoded
+"reviewability" flag:
 
-- Repo scope: all reviewable `PlanCommit` and reviewable
-  `AdHocCommit` variants in fold order, with per-plan supersession
-  applied as a projection rule.
-- Plan scope: commits whose `primary_plan()` or
-  `associated_plans()` names the requested plan.
-- Strict title-fix work: commits in the same scope, regardless of
-  reviewability, because title hygiene is a commit-level rule.
+- Repo scope: for each commit, call
+  `node.review_policy(&config, &state)`. Commits where the
+  caller (`author`) is in the policy's `participants` and lacks a
+  current verdict surface as reviewer work; commits where the
+  policy is `Blocking` with unresolved verdicts surface as master
+  `AddressChanges` work. Per-plan supersession applies as a
+  projection rule (only the latest reviewable commit per plan
+  gates).
+- Plan scope: filter to commits whose `primary_plan()` or
+  `associated_plans()` contains the requested plan. Same policy
+  projection runs.
+- Strict title-fix work (`require_commit_prefix = true`): commits
+  in the same scope, regardless of policy outcome, because title
+  hygiene is a commit-level rule independent of reviewability.
+  Reviewers do not surface for commits with an outstanding
+  `FixCommitTitle`.
+- Non-blocking commits with pending feedback may still surface in
+  the UI's "feedback you wrote / received" lists (projection over
+  `commit.reviews.feedback`), but they don't gate master
+  progress.
 
-No WFW path should read `Plan.timeline` after this plan.
+No WFW path should read `Plan.timeline` or any old `CommitGate`
+field after this plan. All readiness decisions go through
+`node.review_policy(...)` and `node.readiness(...)`.
 
 ## Response Projection
 
-All response builders should project from `CommitNode` variants.
+All response builders project from `CommitNode` variants.
 
 Examples:
 
-- Plan page timeline: select commits associated with that plan and
-  convert each to `api::TimelineEvent`.
+- Plan page timeline: `state.commits_for_plan(&plan)` and convert
+  each `CommitNode` to `api::TimelineEvent`. Includes
+  `MultiPlanCommit` entries whose `touches` mention the plan
+  (they're informational events in that plan's timeline; same
+  as today's behavior — explicit so it doesn't silently
+  regress).
 - Plan revision list: select `PlanCommit::PlanOnly` and
+  `PlanCommit::Mixed` whose `plan()` matches, plus
+  `MultiPlanCommit` entries whose `touches` include the plan
+  (today's `all_plan_revisions` includes `MultiPlan`; preserve
+  that or call out the deliberate behavior change).
+- Implementation list: `PlanCommit::CodeOnly` and
   `PlanCommit::Mixed` for the plan.
-- Implementation list: select `PlanCommit::CodeOnly` and
-  `PlanCommit::Mixed` for the plan.
-- Latest reviewable commit: reverse-scan the derived plan commit
-  list and return the latest variant with a gate.
-- Commit details: switch on `CommitBody` directly.
+- Latest reviewable commit: reverse-scan `commits_for_plan(&plan)`
+  and return the first `PlanCommit` variant. (MultiPlan and
+  Finalize aren't reviewable by their variant existence.)
+- Commit details: `match` on `CommitBody` directly; the variant
+  determines what fields the detail response carries.
 
 Projection can keep small helper methods for readability, but it
 must not rebuild a second persistent model with different facts.
 
 ## Implementation Phases
 
-### Phase 1 — Introduce New Types
+The phase boundaries are designed so each commit leaves the tree
+in a compiling, testable state. Phases 3 + 4 + 5 are the
+risk-concentrated middle and may land as one atomic commit OR as
+sub-steps inside a single PR; the boundaries below are
+descriptive, not contractual.
+
+### Phase 1 — Introduce New Types (additive)
 
 - Add `CommitMeta`, `CommitBody`, `PlanCommit`,
   `MultiPlanCommit`, `AdHocCommit`, `FinalizeCommit`,
-  `PlanTouchSummary`, and `AttributionWarning` to
-  `trinity_core::model`.
-- Add accessor methods that cover current call sites.
-- Keep old `CommitNode` fields temporarily only behind conversion
-  helpers if needed for compilation. The conversion must be
-  one-way and short-lived.
+  `PlanTouchSummary`, `CommitReviews`, `FeedbackBody`,
+  `ReviewPolicy`, `NonBlockingReason`, `ReviewReadiness`, and
+  `AttributionWarning` (tagged enum) to `trinity_core::model`.
+- Old `CommitNode { kind, attribution, plans, gate,
+  attribution_warning }` shape stays compiling alongside.
+- Tests pass against the old shape.
 
-### Phase 2 — Classifier Returns `ClassifiedCommit`
+### Phase 2 — Classifier Returns `ClassifiedCommit` (additive)
 
-- Move prefix parsing, file-touch attribution, finalize detection,
-  ad hoc reviewability, and walk-back update into one classifier.
-- `ClassifiedCommit` is the only source of:
-  - commit body variant,
-  - warnings,
-  - next effective plan,
-  - plan metadata effects.
-- Add tests for every variant and for walk-back behavior:
-  - `[misc]` touching a plan does not seed that plan.
-  - `[plan]` code-only commit becomes a reviewable plan commit.
-  - unknown prefix becomes ad hoc with warning.
-  - multi-plan touch cannot carry a gate.
-  - finalize commit cannot carry a gate.
+- Move prefix parsing, file-touch attribution, finalize
+  detection, ad hoc participant discovery, and walk-back update
+  into one classifier returning `ClassifiedCommit { body,
+  warnings, next_effective_plan, plan_effects }`.
+- Old `apply_commit` continues to populate old `CommitNode`
+  fields; the classifier output is consumed in parallel and its
+  result is asserted equal to the legacy classification.
+- Tests for every `CommitBody` variant + walk-back behavior:
+  - `[misc]` touching a plan does not seed that plan as the
+    effective chain.
+  - `[plan]` code-only commit becomes a `PlanCommit::CodeOnly`.
+  - unknown prefix becomes `AdHocCommit` with
+    `AttributionWarning::UnknownPlanPrefix`.
+  - multi-plan touch produces `MultiPlanCommit` (no policy
+    field; structurally non-reviewable).
+  - finalize commit produces `FinalizeCommit` (no policy field).
 
-### Phase 3 — Replace Canonical `CommitNode`
+### Phase 3 — Replace Canonical `CommitNode` + Remove `Plan.timeline` (atomic)
+
+This phase is the model swap. It MUST be one atomic commit (or
+PR landing as one squashed commit) because the deletions and
+the consumer migrations don't survive intermediate states.
 
 - Change `RepoState.commits` to store the new `CommitNode`.
-- Delete old fields: `kind`, `attribution`, `plans`, `gate`.
-- Update feedback attachment to match on variants.
-- Update gate rebuild helpers so `gate_mut()` only exists for
-  reviewable variants.
-- Bump `state_cache::CACHE_FORMAT_VERSION` so the on-disk
-  `BaseStatePayload` schema change invalidates older caches.
-  `Plan.timeline` is still present in the v4 payload; Phase 4
-  bumps again when that field disappears.
+- Delete old fields: `kind`, `attribution`, `plans`, `gate`,
+  `attribution_warning`. Delete `Plan.timeline`,
+  `Plan.last_activity_ts`, `Plan.plan_intro_parent`,
+  `Plan.archived_cycles`. Delete `model::PlanTimelineEvent`
+  from canonical state (it may move to a projection module if
+  still useful for the API).
+- Rewrite feedback attachment to match on `CommitBody` and
+  write into `commit.reviews.feedback` unconditionally per the
+  Feedback Attachment section.
+- Rewrite WFW candidate collection, plan-page / commit-detail /
+  timeline / preview / diff projections to read from
+  `CommitBody` variants and call `node.review_policy(...)` +
+  `node.readiness(...)`.
+- Preserve API shapes (`CommitRow`, `DiffLine`,
+  `TimelineEvent`); they're already tagged enums.
+- Bump `state_cache::CACHE_FORMAT_VERSION` once (from v3 → v4).
+  v4 carries the new `CommitNode` shape; `Plan.timeline` is
+  gone in v4. Old caches invalidate; the loader's delete-on-
+  error rule (below) collects them.
 - Cache-read error semantics: any `try_load` error (bad magic,
-  format-version mismatch, trinity-generation mismatch,
-  head mismatch, decode failure) must delete the offending file
+  format-version mismatch, trinity-generation mismatch, head
+  mismatch, decode failure) must delete the offending file
   before falling back to a full fold. Today the fallback is
   silent but the stale file rots in the cache dir; bake the
   delete-on-error rule into the loader so the cache is
   self-cleaning. Cache thinning is best-effort housekeeping,
-  not correctness — every error path must clean up after itself.
+  not correctness — every error path must clean up after
+  itself.
 
-### Phase 4 — Remove Canonical `Plan.timeline`
+### Phase 4 — Delete Compatibility Shims
 
-- Delete `Plan.timeline` from model state.
-- Replace `Plan::event_for`, `latest_reviewable_event`,
-  `frozen_at`, and similar methods with projection helpers over
-  `RepoState`.
-- Project plan lifecycle through `RepoState` methods that walk
-  `commit_order`. No `RepoIndexes` is introduced; if Trinity is
-  ever measured to be slow on these projections, that's the
-  signal — not a guess — and the cache earns a follow-up plan.
-- Ensure plan lifecycle/finalization is derived from finalize
-  commit variants.
-- Bump `CACHE_FORMAT_VERSION` again now that `Plan.timeline`
-  drops out of the cached payload.
-- Order-of-operations note: Phase 5 rewrites the consumers
-  (WFW, response builders) to read from `CommitBody` variants.
-  Phase 4's `Plan.timeline` deletion is unblocked by Phase 5
-  — these two phases may land in either order or together,
-  but the deletion cannot precede the consumer migration.
-
-### Phase 5 — Update WFW and Responses
-
-- Rewrite WFW candidate collection to inspect `CommitBody`.
-- Rewrite plan-page, commit-detail, timeline, preview, and diff
-  projections to use commit variants.
-- Preserve the already-good tagged enum API shapes for
-  `CommitRow`, `DiffLine`, and `TimelineEvent`.
-- Remove any leftover code that constructs
-  `PlanTimelineEvent` as canonical model state.
-
-### Phase 6 — Delete Compatibility Shims
-
-- Remove old `CommitAttribution` if it is no longer needed.
-  If a value-form is still useful for display, make it a method
-  return or projection enum, not stored canonical state.
-- Remove stale helpers that derive `plans`, `kind`, or `gate`
-  from old fields.
-- Delete or retire the older
-  `tagged-enums-for-non-orthogonal-fields.md` plan if it is now
-  fully subsumed by this one.
+- Remove old `CommitAttribution` if no consumer needs it. If a
+  value-form is still useful for display, make it a method
+  return from `CommitBody::scope()` or similar, not a stored
+  field.
+- Remove stale helpers that derived `plans`, `kind`, or `gate`
+  from old fields (they were deleted in Phase 3 along with the
+  fields; this phase just catches any residual conversion
+  helpers).
+- Retire `.trinity/plans/tagged-enums-for-non-orthogonal-fields.md`
+  as obsolete — its intent is fully subsumed by this plan, so
+  the document is deleted (not "may be deleted"). Recorded in
+  this plan's `Out of Scope` as an explicit close.
 
 ## Tests
 
+### Unit + structural
+
 - Unit tests for `ClassifiedCommit` covering every `CommitBody`
-  variant.
-- Compile-time structural tests where possible: fixture builders
-  should make impossible old states impossible to construct.
-- Regression: a reviewable plan commit always has a gate because
-  the variant requires it.
-- Regression: multi-plan and finalize commits cannot have gates.
-- Regression: plan-scoped WFW ignores unrelated strict-title
-  violations.
-- Regression: repo-scoped WFW still sees ad hoc commits.
-- Regression: latest plan revision / latest implementation commit
-  are derived from the commit stream and match previous behavior.
-- Regression: deleting `Plan.timeline` does not change rendered
-  plan-page timeline output for representative histories.
-- Wire snapshot tests for response shape changes.
+  variant (Plan / MultiPlan / AdHoc / Finalize) and every
+  `PlanCommit` sub-variant.
+- **Structural impossibilities** that must NOT compile (added as
+  doc-tests with `compile_fail` or as `// @compile_fail` comment
+  markers near the fixture builders):
+  - constructing `PlanCommit::PlanOnly` without a touch.
+  - constructing `PlanCommit::CodeOnly` with a touch (the
+    variant has no `touch` field).
+  - constructing `MultiPlanCommit` from an empty touches list
+    (use `NonEmptyVec`).
+  - constructing `ReviewPolicy::Blocking` with empty
+    participants (use `NonEmptyVec`).
+  - creating a `PlanBody` whose hash doesn't match the text
+    (the only constructor computes the hash).
+- Fixture builders: `CommitFixture::plan_only(touch).reviews(...)`
+  — no public construction path that bypasses variant
+  requirements.
+
+### Acceptance grep
+
+A CI check (or a `tests/architectural_invariants.rs` file using
+`std::process::Command::new("grep")` /
+`std::process::Command::new("rg")`) that asserts:
+
+- `grep -rn "pub kind: " crates/trinity-core/src/model.rs src/`
+  returns no canonical-struct hits. `kind` only appears as a
+  serde tag on enums (`#[serde(tag = "kind")]`).
+- `grep -rn "pub gate: " crates/trinity-core/src/model.rs src/`
+  returns no hits (gate is projected via `readiness()`, never
+  stored).
+- `grep -rn "pub timeline: " crates/trinity-core/src/model.rs`
+  returns no hits on `Plan`.
+
+These run as part of `cargo test` so the next refactor can't
+silently regress.
+
+### Regression
+
+- A reviewable plan commit always projects a non-empty
+  `participants` from `node.readiness(...)` when its plan has
+  at least one historical feedback author (cumulative chain).
+- Multi-plan and finalize commits' `node.review_policy(...)`
+  always returns
+  `NonBlocking { reason: StructurallyNonReviewable }`.
+- Late feedback on a multi-plan commit appears in
+  `node.reviews().feedback` (file IS truth) but does NOT cause
+  `node.blocks_master(...)` to return true.
+- Plan-scoped WFW ignores strict-title violations on other plans.
+- Repo-scoped WFW still surfaces ad hoc commits per the
+  config-derived policy.
+- Latest plan revision / latest implementation commit are
+  derived from `commits_for_plan(&plan)` and match the previous
+  behavior on representative histories.
+- Deleting `Plan.timeline` does not change rendered plan-page
+  timeline output (golden-file test on representative repo
+  fixtures).
+- A `[plan-x]` commit whose plan is later deleted retains its
+  `touch.plan() == plan-x` attribution; the projection emits
+  `AttributionWarning::DanglingPlanRef` rather than rewriting
+  history.
+
+### Wire / shape
+
+- Wire snapshot tests for every response shape that touches a
+  `CommitBody` variant: `WaitWorkPayload` (incl. `ReviewReadiness`
+  if it appears on the wire), `PlanRow`, `PlanDetailResponse`,
+  `CommitDetail`, `TimelineEvent`.
+- Doc-comments on `CommitBody` explain the `scope` vs. inner
+  `kind` discriminator choice. (Reviewer ergonomics — the
+  rationale lives next to the code, not just in this plan.)
+
+### CI
+
 - `cargo test --workspace --exclude trinity-frontend`.
 - `cargo test -p trinity-frontend` if frontend types change.
 - `cargo fmt -- --check`.
 
 ## Acceptance
 
-- There is exactly one canonical chronological representation:
-  `RepoState.commit_order + RepoState.commits`.
-- `Plan` no longer stores `timeline`.
-- `CommitNode` no longer stores parallel `kind`,
-  `attribution`, `plans`, and `gate: Option<_>` fields.
-- Reviewability is encoded by variants that carry `CommitGate`.
-- Non-reviewability is encoded by variants that do not carry
-  `CommitGate`.
+- One canonical chronological representation:
+  `RepoState.commit_order + RepoState.commits`. No second
+  canonical event log anywhere in the model.
+- `Plan` stores only `{ id, plan_path, body: PlanBody,
+  plan_intro }`. No `timeline`, no `last_activity_ts`, no
+  `plan_intro_parent`, no `archived_cycles`.
+- `CommitNode` stores `meta` + `body`. No `kind`, no
+  `attribution`, no `plans`, no `gate`, no `attribution_warning`
+  field. Warnings are on `meta.warnings` (typed enum).
+- Reviewability is encoded by *variant existence* in
+  `PlanCommit` and `AdHocCommit`. `MultiPlanCommit` and
+  `FinalizeCommit` exist as variants but their policy
+  projection returns `NonBlocking { StructurallyNonReviewable }`.
+- Policy is a projection method `node.review_policy(&config,
+  &state)`, NOT a stored field. Config snapshotted at trinity
+  startup; restart re-folds.
+- `ReviewReadiness` is the derived projection type that replaces
+  the old `CommitGate` sidecar. No canonical `CommitGate` field
+  on any struct.
+- Feedback files attach unconditionally to
+  `commit.reviews.feedback`. Variant decides policy; never
+  rejects attachment.
 - WFW, response projection, feedback attachment, and lifecycle
-  derivation all read from `CommitBody` variants.
-- No flat core struct remains where a `kind` discriminator controls
-  whether sibling fields are valid.
-- The old tagged-enum plan's remaining intent is either implemented
-  here or explicitly marked obsolete.
+  derivation all read through `CommitBody` variants and
+  `node.review_policy(...)` / `node.readiness(...)`.
+- The grep-mechanized invariants (`pub kind:`, `pub gate:`,
+  `pub timeline:` returning zero hits) pass as part of `cargo
+  test`.
+- `tagged-enums-for-non-orthogonal-fields.md` is deleted from
+  `.trinity/plans/` as obsolete.
 
 ## Out of Scope
 
@@ -594,4 +866,12 @@ must not rebuild a second persistent model with different facts.
 - Adding any derived-index cache (per-plan or otherwise). Direct
   projections only; performance work is its own future plan if
   Trinity is ever measured to be slow.
+- Live config reload — config is snapshotted at trinity startup.
+  Changing config requires restart. A future plan can add live
+  reload if the workflow demands it; the model design here
+  doesn't preclude it (policy is a projection from config).
+- Frontend UX changes around dangling-plan attribution
+  (commits whose `[plan-x]` prefix names a deleted plan). The
+  projection emits `AttributionWarning::DanglingPlanRef`; how
+  the UI renders it is a separate question.
 - Removing the web UI.
