@@ -564,6 +564,81 @@ equality test against the direct projection it caches. Until
 then, premature index proliferation reintroduces the parallel-
 truth problem this plan exists to remove.
 
+### Reference Implementation
+
+The projections are small. Spelling them out so the next
+implementer doesn't have to re-derive them and so the type
+choices are obvious:
+
+```rust
+impl CommitBody {
+    /// Plans this commit appears in. Each variant computes from
+    /// its canonical fields — no stored sidecar set.
+    pub fn associated_plans(&self) -> BTreeSet<&PlanKey> {
+        match self {
+            CommitBody::Plan(PlanCommit::PlanOnly { touch, .. })
+            | CommitBody::Plan(PlanCommit::Mixed { touch, .. }) => {
+                [touch.plan()].into_iter().collect()
+            }
+            CommitBody::Plan(PlanCommit::CodeOnly { plan, .. }) => {
+                [plan].into_iter().collect()
+            }
+            CommitBody::MultiPlan(m) => m.touches.plans(),
+            CommitBody::Finalize(f) => [&f.plan].into_iter().collect(),
+            CommitBody::AdHoc(_) => BTreeSet::new(),
+        }
+    }
+}
+
+impl RepoState {
+    pub fn commits_for_plan(&self, plan: &PlanKey)
+        -> impl Iterator<Item = &CommitNode>
+    {
+        self.commit_order
+            .iter()
+            .filter_map(|sha| self.commits.get(sha))
+            .filter(move |node| {
+                node.body.associated_plans().contains(plan)
+            })
+    }
+
+    pub fn latest_reviewable_for_plan(&self, plan: &PlanKey)
+        -> Option<&CommitNode>
+    {
+        self.commits_for_plan(plan)
+            .filter(|n| matches!(n.body, CommitBody::Plan(_)))
+            .next_back()
+    }
+
+    pub fn finalized_at(&self, plan: &PlanKey)
+        -> Option<&CommitSha>
+    {
+        self.commits_for_plan(plan).find_map(|n| match &n.body {
+            CommitBody::Finalize(f) if &f.plan == plan
+                => Some(&n.meta.sha),
+            _ => None,
+        })
+    }
+
+    pub fn parent_of(&self, sha: &CommitSha)
+        -> Option<&CommitSha>
+    {
+        let i = self.commit_order.iter().position(|s| s == sha)?;
+        i.checked_sub(1).and_then(|j| self.commit_order.get(j))
+    }
+}
+```
+
+`last_activity_for` does the same fold over
+`commits_for_plan(...)` and the per-commit `reviews.feedback`
+mtimes; spelled out at implementation time.
+
+All four methods are O(commits in repo) and that's the explicit
+trade. The MultiPlan `BTreeSet` allocation per call is wasteful
+when the set is always size 1 for plan/finalize commits;
+swapping in a small-vec or `&dyn Iterator` is a future
+optimization if it ever shows up in a profile.
+
 ## Tagged Enum Carry-Forward
 
 This plan subsumes the intent of
