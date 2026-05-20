@@ -15,6 +15,7 @@ pub mod git_io;
 pub mod preview;
 pub mod responses;
 pub mod runtime;
+pub mod state_cache;
 
 // Operator CLI subcommands (init / finish / purge). Mutations
 // live here; the daemon stays read-only.
