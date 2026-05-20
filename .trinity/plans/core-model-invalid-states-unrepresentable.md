@@ -143,12 +143,16 @@ pub enum CommitBody {
     Plan(PlanCommit),
     MultiPlan(MultiPlanCommit),
     AdHoc(AdHocCommit),
-    Finalize(FinalizeCommit),
 }
 ```
 
 The wire shape becomes `{"scope": "plan", "kind": "plan_only",
 "plan": "...", ...}` — operator-readable and conflict-free.
+
+Note: lifecycle events (Finalize, plan Intro/Revise/Delete) are
+NOT body variants — they live on the parallel `plan_effects`
+channel of `ClassifiedCommit`. See "Lifecycle Effects vs. Body"
+below.
 
 ### Review Storage — Minimal Truth, Derived Everything
 
@@ -364,21 +368,54 @@ participant set (from branch feedback authors) and the policy
 (blocking vs non-blocking) are method outputs over
 `(reviews, config, branch_state)`, not stored fields.
 
-### Finalize Commits
+### Lifecycle Effects vs. Body
+
+Finalize is NOT a `CommitBody` variant. A single commit can
+finalize plan A and ALSO touch plan B; collapsing finalize into
+a body variant forces an either-or choice and silently drops
+one fact (codex on a8b19ae).
+
+The clean split: `CommitBody` describes the commit's REVIEW
+state (Plan / MultiPlan / AdHoc); lifecycle facts ride as a
+separate `plan_effects: Vec<PlanEffect>` channel on
+`ClassifiedCommit`. The fold applies effects to plan metadata
+orthogonally from the body's review state.
 
 ```rust
-pub struct FinalizeCommit {
-    pub plan: PlanKey,
-    pub approver_count: u32,
-    /// As with multi-plan: late feedback files written against
-    /// the freeze commit are preserved but project as
-    /// `NonBlocking { StructurallyNonReviewable }`.
-    pub reviews: CommitReviews,
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum PlanEffect {
+    /// New plan introduced in this commit's tree.
+    Intro {
+        plan: PlanKey,
+        path: String,
+        body: String,
+    },
+    /// Existing plan's body revised.
+    Revise {
+        plan: PlanKey,
+        body: String,
+    },
+    /// Plan file removed (non-frozen plans only — frozen plans
+    /// stay in state by the monotone-finished rule).
+    Delete { plan: PlanKey },
+    /// Finalize commit fires the freeze rule for this plan.
+    /// Coexists with any body — a commit can finalize plan A
+    /// AND touch plan B in the same commit.
+    Finalize {
+        plan: PlanKey,
+        approver_count: u32,
+    },
 }
 ```
 
-The variant implies non-reviewability structurally. The approving
-files themselves remain viewable by loading
+A pure-finalize commit (just lands an approving file under
+`.trinity/finished/`, no plan touches, no code) has `body =
+CommitBody::AdHoc(_)` and `plan_effects = [Finalize { plan: A }]`.
+A "finalize A + revise B" commit has `body = CommitBody::Plan(
+PlanCommit::PlanOnly { touch: B })` AND `plan_effects = [Finalize
+{ plan: A }]`. Both facts survive.
+
+The approving files themselves remain viewable by loading
 `.trinity/finished/<stem>/` from the finalize commit tree.
 
 ### Convenience Methods
@@ -668,27 +705,51 @@ belongs to the commit variant.
 ## Fold Algorithm
 
 Keep the fold shape, but make classification return the full commit
-variant and next walk-back state:
+fact set in one structure. Body, warnings, plan_effects, and the
+walk-back update are ALL outputs of the same classifier call —
+no later stage reinterprets any of them.
 
 ```rust
 pub struct ClassifiedCommit {
+    /// Review-body classification: which CommitBody variant this
+    /// commit takes. Independent of lifecycle effects.
     pub body: CommitBody,
+    /// Non-blocking attribution warnings to display to the
+    /// master.
     pub warnings: Vec<AttributionWarning>,
-    pub next_effective_plan: Option<PlanKey>,
+    /// Lifecycle effects to apply to plan metadata. Orthogonal
+    /// to `body` — a commit can both finalize plan A
+    /// (`plan_effects = [Finalize { plan: A, .. }]`) and revise
+    /// plan B (`body = Plan(PlanOnly { touch: B })`) in the same
+    /// commit. See "Lifecycle Effects vs. Body" above.
     pub plan_effects: Vec<PlanEffect>,
+    /// What the walk-back chain becomes after this commit. The
+    /// fold's `carry.current_effective` is assigned this verbatim.
+    pub next_effective_plan: Option<PlanKey>,
 }
 ```
 
 `apply_commit` should:
 
 1. Read the current fold carry.
-2. Apply plan-file tree changes to plan metadata.
-3. Classify the commit once into `ClassifiedCommit`.
-4. Insert exactly one `CommitNode`.
+2. Classify the commit once into `ClassifiedCommit`.
+3. Apply each `PlanEffect` to plan metadata
+   (Intro/Revise/Delete/Finalize all operate on `state.plans`).
+4. Insert exactly one `CommitNode { meta, body }` into
+   `state.commits`.
 5. Update carry from `classified.next_effective_plan`.
 
-No later stage may reinterpret `kind`, attribution, plan
-membership, or reviewability from a different source.
+No later stage may reinterpret `body`, attribution, plan
+membership, reviewability, or lifecycle state from a different
+source.
+
+### Multiple Finalizations in One Commit
+
+A commit that fires the freeze rule for ≥2 plans simultaneously
+is rare but representable: `plan_effects = [Finalize { plan: A,
+... }, Finalize { plan: B, ... }, ...]`. The fold applies each
+in `BTreeSet` order. No information is dropped (codex on
+a8b19ae's `BTreeSet::iter().next()` silent-pick was rejected).
 
 ## Feedback Attachment
 
@@ -699,11 +760,13 @@ whether it's stored.
 
 - Plan-target feedback (path `.trinity/feedback/<plan>/<sha>/<author>.md`)
   attaches to `CommitBody::Plan(_)` whose `plan()` matches the
-  path's plan key. If the SHA's variant is `MultiPlan` or
-  `Finalize`, attachment ALSO succeeds (the file is truth), but
-  the readiness projection ignores it. If the SHA is `AdHoc` or
-  doesn't exist, attachment is dropped — the path encodes the
-  wrong scope.
+  path's plan key. If the SHA's variant is `MultiPlan`,
+  attachment ALSO succeeds (the file is truth), but the
+  readiness projection ignores it. Pure-finalize commits
+  (body = AdHoc with `plan_effects = [Finalize { plan }]`)
+  treat plan-target feedback the same as any AdHoc commit. If
+  the SHA is `AdHoc`-only or doesn't exist, attachment is
+  dropped — the path encodes the wrong scope.
 - Ad-hoc-target feedback (path `.trinity/feedback/_/<sha>/<author>.md`)
   attaches to `CommitBody::AdHoc(_)`. Plan-attributed SHAs reject
   ad-hoc-target feedback (wrong scope, not "not gating").
@@ -798,21 +861,29 @@ descriptive, not contractual.
 ### Phase 2 — Classifier Returns `ClassifiedCommit` (additive)
 
 - Move prefix parsing, file-touch attribution, finalize
-  detection, ad hoc participant discovery, and walk-back update
+  detection, walk-back update, and plan-effects identification
   into one classifier returning `ClassifiedCommit { body,
-  warnings, next_effective_plan, plan_effects }`.
-- Old `apply_commit` continues to populate old `CommitNode`
-  fields; the classifier output is consumed in parallel and its
-  result is asserted equal to the legacy classification.
-- Tests for every `CommitBody` variant + walk-back behavior:
+  warnings, plan_effects, next_effective_plan }`.
+- The classifier is a pure function. Phase 2 lands the function
+  + unit tests; the shadow assertion against the legacy
+  classifier moves to Phase 3's atomic swap because Phase 3
+  replaces `apply_commit` outright — running both in parallel
+  during Phase 2 would just be scaffolding deleted by Phase 3.
+- Tests for every `CommitBody` variant + walk-back + plan_effects:
   - `[misc]` touching a plan does not seed that plan as the
     effective chain.
   - `[plan]` code-only commit becomes a `PlanCommit::CodeOnly`.
   - unknown prefix becomes `AdHocCommit` with
     `AttributionWarning::UnknownPlanPrefix`.
-  - multi-plan touch produces `MultiPlanCommit` (no policy
-    field; structurally non-reviewable).
-  - finalize commit produces `FinalizeCommit` (no policy field).
+  - multi-plan touch produces `MultiPlanCommit` (structurally
+    non-reviewable).
+  - Pure finalize commit: `body = AdHoc`, `plan_effects =
+    [Finalize { plan }]`.
+  - Finalize-plus-touch: `body = Plan(PlanOnly { touch: B })`,
+    `plan_effects = [Finalize { plan: A }]`. Both facts survive.
+  - Multiple simultaneous finalizations: `plan_effects =
+    [Finalize { A }, Finalize { B }]` in BTreeSet order. No
+    silent picking.
 
 ### Phase 3 — Replace Canonical `CommitNode` + Remove `Plan.timeline` (atomic)
 
