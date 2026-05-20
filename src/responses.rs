@@ -365,6 +365,7 @@ pub fn build_work_payload(inputs: WorkPayloadInputs<'_>) -> trinity_core::api::W
         R::SessionFinished => A::SessionFinished,
     };
     trinity_core::api::WorkPayload {
+        plans: vec![inputs.plan_id.to_string()],
         plan_id: inputs.plan_id.to_string(),
         repo: inputs.repo_root.to_string_lossy().into_owned(),
         action,

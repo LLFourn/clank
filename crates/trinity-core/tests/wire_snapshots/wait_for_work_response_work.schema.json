@@ -5,6 +5,9 @@
     "path": "string"
   },
   "plan_id": "string",
+  "plans": [
+    "string"
+  ],
   "repo": "string",
   "target_sha": "string"
 }

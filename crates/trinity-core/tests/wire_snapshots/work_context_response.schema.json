@@ -9,6 +9,9 @@
   },
   "plan_id": "string",
   "plan_worktree_status": "string",
+  "plans": [
+    "string"
+  ],
   "repo": "string",
   "target_sha": "string",
   "waiting_on": {

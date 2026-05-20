@@ -97,7 +97,7 @@ async fn wait_for_work(state: &AppState, req: &ToolCallRequest) -> Result<Value,
 fn map_wait_error(e: WaitError) -> ToolError {
     match e {
         WaitError::InvalidRole(_)
-        | WaitError::MissingPlanId
+        | WaitError::MissingRepoForRepoScope
         | WaitError::MissingAuthorLabel
         | WaitError::InvalidAuthorLabel(_)
         | WaitError::InvalidPlanId(_) => ToolError::Invalid(e.to_string()),

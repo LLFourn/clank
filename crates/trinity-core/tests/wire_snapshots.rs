@@ -222,6 +222,7 @@ fn schema_list_plans_response() {
 fn schema_work_context_response() {
     let v = serde_json::to_value(WorkContextResponse {
         work: WorkPayload {
+            plans: vec!["trinity/foo.md".into()],
             plan_id: "trinity/foo.md".into(),
             repo: "/r".into(),
             action: ExpectedAction::WriteFeedback {
@@ -415,6 +416,7 @@ fn schema_delete_repo_outcome() {
 fn schema_wait_for_work_work() {
     let v = serde_json::to_value(WaitForWorkResponse::Work(WaitWorkPayload {
         work: WorkPayload {
+            plans: vec!["trinity/foo.md".into()],
             plan_id: "trinity/foo.md".into(),
             repo: "/r".into(),
             action: ExpectedAction::WriteFeedback {

@@ -135,7 +135,7 @@ async fn api_wait_for_work(
         .await
         .map_err(|e| match e {
             WaitError::InvalidRole(_)
-            | WaitError::MissingPlanId
+            | WaitError::MissingRepoForRepoScope
             | WaitError::MissingAuthorLabel
             | WaitError::InvalidAuthorLabel(_)
             | WaitError::InvalidPlanId(_) => AppError {

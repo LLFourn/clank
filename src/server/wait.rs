@@ -36,16 +36,18 @@ const DEFAULT_TIMEOUT_SECS: u64 = 1800;
 #[derive(Debug, Deserialize)]
 pub struct WaitArgs {
     pub role: WaitingRole,
-    /// Optional under phase 2.9. When omitted, the MCP dispatcher
-    /// infers the plan from `repo` (or the caller's cwd) — see
-    /// `resolve_plan_id`. The HTTP surface still requires a value
-    /// here because it has no cwd context; HTTP callers must pre-
-    /// resolve plan_id.
+    /// Optional plan filter. Phase 3 of `commit-first-review-model`
+    /// makes this a filter rather than the primary key: when omitted
+    /// (empty string), the matcher walks all active visible plans in
+    /// the resolved repo and returns the first plan needing the
+    /// caller's role. When supplied, the matcher filters to that
+    /// plan exclusively.
     #[serde(default)]
     pub plan_id: String,
-    /// Optional repo filter (basename or absolute path) used by the
-    /// inference path when `plan_id` is omitted. Ignored when
-    /// `plan_id` is explicit.
+    /// Optional repo scope. Required when `plan_id` is empty so the
+    /// matcher knows which repo to fan out across. Accepted as a
+    /// basename or absolute path (canonical lookup happens via
+    /// `repo_basenames` on the daemon side).
     #[serde(default)]
     pub repo: Option<String>,
     /// Optional on the wire so schema-strict MCP clients allow the shim
@@ -66,8 +68,8 @@ pub use trinity_core::api::WaitForWorkResponse as WaitResponse;
 pub enum WaitError {
     #[error("invalid role: {0} (expected `master` or `reviewers`)")]
     InvalidRole(String),
-    #[error("plan_id is required")]
-    MissingPlanId,
+    #[error("repo is required when plan_id is omitted")]
+    MissingRepoForRepoScope,
     #[error("author_label is required")]
     MissingAuthorLabel,
     #[error("invalid plan_id: {0}")]
@@ -89,11 +91,7 @@ pub enum WaitError {
 ///   `{timed_out: true}` with no work.
 pub async fn wait_for_work(runtime: &Runtime, args: WaitArgs) -> Result<WaitResponse, WaitError> {
     let role = args.role;
-    if args.plan_id.is_empty() {
-        return Err(WaitError::MissingPlanId);
-    }
-    let plan_id = crate::lifecycle::PlanId::parse(&args.plan_id)
-        .map_err(|e| WaitError::InvalidPlanId(e.to_string()))?;
+    let plan_filter = parse_plan_filter(&args)?;
     let author_label = args
         .author_label
         .as_deref()
@@ -107,7 +105,7 @@ pub async fn wait_for_work(runtime: &Runtime, args: WaitArgs) -> Result<WaitResp
     let started_at = Instant::now();
     let mut rx = runtime.subscribe_events();
 
-    if let Some(m) = compute_match(runtime, &plan_id, role, &author).await? {
+    if let Some(m) = compute_match(runtime, plan_filter.as_ref(), role, &author).await? {
         let payload = enrich_for_wait(runtime, m, role, &author).await;
         return Ok(WaitResponse::Work(payload));
     }
@@ -124,14 +122,16 @@ pub async fn wait_for_work(runtime: &Runtime, args: WaitArgs) -> Result<WaitResp
         }
         match tokio::time::timeout(remaining, rx.recv()).await {
             Ok(Ok(_event)) => {
-                if let Some(m) = compute_match(runtime, &plan_id, role, &author).await? {
+                if let Some(m) = compute_match(runtime, plan_filter.as_ref(), role, &author).await?
+                {
                     let payload = enrich_for_wait(runtime, m, role, &author).await;
                     return Ok(WaitResponse::Work(payload));
                 }
             }
             Ok(Err(RecvError::Lagged(_))) => {
                 rx = runtime.subscribe_events();
-                if let Some(m) = compute_match(runtime, &plan_id, role, &author).await? {
+                if let Some(m) = compute_match(runtime, plan_filter.as_ref(), role, &author).await?
+                {
                     let payload = enrich_for_wait(runtime, m, role, &author).await;
                     return Ok(WaitResponse::Work(payload));
                 }
@@ -145,6 +145,34 @@ pub async fn wait_for_work(runtime: &Runtime, args: WaitArgs) -> Result<WaitResp
             }
         }
     }
+}
+
+/// Resolve the (plan_id, repo) inputs into a `PlanFilter`.
+///
+/// - `plan_id` present → `PlanFilter::Plan(parsed_id)`.
+/// - `plan_id` empty, `repo` present → `PlanFilter::RepoScope(repo_ref)`.
+/// - both empty → `WaitError::MissingRepoForRepoScope`.
+fn parse_plan_filter(args: &WaitArgs) -> Result<Option<PlanFilter>, WaitError> {
+    if !args.plan_id.is_empty() {
+        let id = crate::lifecycle::PlanId::parse(&args.plan_id)
+            .map_err(|e| WaitError::InvalidPlanId(e.to_string()))?;
+        return Ok(Some(PlanFilter::Plan(id)));
+    }
+    match args.repo.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        Some(repo) => Ok(Some(PlanFilter::RepoScope(repo.to_string()))),
+        None => Err(WaitError::MissingRepoForRepoScope),
+    }
+}
+
+/// Where the matcher should look for work. Phase 3 of
+/// `commit-first-review-model` distinguishes a single-plan filter
+/// from a repo-wide scan; Phase 4 will add an `AdHoc` ad-hoc-commits
+/// scope (today repo-scope already includes them once they become
+/// reviewable).
+#[derive(Debug, Clone)]
+pub(crate) enum PlanFilter {
+    Plan(crate::lifecycle::PlanId),
+    RepoScope(String),
 }
 
 /// Derive the long-poll duration from the caller's `timeout_secs`.
@@ -171,23 +199,46 @@ pub(crate) struct WaitMatch {
     pub current_target_sha: Option<CommitSha>,
 }
 
-/// Snapshot the candidate under lock, release, then disk-read
-/// `plan_worktree_status` and derive the work payload if any.
-/// Returns the canonical repo root and plan key alongside the
-/// payload so enrichment can key caches off the same path object
-/// `add_repo` stored — no wire-string round-trip.
+/// Snapshot candidate(s) under lock, release, then per-candidate
+/// derive worktree status + build the work payload. Returns the
+/// first plan needing the caller's role.
+///
+/// - `PlanFilter::Plan(id)` → behavior unchanged from pre-Phase-3:
+///   one candidate, return it if it produces a match.
+/// - `PlanFilter::RepoScope(repo)` → enumerate all active visible
+///   plans in the resolved repo, try matching each (in plan-key
+///   order), return the first one that produces work. Today's
+///   ordering matches the BTreeMap iteration over `plans`; the
+///   per-commit chronological-walk Phase 4 introduces only changes
+///   how ad hoc commits join the candidate stream.
 async fn compute_match(
     runtime: &Runtime,
-    plan_id: &crate::lifecycle::PlanId,
+    filter: Option<&PlanFilter>,
     role: WaitingRole,
     author: &AgentLabel,
 ) -> Result<Option<WaitMatch>, WaitError> {
-    let candidate = {
+    let candidates = {
         let trinity_arc = runtime.state();
         let trinity = trinity_arc.lock().await;
-        collect_candidate(&trinity, plan_id)
-    }?;
+        collect_candidates(&trinity, filter)?
+    };
 
+    for candidate in candidates {
+        if let Some(m) = try_match_candidate(candidate, role, author)? {
+            return Ok(Some(m));
+        }
+    }
+    Ok(None)
+}
+
+/// Per-candidate matching: status check, role gate, caller-already-
+/// voted guard, payload build. Returns the produced `WaitMatch` or
+/// `None` if this candidate doesn't carry work for the caller.
+fn try_match_candidate(
+    candidate: Candidate,
+    role: WaitingRole,
+    author: &AgentLabel,
+) -> Result<Option<WaitMatch>, WaitError> {
     let status = compute_plan_worktree_status_parts(
         &candidate.repo_root,
         &candidate.plan_path,
@@ -199,16 +250,9 @@ async fn compute_match(
             crate::repo_state::PlanWorktreeStatus::PlanFileMissing
         )
     {
-        // Active plan with its file uncommitted-deleted is hidden
-        // (Plan::is_visible). No work for either role until the
-        // operator restores or commits the deletion.
         return Ok(None);
     }
     let w = waiting_on(candidate.is_finished, status, candidate.gate.as_ref());
-    // SessionFinished is terminal for every participant — wake any
-    // role. Keyed off the projected reason (not a second
-    // finished-ness check) so `waiting_on` stays the single source
-    // of truth for what work exists.
     let terminal = matches!(w.reason, WaitingReason::SessionFinished);
     if !terminal && w.role != role {
         return Ok(None);
@@ -218,17 +262,13 @@ async fn compute_match(
         return Ok(None);
     }
 
-    // Shared builder: `wait_for_work` and `work_context` both call
-    // `responses::build_work_payload` so the work-prefix shape is
-    // identical by construction. Candidate fields feed
-    // `WorkPayloadInputs` directly.
     let current_reviews = candidate
         .gate
         .as_ref()
         .map(crate::responses::current_reviews_from_gate)
         .unwrap_or_default();
     let payload = crate::responses::build_work_payload(crate::responses::WorkPayloadInputs {
-        plan_id: &plan_id.to_string(),
+        plan_id: &candidate.plan_id_str,
         repo_root: &candidate.repo_root,
         plan_key: &candidate.plan_key,
         plan_path: &candidate.plan_path,
@@ -469,6 +509,9 @@ fn caller_already_voted(cand: &Candidate, reason: WaitingReason, author: &AgentL
 struct Candidate {
     repo_root: PathBuf,
     plan_key: PlanKey,
+    /// Wire-form plan id `<basename>/<stem>.md`. Pre-computed so the
+    /// per-candidate match path doesn't re-derive it.
+    plan_id_str: String,
     plan_path: String,
     body_hash: ContentHash,
     is_finished: bool,
@@ -486,7 +529,45 @@ struct Candidate {
     review_target_kind: Option<crate::repo_state::CommitKind>,
 }
 
-fn collect_candidate(
+fn collect_candidates(
+    trinity: &Trinity,
+    filter: Option<&PlanFilter>,
+) -> Result<Vec<Candidate>, WaitError> {
+    match filter {
+        Some(PlanFilter::Plan(plan_id)) => Ok(vec![collect_candidate_by_plan(trinity, plan_id)?]),
+        Some(PlanFilter::RepoScope(repo)) => collect_candidates_for_repo(trinity, repo),
+        None => Err(WaitError::MissingRepoForRepoScope),
+    }
+}
+
+fn collect_candidates_for_repo(
+    trinity: &Trinity,
+    repo_ref: &str,
+) -> Result<Vec<Candidate>, WaitError> {
+    let basename = crate::lifecycle::RepoBasename::parse(repo_ref)
+        .map_err(|_| WaitError::UnknownRepo(repo_ref.to_string()))?;
+    let repo_root = trinity
+        .repo_basenames
+        .get(&basename)
+        .ok_or_else(|| WaitError::UnknownRepo(repo_ref.to_string()))?
+        .clone();
+    let repo_state = trinity
+        .repos
+        .get(&repo_root)
+        .ok_or_else(|| WaitError::UnknownRepo(repo_ref.to_string()))?;
+    Ok(repo_state
+        .plans
+        .keys()
+        .filter(|key| !repo_state.plan_conflicts.contains_key(*key))
+        .filter_map(|key| {
+            let plan = repo_state.plans.get(key)?;
+            let plan_id = crate::lifecycle::PlanId::new(basename.clone(), key.clone());
+            Some(build_candidate(repo_root.clone(), plan_id, plan, repo_state))
+        })
+        .collect())
+}
+
+fn collect_candidate_by_plan(
     trinity: &Trinity,
     plan_id: &crate::lifecycle::PlanId,
 ) -> Result<Candidate, WaitError> {
@@ -509,21 +590,31 @@ fn collect_candidate(
         .plans
         .get(plan_id.key())
         .ok_or_else(|| WaitError::UnknownPlan(plan_id.to_string()))?;
+    Ok(build_candidate(repo_root, plan_id.clone(), plan, repo_state))
+}
+
+fn build_candidate(
+    repo_root: PathBuf,
+    plan_id: crate::lifecycle::PlanId,
+    plan: &crate::repo_state::Plan,
+    repo_state: &crate::repo_state::RepoState,
+) -> Candidate {
     let review_target = crate::projection::latest_reviewable_commit_for(plan);
     let review_target_kind = review_target
         .as_ref()
         .map(|sha| crate::projection::commit_kind_for(plan, sha));
     let gate = crate::projection::latest_reviewable_commit_gate_for(plan, repo_state).cloned();
-    Ok(Candidate {
+    Candidate {
         repo_root,
         plan_key: plan.id.clone(),
+        plan_id_str: plan_id.to_string(),
         plan_path: plan.plan_path.clone(),
         body_hash: plan.body_hash.clone(),
         is_finished: plan.is_frozen(),
         gate,
         review_target,
         review_target_kind,
-    })
+    }
 }
 
 #[cfg(test)]
@@ -565,6 +656,7 @@ mod tests {
         Candidate {
             repo_root: PathBuf::from("/repo"),
             plan_key: PlanKey::parse("sid").unwrap(),
+            plan_id_str: "trinity/sid.md".to_string(),
             plan_path: ".trinity/plans/sid.md".to_string(),
             body_hash: content_hash("x"),
             is_finished: false,
@@ -924,6 +1016,66 @@ mod integration_tests {
             locations[0]
         );
         assert!(locations[0].ends_with("/codex.md"));
+    }
+
+    /// Phase 3 of commit-first-review-model: `wait_for_work` accepts
+    /// an empty plan_id + a `repo` scope and fans out across the
+    /// repo's active visible plans, returning the first plan needing
+    /// the caller's role.
+    #[tokio::test]
+    async fn repo_scope_finds_first_plan_needing_role() {
+        let dir = init_repo();
+        write_file(dir.path(), ".trinity/plans/alpha.md", "# alpha\n");
+        commit(dir.path(), "intro alpha");
+        write_file(dir.path(), ".trinity/plans/beta.md", "# beta\n");
+        commit(dir.path(), "intro beta");
+        let rt = Runtime::new();
+        rt.add_repo(dir.path().to_path_buf()).await.unwrap();
+
+        let basename = dir
+            .path()
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap()
+            .to_string();
+        let repo_scope_args = WaitArgs {
+            role: WaitingRole::Reviewers,
+            plan_id: String::new(),
+            repo: Some(basename.clone()),
+            author_label: Some("codex".to_string()),
+            timeout_secs: Some(2),
+        };
+        let resp = wait_for_work(&rt, repo_scope_args).await.unwrap();
+        let payload = match resp {
+            WaitResponse::Work(p) => p,
+            WaitResponse::Timeout(_) => panic!("expected work on repo-scope wait, got timeout"),
+        };
+        assert!(
+            payload.work.plans.iter().any(|p| p.contains("alpha.md") || p.contains("beta.md")),
+            "expected plan filter to identify alpha or beta; got plans={:?}",
+            payload.work.plans
+        );
+    }
+
+    /// Phase 3 regression: empty plan_id + empty repo must error
+    /// (the matcher needs a scope).
+    #[tokio::test]
+    async fn missing_repo_with_empty_plan_id_errors() {
+        let dir = init_repo();
+        write_file(dir.path(), ".trinity/plans/foo.md", "# foo\n");
+        commit(dir.path(), "add foo");
+        let rt = Runtime::new();
+        rt.add_repo(dir.path().to_path_buf()).await.unwrap();
+
+        let no_scope_args = WaitArgs {
+            role: WaitingRole::Reviewers,
+            plan_id: String::new(),
+            repo: None,
+            author_label: Some("codex".to_string()),
+            timeout_secs: Some(2),
+        };
+        let err = wait_for_work(&rt, no_scope_args).await.unwrap_err();
+        assert!(matches!(err, WaitError::MissingRepoForRepoScope));
     }
 
     #[tokio::test]

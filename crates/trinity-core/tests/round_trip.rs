@@ -328,6 +328,7 @@ fn live_event_plan_feedback_changed_has_no_extra_fields() {
 #[test]
 fn work_payload_write_feedback_round_trips() {
     let payload = WorkPayload {
+        plans: vec!["trinity/foo.md".into()],
         plan_id: "trinity/foo.md".into(),
         repo: "/r".into(),
         action: ExpectedAction::WriteFeedback {
@@ -355,6 +356,7 @@ fn work_payload_write_feedback_round_trips() {
 #[test]
 fn work_payload_session_finished_round_trips() {
     let payload = WorkPayload {
+        plans: vec!["trinity/foo.md".into()],
         plan_id: "trinity/foo.md".into(),
         repo: "/r".into(),
         action: ExpectedAction::SessionFinished,

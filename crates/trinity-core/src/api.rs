@@ -945,6 +945,18 @@ pub struct WaitTimeout {
 /// same projection (`responses::build_work_payload`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkPayload {
+    /// Plans this commit is attributed to. Phase 3 of
+    /// `commit-first-review-model`: when work is plan-attributed, this
+    /// is `[<plan_id>]` (length 1). When work is ad hoc (Phase 4) this
+    /// is empty. Multi-plan commits (rare; non-reviewable) never
+    /// surface here.
+    #[serde(default)]
+    pub plans: Vec<String>,
+    /// Singular plan_id mirror — populated as `plans[0]` when present,
+    /// empty string otherwise. Kept through the commit-first
+    /// transition so existing wire consumers (`wfw-local` agents that
+    /// pre-date the model change) keep working. Future cleanup
+    /// removes this field once consumers migrate to `plans`.
     pub plan_id: String,
     pub repo: String,
     #[serde(flatten)]
