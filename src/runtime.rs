@@ -385,43 +385,67 @@ impl Runtime {
                     Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
                     Err(e) => return Err(e.into()),
                 };
-                let session_id = parsed.plan_key.clone();
                 let mut trinity = self.state.lock().await;
                 let Some(state) = trinity.repos.get_mut(repo_root) else {
                     return Err(RuntimeError::UnknownRepo(repo_root.to_path_buf()));
                 };
-                if !state.plans.contains_key(&session_id) {
-                    return Ok(());
-                }
+                let target = parsed.target.clone();
                 upsert_feedback(state, abs_path, parsed, body);
-                refresh_commits_for(state, &session_id);
-                let Some(lifecycle) = state.plans.get(&session_id).map(|p| p.lifecycle()) else {
-                    return Ok(());
-                };
-                let Some(plan_id) = plan_id_for(repo_root, &session_id) else {
-                    return Ok(());
-                };
-                self.push_event(
-                    &mut trinity,
-                    LiveEvent::Plan(PlanEvent {
-                        ts: now,
-                        repo: repo_root.to_path_buf(),
-                        plan_id,
-                        lifecycle,
-                        payload: PlanEventPayload::FeedbackChanged {},
-                    }),
-                );
+                match target {
+                    crate::disk_format::FeedbackTarget::Plan(session_id) => {
+                        if !state.plans.contains_key(&session_id) {
+                            return Ok(());
+                        }
+                        refresh_commits_for(state, &session_id);
+                        let Some(lifecycle) =
+                            state.plans.get(&session_id).map(|p| p.lifecycle())
+                        else {
+                            return Ok(());
+                        };
+                        let Some(plan_id) = plan_id_for(repo_root, &session_id) else {
+                            return Ok(());
+                        };
+                        self.push_event(
+                            &mut trinity,
+                            LiveEvent::Plan(PlanEvent {
+                                ts: now,
+                                repo: repo_root.to_path_buf(),
+                                plan_id,
+                                lifecycle,
+                                payload: PlanEventPayload::FeedbackChanged {},
+                            }),
+                        );
+                    }
+                    crate::disk_format::FeedbackTarget::AdHoc => {
+                        // Ad hoc feedback writes go to the targeted
+                        // CommitNode's gate directly (no per-plan
+                        // timeline to refresh). The matcher walks
+                        // commit_order and will pick up the new
+                        // verdict on the next compute_match. Phase
+                        // 4 ships the basic write path; a follow-up
+                        // can add a repo-level SSE event for ad hoc
+                        // feedback if the UI needs it.
+                    }
+                }
             }
             FilesystemSignal::FeedbackRemoved { parsed } => {
                 let mut trinity = self.state.lock().await;
                 let Some(state) = trinity.repos.get_mut(repo_root) else {
                     return Err(RuntimeError::UnknownRepo(repo_root.to_path_buf()));
                 };
-                let session_id = parsed.plan_key.clone();
+                let target = parsed.target.clone();
+                remove_feedback(state, &parsed);
+                let session_id = match target {
+                    crate::disk_format::FeedbackTarget::Plan(s) => s,
+                    crate::disk_format::FeedbackTarget::AdHoc => {
+                        // Ad hoc removal: gate cleared in place; no
+                        // per-plan timeline to refresh.
+                        return Ok(());
+                    }
+                };
                 if !state.plans.contains_key(&session_id) {
                     return Ok(());
                 }
-                remove_feedback(state, &parsed);
                 refresh_commits_for(state, &session_id);
                 let Some(lifecycle) = state.plans.get(&session_id).map(|p| p.lifecycle()) else {
                     return Ok(());
@@ -490,16 +514,21 @@ fn upsert_feedback(
         return;
     };
     // Phase 2 of commit-first-review-model: the gate lives on the
-    // commit, not the per-plan timeline event. Verify the commit
-    // belongs to the plan named in the feedback path; otherwise
-    // we're being asked to write a plan's feedback to a different
-    // plan's (or ad hoc) commit — refuse rather than silently
-    // mis-attribute.
-    let belongs_to_plan = match &node.attribution {
-        crate::repo_state::CommitAttribution::Plan { plan } => plan == &parsed.plan_key,
+    // commit, not the per-plan timeline event. Verify the feedback
+    // path's target matches the commit's attribution; otherwise
+    // we're being asked to write feedback to the wrong scope.
+    let matches_attribution = match (&parsed.target, &node.attribution) {
+        (
+            crate::disk_format::FeedbackTarget::Plan(plan_key),
+            crate::repo_state::CommitAttribution::Plan { plan },
+        ) => plan_key == plan,
+        (
+            crate::disk_format::FeedbackTarget::AdHoc,
+            crate::repo_state::CommitAttribution::AdHoc,
+        ) => true,
         _ => false,
     };
-    if !belongs_to_plan {
+    if !matches_attribution {
         return;
     }
     let Some(gate) = node.gate.as_mut() else {
@@ -525,17 +554,23 @@ fn remove_feedback(
         return;
     };
     // Symmetric ownership check with upsert_feedback. A removed
-    // feedback file's path encodes which plan it belongs to; if that
-    // plan does not own the commit (or the commit is non-reviewable),
-    // the remove event is stale or malformed and must not touch the
-    // owning plan's gate. Without this guard a `FeedbackRemoved` for
+    // feedback file's path encodes which target it belongs to (a
+    // specific plan, or `_` for ad hoc); the commit's attribution
+    // must match. Without this guard a `FeedbackRemoved` for
     // `.trinity/feedback/other-plan/<sha>/alice.md` could delete
     // Alice's real feedback from a commit owned by `this-plan`.
-    let belongs_to_plan = match &node.attribution {
-        crate::repo_state::CommitAttribution::Plan { plan } => plan == &parsed.plan_key,
+    let matches_attribution = match (&parsed.target, &node.attribution) {
+        (
+            crate::disk_format::FeedbackTarget::Plan(plan_key),
+            crate::repo_state::CommitAttribution::Plan { plan },
+        ) => plan_key == plan,
+        (
+            crate::disk_format::FeedbackTarget::AdHoc,
+            crate::repo_state::CommitAttribution::AdHoc,
+        ) => true,
         _ => false,
     };
-    if !belongs_to_plan {
+    if !matches_attribution {
         return;
     }
     if let Some(gate) = node.gate.as_mut() {
@@ -657,7 +692,7 @@ mod tests {
         // claiming the feedback file belongs to a DIFFERENT plan
         // ("other") but targeting the same SHA + author.
         let parsed = FeedbackPath {
-            plan_key: other.clone(),
+            target: crate::disk_format::FeedbackTarget::Plan(other.clone()),
             target_sha: sha.clone(),
             author: alice.clone(),
             raw: PathBuf::from("other/aaa/alice.md"),

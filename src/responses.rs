@@ -318,10 +318,10 @@ pub fn build_work_payload(inputs: WorkPayloadInputs<'_>) -> trinity_core::api::W
             A::WriteFeedback {
                 path: crate::disk_format::feedback_path_wire(inputs.plan_key, &sha, inputs.author),
                 target_sha: sha,
-                plan_file: trinity_core::api::PlanFile {
+                plan_file: Some(trinity_core::api::PlanFile {
                     path: inputs.plan_path.to_string(),
                     content: None,
-                },
+                }),
             }
         }
         R::AddressCommitChanges => {

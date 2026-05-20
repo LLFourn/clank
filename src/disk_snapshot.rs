@@ -24,6 +24,7 @@ use std::path::PathBuf;
 use crate::attribution::{CommitChanges, FinalizeChangeKind, classify, effective_session};
 use crate::disk_format::{FeedbackPath, finalize_first_line_starts_with_approve, parse_verdict};
 use crate::lifecycle::{AgentLabel, CommitSha, PlanKey, content_hash};
+use crate::disk_format::FeedbackTarget;
 use crate::repo_state::{
     AttributionResult, BaseRepoState, CommitAttribution, CommitKind, CommitNode, Feedback,
     LiveRepoState, Plan, PlanTimelineEvent, PlanTouchKind, RepoState, Verdict,
@@ -112,16 +113,87 @@ pub fn attach_live_feedback(
     base: BaseRepoState,
     feedback_files: Vec<FeedbackBlob>,
 ) -> LiveRepoState {
+    attach_live_feedback_with_config(base, feedback_files, &crate::cli::config::Config::default())
+}
+
+/// Phase 4 of `commit-first-review-model`: the live-feedback
+/// overlay is config-aware so ad hoc commit reviewability can be
+/// turned off (`force_review_on_misc_commits = false`) and the
+/// reviewer set can be pinned via `ad_hoc_reviewers`. The
+/// config-less wrapper above uses defaults; the daemon and CLI
+/// call this variant directly with a loaded `Config`.
+pub fn attach_live_feedback_with_config(
+    base: BaseRepoState,
+    feedback_files: Vec<FeedbackBlob>,
+    config: &crate::cli::config::Config,
+) -> LiveRepoState {
     let mut state = base.into_inner();
 
-    // Index feedback by plan. Per-plan we'll walk the timeline once.
+    // Repo-wide feedback-author set (Q1 of the plan): every label
+    // that has authored any feedback on the current branch's
+    // history becomes a potential ad hoc reviewer. Built before we
+    // partition by target so plan AND ad-hoc feedback both
+    // contribute. Excludes ad-hoc commit authors at gate-build
+    // time, not here.
+    let branch_authors: BTreeSet<AgentLabel> = feedback_files
+        .iter()
+        .map(|fb| fb.parsed.author.clone())
+        .collect();
+
+    // Partition feedback into per-plan groups + a separate ad-hoc
+    // bucket. Phase 4: ad hoc paths use `_` as the reserved
+    // segment, parsed into `FeedbackTarget::AdHoc`.
     let mut by_plan: BTreeMap<PlanKey, Vec<FeedbackBlob>> = BTreeMap::new();
+    let mut ad_hoc: Vec<FeedbackBlob> = Vec::new();
     for fb in feedback_files {
-        by_plan
-            .entry(fb.parsed.plan_key.clone())
-            .or_default()
-            .push(fb);
+        match &fb.parsed.target {
+            FeedbackTarget::Plan(key) => {
+                by_plan.entry(key.clone()).or_default().push(fb);
+            }
+            FeedbackTarget::AdHoc => ad_hoc.push(fb),
+        }
     }
+
+    // Build ad hoc commit gates BEFORE writing per-plan feedback
+    // so the by-SHA gate exists when an ad hoc feedback file lands
+    // on the same SHA later in the walk. Gate construction
+    // respects `force_review_on_misc_commits` and the optional
+    // `ad_hoc_reviewers` override.
+    if config.review.force_review_on_misc_commits {
+        let participants = ad_hoc_participants(config, &branch_authors);
+        if !participants.is_empty() {
+            build_ad_hoc_gates(&mut state, &participants);
+        }
+    }
+
+    // Write each ad hoc feedback blob into the matching commit's
+    // gate. Ownership + reviewability checks happen inline.
+    for fb in ad_hoc {
+        let Some(node) = state.commits.get_mut(&fb.parsed.target_sha) else {
+            continue;
+        };
+        if !matches!(node.attribution, CommitAttribution::AdHoc) {
+            continue;
+        }
+        let Some(gate) = node.gate.as_mut() else {
+            continue;
+        };
+        let verdict = parse_verdict(&fb.body);
+        let feedback = Feedback {
+            author: fb.parsed.author.clone(),
+            verdict,
+            body: fb.body,
+            path: fb.abs_path.to_string_lossy().into_owned(),
+            created_at: fb.created_at,
+        };
+        gate.feedback.insert(feedback.author.clone(), feedback);
+    }
+    // Recompose every ad hoc gate's approvers/requesters/missing/
+    // state from its accumulated feedback. Cumulative participants
+    // don't apply per-commit for ad hoc — each ad hoc commit is its
+    // own review unit — but the role/verdict aggregation still
+    // needs to run.
+    rebuild_ad_hoc_gates(&mut state);
 
     for (plan_key, blobs) in by_plan {
         let Some(plan) = state.plans.get(&plan_key) else {
@@ -148,17 +220,17 @@ pub fn attach_live_feedback(
             let Some(node) = state.commits.get_mut(&target) else {
                 continue;
             };
-            // The commit's attribution must include this plan for the
-            // feedback to land — otherwise the path is malformed
-            // (e.g. typo, ad hoc commit's feedback being filed under
-            // a real plan key). Phase 4 routes ad hoc feedback via
-            // the `_` reserved key, not a plan key, so this gate is
-            // strict by design.
-            let belongs_to_plan = match &node.attribution {
-                CommitAttribution::Plan { plan } => plan == &plan_key,
-                _ => false,
-            };
-            if !belongs_to_plan {
+            // The commit's attribution must match the feedback path.
+            // Ad hoc feedback was already split off above; this loop
+            // only sees `FeedbackTarget::Plan` entries.
+            let matches_attribution = matches!(
+                (&fb.parsed.target, &node.attribution),
+                (
+                    FeedbackTarget::Plan(p),
+                    CommitAttribution::Plan { plan },
+                ) if p == plan
+            );
+            if !matches_attribution {
                 continue;
             }
             let Some(gate) = node.gate.as_mut() else {
@@ -188,6 +260,75 @@ pub fn attach_live_feedback(
     }
 
     LiveRepoState::new(state)
+}
+
+/// Compute the participant set for ad hoc commit gates. Config
+/// override (`ad_hoc_reviewers`) wins; otherwise derive from the
+/// repo's branch feedback authors.
+fn ad_hoc_participants(
+    config: &crate::cli::config::Config,
+    branch_authors: &BTreeSet<AgentLabel>,
+) -> Vec<AgentLabel> {
+    if let Some(explicit) = &config.review.ad_hoc_reviewers {
+        return explicit.clone();
+    }
+    branch_authors.iter().cloned().collect()
+}
+
+/// For each `CommitAttribution::AdHoc` commit, install an empty
+/// `Unreviewed` gate with the supplied participant set. Existing
+/// gates (rare; shouldn't happen for AdHoc post-fold) are left
+/// alone so re-runs are idempotent.
+fn build_ad_hoc_gates(state: &mut RepoState, participants: &[AgentLabel]) {
+    for node in state.commits.values_mut() {
+        if !matches!(node.attribution, CommitAttribution::AdHoc) {
+            continue;
+        }
+        if node.gate.is_some() {
+            continue;
+        }
+        node.gate = Some(CommitGate {
+            state: CommitGateState::Unreviewed,
+            participants: participants.to_vec(),
+            approvers: Vec::new(),
+            requesters: Vec::new(),
+            ambiguous: Vec::new(),
+            missing: participants.to_vec(),
+            feedback: BTreeMap::new(),
+        });
+    }
+}
+
+/// After ad hoc feedback has been written into per-commit gates,
+/// recompute each gate's approvers/requesters/ambiguous/missing/
+/// state from its accumulated feedback. Unlike per-plan gates, ad
+/// hoc commits do NOT carry cumulative participants — each commit
+/// is its own review unit.
+fn rebuild_ad_hoc_gates(state: &mut RepoState) {
+    for node in state.commits.values_mut() {
+        if !matches!(node.attribution, CommitAttribution::AdHoc) {
+            continue;
+        }
+        let Some(gate) = node.gate.as_mut() else {
+            continue;
+        };
+        let participants = gate.participants.clone();
+        let feedback = gate.feedback.clone();
+        // compose_gate appends new feedback authors to participants;
+        // for ad hoc we want a FIXED participant set, so we recompose
+        // without participant mutation by snapshotting + restoring.
+        let mut participants_carry = participants.clone();
+        let recomposed = compose_gate(&node.sha, feedback, &mut participants_carry);
+        *gate = CommitGate {
+            state: recomposed.state,
+            participants,
+            approvers: recomposed.approvers,
+            requesters: recomposed.requesters,
+            ambiguous: recomposed.ambiguous,
+            missing: recomposed.missing,
+            feedback: recomposed.feedback,
+        };
+    }
 }
 
 /// Rebuild every reviewable gate that belongs to `plan_key`, walking
@@ -872,7 +1013,7 @@ mod tests {
                 "/r/.trinity/feedback/{session}/{target}/{author}.md"
             )),
             parsed: FeedbackPath {
-                plan_key: sess(session),
+                target: FeedbackTarget::Plan(sess(session)),
                 target_sha: sha(target),
                 author: AgentLabel::parse(author).unwrap(),
                 raw: PathBuf::from(format!("{session}/{target}/{author}.md")),

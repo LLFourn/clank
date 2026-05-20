@@ -334,10 +334,10 @@ fn work_payload_write_feedback_round_trips() {
         action: ExpectedAction::WriteFeedback {
             path: ".trinity/feedback/foo/abc/codex.md".into(),
             target_sha: "abc".into(),
-            plan_file: PlanFile {
+            plan_file: Some(PlanFile {
                 path: ".trinity/plans/foo.md".into(),
                 content: None,
-            },
+            }),
         },
     };
     let v = serde_json::to_value(&payload).unwrap();

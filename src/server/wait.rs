@@ -264,12 +264,45 @@ fn try_match_candidate(
     role: WaitingRole,
     author: &AgentLabel,
 ) -> Result<Option<WaitMatch>, WaitError> {
-    let status = compute_plan_worktree_status_parts(
-        &candidate.repo_root,
-        &candidate.plan_path,
-        &candidate.body_hash,
-    )?;
-    if !candidate.is_finished
+    match candidate.kind.clone() {
+        CandidateKind::Plan {
+            plan_key,
+            plan_id_str,
+            plan_path,
+            body_hash,
+            is_finished,
+            review_target_kind,
+        } => try_match_plan_candidate(
+            candidate,
+            plan_key,
+            plan_id_str,
+            plan_path,
+            body_hash,
+            is_finished,
+            review_target_kind,
+            role,
+            author,
+        ),
+        CandidateKind::AdHoc { sha } => {
+            try_match_ad_hoc_candidate(candidate, sha, role, author)
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn try_match_plan_candidate(
+    candidate: Candidate,
+    plan_key: PlanKey,
+    plan_id_str: String,
+    plan_path: String,
+    body_hash: ContentHash,
+    is_finished: bool,
+    review_target_kind: Option<crate::repo_state::CommitKind>,
+    role: WaitingRole,
+    author: &AgentLabel,
+) -> Result<Option<WaitMatch>, WaitError> {
+    let status = compute_plan_worktree_status_parts(&candidate.repo_root, &plan_path, &body_hash)?;
+    if !is_finished
         && matches!(
             status,
             crate::repo_state::PlanWorktreeStatus::PlanFileMissing
@@ -277,12 +310,13 @@ fn try_match_candidate(
     {
         return Ok(None);
     }
-    let w = waiting_on(candidate.is_finished, status, candidate.gate.as_ref());
+    let w = waiting_on(is_finished, status, candidate.gate.as_ref());
     let terminal = matches!(w.reason, WaitingReason::SessionFinished);
     if !terminal && w.role != role {
         return Ok(None);
     }
-    if matches!(role, WaitingRole::Reviewers) && caller_already_voted(&candidate, w.reason, author)
+    if matches!(role, WaitingRole::Reviewers)
+        && caller_already_voted(candidate.gate.as_ref(), w.reason, author)
     {
         return Ok(None);
     }
@@ -293,22 +327,129 @@ fn try_match_candidate(
         .map(crate::responses::current_reviews_from_gate)
         .unwrap_or_default();
     let payload = crate::responses::build_work_payload(crate::responses::WorkPayloadInputs {
-        plan_id: &candidate.plan_id_str,
+        plan_id: &plan_id_str,
         repo_root: &candidate.repo_root,
-        plan_key: &candidate.plan_key,
-        plan_path: &candidate.plan_path,
+        plan_key: &plan_key,
+        plan_path: &plan_path,
         waiting: &w,
         review_target_sha: candidate.review_target.as_ref(),
-        review_target_kind: candidate.review_target_kind,
+        review_target_kind,
         current_reviews: &current_reviews,
         author,
     });
     Ok(Some(WaitMatch {
         payload,
         repo_root: candidate.repo_root,
-        plan_key: candidate.plan_key,
+        plan_key,
         current_target_sha: candidate.review_target,
     }))
+}
+
+/// Try to match an ad hoc commit candidate. Phase 4 of
+/// `commit-first-review-model`: ad hoc commits surface
+/// reviewer-side WriteFeedback when the caller is in the gate's
+/// `missing` set, and master-side AddressChanges when the gate is
+/// in ChangesRequested. The wire shape uses the existing
+/// `WriteFeedback` action with `plan_file: None`.
+fn try_match_ad_hoc_candidate(
+    candidate: Candidate,
+    sha: CommitSha,
+    role: WaitingRole,
+    author: &AgentLabel,
+) -> Result<Option<WaitMatch>, WaitError> {
+    use trinity_core::api::{CurrentReview, ExpectedAction};
+
+    let Some(gate) = candidate.gate.as_ref() else {
+        return Ok(None);
+    };
+
+    if matches!(role, WaitingRole::Reviewers) {
+        // Reviewer match: only fire if the caller is missing a
+        // verdict on this commit.
+        if !gate.missing.contains(author) {
+            return Ok(None);
+        }
+        let path = format!(
+            ".trinity/feedback/{}/{}/{}.md",
+            crate::disk_format::AD_HOC_FEEDBACK_KEY,
+            sha.as_str(),
+            author.as_str(),
+        );
+        let payload = trinity_core::api::WorkPayload {
+            plans: Vec::new(),
+            plan_id: String::new(),
+            repo: candidate.repo_root.to_string_lossy().into_owned(),
+            action: ExpectedAction::WriteFeedback {
+                path,
+                target_sha: sha.as_str().to_string(),
+                plan_file: None,
+            },
+        };
+        // Synthetic plan_key for the WaitMatch metadata. The ad
+        // hoc reserved segment `_` is rejected by PlanKey::parse,
+        // so we use a sentinel key constructed from the SHA prefix.
+        // Downstream consumers shouldn't care for ad hoc matches.
+        let plan_key = synth_ad_hoc_plan_key(&sha);
+        return Ok(Some(WaitMatch {
+            payload,
+            repo_root: candidate.repo_root,
+            plan_key,
+            current_target_sha: Some(sha),
+        }));
+    }
+
+    // Master match: ad hoc commits with ChangesRequested gate.
+    use crate::review_state::CommitGateState as S;
+    if !matches!(gate.state, S::ChangesRequested) {
+        return Ok(None);
+    }
+    let reviews: Vec<CurrentReview> = crate::responses::current_reviews_from_gate(gate)
+        .into_iter()
+        .map(|(author_label, verdict)| CurrentReview {
+            path: format!(
+                ".trinity/feedback/{}/{}/{}.md",
+                crate::disk_format::AD_HOC_FEEDBACK_KEY,
+                sha.as_str(),
+                author_label.as_str(),
+            ),
+            author: author_label,
+            verdict,
+            content: None,
+        })
+        .collect();
+    let payload = trinity_core::api::WorkPayload {
+        plans: Vec::new(),
+        plan_id: String::new(),
+        repo: candidate.repo_root.to_string_lossy().into_owned(),
+        action: ExpectedAction::AddressChanges {
+            target_sha: sha.as_str().to_string(),
+            reviews,
+            plan_path: None,
+        },
+    };
+    let plan_key = synth_ad_hoc_plan_key(&sha);
+    Ok(Some(WaitMatch {
+        payload,
+        repo_root: candidate.repo_root,
+        plan_key,
+        current_target_sha: Some(sha),
+    }))
+}
+
+/// Construct a synthetic `PlanKey` for ad hoc commits' `WaitMatch`
+/// metadata. Ad hoc commits have no real plan key (the on-disk
+/// segment `_` is reserved and rejected by `PlanKey::parse`); the
+/// match metadata is only consumed by downstream enrichment that
+/// today is plan-scoped — we won't synthesize stale-review or
+/// opportunistic-body lookups against ad hoc commits in Phase 4.
+fn synth_ad_hoc_plan_key(sha: &CommitSha) -> PlanKey {
+    // Prefix with `adhoc-` to make stem-collision with a real plan
+    // mathematically impossible (real plan stems can't start with
+    // `adhoc-` because nobody would name a plan that, and even if
+    // they did the SHA suffix differentiates).
+    let stem = format!("adhoc-{}", &sha.as_str()[..7]);
+    PlanKey::parse(&stem)
+        .unwrap_or_else(|e| panic!("synthetic ad hoc plan_key `{stem}` must parse: {e}"))
 }
 
 /// Cap for inlined body content. Larger files emit `content:
@@ -349,8 +490,10 @@ async fn enrich_for_wait(
 
     match &mut payload.action {
         A::WriteFeedback { plan_file, .. } => {
-            let trinity_core::api::PlanFile { path, content } = plan_file;
-            opportunistic_fill(runtime, &repo_root, author, path, content).await;
+            if let Some(pf) = plan_file.as_mut() {
+                let trinity_core::api::PlanFile { path, content } = pf;
+                opportunistic_fill(runtime, &repo_root, author, path, content).await;
+            }
         }
         A::AddressChanges { reviews, .. } => {
             for r in reviews.iter_mut() {
@@ -509,14 +652,18 @@ async fn opportunistic_fill(
 /// integration test `caller_already_voted_does_not_re_wake_reviewer`
 /// (and its wire counterpart in `server::http::wire_tests`) is the
 /// semantic guard for arm placement.
-fn caller_already_voted(cand: &Candidate, reason: WaitingReason, author: &AgentLabel) -> bool {
+fn caller_already_voted(
+    candidate_gate: Option<&CommitGate>,
+    reason: WaitingReason,
+    author: &AgentLabel,
+) -> bool {
     use WaitingReason::*;
     let gate = match reason {
         // CommitNeedsReview is the only reviewer-role reason. The gate
         // is the latest reviewable commit's gate — same one driving
         // waiting_on and review_target. Master-role reasons return
         // false; caller-already-voted is a reviewer-only concept.
-        CommitNeedsReview => cand.gate.as_ref(),
+        CommitNeedsReview => candidate_gate,
         SessionFinished
         | CommitPlanRevision
         | AddressCommitChanges
@@ -530,28 +677,45 @@ fn caller_already_voted(cand: &Candidate, reason: WaitingReason, author: &AgentL
         || gate.ambiguous.contains(author)
 }
 
+/// Candidate kind discriminator. Phase 4 of
+/// `commit-first-review-model` introduces `AdHoc` so the matcher can
+/// project work for commits that aren't attributed to any plan. Plan
+/// candidates carry the full plan context (plan_path, body_hash,
+/// finalization state); ad hoc candidates carry only the gated
+/// commit's identity.
+#[derive(Debug, Clone)]
+enum CandidateKind {
+    Plan {
+        plan_key: PlanKey,
+        plan_id_str: String,
+        plan_path: String,
+        body_hash: ContentHash,
+        is_finished: bool,
+        /// `CommitKind` of `review_target`, threaded through so
+        /// callers don't re-derive it. `None` iff `review_target`
+        /// is `None`.
+        review_target_kind: Option<crate::repo_state::CommitKind>,
+    },
+    AdHoc {
+        /// The commit's SHA. Doubles as the review target: ad hoc
+        /// commits are self-contained review units.
+        sha: CommitSha,
+    },
+}
+
 #[derive(Debug, Clone)]
 struct Candidate {
     repo_root: PathBuf,
-    plan_key: PlanKey,
-    /// Wire-form plan id `<basename>/<stem>.md`. Pre-computed so the
-    /// per-candidate match path doesn't re-derive it.
-    plan_id_str: String,
-    plan_path: String,
-    body_hash: ContentHash,
-    is_finished: bool,
-    /// One gate: the latest reviewable commit's gate. Folds the old
-    /// (plan_gate, impl_gate) pair into the single value that drives
-    /// waiting_on, locations, target_sha, and commit_kind.
+    kind: CandidateKind,
+    /// The latest reviewable commit's gate. For plan candidates this
+    /// is the plan's current head-of-review-cycle gate; for ad hoc
+    /// it's the commit's own gate.
     gate: Option<CommitGate>,
     /// The SHA the gate was computed on — the same SHA reviewers
-    /// should write to. Equal to `latest_reviewable_commit_for`
-    /// output, which skips MultiPlan / DoneMove / Unattributed.
-    /// `None` when no reviewable commit exists yet.
+    /// should write to. `None` when no reviewable commit exists yet
+    /// (plan candidate, brand-new plan). For ad hoc this always
+    /// equals `kind.sha`.
     review_target: Option<CommitSha>,
-    /// `CommitKind` of `review_target`, threaded through so callers
-    /// don't re-derive it. `None` iff `review_target` is `None`.
-    review_target_kind: Option<crate::repo_state::CommitKind>,
 }
 
 /// Build the chronologically-ordered candidate stream for `filter`.
@@ -609,6 +773,7 @@ fn collect_repo_scope_candidates(
     // entry. Because we walk in fold order, the last write wins
     // and naturally captures the latest reviewable commit per plan.
     let mut latest_per_plan: BTreeMap<PlanKey, CommitSha> = BTreeMap::new();
+    let mut ad_hoc_shas: Vec<CommitSha> = Vec::new();
     for sha in &repo_state.commit_order {
         let Some(node) = repo_state.commits.get(sha) else {
             continue;
@@ -616,47 +781,61 @@ fn collect_repo_scope_candidates(
         if node.gate.is_none() {
             continue;
         }
-        let plan_key = match &node.attribution {
-            crate::repo_state::CommitAttribution::Plan { plan } => plan.clone(),
+        match &node.attribution {
+            crate::repo_state::CommitAttribution::Plan { plan } => {
+                if repo_state.plan_conflicts.contains_key(plan) {
+                    continue;
+                }
+                let Some(p) = repo_state.plans.get(plan) else {
+                    continue;
+                };
+                if p.is_frozen() {
+                    continue;
+                }
+                latest_per_plan.insert(plan.clone(), sha.clone());
+            }
+            crate::repo_state::CommitAttribution::AdHoc => {
+                // Ad hoc commits are first-class reviewable units.
+                // No supersession — each ad hoc commit gets its
+                // own candidate.
+                ad_hoc_shas.push(sha.clone());
+            }
             _ => continue,
-        };
-        if repo_state.plan_conflicts.contains_key(&plan_key) {
-            continue;
         }
-        let Some(plan) = repo_state.plans.get(&plan_key) else {
-            continue;
-        };
-        if plan.is_frozen() {
-            continue;
-        }
-        latest_per_plan.insert(plan_key, sha.clone());
     }
 
-    // Walk commit_order AGAIN forward, emitting candidates only for
-    // the SHAs that ARE the latest-reviewable for their plan. This
-    // preserves the fold's chronology AND deduplicates plans (each
-    // plan appears at most once in the candidate stream).
+    // Walk commit_order forward emitting candidates for both
+    // latest-per-plan plan commits AND every ad hoc commit. The
+    // walk preserves fold-order interleaving across plan and ad
+    // hoc work.
     let latest_set: std::collections::BTreeSet<&CommitSha> = latest_per_plan.values().collect();
+    let ad_hoc_set: std::collections::BTreeSet<&CommitSha> = ad_hoc_shas.iter().collect();
     let mut candidates = Vec::new();
     for sha in &repo_state.commit_order {
-        if !latest_set.contains(sha) {
+        let in_plan_set = latest_set.contains(sha);
+        let in_ad_hoc_set = ad_hoc_set.contains(sha);
+        if !in_plan_set && !in_ad_hoc_set {
             continue;
         }
         let Some(node) = repo_state.commits.get(sha) else {
             continue;
         };
-        let plan_key = match &node.attribution {
-            crate::repo_state::CommitAttribution::Plan { plan } => plan.clone(),
+        match &node.attribution {
+            crate::repo_state::CommitAttribution::Plan { plan } => {
+                if let Some(plan_data) = repo_state.plans.get(plan) {
+                    let plan_id = crate::lifecycle::PlanId::new(basename.clone(), plan.clone());
+                    candidates.push(build_candidate(
+                        repo_root.clone(),
+                        plan_id,
+                        plan_data,
+                        repo_state,
+                    ));
+                }
+            }
+            crate::repo_state::CommitAttribution::AdHoc => {
+                candidates.push(build_ad_hoc_candidate(repo_root.clone(), node));
+            }
             _ => continue,
-        };
-        if let Some(plan) = repo_state.plans.get(&plan_key) {
-            let plan_id = crate::lifecycle::PlanId::new(basename.clone(), plan_key);
-            candidates.push(build_candidate(
-                repo_root.clone(),
-                plan_id,
-                plan,
-                repo_state,
-            ));
         }
     }
     Ok(candidates)
@@ -731,14 +910,34 @@ fn build_candidate(
     let gate = crate::projection::latest_reviewable_commit_gate_for(plan, repo_state).cloned();
     Candidate {
         repo_root,
-        plan_key: plan.id.clone(),
-        plan_id_str: plan_id.to_string(),
-        plan_path: plan.plan_path.clone(),
-        body_hash: plan.body_hash.clone(),
-        is_finished: plan.is_frozen(),
+        kind: CandidateKind::Plan {
+            plan_key: plan.id.clone(),
+            plan_id_str: plan_id.to_string(),
+            plan_path: plan.plan_path.clone(),
+            body_hash: plan.body_hash.clone(),
+            is_finished: plan.is_frozen(),
+            review_target_kind,
+        },
         gate,
         review_target,
-        review_target_kind,
+    }
+}
+
+/// Build a `Candidate` for an ad hoc (no-plan) commit. Phase 4 of
+/// `commit-first-review-model`: the commit IS the review unit, so
+/// the candidate carries the gate directly and uses its own SHA as
+/// the review target.
+fn build_ad_hoc_candidate(
+    repo_root: PathBuf,
+    node: &crate::repo_state::CommitNode,
+) -> Candidate {
+    Candidate {
+        repo_root,
+        kind: CandidateKind::AdHoc {
+            sha: node.sha.clone(),
+        },
+        gate: node.gate.clone(),
+        review_target: Some(node.sha.clone()),
     }
 }
 
@@ -780,14 +979,16 @@ mod tests {
     fn cand(target: Option<&str>, kind: Option<crate::repo_state::CommitKind>) -> Candidate {
         Candidate {
             repo_root: PathBuf::from("/repo"),
-            plan_key: PlanKey::parse("sid").unwrap(),
-            plan_id_str: "trinity/sid.md".to_string(),
-            plan_path: ".trinity/plans/sid.md".to_string(),
-            body_hash: content_hash("x"),
-            is_finished: false,
+            kind: CandidateKind::Plan {
+                plan_key: PlanKey::parse("sid").unwrap(),
+                plan_id_str: "trinity/sid.md".to_string(),
+                plan_path: ".trinity/plans/sid.md".to_string(),
+                body_hash: content_hash("x"),
+                is_finished: false,
+                review_target_kind: kind,
+            },
             gate: None,
             review_target: target.map(|s| CommitSha::parse(s).unwrap()),
-            review_target_kind: kind,
         }
     }
 
@@ -817,14 +1018,25 @@ mod tests {
             .as_ref()
             .map(crate::responses::current_reviews_from_gate)
             .unwrap_or_default();
+        let (plan_key, plan_path, review_target_kind) = match &cand.kind {
+            CandidateKind::Plan {
+                plan_key,
+                plan_path,
+                review_target_kind,
+                ..
+            } => (plan_key.clone(), plan_path.clone(), *review_target_kind),
+            CandidateKind::AdHoc { .. } => {
+                panic!("derive_locations test helper only handles Plan candidates")
+            }
+        };
         let payload = crate::responses::build_work_payload(crate::responses::WorkPayloadInputs {
             plan_id: "trinity/sid.md",
             repo_root: &cand.repo_root,
-            plan_key: &cand.plan_key,
-            plan_path: &cand.plan_path,
+            plan_key: &plan_key,
+            plan_path: &plan_path,
             waiting: &w,
             review_target_sha: cand.review_target.as_ref(),
-            review_target_kind: cand.review_target_kind,
+            review_target_kind,
             current_reviews: &current_reviews,
             author,
         });
@@ -1293,6 +1505,77 @@ mod integration_tests {
         );
     }
 
+    /// Phase 4 of commit-first-review-model: an ad hoc commit
+    /// (no plan attribution) surfaces in repo-scope reviewer waits
+    /// when the caller is in the gate's `missing` set. The reviewer
+    /// participant set comes from `ad_hoc_reviewers` config here
+    /// (deriving from branch feedback authors is exercised by the
+    /// cli::config unit tests + a separate integration once Phase
+    /// 5's `[misc]` prefix lands). The test uses an empty repo with
+    /// a single code-only root commit so walk-back attribution
+    /// can't claim it for a plan.
+    #[tokio::test]
+    async fn ad_hoc_commit_surfaces_in_repo_scope_for_reviewer() {
+        let dir = init_repo();
+        // Pin alice as the ad hoc reviewer via config — independent
+        // of any plan history.
+        write_file(
+            dir.path(),
+            ".trinity/config.json",
+            r#"{"review": {"ad_hoc_reviewers": ["alice"]}}"#,
+        );
+        // Root commit with code only and no plan file → CommitNode
+        // attribution falls through to AdHoc.
+        write_file(dir.path(), "src.rs", "fn main() {}\n");
+        commit(dir.path(), "root code commit");
+        let rt = Runtime::new();
+        rt.add_repo(dir.path().to_path_buf()).await.unwrap();
+
+        let basename = dir
+            .path()
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap()
+            .to_string();
+        let wfw_args = WaitArgs {
+            role: WaitingRole::Reviewers,
+            plan_id: None,
+            repo: Some(basename),
+            author_label: Some("alice".to_string()),
+            timeout_secs: Some(2),
+        };
+        let resp = wait_for_work(&rt, wfw_args).await.unwrap();
+        let payload = match resp {
+            WaitResponse::Work(p) => p,
+            WaitResponse::Timeout(_) => panic!("expected ad hoc work, got timeout"),
+        };
+        use trinity_core::api::ExpectedAction;
+        match payload.work.action {
+            ExpectedAction::WriteFeedback {
+                path,
+                plan_file,
+                target_sha,
+            } => {
+                assert!(
+                    path.starts_with(".trinity/feedback/_/"),
+                    "ad hoc feedback path must use the reserved `_` segment; got: {path}"
+                );
+                assert!(path.ends_with("/alice.md"));
+                assert!(
+                    plan_file.is_none(),
+                    "ad hoc WriteFeedback must have plan_file: None; got {plan_file:?}"
+                );
+                assert!(!target_sha.is_empty());
+            }
+            other => panic!("expected WriteFeedback action for ad hoc, got {other:?}"),
+        }
+        assert!(
+            payload.work.plans.is_empty(),
+            "ad hoc work has no plan attribution; got plans={:?}",
+            payload.work.plans
+        );
+    }
+
     /// Phase 3 regression: empty plan_id + empty repo must error
     /// (the matcher needs a scope).
     #[tokio::test]
@@ -1582,7 +1865,11 @@ mod integration_tests {
     fn strip_inline_content(a: &mut trinity_core::api::ExpectedAction) {
         use trinity_core::api::ExpectedAction::*;
         match a {
-            WriteFeedback { plan_file, .. } => plan_file.content = None,
+            WriteFeedback { plan_file, .. } => {
+                if let Some(pf) = plan_file {
+                    pf.content = None;
+                }
+            }
             AddressChanges { reviews, .. } => {
                 for r in reviews.iter_mut() {
                     r.content = None;
@@ -1616,7 +1903,7 @@ mod integration_tests {
         match &p1.work.action {
             trinity_core::api::ExpectedAction::WriteFeedback { plan_file, .. } => {
                 assert_eq!(
-                    plan_file.content.as_deref(),
+                    plan_file.as_ref().and_then(|p| p.content.as_deref()),
                     Some("# foo plan v1\n"),
                     "first poll should carry plan_file.content"
                 );
@@ -1632,7 +1919,7 @@ mod integration_tests {
         match &p2.work.action {
             trinity_core::api::ExpectedAction::WriteFeedback { plan_file, .. } => {
                 assert!(
-                    plan_file.content.is_none(),
+                    plan_file.as_ref().and_then(|p| p.content.as_ref()).is_none(),
                     "second poll should omit plan_file.content; got: {plan_file:?}"
                 );
             }
@@ -1663,7 +1950,7 @@ mod integration_tests {
         match &p.work.action {
             trinity_core::api::ExpectedAction::WriteFeedback { plan_file, .. } => {
                 assert_eq!(
-                    plan_file.content.as_deref(),
+                    plan_file.as_ref().and_then(|p| p.content.as_deref()),
                     Some("# v2\n"),
                     "hash mismatch should re-send content"
                 );
@@ -1693,7 +1980,7 @@ mod integration_tests {
         match &p1.work.action {
             trinity_core::api::ExpectedAction::WriteFeedback { plan_file, .. } => {
                 assert!(
-                    plan_file.content.is_none(),
+                    plan_file.as_ref().and_then(|p| p.content.as_ref()).is_none(),
                     "oversize file should omit content"
                 );
             }
@@ -2138,7 +2425,7 @@ mod integration_tests {
         match &wc.work.action {
             trinity_core::api::ExpectedAction::WriteFeedback { plan_file, .. } => {
                 assert!(
-                    plan_file.content.is_none(),
+                    plan_file.as_ref().and_then(|p| p.content.as_ref()).is_none(),
                     "work_context must not populate plan_file.content"
                 );
             }

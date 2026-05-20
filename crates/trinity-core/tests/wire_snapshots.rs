@@ -228,10 +228,10 @@ fn schema_work_context_response() {
             action: ExpectedAction::WriteFeedback {
                 path: ".trinity/feedback/foo/abc/alice.md".into(),
                 target_sha: "abc".into(),
-                plan_file: PlanFile {
+                plan_file: Some(PlanFile {
                     path: ".trinity/plans/foo.md".into(),
                     content: None,
-                },
+                }),
             },
         },
         current_path: ".trinity/plans/foo.md".into(),
@@ -422,10 +422,10 @@ fn schema_wait_for_work_work() {
             action: ExpectedAction::WriteFeedback {
                 path: ".trinity/feedback/foo/abc/alice.md".into(),
                 target_sha: "abc".into(),
-                plan_file: PlanFile {
+                plan_file: Some(PlanFile {
                     path: ".trinity/plans/foo.md".into(),
                     content: None,
-                },
+                }),
             },
         },
         stale_reviews: Vec::new(),

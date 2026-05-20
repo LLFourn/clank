@@ -415,10 +415,15 @@ pub enum ExpectedAction {
     /// verdict (master wrote it). On `wait_for_work` the
     /// `plan_file.content` is populated opportunistically on
     /// first encounter; on `work_context` it's always omitted.
+    /// `plan_file` is `None` for ad hoc (no-plan) commits — Phase
+    /// 4 of `commit-first-review-model` introduces ad hoc
+    /// reviewable commits whose feedback paths use the reserved
+    /// `_` segment and have no underlying plan file.
     WriteFeedback {
         path: String,
         target_sha: String,
-        plan_file: PlanFile,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        plan_file: Option<PlanFile>,
     },
     /// Master: address the request-changes / unmarked feedback in
     /// `reviews` against `target_sha` and follow up with a fix

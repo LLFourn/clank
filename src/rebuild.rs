@@ -12,7 +12,7 @@
 
 use std::path::Path;
 
-use crate::disk_snapshot::{attach_live_feedback, derive_base_state};
+use crate::disk_snapshot::{attach_live_feedback_with_config, derive_base_state};
 use crate::git_io::{self, GitIoError};
 use crate::repo_state::{BaseRepoState, LiveRepoState};
 use crate::state_cache;
@@ -71,7 +71,17 @@ pub async fn rebuild_with_diagnostics(
 ) -> Result<(LiveRepoState, RebuildDiagnostics), RebuildError> {
     let (base, diag) = load_or_build_base_state(repo_root, policy).await?;
     let feedback = git_io::collect_feedback_files(repo_root)?;
-    Ok((attach_live_feedback(base, feedback), diag))
+    // Phase 4 of commit-first-review-model: config affects the
+    // live-feedback overlay (ad hoc gate construction +
+    // participant set). Loaded fresh per rebuild so changes in
+    // ~/.trinity/config.json or <repo>/.trinity/config.json take
+    // effect immediately. The base fold is config-independent and
+    // remains cacheable.
+    let config = crate::cli::config::load(repo_root);
+    Ok((
+        attach_live_feedback_with_config(base, feedback, &config),
+        diag,
+    ))
 }
 
 /// Try the cache first when policy allows; fall back to the

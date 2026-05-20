@@ -210,7 +210,7 @@ mod tests {
         );
         match sig {
             Some(FilesystemSignal::FeedbackWritten { parsed }) => {
-                assert_eq!(parsed.plan_key.as_str(), "foo");
+                assert_eq!(parsed.plan_key().unwrap().as_str(), "foo");
                 assert_eq!(parsed.author.as_str(), "alice");
                 assert_eq!(parsed.target_sha.as_str(), "abc1234");
             }

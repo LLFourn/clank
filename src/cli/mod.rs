@@ -9,6 +9,7 @@
 use clap::Args;
 use std::path::{Path, PathBuf};
 
+pub mod config;
 pub mod finish;
 pub mod init;
 pub mod plan_resolve;

@@ -12,19 +12,52 @@ use crate::repo_state::Verdict;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FeedbackPath {
-    /// Directory name = filename stem. Same value as [`PlanKey`] from the
-    /// plan file's path; the on-disk feedback layout is keyed by stem
-    /// (see plan-path-identity §3).
-    pub plan_key: PlanKey,
+    /// What this feedback file targets — a specific plan's commit
+    /// (`Plan`), or a commit outside any plan (`AdHoc`, encoded
+    /// under the reserved `_` first segment per Phase 4 of
+    /// `commit-first-review-model`).
+    pub target: FeedbackTarget,
     pub target_sha: CommitSha,
     pub author: AgentLabel,
     pub raw: PathBuf,
+}
+
+/// What a feedback file targets. Phase 4 of
+/// `commit-first-review-model` adds `AdHoc` so commits touching no
+/// plan file are reviewable as first-class units; their feedback
+/// lives at `.trinity/feedback/_/<sha>/<author>.md`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FeedbackTarget {
+    Plan(PlanKey),
+    AdHoc,
+}
+
+/// Reserved segment used in feedback paths to indicate ad hoc
+/// (no-plan) reviewability. `PlanKey::parse("_")` continues to
+/// reject this token; the path parser checks it before falling
+/// through to `PlanKey::parse`.
+pub const AD_HOC_FEEDBACK_KEY: &str = "_";
+
+impl FeedbackPath {
+    /// Backwards-compatible convenience: the plan key this feedback
+    /// is attributed to, or `None` for ad hoc feedback. Existing
+    /// call sites that only care about plan-targeted feedback can
+    /// pattern-match on this.
+    pub fn plan_key(&self) -> Option<&PlanKey> {
+        match &self.target {
+            FeedbackTarget::Plan(key) => Some(key),
+            FeedbackTarget::AdHoc => None,
+        }
+    }
 }
 
 /// Parse a path relative to `<repo>/.trinity/feedback/` into a
 /// `FeedbackPath`. Expected shape:
 ///
 /// `<plan-key>/<target-sha>/<author>.md`
+///
+/// The reserved first segment `_` indicates ad hoc (no-plan)
+/// feedback and parses into `FeedbackTarget::AdHoc`.
 ///
 /// Returns `None` for any other shape (a stray `.DS_Store`, the legacy
 /// `<plan-key>/commits/<sha>/<author>.md` layout, etc.).
@@ -53,8 +86,14 @@ pub fn parse_feedback_path(rel: &Path) -> Option<FeedbackPath> {
         return None;
     }
 
+    let target = if session_str == AD_HOC_FEEDBACK_KEY {
+        FeedbackTarget::AdHoc
+    } else {
+        FeedbackTarget::Plan(PlanKey::parse(session_str).ok()?)
+    };
+
     Some(FeedbackPath {
-        plan_key: PlanKey::parse(session_str).ok()?,
+        target,
         target_sha: CommitSha::parse(sha_str).ok()?,
         author: AgentLabel::parse(author).ok()?,
         raw: rel.to_path_buf(),
@@ -166,9 +205,18 @@ mod tests {
     #[test]
     fn canonical_path_parses() {
         let parsed = parse_feedback_path(&p("foo/abc1234/bob.md")).unwrap();
-        assert_eq!(parsed.plan_key.as_str(), "foo");
+        assert_eq!(parsed.plan_key().unwrap().as_str(), "foo");
         assert_eq!(parsed.target_sha.as_str(), "abc1234");
         assert_eq!(parsed.author.as_str(), "bob");
+    }
+
+    #[test]
+    fn ad_hoc_path_parses() {
+        let parsed = parse_feedback_path(&p("_/abc1234/codex.md")).unwrap();
+        assert_eq!(parsed.target, FeedbackTarget::AdHoc);
+        assert!(parsed.plan_key().is_none());
+        assert_eq!(parsed.target_sha.as_str(), "abc1234");
+        assert_eq!(parsed.author.as_str(), "codex");
     }
 
     #[test]
