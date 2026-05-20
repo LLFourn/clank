@@ -85,10 +85,14 @@ commit-title prefix".
 
 ### Commit Body
 
-The body is where invalid combinations become unrepresentable:
+The body is where invalid combinations become unrepresentable.
+**Serde tagging detail**: nested internally-tagged enums collide
+on the `tag` field name, and `PlanCommit` below ALSO uses `kind`
+internally. So the outer enum uses a different discriminator
+(`scope`) than the inner one (`kind`):
 
 ```rust
-#[serde(tag = "kind", rename_all = "snake_case")]
+#[serde(tag = "scope", rename_all = "snake_case")]
 pub enum CommitBody {
     Plan(PlanCommit),
     MultiPlan(MultiPlanCommit),
@@ -97,10 +101,65 @@ pub enum CommitBody {
 }
 ```
 
+The wire shape becomes `{"scope": "plan", "kind": "plan_only",
+"plan": "...", ...}` — operator-readable and conflict-free.
+
+### Review Storage — Minimal Truth, Derived Readiness
+
+`CommitGate` today is a flat derived-state bag: `state`,
+`participants`, `approvers`, `requesters`, `ambiguous`,
+`missing`, `feedback`. Those fields can disagree just as badly
+as the commit fields do (`state = Approved` with non-empty
+`requesters`, or `missing` that doesn't match
+`participants - voters`).
+
+Replace it with two minimal-truth structures:
+
+```rust
+pub struct CommitReviews {
+    /// Only canonical fact: who wrote what on this commit.
+    /// Feedback files on disk are truth; we mirror them once.
+    pub feedback: BTreeMap<AgentLabel, Feedback>,
+}
+
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ReviewPolicy {
+    /// Master is blocked until the participant set's verdicts
+    /// resolve. Default for plan commits and (when configured)
+    /// for ad hoc commits with a discovered reviewer set.
+    Blocking { participants: Vec<AgentLabel> },
+    /// Reviews can be written and surface in the UI, but they
+    /// don't gate the master. Used when
+    /// `force_review_on_misc_commits = false` or
+    /// `force_review_on_plan_commits = false`.
+    NonBlocking { reason: NonBlockingReason },
+    /// The commit's variant doesn't carry review semantics
+    /// (multi-plan, finalize). Feedback files written against
+    /// it are preserved structurally — operators can still
+    /// inspect them — but they have no policy effect.
+    NotReviewable { reason: NotReviewableReason },
+}
+```
+
+`state` / `approvers` / `requesters` / `ambiguous` / `missing`
+are method outputs over `(CommitReviews, ReviewPolicy)`, NOT
+stored fields. This eliminates the `state = Approved && requesters
+!= []` class of contradiction by construction.
+
+**Separation of storage and gating.** Feedback files on disk are
+always truth; they attach to the commit's `CommitReviews`
+regardless of `ReviewPolicy`. Late feedback on a
+`NotReviewable` (multi-plan/finalize) commit is preserved as
+informational metadata — the UI can show it; readiness
+projections just ignore it. This removes the old "non-blocking
+means the file is invisible" bug class.
+
 ### Plan Commits
 
 Use nested variants, not `PlanCommit { kind: PlanCommitKind, ... }`.
-The variants imply different data.
+The variants imply different data. Each reviewable plan commit
+carries both `reviews` (canonical) and `policy` (configurable);
+together they project the gate.
 
 ```rust
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -108,16 +167,19 @@ pub enum PlanCommit {
     PlanOnly {
         plan: PlanKey,
         touch: PlanTouchSummary,
-        gate: CommitGate,
+        reviews: CommitReviews,
+        policy: ReviewPolicy,
     },
     CodeOnly {
         plan: PlanKey,
-        gate: CommitGate,
+        reviews: CommitReviews,
+        policy: ReviewPolicy,
     },
     Mixed {
         plan: PlanKey,
         touch: PlanTouchSummary,
-        gate: CommitGate,
+        reviews: CommitReviews,
+        policy: ReviewPolicy,
     },
 }
 ```
@@ -126,8 +188,11 @@ This eliminates:
 
 - `kind == PlanOnly` but no plan touch.
 - `kind == CodeOnly` but a plan touch exists.
-- `kind.is_reviewable()` but `gate == None`.
-- `gate.is_some()` on non-reviewable variants.
+- The reviewable-but-no-gate / non-reviewable-with-gate split
+  (variants enforce reviewability).
+- Gate-field contradictions (`state = Approved` with non-empty
+  `requesters`, etc.) — those are now projection outputs, not
+  stored fields.
 
 ### Multi-Plan Commits
 
@@ -135,31 +200,42 @@ This eliminates:
 pub struct MultiPlanCommit {
     pub plans: BTreeSet<PlanKey>,
     pub touches: Vec<PlanTouchSummary>,
+    /// Late feedback files written against a multi-plan commit
+    /// are preserved (the file IS truth) but have no policy
+    /// effect — `policy` is implicitly `NotReviewable { reason:
+    /// MultiPlan }` and never carried explicitly.
+    pub reviews: CommitReviews,
 }
 ```
 
-No gate. If a future plan makes multi-plan commits reviewable, it
-must introduce a new explicit variant or field with a clear
-reviewer-set model. Do not smuggle reviewability in through
-`Option<CommitGate>`.
+No `policy` field — the variant itself encodes
+`NotReviewable { reason: MultiPlan }`. If a future plan makes
+multi-plan commits reviewable, it must introduce a new explicit
+variant with a `policy` field and a defined reviewer-set model.
+Do not smuggle reviewability in through `Option<CommitGate>`.
 
 ### Ad Hoc Commits
 
-Ad hoc commits are first-class, but their reviewability depends on
-configuration and participant discovery. Encode that explicitly:
+Ad hoc commits are first-class. Their `reviews` always exist
+(feedback files on disk are truth); their `policy` is what
+configuration decides:
 
 ```rust
-#[serde(tag = "review", rename_all = "snake_case")]
-pub enum AdHocCommit {
-    Reviewable { gate: CommitGate },
-    Ungated { reason: AdHocUngatedReason },
-}
-
-pub enum AdHocUngatedReason {
-    NoParticipants,
-    DisabledByConfig,
+pub struct AdHocCommit {
+    pub reviews: CommitReviews,
+    pub policy: ReviewPolicy,
 }
 ```
+
+`policy` may be `Blocking { participants }` (default when an
+ad-hoc reviewer set is discovered or pinned),
+`NonBlocking { reason: ConfigDisabled }` (when
+`force_review_on_misc_commits = false`), or
+`NonBlocking { reason: NoParticipants }` (when no reviewer set
+can be derived AND no override). Either way, feedback files
+written manually against the commit are preserved in
+`reviews.feedback` — invisible-feedback is the bug we're
+removing.
 
 Ad hoc commits do not carry `PlanKey`s. Plan association for the
 UI is always empty.
@@ -170,12 +246,16 @@ UI is always empty.
 pub struct FinalizeCommit {
     pub plan: PlanKey,
     pub approver_count: u32,
+    /// As with multi-plan: late feedback files written against
+    /// the freeze commit are preserved but have no policy effect.
+    pub reviews: CommitReviews,
 }
 ```
 
-No gate. No review target. The approving files remain viewable by
-loading `.trinity/finished/<stem>/` from the finalize commit tree,
-but the finalize commit itself is not reviewable.
+No `policy`. The variant implies
+`NotReviewable { reason: Finalize }`. The approving files
+themselves remain viewable by loading `.trinity/finished/<stem>/`
+from the finalize commit tree.
 
 ### Convenience Methods
 
@@ -201,55 +281,85 @@ to a variant that already determines the kind.
 
 ## Plan State
 
-`Plan` should store plan metadata, not a second timeline:
+`Plan` stores plan metadata only. Body + hash get wrapped so they
+can't disagree; activity timestamp is a projection method, not
+a stored field:
 
 ```rust
 pub struct Plan {
     pub id: PlanKey,
     pub plan_path: String,
-    pub body: String,
-    pub body_hash: ContentHash,
+    pub body: PlanBody,
     pub plan_intro: CommitSha,
     pub plan_intro_parent: Option<CommitSha>,
-    pub last_activity_ts: i64,
+}
+
+/// Body + hash that can never disagree. The only constructor
+/// computes the hash from the body bytes; there is no setter
+/// that updates one without the other.
+pub struct PlanBody {
+    text: String,
+    hash: ContentHash,
+}
+
+impl PlanBody {
+    pub fn new(text: String) -> Self {
+        let hash = content_hash(&text);
+        Self { text, hash }
+    }
+    pub fn text(&self) -> &str { &self.text }
+    pub fn hash(&self) -> &ContentHash { &self.hash }
 }
 ```
 
-Finalize/lifecycle data should be derived from the commit stream.
-If keeping `archived_cycles` as cached data is necessary for
-performance or UI convenience, it must be treated as a derived
-index rebuilt from commits, not independently mutated canonical
-state.
+**Removed from canonical `Plan`**:
+- `timeline: Vec<PlanTimelineEvent>` — derived from
+  `RepoState.commit_order` filtered by `node.associated_plans()`.
+- `last_activity_ts: i64` — call
+  `RepoState::last_activity_for(&plan)`; walks commits +
+  feedback mtimes at projection time.
+- `archived_cycles: Vec<ArchivedCycle>` — derived from the
+  Finalize commit variant on the commit stream.
 
-The important deletion is:
+None of these become a stored sidecar. See "Direct Projections"
+below for the method shapes; no indexes get added until
+profiling demonstrates a hot path.
+
+## Direct Projections (No Indexes)
+
+**Direct projections only.** Every status / lifecycle / latest-
+reviewable / activity query is a method on `RepoState` that walks
+`commit_order`. No cached per-plan maps, no derived indexes, no
+sidecar structures. Trinity has tens of plans and hundreds of
+commits per repo; a linear scan is microseconds and stays
+correct.
+
+Method shape:
 
 ```rust
-pub timeline: Vec<PlanTimelineEvent>
-```
+impl RepoState {
+    /// Commits associated with `plan` in fold order.
+    pub fn commits_for_plan(&self, plan: &PlanKey)
+        -> impl Iterator<Item = &CommitNode>;
 
-from canonical `Plan`.
+    /// Latest reviewable commit attributed to `plan` (reverse
+    /// scan over `commit_order`).
+    pub fn latest_reviewable_for_plan(&self, plan: &PlanKey)
+        -> Option<&CommitNode>;
 
-## Derived Indexes
+    /// The Finalize commit SHA for `plan`, if it has frozen.
+    pub fn finalized_at(&self, plan: &PlanKey) -> Option<&CommitSha>;
 
-If repeated projection is too slow, create explicit derived indexes
-rebuilt from `RepoState.commit_order` after the fold:
-
-```rust
-pub struct RepoIndexes {
-    pub commits_by_plan: BTreeMap<PlanKey, Vec<CommitSha>>,
-    pub latest_reviewable_by_plan: BTreeMap<PlanKey, CommitSha>,
-    pub finalized_by_plan: BTreeMap<PlanKey, CommitSha>,
+    /// Max(commit.author_ts, feedback.created_at) for `plan`.
+    pub fn last_activity_for(&self, plan: &PlanKey) -> i64;
 }
 ```
 
-Rules:
-
-- Indexes are not independently mutated during the fold.
-- Indexes are rebuilt from the canonical commit stream.
-- It must be possible to delete the index and recompute it without
-  changing semantics.
-- No test should assert an index value without also being able to
-  derive it from `commits`.
+If profiling ever surfaces a hot projection on a real-world
+repo, *then* a derived index earns its keep — with a co-located
+equality test against the direct projection it caches. Until
+then, premature index proliferation reintroduces the parallel-
+truth problem this plan exists to remove.
 
 ## Tagged Enum Carry-Forward
 
@@ -403,8 +513,10 @@ must not rebuild a second persistent model with different facts.
 - Replace `Plan::event_for`, `latest_reviewable_event`,
   `frozen_at`, and similar methods with projection helpers over
   `RepoState`.
-- Introduce `RepoIndexes` only if needed, rebuilt from
-  `commit_order`.
+- Project plan lifecycle through `RepoState` methods that walk
+  `commit_order`. No `RepoIndexes` is introduced; if Trinity is
+  ever measured to be slow on these projections, that's the
+  signal — not a guess — and the cache earns a follow-up plan.
 - Ensure plan lifecycle/finalization is derived from finalize
   commit variants.
 - Bump `CACHE_FORMAT_VERSION` again now that `Plan.timeline`
@@ -479,5 +591,7 @@ must not rebuild a second persistent model with different facts.
 - Changing the user-facing workflow semantics of approvals,
   request-changes, or force-finish.
 - Adding a new database or migration layer.
-- Optimizing derived indexes before there is a measured need.
+- Adding any derived-index cache (per-plan or otherwise). Direct
+  projections only; performance work is its own future plan if
+  Trinity is ever measured to be slow.
 - Removing the web UI.
