@@ -98,7 +98,12 @@ pub struct CommitNode {
     /// The plan this commit *says* it belongs to, from either
     /// (a) the explicit title prefix `[plan-x]`, or
     /// (b) walk-back chain inheritance when the title has no
-    ///     prefix (or `[misc]`).
+    ///     prefix at all.
+    /// `[misc]` makes THIS commit ad-hoc
+    /// (`plan_attribution = None`) but does NOT reset the
+    /// walk-back carry — descendants without a prefix still
+    /// inherit the prior attribution. See "Fold Algorithm"
+    /// for `next_effective_attribution` semantics.
     /// Independent of `touches`. Disagreement is a typed
     /// warning.
     pub plan_attribution: Option<PlanKey>,
@@ -164,13 +169,24 @@ canonical truth, the wire string is one render of it.
 ### Review Storage — Minimal Truth, Derived Everything
 
 The canonical fact about a commit's review activity is exactly
-one thing — who wrote what feedback file on disk:
+who wrote what feedback file on disk. Feedback identity on
+disk is `(scope, sha, author)` — a single SHA can receive
+independent feedback from multiple plan scopes (when the
+commit touches multiple plans). Storage matches:
 
 ```rust
 pub struct CommitReviews {
-    /// Canonical: the map key IS truth for author identity.
-    /// FeedbackBody does not carry a duplicate author field.
-    pub feedback: BTreeMap<AgentLabel, FeedbackBody>,
+    /// Outer key = scope (plan or ad-hoc), inner key = author.
+    /// `(scope, author)` together is canonical identity; the
+    /// same author can write independent feedback for two
+    /// plan scopes on the same SHA without one overwriting
+    /// the other.
+    pub feedback: BTreeMap<ReviewScope, BTreeMap<AgentLabel, FeedbackBody>>,
+}
+
+pub enum ReviewScope {
+    Plan(PlanKey),
+    AdHoc,
 }
 
 pub struct FeedbackBody {
@@ -182,7 +198,10 @@ pub struct FeedbackBody {
 
 The feedback file's repo-relative path is derived from
 `(scope, sha, author)` at projection time; not stored on
-`FeedbackBody`.
+`FeedbackBody`. Readiness for `ReviewScope::Plan(A)` reads
+only `commit.reviews.feedback.get(&ReviewScope::Plan(A))` —
+B-scope feedback on the same SHA never affects A's
+readiness.
 
 Review *policy* is a projection over the commit's facts,
 the relevant aggregate, and the snapshotted config:
@@ -204,14 +223,9 @@ pub enum NonBlockingReason {
     StructurallyNonReviewable,
 }
 
-pub enum ReviewScope<'a> {
-    Plan(&'a PlanKey),
-    AdHoc,
-}
-
 pub fn review_policy(
     commit: &CommitNode,
-    scope: ReviewScope,
+    scope: &ReviewScope,
     plan_state: Option<&PlanState>,
     ad_hoc: &AdHocState,
     config: &Config,
@@ -219,7 +233,7 @@ pub fn review_policy(
 
 pub fn readiness(
     commit: &CommitNode,
-    scope: ReviewScope,
+    scope: &ReviewScope,
     plan_state: Option<&PlanState>,
     ad_hoc: &AdHocState,
     config: &Config,
@@ -688,7 +702,11 @@ Phase 1 below before the flat-facts types come in.
 - Delete from `trinity-core::model`: `CommitBody`,
   `PlanCommit`, `MultiPlanCommit`, `AdHocCommit`,
   `FinalizeCommit`, `PlanTouchSummary`, `MultiPlanTouches`,
-  `MultiPlanTouchesError`, `NonEmptyVec`.
+  `MultiPlanTouchesError`.
+- Keep `NonEmptyVec` — still used by
+  `ReviewPolicy::Blocking { participants }` so "blocking
+  with empty participants" remains unrepresentable. It's a
+  general validating helper, not bucket-specific.
 - Delete the prior classifier scaffolding:
   `ClassifiedCommit`, `ClassifierInputs`, `classify`,
   `classify_with_prefix`, `classify_without_prefix`,
