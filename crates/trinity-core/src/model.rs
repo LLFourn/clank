@@ -305,13 +305,4 @@ pub struct CommitNode {
     /// AND `attribution` names exactly one plan (`Plan(_)`). All
     /// other variants are non-reviewable and carry `None`.
     pub gate: Option<CommitGate>,
-    /// Phase 5 of `commit-first-review-model`: non-blocking
-    /// attribution warning attached by the title-prefix
-    /// classifier. `Some` when the commit's `[…]` prefix names a
-    /// plan that doesn't exist (degrades to `AdHoc`), or when no
-    /// prefix is present but file-touched / active-plan
-    /// inference assigned attribution that operators should be
-    /// warned about. `None` in the clean cases.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub attribution_warning: Option<String>,
 }

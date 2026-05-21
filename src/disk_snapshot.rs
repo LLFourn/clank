@@ -794,7 +794,6 @@ pub fn apply_commit(state: &mut RepoState, carry: &mut FoldCarry, event: &Commit
         attribution: classification.attribution.clone(),
         plans: commit_plans,
         gate: gate_for_node,
-        attribution_warning: classification.warning,
     };
     state.commits.insert(commit_sha.clone(), commit_node);
     state.commit_order.push(commit_sha.clone());
@@ -883,10 +882,6 @@ struct EffectiveClassification {
     /// for AdHoc; one entry for Plan(_); the full set for
     /// MultiPlan/Finalize.
     plans_in_scope: BTreeSet<PlanKey>,
-    /// Optional non-blocking warning attached to
-    /// `CommitNode.attribution_warning`. Set when the prefix
-    /// named at least one unknown plan and we degraded to AdHoc.
-    warning: Option<String>,
 }
 
 fn classify_effective(
@@ -897,14 +892,15 @@ fn classify_effective(
     known_plans: &BTreeSet<PlanKey>,
 ) -> EffectiveClassification {
     // Explicit prefix wins. Falls through to file-touch / walk-back
-    // when no prefix is present.
+    // when no prefix is present. Warnings are no longer carried
+    // here — the new fold's classifier in trinity_core::repo_state
+    // owns warning emission and stores them on state.fold.warnings.
     if let Some(prefix) = prefix {
         match prefix {
             TitlePrefix::Misc => {
                 return EffectiveClassification {
                     attribution: CommitAttribution::AdHoc,
                     plans_in_scope: BTreeSet::new(),
-                    warning: None,
                 };
             }
             TitlePrefix::Plans(names) => {
@@ -912,23 +908,14 @@ fn classify_effective(
                     .iter()
                     .map(|n| PlanKey::parse(n).map_err(|_| n.clone()))
                     .collect();
-                let unknown: Vec<String> = parsed
-                    .iter()
-                    .filter_map(|r| match r {
-                        Ok(k) if known_plans.contains(k) => None,
-                        Ok(k) => Some(k.as_str().to_string()),
-                        Err(s) => Some(s.clone()),
-                    })
-                    .collect();
-                if !unknown.is_empty() {
-                    let warning = format!(
-                        "commit-title prefix names unknown plan(s): {}; treated as ad hoc — amend to `[misc]` or a known plan name to silence",
-                        unknown.join(", ")
-                    );
+                let unknown_present = parsed.iter().any(|r| match r {
+                    Ok(k) if known_plans.contains(k) => false,
+                    _ => true,
+                });
+                if unknown_present {
                     return EffectiveClassification {
                         attribution: CommitAttribution::AdHoc,
                         plans_in_scope: BTreeSet::new(),
-                        warning: Some(warning),
                     };
                 }
                 let valid: BTreeSet<PlanKey> = parsed.into_iter().flatten().collect();
@@ -937,7 +924,6 @@ fn classify_effective(
                     return EffectiveClassification {
                         attribution: CommitAttribution::Plan { plan: plan.clone() },
                         plans_in_scope: [plan].into_iter().collect(),
-                        warning: None,
                     };
                 }
                 return EffectiveClassification {
@@ -945,61 +931,41 @@ fn classify_effective(
                         plans: valid.clone(),
                     },
                     plans_in_scope: valid,
-                    warning: None,
                 };
             }
         }
     }
 
-    // No prefix → fall through to today's file-touch /
-    // walk-back inference. Phase 5 of `commit-first-review-model`:
-    // commits that infer a plan attribution without an explicit
-    // prefix get a missing-prefix warning so non-strict mode can
-    // surface "touches plan-a but no `[plan-a]` prefix; consider
-    // amending" to the master.
     let touched_plans: BTreeSet<PlanKey> = active_changes
         .plan_touches
         .iter()
         .map(|t| t.session.clone())
         .collect();
-    let missing_prefix_warning = |suggested: &str| {
-        format!(
-            "commit subject missing convention prefix; inferred attribution suggests `{suggested}` — amend the title to silence"
-        )
-    };
     if touched_plans.len() >= 2 {
-        let names: Vec<&str> = touched_plans.iter().map(|p| p.as_str()).collect();
-        let suggested = format!("[{}]", names.join(","));
         return EffectiveClassification {
             attribution: CommitAttribution::MultiPlan {
                 plans: touched_plans.clone(),
             },
             plans_in_scope: touched_plans,
-            warning: Some(missing_prefix_warning(&suggested)),
         };
     }
-    // Single-plan freeze (and only freeze) → Finalize.
     if plans_finalized_here.len() == 1 && touched_plans.is_empty() {
         let plan = plans_finalized_here.iter().next().cloned().unwrap();
         return EffectiveClassification {
             attribution: CommitAttribution::Finalize { plan: plan.clone() },
             plans_in_scope: [plan].into_iter().collect(),
-            warning: None,
         };
     }
     if let AttributionResult::Attributed { session, .. } = attr {
         let plan = session.clone();
-        let suggested = format!("[{}]", plan.as_str());
         return EffectiveClassification {
             attribution: CommitAttribution::Plan { plan: plan.clone() },
             plans_in_scope: [plan].into_iter().collect(),
-            warning: Some(missing_prefix_warning(&suggested)),
         };
     }
     EffectiveClassification {
         attribution: CommitAttribution::AdHoc,
         plans_in_scope: BTreeSet::new(),
-        warning: None,
     }
 }
 

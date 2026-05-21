@@ -312,10 +312,10 @@ async fn compute_match(
 }
 
 /// One commit's prefix-convention violation under strict mode.
-/// Populated from `CommitNode.attribution_warning` (unknown plan in
-/// prefix) OR from inferred no-prefix attribution (any commit
-/// whose subject lacks a `[…]` prefix and would otherwise be
-/// classified by file/active-plan inference).
+/// Derived from `state.fold.warnings` (unknown-plan prefix) and
+/// from a direct subject scan over the commit list (no prefix
+/// at all). The legacy `CommitNode.attribution_warning` string is
+/// no longer consulted.
 struct PrefixViolation {
     repo_root: std::path::PathBuf,
     sha: CommitSha,
@@ -326,43 +326,62 @@ fn collect_prefix_violations(
     state: &crate::repo_state::RepoState,
     plan_filter: Option<&PlanKey>,
 ) -> Vec<PrefixViolation> {
+    use std::collections::BTreeSet;
+
     let mut out = Vec::new();
+    let mut emitted: BTreeSet<CommitSha> = BTreeSet::new();
+
+    // UnknownPlanPrefix violations come straight from the new
+    // fold's warning log. The suggested prefix is left None — the
+    // master has to choose between [misc] and a known plan.
+    for w in &state.fold.warnings {
+        if !matches!(
+            w.warning,
+            trinity_core::repo_state::Warning::UnknownPlanPrefix { .. }
+        ) {
+            continue;
+        }
+        if let Some(key) = plan_filter {
+            let Some(node) = state.commits.get(&w.sha) else {
+                continue;
+            };
+            if !node.plans.contains(key) {
+                continue;
+            }
+        }
+        if emitted.insert(w.sha.clone()) {
+            out.push(PrefixViolation {
+                repo_root: state.root.clone(),
+                sha: w.sha.clone(),
+                suggested_prefix: None,
+            });
+        }
+    }
+
+    // No-prefix-at-all violations: walk the legacy commit list,
+    // check the subject directly. The new fold's classifier
+    // already suppresses MissingPrefix when the hint-inherit
+    // chain is the expected shape, so strict mode can't rely on
+    // it here — strict means "every commit must have a prefix",
+    // independent of inference.
     for sha in &state.commit_order {
+        if emitted.contains(sha) {
+            continue;
+        }
         let Some(node) = state.commits.get(sha) else {
             continue;
         };
-        // Plan-scoped WFW only surfaces violations on commits
-        // associated with that plan. Repo-scope sees everything.
         if let Some(key) = plan_filter
             && !node.plans.contains(key)
         {
             continue;
         }
-        // Finalize commits aren't subject to the convention —
-        // their subject is a freeze marker, not a content commit.
         if matches!(node.kind, crate::repo_state::CommitKind::Finalize) {
             continue;
         }
-        let has_prefix = crate::disk_snapshot::parse_title_prefix(&node.subject).is_some();
-        if has_prefix && node.attribution_warning.is_none() {
+        if trinity_core::repo_state::parse_title_prefix(&node.subject).is_some() {
             continue;
         }
-        if has_prefix && node.attribution_warning.is_some() {
-            // Prefix was present but named an unknown plan; the
-            // suggested_prefix can't be derived without
-            // ambiguity. Caller-side: the master should choose.
-            out.push(PrefixViolation {
-                repo_root: state.root.clone(),
-                sha: sha.clone(),
-                suggested_prefix: None,
-            });
-            continue;
-        }
-        // No prefix. Suggest based on the inferred attribution.
-        // MultiPlan (no prefix, multi-touch) ALSO needs a fix —
-        // the master should explicitly choose `[plan-a,plan-b]`
-        // or `[misc]`; the suggested_prefix lists the inferred
-        // plans so the master can amend with one keystroke.
         let suggested = match &node.attribution {
             crate::repo_state::CommitAttribution::Plan { plan } => {
                 Some(format!("[{}]", plan.as_str()))
@@ -1853,11 +1872,18 @@ mod integration_tests {
         );
         let rt = Runtime::new();
         rt.add_repo(dir.path().to_path_buf()).await.unwrap();
-        let (attribution, warning) = rt
+        let (attribution, has_unknown_warning) = rt
             .read_repo(dir.path(), |s| {
                 let sha = s.head.as_ref().unwrap().clone();
                 let node = &s.commits[&sha];
-                (node.attribution.clone(), node.attribution_warning.clone())
+                let has_warning = s.fold.warnings.iter().any(|w| {
+                    w.sha == sha
+                        && matches!(
+                            w.warning,
+                            trinity_core::repo_state::Warning::UnknownPlanPrefix { .. }
+                        )
+                });
+                (node.attribution.clone(), has_warning)
             })
             .await
             .unwrap();
@@ -1865,10 +1891,9 @@ mod integration_tests {
             matches!(attribution, crate::repo_state::CommitAttribution::AdHoc),
             "unknown plan in prefix → AdHoc; got {attribution:?}"
         );
-        let warning = warning.expect("attribution_warning must be set");
         assert!(
-            warning.contains("no-such-plan"),
-            "warning must mention the unknown plan name; got {warning:?}"
+            has_unknown_warning,
+            "unknown-plan prefix must produce an UnknownPlanPrefix warning on state.fold.warnings"
         );
     }
 
