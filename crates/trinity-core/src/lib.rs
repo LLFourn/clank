@@ -32,6 +32,7 @@
 pub mod api;
 pub mod ids;
 pub mod model;
+pub mod repo_state;
 pub mod vocab;
 
 // Re-export the closed-vocab enums at crate root for ergonomic
