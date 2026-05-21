@@ -15,8 +15,31 @@ use crate::repo_state::{
     CommitKind, Plan, PlanWorktreeStatus, Posture, WaitingOn, WaitingReason, WaitingRole,
 };
 use crate::review_state::{CommitGate, CommitGateState};
+use trinity_core::PlanLifecycle;
 
-use crate::lifecycle::CommitSha;
+use crate::lifecycle::{CommitSha, PlanKey};
+
+/// True iff `plan_key` appears in `state.fold.finished_plans`. The
+/// new fold's authoritative answer to "is this plan finished?";
+/// callers should prefer this over `Plan::is_frozen` so the legacy
+/// timeline-based check can retire.
+pub fn is_plan_finished(state: &crate::repo_state::RepoState, plan_key: &PlanKey) -> bool {
+    state
+        .fold
+        .finished_plans
+        .iter()
+        .any(|f| &f.plan == plan_key)
+}
+
+/// `PlanLifecycle` derived from the new fold: `Finished` when the
+/// plan is in `state.fold.finished_plans`, otherwise `Active`.
+pub fn plan_lifecycle(state: &crate::repo_state::RepoState, plan_key: &PlanKey) -> PlanLifecycle {
+    if is_plan_finished(state, plan_key) {
+        PlanLifecycle::Finished
+    } else {
+        PlanLifecycle::Active
+    }
+}
 
 /// `plan_worktree_status` from hash comparisons. Pure.
 pub fn plan_worktree_status(

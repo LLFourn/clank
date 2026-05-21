@@ -361,7 +361,7 @@ impl Runtime {
                 let Some(plan) = state.plans.get(&session_id) else {
                     return Ok(());
                 };
-                let lifecycle = plan.lifecycle();
+                let lifecycle = crate::projection::plan_lifecycle(state, &plan.id);
                 let Some(plan_id) = plan_id_for(repo_root, &plan.id) else {
                     return Ok(());
                 };

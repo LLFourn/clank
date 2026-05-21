@@ -1116,7 +1116,7 @@ fn build_candidate(
             plan_id_str: plan_id.to_string(),
             plan_path: plan.plan_path.clone(),
             body_hash: plan.body_hash.clone(),
-            is_finished: plan.is_frozen(),
+            is_finished: crate::projection::is_plan_finished(repo_state, &plan.id),
             review_target_kind,
         },
         gate,

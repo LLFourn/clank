@@ -73,7 +73,7 @@ pub async fn build_finish_preview(
         .as_ref()
         .and_then(|sha| state.gate_for(sha));
     let gate_state = gate.map(|g| g.state).unwrap_or(CommitGateState::Unreviewed);
-    let is_finished = plan.is_frozen();
+    let is_finished = crate::projection::is_plan_finished(state, &plan.id);
 
     let sealed_approvals = match gate {
         Some(g) if g.state == CommitGateState::Approved => {

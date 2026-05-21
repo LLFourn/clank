@@ -137,8 +137,9 @@ fn build_plan_row(
 ) -> PlanRow {
     let plan_phase = current_posture(plan, state);
     let gate = crate::projection::latest_reviewable_commit_gate_for(plan, state);
-    let w = waiting_on(plan.is_frozen(), worktree_status, gate);
-    let lifecycle = plan.lifecycle();
+    let is_finished = crate::projection::is_plan_finished(state, &plan.id);
+    let w = waiting_on(is_finished, worktree_status, gate);
+    let lifecycle = crate::projection::plan_lifecycle(state, &plan.id);
     PlanRow {
         repo: repo_root.to_string_lossy().to_string(),
         plan_id: plan_id_string(repo_root, &plan.id),
@@ -224,7 +225,8 @@ pub fn work_context_response_from_snapshot(
         .expect("snapshot_session invariant: exactly one plan");
     let plan_phase = current_posture(plan, state);
     let gate = crate::projection::latest_reviewable_commit_gate_for(plan, state);
-    let w = waiting_on(plan.is_frozen(), worktree_status, gate);
+    let is_finished = crate::projection::is_plan_finished(state, &plan.id);
+    let w = waiting_on(is_finished, worktree_status, gate);
     let plan_id = plan_id_string(&state.root, &plan.id).expect("active plan must have a plan_id");
     let review_target_sha = crate::projection::latest_reviewable_commit_for(plan);
     let review_target_event = review_target_sha
@@ -251,7 +253,7 @@ pub fn work_context_response_from_snapshot(
     WorkContextResponse {
         work,
         current_path: plan.plan_path.clone(),
-        lifecycle: plan.lifecycle(),
+        lifecycle: crate::projection::plan_lifecycle(state, &plan.id),
         phase: plan_phase,
         plan_worktree_status: worktree_status,
         waiting_on: w,
@@ -385,7 +387,8 @@ pub fn plan_page_with_reader(
     let plan_gate = plan_gate_for(plan, bundle);
     let impl_gate = impl_gate_for(plan, bundle);
     let gate = crate::projection::latest_reviewable_commit_gate_for(plan, bundle);
-    let w = waiting_on(plan.is_frozen(), worktree_status, gate);
+    let is_finished = crate::projection::is_plan_finished(bundle, &plan.id);
+    let w = waiting_on(is_finished, worktree_status, gate);
     let review_target_phase = posture_to_review_target_phase(plan_phase);
 
     let plan_revisions: Vec<String> = all_plan_revisions(plan, bundle)
@@ -427,7 +430,7 @@ pub fn plan_page_with_reader(
         repo: bundle.root.to_string_lossy().to_string(),
         plan_id,
         slug: plan.id.as_str().to_string(),
-        lifecycle: plan.lifecycle(),
+        lifecycle: crate::projection::plan_lifecycle(bundle, &plan.id),
         current_path: plan.plan_path.clone(),
         phase: plan_phase,
         plan_worktree_status: worktree_status,

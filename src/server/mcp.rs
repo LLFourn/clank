@@ -547,7 +547,7 @@ async fn set_active_work(state: &AppState, req: &ToolCallRequest) -> Result<Valu
                         repo_root: repo_root.clone(),
                         plan_path: plan.plan_path.clone(),
                         body_hash: plan.body_hash.clone(),
-                        is_frozen: plan.is_frozen(),
+                        is_frozen: crate::projection::is_plan_finished(repo_state, &plan.id),
                     },
                 }
             }
@@ -797,7 +797,7 @@ pub async fn resolve_plan_id(
                             plan_key: plan.id.clone(),
                             plan_path: plan.plan_path.clone(),
                             body_hash: plan.body_hash.clone(),
-                            is_frozen: plan.is_frozen(),
+                            is_frozen: crate::projection::is_plan_finished(repo_state, &plan.id),
                         }),
                     },
                 }
@@ -806,12 +806,12 @@ pub async fn resolve_plan_id(
         let candidates: Vec<CandidateSnapshot> = repo_state
             .plans
             .values()
-            .filter(|p| !p.is_frozen())
+            .filter(|p| !crate::projection::is_plan_finished(repo_state, &p.id))
             .map(|p| CandidateSnapshot {
                 plan_key: p.id.clone(),
                 plan_path: p.plan_path.clone(),
                 body_hash: p.body_hash.clone(),
-                is_frozen: p.is_frozen(),
+                is_frozen: crate::projection::is_plan_finished(repo_state, &p.id),
             })
             .collect();
         (selection_consult, candidates)
