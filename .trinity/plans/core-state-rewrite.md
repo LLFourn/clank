@@ -38,10 +38,22 @@ with the smaller and more honest scope.
 
 ## Hard Direction
 
-- `RepoState` is `{ plans, ad_hoc, current_attribution,
-  finalize_files }`. Nothing else.
-- `state.plans` holds only active plans. Finalize and
-  non-frozen Delete REMOVE the plan from the map.
+- `RepoState` is `{ plans, finished_plans, ad_hoc,
+  active_plan_hint }`. Four fields. The fold tracks NO
+  per-plan approver state — the daemon (via `git_io`)
+  computes whether a commit's tree freezes a plan when it
+  builds the `CommitEvent`, and tells the fold via
+  `event.newly_finished: BTreeSet<PlanKey>`.
+- `state.plans` holds only active plans. Non-frozen Delete
+  REMOVES the plan from the map. Finalize MOVES the plan
+  to `finished_plans` (recording `{ plan, finalized_at:
+  CommitSha }`) and removes it from `plans`.
+- `state.finished_plans: Vec<FinishedPlan>` is an ordered
+  log of "plan X was finalized at SHA Y." That's all. The
+  body at freeze, approver count, etc. are
+  `git_io::show <sha>:...` queries when the UI needs them.
+  PlanKey can repeat (a plan can be re-introduced and
+  re-finalized).
 - `PlanState` is `{ commits: Vec<PlanTimelineEvent> }`. No
   body, no body_hash, no plan_intro, no plan_intro_parent,
   no last_activity_ts, no archived_cycles, no
@@ -76,25 +88,32 @@ refers back here.
 /// Top-level fold output. The cache stores this directly.
 pub struct RepoState {
     /// Active plans only. A plan exits the map on finalize
-    /// or non-frozen Delete. `git log` is the system of
-    /// record for finished plans.
+    /// (moved to `finished_plans`) or on a non-frozen Delete
+    /// (gone from state entirely).
     pub plans: BTreeMap<PlanKey, PlanState>,
+
+    /// Ordered log of finalize events: "plan X was finalized
+    /// at SHA Y, then plan Z at SHA W, ..." That's all. Body
+    /// at freeze, approver count, etc. are recoverable via
+    /// `git_io::show <sha>:.trinity/finished/<plan>/...` or
+    /// `git show <sha>:.trinity/plans/<plan>.md`. PlanKey
+    /// can repeat (re-intro + re-finalize).
+    pub finished_plans: Vec<FinishedPlan>,
 
     /// Out-of-plan commits in fold order. Cleared on the
     /// next plan intro.
     pub ad_hoc: Vec<AdHocEvent>,
 
-    /// Walk-back attribution carry. The chain the
-    /// classifier will use for the next commit's
-    /// `plan_attribution` inference if the title is bare.
-    pub current_attribution: Option<PlanKey>,
-
-    /// Per-active-plan approving-files map, mirrored from
-    /// `.trinity/finished/<plan>/<author>.md`. The freeze
-    /// rule fires when an approving file landing in a
-    /// commit's tree crosses the configured threshold.
-    /// Inner map: author filename → file body.
-    pub finalize_files: BTreeMap<PlanKey, BTreeMap<String, String>>,
+    /// The plan we're assumed to be working on right now —
+    /// "active plan hint" — determined by the last commit
+    /// that touched exclusively one plan (or had an
+    /// explicit `[plan-x]` prefix). The classifier uses
+    /// this as the fallback `plan_attribution` for the
+    /// next commit when the title is bare and the diff
+    /// doesn't disambiguate. Not authoritative: master can
+    /// always override with an explicit `[plan-x]` or
+    /// `[misc]` prefix.
+    pub active_plan_hint: Option<PlanKey>,
 }
 
 /// One active plan. Just its timeline. All derived facts
@@ -103,6 +122,14 @@ pub struct RepoState {
 /// latest_implementation) are projections.
 pub struct PlanState {
     pub commits: Vec<PlanTimelineEvent>,
+}
+
+/// Entry in `RepoState.finished_plans`. Records the bare
+/// fact that a plan was finalized at a given commit. Body
+/// text, approver count, etc. are recoverable via git.
+pub struct FinishedPlan {
+    pub plan: PlanKey,
+    pub finalized_at: CommitSha,
 }
 
 /// One entry in a plan's timeline: how a single commit
@@ -141,7 +168,15 @@ pub struct CommitEvent {
     pub author_ts: i64,
     pub subject: String,
     pub plan_touches: Vec<PlanTouchInput>,
-    pub finalize_changes: Vec<FinalizeFileChange>,
+    /// Plans whose freeze rule fires at this commit. The
+    /// daemon computes this by inspecting the commit's
+    /// tree: a plan freezes when its `.trinity/finished/<plan>/`
+    /// directory has ≥1 file and all files are APPROVE
+    /// verdicts AND the plan is currently active
+    /// (in `state.plans` at the moment the daemon builds
+    /// the event). The fold never inspects file contents
+    /// or tracks per-plan approver counts.
+    pub newly_finished: BTreeSet<PlanKey>,
     pub has_code_changes: bool,
 }
 
@@ -158,29 +193,33 @@ pub enum TouchKind {
     Delete,
 }
 
-pub enum FinalizeFileChange {
-    Added { plan: PlanKey, filename: String, body: String },
-    Modified { plan: PlanKey, filename: String, body: String },
-    Removed { plan: PlanKey, filename: String },
-}
-
 /// Classifier inputs: built from a CommitEvent + the fold's
-/// current state (carry + known active plans).
+/// current state (active-plan hint + known active plans).
 pub struct ClassifierInputs<'a> {
     pub subject: &'a str,
     pub touches: &'a BTreeMap<PlanKey, TouchKind>,
     pub finalizes: &'a BTreeSet<PlanKey>,
     pub has_code_changes: bool,
-    pub current_attribution: Option<&'a PlanKey>,
+    pub active_plan_hint: Option<&'a PlanKey>,
     pub known_plans: &'a BTreeSet<PlanKey>,
 }
 
 /// Classifier output: per-commit attribution decision +
-/// warnings + the walk-back update.
+/// warnings + the hint update.
 pub struct ClassifierOutput {
-    pub plan_attribution: Option<PlanKey>,
+    /// Plans the master attributed this commit to. Multiple
+    /// entries for `[plan-a,plan-b]`; one for `[plan-x]` or
+    /// walk-back; empty for `[misc]` / unknown prefix / no
+    /// attribution at all.
+    pub plan_attribution: BTreeSet<PlanKey>,
     pub warnings: Vec<AttributionWarning>,
-    pub next_effective_attribution: Option<PlanKey>,
+    /// The new active-plan hint after this commit. Single-plan
+    /// attribution sets it to that plan; multi-plan attribution
+    /// is "transparent" — the previous hint is preserved (a
+    /// `[plan-a,plan-b]` commit doesn't change which plan we're
+    /// dominantly working on); `[misc]` / unknown also preserve
+    /// the previous hint.
+    pub next_active_plan_hint: Option<PlanKey>,
 }
 
 /// Typed attribution warning. Emitted by the classifier
@@ -215,7 +254,11 @@ pub struct CommitNode {
     pub touches: BTreeMap<PlanKey, TouchKind>,
     pub finalizes: BTreeSet<PlanKey>,
     pub has_code_changes: bool,
-    pub plan_attribution: Option<PlanKey>,
+    /// Plans the master attributed this commit to, via the
+    /// title prefix (`[plan-x]` → one plan, `[plan-a,plan-b]`
+    /// → multiple plans) or walk-back (one plan). Empty set
+    /// means ad-hoc / `[misc]`.
+    pub plan_attribution: BTreeSet<PlanKey>,
     pub warnings: Vec<AttributionWarning>,
     pub reviews: CommitReviews,
 }
@@ -281,21 +324,11 @@ pub struct ReviewReadiness {
 ```rust
 impl RepoState {
     pub fn apply_commit(&mut self, event: &CommitEvent) {
-        // 1. Apply finalize-file mutations. These update
-        //    self.finalize_files; threshold crossings
-        //    populate `newly_finalizing`.
-        let mut newly_finalizing: BTreeSet<PlanKey> = BTreeSet::new();
-        for change in &event.finalize_changes {
-            apply_finalize_change(
-                &mut self.finalize_files,
-                &self.plans,
-                change,
-                &mut newly_finalizing,
-            );
-        }
-
-        // 2. Classify the commit (computes plan_attribution
-        //    + warnings + next_attribution).
+        // 1. Classify (computes plan_attribution + warnings
+        //    + next active-plan hint). The fold doesn't
+        //    compute newly_finished — it comes in on
+        //    `event.newly_finished`, already filtered by
+        //    the daemon to active plans.
         let touches: BTreeMap<PlanKey, TouchKind> = event
             .plan_touches
             .iter()
@@ -306,16 +339,20 @@ impl RepoState {
         let classified = classify(ClassifierInputs {
             subject: &event.subject,
             touches: &touches,
-            finalizes: &newly_finalizing,
+            finalizes: &event.newly_finished,
             has_code_changes: event.has_code_changes,
-            current_attribution: self.current_attribution.as_ref(),
+            active_plan_hint: self.active_plan_hint.as_ref(),
             known_plans: &known_plans,
         });
 
-        // 3. Apply touches.
+        // 2. Apply lifecycle mutations (no event emission
+        //    here):
         //    - Intro inserts a new PlanState AND clears
         //      self.ad_hoc.
-        //    - Revise / Delete operate on existing plans.
+        //    - Revise is a no-op (the per-plan event in
+        //      step 3 carries the touched_plan flag).
+        //    - Delete drops the plan entirely (non-frozen
+        //      delete; no entry in `finished_plans`).
         for touch in &event.plan_touches {
             match touch.kind {
                 TouchKind::Intro => {
@@ -325,68 +362,53 @@ impl RepoState {
                         PlanState { commits: Vec::new() },
                     );
                 }
-                TouchKind::Revise => { /* nothing structural to do */ }
+                TouchKind::Revise => {}
                 TouchKind::Delete => {
                     self.plans.remove(&touch.plan);
-                    self.finalize_files.remove(&touch.plan);
                 }
             }
         }
 
-        // 4. Build per-plan event for every touched plan.
-        for touch in &event.plan_touches {
-            if let Some(ps) = self.plans.get_mut(&touch.plan) {
-                ps.commits.push(PlanTimelineEvent {
-                    sha: event.sha.clone(),
-                    ts: event.author_ts,
-                    touched_plan: true,
-                    touched_code: event.has_code_changes
-                        && matches!(touch.kind, TouchKind::Revise),
-                    finished: false,
-                });
-            }
-        }
+        // 3. Emit ONE PlanTimelineEvent per affected plan.
+        //    Affected = touches ∪ attribution ∪
+        //    newly_finished. The booleans are computed
+        //    from the per-plan facts; exactly one push
+        //    site.
+        let mut affected: BTreeSet<PlanKey> = BTreeSet::new();
+        affected.extend(touches.keys().cloned());
+        affected.extend(classified.plan_attribution.iter().cloned());
+        affected.extend(event.newly_finished.iter().cloned());
 
-        // 5. Code-only attribution: if the commit has code
-        //    changes attributed to a plan it didn't touch,
-        //    emit a touched_code event on that plan.
-        if let Some(plan) = &classified.plan_attribution
-            && event.has_code_changes
-            && !touches.contains_key(plan)
-            && let Some(ps) = self.plans.get_mut(plan)
-        {
+        for plan in &affected {
+            let Some(ps) = self.plans.get_mut(plan) else {
+                continue; // plan not active (e.g. attribution
+                          // names a finalized plan)
+            };
             ps.commits.push(PlanTimelineEvent {
                 sha: event.sha.clone(),
                 ts: event.author_ts,
-                touched_plan: false,
-                touched_code: true,
-                finished: false,
+                touched_plan: touches.contains_key(plan),
+                touched_code: event.has_code_changes
+                    && classified.plan_attribution.contains(plan),
+                finished: event.newly_finished.contains(plan),
             });
         }
 
-        // 6. Apply finalize: emit `finished: true` events
-        //    (callers/tests can observe them) THEN remove
-        //    the plans from state.
-        for plan in &newly_finalizing {
-            if let Some(ps) = self.plans.get_mut(plan) {
-                ps.commits.push(PlanTimelineEvent {
-                    sha: event.sha.clone(),
-                    ts: event.author_ts,
-                    touched_plan: false,
-                    touched_code: false,
-                    finished: true,
+        // 4. Move finalized plans to finished_plans and
+        //    drop them from `plans`.
+        for plan in &event.newly_finished {
+            if self.plans.remove(plan).is_some() {
+                self.finished_plans.push(FinishedPlan {
+                    plan: plan.clone(),
+                    finalized_at: event.sha.clone(),
                 });
             }
         }
-        for plan in &newly_finalizing {
-            self.plans.remove(plan);
-            self.finalize_files.remove(plan);
-        }
 
-        // 7. Ad-hoc bucket: commits with no plan touch, no
-        //    plan attribution, code changes present.
+        // 5. Ad-hoc bucket: no touches, no attribution,
+        //    code changes present.
         if touches.is_empty()
-            && classified.plan_attribution.is_none()
+            && classified.plan_attribution.is_empty()
             && event.has_code_changes
         {
             self.ad_hoc.push(AdHocEvent {
@@ -396,32 +418,36 @@ impl RepoState {
             });
         }
 
-        // 8. Update walk-back carry.
-        self.current_attribution =
-            classified.next_effective_attribution;
+        // 6. Update the active-plan hint.
+        self.active_plan_hint = classified.next_active_plan_hint;
     }
 }
 ```
 
 Helper invariants:
 
-- `apply_finalize_change` mutates `self.finalize_files`
-  for the named plan + emits the plan into
-  `newly_finalizing` when the post-mutation count crosses
-  the freeze threshold for a plan currently in
-  `state.plans`.
+- `event.newly_finished` is the daemon's responsibility:
+  for each active plan (in `state.plans` at the moment
+  the daemon builds the event), check the commit's tree
+  for `.trinity/finished/<plan>/` having ≥1 file with all
+  APPROVE verdicts. If yes, add the plan to
+  `newly_finished`. The fold accepts the set as ground
+  truth — it does NOT verify, track approver counts, or
+  inspect file contents.
 - A commit with `touches = {A: Intro}` clears
-  `self.ad_hoc` before doing anything else for A. This is
-  the "new plan absorbs/discards prior ad-hoc work" rule.
-- A commit with `touches = {A: Delete}` removes A and its
-  `finalize_files[A]` entry. If A doesn't exist (already
-  finalized), the delete is a no-op.
-- Multi-plan commits (`touches.len() ≥ 2`) emit one event
-  per touched plan, each with `touched_plan: true`.
+  `self.ad_hoc` before anything else. This is the "new
+  plan absorbs/discards prior ad-hoc work" rule.
+- A commit with `touches = {A: Delete}` removes A. If A
+  doesn't exist (already finalized), the delete is a
+  no-op.
+- Multi-plan commits (`touches.len() ≥ 2`) result in one
+  event per touched plan, each with `touched_plan: true`.
 - `finished: true` events are emitted before plan removal
   so apply_commit's downstream observers (tests, debug
-  prints) see them. They never persist in a saved
-  `RepoState`.
+  prints) can see them. They are never persisted in a
+  saved `RepoState` — once the plan exits `state.plans`,
+  its `commits` Vec is dropped. `finished_plans` is the
+  durable finalize record.
 
 ## Cache & Incremental Fold
 
@@ -541,7 +567,8 @@ ONE atomic commit (or PR landing as one squashed commit).
 - Move the classifier (`classify`, `ClassifierInputs`,
   `parse_title_prefix`) from `model::facts` into
   `repo_state`. Reshape `ClassifierOutput` to `{
-  plan_attribution, warnings, next_effective_attribution }`
+  plan_attribution: BTreeSet<PlanKey>, warnings,
+  next_active_plan_hint: Option<PlanKey> }`
   (drop the bundled `CommitFacts`; the fold passes the
   facts directly into the events it emits).
 - Implement `RepoState::apply_commit(&mut self,
@@ -642,9 +669,12 @@ ONE atomic commit (or PR landing as one squashed commit).
   - `touches = {A: Revise}` after intro appends an event
     with `touched_plan: true`.
   - `touches = {A: Delete}` on an active plan removes it
-    + its `finalize_files[A]` entry.
-  - `finalizes = {A}` (from threshold crossing) appends a
-    `finished: true` event then removes A.
+    from `state.plans` (no entry added to
+    `finished_plans` — delete and finalize are distinct).
+  - `event.newly_finished = {A}` appends a
+    `finished: true` event to A's commits then moves A
+    to `finished_plans` and removes it from
+    `state.plans`.
   - `finalizes = {A}, touches = {B: Revise}`: A exits
     state with its finished event having appeared; B's
     commits gains a touched_plan event.
@@ -696,9 +726,13 @@ ONE atomic commit (or PR landing as one squashed commit).
 
 ## Acceptance
 
-- `RepoState` is `{ plans, ad_hoc, current_attribution,
-  finalize_files }`. Lives in
+- `RepoState` is `{ plans, finished_plans, ad_hoc,
+  active_plan_hint }`. Lives in
   `crates/trinity-core/src/repo_state.rs`.
+- `FinishedPlan` is `{ plan: PlanKey, finalized_at:
+  CommitSha }`. `state.finished_plans: Vec<FinishedPlan>`
+  is the ordered log of finalize events. Body / approver
+  count / etc. are recoverable via `git_io`.
 - `PlanState` is `{ commits: Vec<PlanTimelineEvent> }`.
   No body, body_hash, intro, last_activity, archived_cycles,
   latest_revision, latest_implementation,
