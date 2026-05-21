@@ -1,10 +1,4 @@
 {
-  "archived_cycles": [
-    {
-      "approver_count": "integer",
-      "closer": "string"
-    }
-  ],
   "commits": [
     {
       "feedback": [

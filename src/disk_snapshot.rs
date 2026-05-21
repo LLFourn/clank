@@ -529,7 +529,6 @@ pub fn apply_commit(state: &mut RepoState, carry: &mut FoldCarry, event: &Commit
                         plan_intro_parent: carry.previous_commit.clone(),
                         last_activity_ts: 0,
                         timeline: Vec::new(),
-                        archived_cycles: Vec::new(),
                     },
                 );
             }
@@ -590,15 +589,12 @@ pub fn apply_commit(state: &mut RepoState, carry: &mut FoldCarry, event: &Commit
         if finalize_rule_satisfied(files) {
             let approver_count = files.map(|m| m.len()).unwrap_or(0) as u32;
             let captured_body = carry.plan_bodies.get(plan_key).cloned();
+            let _approver_count = approver_count;
             if let Some(plan) = state.plans.get_mut(plan_key) {
                 if let Some(body) = captured_body {
                     plan.body_hash = content_hash(&body);
                     plan.body = body;
                 }
-                plan.archived_cycles.push(crate::repo_state::ArchivedCycle {
-                    closer: commit_sha.clone(),
-                    approver_count,
-                });
                 // Append the Finalize event last — this is what makes
                 // `plan.frozen_at()` return Some(commit_sha). The
                 // monotone rule guarantees no further events on this

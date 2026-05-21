@@ -151,7 +151,6 @@ fn build_plan_row(
         waiting_on: w,
         latest_reviewable_sha: crate::projection::latest_reviewable_commit_for(plan),
         gate_state: gate.map(|g| g.state),
-        archived_cycles: plan.archived_cycles.clone(),
         last_activity_ts: crate::projection::last_activity_ts_for(plan),
     }
 }
@@ -446,7 +445,6 @@ pub fn plan_page_with_reader(
         plan_body: plan.body.clone(),
         timeline,
         pr_hint,
-        archived_cycles: plan.archived_cycles.clone(),
     }))
 }
 

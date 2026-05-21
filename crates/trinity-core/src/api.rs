@@ -151,11 +151,6 @@ pub enum TimelineEvent {
     },
 }
 
-// `ArchivedCycle` lives in [`crate::model`] because daemon storage
-// (`model::Plan.archived_cycles`) holds it directly. Response
-// shapes here re-export it at use sites.
-pub use crate::model::ArchivedCycle;
-
 /// Approval snapshot file under `.trinity/finished/<stem>/<agent>.md`
 /// at the freeze commit's tree. Surfaced on `CommitDetailResponse`
 /// when the commit's kind is `Finalize`. `body` is raw markdown;
@@ -336,8 +331,6 @@ pub struct PlanRow {
     /// commit exists but no verdicts have landed.
     #[serde(default)]
     pub gate_state: Option<CommitGateState>,
-    #[serde(default)]
-    pub archived_cycles: Vec<ArchivedCycle>,
     /// Powers the homepage sort.
     #[serde(default)]
     pub last_activity_ts: i64,
@@ -574,7 +567,6 @@ pub struct PlanDetailResponse {
     pub plan_body: String,
     pub timeline: Vec<TimelineEvent>,
     pub pr_hint: Option<PrHint>,
-    pub archived_cycles: Vec<ArchivedCycle>,
 }
 
 /// `/api/plan/{repo}/{stem_md}/commit/{sha}` response body. Uses

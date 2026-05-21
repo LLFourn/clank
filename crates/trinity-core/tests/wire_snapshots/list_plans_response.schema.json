@@ -10,12 +10,6 @@
   ],
   "plans": [
     {
-      "archived_cycles": [
-        {
-          "approver_count": "integer",
-          "closer": "string"
-        }
-      ],
       "current_path": "string",
       "gate_state": "string",
       "last_activity_ts": "integer",

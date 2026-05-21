@@ -144,7 +144,6 @@ async fn round_trip_finalize_variant_with_archived_cycle() {
     let base = build_base(dir.path()).await;
     let key = PlanKey::parse("foo").unwrap();
     assert!(base.plans[&key].is_frozen());
-    assert!(!base.plans[&key].archived_cycles.is_empty());
     round_trip(&payload_from_base(&base));
 }
 

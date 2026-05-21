@@ -127,13 +127,6 @@ fn waiting_on_fixture() -> WaitingOn {
     }
 }
 
-fn archived_fixture() -> ArchivedCycle {
-    ArchivedCycle {
-        closer: CommitSha::parse("abc1234").unwrap(),
-        approver_count: 2,
-    }
-}
-
 fn commit_row_fixture() -> CommitRow {
     CommitRow::PlanOnly {
         sha: "abc".into(),
@@ -164,7 +157,6 @@ fn plan_row_fixture() -> PlanRow {
         waiting_on: waiting_on_fixture(),
         latest_reviewable_sha: Some(CommitSha::parse("abc1234").unwrap()),
         gate_state: Some(trinity_core::vocab::CommitGateState::Unreviewed),
-        archived_cycles: vec![archived_fixture()],
         last_activity_ts: 1_700_000_000,
     }
 }
@@ -309,7 +301,6 @@ fn schema_plan_detail_response() {
         plan_body: "# hi\n".into(),
         timeline: vec![timeline_review_fixture()],
         pr_hint: Some(pr_hint_fixture()),
-        archived_cycles: vec![archived_fixture()],
     })
     .unwrap();
     assert_schema("plan_detail_response", &v);
