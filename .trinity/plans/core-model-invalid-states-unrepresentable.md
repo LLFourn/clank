@@ -50,19 +50,31 @@ commit model — that's flat facts.
 
 After this plan:
 
-- `RepoState` is exactly `{ commit_order, commits, plans,
-  ad_hoc }`. No second canonical commit log.
+- `RepoState` carries `{ commit_order, commits, plans,
+  ad_hoc, current_attribution, finalize_files }`. The last
+  two fields absorb the former `FoldCarry`.
 - `CommitNode` is `{ meta, touches, finalizes,
   has_code_changes, plan_attribution, reviews }`. Each field
   is a single-source fact.
 - No `CommitBody`, `PlanCommit`, `MultiPlanCommit`,
   `AdHocCommit`, `FinalizeCommit`, `LifecycleOnly` types.
   Those concepts become projections, not types.
+- No `FoldCarry`. The fold IS `RepoState::apply_commit(&mut
+  self, &CommitEvent)` — single argument; the state knows
+  everything it needs to fold the next commit.
+- The fold lives in `trinity-core::repo_state`. Sans-io: no
+  git, no filesystem, no async. Daemon-side IO builds
+  `CommitEvent`s and calls `apply_commit` for each.
 - `PlanState` is the canonical folded per-plan aggregate:
   `{ id, plan_path, body, stage, timeline, intro,
   latest_revision, latest_implementation, finalized_at,
   participants_cumulative, last_activity_ts }`. Built by the
   fold; the product of the model.
+- The cache stores the entire `RepoState` (including the
+  former-carry fields) and supports incremental fold:
+  loading the cached state at any ancestor SHA, applying new
+  commits, and persisting at the new HEAD. Warm cache
+  updates are O(new commits), not O(history).
 - Reviewability is a per-(commit, scope, config) projection,
   not a stored flag.
 - Gate / readiness / policy are free functions over
@@ -507,100 +519,312 @@ the `api` module and is built by projection.
 
 ## Fold Algorithm
 
-The classifier returns the full commit fact set in one
-structure. Facts and warnings are ALL outputs of the same
-classifier call — no later stage reinterprets any of them.
-There is no separate `PlanEffect` channel because the facts
-ARE the effects.
+### Architectural Constraints
+
+The legacy fold has four interrelated design problems that
+make the cache useless for incremental work. The flat-facts
+rewrite fixes all four, otherwise the new model inherits the
+same waste:
+
+1. **`FoldCarry` is throwaway scratch state.** Today the fold
+   threads a `FoldCarry { current_effective, plan_in_tree,
+   plan_bodies, finalize_tree, previous_commit }` struct
+   through every `apply_commit` call. The carry is never
+   persisted — so on cache miss, the fold has to start from
+   `FoldCarry::new()` at the root commit, walking every commit
+   in history regardless of whether it touches `.trinity/`.
+2. **`apply_commit` takes two mutable references.** Today's
+   signature is `apply_commit(&mut RepoState, &mut FoldCarry,
+   &CommitEvent)`. Threading the carry separately means callers
+   must pass it (and risk re-using stale carry against
+   different state), and there's no single "the fold state
+   right now" object you can serialize.
+3. **The fold is daemon-side.** `apply_commit` lives in
+   `src/disk_snapshot.rs` alongside the IO-heavy feedback
+   attachment pass. Trinity-core has the data types but not
+   the fold function. That means alternative consumers (tests,
+   tooling, alternate runtimes) can't reuse the fold without
+   pulling in the daemon's IO surface.
+4. **The cache stores a terminal `BaseRepoState`** keyed by
+   HEAD. Hit = "skip the fold entirely." Miss = "walk all of
+   history from the root commit," every time. There is no
+   "load the cached state at SHA X, fold-forward just the new
+   commits to HEAD" path, because (a) the cache only stores
+   one SHA's state, not any ancestor, and (b) even if it did,
+   the carry needed to resume is gone.
+
+The Phase 3 rewrite addresses all four:
+
+1. **`FoldCarry` is deleted.** Anything the next `apply_commit`
+   needs to read becomes a field on `RepoState`. The fold
+   state IS the repo state — there is no separate scratch.
+2. **`apply_commit` is a method on `RepoState` taking a single
+   argument**: `impl RepoState { fn apply_commit(&mut self,
+   event: &CommitEvent); }`.
+3. **The fold lives in `trinity-core::repo_state`.** The
+   module is sans-io: it consumes a pre-built `CommitEvent`
+   (which the daemon constructs via `git_io`) and mutates
+   `self`. No git, no filesystem, no async — pure data
+   transformation.
+4. **The cache supports incremental fold.** Cached state is a
+   `RepoState` (post-`apply_commit` at some SHA). On cache
+   hit at a non-HEAD ancestor SHA, the daemon walks just the
+   commits from that SHA to HEAD via `git_io` and calls
+   `state.apply_commit(&event)` for each. No re-fold from the
+   root.
+
+### `RepoState` absorbs the carry
 
 ```rust
-pub struct ClassifierOutput {
-    pub facts: CommitFacts,
-    pub warnings: Vec<AttributionWarning>,
-    /// What the walk-back chain becomes after this commit.
-    /// `carry.current_attribution` is assigned this verbatim.
-    pub next_effective_attribution: Option<PlanKey>,
-}
+pub struct RepoState {
+    /// Chronological fold order — the only canonical commit
+    /// stream.
+    pub commit_order: Vec<CommitSha>,
+    /// Per-commit canonical facts.
+    pub commits: BTreeMap<CommitSha, CommitNode>,
+    /// Per-plan folded aggregates.
+    pub plans: BTreeMap<PlanKey, PlanState>,
+    /// Parallel aggregate for ad-hoc-eligible commits.
+    pub ad_hoc: AdHocState,
 
-pub struct CommitFacts {
-    pub touches: BTreeMap<PlanKey, PlanTouchKind>,
-    pub finalizes: BTreeSet<PlanKey>,
-    pub has_code_changes: bool,
-    pub plan_attribution: Option<PlanKey>,
-}
+    // ---- Former FoldCarry fields ----
 
-fn apply_commit(state: &mut RepoState, carry: &mut FoldCarry, raw: RawCommit) {
-    let classified = classify(ClassifierInputs {
-        raw: &raw,
-        plans: &state.plans,
-        carry,
-    });
+    /// Walk-back attribution chain. Updated by every
+    /// `apply_commit` from `ClassifierOutput::next_effective_attribution`.
+    pub current_attribution: Option<PlanKey>,
 
-    let sha = raw.sha.clone();
-    let node = CommitNode {
-        meta: build_meta(&raw, classified.warnings),
-        touches: classified.facts.touches,
-        finalizes: classified.facts.finalizes,
-        has_code_changes: classified.facts.has_code_changes,
-        plan_attribution: classified.facts.plan_attribution,
-        reviews: CommitReviews::default(), // filled by attach pass
-    };
-
-    // 1. Drive plan aggregates directly from the facts.
-    for (plan, kind) in &node.touches {
-        apply_touch(&mut state.plans, plan, kind, &sha, &node);
-    }
-    for plan in &node.finalizes {
-        apply_finalize(&mut state.plans, plan, &sha);
-    }
-    if let Some(plan) = &node.plan_attribution {
-        if node.has_code_changes && !node.touches.contains_key(plan) {
-            update_implementation(&mut state.plans, plan, &sha);
-        }
-    }
-    if node.is_ad_hoc_eligible() {
-        state.ad_hoc.commits.push(sha.clone());
-    }
-
-    // 2. Append to every associated plan's timeline (no
-    //    duplicates if a plan appears in multiple fact lists).
-    for plan in node.associated_plans() {
-        if let Some(ps) = state.plans.get_mut(plan) {
-            if ps.timeline.last() != Some(&sha) {
-                ps.timeline.push(sha.clone());
-            }
-        }
-    }
-
-    // 3. Insert canonical commit facts.
-    state.commit_order.push(sha.clone());
-    state.commits.insert(sha, node);
-
-    // 4. Update walk-back carry.
-    carry.current_attribution = classified.next_effective_attribution;
+    /// Per-plan approving-files map, mirrored from
+    /// `.trinity/finished/<plan>/<author>.md`. Lives on
+    /// RepoState because the freeze rule fires when an
+    /// approving file landing in a commit's tree crosses the
+    /// configured threshold, and that decision needs the
+    /// previous state's count. Cleared per-plan on intro and
+    /// on delete; finalize commits don't need to recompute
+    /// from git tree.
+    ///
+    /// Inner map: author filename → file body. Kept as
+    /// canonical state so the daemon's tree walker need not
+    /// re-read it on every commit; mutations come from the
+    /// commit's diff (added / modified / removed paths under
+    /// `.trinity/finished/<plan>/`).
+    pub finalize_files: BTreeMap<PlanKey, BTreeMap<String, String>>,
 }
 ```
 
-Where:
+What's NOT a field anymore:
 
-- `apply_touch(plans, plan, Intro, sha, node)` inserts a new
-  `PlanState` with `intro = sha`, `body =` (new plan body
-  from the commit tree), `stage = Drafting`,
-  `latest_revision = None`.
-- `apply_touch(plans, plan, Revise, sha, node)` updates body
-  and sets `latest_revision = Some(sha)`.
-- `apply_touch(plans, plan, Delete, sha, node)` removes the
-  plan iff `finalized_at.is_none()` (monotone-finished rule;
-  frozen plans survive deletion).
-- `apply_finalize(plans, plan, sha)` sets
-  `finalized_at = Some(sha)`, `stage = Frozen`.
-- `update_implementation(plans, plan, sha)` sets
-  `latest_implementation = Some(sha)`, transitions `stage`
-  from `Drafting` → `Implementing` when applicable.
+- `plan_in_tree` → derivable from `state.plans.keys()`. Plans
+  exit `state.plans` on `TouchKind::Delete` (for non-frozen
+  plans).
+- `plan_bodies` → already on `PlanState.body`.
+- `previous_commit` → `state.commit_order.last()`.
+
+`current_attribution` and `finalize_files` are the two
+truly-carry-only facts that need to live on the state.
+
+### `CommitEvent` (the fold's input)
+
+```rust
+/// All facts the fold needs about one commit. Sans-io: built
+/// by the daemon (or any other caller) before calling
+/// `state.apply_commit`. The daemon's `git_io::snapshot`
+/// produces a `Vec<CommitEvent>` for cold rebuilds; for
+/// incremental updates the daemon constructs CommitEvents
+/// one-at-a-time as new commits arrive.
+pub struct CommitEvent {
+    pub meta: CommitMeta,           // sha, author_ts, subject
+    pub plan_touches: Vec<PlanTouchInput>,
+    pub finalize_changes: Vec<FinalizeFileChange>,
+    pub has_code_changes: bool,
+}
+
+pub struct PlanTouchInput {
+    pub plan: PlanKey,
+    pub kind: TouchKind,
+    pub new_body: Option<String>,   // Intro/Revise carry it; Delete is None
+}
+
+pub enum FinalizeFileChange {
+    Added { plan: PlanKey, filename: String, body: String },
+    Modified { plan: PlanKey, filename: String, body: String },
+    Removed { plan: PlanKey, filename: String },
+}
+```
+
+### `apply_commit`
+
+```rust
+impl RepoState {
+    /// Fold one commit. Pure: no IO, no git access. The
+    /// caller pre-extracts the commit's facts into
+    /// `CommitEvent` via `git_io` (daemon) or fixture
+    /// builders (tests).
+    pub fn apply_commit(&mut self, event: &CommitEvent) {
+        // 1. Apply finalize-tree mutations from the commit's
+        //    diff. These update self.finalize_files before
+        //    the freeze rule fires below.
+        let mut newly_finalizing: BTreeSet<PlanKey> = BTreeSet::new();
+        for change in &event.finalize_changes {
+            apply_finalize_change(
+                &mut self.finalize_files,
+                change,
+                &self.plans,
+                &mut newly_finalizing,
+            );
+        }
+
+        // 2. Classify the commit's facts (computes
+        //    plan_attribution + warnings from the title,
+        //    touches, and current carry).
+        let touches: BTreeMap<PlanKey, TouchKind> = event
+            .plan_touches
+            .iter()
+            .map(|t| (t.plan.clone(), t.kind))
+            .collect();
+        let known_plans: BTreeSet<PlanKey> = self.plans.keys().cloned().collect();
+        let classified = classify(ClassifierInputs {
+            subject: &event.meta.subject,
+            touches: &touches,
+            finalizes: &newly_finalizing,
+            has_code_changes: event.has_code_changes,
+            current_attribution: self.current_attribution.as_ref(),
+            known_plans: &known_plans,
+        });
+
+        let sha = event.meta.sha.clone();
+        let mut meta = event.meta.clone();
+        meta.warnings = classified.warnings;
+        let node = CommitNode {
+            meta,
+            touches: classified.facts.touches,
+            finalizes: classified.facts.finalizes.clone(),
+            has_code_changes: classified.facts.has_code_changes,
+            plan_attribution: classified.facts.plan_attribution.clone(),
+            reviews: CommitReviews::default(), // attach pass fills it
+        };
+
+        // 3. Drive plan aggregates directly from the facts.
+        for touch in &event.plan_touches {
+            self.apply_touch(touch, &sha);
+        }
+        for plan in &node.finalizes {
+            self.apply_finalize(plan, &sha);
+        }
+        if let Some(plan) = &node.plan_attribution
+            && node.has_code_changes
+            && !node.touches.contains_key(plan)
+        {
+            self.update_implementation(plan, &sha);
+        }
+        if node.is_ad_hoc_eligible() {
+            self.ad_hoc.commits.push(sha.clone());
+        }
+
+        // 4. Append to every associated plan's timeline.
+        for plan in node.associated_plans() {
+            if let Some(ps) = self.plans.get_mut(plan)
+                && ps.timeline.last() != Some(&sha)
+            {
+                ps.timeline.push(sha.clone());
+            }
+        }
+
+        // 5. Insert canonical commit facts.
+        self.commit_order.push(sha.clone());
+        self.commits.insert(sha, node);
+
+        // 6. Update walk-back carry on self.
+        self.current_attribution = classified.next_effective_attribution;
+    }
+}
+```
+
+Helper invariants:
+
+- `apply_touch(Intro)` inserts a new `PlanState { id, body:
+  new_body, stage: Drafting, intro: sha, latest_revision:
+  None, ... }`. The new body comes from `event.plan_touches`.
+- `apply_touch(Revise)` updates `body` and sets
+  `latest_revision = Some(sha)`.
+- `apply_touch(Delete)` removes the plan iff
+  `finalized_at.is_none()`. Frozen plans persist.
+- `apply_finalize(plan, sha)` sets `finalized_at = Some(sha)`
+  and `stage = Frozen`.
+- `update_implementation(plan, sha)` sets
+  `latest_implementation = Some(sha)` and transitions
+  `stage` Drafting → Implementing.
+- `apply_finalize_change` mutates `self.finalize_files` AND
+  emits `newly_finalizing` when the post-mutation count
+  crosses the freeze threshold for a plan that wasn't
+  already frozen.
 
 No later stage reinterprets `touches`, `finalizes`,
 `has_code_changes`, or `plan_attribution` from a different
 source.
+
+### Sans-io location
+
+The fold module lives at `crates/trinity-core/src/repo_state.rs`
+(promoting / moving the daemon's current
+`src/repo_state.rs::RepoState`). Trinity-core gains a fold
+that is:
+
+- pure data → pure data;
+- testable from `crates/trinity-core` without spinning up the
+  daemon;
+- usable by alternate consumers (e.g. a frontend
+  state-rebuild path, fuzzers, snapshot tests).
+
+The daemon's `src/disk_snapshot.rs` shrinks to its IO role:
+walking the git history to build `Vec<CommitEvent>`, and the
+post-fold pass that reads `.trinity/feedback/` files and
+calls `state.attach_feedback(...)` (or similar).
+
+### Incremental fold via the cache
+
+The cache stores `RepoState` keyed by HEAD SHA. On rebuild:
+
+1. Resolve current HEAD via `git_io::rev_parse_head`.
+2. If a cached `RepoState` exists for HEAD → done; no fold.
+3. Else, find the most-recent cached `RepoState` whose
+   `commit_order.last()` is an ancestor of HEAD. Load it.
+4. Walk `git_io::commits_between(cached_head, current_head)`
+   building `CommitEvent`s.
+5. For each event in order: `state.apply_commit(&event)`.
+6. Save the updated `RepoState` under the new HEAD.
+
+`step 3` requires either:
+- caching state at multiple SHAs (per-commit or per-N-commit
+  checkpoints), OR
+- caching only at HEAD and re-folding from root when HEAD
+  changes (today's behaviour, no incremental benefit).
+
+For Phase 3, the minimum we ship is **per-HEAD cache that
+supports apply_commit on top**: when a new commit lands, the
+daemon loads the cached `RepoState` at the previous HEAD,
+applies the new commits, and writes the cache at the new
+HEAD. Cold start still walks history from the root, but
+warm updates are O(new commits) instead of O(history). The
+old HEAD's cache file is deleted in the same write.
+
+Future plans can add multi-SHA checkpoints if the cold start
+or branch-divergence cost becomes a real problem; the model
+doesn't preclude it.
+
+### Cache shape and serialization
+
+The cache stores the entire `RepoState`, including
+`current_attribution` and `finalize_files` (both moved off
+the carry, both now canonical state). `BaseRepoState` as a
+distinct cache wrapper goes away — there is no carry to
+strip out.
+
+Validating wrappers (`NonEmptyVec`) need cache-encoding that
+goes through validation. wincode-derive bypasses
+constructors; either gate cache-encoding behind a serde
+boundary that uses `TryFrom`, or hand-write `SchemaRead`
+impls. Decide at Phase 3 start; do not ship Phase 3 with a
+wincode bypass on validated types.
 
 ### Multiple Finalizations in One Commit
 
@@ -752,35 +976,98 @@ Phase 1 below before the flat-facts types come in.
 
 ### Phase 3 — Replace canonical fold (atomic)
 
+The model swap + the four architectural fixes in "Fold
+Algorithm" above. ONE atomic commit (or PR landing as one
+squashed commit) because the deletions, the consumer
+migrations, and the cache version bump don't survive
+intermediate states.
+
+**Move + restructure the fold**:
+
+- Create `crates/trinity-core/src/repo_state.rs`. Move
+  `RepoState` (and related types — `BaseRepoState` becomes
+  just `RepoState`) into it.
+- Define `CommitEvent` (sans-io fold input) in
+  `crates/trinity-core/src/repo_state.rs`.
+- Implement `RepoState::apply_commit(&mut self, event:
+  &CommitEvent)` as a method on `RepoState`. The two-arg
+  `apply_commit(state, carry, event)` shape is gone.
+- Move classifier `classify(...)` and `CommitFacts` into the
+  same module (they're already in `trinity-core::model::facts`;
+  move them up — Phase 4 collapses the `facts` namespace).
+- Delete `FoldCarry`. Its fields are absorbed:
+  - `current_attribution` → `RepoState.current_attribution`.
+  - `finalize_files` → `RepoState.finalize_files`.
+  - `plan_in_tree` → derived from `RepoState.plans.keys()`.
+  - `plan_bodies` → already on `PlanState.body`.
+  - `previous_commit` → `RepoState.commit_order.last()`.
+
+**Swap the canonical fold-state types**:
+
 - Switch `RepoState` to `{ commit_order, commits, plans,
-  ad_hoc }` using the new types.
-- Delete the legacy `CommitNode` (`kind`, `attribution`,
-  `plans`, `gate`, `attribution_warning`).
-- Delete the legacy `Plan` struct entirely (`timeline:
-  Vec<PlanTimelineEvent>`, `last_activity_ts`,
-  `plan_intro_parent`, `archived_cycles`). The plan timeline
-  is `PlanState.timeline: Vec<CommitSha>` — same concept, no
-  duplicated event records.
+  ad_hoc, current_attribution, finalize_files }` using the
+  new types.
+- Delete the legacy `model::CommitNode` (`kind`,
+  `attribution`, `plans`, `gate`, `attribution_warning`).
+- Delete the legacy `model::Plan` struct entirely
+  (`timeline: Vec<PlanTimelineEvent>`, `last_activity_ts`,
+  `plan_intro_parent`, `archived_cycles`, `body_hash`,
+  `lifecycle`).
 - Delete `model::PlanTimelineEvent` from canonical state
-  (move to `api` if the API still uses it).
-- Rewrite `apply_commit` per "Fold Algorithm" above:
-  classify, drive plan aggregates from facts, append to
-  timelines, insert node.
-- Rewrite feedback attachment to match on commit facts, write
-  into `node.reviews.feedback`, and update
-  `participants_cumulative` / `participants_discovered` as a
-  side effect.
-- Rewrite WFW candidate collection and all response
-  projections to read `state.plans` / `state.ad_hoc` and
-  project via `review_policy(...)` / `readiness(...)`.
-- Bump `state_cache::CACHE_FORMAT_VERSION` (v3 → v4).
-  - v4 carries the new shape; old caches invalidate.
-  - Bake delete-on-error into the loader so failed loads
-    self-clean (today they leak stale files into the cache
-    dir).
+  (move to `api` if the API still uses it for the wire).
+- Delete `model::Feedback` and `model::CommitGate` (the
+  legacy review storage). `CommitReviews` + `ReviewReadiness`
+  replace them.
+
+**Daemon-side rewrites**:
+
+- `src/disk_snapshot.rs` shrinks to its IO role: walks git
+  history via `git_io`, builds `Vec<CommitEvent>`, calls
+  `state.apply_commit(&event)` in fold order. The post-fold
+  pass that reads `.trinity/feedback/` files calls
+  `state.attach_feedback(...)` (new method on RepoState that
+  matches the scope-aware `CommitReviews` shape and updates
+  `participants_cumulative` / `participants_discovered`).
+- Rewrite WFW candidate collection (`src/server/wait.rs`)
+  and all response projections (`src/responses.rs`,
+  `src/server/http.rs`, `src/preview.rs`) to read
+  `state.plans` / `state.ad_hoc` and project via the free
+  functions `review_policy(...)` / `readiness(...)`.
 - Preserve existing API shapes (`CommitRow`, `DiffLine`,
   `TimelineEvent`); they're tagged enums built by
   projection.
+
+**Cache + incremental fold**:
+
+- Bump `state_cache::CACHE_FORMAT_VERSION` (v3 → v4).
+- v4 stores the entire `RepoState` (including
+  `current_attribution` and `finalize_files`). The
+  `BaseRepoState` wrapper goes away — there is no carry to
+  strip.
+- Rebuild flow changes to incremental-on-warm:
+  1. Resolve current HEAD.
+  2. If a cached `RepoState` exists at HEAD, return it.
+  3. Else, attempt to load the cached `RepoState` at the
+     most recent ancestor SHA we have cached.
+  4. If a usable ancestor is found, walk
+     `git_io::commits_between(ancestor, head)` building
+     `CommitEvent`s, call `state.apply_commit(&event)` for
+     each, and write the cache at the new HEAD (deleting
+     the old HEAD's cache file in the same write).
+  5. Otherwise (cold start or no usable ancestor) walk
+     history from the root commit as today.
+- Cache invariant: any `try_load` error (bad magic,
+  format-version mismatch, head mismatch, decode failure)
+  must delete the offending file before falling back. Today
+  the fallback is silent and stale files leak. Bake
+  delete-on-error into the loader; cache hygiene is
+  best-effort, never correctness.
+- Validating wrappers (`NonEmptyVec`) need cache-encoding
+  that goes through validation. wincode-derive bypasses
+  constructors. Either gate cache-encoding behind a
+  serde-with-TryFrom boundary, or hand-write `SchemaRead`
+  impls that call the validating constructor. Decide at
+  Phase 3 start.
 
 ### Phase 4 — Cleanup
 
@@ -867,6 +1154,12 @@ can't silently regress.
   `AttributionWarning::DanglingPlanRef`.
 - An `[plan-a]` commit touching `plan-b`'s file emits
   `AttributionWarning::AttributionMismatch`.
+- Warm-cache rebuild test: snapshot a `RepoState` after N
+  commits, append one more commit via `apply_commit`, and
+  assert the result equals a from-root re-fold over all
+  N+1 commits. This is the incremental-fold equivalence
+  invariant — the test should be in trinity-core's unit
+  tests, not the daemon.
 
 ### Wire / shape
 
@@ -883,9 +1176,21 @@ can't silently regress.
 
 ## Acceptance
 
-- `RepoState` is exactly four fields: `commit_order`,
-  `commits`, `plans`, `ad_hoc`. No second canonical commit
-  log; no parallel plan metadata struct.
+- `RepoState` carries `commit_order`, `commits`, `plans`,
+  `ad_hoc`, `current_attribution`, `finalize_files`. No
+  second canonical commit log; no parallel plan metadata
+  struct. The former-carry fields are first-class state.
+- `FoldCarry` does not exist. Any state the fold needs to
+  apply the next commit is reachable from `&mut self`.
+- `apply_commit` is a single-argument method on `RepoState`:
+  `fn apply_commit(&mut self, event: &CommitEvent)`. Sans-io.
+- The fold module lives in
+  `crates/trinity-core/src/repo_state.rs`. No daemon imports,
+  no git, no filesystem, no async.
+- The cache stores the full `RepoState` and the rebuild flow
+  supports loading a cached state at any ancestor SHA and
+  applying new commits via `apply_commit` to reach HEAD.
+  Warm rebuilds do NOT re-walk history from the root.
 - `CommitNode` is exactly `{ meta, touches, finalizes,
   has_code_changes, plan_attribution, reviews }`. No
   `CommitBody`, no `kind`, no `attribution`, no `plans`, no
