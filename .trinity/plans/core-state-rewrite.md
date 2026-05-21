@@ -67,7 +67,8 @@ with the smaller and more honest scope.
   participants_cumulative, no stage. All derived at
   projection time.
 - `PlanTimelineEvent` is `{ sha, ts, touched_plan,
-  touched_code, finished }`. Five fields.
+  touched_code }`. Four fields. The finalize fact lives
+  in `state.finished_plans`, not on the event.
 - `state.ad_hoc: Vec<AdHocEvent>`. Cleared on the next plan
   intro.
 - `apply_commit(&mut self, event: &CommitEvent)`. One arg.
@@ -152,11 +153,23 @@ pub struct PlanState {
     pub commits: Vec<PlanTimelineEvent>,
 }
 
-/// Entry in `RepoState.finished_plans`. Records the bare
-/// fact that a plan was finalized at a given commit. Body
-/// text, approver count, etc. are recoverable via git.
+/// Entry in `RepoState.finished_plans`. Stores the bare
+/// identity of a finalized plan: its key plus the two
+/// boundary SHAs (intro = first commit of this instance,
+/// finalized_at = the commit whose tree fired the freeze
+/// predicate). Body text, approver count, and the full
+/// historical timeline are recoverable via `git_io`:
+///   `git show <finalized_at>:.trinity/plans/<plan>.md`
+///   gets the body at freeze;
+///   walking `intro..=finalized_at` reconstructs which
+///   commits belonged to the plan if a future feature
+///   needs full history. The fold itself does NOT retain
+///   per-commit history for finished plans — the
+///   `PlanState.commits` Vec is dropped when the plan
+///   exits `state.plans`.
 pub struct FinishedPlan {
     pub plan: PlanKey,
+    pub intro: CommitSha,
     pub finalized_at: CommitSha,
 }
 
@@ -436,8 +449,16 @@ impl RepoState {
                     self.plans.remove(&touch.plan);
                     self.finished_plans
                         .retain(|f| f.plan != touch.plan);
-                    self.warnings
-                        .retain(|w| w.plan.as_ref() != Some(&touch.plan));
+                    // Drop warnings tagged with the key AND
+                    // warnings whose payload mentions the
+                    // key (e.g. AttributionMismatch's
+                    // `attributed`/`touched` lists). Tag
+                    // alone isn't enough — the variant data
+                    // can still reference the deleted plan.
+                    self.warnings.retain(|w| {
+                        w.plan.as_ref() != Some(&touch.plan)
+                            && !warning_mentions_plan(&w.warning, &touch.plan)
+                    });
                     if self.active_plan_hint.as_ref() == Some(&touch.plan) {
                         self.active_plan_hint = None;
                     }
@@ -476,9 +497,15 @@ impl RepoState {
         //    finalized plan stay too — they're historical
         //    facts about commits the plan saw.
         for plan in &event.newly_finished {
-            if self.plans.remove(plan).is_some() {
+            if let Some(ps) = self.plans.remove(plan) {
+                let intro = ps
+                    .commits
+                    .first()
+                    .map(|e| e.sha.clone())
+                    .unwrap_or_else(|| event.sha.clone());
                 self.finished_plans.push(FinishedPlan {
                     plan: plan.clone(),
+                    intro,
                     finalized_at: event.sha.clone(),
                 });
             }
@@ -515,21 +542,38 @@ impl RepoState {
 
 Helper invariants:
 
-- `event.newly_finished` is the daemon's responsibility:
-  for each active plan (in `state.plans` at the moment
-  the daemon builds the event), check the commit's tree
-  for `.trinity/finished/<plan>/` having ≥1 file with all
-  APPROVE verdicts. If yes, add the plan to
-  `newly_finished`. The fold accepts the set as ground
-  truth — it does NOT verify, track approver counts, or
-  inspect file contents.
+- `event.newly_finished` is a **stateless parent/child
+  tree comparison**. The daemon (with git_io) computes it
+  per commit:
+
+  ```text
+  newly_finished(plan, commit) =
+      plan file exists in the commit tree
+      AND finish_predicate(plan, parent_tree) == false
+      AND finish_predicate(plan, commit_tree) == true
+
+  finish_predicate(plan, tree) =
+      .trinity/finished/<plan>/ has ≥1 file
+      AND every file parses as APPROVE
+  ```
+
+  This rule is a pure function of the two trees; it does
+  NOT depend on `state.plans`. The fold accepts
+  `newly_finished` as ground truth and does not verify,
+  track approver counts, or inspect file contents. A side
+  benefit: stale approver files from a prior cycle don't
+  re-finalize a re-introduced plan unless the directory
+  itself changes after re-intro (the parent tree's
+  predicate is true → no transition).
 - A commit with `touches = {A: Intro}` clears
   `self.ad_hoc` before anything else. This is the "new
   plan absorbs/discards prior ad-hoc work" rule.
 - A `TouchKind::Delete` is **hard-forget**: it wipes
   `plans[key]`, every `finished_plans` entry for the same
-  key, all `warnings` tagged with the key, and clears
-  `active_plan_hint` if it pointed at the key. After
+  key, every `warning` whose tag is the key OR whose
+  payload mentions the key (see `warning_mentions_plan`
+  below), and clears `active_plan_hint` if it pointed at
+  the key. After
   delete, Trinity has no folded memory of the plan; a
   later `Intro` of the same `PlanKey` is a fresh plan.
 - A `TouchKind::Finalize` (via `event.newly_finished`) is
@@ -545,6 +589,13 @@ Helper invariants:
   plan) and `None` for repo-scoped variants
   (`UnknownPlanPrefix`, `AttributionMismatch`,
   multi-plan `MissingPrefix`).
+- `warning_mentions_plan(&Warning, &PlanKey)` returns
+  true iff the warning's payload directly references the
+  given plan: `DanglingPlanRef.plan == key`,
+  `AttributionMismatch.attributed.contains(key)` or
+  `.touched.contains(key)`, etc. Used by the Delete
+  hard-forget path so that wiping a key removes every
+  warning that even mentions it.
 - Post-apply invariant:
   `active_plan_hint.is_none_or(|p|
   self.plans.contains_key(p))`. The sanitization step at
@@ -629,10 +680,19 @@ Common queries:
   mtime)`.
 - Participants cumulative → distinct authors across
   feedback files under `.trinity/feedback/<plan>/`.
-- Per-commit warnings → re-run `classify(...)` on the
-  classifier inputs the projection rebuilds from the
-  commit's facts (re-fetched via `git_io` for the commits
-  the UI is currently displaying).
+- Per-commit warnings → filter `state.warnings` by SHA
+  (and optionally by plan). The classifier emitted them
+  during the fold; projection only displays.
+- Finished plan view → `state.finished_plans` gives
+  `{ plan, intro, finalized_at }`. The UI can show plan
+  identity, intro/finalize SHAs, and the body at finalize
+  via `git show <finalized_at>:.trinity/plans/<plan>.md`.
+  The full historical commit timeline is NOT in
+  `RepoState` for finished plans — the fold drops
+  `PlanState.commits` on finalize. A future feature can
+  walk `intro..=finalized_at` to reconstruct it on
+  demand; this plan keeps `RepoState` small and accepts
+  the tradeoff.
 
 `review_policy` / `readiness` are free functions. The
 caller picks the relevant scope (a `Some(plan)` for plan
@@ -856,18 +916,22 @@ ONE atomic commit (or PR landing as one squashed commit).
 ## Acceptance
 
 - `RepoState` is `{ plans, finished_plans, ad_hoc,
-  active_plan_hint }`. Lives in
+  active_plan_hint, warnings }`. Lives in
   `crates/trinity-core/src/repo_state.rs`.
-- `FinishedPlan` is `{ plan: PlanKey, finalized_at:
-  CommitSha }`. `state.finished_plans: Vec<FinishedPlan>`
-  is the ordered log of finalize events. Body / approver
-  count / etc. are recoverable via `git_io`.
+- `FinishedPlan` is `{ plan: PlanKey, intro: CommitSha,
+  finalized_at: CommitSha }`.
+  `state.finished_plans: Vec<FinishedPlan>` is the ordered
+  log of finalize events. Body / approver count / full
+  historical timeline are recoverable via `git_io`
+  (e.g. `git show <finalized_at>:.trinity/plans/<plan>.md`,
+  or walking `intro..=finalized_at` if a future plan
+  needs full history reconstruction).
 - `PlanState` is `{ commits: Vec<PlanTimelineEvent> }`.
   No body, body_hash, intro, last_activity, archived_cycles,
   latest_revision, latest_implementation,
   participants_cumulative, stage fields.
 - `PlanTimelineEvent` is `{ sha, ts, touched_plan,
-  touched_code, finished }`.
+  touched_code }`.
 - `state.ad_hoc` is `Vec<AdHocEvent>`. Cleared on plan
   intro.
 - `apply_commit` is `RepoState::apply_commit(&mut self,
