@@ -713,19 +713,56 @@ async fn collect_attribution_warnings(
     let Some(state) = trinity.repos.get(repo_root) else {
         return Vec::new();
     };
+    // Walk state.fold.warnings (the new fold's typed warning log)
+    // and render one wire-shaped AttributionWarning per entry.
+    // Subject still comes from the legacy CommitNode store until
+    // disk_snapshot's legacy fold retires.
     state
-        .commit_order
+        .fold
+        .warnings
         .iter()
-        .filter_map(|sha| {
-            let node = state.commits.get(sha)?;
-            let message = node.attribution_warning.as_ref()?.clone();
+        .filter_map(|w| {
+            let node = state.commits.get(&w.sha)?;
             Some(trinity_core::api::AttributionWarning {
-                sha: sha.as_str().to_string(),
+                sha: w.sha.as_str().to_string(),
                 subject: node.subject.clone(),
-                message,
+                message: format_warning_message(&w.warning),
             })
         })
         .collect()
+}
+
+fn format_warning_message(w: &trinity_core::repo_state::Warning) -> String {
+    use trinity_core::repo_state::Warning;
+    match w {
+        Warning::UnknownPlanPrefix { unknown_names } => format!(
+            "commit-title prefix names unknown plan(s): {}; treated as ad hoc — amend to `[misc]` or a known plan name to silence",
+            unknown_names.join(", ")
+        ),
+        Warning::MissingPrefix { suggested_prefix } => format!(
+            "commit subject missing convention prefix; inferred attribution suggests `{suggested_prefix}` — amend the title to silence"
+        ),
+        Warning::AttributionMismatch {
+            attributed,
+            touched,
+        } => format!(
+            "commit-title prefix attributes [{}] but commit touched [{}]; prefix wins for attribution",
+            attributed
+                .iter()
+                .map(|k| k.as_str())
+                .collect::<Vec<_>>()
+                .join(","),
+            touched
+                .iter()
+                .map(|k| k.as_str())
+                .collect::<Vec<_>>()
+                .join(","),
+        ),
+        Warning::DanglingPlanRef { plan } => format!(
+            "commit references plan `{}` which no longer exists",
+            plan.as_str()
+        ),
+    }
 }
 
 /// Walk the plan timeline for feedback against superseded (non-
@@ -2023,25 +2060,27 @@ mod integration_tests {
         // this regression. The point is: NO bar FixCommitTitle.
     }
 
-    /// Phase 5 regression for codex on ad9c147: non-strict
-    /// missing-prefix warnings ride along on master wakes.
-    /// Sequence: properly-prefixed `[foo] intro`, then an
-    /// unprefixed code commit (attributes to foo via walk-back),
-    /// then dirty foo's plan file to drive a master
-    /// CommitPlanRevision wake. The wake must include an
-    /// `attribution_warning` for the unprefixed commit.
+    /// Non-strict missing-prefix warnings ride along on master
+    /// wakes when a commit's inferred attribution disagrees with
+    /// the active-plan hint. Per core-state-rewrite.md, pure
+    /// hint-inherit code commits no longer warn (the implementation
+    /// chain is the expected shape); MissingPrefix fires only when
+    /// the inference produces a DIFFERENT plan than the hint, or
+    /// when multiple plans are touched without a prefix.
     #[tokio::test]
     async fn missing_prefix_warning_rides_along_on_master_wake() {
         let dir = init_repo();
         write_file(dir.path(), ".trinity/plans/foo.md", "# foo v1\n");
+        write_file(dir.path(), ".trinity/plans/bar.md", "# bar v1\n");
         run_git(dir.path(), &["add", "-A"]);
         run_git(dir.path(), &["commit", "--quiet", "-m", "[foo] intro"]);
-        // Unprefixed code commit — should attribute to foo via
-        // walk-back AND get a missing-prefix warning.
-        write_file(dir.path(), "src.rs", "fn main() {}\n");
+        // Unprefixed touch of bar's plan file — hint is foo, so the
+        // single-touch inference attributes to bar but disagrees
+        // with the hint → MissingPrefix warning.
+        write_file(dir.path(), ".trinity/plans/bar.md", "# bar v2\n");
         run_git(dir.path(), &["add", "-A"]);
-        run_git(dir.path(), &["commit", "--quiet", "-m", "implement main"]);
-        // Dirty the plan file to drive a master CommitPlanRevision wake.
+        run_git(dir.path(), &["commit", "--quiet", "-m", "tweak bar"]);
+        // Dirty foo's plan file to drive a master CommitPlanRevision wake.
         write_file(dir.path(), ".trinity/plans/foo.md", "# foo v2\n");
         let rt = Runtime::new();
         rt.add_repo(dir.path().to_path_buf()).await.unwrap();
