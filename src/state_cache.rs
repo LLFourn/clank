@@ -53,7 +53,12 @@ const CACHE_MAGIC: &[u8] = b"TRINITY-BASE-STATE\n";
 ///    commit-first-review-model).
 ///  - v3: adds `commit_order: Vec<CommitSha>` to encode the
 ///    first-parent fold sequence. Older caches are invalidated.
-const CACHE_FORMAT_VERSION: u32 = 3;
+///  - v4: adds `fold: trinity_core::repo_state::RepoState` — the
+///    new sans-io fold state introduced by
+///    `core-state-rewrite.md` Phase 1. Coexists with the legacy
+///    fields during the migration; later phases delete the legacy
+///    fields once consumers cut over.
+const CACHE_FORMAT_VERSION: u32 = 4;
 
 /// Trinity binary identity. Bump on incompatible changes that
 /// would make decoded state semantically invalid even if it
@@ -104,6 +109,7 @@ struct BaseStatePayload {
     plans: BTreeMap<PlanKey, Plan>,
     commits: BTreeMap<crate::lifecycle::CommitSha, crate::repo_state::CommitNode>,
     commit_order: Vec<crate::lifecycle::CommitSha>,
+    fold: trinity_core::repo_state::RepoState,
 }
 
 impl BaseStatePayload {
@@ -112,6 +118,7 @@ impl BaseStatePayload {
             plans: state.plans.clone(),
             commits: state.commits.clone(),
             commit_order: state.commit_order.clone(),
+            fold: state.fold.clone(),
         }
     }
 
@@ -126,6 +133,7 @@ impl BaseStatePayload {
             commit_order: self.commit_order,
             head: Some(head),
             plan_conflicts: BTreeMap::new(),
+            fold: self.fold,
         };
         BaseRepoState::new(state)
     }
@@ -143,10 +151,26 @@ fn cache_file_for(repo_root: &Path, head: &CommitSha) -> PathBuf {
 /// Try to load a cached `BaseRepoState` for `(repo_root, head)`.
 /// Returns `Ok(None)` if the file does not exist; returns `Err`
 /// on header validation failure, corrupt body, or io error so the
-/// caller can log and fall back to a full fold.
+/// caller can log and fall back to a full fold. The offending file
+/// is removed on every error path so stale / corrupt files don't
+/// stick around to trip future loads.
 pub fn try_load(repo_root: &Path, head: &CommitSha) -> Result<Option<BaseRepoState>, CacheError> {
     let path = cache_file_for(repo_root, head);
-    let mut file = match fs::File::open(&path) {
+    match try_load_inner(repo_root, &path, head) {
+        Ok(opt) => Ok(opt),
+        Err(e) => {
+            let _ = fs::remove_file(&path);
+            Err(e)
+        }
+    }
+}
+
+fn try_load_inner(
+    repo_root: &Path,
+    path: &Path,
+    head: &CommitSha,
+) -> Result<Option<BaseRepoState>, CacheError> {
+    let mut file = match fs::File::open(path) {
         Ok(f) => f,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(e.into()),
@@ -352,6 +376,26 @@ mod tests {
         let head = CommitSha::parse("0123456789abcdef0123456789abcdef01234567").unwrap();
         let result = try_load(dir.path(), &head).unwrap();
         assert!(result.is_none());
+    }
+
+    /// Regression for core-state-rewrite Phase 1: every try_load
+    /// error path must remove the offending cache file so a stale /
+    /// corrupt file doesn't keep failing on every subsequent load.
+    #[test]
+    fn try_load_error_deletes_offending_file() {
+        let dir = fresh_repo();
+        let base = synth_base(dir.path());
+        write(dir.path(), &base).unwrap();
+        let path = cache_file_for(dir.path(), base.head.as_ref().unwrap());
+        // Corrupt the magic bytes so try_load fails with BadMagic.
+        let mut bytes = fs::read(&path).unwrap();
+        bytes[0] = b'X';
+        fs::write(&path, &bytes).unwrap();
+        let _ = try_load(dir.path(), base.head.as_ref().unwrap()).unwrap_err();
+        assert!(
+            !path.exists(),
+            "try_load error must delete the offending file; left {path:?}",
+        );
     }
 
     #[test]

@@ -74,6 +74,12 @@ pub struct RepoState {
     /// effectively unused (path-parser rejects `.trinity/plans/done/`),
     /// but kept on the type for future stem-collision surfacing.
     pub plan_conflicts: BTreeMap<PlanKey, Vec<PathBuf>>,
+    /// New sans-io fold state per `core-state-rewrite.md` Phase 1.
+    /// Populated alongside the legacy fold by
+    /// `disk_snapshot::apply_commit`. Subsequent commits migrate
+    /// consumers off the legacy fields above onto this one; eventually
+    /// the legacy fields are deleted and this becomes the only state.
+    pub fold: trinity_core::repo_state::RepoState,
 }
 
 impl RepoState {
@@ -96,6 +102,26 @@ impl RepoState {
             .filter(|sha| commits.contains_key(*sha))
             .cloned()
             .collect();
+        // Project the new fold to just this plan's active state.
+        let mut fold = trinity_core::repo_state::RepoState::default();
+        if let Some(ps) = self.fold.plans.get(key) {
+            fold.plans.insert(key.clone(), ps.clone());
+        }
+        for fp in &self.fold.finished_plans {
+            if &fp.plan == key {
+                fold.finished_plans.push(fp.clone());
+            }
+        }
+        for w in &self.fold.warnings {
+            if w.plan.as_ref() == Some(key)
+                || trinity_core::repo_state::warning_mentions_plan(&w.warning, key)
+            {
+                fold.warnings.push(w.clone());
+            }
+        }
+        if self.fold.active_plan_hint.as_ref() == Some(key) {
+            fold.active_plan_hint = Some(key.clone());
+        }
         Some(RepoState {
             root: self.root.clone(),
             plans: [(key.clone(), plan.clone())].into_iter().collect(),
@@ -103,6 +129,7 @@ impl RepoState {
             commit_order,
             head: self.head.clone(),
             plan_conflicts: std::collections::BTreeMap::new(),
+            fold,
         })
     }
 
@@ -114,6 +141,7 @@ impl RepoState {
             commit_order: Vec::new(),
             head: None,
             plan_conflicts: BTreeMap::new(),
+            fold: trinity_core::repo_state::RepoState::default(),
         }
     }
 

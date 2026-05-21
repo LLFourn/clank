@@ -803,8 +803,62 @@ pub fn apply_commit(state: &mut RepoState, carry: &mut FoldCarry, event: &Commit
     state.commits.insert(commit_sha.clone(), commit_node);
     state.commit_order.push(commit_sha.clone());
 
+    // ============================================================
+    // New sans-io fold (parallel to the legacy fold above). Per
+    // core-state-rewrite.md Phase 1 — populate
+    // `state.fold: trinity_core::repo_state::RepoState` from the
+    // same CommitEvent. Subsequent commits migrate consumers off
+    // the legacy fields and onto `state.fold`, after which the
+    // legacy fold above gets deleted.
+    apply_commit_new_fold(state, event, &plans_finalized_here);
+
     // 7. Carry forward.
     carry.previous_commit = Some(commit_sha);
+}
+
+/// New sans-io fold step. Builds a `trinity_core::repo_state::CommitEvent`
+/// from the daemon's `CommitEvent` + the freeze decision already
+/// computed by the legacy fold, then calls
+/// `state.fold.apply_commit`. The freeze decision rides through
+/// `plans_finalized_here` — that set was computed against the legacy
+/// fold's tree state, but mathematically equals the parent-vs-commit
+/// tree predicate the plan requires for `newly_finished`.
+fn apply_commit_new_fold(
+    state: &mut RepoState,
+    event: &CommitEvent,
+    plans_finalized_here: &BTreeSet<PlanKey>,
+) {
+    use trinity_core::repo_state as fold;
+
+    let plan_touches: Vec<fold::PlanTouchInput> = event
+        .changes
+        .plan_touches
+        .iter()
+        .map(|t| fold::PlanTouchInput {
+            plan: t.session.clone(),
+            kind: match t.kind {
+                PlanTouchKind::Intro => fold::TouchKind::Intro,
+                PlanTouchKind::Revision => {
+                    if t.new_path.is_none() {
+                        fold::TouchKind::Delete
+                    } else {
+                        fold::TouchKind::Revise
+                    }
+                }
+            },
+        })
+        .collect();
+
+    let new_event = fold::CommitEvent {
+        sha: event.commit.clone(),
+        author_ts: event.author_ts,
+        subject: event.subject.clone(),
+        plan_touches,
+        newly_finished: plans_finalized_here.clone(),
+        has_code_changes: event.changes.has_non_plan_code_changes,
+    };
+
+    state.fold.apply_commit(&new_event);
 }
 
 /// Build a `CommitNode` for this commit. Attribution priority:
