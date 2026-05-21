@@ -251,6 +251,36 @@ impl RepoState {
             }
             hasher.update(b";");
         }
+        hasher.update(b"]\nfold=hint:");
+        hasher.update(
+            self.fold
+                .active_plan_hint
+                .as_ref()
+                .map(|k| k.as_str())
+                .unwrap_or("")
+                .as_bytes(),
+        );
+        hasher.update(b"\nfold.finished[");
+        for fp in &self.fold.finished_plans {
+            hasher.update(fp.plan.as_str().as_bytes());
+            hasher.update(b":");
+            hasher.update(fp.intro.as_str().as_bytes());
+            hasher.update(b":");
+            hasher.update(fp.finalized_at.as_str().as_bytes());
+            hasher.update(b";");
+        }
+        hasher.update(b"]\nfold.ad_hoc[");
+        for ev in &self.fold.ad_hoc {
+            hasher.update(ev.sha.as_str().as_bytes());
+            hasher.update(b",");
+        }
+        hasher.update(b"]\nfold.warnings[");
+        for w in &self.fold.warnings {
+            hasher.update(w.sha.as_str().as_bytes());
+            hasher.update(b":");
+            hasher.update(w.plan.as_ref().map(|k| k.as_str()).unwrap_or("").as_bytes());
+            hasher.update(b";");
+        }
         hasher.update(b"]");
 
         StateDigest(hasher.finalize().to_hex().to_string())
