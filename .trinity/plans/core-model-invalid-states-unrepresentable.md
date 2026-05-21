@@ -18,10 +18,14 @@ workflow state. The core model has two problems:
    forcing a new bucket. The buckets are a leaky model of the
    underlying facts.
 
-This plan replaces both with the same architecture codex laid
-out:
+This plan replaces both with a simpler architecture: active
+plans only, no global per-commit registry, the fold lives in
+`trinity-core` and runs incrementally on top of the cache.
 
-- `RepoState { commit_order, commits, plans, ad_hoc }`.
+- `RepoState { plans, ad_hoc, current_attribution,
+  finalize_files }`. Active plans only — finalized plans
+  exit the map. `git log` is the system of record for "what
+  happened before."
 - `CommitNode` answers "what happened in this commit?" — stored
   as a flat set of *facts* about the commit (which plan files
   were touched, which plans were finalized, whether code
@@ -50,45 +54,64 @@ commit model — that's flat facts.
 
 After this plan:
 
-- `RepoState` carries `{ commit_order, commits, plans,
-  ad_hoc, current_attribution, finalize_files }`. The last
-  two fields absorb the former `FoldCarry`.
+- `RepoState` is `{ plans, ad_hoc, current_attribution,
+  finalize_files }`. No `commit_order`. No `commits` map.
+  No `plan_conflicts`.
+- `state.plans` holds **only active plans**. A plan exits
+  the map on finalize OR on a non-frozen Delete touch. The
+  fold does not retain history about finished plans —
+  `git log` is the system of record for "what happened
+  before."
+- Each `PlanState` owns its commits inline:
+  `commits: Vec<CommitNode>` in fold order. Multi-plan
+  commits clone the `CommitNode` into each touched plan's
+  Vec. There is no shared per-SHA registry.
+- `state.ad_hoc` is `Vec<CommitNode>` — commits not
+  associated with any plan, in fold order. **Cleared when a
+  new plan is introduced** (the new plan emerging means the
+  prior ad-hoc work is now context, not actionable).
+  Future: `.trinity/config` policies can declare "deny ad-hoc
+  commits / require review of ad-hoc range / ignore." Not
+  implemented in this plan.
 - `CommitNode` is `{ meta, touches, finalizes,
   has_code_changes, plan_attribution, reviews }`. Each field
-  is a single-source fact.
+  is a single-source fact. `reviews` is a flat
+  `BTreeMap<AgentLabel, FeedbackBody>` — scope is implicit
+  from which container the node lives in (a copy in plan X's
+  Vec carries plan-X-scoped feedback; the ad_hoc copy
+  carries ad-hoc-scoped feedback).
 - No `CommitBody`, `PlanCommit`, `MultiPlanCommit`,
   `AdHocCommit`, `FinalizeCommit`, `LifecycleOnly` types.
   Those concepts become projections, not types.
 - No `FoldCarry`. The fold IS `RepoState::apply_commit(&mut
-  self, &CommitEvent)` — single argument; the state knows
-  everything it needs to fold the next commit.
-- The fold lives in `trinity-core::repo_state`. Sans-io: no
-  git, no filesystem, no async. Daemon-side IO builds
-  `CommitEvent`s and calls `apply_commit` for each.
+  self, &CommitEvent)` — single argument.
+- The fold lives in `crates/trinity-core/src/repo_state.rs`.
+  Sans-io: no git, no filesystem, no async. Daemon-side IO
+  builds `CommitEvent`s and calls `apply_commit` for each.
 - `PlanState` is the canonical folded per-plan aggregate:
-  `{ id, plan_path, body, stage, timeline, intro,
-  latest_revision, latest_implementation, finalized_at,
-  participants_cumulative, last_activity_ts }`. Built by the
-  fold; the product of the model.
-- The cache stores the entire `RepoState` (including the
-  former-carry fields) and supports incremental fold:
-  loading the cached state at any ancestor SHA, applying new
-  commits, and persisting at the new HEAD. Warm cache
-  updates are O(new commits), not O(history).
+  `{ id, plan_path, body, stage, commits, intro,
+  latest_revision, latest_implementation,
+  participants_cumulative, last_activity_ts }`. `stage` is
+  `Drafting | Implementing` — `Frozen` doesn't exist because
+  frozen plans aren't in `state.plans`.
+- The cache stores the entire `RepoState` and supports
+  incremental fold: load the cached state at an ancestor
+  SHA, walk new commits via `git_io`, call `apply_commit`
+  for each, persist at the new HEAD. Warm cache updates are
+  O(new commits), not O(history). The cache header records
+  the SHA the state was saved at — `RepoState` itself
+  doesn't carry that.
 - Reviewability is a per-(commit, scope, config) projection,
   not a stored flag.
 - Gate / readiness / policy are free functions over
   `(commit, plan_state, ad_hoc, config)`.
-- Feedback files are truth: every commit can carry
-  `CommitReviews`. The feedback path's scope (plan stem vs
-  reserved `_` for ad-hoc) decides which commits a feedback
-  file can attach to, not whether the commit is "reviewable."
 - A commit can finalize plan A AND touch plan B in the same
   commit — `finalizes = {A}` and `touches = {B: Revise}` are
-  independent facts, no either/or.
+  independent facts, no either/or. The CommitNode appears in
+  B's `commits` Vec; plan A exits `state.plans`.
 - Multi-plan commits are just commits with `touches.len() ≥ 2`.
-  Each touched plan independently reviews the commit; no
-  special bucket.
+  Each touched plan's Vec gets the CommitNode; each plan
+  independently reviews.
 
 ## Target Types
 
@@ -180,25 +203,27 @@ canonical truth, the wire string is one render of it.
 
 ### Review Storage — Minimal Truth, Derived Everything
 
-The canonical fact about a commit's review activity is exactly
-who wrote what feedback file on disk. Feedback identity on
-disk is `(scope, sha, author)` — a single SHA can receive
-independent feedback from multiple plan scopes (when the
-commit touches multiple plans). Storage matches:
+The canonical fact about a commit's review activity is who
+wrote what feedback file on disk. Feedback identity on disk
+is `(scope, sha, author)`. The new design makes scope
+**implicit from the container** the CommitNode lives in:
+
+- A CommitNode in `state.plans[A].commits` carries A-scoped
+  feedback in its `reviews.feedback`.
+- A CommitNode in `state.plans[B].commits` carries B-scoped
+  feedback (a separate copy of the node, distinct from A's).
+- A CommitNode in `state.ad_hoc` carries ad-hoc-scoped
+  feedback.
+
+Storage simplifies to a flat author map:
 
 ```rust
 pub struct CommitReviews {
-    /// Outer key = scope (plan or ad-hoc), inner key = author.
-    /// `(scope, author)` together is canonical identity; the
-    /// same author can write independent feedback for two
-    /// plan scopes on the same SHA without one overwriting
-    /// the other.
-    pub feedback: BTreeMap<ReviewScope, BTreeMap<AgentLabel, FeedbackBody>>,
-}
-
-pub enum ReviewScope {
-    Plan(PlanKey),
-    AdHoc,
+    /// Author → feedback. Scope is implicit from the
+    /// container the CommitNode lives in. A multi-plan
+    /// CommitNode is cloned into each touched plan's Vec;
+    /// each copy carries that plan's scoped feedback.
+    pub feedback: BTreeMap<AgentLabel, FeedbackBody>,
 }
 
 pub struct FeedbackBody {
@@ -210,10 +235,11 @@ pub struct FeedbackBody {
 
 The feedback file's repo-relative path is derived from
 `(scope, sha, author)` at projection time; not stored on
-`FeedbackBody`. Readiness for `ReviewScope::Plan(A)` reads
-only `commit.reviews.feedback.get(&ReviewScope::Plan(A))` —
-B-scope feedback on the same SHA never affects A's
-readiness.
+`FeedbackBody`. The earlier scope-aware nested-map design
+(landed in Phase 2) is reverted in Phase 3 — it was the
+right answer for a single-CommitNode-shared-across-scopes
+model, but the owned-per-plan model makes scope a property
+of the container, not the storage.
 
 Review *policy* is a projection over the commit's facts,
 the relevant aggregate, and the snapshotted config:
@@ -235,19 +261,22 @@ pub enum NonBlockingReason {
     StructurallyNonReviewable,
 }
 
+/// Compute the policy for a commit in a given container.
+/// Callers know the scope from where they got the CommitNode:
+///   - From `state.plans[X].commits` → pass `plan_state =
+///     Some(&state.plans[X])`.
+///   - From `state.ad_hoc` → pass `plan_state = None`.
 pub fn review_policy(
     commit: &CommitNode,
-    scope: &ReviewScope,
     plan_state: Option<&PlanState>,
-    ad_hoc: &AdHocState,
+    ad_hoc: &[CommitNode],
     config: &Config,
 ) -> ReviewPolicy;
 
 pub fn readiness(
     commit: &CommitNode,
-    scope: &ReviewScope,
     plan_state: Option<&PlanState>,
-    ad_hoc: &AdHocState,
+    ad_hoc: &[CommitNode],
     config: &Config,
 ) -> ReviewReadiness;
 
@@ -268,12 +297,16 @@ participant set is empty, the projection returns
 
 `participants` is also a projection:
 
-- For `ReviewScope::Plan(X)`: the `PlanState`'s cumulative
-  participants up to `sha` — i.e.
-  `plan_state.participants_cumulative` snapshotted at fold
-  time. Not stored on the commit.
-- For `ReviewScope::AdHoc`: `ad_hoc.participants_discovered`
-  or `config.ad_hoc_reviewers` if set.
+- For a plan-scoped CommitNode (`plan_state.is_some()`):
+  `plan_state.unwrap().participants_cumulative` — folded
+  incrementally during feedback attachment.
+- For an ad_hoc CommitNode: distinct feedback authors across
+  `ad_hoc` (computed on demand), or
+  `config.ad_hoc_reviewers` if set. There is no stored
+  `participants_discovered` on RepoState — when feedback
+  attaches to an ad_hoc commit, the author goes into that
+  commit's `reviews.feedback`; cross-ad-hoc participants are
+  derived by iterating the Vec.
 
 `state` / `approvers` / `requesters` / `ambiguous` / `missing`
 are all derived outputs over `(reviews, policy)`. This
@@ -338,32 +371,66 @@ canonical `CommitKind` field.
 
 ```rust
 pub struct RepoState {
-    /// Chronological fold order — the only canonical commit
-    /// stream.
-    pub commit_order: Vec<CommitSha>,
-    /// Per-commit canonical facts.
-    pub commits: BTreeMap<CommitSha, CommitNode>,
-    /// Per-plan folded aggregates. Built by the fold; the
-    /// product of the model.
+    /// Active plans only. A plan exits the map on finalize
+    /// (its `finalizes` set fires) or on a non-frozen Delete
+    /// touch. Frozen plans don't live here — `git log` is
+    /// the system of record for "what happened before."
     pub plans: BTreeMap<PlanKey, PlanState>,
-    /// Parallel aggregate for ad-hoc-eligible commits.
-    pub ad_hoc: AdHocState,
+
+    /// Commits not associated with any plan, in fold order.
+    /// Cleared on the next plan intro — the new plan
+    /// emerging means whatever ad-hoc work preceded it is
+    /// now context, not actionable. Future
+    /// `.trinity/config` policies (deny / require-review /
+    /// ignore) act on this Vec but are not implemented in
+    /// this plan.
+    pub ad_hoc: Vec<CommitNode>,
+
+    /// Walk-back attribution carry. Updated by every
+    /// `apply_commit` from
+    /// `ClassifierOutput::next_effective_attribution`.
+    pub current_attribution: Option<PlanKey>,
+
+    /// Per-active-plan approving-files map, mirrored from
+    /// `.trinity/finished/<plan>/<author>.md`. The freeze
+    /// rule fires when an approving file landing in a
+    /// commit's tree crosses the configured threshold, and
+    /// that decision needs the current count for that plan.
+    /// Lives on RepoState because it's canonical state the
+    /// fold reads + mutates; not derivable from `state.plans`
+    /// or `state.ad_hoc`.
+    ///
+    /// Inner map: author filename → file body. Entries are
+    /// removed when the plan exits `state.plans`.
+    pub finalize_files: BTreeMap<PlanKey, BTreeMap<String, String>>,
 }
 ```
 
-`commits` answers "what happened in this commit?" `plans`
-answers "what is the current folded state of this plan?"
-These are NOT parallel truth — `PlanState` stores SHAs that
-point into `commits`, not copies of facts.
+What's NOT here (and why):
+
+- `commit_order: Vec<CommitSha>`. Removed — `git log` is the
+  canonical chronological commit stream. RepoState's job is
+  active-workflow state, not a per-repo commit registry.
+- `commits: BTreeMap<CommitSha, CommitNode>`. Removed for
+  the same reason. Each plan owns its `CommitNode`s in
+  `commits: Vec<CommitNode>`; cross-plan SHA lookup is not a
+  supported query.
+- `plan_conflicts: BTreeMap<PlanKey, Vec<PathBuf>>` (legacy).
+  Removed. If a plan key resolves to multiple paths, that's
+  a Phase 3 IO-side error surfaced when the fold can't
+  classify a commit's touches.
+- Frozen plans. They leave `state.plans` on finalize. If the
+  UI wants to render "this plan was finalized at SHA X in
+  March," it must re-walk `git log` for that information.
+  This is a deliberate trade: simpler model, no
+  parallel "active vs archived" world.
 
 ## Plan State
 
-`PlanState` is a first-class folded aggregate. It carries
-exactly the per-plan facts the fold materializes as it walks
-commits: ordered SHAs into `commits`, lifecycle stage,
-intro/revision/implementation/finalization boundaries, plan
-path + body text, and cumulative participants for the gate
-projection.
+`PlanState` is the canonical folded aggregate for one
+**active** plan. It owns its commits inline — no global
+per-SHA registry; multi-plan commits clone the `CommitNode`
+into each touched plan's Vec.
 
 ```rust
 pub struct PlanState {
@@ -371,22 +438,22 @@ pub struct PlanState {
     pub plan_path: String,
     /// Current body text (latest revision's text, or the
     /// intro text if no revision happened). Plain `String`:
-    /// git is already the durable identity layer; in-memory
-    /// equality suffices.
+    /// git is the durable identity layer.
     pub body: String,
 
     pub stage: PlanStage,
 
-    /// Every commit associated with this plan in fold order.
-    /// SHAs only — actual `CommitNode`s live in
-    /// `RepoState.commits`. This is the plan's timeline;
-    /// the previous shape `Vec<PlanTimelineEvent>` is gone
-    /// (it stored duplicated event records), replaced by SHA
-    /// references back to canonical commit facts.
-    pub timeline: Vec<CommitSha>,
+    /// Every commit associated with this plan, in fold
+    /// order. **Owned**: multi-plan commits clone the
+    /// `CommitNode` into each touched plan's Vec. No shared
+    /// registry. Plan-scope feedback lives in
+    /// `commits[i].reviews.feedback` (flat author map; scope
+    /// is implicit from the owning plan).
+    pub commits: Vec<CommitNode>,
 
     /// The commit whose `touches[id] == Intro` first created
-    /// the plan.
+    /// the plan. Maps to `commits[0]` immediately after
+    /// intro.
     pub intro: CommitSha,
 
     /// Latest commit with `touches[id] == Revise`. `None`
@@ -397,101 +464,104 @@ pub struct PlanState {
     /// has_code_changes`. `None` until implementation begins.
     pub latest_implementation: Option<CommitSha>,
 
-    /// Latest commit where `finalizes.contains(id)`.
-    /// `Some(_)` iff the plan has frozen.
-    pub finalized_at: Option<CommitSha>,
-
-    /// Distinct feedback authors who wrote on ANY commit in
-    /// `timeline`. Seeds the participants set for plan-scope
-    /// gate projection.
+    /// Distinct feedback authors across this plan's commits.
+    /// Folded incrementally during feedback attachment.
     pub participants_cumulative: BTreeSet<AgentLabel>,
 
-    /// max(commit.author_ts, feedback.created_at) across this
-    /// plan's timeline. Folded incrementally — not a
-    /// projection scan.
+    /// max(commit.author_ts, feedback.created_at) across
+    /// `commits`. Folded incrementally.
     pub last_activity_ts: i64,
 }
 
 pub enum PlanStage {
-    /// Intro landed; no Revise, no implementation yet.
+    /// Intro landed; no implementation yet.
     Drafting,
     /// At least one implementation commit landed.
     Implementing,
-    /// `finalized_at.is_some()`.
-    Frozen,
-}
-
-pub struct AdHocState {
-    /// All commits where `is_ad_hoc_eligible()` returns true,
-    /// in fold order.
-    pub commits: Vec<CommitSha>,
-    /// Distinct feedback authors across all ad-hoc commits.
-    pub participants_discovered: BTreeSet<AgentLabel>,
 }
 ```
 
+`PlanStage::Frozen` does not exist. A frozen plan has been
+removed from `state.plans` entirely.
+
 What's deliberately NOT on `PlanState`:
 
-- `Vec<PlanTimelineEvent>` (the old shape). The plan timeline
-  is `timeline: Vec<CommitSha>`. The plan-page UI builds
-  `api::TimelineEvent` by mapping each `CommitNode` at
-  projection time.
+- `Vec<PlanTimelineEvent>` (the legacy shape). The plan
+  timeline is `commits: Vec<CommitNode>`. The plan-page UI
+  builds `api::TimelineEvent` by mapping each `CommitNode`
+  at projection time.
+- `finalized_at`. Plan removal IS the finalize. The commit
+  that triggered the freeze isn't preserved on the plan —
+  if the UI needs that SHA (rare, e.g. a "recently
+  finalized" feed), it's a git-log query.
 - `gate` / `readiness` / `policy` fields. Dynamic projections.
 - `body_hash`. Git is the durable identity layer.
-- `plan_intro_parent`. Derived from
-  `RepoState.parent_of(&intro)` when needed.
-- `archived_cycles`. Derived from `finalized_at` if needed.
+- `plan_intro_parent`. If the UI needs the parent commit of a
+  plan's intro, it's a `git_io::parent_of(&intro)` query at
+  projection time. `RepoState` doesn't track first-parent
+  links because it has no global commit registry.
+- `archived_cycles`. Frozen plans aren't in `state.plans` and
+  the fold doesn't retain their history; cycle data is a
+  git-log query.
 
 ### Stale Plan References
 
-When a plan is deleted (its file removed while not frozen),
-`state.plans[plan]` is removed. Historical commits still
-reference the plan via `touches[plan]` or
-`plan_attribution == Some(plan)`. The fold is forward-only;
-history is immutable.
+A code-only commit can `plan_attribution == Some(plan)` where
+`plan` was finalized in the same incremental-fold run (or in a
+prior run not represented in the cached state). The fold is
+forward-only; the older attribution doesn't get rewritten when
+its plan exits `state.plans`.
 
 Projection-time behaviour:
 
-- `state.plans.get(plan)` returns `None`.
-- Walking `state.commit_order` and matching on
-  `node.associated_plans()` still surfaces those commits.
+- `state.plans.get(plan)` returns `None` for a finalized /
+  deleted plan.
+- Multi-plan or attribution-mismatch commits still carry the
+  dead plan key in their `touches` / `plan_attribution`.
 - The UI / WFW treats "plan key with no entry in
-  `state.plans`" as a soft signal — surface the commits but
-  don't try to look up the plan body.
+  `state.plans`" as a soft signal — surface what the commit
+  says, don't try to look up a plan body.
 - `AttributionWarning::DanglingPlanRef { plan }` is emitted
-  by projection helpers, NOT stored on the commit.
+  by projection helpers when an attribution names a plan not
+  in `state.plans`. NOT stored on the commit.
 
 ## Projections
 
-`PlanState` answers the common per-plan queries directly —
-O(1) reads. A handful of helpers on `RepoState` cover the
-cross-plan cases the fold doesn't materialize:
+Every per-plan query reads from `PlanState`'s owned commits
+Vec — O(1) lookups into `state.plans[plan]`, then iteration
+over its `commits`.
 
 ```rust
-impl RepoState {
-    /// First-parent of `sha` in fold order, or `None` when
-    /// `sha` is the root commit. Replaces the old stored
-    /// `Plan.plan_intro_parent`.
-    pub fn parent_of(&self, sha: &CommitSha) -> Option<&CommitSha>;
+impl PlanState {
+    /// Iterate the plan's commits in fold order.
+    pub fn commits(&self) -> &[CommitNode] { &self.commits }
+
+    /// Latest commit (the candidate review target — by
+    /// construction the plan's `commits` only holds
+    /// plan-associated nodes; the last one is the working
+    /// front).
+    pub fn latest(&self) -> Option<&CommitNode> {
+        self.commits.last()
+    }
 }
 ```
 
 Common queries become direct reads:
 
-- Plan timeline → `state.plans[plan].timeline.iter()`.
+- Plan timeline → `state.plans[plan].commits.iter()`.
 - Latest reviewable for plan →
-  `state.plans[plan].timeline.last()` if the plan isn't
-  frozen (the timeline only contains commits associated with
-  the plan; the last one is the candidate review target).
+  `state.plans[plan].commits.last()`.
 - Latest revision → `state.plans[plan].latest_revision`.
 - Latest implementation → `state.plans[plan].latest_implementation`.
-- Finalized at → `state.plans[plan].finalized_at`.
 - Last activity → `state.plans[plan].last_activity_ts`.
+- Ad-hoc work pending review → `state.ad_hoc.iter()`.
 
-If a query genuinely needs to walk a plan's timeline (e.g.
-for a historical render), it dereferences
-`PlanState.timeline` against `state.commits`; the
-`CommitNode` is the single source of fact truth.
+There is no "look up a commit by SHA" query on `RepoState`.
+If a caller has a SHA and needs the `CommitNode`, it must
+already know which plan (or ad_hoc) the SHA belongs to. For
+the daemon, that's always the case — WFW and projection
+contexts walk from a `PlanState` or `state.ad_hoc`
+explicitly.
 
 ## Tagged Enum Carry-Forward
 
@@ -513,7 +583,7 @@ API projections turn the flat facts into shape-specific UI
 types where mutual exclusion is real.
 
 `model::PlanTimelineEvent` is removed from canonical state —
-the plan timeline is `PlanState.timeline: Vec<CommitSha>`. If
+the plan timeline is `PlanState.commits: Vec<CommitNode>`. If
 the API still wants a `PlanTimelineEvent` shape, it lives in
 the `api` module and is built by projection.
 
@@ -575,52 +645,20 @@ The Phase 3 rewrite addresses all four:
 
 ### `RepoState` absorbs the carry
 
-```rust
-pub struct RepoState {
-    /// Chronological fold order — the only canonical commit
-    /// stream.
-    pub commit_order: Vec<CommitSha>,
-    /// Per-commit canonical facts.
-    pub commits: BTreeMap<CommitSha, CommitNode>,
-    /// Per-plan folded aggregates.
-    pub plans: BTreeMap<PlanKey, PlanState>,
-    /// Parallel aggregate for ad-hoc-eligible commits.
-    pub ad_hoc: AdHocState,
+See the "Repo State" section above for the canonical
+declaration. The two former-`FoldCarry` fields that survive
+as canonical state are `current_attribution` and
+`finalize_files`; the rest of `FoldCarry` is reconstructable:
 
-    // ---- Former FoldCarry fields ----
-
-    /// Walk-back attribution chain. Updated by every
-    /// `apply_commit` from `ClassifierOutput::next_effective_attribution`.
-    pub current_attribution: Option<PlanKey>,
-
-    /// Per-plan approving-files map, mirrored from
-    /// `.trinity/finished/<plan>/<author>.md`. Lives on
-    /// RepoState because the freeze rule fires when an
-    /// approving file landing in a commit's tree crosses the
-    /// configured threshold, and that decision needs the
-    /// previous state's count. Cleared per-plan on intro and
-    /// on delete; finalize commits don't need to recompute
-    /// from git tree.
-    ///
-    /// Inner map: author filename → file body. Kept as
-    /// canonical state so the daemon's tree walker need not
-    /// re-read it on every commit; mutations come from the
-    /// commit's diff (added / modified / removed paths under
-    /// `.trinity/finished/<plan>/`).
-    pub finalize_files: BTreeMap<PlanKey, BTreeMap<String, String>>,
-}
-```
-
-What's NOT a field anymore:
-
-- `plan_in_tree` → derivable from `state.plans.keys()`. Plans
-  exit `state.plans` on `TouchKind::Delete` (for non-frozen
-  plans).
+- `plan_in_tree` → derivable from `state.plans.keys()`.
 - `plan_bodies` → already on `PlanState.body`.
-- `previous_commit` → `state.commit_order.last()`.
+- `previous_commit` → not needed; the fold doesn't have a
+  "previous commit" concept anymore (there's no global
+  `commit_order` to index into).
 
-`current_attribution` and `finalize_files` are the two
-truly-carry-only facts that need to live on the state.
+The fold mutates these former-carry fields on `&mut self`
+along with `plans` and `ad_hoc`; no second `&mut FoldCarry`
+parameter exists.
 
 ### `CommitEvent` (the fold's input)
 
@@ -661,8 +699,9 @@ impl RepoState {
     /// builders (tests).
     pub fn apply_commit(&mut self, event: &CommitEvent) {
         // 1. Apply finalize-tree mutations from the commit's
-        //    diff. These update self.finalize_files before
-        //    the freeze rule fires below.
+        //    diff. These update self.finalize_files; the
+        //    threshold-crossings collected here become the
+        //    `finalizes` set the classifier sees.
         let mut newly_finalizing: BTreeSet<PlanKey> = BTreeSet::new();
         for change in &event.finalize_changes {
             apply_finalize_change(
@@ -673,15 +712,14 @@ impl RepoState {
             );
         }
 
-        // 2. Classify the commit's facts (computes
-        //    plan_attribution + warnings from the title,
-        //    touches, and current carry).
+        // 2. Classify.
         let touches: BTreeMap<PlanKey, TouchKind> = event
             .plan_touches
             .iter()
             .map(|t| (t.plan.clone(), t.kind))
             .collect();
-        let known_plans: BTreeSet<PlanKey> = self.plans.keys().cloned().collect();
+        let known_plans: BTreeSet<PlanKey> =
+            self.plans.keys().cloned().collect();
         let classified = classify(ClassifierInputs {
             subject: &event.meta.subject,
             touches: &touches,
@@ -691,7 +729,6 @@ impl RepoState {
             known_plans: &known_plans,
         });
 
-        let sha = event.meta.sha.clone();
         let mut meta = event.meta.clone();
         meta.warnings = classified.warnings;
         let node = CommitNode {
@@ -703,37 +740,62 @@ impl RepoState {
             reviews: CommitReviews::default(), // attach pass fills it
         };
 
-        // 3. Drive plan aggregates directly from the facts.
+        // 3. Apply touches. Intro inserts a new PlanState
+        //    AND clears self.ad_hoc — the new plan emerging
+        //    means whatever ad-hoc work preceded it is now
+        //    context. Revise/Delete mutate the existing plan.
         for touch in &event.plan_touches {
-            self.apply_touch(touch, &sha);
-        }
-        for plan in &node.finalizes {
-            self.apply_finalize(plan, &sha);
-        }
-        if let Some(plan) = &node.plan_attribution
-            && node.has_code_changes
-            && !node.touches.contains_key(plan)
-        {
-            self.update_implementation(plan, &sha);
-        }
-        if node.is_ad_hoc_eligible() {
-            self.ad_hoc.commits.push(sha.clone());
-        }
-
-        // 4. Append to every associated plan's timeline.
-        for plan in node.associated_plans() {
-            if let Some(ps) = self.plans.get_mut(plan)
-                && ps.timeline.last() != Some(&sha)
-            {
-                ps.timeline.push(sha.clone());
+            match touch.kind {
+                TouchKind::Intro => {
+                    self.ad_hoc.clear();
+                    self.insert_plan(touch, &node);
+                }
+                TouchKind::Revise => self.revise_plan(touch, &node),
+                TouchKind::Delete => self.delete_plan(&touch.plan),
             }
         }
 
-        // 5. Insert canonical commit facts.
-        self.commit_order.push(sha.clone());
-        self.commits.insert(sha, node);
+        // 4. Append the CommitNode (cloned for multi-plan)
+        //    into every associated plan's commits Vec.
+        let associated: BTreeSet<PlanKey> =
+            node.associated_plans().iter().cloned().cloned().collect();
+        for plan in &associated {
+            if let Some(ps) = self.plans.get_mut(plan)
+                && ps.commits.last().map(|c| &c.meta.sha) != Some(&node.meta.sha)
+            {
+                ps.commits.push(node.clone());
+            }
+        }
 
-        // 6. Update walk-back carry on self.
+        // 5. Apply finalize: removes the plan from
+        //    self.plans (and self.finalize_files). After
+        //    this the plan is GONE — no Frozen variant, no
+        //    finalized_at on a leftover entry.
+        for plan in &classified.facts.finalizes {
+            self.plans.remove(plan);
+            self.finalize_files.remove(plan);
+        }
+
+        // 6. Code-only attribution: update latest_implementation
+        //    on the attributed plan if the plan still exists.
+        //    (Finalize in step 5 may have removed it.)
+        if let Some(plan) = &node.plan_attribution
+            && node.has_code_changes
+            && !node.touches.contains_key(plan)
+            && let Some(ps) = self.plans.get_mut(plan)
+        {
+            ps.latest_implementation = Some(node.meta.sha.clone());
+            if matches!(ps.stage, PlanStage::Drafting) {
+                ps.stage = PlanStage::Implementing;
+            }
+        }
+
+        // 7. Ad-hoc commits.
+        if node.is_ad_hoc_eligible() {
+            self.ad_hoc.push(node);
+        }
+
+        // 8. Update walk-back carry.
         self.current_attribution = classified.next_effective_attribution;
     }
 }
@@ -741,22 +803,28 @@ impl RepoState {
 
 Helper invariants:
 
-- `apply_touch(Intro)` inserts a new `PlanState { id, body:
-  new_body, stage: Drafting, intro: sha, latest_revision:
-  None, ... }`. The new body comes from `event.plan_touches`.
-- `apply_touch(Revise)` updates `body` and sets
-  `latest_revision = Some(sha)`.
-- `apply_touch(Delete)` removes the plan iff
-  `finalized_at.is_none()`. Frozen plans persist.
-- `apply_finalize(plan, sha)` sets `finalized_at = Some(sha)`
-  and `stage = Frozen`.
-- `update_implementation(plan, sha)` sets
-  `latest_implementation = Some(sha)` and transitions
-  `stage` Drafting → Implementing.
-- `apply_finalize_change` mutates `self.finalize_files` AND
+- `insert_plan(touch, node)` inserts a new `PlanState { id,
+  body: new_body, stage: Drafting, commits: vec![node.clone()],
+  intro: node.meta.sha, latest_revision: None,
+  latest_implementation: None, participants_cumulative:
+  Default, last_activity_ts: node.meta.author_ts }`.
+- `revise_plan(touch, node)` mutates the existing plan:
+  `body = new_body`, `latest_revision = Some(sha)`. The
+  CommitNode append happens in step 4.
+- `delete_plan(plan)` removes from `self.plans` and
+  `self.finalize_files`. Frozen plans were already removed by
+  finalize; if a Delete arrives for a plan no longer in
+  state, it's a no-op.
+- `apply_finalize_change` mutates `self.finalize_files` and
   emits `newly_finalizing` when the post-mutation count
-  crosses the freeze threshold for a plan that wasn't
-  already frozen.
+  crosses the freeze threshold for an active plan.
+
+Ordering note: step 4 appends to plans BEFORE step 5
+finalizes. That means the finalize commit's CommitNode lives
+in the plan's Vec right up until the plan is removed. The
+plan exits state with its final commit count visible during
+the same `apply_commit`'s subsequent steps — but after the
+function returns, that history is gone.
 
 No later stage reinterprets `touches`, `finalizes`,
 `has_code_changes`, or `plan_attribution` from a different
@@ -787,7 +855,9 @@ The cache stores `RepoState` keyed by HEAD SHA. On rebuild:
 1. Resolve current HEAD via `git_io::rev_parse_head`.
 2. If a cached `RepoState` exists for HEAD → done; no fold.
 3. Else, find the most-recent cached `RepoState` whose
-   `commit_order.last()` is an ancestor of HEAD. Load it.
+   cache-header SHA is an ancestor of HEAD. (The cache file
+   header carries the SHA the state was saved at;
+   `RepoState` itself doesn't.) Load it.
 4. Walk `git_io::commits_between(cached_head, current_head)`
    building `CommitEvent`s.
 5. For each event in order: `state.apply_commit(&event)`.
@@ -880,11 +950,12 @@ review policy:
   verdicts surfaces master `address_commit_changes` work;
   reviewer `review_commit` work surfaces for any caller in
   `participants` who lacks a current verdict. Strict
-  title-fix work scans `plan_state.timeline` for outstanding
+  title-fix work scans `plan_state.commits` for outstanding
   `FixCommitTitle` warnings.
 - Repo scope: iterate `state.plans` (one candidate per
-  non-frozen plan), then iterate `state.ad_hoc.commits`
-  (each candidate). Aggregate as above.
+  active plan — finalized plans aren't in the map), then
+  iterate `state.ad_hoc` (each candidate). Aggregate as
+  above.
 
 No WFW path reads a stored `gate` field, a `kind`
 discriminator, or `Plan.timeline` event records. All
@@ -895,14 +966,14 @@ decisions flow from facts + policy projection.
 All response builders read `state.plans` for plan-level facts
 and read `CommitNode` facts directly per commit:
 
-- Plan page timeline: walk `state.plans[plan].timeline` and
+- Plan page timeline: walk `state.plans[plan].commits` and
   convert each `CommitNode` to `api::TimelineEvent` via match
   over the facts.
-- Plan revision list: filter timeline to commits where
+- Plan revision list: filter `commits` to nodes where
   `touches.contains_key(plan)`.
-- Implementation list: filter timeline to commits where
+- Implementation list: filter `commits` to nodes where
   `plan_attribution == Some(plan) && has_code_changes`.
-- Latest reviewable commit: `state.plans[plan].timeline.last()`
+- Latest reviewable commit: `state.plans[plan].commits.last()`
   (the timeline only contains plan-associated commits).
 - Commit details: read `CommitNode` facts directly; the API
   shape (`CommitRow` / `DiffLine` / `TimelineEvent`) is a
@@ -996,17 +1067,35 @@ intermediate states.
   same module (they're already in `trinity-core::model::facts`;
   move them up — Phase 4 collapses the `facts` namespace).
 - Delete `FoldCarry`. Its fields are absorbed:
-  - `current_attribution` → `RepoState.current_attribution`.
-  - `finalize_files` → `RepoState.finalize_files`.
+  - `current_effective` → `RepoState.current_attribution`.
+  - `finalize_tree` → `RepoState.finalize_files`.
   - `plan_in_tree` → derived from `RepoState.plans.keys()`.
   - `plan_bodies` → already on `PlanState.body`.
-  - `previous_commit` → `RepoState.commit_order.last()`.
+  - `previous_commit` → not needed (no `commit_order`).
 
 **Swap the canonical fold-state types**:
 
-- Switch `RepoState` to `{ commit_order, commits, plans,
-  ad_hoc, current_attribution, finalize_files }` using the
-  new types.
+- Switch `RepoState` to `{ plans, ad_hoc,
+  current_attribution, finalize_files }`. No `commit_order`,
+  no global `commits` map, no `plan_conflicts`.
+- Each `PlanState` owns `commits: Vec<CommitNode>` inline.
+  Multi-plan commits clone the node into each touched
+  plan's Vec.
+- `state.ad_hoc` is `Vec<CommitNode>`. Cleared on the next
+  plan intro inside `apply_commit`.
+- Plans EXIT `state.plans` on finalize (their `finalizes`
+  set fires) or on non-frozen Delete. There is no
+  `PlanStage::Frozen` and no `finalized_at`.
+- `CommitReviews` reverts to `BTreeMap<AgentLabel,
+  FeedbackBody>` (flat author map). Scope is implicit from
+  the container the CommitNode lives in (plan Vec or
+  ad_hoc Vec). The Phase 2 scope-aware nested map was
+  designed for a single-CommitNode-shared-across-scopes
+  model that the owned-per-plan design replaces. Revert
+  `CommitReviews` and `ReviewScope` (the `Plan(PlanKey) |
+  AdHoc` enum is no longer needed at the storage layer —
+  feedback attachment looks up the target plan or ad_hoc
+  container directly).
 - Delete the legacy `model::CommitNode` (`kind`,
   `attribution`, `plans`, `gate`, `attribution_warning`).
 - Delete the legacy `model::Plan` struct entirely
@@ -1018,6 +1107,16 @@ intermediate states.
 - Delete `model::Feedback` and `model::CommitGate` (the
   legacy review storage). `CommitReviews` + `ReviewReadiness`
   replace them.
+- Delete `plan_conflicts` and the legacy `model::PlanConflict`
+  surfacing — Phase 3 surfaces conflicting plan paths as an
+  IO-side error during `CommitEvent` construction, not as
+  state.
+- Delete `model::facts::AdHocState` (Phase 2 type — replaced
+  by plain `Vec<CommitNode>` on `RepoState.ad_hoc`).
+- Delete `model::facts::PlanStage::Frozen` (Phase 2 variant
+  — replaced by plan-removal-on-finalize).
+- Delete `PlanState.finalized_at` (Phase 2 field — same
+  reason).
 
 **Daemon-side rewrites**:
 
@@ -1092,28 +1191,40 @@ Fold invariants verified by unit tests:
 
 - `apply_commit` with `touches = {A: Intro}` creates
   `state.plans[A]` with `stage = Drafting`, `intro = sha`,
-  `timeline = [sha]`, `latest_revision = None`.
+  `commits = [node]`, `latest_revision = None`. Also
+  clears `state.ad_hoc`.
 - `apply_commit` with `touches = {A: Revise}` after intro
-  sets `latest_revision = Some(sha)` and appends to A's
-  timeline.
-- `apply_commit` with `finalizes = {A}` sets
-  `state.plans[A].finalized_at = Some(sha)`,
-  `stage = Frozen`, and appends to A's timeline.
+  sets `latest_revision = Some(sha)` and appends to
+  `state.plans[A].commits`.
+- `apply_commit` with `finalizes = {A}` REMOVES
+  `state.plans[A]` and `state.finalize_files[A]`. The
+  CommitNode that triggered the finalize is NOT preserved
+  on the plan (the plan is gone).
 - `apply_commit` with `finalizes = {A}` AND
-  `touches = {B: Revise}` finalizes A AND updates B in one
-  commit. Both facts survive in the fold output.
+  `touches = {B: Revise}`: plan A exits state; plan B's
+  `commits` Vec gets the CommitNode; both facts survive in
+  the same call.
+- Multi-plan commit (`touches = {A: Revise, B: Revise}`):
+  the CommitNode is cloned into BOTH plan A's and plan B's
+  `commits` Vec.
 - `apply_commit` with `plan_attribution = Some(A),
-  has_code_changes = true, touches = ∅` sets
-  `state.plans[A].latest_implementation = Some(sha)`,
-  transitions stage to `Implementing` if applicable, and
-  appends to A's timeline.
+  has_code_changes = true, touches = ∅`: appends the
+  CommitNode to `state.plans[A].commits`, sets
+  `latest_implementation = Some(sha)`, transitions stage to
+  `Implementing` if applicable.
 - `apply_commit` with `is_ad_hoc_eligible() == true` appends
-  to `state.ad_hoc.commits`.
+  the CommitNode to `state.ad_hoc`.
+- `state.ad_hoc` is cleared when a TouchKind::Intro fires.
 - `touches = {A: Delete}` on a non-frozen plan removes
-  `state.plans[A]`. On a frozen plan, the delete is a no-op
-  (monotone-finished rule).
-- `finalizes = {A, B}` applies both finalizations; no silent
-  pick.
+  `state.plans[A]`. On a plan no longer in state (already
+  finalized earlier in the same fold pass), the delete is a
+  no-op.
+- `finalizes = {A, B}` removes both plans and both
+  finalize_files entries; no silent pick.
+- Incremental-fold equivalence: snapshot the `RepoState`
+  after N commits, then call `state.apply_commit(&event)`
+  for the (N+1)th commit. The result equals a from-root
+  re-fold over all N+1 commits.
 
 ### Acceptance grep
 
@@ -1126,10 +1237,17 @@ A CI check (or `tests/architectural_invariants.rs` running
   serde tag on enums (`#[serde(tag = "kind")]`).
 - `grep -rn "pub gate: " crates/trinity-core/src/model.rs src/`
   returns no hits (gate is projected via `readiness()`).
-- `grep -rn "CommitBody\|PlanCommit\|MultiPlanCommit\|FinalizeCommit\|AdHocCommit\|LifecycleOnly\|MultiPlanTouches" crates/trinity-core/src/model.rs`
+- `grep -rn "CommitBody\|PlanCommit\|MultiPlanCommit\|FinalizeCommit\|AdHocCommit\|LifecycleOnly\|MultiPlanTouches" crates/trinity-core/src/`
   returns no hits (bucket types are gone).
-- `grep -rn "PlanTimelineEvent" crates/trinity-core/src/model.rs`
+- `grep -rn "PlanTimelineEvent" crates/trinity-core/src/`
   returns no hits in canonical state.
+- `grep -rn "FoldCarry" --include='*.rs' crates/ src/` returns no
+  hits — the type is gone, all carry state is on RepoState.
+- `grep -rn "plan_conflicts\|PlanConflict" crates/trinity-core/src/`
+  returns no hits — plan-path conflicts are an IO-side
+  error, not state.
+- `grep -rn "pub commit_order:\|pub commits: BTreeMap" crates/trinity-core/src/`
+  returns no hits — RepoState has no global commit registry.
 
 These run as part of `cargo test` so the next refactor
 can't silently regress.
@@ -1139,27 +1257,31 @@ can't silently regress.
 - Plan-scoped WFW finds the right candidate for plans that
   went through revise → implement → revise → implement.
 - Multi-plan commits surface review work for each plan they
-  touch.
-- Frozen plans surface no review work (WFW skips
-  `stage == Frozen`).
-- Late feedback on a frozen plan attaches but doesn't
-  produce WFW work.
+  touch (the cloned CommitNode in each plan's Vec carries
+  that plan's reviewability).
+- Finalized plans are absent from `state.plans` (no
+  "frozen" state retained); WFW iterating `state.plans`
+  doesn't see them.
+- An ad-hoc commit followed by an intro: `state.ad_hoc` is
+  empty after the intro applies.
 - Repo-scoped WFW still surfaces ad-hoc-eligible commits
-  per the config-derived policy.
+  in `state.ad_hoc` per the config-derived policy.
 - Rendered plan-page timeline matches today's output on
   golden-file fixtures (built from
-  `state.plans[plan].timeline` → `api::TimelineEvent`).
-- A `[plan-a]` commit whose plan is later deleted retains
-  `plan_attribution == Some(plan-a)`; projection emits
-  `AttributionWarning::DanglingPlanRef`.
+  `state.plans[plan].commits` → `api::TimelineEvent`).
+- A `[plan-a]` commit whose plan is later finalized retains
+  `plan_attribution == Some(plan-a)` if it survived in
+  another container (multi-plan or ad-hoc); projection
+  emits `AttributionWarning::DanglingPlanRef` when the UI
+  tries to resolve plan-a.
 - An `[plan-a]` commit touching `plan-b`'s file emits
   `AttributionWarning::AttributionMismatch`.
 - Warm-cache rebuild test: snapshot a `RepoState` after N
   commits, append one more commit via `apply_commit`, and
   assert the result equals a from-root re-fold over all
   N+1 commits. This is the incremental-fold equivalence
-  invariant — the test should be in trinity-core's unit
-  tests, not the daemon.
+  invariant — the test lives in trinity-core's unit tests,
+  not the daemon.
 
 ### Wire / shape
 
@@ -1176,10 +1298,25 @@ can't silently regress.
 
 ## Acceptance
 
-- `RepoState` carries `commit_order`, `commits`, `plans`,
-  `ad_hoc`, `current_attribution`, `finalize_files`. No
-  second canonical commit log; no parallel plan metadata
-  struct. The former-carry fields are first-class state.
+- `RepoState` is `{ plans, ad_hoc, current_attribution,
+  finalize_files }`. No `commit_order`, no global
+  `commits` map, no `plan_conflicts`, no parallel plan
+  metadata struct. The former-carry fields are first-class
+  state.
+- `state.plans` holds only active plans; finalize and
+  non-frozen Delete touches remove the plan entirely.
+  There is no `PlanStage::Frozen` and no `finalized_at`.
+- `state.ad_hoc` is `Vec<CommitNode>`, cleared on the next
+  plan intro.
+- Each `PlanState` owns its commits inline:
+  `commits: Vec<CommitNode>`. Multi-plan commits clone the
+  CommitNode into each touched plan's Vec.
+- `CommitReviews` is `BTreeMap<AgentLabel, FeedbackBody>` —
+  flat, no scope key. Scope is implicit from container.
+- `ReviewScope` (the `Plan | AdHoc` enum) is gone — no
+  storage layer needs it after the revert. Projection
+  callers know scope from where they obtained the
+  CommitNode.
 - `FoldCarry` does not exist. Any state the fold needs to
   apply the next commit is reachable from `&mut self`.
 - `apply_commit` is a single-argument method on `RepoState`:
@@ -1234,8 +1371,12 @@ can't silently regress.
 - Live config reload — config snapshotted at trinity startup;
   restart re-folds. A future plan can add live reload.
 - Adding any derived-index cache. `PlanState` IS the
-  per-plan cache; cross-plan queries walk `state.commits` /
-  `state.commit_order` directly.
+  per-plan cache; cross-plan queries iterate
+  `state.plans` and `state.ad_hoc`.
+- `.trinity/config` policies for ad-hoc commits (deny /
+  require-review / ignore). The new design tracks ad-hoc
+  commits as `Vec<CommitNode>` cleared on plan intro; the
+  policy layer that acts on this Vec is a follow-up.
 - Removing the web UI.
 - Frontend UX changes around dangling-plan attribution. The
   projection emits `AttributionWarning::DanglingPlanRef`;
