@@ -41,6 +41,26 @@ pub fn plan_lifecycle(state: &crate::repo_state::RepoState, plan_key: &PlanKey) 
     }
 }
 
+/// Repo-relative path for a plan: `.trinity/plans/<key>.md`. The
+/// only on-disk shape we accept for plan files.
+pub fn plan_path_for(plan_key: &PlanKey) -> String {
+    format!(".trinity/plans/{}.md", plan_key.as_str())
+}
+
+/// The intro commit's SHA for a plan, or `None` if the plan has no
+/// folded events yet. Pulled from `state.fold.plans[key].commits[0]`.
+pub fn plan_intro_sha<'a>(
+    state: &'a crate::repo_state::RepoState,
+    plan_key: &PlanKey,
+) -> Option<&'a CommitSha> {
+    state
+        .fold
+        .plans
+        .get(plan_key)
+        .and_then(|ps| ps.commits.first())
+        .map(|e| &e.sha)
+}
+
 /// `plan_worktree_status` from hash comparisons. Pure.
 pub fn plan_worktree_status(
     head_blob_hash: Option<&ContentHash>,

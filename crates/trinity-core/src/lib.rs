@@ -17,9 +17,14 @@
 //!   `PlanKey`, `CommitSha`, `RepoBasename`, `ContentHash`,
 //!   `PlanId`). Serde-transparent over String with parse-time
 //!   validation enforced on deserialize.
-//! - [`model`] — daemon fold-state types (`Plan`,
-//!   `PlanTimelineEvent`, `CommitGate`, `Feedback`,
-//!   `ArchivedCycle`). The daemon stores these directly.
+//! - [`model`] — legacy daemon fold-state types (`Plan`,
+//!   `PlanTimelineEvent`, `CommitGate`, `Feedback`, `CommitNode`,
+//!   `CommitAttribution`). Being phased out by
+//!   `core-state-rewrite.md`'s sans-io fold in [`repo_state`];
+//!   consumers migrate off these one piece at a time.
+//! - [`repo_state`] — new sans-io fold state (`RepoState`,
+//!   `PlanState`, `CommitEvent`, `Warning`, projection types).
+//!   The cache encodes this directly.
 //! - [`api`] — public response DTOs (`GetContextResponse`,
 //!   `CommitDetailResponse`, etc.) plus projection-only structs
 //!   (`PlanRow`, `CommitRow`, `PrHint`, etc.). Wire shapes that

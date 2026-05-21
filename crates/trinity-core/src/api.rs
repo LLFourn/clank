@@ -6,7 +6,7 @@
 //!
 //! Closed-vocabulary fields use typed enums from [`crate::vocab`].
 //! Shared `model`/`api` structs (`Feedback`, `CommitGate`, `Plan`,
-//! `PlanTimelineEvent`, `WaitingOn`, `ArchivedCycle`) reach for
+//! `PlanTimelineEvent`, `WaitingOn`) reach for
 //! `crate::ids` newtypes (`AgentLabel`, `CommitSha`, etc.) where
 //! they OWN validated identity — serde-transparent over `String`,
 //! so the wire form is unchanged from "plain string" but both
