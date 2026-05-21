@@ -177,7 +177,12 @@ fn parse_plan_filter(args: &WaitArgs) -> Result<PlanFilter, WaitError> {
             .map_err(|e| WaitError::InvalidPlanId(e.to_string()))?;
         return Ok(PlanFilter::Plan(id));
     }
-    match args.repo.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+    match args
+        .repo
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
         Some(repo) => Ok(PlanFilter::RepoScope(repo.to_string())),
         None => Err(WaitError::MissingRepoForRepoScope),
     }
@@ -338,8 +343,7 @@ fn collect_prefix_violations(
         if matches!(node.kind, crate::repo_state::CommitKind::Finalize) {
             continue;
         }
-        let has_prefix =
-            crate::disk_snapshot::parse_title_prefix(&node.subject).is_some();
+        let has_prefix = crate::disk_snapshot::parse_title_prefix(&node.subject).is_some();
         if has_prefix && node.attribution_warning.is_none() {
             continue;
         }
@@ -1095,7 +1099,12 @@ fn collect_candidate_by_plan(
         .plans
         .get(plan_id.key())
         .ok_or_else(|| WaitError::UnknownPlan(plan_id.to_string()))?;
-    Ok(build_candidate(repo_root, plan_id.clone(), plan, repo_state))
+    Ok(build_candidate(
+        repo_root,
+        plan_id.clone(),
+        plan,
+        repo_state,
+    ))
 }
 
 fn build_candidate(
@@ -1128,10 +1137,7 @@ fn build_candidate(
 /// `commit-first-review-model`: the commit IS the review unit, so
 /// the candidate carries the gate directly and uses its own SHA as
 /// the review target.
-fn build_ad_hoc_candidate(
-    repo_root: PathBuf,
-    node: &crate::repo_state::CommitNode,
-) -> Candidate {
+fn build_ad_hoc_candidate(repo_root: PathBuf, node: &crate::repo_state::CommitNode) -> Candidate {
     Candidate {
         repo_root,
         kind: CandidateKind::AdHoc {
@@ -1592,7 +1598,11 @@ mod integration_tests {
             WaitResponse::Timeout(_) => panic!("expected work on repo-scope wait, got timeout"),
         };
         assert!(
-            payload.work.plans.iter().any(|p| p.contains("alpha.md") || p.contains("beta.md")),
+            payload
+                .work
+                .plans
+                .iter()
+                .any(|p| p.contains("alpha.md") || p.contains("beta.md")),
             "expected plan filter to identify alpha or beta; got plans={:?}",
             payload.work.plans
         );
@@ -1658,14 +1668,7 @@ mod integration_tests {
         run_git(dir.path(), &["add", "-A"]);
         run_git(
             dir.path(),
-            &[
-                "commit",
-                "--quiet",
-                "--date",
-                fixed_ts,
-                "-m",
-                "intro first",
-            ],
+            &["commit", "--quiet", "--date", fixed_ts, "-m", "intro first"],
         );
         write_file(dir.path(), ".trinity/plans/second.md", "# second\n");
         run_git(dir.path(), &["add", "-A"]);
@@ -1818,12 +1821,7 @@ mod integration_tests {
         run_git(dir.path(), &["add", "-A"]);
         run_git(
             dir.path(),
-            &[
-                "commit",
-                "--quiet",
-                "-m",
-                "[no-such-plan] do stuff",
-            ],
+            &["commit", "--quiet", "-m", "[no-such-plan] do stuff"],
         );
         let rt = Runtime::new();
         rt.add_repo(dir.path().to_path_buf()).await.unwrap();
@@ -2051,10 +2049,7 @@ mod integration_tests {
         // walk-back AND get a missing-prefix warning.
         write_file(dir.path(), "src.rs", "fn main() {}\n");
         run_git(dir.path(), &["add", "-A"]);
-        run_git(
-            dir.path(),
-            &["commit", "--quiet", "-m", "implement main"],
-        );
+        run_git(dir.path(), &["commit", "--quiet", "-m", "implement main"]);
         // Dirty the plan file to drive a master CommitPlanRevision wake.
         write_file(dir.path(), ".trinity/plans/foo.md", "# foo v2\n");
         let rt = Runtime::new();
@@ -2166,12 +2161,7 @@ mod integration_tests {
         run_git(dir.path(), &["add", "-A"]);
         run_git(
             dir.path(),
-            &[
-                "commit",
-                "--quiet",
-                "-m",
-                "[no-such-plan] do stuff",
-            ],
+            &["commit", "--quiet", "-m", "[no-such-plan] do stuff"],
         );
         // Make the plan file dirty so master wakes on
         // CommitPlanRevision.
@@ -2268,13 +2258,9 @@ mod integration_tests {
         let parsed = crate::disk_format::parse_feedback_path(std::path::Path::new(&fb_rel))
             .expect("ad hoc feedback path parses");
         let canonical = dunce::canonicalize(dir.path()).unwrap();
-        rt.handle_signal(
-            &canonical,
-            FilesystemSignal::FeedbackWritten { parsed },
-            0,
-        )
-        .await
-        .unwrap();
+        rt.handle_signal(&canonical, FilesystemSignal::FeedbackWritten { parsed }, 0)
+            .await
+            .unwrap();
 
         // Gate must now be Approved with alice in approvers
         // (NOT still Unreviewed with alice in missing).
@@ -2710,7 +2696,10 @@ mod integration_tests {
         match &p2.work.action {
             trinity_core::api::ExpectedAction::WriteFeedback { plan_file, .. } => {
                 assert!(
-                    plan_file.as_ref().and_then(|p| p.content.as_ref()).is_none(),
+                    plan_file
+                        .as_ref()
+                        .and_then(|p| p.content.as_ref())
+                        .is_none(),
                     "second poll should omit plan_file.content; got: {plan_file:?}"
                 );
             }
@@ -2771,7 +2760,10 @@ mod integration_tests {
         match &p1.work.action {
             trinity_core::api::ExpectedAction::WriteFeedback { plan_file, .. } => {
                 assert!(
-                    plan_file.as_ref().and_then(|p| p.content.as_ref()).is_none(),
+                    plan_file
+                        .as_ref()
+                        .and_then(|p| p.content.as_ref())
+                        .is_none(),
                     "oversize file should omit content"
                 );
             }
@@ -3216,7 +3208,10 @@ mod integration_tests {
         match &wc.work.action {
             trinity_core::api::ExpectedAction::WriteFeedback { plan_file, .. } => {
                 assert!(
-                    plan_file.as_ref().and_then(|p| p.content.as_ref()).is_none(),
+                    plan_file
+                        .as_ref()
+                        .and_then(|p| p.content.as_ref())
+                        .is_none(),
                     "work_context must not populate plan_file.content"
                 );
             }

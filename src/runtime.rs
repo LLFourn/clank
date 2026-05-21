@@ -398,8 +398,7 @@ impl Runtime {
                             return Ok(());
                         }
                         refresh_commits_for(state, &session_id);
-                        let Some(lifecycle) =
-                            state.plans.get(&session_id).map(|p| p.lifecycle())
+                        let Some(lifecycle) = state.plans.get(&session_id).map(|p| p.lifecycle())
                         else {
                             return Ok(());
                         };

@@ -421,7 +421,13 @@ mod tests {
         // PlanKey::parse must reject it so no plan can shadow that path.
         let err = PlanKey::parse("_").unwrap_err();
         assert!(
-            matches!(err, IdError::Reserved { kind: "PlanKey", .. }),
+            matches!(
+                err,
+                IdError::Reserved {
+                    kind: "PlanKey",
+                    ..
+                }
+            ),
             "expected IdError::Reserved for `_`; got {err:?}"
         );
         // from_path routes through parse, so the rejection is inherited.

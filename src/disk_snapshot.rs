@@ -22,9 +22,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 
 use crate::attribution::{CommitChanges, FinalizeChangeKind, classify};
+use crate::disk_format::FeedbackTarget;
 use crate::disk_format::{FeedbackPath, finalize_first_line_starts_with_approve, parse_verdict};
 use crate::lifecycle::{AgentLabel, CommitSha, PlanKey, content_hash};
-use crate::disk_format::FeedbackTarget;
 use crate::repo_state::{
     AttributionResult, BaseRepoState, CommitAttribution, CommitKind, CommitNode, Feedback,
     LiveRepoState, Plan, PlanTimelineEvent, PlanTouchKind, RepoState, Verdict,
@@ -967,12 +967,14 @@ fn per_plan_kind_for(
         CommitAttribution::MultiPlan { .. } => CommitKind::MultiPlan,
         CommitAttribution::Finalize { plan } if plan == plan_key => CommitKind::Finalize,
         CommitAttribution::Finalize { .. } => CommitKind::Unattributed,
-        CommitAttribution::Plan { plan } if plan == plan_key => match (our_touch, has_non_plan_code) {
-            (Some(_), true) => CommitKind::Mixed,
-            (Some(_), false) => CommitKind::PlanOnly,
-            (None, true) => CommitKind::CodeOnly,
-            (None, false) => CommitKind::Unattributed,
-        },
+        CommitAttribution::Plan { plan } if plan == plan_key => {
+            match (our_touch, has_non_plan_code) {
+                (Some(_), true) => CommitKind::Mixed,
+                (Some(_), false) => CommitKind::PlanOnly,
+                (None, true) => CommitKind::CodeOnly,
+                (None, false) => CommitKind::Unattributed,
+            }
+        }
         CommitAttribution::Plan { .. } => CommitKind::Unattributed,
         CommitAttribution::AdHoc => CommitKind::Unattributed,
     }
@@ -1881,7 +1883,11 @@ mod tests {
     fn commits_map_records_plan_intro_node() {
         let state = derive_state(
             PathBuf::from("/r"),
-            snap(vec![event("c1c1", vec![intro_with_body("foo", "# foo\n")], false)]),
+            snap(vec![event(
+                "c1c1",
+                vec![intro_with_body("foo", "# foo\n")],
+                false,
+            )]),
         );
         let node = state.commits.get(&sha("c1c1")).expect("commit node");
         assert!(
@@ -1915,10 +1921,7 @@ mod tests {
 
     #[test]
     fn commits_map_records_ad_hoc_when_no_plan_context() {
-        let state = derive_state(
-            PathBuf::from("/r"),
-            snap(vec![event("c1c1", vec![], true)]),
-        );
+        let state = derive_state(PathBuf::from("/r"), snap(vec![event("c1c1", vec![], true)]));
         let node = state.commits.get(&sha("c1c1")).expect("c1c1 node");
         assert!(
             matches!(node.attribution, CommitAttribution::AdHoc),
@@ -1926,7 +1929,10 @@ mod tests {
             node.attribution
         );
         assert!(node.plans.is_empty());
-        assert!(node.gate.is_none(), "AdHoc commits are non-reviewable until Phase 4");
+        assert!(
+            node.gate.is_none(),
+            "AdHoc commits are non-reviewable until Phase 4"
+        );
     }
 
     #[test]
