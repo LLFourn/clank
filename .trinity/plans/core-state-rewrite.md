@@ -32,18 +32,24 @@ declarative center. After it lands:
 The previous plan (`core-model-invalid-states-unrepresentable`)
 is superseded. Its Phase 1 + Phase 2 commits stay (they
 landed useful cleanup — deleted bucket enums, introduced the
-classifier + AttributionWarning enum). What didn't land
+classifier + Warning enum). What didn't land
 (Phase 3, atomic fold swap) is what this plan now executes,
 with the smaller and more honest scope.
 
 ## Hard Direction
 
 - `RepoState` is `{ plans, finished_plans, ad_hoc,
-  active_plan_hint }`. Four fields. The fold tracks NO
-  per-plan approver state — the daemon (via `git_io`)
-  computes whether a commit's tree freezes a plan when it
-  builds the `CommitEvent`, and tells the fold via
-  `event.newly_finished: BTreeSet<PlanKey>`.
+  active_plan_hint, warnings }`. Five fields. The fold
+  tracks NO per-plan approver state — the daemon (via
+  `git_io`) computes whether a commit's tree freezes a
+  plan when it builds the `CommitEvent`, and tells the
+  fold via `event.newly_finished: BTreeSet<PlanKey>`.
+- Attribution warnings are folded facts (`RepoWarning {
+  sha, plan, warning }`), appended to `state.warnings`
+  during `apply_commit` while the historical classifier
+  context is correct. Projection filters by `(sha,
+  plan)`; it never re-runs the classifier on old
+  commits.
 - `state.plans` holds only active plans. Non-frozen Delete
   REMOVES the plan from the map. Finalize MOVES the plan
   to `finished_plans` (recording `{ plan, finalized_at:
@@ -114,6 +120,28 @@ pub struct RepoState {
     /// always override with an explicit `[plan-x]` or
     /// `[misc]` prefix.
     pub active_plan_hint: Option<PlanKey>,
+
+    /// Attribution warnings discovered by the fold. The
+    /// classifier sees the correct historical inputs
+    /// (active-plan hint + known active plans BEFORE this
+    /// commit), so warnings are recorded here at the
+    /// moment of classification. Projection filters by
+    /// `(sha, plan)` to render them; it never re-runs the
+    /// classifier on historical commits.
+    pub warnings: Vec<RepoWarning>,
+}
+
+pub struct RepoWarning {
+    pub sha: CommitSha,
+    /// `None` for repo-scoped warnings (e.g.
+    /// `UnknownPlanPrefix`, `AttributionMismatch` —
+    /// commit-level facts not tied to a single plan).
+    /// `Some(plan)` when the warning is plan-scoped
+    /// (e.g. `MissingPrefix` whose suggestion names a
+    /// single plan, or `DanglingPlanRef` for the missing
+    /// key).
+    pub plan: Option<PlanKey>,
+    pub warning: Warning,
 }
 
 /// One active plan. Just its timeline. All derived facts
@@ -145,11 +173,6 @@ pub struct PlanTimelineEvent {
     /// changes attributed to this plan (explicit `[plan]`
     /// prefix or walk-back).
     pub touched_code: bool,
-    /// True iff this commit's finalize threshold fired for
-    /// this plan. Set by the fold immediately before the
-    /// plan exits `state.plans`, so a serialized state
-    /// never contains `finished: true` events.
-    pub finished: bool,
 }
 
 /// One entry in `state.ad_hoc`.
@@ -183,8 +206,6 @@ pub struct CommitEvent {
 pub struct PlanTouchInput {
     pub plan: PlanKey,
     pub kind: TouchKind,
-    /// New body text for Intro/Revise; None for Delete.
-    pub new_body: Option<String>,
 }
 
 pub enum TouchKind {
@@ -212,7 +233,7 @@ pub struct ClassifierOutput {
     /// walk-back; empty for `[misc]` / unknown prefix / no
     /// attribution at all.
     pub plan_attribution: BTreeSet<PlanKey>,
-    pub warnings: Vec<AttributionWarning>,
+    pub warnings: Vec<Warning>,
     /// The new active-plan hint after this commit. Single-plan
     /// attribution sets it to that plan; multi-plan attribution
     /// is "transparent" — the previous hint is preserved (a
@@ -222,11 +243,15 @@ pub struct ClassifierOutput {
     pub next_active_plan_hint: Option<PlanKey>,
 }
 
-/// Typed attribution warning. Emitted by the classifier
-/// but NOT stored in `RepoState` — the projection layer
-/// re-classifies the latest commit per plan when it needs
-/// to surface warnings.
-pub enum AttributionWarning {
+/// Typed warning. Closed vocabulary of facts the fold
+/// notices but doesn't act on. The variants here are all
+/// attribution-related (the only category we surface
+/// today); future warning categories (e.g. malformed
+/// finalize file, hook violation, etc.) get their own
+/// variants without changing the wrapper. Emitted by the
+/// classifier during `apply_commit` and persisted on
+/// `RepoState.warnings` (wrapped in `RepoWarning`).
+pub enum Warning {
     UnknownPlanPrefix { unknown_names: Vec<String> },
     MissingPrefix { suggested_prefix: String },
     AttributionMismatch {
@@ -246,7 +271,12 @@ in `trinity-core` for sharing across consumers but they
 never appear as fields on `RepoState`.
 
 ```rust
-/// Rich per-commit view, synthesized on demand.
+/// Rich per-commit view, synthesized on demand. One
+/// view per SHA (repo-scoped); `feedback` carries every
+/// review for the SHA across every scope, each item
+/// tagged with its scope. WFW filters by scope when
+/// deciding readiness; repo/home timelines can show all
+/// reviews together.
 pub struct CommitNode {
     pub sha: CommitSha,
     pub ts: i64,
@@ -259,12 +289,24 @@ pub struct CommitNode {
     /// → multiple plans) or walk-back (one plan). Empty set
     /// means ad-hoc / `[misc]`.
     pub plan_attribution: BTreeSet<PlanKey>,
-    pub warnings: Vec<AttributionWarning>,
-    pub reviews: CommitReviews,
+    pub warnings: Vec<Warning>,
+    pub feedback: Vec<CommitReview>,
 }
 
-pub struct CommitReviews {
-    pub feedback: BTreeMap<AgentLabel, FeedbackBody>,
+/// One review for a commit, carrying its scope. Filesystem
+/// identity is `(scope, sha, author)`; this struct mirrors
+/// that — the projection assembles every review for the
+/// SHA into the same `CommitNode.feedback` Vec, tagged
+/// with its own scope, so the same author writing for plan
+/// A and plan B is two `CommitReview` entries.
+pub struct CommitReview {
+    pub author: AgentLabel,
+    /// `None` = ad-hoc / repo-scoped feedback (the file
+    /// lives under `.trinity/feedback/_/<sha>/<author>.md`).
+    /// `Some(plan)` = plan-scoped feedback under
+    /// `.trinity/feedback/<plan>/<sha>/<author>.md`.
+    pub plan: Option<PlanKey>,
+    pub body: FeedbackBody,
 }
 
 pub struct FeedbackBody {
@@ -303,18 +345,28 @@ pub struct ReviewReadiness {
   `git show <intro_sha>:.trinity/plans/<key>.md` (or the
   tree at the latest commit with `touched_plan == true`).
 - **`participants_cumulative` is a projection.** Scan
-  `.trinity/feedback/<key>/*/` at projection time.
+  `.trinity/feedback/<key>/*/` filtered to SHAs that
+  appear in the active plan's `commits`. (Delete's
+  hard-forget rule means re-introduced plan keys never
+  conflate cycles — old-cycle feedback files may exist on
+  disk but the new active plan's `commits` SHAs are
+  disjoint from prior history.)
 - **`last_activity_ts` is a projection.** `max(commits.last().ts,
-  max feedback mtime)`.
+  max feedback file mtime for SHAs in `commits`)`.
 - **`PlanStage` is a projection.** `Drafting` if every event
   has `touched_code == false`; `Implementing` once any
-  event has `touched_code == true`. Frozen plans aren't in
-  `state.plans`.
+  event has `touched_code == true`. Finalized plans aren't
+  in `state.plans` (they're in `finished_plans`); deleted
+  plans are gone entirely.
 - **`intro` is `commits[0].sha`.** No separate field.
 - **`latest_revision` / `latest_implementation` are
   projections** off the timeline.
-- **Attribution warnings are not stored.** Projection re-runs
-  the classifier on the latest event per plan when needed.
+- **Attribution warnings ARE stored** in
+  `state.warnings: Vec<RepoWarning>` — they're folded
+  facts captured while the classifier sees the correct
+  historical context. Projection filters by `(sha, plan)`
+  to render them; it never re-runs the classifier on
+  historical commits.
 - **Cache shape.** The cache file's header records the HEAD
   SHA the state was saved at. `RepoState` itself doesn't
   carry that field.
@@ -345,14 +397,31 @@ impl RepoState {
             known_plans: &known_plans,
         });
 
-        // 2. Apply lifecycle mutations (no event emission
-        //    here):
+        // 2. Persist warnings while the historical
+        //    classifier context is fresh. RepoWarning's
+        //    `plan` field tags plan-scoped warnings (e.g.
+        //    DanglingPlanRef) so projection can filter
+        //    them per-plan view.
+        for w in classified.warnings {
+            self.warnings.push(RepoWarning {
+                sha: event.sha.clone(),
+                plan: warning_plan_tag(&w),
+                warning: w,
+            });
+        }
+
+        // 3. Apply lifecycle mutations:
         //    - Intro inserts a new PlanState AND clears
         //      self.ad_hoc.
         //    - Revise is a no-op (the per-plan event in
-        //      step 3 carries the touched_plan flag).
-        //    - Delete drops the plan entirely (non-frozen
-        //      delete; no entry in `finished_plans`).
+        //      step 4 carries the touched_plan flag).
+        //    - Delete is HARD-FORGET: drop plan from
+        //      `plans`, drop every `finished_plans` entry
+        //      for the same key (prior cycles), drop
+        //      warnings tagged with the key, and clear
+        //      `active_plan_hint` if it points at the
+        //      deleted key. A subsequent Intro of the same
+        //      key is a fresh plan with no prior memory.
         for touch in &event.plan_touches {
             match touch.kind {
                 TouchKind::Intro => {
@@ -365,11 +434,18 @@ impl RepoState {
                 TouchKind::Revise => {}
                 TouchKind::Delete => {
                     self.plans.remove(&touch.plan);
+                    self.finished_plans
+                        .retain(|f| f.plan != touch.plan);
+                    self.warnings
+                        .retain(|w| w.plan.as_ref() != Some(&touch.plan));
+                    if self.active_plan_hint.as_ref() == Some(&touch.plan) {
+                        self.active_plan_hint = None;
+                    }
                 }
             }
         }
 
-        // 3. Emit ONE PlanTimelineEvent per affected plan.
+        // 4. Emit ONE PlanTimelineEvent per affected plan.
         //    Affected = touches ∪ attribution ∪
         //    newly_finished. The booleans are computed
         //    from the per-plan facts; exactly one push
@@ -390,12 +466,15 @@ impl RepoState {
                 touched_plan: touches.contains_key(plan),
                 touched_code: event.has_code_changes
                     && classified.plan_attribution.contains(plan),
-                finished: event.newly_finished.contains(plan),
             });
         }
 
-        // 4. Move finalized plans to finished_plans and
-        //    drop them from `plans`.
+        // 5. Move finalized plans to finished_plans and
+        //    drop them from `plans`. Finalize keeps the
+        //    finished_plans record (unlike Delete which
+        //    hard-forgets); warnings tagged with the
+        //    finalized plan stay too — they're historical
+        //    facts about commits the plan saw.
         for plan in &event.newly_finished {
             if self.plans.remove(plan).is_some() {
                 self.finished_plans.push(FinishedPlan {
@@ -405,7 +484,7 @@ impl RepoState {
             }
         }
 
-        // 5. Ad-hoc bucket: no touches, no attribution,
+        // 6. Ad-hoc bucket: no touches, no attribution,
         //    code changes present.
         if touches.is_empty()
             && classified.plan_attribution.is_empty()
@@ -418,8 +497,18 @@ impl RepoState {
             });
         }
 
-        // 6. Update the active-plan hint.
+        // 7. Update the active-plan hint, then sanitize:
+        //    if the hint points at a plan that lifecycle
+        //    just removed (Delete or Finalize), clear it.
+        //    `active_plan_hint.is_none_or(|p|
+        //    self.plans.contains_key(p))` is an invariant
+        //    of post-apply state.
         self.active_plan_hint = classified.next_active_plan_hint;
+        if let Some(hint) = &self.active_plan_hint
+            && !self.plans.contains_key(hint)
+        {
+            self.active_plan_hint = None;
+        }
     }
 }
 ```
@@ -437,17 +526,29 @@ Helper invariants:
 - A commit with `touches = {A: Intro}` clears
   `self.ad_hoc` before anything else. This is the "new
   plan absorbs/discards prior ad-hoc work" rule.
-- A commit with `touches = {A: Delete}` removes A. If A
-  doesn't exist (already finalized), the delete is a
-  no-op.
+- A `TouchKind::Delete` is **hard-forget**: it wipes
+  `plans[key]`, every `finished_plans` entry for the same
+  key, all `warnings` tagged with the key, and clears
+  `active_plan_hint` if it pointed at the key. After
+  delete, Trinity has no folded memory of the plan; a
+  later `Intro` of the same `PlanKey` is a fresh plan.
+- A `TouchKind::Finalize` (via `event.newly_finished`) is
+  **soft-archive**: the plan moves to `finished_plans`,
+  its `PlanState.commits` is dropped, but warnings
+  tagged with the key stay (historical facts).
 - Multi-plan commits (`touches.len() ≥ 2`) result in one
   event per touched plan, each with `touched_plan: true`.
-- `finished: true` events are emitted before plan removal
-  so apply_commit's downstream observers (tests, debug
-  prints) can see them. They are never persisted in a
-  saved `RepoState` — once the plan exits `state.plans`,
-  its `commits` Vec is dropped. `finished_plans` is the
-  durable finalize record.
+- `warning_plan_tag(&Warning)` returns
+  `Some(plan)` for plan-scoped variants (e.g.
+  `DanglingPlanRef.plan`, the inferred plan in
+  `MissingPrefix` when the suggestion names exactly one
+  plan) and `None` for repo-scoped variants
+  (`UnknownPlanPrefix`, `AttributionMismatch`,
+  multi-plan `MissingPrefix`).
+- Post-apply invariant:
+  `active_plan_hint.is_none_or(|p|
+  self.plans.contains_key(p))`. The sanitization step at
+  the end of `apply_commit` enforces this.
 
 ## Cache & Incremental Fold
 
@@ -533,14 +634,18 @@ Common queries:
   commit's facts (re-fetched via `git_io` for the commits
   the UI is currently displaying).
 
-`review_policy` / `readiness` are free functions:
+`review_policy` / `readiness` are free functions. The
+caller picks the relevant scope (a `Some(plan)` for plan
+review, `None` for ad-hoc) and the function filters
+`feedback` to only items matching that scope:
 
 ```rust
 pub fn review_policy(
     event: &PlanTimelineEvent,
+    scope: Option<&PlanKey>,
     plan_state: Option<&PlanState>,
     ad_hoc_participants: &[AgentLabel],
-    feedback: &CommitReviews,
+    feedback: &[CommitReview],
     config: &Config,
 ) -> ReviewPolicy;
 
@@ -555,7 +660,7 @@ The core fold is sans-io.
 Phase 0 was the prior plan's Phase 1 + Phase 2 (deleted
 bucket types + added flat-facts scaffolding). That work
 landed; this plan reuses what's salvageable
-(`AttributionWarning` typed enum, the classifier's logic
+(`Warning` typed enum, the classifier's logic
 shape) and replaces the rest.
 
 ### Phase 1 — Move + restructure (atomic)
@@ -584,9 +689,12 @@ ONE atomic commit (or PR landing as one squashed commit).
   - `AdHocState` — replaced by `Vec<AdHocEvent>`.
   - `PlanStage` enum — projection only; defined in
     `repo_state` if a UI consumer needs it.
-- Delete `ReviewScope` enum and revert `CommitReviews` to
-  `BTreeMap<AgentLabel, FeedbackBody>` (scope is implicit
-  from container in the projection layer).
+- Delete `ReviewScope` enum and `CommitReviews` struct
+  entirely. Replace with `CommitReview { author, plan:
+  Option<PlanKey>, body }` and `CommitNode.feedback:
+  Vec<CommitReview>` (one CommitNode per SHA, repo-scoped;
+  filesystem `(scope, sha, author)` identity preserved by
+  the `plan: Option<PlanKey>` on each review).
 - Delete from `trinity-core::model`:
   - Legacy `CommitNode` (`kind`, `attribution`, `plans`,
     `gate`, `attribution_warning`).
@@ -663,28 +771,49 @@ ONE atomic commit (or PR landing as one squashed commit).
   `repo_state`.
 - Fold invariants:
   - `apply_commit` with `touches = {A: Intro}` inserts
-    `state.plans[A]` with `commits = [event]` (touched_plan
-    true, touched_code false, finished false). Also
-    clears `state.ad_hoc`.
+    `state.plans[A]` with `commits = [event]`
+    (touched_plan true, touched_code false). Also clears
+    `state.ad_hoc`.
   - `touches = {A: Revise}` after intro appends an event
     with `touched_plan: true`.
-  - `touches = {A: Delete}` on an active plan removes it
-    from `state.plans` (no entry added to
-    `finished_plans` — delete and finalize are distinct).
-  - `event.newly_finished = {A}` appends a
-    `finished: true` event to A's commits then moves A
-    to `finished_plans` and removes it from
-    `state.plans`.
-  - `finalizes = {A}, touches = {B: Revise}`: A exits
-    state with its finished event having appeared; B's
-    commits gains a touched_plan event.
+  - `touches = {A: Delete}` (hard-forget): removes A from
+    `state.plans`, removes every `finished_plans` entry
+    for A, removes every `warnings` entry tagged with A,
+    clears `active_plan_hint` if it pointed at A.
+  - `event.newly_finished = {A}` (soft-archive): emits an
+    event into A's `commits` (touched_plan/touched_code
+    per the commit's facts), moves A to `finished_plans`,
+    drops A from `state.plans`. `warnings` tagged with A
+    stay.
+  - `newly_finished = {A}` + `touches = {B: Revise}`: A
+    exits state into `finished_plans`; B's `commits`
+    gains a touched_plan event.
   - Multi-plan touch: `touches = {A: Revise, B: Revise}`
     appends one event to each.
-  - Code-only attribution: `plan_attribution = Some(A),
-    has_code_changes = true, touches = ∅` appends a
+  - Multi-plan attribution: `[plan-a,plan-b]` →
+    `plan_attribution = {A, B}`; both A's and B's
+    `commits` get a touched_code event when
+    `has_code_changes`. `active_plan_hint` is preserved
+    (multi-plan attribution is transparent to the hint).
+  - Code-only attribution: `plan_attribution = {A}`,
+    `has_code_changes = true`, `touches = ∅` appends a
     `touched_code: true` event to A's commits.
   - Ad-hoc eligible commit appends to `state.ad_hoc`.
   - Intro after ad-hoc commits clears `state.ad_hoc`.
+  - Warnings: classifier-emitted warnings land in
+    `state.warnings` tagged with `(sha, plan_tag)`.
+    `UnknownPlanPrefix` / `AttributionMismatch` /
+    multi-plan `MissingPrefix` are tagged with
+    `plan: None`. `DanglingPlanRef` is tagged with
+    `Some(the dangling key)`. Single-plan
+    `MissingPrefix` is tagged with `Some(the inferred
+    plan)`.
+  - `active_plan_hint` post-condition: after every
+    `apply_commit` call,
+    `state.active_plan_hint.is_none_or(|p|
+    state.plans.contains_key(p))`. Tested across
+    Delete-of-hint, Finalize-of-hint, and
+    classifier-set-then-deleted scenarios.
 - Incremental-fold equivalence: snapshot `RepoState`
   after N commits; apply commit N+1 via `apply_commit`.
   Result equals a from-root re-fold over all N+1
