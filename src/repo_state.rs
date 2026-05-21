@@ -70,10 +70,6 @@ pub struct RepoState {
     /// survives the cache.
     pub commit_order: Vec<CommitSha>,
     pub head: Option<CommitSha>,
-    /// Plans whose disk state is contradictory at rebuild time. Today
-    /// effectively unused (path-parser rejects `.trinity/plans/done/`),
-    /// but kept on the type for future stem-collision surfacing.
-    pub plan_conflicts: BTreeMap<PlanKey, Vec<PathBuf>>,
     /// New sans-io fold state per `core-state-rewrite.md` Phase 1.
     /// Populated alongside the legacy fold by
     /// `disk_snapshot::apply_commit`. Subsequent commits migrate
@@ -83,11 +79,11 @@ pub struct RepoState {
 }
 
 impl RepoState {
-    /// Clone this state with `plans` filtered to a single plan and
-    /// `plan_conflicts` cleared. Returns `None` if the plan key is
-    /// absent. Used by `Runtime::snapshot_session` to hand response
-    /// builders a `RepoState` for one specific plan without paying for
-    /// every other plan's clone.
+    /// Clone this state with `plans` filtered to a single plan.
+    /// Returns `None` if the plan key is absent. Used by
+    /// `Runtime::snapshot_session` to hand response builders a
+    /// `RepoState` for one specific plan without paying for every
+    /// other plan's clone.
     pub fn single_plan(&self, key: &PlanKey) -> Option<RepoState> {
         let plan = self.plans.get(key)?;
         let commits: BTreeMap<CommitSha, CommitNode> = self
@@ -128,7 +124,6 @@ impl RepoState {
             commits,
             commit_order,
             head: self.head.clone(),
-            plan_conflicts: std::collections::BTreeMap::new(),
             fold,
         })
     }
@@ -140,7 +135,6 @@ impl RepoState {
             commits: BTreeMap::new(),
             commit_order: Vec::new(),
             head: None,
-            plan_conflicts: BTreeMap::new(),
             fold: trinity_core::repo_state::RepoState::default(),
         }
     }
@@ -250,16 +244,6 @@ impl RepoState {
             if let Some(gate) = &node.gate {
                 hasher.update(b":gate=");
                 hasher.update(gate.state.as_str().as_bytes());
-            }
-            hasher.update(b";");
-        }
-        hasher.update(b"]\nconflicts[");
-        for (key, paths) in &self.plan_conflicts {
-            hasher.update(key.as_str().as_bytes());
-            hasher.update(b"=");
-            for path in paths {
-                hasher.update(path.to_string_lossy().as_bytes());
-                hasher.update(b",");
             }
             hasher.update(b";");
         }

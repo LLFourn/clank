@@ -235,12 +235,6 @@ async fn start_plan(state: &AppState, req: &ToolCallRequest) -> Result<Value, To
                     existing.plan_path
                 )));
             }
-            if repo_state.plan_conflicts.contains_key(&plan_key) {
-                return Err(ToolError::Forbidden(format!(
-                    "plan stem `{}` is in a conflict state; resolve before starting a new plan",
-                    plan_key.as_str()
-                )));
-            }
         }
     }
 
@@ -351,15 +345,6 @@ async fn work_context(state: &AppState, req: &ToolCallRequest) -> Result<Value, 
                 repo_root.display()
             )));
         };
-        if let Some(paths) = repo_state.plan_conflicts.get(plan_id.key()) {
-            return mcp_error(trinity_core::api::McpErrorPayload::PlanConflict {
-                slug: plan_id.key().as_str().to_string(),
-                paths: paths
-                    .iter()
-                    .map(|p| p.to_string_lossy().into_owned())
-                    .collect(),
-            });
-        }
         if !repo_state.plans.contains_key(plan_id.key()) {
             return mcp_error(trinity_core::api::McpErrorPayload::PlanNotCommitted {
                 plan_id: plan_id.to_string(),

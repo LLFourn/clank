@@ -988,9 +988,6 @@ fn collect_repo_scope_candidates(
         }
         match &node.attribution {
             crate::repo_state::CommitAttribution::Plan { plan } => {
-                if repo_state.plan_conflicts.contains_key(plan) {
-                    continue;
-                }
                 let Some(p) = repo_state.plans.get(plan) else {
                     continue;
                 };
@@ -1089,12 +1086,6 @@ fn collect_candidate_by_plan(
         .repos
         .get(&repo_root)
         .ok_or_else(|| WaitError::UnknownRepo(plan_id.repo().as_str().to_string()))?;
-    if let Some(paths) = repo_state.plan_conflicts.get(plan_id.key()) {
-        return Err(WaitError::PlanConflict {
-            key: plan_id.key().clone(),
-            paths: paths.clone(),
-        });
-    }
     let plan = repo_state
         .plans
         .get(plan_id.key())

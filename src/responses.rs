@@ -126,19 +126,7 @@ fn plans_index_parts(
         ));
     }
     plans.sort_by_key(|p| std::cmp::Reverse(p.last_activity_ts));
-    let conflicts: Vec<PlanConflict> = snapshot
-        .plan_conflicts
-        .iter()
-        .map(|(key, paths)| PlanConflict {
-            plan_id: plan_id_string(&snapshot.root, key),
-            slug: key.as_str().to_string(),
-            paths: paths
-                .iter()
-                .map(|p| p.to_string_lossy().to_string())
-                .collect(),
-        })
-        .collect();
-    Ok((plans, conflicts))
+    Ok((plans, Vec::new()))
 }
 
 fn build_plan_row(

@@ -123,16 +123,12 @@ impl BaseStatePayload {
     }
 
     fn into_base(self, root: PathBuf, head: CommitSha) -> BaseRepoState {
-        // plan_conflicts is intentionally not cached — see field
-        // comment in repo_state.rs ("Today effectively unused").
-        // If it ever carries data, bump CACHE_FORMAT_VERSION.
         let state = RepoState {
             root,
             plans: self.plans,
             commits: self.commits,
             commit_order: self.commit_order,
             head: Some(head),
-            plan_conflicts: BTreeMap::new(),
             fold: self.fold,
         };
         BaseRepoState::new(state)
