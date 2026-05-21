@@ -364,6 +364,11 @@ mod tests {
             .expect("cache file should exist after write");
         assert_eq!(loaded.head, base.head);
         assert_eq!(loaded.plans, base.plans);
+        // Phase 1 cache v4: the new fold round-trips alongside the
+        // legacy fields. Cache hits MUST restore state.fold so
+        // consumers reading from it after a warm load see the same
+        // facts they'd see after a cold fold.
+        assert_eq!(loaded.fold, base.fold);
     }
 
     #[test]

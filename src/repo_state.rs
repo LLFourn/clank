@@ -1,7 +1,11 @@
-//! In-memory state for the filesystem-truth model. All data here is a
-//! derived cache from git + working tree; nothing is persisted.
+//! Daemon-side in-memory repo state. All data here is a derived
+//! cache from git + working tree; nothing is persisted.
 //!
-//! See `.trinity/plans/filesystem-truth-rewrite.md` for the architecture.
+//! The `fold` field carries the new sans-io
+//! [`trinity_core::repo_state::RepoState`] introduced by
+//! `core-state-rewrite.md`. The legacy fields (`plans`, `commits`,
+//! `commit_order`) coexist during the migration; later sub-commits
+//! cut consumers over to `state.fold` and then delete them.
 
 use std::collections::{BTreeMap, VecDeque};
 use std::path::PathBuf;
