@@ -587,9 +587,7 @@ pub fn apply_commit(state: &mut RepoState, carry: &mut FoldCarry, event: &Commit
         }
         let files = carry.finalize_tree.get(plan_key);
         if finalize_rule_satisfied(files) {
-            let approver_count = files.map(|m| m.len()).unwrap_or(0) as u32;
             let captured_body = carry.plan_bodies.get(plan_key).cloned();
-            let _approver_count = approver_count;
             if let Some(plan) = state.plans.get_mut(plan_key) {
                 if let Some(body) = captured_body {
                     plan.body_hash = content_hash(&body);
