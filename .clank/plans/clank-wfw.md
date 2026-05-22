@@ -30,9 +30,6 @@ agents in the same repo collide on the feedback path if they pick
 the same label; making the label an explicit choice surfaces that
 decision instead of hiding it.
 
-Stubs that still reference `trinity-*` get renamed to `clank-*`
-as a prereq.
-
 ## Hard Direction
 
 - Daemonless. Both surfaces read the same `RepoState` every
@@ -53,8 +50,22 @@ as a prereq.
   ) -> PlanView;
 
   // crates/cli/ — the IO
-  pub fn scan_feedback(repo: &Path, plan: &PlanKey, sha: &CommitSha) -> FeedbackView;
-  pub fn read_worktree_facts(repo: &Path, plan_path: &str, head_blob: Option<&str>) -> WorktreeFacts;
+  //
+  // Participants are cumulative across a plan's reviewable
+  // commits, so the scan needs the full list of reviewable SHAs
+  // (read off `state.fold.plans[key].commits`), not just the
+  // latest. Output's `per_commit` is in chronological order.
+  pub fn scan_feedback(
+      repo: &Path,
+      plan: &PlanKey,
+      reviewable_shas: &[CommitSha],
+  ) -> FeedbackView;
+
+  pub fn read_worktree_facts(
+      repo: &Path,
+      plan_path: &str,
+      head_blob: Option<&str>,
+  ) -> WorktreeFacts;
   ```
 
   `status` and `wfw` both call the CLI-side IO, then hand the
@@ -227,9 +238,10 @@ pub enum WorkItem {
   `MasterToRevise` / `MasterToFinalize` / `MasterToCommit`,
   emit the corresponding `WorkItem`. Skip plans where master
   isn't blocked.
-- Reviewer role: for plans whose `waiting_on` is
-  `Reviewers { missing }` with `author` in `missing`, emit a
-  `ReviewerAction` carrying the canonical feedback path
+- Reviewer role: for plans whose `waiting_on` is `FirstReview`
+  (any reviewer eligible) OR `ReviewerApprovalsMissing { missing }`
+  with `author ∈ missing`, emit a `ReviewerAction` carrying the
+  canonical feedback path
   `.clank/feedback/<plan>/<sha>/<author>.md`.
 
 The deeper rules — how the gate is computed, who counts as a
@@ -239,9 +251,12 @@ output. This keeps the agent-perspective filter (small, simple)
 separate from the projection (which is the same data both
 surfaces share).
 
-`FeedbackView` is the projection-time scan of `.clank/feedback/`
-we already do in `preview.rs`; factor it into core so both
-`plan_view::project` and `preview.rs` consume the same source.
+`FeedbackView` is the typed shape both `plan_view::project` and
+`preview.rs`'s gate computation consume. Core owns the shape +
+the pure interpretation rules. CLI owns the IO that builds it
+(`crates/cli/src/feedback_scan.rs`, replacing the inline scan
+currently in `preview.rs`). Same data path; the boundary stays
+at the IO boundary.
 
 ## CLI Surface
 
@@ -470,8 +485,11 @@ Two commits, in order:
   repo/state.
 - `clank wfw --author alice --role reviewers --timeout 30s`
   exits with code 2 after ~30s when no work appears.
-- `clank wfw` in a linked git worktree wakes when HEAD changes
-  in the main worktree.
+- `clank wfw` running inside a linked git worktree wakes when
+  the ref its own HEAD resolves to is updated via a separate
+  `git` invocation. (Main-worktree HEAD changes that don't
+  touch the linked worktree's resolved ref are NOT required to
+  wake it.)
 - `plan_view::project` is the single source of truth — both
   `status.rs` and `derive_work` consume it, no parallel
   computation of gate state / waiting_on.
