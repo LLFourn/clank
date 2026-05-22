@@ -2,16 +2,31 @@
 
 ## Summary
 
-Wake parked `clank wfw` processes when a plan they were watching
-becomes finished. Today the watcher fires, the refold sees the
-plan moved into `finished_plans`, `derive_work` returns no
-actionable items, and the process keeps blocking forever. From
-the agent's perspective the plan never ends.
+Two finish-boundary fixes in one plan, since they share the
+projection.
 
-Fix: introduce a flat tagged `WaitItem` enum carrying actionable
-work AND terminal events ("a watched plan finished") in one list.
-`wfw` emits whatever non-empty `Vec<WaitItem>` the refold
-produces.
+1. **Wake parked `wfw` on finalize.** Today the watcher fires
+   when a watched plan moves into `finished_plans`, `derive_work`
+   returns no actionable items, and the process keeps blocking
+   forever. The agent never learns the plan ended.
+2. **Distinguish "plan approved" from "impl approved."** Today
+   the projection collapses both into `WaitingOn::MasterToFinalize`
+   — `clank status` tells the master to run `clank finish` as
+   soon as the intro is approved, before any implementation has
+   landed. The latest reviewable commit's `touched_code` flag
+   already carries the right signal; the projection just
+   ignores it.
+
+Fixes share the same `WaitItem` redesign and projection update:
+
+- Introduce a flat tagged `WaitItem` enum carrying actionable
+  work AND terminal events ("a watched plan finished") in one
+  list. `wfw` emits whatever non-empty `Vec<WaitItem>` the
+  refold produces.
+- Add `WaitingOn::MasterToImplement` (and a matching
+  `MasterNext::Implement` work variant) so the
+  approved-plan-only state is distinct from
+  approved-with-code → finalize.
 
 ## Hard Direction
 
@@ -41,8 +56,48 @@ produces.
   finished-detection set. This avoids ambiguity about whether a
   watched plan that disappeared "ended" or was simply never
   watched.
+- **Implement vs finalize routing.** When the gate is `Approved`
+  and the worktree is clean, the projection routes on the
+  latest reviewable commit's `touched_code` flag:
+  - `touched_code: false` (the approved commit was plan-only) →
+    `WaitingOn::MasterToImplement`. The plan was just approved;
+    next move is to write code under the `[<stem>]` prefix.
+  - `touched_code: true` (the approved commit attributed code to
+    the plan) → `WaitingOn::MasterToFinalize`. Implementation
+    has landed and been approved; `clank finish` is the next
+    move.
+  `Mixed` commits (touched_plan + touched_code) follow the
+  touched_code path — code attribution means impl is happening.
+  This is the missing nuance behind `clank status` currently
+  saying "finalize" the moment a plan-only intro is approved.
 
 ## Types
+
+In `crates/core/src/plan_view.rs`, extend `WaitingOn` with a new
+variant for the approved-plan-only case:
+
+```rust
+pub enum WaitingOn {
+    FirstReview,
+    ReviewerApprovalsMissing { missing: NonEmptyVec<AgentLabel> },
+    MasterToRevise { requesters: Vec<AgentLabel>, ambiguous: Vec<AgentLabel> },
+    MasterToCommit,
+    /// Gate approved, worktree clean, latest reviewable was
+    /// plan-only (`touched_code: false`). Next move is the
+    /// implementation, not finalize.
+    MasterToImplement,
+    /// Gate approved, worktree clean, latest reviewable had
+    /// `touched_code: true`. Run `clank finish`.
+    MasterToFinalize,
+}
+```
+
+`plan_view::evaluate` updates to route the `Approved + Clean`
+branch on the latest reviewable's `touched_code` flag, per the
+Hard Direction. `evaluate`'s signature changes to take the
+latest `PlanTimelineEvent` (or a `(sha, touched_code)` pair) so
+the routing has the data it needs without re-walking the
+timeline.
 
 In `crates/core/src/wait.rs` (new module). The existing
 `crates/core/src/work.rs` is removed; its `derive_work` moves
@@ -64,7 +119,18 @@ pub enum Role { Master, Reviewers }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum MasterNext { Revise, Commit, Finalize }
+pub enum MasterNext {
+    /// REQUEST_CHANGES on the latest reviewable. Address + recommit.
+    Revise,
+    /// Approved gate but the plan file has uncommitted edits. Commit
+    /// the next revision (or stash).
+    Commit,
+    /// Approved plan-only commit. Write the implementation under
+    /// the `[<stem>]` commit prefix.
+    Implement,
+    /// Approved commit with code attribution. Run `clank finish`.
+    Finalize,
+}
 
 /// Flat tagged list `wfw` returns from one refold round.
 /// Actionable items (`Master`, `Reviewer`) and terminal events
@@ -111,9 +177,20 @@ impl StartupSnapshot {
     pub fn from(state: &RepoState, plan_filter: Option<&PlanKey>) -> Self;
 }
 
-/// Agent-perspective work derivation (same rules as today's
-/// `derive_work`). Only emits `Master` and `Reviewer` variants —
-/// `Finished` is detected separately by `detect_finished`.
+/// Agent-perspective work derivation. Only emits `Master` and
+/// `Reviewer` variants — `Finished` is detected separately by
+/// `detect_finished`.
+///
+/// Master-role mapping (extends the existing table with
+/// `MasterToImplement → MasterNext::Implement` /
+/// `WaitingReason::ReadyToStartImplementation`):
+///
+/// | `WaitingOn`              | `MasterNext` | `WaitingReason`               |
+/// |-------------------------|--------------|-------------------------------|
+/// | `MasterToRevise`        | `Revise`     | `AddressCommitChanges`        |
+/// | `MasterToCommit`        | `Commit`     | `CommitPlanRevision`          |
+/// | `MasterToImplement`     | `Implement`  | `ReadyToStartImplementation`  |
+/// | `MasterToFinalize`      | `Finalize`   | `ReadyToFinalize`             |
 pub fn derive_work(
     views: &[PlanView],
     author: &AgentLabel,
@@ -178,14 +255,25 @@ Pure — no IO, no fold mutation. `WaitingOn`, `PlanView`,
 
 One commit. Adds:
 
-- `crates/core/src/wait.rs` with `WaitItem`, `Role`, `MasterNext`,
-  `StartupSnapshot`, `derive_work`, `detect_finished` + tests.
+- `crates/core/src/plan_view.rs`: extend `WaitingOn` with
+  `MasterToImplement`; rewire `evaluate` to route the
+  `Approved + Clean` branch on the latest reviewable's
+  `touched_code` flag.
+- `crates/core/src/wait.rs` with `WaitItem`, `Role`, `MasterNext`
+  (including the new `Implement` variant), `StartupSnapshot`,
+  `derive_work`, `detect_finished` + tests.
 - Deletes `crates/core/src/work.rs` (its types/function migrate
   into `wait.rs` under the new names).
 - Updates `crates/cli/src/cli/wfw.rs` to build the snapshot at
   startup, switch to the combined `derive_work ++ detect_finished`
-  flow, and widen `emit` for the new variant.
-- Three integration tests for the finished-wake paths.
+  flow, and widen `emit` for the new variant + the new
+  `MasterNext::Implement` output.
+- Updates `crates/cli/src/cli/status.rs` `waiting_actor` /
+  `waiting_reason` for the `MasterToImplement` variant
+  (`master` actor, "gate approved — implement under [<stem>]"
+  reason).
+- Integration tests for the finished-wake paths AND the
+  plan-only-vs-impl routing.
 
 The pure-core / IO-CLI boundary stays exactly as it is today.
 
@@ -206,12 +294,28 @@ Table-driven against synthetic `StartupSnapshot` + `RepoState`:
 - Multiple watched plans finished on the same fold → items in
   ascending `PlanKey` order.
 
-### Core: `derive_work` (regression)
+### Core: `derive_work` (regression + Implement)
 
 The existing `derive_work` tests survive the WorkItem→WaitItem
 rename. Update the `matches!` patterns + variant names but keep
 the same coverage matrix (master-flavored / reviewer-eligible /
-ineligible).
+ineligible). Add one new row:
+
+- `WaitingOn::MasterToImplement` → `WaitItem::Master` with
+  `next: Implement` and `reason: ReadyToStartImplementation`.
+
+### Core: `plan_view::evaluate` Approved routing
+
+Add two table rows to the existing `evaluate` test suite:
+
+- Latest reviewable has `touched_plan: true, touched_code: false`,
+  gate Approved, worktree Clean → `MasterToImplement`.
+- Latest reviewable has `touched_code: true` (alone or with
+  `touched_plan: true`), gate Approved, worktree Clean →
+  `MasterToFinalize`.
+
+Keep the existing `MasterToCommit` (BodyDirty) and
+`MasterToRevise` (ChangesRequested) rows unchanged.
 
 ### Integration: `crates/cli/tests/wfw_integration.rs`
 
@@ -249,6 +353,18 @@ ineligible).
    This pins the "agent resumed with stale state" path: an
    explicit `--plan` targets a known plan, and `wfw` should
    tell the caller it's over rather than fail or block.
+6. **Plan-only approval routes to Implement.** Temp repo with
+   a `[foo] intro` commit (`touched_plan: true, touched_code:
+   false`). alice approves the intro. Park
+   `clank wfw --author lloyd --role master --timeout 5s`.
+   Assert it exits within ~1s with stdout containing
+   `next=Implement` and `reason=ready_to_start_implementation` —
+   NOT `next=Finalize`. Repeat the same scenario adding a
+   `[foo] code work` commit (touches `src/lib.rs`) after the
+   plan approval but before parking wfw, and alice approving
+   that too; assert wfw exits with `next=Finalize` /
+   `reason=ready_to_finalize`. The two cases pin the
+   plan-only-vs-impl routing fix.
 
 ## Acceptance
 
@@ -264,6 +380,11 @@ ineligible).
 - When work and finished both apply on one wake, the emitted
   `items[]` carries both — the mixed-case test catches a
   regression here.
+- After a reviewer approves a plan-only commit, `clank status`
+  reads "implement under [<stem>]" (not "run clank finish") and
+  `clank wfw --role master` emits `next=Implement`. After a
+  reviewer approves a code-touching commit, both surfaces flip
+  to the finalize wording / `next=Finalize`.
 - `WaitItem` is the single outward type. No caller infers a
   variant from strings; no nested `WaitOutcome` wrapper.
 - `crates/core/src/wait.rs` has no `std::fs::` /
