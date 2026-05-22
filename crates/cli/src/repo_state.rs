@@ -9,10 +9,9 @@ use std::path::PathBuf;
 use crate::lifecycle::{AgentLabel, CommitSha, PlanKey, RepoBasename};
 
 pub use clank_core::PlanLifecycle;
+pub use clank_core::PlanWorktreeStatus;
 pub use clank_core::Verdict;
-pub use clank_core::api::WaitingOn;
-pub use clank_core::{PlanWorktreeStatus, Posture};
-pub use clank_core::{WaitingReason, WaitingRole};
+pub use clank_core::WaitingReason;
 
 pub type RepoRoot = PathBuf;
 

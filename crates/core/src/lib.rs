@@ -6,7 +6,7 @@
 //! ## Modules
 //!
 //! - [`vocab`] — closed-vocab enums (`PlanLifecycle`,
-//!   `CommitKind`, `WaitingReason`, …). Wire form is snake_case.
+//!   `WaitingReason`, …). Wire form is snake_case.
 //! - [`ids`] — validated identifier newtypes (`AgentLabel`,
 //!   `PlanKey`, `CommitSha`, `RepoBasename`, `ContentHash`,
 //!   `PlanId`). Serde-transparent over `String` with parse-time
@@ -44,11 +44,8 @@ pub mod vocab;
 pub mod work;
 
 // Re-export the closed-vocab enums at crate root for ergonomic
-// imports (`use clank_core::CommitKind;`).
-pub use vocab::{
-    CommitGateState, CommitKind, PlanLifecycle, PlanTouchKind, PlanWorktreeStatus, Posture,
-    PrHintOptionKind, ReviewGateState, ReviewTargetPhase, Verdict, WaitingReason, WaitingRole,
-};
+// imports (`use clank_core::Verdict;`).
+pub use vocab::{CommitGateState, PlanLifecycle, PlanWorktreeStatus, Verdict, WaitingReason};
 
 // Re-export the identifier newtypes at crate root.
 pub use ids::{
