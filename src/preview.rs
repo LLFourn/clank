@@ -160,13 +160,7 @@ pub async fn build_rewrite_preview(
     let native_shas: BTreeSet<CommitSha> = if let Some(ps) = state.fold.plans.get(plan_key) {
         ps.commits.iter().map(|e| e.sha.clone()).collect()
     } else if let Some(end) = finalized_at.as_ref() {
-        re_fold_finished_plan_natives(
-            repo_root,
-            plan_key,
-            &intro_sha.as_ref().unwrap().clone(),
-            end,
-        )
-        .await?
+        re_fold_finished_plan_natives(repo_root, plan_key, end).await?
     } else {
         BTreeSet::new()
     };
@@ -307,40 +301,43 @@ pub async fn build_rewrite_preview_all(
     })
 }
 
-/// Re-derive the per-plan native-SHA set for a FINISHED plan by
-/// replaying its [intro, finalized_at) interval through a fresh
-/// sans-io fold. The canonical `RepoState` only stores
-/// `{ plan, intro, finalized_at }` for finished plans (no
-/// timeline), so the rewrite-preview path reconstructs attribution
-/// on demand. Bounded cost — typical plans span tens of commits.
+/// Re-derive the per-plan native-SHA set for a FINISHED plan.
 ///
-/// Walk is HALF-OPEN: stops BEFORE `finalized_at` so the plan stays
-/// active in the scratch fold (the finalize event moves it to
-/// `finished_plans` and drops its timeline). The finalize SHA is
-/// added back at the end.
+/// The canonical `RepoState` only stores `{ plan, intro,
+/// finalized_at }` for finished plans (no timeline). Reconstructing
+/// the timeline requires the SAME repo-scoped classifier context
+/// the original fold saw — `known_plans` and `active_plan_hint` at
+/// each commit can be established by OTHER plans the classifier
+/// already knew before this plan's intro (e.g. a `[other,this]`
+/// prefix needs `other` in `known_plans` for the attribution to
+/// hold). So we cold-fold the first-parent chain from ROOT up to
+/// but excluding `finalized_at`. At that boundary the plan is
+/// still active in `state.fold.plans` with its current cycle's
+/// timeline (prior cycles, if any, were already dropped by their
+/// own finalize). The finalize SHA itself is added back at the end.
+///
+/// Phase-2 cache loading is opportunistic: try the closest cached
+/// ancestor of `finalized_at` and fold-forward from there; fall
+/// back to a cold walk from root on miss.
 async fn re_fold_finished_plan_natives(
     repo_root: &Path,
     plan_key: &PlanKey,
-    intro: &CommitSha,
     finalized_at: &CommitSha,
 ) -> Result<BTreeSet<CommitSha>, PreviewError> {
     use crate::disk_snapshot::{CommitEvent, apply_commit, enrich_with_newly_finished};
 
     let metas = first_parent_commits_to(repo_root, finalized_at).await?;
-    let start =
-        metas
-            .iter()
-            .position(|m| &m.sha == intro)
-            .ok_or_else(|| PreviewError::IntroNotInWalk {
-                intro: intro.as_str().to_string(),
-                head: finalized_at.as_str().to_string(),
-            })?;
+    let final_idx = metas
+        .iter()
+        .position(|m| &m.sha == finalized_at)
+        .ok_or_else(|| PreviewError::IntroNotInWalk {
+            intro: finalized_at.as_str().to_string(),
+            head: finalized_at.as_str().to_string(),
+        })?;
 
-    let mut scratch = RepoState::empty(repo_root.to_path_buf());
-    for meta in &metas[start..] {
-        if &meta.sha == finalized_at {
-            break;
-        }
+    let (mut scratch, start_idx) = pick_cache_anchor(repo_root, &metas, final_idx).await?;
+
+    for meta in &metas[start_idx..final_idx] {
         let changes = diff_tree_changes(repo_root, &meta.sha).await?;
         let raw = CommitEvent {
             commit: meta.sha.clone(),
@@ -360,6 +357,31 @@ async fn re_fold_finished_plan_natives(
         .unwrap_or_default();
     native.insert(finalized_at.clone());
     Ok(native)
+}
+
+/// Most-recent cached `RepoState` whose head is an ancestor of
+/// `finalized_at` and falls before it in the walk. Returns
+/// `(scratch_state, start_idx)` — the index in `metas` from which
+/// to fold forward. Falls back to `(RepoState::empty, 0)` on miss.
+async fn pick_cache_anchor(
+    repo_root: &Path,
+    metas: &[crate::git_io::CommitMeta],
+    final_idx: usize,
+) -> Result<(RepoState, usize), PreviewError> {
+    let ancestor_positions: std::collections::BTreeMap<CommitSha, usize> = metas[..final_idx]
+        .iter()
+        .enumerate()
+        .map(|(i, m)| (m.sha.clone(), i))
+        .collect();
+    for cached in crate::state_cache::list_cached_heads(repo_root) {
+        let Some(&idx) = ancestor_positions.get(&cached) else {
+            continue;
+        };
+        if let Ok(Some(state)) = crate::state_cache::try_load(repo_root, &cached) {
+            return Ok((state, idx + 1));
+        }
+    }
+    Ok((RepoState::empty(repo_root.to_path_buf()), 0))
 }
 
 /// Tree-based classifier shared with the rewrite engine.
@@ -566,3 +588,90 @@ async fn compute_gate(
 // stays in the module graph.
 #[allow(dead_code)]
 fn _feedback_target_marker(_: FeedbackTarget) {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::rebuild::{CachePolicy, rebuild_repo_with_policy};
+    use std::process::Command;
+
+    fn init_repo() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path();
+        run_git(path, &["init", "--quiet", "--initial-branch=main"]);
+        run_git(path, &["config", "user.email", "test@test"]);
+        run_git(path, &["config", "user.name", "test"]);
+        run_git(path, &["config", "commit.gpgsign", "false"]);
+        dir
+    }
+
+    fn run_git(cwd: &Path, args: &[&str]) {
+        let status = Command::new("git")
+            .arg("-C")
+            .arg(cwd)
+            .args(args)
+            .status()
+            .expect("git");
+        assert!(status.success(), "git {args:?} failed");
+    }
+
+    fn write_file(repo: &Path, rel: &str, body: &str) {
+        let abs = repo.join(rel);
+        if let Some(parent) = abs.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        std::fs::write(abs, body).unwrap();
+    }
+
+    fn commit(repo: &Path, msg: &str) {
+        run_git(repo, &["add", "-A"]);
+        run_git(repo, &["commit", "--quiet", "-m", msg]);
+    }
+
+    /// Regression for codex on 31df65e: finished-plan rewrite
+    /// preview must reflect the historical classifier context of
+    /// the repo, not an isolated target-plan scratch fold. If plan
+    /// A is active when plan B is introduced and a commit titled
+    /// `[a,b] shared` lands while both are active, B's native_shas
+    /// must include the shared commit — the cold-from-root re-fold
+    /// keeps A in known_plans at the shared commit so the prefix
+    /// resolves and B's per-cycle timeline picks the commit up.
+    #[tokio::test]
+    async fn finished_plan_rewrite_preview_uses_repo_history() {
+        let dir = init_repo();
+        write_file(dir.path(), ".trinity/plans/a.md", "# a\n");
+        commit(dir.path(), "[a] intro");
+        write_file(dir.path(), ".trinity/plans/b.md", "# b\n");
+        commit(dir.path(), "[b] intro");
+        write_file(dir.path(), "src.rs", "fn main() {}\n");
+        write_file(dir.path(), ".trinity/plans/a.md", "# a v2\n");
+        write_file(dir.path(), ".trinity/plans/b.md", "# b v2\n");
+        commit(dir.path(), "[a,b] shared work");
+        // Approve b and finalize.
+        write_file(
+            dir.path(),
+            ".trinity/finished/b/alice.md",
+            "APPROVE\n\nlgtm\n",
+        );
+        commit(dir.path(), "Finalize b");
+
+        let state = rebuild_repo_with_policy(dir.path(), CachePolicy::Bypass)
+            .await
+            .unwrap();
+        let key = PlanKey::parse("b").unwrap();
+        let preview = build_rewrite_preview(dir.path(), &state, &key, true)
+            .await
+            .unwrap();
+
+        // The `[a,b] shared work` commit must NOT be foreign to b.
+        let shared = preview
+            .commits
+            .iter()
+            .find(|c| c.subject == "[a,b] shared work")
+            .expect("shared commit in rewrite range");
+        assert!(
+            !shared.foreign,
+            "shared `[a,b]` commit must be attributed to b too (historical classifier context)",
+        );
+    }
+}
