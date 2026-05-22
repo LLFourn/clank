@@ -326,11 +326,30 @@ impl WatchContext {
                     .map_err(|e| anyhow::anyhow!("watch `{}` failed: {e}", path.display()))
             };
 
+        // `.git/HEAD` only changes on checkout/symbolic-ref. Local
+        // commits don't touch it. The canonical "HEAD moved" signal
+        // for the current worktree is the reflog `logs/HEAD` — git
+        // appends a line to it on every commit, rebase, reset, etc.
+        // Watch both so we wake on both branch switches AND ordinary
+        // commits, including code-only commits that don't touch any
+        // `.clank/` paths.
         try_watch(
             self.git_dir.join("HEAD"),
             RecursiveMode::NonRecursive,
             false,
         )?;
+        try_watch(
+            self.git_dir.join("logs/HEAD"),
+            RecursiveMode::NonRecursive,
+            // Pristine repos with no commits yet have no logs/HEAD.
+            // Tolerate that — the file appears on the first commit
+            // and notify auto-rewatches via the parent .git dir.
+            true,
+        )?;
+        // The common refs tree carries every branch, tag, and
+        // remote ref — needed for picking up commits made via a
+        // separate `git` invocation (especially from another linked
+        // worktree).
         try_watch(
             self.git_common_dir.join("refs"),
             RecursiveMode::Recursive,

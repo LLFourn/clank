@@ -75,10 +75,11 @@ fn spawn_wfw(repo: &Path, args: &[&str]) -> std::process::Child {
         .stderr(Stdio::piped())
         .spawn()
         .expect("spawn clank wfw");
-    // notify on macOS takes ~150ms to attach its FSEvents listener.
-    // Give the watcher headroom so the mutation that follows actually
-    // shows up as a fired event rather than landing during attach.
-    std::thread::sleep(Duration::from_millis(500));
+    // notify takes a moment to attach. macOS FSEvents and Linux
+    // inotify both need time to wire up — give a generous headroom
+    // so the mutation that follows actually fires through the
+    // watcher rather than landing during attach.
+    std::thread::sleep(Duration::from_millis(1500));
     child
 }
 
@@ -146,6 +147,59 @@ fn wfw_reviewer_wakes_on_new_reviewable_commit() {
     assert!(
         stdout.contains("alice.md"),
         "expected feedback path for alice; got stdout=`{stdout}`"
+    );
+}
+
+#[test]
+fn wfw_reviewer_wakes_on_code_only_commit() {
+    // Regression for the ref-only wake path: an attribution-only
+    // (code-only) commit doesn't touch any `.clank/` path, so the
+    // ONLY signal the watcher has is the git-ref update. Confirms
+    // logs/HEAD + refs/ watching reaches a parked reviewer.
+    let dir = init_repo();
+    let repo = dir.path();
+    write(repo, ".clank/plans/foo.md", "# foo\n");
+    commit(repo, "[foo] intro");
+    let intro_sha = head_sha(repo);
+
+    // alice approved the intro; gate=Approved at startup.
+    write(
+        repo,
+        &format!(".clank/feedback/foo/{intro_sha}/alice.md"),
+        "APPROVE\n\nlgtm\n",
+    );
+
+    let mut child = spawn_wfw(
+        repo,
+        &[
+            "--author",
+            "alice",
+            "--role",
+            "reviewers",
+            "--timeout",
+            "30s",
+        ],
+    );
+
+    // Code-only commit: touches `src/lib.rs`, not the plan file.
+    // Classifier inherits attribution to `foo` via the active-plan
+    // hint, so this is a reviewable commit, but the watcher must
+    // wake on the git-ref update because nothing under `.clank/`
+    // moved.
+    write(repo, "src/lib.rs", "// hello\n");
+    commit(repo, "[foo] code work");
+    let code_sha = head_sha(repo);
+
+    let exit = wait_for_exit(&mut child, Duration::from_secs(20));
+    let stdout = read_stdout_to_end(&mut child);
+    let stderr = read_stderr_to_end(&mut child);
+    assert!(
+        exit.success(),
+        "wfw exit={exit:?} stdout=`{stdout}` stderr=`{stderr}`"
+    );
+    assert!(
+        stdout.contains("review") && stdout.contains(&code_sha[..7]),
+        "expected reviewer wake on code-only sha {code_sha}; got stdout=`{stdout}`"
     );
 }
 
