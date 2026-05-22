@@ -58,18 +58,29 @@ Fixes share the same `WaitItem` redesign and projection update:
   watched.
 - **Implement vs finalize routing.** When the gate is `Approved`
   and the worktree is clean, the projection routes on the
-  latest reviewable commit's `touched_code` flag:
-  - `touched_code: false` (the approved commit was plan-only) →
-    `WaitingOn::MasterToImplement`. The plan was just approved;
+  latest reviewable commit's `touched_plan` flag — which aligns
+  with the existing `Posture` vocabulary (`PlanOnly | Mixed →
+  Planning`, `CodeOnly → Implementing`). Mixed semantics stay
+  exactly as they are today; this plan introduces no shift in
+  what `Posture` / `ReviewTargetPhase` mean:
+  - `touched_plan: true` (the approved commit was `PlanOnly` or
+    `Mixed`, i.e. `Posture::Planning`) →
+    `WaitingOn::MasterToImplement`. The plan was just settled;
     next move is to write code under the `[<stem>]` prefix.
-  - `touched_code: true` (the approved commit attributed code to
-    the plan) → `WaitingOn::MasterToFinalize`. Implementation
-    has landed and been approved; `clank finish` is the next
-    move.
-  `Mixed` commits (touched_plan + touched_code) follow the
-  touched_code path — code attribution means impl is happening.
+    Mixed commits route here even though they also touched code —
+    a plan revision in the same commit signals "still iterating
+    on the plan," so the master gets another implementation
+    cycle before finalize is suggested.
+  - `touched_code: true && touched_plan: false` (the approved
+    commit was `CodeOnly`, i.e. `Posture::Implementing`) →
+    `WaitingOn::MasterToFinalize`. Implementation has landed
+    cleanly with no concurrent plan revision; `clank finish` is
+    the next move.
   This is the missing nuance behind `clank status` currently
   saying "finalize" the moment a plan-only intro is approved.
+  The model stays consistent with `Posture` everywhere: no
+  surface says "implementing" while another says "planning" for
+  the same commit.
 
 ## Types
 
@@ -306,13 +317,17 @@ ineligible). Add one new row:
 
 ### Core: `plan_view::evaluate` Approved routing
 
-Add two table rows to the existing `evaluate` test suite:
+Add three table rows to the existing `evaluate` test suite to
+cover all three reviewable `CommitKind`s under Approved+Clean:
 
-- Latest reviewable has `touched_plan: true, touched_code: false`,
-  gate Approved, worktree Clean → `MasterToImplement`.
-- Latest reviewable has `touched_code: true` (alone or with
-  `touched_plan: true`), gate Approved, worktree Clean →
-  `MasterToFinalize`.
+- `PlanOnly` (`touched_plan: true, touched_code: false`),
+  Approved, Clean → `MasterToImplement`.
+- `Mixed` (`touched_plan: true, touched_code: true`), Approved,
+  Clean → `MasterToImplement`. Pins the Posture-aligned routing:
+  Mixed stays in the planning phase, so the master gets another
+  implementation cycle.
+- `CodeOnly` (`touched_plan: false, touched_code: true`),
+  Approved, Clean → `MasterToFinalize`.
 
 Keep the existing `MasterToCommit` (BodyDirty) and
 `MasterToRevise` (ChangesRequested) rows unchanged.
