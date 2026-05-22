@@ -50,22 +50,35 @@ pub async fn run(args: WfwArgs) -> anyhow::Result<()> {
 
     let repo = resolve_repo(args.repo.as_deref())?;
     let basename = repo_basename(&repo)?;
-    let plan_filter = match args.plan.as_deref() {
-        Some(raw) => Some({
-            let stem = parse_arg(raw, &basename)?;
-            PlanKey::parse(&stem)
-                .map_err(|e| anyhow::anyhow!("invalid plan stem `{stem}`: {e}"))?
-        }),
-        None => None,
-    };
 
     let policy = if args.no_cache {
         crate::rebuild::CachePolicy::Bypass
     } else {
         crate::rebuild::CachePolicy::Use
     };
+    let initial_state = crate::rebuild::rebuild_repo_with_policy(&repo, policy)
+        .await
+        .map_err(|e| anyhow::anyhow!("failed to fold repo `{}`: {e}", repo.display()))?;
 
-    if let Some(items) = check_once(&repo, policy, &plan_filter, &author, role).await? {
+    let plan_filter = match args.plan.as_deref() {
+        Some(raw) => {
+            let stem = parse_arg(raw, &basename)?;
+            let key = PlanKey::parse(&stem)
+                .map_err(|e| anyhow::anyhow!("invalid plan stem `{stem}`: {e}"))?;
+            if !initial_state.fold.plans.contains_key(&key) {
+                anyhow::bail!(
+                    "plan `{basename}/{stem}.md` not active. active: {}",
+                    active_summary(&initial_state, &basename)
+                );
+            }
+            Some(key)
+        }
+        None => None,
+    };
+
+    if let Some(items) =
+        derive_from_state(&repo, &initial_state, &plan_filter, &author, role).await?
+    {
         emit(&items, args.json);
         return Ok(());
     }
@@ -77,32 +90,46 @@ pub async fn run(args: WfwArgs) -> anyhow::Result<()> {
 
     let deadline = timeout.map(|t| std::time::Instant::now() + t);
     loop {
-        let wait = match deadline {
-            Some(end) => end.checked_duration_since(std::time::Instant::now()),
-            None => Some(Duration::from_secs(3600)),
+        // Block forever when `--timeout 0`; otherwise honour the
+        // deadline. Don't fall through `recv_timeout` with a
+        // synthetic interval — `Timeout` is the bottom of the
+        // function's flowchart and unconditionally produces `WfwTimeout`.
+        let event = match deadline {
+            None => rx
+                .recv()
+                .map_err(|_| anyhow::anyhow!("filesystem watcher disconnected"))?,
+            Some(end) => match end.checked_duration_since(std::time::Instant::now()) {
+                None => return Err(WfwTimeout.into()),
+                Some(wait) => match rx.recv_timeout(wait) {
+                    Ok(()) => (),
+                    Err(mpsc::RecvTimeoutError::Timeout) => return Err(WfwTimeout.into()),
+                    Err(mpsc::RecvTimeoutError::Disconnected) => {
+                        anyhow::bail!("filesystem watcher disconnected")
+                    }
+                },
+            },
         };
-        let wait = match wait {
-            Some(d) => d,
-            None => return Err(WfwTimeout.into()),
-        };
-        match rx.recv_timeout(wait) {
-            Ok(()) => {
-                // Drain any further events that landed inside the
-                // debounce window — `notify` fires once per OS event
-                // and we only want one refold per logical change.
-                while rx.recv_timeout(Duration::from_millis(200)).is_ok() {}
-                if let Some(items) =
-                    check_once(&repo, policy, &plan_filter, &author, role).await?
-                {
-                    emit(&items, args.json);
-                    return Ok(());
-                }
-            }
-            Err(mpsc::RecvTimeoutError::Timeout) => return Err(WfwTimeout.into()),
-            Err(mpsc::RecvTimeoutError::Disconnected) => {
-                anyhow::bail!("filesystem watcher disconnected")
-            }
+        let _ = event;
+        // Debounce: drain bursts so one logical change → one refold.
+        while rx.recv_timeout(Duration::from_millis(200)).is_ok() {}
+        if let Some(items) = check_once(&repo, policy, &plan_filter, &author, role).await? {
+            emit(&items, args.json);
+            return Ok(());
         }
+    }
+}
+
+fn active_summary(state: &RepoState, basename: &str) -> String {
+    let names: Vec<String> = state
+        .fold
+        .plans
+        .keys()
+        .map(|k| format!("{basename}/{}.md", k.as_str()))
+        .collect();
+    if names.is_empty() {
+        "(none)".into()
+    } else {
+        names.join(", ")
     }
 }
 
@@ -116,15 +143,28 @@ async fn check_once(
     let state = crate::rebuild::rebuild_repo_with_policy(repo, policy)
         .await
         .map_err(|e| anyhow::anyhow!("failed to fold repo `{}`: {e}", repo.display()))?;
+    derive_from_state(repo, &state, plan_filter, author, role).await
+}
+
+async fn derive_from_state(
+    repo: &Path,
+    state: &RepoState,
+    plan_filter: &Option<PlanKey>,
+    author: &AgentLabel,
+    role: Role,
+) -> anyhow::Result<Option<Vec<WorkItem>>> {
     let plans: Vec<PlanKey> = match plan_filter {
         Some(k) if state.fold.plans.contains_key(k) => vec![k.clone()],
+        // Caller validates the `--plan` arg at startup, so if the
+        // plan disappears mid-watch (e.g. delete commit), we treat
+        // it as "no work" rather than reporting a hard error.
         Some(_) => return Ok(None),
         None => state.fold.plans.keys().cloned().collect(),
     };
 
     let mut views: Vec<PlanView> = Vec::with_capacity(plans.len());
     for key in &plans {
-        if let Some(view) = build_view(repo, &state, key).await? {
+        if let Some(view) = build_view(repo, state, key).await? {
             views.push(view);
         }
     }
@@ -159,10 +199,13 @@ async fn build_view(
 
 fn emit(items: &[WorkItem], json: bool) {
     if json {
-        for item in items {
-            let v = render_json(item);
-            println!("{}", serde_json::to_string(&v).expect("serialize WorkItem"));
-        }
+        let envelope = serde_json::json!({
+            "items": items.iter().map(render_json).collect::<Vec<_>>(),
+        });
+        println!(
+            "{}",
+            serde_json::to_string(&envelope).expect("serialize wfw envelope")
+        );
     } else {
         for item in items {
             println!("{}", render_human(item));
@@ -172,12 +215,18 @@ fn emit(items: &[WorkItem], json: bool) {
 
 fn render_json(item: &WorkItem) -> serde_json::Value {
     match item {
-        WorkItem::MasterAction { plan, sha, next } => serde_json::json!({
+        WorkItem::MasterAction {
+            plan,
+            sha,
+            next,
+            reason,
+        } => serde_json::json!({
             "kind": "master",
             "plan": plan.as_str(),
             "plan_path": format!(".clank/plans/{}.md", plan.as_str()),
             "sha": sha.as_str(),
             "next": next,
+            "reason": reason,
         }),
         WorkItem::ReviewerAction {
             plan,
@@ -195,11 +244,17 @@ fn render_json(item: &WorkItem) -> serde_json::Value {
 
 fn render_human(item: &WorkItem) -> String {
     match item {
-        WorkItem::MasterAction { plan, sha, next } => format!(
-            "master  {plan}  {sha}  next={next:?}",
+        WorkItem::MasterAction {
+            plan,
+            sha,
+            next,
+            reason,
+        } => format!(
+            "master  {plan}  {sha}  next={next:?}  reason={reason}",
             plan = plan.as_str(),
             sha = &sha.as_str()[..sha.as_str().len().min(7)],
-            next = next
+            next = next,
+            reason = reason,
         ),
         WorkItem::ReviewerAction {
             plan,
@@ -241,36 +296,65 @@ impl WatchContext {
     }
 
     fn attach(&self, watcher: &mut RecommendedWatcher) -> anyhow::Result<()> {
-        let mut watched: HashSet<PathBuf> = HashSet::new();
-        let mut try_watch = |path: PathBuf, mode: RecursiveMode| -> anyhow::Result<()> {
-            if !path.exists() {
-                return Ok(());
+        // `.clank/{plans,feedback,finished}` may not exist yet on a
+        // brand-new repo or before any reviewer has weighed in.
+        // `notify` refuses to watch a missing path, so create them
+        // first — they're Clank-managed dirs anyway. The git refs
+        // we tolerate as missing (e.g. `packed-refs` only appears
+        // after `git gc`).
+        for sub in [".clank/plans", ".clank/feedback", ".clank/finished"] {
+            let p = self.repo_root.join(sub);
+            if let Err(e) = std::fs::create_dir_all(&p) {
+                anyhow::bail!("ensure `{}` exists: {e}", p.display());
             }
-            if !watched.insert(path.clone()) {
-                return Ok(());
-            }
-            watcher
-                .watch(&path, mode)
-                .map_err(|e| anyhow::anyhow!("watch `{}` failed: {e}", path.display()))
-        };
+        }
 
-        try_watch(self.git_dir.join("HEAD"), RecursiveMode::NonRecursive)?;
+        let mut watched: HashSet<PathBuf> = HashSet::new();
+        let mut try_watch =
+            |path: PathBuf, mode: RecursiveMode, tolerate_missing: bool| -> anyhow::Result<()> {
+                if !path.exists() {
+                    if tolerate_missing {
+                        return Ok(());
+                    }
+                    anyhow::bail!("required watch path `{}` does not exist", path.display());
+                }
+                if !watched.insert(path.clone()) {
+                    return Ok(());
+                }
+                watcher
+                    .watch(&path, mode)
+                    .map_err(|e| anyhow::anyhow!("watch `{}` failed: {e}", path.display()))
+            };
+
+        try_watch(
+            self.git_dir.join("HEAD"),
+            RecursiveMode::NonRecursive,
+            false,
+        )?;
         try_watch(
             self.git_common_dir.join("refs"),
             RecursiveMode::Recursive,
+            false,
         )?;
         try_watch(
             self.git_common_dir.join("packed-refs"),
             RecursiveMode::NonRecursive,
+            true,
         )?;
-        try_watch(self.repo_root.join(".clank/plans"), RecursiveMode::Recursive)?;
+        try_watch(
+            self.repo_root.join(".clank/plans"),
+            RecursiveMode::Recursive,
+            false,
+        )?;
         try_watch(
             self.repo_root.join(".clank/feedback"),
             RecursiveMode::Recursive,
+            false,
         )?;
         try_watch(
             self.repo_root.join(".clank/finished"),
             RecursiveMode::Recursive,
+            false,
         )?;
         Ok(())
     }
@@ -291,26 +375,24 @@ fn git_resolve_dir(repo: &Path, flag: &str) -> anyhow::Result<PathBuf> {
     }
     let raw = String::from_utf8_lossy(&output.stdout).trim().to_string();
     let p = PathBuf::from(&raw);
-    let absolute = if p.is_absolute() {
-        p
-    } else {
-        repo.join(p)
-    };
+    let absolute = if p.is_absolute() { p } else { repo.join(p) };
     Ok(dunce::canonicalize(&absolute).unwrap_or(absolute))
 }
 
 fn build_watcher(tx: mpsc::Sender<()>) -> anyhow::Result<RecommendedWatcher> {
-    Ok(notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
-        if let Ok(event) = res {
-            if !matches!(
-                event.kind,
-                EventKind::Create(_) | EventKind::Modify(_) | EventKind::Remove(_)
-            ) {
-                return;
+    Ok(notify::recommended_watcher(
+        move |res: notify::Result<notify::Event>| {
+            if let Ok(event) = res {
+                if !matches!(
+                    event.kind,
+                    EventKind::Create(_) | EventKind::Modify(_) | EventKind::Remove(_)
+                ) {
+                    return;
+                }
+                let _ = tx.send(());
             }
-            let _ = tx.send(());
-        }
-    })?)
+        },
+    )?)
 }
 
 fn parse_timeout(raw: &str) -> anyhow::Result<Option<Duration>> {
@@ -328,8 +410,12 @@ fn parse_timeout(raw: &str) -> anyhow::Result<Option<Duration>> {
         .map_err(|_| anyhow::anyhow!("invalid --timeout `{raw}` (expected e.g. 30s, 5m, 1h)"))?;
     let secs = match unit {
         "" | "s" => n,
-        "m" => n.checked_mul(60).ok_or_else(|| anyhow::anyhow!("timeout overflow"))?,
-        "h" => n.checked_mul(3600).ok_or_else(|| anyhow::anyhow!("timeout overflow"))?,
+        "m" => n
+            .checked_mul(60)
+            .ok_or_else(|| anyhow::anyhow!("timeout overflow"))?,
+        "h" => n
+            .checked_mul(3600)
+            .ok_or_else(|| anyhow::anyhow!("timeout overflow"))?,
         other => anyhow::bail!("invalid --timeout unit `{other}` (use s, m, or h)"),
     };
     Ok(Some(Duration::from_secs(secs)))
@@ -350,7 +436,10 @@ mod tests {
         assert_eq!(parse_timeout("30s").unwrap(), Some(Duration::from_secs(30)));
         assert_eq!(parse_timeout("30").unwrap(), Some(Duration::from_secs(30)));
         assert_eq!(parse_timeout("5m").unwrap(), Some(Duration::from_secs(300)));
-        assert_eq!(parse_timeout("1h").unwrap(), Some(Duration::from_secs(3600)));
+        assert_eq!(
+            parse_timeout("1h").unwrap(),
+            Some(Duration::from_secs(3600))
+        );
     }
 
     #[test]

@@ -85,10 +85,17 @@ fn candidate_summary(state: &RepoState, basename: &str) -> String {
     }
 }
 
-/// Parse a plan-arg in any of the three accepted shapes:
-/// bare `<stem>`, `<stem>.md`, or `<basename>/<stem>.md`. Returns
-/// the bare stem; rejects a mismatched basename.
+/// Parse a plan-arg in any of the accepted shapes: bare `<stem>`,
+/// `<stem>.md`, the repo-relative `.clank/plans/<stem>.md`, or the
+/// full `<basename>/<stem>.md`. Returns the bare stem; rejects a
+/// mismatched basename or a path outside `.clank/plans/`.
 pub fn parse_arg(raw: &str, expected_basename: &str) -> anyhow::Result<String> {
+    if let Some(rest) = raw.strip_prefix(".clank/plans/") {
+        if rest.contains('/') {
+            anyhow::bail!("plan path `{raw}` must not contain nested directories");
+        }
+        return Ok(rest.trim_end_matches(".md").to_string());
+    }
     if let Some((basename, rest)) = raw.split_once('/') {
         if basename != expected_basename {
             anyhow::bail!(
@@ -124,5 +131,15 @@ mod tests {
     fn rejects_basename_mismatch() {
         let err = parse_arg("other/foo.md", "myrepo").unwrap_err();
         assert!(err.to_string().contains("names repo `other`"));
+    }
+
+    #[test]
+    fn parses_repo_relative_plan_path() {
+        assert_eq!(parse_arg(".clank/plans/foo.md", "myrepo").unwrap(), "foo");
+    }
+
+    #[test]
+    fn rejects_nested_under_clank_plans() {
+        assert!(parse_arg(".clank/plans/team/foo.md", "myrepo").is_err());
     }
 }

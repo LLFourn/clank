@@ -204,10 +204,14 @@ fn print_human(
     for v in views {
         println!();
         println!("plan: {}", v.plan.as_str());
-        println!("  latest reviewable: {}", short_sha(v.latest_reviewable_sha.as_str()));
+        println!(
+            "  latest reviewable: {}",
+            short_sha(v.latest_reviewable_sha.as_str())
+        );
         println!("  gate:              {}", v.gate_state);
-        println!("  worktree:          {}", v.worktree_status);
-        println!("  waiting on:        {}", render_waiting(&v.waiting_on));
+        println!("  plan file:         {}", v.worktree_status);
+        println!("  waiting on:        {}", waiting_actor(&v.waiting_on));
+        println!("  reason:            {}", waiting_reason(&v.waiting_on));
     }
 
     if !state.fold.finished_plans.is_empty() {
@@ -223,28 +227,58 @@ fn print_human(
     }
 }
 
-fn render_waiting(w: &WaitingOn) -> String {
+/// Short actor label: WHO holds the next move.
+fn waiting_actor(w: &WaitingOn) -> String {
     match w {
-        WaitingOn::FirstReview => "first review (any reviewer)".into(),
+        WaitingOn::FirstReview => "any reviewer".into(),
+        WaitingOn::ReviewerApprovalsMissing { missing } => missing
+            .iter()
+            .map(|a| a.as_str())
+            .collect::<Vec<_>>()
+            .join(", "),
+        WaitingOn::MasterToRevise { .. }
+        | WaitingOn::MasterToFinalize
+        | WaitingOn::MasterToCommit => "master".into(),
+    }
+}
+
+/// Explanation: WHY the actor is on the hook.
+fn waiting_reason(w: &WaitingOn) -> String {
+    match w {
+        WaitingOn::FirstReview => "no reviewer has weighed in yet".into(),
         WaitingOn::ReviewerApprovalsMissing { missing } => {
-            let names: Vec<&str> = missing.iter().map(|a| a.as_str()).collect();
-            format!("reviewer approvals from {}", names.join(", "))
+            let names = missing
+                .iter()
+                .map(|a| a.as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("missing approval from {names}")
         }
         WaitingOn::MasterToRevise {
             requesters,
             ambiguous,
         } => {
-            let mut who = Vec::new();
-            for r in requesters {
-                who.push(r.as_str());
+            let mut parts = Vec::new();
+            if !requesters.is_empty() {
+                let n = requesters
+                    .iter()
+                    .map(|a| a.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                parts.push(format!("changes requested by {n}"));
             }
-            for a in ambiguous {
-                who.push(a.as_str());
+            if !ambiguous.is_empty() {
+                let n = ambiguous
+                    .iter()
+                    .map(|a| a.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                parts.push(format!("ambiguous verdict from {n}"));
             }
-            format!("master to address {}", who.join(", "))
+            parts.join("; ")
         }
-        WaitingOn::MasterToFinalize => "master to run `clank finish`".into(),
-        WaitingOn::MasterToCommit => "master to commit the next revision".into(),
+        WaitingOn::MasterToFinalize => "gate approved — run `clank finish`".into(),
+        WaitingOn::MasterToCommit => "gate approved but plan file dirty".into(),
     }
 }
 

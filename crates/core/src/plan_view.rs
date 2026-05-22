@@ -73,15 +73,9 @@ pub fn project(
         .rev()
         .find(|e| e.touched_plan || e.touched_code)?;
 
-    let last_activity_ts = ps
-        .commits
-        .iter()
-        .map(|e| e.ts)
-        .max()
-        .unwrap_or(latest.ts);
+    let last_activity_ts = ps.commits.iter().map(|e| e.ts).max().unwrap_or(latest.ts);
 
-    let (gate_state, waiting_on) =
-        evaluate(feedback, &latest.sha, worktree.status);
+    let (gate_state, waiting_on) = evaluate(feedback, &latest.sha, worktree.status);
 
     Some(PlanView {
         plan: plan_key.clone(),
@@ -101,7 +95,9 @@ fn evaluate(
     worktree: PlanWorktreeStatus,
 ) -> (CommitGateState, WaitingOn) {
     let mut participants: Vec<AgentLabel> = Vec::new();
-    let mut target_entries: Option<&std::collections::BTreeMap<AgentLabel, crate::feedback_view::FeedbackEntry>> = None;
+    let mut target_entries: Option<
+        &std::collections::BTreeMap<AgentLabel, crate::feedback_view::FeedbackEntry>,
+    > = None;
 
     for commit in &feedback.per_commit {
         for author in commit.entries.keys() {
@@ -156,7 +152,9 @@ fn evaluate(
         CommitGateState::Unreviewed => {
             let missing_nev = NonEmptyVec::new(missing)
                 .expect("missing non-empty: participants exist and at least one hasn't voted");
-            WaitingOn::ReviewerApprovalsMissing { missing: missing_nev }
+            WaitingOn::ReviewerApprovalsMissing {
+                missing: missing_nev,
+            }
         }
     };
 
@@ -227,10 +225,7 @@ mod tests {
         // alice reviewed the second. bob is missing on the latest.
         let s = state_with_one_plan(
             &key,
-            vec![
-                evt("1111", 1, true, false),
-                evt("2222", 2, false, true),
-            ],
+            vec![evt("1111", 1, true, false), evt("2222", 2, false, true)],
         );
         let mut alice1 = BTreeMap::new();
         alice1.insert(label("alice"), entry(Verdict::Approve));
@@ -365,7 +360,10 @@ mod tests {
         )
         .unwrap();
         match view.waiting_on {
-            WaitingOn::MasterToRevise { requesters, ambiguous } => {
+            WaitingOn::MasterToRevise {
+                requesters,
+                ambiguous,
+            } => {
                 assert!(requesters.is_empty());
                 assert_eq!(ambiguous, vec![label("alice")]);
             }

@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::ids::{AgentLabel, CommitSha, PlanKey};
 use crate::plan_view::{PlanView, WaitingOn};
+use crate::vocab::WaitingReason;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -33,11 +34,14 @@ pub enum MasterNext {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum WorkItem {
-    /// Plan owner has the next move.
+    /// Plan owner has the next move. `reason` carries the
+    /// projection's vocabulary so callers can show why master was
+    /// woken without inferring it from `next`.
     MasterAction {
         plan: PlanKey,
         sha: CommitSha,
         next: MasterNext,
+        reason: WaitingReason,
     },
     /// Reviewer has a commit to look at; `feedback_path` is where
     /// to write the verdict.
@@ -48,34 +52,30 @@ pub enum WorkItem {
     },
 }
 
-pub fn derive_work(
-    views: &[PlanView],
-    author: &AgentLabel,
-    role: Role,
-) -> Vec<WorkItem> {
+pub fn derive_work(views: &[PlanView], author: &AgentLabel, role: Role) -> Vec<WorkItem> {
     let mut out = Vec::new();
     for view in views {
         match (role, &view.waiting_on) {
             (Role::Master, WaitingOn::MasterToRevise { .. }) => {
-                out.push(WorkItem::MasterAction {
-                    plan: view.plan.clone(),
-                    sha: view.latest_reviewable_sha.clone(),
-                    next: MasterNext::Revise,
-                });
+                out.push(master(
+                    view,
+                    MasterNext::Revise,
+                    WaitingReason::AddressCommitChanges,
+                ));
             }
             (Role::Master, WaitingOn::MasterToCommit) => {
-                out.push(WorkItem::MasterAction {
-                    plan: view.plan.clone(),
-                    sha: view.latest_reviewable_sha.clone(),
-                    next: MasterNext::Commit,
-                });
+                out.push(master(
+                    view,
+                    MasterNext::Commit,
+                    WaitingReason::CommitPlanRevision,
+                ));
             }
             (Role::Master, WaitingOn::MasterToFinalize) => {
-                out.push(WorkItem::MasterAction {
-                    plan: view.plan.clone(),
-                    sha: view.latest_reviewable_sha.clone(),
-                    next: MasterNext::Finalize,
-                });
+                out.push(master(
+                    view,
+                    MasterNext::Finalize,
+                    WaitingReason::ReadyToStartImplementation,
+                ));
             }
             (Role::Reviewers, WaitingOn::FirstReview) => {
                 out.push(reviewer_item(view, author));
@@ -89,6 +89,15 @@ pub fn derive_work(
         }
     }
     out
+}
+
+fn master(view: &PlanView, next: MasterNext, reason: WaitingReason) -> WorkItem {
+    WorkItem::MasterAction {
+        plan: view.plan.clone(),
+        sha: view.latest_reviewable_sha.clone(),
+        next,
+        reason,
+    }
 }
 
 fn reviewer_item(view: &PlanView, author: &AgentLabel) -> WorkItem {

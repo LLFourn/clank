@@ -65,7 +65,9 @@ pub async fn build_finish_preview(
     }
 
     let head = state.head.as_ref();
-    let worktree_status = read_worktree_facts(repo_root, &plan_path, head).await?.status;
+    let worktree_status = read_worktree_facts(repo_root, &plan_path, head)
+        .await?
+        .status;
 
     // Active plans need their file in the worktree to be eligible
     // for finalize. Finished plans are exempt.
@@ -533,7 +535,6 @@ fn compute_gate(
 
     Ok((state_enum, sealed_approvals))
 }
-
 
 // Drop unused — keep the FeedbackTarget import live so the parser
 // stays in the module graph.
