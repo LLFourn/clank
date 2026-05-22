@@ -58,29 +58,24 @@ Fixes share the same `WaitItem` redesign and projection update:
   watched.
 - **Implement vs finalize routing.** When the gate is `Approved`
   and the worktree is clean, the projection routes on the
-  latest reviewable commit's `touched_plan` flag — which aligns
-  with the existing `Posture` vocabulary (`PlanOnly | Mixed →
-  Planning`, `CodeOnly → Implementing`). Mixed semantics stay
-  exactly as they are today; this plan introduces no shift in
-  what `Posture` / `ReviewTargetPhase` mean:
-  - `touched_plan: true` (the approved commit was `PlanOnly` or
-    `Mixed`, i.e. `Posture::Planning`) →
+  latest reviewable commit's `touched_code` flag:
+  - `touched_code: false` (the approved commit didn't attribute
+    code to this plan — it was a plan-only revision) →
     `WaitingOn::MasterToImplement`. The plan was just settled;
     next move is to write code under the `[<stem>]` prefix.
-    Mixed commits route here even though they also touched code —
-    a plan revision in the same commit signals "still iterating
-    on the plan," so the master gets another implementation
-    cycle before finalize is suggested.
-  - `touched_code: true && touched_plan: false` (the approved
-    commit was `CodeOnly`, i.e. `Posture::Implementing`) →
-    `WaitingOn::MasterToFinalize`. Implementation has landed
-    cleanly with no concurrent plan revision; `clank finish` is
-    the next move.
-  This is the missing nuance behind `clank status` currently
-  saying "finalize" the moment a plan-only intro is approved.
-  The model stays consistent with `Posture` everywhere: no
-  surface says "implementing" while another says "planning" for
-  the same commit.
+  - `touched_code: true` (the approved commit attributed code
+    to this plan, whether or not it also revised the plan file)
+    → `WaitingOn::MasterToFinalize`. Implementation has landed
+    and been approved; `clank finish` is the next move.
+  The user can always ignore the finalize suggestion and commit
+  more code; it's a hint, not a gate. The existing
+  `Posture::from_commit_kind` / `ReviewTargetPhase` vocabulary
+  that classifies "both plan and code touched" as planning is
+  scheduled for removal in a separate plan, so this routing
+  doesn't try to thread the needle on that classification — it
+  reads the raw timeline flags directly. This is the missing
+  nuance behind `clank status` currently saying "finalize" the
+  moment a plan-only intro is approved.
 
 ## Types
 
@@ -317,17 +312,18 @@ ineligible). Add one new row:
 
 ### Core: `plan_view::evaluate` Approved routing
 
-Add three table rows to the existing `evaluate` test suite to
-cover all three reviewable `CommitKind`s under Approved+Clean:
+Add three table rows to the existing `evaluate` test suite,
+covering each combination of the boolean flags under
+Approved+Clean:
 
-- `PlanOnly` (`touched_plan: true, touched_code: false`),
+- `touched_plan: true, touched_code: false` (plan-only revision),
   Approved, Clean → `MasterToImplement`.
-- `Mixed` (`touched_plan: true, touched_code: true`), Approved,
-  Clean → `MasterToImplement`. Pins the Posture-aligned routing:
-  Mixed stays in the planning phase, so the master gets another
-  implementation cycle.
-- `CodeOnly` (`touched_plan: false, touched_code: true`),
-  Approved, Clean → `MasterToFinalize`.
+- `touched_plan: true, touched_code: true` (revision + code in
+  one commit), Approved, Clean → `MasterToFinalize`. Code
+  attribution wins — once code lands and is approved, finalize
+  is on the table.
+- `touched_plan: false, touched_code: true` (pure impl
+  attribution), Approved, Clean → `MasterToFinalize`.
 
 Keep the existing `MasterToCommit` (BodyDirty) and
 `MasterToRevise` (ChangesRequested) rows unchanged.
