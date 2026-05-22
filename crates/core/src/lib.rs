@@ -24,8 +24,10 @@
 //! - [`plan_view`] — per-plan projection: `gate_state`,
 //!   `WaitingOn`, `worktree_status`. The single source of truth
 //!   `status` and `wfw` both project from.
-//! - [`work`] — agent-perspective filter (`derive_work`) over
-//!   `[PlanView]`. Consumed by `wfw`; not by `status`.
+//! - [`wait`] — agent-perspective wait surface for `clank wfw`:
+//!   the flat tagged `WaitItem` enum (`Master` / `Reviewer` /
+//!   `Finished`), `derive_work`, and `detect_finished`. Consumed
+//!   by `wfw`; not by `status`.
 //! - [`api`] — wire-shape response DTOs (`FinishPreviewResponse`,
 //!   `RewritePreviewResponse`, …) produced by the CLI's preview
 //!   builders.
@@ -41,7 +43,7 @@ pub mod model;
 pub mod plan_view;
 pub mod repo_state;
 pub mod vocab;
-pub mod work;
+pub mod wait;
 
 // Re-export the closed-vocab enums at crate root for ergonomic
 // imports (`use clank_core::Verdict;`).

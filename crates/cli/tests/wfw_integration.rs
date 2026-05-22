@@ -309,6 +309,370 @@ fn wfw_wakes_inside_linked_worktree_when_its_ref_moves() {
     );
 }
 
+/// Run the `clank` binary (the one this test crate built) against a
+/// repo as a one-shot subcommand. Returns stdout. Panics on non-zero
+/// exit so tests fail loudly when `finish`/`init` etc. break.
+fn clank_run(repo: &Path, args: &[&str]) -> String {
+    let output = Command::new(clank_bin())
+        .args(args)
+        .arg("--repo")
+        .arg(repo)
+        .output()
+        .expect("spawn clank");
+    if !output.status.success() {
+        panic!(
+            "clank {args:?} failed (exit={:?}): stdout=`{}` stderr=`{}`",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    String::from_utf8_lossy(&output.stdout).to_string()
+}
+
+#[test]
+fn wfw_master_plan_only_approval_routes_to_implement() {
+    // Plan-only intro is approved → master should be told to
+    // implement, not finalize. Regression for the projection bug
+    // where Approved+Clean always routed to MasterToFinalize.
+    let dir = init_repo();
+    let repo = dir.path();
+    write(repo, ".clank/plans/foo.md", "# foo\n");
+    commit(repo, "[foo] intro");
+    let intro_sha = head_sha(repo);
+
+    write(
+        repo,
+        &format!(".clank/feedback/foo/{intro_sha}/alice.md"),
+        "APPROVE\n\nlgtm\n",
+    );
+
+    let output = Command::new(clank_bin())
+        .args([
+            "wfw",
+            "--author",
+            "lloyd",
+            "--role",
+            "master",
+            "--timeout",
+            "3s",
+        ])
+        .arg("--repo")
+        .arg(repo)
+        .output()
+        .expect("spawn");
+    assert!(output.status.success(), "wfw exit={:?}", output.status);
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    assert!(
+        stdout.contains("next=Implement")
+            && stdout.contains("reason=ready_to_start_implementation"),
+        "expected Implement routing; got stdout=`{stdout}`"
+    );
+    assert!(
+        !stdout.contains("next=Finalize"),
+        "Finalize must NOT appear for plan-only approval; got stdout=`{stdout}`"
+    );
+}
+
+#[test]
+fn wfw_master_code_only_approval_routes_to_finalize() {
+    let dir = init_repo();
+    let repo = dir.path();
+    write(repo, ".clank/plans/foo.md", "# foo\n");
+    commit(repo, "[foo] intro");
+    let intro_sha = head_sha(repo);
+
+    write(
+        repo,
+        &format!(".clank/feedback/foo/{intro_sha}/alice.md"),
+        "APPROVE\n\nplan lgtm\n",
+    );
+
+    // Now an impl commit, then alice approves it.
+    write(repo, "src/lib.rs", "// impl\n");
+    commit(repo, "[foo] impl");
+    let impl_sha = head_sha(repo);
+
+    write(
+        repo,
+        &format!(".clank/feedback/foo/{impl_sha}/alice.md"),
+        "APPROVE\n\nimpl lgtm\n",
+    );
+
+    let output = Command::new(clank_bin())
+        .args([
+            "wfw",
+            "--author",
+            "lloyd",
+            "--role",
+            "master",
+            "--timeout",
+            "3s",
+        ])
+        .arg("--repo")
+        .arg(repo)
+        .output()
+        .expect("spawn");
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    assert!(
+        stdout.contains("next=Finalize") && stdout.contains("reason=ready_to_finalize"),
+        "expected Finalize routing for code-attributed approval; got stdout=`{stdout}`"
+    );
+}
+
+#[test]
+fn wfw_reviewer_finish_wake_human_output() {
+    let dir = init_repo();
+    let repo = dir.path();
+    write(repo, ".clank/plans/foo.md", "# foo\n");
+    commit(repo, "[foo] intro");
+    let intro_sha = head_sha(repo);
+
+    write(
+        repo,
+        &format!(".clank/feedback/foo/{intro_sha}/alice.md"),
+        "APPROVE\n\nlgtm\n",
+    );
+
+    // Park as alice (no reviewer work, gate already approved).
+    let mut child = spawn_wfw(
+        repo,
+        &[
+            "--author",
+            "alice",
+            "--role",
+            "reviewers",
+            "--timeout",
+            "30s",
+        ],
+    );
+
+    // Finalize the plan from outside.
+    clank_run(repo, &["finish", "foo"]);
+
+    let exit = wait_for_exit(&mut child, Duration::from_secs(20));
+    let stdout = read_stdout_to_end(&mut child);
+    let stderr = read_stderr_to_end(&mut child);
+    assert!(
+        exit.success(),
+        "wfw exit={exit:?} stdout=`{stdout}` stderr=`{stderr}`"
+    );
+    assert!(
+        stdout.contains("finished") && stdout.contains("foo"),
+        "expected finished notice for foo; got stdout=`{stdout}`"
+    );
+}
+
+#[test]
+fn wfw_reviewer_finish_wake_json_output() {
+    let dir = init_repo();
+    let repo = dir.path();
+    write(repo, ".clank/plans/foo.md", "# foo\n");
+    commit(repo, "[foo] intro");
+    let intro_sha = head_sha(repo);
+    write(
+        repo,
+        &format!(".clank/feedback/foo/{intro_sha}/alice.md"),
+        "APPROVE\n\nlgtm\n",
+    );
+
+    let mut child = spawn_wfw(
+        repo,
+        &[
+            "--author",
+            "alice",
+            "--role",
+            "reviewers",
+            "--timeout",
+            "30s",
+            "-j",
+        ],
+    );
+
+    clank_run(repo, &["finish", "foo"]);
+    let final_sha = head_sha(repo);
+
+    let exit = wait_for_exit(&mut child, Duration::from_secs(20));
+    let stdout = read_stdout_to_end(&mut child);
+    let stderr = read_stderr_to_end(&mut child);
+    assert!(
+        exit.success(),
+        "wfw exit={exit:?} stdout=`{stdout}` stderr=`{stderr}`"
+    );
+    let v: serde_json::Value =
+        serde_json::from_str(stdout.trim()).expect("wfw -j stdout must be valid JSON");
+    let items = v["items"].as_array().expect("items array");
+    let finished = items
+        .iter()
+        .find(|i| i["kind"] == "finished")
+        .expect("at least one finished item");
+    assert_eq!(finished["plan"], "foo");
+    assert_eq!(finished["finalized_at"], final_sha);
+}
+
+#[test]
+fn wfw_plan_filter_finish_wake() {
+    // Same as reviewer-finish-wake but with --plan, exercising the
+    // snapshot path that previously returned Ok(None) when the
+    // filtered plan disappeared.
+    let dir = init_repo();
+    let repo = dir.path();
+    write(repo, ".clank/plans/foo.md", "# foo\n");
+    commit(repo, "[foo] intro");
+    let intro_sha = head_sha(repo);
+    write(
+        repo,
+        &format!(".clank/feedback/foo/{intro_sha}/alice.md"),
+        "APPROVE\n",
+    );
+
+    let mut child = spawn_wfw(
+        repo,
+        &[
+            "--author",
+            "alice",
+            "--role",
+            "reviewers",
+            "--plan",
+            "foo",
+            "--timeout",
+            "30s",
+        ],
+    );
+
+    clank_run(repo, &["finish", "foo"]);
+
+    let exit = wait_for_exit(&mut child, Duration::from_secs(20));
+    let stdout = read_stdout_to_end(&mut child);
+    let stderr = read_stderr_to_end(&mut child);
+    assert!(
+        exit.success(),
+        "wfw exit={exit:?} stdout=`{stdout}` stderr=`{stderr}`"
+    );
+    assert!(
+        stdout.contains("finished"),
+        "expected finished notice for filtered plan; got stdout=`{stdout}`"
+    );
+}
+
+#[test]
+fn wfw_mixed_work_and_finished_on_one_wake() {
+    // Two active plans `a` and `b`. Alice has approved both
+    // intros. Park wfw, then in quick succession (a) land a new
+    // reviewable commit on `a` and (b) finalize `b`. The next
+    // refold should emit BOTH a reviewer item for `a` and a
+    // finished item for `b` — not just one of them.
+    let dir = init_repo();
+    let repo = dir.path();
+    write(repo, ".clank/plans/a.md", "# a\n");
+    commit(repo, "[a] intro");
+    let a_intro = head_sha(repo);
+    write(repo, ".clank/plans/b.md", "# b\n");
+    commit(repo, "[b] intro");
+    let b_intro = head_sha(repo);
+
+    write(
+        repo,
+        &format!(".clank/feedback/a/{a_intro}/alice.md"),
+        "APPROVE\n",
+    );
+    write(
+        repo,
+        &format!(".clank/feedback/b/{b_intro}/alice.md"),
+        "APPROVE\n",
+    );
+
+    let mut child = spawn_wfw(
+        repo,
+        &[
+            "--author",
+            "alice",
+            "--role",
+            "reviewers",
+            "--timeout",
+            "30s",
+            "-j",
+        ],
+    );
+
+    // Land a new reviewable commit on `a` AND finalize `b`.
+    write(repo, ".clank/plans/a.md", "# a v2\n");
+    commit(repo, "[a] revise");
+    clank_run(repo, &["finish", "b"]);
+
+    let exit = wait_for_exit(&mut child, Duration::from_secs(20));
+    let stdout = read_stdout_to_end(&mut child);
+    let stderr = read_stderr_to_end(&mut child);
+    assert!(
+        exit.success(),
+        "wfw exit={exit:?} stdout=`{stdout}` stderr=`{stderr}`"
+    );
+    let v: serde_json::Value =
+        serde_json::from_str(stdout.trim()).expect("wfw -j stdout must be valid JSON");
+    let items = v["items"].as_array().expect("items array");
+    let has_reviewer_for_a = items
+        .iter()
+        .any(|i| i["kind"] == "reviewer" && i["plan"] == "a");
+    let has_finished_for_b = items
+        .iter()
+        .any(|i| i["kind"] == "finished" && i["plan"] == "b");
+    assert!(
+        has_reviewer_for_a && has_finished_for_b,
+        "expected reviewer(a) AND finished(b) in same items[]; got stdout=`{stdout}`"
+    );
+}
+
+#[test]
+fn wfw_plan_already_finished_at_startup_emits_finished_and_exits() {
+    let dir = init_repo();
+    let repo = dir.path();
+    write(repo, ".clank/plans/foo.md", "# foo\n");
+    commit(repo, "[foo] intro");
+    let intro_sha = head_sha(repo);
+    write(
+        repo,
+        &format!(".clank/feedback/foo/{intro_sha}/alice.md"),
+        "APPROVE\n",
+    );
+    clank_run(repo, &["finish", "foo"]);
+    let final_sha = head_sha(repo);
+
+    // Plan is already finished; explicit --plan should emit a
+    // finished item and exit 0 within the short timeout, NOT block.
+    let output = Command::new(clank_bin())
+        .args([
+            "wfw",
+            "--author",
+            "alice",
+            "--role",
+            "reviewers",
+            "--plan",
+            "foo",
+            "--timeout",
+            "2s",
+            "-j",
+        ])
+        .arg("--repo")
+        .arg(repo)
+        .output()
+        .expect("spawn wfw");
+    assert!(
+        output.status.success(),
+        "wfw exit={:?} stderr=`{}`",
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let v: serde_json::Value =
+        serde_json::from_str(stdout.trim()).expect("wfw -j stdout must be valid JSON");
+    let items = v["items"].as_array().expect("items array");
+    assert_eq!(items.len(), 1, "expected exactly one item; got {stdout}");
+    assert_eq!(items[0]["kind"], "finished");
+    assert_eq!(items[0]["plan"], "foo");
+    assert_eq!(items[0]["finalized_at"], final_sha);
+}
+
 fn wait_for_exit(child: &mut std::process::Child, max: Duration) -> std::process::ExitStatus {
     let end = Instant::now() + max;
     loop {

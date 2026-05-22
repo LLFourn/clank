@@ -47,8 +47,12 @@ pub enum WaitingOn {
         requesters: Vec<AgentLabel>,
         ambiguous: Vec<AgentLabel>,
     },
-    /// Gate is approved and the plan worktree is clean — master
-    /// just needs to run `clank finish`.
+    /// Gate is approved on a plan-only commit (the approved
+    /// commit didn't attribute code to this plan). Next move is
+    /// the implementation under `[<stem>]`.
+    MasterToImplement,
+    /// Gate is approved on a code-touching commit and the plan
+    /// worktree is clean — master just needs to run `clank finish`.
     MasterToFinalize,
     /// Gate is approved but the plan file has uncommitted edits.
     /// Master needs to commit the next revision.
@@ -75,7 +79,8 @@ pub fn project(
 
     let last_activity_ts = ps.commits.iter().map(|e| e.ts).max().unwrap_or(latest.ts);
 
-    let (gate_state, waiting_on) = evaluate(feedback, &latest.sha, worktree.status);
+    let (gate_state, waiting_on) =
+        evaluate(feedback, &latest.sha, latest.touched_code, worktree.status);
 
     Some(PlanView {
         plan: plan_key.clone(),
@@ -88,10 +93,16 @@ pub fn project(
 }
 
 /// Compute `(gate_state, waiting_on)` from the cumulative
-/// participant set and the latest reviewable commit's verdicts.
+/// participant set, the latest reviewable commit's verdicts, and
+/// the boolean flags that say what kind of change that commit was.
+/// `latest_touched_code = true` means the approved commit
+/// attributed code to this plan; that routes Approved+Clean to
+/// `MasterToFinalize`. Otherwise (the approved commit only touched
+/// the plan file) the route is `MasterToImplement`.
 fn evaluate(
     feedback: &FeedbackView,
     target_sha: &CommitSha,
+    latest_touched_code: bool,
     worktree: PlanWorktreeStatus,
 ) -> (CommitGateState, WaitingOn) {
     let mut participants: Vec<AgentLabel> = Vec::new();
@@ -146,7 +157,11 @@ fn evaluate(
         CommitGateState::Approved => match worktree {
             PlanWorktreeStatus::BodyDirty => WaitingOn::MasterToCommit,
             PlanWorktreeStatus::Clean | PlanWorktreeStatus::PlanFileMissing => {
-                WaitingOn::MasterToFinalize
+                if latest_touched_code {
+                    WaitingOn::MasterToFinalize
+                } else {
+                    WaitingOn::MasterToImplement
+                }
             }
         },
         CommitGateState::Unreviewed => {
@@ -289,7 +304,7 @@ mod tests {
     }
 
     #[test]
-    fn master_to_finalize_when_approved_and_clean() {
+    fn approved_plan_only_routes_to_master_to_implement() {
         let key = plan("foo");
         let s = state_with_one_plan(&key, vec![evt("1111", 1, true, false)]);
         let mut entries = BTreeMap::new();
@@ -310,6 +325,74 @@ mod tests {
         )
         .unwrap();
         assert_eq!(view.gate_state, CommitGateState::Approved);
+        assert!(matches!(view.waiting_on, WaitingOn::MasterToImplement));
+    }
+
+    #[test]
+    fn approved_code_only_routes_to_master_to_finalize() {
+        let key = plan("foo");
+        let s = state_with_one_plan(
+            &key,
+            vec![
+                evt("1111", 1, true, false), // plan intro
+                evt("2222", 2, false, true), // pure impl commit
+            ],
+        );
+        let mut entries = BTreeMap::new();
+        entries.insert(label("alice"), entry(Verdict::Approve));
+        let fb = FeedbackView {
+            per_commit: vec![
+                CommitFeedback {
+                    sha: sha("1111"),
+                    entries: {
+                        let mut m = BTreeMap::new();
+                        m.insert(label("alice"), entry(Verdict::Approve));
+                        m
+                    },
+                },
+                CommitFeedback {
+                    sha: sha("2222"),
+                    entries,
+                },
+            ],
+        };
+        let view = project(
+            &s,
+            &key,
+            &fb,
+            &WorktreeFacts {
+                status: PlanWorktreeStatus::Clean,
+            },
+        )
+        .unwrap();
+        assert_eq!(view.gate_state, CommitGateState::Approved);
+        assert!(matches!(view.waiting_on, WaitingOn::MasterToFinalize));
+    }
+
+    #[test]
+    fn approved_mixed_commit_routes_to_master_to_finalize() {
+        // Mixed commit (touched_plan + touched_code). Code
+        // attribution wins — once code is approved, finalize is
+        // on the table.
+        let key = plan("foo");
+        let s = state_with_one_plan(&key, vec![evt("1111", 1, true, true)]);
+        let mut entries = BTreeMap::new();
+        entries.insert(label("alice"), entry(Verdict::Approve));
+        let fb = FeedbackView {
+            per_commit: vec![CommitFeedback {
+                sha: sha("1111"),
+                entries,
+            }],
+        };
+        let view = project(
+            &s,
+            &key,
+            &fb,
+            &WorktreeFacts {
+                status: PlanWorktreeStatus::Clean,
+            },
+        )
+        .unwrap();
         assert!(matches!(view.waiting_on, WaitingOn::MasterToFinalize));
     }
 

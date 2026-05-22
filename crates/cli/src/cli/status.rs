@@ -237,6 +237,7 @@ fn waiting_actor(w: &WaitingOn) -> String {
             .collect::<Vec<_>>()
             .join(", "),
         WaitingOn::MasterToRevise { .. }
+        | WaitingOn::MasterToImplement
         | WaitingOn::MasterToFinalize
         | WaitingOn::MasterToCommit => "master".into(),
     }
@@ -276,6 +277,9 @@ fn waiting_reason(w: &WaitingOn) -> String {
                 parts.push(format!("ambiguous verdict from {n}"));
             }
             parts.join("; ")
+        }
+        WaitingOn::MasterToImplement => {
+            "gate approved — start implementation under [<stem>]".into()
         }
         WaitingOn::MasterToFinalize => "gate approved — run `clank finish`".into(),
         WaitingOn::MasterToCommit => "gate approved but plan file dirty".into(),

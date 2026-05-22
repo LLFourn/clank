@@ -84,11 +84,11 @@ pub enum WfwRole {
     Reviewers,
 }
 
-impl From<WfwRole> for clank_core::work::Role {
+impl From<WfwRole> for clank_core::wait::Role {
     fn from(r: WfwRole) -> Self {
         match r {
-            WfwRole::Master => clank_core::work::Role::Master,
-            WfwRole::Reviewers => clank_core::work::Role::Reviewers,
+            WfwRole::Master => clank_core::wait::Role::Master,
+            WfwRole::Reviewers => clank_core::wait::Role::Reviewers,
         }
     }
 }

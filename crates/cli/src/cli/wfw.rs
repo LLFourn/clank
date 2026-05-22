@@ -1,16 +1,21 @@
-//! `clank wfw` — block until the calling agent has work to do.
+//! `clank wfw` — block until the calling agent has wait-surface
+//! items to print.
 //!
-//! Two roles. `--role master` watches for plans where the gate has
-//! moved on without master (ChangesRequested, Approved, or
-//! Approved+dirty). `--role reviewers` watches for plans whose
-//! latest reviewable commit needs an opinion from `--author`.
+//! Two roles. `--role master` watches for plans where the gate
+//! has moved on without master. `--role reviewers` watches for
+//! plans whose latest reviewable commit needs an opinion from
+//! `--author`. Both also receive `Finished` notices when a
+//! watched plan transitions into `finished_plans` — wfw's exit
+//! is positive in either case.
 //!
-//! `wfw` runs the same projection `clank status` does, then filters
-//! it through `clank_core::work::derive_work` for the agent's
-//! perspective. When the initial fold finds work it prints it and
-//! exits; otherwise it watches the filesystem for changes that
-//! could plausibly flip the projection and refolds on each
-//! debounced event.
+//! `wfw` runs the same projection `clank status` does, then
+//! filters it through `clank_core::wait::derive_work` for the
+//! agent's perspective, then concatenates any
+//! `detect_finished` notices from a startup snapshot. When the
+//! initial fold finds at least one item it prints it and exits;
+//! otherwise it watches the filesystem for changes that could
+//! plausibly flip the projection and refolds on each debounced
+//! event.
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -26,7 +31,7 @@ use crate::lifecycle::{AgentLabel, CommitSha, PlanKey};
 use crate::repo_state::RepoState;
 use crate::worktree_facts::read_worktree_facts;
 use clank_core::plan_view::{PlanView, project};
-use clank_core::work::{Role, WorkItem, derive_work};
+use clank_core::wait::{Role, StartupSnapshot, WaitItem, derive_work, detect_finished};
 
 /// Exit code returned when `--timeout` elapses without producing
 /// any work. The rest of the CLI uses anyhow for normal errors;
@@ -65,19 +70,47 @@ pub async fn run(args: WfwArgs) -> anyhow::Result<()> {
             let stem = parse_arg(raw, &basename)?;
             let key = PlanKey::parse(&stem)
                 .map_err(|e| anyhow::anyhow!("invalid plan stem `{stem}`: {e}"))?;
-            if !initial_state.fold.plans.contains_key(&key) {
+            let is_active = initial_state.fold.plans.contains_key(&key);
+            let finished_at = initial_state
+                .fold
+                .finished_plans
+                .iter()
+                .rev()
+                .find(|fp| fp.plan == key)
+                .map(|fp| fp.finalized_at.clone());
+            if !is_active && finished_at.is_none() {
                 anyhow::bail!(
                     "plan `{basename}/{stem}.md` not active. active: {}",
                     active_summary(&initial_state, &basename)
                 );
+            }
+            if !is_active {
+                // Already-finished plan and explicit `--plan`: emit
+                // a one-shot Finished notice and exit. No watch loop.
+                // This is the "agent resumed with stale state" path.
+                let item = WaitItem::Finished {
+                    plan: key.clone(),
+                    finalized_at: finished_at.expect("checked just above"),
+                };
+                emit(&[item], args.json);
+                return Ok(());
             }
             Some(key)
         }
         None => None,
     };
 
-    if let Some(items) =
-        derive_from_state(&repo, &initial_state, &plan_filter, &author, role).await?
+    let snapshot = StartupSnapshot::capture(&initial_state.fold, plan_filter.as_ref());
+
+    if let Some(items) = derive_from_state(
+        &repo,
+        &initial_state,
+        &plan_filter,
+        &snapshot,
+        &author,
+        role,
+    )
+    .await?
     {
         emit(&items, args.json);
         return Ok(());
@@ -112,7 +145,9 @@ pub async fn run(args: WfwArgs) -> anyhow::Result<()> {
         let _ = event;
         // Debounce: drain bursts so one logical change → one refold.
         while rx.recv_timeout(Duration::from_millis(200)).is_ok() {}
-        if let Some(items) = check_once(&repo, policy, &plan_filter, &author, role).await? {
+        if let Some(items) =
+            check_once(&repo, policy, &plan_filter, &snapshot, &author, role).await?
+        {
             emit(&items, args.json);
             return Ok(());
         }
@@ -137,28 +172,32 @@ async fn check_once(
     repo: &Path,
     policy: crate::rebuild::CachePolicy,
     plan_filter: &Option<PlanKey>,
+    snapshot: &StartupSnapshot,
     author: &AgentLabel,
     role: Role,
-) -> anyhow::Result<Option<Vec<WorkItem>>> {
+) -> anyhow::Result<Option<Vec<WaitItem>>> {
     let state = crate::rebuild::rebuild_repo_with_policy(repo, policy)
         .await
         .map_err(|e| anyhow::anyhow!("failed to fold repo `{}`: {e}", repo.display()))?;
-    derive_from_state(repo, &state, plan_filter, author, role).await
+    derive_from_state(repo, &state, plan_filter, snapshot, author, role).await
 }
 
 async fn derive_from_state(
     repo: &Path,
     state: &RepoState,
     plan_filter: &Option<PlanKey>,
+    snapshot: &StartupSnapshot,
     author: &AgentLabel,
     role: Role,
-) -> anyhow::Result<Option<Vec<WorkItem>>> {
+) -> anyhow::Result<Option<Vec<WaitItem>>> {
+    // Plans to derive work over. With `--plan` and the plan still
+    // active, restrict to it. With `--plan` and the plan gone
+    // (finished or deleted mid-watch), skip the work derivation —
+    // `detect_finished` will still surface the finalize notice
+    // from the snapshot.
     let plans: Vec<PlanKey> = match plan_filter {
         Some(k) if state.fold.plans.contains_key(k) => vec![k.clone()],
-        // Caller validates the `--plan` arg at startup, so if the
-        // plan disappears mid-watch (e.g. delete commit), we treat
-        // it as "no work" rather than reporting a hard error.
-        Some(_) => return Ok(None),
+        Some(_) => Vec::new(),
         None => state.fold.plans.keys().cloned().collect(),
     };
 
@@ -168,7 +207,8 @@ async fn derive_from_state(
             views.push(view);
         }
     }
-    let items = derive_work(&views, author, role);
+    let mut items = derive_work(&views, author, role);
+    items.extend(detect_finished(snapshot, &state.fold));
     if items.is_empty() {
         Ok(None)
     } else {
@@ -197,7 +237,7 @@ async fn build_view(
     Ok(project(&state.fold, plan, &feedback, &worktree))
 }
 
-fn emit(items: &[WorkItem], json: bool) {
+fn emit(items: &[WaitItem], json: bool) {
     if json {
         let envelope = serde_json::json!({
             "items": items.iter().map(render_json).collect::<Vec<_>>(),
@@ -213,9 +253,13 @@ fn emit(items: &[WorkItem], json: bool) {
     }
 }
 
-fn render_json(item: &WorkItem) -> serde_json::Value {
+fn short(sha: &CommitSha) -> &str {
+    &sha.as_str()[..sha.as_str().len().min(7)]
+}
+
+fn render_json(item: &WaitItem) -> serde_json::Value {
     match item {
-        WorkItem::MasterAction {
+        WaitItem::Master {
             plan,
             sha,
             next,
@@ -228,7 +272,7 @@ fn render_json(item: &WorkItem) -> serde_json::Value {
             "next": next,
             "reason": reason,
         }),
-        WorkItem::ReviewerAction {
+        WaitItem::Reviewer {
             plan,
             sha,
             feedback_path,
@@ -239,32 +283,43 @@ fn render_json(item: &WorkItem) -> serde_json::Value {
             "sha": sha.as_str(),
             "feedback_path": feedback_path,
         }),
+        WaitItem::Finished { plan, finalized_at } => serde_json::json!({
+            "kind": "finished",
+            "plan": plan.as_str(),
+            "plan_path": format!(".clank/plans/{}.md", plan.as_str()),
+            "finalized_at": finalized_at.as_str(),
+        }),
     }
 }
 
-fn render_human(item: &WorkItem) -> String {
+fn render_human(item: &WaitItem) -> String {
     match item {
-        WorkItem::MasterAction {
+        WaitItem::Master {
             plan,
             sha,
             next,
             reason,
         } => format!(
-            "master  {plan}  {sha}  next={next:?}  reason={reason}",
+            "master   {plan}  {sha}  next={next:?}  reason={reason}",
             plan = plan.as_str(),
-            sha = &sha.as_str()[..sha.as_str().len().min(7)],
+            sha = short(sha),
             next = next,
             reason = reason,
         ),
-        WorkItem::ReviewerAction {
+        WaitItem::Reviewer {
             plan,
             sha,
             feedback_path,
         } => format!(
-            "review  {plan}  {sha}  write {feedback_path}",
+            "review   {plan}  {sha}  write {feedback_path}",
             plan = plan.as_str(),
-            sha = &sha.as_str()[..sha.as_str().len().min(7)],
+            sha = short(sha),
             feedback_path = feedback_path,
+        ),
+        WaitItem::Finished { plan, finalized_at } => format!(
+            "finished {plan}  {sha}",
+            plan = plan.as_str(),
+            sha = short(finalized_at),
         ),
     }
 }
