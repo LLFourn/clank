@@ -18,15 +18,5 @@ pub mod runtime;
 pub mod state_cache;
 
 // Operator CLI subcommands (init / finish / purge). Mutations
-// live here; the daemon stays read-only.
+// live here.
 pub mod cli;
-
-// The MCP stdio shim — forwards tool calls to the daemon's HTTP endpoint.
-pub mod mcp_shim;
-
-// The HTTP + MCP server backed by the filesystem-truth runtime.
-pub mod server;
-
-// Static tool catalog. The descriptor + catalog() function are used by
-// `mcp_shim` to answer `tools/list` without the daemon being up.
-pub mod tools;

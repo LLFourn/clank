@@ -1,5 +1,5 @@
 use clap::{Parser, Subcommand};
-use trinity::{cli, mcp_shim, server};
+use trinity::cli;
 
 #[derive(Parser)]
 #[command(
@@ -14,10 +14,6 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Run the Trinity daemon (HTTP UI + internal API + filesystem watcher).
-    Serve(server::ServeArgs),
-    /// stdio MCP server. Forwards tool calls to a running `trinity serve` daemon.
-    Mcp(mcp_shim::McpArgs),
     /// Scaffold `.trinity/` in a repo (creates `plans/` and `.gitignore`).
     Init(cli::InitArgs),
     /// Finalize an approved plan: seal the approving feedback into
@@ -25,8 +21,7 @@ enum Command {
     Finish(cli::FinishArgs),
     /// Strip a plan's `.trinity/` artifacts from history.
     Purge(cli::PurgeArgs),
-    /// Print the repo's Trinity state (HEAD, plans, phases) without
-    /// contacting the daemon.
+    /// Print the repo's Trinity state (HEAD, plans, phases).
     Status(cli::StatusArgs),
 }
 
@@ -35,8 +30,6 @@ async fn main() -> anyhow::Result<()> {
     init_tracing();
     let cli_args = Cli::parse();
     match cli_args.command {
-        Command::Serve(args) => server::serve(args).await,
-        Command::Mcp(args) => mcp_shim::run(args).await,
         Command::Init(args) => cli::init::run(args).await,
         Command::Finish(args) => cli::finish::run(args).await,
         Command::Purge(args) => cli::purge::run(args).await,
