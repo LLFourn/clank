@@ -6,11 +6,12 @@ use std::path::{Path, PathBuf};
 
 use tokio::process::Command;
 
-use crate::attribution::{CommitChanges, FinalizeChange, FinalizeChangeKind, PlanTouch};
 use crate::disk_format::{parse_feedback_path, parse_finalize_path};
-use crate::disk_snapshot::{CommitEvent, CommitSnapshot, FeedbackBlob};
+use crate::disk_snapshot::{
+    CommitChanges, CommitEvent, CommitSnapshot, FeedbackBlob, FinalizeChange, FinalizeChangeKind,
+    PlanTouch, PlanTouchKind,
+};
 use crate::lifecycle::{CommitSha, PlanKey};
-use crate::repo_state::PlanTouchKind;
 
 #[derive(Debug, thiserror::Error)]
 pub enum GitIoError {
@@ -212,6 +213,99 @@ pub async fn diff_two_blobs(
 
 pub async fn show_commit(repo: &Path, sha: &CommitSha) -> Result<String, GitIoError> {
     run_ok_raw(repo, &["show", "--no-color", sha.as_str()]).await
+}
+
+/// True iff the plan's finish predicate is satisfied at `tree`:
+/// `.trinity/finished/<plan>/` has ≥1 file AND every file's first
+/// line starts with `APPROVE`. Used by the stateless
+/// `newly_finished` computation in `disk_snapshot::enrich_with_newly_finished`.
+pub async fn finish_predicate_at(
+    repo: &Path,
+    tree: &CommitSha,
+    plan: &PlanKey,
+) -> Result<bool, GitIoError> {
+    let snapshot = read_finalize_snapshot(repo, tree, plan.as_str()).await?;
+    if snapshot.is_empty() {
+        return Ok(false);
+    }
+    Ok(snapshot.iter().all(|(_, body)| {
+        let first_line = body
+            .lines()
+            .map(str::trim_end)
+            .find(|l| !l.is_empty())
+            .unwrap_or("");
+        crate::disk_format::finalize_first_line_starts_with_approve(first_line)
+    }))
+}
+
+/// True iff `ancestor` is reachable from `head` along any parent
+/// chain. Used by Phase-2 incremental cache loading to find an
+/// ancestor cache to fold-forward from.
+pub async fn is_ancestor(
+    repo: &Path,
+    ancestor: &CommitSha,
+    head: &CommitSha,
+) -> Result<bool, GitIoError> {
+    let output = run(
+        repo,
+        &[
+            "merge-base",
+            "--is-ancestor",
+            ancestor.as_str(),
+            head.as_str(),
+        ],
+    )
+    .await?;
+    match output.status.code() {
+        Some(0) => Ok(true),
+        Some(1) => Ok(false),
+        _ => Err(GitIoError::NonZero {
+            context: format!("merge-base --is-ancestor {ancestor} {head}"),
+            code: output.status.code(),
+            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+        }),
+    }
+}
+
+/// First-parent commits between `base` (exclusive) and `tip`
+/// (inclusive), oldest-first.
+pub async fn first_parent_commits_between(
+    repo: &Path,
+    base: &CommitSha,
+    tip: &CommitSha,
+) -> Result<Vec<CommitMeta>, GitIoError> {
+    let range = format!("{}..{}", base.as_str(), tip.as_str());
+    let stdout = run_ok(
+        repo,
+        &[
+            "log",
+            "--first-parent",
+            "--reverse",
+            "--format=%H%x00%at%x00%s",
+            &range,
+        ],
+    )
+    .await?;
+    let mut out = Vec::new();
+    for line in stdout.lines() {
+        if line.is_empty() {
+            continue;
+        }
+        let mut parts = line.splitn(3, '\0');
+        let sha = parts.next().unwrap_or("").trim();
+        let ts = parts.next().unwrap_or("0").trim();
+        let subject = parts.next().unwrap_or("").to_string();
+        if sha.is_empty() {
+            continue;
+        }
+        let author_ts = ts.parse::<i64>().unwrap_or(0);
+        out.push(CommitMeta {
+            sha: parse_sha("first_parent_commits_between", sha)?,
+            author_ts,
+            subject,
+        });
+    }
+    Ok(out)
 }
 
 /// `git rev-parse <sha>^` — first parent of the given commit. Returns
@@ -513,16 +607,9 @@ pub async fn diff_tree_changes(repo: &Path, sha: &CommitSha) -> Result<CommitCha
             kind: FinalizeChangeKind::Upsert { first_line },
         });
     }
-    // Pre-fetch plan-file bodies for Add/Modify touches so the sans-IO
-    // fold has the body needed to populate `state.plans` and to
-    // capture body-at-freeze. The path-index pairing above stays
-    // aligned with `changes.plan_touches` because `parse_diff_tree`
-    // pushes plan_touches in stdout order and `plan_body_paths` is
-    // built from the same loop in that same order.
-    for (touch_idx, path) in parsed.plan_body_paths.into_iter() {
-        let body = show_blob(repo, sha, &path).await?;
-        changes.plan_touches[touch_idx].new_body = Some(body);
-    }
+    // Plan bodies are no longer carried on PlanTouch — fold doesn't
+    // need them. Drop pre-fetch.
+    let _ = parsed.plan_body_paths;
     Ok(changes)
 }
 
@@ -550,7 +637,7 @@ fn parse_diff_tree(stdout: &str) -> Result<ParsedDiffTree, GitIoError> {
     let mut has_non_plan_code_changes = false;
     let mut finalize_changes: Vec<FinalizeChange> = Vec::new();
     let mut finalize_upserts: Vec<FinalizeUpsertPath> = Vec::new();
-    let mut plan_body_paths: Vec<(usize, PathBuf)> = Vec::new();
+    let plan_body_paths: Vec<(usize, PathBuf)> = Vec::new();
     let mut trinity_paths: Vec<String> = Vec::new();
     let mut trinity_paths_touched: Vec<String> = Vec::new();
     let mut touched_trinity = false;
@@ -643,21 +730,17 @@ fn parse_diff_tree(stdout: &str) -> Result<ParsedDiffTree, GitIoError> {
                 // Cross-stem rename `git mv .trinity/plans/foo.md
                 // .trinity/plans/bar.md`. Model as two events: delete
                 // `foo` + intro `bar`. The fold then removes `foo`
-                // from state.plans (if not frozen) and creates `bar`.
+                // from state.fold.plans and creates `bar`.
                 plan_touches.push(PlanTouch {
-                    session: old_k.clone(),
+                    plan: old_k.clone(),
                     kind: PlanTouchKind::Revision,
                     new_path: None,
-                    new_body: None,
                 });
-                let touch_index = plan_touches.len();
                 plan_touches.push(PlanTouch {
-                    session: new_k.clone(),
+                    plan: new_k.clone(),
                     kind: PlanTouchKind::Intro,
                     new_path: Some(new_rel.clone()),
-                    new_body: None,
                 });
-                plan_body_paths.push((touch_index, new_rel.clone()));
             } else {
                 let plan_key = match new_key.or(old_key) {
                     Some(id) => id,
@@ -672,16 +755,11 @@ fn parse_diff_tree(stdout: &str) -> Result<ParsedDiffTree, GitIoError> {
                 } else {
                     Some(new_rel.clone())
                 };
-                let touch_index = plan_touches.len();
                 plan_touches.push(PlanTouch {
-                    session: plan_key,
+                    plan: plan_key,
                     kind,
                     new_path: new_path_for_touch,
-                    new_body: None,
                 });
-                if !is_deletion {
-                    plan_body_paths.push((touch_index, new_rel.clone()));
-                }
             }
         } else if new_finalize.is_some() || old_finalize.is_some() {
             // Finalize-snapshot file. A rename whose <stem>/<file> differs
@@ -789,6 +867,7 @@ pub async fn snapshot(repo_root: &Path) -> Result<CommitSnapshot, GitIoError> {
             author_ts: meta.author_ts,
             subject: meta.subject,
             changes,
+            newly_finished: std::collections::BTreeSet::new(),
         });
     }
 
@@ -940,7 +1019,7 @@ mod tests {
         let parsed = parse_diff_tree(stdout).unwrap();
         let changes = &parsed.changes;
         assert_eq!(changes.plan_touches.len(), 1);
-        assert_eq!(changes.plan_touches[0].session.as_str(), "foo");
+        assert_eq!(changes.plan_touches[0].plan.as_str(), "foo");
         assert!(matches!(changes.plan_touches[0].kind, PlanTouchKind::Intro));
         assert_eq!(
             changes.plan_touches[0].new_path.as_deref(),

@@ -1,17 +1,13 @@
 //! `trinity status` — read-only summary of the current repo's
-//! Trinity state. Fully local: folds the repo, projects via
-//! `responses::list_plans_response`, reads HEAD + branch + dirty
-//! state via `git`. No daemon.
+//! Trinity state. Fully local: folds the repo, projects locally,
+//! reads HEAD + branch + dirty state via `git`. No daemon.
 
 use std::path::Path;
 
-use super::{StatusArgs, repo_basename, resolve_repo};
-use trinity_core::api::{PlanRow, StatusResponse};
-use trinity_core::vocab::PlanLifecycle;
+use super::{StatusArgs, resolve_repo};
 
 pub async fn run(args: StatusArgs) -> anyhow::Result<()> {
     let repo = resolve_repo(args.repo.as_deref())?;
-    let basename = repo_basename(&repo)?;
     let policy = if args.no_cache {
         crate::rebuild::CachePolicy::Bypass
     } else {
@@ -20,172 +16,143 @@ pub async fn run(args: StatusArgs) -> anyhow::Result<()> {
     let state = crate::rebuild::rebuild_repo_with_policy(&repo, policy)
         .await
         .map_err(|e| anyhow::anyhow!("failed to fold repo `{}`: {e}", repo.display()))?;
-    let plans = crate::responses::list_plans_response(&state)?;
 
     let (current_branch, head_sha, head_subject) = head_info(&repo);
     let worktree_dirty = worktree_dirty(&repo)?;
 
-    let response = StatusResponse {
-        repo_root: repo.display().to_string(),
-        repo_basename: basename,
-        current_branch,
-        head_sha,
-        head_subject,
-        worktree_dirty,
-        plans,
-    };
-
     if args.json {
-        println!("{}", serde_json::to_string_pretty(&response)?);
+        let json = build_json(
+            &state,
+            &repo,
+            current_branch,
+            head_sha,
+            head_subject,
+            worktree_dirty,
+        );
+        println!("{}", serde_json::to_string_pretty(&json)?);
     } else {
-        render_human(&response);
+        print_human(
+            &state,
+            &repo,
+            current_branch.as_deref(),
+            head_sha.as_deref(),
+            worktree_dirty,
+        );
     }
     Ok(())
 }
 
-/// `symbolic-ref --short HEAD` failing means detached HEAD (or no
-/// commits yet) — that's a normal state we render as `(detached)`.
-/// `log -1` failing only happens in an empty repo, where `None`s
-/// are also a normal render. Genuine git invocation errors (binary
-/// missing, permission denied) are vanishingly rare for an
-/// already-resolved repo root and would surface as `None` here;
-/// `worktree_dirty` is the only signal where swallowing a real
-/// failure would be misleading, so it's `Result` below.
-fn head_info(repo: &Path) -> (Option<String>, Option<String>, Option<String>) {
-    let branch = std::process::Command::new("git")
-        .arg("-C")
-        .arg(repo)
-        .args(["symbolic-ref", "--short", "HEAD"])
-        .output()
-        .ok()
-        .filter(|o| o.status.success())
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-        .filter(|s| !s.is_empty());
+fn build_json(
+    state: &crate::repo_state::RepoState,
+    repo: &Path,
+    current_branch: Option<String>,
+    head_sha: Option<String>,
+    head_subject: Option<String>,
+    worktree_dirty: bool,
+) -> serde_json::Value {
+    let mut active = Vec::new();
+    let mut finished = Vec::new();
+    for key in state.fold.plans.keys() {
+        active.push(serde_json::json!({
+            "slug": key.as_str(),
+            "lifecycle": "active",
+            "current_path": format!(".trinity/plans/{}.md", key.as_str()),
+            "commit_count": state.fold.plans[key].commits.len(),
+        }));
+    }
+    for fp in &state.fold.finished_plans {
+        finished.push(serde_json::json!({
+            "slug": fp.plan.as_str(),
+            "lifecycle": "finished",
+            "intro": fp.intro.as_str(),
+            "finalized_at": fp.finalized_at.as_str(),
+        }));
+    }
+    serde_json::json!({
+        "repo_root": repo.display().to_string(),
+        "current_branch": current_branch,
+        "head_sha": head_sha,
+        "head_subject": head_subject,
+        "worktree_dirty": worktree_dirty,
+        "active_plans": active,
+        "finished_plans": finished,
+    })
+}
 
-    let log = std::process::Command::new("git")
-        .arg("-C")
-        .arg(repo)
-        .args(["log", "-1", "--format=%H%n%s"])
-        .output()
-        .ok();
-    let (sha, subject) = match log {
-        Some(o) if o.status.success() => {
-            let s = String::from_utf8_lossy(&o.stdout).into_owned();
-            let mut lines = s.lines();
-            let sha = lines.next().map(str::to_string).filter(|s| !s.is_empty());
-            let subj = lines.next().map(str::to_string);
-            (sha, subj)
+fn print_human(
+    state: &crate::repo_state::RepoState,
+    repo: &Path,
+    current_branch: Option<&str>,
+    head_sha: Option<&str>,
+    worktree_dirty: bool,
+) {
+    println!("repo:   {}", repo.display());
+    if let Some(b) = current_branch {
+        println!("branch: {b}");
+    }
+    if let Some(s) = head_sha {
+        println!("head:   {s}");
+    }
+    println!("dirty:  {}", if worktree_dirty { "yes" } else { "no" });
+
+    let active: Vec<_> = state.fold.plans.keys().collect();
+    if !active.is_empty() {
+        println!();
+        println!("active plans:");
+        for key in active {
+            let commits = state.fold.plans[key].commits.len();
+            println!("  {} ({} commits)", key.as_str(), commits);
         }
-        _ => (None, None),
-    };
+    }
+
+    if !state.fold.finished_plans.is_empty() {
+        println!();
+        println!("finished plans:");
+        for fp in &state.fold.finished_plans {
+            println!(
+                "  {} (finalized {})",
+                fp.plan.as_str(),
+                short_sha(fp.finalized_at.as_str())
+            );
+        }
+    }
+}
+
+fn short_sha(s: &str) -> &str {
+    &s[..s.len().min(7)]
+}
+
+fn head_info(repo: &Path) -> (Option<String>, Option<String>, Option<String>) {
+    let branch = git_output(repo, &["symbolic-ref", "--short", "HEAD"]);
+    let sha = git_output(repo, &["rev-parse", "HEAD"]);
+    let subject = git_output(repo, &["log", "-1", "--format=%s"]);
     (branch, sha, subject)
 }
 
 fn worktree_dirty(repo: &Path) -> anyhow::Result<bool> {
-    let out = std::process::Command::new("git")
+    let output = std::process::Command::new("git")
         .arg("-C")
         .arg(repo)
         .args(["status", "--porcelain"])
         .output()?;
-    if !out.status.success() {
-        anyhow::bail!(
-            "git status --porcelain failed (exit {}): {}",
-            out.status.code().unwrap_or(-1),
-            String::from_utf8_lossy(&out.stderr).trim(),
-        );
-    }
-    Ok(!out.stdout.iter().all(|b| b.is_ascii_whitespace()))
+    Ok(!output.stdout.is_empty())
 }
 
-fn render_human(s: &StatusResponse) {
-    let head_line = match (&s.head_sha, &s.head_subject) {
-        (Some(sha), Some(subj)) => {
-            format!(" @ {} {}", short_sha(sha), subj.trim())
-        }
-        (Some(sha), None) => format!(" @ {}", short_sha(sha)),
-        _ => String::new(),
-    };
-    let branch = s.current_branch.as_deref().unwrap_or("(detached)");
-    let dirty_mark = if s.worktree_dirty { "  (dirty)" } else { "" };
-    println!(
-        "repo  {} ({}{}){}",
-        s.repo_root, branch, head_line, dirty_mark
-    );
-
-    let active: Vec<&PlanRow> = s
-        .plans
-        .plans
-        .iter()
-        .filter(|p| p.lifecycle == PlanLifecycle::Active)
-        .collect();
-    let finished: Vec<&PlanRow> = s
-        .plans
-        .plans
-        .iter()
-        .filter(|p| p.lifecycle == PlanLifecycle::Finished)
-        .collect();
-
-    if !active.is_empty() {
-        println!();
-        println!("active plans:");
-        for row in &active {
-            print_row(row);
-        }
+fn git_output(repo: &Path, args: &[&str]) -> Option<String> {
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(args)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
     }
-    if !finished.is_empty() {
-        println!();
-        println!("finished plans:");
-        for row in &finished {
-            println!("  {}", row.plan_id.as_deref().unwrap_or(row.slug.as_str()));
-        }
-    }
-    if active.is_empty() && finished.is_empty() {
-        println!();
-        println!("no plans yet — `trinity start_plan` via your agent's MCP to create one.");
-    }
-
-    if !s.plans.conflicts.is_empty() {
-        println!();
-        println!("conflicts:");
-        for c in &s.plans.conflicts {
-            let summary = serde_json::to_string(c).unwrap_or_default();
-            println!("  {summary}");
-        }
-    }
-}
-
-fn print_row(row: &PlanRow) {
-    let id = row.plan_id.as_deref().unwrap_or(row.slug.as_str());
-    println!("  {id}");
-    println!("    phase:    {}", row.phase.as_str());
-    println!("    waiting:  {}", waiting_summary(&row.waiting_on));
-    println!("    path:     {}", row.current_path);
-    if let Some(sha) = &row.latest_reviewable_sha {
-        println!("    latest:   {}", short_sha(sha.as_str()));
-    }
-    match row.gate_state {
-        Some(s) => println!("    gate:     {}", s.as_str()),
-        None => println!("    gate:     (no reviewable commit yet)"),
-    }
-    if row.plan_worktree_status != trinity_core::vocab::PlanWorktreeStatus::Clean {
-        println!("    worktree: {:?}", row.plan_worktree_status);
-    }
-}
-
-fn waiting_summary(w: &trinity_core::api::WaitingOn) -> String {
-    let role = match w.role {
-        trinity_core::vocab::WaitingRole::Master => "master",
-        trinity_core::vocab::WaitingRole::Reviewers => "reviewers",
-        trinity_core::vocab::WaitingRole::None => "none",
-    };
-    if w.agents.is_empty() {
-        role.to_string()
+    let s = String::from_utf8(output.stdout).ok()?;
+    let trimmed = s.trim();
+    if trimmed.is_empty() {
+        None
     } else {
-        let names: Vec<&str> = w.agents.iter().map(|a| a.as_str()).collect();
-        format!("{role} ({})", names.join(", "))
+        Some(trimmed.to_string())
     }
-}
-
-fn short_sha(sha: &str) -> &str {
-    &sha[..sha.len().min(7)]
 }

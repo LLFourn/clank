@@ -1,27 +1,22 @@
-//! Shared finish / rewrite preview projection. The single source of
-//! truth for the typed previews that drive `trinity finish` and
-//! `trinity purge` (single-plan and `--all`). HTTP handlers and the
-//! operator CLI are both thin adapters over this module: they do not
-//! duplicate any of the projection logic below.
-//!
-//! See `.trinity/plans/cli-local-state-and-status.md` for the
-//! filesystem-truth direction this module supports.
+//! Local preview projection for `trinity finish` / `trinity purge`.
+//! Operates against a freshly-folded [`RepoState`] (the new sans-io
+//! fold) plus git_io + on-disk feedback files.
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
-use crate::attribution::CommitChanges;
+use crate::disk_format::{FeedbackTarget, parse_verdict};
 use crate::git_io::{
     self, GitIoError, commit_parent_count, diff_tree_changes, first_parent_commits_to,
     rev_parse_head, tree_plan_paths, tree_trinity_paths,
 };
-use crate::lifecycle::{CommitSha, PlanKey, RepoBasename};
+use crate::lifecycle::{AgentLabel, CommitSha, PlanKey, RepoBasename, content_hash};
 use crate::repo_state::RepoState;
 use trinity_core::api::{
     FinalizeBlockReason, FinalizeReadiness, FinishPreviewResponse, PurgeAllPreviewResponse,
     RewriteCommit, RewriteDisposition, RewritePreviewResponse, SealedApproval,
 };
-use trinity_core::model::PlanTimelineEvent;
-use trinity_core::vocab::{CommitGateState, PlanWorktreeStatus};
+use trinity_core::vocab::{CommitGateState, PlanWorktreeStatus, Verdict};
 
 #[derive(Debug, thiserror::Error)]
 pub enum PreviewError {
@@ -41,9 +36,8 @@ pub enum PreviewError {
     Git(#[from] GitIoError),
 }
 
-/// Single-plan finalize preview. The plan must already exist in
-/// `state.plans`; callers either pass a `single_plan` slice (HTTP) or
-/// a freshly-folded full state and the target `plan_key` (CLI).
+/// Single-plan finalize preview. The plan must be active in
+/// `state.fold.plans`.
 pub async fn build_finish_preview(
     repo_root: &Path,
     state: &RepoState,
@@ -52,50 +46,30 @@ pub async fn build_finish_preview(
     let basename = RepoBasename::from_repo_root(repo_root)
         .ok_or_else(|| PreviewError::UnknownRepo(repo_root.display().to_string()))?;
     let plan_id_str = format!("{}/{}.md", basename.as_str(), plan_key.as_str());
+    let plan_path = format!(".trinity/plans/{}.md", plan_key.as_str());
 
-    let plan = state
-        .plans
-        .get(plan_key)
-        .ok_or_else(|| PreviewError::PlanNotFound(plan_id_str.clone()))?;
+    let is_finished = state
+        .fold
+        .finished_plans
+        .iter()
+        .any(|f| &f.plan == plan_key);
+    let active = state.fold.plans.get(plan_key);
+    if !is_finished && active.is_none() {
+        return Err(PreviewError::PlanNotFound(plan_id_str));
+    }
 
-    let worktree_status = crate::responses::compute_plan_worktree_status_parts(
-        &state.root,
-        &plan.plan_path,
-        &plan.body_hash,
-    )?;
+    let worktree_status = worktree_status(repo_root, &plan_path).await?;
 
-    if !plan.is_visible(worktree_status) {
+    // Active plans need their file in the worktree to be eligible
+    // for finalize. Finished plans are exempt.
+    if !is_finished && matches!(worktree_status, PlanWorktreeStatus::PlanFileMissing) {
         return Err(PreviewError::PlanHidden(plan_id_str));
     }
 
-    let latest_reviewable_sha = crate::projection::latest_reviewable_commit_for(plan);
-    let gate = latest_reviewable_sha
-        .as_ref()
-        .and_then(|sha| state.gate_for(sha));
-    let gate_state = gate.map(|g| g.state).unwrap_or(CommitGateState::Unreviewed);
-    let is_finished = crate::projection::is_plan_finished(state, &plan.id);
+    let latest_reviewable_sha = active.and_then(latest_reviewable_sha);
 
-    let sealed_approvals = match gate {
-        Some(g) if g.state == CommitGateState::Approved => {
-            let target_sha = latest_reviewable_sha
-                .as_ref()
-                .expect("Approved gate implies a reviewable sha");
-            g.feedback
-                .iter()
-                .filter(|(_, fb)| fb.verdict == trinity_core::Verdict::Approve)
-                .map(|(author, fb)| SealedApproval {
-                    author: author.clone(),
-                    source_path: crate::disk_format::feedback_path_wire(
-                        &plan.id,
-                        target_sha.as_str(),
-                        author,
-                    ),
-                    body_hash: crate::lifecycle::content_hash(&fb.body),
-                })
-                .collect()
-        }
-        _ => Vec::new(),
-    };
+    let (gate_state, sealed_approvals_candidates) =
+        compute_gate(repo_root, state, plan_key, latest_reviewable_sha.as_ref()).await?;
 
     let readiness = compute_finalize_readiness(
         is_finished,
@@ -104,9 +78,15 @@ pub async fn build_finish_preview(
         worktree_status,
     );
 
+    let sealed_approvals = if matches!(readiness, FinalizeReadiness::Ready) {
+        sealed_approvals_candidates
+    } else {
+        Vec::new()
+    };
+
     Ok(FinishPreviewResponse {
         plan_id: plan_id_str,
-        plan_path: plan.plan_path.clone(),
+        plan_path,
         readiness,
         gate_state,
         latest_reviewable_sha,
@@ -116,10 +96,8 @@ pub async fn build_finish_preview(
     })
 }
 
-/// Single-plan rewrite preview. `include_finalize=false` preserves
-/// the plan's `.trinity/finished/<stem>/` snapshot (finish audit
-/// trail); `true` strips it (used by `purge --include-finalize`-like
-/// modes).
+/// Single-plan rewrite preview. `include_finalize=true` strips the
+/// `.trinity/finished/<stem>/` snapshot too (purge mode).
 pub async fn build_rewrite_preview(
     repo_root: &Path,
     state: &RepoState,
@@ -129,53 +107,59 @@ pub async fn build_rewrite_preview(
     let basename = RepoBasename::from_repo_root(repo_root)
         .ok_or_else(|| PreviewError::UnknownRepo(repo_root.display().to_string()))?;
     let plan_id_str = format!("{}/{}.md", basename.as_str(), plan_key.as_str());
-    let plan = state
-        .plans
-        .get(plan_key)
-        .ok_or_else(|| PreviewError::PlanNotFound(plan_id_str.clone()))?;
 
-    let worktree_status = crate::responses::compute_plan_worktree_status_parts(
-        &state.root,
-        &plan.plan_path,
-        &plan.body_hash,
-    )?;
-    if !plan.is_visible(worktree_status) {
-        return Err(PreviewError::PlanHidden(plan_id_str));
-    }
+    // Active or finished plan?
+    let intro_sha = if let Some(ps) = state.fold.plans.get(plan_key) {
+        ps.commits.first().map(|e| e.sha.clone())
+    } else if let Some(fp) = state
+        .fold
+        .finished_plans
+        .iter()
+        .find(|f| &f.plan == plan_key)
+    {
+        Some(fp.intro.clone())
+    } else {
+        return Err(PreviewError::PlanNotFound(plan_id_str));
+    };
 
     let head_sha = state
         .head
         .clone()
         .ok_or_else(|| PreviewError::NoHead(basename.as_str().to_string()))?;
-    let intro_sha = Some(plan.plan_intro.clone());
 
     let metas = first_parent_commits_to(repo_root, &head_sha).await?;
-    let start = metas
-        .iter()
-        .position(|m| m.sha == plan.plan_intro)
-        .ok_or_else(|| PreviewError::IntroNotInWalk {
-            intro: plan.plan_intro.as_str().to_string(),
-            head: head_sha.as_str().to_string(),
-        })?;
+    let start = match intro_sha.as_ref() {
+        Some(intro) => metas.iter().position(|m| &m.sha == intro).ok_or_else(|| {
+            PreviewError::IntroNotInWalk {
+                intro: intro.as_str().to_string(),
+                head: head_sha.as_str().to_string(),
+            }
+        })?,
+        None => {
+            return Ok(RewritePreviewResponse {
+                plan_id: plan_id_str,
+                plan_stem: plan_key.clone(),
+                intro_sha: None,
+                head_sha,
+                linear: true,
+                commits: Vec::new(),
+                head_strip_paths: Vec::new(),
+            });
+        }
+    };
     let range = &metas[start..];
 
-    // MultiPlan events touched this plan but a cross-plan commit must
-    // still be flagged `foreign: true` — `--squash` refuses on it,
-    // `--purge` rewrites it.
-    let native_shas: std::collections::BTreeSet<CommitSha> = plan
-        .timeline
-        .iter()
-        .filter_map(|e| match e {
-            PlanTimelineEvent::PlanOnly { sha, .. }
-            | PlanTimelineEvent::CodeOnly { sha, .. }
-            | PlanTimelineEvent::Mixed { sha, .. }
-            | PlanTimelineEvent::Finalize { sha, .. } => Some(sha.clone()),
-            PlanTimelineEvent::MultiPlan { .. } => None,
-        })
-        .collect();
+    // Plan-attributed SHAs (excluding multi-plan / unattributed).
+    // For "foreign" tagging: any commit not attributed to this plan
+    // is foreign — purge handles it, squash refuses on it.
+    let native_shas: BTreeSet<CommitSha> = state
+        .fold
+        .plans
+        .get(plan_key)
+        .map(|ps| ps.commits.iter().map(|e| e.sha.clone()).collect())
+        .unwrap_or_default();
 
-    let mut per_commit: Vec<(&git_io::CommitMeta, CommitChanges, bool)> =
-        Vec::with_capacity(range.len());
+    let mut per_commit = Vec::with_capacity(range.len());
     for meta in range {
         let parent_count = commit_parent_count(repo_root, &meta.sha).await?;
         let changes = diff_tree_changes(repo_root, &meta.sha).await?;
@@ -197,14 +181,14 @@ pub async fn build_rewrite_preview(
                 .trinity_paths_touched
                 .iter()
                 .any(|p| !strip_predicate_for_diff(p));
-        let attributed_to_this_plan = native_shas.contains(&meta.sha);
+        let attributed = native_shas.contains(&meta.sha);
         let (disposition, strip_paths) =
             classify_from_tree(contributes_non_strippable, &strippable_in_tree);
         commits.push(RewriteCommit {
             sha: meta.sha.clone(),
             subject: meta.subject.clone(),
             disposition,
-            foreign: !attributed_to_this_plan,
+            foreign: !attributed,
             strip_paths,
         });
     }
@@ -223,9 +207,8 @@ pub async fn build_rewrite_preview(
     })
 }
 
-/// All-plans rewrite preview. Walks first-parent from HEAD, slices
-/// at the earliest `.trinity/` touch (the all-plans "intro"), then
-/// classifies each commit in the range using tree-state.
+/// All-plans rewrite preview. Walks first-parent from HEAD, finds
+/// the earliest `.trinity/` touch, classifies the range.
 pub async fn build_rewrite_preview_all(
     repo_root: &Path,
     include_finalize: bool,
@@ -241,15 +224,14 @@ pub async fn build_rewrite_preview_all(
     let metas = first_parent_commits_to(repo_root, &head_sha).await?;
 
     let mut intro_pos: Option<usize> = None;
-    let mut per_commit: Vec<(git_io::CommitMeta, CommitChanges, bool)> =
-        Vec::with_capacity(metas.len());
-    let mut plans_seen: std::collections::BTreeSet<PlanKey> = std::collections::BTreeSet::new();
+    let mut per_commit = Vec::with_capacity(metas.len());
+    let mut plans_seen: BTreeSet<PlanKey> = BTreeSet::new();
     for (idx, meta) in metas.into_iter().enumerate() {
         let parent_count = commit_parent_count(repo_root, &meta.sha).await?;
         let is_merge = parent_count > 1;
         let changes = diff_tree_changes(repo_root, &meta.sha).await?;
         for touch in &changes.plan_touches {
-            plans_seen.insert(touch.session.clone());
+            plans_seen.insert(touch.plan.clone());
         }
         for fc in &changes.finalize_changes {
             plans_seen.insert(fc.plan_key.clone());
@@ -260,8 +242,6 @@ pub async fn build_rewrite_preview_all(
         per_commit.push((meta, changes, is_merge));
     }
 
-    // Merges BEFORE the intro are outside the rewrite range and
-    // must not block linearity.
     let linear = match intro_pos {
         Some(start) => !per_commit[start..].iter().any(|(_, _, is_merge)| *is_merge),
         None => true,
@@ -315,21 +295,7 @@ pub async fn build_rewrite_preview_all(
     })
 }
 
-/// Unified tree-based classifier. Two independent signals:
-///
-/// 1. `contributes_non_strippable`: does THIS commit's diff add or
-///    modify any path the rewrite wants to preserve? Non-Trinity
-///    code always counts; unstrippable Trinity paths added by this
-///    commit count too. Inherited content from earlier commits does
-///    NOT count.
-///
-/// 2. `strippable_in_tree`: paths under the strip-predicate that
-///    exist in the commit's resulting tree (from `git ls-tree`).
-///
-/// Disposition matrix:
-/// - `!contributes_non_strippable` → Drop.
-/// - contributes + strippable in tree → Rewrite (strip those).
-/// - contributes + no strippable in tree → KeepVerbatim.
+/// Tree-based classifier shared with the rewrite engine.
 pub fn classify_from_tree(
     contributes_non_strippable: bool,
     strippable_in_tree: &[String],
@@ -344,8 +310,7 @@ pub fn classify_from_tree(
     }
 }
 
-/// Project the typed finalize decision. Single source of truth for
-/// "can the CLI proceed?" — both HTTP and CLI dispatch on this.
+/// Compute finalize readiness from the four observable signals.
 pub fn compute_finalize_readiness(
     is_finished: bool,
     latest_reviewable_sha: Option<&CommitSha>,
@@ -377,3 +342,160 @@ pub fn compute_finalize_readiness(
         FinalizeReadiness::Blocked { reasons }
     }
 }
+
+/// The plan's latest reviewable commit SHA (last touched_plan ||
+/// touched_code event). `None` when the plan has no commits yet.
+fn latest_reviewable_sha(ps: &trinity_core::repo_state::PlanState) -> Option<CommitSha> {
+    ps.commits
+        .iter()
+        .rev()
+        .find(|e| e.touched_plan || e.touched_code)
+        .map(|e| e.sha.clone())
+}
+
+/// Worktree status: compare the file's worktree content (if any) to
+/// HEAD's blob via `git show HEAD:.trinity/plans/<plan>.md`.
+async fn worktree_status(
+    repo_root: &Path,
+    plan_path: &str,
+) -> Result<PlanWorktreeStatus, PreviewError> {
+    let abs = repo_root.join(plan_path);
+    let worktree_body = match std::fs::read_to_string(&abs) {
+        Ok(b) => Some(b),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => return Err(e.into()),
+    };
+    let head = git_io::rev_parse_head(repo_root).await?;
+    let head_body = match head {
+        Some(ref h) => match git_io::show_blob(repo_root, h, Path::new(plan_path)).await {
+            Ok(b) => Some(b),
+            Err(_) => None,
+        },
+        None => None,
+    };
+    Ok(match (head_body.as_deref(), worktree_body.as_deref()) {
+        (Some(h), Some(w)) if h == w => PlanWorktreeStatus::Clean,
+        (Some(_), Some(_)) => PlanWorktreeStatus::BodyDirty,
+        (Some(_), None) => PlanWorktreeStatus::PlanFileMissing,
+        (None, _) => PlanWorktreeStatus::Clean,
+    })
+}
+
+/// Build the per-plan gate from feedback files. Walks the plan's
+/// reviewable timeline accumulating participants, then evaluates the
+/// target SHA's verdicts.
+async fn compute_gate(
+    repo_root: &Path,
+    state: &RepoState,
+    plan_key: &PlanKey,
+    target_sha: Option<&CommitSha>,
+) -> Result<(CommitGateState, Vec<SealedApproval>), PreviewError> {
+    let Some(target) = target_sha else {
+        return Ok((CommitGateState::Unreviewed, Vec::new()));
+    };
+    let Some(ps) = state.fold.plans.get(plan_key) else {
+        return Ok((CommitGateState::Unreviewed, Vec::new()));
+    };
+
+    // Cumulative participants across all reviewable commits up to
+    // and including the target.
+    let mut participants: Vec<AgentLabel> = Vec::new();
+    let mut target_feedback: BTreeMap<AgentLabel, (Verdict, String, std::path::PathBuf)> =
+        BTreeMap::new();
+
+    for ev in &ps.commits {
+        if !(ev.touched_plan || ev.touched_code) {
+            continue;
+        }
+        let dir = repo_root
+            .join(".trinity/feedback")
+            .join(plan_key.as_str())
+            .join(ev.sha.as_str());
+        let entries = match std::fs::read_dir(&dir) {
+            Ok(it) => it,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                if &ev.sha == target {
+                    break;
+                }
+                continue;
+            }
+            Err(e) => return Err(e.into()),
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|s| s.to_str()) != Some("md") {
+                continue;
+            }
+            let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+                continue;
+            };
+            let Ok(author) = AgentLabel::parse(stem) else {
+                continue;
+            };
+            let body = match std::fs::read_to_string(&path) {
+                Ok(b) => b,
+                Err(_) => continue,
+            };
+            let verdict = parse_verdict(&body);
+            if !participants.contains(&author) {
+                participants.push(author.clone());
+            }
+            if &ev.sha == target {
+                target_feedback.insert(author, (verdict, body, path));
+            }
+        }
+        if &ev.sha == target {
+            break;
+        }
+    }
+
+    // Classify per-participant against the target SHA's verdicts.
+    let mut approvers: Vec<AgentLabel> = Vec::new();
+    let mut requesters: Vec<AgentLabel> = Vec::new();
+    let mut ambiguous: Vec<AgentLabel> = Vec::new();
+    let mut missing: Vec<AgentLabel> = Vec::new();
+    for p in &participants {
+        match target_feedback.get(p) {
+            Some((Verdict::Approve, _, _)) => approvers.push(p.clone()),
+            Some((Verdict::RequestChanges, _, _)) => requesters.push(p.clone()),
+            Some((Verdict::Unmarked, _, _)) => ambiguous.push(p.clone()),
+            None => missing.push(p.clone()),
+        }
+    }
+
+    let state_enum = if !requesters.is_empty() || !ambiguous.is_empty() {
+        CommitGateState::ChangesRequested
+    } else if !approvers.is_empty() && missing.is_empty() {
+        CommitGateState::Approved
+    } else {
+        CommitGateState::Unreviewed
+    };
+
+    let sealed_approvals = if matches!(state_enum, CommitGateState::Approved) {
+        target_feedback
+            .iter()
+            .filter(|(_, (v, _, _))| matches!(v, Verdict::Approve))
+            .filter_map(|(author, (_, body, path))| {
+                let rel = path
+                    .strip_prefix(repo_root)
+                    .ok()?
+                    .to_string_lossy()
+                    .to_string();
+                Some(SealedApproval {
+                    author: author.clone(),
+                    source_path: rel,
+                    body_hash: content_hash(body),
+                })
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+
+    Ok((state_enum, sealed_approvals))
+}
+
+// Drop unused — keep the FeedbackTarget import live so the parser
+// stays in the module graph.
+#[allow(dead_code)]
+fn _feedback_target_marker(_: FeedbackTarget) {}
