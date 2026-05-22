@@ -51,6 +51,9 @@ pub async fn run(args: WfwArgs) -> anyhow::Result<()> {
         .map_err(|e| anyhow::anyhow!("invalid --author `{}`: {e}", args.author))?;
     let role: Role = args.role.into();
     let timeout = parse_timeout(&args.timeout)?;
+    // One env read for the entire process, here at the CLI
+    // boundary. Downstream takes a plain `bool`.
+    let poll_mode = args.effective_poll();
 
     let repo = resolve_repo(args.repo.as_deref())?;
     let basename = repo_basename(&repo)?;
@@ -115,29 +118,27 @@ pub async fn run(args: WfwArgs) -> anyhow::Result<()> {
         return Ok(());
     }
 
-    let watch_ctx = WatchContext::resolve(&repo)?;
+    let watch_ctx = WatchContext::resolve(&repo, poll_mode)?;
     let (tx, rx) = mpsc::channel::<()>();
     let mut watcher = build_watcher(tx)?;
     watch_ctx.attach(&mut watcher)?;
 
+    // Refold cadence. Native mode uses a 1.5s heartbeat as the
+    // finalize-race safety net (the watcher carries the load).
+    // Polling mode shortens to 500ms — it IS the primary git-
+    // change signal because the gitdir watch is skipped.
+    let tick: Duration = if poll_mode {
+        Duration::from_millis(500)
+    } else {
+        Duration::from_millis(1500)
+    };
     let deadline = timeout.map(|t| std::time::Instant::now() + t);
     loop {
-        // Heartbeat refold cadence. We refold whenever an FS event
-        // fires AND on this fixed interval, even with no events.
-        // The heartbeat is the safety net for the finalize-race
-        // codex caught: `clank finish` writes the snapshot files
-        // before committing, so the FS event wakes wfw, the
-        // refold lands BEFORE the commit, sees nothing, and the
-        // post-commit git-ref event may never fire reliably. The
-        // periodic refold catches that case. 1500ms gives finalize
-        // notifications a snappy ceiling without burning much CPU
-        // on a warm cache.
-        const HEARTBEAT: Duration = Duration::from_millis(1500);
         let wait = match deadline {
-            None => HEARTBEAT,
+            None => tick,
             Some(end) => match end.checked_duration_since(std::time::Instant::now()) {
                 None => return Err(WfwTimeout.into()),
-                Some(remaining) => remaining.min(HEARTBEAT),
+                Some(remaining) => remaining.min(tick),
             },
         };
         let event_received = match rx.recv_timeout(wait) {
@@ -340,28 +341,27 @@ fn render_human(item: &WaitItem) -> String {
     }
 }
 
-/// Watch-time facts captured up-front. Two roots — that's it.
-/// The old Trinity daemon's shape, adapted to Clank's directory
-/// name: any write under `<repo>/.clank` or the resolved worktree
-/// gitdir wakes wfw; refold figures out what changed.
+/// Watch-time facts captured up-front. `.clank/` is always
+/// watched natively. `git_dir` is watched only in native mode;
+/// polling mode skips it and relies on the loop's periodic
+/// refold tick.
 struct WatchContext {
-    /// `<repo>/.clank`. Watched recursively.
+    /// `<repo>/.clank`. Watched recursively in both modes.
     clank_root: PathBuf,
-    /// Worktree-specific git dir (`.git/worktrees/<name>/` for a
-    /// linked worktree; `<repo>/.git/` for the main worktree).
-    /// Watched non-recursively — top-level files inside the
-    /// gitdir (`index`, `HEAD`, `packed-refs`, `ORIG_HEAD`, etc.)
-    /// are sufficient invalidation signals. `git commit -m`
-    /// rewrites `index` on every local commit, so the
-    /// non-recursive watch fires on every commit boundary in
-    /// this worktree without needing to walk into `objects/`,
-    /// `refs/`, or `logs/`.
-    git_dir: PathBuf,
+    /// Worktree-specific git dir (`.git/worktrees/<name>/` for
+    /// a linked worktree; `<repo>/.git/` for the main worktree).
+    /// `Some` in native mode, `None` in polling mode (no watch
+    /// attached at all — periodic refold handles git changes).
+    git_dir: Option<PathBuf>,
 }
 
 impl WatchContext {
-    fn resolve(repo: &Path) -> anyhow::Result<Self> {
-        let git_dir = git_resolve_dir(repo, "--git-dir")?;
+    fn resolve(repo: &Path, poll_mode: bool) -> anyhow::Result<Self> {
+        let git_dir = if poll_mode {
+            None
+        } else {
+            Some(git_resolve_dir(repo, "--git-dir")?)
+        };
         Ok(Self {
             clank_root: repo.join(".clank"),
             git_dir,
@@ -379,18 +379,16 @@ impl WatchContext {
         watcher
             .watch(&self.clank_root, RecursiveMode::Recursive)
             .map_err(|e| anyhow::anyhow!("watch `{}` failed: {e}", self.clank_root.display()))?;
-        // Recursive on the worktree gitdir, not non-recursive. The
-        // old Trinity daemon's non-recursive shape doesn't survive
-        // the Codex tool sandbox: empirically the sandbox filters
-        // out events for individual top-level files. A recursive
-        // watch picks up writes anywhere under the gitdir — index,
-        // logs/HEAD, refs/heads/*, objects/* — and we don't need
-        // to pre-guess which path the sandbox lets through. The
-        // refold cost is the same either way; we just get more
-        // wakeups.
-        watcher
-            .watch(&self.git_dir, RecursiveMode::Recursive)
-            .map_err(|e| anyhow::anyhow!("watch `{}` failed: {e}", self.git_dir.display()))?;
+        // Gitdir watch is native-mode-only. Polling mode keeps
+        // `.clank/` reactive but treats git movement as a
+        // periodic-poll concern — empirically required under
+        // the Codex tool sandbox where native gitdir events
+        // never reach notify.
+        if let Some(git_dir) = &self.git_dir {
+            watcher
+                .watch(git_dir, RecursiveMode::Recursive)
+                .map_err(|e| anyhow::anyhow!("watch `{}` failed: {e}", git_dir.display()))?;
+        }
         Ok(())
     }
 }

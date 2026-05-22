@@ -65,9 +65,15 @@ fn head_sha(repo: &Path) -> String {
 /// Spawn `clank wfw …` with stdout piped. Returns a handle the test
 /// can read stdout from + reap. Pre-warming sleep so the inotify
 /// watcher is attached before the test mutates files.
+///
+/// **Explicitly passes `--no-poll`** so the native-watcher path is
+/// exercised regardless of whether the test suite is running under
+/// `CODEX_SANDBOX=seatbelt`. Any test that wants polling mode must
+/// build its own `Command::new(clank_bin())` chain with `--poll`.
 fn spawn_wfw(repo: &Path, args: &[&str]) -> std::process::Child {
     let child = Command::new(clank_bin())
         .arg("wfw")
+        .arg("--no-poll")
         .args(args)
         .arg("--repo")
         .arg(repo)
@@ -414,6 +420,7 @@ fn wfw_master_plan_only_approval_routes_to_implement() {
     let output = Command::new(clank_bin())
         .args([
             "wfw",
+            "--no-poll",
             "--author",
             "lloyd",
             "--role",
@@ -466,6 +473,7 @@ fn wfw_master_code_only_approval_routes_to_finalize() {
     let output = Command::new(clank_bin())
         .args([
             "wfw",
+            "--no-poll",
             "--author",
             "lloyd",
             "--role",
@@ -785,6 +793,7 @@ fn wfw_plan_already_finished_at_startup_emits_finished_and_exits() {
     let output = Command::new(clank_bin())
         .args([
             "wfw",
+            "--no-poll",
             "--author",
             "alice",
             "--role",
@@ -813,6 +822,65 @@ fn wfw_plan_already_finished_at_startup_emits_finished_and_exits() {
     assert_eq!(items[0]["kind"], "finished");
     assert_eq!(items[0]["plan"], "foo");
     assert_eq!(items[0]["finalized_at"], final_sha);
+}
+
+#[test]
+fn wfw_polling_mode_wakes_on_commit_via_periodic_refold() {
+    // Polling-mode proof: with --poll explicit, wfw does NOT
+    // watch the gitdir natively. The wake on a git commit
+    // comes from the 500ms periodic refold tick. Stage the
+    // change BEFORE parking wfw so no `.clank/` event is in
+    // play either — the ONLY signal available is the tick.
+    let dir = init_repo();
+    let repo = dir.path();
+    write(repo, ".clank/plans/foo.md", "# foo\n");
+    commit(repo, "[foo] intro");
+    let intro_sha = head_sha(repo);
+    write(
+        repo,
+        &format!(".clank/feedback/foo/{intro_sha}/alice.md"),
+        "APPROVE\n\nlgtm\n",
+    );
+
+    write(repo, "src/lib.rs", "// hello\n");
+    git(repo, &["add", "src/lib.rs"]);
+
+    // Build the Command directly so we can pass --poll. The
+    // shared spawn_wfw helper bakes in --no-poll.
+    let mut child = Command::new(clank_bin())
+        .args([
+            "wfw",
+            "--poll",
+            "--author",
+            "alice",
+            "--role",
+            "reviewers",
+            "--timeout",
+            "30s",
+        ])
+        .arg("--repo")
+        .arg(repo)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn clank wfw --poll");
+    // Attach headroom — same as spawn_wfw.
+    std::thread::sleep(Duration::from_millis(1500));
+
+    git(repo, &["commit", "--quiet", "-m", "[foo] code work"]);
+    let code_sha = head_sha(repo);
+
+    let exit = wait_for_exit(&mut child, Duration::from_secs(20));
+    let stdout = read_stdout_to_end(&mut child);
+    let stderr = read_stderr_to_end(&mut child);
+    assert!(
+        exit.success(),
+        "wfw --poll exit={exit:?} stdout=`{stdout}` stderr=`{stderr}`"
+    );
+    assert!(
+        stdout.contains("review") && stdout.contains(&code_sha[..7]),
+        "expected reviewer wake via poll tick on sha {code_sha}; got stdout=`{stdout}`"
+    );
 }
 
 fn wait_for_exit(child: &mut std::process::Child, max: Duration) -> std::process::ExitStatus {

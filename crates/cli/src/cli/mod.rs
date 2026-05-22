@@ -76,6 +76,86 @@ pub struct WfwArgs {
     /// Skip the on-disk state cache.
     #[arg(long)]
     pub no_cache: bool,
+    /// Force polling mode for git changes (skip the native gitdir
+    /// watch, refold on a 500ms tick). Use this when native
+    /// `notify` events on the gitdir are unreliable — most
+    /// notably inside the Codex tool sandbox.
+    ///
+    /// Default is `false`. Unset, the default flips to `true`
+    /// when `CODEX_SANDBOX=seatbelt` is in the environment. Pass
+    /// `--no-poll` to force the native path regardless of env.
+    #[arg(long, overrides_with = "no_poll")]
+    pub poll: bool,
+    #[arg(long, overrides_with = "poll")]
+    pub no_poll: bool,
+}
+
+impl WfwArgs {
+    /// Resolve the explicit poll flag (Some) vs absent (None) for
+    /// `resolve_poll`. clap can't directly produce
+    /// `Option<bool>` with `--poll` / `--no-poll`, so we
+    /// reconstruct here.
+    pub fn explicit_poll(&self) -> Option<bool> {
+        match (self.poll, self.no_poll) {
+            (true, _) => Some(true),
+            (_, true) => Some(false),
+            _ => None,
+        }
+    }
+
+    /// Effective poll setting. Reads `CODEX_SANDBOX` if the
+    /// caller didn't pass `--poll` / `--no-poll`. THE single
+    /// place in the binary that reads `CODEX_SANDBOX` —
+    /// everything downstream takes a plain `bool`.
+    pub fn effective_poll(&self) -> bool {
+        let codex = std::env::var("CODEX_SANDBOX").ok();
+        resolve_poll(self.explicit_poll(), codex.as_deref())
+    }
+}
+
+/// Pure decision function — no env access, no I/O. `explicit`
+/// is the `--poll` / `--no-poll` selection if present; the env
+/// fallback applies only when it's `None`.
+pub fn resolve_poll(explicit: Option<bool>, codex_sandbox: Option<&str>) -> bool {
+    explicit.unwrap_or_else(|| codex_sandbox == Some("seatbelt"))
+}
+
+#[cfg(test)]
+mod resolve_poll_tests {
+    use super::resolve_poll;
+
+    #[test]
+    fn explicit_true_wins_regardless_of_env() {
+        assert!(resolve_poll(Some(true), None));
+        assert!(resolve_poll(Some(true), Some("seatbelt")));
+        assert!(resolve_poll(Some(true), Some("anything-else")));
+    }
+
+    #[test]
+    fn explicit_false_wins_regardless_of_env() {
+        assert!(!resolve_poll(Some(false), None));
+        assert!(!resolve_poll(Some(false), Some("seatbelt")));
+    }
+
+    #[test]
+    fn unset_with_codex_sandbox_seatbelt_defaults_to_true() {
+        assert!(resolve_poll(None, Some("seatbelt")));
+    }
+
+    #[test]
+    fn unset_with_empty_codex_sandbox_defaults_to_false() {
+        assert!(!resolve_poll(None, Some("")));
+    }
+
+    #[test]
+    fn unset_with_other_codex_sandbox_value_defaults_to_false() {
+        assert!(!resolve_poll(None, Some("other-value")));
+    }
+
+    #[test]
+    fn unset_with_no_codex_sandbox_defaults_to_false() {
+        assert!(!resolve_poll(None, None));
+    }
 }
 
 #[derive(Copy, Clone, Debug, clap::ValueEnum)]
