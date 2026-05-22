@@ -226,10 +226,15 @@ so the field carries the right form. For `Plan(key)` scope is
 `AdHoc` scope is the ad-hoc reviewable timeline (currently
 under `state.fold.ad_hoc`).
 
-`fs_watcher.rs::path_to_signal` keys on the
-`.clank/feedback/` prefix today. The new prefix is
-`.clank/agents/<author>/feedback/`; the segment-shape match
-stays the same after the prefix strip.
+`fs_watcher.rs::path_to_signal` is rewritten for the new
+shape. Today it strips `.clank/feedback/` and parses
+`<plan-or-_>/<sha>/<author>.md` (three segments — author
+comes from the filename). After this change it strips
+`.clank/agents/<author>/feedback/` and parses
+`<plan-or-_>/<sha>.md` (two segments — author comes from the
+intermediate path segment between `agents/` and `feedback/`,
+and `<sha>` is the file stem, 7–40 hex). Same typed
+`FeedbackPath { target, target_sha, author, raw }` output.
 
 `git_io.rs::collect_feedback_files` walks the new root
 (`.clank/agents/*/feedback/`) and yields the same
@@ -240,6 +245,34 @@ stays the same after the prefix strip.
 `FilesystemSignal::FeedbackWritten { parsed }` shape. No
 change to the consumer; `parsed` now comes from the new
 parser.
+
+## Watcher interaction (no changes to wfw's watch roots)
+
+The wfw watcher landed in `wfw-daemon-style-watches` already
+watches `<repo>/.clank` recursively. That single root covers
+EVERY path under `.clank/`, including the new
+`.clank/agents/<author>/feedback/<target>/<sha>.md` tree.
+No additional `watcher.watch(...)` call is needed. The
+recursive descent picks up newly-created agent subdirs
+(`agents/alice/`, `agents/codex/`, …) automatically when
+those directories first appear.
+
+This works identically in both native and polling mode:
+
+- **Native mode (`--no-poll`).** `.clank/` events fire
+  through native notify, exactly as today. The watcher is
+  unaffected by the per-agent layout.
+- **Polling mode (`--poll`, default under
+  `CODEX_SANDBOX=seatbelt`).** `.clank/` events still come
+  through native notify in this mode too — only the gitdir
+  watch is skipped. Feedback writes still trigger immediate
+  wakes; only commit-boundary git events fall back to the
+  500ms refold tick.
+
+So this plan is entirely orthogonal to the watcher design.
+The only watcher-adjacent change is the
+`fs_watcher::path_to_signal` parser update above (a typed-
+path concern, not a watch-root concern).
 
 ## CLI surfaces
 
