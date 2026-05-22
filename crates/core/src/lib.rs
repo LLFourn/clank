@@ -18,6 +18,14 @@
 //! - [`model`] — small surviving DTOs (`Feedback`, `CommitGate`)
 //!   used by projection-time review-gate computation. Not folded
 //!   into state; built on demand from `.clank/feedback/` files.
+//! - [`feedback_view`] — typed `FeedbackView` of one plan's review
+//!   files. Pure data; the CLI scans the filesystem into this shape
+//!   and feeds it to `plan_view::project`.
+//! - [`plan_view`] — per-plan projection: `gate_state`,
+//!   `WaitingOn`, `worktree_status`. The single source of truth
+//!   `status` and `wfw` both project from.
+//! - [`work`] — agent-perspective filter (`derive_work`) over
+//!   `[PlanView]`. Consumed by `wfw`; not by `status`.
 //! - [`api`] — wire-shape response DTOs (`FinishPreviewResponse`,
 //!   `RewritePreviewResponse`, …) produced by the CLI's preview
 //!   builders.
@@ -27,10 +35,13 @@
 //! definitions.
 
 pub mod api;
+pub mod feedback_view;
 pub mod ids;
 pub mod model;
+pub mod plan_view;
 pub mod repo_state;
 pub mod vocab;
+pub mod work;
 
 // Re-export the closed-vocab enums at crate root for ergonomic
 // imports (`use clank_core::CommitKind;`).
