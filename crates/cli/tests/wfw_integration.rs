@@ -204,6 +204,70 @@ fn wfw_reviewer_wakes_on_code_only_commit() {
 }
 
 #[test]
+fn wfw_reviewer_wakes_on_commit_with_index_already_staged() {
+    // Isolation test for the daemon-style two-root watch shape.
+    // The other "wakes on commit" tests stage the change AFTER
+    // parking wfw, so `git add` itself fires the `.git/index`
+    // event and the subsequent `git commit -m` rides in on the
+    // 200ms debounce. That passes even if the commit-time
+    // metadata write never fires.
+    //
+    // This test stages BEFORE parking, then runs ONLY
+    // `git commit -m`. The only FS event the watcher can wake
+    // on is the commit-boundary metadata update. If
+    // non-recursive `.git/` doesn't catch that, this test
+    // fails.
+    let dir = init_repo();
+    let repo = dir.path();
+    write(repo, ".clank/plans/foo.md", "# foo\n");
+    commit(repo, "[foo] intro");
+    let intro_sha = head_sha(repo);
+
+    // alice approved the intro; gate=Approved at startup.
+    write(
+        repo,
+        &format!(".clank/feedback/foo/{intro_sha}/alice.md"),
+        "APPROVE\n\nlgtm\n",
+    );
+
+    // Stage the code change BEFORE wfw exists. This is the
+    // critical ordering — the `git add` index write happens
+    // before the watcher attaches, so it cannot be the wake.
+    write(repo, "src/lib.rs", "// hello\n");
+    git(repo, &["add", "src/lib.rs"]);
+
+    let mut child = spawn_wfw(
+        repo,
+        &[
+            "--author",
+            "alice",
+            "--role",
+            "reviewers",
+            "--timeout",
+            "30s",
+        ],
+    );
+
+    // Only `git commit -m`. No further `git add`, no other FS
+    // mutations. The wake must come from the commit-boundary
+    // gitdir activity alone.
+    git(repo, &["commit", "--quiet", "-m", "[foo] code work"]);
+    let code_sha = head_sha(repo);
+
+    let exit = wait_for_exit(&mut child, Duration::from_secs(20));
+    let stdout = read_stdout_to_end(&mut child);
+    let stderr = read_stderr_to_end(&mut child);
+    assert!(
+        exit.success(),
+        "wfw exit={exit:?} stdout=`{stdout}` stderr=`{stderr}`"
+    );
+    assert!(
+        stdout.contains("review") && stdout.contains(&code_sha[..7]),
+        "expected reviewer wake on commit-only sha {code_sha}; got stdout=`{stdout}`"
+    );
+}
+
+#[test]
 fn wfw_master_wakes_on_request_changes_feedback() {
     let dir = init_repo();
     let repo = dir.path();

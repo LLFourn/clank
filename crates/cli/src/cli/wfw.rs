@@ -17,7 +17,6 @@
 //! plausibly flip the projection and refolds on each debounced
 //! event.
 
-use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::time::Duration;
@@ -341,112 +340,48 @@ fn render_human(item: &WaitItem) -> String {
     }
 }
 
-/// Watch-time facts captured up-front so the loop wakes for the
-/// right git refs regardless of whether `repo` is a main worktree,
-/// a linked worktree, or sits on top of a submodule gitdir.
+/// Watch-time facts captured up-front. Two roots — that's it.
+/// The old Trinity daemon's shape, adapted to Clank's directory
+/// name: any write under `<repo>/.clank` or the resolved worktree
+/// gitdir wakes wfw; refold figures out what changed.
 struct WatchContext {
-    repo_root: PathBuf,
+    /// `<repo>/.clank`. Watched recursively.
+    clank_root: PathBuf,
     /// Worktree-specific git dir (`.git/worktrees/<name>/` for a
     /// linked worktree; `<repo>/.git/` for the main worktree).
-    /// `HEAD` here is the one this process resolves.
+    /// Watched non-recursively — top-level files inside the
+    /// gitdir (`index`, `HEAD`, `packed-refs`, `ORIG_HEAD`, etc.)
+    /// are sufficient invalidation signals. `git commit -m`
+    /// rewrites `index` on every local commit, so the
+    /// non-recursive watch fires on every commit boundary in
+    /// this worktree without needing to walk into `objects/`,
+    /// `refs/`, or `logs/`.
     git_dir: PathBuf,
-    /// Common git dir (always `<repo>/.git/` for the main worktree;
-    /// usually `<main>/.git/` for linked worktrees). Holds the
-    /// shared `refs/` and `packed-refs`.
-    git_common_dir: PathBuf,
 }
 
 impl WatchContext {
     fn resolve(repo: &Path) -> anyhow::Result<Self> {
         let git_dir = git_resolve_dir(repo, "--git-dir")?;
-        let git_common_dir = git_resolve_dir(repo, "--git-common-dir")?;
         Ok(Self {
-            repo_root: repo.to_path_buf(),
+            clank_root: repo.join(".clank"),
             git_dir,
-            git_common_dir,
         })
     }
 
     fn attach(&self, watcher: &mut RecommendedWatcher) -> anyhow::Result<()> {
-        // `.clank/{plans,feedback,finished}` may not exist yet on a
-        // brand-new repo or before any reviewer has weighed in.
-        // `notify` refuses to watch a missing path, so create them
-        // first — they're Clank-managed dirs anyway. The git refs
-        // we tolerate as missing (e.g. `packed-refs` only appears
-        // after `git gc`).
-        for sub in [".clank/plans", ".clank/feedback", ".clank/finished"] {
-            let p = self.repo_root.join(sub);
-            if let Err(e) = std::fs::create_dir_all(&p) {
-                anyhow::bail!("ensure `{}` exists: {e}", p.display());
-            }
+        // `<repo>/.clank` may not exist yet on a brand-new repo.
+        // `notify` refuses to watch a missing path, so create it
+        // first — Clank manages the directory anyway.
+        if let Err(e) = std::fs::create_dir_all(&self.clank_root) {
+            anyhow::bail!("ensure `{}` exists: {e}", self.clank_root.display());
         }
 
-        let mut watched: HashSet<PathBuf> = HashSet::new();
-        let mut try_watch =
-            |path: PathBuf, mode: RecursiveMode, tolerate_missing: bool| -> anyhow::Result<()> {
-                if !path.exists() {
-                    if tolerate_missing {
-                        return Ok(());
-                    }
-                    anyhow::bail!("required watch path `{}` does not exist", path.display());
-                }
-                if !watched.insert(path.clone()) {
-                    return Ok(());
-                }
-                watcher
-                    .watch(&path, mode)
-                    .map_err(|e| anyhow::anyhow!("watch `{}` failed: {e}", path.display()))
-            };
-
-        // `.git/HEAD` only changes on checkout/symbolic-ref. Local
-        // commits don't touch it. The canonical "HEAD moved" signal
-        // for the current worktree is the reflog `logs/HEAD` — git
-        // appends a line to it on every commit, rebase, reset, etc.
-        // Watch both so we wake on both branch switches AND ordinary
-        // commits, including code-only commits that don't touch any
-        // `.clank/` paths.
-        try_watch(
-            self.git_dir.join("HEAD"),
-            RecursiveMode::NonRecursive,
-            false,
-        )?;
-        try_watch(
-            self.git_dir.join("logs/HEAD"),
-            RecursiveMode::NonRecursive,
-            // Pristine repos with no commits yet have no logs/HEAD.
-            // Tolerate that — the file appears on the first commit
-            // and notify auto-rewatches via the parent .git dir.
-            true,
-        )?;
-        // The common refs tree carries every branch, tag, and
-        // remote ref — needed for picking up commits made via a
-        // separate `git` invocation (especially from another linked
-        // worktree).
-        try_watch(
-            self.git_common_dir.join("refs"),
-            RecursiveMode::Recursive,
-            false,
-        )?;
-        try_watch(
-            self.git_common_dir.join("packed-refs"),
-            RecursiveMode::NonRecursive,
-            true,
-        )?;
-        try_watch(
-            self.repo_root.join(".clank/plans"),
-            RecursiveMode::Recursive,
-            false,
-        )?;
-        try_watch(
-            self.repo_root.join(".clank/feedback"),
-            RecursiveMode::Recursive,
-            false,
-        )?;
-        try_watch(
-            self.repo_root.join(".clank/finished"),
-            RecursiveMode::Recursive,
-            false,
-        )?;
+        watcher
+            .watch(&self.clank_root, RecursiveMode::Recursive)
+            .map_err(|e| anyhow::anyhow!("watch `{}` failed: {e}", self.clank_root.display()))?;
+        watcher
+            .watch(&self.git_dir, RecursiveMode::NonRecursive)
+            .map_err(|e| anyhow::anyhow!("watch `{}` failed: {e}", self.git_dir.display()))?;
         Ok(())
     }
 }
