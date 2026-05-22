@@ -2,8 +2,8 @@
 
 ## Summary
 
-Two finish-boundary fixes in one plan, since they share the
-projection.
+Three finish-boundary fixes in one plan, since they share the
+projection and the underlying vocabulary.
 
 1. **Wake parked `wfw` on finalize.** Today the watcher fires
    when a watched plan moves into `finished_plans`, `derive_work`
@@ -16,6 +16,18 @@ projection.
    landed. The latest reviewable commit's `touched_code` flag
    already carries the right signal; the projection just
    ignores it.
+3. **Delete the dead `CommitKind` / `Posture` /
+   `ReviewTargetPhase` vocabulary.** These enums classify a
+   commit as "plan-only / code-only / mixed" and derive a
+   per-plan phase / posture from that classification. No live
+   code consumes them — they're daemon-era wire-shape artifacts
+   still parked in `clank-core::vocab` + `clank-core::api`,
+   reachable only through wire-snapshot tests. Leaving them in
+   place is exactly how the "Mixed = Planning vs Implementing"
+   contradiction kept resurfacing in earlier revisions of this
+   plan. Decisions move to raw `touched_plan` / `touched_code`
+   booleans on `PlanTimelineEvent`; the dead enums and their
+   companion api types are deleted.
 
 Fixes share the same `WaitItem` redesign and projection update:
 
@@ -68,14 +80,15 @@ Fixes share the same `WaitItem` redesign and projection update:
     → `WaitingOn::MasterToFinalize`. Implementation has landed
     and been approved; `clank finish` is the next move.
   The user can always ignore the finalize suggestion and commit
-  more code; it's a hint, not a gate. The existing
-  `Posture::from_commit_kind` / `ReviewTargetPhase` vocabulary
-  that classifies "both plan and code touched" as planning is
-  scheduled for removal in a separate plan, so this routing
-  doesn't try to thread the needle on that classification — it
-  reads the raw timeline flags directly. This is the missing
-  nuance behind `clank status` currently saying "finalize" the
-  moment a plan-only intro is approved.
+  more code; it's a hint, not a gate. The routing reads the raw
+  `touched_plan` / `touched_code` flags directly — there's no
+  intermediate "CommitKind" classification to reconcile, because
+  this plan deletes that vocabulary as part of the same change.
+- **No reconstructed `CommitKind`.** When the CLI emits prose
+  ("plan revision approved" vs "implementation commit
+  approved") it computes the wording at the output edge from
+  the two booleans. Don't introduce a replacement enum at the
+  core layer — the booleans are the model.
 
 ## Types
 
@@ -259,31 +272,85 @@ Pure — no IO, no fold mutation. `WaitingOn`, `PlanView`,
 
 ## Sequencing
 
-One commit. Adds:
+Two commits, in order. Splitting at the dead-vocab boundary keeps
+each commit independently reviewable.
+
+### Commit 1 — delete CommitKind / Posture / ReviewTargetPhase
+
+Drops the dead daemon-era classification vocabulary so the
+projection work in Commit 2 can key on raw `touched_plan` /
+`touched_code` without parallel sources of truth.
+
+- `crates/core/src/vocab.rs`: remove `enum CommitKind`,
+  `enum Posture`, `enum ReviewTargetPhase`, their `as_str`
+  impls, their `impl_display_via_as_str!` entries, and the
+  `is_reviewable()` helper on `CommitKind` (callers consult
+  the boolean flags directly).
+- `crates/core/src/api.rs`: remove every type that referenced
+  any of the three deleted enums. The dependency closure
+  covers `CommitRow`, `CommitDetail`, `TimelineEvent` (uses
+  `CommitKind` via `CommitRow`), `ReviewTarget`, `WriteFeedback`,
+  `ReviewGate`, `PlanRow.phase` / `PlanRow.plan_worktree_status`,
+  `ListPlansResponse`, `StatusResponse` (the daemon shape;
+  the CLI computes its own JSON envelope), `WorkContextResponse`,
+  `PlanDetailResponse`, `CommitDetailResponse`,
+  `WaitForWorkResponse`, `WaitWorkPayload`, and anything else
+  reachable only from those. Keep the api.rs types still used
+  by the CLI: `FinishPreviewResponse`,
+  `FinalizeReadiness`/`FinalizeBlockReason`, `SealedApproval`,
+  `RewritePreviewResponse`/`RewriteCommit`/`RewriteDisposition`,
+  `PurgeAllPreviewResponse`, the diff types, and the live
+  event payloads (`PlanEventPayload`, `RepoEventPayload`).
+- `crates/core/src/lib.rs`: drop the three names from the
+  crate-root re-exports.
+- `crates/core/tests/round_trip.rs` and
+  `crates/core/tests/wire_snapshots.rs`: remove the assertions
+  for every deleted type. Keep the assertions for the surviving
+  types untouched.
+
+This commit changes no behavior. `cargo test --workspace` must
+still pass — the wire-shape tests for deleted types are
+deleted, the projection work hasn't been added yet, and CLI
+callers don't reference the deleted enums.
+
+### Commit 2 — wfw-finish-notification
+
+Now the projection + wfw work, against the smaller vocabulary.
 
 - `crates/core/src/plan_view.rs`: extend `WaitingOn` with
   `MasterToImplement`; rewire `evaluate` to route the
   `Approved + Clean` branch on the latest reviewable's
   `touched_code` flag.
-- `crates/core/src/wait.rs` with `WaitItem`, `Role`, `MasterNext`
-  (including the new `Implement` variant), `StartupSnapshot`,
-  `derive_work`, `detect_finished` + tests.
-- Deletes `crates/core/src/work.rs` (its types/function migrate
-  into `wait.rs` under the new names).
+- `crates/core/src/wait.rs` with `WaitItem`, `Role`,
+  `MasterNext` (including the new `Implement` variant),
+  `StartupSnapshot`, `derive_work`, `detect_finished` + tests.
+- Deletes `crates/core/src/work.rs` (its types/function
+  migrate into `wait.rs` under the new names).
 - Updates `crates/cli/src/cli/wfw.rs` to build the snapshot at
-  startup, switch to the combined `derive_work ++ detect_finished`
-  flow, and widen `emit` for the new variant + the new
-  `MasterNext::Implement` output.
+  startup, switch to the combined
+  `derive_work ++ detect_finished` flow, and widen `emit` for
+  the new variant + the new `MasterNext::Implement` output.
 - Updates `crates/cli/src/cli/status.rs` `waiting_actor` /
   `waiting_reason` for the `MasterToImplement` variant
   (`master` actor, "gate approved — implement under [<stem>]"
-  reason).
+  reason — string built from the boolean facts at the output
+  edge).
 - Integration tests for the finished-wake paths AND the
   plan-only-vs-impl routing.
 
 The pure-core / IO-CLI boundary stays exactly as it is today.
 
 ## Tests
+
+### Commit 1: vocab deletion
+
+- `cargo build --workspace` clean after the deletion (no broken
+  references to `CommitKind` / `Posture` / `ReviewTargetPhase`).
+- `cargo test --workspace` green: the surviving wire-snapshot
+  and round-trip tests still pass; the deleted types' tests
+  are removed.
+- `grep -rn 'CommitKind\|Posture\|ReviewTargetPhase' crates/` is
+  empty.
 
 ### Core: `detect_finished`
 
@@ -379,6 +446,13 @@ Keep the existing `MasterToCommit` (BodyDirty) and
 
 ## Acceptance
 
+- `grep -rn 'CommitKind\|Posture\|ReviewTargetPhase' crates/`
+  returns nothing. No surviving definition, no surviving caller,
+  no test fixture.
+- The Implement-vs-Finalize routing keys on `touched_plan` /
+  `touched_code` directly. There is no intermediate
+  classification enum in `clank-core` for "plan-only" vs
+  "code-only" vs "mixed" — that vocabulary is gone.
 - A parked `clank wfw` exits 0 with a finished notice after
   `clank finish` lands. Both human and JSON output paths are
   covered.
