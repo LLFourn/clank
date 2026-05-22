@@ -2,16 +2,18 @@
 //! Operates against a freshly-folded [`RepoState`] (the new sans-io
 //! fold) plus git_io + on-disk feedback files.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 use std::path::Path;
 
-use crate::disk_format::{FeedbackTarget, parse_verdict};
+use crate::disk_format::FeedbackTarget;
+use crate::feedback_scan::scan_feedback;
 use crate::git_io::{
-    self, GitIoError, commit_parent_count, diff_tree_changes, first_parent_commits_to,
-    rev_parse_head, tree_clank_paths, tree_plan_paths,
+    GitIoError, commit_parent_count, diff_tree_changes, first_parent_commits_to, rev_parse_head,
+    tree_clank_paths, tree_plan_paths,
 };
-use crate::lifecycle::{AgentLabel, CommitSha, PlanKey, RepoBasename, content_hash};
+use crate::lifecycle::{AgentLabel, CommitSha, PlanKey, RepoBasename};
 use crate::repo_state::RepoState;
+use crate::worktree_facts::read_worktree_facts;
 use clank_core::api::{
     FinalizeBlockReason, FinalizeReadiness, FinishPreviewResponse, PurgeAllPreviewResponse,
     RewriteCommit, RewriteDisposition, RewritePreviewResponse, SealedApproval,
@@ -34,6 +36,10 @@ pub enum PreviewError {
     Io(#[from] std::io::Error),
     #[error("git: {0}")]
     Git(#[from] GitIoError),
+    #[error("feedback scan: {0}")]
+    FeedbackScan(#[from] crate::feedback_scan::FeedbackScanError),
+    #[error("worktree facts: {0}")]
+    WorktreeFacts(#[from] crate::worktree_facts::WorktreeFactsError),
 }
 
 /// Single-plan finalize preview. The plan must be active in
@@ -58,7 +64,8 @@ pub async fn build_finish_preview(
         return Err(PreviewError::PlanNotFound(plan_id_str));
     }
 
-    let worktree_status = worktree_status(repo_root, &plan_path).await?;
+    let head = state.head.as_ref();
+    let worktree_status = read_worktree_facts(repo_root, &plan_path, head).await?.status;
 
     // Active plans need their file in the worktree to be eligible
     // for finalize. Finished plans are exempt.
@@ -69,7 +76,7 @@ pub async fn build_finish_preview(
     let latest_reviewable_sha = active.and_then(latest_reviewable_sha);
 
     let (gate_state, sealed_approvals_candidates) =
-        compute_gate(repo_root, state, plan_key, latest_reviewable_sha.as_ref()).await?;
+        compute_gate(repo_root, state, plan_key, latest_reviewable_sha.as_ref())?;
 
     let readiness = compute_finalize_readiness(
         is_finished,
@@ -442,38 +449,10 @@ fn latest_reviewable_sha(ps: &clank_core::repo_state::PlanState) -> Option<Commi
         .map(|e| e.sha.clone())
 }
 
-/// Worktree status: compare the file's worktree content (if any) to
-/// HEAD's blob via `git show HEAD:.clank/plans/<plan>.md`.
-async fn worktree_status(
-    repo_root: &Path,
-    plan_path: &str,
-) -> Result<PlanWorktreeStatus, PreviewError> {
-    let abs = repo_root.join(plan_path);
-    let worktree_body = match std::fs::read_to_string(&abs) {
-        Ok(b) => Some(b),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
-        Err(e) => return Err(e.into()),
-    };
-    let head = git_io::rev_parse_head(repo_root).await?;
-    let head_body = match head {
-        Some(ref h) => match git_io::show_blob(repo_root, h, Path::new(plan_path)).await {
-            Ok(b) => Some(b),
-            Err(_) => None,
-        },
-        None => None,
-    };
-    Ok(match (head_body.as_deref(), worktree_body.as_deref()) {
-        (Some(h), Some(w)) if h == w => PlanWorktreeStatus::Clean,
-        (Some(_), Some(_)) => PlanWorktreeStatus::BodyDirty,
-        (Some(_), None) => PlanWorktreeStatus::PlanFileMissing,
-        (None, _) => PlanWorktreeStatus::Clean,
-    })
-}
-
-/// Build the per-plan gate from feedback files. Walks the plan's
-/// reviewable timeline accumulating participants, then evaluates the
-/// target SHA's verdicts.
-async fn compute_gate(
+/// Build the per-plan gate by handing a scanned `FeedbackView` to
+/// the pure core projection, then re-deriving the sealed-approval
+/// list from the same scan.
+fn compute_gate(
     repo_root: &Path,
     state: &RepoState,
     plan_key: &PlanKey,
@@ -486,68 +465,46 @@ async fn compute_gate(
         return Ok((CommitGateState::Unreviewed, Vec::new()));
     };
 
-    // Cumulative participants across all reviewable commits up to
-    // and including the target.
-    let mut participants: Vec<AgentLabel> = Vec::new();
-    let mut target_feedback: BTreeMap<AgentLabel, (Verdict, String, std::path::PathBuf)> =
-        BTreeMap::new();
-
-    for ev in &ps.commits {
-        if !(ev.touched_plan || ev.touched_code) {
+    let mut reviewable: Vec<CommitSha> = Vec::new();
+    for e in &ps.commits {
+        if !(e.touched_plan || e.touched_code) {
             continue;
         }
-        let dir = repo_root
-            .join(".clank/feedback")
-            .join(plan_key.as_str())
-            .join(ev.sha.as_str());
-        let entries = match std::fs::read_dir(&dir) {
-            Ok(it) => it,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                if &ev.sha == target {
-                    break;
-                }
-                continue;
-            }
-            Err(e) => return Err(e.into()),
-        };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.extension().and_then(|s| s.to_str()) != Some("md") {
-                continue;
-            }
-            let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
-                continue;
-            };
-            let Ok(author) = AgentLabel::parse(stem) else {
-                continue;
-            };
-            let body = match std::fs::read_to_string(&path) {
-                Ok(b) => b,
-                Err(_) => continue,
-            };
-            let verdict = parse_verdict(&body);
-            if !participants.contains(&author) {
-                participants.push(author.clone());
-            }
-            if &ev.sha == target {
-                target_feedback.insert(author, (verdict, body, path));
-            }
-        }
-        if &ev.sha == target {
+        reviewable.push(e.sha.clone());
+        if &e.sha == target {
             break;
         }
     }
 
-    // Classify per-participant against the target SHA's verdicts.
+    let view = scan_feedback(repo_root, plan_key, &reviewable)?;
+
+    let mut participants: Vec<AgentLabel> = Vec::new();
+    let mut target_idx: Option<usize> = None;
+    for (idx, commit) in view.per_commit.iter().enumerate() {
+        for author in commit.entries.keys() {
+            if !participants.contains(author) {
+                participants.push(author.clone());
+            }
+        }
+        if &commit.sha == target {
+            target_idx = Some(idx);
+        }
+    }
+
+    let target_entries = target_idx
+        .map(|i| &view.per_commit[i].entries)
+        .cloned()
+        .unwrap_or_default();
+
     let mut approvers: Vec<AgentLabel> = Vec::new();
     let mut requesters: Vec<AgentLabel> = Vec::new();
     let mut ambiguous: Vec<AgentLabel> = Vec::new();
     let mut missing: Vec<AgentLabel> = Vec::new();
     for p in &participants {
-        match target_feedback.get(p) {
-            Some((Verdict::Approve, _, _)) => approvers.push(p.clone()),
-            Some((Verdict::RequestChanges, _, _)) => requesters.push(p.clone()),
-            Some((Verdict::Unmarked, _, _)) => ambiguous.push(p.clone()),
+        match target_entries.get(p).map(|e| e.verdict) {
+            Some(Verdict::Approve) => approvers.push(p.clone()),
+            Some(Verdict::RequestChanges) => requesters.push(p.clone()),
+            Some(Verdict::Unmarked) => ambiguous.push(p.clone()),
             None => missing.push(p.clone()),
         }
     }
@@ -561,20 +518,13 @@ async fn compute_gate(
     };
 
     let sealed_approvals = if matches!(state_enum, CommitGateState::Approved) {
-        target_feedback
+        target_entries
             .iter()
-            .filter(|(_, (v, _, _))| matches!(v, Verdict::Approve))
-            .filter_map(|(author, (_, body, path))| {
-                let rel = path
-                    .strip_prefix(repo_root)
-                    .ok()?
-                    .to_string_lossy()
-                    .to_string();
-                Some(SealedApproval {
-                    author: author.clone(),
-                    source_path: rel,
-                    body_hash: content_hash(body),
-                })
+            .filter(|(_, entry)| matches!(entry.verdict, Verdict::Approve))
+            .map(|(author, entry)| SealedApproval {
+                author: author.clone(),
+                source_path: entry.source_path.clone(),
+                body_hash: entry.body_hash.clone(),
             })
             .collect()
     } else {
@@ -583,6 +533,7 @@ async fn compute_gate(
 
     Ok((state_enum, sealed_approvals))
 }
+
 
 // Drop unused — keep the FeedbackTarget import live so the parser
 // stays in the module graph.

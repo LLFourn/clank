@@ -85,7 +85,10 @@ fn candidate_summary(state: &RepoState, basename: &str) -> String {
     }
 }
 
-fn parse_arg(raw: &str, expected_basename: &str) -> anyhow::Result<String> {
+/// Parse a plan-arg in any of the three accepted shapes:
+/// bare `<stem>`, `<stem>.md`, or `<basename>/<stem>.md`. Returns
+/// the bare stem; rejects a mismatched basename.
+pub fn parse_arg(raw: &str, expected_basename: &str) -> anyhow::Result<String> {
     if let Some((basename, rest)) = raw.split_once('/') {
         if basename != expected_basename {
             anyhow::bail!(

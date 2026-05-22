@@ -16,6 +16,7 @@ pub mod plan_resolve;
 pub mod purge;
 pub mod rewrite;
 pub mod status;
+pub mod wfw;
 
 #[derive(Args, Debug)]
 pub struct InitArgs {
@@ -29,7 +30,7 @@ pub struct StatusArgs {
     /// Repo root. Defaults to the cwd's git toplevel.
     #[arg(long, value_name = "PATH")]
     pub repo: Option<PathBuf>,
-    /// Emit JSON (typed `StatusResponse` from `clank-core::api`).
+    /// Emit JSON instead of the human rendering.
     #[arg(short = 'j', long)]
     pub json: bool,
     /// Skip the on-disk state cache: don't read it, don't write it.
@@ -37,6 +38,59 @@ pub struct StatusArgs {
     /// a debug escape hatch.
     #[arg(long)]
     pub no_cache: bool,
+    /// Render every active plan instead of inferring a single one.
+    /// Mutually exclusive with `--plan`.
+    #[arg(long, conflicts_with = "plan")]
+    pub all: bool,
+    /// Specific plan to render. Accepts `<stem>`, `<stem>.md`, or
+    /// `<basename>/<stem>.md` — same parser as `clank finish`.
+    #[arg(long, value_name = "PLAN")]
+    pub plan: Option<String>,
+}
+
+#[derive(Args, Debug)]
+pub struct WfwArgs {
+    /// Repo root. Defaults to the cwd's git toplevel.
+    #[arg(long, value_name = "PATH")]
+    pub repo: Option<PathBuf>,
+    /// Required: the agent label this caller is wfw-ing as. Keys
+    /// feedback files and the participant set; pick something stable
+    /// across this agent's sessions (`claude`, `claude-fe`, etc.).
+    #[arg(long, value_name = "LABEL")]
+    pub author: String,
+    /// Required: which side of the workflow this caller plays.
+    #[arg(long, value_enum)]
+    pub role: WfwRole,
+    /// Restrict watch / report to one plan (same parser as
+    /// `clank status --plan`). Without it, wfw considers every
+    /// active plan in the repo.
+    #[arg(long, value_name = "PLAN")]
+    pub plan: Option<String>,
+    /// Maximum wait. Accepts `30s`, `5m`, `1h`. `0` (default) means
+    /// wait indefinitely.
+    #[arg(long, default_value = "0", value_name = "DURATION")]
+    pub timeout: String,
+    /// Emit JSON instead of the human rendering.
+    #[arg(short = 'j', long)]
+    pub json: bool,
+    /// Skip the on-disk state cache.
+    #[arg(long)]
+    pub no_cache: bool,
+}
+
+#[derive(Copy, Clone, Debug, clap::ValueEnum)]
+pub enum WfwRole {
+    Master,
+    Reviewers,
+}
+
+impl From<WfwRole> for clank_core::work::Role {
+    fn from(r: WfwRole) -> Self {
+        match r {
+            WfwRole::Master => clank_core::work::Role::Master,
+            WfwRole::Reviewers => clank_core::work::Role::Reviewers,
+        }
+    }
 }
 
 #[derive(Args, Debug)]

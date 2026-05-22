@@ -23,18 +23,40 @@ enum Command {
     Purge(cli::PurgeArgs),
     /// Print the repo's Clank state (HEAD, plans, phases).
     Status(cli::StatusArgs),
+    /// Wait-for-work: block until the calling agent has actionable
+    /// work on one of the repo's active plans.
+    Wfw(cli::WfwArgs),
 }
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     init_tracing();
     let cli_args = Cli::parse();
-    match cli_args.command {
+    let result = match cli_args.command {
         Command::Init(args) => cli::init::run(args).await,
         Command::Finish(args) => cli::finish::run(args).await,
         Command::Purge(args) => cli::purge::run(args).await,
         Command::Status(args) => cli::status::run(args).await,
+        Command::Wfw(args) => cli::wfw::run(args).await,
+    };
+    if let Err(e) = result {
+        let code = exit_code_for(&e);
+        eprintln!("{e:#}");
+        std::process::exit(code);
     }
+    Ok(())
+}
+
+/// Map error variants to exit codes. Defaults to 1; `wfw` timeout
+/// returns 2; status's "ambiguous active plans" returns 3.
+fn exit_code_for(err: &anyhow::Error) -> i32 {
+    if err.downcast_ref::<cli::wfw::WfwTimeout>().is_some() {
+        return 2;
+    }
+    if let Some(code) = err.downcast_ref::<cli::status::ExitCode>() {
+        return code.0;
+    }
+    1
 }
 
 fn init_tracing() {

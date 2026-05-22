@@ -7,11 +7,13 @@ pub mod rebuild;
 pub mod repo_state;
 
 // IO + runtime layers.
+pub mod feedback_scan;
 pub mod fs_watcher;
 pub mod git_io;
 pub mod preview;
 pub mod runtime;
 pub mod state_cache;
+pub mod worktree_facts;
 
 // Operator CLI subcommands. Local-only mutations.
 pub mod cli;
