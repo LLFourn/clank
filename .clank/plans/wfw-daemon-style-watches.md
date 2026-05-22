@@ -94,23 +94,29 @@ any subdirectory created later. Replaces three separate watches
 with one — the directory layout is no longer load-bearing on
 the watcher.
 
-`<resolved worktree gitdir>` non-recursive catches:
+`<resolved worktree gitdir>` non-recursive catches the top-level
+files Git rewrites during ordinary operations:
 
-- `HEAD` rewrites (checkout, symbolic-ref).
-- `index` updates — Git rewrites the index every `git commit`,
-  `git add`, etc. This is the canonical "something Git is doing
-  in THIS worktree" signal.
+- `index` — rewritten by both `git add` AND by `git commit -m`
+  itself. Empirically verified: a `git commit -m` against an
+  already-staged change grows `.git/index` from 174 → 193 bytes
+  on a minimal repo. The post-commit index write is the
+  canonical "this worktree just produced a commit" signal.
+- `HEAD` — rewritten on checkout / symbolic-ref.
 - `packed-refs`, `ORIG_HEAD`, `MERGE_HEAD`, `FETCH_HEAD`,
-  `COMMIT_EDITMSG`, etc. — top-level files Git touches during
-  ordinary operations.
+  `COMMIT_EDITMSG`, etc.
 
 Non-recursive deliberately does NOT walk into `objects/`,
 `refs/`, or `logs/`. We don't need to — the `index` write fires
 for every local commit and that's a sufficient invalidation
-signal. Cross-worktree ref pushes (where a separate process
-updates `<common>/refs/heads/<branch>` without touching this
-worktree's gitdir) are explicitly out of scope; the heartbeat
-catches them as a slow fallback if they're ever relevant.
+signal. The proof obligation for this claim lives in the
+Tests section: a staged-before-wfw regression test isolates
+the commit-boundary write from any pre-commit `git add` noise.
+
+Cross-worktree ref pushes (where a separate process updates
+`<common>/refs/heads/<branch>` without touching this worktree's
+gitdir) are explicitly out of scope; the heartbeat catches them
+as a slow fallback if they're ever relevant.
 
 ## Implementation
 
@@ -120,7 +126,13 @@ catches them as a slow fallback if they're ever relevant.
    three-subdir create_dir_all loop).
 2. Watch `<repo>/.clank` recursively.
 3. Watch the resolved worktree gitdir (from `git rev-parse
-   --git-dir`) non-recursively.
+   --git-dir`) non-recursively. If the staged-before-wfw test
+   from the Tests section fails under non-recursive — i.e.
+   notify on this platform doesn't deliver the commit-time
+   `.git/index` rewrite — escalate to recursive. The
+   non-recursive default mirrors the old Trinity daemon's
+   proven shape; the escalation is a documented fallback, not
+   the first choice.
 
 Drop:
 
@@ -159,27 +171,51 @@ continue to pass under the new shape:
 - Early-snapshot + late-commit finalize race
 - Master/code-only wake routing
 
-`wfw_reviewer_wakes_on_code_only_commit` is the load-bearing
-one for this change: it asserts the wake fires on a commit that
-touches only `src/lib.rs`, so the ONLY trigger is gitdir
-activity (the `index` write specifically). If non-recursive
-watching the worktree gitdir doesn't catch that, the test fails.
+`wfw_reviewer_wakes_on_code_only_commit` is one part of the
+proof, but on its own it isn't enough: that test runs
+`git add` AFTER wfw has parked. The `git add` itself rewrites
+`.git/index`, which fires under the proposed non-recursive
+gitdir watch. The subsequent `git commit -m` lands inside the
+200 ms debounce window, so the test passes even if the
+commit-time index write never fires. That's a false positive
+for the invariant we actually care about.
+
+**New required test: `wfw_reviewer_wakes_on_commit_with_index_already_staged`.**
+The shape isolates the commit-boundary write from any
+preceding `git add` noise:
+
+1. Create the repo, the plan, and alice's prior approval.
+2. Write the new code change AND `git add` it.
+3. Start `clank wfw` and wait for watcher attach (1.5 s).
+4. Run `git commit -m '[foo] code work'` and nothing else.
+5. Assert wfw exits 0 with a `Reviewer` item on the new SHA,
+   within a reasonable bound (say 10 s).
+
+If non-recursive `.git/` doesn't catch the commit-time index
+rewrite, this test fails — and the implementation must broaden
+the gitdir watch root (e.g. recursive on `.git/`) rather than
+fall back to individual-file watches. Re-introducing
+fine-grained file watches is rejected: the plan's whole point
+is that they're unreliable under Codex's sandbox.
 
 ### Script-level Codex-sandbox repro
 
 `/private/tmp/clank-watch-repro/repro-git-commit-timeout.sh`
-stays as the canonical out-of-tree repro. We don't try to
-reproduce the sandbox behavior from a Rust unit test — the
-behavior only appears under Codex's tool sandbox. The Rust
-suite covers the deterministic invariants; the shell repro is
-the empirical safety net.
+stays as one canonical out-of-tree repro. The behavior under
+Codex's sandbox only appears under that tool sandbox; the Rust
+suite covers the deterministic invariants and the shell repros
+are the empirical safety nets.
 
-Acceptance for the repro:
+Add a second shell repro that mirrors the new Rust isolation
+test (stage-then-park-then-commit-only) so we can verify the
+commit-boundary wake under the sandbox too. Both repros need
+to pass after the switch.
 
-- Outside the sandbox: passes (it already does today; this
-  must not regress).
-- Inside the sandbox: passes consistently. ~230 ms latency,
-  no heartbeat fallbacks.
+Acceptance for the repros:
+
+- Outside the sandbox: both pass (this must not regress).
+- Inside the sandbox: both pass consistently with sub-second
+  latency. No heartbeat fallbacks on the hot path.
 
 ## Acceptance
 
@@ -192,7 +228,14 @@ Acceptance for the repro:
   individual file inside the gitdir.
 - The 12 existing wfw integration tests all pass after the
   switch (including linked-worktree and code-only-commit).
-- The Codex-sandbox repro passes after rebuilding.
+- The new `wfw_reviewer_wakes_on_commit_with_index_already_staged`
+  test passes. This is the load-bearing proof that
+  `git commit -m` alone — with no preceding `git add` event —
+  wakes wfw. If it fails on non-recursive `.git/`, the
+  implementation broadens to recursive (NOT individual-file).
+- Both shell repros (the existing one plus the new staged-
+  before-wfw variant) pass after rebuilding, inside and
+  outside the Codex sandbox.
 - The existing 1.5 s heartbeat from `wfw-finish-notification`
   is untouched. No new polling, no new fallbacks added in this
   plan.
