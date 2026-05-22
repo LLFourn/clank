@@ -1,10 +1,10 @@
-//! Operator-facing CLI commands. The daemon never writes Clank
-//! artifacts; this module does, via local `git` subprocess calls
-//! and direct filesystem writes. Mutations live here; the daemon
-//! exposes typed read-only previews (`finish_preview`,
-//! `rewrite_preview`) that drive what each command actually does.
-//!
-//! See `.clank/plans/clank-cli.md` for the contract.
+//! Operator-facing CLI commands. Clank is daemonless: each
+//! subcommand folds the cwd-repo locally (via the sans-io fold in
+//! `clank-core::repo_state`), projects a typed preview (see
+//! `crate::preview`), and only then performs mutations via local
+//! `git` subprocess calls and direct filesystem writes. The
+//! preview is the contract every mutation runs against — it makes
+//! "what would happen" inspectable before "do it" runs.
 
 use clap::Args;
 use std::path::{Path, PathBuf};
@@ -159,9 +159,9 @@ pub(crate) fn resolve_repo(explicit: Option<&Path>) -> anyhow::Result<PathBuf> {
 }
 
 /// Derive the repo basename — the segment Clank uses to address
-/// plans on the wire (`/api/plan/<basename>/<stem>.md`). Wraps
-/// `RepoBasename::from_repo_root` so the validation rule lives in
-/// one place.
+/// plans as `<basename>/<stem>.md` (e.g. in CLI args and error
+/// messages). Wraps `RepoBasename::from_repo_root` so the
+/// validation rule lives in one place.
 pub(crate) fn repo_basename(repo: &Path) -> anyhow::Result<String> {
     clank_core::ids::RepoBasename::from_repo_root(repo)
         .map(|b| b.as_str().to_string())
