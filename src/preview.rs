@@ -108,16 +108,19 @@ pub async fn build_rewrite_preview(
         .ok_or_else(|| PreviewError::UnknownRepo(repo_root.display().to_string()))?;
     let plan_id_str = format!("{}/{}.md", basename.as_str(), plan_key.as_str());
 
-    // Active or finished plan?
-    let intro_sha = if let Some(ps) = state.fold.plans.get(plan_key) {
-        ps.commits.first().map(|e| e.sha.clone())
+    // Active or finished plan? For finished plans, we also need the
+    // finalize SHA so native_shas can be computed by replaying the
+    // [intro, finalized_at] interval through the sans-io fold (the
+    // fold itself drops finished plans' per-commit timeline).
+    let (intro_sha, finalized_at) = if let Some(ps) = state.fold.plans.get(plan_key) {
+        (ps.commits.first().map(|e| e.sha.clone()), None)
     } else if let Some(fp) = state
         .fold
         .finished_plans
         .iter()
         .find(|f| &f.plan == plan_key)
     {
-        Some(fp.intro.clone())
+        (Some(fp.intro.clone()), Some(fp.finalized_at.clone()))
     } else {
         return Err(PreviewError::PlanNotFound(plan_id_str));
     };
@@ -149,15 +152,24 @@ pub async fn build_rewrite_preview(
     };
     let range = &metas[start..];
 
-    // Plan-attributed SHAs (excluding multi-plan / unattributed).
-    // For "foreign" tagging: any commit not attributed to this plan
-    // is foreign — purge handles it, squash refuses on it.
-    let native_shas: BTreeSet<CommitSha> = state
-        .fold
-        .plans
-        .get(plan_key)
-        .map(|ps| ps.commits.iter().map(|e| e.sha.clone()).collect())
-        .unwrap_or_default();
+    // Plan-attributed SHAs. For active plans, read straight from the
+    // fold's per-plan timeline. For finished plans, re-derive by
+    // folding the [intro, finalized_at] interval — `RepoState`
+    // doesn't retain finished-plan timelines (Acceptance: finished
+    // plans keep only `{ plan, intro, finalized_at }`).
+    let native_shas: BTreeSet<CommitSha> = if let Some(ps) = state.fold.plans.get(plan_key) {
+        ps.commits.iter().map(|e| e.sha.clone()).collect()
+    } else if let Some(end) = finalized_at.as_ref() {
+        re_fold_finished_plan_natives(
+            repo_root,
+            plan_key,
+            &intro_sha.as_ref().unwrap().clone(),
+            end,
+        )
+        .await?
+    } else {
+        BTreeSet::new()
+    };
 
     let mut per_commit = Vec::with_capacity(range.len());
     for meta in range {
@@ -293,6 +305,61 @@ pub async fn build_rewrite_preview_all(
         commits,
         head_strip_paths,
     })
+}
+
+/// Re-derive the per-plan native-SHA set for a FINISHED plan by
+/// replaying its [intro, finalized_at) interval through a fresh
+/// sans-io fold. The canonical `RepoState` only stores
+/// `{ plan, intro, finalized_at }` for finished plans (no
+/// timeline), so the rewrite-preview path reconstructs attribution
+/// on demand. Bounded cost — typical plans span tens of commits.
+///
+/// Walk is HALF-OPEN: stops BEFORE `finalized_at` so the plan stays
+/// active in the scratch fold (the finalize event moves it to
+/// `finished_plans` and drops its timeline). The finalize SHA is
+/// added back at the end.
+async fn re_fold_finished_plan_natives(
+    repo_root: &Path,
+    plan_key: &PlanKey,
+    intro: &CommitSha,
+    finalized_at: &CommitSha,
+) -> Result<BTreeSet<CommitSha>, PreviewError> {
+    use crate::disk_snapshot::{CommitEvent, apply_commit, enrich_with_newly_finished};
+
+    let metas = first_parent_commits_to(repo_root, finalized_at).await?;
+    let start =
+        metas
+            .iter()
+            .position(|m| &m.sha == intro)
+            .ok_or_else(|| PreviewError::IntroNotInWalk {
+                intro: intro.as_str().to_string(),
+                head: finalized_at.as_str().to_string(),
+            })?;
+
+    let mut scratch = RepoState::empty(repo_root.to_path_buf());
+    for meta in &metas[start..] {
+        if &meta.sha == finalized_at {
+            break;
+        }
+        let changes = diff_tree_changes(repo_root, &meta.sha).await?;
+        let raw = CommitEvent {
+            commit: meta.sha.clone(),
+            author_ts: meta.author_ts,
+            subject: meta.subject.clone(),
+            changes,
+            newly_finished: BTreeSet::new(),
+        };
+        let enriched = enrich_with_newly_finished(repo_root, &raw).await?;
+        apply_commit(&mut scratch, &enriched);
+    }
+    let mut native: BTreeSet<CommitSha> = scratch
+        .fold
+        .plans
+        .get(plan_key)
+        .map(|ps| ps.commits.iter().map(|e| e.sha.clone()).collect())
+        .unwrap_or_default();
+    native.insert(finalized_at.clone());
+    Ok(native)
 }
 
 /// Tree-based classifier shared with the rewrite engine.

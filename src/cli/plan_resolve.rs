@@ -21,7 +21,9 @@ pub fn resolve_plan(
         let stem = parse_arg(raw, expected_basename)?;
         let key = PlanKey::parse(&stem)
             .map_err(|e| anyhow::anyhow!("invalid plan stem `{stem}`: {e}"))?;
-        if !state.fold.plans.contains_key(&key) {
+        let known = state.fold.plans.contains_key(&key)
+            || state.fold.finished_plans.iter().any(|f| f.plan == key);
+        if !known {
             anyhow::bail!(
                 "plan `{}/{}.md` not found in repo. candidates: {}",
                 expected_basename,
@@ -69,12 +71,15 @@ fn infer_single_visible_active(
 }
 
 fn candidate_summary(state: &RepoState, basename: &str) -> String {
-    let names: Vec<String> = state
+    let mut names: Vec<String> = state
         .fold
         .plans
         .keys()
         .map(|k| format!("{basename}/{}.md", k.as_str()))
         .collect();
+    for fp in &state.fold.finished_plans {
+        names.push(format!("{basename}/{}.md (finished)", fp.plan.as_str()));
+    }
     if names.is_empty() {
         "(none)".to_string()
     } else {

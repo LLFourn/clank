@@ -728,9 +728,8 @@ fn parse_diff_tree(stdout: &str) -> Result<ParsedDiffTree, GitIoError> {
                 && old_k != new_k
             {
                 // Cross-stem rename `git mv .trinity/plans/foo.md
-                // .trinity/plans/bar.md`. Model as two events: delete
-                // `foo` + intro `bar`. The fold then removes `foo`
-                // from state.fold.plans and creates `bar`.
+                // .trinity/plans/bar.md`. Model as delete-old +
+                // intro-new.
                 plan_touches.push(PlanTouch {
                     plan: old_k.clone(),
                     kind: PlanTouchKind::Revision,
@@ -741,6 +740,28 @@ fn parse_diff_tree(stdout: &str) -> Result<ParsedDiffTree, GitIoError> {
                     kind: PlanTouchKind::Intro,
                     new_path: Some(new_rel.clone()),
                 });
+            } else if is_rename && old_is_plan && !new_is_plan {
+                // Rename OUT of `.trinity/plans/<key>.md` (e.g. into
+                // `.trinity/plans/done/`). The plan key no longer
+                // lives at a flat plan path — model as Delete.
+                if let Some(old_k) = old_key {
+                    plan_touches.push(PlanTouch {
+                        plan: old_k,
+                        kind: PlanTouchKind::Revision,
+                        new_path: None,
+                    });
+                }
+            } else if is_rename && !old_is_plan && new_is_plan {
+                // Rename INTO `.trinity/plans/<key>.md` from somewhere
+                // else (e.g. resurrecting a plan from done/). Model
+                // as Intro on the new key.
+                if let Some(new_k) = new_key {
+                    plan_touches.push(PlanTouch {
+                        plan: new_k,
+                        kind: PlanTouchKind::Intro,
+                        new_path: Some(new_rel.clone()),
+                    });
+                }
             } else {
                 let plan_key = match new_key.or(old_key) {
                     Some(id) => id,
@@ -1026,6 +1047,39 @@ mod tests {
             Some(Path::new(".trinity/plans/foo.md"))
         );
         assert!(!changes.has_non_plan_code_changes);
+    }
+
+    /// Regression for codex on 004fbcb: renaming a plan OUT of
+    /// `.trinity/plans/<key>.md` (e.g. into `done/`) must Delete the
+    /// plan key, not Revise it into a non-plan path.
+    #[test]
+    fn parse_diff_tree_rename_out_of_plans_is_delete() {
+        let stdout = "R100\t.trinity/plans/foo.md\t.trinity/plans/done/foo.md\n";
+        let parsed = parse_diff_tree(stdout).unwrap();
+        let changes = &parsed.changes;
+        assert_eq!(changes.plan_touches.len(), 1);
+        assert_eq!(changes.plan_touches[0].plan.as_str(), "foo");
+        assert!(matches!(
+            changes.plan_touches[0].kind,
+            PlanTouchKind::Revision
+        ));
+        assert!(
+            changes.plan_touches[0].new_path.is_none(),
+            "rename out of plans/ must produce new_path=None (Delete)",
+        );
+    }
+
+    /// Mirror case: renaming a file INTO `.trinity/plans/<key>.md`
+    /// must Intro the plan.
+    #[test]
+    fn parse_diff_tree_rename_into_plans_is_intro() {
+        let stdout = "R100\t.trinity/plans/done/foo.md\t.trinity/plans/foo.md\n";
+        let parsed = parse_diff_tree(stdout).unwrap();
+        let changes = &parsed.changes;
+        assert_eq!(changes.plan_touches.len(), 1);
+        assert_eq!(changes.plan_touches[0].plan.as_str(), "foo");
+        assert!(matches!(changes.plan_touches[0].kind, PlanTouchKind::Intro));
+        assert!(changes.plan_touches[0].new_path.is_some());
     }
 
     #[test]
