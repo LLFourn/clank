@@ -2,137 +2,171 @@
 
 ## Summary
 
-`clank wfw` returns to the old Trinity daemon's coarse watching
-strategy: one recursive watch on `<repo>/.clank` plus one
-non-recursive watch on the resolved worktree gitdir.
+Two changes to `clank wfw`'s wake strategy, both driven by the
+Codex sandbox empirically breaking native notify on the gitdir:
 
-Today wfw uses fine-grained watch roots — `git_dir/HEAD`,
-`git_dir/logs/HEAD`, `git_common_dir/refs` recursive,
-`git_common_dir/packed-refs`, and three separate `.clank/{plans,
-feedback,finished}` recursive watches. More precise on paper;
-not robust in practice.
+1. **Coarse watches for `.clank/`.** One recursive watch on
+   `<repo>/.clank` replaces the three separate watches on
+   `.clank/{plans,feedback,finished}`. This part of the change
+   is unambiguously a win — fewer roots, simpler code, more
+   wakeups.
+2. **Polling fallback for git metadata, gated by env / flag.**
+   `clank wfw` accepts a new `--poll` flag. When set, wfw
+   skips the gitdir watch entirely and uses a short periodic
+   refold to pick up commits. The default is `false` (native
+   watches), but `CODEX_SANDBOX=seatbelt` flips the default to
+   `true`. The env check happens at CLI argument processing,
+   not deep in the code — `WfwArgs::resolve_poll()` returns
+   the effective bool and `WatchContext` / the watch loop take
+   it as a plain parameter.
 
-The blocking case is agents running `clank wfw` inside Codex's
-sandbox. The script-level repro at
-`/private/tmp/clank-watch-repro/repro-git-commit-timeout.sh`
-shows:
+The empirical story behind the env flag:
 
-- Outside the Codex sandbox: every fine-grained watch wake fires
-  on `git commit -m` within ~230 ms. 25+ trials clean here.
-- Inside the Codex sandbox: the same binary, same script, hits
-  `rc=2` / `wfw timed out` — the fine-grained file events never
-  reach `notify`. The 1.5 s heartbeat does eventually catch up,
-  but the immediate FS-event wake path is broken.
-- After flipping to daemon-style directory watches inside the
-  Codex sandbox: five consecutive wakes returned in ~230 ms with
-  no heartbeat involvement.
+- Outside the Codex sandbox: native gitdir watches work fine.
+  25+ trials of both shell repros pass with ~230 ms latency.
+- Inside the Codex sandbox: native gitdir watches DO NOT work,
+  even after broadening to recursive + dropping the
+  `EventKind` filter. Codex confirmed two consecutive
+  revisions where the in-sandbox repros still timed out at
+  ~1.3 s. The "no polling" hard direction the earlier draft
+  of this plan claimed turns out to be empirically wrong for
+  the sandbox: the sandbox does not deliver gitdir events to
+  notify at all, in any kind, at any depth.
+- `.clank/` directory events DO still reach notify inside the
+  sandbox. Feedback writes and finished snapshots still wake
+  wfw on the native path. Only the gitdir is broken.
 
-So the bug is environmental — Codex's sandbox filters out or
-drops the kernel-level events for individual Git files (or for
-fine-grained file paths inside the gitdir generally) but lets
-directory-level watches through. The architectural answer is to
-stop relying on individual-file precision: watch coarsely so any
-Git metadata movement wakes us.
+So the architecture is: native watches where they work,
+polling where they don't, both selectable by an explicit flag
+with a sensible env-driven default. The plan's earlier
+"no polling" rule is dropped — the sandbox empirically
+contradicts it.
 
 ## Hard Direction
 
-- **Watches are coarse and structural, not file-specific.** Two
-  roots: `<repo>/.clank` recursive and the resolved worktree
-  gitdir non-recursive. No individual-file watches. No second-
-  guessing which Git file fires for which operation.
-- **No new polling.** The existing 1.5 s heartbeat from
-  `wfw-finish-notification` stays — it's a finalize-race safety
-  net, not the primary wake mechanism — but this plan does NOT
-  add additional polling, sleeps, or retry loops. If watches
-  work, the heartbeat just doesn't fire on hot paths.
-- **Refold is the only invalidation.** Every wake (FS event or
-  heartbeat tick) refolds. The watcher tells wfw "something
-  changed under one of these roots"; refold figures out what.
+- **`.clank/` is always a native recursive watch.** Both modes
+  rely on the native watch to catch feedback / plan-file /
+  finished-snapshot writes inside `.clank/`. This works in
+  both environments. Replaces the three previous separate
+  watches.
+- **Two modes for git changes.** Native (default outside the
+  sandbox) and polling (default inside).
+  - **Native mode.** Watch the resolved worktree gitdir
+    recursively. Any write under the gitdir wakes wfw; refold
+    figures out what changed. Cheap and immediate where it
+    works.
+  - **Polling mode.** Don't watch the gitdir at all. Use a
+    bounded periodic refold (default 500 ms) as the
+    invalidation tick for git state. The fold cache makes
+    each tick cheap on warm state; the worst-case latency is
+    one tick.
+- **Env / flag selects the mode at CLI argument processing.**
+  - `--poll` / `--no-poll` is an explicit CLI flag, default
+    derived from environment.
+  - `CODEX_SANDBOX=seatbelt` flips the unset default to
+    `true`. Any other value (or unset) defaults to `false`.
+  - The check lives in CLI argument resolution, not in
+    `WatchContext`, not in the loop. The watch layer takes a
+    plain `poll: bool`.
+- **Refold is the only invalidation.** Every wake — native
+  event, periodic tick, finalize-race heartbeat — refolds.
   We don't try to classify events.
-- **Linked worktrees still work.** A linked worktree's resolved
-  gitdir (the per-worktree path under
-  `<main>/.git/worktrees/<name>/`) gets its own `index`,
-  `HEAD`, `ORIG_HEAD`, etc. on local commits. Non-recursive
-  watch there catches the `index` write — which is enough,
-  because the refold reads HEAD via `git rev-parse` against the
-  worktree.
+- **Linked worktrees still work in native mode.** The
+  per-worktree gitdir (`<main>/.git/worktrees/<name>/`) gets
+  recursive watching like the main case. In polling mode the
+  worktree question doesn't matter — we just refold.
 
-## Current vs Old Watch Shape
+## Watch Shape
 
-Current `clank wfw` watches:
-
-```text
-<resolved worktree gitdir>/HEAD          non-recursive
-<resolved worktree gitdir>/logs/HEAD     non-recursive, if present
-<git common dir>/refs                    recursive
-<git common dir>/packed-refs             non-recursive, if present
-<repo>/.clank/plans                      recursive
-<repo>/.clank/feedback                   recursive
-<repo>/.clank/finished                   recursive
-```
-
-Old Trinity daemon (the proven-to-work shape):
-
-```text
-<repo>/.trinity                          recursive
-<resolved worktree gitdir>               non-recursive
-```
-
-This plan adopts the old shape adjusted for Clank's directory
-name (`.clank` instead of `.trinity`):
+Native mode (`--no-poll`, the default outside Codex):
 
 ```text
 <repo>/.clank                            recursive
-<resolved worktree gitdir>               non-recursive
+<resolved worktree gitdir>               recursive
 ```
 
-## What Each Root Catches
+Polling mode (`--poll`, the default under
+`CODEX_SANDBOX=seatbelt`):
+
+```text
+<repo>/.clank                            recursive
+# (no gitdir watch — periodic refold instead)
+```
+
+Periodic refold interval in polling mode: 500 ms. The
+finalize-race heartbeat from `wfw-finish-notification` (1.5 s)
+stays in both modes; in polling mode it's redundant but
+harmless.
+
+## Why .clank/ stays native in both modes
 
 `<repo>/.clank` recursive catches every write Clank itself
 makes or sees: plan files, feedback, finished snapshots, and
-any subdirectory created later. Replaces three separate watches
-with one — the directory layout is no longer load-bearing on
-the watcher.
+any subdirectory created later. Replaces three separate
+watches with one — the directory layout is no longer
+load-bearing on the watcher.
 
-`<resolved worktree gitdir>` non-recursive catches the top-level
-files Git rewrites during ordinary operations:
-
-- `index` — rewritten by both `git add` AND by `git commit -m`
-  itself. Empirically verified: a `git commit -m` against an
-  already-staged change grows `.git/index` from 174 → 193 bytes
-  on a minimal repo. The post-commit index write is the
-  canonical "this worktree just produced a commit" signal.
-- `HEAD` — rewritten on checkout / symbolic-ref.
-- `packed-refs`, `ORIG_HEAD`, `MERGE_HEAD`, `FETCH_HEAD`,
-  `COMMIT_EDITMSG`, etc.
-
-Non-recursive deliberately does NOT walk into `objects/`,
-`refs/`, or `logs/`. We don't need to — the `index` write fires
-for every local commit and that's a sufficient invalidation
-signal. The proof obligation for this claim lives in the
-Tests section: a staged-before-wfw regression test isolates
-the commit-boundary write from any pre-commit `git add` noise.
-
-Cross-worktree ref pushes (where a separate process updates
-`<common>/refs/heads/<branch>` without touching this worktree's
-gitdir) are explicitly out of scope; the heartbeat catches them
-as a slow fallback if they're ever relevant.
+Empirically the Codex sandbox DOES deliver events for
+`.clank/` writes. So we leave that root native in both modes;
+polling mode's periodic refold is only for git changes, not
+for `.clank/`.
 
 ## Implementation
 
-`crates/cli/src/cli/wfw.rs::WatchContext::attach`:
+### CLI argument resolution
 
-1. `std::fs::create_dir_all(<repo>/.clank)` (replaces the
-   three-subdir create_dir_all loop).
-2. Watch `<repo>/.clank` recursively.
-3. Watch the resolved worktree gitdir (from `git rev-parse
-   --git-dir`) non-recursively. If the staged-before-wfw test
-   from the Tests section fails under non-recursive — i.e.
-   notify on this platform doesn't deliver the commit-time
-   `.git/index` rewrite — escalate to recursive. The
-   non-recursive default mirrors the old Trinity daemon's
-   proven shape; the escalation is a documented fallback, not
-   the first choice.
+`crates/cli/src/cli/mod.rs::WfwArgs` gains a tri-state `poll`
+field via clap. Three calls a user can make:
+
+```text
+clank wfw --poll       # force polling on
+clank wfw --no-poll    # force polling off
+clank wfw              # env-driven default
+```
+
+`WfwArgs::resolve_poll(env: &dyn Environment) -> bool` returns
+the effective value. With clap's `Option<bool>` + `--no-<x>`
+support, the args struct just holds `poll: Option<bool>`; the
+helper consults `CODEX_SANDBOX` only when `poll.is_none()`.
+
+```rust
+impl WfwArgs {
+    pub fn resolve_poll(&self) -> bool {
+        if let Some(b) = self.poll { return b; }
+        std::env::var("CODEX_SANDBOX").as_deref() == Ok("seatbelt")
+    }
+}
+```
+
+The env read is bound here, not anywhere downstream. Tests
+that exercise the resolve_poll logic can call it directly
+after setting / unsetting the env var.
+
+### WatchContext + watch loop
+
+`crates/cli/src/cli/wfw.rs::WatchContext` takes the resolved
+bool. Two cases:
+
+- `poll == false` (native mode): existing `clank_root +
+  git_dir` recursive watch. Heartbeat stays at 1.5 s.
+- `poll == true` (polling mode): only the `clank_root`
+  recursive watch is attached. The watch loop's
+  `recv_timeout` interval shortens to 500 ms (a "poll tick")
+  instead of 1.5 s. Each tick refolds and checks for work.
+  Native `.clank/` events still wake the loop early when
+  they fire, debounce as today, refold.
+
+The existing finalize-race heartbeat stays as-is. In polling
+mode the 500 ms tick IS the heartbeat at higher frequency;
+the 1.5 s value just becomes ineffective because the tick
+fires sooner.
+
+### Linked worktrees
+
+Native mode preserves the existing behavior — the resolved
+worktree gitdir gets recursive watch. Polling mode doesn't
+care which worktree we're in; the refold reads HEAD via
+`git rev-parse` against the cwd-repo as today.
 
 Drop:
 
@@ -172,31 +206,36 @@ continue to pass under the new shape:
 - Master/code-only wake routing
 
 `wfw_reviewer_wakes_on_code_only_commit` is one part of the
-proof, but on its own it isn't enough: that test runs
-`git add` AFTER wfw has parked. The `git add` itself rewrites
-`.git/index`, which fires under the proposed non-recursive
-gitdir watch. The subsequent `git commit -m` lands inside the
-200 ms debounce window, so the test passes even if the
-commit-time index write never fires. That's a false positive
-for the invariant we actually care about.
+native-mode proof. `wfw_reviewer_wakes_on_commit_with_index_already_staged`
+isolates the commit-boundary write from any preceding
+`git add` noise: stage BEFORE parking wfw, then run only
+`git commit -m`. Both tests must pass under both modes.
 
-**New required test: `wfw_reviewer_wakes_on_commit_with_index_already_staged`.**
-The shape isolates the commit-boundary write from any
-preceding `git add` noise:
+New required test:
+`wfw_polling_mode_wakes_on_commit_via_periodic_refold`.
 
-1. Create the repo, the plan, and alice's prior approval.
-2. Write the new code change AND `git add` it.
-3. Start `clank wfw` and wait for watcher attach (1.5 s).
-4. Run `git commit -m '[foo] code work'` and nothing else.
-5. Assert wfw exits 0 with a `Reviewer` item on the new SHA,
-   within a reasonable bound (say 10 s).
+1. Set `CODEX_SANDBOX=seatbelt` in the child's environment
+   (or pass `--poll` explicitly) so wfw runs in polling mode.
+2. Stage the code change BEFORE parking wfw.
+3. Start `clank wfw` and wait for the watcher to attach
+   (1.5 s — same as native).
+4. Run `git commit -m '[foo] code work'`.
+5. Assert wfw exits 0 with a `Reviewer` item within ~2 s.
+   The poll tick is 500 ms, so the expected latency is one
+   tick (~500 ms) plus refold; the bound is generous.
+6. Assert `wfw_test_no_gitdir_watch` (a test-only assertion
+   hook) — or simpler, verify by inspection during code
+   review — that polling-mode WatchContext doesn't register
+   a gitdir watch.
 
-If non-recursive `.git/` doesn't catch the commit-time index
-rewrite, this test fails — and the implementation must broaden
-the gitdir watch root (e.g. recursive on `.git/`) rather than
-fall back to individual-file watches. Re-introducing
-fine-grained file watches is rejected: the plan's whole point
-is that they're unreliable under Codex's sandbox.
+`WfwArgs::resolve_poll` gets its own unit tests:
+
+- `--poll` explicit → true regardless of env.
+- `--no-poll` explicit → false regardless of env.
+- No flag + `CODEX_SANDBOX=seatbelt` → true.
+- No flag + `CODEX_SANDBOX=` (empty) → false.
+- No flag + `CODEX_SANDBOX` unset → false.
+- No flag + `CODEX_SANDBOX=other-value` → false.
 
 ### Script-level Codex-sandbox repro
 
@@ -219,45 +258,55 @@ Acceptance for the repros:
 
 ## Acceptance
 
-- `clank wfw` watches exactly two paths: `<repo>/.clank`
-  recursive and the resolved worktree gitdir non-recursive.
-  `grep -n 'watcher.watch'` in `crates/cli/src/cli/wfw.rs`
-  shows two call sites.
-- No watch is configured for `HEAD`, `logs/HEAD`,
-  `packed-refs`, the common-gitdir `refs` tree, or any
-  individual file inside the gitdir.
-- The 12 existing wfw integration tests all pass after the
-  switch (including linked-worktree and code-only-commit).
-- The new `wfw_reviewer_wakes_on_commit_with_index_already_staged`
-  test passes. This is the load-bearing proof that
-  `git commit -m` alone — with no preceding `git add` event —
-  wakes wfw. If it fails on non-recursive `.git/`, the
-  implementation broadens to recursive (NOT individual-file).
-- Both shell repros (the existing one plus the new staged-
-  before-wfw variant) pass after rebuilding, inside and
-  outside the Codex sandbox.
-- The existing 1.5 s heartbeat from `wfw-finish-notification`
-  is untouched. No new polling, no new fallbacks added in this
-  plan.
-- No regression to the broader test sweep:
-  `cargo test --workspace` green; `cargo fmt --check` clean.
+- `clank wfw` accepts `--poll` / `--no-poll`. With neither,
+  the default is `false` UNLESS `CODEX_SANDBOX=seatbelt` is
+  set, in which case the default is `true`.
+- The env check happens ONLY in `WfwArgs::resolve_poll` (or
+  equivalent). `grep -rn 'CODEX_SANDBOX' crates/cli/src` shows
+  exactly one hit, in the CLI arg layer.
+- In native mode, `clank wfw` watches `<repo>/.clank` recursive
+  AND the resolved worktree gitdir recursive. Two
+  `watcher.watch(...)` calls.
+- In polling mode, `clank wfw` watches `<repo>/.clank` recursive
+  only. One `watcher.watch(...)` call. The watch loop's
+  `recv_timeout` interval is 500 ms instead of 1.5 s.
+- No watch is configured anywhere on individual files (HEAD,
+  logs/HEAD, packed-refs, etc.) in either mode.
+- All existing wfw integration tests pass under native mode
+  (the default for the test harness on developer machines).
+- The new
+  `wfw_reviewer_wakes_on_commit_with_index_already_staged`
+  test passes under native mode.
+- The new
+  `wfw_polling_mode_wakes_on_commit_via_periodic_refold` test
+  passes under polling mode (with `--poll` explicit so it's
+  deterministic regardless of `CODEX_SANDBOX`).
+- `WfwArgs::resolve_poll` unit tests cover all six flag/env
+  combinations from the Tests section.
+- Both shell repros pass inside the Codex sandbox after
+  rebuilding. The Codex environment naturally has
+  `CODEX_SANDBOX=seatbelt` set, so the default flips to
+  polling and the gitdir watch is skipped.
+- Both shell repros continue to pass outside the Codex
+  sandbox under native mode (this must not regress).
+- `cargo test --workspace` green; `cargo fmt --check` clean.
 
 ## Out of Scope
 
-- **Removing the heartbeat.** The 1.5 s heartbeat was added as
-  a finalize-race safety net; broad watches likely make it
-  unnecessary on the happy path, but removing it is a separate
-  decision and a separate code review.
-- **Cross-worktree ref pushes.** A different process updating
-  shared refs without touching the current worktree's gitdir
-  is not in scope. If a real use case for this surfaces,
-  expand the watch roots in a follow-on plan.
+- **Removing the heartbeat.** The 1.5 s finalize-race
+  heartbeat from `wfw-finish-notification` stays untouched.
+- **Cross-worktree ref pushes in native mode.** A separate
+  process updating shared refs without touching the current
+  worktree's gitdir is not in scope. The heartbeat / polling
+  catches it as a slow fallback if relevant.
 - **Switching to a different watcher backend.** `notify`'s
-  `RecommendedWatcher` (FSEvents on macOS, inotify on Linux)
-  stays.
-- **Sandbox-tolerant alternatives** (pure polling, named-pipe
-  IPC, etc.). The proposed design fits Codex's sandbox; we
-  don't pre-design for fictional future sandboxes.
+  `RecommendedWatcher` stays.
+- **Detecting other sandboxes.** Only `CODEX_SANDBOX=seatbelt`
+  flips the default. Other sandbox environments (Docker,
+  Podman, gVisor, etc.) need explicit `--poll` or their own
+  env-driven heuristic — added in a follow-on plan if needed.
+- **Tuning the poll interval.** 500 ms is the chosen value;
+  knob added later if real workloads need it.
 
 ## Open Questions
 
