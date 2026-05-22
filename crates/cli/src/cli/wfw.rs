@@ -21,7 +21,7 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::time::Duration;
 
-use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher};
+use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 
 use super::{WfwArgs, repo_basename, resolve_repo};
 use crate::cli::plan_resolve::parse_arg;
@@ -379,8 +379,17 @@ impl WatchContext {
         watcher
             .watch(&self.clank_root, RecursiveMode::Recursive)
             .map_err(|e| anyhow::anyhow!("watch `{}` failed: {e}", self.clank_root.display()))?;
+        // Recursive on the worktree gitdir, not non-recursive. The
+        // old Trinity daemon's non-recursive shape doesn't survive
+        // the Codex tool sandbox: empirically the sandbox filters
+        // out events for individual top-level files. A recursive
+        // watch picks up writes anywhere under the gitdir — index,
+        // logs/HEAD, refs/heads/*, objects/* — and we don't need
+        // to pre-guess which path the sandbox lets through. The
+        // refold cost is the same either way; we just get more
+        // wakeups.
         watcher
-            .watch(&self.git_dir, RecursiveMode::NonRecursive)
+            .watch(&self.git_dir, RecursiveMode::Recursive)
             .map_err(|e| anyhow::anyhow!("watch `{}` failed: {e}", self.git_dir.display()))?;
         Ok(())
     }
@@ -408,13 +417,15 @@ fn git_resolve_dir(repo: &Path, flag: &str) -> anyhow::Result<PathBuf> {
 fn build_watcher(tx: mpsc::Sender<()>) -> anyhow::Result<RecommendedWatcher> {
     Ok(notify::recommended_watcher(
         move |res: notify::Result<notify::Event>| {
-            if let Ok(event) = res {
-                if !matches!(
-                    event.kind,
-                    EventKind::Create(_) | EventKind::Modify(_) | EventKind::Remove(_)
-                ) {
-                    return;
-                }
+            // Any successful event wakes us — including
+            // `EventKind::Any` and `EventKind::Other`. Codex's tool
+            // sandbox empirically delivers directory-level events
+            // without a precise kind classification; filtering on
+            // Create/Modify/Remove drops them. The cost of waking
+            // on Access events too is one extra refold per touch;
+            // the refold reads HEAD and the fold cache cheaply,
+            // and the 200ms debounce drain coalesces bursts.
+            if res.is_ok() {
                 let _ = tx.send(());
             }
         },
