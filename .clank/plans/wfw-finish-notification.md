@@ -136,10 +136,24 @@ Pure — no IO, no fold mutation. `WaitingOn`, `PlanView`,
 
 `crates/cli/src/cli/wfw.rs`:
 
-1. After the initial fold + plan-filter validation, build the
-   `StartupSnapshot` from `initial_state.fold` + the resolved
-   filter. Stash it for the lifetime of the run.
-2. Each refold:
+1. **Plan-filter resolution.** `--plan <stem>` now accepts a plan
+   that's already in `finished_plans` (not just active). The
+   startup check becomes: if the resolved key is active OR
+   finished, proceed; otherwise error with the standard
+   "unknown plan" candidate list (now including finished entries).
+   - If the resolved key is active at startup → normal flow.
+   - If the resolved key is ONLY in `finished_plans` at startup
+     → emit a single `Finished` `WaitItem` carrying that plan's
+     latest `finalized_at` and exit 0. No watch loop, no fold
+     work. This is the "agent resumed with stale state" path —
+     tell them the plan ended rather than block them or fail.
+   - Unfiltered `wfw` (no `--plan`) is unchanged: it never
+     replays historical finished plans. Finished-detection only
+     covers plans that were active when wfw started.
+2. After plan-filter resolution, build the `StartupSnapshot` from
+   `initial_state.fold` + the resolved filter. Stash it for the
+   lifetime of the run.
+3. Each refold:
 
    ```rust
    let state = refold();
@@ -148,7 +162,7 @@ Pure — no IO, no fold mutation. `WaitingOn`, `PlanView`,
    if items.is_empty() { return Ok(None); }   // keep blocking
    Ok(Some(items))
    ```
-3. Remove the current `Some(_) => return Ok(None)` early-exit
+4. Remove the current `Some(_) => return Ok(None)` early-exit
    for "filtered plan disappeared mid-watch" — the
    snapshot-based detection covers it correctly.
 
@@ -225,6 +239,16 @@ ineligible).
    dropped under the work item. This is the regression that
    would have hidden under an earlier "work outranks finished"
    priority rule.
+5. **`--plan` against an already-finished plan.** Create and
+   finalize plan `foo`. Then run
+   `clank wfw --plan foo --author alice --role reviewers --timeout 1s`.
+   Assert exit 0 within ~1s (no watch loop), stdout contains
+   `finished` and `foo`. Repeat with `-j`: assert
+   `items[0].kind == "finished"`, `items[0].plan == "foo"`,
+   `items[0].finalized_at` matches the finalize commit's SHA.
+   This pins the "agent resumed with stale state" path: an
+   explicit `--plan` targets a known plan, and `wfw` should
+   tell the caller it's over rather than fail or block.
 
 ## Acceptance
 
@@ -233,6 +257,10 @@ ineligible).
   covered.
 - `clank wfw --plan <stem>` woken by that same plan finishing
   exits with a finished notice, not a timeout.
+- `clank wfw --plan <stem>` against a plan that's already in
+  `finished_plans` at startup exits 0 immediately with a single
+  `Finished` item, not an error. Scoped to explicit `--plan` —
+  unfiltered `wfw` never replays historical finished plans.
 - When work and finished both apply on one wake, the emitted
   `items[]` carries both — the mixed-case test catches a
   regression here.
@@ -262,11 +290,6 @@ ineligible).
 
 ## Open Questions
 
-- Should `wfw --plan <stem>` against a plan that's ALREADY
-  finished at startup fail at startup, or immediately emit a
-  finished `WaitItem` and exit 0? Today it'd fail (the
-  validation checks `state.fold.plans.contains_key(k)`). Lean:
-  keep the startup failure; a plan finished before you started
-  watching isn't something `wfw` should pretend it just
-  observed. Surfacing as a one-shot notice is defensible too —
-  pick at impl time.
+None outstanding. The "`--plan` against an already-finished plan"
+question is resolved in the CLI Wiring section (emit a one-shot
+`Finished` and exit 0, scoped to explicit `--plan`).
