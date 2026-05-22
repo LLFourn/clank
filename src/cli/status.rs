@@ -1,5 +1,5 @@
-//! `trinity status` — read-only summary of the current repo's
-//! Trinity state. Fully local: folds the repo, projects locally,
+//! `clank status` — read-only summary of the current repo's
+//! Clank state. Fully local: folds the repo, projects locally,
 //! reads HEAD + branch + dirty state via `git`. No daemon.
 
 use std::path::Path;
@@ -56,7 +56,7 @@ fn build_json(
         active.push(serde_json::json!({
             "slug": key.as_str(),
             "lifecycle": "active",
-            "current_path": format!(".trinity/plans/{}.md", key.as_str()),
+            "current_path": format!(".clank/plans/{}.md", key.as_str()),
             "commit_count": state.fold.plans[key].commits.len(),
         }));
     }

@@ -1,9 +1,9 @@
+use clank::cli;
 use clap::{Parser, Subcommand};
-use trinity::cli;
 
 #[derive(Parser)]
 #[command(
-    name = "trinity",
+    name = "clank",
     version,
     about = "Multi-agent peer review around watched artifacts"
 )]
@@ -14,14 +14,14 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Scaffold `.trinity/` in a repo (creates `plans/` and `.gitignore`).
+    /// Scaffold `.clank/` in a repo (creates `plans/` and `.gitignore`).
     Init(cli::InitArgs),
     /// Finalize an approved plan: seal the approving feedback into
-    /// `.trinity/finished/<stem>/` and commit.
+    /// `.clank/finished/<stem>/` and commit.
     Finish(cli::FinishArgs),
-    /// Strip a plan's `.trinity/` artifacts from history.
+    /// Strip a plan's `.clank/` artifacts from history.
     Purge(cli::PurgeArgs),
-    /// Print the repo's Trinity state (HEAD, plans, phases).
+    /// Print the repo's Clank state (HEAD, plans, phases).
     Status(cli::StatusArgs),
 }
 
@@ -40,7 +40,7 @@ async fn main() -> anyhow::Result<()> {
 fn init_tracing() {
     use tracing_subscriber::{EnvFilter, fmt};
     let filter =
-        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("trinity=info,warn"));
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("clank=info,warn"));
     fmt()
         .with_env_filter(filter)
         .with_target(false)

@@ -25,7 +25,7 @@ pub struct FeedbackPath {
 /// What a feedback file targets. Phase 4 of
 /// `commit-first-review-model` adds `AdHoc` so commits touching no
 /// plan file are reviewable as first-class units; their feedback
-/// lives at `.trinity/feedback/_/<sha>/<author>.md`.
+/// lives at `.clank/feedback/_/<sha>/<author>.md`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FeedbackTarget {
     Plan(PlanKey),
@@ -51,7 +51,7 @@ impl FeedbackPath {
     }
 }
 
-/// Parse a path relative to `<repo>/.trinity/feedback/` into a
+/// Parse a path relative to `<repo>/.clank/feedback/` into a
 /// `FeedbackPath`. Expected shape:
 ///
 /// `<plan-key>/<target-sha>/<author>.md`
@@ -100,7 +100,7 @@ pub fn parse_feedback_path(rel: &Path) -> Option<FeedbackPath> {
     })
 }
 
-/// A parsed `.trinity/finished/<plan-stem>/<author>.md` path — one
+/// A parsed `.clank/finished/<plan-stem>/<author>.md` path — one
 /// approving-reviewer entry inside a finalize snapshot.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FinalizePath {
@@ -109,7 +109,7 @@ pub struct FinalizePath {
     pub raw: PathBuf,
 }
 
-/// Parse a path relative to `<repo>/.trinity/finished/` into a
+/// Parse a path relative to `<repo>/.clank/finished/` into a
 /// `FinalizePath`. Expected shape:
 ///
 /// `<plan-stem>/<author>.md` (flat — no per-SHA subdirectory).
@@ -147,7 +147,7 @@ pub fn finalize_first_line_starts_with_approve(first_line: &str) -> bool {
 
 /// Build the canonical relative feedback path
 /// `<plan-key>/<target-sha>/<author>.md` (the part under
-/// `.trinity/feedback/`).
+/// `.clank/feedback/`).
 pub fn canonical_feedback_path(
     plan_key: &PlanKey,
     target_sha: &CommitSha,
@@ -162,21 +162,21 @@ pub fn canonical_feedback_path(
 }
 
 /// Build the repo-relative wire-form feedback path
-/// `.trinity/feedback/<plan-key>/<sha>/<author>.md`. This is the
+/// `.clank/feedback/<plan-key>/<sha>/<author>.md`. This is the
 /// string that lives on `WorkPayload` action variants and on
 /// `StaleReview.path`. Single source of truth for the wire shape so
 /// projection (`responses::build_work_payload`) and the stale-review
 /// collector cannot drift.
 pub fn feedback_path_wire(plan_key: &PlanKey, sha: &str, author: &AgentLabel) -> String {
     format!(
-        ".trinity/feedback/{}/{}/{}.md",
+        ".clank/feedback/{}/{}/{}.md",
         plan_key.as_str(),
         sha,
         author.as_str()
     )
 }
 
-/// Plausible SHA-1 segment: hex string of length 7–40. Trinity accepts
+/// Plausible SHA-1 segment: hex string of length 7–40. Clank accepts
 /// shortened SHAs in path segments since git accepts them and reviewers
 /// commonly paste short SHAs.
 fn is_sha_segment(s: &str) -> bool {

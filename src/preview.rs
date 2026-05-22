@@ -1,4 +1,4 @@
-//! Local preview projection for `trinity finish` / `trinity purge`.
+//! Local preview projection for `clank finish` / `clank purge`.
 //! Operates against a freshly-folded [`RepoState`] (the new sans-io
 //! fold) plus git_io + on-disk feedback files.
 
@@ -8,15 +8,15 @@ use std::path::Path;
 use crate::disk_format::{FeedbackTarget, parse_verdict};
 use crate::git_io::{
     self, GitIoError, commit_parent_count, diff_tree_changes, first_parent_commits_to,
-    rev_parse_head, tree_plan_paths, tree_trinity_paths,
+    rev_parse_head, tree_clank_paths, tree_plan_paths,
 };
 use crate::lifecycle::{AgentLabel, CommitSha, PlanKey, RepoBasename, content_hash};
 use crate::repo_state::RepoState;
-use trinity_core::api::{
+use clank_core::api::{
     FinalizeBlockReason, FinalizeReadiness, FinishPreviewResponse, PurgeAllPreviewResponse,
     RewriteCommit, RewriteDisposition, RewritePreviewResponse, SealedApproval,
 };
-use trinity_core::vocab::{CommitGateState, PlanWorktreeStatus, Verdict};
+use clank_core::vocab::{CommitGateState, PlanWorktreeStatus, Verdict};
 
 #[derive(Debug, thiserror::Error)]
 pub enum PreviewError {
@@ -46,7 +46,7 @@ pub async fn build_finish_preview(
     let basename = RepoBasename::from_repo_root(repo_root)
         .ok_or_else(|| PreviewError::UnknownRepo(repo_root.display().to_string()))?;
     let plan_id_str = format!("{}/{}.md", basename.as_str(), plan_key.as_str());
-    let plan_path = format!(".trinity/plans/{}.md", plan_key.as_str());
+    let plan_path = format!(".clank/plans/{}.md", plan_key.as_str());
 
     let is_finished = state
         .fold
@@ -97,7 +97,7 @@ pub async fn build_finish_preview(
 }
 
 /// Single-plan rewrite preview. `include_finalize=true` strips the
-/// `.trinity/finished/<stem>/` snapshot too (purge mode).
+/// `.clank/finished/<stem>/` snapshot too (purge mode).
 pub async fn build_rewrite_preview(
     repo_root: &Path,
     state: &RepoState,
@@ -178,13 +178,13 @@ pub async fn build_rewrite_preview(
         let strippable_in_tree =
             tree_plan_paths(repo_root, &meta.sha, plan_key.as_str(), include_finalize).await?;
         let strip_predicate_for_diff = |p: &str| -> bool {
-            p == format!(".trinity/plans/{}.md", plan_key.as_str())
+            p == format!(".clank/plans/{}.md", plan_key.as_str())
                 || (include_finalize
-                    && p.starts_with(&format!(".trinity/finished/{}/", plan_key.as_str())))
+                    && p.starts_with(&format!(".clank/finished/{}/", plan_key.as_str())))
         };
         let contributes_non_strippable = changes.has_non_plan_code_changes
             || changes
-                .trinity_paths_touched
+                .clank_paths_touched
                 .iter()
                 .any(|p| !strip_predicate_for_diff(p));
         let attributed = native_shas.contains(&meta.sha);
@@ -214,7 +214,7 @@ pub async fn build_rewrite_preview(
 }
 
 /// All-plans rewrite preview. Walks first-parent from HEAD, finds
-/// the earliest `.trinity/` touch, classifies the range.
+/// the earliest `.clank/` touch, classifies the range.
 pub async fn build_rewrite_preview_all(
     repo_root: &Path,
     include_finalize: bool,
@@ -242,7 +242,7 @@ pub async fn build_rewrite_preview_all(
         for fc in &changes.finalize_changes {
             plans_seen.insert(fc.plan_key.clone());
         }
-        if intro_pos.is_none() && changes.touched_trinity {
+        if intro_pos.is_none() && changes.touched_clank {
             intro_pos = Some(idx);
         }
         per_commit.push((meta, changes, is_merge));
@@ -258,17 +258,17 @@ pub async fn build_rewrite_preview_all(
             let intro_sha = Some(per_commit[start].0.sha.clone());
             let mut commits = Vec::with_capacity(per_commit.len() - start);
             for (meta, changes, _) in &per_commit[start..] {
-                let tree_trinity = tree_trinity_paths(repo_root, &meta.sha).await?;
-                let strippable_in_tree: Vec<String> = tree_trinity
+                let tree_clank = tree_clank_paths(repo_root, &meta.sha).await?;
+                let strippable_in_tree: Vec<String> = tree_clank
                     .into_iter()
-                    .filter(|p| include_finalize || !p.starts_with(".trinity/finished/"))
+                    .filter(|p| include_finalize || !p.starts_with(".clank/finished/"))
                     .collect();
                 let contributes_non_strippable = changes.has_non_plan_code_changes
                     || (!include_finalize
                         && changes
-                            .trinity_paths_touched
+                            .clank_paths_touched
                             .iter()
-                            .any(|p| p.starts_with(".trinity/finished/")));
+                            .any(|p| p.starts_with(".clank/finished/")));
                 let (disposition, strip_paths) =
                     classify_from_tree(contributes_non_strippable, &strippable_in_tree);
                 commits.push(RewriteCommit {
@@ -284,10 +284,10 @@ pub async fn build_rewrite_preview_all(
         None => (None, Vec::new()),
     };
 
-    let head_strip_paths: Vec<String> = tree_trinity_paths(repo_root, &head_sha)
+    let head_strip_paths: Vec<String> = tree_clank_paths(repo_root, &head_sha)
         .await?
         .into_iter()
-        .filter(|p| include_finalize || !p.starts_with(".trinity/finished/"))
+        .filter(|p| include_finalize || !p.starts_with(".clank/finished/"))
         .collect();
 
     Ok(PurgeAllPreviewResponse {
@@ -434,7 +434,7 @@ pub fn compute_finalize_readiness(
 
 /// The plan's latest reviewable commit SHA (last touched_plan ||
 /// touched_code event). `None` when the plan has no commits yet.
-fn latest_reviewable_sha(ps: &trinity_core::repo_state::PlanState) -> Option<CommitSha> {
+fn latest_reviewable_sha(ps: &clank_core::repo_state::PlanState) -> Option<CommitSha> {
     ps.commits
         .iter()
         .rev()
@@ -443,7 +443,7 @@ fn latest_reviewable_sha(ps: &trinity_core::repo_state::PlanState) -> Option<Com
 }
 
 /// Worktree status: compare the file's worktree content (if any) to
-/// HEAD's blob via `git show HEAD:.trinity/plans/<plan>.md`.
+/// HEAD's blob via `git show HEAD:.clank/plans/<plan>.md`.
 async fn worktree_status(
     repo_root: &Path,
     plan_path: &str,
@@ -497,7 +497,7 @@ async fn compute_gate(
             continue;
         }
         let dir = repo_root
-            .join(".trinity/feedback")
+            .join(".clank/feedback")
             .join(plan_key.as_str())
             .join(ev.sha.as_str());
         let entries = match std::fs::read_dir(&dir) {
@@ -639,18 +639,18 @@ mod tests {
     #[tokio::test]
     async fn finished_plan_rewrite_preview_uses_repo_history() {
         let dir = init_repo();
-        write_file(dir.path(), ".trinity/plans/a.md", "# a\n");
+        write_file(dir.path(), ".clank/plans/a.md", "# a\n");
         commit(dir.path(), "[a] intro");
-        write_file(dir.path(), ".trinity/plans/b.md", "# b\n");
+        write_file(dir.path(), ".clank/plans/b.md", "# b\n");
         commit(dir.path(), "[b] intro");
         write_file(dir.path(), "src.rs", "fn main() {}\n");
-        write_file(dir.path(), ".trinity/plans/a.md", "# a v2\n");
-        write_file(dir.path(), ".trinity/plans/b.md", "# b v2\n");
+        write_file(dir.path(), ".clank/plans/a.md", "# a v2\n");
+        write_file(dir.path(), ".clank/plans/b.md", "# b v2\n");
         commit(dir.path(), "[a,b] shared work");
         // Approve b and finalize.
         write_file(
             dir.path(),
-            ".trinity/finished/b/alice.md",
+            ".clank/finished/b/alice.md",
             "APPROVE\n\nlgtm\n",
         );
         commit(dir.path(), "Finalize b");

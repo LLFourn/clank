@@ -1,6 +1,6 @@
 //! Daemon-side in-memory repo state. Wraps the sans-io fold
-//! ([`trinity_core::repo_state::RepoState`]) with daemon-only
-//! runtime identity (`root`, `head`) and the multi-repo `Trinity`
+//! ([`clank_core::repo_state::RepoState`]) with daemon-only
+//! runtime identity (`root`, `head`) and the multi-repo `Clank`
 //! container.
 
 use std::collections::{BTreeMap, VecDeque};
@@ -8,16 +8,16 @@ use std::path::PathBuf;
 
 use crate::lifecycle::{AgentLabel, CommitSha, PlanKey, RepoBasename};
 
-pub use trinity_core::PlanLifecycle;
-pub use trinity_core::Verdict;
-pub use trinity_core::api::WaitingOn;
-pub use trinity_core::{PlanWorktreeStatus, Posture};
-pub use trinity_core::{WaitingReason, WaitingRole};
+pub use clank_core::PlanLifecycle;
+pub use clank_core::Verdict;
+pub use clank_core::api::WaitingOn;
+pub use clank_core::{PlanWorktreeStatus, Posture};
+pub use clank_core::{WaitingReason, WaitingRole};
 
 pub type RepoRoot = PathBuf;
 
 #[derive(Debug, Default)]
-pub struct Trinity {
+pub struct Clank {
     pub repos: BTreeMap<RepoRoot, RepoState>,
     pub repo_basenames: BTreeMap<RepoBasename, RepoRoot>,
     pub live_events: VecDeque<LiveEvent>,
@@ -34,7 +34,7 @@ pub struct Trinity {
 pub struct RepoState {
     pub root: PathBuf,
     pub head: Option<CommitSha>,
-    pub fold: trinity_core::repo_state::RepoState,
+    pub fold: clank_core::repo_state::RepoState,
 }
 
 impl RepoState {
@@ -42,14 +42,14 @@ impl RepoState {
         Self {
             root,
             head: None,
-            fold: trinity_core::repo_state::RepoState::default(),
+            fold: clank_core::repo_state::RepoState::default(),
         }
     }
 
     /// Stable digest over every meaningful field.
     pub fn digest(&self) -> StateDigest {
         let mut hasher = blake3::Hasher::new();
-        hasher.update(b"trinity-state-v3\n");
+        hasher.update(b"clank-state-v3\n");
         hasher.update(self.root.to_string_lossy().as_bytes());
         hasher.update(b"\nhead=");
         hasher.update(
@@ -130,7 +130,7 @@ impl LiveEvent {
 pub struct RepoEvent {
     pub ts: i64,
     pub repo: RepoRoot,
-    pub payload: trinity_core::api::RepoEventPayload,
+    pub payload: clank_core::api::RepoEventPayload,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -139,5 +139,5 @@ pub struct PlanEvent {
     pub repo: RepoRoot,
     pub plan_id: crate::lifecycle::PlanId,
     pub lifecycle: PlanLifecycle,
-    pub payload: trinity_core::api::PlanEventPayload,
+    pub payload: clank_core::api::PlanEventPayload,
 }

@@ -1,12 +1,12 @@
-//! Parse `git diff` output into typed `trinity_core::api` structures.
+//! Parse `git diff` output into typed `clank_core::api` structures.
 //!
 //! The parser writes directly into the wire types so there's no
 //! duplicate diff-DTO family in the daemon (`FileDiff` etc. live in
-//! `trinity_core::api`) and no boundary mapper. The path-based
+//! `clank_core::api`) and no boundary mapper. The path-based
 //! always-folded rule (lockfiles, generated fixtures) is applied
 //! here as the parser sets `FileDiff.always_folded`.
 
-use trinity_core::api::{DiffHunk, DiffLine, FileDiff, FileDiffMode};
+use clank_core::api::{DiffHunk, DiffLine, FileDiff, FileDiffMode};
 
 pub fn parse_diff(raw: &str) -> Vec<FileDiff> {
     let mut files = Vec::new();

@@ -87,7 +87,7 @@ pub async fn rev_parse_head(repo: &Path) -> Result<Option<CommitSha>, GitIoError
     }
 }
 
-/// A committed plan file under `.trinity/plans/` (or `.trinity/plans/done/`).
+/// A committed plan file under `.clank/plans/` (or `.clank/plans/done/`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PlanEntry {
     /// Path relative to the repo root.
@@ -95,13 +95,13 @@ pub struct PlanEntry {
     pub blob_sha: String,
 }
 
-/// `git ls-tree -r HEAD -- .trinity/plans/` parsed into structured entries.
+/// `git ls-tree -r HEAD -- .clank/plans/` parsed into structured entries.
 ///
 /// Returns an empty vec if the path doesn't exist in HEAD.
 pub async fn ls_tree_plans(repo: &Path, head: &CommitSha) -> Result<Vec<PlanEntry>, GitIoError> {
     let output = run(
         repo,
-        &["ls-tree", "-r", "--", head.as_str(), ".trinity/plans/"],
+        &["ls-tree", "-r", "--", head.as_str(), ".clank/plans/"],
     )
     .await?;
     // Path-not-in-tree is `exit 0` with empty output, but older git versions
@@ -147,7 +147,7 @@ pub async fn show_blob(
     run_ok_raw(repo, &["show", &spec]).await
 }
 
-/// List `(filename, content)` pairs under `.trinity/finished/<stem>/`
+/// List `(filename, content)` pairs under `.clank/finished/<stem>/`
 /// in the tree at `rev`. Returned in lexicographic filename order.
 /// Empty when the directory doesn't exist at that rev. Used to surface
 /// the approval snapshot a finalize commit sealed.
@@ -156,7 +156,7 @@ pub async fn read_finalize_snapshot(
     rev: &CommitSha,
     stem: &str,
 ) -> Result<Vec<(String, String)>, GitIoError> {
-    let dir = format!(".trinity/finished/{stem}/");
+    let dir = format!(".clank/finished/{stem}/");
     let output = run(repo, &["ls-tree", "-r", "--", rev.as_str(), &dir]).await?;
     if !output.status.success() {
         return Ok(Vec::new());
@@ -216,7 +216,7 @@ pub async fn show_commit(repo: &Path, sha: &CommitSha) -> Result<String, GitIoEr
 }
 
 /// True iff the plan's finish predicate is satisfied at `tree`:
-/// `.trinity/finished/<plan>/` has ≥1 file AND every file's first
+/// `.clank/finished/<plan>/` has ≥1 file AND every file's first
 /// line starts with `APPROVE`. Used by the stateless
 /// `newly_finished` computation in `disk_snapshot::enrich_with_newly_finished`.
 pub async fn finish_predicate_at(
@@ -364,13 +364,13 @@ pub async fn first_added_commit(
 ///
 /// We deliberately don't try to bound by an `<intro>..HEAD` range: with
 /// multiple sessions each having their own intro, identifying the
-/// topologically earliest plan_intro requires a separate query. Trinity
+/// topologically earliest plan_intro requires a separate query. Clank
 /// repos are small enough that walking from the root is cheap and avoids
 /// a correctness footgun.
-/// List a single plan's strippable `.trinity/` paths in the tree
-/// at `sha`: `.trinity/plans/<stem>.md` (when present) plus, when
+/// List a single plan's strippable `.clank/` paths in the tree
+/// at `sha`: `.clank/plans/<stem>.md` (when present) plus, when
 /// `include_finalize` is true, every path under
-/// `.trinity/finished/<stem>/`. Sorted. Used by the single-plan
+/// `.clank/finished/<stem>/`. Sorted. Used by the single-plan
 /// rewrite preview so classification can be tree-based instead of
 /// diff-touch based.
 pub async fn tree_plan_paths(
@@ -379,9 +379,9 @@ pub async fn tree_plan_paths(
     stem: &str,
     include_finalize: bool,
 ) -> Result<Vec<String>, GitIoError> {
-    let mut pathspecs: Vec<String> = vec![format!(".trinity/plans/{stem}.md")];
+    let mut pathspecs: Vec<String> = vec![format!(".clank/plans/{stem}.md")];
     if include_finalize {
-        pathspecs.push(format!(".trinity/finished/{stem}/"));
+        pathspecs.push(format!(".clank/finished/{stem}/"));
     }
     let mut args: Vec<String> = vec![
         "ls-tree".into(),
@@ -406,14 +406,14 @@ pub async fn tree_plan_paths(
     Ok(paths)
 }
 
-/// List every blob path under `.trinity/` in the tree at `sha`.
-/// Returned sorted. Empty when the tree has no `.trinity/` paths.
+/// List every blob path under `.clank/` in the tree at `sha`.
+/// Returned sorted. Empty when the tree has no `.clank/` paths.
 /// Used by the all-plans rewrite preview to compute strip_paths
 /// from what's actually IN the tree, not what the commit's diff
 /// touched — because every post-intro commit's tree inherits
-/// `.trinity/` content from its parent even when the commit's diff
-/// didn't touch `.trinity/`.
-pub async fn tree_trinity_paths(repo: &Path, sha: &CommitSha) -> Result<Vec<String>, GitIoError> {
+/// `.clank/` content from its parent even when the commit's diff
+/// didn't touch `.clank/`.
+pub async fn tree_clank_paths(repo: &Path, sha: &CommitSha) -> Result<Vec<String>, GitIoError> {
     let output = run(
         repo,
         &[
@@ -422,7 +422,7 @@ pub async fn tree_trinity_paths(repo: &Path, sha: &CommitSha) -> Result<Vec<Stri
             "--name-only",
             "--",
             sha.as_str(),
-            ".trinity/",
+            ".clank/",
         ],
     )
     .await?;
@@ -556,7 +556,7 @@ pub async fn commit_message(repo: &Path, sha: &CommitSha) -> Result<(String, Str
 /// For the root commit (no parent), uses `--root` form to enumerate its
 /// added files.
 ///
-/// For added/modified `.trinity/finished/<stem>/<file>` paths this also
+/// For added/modified `.clank/finished/<stem>/<file>` paths this also
 /// shells out to `git show <sha>:<path>` to capture the body's first
 /// non-empty line (what the finalize rule's APPROVE check reads).
 pub async fn diff_tree_changes(repo: &Path, sha: &CommitSha) -> Result<CommitChanges, GitIoError> {
@@ -590,7 +590,7 @@ pub async fn diff_tree_changes(repo: &Path, sha: &CommitSha) -> Result<CommitCha
     let mut changes = parsed.changes;
     for upsert in parsed.finalize_upserts {
         let path = format!(
-            ".trinity/finished/{}/{}",
+            ".clank/finished/{}/{}",
             upsert.plan_key.as_str(),
             upsert.file_name
         );
@@ -638,9 +638,9 @@ fn parse_diff_tree(stdout: &str) -> Result<ParsedDiffTree, GitIoError> {
     let mut finalize_changes: Vec<FinalizeChange> = Vec::new();
     let mut finalize_upserts: Vec<FinalizeUpsertPath> = Vec::new();
     let plan_body_paths: Vec<(usize, PathBuf)> = Vec::new();
-    let mut trinity_paths: Vec<String> = Vec::new();
-    let mut trinity_paths_touched: Vec<String> = Vec::new();
-    let mut touched_trinity = false;
+    let mut clank_paths: Vec<String> = Vec::new();
+    let mut clank_paths_touched: Vec<String> = Vec::new();
+    let mut touched_clank = false;
 
     for line in stdout.lines() {
         let line = line.trim_end_matches('\r');
@@ -669,37 +669,37 @@ fn parse_diff_tree(stdout: &str) -> Result<ParsedDiffTree, GitIoError> {
 
         let new_rel = PathBuf::from(new_path);
         let old_rel = old_path.map(PathBuf::from);
-        // Track every `.trinity/`-prefixed DESTINATION path the
+        // Track every `.clank/`-prefixed DESTINATION path the
         // commit added/modified/renamed into existence. Source of
         // truth for the all-plans purge endpoint's strip_paths.
         // Skip pure deletions: their "new path" is absent from the
         // resulting tree, so there's nothing to strip there.
         let is_pure_delete = status_char == 'D' && !is_rename;
-        if new_rel.starts_with(".trinity") && !is_pure_delete {
-            trinity_paths.push(new_path.to_string());
+        if new_rel.starts_with(".clank") && !is_pure_delete {
+            clank_paths.push(new_path.to_string());
         }
-        // Track whether the commit touched ANY `.trinity/` path on
+        // Track whether the commit touched ANY `.clank/` path on
         // either side (including pure deletes and renames out of
-        // `.trinity/`). The all-plans classifier uses this to make
-        // a delete-only Trinity commit `Drop` instead of
+        // `.clank/`). The all-plans classifier uses this to make
+        // a delete-only Clank commit `Drop` instead of
         // `KeepVerbatim`.
-        let new_in_trinity = new_rel.starts_with(".trinity");
-        let old_in_trinity = old_rel.as_ref().is_some_and(|p| p.starts_with(".trinity"));
-        if new_in_trinity || old_in_trinity {
-            touched_trinity = true;
+        let new_in_clank = new_rel.starts_with(".clank");
+        let old_in_clank = old_rel.as_ref().is_some_and(|p| p.starts_with(".clank"));
+        if new_in_clank || old_in_clank {
+            touched_clank = true;
         }
-        // Bidirectional path list: every `.trinity/`-prefixed path
+        // Bidirectional path list: every `.clank/`-prefixed path
         // this commit's diff touched on either side. Captures
         // destinations of adds/modifies/renames AND sources of
         // deletes/renames-out. Used by the contribution check so a
         // commit that deletes a preserved path (e.g. removing
         // another plan's file under a single-plan purge) isn't
         // silently dropped.
-        if new_in_trinity {
-            trinity_paths_touched.push(new_path.to_string());
+        if new_in_clank {
+            clank_paths_touched.push(new_path.to_string());
         }
-        if old_in_trinity && let Some(old) = old_path {
-            trinity_paths_touched.push(old.to_string());
+        if old_in_clank && let Some(old) = old_path {
+            clank_paths_touched.push(old.to_string());
         }
         let new_is_plan = is_plan_path(&new_rel);
         let old_is_plan = old_path
@@ -712,7 +712,7 @@ fn parse_diff_tree(stdout: &str) -> Result<ParsedDiffTree, GitIoError> {
         if new_is_plan || old_is_plan {
             // Resolve the plan key on each side. With nested-path
             // rejection (Phase 5 of event-log-and-finished), every
-            // `.trinity/plans/X.md` path uniquely identifies stem X,
+            // `.clank/plans/X.md` path uniquely identifies stem X,
             // so old and new keys differ iff the rename crosses
             // stems.
             let new_key = if new_is_plan {
@@ -727,8 +727,8 @@ fn parse_diff_tree(stdout: &str) -> Result<ParsedDiffTree, GitIoError> {
             if let (true, Some(old_k), Some(new_k)) = (is_rename, &old_key, &new_key)
                 && old_k != new_k
             {
-                // Cross-stem rename `git mv .trinity/plans/foo.md
-                // .trinity/plans/bar.md`. Model as delete-old +
+                // Cross-stem rename `git mv .clank/plans/foo.md
+                // .clank/plans/bar.md`. Model as delete-old +
                 // intro-new.
                 plan_touches.push(PlanTouch {
                     plan: old_k.clone(),
@@ -741,8 +741,8 @@ fn parse_diff_tree(stdout: &str) -> Result<ParsedDiffTree, GitIoError> {
                     new_path: Some(new_rel.clone()),
                 });
             } else if is_rename && old_is_plan && !new_is_plan {
-                // Rename OUT of `.trinity/plans/<key>.md` (e.g. into
-                // `.trinity/plans/done/`). The plan key no longer
+                // Rename OUT of `.clank/plans/<key>.md` (e.g. into
+                // `.clank/plans/done/`). The plan key no longer
                 // lives at a flat plan path — model as Delete.
                 if let Some(old_k) = old_key {
                     plan_touches.push(PlanTouch {
@@ -752,7 +752,7 @@ fn parse_diff_tree(stdout: &str) -> Result<ParsedDiffTree, GitIoError> {
                     });
                 }
             } else if is_rename && !old_is_plan && new_is_plan {
-                // Rename INTO `.trinity/plans/<key>.md` from somewhere
+                // Rename INTO `.clank/plans/<key>.md` from somewhere
                 // else (e.g. resurrecting a plan from done/). Model
                 // as Intro on the new key.
                 if let Some(new_k) = new_key {
@@ -824,23 +824,23 @@ fn parse_diff_tree(stdout: &str) -> Result<ParsedDiffTree, GitIoError> {
                     });
                 }
             }
-        } else if !new_rel.starts_with(".trinity") {
+        } else if !new_rel.starts_with(".clank") {
             has_non_plan_code_changes = true;
         }
     }
 
-    trinity_paths.sort();
-    trinity_paths.dedup();
-    trinity_paths_touched.sort();
-    trinity_paths_touched.dedup();
+    clank_paths.sort();
+    clank_paths.dedup();
+    clank_paths_touched.sort();
+    clank_paths_touched.dedup();
     Ok(ParsedDiffTree {
         changes: CommitChanges {
             plan_touches,
             has_non_plan_code_changes,
             finalize_changes,
-            trinity_paths,
-            touched_trinity,
-            trinity_paths_touched,
+            clank_paths,
+            touched_clank,
+            clank_paths_touched,
         },
         finalize_upserts,
         plan_body_paths,
@@ -848,7 +848,7 @@ fn parse_diff_tree(stdout: &str) -> Result<ParsedDiffTree, GitIoError> {
 }
 
 fn parse_finalize_subpath(rel: &Path) -> Option<(PlanKey, String)> {
-    let under = rel.strip_prefix(".trinity/finished").ok()?;
+    let under = rel.strip_prefix(".clank/finished").ok()?;
     let parsed = parse_finalize_path(under)?;
     let file_name = parsed
         .raw
@@ -898,12 +898,12 @@ pub async fn snapshot(repo_root: &Path) -> Result<CommitSnapshot, GitIoError> {
     })
 }
 
-/// Walk `<repo>/.trinity/feedback/` and return every well-formed
+/// Walk `<repo>/.clank/feedback/` and return every well-formed
 /// feedback file with its body and mtime. Public for the live
 /// overlay path in `rebuild_repo` and any caller that wants the
 /// raw feedback set.
 pub fn collect_feedback_files(repo_root: &Path) -> Result<Vec<FeedbackBlob>, GitIoError> {
-    let feedback_root = repo_root.join(".trinity").join("feedback");
+    let feedback_root = repo_root.join(".clank").join("feedback");
     if !feedback_root.exists() {
         return Ok(Vec::new());
     }
@@ -985,12 +985,12 @@ fn walk_files(root: &Path, max_depth: usize, out: &mut Vec<PathBuf>) -> std::io:
 }
 
 fn is_plan_path(rel: &Path) -> bool {
-    // `.trinity/plans/<name>.md` (no nested subdirs).
+    // `.clank/plans/<name>.md` (no nested subdirs).
     let mut comps = rel.components().filter_map(|c| match c {
         std::path::Component::Normal(s) => s.to_str(),
         _ => None,
     });
-    if comps.next() != Some(".trinity") {
+    if comps.next() != Some(".clank") {
         return false;
     }
     if comps.next() != Some("plans") {
@@ -1009,18 +1009,18 @@ mod tests {
 
     #[test]
     fn is_plan_path_active() {
-        assert!(is_plan_path(&PathBuf::from(".trinity/plans/foo.md")));
+        assert!(is_plan_path(&PathBuf::from(".clank/plans/foo.md")));
     }
 
     #[test]
     fn is_plan_path_rejects_done_subdir() {
-        assert!(!is_plan_path(&PathBuf::from(".trinity/plans/done/foo.md")));
+        assert!(!is_plan_path(&PathBuf::from(".clank/plans/done/foo.md")));
     }
 
     #[test]
     fn is_not_plan_path_feedback() {
         assert!(!is_plan_path(&PathBuf::from(
-            ".trinity/feedback/foo/plan/alice.md"
+            ".clank/feedback/foo/plan/alice.md"
         )));
     }
 
@@ -1031,12 +1031,12 @@ mod tests {
 
     #[test]
     fn is_not_plan_path_too_deep() {
-        assert!(!is_plan_path(&PathBuf::from(".trinity/plans/sub/foo.md")));
+        assert!(!is_plan_path(&PathBuf::from(".clank/plans/sub/foo.md")));
     }
 
     #[test]
     fn parse_diff_tree_single_plan_intro() {
-        let stdout = "A\t.trinity/plans/foo.md\n";
+        let stdout = "A\t.clank/plans/foo.md\n";
         let parsed = parse_diff_tree(stdout).unwrap();
         let changes = &parsed.changes;
         assert_eq!(changes.plan_touches.len(), 1);
@@ -1044,17 +1044,17 @@ mod tests {
         assert!(matches!(changes.plan_touches[0].kind, PlanTouchKind::Intro));
         assert_eq!(
             changes.plan_touches[0].new_path.as_deref(),
-            Some(Path::new(".trinity/plans/foo.md"))
+            Some(Path::new(".clank/plans/foo.md"))
         );
         assert!(!changes.has_non_plan_code_changes);
     }
 
     /// Regression for codex on 004fbcb: renaming a plan OUT of
-    /// `.trinity/plans/<key>.md` (e.g. into `done/`) must Delete the
+    /// `.clank/plans/<key>.md` (e.g. into `done/`) must Delete the
     /// plan key, not Revise it into a non-plan path.
     #[test]
     fn parse_diff_tree_rename_out_of_plans_is_delete() {
-        let stdout = "R100\t.trinity/plans/foo.md\t.trinity/plans/done/foo.md\n";
+        let stdout = "R100\t.clank/plans/foo.md\t.clank/plans/done/foo.md\n";
         let parsed = parse_diff_tree(stdout).unwrap();
         let changes = &parsed.changes;
         assert_eq!(changes.plan_touches.len(), 1);
@@ -1069,11 +1069,11 @@ mod tests {
         );
     }
 
-    /// Mirror case: renaming a file INTO `.trinity/plans/<key>.md`
+    /// Mirror case: renaming a file INTO `.clank/plans/<key>.md`
     /// must Intro the plan.
     #[test]
     fn parse_diff_tree_rename_into_plans_is_intro() {
-        let stdout = "R100\t.trinity/plans/done/foo.md\t.trinity/plans/foo.md\n";
+        let stdout = "R100\t.clank/plans/done/foo.md\t.clank/plans/foo.md\n";
         let parsed = parse_diff_tree(stdout).unwrap();
         let changes = &parsed.changes;
         assert_eq!(changes.plan_touches.len(), 1);
@@ -1084,7 +1084,7 @@ mod tests {
 
     #[test]
     fn parse_diff_tree_plan_revision_with_code() {
-        let stdout = "M\t.trinity/plans/foo.md\nM\tsrc/lib.rs\n";
+        let stdout = "M\t.clank/plans/foo.md\nM\tsrc/lib.rs\n";
         let parsed = parse_diff_tree(stdout).unwrap();
         let changes = &parsed.changes;
         assert_eq!(changes.plan_touches.len(), 1);
@@ -1106,7 +1106,7 @@ mod tests {
 
     #[test]
     fn parse_diff_tree_multi_plan_touch() {
-        let stdout = "M\t.trinity/plans/foo.md\nA\t.trinity/plans/bar.md\nM\tsrc/lib.rs\n";
+        let stdout = "M\t.clank/plans/foo.md\nA\t.clank/plans/bar.md\nM\tsrc/lib.rs\n";
         let parsed = parse_diff_tree(stdout).unwrap();
         let changes = &parsed.changes;
         assert_eq!(changes.plan_touches.len(), 2);
@@ -1114,8 +1114,8 @@ mod tests {
     }
 
     #[test]
-    fn parse_diff_tree_ignores_other_trinity_paths() {
-        let stdout = "A\t.trinity/feedback/foo/plan/alice.md\n";
+    fn parse_diff_tree_ignores_other_clank_paths() {
+        let stdout = "A\t.clank/feedback/foo/plan/alice.md\n";
         let parsed = parse_diff_tree(stdout).unwrap();
         let changes = &parsed.changes;
         assert!(changes.plan_touches.is_empty());
@@ -1125,7 +1125,7 @@ mod tests {
 
     #[test]
     fn parse_diff_tree_finalize_added_queues_upsert() {
-        let stdout = "A\t.trinity/finished/foo/alice.md\n";
+        let stdout = "A\t.clank/finished/foo/alice.md\n";
         let parsed = parse_diff_tree(stdout).unwrap();
         assert!(parsed.changes.plan_touches.is_empty());
         assert!(!parsed.changes.has_non_plan_code_changes);
@@ -1137,7 +1137,7 @@ mod tests {
 
     #[test]
     fn parse_diff_tree_finalize_deleted_emits_remove() {
-        let stdout = "D\t.trinity/finished/foo/alice.md\n";
+        let stdout = "D\t.clank/finished/foo/alice.md\n";
         let parsed = parse_diff_tree(stdout).unwrap();
         assert_eq!(parsed.changes.finalize_changes.len(), 1);
         let fc = &parsed.changes.finalize_changes[0];

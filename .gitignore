@@ -1,12 +1,9 @@
 /target/
-.trinity/*
-!.trinity/plans/
-!.trinity/finished/
-
-# Leptos frontend build output (trunk).
-/frontend/dist/
+.clank/*
+!.clank/plans/
+!.clank/finished/
 
 # Claude Code agent state (machine-local).
 /.claude/
-.trinity/feedback/
-.trinity/cache/
+.clank/feedback/
+.clank/cache/

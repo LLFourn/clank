@@ -1,8 +1,8 @@
 //! Commit-keyed cache for [`RepoState`].
 //!
-//! Files live at `<repo>/.trinity/cache/repo-state/<head-sha>.v<format>.bin`.
+//! Files live at `<repo>/.clank/cache/repo-state/<head-sha>.v<format>.bin`.
 //! Each file starts with a fixed-size header (magic + format_version
-//! + trinity_version + head_sha) validated before deserialization.
+//! + clank_version + head_sha) validated before deserialization.
 //! `RepoState.root` is NOT in the body — the cache injects the
 //! canonical root at load time so a relocated cache directory can't
 //! leak a stale absolute path.
@@ -20,12 +20,12 @@ use crate::repo_state::RepoState;
 
 static TEMP_NONCE: AtomicU64 = AtomicU64::new(0);
 
-const CACHE_MAGIC: &[u8] = b"TRINITY-BASE-STATE\n";
+const CACHE_MAGIC: &[u8] = b"CLANK-STATE\n";
 
-/// - v1–v4: legacy/coexistence shapes (invalid).
-/// - v5: only the new sans-io fold (`trinity_core::repo_state::RepoState`).
-const CACHE_FORMAT_VERSION: u32 = 5;
-const TRINITY_CACHE_GENERATION: u32 = 1;
+/// - v1–v5: legacy/coexistence shapes pre-rename (invalid).
+/// - v6: only the new sans-io fold (`clank_core::repo_state::RepoState`).
+const CACHE_FORMAT_VERSION: u32 = 6;
+const CLANK_CACHE_GENERATION: u32 = 1;
 
 const HEADER_LEN: usize = CACHE_MAGIC.len() + 4 + 4 + 40;
 
@@ -42,8 +42,8 @@ pub enum CacheError {
     BadMagic,
     #[error("cache format version mismatch: file={file}, current={current}")]
     FormatVersion { file: u32, current: u32 },
-    #[error("cache trinity-generation mismatch: file={file}, current={current}")]
-    TrinityGeneration { file: u32, current: u32 },
+    #[error("cache clank-generation mismatch: file={file}, current={current}")]
+    ClankGeneration { file: u32, current: u32 },
     #[error("cache HEAD mismatch: file={file}, expected={expected}")]
     HeadMismatch { file: String, expected: String },
     #[error("wincode decode failure")]
@@ -54,11 +54,11 @@ pub enum CacheError {
 
 #[derive(Debug, Clone, PartialEq, Eq, SchemaWrite, SchemaRead)]
 struct Payload {
-    fold: trinity_core::repo_state::RepoState,
+    fold: clank_core::repo_state::RepoState,
 }
 
 fn cache_dir(repo_root: &Path) -> PathBuf {
-    repo_root.join(".trinity").join("cache").join("repo-state")
+    repo_root.join(".clank").join("cache").join("repo-state")
 }
 
 fn cache_file_for(repo_root: &Path, head: &CommitSha) -> PathBuf {
@@ -106,12 +106,12 @@ fn try_load_inner(path: &Path, head: &CommitSha) -> Result<Option<Payload>, Cach
             current: CACHE_FORMAT_VERSION,
         });
     }
-    let trinity_version = u32::from_le_bytes(header[cursor..cursor + 4].try_into().unwrap());
+    let clank_version = u32::from_le_bytes(header[cursor..cursor + 4].try_into().unwrap());
     cursor += 4;
-    if trinity_version != TRINITY_CACHE_GENERATION {
-        return Err(CacheError::TrinityGeneration {
-            file: trinity_version,
-            current: TRINITY_CACHE_GENERATION,
+    if clank_version != CLANK_CACHE_GENERATION {
+        return Err(CacheError::ClankGeneration {
+            file: clank_version,
+            current: CLANK_CACHE_GENERATION,
         });
     }
     let file_head = std::str::from_utf8(&header[cursor..cursor + 40])
@@ -142,7 +142,7 @@ pub fn write(repo_root: &Path, state: &RepoState) -> Result<(), CacheError> {
     let mut buf = Vec::with_capacity(HEADER_LEN + body.len());
     buf.extend_from_slice(CACHE_MAGIC);
     buf.extend_from_slice(&CACHE_FORMAT_VERSION.to_le_bytes());
-    buf.extend_from_slice(&TRINITY_CACHE_GENERATION.to_le_bytes());
+    buf.extend_from_slice(&CLANK_CACHE_GENERATION.to_le_bytes());
     let sha_bytes = head.as_str().as_bytes();
     if sha_bytes.len() != 40 {
         return Err(CacheError::Encode);

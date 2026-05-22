@@ -1,10 +1,10 @@
-//! `trinity init` — scaffold `.trinity/` in a new repo.
+//! `clank init` — scaffold `.clank/` in a new repo.
 
 use std::path::Path;
 
 use super::{InitArgs, resolve_repo};
 
-/// The single canonical content of `.trinity/.gitignore`.
+/// The single canonical content of `.clank/.gitignore`.
 const GITIGNORE_BODY: &str = "feedback/\ncache/\n";
 
 pub async fn run(args: InitArgs) -> anyhow::Result<()> {
@@ -15,11 +15,11 @@ pub async fn run(args: InitArgs) -> anyhow::Result<()> {
 }
 
 fn write_scaffold(repo: &Path) -> anyhow::Result<()> {
-    let trinity_dir = repo.join(".trinity");
-    let plans_dir = trinity_dir.join("plans");
+    let clank_dir = repo.join(".clank");
+    let plans_dir = clank_dir.join("plans");
     std::fs::create_dir_all(&plans_dir)?;
 
-    let gitignore = trinity_dir.join(".gitignore");
+    let gitignore = clank_dir.join(".gitignore");
     match std::fs::read_to_string(&gitignore) {
         Ok(existing) if existing == GITIGNORE_BODY => {
             println!("{} already up to date", gitignore.display());
@@ -42,18 +42,18 @@ fn write_scaffold(repo: &Path) -> anyhow::Result<()> {
 }
 
 /// Warn (but don't fail) if some ancestor `.gitignore` or
-/// `core.excludesFile` excludes `.trinity/` wholesale — that would
+/// `core.excludesFile` excludes `.clank/` wholesale — that would
 /// hide tracked plan files too.
 ///
-/// Probes `.trinity/plans/` (not the directory we just created — git
+/// Probes `.clank/plans/` (not the directory we just created — git
 /// matches patterns against the path, not its existence) and parses
 /// `git check-ignore -v`'s structured output:
 ///   `<source_file>:<line>:<pattern>\t<probed_path>`
-/// We suppress only when `<source_file>` is the `.trinity/.gitignore`
+/// We suppress only when `<source_file>` is the `.clank/.gitignore`
 /// we just wrote. Substring matching on the whole record would be
 /// fooled by paths or patterns that happen to contain that literal.
 fn warn_if_globally_excluded(repo: &Path) {
-    let probe = repo.join(".trinity/plans");
+    let probe = repo.join(".clank/plans");
     let output = std::process::Command::new("git")
         .arg("-C")
         .arg(repo)
@@ -77,20 +77,20 @@ fn warn_if_globally_excluded(repo: &Path) {
     if line.is_empty() {
         return;
     }
-    if matched_by_trinity_gitignore(line) {
+    if matched_by_clank_gitignore(line) {
         return;
     }
     eprintln!(
-        "warning: an ancestor .gitignore (or core.excludesFile) excludes .trinity/ — \
+        "warning: an ancestor .gitignore (or core.excludesFile) excludes .clank/ — \
          tracked plan files would be hidden. Source:\n  {line}"
     );
 }
 
-/// True if the matched rule lives in `<repo>/.trinity/.gitignore`
+/// True if the matched rule lives in `<repo>/.clank/.gitignore`
 /// (the file we just wrote). `git check-ignore -v` emits records as
 /// `<source_file>:<line>:<pattern>\t<probed>`; we parse the
 /// `source_file` column and check it's our managed file.
-fn matched_by_trinity_gitignore(record: &str) -> bool {
+fn matched_by_clank_gitignore(record: &str) -> bool {
     let (source_part, _probed) = match record.split_once('\t') {
         Some(parts) => parts,
         None => return false,
@@ -101,8 +101,7 @@ fn matched_by_trinity_gitignore(record: &str) -> bool {
     };
     let p = Path::new(source_file);
     p.file_name().is_some_and(|n| n == ".gitignore")
-        && p.parent()
-            .is_some_and(|parent| parent.ends_with(".trinity"))
+        && p.parent().is_some_and(|parent| parent.ends_with(".clank"))
 }
 
 #[cfg(test)]
@@ -125,8 +124,8 @@ mod tests {
     fn writes_scaffold_creates_plans_dir_and_gitignore() {
         let dir = init_repo();
         write_scaffold(dir.path()).unwrap();
-        assert!(dir.path().join(".trinity/plans").is_dir());
-        let body = std::fs::read_to_string(dir.path().join(".trinity/.gitignore")).unwrap();
+        assert!(dir.path().join(".clank/plans").is_dir());
+        let body = std::fs::read_to_string(dir.path().join(".clank/.gitignore")).unwrap();
         assert_eq!(body, GITIGNORE_BODY);
     }
 
@@ -135,48 +134,46 @@ mod tests {
         let dir = init_repo();
         write_scaffold(dir.path()).unwrap();
         write_scaffold(dir.path()).unwrap();
-        let body = std::fs::read_to_string(dir.path().join(".trinity/.gitignore")).unwrap();
+        let body = std::fs::read_to_string(dir.path().join(".clank/.gitignore")).unwrap();
         assert_eq!(body, GITIGNORE_BODY);
     }
 
     #[test]
-    fn matched_by_trinity_gitignore_recognises_our_managed_file() {
+    fn matched_by_clank_gitignore_recognises_our_managed_file() {
         // Standard git check-ignore -v output: <source>:<line>:<pattern>\t<probed>.
-        let record = ".trinity/.gitignore:1:plans/extra\t.trinity/plans/extra/foo";
-        assert!(matched_by_trinity_gitignore(record));
+        let record = ".clank/.gitignore:1:plans/extra\t.clank/plans/extra/foo";
+        assert!(matched_by_clank_gitignore(record));
     }
 
     #[test]
-    fn matched_by_trinity_gitignore_rejects_ancestor_gitignore() {
-        // Pattern column mentions the literal `.trinity/.gitignore`
+    fn matched_by_clank_gitignore_rejects_ancestor_gitignore() {
+        // Pattern column mentions the literal `.clank/.gitignore`
         // but the matching rule is in the repo-root .gitignore.
-        let record = ".gitignore:5:!.trinity/.gitignore\t.trinity/.gitignore";
-        assert!(!matched_by_trinity_gitignore(record));
+        let record = ".gitignore:5:!.clank/.gitignore\t.clank/.gitignore";
+        assert!(!matched_by_clank_gitignore(record));
     }
 
     #[test]
-    fn matched_by_trinity_gitignore_rejects_unrelated_source() {
-        let record = "../.gitignore:2:.trinity/\t.trinity/plans";
-        assert!(!matched_by_trinity_gitignore(record));
+    fn matched_by_clank_gitignore_rejects_unrelated_source() {
+        let record = "../.gitignore:2:.clank/\t.clank/plans";
+        assert!(!matched_by_clank_gitignore(record));
     }
 
     #[test]
-    fn matched_by_trinity_gitignore_rejects_missing_tab() {
-        assert!(!matched_by_trinity_gitignore(""));
-        assert!(!matched_by_trinity_gitignore(
-            ".trinity/.gitignore:1:plans/"
-        ));
+    fn matched_by_clank_gitignore_rejects_missing_tab() {
+        assert!(!matched_by_clank_gitignore(""));
+        assert!(!matched_by_clank_gitignore(".clank/.gitignore:1:plans/"));
     }
 
     #[test]
     fn writes_scaffold_refuses_on_drifted_content() {
         let dir = init_repo();
-        std::fs::create_dir_all(dir.path().join(".trinity")).unwrap();
-        std::fs::write(dir.path().join(".trinity/.gitignore"), "something/else\n").unwrap();
+        std::fs::create_dir_all(dir.path().join(".clank")).unwrap();
+        std::fs::write(dir.path().join(".clank/.gitignore"), "something/else\n").unwrap();
         let err = write_scaffold(dir.path()).unwrap_err();
         let msg = format!("{err}");
         assert!(msg.contains("different content"), "unexpected error: {msg}");
-        let body = std::fs::read_to_string(dir.path().join(".trinity/.gitignore")).unwrap();
+        let body = std::fs::read_to_string(dir.path().join(".clank/.gitignore")).unwrap();
         assert_eq!(
             body, "something/else\n",
             "drifted file must not be overwritten"

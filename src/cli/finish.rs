@@ -1,4 +1,4 @@
-//! `trinity finish` — finalize an approved plan.
+//! `clank finish` — finalize an approved plan.
 //!
 //! Fully local: folds the repo with `rebuild::rebuild_repo`, builds
 //! a typed `FinishPreviewResponse` via `crate::preview`, dispatches
@@ -9,7 +9,7 @@
 use std::path::Path;
 
 use super::{FinishArgs, repo_basename, resolve_repo};
-use trinity_core::api::{FinalizeBlockReason, FinalizeReadiness, FinishPreviewResponse};
+use clank_core::api::{FinalizeBlockReason, FinalizeReadiness, FinishPreviewResponse};
 
 pub async fn run(args: FinishArgs) -> anyhow::Result<()> {
     let repo = resolve_repo(args.repo.as_deref())?;
@@ -35,7 +35,7 @@ pub async fn run(args: FinishArgs) -> anyhow::Result<()> {
     if args.amend && !head_is_finalize_for(&repo, &stem)? {
         anyhow::bail!(
             "--amend requires HEAD to be a finalize commit for plan `{stem}`; \
-             run `trinity finish` without --amend instead",
+             run `clank finish` without --amend instead",
         );
     }
 
@@ -68,7 +68,7 @@ fn dry_run_finish_composite(
     preview: &FinishPreviewResponse,
     args: &FinishArgs,
 ) -> anyhow::Result<()> {
-    println!("# trinity finish --dry preview");
+    println!("# clank finish --dry preview");
     println!("# plan: {}", preview.plan_id);
     println!("# would create finalize commit:");
     let msg = args
@@ -101,7 +101,7 @@ fn dry_run_finish_composite(
             args.squash.as_deref().unwrap_or("")
         );
     } else if args.purge {
-        println!("# would then strip the plan's `.trinity/` artifacts from history.");
+        println!("# would then strip the plan's `.clank/` artifacts from history.");
     }
     println!("# (--dry: no commits, no refs updated)");
     Ok(())
@@ -112,7 +112,7 @@ async fn run_post_finalize_rewrite(
     plan_key: &crate::lifecycle::PlanKey,
     args: FinishArgs,
 ) -> anyhow::Result<()> {
-    // `--purge` semantics: strip the plan's `.trinity/` paths from
+    // `--purge` semantics: strip the plan's `.clank/` paths from
     // history (including the just-landed finalize snapshot). Use
     // include_finalize=true so the snapshot is in the strip set.
     //
@@ -196,7 +196,7 @@ fn reason_to_msg(reason: &FinalizeBlockReason) -> String {
 }
 
 /// Read+hash every approval into memory BEFORE touching
-/// `.trinity/finished/<stem>/`. If any read fails or any hash
+/// `.clank/finished/<stem>/`. If any read fails or any hash
 /// drifts, we abort cleanly and the operator's existing finalize
 /// snapshot is untouched. Especially important for `--amend`: a
 /// failure must not strand the operator between snapshots.
@@ -236,7 +236,7 @@ async fn finalize(
         verified.push((format!("{}.md", approval.author.as_str()), body));
     }
 
-    let finished_dir = repo.join(".trinity/finished").join(stem);
+    let finished_dir = repo.join(".clank/finished").join(stem);
     if finished_dir.exists() {
         std::fs::remove_dir_all(&finished_dir)?;
     }
@@ -250,7 +250,7 @@ async fn finalize(
     // additions/modifications; an --amend would otherwise inherit
     // the prior commit's approver list and silently keep a stale
     // file when the new approver set is a strict subset.
-    let rel_finished = format!(".trinity/finished/{stem}");
+    let rel_finished = format!(".clank/finished/{stem}");
     git_run(repo, &["add", "-A", "--", &rel_finished])?;
 
     let default_msg = format!("Finalize {stem}");
@@ -264,7 +264,7 @@ async fn finalize(
 }
 
 /// True iff HEAD is a finalize commit for this plan — defined as
-/// "every file changed by HEAD lives under `.trinity/finished/<stem>/`."
+/// "every file changed by HEAD lives under `.clank/finished/<stem>/`."
 /// Used by `--amend` to refuse amending an unrelated commit.
 fn head_is_finalize_for(repo: &Path, stem: &str) -> anyhow::Result<bool> {
     let output = std::process::Command::new("git")
@@ -276,7 +276,7 @@ fn head_is_finalize_for(repo: &Path, stem: &str) -> anyhow::Result<bool> {
         return Ok(false);
     }
     let stdout = String::from_utf8_lossy(&output.stdout);
-    let prefix = format!(".trinity/finished/{stem}/");
+    let prefix = format!(".clank/finished/{stem}/");
     let lines: Vec<&str> = stdout.lines().filter(|l| !l.is_empty()).collect();
     Ok(!lines.is_empty() && lines.iter().all(|l| l.starts_with(&prefix)))
 }
@@ -303,9 +303,9 @@ mod tests {
 
     // Plan-arg parsing tests live in `crate::cli::plan_resolve`.
 
-    use trinity_core::api::{FinalizeReadiness, FinishPreviewResponse, SealedApproval};
-    use trinity_core::ids::AgentLabel;
-    use trinity_core::vocab::{CommitGateState, PlanWorktreeStatus};
+    use clank_core::api::{FinalizeReadiness, FinishPreviewResponse, SealedApproval};
+    use clank_core::ids::AgentLabel;
+    use clank_core::vocab::{CommitGateState, PlanWorktreeStatus};
 
     fn init_repo() -> tempfile::TempDir {
         let dir = tempfile::tempdir().unwrap();
@@ -334,8 +334,8 @@ mod tests {
 
     fn mk_preview_ready(approval_path: &str, body: &str) -> FinishPreviewResponse {
         FinishPreviewResponse {
-            plan_id: "trinity/foo.md".into(),
-            plan_path: ".trinity/plans/foo.md".into(),
+            plan_id: "clank/foo.md".into(),
+            plan_path: ".clank/plans/foo.md".into(),
             readiness: FinalizeReadiness::Ready,
             gate_state: CommitGateState::Approved,
             latest_reviewable_sha: None,
@@ -356,7 +356,7 @@ mod tests {
         run_git(dir.path(), &["add", "-A"]);
         run_git(dir.path(), &["commit", "--quiet", "-m", "seed"]);
 
-        let approval = ".trinity/feedback/foo/abcdef/codex.md";
+        let approval = ".clank/feedback/foo/abcdef/codex.md";
         let body = "APPROVE\n\nlgtm\n";
         write_at(dir.path(), approval, body);
 
@@ -365,7 +365,7 @@ mod tests {
             .await
             .unwrap();
 
-        let dest = dir.path().join(".trinity/finished/foo/codex.md");
+        let dest = dir.path().join(".clank/finished/foo/codex.md");
         assert_eq!(std::fs::read_to_string(&dest).unwrap(), body);
         // A finalize commit landed.
         let out = std::process::Command::new("git")
@@ -388,10 +388,10 @@ mod tests {
         run_git(dir.path(), &["commit", "--quiet", "-m", "seed"]);
 
         // Pre-existing finalize snapshot (e.g. from a prior run).
-        let stale_snapshot = ".trinity/finished/foo/codex.md";
+        let stale_snapshot = ".clank/finished/foo/codex.md";
         write_at(dir.path(), stale_snapshot, "OLD APPROVE\n");
 
-        let approval = ".trinity/feedback/foo/abcdef/codex.md";
+        let approval = ".clank/feedback/foo/abcdef/codex.md";
         write_at(dir.path(), approval, "APPROVE\n\non-disk body\n");
         // Preview expects a different body — the daemon's projection
         // is stale relative to disk.
@@ -419,11 +419,11 @@ mod tests {
         run_git(dir.path(), &["add", "-A"]);
         run_git(dir.path(), &["commit", "--quiet", "-m", "seed"]);
 
-        let stale_snapshot = ".trinity/finished/foo/codex.md";
+        let stale_snapshot = ".clank/finished/foo/codex.md";
         write_at(dir.path(), stale_snapshot, "OLD APPROVE\n");
 
         // Approval file does NOT exist on disk.
-        let preview = mk_preview_ready(".trinity/feedback/foo/abcdef/codex.md", "APPROVE\n");
+        let preview = mk_preview_ready(".clank/feedback/foo/abcdef/codex.md", "APPROVE\n");
 
         let err = finalize(dir.path(), "foo", &preview, false, None)
             .await
@@ -446,14 +446,14 @@ mod tests {
         run_git(dir.path(), &["commit", "--quiet", "-m", "seed"]);
 
         // First finalize: two approvers.
-        let codex_approval = ".trinity/feedback/foo/abcdef/codex.md";
-        let claude_approval = ".trinity/feedback/foo/abcdef/claude.md";
+        let codex_approval = ".clank/feedback/foo/abcdef/codex.md";
+        let claude_approval = ".clank/feedback/foo/abcdef/claude.md";
         write_at(dir.path(), codex_approval, "APPROVE codex\n");
         write_at(dir.path(), claude_approval, "APPROVE claude\n");
 
         let first = FinishPreviewResponse {
-            plan_id: "trinity/foo.md".into(),
-            plan_path: ".trinity/plans/foo.md".into(),
+            plan_id: "clank/foo.md".into(),
+            plan_path: ".clank/plans/foo.md".into(),
             readiness: FinalizeReadiness::Ready,
             gate_state: CommitGateState::Approved,
             latest_reviewable_sha: None,
@@ -485,7 +485,7 @@ mod tests {
                 "-r",
                 "--name-only",
                 "HEAD",
-                ".trinity/finished/foo/",
+                ".clank/finished/foo/",
             ])
             .output()
             .unwrap();
@@ -517,7 +517,7 @@ mod tests {
                 "-r",
                 "--name-only",
                 "HEAD",
-                ".trinity/finished/foo/",
+                ".clank/finished/foo/",
             ])
             .output()
             .unwrap();

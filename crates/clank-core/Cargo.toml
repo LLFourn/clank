@@ -1,0 +1,20 @@
+[package]
+name = "clank-core"
+version = "0.0.1"
+edition = "2024"
+publish = false
+description = "Shared core types (closed-vocab enums + response DTOs + identifiers) for Clank. Pure data — no daemon, runtime, or framework dependencies. Compiles to wasm32 unchanged."
+
+[features]
+default = []
+# Enables wincode SchemaWrite/SchemaRead derives on the fold types
+# so the app crate's state_cache can binary-encode a `RepoState`
+# payload. Off by default — wasm consumers don't need it.
+cache-encoding = ["dep:wincode"]
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+wincode = { version = "0.5", features = ["derive"], optional = true }
+
+[dev-dependencies]
+serde_json = "1"

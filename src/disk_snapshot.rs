@@ -1,6 +1,6 @@
 //! Daemon-side IO layer for the sans-io fold. Walks git history,
-//! builds [`trinity_core::repo_state::CommitEvent`]s, and calls
-//! [`trinity_core::repo_state::RepoState::apply_commit`] on each.
+//! builds [`clank_core::repo_state::CommitEvent`]s, and calls
+//! [`clank_core::repo_state::RepoState::apply_commit`] on each.
 
 use std::collections::BTreeSet;
 use std::path::PathBuf;
@@ -9,7 +9,7 @@ use crate::disk_format::FeedbackPath;
 use crate::git_io::{self, GitIoError};
 use crate::lifecycle::{CommitSha, PlanKey};
 use crate::repo_state::RepoState;
-use trinity_core::repo_state as fold;
+use clank_core::repo_state as fold;
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct CommitSnapshot {
@@ -31,9 +31,9 @@ pub struct CommitChanges {
     pub plan_touches: Vec<PlanTouch>,
     pub has_non_plan_code_changes: bool,
     pub finalize_changes: Vec<FinalizeChange>,
-    pub trinity_paths: Vec<String>,
-    pub touched_trinity: bool,
-    pub trinity_paths_touched: Vec<String>,
+    pub clank_paths: Vec<String>,
+    pub touched_clank: bool,
+    pub clank_paths_touched: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -164,7 +164,7 @@ mod tests {
         PlanTouch {
             plan: plan(p),
             kind: PlanTouchKind::Intro,
-            new_path: Some(PathBuf::from(format!(".trinity/plans/{p}.md"))),
+            new_path: Some(PathBuf::from(format!(".clank/plans/{p}.md"))),
         }
     }
 

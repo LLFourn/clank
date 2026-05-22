@@ -1,4 +1,4 @@
-//! `trinity purge` — strip a plan's `.trinity/` artifacts from
+//! `clank purge` — strip a plan's `.clank/` artifacts from
 //! history.
 //!
 //! Fully local: folds the repo with `rebuild::rebuild_repo`, builds
@@ -104,7 +104,7 @@ async fn run_all(repo: &std::path::Path, basename: &str, args: &PurgeArgs) -> an
         .await
         .map_err(|e| anyhow::anyhow!("all-rewrite preview failed: {e}"))?;
     if preview.intro_sha.is_none() {
-        println!("no .trinity/ history found in `{basename}`; nothing to purge.");
+        println!("no .clank/ history found in `{basename}`; nothing to purge.");
         return Ok(());
     }
 
@@ -136,7 +136,7 @@ async fn run_all(repo: &std::path::Path, basename: &str, args: &PurgeArgs) -> an
     }
     if let (Some(tip), Some(branch)) = (outcome.new_tip, outcome.updated_branch) {
         println!(
-            "purged all .trinity/ history: branch `{branch}` now at {} ({})",
+            "purged all .clank/ history: branch `{branch}` now at {} ({})",
             &tip[..tip.len().min(7)],
             tip,
         );
@@ -144,7 +144,7 @@ async fn run_all(repo: &std::path::Path, basename: &str, args: &PurgeArgs) -> an
     Ok(())
 }
 
-/// `--amend`: strip the plan's `.trinity/` paths from HEAD's tree
+/// `--amend`: strip the plan's `.clank/` paths from HEAD's tree
 /// and amend HEAD (no chain rewrite). Useful when the operator
 /// has just landed a commit and wants to retroactively scrub the
 /// plan's artifacts from HEAD's tree without rewriting earlier
@@ -166,8 +166,8 @@ async fn run_amend(repo: &std::path::Path, basename: &str, args: &PurgeArgs) -> 
     // Plan rule: `--amend` requires HEAD to be a finalize commit
     // for the named plan (or for any plan under `--all`). HEAD is
     // a finalize commit iff every changed path lies under
-    // `.trinity/finished/<stem>/` (single-plan) or
-    // `.trinity/finished/` (all-plans).
+    // `.clank/finished/<stem>/` (single-plan) or
+    // `.clank/finished/` (all-plans).
     let head_files = std::process::Command::new("git")
         .arg("-C")
         .arg(repo)
@@ -183,17 +183,17 @@ async fn run_amend(repo: &std::path::Path, basename: &str, args: &PurgeArgs) -> 
         Vec::new()
     };
     let prefix: String = match plan_key.as_ref() {
-        Some(k) => format!(".trinity/finished/{}/", k.as_str()),
-        None => ".trinity/finished/".to_string(),
+        Some(k) => format!(".clank/finished/{}/", k.as_str()),
+        None => ".clank/finished/".to_string(),
     };
     let head_is_finalize =
         !head_lines.is_empty() && head_lines.iter().all(|l| l.starts_with(&prefix));
     if !head_is_finalize {
         anyhow::bail!(
             "--amend requires HEAD to be a finalize commit \
-             (every changed path under `{prefix}`). Run `trinity finish` \
+             (every changed path under `{prefix}`). Run `clank finish` \
              without `--amend` to create the finalize commit first, or \
-             use `trinity purge` without `--amend` to rewrite the chain."
+             use `clank purge` without `--amend` to rewrite the chain."
         );
     }
 
@@ -222,8 +222,8 @@ async fn run_amend(repo: &std::path::Path, basename: &str, args: &PurgeArgs) -> 
                     "--name-only",
                     "--",
                     &head_sha_str,
-                    &format!(".trinity/plans/{s}.md"),
-                    &format!(".trinity/finished/{s}/"),
+                    &format!(".clank/plans/{s}.md"),
+                    &format!(".clank/finished/{s}/"),
                 ])
                 .output()?;
             if !out.status.success() {
@@ -237,7 +237,7 @@ async fn run_amend(repo: &std::path::Path, basename: &str, args: &PurgeArgs) -> 
             }
         }
         None => {
-            // All-plans: every `.trinity/` path in HEAD's tree.
+            // All-plans: every `.clank/` path in HEAD's tree.
             let out = std::process::Command::new("git")
                 .arg("-C")
                 .arg(repo)
@@ -247,7 +247,7 @@ async fn run_amend(repo: &std::path::Path, basename: &str, args: &PurgeArgs) -> 
                     "--name-only",
                     "--",
                     &head_sha_str,
-                    ".trinity/",
+                    ".clank/",
                 ])
                 .output()?;
             if !out.status.success() {
@@ -263,7 +263,7 @@ async fn run_amend(repo: &std::path::Path, basename: &str, args: &PurgeArgs) -> 
     };
 
     if strip_paths.is_empty() {
-        println!("HEAD's tree has no strippable Trinity paths; nothing to amend");
+        println!("HEAD's tree has no strippable Clank paths; nothing to amend");
         return Ok(());
     }
 
@@ -312,7 +312,7 @@ async fn run_amend(repo: &std::path::Path, basename: &str, args: &PurgeArgs) -> 
     }
 
     if args.dry {
-        println!("# trinity purge --amend preview");
+        println!("# clank purge --amend preview");
         println!("# HEAD: {head_sha_str}");
         println!("# would strip from HEAD's tree:");
         for p in &strip_paths {
@@ -377,7 +377,7 @@ fn format_all_warning(plan_count: usize, into_branch: Option<&str>) -> String {
     };
     let noun = if plan_count == 1 { "plan" } else { "plans" };
     format!(
-        "About to purge EVERY `.trinity/` path from history \
+        "About to purge EVERY `.clank/` path from history \
          ({plan_count} {noun} touched in the range) and write \
          rewritten history to {target}."
     )

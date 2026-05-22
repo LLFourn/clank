@@ -1,4 +1,4 @@
-//! Two-layer JSON config loader for Trinity's review knobs.
+//! Two-layer JSON config loader for Clank's review knobs.
 //!
 //! Phase 4 of `commit-first-review-model` introduces a config surface
 //! so operators can decide whether master is blocked on plan reviews,
@@ -8,8 +8,8 @@
 //!
 //! Layering (deep merge, repo overrides user):
 //!
-//! 1. `~/.trinity/config.json` — user-level defaults.
-//! 2. `<repo>/.trinity/config.json` — repo-level overrides
+//! 1. `~/.clank/config.json` — user-level defaults.
+//! 2. `<repo>/.clank/config.json` — repo-level overrides
 //!    (committed; visible to all collaborators).
 //!
 //! Missing files at either layer fall through to built-in defaults.
@@ -25,7 +25,7 @@ use std::path::Path;
 
 use crate::lifecycle::AgentLabel;
 
-/// Top-level Trinity config. Always non-`Option` here even though
+/// Top-level Clank config. Always non-`Option` here even though
 /// the on-disk schema permits omissions; the loader fills in
 /// defaults so consumers don't need to thread Option chains.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -96,12 +96,12 @@ struct ReviewFile {
 pub fn load(repo_root: &Path) -> Config {
     let mut cfg = Config::default();
     apply_layer(&mut cfg, user_path().as_deref());
-    apply_layer(&mut cfg, Some(&repo_root.join(".trinity/config.json")));
+    apply_layer(&mut cfg, Some(&repo_root.join(".clank/config.json")));
     cfg
 }
 
 fn user_path() -> Option<std::path::PathBuf> {
-    std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".trinity/config.json"))
+    std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".clank/config.json"))
 }
 
 fn apply_layer(cfg: &mut Config, path: Option<&Path>) {
@@ -110,14 +110,14 @@ fn apply_layer(cfg: &mut Config, path: Option<&Path>) {
         Ok(b) => b,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
         Err(e) => {
-            tracing::warn!(path = %path.display(), error = %e, "trinity config: read failed; ignoring layer");
+            tracing::warn!(path = %path.display(), error = %e, "clank config: read failed; ignoring layer");
             return;
         }
     };
     let parsed: ConfigFile = match serde_json::from_str(&body) {
         Ok(p) => p,
         Err(e) => {
-            tracing::warn!(path = %path.display(), error = %e, "trinity config: malformed JSON; ignoring layer");
+            tracing::warn!(path = %path.display(), error = %e, "clank config: malformed JSON; ignoring layer");
             return;
         }
     };
@@ -165,7 +165,7 @@ mod tests {
     #[test]
     fn repo_layer_overrides_defaults() {
         let tmp = tempfile::tempdir().unwrap();
-        let repo_cfg = tmp.path().join(".trinity/config.json");
+        let repo_cfg = tmp.path().join(".clank/config.json");
         write(
             &repo_cfg,
             r#"{"review": {"force_review_on_misc_commits": false}}"#,
@@ -179,7 +179,7 @@ mod tests {
     #[test]
     fn malformed_json_ignored_layer_falls_through_to_defaults() {
         let tmp = tempfile::tempdir().unwrap();
-        let repo_cfg = tmp.path().join(".trinity/config.json");
+        let repo_cfg = tmp.path().join(".clank/config.json");
         write(&repo_cfg, "not valid json");
         let cfg = load(tmp.path());
         assert!(cfg.review.force_review_on_misc_commits);
@@ -188,7 +188,7 @@ mod tests {
     #[test]
     fn ad_hoc_reviewers_list_parses() {
         let tmp = tempfile::tempdir().unwrap();
-        let repo_cfg = tmp.path().join(".trinity/config.json");
+        let repo_cfg = tmp.path().join(".clank/config.json");
         write(
             &repo_cfg,
             r#"{"review": {"ad_hoc_reviewers": ["alice", "bob"]}}"#,

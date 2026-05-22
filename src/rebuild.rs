@@ -213,7 +213,7 @@ mod tests {
     #[tokio::test]
     async fn single_plan_intro_appears_in_fold() {
         let dir = init_repo();
-        write_file(dir.path(), ".trinity/plans/foo.md", "# foo\n");
+        write_file(dir.path(), ".clank/plans/foo.md", "# foo\n");
         commit(dir.path(), "[foo] intro");
         let state = rebuild_repo(dir.path()).await.unwrap();
         let key = PlanKey::parse("foo").unwrap();
@@ -224,11 +224,11 @@ mod tests {
     #[tokio::test]
     async fn finalize_moves_plan_to_finished() {
         let dir = init_repo();
-        write_file(dir.path(), ".trinity/plans/foo.md", "# foo\n");
+        write_file(dir.path(), ".clank/plans/foo.md", "# foo\n");
         commit(dir.path(), "[foo] intro");
         write_file(
             dir.path(),
-            ".trinity/finished/foo/alice.md",
+            ".clank/finished/foo/alice.md",
             "APPROVE\n\nlgtm\n",
         );
         commit(dir.path(), "Finalize foo");
@@ -241,7 +241,7 @@ mod tests {
     #[tokio::test]
     async fn warm_cache_skips_the_fold() {
         let dir = init_repo();
-        write_file(dir.path(), ".trinity/plans/foo.md", "# foo\n");
+        write_file(dir.path(), ".clank/plans/foo.md", "# foo\n");
         commit(dir.path(), "[foo] intro");
 
         let (_cold, diag) = rebuild_with_diagnostics(dir.path(), CachePolicy::Use)
@@ -263,7 +263,7 @@ mod tests {
     #[tokio::test]
     async fn ancestor_cache_fold_forwards() {
         let dir = init_repo();
-        write_file(dir.path(), ".trinity/plans/foo.md", "# foo\n");
+        write_file(dir.path(), ".clank/plans/foo.md", "# foo\n");
         commit(dir.path(), "[foo] intro");
         let _ = rebuild_repo(dir.path()).await.unwrap();
         write_file(dir.path(), "src.rs", "fn main() {}\n");

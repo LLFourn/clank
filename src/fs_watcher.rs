@@ -1,6 +1,6 @@
 //! Filesystem-watcher path routing. Pure: takes an absolute path + an
 //! event kind, returns a structured `FilesystemSignal` (or `None` for
-//! paths Trinity doesn't care about). The async wiring that connects
+//! paths Clank doesn't care about). The async wiring that connects
 //! this to `notify::Watcher` lives elsewhere.
 
 use std::path::{Path, PathBuf};
@@ -17,7 +17,7 @@ pub enum FilesystemSignal {
     /// or the linked-worktree gitdir). Triggers a full `RebuildRepo`.
     HeadChanged,
 
-    /// A working-tree write/modify/remove of `.trinity/plans/<id>.md`
+    /// A working-tree write/modify/remove of `.clank/plans/<id>.md`
     /// (or the done-path counterpart). Used to recompute
     /// `plan_worktree_status` for already-discovered sessions. The runner
     /// looks up `session_id` against current state and drops the signal
@@ -41,8 +41,8 @@ pub enum FsEventKind {
 }
 
 /// Translate an absolute path + event kind into a structured signal.
-/// Returns `None` for paths Trinity doesn't watch (anything outside
-/// `<repo>/.trinity/` and `<repo>/.git/HEAD`-family).
+/// Returns `None` for paths Clank doesn't watch (anything outside
+/// `<repo>/.clank/` and `<repo>/.git/HEAD`-family).
 pub fn path_to_signal(
     abs_path: &Path,
     repo_root: &Path,
@@ -57,13 +57,13 @@ pub fn path_to_signal(
         return Some(FilesystemSignal::HeadChanged);
     }
 
-    // .trinity/plans/<id>.md or .trinity/plans/done/<id>.md
+    // .clank/plans/<id>.md or .clank/plans/done/<id>.md
     if let Some(signal) = plan_signal(rel, event_kind) {
         return Some(signal);
     }
 
-    // .trinity/feedback/<plan-key>/<sha>/<author>.md
-    if let Ok(rest) = rel.strip_prefix(".trinity/feedback") {
+    // .clank/feedback/<plan-key>/<sha>/<author>.md
+    if let Ok(rest) = rel.strip_prefix(".clank/feedback") {
         let parsed = parse_feedback_path(rest)?;
         return Some(match event_kind {
             FsEventKind::CreatedOrModified => FilesystemSignal::FeedbackWritten { parsed },
@@ -87,14 +87,14 @@ fn matches_head_file(rel: &Path) -> bool {
 }
 
 fn plan_signal(rel: &Path, _event_kind: FsEventKind) -> Option<FilesystemSignal> {
-    let plans_rel = rel.strip_prefix(".trinity/plans").ok()?;
+    let plans_rel = rel.strip_prefix(".clank/plans").ok()?;
     let mut comps = plans_rel.components();
     let first = comps.next()?;
     let name_seg = first.as_os_str().to_str()?;
     if comps.next().is_some() {
-        return None; // too deep (e.g. .trinity/plans/done/foo.md)
+        return None; // too deep (e.g. .clank/plans/done/foo.md)
     }
-    let plan_rel = Path::new(".trinity/plans").join(name_seg);
+    let plan_rel = Path::new(".clank/plans").join(name_seg);
     let session_id = PlanKey::from_path(&plan_rel)?;
     Some(FilesystemSignal::PlanFileChanged {
         session_id,
@@ -142,14 +142,14 @@ mod tests {
     #[test]
     fn active_plan_file_created() {
         let sig = path_to_signal(
-            &repo().join(".trinity/plans/foo.md"),
+            &repo().join(".clank/plans/foo.md"),
             &repo(),
             FsEventKind::CreatedOrModified,
         );
         match sig {
             Some(FilesystemSignal::PlanFileChanged { session_id, path }) => {
                 assert_eq!(session_id.as_str(), "foo");
-                assert_eq!(path, PathBuf::from(".trinity/plans/foo.md"));
+                assert_eq!(path, PathBuf::from(".clank/plans/foo.md"));
             }
             other => panic!("expected PlanFileChanged, got {other:?}"),
         }
@@ -158,7 +158,7 @@ mod tests {
     #[test]
     fn done_plan_file_is_ignored() {
         let sig = path_to_signal(
-            &repo().join(".trinity/plans/done/foo.md"),
+            &repo().join(".clank/plans/done/foo.md"),
             &repo(),
             FsEventKind::CreatedOrModified,
         );
@@ -171,7 +171,7 @@ mod tests {
         // (e.g. `mv` to done/ without committing → triggers DoneMovePending
         // on next status recompute).
         let sig = path_to_signal(
-            &repo().join(".trinity/plans/foo.md"),
+            &repo().join(".clank/plans/foo.md"),
             &repo(),
             FsEventKind::Removed,
         );
@@ -184,7 +184,7 @@ mod tests {
     #[test]
     fn plan_subdir_not_a_plan_file() {
         let sig = path_to_signal(
-            &repo().join(".trinity/plans/nested/foo.md"),
+            &repo().join(".clank/plans/nested/foo.md"),
             &repo(),
             FsEventKind::CreatedOrModified,
         );
@@ -194,7 +194,7 @@ mod tests {
     #[test]
     fn plan_non_md_file_not_signaled() {
         let sig = path_to_signal(
-            &repo().join(".trinity/plans/foo.txt"),
+            &repo().join(".clank/plans/foo.txt"),
             &repo(),
             FsEventKind::CreatedOrModified,
         );
@@ -204,7 +204,7 @@ mod tests {
     #[test]
     fn feedback_canonical_sha_path() {
         let sig = path_to_signal(
-            &repo().join(".trinity/feedback/foo/abc1234/alice.md"),
+            &repo().join(".clank/feedback/foo/abc1234/alice.md"),
             &repo(),
             FsEventKind::CreatedOrModified,
         );
@@ -221,7 +221,7 @@ mod tests {
     #[test]
     fn legacy_commits_segment_yields_no_signal() {
         let sig = path_to_signal(
-            &repo().join(".trinity/feedback/foo/commits/abc1234/alice.md"),
+            &repo().join(".clank/feedback/foo/commits/abc1234/alice.md"),
             &repo(),
             FsEventKind::CreatedOrModified,
         );
@@ -231,13 +231,13 @@ mod tests {
     #[test]
     fn legacy_plan_segment_yields_no_signal() {
         let sig = path_to_signal(
-            &repo().join(".trinity/feedback/foo/plan/alice.md"),
+            &repo().join(".clank/feedback/foo/plan/alice.md"),
             &repo(),
             FsEventKind::CreatedOrModified,
         );
         assert!(sig.is_none());
         let sig = path_to_signal(
-            &repo().join(".trinity/feedback/foo/plan/abc1234/alice.md"),
+            &repo().join(".clank/feedback/foo/plan/abc1234/alice.md"),
             &repo(),
             FsEventKind::CreatedOrModified,
         );
@@ -247,7 +247,7 @@ mod tests {
     #[test]
     fn feedback_removed() {
         let sig = path_to_signal(
-            &repo().join(".trinity/feedback/foo/def5678/bob.md"),
+            &repo().join(".clank/feedback/foo/def5678/bob.md"),
             &repo(),
             FsEventKind::Removed,
         );
@@ -258,7 +258,7 @@ mod tests {
     }
 
     #[test]
-    fn non_trinity_path_is_ignored() {
+    fn non_clank_path_is_ignored() {
         let sig = path_to_signal(
             &repo().join("src/lib.rs"),
             &repo(),
@@ -270,7 +270,7 @@ mod tests {
     #[test]
     fn cache_dir_is_ignored() {
         let sig = path_to_signal(
-            &repo().join(".trinity/cache/foo.bin"),
+            &repo().join(".clank/cache/foo.bin"),
             &repo(),
             FsEventKind::CreatedOrModified,
         );
@@ -280,7 +280,7 @@ mod tests {
     #[test]
     fn outside_repo_root_is_ignored() {
         let sig = path_to_signal(
-            &PathBuf::from("/elsewhere/.trinity/plans/foo.md"),
+            &PathBuf::from("/elsewhere/.clank/plans/foo.md"),
             &repo(),
             FsEventKind::CreatedOrModified,
         );

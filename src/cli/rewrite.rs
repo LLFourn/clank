@@ -1,16 +1,16 @@
-//! Shared history-rewriting engine for `trinity purge` and
-//! `trinity finish --purge`. Consumes the daemon's typed
+//! Shared history-rewriting engine for `clank purge` and
+//! `clank finish --purge`. Consumes the daemon's typed
 //! `RewritePreviewResponse` and applies it via git plumbing.
 //!
-//! The engine never re-derives Trinity attribution or classification —
+//! The engine never re-derives Clank attribution or classification —
 //! the daemon's manifest IS the rewrite plan. This module is
 //! pure side-effect-producing infrastructure (git plumbing,
 //! ref updates, tree builds).
 
 use std::path::Path;
 
-use trinity_core::api::{RewriteCommit, RewriteDisposition};
-use trinity_core::ids::CommitSha;
+use clank_core::api::{RewriteCommit, RewriteDisposition};
+use clank_core::ids::CommitSha;
 
 /// Engine inputs. Unpacked fields so both single-plan and all-plans
 /// preview responses can feed the same engine. `dry == true` makes
@@ -96,7 +96,7 @@ pub async fn run(opts: RewriteOpts<'_>) -> anyhow::Result<RewriteOutcome> {
         if foreign > 0 {
             blockers.push(format!(
                 "--squash refuses {foreign} foreign commit(s) in the rewrite \
-                 range. Use `trinity purge` without `--squash` first, then \
+                 range. Use `clank purge` without `--squash` first, then \
                  retry."
             ));
         }
@@ -290,7 +290,7 @@ fn is_protected_branch(repo: &Path, branch: &str) -> anyhow::Result<bool> {
 fn print_rebase_todo(opts: &RewriteOpts<'_>, plan: &ExecutionPlan, blockers: &[String]) {
     let cmt = if blockers.is_empty() { "" } else { "# " };
 
-    println!("# trinity rewrite preview");
+    println!("# clank rewrite preview");
     if let Some(intro) = opts.intro_sha {
         println!(
             "# range: {}..{} ({} commits in rewrite range)",
@@ -299,7 +299,7 @@ fn print_rebase_todo(opts: &RewriteOpts<'_>, plan: &ExecutionPlan, blockers: &[S
             plan.steps.len(),
         );
     } else {
-        println!("# range: (empty — no .trinity/ history)");
+        println!("# range: (empty — no .clank/ history)");
     }
     println!(
         "# starting parent: {}",
@@ -400,7 +400,7 @@ fn print_squash_dry_run(
     blockers: &[String],
     msg: &str,
 ) {
-    println!("# trinity rewrite --squash preview");
+    println!("# clank rewrite --squash preview");
     if let Some(intro) = opts.intro_sha {
         println!(
             "# range: {}..{} ({} commit(s) would collapse into one)",
@@ -409,7 +409,7 @@ fn print_squash_dry_run(
             plan.steps.len(),
         );
     } else {
-        println!("# range: (empty — no .trinity/ history)");
+        println!("# range: (empty — no .clank/ history)");
     }
     println!(
         "# starting parent: {}",
@@ -569,7 +569,7 @@ fn build_stripped_tree_from_sha(
     sha: &str,
     strip_paths: &[String],
 ) -> anyhow::Result<String> {
-    let scratch_dir = repo.join(".git").join("trinity-rewrite");
+    let scratch_dir = repo.join(".git").join("clank-rewrite");
     std::fs::create_dir_all(&scratch_dir)?;
     let unique = format!(
         "squash-{}-{}",
@@ -606,7 +606,7 @@ fn build_stripped_tree_from_sha(
 /// in `strip_paths`. Uses a scratch git index under `<repo>/.git/`
 /// so we never disturb the operator's real index.
 fn build_stripped_tree(repo: &Path, sha: &str, strip_paths: &[String]) -> anyhow::Result<String> {
-    let scratch_dir = repo.join(".git").join("trinity-rewrite");
+    let scratch_dir = repo.join(".git").join("clank-rewrite");
     std::fs::create_dir_all(&scratch_dir)?;
     let unique = format!(
         "rewrite-{}-{}",
@@ -798,8 +798,8 @@ fn short(sha: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use trinity_core::api::{RewriteCommit, RewriteDisposition, RewritePreviewResponse};
-    use trinity_core::ids::{CommitSha, PlanKey};
+    use clank_core::api::{RewriteCommit, RewriteDisposition, RewritePreviewResponse};
+    use clank_core::ids::{CommitSha, PlanKey};
 
     fn init_repo() -> tempfile::TempDir {
         let dir = tempfile::tempdir().unwrap();
@@ -879,7 +879,7 @@ mod tests {
         commits: Vec<(String, String, RewriteDisposition, bool, Vec<String>)>,
     ) -> RewritePreviewResponse {
         RewritePreviewResponse {
-            plan_id: "trinity/foo.md".into(),
+            plan_id: "clank/foo.md".into(),
             plan_stem: PlanKey::parse("foo").unwrap(),
             intro_sha: Some(CommitSha::parse(intro).unwrap()),
             head_sha: CommitSha::parse(head).unwrap(),
@@ -904,9 +904,9 @@ mod tests {
         // First-ever commit so the engine has an intro_parent of None.
         write(dir.path(), "README.md", "seed\n");
         let _seed = commit(dir.path(), "seed");
-        write(dir.path(), ".trinity/plans/foo.md", "# foo\n");
+        write(dir.path(), ".clank/plans/foo.md", "# foo\n");
         let intro = commit(dir.path(), "plan: foo");
-        write(dir.path(), ".trinity/plans/foo.md", "# foo v2\n");
+        write(dir.path(), ".clank/plans/foo.md", "# foo v2\n");
         write(dir.path(), "src/lib.rs", "// code\n");
         let mixed = commit(dir.path(), "mixed: revise foo + code");
 
@@ -926,7 +926,7 @@ mod tests {
                     "mixed: revise foo + code".into(),
                     RewriteDisposition::Rewrite,
                     false,
-                    vec![".trinity/plans/foo.md".into()],
+                    vec![".clank/plans/foo.md".into()],
                 ),
             ],
         );
@@ -957,8 +957,8 @@ mod tests {
             show_subject(dir.path(), &new_tip),
             "mixed: revise foo + code"
         );
-        // ...but its tree omits .trinity/plans/foo.md and keeps src/lib.rs.
-        assert!(!tree_has(dir.path(), &new_tip, ".trinity/plans/foo.md"));
+        // ...but its tree omits .clank/plans/foo.md and keeps src/lib.rs.
+        assert!(!tree_has(dir.path(), &new_tip, ".clank/plans/foo.md"));
         assert!(tree_has(dir.path(), &new_tip, "src/lib.rs"));
         // The original `main` branch is untouched.
         let main_chain = rev_list(dir.path(), "main");
@@ -968,7 +968,7 @@ mod tests {
     #[tokio::test]
     async fn rewrite_dry_run_makes_no_commits_or_refs() {
         let dir = init_repo();
-        write(dir.path(), ".trinity/plans/foo.md", "# foo\n");
+        write(dir.path(), ".clank/plans/foo.md", "# foo\n");
         let intro = commit(dir.path(), "plan: foo");
         let preview = mk_preview(
             &intro,
@@ -1013,7 +1013,7 @@ mod tests {
         write(dir.path(), "README.md", "seed\n");
         let _seed = commit(dir.path(), "seed");
         run(dir.path(), &["branch", "already-exists"]);
-        write(dir.path(), ".trinity/plans/foo.md", "# foo\n");
+        write(dir.path(), ".clank/plans/foo.md", "# foo\n");
         let intro = commit(dir.path(), "plan: foo");
         let preview = mk_preview(
             &intro,
@@ -1050,9 +1050,9 @@ mod tests {
         let dir = init_repo();
         write(dir.path(), "README.md", "seed\n");
         let seed = commit(dir.path(), "seed");
-        write(dir.path(), ".trinity/plans/foo.md", "# foo\n");
+        write(dir.path(), ".clank/plans/foo.md", "# foo\n");
         let intro = commit(dir.path(), "plan: foo");
-        write(dir.path(), ".trinity/plans/foo.md", "# foo v2\n");
+        write(dir.path(), ".clank/plans/foo.md", "# foo v2\n");
         let revision = commit(dir.path(), "plan: foo v2");
 
         let preview = mk_preview(
@@ -1099,7 +1099,7 @@ mod tests {
         let dir = init_repo();
         write(dir.path(), "README.md", "seed\n");
         let _seed = commit(dir.path(), "seed");
-        write(dir.path(), ".trinity/plans/foo.md", "# foo\n");
+        write(dir.path(), ".clank/plans/foo.md", "# foo\n");
         let intro = commit(dir.path(), "plan: foo");
 
         // Simulate: preview was fetched against `intro`, then a new
@@ -1147,10 +1147,10 @@ mod tests {
     }
 
     /// End-to-end single-plan purge: codex's specific request.
-    /// `trinity purge foo --into-branch scrubbed` on
+    /// `clank purge foo --into-branch scrubbed` on
     /// `seed → plan → code` must produce a `scrubbed` branch that
     /// contains `src/main.rs` and does NOT contain
-    /// `.trinity/plans/foo.md`. The previous diff-touch
+    /// `.clank/plans/foo.md`. The previous diff-touch
     /// classification would have marked `code` as KeepVerbatim and
     /// leaked the inherited plan file.
     #[tokio::test]
@@ -1158,7 +1158,7 @@ mod tests {
         let dir = init_repo();
         write(dir.path(), "README.md", "seed\n");
         let _seed = commit(dir.path(), "seed");
-        write(dir.path(), ".trinity/plans/foo.md", "# foo\n");
+        write(dir.path(), ".clank/plans/foo.md", "# foo\n");
         let intro = commit(dir.path(), "plan: foo");
         write(dir.path(), "src/main.rs", "fn main() {}\n");
         let code = commit(dir.path(), "later code");
@@ -1181,7 +1181,7 @@ mod tests {
                     "later code".into(),
                     RewriteDisposition::Rewrite,
                     false,
-                    vec![".trinity/plans/foo.md".into()],
+                    vec![".clank/plans/foo.md".into()],
                 ),
             ],
         );
@@ -1200,7 +1200,7 @@ mod tests {
         .await
         .unwrap();
         assert!(
-            !tree_has(dir.path(), "scrubbed", ".trinity/plans/foo.md"),
+            !tree_has(dir.path(), "scrubbed", ".clank/plans/foo.md"),
             "inherited plan file leaked into scrubbed branch"
         );
         assert!(tree_has(dir.path(), "scrubbed", "src/main.rs"));
@@ -1212,11 +1212,11 @@ mod tests {
     /// rewritten branch's final tree does NOT contain the plan
     /// file even though that commit's diff didn't touch it.
     #[tokio::test]
-    async fn rewrite_strips_inherited_trinity_from_later_pure_code() {
+    async fn rewrite_strips_inherited_clank_from_later_pure_code() {
         let dir = init_repo();
         write(dir.path(), "README.md", "seed\n");
         let _seed = commit(dir.path(), "seed");
-        write(dir.path(), ".trinity/plans/foo.md", "# foo\n");
+        write(dir.path(), ".clank/plans/foo.md", "# foo\n");
         let intro = commit(dir.path(), "plan: foo");
         write(dir.path(), "src/main.rs", "fn main() {}\n");
         let code = commit(dir.path(), "later code");
@@ -1224,7 +1224,7 @@ mod tests {
         // Manifest mirrors what api_rewrite_preview_all would
         // emit with tree-based classification: intro Drops, the
         // pure-code commit Rewrites with the inherited
-        // .trinity/plans/foo.md in strip_paths.
+        // .clank/plans/foo.md in strip_paths.
         let preview = mk_preview(
             &intro,
             &code,
@@ -1241,7 +1241,7 @@ mod tests {
                     "later code".into(),
                     RewriteDisposition::Rewrite,
                     false,
-                    vec![".trinity/plans/foo.md".into()],
+                    vec![".clank/plans/foo.md".into()],
                 ),
             ],
         );
@@ -1261,9 +1261,9 @@ mod tests {
         .unwrap();
 
         // The scrubbed branch's tip must contain src/main.rs but
-        // NOT .trinity/plans/foo.md.
+        // NOT .clank/plans/foo.md.
         assert!(
-            !tree_has(dir.path(), "scrubbed", ".trinity/plans/foo.md"),
+            !tree_has(dir.path(), "scrubbed", ".clank/plans/foo.md"),
             "plan file leaked into rewritten branch"
         );
         assert!(
@@ -1288,9 +1288,9 @@ mod tests {
         let dir = init_repo();
         write(dir.path(), "README.md", "seed\n");
         let _seed = commit(dir.path(), "seed");
-        write(dir.path(), ".trinity/plans/foo.md", "# foo\n");
+        write(dir.path(), ".clank/plans/foo.md", "# foo\n");
         let intro = commit(dir.path(), "plan: foo");
-        write(dir.path(), ".trinity/plans/foo.md", "# foo v2\n");
+        write(dir.path(), ".clank/plans/foo.md", "# foo v2\n");
         write(dir.path(), "src/lib.rs", "// code v1\n");
         let _mixed = commit(dir.path(), "plan revision + code");
         write(dir.path(), "src/main.rs", "fn main() {}\n");
@@ -1312,14 +1312,14 @@ mod tests {
                     "plan revision + code".into(),
                     RewriteDisposition::Rewrite,
                     false,
-                    vec![".trinity/plans/foo.md".into()],
+                    vec![".clank/plans/foo.md".into()],
                 ),
                 (
                     code.clone(),
                     "more code".into(),
                     RewriteDisposition::Rewrite,
                     false,
-                    vec![".trinity/plans/foo.md".into()],
+                    vec![".clank/plans/foo.md".into()],
                 ),
             ],
         );
@@ -1333,14 +1333,14 @@ mod tests {
             dry: false,
             allow_rewrite_protected: false,
             squash: Some("Implement foo"),
-            head_strip_paths: &[".trinity/plans/foo.md".to_string()],
+            head_strip_paths: &[".clank/plans/foo.md".to_string()],
         })
         .await
         .unwrap();
 
         // The squashed branch should be: seed → ONE squash commit
         // containing src/lib.rs + src/main.rs + README.md but no
-        // .trinity/plans/foo.md.
+        // .clank/plans/foo.md.
         let chain = rev_list(dir.path(), "squashed");
         assert_eq!(chain.len(), 2, "seed + one squash commit; got {chain:?}");
         let squash_tip = chain.last().unwrap();
@@ -1348,7 +1348,7 @@ mod tests {
         assert!(tree_has(dir.path(), squash_tip, "src/lib.rs"));
         assert!(tree_has(dir.path(), squash_tip, "src/main.rs"));
         assert!(tree_has(dir.path(), squash_tip, "README.md"));
-        assert!(!tree_has(dir.path(), squash_tip, ".trinity/plans/foo.md"));
+        assert!(!tree_has(dir.path(), squash_tip, ".clank/plans/foo.md"));
     }
 
     #[tokio::test]
@@ -1361,7 +1361,7 @@ mod tests {
         let dir = init_repo();
         write(dir.path(), "README.md", "seed\n");
         let _seed = commit(dir.path(), "seed");
-        write(dir.path(), ".trinity/plans/foo.md", "# foo\n");
+        write(dir.path(), ".clank/plans/foo.md", "# foo\n");
         let intro = commit(dir.path(), "plan: foo");
 
         let preview = mk_preview(
@@ -1387,12 +1387,12 @@ mod tests {
             squash: Some("squashed plan"),
             // Daemon provides head_strip_paths — the squash uses
             // these, NOT the union of per-step strip_paths.
-            head_strip_paths: &[".trinity/plans/foo.md".to_string()],
+            head_strip_paths: &[".clank/plans/foo.md".to_string()],
         })
         .await
         .unwrap();
         assert!(
-            !tree_has(dir.path(), "squashed", ".trinity/plans/foo.md"),
+            !tree_has(dir.path(), "squashed", ".clank/plans/foo.md"),
             "Drop-only squash must strip the plan file via head_strip_paths"
         );
     }
@@ -1402,7 +1402,7 @@ mod tests {
         let dir = init_repo();
         write(dir.path(), "README.md", "seed\n");
         let _seed = commit(dir.path(), "seed");
-        write(dir.path(), ".trinity/plans/foo.md", "# foo\n");
+        write(dir.path(), ".clank/plans/foo.md", "# foo\n");
         let intro = commit(dir.path(), "plan: foo");
         let preview = mk_preview(
             &intro,
@@ -1440,7 +1440,7 @@ mod tests {
         let dir = init_repo();
         write(dir.path(), "README.md", "seed\n");
         let _seed = commit(dir.path(), "seed");
-        write(dir.path(), ".trinity/plans/foo.md", "# foo\n");
+        write(dir.path(), ".clank/plans/foo.md", "# foo\n");
         let intro = commit(dir.path(), "plan: foo");
         let preview = mk_preview(
             &intro,
@@ -1480,7 +1480,7 @@ mod tests {
         let dir = init_repo();
         write(dir.path(), "README.md", "seed\n");
         let _seed = commit(dir.path(), "seed");
-        write(dir.path(), ".trinity/plans/foo.md", "# foo\n");
+        write(dir.path(), ".clank/plans/foo.md", "# foo\n");
         let intro = commit(dir.path(), "plan: foo");
         let preview = mk_preview(
             &intro,
@@ -1516,7 +1516,7 @@ mod tests {
         write(dir.path(), "README.md", "seed\n");
         let seed = commit(dir.path(), "seed");
         let preview = RewritePreviewResponse {
-            plan_id: "trinity/foo.md".into(),
+            plan_id: "clank/foo.md".into(),
             plan_stem: PlanKey::parse("foo").unwrap(),
             intro_sha: Some(CommitSha::parse(&seed).unwrap()),
             head_sha: CommitSha::parse(&seed).unwrap(),

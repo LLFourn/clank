@@ -1,10 +1,10 @@
-//! Operator-facing CLI commands. The daemon never writes Trinity
+//! Operator-facing CLI commands. The daemon never writes Clank
 //! artifacts; this module does, via local `git` subprocess calls
 //! and direct filesystem writes. Mutations live here; the daemon
 //! exposes typed read-only previews (`finish_preview`,
 //! `rewrite_preview`) that drive what each command actually does.
 //!
-//! See `.trinity/plans/trinity-cli.md` for the contract.
+//! See `.clank/plans/clank-cli.md` for the contract.
 
 use clap::Args;
 use std::path::{Path, PathBuf};
@@ -29,7 +29,7 @@ pub struct StatusArgs {
     /// Repo root. Defaults to the cwd's git toplevel.
     #[arg(long, value_name = "PATH")]
     pub repo: Option<PathBuf>,
-    /// Emit JSON (typed `StatusResponse` from `trinity-core::api`).
+    /// Emit JSON (typed `StatusResponse` from `clank-core::api`).
     #[arg(short = 'j', long)]
     pub json: bool,
     /// Skip the on-disk state cache: don't read it, don't write it.
@@ -54,14 +54,14 @@ pub struct FinishArgs {
     /// Override the default `Finalize <stem>` commit message.
     #[arg(short = 'm', long)]
     pub message: Option<String>,
-    /// After finalize, strip the plan's `.trinity/` artifacts
+    /// After finalize, strip the plan's `.clank/` artifacts
     /// from history (runs the rewrite engine on the just-extended
     /// range). The finalize snapshot is included in the strip.
     #[arg(long)]
     pub purge: bool,
     /// After finalize, collapse the plan's commits into one with
     /// the supplied message. Combine with `--purge` to also strip
-    /// the plan's `.trinity/` artifacts.
+    /// the plan's `.clank/` artifacts.
     #[arg(long, value_name = "MSG")]
     pub squash: Option<String>,
     /// Write the rewritten history to a fresh branch instead of
@@ -74,7 +74,7 @@ pub struct FinishArgs {
     pub allow_rewrite_protected: bool,
     /// Dry-run for `--purge`/`--squash`: emit the rebase-todo
     /// without creating the finalize commit or moving any refs.
-    /// Ignored on plain `trinity finish`.
+    /// Ignored on plain `clank finish`.
     #[arg(long)]
     pub dry: bool,
     /// Skip the on-disk state cache: don't read it, don't write it.
@@ -86,12 +86,12 @@ pub struct FinishArgs {
 pub struct PurgeArgs {
     /// Plan to purge. Accepts `<repo>/<stem>.md` or just `<stem>`.
     /// Omit to infer the single active in-flight plan, or pass
-    /// `--all` to strip every `.trinity/` path. Mutually exclusive
+    /// `--all` to strip every `.clank/` path. Mutually exclusive
     /// with `--all`.
     pub plan: Option<String>,
-    /// Strip EVERY `.trinity/` path from history (plan files,
-    /// finalize snapshots, AND non-plan Trinity metadata like
-    /// `.trinity/.gitignore` and `.trinity/stubs/*`). Cannot be
+    /// Strip EVERY `.clank/` path from history (plan files,
+    /// finalize snapshots, AND non-plan Clank metadata like
+    /// `.clank/.gitignore` and `.clank/stubs/*`). Cannot be
     /// combined with a plan argument.
     #[arg(long)]
     pub all: bool,
@@ -118,7 +118,7 @@ pub struct PurgeArgs {
     pub squash: Option<String>,
     /// Amend HEAD instead of building a new chain. HEAD must
     /// already be a finalize commit (every changed path under
-    /// `.trinity/finished/<stem>/`, or under `.trinity/finished/`
+    /// `.clank/finished/<stem>/`, or under `.clank/finished/`
     /// for `--all`).
     #[arg(long)]
     pub amend: bool,
@@ -158,12 +158,12 @@ pub(crate) fn resolve_repo(explicit: Option<&Path>) -> anyhow::Result<PathBuf> {
     Ok(dunce::canonicalize(&raw)?)
 }
 
-/// Derive the repo basename — the segment Trinity uses to address
+/// Derive the repo basename — the segment Clank uses to address
 /// plans on the wire (`/api/plan/<basename>/<stem>.md`). Wraps
 /// `RepoBasename::from_repo_root` so the validation rule lives in
 /// one place.
 pub(crate) fn repo_basename(repo: &Path) -> anyhow::Result<String> {
-    trinity_core::ids::RepoBasename::from_repo_root(repo)
+    clank_core::ids::RepoBasename::from_repo_root(repo)
         .map(|b| b.as_str().to_string())
         .ok_or_else(|| anyhow::anyhow!("repo path has no usable basename: {}", repo.display()))
 }
