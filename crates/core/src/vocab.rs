@@ -323,6 +323,9 @@ pub enum WaitingReason {
     /// REQUEST_CHANGES on the latest reviewable commit; master
     /// addresses and commits.
     AddressCommitChanges,
+    /// Gate is approved + worktree clean — master should run
+    /// `clank finish`.
+    ReadyToFinalize,
     /// Latest reviewable commit is approved; master moves forward.
     ReadyToStartImplementation,
     /// Latest reviewable commit hasn't been reviewed yet.
@@ -335,6 +338,7 @@ impl WaitingReason {
             WaitingReason::SessionFinished => "session_finished",
             WaitingReason::CommitPlanRevision => "commit_plan_revision",
             WaitingReason::AddressCommitChanges => "address_commit_changes",
+            WaitingReason::ReadyToFinalize => "ready_to_finalize",
             WaitingReason::ReadyToStartImplementation => "ready_to_start_implementation",
             WaitingReason::CommitNeedsReview => "commit_needs_review",
         }

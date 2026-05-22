@@ -74,7 +74,7 @@ pub fn derive_work(views: &[PlanView], author: &AgentLabel, role: Role) -> Vec<W
                 out.push(master(
                     view,
                     MasterNext::Finalize,
-                    WaitingReason::ReadyToStartImplementation,
+                    WaitingReason::ReadyToFinalize,
                 ));
             }
             (Role::Reviewers, WaitingOn::FirstReview) => {
