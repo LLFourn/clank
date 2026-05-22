@@ -37,19 +37,38 @@ as a prereq.
 
 - Daemonless. Both surfaces read the same `RepoState` every
   other subcommand does. No HTTP, no shared in-process state.
-- One canonical per-plan projection in `clank-core::plan_view`:
-  `pub fn project(state, plan_key, feedback_view) -> PlanView`
-  returns gate state, latest reviewable SHA, waiting_on, worktree
-  status. `status` aggregates over all active plans; `wfw`
-  filters and decides per-agent action.
-- `wfw` blocks by filesystem watch (`notify` crate, already a dep
-  via `fs_watcher`). On any change under `.git/`, `.clank/plans/`,
-  `.clank/feedback/`, `.clank/finished/`, refold and recompute.
-  No polling loop. `status` never blocks.
-- `wfw --author <label>` is mandatory. Clap rejects invocations
-  without it. No env detection, no config file, no inference.
-  The agent picks its label and owns the consequence. `status`
-  has no `--author` — it's repo-wide.
+- **`clank-core` stays pure.** No filesystem reads, no git
+  shell-outs in core. Core defines the typed shapes
+  (`FeedbackView`, `WorktreeFacts`, `PlanView`) and the pure
+  projection over them. CLI does the IO and feeds the results
+  in:
+
+  ```rust
+  // crates/core/
+  pub fn project(
+      state: &RepoState,
+      plan_key: &PlanKey,
+      feedback: &FeedbackView,
+      worktree: &WorktreeFacts,
+  ) -> PlanView;
+
+  // crates/cli/ — the IO
+  pub fn scan_feedback(repo: &Path, plan: &PlanKey, sha: &CommitSha) -> FeedbackView;
+  pub fn read_worktree_facts(repo: &Path, plan_path: &str, head_blob: Option<&str>) -> WorktreeFacts;
+  ```
+
+  `status` and `wfw` both call the CLI-side IO, then hand the
+  results to the core projection.
+- `wfw` blocks by filesystem watch (`notify` crate, already a
+  dep via `fs_watcher`). `status` never blocks.
+- `wfw --author <label>` and `--role` are BOTH mandatory. Clap
+  rejects invocations missing either. No env detection, no
+  config file, no inference. Defaulting role from "has written
+  feedback before" breaks the brand-new-reviewer case (their
+  first review is exactly when they have no prior feedback);
+  rather than ship a heuristic that misfires on the most
+  important case, require explicit `--role`. `status` has
+  neither — it's repo-wide.
 - Human-readable output by default. `-j` / `--json` opts into
   JSON. Standard CLI convention; agents pass `-j` explicitly.
 
@@ -87,16 +106,46 @@ naming the flag.
 
 ## Per-Plan Projection (`clank-core::plan_view`)
 
-Both `status` and `wfw` read this shape. One function, two
-surfaces.
+Pure function over typed inputs. CLI reads filesystem +
+worktree, hands the results in. Both `status` and `wfw` use it.
 
 ```rust
+/// CLI scans `.clank/feedback/<plan>/<sha>/<author>.md` files
+/// into this shape, then hands it to the projection. Core never
+/// touches the filesystem.
+pub struct FeedbackView {
+    /// For every reviewable commit in the plan up to the latest:
+    /// the parsed verdicts indexed by author. Older commits feed
+    /// the participant set; the latest commit's entries decide
+    /// the gate.
+    pub per_commit: Vec<CommitFeedback>,
+}
+
+pub struct CommitFeedback {
+    pub sha: CommitSha,
+    pub entries: BTreeMap<AgentLabel, FeedbackEntry>,
+}
+
+pub struct FeedbackEntry {
+    pub verdict: Verdict,
+    pub body_hash: ContentHash,
+    /// Path relative to repo root — round-trips for the CLI to
+    /// re-read when sealing approvals. Core just stores it.
+    pub source_path: String,
+}
+
+/// CLI compares `.clank/plans/<key>.md` to its HEAD blob and
+/// hands the result in.
+pub struct WorktreeFacts {
+    pub status: PlanWorktreeStatus, // Clean | BodyDirty | PlanFileMissing
+}
+
 pub struct PlanView {
     pub plan: PlanKey,
-    pub latest_reviewable_sha: CommitSha,    // always present; intro touches the plan file
-    pub gate_state: CommitGateState,         // Unreviewed | ChangesRequested | Approved
-    pub waiting_on: WaitingOn,               // see below
-    pub worktree_status: PlanWorktreeStatus, // Clean | BodyDirty | PlanFileMissing
+    pub latest_reviewable_sha: CommitSha,
+    pub gate_state: CommitGateState,
+    pub waiting_on: WaitingOn,
+    pub worktree_status: PlanWorktreeStatus,
     pub last_activity_ts: i64,
 }
 
@@ -186,9 +235,14 @@ we already do in `preview.rs`; factor it into core so both
 ```text
 clank status                                # human rendering of the one inferred active plan
 clank status --all                          # every active plan
-clank status --plan clank/foo.md            # specific plan (active or finished)
+clank status --plan foo                     # specific plan (stem, "foo.md", or ".clank/plans/foo.md" — all accepted)
 clank status -j                             # JSON envelope (any of the above)
 ```
+
+`--plan` accepts the same three forms `clank finish` already
+takes via `cli::plan_resolve::parse_arg`: bare stem, `<stem>.md`,
+or the full repo-qualified `<basename>/<stem>.md`. Don't invent
+a fourth spelling.
 
 Plan inference matches `clank finish`: exactly one visible active
 plan in the cwd-repo → use it. Zero → print "no active plan,
@@ -196,8 +250,9 @@ nothing pending" (and the head/branch/dirty header) and exit 0.
 More than one → exit non-zero with a candidate list and a hint
 pointing at `--all` and `--plan`.
 
-`-j` / `--json` envelope (status-wide, finished plans summarised
-inline):
+`-j` / `--json` envelope. Plans carry both the bare stem
+(`plan`, for display) and the canonical path (`plan_path`, for
+round-tripping):
 
 ```json
 {
@@ -207,7 +262,8 @@ inline):
   "worktree_dirty": false,
   "plans": [
     {
-      "plan": "clank/foo.md",
+      "plan": "foo",
+      "plan_path": ".clank/plans/foo.md",
       "latest_reviewable_sha": "abcd...",
       "gate_state": "approved",
       "waiting_on": {"kind": "master_to_finalize"},
@@ -225,89 +281,94 @@ use case.
 ### `clank wfw`
 
 ```text
-clank wfw --author <label>                              # blocking, human-readable, role inferred from prior feedback
-clank wfw --author <label> -j                           # JSON output
-clank wfw --author <label> --role master
-clank wfw --author <label> --role reviewers
-clank wfw --author <label> --timeout 30m                # max wait; "0" = indefinite (default)
-clank wfw --author <label> --plan-id clank/foo.md       # restrict to one plan
+clank wfw --author <label> --role <master|reviewers>             # blocking, human-readable
+clank wfw --author <label> --role <...> -j                       # JSON
+clank wfw --author <label> --role <...> --timeout 30m            # max wait; "0" = indefinite (default)
+clank wfw --author <label> --role <...> --plan foo               # restrict to one plan (same parser as status)
 ```
 
-Role inference: if `<label>` has ever written a feedback file in
-this repo, default to `reviewers`. Otherwise `master`. Simple
-heuristic; `--role` is the canonical knob, treat the heuristic
-as a fallback.
+Both `--author` and `--role` are mandatory. Clap rejects
+invocations missing either.
 
-Exit codes:
-- `0` — work returned (printed) or `--once` returned Idle.
-- `2` — timeout exceeded with no work.
-- `3` — ambiguous setup (multiple active plans, no `--plan-id`).
-- `1` — error (bad args, fold failure, missing identity).
-
-JSON shape (one object per item, NDJSON for streams):
+JSON output uses the same `plan` + `plan_path` shape as `status`:
 
 ```json
-{"kind":"master","plan":"clank/foo.md","sha":"abcd...","next":"finalize","reason":"latest_approved"}
-{"kind":"reviewer","plan":"clank/foo.md","sha":"abcd...","feedback_path":".clank/feedback/foo/abcd.../codex.md"}
+{"kind":"master","plan":"foo","plan_path":".clank/plans/foo.md","sha":"abcd...","next":"finalize","reason":"latest_approved"}
+{"kind":"reviewer","plan":"foo","plan_path":".clank/plans/foo.md","sha":"abcd...","feedback_path":".clank/feedback/foo/abcd.../codex.md"}
 {"kind":"idle"}
 ```
 
+Exit codes (both commands unless noted):
+- `0` — work returned (printed) or status snapshot emitted.
+- `1` — error (bad args, fold failure).
+- `2` — `wfw` only: timeout exceeded with no work.
+- `3` — ambiguous setup (multiple active plans, no `--plan` /
+  `--all`).
+
 ## Watch Loop
 
-When the initial fold returns empty `WorkItem::Idle` and we're
-not in `--once`:
+When the initial fold returns `WorkItem::Idle`:
 
-1. Build a `notify::RecommendedWatcher` over
-   `.git/HEAD`, `.git/refs/`, `.clank/plans/`, `.clank/feedback/`,
-   `.clank/finished/`.
-2. Debounce events (200ms) — many writes per logical change.
-3. On debounced event: refold, re-derive, return first non-idle
+1. Resolve the actual git dir via `git rev-parse --git-dir` and
+   `--git-common-dir`. `.git` may be a regular file (worktrees,
+   submodules) pointing at the real dir elsewhere, and refs in
+   the common dir need watching even when invoked from a linked
+   worktree. Watching `<repo>/.git/...` blindly misses both
+   cases.
+2. Build a `notify::RecommendedWatcher` over:
+   - `<git_dir>/HEAD`
+   - `<git_common_dir>/refs/`
+   - `<git_common_dir>/packed-refs` (if it exists)
+   - `<repo>/.clank/plans/`
+   - `<repo>/.clank/feedback/`
+   - `<repo>/.clank/finished/`
+3. Debounce events (200ms) — many writes per logical change.
+4. On debounced event: refold, re-derive, return first non-idle
    work item.
-4. Honour `--timeout`; exit code 2 on expiry.
+5. Honour `--timeout`; exit code 2 on expiry.
 
-Borrow the existing `src/fs_watcher.rs` watcher. It already knows
-the filesystem layout and emits typed signals.
+Borrow the existing `src/fs_watcher.rs` watcher for the
+`.clank/` half; add git-dir-resolution helpers to `git_io.rs`
+for the git half. A regression test must cover the worktree case
+(synth a `git worktree add` and assert wfw wakes on HEAD changes
+made from either side).
 
-## Stubs Cleanup (Prereq)
+## Stubs
 
-The stubs under `.clank/stubs/` were never rewritten by the
-trinity → clank rename — they're frozen drafts. Reading
-`trinity wfw` references in a `clank` project causes confusion.
-As a prereq commit:
+`.clank/stubs/` is git-ignored (root `.gitignore` has
+`.clank/*` with `!plans/` and `!finished/` carve-outs). Stubs
+are operator-local drafts, not tracked project artifacts.
+A "prereq commit" can't touch them.
 
-- Rename filenames containing `trinity` → `clank`:
-  - `trinity-cli.md` → `clank-cli.md`
-  - `trinity-wfw-cli.md` → `clank-wfw-cli.md`
-  - `daemonless-trinity-workflow.md` → `daemonless-clank-workflow.md`
-- Sweep `s/trinity/clank/g` and `s/Trinity/Clank/g` across all
-  files in `.clank/stubs/`. They're forward-looking drafts; the
-  rename is a strict improvement.
-- The text `.trinity/` inside stubs becomes `.clank/`.
-- The acceptance grep gains `.clank/stubs/` once this lands —
-  zero `trinity` hits anywhere in the repo.
-
-This is a separate prereq commit. The `clank-wfw` plan body
-references the renamed stub names.
+If you have local stubs and want them renamed, do it yourself
+(`sed -i '' 's/trinity/clank/g'` over the directory). Clank
+doesn't track them and the acceptance grep doesn't cover them.
+Out of scope for this plan.
 
 ## Sequencing
 
-Three commits, in order:
+Two commits, in order:
 
-1. **Stubs cleanup.** Rename + sweep `.clank/stubs/`. Mechanical
-   sed + git mv. No code changes.
-2. **`clank-core` projection.** Adds:
-   - `clank-core::feedback_view` (project from `.clank/feedback/`,
-     factored out of `preview.rs`; both `preview.rs` and the new
-     projection consume it).
-   - `clank-core::plan_view::{PlanView, WaitingOn, project}`.
-   - Tests as in the Tests section below for the projection.
-3. **CLI surfaces.** Adds:
-   - Rewires `crates/cli/src/cli/status.rs` onto `plan_view::project`,
-     adds `--all` / `--plan`, enriches JSON to the new envelope.
-     Single-plan inference matches `finish`.
-   - `clank-core::work` (`WorkItem`, `Role`, `derive_work`) — the
+1. **`clank-core` projection.** Adds:
+   - `clank-core::feedback_view::{FeedbackView, CommitFeedback,
+     FeedbackEntry}` — pure data shape only. No IO.
+   - `clank-core::plan_view::{PlanView, WaitingOn, WorktreeFacts,
+     project}`.
+   - `clank-core::work::{WorkItem, Role, derive_work}` — the
      agent-perspective filter over `PlanView`.
-   - `crates/cli/src/cli/wfw.rs` (CLI subcommand + watch loop).
+   - Tests per the Tests section for `project` and `derive_work`.
+2. **CLI surfaces.** Adds:
+   - `crates/cli/src/feedback_scan.rs` — IO that builds a
+     `FeedbackView` from `.clank/feedback/`. Used by both status
+     and wfw, and replaces the inline scan in `preview.rs`.
+   - `crates/cli/src/worktree_facts.rs` — IO that compares the
+     worktree plan file to its HEAD blob and returns
+     `WorktreeFacts`.
+   - Rewires `crates/cli/src/cli/status.rs` onto the new core
+     projection, adds `--all` / `--plan`, enriches JSON to the
+     new envelope. Single-plan inference matches `finish`.
+   - `crates/cli/src/cli/wfw.rs` — clap subcommand, git-dir
+     resolution helpers, watch loop, role + author required.
    - `clank wfw` + status changes registered in `main.rs` clap.
 
 ## Tests
@@ -332,11 +393,14 @@ Three commits, in order:
   Add a second active plan; assert default exit is non-zero
   with a candidate list, `--all` succeeds with both.
 - `clank wfw` integration: synth temp repo, run
-  `clank wfw --author alice` in a thread, write a feedback file,
-  assert the command returns the expected work item within the
-  debounce window.
-- Missing `--author` on `wfw`: clap exits non-zero, stderr names
-  the flag.
+  `clank wfw --author alice --role reviewers` in a thread,
+  write a feedback file, assert the command returns the expected
+  work item within the debounce window.
+- `clank wfw` worktree-watch regression: `git worktree add` a
+  second working tree of the same repo, run wfw in the linked
+  worktree, change HEAD in the main worktree, assert wfw wakes.
+- Missing `--author` OR missing `--role` on `wfw`: clap exits
+  non-zero, stderr names the missing flag.
 
 ## Acceptance
 
@@ -345,21 +409,25 @@ Three commits, in order:
 - `clank status` with two active plans exits non-zero, message
   names `--all` and `--plan`.
 - `clank status --all` lists every active plan.
-- `clank wfw --author alice` (blocking) in a repo with no work
-  for alice watches FS and returns the first work item when one
-  appears.
-- `clank wfw` with no `--author` exits non-zero with clap's
-  standard "required argument missing" error naming the flag.
+- `clank wfw --author alice --role reviewers` (blocking) in a
+  repo with no work for alice watches FS and returns the first
+  work item when one appears.
+- `clank wfw` with no `--author` or no `--role` exits non-zero
+  with clap's standard "required argument missing" error naming
+  the missing flag.
 - `clank wfw --author alice --role master` and
   `--role reviewers` produce different work sets for the same
   repo/state.
-- `clank wfw --author alice --timeout 30s` exits with code 2
-  after ~30s when no work appears.
-- Zero `trinity` references anywhere in `.clank/stubs/` after
-  the prereq commit.
+- `clank wfw --author alice --role reviewers --timeout 30s`
+  exits with code 2 after ~30s when no work appears.
+- `clank wfw` in a linked git worktree wakes when HEAD changes
+  in the main worktree.
 - `plan_view::project` is the single source of truth — both
   `status.rs` and `derive_work` consume it, no parallel
   computation of gate state / waiting_on.
+- `clank-core` has no `std::fs::` / `std::process::Command` /
+  `tokio::fs::` calls (grep-verifiable). All IO lives in
+  `crates/cli/`.
 
 ## Out of Scope
 
