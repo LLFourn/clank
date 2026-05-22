@@ -150,15 +150,17 @@ pub struct PlanView {
 }
 
 pub enum WaitingOn {
+    /// Nobody has reviewed any commit in this plan yet. Any
+    /// reviewer agent can pick it up. Distinct from
+    /// `ReviewerApprovalsMissing { missing: [] }` (which would
+    /// be ambiguous and is therefore not representable).
+    FirstReview,
     /// Latest reviewable commit lacks feedback from one or more
-    /// reviewers. `missing` is the cumulative participant set the
-    /// gate is short on — `[]` means "no participants yet; open
-    /// for the first review." `wfw --role reviewers` treats both
-    /// shapes as eligible work (own label in `missing`, OR
-    /// `missing.is_empty()`).
-    Reviewers { missing: Vec<AgentLabel> },
+    /// existing participants. `missing` is non-empty by
+    /// construction — the empty case is `FirstReview`.
+    ReviewerApprovalsMissing { missing: NonEmptyVec<AgentLabel> },
     /// A reviewer requested changes or left an ambiguous verdict.
-    /// `requesters`/`ambiguous` tell the master who to address.
+    /// `requesters` / `ambiguous` tell the master who to address.
     MasterToRevise { requesters: Vec<AgentLabel>, ambiguous: Vec<AgentLabel> },
     /// Gate is approved + worktree clean. Master just needs to
     /// run `clank finish`.
@@ -168,6 +170,19 @@ pub enum WaitingOn {
     MasterToCommit,
 }
 ```
+
+The reviewer-eligibility rule then matches by variant:
+
+```rust
+// In derive_work for role=reviewers:
+match plan.waiting_on {
+    WaitingOn::FirstReview                                  => true,
+    WaitingOn::ReviewerApprovalsMissing { missing } if author in missing => true,
+    _ => false,
+}
+```
+
+No empty-vector sentinel, no two-branch test that drifts apart.
 
 Every plan in `state.fold.plans` has at least one reviewable
 commit (the intro itself, which touched the plan file), so
@@ -298,12 +313,22 @@ JSON output uses the same `plan` + `plan_path` shape as `status`:
 {"kind":"idle"}
 ```
 
-Exit codes (both commands unless noted):
-- `0` — work returned (printed) or status snapshot emitted.
-- `1` — error (bad args, fold failure).
-- `2` — `wfw` only: timeout exceeded with no work.
-- `3` — ambiguous setup (multiple active plans, no `--plan` /
-  `--all`).
+Exit codes:
+
+- `clank status`:
+  - `0` — snapshot emitted (one plan, `--all`, or specific `--plan`).
+  - `1` — error (bad args, fold failure).
+  - `3` — multiple active plans without `--all` / `--plan`
+    (ambiguous; emit candidate list to stderr).
+- `clank wfw`:
+  - `0` — at least one work item returned. Multi-plan repos
+    return the full eligible set; no ambiguity error.
+  - `1` — error (bad args, fold failure).
+  - `2` — timeout exceeded with no work.
+
+`wfw` does NOT use exit code 3. Multiple active plans is the
+common case for reviewers — surfacing the full eligible set is
+the point. `--plan <stem>` narrows when the caller wants one.
 
 ## Watch Loop
 
@@ -329,9 +354,18 @@ When the initial fold returns `WorkItem::Idle`:
 
 Borrow the existing `src/fs_watcher.rs` watcher for the
 `.clank/` half; add git-dir-resolution helpers to `git_io.rs`
-for the git half. A regression test must cover the worktree case
-(synth a `git worktree add` and assert wfw wakes on HEAD changes
-made from either side).
+for the git half.
+
+Linked-worktree invariant the regression test must cover: when
+wfw runs inside a linked worktree, it pins the git dir / common
+dir from THAT worktree (its own `HEAD`, its own resolved ref).
+Updating the main worktree's HEAD does NOT necessarily change
+the linked worktree's effective HEAD; updating the ref the
+linked worktree points at DOES. The test reflects this: it
+mutates the specific ref the linked worktree's HEAD resolves to
+(via a separate `git` invocation that targets that ref), then
+asserts wfw wakes and refolds against the linked-worktree
+context.
 
 ## Stubs
 
@@ -375,37 +409,53 @@ Two commits, in order:
 
 - `clank-core::plan_view::project` — table-driven over synthetic
   `RepoState` + `FeedbackView`:
-  - `Reviewers { missing: [] }` when the intro just landed and
-    no one has reviewed yet (open for first review).
-  - `Reviewers { missing: [bob] }` when bob is a participant and
-    the latest reviewable commit has no `bob.md`.
+  - `FirstReview` when the intro just landed and no one has
+    reviewed yet.
+  - `ReviewerApprovalsMissing { missing: [bob] }` when bob is a
+    participant and the latest reviewable commit has no `bob.md`.
   - `MasterToRevise` when a reviewer left RequestChanges.
   - `MasterToFinalize` when gate is Approved + worktree clean.
   - `MasterToCommit` when gate Approved but worktree dirty.
 - `clank-core::work::derive_work` — table-driven over a synthetic
   `[PlanView]`:
   - master role picks plans whose waiting_on is master-flavored.
-  - reviewer role picks plans where `author ∈ missing` OR
-    `missing.is_empty()` (open for first review).
+  - reviewer role picks plans where `waiting_on` is
+    `FirstReview`, OR `ReviewerApprovalsMissing` with `author`
+    in `missing`.
   - role=reviewers + author not eligible on any plan → Idle.
 - `clank status` integration: synth a temp repo with one active
-  plan, assert default JSON matches the documented envelope.
+  plan, assert `clank status -j` matches the documented JSON
+  envelope and `clank status` (no flag) produces a non-empty
+  human rendering containing the plan stem + waiting_on summary.
   Add a second active plan; assert default exit is non-zero
   with a candidate list, `--all` succeeds with both.
-- `clank wfw` integration: synth temp repo, run
+- `clank wfw` reviewer wake-up: synth temp repo, run
   `clank wfw --author alice --role reviewers` in a thread,
-  write a feedback file, assert the command returns the expected
-  work item within the debounce window.
-- `clank wfw` worktree-watch regression: `git worktree add` a
-  second working tree of the same repo, run wfw in the linked
-  worktree, change HEAD in the main worktree, assert wfw wakes.
+  THEN land a new reviewable commit (writing alice's
+  `feedback/<plan>/<sha>/alice.md` would COMPLETE the work, not
+  trigger it). Assert the command returns the expected
+  `ReviewerAction` within the debounce window.
+- `clank wfw` master wake-up: synth temp repo with an approved
+  gate, run `clank wfw --author <plan-owner> --role master` in
+  a thread, then have a second author write a
+  `REQUEST_CHANGES` feedback file at the latest reviewable SHA.
+  Assert wfw returns `MasterToRevise` (the gate flipped from
+  approved → changes-requested).
+- `clank wfw` linked-worktree regression: see the Watch Loop
+  section for the precise setup. Resolve the linked worktree's
+  git dir / common dir, watch the ref its HEAD points at,
+  update that ref via a separate `git` invocation, assert wfw
+  wakes and refolds against the linked-worktree HEAD.
 - Missing `--author` OR missing `--role` on `wfw`: clap exits
   non-zero, stderr names the missing flag.
 
 ## Acceptance
 
-- `clank status` in a one-plan repo prints the enriched JSON
-  envelope with `waiting_on` populated, no blocking.
+- `clank status` in a one-plan repo prints the human rendering
+  (gate state, waiting_on, worktree status) for that plan, no
+  blocking.
+- `clank status -j` in the same repo prints the JSON envelope
+  with `waiting_on` populated.
 - `clank status` with two active plans exits non-zero, message
   names `--all` and `--plan`.
 - `clank status --all` lists every active plan.
@@ -443,10 +493,6 @@ Two commits, in order:
 
 ## Open Questions
 
-- Should reviewer-mode `wfw` surface multiple plans' work at
-  once, or block until one appears and return it alone? Lean:
-  surface all pending reviewer items in one shot — agents can
-  iterate.
 - For `wfw -j` blocking mode: NDJSON stream (one work item per
   line as they appear) or a single envelope on wake? Lean:
   single envelope — `wfw` returns one round of work and exits,
