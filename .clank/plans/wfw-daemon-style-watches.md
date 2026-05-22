@@ -124,23 +124,31 @@ clank wfw --no-poll    # force polling off
 clank wfw              # env-driven default
 ```
 
-`WfwArgs::resolve_poll(env: &dyn Environment) -> bool` returns
-the effective value. With clap's `Option<bool>` + `--no-<x>`
-support, the args struct just holds `poll: Option<bool>`; the
-helper consults `CODEX_SANDBOX` only when `poll.is_none()`.
+The resolution logic is split into a **pure** decision
+function and a tiny CLI wrapper that reads env once:
 
 ```rust
+/// Pure. No env access. Used in unit tests for the full
+/// matrix without touching process-global state.
+pub fn resolve_poll(
+    explicit: Option<bool>,
+    codex_sandbox: Option<&str>,
+) -> bool {
+    explicit.unwrap_or_else(|| codex_sandbox == Some("seatbelt"))
+}
+
 impl WfwArgs {
-    pub fn resolve_poll(&self) -> bool {
-        if let Some(b) = self.poll { return b; }
-        std::env::var("CODEX_SANDBOX").as_deref() == Ok("seatbelt")
+    pub fn effective_poll(&self) -> bool {
+        let codex = std::env::var("CODEX_SANDBOX").ok();
+        resolve_poll(self.poll, codex.as_deref())
     }
 }
 ```
 
-The env read is bound here, not anywhere downstream. Tests
-that exercise the resolve_poll logic can call it directly
-after setting / unsetting the env var.
+`std::env::var("CODEX_SANDBOX")` is read in exactly ONE place
+in the entire codebase: `WfwArgs::effective_poll`. Unit tests
+call `resolve_poll(...)` directly with crafted inputs — no env
+mutation, no race between parallel tests.
 
 ### WatchContext + watch loop
 
@@ -205,37 +213,50 @@ continue to pass under the new shape:
 - Early-snapshot + late-commit finalize race
 - Master/code-only wake routing
 
-`wfw_reviewer_wakes_on_code_only_commit` is one part of the
-native-mode proof. `wfw_reviewer_wakes_on_commit_with_index_already_staged`
-isolates the commit-boundary write from any preceding
-`git add` noise: stage BEFORE parking wfw, then run only
-`git commit -m`. Both tests must pass under both modes.
+**Critical testing invariant: every integration test that
+spawns `clank wfw` MUST pass `--no-poll` or `--poll`
+explicitly.** The integration tests run inside the developer's
+shell — which, in the Codex tool sandbox, sets
+`CODEX_SANDBOX=seatbelt`. Without an explicit flag, every
+test silently switches to polling mode and the native-watcher
+path stops being proven. Tests assert specific architectural
+properties; the test harness must not be allowed to swap modes
+based on which shell ran `cargo test`.
 
-New required test:
-`wfw_polling_mode_wakes_on_commit_via_periodic_refold`.
+Concretely:
 
-1. Set `CODEX_SANDBOX=seatbelt` in the child's environment
-   (or pass `--poll` explicitly) so wfw runs in polling mode.
-2. Stage the code change BEFORE parking wfw.
-3. Start `clank wfw` and wait for the watcher to attach
-   (1.5 s — same as native).
-4. Run `git commit -m '[foo] code work'`.
-5. Assert wfw exits 0 with a `Reviewer` item within ~2 s.
-   The poll tick is 500 ms, so the expected latency is one
-   tick (~500 ms) plus refold; the bound is generous.
-6. Assert `wfw_test_no_gitdir_watch` (a test-only assertion
-   hook) — or simpler, verify by inspection during code
-   review — that polling-mode WatchContext doesn't register
-   a gitdir watch.
+- All 13 existing wfw integration tests get `--no-poll` added
+  to their spawn args. They prove the native-mode path.
+- `wfw_reviewer_wakes_on_code_only_commit` and
+  `wfw_reviewer_wakes_on_commit_with_index_already_staged`
+  remain the load-bearing native-mode commit-wake tests.
+- New test `wfw_polling_mode_wakes_on_commit_via_periodic_refold`:
+  1. Spawn `clank wfw --poll` explicit.
+  2. Stage the code change BEFORE parking wfw.
+  3. Wait for watcher attach (1.5 s).
+  4. Run `git commit -m '[foo] code work'`.
+  5. Assert wfw exits 0 with a `Reviewer` item within ~2 s.
+     One poll tick (~500 ms) plus refold is the expected
+     latency; the bound is generous.
 
-`WfwArgs::resolve_poll` gets its own unit tests:
+`resolve_poll(explicit, codex_sandbox)` gets its own unit
+tests — pure inputs, no env mutation:
 
-- `--poll` explicit → true regardless of env.
-- `--no-poll` explicit → false regardless of env.
-- No flag + `CODEX_SANDBOX=seatbelt` → true.
-- No flag + `CODEX_SANDBOX=` (empty) → false.
-- No flag + `CODEX_SANDBOX` unset → false.
-- No flag + `CODEX_SANDBOX=other-value` → false.
+```rust
+assert_eq!(resolve_poll(Some(true),  None),               true);
+assert_eq!(resolve_poll(Some(false), Some("seatbelt")),   false);
+assert_eq!(resolve_poll(None,        Some("seatbelt")),   true);
+assert_eq!(resolve_poll(None,        Some("")),           false);
+assert_eq!(resolve_poll(None,        Some("other")),      false);
+assert_eq!(resolve_poll(None,        None),               false);
+```
+
+Six rows, no `std::env::set_var`, parallel-test-safe.
+
+`WfwArgs::effective_poll` does NOT get a unit test — it's a
+trivial three-line glue that calls `resolve_poll` with the
+env value. Its correctness follows from `resolve_poll`'s
+tests plus the obvious-by-inspection wrapper.
 
 ### Script-level Codex-sandbox repro
 
@@ -261,9 +282,18 @@ Acceptance for the repros:
 - `clank wfw` accepts `--poll` / `--no-poll`. With neither,
   the default is `false` UNLESS `CODEX_SANDBOX=seatbelt` is
   set, in which case the default is `true`.
-- The env check happens ONLY in `WfwArgs::resolve_poll` (or
-  equivalent). `grep -rn 'CODEX_SANDBOX' crates/cli/src` shows
-  exactly one hit, in the CLI arg layer.
+- The env read happens ONLY in `WfwArgs::effective_poll`.
+  `grep -rn 'CODEX_SANDBOX' crates/cli/src` shows exactly one
+  hit. `resolve_poll(explicit, codex_sandbox)` is the pure
+  decision function; `effective_poll` is its CLI-side wrapper
+  that reads env.
+- Every integration test that spawns `clank wfw` passes
+  `--no-poll` or `--poll` explicitly. `grep -rn 'wfw' crates/cli/tests`
+  shows no spawn arglists without one of the two flags. This
+  guarantees the tests prove what they claim regardless of
+  which shell environment runs `cargo test`.
+- `resolve_poll` unit tests cover the six-row matrix described
+  in the Tests section, with no `std::env::set_var` calls.
 - In native mode, `clank wfw` watches `<repo>/.clank` recursive
   AND the resolved worktree gitdir recursive. Two
   `watcher.watch(...)` calls.
