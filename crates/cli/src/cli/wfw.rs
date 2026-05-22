@@ -123,28 +123,45 @@ pub async fn run(args: WfwArgs) -> anyhow::Result<()> {
 
     let deadline = timeout.map(|t| std::time::Instant::now() + t);
     loop {
-        // Block forever when `--timeout 0`; otherwise honour the
-        // deadline. Don't fall through `recv_timeout` with a
-        // synthetic interval — `Timeout` is the bottom of the
-        // function's flowchart and unconditionally produces `WfwTimeout`.
-        let event = match deadline {
-            None => rx
-                .recv()
-                .map_err(|_| anyhow::anyhow!("filesystem watcher disconnected"))?,
+        // Heartbeat refold cadence. We refold whenever an FS event
+        // fires AND on this fixed interval, even with no events.
+        // The heartbeat is the safety net for the finalize-race
+        // codex caught: `clank finish` writes the snapshot files
+        // before committing, so the FS event wakes wfw, the
+        // refold lands BEFORE the commit, sees nothing, and the
+        // post-commit git-ref event may never fire reliably. The
+        // periodic refold catches that case. 1500ms gives finalize
+        // notifications a snappy ceiling without burning much CPU
+        // on a warm cache.
+        const HEARTBEAT: Duration = Duration::from_millis(1500);
+        let wait = match deadline {
+            None => HEARTBEAT,
             Some(end) => match end.checked_duration_since(std::time::Instant::now()) {
                 None => return Err(WfwTimeout.into()),
-                Some(wait) => match rx.recv_timeout(wait) {
-                    Ok(()) => (),
-                    Err(mpsc::RecvTimeoutError::Timeout) => return Err(WfwTimeout.into()),
-                    Err(mpsc::RecvTimeoutError::Disconnected) => {
-                        anyhow::bail!("filesystem watcher disconnected")
-                    }
-                },
+                Some(remaining) => remaining.min(HEARTBEAT),
             },
         };
-        let _ = event;
-        // Debounce: drain bursts so one logical change → one refold.
-        while rx.recv_timeout(Duration::from_millis(200)).is_ok() {}
+        let event_received = match rx.recv_timeout(wait) {
+            Ok(()) => true,
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                // Could be deadline-expiry or heartbeat-tick. Distinguish.
+                if let Some(end) = deadline {
+                    if std::time::Instant::now() >= end {
+                        return Err(WfwTimeout.into());
+                    }
+                }
+                false
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                anyhow::bail!("filesystem watcher disconnected")
+            }
+        };
+        if event_received {
+            // Debounce: drain bursts so one logical change → one
+            // refold. Only meaningful on the FS-event branch; the
+            // heartbeat tick has nothing to drain.
+            while rx.recv_timeout(Duration::from_millis(200)).is_ok() {}
+        }
         if let Some(items) =
             check_once(&repo, policy, &plan_filter, &snapshot, &author, role).await?
         {

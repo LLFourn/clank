@@ -624,6 +624,84 @@ fn wfw_mixed_work_and_finished_on_one_wake() {
 }
 
 #[test]
+fn wfw_finish_wake_survives_early_snapshot_event() {
+    // Race regression: `clank finish` writes
+    // `.clank/finished/<stem>/...` BEFORE committing the finalize
+    // tree. The FS event for that file write wakes wfw, the
+    // 200ms debounce ends BEFORE the commit lands, and the
+    // refold sees nothing finished. If wfw relied solely on the
+    // post-commit git-ref event for the second wake, that event
+    // could fail to fire (notify drops it under load, debounce
+    // ate it, etc.) and wfw would block forever. The heartbeat
+    // refold is the safety net. This test forces the ordering:
+    // write the snapshot file manually, sleep PAST the debounce
+    // window, THEN run the same `git` calls clank finish does.
+    let dir = init_repo();
+    let repo = dir.path();
+    write(repo, ".clank/plans/foo.md", "# foo\n");
+    write(
+        repo,
+        ".clank/feedback/foo/placeholder.md",
+        "anchor so the feedback dir is tracked\n",
+    );
+    commit(repo, "[foo] intro");
+    let intro_sha = head_sha(repo);
+    // Approval — tracked from the start so the finalize commit
+    // doesn't auto-stage it via `git add -A`.
+    write(
+        repo,
+        &format!(".clank/feedback/foo/{intro_sha}/alice.md"),
+        "APPROVE\n",
+    );
+    git(
+        repo,
+        &["add", &format!(".clank/feedback/foo/{intro_sha}/alice.md")],
+    );
+    commit(repo, "[foo] approval anchor");
+
+    let mut child = spawn_wfw(
+        repo,
+        &[
+            "--author",
+            "alice",
+            "--role",
+            "reviewers",
+            "--timeout",
+            "30s",
+        ],
+    );
+
+    // Stage 1: write the snapshot file under .clank/finished/. This
+    // is the early FS event `clank finish` produces before its
+    // commit lands.
+    write(repo, ".clank/finished/foo/alice.md", "APPROVE\n\nsealed\n");
+
+    // Stage 2: sleep WELL past the watcher's debounce window so
+    // the snapshot-event wake consumed the FS-event budget alone.
+    std::thread::sleep(Duration::from_millis(1200));
+
+    // Stage 3: commit the finalize tree, mirroring `clank finish`:
+    // stage ONLY the new snapshot file and commit. `clank finish`
+    // does not remove the plan file — the finalize predicate
+    // fires on `.clank/finished/<stem>/` becoming non-empty, not
+    // on plan-file deletion.
+    git(repo, &["add", ".clank/finished/foo/alice.md"]);
+    git(repo, &["commit", "--quiet", "-m", "Finalize foo"]);
+
+    let exit = wait_for_exit(&mut child, Duration::from_secs(20));
+    let stdout = read_stdout_to_end(&mut child);
+    let stderr = read_stderr_to_end(&mut child);
+    assert!(
+        exit.success(),
+        "wfw exit={exit:?} stdout=`{stdout}` stderr=`{stderr}`"
+    );
+    assert!(
+        stdout.contains("finished") && stdout.contains("foo"),
+        "expected finished notice after early-snapshot + late-commit race; got stdout=`{stdout}` stderr=`{stderr}`"
+    );
+}
+
+#[test]
 fn wfw_plan_already_finished_at_startup_emits_finished_and_exits() {
     let dir = init_repo();
     let repo = dir.path();
