@@ -167,6 +167,63 @@ fn errors_when_both_session_envs_set() {
 }
 
 #[test]
+fn init_yes_clears_stale_binding_from_clank_as() {
+    // Cross-command uniqueness invariant: `clank as alice` then
+    // `clank init --yes` (which defaults to label=claude) must
+    // clear alice's binding so the session is bound only to the
+    // init-default label. Without the shared bind helper, the
+    // session would resolve to BOTH labels and the resolver would
+    // pick whichever it scans first. Codex caught this on 8813f7e.
+    let dir = init_repo();
+    let repo = dir.path();
+    let session = "742f6a04-f174-409a-ab01-419a16c5f372";
+    let env = [("CLAUDE_CODE_SESSION_ID", session)];
+
+    // First bind: alice.
+    let out_as = run_as(repo, "alice", &env);
+    assert!(out_as.status.success());
+
+    // Now run `clank init --yes` — defaults to label=claude (tool
+    // name). Should clear alice's stale binding.
+    let mut cmd = Command::new(clank_bin());
+    cmd.arg("init")
+        .arg("--yes")
+        .arg("--repo")
+        .arg(repo)
+        .env_remove("CLAUDE_CODE_SESSION_ID")
+        .env_remove("CODEX_THREAD_ID")
+        .env_remove("CLANK_AGENT")
+        .env("CLAUDE_CODE_SESSION_ID", session);
+    let out_init = cmd.output().expect("spawn clank init");
+    assert!(
+        out_init.status.success(),
+        "init failed: stderr={}",
+        String::from_utf8_lossy(&out_init.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out_init.stdout);
+    assert!(
+        stdout.contains("cleared stale binding on `alice`"),
+        "expected stale-clear notice in stdout: {stdout}"
+    );
+
+    // Assert state: claude has the session; alice does not.
+    let claude_cfg: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(repo.join(".clank/agents/claude/config.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(claude_cfg["session"]["id"], session);
+
+    let alice_cfg: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(repo.join(".clank/agents/alice/config.json")).unwrap(),
+    )
+    .unwrap();
+    assert!(
+        alice_cfg.get("session").is_none() || alice_cfg["session"].is_null(),
+        "alice's session should be cleared, got: {alice_cfg}",
+    );
+}
+
+#[test]
 fn preserves_existing_auto_mode_when_rebinding() {
     use clank_core::AgentConfig;
     use clank_core::vocab::AutoMode;

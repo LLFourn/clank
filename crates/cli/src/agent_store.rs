@@ -9,9 +9,12 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use anyhow::Context;
+use time::OffsetDateTime;
+use time::format_description::well_known::Rfc3339;
 
-use clank_core::agent_config::{AgentConfig, RepoConfig};
-use clank_core::ids::AgentLabel;
+use clank_core::agent_config::{AgentConfig, RepoConfig, Session};
+use clank_core::ids::{AgentLabel, SessionId};
+use clank_core::vocab::Tool;
 
 /// Repo-relative path: `.clank/agents`.
 pub fn agents_root(repo: &Path) -> PathBuf {
@@ -134,6 +137,75 @@ pub fn load_repo_config(repo: &Path) -> anyhow::Result<Option<RepoConfig>> {
 pub fn save_repo_config(repo: &Path, cfg: &RepoConfig) -> anyhow::Result<()> {
     let path = repo_config_path(repo);
     save_json(&path, cfg).with_context(|| format!("writing `{}`", path.display()))
+}
+
+/// Outcome of [`bind_session_to_agent`]: the bound agent's
+/// label (echoed for diagnostics) plus the labels of any OTHER
+/// agents whose stale binding to the same session id was cleared
+/// in the process. Both `clank as` and `clank init` phase 2
+/// surface the cleared list to the user.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BindOutcome {
+    pub label: AgentLabel,
+    pub cleared_from: Vec<AgentLabel>,
+}
+
+/// Bind a session to an agent label, atomically updating the
+/// target agent's `config.json` AND clearing the same session id
+/// from any OTHER agent's config that currently holds it.
+///
+/// Single source of truth for the bind operation — used by
+/// `clank as` AND `clank init` phase 2 so the two-shells-one-
+/// session uniqueness invariant can't be re-introduced by a
+/// caller that forgets the clear-stale step.
+///
+/// Ordering: load all configs STRICT (parse errors propagate),
+/// identify stale, write the target FIRST (so a partial failure
+/// on stale-clear leaves a ghost binding rather than no
+/// binding), then clear stale. Preserves auto_mode and
+/// wfw_timeout on the target's existing config.
+pub fn bind_session_to_agent(
+    repo: &Path,
+    label: &AgentLabel,
+    tool: Tool,
+    session_id: &SessionId,
+) -> anyhow::Result<BindOutcome> {
+    let all = load_all_agent_configs(repo)?;
+    let stale: Vec<(AgentLabel, AgentConfig)> = all
+        .into_iter()
+        .filter(|(other_label, cfg)| {
+            other_label != label && cfg.session.as_ref().is_some_and(|s| &s.id == session_id)
+        })
+        .collect();
+
+    // Bind the new label FIRST. Order matters: if the clear-stale
+    // step below partially fails, the worst case is a ghost
+    // binding on the old agent (which `clank as` or `clank doctor`
+    // can clean up later). The reverse (clear-then-bind) could
+    // leave them with neither.
+    let mut cfg = load_agent_config(repo, label)?.unwrap_or_default();
+    let now = OffsetDateTime::now_utc()
+        .format(&Rfc3339)
+        .context("formatting timestamp")?;
+    cfg.session = Some(Session {
+        id: session_id.clone(),
+        tool,
+        updated_at: now,
+    });
+    save_agent_config(repo, label, &cfg)?;
+
+    let mut cleared_from: Vec<AgentLabel> = Vec::new();
+    for (other_label, mut other_cfg) in stale {
+        other_cfg.session = None;
+        save_agent_config(repo, &other_label, &other_cfg)
+            .with_context(|| format!("clearing stale binding on `{}`", other_label.as_str()))?;
+        cleared_from.push(other_label);
+    }
+
+    Ok(BindOutcome {
+        label: label.clone(),
+        cleared_from,
+    })
 }
 
 fn load_json<T: serde::de::DeserializeOwned>(path: &Path) -> anyhow::Result<Option<T>> {

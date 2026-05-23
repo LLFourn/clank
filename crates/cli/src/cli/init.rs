@@ -21,13 +21,10 @@ use anyhow::Context;
 use super::{InitArgs, resolve_repo};
 use crate::agent_env::detect_session_from_env;
 use crate::agent_store::{
-    agent_config_path, load_agent_config, load_repo_config, save_agent_config, save_repo_config,
+    agent_config_path, bind_session_to_agent, load_repo_config, save_repo_config,
 };
-use clank_core::agent_config::Session;
 use clank_core::ids::AgentLabel;
 use clank_core::vocab::Tool;
-use time::OffsetDateTime;
-use time::format_description::well_known::Rfc3339;
 
 /// The current canonical content of `.clank/.gitignore`.
 ///
@@ -249,24 +246,23 @@ async fn bootstrap_agent_identity(repo: &Path, yes: bool) -> anyhow::Result<()> 
         false
     };
 
-    // Bind: write agent config with session.
-    let mut cfg = load_agent_config(repo, &label)?.unwrap_or_default();
-    let now = OffsetDateTime::now_utc()
-        .format(&Rfc3339)
-        .context("formatting timestamp")?;
-    cfg.session = Some(Session {
-        id: session_id.clone(),
-        tool,
-        updated_at: now,
-    });
-    save_agent_config(repo, &label, &cfg)?;
+    // Bind via the shared helper — this preserves the
+    // "one session, one label" invariant that `clank as` enforces,
+    // so a sequence like `clank as alice; clank init --yes`
+    // doesn't leave the session bound to BOTH alice and the
+    // tool-name default. Stale bindings on other agents get
+    // cleared atomically with the new bind.
+    let outcome = bind_session_to_agent(repo, &label, tool, &session_id)?;
     println!(
         "bound {} session {} → agent `{}` ({})",
         tool.as_str(),
         session_id.as_str(),
-        label.as_str(),
+        outcome.label.as_str(),
         agent_config_path(repo, &label).display(),
     );
+    for other in outcome.cleared_from {
+        println!("  (cleared stale binding on `{}`)", other.as_str());
+    }
 
     if make_master {
         let mut repo_cfg = load_repo_config(repo)?.unwrap_or_default();
