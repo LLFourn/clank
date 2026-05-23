@@ -699,7 +699,7 @@ repo-shared concerns):
   "session": {                      // null when not yet bound (fresh agent)
     "id": "742f6a04-f174-409a-ab01-419a16c5f372",
     "tool": "claude",               // "claude" | "codex"
-    "updated_at": "2026-05-23T16:24:47+10:00"
+    "updated_at": "2026-05-23T06:24:47Z"  // RFC3339 UTC
   }
 }
 ```

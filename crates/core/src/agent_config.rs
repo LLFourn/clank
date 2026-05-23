@@ -40,10 +40,12 @@ pub struct AgentConfig {
 pub struct Session {
     pub id: SessionId,
     pub tool: Tool,
-    /// RFC3339 / ISO-8601 timestamp of the last bind, e.g.
-    /// `"2026-05-23T16:24:47+10:00"`. Stringly typed so core stays
-    /// free of `chrono`/`time` deps; the CLI formats with whatever
-    /// clock source it has.
+    /// RFC3339 / ISO-8601 timestamp of the last bind, in UTC
+    /// (e.g. `"2026-05-23T06:24:47Z"`). Stringly typed so core
+    /// stays free of `chrono`/`time` deps; the CLI formats with
+    /// whatever clock source it has. UTC over local-offset
+    /// because the `time` crate's `local-offset` codepath has
+    /// known soundness issues in multi-threaded programs.
     pub updated_at: String,
 }
 

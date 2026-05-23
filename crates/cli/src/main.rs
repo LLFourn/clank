@@ -29,6 +29,9 @@ enum Command {
     /// Read / write feedback files via a typed CLI surface (vs.
     /// editing the on-disk paths directly).
     Feedback(cli::FeedbackArgs),
+    /// Bind the calling agent's session (CLAUDE_CODE_SESSION_ID
+    /// / CODEX_THREAD_ID env var) to a clank label.
+    As(cli::AsArgs),
 }
 
 #[tokio::main]
@@ -42,6 +45,7 @@ async fn main() -> anyhow::Result<()> {
         Command::Status(args) => cli::status::run(args).await,
         Command::Wfw(args) => cli::wfw::run(args).await,
         Command::Feedback(args) => cli::feedback::run(args).await,
+        Command::As(args) => cli::as_cmd::run(args).await,
     };
     if let Err(e) = result {
         let code = exit_code_for(&e);

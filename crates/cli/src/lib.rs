@@ -7,6 +7,8 @@ pub mod rebuild;
 pub mod repo_state;
 
 // IO + runtime layers.
+pub mod agent_env;
+pub mod agent_store;
 pub mod feedback_scan;
 pub mod fs_watcher;
 pub mod git_io;

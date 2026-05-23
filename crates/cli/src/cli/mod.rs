@@ -9,6 +9,7 @@
 use clap::Args;
 use std::path::{Path, PathBuf};
 
+pub mod as_cmd;
 pub mod config;
 pub mod feedback;
 pub mod finish;
@@ -236,6 +237,17 @@ impl From<VerdictArg> for clank_core::Verdict {
             VerdictArg::RequestChanges => clank_core::Verdict::RequestChanges,
         }
     }
+}
+
+#[derive(Args, Debug)]
+pub struct AsArgs {
+    /// Repo root. Defaults to the cwd's git toplevel.
+    #[arg(long, value_name = "PATH")]
+    pub repo: Option<PathBuf>,
+    /// The agent label to bind this session to. Subsequent calls
+    /// to `clank wfw` / `clank auto` / the stop-hook resolve to
+    /// this label for the duration of this agent session.
+    pub label: String,
 }
 
 #[derive(Args, Debug)]
