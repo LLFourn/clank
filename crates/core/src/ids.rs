@@ -57,6 +57,7 @@ string_newtype!(ContentHash);
 string_newtype!(AgentLabel);
 string_newtype!(PlanKey);
 string_newtype!(RepoBasename);
+string_newtype!(SessionId);
 
 /// Validation error for the typed ID parsers.
 ///
@@ -343,6 +344,39 @@ impl PlanKey {
         // forbidden-char rules are enforced for disk discovery the
         // same way they are for wire parsing.
         PlanKey::parse(stem).ok()
+    }
+}
+
+impl SessionId {
+    /// Parse the opaque session id produced by the running agent.
+    /// Claude sets `CLAUDE_CODE_SESSION_ID` to a UUID v4 (36 chars);
+    /// codex sets `CODEX_THREAD_ID` to a ULID rendered in the same
+    /// 36-char dashed shape. Both use only `[0-9a-zA-Z-]`. We
+    /// validate that charset over 8–128 chars: tight enough to
+    /// catch typos, loose enough to survive if either agent
+    /// changes its render (e.g. removes dashes).
+    pub fn parse(s: &str) -> Result<Self, IdError> {
+        const KIND: &str = "SessionId";
+        const MIN: usize = 8;
+        const MAX: usize = 128;
+        if s.len() < MIN || s.len() > MAX {
+            return Err(IdError::BadLength {
+                kind: KIND,
+                min: MIN,
+                max: MAX,
+                len: s.len(),
+            });
+        }
+        for ch in s.chars() {
+            if !(ch.is_ascii_alphanumeric() || ch == '-') {
+                return Err(IdError::ForbiddenChar {
+                    kind: KIND,
+                    ch,
+                    value: s.to_string(),
+                });
+            }
+        }
+        Ok(SessionId(s.to_string()))
     }
 }
 

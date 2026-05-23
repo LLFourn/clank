@@ -32,11 +32,16 @@
 //! - [`api`] — wire-shape response DTOs (`FinishPreviewResponse`,
 //!   `RewritePreviewResponse`, …) produced by the CLI's preview
 //!   builders.
+//! - [`agent_config`] — typed schemas for per-agent
+//!   (`.clank/agents/<label>/config.json`) and repo-level
+//!   (`.clank/config.json`) settings, plus the `role_for` helper
+//!   used by the identity resolver.
 //!
 //! Every type derives both `Serialize` and `Deserialize` so
 //! producers and consumers round-trip through identical
 //! definitions.
 
+pub mod agent_config;
 pub mod api;
 pub mod feedback_view;
 pub mod ids;
@@ -48,10 +53,15 @@ pub mod wait;
 
 // Re-export the closed-vocab enums at crate root for ergonomic
 // imports (`use clank_core::Verdict;`).
-pub use vocab::{CommitGateState, PlanLifecycle, PlanWorktreeStatus, Verdict, WaitingReason};
+pub use vocab::{
+    AutoMode, CommitGateState, PlanLifecycle, PlanWorktreeStatus, Role, Tool, Verdict,
+    WaitingReason,
+};
 
 // Re-export the identifier newtypes at crate root.
 pub use ids::{
     AgentLabel, CommitRef, CommitSha, ContentHash, IdError, ParsePlanIdError, PlanId, PlanKey,
-    RepoBasename,
+    RepoBasename, SessionId,
 };
+
+pub use agent_config::{AgentConfig, RepoConfig, Session, role_for};

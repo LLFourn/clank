@@ -155,10 +155,77 @@ impl WaitingReason {
     }
 }
 
+/// Which agent CLI an agent process is running inside. Used by
+/// `clank stop-hook` (passed via `--tool`) and `clank as` (auto-
+/// detected from which session-id env var is set).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Tool {
+    Claude,
+    Codex,
+}
+
+impl Tool {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Tool::Claude => "claude",
+            Tool::Codex => "codex",
+        }
+    }
+}
+
+/// Auto-mode setting for an agent's stop-hook behavior.
+///
+/// - `Off`: hook exits immediately.
+/// - `Hint`: hook does a non-blocking check; emits a continuation
+///   when work is pending now, else exits.
+/// - `Wait`: hook long-polls `clank wfw` until work arrives or
+///   `wfw_timeout` elapses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AutoMode {
+    #[default]
+    Off,
+    Hint,
+    Wait,
+}
+
+impl AutoMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            AutoMode::Off => "off",
+            AutoMode::Hint => "hint",
+            AutoMode::Wait => "wait",
+        }
+    }
+}
+
+/// Role an agent plays for a plan in this repo. Derived by
+/// comparing an agent's label against `RepoConfig.master`; never
+/// stored on the agent's own config.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Role {
+    Master,
+    Reviewers,
+}
+
+impl Role {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Role::Master => "master",
+            Role::Reviewers => "reviewers",
+        }
+    }
+}
+
 impl_display_via_as_str! {
     PlanLifecycle,
     PlanWorktreeStatus,
     Verdict,
     CommitGateState,
     WaitingReason,
+    Tool,
+    AutoMode,
+    Role,
 }
