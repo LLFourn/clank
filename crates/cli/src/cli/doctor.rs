@@ -456,35 +456,10 @@ fn session_checks(repo: Option<&Path>) -> Vec<CheckResult> {
     const SECTION: &str = "session";
     let mut out = Vec::<CheckResult>::new();
 
-    // Report what the env says first (always — independent of
-    // whether resolution succeeds).
-    let detected = match detect_session_from_env() {
-        Ok(d) => d,
-        Err(e) => {
-            out.push(CheckResult::fail(
-                SECTION,
-                "env",
-                format!("env detection failed: {e}"),
-            ));
-            return out;
-        }
-    };
-    match &detected {
-        Some((tool, session_id)) => out.push(CheckResult::ok(
-            SECTION,
-            "env",
-            format!(
-                "running inside {} (session {})",
-                tool.as_str(),
-                session_id.as_str()
-            ),
-        )),
-        None => out.push(CheckResult::ok(
-            SECTION,
-            "env",
-            "not running inside an agent (no CLAUDE_CODE_SESSION_ID / CODEX_THREAD_ID)".to_string(),
-        )),
-    }
+    // Read CLANK_AGENT FIRST. The pure resolver's precedence
+    // says the explicit override wins before any session env is
+    // touched; doctor must mirror that or it'll report failures
+    // for states `clank wfw` / `clank auto` happily accept.
     let explicit = match explicit_label_from_env() {
         Ok(e) => e,
         Err(e) => {
@@ -503,6 +478,44 @@ fn session_checks(repo: Option<&Path>) -> Vec<CheckResult> {
             format!("explicit override active: `{}`", label.as_str()),
         ));
     }
+
+    // Now report session env. Session-env errors are ALWAYS Warn
+    // (never Fail) so they can't block the identity check below
+    // when CLANK_AGENT's override would still resolve. The
+    // resolver itself is the authoritative success/failure
+    // signal for whether downstream commands will work.
+    let detected: Option<(clank_core::Tool, clank_core::ids::SessionId)> =
+        match detect_session_from_env() {
+            Ok(d) => {
+                match &d {
+                    Some((tool, session_id)) => out.push(CheckResult::ok(
+                        SECTION,
+                        "env",
+                        format!(
+                            "running inside {} (session {})",
+                            tool.as_str(),
+                            session_id.as_str()
+                        ),
+                    )),
+                    None => out.push(CheckResult::ok(
+                        SECTION,
+                        "env",
+                        "not running inside an agent (no CLAUDE_CODE_SESSION_ID / \
+                         CODEX_THREAD_ID)"
+                            .to_string(),
+                    )),
+                }
+                d
+            }
+            Err(e) => {
+                out.push(CheckResult::warn(
+                    SECTION,
+                    "env",
+                    format!("session env unparseable: {e}"),
+                ));
+                None
+            }
+        };
 
     let Some(repo) = repo else {
         out.push(CheckResult::warn(
@@ -726,6 +739,37 @@ mod tests {
         assert_eq!(r.status, CheckStatus::Warn);
     }
 
+    /// Helper: run a closure with a focused env state and
+    /// restore everything afterward. Reduces boilerplate across
+    /// the precedence regression tests.
+    fn with_env<F: FnOnce()>(set: &[(&str, &str)], clear: &[&str], f: F) {
+        let saved: Vec<(String, Option<std::ffi::OsString>)> = set
+            .iter()
+            .map(|(k, _)| (k.to_string(), std::env::var_os(k)))
+            .chain(clear.iter().map(|k| (k.to_string(), std::env::var_os(k))))
+            .collect();
+        unsafe {
+            for k in clear {
+                std::env::remove_var(k);
+            }
+            for (k, v) in set {
+                std::env::set_var(k, v);
+            }
+        }
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
+        unsafe {
+            for (k, v) in saved {
+                match v {
+                    Some(val) => std::env::set_var(&k, val),
+                    None => std::env::remove_var(&k),
+                }
+            }
+        }
+        if let Err(p) = result {
+            std::panic::resume_unwind(p);
+        }
+    }
+
     #[test]
     fn session_checks_clank_agent_override_resolves_without_session_binding() {
         // Regression: codex 3808a0d called out that doctor was
@@ -736,51 +780,118 @@ mod tests {
         // disagrees with `clank wfw` / `clank auto` which both
         // happily run with just the override.
         let dir = init_git_repo();
-        let repo = dir.path();
+        let repo = dir.path().to_path_buf();
 
-        // SAFETY: tests share a process env; this is a focused
-        // test that sets exactly the vars it needs and clears them
-        // after. Don't run in parallel with anything that reads
-        // CLANK_AGENT.
-        let prev_clank_agent = std::env::var_os("CLANK_AGENT");
-        let prev_claude = std::env::var_os("CLAUDE_CODE_SESSION_ID");
-        let prev_codex = std::env::var_os("CODEX_THREAD_ID");
-        unsafe {
-            std::env::set_var("CLANK_AGENT", "alice");
-            std::env::remove_var("CLAUDE_CODE_SESSION_ID");
-            std::env::remove_var("CODEX_THREAD_ID");
-        }
-
-        let results = session_checks(Some(repo));
-        let identity = results
-            .iter()
-            .find(|r| r.name == "identity")
-            .expect("identity check ran");
-        assert_eq!(
-            identity.status,
-            CheckStatus::Ok,
-            "expected OK for CLANK_AGENT override; got {:?}: {}",
-            identity.status,
-            identity.message
+        with_env(
+            &[("CLANK_AGENT", "alice")],
+            &["CLAUDE_CODE_SESSION_ID", "CODEX_THREAD_ID"],
+            || {
+                let results = session_checks(Some(&repo));
+                let identity = results
+                    .iter()
+                    .find(|r| r.name == "identity")
+                    .expect("identity check ran");
+                assert_eq!(
+                    identity.status,
+                    CheckStatus::Ok,
+                    "expected OK for CLANK_AGENT override; got {:?}: {}",
+                    identity.status,
+                    identity.message
+                );
+                assert!(
+                    identity.message.contains("alice") && identity.message.contains("CLANK_AGENT"),
+                    "identity message should attribute to override: {}",
+                    identity.message
+                );
+            },
         );
-        assert!(
-            identity.message.contains("alice") && identity.message.contains("CLANK_AGENT"),
-            "identity message should attribute to override: {}",
-            identity.message
-        );
+    }
 
-        // Restore env.
-        unsafe {
-            match prev_clank_agent {
-                Some(v) => std::env::set_var("CLANK_AGENT", v),
-                None => std::env::remove_var("CLANK_AGENT"),
-            }
-            if let Some(v) = prev_claude {
-                std::env::set_var("CLAUDE_CODE_SESSION_ID", v);
-            }
-            if let Some(v) = prev_codex {
-                std::env::set_var("CODEX_THREAD_ID", v);
-            }
-        }
+    #[test]
+    fn session_checks_clank_agent_override_wins_over_both_session_envs() {
+        // Regression: codex 7108d87 — env detection was bailing
+        // on the both-set case BEFORE the resolver got a chance.
+        // With CLANK_AGENT set, resolver succeeds via override
+        // even when both session env vars are set (leaked from
+        // a parent shell). Env should Warn, identity should OK.
+        let dir = init_git_repo();
+        let repo = dir.path().to_path_buf();
+
+        with_env(
+            &[
+                ("CLANK_AGENT", "alice"),
+                (
+                    "CLAUDE_CODE_SESSION_ID",
+                    "742f6a04-f174-409a-ab01-419a16c5f372",
+                ),
+                ("CODEX_THREAD_ID", "019e5385-ed97-7603-8561-dd9024328ff9"),
+            ],
+            &[],
+            || {
+                let results = session_checks(Some(&repo));
+                let env = results
+                    .iter()
+                    .find(|r| r.name == "env")
+                    .expect("env check ran");
+                assert_eq!(
+                    env.status,
+                    CheckStatus::Warn,
+                    "both-set env should Warn (not Fail) so identity can resolve via override: {}",
+                    env.message
+                );
+                let identity = results
+                    .iter()
+                    .find(|r| r.name == "identity")
+                    .expect("identity check ran");
+                assert_eq!(
+                    identity.status,
+                    CheckStatus::Ok,
+                    "identity must resolve via override despite env warn; got {:?}: {}",
+                    identity.status,
+                    identity.message
+                );
+                assert!(identity.message.contains("alice"));
+            },
+        );
+    }
+
+    #[test]
+    fn session_checks_clank_agent_override_wins_over_malformed_session_env() {
+        // Same precedence: an unparseable session id env
+        // shouldn't block identity when CLANK_AGENT is set.
+        let dir = init_git_repo();
+        let repo = dir.path().to_path_buf();
+
+        with_env(
+            &[
+                ("CLANK_AGENT", "alice"),
+                ("CLAUDE_CODE_SESSION_ID", "not/a/valid/session"),
+            ],
+            &["CODEX_THREAD_ID"],
+            || {
+                let results = session_checks(Some(&repo));
+                let env = results
+                    .iter()
+                    .find(|r| r.name == "env")
+                    .expect("env check ran");
+                assert_eq!(
+                    env.status,
+                    CheckStatus::Warn,
+                    "malformed session id should Warn, not Fail: {}",
+                    env.message
+                );
+                let identity = results
+                    .iter()
+                    .find(|r| r.name == "identity")
+                    .expect("identity check ran");
+                assert_eq!(
+                    identity.status,
+                    CheckStatus::Ok,
+                    "identity must resolve via override despite malformed env: {}",
+                    identity.message
+                );
+                assert!(identity.message.contains("alice"));
+            },
+        );
     }
 }
