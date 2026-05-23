@@ -64,8 +64,8 @@ pub enum HookOutcome {
     /// The agent runs another turn against this text.
     Continue { reason: String },
     /// Let the agent stop normally. No output to either tool.
-    /// Used for: `stop_hook_active=true`, `auto_mode=off`, hint
-    /// mode with no pending work, wait mode that timed out.
+    /// Used for: `auto_mode=off`, hint mode with no pending work,
+    /// wait mode that timed out.
     Silent,
     /// Internal problem (config parse, identity unresolvable,
     /// projection failure). The hook NEVER fails the agent —
