@@ -172,3 +172,38 @@ pub fn resolve_identity_from_env(repo: &Path) -> anyhow::Result<AgentLabel> {
         ),
     })
 }
+
+/// Hook-specific identity resolution: caller passes `tool`
+/// (from `--tool`) and `session_id` (from hook stdin); env
+/// `CLANK_AGENT` still wins if set. Used by `clank stop-hook`,
+/// NOT by regular CLI commands (which read session_id from env).
+pub fn resolve_identity_for_hook(
+    repo: &Path,
+    tool: Tool,
+    session_id: &SessionId,
+) -> anyhow::Result<AgentLabel> {
+    if let Some(label) = explicit_label_from_env()? {
+        return Ok(label);
+    }
+    let agent_configs = load_all_agent_configs_lossy(repo)?;
+    let inputs = IdentityInputs {
+        tool,
+        explicit_label: None,
+        session_id: Some(session_id),
+        agent_configs: &agent_configs,
+    };
+    resolve_agent_identity(&inputs).map_err(|e| match e {
+        ResolveError::NoSession => {
+            anyhow::anyhow!("hook called without a session id (internal: caller passed Some)")
+        }
+        ResolveError::NoAgentForSession {
+            session_id: id,
+            tool: t,
+        } => anyhow::anyhow!(
+            "no agent set up for {tool} session {sid} — run \
+             `clank as <label>` (inside this session) to bootstrap",
+            tool = t.as_str(),
+            sid = id.as_str(),
+        ),
+    })
+}

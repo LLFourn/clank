@@ -35,6 +35,11 @@ enum Command {
     /// Manage this agent's auto-mode (Stop-hook behavior) and
     /// optional role designation.
     Auto(cli::AutoArgs),
+    /// Stop-hook adapter: reads HookInput JSON from stdin and
+    /// emits per-tool continuation output. Installed into the
+    /// agent's Stop hook config by `clank setup`; not typically
+    /// invoked directly.
+    StopHook(cli::StopHookArgs),
 }
 
 #[tokio::main]
@@ -50,6 +55,7 @@ async fn main() -> anyhow::Result<()> {
         Command::Feedback(args) => cli::feedback::run(args).await,
         Command::As(args) => cli::as_cmd::run(args).await,
         Command::Auto(args) => cli::auto::run(args).await,
+        Command::StopHook(args) => cli::stop_hook::run(args).await,
     };
     if let Err(e) = result {
         let code = exit_code_for(&e);

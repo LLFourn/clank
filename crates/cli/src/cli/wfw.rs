@@ -218,7 +218,9 @@ async fn check_once(
     derive_from_state(repo, &state, plan_filter, snapshot, author, role).await
 }
 
-async fn derive_from_state(
+/// Public so the stop-hook adapter (hint mode) can reuse the
+/// same projection wfw does without spinning up a watcher.
+pub async fn derive_from_state(
     repo: &Path,
     state: &RepoState,
     plan_filter: &Option<PlanKey>,

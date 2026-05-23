@@ -19,6 +19,7 @@ pub mod plan_resolve;
 pub mod purge;
 pub mod rewrite;
 pub mod status;
+pub mod stop_hook;
 pub mod wfw;
 
 #[derive(Args, Debug)]
@@ -326,6 +327,37 @@ pub enum AutoModeArg {
 pub enum RoleArg {
     Master,
     Reviewers,
+}
+
+#[derive(Args, Debug)]
+pub struct StopHookArgs {
+    /// Which agent CLI is invoking this hook. Set by
+    /// `clank setup` in the hook config; agents don't pass it
+    /// themselves. Used to render the per-tool continuation
+    /// wire shape (claude: exit 2 + stderr; codex: exit 0 +
+    /// stdout JSON).
+    #[arg(long, value_enum)]
+    pub tool: ToolArg,
+    /// Repo root override. Defaults to the cwd reported in the
+    /// hook stdin JSON (which IS the agent's cwd at stop time).
+    #[arg(long, value_name = "PATH")]
+    pub repo: Option<PathBuf>,
+}
+
+/// `--tool` value. Mirrors [`clank_core::Tool`].
+#[derive(Copy, Clone, Debug, clap::ValueEnum)]
+pub enum ToolArg {
+    Claude,
+    Codex,
+}
+
+impl From<ToolArg> for clank_core::Tool {
+    fn from(t: ToolArg) -> Self {
+        match t {
+            ToolArg::Claude => clank_core::Tool::Claude,
+            ToolArg::Codex => clank_core::Tool::Codex,
+        }
+    }
 }
 
 #[derive(Args, Debug)]
