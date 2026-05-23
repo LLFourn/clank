@@ -12,6 +12,7 @@ use std::path::{Path, PathBuf};
 pub mod as_cmd;
 pub mod auto;
 pub mod config;
+pub mod doctor;
 pub mod feedback;
 pub mod finish;
 pub mod init;
@@ -333,6 +334,18 @@ pub enum AutoModeArg {
 pub enum RoleArg {
     Master,
     Reviewers,
+}
+
+#[derive(Args, Debug)]
+pub struct DoctorArgs {
+    /// Repo root override. Defaults to the cwd's git toplevel
+    /// (which falls back to "no repo" if cwd isn't in a git
+    /// checkout — repo checks are skipped in that case).
+    #[arg(long, value_name = "PATH")]
+    pub repo: Option<PathBuf>,
+    /// Emit JSON instead of the human rendering.
+    #[arg(short = 'j', long)]
+    pub json: bool,
 }
 
 #[derive(Args, Debug)]

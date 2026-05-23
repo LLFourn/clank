@@ -44,6 +44,10 @@ enum Command {
     /// ~/.codex: skill files, slash command, and Stop hook
     /// entries tag-merged into the per-tool config files.
     Setup(cli::SetupArgs),
+    /// Check that the clank integration is correctly set up
+    /// across repo, user, and current-session scopes. Exits 0
+    /// if everything is OK/Warn; 1 if anything is Fail.
+    Doctor(cli::DoctorArgs),
 }
 
 #[tokio::main]
@@ -61,6 +65,7 @@ async fn main() -> anyhow::Result<()> {
         Command::Auto(args) => cli::auto::run(args).await,
         Command::StopHook(args) => cli::stop_hook::run(args).await,
         Command::Setup(args) => cli::setup::run(args).await,
+        Command::Doctor(args) => cli::doctor::run(args).await,
     };
     if let Err(e) = result {
         let code = exit_code_for(&e);

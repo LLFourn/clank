@@ -15,9 +15,11 @@ use anyhow::Context;
 
 use super::SetupArgs;
 
-const CLAUDE_SKILL_BODY: &str = include_str!("setup_assets/claude_skill.md");
-const CODEX_SKILL_BODY: &str = include_str!("setup_assets/codex_skill.md");
-const CODEX_COMMAND_BODY: &str = include_str!("setup_assets/codex_command.md");
+// Pub so `clank doctor` can compare on-disk skill files against
+// the expected embedded content without recomputing the paths.
+pub const CLAUDE_SKILL_BODY: &str = include_str!("setup_assets/claude_skill.md");
+pub const CODEX_SKILL_BODY: &str = include_str!("setup_assets/codex_skill.md");
+pub const CODEX_COMMAND_BODY: &str = include_str!("setup_assets/codex_command.md");
 
 /// Stable identifier we write onto every clank-owned hook entry
 /// as `"id": "<HOOK_ID>"`. The plan's D8 ownership model says
