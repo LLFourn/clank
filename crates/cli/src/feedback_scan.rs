@@ -76,8 +76,9 @@ pub fn scan_feedback(
                 continue;
             }
             // Resolve the on-disk ref into a full sha via the
-            // reviewable-commit scope. Orphans drop here.
-            let Some(full_sha) = parsed.target_ref.resolve_against(reviewable_shas) else {
+            // reviewable-commit scope. Orphans + ambiguous refs
+            // drop here — the scanner doesn't care which.
+            let Ok(full_sha) = parsed.target_ref.resolve_against(reviewable_shas) else {
                 continue;
             };
             let body = match std::fs::read_to_string(&abs) {

@@ -222,26 +222,53 @@ impl CommitRef {
     }
 
     /// Resolve this ref against a known commit scope. Returns
-    /// `Some(full)` iff exactly one commit in `scope` has a
-    /// SHA that starts with `self.as_str()` (or equals it
-    /// when `self` is 40 chars). `None` for no match (orphan)
-    /// or multiple matches (ambiguous — shouldn't happen
-    /// under the per-target filename-mode rule, but the type
-    /// doesn't pretend it can't).
-    pub fn resolve_against(&self, scope: &[CommitSha]) -> Option<CommitSha> {
+    /// `Ok(full)` iff exactly one commit in `scope` has a SHA
+    /// that starts with `self.as_str()` (or equals it when
+    /// `self` is 40 chars). `Err(Orphan)` for no match;
+    /// `Err(Ambiguous { matches })` for multiple matches.
+    ///
+    /// Ambiguous shouldn't happen under the per-target filename-
+    /// mode rule (the long-form prefix is used when collisions
+    /// exist) but the type doesn't pretend it can't.
+    pub fn resolve_against(&self, scope: &[CommitSha]) -> Result<CommitSha, CommitRefResolveError> {
         let prefix = self.as_str();
-        let mut hit: Option<&CommitSha> = None;
+        let mut matches: Vec<CommitSha> = Vec::new();
         for sha in scope {
             if sha.as_str().starts_with(prefix) {
-                if hit.is_some() {
-                    return None; // ambiguous
-                }
-                hit = Some(sha);
+                matches.push(sha.clone());
             }
         }
-        hit.cloned()
+        match matches.len() {
+            0 => Err(CommitRefResolveError::Orphan),
+            1 => Ok(matches.remove(0)),
+            _ => Err(CommitRefResolveError::Ambiguous { matches }),
+        }
     }
 }
+
+/// Why a [`CommitRef`] couldn't be resolved to a unique commit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CommitRefResolveError {
+    /// No commit in scope starts with this ref.
+    Orphan,
+    /// Multiple commits in scope start with this ref. Caller
+    /// should lengthen the prefix or pick a specific sha from
+    /// `matches`.
+    Ambiguous { matches: Vec<CommitSha> },
+}
+
+impl std::fmt::Display for CommitRefResolveError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            CommitRefResolveError::Orphan => f.write_str("no commit matched the ref"),
+            CommitRefResolveError::Ambiguous { matches } => {
+                write!(f, "ref matched {} commits", matches.len())
+            }
+        }
+    }
+}
+
+impl std::error::Error for CommitRefResolveError {}
 
 impl ContentHash {
     /// Parse a blake3 content hash: exactly 64 lowercase hex chars.
@@ -721,7 +748,7 @@ mod tests {
     fn commit_ref_resolve_full_in_scope() {
         let full = CommitSha::parse(&"a".repeat(40)).unwrap();
         let r = CommitRef::parse(&"a".repeat(40)).unwrap();
-        assert_eq!(r.resolve_against(&[full.clone()]), Some(full));
+        assert_eq!(r.resolve_against(&[full.clone()]), Ok(full));
     }
 
     #[test]
@@ -729,28 +756,33 @@ mod tests {
         let full = CommitSha::parse("abcdef0111111111111111111111111111111111").unwrap();
         let other = CommitSha::parse("ffeeddc1111111111111111111111111111111ff").unwrap();
         let r = CommitRef::parse("abcdef0").unwrap();
-        assert_eq!(r.resolve_against(&[full.clone(), other]), Some(full));
+        assert_eq!(r.resolve_against(&[full.clone(), other]), Ok(full));
     }
 
     #[test]
-    fn commit_ref_resolve_ambiguous_returns_none() {
+    fn commit_ref_resolve_ambiguous_lists_matches() {
         let a = CommitSha::parse("abcdef0111111111111111111111111111111111").unwrap();
         let b = CommitSha::parse("abcdef0222222222222222222222222222222222").unwrap();
         let r = CommitRef::parse("abcdef0").unwrap();
-        assert_eq!(r.resolve_against(&[a, b]), None);
+        assert_eq!(
+            r.resolve_against(&[a.clone(), b.clone()]),
+            Err(CommitRefResolveError::Ambiguous {
+                matches: vec![a, b]
+            })
+        );
     }
 
     #[test]
-    fn commit_ref_resolve_orphan_returns_none() {
+    fn commit_ref_resolve_orphan() {
         let s = CommitSha::parse(&"a".repeat(40)).unwrap();
         let r = CommitRef::parse("deadbee").unwrap();
-        assert_eq!(r.resolve_against(&[s]), None);
+        assert_eq!(r.resolve_against(&[s]), Err(CommitRefResolveError::Orphan));
     }
 
     #[test]
-    fn commit_ref_resolve_empty_scope_returns_none() {
+    fn commit_ref_resolve_empty_scope_is_orphan() {
         let r = CommitRef::parse("abc1234").unwrap();
-        assert_eq!(r.resolve_against(&[]), None);
+        assert_eq!(r.resolve_against(&[]), Err(CommitRefResolveError::Orphan));
     }
 
     #[test]

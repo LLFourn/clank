@@ -83,12 +83,7 @@ pub fn project(
 
     let last_activity_ts = ps.commits.iter().map(|e| e.ts).max().unwrap_or(latest.ts);
 
-    let reviewable_shas: Vec<CommitSha> = ps
-        .commits
-        .iter()
-        .filter(|e| e.touched_plan || e.touched_code)
-        .map(|e| e.sha.clone())
-        .collect();
+    let reviewable_shas: Vec<CommitSha> = ps.reviewable_shas();
 
     let (gate_state, waiting_on) =
         evaluate(feedback, &latest.sha, latest.touched_code, worktree.status);

@@ -29,8 +29,8 @@ use crate::feedback_scan::scan_feedback;
 use crate::lifecycle::{AgentLabel, CommitSha, PlanKey};
 use crate::repo_state::RepoState;
 use crate::worktree_facts::read_worktree_facts;
-use clank_core::plan_view::{PlanView, project};
 use clank_core::Role;
+use clank_core::plan_view::{PlanView, project};
 use clank_core::wait::{StartupSnapshot, WaitItem, derive_work, detect_finished};
 
 /// Exit code returned when `--timeout` elapses without producing
@@ -243,12 +243,7 @@ async fn build_view(
         Some(ps) => ps,
         None => return Ok(None),
     };
-    let reviewable: Vec<CommitSha> = ps
-        .commits
-        .iter()
-        .filter(|e| e.touched_plan || e.touched_code)
-        .map(|e| e.sha.clone())
-        .collect();
+    let reviewable = ps.reviewable_shas();
     let feedback = scan_feedback(repo, plan, &reviewable)?;
     let plan_path = format!(".clank/plans/{}.md", plan.as_str());
     let worktree = read_worktree_facts(repo, &plan_path, state.head.as_ref()).await?;

@@ -80,6 +80,23 @@ pub struct PlanState {
     pub commits: Vec<PlanTimelineEvent>,
 }
 
+impl PlanState {
+    /// SHAs of commits in this plan's timeline that count as
+    /// "reviewable" — anything that touched the plan file or
+    /// touched code attributed to the plan. This IS the
+    /// definition; every site that needs the list (status,
+    /// wfw, feedback write, preview builders) should call this
+    /// rather than hand-rolling the filter so the rule stays
+    /// in one place.
+    pub fn reviewable_shas(&self) -> Vec<CommitSha> {
+        self.commits
+            .iter()
+            .filter(|e| e.touched_plan || e.touched_code)
+            .map(|e| e.sha.clone())
+            .collect()
+    }
+}
+
 /// One entry in a plan's timeline: how a single commit affected
 /// this plan. Multi-plan commits emit one event per touched plan.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

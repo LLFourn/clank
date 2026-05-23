@@ -8,7 +8,6 @@
 use std::path::{Component, Path, PathBuf};
 
 use crate::lifecycle::{AgentLabel, CommitRef, CommitSha, PlanKey};
-use crate::repo_state::Verdict;
 use clank_core::feedback_view::{FilenameMode, filename_mode, filename_stem};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -205,16 +204,7 @@ pub use clank_core::feedback_view::FilenameMode as PlanFilenameMode;
 #[allow(dead_code)]
 fn _filename_mode_marker(_: FilenameMode) {}
 
-/// Parse the first non-empty line of a feedback file body as a verdict
-/// marker. Only exact uppercase tokens `APPROVE` / `REQUEST_CHANGES` count;
-/// everything else is `Unmarked`.
-pub fn parse_verdict(body: &str) -> Verdict {
-    match body.lines().map(str::trim).find(|line| !line.is_empty()) {
-        Some("APPROVE") => Verdict::Approve,
-        Some("REQUEST_CHANGES") => Verdict::RequestChanges,
-        _ => Verdict::Unmarked,
-    }
-}
+pub use clank_core::feedback_body::parse_verdict;
 
 #[cfg(test)]
 mod tests {
@@ -412,39 +402,6 @@ mod tests {
         assert_eq!(parsed.target_ref.as_str(), "abcdef0");
     }
 
-    #[test]
-    fn parse_verdict_approve() {
-        assert_eq!(parse_verdict("APPROVE\n\nbody\n"), Verdict::Approve);
-    }
-
-    #[test]
-    fn parse_verdict_request_changes() {
-        assert_eq!(
-            parse_verdict("REQUEST_CHANGES\n\nbody\n"),
-            Verdict::RequestChanges
-        );
-    }
-
-    #[test]
-    fn parse_verdict_leading_whitespace() {
-        assert_eq!(
-            parse_verdict("\n\n   APPROVE   \n\nbody\n"),
-            Verdict::Approve
-        );
-    }
-
-    #[test]
-    fn parse_verdict_lowercase_is_unmarked() {
-        assert_eq!(parse_verdict("approve\n\nbody\n"), Verdict::Unmarked);
-    }
-
-    #[test]
-    fn parse_verdict_prose_is_unmarked() {
-        assert_eq!(parse_verdict("This looks good to me.\n"), Verdict::Unmarked);
-    }
-
-    #[test]
-    fn parse_verdict_empty_body() {
-        assert_eq!(parse_verdict(""), Verdict::Unmarked);
-    }
+    // parse_verdict tests live in `clank_core::feedback_body`;
+    // this module just re-exports the function.
 }

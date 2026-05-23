@@ -26,6 +26,9 @@ enum Command {
     /// Wait-for-work: block until the calling agent has actionable
     /// work on one of the repo's active plans.
     Wfw(cli::WfwArgs),
+    /// Read / write feedback files via a typed CLI surface (vs.
+    /// editing the on-disk paths directly).
+    Feedback(cli::FeedbackArgs),
 }
 
 #[tokio::main]
@@ -38,6 +41,7 @@ async fn main() -> anyhow::Result<()> {
         Command::Purge(args) => cli::purge::run(args).await,
         Command::Status(args) => cli::status::run(args).await,
         Command::Wfw(args) => cli::wfw::run(args).await,
+        Command::Feedback(args) => cli::feedback::run(args).await,
     };
     if let Err(e) = result {
         let code = exit_code_for(&e);

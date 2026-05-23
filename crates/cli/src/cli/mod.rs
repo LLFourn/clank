@@ -10,6 +10,7 @@ use clap::Args;
 use std::path::{Path, PathBuf};
 
 pub mod config;
+pub mod feedback;
 pub mod finish;
 pub mod init;
 pub mod plan_resolve;
@@ -169,6 +170,70 @@ impl From<WfwRole> for clank_core::Role {
         match r {
             WfwRole::Master => clank_core::Role::Master,
             WfwRole::Reviewers => clank_core::Role::Reviewers,
+        }
+    }
+}
+
+#[derive(Args, Debug)]
+pub struct FeedbackArgs {
+    #[command(subcommand)]
+    pub command: FeedbackCmd,
+}
+
+#[derive(clap::Subcommand, Debug)]
+pub enum FeedbackCmd {
+    /// Write a feedback file: validates the body's first
+    /// non-blank line matches `--verdict`, resolves `--commit`
+    /// against the plan's reviewable shas, and writes
+    /// `.clank/agents/<author>/feedback/<plan>/<stem>.md`
+    /// atomically.
+    Write(FeedbackWriteArgs),
+}
+
+#[derive(Args, Debug)]
+pub struct FeedbackWriteArgs {
+    /// Repo root. Defaults to the cwd's git toplevel.
+    #[arg(long, value_name = "PATH")]
+    pub repo: Option<PathBuf>,
+    /// Plan stem (e.g. `clank-agent-integration`). Same parser as
+    /// `clank finish`/`clank status` — `<stem>`, `<stem>.md`, or
+    /// `<basename>/<stem>.md`.
+    #[arg(long, value_name = "PLAN")]
+    pub plan: String,
+    /// Commit ref (7+ lowercase hex chars). Resolved against the
+    /// plan's reviewable commits; ambiguous prefixes are an error.
+    #[arg(long, value_name = "SHA")]
+    pub commit: String,
+    /// Verdict claim. Must match the body's first non-blank line
+    /// (`APPROVE` or `REQUEST_CHANGES`); mismatch is an error.
+    #[arg(long, value_enum)]
+    pub verdict: VerdictArg,
+    /// Agent label to attribute the feedback to. Required for
+    /// now; will become optional when the identity resolver lands
+    /// (then defaults via `CLAUDE_CODE_SESSION_ID` /
+    /// `CODEX_THREAD_ID`).
+    #[arg(long, value_name = "LABEL")]
+    pub author: String,
+    /// Read body from this file. `-` (default) reads from stdin.
+    #[arg(long, value_name = "PATH", default_value = "-")]
+    pub body_file: String,
+}
+
+/// Verdict the writer is claiming for this feedback. Maps to
+/// [`clank_core::Verdict`] for validation. `Unmarked` is
+/// intentionally not selectable — every written file carries a
+/// real verdict.
+#[derive(Copy, Clone, Debug, clap::ValueEnum)]
+pub enum VerdictArg {
+    Approve,
+    RequestChanges,
+}
+
+impl From<VerdictArg> for clank_core::Verdict {
+    fn from(v: VerdictArg) -> Self {
+        match v {
+            VerdictArg::Approve => clank_core::Verdict::Approve,
+            VerdictArg::RequestChanges => clank_core::Verdict::RequestChanges,
         }
     }
 }

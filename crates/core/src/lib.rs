@@ -43,6 +43,7 @@
 
 pub mod agent_config;
 pub mod api;
+pub mod feedback_body;
 pub mod feedback_view;
 pub mod ids;
 pub mod model;
