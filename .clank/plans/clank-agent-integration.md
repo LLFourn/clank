@@ -14,7 +14,12 @@ without being prompted. Deliverables:
 3. A **`clank setup`** command that writes those files and a
    **`/clank`** slash command (in both agents) for managing config
    without editing JSON by hand.
-4. A **`clank doctor`** command that checks every setup invariant
+4. A **`clank feedback write`** command that wraps the file write
+   under `.clank/agents/<author>/feedback/<plan>/<commit>.md`,
+   validates the verdict header, and gives codex a stable
+   command-prefix to approve (vs. re-prompting on every raw file
+   edit).
+5. A **`clank doctor`** command that checks every setup invariant
    (repo, user-scope, current session) so users can self-diagnose
    when something doesn't fire.
 
@@ -385,15 +390,24 @@ wfw returns items?
 - **Option B — Short human instruction**: "wfw returned 2 items. Run
   `clank status` and act on the first one." (Agent re-reads status to
   see details.)
-- **Option C — Rendered work summary + paths**: "Master needs to
-  revise plan X at sha Y. Open `.clank/plans/X.md` and apply
-  feedback at `.clank/agents/codex/feedback/X/abc1234.md`."
+- **Option C — Rendered work summary + actions**: "Master needs
+  to revise plan X at sha Y. Open `.clank/plans/X.md` and apply
+  the comments in feedback files. Reviewer prompts include the
+  exact `clank feedback write …` invocation to use for the
+  approval/revision."
 
-**Recommendation: C, with the structured items appended as JSON for
-the agent to parse if it wants.** The agent doesn't need to re-shell
-`clank status` if the hook already has the answer. Including paths
-inline means the agent's first move is `Read` not `Bash`, which is
-faster and uses less context.
+**Recommendation: C, with the structured items appended as JSON
+for the agent to parse if it wants.** The agent doesn't need to
+re-shell `clank status` if the hook already has the answer.
+Including the next action inline (read path for master, write
+command for reviewer) means the agent's first move matches the
+intent directly.
+
+For reviewer items specifically, the prompt MUST instruct
+`clank feedback write --plan X --commit Y --verdict …` rather
+than telling the agent to edit a file path — this keeps codex on
+the prefix-approved fast path and gets header validation for
+free.
 
 ### D8. Setup idempotency — how does re-running `clank setup` behave?
 
@@ -961,6 +975,58 @@ zero-friction: the agent literally just runs `clank wfw` —
 no remembering which `--author` to pass, no looking up its own
 label.
 
+### `clank feedback write` — first-class feedback write path
+
+**Why this exists.** Codex's approval model is command-prefix-
+based: once the user accepts a `prefix_rule` for `clank feedback`,
+every subsequent invocation runs without re-prompting. Raw file
+edits at `.clank/agents/codex/feedback/...` paths don't get the
+same one-shot approval — codex's `apply_patch` flow still asks
+per-write. So we give agents a CLI command that wraps the write
+and validates shape; users approve `clank feedback` once and
+both agents stop pestering them.
+
+Claude doesn't NEED this command (its `Edit(.clank/agents/**)`
+permission rule from `clank init` covers raw file edits) but
+benefits from the same shape validation. So `clank feedback
+write` is the recommended path for both tools.
+
+Shape:
+
+```text
+clank feedback write \
+  --plan <plan-name> \
+  --commit <commit-ref> \
+  --verdict approve|request-changes \
+  [--author <agent-label>] \
+  [--body-file <path>|-]              # default - = stdin
+```
+
+Behavior:
+- `--author` defaults through the same identity resolver as
+  `wfw` / `auto`. On `NoAgentForSession` → error with the same
+  "run `clank init`" message.
+- Validates that the body's first non-blank line is exactly
+  `APPROVE` or `REQUEST_CHANGES` (matches `--verdict`). Mismatch
+  → error with line/column.
+- Resolves `--commit` against the plan's reviewable commits
+  (using existing `CommitRef::resolve_against` from the
+  agent-keyed-feedback-layout work). Unknown ref → error.
+- Creates `.clank/agents/<author>/feedback/<plan>/` if missing.
+- Writes `<stem>.md` atomically (temp + rename); stem is short
+  or long per the existing `filename_mode` rule.
+- Prints the final path on stdout.
+- Exit 0 on success, 1 on validation error.
+
+Agent skill text + the stop-hook's continuation prompt for
+reviewers BOTH instruct: "write your feedback via `clank
+feedback write …`, not by editing the file directly." This
+keeps the codex prefix-rule path the default behavior, not the
+fallback.
+
+Typed `FeedbackBody` struct in core (verdict header + body);
+parsing + validation pure-functional. CLI does the file I/O.
+
 ### `clank doctor`
 
 Diagnostic command that checks every invariant `clank init` and
@@ -1090,6 +1156,11 @@ directory contains:
 Key commands you can run via Bash:
 - `clank status` — show current plan + gate state
 - `clank wfw` — long-poll for the next thing this agent should do
+- `clank feedback write --plan X --commit Y --verdict approve|request-changes`
+  — write your review feedback. Use this instead of editing
+  files under `.clank/agents/<you>/feedback/` directly; it
+  validates shape and gives a stable command-prefix that the
+  user only approves once.
 - `clank finish <plan>` — finalize an approved plan
 
 When the Stop hook returns work, act on it immediately. The hook
@@ -1193,6 +1264,15 @@ Cleanup: `rm -rf /tmp/clank-hook-experiment`.
   `/clank config` opens the picker; `/clank <verb>` passes
   through. Skill files written by `clank setup` match the
   embedded body.
+- `clank feedback write --plan X --commit abc1234 --verdict
+  approve` (body on stdin) produces
+  `.clank/agents/<resolved-author>/feedback/X/abc1234.md` with
+  the body verbatim. Tests cover: header validation (APPROVE /
+  REQUEST_CHANGES match `--verdict`), commit-ref resolution
+  (short → long), atomic write, and the resolver error path
+  (NoAgentForSession). The agent skill body and the reviewer-
+  branch stop-hook continuation prompt BOTH instruct agents to
+  use this command rather than raw file edits.
 
 ## Out of scope (intentionally)
 
