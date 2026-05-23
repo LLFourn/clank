@@ -112,18 +112,36 @@ the only thing preventing runaway loops — any uncertainty about
 whether we can durably track progress must resolve to
 "don't issue a continuation."
 
-Decision table:
+### Progress signal validity
 
-| `stop_hook_active` | state read | `last_assistant_message` | state write | Outcome |
+Define **valid progress signal** as:
+`last_assistant_message.as_deref().map(str::trim).filter(|s| !s.is_empty())`
+— `Some(non-whitespace)`. `None`, `Some("")`, and `Some("   ")` all
+mean "agent produced nothing new this turn." A trimmed-empty value
+is no more evidence of progress than a missing field; both fail
+closed.
+
+This trim happens before hashing so the stored hash always
+represents non-empty trimmed content. A subsequent fire that comes
+back with `Some("")` doesn't accidentally hash to a "different"
+value from the prior hash and trick the differs-path into firing.
+
+Decision table (precedence is row order — first match wins):
+
+| `stop_hook_active` | progress signal | state read | state write | Outcome |
 | --- | --- | --- | --- | --- |
-| `false` | (skipped) | any | OK | proceed to normal outcome compute |
-| `false` | (skipped) | any | IO error | **Diagnostic** (no continuation) |
-| `true` | OK + hash matches | same / empty | (skipped) | **Silent** (real spin) |
-| `true` | OK + hash differs | new content | OK | proceed to normal outcome compute |
-| `true` | OK + hash differs | new content | IO error | **Diagnostic** |
-| `true` | NotFound | any | (skipped) | **Diagnostic** (anomaly: mid-chain with no prior state — first fire's write must have failed silently, or state was deleted; can't reason about progress) |
-| `true` | IO error (perms, etc.) | any | (skipped) | **Diagnostic** |
-| any | any | `None` (field absent on stdin) | (skipped) | **Diagnostic** (defensive: can't compute progress signal) |
+| any | invalid (`None` / empty / whitespace) | (skipped) | (skipped) | **Diagnostic** (no progress to record) |
+| `false` | valid | (skipped) | OK | proceed to normal outcome compute |
+| `false` | valid | (skipped) | IO error | **Diagnostic** |
+| `true` | valid | OK + hash matches | (skipped) | **Silent** (real spin — agent re-emitted the same message) |
+| `true` | valid | OK + hash differs | OK | proceed to normal outcome compute |
+| `true` | valid | OK + hash differs | IO error | **Diagnostic** |
+| `true` | valid | NotFound | (skipped) | **Diagnostic** (anomaly: mid-chain with no prior state) |
+| `true` | valid | IO error (perms, etc.) | (skipped) | **Diagnostic** |
+
+The "invalid progress signal" row sits at the top so it short-
+circuits before any state IO; that's the safe order regardless of
+`stop_hook_active`.
 
 `Diagnostic` is the right outcome for these failure modes — it exits
 0 with a stderr message and **no continuation prompt**, which is
@@ -137,12 +155,17 @@ exclusive outcomes.
 Sketch:
 
 ```rust
-if input.last_assistant_message.is_none() {
+let progress = input
+    .last_assistant_message
+    .as_deref()
+    .map(str::trim)
+    .filter(|s| !s.is_empty());
+let Some(progress) = progress else {
     return HookOutcome::Diagnostic {
-        message: "hook: missing last_assistant_message; cannot reason about progress".into(),
+        message: "hook: no assistant-message progress signal; refusing to continue".into(),
     };
-}
-let new_hash = sha256(input.last_assistant_message.as_deref().unwrap_or(""));
+};
+let new_hash = sha256(progress);
 
 if input.stop_hook_active {
     match read_state(&repo, &label, &input.session_id) {
@@ -229,7 +252,12 @@ Extend with progress-guard scenarios:
 3. **Second fire, same `last_assistant_message`** → Silent, state
    unchanged.
 4. **Fire with `last_assistant_message=None`** → Diagnostic, no
-   continuation (defensive).
+   continuation.
+4a. **Fire with `last_assistant_message=Some("")`** → Diagnostic
+   (empty is not progress, even if a prior fire had a non-empty
+   hash that would otherwise "differ").
+4b. **Fire with `last_assistant_message=Some("   \n  ")`** →
+   Diagnostic (whitespace-only is not progress).
 5. **Second fire, prior state file unreadable** (chmod 000 or
    corrupt JSON) → Diagnostic, no continuation. Locks in the
    fail-closed contract.
