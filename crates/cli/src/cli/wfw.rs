@@ -138,6 +138,17 @@ pub async fn run(args: WfwArgs) -> anyhow::Result<()> {
         return Ok(());
     }
 
+    // Master + no active plans = nothing the wait loop can resolve.
+    // Reviewer work appears when master commits; master work appears
+    // when reviewers vote on commits master already made. Empty plan
+    // set means master has nothing committed, so blocking would wait
+    // for an event no one else can produce. Reviewers still block on
+    // an empty plan set — a plan may land that they need to review.
+    if role == Role::Master && plan_filter.is_none() && initial_state.fold.plans.is_empty() {
+        emit(&[], args.json);
+        return Ok(());
+    }
+
     let watch_ctx = WatchContext::resolve(&repo, poll_mode)?;
     let (tx, rx) = mpsc::channel::<()>();
     let mut watcher = build_watcher(tx)?;

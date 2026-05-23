@@ -874,6 +874,138 @@ fn wfw_polling_mode_wakes_on_commit_via_periodic_refold() {
     );
 }
 
+#[test]
+fn wfw_master_no_plans_exits_immediately_json() {
+    // Master + empty plan set has nothing the watch loop can resolve
+    // into work — exit 0 with an empty items envelope so the wait-mode
+    // Stop hook doesn't hang the agent's turn.
+    let dir = init_repo();
+    let repo = dir.path();
+    // Need a commit so HEAD resolves; touch only a non-clank file.
+    write(repo, "README.md", "# repo\n");
+    commit(repo, "init");
+
+    let start = Instant::now();
+    let output = Command::new(clank_bin())
+        .args([
+            "wfw",
+            "--no-poll",
+            "--author",
+            "lloyd",
+            "--role",
+            "master",
+            "--timeout",
+            "30s",
+            "--json",
+        ])
+        .arg("--repo")
+        .arg(repo)
+        .output()
+        .expect("spawn clank wfw");
+    let elapsed = start.elapsed();
+
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    assert!(
+        output.status.success(),
+        "wfw exit={:?} stdout=`{stdout}` stderr=`{stderr}`",
+        output.status
+    );
+    assert_eq!(
+        stdout.trim(),
+        r#"{"items":[]}"#,
+        "expected empty items envelope; got stdout=`{stdout}`"
+    );
+    assert!(
+        elapsed < Duration::from_secs(2),
+        "expected fast exit, took {elapsed:?}"
+    );
+}
+
+#[test]
+fn wfw_reviewer_no_plans_still_blocks() {
+    // Regression guard for the master/reviewer asymmetry: reviewers
+    // MUST keep blocking on an empty plan set — a plan they need to
+    // review may land any moment. If a future change widens the
+    // early-exit to both roles this test catches it.
+    let dir = init_repo();
+    let repo = dir.path();
+    write(repo, "README.md", "# repo\n");
+    commit(repo, "init");
+
+    let start = Instant::now();
+    let output = Command::new(clank_bin())
+        .args([
+            "wfw",
+            "--no-poll",
+            "--author",
+            "alice",
+            "--role",
+            "reviewers",
+            "--timeout",
+            "2s",
+        ])
+        .arg("--repo")
+        .arg(repo)
+        .output()
+        .expect("spawn clank wfw");
+    let elapsed = start.elapsed();
+
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "expected timeout exit 2; got {:?} stderr=`{}`",
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        elapsed >= Duration::from_millis(1800),
+        "expected reviewer to block for ~2s, exited in {elapsed:?}"
+    );
+}
+
+#[test]
+fn wfw_master_with_active_plan_still_blocks() {
+    // Regression guard: master with an active plan that is currently
+    // waiting on reviewers must still block — reviewer feedback can
+    // arrive and transition the gate. The early-exit only applies to
+    // an empty plan set.
+    let dir = init_repo();
+    let repo = dir.path();
+    write(repo, ".clank/plans/foo.md", "# foo\n");
+    commit(repo, "[foo] intro");
+
+    let start = Instant::now();
+    let output = Command::new(clank_bin())
+        .args([
+            "wfw",
+            "--no-poll",
+            "--author",
+            "lloyd",
+            "--role",
+            "master",
+            "--timeout",
+            "2s",
+        ])
+        .arg("--repo")
+        .arg(repo)
+        .output()
+        .expect("spawn clank wfw");
+    let elapsed = start.elapsed();
+
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "expected timeout exit 2; got {:?} stderr=`{}`",
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        elapsed >= Duration::from_millis(1800),
+        "expected master to block for ~2s while plan awaits review, exited in {elapsed:?}"
+    );
+}
+
 fn wait_for_exit(child: &mut std::process::Child, max: Duration) -> std::process::ExitStatus {
     let end = Instant::now() + max;
     loop {

@@ -103,15 +103,26 @@ fn wfw_resolves_role_master_from_repo_config() {
     );
     assert!(out_claim.status.success());
 
-    // wfw with no flags should resolve alice as master. We can't
-    // assert role from the timeout-only exit, but we CAN confirm
-    // the command succeeded resolution (no resolver error).
+    // wfw with no flags should resolve alice as master. With no
+    // active plans, the master-only fast-exit fires and we get exit
+    // 0 with an empty items envelope. A reviewer would block to
+    // timeout (exit 2), so exit 0 here doubly confirms the resolved
+    // role was master.
     let out = run_clank(
         repo,
-        &["wfw", "--no-poll", "--timeout", "1s"],
+        &["wfw", "--no-poll", "--timeout", "1s", "--json"],
         &[("CLAUDE_CODE_SESSION_ID", CLAUDE_SESSION)],
     );
-    assert_eq!(out.status.code(), Some(WFW_TIMEOUT_EXIT));
+    assert!(
+        out.status.success(),
+        "expected master fast-exit (exit 0); got status={:?} stderr={}",
+        out.status,
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout).trim(),
+        r#"{"items":[]}"#,
+    );
 }
 
 #[test]
