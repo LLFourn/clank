@@ -129,23 +129,32 @@ impl std::error::Error for EnvError {}
 /// receive `session_id` via stdin and `tool` via `--tool`, not
 /// from env — see `cli::stop_hook` (later commit).
 pub fn resolve_identity_from_env(repo: &Path) -> anyhow::Result<AgentLabel> {
-    let explicit = explicit_label_from_env()?;
+    // Highest precedence: explicit CLANK_AGENT override. Short-
+    // circuit BEFORE touching session env — otherwise lower-
+    // precedence env state (BothToolsDetected, an unparseable
+    // session id, etc.) could fail the command even though the
+    // resolver would happily return the explicit label. This
+    // mirrors the pure resolver's precedence rule and is what
+    // codex's review on `99ce55b` flagged.
+    if let Some(label) = explicit_label_from_env()? {
+        return Ok(label);
+    }
+
     let detected = detect_session_from_env()?;
     let agent_configs = load_all_agent_configs_lossy(repo)?;
     let (tool, session_id_owned) = match detected {
         Some((t, sid)) => (t, Some(sid)),
         None => {
-            // No session detected. The resolver will still
-            // succeed if explicit_label is set; otherwise it
-            // returns NoSession. Default tool to Claude — it
-            // doesn't matter since the lookup path won't run
-            // without a session id.
+            // No session detected. The resolver will return
+            // NoSession; we map that to a friendly error below.
+            // Default tool to Claude — it doesn't matter since
+            // the lookup path won't run without a session id.
             (Tool::Claude, None)
         }
     };
     let inputs = IdentityInputs {
         tool,
-        explicit_label: explicit,
+        explicit_label: None,
         session_id: session_id_owned.as_ref(),
         agent_configs: &agent_configs,
     };

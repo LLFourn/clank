@@ -245,3 +245,55 @@ fn auto_errors_when_session_not_bound() {
         "stderr missing bootstrap hint: {stderr}"
     );
 }
+
+#[test]
+fn clank_agent_overrides_both_tools_detected() {
+    // Per the pure resolver's precedence: CLANK_AGENT > session
+    // lookup. The CLI wrapper MUST honor that — it can't fail
+    // early on BothToolsDetected when the explicit override is
+    // set. (Caught by codex on 99ce55b.)
+    let dir = init_repo();
+    let repo = dir.path();
+    // No `clank as` is needed — the explicit override
+    // short-circuits identity resolution before any session env
+    // gets parsed.
+    let out = run_clank(
+        repo,
+        &["auto", "status", "--json"],
+        &[
+            ("CLANK_AGENT", "alice"),
+            ("CLAUDE_CODE_SESSION_ID", CLAUDE_SESSION),
+            ("CODEX_THREAD_ID", "019e5385-ed97-7603-8561-dd9024328ff9"),
+        ],
+    );
+    assert!(
+        out.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let body: serde_json::Value = serde_json::from_slice(&out.stdout).expect("valid JSON");
+    assert_eq!(body["label"], "alice");
+}
+
+#[test]
+fn clank_agent_overrides_invalid_session_id() {
+    // Same precedence rule: a malformed session env should not
+    // fail the command when the explicit override is set.
+    let dir = init_repo();
+    let repo = dir.path();
+    let out = run_clank(
+        repo,
+        &["auto", "status", "--json"],
+        &[
+            ("CLANK_AGENT", "alice"),
+            ("CLAUDE_CODE_SESSION_ID", "not/a/valid/session"),
+        ],
+    );
+    assert!(
+        out.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let body: serde_json::Value = serde_json::from_slice(&out.stdout).expect("valid JSON");
+    assert_eq!(body["label"], "alice");
+}
