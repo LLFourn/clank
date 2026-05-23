@@ -3,20 +3,25 @@
 ## Summary
 
 Wire clank into Claude Code and Codex CLI so agents call `clank wfw`
-without being prompted. Three deliverables:
+without being prompted. Deliverables:
 
 1. A versioned **clank skill** installed into both agents so they know
    what clank is and how its workflow works.
-2. A **Stop hook** for each agent that long-polls `clank wfw` when the
-   agent would otherwise end its turn, and resumes the agent with the
-   returned work as a continuation prompt.
-3. A **`clank setup`** command that writes those files and a **`/clank`**
-   slash command (in both agents) that toggles auto-mode without
-   editing JSON by hand.
+2. A **Stop hook** for each agent that polls `clank wfw` (hint or
+   wait mode) when the agent would otherwise end its turn, and
+   resumes the agent with the returned work as a continuation
+   prompt.
+3. A **`clank setup`** command that writes those files and a
+   **`/clank`** slash command (in both agents) for managing config
+   without editing JSON by hand.
+4. A **`clank doctor`** command that checks every setup invariant
+   (repo, user-scope, current session) so users can self-diagnose
+   when something doesn't fire.
 
-Plus the related smaller pieces: `clank init` adds a master config and
-the right gitignores, and per-agent auto-mode lives in
-`.clank/agents/<name>/config.json`.
+Plus the related smaller pieces: `clank init` adds the right
+gitignores and agent edit-permission rules; per-agent auto-mode
+lives in `.clank/agents/<name>/config.json`; session identity in
+`.clank/cache/sessions.json`.
 
 Supersedes the older stubs `agent-automation-hooks.md` and
 `codex-stop-hook-wfw-experiment.md`, which conflated several
@@ -248,27 +253,51 @@ at all. The env vars matter only for the session_id lookup, where
 they ARE reliable (set by the tool itself, per-process, no leakage
 risk from `CLAUDE_CODE_SESSION_ID` / `CODEX_THREAD_ID`).
 
-### D5. Master agent config — separate file or just another agent?
+### D5. Role designation — per-agent flag vs. repo-level master
 
-**Question.** Does master need its own file, or is it just an agent
-with `"role": "master"` in `.clank/agents/<name>/config.json`?
+**Question.** How does the system know which agent is "the master"
+for a repo, and which are reviewers?
 
-- **Option A — `.clank/master.json` exists, holds master-specific
-  knobs**.
-- **Option B — Master is a role flag** in
-  `.clank/agents/<name>/config.json`. No new file.
-- **Option C — Both**.
+- **Option A — Per-agent role field** (`role: "master"` in each
+  `.clank/agents/<n>/config.json`). Any agent can self-declare as
+  master by editing its own config. Two agents could declare
+  themselves master simultaneously; nothing prevents the conflict.
+- **Option B — Repo-level master file** (`.clank/master.json`
+  naming THE master agent label; everyone else is reviewer by
+  inference).
+- **Option C — Both with reconciliation**.
 
-**Recommendation: B. Confirmed by user.** Every agent has a label and
-lives in `.clank/agents/<name>/`. The agent's `config.json` carries
-its current `role` (`master` or `reviewers`). Switching roles is
-"edit one field". No `master.json`.
+**Recommendation: B.** A repo has one master (by intent of the
+clank workflow); the model should reflect that. Single source of
+truth, no two-agents-both-master class of bug. Role inference is
+trivial: if my resolved label matches `master.json[agent]` → I'm
+master; otherwise I'm reviewer.
 
-A consequence worth flagging: with role in the config, an agent can
-flip role between turns by editing its own config. That's a feature
-(a single agent can plan-and-then-review without two install paths)
-but it means `clank auto` needs a way to set the role too — `clank
-auto on --role master`.
+Schema:
+
+```json
+// .clank/master.json
+{ "agent": "alice" }
+```
+
+Optional file. If absent → no master designated yet; operations
+that need a master (like wfw with auto-inferred role) error with
+"no master set for this repo; run `clank auto on --role master`".
+
+`clank auto on --role master` is the canonical setter — it writes
+both this agent's auto-mode AND updates master.json to name this
+agent. `clank auto on --role reviewers` removes the master
+designation IF this agent was the master (and writes auto-mode);
+otherwise it just writes auto-mode.
+
+**Consequence for per-agent config.** `role` no longer lives in
+`.clank/agents/<n>/config.json`. The schema shrinks to:
+
+```json
+{ "auto_mode": "hint", "wfw_timeout": null }
+```
+
+Role comes from comparing label vs. `master.json`.
 
 ### D6. The `/clank` slash command — scope and shape
 
@@ -543,14 +572,22 @@ repo with the recommended root gitignore, `git check-ignore` says
 `.clank/agents/claude/feedback/plan/abc.md` is IGNORED. Both
 positive and negative case covered.
 
-**Agent edit-permission setup (also `clank init`'s job).** Without
-explicit permission rules, agents prompt the user on every Write/
-Edit into their own `.clank/agents/<name>/` dir — death by a
-thousand prompts. `clank init` writes blanket allow rules per
-tool, scoped to the agent-owned subtree.
+**Agent edit-permission setup (also `clank init`'s job, claude
+only).** Without explicit permission rules, claude prompts the
+user on every Write/Edit into `.clank/agents/<name>/` — death by
+a thousand prompts. `clank init` writes a blanket allow rule.
 
-For claude, write to `.claude/settings.json` (committed; every
-clone benefits) under the `permissions.allow` array:
+**Claude only.** Codex's permission model is shell-command-based
+(`prefix_rule(pattern=[...])` matches argv arrays for command
+invocation, not file paths). Codex file access is governed by its
+sandbox mode (`workspace-write` etc.), which by default permits
+writes inside the workspace root — so writes to
+`.clank/agents/...` already work without configuration. No codex
+permission file written by `clank init`.
+
+For claude, write to `.claude/settings.local.json` (the
+conventional per-user-per-repo settings file) under
+`permissions.allow`:
 
 ```json
 {
@@ -564,34 +601,30 @@ clone benefits) under the `permissions.allow` array:
 }
 ```
 
-For codex, write to `.codex/config.toml` (per-project; codex reads
-it when the project is trusted) using codex's `prefix_rule` syntax
-(matches the user's existing `~/.codex/rules/default.rules`
-allowlist style):
+`clank init` **does** write/update this file unconditionally —
+no opt-in flag, no warning. The user can revert or move the rule
+later if they want.
 
-```toml
-[[rules]]
-prefix_rule = ".clank/agents"
-allow = ["read", "write"]
-```
+**Clank takes no position on whether `.claude/` is committed or
+gitignored.** Some repos commit `.claude/`; some don't. `clank
+init` does not edit, warn about, or recommend changes to the
+user's root gitignore. The `settings.local.json` filename is the
+standard convention for per-user overrides, so it works whether
+the repo commits `.claude/` (in which case `.local.json` is
+typically already gitignored) or ignores `.claude/` entirely.
 
-(Final TOML keys to verify against codex docs at impl time;
-the user's `~/.codex/rules/default.rules` already uses this
-shape so the pattern is known.)
+The blanket `.clank/agents/**` scope is deliberate: any agent can
+edit ANY agent's dir, because all agents run as the same OS user
+— the "agent label" is attribution, not a security boundary.
 
-Both files merged tagged-key style (same approach as D8) so we
-don't clobber unrelated rules the user may have added. The blanket
-`.clank/agents/**` scope is deliberate: any agent can edit ANY
-agent's dir, because all agents run as the same OS user — the
-"agent label" is attribution, not a security boundary.
+`.claude/settings.local.json` is merged tagged-key style (same
+approach as D8) so we don't clobber unrelated allow rules the
+user may have added.
 
-For codex, first-time use of `.codex/config.toml` still triggers
-the project trust prompt — that's the agent's built-in security
-feature, not something `clank init` should bypass.
-
-Test: `clank init` in a fresh repo produces both files with the
-expected rules; re-running is idempotent; pre-existing unrelated
-rules in either file are preserved.
+Test: `clank init` in a fresh repo produces
+`.claude/settings.local.json` with the expected three allow
+entries; re-running is idempotent; pre-existing unrelated rules
+are preserved.
 
 ---
 
@@ -602,9 +635,10 @@ rules in either file are preserved.
 ```
 <repo>/.clank/
 ├── .gitignore                       # updated: agents/*/feedback ignored
+├── master.json                      # { agent: "<label>" } — optional, TRACKED
 ├── agents/
 │   └── <agent>/
-│       ├── config.json              # auto-mode + role + timeout (TRACKED)
+│       ├── config.json              # auto-mode + timeout (TRACKED)
 │       └── feedback/                # gitignored
 ├── cache/
 │   └── sessions.json                # session_id → {tool, label} (gitignored)
@@ -625,14 +659,30 @@ rules in either file are preserved.
 
 ```json
 {
-  "auto_mode": "hint",         // "off" | "hint" | "wait" — `clank auto on` writes "hint"
-  "role": "reviewers",         // "reviewers" | "master"
+  "auto_mode": "hint",         // "off" | "hint" | "wait"
   "wfw_timeout": null          // null = indefinite (default); else "30m" / "5m" / etc.
 }
 ```
 
+Note: no `role` field — role is derived from `.clank/master.json`
+(see D5 / next subsection).
+
 Schema lives in `clank_core` as a `serde` struct; one source of truth
 read by the stop-hook adapter, written by `clank auto`.
+
+### Repo master config (`.clank/master.json`)
+
+```json
+{ "agent": "alice" }
+```
+
+Optional. Names THE master agent label for this repo. Role
+inference: an agent's role is `master` iff its resolved label
+equals `master.json[agent]`; otherwise `reviewers`. If
+`master.json` is missing, no agent is master in this repo.
+
+Typed `RepoMaster` struct in `clank_core`; pure helper
+`role_for(label: &AgentLabel, master: Option<&RepoMaster>) -> Role`.
 
 **Timeouts — two layers.** Clank's `wfw_timeout` defaults to `null`
 meaning the clank-side wait is indefinite. But the agent's hook
@@ -647,41 +697,63 @@ don't need to touch the hook config.
 
 ### Identity resolver (shared by stop-hook, auto, `clank as`)
 
-ONE function lives in `clank_core` and every caller goes through it:
+**Crate split.** `clank_core` stays pure: it owns the types
+(`Tool`, `AgentLabel`, `AgentConfig`, `SessionsCache`,
+`IdentityInputs`) and the pure resolver function. The CLI does
+all I/O — reads stdin, env, and `sessions.json`; constructs
+`IdentityInputs`; calls the resolver.
+
+Pure resolver in `clank_core`:
 
 ```text
-resolve_agent_identity(tool: Tool, hook_stdin: Option<HookInput>, env, repo) -> AgentLabel
-  1. if env CLANK_AGENT set and non-empty → return it
-  2. if hook_stdin available, read sessions.json[hook_stdin.session_id]
-     → if entry exists AND entry.tool == tool → return entry.label
-  3. if no hook_stdin (running from a slash command / shell), read
-     session_id from env (CLAUDE_CODE_SESSION_ID for claude;
-     CODEX_THREAD_ID for codex) and do the same lookup
-  4. return tool-name default ("claude" or "codex")
+fn resolve_agent_identity(inputs: &IdentityInputs) -> AgentLabel
+  precedence:
+    1. inputs.explicit_label (from CLANK_AGENT env)         → return
+    2. inputs.session_id → sessions.entries.get(session_id)
+         if entry.tool == inputs.tool                       → return entry.label
+    3. tool-name default ("claude" or "codex")              → return
+
+struct IdentityInputs {
+  tool: Tool,
+  explicit_label: Option<AgentLabel>,
+  session_id: Option<SessionId>,
+  sessions: SessionsCache,
+}
 ```
 
-Writer side:
+CLI side (in `crates/cli`):
+
+```text
+build_identity_inputs(tool, hook_stdin: Option<HookInput>, repo) -> IdentityInputs
+  reads CLANK_AGENT env (if set)
+  resolves session_id:
+    if hook_stdin.is_some()  → hook_stdin.session_id
+    else if tool == claude   → env CLAUDE_CODE_SESSION_ID
+    else if tool == codex    → env CODEX_THREAD_ID
+  loads SessionsCache from <repo>/.clank/cache/sessions.json (or empty)
+  returns IdentityInputs { tool, explicit_label, session_id, sessions }
+```
+
+Writer side (CLI):
 
 ```text
 clank as <label> --tool <tool>
-  1. read session_id from env (CLAUDE_CODE_SESSION_ID / CODEX_THREAD_ID
-     per --tool); error if missing (run outside agent)
-  2. write .clank/cache/sessions.json:
-     {
-       "<session_id>": {
-         "tool": "<tool>",
-         "label": "<label>",
-         "updated_at": "<ISO-8601>"
-       },
-       ...
-     }
-  3. prune entries with updated_at older than 7 days
+  1. read session_id from env (per --tool); error if missing
+  2. load <repo>/.clank/cache/sessions.json (or empty)
+  3. upsert: sessions[session_id] = { tool, label, updated_at: now }
+  4. prune entries where updated_at older than 7 days
+  5. write atomically (write to temp + rename)
 ```
 
-`clank as` is a real CLI verb, not just a slash command shortcut.
-Typed `SessionsCache` struct in `clank_core` (serde'd to/from
-`sessions.json`); both reader and writer share it. Unit tests pin
-the resolver's precedence and the prune behavior.
+`SessionsCache` is a typed serde struct in core; both reader
+(stop-hook, auto) and writer (`clank as`) share it. Unit tests
+in core pin resolver precedence + prune; integration tests in CLI
+pin the file round-trip.
+
+Why this split matters: core compiles to wasm unchanged (no
+filesystem, no env, no clock) and is testable without temp dirs.
+The CLI module is the only place that knows about session.json
+on disk.
 
 ### `clank stop-hook --tool <claude|codex>`
 
@@ -731,9 +803,20 @@ per-tool writer, NOT ad-hoc JSON formatting):
 | Internal error               | exit 0; stderr = diagnostic  | exit 0; stderr = diagnostic                                 |
 | Identity unresolvable        | exit 0; stderr = diagnostic  | exit 0; stderr = diagnostic                                 |
 
-**The hook NEVER fails the agent.** Exit code 1 or panic is a
-clank bug — covered by tests that assert exit 0 on every error
-path.
+**Hook exit-code invariant** (precise — codex called out an
+earlier blanket "never non-zero" wording that contradicted the
+table above):
+
+- **Claude continuation** intentionally exits **2**. That IS the
+  agent's continuation protocol. The table is the source of truth.
+- **Codex continuation** exits **0** with `decision:block` JSON on
+  stdout. Codex's continuation protocol uses stdout shape, not
+  exit code.
+- **All non-continuation paths** — `stop_hook_active`, auto off,
+  no-work, timeout, internal error, identity unresolvable — exit
+  **0**.
+- **Unexpected failure codes (1, panic, etc.) are bugs.** Tests
+  assert the exact table; nothing else.
 
 Unit tests live in `crates/cli/tests/stop_hook.rs`, table-driven
 over (auto_mode, has_pending_for_me, has_pending_for_others,
@@ -741,14 +824,24 @@ tool, stop_hook_active) → (exit_code, stdout, stderr).
 
 ### `clank auto on|off [--mode hint|wait] [--role master|reviewers]`
 
-Writes `.clank/agents/<resolved-name>/config.json` via the shared
-typed `AgentConfig`. Identity resolves via `resolve_agent_identity`
+Writes `.clank/agents/<resolved-label>/config.json` via the shared
+typed `AgentConfig`. Identity resolves via the shared resolver
 (no hook stdin available; reads session_id from env).
+
 - `clank auto on` → `auto_mode: "hint"` (default); `--mode wait`
   overrides to `"wait"`.
 - `clank auto off` → `auto_mode: "off"`.
-- `--role` writes the role field; safe to combine with on/off.
-- `clank auto status [--json]` → prints current `AgentConfig`.
+- `--role master` → also updates `.clank/master.json` to
+  `{ "agent": "<resolved-label>" }`. Overwrites any prior master
+  designation (with a one-line "master changed from X to Y" note
+  on stderr).
+- `--role reviewers` → if `.clank/master.json[agent] ==
+  <resolved-label>`, remove `master.json` (this agent is no
+  longer master). If not, no-op for the master file. Either way,
+  auto-mode is still written.
+- `clank auto status [--json]` → prints current `AgentConfig` AND
+  inferred role (with reference to whether master.json names this
+  agent).
 
 ### `clank as <label>`
 
@@ -756,6 +849,99 @@ Writes the session-keyed entry to `.clank/cache/sessions.json`
 (spec'd above). Reads `CLAUDE_CODE_SESSION_ID` /
 `CODEX_THREAD_ID` from env; auto-detects tool from which one is
 set (errors if neither — "run inside claude or codex").
+
+### `clank wfw` changes — `--author` becomes optional
+
+Today `wfw --author <label>` is required. With the identity
+resolver in place, that's redundant — the agent invoking wfw has
+the same env (`CLAUDE_CODE_SESSION_ID` / `CODEX_THREAD_ID`) the
+hook does, and the same session-cache lookup applies.
+
+After this plan:
+- `--author <label>` → still works, wins if passed (explicit override).
+- `--author` omitted → CLI builds `IdentityInputs` from env (no
+  hook stdin), calls the shared resolver, uses the result.
+- Resolver returns the tool-name default if nothing else fires —
+  so a fresh `claude` session can run `clank wfw` with no flags
+  at all and have it act as the default agent.
+
+Similarly, `--role`:
+- `--role <role>` → still works, wins if passed.
+- `--role` omitted → read `.clank/master.json` and compare
+  resolved label against it. Master if equal, reviewers
+  otherwise. If `master.json` is missing and label doesn't match,
+  default to `reviewers` (so wfw works for a fresh repo's first
+  agent without a master designation; explicit `--role master`
+  or `clank auto on --role master` is the path to claim it).
+
+This makes the hint-mode "you may run `clank wfw`" suggestion
+zero-friction: the agent literally just runs `clank wfw` —
+no remembering which `--author` to pass, no looking up its own
+label.
+
+### `clank doctor`
+
+Diagnostic command that checks every invariant `clank init` and
+`clank setup` are supposed to maintain, plus runtime context
+(which tool is currently running, whether the current session
+has an identity binding). Output is a flat list of OK / WARN /
+FAIL lines; exits 0 if all OK/WARN, 1 if any FAIL.
+
+Checks (in order):
+
+**Repo-scope (only if cwd is inside a git repo with `.clank/`):**
+- `.clank/.gitignore` exists with the expected body
+- Root `.gitignore` has `!.clank/agents/` carve-out (WARN if missing)
+- `.clank/agents/` exists (OK if not — gets created lazily)
+- For each agent in `.clank/agents/`:
+  - `config.json` parses as a valid `AgentConfig`
+  - auto_mode is `off` / `hint` / `wait`
+- `.clank/master.json` if present:
+  - parses as `{ agent: "<label>" }`
+  - the named agent's dir exists (WARN if not — master designated
+    for an agent that's never run; harmless but suspicious)
+- `.clank/cache/sessions.json` if present parses; report entries
+  older than 7d (cleanup happens next `clank` invocation; just
+  informational)
+- `.claude/settings.local.json` has the `Edit`/`Write`/`Read`
+  permission rules for `.clank/agents/**` (WARN if missing —
+  user will get prompted on every feedback write)
+
+**User-scope:**
+- `~/.claude/skills/clank/SKILL.md` exists and matches embedded
+  expected content (FAIL if drifted — user edited it; `clank
+  setup --force` would overwrite)
+- `~/.codex/skills/clank/SKILL.md` same
+- `~/.codex/commands/clank.md` same
+- `~/.claude/settings.json` contains a Stop hook entry tagged
+  `"id":"clank-stop-hook"` pointing at `clank stop-hook --tool
+  claude`
+- `~/.codex/hooks.json` same for codex
+- `clank` binary on PATH matches the binary actually invoked by
+  the hooks (resolve via `which clank` vs the command in each
+  hook; WARN if hooks point at a different path)
+
+**Session-scope (only if invoked from inside an agent):**
+- Detect tool from env (`CLAUDECODE=1` → claude; `CODEX_THREAD_ID`
+  set → codex)
+- Session env var present (`CLAUDE_CODE_SESSION_ID` /
+  `CODEX_THREAD_ID`)
+- Identity resolves: tool default, session-cache lookup, or
+  `CLANK_AGENT` env override — print which one fired and what
+  label it produced
+- Role for that label (compare against `.clank/master.json`):
+  "master" or "reviewers"
+- If session has an entry in `sessions.json`, print the bound
+  label and `updated_at`; if not, note "no `/clank as` set yet
+  for this session (falls back to default `<tool>`)" — OK, not
+  WARN
+
+Implementation: each check is a small typed function returning
+`CheckResult { status: Ok | Warn | Fail, message: String }`.
+Aggregated in a `Vec` and rendered. Easy to add new checks over
+time. Most checks reuse the same loaders the rest of the CLI
+uses (typed `AgentConfig`, `SessionsCache`, etc.) — `clank doctor`
+catches bit-rot when those loaders diverge from on-disk reality.
 
 ### `clank setup [--user] [--repo <path>]`
 
@@ -901,7 +1087,12 @@ Cleanup: `rm -rf /tmp/clank-hook-experiment`.
   codex marketplace.
 - Live status display in claude during long-polling (separate plan,
   if ever).
-- True multi-agent-per-tool-per-session (two claude instances in
-  one repo using different labels at the same time). The session
-  resolver supports it as designed — but neither agent fully
-  exposes nesting cleanly; defer the explicit support story.
+- **Nested subagents that don't expose distinct session IDs.**
+  Two same-tool top-level sessions in one repo with different
+  labels DO work — the session-keyed resolver supports it by
+  construction (each session has its own `CLAUDE_CODE_SESSION_ID`
+  / `CODEX_THREAD_ID`). What's deferred is the case where one
+  agent spawns a subagent that inherits the parent's session id
+  (or doesn't surface its own), so `/clank as alice` in the
+  subagent would overwrite the parent's identity binding. Detect
+  and document if/when this comes up.
