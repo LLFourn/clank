@@ -40,4 +40,4 @@ invocation to use — run it verbatim.
 
 ## /clank slash command
 
-See `commands/clank.md` for the interactive flow.
+See `~/.codex/commands/clank.md` for the interactive flow.
