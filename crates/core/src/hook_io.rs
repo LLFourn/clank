@@ -45,10 +45,15 @@ pub struct HookInput {
     pub cwd: String,
     #[serde(default)]
     pub transcript_path: Option<String>,
-    /// True iff this hook invocation is itself a continuation of
-    /// a previous Stop-hook decision. The adapter MUST short-
-    /// circuit on this (return [`HookOutcome::Silent`]) or claude
-    /// force-stops after 8 consecutive blocks and codex loops.
+    /// True iff this hook invocation is itself a continuation of a
+    /// previous Stop-hook decision (we're inside the chain of stops
+    /// between two user prompts). It does NOT mean "the agent did
+    /// nothing"; tool calls between hook fires reset claude's own
+    /// 8-block force-stop counter implicitly. The adapter
+    /// discriminates real spin (same `last_assistant_message` as
+    /// the previous fire) from productive next-iteration (new
+    /// content) — see `stop_hook_state` and the progress guard in
+    /// `cli::stop_hook`.
     pub stop_hook_active: bool,
     #[serde(default)]
     pub last_assistant_message: Option<String>,
