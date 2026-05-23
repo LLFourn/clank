@@ -153,7 +153,9 @@ fn auto_off_exits_silent() {
 }
 
 #[test]
-fn hint_mode_no_work_exits_silent() {
+fn hint_mode_no_plans_exits_silent() {
+    // No plans in this repo at all → branches 1 + 2 both empty
+    // → silent.
     let dir = init_repo();
     let repo = dir.path();
     bind_alice(repo);
@@ -163,8 +165,51 @@ fn hint_mode_no_work_exits_silent() {
     let (code, stdout, stderr) = run_stop_hook(repo, "claude", &stdin, &[]);
     assert_eq!(code, Some(0), "expected silent exit; stderr={stderr}");
     assert!(stdout.is_empty(), "stdout={stdout}");
-    // stderr may have diagnostics from internal probes; just
-    // assert no continuation output.
+}
+
+#[test]
+fn hint_mode_plan_waiting_on_others_suggests_wfw() {
+    // Master committed a plan intro → plan is waiting on first
+    // reviewer. Alice IS the master here, so derive_work returns
+    // no items for her (master has no work; reviewer does), but
+    // branch 2 should fire: an active plan is in flight.
+    let dir = init_repo();
+    let repo = dir.path();
+    std::fs::create_dir_all(repo.join(".clank/plans")).unwrap();
+    std::fs::write(repo.join(".clank/plans/foo.md"), "# foo\n").unwrap();
+    git(repo, &["add", "-A"]);
+    git(repo, &["commit", "--quiet", "-m", "[foo] intro"]);
+
+    bind_alice(repo);
+    // Claim master so derive_work uses Role::Master perspective.
+    let out_claim = run_clank(
+        repo,
+        &["auto", "on", "--role", "master"],
+        &[("CLAUDE_CODE_SESSION_ID", CLAUDE_SESSION)],
+    );
+    assert!(out_claim.status.success());
+
+    let stdin = claude_stdin(CLAUDE_SESSION, repo, false);
+    let (code, stdout, stderr) = run_stop_hook(repo, "claude", &stdin, &[]);
+    // Branch 2 = claude continuation (exit 2 + stderr).
+    assert_eq!(
+        code,
+        Some(2),
+        "expected branch-2 continuation; stderr={stderr}"
+    );
+    assert!(stdout.is_empty(), "stdout={stdout}");
+    assert!(
+        stderr.contains("no work for `alice`"),
+        "expected branch-2 framing; got {stderr}"
+    );
+    assert!(
+        stderr.contains("waiting on first reviewer"),
+        "expected waiting-on description; got {stderr}"
+    );
+    assert!(
+        stderr.contains("clank wfw"),
+        "expected wfw suggestion; got {stderr}"
+    );
 }
 
 #[test]

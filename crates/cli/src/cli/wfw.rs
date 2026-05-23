@@ -218,6 +218,22 @@ async fn check_once(
     derive_from_state(repo, &state, plan_filter, snapshot, author, role).await
 }
 
+/// Project every active plan in `state` to a `PlanView`. Pub so
+/// the stop-hook adapter can reuse this for both the work-derive
+/// branch and the "is anything pending at all" branch in hint
+/// mode. Same per-plan loop `derive_from_state` runs internally;
+/// exposed separately to avoid duplicating it in the hook.
+pub async fn project_all_views(repo: &Path, state: &RepoState) -> anyhow::Result<Vec<PlanView>> {
+    let plans: Vec<PlanKey> = state.fold.plans.keys().cloned().collect();
+    let mut views = Vec::with_capacity(plans.len());
+    for key in &plans {
+        if let Some(view) = build_view(repo, state, key).await? {
+            views.push(view);
+        }
+    }
+    Ok(views)
+}
+
 /// Public so the stop-hook adapter (hint mode) can reuse the
 /// same projection wfw does without spinning up a watcher.
 pub async fn derive_from_state(

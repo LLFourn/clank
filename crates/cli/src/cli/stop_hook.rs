@@ -90,12 +90,23 @@ async fn compute_outcome(tool: Tool, repo_override: Option<&Path>) -> HookOutcom
     }
 }
 
-/// Hint mode: ONE shot through the wfw projection (cache OK —
-/// hint is read-only). If `derive_work` returns items, render a
-/// continuation; else exit silent. No watcher, no long-poll.
+/// Hint mode (per plan, three branches):
+///
+/// 1. **Work pending for me** — `derive_work` returns items.
+///    Continue with the rendered work + actionable command.
+/// 2. **Work pending for someone else** — at least one active
+///    plan has `waiting_on != SessionFinished`. Continue with a
+///    "you may run `clank wfw`" suggestion so the agent can
+///    explicitly block on the wait instead of ending its turn.
+/// 3. **Nothing in flight** — all plans are session-finished or
+///    there are no plans. Silent; let the agent stop.
+///
+/// All from the same projection (`PlanView`s + `derive_work`),
+/// no duplicated lifecycle logic in the hook. Cache OK because
+/// hint is read-only.
 async fn compute_hint_outcome(repo: &Path, label: &AgentLabel, role: Role) -> HookOutcome {
     use crate::rebuild::{CachePolicy, rebuild_repo_with_policy};
-    use clank_core::wait::StartupSnapshot;
+    use clank_core::wait::{StartupSnapshot, derive_work, detect_finished};
 
     let state = match rebuild_repo_with_policy(repo, CachePolicy::Use).await {
         Ok(s) => s,
@@ -105,16 +116,38 @@ async fn compute_hint_outcome(repo: &Path, label: &AgentLabel, role: Role) -> Ho
             };
         }
     };
+    let views = match super::wfw::project_all_views(repo, &state).await {
+        Ok(v) => v,
+        Err(e) => {
+            return HookOutcome::Diagnostic {
+                message: format!("hook: project failed: {e:#}"),
+            };
+        }
+    };
     let snapshot = StartupSnapshot::capture(&state.fold, None);
-    match super::wfw::derive_from_state(repo, &state, &None, &snapshot, label, role).await {
-        Ok(Some(items)) => HookOutcome::Continue {
+
+    // Branch 1: my own pending work.
+    let mut items = derive_work(&views, label, role);
+    items.extend(detect_finished(&snapshot, &state.fold));
+    if !items.is_empty() {
+        return HookOutcome::Continue {
             reason: render_work_reason(&items, label, role),
-        },
-        Ok(None) => HookOutcome::Silent,
-        Err(e) => HookOutcome::Diagnostic {
-            message: format!("hook: derive failed: {e:#}"),
-        },
+        };
     }
+
+    // Branch 2: any active plan waiting on someone else. Finished
+    // plans live in `state.fold.finished_plans` (not in
+    // `state.fold.plans`), so every plan that produced a `PlanView`
+    // above is by definition still in flight — just iterate.
+    let plans_in_flight: Vec<&clank_core::plan_view::PlanView> = views.iter().collect();
+    if !plans_in_flight.is_empty() {
+        return HookOutcome::Continue {
+            reason: render_wfw_suggestion(&plans_in_flight, label, role),
+        };
+    }
+
+    // Branch 3: nothing pending anywhere.
+    HookOutcome::Silent
 }
 
 /// Wait mode: long-poll via a self-spawned `clank wfw --json`.
@@ -338,6 +371,54 @@ fn render_wfw_items(items: &[serde_json::Value], label: &AgentLabel, role: Role)
 
 fn short_sha(s: &str) -> &str {
     &s[..s.len().min(7)]
+}
+
+/// Branch-2 prompt: an active plan exists but the wait isn't on
+/// me. Suggest `clank wfw` so the agent can explicitly block on
+/// the wait. The command is runnable as-is (wfw inferring author
+/// + role via the resolver — see task #262).
+fn render_wfw_suggestion(
+    plans: &[&clank_core::plan_view::PlanView],
+    label: &AgentLabel,
+    role: Role,
+) -> String {
+    use clank_core::plan_view::WaitingOn;
+    let mut out = String::new();
+    out.push_str(&format!(
+        "Clank has no work for `{label}` ({role}) right now, but {n} plan{s} \
+         in flight:\n",
+        label = label.as_str(),
+        role = role.as_str(),
+        n = plans.len(),
+        s = if plans.len() == 1 { "" } else { "s" },
+    ));
+    for view in plans {
+        let waiting = match &view.waiting_on {
+            WaitingOn::MasterToRevise { .. } => "master to address feedback",
+            WaitingOn::MasterToCommit => "master to commit plan revision",
+            WaitingOn::MasterToImplement => "master to implement",
+            WaitingOn::MasterToFinalize => "master to run `clank finish`",
+            WaitingOn::FirstReview => "first reviewer",
+            WaitingOn::ReviewerApprovalsMissing { missing } => {
+                let names: Vec<&str> = missing.iter().map(|l| l.as_str()).collect();
+                out.push_str(&format!(
+                    "  - `{plan}`: waiting on reviewers ({names})\n",
+                    plan = view.plan.as_str(),
+                    names = names.join(", "),
+                ));
+                continue;
+            }
+        };
+        out.push_str(&format!(
+            "  - `{plan}`: waiting on {waiting}\n",
+            plan = view.plan.as_str(),
+        ));
+    }
+    out.push_str(
+        "\nIf you want to wait for this to change, run `clank wfw` (it will block \
+         until you have work or until its timeout expires).",
+    );
+    out
 }
 
 /// Render the outcome to the per-tool wire shape and exit.
