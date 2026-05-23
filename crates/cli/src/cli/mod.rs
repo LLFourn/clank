@@ -18,6 +18,7 @@ pub mod init;
 pub mod plan_resolve;
 pub mod purge;
 pub mod rewrite;
+pub mod setup;
 pub mod status;
 pub mod stop_hook;
 pub mod wfw;
@@ -332,6 +333,19 @@ pub enum AutoModeArg {
 pub enum RoleArg {
     Master,
     Reviewers,
+}
+
+#[derive(Args, Debug)]
+pub struct SetupArgs {
+    /// Overwrite skill/command files even if they've drifted
+    /// from the embedded content (e.g. user manually edited).
+    /// Hook entries in settings.json / hooks.json are always
+    /// tag-merged regardless of this flag.
+    #[arg(long)]
+    pub force: bool,
+    /// Show what would change without writing anything.
+    #[arg(long)]
+    pub dry_run: bool,
 }
 
 #[derive(Args, Debug)]

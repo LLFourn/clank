@@ -40,6 +40,10 @@ enum Command {
     /// agent's Stop hook config by `clank setup`; not typically
     /// invoked directly.
     StopHook(cli::StopHookArgs),
+    /// Install user-scope clank assets into ~/.claude and
+    /// ~/.codex: skill files, slash command, and Stop hook
+    /// entries tag-merged into the per-tool config files.
+    Setup(cli::SetupArgs),
 }
 
 #[tokio::main]
@@ -56,6 +60,7 @@ async fn main() -> anyhow::Result<()> {
         Command::As(args) => cli::as_cmd::run(args).await,
         Command::Auto(args) => cli::auto::run(args).await,
         Command::StopHook(args) => cli::stop_hook::run(args).await,
+        Command::Setup(args) => cli::setup::run(args).await,
     };
     if let Err(e) = result {
         let code = exit_code_for(&e);
