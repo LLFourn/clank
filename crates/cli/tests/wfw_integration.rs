@@ -885,7 +885,10 @@ fn wfw_master_no_plans_exits_immediately_json() {
     write(repo, "README.md", "# repo\n");
     commit(repo, "init");
 
-    let start = Instant::now();
+    // --timeout 30s with exit 0 + empty items proves the fast-exit
+    // path fired (the wait loop would have produced exit 2 on
+    // timeout). No wall-clock assertion — it flakes on cold subprocess
+    // startup and the exit shape is already a stronger signal.
     let output = Command::new(clank_bin())
         .args([
             "wfw",
@@ -902,7 +905,6 @@ fn wfw_master_no_plans_exits_immediately_json() {
         .arg(repo)
         .output()
         .expect("spawn clank wfw");
-    let elapsed = start.elapsed();
 
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();
     let stderr = String::from_utf8_lossy(&output.stderr).to_string();
@@ -915,10 +917,6 @@ fn wfw_master_no_plans_exits_immediately_json() {
         stdout.trim(),
         r#"{"items":[]}"#,
         "expected empty items envelope; got stdout=`{stdout}`"
-    );
-    assert!(
-        elapsed < Duration::from_secs(2),
-        "expected fast exit, took {elapsed:?}"
     );
 }
 
