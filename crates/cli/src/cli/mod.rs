@@ -27,6 +27,11 @@ pub struct InitArgs {
     /// Repo root. Defaults to the cwd's git toplevel.
     #[arg(long, value_name = "PATH")]
     pub repo: Option<PathBuf>,
+    /// Skip the interactive agent-identity prompts (phase 2)
+    /// and accept defaults: label = tool name (claude/codex),
+    /// role = reviewers. Useful for scripts.
+    #[arg(short = 'y', long)]
+    pub yes: bool,
 }
 
 #[derive(Args, Debug)]
