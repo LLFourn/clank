@@ -580,10 +580,15 @@ tracked (every contributor sees them).
 
 **Test** (extends the existing `init.rs` test suite): a
 `check-ignore`-based test verifying that for a freshly-initialized
-repo with the recommended root gitignore, `git check-ignore` says
-`.clank/agents/claude/config.json` is TRACKED while
-`.clank/agents/claude/feedback/plan/abc.md` is IGNORED. Both
-positive and negative case covered.
+repo with the recommended root gitignore, `git check-ignore`
+classifies the following correctly:
+- `.clank/config.json` → TRACKED
+- `.clank/agents/<n>/config.json` → IGNORED (per-user)
+- `.clank/agents/<n>/feedback/<plan>/<commit>.md` → TRACKED
+- `.clank/cache/anything` → IGNORED
+
+Each path covered with both positive and negative assertions
+(check-ignore exit 0 with source line, vs. exit 1 = not ignored).
 
 **Agent edit-permission setup (also `clank init`'s job, claude
 only).** Without explicit permission rules, claude prompts the
@@ -890,6 +895,13 @@ Writes `.clank/agents/<resolved-label>/config.json` via the shared
 typed `AgentConfig`. Identity resolves via the shared resolver
 (no hook stdin available; reads session_id from env).
 
+**`clank auto` requires identity to already resolve.** It is NOT
+a bootstrap path. If the resolver returns `NoAgentForSession` /
+`NoSession`, `clank auto` errors with: "no agent set up for this
+session — run `clank init` (inside this session) or
+`clank as <label>` first." Bootstrap is exclusively the job of
+`clank init` phase 2 and `clank as`.
+
 - `clank auto on` → `auto_mode: "hint"` (default); `--mode wait`
   overrides to `"wait"`.
 - `clank auto off` → `auto_mode: "off"`.
@@ -919,7 +931,7 @@ other agents holding the same session id.
 Today `wfw --author <label>` is required. With the identity
 resolver in place, that's redundant — the agent invoking wfw has
 the same env (`CLAUDE_CODE_SESSION_ID` / `CODEX_THREAD_ID`) the
-hook does, and the same session-cache lookup applies.
+hook does, and the same agent-config session lookup applies.
 
 After this plan:
 - `--author <label>` → still works, wins if passed (explicit
@@ -1007,7 +1019,7 @@ Implementation: each check is a small typed function returning
 `CheckResult { status: Ok | Warn | Fail, message: String }`.
 Aggregated in a `Vec` and rendered. Easy to add new checks over
 time. Most checks reuse the same loaders the rest of the CLI
-uses (typed `AgentConfig`, `SessionsCache`, etc.) — `clank doctor`
+uses (typed `AgentConfig`, `RepoConfig`) — `clank doctor`
 catches bit-rot when those loaders diverge from on-disk reality.
 
 ### `clank setup [--user] [--repo <path>]`
@@ -1133,37 +1145,54 @@ Cleanup: `rm -rf /tmp/clank-hook-experiment`.
   merges two hook configs. Re-running is idempotent (tagged merge
   by `"id":"clank-stop-hook"`).
 - `clank init` in a fresh repo writes `.clank/.gitignore` per D10;
-  warns if the root gitignore lacks `!.clank/agents/`. The
-  `check-ignore` test asserts `agents/<n>/config.json` is TRACKED
-  and `agents/<n>/feedback/...` is IGNORED.
-- `clank auto on` writes `.clank/agents/<resolved-label>/config.json`
-  with `auto_mode: "hint"` by default (`--mode wait` to opt into
-  blocking). Resolution goes through the shared identity resolver.
+  warns if the root gitignore lacks `!.clank/config.json` and
+  `!.clank/agents/` carve-outs. The `check-ignore` test (per D10)
+  asserts:
+  - `.clank/config.json` TRACKED
+  - `.clank/agents/<n>/config.json` IGNORED
+  - `.clank/agents/<n>/feedback/<plan>/<commit>.md` TRACKED
+  - `.clank/cache/anything` IGNORED
+- `clank init` phase 2 (only when running inside an agent):
+  prompts for agent name + master?, writes
+  `.clank/agents/<name>/config.json` with the env-derived session
+  binding and `auto_mode: "off"`; if master, also writes
+  `.clank/config.json`.
+- `clank auto on` requires identity to already resolve. Errors
+  with "no agent set up for this session — run `clank init` (or
+  `clank as <label>`)" if NoAgentForSession. On success: writes
+  `auto_mode: "hint"` (default; `--mode wait` overrides). With
+  `--role master`, also updates `.clank/config.json`. With
+  `--role reviewers`, clears master if this agent held it.
 - `clank as alice` writes alice's `.clank/agents/alice/config.json`
   with a `session` field keyed by the env-resolved session_id;
   if any other agent's config held the same session id, that
   stale binding is cleared. Test verifies round-trip + lookup +
-  staleness cleanup.
-- After setup + `clank auto on` in hint mode: a claude session
-  that finishes a turn invokes the stop hook; if work is pending
-  for this agent the hook continues claude (exit 2 + stderr); if
-  another agent is pending it suggests `clank wfw`; if neither it
-  exits 0 silently.
-- After setup + `clank auto on --mode wait`: same as above but the
-  hook long-polls instead of one-shot checking.
+  staleness cleanup. (No separate sessions cache; no prune
+  needed.)
+- After setup + agent bootstrap + `clank auto on` in hint mode:
+  a claude session that finishes a turn invokes the stop hook;
+  if work is pending for this agent the hook continues claude
+  (exit 2 + stderr); if another agent is pending it suggests
+  `clank wfw`; if neither it exits 0 silently.
+- After setup + bootstrap + `clank auto on --mode wait`: same
+  matrix but the hook long-polls instead of one-shot checking.
 - Same matrix works under codex (continuation via stdout JSON +
   exit 0).
 - `stop_hook_active == true` → hook exits 0 with no output (loop
   guard).
-- The hook NEVER exits non-zero; even crashes are caught and
-  reported via stderr with exit 0. Covered by table-driven tests
-  in `crates/cli/tests/stop_hook.rs`.
+- **Hook exit-code invariant** (matches the table; not a blanket
+  "never non-zero"):
+  - Claude continuation exits **2** with stderr = reason.
+  - Codex continuation exits **0** with stdout =
+    `{"decision":"block","reason":...}`.
+  - All non-continuation paths AND handled internal errors exit
+    **0**. Unexpected exit 1 / panic is a bug.
+  - Covered by table-driven tests in
+    `crates/cli/tests/stop_hook.rs`.
 - `/clank` (bare) prints status + the `/clank config` hint;
   `/clank config` opens the picker; `/clank <verb>` passes
-  through. Skill files written by `clank setup` match the embedded
-  body.
-- Session-cache prune: entries older than 7 days are removed on
-  next `clank` invocation. Test exercises this with mocked time.
+  through. Skill files written by `clank setup` match the
+  embedded body.
 
 ## Out of scope (intentionally)
 
