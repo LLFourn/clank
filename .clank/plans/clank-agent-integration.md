@@ -274,48 +274,29 @@ auto on --role master`.
 
 **Question.** What does `/clank` do, and how is it invoked?
 
-**Goal: discoverability.** User wants `/clank` to act like a picker
-(`/model`-style) rather than a "memorize CLI args" command.
+**Goal: discoverability.** Users shouldn't have to memorize CLI
+args. `/clank` is the discovery surface.
 
-**Research finding (rules out native TUI path).** In both claude and
-codex, slash-command shell execution runs in a PTY-captured channel
-that streams stdout back as prompt context — stdin is not connected
-to the user's tty. No frontmatter flag, no plugin manifest field, no
-hook surface, no MCP path hands off the terminal to a subprocess.
-The only tty-handoff codepath in codex is hard-wired to
-`$VISUAL`/`$EDITOR` for the external-editor feature; not exposed.
-Claude has open feature requests for "interactive tty mode" but
-nothing shipped. **So `/clank` cannot launch `clank menu` (or any
-ratatui-style picker) and let it own the terminal.** Verified
-against both agents' binaries and bundled plugins; no plugin in
-either ecosystem does this today.
-
-What `/clank` CAN do from a slash command: print text the agent
-reads, optionally suggest the agent calls a structured-question
-tool (claude `AskUserQuestion`; codex's `elicitation_request` /
-MCP analog). That's an LLM-mediated picker — slower, but works.
+**Constraint.** Slash commands in both agents capture shell stdout
+into prompt context — they don't hand off the terminal to the
+subprocess. So the only way to give the user a picker UI is to
+have the skill body tell the model to call its own structured-
+question tool (claude `AskUserQuestion`; codex's
+`elicitation_request` / MCP-elicit). That's an LLM-mediated
+picker. (Verified against both agents' binaries + bundled
+plugins — see Out of Scope for why nothing fancier is possible
+today.)
 
 - **Option A — Passthrough only**: `/clank auto on` maps to `clank
   auto on`. No bare `/clank` menu. Discoverability: nil.
 - **Option B — Model-mediated picker**: skill body grounds the agent
   in (current state, available options, command to apply each) and
-  asks the agent to use its structured-question tool
-  (`AskUserQuestion` in claude; `elicitation_request` / MCP-elicit
-  in codex). Slow (LLM turn before the picker shows), but works
-  today and gives a real option-picker UI.
-- **Option C — Signpost to standalone `clank menu`**: bare `/clank`
-  prints current state plus a one-liner: "for an interactive picker,
-  run `clank menu` in another shell." No model picker, just a
-  pointer. Cheap, honest, but adds friction.
-- **Option D — B + C**: model-mediated picker INSIDE the agent,
-  standalone `clank menu` TUI for users who want a native picker.
-  `/clank` does B; doc string mentions C exists.
+  asks the agent to use its structured-question tool. Slow (LLM
+  turn before the picker shows), but works today and gives a real
+  option-picker UI.
 
-**Recommendation: D.** Ship the model-mediated picker (B) as the
-in-agent default so `/clank` actually does something useful without
-a context switch; ship `clank menu` as a separate ratatui binary
-verb for users who want the real thing in their own shell. Cost
-of `clank menu` is one new ratatui dep + a config screen — small.
+**Recommendation: B.** Skill body + structured-question tool. Spec
+below.
 
 **Invocation shape (per user):**
 - `/clank` — bare: show current state and one-liner "for an
@@ -494,19 +475,123 @@ below.** Don't commit to A vs B vs C until we've actually fired a
 10s test hook in a claude session and watched what happens. Codex
 gets `statusMessage` either way.
 
-### D10. `clank init` additions
+### D10. `clank init` + gitignore additions
 
-`clank init` today only writes `.clank/.gitignore` + creates
-`.clank/plans/`. User wants it to also create:
+`clank init` today writes `.clank/.gitignore` + creates
+`.clank/plans/`. New work:
 
-- `.clank/agents/.gitignore` (ignore everything except per-agent
-  configs? or ignore the whole thing?) — current
-  `.clank/.gitignore` is `feedback/\ncache/\n`. New `agents/` is
-  agent-owned; we should commit `agents/<name>/config.json` but
-  ignore `agents/<name>/feedback/`. → update the existing gitignore
-  to add `agents/*/feedback/` and `agents/*/cache/` exclusions.
-- `.clank/master.json` — per D5 recommendation, **drop this**. If D5
-  is rejected, write an empty `{}` and document the schema.
+**Two gitignore files to keep in sync.** The repo root already has
+its own gitignore that wholesale-ignores `.clank/*` with positive
+carve-outs:
+
+```text
+# <repo>/.gitignore (existing)
+/target/
+.clank/*
+!.clank/plans/
+!.clank/finished/
+
+/.claude/
+.clank/feedback/
+.clank/cache/
+```
+
+For agent configs to actually be commit-able, the ROOT gitignore
+ALSO needs a carve-out for `agents/`. After this plan:
+
+```text
+# <repo>/.gitignore (target)
+/target/
+.clank/*
+!.clank/plans/
+!.clank/finished/
+!.clank/agents/
+
+/.claude/
+.clank/feedback/                    # legacy; gone after migration
+.clank/cache/
+.clank/agents/*/feedback/
+.clank/agents/*/cache/
+```
+
+And the managed `.clank/.gitignore` mirrors (so cloning into a fresh
+worktree without the root-gitignore update still ignores the right
+sub-paths):
+
+```text
+# .clank/.gitignore (managed by clank init)
+feedback/                           # legacy
+cache/
+agents/*/feedback/
+agents/*/cache/
+```
+
+**`clank init` responsibilities:**
+- Write/update `.clank/.gitignore` to the body above (existing
+  drift-refusal contract from `init.rs` continues to apply).
+- Detect ROOT `.gitignore` and, if the carve-outs are missing,
+  warn the user (don't auto-edit the root gitignore — it's
+  user-owned and might have other rules). The `init.rs`
+  `warn_if_globally_excluded` plumbing already does similar
+  probing; extend it.
+- Per D5: **no `.clank/master.json`**.
+
+**Test** (extends the existing `init.rs` test suite): a
+`check-ignore`-based test verifying that for a freshly-initialized
+repo with the recommended root gitignore, `git check-ignore` says
+`.clank/agents/claude/config.json` is TRACKED while
+`.clank/agents/claude/feedback/plan/abc.md` is IGNORED. Both
+positive and negative case covered.
+
+**Agent edit-permission setup (also `clank init`'s job).** Without
+explicit permission rules, agents prompt the user on every Write/
+Edit into their own `.clank/agents/<name>/` dir — death by a
+thousand prompts. `clank init` writes blanket allow rules per
+tool, scoped to the agent-owned subtree.
+
+For claude, write to `.claude/settings.json` (committed; every
+clone benefits) under the `permissions.allow` array:
+
+```json
+{
+  "permissions": {
+    "allow": [
+      "Write(.clank/agents/**)",
+      "Edit(.clank/agents/**)",
+      "Read(.clank/agents/**)"
+    ]
+  }
+}
+```
+
+For codex, write to `.codex/config.toml` (per-project; codex reads
+it when the project is trusted) using codex's `prefix_rule` syntax
+(matches the user's existing `~/.codex/rules/default.rules`
+allowlist style):
+
+```toml
+[[rules]]
+prefix_rule = ".clank/agents"
+allow = ["read", "write"]
+```
+
+(Final TOML keys to verify against codex docs at impl time;
+the user's `~/.codex/rules/default.rules` already uses this
+shape so the pattern is known.)
+
+Both files merged tagged-key style (same approach as D8) so we
+don't clobber unrelated rules the user may have added. The blanket
+`.clank/agents/**` scope is deliberate: any agent can edit ANY
+agent's dir, because all agents run as the same OS user — the
+"agent label" is attribution, not a security boundary.
+
+For codex, first-time use of `.codex/config.toml` still triggers
+the project trust prompt — that's the agent's built-in security
+feature, not something `clank init` should bypass.
+
+Test: `clank init` in a fresh repo produces both files with the
+expected rules; re-running is idempotent; pre-existing unrelated
+rules in either file are preserved.
 
 ---
 
@@ -516,11 +601,13 @@ gets `statusMessage` either way.
 
 ```
 <repo>/.clank/
-├── .gitignore                       # updated to cover agents/*/feedback
+├── .gitignore                       # updated: agents/*/feedback ignored
 ├── agents/
 │   └── <agent>/
-│       ├── config.json              # auto-mode + role + timeout
-│       └── feedback/                # already exists, gitignored
+│       ├── config.json              # auto-mode + role + timeout (TRACKED)
+│       └── feedback/                # gitignored
+├── cache/
+│   └── sessions.json                # session_id → {tool, label} (gitignored)
 ├── plans/
 └── ... (existing)
 
@@ -558,28 +645,117 @@ hook JSON, and the *clank-side* `wfw_timeout` controls actual
 give-up time. User overrides `wfw_timeout` to cap the wait; they
 don't need to touch the hook config.
 
+### Identity resolver (shared by stop-hook, auto, `clank as`)
+
+ONE function lives in `clank_core` and every caller goes through it:
+
+```text
+resolve_agent_identity(tool: Tool, hook_stdin: Option<HookInput>, env, repo) -> AgentLabel
+  1. if env CLANK_AGENT set and non-empty → return it
+  2. if hook_stdin available, read sessions.json[hook_stdin.session_id]
+     → if entry exists AND entry.tool == tool → return entry.label
+  3. if no hook_stdin (running from a slash command / shell), read
+     session_id from env (CLAUDE_CODE_SESSION_ID for claude;
+     CODEX_THREAD_ID for codex) and do the same lookup
+  4. return tool-name default ("claude" or "codex")
+```
+
+Writer side:
+
+```text
+clank as <label> --tool <tool>
+  1. read session_id from env (CLAUDE_CODE_SESSION_ID / CODEX_THREAD_ID
+     per --tool); error if missing (run outside agent)
+  2. write .clank/cache/sessions.json:
+     {
+       "<session_id>": {
+         "tool": "<tool>",
+         "label": "<label>",
+         "updated_at": "<ISO-8601>"
+       },
+       ...
+     }
+  3. prune entries with updated_at older than 7 days
+```
+
+`clank as` is a real CLI verb, not just a slash command shortcut.
+Typed `SessionsCache` struct in `clank_core` (serde'd to/from
+`sessions.json`); both reader and writer share it. Unit tests pin
+the resolver's precedence and the prune behavior.
+
 ### `clank stop-hook --tool <claude|codex>`
 
 Flow:
-1. Read hook stdin JSON. If `stop_hook_active == true`, exit 0
-   without continuation. (Both agents enforce this.)
-2. Resolve agent label: `CLANK_AGENT` env > tool-name default.
-3. Read `.clank/agents/<agent>/config.json`. If missing or
-   `auto_mode == "off"`, exit 0.
-4. Invoke the same projection wfw does, with `role` and `wfw_timeout`
-   from config.
-5. If no items by timeout, exit 0 (agent stops normally).
-6. If items returned, format the continuation prompt (D7 shape) and
-   emit per-tool decision JSON to stdout. Exit 0.
 
-The hook never fails the agent. Any internal error → exit 0 with a
-diagnostic on stderr.
+1. Read hook stdin JSON into a typed `HookInput` struct (`session_id`,
+   `cwd`, `stop_hook_active`, ...). On parse failure → exit 0 with
+   a diagnostic on stderr.
+2. If `stop_hook_active == true` → emit nothing, exit 0. (Both
+   agents enforce this; we just MUST honor it.)
+3. Resolve label via `resolve_agent_identity(tool, Some(input), env,
+   repo)`.
+4. Read `.clank/agents/<label>/config.json` into a typed
+   `AgentConfig` struct. If file missing → treat as
+   `{ auto_mode: "off" }` (i.e. exit 0).
+5. **Branch on `auto_mode`** (this is the state machine codex asked
+   for — explicit, exhaustive):
+   - `"off"` → emit nothing, exit 0.
+   - `"hint"` → run a NON-BLOCKING projection of wait state (no
+     watcher, no loop). Compute:
+     - `pending_for_me`: items derive_work would return for
+       (label, role) right now
+     - `pending_for_others`: any active plan whose `waiting_on`
+       projects to an agent other than me, where I'm a
+       participant
+     If `pending_for_me` non-empty → emit continuation per-tool
+     (see table) with the rendered work summary (D7). If empty
+     but `pending_for_others` non-empty → emit continuation with
+     a "you may run `clank wfw`" suggestion. If both empty →
+     emit nothing, exit 0.
+   - `"wait"` → call the same blocking wfw loop with `role` and
+     `wfw_timeout` from config. On returned items → emit
+     continuation with rendered work summary. On timeout → emit
+     nothing, exit 0.
+6. Format continuation EXACTLY per the table below.
 
-### `clank auto on|off|status [--as <name>] [--role master|reviewers]`
+**Per-tool output contract** (typed `HookContinuation` struct +
+per-tool writer, NOT ad-hoc JSON formatting):
 
-Writes/reads `.clank/agents/<resolved-name>/config.json`. `status`
-prints the current state in a human format (and JSON with
-`--json`). The `/clank` skill in both agents shells out to this.
+| Branch                       | Claude                       | Codex                                                       |
+| ---                          | ---                          | ---                                                         |
+| Continuation with `reason`   | exit 2; stderr = reason text | exit 0; stdout = `{"decision":"block","reason":"<text>"}`   |
+| `stop_hook_active == true`   | exit 0; no output            | exit 0; no output                                           |
+| `auto_mode == "off"`         | exit 0; no output            | exit 0; no output                                           |
+| Hint mode, nothing pending   | exit 0; no output            | exit 0; no output                                           |
+| Wait mode, timeout elapsed   | exit 0; no output            | exit 0; no output                                           |
+| Internal error               | exit 0; stderr = diagnostic  | exit 0; stderr = diagnostic                                 |
+| Identity unresolvable        | exit 0; stderr = diagnostic  | exit 0; stderr = diagnostic                                 |
+
+**The hook NEVER fails the agent.** Exit code 1 or panic is a
+clank bug — covered by tests that assert exit 0 on every error
+path.
+
+Unit tests live in `crates/cli/tests/stop_hook.rs`, table-driven
+over (auto_mode, has_pending_for_me, has_pending_for_others,
+tool, stop_hook_active) → (exit_code, stdout, stderr).
+
+### `clank auto on|off [--mode hint|wait] [--role master|reviewers]`
+
+Writes `.clank/agents/<resolved-name>/config.json` via the shared
+typed `AgentConfig`. Identity resolves via `resolve_agent_identity`
+(no hook stdin available; reads session_id from env).
+- `clank auto on` → `auto_mode: "hint"` (default); `--mode wait`
+  overrides to `"wait"`.
+- `clank auto off` → `auto_mode: "off"`.
+- `--role` writes the role field; safe to combine with on/off.
+- `clank auto status [--json]` → prints current `AgentConfig`.
+
+### `clank as <label>`
+
+Writes the session-keyed entry to `.clank/cache/sessions.json`
+(spec'd above). Reads `CLAUDE_CODE_SESSION_ID` /
+`CODEX_THREAD_ID` from env; auto-detects tool from which one is
+set (errors if neither — "run inside claude or codex").
 
 ### `clank setup [--user] [--repo <path>]`
 
@@ -599,11 +775,10 @@ Prints what got changed and what was left alone.
 
 ### `clank init` changes
 
-- Update embedded `.gitignore` body to also cover
-  `agents/*/feedback/` and `agents/*/cache/` (or just `agents/*/`
-  with `!agents/*/config.json` carve-out — decide at impl time).
-- Per D5 recommendation: do NOT create `.clank/master.json`. If D5
-  rejected, also write `{}` with a comment about schema.
+Per D10 (full spec there): update `.clank/.gitignore` to cover
+`agents/*/feedback/` and `agents/*/cache/`; warn (don't auto-edit)
+if the ROOT gitignore lacks the `!.clank/agents/` carve-out;
+no `.clank/master.json`.
 
 ### Skill content (both tools, same text)
 
@@ -674,25 +849,49 @@ Cleanup: `rm -rf /tmp/clank-hook-experiment`.
 ## Acceptance sketch
 
 - `clank setup` on a fresh user account writes the four files +
-  merges two hook configs. Re-running is idempotent.
-- `clank init` in a fresh repo writes `.gitignore` covering the
-  agent-feedback paths.
-- `clank auto on` in a repo writes
-  `.clank/agents/<tool>/config.json` with `auto_mode: "wait"`.
-- After setup + `clank auto on`: a claude session that finishes a
-  turn invokes the stop hook, the hook polls `clank wfw` until
-  timeout, and on returned work resumes the agent with the
-  continuation prompt without the user typing anything.
-- Same flow works under codex with the codex-shape decision JSON.
-- The hook short-circuits when `stop_hook_active == true`; no
-  infinite loop / 8-cap force-stop in claude.
-- The hook never fails the agent — `clank` missing, config missing,
-  wfw error all exit 0.
-- `/clank` works in both tools; `/clank auto off` flips the bit
-  visible to the next stop hook invocation.
+  merges two hook configs. Re-running is idempotent (tagged merge
+  by `"id":"clank-stop-hook"`).
+- `clank init` in a fresh repo writes `.clank/.gitignore` per D10;
+  warns if the root gitignore lacks `!.clank/agents/`. The
+  `check-ignore` test asserts `agents/<n>/config.json` is TRACKED
+  and `agents/<n>/feedback/...` is IGNORED.
+- `clank auto on` writes `.clank/agents/<resolved-label>/config.json`
+  with `auto_mode: "hint"` by default (`--mode wait` to opt into
+  blocking). Resolution goes through the shared identity resolver.
+- `clank as alice` writes the session entry to
+  `.clank/cache/sessions.json` keyed by env-resolved session_id.
+  Test verifies the entry round-trips and is found by the resolver
+  when given the same session_id via mock hook input.
+- After setup + `clank auto on` in hint mode: a claude session
+  that finishes a turn invokes the stop hook; if work is pending
+  for this agent the hook continues claude (exit 2 + stderr); if
+  another agent is pending it suggests `clank wfw`; if neither it
+  exits 0 silently.
+- After setup + `clank auto on --mode wait`: same as above but the
+  hook long-polls instead of one-shot checking.
+- Same matrix works under codex (continuation via stdout JSON +
+  exit 0).
+- `stop_hook_active == true` → hook exits 0 with no output (loop
+  guard).
+- The hook NEVER exits non-zero; even crashes are caught and
+  reported via stderr with exit 0. Covered by table-driven tests
+  in `crates/cli/tests/stop_hook.rs`.
+- `/clank` (bare) prints status + the `/clank config` hint;
+  `/clank config` opens the picker; `/clank <verb>` passes
+  through. Skill files written by `clank setup` match the embedded
+  body.
+- Session-cache prune: entries older than 7 days are removed on
+  next `clank` invocation. Test exercises this with mocked time.
 
 ## Out of scope (intentionally)
 
+- **Any custom TUI shipped with clank** (ratatui or otherwise).
+  `/clank`'s discoverability is achieved via the agent's own
+  structured-question tool (D6); no separate config picker, no
+  in-shell TUI, no native picker that handoffs the terminal.
+  Neither claude nor codex exposes a tty-handoff path for slash
+  commands, hooks, plugins, or MCP — verified against both
+  binaries and ~50 bundled plugins. If this changes, revisit.
 - Durable background waiter (the original
   `agent-automation-hooks.md` proposal). The Stop hook IS the
   waiter; recovering across a killed turn is just "user re-invokes".
@@ -702,4 +901,7 @@ Cleanup: `rm -rf /tmp/clank-hook-experiment`.
   codex marketplace.
 - Live status display in claude during long-polling (separate plan,
   if ever).
-- Multi-agent-per-tool support beyond the `--as <name>` override.
+- True multi-agent-per-tool-per-session (two claude instances in
+  one repo using different labels at the same time). The session
+  resolver supports it as designed — but neither agent fully
+  exposes nesting cleanly; defer the explicit support story.
