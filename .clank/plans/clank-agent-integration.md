@@ -19,9 +19,11 @@ without being prompted. Deliverables:
    when something doesn't fire.
 
 Plus the related smaller pieces: `clank init` adds the right
-gitignores and agent edit-permission rules; per-agent auto-mode
-lives in `.clank/agents/<name>/config.json`; session identity in
-`.clank/cache/sessions.json`.
+gitignores + claude edit-permission rules, and (when run inside
+an agent) interactively bootstraps that agent's identity;
+per-agent state — auto-mode, wfw_timeout, current session binding
+— lives in `.clank/agents/<name>/config.json`; repo-wide master
+designation in `.clank/config.json`.
 
 Supersedes the older stubs `agent-automation-hooks.md` and
 `codex-stop-hook-wfw-experiment.md`, which conflated several
@@ -201,11 +203,12 @@ the hook at read time.
   (`.clank/agents/_identity.json` mapping `{ "claude": "alice" }`).
   Cwd-scoped; one label per (tool, repo). Can't distinguish two
   claude sessions in the same repo.
-- **Option B — Session-keyed cache** at
-  `.clank/cache/sessions.json` mapping
-  `{ "<session_id>": { "label": "alice", "tool": "claude" } }`.
-  `/clank as alice` writes the entry keyed by THIS session; hook
-  reads same id from stdin. True per-session identity.
+- **Option B — Session bound in agent config** at
+  `.clank/agents/<label>/config.json` (gitignored), with a
+  `session: { id, tool, updated_at }` field. `/clank as alice`
+  writes alice's config with the current session; hook iterates
+  agent configs looking for a match. True per-session identity,
+  state lives next to the agent it identifies.
 - **Option B' — Transcript-as-cache**: parse `transcript_path` JSONL
   backwards for the most recent `clank as <name>` Bash invocation.
   No separate cache file; transcript IS the source of truth.
@@ -225,8 +228,10 @@ the hook at read time.
   the `session_id` field codex sends in hook stdin.
 
 `/clank as alice` (or `clank as alice` from the agent's Bash) reads
-the appropriate env var, writes `.clank/cache/sessions.json[<id>]
-= { label, tool }`. Hook reads same id from stdin, looks up.
+the appropriate env var, writes
+`.clank/agents/alice/config.json` with
+`session: { id: <env-id>, tool, updated_at: now }`. Hook reads the
+same id from stdin and iterates agent configs to find the match.
 
 **Bootstrap UX:**
 - Fresh install: no session entry yet → hook falls back to tool
@@ -253,42 +258,42 @@ at all. The env vars matter only for the session_id lookup, where
 they ARE reliable (set by the tool itself, per-process, no leakage
 risk from `CLAUDE_CODE_SESSION_ID` / `CODEX_THREAD_ID`).
 
-### D5. Role designation — per-agent flag vs. repo-level master
+### D5. Role designation — per-agent flag vs. repo-level config
 
 **Question.** How does the system know which agent is "the master"
 for a repo, and which are reviewers?
 
-- **Option A — Per-agent role field** (`role: "master"` in each
-  `.clank/agents/<n>/config.json`). Any agent can self-declare as
-  master by editing its own config. Two agents could declare
-  themselves master simultaneously; nothing prevents the conflict.
-- **Option B — Repo-level master file** (`.clank/master.json`
-  naming THE master agent label; everyone else is reviewer by
-  inference).
+- **Option A — Per-agent role field** in each
+  `.clank/agents/<n>/config.json`. Any agent can self-declare as
+  master; two agents could declare themselves master
+  simultaneously.
+- **Option B — Repo-level config file** (`.clank/config.json`
+  naming the master; everyone else is reviewer by inference).
 - **Option C — Both with reconciliation**.
 
 **Recommendation: B.** A repo has one master (by intent of the
 clank workflow); the model should reflect that. Single source of
-truth, no two-agents-both-master class of bug. Role inference is
-trivial: if my resolved label matches `master.json[agent]` → I'm
-master; otherwise I'm reviewer.
+truth, no two-agents-both-master class of bug.
 
-Schema:
+Schema (extensible — only the `master` field exists in v1):
 
 ```json
-// .clank/master.json
-{ "agent": "alice" }
+// .clank/config.json
+{
+  "master": "alice"
+}
 ```
 
 Optional file. If absent → no master designated yet; operations
-that need a master (like wfw with auto-inferred role) error with
-"no master set for this repo; run `clank auto on --role master`".
+that need a master (like wfw with auto-inferred role) default to
+`reviewers` for the calling agent. Explicit `--role master` or
+`clank auto on --role master` claims it.
 
 `clank auto on --role master` is the canonical setter — it writes
-both this agent's auto-mode AND updates master.json to name this
-agent. `clank auto on --role reviewers` removes the master
-designation IF this agent was the master (and writes auto-mode);
-otherwise it just writes auto-mode.
+both this agent's auto-mode AND updates config.json's `master`
+field to name this agent. `clank auto on --role reviewers` clears
+the `master` field IF this agent currently holds it (and writes
+auto-mode); otherwise it just writes auto-mode.
 
 **Consequence for per-agent config.** `role` no longer lives in
 `.clank/agents/<n>/config.json`. The schema shrinks to:
@@ -297,7 +302,7 @@ otherwise it just writes auto-mode.
 { "auto_mode": "hint", "wfw_timeout": null }
 ```
 
-Role comes from comparing label vs. `master.json`.
+Role comes from comparing label vs. `config.json.master`.
 
 ### D6. The `/clank` slash command — scope and shape
 
@@ -525,8 +530,8 @@ carve-outs:
 .clank/cache/
 ```
 
-For agent configs to actually be commit-able, the ROOT gitignore
-ALSO needs a carve-out for `agents/`. After this plan:
+After this plan, the ROOT gitignore needs additional carve-outs
+for `config.json` and `agents/`:
 
 ```text
 # <repo>/.gitignore (target)
@@ -534,26 +539,28 @@ ALSO needs a carve-out for `agents/`. After this plan:
 .clank/*
 !.clank/plans/
 !.clank/finished/
+!.clank/config.json
 !.clank/agents/
 
 /.claude/
 .clank/feedback/                    # legacy; gone after migration
 .clank/cache/
-.clank/agents/*/feedback/
-.clank/agents/*/cache/
+.clank/agents/*/config.json         # per-user, not committed
 ```
 
-And the managed `.clank/.gitignore` mirrors (so cloning into a fresh
-worktree without the root-gitignore update still ignores the right
-sub-paths):
+And the managed `.clank/.gitignore` mirrors (so cloning into a
+fresh worktree without the root-gitignore update still ignores
+the right sub-paths):
 
 ```text
 # .clank/.gitignore (managed by clank init)
 feedback/                           # legacy
 cache/
-agents/*/feedback/
-agents/*/cache/
+agents/*/config.json
 ```
+
+Note: `agents/*/feedback/` is NOT ignored — peer reviews are
+tracked (every contributor sees them).
 
 **`clank init` responsibilities:**
 - Write/update `.clank/.gitignore` to the body above (existing
@@ -563,7 +570,8 @@ agents/*/cache/
   user-owned and might have other rules). The `init.rs`
   `warn_if_globally_excluded` plumbing already does similar
   probing; extend it.
-- Per D5: **no `.clank/master.json`**.
+- Do not create `.clank/config.json` (it's optional; written by
+  `clank auto on --role master`).
 
 **Test** (extends the existing `init.rs` test suite): a
 `check-ignore`-based test verifying that for a freshly-initialized
@@ -634,14 +642,13 @@ are preserved.
 
 ```
 <repo>/.clank/
-├── .gitignore                       # updated: agents/*/feedback ignored
-├── master.json                      # { agent: "<label>" } — optional, TRACKED
+├── .gitignore                       # updated: cache + agents/*/config.json ignored
+├── config.json                      # { master: "<label>" } — TRACKED
 ├── agents/
 │   └── <agent>/
-│       ├── config.json              # auto-mode + timeout (TRACKED)
-│       └── feedback/                # gitignored
-├── cache/
-│   └── sessions.json                # session_id → {tool, label} (gitignored)
+│       ├── config.json              # auto-mode + session binding (GITIGNORED)
+│       └── feedback/                # TRACKED (peer reviews)
+├── cache/                           # gitignored entirely
 ├── plans/
 └── ... (existing)
 
@@ -657,32 +664,56 @@ are preserved.
 
 ### Per-agent config (`.clank/agents/<name>/config.json`)
 
+Per-user, per-machine settings for this agent in this repo.
+**Gitignored** (auto-mode preference and session_id are not
+repo-shared concerns):
+
 ```json
 {
-  "auto_mode": "hint",         // "off" | "hint" | "wait"
-  "wfw_timeout": null          // null = indefinite (default); else "30m" / "5m" / etc.
+  "auto_mode": "hint",              // "off" | "hint" | "wait"
+  "wfw_timeout": null,              // null = indefinite; else "30m" / "5m"
+  "session": {                      // null when not yet bound (fresh agent)
+    "id": "742f6a04-f174-409a-ab01-419a16c5f372",
+    "tool": "claude",               // "claude" | "codex"
+    "updated_at": "2026-05-23T16:24:47+10:00"
+  }
 }
 ```
 
-Note: no `role` field — role is derived from `.clank/master.json`
-(see D5 / next subsection).
+Notes:
+- No `role` field — role is derived from `.clank/config.json`.
+- `session` is the binding written by `clank as <label>` (or the
+  first run of `/clank as alice`). The hook resolver iterates
+  agent configs looking for one whose `session.id` matches the
+  hook stdin's `session_id`.
+- When `/clank as alice` runs in a new session, alice's config is
+  updated — old binding is overwritten. (One label, one active
+  session at a time; matches reality.)
 
-Schema lives in `clank_core` as a `serde` struct; one source of truth
-read by the stop-hook adapter, written by `clank auto`.
+Schema lives in `clank_core` as a `serde` struct; the CLI does
+the file I/O.
 
-### Repo master config (`.clank/master.json`)
+### Repo config (`.clank/config.json`)
+
+Repo-level settings. **Tracked** in git (this IS a repo-shared
+concern — every contributor needs to know who the master is).
 
 ```json
-{ "agent": "alice" }
+{
+  "master": "alice"
+}
 ```
 
-Optional. Names THE master agent label for this repo. Role
-inference: an agent's role is `master` iff its resolved label
-equals `master.json[agent]`; otherwise `reviewers`. If
-`master.json` is missing, no agent is master in this repo.
+Optional. Only field in v1 is `master` — the agent label
+designated as master for this repo. Role inference: an agent's
+role is `master` iff its resolved label equals `config.master`;
+otherwise `reviewers`. If `config.json` is missing or `master`
+is absent, no agent is master.
 
-Typed `RepoMaster` struct in `clank_core`; pure helper
-`role_for(label: &AgentLabel, master: Option<&RepoMaster>) -> Role`.
+Typed `RepoConfig` struct in `clank_core`; pure helper
+`role_for(label: &AgentLabel, config: Option<&RepoConfig>) -> Role`.
+Schema is extensible; future fields layer in via additional
+optional `serde` fields.
 
 **Timeouts — two layers.** Clank's `wfw_timeout` defaults to `null`
 meaning the clank-side wait is indefinite. But the agent's hook
@@ -698,9 +729,9 @@ don't need to touch the hook config.
 ### Identity resolver (shared by stop-hook, auto, `clank as`)
 
 **Crate split.** `clank_core` stays pure: it owns the types
-(`Tool`, `AgentLabel`, `AgentConfig`, `SessionsCache`,
+(`Tool`, `AgentLabel`, `AgentConfig`, `RepoConfig`, `Session`,
 `IdentityInputs`) and the pure resolver function. The CLI does
-all I/O — reads stdin, env, and `sessions.json`; constructs
+all I/O — reads stdin, env, and agent config files; constructs
 `IdentityInputs`; calls the resolver.
 
 Pure resolver in `clank_core`:
@@ -708,16 +739,17 @@ Pure resolver in `clank_core`:
 ```text
 fn resolve_agent_identity(inputs: &IdentityInputs) -> AgentLabel
   precedence:
-    1. inputs.explicit_label (from CLANK_AGENT env)         → return
-    2. inputs.session_id → sessions.entries.get(session_id)
-         if entry.tool == inputs.tool                       → return entry.label
-    3. tool-name default ("claude" or "codex")              → return
+    1. inputs.explicit_label (from CLANK_AGENT env)              → return
+    2. for each (label, agent_config) in inputs.agent_configs:
+         if agent_config.session.id == inputs.session_id
+            AND agent_config.session.tool == inputs.tool         → return label
+    3. tool-name default ("claude" or "codex")                   → return
 
 struct IdentityInputs {
   tool: Tool,
   explicit_label: Option<AgentLabel>,
   session_id: Option<SessionId>,
-  sessions: SessionsCache,
+  agent_configs: Vec<(AgentLabel, AgentConfig)>,
 }
 ```
 
@@ -730,30 +762,33 @@ build_identity_inputs(tool, hook_stdin: Option<HookInput>, repo) -> IdentityInpu
     if hook_stdin.is_some()  → hook_stdin.session_id
     else if tool == claude   → env CLAUDE_CODE_SESSION_ID
     else if tool == codex    → env CODEX_THREAD_ID
-  loads SessionsCache from <repo>/.clank/cache/sessions.json (or empty)
-  returns IdentityInputs { tool, explicit_label, session_id, sessions }
+  loads every .clank/agents/<label>/config.json into agent_configs
+  returns IdentityInputs { tool, explicit_label, session_id, agent_configs }
 ```
 
 Writer side (CLI):
 
 ```text
-clank as <label> --tool <tool>
-  1. read session_id from env (per --tool); error if missing
-  2. load <repo>/.clank/cache/sessions.json (or empty)
-  3. upsert: sessions[session_id] = { tool, label, updated_at: now }
-  4. prune entries where updated_at older than 7 days
-  5. write atomically (write to temp + rename)
+clank as <label>
+  1. read session_id from env (auto-detect tool from which env var
+     is set: CLAUDE_CODE_SESSION_ID → claude; CODEX_THREAD_ID →
+     codex; error if neither)
+  2. load .clank/agents/<label>/config.json (or default empty)
+  3. set config.session = { id: <session_id>, tool, updated_at: now }
+  4. write atomically (temp + rename)
+  5. if any OTHER agent's config holds this session id, clear that
+     agent's session field (one session can't be bound to two
+     labels simultaneously)
 ```
 
-`SessionsCache` is a typed serde struct in core; both reader
-(stop-hook, auto) and writer (`clank as`) share it. Unit tests
-in core pin resolver precedence + prune; integration tests in CLI
-pin the file round-trip.
+`AgentConfig` is a typed serde struct in core; both reader
+(stop-hook, auto, wfw) and writer (`clank as`) share it. Unit
+tests in core pin resolver precedence; integration tests in CLI
+pin the file round-trip and the "clear stale binding" rule.
 
 Why this split matters: core compiles to wasm unchanged (no
 filesystem, no env, no clock) and is testable without temp dirs.
-The CLI module is the only place that knows about session.json
-on disk.
+The CLI is the only place that knows about config files on disk.
 
 ### `clank stop-hook --tool <claude|codex>`
 
@@ -831,24 +866,26 @@ typed `AgentConfig`. Identity resolves via the shared resolver
 - `clank auto on` → `auto_mode: "hint"` (default); `--mode wait`
   overrides to `"wait"`.
 - `clank auto off` → `auto_mode: "off"`.
-- `--role master` → also updates `.clank/master.json` to
-  `{ "agent": "<resolved-label>" }`. Overwrites any prior master
-  designation (with a one-line "master changed from X to Y" note
-  on stderr).
-- `--role reviewers` → if `.clank/master.json[agent] ==
-  <resolved-label>`, remove `master.json` (this agent is no
-  longer master). If not, no-op for the master file. Either way,
-  auto-mode is still written.
-- `clank auto status [--json]` → prints current `AgentConfig` AND
-  inferred role (with reference to whether master.json names this
-  agent).
+- `--role master` → also updates `.clank/config.json`'s `master`
+  field to `<resolved-label>` (creating the file if absent).
+  Overwrites any prior master designation with a one-line
+  "master changed from X to Y" note on stderr.
+- `--role reviewers` → if `.clank/config.json.master ==
+  <resolved-label>`, clear it (this agent is no longer master).
+  If not, no-op for the repo config. Auto-mode is still written
+  either way.
+- `clank auto status [--json]` → prints current `AgentConfig`
+  AND inferred role (with reference to whether config.json names
+  this agent as master).
 
 ### `clank as <label>`
 
-Writes the session-keyed entry to `.clank/cache/sessions.json`
-(spec'd above). Reads `CLAUDE_CODE_SESSION_ID` /
-`CODEX_THREAD_ID` from env; auto-detects tool from which one is
-set (errors if neither — "run inside claude or codex").
+Writes the session binding into
+`.clank/agents/<label>/config.json` (spec'd above). Reads
+`CLAUDE_CODE_SESSION_ID` / `CODEX_THREAD_ID` from env;
+auto-detects tool from which one is set (errors if neither —
+"run inside claude or codex"). Clears stale `session` fields on
+other agents holding the same session id.
 
 ### `clank wfw` changes — `--author` becomes optional
 
@@ -867,12 +904,13 @@ After this plan:
 
 Similarly, `--role`:
 - `--role <role>` → still works, wins if passed.
-- `--role` omitted → read `.clank/master.json` and compare
-  resolved label against it. Master if equal, reviewers
-  otherwise. If `master.json` is missing and label doesn't match,
-  default to `reviewers` (so wfw works for a fresh repo's first
-  agent without a master designation; explicit `--role master`
-  or `clank auto on --role master` is the path to claim it).
+- `--role` omitted → read `.clank/config.json` and compare
+  resolved label against `config.master`. Master if equal,
+  reviewers otherwise. If `config.json` is missing or `master`
+  is unset, default to `reviewers` (so wfw works for a fresh
+  repo's first agent without a master designation; explicit
+  `--role master` or `clank auto on --role master` is the path
+  to claim it).
 
 This makes the hint-mode "you may run `clank wfw`" suggestion
 zero-friction: the agent literally just runs `clank wfw` —
@@ -896,13 +934,13 @@ Checks (in order):
 - For each agent in `.clank/agents/`:
   - `config.json` parses as a valid `AgentConfig`
   - auto_mode is `off` / `hint` / `wait`
-- `.clank/master.json` if present:
-  - parses as `{ agent: "<label>" }`
-  - the named agent's dir exists (WARN if not — master designated
-    for an agent that's never run; harmless but suspicious)
-- `.clank/cache/sessions.json` if present parses; report entries
-  older than 7d (cleanup happens next `clank` invocation; just
-  informational)
+- `.clank/config.json` if present:
+  - parses as a valid `RepoConfig`
+  - the agent named in `master` has a dir under `.clank/agents/`
+    (WARN if not — master designated for an agent that's never
+    run locally; harmless but suspicious)
+- (No separate session cache — session bindings live in each
+  agent's `config.json`.)
 - `.claude/settings.local.json` has the `Edit`/`Write`/`Read`
   permission rules for `.clank/agents/**` (WARN if missing —
   user will get prompted on every feedback write)
@@ -929,12 +967,12 @@ Checks (in order):
 - Identity resolves: tool default, session-cache lookup, or
   `CLANK_AGENT` env override — print which one fired and what
   label it produced
-- Role for that label (compare against `.clank/master.json`):
+- Role for that label (compare against `.clank/config.json.master`):
   "master" or "reviewers"
-- If session has an entry in `sessions.json`, print the bound
-  label and `updated_at`; if not, note "no `/clank as` set yet
-  for this session (falls back to default `<tool>`)" — OK, not
-  WARN
+- If any agent's `config.json.session` matches this session id,
+  print which agent + when it was bound; if not, note "no
+  `/clank as` set yet for this session (falls back to default
+  `<tool>`)" — OK, not WARN
 
 Implementation: each check is a small typed function returning
 `CheckResult { status: Ok | Warn | Fail, message: String }`.
@@ -961,10 +999,38 @@ Prints what got changed and what was left alone.
 
 ### `clank init` changes
 
-Per D10 (full spec there): update `.clank/.gitignore` to cover
-`agents/*/feedback/` and `agents/*/cache/`; warn (don't auto-edit)
-if the ROOT gitignore lacks the `!.clank/agents/` carve-out;
-no `.clank/master.json`.
+`clank init` is now a two-phase command:
+
+**Phase 1 — scaffolding (always runs, non-interactive):**
+- Update `.clank/.gitignore` to cover `cache/` and
+  `agents/*/config.json`.
+- Warn if the ROOT gitignore lacks `!.clank/config.json` and
+  `!.clank/agents/` carve-outs.
+- Write `.claude/settings.local.json` with the agent edit-
+  permission rules (per D10).
+
+**Phase 2 — agent identity bootstrap (only if running inside an
+agent):** Detect tool from env (`CLAUDECODE` / `CODEX_THREAD_ID`).
+If detected:
+- Read session id from env (`CLAUDE_CODE_SESSION_ID` /
+  `CODEX_THREAD_ID`).
+- Prompt: `Agent name [<tool>]: ` — accept default if user hits
+  enter.
+- Prompt: `Make this agent the master for this repo? [y/N] ` —
+  read y/n.
+- Write `.clank/agents/<name>/config.json` with the session
+  binding (and `auto_mode: "off"` default — user enables later
+  via `clank auto on`).
+- If master: write `.clank/config.json` with `master: <name>`.
+- Print summary of what was written.
+
+If NOT running inside an agent (env vars absent), skip phase 2
+with a message: "Not running inside an agent — agent identity
+will be bootstrapped on first `clank auto on` from inside
+claude/codex."
+
+Non-interactive flag: `clank init --yes` accepts defaults
+without prompting (useful for scripts).
 
 ### Skill content (both tools, same text)
 
@@ -1044,10 +1110,11 @@ Cleanup: `rm -rf /tmp/clank-hook-experiment`.
 - `clank auto on` writes `.clank/agents/<resolved-label>/config.json`
   with `auto_mode: "hint"` by default (`--mode wait` to opt into
   blocking). Resolution goes through the shared identity resolver.
-- `clank as alice` writes the session entry to
-  `.clank/cache/sessions.json` keyed by env-resolved session_id.
-  Test verifies the entry round-trips and is found by the resolver
-  when given the same session_id via mock hook input.
+- `clank as alice` writes alice's `.clank/agents/alice/config.json`
+  with a `session` field keyed by the env-resolved session_id;
+  if any other agent's config held the same session id, that
+  stale binding is cleared. Test verifies round-trip + lookup +
+  staleness cleanup.
 - After setup + `clank auto on` in hint mode: a claude session
   that finishes a turn invokes the stop hook; if work is pending
   for this agent the hook continues claude (exit 2 + stderr); if
