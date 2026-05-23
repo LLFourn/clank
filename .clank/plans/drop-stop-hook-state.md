@@ -41,14 +41,19 @@ a guard if it becomes a real problem.
 
 ## Tests
 
-No new tests. The existing hint/wait continuation tests already
-verify that the hook issues continuations correctly. The removed
-`stop_hook_active_short_circuits_silent` test was encoding the
-old bug; it should NOT be restored.
+Replace the removed `progress_guard_*` tests with one focused
+regression test:
 
-Verify that `stop_hook_active=true` + hint mode with work pending
-now fires a continuation (this is the whole point — the old guard
-would have returned Silent).
+- **`stop_hook_active_still_fires_continuation`**: hint mode +
+  reviewable work pending + `stop_hook_active=true` → claude
+  continuation (exit 2 + stderr with `clank feedback write`).
+  This is the exact scenario the old binary guard made Silent;
+  keeping it as a regression test ensures nobody re-adds the
+  short-circuit.
+
+The existing continuation tests
+(`hint_with_reviewable_work_emits_claude_continuation` etc.)
+exercise `stop_hook_active=false` and stay unchanged.
 
 ## Acceptance criteria
 
