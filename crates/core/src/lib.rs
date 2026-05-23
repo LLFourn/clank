@@ -39,6 +39,9 @@
 //! - [`identity`] — pure `resolve_agent_identity` function +
 //!   `IdentityInputs` / `ResolveError` types. The single
 //!   "who am I" resolver shared by stop-hook, auto, wfw, doctor.
+//! - [`hook_io`] — typed Stop-hook stdin (`HookInput`) and the
+//!   adapter's decision (`HookOutcome`); plus the codex
+//!   `{decision:"block",reason:...}` wire shape.
 //!
 //! Every type derives both `Serialize` and `Deserialize` so
 //! producers and consumers round-trip through identical
@@ -48,6 +51,7 @@ pub mod agent_config;
 pub mod api;
 pub mod feedback_body;
 pub mod feedback_view;
+pub mod hook_io;
 pub mod identity;
 pub mod ids;
 pub mod model;
@@ -70,4 +74,7 @@ pub use ids::{
 };
 
 pub use agent_config::{AgentConfig, RepoConfig, Session, role_for};
+pub use hook_io::{
+    CLAUDE_CONTINUATION_EXIT, CodexBlockDecision, HOOK_OK_EXIT, HookInput, HookOutcome,
+};
 pub use identity::{IdentityInputs, ResolveError, resolve_agent_identity};
