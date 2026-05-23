@@ -30,7 +30,8 @@ use crate::lifecycle::{AgentLabel, CommitSha, PlanKey};
 use crate::repo_state::RepoState;
 use crate::worktree_facts::read_worktree_facts;
 use clank_core::plan_view::{PlanView, project};
-use clank_core::wait::{Role, StartupSnapshot, WaitItem, derive_work, detect_finished};
+use clank_core::Role;
+use clank_core::wait::{StartupSnapshot, WaitItem, derive_work, detect_finished};
 
 /// Exit code returned when `--timeout` elapses without producing
 /// any work. The rest of the CLI uses anyhow for normal errors;

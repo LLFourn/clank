@@ -22,14 +22,7 @@ use serde::{Deserialize, Serialize};
 use crate::ids::{AgentLabel, CommitSha, PlanKey};
 use crate::plan_view::{PlanView, WaitingOn};
 use crate::repo_state::RepoState;
-use crate::vocab::WaitingReason;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum Role {
-    Master,
-    Reviewers,
-}
+use crate::vocab::{Role, WaitingReason};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
