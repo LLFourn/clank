@@ -106,27 +106,70 @@ if input.stop_hook_active {
 }
 ```
 
-with:
+with progress-aware logic, **fail-closed on any IO error** for
+continuation fires. Codex has no native block-cap, so the guard is
+the only thing preventing runaway loops — any uncertainty about
+whether we can durably track progress must resolve to
+"don't issue a continuation."
+
+Decision table:
+
+| `stop_hook_active` | state read | `last_assistant_message` | state write | Outcome |
+| --- | --- | --- | --- | --- |
+| `false` | (skipped) | any | OK | proceed to normal outcome compute |
+| `false` | (skipped) | any | IO error | **Diagnostic** (no continuation) |
+| `true` | OK + hash matches | same / empty | (skipped) | **Silent** (real spin) |
+| `true` | OK + hash differs | new content | OK | proceed to normal outcome compute |
+| `true` | OK + hash differs | new content | IO error | **Diagnostic** |
+| `true` | NotFound | any | (skipped) | **Diagnostic** (anomaly: mid-chain with no prior state — first fire's write must have failed silently, or state was deleted; can't reason about progress) |
+| `true` | IO error (perms, etc.) | any | (skipped) | **Diagnostic** |
+| any | any | `None` (field absent on stdin) | (skipped) | **Diagnostic** (defensive: can't compute progress signal) |
+
+`Diagnostic` is the right outcome for these failure modes — it exits
+0 with a stderr message and **no continuation prompt**, which is
+exactly the "fail closed" behavior we want. The existing comment in
+`hook_io.rs:71-75` already describes Diagnostic as the "internal
+problem" path that exits cleanly without breaking the agent. The
+plan's earlier draft (revision 1) claimed Diagnostic would "log but
+still fire" — that was wrong; Diagnostic and Continue are mutually
+exclusive outcomes.
+
+Sketch:
 
 ```rust
-if input.stop_hook_active && !agent_made_progress(&repo, &label, &input)? {
-    return HookOutcome::Silent;
+if input.last_assistant_message.is_none() {
+    return HookOutcome::Diagnostic {
+        message: "hook: missing last_assistant_message; cannot reason about progress".into(),
+    };
 }
-record_progress(&repo, &label, &input)?;
+let new_hash = sha256(input.last_assistant_message.as_deref().unwrap_or(""));
+
+if input.stop_hook_active {
+    match read_state(&repo, &label, &input.session_id) {
+        Ok(Some(prev)) if prev.last_assistant_message_hash == new_hash => {
+            return HookOutcome::Silent; // real spin
+        }
+        Ok(Some(_)) => { /* progressed; fall through to write + fire */ }
+        Ok(None) | Err(_) => {
+            return HookOutcome::Diagnostic {
+                message: "hook: progress state unreadable mid-chain; refusing to continue".into(),
+            };
+        }
+    }
+}
+
+if let Err(e) = write_state(&repo, &label, &input.session_id, &StopHookState { ... }) {
+    return HookOutcome::Diagnostic {
+        message: format!("hook: state write failed ({e}); refusing to continue"),
+    };
+}
+
+// fall through to the existing auto_mode dispatch
 ```
 
-`agent_made_progress` reads the per-session state file (if any),
-hashes `input.last_assistant_message`, compares, returns bool. Treat a
-missing or unreadable state file as "no prior progress recorded" →
-returns true (fire normally) since we can't distinguish "first fire"
-from "spin." A `None`/empty `last_assistant_message` always means "no
-progress" → returns false → Silent. That's the defensive fallback if
-the hook stdin lacks the field.
-
-`record_progress` writes the new hash + timestamp. Errors from this
-write must not fail the hook — log to stderr (`Diagnostic`) but still
-fire. The hook NEVER fails the agent (per the existing comment at
-`stop_hook.rs:11-14`).
+The state write happens **before** the auto_mode dispatch so a write
+failure aborts the continuation regardless of whether hint or wait
+mode would otherwise have produced one.
 
 ### State file I/O
 
@@ -179,17 +222,22 @@ Update the inline comment at the old short-circuit site in
 Stop-hook tests already exist there for the per-tool wire shapes.
 Extend with progress-guard scenarios:
 
-1. **First fire (`stop_hook_active=false`)** → fires normally,
-   persists state file.
-2. **Second fire, new `last_assistant_message`** → fires normally,
-   state file updated.
+1. **First fire (`stop_hook_active=false`)** → state persisted,
+   normal outcome.
+2. **Second fire, new `last_assistant_message`** → state updated,
+   normal outcome.
 3. **Second fire, same `last_assistant_message`** → Silent, state
-   file unchanged.
-4. **Second fire, missing/empty `last_assistant_message`** → Silent
-   (defensive).
-5. **Second fire, prior state file unreadable** (delete or corrupt
-   it) → fires normally (treat unreadable as "no prior progress").
-6. **Multiple sessions same label** → independent state files; one
+   unchanged.
+4. **Fire with `last_assistant_message=None`** → Diagnostic, no
+   continuation (defensive).
+5. **Second fire, prior state file unreadable** (chmod 000 or
+   corrupt JSON) → Diagnostic, no continuation. Locks in the
+   fail-closed contract.
+6. **Second fire, state directory unwritable** (chmod 555 the
+   parent) → Diagnostic, no continuation.
+7. **Second fire, state file missing while `stop_hook_active=true`**
+   (delete it between fires) → Diagnostic, no continuation.
+8. **Multiple sessions same label** → independent state files; one
    session's progress doesn't satisfy another's chain.
 
 The existing per-tool wire-shape tests (claude exit 2, codex
@@ -211,8 +259,12 @@ discriminator runs before outcome rendering.
   short-circuits to Silent on the second fire — protecting codex
   (which has no native cap) and reducing the rate of claude's
   force-stop trigger.
-- State-file write failures degrade gracefully (Diagnostic message,
-  hook still fires) — they never break the agent.
+- State-file IO failures (read error mid-chain, write error,
+  unreadable corrupt file, missing field on stdin) **fail closed**:
+  the hook returns `Diagnostic` (exit 0, stderr message, no
+  continuation). The agent stops cleanly; the user sees the
+  stderr line. The hook never issues a continuation it can't
+  durably track.
 
 ## Out of scope
 
