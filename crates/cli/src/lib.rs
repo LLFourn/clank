@@ -15,7 +15,6 @@ pub mod git_io;
 pub mod preview;
 pub mod runtime;
 pub mod state_cache;
-pub mod stop_hook_state;
 pub mod worktree_facts;
 
 // Operator CLI subcommands. Local-only mutations.

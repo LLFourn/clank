@@ -46,14 +46,9 @@ pub struct HookInput {
     #[serde(default)]
     pub transcript_path: Option<String>,
     /// True iff this hook invocation is itself a continuation of a
-    /// previous Stop-hook decision (we're inside the chain of stops
-    /// between two user prompts). It does NOT mean "the agent did
-    /// nothing"; tool calls between hook fires reset claude's own
-    /// 8-block force-stop counter implicitly. The adapter
-    /// discriminates real spin (same `last_assistant_message` as
-    /// the previous fire) from productive next-iteration (new
-    /// content) — see `stop_hook_state` and the progress guard in
-    /// `cli::stop_hook`.
+    /// previous Stop-hook decision. The adapter does not act on
+    /// this — claude's own 8-block cap (which resets on tool use
+    /// between fires) is the safety net for runaway loops.
     pub stop_hook_active: bool,
     #[serde(default)]
     pub last_assistant_message: Option<String>,

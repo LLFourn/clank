@@ -21,8 +21,6 @@ use super::{StopHookArgs, resolve_repo};
 use crate::agent_env::resolve_identity_for_hook;
 use crate::agent_store::load_agent_config;
 use crate::lifecycle::AgentLabel;
-use crate::stop_hook_state::{StopHookState, hash_progress, read_state, write_state};
-use clank_core::ids::SessionId;
 use clank_core::{
     AutoMode, CLAUDE_CONTINUATION_EXIT, CodexBlockDecision, HOOK_OK_EXIT, HookInput, HookOutcome,
     Role, Tool, role_for,
@@ -73,92 +71,11 @@ async fn compute_outcome(tool: Tool, repo_override: Option<&Path>) -> HookOutcom
 
     match cfg.auto_mode {
         AutoMode::Off => HookOutcome::Silent,
-        AutoMode::Hint | AutoMode::Wait => {
-            match progress_guard(&repo, &label, &input.session_id, &input) {
-                ProgressGuard::Spin => return HookOutcome::Silent,
-                ProgressGuard::Diagnostic(message) => {
-                    return HookOutcome::Diagnostic { message };
-                }
-                ProgressGuard::Proceed => {}
-            }
-            match cfg.auto_mode {
-                AutoMode::Hint => compute_hint_outcome(&repo, &label, role).await,
-                AutoMode::Wait => {
-                    compute_wait_outcome(&repo, &label, role, cfg.wfw_timeout.as_deref()).await
-                }
-                AutoMode::Off => unreachable!("outer match guarded Off"),
-            }
+        AutoMode::Hint => compute_hint_outcome(&repo, &label, role).await,
+        AutoMode::Wait => {
+            compute_wait_outcome(&repo, &label, role, cfg.wfw_timeout.as_deref()).await
         }
     }
-}
-
-/// Result of the progress guard. Three-way so the caller stays
-/// linear instead of nesting Result<Option<_>, _>.
-enum ProgressGuard {
-    /// Agent made real progress (or this is a fresh chain). State
-    /// persisted; safe to proceed to outcome compute.
-    Proceed,
-    /// `stop_hook_active=true` and `last_assistant_message` hashes
-    /// to the same value as the previous fire — real spin.
-    Spin,
-    /// Any failure that means we can't durably reason about progress:
-    /// missing/empty/whitespace assistant message, state read error,
-    /// state write error, NotFound mid-chain. Fail closed — no
-    /// continuation — because codex has no native block-cap and a
-    /// silent persistence failure would loop forever.
-    Diagnostic(String),
-}
-
-fn progress_guard(
-    repo: &Path,
-    label: &AgentLabel,
-    session: &SessionId,
-    input: &HookInput,
-) -> ProgressGuard {
-    let progress = input
-        .last_assistant_message
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty());
-    let Some(progress) = progress else {
-        return ProgressGuard::Diagnostic(
-            "hook: no assistant-message progress signal; refusing to continue".into(),
-        );
-    };
-    let new_hash = hash_progress(progress);
-
-    if input.stop_hook_active {
-        match read_state(repo, label, session) {
-            Ok(Some(prev)) if prev.last_assistant_message_hash == new_hash => {
-                return ProgressGuard::Spin;
-            }
-            Ok(Some(_)) => { /* progressed; fall through to write */ }
-            Ok(None) => {
-                return ProgressGuard::Diagnostic(
-                    "hook: progress state missing mid-chain; refusing to continue".into(),
-                );
-            }
-            Err(e) => {
-                return ProgressGuard::Diagnostic(format!(
-                    "hook: progress state unreadable ({e}); refusing to continue"
-                ));
-            }
-        }
-    }
-
-    let now = time::OffsetDateTime::now_utc()
-        .format(&time::format_description::well_known::Rfc3339)
-        .unwrap_or_else(|_| String::new());
-    let state = StopHookState {
-        last_assistant_message_hash: new_hash,
-        fired_at: now,
-    };
-    if let Err(e) = write_state(repo, label, session, &state) {
-        return ProgressGuard::Diagnostic(format!(
-            "hook: progress state write failed ({e}); refusing to continue"
-        ));
-    }
-    ProgressGuard::Proceed
 }
 
 /// Hint mode (per plan, three branches):

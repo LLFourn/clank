@@ -113,37 +113,22 @@ fn run_stop_hook(
 }
 
 fn claude_stdin(session: &str, repo: &Path, stop_hook_active: bool) -> String {
-    claude_stdin_with_progress(session, repo, stop_hook_active, Some("agent did stuff"))
-}
-
-/// Build claude hook stdin JSON with an optional `last_assistant_message`.
-/// Hint/wait-mode paths require this field (the progress guard); off
-/// and no-config paths don't, so tests for those modes can pass `None`.
-fn claude_stdin_with_progress(
-    session: &str,
-    repo: &Path,
-    stop_hook_active: bool,
-    last_assistant_message: Option<&str>,
-) -> String {
-    let msg = match last_assistant_message {
-        Some(s) => serde_json::to_string(s).expect("encode message"),
-        None => "null".to_string(),
-    };
     format!(
         r#"{{
             "session_id": "{session}",
             "cwd": "{cwd}",
-            "stop_hook_active": {stop_hook_active},
-            "last_assistant_message": {msg}
+            "stop_hook_active": {stop_hook_active}
         }}"#,
         cwd = repo.display(),
     )
 }
 
-/// Set up a repo with a reviewable commit alice needs to act on, so
-/// hint mode would emit a claude continuation if the progress guard
-/// permits it. Returns the repo's temp dir.
-fn repo_with_reviewable_work_for_alice() -> tempfile::TempDir {
+#[test]
+fn stop_hook_active_still_fires_continuation() {
+    // Regression: the old adapter short-circuited to Silent on
+    // `stop_hook_active=true`. The whole point of removing the guard
+    // is that `stop_hook_active` is now ignored — hint/wait fire
+    // regardless of chain position. This test locks that in.
     let dir = init_repo();
     let repo = dir.path();
     std::fs::create_dir_all(repo.join(".clank/plans")).unwrap();
@@ -152,193 +137,23 @@ fn repo_with_reviewable_work_for_alice() -> tempfile::TempDir {
     git(repo, &["commit", "--quiet", "-m", "[foo] intro"]);
     bind_alice(repo);
     turn_auto_on(repo, "hint");
-    dir
-}
 
-#[test]
-fn progress_guard_spin_same_message_is_silent() {
-    // First fire (fresh chain) → state persisted, hint returns
-    // claude continuation. Second fire with `stop_hook_active=true`
-    // and the SAME `last_assistant_message` is a real spin → Silent.
-    let dir = repo_with_reviewable_work_for_alice();
-    let repo = dir.path();
-
-    let fire1 =
-        claude_stdin_with_progress(CLAUDE_SESSION, repo, false, Some("agent said something"));
-    let (code1, _, stderr1) = run_stop_hook(repo, "claude", &fire1, &[]);
-    assert_eq!(code1, Some(2), "fire1 should continue; stderr={stderr1}");
-
-    let fire2 =
-        claude_stdin_with_progress(CLAUDE_SESSION, repo, true, Some("agent said something"));
-    let (code2, stdout2, stderr2) = run_stop_hook(repo, "claude", &fire2, &[]);
-    assert_eq!(code2, Some(0), "fire2 should be silent; stderr={stderr2}");
-    assert!(stdout2.is_empty(), "stdout2={stdout2}");
-    assert!(stderr2.is_empty(), "stderr2={stderr2}");
-}
-
-#[test]
-fn progress_guard_progress_new_message_continues() {
-    // First fire writes state for "msg one". Second fire with
-    // `stop_hook_active=true` and a different message means the
-    // agent did real work between fires → continuation again.
-    let dir = repo_with_reviewable_work_for_alice();
-    let repo = dir.path();
-
-    let fire1 = claude_stdin_with_progress(CLAUDE_SESSION, repo, false, Some("msg one"));
-    let (code1, _, stderr1) = run_stop_hook(repo, "claude", &fire1, &[]);
-    assert_eq!(code1, Some(2), "fire1 should continue; stderr={stderr1}");
-
-    let fire2 = claude_stdin_with_progress(CLAUDE_SESSION, repo, true, Some("msg two"));
-    let (code2, stdout2, stderr2) = run_stop_hook(repo, "claude", &fire2, &[]);
+    let stdin = claude_stdin(CLAUDE_SESSION, repo, true);
+    let (code, stdout, stderr) = run_stop_hook(repo, "claude", &stdin, &[]);
     assert_eq!(
-        code2,
+        code,
         Some(2),
-        "fire2 should continue (new content); stderr={stderr2}"
+        "expected claude continuation even with stop_hook_active=true; stderr={stderr}"
     );
-    assert!(
-        stdout2.is_empty(),
-        "claude continuation is on stderr: {stdout2}"
-    );
-    assert!(
-        stderr2.contains("clank feedback write"),
-        "expected reviewer continuation prompt; got {stderr2}"
-    );
-}
-
-#[test]
-fn progress_guard_missing_message_diagnostic() {
-    // No last_assistant_message field at all → can't compute
-    // progress → Diagnostic (no continuation).
-    let dir = repo_with_reviewable_work_for_alice();
-    let repo = dir.path();
-
-    let stdin = claude_stdin_with_progress(CLAUDE_SESSION, repo, false, None);
-    let (code, stdout, stderr) = run_stop_hook(repo, "claude", &stdin, &[]);
-    assert_eq!(code, Some(0), "Diagnostic exits 0; stderr={stderr}");
-    assert!(stdout.is_empty(), "stdout={stdout}");
-    assert!(
-        stderr.contains("no assistant-message progress signal"),
-        "expected progress-signal diag; got {stderr}"
-    );
-}
-
-#[test]
-fn progress_guard_empty_message_diagnostic() {
-    // Some("") is not progress — even if it would hash to a value
-    // that differs from the prior fire's stored hash.
-    let dir = repo_with_reviewable_work_for_alice();
-    let repo = dir.path();
-
-    let stdin = claude_stdin_with_progress(CLAUDE_SESSION, repo, false, Some(""));
-    let (code, _, stderr) = run_stop_hook(repo, "claude", &stdin, &[]);
-    assert_eq!(code, Some(0), "Diagnostic exits 0; stderr={stderr}");
-    assert!(
-        stderr.contains("no assistant-message progress signal"),
-        "expected progress-signal diag; got {stderr}"
-    );
-}
-
-#[test]
-fn progress_guard_whitespace_message_diagnostic() {
-    let dir = repo_with_reviewable_work_for_alice();
-    let repo = dir.path();
-
-    let stdin = claude_stdin_with_progress(CLAUDE_SESSION, repo, false, Some("   \n  "));
-    let (code, _, stderr) = run_stop_hook(repo, "claude", &stdin, &[]);
-    assert_eq!(code, Some(0), "Diagnostic exits 0; stderr={stderr}");
-    assert!(
-        stderr.contains("no assistant-message progress signal"),
-        "expected progress-signal diag; got {stderr}"
-    );
-}
-
-#[test]
-fn progress_guard_missing_state_midchain_diagnostic() {
-    // `stop_hook_active=true` on a chain where we have no prior
-    // state file is an anomaly (first fire's write must have failed
-    // silently, or state was deleted). Fail closed.
-    let dir = repo_with_reviewable_work_for_alice();
-    let repo = dir.path();
-
-    let stdin = claude_stdin_with_progress(CLAUDE_SESSION, repo, true, Some("mid-chain orphan"));
-    let (code, _, stderr) = run_stop_hook(repo, "claude", &stdin, &[]);
-    assert_eq!(code, Some(0));
-    assert!(
-        stderr.contains("progress state missing mid-chain"),
-        "expected missing-state diag; got {stderr}"
-    );
-}
-
-#[test]
-fn progress_guard_write_failure_diagnostic() {
-    // Force write_state to fail by planting a regular file where the
-    // stop-hook-state directory would live. create_dir_all then
-    // refuses to overwrite the file with a directory, so the write
-    // path returns IO error → Diagnostic, no continuation.
-    let dir = repo_with_reviewable_work_for_alice();
-    let repo = dir.path();
-
-    let agent_dir = repo.join(".clank/agents/alice");
-    std::fs::create_dir_all(&agent_dir).unwrap();
-    std::fs::write(agent_dir.join("stop-hook-state"), b"this is a file, not a dir").unwrap();
-
-    let stdin = claude_stdin_with_progress(CLAUDE_SESSION, repo, false, Some("hello"));
-    let (code, stdout, stderr) = run_stop_hook(repo, "claude", &stdin, &[]);
-    assert_eq!(code, Some(0), "Diagnostic exits 0; stderr={stderr}");
     assert!(
         stdout.is_empty(),
-        "no continuation on write failure: {stdout}"
+        "claude continuation goes to stderr: {stdout}"
     );
     assert!(
-        stderr.contains("progress state write failed"),
-        "expected write-failure diag; got {stderr}"
+        stderr.contains("clank feedback write"),
+        "expected reviewer continuation prompt; got {stderr}"
     );
 }
-
-#[test]
-fn progress_guard_corrupt_state_diagnostic() {
-    let dir = repo_with_reviewable_work_for_alice();
-    let repo = dir.path();
-
-    let state_path = repo
-        .join(".clank/agents/alice/stop-hook-state")
-        .join(format!("{CLAUDE_SESSION}.json"));
-    std::fs::create_dir_all(state_path.parent().unwrap()).unwrap();
-    std::fs::write(&state_path, b"not json").unwrap();
-
-    let stdin = claude_stdin_with_progress(CLAUDE_SESSION, repo, true, Some("after corruption"));
-    let (code, _, stderr) = run_stop_hook(repo, "claude", &stdin, &[]);
-    assert_eq!(code, Some(0));
-    assert!(
-        stderr.contains("progress state unreadable"),
-        "expected unreadable-state diag; got {stderr}"
-    );
-}
-
-#[test]
-fn progress_guard_off_mode_no_progress_signal_still_silent() {
-    // auto_mode=off must NOT require the progress signal — the
-    // guard moves inside the hint/wait arms. Regression for
-    // codex's review point that the guard shouldn't leak into
-    // non-continuation paths.
-    let dir = init_repo();
-    let repo = dir.path();
-    bind_alice(repo);
-    // Don't turn auto on — alice's config has auto_mode=off by default.
-
-    let stdin = claude_stdin_with_progress(CLAUDE_SESSION, repo, true, None);
-    let (code, stdout, stderr) = run_stop_hook(repo, "claude", &stdin, &[]);
-    assert_eq!(code, Some(0), "off should be silent; stderr={stderr}");
-    assert!(stdout.is_empty(), "stdout={stdout}");
-    assert!(stderr.is_empty(), "stderr={stderr}");
-}
-
-// Per-session isolation of the state file path is verified by the
-// `stop_hook_state::tests::round_trip` unit test, which constructs
-// paths from `(repo, label, session)` and confirms the session id
-// participates in the filename. An integration test for cross-
-// session isolation would require multiple agent bindings in one
-// repo and add more setup than signal.
 
 #[test]
 fn auto_off_exits_silent() {
@@ -527,8 +342,7 @@ fn hint_with_reviewable_work_emits_codex_continuation() {
         r#"{{
             "session_id": "{CODEX_SESSION}",
             "cwd": "{cwd}",
-            "stop_hook_active": false,
-            "last_assistant_message": "agent did stuff"
+            "stop_hook_active": false
         }}"#,
         cwd = repo.display(),
     );
