@@ -4,9 +4,13 @@
 //! goes through here.
 
 use std::env;
+use std::path::Path;
 
 use clank_core::ids::{AgentLabel, SessionId};
 use clank_core::vocab::Tool;
+use clank_core::{IdentityInputs, ResolveError, resolve_agent_identity};
+
+use crate::agent_store::load_all_agent_configs_lossy;
 
 const ENV_CLAUDE_SESSION: &str = "CLAUDE_CODE_SESSION_ID";
 const ENV_CODEX_SESSION: &str = "CODEX_THREAD_ID";
@@ -114,3 +118,48 @@ impl std::fmt::Display for EnvError {
 }
 
 impl std::error::Error for EnvError {}
+
+/// High-level wrapper: read env, load this repo's agent configs,
+/// and call the pure `resolve_agent_identity`. The single way
+/// any non-hook CLI command finds out "who am I" — used by
+/// `clank auto`, `clank wfw`, `clank feedback write` (later),
+/// and `clank doctor`.
+///
+/// Stop-hook callers go through a different path because they
+/// receive `session_id` via stdin and `tool` via `--tool`, not
+/// from env — see `cli::stop_hook` (later commit).
+pub fn resolve_identity_from_env(repo: &Path) -> anyhow::Result<AgentLabel> {
+    let explicit = explicit_label_from_env()?;
+    let detected = detect_session_from_env()?;
+    let agent_configs = load_all_agent_configs_lossy(repo)?;
+    let (tool, session_id_owned) = match detected {
+        Some((t, sid)) => (t, Some(sid)),
+        None => {
+            // No session detected. The resolver will still
+            // succeed if explicit_label is set; otherwise it
+            // returns NoSession. Default tool to Claude — it
+            // doesn't matter since the lookup path won't run
+            // without a session id.
+            (Tool::Claude, None)
+        }
+    };
+    let inputs = IdentityInputs {
+        tool,
+        explicit_label: explicit,
+        session_id: session_id_owned.as_ref(),
+        agent_configs: &agent_configs,
+    };
+    resolve_agent_identity(&inputs).map_err(|e| match e {
+        ResolveError::NoSession => anyhow::anyhow!(
+            "no session detected — pass --author <label>, set CLANK_AGENT, \
+             or run inside claude/codex"
+        ),
+        ResolveError::NoAgentForSession { session_id, tool } => anyhow::anyhow!(
+            "no agent is bound to {tool} session {sid} in this repo — run \
+             `clank as <label>` first (inside this session) or `clank init` \
+             to bootstrap",
+            tool = tool.as_str(),
+            sid = session_id.as_str(),
+        ),
+    })
+}

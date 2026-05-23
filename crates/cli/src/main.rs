@@ -32,6 +32,9 @@ enum Command {
     /// Bind the calling agent's session (CLAUDE_CODE_SESSION_ID
     /// / CODEX_THREAD_ID env var) to a clank label.
     As(cli::AsArgs),
+    /// Manage this agent's auto-mode (Stop-hook behavior) and
+    /// optional role designation.
+    Auto(cli::AutoArgs),
 }
 
 #[tokio::main]
@@ -46,6 +49,7 @@ async fn main() -> anyhow::Result<()> {
         Command::Wfw(args) => cli::wfw::run(args).await,
         Command::Feedback(args) => cli::feedback::run(args).await,
         Command::As(args) => cli::as_cmd::run(args).await,
+        Command::Auto(args) => cli::auto::run(args).await,
     };
     if let Err(e) = result {
         let code = exit_code_for(&e);

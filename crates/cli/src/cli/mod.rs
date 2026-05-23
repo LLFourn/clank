@@ -10,6 +10,7 @@ use clap::Args;
 use std::path::{Path, PathBuf};
 
 pub mod as_cmd;
+pub mod auto;
 pub mod config;
 pub mod feedback;
 pub mod finish;
@@ -248,6 +249,79 @@ pub struct AsArgs {
     /// to `clank wfw` / `clank auto` / the stop-hook resolve to
     /// this label for the duration of this agent session.
     pub label: String,
+}
+
+#[derive(Args, Debug)]
+pub struct AutoArgs {
+    #[command(subcommand)]
+    pub command: AutoCmd,
+}
+
+#[derive(clap::Subcommand, Debug)]
+pub enum AutoCmd {
+    /// Enable auto-mode (hint by default; opt into blocking
+    /// long-poll with `--mode wait`). Optionally update role.
+    On(AutoOnArgs),
+    /// Disable auto-mode. Optionally update role.
+    Off(AutoOffArgs),
+    /// Print current auto-mode + role for the calling agent.
+    Status(AutoStatusArgs),
+}
+
+#[derive(Args, Debug)]
+pub struct AutoOnArgs {
+    #[arg(long, value_name = "PATH")]
+    pub repo: Option<PathBuf>,
+    /// Auto-mode flavor. `hint` (default) does a cheap status
+    /// check and emits a continuation only when work is already
+    /// pending; `wait` long-polls `clank wfw` and blocks the
+    /// agent until work arrives or `wfw_timeout` elapses.
+    #[arg(long, value_enum, default_value_t = AutoModeArg::Hint)]
+    pub mode: AutoModeArg,
+    /// Designate this agent as `master` or `reviewers` for the
+    /// repo. `master` writes `.clank/config.json` with this
+    /// label; `reviewers` clears master only if this agent
+    /// currently holds it.
+    #[arg(long, value_enum)]
+    pub role: Option<RoleArg>,
+    /// Override the wait-for-work timeout (e.g. `30m`, `5m`,
+    /// `45s`). Omit to leave unchanged; `null` in the underlying
+    /// config means "indefinite".
+    #[arg(long, value_name = "DUR")]
+    pub wfw_timeout: Option<String>,
+}
+
+#[derive(Args, Debug)]
+pub struct AutoOffArgs {
+    #[arg(long, value_name = "PATH")]
+    pub repo: Option<PathBuf>,
+    #[arg(long, value_enum)]
+    pub role: Option<RoleArg>,
+}
+
+#[derive(Args, Debug)]
+pub struct AutoStatusArgs {
+    #[arg(long, value_name = "PATH")]
+    pub repo: Option<PathBuf>,
+    /// Emit JSON instead of the human rendering.
+    #[arg(short = 'j', long)]
+    pub json: bool,
+}
+
+/// Auto-mode flavor for `clank auto on --mode`. Maps to
+/// [`clank_core::AutoMode`]; the `Off` value is intentionally
+/// not selectable here (that's what `clank auto off` is for).
+#[derive(Copy, Clone, Debug, clap::ValueEnum)]
+pub enum AutoModeArg {
+    Hint,
+    Wait,
+}
+
+/// Role designation for `--role`.
+#[derive(Copy, Clone, Debug, clap::ValueEnum)]
+pub enum RoleArg {
+    Master,
+    Reviewers,
 }
 
 #[derive(Args, Debug)]
