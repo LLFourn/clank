@@ -48,9 +48,6 @@ impl std::fmt::Display for WfwTimeout {
 impl std::error::Error for WfwTimeout {}
 
 pub async fn run(args: WfwArgs) -> anyhow::Result<()> {
-    let author = AgentLabel::parse(&args.author)
-        .map_err(|e| anyhow::anyhow!("invalid --author `{}`: {e}", args.author))?;
-    let role: Role = args.role.into();
     let timeout = parse_timeout(&args.timeout)?;
     // One env read for the entire process, here at the CLI
     // boundary. Downstream takes a plain `bool`.
@@ -58,6 +55,27 @@ pub async fn run(args: WfwArgs) -> anyhow::Result<()> {
 
     let repo = resolve_repo(args.repo.as_deref())?;
     let basename = repo_basename(&repo)?;
+
+    // Resolve --author via the shared identity resolver when
+    // omitted. Same precedence rule as `clank auto`: explicit
+    // flag > CLANK_AGENT env > session lookup. Error with an
+    // actionable bootstrap hint if nothing resolves.
+    let author = match args.author.as_deref() {
+        Some(raw) => {
+            AgentLabel::parse(raw).map_err(|e| anyhow::anyhow!("invalid --author `{raw}`: {e}"))?
+        }
+        None => crate::agent_env::resolve_identity_from_env(&repo)?,
+    };
+
+    // Resolve --role from .clank/config.json when omitted. Master
+    // iff this label is the repo's master; reviewers otherwise.
+    let role: Role = match args.role {
+        Some(explicit) => explicit.into(),
+        None => {
+            let repo_cfg = crate::agent_store::load_repo_config(&repo)?;
+            clank_core::role_for(&author, repo_cfg.as_ref())
+        }
+    };
 
     let policy = if args.no_cache {
         crate::rebuild::CachePolicy::Bypass

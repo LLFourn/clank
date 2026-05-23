@@ -56,14 +56,18 @@ pub struct WfwArgs {
     /// Repo root. Defaults to the cwd's git toplevel.
     #[arg(long, value_name = "PATH")]
     pub repo: Option<PathBuf>,
-    /// Required: the agent label this caller is wfw-ing as. Keys
-    /// feedback files and the participant set; pick something stable
-    /// across this agent's sessions (`claude`, `claude-fe`, etc.).
+    /// Agent label this caller is wfw-ing as. Keys feedback files
+    /// and the participant set. Optional: defaults via the shared
+    /// identity resolver (CLANK_AGENT env > session lookup via
+    /// CLAUDE_CODE_SESSION_ID / CODEX_THREAD_ID). Pass explicitly
+    /// to override or to run from outside a session.
     #[arg(long, value_name = "LABEL")]
-    pub author: String,
-    /// Required: which side of the workflow this caller plays.
+    pub author: Option<String>,
+    /// Which side of the workflow this caller plays. Optional:
+    /// defaults to `master` iff the resolved label matches
+    /// `.clank/config.json`'s `master` field, else `reviewers`.
     #[arg(long, value_enum)]
-    pub role: WfwRole,
+    pub role: Option<WfwRole>,
     /// Restrict watch / report to one plan (same parser as
     /// `clank status --plan`). Without it, wfw considers every
     /// active plan in the repo.
