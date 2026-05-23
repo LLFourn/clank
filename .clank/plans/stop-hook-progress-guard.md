@@ -96,21 +96,58 @@ parent `.gitignore` already excludes everything under
 
 ## Implementation surface
 
+### Guard placement — NOT a drop-in replacement
+
+The current short-circuit at `stop_hook.rs:44-46` sits BEFORE repo
+resolution, identity resolution, and config load. The new guard needs
+all three (repo + label + session_id for the state path; auto_mode to
+know whether continuations are even possible). It cannot be replaced
+in-place — it has to move.
+
+The guard runs **inside the auto_mode dispatch, only on the hint/wait
+arms**. `auto_mode=off` and the "no config" early-Silent path keep
+their current behavior unchanged: no progress signal required, no
+state written. The only modes that can issue a `Continue` are hint
+and wait, and the only modes that need spin protection are the same
+two — keep the scopes aligned.
+
+That ordering also means existing tests for off-mode and no-config
+paths (`stop_hook_integration.rs` already exercises these with
+minimal stdin and no `last_assistant_message`) continue to pass
+unchanged.
+
 ### `crates/cli/src/cli/stop_hook.rs::compute_outcome`
 
-Replace:
+Replace the line-44 short-circuit with `// progress guard moves below
+config load — see auto_mode dispatch`. Then rewrite the auto_mode
+match:
 
 ```rust
-if input.stop_hook_active {
-    return HookOutcome::Silent;
+match cfg.auto_mode {
+    AutoMode::Off => HookOutcome::Silent,
+    AutoMode::Hint | AutoMode::Wait => {
+        match progress_guard(&repo, &label, &input) {
+            ProgressGuard::Spin => return HookOutcome::Silent,
+            ProgressGuard::Diagnostic(msg) => return HookOutcome::Diagnostic { message: msg },
+            ProgressGuard::Proceed => {}
+        }
+        match cfg.auto_mode {
+            AutoMode::Hint => compute_hint_outcome(&repo, &label, role).await,
+            AutoMode::Wait => compute_wait_outcome(&repo, &label, role, cfg.wfw_timeout.as_deref()).await,
+            AutoMode::Off => unreachable!(),
+        }
+    }
 }
 ```
 
-with progress-aware logic, **fail-closed on any IO error** for
-continuation fires. Codex has no native block-cap, so the guard is
-the only thing preventing runaway loops — any uncertainty about
-whether we can durably track progress must resolve to
-"don't issue a continuation."
+`progress_guard` returns a three-way result so the caller stays
+linear. It encapsulates the validity check, the spin detection, and
+the state write — all the fail-closed IO is in one place.
+
+**Fail-closed on any IO error** for continuation fires. Codex has no
+native block-cap, so the guard is the only thing preventing runaway
+loops — any uncertainty about whether we can durably track progress
+must resolve to "don't issue a continuation."
 
 ### Progress signal validity
 
@@ -126,7 +163,9 @@ represents non-empty trimmed content. A subsequent fire that comes
 back with `Some("")` doesn't accidentally hash to a "different"
 value from the prior hash and trick the differs-path into firing.
 
-Decision table (precedence is row order — first match wins):
+Decision table (`auto_mode ∈ {hint, wait}` only; off and no-config
+return Silent before this table is consulted). Precedence is row
+order — first match wins.
 
 | `stop_hook_active` | progress signal | state read | state write | Outcome |
 | --- | --- | --- | --- | --- |
@@ -141,7 +180,9 @@ Decision table (precedence is row order — first match wins):
 
 The "invalid progress signal" row sits at the top so it short-
 circuits before any state IO; that's the safe order regardless of
-`stop_hook_active`.
+`stop_hook_active`. **`auto_mode=off` never reaches this table** —
+it returns Silent earlier and is unaffected by progress-signal
+presence.
 
 `Diagnostic` is the right outcome for these failure modes — it exits
 0 with a stderr message and **no continuation prompt**, which is
@@ -242,11 +283,20 @@ Update the inline comment at the old short-circuit site in
 
 ### Integration (`crates/cli/tests/stop_hook_integration.rs`)
 
-Stop-hook tests already exist there for the per-tool wire shapes.
-Extend with progress-guard scenarios:
+Stop-hook tests already exist there for the per-tool wire shapes
+and for off-mode / no-config Silent paths. Those keep their
+existing minimal stdin (no `last_assistant_message`) and must
+continue to pass — the new guard runs only on the hint/wait arms,
+so off-mode tests are unaffected. Locking that in is one of the
+new tests (#0 below).
 
-1. **First fire (`stop_hook_active=false`)** → state persisted,
-   normal outcome.
+New scenarios, all with `auto_mode ∈ {hint, wait}`:
+
+0. **Auto-mode off, minimal stdin (no `last_assistant_message`)** →
+   Silent. Regression guard ensuring the progress guard does not
+   leak into the off-mode path.
+1. **First fire (`stop_hook_active=false`), valid progress signal**
+   → state persisted, normal outcome.
 2. **Second fire, new `last_assistant_message`** → state updated,
    normal outcome.
 3. **Second fire, same `last_assistant_message`** → Silent, state
