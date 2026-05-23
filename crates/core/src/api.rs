@@ -118,7 +118,8 @@ pub enum FinalizeBlockReason {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SealedApproval {
     pub author: crate::ids::AgentLabel,
-    /// Repo-relative path: `.clank/feedback/<stem>/<sha>/<author>.md`.
+    /// Repo-relative path:
+    /// `.clank/agents/<author>/feedback/<stem>/<ref>.md`.
     pub source_path: String,
     pub body_hash: crate::ids::ContentHash,
 }

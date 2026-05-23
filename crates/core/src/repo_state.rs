@@ -599,9 +599,9 @@ pub struct CommitNode {
 pub struct CommitReview {
     pub author: AgentLabel,
     /// `None` = ad-hoc / repo-scoped feedback (file lives under
-    /// `.clank/feedback/_/<sha>/<author>.md`). `Some(plan)` =
-    /// plan-scoped feedback under
-    /// `.clank/feedback/<plan>/<sha>/<author>.md`.
+    /// `.clank/agents/<author>/feedback/_/<ref>.md`).
+    /// `Some(plan)` = plan-scoped feedback under
+    /// `.clank/agents/<author>/feedback/<plan>/<ref>.md`.
     pub plan: Option<PlanKey>,
     pub body: FeedbackBody,
 }

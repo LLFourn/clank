@@ -278,7 +278,7 @@ impl ContentHash {
 impl AgentLabel {
     /// Parse an agent label: non-empty, no `/`, not `.`/`..`, no
     /// leading `.` (avoids dotfile collisions in
-    /// `.clank/feedback/.../<author>.md`).
+    /// `.clank/agents/<author>/...`).
     pub fn parse(s: &str) -> Result<Self, IdError> {
         const KIND: &str = "AgentLabel";
         check_non_empty(KIND, s)?;

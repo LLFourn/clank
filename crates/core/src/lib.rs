@@ -17,7 +17,8 @@
 //!   The on-disk state cache encodes `RepoState` directly.
 //! - [`model`] — small surviving DTOs (`Feedback`, `CommitGate`)
 //!   used by projection-time review-gate computation. Not folded
-//!   into state; built on demand from `.clank/feedback/` files.
+//!   into state; built on demand from
+//!   `.clank/agents/<author>/feedback/<plan-or-_>/<ref>.md` files.
 //! - [`feedback_view`] — typed `FeedbackView` of one plan's review
 //!   files. Pure data; the CLI scans the filesystem into this shape
 //!   and feeds it to `plan_view::project`.
