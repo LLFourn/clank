@@ -73,7 +73,7 @@ pub use ids::{
     RepoBasename, SessionId,
 };
 
-pub use agent_config::{AgentConfig, RepoConfig, Session, role_for};
+pub use agent_config::{AgentConfig, Session, role_for};
 pub use hook_io::{
     CLAUDE_CONTINUATION_EXIT, CodexBlockDecision, HOOK_OK_EXIT, HookInput, HookOutcome,
 };

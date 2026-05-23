@@ -21,18 +21,22 @@ use anyhow::Context;
 use super::{InitArgs, resolve_repo};
 use crate::agent_env::detect_session_from_env;
 use crate::agent_store::{
-    agent_config_path, bind_session_to_agent, load_repo_config, save_repo_config,
+    agent_config_path, bind_session_to_agent, load_agent_config, save_agent_config,
 };
 use clank_core::ids::AgentLabel;
-use clank_core::vocab::Tool;
+use clank_core::vocab::{Role, Tool};
 
 /// The current canonical content of `.clank/.gitignore`.
 ///
-/// `/feedback/` and `/cache/` use a leading slash so they're
-/// anchored to `.clank/` — without it, `feedback/` would also
-/// catch `.clank/agents/<n>/feedback/` (where peer reviews
-/// live and MUST stay tracked).
-const GITIGNORE_BODY: &str = "/feedback/\n/cache/\nagents/*/config.json\n";
+/// In the current model, only `plans/` and `finished/` under
+/// `.clank/` are tracked (the artifacts being reviewed + the
+/// durable record of finalized plans). Everything else is local:
+/// per-agent configs, feedback, cache. The root gitignore's
+/// `.clank/*` + `!.clank/plans/` + `!.clank/finished/`
+/// carve-outs are the authoritative rule; the inner gitignore
+/// is defensive (catches per-agent state even if a root
+/// gitignore is misconfigured or absent).
+const GITIGNORE_BODY: &str = "/agents/\n/cache/\n/feedback/\n";
 
 /// Prior `.gitignore` bodies that should be silently upgraded to
 /// `GITIGNORE_BODY`. Add an entry whenever this constant changes
@@ -41,6 +45,7 @@ const GITIGNORE_BODY: &str = "/feedback/\n/cache/\nagents/*/config.json\n";
 const LEGACY_GITIGNORE_BODIES: &[&str] = &[
     "feedback/\ncache/\n",
     "feedback/\ncache/\nagents/*/config.json\n",
+    "/feedback/\n/cache/\nagents/*/config.json\n",
 ];
 
 pub async fn run(args: InitArgs) -> anyhow::Result<()> {
@@ -241,7 +246,10 @@ async fn bootstrap_agent_identity(repo: &Path, yes: bool) -> anyhow::Result<()> 
         .map_err(|e| anyhow::anyhow!("invalid label `{label_raw}`: {e}"))?;
 
     let make_master = if interactive {
-        prompt_yes_no("Make this agent the master for this repo? [y/N] ", false)?
+        prompt_yes_no(
+            "Default this agent to master role (vs reviewers)? [y/N] ",
+            false,
+        )?
     } else {
         false
     };
@@ -265,19 +273,12 @@ async fn bootstrap_agent_identity(repo: &Path, yes: bool) -> anyhow::Result<()> 
     }
 
     if make_master {
-        let mut repo_cfg = load_repo_config(repo)?.unwrap_or_default();
-        let prior = repo_cfg.master.clone();
-        repo_cfg.master = Some(label.clone());
-        save_repo_config(repo, &repo_cfg)?;
-        match prior {
-            Some(p) if p == label => println!("  (already master)"),
-            Some(p) => println!(
-                "  master: changed from `{}` to `{}` in .clank/config.json",
-                p.as_str(),
-                label.as_str()
-            ),
-            None => println!("  master: written to .clank/config.json"),
-        }
+        // Role is a per-user preference; write to the agent's
+        // own config. No repo-shared file involved.
+        let mut cfg = load_agent_config(repo, &label)?.unwrap_or_default();
+        cfg.role = Role::Master;
+        save_agent_config(repo, &label, &cfg)?;
+        println!("  role: master");
     }
     Ok(())
 }
@@ -350,17 +351,10 @@ mod tests {
         assert!(dir.path().join(".clank/plans").is_dir());
         let body = std::fs::read_to_string(dir.path().join(".clank/.gitignore")).unwrap();
         assert_eq!(body, GITIGNORE_BODY);
-        // Sanity: the body covers the right things.
-        assert!(body.contains("feedback/"), "missing legacy feedback ignore");
-        assert!(body.contains("cache/"), "missing cache ignore");
-        assert!(
-            body.contains("agents/*/config.json"),
-            "missing per-agent config ignore"
-        );
-        assert!(
-            !body.contains("agents/*/feedback"),
-            "feedback dirs MUST stay tracked"
-        );
+        // Sanity: anchored patterns blanket the per-agent subtree.
+        assert!(body.contains("/agents/"));
+        assert!(body.contains("/feedback/"));
+        assert!(body.contains("/cache/"));
     }
 
     #[test]
@@ -463,26 +457,20 @@ mod tests {
     /// gitignore + the managed `.clank/.gitignore`, which paths
     /// are tracked vs ignored.
     ///
-    /// `.clank/*` only matches one level deep, so re-including
-    /// `.clank/agents/` lets git RECURSE into the dir but doesn't
-    /// automatically include children at depth 2+. The recursive
-    /// `!.clank/agents/**` un-ignore is necessary; the targeted
-    /// `.clank/agents/*/config.json` ignore must come AFTER it to
-    /// actually apply.
+    /// Check-ignore matrix for the simplified tracking model:
+    /// only `plans/` and `finished/` need to be tracked;
+    /// everything else under `.clank/` is per-user / local
+    /// (agents/, feedback/, cache/, config.json — none of these
+    /// exist anymore as repo-shared state).
     #[test]
-    fn check_ignore_matrix_matches_d10_spec() {
+    fn check_ignore_matrix_simplified() {
         let dir = init_repo();
         std::fs::write(
             dir.path().join(".gitignore"),
             "/target/\n\
              .clank/*\n\
              !.clank/plans/\n\
-             !.clank/finished/\n\
-             !.clank/config.json\n\
-             !.clank/agents/\n\
-             !.clank/agents/**\n\
-             .clank/agents/*/config.json\n\
-             .clank/cache/\n",
+             !.clank/finished/\n",
         )
         .unwrap();
         write_scaffold(dir.path()).unwrap();
@@ -498,20 +486,13 @@ mod tests {
             out.status.code() == Some(0)
         };
 
-        assert!(
-            !probe(".clank/config.json"),
-            "config.json should be TRACKED"
-        );
-        assert!(
-            !probe(".clank/agents/alice/feedback/foo/abc.md"),
-            "agents/<n>/feedback/... should be TRACKED"
-        );
-        assert!(
-            probe(".clank/agents/alice/config.json"),
-            "agents/<n>/config.json should be IGNORED"
-        );
-        assert!(probe(".clank/cache/anything"), "cache/ should be IGNORED");
-        assert!(!probe(".clank/plans/foo.md"), "plans/ should be TRACKED");
+        // Tracked.
+        assert!(!probe(".clank/plans/foo.md"));
+        assert!(!probe(".clank/finished/foo/seal.md"));
+        // Per-user / local.
+        assert!(probe(".clank/agents/alice/config.json"));
+        assert!(probe(".clank/agents/alice/feedback/foo/abc.md"));
+        assert!(probe(".clank/cache/anything"));
     }
 
     #[test]

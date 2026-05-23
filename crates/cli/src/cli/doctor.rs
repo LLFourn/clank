@@ -12,9 +12,7 @@ use super::DoctorArgs;
 use crate::agent_env::{
     detect_session_from_env, explicit_label_from_env, resolve_identity_from_env,
 };
-use crate::agent_store::{
-    agent_config_path, agents_root, load_all_agent_configs, load_repo_config,
-};
+use crate::agent_store::{agent_config_path, agents_root, load_agent_config, load_all_agent_configs};
 use clank_core::role_for;
 
 /// Sentinel returned by [`run`] when one or more checks failed.
@@ -131,13 +129,11 @@ fn repo_checks(repo: &Path) -> Vec<CheckResult> {
         )),
     }
 
-    // Root-gitignore carve-outs (via git check-ignore probes).
-    out.push(check_gitignore_probe(repo, ".clank/config.json", true));
-    out.push(check_gitignore_probe(
-        repo,
-        ".clank/agents/some/feedback/foo/abc.md",
-        true,
-    ));
+    // Root-gitignore carve-outs: only plans/ and finished/ need
+    // to be tracked. Everything else under .clank/ is local
+    // (per-agent configs, feedback, cache).
+    out.push(check_gitignore_probe(repo, ".clank/plans/x.md", true));
+    out.push(check_gitignore_probe(repo, ".clank/finished/x", true));
 
     // .claude/settings.local.json permissions.
     out.push(check_claude_perms(repo));
@@ -187,49 +183,6 @@ fn repo_checks(repo: &Path) -> Vec<CheckResult> {
             "agents",
             ".clank/agents/ does not exist yet (created lazily)".to_string(),
         ));
-    }
-
-    // Repo-level config (master designation).
-    match load_repo_config(repo) {
-        Ok(Some(cfg)) => {
-            if let Some(master) = &cfg.master {
-                let master_dir = agents_root(repo).join(master.as_str());
-                if master_dir.is_dir() {
-                    out.push(CheckResult::ok(
-                        SECTION,
-                        ".clank/config.json",
-                        format!("master = `{}`", master.as_str()),
-                    ));
-                } else {
-                    out.push(CheckResult::warn(
-                        SECTION,
-                        ".clank/config.json",
-                        format!(
-                            "master = `{}` but no `.clank/agents/{}/` dir exists locally \
-                             (harmless if that agent has never run here)",
-                            master.as_str(),
-                            master.as_str(),
-                        ),
-                    ));
-                }
-            } else {
-                out.push(CheckResult::ok(
-                    SECTION,
-                    ".clank/config.json",
-                    "present, no master designated".to_string(),
-                ));
-            }
-        }
-        Ok(None) => out.push(CheckResult::ok(
-            SECTION,
-            ".clank/config.json",
-            "not present (no master designated; optional)".to_string(),
-        )),
-        Err(e) => out.push(CheckResult::fail(
-            SECTION,
-            ".clank/config.json",
-            format!("parse failed: {e:#}"),
-        )),
     }
 
     out
@@ -541,9 +494,9 @@ fn session_checks(repo: Option<&Path>) -> Vec<CheckResult> {
     let source = describe_identity_source(repo, &resolved, &detected, &explicit);
     out.push(CheckResult::ok(SECTION, "identity", source));
 
-    // Inferred role (label vs .clank/config.json.master).
-    let repo_cfg = load_repo_config(repo).ok().flatten();
-    let role = role_for(&resolved, repo_cfg.as_ref());
+    // Inferred role from the resolved agent's own config.
+    let agent_cfg = load_agent_config(repo, &resolved).ok().flatten();
+    let role = role_for(&resolved, agent_cfg.as_ref());
     out.push(CheckResult::ok(
         SECTION,
         "role",

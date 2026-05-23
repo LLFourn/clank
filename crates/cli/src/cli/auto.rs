@@ -5,15 +5,15 @@
 //! resolve_identity_from_env`. Errors with an actionable message
 //! if the session isn't bound — `clank auto` is NOT a bootstrap
 //! path (that's `clank as` or `clank init` phase 2).
+//!
+//! Role is a per-user preference stored on the agent's own
+//! config. Setting `--role master` doesn't make any repo-wide
+//! assertion — it just changes what `wfw` / `stop-hook` default
+//! to for THIS agent.
 
-use anyhow::Context;
-
-use super::{AutoArgs, AutoCmd, AutoOffArgs, AutoOnArgs, AutoStatusArgs, RoleArg, resolve_repo};
+use super::{AutoArgs, AutoCmd, AutoOffArgs, AutoOnArgs, AutoStatusArgs, resolve_repo};
 use crate::agent_env::resolve_identity_from_env;
-use crate::agent_store::{
-    load_agent_config, load_repo_config, save_agent_config, save_repo_config,
-};
-use clank_core::ids::AgentLabel;
+use crate::agent_store::{load_agent_config, save_agent_config};
 use clank_core::role_for;
 use clank_core::vocab::{AutoMode, Role};
 
@@ -35,21 +35,18 @@ async fn run_on(args: AutoOnArgs) -> anyhow::Result<()> {
     if let Some(t) = args.wfw_timeout.as_deref() {
         cfg.wfw_timeout = Some(t.to_string());
     }
+    if let Some(role_arg) = args.role {
+        cfg.role = role_arg.into();
+    }
     save_agent_config(&repo, &label, &cfg)?;
-
-    let role_note = if let Some(role_arg) = args.role {
-        Some(apply_role(&repo, &label, role_arg)?)
-    } else {
-        None
-    };
 
     println!(
         "auto-mode for `{}` set to {}",
         label.as_str(),
         mode.as_str()
     );
-    if let Some(note) = role_note {
-        println!("  {note}");
+    if args.role.is_some() {
+        println!("  role: {}", cfg.role.as_str());
     }
     Ok(())
 }
@@ -60,17 +57,14 @@ async fn run_off(args: AutoOffArgs) -> anyhow::Result<()> {
 
     let mut cfg = load_agent_config(&repo, &label)?.unwrap_or_default();
     cfg.auto_mode = AutoMode::Off;
+    if let Some(role_arg) = args.role {
+        cfg.role = role_arg.into();
+    }
     save_agent_config(&repo, &label, &cfg)?;
 
-    let role_note = if let Some(role_arg) = args.role {
-        Some(apply_role(&repo, &label, role_arg)?)
-    } else {
-        None
-    };
-
     println!("auto-mode for `{}` set to off", label.as_str());
-    if let Some(note) = role_note {
-        println!("  {note}");
+    if args.role.is_some() {
+        println!("  role: {}", cfg.role.as_str());
     }
     Ok(())
 }
@@ -80,8 +74,7 @@ async fn run_status(args: AutoStatusArgs) -> anyhow::Result<()> {
     let label = resolve_identity_from_env(&repo)?;
 
     let cfg = load_agent_config(&repo, &label)?.unwrap_or_default();
-    let repo_cfg = load_repo_config(&repo)?;
-    let role = role_for(&label, repo_cfg.as_ref());
+    let role = role_for(&label, Some(&cfg));
 
     if args.json {
         let payload = serde_json::json!({
@@ -101,48 +94,6 @@ async fn run_status(args: AutoStatusArgs) -> anyhow::Result<()> {
         println!("  role:        {}", role.as_str());
     }
     Ok(())
-}
-
-/// Update `.clank/config.json`'s `master` field per `--role`,
-/// returning a human note for the caller to print. Master claims
-/// take precedence: `--role master` writes this label even if a
-/// different one was master before (with a "changed from X" note);
-/// `--role reviewers` clears master ONLY if this label currently
-/// holds it.
-fn apply_role(repo: &std::path::Path, label: &AgentLabel, role: RoleArg) -> anyhow::Result<String> {
-    let mut repo_cfg = load_repo_config(repo)?.unwrap_or_default();
-    let prior_master = repo_cfg.master.clone();
-    match role {
-        RoleArg::Master => {
-            repo_cfg.master = Some(label.clone());
-            save_repo_config(repo, &repo_cfg).context("writing .clank/config.json")?;
-            match prior_master {
-                Some(prev) if &prev == label => Ok(format!(
-                    "role: master (already designated; .clank/config.json unchanged)"
-                )),
-                Some(prev) => Ok(format!(
-                    "role: master (changed from `{}` to `{}` in .clank/config.json)",
-                    prev.as_str(),
-                    label.as_str()
-                )),
-                None => Ok(format!("role: master (written to .clank/config.json)")),
-            }
-        }
-        RoleArg::Reviewers => {
-            if prior_master.as_ref() == Some(label) {
-                repo_cfg.master = None;
-                save_repo_config(repo, &repo_cfg).context("writing .clank/config.json")?;
-                Ok(format!(
-                    "role: reviewers (cleared `{}` from .clank/config.json master)",
-                    label.as_str()
-                ))
-            } else {
-                Ok(format!(
-                    "role: reviewers (this agent was not the master; .clank/config.json unchanged)"
-                ))
-            }
-        }
-    }
 }
 
 impl From<crate::cli::AutoModeArg> for AutoMode {

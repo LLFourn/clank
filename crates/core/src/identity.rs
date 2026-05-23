@@ -127,12 +127,12 @@ mod tests {
     fn cfg_with_session(id: &str, tool: Tool) -> AgentConfig {
         AgentConfig {
             auto_mode: AutoMode::Hint,
-            wfw_timeout: None,
             session: Some(Session {
                 id: sid(id),
                 tool,
                 updated_at: "2026-05-23T00:00:00+00:00".into(),
             }),
+            ..Default::default()
         }
     }
 

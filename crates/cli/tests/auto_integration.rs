@@ -133,7 +133,7 @@ fn auto_off_writes_off() {
 }
 
 #[test]
-fn auto_on_role_master_writes_repo_config() {
+fn auto_on_role_master_writes_agent_config() {
     let dir = init_repo();
     let repo = dir.path();
     bind_alice(repo);
@@ -145,14 +145,18 @@ fn auto_on_role_master_writes_repo_config() {
     );
     assert!(out.status.success());
 
-    let cfg: serde_json::Value =
-        serde_json::from_str(&std::fs::read_to_string(repo.join(".clank/config.json")).unwrap())
-            .unwrap();
-    assert_eq!(cfg["master"], "alice");
+    let cfg: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(repo.join(".clank/agents/alice/config.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(cfg["role"], "master");
+    // No repo-shared config.json should exist — master is
+    // per-user preference, not a repo claim.
+    assert!(!repo.join(".clank/config.json").exists());
 }
 
 #[test]
-fn auto_on_role_reviewers_clears_master_when_self() {
+fn auto_on_role_reviewers_writes_agent_config() {
     let dir = init_repo();
     let repo = dir.path();
     bind_alice(repo);
@@ -171,25 +175,30 @@ fn auto_on_role_reviewers_clears_master_when_self() {
     );
     assert!(out.status.success());
 
-    let cfg: serde_json::Value =
-        serde_json::from_str(&std::fs::read_to_string(repo.join(".clank/config.json")).unwrap())
-            .unwrap();
-    assert!(
-        cfg.get("master").is_none() || cfg["master"].is_null(),
-        "expected master cleared, got {cfg}"
-    );
+    let cfg: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(repo.join(".clank/agents/alice/config.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(cfg["role"], "reviewers");
 }
 
 #[test]
-fn auto_on_role_reviewers_leaves_other_master_alone() {
+fn auto_on_role_only_touches_self() {
+    // Alice's --role doesn't affect bob's config at all (each
+    // agent's role is independent per-user state).
     let dir = init_repo();
     let repo = dir.path();
-    // Seed repo config with bob as master (manually — bob isn't
-    // bound to a session here, just designated).
-    std::fs::create_dir_all(repo.join(".clank")).unwrap();
-    std::fs::write(repo.join(".clank/config.json"), r#"{"master":"bob"}"#).unwrap();
     bind_alice(repo);
 
+    // Pre-seed bob with role=master via a direct file write.
+    std::fs::create_dir_all(repo.join(".clank/agents/bob")).unwrap();
+    std::fs::write(
+        repo.join(".clank/agents/bob/config.json"),
+        r#"{"auto_mode":"off","role":"master"}"#,
+    )
+    .unwrap();
+
+    // Alice claims reviewer.
     let out = run_clank(
         repo,
         &["auto", "on", "--role", "reviewers"],
@@ -197,12 +206,12 @@ fn auto_on_role_reviewers_leaves_other_master_alone() {
     );
     assert!(out.status.success());
 
-    let cfg: serde_json::Value =
-        serde_json::from_str(&std::fs::read_to_string(repo.join(".clank/config.json")).unwrap())
-            .unwrap();
-    // bob should still be master — alice asking to be reviewers
-    // doesn't disturb a different agent's master designation.
-    assert_eq!(cfg["master"], "bob");
+    // Bob's config untouched.
+    let bob_cfg: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(repo.join(".clank/agents/bob/config.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(bob_cfg["role"], "master");
 }
 
 #[test]

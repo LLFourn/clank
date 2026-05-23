@@ -12,7 +12,7 @@ use anyhow::Context;
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 
-use clank_core::agent_config::{AgentConfig, RepoConfig, Session};
+use clank_core::agent_config::{AgentConfig, Session};
 use clank_core::ids::{AgentLabel, SessionId};
 use clank_core::vocab::Tool;
 
@@ -24,11 +24,6 @@ pub fn agents_root(repo: &Path) -> PathBuf {
 /// Repo-relative path: `.clank/agents/<label>/config.json`.
 pub fn agent_config_path(repo: &Path, label: &AgentLabel) -> PathBuf {
     agents_root(repo).join(label.as_str()).join("config.json")
-}
-
-/// Repo-relative path: `.clank/config.json`.
-pub fn repo_config_path(repo: &Path) -> PathBuf {
-    repo.join(".clank").join("config.json")
 }
 
 /// Load this agent's config from disk. Returns `Ok(None)` if the
@@ -125,18 +120,6 @@ fn iter_agent_dirs(
         }
     }
     Ok(out.into_iter())
-}
-
-/// Load `.clank/config.json` (repo-level). `Ok(None)` if missing.
-pub fn load_repo_config(repo: &Path) -> anyhow::Result<Option<RepoConfig>> {
-    let path = repo_config_path(repo);
-    load_json(&path).with_context(|| format!("reading `{}`", path.display()))
-}
-
-/// Atomically write `.clank/config.json`.
-pub fn save_repo_config(repo: &Path, cfg: &RepoConfig) -> anyhow::Result<()> {
-    let path = repo_config_path(repo);
-    save_json(&path, cfg).with_context(|| format!("writing `{}`", path.display()))
 }
 
 /// Outcome of [`bind_session_to_agent`]: the bound agent's

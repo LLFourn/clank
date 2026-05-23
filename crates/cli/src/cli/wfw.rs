@@ -67,13 +67,14 @@ pub async fn run(args: WfwArgs) -> anyhow::Result<()> {
         None => crate::agent_env::resolve_identity_from_env(&repo)?,
     };
 
-    // Resolve --role from .clank/config.json when omitted. Master
-    // iff this label is the repo's master; reviewers otherwise.
+    // Resolve --role from the agent's own config when omitted.
+    // Role is a per-user preference, not a repo-shared claim —
+    // see `clank_core::agent_config` module docs.
     let role: Role = match args.role {
         Some(explicit) => explicit.into(),
         None => {
-            let repo_cfg = crate::agent_store::load_repo_config(&repo)?;
-            clank_core::role_for(&author, repo_cfg.as_ref())
+            let agent_cfg = crate::agent_store::load_agent_config(&repo, &author)?;
+            clank_core::role_for(&author, agent_cfg.as_ref())
         }
     };
 

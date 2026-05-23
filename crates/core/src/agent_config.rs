@@ -1,11 +1,17 @@
-//! Typed config schemas for per-agent and repo-level Clank state.
+//! Typed config schema for per-agent Clank state.
 //!
 //! Pure data + serde round-trip. No clock, no env, no filesystem
-//! — the CLI is the only place that touches the world. These
-//! types just describe what's written to:
-//! - `.clank/agents/<label>/config.json` — per-agent, per-machine
-//!   ([`AgentConfig`]). Gitignored.
-//! - `.clank/config.json` — repo-shared ([`RepoConfig`]). Tracked.
+//! — the CLI is the only place that touches the world. This type
+//! describes what's written to
+//! `.clank/agents/<label>/config.json` (per-agent, per-machine;
+//! gitignored).
+//!
+//! There is intentionally no repo-shared config type. Master is
+//! a per-user preference: whoever wrote the plan wants their
+//! `wfw` to default to master's view; everyone else wants
+//! reviewers. There's no useful repo-wide assertion of "alice is
+//! THE master" — gate state is computed from the cumulative
+//! participant set, not from role claims.
 
 use serde::{Deserialize, Serialize};
 
@@ -13,12 +19,18 @@ use crate::ids::{AgentLabel, SessionId};
 use crate::vocab::{AutoMode, Role, Tool};
 
 /// Per-agent state for one (label, repo). Lives at
-/// `.clank/agents/<label>/config.json`. Gitignored — auto-mode
-/// preferences and session bindings are per-machine concerns.
+/// `.clank/agents/<label>/config.json`. Gitignored.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct AgentConfig {
     #[serde(default)]
     pub auto_mode: AutoMode,
+    /// Default role for this agent in this repo. Used by
+    /// `wfw` / `stop-hook` when no explicit `--role` is passed.
+    /// Per-user preference; two agents on the same repo can
+    /// independently choose `master` without conflict (gate
+    /// state ignores role claims).
+    #[serde(default)]
+    pub role: Role,
     /// Wait-for-work timeout as a duration string (`"30m"`,
     /// `"5m"`, `"45s"`). `None` means indefinite. Stringly typed
     /// so users editing JSON see the same form
@@ -49,29 +61,12 @@ pub struct Session {
     pub updated_at: String,
 }
 
-/// Repo-shared settings. Lives at `.clank/config.json`. Tracked.
-/// Only field in v1 is `master`; schema is extensible via
-/// additional optional `serde` fields.
-#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
-pub struct RepoConfig {
-    /// Agent label designated as master for this repo. `None`
-    /// means no master is set; operations that need one (e.g.
-    /// wfw inferring `--role`) default to `reviewers`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub master: Option<AgentLabel>,
-}
-
-/// Role an agent plays for this repo: master iff its label
-/// matches `config.master`, reviewers otherwise.
-///
-/// Pure helper — no I/O, no clock. Caller loads `RepoConfig` from
-/// disk (or passes `None` if missing) and the agent's label
-/// (resolved through the identity resolver) and gets back the role.
-pub fn role_for(label: &AgentLabel, config: Option<&RepoConfig>) -> Role {
-    match config.and_then(|c| c.master.as_ref()) {
-        Some(master) if master == label => Role::Master,
-        _ => Role::Reviewers,
-    }
+/// The agent's effective role: their stored
+/// [`AgentConfig::role`]. Pure helper kept as a separate
+/// function for readability + so future changes (e.g. a
+/// per-plan role override) have one place to live.
+pub fn role_for(_label: &AgentLabel, config: Option<&AgentConfig>) -> Role {
+    config.map(|c| c.role).unwrap_or_default()
 }
 
 #[cfg(test)]
@@ -93,6 +88,7 @@ mod tests {
         let back: AgentConfig = serde_json::from_str(&json).unwrap();
         assert_eq!(cfg, back);
         assert_eq!(back.auto_mode, AutoMode::Off);
+        assert_eq!(back.role, Role::Reviewers);
         assert!(back.wfw_timeout.is_none());
         assert!(back.session.is_none());
     }
@@ -101,6 +97,7 @@ mod tests {
     fn agent_config_round_trips_populated() {
         let cfg = AgentConfig {
             auto_mode: AutoMode::Hint,
+            role: Role::Master,
             wfw_timeout: Some("30m".into()),
             session: Some(Session {
                 id: session_id("742f6a04-f174-409a-ab01-419a16c5f372"),
@@ -118,6 +115,7 @@ mod tests {
         let json = r#"{ "auto_mode": "wait" }"#;
         let cfg: AgentConfig = serde_json::from_str(json).unwrap();
         assert_eq!(cfg.auto_mode, AutoMode::Wait);
+        assert_eq!(cfg.role, Role::Reviewers);
         assert!(cfg.wfw_timeout.is_none());
         assert!(cfg.session.is_none());
     }
@@ -137,38 +135,16 @@ mod tests {
     }
 
     #[test]
-    fn repo_config_round_trips() {
-        let cfg = RepoConfig {
-            master: Some(label("alice")),
-        };
-        let json = serde_json::to_string(&cfg).unwrap();
-        assert_eq!(json, r#"{"master":"alice"}"#);
-        let back: RepoConfig = serde_json::from_str(&json).unwrap();
-        assert_eq!(cfg, back);
-    }
-
-    #[test]
-    fn repo_config_empty_omits_master() {
-        let cfg = RepoConfig::default();
-        let json = serde_json::to_string(&cfg).unwrap();
-        assert_eq!(json, "{}");
-    }
-
-    #[test]
-    fn role_for_matches_master_label() {
-        let cfg = RepoConfig {
-            master: Some(label("alice")),
+    fn role_for_returns_configured_role() {
+        let cfg = AgentConfig {
+            role: Role::Master,
+            ..Default::default()
         };
         assert_eq!(role_for(&label("alice"), Some(&cfg)), Role::Master);
-        assert_eq!(role_for(&label("bob"), Some(&cfg)), Role::Reviewers);
     }
 
     #[test]
-    fn role_for_no_master_yields_reviewers() {
+    fn role_for_no_config_yields_default_reviewers() {
         assert_eq!(role_for(&label("alice"), None), Role::Reviewers);
-        assert_eq!(
-            role_for(&label("alice"), Some(&RepoConfig::default())),
-            Role::Reviewers
-        );
     }
 }

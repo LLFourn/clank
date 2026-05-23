@@ -200,13 +200,14 @@ impl AutoMode {
     }
 }
 
-/// Role an agent plays for a plan in this repo. Derived by
-/// comparing an agent's label against `RepoConfig.master`; never
-/// stored on the agent's own config.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+/// Role an agent plays — their default perspective for `wfw`,
+/// `stop-hook`, etc. Per-user preference stored on the agent's
+/// own [`AgentConfig`]; not a repo-shared assertion.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Role {
     Master,
+    #[default]
     Reviewers,
 }
 

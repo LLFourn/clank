@@ -240,6 +240,7 @@ fn preserves_existing_auto_mode_when_rebinding() {
         auto_mode: AutoMode::Hint,
         wfw_timeout: Some("30m".into()),
         session: None,
+        ..Default::default()
     };
     std::fs::write(
         cfg_dir.join("config.json"),
