@@ -270,6 +270,32 @@ fn progress_guard_missing_state_midchain_diagnostic() {
 }
 
 #[test]
+fn progress_guard_write_failure_diagnostic() {
+    // Force write_state to fail by planting a regular file where the
+    // stop-hook-state directory would live. create_dir_all then
+    // refuses to overwrite the file with a directory, so the write
+    // path returns IO error → Diagnostic, no continuation.
+    let dir = repo_with_reviewable_work_for_alice();
+    let repo = dir.path();
+
+    let agent_dir = repo.join(".clank/agents/alice");
+    std::fs::create_dir_all(&agent_dir).unwrap();
+    std::fs::write(agent_dir.join("stop-hook-state"), b"this is a file, not a dir").unwrap();
+
+    let stdin = claude_stdin_with_progress(CLAUDE_SESSION, repo, false, Some("hello"));
+    let (code, stdout, stderr) = run_stop_hook(repo, "claude", &stdin, &[]);
+    assert_eq!(code, Some(0), "Diagnostic exits 0; stderr={stderr}");
+    assert!(
+        stdout.is_empty(),
+        "no continuation on write failure: {stdout}"
+    );
+    assert!(
+        stderr.contains("progress state write failed"),
+        "expected write-failure diag; got {stderr}"
+    );
+}
+
+#[test]
 fn progress_guard_corrupt_state_diagnostic() {
     let dir = repo_with_reviewable_work_for_alice();
     let repo = dir.path();
