@@ -84,6 +84,9 @@ fn exit_code_for(err: &anyhow::Error) -> i32 {
     if let Some(code) = err.downcast_ref::<cli::status::ExitCode>() {
         return code.0;
     }
+    if err.downcast_ref::<cli::doctor::DoctorFailed>().is_some() {
+        return 1;
+    }
     1
 }
 

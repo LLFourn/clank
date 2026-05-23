@@ -9,11 +9,29 @@
 use std::path::{Path, PathBuf};
 
 use super::DoctorArgs;
-use crate::agent_env::{detect_session_from_env, explicit_label_from_env};
+use crate::agent_env::{
+    detect_session_from_env, explicit_label_from_env, resolve_identity_from_env,
+};
 use crate::agent_store::{
     agent_config_path, agents_root, load_all_agent_configs, load_repo_config,
 };
 use clank_core::role_for;
+
+/// Sentinel returned by [`run`] when one or more checks failed.
+/// Routed to exit code 1 by `main::exit_code_for`. Defining it as
+/// a typed error (rather than calling `std::process::exit`
+/// directly) keeps the only direct-exit caller in the binary the
+/// stop-hook adapter, which has its own per-tool exit protocol.
+#[derive(Debug)]
+pub struct DoctorFailed;
+
+impl std::fmt::Display for DoctorFailed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("clank doctor: one or more checks failed")
+    }
+}
+
+impl std::error::Error for DoctorFailed {}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CheckStatus {
@@ -84,7 +102,7 @@ pub async fn run(args: DoctorArgs) -> anyhow::Result<()> {
         .iter()
         .any(|r| matches!(r.status, CheckStatus::Fail))
     {
-        std::process::exit(1);
+        return Err(DoctorFailed.into());
     }
     Ok(())
 }
@@ -438,6 +456,8 @@ fn session_checks(repo: Option<&Path>) -> Vec<CheckResult> {
     const SECTION: &str = "session";
     let mut out = Vec::<CheckResult>::new();
 
+    // Report what the env says first (always — independent of
+    // whether resolution succeeds).
     let detected = match detect_session_from_env() {
         Ok(d) => d,
         Err(e) => {
@@ -449,37 +469,39 @@ fn session_checks(repo: Option<&Path>) -> Vec<CheckResult> {
             return out;
         }
     };
-    let Some((tool, session_id)) = detected else {
-        out.push(CheckResult::ok(
+    match &detected {
+        Some((tool, session_id)) => out.push(CheckResult::ok(
+            SECTION,
+            "env",
+            format!(
+                "running inside {} (session {})",
+                tool.as_str(),
+                session_id.as_str()
+            ),
+        )),
+        None => out.push(CheckResult::ok(
             SECTION,
             "env",
             "not running inside an agent (no CLAUDE_CODE_SESSION_ID / CODEX_THREAD_ID)".to_string(),
-        ));
-        return out;
+        )),
+    }
+    let explicit = match explicit_label_from_env() {
+        Ok(e) => e,
+        Err(e) => {
+            out.push(CheckResult::warn(
+                SECTION,
+                "CLANK_AGENT",
+                format!("invalid override: {e}"),
+            ));
+            None
+        }
     };
-    out.push(CheckResult::ok(
-        SECTION,
-        "env",
-        format!(
-            "running inside {} (session {})",
-            tool.as_str(),
-            session_id.as_str()
-        ),
-    ));
-
-    // CLANK_AGENT override?
-    match explicit_label_from_env() {
-        Ok(Some(label)) => out.push(CheckResult::ok(
+    if let Some(label) = &explicit {
+        out.push(CheckResult::ok(
             SECTION,
             "CLANK_AGENT",
             format!("explicit override active: `{}`", label.as_str()),
-        )),
-        Ok(None) => {}
-        Err(e) => out.push(CheckResult::warn(
-            SECTION,
-            "CLANK_AGENT",
-            format!("invalid override: {e}"),
-        )),
+        ));
     }
 
     let Some(repo) = repo else {
@@ -491,59 +513,74 @@ fn session_checks(repo: Option<&Path>) -> Vec<CheckResult> {
         return out;
     };
 
-    // Find which agent (if any) has this session bound.
-    let agents = match load_all_agent_configs(repo) {
-        Ok(a) => a,
+    // Identity resolution: go through the SAME resolver `clank
+    // wfw` / `clank auto` use, so doctor never disagrees with
+    // what those commands would do. Critically, this honors the
+    // CLANK_AGENT > session-binding precedence — an explicit
+    // override succeeds even without a matching session config.
+    let resolved = match resolve_identity_from_env(repo) {
+        Ok(label) => label,
         Err(e) => {
-            out.push(CheckResult::fail(
-                SECTION,
-                "identity",
-                format!("loading agent configs failed: {e:#}"),
-            ));
+            out.push(CheckResult::fail(SECTION, "identity", format!("{e:#}")));
             return out;
         }
     };
-    let bound = agents.iter().find(|(_, cfg)| {
-        cfg.session
-            .as_ref()
-            .is_some_and(|s| s.id == session_id && s.tool == tool)
-    });
-    match bound {
-        Some((label, cfg)) => {
+    let source = describe_identity_source(repo, &resolved, &detected, &explicit);
+    out.push(CheckResult::ok(SECTION, "identity", source));
+
+    // Inferred role (label vs .clank/config.json.master).
+    let repo_cfg = load_repo_config(repo).ok().flatten();
+    let role = role_for(&resolved, repo_cfg.as_ref());
+    out.push(CheckResult::ok(
+        SECTION,
+        "role",
+        format!("inferred role: {}", role.as_str()),
+    ));
+
+    out
+}
+
+/// Describe WHERE the resolver got the label: explicit
+/// CLANK_AGENT override vs which agent's session binding
+/// matched. Pure diagnostic — the resolved label itself is the
+/// authoritative answer.
+fn describe_identity_source(
+    repo: &Path,
+    resolved: &clank_core::ids::AgentLabel,
+    detected: &Option<(clank_core::vocab::Tool, clank_core::ids::SessionId)>,
+    explicit: &Option<clank_core::ids::AgentLabel>,
+) -> String {
+    if let Some(label) = explicit
+        && label == resolved
+    {
+        return format!(
+            "resolved to `{}` via CLANK_AGENT override",
+            resolved.as_str()
+        );
+    }
+    if let Some((tool, sid)) = detected {
+        let agents = load_all_agent_configs(repo).unwrap_or_default();
+        let bound = agents.iter().find(|(label, cfg)| {
+            label == resolved
+                && cfg
+                    .session
+                    .as_ref()
+                    .is_some_and(|s| &s.id == sid && s.tool == *tool)
+        });
+        if let Some((label, cfg)) = bound {
             let updated_at = cfg
                 .session
                 .as_ref()
                 .map(|s| s.updated_at.clone())
                 .unwrap_or_default();
-            out.push(CheckResult::ok(
-                SECTION,
-                "identity",
-                format!(
-                    "this session is bound to agent `{}` (last bound {})",
-                    label.as_str(),
-                    updated_at
-                ),
-            ));
-            // Inferred role.
-            let repo_cfg = load_repo_config(repo).ok().flatten();
-            let role = role_for(label, repo_cfg.as_ref());
-            out.push(CheckResult::ok(
-                SECTION,
-                "role",
-                format!("inferred role: {}", role.as_str()),
-            ));
+            return format!(
+                "resolved to `{}` via session binding (last bound {})",
+                label.as_str(),
+                updated_at
+            );
         }
-        None => out.push(CheckResult::fail(
-            SECTION,
-            "identity",
-            format!(
-                "no agent is bound to this session — run `clank as <label>` \
-                 (inside this session) or `clank init` to bootstrap"
-            ),
-        )),
     }
-
-    out
+    format!("resolved to `{}` (source unknown)", resolved.as_str())
 }
 
 fn render(results: &[CheckResult], json: bool) -> anyhow::Result<()> {
@@ -687,5 +724,63 @@ mod tests {
         std::fs::write(&p, r#"{"hooks":{}}"#).unwrap();
         let r = check_hook_entry(&p, "claude", "test");
         assert_eq!(r.status, CheckStatus::Warn);
+    }
+
+    #[test]
+    fn session_checks_clank_agent_override_resolves_without_session_binding() {
+        // Regression: codex 3808a0d called out that doctor was
+        // failing identity when CLANK_AGENT was set but no agent
+        // config had a matching session binding. The pure
+        // resolver succeeds in that case (override > session
+        // lookup), and doctor must mirror that — otherwise it
+        // disagrees with `clank wfw` / `clank auto` which both
+        // happily run with just the override.
+        let dir = init_git_repo();
+        let repo = dir.path();
+
+        // SAFETY: tests share a process env; this is a focused
+        // test that sets exactly the vars it needs and clears them
+        // after. Don't run in parallel with anything that reads
+        // CLANK_AGENT.
+        let prev_clank_agent = std::env::var_os("CLANK_AGENT");
+        let prev_claude = std::env::var_os("CLAUDE_CODE_SESSION_ID");
+        let prev_codex = std::env::var_os("CODEX_THREAD_ID");
+        unsafe {
+            std::env::set_var("CLANK_AGENT", "alice");
+            std::env::remove_var("CLAUDE_CODE_SESSION_ID");
+            std::env::remove_var("CODEX_THREAD_ID");
+        }
+
+        let results = session_checks(Some(repo));
+        let identity = results
+            .iter()
+            .find(|r| r.name == "identity")
+            .expect("identity check ran");
+        assert_eq!(
+            identity.status,
+            CheckStatus::Ok,
+            "expected OK for CLANK_AGENT override; got {:?}: {}",
+            identity.status,
+            identity.message
+        );
+        assert!(
+            identity.message.contains("alice") && identity.message.contains("CLANK_AGENT"),
+            "identity message should attribute to override: {}",
+            identity.message
+        );
+
+        // Restore env.
+        unsafe {
+            match prev_clank_agent {
+                Some(v) => std::env::set_var("CLANK_AGENT", v),
+                None => std::env::remove_var("CLANK_AGENT"),
+            }
+            if let Some(v) = prev_claude {
+                std::env::set_var("CLAUDE_CODE_SESSION_ID", v);
+            }
+            if let Some(v) = prev_codex {
+                std::env::set_var("CODEX_THREAD_ID", v);
+            }
+        }
     }
 }
