@@ -8,7 +8,8 @@
 //! `blake3`, not a wire crate dep).
 
 pub use clank_core::ids::{
-    AgentLabel, CommitSha, ContentHash, IdError, ParsePlanIdError, PlanId, PlanKey, RepoBasename,
+    AgentLabel, CommitRef, CommitSha, ContentHash, IdError, ParsePlanIdError, PlanId, PlanKey,
+    RepoBasename,
 };
 
 /// Stable content hash for a plan-file body. Identifies "is this the

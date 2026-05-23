@@ -898,23 +898,30 @@ pub async fn snapshot(repo_root: &Path) -> Result<CommitSnapshot, GitIoError> {
     })
 }
 
-/// Walk `<repo>/.clank/feedback/` and return every well-formed
+/// Walk `<repo>/.clank/agents/` and return every well-formed
 /// feedback file with its body and mtime. Public for the live
 /// overlay path in `rebuild_repo` and any caller that wants the
 /// raw feedback set.
+///
+/// `parse_feedback_path` takes paths RELATIVE TO
+/// `<repo>/.clank/`, so we strip that prefix before parsing
+/// (the parser sees `agents/<author>/feedback/<plan-or-_>/
+/// <ref>.md`).
 pub fn collect_feedback_files(repo_root: &Path) -> Result<Vec<FeedbackBlob>, GitIoError> {
-    let feedback_root = repo_root.join(".clank").join("feedback");
-    if !feedback_root.exists() {
+    let clank_root = repo_root.join(".clank");
+    let agents_root = clank_root.join("agents");
+    if !agents_root.exists() {
         return Ok(Vec::new());
     }
     let mut paths = Vec::new();
-    walk_files(&feedback_root, 4, &mut paths).map_err(|e| GitIoError::Parse {
-        context: "walk feedback dir".into(),
+    // Depth from `agents/`: <author>/feedback/<target>/<ref>.md = 4 segments.
+    walk_files(&agents_root, 4, &mut paths).map_err(|e| GitIoError::Parse {
+        context: "walk agents dir".into(),
         detail: format!("{e}"),
     })?;
     let mut out = Vec::with_capacity(paths.len());
     for abs in paths {
-        let Ok(rel) = abs.strip_prefix(&feedback_root) else {
+        let Ok(rel) = abs.strip_prefix(&clank_root) else {
             continue;
         };
         let Some(parsed) = parse_feedback_path(rel) else {

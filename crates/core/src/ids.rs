@@ -52,6 +52,7 @@ macro_rules! string_newtype {
 }
 
 string_newtype!(CommitSha);
+string_newtype!(CommitRef);
 string_newtype!(ContentHash);
 string_newtype!(AgentLabel);
 string_newtype!(PlanKey);
@@ -187,6 +188,57 @@ impl CommitSha {
             });
         }
         Ok(CommitSha(s.to_string()))
+    }
+}
+
+impl CommitRef {
+    /// Parse an on-disk commit reference — the filename stem
+    /// for a feedback file. 7–40 lowercase hex chars. NOT a
+    /// commit identity by itself; use `resolve_against` to
+    /// disambiguate against a known scope.
+    pub fn parse(s: &str) -> Result<Self, IdError> {
+        const KIND: &str = "CommitRef";
+        const MIN: usize = 7;
+        const MAX: usize = 40;
+        if s.len() < MIN || s.len() > MAX {
+            return Err(IdError::BadLength {
+                kind: KIND,
+                min: MIN,
+                max: MAX,
+                len: s.len(),
+            });
+        }
+        if !s
+            .chars()
+            .all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c))
+        {
+            return Err(IdError::NotHex {
+                kind: KIND,
+                value: s.to_string(),
+            });
+        }
+        Ok(CommitRef(s.to_string()))
+    }
+
+    /// Resolve this ref against a known commit scope. Returns
+    /// `Some(full)` iff exactly one commit in `scope` has a
+    /// SHA that starts with `self.as_str()` (or equals it
+    /// when `self` is 40 chars). `None` for no match (orphan)
+    /// or multiple matches (ambiguous — shouldn't happen
+    /// under the per-target filename-mode rule, but the type
+    /// doesn't pretend it can't).
+    pub fn resolve_against(&self, scope: &[CommitSha]) -> Option<CommitSha> {
+        let prefix = self.as_str();
+        let mut hit: Option<&CommitSha> = None;
+        for sha in scope {
+            if sha.as_str().starts_with(prefix) {
+                if hit.is_some() {
+                    return None; // ambiguous
+                }
+                hit = Some(sha);
+            }
+        }
+        hit.cloned()
     }
 }
 
@@ -579,6 +631,92 @@ mod tests {
             CommitSha::parse(&s),
             Err(IdError::BadLength { .. })
         ));
+    }
+
+    // ============ CommitRef ============
+
+    #[test]
+    fn commit_ref_accepts_7_through_40_hex() {
+        assert!(CommitRef::parse("abc1234").is_ok());
+        assert!(CommitRef::parse(&"a".repeat(40)).is_ok());
+        assert!(CommitRef::parse(&"f".repeat(20)).is_ok());
+    }
+
+    #[test]
+    fn commit_ref_rejects_under_7() {
+        assert!(matches!(
+            CommitRef::parse("abc123"),
+            Err(IdError::BadLength { .. })
+        ));
+    }
+
+    #[test]
+    fn commit_ref_rejects_over_40() {
+        let s = "a".repeat(41);
+        assert!(matches!(
+            CommitRef::parse(&s),
+            Err(IdError::BadLength { .. })
+        ));
+    }
+
+    #[test]
+    fn commit_ref_rejects_uppercase() {
+        assert!(matches!(
+            CommitRef::parse("ABC1234"),
+            Err(IdError::NotHex { .. })
+        ));
+    }
+
+    #[test]
+    fn commit_ref_rejects_non_hex() {
+        assert!(matches!(
+            CommitRef::parse("xyzqrst"),
+            Err(IdError::NotHex { .. })
+        ));
+    }
+
+    #[test]
+    fn commit_ref_rejects_empty() {
+        assert!(matches!(
+            CommitRef::parse(""),
+            Err(IdError::BadLength { .. })
+        ));
+    }
+
+    #[test]
+    fn commit_ref_resolve_full_in_scope() {
+        let full = CommitSha::parse(&"a".repeat(40)).unwrap();
+        let r = CommitRef::parse(&"a".repeat(40)).unwrap();
+        assert_eq!(r.resolve_against(&[full.clone()]), Some(full));
+    }
+
+    #[test]
+    fn commit_ref_resolve_short_matches_unique_scope() {
+        let full = CommitSha::parse("abcdef0111111111111111111111111111111111").unwrap();
+        let other = CommitSha::parse("ffeeddc1111111111111111111111111111111ff").unwrap();
+        let r = CommitRef::parse("abcdef0").unwrap();
+        assert_eq!(r.resolve_against(&[full.clone(), other]), Some(full));
+    }
+
+    #[test]
+    fn commit_ref_resolve_ambiguous_returns_none() {
+        let a = CommitSha::parse("abcdef0111111111111111111111111111111111").unwrap();
+        let b = CommitSha::parse("abcdef0222222222222222222222222222222222").unwrap();
+        let r = CommitRef::parse("abcdef0").unwrap();
+        assert_eq!(r.resolve_against(&[a, b]), None);
+    }
+
+    #[test]
+    fn commit_ref_resolve_orphan_returns_none() {
+        let s = CommitSha::parse(&"a".repeat(40)).unwrap();
+        let r = CommitRef::parse("deadbee").unwrap();
+        assert_eq!(r.resolve_against(&[s]), None);
+    }
+
+    #[test]
+    fn commit_ref_resolve_empty_scope_returns_none() {
+        let r = CommitRef::parse("abc1234").unwrap();
+        assert_eq!(r.resolve_against(&[]), None);
     }
 
     #[test]

@@ -62,13 +62,14 @@ pub fn path_to_signal(
         return Some(signal);
     }
 
-    // .clank/feedback/<plan-key>/<sha>/<author>.md
-    if let Ok(rest) = rel.strip_prefix(".clank/feedback") {
-        let parsed = parse_feedback_path(rest)?;
-        return Some(match event_kind {
-            FsEventKind::CreatedOrModified => FilesystemSignal::FeedbackWritten { parsed },
-            FsEventKind::Removed => FilesystemSignal::FeedbackRemoved { parsed },
-        });
+    // .clank/agents/<author>/feedback/<target>/<commit-ref>.md
+    if let Ok(rest) = rel.strip_prefix(".clank") {
+        if let Some(parsed) = parse_feedback_path(rest) {
+            return Some(match event_kind {
+                FsEventKind::CreatedOrModified => FilesystemSignal::FeedbackWritten { parsed },
+                FsEventKind::Removed => FilesystemSignal::FeedbackRemoved { parsed },
+            });
+        }
     }
 
     None
@@ -202,9 +203,9 @@ mod tests {
     }
 
     #[test]
-    fn feedback_canonical_sha_path() {
+    fn feedback_canonical_path() {
         let sig = path_to_signal(
-            &repo().join(".clank/feedback/foo/abc1234/alice.md"),
+            &repo().join(".clank/agents/alice/feedback/foo/abc1234.md"),
             &repo(),
             FsEventKind::CreatedOrModified,
         );
@@ -212,32 +213,35 @@ mod tests {
             Some(FilesystemSignal::FeedbackWritten { parsed }) => {
                 assert_eq!(parsed.plan_key().unwrap().as_str(), "foo");
                 assert_eq!(parsed.author.as_str(), "alice");
-                assert_eq!(parsed.target_sha.as_str(), "abc1234");
+                assert_eq!(parsed.target_ref.as_str(), "abc1234");
             }
             other => panic!("expected FeedbackWritten, got {other:?}"),
         }
     }
 
     #[test]
-    fn legacy_commits_segment_yields_no_signal() {
+    fn feedback_ad_hoc_path() {
         let sig = path_to_signal(
-            &repo().join(".clank/feedback/foo/commits/abc1234/alice.md"),
+            &repo().join(".clank/agents/codex/feedback/_/abc1234.md"),
             &repo(),
             FsEventKind::CreatedOrModified,
         );
-        assert!(sig.is_none());
+        match sig {
+            Some(FilesystemSignal::FeedbackWritten { parsed }) => {
+                assert!(parsed.plan_key().is_none());
+                assert_eq!(parsed.author.as_str(), "codex");
+                assert_eq!(parsed.target_ref.as_str(), "abc1234");
+            }
+            other => panic!("expected FeedbackWritten, got {other:?}"),
+        }
     }
 
     #[test]
-    fn legacy_plan_segment_yields_no_signal() {
+    fn legacy_feedback_root_yields_no_signal() {
+        // The old `.clank/feedback/<plan>/<sha>/<author>.md`
+        // layout no longer parses.
         let sig = path_to_signal(
-            &repo().join(".clank/feedback/foo/plan/alice.md"),
-            &repo(),
-            FsEventKind::CreatedOrModified,
-        );
-        assert!(sig.is_none());
-        let sig = path_to_signal(
-            &repo().join(".clank/feedback/foo/plan/abc1234/alice.md"),
+            &repo().join(".clank/feedback/foo/abc1234/alice.md"),
             &repo(),
             FsEventKind::CreatedOrModified,
         );
@@ -247,7 +251,7 @@ mod tests {
     #[test]
     fn feedback_removed() {
         let sig = path_to_signal(
-            &repo().join(".clank/feedback/foo/def5678/bob.md"),
+            &repo().join(".clank/agents/bob/feedback/foo/def5678.md"),
             &repo(),
             FsEventKind::Removed,
         );

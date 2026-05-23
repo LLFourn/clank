@@ -118,7 +118,7 @@ fn wfw_reviewer_wakes_on_new_reviewable_commit() {
     // No reviewer-eligible work for her.
     write(
         repo,
-        &format!(".clank/feedback/foo/{intro_sha}/alice.md"),
+        &format!(".clank/agents/alice/feedback/foo/{intro_sha}.md"),
         "APPROVE\n\nlgtm\n",
     );
 
@@ -151,8 +151,8 @@ fn wfw_reviewer_wakes_on_new_reviewable_commit() {
         "expected review work on new sha {new_sha}; got stdout=`{stdout}`"
     );
     assert!(
-        stdout.contains("alice.md"),
-        "expected feedback path for alice; got stdout=`{stdout}`"
+        stdout.contains("/agents/alice/feedback/"),
+        "expected feedback path under alice's agent dir; got stdout=`{stdout}`"
     );
 }
 
@@ -171,7 +171,7 @@ fn wfw_reviewer_wakes_on_code_only_commit() {
     // alice approved the intro; gate=Approved at startup.
     write(
         repo,
-        &format!(".clank/feedback/foo/{intro_sha}/alice.md"),
+        &format!(".clank/agents/alice/feedback/foo/{intro_sha}.md"),
         "APPROVE\n\nlgtm\n",
     );
 
@@ -232,7 +232,7 @@ fn wfw_reviewer_wakes_on_commit_with_index_already_staged() {
     // alice approved the intro; gate=Approved at startup.
     write(
         repo,
-        &format!(".clank/feedback/foo/{intro_sha}/alice.md"),
+        &format!(".clank/agents/alice/feedback/foo/{intro_sha}.md"),
         "APPROVE\n\nlgtm\n",
     );
 
@@ -292,7 +292,7 @@ fn wfw_master_wakes_on_request_changes_feedback() {
     // to ChangesRequested, waiting_on becomes MasterToRevise.
     write(
         repo,
-        &format!(".clank/feedback/foo/{intro_sha}/codex.md"),
+        &format!(".clank/agents/codex/feedback/foo/{intro_sha}.md"),
         "REQUEST_CHANGES\n\ntake another look\n",
     );
 
@@ -341,7 +341,7 @@ fn wfw_wakes_inside_linked_worktree_when_its_ref_moves() {
     // so there's no reviewer work at startup.
     write(
         wt,
-        &format!(".clank/feedback/foo/{initial_head}/alice.md"),
+        &format!(".clank/agents/alice/feedback/foo/{initial_head}.md"),
         "APPROVE\n\nlgtm\n",
     );
 
@@ -413,7 +413,7 @@ fn wfw_master_plan_only_approval_routes_to_implement() {
 
     write(
         repo,
-        &format!(".clank/feedback/foo/{intro_sha}/alice.md"),
+        &format!(".clank/agents/alice/feedback/foo/{intro_sha}.md"),
         "APPROVE\n\nlgtm\n",
     );
 
@@ -455,7 +455,7 @@ fn wfw_master_code_only_approval_routes_to_finalize() {
 
     write(
         repo,
-        &format!(".clank/feedback/foo/{intro_sha}/alice.md"),
+        &format!(".clank/agents/alice/feedback/foo/{intro_sha}.md"),
         "APPROVE\n\nplan lgtm\n",
     );
 
@@ -466,7 +466,7 @@ fn wfw_master_code_only_approval_routes_to_finalize() {
 
     write(
         repo,
-        &format!(".clank/feedback/foo/{impl_sha}/alice.md"),
+        &format!(".clank/agents/alice/feedback/foo/{impl_sha}.md"),
         "APPROVE\n\nimpl lgtm\n",
     );
 
@@ -503,7 +503,7 @@ fn wfw_reviewer_finish_wake_human_output() {
 
     write(
         repo,
-        &format!(".clank/feedback/foo/{intro_sha}/alice.md"),
+        &format!(".clank/agents/alice/feedback/foo/{intro_sha}.md"),
         "APPROVE\n\nlgtm\n",
     );
 
@@ -545,7 +545,7 @@ fn wfw_reviewer_finish_wake_json_output() {
     let intro_sha = head_sha(repo);
     write(
         repo,
-        &format!(".clank/feedback/foo/{intro_sha}/alice.md"),
+        &format!(".clank/agents/alice/feedback/foo/{intro_sha}.md"),
         "APPROVE\n\nlgtm\n",
     );
 
@@ -595,7 +595,7 @@ fn wfw_plan_filter_finish_wake() {
     let intro_sha = head_sha(repo);
     write(
         repo,
-        &format!(".clank/feedback/foo/{intro_sha}/alice.md"),
+        &format!(".clank/agents/alice/feedback/foo/{intro_sha}.md"),
         "APPROVE\n",
     );
 
@@ -646,12 +646,12 @@ fn wfw_mixed_work_and_finished_on_one_wake() {
 
     write(
         repo,
-        &format!(".clank/feedback/a/{a_intro}/alice.md"),
+        &format!(".clank/agents/alice/feedback/a/{a_intro}.md"),
         "APPROVE\n",
     );
     write(
         repo,
-        &format!(".clank/feedback/b/{b_intro}/alice.md"),
+        &format!(".clank/agents/alice/feedback/b/{b_intro}.md"),
         "APPROVE\n",
     );
 
@@ -711,25 +711,16 @@ fn wfw_finish_wake_survives_early_snapshot_event() {
     let dir = init_repo();
     let repo = dir.path();
     write(repo, ".clank/plans/foo.md", "# foo\n");
-    write(
-        repo,
-        ".clank/feedback/foo/placeholder.md",
-        "anchor so the feedback dir is tracked\n",
-    );
     commit(repo, "[foo] intro");
     let intro_sha = head_sha(repo);
-    // Approval — tracked from the start so the finalize commit
-    // doesn't auto-stage it via `git add -A`.
+    // Approval is untracked feedback — `.clank/agents/` is
+    // gitignored just like `.clank/feedback/` was. The
+    // subsequent staged-finalize commit doesn't pick it up.
     write(
         repo,
-        &format!(".clank/feedback/foo/{intro_sha}/alice.md"),
+        &format!(".clank/agents/alice/feedback/foo/{intro_sha}.md"),
         "APPROVE\n",
     );
-    git(
-        repo,
-        &["add", &format!(".clank/feedback/foo/{intro_sha}/alice.md")],
-    );
-    commit(repo, "[foo] approval anchor");
 
     let mut child = spawn_wfw(
         repo,
@@ -782,7 +773,7 @@ fn wfw_plan_already_finished_at_startup_emits_finished_and_exits() {
     let intro_sha = head_sha(repo);
     write(
         repo,
-        &format!(".clank/feedback/foo/{intro_sha}/alice.md"),
+        &format!(".clank/agents/alice/feedback/foo/{intro_sha}.md"),
         "APPROVE\n",
     );
     clank_run(repo, &["finish", "foo"]);
@@ -838,7 +829,7 @@ fn wfw_polling_mode_wakes_on_commit_via_periodic_refold() {
     let intro_sha = head_sha(repo);
     write(
         repo,
-        &format!(".clank/feedback/foo/{intro_sha}/alice.md"),
+        &format!(".clank/agents/alice/feedback/foo/{intro_sha}.md"),
         "APPROVE\n\nlgtm\n",
     );
 

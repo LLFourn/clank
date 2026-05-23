@@ -24,6 +24,10 @@ pub struct WorktreeFacts {
 pub struct PlanView {
     pub plan: PlanKey,
     pub latest_reviewable_sha: CommitSha,
+    /// Every reviewable commit on this plan's timeline, in
+    /// chronological order. The set the
+    /// short-vs-long-feedback-filename mode is decided over.
+    pub reviewable_shas: Vec<CommitSha>,
     pub gate_state: CommitGateState,
     pub waiting_on: WaitingOn,
     pub worktree_status: PlanWorktreeStatus,
@@ -79,12 +83,20 @@ pub fn project(
 
     let last_activity_ts = ps.commits.iter().map(|e| e.ts).max().unwrap_or(latest.ts);
 
+    let reviewable_shas: Vec<CommitSha> = ps
+        .commits
+        .iter()
+        .filter(|e| e.touched_plan || e.touched_code)
+        .map(|e| e.sha.clone())
+        .collect();
+
     let (gate_state, waiting_on) =
         evaluate(feedback, &latest.sha, latest.touched_code, worktree.status);
 
     Some(PlanView {
         plan: plan_key.clone(),
         latest_reviewable_sha: latest.sha.clone(),
+        reviewable_shas,
         gate_state,
         waiting_on,
         worktree_status: worktree.status,

@@ -356,7 +356,7 @@ mod tests {
         run_git(dir.path(), &["add", "-A"]);
         run_git(dir.path(), &["commit", "--quiet", "-m", "seed"]);
 
-        let approval = ".clank/feedback/foo/abcdef/codex.md";
+        let approval = ".clank/agents/codex/feedback/foo/abcdef.md";
         let body = "APPROVE\n\nlgtm\n";
         write_at(dir.path(), approval, body);
 
@@ -391,7 +391,7 @@ mod tests {
         let stale_snapshot = ".clank/finished/foo/codex.md";
         write_at(dir.path(), stale_snapshot, "OLD APPROVE\n");
 
-        let approval = ".clank/feedback/foo/abcdef/codex.md";
+        let approval = ".clank/agents/codex/feedback/foo/abcdef.md";
         write_at(dir.path(), approval, "APPROVE\n\non-disk body\n");
         // Preview expects a different body — the daemon's projection
         // is stale relative to disk.
@@ -423,7 +423,7 @@ mod tests {
         write_at(dir.path(), stale_snapshot, "OLD APPROVE\n");
 
         // Approval file does NOT exist on disk.
-        let preview = mk_preview_ready(".clank/feedback/foo/abcdef/codex.md", "APPROVE\n");
+        let preview = mk_preview_ready(".clank/agents/codex/feedback/foo/abcdef.md", "APPROVE\n");
 
         let err = finalize(dir.path(), "foo", &preview, false, None)
             .await
@@ -446,8 +446,8 @@ mod tests {
         run_git(dir.path(), &["commit", "--quiet", "-m", "seed"]);
 
         // First finalize: two approvers.
-        let codex_approval = ".clank/feedback/foo/abcdef/codex.md";
-        let claude_approval = ".clank/feedback/foo/abcdef/claude.md";
+        let codex_approval = ".clank/agents/codex/feedback/foo/abcdef.md";
+        let claude_approval = ".clank/agents/claude/feedback/foo/abcdef.md";
         write_at(dir.path(), codex_approval, "APPROVE codex\n");
         write_at(dir.path(), claude_approval, "APPROVE claude\n");
 

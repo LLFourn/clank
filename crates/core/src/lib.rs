@@ -51,5 +51,6 @@ pub use vocab::{CommitGateState, PlanLifecycle, PlanWorktreeStatus, Verdict, Wai
 
 // Re-export the identifier newtypes at crate root.
 pub use ids::{
-    AgentLabel, CommitSha, ContentHash, IdError, ParsePlanIdError, PlanId, PlanKey, RepoBasename,
+    AgentLabel, CommitRef, CommitSha, ContentHash, IdError, ParsePlanIdError, PlanId, PlanKey,
+    RepoBasename,
 };

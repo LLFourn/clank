@@ -7,25 +7,27 @@
 
 use std::path::{Component, Path, PathBuf};
 
-use crate::lifecycle::{AgentLabel, CommitSha, PlanKey};
+use crate::lifecycle::{AgentLabel, CommitRef, CommitSha, PlanKey};
 use crate::repo_state::Verdict;
+use clank_core::feedback_view::{FilenameMode, filename_mode, filename_stem};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FeedbackPath {
+    pub author: AgentLabel,
     /// What this feedback file targets — a specific plan's commit
     /// (`Plan`), or a commit outside any plan (`AdHoc`, encoded
-    /// under the reserved `_` first segment per Phase 4 of
-    /// `commit-first-review-model`).
+    /// under the reserved `_` target segment).
     pub target: FeedbackTarget,
-    pub target_sha: CommitSha,
-    pub author: AgentLabel,
+    /// On-disk commit reference (7–40 hex). NOT commit identity
+    /// on its own — resolve against the target's reviewable scope
+    /// before comparing to `CommitSha`.
+    pub target_ref: CommitRef,
     pub raw: PathBuf,
 }
 
-/// What a feedback file targets. Phase 4 of
-/// `commit-first-review-model` adds `AdHoc` so commits touching no
-/// plan file are reviewable as first-class units; their feedback
-/// lives at `.clank/feedback/_/<sha>/<author>.md`.
+/// What a feedback file targets. `AdHoc` covers commits touching
+/// no plan file — their feedback lives at the reserved `_` target
+/// segment.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FeedbackTarget {
     Plan(PlanKey),
@@ -33,16 +35,14 @@ pub enum FeedbackTarget {
 }
 
 /// Reserved segment used in feedback paths to indicate ad hoc
-/// (no-plan) reviewability. `PlanKey::parse("_")` continues to
-/// reject this token; the path parser checks it before falling
-/// through to `PlanKey::parse`.
+/// (no-plan) reviewability. `PlanKey::parse("_")` rejects this
+/// token; the path parser checks it before falling through to
+/// `PlanKey::parse`.
 pub const AD_HOC_FEEDBACK_KEY: &str = "_";
 
 impl FeedbackPath {
-    /// Backwards-compatible convenience: the plan key this feedback
-    /// is attributed to, or `None` for ad hoc feedback. Existing
-    /// call sites that only care about plan-targeted feedback can
-    /// pattern-match on this.
+    /// Convenience: the plan key this feedback is attributed to,
+    /// or `None` for ad hoc feedback.
     pub fn plan_key(&self) -> Option<&PlanKey> {
         match &self.target {
             FeedbackTarget::Plan(key) => Some(key),
@@ -51,16 +51,23 @@ impl FeedbackPath {
     }
 }
 
-/// Parse a path relative to `<repo>/.clank/feedback/` into a
-/// `FeedbackPath`. Expected shape:
+/// Parse a path RELATIVE TO `<repo>/.clank/` into a
+/// `FeedbackPath`. The single parser used by every consumer
+/// (`feedback_scan`, `git_io::collect_feedback_files`,
+/// `fs_watcher::path_to_signal`). No caller hand-rolls
+/// segment splitting.
 ///
-/// `<plan-key>/<target-sha>/<author>.md`
+/// Accepted shape:
 ///
-/// The reserved first segment `_` indicates ad hoc (no-plan)
-/// feedback and parses into `FeedbackTarget::AdHoc`.
+/// `agents/<author>/feedback/<plan-or-_>/<commit-ref>.md`
 ///
-/// Returns `None` for any other shape (a stray `.DS_Store`, the legacy
-/// `<plan-key>/commits/<sha>/<author>.md` layout, etc.).
+/// - `<author>`     parses through `AgentLabel::parse`.
+/// - `<plan-or-_>`  parses through `PlanKey::parse`, OR matches
+///   the reserved `_` literal (→ `AdHoc`).
+/// - `<commit-ref>` parses through `CommitRef::parse` (7–40 hex).
+///
+/// Returns `None` for any other shape (`.DS_Store`, legacy
+/// `feedback/<plan>/<sha>/<author>.md`, etc.).
 pub fn parse_feedback_path(rel: &Path) -> Option<FeedbackPath> {
     let segments: Vec<&std::ffi::OsStr> = rel
         .components()
@@ -70,32 +77,32 @@ pub fn parse_feedback_path(rel: &Path) -> Option<FeedbackPath> {
         })
         .collect();
 
-    let (session, sha_seg, file_seg) = match segments.as_slice() {
-        [session, sha, file] => (*session, *sha, *file),
+    let (agents_lit, author_seg, feedback_lit, target_seg, file_seg) = match segments.as_slice() {
+        [a, b, c, d, e] => (*a, *b, *c, *d, *e),
         _ => return None,
     };
 
-    let session_str = session.to_str()?;
-    let file_str = file_seg.to_str()?;
-    let author = file_str.strip_suffix(".md")?;
-    if author.is_empty() {
-        return None;
-    }
-    let sha_str = sha_seg.to_str()?;
-    if !is_sha_segment(sha_str) {
+    if agents_lit.to_str()? != "agents" || feedback_lit.to_str()? != "feedback" {
         return None;
     }
 
-    let target = if session_str == AD_HOC_FEEDBACK_KEY {
+    let author = AgentLabel::parse(author_seg.to_str()?).ok()?;
+
+    let target_str = target_seg.to_str()?;
+    let target = if target_str == AD_HOC_FEEDBACK_KEY {
         FeedbackTarget::AdHoc
     } else {
-        FeedbackTarget::Plan(PlanKey::parse(session_str).ok()?)
+        FeedbackTarget::Plan(PlanKey::parse(target_str).ok()?)
     };
 
+    let file_str = file_seg.to_str()?;
+    let stem = file_str.strip_suffix(".md")?;
+    let target_ref = CommitRef::parse(stem).ok()?;
+
     Some(FeedbackPath {
+        author,
         target,
-        target_sha: CommitSha::parse(sha_str).ok()?,
-        author: AgentLabel::parse(author).ok()?,
+        target_ref,
         raw: rel.to_path_buf(),
     })
 }
@@ -145,43 +152,58 @@ pub fn finalize_first_line_starts_with_approve(first_line: &str) -> bool {
     first_line.trim_start().starts_with("APPROVE")
 }
 
+/// Render the target slot (`<plan-or-_>`) as a path segment.
+pub fn target_segment(target: &FeedbackTarget) -> &str {
+    match target {
+        FeedbackTarget::Plan(key) => key.as_str(),
+        FeedbackTarget::AdHoc => AD_HOC_FEEDBACK_KEY,
+    }
+}
+
 /// Build the canonical relative feedback path
-/// `<plan-key>/<target-sha>/<author>.md` (the part under
-/// `.clank/feedback/`).
+/// `agents/<author>/feedback/<target>/<ref>.md` (the part under
+/// `<repo>/.clank/`). The caller supplies `scope_shas` — every
+/// reviewable commit in this target's scope — so the writer can
+/// pick the right per-target filename mode (short vs full SHA).
 pub fn canonical_feedback_path(
-    plan_key: &PlanKey,
-    target_sha: &CommitSha,
     author: &AgentLabel,
+    target: &FeedbackTarget,
+    target_sha: &CommitSha,
+    scope_shas: &[CommitSha],
 ) -> PathBuf {
+    let mode = filename_mode(scope_shas);
+    let stem = filename_stem(target_sha, mode);
     PathBuf::from(format!(
-        "{}/{}/{}.md",
-        plan_key.as_str(),
-        target_sha.as_str(),
-        author.as_str()
+        "agents/{}/feedback/{}/{}.md",
+        author.as_str(),
+        target_segment(target),
+        stem
     ))
 }
 
 /// Build the repo-relative wire-form feedback path
-/// `.clank/feedback/<plan-key>/<sha>/<author>.md`. This is the
-/// string that lives on `WorkPayload` action variants and on
-/// `StaleReview.path`. Single source of truth for the wire shape so
-/// projection (`responses::build_work_payload`) and the stale-review
-/// collector cannot drift.
-pub fn feedback_path_wire(plan_key: &PlanKey, sha: &str, author: &AgentLabel) -> String {
+/// `.clank/agents/<author>/feedback/<target>/<ref>.md`. This is
+/// the string that lives on `WaitItem::Reviewer.feedback_path`
+/// (and historically on `WorkPayload` / `StaleReview` shapes).
+/// Single source of truth for the wire shape.
+pub fn feedback_path_wire(
+    author: &AgentLabel,
+    target: &FeedbackTarget,
+    target_sha: &CommitSha,
+    scope_shas: &[CommitSha],
+) -> String {
     format!(
-        ".clank/feedback/{}/{}/{}.md",
-        plan_key.as_str(),
-        sha,
-        author.as_str()
+        ".clank/{}",
+        canonical_feedback_path(author, target, target_sha, scope_shas).display()
     )
 }
 
-/// Plausible SHA-1 segment: hex string of length 7–40. Clank accepts
-/// shortened SHAs in path segments since git accepts them and reviewers
-/// commonly paste short SHAs.
-fn is_sha_segment(s: &str) -> bool {
-    s.len() >= 7 && s.len() <= 40 && s.chars().all(|c| c.is_ascii_hexdigit())
-}
+/// Re-export for tests that want to use the mode helper
+/// directly. Kept as part of the disk_format surface since
+/// callers building feedback paths use it.
+pub use clank_core::feedback_view::FilenameMode as PlanFilenameMode;
+#[allow(dead_code)]
+fn _filename_mode_marker(_: FilenameMode) {}
 
 /// Parse the first non-empty line of a feedback file body as a verdict
 /// marker. Only exact uppercase tokens `APPROVE` / `REQUEST_CHANGES` count;
@@ -203,61 +225,92 @@ mod tests {
     }
 
     #[test]
-    fn canonical_path_parses() {
-        let parsed = parse_feedback_path(&p("foo/abc1234/bob.md")).unwrap();
+    fn plan_scoped_short_ref_parses() {
+        let parsed = parse_feedback_path(&p("agents/bob/feedback/foo/abc1234.md")).unwrap();
         assert_eq!(parsed.plan_key().unwrap().as_str(), "foo");
-        assert_eq!(parsed.target_sha.as_str(), "abc1234");
+        assert_eq!(parsed.target_ref.as_str(), "abc1234");
         assert_eq!(parsed.author.as_str(), "bob");
     }
 
     #[test]
-    fn ad_hoc_path_parses() {
-        let parsed = parse_feedback_path(&p("_/abc1234/codex.md")).unwrap();
-        assert_eq!(parsed.target, FeedbackTarget::AdHoc);
-        assert!(parsed.plan_key().is_none());
-        assert_eq!(parsed.target_sha.as_str(), "abc1234");
-        assert_eq!(parsed.author.as_str(), "codex");
-    }
-
-    #[test]
-    fn full_sha_accepted() {
-        let parsed =
-            parse_feedback_path(&p("foo/abcdef0123456789abcdef0123456789abcdef01/x.md")).unwrap();
+    fn plan_scoped_full_sha_parses() {
+        let parsed = parse_feedback_path(&p(
+            "agents/bob/feedback/foo/abcdef0123456789abcdef0123456789abcdef01.md",
+        ))
+        .unwrap();
         assert_eq!(
-            parsed.target_sha.as_str(),
+            parsed.target_ref.as_str(),
             "abcdef0123456789abcdef0123456789abcdef01"
         );
     }
 
     #[test]
-    fn short_sha_below_minimum_rejected() {
-        assert!(parse_feedback_path(&p("foo/abc012/x.md")).is_none());
+    fn ad_hoc_short_ref_parses() {
+        let parsed = parse_feedback_path(&p("agents/codex/feedback/_/abc1234.md")).unwrap();
+        assert_eq!(parsed.target, FeedbackTarget::AdHoc);
+        assert!(parsed.plan_key().is_none());
+        assert_eq!(parsed.target_ref.as_str(), "abc1234");
+        assert_eq!(parsed.author.as_str(), "codex");
     }
 
     #[test]
-    fn non_hex_sha_rejected() {
-        assert!(parse_feedback_path(&p("foo/notasha1/x.md")).is_none());
+    fn ad_hoc_full_sha_parses() {
+        let parsed = parse_feedback_path(&p(
+            "agents/codex/feedback/_/abcdef0123456789abcdef0123456789abcdef01.md",
+        ))
+        .unwrap();
+        assert_eq!(parsed.target, FeedbackTarget::AdHoc);
     }
 
     #[test]
-    fn three_segment_paths_reject_unknown_middle_segment() {
-        assert!(parse_feedback_path(&p("foo/plan/alice.md")).is_none());
-        assert!(parse_feedback_path(&p("foo/impl/alice.md")).is_none());
+    fn missing_agents_prefix_rejected() {
+        assert!(parse_feedback_path(&p("bob/feedback/foo/abc1234.md")).is_none());
     }
 
     #[test]
-    fn too_few_segments_rejected() {
-        assert!(parse_feedback_path(&p("foo/alice.md")).is_none());
+    fn missing_feedback_segment_rejected() {
+        assert!(parse_feedback_path(&p("agents/bob/foo/abc1234.md")).is_none());
+    }
+
+    #[test]
+    fn invalid_author_rejected() {
+        assert!(parse_feedback_path(&p("agents/.hidden/feedback/foo/abc1234.md")).is_none());
+    }
+
+    #[test]
+    fn invalid_plan_key_rejected() {
+        // PlanKey rejects leading dot.
+        assert!(parse_feedback_path(&p("agents/bob/feedback/.bad/abc1234.md")).is_none());
+    }
+
+    #[test]
+    fn short_ref_below_minimum_rejected() {
+        // CommitRef requires >= 7 chars.
+        assert!(parse_feedback_path(&p("agents/bob/feedback/foo/abc012.md")).is_none());
+    }
+
+    #[test]
+    fn non_hex_ref_rejected() {
+        assert!(parse_feedback_path(&p("agents/bob/feedback/foo/notasha1.md")).is_none());
     }
 
     #[test]
     fn extra_segments_rejected() {
-        assert!(parse_feedback_path(&p("foo/abc1234/extra/x.md")).is_none());
+        assert!(parse_feedback_path(&p("agents/bob/feedback/foo/abc1234/extra.md")).is_none());
     }
 
     #[test]
     fn non_md_rejected() {
-        assert!(parse_feedback_path(&p("foo/abc1234/alice.txt")).is_none());
+        assert!(parse_feedback_path(&p("agents/bob/feedback/foo/abc1234.txt")).is_none());
+    }
+
+    #[test]
+    fn legacy_layout_rejected() {
+        // Old `.clank/feedback/<plan>/<sha>/<author>.md` shape no
+        // longer parses — the parser intentionally only accepts
+        // the new agent-keyed layout.
+        assert!(parse_feedback_path(&p("foo/abc1234/bob.md")).is_none());
+        assert!(parse_feedback_path(&p("feedback/foo/abc1234/bob.md")).is_none());
     }
 
     #[test]
@@ -299,14 +352,64 @@ mod tests {
     }
 
     #[test]
-    fn canonical_feedback_path_builds_expected_shape() {
+    fn canonical_feedback_path_short_mode() {
         let key = PlanKey::parse("foo").unwrap();
-        let sha = CommitSha::parse("abc1234").unwrap();
+        let target = FeedbackTarget::Plan(key);
+        let sha = CommitSha::parse("abcdef0111111111111111111111111111111111").unwrap();
         let author = AgentLabel::parse("alice").unwrap();
         assert_eq!(
-            canonical_feedback_path(&key, &sha, &author),
-            PathBuf::from("foo/abc1234/alice.md")
+            canonical_feedback_path(&author, &target, &sha, &[sha.clone()]),
+            PathBuf::from("agents/alice/feedback/foo/abcdef0.md")
         );
+    }
+
+    #[test]
+    fn canonical_feedback_path_long_mode_on_collision() {
+        let key = PlanKey::parse("foo").unwrap();
+        let target = FeedbackTarget::Plan(key);
+        let a = CommitSha::parse("abcdef0111111111111111111111111111111111").unwrap();
+        let b = CommitSha::parse("abcdef0222222222222222222222222222222222").unwrap();
+        let author = AgentLabel::parse("alice").unwrap();
+        // Two commits share `abcdef0` — scope is in long mode.
+        assert_eq!(
+            canonical_feedback_path(&author, &target, &a, &[a.clone(), b.clone()]),
+            PathBuf::from(format!("agents/alice/feedback/foo/{}.md", a.as_str()))
+        );
+    }
+
+    #[test]
+    fn canonical_feedback_path_ad_hoc() {
+        let target = FeedbackTarget::AdHoc;
+        let sha = CommitSha::parse("abcdef0111111111111111111111111111111111").unwrap();
+        let author = AgentLabel::parse("codex").unwrap();
+        assert_eq!(
+            canonical_feedback_path(&author, &target, &sha, &[sha.clone()]),
+            PathBuf::from("agents/codex/feedback/_/abcdef0.md")
+        );
+    }
+
+    #[test]
+    fn feedback_path_wire_prepends_dot_clank() {
+        let target = FeedbackTarget::Plan(PlanKey::parse("foo").unwrap());
+        let sha = CommitSha::parse("abcdef0111111111111111111111111111111111").unwrap();
+        let author = AgentLabel::parse("alice").unwrap();
+        assert_eq!(
+            feedback_path_wire(&author, &target, &sha, &[sha.clone()]),
+            ".clank/agents/alice/feedback/foo/abcdef0.md"
+        );
+    }
+
+    #[test]
+    fn canonical_and_parse_round_trip() {
+        let key = PlanKey::parse("foo").unwrap();
+        let target = FeedbackTarget::Plan(key.clone());
+        let sha = CommitSha::parse("abcdef0111111111111111111111111111111111").unwrap();
+        let author = AgentLabel::parse("alice").unwrap();
+        let built = canonical_feedback_path(&author, &target, &sha, &[sha.clone()]);
+        let parsed = parse_feedback_path(&built).expect("round-trip parse");
+        assert_eq!(parsed.author, author);
+        assert_eq!(parsed.target, target);
+        assert_eq!(parsed.target_ref.as_str(), "abcdef0");
     }
 
     #[test]

@@ -193,11 +193,14 @@ fn master(view: &PlanView, next: MasterNext, reason: WaitingReason) -> WaitItem 
 }
 
 fn reviewer_item(view: &PlanView, author: &AgentLabel) -> WaitItem {
+    use crate::feedback_view::{filename_mode, filename_stem};
+    let mode = filename_mode(&view.reviewable_shas);
+    let stem = filename_stem(&view.latest_reviewable_sha, mode);
     let path = format!(
-        ".clank/feedback/{}/{}/{}.md",
-        view.plan.as_str(),
-        view.latest_reviewable_sha.as_str(),
+        ".clank/agents/{}/feedback/{}/{}.md",
         author.as_str(),
+        view.plan.as_str(),
+        stem,
     );
     WaitItem::Reviewer {
         plan: view.plan.clone(),
@@ -223,9 +226,11 @@ mod tests {
     }
 
     fn view(plan_key: &str, sha_hex: &str, waiting: WaitingOn) -> PlanView {
+        let latest = sha(sha_hex);
         PlanView {
             plan: plan(plan_key),
-            latest_reviewable_sha: sha(sha_hex),
+            latest_reviewable_sha: latest.clone(),
+            reviewable_shas: vec![latest],
             gate_state: CommitGateState::Unreviewed,
             waiting_on: waiting,
             worktree_status: PlanWorktreeStatus::Clean,
@@ -275,7 +280,62 @@ mod tests {
         assert_eq!(out.len(), 1);
         match &out[0] {
             WaitItem::Reviewer { feedback_path, .. } => {
-                assert!(feedback_path.ends_with("/anyone.md"));
+                // New layout: .clank/agents/<author>/feedback/<plan>/<stem>.md
+                assert!(
+                    feedback_path.starts_with(".clank/agents/anyone/feedback/a/"),
+                    "got {feedback_path}"
+                );
+                assert!(feedback_path.ends_with(".md"));
+            }
+            other => panic!("expected Reviewer, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn reviewer_path_uses_short_sha_for_unique_prefixes() {
+        // Build a view with a real 40-char latest sha + a
+        // singleton reviewable scope. Short mode applies.
+        let plan_key = plan("p");
+        let latest = CommitSha::parse("abcdef0111111111111111111111111111111111").unwrap();
+        let v = PlanView {
+            plan: plan_key,
+            latest_reviewable_sha: latest.clone(),
+            reviewable_shas: vec![latest],
+            gate_state: CommitGateState::Unreviewed,
+            waiting_on: WaitingOn::FirstReview,
+            worktree_status: PlanWorktreeStatus::Clean,
+            last_activity_ts: 0,
+        };
+        let out = derive_work(std::slice::from_ref(&v), &label("alice"), Role::Reviewers);
+        match &out[0] {
+            WaitItem::Reviewer { feedback_path, .. } => {
+                assert_eq!(feedback_path, ".clank/agents/alice/feedback/p/abcdef0.md");
+            }
+            other => panic!("expected Reviewer, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn reviewer_path_uses_full_sha_for_colliding_short_prefix() {
+        let plan_key = plan("p");
+        let a = CommitSha::parse("abcdef0111111111111111111111111111111111").unwrap();
+        let b = CommitSha::parse("abcdef0222222222222222222222222222222222").unwrap();
+        let v = PlanView {
+            plan: plan_key,
+            latest_reviewable_sha: b.clone(),
+            reviewable_shas: vec![a, b.clone()],
+            gate_state: CommitGateState::Unreviewed,
+            waiting_on: WaitingOn::FirstReview,
+            worktree_status: PlanWorktreeStatus::Clean,
+            last_activity_ts: 0,
+        };
+        let out = derive_work(std::slice::from_ref(&v), &label("alice"), Role::Reviewers);
+        match &out[0] {
+            WaitItem::Reviewer { feedback_path, .. } => {
+                assert_eq!(
+                    feedback_path,
+                    &format!(".clank/agents/alice/feedback/p/{}.md", b.as_str())
+                );
             }
             other => panic!("expected Reviewer, got {other:?}"),
         }
