@@ -740,9 +740,30 @@ mod tests {
     }
 
     /// Helper: run a closure with a focused env state and
-    /// restore everything afterward. Reduces boilerplate across
-    /// the precedence regression tests.
+    /// restore everything afterward.
+    ///
+    /// Tests run in parallel by default and the process env is
+    /// global, so we hold a static mutex across the entire
+    /// save→set→run→restore window. The lock spans the closure
+    /// execution itself — releasing the lock around just
+    /// set/restore would let a concurrent test observe our
+    /// mid-run env. Codex flagged this on c1414f2.
+    ///
+    /// SAFETY (`set_var`/`remove_var`): holding `ENV_LOCK`
+    /// serializes every caller of `with_env` against every
+    /// other caller. Tests that read env outside `with_env`
+    /// would still be racy in principle; nothing in this
+    /// module does that.
     fn with_env<F: FnOnce()>(set: &[(&str, &str)], clear: &[&str], f: F) {
+        use std::sync::{Mutex, OnceLock};
+        static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        let lock = ENV_LOCK.get_or_init(|| Mutex::new(()));
+        // Poisoned-lock recovery: if a prior test panicked
+        // inside this critical section we still restored the
+        // env via catch_unwind below, so the poison flag
+        // carries no real risk.
+        let _guard = lock.lock().unwrap_or_else(|p| p.into_inner());
+
         let saved: Vec<(String, Option<std::ffi::OsString>)> = set
             .iter()
             .map(|(k, _)| (k.to_string(), std::env::var_os(k)))
