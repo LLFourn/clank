@@ -234,13 +234,18 @@ the appropriate env var, writes
 same id from stdin and iterates agent configs to find the match.
 
 **Bootstrap UX:**
-- Fresh install: no session entry yet → hook falls back to tool
-  name as label → `.clank/agents/claude/config.json` (auto-created
-  empty if missing). Works immediately, no `/clank` ceremony.
-- User wants custom name: `/clank as alice` → writes session
-  entry → from now on this session is "alice".
-- Cleanup: prune session entries older than 7 days on each `clank`
-  invocation. Cheap, prevents unbounded growth.
+- Fresh install: no agent config bound to this session →
+  resolver errors `NoAgentForSession`. Caller (hook / wfw /
+  status) surfaces "no agent set up for this session — run
+  `clank init` (inside this session) or `clank as <label>` to
+  bind".
+- User wants custom name later: `clank as alice` → writes
+  alice's config with this session binding (and clears the same
+  binding from any other agent that held it).
+- Cleanup: when an agent's binding is overwritten (e.g.
+  `clank as alice` then `clank as bob` in the same session),
+  the older agent's `session` field is cleared. No background
+  prune needed — stale bindings just stop matching anything.
 
 **Tool detection caveat.** Env vars that DO reliably indicate the
 running tool:
@@ -737,13 +742,24 @@ all I/O — reads stdin, env, and agent config files; constructs
 Pure resolver in `clank_core`:
 
 ```text
-fn resolve_agent_identity(inputs: &IdentityInputs) -> AgentLabel
-  precedence:
-    1. inputs.explicit_label (from CLANK_AGENT env)              → return
-    2. for each (label, agent_config) in inputs.agent_configs:
+fn resolve_agent_identity(inputs: &IdentityInputs)
+   -> Result<AgentLabel, ResolveError>
+
+precedence:
+  1. inputs.explicit_label (from CLANK_AGENT env)              → Ok
+  2. if inputs.session_id is Some:
+       for each (label, agent_config) in inputs.agent_configs:
          if agent_config.session.id == inputs.session_id
-            AND agent_config.session.tool == inputs.tool         → return label
-    3. tool-name default ("claude" or "codex")                   → return
+            AND agent_config.session.tool == inputs.tool       → Ok(label)
+       → Err(NoAgentForSession)
+  3. inputs.session_id is None                                 → Err(NoSession)
+
+enum ResolveError {
+  NoSession,         // not running inside an agent (or hook),
+                     // and no CLANK_AGENT override
+  NoAgentForSession, // running inside an agent, env session_id
+                     // present, but no agent config has bound it
+}
 
 struct IdentityInputs {
   tool: Tool,
@@ -752,6 +768,11 @@ struct IdentityInputs {
   agent_configs: Vec<(AgentLabel, AgentConfig)>,
 }
 ```
+
+**No tool-name fallback.** If the resolver can't find an agent
+for the current session, the caller MUST surface the error;
+silently defaulting to label `claude` / `codex` was a
+foot-gun (you'd end up writing feedback as the wrong agent).
 
 CLI side (in `crates/cli`):
 
@@ -799,11 +820,17 @@ Flow:
    a diagnostic on stderr.
 2. If `stop_hook_active == true` → emit nothing, exit 0. (Both
    agents enforce this; we just MUST honor it.)
-3. Resolve label via `resolve_agent_identity(tool, Some(input), env,
-   repo)`.
+3. Resolve label via `resolve_agent_identity(tool, Some(input),
+   env, repo)`.
+   - `Err(NoAgentForSession)` → exit 0; stderr =
+     "no agent set up for this session — run `clank init`
+     (inside this session) or `clank as <label>`". DO NOT
+     fall back to a default.
+   - `Err(NoSession)` is impossible here (hook stdin always
+     carries `session_id`); treat as bug → exit 0 with stderr.
 4. Read `.clank/agents/<label>/config.json` into a typed
-   `AgentConfig` struct. If file missing → treat as
-   `{ auto_mode: "off" }` (i.e. exit 0).
+   `AgentConfig` struct. (Always exists; resolver only returns
+   labels whose config currently holds this session id.)
 5. **Branch on `auto_mode`** (this is the state machine codex asked
    for — explicit, exhaustive):
    - `"off"` → emit nothing, exit 0.
@@ -836,7 +863,7 @@ per-tool writer, NOT ad-hoc JSON formatting):
 | Hint mode, nothing pending   | exit 0; no output            | exit 0; no output                                           |
 | Wait mode, timeout elapsed   | exit 0; no output            | exit 0; no output                                           |
 | Internal error               | exit 0; stderr = diagnostic  | exit 0; stderr = diagnostic                                 |
-| Identity unresolvable        | exit 0; stderr = diagnostic  | exit 0; stderr = diagnostic                                 |
+| Identity unresolvable (NoAgentForSession) | exit 0; stderr = "no agent set up for this session — run `clank init`" | same |
 
 **Hook exit-code invariant** (precise — codex called out an
 earlier blanket "never non-zero" wording that contradicted the
@@ -895,12 +922,17 @@ the same env (`CLAUDE_CODE_SESSION_ID` / `CODEX_THREAD_ID`) the
 hook does, and the same session-cache lookup applies.
 
 After this plan:
-- `--author <label>` → still works, wins if passed (explicit override).
+- `--author <label>` → still works, wins if passed (explicit
+  override).
 - `--author` omitted → CLI builds `IdentityInputs` from env (no
-  hook stdin), calls the shared resolver, uses the result.
-- Resolver returns the tool-name default if nothing else fires —
-  so a fresh `claude` session can run `clank wfw` with no flags
-  at all and have it act as the default agent.
+  hook stdin), calls the shared resolver, uses the result on
+  success.
+- On `Err(NoAgentForSession)`: error with "no agent set up for
+  this session — run `clank init` or pass `--author <label>`".
+  No fallback to tool name.
+- On `Err(NoSession)` (running outside any agent, no env var):
+  error with "no session detected — pass `--author <label>` or
+  run inside claude/codex".
 
 Similarly, `--role`:
 - `--role <role>` → still works, wins if passed.
@@ -964,15 +996,12 @@ Checks (in order):
   set → codex)
 - Session env var present (`CLAUDE_CODE_SESSION_ID` /
   `CODEX_THREAD_ID`)
-- Identity resolves: tool default, session-cache lookup, or
-  `CLANK_AGENT` env override — print which one fired and what
-  label it produced
-- Role for that label (compare against `.clank/config.json.master`):
-  "master" or "reviewers"
-- If any agent's `config.json.session` matches this session id,
-  print which agent + when it was bound; if not, note "no
-  `/clank as` set yet for this session (falls back to default
-  `<tool>`)" — OK, not WARN
+- Identity resolution: print whether `CLANK_AGENT` env override
+  fired, OR which agent's `config.json.session` matched this
+  session id, OR FAIL with "no agent set up for this session —
+  run `clank init` or `clank as <label>`"
+- If resolved, print the role (compare against
+  `.clank/config.json.master`): "master" or "reviewers"
 
 Implementation: each check is a small typed function returning
 `CheckResult { status: Ok | Warn | Fail, message: String }`.
