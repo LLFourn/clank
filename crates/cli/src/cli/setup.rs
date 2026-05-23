@@ -3,7 +3,7 @@
 //!
 //! Writes three skill/command files (refuse-if-drifted; D8) and
 //! tag-merges a `Stop` hook entry into each agent's user-wide
-//! hook config (idempotent by command-prefix match; D8).
+//! hook config (idempotent by stable `id` marker; D8).
 //!
 //! Per the plan (D1) clank ships as a CLI that owns these
 //! files — no separate plugin distribution. Re-running `clank
@@ -19,11 +19,21 @@ const CLAUDE_SKILL_BODY: &str = include_str!("setup_assets/claude_skill.md");
 const CODEX_SKILL_BODY: &str = include_str!("setup_assets/codex_skill.md");
 const CODEX_COMMAND_BODY: &str = include_str!("setup_assets/codex_command.md");
 
-/// Match string used to identify "our" Stop hook entry inside a
-/// user's settings.json / hooks.json. Anything whose `command`
-/// starts with this is replaced on re-setup; everything else is
-/// preserved. (D8: tag-merge by marker, not append-only.)
-const HOOK_COMMAND_MARKER: &str = "clank stop-hook";
+/// Stable identifier we write onto every clank-owned hook entry
+/// as `"id": "<HOOK_ID>"`. The plan's D8 ownership model says
+/// re-setup must find clank's entries by a stable marker — not
+/// by the `command` string — so renames / absolute-path wrappers
+/// / env shims don't strand prior entries and pile up duplicates.
+/// Neither claude nor codex's hook schema rejects unknown
+/// fields, so the marker rides along harmlessly.
+const HOOK_ID: &str = "clank-stop-hook";
+
+/// Legacy ownership signal: entries written before [`HOOK_ID`]
+/// landed in this command were identified by a `command` that
+/// started with this prefix. We still match on it so a re-setup
+/// after upgrading from an earlier dogfood build replaces those
+/// entries in place. Drop once nobody has un-upgraded configs.
+const LEGACY_COMMAND_PREFIX: &str = "clank stop-hook";
 
 /// Per-tool hook timeout we write into the agent's hook config.
 /// 24 hours — effectively infinite. The clank-side `wfw_timeout`
@@ -171,9 +181,10 @@ impl HookKind for CodexHook {
 }
 
 /// Tag-merge our Stop hook entry into the user's hook-config
-/// JSON. Replaces any existing entry whose `command` begins with
-/// `HOOK_COMMAND_MARKER` (so re-installing after an upgrade
-/// updates in place); preserves every unrelated Stop hook.
+/// JSON. Replaces any existing entry whose inner hook has the
+/// stable [`HOOK_ID`] (or matches [`LEGACY_COMMAND_PREFIX`] for
+/// pre-id-marker dogfood entries); preserves every unrelated
+/// Stop hook.
 fn merge_hook_into_settings(
     path: &Path,
     kind: impl HookKind,
@@ -203,15 +214,19 @@ fn merge_hook_into_settings(
         .as_array_mut()
         .ok_or_else(|| anyhow::anyhow!("`hooks.Stop` is not a JSON array"))?;
 
-    // Remove any prior clank entries. The outer "matcher" wrapper
-    // contains a nested `hooks` array; an entry is "ours" if ANY
-    // inner hook has a command starting with the marker.
+    // Remove any prior clank entries — keyed on the stable
+    // `id` marker first, falling back to the legacy
+    // command-prefix match for entries written before HOOK_ID
+    // shipped (dogfood-era).
     let before = stop.len();
     stop.retain(|wrapper| !wrapper_is_clank(wrapper));
     let removed = before - stop.len();
 
-    // Add our fresh entry.
+    // Add our fresh entry, tagged with HOOK_ID so future re-runs
+    // (with whatever command shape we evolve to) can still find
+    // and replace it.
     let mut inner_hook = serde_json::json!({
+        "id": HOOK_ID,
         "type": "command",
         "command": kind.command(),
         "timeout": HOOK_TIMEOUT_SECS,
@@ -249,10 +264,19 @@ fn wrapper_is_clank(wrapper: &serde_json::Value) -> bool {
     let Some(inner) = wrapper.get("hooks").and_then(|h| h.as_array()) else {
         return false;
     };
-    inner
-        .iter()
-        .filter_map(|h| h.get("command").and_then(|c| c.as_str()))
-        .any(|cmd| cmd.starts_with(HOOK_COMMAND_MARKER))
+    inner.iter().any(|h| {
+        // Primary: the stable id marker.
+        let id_match = h
+            .get("id")
+            .and_then(|v| v.as_str())
+            .is_some_and(|id| id == HOOK_ID);
+        // Legacy: pre-id-marker dogfood entries.
+        let cmd_match = h
+            .get("command")
+            .and_then(|c| c.as_str())
+            .is_some_and(|cmd| cmd.starts_with(LEGACY_COMMAND_PREFIX));
+        id_match || cmd_match
+    })
 }
 
 #[cfg(test)]
@@ -327,12 +351,64 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(&body).unwrap();
         let stop = &v["hooks"]["Stop"];
         assert_eq!(stop.as_array().unwrap().len(), 1);
-        let cmd = stop[0]["hooks"][0]["command"].as_str().unwrap();
+        let inner = &stop[0]["hooks"][0];
+        let id = inner["id"].as_str().unwrap();
+        assert_eq!(id, HOOK_ID, "stable id marker must be present");
+        let cmd = inner["command"].as_str().unwrap();
         assert_eq!(cmd, "clank stop-hook --tool claude");
-        let timeout = stop[0]["hooks"][0]["timeout"].as_u64().unwrap();
+        let timeout = inner["timeout"].as_u64().unwrap();
         assert_eq!(timeout, HOOK_TIMEOUT_SECS);
         // Claude entries don't carry statusMessage.
-        assert!(stop[0]["hooks"][0].get("statusMessage").is_none());
+        assert!(inner.get("statusMessage").is_none());
+    }
+
+    #[test]
+    fn merge_hook_replaces_entry_keyed_by_id_even_if_command_changed() {
+        // Simulates upgrading: prior version wrote a hook with a
+        // different command shape (e.g. absolute path) but our
+        // id marker. Re-setup must replace by id, not by command.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(".claude/settings.json");
+        write_file(
+            &path,
+            &format!(
+                r#"{{
+                    "hooks": {{
+                        "Stop": [
+                            {{ "hooks": [
+                                {{
+                                    "id": "{HOOK_ID}",
+                                    "type": "command",
+                                    "command": "/some/abs/path/to/clank --baroque-flags stop-hook --tool claude",
+                                    "timeout": 60
+                                }}
+                            ]}}
+                        ]
+                    }}
+                }}"#
+            ),
+        );
+        let mut summary = Vec::new();
+        merge_hook_into_settings(&path, ClaudeHook, false, &mut summary).unwrap();
+        let v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let stop = v["hooks"]["Stop"].as_array().unwrap();
+        assert_eq!(
+            stop.len(),
+            1,
+            "expected the prior entry replaced, not duplicated"
+        );
+        let inner = &stop[0]["hooks"][0];
+        // New command shape; old absolute-path command gone.
+        assert_eq!(
+            inner["command"].as_str().unwrap(),
+            "clank stop-hook --tool claude"
+        );
+        assert_eq!(
+            inner["timeout"].as_u64().unwrap(),
+            HOOK_TIMEOUT_SECS,
+            "timeout refreshed from the binary's constant"
+        );
     }
 
     #[test]
@@ -401,7 +477,20 @@ mod tests {
     }
 
     #[test]
-    fn wrapper_is_clank_matches_exact_command() {
+    fn wrapper_is_clank_matches_id_marker() {
+        let w = serde_json::json!({
+            "hooks": [{
+                "id": HOOK_ID,
+                "type": "command",
+                "command": "/totally/different/path/to/clank-stop-hook"
+            }]
+        });
+        assert!(wrapper_is_clank(&w));
+    }
+
+    #[test]
+    fn wrapper_is_clank_matches_legacy_command_prefix() {
+        // Pre-id-marker dogfood entries — no `id` field at all.
         let w = serde_json::json!({
             "hooks": [{"type":"command","command":"clank stop-hook --tool claude"}]
         });
@@ -409,7 +498,7 @@ mod tests {
     }
 
     #[test]
-    fn wrapper_is_clank_matches_prefix_with_extra_args() {
+    fn wrapper_is_clank_matches_legacy_prefix_with_extra_args() {
         let w = serde_json::json!({
             "hooks": [{"type":"command","command":"clank stop-hook --tool codex --debug"}]
         });
@@ -420,6 +509,20 @@ mod tests {
     fn wrapper_is_clank_rejects_unrelated() {
         let w = serde_json::json!({
             "hooks": [{"type":"command","command":"/some/other-tool"}]
+        });
+        assert!(!wrapper_is_clank(&w));
+    }
+
+    #[test]
+    fn wrapper_is_clank_rejects_id_pointing_at_different_tool() {
+        // A different tool that also happens to use an `id` field
+        // but with a non-clank value must NOT be claimed by us.
+        let w = serde_json::json!({
+            "hooks": [{
+                "id": "some-other-tool",
+                "type": "command",
+                "command": "/path/to/something"
+            }]
         });
         assert!(!wrapper_is_clank(&w));
     }
