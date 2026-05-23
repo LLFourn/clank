@@ -233,9 +233,14 @@ fn parse_wfw_json(raw: &[u8]) -> Result<Vec<serde_json::Value>, String> {
 }
 
 /// Render a [`Vec<WaitItem>`] (from the hint-mode projection)
-/// into the continuation prompt body. For reviewer items the
-/// rendered text steers the agent to `clank feedback write`
-/// rather than raw file edits (codex prefix-rule benefit).
+/// into the continuation prompt body.
+///
+/// For reviewer items the prompt MUST include both `--author
+/// {label}` (since `clank feedback write` still requires it
+/// until task #261's optional-author work lands) AND the FULL
+/// commit SHA (short refs can be ambiguous; the rendered
+/// command must be guaranteed-runnable). The short form
+/// appears separately as the human-readable display.
 fn render_work_reason(
     items: &[clank_core::wait::WaitItem],
     label: &AgentLabel,
@@ -257,9 +262,10 @@ fn render_work_reason(
                 reason,
             } => {
                 out.push_str(&format!(
-                    "  - master: plan `{plan}` at {short} — next={next:?} ({reason})\n",
+                    "  - master: plan `{plan}` at {short} ({full}) — next={next:?} ({reason})\n",
                     plan = plan.as_str(),
                     short = short_sha(sha.as_str()),
+                    full = sha.as_str(),
                 ));
             }
             WaitItem::Reviewer {
@@ -268,9 +274,11 @@ fn render_work_reason(
                 feedback_path: _,
             } => {
                 out.push_str(&format!(
-                    "  - reviewer: plan `{plan}` at {short} — write feedback via\n    `clank feedback write --plan {plan} --commit {short} \\\n        --verdict approve|request-changes` (body on stdin)\n",
+                    "  - reviewer: plan `{plan}` at {short} — write feedback via\n    `clank feedback write --plan {plan} --commit {full} \\\n        --author {label} --verdict approve|request-changes` (body on stdin)\n",
                     plan = plan.as_str(),
                     short = short_sha(sha.as_str()),
+                    full = sha.as_str(),
+                    label = label.as_str(),
                 ));
             }
             WaitItem::Finished { plan, finalized_at } => {
@@ -288,7 +296,8 @@ fn render_work_reason(
 
 /// Render wfw's JSON `items` array into the continuation prompt
 /// body. Loose stringly-typed projection because we're consuming
-/// our own JSON output via subprocess.
+/// our own JSON output via subprocess. Same `--author` + full-SHA
+/// rules as [`render_work_reason`].
 fn render_wfw_items(items: &[serde_json::Value], label: &AgentLabel, role: Role) -> String {
     let mut out = String::new();
     out.push_str(&format!(
@@ -299,27 +308,28 @@ fn render_wfw_items(items: &[serde_json::Value], label: &AgentLabel, role: Role)
     for item in items {
         let kind = item.get("kind").and_then(|v| v.as_str()).unwrap_or("?");
         let plan = item.get("plan").and_then(|v| v.as_str()).unwrap_or("?");
-        let sha = item
+        let full = item
             .get("sha")
             .or_else(|| item.get("finalized_at"))
             .and_then(|v| v.as_str())
-            .map(short_sha)
-            .unwrap_or_default();
+            .unwrap_or("");
+        let short = short_sha(full);
         match kind {
             "reviewer" => out.push_str(&format!(
-                "  - reviewer: plan `{plan}` at {sha} — write feedback via\n    `clank feedback write --plan {plan} --commit {sha} \\\n        --verdict approve|request-changes` (body on stdin)\n",
+                "  - reviewer: plan `{plan}` at {short} — write feedback via\n    `clank feedback write --plan {plan} --commit {full} \\\n        --author {label} --verdict approve|request-changes` (body on stdin)\n",
+                label = label.as_str(),
             )),
             "master" => {
                 let next = item.get("next").and_then(|v| v.as_str()).unwrap_or("?");
                 let reason = item.get("reason").and_then(|v| v.as_str()).unwrap_or("?");
                 out.push_str(&format!(
-                    "  - master: plan `{plan}` at {sha} — next={next} ({reason})\n",
+                    "  - master: plan `{plan}` at {short} ({full}) — next={next} ({reason})\n",
                 ));
             }
             "finished" => out.push_str(&format!(
-                "  - finished: plan `{plan}` finalized at {sha}\n",
+                "  - finished: plan `{plan}` finalized at {short}\n",
             )),
-            other => out.push_str(&format!("  - {other}: plan `{plan}` at {sha}\n",)),
+            other => out.push_str(&format!("  - {other}: plan `{plan}` at {short} ({full})\n",)),
         }
     }
     out.push_str("\nAct on these items now.");

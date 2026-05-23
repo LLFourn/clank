@@ -219,6 +219,23 @@ fn hint_with_reviewable_work_emits_claude_continuation() {
     // commit is reviewable; alice hasn't reviewed → derive_work
     // should return a Reviewer item for her.
 
+    // We assert the emitted command is RUNNABLE — full SHA,
+    // explicit --author. Short SHAs can collide; missing
+    // --author hits the (still-required) CLI flag.
+    let head = String::from_utf8(
+        Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .unwrap()
+    .trim()
+    .to_string();
+    assert_eq!(head.len(), 40, "expected full sha, got {head}");
+
     let stdin = claude_stdin(CLAUDE_SESSION, repo, false);
     let (code, stdout, stderr) = run_stop_hook(repo, "claude", &stdin, &[]);
     // Claude continuation = exit 2 + stderr = reason.
@@ -231,9 +248,12 @@ fn hint_with_reviewable_work_emits_claude_continuation() {
         stdout.is_empty(),
         "claude continuation goes to stderr, not stdout: {stdout}"
     );
+    let expected_cmd = format!(
+        "clank feedback write --plan foo --commit {head} \\\n        --author alice --verdict approve|request-changes"
+    );
     assert!(
-        stderr.contains("reviewer") && stderr.contains("clank feedback write"),
-        "expected reviewer prompt steering to clank feedback write; got {stderr}"
+        stderr.contains(&expected_cmd),
+        "stderr missing exact runnable command; expected to contain:\n{expected_cmd}\n\ngot:\n{stderr}"
     );
 }
 
@@ -263,6 +283,20 @@ fn hint_with_reviewable_work_emits_codex_continuation() {
         }}"#,
         cwd = repo.display(),
     );
+    let head = String::from_utf8(
+        Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .unwrap()
+    .trim()
+    .to_string();
+    assert_eq!(head.len(), 40);
+
     let (code, stdout, stderr) = run_stop_hook(repo, "codex", &stdin, &[]);
     // Codex continuation = exit 0 + stdout JSON.
     assert_eq!(code, Some(0), "expected codex success; stderr={stderr}");
@@ -270,9 +304,12 @@ fn hint_with_reviewable_work_emits_codex_continuation() {
         serde_json::from_str(stdout.trim()).expect("valid JSON on stdout");
     assert_eq!(decision["decision"], "block");
     let reason = decision["reason"].as_str().expect("reason is string");
+    let expected_cmd = format!(
+        "clank feedback write --plan foo --commit {head} \\\n        --author alice --verdict approve|request-changes"
+    );
     assert!(
-        reason.contains("reviewer") && reason.contains("clank feedback write"),
-        "expected reviewer prompt; got {reason}"
+        reason.contains(&expected_cmd),
+        "reason missing exact runnable command; expected to contain:\n{expected_cmd}\n\ngot:\n{reason}"
     );
 }
 
