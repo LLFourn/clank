@@ -400,34 +400,49 @@ This repo and any other already-active Clank repo has feedback
 files at the old paths. Choices:
 
 1. **Hard cutover.** New code stops reading the old paths. Any
-   existing feedback files are migrated by an operator (manual
-   `mv`) before they can resume work on an active plan.
+   existing feedback files are migrated by an operator (running
+   the bundled shell script) before they can resume work on an
+   active plan.
 2. **Compat read window.** New code reads BOTH old and new
    layouts for one release, writes only the new layout. Drop
    the old read after a cleanup commit.
 
-This plan picks **hard cutover.** Clank is heavy-dev — the only
-real consumer is this repo, and we can migrate by hand. The
-implementation commit includes a tiny shell script
+This plan picks **hard cutover.** Clank is heavy-dev — the
+only real consumer is this repo, and we can migrate by hand.
+The implementation commit includes a tiny shell script
 (`scripts/migrate-feedback-to-agents.sh`) that does the move
-deterministically for any existing repo, so the cutover isn't
-hostile to operators.
+deterministically for any existing repo.
 
-The migration script handles BOTH `FeedbackTarget` kinds:
+### Feedback is ignored — use plain `mv`, NOT `git mv`
+
+`.clank/feedback/` is gitignored (the root `.gitignore` has
+`.clank/*` with carve-outs only for `plans/` and `finished/`,
+plus an explicit `.clank/feedback/` rule). Feedback files are
+local filesystem truth — not tracked git artifacts.
+`.clank/agents/` will be ignored too, by the same `.clank/*`
+catch-all (no new `.gitignore` entry needed; no carve-out
+desired — feedback stays untracked).
+
+`git mv` on an ignored file fails (`fatal: not under
+version control`). The migration script uses plain `mv`
+(filesystem rename):
 
 ```text
 for old in .clank/feedback/<target>/<sha>/<author>.md:
   # <target> is either a plan stem or the reserved `_`.
   new = .clank/agents/<author>/feedback/<target>/<sha>.md
   mkdir -p $(dirname new)
-  git mv old new
+  mv old new
 ```
 
-It keeps the full SHA in the new filename to preserve history;
-the writer will start producing short form on the next review
-cycle. Plan-scoped and ad-hoc paths use the same rewrite (the
-`<target>` segment is opaque to the script — `_` or any plan
-stem is moved identically).
+`std::fs::rename` is the equivalent in any Rust-based
+variant; the shell script uses `mv`.
+
+The migration keeps the full SHA in the new filename to
+preserve identity; the writer will start producing short
+form on the next review cycle. Plan-scoped and ad-hoc paths
+use the same rewrite (the `<target>` segment is opaque to
+the script — `_` or any plan stem is moved identically).
 
 ## Tests
 
@@ -503,14 +518,20 @@ the type shape (`FeedbackView`) is unchanged.
 - `clank finish`: writes a sealed approval whose
   `source_path` points at the new layout. The existing
   finalize-wake test continues to pass.
-- Migration script smoke tests:
-  - Old layout with only plan-scoped feedback → new layout
-    with plan-scoped feedback. `clank status` projects.
-  - Old layout with only ad-hoc (`_`) feedback → new layout
-    with ad-hoc feedback. `collect_feedback_files` returns
-    the expected `AdHoc` blob with the correct
-    `CommitRef`.
-  - Old layout with BOTH targets → both move.
+- Migration script smoke tests. **Crucially these set up
+  the OLD layout as untracked files (`.gitignore` has
+  `.clank/feedback/`), not staged or committed, because
+  that's what real Clank repos have.** A `git mv`-based
+  script would fail this test; the `mv`-based script
+  passes.
+  - Old layout with only plan-scoped feedback (untracked) →
+    new layout with plan-scoped feedback. `clank status`
+    projects.
+  - Old layout with only ad-hoc (`_`) feedback
+    (untracked) → new layout with ad-hoc feedback.
+    `collect_feedback_files` returns the expected `AdHoc`
+    blob with the correct `CommitRef`.
+  - Old layout with BOTH targets (untracked) → both move.
 
 ## Sequencing
 
@@ -578,8 +599,11 @@ Two commits:
   including ad-hoc, via the single shared parser.
 - All 14 wfw integration tests pass.
 - The migration script transforms a synthetic old-layout repo
-  (with both plan and ad-hoc feedback) into the new layout
-  and `clank status` projects correctly.
+  (with both plan and ad-hoc feedback, set up as UNTRACKED
+  files matching the production `.gitignore` rule for
+  `.clank/feedback/`) into the new layout and `clank status`
+  projects correctly. `grep -n 'git mv' scripts/migrate-*` is
+  empty — the script uses plain `mv`.
 - `cargo test --workspace` green; `cargo fmt --check` clean.
 
 ## Out of Scope
