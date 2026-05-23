@@ -36,6 +36,9 @@
 //!   (`.clank/agents/<label>/config.json`) and repo-level
 //!   (`.clank/config.json`) settings, plus the `role_for` helper
 //!   used by the identity resolver.
+//! - [`identity`] — pure `resolve_agent_identity` function +
+//!   `IdentityInputs` / `ResolveError` types. The single
+//!   "who am I" resolver shared by stop-hook, auto, wfw, doctor.
 //!
 //! Every type derives both `Serialize` and `Deserialize` so
 //! producers and consumers round-trip through identical
@@ -45,6 +48,7 @@ pub mod agent_config;
 pub mod api;
 pub mod feedback_body;
 pub mod feedback_view;
+pub mod identity;
 pub mod ids;
 pub mod model;
 pub mod plan_view;
@@ -66,3 +70,4 @@ pub use ids::{
 };
 
 pub use agent_config::{AgentConfig, RepoConfig, Session, role_for};
+pub use identity::{IdentityInputs, ResolveError, resolve_agent_identity};

@@ -183,21 +183,6 @@ fn errors_on_unknown_commit_ref() {
 }
 
 #[test]
-fn errors_on_ambiguous_commit_ref() {
-    // Two reviewable commits sharing the `aaaaaaa` prefix would be
-    // contrived to set up with real git; instead, exercise the
-    // resolver's typed Ambiguous path via the unit tests in
-    // clank_core. This integration test asserts a more reachable
-    // failure: passing a 7-char prefix that the per-target filename
-    // mode would have collided on. With one commit it's Orphan or
-    // matches uniquely — the ambiguous path requires multiple
-    // commits whose short prefixes collide AND aren't already
-    // disambiguated by long-form. That setup is non-trivial here;
-    // unit coverage of the typed error variants lives in
-    // clank_core::ids::tests::commit_ref_resolve_ambiguous_lists_matches.
-}
-
-#[test]
 fn errors_on_inactive_plan() {
     let (dir, sha) = one_plan_repo();
     let repo = dir.path();
