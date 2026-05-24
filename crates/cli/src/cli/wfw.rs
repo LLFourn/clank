@@ -57,26 +57,11 @@ struct LifecycleSnapshot {
 }
 
 impl LifecycleSnapshot {
-    fn capture(state: &clank_core::repo_state::RepoState, views: &[PlanView]) -> Self {
-        let known_plans = state.plans.keys().cloned().collect();
-        let mut review_state = BTreeMap::new();
-        for v in views {
-            review_state.insert(
-                v.plan.clone(),
-                (v.latest_reviewable_sha.clone(), v.gate_state),
-            );
-        }
-        let mut finished_shas: BTreeMap<PlanKey, BTreeSet<CommitSha>> = BTreeMap::new();
-        for fp in &state.finished_plans {
-            finished_shas
-                .entry(fp.plan.clone())
-                .or_default()
-                .insert(fp.finalized_at.clone());
-        }
+    fn empty() -> Self {
         Self {
-            known_plans,
-            review_state,
-            finished_shas,
+            known_plans: BTreeSet::new(),
+            review_state: BTreeMap::new(),
+            finished_shas: BTreeMap::new(),
         }
     }
 }
@@ -240,7 +225,21 @@ pub async fn run(args: WfwArgs) -> anyhow::Result<()> {
     let snapshot = StartupSnapshot::capture(&initial_state.fold, plan_filter.as_ref());
 
     let initial_views = build_views_for_state(&repo, &initial_state, &plan_filter).await?;
-    let mut lifecycle = LifecycleSnapshot::capture(&initial_state.fold, &initial_views);
+    // Start lifecycle snapshot empty so the initial fold can detect
+    // plans that appeared between wfw invocations. Without this,
+    // a plan committed while the agent wasn't running would never
+    // fire plan-introduced.
+    let mut lifecycle = LifecycleSnapshot::empty();
+
+    // Run lifecycle detection on the initial fold before any
+    // early-return path — hooks should fire even on one-shot exits.
+    {
+        let firings = detect_lifecycle_transitions(&lifecycle, &initial_state.fold, &initial_views);
+        for firing in &firings {
+            hook_config::run_hook(&repo, &hook_config, firing);
+        }
+        advance_lifecycle_snapshot(&mut lifecycle, &initial_state.fold, &initial_views);
+    }
 
     if let Some(items) = derive_from_state(
         &repo,

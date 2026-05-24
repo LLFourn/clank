@@ -1050,6 +1050,9 @@ fn wfw_lifecycle_hook_fires_on_plan_introduced() {
 
 #[test]
 fn wfw_hook_failure_does_not_fail_wfw() {
+    // The plan already exists when wfw starts, so plan-introduced
+    // fires on the initial fold (lifecycle snapshot starts empty).
+    // The hook exits 1 — wfw should still succeed and emit items.
     let dir = init_repo();
     let repo = dir.path();
     write(repo, ".clank/plans/foo.md", "# foo\n");
@@ -1085,6 +1088,11 @@ fn wfw_hook_failure_does_not_fail_wfw() {
     assert!(
         stdout.contains("review"),
         "should still emit work items; stdout={stdout}"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("lifecycle hook") && stderr.contains("plan-introduced"),
+        "stderr should warn about the failing hook; got: {stderr}"
     );
 }
 
