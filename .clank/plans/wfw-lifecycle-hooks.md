@@ -69,20 +69,25 @@ that wasn't in the set, fire the hook and add it to the set.
 
 ### `review-received`
 
-Track per-plan gate state at startup (`PlanView::waiting_on`).
-Track the per-plan **gate state** (`PlanView::gate_state` —
-`Unreviewed`, `Approved`, `ChangesRequested`) across refold ticks.
-Fire `review-received` when the gate state changes. Gate state is
-derived purely from reviewer feedback, not from worktree dirtiness
-or `waiting_on` — so a dirty plan file doesn't cause a false
-positive, and reviewer feedback that lands while the plan file is
-dirty doesn't cause a false negative.
+Track per-plan `(latest_reviewable_sha, gate_state)` at startup.
+Track per-plan `(latest_reviewable_sha, gate_state)` pairs across
+refold ticks. Fire `review-received` only when the gate state
+changes **on the same SHA** — that means reviewer feedback landed,
+not a new commit.
 
-Do NOT key this event off `waiting_on`. `waiting_on` mixes
-reviewer-driven transitions (feedback posted) with worktree-driven
-transitions (`MasterToCommit` from a dirty plan file) and master-
-driven transitions (new commit changing `waiting_on` back to
-`FirstReview`). Gate state is the clean signal.
+When the SHA changes (master committed a revision), the gate
+commonly resets to `Unreviewed`. That's a master-driven event, not
+a review. The SHA-pinning filter prevents a false fire:
+
+- Same SHA + gate `Unreviewed → Approved`: reviewer approved → fire.
+- Same SHA + gate `Unreviewed → ChangesRequested`: reviewer
+  requested changes → fire.
+- Different SHA + gate `Approved → Unreviewed`: master committed
+  a new revision, gate reset → don't fire.
+
+This avoids both the `waiting_on` problems (worktree dirtiness,
+master-driven resets) and the pure `gate_state` problem (SHA
+movement resets the gate independently of feedback).
 
 ### `plan-finalized`
 
@@ -143,8 +148,9 @@ review-received fires on tick 7 when feedback lands).
 ### `crates/cli/src/cli/wfw.rs`
 
 - New `LifecycleSnapshot` alongside `StartupSnapshot`:
-  `{ known_plans: BTreeSet<PlanKey>, gate_states: BTreeMap<PlanKey, GateState> }`
-  where `GateState` is the gate's approval status (not `WaitingOn`).
+  `{ known_plans: BTreeSet<PlanKey>, review_state: BTreeMap<PlanKey, (CommitSha, GateState)> }`
+  — tracks the `(latest_reviewable_sha, gate_state)` pair per plan
+  so `review-received` only fires on same-SHA gate transitions.
 - `detect_lifecycle_transitions(prev, current_views) -> Vec<HookFiring>`:
   compare previous snapshot to current views, emit firings.
 - In the watch loop's refold path: call
@@ -178,7 +184,7 @@ add `!hooks.json` to their repo's `.clank/.gitignore`.
 - `load_hook_config`: repo overrides user per-event; missing
   files return empty config.
 - `detect_lifecycle_transitions`: new plan → `PlanIntroduced`;
-  gate state change to master-facing variant → `ReviewReceived`;
+  same-SHA gate state change → `ReviewReceived`;
   no change → empty.
 
 ### Integration
