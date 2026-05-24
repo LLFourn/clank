@@ -21,7 +21,8 @@ use anyhow::Context;
 use super::{InitArgs, resolve_repo};
 use crate::agent_env::detect_session_from_env;
 use crate::agent_store::{
-    agent_config_path, bind_session_to_agent, load_agent_config, save_agent_config,
+    agent_config_path, bind_session_to_agent, load_agent_config, load_all_agent_configs,
+    save_agent_config,
 };
 use clank_core::ids::AgentLabel;
 use clank_core::vocab::{Role, Tool};
@@ -245,13 +246,26 @@ async fn bootstrap_agent_identity(repo: &Path, yes: bool) -> anyhow::Result<()> 
     let label = AgentLabel::parse(&label_raw)
         .map_err(|e| anyhow::anyhow!("invalid label `{label_raw}`: {e}"))?;
 
-    let make_master = if interactive {
+    let has_existing_master = load_all_agent_configs(repo)?
+        .iter()
+        .any(|(_, cfg)| cfg.role == Role::Master);
+
+    let make_master = if has_existing_master {
+        if interactive {
+            prompt_yes_no(
+                "Default this agent to master role (vs reviewers)? [y/N] ",
+                false,
+            )?
+        } else {
+            false
+        }
+    } else if interactive {
         prompt_yes_no(
-            "Default this agent to master role (vs reviewers)? [y/N] ",
-            false,
+            "No master agent in this repo yet. Claim master? [Y/n] ",
+            true,
         )?
     } else {
-        false
+        true
     };
 
     // Bind via the shared helper — this preserves the
