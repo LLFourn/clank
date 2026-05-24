@@ -47,8 +47,7 @@ If there IS an existing master:
 In `bootstrap_agent_identity` (`init.rs:248`):
 
 ```rust
-let has_existing_master = load_all_agent_configs(repo)
-    .unwrap_or_default()
+let has_existing_master = load_all_agent_configs(repo)?
     .iter()
     .any(|(_, cfg)| cfg.role == Role::Master);
 
@@ -73,9 +72,10 @@ let make_master = if has_existing_master {
 
 Add `load_all_agent_configs` to the import from `agent_store`.
 
-`load_all_agent_configs` errors are swallowed (`unwrap_or_default`)
-so a fresh repo with no `.clank/agents/` directory doesn't fail
-init.
+`load_all_agent_configs` already returns `Ok([])` when
+`.clank/agents/` doesn't exist (fresh repo). Parse/read errors on
+existing agent configs propagate via `?` — a corrupt master config
+must not be silently treated as "no master exists."
 
 ## Tests
 
@@ -87,6 +87,10 @@ init.
 3. **Existing agent configs dir missing** (fresh repo, no
    `.clank/agents/`): `load_all_agent_configs` returns empty →
    auto-claims master. No error.
+4. **Corrupt existing agent config**: pre-seed a malformed
+   `config.json` under `.clank/agents/bob/`, then `clank init
+   --yes` → init fails with a parse error rather than silently
+   claiming master.
 
 Interactive-mode prompt defaults are hard to test in CI without a
 PTY; the non-interactive paths cover the logic.
