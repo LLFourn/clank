@@ -4,174 +4,172 @@
 
 `clank wfw --role master` blocks when there are no active plans
 and `~/.clank/hooks.json` exists. The `wfw-master-empty-exit` fix
-is bypassed by the `&& !has_hooks` guard at `wfw.rs:268`, which
-was added so the watch loop could observe `plan-introduced` via
-snapshot-based lifecycle detection.
+is bypassed by the `&& !has_hooks` guard at `wfw.rs:268`.
 
-The snapshot approach turned out to be over-engineered: hooks only
-fire for transitions during a wfw watch session, never for events
-between invocations. In practice the only hook that ever fired was
-`review-received` (the gate change happens mid-watch). Plan-
-introduced and plan-finalized never fired because they happen via
-commits that complete before wfw starts.
+## Root cause
 
-## Fix: fire hooks from work items, not snapshots
+The snapshot-based lifecycle detection was over-engineered and
+didn't work in practice — only `review-received` ever fired
+(the gate change happens mid-watch). The `has_hooks` guard kept
+master in the watch loop to observe `plan-introduced`, but that
+event never fired because plan introductions happen between wfw
+invocations.
 
-Replace the snapshot-based lifecycle detection with a simple
-mapping from `WaitItem` variants to hook events. Fire hooks right
-before wfw prints items:
+## Fix: work-item hooks, not lifecycle hooks
 
-- `WaitItem::Reviewer` → fire `plan-introduced` hook
-- `WaitItem::Master` → fire `review-received` hook
-- `WaitItem::Finished` → fire `plan-finalized` hook
+Replace the snapshot-based lifecycle detection with simple
+work-item notifications. Hooks fire based on what wfw returns,
+not on state transitions. Rename events to be honest about what
+they are:
 
-Pass the item's plan, sha, and (for review-received) the gate
-state as env vars.
+- **`master-work`** — fires when `WaitItem::Master` is returned.
+  Env includes `CLANK_NEXT` (revise/commit/implement/finalize)
+  and `CLANK_GATE` (from the PlanView).
+- **`reviewer-work`** — fires when `WaitItem::Reviewer` is
+  returned.
+- **`plan-finalized`** — fires when `WaitItem::Finished` is
+  returned.
+- **`idle`** — fires when wfw has no items and nothing to wait
+  for. Unlike the others, idle captures stdout — non-empty stdout
+  becomes a synthetic prompt that wfw emits so the stop-hook can
+  continue the agent.
 
-This covers all cases because wfw always produces items before
-exiting. No snapshots, no transition detection, no empty-vs-
-capture lifecycle state. The work items ARE the lifecycle events.
+Hooks fire once per wfw invocation, right before items are
+printed. No snapshot state, no transition detection.
 
-## What goes
+## Config
 
-- `LifecycleSnapshot` struct and `capture`/`empty` constructors
-- `detect_lifecycle_transitions` function
-- `advance_lifecycle_snapshot` function
-- The `has_hooks` variable and the `&& !has_hooks` guard on the
-  master-empty early-exit
-- All snapshot-related code in the watch loop
-- The `HookEvent` enum in `crates/core/src/vocab.rs` (the event
-  name is derived from the `WaitItem` variant, not from a
-  separate enum — or keep the enum if the hook config keys still
-  need `plan-introduced`/`review-received`/`plan-finalized`)
-
-## What stays
-
-- `HookConfig` type and `load_hook_config` / `merge_from_file`
-- `HookFiring` struct and `run_hook`
-- `HookEvent` enum (for config key deserialization)
-- `~/.clank/hooks.json` and `.clank/hooks.json` config loading
-
-## Implementation
-
-In `wfw.rs`, replace the lifecycle detection code with a simple
-function that maps items to firings:
-
-```rust
-fn firings_from_items(items: &[WaitItem]) -> Vec<HookFiring> {
-    items.iter().map(|item| match item {
-        WaitItem::Reviewer { plan, sha, .. } => HookFiring {
-            event: HookEvent::PlanIntroduced,
-            plan: plan.clone(),
-            sha: sha.clone(),
-            gate: None,
-        },
-        WaitItem::Master { plan, sha, .. } => HookFiring {
-            event: HookEvent::ReviewReceived,
-            plan: plan.clone(),
-            sha: sha.clone(),
-            gate: /* from the PlanView or derive */,
-        },
-        WaitItem::Finished { plan, finalized_at } => HookFiring {
-            event: HookEvent::PlanFinalized,
-            plan: plan.clone(),
-            sha: finalized_at.clone(),
-            gate: None,
-        },
-    }).collect()
-}
-```
-
-Call it before `emit` on both the initial-fold and watch-loop
-paths. Remove the `has_hooks` guard from the master-empty
-early-exit.
-
-## Tests
-
-- **Regression**: `wfw_master_no_plans_exits_immediately_json`
-  must pass even with hooks configured. Add a variant that writes
-  a hooks.json first.
-- **Existing hook tests**: `wfw_lifecycle_hook_fires_on_plan_
-  introduced` and `wfw_hook_failure_does_not_fail_wfw` still pass
-  (they use the watch-loop path which produces items).
-- **Repeated invocations**: `wfw_repeated_invocations_do_not_
-  refire_hooks` — this test may need updating since hooks now
-  fire on items (which ARE produced on repeated invocations for
-  pre-existing reviewer work). The test's intent (no spam) needs
-  rethinking: hooks fire once per wfw invocation if work exists,
-  which is correct — each invocation is a separate notification.
-
-## New event: `idle`
-
-A fourth hook event. Fires when wfw has checked for work and
-found nothing — right before it would block (watch loop) or exit
-empty (master fast-exit).
-
-Unlike the other hooks, `idle` captures stdout. If the hook
-writes non-empty stdout, wfw treats it as a synthetic prompt and
-emits it as a special work item so the stop-hook can use it as a
-continuation prompt. If stdout is empty (or the hook isn't
-configured), wfw proceeds as today (block or fast-exit).
-
-Use case: the hook command can inspect the repo and suggest what
-to work on next — check stubs, run tests, triage issues. The
-agent gets a continuation prompt instead of ending its turn.
-
-Config:
+Same files (`~/.clank/hooks.json`, `.clank/hooks.json`), new
+event names:
 
 ```json
 {
-  "idle": "echo 'No plans in flight. Check .clank/stubs/ for ideas.'"
+  "master-work": "say $CLANK_PLAN $CLANK_NEXT",
+  "reviewer-work": "say Review $CLANK_PLAN",
+  "plan-finalized": "say $CLANK_PLAN finalized",
+  "idle": "echo Check .clank/stubs/ for ideas."
 }
 ```
 
-The idle hook runs **once per wfw invocation** on the initial
-fold's empty-items path. It does NOT run on every watch-loop
-tick — that would spam. For the watch loop, wfw blocks as normal
-waiting for FS events.
+## What goes
 
-### Implementation
+- `LifecycleSnapshot` struct and all methods
+- `detect_lifecycle_transitions` / `advance_lifecycle_snapshot`
+- `build_views_for_state` (only used by lifecycle detection;
+  `derive_from_state` builds its own views)
+- The `has_hooks` variable and `&& !has_hooks` guard
+- Old event names (`plan-introduced`, `review-received`) from
+  `HookEvent` enum — replaced by `master-work`, `reviewer-work`
 
-In `wfw::run`, after `derive_from_state` returns `None` on the
-initial fold (and after the master-empty fast-exit check):
+## Implementation
+
+### `HookEvent` enum (`crates/core/src/vocab.rs`)
 
 ```rust
-if let Some(idle_cmd) = hook_config.get(&HookEvent::Idle) {
-    let output = Command::new("sh")
-        .arg("-c").arg(idle_cmd)
-        .env("CLANK_EVENT", "idle")
-        .env("CLANK_REPO", repo)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::inherit())
-        .output()?;
-    let prompt = String::from_utf8_lossy(&output.stdout)
-        .trim().to_string();
-    if !prompt.is_empty() {
-        // Emit as a synthetic item so the stop-hook picks it up
-        emit_idle_prompt(&prompt, args.json);
-        return Ok(());
-    }
+pub enum HookEvent {
+    MasterWork,
+    ReviewerWork,
+    PlanFinalized,
+    Idle,
 }
-// fall through to watch loop or fast-exit
 ```
 
-The `emit_idle_prompt` function emits a JSON envelope (in
-`--json` mode) or human text that the stop-hook adapter can parse
-and forward as a continuation prompt.
+Serde kebab-case: `master-work`, `reviewer-work`, etc.
 
-### WaitItem extension
+### `HookFiring` (`crates/cli/src/hook_config.rs`)
 
-Add `WaitItem::Idle { prompt: String }` to represent the
-synthetic work item. The stop-hook adapter's `render_wfw_items`
-handles it by forwarding the prompt text directly.
+```rust
+pub struct HookFiring {
+    pub event: HookEvent,
+    pub plan: PlanKey,
+    pub sha: CommitSha,
+    pub gate: Option<CommitGateState>,
+    pub next: Option<String>,
+}
+```
+
+### `run_hook` (`crates/cli/src/hook_config.rs`)
+
+Set `CLANK_GATE` and `CLANK_NEXT` from the firing's fields when
+present. For `idle`, capture stdout instead of discarding it.
+Return `Option<String>` — the captured prompt for idle, `None`
+for other events.
+
+### `firings_from_items` (`crates/cli/src/cli/wfw.rs`)
+
+```rust
+fn firings_from_items(
+    items: &[WaitItem],
+    views: &[PlanView],
+) -> Vec<HookFiring> { ... }
+```
+
+Map each WaitItem to a HookFiring. For `WaitItem::Master`, look
+up the plan's PlanView to get `gate_state`. For `next`, serialize
+the `MasterNext` variant.
+
+### `wfw::run` flow
+
+```
+1. Initial fold
+2. derive_from_state → items
+3. If items non-empty:
+     fire work-item hooks (master-work / reviewer-work / plan-finalized)
+     emit items, return
+4. Master + no plans:
+     fire idle hook if configured → if prompt returned, emit + return
+     else emit empty items, return
+5. Enter watch loop
+6. On each refold tick:
+     derive items
+     if non-empty:
+       fire work-item hooks
+       emit items, return
+```
+
+The idle hook runs at step 4 — BEFORE the master-empty fast-exit.
+If idle produces a prompt, wfw exits with the prompt as a
+synthetic item. If not, fast-exit as today.
+
+For non-master roles with no items, wfw enters the watch loop
+(step 5) — idle doesn't fire there (would spam on every tick).
+
+### `WaitItem::Idle` (`crates/core/src/wait.rs`)
+
+Add a new variant for the synthetic prompt:
+
+```rust
+Idle { prompt: String }
+```
+
+The stop-hook adapter's `render_wfw_items` handles it by
+forwarding the prompt text as the continuation reason.
+
+## Tests
+
+- `wfw_master_no_plans_exits_immediately_json`: must pass with
+  hooks configured (regression fix).
+- `wfw_lifecycle_hook_fires_on_plan_introduced`: rename to
+  `wfw_hook_fires_reviewer_work`, update hook key + assertions.
+- `wfw_hook_failure_does_not_fail_wfw`: update hook key.
+- `wfw_master_empty_blocks_when_hooks_configured`: DELETE — the
+  whole point is that master-empty no longer blocks with hooks.
+- `wfw_repeated_invocations_do_not_refire_hooks`: DELETE —
+  hooks now fire per-invocation by design (one notification per
+  wfw call when work exists is correct).
+- NEW: `wfw_idle_hook_returns_prompt` — master + no plans + idle
+  hook configured → wfw exits 0 with the prompt as a synthetic
+  item.
+- NEW: `wfw_master_no_plans_no_idle_exits_empty` — master + no
+  plans + no idle hook → fast-exit with empty items.
 
 ## Acceptance criteria
 
-- Master + no plans + hooks configured → exits immediately
-  (exit 0, empty items) unless an `idle` hook produces a prompt.
-- Hooks fire for every work item wfw returns, on both the
-  initial-fold and watch-loop paths.
+- Master + no plans → fast-exit regardless of hooks config
+  (unless idle hook produces a prompt).
+- Work-item hooks fire for every item wfw returns.
 - `idle` hook captures stdout; non-empty stdout becomes a
-  synthetic prompt that the stop-hook forwards as a continuation.
+  synthetic `WaitItem::Idle` prompt.
 - No `LifecycleSnapshot` or snapshot comparison code remains.
-- All existing wfw tests pass.
+- `HookEvent` uses the new names (`master-work`, `reviewer-work`,
+  `plan-finalized`, `idle`).
