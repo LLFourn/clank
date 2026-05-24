@@ -28,7 +28,8 @@ they are:
 - **`reviewer-work`** — fires when `WaitItem::Reviewer` is
   returned.
 - **`plan-finalized`** — fires when `WaitItem::Finished` is
-  returned.
+  returned. This is a per-invocation notice (fires whenever wfw
+  surfaces a finished plan), not a one-shot lifecycle transition.
 - **`idle`** — fires when wfw has no items and nothing to wait
   for. Unlike the others, idle captures stdout — non-empty stdout
   becomes a synthetic prompt that wfw emits so the stop-hook can
@@ -55,8 +56,7 @@ event names:
 
 - `LifecycleSnapshot` struct and all methods
 - `detect_lifecycle_transitions` / `advance_lifecycle_snapshot`
-- `build_views_for_state` (only used by lifecycle detection;
-  `derive_from_state` builds its own views)
+- `build_views_for_state` (only used by lifecycle detection)
 - The `has_hooks` variable and `&& !has_hooks` guard
 - Old event names (`plan-introduced`, `review-received`) from
   `HookEvent` enum — replaced by `master-work`, `reviewer-work`
@@ -76,6 +76,13 @@ pub enum HookEvent {
 
 Serde kebab-case: `master-work`, `reviewer-work`, etc.
 
+### `WaitItem::Master` — add `gate` field (`crates/core/src/wait.rs`)
+
+Add `gate: CommitGateState` to `WaitItem::Master`. The projection
+already has this from the `PlanView`; carrying it on the item
+means hooks don't need separate view access. Update `master()`
+helper and `derive_work` to pass it through.
+
 ### `HookFiring` (`crates/cli/src/hook_config.rs`)
 
 ```rust
@@ -88,25 +95,39 @@ pub struct HookFiring {
 }
 ```
 
+Only used for the three work-item events (`master-work`,
+`reviewer-work`, `plan-finalized`). `idle` does NOT go through
+`HookFiring` — it's a separate path (see below).
+
 ### `run_hook` (`crates/cli/src/hook_config.rs`)
 
 Set `CLANK_GATE` and `CLANK_NEXT` from the firing's fields when
-present. For `idle`, capture stdout instead of discarding it.
-Return `Option<String>` — the captured prompt for idle, `None`
-for other events.
+present. Stdout discarded (notifications only). Returns nothing.
+
+### `run_idle_hook` (`crates/cli/src/hook_config.rs`)
+
+Separate function for idle — different shape (captures stdout,
+no plan/sha context):
+
+```rust
+pub fn run_idle_hook(
+    repo: &Path,
+    config: &HookConfig,
+) -> Option<String> { ... }
+```
+
+Sets `CLANK_EVENT=idle` and `CLANK_REPO`. Captures stdout. Returns
+`Some(prompt)` if non-empty, `None` otherwise.
 
 ### `firings_from_items` (`crates/cli/src/cli/wfw.rs`)
 
 ```rust
-fn firings_from_items(
-    items: &[WaitItem],
-    views: &[PlanView],
-) -> Vec<HookFiring> { ... }
+fn firings_from_items(items: &[WaitItem]) -> Vec<HookFiring> { ... }
 ```
 
-Map each WaitItem to a HookFiring. For `WaitItem::Master`, look
-up the plan's PlanView to get `gate_state`. For `next`, serialize
-the `MasterNext` variant.
+Map each WaitItem to a HookFiring. `WaitItem::Master` now carries
+`gate` directly — no PlanView lookup needed. `next` is serialized
+from the `MasterNext` variant name.
 
 ### `wfw::run` flow
 
@@ -116,9 +137,10 @@ the `MasterNext` variant.
 3. If items non-empty:
      fire work-item hooks (master-work / reviewer-work / plan-finalized)
      emit items, return
-4. Master + no plans:
-     fire idle hook if configured → if prompt returned, emit + return
-     else emit empty items, return
+4. Master + no plans (or no items after initial fold):
+     fire idle hook via run_idle_hook (separate from HookFiring)
+     → if prompt returned, emit as WaitItem::Idle + return
+     → else emit empty items, return (master-empty fast-exit)
 5. Enter watch loop
 6. On each refold tick:
      derive items
