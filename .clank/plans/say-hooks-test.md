@@ -18,7 +18,14 @@ Global hooks installed at `~/.clank/hooks.json`:
    **APPROVE** so we can finalize and hear the plan-finalized
    hook.
 
+## Bug found
+
+The initial `~/.clank/hooks.json` used single quotes around
+`$CLANK_PLAN` (e.g. `say 'Plan $CLANK_PLAN introduced'`).
+Single quotes in shell prevent variable expansion — `say` spoke
+the literal string `$CLANK_PLAN`. Fix: drop the quotes. `say`
+joins its arguments so `say Plan $CLANK_PLAN introduced` works.
+
 ## Implementation
 
-Nothing to implement. This plan exists solely to trigger
-lifecycle events.
+Fix `~/.clank/hooks.json` to not single-quote the env vars.
