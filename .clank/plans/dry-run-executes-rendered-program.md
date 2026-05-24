@@ -58,7 +58,10 @@ returns the program or errors on pre-flight failures.
 314-322. It renders from the program struct, not from loose locals.
 
 `execute_amend` replaces the inline git-rm + git-commit-amend
-sequence. It consumes the same program the render produced.
+sequence. It consumes the same program the render produced. Before
+mutating, it re-reads HEAD and bails if it differs from
+`program.head_sha` — a CAS guard against concurrent HEAD movement
+between build and execute.
 
 ### Testable invariant
 
@@ -95,7 +98,10 @@ No changes to `rewrite.rs` or the standard purge/squash path.
    that the dry output lists every path from the program.
 3. **Execute strips paths from HEAD**: after `execute_amend`,
    `git ls-tree HEAD` no longer shows the stripped paths.
-4. **Existing `purge --amend` integration tests** (if any) still
+4. **Stale HEAD bails**: move HEAD between `build_amend_program` and
+   `execute_amend`; assert the execute bails with a clear message
+   rather than amending the wrong commit.
+5. **Existing `purge --amend` integration tests** (if any) still
    pass — behavior is preserved, only the internal structure changed.
 
 ## Acceptance criteria
@@ -105,6 +111,8 @@ No changes to `rewrite.rs` or the standard purge/squash path.
 - `--dry` renders from the same `AmendProgram` struct that live
   executes.
 - A test verifies dry and live consume the same typed value.
+- `execute_amend` re-reads HEAD and bails if it differs from
+  `program.head_sha` (CAS guard against concurrent HEAD movement).
 - No changes to the rewrite engine or the standard purge path.
 
 ## Out of scope
