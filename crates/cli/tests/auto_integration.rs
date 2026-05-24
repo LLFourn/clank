@@ -64,7 +64,7 @@ fn bind_alice(repo: &Path) {
 }
 
 #[test]
-fn auto_on_writes_hint_by_default() {
+fn auto_on_writes_on() {
     let dir = init_repo();
     let repo = dir.path();
     bind_alice(repo);
@@ -84,27 +84,57 @@ fn auto_on_writes_hint_by_default() {
         &std::fs::read_to_string(repo.join(".clank/agents/alice/config.json")).unwrap(),
     )
     .unwrap();
-    assert_eq!(cfg["auto_mode"], "hint");
+    assert_eq!(cfg["auto_mode"], "on");
 }
 
 #[test]
-fn auto_on_mode_wait_writes_wait() {
+fn auto_on_legacy_hint_deserializes_as_on() {
     let dir = init_repo();
     let repo = dir.path();
     bind_alice(repo);
 
+    let cfg_path = repo.join(".clank/agents/alice/config.json");
+    let mut cfg: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&cfg_path).unwrap()).unwrap();
+    cfg["auto_mode"] = serde_json::json!("hint");
+    std::fs::write(&cfg_path, serde_json::to_string_pretty(&cfg).unwrap()).unwrap();
+
     let out = run_clank(
         repo,
-        &["auto", "on", "--mode", "wait"],
+        &["auto", "status"],
         &[("CLAUDE_CODE_SESSION_ID", CLAUDE_SESSION)],
     );
     assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("auto_mode:   on"),
+        "legacy 'hint' should read as 'on'; got {stdout}"
+    );
+}
 
-    let cfg: serde_json::Value = serde_json::from_str(
-        &std::fs::read_to_string(repo.join(".clank/agents/alice/config.json")).unwrap(),
-    )
-    .unwrap();
-    assert_eq!(cfg["auto_mode"], "wait");
+#[test]
+fn auto_on_legacy_wait_deserializes_as_on() {
+    let dir = init_repo();
+    let repo = dir.path();
+    bind_alice(repo);
+
+    let cfg_path = repo.join(".clank/agents/alice/config.json");
+    let mut cfg: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&cfg_path).unwrap()).unwrap();
+    cfg["auto_mode"] = serde_json::json!("wait");
+    std::fs::write(&cfg_path, serde_json::to_string_pretty(&cfg).unwrap()).unwrap();
+
+    let out = run_clank(
+        repo,
+        &["auto", "status"],
+        &[("CLAUDE_CODE_SESSION_ID", CLAUDE_SESSION)],
+    );
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("auto_mode:   on"),
+        "legacy 'wait' should read as 'on'; got {stdout}"
+    );
 }
 
 #[test]
@@ -233,7 +263,7 @@ fn auto_status_shows_resolved_role() {
     assert!(out.status.success());
     let body: serde_json::Value = serde_json::from_slice(&out.stdout).expect("valid JSON");
     assert_eq!(body["label"], "alice");
-    assert_eq!(body["auto_mode"], "hint");
+    assert_eq!(body["auto_mode"], "on");
     assert_eq!(body["role"], "master");
 }
 

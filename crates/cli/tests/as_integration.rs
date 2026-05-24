@@ -237,7 +237,7 @@ fn preserves_existing_auto_mode_when_rebinding() {
     let cfg_dir = repo.join(".clank/agents/alice");
     std::fs::create_dir_all(&cfg_dir).unwrap();
     let seed = AgentConfig {
-        auto_mode: AutoMode::Hint,
+        auto_mode: AutoMode::On,
         wfw_timeout: Some("30m".into()),
         session: None,
         ..Default::default()
@@ -257,7 +257,7 @@ fn preserves_existing_auto_mode_when_rebinding() {
 
     let body = std::fs::read_to_string(repo.join(".clank/agents/alice/config.json")).unwrap();
     let after: AgentConfig = serde_json::from_str(&body).unwrap();
-    assert_eq!(after.auto_mode, AutoMode::Hint);
+    assert_eq!(after.auto_mode, AutoMode::On);
     assert_eq!(after.wfw_timeout.as_deref(), Some("30m"));
     let bound = after.session.expect("session bound");
     assert_eq!(bound.id.as_str(), session);

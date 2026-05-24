@@ -271,8 +271,8 @@ pub struct AutoArgs {
 
 #[derive(clap::Subcommand, Debug)]
 pub enum AutoCmd {
-    /// Enable auto-mode (hint by default; opt into blocking
-    /// long-poll with `--mode wait`). Optionally update role.
+    /// Enable auto-mode (wait-for-work long-poll). Optionally
+    /// update role.
     On(AutoOnArgs),
     /// Disable auto-mode. Optionally update role.
     Off(AutoOffArgs),
@@ -284,12 +284,6 @@ pub enum AutoCmd {
 pub struct AutoOnArgs {
     #[arg(long, value_name = "PATH")]
     pub repo: Option<PathBuf>,
-    /// Auto-mode flavor. `hint` (default) does a cheap status
-    /// check and emits a continuation only when work is already
-    /// pending; `wait` long-polls `clank wfw` and blocks the
-    /// agent until work arrives or `wfw_timeout` elapses.
-    #[arg(long, value_enum, default_value_t = AutoModeArg::Hint)]
-    pub mode: AutoModeArg,
     /// Designate this agent as `master` or `reviewers` for the
     /// repo. `master` writes `.clank/config.json` with this
     /// label; `reviewers` clears master only if this agent
@@ -318,15 +312,6 @@ pub struct AutoStatusArgs {
     /// Emit JSON instead of the human rendering.
     #[arg(short = 'j', long)]
     pub json: bool,
-}
-
-/// Auto-mode flavor for `clank auto on --mode`. Maps to
-/// [`clank_core::AutoMode`]; the `Off` value is intentionally
-/// not selectable here (that's what `clank auto off` is for).
-#[derive(Copy, Clone, Debug, clap::ValueEnum)]
-pub enum AutoModeArg {
-    Hint,
-    Wait,
 }
 
 /// Role designation for `--role`.

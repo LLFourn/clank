@@ -28,10 +28,9 @@ pub async fn run(args: AutoArgs) -> anyhow::Result<()> {
 async fn run_on(args: AutoOnArgs) -> anyhow::Result<()> {
     let repo = resolve_repo(args.repo.as_deref())?;
     let label = resolve_identity_from_env(&repo)?;
-    let mode: AutoMode = args.mode.into();
 
     let mut cfg = load_agent_config(&repo, &label)?.unwrap_or_default();
-    cfg.auto_mode = mode;
+    cfg.auto_mode = AutoMode::On;
     if let Some(t) = args.wfw_timeout.as_deref() {
         cfg.wfw_timeout = Some(t.to_string());
     }
@@ -43,7 +42,7 @@ async fn run_on(args: AutoOnArgs) -> anyhow::Result<()> {
     println!(
         "auto-mode for `{}` set to {}",
         label.as_str(),
-        mode.as_str()
+        cfg.auto_mode.as_str()
     );
     if args.role.is_some() {
         println!("  role: {}", cfg.role.as_str());
@@ -94,15 +93,6 @@ async fn run_status(args: AutoStatusArgs) -> anyhow::Result<()> {
         println!("  role:        {}", role.as_str());
     }
     Ok(())
-}
-
-impl From<crate::cli::AutoModeArg> for AutoMode {
-    fn from(m: crate::cli::AutoModeArg) -> Self {
-        match m {
-            crate::cli::AutoModeArg::Hint => AutoMode::Hint,
-            crate::cli::AutoModeArg::Wait => AutoMode::Wait,
-        }
-    }
 }
 
 impl From<crate::cli::RoleArg> for Role {

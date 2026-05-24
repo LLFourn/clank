@@ -71,74 +71,11 @@ async fn compute_outcome(tool: Tool, repo_override: Option<&Path>) -> HookOutcom
 
     match cfg.auto_mode {
         AutoMode::Off => HookOutcome::Silent,
-        AutoMode::Hint => compute_hint_outcome(&repo, &label, role).await,
-        AutoMode::Wait => {
-            compute_wait_outcome(&repo, &label, role, cfg.wfw_timeout.as_deref()).await
-        }
+        AutoMode::On => compute_wait_outcome(&repo, &label, role, cfg.wfw_timeout.as_deref()).await,
     }
 }
 
-/// Hint mode (per plan, three branches):
-///
-/// 1. **Work pending for me** — `derive_work` returns items.
-///    Continue with the rendered work + actionable command.
-/// 2. **Work pending for someone else** — at least one active
-///    plan has `waiting_on != SessionFinished`. Continue with a
-///    "you may run `clank wfw`" suggestion so the agent can
-///    explicitly block on the wait instead of ending its turn.
-/// 3. **Nothing in flight** — all plans are session-finished or
-///    there are no plans. Silent; let the agent stop.
-///
-/// All from the same projection (`PlanView`s + `derive_work`),
-/// no duplicated lifecycle logic in the hook. Cache OK because
-/// hint is read-only.
-async fn compute_hint_outcome(repo: &Path, label: &AgentLabel, role: Role) -> HookOutcome {
-    use crate::rebuild::{CachePolicy, rebuild_repo_with_policy};
-    use clank_core::wait::{StartupSnapshot, derive_work, detect_finished};
-
-    let state = match rebuild_repo_with_policy(repo, CachePolicy::Use).await {
-        Ok(s) => s,
-        Err(e) => {
-            return HookOutcome::Diagnostic {
-                message: format!("hook: fold failed: {e:#}"),
-            };
-        }
-    };
-    let views = match super::wfw::project_all_views(repo, &state).await {
-        Ok(v) => v,
-        Err(e) => {
-            return HookOutcome::Diagnostic {
-                message: format!("hook: project failed: {e:#}"),
-            };
-        }
-    };
-    let snapshot = StartupSnapshot::capture(&state.fold, None);
-
-    // Branch 1: my own pending work.
-    let mut items = derive_work(&views, label, role);
-    items.extend(detect_finished(&snapshot, &state.fold));
-    if !items.is_empty() {
-        return HookOutcome::Continue {
-            reason: render_work_reason(&items, label, role),
-        };
-    }
-
-    // Branch 2: any active plan waiting on someone else. Finished
-    // plans live in `state.fold.finished_plans` (not in
-    // `state.fold.plans`), so every plan that produced a `PlanView`
-    // above is by definition still in flight — just iterate.
-    let plans_in_flight: Vec<&clank_core::plan_view::PlanView> = views.iter().collect();
-    if !plans_in_flight.is_empty() {
-        return HookOutcome::Continue {
-            reason: render_wfw_suggestion(&plans_in_flight, label, role),
-        };
-    }
-
-    // Branch 3: nothing pending anywhere.
-    HookOutcome::Silent
-}
-
-/// Wait mode: long-poll via a self-spawned `clank wfw --json`.
+/// Long-poll via a self-spawned `clank wfw --json`.
 /// Reuses the watcher loop without refactoring it. On items →
 /// Continue. On timeout (exit 2) → Silent. Anything else →
 /// Diagnostic.
@@ -253,72 +190,10 @@ fn parse_wfw_json(raw: &[u8]) -> Result<Vec<serde_json::Value>, String> {
         .ok_or_else(|| "`items` is not an array".to_string())
 }
 
-/// Render a [`Vec<WaitItem>`] (from the hint-mode projection)
-/// into the continuation prompt body.
-///
-/// For reviewer items the prompt MUST include both `--author
-/// {label}` (since `clank feedback write` still requires it
-/// until task #261's optional-author work lands) AND the FULL
-/// commit SHA (short refs can be ambiguous; the rendered
-/// command must be guaranteed-runnable). The short form
-/// appears separately as the human-readable display.
-fn render_work_reason(
-    items: &[clank_core::wait::WaitItem],
-    label: &AgentLabel,
-    role: Role,
-) -> String {
-    use clank_core::wait::WaitItem;
-    let mut out = String::new();
-    out.push_str(&format!(
-        "Clank has work for `{label}` ({role}). Items:\n",
-        label = label.as_str(),
-        role = role.as_str(),
-    ));
-    for item in items {
-        match item {
-            WaitItem::Master {
-                plan,
-                sha,
-                next,
-                reason,
-            } => {
-                out.push_str(&format!(
-                    "  - master: plan `{plan}` at {short} ({full}) — next={next:?} ({reason})\n",
-                    plan = plan.as_str(),
-                    short = short_sha(sha.as_str()),
-                    full = sha.as_str(),
-                ));
-            }
-            WaitItem::Reviewer {
-                plan,
-                sha,
-                feedback_path: _,
-            } => {
-                out.push_str(&format!(
-                    "  - reviewer: plan `{plan}` at {short} — write feedback via\n    `clank feedback write --plan {plan} --commit {full} \\\n        --author {label} --verdict approve|request-changes` (body on stdin)\n",
-                    plan = plan.as_str(),
-                    short = short_sha(sha.as_str()),
-                    full = sha.as_str(),
-                    label = label.as_str(),
-                ));
-            }
-            WaitItem::Finished { plan, finalized_at } => {
-                out.push_str(&format!(
-                    "  - finished: plan `{plan}` finalized at {short}\n",
-                    plan = plan.as_str(),
-                    short = short_sha(finalized_at.as_str()),
-                ));
-            }
-        }
-    }
-    out.push_str("\nAct on these items now.");
-    out
-}
-
 /// Render wfw's JSON `items` array into the continuation prompt
 /// body. Loose stringly-typed projection because we're consuming
 /// our own JSON output via subprocess. Same `--author` + full-SHA
-/// rules as [`render_work_reason`].
+/// rules as the hint-mode renderer (removed).
 fn render_wfw_items(items: &[serde_json::Value], label: &AgentLabel, role: Role) -> String {
     let mut out = String::new();
     out.push_str(&format!(
@@ -359,54 +234,6 @@ fn render_wfw_items(items: &[serde_json::Value], label: &AgentLabel, role: Role)
 
 fn short_sha(s: &str) -> &str {
     &s[..s.len().min(7)]
-}
-
-/// Branch-2 prompt: an active plan exists but the wait isn't on
-/// me. Suggest `clank wfw` so the agent can explicitly block on
-/// the wait. The command is runnable as-is (wfw inferring author
-/// + role via the resolver — see task #262).
-fn render_wfw_suggestion(
-    plans: &[&clank_core::plan_view::PlanView],
-    label: &AgentLabel,
-    role: Role,
-) -> String {
-    use clank_core::plan_view::WaitingOn;
-    let mut out = String::new();
-    out.push_str(&format!(
-        "Clank has no work for `{label}` ({role}) right now, but {n} plan{s} \
-         in flight:\n",
-        label = label.as_str(),
-        role = role.as_str(),
-        n = plans.len(),
-        s = if plans.len() == 1 { "" } else { "s" },
-    ));
-    for view in plans {
-        let waiting = match &view.waiting_on {
-            WaitingOn::MasterToRevise { .. } => "master to address feedback",
-            WaitingOn::MasterToCommit => "master to commit plan revision",
-            WaitingOn::MasterToImplement => "master to implement",
-            WaitingOn::MasterToFinalize => "master to run `clank finish`",
-            WaitingOn::FirstReview => "first reviewer",
-            WaitingOn::ReviewerApprovalsMissing { missing } => {
-                let names: Vec<&str> = missing.iter().map(|l| l.as_str()).collect();
-                out.push_str(&format!(
-                    "  - `{plan}`: waiting on reviewers ({names})\n",
-                    plan = view.plan.as_str(),
-                    names = names.join(", "),
-                ));
-                continue;
-            }
-        };
-        out.push_str(&format!(
-            "  - `{plan}`: waiting on {waiting}\n",
-            plan = view.plan.as_str(),
-        ));
-    }
-    out.push_str(
-        "\nIf you want to wait for this to change, run `clank wfw` (it will block \
-         until you have work or until its timeout expires).",
-    );
-    out
 }
 
 /// Render the outcome to the per-tool wire shape and exit.

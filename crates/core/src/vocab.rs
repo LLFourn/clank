@@ -177,25 +177,22 @@ impl Tool {
 /// Auto-mode setting for an agent's stop-hook behavior.
 ///
 /// - `Off`: hook exits immediately.
-/// - `Hint`: hook does a non-blocking check; emits a continuation
-///   when work is pending now, else exits.
-/// - `Wait`: hook long-polls `clank wfw` until work arrives or
+/// - `On`: hook long-polls `clank wfw` until work arrives or
 ///   `wfw_timeout` elapses.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AutoMode {
     #[default]
     Off,
-    Hint,
-    Wait,
+    #[serde(alias = "hint", alias = "wait")]
+    On,
 }
 
 impl AutoMode {
     pub fn as_str(self) -> &'static str {
         match self {
             AutoMode::Off => "off",
-            AutoMode::Hint => "hint",
-            AutoMode::Wait => "wait",
+            AutoMode::On => "on",
         }
     }
 }

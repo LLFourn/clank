@@ -96,7 +96,7 @@ mod tests {
     #[test]
     fn agent_config_round_trips_populated() {
         let cfg = AgentConfig {
-            auto_mode: AutoMode::Hint,
+            auto_mode: AutoMode::On,
             role: Role::Master,
             wfw_timeout: Some("30m".into()),
             session: Some(Session {
@@ -114,7 +114,7 @@ mod tests {
     fn agent_config_accepts_missing_optional_fields() {
         let json = r#"{ "auto_mode": "wait" }"#;
         let cfg: AgentConfig = serde_json::from_str(json).unwrap();
-        assert_eq!(cfg.auto_mode, AutoMode::Wait);
+        assert_eq!(cfg.auto_mode, AutoMode::On);
         assert_eq!(cfg.role, Role::Reviewers);
         assert!(cfg.wfw_timeout.is_none());
         assert!(cfg.session.is_none());
@@ -123,7 +123,7 @@ mod tests {
     #[test]
     fn agent_config_omits_none_session() {
         let cfg = AgentConfig {
-            auto_mode: AutoMode::Hint,
+            auto_mode: AutoMode::On,
             ..Default::default()
         };
         let json = serde_json::to_string(&cfg).unwrap();

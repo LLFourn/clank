@@ -62,7 +62,7 @@ The first thing an agent does in a session:
 
 ```sh
 clank as alice          # bind this session as `alice`
-clank auto on           # enable the Stop hook in hint mode
+clank auto on           # enable the Stop hook
 ```
 
 (`clank init` does both interactively if you'd rather.)
@@ -125,18 +125,14 @@ and commits the finalize.
 `clank setup` installs a Stop hook into your claude / codex config that
 runs whenever the agent would end a turn. Two modes:
 
-- **hint** (default): cheap status check. If there's work waiting for
-  this agent, the hook resumes the agent with that work. If there's
-  work waiting on someone else, it suggests running `clank wfw`. If
-  nothing's in flight, exits silently.
-- **wait**: long-polls `clank wfw`. The agent's turn doesn't end until
-  work arrives or the timeout expires.
+When enabled, the hook long-polls `clank wfw`. The agent's turn
+doesn't end until work arrives or the timeout expires. When there's
+no work and no active plans, the hook exits silently.
 
 Toggle per-agent per-repo:
 
 ```sh
-clank auto on              # hint mode
-clank auto on --mode wait  # blocking long-poll
+clank auto on              # enable
 clank auto off             # disable
 clank auto status          # show current state
 ```
@@ -221,7 +217,7 @@ For a fully bound session with the hook installed, you should see:
 [repo]
   OK   .clank/.gitignore: present
   OK   .claude/settings.local.json: all three agent edit-permission rules present
-  OK   agent: alice: …, auto_mode=hint, session=claude bound to …
+  OK   agent: alice: …, auto_mode=on, session=claude bound to …
 
 [user]
   OK   ~/.claude/skills/clank/SKILL.md: matches embedded content

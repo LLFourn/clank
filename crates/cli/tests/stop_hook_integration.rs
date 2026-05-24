@@ -61,10 +61,10 @@ fn bind_alice(repo: &Path) {
     );
 }
 
-fn turn_auto_on(repo: &Path, mode: &str) {
+fn turn_auto_on(repo: &Path) {
     let out = run_clank(
         repo,
-        &["auto", "on", "--mode", mode],
+        &["auto", "on", "--wfw-timeout", "10s"],
         &[("CLAUDE_CODE_SESSION_ID", CLAUDE_SESSION)],
     );
     assert!(
@@ -136,7 +136,7 @@ fn stop_hook_active_still_fires_continuation() {
     git(repo, &["add", "-A"]);
     git(repo, &["commit", "--quiet", "-m", "[foo] intro"]);
     bind_alice(repo);
-    turn_auto_on(repo, "hint");
+    turn_auto_on(repo);
 
     let stdin = claude_stdin(CLAUDE_SESSION, repo, true);
     let (code, stdout, stderr) = run_stop_hook(repo, "claude", &stdin, &[]);
@@ -168,66 +168,6 @@ fn auto_off_exits_silent() {
     assert_eq!(code, Some(0));
     assert!(stdout.is_empty(), "stdout={stdout}");
     assert!(stderr.is_empty(), "stderr={stderr}");
-}
-
-#[test]
-fn hint_mode_no_plans_exits_silent() {
-    // No plans in this repo at all → branches 1 + 2 both empty
-    // → silent.
-    let dir = init_repo();
-    let repo = dir.path();
-    bind_alice(repo);
-    turn_auto_on(repo, "hint");
-
-    let stdin = claude_stdin(CLAUDE_SESSION, repo, false);
-    let (code, stdout, stderr) = run_stop_hook(repo, "claude", &stdin, &[]);
-    assert_eq!(code, Some(0), "expected silent exit; stderr={stderr}");
-    assert!(stdout.is_empty(), "stdout={stdout}");
-}
-
-#[test]
-fn hint_mode_plan_waiting_on_others_suggests_wfw() {
-    // Master committed a plan intro → plan is waiting on first
-    // reviewer. Alice IS the master here, so derive_work returns
-    // no items for her (master has no work; reviewer does), but
-    // branch 2 should fire: an active plan is in flight.
-    let dir = init_repo();
-    let repo = dir.path();
-    std::fs::create_dir_all(repo.join(".clank/plans")).unwrap();
-    std::fs::write(repo.join(".clank/plans/foo.md"), "# foo\n").unwrap();
-    git(repo, &["add", "-A"]);
-    git(repo, &["commit", "--quiet", "-m", "[foo] intro"]);
-
-    bind_alice(repo);
-    // Claim master so derive_work uses Role::Master perspective.
-    let out_claim = run_clank(
-        repo,
-        &["auto", "on", "--role", "master"],
-        &[("CLAUDE_CODE_SESSION_ID", CLAUDE_SESSION)],
-    );
-    assert!(out_claim.status.success());
-
-    let stdin = claude_stdin(CLAUDE_SESSION, repo, false);
-    let (code, stdout, stderr) = run_stop_hook(repo, "claude", &stdin, &[]);
-    // Branch 2 = claude continuation (exit 2 + stderr).
-    assert_eq!(
-        code,
-        Some(2),
-        "expected branch-2 continuation; stderr={stderr}"
-    );
-    assert!(stdout.is_empty(), "stdout={stdout}");
-    assert!(
-        stderr.contains("no work for `alice`"),
-        "expected branch-2 framing; got {stderr}"
-    );
-    assert!(
-        stderr.contains("waiting on first reviewer"),
-        "expected waiting-on description; got {stderr}"
-    );
-    assert!(
-        stderr.contains("clank wfw"),
-        "expected wfw suggestion; got {stderr}"
-    );
 }
 
 #[test]
@@ -277,7 +217,7 @@ fn hint_with_reviewable_work_emits_claude_continuation() {
     git(repo, &["commit", "--quiet", "-m", "[foo] intro"]);
 
     bind_alice(repo);
-    turn_auto_on(repo, "hint");
+    turn_auto_on(repo);
     // alice has role=reviewers (no master designated). The intro
     // commit is reviewable; alice hasn't reviewed → derive_work
     // should return a Reviewer item for her.
@@ -336,7 +276,7 @@ fn hint_with_reviewable_work_emits_codex_continuation() {
         &[("CODEX_THREAD_ID", CODEX_SESSION)],
     );
     assert!(out.status.success());
-    turn_auto_on_codex(repo, "hint");
+    turn_auto_on_codex(repo);
 
     let stdin = format!(
         r#"{{
@@ -376,10 +316,10 @@ fn hint_with_reviewable_work_emits_codex_continuation() {
     );
 }
 
-fn turn_auto_on_codex(repo: &Path, mode: &str) {
+fn turn_auto_on_codex(repo: &Path) {
     let out = run_clank(
         repo,
-        &["auto", "on", "--mode", mode],
+        &["auto", "on", "--wfw-timeout", "10s"],
         &[("CODEX_THREAD_ID", CODEX_SESSION)],
     );
     assert!(
