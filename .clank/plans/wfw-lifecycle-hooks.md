@@ -91,9 +91,17 @@ movement resets the gate independently of feedback).
 
 ### `plan-finalized`
 
-Reuse `detect_finished`'s existing `StartupSnapshot` comparison.
-When `detect_finished` produces `WaitItem::Finished` items, also
-fire the hook for each.
+Track `finished_shas: BTreeMap<PlanKey, BTreeSet<CommitSha>>` in
+the lifecycle snapshot (same shape as `StartupSnapshot`'s
+`finished_at_startup`). On each refold, compare current
+`state.fold.finished_plans` against the tracked set. New entries
+fire `plan-finalized`. Update the tracked set unconditionally.
+
+Do NOT piggyback on `detect_finished` / `StartupSnapshot` — its
+`watched` set is fixed at startup and doesn't include plans
+introduced mid-session. The lifecycle snapshot maintains its own
+finished-plan tracking so a plan introduced and finalized during
+the same wfw invocation is correctly observed.
 
 ## Environment variables
 
@@ -116,9 +124,17 @@ loop iteration):
 2. Detect lifecycle transitions by comparing current state to the
    lifecycle snapshot. For each transition matching a configured
    hook, run the hook command via `sh -c` with env vars set.
-   Block until the hook exits. Log stderr to wfw's stderr. If the
-   hook exits non-zero, log a warning but don't fail wfw — hooks
-   are best-effort notifications, not gates. Update the snapshot.
+   Block until the hook exits. Hook stdout is captured and
+   discarded (never inherited — `wfw --json` stdout must stay
+   clean for the stop-hook parser). Hook stderr is forwarded to
+   wfw's stderr. If the hook exits non-zero, log a warning but
+   don't fail wfw — hooks are best-effort notifications, not
+   gates.
+3. **Advance the lifecycle snapshot unconditionally** — update
+   `known_plans`, `review_state`, and `finished_shas` to the
+   current state regardless of whether any event had a configured
+   hook. This ensures later transitions compare against fresh
+   state even for events the operator chose not to hook.
 3. Derive work items for this role (existing `derive_work` +
    `detect_finished`).
 4. If items non-empty, print and exit.
@@ -166,9 +182,16 @@ behavior, no regression).
 ### `crates/cli/src/cli/wfw.rs`
 
 - New `LifecycleSnapshot` alongside `StartupSnapshot`:
-  `{ known_plans: BTreeSet<PlanKey>, review_state: BTreeMap<PlanKey, (CommitSha, GateState)> }`
-  — tracks the `(latest_reviewable_sha, gate_state)` pair per plan
-  so `review-received` only fires on same-SHA gate transitions.
+  ```rust
+  struct LifecycleSnapshot {
+      known_plans: BTreeSet<PlanKey>,
+      review_state: BTreeMap<PlanKey, (CommitSha, GateState)>,
+      finished_shas: BTreeMap<PlanKey, BTreeSet<CommitSha>>,
+  }
+  ```
+  Tracks plan existence, `(latest_reviewable_sha, gate_state)` for
+  same-SHA review detection, and finished-plan SHAs independently
+  of `StartupSnapshot` so mid-session introductions are covered.
 - `detect_lifecycle_transitions(prev, current_views) -> Vec<HookFiring>`:
   compare previous snapshot to current views, emit firings.
 - In the watch loop's refold path: call
@@ -176,8 +199,8 @@ behavior, no regression).
   to `derive_work` as today.
 - On the initial fold (one-shot path): same detection before
   returning items.
-- `plan-finalized` hooks piggyback on the existing
-  `detect_finished` output.
+- `plan-finalized` hooks use the lifecycle snapshot's own
+  `finished_shas` tracking (not `detect_finished`).
 
 ### `.clank/.gitignore`
 
