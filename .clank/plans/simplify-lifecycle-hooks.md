@@ -56,7 +56,9 @@ event names:
 
 - `LifecycleSnapshot` struct and all methods
 - `detect_lifecycle_transitions` / `advance_lifecycle_snapshot`
-- `build_views_for_state` (only used by lifecycle detection)
+- Lifecycle detection code in the watch loop (the inline refold
+  that called detect/advance is replaced by the existing
+  `derive_from_state` call)
 - The `has_hooks` variable and `&& !has_hooks` guard
 - Old event names (`plan-introduced`, `review-received`) from
   `HookEvent` enum — replaced by `master-work`, `reviewer-work`
@@ -137,10 +139,13 @@ from the `MasterNext` variant name.
 3. If items non-empty:
      fire work-item hooks (master-work / reviewer-work / plan-finalized)
      emit items, return
-4. Master + no plans (or no items after initial fold):
+4. Master + no plans (`plans.is_empty()` only — NOT "no items"):
      fire idle hook via run_idle_hook (separate from HookFiring)
      → if prompt returned, emit as WaitItem::Idle + return
      → else emit empty items, return (master-empty fast-exit)
+   Note: master with active plans but no current items (waiting
+   on reviewers) must NOT hit this path — it enters the watch
+   loop at step 5 so reviewer feedback can wake it.
 5. Enter watch loop
 6. On each refold tick:
      derive items
