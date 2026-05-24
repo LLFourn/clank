@@ -1050,13 +1050,12 @@ fn wfw_lifecycle_hook_fires_on_plan_introduced() {
 
 #[test]
 fn wfw_hook_failure_does_not_fail_wfw() {
-    // The plan already exists when wfw starts, so plan-introduced
-    // fires on the initial fold (lifecycle snapshot starts empty).
-    // The hook exits 1 — wfw should still succeed and emit items.
+    // Park wfw as reviewer, then introduce a plan mid-watch.
+    // The plan-introduced hook exits 1 — wfw should still succeed.
     let dir = init_repo();
     let repo = dir.path();
-    write(repo, ".clank/plans/foo.md", "# foo\n");
-    commit(repo, "[foo] intro");
+    write(repo, "README.md", "# repo\n");
+    commit(repo, "init");
 
     write(
         repo,
@@ -1064,32 +1063,32 @@ fn wfw_hook_failure_does_not_fail_wfw() {
         r#"{"plan-introduced": "exit 1"}"#,
     );
 
-    let output = Command::new(clank_bin())
-        .args([
-            "wfw",
-            "--no-poll",
+    let mut child = spawn_wfw(
+        repo,
+        &[
             "--author",
             "alice",
             "--role",
             "reviewers",
             "--timeout",
-            "3s",
-        ])
-        .arg("--repo")
-        .arg(repo)
-        .output()
-        .expect("spawn");
-    assert!(
-        output.status.success(),
-        "wfw should succeed despite hook failure; stderr={}",
-        String::from_utf8_lossy(&output.stderr)
+            "30s",
+        ],
     );
-    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    write(repo, ".clank/plans/foo.md", "# foo\n");
+    commit(repo, "[foo] intro");
+
+    let exit = wait_for_exit(&mut child, Duration::from_secs(20));
+    let stdout = read_stdout_to_end(&mut child);
+    let stderr = read_stderr_to_end(&mut child);
+    assert!(
+        exit.success(),
+        "wfw should succeed despite hook failure; stderr={stderr}"
+    );
     assert!(
         stdout.contains("review"),
         "should still emit work items; stdout={stdout}"
     );
-    let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
         stderr.contains("lifecycle hook") && stderr.contains("plan-introduced"),
         "stderr should warn about the failing hook; got: {stderr}"
@@ -1132,6 +1131,70 @@ fn wfw_master_empty_blocks_when_hooks_configured() {
     assert!(
         elapsed >= Duration::from_millis(1800),
         "expected master to block for ~2s with hooks; exited in {elapsed:?}"
+    );
+}
+
+#[test]
+fn wfw_repeated_invocations_do_not_refire_hooks() {
+    // Regression: lifecycle snapshot must capture initial state so
+    // pre-existing plans don't fire plan-introduced on every wfw
+    // invocation.
+    let dir = init_repo();
+    let repo = dir.path();
+    write(repo, ".clank/plans/foo.md", "# foo\n");
+    commit(repo, "[foo] intro");
+
+    let marker = repo.join("hook-fired.txt");
+    let hook_cmd = format!("echo fired >> {}", marker.display());
+    write(
+        repo,
+        ".clank/hooks.json",
+        &format!(r#"{{"plan-introduced": "{hook_cmd}"}}"#),
+    );
+
+    // First invocation — plan already exists, snapshot captures it,
+    // no transition detected.
+    let output1 = Command::new(clank_bin())
+        .args([
+            "wfw",
+            "--no-poll",
+            "--author",
+            "alice",
+            "--role",
+            "reviewers",
+            "--timeout",
+            "1s",
+        ])
+        .arg("--repo")
+        .arg(repo)
+        .output()
+        .expect("spawn");
+    // wfw returns reviewer work (intro commit) or times out — either
+    // way, the hook should NOT have fired.
+    let _ = output1;
+
+    // Second invocation — same state, still no transition.
+    let output2 = Command::new(clank_bin())
+        .args([
+            "wfw",
+            "--no-poll",
+            "--author",
+            "alice",
+            "--role",
+            "reviewers",
+            "--timeout",
+            "1s",
+        ])
+        .arg("--repo")
+        .arg(repo)
+        .output()
+        .expect("spawn");
+    let _ = output2;
+
+    assert!(
+        !marker.exists(),
+        "hook should NOT fire for pre-existing plans; marker file exists with: {}",
+        std::fs::read_to_string(&marker).unwrap_or_default()
     );
 }
 
