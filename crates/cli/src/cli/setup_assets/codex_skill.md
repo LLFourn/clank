@@ -28,8 +28,8 @@ Each repo's `.clank/` directory contains:
 - `clank finish <plan>` — finalize an approved plan (master only).
 - `clank as <label>` — bind this session to an agent label (you'll
   typically run this once per session at the start).
-- `clank auto on|off [--mode hint|wait] [--role …]` — toggle the
-  Stop-hook auto-mode for this session.
+- `clank auto on|off [--role …]` — toggle the Stop-hook auto-mode
+  for this session.
 
 ## Stop-hook continuations
 

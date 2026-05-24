@@ -10,8 +10,7 @@ User invoked `/clank` with arguments: "$ARGUMENTS"
 - **If $ARGUMENTS is `config`**: use codex's structured-question
   tool (`elicitation_request` or equivalent) to present these
   options to the user:
-  - "Enable auto-mode (hint, default)" → `clank auto on`
-  - "Enable auto-mode (wait, blocking)" → `clank auto on --mode wait`
+  - "Enable auto-mode" → `clank auto on`
   - "Disable auto-mode" → `clank auto off`
   - "Switch role to master" → `clank auto on --role master`
   - "Switch role to reviewers" → `clank auto on --role reviewers`

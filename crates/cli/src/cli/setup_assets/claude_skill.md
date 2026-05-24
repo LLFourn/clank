@@ -28,8 +28,8 @@ Each repo's `.clank/` directory contains:
 - `clank finish <plan>` — finalize an approved plan (master only).
 - `clank as <label>` — bind this session to an agent label (you'll
   typically run this once per session at the start).
-- `clank auto on|off [--mode hint|wait] [--role …]` — toggle the
-  Stop-hook auto-mode for this session.
+- `clank auto on|off [--role …]` — toggle the Stop-hook auto-mode
+  for this session.
 
 ## /clank slash command
 
@@ -41,8 +41,7 @@ User invoked `/clank` with arguments: "$ARGUMENTS"
 - **If $ARGUMENTS is `config`**: use the structured-question tool
   (`AskUserQuestion` in claude; `elicitation_request` /
   equivalent in codex) to present these options to the user:
-  - "Enable auto-mode (hint, default)" → `clank auto on`
-  - "Enable auto-mode (wait, blocking)" → `clank auto on --mode wait`
+  - "Enable auto-mode" → `clank auto on`
   - "Disable auto-mode" → `clank auto off`
   - "Switch role to master" → `clank auto on --role master`
   - "Switch role to reviewers" → `clank auto on --role reviewers`
