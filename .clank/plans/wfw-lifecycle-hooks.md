@@ -27,17 +27,18 @@ react."
 
 ## Configuration
 
-Two config files, loaded in order (repo overrides user):
+Two config files, merged (repo overlays user defaults):
 
-1. **`.clank/hooks.json`** (repo-level, gitignored)
-2. **`~/.clank/hooks.json`** (user-level, global default)
+1. **`~/.clank/hooks.json`** (user-level, global defaults)
+2. **`.clank/hooks.json`** (repo-level, gitignored, overrides
+   user per-event)
 
 Schema:
 
 ```json
 {
   "plan-introduced": "notify-send 'New plan: $CLANK_PLAN'",
-  "review-received": "notify-send 'Review on $CLANK_PLAN ($CLANK_VERDICT)'",
+  "review-received": "notify-send 'Review on $CLANK_PLAN'",
   "plan-finalized": "notify-send 'Finalized: $CLANK_PLAN'"
 }
 ```
@@ -69,22 +70,19 @@ that wasn't in the set, fire the hook and add it to the set.
 ### `review-received`
 
 Track per-plan gate state at startup (`PlanView::waiting_on`).
-On each refold, project the plan view. If `waiting_on` changed
-AND the change was caused by reviewer activity (the new state is
-a Master-facing variant: `MasterToRevise`, `MasterToImplement`,
-`MasterToFinalize`, `MasterToCommit`), fire the hook. Update the
-tracked state.
+Track the per-plan **gate state** (`PlanView::gate_state` —
+`Unreviewed`, `Approved`, `ChangesRequested`) across refold ticks.
+Fire `review-received` when the gate state changes. Gate state is
+derived purely from reviewer feedback, not from worktree dirtiness
+or `waiting_on` — so a dirty plan file doesn't cause a false
+positive, and reviewer feedback that lands while the plan file is
+dirty doesn't cause a false negative.
 
-The "caused by reviewer activity" filter distinguishes reviewer-
-driven transitions (feedback posted) from master-driven ones
-(master committed a revision, changing `waiting_on` back to
-`FirstReview` or `ReviewerApprovalsMissing`). Without this filter,
-master's own commits would fire `review-received`.
-
-`MasterToCommit` is explicitly excluded from the trigger set — it
-fires when the plan file becomes dirty (a worktree state), not
-when a reviewer posts feedback. The trigger set is:
-`MasterToRevise`, `MasterToImplement`, `MasterToFinalize`.
+Do NOT key this event off `waiting_on`. `waiting_on` mixes
+reviewer-driven transitions (feedback posted) with worktree-driven
+transitions (`MasterToCommit` from a dirty plan file) and master-
+driven transitions (new commit changing `waiting_on` back to
+`FirstReview`). Gate state is the clean signal.
 
 ### `plan-finalized`
 
@@ -145,7 +143,8 @@ review-received fires on tick 7 when feedback lands).
 ### `crates/cli/src/cli/wfw.rs`
 
 - New `LifecycleSnapshot` alongside `StartupSnapshot`:
-  `{ known_plans: BTreeSet<PlanKey>, gate_states: BTreeMap<PlanKey, WaitingOn> }`.
+  `{ known_plans: BTreeSet<PlanKey>, gate_states: BTreeMap<PlanKey, GateState> }`
+  where `GateState` is the gate's approval status (not `WaitingOn`).
 - `detect_lifecycle_transitions(prev, current_views) -> Vec<HookFiring>`:
   compare previous snapshot to current views, emit firings.
 - In the watch loop's refold path: call
