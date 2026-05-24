@@ -242,14 +242,16 @@ pub(crate) fn build_amend_program(
     })
 }
 
-pub(crate) fn render_amend_dry(program: &AmendProgram) {
-    println!("# clank purge --amend preview");
-    println!("# HEAD: {}", program.head_sha);
-    println!("# would strip from HEAD's tree:");
+pub(crate) fn render_amend_dry(program: &AmendProgram) -> String {
+    let mut out = String::new();
+    out.push_str("# clank purge --amend preview\n");
+    out.push_str(&format!("# HEAD: {}\n", program.head_sha));
+    out.push_str("# would strip from HEAD's tree:\n");
     for p in &program.strip_paths {
-        println!("#   - {p}");
+        out.push_str(&format!("#   - {p}\n"));
     }
-    println!("# (--dry: no commits, no refs touched)");
+    out.push_str("# (--dry: no commits, no refs touched)\n");
+    out
 }
 
 pub(crate) fn execute_amend(repo: &std::path::Path, program: &AmendProgram) -> anyhow::Result<()> {
@@ -361,7 +363,7 @@ async fn run_amend(repo: &std::path::Path, basename: &str, args: &PurgeArgs) -> 
     }
 
     if args.dry {
-        render_amend_dry(&program);
+        print!("{}", render_amend_dry(&program));
         return Ok(());
     }
 
@@ -549,17 +551,20 @@ mod tests {
         let plan = PlanKey::parse("foo").unwrap();
         let program = build_amend_program(repo, Some(&plan)).unwrap();
 
-        let mut buf = Vec::new();
-        // Capture stdout by redirecting via a closure.
-        // Simpler: just check that the function doesn't panic and
-        // verify structurally that the same paths are present.
+        let rendered = render_amend_dry(&program);
+        assert!(
+            rendered.contains(&program.head_sha),
+            "render should include HEAD SHA; got:\n{rendered}"
+        );
         for p in &program.strip_paths {
-            let line = format!("#   - {p}");
-            buf.push(line);
+            assert!(
+                rendered.contains(p),
+                "render missing strip path `{p}`; got:\n{rendered}"
+            );
         }
         assert!(
-            !buf.is_empty(),
-            "expected at least one strip path in render"
+            rendered.contains("--dry: no commits"),
+            "render should include dry-run notice; got:\n{rendered}"
         );
     }
 
