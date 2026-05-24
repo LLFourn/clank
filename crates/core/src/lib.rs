@@ -63,7 +63,7 @@ pub mod wait;
 // Re-export the closed-vocab enums at crate root for ergonomic
 // imports (`use clank_core::Verdict;`).
 pub use vocab::{
-    AutoMode, CommitGateState, PlanLifecycle, PlanWorktreeStatus, Role, Tool, Verdict,
+    AutoMode, CommitGateState, HookEvent, PlanLifecycle, PlanWorktreeStatus, Role, Tool, Verdict,
     WaitingReason,
 };
 

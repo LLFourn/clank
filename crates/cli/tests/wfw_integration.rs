@@ -1004,6 +1004,129 @@ fn wfw_master_with_active_plan_still_blocks() {
     );
 }
 
+#[test]
+fn wfw_lifecycle_hook_fires_on_plan_introduced() {
+    let dir = init_repo();
+    let repo = dir.path();
+    write(repo, "README.md", "# repo\n");
+    commit(repo, "init");
+
+    let marker = repo.join("hook-fired.txt");
+    let hook_cmd = format!("echo $CLANK_EVENT $CLANK_PLAN > {}", marker.display());
+    write(
+        repo,
+        ".clank/hooks.json",
+        &format!(r#"{{"plan-introduced": "{hook_cmd}"}}"#),
+    );
+
+    let mut child = spawn_wfw(
+        repo,
+        &[
+            "--author",
+            "alice",
+            "--role",
+            "reviewers",
+            "--timeout",
+            "30s",
+        ],
+    );
+
+    write(repo, ".clank/plans/foo.md", "# foo\n");
+    commit(repo, "[foo] intro");
+
+    let exit = wait_for_exit(&mut child, Duration::from_secs(20));
+    let stdout = read_stdout_to_end(&mut child);
+    assert!(exit.success(), "wfw exit={exit:?} stdout=`{stdout}`");
+    assert!(
+        marker.exists(),
+        "hook marker file should exist after plan-introduced"
+    );
+    let content = std::fs::read_to_string(&marker).unwrap();
+    assert!(
+        content.contains("plan-introduced") && content.contains("foo"),
+        "marker should contain event + plan; got: {content}"
+    );
+}
+
+#[test]
+fn wfw_hook_failure_does_not_fail_wfw() {
+    let dir = init_repo();
+    let repo = dir.path();
+    write(repo, ".clank/plans/foo.md", "# foo\n");
+    commit(repo, "[foo] intro");
+
+    write(
+        repo,
+        ".clank/hooks.json",
+        r#"{"plan-introduced": "exit 1"}"#,
+    );
+
+    let output = Command::new(clank_bin())
+        .args([
+            "wfw",
+            "--no-poll",
+            "--author",
+            "alice",
+            "--role",
+            "reviewers",
+            "--timeout",
+            "3s",
+        ])
+        .arg("--repo")
+        .arg(repo)
+        .output()
+        .expect("spawn");
+    assert!(
+        output.status.success(),
+        "wfw should succeed despite hook failure; stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("review"),
+        "should still emit work items; stdout={stdout}"
+    );
+}
+
+#[test]
+fn wfw_master_empty_blocks_when_hooks_configured() {
+    let dir = init_repo();
+    let repo = dir.path();
+    write(repo, "README.md", "# repo\n");
+    commit(repo, "init");
+
+    write(repo, ".clank/hooks.json", r#"{"plan-introduced": "true"}"#);
+
+    let start = Instant::now();
+    let output = Command::new(clank_bin())
+        .args([
+            "wfw",
+            "--no-poll",
+            "--author",
+            "lloyd",
+            "--role",
+            "master",
+            "--timeout",
+            "2s",
+        ])
+        .arg("--repo")
+        .arg(repo)
+        .output()
+        .expect("spawn");
+    let elapsed = start.elapsed();
+
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "expected timeout (hooks keep master in watch loop); got {:?}",
+        output.status
+    );
+    assert!(
+        elapsed >= Duration::from_millis(1800),
+        "expected master to block for ~2s with hooks; exited in {elapsed:?}"
+    );
+}
+
 fn wait_for_exit(child: &mut std::process::Child, max: Duration) -> std::process::ExitStatus {
     let end = Instant::now() + max;
     loop {

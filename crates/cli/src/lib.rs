@@ -12,6 +12,7 @@ pub mod agent_store;
 pub mod feedback_scan;
 pub mod fs_watcher;
 pub mod git_io;
+pub mod hook_config;
 pub mod preview;
 pub mod runtime;
 pub mod state_cache;
