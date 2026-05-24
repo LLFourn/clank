@@ -108,24 +108,42 @@ Hook commands receive context via env vars:
 
 ## Hook execution
 
-Inside `wfw::run`, after `derive_from_state` (or `check_once`)
-produces a non-empty result:
+Lifecycle detection is a **separate path from work-item
+derivation**. On every refold tick (initial fold and each watch-
+loop iteration):
 
-1. Detect lifecycle transitions by comparing current state to the
-   snapshot.
-2. For each detected transition, look up the configured hook
-   command.
-3. Run each hook via `sh -c <command>` with the env vars set.
+1. Project plan views.
+2. Detect lifecycle transitions by comparing current state to the
+   lifecycle snapshot. For each transition matching a configured
+   hook, run the hook command via `sh -c` with env vars set.
    Block until the hook exits. Log stderr to wfw's stderr. If the
    hook exits non-zero, log a warning but don't fail wfw — hooks
-   are best-effort notifications, not gates.
-4. Print items and exit as today.
+   are best-effort notifications, not gates. Update the snapshot.
+3. Derive work items for this role (existing `derive_work` +
+   `detect_finished`).
+4. If items non-empty, print and exit.
+5. Otherwise, loop back to the next refold tick.
 
-For the watch loop (long-poll mode): hooks fire on each refold
-tick that produces transitions, not just the final one that also
-produces work items. This means hooks can fire multiple times
-during one wfw invocation (e.g. plan-introduced fires on tick 3,
-review-received fires on tick 7 when feedback lands).
+This ordering means hooks fire on transitions that don't produce
+role-filtered work items (e.g. `plan-introduced` fires for a
+master agent even though the intro commit produces `Reviewer`
+work, not `Master` work).
+
+### Master-empty early-exit interaction
+
+The `wfw-master-empty-exit` plan added an early return when
+`role == Master` and the active plan set is empty — master has
+nothing to wait for. That early-exit skips the watch loop, so
+master's wfw can't observe `plan-introduced` for a plan committed
+after wfw starts.
+
+When hooks are configured: **skip the master-empty early-exit**
+and enter the watch loop. The hook system needs the watcher to
+observe new plans. Work items still won't appear for master (no
+plans = no master work), but hooks will fire.
+
+When no hooks are configured: preserve the early-exit (existing
+behavior, no regression).
 
 ## Implementation surface
 
