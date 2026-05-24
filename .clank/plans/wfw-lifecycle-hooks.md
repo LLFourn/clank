@@ -42,12 +42,12 @@ Schema:
 }
 ```
 
-Each value is a shell command string executed via `sh -c`. `null`
-or absent means no hook for that event.
+Each value is a shell command string executed via `sh -c`. Absent
+keys mean no hook for that event — omit the key to disable.
 
-Merging: per-event override. If the repo config defines
-`review-received`, it wins over the user-level one. Events not
-defined in the repo config fall through to the user config.
+Merging: load user-level defaults first, then overlay repo-level
+entries. Repo wins for any event defined in both. Events only in
+the user config are preserved as defaults.
 
 ## Event detection
 
@@ -80,6 +80,11 @@ driven transitions (feedback posted) from master-driven ones
 (master committed a revision, changing `waiting_on` back to
 `FirstReview` or `ReviewerApprovalsMissing`). Without this filter,
 master's own commits would fire `review-received`.
+
+`MasterToCommit` is explicitly excluded from the trigger set — it
+fires when the plan file becomes dirty (a worktree state), not
+when a reviewer posts feedback. The trigger set is:
+`MasterToRevise`, `MasterToImplement`, `MasterToFinalize`.
 
 ### `plan-finalized`
 
@@ -124,15 +129,16 @@ review-received fires on tick 7 when feedback lands).
 ### `crates/core` — new types
 
 - `HookEvent` enum: `PlanIntroduced`, `ReviewReceived`,
-  `PlanFinalized`. Serde snake_case.
+  `PlanFinalized`. Serde `rename_all = "kebab-case"` to match
+  the JSON config keys (`plan-introduced`, etc.).
 - `HookFiring` struct: `{ event: HookEvent, plan: PlanKey,
   sha: CommitSha }`.
 
 ### `crates/cli` — new module `hook_config.rs`
 
 - `HookConfig` struct: `BTreeMap<HookEvent, String>`.
-- `load_hook_config(repo) -> HookConfig`: load repo-level,
-  then user-level, merge per-event.
+- `load_hook_config(repo) -> HookConfig`: load user-level
+  defaults first, then overlay repo-level entries per-event.
 - `run_hook(repo, config, firing) -> ()`: spawn `sh -c`,
   set env vars, wait, log.
 
