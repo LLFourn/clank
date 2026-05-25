@@ -164,6 +164,16 @@ flag needed.
 - `feedback_scan.rs`: simplify to scan flat directory.
 - `disk_format.rs`: remove `FeedbackTarget`, simplify parsing.
 - `stop_hook.rs`: render `AdHocReview` / `AdHocRevise`.
+  Update existing plan reviewer prompt to remove `--plan`
+  from the `clank feedback write` command.
+- `finish.rs`: simplify. `clank finish` verifies approvals
+  exist in flat feedback (gate check), then commits a
+  lightweight marker `.clank/finished/<plan>.finish`. No
+  more copying feedback files into `.clank/finished/<plan>/`.
+  The approval check is a gate, the marker is the record.
+- `preview.rs`: update to use flat feedback for gate checks.
+- `setup_assets/claude_skill.md` + `codex_skill.md`: update
+  `clank feedback write` docs to remove `--plan`.
 - Migration: move old plan-scoped files to flat layout.
 - Lifecycle hooks: ad-hoc items skip `firings_from_items`.
 
@@ -176,6 +186,9 @@ flag needed.
 - `ad_hoc_reviewers=["codex"]`: only codex gets ad-hoc work.
 - `clank feedback write --commit <sha>` writes flat path.
 - Plan feedback still works with flat path.
+- `clank finish` checks approvals in flat feedback, commits
+  a `.finish` marker (no feedback file copying).
+- Stop-hook reviewer prompt uses `--commit` (no `--plan`).
 - Migration moves old files correctly.
 - Ad-hoc items don't fire lifecycle hooks.
 
