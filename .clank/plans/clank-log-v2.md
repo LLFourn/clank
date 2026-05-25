@@ -31,15 +31,22 @@ pub async fn rebuild_from(
 ```
 
 The caller says "I need fold state and log events starting from
-this commit." The rebuild module:
+this commit." `start` is **inclusive** — events begin at `start`
+itself. The rebuild module:
 
-1. Scans cached heads for the best ancestor of `start` (or
-   `start` itself). Loads the cache.
-2. Fold-forwards from the cache anchor through HEAD, collecting
-   log events for every commit folded.
-3. Returns `(RepoState, LogEvents)`.
+1. Scans cached heads for the best ancestor strictly before
+   `start`. Loads the cache.
+2. Two-phase fold-forward from cache to HEAD:
+   - **Phase 1 (silent):** fold from cache anchor to `start`'s
+     parent. Builds state but discards log events.
+   - **Phase 2 (collecting):** fold from `start` through HEAD,
+     collecting log events for every commit.
+3. Returns `(RepoState, LogEvents)` — events only for commits
+   at or after `start`.
 
-If no cache predates `start`, cold-fold from root.
+If no cache predates `start`, cold-fold from root with the same
+two-phase split (silent to `start`'s parent, collect from
+`start`).
 
 The cache is invisible to the caller. `rebuild_from` is just
 another rebuild entry point — it uses the same `fold_forward`
@@ -75,8 +82,13 @@ only the plan's range + whatever gap to the nearest cache).
 
 ### Default limit
 
-Show the most recent 30 log events. `-n N` overrides.
-`--all` or `-n 0` shows everything.
+Show the most recent 30 **commit groups** (a commit + its
+reviews count as one group). `-n N` overrides. `-n 0` shows
+unlimited history.
+
+`--all` remains the plan-scope selector (all plans), not a
+history-depth flag. `--all -n 10` means all plans, 10 most
+recent commit groups.
 
 ## Part 3: git-log-style rendering
 
@@ -155,9 +167,15 @@ Array of typed event objects with reviews as separate `kind:
 ## Tests
 
 - `rebuild_from` with a warm cache: fold-forwards from cache,
-  returns events for the forwarded portion.
-- `rebuild_from` on a cold repo: cold-folds, returns all events.
-- Log default shows at most 30 events.
+  returns events only from `start` onward (not from cache anchor).
+- `rebuild_from` on a cold repo: cold-folds, returns events only
+  from `start` onward.
+- `rebuild_from` with a re-introduced plan key: events contain
+  only the current instance, not the prior finalized one.
+- Log default shows at most 30 commit groups.
+- A commit at the limit boundary keeps its reviews (group stays
+  together).
+- `--all -n 10` shows all plans but only 10 groups.
 - Log `--oneline` produces compact output.
 - Existing log tests still pass.
 
