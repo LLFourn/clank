@@ -26,15 +26,18 @@ don't care use `let _ =`.
 ```rust
 pub async fn rebuild_from(
     repo_root: &Path,
-    from: &CommitSha,
+    from: Option<&CommitSha>,
     to: &CommitSha,
 ) -> Result<(RepoState, LogEvents), RebuildError>
 ```
 
 `from` is exclusive, `to` is inclusive — same as `git log from..to`.
+`from = None` means "from repository root" (all commits up to `to`
+are included — handles root commits with no parent).
 The rebuild module:
 
-1. Finds the best cache at or before `from`'s parent. Loads it.
+1. Finds the best cache at or before `from` (or root if `None`).
+   Loads it.
 2. Two-phase fold-forward from cache to `to`:
    - **Phase 1 (silent):** fold from cache anchor through `from`.
      Builds state but discards log events.
@@ -74,7 +77,8 @@ clank log [<range>] [--plan <stem>] [--all] [-n N] [--oneline]
 
 `<range>` is optional, git-log-style:
 - `<sha>` — show from that commit (inclusive) to HEAD. Resolved
-  to `rebuild_from(parent_of(sha), HEAD)` so `sha` is included.
+  to `rebuild_from(parent_of(sha), HEAD)` — or
+  `rebuild_from(None, HEAD)` if `sha` is the root commit.
 - `<from>..<to>` — commits reachable from `to` but not from
   `from` (exclusive from, inclusive to). Passed directly to
   `rebuild_from(from, to)`.
@@ -199,6 +203,8 @@ Array of typed event objects with reviews as separate `kind:
 - `--all -n 10` shows all plans but only 10 groups.
 - `clank log A..B` excludes commit A, includes B.
 - `clank log A` includes commit A.
+- `clank log <root-sha>` includes the root commit (from=None).
+- Plan intro at root commit: inferred range includes the intro.
 - Log `--oneline` produces compact output.
 - Existing log tests still pass.
 
