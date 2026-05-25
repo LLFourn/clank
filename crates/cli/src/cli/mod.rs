@@ -239,8 +239,9 @@ pub struct FeedbackWriteArgs {
     /// plan's reviewable commits; ambiguous prefixes are an error.
     #[arg(long, value_name = "SHA")]
     pub commit: String,
-    /// Verdict claim. Must match the body's first non-blank line
-    /// (`APPROVE` or `REQUEST_CHANGES`); mismatch is an error.
+    /// Verdict claim. The body's first line must start with
+    /// `APPROVE <summary>` or `REQUEST_CHANGES <summary>`;
+    /// mismatch with this flag is an error.
     #[arg(long, value_enum)]
     pub verdict: VerdictArg,
     /// Agent label to attribute the feedback to. Required for

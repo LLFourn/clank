@@ -23,9 +23,9 @@ don't care use `let _ =`.
    `VERDICT\n\n<body>` to `VERDICT <one-line summary>\n\n<body>`.
    Like git commits: first line is verdict + summary, blank line,
    then details. `FeedbackBody::summary()` extracts the summary
-   from the first line. `clank feedback write --summary` or the
-   verdict line itself carries the summary. Update skill files to
-   explain the new convention.
+   from the first line. The verdict line itself carries the
+   summary. Update skill files and CLI help to explain the new
+   convention.
 
 ## Part 1: `rebuild_from`
 
