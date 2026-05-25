@@ -63,6 +63,9 @@ pub async fn run(args: LogArgs) -> anyhow::Result<()> {
         return Ok(());
     }
 
+    // Most recent first (git log convention).
+    let filtered: Vec<&LogEvent> = filtered.into_iter().rev().collect();
+
     let reviewable_shas: Vec<CommitSha> = filtered
         .iter()
         .filter_map(|e| match e {
@@ -169,6 +172,7 @@ fn short(sha: &CommitSha) -> &str {
 struct Review {
     author: String,
     verdict: Verdict,
+    summary: String,
 }
 
 fn collect_reviews(
@@ -176,16 +180,22 @@ fn collect_reviews(
     plan_keys: &[PlanKey],
     reviewable_shas: &[CommitSha],
 ) -> std::collections::BTreeMap<(String, String), Vec<Review>> {
+    use clank_core::feedback_body::FeedbackBody;
     let mut out = std::collections::BTreeMap::new();
     for key in plan_keys {
         if let Ok(fv) = scan_feedback(repo, key, reviewable_shas) {
             for cf in &fv.per_commit {
                 for (author, entry) in &cf.entries {
+                    let summary = std::fs::read_to_string(repo.join(&entry.source_path))
+                        .ok()
+                        .map(|body| FeedbackBody::parse(&body).summary(80))
+                        .unwrap_or_default();
                     out.entry((key.as_str().to_string(), cf.sha.as_str().to_string()))
                         .or_insert_with(Vec::new)
                         .push(Review {
                             author: author.as_str().to_string(),
                             verdict: entry.verdict,
+                            summary,
                         });
                 }
             }
@@ -287,10 +297,15 @@ fn print_human(
         if let Some(rs) = reviews.get(&key) {
             for r in rs {
                 let m = verdict_mark(r.verdict, c);
-                if c {
-                    println!("    {m} {C}{}{Z} {}", r.author, r.verdict);
+                let snip = if r.summary.is_empty() {
+                    String::new()
                 } else {
-                    println!("    {m} {} {}", r.author, r.verdict);
+                    format!(": {}", r.summary)
+                };
+                if c {
+                    println!("    {m} {C}{}{Z} {}{snip}", r.author, r.verdict);
+                } else {
+                    println!("    {m} {} {}{snip}", r.author, r.verdict);
                 }
             }
         }
@@ -320,31 +335,25 @@ fn print_oneline(
         };
         let subj = subj_override.unwrap_or_else(|| commit_subject(repo, sha));
         let key = (plan.as_str().to_string(), sha.as_str().to_string());
-        let review_summary = reviews
-            .get(&key)
-            .map(|rs| {
-                rs.iter()
-                    .map(|r| {
-                        let m = verdict_mark(r.verdict, c);
-                        if c {
-                            format!("{m} {C}{}{Z}", r.author)
-                        } else {
-                            format!("{m} {}", r.author)
-                        }
-                    })
-                    .collect::<Vec<_>>()
-                    .join(" ")
-            })
-            .unwrap_or_default();
-        let suffix = if review_summary.is_empty() {
-            String::new()
-        } else {
-            format!("  {review_summary}")
-        };
         if c {
-            println!("{Y}{}{Z} {subj}{suffix}", short(sha));
+            println!("{Y}{}{Z} {subj}", short(sha));
         } else {
-            println!("{} {subj}{suffix}", short(sha));
+            println!("{} {subj}", short(sha));
+        }
+        if let Some(rs) = reviews.get(&key) {
+            for r in rs {
+                let m = verdict_mark(r.verdict, c);
+                let snip = if r.summary.is_empty() {
+                    String::new()
+                } else {
+                    format!(": {}", r.summary)
+                };
+                if c {
+                    println!("  {m} {C}{}{Z}{snip}", r.author);
+                } else {
+                    println!("  {m} {}{snip}", r.author);
+                }
+            }
         }
     }
     Ok(())

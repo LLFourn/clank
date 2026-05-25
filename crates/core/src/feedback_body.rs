@@ -45,15 +45,33 @@ pub fn parse_verdict(body: &str) -> Verdict {
 /// Use [`FeedbackBody::parse`] to construct, then
 /// [`FeedbackBody::validate_matches`] when writing a file to
 /// enforce that the body matches the verdict the caller claims.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FeedbackBody {
     pub verdict: Verdict,
+    body: String,
 }
 
 impl FeedbackBody {
     pub fn parse(body: &str) -> Self {
         Self {
             verdict: parse_verdict(body),
+            body: body.to_string(),
+        }
+    }
+
+    /// First line of review content, truncated to `max` chars.
+    pub fn summary(&self, max: usize) -> String {
+        let first_content_line = self
+            .body
+            .lines()
+            .map(str::trim)
+            .skip_while(|l| l.is_empty() || *l == "APPROVE" || *l == "REQUEST_CHANGES")
+            .find(|l| !l.is_empty())
+            .unwrap_or("");
+        if first_content_line.len() > max {
+            format!("{}...", &first_content_line[..max])
+        } else {
+            first_content_line.to_string()
         }
     }
 
