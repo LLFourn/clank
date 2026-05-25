@@ -14,10 +14,9 @@ effective values and defaults:
 
 ```
 review:
-  force_review_on_misc_commits = true  (default: true)
-  force_review_on_plan_commits = true  (default: true)
-  ad_hoc_reviewers = null              (default: null)
-  require_commit_prefix = false        (default: false)
+  adhoc_feedback = true       (default: true)
+  plan_feedback = true        (default: true)
+  require_commit_prefix = false  (default: false)
 ```
 
 Source: two-layer merge of `~/.clank/config.json` and
@@ -64,9 +63,9 @@ for consistency.
 ## Tests
 
 - Bare `clank config` prints all keys with values.
-- `clank config review.force_review_on_misc_commits set false`
+- `clank config review.adhoc_feedback set false`
   writes to repo config.json.
-- `clank config review.force_review_on_misc_commits get`
+- `clank config review.adhoc_feedback get`
   returns the effective value.
 - `clank config --json` returns valid JSON.
 - Unknown key errors cleanly.
