@@ -65,6 +65,13 @@ pub enum WaitItem {
     Idle {
         prompt: String,
     },
+    AdHocReview {
+        sha: CommitSha,
+        feedback_path: String,
+    },
+    AdHocRevise {
+        sha: CommitSha,
+    },
 }
 
 /// Snapshot taken once at `wfw` startup. `detect_finished` compares
@@ -105,6 +112,219 @@ impl StartupSnapshot {
         }
     }
 }
+
+// ── ReviewLookup trait + derive_status ──────────────────
+
+pub trait ReviewLookup {
+    fn reviews_for(&self, sha: &CommitSha) -> Vec<ReviewEntry>;
+    fn worktree_status(&self, plan: &PlanKey) -> crate::vocab::PlanWorktreeStatus;
+}
+
+pub struct ReviewEntry {
+    pub author: AgentLabel,
+    pub verdict: crate::vocab::Verdict,
+}
+
+pub struct WorkPolicy {
+    pub force_review_on_plan_commits: bool,
+    pub force_review_on_misc_commits: bool,
+    pub ad_hoc_reviewers: Option<Vec<AgentLabel>>,
+}
+
+#[derive(Debug, Clone)]
+pub struct WorkStatus {
+    pub plans: Vec<PlanWorkState>,
+    pub ad_hoc: Vec<AdHocWorkState>,
+}
+
+#[derive(Debug, Clone)]
+pub struct PlanWorkState {
+    pub plan: PlanKey,
+    pub sha: CommitSha,
+    pub gate: crate::vocab::CommitGateState,
+    pub waiting_on: WaitingOn,
+    pub touched_code: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct AdHocWorkState {
+    pub sha: CommitSha,
+    pub gate: crate::vocab::CommitGateState,
+}
+
+fn compute_gate(reviews: &[ReviewEntry]) -> crate::vocab::CommitGateState {
+    use crate::vocab::CommitGateState;
+    let has_approve = reviews
+        .iter()
+        .any(|r| r.verdict == crate::vocab::Verdict::Approve);
+    let has_changes = reviews.iter().any(|r| {
+        r.verdict == crate::vocab::Verdict::RequestChanges
+            || r.verdict == crate::vocab::Verdict::Unmarked
+    });
+    if has_changes {
+        CommitGateState::ChangesRequested
+    } else if has_approve {
+        CommitGateState::Approved
+    } else {
+        CommitGateState::Unreviewed
+    }
+}
+
+impl RepoState {
+    pub fn derive_status(&self, reviews: &impl ReviewLookup, policy: &WorkPolicy) -> WorkStatus {
+        use crate::vocab::{CommitGateState, PlanWorktreeStatus};
+
+        let mut plans = Vec::new();
+        if policy.force_review_on_plan_commits {
+            for (key, ps) in &self.plans {
+                let reviewable = ps.reviewable_shas();
+                if reviewable.is_empty() {
+                    continue;
+                }
+                let latest_sha = reviewable.last().unwrap().clone();
+                let latest_event = ps.commits.iter().rev().find(|e| e.sha == latest_sha);
+                let touched_code = latest_event.map_or(false, |e| e.touched_code);
+
+                let entries = reviews.reviews_for(&latest_sha);
+                let gate = compute_gate(&entries);
+
+                let worktree = reviews.worktree_status(key);
+                let waiting_on = match gate {
+                    CommitGateState::ChangesRequested => {
+                        let requesters = entries
+                            .iter()
+                            .filter(|r| r.verdict == crate::vocab::Verdict::RequestChanges)
+                            .map(|r| r.author.clone())
+                            .collect();
+                        let ambiguous = entries
+                            .iter()
+                            .filter(|r| r.verdict == crate::vocab::Verdict::Unmarked)
+                            .map(|r| r.author.clone())
+                            .collect();
+                        WaitingOn::MasterToRevise {
+                            requesters,
+                            ambiguous,
+                        }
+                    }
+                    CommitGateState::Approved => match worktree {
+                        PlanWorktreeStatus::BodyDirty => WaitingOn::MasterToCommit,
+                        _ => {
+                            if touched_code {
+                                WaitingOn::MasterToFinalize
+                            } else {
+                                WaitingOn::MasterToImplement
+                            }
+                        }
+                    },
+                    CommitGateState::Unreviewed => WaitingOn::FirstReview,
+                };
+
+                plans.push(PlanWorkState {
+                    plan: key.clone(),
+                    sha: latest_sha,
+                    gate,
+                    waiting_on,
+                    touched_code,
+                });
+            }
+        }
+
+        let mut ad_hoc = Vec::new();
+        if policy.force_review_on_misc_commits {
+            for event in &self.ad_hoc {
+                let entries = reviews.reviews_for(&event.sha);
+                let gate = compute_gate(&entries);
+                ad_hoc.push(AdHocWorkState {
+                    sha: event.sha.clone(),
+                    gate,
+                });
+            }
+        }
+
+        WorkStatus { plans, ad_hoc }
+    }
+}
+
+impl WorkStatus {
+    pub fn work_for(&self, author: &AgentLabel, role: Role) -> Vec<WaitItem> {
+        let mut out = Vec::new();
+        for ps in &self.plans {
+            match (role, &ps.waiting_on) {
+                (Role::Master, WaitingOn::MasterToRevise { .. }) => {
+                    out.push(WaitItem::Master {
+                        plan: ps.plan.clone(),
+                        sha: ps.sha.clone(),
+                        next: MasterNext::Revise,
+                        reason: WaitingReason::AddressCommitChanges,
+                        gate: ps.gate,
+                    });
+                }
+                (Role::Master, WaitingOn::MasterToCommit) => {
+                    out.push(WaitItem::Master {
+                        plan: ps.plan.clone(),
+                        sha: ps.sha.clone(),
+                        next: MasterNext::Commit,
+                        reason: WaitingReason::CommitPlanRevision,
+                        gate: ps.gate,
+                    });
+                }
+                (Role::Master, WaitingOn::MasterToImplement) => {
+                    out.push(WaitItem::Master {
+                        plan: ps.plan.clone(),
+                        sha: ps.sha.clone(),
+                        next: MasterNext::Implement,
+                        reason: WaitingReason::ReadyToStartImplementation,
+                        gate: ps.gate,
+                    });
+                }
+                (Role::Master, WaitingOn::MasterToFinalize) => {
+                    out.push(WaitItem::Master {
+                        plan: ps.plan.clone(),
+                        sha: ps.sha.clone(),
+                        next: MasterNext::Finalize,
+                        reason: WaitingReason::ReadyToFinalize,
+                        gate: ps.gate,
+                    });
+                }
+                (Role::Reviewers, WaitingOn::FirstReview) => {
+                    out.push(WaitItem::Reviewer {
+                        plan: ps.plan.clone(),
+                        sha: ps.sha.clone(),
+                        feedback_path: format!(
+                            ".clank/agents/{}/feedback/{}.md",
+                            author.as_str(),
+                            ps.sha.as_str()
+                        ),
+                    });
+                }
+                _ => {}
+            }
+        }
+        for ah in &self.ad_hoc {
+            match (role, ah.gate) {
+                (Role::Reviewers, crate::vocab::CommitGateState::Unreviewed) => {
+                    out.push(WaitItem::AdHocReview {
+                        sha: ah.sha.clone(),
+                        feedback_path: format!(
+                            ".clank/agents/{}/feedback/{}.md",
+                            author.as_str(),
+                            ah.sha.as_str()
+                        ),
+                    });
+                }
+                (Role::Master, crate::vocab::CommitGateState::ChangesRequested) => {
+                    out.push(WaitItem::AdHocRevise {
+                        sha: ah.sha.clone(),
+                    });
+                }
+                _ => {}
+            }
+        }
+        out
+    }
+}
+
+// ── Legacy derive_work (kept for now) ──────────────────
 
 pub fn derive_work(views: &[PlanView], author: &AgentLabel, role: Role) -> Vec<WaitItem> {
     let mut out = Vec::new();

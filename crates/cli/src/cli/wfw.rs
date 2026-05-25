@@ -80,7 +80,9 @@ fn firings_from_items(items: &[WaitItem]) -> Vec<HookFiring> {
                 gate: None,
                 next: None,
             }),
-            WaitItem::Idle { .. } => None,
+            WaitItem::Idle { .. } | WaitItem::AdHocReview { .. } | WaitItem::AdHocRevise { .. } => {
+                None
+            }
         })
         .collect()
 }
@@ -377,6 +379,15 @@ fn render_json(item: &WaitItem) -> serde_json::Value {
             "kind": "idle",
             "prompt": prompt,
         }),
+        WaitItem::AdHocReview { sha, feedback_path } => serde_json::json!({
+            "kind": "adhoc_review",
+            "sha": sha.as_str(),
+            "feedback_path": feedback_path,
+        }),
+        WaitItem::AdHocRevise { sha } => serde_json::json!({
+            "kind": "adhoc_revise",
+            "sha": sha.as_str(),
+        }),
     }
 }
 
@@ -411,6 +422,10 @@ fn render_human(item: &WaitItem) -> String {
             sha = short(finalized_at),
         ),
         WaitItem::Idle { prompt } => format!("idle     {prompt}"),
+        WaitItem::AdHocReview { sha, .. } => {
+            format!("adhoc-review  {}  write feedback", short(sha),)
+        }
+        WaitItem::AdHocRevise { sha } => format!("adhoc-revise  {}  address changes", short(sha),),
     }
 }
 

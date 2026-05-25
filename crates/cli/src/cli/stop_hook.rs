@@ -229,6 +229,19 @@ fn render_wfw_items(items: &[serde_json::Value], label: &AgentLabel, role: Role)
                 let prompt = item.get("prompt").and_then(|v| v.as_str()).unwrap_or("");
                 out.push_str(&format!("  - idle: {prompt}\n"));
             }
+            "adhoc_review" => {
+                let fp = item.get("feedback_path").and_then(|v| v.as_str()).unwrap_or("");
+                out.push_str(&format!(
+                    "  - adhoc review: commit {short} — write feedback via\n    `clank feedback write --commit {full} \\\n        --author {label} --verdict approve|request-changes \\\n        -m \"<summary>\"`\n",
+                    label = label.as_str(),
+                ));
+                let _ = fp;
+            }
+            "adhoc_revise" => {
+                out.push_str(&format!(
+                    "  - adhoc revise: commit {short} ({full}) — address reviewer feedback\n",
+                ));
+            }
             other => out.push_str(&format!("  - {other}: plan `{plan}` at {short} ({full})\n",)),
         }
     }
