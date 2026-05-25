@@ -69,15 +69,15 @@ impl RepoState {
     pub fn derive_status(
         &self,
         reviews: &impl ReviewLookup,
-        policy: &ReviewPolicy,
+        policy: &WorkPolicy,
     ) -> WorkStatus { ... }
 }
 ```
 
-### `ReviewPolicy`
+### `WorkPolicy`
 
-Rename to avoid collision with the existing `ReviewPolicy`
-enum in `repo_state.rs`:
+Named `WorkPolicy` to avoid collision with the existing
+`ReviewPolicy` enum in `repo_state.rs`:
 
 ```rust
 pub struct WorkPolicy {
@@ -167,11 +167,15 @@ flag needed.
   Update existing plan reviewer prompt to remove `--plan`
   from the `clank feedback write` command.
 - `finish.rs`: simplify. `clank finish` verifies approvals
-  exist in flat feedback (gate check), then commits a
-  lightweight marker `.clank/finished/<plan>.finish`. No
-  more copying feedback files into `.clank/finished/<plan>/`.
-  The approval check is a gate, the marker is the record.
-- `preview.rs`: update to use flat feedback for gate checks.
+  exist in flat feedback (gate check), then commits an empty
+  file `.clank/finished/<plan>` (no directory, no extension).
+  `finish_predicate_at` updated to check for a file instead
+  of a directory.
+- `preview.rs`: update gate checks to use flat feedback.
+  Sealed-approval logic simplified (no copied feedback to seal).
+- `git_io.rs`: `finish_predicate_at` updated to check for
+  `.clank/finished/<plan>` file instead of a directory.
+- `purge.rs`: strip paths updated for file instead of directory.
 - `setup_assets/claude_skill.md` + `codex_skill.md`: update
   `clank feedback write` docs to remove `--plan`.
 - Migration: move old plan-scoped files to flat layout.
@@ -186,8 +190,8 @@ flag needed.
 - `ad_hoc_reviewers=["codex"]`: only codex gets ad-hoc work.
 - `clank feedback write --commit <sha>` writes flat path.
 - Plan feedback still works with flat path.
-- `clank finish` checks approvals in flat feedback, commits
-  a `.finish` marker (no feedback file copying).
+- `clank finish` checks approvals, commits empty
+  `.clank/finished/<plan>` file.
 - Stop-hook reviewer prompt uses `--commit` (no `--plan`).
 - Migration moves old files correctly.
 - Ad-hoc items don't fire lifecycle hooks.
