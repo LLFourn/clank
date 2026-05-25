@@ -144,6 +144,7 @@ async fn run_all(repo: &std::path::Path, basename: &str, args: &PurgeArgs) -> an
     Ok(())
 }
 
+#[derive(Debug)]
 pub(crate) struct AmendProgram {
     pub head_sha: String,
     pub strip_paths: Vec<String>,
@@ -167,16 +168,19 @@ pub(crate) fn build_amend_program(
     } else {
         Vec::new()
     };
-    let prefix: String = match plan_key {
-        Some(k) => format!(".clank/finished/{}", k.as_str()),
-        None => ".clank/finished/".to_string(),
-    };
-    let head_is_finalize =
-        !head_lines.is_empty() && head_lines.iter().all(|l| l.starts_with(&prefix));
+    let head_is_finalize = !head_lines.is_empty()
+        && head_lines.iter().all(|l| match plan_key {
+            Some(k) => *l == format!(".clank/finished/{}", k.as_str()),
+            None => l.starts_with(".clank/finished/"),
+        });
     if !head_is_finalize {
+        let desc = match plan_key {
+            Some(k) => format!(".clank/finished/{}", k.as_str()),
+            None => ".clank/finished/".to_string(),
+        };
         anyhow::bail!(
             "--amend requires HEAD to be a finalize commit \
-             (every changed path under `{prefix}`). Run `clank finish` \
+             (every changed path matching `{desc}`). Run `clank finish` \
              without `--amend` to create the finalize commit first, or \
              use `clank purge` without `--amend` to rewrite the chain."
         );
@@ -610,6 +614,29 @@ mod tests {
         assert!(
             msg.contains("HEAD moved"),
             "expected stale-HEAD error; got: {msg}"
+        );
+    }
+
+    #[test]
+    fn build_amend_program_rejects_prefix_colliding_finalize() {
+        let dir = init_test_repo();
+        let repo = dir.path();
+        write_file(repo, ".clank/plans/foo.md", "# foo\n");
+        write_file(repo, ".clank/plans/foobar.md", "# foobar\n");
+        write_file(repo, "src/lib.rs", "// impl\n");
+        git(repo, &["add", "-A"]);
+        git(repo, &["commit", "--quiet", "-m", "[foo,foobar] intro"]);
+        // Finalize foobar (not foo).
+        write_file(repo, ".clank/finished/foobar", "");
+        git(repo, &["add", "-A"]);
+        git(repo, &["commit", "--quiet", "-m", "Finalize foobar"]);
+
+        let foo = PlanKey::parse("foo").unwrap();
+        let err = build_amend_program(repo, Some(&foo)).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("--amend requires HEAD to be a finalize commit"),
+            "should reject foobar finalize when purging foo; got: {msg}"
         );
     }
 }
