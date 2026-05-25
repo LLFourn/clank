@@ -109,18 +109,28 @@ cache anchor through HEAD. The finished plan's timeline is
 recoverable from the fold's history — but currently the fold
 drops finished plans' timelines on finalize.
 
-**Simplest fix**: don't drop finished plan timelines from the
-fold. Keep them in a `finished_timelines: BTreeMap<PlanKey,
-Vec<PlanTimelineEvent>>` on `RepoState`, populated when a plan
-finalizes. This is a small change to `apply_commit`'s finalize
-branch — instead of dropping the `PlanState`, move its `commits`
-vec to `finished_timelines`. Then `clank log` reads finished
-timelines directly from the fold with no re-fold needed.
+**Simplest fix**: store the timeline on `FinishedPlan` directly.
+Add `commits: Vec<PlanTimelineEvent>` to the `FinishedPlan`
+struct. When a plan finalizes, move the `PlanState.commits` vec
+into the new `FinishedPlan` entry instead of dropping it.
+
+Why on `FinishedPlan`, not a side `BTreeMap<PlanKey, ...>`:
+a plan can be re-introduced and re-finalized, producing
+multiple `FinishedPlan` entries with the same `PlanKey`. Each
+entry needs its own timeline. Storing on the struct keeps them
+paired by construction.
+
+Hard-forget (plan deletion at `repo_state.rs:475`) already
+removes all `finished_plans` entries for the deleted plan. Since
+the timeline lives on `FinishedPlan`, it's automatically cleared
+by the existing delete logic — no additional cleanup needed.
+
+`clank log` reads `finished_plan.commits` directly. No re-fold,
+no reconstruction helper.
 
 This also simplifies preview (which currently re-folds
-specifically to recover the dropped timeline).
-
-Extract nothing — the data is just kept in the fold.
+specifically to recover the dropped timeline — it can read
+`FinishedPlan.commits` instead).
 
 ### Implementation
 
