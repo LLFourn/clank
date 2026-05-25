@@ -217,9 +217,9 @@ pub struct FeedbackArgs {
 
 #[derive(clap::Subcommand, Debug)]
 pub enum FeedbackCmd {
-    /// Write a feedback file: validates the body's first
-    /// non-blank line matches `--verdict`, resolves `--commit`
-    /// against the plan's reviewable shas, and writes
+    /// Write a feedback file: prepends the `--verdict` to the
+    /// `-m` message, resolves `--commit` against the plan's
+    /// reviewable shas, and writes
     /// `.clank/agents/<author>/feedback/<plan>/<stem>.md`
     /// atomically.
     Write(FeedbackWriteArgs),
