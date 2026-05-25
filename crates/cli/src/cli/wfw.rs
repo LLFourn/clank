@@ -25,15 +25,12 @@ use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 
 use super::{WfwArgs, repo_basename, resolve_repo};
 use crate::cli::plan_resolve::parse_arg;
-use crate::feedback_scan::scan_feedback;
 use crate::hook_config::{self, HookFiring};
 use crate::lifecycle::{AgentLabel, CommitSha, PlanKey};
 use crate::repo_state::RepoState;
-use crate::worktree_facts::read_worktree_facts;
 use clank_core::Role;
-use clank_core::plan_view::{PlanView, project};
 use clank_core::vocab::HookEvent;
-use clank_core::wait::{StartupSnapshot, WaitItem, derive_work, detect_finished};
+use clank_core::wait::{StartupSnapshot, WaitItem, detect_finished};
 
 /// Exit code returned when `--timeout` elapses without producing
 /// any work. The rest of the CLI uses anyhow for normal errors;
@@ -176,7 +173,15 @@ pub async fn run(args: WfwArgs) -> anyhow::Result<()> {
         let reviews =
             crate::fs_review_lookup::FsReviewLookup::new(&repo, initial_state.head.as_ref());
         let status = initial_state.fold.derive_status(&reviews, &work_policy);
-        let mut items = status.work_for(&author, role);
+        let mut items = status.work_for(&author, role, &work_policy);
+        if let Some(ref pf) = plan_filter {
+            items.retain(|item| match item {
+                WaitItem::Master { plan, .. }
+                | WaitItem::Reviewer { plan, .. }
+                | WaitItem::Finished { plan, .. } => plan == pf,
+                _ => false,
+            });
+        }
         items.extend(detect_finished(&snapshot, &initial_state.fold));
         if !items.is_empty() {
             for firing in &firings_from_items(&items) {
@@ -250,7 +255,15 @@ pub async fn run(args: WfwArgs) -> anyhow::Result<()> {
                 .map_err(|e| anyhow::anyhow!("failed to fold repo `{}`: {e}", repo.display()))?;
             let reviews = crate::fs_review_lookup::FsReviewLookup::new(&repo, state.head.as_ref());
             let status = state.fold.derive_status(&reviews, &work_policy);
-            let mut items = status.work_for(&author, role);
+            let mut items = status.work_for(&author, role, &work_policy);
+            if let Some(ref pf) = plan_filter {
+                items.retain(|item| match item {
+                    WaitItem::Master { plan, .. }
+                    | WaitItem::Reviewer { plan, .. }
+                    | WaitItem::Finished { plan, .. } => plan == pf,
+                    _ => false,
+                });
+            }
             items.extend(detect_finished(&snapshot, &state.fold));
             if !items.is_empty() {
                 for firing in &firings_from_items(&items) {
@@ -275,22 +288,6 @@ fn active_summary(state: &RepoState, basename: &str) -> String {
     } else {
         names.join(", ")
     }
-}
-
-async fn build_view(
-    repo: &Path,
-    state: &RepoState,
-    plan: &PlanKey,
-) -> anyhow::Result<Option<PlanView>> {
-    let ps = match state.fold.plans.get(plan) {
-        Some(ps) => ps,
-        None => return Ok(None),
-    };
-    let reviewable = ps.reviewable_shas();
-    let feedback = scan_feedback(repo, plan, &reviewable)?;
-    let plan_path = format!(".clank/plans/{}.md", plan.as_str());
-    let worktree = read_worktree_facts(repo, &plan_path, state.head.as_ref()).await?;
-    Ok(project(&state.fold, plan, &feedback, &worktree))
 }
 
 fn emit(items: &[WaitItem], json: bool) {

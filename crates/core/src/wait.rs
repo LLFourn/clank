@@ -175,7 +175,7 @@ impl RepoState {
         use crate::vocab::{CommitGateState, PlanWorktreeStatus};
 
         let mut plans = Vec::new();
-        if policy.force_review_on_plan_commits {
+        {
             for (key, ps) in &self.plans {
                 let reviewable = ps.reviewable_shas();
                 if reviewable.is_empty() {
@@ -186,7 +186,20 @@ impl RepoState {
                 let touched_code = latest_event.map_or(false, |e| e.touched_code);
 
                 let entries = reviews.reviews_for(&latest_sha);
-                let gate = compute_gate(&entries);
+                let gate = if policy.force_review_on_plan_commits {
+                    compute_gate(&entries)
+                } else {
+                    // When plan review is disabled, treat as approved
+                    // so master isn't blocked.
+                    if entries
+                        .iter()
+                        .any(|r| r.verdict == crate::vocab::Verdict::RequestChanges)
+                    {
+                        CommitGateState::ChangesRequested
+                    } else {
+                        CommitGateState::Approved
+                    }
+                };
 
                 let worktree = reviews.worktree_status(key);
                 let waiting_on = match gate {
@@ -230,7 +243,7 @@ impl RepoState {
         }
 
         let mut ad_hoc = Vec::new();
-        if policy.force_review_on_misc_commits {
+        if policy.force_review_on_misc_commits && !self.ad_hoc.is_empty() {
             for event in &self.ad_hoc {
                 let entries = reviews.reviews_for(&event.sha);
                 let gate = compute_gate(&entries);
@@ -246,7 +259,7 @@ impl RepoState {
 }
 
 impl WorkStatus {
-    pub fn work_for(&self, author: &AgentLabel, role: Role) -> Vec<WaitItem> {
+    pub fn work_for(&self, author: &AgentLabel, role: Role, policy: &WorkPolicy) -> Vec<WaitItem> {
         let mut out = Vec::new();
         for ps in &self.plans {
             match (role, &ps.waiting_on) {
@@ -302,7 +315,12 @@ impl WorkStatus {
         }
         for ah in &self.ad_hoc {
             match (role, ah.gate) {
-                (Role::Reviewers, crate::vocab::CommitGateState::Unreviewed) => {
+                (Role::Reviewers, crate::vocab::CommitGateState::Unreviewed)
+                    if policy
+                        .ad_hoc_reviewers
+                        .as_ref()
+                        .is_none_or(|list| list.contains(author)) =>
+                {
                     out.push(WaitItem::AdHocReview {
                         sha: ah.sha.clone(),
                         feedback_path: format!(
