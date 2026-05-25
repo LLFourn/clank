@@ -671,7 +671,7 @@ fn parse_diff_tree(stdout: &str) -> Result<CommitChanges, GitIoError> {
                     new_path: new_path_for_touch,
                 });
             }
-        } else if is_finished_path(&new_rel) && !is_pure_delete {
+        } else if is_finished_path(&new_rel) && (status_char == 'A' || is_rename) {
             if let Some(key) = plan_key_from_finished_path(&new_rel) {
                 plans_finished_added.insert(key);
             }
