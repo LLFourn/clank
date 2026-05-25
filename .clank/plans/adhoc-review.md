@@ -185,6 +185,14 @@ flag needed.
   the new finish candidate discovery.
 - `preview.rs`: rewrite path predicates updated for file shape.
 - `purge.rs`: strip paths updated for file instead of directory.
+- `status.rs`: update `PlanView` building to use flat feedback
+  (scan `feedback/<sha>.md` instead of `feedback/<plan>/<sha>.md`).
+- `log.rs`: update `collect_reviews` to scan flat feedback path.
+- `fs_watcher.rs`: `path_to_signal` updated to parse flat
+  feedback path (no plan segment). `FeedbackWritten` signal
+  triggers a full refold rather than plan-scoped wake.
+- `runtime.rs`: remove plan-based feedback routing — just
+  refold on any feedback write.
 - `setup_assets/claude_skill.md` + `codex_skill.md`: update
   `clank feedback write` docs to remove `--plan`.
 - Migration: move old plan-scoped files to flat layout.
