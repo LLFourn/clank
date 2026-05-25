@@ -44,6 +44,5 @@ commit abc1234
 - Add `Read` variant to `FeedbackCmd` in `cli/mod.rs`.
 - `FeedbackReadArgs`: `--commit` (optional, default HEAD),
   `--repo`, `--json`.
-- `cli/feedback.rs`: resolve commit ref, scan feedback via
-  `FsReviewLookup::reviews_for` or direct filesystem walk,
-  read bodies, render.
+- `cli/feedback.rs`: resolve commit, walk
+  `agents/*/feedback/<sha>.md`, read bodies, render.
