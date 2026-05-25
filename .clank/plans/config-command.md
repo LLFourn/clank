@@ -53,6 +53,11 @@ Prints the new effective value after write.
 Does NOT commit — the operator decides when to commit
 config changes (they might set several keys).
 
+### `clank config <key>`
+
+With just a key and no action, prints the key's help:
+name, type, default, current value, source, and description.
+
 ### `clank config --json`
 
 Dumps the full effective config as JSON.
@@ -73,12 +78,17 @@ Move hooks from `~/.clank/hooks.json` and
 }
 ```
 
-The loader reads `config.json` first. If `hooks.json` exists
-and `config.json` has no `hooks` section, the loader falls
-back to `hooks.json` and emits a deprecation warning via
-`tracing::warn`. Once the user runs
-`clank config hooks.<key> set <value>`, the value lands in
-`config.json` and the `hooks.json` fallback is superseded.
+The loader merges per-key: for each hook event, `config.json`
+wins if present, otherwise `hooks.json` provides the value.
+This is the same layered merge used for review keys — repo
+overrides user, and within each layer `config.json` overrides
+`hooks.json` per-key.
+
+On first write via `clank config hooks.<key> set`, the
+command imports all existing `hooks.json` values into
+`config.json` before applying the requested change. This
+ensures no hooks are silently lost. A deprecation warning
+is emitted when `hooks.json` values are used.
 
 Key names use underscores (`master_work`) in config.json.
 Serde aliases accept the kebab-case form (`master-work`)
@@ -112,3 +122,7 @@ Old JSON keys accepted via `#[serde(alias)]`.
 - Unknown key errors cleanly.
 - Invalid value type errors cleanly.
 - Hooks loaded from config.json work in wfw lifecycle.
+- `clank config review.adhoc_feedback` prints key help.
+- Legacy hooks.json values merge per-key with config.json.
+- First `set` on a hook key imports existing hooks.json
+  values into config.json.
