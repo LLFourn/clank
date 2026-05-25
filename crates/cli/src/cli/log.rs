@@ -220,7 +220,7 @@ fn resolve_plan_filter(
         .arg(repo)
         .args(["ls-tree", "--name-only", "HEAD", ".clank/plans/"])
         .output();
-    let plans: Vec<PlanKey> = match output {
+    let all_plans: Vec<PlanKey> = match output {
         Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout)
             .lines()
             .filter_map(|l| {
@@ -230,9 +230,51 @@ fn resolve_plan_filter(
             .collect(),
         _ => Vec::new(),
     };
-    match plans.as_slice() {
+    let active: Vec<PlanKey> = all_plans
+        .into_iter()
+        .filter(|k| !is_finished_in_tree(repo, k))
+        .collect();
+    match active.as_slice() {
         [one] => Ok(Some(vec![one.clone()])),
+        [] => {
+            // No active plans — show the most recent finished plan
+            // (last entry in .clank/finished/ by name; imprecise but
+            // good enough for default selection).
+            let output = std::process::Command::new("git")
+                .arg("-C")
+                .arg(repo)
+                .args(["ls-tree", "--name-only", "-d", "HEAD", ".clank/finished/"])
+                .output();
+            if let Ok(o) = output {
+                if o.status.success() {
+                    let last = String::from_utf8_lossy(&o.stdout)
+                        .lines()
+                        .filter_map(|l| {
+                            let stem = l.strip_prefix(".clank/finished/")?;
+                            PlanKey::parse(stem).ok()
+                        })
+                        .last();
+                    if let Some(k) = last {
+                        return Ok(Some(vec![k]));
+                    }
+                }
+            }
+            Ok(None)
+        }
         _ => Ok(None),
+    }
+}
+
+fn is_finished_in_tree(repo: &Path, key: &PlanKey) -> bool {
+    let path = format!(".clank/finished/{}/", key.as_str());
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["ls-tree", "HEAD", &path])
+        .output();
+    match output {
+        Ok(o) => o.status.success() && !o.stdout.is_empty(),
+        Err(_) => false,
     }
 }
 
