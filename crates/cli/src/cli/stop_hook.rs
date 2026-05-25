@@ -212,7 +212,7 @@ fn render_wfw_items(items: &[serde_json::Value], label: &AgentLabel, role: Role)
         let short = short_sha(full);
         match kind {
             "reviewer" => out.push_str(&format!(
-                "  - reviewer: plan `{plan}` at {short} — write feedback via\n    `clank feedback write --plan {plan} --commit {full} \\\n        --author {label} --verdict approve|request-changes` (body on stdin)\n",
+                "  - reviewer: plan `{plan}` at {short} — write feedback via\n    `clank feedback write --plan {plan} --commit {full} \\\n        --author {label} --verdict approve|request-changes \\\n        -m \"<summary>\"` \n",
                 label = label.as_str(),
             )),
             "master" => {
