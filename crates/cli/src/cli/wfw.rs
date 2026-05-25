@@ -162,9 +162,8 @@ pub async fn run(args: WfwArgs) -> anyhow::Result<()> {
     let hook_config = hook_config::load_hook_config(&repo);
     let review_config = crate::cli::config::load(&repo);
     let work_policy = clank_core::wait::WorkPolicy {
-        force_review_on_plan_commits: review_config.review.force_review_on_plan_commits,
-        force_review_on_misc_commits: review_config.review.force_review_on_misc_commits,
-        ad_hoc_reviewers: review_config.review.ad_hoc_reviewers.clone(),
+        plan_feedback: review_config.review.plan_feedback,
+        adhoc_feedback: review_config.review.adhoc_feedback,
     };
 
     let snapshot = StartupSnapshot::capture(&initial_state.fold, plan_filter.as_ref());
@@ -173,7 +172,7 @@ pub async fn run(args: WfwArgs) -> anyhow::Result<()> {
         let reviews =
             crate::fs_review_lookup::FsReviewLookup::new(&repo, initial_state.head.as_ref());
         let status = initial_state.fold.derive_status(&reviews, &work_policy);
-        let mut items = status.work_for(&author, role, &work_policy);
+        let mut items = status.work_for(&author, role);
         if let Some(ref pf) = plan_filter {
             items.retain(|item| match item {
                 WaitItem::Master { plan, .. }
@@ -255,7 +254,7 @@ pub async fn run(args: WfwArgs) -> anyhow::Result<()> {
                 .map_err(|e| anyhow::anyhow!("failed to fold repo `{}`: {e}", repo.display()))?;
             let reviews = crate::fs_review_lookup::FsReviewLookup::new(&repo, state.head.as_ref());
             let status = state.fold.derive_status(&reviews, &work_policy);
-            let mut items = status.work_for(&author, role, &work_policy);
+            let mut items = status.work_for(&author, role);
             if let Some(ref pf) = plan_filter {
                 items.retain(|item| match item {
                     WaitItem::Master { plan, .. }

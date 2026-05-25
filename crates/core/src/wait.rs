@@ -127,9 +127,8 @@ pub struct ReviewEntry {
 }
 
 pub struct WorkPolicy {
-    pub force_review_on_plan_commits: bool,
-    pub force_review_on_misc_commits: bool,
-    pub ad_hoc_reviewers: Option<Vec<AgentLabel>>,
+    pub plan_feedback: bool,
+    pub adhoc_feedback: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -187,7 +186,7 @@ impl RepoState {
                 let touched_code = latest_event.map_or(false, |e| e.touched_code);
 
                 let entries = reviews.reviews_for(&latest_sha);
-                let gate = if policy.force_review_on_plan_commits {
+                let gate = if policy.plan_feedback {
                     compute_gate(&entries)
                 } else {
                     // When plan review is disabled, treat as approved
@@ -244,7 +243,7 @@ impl RepoState {
         }
 
         let mut ad_hoc = Vec::new();
-        if policy.force_review_on_misc_commits {
+        if policy.adhoc_feedback {
             if let Some(event) = self.ad_hoc.last() {
                 let entries = reviews.reviews_for(&event.sha);
                 let gate = compute_gate(&entries);
@@ -260,7 +259,7 @@ impl RepoState {
 }
 
 impl WorkStatus {
-    pub fn work_for(&self, author: &AgentLabel, role: Role, policy: &WorkPolicy) -> Vec<WaitItem> {
+    pub fn work_for(&self, author: &AgentLabel, role: Role) -> Vec<WaitItem> {
         let mut out = Vec::new();
         for ps in &self.plans {
             match (role, &ps.waiting_on) {
@@ -316,12 +315,7 @@ impl WorkStatus {
         }
         for ah in &self.ad_hoc {
             match (role, ah.gate) {
-                (Role::Reviewers, crate::vocab::CommitGateState::Unreviewed)
-                    if policy
-                        .ad_hoc_reviewers
-                        .as_ref()
-                        .is_none_or(|list| list.contains(author)) =>
-                {
+                (Role::Reviewers, crate::vocab::CommitGateState::Unreviewed) => {
                     out.push(WaitItem::AdHocReview {
                         sha: ah.sha.clone(),
                         feedback_path: format!(
@@ -734,9 +728,8 @@ mod tests {
 
     fn adhoc_policy() -> WorkPolicy {
         WorkPolicy {
-            force_review_on_plan_commits: true,
-            force_review_on_misc_commits: true,
-            ad_hoc_reviewers: None,
+            plan_feedback: true,
+            adhoc_feedback: true,
         }
     }
 
@@ -795,7 +788,7 @@ mod tests {
             ),
         ]);
         let status = state.derive_status(&reviews, &adhoc_policy());
-        let work = status.work_for(&label("master"), Role::Master, &adhoc_policy());
+        let work = status.work_for(&label("master"), Role::Master);
         assert!(
             work.is_empty(),
             "approve on latest should produce no master work; got {work:?}"

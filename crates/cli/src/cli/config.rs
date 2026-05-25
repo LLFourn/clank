@@ -23,8 +23,6 @@
 use serde::Deserialize;
 use std::path::Path;
 
-use crate::lifecycle::AgentLabel;
-
 /// Top-level Clank config. Always non-`Option` here even though
 /// the on-disk schema permits omissions; the loader fills in
 /// defaults so consumers don't need to thread Option chains.
@@ -43,28 +41,16 @@ impl Default for Config {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReviewConfig {
-    /// Block master on ad hoc (no-plan) commit review. Default `true`
-    /// (review every commit by default).
-    pub force_review_on_misc_commits: bool,
-    /// Block master on plan-attributed commit review. Default `true`
-    /// — today's implicit behavior.
-    pub force_review_on_plan_commits: bool,
-    /// Explicit reviewer list for ad hoc commits. `None` → derive
-    /// from the repo's feedback authors at projection time.
-    pub ad_hoc_reviewers: Option<Vec<AgentLabel>>,
-    /// Strict mode: when `true`, commits without a valid
-    /// `[plan]` / `[plan-one,plan-two]` / `[misc]` title prefix
-    /// surface as `FixCommitTitle` master work instead of being
-    /// classified. Phase 5 of `commit-first-review-model`.
+    pub adhoc_feedback: bool,
+    pub plan_feedback: bool,
     pub require_commit_prefix: bool,
 }
 
 impl Default for ReviewConfig {
     fn default() -> Self {
         Self {
-            force_review_on_misc_commits: true,
-            force_review_on_plan_commits: true,
-            ad_hoc_reviewers: None,
+            adhoc_feedback: true,
+            plan_feedback: true,
             require_commit_prefix: false,
         }
     }
@@ -79,12 +65,10 @@ struct ConfigFile {
 
 #[derive(Debug, Default, Deserialize)]
 struct ReviewFile {
-    #[serde(default)]
-    force_review_on_misc_commits: Option<bool>,
-    #[serde(default)]
-    force_review_on_plan_commits: Option<bool>,
-    #[serde(default)]
-    ad_hoc_reviewers: Option<Vec<String>>,
+    #[serde(default, alias = "force_review_on_misc_commits")]
+    adhoc_feedback: Option<bool>,
+    #[serde(default, alias = "force_review_on_plan_commits")]
+    plan_feedback: Option<bool>,
     #[serde(default)]
     require_commit_prefix: Option<bool>,
 }
@@ -122,18 +106,11 @@ fn apply_layer(cfg: &mut Config, path: Option<&Path>) {
         }
     };
     if let Some(review) = parsed.review {
-        if let Some(v) = review.force_review_on_misc_commits {
-            cfg.review.force_review_on_misc_commits = v;
+        if let Some(v) = review.adhoc_feedback {
+            cfg.review.adhoc_feedback = v;
         }
-        if let Some(v) = review.force_review_on_plan_commits {
-            cfg.review.force_review_on_plan_commits = v;
-        }
-        if let Some(list) = review.ad_hoc_reviewers {
-            let parsed: Vec<AgentLabel> = list
-                .into_iter()
-                .filter_map(|s| AgentLabel::parse(&s).ok())
-                .collect();
-            cfg.review.ad_hoc_reviewers = Some(parsed);
+        if let Some(v) = review.plan_feedback {
+            cfg.review.plan_feedback = v;
         }
         if let Some(v) = review.require_commit_prefix {
             cfg.review.require_commit_prefix = v;
@@ -156,9 +133,8 @@ mod tests {
     fn defaults_when_no_files() {
         let tmp = tempfile::tempdir().unwrap();
         let cfg = load(tmp.path());
-        assert!(cfg.review.force_review_on_misc_commits);
-        assert!(cfg.review.force_review_on_plan_commits);
-        assert!(cfg.review.ad_hoc_reviewers.is_none());
+        assert!(cfg.review.adhoc_feedback);
+        assert!(cfg.review.plan_feedback);
         assert!(!cfg.review.require_commit_prefix);
     }
 
@@ -168,12 +144,23 @@ mod tests {
         let repo_cfg = tmp.path().join(".clank/config.json");
         write(
             &repo_cfg,
+            r#"{"review": {"adhoc_feedback": false}}"#,
+        );
+        let cfg = load(tmp.path());
+        assert!(!cfg.review.adhoc_feedback);
+        assert!(cfg.review.plan_feedback);
+    }
+
+    #[test]
+    fn legacy_key_name_accepted() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo_cfg = tmp.path().join(".clank/config.json");
+        write(
+            &repo_cfg,
             r#"{"review": {"force_review_on_misc_commits": false}}"#,
         );
         let cfg = load(tmp.path());
-        assert!(!cfg.review.force_review_on_misc_commits);
-        // Other fields untouched.
-        assert!(cfg.review.force_review_on_plan_commits);
+        assert!(!cfg.review.adhoc_feedback);
     }
 
     #[test]
@@ -182,21 +169,6 @@ mod tests {
         let repo_cfg = tmp.path().join(".clank/config.json");
         write(&repo_cfg, "not valid json");
         let cfg = load(tmp.path());
-        assert!(cfg.review.force_review_on_misc_commits);
-    }
-
-    #[test]
-    fn ad_hoc_reviewers_list_parses() {
-        let tmp = tempfile::tempdir().unwrap();
-        let repo_cfg = tmp.path().join(".clank/config.json");
-        write(
-            &repo_cfg,
-            r#"{"review": {"ad_hoc_reviewers": ["alice", "bob"]}}"#,
-        );
-        let cfg = load(tmp.path());
-        let list = cfg.review.ad_hoc_reviewers.expect("list set");
-        assert_eq!(list.len(), 2);
-        assert_eq!(list[0].as_str(), "alice");
-        assert_eq!(list[1].as_str(), "bob");
+        assert!(cfg.review.adhoc_feedback);
     }
 }

@@ -40,12 +40,23 @@ config changes (they might set several keys).
 
 Dumps the full effective config as JSON.
 
+## Rename
+
+Rename `force_review_on_misc_commits` → `adhoc_feedback`
+everywhere (Rust field, JSON key). The on-disk deserializer
+accepts both names for backward compat via `#[serde(alias)]`.
+
+Also rename `force_review_on_plan_commits` → `plan_feedback`
+for consistency.
+
 ## Implementation
 
-- `cli/config.rs`: add `pub async fn run(args: ConfigArgs)`,
-  `ConfigArgs` with subcommands `Get`/`Set` + bare dump.
-- `cli/mod.rs`: `ConfigArgs`, `ConfigCmd` enum.
+- `cli/config.rs`: rename fields, add `pub async fn run`,
+  `ConfigArgs` with key + action parsing, bare dump.
+- `cli/mod.rs`: `ConfigArgs`.
 - `main.rs`: wire `Config` variant.
+- `core/wait.rs`: rename `WorkPolicy` fields.
+- `cli/wfw.rs`: update field mapping.
 - Config write: read existing repo config.json, deep-merge
   the new key, write back. Use `serde_json::Value` for the
   merge so we don't clobber unknown keys.

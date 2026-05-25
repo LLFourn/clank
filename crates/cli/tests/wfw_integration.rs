@@ -79,7 +79,7 @@ impl TestEnv {
         std::fs::create_dir_all(cfg_path.parent().unwrap()).unwrap();
         std::fs::write(
             &cfg_path,
-            r#"{"review":{"force_review_on_misc_commits":false}}"#,
+            r#"{"review":{"adhoc_feedback":false}}"#,
         )
         .unwrap();
         Self {
@@ -118,7 +118,7 @@ fn disable_adhoc_review(repo: &Path) {
     write(
         repo,
         ".clank/config.json",
-        r#"{"review":{"force_review_on_misc_commits":false}}"#,
+        r#"{"review":{"adhoc_feedback":false}}"#,
     );
 }
 
