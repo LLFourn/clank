@@ -22,7 +22,6 @@ use super::{FeedbackCmd, FeedbackWriteArgs, repo_basename, resolve_repo};
 use crate::cli::plan_resolve::parse_arg;
 use crate::disk_format::{FeedbackTarget, feedback_path_wire};
 use crate::lifecycle::{AgentLabel, CommitRef, CommitSha, PlanKey};
-use clank_core::feedback_body::FeedbackBody;
 use clank_core::ids::CommitRefResolveError;
 
 pub async fn run(args: super::FeedbackArgs) -> anyhow::Result<()> {
@@ -43,13 +42,18 @@ async fn run_write(args: FeedbackWriteArgs) -> anyhow::Result<()> {
     let author = AgentLabel::parse(&args.author)
         .map_err(|e| anyhow::anyhow!("invalid --author `{}`: {e}", args.author))?;
     let expected_verdict: clank_core::Verdict = args.verdict.into();
+    let verdict_header = match expected_verdict {
+        clank_core::Verdict::Approve => "APPROVE",
+        clank_core::Verdict::RequestChanges => "REQUEST_CHANGES",
+        clank_core::Verdict::Unmarked => {
+            anyhow::bail!("verdict `unmarked` cannot be written");
+        }
+    };
 
-    let body = read_body(&args.body_file)
+    let raw_body = read_body(&args.body_file)
         .with_context(|| format!("reading body from `{}`", args.body_file))?;
 
-    FeedbackBody::parse(&body)
-        .validate_matches(expected_verdict)
-        .map_err(|e| anyhow::anyhow!("body validation failed: {e}"))?;
+    let body = format!("{verdict_header} {raw_body}");
 
     // Write paths can't tolerate a stale fold: if a commit landed
     // since the last cache entry, the reviewable set won't contain

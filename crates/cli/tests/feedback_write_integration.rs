@@ -108,7 +108,7 @@ fn writes_approve_feedback_to_canonical_path() {
             "--author",
             "alice",
         ],
-        "APPROVE\n\nlgtm\n",
+        "lgtm\n",
     );
 
     assert!(status.success(), "exit={status:?} stderr={stderr}");
@@ -119,16 +119,16 @@ fn writes_approve_feedback_to_canonical_path() {
     );
     let abs = repo.join(&expected_rel);
     let written = std::fs::read_to_string(&abs).expect("file exists");
-    assert_eq!(written, "APPROVE\n\nlgtm\n");
+    assert_eq!(written, "APPROVE lgtm\n");
 }
 
 #[test]
-fn rejects_mismatched_verdict() {
+fn prepends_request_changes_verdict() {
     let (dir, sha) = one_plan_repo();
     let repo = dir.path();
     let short = &sha[..7];
 
-    let (status, _stdout, stderr) = run_feedback_write(
+    let (status, _stdout, _stderr) = run_feedback_write(
         repo,
         &[
             "--plan",
@@ -136,22 +136,19 @@ fn rejects_mismatched_verdict() {
             "--commit",
             short,
             "--verdict",
-            "approve",
+            "request-changes",
             "--author",
             "alice",
         ],
-        "REQUEST_CHANGES\n\nplease fix\n",
+        "overwrought API in foo.rs\n\n- [P1] details\n",
     );
 
-    assert!(!status.success(), "expected failure, got {status:?}");
-    assert!(
-        stderr.contains("body validation failed"),
-        "stderr missing validation msg: {stderr}",
-    );
+    assert!(status.success());
     let abs = repo.join(format!(".clank/agents/alice/feedback/foo/{short}.md"));
+    let written = std::fs::read_to_string(&abs).expect("file exists");
     assert!(
-        !abs.exists(),
-        "no file should be written on validation failure",
+        written.starts_with("REQUEST_CHANGES overwrought API in foo.rs"),
+        "verdict should be prepended: {written}",
     );
 }
 
@@ -172,7 +169,7 @@ fn errors_on_unknown_commit_ref() {
             "--author",
             "alice",
         ],
-        "APPROVE\n",
+        "lgtm\n",
     );
 
     assert!(!status.success());
@@ -199,7 +196,7 @@ fn errors_on_inactive_plan() {
             "--author",
             "alice",
         ],
-        "APPROVE\n",
+        "lgtm\n",
     );
 
     assert!(!status.success());
