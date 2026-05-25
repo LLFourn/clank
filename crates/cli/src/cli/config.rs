@@ -462,6 +462,10 @@ pub async fn run(args: ConfigArgs) -> anyhow::Result<()> {
             println!("help:    {}", def.help);
         }
         (Some(key), Some(action)) if action == "get" => {
+            KEY_CATALOG
+                .iter()
+                .find(|d| format!("{}.{}", d.section, d.name) == *key)
+                .ok_or_else(|| anyhow::anyhow!("unknown config key: {key}"))?;
             let cfg = load(&repo);
             println!("{}", get_value(&cfg, key));
         }
@@ -483,7 +487,7 @@ pub async fn run(args: ConfigArgs) -> anyhow::Result<()> {
                 _ => {}
             }
             let (section, field) = key_to_json_path(key).expect("key in catalog implies valid path");
-            set_repo_key(&repo, section, field, value)?;
+            set_repo_key(&repo, section, field, value, def.type_desc)?;
             let kvs = resolve_key_values(&repo);
             if let Some(kv) = kvs.iter().find(|kv| kv.key == *key) {
                 println!("{} = {} ({})", kv.key, kv.value, kv.source);
@@ -497,7 +501,13 @@ pub async fn run(args: ConfigArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn set_repo_key(repo: &Path, section: &str, field: &str, value: &str) -> anyhow::Result<()> {
+fn set_repo_key(
+    repo: &Path,
+    section: &str,
+    field: &str,
+    value: &str,
+    type_desc: &str,
+) -> anyhow::Result<()> {
     let config_path = repo.join(".clank/config.json");
     let mut root: serde_json::Value = if config_path.exists() {
         let body = std::fs::read_to_string(&config_path)?;
@@ -518,15 +528,19 @@ fn set_repo_key(repo: &Path, section: &str, field: &str, value: &str) -> anyhow:
         .as_object_mut()
         .ok_or_else(|| anyhow::anyhow!("config section `{section}` is not an object"))?;
 
-    // Parse the value: try bool, then null, then keep as string.
-    let json_val = if value == "null" {
-        serde_json::Value::Null
-    } else if value == "true" {
-        serde_json::Value::Bool(true)
-    } else if value == "false" {
-        serde_json::Value::Bool(false)
-    } else {
-        serde_json::Value::String(value.to_string())
+    let json_val = match type_desc {
+        "bool" => match value {
+            "true" => serde_json::Value::Bool(true),
+            "false" => serde_json::Value::Bool(false),
+            _ => anyhow::bail!("bool key requires true or false"),
+        },
+        _ => {
+            if value == "null" {
+                serde_json::Value::Null
+            } else {
+                serde_json::Value::String(value.to_string())
+            }
+        }
     };
 
     sec_obj.insert(field.to_string(), json_val);
@@ -691,7 +705,7 @@ mod tests {
     fn set_repo_key_creates_file() {
         let tmp = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(tmp.path().join(".clank")).unwrap();
-        set_repo_key(tmp.path(), "review", "adhoc_feedback", "false").unwrap();
+        set_repo_key(tmp.path(), "review", "adhoc_feedback", "false", "bool").unwrap();
         let cfg = load_isolated(tmp.path());
         assert!(!cfg.review.adhoc_feedback);
     }
@@ -704,7 +718,7 @@ mod tests {
             &tmp.path().join(".clank/hooks.json"),
             r#"{"reviewer-work": "old-cmd"}"#,
         );
-        set_repo_key(tmp.path(), "hooks", "idle", "new-idle").unwrap();
+        set_repo_key(tmp.path(), "hooks", "idle", "new-idle", "string|null").unwrap();
         let body =
             std::fs::read_to_string(tmp.path().join(".clank/config.json")).unwrap();
         let v: serde_json::Value = serde_json::from_str(&body).unwrap();
@@ -740,7 +754,7 @@ mod tests {
     fn set_prints_new_effective_value() {
         let tmp = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(tmp.path().join(".clank")).unwrap();
-        set_repo_key(tmp.path(), "review", "adhoc_feedback", "false").unwrap();
+        set_repo_key(tmp.path(), "review", "adhoc_feedback", "false", "bool").unwrap();
         let kvs = resolve_key_values_with_home(tmp.path(), None);
         let kv = kvs.iter().find(|kv| kv.key == "review.adhoc_feedback").unwrap();
         assert_eq!(kv.value, "false");
@@ -758,6 +772,43 @@ mod tests {
         let kv = kvs.iter().find(|kv| kv.key == "review.adhoc_feedback").unwrap();
         assert_eq!(kv.value, "false");
         assert_eq!(kv.source, ValueSource::Repo);
+    }
+
+    #[test]
+    fn hook_set_true_writes_string_not_bool() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join(".clank")).unwrap();
+        set_repo_key(tmp.path(), "hooks", "master_work", "true", "string|null").unwrap();
+        let body = std::fs::read_to_string(tmp.path().join(".clank/config.json")).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["hooks"]["master_work"], serde_json::Value::String("true".into()));
+    }
+
+    #[test]
+    fn hook_set_null_writes_json_null() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join(".clank")).unwrap();
+        set_repo_key(tmp.path(), "hooks", "idle", "null", "string|null").unwrap();
+        let body = std::fs::read_to_string(tmp.path().join(".clank/config.json")).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert!(v["hooks"]["idle"].is_null());
+    }
+
+    #[test]
+    fn unknown_key_get_errors() {
+        let tmp = tempfile::tempdir().unwrap();
+        let args = super::super::ConfigArgs {
+            key: Some("nope.nope".to_string()),
+            action: Some("get".to_string()),
+            value: None,
+            repo: Some(tmp.path().to_path_buf()),
+            json: false,
+        };
+        let result = tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(run(args));
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("unknown"));
     }
 
     #[test]
