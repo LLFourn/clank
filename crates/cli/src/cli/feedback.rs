@@ -173,7 +173,7 @@ async fn run_read(args: FeedbackReadArgs) -> anyhow::Result<()> {
             .map(|e| {
                 serde_json::json!({
                     "author": e.author,
-                    "verdict": format!("{}", e.verdict),
+                    "verdict": e.verdict.as_str(),
                     "summary": e.summary,
                     "details": e.details,
                     "source_path": e.source_path,
