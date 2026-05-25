@@ -8,8 +8,8 @@ Fix `clank log` to be fast and look good. Three changes:
    loads the best cache at or before `start_sha`, then folds
    from there to HEAD collecting log events. The caller says
    where to start; the cache is invisible.
-2. **Default to last 30 commits** — `clank log` shows at most
-   30 log events by default (like `git log`). `-n N` overrides.
+2. **Default to last 30 commit groups** — `clank log` shows at
+   most 30 commit groups by default. `-n N` overrides.
 3. **Git-log-style output** — mimic `git log` rendering with
    ANSI colors. `--oneline` for compact. Default shows full
    commit messages with reviews beneath each commit.
@@ -26,27 +26,24 @@ don't care use `let _ =`.
 ```rust
 pub async fn rebuild_from(
     repo_root: &Path,
-    start: &CommitSha,
+    from: &CommitSha,
+    to: &CommitSha,
 ) -> Result<(RepoState, LogEvents), RebuildError>
 ```
 
-The caller says "I need fold state and log events starting from
-this commit." `start` is **inclusive** — events begin at `start`
-itself. The rebuild module:
+`from` is inclusive, `to` is inclusive. The rebuild module:
 
-1. Scans cached heads for the best ancestor strictly before
-   `start`. Loads the cache.
-2. Two-phase fold-forward from cache to HEAD:
-   - **Phase 1 (silent):** fold from cache anchor to `start`'s
+1. Finds the best cache at or before `from`'s parent. Loads it.
+2. Two-phase fold-forward from cache to `to`:
+   - **Phase 1 (silent):** fold from cache anchor to `from`'s
      parent. Builds state but discards log events.
-   - **Phase 2 (collecting):** fold from `start` through HEAD,
+   - **Phase 2 (collecting):** fold from `from` through `to`,
      collecting log events for every commit.
 3. Returns `(RepoState, LogEvents)` — events only for commits
-   at or after `start`.
+   in `[from, to]`.
 
-If no cache predates `start`, cold-fold from root with the same
-two-phase split (silent to `start`'s parent, collect from
-`start`).
+If no cache predates `from`, cold-fold from root with the same
+two-phase split.
 
 The cache is invisible to the caller. `rebuild_from` is just
 another rebuild entry point — it uses the same `fold_forward`
@@ -67,18 +64,36 @@ Delete `apply_commit_with_log` from `disk_snapshot.rs`. Make
 
 ## Part 2: clank log uses `rebuild_from`
 
-Two-phase approach:
+### CLI
+
+```
+clank log [<range>] [--plan <stem>] [--all] [-n N] [--oneline]
+          [--json] [--repo <path>]
+```
+
+`<range>` is optional, git-log-style:
+- `<sha>` — from that commit to HEAD (inclusive).
+- `<from>..<to>` — from `from` (exclusive) to `to` (inclusive).
+- Omitted — inferred from the plan's intro to HEAD.
+
+Plan selection:
+- No args + one active plan: that plan's timeline.
+- `--plan <stem>`: specific plan (active or finished).
+- `--all`: all plans interleaved.
+- No active plans + no `--plan`: most recent finished plan.
+
+### Two-phase approach
 
 1. Fast rebuild (`rebuild_repo_with_policy(Use)`) to get fold
-   state → find the plan's first commit SHA (active plan:
-   `plans[key].commits[0].sha`; finished plan:
-   `finished_plans[i].intro`).
-2. `rebuild_from(intro_parent)` → get `(state, log_events)`.
+   state → resolve the range (find the plan's intro SHA if no
+   explicit range given).
+2. `rebuild_from(from, to)` → get `(state, log_events)`.
+   Both inclusive — `rebuild_from` handles caching internally.
    Filter events by plan. Scan feedback. Render.
 
 The first call is a cache hit (~instant). The second call loads
-a cache before the plan's intro and folds from there (~fast,
-only the plan's range + whatever gap to the nearest cache).
+a cache before the range start and folds from there (~fast,
+only the range + whatever gap to the nearest cache).
 
 ### Default limit
 
