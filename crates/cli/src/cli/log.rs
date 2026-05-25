@@ -14,25 +14,16 @@ pub async fn run(args: LogArgs) -> anyhow::Result<()> {
     let repo = resolve_repo(args.repo.as_deref())?;
     let basename = repo_basename(&repo)?;
 
-    // Phase 1: fast cached rebuild to find the plan's intro SHA.
-    let fast_state =
-        crate::rebuild::rebuild_repo_with_policy(&repo, crate::rebuild::CachePolicy::Use)
-            .await
-            .map_err(|e| anyhow::anyhow!("failed to fold repo: {e}"))?;
+    let head = git_rev_parse_head(&repo).ok_or_else(|| anyhow::anyhow!("repo has no HEAD"))?;
 
-    let head = fast_state
-        .head
-        .as_ref()
-        .ok_or_else(|| anyhow::anyhow!("repo has no HEAD"))?;
+    let plan_filter = resolve_plan_filter(&repo, &basename, args.all, args.plan.as_deref())?;
 
-    let plan_filter =
-        resolve_plan_filter(&fast_state.fold, &basename, args.all, args.plan.as_deref())?;
+    let from: Option<CommitSha> = match &plan_filter {
+        Some(keys) => earliest_plan_intro_parent(&repo, keys),
+        None => None,
+    };
 
-    let intro = find_earliest_intro(&fast_state, &plan_filter);
-    let from: Option<CommitSha> = intro.as_ref().and_then(|sha| git_parent_of(&repo, sha));
-
-    // Phase 2: rebuild_from to get log events for the range.
-    let (_state, log_events) = crate::rebuild::rebuild_from(&repo, from.as_ref(), head)
+    let (_state, log_events) = crate::rebuild::rebuild_from(&repo, from.as_ref(), &head)
         .await
         .map_err(|e| anyhow::anyhow!("failed to fold range: {e}"))?;
 
@@ -86,55 +77,72 @@ pub async fn run(args: LogArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn find_earliest_intro(
-    state: &crate::repo_state::RepoState,
-    plan_filter: &Option<Vec<PlanKey>>,
-) -> Option<CommitSha> {
-    let keys: Vec<&PlanKey> = match plan_filter {
-        Some(keys) => keys.iter().collect(),
-        None => state
-            .fold
-            .plans
-            .keys()
-            .chain(state.fold.finished_plans.iter().map(|fp| &fp.plan))
-            .collect(),
-    };
-
-    let mut candidates: Vec<(CommitSha, i64)> = Vec::new();
-    for key in &keys {
-        if let Some(ps) = state.fold.plans.get(*key) {
-            if let Some(first) = ps.commits.first() {
-                candidates.push((first.sha.clone(), first.ts));
-            }
-        }
-        for fp in &state.fold.finished_plans {
-            if &fp.plan == *key {
-                // Finished plans don't carry timestamps on the intro
-                // SHA — use 0 as a sentinel so they sort earliest.
-                candidates.push((fp.intro.clone(), 0));
-            }
-        }
-    }
-    candidates.sort_by_key(|(_, ts)| *ts);
-    candidates.into_iter().next().map(|(sha, _)| sha)
-}
-
-fn git_parent_of(repo: &Path, sha: &CommitSha) -> Option<CommitSha> {
+fn git_rev_parse_head(repo: &Path) -> Option<CommitSha> {
     let output = std::process::Command::new("git")
         .arg("-C")
         .arg(repo)
-        .args(["rev-parse", &format!("{}^", sha.as_str())])
+        .args(["rev-parse", "HEAD"])
         .output()
         .ok()?;
     if !output.status.success() {
         return None;
     }
-    let s = String::from_utf8(output.stdout).ok()?;
-    CommitSha::parse(s.trim()).ok()
+    CommitSha::parse(String::from_utf8_lossy(&output.stdout).trim()).ok()
 }
 
+/// Find the parent of the earliest plan file introduction across
+/// the selected plans. Uses `git log --diff-filter=A` to find when
+/// `.clank/plans/<stem>.md` was first committed.
+fn earliest_plan_intro_parent(repo: &Path, keys: &[PlanKey]) -> Option<CommitSha> {
+    let mut earliest: Option<(String, i64)> = None;
+    for key in keys {
+        let plan_path = format!(".clank/plans/{}.md", key.as_str());
+        let output = std::process::Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args([
+                "log",
+                "--diff-filter=A",
+                "--format=%H %at",
+                "--follow",
+                "--",
+                &plan_path,
+            ])
+            .output()
+            .ok()?;
+        if !output.status.success() {
+            continue;
+        }
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        if let Some(line) = stdout.lines().last() {
+            let mut parts = line.splitn(2, ' ');
+            let sha_str = parts.next().unwrap_or("").trim().to_string();
+            let ts: i64 = parts.next().unwrap_or("0").trim().parse().unwrap_or(0);
+            earliest = Some(match earliest {
+                Some((_prev_sha, prev_ts)) if ts < prev_ts => (sha_str, ts),
+                Some(prev) => prev,
+                None => (sha_str, ts),
+            });
+        }
+    }
+    let (intro_sha_str, _) = earliest?;
+    let intro_sha = CommitSha::parse(&intro_sha_str).ok()?;
+    // Return the parent (exclusive lower bound). None if root commit.
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["rev-parse", &format!("{}^", intro_sha.as_str())])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    CommitSha::parse(String::from_utf8_lossy(&output.stdout).trim()).ok()
+}
+
+/// Resolve plan filter using git only (no fold state needed).
 fn resolve_plan_filter(
-    fold: &clank_core::repo_state::RepoState,
+    repo: &Path,
     basename: &str,
     all: bool,
     plan_arg: Option<&str>,
@@ -148,16 +156,23 @@ fn resolve_plan_filter(
             .map_err(|e| anyhow::anyhow!("invalid plan stem `{stem}`: {e}"))?;
         return Ok(Some(vec![key]));
     }
-    let actives: Vec<PlanKey> = fold.plans.keys().cloned().collect();
-    match actives.as_slice() {
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["ls-tree", "--name-only", "HEAD", ".clank/plans/"])
+        .output();
+    let plans: Vec<PlanKey> = match output {
+        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout)
+            .lines()
+            .filter_map(|l| {
+                let stem = l.strip_prefix(".clank/plans/")?.strip_suffix(".md")?;
+                PlanKey::parse(stem).ok()
+            })
+            .collect(),
+        _ => Vec::new(),
+    };
+    match plans.as_slice() {
         [one] => Ok(Some(vec![one.clone()])),
-        [] => {
-            if let Some(fp) = fold.finished_plans.last() {
-                Ok(Some(vec![fp.plan.clone()]))
-            } else {
-                Ok(None)
-            }
-        }
         _ => Ok(None),
     }
 }
@@ -228,8 +243,7 @@ fn print_human(
         match event {
             LogEvent::PlanIntro { plan, sha, .. } => {
                 let subj = commit_subject(repo, sha);
-                let kind = "plan";
-                println!("{:<40} {}  {kind}", subj, short(sha));
+                println!("{:<40} {}  plan", subj, short(sha));
                 print_reviews_for(&reviews, plan, sha);
             }
             LogEvent::PlanCommit {
