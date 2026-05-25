@@ -23,21 +23,18 @@ review:
 Source: two-layer merge of `~/.clank/config.json` and
 `<repo>/.clank/config.json`.
 
-### `clank config set <key> <value>`
+### `clank config <key> get`
 
-Sets a key in `<repo>/.clank/config.json`. Dot-separated
-keys: `review.force_review_on_misc_commits false`.
+Prints the effective value for one key.
 
-Validates the key exists and the value is the right type
-before writing. Prints the new effective value after write.
+### `clank config <key> set <value>`
+
+Sets a key in `<repo>/.clank/config.json`. Validates the
+key exists and the value is the right type before writing.
+Prints the new effective value after write.
 
 Does NOT commit — the operator decides when to commit
 config changes (they might set several keys).
-
-### `clank config get <key>`
-
-Prints just the effective value for one key. Useful for
-scripts.
 
 ### `clank config --json`
 
@@ -56,9 +53,9 @@ Dumps the full effective config as JSON.
 ## Tests
 
 - Bare `clank config` prints all keys with values.
-- `clank config set review.force_review_on_misc_commits false`
+- `clank config review.force_review_on_misc_commits set false`
   writes to repo config.json.
-- `clank config get review.force_review_on_misc_commits`
+- `clank config review.force_review_on_misc_commits get`
   returns the effective value.
 - `clank config --json` returns valid JSON.
 - Unknown key errors cleanly.
