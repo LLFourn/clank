@@ -10,13 +10,12 @@
 
 use std::path::Path;
 
-use crate::disk_snapshot::{
-    CommitEvent, apply_commit, derive_state, derive_state_with_log, enrich_with_newly_finished,
-};
+use crate::disk_snapshot::{CommitEvent, apply_commit, derive_state, enrich_with_newly_finished};
 use crate::git_io::{self, GitIoError};
 use crate::lifecycle::CommitSha;
 use crate::repo_state::RepoState;
 use crate::state_cache;
+use clank_core::repo_state::LogEvent;
 
 #[derive(Debug, thiserror::Error)]
 pub enum RebuildError {
@@ -39,22 +38,86 @@ pub async fn rebuild_repo(repo_root: &Path) -> Result<RepoState, RebuildError> {
     rebuild_repo_with_policy(repo_root, CachePolicy::Use).await
 }
 
-pub struct RepoStateWithLog {
-    pub fold: clank_core::repo_state::RepoState,
-    pub head: Option<CommitSha>,
-    pub log_events: Vec<clank_core::repo_state::LogEvent>,
-}
+/// Rebuild a range `(from, to]` collecting log events. `from` is
+/// exclusive (`None` = repo root), `to` is inclusive. Uses the cache
+/// to skip history before `from`; the cache is invisible to callers.
+pub async fn rebuild_from(
+    repo_root: &Path,
+    from: Option<&CommitSha>,
+    to: &CommitSha,
+) -> Result<(RepoState, Vec<LogEvent>), RebuildError> {
+    // Find the best cache at or before `from`. When `from=None`
+    // (from root), no cache helps — we need to fold everything
+    // to collect all events.
+    let mut best_cache: Option<(CommitSha, RepoState)> = None;
+    if let Some(f) = from {
+        for cached_head in state_cache::list_cached_heads(repo_root) {
+            let usable = &cached_head == f
+                || git_io::is_ancestor(repo_root, &cached_head, f)
+                    .await
+                    .unwrap_or(false);
+            if !usable {
+                continue;
+            }
+            if let Ok(Some(state)) = state_cache::try_load(repo_root, &cached_head) {
+                best_cache = Some((cached_head, state));
+                break;
+            }
+        }
+    }
 
-/// Rebuild with a full cold fold, collecting log events.
-/// Always bypasses the cache (log events are not cached).
-pub async fn rebuild_repo_with_log(repo_root: &Path) -> Result<RepoStateWithLog, RebuildError> {
-    let snapshot = git_io::snapshot(repo_root).await?;
-    let (state, log_events) = derive_state_with_log(repo_root.to_path_buf(), snapshot).await?;
-    Ok(RepoStateWithLog {
-        fold: state.fold,
-        head: state.head,
-        log_events,
-    })
+    let mut state = match best_cache {
+        Some((_ch, s)) => s,
+        None => RepoState::empty(repo_root.to_path_buf()),
+    };
+
+    // Phase 1 (silent): fold from current state head through `from`.
+    // This builds fold context without emitting log events.
+    let silent_target = from.cloned();
+    if let Some(ref target) = silent_target {
+        let base = state.head.clone();
+        let metas = match base.as_ref() {
+            Some(b) if b == target => Vec::new(),
+            Some(b) => git_io::first_parent_commits_between(repo_root, b, target).await?,
+            None => git_io::first_parent_commits_to(repo_root, target).await?,
+        };
+        for meta in metas {
+            let changes = git_io::diff_tree_changes(repo_root, &meta.sha).await?;
+            let raw = CommitEvent {
+                commit: meta.sha.clone(),
+                author_ts: meta.author_ts,
+                subject: meta.subject,
+                changes,
+                newly_finished: std::collections::BTreeSet::new(),
+            };
+            let enriched = enrich_with_newly_finished(repo_root, &raw).await?;
+            let _ = apply_commit(&mut state, &enriched);
+        }
+        state.head = Some(target.clone());
+    }
+
+    // Phase 2 (collecting): fold from `from` (exclusive) through `to` (inclusive).
+    let base = state.head.clone();
+    let metas = match base.as_ref() {
+        Some(b) => git_io::first_parent_commits_between(repo_root, b, to).await?,
+        None => git_io::first_parent_commits_to(repo_root, to).await?,
+    };
+    let mut log_events = Vec::new();
+    for meta in metas {
+        let changes = git_io::diff_tree_changes(repo_root, &meta.sha).await?;
+        let raw = CommitEvent {
+            commit: meta.sha.clone(),
+            author_ts: meta.author_ts,
+            subject: meta.subject,
+            changes,
+            newly_finished: std::collections::BTreeSet::new(),
+        };
+        let enriched = enrich_with_newly_finished(repo_root, &raw).await?;
+        log_events.extend(apply_commit(&mut state, &enriched));
+    }
+    state.head = Some(to.clone());
+
+    Ok((state, log_events))
 }
 
 pub async fn rebuild_repo_with_policy(
