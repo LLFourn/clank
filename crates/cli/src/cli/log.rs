@@ -100,26 +100,23 @@ fn find_earliest_intro(
             .collect(),
     };
 
-    let mut earliest: Option<CommitSha> = None;
+    let mut candidates: Vec<(CommitSha, i64)> = Vec::new();
     for key in &keys {
         if let Some(ps) = state.fold.plans.get(*key) {
             if let Some(first) = ps.commits.first() {
-                earliest = Some(earliest.map_or(first.sha.clone(), |prev| {
-                    if first.ts < state.fold.plans.get(*key).unwrap().commits[0].ts {
-                        first.sha.clone()
-                    } else {
-                        prev
-                    }
-                }));
+                candidates.push((first.sha.clone(), first.ts));
             }
         }
         for fp in &state.fold.finished_plans {
             if &fp.plan == *key {
-                earliest = earliest.or(Some(fp.intro.clone()));
+                // Finished plans don't carry timestamps on the intro
+                // SHA — use 0 as a sentinel so they sort earliest.
+                candidates.push((fp.intro.clone(), 0));
             }
         }
     }
-    earliest
+    candidates.sort_by_key(|(_, ts)| *ts);
+    candidates.into_iter().next().map(|(sha, _)| sha)
 }
 
 fn git_parent_of(repo: &Path, sha: &CommitSha) -> Option<CommitSha> {
