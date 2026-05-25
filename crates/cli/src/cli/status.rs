@@ -55,6 +55,7 @@ pub async fn run(args: StatusArgs) -> anyhow::Result<()> {
             worktree_dirty,
             &views,
             &state,
+            args.all,
         );
     }
     Ok(())
@@ -182,6 +183,7 @@ fn print_human(
     worktree_dirty: bool,
     views: &[PlanView],
     state: &RepoState,
+    all: bool,
 ) {
     println!("repo:   {}", repo.display());
     if let Some(b) = branch {
@@ -210,9 +212,15 @@ fn print_human(
     }
 
     if !state.fold.finished_plans.is_empty() {
+        let total = state.fold.finished_plans.len();
+        let show = if all { total } else { total.min(3) };
         println!();
-        println!("finished plans:");
-        for fp in &state.fold.finished_plans {
+        if show < total {
+            println!("finished plans ({show} of {total}):");
+        } else {
+            println!("finished plans:");
+        }
+        for fp in state.fold.finished_plans.iter().rev().take(show).rev() {
             println!(
                 "  {} (finalized {})",
                 fp.plan.as_str(),

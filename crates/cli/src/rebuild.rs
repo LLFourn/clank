@@ -10,7 +10,9 @@
 
 use std::path::Path;
 
-use crate::disk_snapshot::{CommitEvent, apply_commit, derive_state, enrich_with_newly_finished};
+use crate::disk_snapshot::{
+    CommitEvent, apply_commit, derive_state, derive_state_with_log, enrich_with_newly_finished,
+};
 use crate::git_io::{self, GitIoError};
 use crate::lifecycle::CommitSha;
 use crate::repo_state::RepoState;
@@ -35,6 +37,24 @@ pub struct RebuildDiagnostics {
 
 pub async fn rebuild_repo(repo_root: &Path) -> Result<RepoState, RebuildError> {
     rebuild_repo_with_policy(repo_root, CachePolicy::Use).await
+}
+
+pub struct RepoStateWithLog {
+    pub fold: clank_core::repo_state::RepoState,
+    pub head: Option<CommitSha>,
+    pub log_events: Vec<clank_core::repo_state::LogEvent>,
+}
+
+/// Rebuild with a full cold fold, collecting log events.
+/// Always bypasses the cache (log events are not cached).
+pub async fn rebuild_repo_with_log(repo_root: &Path) -> Result<RepoStateWithLog, RebuildError> {
+    let snapshot = git_io::snapshot(repo_root).await?;
+    let (state, log_events) = derive_state_with_log(repo_root.to_path_buf(), snapshot).await?;
+    Ok(RepoStateWithLog {
+        fold: state.fold,
+        head: state.head,
+        log_events,
+    })
 }
 
 pub async fn rebuild_repo_with_policy(

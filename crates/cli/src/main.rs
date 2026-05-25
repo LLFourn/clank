@@ -21,6 +21,9 @@ enum Command {
     Finish(cli::FinishArgs),
     /// Strip a plan's `.clank/` artifacts from history.
     Purge(cli::PurgeArgs),
+    /// Print a chronological timeline of commits and reviews for
+    /// a plan.
+    Log(cli::LogArgs),
     /// Print the repo's Clank state (HEAD, plans, phases).
     Status(cli::StatusArgs),
     /// Wait-for-work: block until the calling agent has actionable
@@ -58,6 +61,7 @@ async fn main() -> anyhow::Result<()> {
         Command::Init(args) => cli::init::run(args).await,
         Command::Finish(args) => cli::finish::run(args).await,
         Command::Purge(args) => cli::purge::run(args).await,
+        Command::Log(args) => cli::log::run(args).await,
         Command::Status(args) => cli::status::run(args).await,
         Command::Wfw(args) => cli::wfw::run(args).await,
         Command::Feedback(args) => cli::feedback::run(args).await,

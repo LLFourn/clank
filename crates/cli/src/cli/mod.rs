@@ -16,6 +16,7 @@ pub mod doctor;
 pub mod feedback;
 pub mod finish;
 pub mod init;
+pub mod log;
 pub mod plan_resolve;
 pub mod purge;
 pub mod rewrite;
@@ -34,6 +35,18 @@ pub struct InitArgs {
     /// role = reviewers. Useful for scripts.
     #[arg(short = 'y', long)]
     pub yes: bool,
+}
+
+#[derive(Args, Debug)]
+pub struct LogArgs {
+    #[arg(long, value_name = "PATH")]
+    pub repo: Option<PathBuf>,
+    #[arg(short = 'j', long)]
+    pub json: bool,
+    #[arg(long, conflicts_with = "plan")]
+    pub all: bool,
+    #[arg(long, value_name = "PLAN")]
+    pub plan: Option<String>,
 }
 
 #[derive(Args, Debug)]

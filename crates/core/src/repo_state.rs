@@ -193,6 +193,36 @@ pub enum Warning {
 }
 
 // ============================================================
+// LogEvent — fold output (side-channel for `clank log`)
+// ============================================================
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LogEvent {
+    PlanIntro {
+        plan: PlanKey,
+        sha: CommitSha,
+        ts: i64,
+    },
+    PlanCommit {
+        plan: PlanKey,
+        sha: CommitSha,
+        ts: i64,
+        touched_plan: bool,
+        touched_code: bool,
+    },
+    PlanFinalized {
+        plan: PlanKey,
+        sha: CommitSha,
+        ts: i64,
+    },
+    PlanDeleted {
+        plan: PlanKey,
+        sha: CommitSha,
+        ts: i64,
+    },
+}
+
+// ============================================================
 // CommitEvent — fold input
 // ============================================================
 
@@ -427,7 +457,8 @@ impl RepoState {
     }
 
     /// Apply one `CommitEvent` to this state.
-    pub fn apply_commit(&mut self, event: &CommitEvent) {
+    pub fn apply_commit(&mut self, event: &CommitEvent) -> Vec<LogEvent> {
+        let mut log_events = Vec::new();
         let touches: BTreeMap<PlanKey, TouchKind> = event
             .plan_touches
             .iter()
@@ -460,9 +491,8 @@ impl RepoState {
             });
         }
 
-        // Lifecycle: Intro inserts + clears ad_hoc; Revise is a
-        // no-op (the touched_plan flag rides into the per-plan
-        // event later); Delete is hard-forget.
+        let mut intros_this_commit: BTreeSet<PlanKey> = BTreeSet::new();
+
         for touch in &event.plan_touches {
             match touch.kind {
                 TouchKind::Intro => {
@@ -470,9 +500,20 @@ impl RepoState {
                     self.plans
                         .entry(touch.plan.clone())
                         .or_insert_with(PlanState::default);
+                    intros_this_commit.insert(touch.plan.clone());
+                    log_events.push(LogEvent::PlanIntro {
+                        plan: touch.plan.clone(),
+                        sha: event.sha.clone(),
+                        ts: event.author_ts,
+                    });
                 }
                 TouchKind::Revise => {}
                 TouchKind::Delete => {
+                    log_events.push(LogEvent::PlanDeleted {
+                        plan: touch.plan.clone(),
+                        sha: event.sha.clone(),
+                        ts: event.author_ts,
+                    });
                     self.plans.remove(&touch.plan);
                     self.finished_plans.retain(|f| f.plan != touch.plan);
                     self.warnings.retain(|w| {
@@ -497,12 +538,23 @@ impl RepoState {
             let Some(ps) = self.plans.get_mut(plan) else {
                 continue;
             };
+            let tp = touches.contains_key(plan);
+            let tc = event.has_code_changes && classified.plan_attribution.contains(plan);
             ps.commits.push(PlanTimelineEvent {
                 sha: event.sha.clone(),
                 ts: event.author_ts,
-                touched_plan: touches.contains_key(plan),
-                touched_code: event.has_code_changes && classified.plan_attribution.contains(plan),
+                touched_plan: tp,
+                touched_code: tc,
             });
+            if !intros_this_commit.contains(plan) && !event.newly_finished.contains(plan) {
+                log_events.push(LogEvent::PlanCommit {
+                    plan: plan.clone(),
+                    sha: event.sha.clone(),
+                    ts: event.author_ts,
+                    touched_plan: tp,
+                    touched_code: tc,
+                });
+            }
         }
 
         // Soft-archive finalized plans: move them to
@@ -518,6 +570,11 @@ impl RepoState {
                     plan: plan.clone(),
                     intro,
                     finalized_at: event.sha.clone(),
+                });
+                log_events.push(LogEvent::PlanFinalized {
+                    plan: plan.clone(),
+                    sha: event.sha.clone(),
+                    ts: event.author_ts,
                 });
             }
         }
@@ -541,6 +598,7 @@ impl RepoState {
         {
             self.active_plan_hint = None;
         }
+        log_events
     }
 }
 

@@ -85,6 +85,51 @@ pub async fn derive_state(
     Ok(state)
 }
 
+/// Cold-start derivation with log events: same as `derive_state`
+/// but collects `LogEvent`s from each `apply_commit` call.
+pub async fn derive_state_with_log(
+    repo_root: PathBuf,
+    snapshot: CommitSnapshot,
+) -> Result<(RepoState, Vec<fold::LogEvent>), GitIoError> {
+    let mut state = RepoState::empty(repo_root.clone());
+    state.head = snapshot.head.clone();
+    let mut all_events = Vec::new();
+    for event in &snapshot.history {
+        let enriched = enrich_with_newly_finished(&repo_root, event).await?;
+        let log = apply_commit_with_log(&mut state, &enriched);
+        all_events.extend(log);
+    }
+    Ok((state, all_events))
+}
+
+fn apply_commit_with_log(state: &mut RepoState, event: &CommitEvent) -> Vec<fold::LogEvent> {
+    let plan_touches: Vec<fold::PlanTouchInput> = event
+        .changes
+        .plan_touches
+        .iter()
+        .map(|t| fold::PlanTouchInput {
+            plan: t.plan.clone(),
+            kind: match (t.kind, t.new_path.is_some()) {
+                (PlanTouchKind::Intro, true) => fold::TouchKind::Intro,
+                (PlanTouchKind::Intro, false) => fold::TouchKind::Delete,
+                (PlanTouchKind::Revision, true) => fold::TouchKind::Revise,
+                (PlanTouchKind::Revision, false) => fold::TouchKind::Delete,
+            },
+        })
+        .collect();
+
+    let new_event = fold::CommitEvent {
+        sha: event.commit.clone(),
+        author_ts: event.author_ts,
+        subject: event.subject.clone(),
+        plan_touches,
+        newly_finished: event.newly_finished.clone(),
+        has_code_changes: event.changes.has_non_plan_code_changes,
+    };
+
+    state.fold.apply_commit(&new_event)
+}
+
 /// Apply one commit to `state.fold`. Pure: every input the fold
 /// needs is encoded in `event`.
 pub fn apply_commit(state: &mut RepoState, event: &CommitEvent) {
@@ -112,7 +157,7 @@ pub fn apply_commit(state: &mut RepoState, event: &CommitEvent) {
         has_code_changes: event.changes.has_non_plan_code_changes,
     };
 
-    state.fold.apply_commit(&new_event);
+    let _ = state.fold.apply_commit(&new_event);
 }
 
 /// Compute the stateless `newly_finished` set for a commit by
