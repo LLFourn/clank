@@ -47,9 +47,11 @@ User invoked `/clank` with arguments: "$ARGUMENTS"
   - "Switch role to reviewers" → `clank auto on --role reviewers`
   Run the matching command via Bash, then re-print state.
 - **Otherwise**: pass arguments through. Run `clank $ARGUMENTS`
-  via Bash and print the output.
+  via Bash and relay the full stdout to the user as your response.
 
-No commentary; just the command output.
+No commentary; just the command output. The user cannot see tool
+call results directly — you must include the output in your
+response text.
 
 ## Stop-hook continuations
 
