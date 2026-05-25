@@ -32,18 +32,14 @@ the fold. `LogEvent::AdHoc` was just added for `clank log`.
 
 3. **`clank feedback write` can't target ad-hoc commits**.
 
-## Design: `derive_work` with a feedback trait
+## Design: `derive_status` + `ReviewLookup` trait
 
 ### The trait
 
 ```rust
 pub trait ReviewLookup {
-    fn reviews_for(&self, target: ReviewTarget) -> Vec<ReviewEntry>;
-}
-
-pub enum ReviewTarget {
-    Plan { plan: PlanKey, sha: CommitSha },
-    AdHoc { sha: CommitSha },
+    fn reviews_for(&self, sha: &CommitSha) -> Vec<ReviewEntry>;
+    fn worktree_status(&self, plan: &PlanKey) -> PlanWorktreeStatus;
 }
 
 pub struct ReviewEntry {
@@ -53,40 +49,80 @@ pub struct ReviewEntry {
 ```
 
 Lives in `crates/core`. The CLI implements it by scanning
-feedback files from disk. Core never does I/O.
+feedback files from disk and comparing worktree to HEAD. Core
+never does I/O.
 
-### New `derive_work` signature
+### `RepoState::derive_status`
 
 ```rust
-pub fn derive_work(
-    state: &RepoState,
-    reviews: &impl ReviewLookup,
-    author: &AgentLabel,
-    role: Role,
-    config: &ReviewPolicy,
-) -> Vec<WaitItem>
+impl RepoState {
+    pub fn derive_status(
+        &self,
+        reviews: &impl ReviewLookup,
+        policy: &ReviewPolicy,
+    ) -> WorkStatus { ... }
+}
 ```
 
-`ReviewPolicy` is a small core struct:
+Computes the objective work state for every plan + ad-hoc
+commit in one pass. No per-agent filtering — that comes after.
+
+### `ReviewPolicy`
 
 ```rust
 pub struct ReviewPolicy {
     pub force_review_on_misc_commits: bool,
-    pub force_review_on_plan_commits: bool,
     pub ad_hoc_reviewers: Option<Vec<AgentLabel>>,
 }
 ```
 
-`derive_work` iterates `state.plans` (computing gate state
-via `reviews.reviews_for(Plan { .. })`) and `state.ad_hoc`
-(via `reviews.reviews_for(AdHoc { .. })`), emitting work items
-for both. The `PlanView` projection step is absorbed into
-`derive_work` — it computes `waiting_on` internally from the
-fold timeline + reviews.
+### `WorkStatus`
+
+```rust
+pub struct WorkStatus {
+    pub plans: Vec<PlanWorkState>,
+    pub ad_hoc: Vec<AdHocWorkState>,
+}
+
+pub struct PlanWorkState {
+    pub plan: PlanKey,
+    pub sha: CommitSha,
+    pub gate: CommitGateState,
+    pub waiting_on: WaitingOn,
+}
+
+pub struct AdHocWorkState {
+    pub sha: CommitSha,
+    pub gate: CommitGateState,
+}
+
+impl WorkStatus {
+    pub fn work_for(
+        &self,
+        author: &AgentLabel,
+        role: Role,
+    ) -> Vec<WaitItem> {
+        // cheap filter over the precomputed state
+    }
+}
+```
+
+`derive_status` computes gate states:
+- For each active plan: get reviewable SHAs from timeline,
+  call `reviews.reviews_for(sha)` for each, build cumulative
+  participants, compute gate + `waiting_on` on the latest.
+  Call `reviews.worktree_status(plan)` for commit routing.
+- For each ad-hoc commit (when `policy.force_review_on_misc_commits`):
+  call `reviews.reviews_for(sha)`, compute gate.
+  Respect `policy.ad_hoc_reviewers` in `work_for`.
+
+`work_for` filters the objective state by role + author to
+produce actionable `WaitItem`s. This is the same data `clank
+status` can also render — one computation serves both commands.
 
 ### WaitItem shape
 
-Add `AdHocReview` and `AdHocRevise` to `WaitItem`:
+Add to `WaitItem`:
 
 ```rust
 AdHocReview {
@@ -114,26 +150,24 @@ the `_` feedback directory.
 
 ### `crates/core`
 
-- New `ReviewLookup` trait + `ReviewTarget` + `ReviewEntry` +
-  `ReviewPolicy` types.
-- `derive_work` rewritten to take `&RepoState` + `&impl
-  ReviewLookup` instead of `&[PlanView]`. Computes gate state
-  internally. Handles both plans and ad-hoc commits.
-- `PlanView` projection may be simplified or kept for `status`
-  display (it still needs worktree facts which come from I/O).
+- New `ReviewLookup` trait, `ReviewEntry`, `ReviewPolicy`,
+  `WorkStatus`, `PlanWorkState`, `AdHocWorkState`.
+- `RepoState::derive_status` method.
+- `WorkStatus::work_for` method.
+- `PlanView` projection kept for `clank status` display but
+  no longer used by work derivation. Can be simplified or
+  migrated to use `WorkStatus` over time.
 
 ### `crates/cli`
 
-- Implement `ReviewLookup` over the filesystem (scan feedback
-  files, return entries). Replaces the current `scan_feedback`
-  → `PlanView` projection → `derive_work` pipeline with a
-  single `derive_work(&state, &fs_reviews, ...)` call.
-- `wfw.rs`: load config, build `ReviewPolicy`, construct the
-  filesystem `ReviewLookup`, call `derive_work`.
+- `FsReviewLookup` implements `ReviewLookup` over the
+  filesystem (scan feedback files, check worktree).
+- `wfw.rs`: load config → build `ReviewPolicy` → construct
+  `FsReviewLookup` → call `state.derive_status(reviews, policy)`
+  → call `status.work_for(author, role)`.
 - `feedback.rs`: add `--adhoc` flag.
 - `stop_hook.rs`: render `AdHocReview` / `AdHocRevise`.
-- Lifecycle hooks: ad-hoc items skip `firings_from_items` (no
-  `PlanKey`).
+- Lifecycle hooks: ad-hoc items skip `firings_from_items`.
 
 ## Tests
 
