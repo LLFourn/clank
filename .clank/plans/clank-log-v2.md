@@ -82,28 +82,26 @@ clank log [<range>] [--plan <stem>] [--all] [-n N] [--oneline]
 - `<from>..<to>` — commits reachable from `to` but not from
   `from` (exclusive from, inclusive to). Passed directly to
   `rebuild_from(from, to)`.
-- Omitted — inferred from the plan's intro's parent to HEAD
-  (so the intro itself is included).
+- Omitted — last 30 commits from HEAD (like `git log` with no
+  args). Shows whatever plan events are in that range.
 
-Plan selection:
-- No args + one active plan: that plan's timeline.
-- `--plan <stem>`: specific plan (active or finished).
-- `--all`: all plans interleaved.
-- No active plans + no `--plan`: most recent finished plan.
+`--plan <stem>` filters events to that plan within the range.
+`--all` is not needed (bare already shows all plans in range).
 
-### Two-phase approach
+### Approach
 
-1. Fast rebuild (`rebuild_repo_with_policy(Use)`) to get fold
-   state → resolve the range (find the plan's intro SHA if no
-   explicit range given).
-2. `rebuild_from(intro_parent, head)` → get events for `(intro_parent, head]`.
-   The intro itself is included (exclusive from). `rebuild_from`
-   handles caching internally.
-   Filter events by plan. Scan feedback. Render.
+Bare `clank log`: `rebuild_from(HEAD~30_parent, HEAD)`. No plan
+resolution, no fold-state lookup. Just fold the last 30 commits,
+collect events, filter by `--plan` if given, render.
 
-The first call is a cache hit (~instant). The second call loads
-a cache before the range start and folds from there (~fast,
-only the range + whatever gap to the nearest cache).
+`clank log --plan foo`: same 30-commit range but filter events
+to plan `foo`. If the plan's intro is older than 30 commits,
+the user passes an explicit range or `-n 0`.
+
+`clank log <range>`: `rebuild_from` with the parsed range.
+No default limit applied (the user specified the range).
+
+`rebuild_from` handles caching internally.
 
 ### Default limit
 
