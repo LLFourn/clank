@@ -10,10 +10,9 @@ Two changes:
    separate predicate. A plan is finished iff its `.md` lives
    under `finished/`.
 
-2. **`clank unfinish <plan>`.** Finds the commit that moved the
-   plan file to `finished/`, rewrites it out of history (drop if
-   it was the only change, strip the mv otherwise), and leaves
-   the plan file back in `plans/`.
+2. **`clank unfinish <plan>`.** Moves the plan file back:
+   `git mv .clank/finished/<plan>.md .clank/plans/<plan>.md`
+   and commits. No history rewriting.
 
 ## Current state
 
@@ -164,8 +163,8 @@ finished/ for the given stem.
 ### `crates/cli`
 
 - `git_io.rs`: add `is_finished_path`. Update `parse_diff_tree`:
-  rename plans/→finished/ emits `PlanTouch::Finish`. Remove
-  `FinalizeChange` handling, `finish_predicate_at`,
+  reconcile plan Delete + finished Add → `TouchKind::Finish`.
+  Remove `FinalizeChange` handling, `finish_predicate_at`,
   `read_finalize_snapshot`, `parse_finalize_subpath`.
   Remove `enrich_with_newly_finished` calls.
 - `disk_snapshot.rs`: remove `FinalizeChange`, `FinalizeChangeKind`,
@@ -176,7 +175,7 @@ finished/ for the given stem.
 - `preview.rs`: update `tree_plan_paths` pathspec. Keep gate check.
 - `purge.rs`: update amend program for rename-based finalize diff.
 - `disk_format.rs`: remove `FinalizePath`, `parse_finalize_path`.
-- New: `cli/unfinish.rs` — find finish commit, drop or strip.
+- New: `cli/unfinish.rs` — `git mv finished/ → plans/` + commit.
 - `mod.rs`: add `UnfinishArgs`, wire subcommand.
 - Migration commit: mv existing finished markers to plan files.
 
