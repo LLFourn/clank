@@ -23,6 +23,7 @@ pub mod rewrite;
 pub mod setup;
 pub mod status;
 pub mod stop_hook;
+pub mod unfinish;
 pub mod wfw;
 
 #[derive(Args, Debug)]
@@ -431,6 +432,14 @@ pub struct FinishArgs {
     /// Skip the on-disk state cache: don't read it, don't write it.
     #[arg(long)]
     pub no_cache: bool,
+}
+
+#[derive(Args, Debug)]
+pub struct UnfinishArgs {
+    /// Plan to unfinish. Required.
+    pub plan: Option<String>,
+    #[arg(long, value_name = "PATH")]
+    pub repo: Option<PathBuf>,
 }
 
 #[derive(Args, Debug)]

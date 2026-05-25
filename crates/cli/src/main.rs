@@ -16,9 +16,10 @@ struct Cli {
 enum Command {
     /// Scaffold `.clank/` in a repo (creates `plans/` and `.gitignore`).
     Init(cli::InitArgs),
-    /// Finalize an approved plan: seal the approving feedback into
-    /// `.clank/finished/<stem>/` and commit.
+    /// Finish a plan: move its file from `plans/` to `finished/`.
     Finish(cli::FinishArgs),
+    /// Unfinish a plan: move it back from `finished/` to `plans/`.
+    Unfinish(cli::UnfinishArgs),
     /// Strip a plan's `.clank/` artifacts from history.
     Purge(cli::PurgeArgs),
     /// Print a chronological timeline of commits and reviews for
@@ -66,6 +67,7 @@ async fn main() -> anyhow::Result<()> {
     let result = match cli_args.command {
         Command::Init(args) => cli::init::run(args).await,
         Command::Finish(args) => cli::finish::run(args).await,
+        Command::Unfinish(args) => cli::unfinish::run(args).await,
         Command::Purge(args) => cli::purge::run(args).await,
         Command::Log(args) => cli::log::run(args).await,
         Command::Status(args) => cli::status::run(args).await,

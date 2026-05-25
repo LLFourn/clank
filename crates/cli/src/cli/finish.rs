@@ -253,25 +253,28 @@ fn head_is_finalize_for(repo: &Path, stem: &str) -> anyhow::Result<bool> {
     let stdout = String::from_utf8_lossy(&output.stdout);
     let plan_path = format!(".clank/plans/{stem}.md");
     let finished_path = format!(".clank/finished/{stem}.md");
+    let lines: Vec<&str> = stdout.lines().filter(|l| !l.is_empty()).collect();
+    if lines.is_empty() {
+        return Ok(false);
+    }
     let mut deleted_plan = false;
     let mut added_finished = false;
-    for line in stdout.lines().filter(|l| !l.is_empty()) {
+    for line in &lines {
         let mut parts = line.splitn(3, '\t');
         let status = parts.next().unwrap_or("");
         let path = parts.next().unwrap_or("");
         match status.chars().next() {
             Some('D') if path == plan_path => deleted_plan = true,
             Some('A') if path == finished_path => added_finished = true,
-            Some('R') => {
-                // Rename: check old and new paths.
-                if path == plan_path {
-                    let new_path = parts.next().unwrap_or("");
-                    if new_path == finished_path {
-                        return Ok(true);
-                    }
+            Some('R') if path == plan_path => {
+                let new_path = parts.next().unwrap_or("");
+                if new_path != finished_path {
+                    return Ok(false);
                 }
+                deleted_plan = true;
+                added_finished = true;
             }
-            _ => {}
+            _ => return Ok(false),
         }
     }
     Ok(deleted_plan && added_finished)

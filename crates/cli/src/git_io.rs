@@ -631,16 +631,14 @@ fn parse_diff_tree(stdout: &str) -> Result<CommitChanges, GitIoError> {
                     new_path: Some(new_rel.clone()),
                 });
             } else if is_rename && old_is_plan && !new_is_plan {
-                // Rename OUT of `.clank/plans/<key>.md`. When the
-                // destination is `.clank/finished/<key>.md`, this is
-                // the canonical mv-finish operation. Otherwise it's a
-                // plain delete.
                 if let Some(old_k) = old_key {
-                    let kind = if is_finished_path(&new_rel) {
-                        PlanTouchKind::Finish
-                    } else {
-                        PlanTouchKind::Revision
-                    };
+                    let finished_key = plan_key_from_finished_path(&new_rel);
+                    let kind =
+                        if is_finished_path(&new_rel) && finished_key.as_ref() == Some(&old_k) {
+                            PlanTouchKind::Finish
+                        } else {
+                            PlanTouchKind::Revision
+                        };
                     plan_touches.push(PlanTouch {
                         plan: old_k,
                         kind,
