@@ -108,3 +108,51 @@ fn json_output_includes_summary_and_details() {
         "details should include body; got: {details}"
     );
 }
+
+#[test]
+fn short_ref_finds_full_sha_feedback() {
+    let dir = init_repo();
+    let repo = dir.path();
+    write(repo, ".clank/plans/foo.md", "# foo\n");
+    commit(repo, "[foo] intro");
+    let sha = head_sha(repo);
+
+    write(
+        repo,
+        &format!(".clank/agents/codex/feedback/{sha}.md"),
+        "APPROVE full sha feedback\n",
+    );
+
+    let short = &sha[..7];
+    let out = Command::new(clank_bin())
+        .args(["feedback", "read", "--commit", short, "--repo"])
+        .arg(repo)
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("codex") && stdout.contains("APPROVE"),
+        "short ref should find full-SHA feedback; got:\n{stdout}"
+    );
+}
+
+#[test]
+fn invalid_ref_errors() {
+    let dir = init_repo();
+    let repo = dir.path();
+    write(repo, "README.md", "seed\n");
+    commit(repo, "seed");
+
+    let out = Command::new(clank_bin())
+        .args(["feedback", "read", "--commit", "not-a-ref", "--repo"])
+        .arg(repo)
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("cannot resolve"),
+        "should error on invalid ref; got:\n{stderr}"
+    );
+}

@@ -108,20 +108,17 @@ fn format_short_list(shas: &[CommitSha]) -> String {
 async fn run_read(args: FeedbackReadArgs) -> anyhow::Result<()> {
     let repo = resolve_repo(args.repo.as_deref())?;
 
-    let sha_str = match &args.commit {
-        Some(s) => s.clone(),
-        None => {
-            let output = std::process::Command::new("git")
-                .arg("-C")
-                .arg(&repo)
-                .args(["rev-parse", "HEAD"])
-                .output()?;
-            if !output.status.success() {
-                anyhow::bail!("repo has no HEAD");
-            }
-            String::from_utf8_lossy(&output.stdout).trim().to_string()
-        }
-    };
+    let rev = args.commit.as_deref().unwrap_or("HEAD");
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(&repo)
+        .args(["rev-parse", "--verify", "--quiet", rev])
+        .output()?;
+    if !output.status.success() {
+        anyhow::bail!("cannot resolve `{rev}` to a commit");
+    }
+    let full_sha = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let short_sha = &full_sha[..full_sha.len().min(7)];
 
     let agents_dir = repo.join(".clank/agents");
     let mut entries: Vec<FeedbackEntry> = Vec::new();
@@ -133,10 +130,9 @@ async fn run_read(args: FeedbackReadArgs) -> anyhow::Result<()> {
                 continue;
             };
             let feedback_dir = agent_entry.path().join("feedback");
-            // Try full SHA then short (first 7 chars)
             let candidates = [
-                feedback_dir.join(format!("{sha_str}.md")),
-                feedback_dir.join(format!("{}.md", &sha_str[..sha_str.len().min(7)])),
+                feedback_dir.join(format!("{full_sha}.md")),
+                feedback_dir.join(format!("{short_sha}.md")),
             ];
             for path in &candidates {
                 if path.exists() {
@@ -162,7 +158,7 @@ async fn run_read(args: FeedbackReadArgs) -> anyhow::Result<()> {
     entries.sort_by(|a, b| a.author.cmp(&b.author));
 
     if entries.is_empty() {
-        let short = &sha_str[..sha_str.len().min(7)];
+        let short = &full_sha[..full_sha.len().min(7)];
         println!("no feedback for {short}");
         return Ok(());
     }
@@ -182,7 +178,7 @@ async fn run_read(args: FeedbackReadArgs) -> anyhow::Result<()> {
             .collect();
         println!("{}", serde_json::to_string_pretty(&json)?);
     } else {
-        let short = &sha_str[..sha_str.len().min(7)];
+        let short = &full_sha[..full_sha.len().min(7)];
         println!("commit {short}");
         for e in &entries {
             let verdict_str = match e.verdict {

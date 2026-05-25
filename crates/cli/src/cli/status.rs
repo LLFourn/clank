@@ -87,16 +87,6 @@ fn select_plans(
     Ok(state.fold.plans.keys().cloned().collect())
 }
 
-/// Marker carried via `anyhow::Error::context` so `main` can map an
-/// "ambiguous active plans" error to exit code 3 without coupling
-/// the rest of the CLI to a custom error enum.
-#[derive(Debug, Clone, Copy)]
-pub struct ExitCode(pub i32);
-impl std::fmt::Display for ExitCode {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "exit_code:{}", self.0)
-    }
-}
 
 fn build_json(
     basename: &str,
