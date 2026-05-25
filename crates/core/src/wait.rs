@@ -433,9 +433,8 @@ fn reviewer_item(view: &PlanView, author: &AgentLabel) -> WaitItem {
     let mode = filename_mode(&view.reviewable_shas);
     let stem = filename_stem(&view.latest_reviewable_sha, mode);
     let path = format!(
-        ".clank/agents/{}/feedback/{}/{}.md",
+        ".clank/agents/{}/feedback/{}.md",
         author.as_str(),
-        view.plan.as_str(),
         stem,
     );
     WaitItem::Reviewer {
@@ -516,9 +515,8 @@ mod tests {
         assert_eq!(out.len(), 1);
         match &out[0] {
             WaitItem::Reviewer { feedback_path, .. } => {
-                // New layout: .clank/agents/<author>/feedback/<plan>/<stem>.md
                 assert!(
-                    feedback_path.starts_with(".clank/agents/anyone/feedback/a/"),
+                    feedback_path.starts_with(".clank/agents/anyone/feedback/"),
                     "got {feedback_path}"
                 );
                 assert!(feedback_path.ends_with(".md"));
@@ -545,7 +543,7 @@ mod tests {
         let out = derive_work(std::slice::from_ref(&v), &label("alice"), Role::Reviewers);
         match &out[0] {
             WaitItem::Reviewer { feedback_path, .. } => {
-                assert_eq!(feedback_path, ".clank/agents/alice/feedback/p/abcdef0.md");
+                assert_eq!(feedback_path, ".clank/agents/alice/feedback/abcdef0.md");
             }
             other => panic!("expected Reviewer, got {other:?}"),
         }
@@ -570,7 +568,7 @@ mod tests {
             WaitItem::Reviewer { feedback_path, .. } => {
                 assert_eq!(
                     feedback_path,
-                    &format!(".clank/agents/alice/feedback/p/{}.md", b.as_str())
+                    &format!(".clank/agents/alice/feedback/{}.md", b.as_str())
                 );
             }
             other => panic!("expected Reviewer, got {other:?}"),

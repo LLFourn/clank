@@ -914,8 +914,8 @@ pub fn collect_feedback_files(repo_root: &Path) -> Result<Vec<FeedbackBlob>, Git
         return Ok(Vec::new());
     }
     let mut paths = Vec::new();
-    // Depth from `agents/`: <author>/feedback/<target>/<ref>.md = 4 segments.
-    walk_files(&agents_root, 4, &mut paths).map_err(|e| GitIoError::Parse {
+    // Depth from `agents/`: <author>/feedback/<ref>.md = 3 segments.
+    walk_files(&agents_root, 3, &mut paths).map_err(|e| GitIoError::Parse {
         context: "walk agents dir".into(),
         detail: format!("{e}"),
     })?;

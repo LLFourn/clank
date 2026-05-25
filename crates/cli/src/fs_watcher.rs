@@ -62,7 +62,7 @@ pub fn path_to_signal(
         return Some(signal);
     }
 
-    // .clank/agents/<author>/feedback/<target>/<commit-ref>.md
+    // .clank/agents/<author>/feedback/<commit-ref>.md
     if let Ok(rest) = rel.strip_prefix(".clank") {
         if let Some(parsed) = parse_feedback_path(rest) {
             return Some(match event_kind {
@@ -203,15 +203,14 @@ mod tests {
     }
 
     #[test]
-    fn feedback_canonical_path() {
+    fn feedback_flat_path() {
         let sig = path_to_signal(
-            &repo().join(".clank/agents/alice/feedback/foo/abc1234.md"),
+            &repo().join(".clank/agents/alice/feedback/abc1234.md"),
             &repo(),
             FsEventKind::CreatedOrModified,
         );
         match sig {
             Some(FilesystemSignal::FeedbackWritten { parsed }) => {
-                assert_eq!(parsed.plan_key().unwrap().as_str(), "foo");
                 assert_eq!(parsed.author.as_str(), "alice");
                 assert_eq!(parsed.target_ref.as_str(), "abc1234");
             }
@@ -220,20 +219,13 @@ mod tests {
     }
 
     #[test]
-    fn feedback_ad_hoc_path() {
+    fn old_plan_scoped_feedback_not_parsed() {
         let sig = path_to_signal(
-            &repo().join(".clank/agents/codex/feedback/_/abc1234.md"),
+            &repo().join(".clank/agents/codex/feedback/foo/abc1234.md"),
             &repo(),
             FsEventKind::CreatedOrModified,
         );
-        match sig {
-            Some(FilesystemSignal::FeedbackWritten { parsed }) => {
-                assert!(parsed.plan_key().is_none());
-                assert_eq!(parsed.author.as_str(), "codex");
-                assert_eq!(parsed.target_ref.as_str(), "abc1234");
-            }
-            other => panic!("expected FeedbackWritten, got {other:?}"),
-        }
+        assert!(sig.is_none());
     }
 
     #[test]
@@ -251,7 +243,7 @@ mod tests {
     #[test]
     fn feedback_removed() {
         let sig = path_to_signal(
-            &repo().join(".clank/agents/bob/feedback/foo/def5678.md"),
+            &repo().join(".clank/agents/bob/feedback/def5678.md"),
             &repo(),
             FsEventKind::Removed,
         );

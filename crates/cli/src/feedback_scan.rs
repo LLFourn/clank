@@ -1,16 +1,12 @@
-//! CLI-side IO: walk
-//! `.clank/agents/<author>/feedback/<plan>/<commit-ref>.md`
+//! CLI-side IO: walk `.clank/agents/<author>/feedback/<sha>.md`
 //! into a typed [`FeedbackView`]. Both `status` / `wfw` and the
 //! `preview` gate-computation consume the result.
-//!
-//! Pure interpretation of the parsed bodies (verdict → state
-//! machine, participant set, etc.) lives in `clank_core::plan_view`.
 
 use std::collections::BTreeMap;
 use std::path::Path;
 
-use crate::disk_format::{FeedbackTarget, parse_feedback_path, parse_verdict};
-use crate::lifecycle::{AgentLabel, CommitSha, PlanKey, content_hash};
+use crate::disk_format::{parse_feedback_path, parse_verdict};
+use crate::lifecycle::{AgentLabel, CommitSha, content_hash};
 use clank_core::feedback_view::{CommitFeedback, FeedbackEntry, FeedbackView};
 
 #[derive(Debug, thiserror::Error)]
@@ -19,25 +15,15 @@ pub enum FeedbackScanError {
     Io(#[from] std::io::Error),
 }
 
-/// Build a `FeedbackView` for `plan` by walking
-/// `.clank/agents/*/feedback/<plan>/*.md`.
+/// Build a `FeedbackView` by walking
+/// `.clank/agents/*/feedback/<sha>.md`.
 ///
-/// `reviewable_shas` is the cumulative list of reviewable commits
-/// (chronological); pass `state.fold.plans[plan].commits` filtered
-/// to `touched_plan || touched_code`. Result `per_commit` is in
-/// the same order.
-///
-/// Files whose stem doesn't resolve against `reviewable_shas` —
-/// orphans from rewritten history, or just a typo — are silently
-/// dropped. The reader doesn't error on missing directories
-/// either: a brand-new repo with no `.clank/agents/` yields an
-/// empty `FeedbackView` for every sha.
+/// `reviewable_shas` scopes which commits we care about;
+/// feedback for shas not in this set is silently dropped.
 pub fn scan_feedback(
     repo: &Path,
-    plan: &PlanKey,
     reviewable_shas: &[CommitSha],
 ) -> Result<FeedbackView, FeedbackScanError> {
-    // Result accumulator: one bucket per reviewable sha.
     let mut buckets: BTreeMap<CommitSha, BTreeMap<AgentLabel, FeedbackEntry>> = reviewable_shas
         .iter()
         .cloned()
@@ -54,14 +40,17 @@ pub fn scan_feedback(
     };
 
     for agent_entry in agent_dirs.flatten() {
-        let plan_dir = agent_entry.path().join("feedback").join(plan.as_str());
-        let files = match std::fs::read_dir(&plan_dir) {
+        let feedback_dir = agent_entry.path().join("feedback");
+        let files = match std::fs::read_dir(&feedback_dir) {
             Ok(it) => it,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
             Err(e) => return Err(e.into()),
         };
         for file_entry in files.flatten() {
             let abs = file_entry.path();
+            if abs.is_dir() {
+                continue;
+            }
             let rel = match abs.strip_prefix(repo.join(".clank")) {
                 Ok(r) => r.to_path_buf(),
                 Err(_) => continue,
@@ -69,15 +58,6 @@ pub fn scan_feedback(
             let Some(parsed) = parse_feedback_path(&rel) else {
                 continue;
             };
-            // Defensive — caller asked for `plan` so AdHoc and
-            // other-plan files shouldn't be here, but typed-skip
-            // anyway.
-            if parsed.target != FeedbackTarget::Plan(plan.clone()) {
-                continue;
-            }
-            // Resolve the on-disk ref into a full sha via the
-            // reviewable-commit scope. Orphans + ambiguous refs
-            // drop here — the scanner doesn't care which.
             let Ok(full_sha) = parsed.target_ref.resolve_against(reviewable_shas) else {
                 continue;
             };
@@ -94,9 +74,6 @@ pub fn scan_feedback(
                 body_hash: content_hash(&body),
                 source_path,
             };
-            // `buckets[full_sha]` always exists because
-            // `resolve_against` only returns shas from
-            // `reviewable_shas`.
             buckets
                 .entry(full_sha)
                 .or_default()
@@ -140,27 +117,25 @@ mod tests {
     fn scans_two_commits_with_interleaved_authors() {
         let dir = TempDir::new().unwrap();
         let repo = dir.path();
-        let key = PlanKey::parse("foo").unwrap();
         let s1 = full_sha("1111");
         let s2 = full_sha("2222");
-        // Short stem for both — first 7 chars unique.
         write(
             repo,
-            &format!(".clank/agents/alice/feedback/foo/{}.md", &s1.as_str()[..7]),
+            &format!(".clank/agents/alice/feedback/{}.md", &s1.as_str()[..7]),
             "APPROVE\n\nlgtm\n",
         );
         write(
             repo,
-            &format!(".clank/agents/bob/feedback/foo/{}.md", &s1.as_str()[..7]),
+            &format!(".clank/agents/bob/feedback/{}.md", &s1.as_str()[..7]),
             "REQUEST_CHANGES\n\nnope\n",
         );
         write(
             repo,
-            &format!(".clank/agents/alice/feedback/foo/{}.md", &s2.as_str()[..7]),
+            &format!(".clank/agents/alice/feedback/{}.md", &s2.as_str()[..7]),
             "APPROVE\n\nstill lgtm\n",
         );
 
-        let view = scan_feedback(repo, &key, &[s1.clone(), s2.clone()]).unwrap();
+        let view = scan_feedback(repo, &[s1.clone(), s2.clone()]).unwrap();
         assert_eq!(view.per_commit.len(), 2);
         assert_eq!(view.per_commit[0].sha, s1);
         assert_eq!(view.per_commit[0].entries.len(), 2);
@@ -172,14 +147,13 @@ mod tests {
     fn reader_finds_short_path() {
         let dir = TempDir::new().unwrap();
         let repo = dir.path();
-        let key = PlanKey::parse("foo").unwrap();
         let s1 = full_sha("abcdef0");
         write(
             repo,
-            ".clank/agents/alice/feedback/foo/abcdef0.md",
+            ".clank/agents/alice/feedback/abcdef0.md",
             "APPROVE\n",
         );
-        let view = scan_feedback(repo, &key, &[s1.clone()]).unwrap();
+        let view = scan_feedback(repo, &[s1.clone()]).unwrap();
         assert_eq!(view.per_commit[0].entries.len(), 1);
     }
 
@@ -187,14 +161,13 @@ mod tests {
     fn reader_finds_full_sha_path() {
         let dir = TempDir::new().unwrap();
         let repo = dir.path();
-        let key = PlanKey::parse("foo").unwrap();
         let s1 = full_sha("abcdef0");
         write(
             repo,
-            &format!(".clank/agents/alice/feedback/foo/{}.md", s1.as_str()),
+            &format!(".clank/agents/alice/feedback/{}.md", s1.as_str()),
             "APPROVE\n",
         );
-        let view = scan_feedback(repo, &key, &[s1.clone()]).unwrap();
+        let view = scan_feedback(repo, &[s1.clone()]).unwrap();
         assert_eq!(view.per_commit[0].entries.len(), 1);
     }
 
@@ -202,23 +175,20 @@ mod tests {
     fn orphan_ref_is_dropped() {
         let dir = TempDir::new().unwrap();
         let repo = dir.path();
-        let key = PlanKey::parse("foo").unwrap();
         let s1 = full_sha("1111111");
-        // Write feedback for a sha that's NOT in the reviewable scope.
         write(
             repo,
-            ".clank/agents/alice/feedback/foo/deadbee.md",
+            ".clank/agents/alice/feedback/deadbee.md",
             "APPROVE\n",
         );
-        let view = scan_feedback(repo, &key, &[s1.clone()]).unwrap();
+        let view = scan_feedback(repo, &[s1.clone()]).unwrap();
         assert_eq!(view.per_commit[0].entries.len(), 0);
     }
 
     #[test]
     fn missing_agents_root_is_not_an_error() {
         let dir = TempDir::new().unwrap();
-        let key = PlanKey::parse("foo").unwrap();
-        let view = scan_feedback(dir.path(), &key, &[full_sha("1111")]).unwrap();
+        let view = scan_feedback(dir.path(), &[full_sha("1111")]).unwrap();
         assert_eq!(view.per_commit.len(), 1);
         assert!(view.per_commit[0].entries.is_empty());
     }
@@ -227,31 +197,29 @@ mod tests {
     fn non_md_files_ignored() {
         let dir = TempDir::new().unwrap();
         let repo = dir.path();
-        let key = PlanKey::parse("foo").unwrap();
         let s1 = full_sha("1111");
         write(
             repo,
-            &format!(".clank/agents/alice/feedback/foo/{}.md", &s1.as_str()[..7]),
+            &format!(".clank/agents/alice/feedback/{}.md", &s1.as_str()[..7]),
             "APPROVE\n",
         );
         write(
             repo,
-            ".clank/agents/alice/feedback/foo/notes.txt",
+            ".clank/agents/alice/feedback/notes.txt",
             "ignore me",
         );
-        let view = scan_feedback(repo, &key, &[s1]).unwrap();
+        let view = scan_feedback(repo, &[s1]).unwrap();
         assert_eq!(view.per_commit[0].entries.len(), 1);
     }
 
     #[test]
-    fn other_plan_files_ignored() {
+    fn old_plan_scoped_layout_ignored() {
         let dir = TempDir::new().unwrap();
         let repo = dir.path();
-        let key = PlanKey::parse("foo").unwrap();
         let s1 = full_sha("1111");
         write(
             repo,
-            &format!(".clank/agents/alice/feedback/foo/{}.md", &s1.as_str()[..7]),
+            &format!(".clank/agents/alice/feedback/{}.md", &s1.as_str()[..7]),
             "APPROVE\n",
         );
         write(
@@ -259,9 +227,7 @@ mod tests {
             &format!(".clank/agents/alice/feedback/bar/{}.md", &s1.as_str()[..7]),
             "APPROVE\n",
         );
-        let view = scan_feedback(repo, &key, &[s1]).unwrap();
-        // `bar` plan file not visible — `scan_feedback(plan=foo)`
-        // descends only into `agents/*/feedback/foo/`.
+        let view = scan_feedback(repo, &[s1]).unwrap();
         assert_eq!(view.per_commit[0].entries.len(), 1);
     }
 }

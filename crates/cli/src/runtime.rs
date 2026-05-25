@@ -192,19 +192,35 @@ impl Runtime {
                 )
                 .await;
             }
-            FilesystemSignal::FeedbackWritten { parsed }
-            | FilesystemSignal::FeedbackRemoved { parsed } => {
-                let session_id = match parsed.target.clone() {
-                    crate::disk_format::FeedbackTarget::Plan(k) => k,
-                    crate::disk_format::FeedbackTarget::AdHoc => return Ok(()),
-                };
-                self.emit_plan_event(
-                    repo_root,
-                    &session_id,
-                    now,
-                    PlanEventPayload::FeedbackChanged {},
-                )
-                .await;
+            FilesystemSignal::FeedbackWritten { .. }
+            | FilesystemSignal::FeedbackRemoved { .. } => {
+                {
+                    let clank = self.state.lock().await;
+                    if !clank.repos.contains_key(repo_root) {
+                        return Ok(());
+                    }
+                }
+                let fresh = rebuild_repo(repo_root).await?;
+                let fresh_digest = fresh.digest();
+                {
+                    let mut clank = self.state.lock().await;
+                    if !clank.repos.contains_key(repo_root) {
+                        return Ok(());
+                    }
+                    let prior_digest = clank.repos.get(repo_root).map(|r| r.digest());
+                    let changed = prior_digest.as_ref() != Some(&fresh_digest);
+                    clank.repos.insert(repo_root.to_path_buf(), fresh);
+                    if changed {
+                        self.push_event(
+                            &mut clank,
+                            LiveEvent::Repo(RepoEvent {
+                                ts: now,
+                                repo: repo_root.to_path_buf(),
+                                payload: RepoEventPayload::RepoRebuilt {},
+                            }),
+                        );
+                    }
+                }
             }
         }
         Ok(())

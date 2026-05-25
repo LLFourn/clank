@@ -8,7 +8,7 @@ description: Multi-agent peer review around plans. Use clank commands to partici
 Clank is a peer-review workflow tool for multi-agent development.
 Each repo's `.clank/` directory contains:
 - `plans/` — one `.md` per active plan
-- `agents/<label>/feedback/<plan>/<commit>.md` — per-agent review notes
+- `agents/<label>/feedback/<commit>.md` — per-agent review notes
 - `finished/` — finalized plans
 - `config.json` — repo-level config (designated master agent)
 - `agents/<label>/config.json` — per-agent local config (gitignored)
@@ -19,13 +19,12 @@ Each repo's `.clank/` directory contains:
 - `clank wfw` — wait-for-work; long-polls for the next thing this
   agent should do. Author + role inferred from your session
   binding (`clank as`) — no flags needed in the common case.
-- `clank feedback write --plan X --commit Y --verdict
+- `clank feedback write --commit Y --verdict
   approve|request-changes --author <label> -m "<message>"` —
   write your review feedback. `-m` is the review message (like
   `git commit -m`): first line is a summary, then details. The
-  tool prepends the verdict to the file. Do not include the plan
-  name in the summary. Write messages as you would a commit
-  message. Examples:
+  tool prepends the verdict to the file. Write messages as you
+  would a commit message. Examples:
   `clank feedback write ... --verdict approve -m "clean impl, one non-blocking nit"`
   `clank feedback write ... --verdict request-changes -m "overwrought API in foo.rs"`
 - `clank finish <plan>` — finalize an approved plan (master only).

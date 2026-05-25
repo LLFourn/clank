@@ -121,7 +121,7 @@ async fn build_view(
         None => return Ok(None),
     };
     let reviewable = ps.reviewable_shas();
-    let feedback = scan_feedback(repo, plan, &reviewable)?;
+    let feedback = scan_feedback(repo, &reviewable)?;
     let plan_path = format!(".clank/plans/{}.md", plan.as_str());
     let worktree = read_worktree_facts(repo, &plan_path, state.head.as_ref()).await?;
     Ok(project(&state.fold, plan, &feedback, &worktree))

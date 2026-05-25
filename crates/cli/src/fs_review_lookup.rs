@@ -1,12 +1,10 @@
 //! Filesystem implementation of `ReviewLookup` for the CLI.
 //!
-//! Scans `.clank/agents/*/feedback/` for review files matching a
-//! given commit SHA. Supports both the old plan-scoped layout
-//! (`<plan>/<sha>.md`) and the new flat layout (`<sha>.md`).
+//! Scans `.clank/agents/*/feedback/<sha>.md` for review files.
 
 use std::path::Path;
 
-use clank_core::ids::{AgentLabel, CommitSha, PlanKey};
+use clank_core::ids::{CommitSha, PlanKey};
 use clank_core::vocab::{PlanWorktreeStatus, Verdict};
 use clank_core::wait::{ReviewEntry, ReviewLookup};
 
@@ -33,14 +31,17 @@ impl ReviewLookup for FsReviewLookup<'_> {
 
         for agent_entry in agents.flatten() {
             let agent_name = agent_entry.file_name();
-            let Some(label) = agent_name.to_str().and_then(|s| AgentLabel::parse(s).ok()) else {
+            let Some(label) =
+                agent_name
+                    .to_str()
+                    .and_then(|s| clank_core::ids::AgentLabel::parse(s).ok())
+            else {
                 continue;
             };
             let feedback_dir = agent_entry.path().join("feedback");
             if !feedback_dir.is_dir() {
                 continue;
             }
-            // Scan flat layout: feedback/<sha>.md
             if let Some(verdict) = try_read_verdict(&feedback_dir.join(format!("{sha_stem}.md"))) {
                 entries.push(ReviewEntry {
                     author: label.clone(),
@@ -48,37 +49,11 @@ impl ReviewLookup for FsReviewLookup<'_> {
                 });
                 continue;
             }
-            // Scan short-sha flat: feedback/<short>.md
             if let Some(verdict) = try_read_verdict(&feedback_dir.join(format!("{sha_short}.md"))) {
                 entries.push(ReviewEntry {
-                    author: label.clone(),
+                    author: label,
                     verdict,
                 });
-                continue;
-            }
-            // Scan old plan-scoped layout: feedback/<plan>/<sha>.md
-            if let Ok(plan_dirs) = std::fs::read_dir(&feedback_dir) {
-                for pd in plan_dirs.flatten() {
-                    if !pd.file_type().map_or(false, |t| t.is_dir()) {
-                        continue;
-                    }
-                    let full = pd.path().join(format!("{sha_stem}.md"));
-                    if let Some(verdict) = try_read_verdict(&full) {
-                        entries.push(ReviewEntry {
-                            author: label.clone(),
-                            verdict,
-                        });
-                        break;
-                    }
-                    let short_path = pd.path().join(format!("{sha_short}.md"));
-                    if let Some(verdict) = try_read_verdict(&short_path) {
-                        entries.push(ReviewEntry {
-                            author: label.clone(),
-                            verdict,
-                        });
-                        break;
-                    }
-                }
             }
         }
         entries

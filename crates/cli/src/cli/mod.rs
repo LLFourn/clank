@@ -218,9 +218,8 @@ pub struct FeedbackArgs {
 #[derive(clap::Subcommand, Debug)]
 pub enum FeedbackCmd {
     /// Write a feedback file: prepends the `--verdict` to the
-    /// `-m` message, resolves `--commit` against the plan's
-    /// reviewable shas, and writes
-    /// `.clank/agents/<author>/feedback/<plan>/<stem>.md`
+    /// `-m` message, resolves `--commit` against all known shas,
+    /// and writes `.clank/agents/<author>/feedback/<sha>.md`
     /// atomically.
     Write(FeedbackWriteArgs),
 }
@@ -230,24 +229,15 @@ pub struct FeedbackWriteArgs {
     /// Repo root. Defaults to the cwd's git toplevel.
     #[arg(long, value_name = "PATH")]
     pub repo: Option<PathBuf>,
-    /// Plan stem (e.g. `clank-agent-integration`). Same parser as
-    /// `clank finish`/`clank status` — `<stem>`, `<stem>.md`, or
-    /// `<basename>/<stem>.md`.
-    #[arg(long, value_name = "PLAN")]
-    pub plan: String,
-    /// Commit ref (7+ lowercase hex chars). Resolved against the
-    /// plan's reviewable commits; ambiguous prefixes are an error.
+    /// Commit ref (7+ lowercase hex chars). Resolved against
+    /// known commits; ambiguous prefixes are an error.
     #[arg(long, value_name = "SHA")]
     pub commit: String,
     /// Verdict. Prepended to the body as `APPROVE <body>` or
-    /// `REQUEST_CHANGES <body>` — the body should start with a
-    /// one-line summary, then a blank line, then details.
+    /// `REQUEST_CHANGES <body>`.
     #[arg(long, value_enum)]
     pub verdict: VerdictArg,
-    /// Agent label to attribute the feedback to. Required for
-    /// now; will become optional when the identity resolver lands
-    /// (then defaults via `CLAUDE_CODE_SESSION_ID` /
-    /// `CODEX_THREAD_ID`).
+    /// Agent label to attribute the feedback to.
     #[arg(long, value_name = "LABEL")]
     pub author: String,
     /// Review message (like `git commit -m`). First line is the

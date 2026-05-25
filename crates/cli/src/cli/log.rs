@@ -67,34 +67,19 @@ pub async fn run(args: LogArgs) -> anyhow::Result<()> {
     let reviewable_shas: Vec<CommitSha> = filtered
         .iter()
         .filter_map(|e| match e {
-            LogEvent::PlanCommit { sha, .. } | LogEvent::PlanIntro { sha, .. } => Some(sha.clone()),
+            LogEvent::PlanCommit { sha, .. }
+            | LogEvent::PlanIntro { sha, .. }
+            | LogEvent::AdHoc { sha, .. } => Some(sha.clone()),
             _ => None,
         })
         .collect();
 
-    let plan_keys: Vec<PlanKey> = {
-        let mut keys: Vec<PlanKey> = Vec::new();
-        for e in &filtered {
-            let k = match e {
-                LogEvent::PlanIntro { plan, .. }
-                | LogEvent::PlanCommit { plan, .. }
-                | LogEvent::PlanFinalized { plan, .. }
-                | LogEvent::PlanDeleted { plan, .. } => plan,
-                LogEvent::AdHoc { .. } => continue,
-            };
-            if !keys.contains(k) {
-                keys.push(k.clone());
-            }
-        }
-        keys
-    };
-
     if args.json {
-        print_json(&filtered, &repo, &plan_keys, &reviewable_shas)?;
+        print_json(&filtered, &repo, &reviewable_shas)?;
     } else if args.oneline {
-        print_oneline(&filtered, &repo, &plan_keys, &reviewable_shas)?;
+        print_oneline(&filtered, &repo, &reviewable_shas)?;
     } else {
-        print_human(&filtered, &repo, &plan_keys, &reviewable_shas)?;
+        print_human(&filtered, &repo, &reviewable_shas)?;
     }
     Ok(())
 }
@@ -177,31 +162,28 @@ struct Review {
 
 fn collect_reviews(
     repo: &Path,
-    plan_keys: &[PlanKey],
     reviewable_shas: &[CommitSha],
-) -> std::collections::BTreeMap<(String, String), Vec<Review>> {
+) -> std::collections::BTreeMap<String, Vec<Review>> {
     use clank_core::feedback_body::FeedbackBody;
     let mut out = std::collections::BTreeMap::new();
-    for key in plan_keys {
-        if let Ok(fv) = scan_feedback(repo, key, reviewable_shas) {
-            for cf in &fv.per_commit {
-                for (author, entry) in &cf.entries {
-                    let (summary, body) = std::fs::read_to_string(repo.join(&entry.source_path))
-                        .ok()
-                        .map(|raw| {
-                            let fb = FeedbackBody::parse(&raw);
-                            (fb.summary(), fb.details())
-                        })
-                        .unwrap_or_default();
-                    out.entry((key.as_str().to_string(), cf.sha.as_str().to_string()))
-                        .or_insert_with(Vec::new)
-                        .push(Review {
-                            author: author.as_str().to_string(),
-                            verdict: entry.verdict,
-                            summary,
-                            body,
-                        });
-                }
+    if let Ok(fv) = scan_feedback(repo, reviewable_shas) {
+        for cf in &fv.per_commit {
+            for (author, entry) in &cf.entries {
+                let (summary, body) = std::fs::read_to_string(repo.join(&entry.source_path))
+                    .ok()
+                    .map(|raw| {
+                        let fb = FeedbackBody::parse(&raw);
+                        (fb.summary(), fb.details())
+                    })
+                    .unwrap_or_default();
+                out.entry(cf.sha.as_str().to_string())
+                    .or_insert_with(Vec::new)
+                    .push(Review {
+                        author: author.as_str().to_string(),
+                        verdict: entry.verdict,
+                        summary,
+                        body,
+                    });
             }
         }
     }
@@ -246,10 +228,9 @@ fn verdict_mark(v: Verdict, c: bool) -> String {
 fn print_human(
     events: &[&LogEvent],
     repo: &Path,
-    plan_keys: &[PlanKey],
     shas: &[CommitSha],
 ) -> anyhow::Result<()> {
-    let reviews = collect_reviews(repo, plan_keys, shas);
+    let reviews = collect_reviews(repo, shas);
     let c = color();
     for (i, event) in events.iter().enumerate() {
         if i > 0 {
@@ -312,8 +293,7 @@ fn print_human(
         for line in body.lines() {
             println!("    {line}");
         }
-        let key = (plan.as_str().to_string(), sha.as_str().to_string());
-        if let Some(rs) = reviews.get(&key) {
+        if let Some(rs) = reviews.get(sha.as_str()) {
             for r in rs {
                 let m = verdict_mark(r.verdict, c);
                 let snip = if r.summary.is_empty() {
@@ -341,13 +321,12 @@ fn print_human(
 fn print_oneline(
     events: &[&LogEvent],
     repo: &Path,
-    plan_keys: &[PlanKey],
     shas: &[CommitSha],
 ) -> anyhow::Result<()> {
-    let reviews = collect_reviews(repo, plan_keys, shas);
+    let reviews = collect_reviews(repo, shas);
     let c = color();
     for event in events {
-        let (plan, sha, subj_override) = match event {
+        let (_plan, sha, subj_override) = match event {
             LogEvent::PlanIntro { plan, sha, .. } | LogEvent::PlanCommit { plan, sha, .. } => {
                 (plan, sha, None)
             }
@@ -368,13 +347,12 @@ fn print_oneline(
             }
         };
         let subj = subj_override.unwrap_or_else(|| commit_subject(repo, sha));
-        let key = (plan.as_str().to_string(), sha.as_str().to_string());
         if c {
             println!("{Y}{}{Z} {subj}", short(sha));
         } else {
             println!("{} {subj}", short(sha));
         }
-        if let Some(rs) = reviews.get(&key) {
+        if let Some(rs) = reviews.get(sha.as_str()) {
             for r in rs {
                 let m = verdict_mark(r.verdict, c);
                 let snip = if r.summary.is_empty() {
@@ -396,10 +374,9 @@ fn print_oneline(
 fn print_json(
     events: &[&LogEvent],
     repo: &Path,
-    plan_keys: &[PlanKey],
     shas: &[CommitSha],
 ) -> anyhow::Result<()> {
-    let reviews = collect_reviews(repo, plan_keys, shas);
+    let reviews = collect_reviews(repo, shas);
     let mut out: Vec<serde_json::Value> = Vec::new();
     for event in events {
         let obj = match event {
@@ -430,19 +407,17 @@ fn print_json(
             }),
         };
         out.push(obj);
-        let (p, s) = match event {
-            LogEvent::PlanIntro { plan, sha, .. }
-            | LogEvent::PlanCommit { plan, sha, .. }
-            | LogEvent::PlanFinalized { plan, sha, .. }
-            | LogEvent::PlanDeleted { plan, sha, .. } => {
-                (plan.as_str().to_string(), sha.as_str().to_string())
-            }
-            LogEvent::AdHoc { .. } => continue,
+        let sha_str = match event {
+            LogEvent::PlanIntro { sha, .. }
+            | LogEvent::PlanCommit { sha, .. }
+            | LogEvent::PlanFinalized { sha, .. }
+            | LogEvent::PlanDeleted { sha, .. }
+            | LogEvent::AdHoc { sha, .. } => sha.as_str(),
         };
-        if let Some(rs) = reviews.get(&(p.clone(), s.clone())) {
+        if let Some(rs) = reviews.get(sha_str) {
             for r in rs {
                 out.push(serde_json::json!({
-                    "kind": "review", "plan": p, "sha": s,
+                    "kind": "review", "sha": sha_str,
                     "author": r.author, "verdict": r.verdict,
                 }));
             }

@@ -145,7 +145,7 @@ fn log_shows_intro_and_reviews_for_active_plan() {
 
     write(
         repo,
-        &format!(".clank/agents/alice/feedback/foo/{intro_sha}.md"),
+        &format!(".clank/agents/alice/feedback/{intro_sha}.md"),
         "APPROVE\n\nlgtm\n",
     );
 
@@ -173,7 +173,7 @@ fn log_json_emits_review_as_separate_event() {
 
     write(
         repo,
-        &format!(".clank/agents/alice/feedback/foo/{intro_sha}.md"),
+        &format!(".clank/agents/alice/feedback/{intro_sha}.md"),
         "REQUEST_CHANGES\n\nfix it\n",
     );
 
@@ -202,7 +202,7 @@ fn log_finished_plan_shows_full_timeline() {
 
     write(
         repo,
-        &format!(".clank/agents/codex/feedback/bar/{intro_sha}.md"),
+        &format!(".clank/agents/codex/feedback/{intro_sha}.md"),
         "APPROVE\n\nok\n",
     );
 
@@ -212,7 +212,7 @@ fn log_finished_plan_shows_full_timeline() {
 
     write(
         repo,
-        &format!(".clank/agents/codex/feedback/bar/{impl_sha}.md"),
+        &format!(".clank/agents/codex/feedback/{impl_sha}.md"),
         "APPROVE\n\nimpl ok\n",
     );
 

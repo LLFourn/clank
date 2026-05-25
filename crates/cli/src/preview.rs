@@ -5,7 +5,6 @@
 use std::collections::BTreeSet;
 use std::path::Path;
 
-use crate::disk_format::FeedbackTarget;
 use crate::feedback_scan::scan_feedback;
 use crate::git_io::{
     GitIoError, commit_parent_count, diff_tree_changes, first_parent_commits_to, rev_parse_head,
@@ -478,7 +477,7 @@ fn compute_gate(
         }
     }
 
-    let view = scan_feedback(repo_root, plan_key, &reviewable)?;
+    let view = scan_feedback(repo_root, &reviewable)?;
 
     let mut participants: Vec<AgentLabel> = Vec::new();
     let mut target_idx: Option<usize> = None;
@@ -536,10 +535,6 @@ fn compute_gate(
     Ok((state_enum, sealed_approvals))
 }
 
-// Drop unused — keep the FeedbackTarget import live so the parser
-// stays in the module graph.
-#[allow(dead_code)]
-fn _feedback_target_marker(_: FeedbackTarget) {}
 
 #[cfg(test)]
 mod tests {

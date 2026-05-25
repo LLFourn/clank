@@ -1,8 +1,4 @@
 //! Integration tests for `clank feedback write`.
-//!
-//! Spawns the real `clank` binary against a temp git repo with one
-//! active plan + intro commit, then verifies the write produces the
-//! expected file (or fails with the expected diagnostic).
 
 use std::path::Path;
 use std::process::Command;
@@ -52,7 +48,6 @@ fn head_sha(repo: &Path) -> String {
     String::from_utf8(out.stdout).unwrap().trim().to_string()
 }
 
-/// Repo + one plan + an intro commit; returns (dir, head_sha).
 fn one_plan_repo() -> (tempfile::TempDir, String) {
     let dir = init_repo();
     let repo = dir.path();
@@ -79,7 +74,7 @@ fn run_feedback_write(repo: &Path, args: &[&str]) -> (std::process::ExitStatus, 
 }
 
 #[test]
-fn writes_approve_feedback_to_canonical_path() {
+fn writes_approve_feedback_to_flat_path() {
     let (dir, sha) = one_plan_repo();
     let repo = dir.path();
     let short = &sha[..7];
@@ -87,8 +82,6 @@ fn writes_approve_feedback_to_canonical_path() {
     let (status, stdout, stderr) = run_feedback_write(
         repo,
         &[
-            "--plan",
-            "foo",
             "--commit",
             short,
             "--verdict",
@@ -101,7 +94,7 @@ fn writes_approve_feedback_to_canonical_path() {
     );
 
     assert!(status.success(), "exit={status:?} stderr={stderr}");
-    let expected_rel = format!(".clank/agents/alice/feedback/foo/{short}.md");
+    let expected_rel = format!(".clank/agents/alice/feedback/{short}.md");
     assert!(
         stdout.trim().ends_with(&expected_rel),
         "stdout did not advertise expected path: {stdout}",
@@ -120,8 +113,6 @@ fn prepends_request_changes_verdict() {
     let (status, _stdout, _stderr) = run_feedback_write(
         repo,
         &[
-            "--plan",
-            "foo",
             "--commit",
             short,
             "--verdict",
@@ -134,7 +125,7 @@ fn prepends_request_changes_verdict() {
     );
 
     assert!(status.success());
-    let abs = repo.join(format!(".clank/agents/alice/feedback/foo/{short}.md"));
+    let abs = repo.join(format!(".clank/agents/alice/feedback/{short}.md"));
     let written = std::fs::read_to_string(&abs).expect("file exists");
     assert!(
         written.starts_with("REQUEST_CHANGES overwrought API in foo.rs"),
@@ -150,8 +141,6 @@ fn errors_on_unknown_commit_ref() {
     let (status, _stdout, stderr) = run_feedback_write(
         repo,
         &[
-            "--plan",
-            "foo",
             "--commit",
             "deadbeef",
             "--verdict",
@@ -165,35 +154,7 @@ fn errors_on_unknown_commit_ref() {
 
     assert!(!status.success());
     assert!(
-        stderr.contains("did not match any reviewable commit"),
+        stderr.contains("did not match any known commit"),
         "stderr missing resolution diag: {stderr}",
-    );
-}
-
-#[test]
-fn errors_on_inactive_plan() {
-    let (dir, sha) = one_plan_repo();
-    let repo = dir.path();
-
-    let (status, _stdout, stderr) = run_feedback_write(
-        repo,
-        &[
-            "--plan",
-            "bar",
-            "--commit",
-            &sha[..7],
-            "--verdict",
-            "approve",
-            "--author",
-            "alice",
-            "-m",
-            "lgtm",
-        ],
-    );
-
-    assert!(!status.success());
-    assert!(
-        stderr.contains("not active"),
-        "stderr missing inactive-plan diag: {stderr}",
     );
 }

@@ -131,6 +131,7 @@ dependencies = [
  "clap",
  "dunce",
  "filetime",
+ "libc",
  "notify",
  "notify-debouncer-full",
  "serde",

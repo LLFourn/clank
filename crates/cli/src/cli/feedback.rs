@@ -1,27 +1,15 @@
 //! `clank feedback write` — write a typed feedback file.
 //!
-//! Wraps the file-write at
-//! `.clank/agents/<author>/feedback/<plan>/<commit>.md` so:
-//! - Codex gets a stable command prefix to one-shot approve
-//!   (vs. re-prompting on every raw `apply_patch`).
-//! - The verdict header is validated against the `--verdict`
-//!   claim in one place (via `clank_core::feedback_body`).
-//! - The commit ref is resolved against the plan's reviewable
-//!   shas (short → long disambiguation; orphan refs are
-//!   rejected up-front).
-//! - The write is atomic (temp file + rename) so a crash
-//!   mid-write can't leave a half-written feedback file the
-//!   reviewer-scan would treat as `Unmarked`.
+//! Writes to `.clank/agents/<author>/feedback/<sha>.md`.
 
 use std::io::Write;
 use std::path::Path;
 
 use anyhow::Context;
 
-use super::{FeedbackCmd, FeedbackWriteArgs, repo_basename, resolve_repo};
-use crate::cli::plan_resolve::parse_arg;
-use crate::disk_format::{FeedbackTarget, feedback_path_wire};
-use crate::lifecycle::{AgentLabel, CommitRef, CommitSha, PlanKey};
+use super::{FeedbackCmd, FeedbackWriteArgs, resolve_repo};
+use crate::disk_format::feedback_path_wire;
+use crate::lifecycle::{AgentLabel, CommitRef, CommitSha};
 use clank_core::ids::CommitRefResolveError;
 
 pub async fn run(args: super::FeedbackArgs) -> anyhow::Result<()> {
@@ -32,11 +20,7 @@ pub async fn run(args: super::FeedbackArgs) -> anyhow::Result<()> {
 
 async fn run_write(args: FeedbackWriteArgs) -> anyhow::Result<()> {
     let repo = resolve_repo(args.repo.as_deref())?;
-    let basename = repo_basename(&repo)?;
 
-    let stem = parse_arg(&args.plan, &basename)?;
-    let plan =
-        PlanKey::parse(&stem).map_err(|e| anyhow::anyhow!("invalid plan stem `{stem}`: {e}"))?;
     let commit_ref = CommitRef::parse(&args.commit)
         .map_err(|e| anyhow::anyhow!("invalid --commit `{}`: {e}", args.commit))?;
     let author = AgentLabel::parse(&args.author)
@@ -52,52 +36,38 @@ async fn run_write(args: FeedbackWriteArgs) -> anyhow::Result<()> {
 
     let body = format!("{verdict_header} {}\n", args.message.trim());
 
-    // Write paths can't tolerate a stale fold: if a commit landed
-    // since the last cache entry, the reviewable set won't contain
-    // it and an otherwise-valid write would be rejected as orphan.
-    // Bypass the cache for this branch.
     let state =
         crate::rebuild::rebuild_repo_with_policy(&repo, crate::rebuild::CachePolicy::Bypass)
             .await
             .map_err(|e| anyhow::anyhow!("failed to fold repo `{}`: {e}", repo.display()))?;
 
-    let plan_state = state.fold.plans.get(&plan).ok_or_else(|| {
-        anyhow::anyhow!(
-            "plan `{}/{}.md` is not active in this repo. Feedback can only be \
-             written against in-flight plans.",
-            basename.as_str(),
-            plan.as_str(),
-        )
-    })?;
-
-    let reviewable = plan_state.reviewable_shas();
+    let mut all_shas: Vec<CommitSha> = Vec::new();
+    for ps in state.fold.plans.values() {
+        all_shas.extend(ps.reviewable_shas());
+    }
+    for ah in &state.fold.ad_hoc {
+        all_shas.push(ah.sha.clone());
+    }
 
     let target_sha = commit_ref
-        .resolve_against(&reviewable)
+        .resolve_against(&all_shas)
         .map_err(|e| match e {
             CommitRefResolveError::Orphan => anyhow::anyhow!(
-                "--commit `{}` did not match any reviewable commit for plan `{}`. \
-                 Reviewable shas: {}",
+                "--commit `{}` did not match any known commit. \
+                 Known shas: {}",
                 args.commit,
-                plan.as_str(),
-                format_short_list(&reviewable),
+                format_short_list(&all_shas),
             ),
             CommitRefResolveError::Ambiguous { matches } => anyhow::anyhow!(
-                "--commit `{}` is ambiguous (matched {} reviewable commits for plan \
-                 `{}`): {}. Pass a longer prefix or the full SHA.",
+                "--commit `{}` is ambiguous (matched {} commits): \
+                 {}. Pass a longer prefix or the full SHA.",
                 args.commit,
                 matches.len(),
-                plan.as_str(),
                 format_short_list(&matches),
             ),
         })?;
 
-    let wire_path = feedback_path_wire(
-        &author,
-        &FeedbackTarget::Plan(plan.clone()),
-        &target_sha,
-        &reviewable,
-    );
+    let wire_path = feedback_path_wire(&author, &target_sha, &all_shas);
     let abs_path = repo.join(&wire_path);
 
     if let Some(parent) = abs_path.parent() {
