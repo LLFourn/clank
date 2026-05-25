@@ -109,12 +109,16 @@ impl WorkStatus {
 
 `derive_status` computes gate states:
 - For each active plan: get reviewable SHAs from timeline,
-  call `reviews.reviews_for(sha)` for each, build cumulative
-  participants, compute gate + `waiting_on` on the latest.
-  Call `reviews.worktree_status(plan)` for commit routing.
+  call `reviews.reviews_for(sha)` on the latest reviewable.
+  Gate: any approve → approved, any request_changes →
+  changes_requested, else unreviewed. Call
+  `reviews.worktree_status(plan)` for commit routing.
 - For each ad-hoc commit (when `policy.force_review_on_misc_commits`):
-  call `reviews.reviews_for(sha)`, compute gate.
-  Respect `policy.ad_hoc_reviewers` in `work_for`.
+  call `reviews.reviews_for(sha)`. Same gate rule: any approve
+  → approved.
+
+Gate rule is intentionally simple: a single approve is enough
+to unblock. Cumulative participant tracking is deferred.
 
 `work_for` filters the objective state by role + author to
 produce actionable `WaitItem`s. This is the same data `clank
