@@ -102,12 +102,13 @@ events from each `apply_commit` call. `RepoState` result type
 extended to carry the events (or they're returned separately).
 
 `clank log` uses the cache to reach the range start quickly,
-then folds from there collecting log events. A warm cache whose
-head is at or before the range start provides the fold context;
-commits from the range start onward are always folded (not
-skipped), producing events. If the cache head is past the range
-start, fall back to a cold fold from root. No cache encoding
-changes needed — log events are never stored in the cache.
+then folds from there collecting log events. The cache anchor
+must be **strictly before** the first commit in the range (i.e.
+the parent of the range-start commit). A cache AT the range
+start is post-apply — folding that commit again would double-
+apply. If no cache exists at the parent, fall back to a cold
+fold from root. No cache encoding changes — log events are
+never stored in the cache.
 
 **`crates/cli/src/cli/log.rs`**: new file. Rebuilds the repo,
 filters log events by plan, scans feedback for the relevant
@@ -135,6 +136,9 @@ cache encoding.
 - Log JSON mode produces typed event array.
 - `apply_commit` return type change doesn't break any existing
   tests (callers updated to collect/discard events).
+- Warm-cache regression: create a cache at HEAD (past the plan's
+  intro), then run `clank log --plan <finished>`. Assert the
+  intro commit and all later events appear exactly once.
 
 ## Acceptance criteria
 
