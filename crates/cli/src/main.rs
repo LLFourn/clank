@@ -55,6 +55,12 @@ enum Command {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // Reset SIGPIPE to default so piping into `head` etc. doesn't
+    // panic on broken pipe.
+    #[cfg(unix)]
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+    }
     init_tracing();
     let cli_args = Cli::parse();
     let result = match cli_args.command {
