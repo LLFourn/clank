@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use clank_core::HookEvent;
@@ -73,8 +73,8 @@ pub fn load(repo_root: &Path) -> Config {
 
 fn load_with_home(repo_root: &Path, home: Option<&Path>) -> Config {
     let mut cfg = Config::default();
-    apply_layer(&mut cfg, home.map(|h| h.join(".clank/config.json")).as_deref());
-    apply_layer(&mut cfg, Some(&repo_root.join(".clank/config.json")));
+    let _ = apply_layer(&mut cfg, home.map(|h| h.join(".clank/config.json")).as_deref());
+    let _ = apply_layer(&mut cfg, Some(&repo_root.join(".clank/config.json")));
 
     // Merge legacy hooks.json files (repo overrides user) then apply as
     // fallback so config.json always wins.
@@ -91,48 +91,57 @@ fn load_with_home(repo_root: &Path, home: Option<&Path>) -> Config {
     cfg
 }
 
-fn apply_layer(cfg: &mut Config, path: Option<&Path>) {
-    let Some(path) = path else { return };
+fn apply_layer(cfg: &mut Config, path: Option<&Path>) -> BTreeSet<String> {
+    let mut present: BTreeSet<String> = BTreeSet::new();
+    let Some(path) = path else { return present };
     let body = match std::fs::read_to_string(path) {
         Ok(b) => b,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return present,
         Err(e) => {
             tracing::warn!(path = %path.display(), error = %e, "clank config: read failed; ignoring layer");
-            return;
+            return present;
         }
     };
     let parsed: ConfigFile = match serde_json::from_str(&body) {
         Ok(p) => p,
         Err(e) => {
             tracing::warn!(path = %path.display(), error = %e, "clank config: malformed JSON; ignoring layer");
-            return;
+            return present;
         }
     };
     if let Some(review) = parsed.review {
         if let Some(v) = review.adhoc_feedback {
             cfg.review.adhoc_feedback = v;
+            present.insert("review.adhoc_feedback".to_string());
         }
         if let Some(v) = review.plan_feedback {
             cfg.review.plan_feedback = v;
+            present.insert("review.plan_feedback".to_string());
         }
         if let Some(v) = review.require_commit_prefix {
             cfg.review.require_commit_prefix = v;
+            present.insert("review.require_commit_prefix".to_string());
         }
     }
     if let Some(hooks) = parsed.hooks {
         if let Some(v) = hooks.master_work {
             cfg.hooks.insert(HookEvent::MasterWork, v);
+            present.insert("hooks.master_work".to_string());
         }
         if let Some(v) = hooks.reviewer_work {
             cfg.hooks.insert(HookEvent::ReviewerWork, v);
+            present.insert("hooks.reviewer_work".to_string());
         }
         if let Some(v) = hooks.plan_finalized {
             cfg.hooks.insert(HookEvent::PlanFinalized, v);
+            present.insert("hooks.plan_finalized".to_string());
         }
         if let Some(v) = hooks.idle {
             cfg.hooks.insert(HookEvent::Idle, v);
+            present.insert("hooks.idle".to_string());
         }
     }
+    present
 }
 
 fn merge_legacy_file(out: &mut BTreeMap<HookEvent, String>, path: &Path) {
@@ -258,17 +267,16 @@ pub fn resolve_key_values(repo_root: &Path) -> Vec<KeyValue> {
 }
 
 fn resolve_key_values_with_home(repo_root: &Path, home: Option<&Path>) -> Vec<KeyValue> {
-    let default_cfg = Config::default();
     let mut sources: BTreeMap<String, ValueSource> = BTreeMap::new();
 
     let mut user_cfg = Config::default();
-    apply_layer(
+    let user_present = apply_layer(
         &mut user_cfg,
         home.map(|h| h.join(".clank/config.json")).as_deref(),
     );
 
     let mut repo_cfg = user_cfg.clone();
-    apply_layer(&mut repo_cfg, Some(&repo_root.join(".clank/config.json")));
+    let repo_present = apply_layer(&mut repo_cfg, Some(&repo_root.join(".clank/config.json")));
 
     // Legacy hooks.json: user first, repo overwrites, then apply as fallback.
     let mut legacy: BTreeMap<HookEvent, String> = BTreeMap::new();
@@ -290,23 +298,12 @@ fn resolve_key_values_with_home(repo_root: &Path, home: Option<&Path>) -> Vec<Ke
         full_cfg.hooks.entry(*event).or_insert_with(|| cmd.clone());
     }
 
-    macro_rules! track_bool {
-        ($field:expr, $key:expr) => {
-            let key = $key.to_string();
-            if $field(&repo_cfg) != $field(&default_cfg) {
-                sources.insert(key, ValueSource::Repo);
-            } else if $field(&user_cfg) != $field(&default_cfg) {
-                sources.insert(key, ValueSource::User);
-            }
-        };
+    for key in &repo_present {
+        sources.insert(key.clone(), ValueSource::Repo);
     }
-
-    track_bool!(|c: &Config| c.review.adhoc_feedback, "review.adhoc_feedback");
-    track_bool!(|c: &Config| c.review.plan_feedback, "review.plan_feedback");
-    track_bool!(
-        |c: &Config| c.review.require_commit_prefix,
-        "review.require_commit_prefix"
-    );
+    for key in &user_present {
+        sources.entry(key.clone()).or_insert(ValueSource::User);
+    }
 
     for event in [
         HookEvent::MasterWork,
@@ -315,14 +312,10 @@ fn resolve_key_values_with_home(repo_root: &Path, home: Option<&Path>) -> Vec<Ke
         HookEvent::Idle,
     ] {
         let key = format!("hooks.{}", event_to_key_name(event));
-        let in_repo_cfg = repo_cfg.hooks.contains_key(&event);
-        let in_user_cfg = user_cfg.hooks.contains_key(&event);
-        let in_legacy = legacy.contains_key(&event);
-        if in_repo_cfg {
-            sources.insert(key, ValueSource::Repo);
-        } else if in_user_cfg {
-            sources.insert(key, ValueSource::User);
-        } else if in_legacy {
+        if sources.contains_key(&key) {
+            continue;
+        }
+        if legacy.contains_key(&event) {
             sources.insert(key, ValueSource::Legacy);
         }
     }
@@ -453,14 +446,19 @@ pub async fn run(args: ConfigArgs) -> anyhow::Result<()> {
             }
         }
         (Some(key), None) => {
-            // Key only: show help info for that key
             let def = KEY_CATALOG
                 .iter()
                 .find(|d| format!("{}.{}", d.section, d.name) == *key)
                 .ok_or_else(|| anyhow::anyhow!("unknown config key: {key}"))?;
+            let kvs = resolve_key_values(&repo);
+            let kv = kvs.iter().find(|kv| kv.key == *key);
             println!("key:     {}.{}", def.section, def.name);
             println!("type:    {}", def.type_desc);
             println!("default: {}", def.default);
+            if let Some(kv) = kv {
+                println!("value:   {}", kv.value);
+                println!("source:  {}", kv.source);
+            }
             println!("help:    {}", def.help);
         }
         (Some(key), Some(action)) if action == "get" => {
@@ -472,9 +470,24 @@ pub async fn run(args: ConfigArgs) -> anyhow::Result<()> {
                 .value
                 .as_deref()
                 .ok_or_else(|| anyhow::anyhow!("set requires a value"))?;
-            let (section, field) =
-                key_to_json_path(key).ok_or_else(|| anyhow::anyhow!("unknown config key: {key}"))?;
+            let def = KEY_CATALOG
+                .iter()
+                .find(|d| format!("{}.{}", d.section, d.name) == *key)
+                .ok_or_else(|| anyhow::anyhow!("unknown config key: {key}"))?;
+            match def.type_desc {
+                "bool" => {
+                    if value != "true" && value != "false" {
+                        anyhow::bail!("{key} is a bool; value must be true or false");
+                    }
+                }
+                _ => {}
+            }
+            let (section, field) = key_to_json_path(key).expect("key in catalog implies valid path");
             set_repo_key(&repo, section, field, value)?;
+            let kvs = resolve_key_values(&repo);
+            if let Some(kv) = kvs.iter().find(|kv| kv.key == *key) {
+                println!("{} = {} ({})", kv.key, kv.value, kv.source);
+            }
         }
         (Some(_), Some(action)) => {
             anyhow::bail!("unknown action `{action}`; expected get or set");
@@ -704,5 +717,58 @@ mod tests {
     fn get_value_returns_null_string_for_unset_hook() {
         let cfg = Config::default();
         assert_eq!(get_value(&cfg, "hooks.master_work"), "null");
+    }
+
+    #[test]
+    fn set_bool_key_with_non_bool_value_errors() {
+        let tmp = tempfile::tempdir().unwrap();
+        let args = super::super::ConfigArgs {
+            key: Some("review.adhoc_feedback".to_string()),
+            action: Some("set".to_string()),
+            value: Some("banana".to_string()),
+            repo: Some(tmp.path().to_path_buf()),
+            json: false,
+        };
+        let result = tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(run(args));
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("bool"));
+    }
+
+    #[test]
+    fn set_prints_new_effective_value() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join(".clank")).unwrap();
+        set_repo_key(tmp.path(), "review", "adhoc_feedback", "false").unwrap();
+        let kvs = resolve_key_values_with_home(tmp.path(), None);
+        let kv = kvs.iter().find(|kv| kv.key == "review.adhoc_feedback").unwrap();
+        assert_eq!(kv.value, "false");
+        assert_eq!(kv.source, ValueSource::Repo);
+    }
+
+    #[test]
+    fn key_only_shows_value_and_source() {
+        let tmp = tempfile::tempdir().unwrap();
+        write(
+            &tmp.path().join(".clank/config.json"),
+            r#"{"review": {"adhoc_feedback": false}}"#,
+        );
+        let kvs = resolve_key_values_with_home(tmp.path(), None);
+        let kv = kvs.iter().find(|kv| kv.key == "review.adhoc_feedback").unwrap();
+        assert_eq!(kv.value, "false");
+        assert_eq!(kv.source, ValueSource::Repo);
+    }
+
+    #[test]
+    fn explicit_bool_equal_to_default_shows_repo_source() {
+        let tmp = tempfile::tempdir().unwrap();
+        write(
+            &tmp.path().join(".clank/config.json"),
+            r#"{"review": {"adhoc_feedback": true}}"#,
+        );
+        let kvs = resolve_key_values_with_home(tmp.path(), None);
+        let kv = kvs.iter().find(|kv| kv.key == "review.adhoc_feedback").unwrap();
+        assert_eq!(kv.source, ValueSource::Repo);
     }
 }
