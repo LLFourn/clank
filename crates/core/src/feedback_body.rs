@@ -80,6 +80,17 @@ impl FeedbackBody {
         parse_summary(&self.body).to_string()
     }
 
+    /// Full review body after the verdict+summary line, trimmed.
+    pub fn details(&self) -> String {
+        self.body
+            .lines()
+            .skip(1)
+            .collect::<Vec<_>>()
+            .join("\n")
+            .trim()
+            .to_string()
+    }
+
     /// Confirm that the parsed verdict matches what the caller
     /// claimed. `expected` of `Verdict::Unmarked` is rejected —
     /// you cannot intentionally write an unmarked feedback file.

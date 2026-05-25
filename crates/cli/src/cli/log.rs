@@ -173,6 +173,7 @@ struct Review {
     author: String,
     verdict: Verdict,
     summary: String,
+    body: String,
 }
 
 fn collect_reviews(
@@ -186,9 +187,12 @@ fn collect_reviews(
         if let Ok(fv) = scan_feedback(repo, key, reviewable_shas) {
             for cf in &fv.per_commit {
                 for (author, entry) in &cf.entries {
-                    let summary = std::fs::read_to_string(repo.join(&entry.source_path))
+                    let (summary, body) = std::fs::read_to_string(repo.join(&entry.source_path))
                         .ok()
-                        .map(|body| FeedbackBody::parse(&body).summary())
+                        .map(|raw| {
+                            let fb = FeedbackBody::parse(&raw);
+                            (fb.summary(), fb.details())
+                        })
                         .unwrap_or_default();
                     out.entry((key.as_str().to_string(), cf.sha.as_str().to_string()))
                         .or_insert_with(Vec::new)
@@ -196,6 +200,7 @@ fn collect_reviews(
                             author: author.as_str().to_string(),
                             verdict: entry.verdict,
                             summary,
+                            body,
                         });
                 }
             }
@@ -306,6 +311,12 @@ fn print_human(
                     println!("    {m} {C}{}{Z} {}{snip}", r.author, r.verdict);
                 } else {
                     println!("    {m} {} {}{snip}", r.author, r.verdict);
+                }
+                if !r.body.is_empty() {
+                    println!();
+                    for line in r.body.lines() {
+                        println!("        {line}");
+                    }
                 }
             }
         }
