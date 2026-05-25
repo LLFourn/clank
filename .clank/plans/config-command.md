@@ -13,20 +13,31 @@ configuration, including hooks. Everything lives in
 ### `clank config` (no args)
 
 Prints all config keys grouped by section, with current
-effective values and defaults:
+effective values, defaults, source, and description:
 
 ```
 review:
-  adhoc_feedback = true          (default: true)
-  plan_feedback = true           (default: true)
-  require_commit_prefix = false  (default: false)
+  adhoc_feedback = true          (default: true, source: default)
+    Require review for ad-hoc (non-plan) commits. bool.
+  plan_feedback = true           (default: true, source: default)
+    Require review for plan-attributed commits. bool.
+  require_commit_prefix = false  (default: false, source: default)
+    Require [plan] or [misc] commit title prefixes. bool.
 
 hooks:
-  master_work = null             (default: null)
-  reviewer_work = null           (default: null)
-  plan_finalized = null          (default: null)
-  idle = null                    (default: null)
+  master_work = "say work"       (default: null, source: repo)
+    Shell command to run when master has new work. string or null.
+  reviewer_work = null            (default: null, source: default)
+    Shell command to run when a reviewer has work. string or null.
+  plan_finalized = null           (default: null, source: default)
+    Shell command to run when a plan is finished. string or null.
+  idle = null                     (default: null, source: default)
+    Shell command to run on idle (no work). string or null.
 ```
+
+Each key's description is compiled into the binary — the
+catalog is a static `&[KeyDef]` with name, section, type,
+default, and one-line help.
 
 ### `clank config <key> get`
 
@@ -62,10 +73,16 @@ Move hooks from `~/.clank/hooks.json` and
 }
 ```
 
-The loader reads from `config.json` only. Old `hooks.json`
-files are ignored (can be cleaned up manually). The key
-names match `HookEvent::as_str()` but with underscores
-(serde rename).
+The loader reads `config.json` first. If `hooks.json` exists
+and `config.json` has no `hooks` section, the loader falls
+back to `hooks.json` and emits a deprecation warning via
+`tracing::warn`. Once the user runs
+`clank config hooks.<key> set <value>`, the value lands in
+`config.json` and the `hooks.json` fallback is superseded.
+
+Key names use underscores (`master_work`) in config.json.
+Serde aliases accept the kebab-case form (`master-work`)
+used in the old `hooks.json` files.
 
 ## Rename (already done)
 
