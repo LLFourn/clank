@@ -17,7 +17,6 @@
 //! plausibly flip the projection and refolds on each debounced
 //! event.
 
-use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::time::Duration;
@@ -31,10 +30,10 @@ use crate::hook_config::{self, HookFiring};
 use crate::lifecycle::{AgentLabel, CommitSha, PlanKey};
 use crate::repo_state::RepoState;
 use crate::worktree_facts::read_worktree_facts;
+use clank_core::Role;
 use clank_core::plan_view::{PlanView, project};
 use clank_core::vocab::HookEvent;
 use clank_core::wait::{StartupSnapshot, WaitItem, derive_work, detect_finished};
-use clank_core::{CommitGateState, Role};
 
 /// Exit code returned when `--timeout` elapses without producing
 /// any work. The rest of the CLI uses anyhow for normal errors;
@@ -50,113 +49,40 @@ impl std::fmt::Display for WfwTimeout {
 }
 impl std::error::Error for WfwTimeout {}
 
-struct LifecycleSnapshot {
-    known_plans: BTreeSet<PlanKey>,
-    review_state: BTreeMap<PlanKey, (CommitSha, CommitGateState)>,
-    finished_shas: BTreeMap<PlanKey, BTreeSet<CommitSha>>,
-}
-
-impl LifecycleSnapshot {
-    fn capture(state: &clank_core::repo_state::RepoState, views: &[PlanView]) -> Self {
-        let known_plans = state.plans.keys().cloned().collect();
-        let mut review_state = BTreeMap::new();
-        for v in views {
-            review_state.insert(
-                v.plan.clone(),
-                (v.latest_reviewable_sha.clone(), v.gate_state),
-            );
-        }
-        let mut finished_shas: BTreeMap<PlanKey, BTreeSet<CommitSha>> = BTreeMap::new();
-        for fp in &state.finished_plans {
-            finished_shas
-                .entry(fp.plan.clone())
-                .or_default()
-                .insert(fp.finalized_at.clone());
-        }
-        Self {
-            known_plans,
-            review_state,
-            finished_shas,
-        }
-    }
-}
-
-fn detect_lifecycle_transitions(
-    snapshot: &LifecycleSnapshot,
-    current_fold: &clank_core::repo_state::RepoState,
-    current_views: &[PlanView],
-) -> Vec<HookFiring> {
-    let mut firings = Vec::new();
-
-    for (key, ps) in &current_fold.plans {
-        if !snapshot.known_plans.contains(key) {
-            let sha = ps
-                .commits
-                .first()
-                .map(|e| e.sha.clone())
-                .unwrap_or_else(|| {
-                    CommitSha::parse("0000000000000000000000000000000000000000").unwrap()
-                });
-            firings.push(HookFiring {
-                event: HookEvent::PlanIntroduced,
-                plan: key.clone(),
+fn firings_from_items(items: &[WaitItem]) -> Vec<HookFiring> {
+    items
+        .iter()
+        .filter_map(|item| match item {
+            WaitItem::Master {
+                plan,
                 sha,
-            });
-        }
-    }
-
-    for v in current_views {
-        if let Some((prev_sha, prev_gate)) = snapshot.review_state.get(&v.plan) {
-            if *prev_sha == v.latest_reviewable_sha && *prev_gate != v.gate_state {
-                firings.push(HookFiring {
-                    event: HookEvent::ReviewReceived,
-                    plan: v.plan.clone(),
-                    sha: v.latest_reviewable_sha.clone(),
-                });
-            }
-        }
-    }
-
-    for fp in &current_fold.finished_plans {
-        let known = snapshot
-            .finished_shas
-            .get(&fp.plan)
-            .map(|set| set.contains(&fp.finalized_at))
-            .unwrap_or(false);
-        if !known {
-            firings.push(HookFiring {
+                next,
+                gate,
+                ..
+            } => Some(HookFiring {
+                event: HookEvent::MasterWork,
+                plan: plan.clone(),
+                sha: sha.clone(),
+                gate: Some(*gate),
+                next: Some(format!("{next:?}").to_lowercase()),
+            }),
+            WaitItem::Reviewer { plan, sha, .. } => Some(HookFiring {
+                event: HookEvent::ReviewerWork,
+                plan: plan.clone(),
+                sha: sha.clone(),
+                gate: None,
+                next: None,
+            }),
+            WaitItem::Finished { plan, finalized_at } => Some(HookFiring {
                 event: HookEvent::PlanFinalized,
-                plan: fp.plan.clone(),
-                sha: fp.finalized_at.clone(),
-            });
-        }
-    }
-
-    firings
-}
-
-fn advance_lifecycle_snapshot(
-    snapshot: &mut LifecycleSnapshot,
-    current_fold: &clank_core::repo_state::RepoState,
-    current_views: &[PlanView],
-) {
-    for key in current_fold.plans.keys() {
-        snapshot.known_plans.insert(key.clone());
-    }
-    snapshot.review_state.clear();
-    for v in current_views {
-        snapshot.review_state.insert(
-            v.plan.clone(),
-            (v.latest_reviewable_sha.clone(), v.gate_state),
-        );
-    }
-    for fp in &current_fold.finished_plans {
-        snapshot
-            .finished_shas
-            .entry(fp.plan.clone())
-            .or_default()
-            .insert(fp.finalized_at.clone());
-    }
+                plan: plan.clone(),
+                sha: finalized_at.clone(),
+                gate: None,
+                next: None,
+            }),
+            WaitItem::Idle { .. } => None,
+        })
+        .collect()
 }
 
 pub async fn run(args: WfwArgs) -> anyhow::Result<()> {
@@ -235,12 +161,8 @@ pub async fn run(args: WfwArgs) -> anyhow::Result<()> {
     };
 
     let hook_config = hook_config::load_hook_config(&repo);
-    let has_hooks = !hook_config.is_empty();
 
     let snapshot = StartupSnapshot::capture(&initial_state.fold, plan_filter.as_ref());
-
-    let initial_views = build_views_for_state(&repo, &initial_state, &plan_filter).await?;
-    let mut lifecycle = LifecycleSnapshot::capture(&initial_state.fold, &initial_views);
 
     if let Some(items) = derive_from_state(
         &repo,
@@ -252,18 +174,19 @@ pub async fn run(args: WfwArgs) -> anyhow::Result<()> {
     )
     .await?
     {
+        for firing in &firings_from_items(&items) {
+            hook_config::run_hook(&repo, &hook_config, firing);
+        }
         emit(&items, args.json);
         return Ok(());
     }
 
-    // Master + no active plans = nothing the wait loop can resolve —
-    // unless hooks are configured (need the watcher to observe
-    // plan-introduced events).
-    if role == Role::Master
-        && plan_filter.is_none()
-        && initial_state.fold.plans.is_empty()
-        && !has_hooks
-    {
+    if role == Role::Master && plan_filter.is_none() && initial_state.fold.plans.is_empty() {
+        if let Some(prompt) = hook_config::run_idle_hook(&repo, &hook_config) {
+            let items = [WaitItem::Idle { prompt }];
+            emit(&items, args.json);
+            return Ok(());
+        }
         emit(&[], args.json);
         return Ok(());
     }
@@ -312,20 +235,12 @@ pub async fn run(args: WfwArgs) -> anyhow::Result<()> {
             // heartbeat tick has nothing to drain.
             while rx.recv_timeout(Duration::from_millis(200)).is_ok() {}
         }
-        let state = crate::rebuild::rebuild_repo_with_policy(&repo, policy)
-            .await
-            .map_err(|e| anyhow::anyhow!("failed to fold repo `{}`: {e}", repo.display()))?;
-        let views = build_views_for_state(&repo, &state, &plan_filter).await?;
-
-        let firings = detect_lifecycle_transitions(&lifecycle, &state.fold, &views);
-        for firing in &firings {
-            hook_config::run_hook(&repo, &hook_config, firing);
-        }
-        advance_lifecycle_snapshot(&mut lifecycle, &state.fold, &views);
-
-        let mut items = derive_work(&views, &author, role);
-        items.extend(detect_finished(&snapshot, &state.fold));
-        if !items.is_empty() {
+        if let Some(items) =
+            check_once(&repo, policy, &plan_filter, &snapshot, &author, role).await?
+        {
+            for firing in &firings_from_items(&items) {
+                hook_config::run_hook(&repo, &hook_config, firing);
+            }
             emit(&items, args.json);
             return Ok(());
         }
@@ -346,23 +261,18 @@ fn active_summary(state: &RepoState, basename: &str) -> String {
     }
 }
 
-async fn build_views_for_state(
+async fn check_once(
     repo: &Path,
-    state: &RepoState,
+    policy: crate::rebuild::CachePolicy,
     plan_filter: &Option<PlanKey>,
-) -> anyhow::Result<Vec<PlanView>> {
-    let plans: Vec<PlanKey> = match plan_filter {
-        Some(k) if state.fold.plans.contains_key(k) => vec![k.clone()],
-        Some(_) => Vec::new(),
-        None => state.fold.plans.keys().cloned().collect(),
-    };
-    let mut views = Vec::with_capacity(plans.len());
-    for key in &plans {
-        if let Some(view) = build_view(repo, state, key).await? {
-            views.push(view);
-        }
-    }
-    Ok(views)
+    snapshot: &StartupSnapshot,
+    author: &AgentLabel,
+    role: Role,
+) -> anyhow::Result<Option<Vec<WaitItem>>> {
+    let state = crate::rebuild::rebuild_repo_with_policy(repo, policy)
+        .await
+        .map_err(|e| anyhow::anyhow!("failed to fold repo `{}`: {e}", repo.display()))?;
+    derive_from_state(repo, &state, plan_filter, snapshot, author, role).await
 }
 
 pub async fn derive_from_state(
@@ -373,7 +283,17 @@ pub async fn derive_from_state(
     author: &AgentLabel,
     role: Role,
 ) -> anyhow::Result<Option<Vec<WaitItem>>> {
-    let views = build_views_for_state(repo, state, plan_filter).await?;
+    let plans: Vec<PlanKey> = match plan_filter {
+        Some(k) if state.fold.plans.contains_key(k) => vec![k.clone()],
+        Some(_) => Vec::new(),
+        None => state.fold.plans.keys().cloned().collect(),
+    };
+    let mut views: Vec<PlanView> = Vec::with_capacity(plans.len());
+    for key in &plans {
+        if let Some(view) = build_view(repo, state, key).await? {
+            views.push(view);
+        }
+    }
     let mut items = derive_work(&views, author, role);
     items.extend(detect_finished(snapshot, &state.fold));
     if items.is_empty() {
@@ -426,6 +346,7 @@ fn render_json(item: &WaitItem) -> serde_json::Value {
             sha,
             next,
             reason,
+            gate,
         } => serde_json::json!({
             "kind": "master",
             "plan": plan.as_str(),
@@ -433,6 +354,7 @@ fn render_json(item: &WaitItem) -> serde_json::Value {
             "sha": sha.as_str(),
             "next": next,
             "reason": reason,
+            "gate": gate.as_str(),
         }),
         WaitItem::Reviewer {
             plan,
@@ -451,6 +373,10 @@ fn render_json(item: &WaitItem) -> serde_json::Value {
             "plan_path": format!(".clank/plans/{}.md", plan.as_str()),
             "finalized_at": finalized_at.as_str(),
         }),
+        WaitItem::Idle { prompt } => serde_json::json!({
+            "kind": "idle",
+            "prompt": prompt,
+        }),
     }
 }
 
@@ -461,6 +387,7 @@ fn render_human(item: &WaitItem) -> String {
             sha,
             next,
             reason,
+            ..
         } => format!(
             "master   {plan}  {sha}  next={next:?}  reason={reason}",
             plan = plan.as_str(),
@@ -483,6 +410,7 @@ fn render_human(item: &WaitItem) -> String {
             plan = plan.as_str(),
             sha = short(finalized_at),
         ),
+        WaitItem::Idle { prompt } => format!("idle     {prompt}"),
     }
 }
 

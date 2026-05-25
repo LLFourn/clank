@@ -51,6 +51,7 @@ pub enum WaitItem {
         sha: CommitSha,
         next: MasterNext,
         reason: WaitingReason,
+        gate: crate::vocab::CommitGateState,
     },
     Reviewer {
         plan: PlanKey,
@@ -60,6 +61,9 @@ pub enum WaitItem {
     Finished {
         plan: PlanKey,
         finalized_at: CommitSha,
+    },
+    Idle {
+        prompt: String,
     },
 }
 
@@ -182,6 +186,7 @@ fn master(view: &PlanView, next: MasterNext, reason: WaitingReason) -> WaitItem 
         sha: view.latest_reviewable_sha.clone(),
         next,
         reason,
+        gate: view.gate_state,
     }
 }
 

@@ -1,4 +1,4 @@
-//! Hook configuration loading and execution for lifecycle hooks.
+//! Hook configuration loading and execution for work-item hooks.
 //!
 //! Two config files, merged (repo overlays user defaults):
 //! 1. `~/.clank/hooks.json` (user-level defaults)
@@ -10,6 +10,7 @@ use std::process::Stdio;
 
 use clank_core::HookEvent;
 use clank_core::ids::{CommitSha, PlanKey};
+use clank_core::vocab::CommitGateState;
 
 pub type HookConfig = BTreeMap<HookEvent, String>;
 
@@ -17,6 +18,8 @@ pub struct HookFiring {
     pub event: HookEvent,
     pub plan: PlanKey,
     pub sha: CommitSha,
+    pub gate: Option<CommitGateState>,
+    pub next: Option<String>,
 }
 
 pub fn load_hook_config(repo: &Path) -> HookConfig {
@@ -57,7 +60,8 @@ pub fn run_hook(repo: &Path, config: &HookConfig, firing: &HookFiring) {
         Some(c) => c,
         None => return,
     };
-    let result = std::process::Command::new("sh")
+    let mut child = std::process::Command::new("sh");
+    child
         .arg("-c")
         .arg(cmd)
         .env("CLANK_EVENT", firing.event.as_str())
@@ -65,8 +69,14 @@ pub fn run_hook(repo: &Path, config: &HookConfig, firing: &HookFiring) {
         .env("CLANK_REPO", &*repo.to_string_lossy())
         .env("CLANK_SHA", firing.sha.as_str())
         .stdout(Stdio::null())
-        .stderr(Stdio::inherit())
-        .status();
+        .stderr(Stdio::inherit());
+    if let Some(gate) = &firing.gate {
+        child.env("CLANK_GATE", gate.as_str());
+    }
+    if let Some(next) = &firing.next {
+        child.env("CLANK_NEXT", next.as_str());
+    }
+    let result = child.status();
 
     match result {
         Ok(status) if !status.success() => {
@@ -88,14 +98,37 @@ pub fn run_hook(repo: &Path, config: &HookConfig, firing: &HookFiring) {
     }
 }
 
+/// Run the idle hook. Unlike work-item hooks, idle captures stdout —
+/// non-empty stdout becomes a synthetic prompt. Returns None if no
+/// idle hook is configured or stdout is empty.
+pub fn run_idle_hook(repo: &Path, config: &HookConfig) -> Option<String> {
+    let cmd = config.get(&HookEvent::Idle)?;
+    let output = std::process::Command::new("sh")
+        .arg("-c")
+        .arg(cmd)
+        .env("CLANK_EVENT", "idle")
+        .env("CLANK_REPO", &*repo.to_string_lossy())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .output()
+        .ok()?;
+    let prompt = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if prompt.is_empty() {
+        None
+    } else {
+        Some(prompt)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn empty_when_no_files_exist() {
+    fn missing_file_returns_empty() {
+        let mut config = HookConfig::new();
         let dir = tempfile::tempdir().unwrap();
-        let config = load_hook_config(dir.path());
+        merge_from_file(&mut config, &dir.path().join("nonexistent.json"));
         assert!(config.is_empty());
     }
 
@@ -107,18 +140,18 @@ mod tests {
         let user = dir.path().join("user.json");
         std::fs::write(
             &user,
-            r#"{"plan-introduced":"user-cmd","review-received":"user-review"}"#,
+            r#"{"master-work":"user-cmd","reviewer-work":"user-review"}"#,
         )
         .unwrap();
         merge_from_file(&mut config, &user);
-        assert_eq!(config[&HookEvent::PlanIntroduced], "user-cmd");
-        assert_eq!(config[&HookEvent::ReviewReceived], "user-review");
+        assert_eq!(config[&HookEvent::MasterWork], "user-cmd");
+        assert_eq!(config[&HookEvent::ReviewerWork], "user-review");
 
         let repo = dir.path().join("repo.json");
-        std::fs::write(&repo, r#"{"plan-introduced":"repo-cmd"}"#).unwrap();
+        std::fs::write(&repo, r#"{"master-work":"repo-cmd"}"#).unwrap();
         merge_from_file(&mut config, &repo);
-        assert_eq!(config[&HookEvent::PlanIntroduced], "repo-cmd");
-        assert_eq!(config[&HookEvent::ReviewReceived], "user-review");
+        assert_eq!(config[&HookEvent::MasterWork], "repo-cmd");
+        assert_eq!(config[&HookEvent::ReviewerWork], "user-review");
     }
 
     #[test]

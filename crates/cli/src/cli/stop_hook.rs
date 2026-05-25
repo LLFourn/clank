@@ -225,6 +225,10 @@ fn render_wfw_items(items: &[serde_json::Value], label: &AgentLabel, role: Role)
             "finished" => out.push_str(&format!(
                 "  - finished: plan `{plan}` finalized at {short}\n",
             )),
+            "idle" => {
+                let prompt = item.get("prompt").and_then(|v| v.as_str()).unwrap_or("");
+                out.push_str(&format!("  - idle: {prompt}\n"));
+            }
             other => out.push_str(&format!("  - {other}: plan `{plan}` at {short} ({full})\n",)),
         }
     }
