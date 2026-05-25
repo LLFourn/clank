@@ -163,26 +163,33 @@ pub async fn run(args: WfwArgs) -> anyhow::Result<()> {
     };
 
     let hook_config = hook_config::load_hook_config(&repo);
+    let review_config = crate::cli::config::load(&repo);
+    let work_policy = clank_core::wait::WorkPolicy {
+        force_review_on_plan_commits: review_config.review.force_review_on_plan_commits,
+        force_review_on_misc_commits: review_config.review.force_review_on_misc_commits,
+        ad_hoc_reviewers: review_config.review.ad_hoc_reviewers.clone(),
+    };
 
     let snapshot = StartupSnapshot::capture(&initial_state.fold, plan_filter.as_ref());
 
-    if let Some(items) = derive_from_state(
-        &repo,
-        &initial_state,
-        &plan_filter,
-        &snapshot,
-        &author,
-        role,
-    )
-    .await?
     {
-        for firing in &firings_from_items(&items) {
-            hook_config::run_hook(&repo, &hook_config, firing);
+        let reviews =
+            crate::fs_review_lookup::FsReviewLookup::new(&repo, initial_state.head.as_ref());
+        let status = initial_state.fold.derive_status(&reviews, &work_policy);
+        let mut items = status.work_for(&author, role);
+        items.extend(detect_finished(&snapshot, &initial_state.fold));
+        if !items.is_empty() {
+            for firing in &firings_from_items(&items) {
+                hook_config::run_hook(&repo, &hook_config, firing);
+            }
+            emit(&items, args.json);
+            return Ok(());
         }
-        emit(&items, args.json);
-        return Ok(());
     }
 
+    // Fast-exit: no plans, no pending work from the initial derive.
+    // The derive_status above already checked plans + ad-hoc;
+    // if it returned empty items, there's nothing to wait for.
     if role == Role::Master && plan_filter.is_none() && initial_state.fold.plans.is_empty() {
         if let Some(prompt) = hook_config::run_idle_hook(&repo, &hook_config) {
             let items = [WaitItem::Idle { prompt }];
@@ -237,14 +244,21 @@ pub async fn run(args: WfwArgs) -> anyhow::Result<()> {
             // heartbeat tick has nothing to drain.
             while rx.recv_timeout(Duration::from_millis(200)).is_ok() {}
         }
-        if let Some(items) =
-            check_once(&repo, policy, &plan_filter, &snapshot, &author, role).await?
         {
-            for firing in &firings_from_items(&items) {
-                hook_config::run_hook(&repo, &hook_config, firing);
+            let state = crate::rebuild::rebuild_repo_with_policy(&repo, policy)
+                .await
+                .map_err(|e| anyhow::anyhow!("failed to fold repo `{}`: {e}", repo.display()))?;
+            let reviews = crate::fs_review_lookup::FsReviewLookup::new(&repo, state.head.as_ref());
+            let status = state.fold.derive_status(&reviews, &work_policy);
+            let mut items = status.work_for(&author, role);
+            items.extend(detect_finished(&snapshot, &state.fold));
+            if !items.is_empty() {
+                for firing in &firings_from_items(&items) {
+                    hook_config::run_hook(&repo, &hook_config, firing);
+                }
+                emit(&items, args.json);
+                return Ok(());
             }
-            emit(&items, args.json);
-            return Ok(());
         }
     }
 }
@@ -260,48 +274,6 @@ fn active_summary(state: &RepoState, basename: &str) -> String {
         "(none)".into()
     } else {
         names.join(", ")
-    }
-}
-
-async fn check_once(
-    repo: &Path,
-    policy: crate::rebuild::CachePolicy,
-    plan_filter: &Option<PlanKey>,
-    snapshot: &StartupSnapshot,
-    author: &AgentLabel,
-    role: Role,
-) -> anyhow::Result<Option<Vec<WaitItem>>> {
-    let state = crate::rebuild::rebuild_repo_with_policy(repo, policy)
-        .await
-        .map_err(|e| anyhow::anyhow!("failed to fold repo `{}`: {e}", repo.display()))?;
-    derive_from_state(repo, &state, plan_filter, snapshot, author, role).await
-}
-
-pub async fn derive_from_state(
-    repo: &Path,
-    state: &RepoState,
-    plan_filter: &Option<PlanKey>,
-    snapshot: &StartupSnapshot,
-    author: &AgentLabel,
-    role: Role,
-) -> anyhow::Result<Option<Vec<WaitItem>>> {
-    let plans: Vec<PlanKey> = match plan_filter {
-        Some(k) if state.fold.plans.contains_key(k) => vec![k.clone()],
-        Some(_) => Vec::new(),
-        None => state.fold.plans.keys().cloned().collect(),
-    };
-    let mut views: Vec<PlanView> = Vec::with_capacity(plans.len());
-    for key in &plans {
-        if let Some(view) = build_view(repo, state, key).await? {
-            views.push(view);
-        }
-    }
-    let mut items = derive_work(&views, author, role);
-    items.extend(detect_finished(snapshot, &state.fold));
-    if items.is_empty() {
-        Ok(None)
-    } else {
-        Ok(Some(items))
     }
 }
 

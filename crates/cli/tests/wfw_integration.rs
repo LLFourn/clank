@@ -72,9 +72,19 @@ struct TestEnv {
 
 impl TestEnv {
     fn new() -> Self {
+        let repo = init_repo();
+        // Disable ad-hoc review by default in tests so only plan
+        // work is visible (matches pre-adhoc-review behavior).
+        let cfg_path = repo.path().join(".clank/config.json");
+        std::fs::create_dir_all(cfg_path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &cfg_path,
+            r#"{"review":{"force_review_on_misc_commits":false}}"#,
+        )
+        .unwrap();
         Self {
             home: tempfile::tempdir().unwrap(),
-            repo: init_repo(),
+            repo,
         }
     }
 
@@ -100,6 +110,16 @@ fn clank_cmd(repo: &Path) -> Command {
     let mut cmd = Command::new(clank_bin());
     cmd.env("HOME", repo);
     cmd
+}
+
+/// Disable ad-hoc review in a test repo so old tests that expect
+/// "reviewer blocks with no plans" still pass.
+fn disable_adhoc_review(repo: &Path) {
+    write(
+        repo,
+        ".clank/config.json",
+        r#"{"review":{"force_review_on_misc_commits":false}}"#,
+    );
 }
 
 /// Spawn `clank wfw …` with stdout piped. Returns a handle the test
@@ -970,6 +990,7 @@ fn wfw_reviewer_no_plans_still_blocks() {
     let repo = dir.path();
     write(repo, "README.md", "# repo\n");
     commit(repo, "init");
+    disable_adhoc_review(repo);
 
     let start = Instant::now();
     let output = clank_cmd(repo)
