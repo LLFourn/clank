@@ -120,6 +120,7 @@ pub trait ReviewLookup {
     fn worktree_status(&self, plan: &PlanKey) -> crate::vocab::PlanWorktreeStatus;
 }
 
+#[derive(Clone)]
 pub struct ReviewEntry {
     pub author: AgentLabel,
     pub verdict: crate::vocab::Verdict,
@@ -711,5 +712,93 @@ mod tests {
         state.plans.insert(plan("b"), PlanState::default());
         let snap = StartupSnapshot::capture(&state, Some(&plan("a")));
         assert_eq!(snap.watched, std::iter::once(plan("a")).collect());
+    }
+
+    // ============ derive_status ad-hoc ============
+
+    use crate::repo_state::AdHocEvent;
+
+    struct MockReviews(Vec<(CommitSha, Vec<ReviewEntry>)>);
+    impl ReviewLookup for MockReviews {
+        fn reviews_for(&self, sha: &CommitSha) -> Vec<ReviewEntry> {
+            self.0
+                .iter()
+                .filter(|(s, _)| s == sha)
+                .flat_map(|(_, entries)| entries.clone())
+                .collect()
+        }
+        fn worktree_status(&self, _plan: &PlanKey) -> PlanWorktreeStatus {
+            PlanWorktreeStatus::Clean
+        }
+    }
+
+    fn adhoc_policy() -> WorkPolicy {
+        WorkPolicy {
+            force_review_on_plan_commits: true,
+            force_review_on_misc_commits: true,
+            ad_hoc_reviewers: None,
+        }
+    }
+
+    #[test]
+    fn only_latest_adhoc_commit_produces_work() {
+        let mut state = RepoState::default();
+        state.ad_hoc.push(AdHocEvent {
+            sha: sha("1111"),
+            ts: 1,
+            touched_code: true,
+        });
+        state.ad_hoc.push(AdHocEvent {
+            sha: sha("2222"),
+            ts: 2,
+            touched_code: true,
+        });
+        let reviews = MockReviews(vec![(
+            sha("1111"),
+            vec![ReviewEntry {
+                author: label("codex"),
+                verdict: crate::vocab::Verdict::RequestChanges,
+            }],
+        )]);
+        let status = state.derive_status(&reviews, &adhoc_policy());
+        assert_eq!(status.ad_hoc.len(), 1);
+        assert_eq!(status.ad_hoc[0].sha, sha("2222"));
+    }
+
+    #[test]
+    fn approve_on_latest_adhoc_clears_all_work() {
+        let mut state = RepoState::default();
+        state.ad_hoc.push(AdHocEvent {
+            sha: sha("1111"),
+            ts: 1,
+            touched_code: true,
+        });
+        state.ad_hoc.push(AdHocEvent {
+            sha: sha("2222"),
+            ts: 2,
+            touched_code: true,
+        });
+        let reviews = MockReviews(vec![
+            (
+                sha("1111"),
+                vec![ReviewEntry {
+                    author: label("codex"),
+                    verdict: crate::vocab::Verdict::RequestChanges,
+                }],
+            ),
+            (
+                sha("2222"),
+                vec![ReviewEntry {
+                    author: label("codex"),
+                    verdict: crate::vocab::Verdict::Approve,
+                }],
+            ),
+        ]);
+        let status = state.derive_status(&reviews, &adhoc_policy());
+        let work = status.work_for(&label("master"), Role::Master, &adhoc_policy());
+        assert!(
+            work.is_empty(),
+            "approve on latest should produce no master work; got {work:?}"
+        );
     }
 }
