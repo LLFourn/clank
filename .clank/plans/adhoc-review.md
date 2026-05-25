@@ -22,31 +22,71 @@ the fold. `LogEvent::AdHoc` was just added for `clank log`.
 
 ## What's missing
 
-1. **`derive_work` doesn't inspect `ad_hoc`** — it only looks
-   at `PlanView`s. Need to add an ad-hoc branch.
+1. **`derive_work` takes `&[PlanView]`** — it should take
+   `RepoState` + a trait for feedback lookup, so it can derive
+   work for both plans and ad-hoc commits in one pass.
 
-2. **No ad-hoc feedback path** — feedback files live under
-   `.clank/agents/<author>/feedback/<plan>/<sha>.md`. Ad-hoc
-   commits have no plan. Need a feedback target for them.
+2. **No ad-hoc feedback path wired** — `FeedbackTarget::AdHoc`
+   and the `_` directory already exist in `disk_format.rs` but
+   nothing scans or writes ad-hoc feedback yet.
 
-3. **`clank feedback write` can't target ad-hoc commits** —
-   `--plan` parses into `PlanKey` which rejects non-plan values.
+3. **`clank feedback write` can't target ad-hoc commits**.
 
-## Design decisions
+## Design: `derive_work` with a feedback trait
 
-### Feedback target for ad-hoc commits
+### The trait
 
-Use the existing `FeedbackTarget::AdHoc` from `disk_format.rs`,
-which renders as the `_` segment. Feedback path:
-`.clank/agents/<author>/feedback/_/<sha>.md`.
+```rust
+pub trait ReviewLookup {
+    fn reviews_for(&self, target: ReviewTarget) -> Vec<ReviewEntry>;
+}
 
-Already defined, parsed, and tested in `disk_format.rs:36-40`,
-`disk_format.rs:154-159`, `disk_format.rs:237-253`.
+pub enum ReviewTarget {
+    Plan { plan: PlanKey, sha: CommitSha },
+    AdHoc { sha: CommitSha },
+}
+
+pub struct ReviewEntry {
+    pub author: AgentLabel,
+    pub verdict: Verdict,
+}
+```
+
+Lives in `crates/core`. The CLI implements it by scanning
+feedback files from disk. Core never does I/O.
+
+### New `derive_work` signature
+
+```rust
+pub fn derive_work(
+    state: &RepoState,
+    reviews: &impl ReviewLookup,
+    author: &AgentLabel,
+    role: Role,
+    config: &ReviewPolicy,
+) -> Vec<WaitItem>
+```
+
+`ReviewPolicy` is a small core struct:
+
+```rust
+pub struct ReviewPolicy {
+    pub force_review_on_misc_commits: bool,
+    pub force_review_on_plan_commits: bool,
+    pub ad_hoc_reviewers: Option<Vec<AgentLabel>>,
+}
+```
+
+`derive_work` iterates `state.plans` (computing gate state
+via `reviews.reviews_for(Plan { .. })`) and `state.ad_hoc`
+(via `reviews.reviews_for(AdHoc { .. })`), emitting work items
+for both. The `PlanView` projection step is absorbed into
+`derive_work` — it computes `waiting_on` internally from the
+fold timeline + reviews.
 
 ### WaitItem shape
 
-Add `WaitItem::AdHocReview` and `WaitItem::AdHocRevise` variants
-rather than smuggling a sentinel through `PlanKey`:
+Add `AdHocReview` and `AdHocRevise` to `WaitItem`:
 
 ```rust
 AdHocReview {
@@ -58,58 +98,64 @@ AdHocRevise {
 },
 ```
 
+### Feedback target
+
+Use the existing `FeedbackTarget::AdHoc` from `disk_format.rs`
+(the `_` segment). Path:
+`.clank/agents/<author>/feedback/_/<sha>.md`.
+
 ### `clank feedback write` for ad-hoc
 
 Add `--adhoc` flag (mutually exclusive with `--plan`). When set,
 the commit ref resolves against `state.ad_hoc` SHAs. Writes to
 the `_` feedback directory.
 
-### Gate computation
-
-For each `AdHocEvent`, scan feedback at
-`.clank/agents/*/feedback/_/<sha>.md`. Compute gate:
-- No feedback → unreviewed → reviewer work
-- All approve → done
-- Any request_changes → master revise work
-
-Use the existing `evaluate` logic from `plan_view` or a
-simplified version (ad-hoc has no `waiting_on` variants beyond
-review/revise).
-
 ## Implementation surface
 
-### `crates/core/src/wait.rs`
+### `crates/core`
 
-- Add `AdHocReview` and `AdHocRevise` to `WaitItem`.
-- Ad-hoc work derivation lives in the **CLI layer** (not in
-  `clank_core::wait::derive_work`) because it depends on
-  `ReviewConfig` which is a CLI type. The CLI's wfw module
-  calls `derive_work` for plan items as today, then separately
-  derives ad-hoc items using `state.ad_hoc` + feedback scan +
-  config. Both sets are concatenated into the final work items.
-- When `ad_hoc_reviewers` is `Some(list)`, only those agents
-  are eligible reviewers for ad-hoc commits. When `None`,
-  any reviewer is eligible.
+- New `ReviewLookup` trait + `ReviewTarget` + `ReviewEntry` +
+  `ReviewPolicy` types.
+- `derive_work` rewritten to take `&RepoState` + `&impl
+  ReviewLookup` instead of `&[PlanView]`. Computes gate state
+  internally. Handles both plans and ad-hoc commits.
+- `PlanView` projection may be simplified or kept for `status`
+  display (it still needs worktree facts which come from I/O).
 
-### `crates/cli/src/cli/wfw.rs`
+### `crates/cli`
 
-- Load config via `config::load(repo)`.
-- Pass `config.review.force_review_on_misc_commits` and ad-hoc
-  feedback into `derive_work`.
-- Render `AdHocReview` / `AdHocRevise` in emit/JSON.
+- Implement `ReviewLookup` over the filesystem (scan feedback
+  files, return entries). Replaces the current `scan_feedback`
+  → `PlanView` projection → `derive_work` pipeline with a
+  single `derive_work(&state, &fs_reviews, ...)` call.
+- `wfw.rs`: load config, build `ReviewPolicy`, construct the
+  filesystem `ReviewLookup`, call `derive_work`.
+- `feedback.rs`: add `--adhoc` flag.
+- `stop_hook.rs`: render `AdHocReview` / `AdHocRevise`.
+- Lifecycle hooks: ad-hoc items skip `firings_from_items` (no
+  `PlanKey`).
 
-### `crates/cli/src/cli/stop_hook.rs`
+## Tests
 
-- Render `AdHocReview` / `AdHocRevise` in the continuation
-  prompt.
+- `force_review_on_misc_commits=true`: unreviewed ad-hoc →
+  reviewer wfw returns work.
+- Reviewer approves → no more work.
+- Reviewer request_changes → master wfw returns revise.
+- `force_review_on_misc_commits=false`: no ad-hoc work items.
+- `ad_hoc_reviewers=["codex"]`: only codex gets ad-hoc work.
+- `clank feedback write --adhoc --commit <sha>` writes to
+  `_` path.
+- Ad-hoc items don't fire lifecycle hooks.
+- Existing plan-based derive_work tests still pass (the trait
+  impl returns the same data the old PlanView projection did).
 
-### Lifecycle hooks
+## Acceptance criteria
 
-Ad-hoc work items skip `firings_from_items` — they have no
-`PlanKey` so `HookFiring` can't be constructed. The
-`master-work` / `reviewer-work` hooks only fire for plan items.
-This is acceptable: ad-hoc reviews are a lightweight side-channel,
-not a plan lifecycle event.
+- `derive_work` takes `RepoState` + `ReviewLookup` trait.
+- Ad-hoc commits surface as wfw work items when config enables.
+- Reviewer and master flows work for ad-hoc commits.
+- `clank feedback write --adhoc` works.
+- Default `force_review_on_misc_commits` is true.
 
 ### `crates/cli/src/cli/feedback.rs`
 
