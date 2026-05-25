@@ -47,6 +47,12 @@ pub struct LogArgs {
     pub all: bool,
     #[arg(long, value_name = "PLAN")]
     pub plan: Option<String>,
+    /// Max commit groups to show (default 30, 0 = unlimited).
+    #[arg(short = 'n', default_value_t = 30)]
+    pub limit: usize,
+    /// Compact one-line-per-commit output.
+    #[arg(long)]
+    pub oneline: bool,
 }
 
 #[derive(Args, Debug)]

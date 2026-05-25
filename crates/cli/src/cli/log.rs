@@ -40,6 +40,16 @@ pub async fn run(args: LogArgs) -> anyhow::Result<()> {
         })
         .collect();
 
+    // Apply limit (over commit groups: intro/commit/finalize each = 1 group).
+    let limited: Vec<&LogEvent> = if args.limit > 0 {
+        let total = filtered_events.len();
+        let skip = total.saturating_sub(args.limit);
+        filtered_events.into_iter().skip(skip).collect()
+    } else {
+        filtered_events
+    };
+    let filtered_events = limited;
+
     if filtered_events.is_empty() {
         println!("no log events");
         return Ok(());
@@ -71,6 +81,8 @@ pub async fn run(args: LogArgs) -> anyhow::Result<()> {
 
     if args.json {
         print_json(&filtered_events, &repo, &plan_keys, &reviewable_shas)?;
+    } else if args.oneline {
+        print_oneline(&filtered_events, &repo, &plan_keys, &reviewable_shas)?;
     } else {
         print_human(&filtered_events, &repo, &plan_keys, &reviewable_shas)?;
     }
@@ -114,7 +126,9 @@ fn earliest_plan_intro_parent(repo: &Path, keys: &[PlanKey]) -> Option<CommitSha
             continue;
         }
         let stdout = String::from_utf8_lossy(&output.stdout);
-        if let Some(line) = stdout.lines().last() {
+        // git log outputs newest-first. First line = most recent
+        // introduction (handles reintroduced plans correctly).
+        if let Some(line) = stdout.lines().next() {
             let mut parts = line.splitn(2, ' ');
             let sha_str = parts.next().unwrap_or("").trim().to_string();
             let ts: i64 = parts.next().unwrap_or("0").trim().parse().unwrap_or(0);
@@ -231,6 +245,16 @@ fn kind_label(touched_plan: bool, touched_code: bool) -> &'static str {
     }
 }
 
+const YELLOW: &str = "\x1b[33m";
+const CYAN: &str = "\x1b[36m";
+const GREEN: &str = "\x1b[32m";
+const RED: &str = "\x1b[31m";
+const RESET: &str = "\x1b[0m";
+
+fn use_color() -> bool {
+    std::env::var_os("NO_COLOR").is_none()
+}
+
 fn print_human(
     events: &[&LogEvent],
     repo: &Path,
@@ -238,51 +262,129 @@ fn print_human(
     reviewable_shas: &[CommitSha],
 ) -> anyhow::Result<()> {
     let reviews = collect_reviews(repo, plan_keys, reviewable_shas);
+    let c = use_color();
 
     for event in events {
-        match event {
-            LogEvent::PlanIntro { plan, sha, .. } => {
-                let subj = commit_subject(repo, sha);
-                println!("{:<40} {}  plan", subj, short(sha));
-                print_reviews_for(&reviews, plan, sha);
-            }
+        let (plan, sha, kind) = match event {
+            LogEvent::PlanIntro { plan, sha, .. } => (plan, sha, "plan"),
             LogEvent::PlanCommit {
                 plan,
                 sha,
                 touched_plan,
                 touched_code,
                 ..
-            } => {
-                let subj = commit_subject(repo, sha);
-                let kind = kind_label(*touched_plan, *touched_code);
-                println!("{:<40} {}  {kind}", subj, short(sha));
-                print_reviews_for(&reviews, plan, sha);
-            }
+            } => (plan, sha, kind_label(*touched_plan, *touched_code)),
             LogEvent::PlanFinalized { plan, sha, .. } => {
-                println!("Finalize {:<31} {}", plan.as_str(), short(sha));
+                if c {
+                    println!(
+                        "{YELLOW}Finalize{RESET} {CYAN}{}{RESET}  {}",
+                        plan.as_str(),
+                        short(sha)
+                    );
+                } else {
+                    println!("Finalize {}  {}", plan.as_str(), short(sha));
+                }
+                continue;
             }
             LogEvent::PlanDeleted { plan, sha, .. } => {
-                println!("Delete {:<33} {}", plan.as_str(), short(sha));
+                println!("Delete {}  {}", plan.as_str(), short(sha));
+                continue;
             }
+        };
+        let subj = commit_subject(repo, sha);
+        if c {
+            println!("{YELLOW}{}{RESET} {subj}  {CYAN}{kind}{RESET}", short(sha));
+        } else {
+            println!("{} {subj}  {kind}", short(sha));
+        }
+        print_reviews_for(&reviews, plan, sha, c);
+    }
+    Ok(())
+}
+
+fn print_oneline(
+    events: &[&LogEvent],
+    repo: &Path,
+    plan_keys: &[PlanKey],
+    reviewable_shas: &[CommitSha],
+) -> anyhow::Result<()> {
+    let reviews = collect_reviews(repo, plan_keys, reviewable_shas);
+    let c = use_color();
+
+    for event in events {
+        let (plan, sha, subj_override) = match event {
+            LogEvent::PlanIntro { plan, sha, .. } | LogEvent::PlanCommit { plan, sha, .. } => {
+                (plan, sha, None)
+            }
+            LogEvent::PlanFinalized { plan, sha, .. } => {
+                (plan, sha, Some(format!("Finalize {}", plan.as_str())))
+            }
+            LogEvent::PlanDeleted { plan, sha, .. } => {
+                (plan, sha, Some(format!("Delete {}", plan.as_str())))
+            }
+        };
+        let subj = subj_override.unwrap_or_else(|| commit_subject(repo, sha));
+        let review_summary = review_oneline_summary(&reviews, plan, sha, c);
+        if c {
+            println!("{YELLOW}{}{RESET} {subj}{review_summary}", short(sha));
+        } else {
+            println!("{} {subj}{review_summary}", short(sha));
         }
     }
     Ok(())
+}
+
+fn review_oneline_summary(
+    reviews: &std::collections::BTreeMap<(String, String), Vec<Review>>,
+    plan: &PlanKey,
+    sha: &CommitSha,
+    color: bool,
+) -> String {
+    let key = (plan.as_str().to_string(), sha.as_str().to_string());
+    let Some(rs) = reviews.get(&key) else {
+        return String::new();
+    };
+    let parts: Vec<String> = rs
+        .iter()
+        .map(|r| {
+            let (mark, col) = match r.verdict {
+                Verdict::Approve => ("✓", GREEN),
+                Verdict::RequestChanges => ("✗", RED),
+                Verdict::Unmarked => ("?", RESET),
+            };
+            if color {
+                format!("{col}{mark} {}{RESET}", r.author)
+            } else {
+                format!("{mark} {}", r.author)
+            }
+        })
+        .collect();
+    if parts.is_empty() {
+        String::new()
+    } else {
+        format!("  {}", parts.join(" "))
+    }
 }
 
 fn print_reviews_for(
     reviews: &std::collections::BTreeMap<(String, String), Vec<Review>>,
     plan: &PlanKey,
     sha: &CommitSha,
+    color: bool,
 ) {
     let key = (plan.as_str().to_string(), sha.as_str().to_string());
     if let Some(rs) = reviews.get(&key) {
         for r in rs {
-            let mark = match r.verdict {
-                Verdict::Approve => "✓",
-                Verdict::RequestChanges => "✗",
-                Verdict::Unmarked => "?",
+            let (mark, col) = match r.verdict {
+                Verdict::Approve => ("✓", GREEN),
+                Verdict::RequestChanges => ("✗", RED),
+                Verdict::Unmarked => ("?", RESET),
             };
-            println!("  {mark} {} {}", r.author, r.verdict);
+            if color {
+                println!("  {col}{mark} {} {}{RESET}", r.author, r.verdict);
+            } else {
+                println!("  {mark} {} {}", r.author, r.verdict);
+            }
         }
     }
 }
