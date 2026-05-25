@@ -56,4 +56,6 @@ commit abc1234
 
 - Human output shows author, verdict, summary, and body.
 - `--json` output includes `summary` and `details` fields
-  for a feedback file with both (e.g. `APPROVE summary\n\ndetail line`).
+  for a feedback file with both.
+- Short ref finds full-SHA feedback file.
+- Invalid ref errors cleanly.
