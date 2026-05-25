@@ -29,38 +29,39 @@ need the full list for programmatic use. Only human mode trims.
 
 ## Part 2: clank log
 
-### What the fold gives us
+### Architecture: log events from the fold
 
-Each active `PlanState` has `commits: Vec<PlanTimelineEvent>`
-with `{ sha, ts, touched_plan, touched_code }`. Each
-`FinishedPlan` has `{ plan, intro, finalized_at }`.
+`apply_commit` currently mutates `RepoState` in place. Change it
+to also return a `Vec<LogEvent>` describing what it did. This is
+purely additive — no change to existing data structures, cache
+encoding, or fold behavior. `LogEvent` is a new type in
+`crates/core`.
 
-Reviews are NOT in the fold — they're local-only feedback files
-at `.clank/agents/<author>/feedback/<plan>/<sha>.md`. The
-`feedback_scan` module already reads these into a
-`FeedbackView` keyed by `(plan, sha) → Vec<(author, verdict)>`.
+```rust
+pub enum LogEvent {
+    PlanIntro { plan: PlanKey, sha: CommitSha, ts: i64 },
+    PlanCommit { plan: PlanKey, sha: CommitSha, ts: i64,
+                 touched_plan: bool, touched_code: bool },
+    PlanFinalized { plan: PlanKey, sha: CommitSha, ts: i64 },
+    PlanDeleted { plan: PlanKey, sha: CommitSha, ts: i64 },
+}
+```
 
-### Event model for log
+The fold loop in `rebuild` collects these events into a
+`Vec<LogEvent>` alongside the `RepoState`. Existing callers
+(`status`, `wfw`, etc.) ignore the events.
 
-A log entry is one of:
+### Reviews as virtual events
 
-- **commit** — from `PlanTimelineEvent`. Plan-scoped. Has sha,
-  ts, touched_plan, touched_code. Commit subject from git.
-- **review** — from feedback files. Virtual event placed after
-  the commit it reviews. Has plan, sha (of the reviewed commit),
-  author, verdict.
-- **finalize** — from `FinishedPlan`. Plan-scoped. Has plan,
-  finalized_at sha, ts from git.
+Reviews are NOT in the fold — they're local-only feedback files.
+`clank log` scans feedback via `feedback_scan::scan_feedback`,
+then attaches reviews as virtual events placed immediately after
+their target commit. Within a commit's reviews, order by author.
 
 ### Ordering
 
-Commits are ordered by `ts` (committer timestamp from the fold).
-Reviews are placed immediately after their target commit (the
-commit they provide feedback on). Within the same commit's
-reviews, order by author name.
-
-Finalize events are ordered by the finalized_at commit's
-timestamp.
+Log events are already in fold order (chronological by commit).
+Reviews are interleaved after their target commit's event.
 
 ### Rendering
 
@@ -85,67 +86,31 @@ clank log [--plan <stem>] [--all] [--json] [--repo <path>]
 ```
 
 - No args + one active plan: show that plan's timeline.
-- `--plan <stem>`: specific plan.
+- `--plan <stem>`: specific plan (active or finished).
 - `--all`: all plans interleaved chronologically.
 - No active plans + no `--plan`: show the most recent finished
   plan's timeline.
 
-### Finished-plan timeline reconstruction
-
-`FinishedPlan` stores only `{ plan, intro, finalized_at }` — the
-fold drops per-commit timelines on finalize. To reconstruct:
-
-Cold-fold the first-parent chain from root (or cache anchor)
-through `finalized_at`, matching the preview module's approach
-(`crates/cli/src/preview.rs:313`). Attribution depends on
-repo-scoped fold context (known plans, active-plan hints), so a
-simple path-classification of `intro..finalized_at` would
-misattribute commits and miss the intro commit itself (git log
-`A..B` excludes A).
-
-The concrete approach: call the existing
-`rebuild_repo_with_policy` with the repo, which folds from the
-cache anchor through HEAD. The finished plan's timeline is
-recoverable from the fold's history — but currently the fold
-drops finished plans' timelines on finalize.
-
-**Simplest fix**: store the timeline on `FinishedPlan` directly.
-Add `commits: Vec<PlanTimelineEvent>` to the `FinishedPlan`
-struct. When a plan finalizes, move the `PlanState.commits` vec
-into the new `FinishedPlan` entry instead of dropping it.
-
-Why on `FinishedPlan`, not a side `BTreeMap<PlanKey, ...>`:
-a plan can be re-introduced and re-finalized, producing
-multiple `FinishedPlan` entries with the same `PlanKey`. Each
-entry needs its own timeline. Storing on the struct keeps them
-paired by construction.
-
-Hard-forget (plan deletion at `repo_state.rs:475`) already
-removes all `finished_plans` entries for the deleted plan. Since
-the timeline lives on `FinishedPlan`, it's automatically cleared
-by the existing delete logic — no additional cleanup needed.
-
-`clank log` reads `finished_plan.commits` directly. No re-fold,
-no reconstruction helper.
-
-This also simplifies preview (which currently re-folds
-specifically to recover the dropped timeline — it can read
-`FinishedPlan.commits` instead).
-
 ### Implementation
 
-New file `crates/cli/src/cli/log.rs`. Fold the repo, collect
-events from active plan timelines (directly available) and
-finished plan timelines (via the reconstruction helper), scan
-feedback for review events, sort chronologically with reviews
-after their target commit, render.
+**`crates/core`**: new `LogEvent` enum. `apply_commit` signature
+changes to return `Vec<LogEvent>`. Fold callers updated to
+collect or discard the events.
 
-The feedback scan is already available via
-`crate::feedback_scan::scan_feedback`. Commit subjects come from
+**`crates/cli/src/rebuild.rs`**: the rebuild loop collects log
+events from each `apply_commit` call. `RepoState` result type
+extended to carry the events (or they're returned separately).
+
+**`crates/cli/src/cli/log.rs`**: new file. Rebuilds the repo,
+filters log events by plan, scans feedback for the relevant
+SHAs, interleaves reviews, renders. Commit subjects come from
 `git log --format=%s <sha> -1`.
 
 Register in `crates/cli/src/cli/mod.rs` as `Command::Log` and
 in `main.rs`.
+
+No changes to `RepoState`, `FinishedPlan`, `PlanState`, or the
+cache encoding.
 
 ## Tests
 
@@ -158,9 +123,10 @@ in `main.rs`.
 - Log with one active plan shows commit + review timeline.
 - Log with `--plan` on a finished plan shows its timeline
   including the intro commit, later implementation commits, and
-  their reviews (verifies the finished timeline is preserved
-  in the fold, not just intro/finalize).
+  their reviews.
 - Log JSON mode produces typed event array.
+- `apply_commit` return type change doesn't break any existing
+  tests (callers updated to collect/discard events).
 
 ## Acceptance criteria
 
