@@ -24,7 +24,8 @@ Each repo's `.clank/` directory contains:
   write your review feedback. The first line of the body MUST
   be `APPROVE <one-line summary>` or `REQUEST_CHANGES <summary>`,
   like a git commit message: verdict + summary on line 1, blank
-  line, then detailed body.
+  line, then detailed body. Do not include the plan name in the
+  summary.
 - `clank finish <plan>` — finalize an approved plan (master only).
 - `clank as <label>` — bind this session to an agent label (you'll
   typically run this once per session at the start).

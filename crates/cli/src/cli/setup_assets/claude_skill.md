@@ -22,10 +22,12 @@ Each repo's `.clank/` directory contains:
 - `clank feedback write --plan X --commit Y --verdict
   approve|request-changes --author <label>` (body on stdin) —
   write your review feedback. The first line of the body MUST
-  be `APPROVE <one-line summary>` or `REQUEST_CHANGES <summary>`,
-  like a git commit message: verdict + summary on line 1, blank
-  line, then detailed body. Example:
-  `APPROVE No findings.\n\nVerification: cargo test passed.`
+  be `APPROVE <summary>` or `REQUEST_CHANGES <summary>`, like a
+  git commit message: verdict + summary on line 1, blank line,
+  then detailed body. Do not include the plan name in the
+  summary (it's already shown by `clank log`). Examples:
+  `APPROVE clean impl, one non-blocking nit`
+  `REQUEST_CHANGES overwrought API in foo.rs`
 - `clank finish <plan>` — finalize an approved plan (master only).
 - `clank as <label>` — bind this session to an agent label (you'll
   typically run this once per session at the start).
