@@ -62,6 +62,46 @@ fn head_sha(repo: &Path) -> String {
     String::from_utf8(out.stdout).unwrap().trim().to_string()
 }
 
+/// Test environment with separate home and repo dirs so user-level
+/// `~/.clank/hooks.json` doesn't leak into assertions and
+/// user→repo config shadowing can be tested.
+struct TestEnv {
+    home: tempfile::TempDir,
+    repo: tempfile::TempDir,
+}
+
+impl TestEnv {
+    fn new() -> Self {
+        Self {
+            home: tempfile::tempdir().unwrap(),
+            repo: init_repo(),
+        }
+    }
+
+    fn repo(&self) -> &Path {
+        self.repo.path()
+    }
+
+    fn home(&self) -> &Path {
+        self.home.path()
+    }
+
+    fn cmd(&self) -> Command {
+        let mut cmd = Command::new(clank_bin());
+        cmd.env("HOME", self.home());
+        cmd
+    }
+}
+
+/// Build a `Command` for `clank` with HOME isolated to a temp dir.
+/// For tests that don't use TestEnv, this uses the repo as a
+/// fallback home (no ~/.clank/ will exist there).
+fn clank_cmd(repo: &Path) -> Command {
+    let mut cmd = Command::new(clank_bin());
+    cmd.env("HOME", repo);
+    cmd
+}
+
 /// Spawn `clank wfw …` with stdout piped. Returns a handle the test
 /// can read stdout from + reap. Pre-warming sleep so the inotify
 /// watcher is attached before the test mutates files.
@@ -69,9 +109,9 @@ fn head_sha(repo: &Path) -> String {
 /// **Explicitly passes `--no-poll`** so the native-watcher path is
 /// exercised regardless of whether the test suite is running under
 /// `CODEX_SANDBOX=seatbelt`. Any test that wants polling mode must
-/// build its own `Command::new(clank_bin())` chain with `--poll`.
+/// build its own `clank_cmd(repo)` chain with `--poll`.
 fn spawn_wfw(repo: &Path, args: &[&str]) -> std::process::Child {
-    let child = Command::new(clank_bin())
+    let child = clank_cmd(repo)
         .arg("wfw")
         .arg("--no-poll")
         .args(args)
@@ -383,7 +423,7 @@ fn wfw_wakes_inside_linked_worktree_when_its_ref_moves() {
 /// repo as a one-shot subcommand. Returns stdout. Panics on non-zero
 /// exit so tests fail loudly when `finish`/`init` etc. break.
 fn clank_run(repo: &Path, args: &[&str]) -> String {
-    let output = Command::new(clank_bin())
+    let output = clank_cmd(repo)
         .args(args)
         .arg("--repo")
         .arg(repo)
@@ -417,7 +457,7 @@ fn wfw_master_plan_only_approval_routes_to_implement() {
         "APPROVE\n\nlgtm\n",
     );
 
-    let output = Command::new(clank_bin())
+    let output = clank_cmd(repo)
         .args([
             "wfw",
             "--no-poll",
@@ -470,7 +510,7 @@ fn wfw_master_code_only_approval_routes_to_finalize() {
         "APPROVE\n\nimpl lgtm\n",
     );
 
-    let output = Command::new(clank_bin())
+    let output = clank_cmd(repo)
         .args([
             "wfw",
             "--no-poll",
@@ -781,7 +821,7 @@ fn wfw_plan_already_finished_at_startup_emits_finished_and_exits() {
 
     // Plan is already finished; explicit --plan should emit a
     // finished item and exit 0 within the short timeout, NOT block.
-    let output = Command::new(clank_bin())
+    let output = clank_cmd(repo)
         .args([
             "wfw",
             "--no-poll",
@@ -838,7 +878,7 @@ fn wfw_polling_mode_wakes_on_commit_via_periodic_refold() {
 
     // Build the Command directly so we can pass --poll. The
     // shared spawn_wfw helper bakes in --no-poll.
-    let mut child = Command::new(clank_bin())
+    let mut child = clank_cmd(repo)
         .args([
             "wfw",
             "--poll",
@@ -889,7 +929,7 @@ fn wfw_master_no_plans_exits_immediately_json() {
     // path fired (the wait loop would have produced exit 2 on
     // timeout). No wall-clock assertion — it flakes on cold subprocess
     // startup and the exit shape is already a stronger signal.
-    let output = Command::new(clank_bin())
+    let output = clank_cmd(repo)
         .args([
             "wfw",
             "--no-poll",
@@ -932,7 +972,7 @@ fn wfw_reviewer_no_plans_still_blocks() {
     commit(repo, "init");
 
     let start = Instant::now();
-    let output = Command::new(clank_bin())
+    let output = clank_cmd(repo)
         .args([
             "wfw",
             "--no-poll",
@@ -974,7 +1014,7 @@ fn wfw_master_with_active_plan_still_blocks() {
     commit(repo, "[foo] intro");
 
     let start = Instant::now();
-    let output = Command::new(clank_bin())
+    let output = clank_cmd(repo)
         .args([
             "wfw",
             "--no-poll",
@@ -1006,8 +1046,8 @@ fn wfw_master_with_active_plan_still_blocks() {
 
 #[test]
 fn wfw_hook_fires_reviewer_work() {
-    let dir = init_repo();
-    let repo = dir.path();
+    let env = TestEnv::new();
+    let repo = env.repo();
     write(repo, "README.md", "# repo\n");
     commit(repo, "init");
 
@@ -1019,17 +1059,25 @@ fn wfw_hook_fires_reviewer_work() {
         &format!(r#"{{"reviewer-work": "{hook_cmd}"}}"#),
     );
 
-    let mut child = spawn_wfw(
-        repo,
-        &[
+    let mut child = env
+        .cmd()
+        .arg("wfw")
+        .arg("--no-poll")
+        .args([
             "--author",
             "alice",
             "--role",
             "reviewers",
             "--timeout",
             "30s",
-        ],
-    );
+        ])
+        .arg("--repo")
+        .arg(repo)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn");
+    std::thread::sleep(Duration::from_millis(1500));
 
     write(repo, ".clank/plans/foo.md", "# foo\n");
     commit(repo, "[foo] intro");
@@ -1047,24 +1095,32 @@ fn wfw_hook_fires_reviewer_work() {
 
 #[test]
 fn wfw_hook_failure_does_not_fail_wfw() {
-    let dir = init_repo();
-    let repo = dir.path();
+    let env = TestEnv::new();
+    let repo = env.repo();
     write(repo, "README.md", "# repo\n");
     commit(repo, "init");
 
     write(repo, ".clank/hooks.json", r#"{"reviewer-work": "exit 1"}"#);
 
-    let mut child = spawn_wfw(
-        repo,
-        &[
+    let mut child = env
+        .cmd()
+        .arg("wfw")
+        .arg("--no-poll")
+        .args([
             "--author",
             "alice",
             "--role",
             "reviewers",
             "--timeout",
             "30s",
-        ],
-    );
+        ])
+        .arg("--repo")
+        .arg(repo)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn");
+    std::thread::sleep(Duration::from_millis(1500));
 
     write(repo, ".clank/plans/foo.md", "# foo\n");
     commit(repo, "[foo] intro");
@@ -1088,14 +1144,15 @@ fn wfw_hook_failure_does_not_fail_wfw() {
 
 #[test]
 fn wfw_master_empty_exits_even_with_hooks_configured() {
-    let dir = init_repo();
-    let repo = dir.path();
+    let env = TestEnv::new();
+    let repo = env.repo();
     write(repo, "README.md", "# repo\n");
     commit(repo, "init");
 
     write(repo, ".clank/hooks.json", r#"{"reviewer-work": "true"}"#);
 
-    let output = Command::new(clank_bin())
+    let output = env
+        .cmd()
         .args([
             "wfw",
             "--no-poll",
@@ -1126,8 +1183,8 @@ fn wfw_master_empty_exits_even_with_hooks_configured() {
 
 #[test]
 fn wfw_idle_hook_returns_prompt() {
-    let dir = init_repo();
-    let repo = dir.path();
+    let env = TestEnv::new();
+    let repo = env.repo();
     write(repo, "README.md", "# repo\n");
     commit(repo, "init");
 
@@ -1137,7 +1194,8 @@ fn wfw_idle_hook_returns_prompt() {
         r#"{"idle": "echo Check stubs for ideas"}"#,
     );
 
-    let output = Command::new(clank_bin())
+    let output = env
+        .cmd()
         .args([
             "wfw",
             "--no-poll",
@@ -1164,6 +1222,63 @@ fn wfw_idle_hook_returns_prompt() {
         items[0]["prompt"].as_str().unwrap().contains("Check stubs"),
         "idle prompt should contain hook stdout; got: {}",
         items[0]["prompt"]
+    );
+}
+
+#[test]
+fn wfw_user_hooks_shadowed_by_repo_hooks() {
+    let env = TestEnv::new();
+    let repo = env.repo();
+    write(repo, "README.md", "# repo\n");
+    commit(repo, "init");
+
+    let user_marker = env.home().join("user-hook-ran.txt");
+    let repo_marker = repo.join("repo-hook-ran.txt");
+
+    let user_hooks_dir = env.home().join(".clank");
+    std::fs::create_dir_all(&user_hooks_dir).unwrap();
+    std::fs::write(
+        user_hooks_dir.join("hooks.json"),
+        format!(r#"{{"reviewer-work": "touch {}"}}"#, user_marker.display()),
+    )
+    .unwrap();
+
+    write(
+        repo,
+        ".clank/hooks.json",
+        &format!(r#"{{"reviewer-work": "touch {}"}}"#, repo_marker.display()),
+    );
+
+    let mut child = env
+        .cmd()
+        .arg("wfw")
+        .arg("--no-poll")
+        .args([
+            "--author",
+            "alice",
+            "--role",
+            "reviewers",
+            "--timeout",
+            "30s",
+        ])
+        .arg("--repo")
+        .arg(repo)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn");
+    std::thread::sleep(Duration::from_millis(1500));
+
+    write(repo, ".clank/plans/foo.md", "# foo\n");
+    commit(repo, "[foo] intro");
+
+    let exit = wait_for_exit(&mut child, Duration::from_secs(20));
+    assert!(exit.success());
+
+    assert!(repo_marker.exists(), "repo-level hook should have run");
+    assert!(
+        !user_marker.exists(),
+        "user-level hook should be shadowed by repo-level"
     );
 }
 
