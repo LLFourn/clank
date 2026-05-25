@@ -530,9 +530,6 @@ fn parse_diff_tree(stdout: &str) -> Result<CommitChanges, GitIoError> {
     let mut clank_paths: Vec<String> = Vec::new();
     let mut clank_paths_touched: Vec<String> = Vec::new();
     let mut touched_clank = false;
-    // Plans deleted from `.clank/plans/` in this commit (by key).
-    let mut plans_deleted: std::collections::BTreeSet<PlanKey> = Default::default();
-    // Plans added to `.clank/finished/` in this commit (by key).
     let mut plans_finished_added: std::collections::BTreeSet<PlanKey> = Default::default();
 
     for line in stdout.lines() {
@@ -632,16 +629,14 @@ fn parse_diff_tree(stdout: &str) -> Result<CommitChanges, GitIoError> {
                 });
             } else if is_rename && old_is_plan && !new_is_plan {
                 if let Some(old_k) = old_key {
-                    let finished_key = plan_key_from_finished_path(&new_rel);
-                    let kind =
-                        if is_finished_path(&new_rel) && finished_key.as_ref() == Some(&old_k) {
-                            PlanTouchKind::Finish
-                        } else {
-                            PlanTouchKind::Revision
-                        };
+                    if is_finished_path(&new_rel) {
+                        if let Some(fk) = plan_key_from_finished_path(&new_rel) {
+                            plans_finished_added.insert(fk);
+                        }
+                    }
                     plan_touches.push(PlanTouch {
                         plan: old_k,
-                        kind,
+                        kind: PlanTouchKind::Revision,
                         new_path: None,
                     });
                 }
@@ -670,19 +665,13 @@ fn parse_diff_tree(stdout: &str) -> Result<CommitChanges, GitIoError> {
                 } else {
                     Some(new_rel.clone())
                 };
-                if is_deletion {
-                    plans_deleted.insert(plan_key.clone());
-                }
                 plan_touches.push(PlanTouch {
                     plan: plan_key,
                     kind,
                     new_path: new_path_for_touch,
                 });
             }
-        } else if is_finished_path(&new_rel) && status_char == 'A' {
-            // Plan file added to `.clank/finished/<stem>.md` — record
-            // as a candidate finish. Confirmed below if the same plan
-            // was also deleted from `.clank/plans/` in this commit.
+        } else if is_finished_path(&new_rel) && !is_pure_delete {
             if let Some(key) = plan_key_from_finished_path(&new_rel) {
                 plans_finished_added.insert(key);
             }
@@ -691,14 +680,23 @@ fn parse_diff_tree(stdout: &str) -> Result<CommitChanges, GitIoError> {
         }
     }
 
-    // Upgrade any plan touch from Revision(delete) to Finish when the
-    // same commit also added it to `.clank/finished/`.
-    for touch in &mut plan_touches {
-        if touch.new_path.is_none()
-            && plans_deleted.contains(&touch.plan)
-            && plans_finished_added.contains(&touch.plan)
-        {
-            touch.kind = PlanTouchKind::Finish;
+    // Any new file in finished/ is a finish. Upgrade existing
+    // delete touches, or add new Finish touches.
+    for key in &plans_finished_added {
+        let upgraded = plan_touches.iter_mut().any(|t| {
+            if &t.plan == key && t.new_path.is_none() {
+                t.kind = PlanTouchKind::Finish;
+                true
+            } else {
+                false
+            }
+        });
+        if !upgraded {
+            plan_touches.push(PlanTouch {
+                plan: key.clone(),
+                kind: PlanTouchKind::Finish,
+                new_path: None,
+            });
         }
     }
 
@@ -1035,12 +1033,15 @@ mod tests {
     }
 
     #[test]
-    fn parse_diff_tree_finished_added_alone_is_not_a_plan_touch() {
-        // Adding to finished/ without deleting from plans/ doesn't produce a plan touch.
+    fn parse_diff_tree_finished_added_alone_is_finish() {
         let stdout = "A\t.clank/finished/foo.md\n";
         let parsed = parse_diff_tree(stdout).unwrap();
-        assert!(parsed.plan_touches.is_empty());
-        assert!(!parsed.has_non_plan_code_changes);
+        assert_eq!(parsed.plan_touches.len(), 1);
+        assert_eq!(parsed.plan_touches[0].plan.as_str(), "foo");
+        assert!(matches!(
+            parsed.plan_touches[0].kind,
+            PlanTouchKind::Finish
+        ));
     }
 
     #[test]

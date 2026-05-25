@@ -387,75 +387,42 @@ async fn run_amend(repo: &std::path::Path, basename: &str, args: &PurgeArgs) -> 
     Ok(())
 }
 
-/// True iff `lines` (from `git diff-tree --name-status -M`) describe
-/// exactly the plans/ → finished/ move for the given plan (or any
-/// plan when `plan_key` is None).
+/// A finish commit is one that only touches `.clank/plans/` and
+/// `.clank/finished/` paths and adds at least one file to `finished/`.
 fn is_finish_diff(lines: &[String], plan_key: Option<&PlanKey>) -> bool {
     if lines.is_empty() {
         return false;
     }
-    // For single-plan: accept R (rename) or D+A pair, nothing else.
-    // For all-plans: accept any mix of finish-shaped entries.
-    let mut deleted_plans: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
-    let mut added_finished: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    let mut has_finished_add = false;
     for line in lines {
         let mut parts = line.splitn(3, '\t');
         let status = parts.next().unwrap_or("");
         let path = parts.next().unwrap_or("");
         let path2 = parts.next();
         let sc = status.chars().next().unwrap_or(' ');
-        if sc == 'R' {
-            let old = path;
-            let new = path2.unwrap_or("");
-            let old_stem = old
-                .strip_prefix(".clank/plans/")
-                .and_then(|s| s.strip_suffix(".md"));
-            let new_stem = new
+        let relevant_path = if sc == 'R' { path2.unwrap_or("") } else { path };
+        let in_plans = relevant_path.starts_with(".clank/plans/");
+        let in_finished = relevant_path.starts_with(".clank/finished/");
+        if !in_plans && !in_finished {
+            // Also check the old side of renames
+            if sc == 'R' && path.starts_with(".clank/plans/") {
+                // old side in plans, new side checked above
+            } else {
+                return false;
+            }
+        }
+        if in_finished && sc != 'D' {
+            if let Some(stem) = relevant_path
                 .strip_prefix(".clank/finished/")
-                .and_then(|s| s.strip_suffix(".md"));
-            match (old_stem, new_stem) {
-                (Some(o), Some(n)) if o == n => {
-                    if let Some(k) = plan_key {
-                        if o != k.as_str() {
-                            return false;
-                        }
-                    }
+                .and_then(|s| s.strip_suffix(".md"))
+            {
+                if plan_key.is_none_or(|k| k.as_str() == stem) {
+                    has_finished_add = true;
                 }
-                _ => return false,
             }
-        } else if sc == 'D' {
-            if let Some(stem) = path
-                .strip_prefix(".clank/plans/")
-                .and_then(|s| s.strip_suffix(".md"))
-            {
-                deleted_plans.insert(stem.to_string());
-            } else {
-                return false;
-            }
-        } else if sc == 'A' {
-            if let Some(stem) = path
-                .strip_prefix(".clank/finished/")
-                .and_then(|s| s.strip_suffix(".md"))
-            {
-                added_finished.insert(stem.to_string());
-            } else {
-                return false;
-            }
-        } else {
-            return false;
         }
     }
-    if deleted_plans.is_empty() && added_finished.is_empty() {
-        return true; // all renames, already validated
-    }
-    if deleted_plans != added_finished {
-        return false;
-    }
-    if let Some(k) = plan_key {
-        deleted_plans.len() == 1 && deleted_plans.contains(k.as_str())
-    } else {
-        true
-    }
+    has_finished_add
 }
 
 fn confirm_single(stem: &str, into_branch: Option<&str>) -> anyhow::Result<bool> {
