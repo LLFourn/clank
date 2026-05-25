@@ -556,25 +556,23 @@ impl RepoState {
         }
 
         for plan in &finished_this_commit {
-            if let Some(ps) = self.plans.remove(plan) {
-                let intro = ps
-                    .commits
-                    .first()
-                    .map(|e| e.sha.clone())
-                    .unwrap_or_else(|| event.sha.clone());
-                self.finished_plans.push(FinishedPlan {
-                    plan: plan.clone(),
-                    intro,
-                    finalized_at: event.sha.clone(),
-                });
-                log_events.push(LogEvent::PlanFinalized {
-                    plan: plan.clone(),
-                    sha: event.sha.clone(),
-                    ts: event.author_ts,
-                });
-                if self.active_plan_hint.as_ref() == Some(plan) {
-                    self.active_plan_hint = None;
-                }
+            let intro = self
+                .plans
+                .remove(plan)
+                .and_then(|ps| ps.commits.first().map(|e| e.sha.clone()))
+                .unwrap_or_else(|| event.sha.clone());
+            self.finished_plans.push(FinishedPlan {
+                plan: plan.clone(),
+                intro,
+                finalized_at: event.sha.clone(),
+            });
+            log_events.push(LogEvent::PlanFinalized {
+                plan: plan.clone(),
+                sha: event.sha.clone(),
+                ts: event.author_ts,
+            });
+            if self.active_plan_hint.as_ref() == Some(plan) {
+                self.active_plan_hint = None;
             }
         }
 
@@ -1050,6 +1048,21 @@ mod tests {
             s.finished_plans[0].finalized_at.as_str(),
             sha("2222").as_str()
         );
+    }
+
+    #[test]
+    fn finish_without_prior_intro_still_archives() {
+        let mut s = RepoState::new();
+        s.apply_commit(&ev(
+            "1111",
+            1,
+            "squashed plan",
+            touches(&[("foo", TouchKind::Finish)]),
+        ));
+        assert!(s.plans.is_empty());
+        assert_eq!(s.finished_plans.len(), 1);
+        assert_eq!(s.finished_plans[0].plan, plan("foo"));
+        assert_eq!(s.finished_plans[0].intro.as_str(), sha("1111").as_str());
     }
 
     #[test]
