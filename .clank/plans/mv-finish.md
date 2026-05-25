@@ -69,18 +69,22 @@ whose only diff is the rename.
 
 ### `clank unfinish <plan>`
 
-1. Walk first-parent from HEAD looking for the commit that
-   renamed `.clank/plans/<plan>.md` →
-   `.clank/finished/<plan>.md`.
-2. If that commit ONLY contains the rename (no other changes):
-   drop it via `git rebase --onto <parent> <sha> HEAD`.
-3. If the commit has other changes: strip just the rename by
-   amending the commit to undo the mv (restore the file to
-   `plans/`).
+Does NOT rewrite history. Just moves the file back:
 
-Edge case: if the finished file has been modified since the
-finish commit, `unfinish` should still work — it moves the
-current `finished/<plan>.md` back to `plans/<plan>.md`.
+```
+git mv .clank/finished/<plan>.md .clank/plans/<plan>.md
+git commit -m "Unfinish <plan>"
+```
+
+The finish commit stays in history. The fold sees the reverse
+rename (finished/ → plans/) and re-intros the plan. This is
+the same mechanism as "rename INTO plans/" which already
+produces `TouchKind::Intro`.
+
+This avoids all the rewrite edge cases (later edits to the
+finished file, non-HEAD finish commits, mixed commits). The
+history accurately reflects what happened: plan was finished,
+then un-finished.
 
 ### Migration
 
@@ -175,8 +179,8 @@ finished/ for the given stem.
 - `git mv plans/foo.md finished/foo.md` → fold archives plan.
 - `git mv finished/foo.md plans/foo.md` → fold re-intros plan.
 - `clank finish` produces the mv commit.
-- `clank unfinish` drops a finish-only commit.
-- `clank unfinish` strips the mv from a mixed commit.
+- `clank unfinish` produces the reverse mv commit.
+- Finish then edit `finished/foo.md` then unfinish preserves edits.
 - `parse_diff_tree` rename plans→finished = Finish touch.
 - `parse_diff_tree` rename finished→plans = Intro touch.
 - Purge amend works with rename-based finalize.
