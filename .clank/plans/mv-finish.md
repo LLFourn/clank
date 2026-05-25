@@ -33,26 +33,32 @@ Two changes:
 
 ### Finish detection in the fold
 
-The diff parser (`parse_diff_tree`) already distinguishes:
-- rename out of plans/ (currently → Delete)
-- rename into plans/ (currently → Intro)
+Don't rely on git's rename detection. Instead, after
+collecting all plan touches and finished-path touches from
+the diff, reconcile: if the same stem has a Delete from
+`plans/` AND an Add to `finished/` in the same commit,
+collapse both into a single `TouchKind::Finish`. Reverse
+(Delete from `finished/` + Add to `plans/`) collapses into
+`TouchKind::Intro` (unfinish).
 
-Add a new case: rename from `.clank/plans/<key>.md` to
-`.clank/finished/<key>.md` → model as a **Finish** touch
-(new `TouchKind::Finish`). The fold's `apply_commit` handles
-`TouchKind::Finish` by archiving the plan to `finished_plans`
-(same as `newly_finished` does today) instead of deleting it.
+This means `parse_diff_tree` collects two independent lists:
+- plan touches (as today): intro/revise/delete on `plans/`
+- finished touches: add/delete on `finished/`
+
+Then a reconciliation pass merges them. A plan Delete +
+finished Add = Finish. A finished Delete + plan Intro =
+Intro (unfinish). Unmatched finished adds/deletes are just
+recorded for the clank_paths / strip_paths tracking.
 
 This replaces the `newly_finished` / `enrich_with_newly_finished`
-/ `finish_predicate_at` machinery entirely. Finish is now
+/ `finish_predicate_at` machinery entirely. Finish is
 detectable from the diff alone — no tree inspection needed.
 
 ### `is_finished_path`
 
 New predicate: `.clank/finished/<name>.md` (flat, same rules
 as `is_plan_path` but under `finished/`). Used by
-`parse_diff_tree` to detect the destination side of a finish
-rename.
+`parse_diff_tree` to detect finished-path touches.
 
 ### `clank finish`
 
