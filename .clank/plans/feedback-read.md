@@ -34,10 +34,15 @@ commit abc1234
     "author": "codex",
     "verdict": "approve",
     "summary": "clean impl, one non-blocking nit",
+    "details": "No blocking findings.\n...",
     "source_path": ".clank/agents/codex/feedback/abc1234.md"
   }
 ]
 ```
+
+`summary` is the first line after the verdict header.
+`details` is everything after the blank line separator
+(same split as `FeedbackBody::summary()` / `details()`).
 
 ## Implementation
 
