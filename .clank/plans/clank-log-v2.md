@@ -4,10 +4,10 @@
 
 Fix `clank log` to be fast and look good. Three changes:
 
-1. **`rebuild_from(repo, from, to)`** — new rebuild API that
-   loads the best cache before `from`, folds silently to `from`'s
-   parent, then collects log events from `from` through `to`.
-   The caller specifies the range; the cache is invisible.
+1. **`rebuild_from(repo, from, to)`** — new rebuild API. `from`
+   exclusive, `to` inclusive (git-log convention). Loads the best
+   cache before `from`, folds silently through `from`, then
+   collects log events for `(from, to]`. Cache is invisible.
 2. **Default to last 30 commit groups** — `clank log` shows at
    most 30 commit groups by default. `-n N` overrides.
 3. **Git-log-style output** — mimic `git log` rendering with
@@ -73,7 +73,8 @@ clank log [<range>] [--plan <stem>] [--all] [-n N] [--oneline]
 ```
 
 `<range>` is optional, git-log-style:
-- `<sha>` — equivalent to `<sha>..HEAD` (same as git log).
+- `<sha>` — show from that commit (inclusive) to HEAD. Resolved
+  to `rebuild_from(parent_of(sha), HEAD)` so `sha` is included.
 - `<from>..<to>` — commits reachable from `to` but not from
   `from` (exclusive from, inclusive to). Passed directly to
   `rebuild_from(from, to)`.
