@@ -204,14 +204,31 @@ async fn finalize(
 ) -> anyhow::Result<()> {
     let finished_dir = repo.join(".clank/finished");
     std::fs::create_dir_all(&finished_dir)?;
-    let marker = finished_dir.join(stem);
-    // Remove old directory-style finished marker if present.
-    if marker.is_dir() {
-        std::fs::remove_dir_all(&marker)?;
-    }
-    std::fs::write(&marker, "")?;
 
-    let rel_finished = format!(".clank/finished/{stem}");
+    // Remove legacy directory-style finished marker if present.
+    let legacy_dir = finished_dir.join(stem);
+    if legacy_dir.is_dir() {
+        std::fs::remove_dir_all(&legacy_dir)?;
+    }
+    // Remove legacy no-extension marker file if present.
+    let legacy_marker = finished_dir.join(stem);
+    if legacy_marker.is_file() {
+        std::fs::remove_file(&legacy_marker)?;
+    }
+
+    // Move the plan file into finished/ to commit as a rename/move.
+    let plan_path = repo.join(format!(".clank/plans/{stem}.md"));
+    let finished_path = finished_dir.join(format!("{stem}.md"));
+    if plan_path.exists() {
+        std::fs::copy(&plan_path, &finished_path)?;
+    } else {
+        // Plan file missing (e.g. hidden); write an empty finished marker.
+        std::fs::write(&finished_path, "")?;
+    }
+
+    let rel_plan = format!(".clank/plans/{stem}.md");
+    let rel_finished = format!(".clank/finished/{stem}.md");
+    git_run(repo, &["rm", "--quiet", "--force", "--", &rel_plan])?;
     git_run(repo, &["add", "--", &rel_finished])?;
 
     let default_msg = format!("Finalize {stem}");
@@ -228,15 +245,36 @@ fn head_is_finalize_for(repo: &Path, stem: &str) -> anyhow::Result<bool> {
     let output = std::process::Command::new("git")
         .arg("-C")
         .arg(repo)
-        .args(["diff-tree", "--no-commit-id", "--name-only", "-r", "HEAD"])
+        .args(["diff-tree", "--no-commit-id", "--name-status", "-r", "HEAD"])
         .output()?;
     if !output.status.success() {
         return Ok(false);
     }
     let stdout = String::from_utf8_lossy(&output.stdout);
-    let expected = format!(".clank/finished/{stem}");
-    let lines: Vec<&str> = stdout.lines().filter(|l| !l.is_empty()).collect();
-    Ok(!lines.is_empty() && lines.iter().all(|l| *l == expected))
+    let plan_path = format!(".clank/plans/{stem}.md");
+    let finished_path = format!(".clank/finished/{stem}.md");
+    let mut deleted_plan = false;
+    let mut added_finished = false;
+    for line in stdout.lines().filter(|l| !l.is_empty()) {
+        let mut parts = line.splitn(3, '\t');
+        let status = parts.next().unwrap_or("");
+        let path = parts.next().unwrap_or("");
+        match status.chars().next() {
+            Some('D') if path == plan_path => deleted_plan = true,
+            Some('A') if path == finished_path => added_finished = true,
+            Some('R') => {
+                // Rename: check old and new paths.
+                if path == plan_path {
+                    let new_path = parts.next().unwrap_or("");
+                    if new_path == finished_path {
+                        return Ok(true);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(deleted_plan && added_finished)
 }
 
 fn git_run(repo: &Path, args: &[&str]) -> anyhow::Result<()> {
@@ -303,7 +341,8 @@ mod tests {
     #[tokio::test]
     async fn finalize_writes_empty_marker_and_commits() {
         let dir = init_repo();
-        write_at(dir.path(), "README.md", "seed\n");
+        // A plan file must exist so finalize can move it.
+        write_at(dir.path(), ".clank/plans/foo.md", "# foo\n");
         run_git(dir.path(), &["add", "-A"]);
         run_git(dir.path(), &["commit", "--quiet", "-m", "seed"]);
 
@@ -312,9 +351,10 @@ mod tests {
             .await
             .unwrap();
 
-        let marker = dir.path().join(".clank/finished/foo");
-        assert!(marker.exists(), "marker file should exist");
-        assert_eq!(std::fs::read_to_string(&marker).unwrap(), "");
+        let finished = dir.path().join(".clank/finished/foo.md");
+        assert!(finished.exists(), "finished file should exist");
+        let plan = dir.path().join(".clank/plans/foo.md");
+        assert!(!plan.exists(), "plan file should be removed");
         let out = std::process::Command::new("git")
             .arg("-C")
             .arg(dir.path())
@@ -330,10 +370,11 @@ mod tests {
     #[tokio::test]
     async fn finalize_replaces_old_directory_style_marker() {
         let dir = init_repo();
-        write_at(dir.path(), "README.md", "seed\n");
+        write_at(dir.path(), ".clank/plans/foo.md", "# foo\n");
         run_git(dir.path(), &["add", "-A"]);
         run_git(dir.path(), &["commit", "--quiet", "-m", "seed"]);
 
+        // Simulate a pre-existing legacy directory-style marker.
         write_at(dir.path(), ".clank/finished/foo/codex.md", "APPROVE\n");
 
         let preview = mk_preview_ready();
@@ -341,8 +382,9 @@ mod tests {
             .await
             .unwrap();
 
-        let marker = dir.path().join(".clank/finished/foo");
-        assert!(marker.is_file(), "should be a file, not a directory");
-        assert_eq!(std::fs::read_to_string(&marker).unwrap(), "");
+        let finished = dir.path().join(".clank/finished/foo.md");
+        assert!(finished.is_file(), "should produce .md file");
+        let legacy_dir = dir.path().join(".clank/finished/foo");
+        assert!(!legacy_dir.is_dir(), "legacy directory should be removed");
     }
 }

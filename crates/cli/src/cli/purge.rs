@@ -170,12 +170,15 @@ pub(crate) fn build_amend_program(
     };
     let head_is_finalize = !head_lines.is_empty()
         && head_lines.iter().all(|l| match plan_key {
-            Some(k) => *l == format!(".clank/finished/{}", k.as_str()),
-            None => l.starts_with(".clank/finished/"),
+            Some(k) => {
+                *l == format!(".clank/finished/{}.md", k.as_str())
+                    || *l == format!(".clank/plans/{}.md", k.as_str())
+            }
+            None => l.starts_with(".clank/finished/") || l.starts_with(".clank/plans/"),
         });
     if !head_is_finalize {
         let desc = match plan_key {
-            Some(k) => format!(".clank/finished/{}", k.as_str()),
+            Some(k) => format!(".clank/finished/{}.md", k.as_str()),
             None => ".clank/finished/".to_string(),
         };
         anyhow::bail!(
@@ -209,7 +212,7 @@ pub(crate) fn build_amend_program(
                     "--",
                     &head_sha,
                     &format!(".clank/plans/{s}.md"),
-                    &format!(".clank/finished/{s}"),
+                    &format!(".clank/finished/{s}.md"),
                 ])
                 .output()?;
             if !out.status.success() {
@@ -518,8 +521,10 @@ mod tests {
         write_file(repo, "src/lib.rs", "// impl\n");
         git(repo, &["add", "-A"]);
         git(repo, &["commit", "--quiet", "-m", "[foo] intro + impl"]);
-        write_file(repo, ".clank/finished/foo", "");
-        git(repo, &["add", "-A"]);
+        // Move plan file to finished/ to trigger Finish detection.
+        write_file(repo, ".clank/finished/foo.md", "# foo\n");
+        git(repo, &["rm", "--quiet", ".clank/plans/foo.md"]);
+        git(repo, &["add", ".clank/finished/foo.md"]);
         git(repo, &["commit", "--quiet", "-m", "Finalize foo"]);
         dir
     }
@@ -531,17 +536,14 @@ mod tests {
         let plan = PlanKey::parse("foo").unwrap();
         let program = build_amend_program(repo, Some(&plan)).unwrap();
         assert_eq!(program.head_sha, head_sha(repo));
-        assert!(
-            program.strip_paths.iter().any(|p| p.contains("plans/foo")),
-            "strip_paths should include plan file: {:?}",
-            program.strip_paths
-        );
+        // After mv-finish, plans/foo.md is deleted and finished/foo.md is
+        // present in the HEAD tree. Only the finished path needs stripping.
         assert!(
             program
                 .strip_paths
                 .iter()
-                .any(|p| p.contains("finished/foo")),
-            "strip_paths should include finalize dir: {:?}",
+                .any(|p| p.contains("finished/foo.md")),
+            "strip_paths should include finalize file: {:?}",
             program.strip_paths
         );
     }
@@ -626,9 +628,10 @@ mod tests {
         write_file(repo, "src/lib.rs", "// impl\n");
         git(repo, &["add", "-A"]);
         git(repo, &["commit", "--quiet", "-m", "[foo,foobar] intro"]);
-        // Finalize foobar (not foo).
-        write_file(repo, ".clank/finished/foobar", "");
-        git(repo, &["add", "-A"]);
+        // Finalize foobar (not foo) using the mv-finish approach.
+        write_file(repo, ".clank/finished/foobar.md", "# foobar\n");
+        git(repo, &["rm", "--quiet", ".clank/plans/foobar.md"]);
+        git(repo, &["add", ".clank/finished/foobar.md"]);
         git(repo, &["commit", "--quiet", "-m", "Finalize foobar"]);
 
         let foo = PlanKey::parse("foo").unwrap();

@@ -2,11 +2,10 @@
 //! builds [`clank_core::repo_state::CommitEvent`]s, and calls
 //! [`clank_core::repo_state::RepoState::apply_commit`] on each.
 
-use std::collections::BTreeSet;
 use std::path::PathBuf;
 
 use crate::disk_format::FeedbackPath;
-use crate::git_io::{self, GitIoError};
+use crate::git_io::GitIoError;
 use crate::lifecycle::{CommitSha, PlanKey};
 use crate::repo_state::RepoState;
 use clank_core::repo_state as fold;
@@ -23,14 +22,12 @@ pub struct CommitEvent {
     pub author_ts: i64,
     pub subject: String,
     pub changes: CommitChanges,
-    pub newly_finished: BTreeSet<PlanKey>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct CommitChanges {
     pub plan_touches: Vec<PlanTouch>,
     pub has_non_plan_code_changes: bool,
-    pub finalize_changes: Vec<FinalizeChange>,
     pub clank_paths: Vec<String>,
     pub touched_clank: bool,
     pub clank_paths_touched: Vec<String>,
@@ -47,19 +44,9 @@ pub struct PlanTouch {
 pub enum PlanTouchKind {
     Intro,
     Revision,
+    Finish,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct FinalizeChange {
-    pub plan_key: PlanKey,
-    pub kind: FinalizeChangeKind,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum FinalizeChangeKind {
-    Added,
-    Remove,
-}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FeedbackBlob {
@@ -78,8 +65,7 @@ pub async fn derive_state(
     let mut state = RepoState::empty(repo_root.clone());
     state.head = snapshot.head.clone();
     for event in &snapshot.history {
-        let enriched = enrich_with_newly_finished(&repo_root, event).await?;
-        let _ = apply_commit(&mut state, &enriched);
+        let _ = apply_commit(&mut state, event);
     }
     Ok(state)
 }
@@ -96,6 +82,7 @@ pub fn apply_commit(state: &mut RepoState, event: &CommitEvent) -> Vec<fold::Log
                 (PlanTouchKind::Intro, false) => fold::TouchKind::Delete,
                 (PlanTouchKind::Revision, true) => fold::TouchKind::Revise,
                 (PlanTouchKind::Revision, false) => fold::TouchKind::Delete,
+                (PlanTouchKind::Finish, _) => fold::TouchKind::Finish,
             },
         })
         .collect();
@@ -105,45 +92,10 @@ pub fn apply_commit(state: &mut RepoState, event: &CommitEvent) -> Vec<fold::Log
         author_ts: event.author_ts,
         subject: event.subject.clone(),
         plan_touches,
-        newly_finished: event.newly_finished.clone(),
         has_code_changes: event.changes.has_non_plan_code_changes,
     };
 
     state.fold.apply_commit(&new_event)
-}
-
-/// Compute the stateless `newly_finished` set for a commit by
-/// comparing parent-tree and commit-tree finish predicates.
-pub async fn enrich_with_newly_finished(
-    repo_root: &std::path::Path,
-    event: &CommitEvent,
-) -> Result<CommitEvent, GitIoError> {
-    let mut candidates: BTreeSet<PlanKey> = BTreeSet::new();
-    for fc in &event.changes.finalize_changes {
-        candidates.insert(fc.plan_key.clone());
-    }
-    for touch in &event.changes.plan_touches {
-        candidates.insert(touch.plan.clone());
-    }
-    if candidates.is_empty() {
-        return Ok(event.clone());
-    }
-
-    let parent = git_io::parent_of(repo_root, &event.commit).await?;
-    let mut newly_finished: BTreeSet<PlanKey> = BTreeSet::new();
-    for plan in candidates {
-        let parent_satisfied = match parent.as_ref() {
-            Some(p) => git_io::finish_predicate_at(repo_root, p, &plan).await?,
-            None => false,
-        };
-        let commit_satisfied = git_io::finish_predicate_at(repo_root, &event.commit, &plan).await?;
-        if !parent_satisfied && commit_satisfied {
-            newly_finished.insert(plan);
-        }
-    }
-    let mut out = event.clone();
-    out.newly_finished = newly_finished;
-    Ok(out)
 }
 
 #[cfg(test)]
@@ -165,18 +117,25 @@ mod tests {
         }
     }
 
-    fn ev(commit: &str, changes: CommitChanges, newly_finished: BTreeSet<PlanKey>) -> CommitEvent {
+    fn ev(commit: &str, changes: CommitChanges) -> CommitEvent {
         CommitEvent {
             commit: sha(commit),
             author_ts: 0,
             subject: String::new(),
             changes,
-            newly_finished,
+        }
+    }
+
+    fn finish_touch(p: &str) -> PlanTouch {
+        PlanTouch {
+            plan: plan(p),
+            kind: PlanTouchKind::Finish,
+            new_path: None,
         }
     }
 
     #[test]
-    fn intro_then_finalize_drives_newly_finished() {
+    fn intro_then_finish_archives_plan() {
         let mut state = RepoState::empty(PathBuf::from("/r"));
         apply_commit(
             &mut state,
@@ -186,7 +145,6 @@ mod tests {
                     plan_touches: vec![intro("foo")],
                     ..Default::default()
                 },
-                BTreeSet::new(),
             ),
         );
         assert!(state.fold.plans.contains_key(&plan("foo")));
@@ -195,8 +153,10 @@ mod tests {
             &mut state,
             &ev(
                 "2222222222222222222222222222222222222222",
-                CommitChanges::default(),
-                std::iter::once(plan("foo")).collect(),
+                CommitChanges {
+                    plan_touches: vec![finish_touch("foo")],
+                    ..Default::default()
+                },
             ),
         );
         assert!(!state.fold.plans.contains_key(&plan("foo")));

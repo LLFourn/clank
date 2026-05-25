@@ -10,7 +10,7 @@
 
 use std::path::Path;
 
-use crate::disk_snapshot::{CommitEvent, apply_commit, derive_state, enrich_with_newly_finished};
+use crate::disk_snapshot::{CommitEvent, apply_commit, derive_state};
 use crate::git_io::{self, GitIoError};
 use crate::lifecycle::CommitSha;
 use crate::repo_state::RepoState;
@@ -83,15 +83,13 @@ pub async fn rebuild_from(
         };
         for meta in metas {
             let changes = git_io::diff_tree_changes(repo_root, &meta.sha).await?;
-            let raw = CommitEvent {
+            let event = CommitEvent {
                 commit: meta.sha.clone(),
                 author_ts: meta.author_ts,
                 subject: meta.subject,
                 changes,
-                newly_finished: std::collections::BTreeSet::new(),
             };
-            let enriched = enrich_with_newly_finished(repo_root, &raw).await?;
-            let _ = apply_commit(&mut state, &enriched);
+            let _ = apply_commit(&mut state, &event);
         }
         state.head = Some(target.clone());
     }
@@ -105,15 +103,13 @@ pub async fn rebuild_from(
     let mut log_events = Vec::new();
     for meta in metas {
         let changes = git_io::diff_tree_changes(repo_root, &meta.sha).await?;
-        let raw = CommitEvent {
+        let event = CommitEvent {
             commit: meta.sha.clone(),
             author_ts: meta.author_ts,
             subject: meta.subject,
             changes,
-            newly_finished: std::collections::BTreeSet::new(),
         };
-        let enriched = enrich_with_newly_finished(repo_root, &raw).await?;
-        log_events.extend(apply_commit(&mut state, &enriched));
+        log_events.extend(apply_commit(&mut state, &event));
     }
     state.head = Some(to.clone());
 
@@ -231,15 +227,13 @@ async fn fold_forward(
     let metas = git_io::first_parent_commits_between(repo_root, &base, target_head).await?;
     for meta in metas {
         let changes = git_io::diff_tree_changes(repo_root, &meta.sha).await?;
-        let raw = CommitEvent {
+        let event = CommitEvent {
             commit: meta.sha.clone(),
             author_ts: meta.author_ts,
             subject: meta.subject,
             changes,
-            newly_finished: std::collections::BTreeSet::new(),
         };
-        let enriched = enrich_with_newly_finished(repo_root, &raw).await?;
-        apply_commit(state, &enriched);
+        apply_commit(state, &event);
     }
     state.head = Some(target_head.clone());
     Ok(())
@@ -309,7 +303,9 @@ mod tests {
         let dir = init_repo();
         write_file(dir.path(), ".clank/plans/foo.md", "# foo\n");
         commit(dir.path(), "[foo] intro");
-        write_file(dir.path(), ".clank/finished/foo", "");
+        // Move the plan file to finished/ to trigger Finish detection.
+        write_file(dir.path(), ".clank/finished/foo.md", "# foo\n");
+        run_git(dir.path(), &["rm", "--quiet", ".clank/plans/foo.md"]);
         commit(dir.path(), "Finalize foo");
         let state = rebuild_repo(dir.path()).await.unwrap();
         let key = PlanKey::parse("foo").unwrap();

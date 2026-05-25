@@ -8,8 +8,7 @@ use tokio::process::Command;
 
 use crate::disk_format::parse_feedback_path;
 use crate::disk_snapshot::{
-    CommitChanges, CommitEvent, CommitSnapshot, FeedbackBlob, FinalizeChange, FinalizeChangeKind,
-    PlanTouch, PlanTouchKind,
+    CommitChanges, CommitEvent, CommitSnapshot, FeedbackBlob, PlanTouch, PlanTouchKind,
 };
 use crate::lifecycle::{CommitSha, PlanKey};
 
@@ -147,48 +146,6 @@ pub async fn show_blob(
     run_ok_raw(repo, &["show", &spec]).await
 }
 
-/// List `(filename, content)` pairs under `.clank/finished/<stem>/`
-/// in the tree at `rev`. Returned in lexicographic filename order.
-/// Empty when the directory doesn't exist at that rev. Used to surface
-/// the approval snapshot a finalize commit sealed.
-pub async fn read_finalize_snapshot(
-    repo: &Path,
-    rev: &CommitSha,
-    stem: &str,
-) -> Result<Vec<(String, String)>, GitIoError> {
-    let dir = format!(".clank/finished/{stem}/");
-    let output = run(repo, &["ls-tree", "-r", "--", rev.as_str(), &dir]).await?;
-    if !output.status.success() {
-        return Ok(Vec::new());
-    }
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let mut paths: Vec<PathBuf> = Vec::new();
-    for line in stdout.lines() {
-        let (head_part, path) = match line.split_once('\t') {
-            Some(p) => p,
-            None => continue,
-        };
-        let mut tokens = head_part.split_ascii_whitespace();
-        let _mode = tokens.next();
-        let kind = tokens.next();
-        if kind != Some("blob") {
-            continue;
-        }
-        paths.push(PathBuf::from(path));
-    }
-    paths.sort();
-    let mut out = Vec::with_capacity(paths.len());
-    for path in paths {
-        let body = show_blob(repo, rev, &path).await?;
-        let filename = path
-            .file_name()
-            .map(|s| s.to_string_lossy().to_string())
-            .unwrap_or_default();
-        out.push((filename, body));
-    }
-    Ok(out)
-}
-
 /// `git show <sha>` — return the full commit patch (header + diff) as text.
 /// Used by the commit-diff route to render impl commits.
 /// Patch text from `git diff <from>:<from_path> <to>:<to_path>` (unified
@@ -213,17 +170,6 @@ pub async fn diff_two_blobs(
 
 pub async fn show_commit(repo: &Path, sha: &CommitSha) -> Result<String, GitIoError> {
     run_ok_raw(repo, &["show", "--no-color", sha.as_str()]).await
-}
-
-/// True iff `.clank/finished/<plan>` exists as a blob in the tree.
-pub async fn finish_predicate_at(
-    repo: &Path,
-    tree: &CommitSha,
-    plan: &PlanKey,
-) -> Result<bool, GitIoError> {
-    let spec = format!("{}:.clank/finished/{}", tree.as_str(), plan.as_str());
-    let output = run(repo, &["cat-file", "-t", &spec]).await?;
-    Ok(output.status.success())
 }
 
 /// True iff `ancestor` is reachable from `head` along any parent
@@ -369,7 +315,7 @@ pub async fn tree_plan_paths(
 ) -> Result<Vec<String>, GitIoError> {
     let mut pathspecs: Vec<String> = vec![format!(".clank/plans/{stem}.md")];
     if include_finalize {
-        pathspecs.push(format!(".clank/finished/{stem}"));
+        pathspecs.push(format!(".clank/finished/{stem}.md"));
     }
     let mut args: Vec<String> = vec![
         "ls-tree".into(),
@@ -581,10 +527,13 @@ pub async fn diff_tree_changes(repo: &Path, sha: &CommitSha) -> Result<CommitCha
 fn parse_diff_tree(stdout: &str) -> Result<CommitChanges, GitIoError> {
     let mut plan_touches: Vec<PlanTouch> = Vec::new();
     let mut has_non_plan_code_changes = false;
-    let mut finalize_changes: Vec<FinalizeChange> = Vec::new();
     let mut clank_paths: Vec<String> = Vec::new();
     let mut clank_paths_touched: Vec<String> = Vec::new();
     let mut touched_clank = false;
+    // Plans deleted from `.clank/plans/` in this commit (by key).
+    let mut plans_deleted: std::collections::BTreeSet<PlanKey> = Default::default();
+    // Plans added to `.clank/finished/` in this commit (by key).
+    let mut plans_finished_added: std::collections::BTreeSet<PlanKey> = Default::default();
 
     for line in stdout.lines() {
         let line = line.trim_end_matches('\r');
@@ -650,9 +599,6 @@ fn parse_diff_tree(stdout: &str) -> Result<CommitChanges, GitIoError> {
             .map(|p| is_plan_path(&PathBuf::from(p)))
             .unwrap_or(false);
 
-        let new_finalize = parse_finalize_subpath(&new_rel);
-        let old_finalize = old_path.and_then(|p| parse_finalize_subpath(&PathBuf::from(p)));
-
         if new_is_plan || old_is_plan {
             // Resolve the plan key on each side. With nested-path
             // rejection (Phase 5 of event-log-and-finished), every
@@ -685,13 +631,19 @@ fn parse_diff_tree(stdout: &str) -> Result<CommitChanges, GitIoError> {
                     new_path: Some(new_rel.clone()),
                 });
             } else if is_rename && old_is_plan && !new_is_plan {
-                // Rename OUT of `.clank/plans/<key>.md` (e.g. into
-                // `.clank/plans/done/`). The plan key no longer
-                // lives at a flat plan path — model as Delete.
+                // Rename OUT of `.clank/plans/<key>.md`. When the
+                // destination is `.clank/finished/<key>.md`, this is
+                // the canonical mv-finish operation. Otherwise it's a
+                // plain delete.
                 if let Some(old_k) = old_key {
+                    let kind = if is_finished_path(&new_rel) {
+                        PlanTouchKind::Finish
+                    } else {
+                        PlanTouchKind::Revision
+                    };
                     plan_touches.push(PlanTouch {
                         plan: old_k,
-                        kind: PlanTouchKind::Revision,
+                        kind,
                         new_path: None,
                     });
                 }
@@ -720,45 +672,35 @@ fn parse_diff_tree(stdout: &str) -> Result<CommitChanges, GitIoError> {
                 } else {
                     Some(new_rel.clone())
                 };
+                if is_deletion {
+                    plans_deleted.insert(plan_key.clone());
+                }
                 plan_touches.push(PlanTouch {
                     plan: plan_key,
                     kind,
                     new_path: new_path_for_touch,
                 });
             }
-        } else if new_finalize.is_some() || old_finalize.is_some() {
-            if status_char == 'D' && !is_rename {
-                if let Some(plan_key) = new_finalize {
-                    finalize_changes.push(FinalizeChange {
-                        plan_key,
-                        kind: FinalizeChangeKind::Remove,
-                    });
-                }
-            } else if is_rename {
-                if let Some(old_key) = old_finalize {
-                    if new_finalize.as_ref() != Some(&old_key) {
-                        finalize_changes.push(FinalizeChange {
-                            plan_key: old_key,
-                            kind: FinalizeChangeKind::Remove,
-                        });
-                    }
-                }
-                if let Some(plan_key) = new_finalize {
-                    finalize_changes.push(FinalizeChange {
-                        plan_key,
-                        kind: FinalizeChangeKind::Added,
-                    });
-                }
-            } else {
-                if let Some(plan_key) = new_finalize {
-                    finalize_changes.push(FinalizeChange {
-                        plan_key,
-                        kind: FinalizeChangeKind::Added,
-                    });
-                }
+        } else if is_finished_path(&new_rel) && status_char == 'A' {
+            // Plan file added to `.clank/finished/<stem>.md` — record
+            // as a candidate finish. Confirmed below if the same plan
+            // was also deleted from `.clank/plans/` in this commit.
+            if let Some(key) = plan_key_from_finished_path(&new_rel) {
+                plans_finished_added.insert(key);
             }
         } else if !new_rel.starts_with(".clank") {
             has_non_plan_code_changes = true;
+        }
+    }
+
+    // Upgrade any plan touch from Revision(delete) to Finish when the
+    // same commit also added it to `.clank/finished/`.
+    for touch in &mut plan_touches {
+        if touch.new_path.is_none()
+            && plans_deleted.contains(&touch.plan)
+            && plans_finished_added.contains(&touch.plan)
+        {
+            touch.kind = PlanTouchKind::Finish;
         }
     }
 
@@ -769,20 +711,10 @@ fn parse_diff_tree(stdout: &str) -> Result<CommitChanges, GitIoError> {
     Ok(CommitChanges {
         plan_touches,
         has_non_plan_code_changes,
-        finalize_changes,
         clank_paths,
         touched_clank,
         clank_paths_touched,
     })
-}
-
-fn parse_finalize_subpath(rel: &Path) -> Option<PlanKey> {
-    let under = rel.strip_prefix(".clank/finished").ok()?;
-    let stem = under.to_str()?;
-    if stem.is_empty() || stem.contains('/') {
-        return None;
-    }
-    PlanKey::parse(stem).ok()
 }
 
 /// Gather a `CommitSnapshot` for `repo_root`. IO half of the
@@ -815,7 +747,6 @@ pub async fn snapshot(repo_root: &Path) -> Result<CommitSnapshot, GitIoError> {
             author_ts: meta.author_ts,
             subject: meta.subject,
             changes,
-            newly_finished: std::collections::BTreeSet::new(),
         });
     }
 
@@ -916,6 +847,45 @@ fn walk_files(root: &Path, max_depth: usize, out: &mut Vec<PathBuf>) -> std::io:
         Ok(())
     }
     walk(root, 1, max_depth, out)
+}
+
+/// True iff `rel` is exactly `.clank/finished/<name>.md` (flat, no subdirs).
+fn is_finished_path(rel: &Path) -> bool {
+    let mut comps = rel.components().filter_map(|c| match c {
+        std::path::Component::Normal(s) => s.to_str(),
+        _ => None,
+    });
+    if comps.next() != Some(".clank") {
+        return false;
+    }
+    if comps.next() != Some("finished") {
+        return false;
+    }
+    let third = match comps.next() {
+        Some(s) => s,
+        None => return false,
+    };
+    comps.next().is_none() && third.ends_with(".md")
+}
+
+/// Extract the `PlanKey` from a `.clank/finished/<stem>.md` path.
+fn plan_key_from_finished_path(rel: &Path) -> Option<PlanKey> {
+    let mut comps = rel.components().filter_map(|c| match c {
+        std::path::Component::Normal(s) => s.to_str(),
+        _ => None,
+    });
+    if comps.next() != Some(".clank") {
+        return None;
+    }
+    if comps.next() != Some("finished") {
+        return None;
+    }
+    let name = comps.next()?;
+    if comps.next().is_some() {
+        return None;
+    }
+    let stem = name.strip_suffix(".md")?;
+    PlanKey::parse(stem).ok()
 }
 
 fn is_plan_path(rel: &Path) -> bool {
@@ -1054,27 +1024,33 @@ mod tests {
         let changes = &parsed;
         assert!(changes.plan_touches.is_empty());
         assert!(!changes.has_non_plan_code_changes);
-        assert!(changes.finalize_changes.is_empty());
     }
 
     #[test]
-    fn parse_diff_tree_finalize_added() {
+    fn parse_diff_tree_finish_detected_when_plan_deleted_and_finished_added() {
+        // Deleting from plans/ and adding to finished/ in the same commit = Finish.
+        let stdout = "D\t.clank/plans/foo.md\nA\t.clank/finished/foo.md\n";
+        let parsed = parse_diff_tree(stdout).unwrap();
+        assert_eq!(parsed.plan_touches.len(), 1);
+        assert_eq!(parsed.plan_touches[0].plan.as_str(), "foo");
+        assert!(matches!(parsed.plan_touches[0].kind, PlanTouchKind::Finish));
+    }
+
+    #[test]
+    fn parse_diff_tree_finished_added_alone_is_not_a_plan_touch() {
+        // Adding to finished/ without deleting from plans/ doesn't produce a plan touch.
+        let stdout = "A\t.clank/finished/foo.md\n";
+        let parsed = parse_diff_tree(stdout).unwrap();
+        assert!(parsed.plan_touches.is_empty());
+        assert!(!parsed.has_non_plan_code_changes);
+    }
+
+    #[test]
+    fn parse_diff_tree_finished_without_md_extension_ignored() {
+        // Old-style `.clank/finished/foo` (no .md) is not a finished path.
         let stdout = "A\t.clank/finished/foo\n";
         let parsed = parse_diff_tree(stdout).unwrap();
         assert!(parsed.plan_touches.is_empty());
         assert!(!parsed.has_non_plan_code_changes);
-        assert_eq!(parsed.finalize_changes.len(), 1);
-        assert_eq!(parsed.finalize_changes[0].plan_key.as_str(), "foo");
-        assert!(matches!(parsed.finalize_changes[0].kind, FinalizeChangeKind::Added));
-    }
-
-    #[test]
-    fn parse_diff_tree_finalize_deleted_emits_remove() {
-        let stdout = "D\t.clank/finished/foo\n";
-        let parsed = parse_diff_tree(stdout).unwrap();
-        assert_eq!(parsed.finalize_changes.len(), 1);
-        let fc = &parsed.finalize_changes[0];
-        assert_eq!(fc.plan_key.as_str(), "foo");
-        assert!(matches!(fc.kind, FinalizeChangeKind::Remove));
     }
 }

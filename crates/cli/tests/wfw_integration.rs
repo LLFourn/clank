@@ -757,17 +757,16 @@ fn wfw_mixed_work_and_finished_on_one_wake() {
 
 #[test]
 fn wfw_finish_wake_survives_early_snapshot_event() {
-    // Race regression: `clank finish` writes
-    // `.clank/finished/<stem>/...` BEFORE committing the finalize
-    // tree. The FS event for that file write wakes wfw, the
-    // 200ms debounce ends BEFORE the commit lands, and the
-    // refold sees nothing finished. If wfw relied solely on the
-    // post-commit git-ref event for the second wake, that event
-    // could fail to fire (notify drops it under load, debounce
-    // ate it, etc.) and wfw would block forever. The heartbeat
-    // refold is the safety net. This test forces the ordering:
-    // write the snapshot file manually, sleep PAST the debounce
-    // window, THEN run the same `git` calls clank finish does.
+    // Race regression: `clank finish` moves `.clank/plans/<stem>.md`
+    // to `.clank/finished/<stem>.md` BEFORE committing. The FS event
+    // for that file write wakes wfw, the 200ms debounce ends BEFORE
+    // the commit lands, and the refold sees nothing finished. If wfw
+    // relied solely on the post-commit git-ref event for the second
+    // wake, that event could fail to fire (notify drops it under
+    // load, debounce ate it, etc.) and wfw would block forever. The
+    // heartbeat refold is the safety net. This test forces the
+    // ordering: write the finished file manually, sleep PAST the
+    // debounce window, THEN run the same `git` calls clank finish does.
     let dir = init_repo();
     let repo = dir.path();
     write(repo, ".clank/plans/foo.md", "# foo\n");
@@ -794,14 +793,15 @@ fn wfw_finish_wake_survives_early_snapshot_event() {
         ],
     );
 
-    // Stage 1: write the empty marker file.
-    write(repo, ".clank/finished/foo", "");
+    // Stage 1: write the finished plan file (mv-finish approach).
+    write(repo, ".clank/finished/foo.md", "# foo\n");
 
     // Stage 2: sleep past the watcher's debounce window.
     std::thread::sleep(Duration::from_millis(1200));
 
-    // Stage 3: commit the finalize marker.
-    git(repo, &["add", ".clank/finished/foo"]);
+    // Stage 3: commit the finalize — delete from plans/, add to finished/.
+    git(repo, &["rm", "--quiet", ".clank/plans/foo.md"]);
+    git(repo, &["add", ".clank/finished/foo.md"]);
     git(repo, &["commit", "--quiet", "-m", "Finalize foo"]);
 
     let exit = wait_for_exit(&mut child, Duration::from_secs(20));

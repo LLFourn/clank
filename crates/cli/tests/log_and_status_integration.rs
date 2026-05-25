@@ -73,11 +73,13 @@ fn status_trims_finished_plans_to_three() {
             &format!("# {name}\n"),
         );
         commit(repo, &format!("[{name}] intro"));
+        // Move plan file to finished/ to trigger Finish detection.
         write(
             repo,
-            &format!(".clank/finished/{name}"),
-            "",
+            &format!(".clank/finished/{name}.md"),
+            &format!("# {name}\n"),
         );
+        git(repo, &["rm", "--quiet", &format!(".clank/plans/{name}.md")]);
         commit(repo, &format!("Finalize {name}"));
     }
 
@@ -110,11 +112,13 @@ fn status_all_shows_all_finished_plans() {
             &format!("# {name}\n"),
         );
         commit(repo, &format!("[{name}] intro"));
+        // Move plan file to finished/ to trigger Finish detection.
         write(
             repo,
-            &format!(".clank/finished/{name}"),
-            "",
+            &format!(".clank/finished/{name}.md"),
+            &format!("# {name}\n"),
         );
+        git(repo, &["rm", "--quiet", &format!(".clank/plans/{name}.md")]);
         commit(repo, &format!("Finalize {name}"));
     }
 
@@ -216,11 +220,9 @@ fn log_finished_plan_shows_full_timeline() {
         "APPROVE\n\nimpl ok\n",
     );
 
-    write(
-        repo,
-        ".clank/finished/bar",
-        "",
-    );
+    // Move plan file to finished/ to trigger Finish detection.
+    write(repo, ".clank/finished/bar.md", "# bar\n");
+    git(repo, &["rm", "--quiet", ".clank/plans/bar.md"]);
     commit(repo, "Finalize bar");
 
     let out = run_clank(repo, &["log", "--plan", "bar"]);

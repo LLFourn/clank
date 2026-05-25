@@ -468,9 +468,9 @@ pub struct PurgeArgs {
     #[arg(long, value_name = "MSG")]
     pub squash: Option<String>,
     /// Amend HEAD instead of building a new chain. HEAD must
-    /// already be a finalize commit (every changed path under
-    /// `.clank/finished/<stem>/`, or under `.clank/finished/`
-    /// for `--all`).
+    /// already be a finalize commit (paths under `.clank/finished/`
+    /// and `.clank/plans/` matching the plan stem, or under
+    /// `.clank/finished/` for `--all`).
     #[arg(long)]
     pub amend: bool,
     /// Permit rewriting a protected branch (`main`/`master` or any

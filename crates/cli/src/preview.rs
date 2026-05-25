@@ -188,7 +188,7 @@ pub async fn build_rewrite_preview(
         let strip_predicate_for_diff = |p: &str| -> bool {
             p == format!(".clank/plans/{}.md", plan_key.as_str())
                 || (include_finalize
-                    && p == format!(".clank/finished/{}", plan_key.as_str()))
+                    && p == format!(".clank/finished/{}.md", plan_key.as_str()))
         };
         let contributes_non_strippable = changes.has_non_plan_code_changes
             || changes
@@ -246,9 +246,6 @@ pub async fn build_rewrite_preview_all(
         let changes = diff_tree_changes(repo_root, &meta.sha).await?;
         for touch in &changes.plan_touches {
             plans_seen.insert(touch.plan.clone());
-        }
-        for fc in &changes.finalize_changes {
-            plans_seen.insert(fc.plan_key.clone());
         }
         if intro_pos.is_none() && changes.touched_clank {
             intro_pos = Some(idx);
@@ -332,7 +329,7 @@ async fn re_fold_finished_plan_natives(
     plan_key: &PlanKey,
     finalized_at: &CommitSha,
 ) -> Result<BTreeSet<CommitSha>, PreviewError> {
-    use crate::disk_snapshot::{CommitEvent, apply_commit, enrich_with_newly_finished};
+    use crate::disk_snapshot::{CommitEvent, apply_commit};
 
     let metas = first_parent_commits_to(repo_root, finalized_at).await?;
     let final_idx = metas
@@ -347,15 +344,13 @@ async fn re_fold_finished_plan_natives(
 
     for meta in &metas[start_idx..final_idx] {
         let changes = diff_tree_changes(repo_root, &meta.sha).await?;
-        let raw = CommitEvent {
+        let event = CommitEvent {
             commit: meta.sha.clone(),
             author_ts: meta.author_ts,
             subject: meta.subject.clone(),
             changes,
-            newly_finished: BTreeSet::new(),
         };
-        let enriched = enrich_with_newly_finished(repo_root, &raw).await?;
-        apply_commit(&mut scratch, &enriched);
+        apply_commit(&mut scratch, &event);
     }
     let mut native: BTreeSet<CommitSha> = scratch
         .fold
@@ -594,8 +589,9 @@ mod tests {
         write_file(dir.path(), ".clank/plans/a.md", "# a v2\n");
         write_file(dir.path(), ".clank/plans/b.md", "# b v2\n");
         commit(dir.path(), "[a,b] shared work");
-        // Approve b and finalize.
-        write_file(dir.path(), ".clank/finished/b", "");
+        // Move the plan file to finished/ to trigger Finish detection.
+        write_file(dir.path(), ".clank/finished/b.md", "# b v2\n");
+        run_git(dir.path(), &["rm", "--quiet", ".clank/plans/b.md"]);
         commit(dir.path(), "Finalize b");
 
         let state = rebuild_repo_with_policy(dir.path(), CachePolicy::Bypass)

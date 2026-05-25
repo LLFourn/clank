@@ -241,11 +241,6 @@ pub struct CommitEvent {
     pub author_ts: i64,
     pub subject: String,
     pub plan_touches: Vec<PlanTouchInput>,
-    /// Plans whose freeze rule fires AT this commit (parent tree
-    /// not finished, this commit's tree finished). Computed
-    /// stateless by the daemon as a pure parent/child tree
-    /// predicate; the fold takes this as ground truth.
-    pub newly_finished: BTreeSet<PlanKey>,
     pub has_code_changes: bool,
 }
 
@@ -265,6 +260,7 @@ pub enum TouchKind {
     Intro,
     Revise,
     Delete,
+    Finish,
 }
 
 // ============================================================
@@ -278,7 +274,6 @@ pub enum TouchKind {
 pub struct ClassifierInputs<'a> {
     pub subject: &'a str,
     pub touches: &'a BTreeMap<PlanKey, TouchKind>,
-    pub finalizes: &'a BTreeSet<PlanKey>,
     pub has_code_changes: bool,
     pub active_plan_hint: Option<&'a PlanKey>,
     pub known_plans: &'a BTreeSet<PlanKey>,
@@ -442,8 +437,6 @@ pub fn classify(inputs: ClassifierInputs<'_>) -> ClassifierOutput {
         }
     };
 
-    let _ = inputs.finalizes;
-
     ClassifierOutput {
         plan_attribution,
         warnings,
@@ -481,7 +474,6 @@ impl RepoState {
         let classified = classify(ClassifierInputs {
             subject: &event.subject,
             touches: &touches,
-            finalizes: &event.newly_finished,
             has_code_changes: event.has_code_changes,
             active_plan_hint: self.active_plan_hint.as_ref(),
             known_plans: &known_plans,
@@ -496,6 +488,7 @@ impl RepoState {
         }
 
         let mut intros_this_commit: BTreeSet<PlanKey> = BTreeSet::new();
+        let mut finished_this_commit: BTreeSet<PlanKey> = BTreeSet::new();
 
         for touch in &event.plan_touches {
             match touch.kind {
@@ -528,15 +521,16 @@ impl RepoState {
                         self.active_plan_hint = None;
                     }
                 }
+                TouchKind::Finish => {
+                    finished_this_commit.insert(touch.plan.clone());
+                }
             }
         }
 
-        // Per-plan timeline events: one push site. Affected =
-        // touches ∪ attribution ∪ newly_finished.
         let mut affected: BTreeSet<PlanKey> = BTreeSet::new();
         affected.extend(touches.keys().cloned());
         affected.extend(classified.plan_attribution.iter().cloned());
-        affected.extend(event.newly_finished.iter().cloned());
+        affected.extend(finished_this_commit.iter().cloned());
 
         for plan in &affected {
             let Some(ps) = self.plans.get_mut(plan) else {
@@ -550,7 +544,7 @@ impl RepoState {
                 touched_plan: tp,
                 touched_code: tc,
             });
-            if !intros_this_commit.contains(plan) && !event.newly_finished.contains(plan) {
+            if !intros_this_commit.contains(plan) && !finished_this_commit.contains(plan) {
                 log_events.push(LogEvent::PlanCommit {
                     plan: plan.clone(),
                     sha: event.sha.clone(),
@@ -561,9 +555,7 @@ impl RepoState {
             }
         }
 
-        // Soft-archive finalized plans: move them to
-        // `finished_plans` with the boundary SHAs.
-        for plan in &event.newly_finished {
+        for plan in &finished_this_commit {
             if let Some(ps) = self.plans.remove(plan) {
                 let intro = ps
                     .commits
@@ -580,6 +572,9 @@ impl RepoState {
                     sha: event.sha.clone(),
                     ts: event.author_ts,
                 });
+                if self.active_plan_hint.as_ref() == Some(plan) {
+                    self.active_plan_hint = None;
+                }
             }
         }
 
@@ -669,7 +664,6 @@ pub struct CommitNode {
     pub ts: i64,
     pub subject: String,
     pub touches: BTreeMap<PlanKey, TouchKind>,
-    pub finalizes: BTreeSet<PlanKey>,
     pub has_code_changes: bool,
     /// Plans the master attributed this commit to. Empty set ==
     /// ad-hoc / `[misc]`.
@@ -831,7 +825,6 @@ mod tests {
             author_ts: ts,
             subject: subject.into(),
             plan_touches,
-            newly_finished: BTreeSet::new(),
             has_code_changes: false,
         }
     }
@@ -845,7 +838,7 @@ mod tests {
         let out = classify(ClassifierInputs {
             subject: "[foo] revise",
             touches: &touches,
-            finalizes: &BTreeSet::new(),
+
             has_code_changes: false,
             active_plan_hint: None,
             known_plans: &known,
@@ -861,7 +854,7 @@ mod tests {
         let out = classify(ClassifierInputs {
             subject: "[ghost] random",
             touches: &BTreeMap::new(),
-            finalizes: &BTreeSet::new(),
+
             has_code_changes: true,
             active_plan_hint: None,
             known_plans: &known,
@@ -881,7 +874,7 @@ mod tests {
         let out = classify(ClassifierInputs {
             subject: "[misc] one-off",
             touches: &BTreeMap::new(),
-            finalizes: &BTreeSet::new(),
+
             has_code_changes: true,
             active_plan_hint: Some(&hint),
             known_plans: &known,
@@ -904,7 +897,7 @@ mod tests {
         let out = classify(ClassifierInputs {
             subject: "[foo,bar] cross-cut",
             touches: &touches,
-            finalizes: &BTreeSet::new(),
+
             has_code_changes: false,
             active_plan_hint: Some(&hint),
             known_plans: &known,
@@ -925,7 +918,7 @@ mod tests {
         let out = classify(ClassifierInputs {
             subject: "introduce foo",
             touches: &touches,
-            finalizes: &BTreeSet::new(),
+
             has_code_changes: false,
             active_plan_hint: None,
             known_plans: &known,
@@ -946,7 +939,7 @@ mod tests {
         let out = classify(ClassifierInputs {
             subject: "implement",
             touches: &BTreeMap::new(),
-            finalizes: &BTreeSet::new(),
+
             has_code_changes: true,
             active_plan_hint: Some(&hint),
             known_plans: &known,
@@ -1035,7 +1028,7 @@ mod tests {
     }
 
     #[test]
-    fn finalize_moves_to_finished_plans() {
+    fn finish_moves_to_finished_plans() {
         let mut s = RepoState::new();
         s.apply_commit(&ev(
             "1111",
@@ -1043,9 +1036,12 @@ mod tests {
             "[foo] intro",
             touches(&[("foo", TouchKind::Intro)]),
         ));
-        let mut e = ev("2222", 2, "freeze foo", Vec::new());
-        e.newly_finished = std::iter::once(plan("foo")).collect();
-        s.apply_commit(&e);
+        s.apply_commit(&ev(
+            "2222",
+            2,
+            "Finish foo",
+            touches(&[("foo", TouchKind::Finish)]),
+        ));
         assert!(!s.plans.contains_key(&plan("foo")));
         assert_eq!(s.finished_plans.len(), 1);
         assert_eq!(s.finished_plans[0].plan, plan("foo"));
@@ -1054,13 +1050,10 @@ mod tests {
             s.finished_plans[0].finalized_at.as_str(),
             sha("2222").as_str()
         );
-        // The freeze commit produced a per-plan event before the
-        // plan was archived.
-        // (consumed by the move into finished_plans).
     }
 
     #[test]
-    fn active_plan_hint_sanitized_after_lifecycle_removal() {
+    fn active_plan_hint_sanitized_after_finish() {
         let mut s = RepoState::new();
         s.apply_commit(&ev(
             "1111",
@@ -1069,9 +1062,12 @@ mod tests {
             touches(&[("foo", TouchKind::Intro)]),
         ));
         assert_eq!(s.active_plan_hint, Some(plan("foo")));
-        let mut e = ev("2222", 2, "freeze foo", Vec::new());
-        e.newly_finished = std::iter::once(plan("foo")).collect();
-        s.apply_commit(&e);
+        s.apply_commit(&ev(
+            "2222",
+            2,
+            "Finish foo",
+            touches(&[("foo", TouchKind::Finish)]),
+        ));
         assert!(s.active_plan_hint.is_none());
     }
 

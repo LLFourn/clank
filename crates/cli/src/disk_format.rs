@@ -7,7 +7,7 @@
 
 use std::path::{Component, Path, PathBuf};
 
-use crate::lifecycle::{AgentLabel, CommitRef, CommitSha, PlanKey};
+use crate::lifecycle::{AgentLabel, CommitRef, CommitSha};
 use clank_core::feedback_view::{filename_mode, filename_stem};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -51,32 +51,6 @@ pub fn parse_feedback_path(rel: &Path) -> Option<FeedbackPath> {
         author,
         target_ref,
         raw: rel.to_path_buf(),
-    })
-}
-
-/// A parsed `.clank/finished/<plan-stem>` path — an empty marker
-/// file indicating a plan is finished.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct FinalizePath {
-    pub plan_key: PlanKey,
-}
-
-/// Parse a path relative to `<repo>/.clank/finished/` into a
-/// `FinalizePath`. Expected shape: `<plan-stem>` (a single segment,
-/// no extension).
-pub fn parse_finalize_path(rel: &Path) -> Option<FinalizePath> {
-    let segments: Vec<&std::ffi::OsStr> = rel
-        .components()
-        .filter_map(|c| match c {
-            Component::Normal(s) => Some(s),
-            _ => None,
-        })
-        .collect();
-    let [stem] = segments.as_slice() else {
-        return None;
-    };
-    Some(FinalizePath {
-        plan_key: PlanKey::parse(stem.to_str()?).ok()?,
     })
 }
 
@@ -178,22 +152,6 @@ mod tests {
     fn legacy_layout_rejected() {
         assert!(parse_feedback_path(&p("foo/abc1234/bob.md")).is_none());
         assert!(parse_feedback_path(&p("feedback/foo/abc1234/bob.md")).is_none());
-    }
-
-    #[test]
-    fn parse_finalize_path_single_segment() {
-        let parsed = parse_finalize_path(&p("foo")).unwrap();
-        assert_eq!(parsed.plan_key.as_str(), "foo");
-    }
-
-    #[test]
-    fn parse_finalize_path_rejects_nested() {
-        assert!(parse_finalize_path(&p("foo/alice.md")).is_none());
-    }
-
-    #[test]
-    fn parse_finalize_path_rejects_invalid_plan_key() {
-        assert!(parse_finalize_path(&p(".bad")).is_none());
     }
 
     #[test]
