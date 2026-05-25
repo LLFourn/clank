@@ -82,8 +82,13 @@ review/revise).
 
 - Add `AdHocReview` and `AdHocRevise` to `WaitItem`.
 - `derive_work` gains `ad_hoc: &[AdHocEvent]` + ad-hoc feedback
-  + `force_review: bool`. When force_review is true, emits work
-  items for unreviewed/changes-requested ad-hoc commits.
+  + `ReviewConfig`. When `force_review_on_misc_commits` is true,
+  emits work items for unreviewed/changes-requested ad-hoc
+  commits.
+- When `ad_hoc_reviewers` is `Some(list)`, only those agents
+  are eligible reviewers for ad-hoc commits (reviewer wfw only
+  emits work if the calling author is in the list). When `None`,
+  any reviewer is eligible (same as plan review).
 
 ### `crates/cli/src/cli/wfw.rs`
 
@@ -116,6 +121,8 @@ review/revise).
 - `force_review_on_misc_commits=false`: no ad-hoc work items.
 - `clank feedback write --adhoc --commit <sha>` writes to
   `_` path.
+- `ad_hoc_reviewers=["codex"]`: only codex gets ad-hoc review
+  work; alice (not in list) gets none.
 
 ## Acceptance criteria
 
