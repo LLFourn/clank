@@ -56,6 +56,8 @@ only the latest should be reviewable.
 
 In `derive_status` (`crates/core/src/wait.rs`), instead of
 iterating all `self.ad_hoc`, only consider the last entry.
+An approve on the latest ad-hoc commit implicitly approves
+all earlier ones in the chain.
 
 ## Surface
 
@@ -63,3 +65,5 @@ iterating all `self.ad_hoc`, only consider the last entry.
   `self.ad_hoc.last()` for ad-hoc work.
 - Test: REQUEST_CHANGES on ad-hoc commit, then new ad-hoc
   commit → old revise item gone.
+- Test: approve on latest ad-hoc → no work for any earlier
+  ad-hoc commits.

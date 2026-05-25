@@ -243,8 +243,8 @@ impl RepoState {
         }
 
         let mut ad_hoc = Vec::new();
-        if policy.force_review_on_misc_commits && !self.ad_hoc.is_empty() {
-            for event in &self.ad_hoc {
+        if policy.force_review_on_misc_commits {
+            if let Some(event) = self.ad_hoc.last() {
                 let entries = reviews.reviews_for(&event.sha);
                 let gate = compute_gate(&entries);
                 ad_hoc.push(AdHocWorkState {
