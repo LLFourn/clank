@@ -6,7 +6,7 @@ use clank_core::HookEvent;
 use clank_core::ids::{CommitSha, PlanKey};
 use clank_core::vocab::CommitGateState;
 
-pub type HookConfig = BTreeMap<HookEvent, String>;
+pub type HookConfig = BTreeMap<HookEvent, Option<String>>;
 
 pub struct HookFiring {
     pub event: HookEvent,
@@ -18,8 +18,8 @@ pub struct HookFiring {
 
 pub fn run_hook(repo: &Path, config: &HookConfig, firing: &HookFiring) {
     let cmd = match config.get(&firing.event) {
-        Some(c) => c,
-        None => return,
+        Some(Some(c)) => c,
+        _ => return,
     };
     let mut child = std::process::Command::new("sh");
     child
@@ -63,7 +63,7 @@ pub fn run_hook(repo: &Path, config: &HookConfig, firing: &HookFiring) {
 /// non-empty stdout becomes a synthetic prompt. Returns None if no
 /// idle hook is configured or stdout is empty.
 pub fn run_idle_hook(repo: &Path, config: &HookConfig) -> Option<String> {
-    let cmd = config.get(&HookEvent::Idle)?;
+    let cmd = config.get(&HookEvent::Idle)?.as_ref()?;
     let output = std::process::Command::new("sh")
         .arg("-c")
         .arg(cmd)

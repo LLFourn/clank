@@ -7,7 +7,9 @@ use serde::Deserialize;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Config {
     pub review: ReviewConfig,
-    pub hooks: BTreeMap<HookEvent, String>,
+    /// `Some(cmd)` = hook set, `None` = explicitly disabled (null).
+    /// Absent keys are not in the map at all.
+    pub hooks: BTreeMap<HookEvent, Option<String>>,
 }
 
 impl Default for Config {
@@ -54,16 +56,40 @@ struct ReviewFile {
     require_commit_prefix: Option<bool>,
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug)]
 struct HooksFile {
-    #[serde(default, alias = "master-work")]
-    master_work: Option<String>,
-    #[serde(default, alias = "reviewer-work")]
-    reviewer_work: Option<String>,
-    #[serde(default, alias = "plan-finalized")]
-    plan_finalized: Option<String>,
-    #[serde(default)]
-    idle: Option<String>,
+    entries: BTreeMap<String, serde_json::Value>,
+}
+
+impl<'de> Deserialize<'de> for HooksFile {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let map: BTreeMap<String, serde_json::Value> = Deserialize::deserialize(deserializer)?;
+        Ok(HooksFile { entries: map })
+    }
+}
+
+impl Default for HooksFile {
+    fn default() -> Self {
+        HooksFile {
+            entries: BTreeMap::new(),
+        }
+    }
+}
+
+impl HooksFile {
+    fn get(&self, event: HookEvent) -> Option<Option<String>> {
+        let key_underscore = event_to_key_name(event);
+        let key_kebab = event.as_str();
+        let val = self
+            .entries
+            .get(key_underscore)
+            .or_else(|| self.entries.get(key_kebab))?;
+        match val {
+            serde_json::Value::Null => Some(None),
+            serde_json::Value::String(s) => Some(Some(s.clone())),
+            _ => None,
+        }
+    }
 }
 
 pub fn load(repo_root: &Path) -> Config {
@@ -85,7 +111,7 @@ fn load_with_home(repo_root: &Path, home: Option<&Path>) -> Config {
     // repo overwrites user
     merge_legacy_file(&mut legacy, &repo_root.join(".clank/hooks.json"));
     for (event, cmd) in legacy {
-        cfg.hooks.entry(event).or_insert(cmd);
+        cfg.hooks.entry(event).or_insert(Some(cmd));
     }
 
     cfg
@@ -124,21 +150,16 @@ fn apply_layer(cfg: &mut Config, path: Option<&Path>) -> BTreeSet<String> {
         }
     }
     if let Some(hooks) = parsed.hooks {
-        if let Some(v) = hooks.master_work {
-            cfg.hooks.insert(HookEvent::MasterWork, v);
-            present.insert("hooks.master_work".to_string());
-        }
-        if let Some(v) = hooks.reviewer_work {
-            cfg.hooks.insert(HookEvent::ReviewerWork, v);
-            present.insert("hooks.reviewer_work".to_string());
-        }
-        if let Some(v) = hooks.plan_finalized {
-            cfg.hooks.insert(HookEvent::PlanFinalized, v);
-            present.insert("hooks.plan_finalized".to_string());
-        }
-        if let Some(v) = hooks.idle {
-            cfg.hooks.insert(HookEvent::Idle, v);
-            present.insert("hooks.idle".to_string());
+        for event in [
+            HookEvent::MasterWork,
+            HookEvent::ReviewerWork,
+            HookEvent::PlanFinalized,
+            HookEvent::Idle,
+        ] {
+            if let Some(v) = hooks.get(event) {
+                cfg.hooks.insert(event, v);
+                present.insert(format!("hooks.{}", event_to_key_name(event)));
+            }
         }
     }
     present
@@ -295,7 +316,7 @@ fn resolve_key_values_with_home(repo_root: &Path, home: Option<&Path>) -> Vec<Ke
 
     let mut full_cfg = repo_cfg.clone();
     for (event, cmd) in &legacy {
-        full_cfg.hooks.entry(*event).or_insert_with(|| cmd.clone());
+        full_cfg.hooks.entry(*event).or_insert_with(|| Some(cmd.clone()));
     }
 
     for key in &repo_present {
@@ -336,31 +357,22 @@ fn resolve_key_values_with_home(repo_root: &Path, home: Option<&Path>) -> Vec<Ke
         .collect()
 }
 
+fn hook_display(v: Option<&Option<String>>) -> String {
+    match v {
+        Some(Some(cmd)) => cmd.clone(),
+        _ => "null".to_string(),
+    }
+}
+
 pub fn get_value(cfg: &Config, key: &str) -> String {
     match key {
         "review.adhoc_feedback" => cfg.review.adhoc_feedback.to_string(),
         "review.plan_feedback" => cfg.review.plan_feedback.to_string(),
         "review.require_commit_prefix" => cfg.review.require_commit_prefix.to_string(),
-        "hooks.master_work" => cfg
-            .hooks
-            .get(&HookEvent::MasterWork)
-            .cloned()
-            .unwrap_or_else(|| "null".to_string()),
-        "hooks.reviewer_work" => cfg
-            .hooks
-            .get(&HookEvent::ReviewerWork)
-            .cloned()
-            .unwrap_or_else(|| "null".to_string()),
-        "hooks.plan_finalized" => cfg
-            .hooks
-            .get(&HookEvent::PlanFinalized)
-            .cloned()
-            .unwrap_or_else(|| "null".to_string()),
-        "hooks.idle" => cfg
-            .hooks
-            .get(&HookEvent::Idle)
-            .cloned()
-            .unwrap_or_else(|| "null".to_string()),
+        "hooks.master_work" => hook_display(cfg.hooks.get(&HookEvent::MasterWork)),
+        "hooks.reviewer_work" => hook_display(cfg.hooks.get(&HookEvent::ReviewerWork)),
+        "hooks.plan_finalized" => hook_display(cfg.hooks.get(&HookEvent::PlanFinalized)),
+        "hooks.idle" => hook_display(cfg.hooks.get(&HookEvent::Idle)),
         _ => "unknown key".to_string(),
     }
 }
@@ -659,8 +671,8 @@ mod tests {
             r#"{"hooks": {"master_work": "notify master", "idle": "do idle"}}"#,
         );
         let cfg = load_isolated(tmp.path());
-        assert_eq!(cfg.hooks[&HookEvent::MasterWork], "notify master");
-        assert_eq!(cfg.hooks[&HookEvent::Idle], "do idle");
+        assert_eq!(cfg.hooks[&HookEvent::MasterWork], Some("notify master".to_string()));
+        assert_eq!(cfg.hooks[&HookEvent::Idle], Some("do idle".to_string()));
     }
 
     #[test]
@@ -672,7 +684,7 @@ mod tests {
             r#"{"hooks": {"master-work": "kebab-cmd"}}"#,
         );
         let cfg = load_isolated(tmp.path());
-        assert_eq!(cfg.hooks[&HookEvent::MasterWork], "kebab-cmd");
+        assert_eq!(cfg.hooks[&HookEvent::MasterWork], Some("kebab-cmd".to_string()));
     }
 
     #[test]
@@ -687,7 +699,7 @@ mod tests {
             r#"{"master-work": "legacy-cmd"}"#,
         );
         let cfg = load_isolated(tmp.path());
-        assert_eq!(cfg.hooks[&HookEvent::MasterWork], "config-cmd");
+        assert_eq!(cfg.hooks[&HookEvent::MasterWork], Some("config-cmd".to_string()));
     }
 
     #[test]
@@ -698,7 +710,7 @@ mod tests {
             r#"{"master-work": "legacy-cmd"}"#,
         );
         let cfg = load_isolated(tmp.path());
-        assert_eq!(cfg.hooks[&HookEvent::MasterWork], "legacy-cmd");
+        assert_eq!(cfg.hooks[&HookEvent::MasterWork], Some("legacy-cmd".to_string()));
     }
 
     #[test]
@@ -821,5 +833,20 @@ mod tests {
         let kvs = resolve_key_values_with_home(tmp.path(), None);
         let kv = kvs.iter().find(|kv| kv.key == "review.adhoc_feedback").unwrap();
         assert_eq!(kv.source, ValueSource::Repo);
+    }
+
+    #[test]
+    fn null_hook_in_config_blocks_legacy() {
+        let tmp = tempfile::tempdir().unwrap();
+        write(
+            &tmp.path().join(".clank/hooks.json"),
+            r#"{"master-work": "legacy-cmd"}"#,
+        );
+        write(
+            &tmp.path().join(".clank/config.json"),
+            r#"{"hooks": {"master_work": null}}"#,
+        );
+        let cfg = load_isolated(tmp.path());
+        assert_eq!(cfg.hooks.get(&HookEvent::MasterWork), Some(&None));
     }
 }
