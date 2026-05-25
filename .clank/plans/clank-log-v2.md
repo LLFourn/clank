@@ -4,10 +4,10 @@
 
 Fix `clank log` to be fast and look good. Three changes:
 
-1. **`rebuild_from(repo, start_sha)`** — new rebuild API that
-   loads the best cache at or before `start_sha`, then folds
-   from there to HEAD collecting log events. The caller says
-   where to start; the cache is invisible.
+1. **`rebuild_from(repo, from, to)`** — new rebuild API that
+   loads the best cache before `from`, folds silently to `from`'s
+   parent, then collects log events from `from` through `to`.
+   The caller specifies the range; the cache is invisible.
 2. **Default to last 30 commit groups** — `clank log` shows at
    most 30 commit groups by default. `-n N` overrides.
 3. **Git-log-style output** — mimic `git log` rendering with
@@ -31,16 +31,17 @@ pub async fn rebuild_from(
 ) -> Result<(RepoState, LogEvents), RebuildError>
 ```
 
-`from` is inclusive, `to` is inclusive. The rebuild module:
+`from` is exclusive, `to` is inclusive — same as `git log from..to`.
+The rebuild module:
 
 1. Finds the best cache at or before `from`'s parent. Loads it.
 2. Two-phase fold-forward from cache to `to`:
-   - **Phase 1 (silent):** fold from cache anchor to `from`'s
-     parent. Builds state but discards log events.
-   - **Phase 2 (collecting):** fold from `from` through `to`,
-     collecting log events for every commit.
+   - **Phase 1 (silent):** fold from cache anchor through `from`.
+     Builds state but discards log events.
+   - **Phase 2 (collecting):** fold from `from` (exclusive)
+     through `to` (inclusive), collecting log events.
 3. Returns `(RepoState, LogEvents)` — events only for commits
-   in `[from, to]`.
+   in `(from, to]`.
 
 If no cache predates `from`, cold-fold from root with the same
 two-phase split.
@@ -72,9 +73,12 @@ clank log [<range>] [--plan <stem>] [--all] [-n N] [--oneline]
 ```
 
 `<range>` is optional, git-log-style:
-- `<sha>` — from that commit to HEAD (inclusive).
-- `<from>..<to>` — from `from` (exclusive) to `to` (inclusive).
-- Omitted — inferred from the plan's intro to HEAD.
+- `<sha>` — equivalent to `<sha>..HEAD` (same as git log).
+- `<from>..<to>` — commits reachable from `to` but not from
+  `from` (exclusive from, inclusive to). Passed directly to
+  `rebuild_from(from, to)`.
+- Omitted — inferred from the plan's intro's parent to HEAD
+  (so the intro itself is included).
 
 Plan selection:
 - No args + one active plan: that plan's timeline.
@@ -87,8 +91,9 @@ Plan selection:
 1. Fast rebuild (`rebuild_repo_with_policy(Use)`) to get fold
    state → resolve the range (find the plan's intro SHA if no
    explicit range given).
-2. `rebuild_from(from, to)` → get `(state, log_events)`.
-   Both inclusive — `rebuild_from` handles caching internally.
+2. `rebuild_from(intro_parent, head)` → get events for `(intro_parent, head]`.
+   The intro itself is included (exclusive from). `rebuild_from`
+   handles caching internally.
    Filter events by plan. Scan feedback. Render.
 
 The first call is a cache hit (~instant). The second call loads
@@ -157,7 +162,8 @@ Array of typed event objects with reviews as separate `kind:
 ### `crates/cli/src/rebuild.rs`
 
 - `fold_forward` returns `LogEvents` (merge the two variants).
-- New `pub async fn rebuild_from(repo, start) -> Result<(RepoState, LogEvents)>`.
+- New `pub async fn rebuild_from(repo, from, to) -> Result<(RepoState, LogEvents)>`.
+  `from` exclusive, `to` inclusive (git-log convention).
 - Existing `rebuild_repo_with_policy` unchanged (discards log).
 
 ### `crates/cli/src/disk_snapshot.rs`
@@ -181,24 +187,25 @@ Array of typed event objects with reviews as separate `kind:
 
 ## Tests
 
-- `rebuild_from` with a warm cache: fold-forwards from cache,
-  returns events only from `start` onward (not from cache anchor).
-- `rebuild_from` on a cold repo: cold-folds, returns events only
-  from `start` onward.
+- `rebuild_from(A, B)` with a warm cache: loads cache before A,
+  folds silently through A, collects events for `(A, B]`.
+- `rebuild_from` on a cold repo: cold-folds, same `(from, to]`.
 - `rebuild_from` with a re-introduced plan key: events contain
   only the current instance, not the prior finalized one.
 - Log default shows at most 30 commit groups.
 - A commit at the limit boundary keeps its reviews (group stays
   together).
 - `--all -n 10` shows all plans but only 10 groups.
+- `clank log A..B` excludes commit A, includes B.
+- `clank log A` includes commit A.
 - Log `--oneline` produces compact output.
 - Existing log tests still pass.
 
 ## Acceptance criteria
 
 - `clank log` is fast (uses cache for fold context).
-- Default shows 30 most recent events in git-log multi-line
-  format with ANSI colors.
+- Default shows 30 most recent commit groups in git-log
+  multi-line format with ANSI colors.
 - `--oneline` shows compact format.
 - `--json` unchanged.
 - `rebuild_from` is a clean API that hides the cache.
