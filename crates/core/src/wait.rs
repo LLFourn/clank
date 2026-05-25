@@ -152,7 +152,7 @@ pub struct AdHocWorkState {
     pub gate: crate::vocab::CommitGateState,
 }
 
-fn compute_gate(reviews: &[ReviewEntry]) -> crate::vocab::CommitGateState {
+pub fn compute_gate(reviews: &[ReviewEntry]) -> crate::vocab::CommitGateState {
     use crate::vocab::CommitGateState;
     let has_approve = reviews
         .iter()

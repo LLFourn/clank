@@ -5,19 +5,19 @@
 use std::collections::BTreeSet;
 use std::path::Path;
 
-use crate::feedback_scan::scan_feedback;
 use crate::git_io::{
     GitIoError, commit_parent_count, diff_tree_changes, first_parent_commits_to, rev_parse_head,
     tree_clank_paths, tree_plan_paths,
 };
-use crate::lifecycle::{AgentLabel, CommitSha, PlanKey, RepoBasename};
+use crate::lifecycle::{CommitSha, PlanKey, RepoBasename};
 use crate::repo_state::RepoState;
 use crate::worktree_facts::read_worktree_facts;
 use clank_core::api::{
     FinalizeBlockReason, FinalizeReadiness, FinishPreviewResponse, PurgeAllPreviewResponse,
-    RewriteCommit, RewriteDisposition, RewritePreviewResponse, SealedApproval,
+    RewriteCommit, RewriteDisposition, RewritePreviewResponse,
 };
-use clank_core::vocab::{CommitGateState, PlanWorktreeStatus, Verdict};
+use clank_core::vocab::{CommitGateState, PlanWorktreeStatus};
+use clank_core::wait::ReviewLookup;
 
 #[derive(Debug, thiserror::Error)]
 pub enum PreviewError {
@@ -76,8 +76,7 @@ pub async fn build_finish_preview(
 
     let latest_reviewable_sha = active.and_then(latest_reviewable_sha);
 
-    let (gate_state, sealed_approvals_candidates) =
-        compute_gate(repo_root, state, plan_key, latest_reviewable_sha.as_ref())?;
+    let gate_state = compute_gate(repo_root, latest_reviewable_sha.as_ref())?;
 
     let readiness = compute_finalize_readiness(
         is_finished,
@@ -85,12 +84,6 @@ pub async fn build_finish_preview(
         gate_state,
         worktree_status,
     );
-
-    let sealed_approvals = if matches!(readiness, FinalizeReadiness::Ready) {
-        sealed_approvals_candidates
-    } else {
-        Vec::new()
-    };
 
     Ok(FinishPreviewResponse {
         plan_id: plan_id_str,
@@ -100,7 +93,7 @@ pub async fn build_finish_preview(
         latest_reviewable_sha,
         plan_worktree_status: worktree_status,
         is_finished,
-        sealed_approvals,
+        sealed_approvals: Vec::new(),
     })
 }
 
@@ -445,89 +438,16 @@ fn latest_reviewable_sha(ps: &clank_core::repo_state::PlanState) -> Option<Commi
         .map(|e| e.sha.clone())
 }
 
-/// Build the per-plan gate by handing a scanned `FeedbackView` to
-/// the pure core projection, then re-deriving the sealed-approval
-/// list from the same scan.
 fn compute_gate(
     repo_root: &Path,
-    state: &RepoState,
-    plan_key: &PlanKey,
     target_sha: Option<&CommitSha>,
-) -> Result<(CommitGateState, Vec<SealedApproval>), PreviewError> {
+) -> Result<CommitGateState, PreviewError> {
     let Some(target) = target_sha else {
-        return Ok((CommitGateState::Unreviewed, Vec::new()));
+        return Ok(CommitGateState::Unreviewed);
     };
-    let Some(ps) = state.fold.plans.get(plan_key) else {
-        return Ok((CommitGateState::Unreviewed, Vec::new()));
-    };
-
-    let mut reviewable: Vec<CommitSha> = Vec::new();
-    for e in &ps.commits {
-        if !(e.touched_plan || e.touched_code) {
-            continue;
-        }
-        reviewable.push(e.sha.clone());
-        if &e.sha == target {
-            break;
-        }
-    }
-
-    let view = scan_feedback(repo_root, &reviewable)?;
-
-    let mut participants: Vec<AgentLabel> = Vec::new();
-    let mut target_idx: Option<usize> = None;
-    for (idx, commit) in view.per_commit.iter().enumerate() {
-        for author in commit.entries.keys() {
-            if !participants.contains(author) {
-                participants.push(author.clone());
-            }
-        }
-        if &commit.sha == target {
-            target_idx = Some(idx);
-        }
-    }
-
-    let target_entries = target_idx
-        .map(|i| &view.per_commit[i].entries)
-        .cloned()
-        .unwrap_or_default();
-
-    let mut approvers: Vec<AgentLabel> = Vec::new();
-    let mut requesters: Vec<AgentLabel> = Vec::new();
-    let mut ambiguous: Vec<AgentLabel> = Vec::new();
-    let mut missing: Vec<AgentLabel> = Vec::new();
-    for p in &participants {
-        match target_entries.get(p).map(|e| e.verdict) {
-            Some(Verdict::Approve) => approvers.push(p.clone()),
-            Some(Verdict::RequestChanges) => requesters.push(p.clone()),
-            Some(Verdict::Unmarked) => ambiguous.push(p.clone()),
-            None => missing.push(p.clone()),
-        }
-    }
-
-    let state_enum = if !requesters.is_empty() || !ambiguous.is_empty() {
-        CommitGateState::ChangesRequested
-    } else if !approvers.is_empty() && missing.is_empty() {
-        CommitGateState::Approved
-    } else {
-        CommitGateState::Unreviewed
-    };
-
-    let sealed_approvals = if matches!(state_enum, CommitGateState::Approved) {
-        target_entries
-            .iter()
-            .filter(|(_, entry)| matches!(entry.verdict, Verdict::Approve))
-            .map(|(author, entry)| SealedApproval {
-                author: author.clone(),
-                source_path: entry.source_path.clone(),
-                body_hash: entry.body_hash.clone(),
-            })
-            .collect()
-    } else {
-        Vec::new()
-    };
-
-    Ok((state_enum, sealed_approvals))
+    let reviews = crate::fs_review_lookup::FsReviewLookup::new(repo_root, Some(target));
+    let entries = reviews.reviews_for(target);
+    Ok(clank_core::wait::compute_gate(&entries))
 }
 
 

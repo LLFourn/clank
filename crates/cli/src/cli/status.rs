@@ -6,11 +6,11 @@ use std::path::Path;
 
 use super::{StatusArgs, repo_basename, resolve_repo};
 use crate::cli::plan_resolve::parse_arg;
-use crate::feedback_scan::scan_feedback;
+use crate::fs_review_lookup::FsReviewLookup;
 use crate::lifecycle::PlanKey;
 use crate::repo_state::RepoState;
-use crate::worktree_facts::read_worktree_facts;
-use clank_core::plan_view::{PlanView, WaitingOn, project};
+use clank_core::plan_view::WaitingOn;
+use clank_core::wait::PlanWorkState;
 
 pub async fn run(args: StatusArgs) -> anyhow::Result<()> {
     let repo = resolve_repo(args.repo.as_deref())?;
@@ -27,17 +27,23 @@ pub async fn run(args: StatusArgs) -> anyhow::Result<()> {
     let (branch, head_sha, head_subject) = head_info(&repo);
     let worktree_dirty = worktree_dirty(&repo)?;
 
+    let config = crate::cli::config::load(&repo);
+    let work_policy = clank_core::wait::WorkPolicy {
+        plan_feedback: config.review.plan_feedback,
+        adhoc_feedback: config.review.adhoc_feedback,
+    };
+    let reviews = FsReviewLookup::new(&repo, state.head.as_ref());
+    let work_status = state.fold.derive_status(&reviews, &work_policy);
+
     let selected = select_plans(&state, &basename, args.plan.as_deref())?;
-    let mut views: Vec<PlanView> = Vec::with_capacity(selected.len());
-    for key in &selected {
-        if let Some(view) = build_view(&repo, &state, key).await? {
-            views.push(view);
-        }
-    }
+    let views: Vec<&PlanWorkState> = work_status
+        .plans
+        .iter()
+        .filter(|ps| selected.contains(&ps.plan))
+        .collect();
 
     if args.json {
         let json = build_json(
-            &repo,
             &basename,
             branch.clone(),
             head_sha.clone(),
@@ -92,30 +98,13 @@ impl std::fmt::Display for ExitCode {
     }
 }
 
-async fn build_view(
-    repo: &Path,
-    state: &RepoState,
-    plan: &PlanKey,
-) -> anyhow::Result<Option<PlanView>> {
-    let ps = match state.fold.plans.get(plan) {
-        Some(ps) => ps,
-        None => return Ok(None),
-    };
-    let reviewable = ps.reviewable_shas();
-    let feedback = scan_feedback(repo, &reviewable)?;
-    let plan_path = format!(".clank/plans/{}.md", plan.as_str());
-    let worktree = read_worktree_facts(repo, &plan_path, state.head.as_ref()).await?;
-    Ok(project(&state.fold, plan, &feedback, &worktree))
-}
-
 fn build_json(
-    repo: &Path,
     basename: &str,
     branch: Option<String>,
     head_sha: Option<String>,
     head_subject: Option<String>,
     worktree_dirty: bool,
-    views: &[PlanView],
+    views: &[&PlanWorkState],
     state: &RepoState,
 ) -> serde_json::Value {
     let plans: Vec<serde_json::Value> = views
@@ -123,12 +112,9 @@ fn build_json(
         .map(|v| {
             serde_json::json!({
                 "plan": v.plan.as_str(),
-                "plan_path": format!(".clank/plans/{}.md", v.plan.as_str()),
-                "latest_reviewable_sha": v.latest_reviewable_sha.as_str(),
-                "gate_state": v.gate_state,
-                "waiting_on": v.waiting_on,
-                "worktree_status": v.worktree_status,
-                "last_activity_ts": v.last_activity_ts,
+                "latest_reviewable_sha": v.sha.as_str(),
+                "gate_state": v.gate,
+                "waiting_on": format!("{:?}", v.waiting_on),
             })
         })
         .collect();
@@ -139,14 +125,12 @@ fn build_json(
         .map(|fp| {
             serde_json::json!({
                 "plan": fp.plan.as_str(),
-                "plan_path": format!(".clank/plans/{}.md", fp.plan.as_str()),
                 "intro": fp.intro.as_str(),
                 "finalized_at": fp.finalized_at.as_str(),
             })
         })
         .collect();
     serde_json::json!({
-        "repo_root": repo.display().to_string(),
         "repo_basename": basename,
         "branch": branch,
         "head_sha": head_sha,
@@ -162,7 +146,7 @@ fn print_human(
     branch: Option<&str>,
     head_sha: Option<&str>,
     worktree_dirty: bool,
-    views: &[PlanView],
+    views: &[&PlanWorkState],
     state: &RepoState,
 ) {
     println!("repo:   {}", repo.display());
@@ -181,12 +165,8 @@ fn print_human(
     for v in views {
         println!();
         println!("plan: {}", v.plan.as_str());
-        println!(
-            "  latest reviewable: {}",
-            short_sha(v.latest_reviewable_sha.as_str())
-        );
-        println!("  gate:              {}", v.gate_state);
-        println!("  plan file:         {}", v.worktree_status);
+        println!("  latest reviewable: {}", short_sha(v.sha.as_str()));
+        println!("  gate:              {}", v.gate);
         println!("  waiting on:        {}", waiting_actor(&v.waiting_on));
         println!("  reason:            {}", waiting_reason(&v.waiting_on));
     }
