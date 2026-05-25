@@ -21,10 +21,11 @@ Each repo's `.clank/` directory contains:
   binding (`clank as`) — no flags needed in the common case.
 - `clank feedback write --plan X --commit Y --verdict
   approve|request-changes --author <label>` (body on stdin) —
-  write your review feedback. **Prefer this over editing files
-  in `.clank/agents/<you>/feedback/` directly** — it validates
-  the verdict header in one place and gives codex a stable
-  command prefix to one-shot approve.
+  write your review feedback. The first line of the body MUST
+  be `APPROVE <one-line summary>` or `REQUEST_CHANGES <summary>`,
+  like a git commit message: verdict + summary on line 1, blank
+  line, then detailed body. Example:
+  `APPROVE No findings.\n\nVerification: cargo test passed.`
 - `clank finish <plan>` — finalize an approved plan (master only).
 - `clank as <label>` — bind this session to an agent label (you'll
   typically run this once per session at the start).

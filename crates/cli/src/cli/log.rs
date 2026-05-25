@@ -188,7 +188,7 @@ fn collect_reviews(
                 for (author, entry) in &cf.entries {
                     let summary = std::fs::read_to_string(repo.join(&entry.source_path))
                         .ok()
-                        .map(|body| FeedbackBody::parse(&body).summary(80))
+                        .map(|body| FeedbackBody::parse(&body).summary())
                         .unwrap_or_default();
                     out.entry((key.as_str().to_string(), cf.sha.as_str().to_string()))
                         .or_insert_with(Vec::new)

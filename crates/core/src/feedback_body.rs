@@ -29,14 +29,29 @@
 use crate::vocab::Verdict;
 
 /// Parse the first non-empty line of a feedback file body as a
-/// verdict marker. Only exact uppercase tokens `APPROVE` /
-/// `REQUEST_CHANGES` count; everything else is `Unmarked`.
-/// Leading whitespace on the header line is tolerated.
+/// verdict marker. The line starts with `APPROVE` or
+/// `REQUEST_CHANGES`, optionally followed by a space and a
+/// one-line summary. Everything else is `Unmarked`.
 pub fn parse_verdict(body: &str) -> Verdict {
-    match body.lines().map(str::trim).find(|line| !line.is_empty()) {
-        Some("APPROVE") => Verdict::Approve,
-        Some("REQUEST_CHANGES") => Verdict::RequestChanges,
+    let first = body.lines().map(str::trim).find(|line| !line.is_empty());
+    match first {
+        Some(l) if l == "APPROVE" || l.starts_with("APPROVE ") => Verdict::Approve,
+        Some(l) if l == "REQUEST_CHANGES" || l.starts_with("REQUEST_CHANGES ") => {
+            Verdict::RequestChanges
+        }
         _ => Verdict::Unmarked,
+    }
+}
+
+/// Extract the one-line summary from the verdict line.
+/// Returns the text after `APPROVE ` or `REQUEST_CHANGES `,
+/// or empty string if no summary is present.
+pub fn parse_summary(body: &str) -> &str {
+    let first = body.lines().map(str::trim).find(|line| !line.is_empty());
+    match first {
+        Some(l) if l.starts_with("APPROVE ") => l["APPROVE ".len()..].trim(),
+        Some(l) if l.starts_with("REQUEST_CHANGES ") => l["REQUEST_CHANGES ".len()..].trim(),
+        _ => "",
     }
 }
 
@@ -59,20 +74,10 @@ impl FeedbackBody {
         }
     }
 
-    /// First line of review content, truncated to `max` chars.
-    pub fn summary(&self, max: usize) -> String {
-        let first_content_line = self
-            .body
-            .lines()
-            .map(str::trim)
-            .skip_while(|l| l.is_empty() || *l == "APPROVE" || *l == "REQUEST_CHANGES")
-            .find(|l| !l.is_empty())
-            .unwrap_or("");
-        if first_content_line.len() > max {
-            format!("{}...", &first_content_line[..max])
-        } else {
-            first_content_line.to_string()
-        }
+    /// One-line summary from the verdict line. Returns the text
+    /// after `APPROVE ` / `REQUEST_CHANGES ` on the first line.
+    pub fn summary(&self) -> String {
+        parse_summary(&self.body).to_string()
     }
 
     /// Confirm that the parsed verdict matches what the caller
