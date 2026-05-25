@@ -40,8 +40,8 @@ pub struct InitArgs {
 #[derive(Args, Debug)]
 pub struct LogArgs {
     /// Commit range (git-log style). `<sha>` = from sha to HEAD.
-    /// `<from>..<to>` = exclusive from, inclusive to. Omit to
-    /// infer from the plan's intro to HEAD.
+    /// `<from>..<to>` = exclusive from, inclusive to. Omit for
+    /// the last `-n` commits from HEAD.
     pub range: Option<String>,
     #[arg(long, value_name = "PATH")]
     pub repo: Option<PathBuf>,
@@ -49,7 +49,7 @@ pub struct LogArgs {
     pub json: bool,
     #[arg(long, value_name = "PLAN")]
     pub plan: Option<String>,
-    /// Max commit groups to show (default 30, 0 = unlimited).
+    /// Number of commits to fold from HEAD (default 30).
     #[arg(short = 'n', default_value_t = 30)]
     pub limit: usize,
     /// Compact one-line-per-commit output.
