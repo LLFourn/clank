@@ -95,17 +95,32 @@ clank log [--plan <stem>] [--all] [--json] [--repo <path>]
 `FinishedPlan` stores only `{ plan, intro, finalized_at }` — the
 fold drops per-commit timelines on finalize. To reconstruct:
 
-Reuse the preview module's re-fold approach
-(`crates/cli/src/preview.rs:120`): given `intro` and
-`finalized_at`, walk `git log intro..finalized_at` to get the
-commit SHAs in the range, then classify each commit's touched
-paths against the plan stem. This produces
-`Vec<PlanTimelineEvent>` for the finished plan, which
-`scan_feedback` can use for reviewable-SHA extraction.
+Cold-fold the first-parent chain from root (or cache anchor)
+through `finalized_at`, matching the preview module's approach
+(`crates/cli/src/preview.rs:313`). Attribution depends on
+repo-scoped fold context (known plans, active-plan hints), so a
+simple path-classification of `intro..finalized_at` would
+misattribute commits and miss the intro commit itself (git log
+`A..B` excludes A).
 
-Extract this into a shared helper
-`rebuild_finished_plan_timeline(repo, plan, intro, finalized_at)`
-so both `log` and `preview` can use it.
+The concrete approach: call the existing
+`rebuild_repo_with_policy` with the repo, which folds from the
+cache anchor through HEAD. The finished plan's timeline is
+recoverable from the fold's history — but currently the fold
+drops finished plans' timelines on finalize.
+
+**Simplest fix**: don't drop finished plan timelines from the
+fold. Keep them in a `finished_timelines: BTreeMap<PlanKey,
+Vec<PlanTimelineEvent>>` on `RepoState`, populated when a plan
+finalizes. This is a small change to `apply_commit`'s finalize
+branch — instead of dropping the `PlanState`, move its `commits`
+vec to `finished_timelines`. Then `clank log` reads finished
+timelines directly from the fold with no re-fold needed.
+
+This also simplifies preview (which currently re-folds
+specifically to recover the dropped timeline).
+
+Extract nothing — the data is just kept in the fold.
 
 ### Implementation
 
@@ -132,8 +147,9 @@ in `main.rs`.
 ### Log
 - Log with one active plan shows commit + review timeline.
 - Log with `--plan` on a finished plan shows its timeline
-  including multiple reviewable commits and their reviews
-  (exercises the reconstruction helper).
+  including the intro commit, later implementation commits, and
+  their reviews (verifies the finished timeline is preserved
+  in the fold, not just intro/finalize).
 - Log JSON mode produces typed event array.
 
 ## Acceptance criteria
