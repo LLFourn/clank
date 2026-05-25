@@ -220,6 +220,10 @@ pub enum LogEvent {
         sha: CommitSha,
         ts: i64,
     },
+    AdHoc {
+        sha: CommitSha,
+        ts: i64,
+    },
 }
 
 // ============================================================
@@ -581,11 +585,17 @@ impl RepoState {
 
         // Ad-hoc bucket: bare code-only commit with no touches and
         // no attribution.
-        if touches.is_empty() && classified.plan_attribution.is_empty() && event.has_code_changes {
-            self.ad_hoc.push(AdHocEvent {
+        if touches.is_empty() && classified.plan_attribution.is_empty() {
+            if event.has_code_changes {
+                self.ad_hoc.push(AdHocEvent {
+                    sha: event.sha.clone(),
+                    ts: event.author_ts,
+                    touched_code: true,
+                });
+            }
+            log_events.push(LogEvent::AdHoc {
                 sha: event.sha.clone(),
                 ts: event.author_ts,
-                touched_code: true,
             });
         }
 

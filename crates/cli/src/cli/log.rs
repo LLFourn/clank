@@ -47,14 +47,12 @@ pub async fn run(args: LogArgs) -> anyhow::Result<()> {
 
     let filtered: Vec<&LogEvent> = log_events
         .iter()
-        .filter(|e| {
-            let plan = match e {
-                LogEvent::PlanIntro { plan, .. }
-                | LogEvent::PlanCommit { plan, .. }
-                | LogEvent::PlanFinalized { plan, .. }
-                | LogEvent::PlanDeleted { plan, .. } => plan,
-            };
-            plan_filter.as_ref().is_none_or(|f| f == plan)
+        .filter(|e| match e {
+            LogEvent::AdHoc { .. } => plan_filter.is_none(),
+            LogEvent::PlanIntro { plan, .. }
+            | LogEvent::PlanCommit { plan, .. }
+            | LogEvent::PlanFinalized { plan, .. }
+            | LogEvent::PlanDeleted { plan, .. } => plan_filter.as_ref().is_none_or(|f| f == plan),
         })
         .collect();
 
@@ -82,6 +80,7 @@ pub async fn run(args: LogArgs) -> anyhow::Result<()> {
                 | LogEvent::PlanCommit { plan, .. }
                 | LogEvent::PlanFinalized { plan, .. }
                 | LogEvent::PlanDeleted { plan, .. } => plan,
+                LogEvent::AdHoc { .. } => continue,
             };
             if !keys.contains(k) {
                 keys.push(k.clone());
@@ -281,6 +280,21 @@ fn print_human(
                 println!("delete {} (plan: {})", short(sha), plan.as_str());
                 continue;
             }
+            LogEvent::AdHoc { sha, .. } => {
+                let (author, date, body) = commit_info(repo, sha);
+                if c {
+                    println!("{Y}commit {}{Z}", sha.as_str());
+                } else {
+                    println!("commit {}", sha.as_str());
+                }
+                println!("Author: {author}");
+                println!("Date:   {date}");
+                println!();
+                for line in body.lines() {
+                    println!("    {line}");
+                }
+                continue;
+            }
         };
         let (author, date, body) = commit_info(repo, sha);
         if c {
@@ -343,6 +357,15 @@ fn print_oneline(
             LogEvent::PlanDeleted { plan, sha, .. } => {
                 (plan, sha, Some(format!("Delete {}", plan.as_str())))
             }
+            LogEvent::AdHoc { sha, .. } => {
+                let subj = commit_subject(repo, sha);
+                if c {
+                    println!("{Y}{}{Z} {subj}", short(sha));
+                } else {
+                    println!("{} {subj}", short(sha));
+                }
+                continue;
+            }
         };
         let subj = subj_override.unwrap_or_else(|| commit_subject(repo, sha));
         let key = (plan.as_str().to_string(), sha.as_str().to_string());
@@ -401,6 +424,10 @@ fn print_json(
             LogEvent::PlanDeleted { plan, sha, ts } => serde_json::json!({
                 "kind": "deleted", "plan": plan.as_str(), "sha": sha.as_str(), "ts": ts,
             }),
+            LogEvent::AdHoc { sha, ts } => serde_json::json!({
+                "kind": "ad-hoc", "sha": sha.as_str(), "ts": ts,
+                "subject": commit_subject(repo, sha),
+            }),
         };
         out.push(obj);
         let (p, s) = match event {
@@ -410,6 +437,7 @@ fn print_json(
             | LogEvent::PlanDeleted { plan, sha, .. } => {
                 (plan.as_str().to_string(), sha.as_str().to_string())
             }
+            LogEvent::AdHoc { .. } => continue,
         };
         if let Some(rs) = reviews.get(&(p.clone(), s.clone())) {
             for r in rs {
