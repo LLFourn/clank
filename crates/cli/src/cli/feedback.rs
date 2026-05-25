@@ -48,6 +48,8 @@ async fn run_write(args: FeedbackWriteArgs) -> anyhow::Result<()> {
     for ah in &state.fold.ad_hoc {
         all_shas.push(ah.sha.clone());
     }
+    all_shas.sort();
+    all_shas.dedup();
 
     let target_sha = commit_ref
         .resolve_against(&all_shas)
