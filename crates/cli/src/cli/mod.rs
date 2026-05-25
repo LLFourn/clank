@@ -47,8 +47,6 @@ pub struct LogArgs {
     pub repo: Option<PathBuf>,
     #[arg(short = 'j', long)]
     pub json: bool,
-    #[arg(long, conflicts_with = "plan")]
-    pub all: bool,
     #[arg(long, value_name = "PLAN")]
     pub plan: Option<String>,
     /// Max commit groups to show (default 30, 0 = unlimited).
