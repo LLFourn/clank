@@ -81,14 +81,15 @@ review/revise).
 ### `crates/core/src/wait.rs`
 
 - Add `AdHocReview` and `AdHocRevise` to `WaitItem`.
-- `derive_work` gains `ad_hoc: &[AdHocEvent]` + ad-hoc feedback
-  + `ReviewConfig`. When `force_review_on_misc_commits` is true,
-  emits work items for unreviewed/changes-requested ad-hoc
-  commits.
+- Ad-hoc work derivation lives in the **CLI layer** (not in
+  `clank_core::wait::derive_work`) because it depends on
+  `ReviewConfig` which is a CLI type. The CLI's wfw module
+  calls `derive_work` for plan items as today, then separately
+  derives ad-hoc items using `state.ad_hoc` + feedback scan +
+  config. Both sets are concatenated into the final work items.
 - When `ad_hoc_reviewers` is `Some(list)`, only those agents
-  are eligible reviewers for ad-hoc commits (reviewer wfw only
-  emits work if the calling author is in the list). When `None`,
-  any reviewer is eligible (same as plan review).
+  are eligible reviewers for ad-hoc commits. When `None`,
+  any reviewer is eligible.
 
 ### `crates/cli/src/cli/wfw.rs`
 
@@ -101,6 +102,14 @@ review/revise).
 
 - Render `AdHocReview` / `AdHocRevise` in the continuation
   prompt.
+
+### Lifecycle hooks
+
+Ad-hoc work items skip `firings_from_items` — they have no
+`PlanKey` so `HookFiring` can't be constructed. The
+`master-work` / `reviewer-work` hooks only fire for plan items.
+This is acceptable: ad-hoc reviews are a lightweight side-channel,
+not a plan lifecycle event.
 
 ### `crates/cli/src/cli/feedback.rs`
 
