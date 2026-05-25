@@ -159,11 +159,11 @@ pub async fn run(args: WfwArgs) -> anyhow::Result<()> {
         None => None,
     };
 
-    let hook_config = hook_config::load_hook_config(&repo);
-    let review_config = crate::cli::config::load(&repo);
+    let config = crate::cli::config::load(&repo);
+    let hook_config = config.hooks.clone();
     let work_policy = clank_core::wait::WorkPolicy {
-        plan_feedback: review_config.review.plan_feedback,
-        adhoc_feedback: review_config.review.adhoc_feedback,
+        plan_feedback: config.review.plan_feedback,
+        adhoc_feedback: config.review.adhoc_feedback,
     };
 
     let snapshot = StartupSnapshot::capture(&initial_state.fold, plan_filter.as_ref());

@@ -52,6 +52,8 @@ enum Command {
     /// across repo, user, and current-session scopes. Exits 0
     /// if everything is OK/Warn; 1 if anything is Fail.
     Doctor(cli::DoctorArgs),
+    /// Read or write Clank config values.
+    Config(cli::ConfigArgs),
 }
 
 #[tokio::main]
@@ -78,6 +80,7 @@ async fn main() -> anyhow::Result<()> {
         Command::StopHook(args) => cli::stop_hook::run(args).await,
         Command::Setup(args) => cli::setup::run(args).await,
         Command::Doctor(args) => cli::doctor::run(args).await,
+        Command::Config(args) => cli::config::run(args).await,
     };
     if let Err(e) = result {
         let code = exit_code_for(&e);

@@ -1,9 +1,3 @@
-//! Hook configuration loading and execution for work-item hooks.
-//!
-//! Two config files, merged (repo overlays user defaults):
-//! 1. `~/.clank/hooks.json` (user-level defaults)
-//! 2. `<repo>/.clank/hooks.json` (repo-level overrides per-event)
-
 use std::collections::BTreeMap;
 use std::path::Path;
 use std::process::Stdio;
@@ -20,39 +14,6 @@ pub struct HookFiring {
     pub sha: CommitSha,
     pub gate: Option<CommitGateState>,
     pub next: Option<String>,
-}
-
-pub fn load_hook_config(repo: &Path) -> HookConfig {
-    let mut config = HookConfig::new();
-    if let Some(home) = std::env::var_os("HOME") {
-        let user_path = std::path::PathBuf::from(home)
-            .join(".clank")
-            .join("hooks.json");
-        merge_from_file(&mut config, &user_path);
-    }
-    let repo_path = repo.join(".clank").join("hooks.json");
-    merge_from_file(&mut config, &repo_path);
-    config
-}
-
-fn merge_from_file(config: &mut HookConfig, path: &Path) {
-    let content = match std::fs::read_to_string(path) {
-        Ok(c) => c,
-        Err(_) => return,
-    };
-    let parsed: BTreeMap<HookEvent, String> = match serde_json::from_str(&content) {
-        Ok(m) => m,
-        Err(e) => {
-            eprintln!(
-                "warning: hooks.json at `{}` malformed ({e}); ignoring",
-                path.display()
-            );
-            return;
-        }
-    };
-    for (event, cmd) in parsed {
-        config.insert(event, cmd);
-    }
 }
 
 pub fn run_hook(repo: &Path, config: &HookConfig, firing: &HookFiring) {
@@ -120,47 +81,3 @@ pub fn run_idle_hook(repo: &Path, config: &HookConfig) -> Option<String> {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn missing_file_returns_empty() {
-        let mut config = HookConfig::new();
-        let dir = tempfile::tempdir().unwrap();
-        merge_from_file(&mut config, &dir.path().join("nonexistent.json"));
-        assert!(config.is_empty());
-    }
-
-    #[test]
-    fn merge_repo_overrides_user_per_event() {
-        let mut config = HookConfig::new();
-        let dir = tempfile::tempdir().unwrap();
-
-        let user = dir.path().join("user.json");
-        std::fs::write(
-            &user,
-            r#"{"master-work":"user-cmd","reviewer-work":"user-review"}"#,
-        )
-        .unwrap();
-        merge_from_file(&mut config, &user);
-        assert_eq!(config[&HookEvent::MasterWork], "user-cmd");
-        assert_eq!(config[&HookEvent::ReviewerWork], "user-review");
-
-        let repo = dir.path().join("repo.json");
-        std::fs::write(&repo, r#"{"master-work":"repo-cmd"}"#).unwrap();
-        merge_from_file(&mut config, &repo);
-        assert_eq!(config[&HookEvent::MasterWork], "repo-cmd");
-        assert_eq!(config[&HookEvent::ReviewerWork], "user-review");
-    }
-
-    #[test]
-    fn malformed_json_returns_empty() {
-        let mut config = HookConfig::new();
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("hooks.json");
-        std::fs::write(&path, "not json").unwrap();
-        merge_from_file(&mut config, &path);
-        assert!(config.is_empty());
-    }
-}

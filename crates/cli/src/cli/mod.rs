@@ -27,6 +27,20 @@ pub mod unfinish;
 pub mod wfw;
 
 #[derive(Args, Debug)]
+pub struct ConfigArgs {
+    /// Config key (e.g. review.adhoc_feedback, hooks.master_work)
+    pub key: Option<String>,
+    /// Action: get, set
+    pub action: Option<String>,
+    /// Value for set
+    pub value: Option<String>,
+    #[arg(long, value_name = "PATH")]
+    pub repo: Option<PathBuf>,
+    #[arg(short = 'j', long)]
+    pub json: bool,
+}
+
+#[derive(Args, Debug)]
 pub struct InitArgs {
     /// Repo root. Defaults to the cwd's git toplevel.
     #[arg(long, value_name = "PATH")]
