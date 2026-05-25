@@ -101,19 +101,6 @@ fn load_with_home(repo_root: &Path, home: Option<&Path>) -> Config {
     let mut cfg = Config::default();
     let _ = apply_layer(&mut cfg, home.map(|h| h.join(".clank/config.json")).as_deref());
     let _ = apply_layer(&mut cfg, Some(&repo_root.join(".clank/config.json")));
-
-    // Merge legacy hooks.json files (repo overrides user) then apply as
-    // fallback so config.json always wins.
-    let mut legacy: BTreeMap<HookEvent, String> = BTreeMap::new();
-    if let Some(user_path) = home.map(|h| h.join(".clank/hooks.json")) {
-        merge_legacy_file(&mut legacy, &user_path);
-    }
-    // repo overwrites user
-    merge_legacy_file(&mut legacy, &repo_root.join(".clank/hooks.json"));
-    for (event, cmd) in legacy {
-        cfg.hooks.entry(event).or_insert(Some(cmd));
-    }
-
     cfg
 }
 
@@ -163,31 +150,6 @@ fn apply_layer(cfg: &mut Config, path: Option<&Path>) -> BTreeSet<String> {
         }
     }
     present
-}
-
-fn merge_legacy_file(out: &mut BTreeMap<HookEvent, String>, path: &Path) {
-    let body = match std::fs::read_to_string(path) {
-        Ok(b) => b,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
-        Err(e) => {
-            tracing::warn!(path = %path.display(), error = %e, "clank hooks.json: read failed; ignoring");
-            return;
-        }
-    };
-    let parsed: BTreeMap<HookEvent, String> = match serde_json::from_str(&body) {
-        Ok(p) => p,
-        Err(e) => {
-            tracing::warn!(path = %path.display(), error = %e, "clank hooks.json: malformed JSON; ignoring");
-            return;
-        }
-    };
-    tracing::warn!(
-        path = %path.display(),
-        "hooks.json is deprecated; move hooks into the `hooks` section of config.json"
-    );
-    for (event, cmd) in parsed {
-        out.insert(event, cmd);
-    }
 }
 
 // ── Key catalog ──────────────────────────────────────────────────────────────
@@ -260,7 +222,6 @@ pub enum ValueSource {
     Default,
     User,
     Repo,
-    Legacy,
 }
 
 impl std::fmt::Display for ValueSource {
@@ -269,7 +230,6 @@ impl std::fmt::Display for ValueSource {
             ValueSource::Default => f.write_str("default"),
             ValueSource::User => f.write_str("user"),
             ValueSource::Repo => f.write_str("repo"),
-            ValueSource::Legacy => f.write_str("legacy"),
         }
     }
 }
@@ -299,26 +259,6 @@ fn resolve_key_values_with_home(repo_root: &Path, home: Option<&Path>) -> Vec<Ke
     let mut repo_cfg = user_cfg.clone();
     let repo_present = apply_layer(&mut repo_cfg, Some(&repo_root.join(".clank/config.json")));
 
-    // Legacy hooks.json: user first, repo overwrites, then apply as fallback.
-    let mut legacy: BTreeMap<HookEvent, String> = BTreeMap::new();
-    if let Some(user_hooks) = home.map(|h| h.join(".clank/hooks.json")) {
-        if let Ok(body) = std::fs::read_to_string(&user_hooks) {
-            if let Ok(m) = serde_json::from_str::<BTreeMap<HookEvent, String>>(&body) {
-                legacy.extend(m);
-            }
-        }
-    }
-    if let Ok(body) = std::fs::read_to_string(repo_root.join(".clank/hooks.json")) {
-        if let Ok(m) = serde_json::from_str::<BTreeMap<HookEvent, String>>(&body) {
-            legacy.extend(m);
-        }
-    }
-
-    let mut full_cfg = repo_cfg.clone();
-    for (event, cmd) in &legacy {
-        full_cfg.hooks.entry(*event).or_insert_with(|| Some(cmd.clone()));
-    }
-
     for key in &repo_present {
         sources.insert(key.clone(), ValueSource::Repo);
     }
@@ -326,26 +266,11 @@ fn resolve_key_values_with_home(repo_root: &Path, home: Option<&Path>) -> Vec<Ke
         sources.entry(key.clone()).or_insert(ValueSource::User);
     }
 
-    for event in [
-        HookEvent::MasterWork,
-        HookEvent::ReviewerWork,
-        HookEvent::PlanFinalized,
-        HookEvent::Idle,
-    ] {
-        let key = format!("hooks.{}", event_to_key_name(event));
-        if sources.contains_key(&key) {
-            continue;
-        }
-        if legacy.contains_key(&event) {
-            sources.insert(key, ValueSource::Legacy);
-        }
-    }
-
     KEY_CATALOG
         .iter()
         .map(|def| {
             let key = format!("{}.{}", def.section, def.name);
-            let value = get_value(&full_cfg, &key);
+            let value = get_value(&repo_cfg, &key);
             let source = sources.get(&key).copied().unwrap_or(ValueSource::Default);
             KeyValue {
                 key,
@@ -557,49 +482,11 @@ fn set_repo_key(
 
     sec_obj.insert(field.to_string(), json_val);
 
-    // Migrate any legacy hooks.json hooks into config.json on first hooks write.
-    if section == "hooks" {
-        migrate_legacy_hooks_into_object(repo, obj)?;
-    }
-
     if let Some(parent) = config_path.parent() {
         std::fs::create_dir_all(parent)?;
     }
     let body = serde_json::to_string_pretty(&root)?;
     std::fs::write(&config_path, body)?;
-    Ok(())
-}
-
-fn migrate_legacy_hooks_into_object(
-    repo: &Path,
-    root: &mut serde_json::Map<String, serde_json::Value>,
-) -> anyhow::Result<()> {
-    let hooks_path = repo.join(".clank/hooks.json");
-    let body = match std::fs::read_to_string(&hooks_path) {
-        Ok(b) => b,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(e) => return Err(e.into()),
-    };
-    let legacy: BTreeMap<HookEvent, String> = match serde_json::from_str(&body) {
-        Ok(m) => m,
-        Err(_) => return Ok(()),
-    };
-
-    let hooks_sec = root
-        .entry("hooks")
-        .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
-    let hooks_obj = match hooks_sec.as_object_mut() {
-        Some(o) => o,
-        None => return Ok(()),
-    };
-
-    for (event, cmd) in legacy {
-        let field = event_to_key_name(event);
-        // Only migrate where not already explicitly set.
-        hooks_obj
-            .entry(field)
-            .or_insert_with(|| serde_json::Value::String(cmd));
-    }
     Ok(())
 }
 
@@ -688,55 +575,12 @@ mod tests {
     }
 
     #[test]
-    fn config_json_hooks_win_over_legacy_hooks_json() {
-        let tmp = tempfile::tempdir().unwrap();
-        write(
-            &tmp.path().join(".clank/config.json"),
-            r#"{"hooks": {"master_work": "config-cmd"}}"#,
-        );
-        write(
-            &tmp.path().join(".clank/hooks.json"),
-            r#"{"master-work": "legacy-cmd"}"#,
-        );
-        let cfg = load_isolated(tmp.path());
-        assert_eq!(cfg.hooks[&HookEvent::MasterWork], Some("config-cmd".to_string()));
-    }
-
-    #[test]
-    fn legacy_hooks_json_used_as_fallback() {
-        let tmp = tempfile::tempdir().unwrap();
-        write(
-            &tmp.path().join(".clank/hooks.json"),
-            r#"{"master-work": "legacy-cmd"}"#,
-        );
-        let cfg = load_isolated(tmp.path());
-        assert_eq!(cfg.hooks[&HookEvent::MasterWork], Some("legacy-cmd".to_string()));
-    }
-
-    #[test]
     fn set_repo_key_creates_file() {
         let tmp = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(tmp.path().join(".clank")).unwrap();
         set_repo_key(tmp.path(), "review", "adhoc_feedback", "false", "bool").unwrap();
         let cfg = load_isolated(tmp.path());
         assert!(!cfg.review.adhoc_feedback);
-    }
-
-    #[test]
-    fn set_hook_migrates_legacy() {
-        let tmp = tempfile::tempdir().unwrap();
-        std::fs::create_dir_all(tmp.path().join(".clank")).unwrap();
-        write(
-            &tmp.path().join(".clank/hooks.json"),
-            r#"{"reviewer-work": "old-cmd"}"#,
-        );
-        set_repo_key(tmp.path(), "hooks", "idle", "new-idle", "string|null").unwrap();
-        let body =
-            std::fs::read_to_string(tmp.path().join(".clank/config.json")).unwrap();
-        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
-        // Both the new key and the migrated legacy key should be present.
-        assert_eq!(v["hooks"]["idle"], "new-idle");
-        assert_eq!(v["hooks"]["reviewer_work"], "old-cmd");
     }
 
     #[test]
@@ -835,18 +679,4 @@ mod tests {
         assert_eq!(kv.source, ValueSource::Repo);
     }
 
-    #[test]
-    fn null_hook_in_config_blocks_legacy() {
-        let tmp = tempfile::tempdir().unwrap();
-        write(
-            &tmp.path().join(".clank/hooks.json"),
-            r#"{"master-work": "legacy-cmd"}"#,
-        );
-        write(
-            &tmp.path().join(".clank/config.json"),
-            r#"{"hooks": {"master_work": null}}"#,
-        );
-        let cfg = load_isolated(tmp.path());
-        assert_eq!(cfg.hooks.get(&HookEvent::MasterWork), Some(&None));
-    }
 }

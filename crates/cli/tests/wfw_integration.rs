@@ -63,7 +63,7 @@ fn head_sha(repo: &Path) -> String {
 }
 
 /// Test environment with separate home and repo dirs so user-level
-/// `~/.clank/hooks.json` doesn't leak into assertions and
+/// `~/.clank/config.json` doesn't leak into assertions and
 /// user→repo config shadowing can be tested.
 struct TestEnv {
     home: tempfile::TempDir,
@@ -1069,8 +1069,8 @@ fn wfw_hook_fires_reviewer_work() {
     let hook_cmd = format!("echo $CLANK_EVENT $CLANK_PLAN > {}", marker.display());
     write(
         repo,
-        ".clank/hooks.json",
-        &format!(r#"{{"reviewer-work": "{hook_cmd}"}}"#),
+        ".clank/config.json",
+        &format!(r#"{{"review":{{"adhoc_feedback":false}},"hooks":{{"reviewer-work":"{hook_cmd}"}}}}"#),
     );
 
     let mut child = env
@@ -1114,7 +1114,7 @@ fn wfw_hook_failure_does_not_fail_wfw() {
     write(repo, "README.md", "# repo\n");
     commit(repo, "init");
 
-    write(repo, ".clank/hooks.json", r#"{"reviewer-work": "exit 1"}"#);
+    write(repo, ".clank/config.json", r#"{"review":{"adhoc_feedback":false},"hooks":{"reviewer-work":"exit 1"}}"#);
 
     let mut child = env
         .cmd()
@@ -1163,7 +1163,7 @@ fn wfw_master_empty_exits_even_with_hooks_configured() {
     write(repo, "README.md", "# repo\n");
     commit(repo, "init");
 
-    write(repo, ".clank/hooks.json", r#"{"reviewer-work": "true"}"#);
+    write(repo, ".clank/config.json", r#"{"review":{"adhoc_feedback":false},"hooks":{"reviewer-work":"true"}}"#);
 
     let output = env
         .cmd()
@@ -1204,8 +1204,8 @@ fn wfw_idle_hook_returns_prompt() {
 
     write(
         repo,
-        ".clank/hooks.json",
-        r#"{"idle": "echo Check stubs for ideas"}"#,
+        ".clank/config.json",
+        r#"{"review":{"adhoc_feedback":false},"hooks":{"idle":"echo Check stubs for ideas"}}"#,
     );
 
     let output = env
@@ -1249,18 +1249,18 @@ fn wfw_user_hooks_shadowed_by_repo_hooks() {
     let user_marker = env.home().join("user-hook-ran.txt");
     let repo_marker = repo.join("repo-hook-ran.txt");
 
-    let user_hooks_dir = env.home().join(".clank");
-    std::fs::create_dir_all(&user_hooks_dir).unwrap();
+    let user_config_dir = env.home().join(".clank");
+    std::fs::create_dir_all(&user_config_dir).unwrap();
     std::fs::write(
-        user_hooks_dir.join("hooks.json"),
-        format!(r#"{{"reviewer-work": "touch {}"}}"#, user_marker.display()),
+        user_config_dir.join("config.json"),
+        format!(r#"{{"hooks":{{"reviewer-work":"touch {}"}}}}"#, user_marker.display()),
     )
     .unwrap();
 
     write(
         repo,
-        ".clank/hooks.json",
-        &format!(r#"{{"reviewer-work": "touch {}"}}"#, repo_marker.display()),
+        ".clank/config.json",
+        &format!(r#"{{"review":{{"adhoc_feedback":false}},"hooks":{{"reviewer-work":"touch {}"}}}}"#, repo_marker.display()),
     );
 
     let mut child = env
