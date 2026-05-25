@@ -36,12 +36,12 @@ the fold. `LogEvent::AdHoc` was just added for `clank log`.
 
 ### Feedback target for ad-hoc commits
 
-Use `FeedbackTarget::AdHoc` (check if this already exists in
-`disk_format.rs`). Feedback path:
-`.clank/agents/<author>/feedback/_adhoc/<sha>.md`.
+Use the existing `FeedbackTarget::AdHoc` from `disk_format.rs`,
+which renders as the `_` segment. Feedback path:
+`.clank/agents/<author>/feedback/_/<sha>.md`.
 
-The `_adhoc` directory name is safe (starts with underscore,
-can't collide with plan stems which are `[a-z0-9][a-z0-9._-]*`).
+Already defined, parsed, and tested in `disk_format.rs:36-40`,
+`disk_format.rs:154-159`, `disk_format.rs:237-253`.
 
 ### WaitItem shape
 
@@ -62,12 +62,12 @@ AdHocRevise {
 
 Add `--adhoc` flag (mutually exclusive with `--plan`). When set,
 the commit ref resolves against `state.ad_hoc` SHAs. Writes to
-the `_adhoc` feedback directory.
+the `_` feedback directory.
 
 ### Gate computation
 
 For each `AdHocEvent`, scan feedback at
-`.clank/agents/*/feedback/_adhoc/<sha>.md`. Compute gate:
+`.clank/agents/*/feedback/_/<sha>.md`. Compute gate:
 - No feedback → unreviewed → reviewer work
 - All approve → done
 - Any request_changes → master revise work
@@ -101,11 +101,11 @@ review/revise).
 
 - Add `--adhoc` flag to `FeedbackWriteArgs`.
 - When set, resolve commit against `state.ad_hoc` SHAs.
-- Write to `_adhoc` feedback directory.
+- Write to `_` feedback directory.
 
 ### `crates/cli/src/feedback_scan.rs`
 
-- Extend to scan `_adhoc` directory for ad-hoc feedback.
+- Extend to scan `_` directory for ad-hoc feedback.
 
 ## Tests
 
@@ -115,14 +115,14 @@ review/revise).
 - Reviewer request_changes → master wfw returns revise.
 - `force_review_on_misc_commits=false`: no ad-hoc work items.
 - `clank feedback write --adhoc --commit <sha>` writes to
-  `_adhoc` path.
+  `_` path.
 
 ## Acceptance criteria
 
 - Ad-hoc commits surface as wfw work items when
   `force_review_on_misc_commits` is true.
 - Reviewer and master flows work for ad-hoc commits.
-- Feedback lives at `_adhoc/<sha>.md`.
+- Feedback lives at `_/<sha>.md`.
 - `clank feedback write --adhoc` works.
 - Default is true (existing config default). Set to true for
   this repo (already the default — no config change needed).
