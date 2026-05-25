@@ -221,7 +221,7 @@ fn print_json(
     let mut json_events: Vec<serde_json::Value> = Vec::new();
 
     for event in events {
-        let mut obj = match event {
+        let obj = match event {
             LogEvent::PlanIntro { plan, sha, ts } => serde_json::json!({
                 "kind": "intro",
                 "plan": plan.as_str(),
@@ -257,37 +257,27 @@ fn print_json(
                 "ts": ts,
             }),
         };
-
-        let plan_str = match event {
-            LogEvent::PlanIntro { plan, .. }
-            | LogEvent::PlanCommit { plan, .. }
-            | LogEvent::PlanFinalized { plan, .. }
-            | LogEvent::PlanDeleted { plan, .. } => plan.as_str().to_string(),
-        };
-        let sha_str = match event {
-            LogEvent::PlanIntro { sha, .. }
-            | LogEvent::PlanCommit { sha, .. }
-            | LogEvent::PlanFinalized { sha, .. }
-            | LogEvent::PlanDeleted { sha, .. } => sha.as_str().to_string(),
-        };
-
-        let key = (plan_str, sha_str);
-        if let Some(rs) = reviews.get(&key) {
-            let review_json: Vec<serde_json::Value> = rs
-                .iter()
-                .map(|r| {
-                    serde_json::json!({
-                        "author": r.author,
-                        "verdict": r.verdict,
-                    })
-                })
-                .collect();
-            obj.as_object_mut()
-                .unwrap()
-                .insert("reviews".into(), serde_json::json!(review_json));
-        }
-
         json_events.push(obj);
+
+        let (plan_str, sha_str) = match event {
+            LogEvent::PlanIntro { plan, sha, .. }
+            | LogEvent::PlanCommit { plan, sha, .. }
+            | LogEvent::PlanFinalized { plan, sha, .. }
+            | LogEvent::PlanDeleted { plan, sha, .. } => {
+                (plan.as_str().to_string(), sha.as_str().to_string())
+            }
+        };
+        if let Some(rs) = reviews.get(&(plan_str.clone(), sha_str.clone())) {
+            for r in rs {
+                json_events.push(serde_json::json!({
+                    "kind": "review",
+                    "plan": plan_str,
+                    "sha": sha_str,
+                    "author": r.author,
+                    "verdict": r.verdict,
+                }));
+            }
+        }
     }
 
     println!("{}", serde_json::to_string_pretty(&json_events)?);
