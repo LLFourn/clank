@@ -39,6 +39,10 @@ pub struct InitArgs {
 
 #[derive(Args, Debug)]
 pub struct LogArgs {
+    /// Commit range (git-log style). `<sha>` = from sha to HEAD.
+    /// `<from>..<to>` = exclusive from, inclusive to. Omit to
+    /// infer from the plan's intro to HEAD.
+    pub range: Option<String>,
     #[arg(long, value_name = "PATH")]
     pub repo: Option<PathBuf>,
     #[arg(short = 'j', long)]

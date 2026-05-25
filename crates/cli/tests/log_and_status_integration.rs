@@ -235,7 +235,7 @@ fn log_finished_plan_shows_full_timeline() {
         "should include impl; got:\n{stdout}"
     );
     assert!(
-        stdout.contains("Finalize"),
+        stdout.contains("finalize"),
         "should include finalize; got:\n{stdout}"
     );
     assert!(

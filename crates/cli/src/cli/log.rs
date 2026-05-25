@@ -14,16 +14,22 @@ pub async fn run(args: LogArgs) -> anyhow::Result<()> {
     let repo = resolve_repo(args.repo.as_deref())?;
     let basename = repo_basename(&repo)?;
 
-    let head = git_rev_parse_head(&repo).ok_or_else(|| anyhow::anyhow!("repo has no HEAD"))?;
+    let git_head = git_rev_parse_head(&repo).ok_or_else(|| anyhow::anyhow!("repo has no HEAD"))?;
 
     let plan_filter = resolve_plan_filter(&repo, &basename, args.all, args.plan.as_deref())?;
 
-    let from: Option<CommitSha> = match &plan_filter {
-        Some(keys) => earliest_plan_intro_parent(&repo, keys),
-        None => None,
+    let (from, to) = match &args.range {
+        Some(range) => parse_range(&repo, range)?,
+        None => {
+            let from = match &plan_filter {
+                Some(keys) => earliest_plan_intro_parent(&repo, keys),
+                None => None,
+            };
+            (from, git_head)
+        }
     };
 
-    let (_state, log_events) = crate::rebuild::rebuild_from(&repo, from.as_ref(), &head)
+    let (_state, log_events) = crate::rebuild::rebuild_from(&repo, from.as_ref(), &to)
         .await
         .map_err(|e| anyhow::anyhow!("failed to fold range: {e}"))?;
 
@@ -94,6 +100,45 @@ fn git_rev_parse_head(repo: &Path) -> Option<CommitSha> {
         .arg("-C")
         .arg(repo)
         .args(["rev-parse", "HEAD"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    CommitSha::parse(String::from_utf8_lossy(&output.stdout).trim()).ok()
+}
+
+fn parse_range(repo: &Path, range: &str) -> anyhow::Result<(Option<CommitSha>, CommitSha)> {
+    if let Some((from_str, to_str)) = range.split_once("..") {
+        let from = git_resolve(repo, from_str)?;
+        let to = git_resolve(repo, to_str)?;
+        Ok((Some(from), to))
+    } else {
+        let sha = git_resolve(repo, range)?;
+        let parent = git_parent(repo, &sha);
+        let head = git_rev_parse_head(repo).ok_or_else(|| anyhow::anyhow!("repo has no HEAD"))?;
+        Ok((parent, head))
+    }
+}
+
+fn git_resolve(repo: &Path, rev: &str) -> anyhow::Result<CommitSha> {
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["rev-parse", rev])
+        .output()?;
+    if !output.status.success() {
+        anyhow::bail!("cannot resolve `{rev}`");
+    }
+    CommitSha::parse(String::from_utf8_lossy(&output.stdout).trim())
+        .map_err(|e| anyhow::anyhow!("invalid SHA for `{rev}`: {e}"))
+}
+
+fn git_parent(repo: &Path, sha: &CommitSha) -> Option<CommitSha> {
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["rev-parse", &format!("{}^", sha.as_str())])
         .output()
         .ok()?;
     if !output.status.success() {
@@ -255,6 +300,25 @@ fn use_color() -> bool {
     std::env::var_os("NO_COLOR").is_none()
 }
 
+fn commit_info(repo: &Path, sha: &CommitSha) -> (String, String, String) {
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["log", "-1", "--format=%an <%ae>%n%ai%n%B", sha.as_str()])
+        .output();
+    match output {
+        Ok(o) if o.status.success() => {
+            let text = String::from_utf8_lossy(&o.stdout).to_string();
+            let mut lines = text.lines();
+            let author = lines.next().unwrap_or("").to_string();
+            let date = lines.next().unwrap_or("").to_string();
+            let body: String = lines.collect::<Vec<_>>().join("\n").trim().to_string();
+            (author, date, body)
+        }
+        _ => (String::new(), String::new(), String::new()),
+    }
+}
+
 fn print_human(
     events: &[&LogEvent],
     repo: &Path,
@@ -264,7 +328,10 @@ fn print_human(
     let reviews = collect_reviews(repo, plan_keys, reviewable_shas);
     let c = use_color();
 
-    for event in events {
+    for (i, event) in events.iter().enumerate() {
+        if i > 0 {
+            println!();
+        }
         let (plan, sha, kind) = match event {
             LogEvent::PlanIntro { plan, sha, .. } => (plan, sha, "plan"),
             LogEvent::PlanCommit {
@@ -277,25 +344,35 @@ fn print_human(
             LogEvent::PlanFinalized { plan, sha, .. } => {
                 if c {
                     println!(
-                        "{YELLOW}Finalize{RESET} {CYAN}{}{RESET}  {}",
-                        plan.as_str(),
-                        short(sha)
+                        "{YELLOW}finalize {}{RESET} {CYAN}(plan: {}){RESET}",
+                        short(sha),
+                        plan.as_str()
                     );
                 } else {
-                    println!("Finalize {}  {}", plan.as_str(), short(sha));
+                    println!("finalize {} (plan: {})", short(sha), plan.as_str());
                 }
                 continue;
             }
             LogEvent::PlanDeleted { plan, sha, .. } => {
-                println!("Delete {}  {}", plan.as_str(), short(sha));
+                println!("delete {} (plan: {})", short(sha), plan.as_str());
                 continue;
             }
         };
-        let subj = commit_subject(repo, sha);
+        let (author, date, body) = commit_info(repo, sha);
         if c {
-            println!("{YELLOW}{}{RESET} {subj}  {CYAN}{kind}{RESET}", short(sha));
+            println!(
+                "{YELLOW}commit {}{RESET} {CYAN}(plan: {}, {kind}){RESET}",
+                sha.as_str(),
+                plan.as_str()
+            );
         } else {
-            println!("{} {subj}  {kind}", short(sha));
+            println!("commit {} (plan: {}, {kind})", sha.as_str(), plan.as_str());
+        }
+        println!("Author: {author}");
+        println!("Date:   {date}");
+        println!();
+        for line in body.lines() {
+            println!("    {line}");
         }
         print_reviews_for(&reviews, plan, sha, c);
     }
