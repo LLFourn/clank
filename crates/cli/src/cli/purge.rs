@@ -157,7 +157,14 @@ pub(crate) fn build_amend_program(
     let head_files = std::process::Command::new("git")
         .arg("-C")
         .arg(repo)
-        .args(["diff-tree", "--no-commit-id", "--name-only", "-r", "HEAD"])
+        .args([
+            "diff-tree",
+            "--no-commit-id",
+            "--name-status",
+            "-M",
+            "-r",
+            "HEAD",
+        ])
         .output()?;
     let head_lines: Vec<String> = if head_files.status.success() {
         String::from_utf8_lossy(&head_files.stdout)
@@ -168,14 +175,7 @@ pub(crate) fn build_amend_program(
     } else {
         Vec::new()
     };
-    let head_is_finalize = !head_lines.is_empty()
-        && head_lines.iter().all(|l| match plan_key {
-            Some(k) => {
-                *l == format!(".clank/finished/{}.md", k.as_str())
-                    || *l == format!(".clank/plans/{}.md", k.as_str())
-            }
-            None => l.starts_with(".clank/finished/") || l.starts_with(".clank/plans/"),
-        });
+    let head_is_finalize = is_finish_diff(&head_lines, plan_key);
     if !head_is_finalize {
         let desc = match plan_key {
             Some(k) => format!(".clank/finished/{}.md", k.as_str()),
@@ -183,7 +183,7 @@ pub(crate) fn build_amend_program(
         };
         anyhow::bail!(
             "--amend requires HEAD to be a finalize commit \
-             (every changed path matching `{desc}`). Run `clank finish` \
+             (exact plans/ → finished/ move for `{desc}`). Run `clank finish` \
              without `--amend` to create the finalize commit first, or \
              use `clank purge` without `--amend` to rewrite the chain."
         );
@@ -385,6 +385,77 @@ async fn run_amend(repo: &std::path::Path, basename: &str, args: &PurgeArgs) -> 
 
     execute_amend(repo, &program)?;
     Ok(())
+}
+
+/// True iff `lines` (from `git diff-tree --name-status -M`) describe
+/// exactly the plans/ → finished/ move for the given plan (or any
+/// plan when `plan_key` is None).
+fn is_finish_diff(lines: &[String], plan_key: Option<&PlanKey>) -> bool {
+    if lines.is_empty() {
+        return false;
+    }
+    // For single-plan: accept R (rename) or D+A pair, nothing else.
+    // For all-plans: accept any mix of finish-shaped entries.
+    let mut deleted_plans: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    let mut added_finished: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    for line in lines {
+        let mut parts = line.splitn(3, '\t');
+        let status = parts.next().unwrap_or("");
+        let path = parts.next().unwrap_or("");
+        let path2 = parts.next();
+        let sc = status.chars().next().unwrap_or(' ');
+        if sc == 'R' {
+            let old = path;
+            let new = path2.unwrap_or("");
+            let old_stem = old
+                .strip_prefix(".clank/plans/")
+                .and_then(|s| s.strip_suffix(".md"));
+            let new_stem = new
+                .strip_prefix(".clank/finished/")
+                .and_then(|s| s.strip_suffix(".md"));
+            match (old_stem, new_stem) {
+                (Some(o), Some(n)) if o == n => {
+                    if let Some(k) = plan_key {
+                        if o != k.as_str() {
+                            return false;
+                        }
+                    }
+                }
+                _ => return false,
+            }
+        } else if sc == 'D' {
+            if let Some(stem) = path
+                .strip_prefix(".clank/plans/")
+                .and_then(|s| s.strip_suffix(".md"))
+            {
+                deleted_plans.insert(stem.to_string());
+            } else {
+                return false;
+            }
+        } else if sc == 'A' {
+            if let Some(stem) = path
+                .strip_prefix(".clank/finished/")
+                .and_then(|s| s.strip_suffix(".md"))
+            {
+                added_finished.insert(stem.to_string());
+            } else {
+                return false;
+            }
+        } else {
+            return false;
+        }
+    }
+    if deleted_plans.is_empty() && added_finished.is_empty() {
+        return true; // all renames, already validated
+    }
+    if deleted_plans != added_finished {
+        return false;
+    }
+    if let Some(k) = plan_key {
+        deleted_plans.len() == 1 && deleted_plans.contains(k.as_str())
+    } else {
+        true
+    }
 }
 
 fn confirm_single(stem: &str, into_branch: Option<&str>) -> anyhow::Result<bool> {
