@@ -51,3 +51,9 @@ commit abc1234
   `--repo`, `--json`.
 - `cli/feedback.rs`: resolve commit, walk
   `agents/*/feedback/<sha>.md`, read bodies, render.
+
+## Tests
+
+- Human output shows author, verdict, summary, and body.
+- `--json` output includes `summary` and `details` fields
+  for a feedback file with both (e.g. `APPROVE summary\n\ndetail line`).
