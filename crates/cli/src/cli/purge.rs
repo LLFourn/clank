@@ -168,7 +168,7 @@ pub(crate) fn build_amend_program(
         Vec::new()
     };
     let prefix: String = match plan_key {
-        Some(k) => format!(".clank/finished/{}/", k.as_str()),
+        Some(k) => format!(".clank/finished/{}", k.as_str()),
         None => ".clank/finished/".to_string(),
     };
     let head_is_finalize =
@@ -205,7 +205,7 @@ pub(crate) fn build_amend_program(
                     "--",
                     &head_sha,
                     &format!(".clank/plans/{s}.md"),
-                    &format!(".clank/finished/{s}/"),
+                    &format!(".clank/finished/{s}"),
                 ])
                 .output()?;
             if !out.status.success() {
@@ -507,8 +507,6 @@ mod tests {
     }
 
     /// Create a repo with a plan intro, an impl commit, and a
-    /// finalize commit (which adds `.clank/finished/foo/`). HEAD is
-    /// the finalize commit — the shape `--amend` requires.
     fn repo_with_finalize() -> tempfile::TempDir {
         let dir = init_test_repo();
         let repo = dir.path();
@@ -516,7 +514,7 @@ mod tests {
         write_file(repo, "src/lib.rs", "// impl\n");
         git(repo, &["add", "-A"]);
         git(repo, &["commit", "--quiet", "-m", "[foo] intro + impl"]);
-        write_file(repo, ".clank/finished/foo/codex.md", "APPROVE\n\nlgtm\n");
+        write_file(repo, ".clank/finished/foo", "");
         git(repo, &["add", "-A"]);
         git(repo, &["commit", "--quiet", "-m", "Finalize foo"]);
         dir

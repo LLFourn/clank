@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 
 use tokio::process::Command;
 
-use crate::disk_format::{parse_feedback_path, parse_finalize_path};
+use crate::disk_format::parse_feedback_path;
 use crate::disk_snapshot::{
     CommitChanges, CommitEvent, CommitSnapshot, FeedbackBlob, FinalizeChange, FinalizeChangeKind,
     PlanTouch, PlanTouchKind,
@@ -215,27 +215,15 @@ pub async fn show_commit(repo: &Path, sha: &CommitSha) -> Result<String, GitIoEr
     run_ok_raw(repo, &["show", "--no-color", sha.as_str()]).await
 }
 
-/// True iff the plan's finish predicate is satisfied at `tree`:
-/// `.clank/finished/<plan>/` has ≥1 file AND every file's first
-/// line starts with `APPROVE`. Used by the stateless
-/// `newly_finished` computation in `disk_snapshot::enrich_with_newly_finished`.
+/// True iff `.clank/finished/<plan>` exists as a blob in the tree.
 pub async fn finish_predicate_at(
     repo: &Path,
     tree: &CommitSha,
     plan: &PlanKey,
 ) -> Result<bool, GitIoError> {
-    let snapshot = read_finalize_snapshot(repo, tree, plan.as_str()).await?;
-    if snapshot.is_empty() {
-        return Ok(false);
-    }
-    Ok(snapshot.iter().all(|(_, body)| {
-        let first_line = body
-            .lines()
-            .map(str::trim_end)
-            .find(|l| !l.is_empty())
-            .unwrap_or("");
-        crate::disk_format::finalize_first_line_starts_with_approve(first_line)
-    }))
+    let spec = format!("{}:.clank/finished/{}", tree.as_str(), plan.as_str());
+    let output = run(repo, &["cat-file", "-t", &spec]).await?;
+    Ok(output.status.success())
 }
 
 /// True iff `ancestor` is reachable from `head` along any parent
@@ -381,7 +369,7 @@ pub async fn tree_plan_paths(
 ) -> Result<Vec<String>, GitIoError> {
     let mut pathspecs: Vec<String> = vec![format!(".clank/plans/{stem}.md")];
     if include_finalize {
-        pathspecs.push(format!(".clank/finished/{stem}/"));
+        pathspecs.push(format!(".clank/finished/{stem}"));
     }
     let mut args: Vec<String> = vec![
         "ls-tree".into(),
@@ -586,58 +574,14 @@ pub async fn diff_tree_changes(repo: &Path, sha: &CommitSha) -> Result<CommitCha
             stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
         });
     }
-    let parsed = parse_diff_tree(&String::from_utf8_lossy(&output.stdout))?;
-    let mut changes = parsed.changes;
-    for upsert in parsed.finalize_upserts {
-        let path = format!(
-            ".clank/finished/{}/{}",
-            upsert.plan_key.as_str(),
-            upsert.file_name
-        );
-        let body = run_ok(repo, &["show", &format!("{}:{}", sha.as_str(), path)]).await?;
-        let first_line = body
-            .lines()
-            .map(str::trim_end)
-            .find(|l| !l.is_empty())
-            .unwrap_or("")
-            .to_string();
-        changes.finalize_changes.push(FinalizeChange {
-            plan_key: upsert.plan_key,
-            file_name: upsert.file_name,
-            kind: FinalizeChangeKind::Upsert { first_line },
-        });
-    }
-    // Plan bodies are no longer carried on PlanTouch — fold doesn't
-    // need them. Drop pre-fetch.
-    let _ = parsed.plan_body_paths;
+    let changes = parse_diff_tree(&String::from_utf8_lossy(&output.stdout))?;
     Ok(changes)
 }
 
-struct ParsedDiffTree {
-    changes: CommitChanges,
-    /// Finalize paths added or modified in this commit. The caller
-    /// resolves each one's first-body-line via a `git show` call after
-    /// parsing.
-    finalize_upserts: Vec<FinalizeUpsertPath>,
-    /// (plan_touch_index, path) pairs for plan-file touches whose
-    /// `new_body` needs filling. The caller fetches each body via
-    /// `git show <sha>:<path>` and writes it back into
-    /// `changes.plan_touches[index].new_body`. Deletion touches are
-    /// omitted (their `new_body` stays `None`).
-    plan_body_paths: Vec<(usize, PathBuf)>,
-}
-
-struct FinalizeUpsertPath {
-    plan_key: PlanKey,
-    file_name: String,
-}
-
-fn parse_diff_tree(stdout: &str) -> Result<ParsedDiffTree, GitIoError> {
+fn parse_diff_tree(stdout: &str) -> Result<CommitChanges, GitIoError> {
     let mut plan_touches: Vec<PlanTouch> = Vec::new();
     let mut has_non_plan_code_changes = false;
     let mut finalize_changes: Vec<FinalizeChange> = Vec::new();
-    let mut finalize_upserts: Vec<FinalizeUpsertPath> = Vec::new();
-    let plan_body_paths: Vec<(usize, PathBuf)> = Vec::new();
     let mut clank_paths: Vec<String> = Vec::new();
     let mut clank_paths_touched: Vec<String> = Vec::new();
     let mut touched_clank = false;
@@ -783,44 +727,33 @@ fn parse_diff_tree(stdout: &str) -> Result<ParsedDiffTree, GitIoError> {
                 });
             }
         } else if new_finalize.is_some() || old_finalize.is_some() {
-            // Finalize-snapshot file. A rename whose <stem>/<file> differs
-            // is modelled as Remove(old) + Upsert(new); a pure 'D' is a
-            // Remove of the path in `new_rel` (git's name-status puts the
-            // deleted path there for non-rename deletes).
             if status_char == 'D' && !is_rename {
-                if let Some((plan_key, file_name)) = new_finalize.clone() {
+                if let Some(plan_key) = new_finalize {
                     finalize_changes.push(FinalizeChange {
                         plan_key,
-                        file_name,
                         kind: FinalizeChangeKind::Remove,
                     });
                 }
             } else if is_rename {
-                if let Some((old_key, old_file)) = old_finalize.clone() {
-                    let same = matches!(
-                        &new_finalize,
-                        Some((nk, nf)) if nk == &old_key && nf == &old_file
-                    );
-                    if !same {
+                if let Some(old_key) = old_finalize {
+                    if new_finalize.as_ref() != Some(&old_key) {
                         finalize_changes.push(FinalizeChange {
                             plan_key: old_key,
-                            file_name: old_file,
                             kind: FinalizeChangeKind::Remove,
                         });
                     }
                 }
-                if let Some((plan_key, file_name)) = new_finalize {
-                    finalize_upserts.push(FinalizeUpsertPath {
+                if let Some(plan_key) = new_finalize {
+                    finalize_changes.push(FinalizeChange {
                         plan_key,
-                        file_name,
+                        kind: FinalizeChangeKind::Added,
                     });
                 }
             } else {
-                // 'A' or 'M' (or any other non-D, non-rename status).
-                if let Some((plan_key, file_name)) = new_finalize {
-                    finalize_upserts.push(FinalizeUpsertPath {
+                if let Some(plan_key) = new_finalize {
+                    finalize_changes.push(FinalizeChange {
                         plan_key,
-                        file_name,
+                        kind: FinalizeChangeKind::Added,
                     });
                 }
             }
@@ -833,29 +766,23 @@ fn parse_diff_tree(stdout: &str) -> Result<ParsedDiffTree, GitIoError> {
     clank_paths.dedup();
     clank_paths_touched.sort();
     clank_paths_touched.dedup();
-    Ok(ParsedDiffTree {
-        changes: CommitChanges {
-            plan_touches,
-            has_non_plan_code_changes,
-            finalize_changes,
-            clank_paths,
-            touched_clank,
-            clank_paths_touched,
-        },
-        finalize_upserts,
-        plan_body_paths,
+    Ok(CommitChanges {
+        plan_touches,
+        has_non_plan_code_changes,
+        finalize_changes,
+        clank_paths,
+        touched_clank,
+        clank_paths_touched,
     })
 }
 
-fn parse_finalize_subpath(rel: &Path) -> Option<(PlanKey, String)> {
+fn parse_finalize_subpath(rel: &Path) -> Option<PlanKey> {
     let under = rel.strip_prefix(".clank/finished").ok()?;
-    let parsed = parse_finalize_path(under)?;
-    let file_name = parsed
-        .raw
-        .file_name()
-        .and_then(|s| s.to_str())
-        .map(|s| s.to_string())?;
-    Some((parsed.plan_key, file_name))
+    let stem = under.to_str()?;
+    if stem.is_empty() || stem.contains('/') {
+        return None;
+    }
+    PlanKey::parse(stem).ok()
 }
 
 /// Gather a `CommitSnapshot` for `repo_root`. IO half of the
@@ -1045,7 +972,7 @@ mod tests {
     fn parse_diff_tree_single_plan_intro() {
         let stdout = "A\t.clank/plans/foo.md\n";
         let parsed = parse_diff_tree(stdout).unwrap();
-        let changes = &parsed.changes;
+        let changes = &parsed;
         assert_eq!(changes.plan_touches.len(), 1);
         assert_eq!(changes.plan_touches[0].plan.as_str(), "foo");
         assert!(matches!(changes.plan_touches[0].kind, PlanTouchKind::Intro));
@@ -1063,7 +990,7 @@ mod tests {
     fn parse_diff_tree_rename_out_of_plans_is_delete() {
         let stdout = "R100\t.clank/plans/foo.md\t.clank/plans/done/foo.md\n";
         let parsed = parse_diff_tree(stdout).unwrap();
-        let changes = &parsed.changes;
+        let changes = &parsed;
         assert_eq!(changes.plan_touches.len(), 1);
         assert_eq!(changes.plan_touches[0].plan.as_str(), "foo");
         assert!(matches!(
@@ -1082,7 +1009,7 @@ mod tests {
     fn parse_diff_tree_rename_into_plans_is_intro() {
         let stdout = "R100\t.clank/plans/done/foo.md\t.clank/plans/foo.md\n";
         let parsed = parse_diff_tree(stdout).unwrap();
-        let changes = &parsed.changes;
+        let changes = &parsed;
         assert_eq!(changes.plan_touches.len(), 1);
         assert_eq!(changes.plan_touches[0].plan.as_str(), "foo");
         assert!(matches!(changes.plan_touches[0].kind, PlanTouchKind::Intro));
@@ -1093,7 +1020,7 @@ mod tests {
     fn parse_diff_tree_plan_revision_with_code() {
         let stdout = "M\t.clank/plans/foo.md\nM\tsrc/lib.rs\n";
         let parsed = parse_diff_tree(stdout).unwrap();
-        let changes = &parsed.changes;
+        let changes = &parsed;
         assert_eq!(changes.plan_touches.len(), 1);
         assert!(matches!(
             changes.plan_touches[0].kind,
@@ -1106,7 +1033,7 @@ mod tests {
     fn parse_diff_tree_pure_code() {
         let stdout = "M\tsrc/foo.rs\nA\ttests/bar.rs\n";
         let parsed = parse_diff_tree(stdout).unwrap();
-        let changes = &parsed.changes;
+        let changes = &parsed;
         assert!(changes.plan_touches.is_empty());
         assert!(changes.has_non_plan_code_changes);
     }
@@ -1115,7 +1042,7 @@ mod tests {
     fn parse_diff_tree_multi_plan_touch() {
         let stdout = "M\t.clank/plans/foo.md\nA\t.clank/plans/bar.md\nM\tsrc/lib.rs\n";
         let parsed = parse_diff_tree(stdout).unwrap();
-        let changes = &parsed.changes;
+        let changes = &parsed;
         assert_eq!(changes.plan_touches.len(), 2);
         assert!(changes.has_non_plan_code_changes);
     }
@@ -1124,33 +1051,30 @@ mod tests {
     fn parse_diff_tree_ignores_other_clank_paths() {
         let stdout = "A\t.clank/feedback/foo/plan/alice.md\n";
         let parsed = parse_diff_tree(stdout).unwrap();
-        let changes = &parsed.changes;
+        let changes = &parsed;
         assert!(changes.plan_touches.is_empty());
         assert!(!changes.has_non_plan_code_changes);
         assert!(changes.finalize_changes.is_empty());
     }
 
     #[test]
-    fn parse_diff_tree_finalize_added_queues_upsert() {
-        let stdout = "A\t.clank/finished/foo/alice.md\n";
+    fn parse_diff_tree_finalize_added() {
+        let stdout = "A\t.clank/finished/foo\n";
         let parsed = parse_diff_tree(stdout).unwrap();
-        assert!(parsed.changes.plan_touches.is_empty());
-        assert!(!parsed.changes.has_non_plan_code_changes);
-        assert!(parsed.changes.finalize_changes.is_empty());
-        assert_eq!(parsed.finalize_upserts.len(), 1);
-        assert_eq!(parsed.finalize_upserts[0].plan_key.as_str(), "foo");
-        assert_eq!(parsed.finalize_upserts[0].file_name, "alice.md");
+        assert!(parsed.plan_touches.is_empty());
+        assert!(!parsed.has_non_plan_code_changes);
+        assert_eq!(parsed.finalize_changes.len(), 1);
+        assert_eq!(parsed.finalize_changes[0].plan_key.as_str(), "foo");
+        assert!(matches!(parsed.finalize_changes[0].kind, FinalizeChangeKind::Added));
     }
 
     #[test]
     fn parse_diff_tree_finalize_deleted_emits_remove() {
-        let stdout = "D\t.clank/finished/foo/alice.md\n";
+        let stdout = "D\t.clank/finished/foo\n";
         let parsed = parse_diff_tree(stdout).unwrap();
-        assert_eq!(parsed.changes.finalize_changes.len(), 1);
-        let fc = &parsed.changes.finalize_changes[0];
+        assert_eq!(parsed.finalize_changes.len(), 1);
+        let fc = &parsed.finalize_changes[0];
         assert_eq!(fc.plan_key.as_str(), "foo");
-        assert_eq!(fc.file_name, "alice.md");
         assert!(matches!(fc.kind, FinalizeChangeKind::Remove));
-        assert!(parsed.finalize_upserts.is_empty());
     }
 }

@@ -52,13 +52,12 @@ pub enum PlanTouchKind {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FinalizeChange {
     pub plan_key: PlanKey,
-    pub file_name: String,
     pub kind: FinalizeChangeKind,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FinalizeChangeKind {
-    Upsert { first_line: String },
+    Added,
     Remove,
 }
 

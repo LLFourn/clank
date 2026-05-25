@@ -54,21 +54,16 @@ pub fn parse_feedback_path(rel: &Path) -> Option<FeedbackPath> {
     })
 }
 
-/// A parsed `.clank/finished/<plan-stem>/<author>.md` path — one
-/// approving-reviewer entry inside a finalize snapshot.
+/// A parsed `.clank/finished/<plan-stem>` path — an empty marker
+/// file indicating a plan is finished.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FinalizePath {
     pub plan_key: PlanKey,
-    pub author: AgentLabel,
-    pub raw: PathBuf,
 }
 
 /// Parse a path relative to `<repo>/.clank/finished/` into a
-/// `FinalizePath`. Expected shape:
-///
-/// `<plan-stem>/<author>.md` (flat — no per-SHA subdirectory).
-///
-/// Returns `None` for any other shape.
+/// `FinalizePath`. Expected shape: `<plan-stem>` (a single segment,
+/// no extension).
 pub fn parse_finalize_path(rel: &Path) -> Option<FinalizePath> {
     let segments: Vec<&std::ffi::OsStr> = rel
         .components()
@@ -77,26 +72,12 @@ pub fn parse_finalize_path(rel: &Path) -> Option<FinalizePath> {
             _ => None,
         })
         .collect();
-    let (stem, file_seg) = match segments.as_slice() {
-        [stem, file] => (*stem, *file),
-        _ => return None,
-    };
-    let author = file_seg.to_str()?.strip_suffix(".md")?;
-    if author.is_empty() {
+    let [stem] = segments.as_slice() else {
         return None;
-    }
+    };
     Some(FinalizePath {
         plan_key: PlanKey::parse(stem.to_str()?).ok()?,
-        author: AgentLabel::parse(author).ok()?,
-        raw: rel.to_path_buf(),
     })
-}
-
-/// True iff the first non-empty line, trimmed, starts with `APPROVE`
-/// (the bare token, optionally followed by other characters). Used by
-/// the finalize rule's per-file check.
-pub fn finalize_first_line_starts_with_approve(first_line: &str) -> bool {
-    first_line.trim_start().starts_with("APPROVE")
 }
 
 /// Build the canonical relative feedback path
@@ -200,41 +181,19 @@ mod tests {
     }
 
     #[test]
-    fn parse_finalize_path_flat_shape() {
-        let parsed = parse_finalize_path(&p("foo/alice.md")).unwrap();
+    fn parse_finalize_path_single_segment() {
+        let parsed = parse_finalize_path(&p("foo")).unwrap();
         assert_eq!(parsed.plan_key.as_str(), "foo");
-        assert_eq!(parsed.author.as_str(), "alice");
     }
 
     #[test]
-    fn parse_finalize_path_rejects_per_sha_subdir() {
-        assert!(parse_finalize_path(&p("foo/abc1234/alice.md")).is_none());
+    fn parse_finalize_path_rejects_nested() {
+        assert!(parse_finalize_path(&p("foo/alice.md")).is_none());
     }
 
     #[test]
-    fn parse_finalize_path_rejects_top_level_md() {
-        assert!(parse_finalize_path(&p("alice.md")).is_none());
-    }
-
-    #[test]
-    fn parse_finalize_path_rejects_non_md() {
-        assert!(parse_finalize_path(&p("foo/alice.txt")).is_none());
-    }
-
-    #[test]
-    fn finalize_first_line_approve_passes() {
-        assert!(finalize_first_line_starts_with_approve("APPROVE"));
-        assert!(finalize_first_line_starts_with_approve(
-            "APPROVE — looks good"
-        ));
-        assert!(finalize_first_line_starts_with_approve("  APPROVE"));
-    }
-
-    #[test]
-    fn finalize_first_line_other_fails() {
-        assert!(!finalize_first_line_starts_with_approve("REQUEST_CHANGES"));
-        assert!(!finalize_first_line_starts_with_approve("approve"));
-        assert!(!finalize_first_line_starts_with_approve(""));
+    fn parse_finalize_path_rejects_invalid_plan_key() {
+        assert!(parse_finalize_path(&p(".bad")).is_none());
     }
 
     #[test]

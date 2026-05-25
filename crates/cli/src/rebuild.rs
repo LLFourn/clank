@@ -309,11 +309,7 @@ mod tests {
         let dir = init_repo();
         write_file(dir.path(), ".clank/plans/foo.md", "# foo\n");
         commit(dir.path(), "[foo] intro");
-        write_file(
-            dir.path(),
-            ".clank/finished/foo/alice.md",
-            "APPROVE\n\nlgtm\n",
-        );
+        write_file(dir.path(), ".clank/finished/foo", "");
         commit(dir.path(), "Finalize foo");
         let state = rebuild_repo(dir.path()).await.unwrap();
         let key = PlanKey::parse("foo").unwrap();

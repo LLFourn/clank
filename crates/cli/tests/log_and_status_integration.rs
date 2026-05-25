@@ -75,8 +75,8 @@ fn status_trims_finished_plans_to_three() {
         commit(repo, &format!("[{name}] intro"));
         write(
             repo,
-            &format!(".clank/finished/{name}/codex.md"),
-            "APPROVE\n\nlgtm\n",
+            &format!(".clank/finished/{name}"),
+            "",
         );
         commit(repo, &format!("Finalize {name}"));
     }
@@ -112,8 +112,8 @@ fn status_all_shows_all_finished_plans() {
         commit(repo, &format!("[{name}] intro"));
         write(
             repo,
-            &format!(".clank/finished/{name}/codex.md"),
-            "APPROVE\n\nlgtm\n",
+            &format!(".clank/finished/{name}"),
+            "",
         );
         commit(repo, &format!("Finalize {name}"));
     }
@@ -218,8 +218,8 @@ fn log_finished_plan_shows_full_timeline() {
 
     write(
         repo,
-        ".clank/finished/bar/codex.md",
-        "APPROVE\n\nfinalized\n",
+        ".clank/finished/bar",
+        "",
     );
     commit(repo, "Finalize bar");
 

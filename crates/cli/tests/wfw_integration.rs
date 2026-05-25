@@ -794,21 +794,14 @@ fn wfw_finish_wake_survives_early_snapshot_event() {
         ],
     );
 
-    // Stage 1: write the snapshot file under .clank/finished/. This
-    // is the early FS event `clank finish` produces before its
-    // commit lands.
-    write(repo, ".clank/finished/foo/alice.md", "APPROVE\n\nsealed\n");
+    // Stage 1: write the empty marker file.
+    write(repo, ".clank/finished/foo", "");
 
-    // Stage 2: sleep WELL past the watcher's debounce window so
-    // the snapshot-event wake consumed the FS-event budget alone.
+    // Stage 2: sleep past the watcher's debounce window.
     std::thread::sleep(Duration::from_millis(1200));
 
-    // Stage 3: commit the finalize tree, mirroring `clank finish`:
-    // stage ONLY the new snapshot file and commit. `clank finish`
-    // does not remove the plan file — the finalize predicate
-    // fires on `.clank/finished/<stem>/` becoming non-empty, not
-    // on plan-file deletion.
-    git(repo, &["add", ".clank/finished/foo/alice.md"]);
+    // Stage 3: commit the finalize marker.
+    git(repo, &["add", ".clank/finished/foo"]);
     git(repo, &["commit", "--quiet", "-m", "Finalize foo"]);
 
     let exit = wait_for_exit(&mut child, Duration::from_secs(20));

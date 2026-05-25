@@ -188,7 +188,7 @@ pub async fn build_rewrite_preview(
         let strip_predicate_for_diff = |p: &str| -> bool {
             p == format!(".clank/plans/{}.md", plan_key.as_str())
                 || (include_finalize
-                    && p.starts_with(&format!(".clank/finished/{}/", plan_key.as_str())))
+                    && p == format!(".clank/finished/{}", plan_key.as_str()))
         };
         let contributes_non_strippable = changes.has_non_plan_code_changes
             || changes
@@ -595,11 +595,7 @@ mod tests {
         write_file(dir.path(), ".clank/plans/b.md", "# b v2\n");
         commit(dir.path(), "[a,b] shared work");
         // Approve b and finalize.
-        write_file(
-            dir.path(),
-            ".clank/finished/b/alice.md",
-            "APPROVE\n\nlgtm\n",
-        );
+        write_file(dir.path(), ".clank/finished/b", "");
         commit(dir.path(), "Finalize b");
 
         let state = rebuild_repo_with_policy(dir.path(), CachePolicy::Bypass)

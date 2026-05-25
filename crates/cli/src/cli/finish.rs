@@ -195,63 +195,24 @@ fn reason_to_msg(reason: &FinalizeBlockReason) -> String {
     }
 }
 
-/// Read+hash every approval into memory BEFORE touching
-/// `.clank/finished/<stem>/`. If any read fails or any hash
-/// drifts, we abort cleanly and the operator's existing finalize
-/// snapshot is untouched. Especially important for `--amend`: a
-/// failure must not strand the operator between snapshots.
 async fn finalize(
     repo: &Path,
     stem: &str,
-    preview: &FinishPreviewResponse,
+    _preview: &FinishPreviewResponse,
     amend: bool,
     message: Option<&str>,
 ) -> anyhow::Result<()> {
-    if preview.sealed_approvals.is_empty() {
-        anyhow::bail!(
-            "readiness=Ready but no sealed approvals to write — refusing to seal an empty set"
-        );
-    }
-
-    let mut verified: Vec<(String, String)> = Vec::with_capacity(preview.sealed_approvals.len());
-    for approval in &preview.sealed_approvals {
-        let source = repo.join(&approval.source_path);
-        let body = std::fs::read_to_string(&source).map_err(|e| {
-            anyhow::anyhow!(
-                "failed to read sealed-approval source `{}`: {e}",
-                approval.source_path,
-            )
-        })?;
-        let observed = crate::lifecycle::content_hash(&body);
-        if observed != approval.body_hash {
-            anyhow::bail!(
-                "sealed approval for `{}` drifted between preview and commit \
-                 (daemon hash {}, on-disk hash {}); re-run after the watcher \
-                 catches up, or revert the file",
-                approval.author.as_str(),
-                approval.body_hash.as_str(),
-                observed.as_str(),
-            );
-        }
-        verified.push((format!("{}.md", approval.author.as_str()), body));
-    }
-
-    let finished_dir = repo.join(".clank/finished").join(stem);
-    if finished_dir.exists() {
-        std::fs::remove_dir_all(&finished_dir)?;
-    }
+    let finished_dir = repo.join(".clank/finished");
     std::fs::create_dir_all(&finished_dir)?;
-    for (name, body) in &verified {
-        std::fs::write(finished_dir.join(name), body)?;
+    let marker = finished_dir.join(stem);
+    // Remove old directory-style finished marker if present.
+    if marker.is_dir() {
+        std::fs::remove_dir_all(&marker)?;
     }
+    std::fs::write(&marker, "")?;
 
-    // `-A` so that approver files removed from the new set are
-    // staged as deletions. Plain `git add <dir>` only stages
-    // additions/modifications; an --amend would otherwise inherit
-    // the prior commit's approver list and silently keep a stale
-    // file when the new approver set is a strict subset.
     let rel_finished = format!(".clank/finished/{stem}");
-    git_run(repo, &["add", "-A", "--", &rel_finished])?;
+    git_run(repo, &["add", "--", &rel_finished])?;
 
     let default_msg = format!("Finalize {stem}");
     let msg = message.unwrap_or(&default_msg);
@@ -263,9 +224,6 @@ async fn finalize(
     Ok(())
 }
 
-/// True iff HEAD is a finalize commit for this plan — defined as
-/// "every file changed by HEAD lives under `.clank/finished/<stem>/`."
-/// Used by `--amend` to refuse amending an unrelated commit.
 fn head_is_finalize_for(repo: &Path, stem: &str) -> anyhow::Result<bool> {
     let output = std::process::Command::new("git")
         .arg("-C")
@@ -276,9 +234,9 @@ fn head_is_finalize_for(repo: &Path, stem: &str) -> anyhow::Result<bool> {
         return Ok(false);
     }
     let stdout = String::from_utf8_lossy(&output.stdout);
-    let prefix = format!(".clank/finished/{stem}/");
+    let expected = format!(".clank/finished/{stem}");
     let lines: Vec<&str> = stdout.lines().filter(|l| !l.is_empty()).collect();
-    Ok(!lines.is_empty() && lines.iter().all(|l| l.starts_with(&prefix)))
+    Ok(!lines.is_empty() && lines.iter().all(|l| *l == expected))
 }
 
 fn git_run(repo: &Path, args: &[&str]) -> anyhow::Result<()> {
@@ -301,10 +259,7 @@ fn git_run(repo: &Path, args: &[&str]) -> anyhow::Result<()> {
 mod tests {
     use super::*;
 
-    // Plan-arg parsing tests live in `crate::cli::plan_resolve`.
-
-    use clank_core::api::{FinalizeReadiness, FinishPreviewResponse, SealedApproval};
-    use clank_core::ids::AgentLabel;
+    use clank_core::api::{FinalizeReadiness, FinishPreviewResponse};
     use clank_core::vocab::{CommitGateState, PlanWorktreeStatus};
 
     fn init_repo() -> tempfile::TempDir {
@@ -332,7 +287,7 @@ mod tests {
         std::fs::write(p, body).unwrap();
     }
 
-    fn mk_preview_ready(approval_path: &str, body: &str) -> FinishPreviewResponse {
+    fn mk_preview_ready() -> FinishPreviewResponse {
         FinishPreviewResponse {
             plan_id: "clank/foo.md".into(),
             plan_path: ".clank/plans/foo.md".into(),
@@ -341,33 +296,25 @@ mod tests {
             latest_reviewable_sha: None,
             plan_worktree_status: PlanWorktreeStatus::Clean,
             is_finished: false,
-            sealed_approvals: vec![SealedApproval {
-                author: AgentLabel::parse("codex").unwrap(),
-                source_path: approval_path.to_string(),
-                body_hash: crate::lifecycle::content_hash(body),
-            }],
+            sealed_approvals: vec![],
         }
     }
 
     #[tokio::test]
-    async fn finalize_writes_approver_file_and_commits() {
+    async fn finalize_writes_empty_marker_and_commits() {
         let dir = init_repo();
         write_at(dir.path(), "README.md", "seed\n");
         run_git(dir.path(), &["add", "-A"]);
         run_git(dir.path(), &["commit", "--quiet", "-m", "seed"]);
 
-        let approval = ".clank/agents/codex/feedback/foo/abcdef.md";
-        let body = "APPROVE\n\nlgtm\n";
-        write_at(dir.path(), approval, body);
-
-        let preview = mk_preview_ready(approval, body);
+        let preview = mk_preview_ready();
         finalize(dir.path(), "foo", &preview, false, None)
             .await
             .unwrap();
 
-        let dest = dir.path().join(".clank/finished/foo/codex.md");
-        assert_eq!(std::fs::read_to_string(&dest).unwrap(), body);
-        // A finalize commit landed.
+        let marker = dir.path().join(".clank/finished/foo");
+        assert!(marker.exists(), "marker file should exist");
+        assert_eq!(std::fs::read_to_string(&marker).unwrap(), "");
         let out = std::process::Command::new("git")
             .arg("-C")
             .arg(dir.path())
@@ -381,151 +328,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn finalize_aborts_on_hash_drift_without_touching_existing_snapshot() {
+    async fn finalize_replaces_old_directory_style_marker() {
         let dir = init_repo();
         write_at(dir.path(), "README.md", "seed\n");
         run_git(dir.path(), &["add", "-A"]);
         run_git(dir.path(), &["commit", "--quiet", "-m", "seed"]);
 
-        // Pre-existing finalize snapshot (e.g. from a prior run).
-        let stale_snapshot = ".clank/finished/foo/codex.md";
-        write_at(dir.path(), stale_snapshot, "OLD APPROVE\n");
+        write_at(dir.path(), ".clank/finished/foo/codex.md", "APPROVE\n");
 
-        let approval = ".clank/agents/codex/feedback/foo/abcdef.md";
-        write_at(dir.path(), approval, "APPROVE\n\non-disk body\n");
-        // Preview expects a different body — the daemon's projection
-        // is stale relative to disk.
-        let preview = mk_preview_ready(approval, "APPROVE\n\nDAEMON BELIEVED THIS\n");
-
-        let err = finalize(dir.path(), "foo", &preview, false, None)
-            .await
-            .unwrap_err();
-        let msg = format!("{err}");
-        assert!(msg.contains("drifted"), "got: {msg}");
-
-        // The pre-existing snapshot is intact — abort happened BEFORE
-        // mutation.
-        assert_eq!(
-            std::fs::read_to_string(dir.path().join(stale_snapshot)).unwrap(),
-            "OLD APPROVE\n",
-            "drift abort must not touch the existing finalize snapshot",
-        );
-    }
-
-    #[tokio::test]
-    async fn finalize_aborts_on_missing_source_without_touching_existing_snapshot() {
-        let dir = init_repo();
-        write_at(dir.path(), "README.md", "seed\n");
-        run_git(dir.path(), &["add", "-A"]);
-        run_git(dir.path(), &["commit", "--quiet", "-m", "seed"]);
-
-        let stale_snapshot = ".clank/finished/foo/codex.md";
-        write_at(dir.path(), stale_snapshot, "OLD APPROVE\n");
-
-        // Approval file does NOT exist on disk.
-        let preview = mk_preview_ready(".clank/agents/codex/feedback/foo/abcdef.md", "APPROVE\n");
-
-        let err = finalize(dir.path(), "foo", &preview, false, None)
-            .await
-            .unwrap_err();
-        let msg = format!("{err}");
-        assert!(msg.contains("failed to read"), "got: {msg}");
-
-        assert_eq!(
-            std::fs::read_to_string(dir.path().join(stale_snapshot)).unwrap(),
-            "OLD APPROVE\n",
-            "missing-source abort must not touch the existing finalize snapshot",
-        );
-    }
-
-    #[tokio::test]
-    async fn finalize_amend_removes_approver_no_longer_in_set() {
-        let dir = init_repo();
-        write_at(dir.path(), "README.md", "seed\n");
-        run_git(dir.path(), &["add", "-A"]);
-        run_git(dir.path(), &["commit", "--quiet", "-m", "seed"]);
-
-        // First finalize: two approvers.
-        let codex_approval = ".clank/agents/codex/feedback/foo/abcdef.md";
-        let claude_approval = ".clank/agents/claude/feedback/foo/abcdef.md";
-        write_at(dir.path(), codex_approval, "APPROVE codex\n");
-        write_at(dir.path(), claude_approval, "APPROVE claude\n");
-
-        let first = FinishPreviewResponse {
-            plan_id: "clank/foo.md".into(),
-            plan_path: ".clank/plans/foo.md".into(),
-            readiness: FinalizeReadiness::Ready,
-            gate_state: CommitGateState::Approved,
-            latest_reviewable_sha: None,
-            plan_worktree_status: PlanWorktreeStatus::Clean,
-            is_finished: false,
-            sealed_approvals: vec![
-                SealedApproval {
-                    author: AgentLabel::parse("codex").unwrap(),
-                    source_path: codex_approval.into(),
-                    body_hash: crate::lifecycle::content_hash("APPROVE codex\n"),
-                },
-                SealedApproval {
-                    author: AgentLabel::parse("claude").unwrap(),
-                    source_path: claude_approval.into(),
-                    body_hash: crate::lifecycle::content_hash("APPROVE claude\n"),
-                },
-            ],
-        };
-        finalize(dir.path(), "foo", &first, false, None)
+        let preview = mk_preview_ready();
+        finalize(dir.path(), "foo", &preview, false, None)
             .await
             .unwrap();
 
-        // Sanity: both files in HEAD's tree.
-        let ls = std::process::Command::new("git")
-            .arg("-C")
-            .arg(dir.path())
-            .args([
-                "ls-tree",
-                "-r",
-                "--name-only",
-                "HEAD",
-                ".clank/finished/foo/",
-            ])
-            .output()
-            .unwrap();
-        let listed = String::from_utf8(ls.stdout).unwrap();
-        assert!(listed.contains("codex.md"));
-        assert!(listed.contains("claude.md"));
-
-        // Amend with a strict subset (claude only). The codex approver
-        // file must be staged as a deletion and disappear from HEAD's
-        // tree — otherwise `git add <dir>` would leave the stale file
-        // around.
-        let second = FinishPreviewResponse {
-            sealed_approvals: vec![SealedApproval {
-                author: AgentLabel::parse("claude").unwrap(),
-                source_path: claude_approval.into(),
-                body_hash: crate::lifecycle::content_hash("APPROVE claude\n"),
-            }],
-            ..first
-        };
-        finalize(dir.path(), "foo", &second, true, None)
-            .await
-            .unwrap();
-
-        let ls = std::process::Command::new("git")
-            .arg("-C")
-            .arg(dir.path())
-            .args([
-                "ls-tree",
-                "-r",
-                "--name-only",
-                "HEAD",
-                ".clank/finished/foo/",
-            ])
-            .output()
-            .unwrap();
-        let listed = String::from_utf8(ls.stdout).unwrap();
-        assert!(
-            !listed.contains("codex.md"),
-            "codex approver should be removed after amend; got:\n{listed}"
-        );
-        assert!(listed.contains("claude.md"));
+        let marker = dir.path().join(".clank/finished/foo");
+        assert!(marker.is_file(), "should be a file, not a directory");
+        assert_eq!(std::fs::read_to_string(&marker).unwrap(), "");
     }
 }
