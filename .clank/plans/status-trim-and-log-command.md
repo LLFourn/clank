@@ -101,6 +101,14 @@ collect or discard the events.
 events from each `apply_commit` call. `RepoState` result type
 extended to carry the events (or they're returned separately).
 
+`clank log` uses the cache to reach the range start quickly,
+then folds from there collecting log events. A warm cache whose
+head is at or before the range start provides the fold context;
+commits from the range start onward are always folded (not
+skipped), producing events. If the cache head is past the range
+start, fall back to a cold fold from root. No cache encoding
+changes needed — log events are never stored in the cache.
+
 **`crates/cli/src/cli/log.rs`**: new file. Rebuilds the repo,
 filters log events by plan, scans feedback for the relevant
 SHAs, interleaves reviews, renders. Commit subjects come from
