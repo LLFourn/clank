@@ -24,7 +24,8 @@ Show a count header like `finished plans (3 of 14):` so the
 operator knows there are more. `--all` already exists on status
 and should show the full list.
 
-Same trim for the JSON builder (`build_json`).
+JSON mode keeps all finished plans (no truncation) — consumers
+need the full list for programmatic use. Only human mode trims.
 
 ## Part 2: clank log
 
@@ -89,12 +90,30 @@ clank log [--plan <stem>] [--all] [--json] [--repo <path>]
 - No active plans + no `--plan`: show the most recent finished
   plan's timeline.
 
+### Finished-plan timeline reconstruction
+
+`FinishedPlan` stores only `{ plan, intro, finalized_at }` — the
+fold drops per-commit timelines on finalize. To reconstruct:
+
+Reuse the preview module's re-fold approach
+(`crates/cli/src/preview.rs:120`): given `intro` and
+`finalized_at`, walk `git log intro..finalized_at` to get the
+commit SHAs in the range, then classify each commit's touched
+paths against the plan stem. This produces
+`Vec<PlanTimelineEvent>` for the finished plan, which
+`scan_feedback` can use for reviewable-SHA extraction.
+
+Extract this into a shared helper
+`rebuild_finished_plan_timeline(repo, plan, intro, finalized_at)`
+so both `log` and `preview` can use it.
+
 ### Implementation
 
 New file `crates/cli/src/cli/log.rs`. Fold the repo, collect
-events from active + finished plan timelines, scan feedback for
-review events, sort chronologically with reviews after their
-target commit, render.
+events from active plan timelines (directly available) and
+finished plan timelines (via the reconstruction helper), scan
+feedback for review events, sort chronologically with reviews
+after their target commit, render.
 
 The feedback scan is already available via
 `crate::feedback_scan::scan_feedback`. Commit subjects come from
@@ -112,7 +131,9 @@ in `main.rs`.
 
 ### Log
 - Log with one active plan shows commit + review timeline.
-- Log with `--plan` on a finished plan shows its timeline.
+- Log with `--plan` on a finished plan shows its timeline
+  including multiple reviewable commits and their reviews
+  (exercises the reconstruction helper).
 - Log JSON mode produces typed event array.
 
 ## Acceptance criteria
