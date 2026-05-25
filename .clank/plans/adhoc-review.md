@@ -173,8 +173,17 @@ flag needed.
   of a directory.
 - `preview.rs`: update gate checks to use flat feedback.
   Sealed-approval logic simplified (no copied feedback to seal).
+- `disk_format.rs`: rename `parse_finalize_path` →
+  `parse_finish_path`, update to accept `.clank/finished/<plan>`
+  (file, no subdirectory).
 - `git_io.rs`: `finish_predicate_at` updated to check for
-  `.clank/finished/<plan>` file instead of a directory.
+  `.clank/finished/<plan>` file. Rename `parse_finalize_subpath`
+  → `parse_finish_subpath`, update `diff_tree_changes` finish
+  detection for new file shape. `tree_plan_paths` updated for
+  rewrite stripping.
+- `disk_snapshot.rs`: `enrich_with_newly_finished` works with
+  the new finish candidate discovery.
+- `preview.rs`: rewrite path predicates updated for file shape.
 - `purge.rs`: strip paths updated for file instead of directory.
 - `setup_assets/claude_skill.md` + `codex_skill.md`: update
   `clank feedback write` docs to remove `--plan`.
