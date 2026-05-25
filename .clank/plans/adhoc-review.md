@@ -81,10 +81,15 @@ Named `WorkPolicy` to avoid collision with the existing
 
 ```rust
 pub struct WorkPolicy {
+    pub force_review_on_plan_commits: bool,
     pub force_review_on_misc_commits: bool,
     pub ad_hoc_reviewers: Option<Vec<AgentLabel>>,
 }
 ```
+
+`force_review_on_plan_commits` preserved from the existing
+config — when false, plan commits don't require review
+(master can proceed without waiting for reviewers).
 
 ### `WorkStatus`
 
@@ -212,6 +217,10 @@ flag needed.
 - Stop-hook reviewer prompt uses `--commit` (no `--plan`).
 - Migration moves old files correctly.
 - Ad-hoc items don't fire lifecycle hooks.
+- `clank status` shows reviews from flat feedback.
+- `clank log` shows reviews from flat feedback.
+- `fs_watcher::path_to_signal` recognizes flat feedback path.
+- Feedback write triggers wfw wake/refold.
 
 ## Acceptance criteria
 
