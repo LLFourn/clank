@@ -13,7 +13,7 @@
 //!   mid-write can't leave a half-written feedback file the
 //!   reviewer-scan would treat as `Unmarked`.
 
-use std::io::{Read, Write};
+use std::io::Write;
 use std::path::Path;
 
 use anyhow::Context;
@@ -50,10 +50,7 @@ async fn run_write(args: FeedbackWriteArgs) -> anyhow::Result<()> {
         }
     };
 
-    let raw_body = read_body(&args.body_file)
-        .with_context(|| format!("reading body from `{}`", args.body_file))?;
-
-    let body = format!("{verdict_header} {raw_body}");
+    let body = format!("{verdict_header} {}\n", args.message.trim());
 
     // Write paths can't tolerate a stale fold: if a commit landed
     // since the last cache entry, the reviewable set won't contain
@@ -113,16 +110,6 @@ async fn run_write(args: FeedbackWriteArgs) -> anyhow::Result<()> {
 
     println!("{wire_path}");
     Ok(())
-}
-
-fn read_body(spec: &str) -> std::io::Result<String> {
-    if spec == "-" {
-        let mut s = String::new();
-        std::io::stdin().read_to_string(&mut s)?;
-        Ok(s)
-    } else {
-        std::fs::read_to_string(spec)
-    }
 }
 
 fn write_atomic(path: &Path, contents: &[u8]) -> std::io::Result<()> {

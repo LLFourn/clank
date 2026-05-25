@@ -20,14 +20,14 @@ Each repo's `.clank/` directory contains:
   agent should do. Author + role inferred from your session
   binding (`clank as`) — no flags needed in the common case.
 - `clank feedback write --plan X --commit Y --verdict
-  approve|request-changes --author <label>` (body on stdin) —
-  write your review feedback. The `--verdict` flag sets the
-  verdict; the body on stdin is `<summary>\n\n<details>` — a
-  one-line summary, blank line, then detailed review. The tool
-  prepends the verdict to the file. Do not include the plan
-  name in the summary. Examples:
-  `echo "clean impl, one non-blocking nit" | clank feedback write ...`
-  `echo "overwrought API in foo.rs\n\n- [P1] ..." | clank feedback write ...`
+  approve|request-changes --author <label> -m "<message>"` —
+  write your review feedback. `-m` is the review message (like
+  `git commit -m`): first line is a summary, then details. The
+  tool prepends the verdict to the file. Do not include the plan
+  name in the summary. Write messages as you would a commit
+  message. Examples:
+  `clank feedback write ... --verdict approve -m "clean impl, one non-blocking nit"`
+  `clank feedback write ... --verdict request-changes -m "overwrought API in foo.rs"`
 - `clank finish <plan>` — finalize an approved plan (master only).
 - `clank as <label>` — bind this session to an agent label (you'll
   typically run this once per session at the start).

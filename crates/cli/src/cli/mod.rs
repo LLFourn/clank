@@ -250,9 +250,10 @@ pub struct FeedbackWriteArgs {
     /// `CODEX_THREAD_ID`).
     #[arg(long, value_name = "LABEL")]
     pub author: String,
-    /// Read body from this file. `-` (default) reads from stdin.
-    #[arg(long, value_name = "PATH", default_value = "-")]
-    pub body_file: String,
+    /// Review message (like `git commit -m`). First line is the
+    /// summary; subsequent lines are details. Required.
+    #[arg(short = 'm', value_name = "MSG")]
+    pub message: String,
 }
 
 /// Verdict the writer is claiming for this feedback. Maps to

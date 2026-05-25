@@ -62,27 +62,15 @@ fn one_plan_repo() -> (tempfile::TempDir, String) {
     (dir, sha)
 }
 
-fn run_feedback_write(
-    repo: &Path,
-    args: &[&str],
-    stdin_body: &str,
-) -> (std::process::ExitStatus, String, String) {
-    use std::io::Write;
-    let mut child = Command::new(clank_bin())
+fn run_feedback_write(repo: &Path, args: &[&str]) -> (std::process::ExitStatus, String, String) {
+    let output = Command::new(clank_bin())
         .arg("feedback")
         .arg("write")
         .arg("--repo")
         .arg(repo)
         .args(args)
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
+        .output()
         .expect("spawn clank feedback write");
-    if let Some(mut stdin) = child.stdin.take() {
-        stdin.write_all(stdin_body.as_bytes()).expect("write stdin");
-    }
-    let output = child.wait_with_output().expect("wait");
     (
         output.status,
         String::from_utf8_lossy(&output.stdout).into_owned(),
@@ -107,8 +95,9 @@ fn writes_approve_feedback_to_canonical_path() {
             "approve",
             "--author",
             "alice",
+            "-m",
+            "lgtm",
         ],
-        "lgtm\n",
     );
 
     assert!(status.success(), "exit={status:?} stderr={stderr}");
@@ -139,8 +128,9 @@ fn prepends_request_changes_verdict() {
             "request-changes",
             "--author",
             "alice",
+            "-m",
+            "overwrought API in foo.rs\n\n- [P1] details",
         ],
-        "overwrought API in foo.rs\n\n- [P1] details\n",
     );
 
     assert!(status.success());
@@ -168,8 +158,9 @@ fn errors_on_unknown_commit_ref() {
             "approve",
             "--author",
             "alice",
+            "-m",
+            "lgtm",
         ],
-        "lgtm\n",
     );
 
     assert!(!status.success());
@@ -195,8 +186,9 @@ fn errors_on_inactive_plan() {
             "approve",
             "--author",
             "alice",
+            "-m",
+            "lgtm",
         ],
-        "lgtm\n",
     );
 
     assert!(!status.success());
