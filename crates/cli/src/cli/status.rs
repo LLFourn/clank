@@ -27,7 +27,7 @@ pub async fn run(args: StatusArgs) -> anyhow::Result<()> {
     let (branch, head_sha, head_subject) = head_info(&repo);
     let worktree_dirty = worktree_dirty(&repo)?;
 
-    let selected = select_plans(&state, &basename, args.all, args.plan.as_deref())?;
+    let selected = select_plans(&state, &basename, args.plan.as_deref())?;
     let mut views: Vec<PlanView> = Vec::with_capacity(selected.len());
     for key in &selected {
         if let Some(view) = build_view(&repo, &state, key).await? {
@@ -55,19 +55,15 @@ pub async fn run(args: StatusArgs) -> anyhow::Result<()> {
             worktree_dirty,
             &views,
             &state,
-            args.all,
         );
     }
     Ok(())
 }
 
 /// Pick the plans to render based on the CLI flags. Errors with
-/// exit-3 semantics when no flag is set and the repo has > 1
-/// active plan.
 fn select_plans(
     state: &RepoState,
     basename: &str,
-    all: bool,
     plan_arg: Option<&str>,
 ) -> anyhow::Result<Vec<PlanKey>> {
     if let Some(raw) = plan_arg {
@@ -82,22 +78,7 @@ fn select_plans(
         }
         return Ok(vec![key]);
     }
-    if all {
-        return Ok(state.fold.plans.keys().cloned().collect());
-    }
-    let actives: Vec<PlanKey> = state.fold.plans.keys().cloned().collect();
-    match actives.as_slice() {
-        [] => Ok(Vec::new()),
-        [one] => Ok(vec![one.clone()]),
-        _ => {
-            let err = anyhow::anyhow!(
-                "{} active plans in `{basename}`; pass --all or --plan <stem>. candidates: {}",
-                actives.len(),
-                active_summary(state, basename)
-            );
-            Err(err.context(ExitCode(3)))
-        }
-    }
+    Ok(state.fold.plans.keys().cloned().collect())
 }
 
 /// Marker carried via `anyhow::Error::context` so `main` can map an
@@ -183,7 +164,6 @@ fn print_human(
     worktree_dirty: bool,
     views: &[PlanView],
     state: &RepoState,
-    all: bool,
 ) {
     println!("repo:   {}", repo.display());
     if let Some(b) = branch {
@@ -212,15 +192,9 @@ fn print_human(
     }
 
     if !state.fold.finished_plans.is_empty() {
-        let total = state.fold.finished_plans.len();
-        let show = if all { total } else { total.min(3) };
         println!();
-        if show < total {
-            println!("finished plans ({show} of {total}):");
-        } else {
-            println!("finished plans:");
-        }
-        for fp in state.fold.finished_plans.iter().rev().take(show).rev() {
+        println!("finished plans:");
+        for fp in &state.fold.finished_plans {
             println!(
                 "  {} (finalized {})",
                 fp.plan.as_str(),

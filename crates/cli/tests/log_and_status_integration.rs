@@ -61,79 +61,24 @@ fn run_clank(repo: &Path, args: &[&str]) -> std::process::Output {
 // ---- status trim tests ----
 
 #[test]
-fn status_trims_finished_plans_to_three() {
+fn status_shows_multiple_active_plans_without_error() {
     let dir = init_repo();
     let repo = dir.path();
 
-    for i in 0..5 {
-        let name = format!("plan-{i}");
-        write(
-            repo,
-            &format!(".clank/plans/{name}.md"),
-            &format!("# {name}\n"),
-        );
-        commit(repo, &format!("[{name}] intro"));
-        // Move plan file to finished/ to trigger Finish detection.
-        write(
-            repo,
-            &format!(".clank/finished/{name}.md"),
-            &format!("# {name}\n"),
-        );
-        git(repo, &["rm", "--quiet", &format!(".clank/plans/{name}.md")]);
-        commit(repo, &format!("Finalize {name}"));
-    }
+    write(repo, ".clank/plans/alpha.md", "# alpha\n");
+    write(repo, ".clank/plans/beta.md", "# beta\n");
+    commit(repo, "[alpha,beta] intro both");
 
     let out = run_clank(repo, &["status"]);
+    assert!(
+        out.status.success(),
+        "status should succeed with multiple plans; exit={:?} stderr={}",
+        out.status,
+        String::from_utf8_lossy(&out.stderr),
+    );
     let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(
-        stdout.contains("3 of 5"),
-        "should show '3 of 5'; got:\n{stdout}"
-    );
-    assert!(
-        stdout.contains("plan-4") && stdout.contains("plan-3") && stdout.contains("plan-2"),
-        "should show the 3 most recent; got:\n{stdout}"
-    );
-    assert!(
-        !stdout.contains("plan-0") && !stdout.contains("plan-1"),
-        "should NOT show older plans; got:\n{stdout}"
-    );
-}
-
-#[test]
-fn status_all_shows_all_finished_plans() {
-    let dir = init_repo();
-    let repo = dir.path();
-
-    for i in 0..5 {
-        let name = format!("plan-{i}");
-        write(
-            repo,
-            &format!(".clank/plans/{name}.md"),
-            &format!("# {name}\n"),
-        );
-        commit(repo, &format!("[{name}] intro"));
-        // Move plan file to finished/ to trigger Finish detection.
-        write(
-            repo,
-            &format!(".clank/finished/{name}.md"),
-            &format!("# {name}\n"),
-        );
-        git(repo, &["rm", "--quiet", &format!(".clank/plans/{name}.md")]);
-        commit(repo, &format!("Finalize {name}"));
-    }
-
-    let out = run_clank(repo, &["status", "--all"]);
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    for i in 0..5 {
-        assert!(
-            stdout.contains(&format!("plan-{i}")),
-            "status --all should show plan-{i}; got:\n{stdout}"
-        );
-    }
-    assert!(
-        !stdout.contains("of 5"),
-        "should NOT show truncation notice with --all; got:\n{stdout}"
-    );
+    assert!(stdout.contains("alpha"), "should show alpha; got:\n{stdout}");
+    assert!(stdout.contains("beta"), "should show beta; got:\n{stdout}");
 }
 
 // ---- log tests ----

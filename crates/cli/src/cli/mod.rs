@@ -85,10 +85,6 @@ pub struct StatusArgs {
     /// a debug escape hatch.
     #[arg(long)]
     pub no_cache: bool,
-    /// Render every active plan instead of inferring a single one.
-    /// Mutually exclusive with `--plan`.
-    #[arg(long, conflicts_with = "plan")]
-    pub all: bool,
     /// Specific plan to render. Accepts `<stem>`, `<stem>.md`, or
     /// `<basename>/<stem>.md` — same parser as `clank finish`.
     #[arg(long, value_name = "PLAN")]
