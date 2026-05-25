@@ -71,7 +71,7 @@ Delete `apply_commit_with_log` from `disk_snapshot.rs`. Make
 ### CLI
 
 ```
-clank log [<range>] [--plan <stem>] [--all] [-n N] [--oneline]
+clank log [<range>] [--plan <stem>] [-n N] [--oneline]
           [--json] [--repo <path>]
 ```
 
@@ -86,7 +86,6 @@ clank log [<range>] [--plan <stem>] [--all] [-n N] [--oneline]
   args). Shows whatever plan events are in that range.
 
 `--plan <stem>` filters events to that plan within the range.
-`--all` is not needed (bare already shows all plans in range).
 
 ### Approach
 
@@ -105,13 +104,9 @@ No default limit applied (the user specified the range).
 
 ### Default limit
 
-Show the most recent 30 **commit groups** (a commit + its
-reviews count as one group). `-n N` overrides. `-n 0` shows
-unlimited history.
-
-`--all` remains the plan-scope selector (all plans), not a
-history-depth flag. `--all -n 10` means all plans, 10 most
-recent commit groups.
+`-n 30` (default): fold the last 30 commits from HEAD.
+`-n N` overrides. When an explicit `<range>` is given, `-n`
+is ignored (the range determines the window).
 
 ## Part 3: git-log-style rendering
 
@@ -177,39 +172,32 @@ Array of typed event objects with reviews as separate `kind:
 
 ### `crates/cli/src/cli/log.rs`
 
-- Two-phase rebuild: fast first, `rebuild_from` second.
-- `-n` / `--oneline` flags on `LogArgs`.
-- `print_human` replaced with `print_default` (multi-line) and
-  `print_oneline`.
-- ANSI color output (respect `NO_COLOR` env).
-- Git log data: author name + email from `git log --format`.
+- `rebuild_from(HEAD~N_parent, HEAD)` for the default range.
+- `--plan` filter applied after events are collected.
+- Git-log-style multi-line default output with ANSI colors.
+- `--oneline` compact output.
 
 ### `crates/cli/src/cli/mod.rs`
 
-- Add `-n` and `--oneline` to `LogArgs`.
+- Add `<range>`, `-n`, `--oneline` to `LogArgs`. Remove `--all`.
 
 ## Tests
 
 - `rebuild_from(A, B)` with a warm cache: loads cache before A,
   folds silently through A, collects events for `(A, B]`.
 - `rebuild_from` on a cold repo: cold-folds, same `(from, to]`.
-- `rebuild_from` with a re-introduced plan key: events contain
-  only the current instance, not the prior finalized one.
-- Log default shows at most 30 commit groups.
-- A commit at the limit boundary keeps its reviews (group stays
-  together).
-- `--all -n 10` shows all plans but only 10 groups.
+- Bare `clank log` shows events from the last 30 commits.
+- `clank log --plan foo` filters to plan `foo` within the range.
 - `clank log A..B` excludes commit A, includes B.
 - `clank log A` includes commit A.
-- `clank log <root-sha>` includes the root commit (from=None).
-- Plan intro at root commit: inferred range includes the intro.
-- Log `--oneline` produces compact output.
+- `clank log --oneline` produces compact output.
 - Existing log tests still pass.
 
 ## Acceptance criteria
 
-- `clank log` is fast (uses cache for fold context).
-- Default shows 30 most recent commit groups in git-log
+- `clank log` is fast (folds only the last 30 commits by
+  default, using the cache for fold context).
+- Default shows events from the last 30 commits in git-log
   multi-line format with ANSI colors.
 - `--oneline` shows compact format.
 - `--json` unchanged.
