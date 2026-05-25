@@ -1,13 +1,11 @@
-//! `clank feedback write` — write a typed feedback file.
-//!
-//! Writes to `.clank/agents/<author>/feedback/<sha>.md`.
+//! `clank feedback write` and `clank feedback read`.
 
 use std::io::Write;
 use std::path::Path;
 
 use anyhow::Context;
 
-use super::{FeedbackCmd, FeedbackWriteArgs, resolve_repo};
+use super::{FeedbackCmd, FeedbackReadArgs, FeedbackWriteArgs, resolve_repo};
 use crate::disk_format::feedback_path_wire;
 use crate::lifecycle::{AgentLabel, CommitRef, CommitSha};
 use clank_core::ids::CommitRefResolveError;
@@ -15,6 +13,7 @@ use clank_core::ids::CommitRefResolveError;
 pub async fn run(args: super::FeedbackArgs) -> anyhow::Result<()> {
     match args.command {
         FeedbackCmd::Write(write) => run_write(write).await,
+        FeedbackCmd::Read(read) => run_read(read).await,
     }
 }
 
@@ -104,4 +103,115 @@ fn format_short_list(shas: &[CommitSha]) -> String {
         .map(|s| s.as_str()[..7].to_string())
         .collect::<Vec<_>>()
         .join(", ")
+}
+
+async fn run_read(args: FeedbackReadArgs) -> anyhow::Result<()> {
+    let repo = resolve_repo(args.repo.as_deref())?;
+
+    let sha_str = match &args.commit {
+        Some(s) => s.clone(),
+        None => {
+            let output = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&repo)
+                .args(["rev-parse", "HEAD"])
+                .output()?;
+            if !output.status.success() {
+                anyhow::bail!("repo has no HEAD");
+            }
+            String::from_utf8_lossy(&output.stdout).trim().to_string()
+        }
+    };
+
+    let agents_dir = repo.join(".clank/agents");
+    let mut entries: Vec<FeedbackEntry> = Vec::new();
+
+    if let Ok(agents) = std::fs::read_dir(&agents_dir) {
+        for agent_entry in agents.flatten() {
+            let agent_name = agent_entry.file_name();
+            let Some(label) = agent_name.to_str() else {
+                continue;
+            };
+            let feedback_dir = agent_entry.path().join("feedback");
+            // Try full SHA then short (first 7 chars)
+            let candidates = [
+                feedback_dir.join(format!("{sha_str}.md")),
+                feedback_dir.join(format!("{}.md", &sha_str[..sha_str.len().min(7)])),
+            ];
+            for path in &candidates {
+                if path.exists() {
+                    let body = std::fs::read_to_string(path)?;
+                    let fb = clank_core::feedback_body::FeedbackBody::parse(&body);
+                    let rel = path
+                        .strip_prefix(&repo)
+                        .map(|p| p.to_string_lossy().to_string())
+                        .unwrap_or_else(|_| path.to_string_lossy().to_string());
+                    entries.push(FeedbackEntry {
+                        author: label.to_string(),
+                        verdict: fb.verdict,
+                        summary: fb.summary(),
+                        details: fb.details(),
+                        source_path: rel,
+                    });
+                    break;
+                }
+            }
+        }
+    }
+
+    entries.sort_by(|a, b| a.author.cmp(&b.author));
+
+    if entries.is_empty() {
+        let short = &sha_str[..sha_str.len().min(7)];
+        println!("no feedback for {short}");
+        return Ok(());
+    }
+
+    if args.json {
+        let json: Vec<serde_json::Value> = entries
+            .iter()
+            .map(|e| {
+                serde_json::json!({
+                    "author": e.author,
+                    "verdict": format!("{}", e.verdict),
+                    "summary": e.summary,
+                    "details": e.details,
+                    "source_path": e.source_path,
+                })
+            })
+            .collect();
+        println!("{}", serde_json::to_string_pretty(&json)?);
+    } else {
+        let short = &sha_str[..sha_str.len().min(7)];
+        println!("commit {short}");
+        for e in &entries {
+            let verdict_str = match e.verdict {
+                clank_core::Verdict::Approve => "APPROVE",
+                clank_core::Verdict::RequestChanges => "REQUEST_CHANGES",
+                clank_core::Verdict::Unmarked => "UNMARKED",
+            };
+            let summary = if e.summary.is_empty() {
+                String::new()
+            } else {
+                format!(": {}", e.summary)
+            };
+            println!("  {}  {}{}", e.author, verdict_str, summary);
+            if !e.details.is_empty() {
+                for line in e.details.lines() {
+                    println!("    {line}");
+                }
+            }
+            println!("    {}", e.source_path);
+        }
+    }
+
+    Ok(())
+}
+
+struct FeedbackEntry {
+    author: String,
+    verdict: clank_core::Verdict,
+    summary: String,
+    details: String,
+    source_path: String,
 }

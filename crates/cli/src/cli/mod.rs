@@ -232,11 +232,21 @@ pub struct FeedbackArgs {
 
 #[derive(clap::Subcommand, Debug)]
 pub enum FeedbackCmd {
-    /// Write a feedback file: prepends the `--verdict` to the
-    /// `-m` message, resolves `--commit` against all known shas,
-    /// and writes `.clank/agents/<author>/feedback/<sha>.md`
-    /// atomically.
+    /// Write a feedback file.
     Write(FeedbackWriteArgs),
+    /// Show all feedback for a commit.
+    Read(FeedbackReadArgs),
+}
+
+#[derive(Args, Debug)]
+pub struct FeedbackReadArgs {
+    /// Commit SHA (default: HEAD).
+    #[arg(long, value_name = "SHA")]
+    pub commit: Option<String>,
+    #[arg(long, value_name = "PATH")]
+    pub repo: Option<PathBuf>,
+    #[arg(short = 'j', long)]
+    pub json: bool,
 }
 
 #[derive(Args, Debug)]
