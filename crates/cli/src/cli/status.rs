@@ -108,27 +108,23 @@ fn build_json(
             })
         })
         .collect();
-    let finished: Vec<serde_json::Value> = state
-        .fold
-        .finished_plans
-        .iter()
-        .map(|fp| {
-            serde_json::json!({
-                "plan": fp.plan.as_str(),
-                "intro": fp.intro.as_str(),
-                "finalized_at": fp.finalized_at.as_str(),
-            })
-        })
-        .collect();
-    serde_json::json!({
+    let mut obj = serde_json::json!({
         "repo_basename": basename,
         "branch": branch,
         "head_sha": head_sha,
         "head_subject": head_subject,
         "worktree_dirty": worktree_dirty,
         "plans": plans,
-        "finished_plans": finished,
-    })
+    });
+    if views.is_empty() {
+        if let Some(fp) = state.fold.finished_plans.last() {
+            obj["last_finished"] = serde_json::json!({
+                "plan": fp.plan.as_str(),
+                "finalized_at": fp.finalized_at.as_str(),
+            });
+        }
+    }
+    obj
 }
 
 fn print_human(
@@ -161,12 +157,11 @@ fn print_human(
         println!("  reason:            {}", waiting_reason(&v.waiting_on));
     }
 
-    if !state.fold.finished_plans.is_empty() {
-        println!();
-        println!("finished plans:");
-        for fp in &state.fold.finished_plans {
+    if views.is_empty() {
+        if let Some(fp) = state.fold.finished_plans.last() {
+            println!();
             println!(
-                "  {} (finalized {})",
+                "last finished: {} (finalized {})",
                 fp.plan.as_str(),
                 short_sha(fp.finalized_at.as_str())
             );
