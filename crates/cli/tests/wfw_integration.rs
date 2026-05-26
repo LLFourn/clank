@@ -1375,6 +1375,41 @@ fn wfw_repo_block_suppresses_available_work() {
 }
 
 #[test]
+fn wfw_repo_block_suppresses_queue_promotion() {
+    let dir = init_repo();
+    let repo = dir.path();
+    disable_adhoc_review(repo);
+    write(repo, "README.md", "# repo\n");
+    commit(repo, "init");
+
+    std::fs::create_dir_all(repo.join(".clank/queue")).unwrap();
+    std::fs::write(repo.join(".clank/queue/100-feature.md"), "# feature\n").unwrap();
+
+    write(
+        repo,
+        ".clank/agents/lloyd/blocks/halt.md",
+        "stop everything",
+    );
+
+    let mut child = spawn_wfw(
+        repo,
+        &["--author", "lloyd", "--role", "master", "--timeout", "3s", "--json"],
+    );
+
+    let exit = wait_for_exit(&mut child, Duration::from_secs(10));
+    let stdout = read_stdout_to_end(&mut child);
+    assert_eq!(
+        exit.code(),
+        Some(2),
+        "repo block should suppress queue promotion; stdout=`{stdout}`"
+    );
+    assert!(
+        !stdout.contains("promote"),
+        "should not emit promote while repo-blocked; got: {stdout}"
+    );
+}
+
+#[test]
 fn wfw_parks_on_pending_block() {
     let dir = init_repo();
     let repo = dir.path();

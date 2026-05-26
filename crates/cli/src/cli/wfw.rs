@@ -172,8 +172,10 @@ pub async fn run(args: WfwArgs) -> anyhow::Result<()> {
 
     let snapshot = StartupSnapshot::capture(&initial_state.fold, plan_filter.as_ref());
 
+    let initial_suppress_all;
     {
         let br = check_blocks(&repo, &author);
+        initial_suppress_all = br.suppress_all;
         let has_answer = br.items.iter().any(|i| matches!(i, WaitItem::Unblocked { .. }));
         if has_answer {
             emit(&br.items, args.json);
@@ -211,7 +213,7 @@ pub async fn run(args: WfwArgs) -> anyhow::Result<()> {
         } // !suppress_all
     }
 
-    if role == Role::Master && plan_filter.is_none() && initial_state.fold.plans.is_empty() {
+    if !initial_suppress_all && role == Role::Master && plan_filter.is_none() && initial_state.fold.plans.is_empty() {
         let queue = crate::cli::queue::scan_queue(&repo);
         if let Some(first) = queue.first() {
             let items = [WaitItem::PromoteFromQueue {
