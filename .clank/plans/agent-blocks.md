@@ -22,10 +22,26 @@ question. The unblock file body is the answer.
 Root-level blocks are repo-wide. Blocks inside a plan
 subdirectory only block that plan.
 
-## Semantics
+## Lifecycle
 
-A block is active when `blocks/[plan/]<name>.md` exists
-and `unblocks/[plan/]<name>.md` does not.
+Three states per block:
+
+1. **Pending**: `blocks/` file exists, no matching `unblocks/`.
+   Work is suppressed.
+2. **Answered**: matching `unblocks/` file exists. wfw emits
+   the answer. The agent deletes its own block file after
+   reading. Once the block file is gone, wfw stops emitting.
+3. **Cleaned**: `clank clean` removes orphaned unblock files
+   (unblock with no matching block).
+
+That's it. No consumed/ack state — the agent deletes its
+own block file as acknowledgment.
+
+Decline is just an answer whose content says "continue with
+best effort." There's no separate state — the agent reads
+the answer body and acts accordingly. Agents should not
+re-create a block with the same question after being told
+to continue.
 
 - Plan block: only that plan's work is suppressed. Other
   plans and queue promotion proceed normally.
@@ -48,13 +64,14 @@ plans, and other stale artifacts.
 
 ## wfw behavior
 
-1. Scan all agents' `blocks/` and `unblocks/`.
-2. Unmatched repo block → suppress all work, emit
+1. Scan the current agent's `blocks/` and `unblocks/`.
+2. Pending repo block → suppress all work, emit
    `WaitItem::HumanBlock`.
-3. Unmatched plan block → suppress that plan's work, emit
+3. Pending plan block → suppress that plan's work, emit
    `WaitItem::HumanBlock`. Other plans proceed.
-4. Block with matching unblock the agent hasn't consumed →
-   emit `WaitItem::HumanAnswer`.
+4. Answered block (matching unblock exists) → emit
+   `WaitItem::HumanAnswer { name, answer }`. The agent
+   deletes its block file to acknowledge.
 
 ## Status
 
@@ -86,8 +103,7 @@ plan drifts, or the work feels unwise, use `clank block`.
 ## `clank clean`
 
 Removes:
-- Matched block/unblock pairs (both files deleted)
-- Finished plan files in `.clank/finished/`
+- Orphaned unblock files (no matching block)
 - Other stale artifacts
 
 ## Tests
@@ -95,6 +111,7 @@ Removes:
 - Plan block without unblock → wfw suppresses that plan.
 - Repo block without unblock → wfw suppresses all work.
 - Matching unblock → wfw returns HumanAnswer.
+- Agent deletes block file → wfw stops emitting answer.
 - Other plans proceed while one is plan-blocked.
-- clank clean removes matched pairs.
-- Status shows active blocks.
+- clank clean removes orphaned unblocks.
+- Status shows pending and answered blocks.
