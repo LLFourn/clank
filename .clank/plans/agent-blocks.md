@@ -51,9 +51,9 @@ clank unblock <agent> <name> --plan <plan> -m "answer"
 ```
 
 `block` writes the block file for the current agent.
-`block clean` removes the calling agent's matched
-block+unblock pairs (the ack step).
 `unblock` writes the matching unblock file (user runs this).
+`clean` removes the calling agent's answered block+unblock
+pairs (the ack step).
 
 ## wfw behavior
 
@@ -98,7 +98,7 @@ Unblocked:
 
 ## Hooks
 
-`hooks.human_block` fires on block creation.
+`hooks.blocked` fires on block creation.
 
 ## Skill updates
 
@@ -110,8 +110,7 @@ plan drifts, or the work feels unwise, use `clank block`.
 
 - Plan block without unblock → wfw suppresses that plan.
 - Repo block without unblock → wfw suppresses all work.
-- Matching unblock → wfw returns HumanAnswer.
-- Agent deletes block file → wfw stops emitting.
+- Matching unblock → wfw returns Unblocked.
+- Agent runs clank clean → matched pair removed, wfw stops.
 - Other plans proceed while one is plan-blocked.
-- clank clean removes orphaned unblocks.
-- Status shows pending and unblocked states.
+- Status shows pending and answered blocks.
