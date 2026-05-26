@@ -36,11 +36,12 @@ impl StatusSnapshot {
         basename: &str,
         policy: crate::rebuild::CachePolicy,
         plan_arg: Option<&str>,
+        watch_mode: bool,
     ) -> anyhow::Result<Self> {
         let state = crate::rebuild::rebuild_repo_with_policy(repo, policy)
             .await
             .map_err(|e| anyhow::anyhow!("failed to fold repo `{}`: {e}", repo.display()))?;
-        Self::from_state(repo, basename, &state, plan_arg)
+        Self::from_state(repo, basename, &state, plan_arg, watch_mode)
     }
 
     fn from_state(
@@ -48,6 +49,7 @@ impl StatusSnapshot {
         basename: &str,
         state: &RepoState,
         plan_arg: Option<&str>,
+        watch_mode: bool,
     ) -> anyhow::Result<Self> {
         let (branch, head_sha, head_subject) = head_info(repo);
         let worktree_dirty = worktree_dirty(repo)?;
@@ -61,7 +63,7 @@ impl StatusSnapshot {
         let work_status = state.fold.derive_status(&reviews, &work_policy);
 
         let (plans, last_finished) =
-            select_plans_and_finished(&work_status.plans, &state.fold, basename, plan_arg)?;
+            select_plans_and_finished(&work_status.plans, &state.fold, basename, plan_arg, watch_mode)?;
 
         let blocks = crate::cli::block::scan_blocks(repo);
         let queue_count = crate::cli::queue::scan_queue(repo).len();
@@ -232,7 +234,7 @@ pub async fn run(args: StatusArgs) -> anyhow::Result<()> {
     }
 
     let snapshot =
-        StatusSnapshot::build_async(&repo, &basename, policy, args.plan.as_deref()).await?;
+        StatusSnapshot::build_async(&repo, &basename, policy, args.plan.as_deref(), false).await?;
 
     if args.json {
         println!("{}", serde_json::to_string_pretty(&snapshot.to_json())?);
@@ -258,7 +260,7 @@ async fn run_watch(
 
     loop {
         let snapshot =
-            StatusSnapshot::build_async(&repo, &basename, policy, plan_arg).await?;
+            StatusSnapshot::build_async(&repo, &basename, policy, plan_arg, true).await?;
 
         let output = if json {
             snapshot.to_json_compact()
@@ -339,6 +341,7 @@ fn select_plans_and_finished(
     fold: &clank_core::repo_state::RepoState,
     basename: &str,
     plan_arg: Option<&str>,
+    watch_mode: bool,
 ) -> anyhow::Result<(Vec<PlanWorkState>, Option<FinishedPlan>)> {
     if let Some(raw) = plan_arg {
         let stem = parse_arg(raw, basename)?;
@@ -355,15 +358,16 @@ fn select_plans_and_finished(
             return Ok((matching, None));
         }
 
-        let last_finished = fold
-            .finished_plans
-            .iter()
-            .rev()
-            .find(|fp| fp.plan == key)
-            .cloned();
-
-        if last_finished.is_some() {
-            return Ok((vec![], last_finished));
+        if watch_mode {
+            let last_finished = fold
+                .finished_plans
+                .iter()
+                .rev()
+                .find(|fp| fp.plan == key)
+                .cloned();
+            if last_finished.is_some() {
+                return Ok((vec![], last_finished));
+            }
         }
 
         anyhow::bail!(
