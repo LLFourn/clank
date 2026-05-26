@@ -53,12 +53,13 @@ pub async fn build_finish_preview(
     let plan_id_str = format!("{}/{}.md", basename.as_str(), plan_key.as_str());
     let plan_path = format!(".clank/plans/{}.md", plan_key.as_str());
 
-    let is_finished = state
-        .fold
-        .finished_plans
-        .iter()
-        .any(|f| &f.plan == plan_key);
     let active = state.fold.plans.get(plan_key);
+    let is_finished = active.is_none()
+        && state
+            .fold
+            .finished_plans
+            .iter()
+            .any(|f| &f.plan == plan_key);
     if !is_finished && active.is_none() {
         return Err(PreviewError::PlanNotFound(plan_id_str));
     }
