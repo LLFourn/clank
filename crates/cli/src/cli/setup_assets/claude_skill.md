@@ -67,3 +67,8 @@ ready to implement given the current codebase. Edit or
 rescope as needed — split into smaller plans if appropriate
 (leave unready parts in the queue). Only run
 `clank queue promote <name>` when the plan is ready.
+
+**Blocks**: if reviews become contentious, the plan is
+drifting from user intent, or the work feels unwise, use
+`clank block create <name> -m "question"` to ask the human.
+Use `clank block clean` to acknowledge answered blocks.

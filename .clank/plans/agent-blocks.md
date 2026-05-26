@@ -30,7 +30,7 @@ Blocked = block file exists, no matching unblock.
 Answered = block file + matching unblock exist.
 
 The agent owns its block file — it can edit it, elaborate,
-or delete the unblock to re-enter pending state. `clank clean`
+or delete the unblock to re-enter pending state. `clank block clean`
 removes matched pairs when both exist.
 
 The unblock file body is the user's response. The agent
@@ -64,7 +64,7 @@ block+unblock pairs (the ack step).
    work, emit `WaitItem::Blocked`. Other plans proceed.
 4. Answered block where the calling agent is the blocker →
    emit `WaitItem::Unblocked { name, answer }`. Agent
-   runs `clank clean` to acknowledge.
+   runs `clank block clean` to acknowledge.
 
 ## Status
 
@@ -111,6 +111,6 @@ plan drifts, or the work feels unwise, use `clank block`.
 - Plan block without unblock → wfw suppresses that plan.
 - Repo block without unblock → wfw suppresses all work.
 - Matching unblock → wfw returns Unblocked.
-- Agent runs clank clean → matched pair removed, wfw stops.
+- Agent runs clank block clean → matched pair removed, wfw stops.
 - Other plans proceed while one is plan-blocked.
 - Status shows pending and answered blocks.
