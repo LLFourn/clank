@@ -249,6 +249,23 @@ fn render_wfw_items(items: &[serde_json::Value], label: &AgentLabel, role: Role)
                     "  - promote: queue item `{name}` (priority {priority:03})\n    Read `.clank/queue/{priority:03}-{name}.md`, evaluate whether it is\n    well-scoped and ready to implement. Edit/rescope as needed.\n    When ready: `clank queue promote {name}`\n",
                 ));
             }
+            "human_block" => {
+                let agent = item.get("agent").and_then(|v| v.as_str()).unwrap_or("?");
+                let name = item.get("name").and_then(|v| v.as_str()).unwrap_or("?");
+                let block_plan = item.get("plan").and_then(|v| v.as_str());
+                let question = item.get("question").and_then(|v| v.as_str()).unwrap_or("");
+                let scope = block_plan.unwrap_or("repo");
+                out.push_str(&format!(
+                    "  - blocked: agent `{agent}` block `{name}` (scope: {scope})\n    Question: {question}\n    This block suppresses work until a human runs:\n    `clank unblock {agent} {name} -m \"<answer>\"`\n",
+                ));
+            }
+            "human_answer" => {
+                let name = item.get("name").and_then(|v| v.as_str()).unwrap_or("?");
+                let answer = item.get("answer").and_then(|v| v.as_str()).unwrap_or("");
+                out.push_str(&format!(
+                    "  - answer: block `{name}` has been answered\n    Answer: {answer}\n",
+                ));
+            }
             other => out.push_str(&format!("  - {other}: plan `{plan}` at {short} ({full})\n",)),
         }
     }

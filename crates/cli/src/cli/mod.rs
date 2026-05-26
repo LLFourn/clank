@@ -11,6 +11,7 @@ use std::path::{Path, PathBuf};
 
 pub mod as_cmd;
 pub mod auto;
+pub mod block;
 pub mod config;
 pub mod doctor;
 pub mod feedback;
@@ -522,6 +523,39 @@ pub struct FinishArgs {
 #[derive(Args, Debug)]
 pub struct UnfinishArgs {
     /// Plan to unfinish. Required.
+    pub plan: Option<String>,
+    #[arg(long, value_name = "PATH")]
+    pub repo: Option<PathBuf>,
+}
+
+#[derive(Args, Debug)]
+pub struct BlockArgs {
+    /// Block name.
+    pub name: String,
+    /// Question or reason for the block.
+    #[arg(short = 'm', value_name = "MSG")]
+    pub message: String,
+    /// Scope block to a specific plan.
+    #[arg(long, value_name = "PLAN")]
+    pub plan: Option<String>,
+    /// Agent label. Resolved from env when omitted.
+    #[arg(long, value_name = "LABEL")]
+    pub author: Option<String>,
+    #[arg(long, value_name = "PATH")]
+    pub repo: Option<PathBuf>,
+}
+
+#[derive(Args, Debug)]
+pub struct UnblockArgs {
+    /// Agent that is blocked.
+    pub agent: String,
+    /// Block name to answer.
+    pub name: String,
+    /// Answer message.
+    #[arg(short = 'm', value_name = "MSG")]
+    pub message: String,
+    /// Plan scope (must match the block's scope).
+    #[arg(long, value_name = "PLAN")]
     pub plan: Option<String>,
     #[arg(long, value_name = "PATH")]
     pub repo: Option<PathBuf>,

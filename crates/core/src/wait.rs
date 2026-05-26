@@ -76,6 +76,17 @@ pub enum WaitItem {
         name: String,
         priority: u16,
     },
+    HumanBlock {
+        agent: String,
+        name: String,
+        plan: Option<String>,
+        question: String,
+    },
+    HumanAnswer {
+        name: String,
+        plan: Option<String>,
+        answer: String,
+    },
 }
 
 /// Snapshot taken once at `wfw` startup. `detect_finished` compares

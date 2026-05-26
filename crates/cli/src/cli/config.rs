@@ -142,6 +142,7 @@ fn apply_layer(cfg: &mut Config, path: Option<&Path>) -> BTreeSet<String> {
             HookEvent::ReviewerWork,
             HookEvent::PlanFinalized,
             HookEvent::Idle,
+            HookEvent::HumanBlock,
         ] {
             if let Some(v) = hooks.get(event) {
                 cfg.hooks.insert(event, v);
@@ -308,6 +309,7 @@ fn event_to_key_name(event: HookEvent) -> &'static str {
         HookEvent::ReviewerWork => "reviewer_work",
         HookEvent::PlanFinalized => "plan_finalized",
         HookEvent::Idle => "idle",
+        HookEvent::HumanBlock => "human_block",
     }
 }
 

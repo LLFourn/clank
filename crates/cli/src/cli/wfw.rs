@@ -31,6 +31,7 @@ use crate::repo_state::RepoState;
 use clank_core::Role;
 use clank_core::vocab::HookEvent;
 use clank_core::wait::{StartupSnapshot, WaitItem, detect_finished};
+use crate::cli::block::scan_blocks;
 
 /// Exit code returned when `--timeout` elapses without producing
 /// any work. The rest of the CLI uses anyhow for normal errors;
@@ -80,7 +81,9 @@ fn firings_from_items(items: &[WaitItem]) -> Vec<HookFiring> {
             WaitItem::Idle { .. }
             | WaitItem::AdHocReview { .. }
             | WaitItem::AdHocRevise { .. }
-            | WaitItem::PromoteFromQueue { .. } => None,
+            | WaitItem::PromoteFromQueue { .. }
+            | WaitItem::HumanBlock { .. }
+            | WaitItem::HumanAnswer { .. } => None,
         })
         .collect()
 }
@@ -170,6 +173,12 @@ pub async fn run(args: WfwArgs) -> anyhow::Result<()> {
     let snapshot = StartupSnapshot::capture(&initial_state.fold, plan_filter.as_ref());
 
     {
+        let br = check_blocks(&repo, &author);
+        if br.suppress_all && !br.items.is_empty() {
+            emit(&br.items, args.json);
+            return Ok(());
+        }
+
         let reviews =
             crate::fs_review_lookup::FsReviewLookup::new(&repo, initial_state.head.as_ref());
         let status = initial_state.fold.derive_status(&reviews, &work_policy);
@@ -182,7 +191,15 @@ pub async fn run(args: WfwArgs) -> anyhow::Result<()> {
                 _ => false,
             });
         }
+        if !br.suppressed_plans.is_empty() {
+            items.retain(|item| match item {
+                WaitItem::Master { plan, .. }
+                | WaitItem::Reviewer { plan, .. } => !br.suppressed_plans.contains(plan),
+                _ => true,
+            });
+        }
         items.extend(detect_finished(&snapshot, &initial_state.fold));
+        items.extend(br.items);
         if !items.is_empty() {
             for firing in &firings_from_items(&items) {
                 hook_config::run_hook(&repo, &hook_config, firing);
@@ -250,6 +267,12 @@ pub async fn run(args: WfwArgs) -> anyhow::Result<()> {
             while rx.recv_timeout(Duration::from_millis(200)).is_ok() {}
         }
         {
+            let br = check_blocks(&repo, &author);
+            if br.suppress_all && !br.items.is_empty() {
+                emit(&br.items, args.json);
+                return Ok(());
+            }
+
             let state = crate::rebuild::rebuild_repo_with_policy(&repo, policy)
                 .await
                 .map_err(|e| anyhow::anyhow!("failed to fold repo `{}`: {e}", repo.display()))?;
@@ -264,7 +287,15 @@ pub async fn run(args: WfwArgs) -> anyhow::Result<()> {
                     _ => false,
                 });
             }
+            if !br.suppressed_plans.is_empty() {
+                items.retain(|item| match item {
+                    WaitItem::Master { plan, .. }
+                    | WaitItem::Reviewer { plan, .. } => !br.suppressed_plans.contains(plan),
+                    _ => true,
+                });
+            }
             items.extend(detect_finished(&snapshot, &state.fold));
+            items.extend(br.items);
             if !items.is_empty() {
                 for firing in &firings_from_items(&items) {
                     hook_config::run_hook(&repo, &hook_config, firing);
@@ -288,6 +319,62 @@ pub async fn run(args: WfwArgs) -> anyhow::Result<()> {
             }
         }
     }
+}
+
+/// Check blocks and return (block_items, suppressed_plans). If a
+/// `HumanAnswer` is found for the calling agent, it is returned as
+/// the sole item with `suppress_all = true` so the caller exits
+/// immediately. Pending blocks emit `HumanBlock` items and
+/// suppress either all work (repo-scope) or specific plans.
+struct BlockResult {
+    items: Vec<WaitItem>,
+    suppress_all: bool,
+    suppressed_plans: std::collections::BTreeSet<PlanKey>,
+}
+
+fn check_blocks(repo: &Path, author: &AgentLabel) -> BlockResult {
+    let blocks = scan_blocks(repo);
+    let mut result = BlockResult {
+        items: Vec::new(),
+        suppress_all: false,
+        suppressed_plans: std::collections::BTreeSet::new(),
+    };
+
+    for b in &blocks {
+        if b.agent == author.as_str() {
+            if let Some(ref answer) = b.answer {
+                result.items = vec![WaitItem::HumanAnswer {
+                    name: b.name.clone(),
+                    plan: b.plan.clone(),
+                    answer: answer.clone(),
+                }];
+                result.suppress_all = true;
+                return result;
+            }
+        }
+    }
+
+    for b in &blocks {
+        if b.answer.is_some() {
+            continue;
+        }
+        result.items.push(WaitItem::HumanBlock {
+            agent: b.agent.clone(),
+            name: b.name.clone(),
+            plan: b.plan.clone(),
+            question: b.question.clone(),
+        });
+        match &b.plan {
+            None => result.suppress_all = true,
+            Some(plan_str) => {
+                if let Ok(pk) = PlanKey::parse(plan_str) {
+                    result.suppressed_plans.insert(pk);
+                }
+            }
+        }
+    }
+
+    result
 }
 
 fn active_summary(state: &RepoState, basename: &str) -> String {
@@ -376,6 +463,28 @@ fn render_json(item: &WaitItem) -> serde_json::Value {
             "name": name,
             "priority": priority,
         }),
+        WaitItem::HumanBlock {
+            agent,
+            name,
+            plan,
+            question,
+        } => serde_json::json!({
+            "kind": "human_block",
+            "agent": agent,
+            "name": name,
+            "plan": plan,
+            "question": question,
+        }),
+        WaitItem::HumanAnswer {
+            name,
+            plan,
+            answer,
+        } => serde_json::json!({
+            "kind": "human_answer",
+            "name": name,
+            "plan": plan,
+            "answer": answer,
+        }),
     }
 }
 
@@ -416,6 +525,19 @@ fn render_human(item: &WaitItem) -> String {
         WaitItem::AdHocRevise { sha } => format!("adhoc-revise  {}  address changes", short(sha)),
         WaitItem::PromoteFromQueue { name, priority } => {
             format!("promote  {name}  (priority {priority:03}) — run `clank queue promote {name}`")
+        }
+        WaitItem::HumanBlock {
+            agent,
+            name,
+            plan,
+            question,
+        } => {
+            let scope = plan.as_deref().unwrap_or("repo");
+            format!("blocked  {agent}/{name}  scope={scope}  {question}")
+        }
+        WaitItem::HumanAnswer { name, plan, answer } => {
+            let scope = plan.as_deref().unwrap_or("repo");
+            format!("answer   {name}  scope={scope}  {answer}")
         }
     }
 }
