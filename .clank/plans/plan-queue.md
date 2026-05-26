@@ -42,9 +42,10 @@ moved back to stubs.
 ### `clank queue promote <name>`
 
 Move `<repo>/.clank/queue/<NNN>-<name>.md` to
-`.clank/plans/<name>.md`, stage and commit as
-`[<name>] intro`. This is what the agent runs when wfw
-tells it to promote.
+`.clank/plans/<name>.md` and commit. Uses path-limited
+`git add .clank/plans/<name>.md` and
+`git commit .clank/plans/<name>.md -m "[<name>] intro"`
+so unrelated staged changes are not included.
 
 ## wfw integration
 
@@ -91,3 +92,4 @@ is empty, wfw returns the existing idle behavior.
 - wfw with no plans and non-empty queue returns PromoteFromQueue.
 - wfw with active plans ignores the queue.
 - Stop-hook renders promote instruction.
+- Promote with unrelated staged changes does not include them.
