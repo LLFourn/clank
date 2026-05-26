@@ -19,7 +19,6 @@ use super::SetupArgs;
 // the expected embedded content without recomputing the paths.
 pub const CLAUDE_SKILL_BODY: &str = include_str!("setup_assets/claude_skill.md");
 pub const CODEX_SKILL_BODY: &str = include_str!("setup_assets/codex_skill.md");
-pub const CODEX_COMMAND_BODY: &str = include_str!("setup_assets/codex_command.md");
 
 /// Stable identifier we write onto every clank-owned hook entry
 /// as `"id": "<HOOK_ID>"`. The plan's D8 ownership model says
@@ -61,14 +60,6 @@ pub async fn run(args: SetupArgs) -> anyhow::Result<()> {
         args.dry_run,
         &mut summary,
     )?;
-    install_skill(
-        &home.join(".codex/commands/clank.md"),
-        CODEX_COMMAND_BODY,
-        args.force,
-        args.dry_run,
-        &mut summary,
-    )?;
-
     merge_hook_into_settings(
         &home.join(".claude/settings.json"),
         ClaudeHook,
