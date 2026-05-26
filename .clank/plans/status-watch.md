@@ -41,7 +41,7 @@ Reuse the same state sources that can affect `clank status`:
 - `.clank/plans/`
 - `.clank/finished/`
 - `.clank/agents/*/feedback/`
-- `.clank/queue/`
+- `.clank/queue/` — status shows queue count when non-empty
 - `.clank/config.json` and relevant agent config if status output uses it
 
 Worktree dirty/clean state: recomputed on each wake via
