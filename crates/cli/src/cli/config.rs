@@ -326,13 +326,36 @@ fn key_to_json_path(key: &str) -> Option<(&'static str, &'static str)> {
 
 // ── run() ─────────────────────────────────────────────────────────────────────
 
-use super::ConfigArgs;
+use super::{ConfigArgs, ConfigKey, ConfigKeyArgs};
+
+fn key_name(cmd: &ConfigKey) -> &'static str {
+    match cmd {
+        ConfigKey::ReviewAdhocFeedback(_) => "review.adhoc_feedback",
+        ConfigKey::ReviewPlanFeedback(_) => "review.plan_feedback",
+        ConfigKey::ReviewRequireCommitPrefix(_) => "review.require_commit_prefix",
+        ConfigKey::HooksMasterWork(_) => "hooks.master_work",
+        ConfigKey::HooksReviewerWork(_) => "hooks.reviewer_work",
+        ConfigKey::HooksPlanFinalized(_) => "hooks.plan_finalized",
+        ConfigKey::HooksIdle(_) => "hooks.idle",
+    }
+}
+
+fn key_args(cmd: &ConfigKey) -> &ConfigKeyArgs {
+    match cmd {
+        ConfigKey::ReviewAdhocFeedback(a)
+        | ConfigKey::ReviewPlanFeedback(a)
+        | ConfigKey::ReviewRequireCommitPrefix(a)
+        | ConfigKey::HooksMasterWork(a)
+        | ConfigKey::HooksReviewerWork(a)
+        | ConfigKey::HooksPlanFinalized(a)
+        | ConfigKey::HooksIdle(a) => a,
+    }
+}
 
 pub async fn run(args: ConfigArgs) -> anyhow::Result<()> {
     let repo = match &args.repo {
         Some(p) => dunce::canonicalize(p)?,
         None => {
-            // For `clank config` without --repo, try git toplevel but don't fail.
             let output = std::process::Command::new("git")
                 .args(["rev-parse", "--show-toplevel"])
                 .output();
@@ -346,49 +369,53 @@ pub async fn run(args: ConfigArgs) -> anyhow::Result<()> {
         }
     };
 
-    match (&args.key, &args.action) {
-        (None, _) => {
-            // No key: dump all
-            if args.json {
-                let cfg = load(&repo);
-                let obj = serde_json::json!({
-                    "review": {
-                        "adhoc_feedback": cfg.review.adhoc_feedback,
-                        "plan_feedback": cfg.review.plan_feedback,
-                        "require_commit_prefix": cfg.review.require_commit_prefix,
-                    },
-                    "hooks": {
-                        "master_work": cfg.hooks.get(&HookEvent::MasterWork),
-                        "reviewer_work": cfg.hooks.get(&HookEvent::ReviewerWork),
-                        "plan_finalized": cfg.hooks.get(&HookEvent::PlanFinalized),
-                        "idle": cfg.hooks.get(&HookEvent::Idle),
-                    }
-                });
-                println!("{}", serde_json::to_string_pretty(&obj)?);
-            } else {
-                let kvs = resolve_key_values(&repo);
-                let key_w = kvs.iter().map(|kv| kv.key.len()).max().unwrap_or(0);
-                let val_w = kvs.iter().map(|kv| kv.value.len()).max().unwrap_or(0);
-                for kv in &kvs {
-                    println!(
-                        "{:<kw$}  {:<vw$}  ({})  {}",
-                        kv.key,
-                        kv.value,
-                        kv.source,
-                        kv.description,
-                        kw = key_w,
-                        vw = val_w,
-                    );
+    let Some(cmd) = &args.command else {
+        if args.json {
+            let cfg = load(&repo);
+            let obj = serde_json::json!({
+                "review": {
+                    "adhoc_feedback": cfg.review.adhoc_feedback,
+                    "plan_feedback": cfg.review.plan_feedback,
+                    "require_commit_prefix": cfg.review.require_commit_prefix,
+                },
+                "hooks": {
+                    "master_work": cfg.hooks.get(&HookEvent::MasterWork),
+                    "reviewer_work": cfg.hooks.get(&HookEvent::ReviewerWork),
+                    "plan_finalized": cfg.hooks.get(&HookEvent::PlanFinalized),
+                    "idle": cfg.hooks.get(&HookEvent::Idle),
                 }
+            });
+            println!("{}", serde_json::to_string_pretty(&obj)?);
+        } else {
+            let kvs = resolve_key_values(&repo);
+            let key_w = kvs.iter().map(|kv| kv.key.len()).max().unwrap_or(0);
+            let val_w = kvs.iter().map(|kv| kv.value.len()).max().unwrap_or(0);
+            for kv in &kvs {
+                println!(
+                    "{:<kw$}  {:<vw$}  ({})  {}",
+                    kv.key,
+                    kv.value,
+                    kv.source,
+                    kv.description,
+                    kw = key_w,
+                    vw = val_w,
+                );
             }
         }
-        (Some(key), None) => {
-            let def = KEY_CATALOG
-                .iter()
-                .find(|d| format!("{}.{}", d.section, d.name) == *key)
-                .ok_or_else(|| anyhow::anyhow!("unknown config key: {key}"))?;
+        return Ok(());
+    };
+
+    let key = key_name(cmd);
+    let kargs = key_args(cmd);
+    let def = KEY_CATALOG
+        .iter()
+        .find(|d| format!("{}.{}", d.section, d.name) == key)
+        .expect("key_name always returns a catalog key");
+
+    match kargs.action.as_deref() {
+        None => {
             let kvs = resolve_key_values(&repo);
-            let kv = kvs.iter().find(|kv| kv.key == *key);
+            let kv = kvs.iter().find(|kv| kv.key == key);
             println!("key:     {}.{}", def.section, def.name);
             println!("type:    {}", def.type_desc);
             println!("default: {}", def.default);
@@ -398,39 +425,27 @@ pub async fn run(args: ConfigArgs) -> anyhow::Result<()> {
             }
             println!("help:    {}", def.help);
         }
-        (Some(key), Some(action)) if action == "get" => {
-            KEY_CATALOG
-                .iter()
-                .find(|d| format!("{}.{}", d.section, d.name) == *key)
-                .ok_or_else(|| anyhow::anyhow!("unknown config key: {key}"))?;
+        Some("get") => {
             let cfg = load(&repo);
             println!("{}", get_value(&cfg, key));
         }
-        (Some(key), Some(action)) if action == "set" => {
-            let value = args
+        Some("set") => {
+            let value = kargs
                 .value
                 .as_deref()
                 .ok_or_else(|| anyhow::anyhow!("set requires a value"))?;
-            let def = KEY_CATALOG
-                .iter()
-                .find(|d| format!("{}.{}", d.section, d.name) == *key)
-                .ok_or_else(|| anyhow::anyhow!("unknown config key: {key}"))?;
-            match def.type_desc {
-                "bool" => {
-                    if value != "true" && value != "false" {
-                        anyhow::bail!("{key} is a bool; value must be true or false");
-                    }
-                }
-                _ => {}
+            if def.type_desc == "bool" && value != "true" && value != "false" {
+                anyhow::bail!("{key} is a bool; value must be true or false");
             }
-            let (section, field) = key_to_json_path(key).expect("key in catalog implies valid path");
+            let (section, field) =
+                key_to_json_path(key).expect("key_name always returns a catalog key");
             set_repo_key(&repo, section, field, value, def.type_desc)?;
             let kvs = resolve_key_values(&repo);
-            if let Some(kv) = kvs.iter().find(|kv| kv.key == *key) {
+            if let Some(kv) = kvs.iter().find(|kv| kv.key == key) {
                 println!("{} = {} ({})", kv.key, kv.value, kv.source);
             }
         }
-        (Some(_), Some(action)) => {
+        Some(action) => {
             anyhow::bail!("unknown action `{action}`; expected get or set");
         }
     }
@@ -593,9 +608,12 @@ mod tests {
     fn set_bool_key_with_non_bool_value_errors() {
         let tmp = tempfile::tempdir().unwrap();
         let args = super::super::ConfigArgs {
-            key: Some("review.adhoc_feedback".to_string()),
-            action: Some("set".to_string()),
-            value: Some("banana".to_string()),
+            command: Some(super::super::ConfigKey::ReviewAdhocFeedback(
+                super::super::ConfigKeyArgs {
+                    action: Some("set".to_string()),
+                    value: Some("banana".to_string()),
+                },
+            )),
             repo: Some(tmp.path().to_path_buf()),
             json: false,
         };
@@ -651,12 +669,15 @@ mod tests {
     }
 
     #[test]
-    fn unknown_key_get_errors() {
+    fn unknown_action_errors() {
         let tmp = tempfile::tempdir().unwrap();
         let args = super::super::ConfigArgs {
-            key: Some("nope.nope".to_string()),
-            action: Some("get".to_string()),
-            value: None,
+            command: Some(super::super::ConfigKey::ReviewAdhocFeedback(
+                super::super::ConfigKeyArgs {
+                    action: Some("nope".to_string()),
+                    value: None,
+                },
+            )),
             repo: Some(tmp.path().to_path_buf()),
             json: false,
         };
@@ -664,7 +685,7 @@ mod tests {
             .unwrap()
             .block_on(run(args));
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("unknown"));
+        assert!(result.unwrap_err().to_string().contains("unknown action"));
     }
 
     #[test]

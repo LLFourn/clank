@@ -28,16 +28,45 @@ pub mod wfw;
 
 #[derive(Args, Debug)]
 pub struct ConfigArgs {
-    /// Config key (e.g. review.adhoc_feedback, hooks.master_work)
-    pub key: Option<String>,
-    /// Action: get, set
-    pub action: Option<String>,
-    /// Value for set
-    pub value: Option<String>,
+    #[command(subcommand)]
+    pub command: Option<ConfigKey>,
     #[arg(long, value_name = "PATH")]
     pub repo: Option<PathBuf>,
     #[arg(short = 'j', long)]
     pub json: bool,
+}
+
+#[derive(Args, Debug)]
+pub struct ConfigKeyArgs {
+    /// Action: get or set
+    pub action: Option<String>,
+    /// Value (for set)
+    pub value: Option<String>,
+}
+
+#[derive(clap::Subcommand, Debug)]
+pub enum ConfigKey {
+    /// Require review for ad-hoc (non-plan) commits. bool, default: true.
+    #[command(name = "review_adhoc_feedback")]
+    ReviewAdhocFeedback(ConfigKeyArgs),
+    /// Require review for plan-attributed commits. bool, default: true.
+    #[command(name = "review_plan_feedback")]
+    ReviewPlanFeedback(ConfigKeyArgs),
+    /// Require [plan] or [misc] commit title prefixes. bool, default: false.
+    #[command(name = "review_require_commit_prefix")]
+    ReviewRequireCommitPrefix(ConfigKeyArgs),
+    /// Shell command to run when master has new work. string or null.
+    #[command(name = "hooks_master_work")]
+    HooksMasterWork(ConfigKeyArgs),
+    /// Shell command to run when a reviewer has work. string or null.
+    #[command(name = "hooks_reviewer_work")]
+    HooksReviewerWork(ConfigKeyArgs),
+    /// Shell command to run when a plan is finished. string or null.
+    #[command(name = "hooks_plan_finalized")]
+    HooksPlanFinalized(ConfigKeyArgs),
+    /// Shell command to run on idle (no work). string or null.
+    #[command(name = "hooks_idle")]
+    HooksIdle(ConfigKeyArgs),
 }
 
 #[derive(Args, Debug)]

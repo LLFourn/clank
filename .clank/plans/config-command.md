@@ -62,11 +62,10 @@ name, type, default, current value, source, and description.
 
 Dumps the full effective config as JSON.
 
-## Hooks migration
+## Hooks
 
-Move hooks from `~/.clank/hooks.json` and
-`<repo>/.clank/hooks.json` into `config.json` under a
-`hooks` key:
+Hooks live in `config.json` under the `hooks` section.
+`hooks.json` is not supported.
 
 ```json
 {
@@ -78,39 +77,11 @@ Move hooks from `~/.clank/hooks.json` and
 }
 ```
 
-The loader merges per-key: for each hook event, `config.json`
-wins if present, otherwise `hooks.json` provides the value.
-This is the same layered merge used for review keys — repo
-overrides user, and within each layer `config.json` overrides
-`hooks.json` per-key.
-
-On first write via `clank config hooks.<key> set`, the
-command imports all existing `hooks.json` values into
-`config.json` before applying the requested change. This
-ensures no hooks are silently lost. A deprecation warning
-is emitted when `hooks.json` values are used.
-
-Key names use underscores (`master_work`) in config.json.
-Serde aliases accept the kebab-case form (`master-work`)
-used in the old `hooks.json` files.
-
 ## Rename (already done)
 
 `force_review_on_misc_commits` → `adhoc_feedback`,
 `force_review_on_plan_commits` → `plan_feedback`.
 Old JSON keys accepted via `#[serde(alias)]`.
-
-## Implementation
-
-- `cli/config.rs`: add `hooks: HookConfig` to `Config` and
-  `ConfigFile`. Load hooks from `config.json` `hooks` section.
-  Add `pub async fn run` with bare dump, get, set.
-- `hook_config.rs`: simplify to read from `Config` instead
-  of separate `hooks.json` files.
-- `cli/mod.rs`: `ConfigArgs` with positional key + action.
-- `main.rs`: wire `Config` variant.
-- Config write: read existing repo config.json, deep-merge
-  the new key, write back.
 
 ## Tests
 
@@ -119,10 +90,6 @@ Old JSON keys accepted via `#[serde(alias)]`.
 - `clank config review.adhoc_feedback set false` writes.
 - `clank config hooks.master_work set "say hello"` writes.
 - `clank config --json` returns valid JSON.
+- `clank config review.adhoc_feedback` prints key help.
 - Unknown key errors cleanly.
 - Invalid value type errors cleanly.
-- Hooks loaded from config.json work in wfw lifecycle.
-- `clank config review.adhoc_feedback` prints key help.
-- Legacy hooks.json values merge per-key with config.json.
-- First `set` on a hook key imports existing hooks.json
-  values into config.json.
