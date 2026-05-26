@@ -1343,6 +1343,71 @@ fn wfw_master_with_active_plan_ignores_queue() {
     );
 }
 
+#[test]
+fn wfw_parks_on_pending_block() {
+    let dir = init_repo();
+    let repo = dir.path();
+    disable_adhoc_review(repo);
+    write(repo, "README.md", "# repo\n");
+    commit(repo, "init");
+
+    write(
+        repo,
+        ".clank/agents/claude/blocks/test-question.md",
+        "is this ok?",
+    );
+
+    let mut child = spawn_wfw(
+        repo,
+        &["--author", "claude", "--role", "master", "--timeout", "3s", "--json"],
+    );
+
+    let exit = wait_for_exit(&mut child, Duration::from_secs(10));
+    let stdout = read_stdout_to_end(&mut child);
+    assert_eq!(
+        exit.code(),
+        Some(2),
+        "should timeout (park on block), not return block item; stdout=`{stdout}`"
+    );
+}
+
+#[test]
+fn wfw_wakes_on_unblock() {
+    let dir = init_repo();
+    let repo = dir.path();
+    disable_adhoc_review(repo);
+    write(repo, "README.md", "# repo\n");
+    commit(repo, "init");
+
+    write(
+        repo,
+        ".clank/agents/claude/blocks/test-question.md",
+        "is this ok?",
+    );
+
+    let mut child = spawn_wfw(
+        repo,
+        &["--author", "claude", "--role", "master", "--timeout", "30s", "--json"],
+    );
+
+    write(
+        repo,
+        ".clank/agents/claude/unblocks/test-question.md",
+        "yes it is fine",
+    );
+
+    let exit = wait_for_exit(&mut child, Duration::from_secs(20));
+    let stdout = read_stdout_to_end(&mut child);
+    assert!(
+        exit.success(),
+        "should wake on unblock; exit={exit:?} stdout=`{stdout}`"
+    );
+    assert!(
+        stdout.contains("unblocked") && stdout.contains("yes it is fine"),
+        "should emit Unblocked with answer; got: {stdout}"
+    );
+}
+
 fn wait_for_exit(child: &mut std::process::Child, max: Duration) -> std::process::ExitStatus {
     let end = Instant::now() + max;
     loop {
