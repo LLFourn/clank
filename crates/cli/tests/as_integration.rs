@@ -44,7 +44,8 @@ fn run_as(repo: &Path, label: &str, env: &[(&str, &str)]) -> std::process::Outpu
         // we set explicitly.
         .env_remove("CLAUDE_CODE_SESSION_ID")
         .env_remove("CODEX_THREAD_ID")
-        .env_remove("CLANK_AGENT");
+        .env_remove("CLANK_AGENT")
+        .env("HOME", repo);
     for (k, v) in env {
         cmd.env(k, v);
     }
@@ -193,6 +194,7 @@ fn init_yes_clears_stale_binding_from_clank_as() {
         .env_remove("CLAUDE_CODE_SESSION_ID")
         .env_remove("CODEX_THREAD_ID")
         .env_remove("CLANK_AGENT")
+        .env("HOME", repo)
         .env("CLAUDE_CODE_SESSION_ID", session);
     let out_init = cmd.output().expect("spawn clank init");
     assert!(

@@ -63,6 +63,7 @@ fn run_feedback_write(repo: &Path, args: &[&str]) -> (std::process::ExitStatus, 
         .arg("write")
         .arg("--repo")
         .arg(repo)
+        .env("HOME", repo)
         .args(args)
         .output()
         .expect("spawn clank feedback write");

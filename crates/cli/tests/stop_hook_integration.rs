@@ -41,7 +41,8 @@ fn run_clank(repo: &Path, args: &[&str], env: &[(&str, &str)]) -> std::process::
     cmd.args(args)
         .env_remove("CLAUDE_CODE_SESSION_ID")
         .env_remove("CODEX_THREAD_ID")
-        .env_remove("CLANK_AGENT");
+        .env_remove("CLANK_AGENT")
+        .env("HOME", repo);
     for (k, v) in env {
         cmd.env(k, v);
     }
@@ -91,6 +92,7 @@ fn run_stop_hook(
         .env_remove("CLAUDE_CODE_SESSION_ID")
         .env_remove("CODEX_THREAD_ID")
         .env_remove("CLANK_AGENT")
+        .env("HOME", repo)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());

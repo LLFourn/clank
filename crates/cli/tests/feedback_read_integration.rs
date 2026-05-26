@@ -63,6 +63,7 @@ fn human_output_shows_author_verdict_summary_and_body() {
     let out = Command::new(clank_bin())
         .args(["feedback", "read", "--commit", &sha, "--repo"])
         .arg(repo)
+        .env("HOME", repo)
         .output()
         .unwrap();
     assert!(out.status.success());
@@ -93,6 +94,7 @@ fn json_output_includes_summary_and_details() {
     let out = Command::new(clank_bin())
         .args(["feedback", "read", "--commit", &sha, "--json", "--repo"])
         .arg(repo)
+        .env("HOME", repo)
         .output()
         .unwrap();
     assert!(out.status.success());
@@ -127,6 +129,7 @@ fn short_ref_finds_full_sha_feedback() {
     let out = Command::new(clank_bin())
         .args(["feedback", "read", "--commit", short, "--repo"])
         .arg(repo)
+        .env("HOME", repo)
         .output()
         .unwrap();
     assert!(out.status.success());
@@ -147,6 +150,7 @@ fn invalid_ref_errors() {
     let out = Command::new(clank_bin())
         .args(["feedback", "read", "--commit", "not-a-ref", "--repo"])
         .arg(repo)
+        .env("HOME", repo)
         .output()
         .unwrap();
     assert!(!out.status.success());

@@ -43,7 +43,8 @@ fn run_clank(repo: &Path, args: &[&str], env: &[(&str, &str)]) -> std::process::
         .arg(repo)
         .env_remove("CLAUDE_CODE_SESSION_ID")
         .env_remove("CODEX_THREAD_ID")
-        .env_remove("CLANK_AGENT");
+        .env_remove("CLANK_AGENT")
+        .env("HOME", repo);
     for (k, v) in env {
         cmd.env(k, v);
     }
