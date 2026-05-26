@@ -37,11 +37,10 @@ Three states per block:
 That's it. No consumed/ack state — the agent deletes its
 own block file as acknowledgment.
 
-Decline is just an answer whose content says "continue with
-best effort." There's no separate state — the agent reads
-the answer body and acts accordingly. Agents should not
-re-create a block with the same question after being told
-to continue.
+Decline is machine-visible: unblock files created with
+`--decline` start with `DECLINE `. wfw surfaces
+`declined: true` so agents know not to re-create the same
+block.
 
 - Plan block: only that plan's work is suppressed. Other
   plans and queue promotion proceed normally.
@@ -78,20 +77,46 @@ the same question.
 
 ## Status
 
-Shows active blocks prominently:
-
+Pending:
 ```
 plan: foo
   BLOCKED: waiting on human (claude)
   reason: is this the right API shape?
 ```
 
+Answered:
+```
+plan: foo
+  ANSWERED: human responded to claude's block
+```
+
+Declined:
+```
+plan: foo
+  DECLINED: human declined claude's block
+```
+
 ## Stop-hook rendering
 
+Pending:
 ```
 - blocked: `api-shape-question` (plan: foo) — claude asked:
   "is this the right API shape?"
   User: `clank unblock claude api-shape-question --plan foo -m "answer"`
+```
+
+Answered:
+```
+- answered: `api-shape-question` (plan: foo) — human said:
+  "yes but use trait objects"
+  Acknowledge and proceed.
+```
+
+Declined:
+```
+- declined: `api-shape-question` (plan: foo) — human said:
+  "continue with best effort"
+  Proceed without re-asking.
 ```
 
 ## Hooks
