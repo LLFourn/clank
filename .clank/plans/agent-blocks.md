@@ -26,16 +26,12 @@ subdirectory only block that plan.
 
 Three states per block:
 
-1. **Pending**: `blocks/` file exists, no matching `unblocks/`.
-   Work is suppressed.
-2. **Answered**: matching `unblocks/` file exists. wfw emits
-   the answer. The agent deletes its own block file after
-   reading. Once the block file is gone, wfw stops emitting.
-3. **Cleaned**: `clank clean` removes orphaned unblock files
-   (unblock with no matching block).
+Blocked = block file exists, no matching unblock.
+Answered = block file + matching unblock exist.
 
-That's it. No consumed/ack state — the agent deletes its
-own block file as acknowledgment.
+The agent owns its block file — it can edit it, elaborate,
+or delete the unblock to re-enter pending state. `clank clean`
+removes matched pairs when both exist.
 
 The unblock file body is the user's response. The agent
 reads it and acts on it.
