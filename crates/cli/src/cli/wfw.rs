@@ -174,7 +174,8 @@ pub async fn run(args: WfwArgs) -> anyhow::Result<()> {
 
     {
         let br = check_blocks(&repo, &author);
-        if br.suppress_all && !br.items.is_empty() {
+        let has_answer = br.items.iter().any(|i| matches!(i, WaitItem::Unblocked { .. }));
+        if has_answer {
             emit(&br.items, args.json);
             return Ok(());
         }
@@ -199,7 +200,6 @@ pub async fn run(args: WfwArgs) -> anyhow::Result<()> {
             });
         }
         items.extend(detect_finished(&snapshot, &initial_state.fold));
-        items.extend(br.items);
         if !items.is_empty() {
             for firing in &firings_from_items(&items) {
                 hook_config::run_hook(&repo, &hook_config, firing);
@@ -268,9 +268,13 @@ pub async fn run(args: WfwArgs) -> anyhow::Result<()> {
         }
         {
             let br = check_blocks(&repo, &author);
-            if br.suppress_all && !br.items.is_empty() {
+            let has_answer = br.items.iter().any(|i| matches!(i, WaitItem::Unblocked { .. }));
+            if has_answer {
                 emit(&br.items, args.json);
                 return Ok(());
+            }
+            if br.suppress_all {
+                continue;
             }
 
             let state = crate::rebuild::rebuild_repo_with_policy(&repo, policy)
@@ -295,7 +299,6 @@ pub async fn run(args: WfwArgs) -> anyhow::Result<()> {
                 });
             }
             items.extend(detect_finished(&snapshot, &state.fold));
-            items.extend(br.items);
             if !items.is_empty() {
                 for firing in &firings_from_items(&items) {
                     hook_config::run_hook(&repo, &hook_config, firing);
