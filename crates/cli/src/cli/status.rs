@@ -2,7 +2,12 @@
 //! state. Folds the repo, projects per-plan via `clank-core::plan_view`,
 //! then renders. Never blocks.
 
+use std::io::Write as _;
 use std::path::Path;
+use std::sync::mpsc;
+use std::time::Duration;
+
+use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 
 use super::{StatusArgs, repo_basename, resolve_repo};
 use crate::cli::plan_resolve::parse_arg;
@@ -20,6 +25,11 @@ pub async fn run(args: StatusArgs) -> anyhow::Result<()> {
     } else {
         crate::rebuild::CachePolicy::Use
     };
+
+    if args.watch {
+        return run_watch(repo, basename, policy, args.json, args.plan.as_deref()).await;
+    }
+
     let state = crate::rebuild::rebuild_repo_with_policy(&repo, policy)
         .await
         .map_err(|e| anyhow::anyhow!("failed to fold repo `{}`: {e}", repo.display()))?;
@@ -35,7 +45,7 @@ pub async fn run(args: StatusArgs) -> anyhow::Result<()> {
     let reviews = FsReviewLookup::new(&repo, state.head.as_ref());
     let work_status = state.fold.derive_status(&reviews, &work_policy);
 
-    let selected = select_plans(&state, &basename, args.plan.as_deref())?;
+    let selected = select_plans(&state, &basename, args.plan.as_deref(), false)?;
     let views: Vec<&PlanWorkState> = work_status
         .plans
         .iter()
@@ -43,6 +53,7 @@ pub async fn run(args: StatusArgs) -> anyhow::Result<()> {
         .collect();
 
     let blocks = crate::cli::block::scan_blocks(&repo);
+    let queue_count = crate::cli::queue::scan_queue(&repo).len();
 
     if args.json {
         let json = build_json(
@@ -54,6 +65,7 @@ pub async fn run(args: StatusArgs) -> anyhow::Result<()> {
             &views,
             &state,
             &blocks,
+            queue_count,
         );
         println!("{}", serde_json::to_string_pretty(&json)?);
     } else {
@@ -65,28 +77,175 @@ pub async fn run(args: StatusArgs) -> anyhow::Result<()> {
             &views,
             &state,
             &blocks,
+            queue_count,
         );
     }
     Ok(())
 }
 
-/// Pick the plans to render based on the CLI flags. Errors with
+async fn run_watch(
+    repo: std::path::PathBuf,
+    basename: String,
+    policy: crate::rebuild::CachePolicy,
+    json: bool,
+    plan_arg: Option<&str>,
+) -> anyhow::Result<()> {
+    let (tx, rx) = mpsc::channel::<()>();
+    let mut watcher = build_watcher(tx)?;
+    attach_watcher(&mut watcher, &repo)?;
+
+    let mut last_emitted: Option<String> = None;
+
+    loop {
+        let state = crate::rebuild::rebuild_repo_with_policy(&repo, policy)
+            .await
+            .map_err(|e| anyhow::anyhow!("failed to fold repo `{}`: {e}", repo.display()))?;
+
+        let (branch, head_sha, head_subject) = head_info(&repo);
+        let worktree_dirty = worktree_dirty(&repo)?;
+
+        let config = crate::cli::config::load(&repo);
+        let work_policy = clank_core::wait::WorkPolicy {
+            plan_feedback: config.review.plan_feedback,
+            adhoc_feedback: config.review.adhoc_feedback,
+        };
+        let reviews = FsReviewLookup::new(&repo, state.head.as_ref());
+        let work_status = state.fold.derive_status(&reviews, &work_policy);
+
+        let selected = select_plans(&state, &basename, plan_arg, true)?;
+        let views: Vec<&PlanWorkState> = work_status
+            .plans
+            .iter()
+            .filter(|ps| selected.contains(&ps.plan))
+            .collect();
+
+        let blocks = crate::cli::block::scan_blocks(&repo);
+        let queue_count = crate::cli::queue::scan_queue(&repo).len();
+
+        let output = if json {
+            let val = build_json(
+                &basename,
+                branch.clone(),
+                head_sha.clone(),
+                head_subject.clone(),
+                worktree_dirty,
+                &views,
+                &state,
+                &blocks,
+                queue_count,
+            );
+            serde_json::to_string(&val)?
+        } else {
+            render_human_to_string(
+                &repo,
+                branch.as_deref(),
+                head_sha.as_deref(),
+                worktree_dirty,
+                &views,
+                &state,
+                &blocks,
+                queue_count,
+            )
+        };
+
+        if last_emitted.as_deref() != Some(&output) {
+            let stdout = std::io::stdout();
+            let mut out = stdout.lock();
+            if last_emitted.is_some() {
+                writeln!(out)?;
+            }
+            writeln!(out, "{output}")?;
+            out.flush()?;
+            last_emitted = Some(output);
+        }
+
+        match rx.recv_timeout(Duration::from_secs(2)) {
+            Ok(()) => {
+                while rx.recv_timeout(Duration::from_millis(200)).is_ok() {}
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                anyhow::bail!("filesystem watcher disconnected")
+            }
+        }
+    }
+}
+
+fn build_watcher(tx: mpsc::Sender<()>) -> anyhow::Result<RecommendedWatcher> {
+    Ok(notify::recommended_watcher(
+        move |res: notify::Result<notify::Event>| {
+            if res.is_ok() {
+                let _ = tx.send(());
+            }
+        },
+    )?)
+}
+
+fn attach_watcher(watcher: &mut RecommendedWatcher, repo: &Path) -> anyhow::Result<()> {
+    let clank_root = repo.join(".clank");
+    if let Err(e) = std::fs::create_dir_all(&clank_root) {
+        anyhow::bail!("ensure `{}` exists: {e}", clank_root.display());
+    }
+    watcher
+        .watch(&clank_root, RecursiveMode::Recursive)
+        .map_err(|e| anyhow::anyhow!("watch `{}` failed: {e}", clank_root.display()))?;
+
+    let git_dir = git_resolve_dir(repo)?;
+    watcher
+        .watch(&git_dir, RecursiveMode::Recursive)
+        .map_err(|e| anyhow::anyhow!("watch `{}` failed: {e}", git_dir.display()))?;
+    Ok(())
+}
+
+fn git_resolve_dir(repo: &Path) -> anyhow::Result<std::path::PathBuf> {
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["rev-parse", "--git-dir"])
+        .output()
+        .map_err(|e| anyhow::anyhow!("git rev-parse --git-dir: {e}"))?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "git rev-parse --git-dir failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    let raw = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let p = std::path::PathBuf::from(&raw);
+    let absolute = if p.is_absolute() { p } else { repo.join(p) };
+    Ok(dunce::canonicalize(&absolute).unwrap_or(absolute))
+}
+
+/// Pick the plans to render based on the CLI flags. In watch mode,
+/// a `--plan` that is not active is checked against finished plans
+/// instead of erroring, so callers can observe the finished state.
 fn select_plans(
     state: &RepoState,
     basename: &str,
     plan_arg: Option<&str>,
+    watch_mode: bool,
 ) -> anyhow::Result<Vec<PlanKey>> {
     if let Some(raw) = plan_arg {
         let stem = parse_arg(raw, basename)?;
         let key = PlanKey::parse(&stem)
             .map_err(|e| anyhow::anyhow!("invalid plan stem `{stem}`: {e}"))?;
-        if !state.fold.plans.contains_key(&key) {
-            anyhow::bail!(
-                "plan `{basename}/{stem}.md` not active. active: {}",
-                active_summary(state, basename)
-            );
+        if state.fold.plans.contains_key(&key) {
+            return Ok(vec![key]);
         }
-        return Ok(vec![key]);
+        if watch_mode {
+            let finished = state
+                .fold
+                .finished_plans
+                .iter()
+                .any(|fp| fp.plan == key);
+            if finished {
+                return Ok(vec![]);
+            }
+        }
+        anyhow::bail!(
+            "plan `{basename}/{stem}.md` not active. active: {}",
+            active_summary(state, basename)
+        );
     }
     Ok(state.fold.plans.keys().cloned().collect())
 }
@@ -101,6 +260,7 @@ fn build_json(
     views: &[&PlanWorkState],
     state: &RepoState,
     blocks: &[crate::cli::block::BlockEntry],
+    queue_count: usize,
 ) -> serde_json::Value {
     let plans: Vec<serde_json::Value> = views
         .iter()
@@ -151,10 +311,11 @@ fn build_json(
         "plans": plans,
         "finished_plans": finished,
         "blocks": all_blocks,
+        "queue_count": queue_count,
     })
 }
 
-fn print_human(
+fn render_human_to_string(
     repo: &Path,
     branch: Option<&str>,
     head_sha: Option<&str>,
@@ -162,33 +323,41 @@ fn print_human(
     views: &[&PlanWorkState],
     state: &RepoState,
     blocks: &[crate::cli::block::BlockEntry],
-) {
-    println!("repo:   {}", repo.display());
+    queue_count: usize,
+) -> String {
+    let mut out = String::new();
+    use std::fmt::Write as _;
+
+    let _ = writeln!(out, "repo:   {}", repo.display());
     if let Some(b) = branch {
-        println!("branch: {b}");
+        let _ = writeln!(out, "branch: {b}");
     }
     if let Some(s) = head_sha {
-        println!("head:   {s}");
+        let _ = writeln!(out, "head:   {s}");
     }
-    println!("dirty:  {}", if worktree_dirty { "yes" } else { "no" });
+    let _ = writeln!(out, "dirty:  {}", if worktree_dirty { "yes" } else { "no" });
+    if queue_count > 0 {
+        let _ = writeln!(out, "queue:  {queue_count} item{}", if queue_count == 1 { "" } else { "s" });
+    }
 
     if views.is_empty() && state.fold.plans.is_empty() {
-        println!();
-        println!("no active plan, nothing pending");
+        let _ = writeln!(out);
+        let _ = writeln!(out, "no active plan, nothing pending");
     }
     for v in views {
-        println!();
-        println!("plan: {}", v.plan.as_str());
-        println!("  latest reviewable: {}", short_sha(v.sha.as_str()));
-        println!("  gate:              {}", v.gate);
-        println!("  waiting on:        {}", waiting_actor(&v.waiting_on));
-        println!("  reason:            {}", waiting_reason(&v.waiting_on));
+        let _ = writeln!(out);
+        let _ = writeln!(out, "plan: {}", v.plan.as_str());
+        let _ = writeln!(out, "  latest reviewable: {}", short_sha(v.sha.as_str()));
+        let _ = writeln!(out, "  gate:              {}", v.gate);
+        let _ = writeln!(out, "  waiting on:        {}", waiting_actor(&v.waiting_on));
+        let _ = writeln!(out, "  reason:            {}", waiting_reason(&v.waiting_on));
     }
 
     if views.is_empty() {
         if let Some(fp) = state.fold.finished_plans.last() {
-            println!();
-            println!(
+            let _ = writeln!(out);
+            let _ = writeln!(
+                out,
                 "last finished: {} (finalized {})",
                 fp.plan.as_str(),
                 short_sha(fp.finalized_at.as_str())
@@ -199,19 +368,37 @@ fn print_human(
     if !blocks.is_empty() {
         let has_any = blocks.iter().any(|b| b.answer.is_none() || b.answer.is_some());
         if has_any {
-            println!();
-            println!("blocks:");
+            let _ = writeln!(out);
+            let _ = writeln!(out, "blocks:");
             for b in blocks {
                 let scope = b.plan.as_deref().unwrap_or("repo");
                 if let Some(ref answer) = b.answer {
-                    println!("  UNBLOCKED ({}, scope: {}): {}", b.agent, scope, b.question);
-                    println!("    answer: {answer}");
+                    let _ = writeln!(out, "  UNBLOCKED ({}, scope: {}): {}", b.agent, scope, b.question);
+                    let _ = writeln!(out, "    answer: {answer}");
                 } else {
-                    println!("  BLOCKED ({}, scope: {}): {}", b.agent, scope, b.question);
+                    let _ = writeln!(out, "  BLOCKED ({}, scope: {}): {}", b.agent, scope, b.question);
                 }
             }
         }
     }
+
+    out.trim_end_matches('\n').to_string()
+}
+
+fn print_human(
+    repo: &Path,
+    branch: Option<&str>,
+    head_sha: Option<&str>,
+    worktree_dirty: bool,
+    views: &[&PlanWorkState],
+    state: &RepoState,
+    blocks: &[crate::cli::block::BlockEntry],
+    queue_count: usize,
+) {
+    println!(
+        "{}",
+        render_human_to_string(repo, branch, head_sha, worktree_dirty, views, state, blocks, queue_count)
+    );
 }
 
 /// Short actor label: WHO holds the next move.

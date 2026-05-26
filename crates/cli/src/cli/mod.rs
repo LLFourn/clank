@@ -123,6 +123,11 @@ pub struct StatusArgs {
     /// `<basename>/<stem>.md` — same parser as `clank finish`.
     #[arg(long, value_name = "PLAN")]
     pub plan: Option<String>,
+    /// Watch for changes and re-print status when it changes.
+    /// Never exits on its own. With `-j`, emits one compact JSON
+    /// line per update.
+    #[arg(long)]
+    pub watch: bool,
 }
 
 #[derive(Args, Debug)]
