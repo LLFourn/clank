@@ -45,9 +45,9 @@ reads it and acts on it.
 ```
 clank block <name> -m "question"
 clank block <name> --plan <plan> -m "question"
-clank block clean
 clank unblock <agent> <name> -m "answer"
 clank unblock <agent> <name> --plan <plan> -m "answer"
+clank clean
 ```
 
 `block` writes the block file for the current agent.
@@ -59,12 +59,12 @@ pairs (the ack step).
 
 1. Scan ALL agents' `blocks/` and `unblocks/`.
 2. Pending repo block from any agent → suppress all work,
-   emit `WaitItem::HumanBlock`.
+   emit `WaitItem::Blocked`.
 3. Pending plan block from any agent → suppress that plan's
-   work, emit `WaitItem::HumanBlock`. Other plans proceed.
+   work, emit `WaitItem::Blocked`. Other plans proceed.
 4. Answered block where the calling agent is the blocker →
-   emit `WaitItem::HumanAnswer { name, answer }`. The
-   agent deletes its block file to acknowledge.
+   emit `WaitItem::Unblocked { name, answer }`. Agent
+   runs `clank clean` to acknowledge.
 
 ## Status
 
