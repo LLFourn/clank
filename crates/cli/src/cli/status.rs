@@ -108,23 +108,31 @@ fn build_json(
             })
         })
         .collect();
-    let mut obj = serde_json::json!({
+    let finished: Vec<serde_json::Value> = if views.is_empty() {
+        state
+            .fold
+            .finished_plans
+            .last()
+            .map(|fp| {
+                vec![serde_json::json!({
+                    "plan": fp.plan.as_str(),
+                    "intro": fp.intro.as_str(),
+                    "finalized_at": fp.finalized_at.as_str(),
+                })]
+            })
+            .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+    serde_json::json!({
         "repo_basename": basename,
         "branch": branch,
         "head_sha": head_sha,
         "head_subject": head_subject,
         "worktree_dirty": worktree_dirty,
         "plans": plans,
-    });
-    if views.is_empty() {
-        if let Some(fp) = state.fold.finished_plans.last() {
-            obj["last_finished"] = serde_json::json!({
-                "plan": fp.plan.as_str(),
-                "finalized_at": fp.finalized_at.as_str(),
-            });
-        }
-    }
-    obj
+        "finished_plans": finished,
+    })
 }
 
 fn print_human(

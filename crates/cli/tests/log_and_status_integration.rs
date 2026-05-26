@@ -81,6 +81,59 @@ fn status_shows_multiple_active_plans_without_error() {
     assert!(stdout.contains("beta"), "should show beta; got:\n{stdout}");
 }
 
+#[test]
+fn status_active_plans_hide_finished() {
+    let dir = init_repo();
+    let repo = dir.path();
+
+    write(repo, ".clank/plans/old.md", "# old\n");
+    commit(repo, "[old] intro");
+    write(repo, ".clank/finished/old.md", "# old\n");
+    git(repo, &["rm", "--quiet", ".clank/plans/old.md"]);
+    commit(repo, "Finish old");
+
+    write(repo, ".clank/plans/active.md", "# active\n");
+    commit(repo, "[active] intro");
+
+    let out = run_clank(repo, &["status"]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("active"), "should show active; got:\n{stdout}");
+    assert!(!stdout.contains("finished"), "should not show finished section; got:\n{stdout}");
+
+    let out = run_clank(repo, &["status", "--json"]);
+    let json: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert!(json["finished_plans"].as_array().unwrap().is_empty());
+}
+
+#[test]
+fn status_no_active_shows_last_finished() {
+    let dir = init_repo();
+    let repo = dir.path();
+
+    write(repo, ".clank/plans/first.md", "# first\n");
+    commit(repo, "[first] intro");
+    write(repo, ".clank/finished/first.md", "# first\n");
+    git(repo, &["rm", "--quiet", ".clank/plans/first.md"]);
+    commit(repo, "Finish first");
+
+    write(repo, ".clank/plans/second.md", "# second\n");
+    commit(repo, "[second] intro");
+    write(repo, ".clank/finished/second.md", "# second\n");
+    git(repo, &["rm", "--quiet", ".clank/plans/second.md"]);
+    commit(repo, "Finish second");
+
+    let out = run_clank(repo, &["status"]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("last finished: second"), "should show last finished; got:\n{stdout}");
+    assert!(!stdout.contains("first"), "should not show older finished; got:\n{stdout}");
+
+    let out = run_clank(repo, &["status", "--json"]);
+    let json: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let fp = json["finished_plans"].as_array().unwrap();
+    assert_eq!(fp.len(), 1);
+    assert_eq!(fp[0]["plan"], "second");
+}
+
 // ---- log tests ----
 
 #[test]
