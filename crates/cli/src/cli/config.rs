@@ -306,6 +306,7 @@ pub fn get_value(cfg: &Config, key: &str) -> String {
         "hooks.reviewer_work" => hook_display(cfg.hooks.get(&HookEvent::ReviewerWork)),
         "hooks.plan_finalized" => hook_display(cfg.hooks.get(&HookEvent::PlanFinalized)),
         "hooks.idle" => hook_display(cfg.hooks.get(&HookEvent::Idle)),
+        "hooks.blocked" => hook_display(cfg.hooks.get(&HookEvent::Blocked)),
         _ => "unknown key".to_string(),
     }
 }
@@ -329,6 +330,7 @@ fn key_to_json_path(key: &str) -> Option<(&'static str, &'static str)> {
         "hooks.reviewer_work" => Some(("hooks", "reviewer_work")),
         "hooks.plan_finalized" => Some(("hooks", "plan_finalized")),
         "hooks.idle" => Some(("hooks", "idle")),
+        "hooks.blocked" => Some(("hooks", "blocked")),
         _ => None,
     }
 }
@@ -394,6 +396,7 @@ pub async fn run(args: ConfigArgs) -> anyhow::Result<()> {
                     "reviewer_work": cfg.hooks.get(&HookEvent::ReviewerWork),
                     "plan_finalized": cfg.hooks.get(&HookEvent::PlanFinalized),
                     "idle": cfg.hooks.get(&HookEvent::Idle),
+                    "blocked": cfg.hooks.get(&HookEvent::Blocked),
                 }
             });
             println!("{}", serde_json::to_string_pretty(&obj)?);
