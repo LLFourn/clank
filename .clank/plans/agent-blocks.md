@@ -24,7 +24,7 @@ subdirectory only block that plan.
 
 ## Lifecycle
 
-Three states per block:
+Two states:
 
 Blocked = block file exists, no matching unblock.
 Answered = block file + matching unblock exist.
