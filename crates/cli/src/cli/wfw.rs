@@ -77,9 +77,10 @@ fn firings_from_items(items: &[WaitItem]) -> Vec<HookFiring> {
                 gate: None,
                 next: None,
             }),
-            WaitItem::Idle { .. } | WaitItem::AdHocReview { .. } | WaitItem::AdHocRevise { .. } => {
-                None
-            }
+            WaitItem::Idle { .. }
+            | WaitItem::AdHocReview { .. }
+            | WaitItem::AdHocRevise { .. }
+            | WaitItem::PromoteFromQueue { .. } => None,
         })
         .collect()
 }
@@ -191,10 +192,16 @@ pub async fn run(args: WfwArgs) -> anyhow::Result<()> {
         }
     }
 
-    // Fast-exit: no plans, no pending work from the initial derive.
-    // The derive_status above already checked plans + ad-hoc;
-    // if it returned empty items, there's nothing to wait for.
     if role == Role::Master && plan_filter.is_none() && initial_state.fold.plans.is_empty() {
+        let queue = crate::cli::queue::scan_queue(&repo);
+        if let Some(first) = queue.first() {
+            let items = [WaitItem::PromoteFromQueue {
+                name: first.name.clone(),
+                priority: first.priority,
+            }];
+            emit(&items, args.json);
+            return Ok(());
+        }
         if let Some(prompt) = hook_config::run_idle_hook(&repo, &hook_config) {
             let items = [WaitItem::Idle { prompt }];
             emit(&items, args.json);
@@ -356,6 +363,11 @@ fn render_json(item: &WaitItem) -> serde_json::Value {
             "kind": "adhoc_revise",
             "sha": sha.as_str(),
         }),
+        WaitItem::PromoteFromQueue { name, priority } => serde_json::json!({
+            "kind": "promote_from_queue",
+            "name": name,
+            "priority": priority,
+        }),
     }
 }
 
@@ -393,7 +405,10 @@ fn render_human(item: &WaitItem) -> String {
         WaitItem::AdHocReview { sha, .. } => {
             format!("adhoc-review  {}  write feedback", short(sha),)
         }
-        WaitItem::AdHocRevise { sha } => format!("adhoc-revise  {}  address changes", short(sha),),
+        WaitItem::AdHocRevise { sha } => format!("adhoc-revise  {}  address changes", short(sha)),
+        WaitItem::PromoteFromQueue { name, priority } => {
+            format!("promote  {name}  (priority {priority:03}) — run `clank queue promote {name}`")
+        }
     }
 }
 

@@ -242,6 +242,13 @@ fn render_wfw_items(items: &[serde_json::Value], label: &AgentLabel, role: Role)
                     "  - adhoc revise: commit {short} ({full}) — address reviewer feedback\n",
                 ));
             }
+            "promote_from_queue" => {
+                let name = item.get("name").and_then(|v| v.as_str()).unwrap_or("?");
+                let priority = item.get("priority").and_then(|v| v.as_u64()).unwrap_or(0);
+                out.push_str(&format!(
+                    "  - promote: queue item `{name}` (priority {priority:03}) — run\n    `clank queue promote {name}`\n",
+                ));
+            }
             other => out.push_str(&format!("  - {other}: plan `{plan}` at {short} ({full})\n",)),
         }
     }

@@ -37,13 +37,10 @@ use clank_core::vocab::{Role, Tool};
 /// carve-outs are the authoritative rule; the inner gitignore
 /// is defensive (catches per-agent state even if a root
 /// gitignore is misconfigured or absent).
-const GITIGNORE_BODY: &str = "/agents/\n/cache/\n/feedback/\n";
+const GITIGNORE_BODY: &str = "/agents/\n/cache/\n/feedback/\n/queue/\n";
 
-/// Prior `.gitignore` bodies that should be silently upgraded to
-/// `GITIGNORE_BODY`. Add an entry whenever this constant changes
-/// so existing repos upgrade cleanly instead of hitting the
-/// drift refusal.
 const LEGACY_GITIGNORE_BODIES: &[&str] = &[
+    "/agents/\n/cache/\n/feedback/\n",
     "feedback/\ncache/\n",
     "feedback/\ncache/\nagents/*/config.json\n",
     "/feedback/\n/cache/\nagents/*/config.json\n",

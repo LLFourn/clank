@@ -72,6 +72,10 @@ pub enum WaitItem {
     AdHocRevise {
         sha: CommitSha,
     },
+    PromoteFromQueue {
+        name: String,
+        priority: u16,
+    },
 }
 
 /// Snapshot taken once at `wfw` startup. `detect_finished` compares

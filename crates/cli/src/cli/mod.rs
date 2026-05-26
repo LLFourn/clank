@@ -20,6 +20,7 @@ pub mod log;
 pub mod plan_resolve;
 pub mod purge;
 pub mod rewrite;
+pub mod queue;
 pub mod setup;
 pub mod status;
 pub mod stop_hook;
@@ -438,6 +439,41 @@ impl From<ToolArg> for clank_core::Tool {
             ToolArg::Codex => clank_core::Tool::Codex,
         }
     }
+}
+
+#[derive(Args, Debug)]
+pub struct QueueArgs {
+    #[command(subcommand)]
+    pub command: Option<QueueCmd>,
+    #[arg(long, value_name = "PATH")]
+    pub repo: Option<PathBuf>,
+}
+
+#[derive(clap::Subcommand, Debug)]
+pub enum QueueCmd {
+    /// Add a stub to the queue.
+    Add(QueueAddArgs),
+    /// Remove an item from the queue.
+    Remove(QueueRemoveArgs),
+    /// Promote a queued item to an active plan.
+    Promote(QueuePromoteArgs),
+}
+
+#[derive(Args, Debug)]
+pub struct QueueAddArgs {
+    pub name: String,
+    #[arg(long, default_value_t = 500)]
+    pub priority: u16,
+}
+
+#[derive(Args, Debug)]
+pub struct QueueRemoveArgs {
+    pub name: String,
+}
+
+#[derive(Args, Debug)]
+pub struct QueuePromoteArgs {
+    pub name: String,
 }
 
 #[derive(Args, Debug)]
