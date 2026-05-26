@@ -59,13 +59,13 @@ block+unblock pairs (the ack step).
 ## wfw behavior
 
 1. Scan ALL agents' `blocks/` and `unblocks/`.
-2. Pending repo block from any agent → suppress all work,
-   emit `WaitItem::Blocked`.
-3. Pending plan block from any agent → suppress that plan's
-   work, emit `WaitItem::Blocked`. Other plans proceed.
-4. Answered block where the calling agent is the blocker →
-   emit `WaitItem::Unblocked { name, answer }`. Agent
-   runs `clank block clean` to acknowledge.
+2. Pending block → wfw parks (hangs) waiting for the
+   unblock file to appear. No item emitted. The user is
+   notified via `hooks.blocked` at block creation time,
+   not via wfw.
+3. Answered block where the calling agent is the blocker →
+   emit `WaitItem::Unblocked { name, answer }` and return.
+   Agent runs `clank block clean` to acknowledge.
 
 ## Status
 
@@ -84,14 +84,7 @@ plan: foo
 
 ## Stop-hook rendering
 
-Pending:
-```
-- blocked: `api-shape-question` (plan: foo) — claude asked:
-  "is this the right API shape?"
-  User: `clank unblock claude api-shape-question --plan foo -m "answer"`
-```
-
-Unblocked:
+Unblocked (the only block-related item wfw emits):
 ```
 - unblocked: `api-shape-question` (plan: foo) — human said:
   "yes but use trait objects"
