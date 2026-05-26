@@ -32,6 +32,8 @@ pub async fn run(args: UnfinishArgs) -> anyhow::Result<()> {
         );
     }
 
+    std::fs::create_dir_all(repo.join(".clank/plans"))?;
+
     git_run(
         &repo,
         &[
