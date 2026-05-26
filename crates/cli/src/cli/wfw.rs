@@ -202,13 +202,7 @@ pub async fn run(args: WfwArgs) -> anyhow::Result<()> {
             emit(&items, args.json);
             return Ok(());
         }
-        if let Some(prompt) = hook_config::run_idle_hook(&repo, &hook_config) {
-            let items = [WaitItem::Idle { prompt }];
-            emit(&items, args.json);
-            return Ok(());
-        }
-        emit(&[], args.json);
-        return Ok(());
+        hook_config::run_idle_hook(&repo, &hook_config);
     }
 
     let watch_ctx = WatchContext::resolve(&repo, poll_mode)?;
@@ -277,6 +271,20 @@ pub async fn run(args: WfwArgs) -> anyhow::Result<()> {
                 }
                 emit(&items, args.json);
                 return Ok(());
+            }
+            if role == Role::Master
+                && plan_filter.is_none()
+                && state.fold.plans.is_empty()
+            {
+                let queue = crate::cli::queue::scan_queue(&repo);
+                if let Some(first) = queue.first() {
+                    let items = [WaitItem::PromoteFromQueue {
+                        name: first.name.clone(),
+                        priority: first.priority,
+                    }];
+                    emit(&items, args.json);
+                    return Ok(());
+                }
             }
         }
     }

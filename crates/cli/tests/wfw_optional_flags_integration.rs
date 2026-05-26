@@ -104,11 +104,13 @@ fn wfw_resolves_role_master_from_repo_config() {
     );
     assert!(out_claim.status.success());
 
-    // wfw with no flags should resolve alice as master. With no
-    // active plans, the master-only fast-exit fires and we get exit
-    // 0 with an empty items envelope. A reviewer would block to
-    // timeout (exit 2), so exit 0 here doubly confirms the resolved
+    // Add a queue item so master returns PromoteFromQueue (exit 0).
+    // A reviewer would timeout (exit 2), confirming the resolved
     // role was master.
+    let queue_dir = repo.join(".clank/queue");
+    std::fs::create_dir_all(&queue_dir).unwrap();
+    std::fs::write(queue_dir.join("500-test.md"), "# test\n").unwrap();
+
     let out = run_clank(
         repo,
         &["wfw", "--no-poll", "--timeout", "1s", "--json"],
@@ -116,13 +118,14 @@ fn wfw_resolves_role_master_from_repo_config() {
     );
     assert!(
         out.status.success(),
-        "expected master fast-exit (exit 0); got status={:?} stderr={}",
+        "expected master promote (exit 0); got status={:?} stderr={}",
         out.status,
         String::from_utf8_lossy(&out.stderr)
     );
-    assert_eq!(
-        String::from_utf8_lossy(&out.stdout).trim(),
-        r#"{"items":[]}"#,
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("promote_from_queue"),
+        "expected promote_from_queue; got: {}",
+        String::from_utf8_lossy(&out.stdout),
     );
 }
 

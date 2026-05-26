@@ -928,20 +928,12 @@ fn wfw_polling_mode_wakes_on_commit_via_periodic_refold() {
 }
 
 #[test]
-fn wfw_master_no_plans_exits_immediately_json() {
-    // Master + empty plan set has nothing the watch loop can resolve
-    // into work — exit 0 with an empty items envelope so the wait-mode
-    // Stop hook doesn't hang the agent's turn.
+fn wfw_master_no_plans_parks_until_timeout() {
     let dir = init_repo();
     let repo = dir.path();
-    // Need a commit so HEAD resolves; touch only a non-clank file.
     write(repo, "README.md", "# repo\n");
     commit(repo, "init");
 
-    // --timeout 30s with exit 0 + empty items proves the fast-exit
-    // path fired (the wait loop would have produced exit 2 on
-    // timeout). No wall-clock assertion — it flakes on cold subprocess
-    // startup and the exit shape is already a stronger signal.
     let output = clank_cmd(repo)
         .args([
             "wfw",
@@ -951,7 +943,7 @@ fn wfw_master_no_plans_exits_immediately_json() {
             "--role",
             "master",
             "--timeout",
-            "30s",
+            "1s",
             "--json",
         ])
         .arg("--repo")
@@ -959,17 +951,10 @@ fn wfw_master_no_plans_exits_immediately_json() {
         .output()
         .expect("spawn clank wfw");
 
-    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-    assert!(
-        output.status.success(),
-        "wfw exit={:?} stdout=`{stdout}` stderr=`{stderr}`",
-        output.status
-    );
     assert_eq!(
-        stdout.trim(),
-        r#"{"items":[]}"#,
-        "expected empty items envelope; got stdout=`{stdout}`"
+        output.status.code(),
+        Some(2),
+        "idle master should park and timeout (exit 2)"
     );
 }
 
@@ -1157,13 +1142,13 @@ fn wfw_hook_failure_does_not_fail_wfw() {
 }
 
 #[test]
-fn wfw_master_empty_exits_even_with_hooks_configured() {
+fn wfw_master_empty_parks_with_hooks_configured() {
     let env = TestEnv::new();
     let repo = env.repo();
     write(repo, "README.md", "# repo\n");
     commit(repo, "init");
 
-    write(repo, ".clank/config.json", r#"{"review":{"adhoc_feedback":false},"hooks":{"reviewer-work":"true"}}"#);
+    write(repo, ".clank/config.json", r#"{"review":{"adhoc_feedback":false},"hooks":{"reviewer_work":"true"}}"#);
 
     let output = env
         .cmd()
@@ -1175,7 +1160,7 @@ fn wfw_master_empty_exits_even_with_hooks_configured() {
             "--role",
             "master",
             "--timeout",
-            "30s",
+            "1s",
             "--json",
         ])
         .arg("--repo")
@@ -1183,20 +1168,17 @@ fn wfw_master_empty_exits_even_with_hooks_configured() {
         .output()
         .expect("spawn");
 
-    assert!(
-        output.status.success(),
-        "master-empty should fast-exit even with hooks; got {:?} stderr={}",
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "idle master should park and timeout; got {:?} stderr={}",
         output.status,
         String::from_utf8_lossy(&output.stderr)
-    );
-    assert_eq!(
-        String::from_utf8_lossy(&output.stdout).trim(),
-        r#"{"items":[]}"#,
     );
 }
 
 #[test]
-fn wfw_idle_hook_returns_prompt() {
+fn wfw_idle_hook_fires_but_master_parks() {
     let env = TestEnv::new();
     let repo = env.repo();
     write(repo, "README.md", "# repo\n");
@@ -1218,7 +1200,7 @@ fn wfw_idle_hook_returns_prompt() {
             "--role",
             "master",
             "--timeout",
-            "30s",
+            "1s",
             "--json",
         ])
         .arg("--repo")
@@ -1226,16 +1208,11 @@ fn wfw_idle_hook_returns_prompt() {
         .output()
         .expect("spawn");
 
-    assert!(output.status.success());
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let envelope: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid JSON");
-    let items = envelope["items"].as_array().expect("items array");
-    assert_eq!(items.len(), 1);
-    assert_eq!(items[0]["kind"], "idle");
-    assert!(
-        items[0]["prompt"].as_str().unwrap().contains("Check stubs"),
-        "idle prompt should contain hook stdout; got: {}",
-        items[0]["prompt"]
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "idle master should park after idle hook; got {:?}",
+        output.status
     );
 }
 
