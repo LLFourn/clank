@@ -67,6 +67,9 @@ fn add(repo: &Path, stub_name: &str, priority: u16) -> anyhow::Result<()> {
     let home = std::env::var_os("HOME")
         .map(PathBuf::from)
         .ok_or_else(|| anyhow::anyhow!("HOME not set"))?;
+    if priority > 999 {
+        anyhow::bail!("priority must be 0-999");
+    }
     let stub_path = home.join(format!(".clank/stubs/{stub_name}.md"));
     if !stub_path.exists() {
         anyhow::bail!("stub `{stub_name}` not found at {}", stub_path.display());
@@ -127,4 +130,50 @@ fn promote(repo: &Path, name: &str) -> anyhow::Result<()> {
     }
     println!("promoted `{name}` to active plan");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn write(path: &Path, body: &str) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, body).unwrap();
+    }
+
+    #[test]
+    fn scan_queue_returns_sorted_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let q = dir.path().join(".clank/queue");
+        write(&q.join("200-beta.md"), "# beta\n");
+        write(&q.join("100-alpha.md"), "# alpha\n");
+        write(&q.join("100-gamma.md"), "# gamma\n");
+        let entries = scan_queue(dir.path());
+        assert_eq!(entries.len(), 3);
+        assert_eq!(entries[0].name, "alpha");
+        assert_eq!(entries[0].priority, 100);
+        assert_eq!(entries[1].name, "gamma");
+        assert_eq!(entries[2].name, "beta");
+    }
+
+    #[test]
+    fn scan_queue_ignores_malformed_filenames() {
+        let dir = tempfile::tempdir().unwrap();
+        let q = dir.path().join(".clank/queue");
+        write(&q.join("100-good.md"), "ok\n");
+        write(&q.join("bad.md"), "no prefix\n");
+        write(&q.join("1000-overflow.md"), "4 digits\n");
+        write(&q.join("notes.txt"), "not md\n");
+        let entries = scan_queue(dir.path());
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].name, "good");
+    }
+
+    #[test]
+    fn priority_over_999_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let result = add(dir.path(), "foo", 1000);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("0-999"));
+    }
 }
