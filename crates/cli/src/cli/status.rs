@@ -42,6 +42,8 @@ pub async fn run(args: StatusArgs) -> anyhow::Result<()> {
         .filter(|ps| selected.contains(&ps.plan))
         .collect();
 
+    let blocks = crate::cli::block::scan_blocks(&repo);
+
     if args.json {
         let json = build_json(
             &basename,
@@ -51,6 +53,7 @@ pub async fn run(args: StatusArgs) -> anyhow::Result<()> {
             worktree_dirty,
             &views,
             &state,
+            &blocks,
         );
         println!("{}", serde_json::to_string_pretty(&json)?);
     } else {
@@ -61,6 +64,7 @@ pub async fn run(args: StatusArgs) -> anyhow::Result<()> {
             worktree_dirty,
             &views,
             &state,
+            &blocks,
         );
     }
     Ok(())
@@ -96,6 +100,7 @@ fn build_json(
     worktree_dirty: bool,
     views: &[&PlanWorkState],
     state: &RepoState,
+    blocks: &[crate::cli::block::BlockEntry],
 ) -> serde_json::Value {
     let plans: Vec<serde_json::Value> = views
         .iter()
@@ -124,6 +129,18 @@ fn build_json(
     } else {
         Vec::new()
     };
+    let pending_blocks: Vec<serde_json::Value> = blocks
+        .iter()
+        .filter(|b| b.answer.is_none())
+        .map(|b| {
+            serde_json::json!({
+                "agent": b.agent,
+                "name": b.name,
+                "plan": b.plan,
+                "question": b.question,
+            })
+        })
+        .collect();
     serde_json::json!({
         "repo_basename": basename,
         "branch": branch,
@@ -132,6 +149,7 @@ fn build_json(
         "worktree_dirty": worktree_dirty,
         "plans": plans,
         "finished_plans": finished,
+        "blocks": pending_blocks,
     })
 }
 
@@ -142,6 +160,7 @@ fn print_human(
     worktree_dirty: bool,
     views: &[&PlanWorkState],
     state: &RepoState,
+    blocks: &[crate::cli::block::BlockEntry],
 ) {
     println!("repo:   {}", repo.display());
     if let Some(b) = branch {
@@ -173,6 +192,16 @@ fn print_human(
                 fp.plan.as_str(),
                 short_sha(fp.finalized_at.as_str())
             );
+        }
+    }
+
+    let pending: Vec<_> = blocks.iter().filter(|b| b.answer.is_none()).collect();
+    if !pending.is_empty() {
+        println!();
+        println!("blocks:");
+        for b in &pending {
+            let scope = b.plan.as_deref().unwrap_or("repo");
+            println!("  BLOCKED ({}, scope: {}): {}", b.agent, scope, b.question);
         }
     }
 }

@@ -255,8 +255,9 @@ fn render_wfw_items(items: &[serde_json::Value], label: &AgentLabel, role: Role)
                 let block_plan = item.get("plan").and_then(|v| v.as_str());
                 let question = item.get("question").and_then(|v| v.as_str()).unwrap_or("");
                 let scope = block_plan.unwrap_or("repo");
+                let plan_flag = block_plan.map(|p| format!(" --plan {p}")).unwrap_or_default();
                 out.push_str(&format!(
-                    "  - blocked: agent `{agent}` block `{name}` (scope: {scope})\n    Question: {question}\n    This block suppresses work until a human runs:\n    `clank unblock {agent} {name} -m \"<answer>\"`\n",
+                    "  - blocked: agent `{agent}` block `{name}` (scope: {scope})\n    Question: {question}\n    This block suppresses work until a human runs:\n    `clank unblock {agent} {name}{plan_flag} -m \"<answer>\"`\n",
                 ));
             }
             "human_answer" => {
