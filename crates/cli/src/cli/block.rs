@@ -81,10 +81,21 @@ pub async fn run_clean(args: super::CleanArgs) -> anyhow::Result<()> {
 
 pub fn clean_blocks(repo: &Path) -> anyhow::Result<usize> {
     let entries = scan_blocks(repo);
+    let agents = agents_root(repo);
     let mut removed = 0;
     for entry in &entries {
         if entry.answer.is_some() {
-            let agents = agents_root(repo);
+            let block_path = match &entry.plan {
+                Some(plan) => agents
+                    .join(&entry.agent)
+                    .join("blocks")
+                    .join(plan)
+                    .join(format!("{}.md", entry.name)),
+                None => agents
+                    .join(&entry.agent)
+                    .join("blocks")
+                    .join(format!("{}.md", entry.name)),
+            };
             let unblock_path = match &entry.plan {
                 Some(plan) => agents
                     .join(&entry.agent)
@@ -96,6 +107,10 @@ pub fn clean_blocks(repo: &Path) -> anyhow::Result<usize> {
                     .join("unblocks")
                     .join(format!("{}.md", entry.name)),
             };
+            if block_path.exists() {
+                std::fs::remove_file(&block_path)?;
+                removed += 1;
+            }
             if unblock_path.exists() {
                 std::fs::remove_file(&unblock_path)?;
                 removed += 1;
