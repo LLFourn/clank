@@ -80,20 +80,21 @@ the same question.
 Pending:
 ```
 plan: foo
-  BLOCKED: waiting on human (claude)
-  reason: is this the right API shape?
+  BLOCKED (claude): is this the right API shape?
 ```
 
 Answered:
 ```
 plan: foo
-  ANSWERED: human responded to claude's block
+  ANSWERED (claude asked: is this the right API shape?):
+    yes but use trait objects
 ```
 
 Declined:
 ```
 plan: foo
-  DECLINED: human declined claude's block
+  DECLINED (claude asked: is this the right API shape?):
+    continue with best effort
 ```
 
 ## Stop-hook rendering
