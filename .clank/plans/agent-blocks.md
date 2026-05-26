@@ -37,10 +37,8 @@ Three states per block:
 That's it. No consumed/ack state — the agent deletes its
 own block file as acknowledgment.
 
-Decline is machine-visible: unblock files created with
-`--decline` start with `DECLINE `. wfw surfaces
-`declined: true` so agents know not to re-create the same
-block.
+The unblock file body is the user's response. The agent
+reads it and acts on it.
 
 - Plan block: only that plan's work is suppressed. Other
   plans and queue promotion proceed normally.
@@ -53,15 +51,11 @@ clank block <name> -m "question"
 clank block <name> --plan <plan> -m "question"
 clank unblock <agent> <name> -m "answer"
 clank unblock <agent> <name> --plan <plan> -m "answer"
-clank unblock <agent> <name> --decline -m "continue with best effort"
 clank clean
 ```
 
 `block` writes the block file for the current agent.
 `unblock` writes the matching unblock file (user runs this).
-`--decline` prefixes the unblock body with `DECLINE ` so
-wfw can surface it distinctly and agents know not to re-ask
-the same question.
 `clean` removes orphaned unblock files (no matching block).
 
 ## wfw behavior
@@ -72,8 +66,8 @@ the same question.
 3. Pending plan block from any agent → suppress that plan's
    work, emit `WaitItem::HumanBlock`. Other plans proceed.
 4. Answered block where the calling agent is the blocker →
-   emit `WaitItem::HumanAnswer { name, answer, declined }`.
-   The agent deletes its block file to acknowledge.
+   emit `WaitItem::HumanAnswer { name, answer }`. The
+   agent deletes its block file to acknowledge.
 
 ## Status
 
@@ -83,18 +77,11 @@ plan: foo
   BLOCKED (claude): is this the right API shape?
 ```
 
-Answered:
+Unblocked:
 ```
 plan: foo
-  ANSWERED (claude asked: is this the right API shape?):
+  UNBLOCKED (claude asked: is this the right API shape?):
     yes but use trait objects
-```
-
-Declined:
-```
-plan: foo
-  DECLINED (claude asked: is this the right API shape?):
-    continue with best effort
 ```
 
 ## Stop-hook rendering
@@ -106,18 +93,10 @@ Pending:
   User: `clank unblock claude api-shape-question --plan foo -m "answer"`
 ```
 
-Answered:
+Unblocked:
 ```
-- answered: `api-shape-question` (plan: foo) — human said:
+- unblocked: `api-shape-question` (plan: foo) — human said:
   "yes but use trait objects"
-  Acknowledge and proceed.
-```
-
-Declined:
-```
-- declined: `api-shape-question` (plan: foo) — human said:
-  "continue with best effort"
-  Proceed without re-asking.
 ```
 
 ## Hooks
@@ -139,7 +118,7 @@ block — the agent already deleted its block file).
 - Plan block without unblock → wfw suppresses that plan.
 - Repo block without unblock → wfw suppresses all work.
 - Matching unblock → wfw returns HumanAnswer.
-- Agent deletes block file → wfw stops emitting answer.
+- Agent deletes block file → wfw stops emitting.
 - Other plans proceed while one is plan-blocked.
 - clank clean removes orphaned unblocks.
-- Status shows pending and answered blocks.
+- Status shows pending and unblocked states.
