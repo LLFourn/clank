@@ -50,7 +50,7 @@ tells it to promote.
 
 In `derive_status` or `work_for`: when there are no plan
 work items and no ad-hoc work items, check
-`~/.clank/queue/` for files. If any exist, return:
+`<repo>/.clank/queue/` for files. If any exist, return:
 
 ```rust
 WaitItem::PromoteFromQueue {
@@ -85,7 +85,7 @@ is empty, wfw returns the existing idle behavior.
 
 ## Tests
 
-- `clank queue add` moves stub to queue with priority prefix.
+- `clank queue add` copies stub to queue with priority prefix.
 - `clank queue` lists items in priority order.
 - `clank queue promote` moves to plans/ and commits.
 - wfw with no plans and non-empty queue returns PromoteFromQueue.
