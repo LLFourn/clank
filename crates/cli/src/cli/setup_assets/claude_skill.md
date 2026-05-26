@@ -60,3 +60,10 @@ response text.
 When the Stop hook returns work, **act on it immediately**.
 Reviewer prompts include the exact `clank feedback write …`
 invocation to use — run it verbatim.
+
+**Queue promote items**: do NOT blindly promote. Read the
+queued plan file, evaluate whether it is well-scoped and
+ready to implement given the current codebase. Edit or
+rescope as needed — split into smaller plans if appropriate
+(leave unready parts in the queue). Only run
+`clank queue promote <name>` when the plan is ready.
