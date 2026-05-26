@@ -18,7 +18,10 @@ updates without parsing pretty-printed multi-line JSON.
 - Prefer `clank status --watch` over a separate command. It keeps the
   existing status projection and flags in one place.
 - Preserve existing one-shot behavior when `--watch` is absent.
-- Initial output happens before any watcher is installed.
+- Attach watcher first, then render initial output. This avoids
+  the race where an event between render and attach is missed.
+  The watcher may fire during the initial render — that's fine,
+  it just triggers a recompute which deduplicates.
 - Subsequent output happens only when the rendered status payload
   changes, so duplicate filesystem notifications do not spam readers.
 - Human watch output may print repeated normal status blocks separated
@@ -26,6 +29,9 @@ updates without parsing pretty-printed multi-line JSON.
 - JSON watch output must be one compact JSON line per update, not the
   existing pretty JSON format.
 - Flush stdout after every update.
+- `--plan foo` with `--watch`: if the plan is finalized mid-watch,
+  render the finished state and keep watching (the plan could be
+  unfinished later). `--plan` is not rejected with `--watch`.
 
 ## Watch Sources
 
@@ -38,8 +44,15 @@ Reuse the same state sources that can affect `clank status`:
 - `.clank/queue/`
 - `.clank/config.json` and relevant agent config if status output uses it
 
-The watcher should be level-triggered: on any event, refold/recompute
-status, compare to the last emitted payload, and print if changed.
+Worktree dirty/clean state: recomputed on each wake via
+`git status --porcelain`. No separate worktree watcher —
+the existing `.git/HEAD` / `.git/logs/HEAD` watcher plus
+a periodic heartbeat (same as wfw's poll tick) catches
+worktree changes that don't touch `.clank/`.
+
+The watcher should be level-triggered: on any event or
+heartbeat, refold/recompute status, compare to the last
+emitted payload, and print if changed.
 
 ## Tests
 
@@ -52,3 +65,5 @@ status, compare to the last emitted payload, and print if changed.
 - `clank status --watch -j` emits compact one-line JSON per update.
 - Existing `clank status` and `clank status -j` one-shot output remain
   unchanged.
+- `--watch --plan foo` renders finished state when foo is finalized.
+- Worktree dirty→clean transition produces a status update.
