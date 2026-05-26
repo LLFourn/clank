@@ -47,25 +47,25 @@ pub struct ConfigKeyArgs {
 #[derive(clap::Subcommand, Debug)]
 pub enum ConfigKey {
     /// Require review for ad-hoc (non-plan) commits. bool, default: true.
-    #[command(name = "review_adhoc_feedback")]
+    #[command(name = "review.adhoc_feedback", alias = "review_adhoc_feedback")]
     ReviewAdhocFeedback(ConfigKeyArgs),
     /// Require review for plan-attributed commits. bool, default: true.
-    #[command(name = "review_plan_feedback")]
+    #[command(name = "review.plan_feedback", alias = "review_plan_feedback")]
     ReviewPlanFeedback(ConfigKeyArgs),
     /// Require [plan] or [misc] commit title prefixes. bool, default: false.
-    #[command(name = "review_require_commit_prefix")]
+    #[command(name = "review.require_commit_prefix", alias = "review_require_commit_prefix")]
     ReviewRequireCommitPrefix(ConfigKeyArgs),
     /// Shell command to run when master has new work. string or null.
-    #[command(name = "hooks_master_work")]
+    #[command(name = "hooks.master_work", alias = "hooks_master_work")]
     HooksMasterWork(ConfigKeyArgs),
     /// Shell command to run when a reviewer has work. string or null.
-    #[command(name = "hooks_reviewer_work")]
+    #[command(name = "hooks.reviewer_work", alias = "hooks_reviewer_work")]
     HooksReviewerWork(ConfigKeyArgs),
     /// Shell command to run when a plan is finished. string or null.
-    #[command(name = "hooks_plan_finalized")]
+    #[command(name = "hooks.plan_finalized", alias = "hooks_plan_finalized")]
     HooksPlanFinalized(ConfigKeyArgs),
     /// Shell command to run on idle (no work). string or null.
-    #[command(name = "hooks_idle")]
+    #[command(name = "hooks.idle", alias = "hooks_idle")]
     HooksIdle(ConfigKeyArgs),
 }
 
