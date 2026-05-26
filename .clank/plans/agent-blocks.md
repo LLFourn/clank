@@ -54,24 +54,27 @@ clank block <name> -m "question"
 clank block <name> --plan <plan> -m "question"
 clank unblock <agent> <name> -m "answer"
 clank unblock <agent> <name> --plan <plan> -m "answer"
+clank unblock <agent> <name> --decline -m "continue with best effort"
 clank clean
 ```
 
 `block` writes the block file for the current agent.
 `unblock` writes the matching unblock file (user runs this).
-`clean` removes matched block/unblock pairs, finished
-plans, and other stale artifacts.
+`--decline` prefixes the unblock body with `DECLINE ` so
+wfw can surface it distinctly and agents know not to re-ask
+the same question.
+`clean` removes orphaned unblock files (no matching block).
 
 ## wfw behavior
 
-1. Scan the current agent's `blocks/` and `unblocks/`.
-2. Pending repo block → suppress all work, emit
-   `WaitItem::HumanBlock`.
-3. Pending plan block → suppress that plan's work, emit
-   `WaitItem::HumanBlock`. Other plans proceed.
-4. Answered block (matching unblock exists) → emit
-   `WaitItem::HumanAnswer { name, answer }`. The agent
-   deletes its block file to acknowledge.
+1. Scan ALL agents' `blocks/` and `unblocks/`.
+2. Pending repo block from any agent → suppress all work,
+   emit `WaitItem::HumanBlock`.
+3. Pending plan block from any agent → suppress that plan's
+   work, emit `WaitItem::HumanBlock`. Other plans proceed.
+4. Answered block where the calling agent is the blocker →
+   emit `WaitItem::HumanAnswer { name, answer, declined }`.
+   The agent deletes its block file to acknowledge.
 
 ## Status
 
@@ -102,9 +105,8 @@ plan drifts, or the work feels unwise, use `clank block`.
 
 ## `clank clean`
 
-Removes:
-- Orphaned unblock files (no matching block)
-- Other stale artifacts
+Removes orphaned unblock files (unblock with no matching
+block — the agent already deleted its block file).
 
 ## Tests
 
