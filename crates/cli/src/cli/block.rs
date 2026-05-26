@@ -1,9 +1,16 @@
 use std::path::Path;
 
-use super::{BlockArgs, UnblockArgs, resolve_repo};
+use super::{BlockArgs, BlockCmd, BlockCreateArgs, UnblockArgs, resolve_repo};
 use crate::agent_store::agents_root;
 
-pub async fn run_block(args: BlockArgs) -> anyhow::Result<()> {
+pub async fn run(args: BlockArgs) -> anyhow::Result<()> {
+    match args.command {
+        BlockCmd::Create(a) => run_create(a).await,
+        BlockCmd::Clean(a) => run_clean(a).await,
+    }
+}
+
+async fn run_create(args: BlockCreateArgs) -> anyhow::Result<()> {
     let repo = resolve_repo(args.repo.as_deref())?;
     let author = match args.author.as_deref() {
         Some(raw) => clank_core::ids::AgentLabel::parse(raw)
@@ -72,7 +79,7 @@ pub async fn run_unblock(args: UnblockArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
-pub async fn run_clean(args: super::CleanArgs) -> anyhow::Result<()> {
+async fn run_clean(args: super::BlockCleanArgs) -> anyhow::Result<()> {
     let repo = super::resolve_repo(args.repo.as_deref())?;
     let author = crate::agent_env::resolve_identity_from_env(&repo)?;
     let entries = scan_blocks(&repo);

@@ -43,17 +43,17 @@ reads it and acts on it.
 ## Commands
 
 ```
-clank block <name> -m "question"
-clank block <name> --plan <plan> -m "question"
+clank block create <name> -m "question"
+clank block create <name> --plan <plan> -m "question"
+clank block clean
 clank unblock <agent> <name> -m "answer"
 clank unblock <agent> <name> --plan <plan> -m "answer"
-clank clean
 ```
 
-`block` writes the block file for the current agent.
+`block create` writes the block file for the current agent.
+`block clean` removes the calling agent's answered
+block+unblock pairs (the ack step).
 `unblock` writes the matching unblock file (user runs this).
-`clean` removes the calling agent's answered block+unblock
-pairs (the ack step).
 
 ## wfw behavior
 

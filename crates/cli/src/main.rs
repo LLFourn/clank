@@ -56,13 +56,10 @@ enum Command {
     Doctor(cli::DoctorArgs),
     /// Read or write Clank config values.
     Config(cli::ConfigArgs),
-    /// Declare a blockeding question. The calling agent's work
-    /// is suppressed until unblocked.
+    /// Create or clean blocks.
     Block(cli::BlockArgs),
     /// Answer a pending block.
     Unblock(cli::UnblockArgs),
-    /// Remove answered blocks for the calling agent.
-    Clean(cli::CleanArgs),
 }
 
 #[tokio::main]
@@ -91,9 +88,8 @@ async fn main() -> anyhow::Result<()> {
         Command::Setup(args) => cli::setup::run(args).await,
         Command::Doctor(args) => cli::doctor::run(args).await,
         Command::Config(args) => cli::config::run(args).await,
-        Command::Block(args) => cli::block::run_block(args).await,
+        Command::Block(args) => cli::block::run(args).await,
         Command::Unblock(args) => cli::block::run_unblock(args).await,
-        Command::Clean(args) => cli::block::run_clean(args).await,
     };
     if let Err(e) = result {
         let code = exit_code_for(&e);

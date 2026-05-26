@@ -533,6 +533,20 @@ pub struct UnfinishArgs {
 
 #[derive(Args, Debug)]
 pub struct BlockArgs {
+    #[command(subcommand)]
+    pub command: BlockCmd,
+}
+
+#[derive(clap::Subcommand, Debug)]
+pub enum BlockCmd {
+    /// Create a block.
+    Create(BlockCreateArgs),
+    /// Remove answered block+unblock pairs for this agent.
+    Clean(BlockCleanArgs),
+}
+
+#[derive(Args, Debug)]
+pub struct BlockCreateArgs {
     /// Block name.
     pub name: String,
     /// Question or reason for the block.
@@ -549,7 +563,7 @@ pub struct BlockArgs {
 }
 
 #[derive(Args, Debug)]
-pub struct CleanArgs {
+pub struct BlockCleanArgs {
     #[arg(long, value_name = "PATH")]
     pub repo: Option<PathBuf>,
 }
