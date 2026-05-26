@@ -22,20 +22,26 @@ hook fires once before parking but doesn't cause an exit.
 
 ## Implementation
 
-- `cli/wfw.rs`: remove the fast-exit block for idle master
-  (the `if role == Master && plans.is_empty()` early return).
-  Master always falls through to the watch loop.
+- `cli/wfw.rs`: change the idle-master fast-exit block to:
+  1. Scan queue immediately — if non-empty, emit
+     `PromoteFromQueue` and return (preserves startup behavior).
+  2. If queue empty, fire idle hook (no exit), then fall
+     through to the watch loop.
 - `cli/wfw.rs`: in the watch loop, after `derive_status` +
-  `detect_finished` finds no items, scan queue via
-  `scan_queue(&repo)`. If Master and queue non-empty, emit
-  `PromoteFromQueue` and return.
-- Update `wfw_master_empty_exits_even_with_hooks_configured`
-  test — master no longer exits immediately when idle, it
-  parks. The test should verify wfw blocks (timeout exit)
-  instead of immediate exit.
+  `detect_finished` finds no items AND role is Master,
+  scan queue. If non-empty, emit `PromoteFromQueue` and
+  return.
+- Update tests:
+  - `wfw_master_empty_exits_even_with_hooks_configured` →
+    master now parks instead of exiting; use timeout.
+  - `wfw_master_no_plans_exits_immediately_json` → master
+    parks; use timeout for the empty case.
+  - `wfw_idle_hook_returns_prompt` → idle hook fires but
+    wfw doesn't exit with Idle item; it parks.
 
 ## Tests
 
+- Startup with non-empty queue → immediate PromoteFromQueue.
 - wfw master parked with no plans, queue file added mid-watch
   → wfw wakes and emits PromoteFromQueue.
 - wfw master with active plans ignores queue.
