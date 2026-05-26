@@ -1344,6 +1344,37 @@ fn wfw_master_with_active_plan_ignores_queue() {
 }
 
 #[test]
+fn wfw_repo_block_suppresses_available_work() {
+    let dir = init_repo();
+    let repo = dir.path();
+    write(repo, ".clank/plans/foo.md", "# foo\n");
+    commit(repo, "[foo] intro");
+
+    write(
+        repo,
+        ".clank/agents/claude/blocks/need-discussion.md",
+        "should we even do this?",
+    );
+
+    let mut child = spawn_wfw(
+        repo,
+        &["--author", "claude", "--role", "reviewers", "--timeout", "3s", "--json"],
+    );
+
+    let exit = wait_for_exit(&mut child, Duration::from_secs(10));
+    let stdout = read_stdout_to_end(&mut child);
+    assert_eq!(
+        exit.code(),
+        Some(2),
+        "repo block should suppress reviewer work and park; stdout=`{stdout}`"
+    );
+    assert!(
+        !stdout.contains("review"),
+        "should not emit review work while repo-blocked; got: {stdout}"
+    );
+}
+
+#[test]
 fn wfw_parks_on_pending_block() {
     let dir = init_repo();
     let repo = dir.path();

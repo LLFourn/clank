@@ -180,6 +180,7 @@ pub async fn run(args: WfwArgs) -> anyhow::Result<()> {
             return Ok(());
         }
 
+        if !br.suppress_all {
         let reviews =
             crate::fs_review_lookup::FsReviewLookup::new(&repo, initial_state.head.as_ref());
         let status = initial_state.fold.derive_status(&reviews, &work_policy);
@@ -207,6 +208,7 @@ pub async fn run(args: WfwArgs) -> anyhow::Result<()> {
             emit(&items, args.json);
             return Ok(());
         }
+        } // !suppress_all
     }
 
     if role == Role::Master && plan_filter.is_none() && initial_state.fold.plans.is_empty() {
