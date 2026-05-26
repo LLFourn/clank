@@ -493,7 +493,6 @@ impl RepoState {
         for touch in &event.plan_touches {
             match touch.kind {
                 TouchKind::Intro => {
-                    self.ad_hoc.clear();
                     self.plans
                         .entry(touch.plan.clone())
                         .or_insert_with(PlanState::default);
@@ -578,7 +577,9 @@ impl RepoState {
 
         // Ad-hoc bucket: bare code-only commit with no touches and
         // no attribution.
-        if touches.is_empty() && classified.plan_attribution.is_empty() {
+        if !touches.is_empty() || !classified.plan_attribution.is_empty() {
+            self.ad_hoc.clear();
+        } else {
             if event.has_code_changes {
                 self.ad_hoc.push(AdHocEvent {
                     sha: event.sha.clone(),
@@ -1091,6 +1092,46 @@ mod tests {
         e.has_code_changes = true;
         s.apply_commit(&e);
         assert_eq!(s.ad_hoc.len(), 1);
+    }
+
+    #[test]
+    fn plan_commit_supersedes_adhoc() {
+        let mut s = RepoState::new();
+        let mut e = ev("1111", 1, "fix typo", Vec::new());
+        e.has_code_changes = true;
+        s.apply_commit(&e);
+        assert_eq!(s.ad_hoc.len(), 1);
+
+        s.apply_commit(&ev(
+            "2222",
+            2,
+            "[foo] intro",
+            touches(&[("foo", TouchKind::Intro)]),
+        ));
+        assert!(s.ad_hoc.is_empty(), "plan commit should clear ad-hoc");
+    }
+
+    #[test]
+    fn plan_revision_supersedes_adhoc() {
+        let mut s = RepoState::new();
+        s.apply_commit(&ev(
+            "1111",
+            1,
+            "[foo] intro",
+            touches(&[("foo", TouchKind::Intro)]),
+        ));
+        let mut e = ev("2222", 2, "[misc] fix", Vec::new());
+        e.has_code_changes = true;
+        s.apply_commit(&e);
+        assert_eq!(s.ad_hoc.len(), 1, "misc commit should be ad-hoc");
+
+        s.apply_commit(&ev(
+            "3333",
+            3,
+            "[foo] revise",
+            touches(&[("foo", TouchKind::Revise)]),
+        ));
+        assert!(s.ad_hoc.is_empty(), "plan revision should clear ad-hoc");
     }
 
     #[test]
