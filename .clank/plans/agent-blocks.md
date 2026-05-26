@@ -3,30 +3,21 @@
 ## Summary
 
 Agents can block a plan or the whole repo to request human
-intervention. Blocks are files under the agent's `.clank/`
-directory. While blocked, wfw shows "waiting on human" instead
-of normal work. The user unblocks by responding.
+input. The user responds via `clank unblock`, and the agent
+receives the answer through wfw.
 
 ## Layout
 
 ```
-.clank/agents/<agent>/blocks/<plan>.md   — plan block
-.clank/agents/<agent>/blocks/REPO.md     — repo-wide block
+.clank/agents/<agent>/blocks/<plan>.md  — plan block
+.clank/agents/<agent>/blocks/REPO.md    — repo block
+.clank/agents/<agent>/answers/<plan>.md — user's answer
+.clank/agents/<agent>/answers/REPO.md   — user's answer
 ```
 
-Blocks are gitignored (local to the agent's machine). The
-file body explains why the agent is blocked.
-
-## Semantics
-
-- **Plan block**: the blocked plan shows "waiting on human"
-  in status and wfw. Other plans and queue promotion proceed
-  normally.
-- **Repo block** (`REPO.md`): all work stops. wfw returns
-  only the block item. Queue promotion is suppressed.
-- Blocks are not commit-scoped — they apply to the plan or
-  repo as a whole.
-- Multiple agents can have blocks simultaneously.
+All gitignored (under agents/ which is already gitignored).
+One block file per agent per plan. The file body is the
+agent's question/reason.
 
 ## Creating a block
 
@@ -35,73 +26,75 @@ clank block <plan> -m "reason"
 clank block --repo -m "reason"
 ```
 
-Writes `.clank/agents/<self>/blocks/<plan>.md` or `REPO.md`.
-The agent's label is resolved the same way as `clank as`.
+Writes the block file. The agent's label is resolved via
+the standard identity resolver.
 
-## Unblocking
-
-The user responds at `.clank/human/<plan>.md` or
-`.clank/human/REPO.md` (git-tracked so all agents see the
-response). The block file is deleted when the response is
-read by wfw. Alternatively:
+## Answering (unblock)
 
 ```
-clank unblock <plan> -m "response"
-clank unblock --repo -m "response"
+clank unblock <agent> <plan> -m "answer"
+clank unblock <agent> --repo -m "answer"
 ```
 
-This writes the response file and deletes the block.
+Writes the answer file. Does NOT delete the block — wfw
+handles cleanup.
 
-## wfw integration
+## wfw behavior
 
-During derive_status or after:
-1. Scan `.clank/agents/*/blocks/` for any agent's blocks.
-2. If `REPO.md` exists from any agent → emit a single
-   `WaitItem::HumanBlock` with scope=repo. No other work.
-3. For each plan with a block → that plan's work item becomes
-   `WaitItem::HumanBlock` with scope=plan. Other plans
-   proceed normally.
-4. If a response exists in `.clank/human/` for the block,
-   the block is considered resolved — delete the block file
-   and resume normal work.
+On each cycle, for each agent:
+
+1. If `answers/<plan>.md` exists → emit
+   `WaitItem::HumanAnswer { plan, answer }`. Delete both
+   the answer and block files. The agent gets the answer
+   exactly once.
+
+2. If `blocks/<plan>.md` exists (no answer) → that plan
+   shows "waiting on human" instead of normal work. Other
+   plans proceed normally.
+
+3. If `blocks/REPO.md` exists (no answer) → all work
+   suppressed. Only the block item is returned.
+
+4. If `answers/REPO.md` exists → emit HumanAnswer, delete
+   both files, resume all work.
 
 ## Status
-
-`clank status` shows blocks prominently:
 
 ```
 plan: foo
   BLOCKED: waiting on human (claude)
-  reason: plan is drifting from user intent
+  reason: is this the right API shape?
 ```
 
 ## Stop-hook rendering
 
 ```
 - blocked: plan `foo` waiting on human — claude asked:
-  "plan is drifting from user intent"
-  Respond via `clank unblock foo -m "your answer"`
+  "is this the right API shape?"
+  User: `clank unblock claude foo -m "answer"`
+```
+
+When the answer arrives:
+```
+- answer: plan `foo` — human said:
+  "yes but use trait objects"
 ```
 
 ## Hooks
 
-New hook event `hooks.human_block` fires when a block is
-created. The hook should make it hard for the user to miss
-the request (e.g. `say` on macOS).
+`hooks.human_block` fires when a block is created so the
+user gets notified (e.g. `say`).
 
 ## Skill updates
 
-Add guidance to both skill files: when reviews become
-contentious, when the plan drifts, or when the work feels
-unwise, use `clank block` instead of continuing.
+Add to both skills: when reviews become contentious, the
+plan drifts, or the work feels unwise, use `clank block`.
 
 ## Tests
 
-- Agent creates plan block → wfw returns HumanBlock for
-  that plan, other plans proceed.
-- Agent creates repo block → all work suppressed.
-- User responds via clank unblock → block clears, work
-  resumes.
+- Block plan → wfw returns HumanBlock, other plans proceed.
+- Block repo → all work suppressed.
+- Unblock with answer → wfw returns HumanAnswer once, then
+  block and answer files are deleted.
 - Status shows block reason.
-- Stop-hook renders block item.
-- human_block hook fires.
+- Stop-hook renders block and answer items.
