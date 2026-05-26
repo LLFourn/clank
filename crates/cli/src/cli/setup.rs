@@ -1,7 +1,7 @@
 //! `clank setup` — install user-scope clank assets into
 //! `~/.claude/` and `~/.codex/`.
 //!
-//! Writes three skill/command files (refuse-if-drifted; D8) and
+//! Writes skill files (refuse-if-drifted; D8) and
 //! tag-merges a `Stop` hook entry into each agent's user-wide
 //! hook config (idempotent by stable `id` marker; D8).
 //!

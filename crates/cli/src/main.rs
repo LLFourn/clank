@@ -47,8 +47,7 @@ enum Command {
     /// invoked directly.
     StopHook(cli::StopHookArgs),
     /// Install user-scope clank assets into ~/.claude and
-    /// ~/.codex: skill files, slash command, and Stop hook
-    /// entries tag-merged into the per-tool config files.
+    /// ~/.codex: skill files and Stop hook entries.
     Setup(cli::SetupArgs),
     /// Check that the clank integration is correctly set up
     /// across repo, user, and current-session scopes. Exits 0

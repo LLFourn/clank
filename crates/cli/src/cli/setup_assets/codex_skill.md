@@ -50,6 +50,3 @@ drifting from user intent, or the work feels unwise, use
 `clank block create <name> -m "question"` to ask the human.
 Use `clank block clean` to acknowledge answered blocks.
 
-## /clank slash command
-
-See `~/.codex/commands/clank.md` for the interactive flow.
