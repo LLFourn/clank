@@ -1184,10 +1184,12 @@ fn wfw_idle_hook_fires_but_master_parks() {
     write(repo, "README.md", "# repo\n");
     commit(repo, "init");
 
+    let marker = repo.join("idle-hook-ran.txt");
+    let hook_cmd = format!("touch {}", marker.display());
     write(
         repo,
         ".clank/config.json",
-        r#"{"review":{"adhoc_feedback":false},"hooks":{"idle":"echo Check stubs for ideas"}}"#,
+        &format!(r#"{{"review":{{"adhoc_feedback":false}},"hooks":{{"idle":"{hook_cmd}"}}}}"#),
     );
 
     let output = env
@@ -1200,7 +1202,7 @@ fn wfw_idle_hook_fires_but_master_parks() {
             "--role",
             "master",
             "--timeout",
-            "1s",
+            "2s",
             "--json",
         ])
         .arg("--repo")
@@ -1213,6 +1215,10 @@ fn wfw_idle_hook_fires_but_master_parks() {
         Some(2),
         "idle master should park after idle hook; got {:?}",
         output.status
+    );
+    assert!(
+        marker.exists(),
+        "idle hook should have fired and created marker file"
     );
 }
 
@@ -1270,6 +1276,70 @@ fn wfw_user_hooks_shadowed_by_repo_hooks() {
     assert!(
         !user_marker.exists(),
         "user-level hook should be shadowed by repo-level"
+    );
+}
+
+#[test]
+fn wfw_master_parked_wakes_on_queue_item() {
+    let dir = init_repo();
+    let repo = dir.path();
+    disable_adhoc_review(repo);
+    write(repo, "README.md", "# repo\n");
+    commit(repo, "init");
+
+    let mut child = spawn_wfw(
+        repo,
+        &["--author", "lloyd", "--role", "master", "--timeout", "30s", "--json"],
+    );
+
+    std::fs::create_dir_all(repo.join(".clank/queue")).unwrap();
+    std::fs::write(
+        repo.join(".clank/queue/100-new-feature.md"),
+        "# new feature\n",
+    )
+    .unwrap();
+
+    let exit = wait_for_exit(&mut child, Duration::from_secs(20));
+    let stdout = read_stdout_to_end(&mut child);
+    assert!(
+        exit.success(),
+        "should wake on queue item; exit={exit:?} stdout=`{stdout}`"
+    );
+    assert!(
+        stdout.contains("promote_from_queue") && stdout.contains("new-feature"),
+        "should emit PromoteFromQueue; got: {stdout}"
+    );
+}
+
+#[test]
+fn wfw_master_with_active_plan_ignores_queue() {
+    let dir = init_repo();
+    let repo = dir.path();
+    write(repo, ".clank/plans/foo.md", "# foo\n");
+    commit(repo, "[foo] intro");
+
+    std::fs::create_dir_all(repo.join(".clank/queue")).unwrap();
+    std::fs::write(
+        repo.join(".clank/queue/100-queued.md"),
+        "# queued\n",
+    )
+    .unwrap();
+
+    let mut child = spawn_wfw(
+        repo,
+        &["--author", "lloyd", "--role", "master", "--timeout", "3s", "--json"],
+    );
+
+    let exit = wait_for_exit(&mut child, Duration::from_secs(10));
+    let stdout = read_stdout_to_end(&mut child);
+    assert_eq!(
+        exit.code(),
+        Some(2),
+        "should timeout, not promote; stdout=`{stdout}`"
+    );
+    assert!(
+        !stdout.contains("promote"),
+        "should not emit queue items while plan active; got: {stdout}"
     );
 }
 
