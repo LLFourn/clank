@@ -59,13 +59,13 @@ block+unblock pairs (the ack step).
 ## wfw behavior
 
 1. Scan ALL agents' `blocks/` and `unblocks/`.
-2. Pending block → wfw parks (hangs) waiting for the
-   unblock file to appear. No item emitted. The user is
-   notified via `hooks.blocked` at block creation time,
-   not via wfw.
-3. Answered block where the calling agent is the blocker →
+2. Answered block where the calling agent is the blocker →
    emit `WaitItem::Unblocked { name, answer }` and return.
    Agent runs `clank block clean` to acknowledge.
+3. Pending repo block → suppress all work, wfw parks.
+4. Pending plan block → suppress that plan's work items.
+   Other plans and queue promotion proceed normally. wfw
+   only parks if no unsuppressed work remains.
 
 ## Status
 
