@@ -549,6 +549,12 @@ pub struct BlockArgs {
 }
 
 #[derive(Args, Debug)]
+pub struct CleanArgs {
+    #[arg(long, value_name = "PATH")]
+    pub repo: Option<PathBuf>,
+}
+
+#[derive(Args, Debug)]
 pub struct UnblockArgs {
     /// Agent that is blocked.
     pub agent: String,

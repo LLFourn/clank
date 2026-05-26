@@ -61,6 +61,8 @@ enum Command {
     Block(cli::BlockArgs),
     /// Answer a pending block.
     Unblock(cli::UnblockArgs),
+    /// Remove orphaned unblock files.
+    Clean(cli::CleanArgs),
 }
 
 #[tokio::main]
@@ -91,6 +93,7 @@ async fn main() -> anyhow::Result<()> {
         Command::Config(args) => cli::config::run(args).await,
         Command::Block(args) => cli::block::run_block(args).await,
         Command::Unblock(args) => cli::block::run_unblock(args).await,
+        Command::Clean(args) => cli::block::run_clean(args).await,
     };
     if let Err(e) = result {
         let code = exit_code_for(&e);

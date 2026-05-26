@@ -129,15 +129,16 @@ fn build_json(
     } else {
         Vec::new()
     };
-    let pending_blocks: Vec<serde_json::Value> = blocks
+    let all_blocks: Vec<serde_json::Value> = blocks
         .iter()
-        .filter(|b| b.answer.is_none())
         .map(|b| {
             serde_json::json!({
                 "agent": b.agent,
                 "name": b.name,
                 "plan": b.plan,
                 "question": b.question,
+                "answer": b.answer,
+                "pending": b.answer.is_none(),
             })
         })
         .collect();
@@ -149,7 +150,7 @@ fn build_json(
         "worktree_dirty": worktree_dirty,
         "plans": plans,
         "finished_plans": finished,
-        "blocks": pending_blocks,
+        "blocks": all_blocks,
     })
 }
 
@@ -195,13 +196,20 @@ fn print_human(
         }
     }
 
-    let pending: Vec<_> = blocks.iter().filter(|b| b.answer.is_none()).collect();
-    if !pending.is_empty() {
-        println!();
-        println!("blocks:");
-        for b in &pending {
-            let scope = b.plan.as_deref().unwrap_or("repo");
-            println!("  BLOCKED ({}, scope: {}): {}", b.agent, scope, b.question);
+    if !blocks.is_empty() {
+        let has_any = blocks.iter().any(|b| b.answer.is_none() || b.answer.is_some());
+        if has_any {
+            println!();
+            println!("blocks:");
+            for b in blocks {
+                let scope = b.plan.as_deref().unwrap_or("repo");
+                if let Some(ref answer) = b.answer {
+                    println!("  UNBLOCKED ({}, scope: {}): {}", b.agent, scope, b.question);
+                    println!("    answer: {answer}");
+                } else {
+                    println!("  BLOCKED ({}, scope: {}): {}", b.agent, scope, b.question);
+                }
+            }
         }
     }
 }

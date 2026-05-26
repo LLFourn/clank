@@ -72,6 +72,39 @@ pub async fn run_unblock(args: UnblockArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
+pub async fn run_clean(args: super::CleanArgs) -> anyhow::Result<()> {
+    let repo = super::resolve_repo(args.repo.as_deref())?;
+    let removed = clean_blocks(&repo)?;
+    println!("cleaned {removed} orphaned unblock file(s)");
+    Ok(())
+}
+
+pub fn clean_blocks(repo: &Path) -> anyhow::Result<usize> {
+    let entries = scan_blocks(repo);
+    let mut removed = 0;
+    for entry in &entries {
+        if entry.answer.is_some() {
+            let agents = agents_root(repo);
+            let unblock_path = match &entry.plan {
+                Some(plan) => agents
+                    .join(&entry.agent)
+                    .join("unblocks")
+                    .join(plan)
+                    .join(format!("{}.md", entry.name)),
+                None => agents
+                    .join(&entry.agent)
+                    .join("unblocks")
+                    .join(format!("{}.md", entry.name)),
+            };
+            if unblock_path.exists() {
+                std::fs::remove_file(&unblock_path)?;
+                removed += 1;
+            }
+        }
+    }
+    Ok(removed)
+}
+
 #[derive(Debug, Clone)]
 pub struct BlockEntry {
     pub agent: String,
