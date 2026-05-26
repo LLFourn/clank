@@ -126,7 +126,7 @@ impl StatusSnapshot {
             })
             .collect();
 
-        serde_json::json!({
+        let mut obj = serde_json::json!({
             "repo_basename": self.basename,
             "branch": self.branch,
             "head_sha": self.head_sha,
@@ -135,8 +135,11 @@ impl StatusSnapshot {
             "plans": plans,
             "finished_plans": finished,
             "blocks": all_blocks,
-            "queue_count": self.queue_count,
-        })
+        });
+        if self.queue_count > 0 {
+            obj["queue_count"] = serde_json::json!(self.queue_count);
+        }
+        obj
     }
 
     fn to_human(&self) -> String {
