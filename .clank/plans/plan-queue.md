@@ -10,16 +10,17 @@ highest-priority queued item to an active plan.
 ## Layout
 
 ```
-~/.clank/stubs/<name>.md        — ideas, not committed
-~/.clank/queue/<NNN>-<name>.md  — prioritized, not committed
-.clank/plans/<name>.md          — active, committed
-.clank/finished/<name>.md       — done, committed
+~/.clank/stubs/<name>.md                — ideas, not committed
+<repo>/.clank/queue/<NNN>-<name>.md     — prioritized, gitignored
+.clank/plans/<name>.md                  — active, committed
+.clank/finished/<name>.md               — done, committed
 ```
 
-Queue files live at `~/.clank/queue/` (user-local, not
+Queue is repo-scoped at `.clank/queue/` (gitignored, not
 committed). The filename starts with a 3-digit priority
 (`000` = highest). Files are promoted in lexicographic order
-(lowest number first).
+(lowest number first). `clank init` adds `queue/` to
+`.clank/.gitignore`.
 
 ## `clank queue` subcommand
 
@@ -29,17 +30,18 @@ List queued items in priority order.
 
 ### `clank queue add <stub-name> [--priority NNN]`
 
-Move `~/.clank/stubs/<stub-name>.md` to
-`~/.clank/queue/<NNN>-<stub-name>.md`. Default priority 500.
-Error if the stub doesn't exist.
+Copy `~/.clank/stubs/<stub-name>.md` to
+`<repo>/.clank/queue/<NNN>-<stub-name>.md`. Default priority
+500. Error if the stub doesn't exist.
 
 ### `clank queue remove <name>`
 
-Remove an item from the queue (back to stubs or just delete).
+Delete an item from the queue. The file is removed, not
+moved back to stubs.
 
 ### `clank queue promote <name>`
 
-Move `~/.clank/queue/<NNN>-<name>.md` to
+Move `<repo>/.clank/queue/<NNN>-<name>.md` to
 `.clank/plans/<name>.md`, stage and commit as
 `[<name>] intro`. This is what the agent runs when wfw
 tells it to promote.
@@ -64,7 +66,8 @@ The stop-hook renders this as:
   `clank queue promote foo`
 ```
 
-Only the highest-priority item is surfaced. If the queue
+Only the highest-priority item is surfaced. Only emitted
+for `Role::Master` — reviewers idle normally. If the queue
 is empty, wfw returns the existing idle behavior.
 
 ## Implementation
@@ -73,11 +76,12 @@ is empty, wfw returns the existing idle behavior.
 - `cli/mod.rs`: `QueueArgs` with subcommands.
 - `main.rs`: wire `Queue` variant.
 - `core/wait.rs`: add `WaitItem::PromoteFromQueue`.
-- `cli/wfw.rs`: after derive_status finds no work, scan
-  the queue directory and emit PromoteFromQueue if non-empty.
+- `cli/wfw.rs`: after derive_status finds no work AND
+  role is Master, scan the queue directory and emit
+  PromoteFromQueue if non-empty.
 - `cli/stop_hook.rs`: render PromoteFromQueue.
 - Queue scanning is filesystem-only (not git), reads
-  `~/.clank/queue/` sorted lexicographically.
+  `<repo>/.clank/queue/` sorted lexicographically.
 
 ## Tests
 
