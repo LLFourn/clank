@@ -63,7 +63,14 @@ fn list(repo: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn validate_name(name: &str) -> anyhow::Result<()> {
+    clank_core::ids::PlanKey::parse(name)
+        .map_err(|e| anyhow::anyhow!("invalid plan name `{name}`: {e}"))?;
+    Ok(())
+}
+
 fn add(repo: &Path, stub_name: &str, priority: u16) -> anyhow::Result<()> {
+    validate_name(stub_name)?;
     let home = std::env::var_os("HOME")
         .map(PathBuf::from)
         .ok_or_else(|| anyhow::anyhow!("HOME not set"))?;
@@ -94,6 +101,7 @@ fn remove(repo: &Path, name: &str) -> anyhow::Result<()> {
 }
 
 fn promote(repo: &Path, name: &str) -> anyhow::Result<()> {
+    validate_name(name)?;
     let entries = scan_queue(repo);
     let entry = entries
         .iter()
@@ -167,6 +175,14 @@ mod tests {
         let entries = scan_queue(dir.path());
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].name, "good");
+    }
+
+    #[test]
+    fn invalid_name_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let result = add(dir.path(), ".hidden", 100);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("invalid plan name"));
     }
 
     #[test]
