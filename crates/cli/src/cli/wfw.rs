@@ -82,8 +82,8 @@ fn firings_from_items(items: &[WaitItem]) -> Vec<HookFiring> {
             | WaitItem::AdHocReview { .. }
             | WaitItem::AdHocRevise { .. }
             | WaitItem::PromoteFromQueue { .. }
-            | WaitItem::HumanBlock { .. }
-            | WaitItem::HumanAnswer { .. } => None,
+            | WaitItem::Blocked { .. }
+            | WaitItem::Unblocked { .. } => None,
         })
         .collect()
 }
@@ -322,9 +322,9 @@ pub async fn run(args: WfwArgs) -> anyhow::Result<()> {
 }
 
 /// Check blocks and return (block_items, suppressed_plans). If a
-/// `HumanAnswer` is found for the calling agent, it is returned as
+/// `Unblocked` is found for the calling agent, it is returned as
 /// the sole item with `suppress_all = true` so the caller exits
-/// immediately. Pending blocks emit `HumanBlock` items and
+/// immediately. Pending blocks emit `Blocked` items and
 /// suppress either all work (repo-scope) or specific plans.
 struct BlockResult {
     items: Vec<WaitItem>,
@@ -343,7 +343,7 @@ fn check_blocks(repo: &Path, author: &AgentLabel) -> BlockResult {
     for b in &blocks {
         if b.agent == author.as_str() {
             if let Some(ref answer) = b.answer {
-                result.items = vec![WaitItem::HumanAnswer {
+                result.items = vec![WaitItem::Unblocked {
                     name: b.name.clone(),
                     plan: b.plan.clone(),
                     answer: answer.clone(),
@@ -358,7 +358,7 @@ fn check_blocks(repo: &Path, author: &AgentLabel) -> BlockResult {
         if b.answer.is_some() {
             continue;
         }
-        result.items.push(WaitItem::HumanBlock {
+        result.items.push(WaitItem::Blocked {
             agent: b.agent.clone(),
             name: b.name.clone(),
             plan: b.plan.clone(),
@@ -463,24 +463,24 @@ fn render_json(item: &WaitItem) -> serde_json::Value {
             "name": name,
             "priority": priority,
         }),
-        WaitItem::HumanBlock {
+        WaitItem::Blocked {
             agent,
             name,
             plan,
             question,
         } => serde_json::json!({
-            "kind": "human_block",
+            "kind": "blocked",
             "agent": agent,
             "name": name,
             "plan": plan,
             "question": question,
         }),
-        WaitItem::HumanAnswer {
+        WaitItem::Unblocked {
             name,
             plan,
             answer,
         } => serde_json::json!({
-            "kind": "human_answer",
+            "kind": "unblocked",
             "name": name,
             "plan": plan,
             "answer": answer,
@@ -526,7 +526,7 @@ fn render_human(item: &WaitItem) -> String {
         WaitItem::PromoteFromQueue { name, priority } => {
             format!("promote  {name}  (priority {priority:03}) — run `clank queue promote {name}`")
         }
-        WaitItem::HumanBlock {
+        WaitItem::Blocked {
             agent,
             name,
             plan,
@@ -535,7 +535,7 @@ fn render_human(item: &WaitItem) -> String {
             let scope = plan.as_deref().unwrap_or("repo");
             format!("blocked  {agent}/{name}  scope={scope}  {question}")
         }
-        WaitItem::HumanAnswer { name, plan, answer } => {
+        WaitItem::Unblocked { name, plan, answer } => {
             let scope = plan.as_deref().unwrap_or("repo");
             format!("answer   {name}  scope={scope}  {answer}")
         }

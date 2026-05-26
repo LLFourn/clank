@@ -24,12 +24,12 @@ pub async fn run_block(args: BlockArgs) -> anyhow::Result<()> {
     std::fs::write(&path, &args.message)?;
 
     let config = crate::cli::config::load(&repo);
-    if let Some(Some(cmd)) = config.hooks.get(&clank_core::HookEvent::HumanBlock) {
+    if let Some(Some(cmd)) = config.hooks.get(&clank_core::HookEvent::Blocked) {
         let mut child = std::process::Command::new("sh");
         child
             .arg("-c")
             .arg(cmd)
-            .env("CLANK_EVENT", "human-block")
+            .env("CLANK_EVENT", "blocked")
             .env("CLANK_AGENT", author.as_str())
             .env("CLANK_BLOCK_NAME", &args.name)
             .env("CLANK_REPO", &*repo.to_string_lossy())

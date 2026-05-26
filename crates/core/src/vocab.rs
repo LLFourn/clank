@@ -225,7 +225,7 @@ pub enum HookEvent {
     ReviewerWork,
     PlanFinalized,
     Idle,
-    HumanBlock,
+    Blocked,
 }
 
 impl HookEvent {
@@ -235,7 +235,7 @@ impl HookEvent {
             HookEvent::ReviewerWork => "reviewer-work",
             HookEvent::PlanFinalized => "plan-finalized",
             HookEvent::Idle => "idle",
-            HookEvent::HumanBlock => "human-block",
+            HookEvent::Blocked => "blocked",
         }
     }
 }

@@ -69,6 +69,9 @@ pub enum ConfigKey {
     /// Shell command to run on idle (no work). string or null.
     #[command(name = "hooks.idle", alias = "hooks_idle")]
     HooksIdle(ConfigKeyArgs),
+    /// Shell command to run when an agent creates a block. string or null.
+    #[command(name = "hooks.blocked", alias = "hooks_blocked")]
+    HooksBlocked(ConfigKeyArgs),
 }
 
 #[derive(Args, Debug)]

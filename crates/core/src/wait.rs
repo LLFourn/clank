@@ -76,13 +76,13 @@ pub enum WaitItem {
         name: String,
         priority: u16,
     },
-    HumanBlock {
+    Blocked {
         agent: String,
         name: String,
         plan: Option<String>,
         question: String,
     },
-    HumanAnswer {
+    Unblocked {
         name: String,
         plan: Option<String>,
         answer: String,

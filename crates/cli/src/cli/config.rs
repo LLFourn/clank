@@ -142,7 +142,7 @@ fn apply_layer(cfg: &mut Config, path: Option<&Path>) -> BTreeSet<String> {
             HookEvent::ReviewerWork,
             HookEvent::PlanFinalized,
             HookEvent::Idle,
-            HookEvent::HumanBlock,
+            HookEvent::Blocked,
         ] {
             if let Some(v) = hooks.get(event) {
                 cfg.hooks.insert(event, v);
@@ -212,6 +212,13 @@ pub static KEY_CATALOG: &[KeyDef] = &[
         type_desc: "string|null",
         default: "null",
         help: "Shell command to run on idle (no work)",
+    },
+    KeyDef {
+        section: "hooks",
+        name: "blocked",
+        type_desc: "string|null",
+        default: "null",
+        help: "Shell command to run when an agent creates a block",
     },
 ];
 
@@ -309,7 +316,7 @@ fn event_to_key_name(event: HookEvent) -> &'static str {
         HookEvent::ReviewerWork => "reviewer_work",
         HookEvent::PlanFinalized => "plan_finalized",
         HookEvent::Idle => "idle",
-        HookEvent::HumanBlock => "human_block",
+        HookEvent::Blocked => "blocked",
     }
 }
 
@@ -339,6 +346,7 @@ fn key_name(cmd: &ConfigKey) -> &'static str {
         ConfigKey::HooksReviewerWork(_) => "hooks.reviewer_work",
         ConfigKey::HooksPlanFinalized(_) => "hooks.plan_finalized",
         ConfigKey::HooksIdle(_) => "hooks.idle",
+        ConfigKey::HooksBlocked(_) => "hooks.blocked",
     }
 }
 
@@ -350,7 +358,8 @@ fn key_args(cmd: &ConfigKey) -> &ConfigKeyArgs {
         | ConfigKey::HooksMasterWork(a)
         | ConfigKey::HooksReviewerWork(a)
         | ConfigKey::HooksPlanFinalized(a)
-        | ConfigKey::HooksIdle(a) => a,
+        | ConfigKey::HooksIdle(a)
+        | ConfigKey::HooksBlocked(a) => a,
     }
 }
 

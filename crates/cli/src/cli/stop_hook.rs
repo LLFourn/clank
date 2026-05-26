@@ -249,7 +249,7 @@ fn render_wfw_items(items: &[serde_json::Value], label: &AgentLabel, role: Role)
                     "  - promote: queue item `{name}` (priority {priority:03})\n    Read `.clank/queue/{priority:03}-{name}.md`, evaluate whether it is\n    well-scoped and ready to implement. Edit/rescope as needed.\n    When ready: `clank queue promote {name}`\n",
                 ));
             }
-            "human_block" => {
+            "blocked" => {
                 let agent = item.get("agent").and_then(|v| v.as_str()).unwrap_or("?");
                 let name = item.get("name").and_then(|v| v.as_str()).unwrap_or("?");
                 let block_plan = item.get("plan").and_then(|v| v.as_str());
@@ -260,7 +260,7 @@ fn render_wfw_items(items: &[serde_json::Value], label: &AgentLabel, role: Role)
                     "  - blocked: agent `{agent}` block `{name}` (scope: {scope})\n    Question: {question}\n    This block suppresses work until a human runs:\n    `clank unblock {agent} {name}{plan_flag} -m \"<answer>\"`\n",
                 ));
             }
-            "human_answer" => {
+            "unblocked" => {
                 let name = item.get("name").and_then(|v| v.as_str()).unwrap_or("?");
                 let answer = item.get("answer").and_then(|v| v.as_str()).unwrap_or("");
                 out.push_str(&format!(

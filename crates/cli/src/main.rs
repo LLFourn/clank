@@ -56,7 +56,7 @@ enum Command {
     Doctor(cli::DoctorArgs),
     /// Read or write Clank config values.
     Config(cli::ConfigArgs),
-    /// Declare a human-blocking question. The calling agent's work
+    /// Declare a blockeding question. The calling agent's work
     /// is suppressed until unblocked.
     Block(cli::BlockArgs),
     /// Answer a pending block.
