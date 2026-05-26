@@ -189,7 +189,6 @@ finalized seal.
 
 ~/.codex/
 ├── skills/clank/SKILL.md
-├── commands/clank.md
 └── hooks.json
 ```
 
@@ -222,7 +221,6 @@ For a fully bound session with the hook installed, you should see:
 [user]
   OK   ~/.claude/skills/clank/SKILL.md: matches embedded content
   OK   ~/.codex/skills/clank/SKILL.md: matches embedded content
-  OK   ~/.codex/commands/clank.md: matches embedded content
   OK   ~/.claude/settings.json: claude Stop hook installed
   OK   ~/.codex/hooks.json: codex Stop hook installed
 
