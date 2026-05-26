@@ -45,14 +45,15 @@ reads it and acts on it.
 ```
 clank block <name> -m "question"
 clank block <name> --plan <plan> -m "question"
+clank block clean
 clank unblock <agent> <name> -m "answer"
 clank unblock <agent> <name> --plan <plan> -m "answer"
-clank clean
 ```
 
 `block` writes the block file for the current agent.
+`block clean` removes the calling agent's matched
+block+unblock pairs (the ack step).
 `unblock` writes the matching unblock file (user runs this).
-`clean` removes orphaned unblock files (no matching block).
 
 ## wfw behavior
 
@@ -104,10 +105,6 @@ Unblocked:
 Add to both skills: when reviews become contentious, the
 plan drifts, or the work feels unwise, use `clank block`.
 
-## `clank clean`
-
-Removes orphaned unblock files (unblock with no matching
-block — the agent already deleted its block file).
 
 ## Tests
 

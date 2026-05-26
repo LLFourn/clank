@@ -61,7 +61,7 @@ enum Command {
     Block(cli::BlockArgs),
     /// Answer a pending block.
     Unblock(cli::UnblockArgs),
-    /// Remove orphaned unblock files.
+    /// Remove answered blocks for the calling agent.
     Clean(cli::CleanArgs),
 }
 
