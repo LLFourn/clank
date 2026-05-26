@@ -26,8 +26,9 @@ subdirectory only block that plan.
 
 Two states:
 
-Blocked = block file exists, no matching unblock.
-Answered = block file + matching unblock exist.
+Blocked = block file exists, no matching unblock. wfw parks.
+Answered = block file + matching unblock exist. wfw emits
+Unblocked and returns.
 
 The agent owns its block file — it can edit it, elaborate,
 or delete the unblock to re-enter pending state. `clank block clean`
