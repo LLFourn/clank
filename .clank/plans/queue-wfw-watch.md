@@ -28,9 +28,10 @@ hook fires once before parking but doesn't cause an exit.
   2. If queue empty, fire idle hook (no exit), then fall
      through to the watch loop.
 - `cli/wfw.rs`: in the watch loop, after `derive_status` +
-  `detect_finished` finds no items AND role is Master,
-  scan queue. If non-empty, emit `PromoteFromQueue` and
-  return.
+  `detect_finished` finds no items, check: role is Master,
+  no plan filter, AND `state.fold.plans.is_empty()`. Only
+  then scan queue. If non-empty, emit `PromoteFromQueue`
+  and return.
 - Update tests:
   - `wfw_master_empty_exits_even_with_hooks_configured` →
     master now parks instead of exiting; use timeout.
