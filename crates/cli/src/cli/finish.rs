@@ -4,7 +4,7 @@
 //! a typed `FinishPreviewResponse` via `crate::preview`, dispatches
 //! on `readiness`, re-reads each sealed approval (verifying its
 //! body hash against the local projection), then makes a single
-//! `Finalize <stem>` commit. No daemon required.
+//! `[<stem>] finish` commit. No daemon required.
 
 use std::path::Path;
 

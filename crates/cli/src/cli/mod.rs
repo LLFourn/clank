@@ -497,7 +497,7 @@ pub struct FinishArgs {
     /// must already be a finalize commit for this plan.
     #[arg(long)]
     pub amend: bool,
-    /// Override the default `Finalize <stem>` commit message.
+    /// Override the default `[<stem>] finish` commit message.
     #[arg(short = 'm', long)]
     pub message: Option<String>,
     /// After finalize, strip the plan's `.clank/` artifacts
