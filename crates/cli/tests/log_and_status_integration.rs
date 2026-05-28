@@ -221,7 +221,7 @@ fn log_finished_plan_shows_full_timeline() {
     // Move plan file to finished/ to trigger Finish detection.
     write(repo, ".clank/finished/bar.md", "# bar\n");
     git(repo, &["rm", "--quiet", ".clank/plans/bar.md"]);
-    commit(repo, "Finalize bar");
+    commit(repo, "[bar] finish");
 
     let out = run_clank(repo, &["log", "--plan", "bar"]);
     assert!(out.status.success());

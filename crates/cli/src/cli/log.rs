@@ -331,7 +331,7 @@ fn print_oneline(
                 (plan, sha, None)
             }
             LogEvent::PlanFinalized { plan, sha, .. } => {
-                (plan, sha, Some(format!("Finalize {}", plan.as_str())))
+                (plan, sha, Some(format!("[{}] finish", plan.as_str())))
             }
             LogEvent::PlanDeleted { plan, sha, .. } => {
                 (plan, sha, Some(format!("Delete {}", plan.as_str())))

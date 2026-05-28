@@ -306,7 +306,7 @@ mod tests {
         // Move the plan file to finished/ to trigger Finish detection.
         write_file(dir.path(), ".clank/finished/foo.md", "# foo\n");
         run_git(dir.path(), &["rm", "--quiet", ".clank/plans/foo.md"]);
-        commit(dir.path(), "Finalize foo");
+        commit(dir.path(), "[foo] finish");
         let state = rebuild_repo(dir.path()).await.unwrap();
         let key = PlanKey::parse("foo").unwrap();
         assert!(!state.fold.plans.contains_key(&key));

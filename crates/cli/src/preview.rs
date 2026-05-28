@@ -513,7 +513,7 @@ mod tests {
         // Move the plan file to finished/ to trigger Finish detection.
         write_file(dir.path(), ".clank/finished/b.md", "# b v2\n");
         run_git(dir.path(), &["rm", "--quiet", ".clank/plans/b.md"]);
-        commit(dir.path(), "Finalize b");
+        commit(dir.path(), "[b] finish");
 
         let state = rebuild_repo_with_policy(dir.path(), CachePolicy::Bypass)
             .await

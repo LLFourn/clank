@@ -75,7 +75,7 @@ fn dry_run_finish_composite(
         .message
         .as_deref()
         .map(str::to_string)
-        .unwrap_or_else(|| format!("Finalize {stem}"));
+        .unwrap_or_else(|| format!("[{stem}] finish"));
     println!("#   message: {msg}");
     let approvers: Vec<&str> = preview
         .sealed_approvals
@@ -231,7 +231,7 @@ async fn finalize(
     git_run(repo, &["rm", "--quiet", "--force", "--", &rel_plan])?;
     git_run(repo, &["add", "--", &rel_finished])?;
 
-    let default_msg = format!("Finalize {stem}");
+    let default_msg = format!("[{stem}] finish");
     let msg = message.unwrap_or(&default_msg);
     let mut commit_args: Vec<&str> = vec!["commit", "--quiet", "-m", msg];
     if amend {
@@ -342,7 +342,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             String::from_utf8(out.stdout).unwrap().trim(),
-            "Finalize foo"
+            "[foo] finish"
         );
     }
 

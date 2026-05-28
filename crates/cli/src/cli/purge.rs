@@ -563,7 +563,7 @@ mod tests {
         write_file(repo, ".clank/finished/foo.md", "# foo\n");
         git(repo, &["rm", "--quiet", ".clank/plans/foo.md"]);
         git(repo, &["add", ".clank/finished/foo.md"]);
-        git(repo, &["commit", "--quiet", "-m", "Finalize foo"]);
+        git(repo, &["commit", "--quiet", "-m", "[foo] finish"]);
         dir
     }
 
@@ -670,7 +670,7 @@ mod tests {
         write_file(repo, ".clank/finished/foobar.md", "# foobar\n");
         git(repo, &["rm", "--quiet", ".clank/plans/foobar.md"]);
         git(repo, &["add", ".clank/finished/foobar.md"]);
-        git(repo, &["commit", "--quiet", "-m", "Finalize foobar"]);
+        git(repo, &["commit", "--quiet", "-m", "[foobar] finish"]);
 
         let foo = PlanKey::parse("foo").unwrap();
         let err = build_amend_program(repo, Some(&foo)).unwrap_err();

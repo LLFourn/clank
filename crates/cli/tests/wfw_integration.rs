@@ -802,7 +802,7 @@ fn wfw_finish_wake_survives_early_snapshot_event() {
     // Stage 3: commit the finalize — delete from plans/, add to finished/.
     git(repo, &["rm", "--quiet", ".clank/plans/foo.md"]);
     git(repo, &["add", ".clank/finished/foo.md"]);
-    git(repo, &["commit", "--quiet", "-m", "Finalize foo"]);
+    git(repo, &["commit", "--quiet", "-m", "[foo] finish"]);
 
     let exit = wait_for_exit(&mut child, Duration::from_secs(20));
     let stdout = read_stdout_to_end(&mut child);

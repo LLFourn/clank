@@ -43,7 +43,7 @@ pub async fn run(args: UnfinishArgs) -> anyhow::Result<()> {
         ],
     )?;
 
-    let msg = format!("Unfinish {}", plan_key.as_str());
+    let msg = format!("[{}] unfinish", plan_key.as_str());
     git_run(&repo, &["commit", "--quiet", "-m", &msg])?;
 
     println!("unfinished `{}`", plan_key.as_str());
