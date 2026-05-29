@@ -79,6 +79,10 @@ struct OpenResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     clank: Option<ClankInfo>,
     recommendations: Vec<Recommendation>,
+    /// Non-fatal degradations (e.g. fold failed, JSONL probe
+    /// errored). Empty when everything resolved cleanly.
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    warnings: Vec<String>,
 }
 
 #[derive(Serialize)]
@@ -104,7 +108,13 @@ struct GitInfo {
 
 #[derive(Serialize)]
 struct ClankInfo {
-    master: Option<String>,
+    /// Labels of agents whose per-agent
+    /// `.clank/agents/<label>/config.json` declares `role:
+    /// "master"`. Per `crates/core/src/agent_config.rs`, master
+    /// is a per-user role claim, not a repo-wide assertion —
+    /// the list may be empty, single, or multi-element, and
+    /// none of those are "wrong" states.
+    master_agents: Vec<String>,
     agents: Vec<AgentInfo>,
     active_plans: usize,
     waiting_on: Option<String>, // short string like "reviewer"
@@ -172,18 +182,20 @@ erroring the whole inspector.
 
 Reuse existing machinery — don't reimplement:
 
-- `agents` from `.clank/agents/<label>/config.json` reads (the
-  per-agent local config; gitignored). Extract `session.id`
-  and `session.tool`.
-- `master` from `crates/cli/src/cli/config.rs::Config` loaded at
-  `repo_root` — `cfg.master` or equivalent.
+- `agents` from `.clank/agents/<label>/config.json` reads
+  (`AgentConfig` in `crates/core/src/agent_config.rs`).
+  Extract `session.id` and `session.tool`.
+- `master_agents` = labels whose `AgentConfig::role` is
+  `Role::Master`. Same scan as `agents`; just filter.
 - `active_plans` and `waiting_on` from a `rebuild_repo` +
   `derive_status` call on `repo_root`. Reuse the same path
   `clank status` uses (`StatusSnapshot::build_async`) and pull
-  the summary fields. If `rebuild_repo` fails (broken repo),
-  set both to `None` / `0` and emit no `ClankInit`
-  recommendation downgrade — note the partial state in a
-  `warnings: Vec<String>` field on the response.
+  the summary fields. If `rebuild_repo` fails (broken repo,
+  partial init, etc.), set `active_plans: 0` /
+  `waiting_on: None`, do NOT downgrade the state (it's still
+  `ClankInitialized` if `config.json` exists), and push a
+  message like `"fold failed: <err>"` onto
+  `OpenResponse::warnings`.
 
 ## Human-readable output (no `--json`)
 
@@ -194,7 +206,7 @@ state:        ClankInitialized
 opened_path:  /Users/me/code/myproj/sub
 repo_root:    /Users/me/code/myproj
 git:          branch=main, clean
-clank:        master=claude, 2 agents, 1 active plan, waiting on reviewer
+clank:        master=[claude], 2 agents, 1 active plan, waiting on reviewer
 
 recommendations:
   - resume agent `claude` (claude --resume 742f6a04-...)
@@ -202,7 +214,9 @@ recommendations:
 ```
 
 For non-`ClankInitialized` states, the same shape with
-`repo_root: -` / `clank: -` lines.
+`repo_root: -` / `clank: -` lines. If `warnings` is non-empty,
+append a `warnings:` block after `recommendations:` with one
+bullet per entry.
 
 ## Tests
 
@@ -224,8 +238,13 @@ State-coverage tests (spawn the binary, parse `--json` output):
   populated with branch/clean, recommendations =
   `[clank_init, bind_agent]`.
 - `clank_initialized_with_agents` — full repo with two agents
-  in `.clank/agents/`; assert agents listed and resume
-  recommendations.
+  in `.clank/agents/`, one with `role: "master"`, one with
+  `role: "reviewers"`. Assert `master_agents == ["<that-label>"]`,
+  both agents listed, and resume recommendations emitted.
+- `clank_initialized_zero_or_many_master_agents` — first
+  variant: both agents `role: "reviewers"` → `master_agents`
+  is empty (not an error). Second variant: both agents
+  `role: "master"` → both labels appear in `master_agents`.
 - `clank_initialized_subdir` — open a subdirectory of an
   initialized repo; assert `repo_root` is the toplevel,
   `opened_path` is the subdir, state is still
@@ -253,6 +272,16 @@ Session-resumability tests:
   config has a UUID with no JSONL on disk; assert
   `session_resumable: false` and recommendation is
   `BindAgent`, not `ResumeAgent`.
+
+Warning-surface tests:
+
+- `fold_failure_pushes_warning_but_keeps_clank_initialized` —
+  initialize clank, then corrupt `.git/HEAD` (or commit garbage
+  that breaks rebuild). Assert state is still
+  `ClankInitialized`, `clank.active_plans == 0`,
+  `clank.waiting_on == None`, and `warnings` contains one entry
+  mentioning the fold failure. JSON output omits `warnings` when
+  empty (serde `skip_serializing_if`) — pin that too.
 
 ## Out of scope
 
