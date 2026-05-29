@@ -16,6 +16,29 @@ A single command, e.g. `clank open <path> [--json]`, that
 classifies `<path>` and returns a recommendation. No mutation —
 the editor decides whether to act on the recommendation.
 
+## Path handling (the not-just-`.git/` problem)
+
+Editors commonly hand us a *subdirectory* of a repo, or a path
+inside a linked worktree (whose `.git` is a file pointing at a
+separate `gitdir`). Looking for a literal `.git/` directly under
+`<path>` would misclassify both cases as "not a git repo."
+
+Inspector contract:
+
+- Canonicalize `<path>` with `dunce::canonicalize` (matches
+  `crates/cli/src/cli/mod.rs:resolve_repo`).
+- Probe git with `git -C <canonical> rev-parse --show-toplevel`
+  AND `--git-dir`. Success on both → `repo_root` =
+  `--show-toplevel`, `git_dir` = `--git-dir` (these differ for
+  linked worktrees).
+- Classification keys off `repo_root`, not off `<path>` itself.
+  In particular, `.clank/config.json` is looked up at
+  `repo_root/.clank/config.json`.
+- Both `opened_path` and `repo_root` are returned to the editor
+  so it knows the original input and the canonical project root.
+- If `<path>` exists but git rev-parse fails (no repo found
+  walking up), we fall through to `DirectoryNotGit`.
+
 ## States to distinguish
 
 In rough order of "less set up" → "more set up":
@@ -29,35 +52,48 @@ In rough order of "less set up" → "more set up":
    lets the user pick a different path.
 
 3. **`EmptyDirectory`** — exists, no entries (or only ignored
-   noise like `.DS_Store`).
+   noise like `.DS_Store`), and git rev-parse finds no repo
+   walking up.
    Recommended actions: `git init` + `clank init`.
 
-4. **`DirectoryNotGit`** — non-empty, no `.git/`.
+4. **`DirectoryNotGit`** — non-empty, git rev-parse finds no
+   repo walking up.
    Recommended actions: prompt user; either `git init` here or
    bail.
 
-5. **`GitWithoutClank`** — `.git/` exists, no `.clank/`.
-   Recommended actions: `clank init`.
+5. **`GitWithoutClank`** — git rev-parse succeeded
+   (`repo_root` known, linked worktrees included), but
+   `repo_root/.clank/config.json` is missing.
+   Recommended actions: `clank init` at `repo_root`.
 
-6. **`ClankInitialized`** — `.clank/config.json` exists.
-   Returns the existing master designation, list of agents
-   (`.clank/agents/<label>/`), any per-agent local config
-   (`config.json` with last-bound session ID), and the current
-   `clank status` summary so the editor can show "1 active plan,
-   waiting on reviewer" without a second call.
+6. **`ClankInitialized`** — `repo_root/.clank/config.json`
+   exists. Returns the existing master designation, list of
+   agents (`repo_root/.clank/agents/<label>/`), any per-agent
+   local config (`config.json` with last-bound session ID), and
+   the current `clank status` summary so the editor can show
+   "1 active plan, waiting on reviewer" without a second call.
 
-(There are sub-cases worth flagging — e.g. "clank init started
-but `.clank/config.json` missing", "git repo with detached HEAD"
-— but the editor probably treats those as "5/6 with warnings"
-rather than separate top-level states.)
+(Sub-cases worth flagging on top of 5/6 rather than as separate
+states: detached HEAD, dirty worktree, linked-worktree vs main
+worktree, partially-initialized `.clank/` without `config.json`.
+These ride as boolean / enum fields on the response, not as new
+top-level `state` values.)
 
 ## Proposed response shape (JSON)
 
 ```json
 {
-  "path": "/abs/path",
+  "opened_path": "/abs/path/maybe/sub/dir",
+  "repo_root": "/abs/path",
   "state": "ClankInitialized",
-  "git": { "is_repo": true, "head_branch": "main", "dirty": false },
+  "git": {
+    "is_repo": true,
+    "git_dir": "/abs/path/.git",
+    "is_linked_worktree": false,
+    "head_branch": "main",
+    "detached_head": false,
+    "dirty": false
+  },
   "clank": {
     "master": "claude",
     "agents": [
@@ -96,7 +132,26 @@ rather than separate top-level states.)
 
 For PathMissing / Empty / etc., `recommendations` contains
 `InitDirectory`, `GitInit`, `ClankInit`, `BindAgent` entries in
-order. The editor walks them.
+order. The editor walks them. The `ClankInit` recommendation
+carries the `repo_root` it should run against, so it's correct
+even when the editor opened a subdirectory.
+
+## Test coverage to bake in
+
+When this lands, the test matrix has to include — not just the
+six top-level states, but the path-handling cases:
+
+- Opened path is the repo root → `opened_path == repo_root`.
+- Opened path is a nested subdirectory of an initialized repo
+  → `repo_root` correctly points up; classification is still
+  `ClankInitialized`; `ClankInit` is NOT recommended.
+- Opened path is inside a linked worktree (`.git` file, external
+  `git_dir`) → `is_linked_worktree: true`, `repo_root` points at
+  the linked worktree's toplevel.
+- Opened path is inside a bare repo subdirectory (rare for
+  editors but worth a defined behavior).
+- Symlinked path resolves to the same identity as the canonical
+  one (regression on `dunce::canonicalize`).
 
 ## Open questions (must research before designing the recs)
 
