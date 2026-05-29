@@ -13,32 +13,46 @@ causing `run` to return early. The subsequent
 `finalize(..., amend=true, ...)` call are never reached when the
 plan is already in `finished/`.
 
+## Why `finalize()` cannot handle this directly
+
+`finalize()` assumes the plan still lives in `.clank/plans/`: it
+copies that file into `finished/`, falling back to writing an
+*empty* finished marker if the plan file is missing, then runs
+`git rm` on the (missing) plans path. Routing AlreadyFinished
+through `finalize(..., amend=true, ...)` would clobber the real
+finished marker with an empty file and fail on the `git rm`.
+
+So the amend-on-already-finished case needs its own path that
+does NOT touch the worktree files.
+
 ## Fix
 
-When `--amend` is set, skip the `AlreadyFinished` short-circuit.
-Concretely: route `--amend` through a path that does not call
-`dispatch_readiness` for the AlreadyFinished case. Two reasonable
-shapes —
+In `run`, branch on `(readiness, args.amend)`:
 
-1. In `run`, if `args.amend`, only treat `Blocked` as fatal;
-   `Ready` and `AlreadyFinished` both fall through to the
-   existing `head_is_finalize_for` check + `finalize(..., true, ...)`.
-2. Change `dispatch_readiness` to take `amend: bool` and return
-   `true` for `AlreadyFinished` when amending.
+- `Ready`, amend or not → existing `finalize(..., amend, msg)`.
+- `Blocked` → existing error.
+- `AlreadyFinished`, no amend → existing "already finished" no-op.
+- `AlreadyFinished` + amend → new `amend_already_finished()` path:
+  - require `head_is_finalize_for(stem)` (else bail as today);
+  - run `git commit --amend -m <msg>` (where `msg` is
+    `args.message` or the default `[<stem>] finish`);
+  - no file ops, no `git add`/`git rm`.
 
-Prefer (1) — keeps `dispatch_readiness` a pure decision on the
-preview.
+`dispatch_readiness` stays a pure preview decision; the amend
+case is handled by the caller, which already knows the amend
+flag.
 
 ## Tests
 
-Add a test in `finish.rs` tests module:
-- seed a repo, create a plan, finalize once, then call
-  `finalize(..., amend=true, message=Some("new msg"))` and assert
-  HEAD subject is the new message and `.clank/finished/<stem>.md`
-  still exists.
-
-(The CLI-level dispatch in `run` is harder to unit-test; the
-`finalize` function path is what changes behaviourally.)
+In `finish.rs` tests:
+- `amend_already_finished_rewrites_message`: seed repo, finalize
+  once (HEAD = `[foo] finish`), call `amend_already_finished`
+  with `Some("new msg")`, assert HEAD subject == `new msg` and
+  `.clank/finished/foo.md` is unchanged (non-empty, same content).
+- `amend_already_finished_rejects_when_head_is_not_finalize`:
+  after the finalize, add an unrelated commit on top, then call
+  the amend path; expect the same error as the existing
+  `--amend requires HEAD to be a finalize commit` check.
 
 ## Out of scope
 
