@@ -28,15 +28,26 @@ pub async fn run(args: FinishArgs) -> anyhow::Result<()> {
     let preview = crate::preview::build_finish_preview(&repo, &state, &plan_key)
         .await
         .map_err(|e| anyhow::anyhow!("finish preview failed: {e}"))?;
+
+    // Amend on an already-finished plan: rewrite HEAD's commit
+    // (e.g. to refresh a stale message). The finalize tree is
+    // already on disk, so skip the file-moving `finalize()` path.
+    if args.amend && matches!(preview.readiness, FinalizeReadiness::AlreadyFinished) {
+        require_head_is_finalize(&repo, &stem)?;
+        amend_already_finished(&repo, &stem, args.message.as_deref())?;
+        println!("amended HEAD with finalize tree for `{stem}`");
+        if args.purge || args.squash.is_some() {
+            run_post_finalize_rewrite(&repo, &plan_key, args).await?;
+        }
+        return Ok(());
+    }
+
     if !dispatch_readiness(&preview)? {
         return Ok(());
     }
 
-    if args.amend && !head_is_finalize_for(&repo, &stem)? {
-        anyhow::bail!(
-            "--amend requires HEAD to be a finalize commit for plan `{stem}`; \
-             run `clank finish` without --amend instead",
-        );
+    if args.amend {
+        require_head_is_finalize(&repo, &stem)?;
     }
 
     if args.dry && (args.purge || args.squash.is_some()) {
@@ -241,6 +252,26 @@ async fn finalize(
     Ok(())
 }
 
+fn amend_already_finished(
+    repo: &Path,
+    stem: &str,
+    message: Option<&str>,
+) -> anyhow::Result<()> {
+    let default_msg = format!("[{stem}] finish");
+    let msg = message.unwrap_or(&default_msg);
+    git_run(repo, &["commit", "--amend", "--quiet", "-m", msg])
+}
+
+fn require_head_is_finalize(repo: &Path, stem: &str) -> anyhow::Result<()> {
+    if !head_is_finalize_for(repo, stem)? {
+        anyhow::bail!(
+            "--amend requires HEAD to be a finalize commit for plan `{stem}`; \
+             run `clank finish` without --amend instead",
+        );
+    }
+    Ok(())
+}
+
 fn head_is_finalize_for(repo: &Path, stem: &str) -> anyhow::Result<bool> {
     let output = std::process::Command::new("git")
         .arg("-C")
@@ -344,6 +375,38 @@ mod tests {
             String::from_utf8(out.stdout).unwrap().trim(),
             "[foo] finish"
         );
+    }
+
+    #[tokio::test]
+    async fn amend_already_finished_rewrites_message_without_touching_finished_file() {
+        let dir = init_repo();
+        write_at(dir.path(), ".clank/plans/foo.md", "# foo body\n");
+        run_git(dir.path(), &["add", "-A"]);
+        run_git(dir.path(), &["commit", "--quiet", "-m", "seed"]);
+
+        let preview = mk_preview_ready();
+        finalize(dir.path(), "foo", &preview, false, None)
+            .await
+            .unwrap();
+
+        let finished = dir.path().join(".clank/finished/foo.md");
+        let original_body = std::fs::read_to_string(&finished).unwrap();
+        assert_eq!(original_body, "# foo body\n");
+
+        amend_already_finished(dir.path(), "foo", Some("custom amend message")).unwrap();
+
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir.path())
+            .args(["log", "-1", "--format=%s"])
+            .output()
+            .unwrap();
+        assert_eq!(
+            String::from_utf8(out.stdout).unwrap().trim(),
+            "custom amend message"
+        );
+
+        assert_eq!(std::fs::read_to_string(&finished).unwrap(), original_body);
     }
 
     #[tokio::test]
