@@ -34,6 +34,9 @@ pub async fn run(args: FinishArgs) -> anyhow::Result<()> {
     // already on disk, so skip the file-moving `finalize()` path.
     if args.amend && matches!(preview.readiness, FinalizeReadiness::AlreadyFinished) {
         require_head_is_finalize(&repo, &stem)?;
+        if args.dry && (args.purge || args.squash.is_some()) {
+            return dry_run_finish_composite(&stem, &preview, &args);
+        }
         amend_already_finished(&repo, &stem, args.message.as_deref())?;
         println!("amended HEAD with finalize tree for `{stem}`");
         if args.purge || args.squash.is_some() {
@@ -81,19 +84,27 @@ fn dry_run_finish_composite(
 ) -> anyhow::Result<()> {
     println!("# clank finish --dry preview");
     println!("# plan: {}", preview.plan_id);
-    println!("# would create finalize commit:");
+    let amending_existing = args.amend
+        && matches!(preview.readiness, FinalizeReadiness::AlreadyFinished);
+    if amending_existing {
+        println!("# would amend HEAD finalize commit:");
+    } else {
+        println!("# would create finalize commit:");
+    }
     let msg = args
         .message
         .as_deref()
         .map(str::to_string)
         .unwrap_or_else(|| format!("[{stem}] finish"));
     println!("#   message: {msg}");
-    let approvers: Vec<&str> = preview
-        .sealed_approvals
-        .iter()
-        .map(|a| a.author.as_str())
-        .collect();
-    println!("#   sealed approvals: {}", approvers.join(", "));
+    if !amending_existing {
+        let approvers: Vec<&str> = preview
+            .sealed_approvals
+            .iter()
+            .map(|a| a.author.as_str())
+            .collect();
+        println!("#   sealed approvals: {}", approvers.join(", "));
+    }
     println!("#");
     if args.purge && args.squash.is_some() {
         println!(
