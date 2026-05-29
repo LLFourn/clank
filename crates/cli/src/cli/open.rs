@@ -11,7 +11,7 @@ use clank_core::agent_config::AgentConfig;
 use clank_core::vocab::{Role, Tool};
 
 pub async fn run(args: OpenArgs) -> anyhow::Result<()> {
-    let response = inspect(&args.path).await;
+    let response = inspect(&args.path).await?;
     if args.json {
         println!("{}", serde_json::to_string_pretty(&response)?);
     } else {
@@ -103,20 +103,15 @@ pub enum Recommendation {
     },
 }
 
-async fn inspect(requested: &str) -> OpenResponse {
+async fn inspect(requested: &str) -> anyhow::Result<OpenResponse> {
     let mut warnings = Vec::<String>::new();
 
-    let exists = match std::fs::exists(requested) {
-        Ok(v) => v,
-        Err(e) => {
-            warnings.push(format!("path probe failed: {e}"));
-            false
-        }
-    };
+    let exists = std::fs::exists(requested)
+        .map_err(|e| anyhow::anyhow!("probing `{requested}` failed: {e}"))?;
 
     if !exists {
         let opened = lex_absolute(requested);
-        return OpenResponse {
+        return Ok(OpenResponse {
             requested_path: requested.to_string(),
             opened_path: opened.to_string_lossy().to_string(),
             state: OpenState::PathMissing,
@@ -139,30 +134,15 @@ async fn inspect(requested: &str) -> OpenResponse {
                 },
             ],
             warnings,
-        };
+        });
     }
 
-    let meta = match std::fs::metadata(requested) {
-        Ok(m) => m,
-        Err(e) => {
-            warnings.push(format!("stat failed: {e}"));
-            let opened = lex_absolute(requested);
-            return OpenResponse {
-                requested_path: requested.to_string(),
-                opened_path: opened.to_string_lossy().to_string(),
-                state: OpenState::PathNotDirectory,
-                repo_root: None,
-                git: None,
-                clank: None,
-                recommendations: vec![],
-                warnings,
-            };
-        }
-    };
+    let meta = std::fs::metadata(requested)
+        .map_err(|e| anyhow::anyhow!("stat `{requested}` failed: {e}"))?;
 
     if !meta.is_dir() {
         let opened = lex_absolute(requested);
-        return OpenResponse {
+        return Ok(OpenResponse {
             requested_path: requested.to_string(),
             opened_path: opened.to_string_lossy().to_string(),
             state: OpenState::PathNotDirectory,
@@ -171,7 +151,7 @@ async fn inspect(requested: &str) -> OpenResponse {
             clank: None,
             recommendations: vec![],
             warnings,
-        };
+        });
     }
 
     let opened = match dunce::canonicalize(requested) {
@@ -192,7 +172,7 @@ async fn inspect(requested: &str) -> OpenResponse {
             OpenState::DirectoryNotGit
         };
         let cwd = opened.to_string_lossy().to_string();
-        return OpenResponse {
+        return Ok(OpenResponse {
             requested_path: requested.to_string(),
             opened_path: cwd.clone(),
             state,
@@ -208,7 +188,7 @@ async fn inspect(requested: &str) -> OpenResponse {
                 },
             ],
             warnings,
-        };
+        });
     };
 
     let repo_root = git_probe.repo_root.clone();
@@ -227,7 +207,7 @@ async fn inspect(requested: &str) -> OpenResponse {
     let clank_config_path = repo_root.join(".clank/config.json");
     if !clank_config_path.is_file() {
         let cwd = repo_root.to_string_lossy().to_string();
-        return OpenResponse {
+        return Ok(OpenResponse {
             requested_path: requested.to_string(),
             opened_path: opened.to_string_lossy().to_string(),
             state: OpenState::GitWithoutClank,
@@ -242,7 +222,7 @@ async fn inspect(requested: &str) -> OpenResponse {
                 },
             ],
             warnings,
-        };
+        });
     }
 
     let (clank_info, agent_recs, fold_warning) =
@@ -251,7 +231,7 @@ async fn inspect(requested: &str) -> OpenResponse {
         warnings.push(w);
     }
 
-    OpenResponse {
+    Ok(OpenResponse {
         requested_path: requested.to_string(),
         opened_path: opened.to_string_lossy().to_string(),
         state: OpenState::ClankInitialized,
@@ -260,7 +240,7 @@ async fn inspect(requested: &str) -> OpenResponse {
         clank: Some(clank_info),
         recommendations: agent_recs,
         warnings,
-    }
+    })
 }
 
 fn lex_absolute(p: &str) -> PathBuf {

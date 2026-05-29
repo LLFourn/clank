@@ -338,6 +338,98 @@ fn warnings_field_omitted_when_empty() {
 }
 
 #[test]
+fn linked_worktree_git_dir_outside_repo_root() {
+    let home = tempfile::tempdir().unwrap();
+    let main = init_repo();
+    let main_repo = main.path();
+    std::fs::write(main_repo.join("README.md"), "x").unwrap();
+    git(main_repo, &["add", "-A"]);
+    git(main_repo, &["commit", "--quiet", "-m", "seed"]);
+
+    let linked_dir = tempfile::tempdir().unwrap();
+    let linked = linked_dir.path();
+    // git worktree add requires a non-existent path. Drop the
+    // tempdir's bookkeeping and let git create it.
+    let linked_path = linked.join("wt");
+    git(
+        main_repo,
+        &[
+            "worktree",
+            "add",
+            linked_path.to_str().unwrap(),
+            "-b",
+            "feature",
+        ],
+    );
+
+    let v = run_open(&linked_path, home.path());
+    assert_eq!(v["state"], "git_without_clank");
+    assert_eq!(v["git"]["is_linked_worktree"], true);
+    let git_dir = v["git"]["git_dir"].as_str().unwrap();
+    let repo_root = v["repo_root"].as_str().unwrap();
+    assert!(
+        !git_dir.starts_with(repo_root),
+        "linked-worktree git_dir should live outside repo_root: git_dir={git_dir} repo_root={repo_root}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn symlink_canonicalizes_to_target() {
+    let home = tempfile::tempdir().unwrap();
+    let dir = init_repo();
+    let repo = dir.path();
+    write(repo, ".clank/config.json", "{}");
+    git(repo, &["add", "-A"]);
+    git(repo, &["commit", "--quiet", "-m", "seed"]);
+
+    let link_parent = tempfile::tempdir().unwrap();
+    let link = link_parent.path().join("link-to-repo");
+    std::os::unix::fs::symlink(repo, &link).unwrap();
+
+    let v = run_open(&link, home.path());
+    assert_eq!(v["state"], "clank_initialized");
+    let opened = v["opened_path"].as_str().unwrap();
+    let canonical_target = dunce::canonicalize(repo)
+        .unwrap()
+        .to_string_lossy()
+        .to_string();
+    assert_eq!(
+        opened, canonical_target,
+        "opened_path should be canonical target, not the symlink path"
+    );
+}
+
+#[test]
+fn fold_failure_pushes_warning_but_keeps_clank_initialized() {
+    let home = tempfile::tempdir().unwrap();
+    let dir = init_repo();
+    let repo = dir.path();
+    write(repo, ".clank/config.json", "{}");
+    git(repo, &["add", "-A"]);
+    git(repo, &["commit", "--quiet", "-m", "seed"]);
+
+    // Point the branch ref at a non-existent object so `git log
+    // HEAD` errors — git still recognizes this as a repo (so we
+    // hit the ClankInitialized path) but the fold blows up
+    // walking history.
+    let head_ref = repo.join(".git/refs/heads/main");
+    std::fs::write(&head_ref, "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef\n").unwrap();
+
+    let v = run_open(repo, home.path());
+    assert_eq!(v["state"], "clank_initialized");
+    let warnings = v["warnings"].as_array().expect("warnings present");
+    assert!(
+        warnings.iter().any(|w| {
+            let s = w.as_str().unwrap_or("");
+            s.contains("fold failed")
+        }),
+        "expected a fold-failure warning, got: {warnings:?}"
+    );
+    assert_eq!(v["clank"]["active_plans"], 0);
+}
+
+#[test]
 fn lex_clean_for_missing_relative_path() {
     let home = tempfile::tempdir().unwrap();
     // Relative path; should be lex-cleaned to an absolute one
