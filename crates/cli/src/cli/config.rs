@@ -31,7 +31,7 @@ pub struct ReviewConfig {
 impl Default for ReviewConfig {
     fn default() -> Self {
         Self {
-            adhoc_feedback: true,
+            adhoc_feedback: false,
             plan_feedback: true,
             require_commit_prefix: false,
         }
@@ -168,7 +168,7 @@ pub static KEY_CATALOG: &[KeyDef] = &[
         section: "review",
         name: "adhoc_feedback",
         type_desc: "bool",
-        default: "true",
+        default: "false",
         help: "Require review for ad-hoc (non-plan) commits",
     },
     KeyDef {
@@ -538,10 +538,33 @@ mod tests {
     fn defaults_when_no_files() {
         let tmp = tempfile::tempdir().unwrap();
         let cfg = load_isolated(tmp.path());
-        assert!(cfg.review.adhoc_feedback);
+        assert!(!cfg.review.adhoc_feedback);
         assert!(cfg.review.plan_feedback);
         assert!(!cfg.review.require_commit_prefix);
         assert!(cfg.hooks.is_empty());
+    }
+
+    #[test]
+    fn key_catalog_defaults_match_review_config_default() {
+        let defaults = ReviewConfig::default();
+        let by_name = |name: &str| {
+            KEY_CATALOG
+                .iter()
+                .find(|k| k.section == "review" && k.name == name)
+                .unwrap_or_else(|| panic!("KEY_CATALOG missing review.{name}"))
+        };
+        assert_eq!(
+            by_name("adhoc_feedback").default,
+            defaults.adhoc_feedback.to_string()
+        );
+        assert_eq!(
+            by_name("plan_feedback").default,
+            defaults.plan_feedback.to_string()
+        );
+        assert_eq!(
+            by_name("require_commit_prefix").default,
+            defaults.require_commit_prefix.to_string()
+        );
     }
 
     #[test]
@@ -575,7 +598,8 @@ mod tests {
         let repo_cfg = tmp.path().join(".clank/config.json");
         write(&repo_cfg, "not valid json");
         let cfg = load_isolated(tmp.path());
-        assert!(cfg.review.adhoc_feedback);
+        assert!(cfg.review.plan_feedback);
+        assert!(!cfg.review.adhoc_feedback);
     }
 
     #[test]

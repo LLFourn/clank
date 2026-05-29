@@ -1002,6 +1002,48 @@ fn wfw_reviewer_no_plans_still_blocks() {
 }
 
 #[test]
+fn wfw_fresh_repo_does_not_surface_adhoc_review_by_default() {
+    // A repo with no `.clank/` config and a plain commit must not
+    // surface AdHocReview work to a reviewer. The default for
+    // review.adhoc_feedback is `false`, so wfw should time out
+    // cleanly (exit 2) instead of pulling the commit in for review.
+    let dir = init_repo();
+    let repo = dir.path();
+    write(repo, "README.md", "# repo\n");
+    commit(repo, "init");
+
+    let output = clank_cmd(repo)
+        .args([
+            "wfw",
+            "--no-poll",
+            "--author",
+            "alice",
+            "--role",
+            "reviewers",
+            "--timeout",
+            "1s",
+        ])
+        .arg("--repo")
+        .arg(repo)
+        .output()
+        .expect("spawn clank wfw");
+
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "expected timeout exit 2 (no adhoc work by default); got {:?} stdout=`{}` stderr=`{}`",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        !stdout.contains("adhoc_review") && !stdout.contains("AdHocReview"),
+        "no adhoc work should be emitted; got: {stdout}"
+    );
+}
+
+#[test]
 fn wfw_master_with_active_plan_still_blocks() {
     // Regression guard: master with an active plan that is currently
     // waiting on reviewers must still block — reviewer feedback can

@@ -48,7 +48,7 @@ pub struct ConfigKeyArgs {
 
 #[derive(clap::Subcommand, Debug)]
 pub enum ConfigKey {
-    /// Require review for ad-hoc (non-plan) commits. bool, default: true.
+    /// Require review for ad-hoc (non-plan) commits. bool, default: false.
     #[command(name = "review.adhoc_feedback", alias = "review_adhoc_feedback")]
     ReviewAdhocFeedback(ConfigKeyArgs),
     /// Require review for plan-attributed commits. bool, default: true.
