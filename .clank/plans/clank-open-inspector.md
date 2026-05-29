@@ -25,19 +25,37 @@ separate `gitdir`). Looking for a literal `.git/` directly under
 
 Inspector contract:
 
-- Canonicalize `<path>` with `dunce::canonicalize` (matches
-  `crates/cli/src/cli/mod.rs:resolve_repo`).
-- Probe git with `git -C <canonical> rev-parse --show-toplevel`
+- Always echo the editor's input back as `requested_path` (the
+  literal string given, before any normalization). This is what
+  the editor used; it should not change shape on the way back.
+- Check `requested_path` for existence with `try_exists`.
+  - **Missing** → return `PathMissing` immediately. Do NOT
+    canonicalize (`dunce::canonicalize` errors on missing
+    paths). `opened_path` is set to the *lexically-cleaned*
+    `requested_path` (e.g. trim trailing slash, resolve `..`
+    against cwd) so it's an absolute path the editor can act on,
+    but no symlink resolution happens. `repo_root`, `git`, and
+    `clank` are absent / null in this response.
+  - **Not a directory** → return `PathNotDirectory`; same
+    nullable-fields treatment as above.
+  - **Exists and is a directory** → canonicalize with
+    `dunce::canonicalize` (matches
+    `crates/cli/src/cli/mod.rs:resolve_repo`). The result is
+    `opened_path`. Continue.
+- Probe git with `git -C <opened_path> rev-parse --show-toplevel`
   AND `--git-dir`. Success on both → `repo_root` =
   `--show-toplevel`, `git_dir` = `--git-dir` (these differ for
   linked worktrees).
 - Classification keys off `repo_root`, not off `<path>` itself.
   In particular, `.clank/config.json` is looked up at
   `repo_root/.clank/config.json`.
-- Both `opened_path` and `repo_root` are returned to the editor
-  so it knows the original input and the canonical project root.
+- All of `opened_path`, `repo_root`, and `requested_path` are
+  returned to the editor: original input, canonical opened path,
+  and canonical project root. The first is always present; the
+  latter two are nullable per state (see below).
 - If `<path>` exists but git rev-parse fails (no repo found
-  walking up), we fall through to `DirectoryNotGit`.
+  walking up), we fall through to `EmptyDirectory` or
+  `DirectoryNotGit` and `repo_root` / `git_dir` are null.
 
 ## States to distinguish
 
@@ -81,14 +99,26 @@ top-level `state` values.)
 
 ## Proposed response shape (JSON)
 
+Field presence per state:
+
+| state               | requested_path | opened_path | repo_root | git  | clank |
+| ------------------- | -------------- | ----------- | --------- | ---- | ----- |
+| PathMissing         | yes            | yes (lex)   | null      | null | null  |
+| PathNotDirectory    | yes            | yes (lex)   | null      | null | null  |
+| EmptyDirectory      | yes            | yes (canon) | null      | null | null  |
+| DirectoryNotGit     | yes            | yes (canon) | null      | null | null  |
+| GitWithoutClank     | yes            | yes (canon) | yes       | yes  | null  |
+| ClankInitialized    | yes            | yes (canon) | yes       | yes  | yes   |
+
 ```json
 {
-  "opened_path": "/abs/path/maybe/sub/dir",
-  "repo_root": "/abs/path",
+  "requested_path": "~/code/myproj/sub",
+  "opened_path": "/Users/me/code/myproj/sub",
+  "repo_root": "/Users/me/code/myproj",
   "state": "ClankInitialized",
   "git": {
     "is_repo": true,
-    "git_dir": "/abs/path/.git",
+    "git_dir": "/Users/me/code/myproj/.git",
     "is_linked_worktree": false,
     "head_branch": "main",
     "detached_head": false,
@@ -152,6 +182,15 @@ six top-level states, but the path-handling cases:
   editors but worth a defined behavior).
 - Symlinked path resolves to the same identity as the canonical
   one (regression on `dunce::canonicalize`).
+- `PathMissing` for a path under a non-existent parent returns a
+  cleanly-rendered `opened_path` and explicit nulls for
+  `repo_root` / `git` / `clank`, NOT a generic canonicalize
+  error. (Guards the contract spelled out in "Path handling".)
+- `PathMissing` for a path with a `~` prefix: the editor's
+  shell-expansion is not our problem, but verify we don't
+  silently treat `~/foo` as a literal directory name. (We
+  document `requested_path` as "literal input"; tests pin that
+  behavior.)
 
 ## Open questions (must research before designing the recs)
 
