@@ -13,6 +13,12 @@ true`.
 
 - `crates/cli/src/cli/config.rs:34` — `adhoc_feedback: true` →
   `false` in `ReviewConfig::default`.
+- `crates/cli/src/cli/config.rs:171` — `KEY_CATALOG`
+  `adhoc_feedback` entry: `default: "true"` → `"false"` so
+  `clank config` listings stay truthful.
+- `crates/cli/src/cli/mod.rs:51` — clap doc comment on
+  `ReviewAdhocFeedback`: `default: true` → `default: false` so
+  `clank config --help` stays truthful.
 - `crates/cli/src/cli/config.rs:541` — flip the default-true
   assertion to default-false. Other config tests already write
   their own value and are unaffected.
@@ -27,6 +33,10 @@ true`.
   config and one plain commit, run `clank wfw --timeout 1s`
   with reviewer identity, assert it exits with the empty-work
   timeout code and emits no AdHocReview item.
+- Extend the existing `KEY_CATALOG` test (or add one) to assert
+  the `adhoc_feedback` entry's `default` string matches the
+  Rust default — wired through `ReviewConfig::default()` so the
+  two cannot drift again.
 
 ## Out of scope
 
