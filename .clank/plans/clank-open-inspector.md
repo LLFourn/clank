@@ -44,15 +44,23 @@ Inspector contract:
     `opened_path`. Continue.
 - Probe git with `git -C <opened_path> rev-parse --show-toplevel`
   AND `--git-dir`. Success on both → `repo_root` =
-  `--show-toplevel`, `git_dir` = `--git-dir` (these differ for
-  linked worktrees).
+  `--show-toplevel` (already absolute); `git_dir` =
+  `--git-dir` resolved through the same normalization that
+  `crates/cli/src/cli/status.rs:git_resolve_dir` uses today:
+  relative output (`.git` when run at the repo root) is joined
+  to `opened_path`, then `dunce::canonicalize` is applied with
+  the raw absolute as a fallback. The wire value is always an
+  absolute canonical path. For linked worktrees this resolves
+  to the external worktree-specific gitdir, distinct from
+  `repo_root`.
 - Classification keys off `repo_root`, not off `<path>` itself.
   In particular, `.clank/config.json` is looked up at
   `repo_root/.clank/config.json`.
-- All of `opened_path`, `repo_root`, and `requested_path` are
-  returned to the editor: original input, canonical opened path,
-  and canonical project root. The first is always present; the
-  latter two are nullable per state (see below).
+- `requested_path` (the editor's literal input) and
+  `opened_path` (lex-cleaned for missing/non-dir states,
+  canonicalized otherwise) are ALWAYS present. `repo_root`,
+  `git`, and `clank` are present per the nullability table
+  below.
 - If `<path>` exists but git rev-parse fails (no repo found
   walking up), we fall through to `EmptyDirectory` or
   `DirectoryNotGit` and `repo_root` / `git_dir` are null.
@@ -191,6 +199,12 @@ six top-level states, but the path-handling cases:
   silently treat `~/foo` as a literal directory name. (We
   document `requested_path` as "literal input"; tests pin that
   behavior.)
+- `git_dir` is always an absolute canonical path, including
+  when probing FROM the repo root (where raw `git rev-parse
+  --git-dir` returns the literal string `.git`). Test asserts
+  the response value is `repo_root/.git` canonicalized, not
+  `.git`. Same test must cover a linked worktree where
+  `git_dir` lives outside `repo_root`.
 
 ## Open questions (must research before designing the recs)
 
