@@ -18,6 +18,7 @@ pub mod feedback;
 pub mod finish;
 pub mod init;
 pub mod log;
+pub mod open;
 pub mod plan_resolve;
 pub mod purge;
 pub mod rewrite;
@@ -104,6 +105,16 @@ pub struct LogArgs {
     /// Compact one-line-per-commit output.
     #[arg(long)]
     pub oneline: bool,
+}
+
+#[derive(Args, Debug)]
+pub struct OpenArgs {
+    /// Path to inspect. Echoed back verbatim as `requested_path`;
+    /// not canonicalized until existence is confirmed.
+    pub path: String,
+    /// Emit the response as JSON.
+    #[arg(short = 'j', long)]
+    pub json: bool,
 }
 
 #[derive(Args, Debug)]

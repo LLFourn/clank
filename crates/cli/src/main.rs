@@ -27,6 +27,11 @@ enum Command {
     /// Print a chronological timeline of commits and reviews for
     /// a plan.
     Log(cli::LogArgs),
+    /// Inspect a path: classify what's there (no repo / git
+    /// without clank / clank initialized) and return enough
+    /// structured data for an editor to drive its own bootstrap.
+    /// Read-only; never mutates.
+    Open(cli::OpenArgs),
     /// Print the repo's Clank state (HEAD, plans, phases).
     Status(cli::StatusArgs),
     /// Wait-for-work: block until the calling agent has actionable
@@ -78,6 +83,7 @@ async fn main() -> anyhow::Result<()> {
         Command::Queue(args) => cli::queue::run(args).await,
         Command::Purge(args) => cli::purge::run(args).await,
         Command::Log(args) => cli::log::run(args).await,
+        Command::Open(args) => cli::open::run(args).await,
         Command::Status(args) => cli::status::run(args).await,
         Command::Wfw(args) => cli::wfw::run(args).await,
         Command::Feedback(args) => cli::feedback::run(args).await,
