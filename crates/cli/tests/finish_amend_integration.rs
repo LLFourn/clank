@@ -93,6 +93,39 @@ fn finish_amend_dry_purge_does_not_mutate_head_when_already_finished() {
 }
 
 #[test]
+fn finish_rejects_plan_only_approval() {
+    // Plan intro is approved, but no code commit has landed.
+    // clank finish must refuse — wfw would route this to
+    // MasterToImplement, not MasterToFinalize.
+    let dir = init_repo();
+    let repo = dir.path();
+    write(repo, ".clank/plans/foo.md", "# foo\n");
+    git(repo, &["add", "-A"]);
+    git(repo, &["commit", "--quiet", "-m", "[foo] intro"]);
+    let intro_sha = head_sha(repo);
+    write(
+        repo,
+        &format!(".clank/agents/codex/feedback/{intro_sha}.md"),
+        "APPROVE\n\nplan looks good\n",
+    );
+    git(repo, &["add", "-A"]);
+    git(repo, &["commit", "--quiet", "-m", "approve plan"]);
+
+    let out = run_clank(repo, &["finish", "foo"]);
+    assert!(
+        !out.status.success(),
+        "clank finish should refuse plan-only approval; got stdout=`{}` stderr=`{}`",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("plan-only") || stderr.contains("implementation"),
+        "expected error to mention impl approval; got: {stderr}"
+    );
+}
+
+#[test]
 fn finish_amend_no_dry_rewrites_head_message_when_already_finished() {
     let dir = repo_with_finished_foo();
     let repo = dir.path();

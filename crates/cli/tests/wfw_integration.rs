@@ -560,10 +560,17 @@ fn wfw_reviewer_finish_wake_human_output() {
     write(repo, ".clank/plans/foo.md", "# foo\n");
     commit(repo, "[foo] intro");
     let intro_sha = head_sha(repo);
-
     write(
         repo,
         &format!(".clank/agents/alice/feedback/{intro_sha}.md"),
+        "APPROVE\n\nlgtm\n",
+    );
+    write(repo, "src/lib.rs", "// impl\n");
+    commit(repo, "[foo] impl");
+    let impl_sha = head_sha(repo);
+    write(
+        repo,
+        &format!(".clank/agents/alice/feedback/{impl_sha}.md"),
         "APPROVE\n\nlgtm\n",
     );
 
@@ -606,6 +613,14 @@ fn wfw_reviewer_finish_wake_json_output() {
     write(
         repo,
         &format!(".clank/agents/alice/feedback/{intro_sha}.md"),
+        "APPROVE\n\nlgtm\n",
+    );
+    write(repo, "src/lib.rs", "// impl\n");
+    commit(repo, "[foo] impl");
+    let impl_sha = head_sha(repo);
+    write(
+        repo,
+        &format!(".clank/agents/alice/feedback/{impl_sha}.md"),
         "APPROVE\n\nlgtm\n",
     );
 
@@ -656,6 +671,14 @@ fn wfw_plan_filter_finish_wake() {
     write(
         repo,
         &format!(".clank/agents/alice/feedback/{intro_sha}.md"),
+        "APPROVE\n",
+    );
+    write(repo, "src/lib.rs", "// impl\n");
+    commit(repo, "[foo] impl");
+    let impl_sha = head_sha(repo);
+    write(
+        repo,
+        &format!(".clank/agents/alice/feedback/{impl_sha}.md"),
         "APPROVE\n",
     );
 
@@ -712,6 +735,16 @@ fn wfw_mixed_work_and_finished_on_one_wake() {
     write(
         repo,
         &format!(".clank/agents/alice/feedback/{b_intro}.md"),
+        "APPROVE\n",
+    );
+    // `b` needs an approved code-touching commit before it can
+    // be finalized.
+    write(repo, "src/b.rs", "// impl b\n");
+    commit(repo, "[b] impl");
+    let b_impl = head_sha(repo);
+    write(
+        repo,
+        &format!(".clank/agents/alice/feedback/{b_impl}.md"),
         "APPROVE\n",
     );
 
@@ -827,6 +860,14 @@ fn wfw_plan_already_finished_at_startup_emits_finished_and_exits() {
     write(
         repo,
         &format!(".clank/agents/alice/feedback/{intro_sha}.md"),
+        "APPROVE\n",
+    );
+    write(repo, "src/lib.rs", "// impl\n");
+    commit(repo, "[foo] impl");
+    let impl_sha = head_sha(repo);
+    write(
+        repo,
+        &format!(".clank/agents/alice/feedback/{impl_sha}.md"),
         "APPROVE\n",
     );
     clank_run(repo, &["finish", "foo"]);

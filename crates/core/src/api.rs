@@ -109,6 +109,10 @@ pub enum FinalizeBlockReason {
     GateNotApproved {
         state: crate::vocab::CommitGateState,
     },
+    /// Gate is approved but the approved commit only touched the
+    /// plan file — no implementation has been approved yet.
+    /// Matches `wfw`'s `MasterToImplement` routing.
+    ImplementationNotApproved,
     PlanFileMissing,
     PlanFileDirty,
 }

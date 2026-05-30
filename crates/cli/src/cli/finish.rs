@@ -210,6 +210,9 @@ fn reason_to_msg(reason: &FinalizeBlockReason) -> String {
         FinalizeBlockReason::GateNotApproved { state } => {
             format!("gate is {} (need approved)", state.as_str())
         }
+        FinalizeBlockReason::ImplementationNotApproved => {
+            "approved commit is plan-only; commit and approve an implementation first".into()
+        }
         FinalizeBlockReason::PlanFileMissing => "plan file is missing from the worktree".into(),
         FinalizeBlockReason::PlanFileDirty => {
             "plan file has uncommitted changes; commit or stash first".into()

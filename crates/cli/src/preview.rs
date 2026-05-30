@@ -75,13 +75,16 @@ pub async fn build_finish_preview(
         return Err(PreviewError::PlanHidden(plan_id_str));
     }
 
-    let latest_reviewable_sha = active.and_then(latest_reviewable_sha);
+    let latest = active.and_then(latest_reviewable);
+    let latest_reviewable_sha = latest.as_ref().map(|(sha, _)| sha.clone());
+    let latest_touched_code = latest.as_ref().is_some_and(|(_, tc)| *tc);
 
     let gate_state = compute_gate(repo_root, latest_reviewable_sha.as_ref())?;
 
     let readiness = compute_finalize_readiness(
         is_finished,
         latest_reviewable_sha.as_ref(),
+        latest_touched_code,
         gate_state,
         worktree_status,
     );
@@ -396,10 +399,14 @@ pub fn classify_from_tree(
     }
 }
 
-/// Compute finalize readiness from the four observable signals.
+/// Compute finalize readiness from the observable signals.
+/// `latest_reviewable_touched_code` is whether the approved
+/// commit touched code (not just the plan file); finalize is
+/// blocked when the gate is approved on a plan-only commit.
 pub fn compute_finalize_readiness(
     is_finished: bool,
     latest_reviewable_sha: Option<&CommitSha>,
+    latest_reviewable_touched_code: bool,
     gate_state: CommitGateState,
     worktree_status: PlanWorktreeStatus,
 ) -> FinalizeReadiness {
@@ -412,6 +419,8 @@ pub fn compute_finalize_readiness(
     }
     if gate_state != CommitGateState::Approved {
         reasons.push(FinalizeBlockReason::GateNotApproved { state: gate_state });
+    } else if !latest_reviewable_touched_code {
+        reasons.push(FinalizeBlockReason::ImplementationNotApproved);
     }
     match worktree_status {
         PlanWorktreeStatus::PlanFileMissing => {
@@ -429,14 +438,15 @@ pub fn compute_finalize_readiness(
     }
 }
 
-/// The plan's latest reviewable commit SHA (last touched_plan ||
-/// touched_code event). `None` when the plan has no commits yet.
-fn latest_reviewable_sha(ps: &clank_core::repo_state::PlanState) -> Option<CommitSha> {
+/// The plan's latest reviewable commit (last touched_plan ||
+/// touched_code event), with whether it touched code. `None`
+/// when the plan has no commits yet.
+fn latest_reviewable(ps: &clank_core::repo_state::PlanState) -> Option<(CommitSha, bool)> {
     ps.commits
         .iter()
         .rev()
         .find(|e| e.touched_plan || e.touched_code)
-        .map(|e| e.sha.clone())
+        .map(|e| (e.sha.clone(), e.touched_code))
 }
 
 fn compute_gate(
@@ -533,5 +543,39 @@ mod tests {
             !shared.foreign,
             "shared `[a,b]` commit must be attributed to b too (historical classifier context)",
         );
+    }
+
+    #[test]
+    fn finalize_blocked_when_approved_commit_is_plan_only() {
+        let sha = CommitSha::parse(&"a".repeat(40)).unwrap();
+        let readiness = compute_finalize_readiness(
+            false,
+            Some(&sha),
+            false, // plan-only approval
+            CommitGateState::Approved,
+            PlanWorktreeStatus::Clean,
+        );
+        match readiness {
+            FinalizeReadiness::Blocked { reasons } => {
+                assert!(
+                    reasons.contains(&FinalizeBlockReason::ImplementationNotApproved),
+                    "expected ImplementationNotApproved; got {reasons:?}"
+                );
+            }
+            other => panic!("expected Blocked, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn finalize_ready_when_approved_commit_touched_code() {
+        let sha = CommitSha::parse(&"a".repeat(40)).unwrap();
+        let readiness = compute_finalize_readiness(
+            false,
+            Some(&sha),
+            true, // code-touching approval
+            CommitGateState::Approved,
+            PlanWorktreeStatus::Clean,
+        );
+        assert!(matches!(readiness, FinalizeReadiness::Ready));
     }
 }
