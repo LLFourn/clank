@@ -3,7 +3,7 @@
 //! Pure data. CLI scans
 //! `.clank/agents/<author>/feedback/<plan>/<commit-ref>.md`
 //! files (see `clank::feedback_scan`) and hands the result here;
-//! `plan_view::project` consumes it.
+//! `wait::compute_gate` (and `RepoState::derive_status`) consume it.
 
 use std::collections::{BTreeMap, BTreeSet};
 

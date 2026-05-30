@@ -1,26 +1,23 @@
-//! Agent-perspective wait surface for `clank wfw`.
+//! Gate computation and agent-perspective wait surface.
 //!
-//! Two things:
-//!
-//! 1. `derive_work` — pure filter over `[PlanView]` for the
-//!    calling agent's role + label. Emits `WaitItem::Master` and
-//!    `WaitItem::Reviewer` only.
-//! 2. `detect_finished` — pure comparison between a startup
-//!    snapshot of "plans this wfw is watching" and the current
-//!    `RepoState`. Emits `WaitItem::Finished` for every watched
-//!    plan that newly transitioned into `finished_plans` since
-//!    startup.
-//!
-//! Both produce `Vec<WaitItem>`; `wfw` concatenates them and
-//! emits whatever's non-empty as one round's outcome. Empty means
-//! "keep blocking."
+//! - [`compute_gate`] — the single gate-state function.
+//!   Maps a commit's review set to one of
+//!   [`CommitGateState::{Unreviewed, Approved, Finished,
+//!   ChangesRequested}`](crate::vocab::CommitGateState).
+//! - [`RepoState::derive_status`] (impl on `RepoState`) — folds
+//!   `compute_gate` over every plan and produces the
+//!   role-flavored [`WaitItem`]s `clank wfw` emits.
+//! - [`detect_finished`] — pure comparison between a startup
+//!   snapshot of watched plans and the current `RepoState`.
+//!   Emits `WaitItem::Finished` for every watched plan that
+//!   newly transitioned into `finished_plans` since startup.
 
 use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 
 use crate::ids::{AgentLabel, CommitSha, PlanKey};
-use crate::plan_view::{PlanView, WaitingOn};
+use crate::plan_view::WaitingOn;
 use crate::repo_state::RepoState;
 use crate::vocab::{Role, WaitingReason};
 
@@ -353,54 +350,6 @@ impl WorkStatus {
     }
 }
 
-// ── Legacy derive_work (kept for now) ──────────────────
-
-pub fn derive_work(views: &[PlanView], author: &AgentLabel, role: Role) -> Vec<WaitItem> {
-    let mut out = Vec::new();
-    for view in views {
-        match (role, &view.waiting_on) {
-            (Role::Master, WaitingOn::MasterToRevise { .. }) => {
-                out.push(master(
-                    view,
-                    MasterNext::Revise,
-                    WaitingReason::AddressCommitChanges,
-                ));
-            }
-            (Role::Master, WaitingOn::MasterToCommit) => {
-                out.push(master(
-                    view,
-                    MasterNext::Commit,
-                    WaitingReason::CommitPlanRevision,
-                ));
-            }
-            (Role::Master, WaitingOn::MasterToContinue) => {
-                out.push(master(
-                    view,
-                    MasterNext::Continue,
-                    WaitingReason::GateApproved,
-                ));
-            }
-            (Role::Master, WaitingOn::MasterToFinalize) => {
-                out.push(master(
-                    view,
-                    MasterNext::Finalize,
-                    WaitingReason::ReadyToFinalize,
-                ));
-            }
-            (Role::Reviewers, WaitingOn::FirstReview) => {
-                out.push(reviewer_item(view, author));
-            }
-            (Role::Reviewers, WaitingOn::ReviewerApprovalsMissing { missing })
-                if missing.iter().any(|a| a == author) =>
-            {
-                out.push(reviewer_item(view, author));
-            }
-            _ => {}
-        }
-    }
-    out
-}
-
 /// Plan-key-ordered `Finished` items for every watched plan that
 /// transitioned into `finished_plans` since the snapshot. Re-intro /
 /// re-finalize cycles produce a new item iff the `finalized_at`
@@ -429,36 +378,10 @@ pub fn detect_finished(snapshot: &StartupSnapshot, current: &RepoState) -> Vec<W
         .collect()
 }
 
-fn master(view: &PlanView, next: MasterNext, reason: WaitingReason) -> WaitItem {
-    WaitItem::Master {
-        plan: view.plan.clone(),
-        sha: view.latest_reviewable_sha.clone(),
-        next,
-        reason,
-        gate: view.gate_state,
-    }
-}
-
-fn reviewer_item(view: &PlanView, author: &AgentLabel) -> WaitItem {
-    use crate::feedback_view::{filename_mode, filename_stem};
-    let mode = filename_mode(&view.reviewable_shas);
-    let stem = filename_stem(&view.latest_reviewable_sha, mode);
-    let path = format!(
-        ".clank/agents/{}/feedback/{}.md",
-        author.as_str(),
-        stem,
-    );
-    WaitItem::Reviewer {
-        plan: view.plan.clone(),
-        sha: view.latest_reviewable_sha.clone(),
-        feedback_path: path,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::repo_state::{FinishedPlan, NonEmptyVec, PlanState};
+    use crate::repo_state::{FinishedPlan, PlanState};
     use crate::vocab::{CommitGateState, PlanWorktreeStatus};
 
     fn plan(s: &str) -> PlanKey {
@@ -469,39 +392,6 @@ mod tests {
     }
     fn label(s: &str) -> AgentLabel {
         AgentLabel::parse(s).unwrap()
-    }
-
-    fn view(plan_key: &str, sha_hex: &str, waiting: WaitingOn) -> PlanView {
-        let latest = sha(sha_hex);
-        PlanView {
-            plan: plan(plan_key),
-            latest_reviewable_sha: latest.clone(),
-            reviewable_shas: vec![latest],
-            gate_state: CommitGateState::Unreviewed,
-            waiting_on: waiting,
-            worktree_status: PlanWorktreeStatus::Clean,
-            last_activity_ts: 0,
-        }
-    }
-
-    // ============ derive_work ============
-
-    #[test]
-    fn master_picks_master_flavored_plans() {
-        let views = vec![
-            view("a", "aaaa", WaitingOn::MasterToFinalize),
-            view("b", "bbbb", WaitingOn::FirstReview),
-        ];
-        let out = derive_work(&views, &label("master"), Role::Master);
-        assert_eq!(out.len(), 1);
-        assert!(matches!(
-            out[0],
-            WaitItem::Master {
-                next: MasterNext::Finalize,
-                reason: WaitingReason::ReadyToFinalize,
-                ..
-            }
-        ));
     }
 
     fn entry(verdict: crate::vocab::Verdict, who: &str) -> ReviewEntry {
@@ -542,114 +432,20 @@ mod tests {
     }
 
     #[test]
+    fn compute_gate_finished_when_other_participant_silent_on_latest() {
+        // Regression: under the old plan_view::evaluate model,
+        // Alice having ever-reviewed required her to vote on the
+        // latest commit. The new model: any single FINISHED on
+        // the latest commit's review set is enough, regardless
+        // of who else hasn't voted.
+        let reviews = [entry(crate::vocab::Verdict::Finished, "bob")];
+        assert_eq!(compute_gate(&reviews), CommitGateState::Finished);
+    }
+
+    #[test]
     fn compute_gate_unmarked_treated_as_changes() {
         let reviews = [entry(crate::vocab::Verdict::Unmarked, "alice")];
         assert_eq!(compute_gate(&reviews), CommitGateState::ChangesRequested);
-    }
-
-    #[test]
-    fn master_to_continue_emits_continue_with_gate_approved() {
-        let views = vec![view("a", "aaaa", WaitingOn::MasterToContinue)];
-        let out = derive_work(&views, &label("anybody"), Role::Master);
-        assert_eq!(out.len(), 1);
-        assert!(matches!(
-            out[0],
-            WaitItem::Master {
-                next: MasterNext::Continue,
-                reason: WaitingReason::GateApproved,
-                ..
-            }
-        ));
-    }
-
-    #[test]
-    fn reviewer_picks_first_review_unconditionally() {
-        let views = vec![view("a", "aaaa", WaitingOn::FirstReview)];
-        let out = derive_work(&views, &label("anyone"), Role::Reviewers);
-        assert_eq!(out.len(), 1);
-        match &out[0] {
-            WaitItem::Reviewer { feedback_path, .. } => {
-                assert!(
-                    feedback_path.starts_with(".clank/agents/anyone/feedback/"),
-                    "got {feedback_path}"
-                );
-                assert!(feedback_path.ends_with(".md"));
-            }
-            other => panic!("expected Reviewer, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn reviewer_path_uses_short_sha_for_unique_prefixes() {
-        // Build a view with a real 40-char latest sha + a
-        // singleton reviewable scope. Short mode applies.
-        let plan_key = plan("p");
-        let latest = CommitSha::parse("abcdef0111111111111111111111111111111111").unwrap();
-        let v = PlanView {
-            plan: plan_key,
-            latest_reviewable_sha: latest.clone(),
-            reviewable_shas: vec![latest],
-            gate_state: CommitGateState::Unreviewed,
-            waiting_on: WaitingOn::FirstReview,
-            worktree_status: PlanWorktreeStatus::Clean,
-            last_activity_ts: 0,
-        };
-        let out = derive_work(std::slice::from_ref(&v), &label("alice"), Role::Reviewers);
-        match &out[0] {
-            WaitItem::Reviewer { feedback_path, .. } => {
-                assert_eq!(feedback_path, ".clank/agents/alice/feedback/abcdef0.md");
-            }
-            other => panic!("expected Reviewer, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn reviewer_path_uses_full_sha_for_colliding_short_prefix() {
-        let plan_key = plan("p");
-        let a = CommitSha::parse("abcdef0111111111111111111111111111111111").unwrap();
-        let b = CommitSha::parse("abcdef0222222222222222222222222222222222").unwrap();
-        let v = PlanView {
-            plan: plan_key,
-            latest_reviewable_sha: b.clone(),
-            reviewable_shas: vec![a, b.clone()],
-            gate_state: CommitGateState::Unreviewed,
-            waiting_on: WaitingOn::FirstReview,
-            worktree_status: PlanWorktreeStatus::Clean,
-            last_activity_ts: 0,
-        };
-        let out = derive_work(std::slice::from_ref(&v), &label("alice"), Role::Reviewers);
-        match &out[0] {
-            WaitItem::Reviewer { feedback_path, .. } => {
-                assert_eq!(
-                    feedback_path,
-                    &format!(".clank/agents/alice/feedback/{}.md", b.as_str())
-                );
-            }
-            other => panic!("expected Reviewer, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn reviewer_picks_missing_only_when_author_in_set() {
-        let missing = NonEmptyVec::new(vec![label("alice"), label("bob")]).unwrap();
-        let views = vec![view(
-            "a",
-            "aaaa",
-            WaitingOn::ReviewerApprovalsMissing { missing },
-        )];
-
-        let bob = derive_work(&views, &label("bob"), Role::Reviewers);
-        assert_eq!(bob.len(), 1);
-
-        let carol = derive_work(&views, &label("carol"), Role::Reviewers);
-        assert!(carol.is_empty());
-    }
-
-    #[test]
-    fn master_skips_reviewer_states() {
-        let views = vec![view("a", "aaaa", WaitingOn::FirstReview)];
-        let out = derive_work(&views, &label("master"), Role::Master);
-        assert!(out.is_empty());
     }
 
     // ============ detect_finished ============

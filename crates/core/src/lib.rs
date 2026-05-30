@@ -21,14 +21,15 @@
 //!   `.clank/agents/<author>/feedback/<plan-or-_>/<ref>.md` files.
 //! - [`feedback_view`] — typed `FeedbackView` of one plan's review
 //!   files. Pure data; the CLI scans the filesystem into this shape
-//!   and feeds it to `plan_view::project`.
-//! - [`plan_view`] — per-plan projection: `gate_state`,
-//!   `WaitingOn`, `worktree_status`. The single source of truth
-//!   `status` and `wfw` both project from.
-//! - [`wait`] — agent-perspective wait surface for `clank wfw`:
-//!   the flat tagged `WaitItem` enum (`Master` / `Reviewer` /
-//!   `Finished`), `derive_work`, and `detect_finished`. Consumed
-//!   by `wfw`; not by `status`.
+//!   and feeds it to gate computation.
+//! - [`plan_view`] — shared `WaitingOn` / `WorktreeFacts` types
+//!   the CLI projects from. Gate computation itself lives in
+//!   [`wait`] (one place, no parallel implementation).
+//! - [`wait`] — gate computation and agent-perspective wait
+//!   surface: [`wait::compute_gate`] is the single gate-state
+//!   function; [`repo_state::RepoState::derive_status`] folds it
+//!   over every plan; `detect_finished` finds plans that flipped
+//!   to finished since startup.
 //! - [`api`] — wire-shape response DTOs (`FinishPreviewResponse`,
 //!   `RewritePreviewResponse`, …) produced by the CLI's preview
 //!   builders.

@@ -8,14 +8,14 @@
 //! watched plan transitions into `finished_plans` — wfw's exit
 //! is positive in either case.
 //!
-//! `wfw` runs the same projection `clank status` does, then
-//! filters it through `clank_core::wait::derive_work` for the
-//! agent's perspective, then concatenates any
-//! `detect_finished` notices from a startup snapshot. When the
-//! initial fold finds at least one item it prints it and exits;
-//! otherwise it watches the filesystem for changes that could
-//! plausibly flip the projection and refolds on each debounced
-//! event.
+//! `wfw` folds the repo, runs `RepoState::derive_status` (which
+//! threads `wait::compute_gate` over every plan), filters the
+//! result through `RepoState::work_for` for the agent's
+//! perspective, then concatenates any `detect_finished` notices
+//! from a startup snapshot. When the initial fold finds at least
+//! one item it prints it and exits; otherwise it watches the
+//! filesystem for changes that could plausibly flip the
+//! projection and refolds on each debounced event.
 
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;

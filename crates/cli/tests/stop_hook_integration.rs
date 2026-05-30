@@ -221,8 +221,8 @@ fn hint_with_reviewable_work_emits_claude_continuation() {
     bind_alice(repo);
     turn_auto_on(repo);
     // alice has role=reviewers (no master designated). The intro
-    // commit is reviewable; alice hasn't reviewed → derive_work
-    // should return a Reviewer item for her.
+    // commit is reviewable; alice hasn't reviewed → wfw should
+    // emit a Reviewer item for her.
 
     // We assert the emitted command is RUNNABLE — full SHA,
     // explicit --author. Short SHAs can collide; missing
