@@ -106,13 +106,14 @@ pub enum FinalizeReadiness {
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum FinalizeBlockReason {
     NoReviewableCommit,
-    GateNotApproved {
+    /// Gate state on the latest reviewable commit is something
+    /// other than `Finished`. Holds the actual state so the
+    /// caller can render a helpful message ("approved — needs a
+    /// FINISHED vote", "changes requested — address them",
+    /// etc.).
+    NotFinished {
         state: crate::vocab::CommitGateState,
     },
-    /// Gate is approved but the approved commit only touched the
-    /// plan file — no implementation has been approved yet.
-    /// Matches `wfw`'s `MasterToImplement` routing.
-    ImplementationNotApproved,
     PlanFileMissing,
     PlanFileDirty,
 }

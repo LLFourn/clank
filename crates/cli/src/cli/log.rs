@@ -213,6 +213,7 @@ fn kind_label(tp: bool, tc: bool) -> &'static str {
 fn verdict_mark(v: Verdict, c: bool) -> String {
     let (mark, col) = match v {
         Verdict::Approve => ("✓", G),
+        Verdict::Finished => ("✓✓", C),
         Verdict::RequestChanges => ("✗", R),
         Verdict::Unmarked => ("?", Z),
     };

@@ -60,10 +60,7 @@ fn waiting_reason_wire_strings() {
         "address_commit_changes",
     );
     assert_wire(WaitingReason::ReadyToFinalize, "ready_to_finalize");
-    assert_wire(
-        WaitingReason::ReadyToStartImplementation,
-        "ready_to_start_implementation",
-    );
+    assert_wire(WaitingReason::GateApproved, "gate_approved");
     assert_wire(WaitingReason::CommitNeedsReview, "commit_needs_review");
 }
 

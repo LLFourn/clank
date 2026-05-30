@@ -106,6 +106,32 @@ fn writes_approve_feedback_to_flat_path() {
 }
 
 #[test]
+fn writes_finished_feedback() {
+    let (dir, sha) = one_plan_repo();
+    let repo = dir.path();
+    let short = &sha[..7];
+
+    let (status, _stdout, stderr) = run_feedback_write(
+        repo,
+        &[
+            "--commit",
+            short,
+            "--verdict",
+            "finished",
+            "--author",
+            "alice",
+            "-m",
+            "ship it",
+        ],
+    );
+
+    assert!(status.success(), "exit={status:?} stderr={stderr}");
+    let abs = repo.join(format!(".clank/agents/alice/feedback/{short}.md"));
+    let written = std::fs::read_to_string(&abs).expect("file exists");
+    assert_eq!(written, "FINISHED ship it\n");
+}
+
+#[test]
 fn prepends_request_changes_verdict() {
     let (dir, sha) = one_plan_repo();
     let repo = dir.path();

@@ -207,12 +207,24 @@ fn reason_to_msg(reason: &FinalizeBlockReason) -> String {
         FinalizeBlockReason::NoReviewableCommit => {
             "no reviewable commit attributed to this plan yet".into()
         }
-        FinalizeBlockReason::GateNotApproved { state } => {
-            format!("gate is {} (need approved)", state.as_str())
-        }
-        FinalizeBlockReason::ImplementationNotApproved => {
-            "approved commit is plan-only; commit and approve an implementation first".into()
-        }
+        FinalizeBlockReason::NotFinished { state } => match state {
+            clank_core::vocab::CommitGateState::Approved => {
+                "latest reviewable commit is approved but not FINISHED — \
+                 a reviewer needs to mark FINISHED before finalize".into()
+            }
+            clank_core::vocab::CommitGateState::ChangesRequested => {
+                "changes requested on the latest reviewable commit; address them \
+                 and re-commit before finalize".into()
+            }
+            clank_core::vocab::CommitGateState::Unreviewed => {
+                "latest reviewable commit hasn't been reviewed yet".into()
+            }
+            clank_core::vocab::CommitGateState::Finished => {
+                // Logically unreachable — compute_finalize_readiness
+                // only emits NotFinished when state != Finished.
+                "gate is unexpectedly Finished but finalize is blocked".into()
+            }
+        },
         FinalizeBlockReason::PlanFileMissing => "plan file is missing from the worktree".into(),
         FinalizeBlockReason::PlanFileDirty => {
             "plan file has uncommitted changes; commit or stash first".into()

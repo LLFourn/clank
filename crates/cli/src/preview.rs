@@ -75,16 +75,13 @@ pub async fn build_finish_preview(
         return Err(PreviewError::PlanHidden(plan_id_str));
     }
 
-    let latest = active.and_then(latest_reviewable);
-    let latest_reviewable_sha = latest.as_ref().map(|(sha, _)| sha.clone());
-    let latest_touched_code = latest.as_ref().is_some_and(|(_, tc)| *tc);
+    let latest_reviewable_sha = active.and_then(latest_reviewable);
 
     let gate_state = compute_gate(repo_root, latest_reviewable_sha.as_ref())?;
 
     let readiness = compute_finalize_readiness(
         is_finished,
         latest_reviewable_sha.as_ref(),
-        latest_touched_code,
         gate_state,
         worktree_status,
     );
@@ -400,13 +397,11 @@ pub fn classify_from_tree(
 }
 
 /// Compute finalize readiness from the observable signals.
-/// `latest_reviewable_touched_code` is whether the approved
-/// commit touched code (not just the plan file); finalize is
-/// blocked when the gate is approved on a plan-only commit.
+/// Finalize requires a FINISHED gate on the latest reviewable
+/// commit — APPROVE alone is not enough.
 pub fn compute_finalize_readiness(
     is_finished: bool,
     latest_reviewable_sha: Option<&CommitSha>,
-    latest_reviewable_touched_code: bool,
     gate_state: CommitGateState,
     worktree_status: PlanWorktreeStatus,
 ) -> FinalizeReadiness {
@@ -417,10 +412,8 @@ pub fn compute_finalize_readiness(
     if latest_reviewable_sha.is_none() {
         reasons.push(FinalizeBlockReason::NoReviewableCommit);
     }
-    if gate_state != CommitGateState::Approved {
-        reasons.push(FinalizeBlockReason::GateNotApproved { state: gate_state });
-    } else if !latest_reviewable_touched_code {
-        reasons.push(FinalizeBlockReason::ImplementationNotApproved);
+    if gate_state != CommitGateState::Finished {
+        reasons.push(FinalizeBlockReason::NotFinished { state: gate_state });
     }
     match worktree_status {
         PlanWorktreeStatus::PlanFileMissing => {
@@ -439,14 +432,13 @@ pub fn compute_finalize_readiness(
 }
 
 /// The plan's latest reviewable commit (last touched_plan ||
-/// touched_code event), with whether it touched code. `None`
-/// when the plan has no commits yet.
-fn latest_reviewable(ps: &clank_core::repo_state::PlanState) -> Option<(CommitSha, bool)> {
+/// touched_code event). `None` when the plan has no commits yet.
+fn latest_reviewable(ps: &clank_core::repo_state::PlanState) -> Option<CommitSha> {
     ps.commits
         .iter()
         .rev()
         .find(|e| e.touched_plan || e.touched_code)
-        .map(|e| (e.sha.clone(), e.touched_code))
+        .map(|e| e.sha.clone())
 }
 
 fn compute_gate(
@@ -546,20 +538,21 @@ mod tests {
     }
 
     #[test]
-    fn finalize_blocked_when_approved_commit_is_plan_only() {
+    fn finalize_blocked_on_approved_gate_with_not_finished() {
         let sha = CommitSha::parse(&"a".repeat(40)).unwrap();
         let readiness = compute_finalize_readiness(
             false,
             Some(&sha),
-            false, // plan-only approval
             CommitGateState::Approved,
             PlanWorktreeStatus::Clean,
         );
         match readiness {
             FinalizeReadiness::Blocked { reasons } => {
                 assert!(
-                    reasons.contains(&FinalizeBlockReason::ImplementationNotApproved),
-                    "expected ImplementationNotApproved; got {reasons:?}"
+                    reasons.contains(&FinalizeBlockReason::NotFinished {
+                        state: CommitGateState::Approved
+                    }),
+                    "expected NotFinished {{state: Approved}}; got {reasons:?}"
                 );
             }
             other => panic!("expected Blocked, got {other:?}"),
@@ -567,13 +560,12 @@ mod tests {
     }
 
     #[test]
-    fn finalize_ready_when_approved_commit_touched_code() {
+    fn finalize_ready_on_finished_gate() {
         let sha = CommitSha::parse(&"a".repeat(40)).unwrap();
         let readiness = compute_finalize_readiness(
             false,
             Some(&sha),
-            true, // code-touching approval
-            CommitGateState::Approved,
+            CommitGateState::Finished,
             PlanWorktreeStatus::Clean,
         );
         assert!(matches!(readiness, FinalizeReadiness::Ready));

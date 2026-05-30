@@ -68,8 +68,12 @@ impl PlanWorktreeStatus {
 }
 
 /// Verdict on a single feedback file. Parsed from the file's first
-/// non-blank line: `APPROVE` → `Approve`, `REQUEST_CHANGES` →
-/// `RequestChanges`, anything else → `Unmarked`.
+/// non-blank line: `APPROVE` → `Approve`, `FINISHED` → `Finished`,
+/// `REQUEST_CHANGES` → `RequestChanges`, anything else → `Unmarked`.
+///
+/// `Finished` is the "ship it — finalize this plan" signal,
+/// distinct from `Approve` which just blesses the commit's work.
+/// Reviewers explicitly opt into `Finished`; clank never infers it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 #[cfg_attr(
@@ -78,6 +82,7 @@ impl PlanWorktreeStatus {
 )]
 pub enum Verdict {
     Approve,
+    Finished,
     RequestChanges,
     Unmarked,
 }
@@ -86,6 +91,7 @@ impl Verdict {
     pub fn as_str(self) -> &'static str {
         match self {
             Verdict::Approve => "approve",
+            Verdict::Finished => "finished",
             Verdict::RequestChanges => "request_changes",
             Verdict::Unmarked => "unmarked",
         }
@@ -94,11 +100,13 @@ impl Verdict {
 
 /// Per-commit gate state.
 ///
-/// `Approved`: all cumulative participants have voted APPROVE.
-/// `ChangesRequested`: ≥1 cumulative participant voted
-/// REQUEST_CHANGES (or Unmarked).
-/// `Unreviewed`: no verdict yet, OR ≥1 participant hasn't voted on
-/// THIS commit.
+/// Precedence (any single review pushes the gate to the highest
+/// matching state):
+/// - `ChangesRequested`: ≥1 reviewer voted REQUEST_CHANGES.
+/// - `Finished`: ≥1 reviewer voted FINISHED, none requested changes.
+/// - `Approved`: ≥1 reviewer voted APPROVE, none FINISHED or
+///   request-changes.
+/// - `Unreviewed`: no recognized verdict yet on this commit.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 #[cfg_attr(
@@ -108,6 +116,7 @@ impl Verdict {
 pub enum CommitGateState {
     Unreviewed,
     Approved,
+    Finished,
     ChangesRequested,
 }
 
@@ -116,6 +125,7 @@ impl CommitGateState {
         match self {
             CommitGateState::Unreviewed => "unreviewed",
             CommitGateState::Approved => "approved",
+            CommitGateState::Finished => "finished",
             CommitGateState::ChangesRequested => "changes_requested",
         }
     }
@@ -133,11 +143,13 @@ pub enum WaitingReason {
     /// REQUEST_CHANGES on the latest reviewable commit; master
     /// addresses and commits.
     AddressCommitChanges,
-    /// Gate is approved + worktree clean — master should run
+    /// Gate is FINISHED + worktree clean — master should run
     /// `clank finish`.
     ReadyToFinalize,
-    /// Latest reviewable commit is approved; master moves forward.
-    ReadyToStartImplementation,
+    /// Latest reviewable commit is APPROVE (not FINISHED). Master
+    /// keeps working — more impl, more docs, more tests, or
+    /// nudge a reviewer to upgrade to FINISHED.
+    GateApproved,
     /// Latest reviewable commit hasn't been reviewed yet.
     CommitNeedsReview,
 }
@@ -149,7 +161,7 @@ impl WaitingReason {
             WaitingReason::CommitPlanRevision => "commit_plan_revision",
             WaitingReason::AddressCommitChanges => "address_commit_changes",
             WaitingReason::ReadyToFinalize => "ready_to_finalize",
-            WaitingReason::ReadyToStartImplementation => "ready_to_start_implementation",
+            WaitingReason::GateApproved => "gate_approved",
             WaitingReason::CommitNeedsReview => "commit_needs_review",
         }
     }

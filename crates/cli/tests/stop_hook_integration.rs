@@ -254,7 +254,7 @@ fn hint_with_reviewable_work_emits_claude_continuation() {
         "claude continuation goes to stderr, not stdout: {stdout}"
     );
     let expected_cmd = format!(
-        "clank feedback write --commit {head} \\\n        --author alice --verdict approve|request-changes \\\n        -m"
+        "clank feedback write --commit {head} \\\n        --author alice --verdict approve|finished|request-changes \\\n        -m"
     );
     assert!(
         stderr.contains(&expected_cmd),
@@ -310,7 +310,7 @@ fn hint_with_reviewable_work_emits_codex_continuation() {
     assert_eq!(decision["decision"], "block");
     let reason = decision["reason"].as_str().expect("reason is string");
     let expected_cmd = format!(
-        "clank feedback write --commit {head} \\\n        --author alice --verdict approve|request-changes \\\n        -m"
+        "clank feedback write --commit {head} \\\n        --author alice --verdict approve|finished|request-changes \\\n        -m"
     );
     assert!(
         reason.contains(&expected_cmd),

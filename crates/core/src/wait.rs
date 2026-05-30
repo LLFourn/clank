@@ -32,10 +32,11 @@ pub enum MasterNext {
     /// Approved gate but the plan file has uncommitted edits. Commit
     /// the next revision (or stash).
     Commit,
-    /// Approved plan-only commit. Write the implementation under
-    /// the `[<stem>]` commit prefix.
-    Implement,
-    /// Approved code-touching commit. Run `clank finish`.
+    /// APPROVED (not FINISHED) on the latest reviewable. Master
+    /// keeps working — more impl, more docs, more tests, or
+    /// prompting the reviewer to upgrade to FINISHED.
+    Continue,
+    /// FINISHED on the latest reviewable. Run `clank finish`.
     Finalize,
 }
 
@@ -168,17 +169,19 @@ pub struct AdHocWorkState {
 }
 
 pub fn compute_gate(reviews: &[ReviewEntry]) -> crate::vocab::CommitGateState {
-    use crate::vocab::CommitGateState;
-    let has_approve = reviews
+    use crate::vocab::{CommitGateState, Verdict};
+    let has_changes = reviews
         .iter()
-        .any(|r| r.verdict == crate::vocab::Verdict::Approve);
-    let has_changes = reviews.iter().any(|r| {
-        r.verdict == crate::vocab::Verdict::RequestChanges
-            || r.verdict == crate::vocab::Verdict::Unmarked
-    });
+        .any(|r| r.verdict == Verdict::RequestChanges || r.verdict == Verdict::Unmarked);
     if has_changes {
-        CommitGateState::ChangesRequested
-    } else if has_approve {
+        return CommitGateState::ChangesRequested;
+    }
+    let has_finished = reviews.iter().any(|r| r.verdict == Verdict::Finished);
+    if has_finished {
+        return CommitGateState::Finished;
+    }
+    let has_approve = reviews.iter().any(|r| r.verdict == Verdict::Approve);
+    if has_approve {
         CommitGateState::Approved
     } else {
         CommitGateState::Unreviewed
@@ -234,15 +237,13 @@ impl RepoState {
                             ambiguous,
                         }
                     }
+                    CommitGateState::Finished => match worktree {
+                        PlanWorktreeStatus::BodyDirty => WaitingOn::MasterToCommit,
+                        _ => WaitingOn::MasterToFinalize,
+                    },
                     CommitGateState::Approved => match worktree {
                         PlanWorktreeStatus::BodyDirty => WaitingOn::MasterToCommit,
-                        _ => {
-                            if touched_code {
-                                WaitingOn::MasterToFinalize
-                            } else {
-                                WaitingOn::MasterToImplement
-                            }
-                        }
+                        _ => WaitingOn::MasterToContinue,
                     },
                     CommitGateState::Unreviewed => WaitingOn::FirstReview,
                 };
@@ -296,12 +297,12 @@ impl WorkStatus {
                         gate: ps.gate,
                     });
                 }
-                (Role::Master, WaitingOn::MasterToImplement) => {
+                (Role::Master, WaitingOn::MasterToContinue) => {
                     out.push(WaitItem::Master {
                         plan: ps.plan.clone(),
                         sha: ps.sha.clone(),
-                        next: MasterNext::Implement,
-                        reason: WaitingReason::ReadyToStartImplementation,
+                        next: MasterNext::Continue,
+                        reason: WaitingReason::GateApproved,
                         gate: ps.gate,
                     });
                 }
@@ -372,11 +373,11 @@ pub fn derive_work(views: &[PlanView], author: &AgentLabel, role: Role) -> Vec<W
                     WaitingReason::CommitPlanRevision,
                 ));
             }
-            (Role::Master, WaitingOn::MasterToImplement) => {
+            (Role::Master, WaitingOn::MasterToContinue) => {
                 out.push(master(
                     view,
-                    MasterNext::Implement,
-                    WaitingReason::ReadyToStartImplementation,
+                    MasterNext::Continue,
+                    WaitingReason::GateApproved,
                 ));
             }
             (Role::Master, WaitingOn::MasterToFinalize) => {
@@ -503,16 +504,59 @@ mod tests {
         ));
     }
 
+    fn entry(verdict: crate::vocab::Verdict, who: &str) -> ReviewEntry {
+        ReviewEntry {
+            author: label(who),
+            verdict,
+        }
+    }
+
     #[test]
-    fn master_to_implement_emits_implement_with_ready_to_start_implementation() {
-        let views = vec![view("a", "aaaa", WaitingOn::MasterToImplement)];
+    fn compute_gate_no_reviews_is_unreviewed() {
+        assert_eq!(compute_gate(&[]), CommitGateState::Unreviewed);
+    }
+
+    #[test]
+    fn compute_gate_request_changes_beats_finished_and_approve() {
+        let reviews = [
+            entry(crate::vocab::Verdict::RequestChanges, "alice"),
+            entry(crate::vocab::Verdict::Finished, "bob"),
+            entry(crate::vocab::Verdict::Approve, "carol"),
+        ];
+        assert_eq!(compute_gate(&reviews), CommitGateState::ChangesRequested);
+    }
+
+    #[test]
+    fn compute_gate_finished_beats_approve() {
+        let reviews = [
+            entry(crate::vocab::Verdict::Finished, "alice"),
+            entry(crate::vocab::Verdict::Approve, "bob"),
+        ];
+        assert_eq!(compute_gate(&reviews), CommitGateState::Finished);
+    }
+
+    #[test]
+    fn compute_gate_approve_when_no_finished_or_changes() {
+        let reviews = [entry(crate::vocab::Verdict::Approve, "alice")];
+        assert_eq!(compute_gate(&reviews), CommitGateState::Approved);
+    }
+
+    #[test]
+    fn compute_gate_unmarked_treated_as_changes() {
+        let reviews = [entry(crate::vocab::Verdict::Unmarked, "alice")];
+        assert_eq!(compute_gate(&reviews), CommitGateState::ChangesRequested);
+    }
+
+    #[test]
+    fn master_to_continue_emits_continue_with_gate_approved() {
+        let views = vec![view("a", "aaaa", WaitingOn::MasterToContinue)];
         let out = derive_work(&views, &label("anybody"), Role::Master);
         assert_eq!(out.len(), 1);
         assert!(matches!(
             out[0],
             WaitItem::Master {
-                next: MasterNext::Implement,
-                reason: WaitingReason::ReadyToStartImplementation,
+                next: MasterNext::Continue,
+                reason: WaitingReason::GateApproved,
                 ..
             }
         ));

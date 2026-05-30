@@ -397,7 +397,7 @@ fn waiting_actor(w: &WaitingOn) -> String {
             .collect::<Vec<_>>()
             .join(", "),
         WaitingOn::MasterToRevise { .. }
-        | WaitingOn::MasterToImplement
+        | WaitingOn::MasterToContinue
         | WaitingOn::MasterToFinalize
         | WaitingOn::MasterToCommit => "master".into(),
     }
@@ -437,10 +437,11 @@ fn waiting_reason(w: &WaitingOn) -> String {
             }
             parts.join("; ")
         }
-        WaitingOn::MasterToImplement => {
-            "gate approved — start implementation under [<stem>]".into()
+        WaitingOn::MasterToContinue => {
+            "gate approved (not FINISHED) — continue work or ask a reviewer to mark FINISHED"
+                .into()
         }
-        WaitingOn::MasterToFinalize => "gate approved — run `clank finish`".into(),
+        WaitingOn::MasterToFinalize => "gate FINISHED — run `clank finish`".into(),
         WaitingOn::MasterToCommit => "gate approved but plan file dirty".into(),
     }
 }

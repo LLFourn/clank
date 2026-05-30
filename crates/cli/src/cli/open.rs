@@ -514,7 +514,7 @@ fn format_waiting_on(w: &clank_core::plan_view::WaitingOn) -> String {
         FirstReview => "first review".to_string(),
         ReviewerApprovalsMissing { .. } => "reviewers".to_string(),
         MasterToRevise { .. } => "master to revise".to_string(),
-        MasterToImplement => "master to implement".to_string(),
+        MasterToContinue => "master to continue".to_string(),
         MasterToFinalize => "master to finalize".to_string(),
         MasterToCommit => "master to commit".to_string(),
     }

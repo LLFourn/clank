@@ -1,7 +1,7 @@
 //! Parse + validate feedback file bodies.
 //!
 //! A feedback file body is a markdown text whose first non-blank
-//! line is the verdict header — exactly `APPROVE` or
+//! line is the verdict header — exactly `APPROVE`, `FINISHED`, or
 //! `REQUEST_CHANGES`. Anything else parses as [`Verdict::Unmarked`].
 //!
 //! Used by:
@@ -29,13 +29,14 @@
 use crate::vocab::Verdict;
 
 /// Parse the first non-empty line of a feedback file body as a
-/// verdict marker. The line starts with `APPROVE` or
+/// verdict marker. The line starts with `APPROVE`, `FINISHED`, or
 /// `REQUEST_CHANGES`, optionally followed by a space and a
 /// one-line summary. Everything else is `Unmarked`.
 pub fn parse_verdict(body: &str) -> Verdict {
     let first = body.lines().map(str::trim).find(|line| !line.is_empty());
     match first {
         Some(l) if l == "APPROVE" || l.starts_with("APPROVE ") => Verdict::Approve,
+        Some(l) if l == "FINISHED" || l.starts_with("FINISHED ") => Verdict::Finished,
         Some(l) if l == "REQUEST_CHANGES" || l.starts_with("REQUEST_CHANGES ") => {
             Verdict::RequestChanges
         }
@@ -44,12 +45,13 @@ pub fn parse_verdict(body: &str) -> Verdict {
 }
 
 /// Extract the one-line summary from the verdict line.
-/// Returns the text after `APPROVE ` or `REQUEST_CHANGES `,
-/// or empty string if no summary is present.
+/// Returns the text after the verdict keyword, or empty string
+/// if no summary is present.
 pub fn parse_summary(body: &str) -> &str {
     let first = body.lines().map(str::trim).find(|line| !line.is_empty());
     match first {
         Some(l) if l.starts_with("APPROVE ") => l["APPROVE ".len()..].trim(),
+        Some(l) if l.starts_with("FINISHED ") => l["FINISHED ".len()..].trim(),
         Some(l) if l.starts_with("REQUEST_CHANGES ") => l["REQUEST_CHANGES ".len()..].trim(),
         _ => "",
     }
@@ -145,6 +147,7 @@ impl std::error::Error for VerdictMismatch {}
 fn header_for(v: Verdict) -> &'static str {
     match v {
         Verdict::Approve => "APPROVE",
+        Verdict::Finished => "FINISHED",
         Verdict::RequestChanges => "REQUEST_CHANGES",
         Verdict::Unmarked => {
             debug_assert!(false, "header_for(Unmarked) — guarded by validate_matches");

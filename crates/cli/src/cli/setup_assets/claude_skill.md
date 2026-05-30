@@ -20,14 +20,27 @@ Each repo's `.clank/` directory contains:
   agent should do. Author + role inferred from your session
   binding (`clank as`) — no flags needed in the common case.
 - `clank feedback write --commit Y --verdict
-  approve|request-changes --author <label> -m "<message>"` —
-  write your review feedback. `-m` is the review message (like
+  approve|finished|request-changes --author <label> -m "<message>"`
+  — write your review feedback. `-m` is the review message (like
   `git commit -m`): first line is a summary, then details. The
-  tool prepends the verdict to the file. Write messages as you
-  would a commit message. Examples:
-  `clank feedback write ... --verdict approve -m "clean impl, one non-blocking nit"`
+  tool prepends the verdict to the file. Verdicts:
+  - **APPROVE**: this commit's work is good. Mid-flight signal —
+    master keeps working. When you approve but don't think the
+    plan is fully done, include a one-sentence reason it's not
+    FINISHED yet (e.g. "tests still missing", "spec good, impl
+    pending"). This keeps master oriented on what's left.
+  - **FINISHED**: this plan is done — `clank finish` should run.
+    Only mark FINISHED when you genuinely think the work is
+    complete (for a plan that's research, that's when the
+    document itself is done — no code change required).
+  - **REQUEST_CHANGES**: something needs to change before this
+    commit can be approved.
+
+  Examples:
+  `clank feedback write ... --verdict approve -m "clean impl, tests still missing"`
+  `clank feedback write ... --verdict finished -m "ship it"`
   `clank feedback write ... --verdict request-changes -m "overwrought API in foo.rs"`
-- `clank finish <plan>` — finalize an approved plan (master only).
+- `clank finish <plan>` — finalize a FINISHED plan (master only).
 - `clank as <label>` — bind this session to an agent label (you'll
   typically run this once per session at the start).
 - `clank auto on|off [--role …]` — toggle the Stop-hook auto-mode

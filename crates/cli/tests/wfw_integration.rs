@@ -461,10 +461,9 @@ fn clank_run(repo: &Path, args: &[&str]) -> String {
 }
 
 #[test]
-fn wfw_master_plan_only_approval_routes_to_implement() {
-    // Plan-only intro is approved → master should be told to
-    // implement, not finalize. Regression for the projection bug
-    // where Approved+Clean always routed to MasterToFinalize.
+fn wfw_master_approve_only_routes_to_continue() {
+    // APPROVE alone (no FINISHED) routes master to Continue,
+    // regardless of whether the approved commit touched code.
     let dir = init_repo();
     let repo = dir.path();
     write(repo, ".clank/plans/foo.md", "# foo\n");
@@ -495,39 +494,29 @@ fn wfw_master_plan_only_approval_routes_to_implement() {
     assert!(output.status.success(), "wfw exit={:?}", output.status);
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();
     assert!(
-        stdout.contains("next=Implement")
-            && stdout.contains("reason=ready_to_start_implementation"),
-        "expected Implement routing; got stdout=`{stdout}`"
+        stdout.contains("next=Continue") && stdout.contains("reason=gate_approved"),
+        "expected Continue routing for approve-only; got stdout=`{stdout}`"
     );
     assert!(
         !stdout.contains("next=Finalize"),
-        "Finalize must NOT appear for plan-only approval; got stdout=`{stdout}`"
+        "Finalize must NOT appear without a FINISHED vote; got stdout=`{stdout}`"
     );
 }
 
 #[test]
-fn wfw_master_code_only_approval_routes_to_finalize() {
+fn wfw_master_finished_verdict_routes_to_finalize() {
     let dir = init_repo();
     let repo = dir.path();
     write(repo, ".clank/plans/foo.md", "# foo\n");
     commit(repo, "[foo] intro");
     let intro_sha = head_sha(repo);
 
+    // A single FINISHED vote on the intro commit unlocks finalize,
+    // even for a plan-only chain (the research path).
     write(
         repo,
         &format!(".clank/agents/alice/feedback/{intro_sha}.md"),
-        "APPROVE\n\nplan lgtm\n",
-    );
-
-    // Now an impl commit, then alice approves it.
-    write(repo, "src/lib.rs", "// impl\n");
-    commit(repo, "[foo] impl");
-    let impl_sha = head_sha(repo);
-
-    write(
-        repo,
-        &format!(".clank/agents/alice/feedback/{impl_sha}.md"),
-        "APPROVE\n\nimpl lgtm\n",
+        "FINISHED\n\nplan is done\n",
     );
 
     let output = clank_cmd(repo)
@@ -549,7 +538,7 @@ fn wfw_master_code_only_approval_routes_to_finalize() {
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();
     assert!(
         stdout.contains("next=Finalize") && stdout.contains("reason=ready_to_finalize"),
-        "expected Finalize routing for code-attributed approval; got stdout=`{stdout}`"
+        "expected Finalize routing for FINISHED verdict; got stdout=`{stdout}`"
     );
 }
 
@@ -571,7 +560,7 @@ fn wfw_reviewer_finish_wake_human_output() {
     write(
         repo,
         &format!(".clank/agents/alice/feedback/{impl_sha}.md"),
-        "APPROVE\n\nlgtm\n",
+        "FINISHED\n\nlgtm\n",
     );
 
     // Park as alice (no reviewer work, gate already approved).
@@ -621,7 +610,7 @@ fn wfw_reviewer_finish_wake_json_output() {
     write(
         repo,
         &format!(".clank/agents/alice/feedback/{impl_sha}.md"),
-        "APPROVE\n\nlgtm\n",
+        "FINISHED\n\nlgtm\n",
     );
 
     let mut child = spawn_wfw(
@@ -679,7 +668,7 @@ fn wfw_plan_filter_finish_wake() {
     write(
         repo,
         &format!(".clank/agents/alice/feedback/{impl_sha}.md"),
-        "APPROVE\n",
+        "FINISHED\n",
     );
 
     let mut child = spawn_wfw(
@@ -745,7 +734,7 @@ fn wfw_mixed_work_and_finished_on_one_wake() {
     write(
         repo,
         &format!(".clank/agents/alice/feedback/{b_impl}.md"),
-        "APPROVE\n",
+        "FINISHED\n",
     );
 
     let mut child = spawn_wfw(
@@ -868,7 +857,7 @@ fn wfw_plan_already_finished_at_startup_emits_finished_and_exits() {
     write(
         repo,
         &format!(".clank/agents/alice/feedback/{impl_sha}.md"),
-        "APPROVE\n",
+        "FINISHED\n",
     );
     clank_run(repo, &["finish", "foo"]);
     let final_sha = head_sha(repo);

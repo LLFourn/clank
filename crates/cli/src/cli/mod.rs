@@ -324,6 +324,7 @@ pub struct FeedbackWriteArgs {
 #[derive(Copy, Clone, Debug, clap::ValueEnum)]
 pub enum VerdictArg {
     Approve,
+    Finished,
     RequestChanges,
 }
 
@@ -331,6 +332,7 @@ impl From<VerdictArg> for clank_core::Verdict {
     fn from(v: VerdictArg) -> Self {
         match v {
             VerdictArg::Approve => clank_core::Verdict::Approve,
+            VerdictArg::Finished => clank_core::Verdict::Finished,
             VerdictArg::RequestChanges => clank_core::Verdict::RequestChanges,
         }
     }
