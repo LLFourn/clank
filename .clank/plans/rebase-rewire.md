@@ -28,8 +28,14 @@ write `.git/hooks/post-rewrite` (mode 0755) containing:
 
 ```sh
 #!/usr/bin/env sh
-exec clank rewire --from-stdin "$@"
+# clank rewire hook
+exec clank rewire --from-stdin
 ```
+
+Git invokes `post-rewrite` with a positional arg (`amend` or
+`rebase`); we deliberately drop it because `clank rewire`
+treats both the same way. If we add per-mode behavior later,
+the CLI grows an optional positional then.
 
 Behavior:
 - If `.git/hooks/post-rewrite` doesn't exist → write it.
@@ -59,18 +65,26 @@ Algorithm:
    input order (= most recent commit in the squash range).
    Discard earlier `old` shas in the group.
 3. For each `(latest_old, new)` pair, for every author dir under
-   `.clank/agents/*/`:
-   - If `feedback/<latest_old>.md` exists, copy it to
-     `feedback/<new>.md` (clobbering if it already exists —
-     user just rewrote history, the new SHA is authoritative).
-   - If `feedback/<latest_old>.md` is missing → do nothing.
-     This implements the user's "if the most recent commit in
-     the squash range has no feedback, drop all" rule by simply
+   `.clank/agents/*/`, look for the source file in the same
+   order `FsReviewLookup::reviews_for` does:
+   - `feedback/<latest_old_full>.md` (40-char) first;
+   - then `feedback/<latest_old_short>.md` (first 7 chars of
+     `latest_old`).
+   - First hit wins. If neither exists → do nothing. This
+     implements the user's "if the most recent commit in the
+     squash range has no feedback, drop all" rule by simply
      not copying anything.
-4. Stage the new files with `git add` so the user sees them in
-   the index. Do NOT commit — the user decides when (and may
-   want to combine with whatever post-rebase tidying they
-   normally do).
+4. Destination is always written as
+   `feedback/<new_full>.md`. The reader checks full first,
+   so writing full guarantees the new SHA's feedback is
+   found regardless of whether the source was short- or
+   full-form. Overwrite if it already exists — the new SHA is
+   authoritative.
+
+No `git add`. Feedback files are gitignored by design (see
+root `.gitignore`'s `.clank/*` + `.clank/agents/` carve-outs);
+they live as per-clone local state. The hook copies in place;
+git's index never sees the file.
 
 The OLD feedback files are left untouched. Reset --hard back to
 an old SHA continues to work.
@@ -92,7 +106,9 @@ an old SHA continues to work.
 - **No `.clank/agents/` directory**: hook is a no-op (the
   scanner skips silently).
 - **Author dir contains non-`<sha>.md` files**: ignored (the
-  scanner only looks for `<40-hex-chars>.md`).
+  scanner only probes the two exact filenames it expects —
+  `<full-sha>.md` and `<short-sha>.md` — and skips anything
+  else).
 - **Running outside a clank repo**: `clank rewire` resolves
   the repo root via the same `resolve_repo` everything else
   uses. If `.clank/` is absent, no-op.
@@ -113,8 +129,15 @@ Unit, on a synthetic `.clank/agents/` tree:
   earlier olds did.
 - `rewire_handles_multiple_authors` — alice + bob feedback
   on the same old sha → both copy forward.
-- `rewire_stages_copied_files` — after rewire, `git status`
-  shows the new files as staged.
+- `rewire_source_short_form_writes_destination_full` — source
+  file is `<short>.md`, destination must land at
+  `<full-new>.md` (matching the reader's lookup order).
+- `rewire_destination_always_full_even_when_source_full` —
+  same outcome regardless of source filename mode; pins the
+  "always write full" invariant.
+- `rewire_does_not_touch_index` — after rewire on a repo with
+  ignored `.clank/agents/`, `git status --porcelain` is
+  unchanged (no entries appear in the index).
 
 Integration (spawns clank as the hook):
 
