@@ -148,8 +148,10 @@ Integration (spawns clank as the hook):
   post-rewrite hook → `clank init` warns and leaves it alone;
   `--force-hooks` overwrites.
 - `actual_rebase_rewires_feedback_end_to_end` — real `git
-  rebase -i` with a squash; after the rebase the new SHA has
-  the expected feedback file in the index.
+  rebase -i` with a squash; after the rebase, on-disk
+  `.clank/agents/<author>/feedback/<new-sha>.md` exists with
+  the expected content, and `git status --porcelain` is
+  unchanged (the files are gitignored — never staged).
 
 ## Out of scope
 
@@ -164,5 +166,7 @@ Integration (spawns clank as the hook):
 - `core.hooksPath` indirection. Per-clone install via
   `.git/hooks/` is the standard pattern; users with custom
   hookspath already know they need to wire clank in.
-- Auto-committing the rewired files. Staging only — the user
-  composes the commit themselves.
+- Touching the git index at all. Feedback files are
+  gitignored by design; the hook copies on disk and never
+  runs `git add` / `git commit`. Both staging and
+  auto-committing are out of scope.
