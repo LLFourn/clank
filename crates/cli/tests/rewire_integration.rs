@@ -323,6 +323,86 @@ fn rewire_does_not_touch_index() {
 }
 
 #[test]
+fn installed_hook_rewires_on_real_amend() {
+    // End-to-end: clank init installs the hook; git's amend
+    // triggers it; rewire copies feedback to the new SHA. No
+    // manual `clank rewire` invocation.
+    let dir = init_repo();
+    let repo = dir.path();
+    // Init so the hook is in place. Run with HOME pointed
+    // somewhere innocuous to avoid touching the user's
+    // real config / agent state.
+    let out = run_clank(repo, &["init", "--yes"]);
+    assert!(
+        out.status.success(),
+        "clank init failed: {}",
+        String::from_utf8_lossy(&out.stderr),
+    );
+
+    write(repo, ".clank/plans/foo.md", "# foo\n");
+    git(repo, &["add", "-A"]);
+    git(repo, &["commit", "--quiet", "-m", "[foo] intro"]);
+    let old_sha = head_sha(repo);
+
+    let old_short = &old_sha[..7];
+    let src = repo.join(format!(".clank/agents/alice/feedback/{old_short}.md"));
+    std::fs::create_dir_all(src.parent().unwrap()).unwrap();
+    std::fs::write(&src, "FINISHED ship it\n").unwrap();
+
+    // Put the test clank binary on PATH so the installed
+    // post-rewrite hook (`exec clank rewire --from-stdin`)
+    // can find it.
+    let clank_dir = Path::new(clank_bin()).parent().unwrap();
+    let existing_path = std::env::var("PATH").unwrap_or_default();
+    let new_path = format!(
+        "{}:{}",
+        clank_dir.display(),
+        existing_path,
+    );
+
+    // Stage a real change so amend actually rewrites the commit.
+    write(repo, "src/lib.rs", "// impl\n");
+    git(repo, &["add", "-A"]);
+
+    // Real amend → git fires post-rewrite → hook fires clank rewire.
+    let status = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["commit", "--amend", "--quiet", "--no-edit"])
+        .env("PATH", &new_path)
+        .env("HOME", repo)
+        .env_remove("CLAUDE_CODE_SESSION_ID")
+        .env_remove("CODEX_THREAD_ID")
+        .env_remove("CLANK_AGENT")
+        .status()
+        .expect("git amend");
+    assert!(status.success(), "git amend failed");
+    let new_sha = head_sha(repo);
+    assert_ne!(old_sha, new_sha);
+
+    // Feedback should now be findable for the new sha (full
+    // form or short, depending on what canonical_feedback_path
+    // chose). At least one variant must exist.
+    let new_short = &new_sha[..7];
+    let candidate_full = repo.join(format!(".clank/agents/alice/feedback/{new_sha}.md"));
+    let candidate_short = repo.join(format!(".clank/agents/alice/feedback/{new_short}.md"));
+    assert!(
+        candidate_full.is_file() || candidate_short.is_file(),
+        "installed post-rewrite hook should have copied feedback for {new_sha}; \
+         checked {} and {}",
+        candidate_full.display(),
+        candidate_short.display(),
+    );
+    let body = std::fs::read_to_string(if candidate_full.is_file() {
+        &candidate_full
+    } else {
+        &candidate_short
+    })
+    .unwrap();
+    assert_eq!(body, "FINISHED ship it\n");
+}
+
+#[test]
 fn rewire_followed_by_feedback_write_overwrites_rewired_copy() {
     // Regression for codex's shadow concern: rewire writes for
     // a new sha, then a later `clank feedback write` for the
