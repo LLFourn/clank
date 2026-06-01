@@ -61,17 +61,23 @@ const POST_REWRITE_BODY: &str = "#!/usr/bin/env sh\n\
 # clank rewire hook\n\
 exec clank rewire --from-stdin\n";
 
-/// Install `.git/hooks/post-rewrite` so feedback files follow
-/// commits through rebases/amends. If a foreign hook exists,
-/// print a warning and leave it alone unless `force` is set.
+/// Install the `post-rewrite` git hook so feedback files
+/// follow commits through rebases/amends. Resolves the real
+/// hook path via `git rev-parse --git-path` so this works in
+/// linked worktrees too (where `.git` is a file pointing at
+/// the worktree's gitdir; hooks live in the main repo's
+/// shared `.git/hooks/`). If a foreign hook exists, print a
+/// warning and leave it alone unless `force` is set.
 fn write_post_rewrite_hook(repo: &Path, force: bool) -> anyhow::Result<()> {
-    let hooks_dir = repo.join(".git").join("hooks");
-    if !hooks_dir.is_dir() {
-        // Not a real git repo (or `.git` is a file pointing
-        // elsewhere); skip silently.
+    let Some(hook_path) = resolve_hook_path(repo, "post-rewrite") else {
+        // Not a real git repo (resolve failed); skip silently.
         return Ok(());
+    };
+    if let Some(parent) = hook_path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| {
+            anyhow::anyhow!("creating hooks dir `{}`: {e}", parent.display())
+        })?;
     }
-    let hook_path = hooks_dir.join("post-rewrite");
     match std::fs::read_to_string(&hook_path) {
         Ok(existing) if existing.contains(POST_REWRITE_MARKER) => {
             // Already ours; refresh body in case it changed.
@@ -100,6 +106,29 @@ fn write_post_rewrite_hook(repo: &Path, force: bool) -> anyhow::Result<()> {
         Err(e) => return Err(e.into()),
     }
     Ok(())
+}
+
+/// Resolve `<git-common-dir>/hooks/<name>` via
+/// `git rev-parse --git-path hooks/<name>`. The output is
+/// relative to the repo's working directory; we join to absolute
+/// for clarity.
+fn resolve_hook_path(repo: &Path, name: &str) -> Option<std::path::PathBuf> {
+    let arg = format!("hooks/{name}");
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["rev-parse", "--git-path", &arg])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let raw = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if raw.is_empty() {
+        return None;
+    }
+    let p = std::path::PathBuf::from(&raw);
+    Some(if p.is_absolute() { p } else { repo.join(p) })
 }
 
 #[cfg(unix)]

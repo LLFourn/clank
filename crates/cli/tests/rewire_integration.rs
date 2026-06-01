@@ -80,6 +80,49 @@ fn clank_init_installs_post_rewrite_hook() {
 }
 
 #[test]
+fn clank_init_installs_hook_in_linked_worktree() {
+    let main_dir = init_repo();
+    let main_repo = main_dir.path();
+    // Seed a commit so we can branch off.
+    write(main_repo, "README.md", "x");
+    git(main_repo, &["add", "-A"]);
+    git(main_repo, &["commit", "--quiet", "-m", "seed"]);
+
+    // Create a linked worktree (sibling path; git creates the dir).
+    let wt_parent = tempfile::tempdir().unwrap();
+    let wt_path = wt_parent.path().join("wt");
+    git(
+        main_repo,
+        &[
+            "worktree",
+            "add",
+            wt_path.to_str().unwrap(),
+            "-b",
+            "feature",
+        ],
+    );
+
+    // Run clank init INSIDE the linked worktree.
+    let out = run_clank(&wt_path, &["init", "--yes"]);
+    assert!(
+        out.status.success(),
+        "clank init in linked worktree failed: {}",
+        String::from_utf8_lossy(&out.stderr),
+    );
+
+    // The hook should land in the main repo's shared
+    // .git/hooks/ — that's where git looks for them from any
+    // worktree.
+    let hook = main_repo.join(".git/hooks/post-rewrite");
+    assert!(
+        hook.is_file(),
+        "post-rewrite hook should be installed in main repo's .git/hooks/, even when init runs from the linked worktree"
+    );
+    let body = std::fs::read_to_string(&hook).unwrap();
+    assert!(body.contains("clank rewire --from-stdin"));
+}
+
+#[test]
 fn rewire_from_stdin_copies_feedback_for_simple_rename() {
     let dir = init_repo();
     let repo = dir.path();
