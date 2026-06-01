@@ -20,6 +20,7 @@ pub mod init;
 pub mod log;
 pub mod open;
 pub mod plan_resolve;
+pub mod rewire;
 pub mod purge;
 pub mod rewrite;
 pub mod queue;
@@ -85,6 +86,20 @@ pub struct InitArgs {
     /// role = reviewers. Useful for scripts.
     #[arg(short = 'y', long)]
     pub yes: bool,
+    /// Overwrite an existing foreign `post-rewrite` hook.
+    #[arg(long)]
+    pub force_hooks: bool,
+}
+
+#[derive(Args, Debug)]
+pub struct RewireArgs {
+    /// Repo root. Defaults to the cwd's git toplevel.
+    #[arg(long, value_name = "PATH")]
+    pub repo: Option<PathBuf>,
+    /// Read git `post-rewrite` pairs (`<old> <new> [extra]`,
+    /// one per line) from stdin and rewire feedback in place.
+    #[arg(long)]
+    pub from_stdin: bool,
 }
 
 #[derive(Args, Debug)]

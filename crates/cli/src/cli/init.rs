@@ -50,8 +50,68 @@ pub async fn run(args: InitArgs) -> anyhow::Result<()> {
     let repo = resolve_repo(args.repo.as_deref())?;
     write_scaffold(&repo)?;
     write_claude_perms(&repo)?;
+    write_post_rewrite_hook(&repo, args.force_hooks)?;
     warn_if_globally_excluded(&repo);
     bootstrap_agent_identity(&repo, args.yes).await?;
+    Ok(())
+}
+
+const POST_REWRITE_MARKER: &str = "# clank rewire hook";
+const POST_REWRITE_BODY: &str = "#!/usr/bin/env sh\n\
+# clank rewire hook\n\
+exec clank rewire --from-stdin\n";
+
+/// Install `.git/hooks/post-rewrite` so feedback files follow
+/// commits through rebases/amends. If a foreign hook exists,
+/// print a warning and leave it alone unless `force` is set.
+fn write_post_rewrite_hook(repo: &Path, force: bool) -> anyhow::Result<()> {
+    let hooks_dir = repo.join(".git").join("hooks");
+    if !hooks_dir.is_dir() {
+        // Not a real git repo (or `.git` is a file pointing
+        // elsewhere); skip silently.
+        return Ok(());
+    }
+    let hook_path = hooks_dir.join("post-rewrite");
+    match std::fs::read_to_string(&hook_path) {
+        Ok(existing) if existing.contains(POST_REWRITE_MARKER) => {
+            // Already ours; refresh body in case it changed.
+            std::fs::write(&hook_path, POST_REWRITE_BODY)?;
+            set_executable(&hook_path)?;
+            println!("{} up to date", hook_path.display());
+        }
+        Ok(_) if force => {
+            std::fs::write(&hook_path, POST_REWRITE_BODY)?;
+            set_executable(&hook_path)?;
+            println!("force-overwrote {}", hook_path.display());
+        }
+        Ok(_) => {
+            eprintln!(
+                "warning: {} already exists with non-clank content; \
+                 leaving it alone. Pass `clank init --force-hooks` to overwrite, \
+                 or chain `clank rewire --from-stdin` into it manually.",
+                hook_path.display()
+            );
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            std::fs::write(&hook_path, POST_REWRITE_BODY)?;
+            set_executable(&hook_path)?;
+            println!("wrote {}", hook_path.display());
+        }
+        Err(e) => return Err(e.into()),
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn set_executable(path: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let mut perms = std::fs::metadata(path)?.permissions();
+    perms.set_mode(0o755);
+    std::fs::set_permissions(path, perms)
+}
+
+#[cfg(not(unix))]
+fn set_executable(_path: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
@@ -504,6 +564,58 @@ mod tests {
         assert!(probe(".clank/agents/alice/config.json"));
         assert!(probe(".clank/agents/alice/feedback/foo/abc.md"));
         assert!(probe(".clank/cache/anything"));
+    }
+
+    #[test]
+    fn writes_post_rewrite_hook_when_absent() {
+        let dir = init_repo();
+        write_post_rewrite_hook(dir.path(), false).unwrap();
+        let body = std::fs::read_to_string(dir.path().join(".git/hooks/post-rewrite")).unwrap();
+        assert!(body.contains(POST_REWRITE_MARKER));
+        assert!(body.contains("clank rewire --from-stdin"));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(dir.path().join(".git/hooks/post-rewrite"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(mode, 0o755, "hook should be executable");
+        }
+    }
+
+    #[test]
+    fn writes_post_rewrite_hook_warns_on_foreign_content() {
+        let dir = init_repo();
+        let hook_path = dir.path().join(".git/hooks/post-rewrite");
+        std::fs::write(&hook_path, "#!/bin/sh\necho not clank\n").unwrap();
+        write_post_rewrite_hook(dir.path(), false).unwrap();
+        let body = std::fs::read_to_string(&hook_path).unwrap();
+        assert!(
+            !body.contains(POST_REWRITE_MARKER),
+            "foreign hook must NOT be overwritten without --force-hooks; body={body}"
+        );
+    }
+
+    #[test]
+    fn force_hooks_overwrites_foreign_content() {
+        let dir = init_repo();
+        let hook_path = dir.path().join(".git/hooks/post-rewrite");
+        std::fs::write(&hook_path, "#!/bin/sh\necho not clank\n").unwrap();
+        write_post_rewrite_hook(dir.path(), true).unwrap();
+        let body = std::fs::read_to_string(&hook_path).unwrap();
+        assert!(body.contains(POST_REWRITE_MARKER));
+    }
+
+    #[test]
+    fn writes_post_rewrite_hook_idempotent_on_our_marker() {
+        let dir = init_repo();
+        write_post_rewrite_hook(dir.path(), false).unwrap();
+        write_post_rewrite_hook(dir.path(), false).unwrap();
+        let body = std::fs::read_to_string(dir.path().join(".git/hooks/post-rewrite")).unwrap();
+        assert!(body.contains(POST_REWRITE_MARKER));
+        assert_eq!(body, POST_REWRITE_BODY);
     }
 
     #[test]

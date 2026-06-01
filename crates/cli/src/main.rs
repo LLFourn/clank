@@ -32,6 +32,10 @@ enum Command {
     /// structured data for an editor to drive its own bootstrap.
     /// Read-only; never mutates.
     Open(cli::OpenArgs),
+    /// Rewire feedback files after a rebase / amend. Installed
+    /// as a `post-rewrite` git hook by `clank init`; reads
+    /// old->new SHA pairs from stdin (with --from-stdin).
+    Rewire(cli::RewireArgs),
     /// Print the repo's Clank state (HEAD, plans, phases).
     Status(cli::StatusArgs),
     /// Wait-for-work: block until the calling agent has actionable
@@ -84,6 +88,7 @@ async fn main() -> anyhow::Result<()> {
         Command::Purge(args) => cli::purge::run(args).await,
         Command::Log(args) => cli::log::run(args).await,
         Command::Open(args) => cli::open::run(args).await,
+        Command::Rewire(args) => cli::rewire::run(args).await,
         Command::Status(args) => cli::status::run(args).await,
         Command::Wfw(args) => cli::wfw::run(args).await,
         Command::Feedback(args) => cli::feedback::run(args).await,
