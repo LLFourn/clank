@@ -74,12 +74,17 @@ Algorithm:
      implements the user's "if the most recent commit in the
      squash range has no feedback, drop all" rule by simply
      not copying anything.
-4. Destination is always written as
-   `feedback/<new_full>.md`. The reader checks full first,
-   so writing full guarantees the new SHA's feedback is
-   found regardless of whether the source was short- or
-   full-form. Overwrite if it already exists — the new SHA is
-   authoritative.
+4. Destination is the **canonical path the writer would use**
+   for the new SHA — computed by folding the repo (the
+   post-rewrite hook fires after the rebase, so HEAD already
+   carries the new SHAs) and calling
+   `crate::disk_format::feedback_path_wire(author, new_sha,
+   &all_shas)` where `all_shas` is the same set
+   `cli/feedback.rs` builds (plan reviewable shas + ad-hoc
+   shas). This guarantees a later `clank feedback write` for
+   the same author + new sha lands at the same path and
+   overwrites the rewired copy — no full-vs-short shadow.
+   Overwrite if it already exists.
 
 No `git add`. Feedback files are gitignored by design (see
 root `.gitignore`'s `.clank/*` + `.clank/agents/` carve-outs);
@@ -129,12 +134,21 @@ Unit, on a synthetic `.clank/agents/` tree:
   earlier olds did.
 - `rewire_handles_multiple_authors` — alice + bob feedback
   on the same old sha → both copy forward.
-- `rewire_source_short_form_writes_destination_full` — source
-  file is `<short>.md`, destination must land at
-  `<full-new>.md` (matching the reader's lookup order).
-- `rewire_destination_always_full_even_when_source_full` —
-  same outcome regardless of source filename mode; pins the
-  "always write full" invariant.
+- `rewire_destination_matches_writer_canonical` — for a
+  repo whose new sha's canonical is SHORT, rewire writes
+  `<new-short>.md`; for a repo where the new sha's canonical
+  is LONG (short prefix collides with another reviewable),
+  rewire writes `<new-full>.md`. Pins the
+  "writes canonical path" invariant.
+- `rewire_source_short_form_resolves` — source file is at
+  `<old-short>.md`; destination is canonical (per the rule
+  above). Verifies the source-lookup order.
+- `later_feedback_write_overwrites_rewired_copy` —
+  regression for codex's shadow concern: seed an old SHA's
+  feedback, rebase to a new SHA, run rewire, then
+  `clank feedback write` for the same author + new sha with
+  a different verdict. The reader sees the NEW verdict, not
+  the rewired one.
 - `rewire_does_not_touch_index` — after rewire on a repo with
   ignored `.clank/agents/`, `git status --porcelain` is
   unchanged (no entries appear in the index).
