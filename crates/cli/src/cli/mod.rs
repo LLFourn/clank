@@ -17,6 +17,7 @@ pub mod doctor;
 pub mod feedback;
 pub mod finish;
 pub mod init;
+pub mod html;
 pub mod log;
 pub mod open;
 pub mod plan_resolve;
@@ -120,6 +121,17 @@ pub struct LogArgs {
     /// Compact one-line-per-commit output.
     #[arg(long)]
     pub oneline: bool,
+}
+
+#[derive(Args, Debug)]
+pub struct HtmlArgs {
+    /// Repo root. Defaults to the cwd's git toplevel.
+    #[arg(long, value_name = "PATH")]
+    pub repo: Option<PathBuf>,
+    /// Build, then launch `open`/`xdg-open`/`start` against the
+    /// generated `index.html`.
+    #[arg(long)]
+    pub open: bool,
 }
 
 #[derive(Args, Debug)]

@@ -7,11 +7,13 @@
 use std::path::{Path, PathBuf};
 
 /// Canonical body of `.clank/.gitignore`.
-pub const CLANK_GITIGNORE_BODY: &str = "/agents/\n/cache/\n/feedback/\n/queue/\n";
+pub const CLANK_GITIGNORE_BODY: &str =
+    "/agents/\n/cache/\n/feedback/\n/queue/\n/html/\n";
 
 /// Older bodies init silently upgrades to `CLANK_GITIGNORE_BODY`.
 /// Anything else makes init bail.
 pub const CLANK_GITIGNORE_LEGACY_BODIES: &[&str] = &[
+    "/agents/\n/cache/\n/feedback/\n/queue/\n",
     "/agents/\n/cache/\n/feedback/\n",
     "feedback/\ncache/\n",
     "feedback/\ncache/\nagents/*/config.json\n",

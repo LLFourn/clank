@@ -37,6 +37,9 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # Atomic file writes (clank feedback write).
 tempfile = "3"
 
+# Markdown -> HTML for clank html.
+pulldown-cmark = { version = "0.13", default-features = false, features = ["html"] }
+
 # RFC3339 timestamp formatting for AgentConfig.session.updated_at.
 # UTC only — local-offset has soundness issues in multi-threaded programs.
 time = { version = "0.3", features = ["formatting"] }

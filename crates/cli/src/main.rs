@@ -27,6 +27,10 @@ enum Command {
     /// Print a chronological timeline of commits and reviews for
     /// a plan.
     Log(cli::LogArgs),
+    /// Render the event log + status to a static HTML site at
+    /// `.clank/html/`. Pass `--open` to launch the result in
+    /// your browser.
+    Html(cli::HtmlArgs),
     /// Inspect a path: classify what's there (no repo / git
     /// without clank / clank initialized) and return enough
     /// structured data for an editor to drive its own bootstrap.
@@ -87,6 +91,7 @@ async fn main() -> anyhow::Result<()> {
         Command::Queue(args) => cli::queue::run(args).await,
         Command::Purge(args) => cli::purge::run(args).await,
         Command::Log(args) => cli::log::run(args).await,
+        Command::Html(args) => cli::html::run(args).await,
         Command::Open(args) => cli::open::run(args).await,
         Command::Rewire(args) => cli::rewire::run(args).await,
         Command::Status(args) => cli::status::run(args).await,

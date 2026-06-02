@@ -17,21 +17,21 @@ use clank_core::plan_view::WaitingOn;
 use clank_core::repo_state::FinishedPlan;
 use clank_core::wait::PlanWorkState;
 
-struct StatusSnapshot {
-    repo_path: PathBuf,
-    basename: String,
-    branch: Option<String>,
-    head_sha: Option<String>,
-    head_subject: Option<String>,
-    worktree_dirty: bool,
-    plans: Vec<PlanWorkState>,
-    last_finished: Option<FinishedPlan>,
-    blocks: Vec<crate::cli::block::BlockEntry>,
-    queue_count: usize,
+pub(crate) struct StatusSnapshot {
+    pub(crate) repo_path: PathBuf,
+    pub(crate) basename: String,
+    pub(crate) branch: Option<String>,
+    pub(crate) head_sha: Option<String>,
+    pub(crate) head_subject: Option<String>,
+    pub(crate) worktree_dirty: bool,
+    pub(crate) plans: Vec<PlanWorkState>,
+    pub(crate) last_finished: Option<FinishedPlan>,
+    pub(crate) blocks: Vec<crate::cli::block::BlockEntry>,
+    pub(crate) queue_count: usize,
 }
 
 impl StatusSnapshot {
-    async fn build_async(
+    pub(crate) async fn build_async(
         repo: &Path,
         basename: &str,
         policy: crate::rebuild::CachePolicy,
