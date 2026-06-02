@@ -92,19 +92,49 @@ document.querySelectorAll('.sha-copy').forEach(function (btn) {
 });
 ```
 
+## Timeline row markup change
+
+The current timeline row wraps EVERY column in a single
+`<a class="row-link" href="commit/<sha>.html">` so the
+whole strip is clickable. Putting a `<button>` inside an
+`<a>` is invalid HTML and a click on the inner button
+would race the anchor's navigation.
+
+Split the row into two siblings inside `<div class="row">`:
+
+- `<button class="sha-copy">` carrying the SHA only.
+- `<a class="row-link">` wrapping the remaining columns
+  (kind + subject + marks + ts).
+
+The row's grid keeps the SHA column position to preserve
+column alignment; the anchor's grid loses its first
+column. Hover background moves off the anchor and onto the
+row (or uses `.row:has(.row-link:hover) { background: ... }`)
+so the hover affordance still covers the whole strip
+visually without an outer anchor wrapping the button.
+Click targets stay disjoint: SHA copies; the rest
+navigates.
+
 ## Surfaces touched
 
 - `crates/cli/src/cli/html.rs`:
   - `commit_body(repo, sha)` helper + render call in
     `render_commit_page`.
-  - Replace `<code class="sha">…</code>` (timeline row),
-    `<h1><code>…</code> …</h1>` (commit page), and
+  - `render_row` rewrite: emit the SHA button as a
+    SIBLING of the row link rather than nested inside.
+    Adjust the row's grid container so the SHA and the
+    anchor lay out in the same five-column shape as
+    today.
+  - Replace `<h1><code>…</code> …</h1>` (commit page) and
     `<p class="sha-full"><code>…</code></p>` (commit page)
     with `<button class="sha-copy" data-sha="<full>">…</button>`.
+    These are NOT inside any anchor on the commit page so
+    plain replacement is fine.
   - Extend the inline `<script>` with the copy-on-click
     handler.
   - CSS additions for `.sha-copy`, `.sha-copy:hover`,
-    `.sha-copy.copied`.
+    `.sha-copy.copied`, and the row hover-state migration
+    so it still reads as a single clickable strip.
 - No core changes. No new deps.
 
 ## Tests
@@ -125,6 +155,13 @@ document.querySelectorAll('.sha-copy').forEach(function (btn) {
   the abbreviated SHA is the button's text content (not
   hidden behind a JS-only label) so it's readable when
   JS is disabled.
+- `html_timeline_row_does_not_nest_button_inside_anchor`
+  — Regression for the timeline split: assert that the
+  rendered row's `<button class="sha-copy">` is NOT a
+  descendant of an `<a class="row-link">` (a substring
+  check that `<a class="row-link"` does not appear
+  before a `<button class="sha-copy"` inside a single
+  row block is sufficient for v1).
 
 ## Out of scope
 
