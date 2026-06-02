@@ -14,80 +14,149 @@ re-run today.
 
 ## Proposed state model
 
-Replace the binary `ClankInitialized` vs `GitWithoutClank`
-with `ClankInitNeeded` carrying the reasons:
+Two values: `ClankInitNeeded` and `ClankReady`. A reason
+qualifies as an `InitGap` ONLY when running `clank init`
+actually fixes it — every variant must round-trip with
+init's own write/repair surface.
 
-- `ClankInitNeeded { reasons: Vec<InitGap> }` — running
-  `clank init` would do something useful here. Reasons:
-  - `MissingClankDir` — `.clank/` doesn't exist.
-  - `MissingGitignoreEntries { entries: Vec<String> }` —
-    root `.gitignore` lacks one or more clank rules
-    (`.clank/*`, `!.clank/plans/`, `!.clank/finished/`).
-  - `MissingClaudePermissions` — `.claude/settings.local.json`
-    is absent or doesn't include the `Write/Edit/Read(.clank/agents/**)`
-    allow entries.
-  - `MissingPostRewriteHook` — `.git/hooks/post-rewrite`
-    isn't installed or doesn't carry the clank marker.
-  - `MissingClankGitignore` — `.clank/.gitignore` is absent
-    or stale relative to the current canonical body.
-- `ClankReady` — none of the above; init has nothing to do.
-  (Distinct from "agent X is bound to a session" — that's
-  separate, surfaced by the existing `agents` array.)
+Variants on disk today (cross-checked against `cli/init.rs`):
 
-Agent registration is NOT an init gap. If the editor wants
-to launch agent `claude` and `clank.agents` doesn't include
-it, that's a `BindAgent` recommendation regardless of init
-state. Don't conflate "repo wiring needs update" with
-"this session needs to bind."
+- `MissingClankDir` — `.clank/` doesn't exist.
+  (`init.rs::write_scaffold` creates it.)
+- `MissingClankGitignore` — `.clank/.gitignore` is absent or
+  doesn't match `GITIGNORE_BODY`. (`init.rs::write_scaffold`
+  writes/upgrades it.)
+- `MissingClaudePermissions` — `.claude/settings.local.json`
+  is absent or its `permissions.allow` doesn't include
+  `Write(.clank/agents/**)`, `Edit(.clank/agents/**)`, or
+  `Read(.clank/agents/**)`. (`init.rs::write_claude_perms`
+  tag-merges them.)
+- `MissingPostRewriteHook` — `git rev-parse --git-path
+  hooks/post-rewrite` resolves to a file that doesn't carry
+  `POST_REWRITE_MARKER` (or doesn't exist).
+  (`init.rs::write_post_rewrite_hook` installs / refreshes.)
 
-## Why this shape
+`ClankReady` is the absence of all of the above.
 
-- Action-oriented for editors: read `state == ClankInitNeeded`
-  → "run `clank init`." No structural inference required.
-- Forward-compatible: when init starts managing a new
-  file/path, add a new `InitGap` variant. Existing editors
-  ignore unknown variants and still surface `ClankInitNeeded`.
-- Idempotent fit: `clank init` is already designed to be
-  re-run safely; this state model is its natural read side.
-- Captures the `mkdir .clank` corner cleanly: `.clank/`
-  exists but `MissingGitignoreEntries` / `MissingClankGitignore`
-  / `MissingClaudePermissions` light up → still
-  `ClankInitNeeded`, not falsely `Ready`.
+### Not InitGaps
+
+- **Root `.gitignore` carve-outs.** Init currently only
+  WARNS via `warn_if_globally_excluded`; it doesn't write
+  `/.clank/*` / `!.clank/plans/` / `!.clank/finished/` to
+  the root `.gitignore`. Surface this from `clank open` as
+  a `warnings` entry on `OpenResponse` (existing field),
+  reusing the same probe init uses (`git check-ignore -v`
+  against the tracked subpaths). If we later expand init to
+  manage the root gitignore, promote this to a real
+  InitGap.
+- **Agent binding.** A fully-init'd repo with no bound
+  agents is `ClankReady` + empty `agents` array. The
+  `BindAgent` recommendation is the action, independent of
+  init.
+
+## Wire shape (JSON)
+
+`state` stays a string enum to keep the existing flat shape
+editors are already parsing:
+
+```json
+{
+  ...,
+  "state": "clank_init_needed",       // or "clank_ready"
+  "init_gaps": [
+    { "kind": "missing_clank_dir" },
+    { "kind": "missing_post_rewrite_hook" }
+  ],
+  "recommendations": [
+    {
+      "kind": "clank_init",
+      "cwd": "/abs/path",
+      "gaps": ["missing_clank_dir", "missing_post_rewrite_hook"]
+    }
+  ]
+}
+```
+
+Pinned rules:
+
+- `state` values are exactly the snake_case strings
+  `clank_init_needed` and `clank_ready`. No tagged-object
+  encoding.
+- `init_gaps` is a top-level array of `{ "kind": "<snake>" }`
+  objects; omitted (via `skip_serializing_if = "Vec::is_empty"`)
+  when state is `clank_ready`.
+- The `clank_init` recommendation gains a `gaps: [kind, ...]`
+  string array — same kinds in the same order as
+  `init_gaps`. Lets editors render "init will: create
+  .clank/, install hook" without parsing the top-level
+  array.
+- Adding a new variant is a forward-compatible additive
+  change: editors that don't know the new `kind` still see
+  `state == clank_init_needed` and prompt to run init.
 
 ## Surfaces touched
 
-- `crates/cli/src/cli/open.rs::OpenState` — replace
-  `ClankInitialized` / `GitWithoutClank` with the two new
-  variants. Compute `InitGap`s by probing each managed
-  artifact.
-- `crates/cli/src/cli/init.rs` — extract the
-  "what does init manage?" facts into a small read-only
-  helper the open inspector can call. Source of truth stays
-  in init.rs; open re-uses it instead of duplicating path
-  lists.
-- Recommendations: when `ClankInitNeeded`, emit a single
-  `ClankInit { cwd, reasons }` recommendation. `BindAgent`
-  is independent.
+- `crates/core/src/...` — `InitGap` isn't shared yet;
+  define it in `crates/cli/src/cli/open.rs` for now (single
+  consumer). Hoist to core if a second consumer appears.
+- `crates/cli/src/cli/open.rs::OpenState` — drop
+  `ClankInitialized` and `GitWithoutClank`; add
+  `ClankInitNeeded` and `ClankReady`. Compute `InitGap`s by
+  probing each artifact `init.rs` manages.
+- `crates/cli/src/cli/init.rs` — extract the "what does
+  init manage?" facts (paths, expected bodies, marker
+  strings) into a small read-only helper module the open
+  inspector calls. `init.rs` stays the writer; open is the
+  reader.
+- `OpenResponse` — add `init_gaps: Vec<InitGap>` (skip
+  when empty). Existing `warnings` carries the
+  ancestor-gitignore advisory.
+- `Recommendation::ClankInit` — add `gaps: Vec<String>`.
+  When the state is `ClankReady`, no `ClankInit`
+  recommendation appears.
 - Human output: state line becomes
-  `state: clank_init_needed (3 gaps)` with the gap kinds
-  listed underneath; `clank_ready` otherwise.
+  `state: clank_init_needed (N gaps)` with each gap kind
+  listed on its own indented line; `clank_ready` otherwise.
 
 ## Tests
 
+State + gap probing:
+
 - `init_needed_when_clank_dir_missing` — no `.clank/`,
-  expect `ClankInitNeeded { MissingClankDir }`.
-- `init_needed_when_gitignore_missing_entries` — `.clank/`
-  exists but root `.gitignore` lacks `.clank/*` carve-outs.
-- `init_needed_when_claude_permissions_missing` — no
-  `.claude/settings.local.json`.
+  expect `init_gaps` contains `missing_clank_dir`.
 - `init_needed_when_post_rewrite_hook_absent` — `.clank/`
-  present, hook missing.
+  + `.clank/.gitignore` + `.claude/settings.local.json`
+  present, hook missing → only `missing_post_rewrite_hook`
+  in `init_gaps`.
+- `init_needed_when_claude_permissions_missing` — no
+  `.claude/settings.local.json` → only
+  `missing_claude_permissions`.
+- `init_needed_when_clank_gitignore_stale` — `.clank/.gitignore`
+  exists with old body → `missing_clank_gitignore`.
 - `clank_ready_after_full_init` — run `clank init --yes`,
-  re-run `clank open`, expect `ClankReady` with no gaps.
-- `clank_ready_unaffected_by_unbound_agents` — repo is fully
-  init'd but no agents bound; state is still `ClankReady`,
-  agents array is empty, recommendation is `BindAgent` not
-  `ClankInit`.
+  re-run `clank open`, expect `state == "clank_ready"`,
+  `init_gaps` omitted from JSON.
+- `clank_ready_unaffected_by_unbound_agents` — fully
+  init'd repo, no `.clank/agents/*` dirs; state is
+  `clank_ready`, `agents` is empty, only recommendation
+  is `bind_agent`.
+
+Wire shape:
+
+- `init_gaps_omitted_when_empty` — assert the JSON has
+  no `init_gaps` key when state is ready.
+- `clank_init_recommendation_carries_gaps_array` — when
+  state is init-needed, the `clank_init` recommendation
+  has a `gaps` field matching the top-level `init_gaps`
+  kinds in order.
+
+Root-gitignore advisory:
+
+- `warning_for_ancestor_gitignore_excluding_clank_paths`
+  — ancestor `.gitignore` excludes `.clank/plans/`; assert
+  a `warnings` entry mentions the source file and that no
+  `MissingGitignoreEntries`-style `InitGap` is emitted
+  (init doesn't fix this).
 
 ## Out of scope
 
@@ -96,3 +165,6 @@ state. Don't conflate "repo wiring needs update" with
 - A `clank init --check` mode. Same machinery, different
   invocation; not needed for the editor to function.
 - Renaming `clank init` or splitting it into sub-commands.
+- Expanding init to manage the root `.gitignore`. Separate
+  plan if we want it; until then, root-gitignore problems
+  are advisories, not InitGaps.
