@@ -134,28 +134,45 @@ umbrella starts when the plan attribution changes. A single
 plan can spawn multiple umbrellas if interleaved with
 other plans or ad-hoc commits.
 
-### Subject prefix stripping
+### Subject prefix stripping (core, not html)
 
 The umbrella header already says `[foo]`, so the
-`[foo] subject` prefix on each row is pure noise. Strip the
-leading `[<plan>] ` (or `[<a>,<b>] ` for multi-plan tags)
-from the subject text BEFORE rendering. Concretely:
+`[foo] subject` prefix on each row is pure noise. But this
+parsing belongs in `clank-core` — there's already a
+`parse_title_prefix(subject: &str) -> Option<TitlePrefix>`
+at `crates/core/src/repo_state.rs:317` that the classifier
+uses, and the html layer shouldn't re-parse / re-strip the
+same syntax.
 
-- If the umbrella's plan name is `foo`, a subject of
-  `[foo] intro` renders as `intro`.
-- A subject of `[foo,bar] shared work` rendered inside
-  the `foo` umbrella renders as `shared work` (drop the
-  whole bracketed prefix; the multi-plan attribution is
-  already implicit from the umbrella + the
-  shared-prefix link the per-commit page can carry).
-- A subject that doesn't start with `[…] ` renders
-  verbatim.
-- Subjects rendered OUTSIDE any plan umbrella
-  (`ad-hoc` group) keep the raw subject; nothing to
-  strip.
+Refactor (or add a sibling helper) in core:
 
-Apply the same strip on the per-commit page header so the
-`<h2 class="subject">` doesn't repeat `[<plan>]` either.
+```rust
+pub struct ParsedSubject<'a> {
+    pub prefix: Option<TitlePrefix>,
+    /// Subject with the recognized `[…] ` prefix removed.
+    /// Equals the raw input when no prefix matched.
+    pub body: &'a str,
+}
+
+pub fn parse_subject(subject: &str) -> ParsedSubject<'_>;
+```
+
+Existing classifier path: rewrite the one site that calls
+`parse_title_prefix` to read `parse_subject(...).prefix`.
+Renderers (`clank log`, `clank html`) call `parse_subject`
+directly and render `.body`. No re-stripping, no string
+juggling, no re-finding the `]`.
+
+Observable behavior in `clank html`:
+
+- Subject `[foo] intro` under any plan umbrella renders as
+  `intro`. The plan badge is already in the umbrella
+  header.
+- Subject `[foo,bar] shared work` renders as `shared work`
+  in either the `foo` or `bar` umbrella.
+- Subject without a recognized prefix renders verbatim.
+- Per-commit page header reads the same parsed body, so
+  `<h2 class="subject">` doesn't repeat `[<plan>]` either.
 
 ### CSS shape
 
@@ -195,6 +212,19 @@ pages and the index share it.
 
 ## Surfaces touched
 
+- `crates/core/src/repo_state.rs`:
+  - Add `ParsedSubject<'a>` struct and `parse_subject(&str)
+    -> ParsedSubject<'_>` returning prefix + body.
+  - Re-implement `parse_title_prefix` as a thin wrapper
+    over `parse_subject(...).prefix` (or delete it and
+    migrate the classifier call site directly — pick at
+    implementation time, whichever leaves fewer callers
+    on the old name).
+  - Unit tests: bracketed-single, bracketed-multi,
+    `[misc]`, no prefix, empty brackets, whitespace
+    before / inside brackets — same shapes
+    `parse_title_prefix` tests today, extended to assert
+    `.body`.
 - `crates/cli/src/cli/html.rs`:
   - Read existing `index.html` and parse the meta markers
     when present.
@@ -251,17 +281,20 @@ Umbrella:
 - `html_timeline_ad_hoc_umbrella_label` — adopted repo
   with two consecutive ad-hocs; assert one umbrella with
   label "ad-hoc" containing both rows.
-- `html_timeline_strips_plan_prefix_from_subject` — seed
+- `html_timeline_renders_parsed_subject_body` — seed
   commit `[foo] intro`; assert the index row's subject
-  text is `intro` (no `[foo]`) when rendered inside the
-  `foo` umbrella, AND the per-commit page header reads
-  `intro` (not `[foo] intro`).
-- `html_timeline_strips_multi_plan_prefix` — commit
-  `[foo,bar] shared work`; under the `foo` umbrella the
-  subject reads `shared work`.
-- `html_timeline_leaves_non_prefixed_subjects_alone` —
-  ad-hoc commit titled `random fix`; assert the rendered
-  subject is `random fix` (no over-aggressive stripping).
+  text is `intro` and the per-commit page header reads
+  `intro`. (Behavior is observed at the html layer; the
+  source of truth is `parse_subject` in core.)
+- `html_timeline_renders_parsed_body_for_multi_plan` —
+  commit `[foo,bar] shared work`; under the `foo`
+  umbrella the subject reads `shared work`.
+- `html_timeline_renders_raw_when_no_prefix` — ad-hoc
+  commit titled `random fix`; assert the rendered subject
+  is `random fix` verbatim (no over-aggressive stripping).
+- Core unit tests on `parse_subject` cover the edge
+  cases (whitespace, `[misc]`, empty brackets, mixed
+  case) so the html tests don't need to retrace them.
 
 Relative timestamps:
 
