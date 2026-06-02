@@ -74,20 +74,41 @@ should leave the output structure friendly to a future watcher
 
 ## Data sources
 
-- Status: `crate::cli::status::StatusSnapshot::build_async`
-  (already exists). Render its fields directly; no parallel
-  fold logic.
-- Timeline: `RepoState::log_events` (same source `clank log`
-  uses). Iterate in reverse chronological order.
-- Per-commit diff: shell out to `git show --pretty=format: -p
-  <sha>` and parse into file sections. Use existing
-  `crate::git_io` helpers where they fit.
-- Per-commit feedback: `FsReviewLookup::reviews_for(sha)`
-  returns the verdict list; read the body of each
-  `.clank/agents/<author>/feedback/<ref>.md` for the rendered
-  text.
-- Plan-at-commit body: `git show <sha>:.clank/plans/<stem>.md`
-  for plan-only events; render via pulldown-cmark.
+- **Status**: `crate::cli::status::StatusSnapshot` is
+  currently private to `status.rs`. As part of this plan,
+  promote it (and its `build_async` constructor + the
+  accessor fields the renderer needs: branch, head, dirty,
+  plans, last_finished, blocks, queue_count) to
+  `pub(crate)` so `html.rs` (sibling module) can read them
+  directly. No parallel fold logic.
+- **Timeline**: `crate::rebuild::rebuild_from(&repo, None,
+  &head)` returns `(RepoState, Vec<LogEvent>)`. That's what
+  `clank log` uses (`cli/log.rs:44`). For `clank html` use
+  `from=None` so the range covers root→HEAD; the renderer
+  reverses the vec for newest-first display. No default
+  truncation in v1 — write every event. (If repos with
+  thousands of events become a problem, add `--limit N` in
+  a follow-up.)
+- **Per-commit diff**: shell out to
+  `git show --pretty=format: -p <sha>` and parse into file
+  sections. No existing `crate::git_io` helper covers this;
+  add a small `commit_diff(repo, sha) -> Vec<FilePatch>`
+  helper inside `html.rs` for v1 and hoist it to
+  `crate::git_io` if a second caller appears.
+- **Per-commit feedback**: use
+  `crate::feedback_scan::scan_feedback(repo, &[sha])` —
+  same path `clank log` uses (`cli/log.rs::collect_reviews`).
+  It returns a `FeedbackView` whose entries carry
+  `source_path` + `body_hash` per author. The renderer
+  reads each `source_path` off disk and parses via
+  `clank_core::feedback_body::FeedbackBody::parse` to get
+  `verdict`, `summary()`, and `details()` for the card.
+  `FsReviewLookup::reviews_for` is NOT enough — it returns
+  only author + verdict, not the body or path.
+- **Plan-at-commit body**: `git show <sha>:.clank/plans/<stem>.md`
+  for plan-only events; render via pulldown-cmark. For
+  finalize commits the body lives at
+  `.clank/finished/<stem>.md` in the post-finalize tree.
 
 ## Rendering
 
@@ -148,6 +169,12 @@ self-contained `index.html` later.
 - `crates/cli/src/cli/mod.rs` — `HtmlArgs`, `HtmlCmd::Open`
   variant (or `--open` flag), `Commands::Html` wire-up.
 - `crates/cli/src/main.rs` — dispatch.
+- `crates/cli/src/cli/status.rs` — promote `StatusSnapshot`,
+  its constructor `build_async`, and the accessor fields
+  the renderer reads (branch, head_sha, head_subject,
+  worktree_dirty, plans, last_finished, blocks,
+  queue_count) to `pub(crate)`. No behavior change in
+  `clank status` itself.
 - `crates/cli/Cargo.toml` — add `pulldown-cmark` (latest
   4.x), probably `html-escape` too (or hand-rolled escape).
 - `crates/cli/src/init_facts.rs` —
