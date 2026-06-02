@@ -182,6 +182,39 @@ fn queue_add_m_and_from_mutually_exclusive() {
 }
 
 #[test]
+fn queue_add_duplicate_short_circuits_before_reading_source() {
+    // Regression: duplicate-name detection must fire BEFORE
+    // body-source IO. Otherwise `--from -` would block on
+    // stdin, or `--from missing` would fail with an
+    // IO error, both worse UX than "this name already
+    // exists."
+    let dir = init_repo();
+    write(dir.path(), ".clank/queue/400-foo.md", "# foo\nbody\n");
+    let out = run_queue(
+        dir.path(),
+        &[
+            "add",
+            "foo",
+            "--priority",
+            "410",
+            "--from",
+            "/this/path/definitely/does/not/exist",
+        ],
+    );
+    assert!(!out.status.success(), "must fail on conflict");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("already exists") && stderr.contains("400-foo.md"),
+        "expected conflict message, NOT a file-IO error; got: {stderr}"
+    );
+    assert!(
+        !stderr.contains("definitely/does/not/exist")
+            && !stderr.contains("No such file"),
+        "source path must NOT be read when the name is a conflict; got: {stderr}"
+    );
+}
+
+#[test]
 fn queue_add_rejects_from_file_that_is_header_only() {
     let dir = init_repo();
     let stub = dir.path().join("draft.md");

@@ -7,13 +7,39 @@ pub async fn run(args: QueueArgs) -> anyhow::Result<()> {
     let repo = resolve_repo(args.repo.as_deref())?;
     match args.command {
         None => list(&repo),
-        Some(QueueCmd::Add(a)) => {
-            let source = pick_body_source(&repo, &a.name, &a)?;
-            add(&repo, &a.name, a.priority, source)
-        }
+        Some(QueueCmd::Add(a)) => add_cmd(&repo, a),
         Some(QueueCmd::Remove(r)) => remove(&repo, &r.name),
         Some(QueueCmd::Promote(p)) => promote(&repo, &p.name),
     }
+}
+
+/// Top-level orchestrator for `queue add`. Runs all cheap
+/// validation (name shape, priority range, duplicate-name
+/// conflict) BEFORE touching the body source — `--from -`
+/// would otherwise block on stdin and `--from <missing>`
+/// would fail on IO before we knew the queue item couldn't
+/// land.
+fn add_cmd(repo: &Path, args: super::QueueAddArgs) -> anyhow::Result<()> {
+    validate_name(&args.name)?;
+    if args.priority > 999 {
+        anyhow::bail!("priority must be 0-999");
+    }
+    let scanned = scan_queue(repo);
+    let conflicts: Vec<&QueueEntry> = scanned.iter().filter(|e| e.name == args.name).collect();
+    if !conflicts.is_empty() {
+        let listed = conflicts
+            .iter()
+            .map(|e| format!("{:03}-{}.md", e.priority, e.name))
+            .collect::<Vec<_>>()
+            .join(", ");
+        anyhow::bail!(
+            "queue item `{}` already exists ({listed}). \
+             Delete it from .clank/queue/ first or pick a different name.",
+            args.name
+        );
+    }
+    let source = pick_body_source(repo, &args.name, &args)?;
+    add(repo, &args.name, args.priority, source)
 }
 
 /// Where a queued stub's body came from. Used for error
