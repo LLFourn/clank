@@ -50,10 +50,22 @@ skip both the `LogEvent::AdHoc` push AND the `ad_hoc`
 bucket entry.
 
 Cache compatibility: `RepoState` is serialized into the
-state cache (see the `cache-encoding` feature). Add the
-new field with `#[serde(default)]` so older caches load as
-`adopted: false`. That just causes the next walk to
-re-derive it from events — fine, fold is deterministic.
+state cache. The cache hot path (`crates/cli/src/rebuild.rs`)
+serves an exact-HEAD cache hit DIRECTLY without re-folding,
+and ancestor hits only fold forward from the cached state.
+So just adding `#[serde(default)]` is unsafe — a stale
+post-adoption cache would be served with `adopted: false`
+and silently suppress legitimate AdHocs until the next plan
+touch.
+
+Bump `CACHE_FORMAT_VERSION` in
+`crates/cli/src/state_cache.rs:27` (currently `6` → `7`).
+That makes the file extension `.v7.bin` and the version
+check at line 103 reject every prior cache as a version
+mismatch, forcing a clean re-fold from history. `adopted`
+gets re-derived correctly. The new field can still carry
+`#[serde(default)]` for forward source-level safety, but
+the version bump is what makes the change live cache-safe.
 
 ## Surfaces touched
 
@@ -66,6 +78,12 @@ re-derive it from events — fine, fold is deterministic.
     finalize / delete).
   - Wrap the AdHoc emission block in an
     `if self.adopted` guard.
+- `crates/cli/src/state_cache.rs:27`: bump
+  `CACHE_FORMAT_VERSION` from `6` to `7` so prior caches
+  fail the version check and trigger a clean re-fold. The
+  cache write/read paths already key the filename on the
+  version (`.v{N}.bin`) so old artifacts stay on disk but
+  are ignored.
 
 ## Tests
 
