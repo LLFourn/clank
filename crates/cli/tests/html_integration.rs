@@ -438,6 +438,74 @@ fn html_emits_inline_relative_time_script_and_data_iso_attrs() {
 }
 
 #[test]
+fn html_incremental_same_head_reuses_event_cache_and_preserves_old_pages() {
+    // Codex's regression: feedback-only rebuild at the same
+    // HEAD must not re-fold the repo. The cached event log
+    // is reused, top-N feedback is refreshed (page + index
+    // marks), and an OLD page outside the top-N keeps its
+    // mtime.
+    let dir = init_repo();
+    let repo = dir.path();
+    write(repo, ".clank/plans/foo.md", "# foo\n");
+    commit(repo, "[foo] intro");
+    for i in 0..15 {
+        write(repo, &format!("src/f{i}.rs"), "// x\n");
+        commit(repo, &format!("[foo] revise {i}"));
+    }
+    let intro_sha = {
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(["log", "--reverse", "--format=%H", "HEAD"])
+            .output()
+            .unwrap();
+        String::from_utf8(out.stdout)
+            .unwrap()
+            .lines()
+            .next()
+            .unwrap()
+            .to_string()
+    };
+    let head_before = head_sha(repo);
+
+    // First build.
+    run_clank(repo, &["html"]).status.success().then_some(()).expect("build 1");
+    let oldest_path = repo.join(format!(".clank/html/commit/{intro_sha}.html"));
+    let old_meta = std::fs::metadata(&oldest_path).unwrap();
+    let old_mtime = filetime::FileTime::from_last_modification_time(&old_meta);
+
+    // Land FEEDBACK only — no new commit.
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+    write(
+        repo,
+        &format!(".clank/agents/alice/feedback/{head_before}.md"),
+        "FINISHED ship it\n",
+    );
+
+    // Rebuild. HEAD is unchanged.
+    run_clank(repo, &["html"]).status.success().then_some(()).expect("build 2");
+    let head_after = head_sha(repo);
+    assert_eq!(head_before, head_after, "HEAD must not have moved");
+
+    // Status header must reflect the new FINISHED gate.
+    let index = std::fs::read_to_string(repo.join(".clank/html/index.html")).unwrap();
+    assert!(
+        index.contains("gate-finished") || index.contains("finished"),
+        "status header should refresh on same-HEAD rebuild; index len {}",
+        index.len()
+    );
+
+    // Old page outside top-N kept its mtime.
+    let after_meta = std::fs::metadata(&oldest_path).unwrap();
+    let after_mtime = filetime::FileTime::from_last_modification_time(&after_meta);
+    assert_eq!(
+        old_mtime.unix_seconds(),
+        after_mtime.unix_seconds(),
+        "oldest page must NOT be rewritten on a same-HEAD rebuild"
+    );
+}
+
+#[test]
 fn html_incremental_skips_old_pages_outside_top_n() {
     // 15 prior commits + 1 new commit. After incremental,
     // the OLDEST prior page (well outside the top-10 refresh

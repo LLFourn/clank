@@ -65,30 +65,35 @@ async fn build_site(
     } else {
         read_prior_head(out_dir)
     };
-    let cached_events: Option<Vec<LogEvent>> = match (prior_head.as_deref(), head_sha.as_ref()) {
-        (Some(prev), Some(head))
-            if prev != head.as_str() && prev_is_ancestor(repo, prev, head.as_str()) =>
+    // Three cases for the event log:
+    //
+    // 1. Cache hit, prev == head: feedback-only rebuild
+    //    (e.g. a new FINISHED landed but no new commit).
+    //    Reuse the cached events verbatim; no fold needed.
+    // 2. Cache hit, prev is a strict ancestor of head:
+    //    incremental slice via rebuild_from(prev, head),
+    //    appended to the cached log.
+    // 3. Otherwise (cache miss / --rebuild / not an
+    //    ancestor): full fold from root.
+    let events: Vec<LogEvent> = match (
+        prior_head.as_deref(),
+        head_sha.as_ref(),
+        read_events_cache(out_dir),
+    ) {
+        (Some(prev), Some(head), Some(prior_events)) if prev == head.as_str() => prior_events,
+        (Some(prev), Some(head), Some(mut prior_events))
+            if prev_is_ancestor(repo, prev, head.as_str()) =>
         {
-            read_events_cache(out_dir)
-        }
-        _ => None,
-    };
-
-    let events: Vec<LogEvent> = match (cached_events, head_sha.as_ref(), prior_head.as_deref()) {
-        // Incremental: cached log + slice from prev_head.
-        (Some(mut prior_events), Some(head), Some(prev)) => {
             let prev_sha = clank_core::ids::CommitSha::parse(prev)
                 .map_err(|e| anyhow::anyhow!("parse prior head sha `{prev}`: {e}"))?;
             let (_state, slice) = crate::rebuild::rebuild_from(repo, Some(&prev_sha), head).await?;
             prior_events.extend(slice);
             prior_events
         }
-        // Full fold (first build, --rebuild, or stale cache).
-        (None, Some(head), _) => {
+        (_, Some(head), _) => {
             let (_state, events) = crate::rebuild::rebuild_from(repo, None, head).await?;
             events
         }
-        // No head — empty repo.
         _ => Vec::new(),
     };
 
