@@ -141,6 +141,9 @@ async fn build_site(
     let writes_needed: Vec<&LogEvent> = events
         .iter()
         .filter(|e| {
+            if force_rebuild {
+                return true;
+            }
             let s = event_sha(e).as_str();
             let exists = out_dir.join(format!("commit/{s}.html")).exists();
             !exists || top_n_sha_set.contains(s)

@@ -675,6 +675,60 @@ fn html_incremental_skips_unchanged_commit_pages() {
 }
 
 #[test]
+fn html_rebuild_flag_overwrites_pages_outside_top_n() {
+    // Codex's regression: --rebuild must rewrite OLD pages
+    // sitting deep in history, not just top-N or missing
+    // files. Seed >TOP_N_FEEDBACK_RECHECK commits, stamp the
+    // oldest with an ancient mtime, run --rebuild, assert it
+    // got rewritten.
+    let dir = init_repo();
+    let repo = dir.path();
+    write(repo, ".clank/plans/foo.md", "# foo\n");
+    commit(repo, "[foo] intro");
+    for i in 0..15 {
+        write(repo, &format!("src/f{i}.rs"), "// x\n");
+        commit(repo, &format!("[foo] revise {i}"));
+    }
+    let intro_sha = {
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(["log", "--reverse", "--format=%H", "HEAD"])
+            .output()
+            .unwrap();
+        String::from_utf8(out.stdout)
+            .unwrap()
+            .lines()
+            .next()
+            .unwrap()
+            .to_string()
+    };
+
+    run_clank(repo, &["html"])
+        .status
+        .success()
+        .then_some(())
+        .expect("build 1");
+    let oldest = repo.join(format!(".clank/html/commit/{intro_sha}.html"));
+    let stamp = filetime::FileTime::from_unix_time(1_000_000_000, 0);
+    filetime::set_file_times(&oldest, stamp, stamp).unwrap();
+
+    run_clank(repo, &["html", "--rebuild"])
+        .status
+        .success()
+        .then_some(())
+        .expect("rebuild");
+
+    let meta = std::fs::metadata(&oldest).unwrap();
+    let mtime = filetime::FileTime::from_last_modification_time(&meta);
+    assert_ne!(
+        mtime.unix_seconds(),
+        1_000_000_000,
+        "--rebuild must overwrite OLD pages outside the top-N refresh window"
+    );
+}
+
+#[test]
 fn html_rebuild_flag_overwrites_all_pages() {
     let dir = init_repo();
     let repo = dir.path();
