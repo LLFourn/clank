@@ -41,28 +41,88 @@ On the next `clank html`:
 
 - Per-commit pages: write one for each new event in the
   slice. Don't touch the prior commit pages.
-- Index timeline: parse out the existing `<ol class="timeline">`
-  content, prepend the new event rows above the existing
-  rows (newest-first stays correct), and write the
+- Index timeline: parse the existing `<div class="timeline">`
+  block out of the document (see "HTML container shape"
+  below for why it's a `<div>`, not `<ol>`). Splice in the
+  new rows per the boundary rules below. Write the
   document back. Update the `clank:last-built-sha` meta.
 - Subjects for the slice come from a fresh
   `collect_subjects(repo, Some(new_head))` scoped to the new
   range only (cheap: one `git log` call against the slice).
 
+### Umbrella boundary merge
+
+The new slice's earliest event may belong in the SAME
+umbrella as the existing topmost rendered row (e.g. prior
+build ended with `[foo] revise`; the new slice starts with
+`[foo] impl`). Blindly prepending a new `[foo]` umbrella
+would produce two `[foo]` cycles for what is actually one
+continuous cycle.
+
+Rule the splicer applies, in order:
+
+1. Read the prior index's TOPMOST umbrella (the most
+   recently rendered group): its `data-umbrella-key`
+   attribute (`foo`, `bar`, `ad-hoc`, etc.) plus its
+   `data-umbrella-tail-sha` attribute (sha of its
+   most-recent row).
+2. Group the NEW slice's events into umbrellas using the
+   same grouping rule as a full rebuild.
+3. If the FIRST umbrella in the new grouping shares the
+   same key as the prior topmost umbrella, MERGE: append
+   the new rows into the existing umbrella's row list (in
+   the prior index's DOM), update the umbrella's
+   `data-umbrella-tail-sha` to the new latest sha. Then
+   prepend the REMAINING new umbrellas above it.
+4. Otherwise: prepend all new umbrellas above the prior
+   topmost row.
+
+Tag every umbrella with `data-umbrella-key=` (and
+`data-umbrella-tail-sha=` on the latest row inside it) at
+render time so the splicer doesn't have to re-derive group
+identity from text.
+
+### HTML container shape
+
+`<section class="umbrella">` inside an `<ol class="timeline">`
+is invalid HTML — `<ol>` only accepts `<li>` children. Two
+clean options:
+
+- (a) `<div class="timeline">` containing
+  `<section class="umbrella">` blocks containing
+  `<div class="row">` rows. Loses the implicit ordered-list
+  semantic but the visual order is clear without it.
+- (b) Keep `<ol class="timeline">` with `<li class="umbrella">`
+  wrappers, each carrying an internal `<header>` + a
+  nested `<ol class="rows">` of `<li class="row">`. More
+  semantically correct but heavier markup.
+
+Decision: ship (a). Simpler, easier to splice, and the
+"timeline" semantic is already implicit from the heading.
+Document this on the renderer so a future maintainer
+doesn't reach for `<ol>` again by reflex.
+
 ### Feedback re-check window
 
 Feedback can land on old commits after the prior build —
 codex might approve commit X half an hour after the html
-was generated. Re-render those tile-by-tile is cheap if we
-bound the work:
+was generated. Re-rendering them tile-by-tile is cheap if
+we bound the work:
 
 - Re-scan feedback for the TOP N commits of the prior
   timeline (N = 10). For each, if the feedback set has
-  changed (compare against the verdict marks rendered in
-  the prior index — easiest is to look up the per-commit
-  page's review section and re-write it from the new
-  scan).
-- Plus the full feedback scan for every new slice commit.
+  changed, rewrite BOTH:
+  1. The `<section class="reviews">` block on that
+     commit's per-commit page, AND
+  2. The `<span class="marks">` element on that commit's
+     row in the index `<div class="timeline">`.
+- Plus the full feedback scan for every new slice commit
+  (their pages and rows are being written for the first
+  time, so no diffing needed).
+
+For (2), tag each row with `data-sha=<full-sha>` at render
+time. The splicer finds the row by selector and replaces
+just the marks span — surgical, no row reflow.
 
 Feedback for commits older than the top 10 of the prior
 timeline is not re-checked. Trade-off explicitly: stale
@@ -262,6 +322,28 @@ Incremental:
   feedback on a prior-build commit AFTER the first build;
   run the second build; assert the per-commit page's
   review section reflects the new feedback.
+- `html_incremental_updates_index_verdict_marks` — same
+  setup as above, but the assertion checks the INDEX
+  timeline row's `<span class="marks">` for that commit
+  also shows the new verdict (regression for the case
+  where commit pages were updated but the index marks
+  went stale).
+- `html_incremental_merges_continuation_umbrella` —
+  fold ends with `[foo] revise` as the topmost row inside
+  a `[foo]` umbrella; add a new `[foo] impl` commit; run
+  incremental; assert the rendered index has exactly ONE
+  `[foo]` umbrella, containing both the prior rows and
+  the new row.
+- `html_incremental_starts_new_umbrella_on_plan_change` —
+  prior tail is `[foo] revise`; new slice is
+  `[bar] intro`; assert the rendered index has TWO
+  umbrellas, `[bar]` above `[foo]`, in that order.
+- `html_timeline_uses_div_container_not_ol` — assert
+  the rendered `class="timeline"` element is a `<div>`,
+  not an `<ol>` (and that umbrella `<section>` blocks
+  appear as its direct children; no `<li>` parents). This
+  pins the valid-HTML decision so a future change can't
+  silently regress it.
 - `html_incremental_falls_back_to_full_rebuild_when_prev_head_not_ancestor`
   — write a marker with a SHA from a discarded branch;
   assert the build runs a full rebuild and overwrites
