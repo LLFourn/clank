@@ -845,9 +845,13 @@ fn render_file_patch(fp: &FilePatch) -> String {
 }
 
 fn classify_line(line: &str) -> (&'static str, &'static str, &str) {
-    if line.starts_with("+++") || line.starts_with("---") {
-        return ("meta", " ", line);
-    }
+    // `parse_unified_diff` puts file-header lines (`+++ b/...`
+    // and `--- a/...`) on FilePatch::header, not in any hunk
+    // body. Inside a hunk body, the leading `+`/`-` is always
+    // the diff sign — content that itself starts with `+`/`-`
+    // (e.g. an added `++x` line lands as `+++x`) still has
+    // the diff sign as its first byte. Classify on that byte
+    // alone; never re-special-case multi-byte prefixes.
     if let Some(rest) = line.strip_prefix('+') {
         ("add", "+", rest)
     } else if let Some(rest) = line.strip_prefix('-') {
@@ -855,8 +859,8 @@ fn classify_line(line: &str) -> (&'static str, &'static str, &str) {
     } else if let Some(rest) = line.strip_prefix(' ') {
         ("ctx", " ", rest)
     } else if line.starts_with('\\') {
-        // "\ No newline at end of file" — treat as a context
-        // annotation; show verbatim with empty line numbers.
+        // "\ No newline at end of file" — context annotation;
+        // show verbatim with empty line numbers.
         ("meta", " ", line)
     } else {
         ("ctx", " ", line)

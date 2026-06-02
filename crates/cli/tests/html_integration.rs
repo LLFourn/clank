@@ -882,6 +882,52 @@ fn html_diff_hunk_header_uses_full_width_band() {
 }
 
 #[test]
+fn html_diff_classifies_plus_plus_and_minus_minus_content_as_add_del() {
+    // Regression: lines whose source content starts with `++`
+    // or `--` produce hunk-body lines that look like `+++…`
+    // / `---…`. These are NOT file headers (parse_unified_diff
+    // already split those out) — they're real add/del rows
+    // with `++…` / `--…` as their content.
+    let dir = init_repo();
+    let repo = dir.path();
+    write(repo, ".clank/plans/foo.md", "# foo\n");
+    commit(repo, "[foo] intro");
+    // Seed a file with `--something` so the next commit
+    // produces a hunk that adds `++replaced` and deletes
+    // `--something`. Both source lines start with two of the
+    // diff-sign character.
+    write(repo, "src/x.txt", "--something\n");
+    commit(repo, "[foo] seed");
+    write(repo, "src/x.txt", "++replaced\n");
+    commit(repo, "[foo] mutate");
+    let sha = head_sha(repo);
+
+    let out = run_clank(repo, &["html"]);
+    assert!(out.status.success());
+    let page =
+        std::fs::read_to_string(repo.join(format!(".clank/html/commit/{sha}.html"))).unwrap();
+
+    // The add row should classify as `add` (not meta) with
+    // sign `+` and source `++replaced` visible.
+    assert!(
+        page.contains("class=\"line add\"") && page.contains("++replaced"),
+        "added line `++replaced` must classify as add; page len {}",
+        page.len()
+    );
+    // Same for the delete side.
+    assert!(
+        page.contains("class=\"line del\"") && page.contains("--something"),
+        "deleted line `--something` must classify as del; page len {}",
+        page.len()
+    );
+    // The `meta` class must NOT appear for these lines.
+    assert!(
+        !page.contains("class=\"line meta\">+"),
+        "no add/del line should be misclassified as meta"
+    );
+}
+
+#[test]
 fn html_diff_rows_have_no_trailing_newline_in_markup() {
     // The pre-fancy renderer emitted "</span>\n<span" which
     // combined with a 1.4 line-height to produce a visible
