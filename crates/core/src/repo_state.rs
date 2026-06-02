@@ -65,6 +65,16 @@ pub struct RepoState {
     /// filters by `(sha, plan)` for display; it never re-runs the
     /// classifier on historical commits.
     pub warnings: Vec<RepoWarning>,
+
+    /// Has this repo ever participated in clank? Set true on the
+    /// first commit that touches any plan (intro / revise /
+    /// finalize / delete) and never cleared, even when
+    /// `PlanDeleted` removes the plan from `plans` without
+    /// promoting it into `finished_plans`. Gate for `LogEvent::AdHoc`
+    /// emission — pre-adoption code commits don't surface as
+    /// ad-hoc events.
+    #[serde(default)]
+    pub adopted: bool,
 }
 
 /// One active plan. Just its per-commit timeline; every other
@@ -497,14 +507,18 @@ impl RepoState {
                         .entry(touch.plan.clone())
                         .or_insert_with(PlanState::default);
                     intros_this_commit.insert(touch.plan.clone());
+                    self.adopted = true;
                     log_events.push(LogEvent::PlanIntro {
                         plan: touch.plan.clone(),
                         sha: event.sha.clone(),
                         ts: event.author_ts,
                     });
                 }
-                TouchKind::Revise => {}
+                TouchKind::Revise => {
+                    self.adopted = true;
+                }
                 TouchKind::Delete => {
+                    self.adopted = true;
                     log_events.push(LogEvent::PlanDeleted {
                         plan: touch.plan.clone(),
                         sha: event.sha.clone(),
@@ -544,6 +558,7 @@ impl RepoState {
                 touched_code: tc,
             });
             if !intros_this_commit.contains(plan) && !finished_this_commit.contains(plan) {
+                self.adopted = true;
                 log_events.push(LogEvent::PlanCommit {
                     plan: plan.clone(),
                     sha: event.sha.clone(),
@@ -565,6 +580,7 @@ impl RepoState {
                 intro,
                 finalized_at: event.sha.clone(),
             });
+            self.adopted = true;
             log_events.push(LogEvent::PlanFinalized {
                 plan: plan.clone(),
                 sha: event.sha.clone(),
@@ -576,10 +592,14 @@ impl RepoState {
         }
 
         // Ad-hoc bucket: bare code-only commit with no touches and
-        // no attribution.
+        // no attribution. Gated on `self.adopted` so pre-adoption
+        // history (everything before the first plan touch in this
+        // repo) doesn't flood the log / bucket with AdHoc events.
+        // `adopted` is durable, so a later PlanDeleted that drops
+        // `plans` doesn't reverse the gate.
         if !touches.is_empty() || !classified.plan_attribution.is_empty() {
             self.ad_hoc.clear();
-        } else {
+        } else if self.adopted {
             if event.has_code_changes {
                 self.ad_hoc.push(AdHocEvent {
                     sha: event.sha.clone(),
@@ -1096,19 +1116,134 @@ mod tests {
 
     #[test]
     fn plan_commit_supersedes_adhoc() {
+        // Adoption first, then a plain commit lands in ad_hoc,
+        // then a plan touch supersedes it. (Pre-adoption plain
+        // commits don't enter ad_hoc at all — see
+        // `adhoc_suppressed_before_first_plan_intro`.)
         let mut s = RepoState::new();
-        let mut e = ev("1111", 1, "fix typo", Vec::new());
+        s.apply_commit(&ev(
+            "1111",
+            1,
+            "[foo] intro",
+            touches(&[("foo", TouchKind::Intro)]),
+        ));
+        let mut e = ev("2222", 2, "fix typo", Vec::new());
         e.has_code_changes = true;
         s.apply_commit(&e);
         assert_eq!(s.ad_hoc.len(), 1);
 
         s.apply_commit(&ev(
-            "2222",
-            2,
+            "3333",
+            3,
+            "[bar] intro",
+            touches(&[("bar", TouchKind::Intro)]),
+        ));
+        assert!(s.ad_hoc.is_empty(), "plan commit should clear ad-hoc");
+    }
+
+    #[test]
+    fn adhoc_suppressed_before_first_plan_intro() {
+        // Fold three plain code commits then a plan intro.
+        // The first three must NOT emit AdHoc events; only the
+        // intro lands in the log.
+        let mut s = RepoState::new();
+        let mut events = Vec::new();
+        for (i, sha) in ["1111", "2222", "3333"].iter().enumerate() {
+            let mut e = ev(sha, (i + 1) as i64, "fix something", Vec::new());
+            e.has_code_changes = true;
+            events.extend(s.apply_commit(&e));
+        }
+        events.extend(s.apply_commit(&ev(
+            "4444",
+            4,
+            "[foo] intro",
+            touches(&[("foo", TouchKind::Intro)]),
+        )));
+        assert!(
+            !events.iter().any(|e| matches!(e, LogEvent::AdHoc { .. })),
+            "no AdHoc events before adoption; got {events:?}"
+        );
+        assert!(s.ad_hoc.is_empty(), "ad_hoc bucket stays empty pre-adoption");
+        assert!(matches!(events.last(), Some(LogEvent::PlanIntro { .. })));
+        assert!(s.adopted);
+    }
+
+    #[test]
+    fn adhoc_emitted_after_first_plan_intro() {
+        // After adoption, a plain code commit DOES emit AdHoc.
+        let mut s = RepoState::new();
+        s.apply_commit(&ev(
+            "1111",
+            1,
             "[foo] intro",
             touches(&[("foo", TouchKind::Intro)]),
         ));
-        assert!(s.ad_hoc.is_empty(), "plan commit should clear ad-hoc");
+        let mut e = ev("2222", 2, "plain code", Vec::new());
+        e.has_code_changes = true;
+        let events = s.apply_commit(&e);
+        assert!(
+            events.iter().any(|e| matches!(e, LogEvent::AdHoc { .. })),
+            "post-adoption plain commit should emit AdHoc; got {events:?}"
+        );
+        assert_eq!(s.ad_hoc.len(), 1);
+    }
+
+    #[test]
+    fn adhoc_emitted_again_after_plan_finalized() {
+        // intro -> finish -> plain code commit. Repo is still
+        // adopted (finished_plans has the entry).
+        let mut s = RepoState::new();
+        s.apply_commit(&ev(
+            "1111",
+            1,
+            "[foo] intro",
+            touches(&[("foo", TouchKind::Intro)]),
+        ));
+        s.apply_commit(&ev(
+            "2222",
+            2,
+            "[foo] finish",
+            touches(&[("foo", TouchKind::Finish)]),
+        ));
+        let mut e = ev("3333", 3, "drive-by fix", Vec::new());
+        e.has_code_changes = true;
+        let events = s.apply_commit(&e);
+        assert!(
+            events.iter().any(|e| matches!(e, LogEvent::AdHoc { .. })),
+            "post-finalize plain commit should emit AdHoc; got {events:?}"
+        );
+    }
+
+    #[test]
+    fn adhoc_emitted_after_plan_deleted_then_plain_commit() {
+        // Codex's flag: intro -> delete -> plain commit.
+        // After PlanDeleted, `plans` is empty AND
+        // `finished_plans` is empty for this plan — but
+        // `adopted` is durable, so the plain commit still
+        // emits AdHoc.
+        let mut s = RepoState::new();
+        s.apply_commit(&ev(
+            "1111",
+            1,
+            "[foo] intro",
+            touches(&[("foo", TouchKind::Intro)]),
+        ));
+        s.apply_commit(&ev(
+            "2222",
+            2,
+            "[foo] delete",
+            touches(&[("foo", TouchKind::Delete)]),
+        ));
+        assert!(s.plans.is_empty());
+        assert!(s.finished_plans.is_empty());
+        assert!(s.adopted, "adoption must persist across PlanDeleted");
+        let mut e = ev("3333", 3, "drive-by fix", Vec::new());
+        e.has_code_changes = true;
+        let events = s.apply_commit(&e);
+        assert!(
+            events.iter().any(|e| matches!(e, LogEvent::AdHoc { .. })),
+            "plain commit after PlanDeleted must still emit AdHoc; got {events:?}"
+        );
     }
 
     #[test]

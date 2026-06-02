@@ -24,7 +24,10 @@ const CACHE_MAGIC: &[u8] = b"CLANK-STATE\n";
 
 /// - v1–v5: legacy/coexistence shapes pre-rename (invalid).
 /// - v6: only the new sans-io fold (`clank_core::repo_state::RepoState`).
-const CACHE_FORMAT_VERSION: u32 = 6;
+/// - v7: `RepoState::adopted` field gates pre-adoption AdHoc emission.
+///   Older post-adoption caches would load with `adopted = false` and
+///   silently suppress legitimate AdHoc events; bump forces a re-fold.
+const CACHE_FORMAT_VERSION: u32 = 7;
 const CLANK_CACHE_GENERATION: u32 = 1;
 
 const HEADER_LEN: usize = CACHE_MAGIC.len() + 4 + 4 + 40;
