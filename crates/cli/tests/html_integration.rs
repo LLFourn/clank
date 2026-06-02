@@ -1132,3 +1132,193 @@ fn html_timeline_row_does_not_nest_button_inside_anchor() {
         }
     }
 }
+
+#[test]
+fn html_writes_plan_page_for_each_active_plan() {
+    let dir = init_repo();
+    let repo = dir.path();
+    write(repo, ".clank/plans/foo.md", "# foo\n");
+    commit(repo, "[foo] intro");
+    write(repo, ".clank/plans/bar.md", "# bar\n");
+    commit(repo, "[bar] intro");
+
+    let out = run_clank(repo, &["html"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    assert!(repo.join(".clank/html/plan/foo.html").is_file());
+    assert!(repo.join(".clank/html/plan/bar.html").is_file());
+}
+
+#[test]
+fn html_writes_plan_page_for_finished_plans() {
+    let dir = init_repo();
+    let repo = dir.path();
+    // Seed an intro, approve+finish the commit, then finalize.
+    write(repo, ".clank/plans/foo.md", "# Foo Plan\n\nBody.\n");
+    commit(repo, "[foo] intro");
+    let intro = head_sha(repo);
+    let short = &intro[..7];
+    write(
+        repo,
+        &format!(".clank/agents/alice/feedback/{short}.md"),
+        "FINISHED ship it\n",
+    );
+    // Move .clank/plans/foo.md → .clank/finished/foo.md to
+    // simulate `clank finish` without invoking the bin (the
+    // PlanFinalized event keys on the file path move).
+    std::fs::create_dir_all(repo.join(".clank/finished")).unwrap();
+    std::fs::rename(
+        repo.join(".clank/plans/foo.md"),
+        repo.join(".clank/finished/foo.md"),
+    )
+    .unwrap();
+    commit(repo, "[foo] finish");
+
+    let out = run_clank(repo, &["html"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let page = repo.join(".clank/html/plan/foo.html");
+    assert!(
+        page.is_file(),
+        "plan/foo.html should exist for finished plan"
+    );
+    let body = std::fs::read_to_string(&page).unwrap();
+    assert!(
+        body.contains("# Foo Plan") || body.contains("<h1>Foo Plan</h1>"),
+        "finished plan body should be rendered; got:\n{body}"
+    );
+}
+
+#[test]
+fn html_plan_page_contains_events_for_that_plan_only() {
+    let dir = init_repo();
+    let repo = dir.path();
+    write(repo, ".clank/plans/foo.md", "# foo\n");
+    commit(repo, "[foo] intro");
+    let foo_sha = head_sha(repo);
+    write(repo, ".clank/plans/bar.md", "# bar\n");
+    commit(repo, "[bar] intro");
+    let bar_sha = head_sha(repo);
+
+    let out = run_clank(repo, &["html"]);
+    assert!(out.status.success());
+
+    let foo_page = std::fs::read_to_string(repo.join(".clank/html/plan/foo.html")).unwrap();
+    let bar_page = std::fs::read_to_string(repo.join(".clank/html/plan/bar.html")).unwrap();
+
+    assert!(
+        foo_page.contains(&foo_sha[..7]),
+        "foo page should list the foo intro sha"
+    );
+    assert!(
+        !foo_page.contains(&bar_sha[..7]),
+        "foo page should NOT list the bar intro sha"
+    );
+    assert!(
+        bar_page.contains(&bar_sha[..7]),
+        "bar page should list the bar intro sha"
+    );
+    assert!(
+        !bar_page.contains(&foo_sha[..7]),
+        "bar page should NOT list the foo intro sha"
+    );
+}
+
+#[test]
+fn html_plan_page_renders_markdown_body() {
+    let dir = init_repo();
+    let repo = dir.path();
+    write(
+        repo,
+        ".clank/plans/foo.md",
+        "# Foo Plan\n\nA detailed description.\n",
+    );
+    commit(repo, "[foo] intro");
+
+    let out = run_clank(repo, &["html"]);
+    assert!(out.status.success());
+
+    let page = std::fs::read_to_string(repo.join(".clank/html/plan/foo.html")).unwrap();
+    assert!(
+        page.contains("<h1>Foo Plan</h1>"),
+        "expected rendered <h1> from plan markdown; got:\n{}",
+        &page[..page.len().min(2000)]
+    );
+}
+
+#[test]
+fn html_index_umbrella_links_to_plan_page() {
+    let dir = init_repo();
+    let repo = dir.path();
+    write(repo, ".clank/plans/foo.md", "# foo\n");
+    commit(repo, "[foo] intro");
+
+    let out = run_clank(repo, &["html"]);
+    assert!(out.status.success());
+
+    let index = std::fs::read_to_string(repo.join(".clank/html/index.html")).unwrap();
+    assert!(
+        index.contains("<a class=\"plan-pill\" href=\"plan/foo.html\">foo</a>"),
+        "index umbrella header should link the plan pill to plan/foo.html; got:\n{index}"
+    );
+}
+
+#[test]
+fn html_commit_page_plan_line_links_to_plan_page() {
+    let dir = init_repo();
+    let repo = dir.path();
+    write(repo, ".clank/plans/foo.md", "# foo\n");
+    commit(repo, "[foo] intro");
+    let sha = head_sha(repo);
+
+    let out = run_clank(repo, &["html"]);
+    assert!(out.status.success());
+
+    let page =
+        std::fs::read_to_string(repo.join(format!(".clank/html/commit/{sha}.html"))).unwrap();
+    assert!(
+        page.contains("<a class=\"plan-pill\" href=\"../plan/foo.html\">foo</a>"),
+        "commit page plan-line should link to ../plan/foo.html; got:\n{page}"
+    );
+}
+
+#[test]
+fn html_incremental_rewrites_affected_plan_pages() {
+    let dir = init_repo();
+    let repo = dir.path();
+    write(repo, ".clank/plans/foo.md", "# foo\n");
+    commit(repo, "[foo] intro");
+
+    let out = run_clank(repo, &["html"]);
+    assert!(out.status.success());
+    let foo_page = repo.join(".clank/html/plan/foo.html");
+    let foo_mtime_1 = std::fs::metadata(&foo_page).unwrap().modified().unwrap();
+
+    // Sleep just enough for filesystem mtime resolution to
+    // register a difference if a write happens.
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+
+    // New commit on a DIFFERENT plan; foo's page should NOT
+    // be rewritten.
+    write(repo, ".clank/plans/bar.md", "# bar\n");
+    commit(repo, "[bar] intro");
+
+    let out = run_clank(repo, &["html"]);
+    assert!(out.status.success());
+    let foo_mtime_2 = std::fs::metadata(&foo_page).unwrap().modified().unwrap();
+    let bar_page = repo.join(".clank/html/plan/bar.html");
+    assert!(bar_page.is_file(), "bar.html should have been written");
+
+    assert_eq!(
+        foo_mtime_1, foo_mtime_2,
+        "foo.html should be untouched by an unrelated bar commit"
+    );
+}

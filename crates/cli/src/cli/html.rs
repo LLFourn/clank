@@ -14,6 +14,7 @@ use clank_core::feedback_body::FeedbackBody;
 use clank_core::ids::CommitSha;
 use clank_core::repo_state::LogEvent;
 use clank_core::vocab::Verdict;
+use clank_core::wait::PlanWorkState;
 
 use super::{HtmlArgs, HtmlCmd, repo_basename, resolve_repo};
 use crate::cli::status::StatusSnapshot;
@@ -44,6 +45,7 @@ async fn build_site(
 ) -> anyhow::Result<()> {
     std::fs::create_dir_all(out_dir)?;
     std::fs::create_dir_all(out_dir.join("commit"))?;
+    std::fs::create_dir_all(out_dir.join("plan"))?;
 
     let status = StatusSnapshot::build_async(
         repo,
@@ -155,6 +157,58 @@ async fn build_site(
         let path = out_dir.join(format!("commit/{}.html", sha.as_str()));
         let page = render_commit_page(repo, event, &reviews);
         std::fs::write(&path, page)?;
+        progress.tick(i + 1);
+    }
+    progress.end();
+
+    // Plan pages. One per active or finished plan. On full
+    // rebuild every page is rewritten; on incremental, only
+    // plans whose events appeared in the SLICE (not the top-N
+    // feedback re-check window). Top-N re-checks only refresh
+    // verdict-mark state, which the plan page also shows but
+    // doesn't materially change between identical reviews —
+    // we accept slightly stale plan-page marks until the next
+    // commit on that plan or a `--rebuild`.
+    let plan_buckets = collect_plan_buckets(&events);
+    let slice_plans: std::collections::HashSet<String> = match prior_events.as_ref() {
+        Some(prior) => events
+            .iter()
+            .skip(prior.len())
+            .filter_map(|e| event_plan(e).map(str::to_string))
+            .collect(),
+        None => plan_buckets.keys().cloned().collect(),
+    };
+    let affected: std::collections::HashSet<String> = if force_rebuild {
+        plan_buckets.keys().cloned().collect()
+    } else {
+        slice_plans
+    };
+    let plan_writes: Vec<(&String, &PlanLifecycle)> = plan_buckets
+        .iter()
+        .filter(|(stem, _)| affected.contains(stem.as_str()))
+        .collect();
+    let work_by_stem: BTreeMap<String, &PlanWorkState> = status
+        .plans
+        .iter()
+        .map(|p| (p.plan.as_str().to_string(), p))
+        .collect();
+    progress.begin("writing plan pages", plan_writes.len());
+    for (i, (stem, lifecycle)) in plan_writes.iter().enumerate() {
+        let plan_events: Vec<LogEvent> = events
+            .iter()
+            .filter(|e| event_plan(e) == Some(stem.as_str()))
+            .cloned()
+            .collect();
+        let page = render_plan_page(
+            repo,
+            stem.as_str(),
+            **lifecycle,
+            &plan_events,
+            &reviews,
+            &subjects,
+            work_by_stem.get(stem.as_str()).copied(),
+        );
+        std::fs::write(out_dir.join(format!("plan/{stem}.html")), page)?;
         progress.tick(i + 1);
     }
     progress.end();
@@ -425,10 +479,26 @@ fn render_index(
 
     out.push_str("<main>\n");
     out.push_str("<h2>Timeline</h2>\n");
-    out.push_str(&render_timeline(events, reviews, subjects));
+    out.push_str(&render_timeline(
+        events,
+        reviews,
+        subjects,
+        PlanLinkMode::LinkRelativeToIndex,
+    ));
     out.push_str("</main>\n");
     write_doc_close(&mut out);
     out
+}
+
+/// How umbrella plan-pills link out.
+#[derive(Copy, Clone)]
+enum PlanLinkMode {
+    /// `<a class="plan-pill" href="plan/<stem>.html">…</a>`
+    /// — used on the index page.
+    LinkRelativeToIndex,
+    /// Plain `<span class="plan-pill">` — used on a plan page
+    /// itself (self-link is noise).
+    NoLink,
 }
 
 /// Render the `<div class="timeline">` block: newest-first
@@ -439,6 +509,7 @@ fn render_timeline(
     events: &[LogEvent],
     reviews: &BTreeMap<String, Vec<Review>>,
     subjects: &BTreeMap<String, String>,
+    plan_link_mode: PlanLinkMode,
 ) -> String {
     if events.is_empty() {
         return "<p class=\"empty\">No events yet.</p>\n".to_string();
@@ -454,7 +525,13 @@ fn render_timeline(
             .position(|e| umbrella_key(e) != key)
             .unwrap_or(newest_first.len());
         let (run, rest) = newest_first.split_at(split);
-        out.push_str(&render_umbrella(&key, run, reviews, subjects));
+        out.push_str(&render_umbrella(
+            &key,
+            run,
+            reviews,
+            subjects,
+            plan_link_mode,
+        ));
         newest_first = rest.to_vec();
     }
     out.push_str("</div>\n");
@@ -468,6 +545,7 @@ fn render_umbrella(
     rows: &[&LogEvent],
     reviews: &BTreeMap<String, Vec<Review>>,
     subjects: &BTreeMap<String, String>,
+    plan_link_mode: PlanLinkMode,
 ) -> String {
     let mut out = format!(
         "<section class=\"umbrella umbrella-{kind}\" data-umbrella-key=\"{key_attr}\">\n",
@@ -476,9 +554,16 @@ fn render_umbrella(
     );
     out.push_str("  <header class=\"umbrella-header\">");
     match key {
-        UmbrellaKey::Plan(p) => {
-            out.push_str(&format!("<span class=\"plan-pill\">{}</span>", esc(p)))
-        }
+        UmbrellaKey::Plan(p) => match plan_link_mode {
+            PlanLinkMode::LinkRelativeToIndex => out.push_str(&format!(
+                "<a class=\"plan-pill\" href=\"plan/{}.html\">{}</a>",
+                esc(p),
+                esc(p)
+            )),
+            PlanLinkMode::NoLink => {
+                out.push_str(&format!("<span class=\"plan-pill\">{}</span>", esc(p)))
+            }
+        },
         UmbrellaKey::AdHoc => out.push_str("<span class=\"adhoc-label\">ad-hoc</span>"),
     }
     out.push_str("</header>\n");
@@ -591,7 +676,8 @@ fn render_commit_page(
     ));
     if let Some(p) = plan {
         out.push_str(&format!(
-            "  <div class=\"plan-line\">plan: <span class=\"plan-pill\">{}</span></div>\n",
+            "  <div class=\"plan-line\">plan: <a class=\"plan-pill\" href=\"../plan/{}.html\">{}</a></div>\n",
+            esc(p),
             esc(p)
         ));
     }
@@ -692,6 +778,153 @@ fn render_commit_page(
     out.push_str("</main>\n");
     write_doc_close(&mut out);
     out
+}
+
+// ───────────────────────── plan page ────────────────────────
+
+/// Lifecycle slot of a plan as inferred from its events.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PlanLifecycle {
+    Active,
+    Finished,
+}
+
+/// Walk `events` and group plan-tagged ones by stem along
+/// with the lifecycle implied by the latest plan-touching
+/// event. Plans whose latest event is `PlanDeleted` are
+/// excluded.
+fn collect_plan_buckets(events: &[LogEvent]) -> BTreeMap<String, PlanLifecycle> {
+    let mut latest: BTreeMap<String, &LogEvent> = BTreeMap::new();
+    for e in events {
+        if let Some(stem) = event_plan(e) {
+            // Last write wins → latest event per stem.
+            latest.insert(stem.to_string(), e);
+        }
+    }
+    let mut out = BTreeMap::new();
+    for (stem, e) in latest {
+        match e {
+            LogEvent::PlanDeleted { .. } => continue,
+            LogEvent::PlanFinalized { .. } => {
+                out.insert(stem, PlanLifecycle::Finished);
+            }
+            _ => {
+                out.insert(stem, PlanLifecycle::Active);
+            }
+        }
+    }
+    out
+}
+
+/// `git show HEAD:<.clank/{plans,finished}/<stem>.md>` —
+/// empty `None` if either git or the path resolves
+/// unsuccessfully.
+fn plan_body_at_head(repo: &Path, stem: &str, lifecycle: PlanLifecycle) -> Option<String> {
+    let head = head_sha(repo).ok().flatten()?;
+    let path = match lifecycle {
+        PlanLifecycle::Active => format!(".clank/plans/{stem}.md"),
+        PlanLifecycle::Finished => format!(".clank/finished/{stem}.md"),
+    };
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["show", &format!("{}:{path}", head.as_str())])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    Some(String::from_utf8_lossy(&out.stdout).to_string())
+}
+
+fn render_plan_page(
+    repo: &Path,
+    stem: &str,
+    lifecycle: PlanLifecycle,
+    plan_events: &[LogEvent],
+    reviews: &BTreeMap<String, Vec<Review>>,
+    subjects: &BTreeMap<String, String>,
+    work: Option<&PlanWorkState>,
+) -> String {
+    let mut out = String::new();
+    write_doc_open(&mut out, &format!("plan {stem} · clank"), "..");
+    out.push_str("<header class=\"plan-header\">\n");
+    out.push_str("  <p class=\"crumb\"><a href=\"../index.html\">← timeline</a></p>\n");
+    out.push_str(&format!(
+        "  <h1><span class=\"plan-pill\">{}</span></h1>\n",
+        esc(stem)
+    ));
+    let state_line = match lifecycle {
+        PlanLifecycle::Active => {
+            let mut bits = vec!["active".to_string()];
+            if let Some(w) = work {
+                bits.push(format!("gate: {}", verdict_gate_label(w.gate)));
+                let waiting = waiting_on_label(&w.waiting_on);
+                if !waiting.is_empty() {
+                    bits.push(format!("waiting on {waiting}"));
+                }
+            }
+            bits.join(" · ")
+        }
+        PlanLifecycle::Finished => "finished".to_string(),
+    };
+    out.push_str(&format!(
+        "  <div class=\"plan-state\">{}</div>\n",
+        esc(&state_line)
+    ));
+    out.push_str("</header>\n");
+
+    out.push_str("<main>\n");
+    out.push_str("<h2>Timeline</h2>\n");
+    out.push_str(&render_timeline(
+        plan_events,
+        reviews,
+        subjects,
+        PlanLinkMode::NoLink,
+    ));
+
+    if let Some(md) = plan_body_at_head(repo, stem, lifecycle) {
+        out.push_str("<section class=\"plan-body\">\n");
+        out.push_str("  <h3>Plan (latest revision)</h3>\n");
+        out.push_str("  <article class=\"md\">\n");
+        out.push_str(&render_markdown(&md));
+        out.push_str("  </article>\n");
+        out.push_str("</section>\n");
+    }
+
+    out.push_str("</main>\n");
+    write_doc_close(&mut out);
+    out
+}
+
+fn verdict_gate_label(g: clank_core::vocab::CommitGateState) -> &'static str {
+    use clank_core::vocab::CommitGateState as G;
+    match g {
+        G::Approved => "approved",
+        G::Finished => "finished",
+        G::ChangesRequested => "changes-requested",
+        G::Unreviewed => "unreviewed",
+    }
+}
+
+fn waiting_on_label(w: &clank_core::plan_view::WaitingOn) -> String {
+    use clank_core::plan_view::WaitingOn as W;
+    match w {
+        W::FirstReview => "first review".to_string(),
+        W::ReviewerApprovalsMissing { missing } => {
+            let mut names: Vec<String> = missing
+                .as_slice()
+                .iter()
+                .map(|a| a.as_str().to_string())
+                .collect();
+            names.sort();
+            format!("reviewers ({})", names.join(", "))
+        }
+        W::MasterToRevise { .. } => "master to revise".to_string(),
+        W::MasterToContinue => "master to continue".to_string(),
+        W::MasterToFinalize => "master to finalize".to_string(),
+        W::MasterToCommit => "master to commit".to_string(),
+    }
 }
 
 // ─────────────────────────── diff ───────────────────────────
@@ -1223,6 +1456,11 @@ header.status h1 { margin: 0 0 .25rem; font-size: 1.2rem; }
   background: var(--pill-bg); color: var(--pill-fg);
   padding: .15rem .45rem; border-radius: 999px;
 }
+a.plan-pill { text-decoration: none; }
+a.plan-pill:hover { filter: brightness(0.96); }
+.plan-header { max-width: 880px; margin: 0 auto; padding: 1rem 1.5rem; border-bottom: 1px solid var(--rule); }
+.plan-header h1 { margin: .25rem 0; }
+.plan-state { color: var(--fg-dim); font-size: .9rem; margin-top: .25rem; }
 .gate { font-size: .8rem; padding: 0 .35rem; border-radius: 4px; }
 .gate-approved { color: var(--approve); }
 .gate-finished { color: var(--finished); }
