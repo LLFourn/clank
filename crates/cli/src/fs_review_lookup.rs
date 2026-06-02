@@ -31,10 +31,9 @@ impl ReviewLookup for FsReviewLookup<'_> {
 
         for agent_entry in agents.flatten() {
             let agent_name = agent_entry.file_name();
-            let Some(label) =
-                agent_name
-                    .to_str()
-                    .and_then(|s| clank_core::ids::AgentLabel::parse(s).ok())
+            let Some(label) = agent_name
+                .to_str()
+                .and_then(|s| clank_core::ids::AgentLabel::parse(s).ok())
             else {
                 continue;
             };

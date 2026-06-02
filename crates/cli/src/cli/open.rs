@@ -308,10 +308,7 @@ async fn inspect(requested: &str) -> anyhow::Result<OpenResponse> {
     let (state, mut recommendations) = if init_gaps.is_empty() {
         (OpenState::ClankReady, Vec::new())
     } else {
-        let gap_kinds: Vec<String> = init_gaps
-            .iter()
-            .map(|g| g.kind_str().to_string())
-            .collect();
+        let gap_kinds: Vec<String> = init_gaps.iter().map(|g| g.kind_str().to_string()).collect();
         (
             OpenState::ClankInitNeeded,
             vec![Recommendation::ClankInit {
@@ -339,9 +336,9 @@ async fn inspect(requested: &str) -> anyhow::Result<OpenResponse> {
 /// gaps + drift warnings.
 fn probe_init_state(repo: &Path) -> (Vec<InitGap>, Vec<String>) {
     use crate::init_facts::{
-        ClaudePermsState, GitignoreState, HookState, classify_claude_perms,
-        classify_clank_gitignore, classify_post_rewrite_hook, claude_perms_path,
-        clank_gitignore_path, post_rewrite_hook_path,
+        ClaudePermsState, GitignoreState, HookState, clank_gitignore_path,
+        classify_clank_gitignore, classify_claude_perms, classify_post_rewrite_hook,
+        claude_perms_path, post_rewrite_hook_path,
     };
     let mut gaps = Vec::new();
     let mut warnings = Vec::new();
@@ -407,10 +404,7 @@ fn probe_init_state(repo: &Path) -> (Vec<InitGap>, Vec<String>) {
 /// these and doesn't write them, so they're advisories, not
 /// InitGaps.
 fn probe_ancestor_gitignore_advisory(repo: &Path) -> Vec<String> {
-    const TRACKED_PROBES: &[&str] = &[
-        ".clank/plans",
-        ".clank/finished",
-    ];
+    const TRACKED_PROBES: &[&str] = &[".clank/plans", ".clank/finished"];
     let mut out = Vec::new();
     for rel in TRACKED_PROBES {
         let probe = repo.join(rel);
@@ -565,8 +559,8 @@ fn directory_is_empty(path: &Path) -> bool {
 }
 
 async fn clank_info_for_repo(repo_root: &Path) -> (ClankInfo, Vec<Recommendation>, Option<String>) {
-    let agent_configs = crate::agent_store::load_all_agent_configs_lossy(repo_root)
-        .unwrap_or_default();
+    let agent_configs =
+        crate::agent_store::load_all_agent_configs_lossy(repo_root).unwrap_or_default();
 
     let mut master_agents = Vec::<String>::new();
     let mut agents = Vec::<AgentInfo>::new();
@@ -676,9 +670,7 @@ fn walk_for_session(dir: &Path, session_id: &str, depth: usize) -> bool {
                 return true;
             }
         } else if let Some(name) = path.file_name().and_then(|s| s.to_str()) {
-            if name.starts_with("rollout-")
-                && name.ends_with(".jsonl")
-                && name.contains(session_id)
+            if name.starts_with("rollout-") && name.ends_with(".jsonl") && name.contains(session_id)
             {
                 return true;
             }
@@ -688,15 +680,13 @@ fn walk_for_session(dir: &Path, session_id: &str, depth: usize) -> bool {
 }
 
 async fn fold_summary(repo_root: &Path) -> (usize, Option<String>, Option<String>) {
-    let state = match crate::rebuild::rebuild_repo_with_policy(
-        repo_root,
-        crate::rebuild::CachePolicy::Use,
-    )
-    .await
-    {
-        Ok(s) => s,
-        Err(e) => return (0, None, Some(format!("fold failed: {e}"))),
-    };
+    let state =
+        match crate::rebuild::rebuild_repo_with_policy(repo_root, crate::rebuild::CachePolicy::Use)
+            .await
+        {
+            Ok(s) => s,
+            Err(e) => return (0, None, Some(format!("fold failed: {e}"))),
+        };
     let config = crate::cli::config::load(repo_root);
     let work_policy = clank_core::wait::WorkPolicy {
         plan_feedback: config.review.plan_feedback,
@@ -745,10 +735,7 @@ fn print_human(r: &OpenResponse) {
         }
     }
     println!("opened_path:  {}", r.opened_path);
-    println!(
-        "repo_root:    {}",
-        r.repo_root.as_deref().unwrap_or("-"),
-    );
+    println!("repo_root:    {}", r.repo_root.as_deref().unwrap_or("-"),);
     if let Some(g) = &r.git {
         let branch = g.head_branch.as_deref().unwrap_or("(detached)");
         let clean = if g.dirty { "dirty" } else { "clean" };
@@ -819,9 +806,11 @@ fn rec_label(r: &Recommendation) -> String {
             if gaps.is_empty() {
                 format!("clank init in `{cwd}`")
             } else {
-                format!("clank init in `{cwd}` ({} gap{})",
+                format!(
+                    "clank init in `{cwd}` ({} gap{})",
                     gaps.len(),
-                    if gaps.len() == 1 { "" } else { "s" })
+                    if gaps.len() == 1 { "" } else { "s" }
+                )
             }
         }
         Recommendation::BindAgent { label, tool } => {

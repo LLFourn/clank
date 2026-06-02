@@ -99,7 +99,10 @@ pub fn load(repo_root: &Path) -> Config {
 
 fn load_with_home(repo_root: &Path, home: Option<&Path>) -> Config {
     let mut cfg = Config::default();
-    let _ = apply_layer(&mut cfg, home.map(|h| h.join(".clank/config.json")).as_deref());
+    let _ = apply_layer(
+        &mut cfg,
+        home.map(|h| h.join(".clank/config.json")).as_deref(),
+    );
     let _ = apply_layer(&mut cfg, Some(&repo_root.join(".clank/config.json")));
     cfg
 }
@@ -571,10 +574,7 @@ mod tests {
     fn repo_layer_overrides_defaults() {
         let tmp = tempfile::tempdir().unwrap();
         let repo_cfg = tmp.path().join(".clank/config.json");
-        write(
-            &repo_cfg,
-            r#"{"review": {"adhoc_feedback": false}}"#,
-        );
+        write(&repo_cfg, r#"{"review": {"adhoc_feedback": false}}"#);
         let cfg = load_isolated(tmp.path());
         assert!(!cfg.review.adhoc_feedback);
         assert!(cfg.review.plan_feedback);
@@ -611,7 +611,10 @@ mod tests {
             r#"{"hooks": {"master_work": "notify master", "idle": "do idle"}}"#,
         );
         let cfg = load_isolated(tmp.path());
-        assert_eq!(cfg.hooks[&HookEvent::MasterWork], Some("notify master".to_string()));
+        assert_eq!(
+            cfg.hooks[&HookEvent::MasterWork],
+            Some("notify master".to_string())
+        );
         assert_eq!(cfg.hooks[&HookEvent::Idle], Some("do idle".to_string()));
     }
 
@@ -619,12 +622,12 @@ mod tests {
     fn hooks_kebab_alias_in_config_json() {
         let tmp = tempfile::tempdir().unwrap();
         let repo_cfg = tmp.path().join(".clank/config.json");
-        write(
-            &repo_cfg,
-            r#"{"hooks": {"master-work": "kebab-cmd"}}"#,
-        );
+        write(&repo_cfg, r#"{"hooks": {"master-work": "kebab-cmd"}}"#);
         let cfg = load_isolated(tmp.path());
-        assert_eq!(cfg.hooks[&HookEvent::MasterWork], Some("kebab-cmd".to_string()));
+        assert_eq!(
+            cfg.hooks[&HookEvent::MasterWork],
+            Some("kebab-cmd".to_string())
+        );
     }
 
     #[test]
@@ -655,9 +658,7 @@ mod tests {
             repo: Some(tmp.path().to_path_buf()),
             json: false,
         };
-        let result = tokio::runtime::Runtime::new()
-            .unwrap()
-            .block_on(run(args));
+        let result = tokio::runtime::Runtime::new().unwrap().block_on(run(args));
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("bool"));
     }
@@ -668,7 +669,10 @@ mod tests {
         std::fs::create_dir_all(tmp.path().join(".clank")).unwrap();
         set_repo_key(tmp.path(), "review", "adhoc_feedback", "false", "bool").unwrap();
         let kvs = resolve_key_values_with_home(tmp.path(), None);
-        let kv = kvs.iter().find(|kv| kv.key == "review.adhoc_feedback").unwrap();
+        let kv = kvs
+            .iter()
+            .find(|kv| kv.key == "review.adhoc_feedback")
+            .unwrap();
         assert_eq!(kv.value, "false");
         assert_eq!(kv.source, ValueSource::Repo);
     }
@@ -681,7 +685,10 @@ mod tests {
             r#"{"review": {"adhoc_feedback": false}}"#,
         );
         let kvs = resolve_key_values_with_home(tmp.path(), None);
-        let kv = kvs.iter().find(|kv| kv.key == "review.adhoc_feedback").unwrap();
+        let kv = kvs
+            .iter()
+            .find(|kv| kv.key == "review.adhoc_feedback")
+            .unwrap();
         assert_eq!(kv.value, "false");
         assert_eq!(kv.source, ValueSource::Repo);
     }
@@ -693,7 +700,10 @@ mod tests {
         set_repo_key(tmp.path(), "hooks", "master_work", "true", "string|null").unwrap();
         let body = std::fs::read_to_string(tmp.path().join(".clank/config.json")).unwrap();
         let v: serde_json::Value = serde_json::from_str(&body).unwrap();
-        assert_eq!(v["hooks"]["master_work"], serde_json::Value::String("true".into()));
+        assert_eq!(
+            v["hooks"]["master_work"],
+            serde_json::Value::String("true".into())
+        );
     }
 
     #[test]
@@ -719,9 +729,7 @@ mod tests {
             repo: Some(tmp.path().to_path_buf()),
             json: false,
         };
-        let result = tokio::runtime::Runtime::new()
-            .unwrap()
-            .block_on(run(args));
+        let result = tokio::runtime::Runtime::new().unwrap().block_on(run(args));
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("unknown action"));
     }
@@ -734,8 +742,10 @@ mod tests {
             r#"{"review": {"adhoc_feedback": true}}"#,
         );
         let kvs = resolve_key_values_with_home(tmp.path(), None);
-        let kv = kvs.iter().find(|kv| kv.key == "review.adhoc_feedback").unwrap();
+        let kv = kvs
+            .iter()
+            .find(|kv| kv.key == "review.adhoc_feedback")
+            .unwrap();
         assert_eq!(kv.source, ValueSource::Repo);
     }
-
 }

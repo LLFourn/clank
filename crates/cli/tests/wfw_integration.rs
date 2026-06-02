@@ -77,11 +77,7 @@ impl TestEnv {
         // work is visible (matches pre-adhoc-review behavior).
         let cfg_path = repo.path().join(".clank/config.json");
         std::fs::create_dir_all(cfg_path.parent().unwrap()).unwrap();
-        std::fs::write(
-            &cfg_path,
-            r#"{"review":{"adhoc_feedback":false}}"#,
-        )
-        .unwrap();
+        std::fs::write(&cfg_path, r#"{"review":{"adhoc_feedback":false}}"#).unwrap();
         Self {
             home: tempfile::tempdir().unwrap(),
             repo,
@@ -1174,7 +1170,9 @@ fn wfw_hook_fires_reviewer_work() {
     write(
         repo,
         ".clank/config.json",
-        &format!(r#"{{"review":{{"adhoc_feedback":false}},"hooks":{{"reviewer-work":"{hook_cmd}"}}}}"#),
+        &format!(
+            r#"{{"review":{{"adhoc_feedback":false}},"hooks":{{"reviewer-work":"{hook_cmd}"}}}}"#
+        ),
     );
 
     let mut child = env
@@ -1218,7 +1216,11 @@ fn wfw_hook_failure_does_not_fail_wfw() {
     write(repo, "README.md", "# repo\n");
     commit(repo, "init");
 
-    write(repo, ".clank/config.json", r#"{"review":{"adhoc_feedback":false},"hooks":{"reviewer-work":"exit 1"}}"#);
+    write(
+        repo,
+        ".clank/config.json",
+        r#"{"review":{"adhoc_feedback":false},"hooks":{"reviewer-work":"exit 1"}}"#,
+    );
 
     let mut child = env
         .cmd()
@@ -1267,7 +1269,11 @@ fn wfw_master_empty_parks_with_hooks_configured() {
     write(repo, "README.md", "# repo\n");
     commit(repo, "init");
 
-    write(repo, ".clank/config.json", r#"{"review":{"adhoc_feedback":false},"hooks":{"reviewer_work":"true"}}"#);
+    write(
+        repo,
+        ".clank/config.json",
+        r#"{"review":{"adhoc_feedback":false},"hooks":{"reviewer_work":"true"}}"#,
+    );
 
     let output = env
         .cmd()
@@ -1355,14 +1361,20 @@ fn wfw_user_hooks_shadowed_by_repo_hooks() {
     std::fs::create_dir_all(&user_config_dir).unwrap();
     std::fs::write(
         user_config_dir.join("config.json"),
-        format!(r#"{{"hooks":{{"reviewer-work":"touch {}"}}}}"#, user_marker.display()),
+        format!(
+            r#"{{"hooks":{{"reviewer-work":"touch {}"}}}}"#,
+            user_marker.display()
+        ),
     )
     .unwrap();
 
     write(
         repo,
         ".clank/config.json",
-        &format!(r#"{{"review":{{"adhoc_feedback":false}},"hooks":{{"reviewer-work":"touch {}"}}}}"#, repo_marker.display()),
+        &format!(
+            r#"{{"review":{{"adhoc_feedback":false}},"hooks":{{"reviewer-work":"touch {}"}}}}"#,
+            repo_marker.display()
+        ),
     );
 
     let mut child = env
@@ -1408,7 +1420,15 @@ fn wfw_master_parked_wakes_on_queue_item() {
 
     let mut child = spawn_wfw(
         repo,
-        &["--author", "lloyd", "--role", "master", "--timeout", "30s", "--json"],
+        &[
+            "--author",
+            "lloyd",
+            "--role",
+            "master",
+            "--timeout",
+            "30s",
+            "--json",
+        ],
     );
 
     std::fs::create_dir_all(repo.join(".clank/queue")).unwrap();
@@ -1438,15 +1458,19 @@ fn wfw_master_with_active_plan_ignores_queue() {
     commit(repo, "[foo] intro");
 
     std::fs::create_dir_all(repo.join(".clank/queue")).unwrap();
-    std::fs::write(
-        repo.join(".clank/queue/100-queued.md"),
-        "# queued\n",
-    )
-    .unwrap();
+    std::fs::write(repo.join(".clank/queue/100-queued.md"), "# queued\n").unwrap();
 
     let mut child = spawn_wfw(
         repo,
-        &["--author", "lloyd", "--role", "master", "--timeout", "3s", "--json"],
+        &[
+            "--author",
+            "lloyd",
+            "--role",
+            "master",
+            "--timeout",
+            "3s",
+            "--json",
+        ],
     );
 
     let exit = wait_for_exit(&mut child, Duration::from_secs(10));
@@ -1477,7 +1501,15 @@ fn wfw_repo_block_suppresses_available_work() {
 
     let mut child = spawn_wfw(
         repo,
-        &["--author", "claude", "--role", "reviewers", "--timeout", "3s", "--json"],
+        &[
+            "--author",
+            "claude",
+            "--role",
+            "reviewers",
+            "--timeout",
+            "3s",
+            "--json",
+        ],
     );
 
     let exit = wait_for_exit(&mut child, Duration::from_secs(10));
@@ -1512,7 +1544,15 @@ fn wfw_repo_block_suppresses_queue_promotion() {
 
     let mut child = spawn_wfw(
         repo,
-        &["--author", "lloyd", "--role", "master", "--timeout", "3s", "--json"],
+        &[
+            "--author",
+            "lloyd",
+            "--role",
+            "master",
+            "--timeout",
+            "3s",
+            "--json",
+        ],
     );
 
     let exit = wait_for_exit(&mut child, Duration::from_secs(10));
@@ -1544,7 +1584,15 @@ fn wfw_parks_on_pending_block() {
 
     let mut child = spawn_wfw(
         repo,
-        &["--author", "claude", "--role", "master", "--timeout", "3s", "--json"],
+        &[
+            "--author",
+            "claude",
+            "--role",
+            "master",
+            "--timeout",
+            "3s",
+            "--json",
+        ],
     );
 
     let exit = wait_for_exit(&mut child, Duration::from_secs(10));
@@ -1572,7 +1620,15 @@ fn wfw_wakes_on_unblock() {
 
     let mut child = spawn_wfw(
         repo,
-        &["--author", "claude", "--role", "master", "--timeout", "30s", "--json"],
+        &[
+            "--author",
+            "claude",
+            "--role",
+            "master",
+            "--timeout",
+            "30s",
+            "--json",
+        ],
     );
 
     write(

@@ -47,7 +47,6 @@ pub enum PlanTouchKind {
     Finish,
 }
 
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FeedbackBlob {
     pub abs_path: PathBuf,

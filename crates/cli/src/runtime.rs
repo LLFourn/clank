@@ -192,8 +192,7 @@ impl Runtime {
                 )
                 .await;
             }
-            FilesystemSignal::FeedbackWritten { .. }
-            | FilesystemSignal::FeedbackRemoved { .. } => {
+            FilesystemSignal::FeedbackWritten { .. } | FilesystemSignal::FeedbackRemoved { .. } => {
                 {
                     let clank = self.state.lock().await;
                     if !clank.repos.contains_key(repo_root) {

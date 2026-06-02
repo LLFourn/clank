@@ -92,11 +92,12 @@ fn queue_add_from_path_writes_body() {
 #[test]
 fn queue_add_from_stubs_dir_when_present() {
     let dir = init_repo();
-    write(dir.path(), ".clank/stubs/foo.md", "# foo\n\nfrom stubs dir\n");
-    let out = run_queue(
+    write(
         dir.path(),
-        &["add", "foo", "--priority", "400"],
+        ".clank/stubs/foo.md",
+        "# foo\n\nfrom stubs dir\n",
     );
+    let out = run_queue(dir.path(), &["add", "foo", "--priority", "400"]);
     assert!(
         out.status.success(),
         "stubs-dir fallback should work; stderr: {}",
@@ -109,10 +110,7 @@ fn queue_add_from_stubs_dir_when_present() {
 #[test]
 fn queue_add_fails_with_no_body_source() {
     let dir = init_repo();
-    let out = run_queue(
-        dir.path(),
-        &["add", "foo", "--priority", "400"],
-    );
+    let out = run_queue(dir.path(), &["add", "foo", "--priority", "400"]);
     assert!(
         !out.status.success(),
         "must reject when neither -m / --from / stubs file is available"
@@ -208,8 +206,7 @@ fn queue_add_duplicate_short_circuits_before_reading_source() {
         "expected conflict message, NOT a file-IO error; got: {stderr}"
     );
     assert!(
-        !stderr.contains("definitely/does/not/exist")
-            && !stderr.contains("No such file"),
+        !stderr.contains("definitely/does/not/exist") && !stderr.contains("No such file"),
         "source path must NOT be read when the name is a conflict; got: {stderr}"
     );
 }
@@ -243,10 +240,7 @@ fn queue_add_rejects_from_file_that_is_header_only() {
 fn queue_add_rejects_empty_stubs_file() {
     let dir = init_repo();
     write(dir.path(), ".clank/stubs/foo.md", "");
-    let out = run_queue(
-        dir.path(),
-        &["add", "foo", "--priority", "400"],
-    );
+    let out = run_queue(dir.path(), &["add", "foo", "--priority", "400"]);
     assert!(!out.status.success(), "empty stub should be rejected");
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(

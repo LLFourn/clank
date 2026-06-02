@@ -118,10 +118,7 @@ fn pick_body_source(
 /// `# <name>` header. Returns the normalized body (with a
 /// leading header prepended when missing) or an error
 /// citing the source.
-fn normalize_and_validate(
-    name: &str,
-    source: BodySource,
-) -> anyhow::Result<String> {
+fn normalize_and_validate(name: &str, source: BodySource) -> anyhow::Result<String> {
     let raw = source.raw;
     let has_header = raw
         .lines()
@@ -241,12 +238,7 @@ fn validate_name(name: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn add(
-    repo: &Path,
-    name: &str,
-    priority: u16,
-    source: BodySource,
-) -> anyhow::Result<()> {
+fn add(repo: &Path, name: &str, priority: u16, source: BodySource) -> anyhow::Result<()> {
     validate_name(name)?;
     if priority > 999 {
         anyhow::bail!("priority must be 0-999");
@@ -389,7 +381,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let result = add(dir.path(), ".hidden", 100, inline("body\n"));
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("invalid plan name"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("invalid plan name")
+        );
     }
 
     #[test]
@@ -412,15 +409,8 @@ mod tests {
     #[test]
     fn add_preserves_existing_header_when_present() {
         let dir = tempfile::tempdir().unwrap();
-        add(
-            dir.path(),
-            "foo",
-            400,
-            inline("# foo\n\nreal body\n"),
-        )
-        .unwrap();
-        let body = std::fs::read_to_string(dir.path().join(".clank/queue/400-foo.md"))
-            .unwrap();
+        add(dir.path(), "foo", 400, inline("# foo\n\nreal body\n")).unwrap();
+        let body = std::fs::read_to_string(dir.path().join(".clank/queue/400-foo.md")).unwrap();
         assert_eq!(body, "# foo\n\nreal body\n");
     }
 

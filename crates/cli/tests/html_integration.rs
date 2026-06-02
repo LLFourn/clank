@@ -134,7 +134,8 @@ fn html_commit_page_for_plan_only_renders_markdown() {
 
     let out = run_clank(repo, &["html"]);
     assert!(out.status.success());
-    let page = std::fs::read_to_string(repo.join(format!(".clank/html/commit/{sha}.html"))).unwrap();
+    let page =
+        std::fs::read_to_string(repo.join(format!(".clank/html/commit/{sha}.html"))).unwrap();
     assert!(
         page.contains("<h1>Foo Plan</h1>"),
         "rendered markdown should include <h1>; page snippet:\n{}",
@@ -197,7 +198,8 @@ fn html_commit_page_renders_feedback_with_verdict_marks() {
 
     let out = run_clank(repo, &["html"]);
     assert!(out.status.success());
-    let page = std::fs::read_to_string(repo.join(format!(".clank/html/commit/{sha}.html"))).unwrap();
+    let page =
+        std::fs::read_to_string(repo.join(format!(".clank/html/commit/{sha}.html"))).unwrap();
     assert!(
         page.contains("verdict-approve") && page.contains("verdict-finished"),
         "expected both verdict classes on the page"
@@ -228,7 +230,8 @@ fn html_escapes_user_content_in_feedback_bodies() {
 
     let out = run_clank(repo, &["html"]);
     assert!(out.status.success());
-    let page = std::fs::read_to_string(repo.join(format!(".clank/html/commit/{sha}.html"))).unwrap();
+    let page =
+        std::fs::read_to_string(repo.join(format!(".clank/html/commit/{sha}.html"))).unwrap();
     // pulldown-cmark's safe-html (default) leaves raw HTML as
     // text-escaped; either way the live <script> tag must NOT
     // appear in the output.
@@ -290,7 +293,11 @@ fn html_writes_meta_marker_with_head_sha() {
     let sha = head_sha(repo);
 
     let out = run_clank(repo, &["html"]);
-    assert!(out.status.success(), "clank html failed: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "clank html failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     let body = std::fs::read_to_string(repo.join(".clank/html/index.html")).unwrap();
     assert!(
         body.contains(&format!("name=\"clank:last-built-sha\" content=\"{sha}\"")),
@@ -312,7 +319,10 @@ fn html_timeline_uses_div_container_not_ol() {
     let out = run_clank(repo, &["html"]);
     assert!(out.status.success());
     let body = std::fs::read_to_string(repo.join(".clank/html/index.html")).unwrap();
-    assert!(body.contains("<div class=\"timeline\">"), "timeline must be a div");
+    assert!(
+        body.contains("<div class=\"timeline\">"),
+        "timeline must be a div"
+    );
     assert!(
         !body.contains("<ol class=\"timeline"),
         "must NOT use <ol class=\"timeline\""
@@ -333,7 +343,8 @@ fn html_timeline_groups_same_plan_into_umbrella() {
     let body = std::fs::read_to_string(repo.join(".clank/html/index.html")).unwrap();
     let umbrella_count = body.matches("class=\"umbrella umbrella").count();
     assert_eq!(
-        umbrella_count, 1,
+        umbrella_count,
+        1,
         "expected one umbrella, got {umbrella_count}; body length {}",
         body.len()
     );
@@ -372,9 +383,14 @@ fn html_timeline_renders_parsed_subject_body() {
     assert!(out.status.success());
     let body = std::fs::read_to_string(repo.join(".clank/html/index.html")).unwrap();
     // Subject body is "intro", not "[foo] intro".
-    assert!(body.contains("<span class=\"subject\">intro</span>"), "expected stripped subject; body len {}", body.len());
+    assert!(
+        body.contains("<span class=\"subject\">intro</span>"),
+        "expected stripped subject; body len {}",
+        body.len()
+    );
 
-    let page = std::fs::read_to_string(repo.join(format!(".clank/html/commit/{sha}.html"))).unwrap();
+    let page =
+        std::fs::read_to_string(repo.join(format!(".clank/html/commit/{sha}.html"))).unwrap();
     assert!(
         page.contains("<h2 class=\"subject\">intro</h2>"),
         "commit page header should also use the parsed body"
@@ -414,8 +430,76 @@ fn html_emits_inline_relative_time_script_and_data_iso_attrs() {
     assert!(out.status.success());
     let body = std::fs::read_to_string(repo.join(".clank/html/index.html")).unwrap();
     assert!(body.contains("<script>"), "inline script missing");
-    assert!(body.contains("data-iso"), "data-iso attribute missing on rows");
+    assert!(
+        body.contains("data-iso"),
+        "data-iso attribute missing on rows"
+    );
     assert!(body.contains("[data-iso]"), "script must select data-iso");
+}
+
+#[test]
+fn html_incremental_skips_old_pages_outside_top_n() {
+    // 15 prior commits + 1 new commit. After incremental,
+    // the OLDEST prior page (well outside the top-10 refresh
+    // window) must retain its pre-rebuild mtime. The new
+    // page must exist.
+    let dir = init_repo();
+    let repo = dir.path();
+    write(repo, ".clank/plans/foo.md", "# foo\n");
+    commit(repo, "[foo] intro");
+    for i in 0..15 {
+        write(repo, &format!("src/f{i}.rs"), "// x\n");
+        commit(repo, &format!("[foo] revise {i}"));
+    }
+    // Capture the oldest event sha (the intro).
+    let intro_sha = {
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(["log", "--reverse", "--format=%H", "HEAD"])
+            .output()
+            .unwrap();
+        String::from_utf8(out.stdout)
+            .unwrap()
+            .lines()
+            .next()
+            .unwrap()
+            .to_string()
+    };
+
+    // First build.
+    run_clank(repo, &["html"])
+        .status
+        .success()
+        .then_some(())
+        .expect("build 1");
+    let oldest_path = repo.join(format!(".clank/html/commit/{intro_sha}.html"));
+    let old_meta = std::fs::metadata(&oldest_path).unwrap();
+    let old_mtime = filetime::FileTime::from_last_modification_time(&old_meta);
+
+    // Land a new commit and rebuild incrementally.
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+    write(repo, "src/extra.rs", "// y\n");
+    commit(repo, "[foo] extra");
+    let new_sha = head_sha(repo);
+    run_clank(repo, &["html"])
+        .status
+        .success()
+        .then_some(())
+        .expect("build 2");
+
+    assert!(
+        repo.join(format!(".clank/html/commit/{new_sha}.html"))
+            .is_file(),
+        "new commit's page must exist after incremental build"
+    );
+    let after_meta = std::fs::metadata(&oldest_path).unwrap();
+    let after_mtime = filetime::FileTime::from_last_modification_time(&after_meta);
+    assert_eq!(
+        old_mtime.unix_seconds(),
+        after_mtime.unix_seconds(),
+        "oldest page (outside top-N) must retain its mtime; was {old_mtime:?}, became {after_mtime:?}"
+    );
 }
 
 #[test]
@@ -427,7 +511,11 @@ fn html_incremental_skips_unchanged_commit_pages() {
     let first_sha = head_sha(repo);
 
     // First build.
-    run_clank(repo, &["html"]).status.success().then_some(()).expect("build 1");
+    run_clank(repo, &["html"])
+        .status
+        .success()
+        .then_some(())
+        .expect("build 1");
     let first_path = repo.join(format!(".clank/html/commit/{first_sha}.html"));
     let first_meta = std::fs::metadata(&first_path).unwrap();
     let first_mtime = filetime::FileTime::from_last_modification_time(&first_meta);
@@ -437,10 +525,17 @@ fn html_incremental_skips_unchanged_commit_pages() {
     write(repo, "src/lib.rs", "// x\n");
     commit(repo, "[foo] impl");
     let second_sha = head_sha(repo);
-    run_clank(repo, &["html"]).status.success().then_some(()).expect("build 2");
+    run_clank(repo, &["html"])
+        .status
+        .success()
+        .then_some(())
+        .expect("build 2");
 
     // The new commit's page exists.
-    assert!(repo.join(format!(".clank/html/commit/{second_sha}.html")).is_file());
+    assert!(
+        repo.join(format!(".clank/html/commit/{second_sha}.html"))
+            .is_file()
+    );
 
     // The original commit's page was within the top-N
     // refresh window (only one prior page, well under 10),
@@ -458,16 +553,28 @@ fn html_rebuild_flag_overwrites_all_pages() {
     commit(repo, "[foo] intro");
     let sha = head_sha(repo);
 
-    run_clank(repo, &["html"]).status.success().then_some(()).expect("build 1");
+    run_clank(repo, &["html"])
+        .status
+        .success()
+        .then_some(())
+        .expect("build 1");
     let path = repo.join(format!(".clank/html/commit/{sha}.html"));
     // Stamp the file with an old mtime; --rebuild must touch it.
     let old = filetime::FileTime::from_unix_time(1_000_000_000, 0);
     filetime::set_file_times(&path, old, old).unwrap();
 
-    run_clank(repo, &["html", "--rebuild"]).status.success().then_some(()).expect("rebuild");
+    run_clank(repo, &["html", "--rebuild"])
+        .status
+        .success()
+        .then_some(())
+        .expect("rebuild");
     let new_meta = std::fs::metadata(&path).unwrap();
     let new_mtime = filetime::FileTime::from_last_modification_time(&new_meta);
-    assert_ne!(new_mtime.unix_seconds(), 1_000_000_000, "--rebuild must overwrite");
+    assert_ne!(
+        new_mtime.unix_seconds(),
+        1_000_000_000,
+        "--rebuild must overwrite"
+    );
 }
 
 #[test]
@@ -477,7 +584,11 @@ fn html_incremental_refreshes_status_header_on_empty_slice() {
     write(repo, ".clank/plans/foo.md", "# foo\n");
     commit(repo, "[foo] intro");
     let sha = head_sha(repo);
-    run_clank(repo, &["html"]).status.success().then_some(()).expect("build 1");
+    run_clank(repo, &["html"])
+        .status
+        .success()
+        .then_some(())
+        .expect("build 1");
 
     let before = std::fs::read_to_string(repo.join(".clank/html/index.html")).unwrap();
     assert!(before.contains("gate-unreviewed") || before.contains("waiting"));
@@ -488,7 +599,11 @@ fn html_incremental_refreshes_status_header_on_empty_slice() {
         &format!(".clank/agents/alice/feedback/{sha}.md"),
         "FINISHED ship it\n",
     );
-    run_clank(repo, &["html"]).status.success().then_some(()).expect("build 2");
+    run_clank(repo, &["html"])
+        .status
+        .success()
+        .then_some(())
+        .expect("build 2");
 
     let after = std::fs::read_to_string(repo.join(".clank/html/index.html")).unwrap();
     assert!(

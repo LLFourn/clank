@@ -229,7 +229,8 @@ mod tests {
     fn scan_finds_plan_block() {
         let dir = tempfile::tempdir().unwrap();
         write(
-            &dir.path().join(".clank/agents/bob/blocks/auth/need-creds.md"),
+            &dir.path()
+                .join(".clank/agents/bob/blocks/auth/need-creds.md"),
             "Which OAuth provider?",
         );
         let blocks = scan_blocks(dir.path());
@@ -275,18 +276,9 @@ mod tests {
     #[test]
     fn scan_returns_sorted_by_agent_then_name() {
         let dir = tempfile::tempdir().unwrap();
-        write(
-            &dir.path().join(".clank/agents/bob/blocks/z.md"),
-            "q",
-        );
-        write(
-            &dir.path().join(".clank/agents/alice/blocks/b.md"),
-            "q",
-        );
-        write(
-            &dir.path().join(".clank/agents/alice/blocks/a.md"),
-            "q",
-        );
+        write(&dir.path().join(".clank/agents/bob/blocks/z.md"), "q");
+        write(&dir.path().join(".clank/agents/alice/blocks/b.md"), "q");
+        write(&dir.path().join(".clank/agents/alice/blocks/a.md"), "q");
         let blocks = scan_blocks(dir.path());
         assert_eq!(blocks.len(), 3);
         assert_eq!(blocks[0].agent, "alice");

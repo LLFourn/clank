@@ -226,11 +226,7 @@ fn verdict_mark(v: Verdict, c: bool) -> String {
 
 // ── renderers ───────────────────────────────────────────────
 
-fn print_human(
-    events: &[&LogEvent],
-    repo: &Path,
-    shas: &[CommitSha],
-) -> anyhow::Result<()> {
+fn print_human(events: &[&LogEvent], repo: &Path, shas: &[CommitSha]) -> anyhow::Result<()> {
     let reviews = collect_reviews(repo, shas);
     let c = color();
     for (i, event) in events.iter().enumerate() {
@@ -319,11 +315,7 @@ fn print_human(
     Ok(())
 }
 
-fn print_oneline(
-    events: &[&LogEvent],
-    repo: &Path,
-    shas: &[CommitSha],
-) -> anyhow::Result<()> {
+fn print_oneline(events: &[&LogEvent], repo: &Path, shas: &[CommitSha]) -> anyhow::Result<()> {
     let reviews = collect_reviews(repo, shas);
     let c = color();
     for event in events {
@@ -372,11 +364,7 @@ fn print_oneline(
     Ok(())
 }
 
-fn print_json(
-    events: &[&LogEvent],
-    repo: &Path,
-    shas: &[CommitSha],
-) -> anyhow::Result<()> {
+fn print_json(events: &[&LogEvent], repo: &Path, shas: &[CommitSha]) -> anyhow::Result<()> {
     let reviews = collect_reviews(repo, shas);
     let mut out: Vec<serde_json::Value> = Vec::new();
     for event in events {

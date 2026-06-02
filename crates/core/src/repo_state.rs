@@ -206,7 +206,7 @@ pub enum Warning {
 // LogEvent — fold output (side-channel for `clank log`)
 // ============================================================
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum LogEvent {
     PlanIntro {
         plan: PlanKey,

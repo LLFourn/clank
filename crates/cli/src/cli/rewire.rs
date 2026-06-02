@@ -83,10 +83,7 @@ fn plan_actions(repo: &Path, pairs: &[RewritePair]) -> Plan {
     // order (most recent commit in the rebase processing sequence).
     let mut latest_old_per_new: Vec<(CommitSha, CommitSha)> = Vec::new();
     for p in pairs {
-        if let Some(slot) = latest_old_per_new
-            .iter_mut()
-            .find(|(_, new)| new == &p.new)
-        {
+        if let Some(slot) = latest_old_per_new.iter_mut().find(|(_, new)| new == &p.new) {
             slot.0 = p.old.clone();
         } else {
             latest_old_per_new.push((p.old.clone(), p.new.clone()));
@@ -156,12 +153,13 @@ fn copy_file(action: &CopyAction) -> anyhow::Result<bool> {
         std::fs::create_dir_all(parent)
             .map_err(|e| anyhow::anyhow!("creating `{}`: {e}", parent.display()))?;
     }
-    std::fs::copy(&action.src, &action.dst)
-        .map_err(|e| anyhow::anyhow!(
+    std::fs::copy(&action.src, &action.dst).map_err(|e| {
+        anyhow::anyhow!(
             "copying `{}` → `{}`: {e}",
             action.src.display(),
             action.dst.display(),
-        ))?;
+        )
+    })?;
     Ok(true)
 }
 
@@ -177,11 +175,8 @@ fn scope_shas_via_fold(repo: &Path) -> Vec<CommitSha> {
     let repo_path = repo.to_path_buf();
     let fold = tokio::task::block_in_place(|| {
         rt.block_on(async move {
-            crate::rebuild::rebuild_repo_with_policy(
-                &repo_path,
-                crate::rebuild::CachePolicy::Use,
-            )
-            .await
+            crate::rebuild::rebuild_repo_with_policy(&repo_path, crate::rebuild::CachePolicy::Use)
+                .await
         })
     });
     let Ok(state) = fold else {
@@ -239,9 +234,18 @@ mod tests {
         let new = sha_full('d');
         // Order matters: a is processed first, c last.
         let pairs = vec![
-            RewritePair { old: old_a.clone(), new: new.clone() },
-            RewritePair { old: old_b.clone(), new: new.clone() },
-            RewritePair { old: old_c.clone(), new: new.clone() },
+            RewritePair {
+                old: old_a.clone(),
+                new: new.clone(),
+            },
+            RewritePair {
+                old: old_b.clone(),
+                new: new.clone(),
+            },
+            RewritePair {
+                old: old_c.clone(),
+                new: new.clone(),
+            },
         ];
         // Seed feedback ONLY on old_a (the earliest squashed
         // commit). Expected: no copy emitted, because the LAST
@@ -268,8 +272,14 @@ mod tests {
         let old_b = sha_full('b');
         let new = sha_full('d');
         let pairs = vec![
-            RewritePair { old: old_a.clone(), new: new.clone() },
-            RewritePair { old: old_b.clone(), new: new.clone() },
+            RewritePair {
+                old: old_a.clone(),
+                new: new.clone(),
+            },
+            RewritePair {
+                old: old_b.clone(),
+                new: new.clone(),
+            },
         ];
         write(
             &dir.path().join(format!(
@@ -281,7 +291,10 @@ mod tests {
         let plan = plan_actions(dir.path(), &pairs);
         assert_eq!(plan.actions.len(), 1);
         assert!(
-            plan.actions[0].dst.to_string_lossy().contains(&new.as_str()[..7])
+            plan.actions[0]
+                .dst
+                .to_string_lossy()
+                .contains(&new.as_str()[..7])
                 || plan.actions[0].dst.to_string_lossy().contains(new.as_str()),
             "dst path should include some form of new sha: {}",
             plan.actions[0].dst.display()
@@ -293,12 +306,13 @@ mod tests {
         let dir = make_repo();
         let old = sha_full('a');
         let new = sha_full('b');
-        let pairs = vec![RewritePair { old: old.clone(), new: new.clone() }];
+        let pairs = vec![RewritePair {
+            old: old.clone(),
+            new: new.clone(),
+        }];
         write(
-            &dir.path().join(format!(
-                ".clank/agents/alice/feedback/{}.md",
-                old.as_str()
-            )),
+            &dir.path()
+                .join(format!(".clank/agents/alice/feedback/{}.md", old.as_str())),
             "APPROVE\n",
         );
         let plan = plan_actions(dir.path(), &pairs);
@@ -311,11 +325,15 @@ mod tests {
         let dir = make_repo();
         let old = sha_full('a');
         let new = sha_full('b');
-        let pairs = vec![RewritePair { old: old.clone(), new: new.clone() }];
+        let pairs = vec![RewritePair {
+            old: old.clone(),
+            new: new.clone(),
+        }];
         // Source stored as 7-char short form.
         let short = &old.as_str()[..7];
         write(
-            &dir.path().join(format!(".clank/agents/alice/feedback/{short}.md")),
+            &dir.path()
+                .join(format!(".clank/agents/alice/feedback/{short}.md")),
             "APPROVE\n",
         );
         let plan = plan_actions(dir.path(), &pairs);
@@ -344,19 +362,18 @@ mod tests {
         std::fs::create_dir_all(dir.path().join(".clank/agents/bob/feedback")).unwrap();
         let old = sha_full('a');
         let new = sha_full('b');
-        let pairs = vec![RewritePair { old: old.clone(), new }];
+        let pairs = vec![RewritePair {
+            old: old.clone(),
+            new,
+        }];
         write(
-            &dir.path().join(format!(
-                ".clank/agents/alice/feedback/{}.md",
-                old.as_str()
-            )),
+            &dir.path()
+                .join(format!(".clank/agents/alice/feedback/{}.md", old.as_str())),
             "APPROVE\n",
         );
         write(
-            &dir.path().join(format!(
-                ".clank/agents/bob/feedback/{}.md",
-                old.as_str()
-            )),
+            &dir.path()
+                .join(format!(".clank/agents/bob/feedback/{}.md", old.as_str())),
             "FINISHED\n",
         );
         let plan = plan_actions(dir.path(), &pairs);

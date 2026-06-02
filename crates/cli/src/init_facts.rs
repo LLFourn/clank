@@ -7,8 +7,7 @@
 use std::path::{Path, PathBuf};
 
 /// Canonical body of `.clank/.gitignore`.
-pub const CLANK_GITIGNORE_BODY: &str =
-    "/agents/\n/cache/\n/feedback/\n/queue/\n/html/\n";
+pub const CLANK_GITIGNORE_BODY: &str = "/agents/\n/cache/\n/feedback/\n/queue/\n/html/\n";
 
 /// Older bodies init silently upgrades to `CLANK_GITIGNORE_BODY`.
 /// Anything else makes init bail.
@@ -88,9 +87,10 @@ pub enum GitignoreState {
 pub fn classify_clank_gitignore(repo: &Path) -> GitignoreState {
     match std::fs::read_to_string(clank_gitignore_path(repo)) {
         Ok(body) if body == CLANK_GITIGNORE_BODY => GitignoreState::Canonical,
-        Ok(body) if CLANK_GITIGNORE_LEGACY_BODIES
-            .iter()
-            .any(|legacy| *legacy == body) =>
+        Ok(body)
+            if CLANK_GITIGNORE_LEGACY_BODIES
+                .iter()
+                .any(|legacy| *legacy == body) =>
         {
             GitignoreState::Legacy
         }
@@ -138,7 +138,9 @@ pub enum ClaudePermsState {
     Missing,
     /// File exists but `permissions.allow` lacks one or more
     /// of our rules. Init tag-merges to repair.
-    NeedsPatch { missing_rules: Vec<String> },
+    NeedsPatch {
+        missing_rules: Vec<String>,
+    },
     Complete,
     /// File exists but isn't valid JSON, or has the wrong
     /// shape. Init bails; surface as a warning.
@@ -181,7 +183,10 @@ pub fn classify_claude_perms(repo: &Path) -> ClaudePermsState {
     };
     let Some(allow) = allow else {
         return ClaudePermsState::NeedsPatch {
-            missing_rules: CLAUDE_ALLOW_RULES.iter().map(|s| (*s).to_string()).collect(),
+            missing_rules: CLAUDE_ALLOW_RULES
+                .iter()
+                .map(|s| (*s).to_string())
+                .collect(),
         };
     };
     let present: Vec<&str> = allow.iter().filter_map(|v| v.as_str()).collect();
@@ -210,7 +215,10 @@ mod tests {
     #[test]
     fn classify_clank_gitignore_missing_when_absent() {
         let dir = tempdir();
-        assert_eq!(classify_clank_gitignore(dir.path()), GitignoreState::Missing);
+        assert_eq!(
+            classify_clank_gitignore(dir.path()),
+            GitignoreState::Missing
+        );
     }
 
     #[test]
@@ -305,11 +313,7 @@ mod tests {
         // a fixable NeedsPatch.
         let dir = tempdir();
         std::fs::create_dir_all(dir.path().join(".claude")).unwrap();
-        std::fs::write(
-            claude_perms_path(dir.path()),
-            r#"{"permissions":"oh no"}"#,
-        )
-        .unwrap();
+        std::fs::write(claude_perms_path(dir.path()), r#"{"permissions":"oh no"}"#).unwrap();
         assert_eq!(classify_claude_perms(dir.path()), ClaudePermsState::Drifted);
     }
 

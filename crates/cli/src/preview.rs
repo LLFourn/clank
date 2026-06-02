@@ -181,8 +181,7 @@ pub async fn build_rewrite_preview(
             tree_plan_paths(repo_root, &meta.sha, plan_key.as_str(), include_finalize).await?;
         let strip_predicate_for_diff = |p: &str| -> bool {
             p == format!(".clank/plans/{}.md", plan_key.as_str())
-                || (include_finalize
-                    && p == format!(".clank/finished/{}.md", plan_key.as_str()))
+                || (include_finalize && p == format!(".clank/finished/{}.md", plan_key.as_str()))
         };
         let contributes_non_strippable = changes.has_non_plan_code_changes
             || changes
@@ -452,7 +451,6 @@ fn compute_gate(
     let entries = reviews.reviews_for(target);
     Ok(clank_core::wait::compute_gate(&entries))
 }
-
 
 #[cfg(test)]
 mod tests {

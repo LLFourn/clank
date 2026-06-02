@@ -51,23 +51,21 @@ async fn run_write(args: FeedbackWriteArgs) -> anyhow::Result<()> {
     all_shas.sort();
     all_shas.dedup();
 
-    let target_sha = commit_ref
-        .resolve_against(&all_shas)
-        .map_err(|e| match e {
-            CommitRefResolveError::Orphan => anyhow::anyhow!(
-                "--commit `{}` did not match any known commit. \
+    let target_sha = commit_ref.resolve_against(&all_shas).map_err(|e| match e {
+        CommitRefResolveError::Orphan => anyhow::anyhow!(
+            "--commit `{}` did not match any known commit. \
                  Known shas: {}",
-                args.commit,
-                format_short_list(&all_shas),
-            ),
-            CommitRefResolveError::Ambiguous { matches } => anyhow::anyhow!(
-                "--commit `{}` is ambiguous (matched {} commits): \
+            args.commit,
+            format_short_list(&all_shas),
+        ),
+        CommitRefResolveError::Ambiguous { matches } => anyhow::anyhow!(
+            "--commit `{}` is ambiguous (matched {} commits): \
                  {}. Pass a longer prefix or the full SHA.",
-                args.commit,
-                matches.len(),
-                format_short_list(&matches),
-            ),
-        })?;
+            args.commit,
+            matches.len(),
+            format_short_list(&matches),
+        ),
+    })?;
 
     let wire_path = feedback_path_wire(&author, &target_sha, &all_shas);
     let abs_path = repo.join(&wire_path);

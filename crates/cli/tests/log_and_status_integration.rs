@@ -77,7 +77,10 @@ fn status_shows_multiple_active_plans_without_error() {
         String::from_utf8_lossy(&out.stderr),
     );
     let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(stdout.contains("alpha"), "should show alpha; got:\n{stdout}");
+    assert!(
+        stdout.contains("alpha"),
+        "should show alpha; got:\n{stdout}"
+    );
     assert!(stdout.contains("beta"), "should show beta; got:\n{stdout}");
 }
 
@@ -97,8 +100,14 @@ fn status_active_plans_hide_finished() {
 
     let out = run_clank(repo, &["status"]);
     let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(stdout.contains("active"), "should show active; got:\n{stdout}");
-    assert!(!stdout.contains("finished"), "should not show finished section; got:\n{stdout}");
+    assert!(
+        stdout.contains("active"),
+        "should show active; got:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("finished"),
+        "should not show finished section; got:\n{stdout}"
+    );
 
     let out = run_clank(repo, &["status", "--json"]);
     let json: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
@@ -124,8 +133,14 @@ fn status_no_active_shows_last_finished() {
 
     let out = run_clank(repo, &["status"]);
     let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(stdout.contains("last finished: second"), "should show last finished; got:\n{stdout}");
-    assert!(!stdout.contains("first"), "should not show older finished; got:\n{stdout}");
+    assert!(
+        stdout.contains("last finished: second"),
+        "should show last finished; got:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("first"),
+        "should not show older finished; got:\n{stdout}"
+    );
 
     let out = run_clank(repo, &["status", "--json"]);
     let json: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();

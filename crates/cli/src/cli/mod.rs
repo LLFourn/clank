@@ -16,15 +16,15 @@ pub mod config;
 pub mod doctor;
 pub mod feedback;
 pub mod finish;
-pub mod init;
 pub mod html;
+pub mod init;
 pub mod log;
 pub mod open;
 pub mod plan_resolve;
-pub mod rewire;
 pub mod purge;
-pub mod rewrite;
 pub mod queue;
+pub mod rewire;
+pub mod rewrite;
 pub mod setup;
 pub mod status;
 pub mod stop_hook;
@@ -58,7 +58,10 @@ pub enum ConfigKey {
     #[command(name = "review.plan_feedback", alias = "review_plan_feedback")]
     ReviewPlanFeedback(ConfigKeyArgs),
     /// Require [plan] or [misc] commit title prefixes. bool, default: false.
-    #[command(name = "review.require_commit_prefix", alias = "review_require_commit_prefix")]
+    #[command(
+        name = "review.require_commit_prefix",
+        alias = "review_require_commit_prefix"
+    )]
     ReviewRequireCommitPrefix(ConfigKeyArgs),
     /// Shell command to run when master has new work. string or null.
     #[command(name = "hooks.master_work", alias = "hooks_master_work")]

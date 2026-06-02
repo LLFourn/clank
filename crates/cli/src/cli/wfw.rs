@@ -24,6 +24,7 @@ use std::time::Duration;
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 
 use super::{WfwArgs, repo_basename, resolve_repo};
+use crate::cli::block::scan_blocks;
 use crate::cli::plan_resolve::parse_arg;
 use crate::hook_config::{self, HookFiring};
 use crate::lifecycle::{AgentLabel, CommitSha, PlanKey};
@@ -31,7 +32,6 @@ use crate::repo_state::RepoState;
 use clank_core::Role;
 use clank_core::vocab::HookEvent;
 use clank_core::wait::{StartupSnapshot, WaitItem, detect_finished};
-use crate::cli::block::scan_blocks;
 
 /// Exit code returned when `--timeout` elapses without producing
 /// any work. The rest of the CLI uses anyhow for normal errors;
@@ -176,44 +176,52 @@ pub async fn run(args: WfwArgs) -> anyhow::Result<()> {
     {
         let br = check_blocks(&repo, &author);
         initial_suppress_all = br.suppress_all;
-        let has_answer = br.items.iter().any(|i| matches!(i, WaitItem::Unblocked { .. }));
+        let has_answer = br
+            .items
+            .iter()
+            .any(|i| matches!(i, WaitItem::Unblocked { .. }));
         if has_answer {
             emit(&br.items, args.json);
             return Ok(());
         }
 
         if !br.suppress_all {
-        let reviews =
-            crate::fs_review_lookup::FsReviewLookup::new(&repo, initial_state.head.as_ref());
-        let status = initial_state.fold.derive_status(&reviews, &work_policy);
-        let mut items = status.work_for(&author, role);
-        if let Some(ref pf) = plan_filter {
-            items.retain(|item| match item {
-                WaitItem::Master { plan, .. }
-                | WaitItem::Reviewer { plan, .. }
-                | WaitItem::Finished { plan, .. } => plan == pf,
-                _ => false,
-            });
-        }
-        if !br.suppressed_plans.is_empty() {
-            items.retain(|item| match item {
-                WaitItem::Master { plan, .. }
-                | WaitItem::Reviewer { plan, .. } => !br.suppressed_plans.contains(plan),
-                _ => true,
-            });
-        }
-        items.extend(detect_finished(&snapshot, &initial_state.fold));
-        if !items.is_empty() {
-            for firing in &firings_from_items(&items) {
-                hook_config::run_hook(&repo, &hook_config, firing);
+            let reviews =
+                crate::fs_review_lookup::FsReviewLookup::new(&repo, initial_state.head.as_ref());
+            let status = initial_state.fold.derive_status(&reviews, &work_policy);
+            let mut items = status.work_for(&author, role);
+            if let Some(ref pf) = plan_filter {
+                items.retain(|item| match item {
+                    WaitItem::Master { plan, .. }
+                    | WaitItem::Reviewer { plan, .. }
+                    | WaitItem::Finished { plan, .. } => plan == pf,
+                    _ => false,
+                });
             }
-            emit(&items, args.json);
-            return Ok(());
-        }
+            if !br.suppressed_plans.is_empty() {
+                items.retain(|item| match item {
+                    WaitItem::Master { plan, .. } | WaitItem::Reviewer { plan, .. } => {
+                        !br.suppressed_plans.contains(plan)
+                    }
+                    _ => true,
+                });
+            }
+            items.extend(detect_finished(&snapshot, &initial_state.fold));
+            if !items.is_empty() {
+                for firing in &firings_from_items(&items) {
+                    hook_config::run_hook(&repo, &hook_config, firing);
+                }
+                emit(&items, args.json);
+                return Ok(());
+            }
         } // !suppress_all
     }
 
-    if !initial_suppress_all && role == Role::Master && plan_filter.is_none() && initial_state.fold.plans.is_empty() {
+    if !initial_suppress_all
+        && role == Role::Master
+        && plan_filter.is_none()
+        && initial_state.fold.plans.is_empty()
+    {
         let queue = match crate::cli::queue::scan_queue_no_dups(&repo) {
             Ok(q) => q,
             Err(e) => {
@@ -278,7 +286,10 @@ pub async fn run(args: WfwArgs) -> anyhow::Result<()> {
         }
         {
             let br = check_blocks(&repo, &author);
-            let has_answer = br.items.iter().any(|i| matches!(i, WaitItem::Unblocked { .. }));
+            let has_answer = br
+                .items
+                .iter()
+                .any(|i| matches!(i, WaitItem::Unblocked { .. }));
             if has_answer {
                 emit(&br.items, args.json);
                 return Ok(());
@@ -303,8 +314,9 @@ pub async fn run(args: WfwArgs) -> anyhow::Result<()> {
             }
             if !br.suppressed_plans.is_empty() {
                 items.retain(|item| match item {
-                    WaitItem::Master { plan, .. }
-                    | WaitItem::Reviewer { plan, .. } => !br.suppressed_plans.contains(plan),
+                    WaitItem::Master { plan, .. } | WaitItem::Reviewer { plan, .. } => {
+                        !br.suppressed_plans.contains(plan)
+                    }
                     _ => true,
                 });
             }
@@ -316,10 +328,7 @@ pub async fn run(args: WfwArgs) -> anyhow::Result<()> {
                 emit(&items, args.json);
                 return Ok(());
             }
-            if role == Role::Master
-                && plan_filter.is_none()
-                && state.fold.plans.is_empty()
-            {
+            if role == Role::Master && plan_filter.is_none() && state.fold.plans.is_empty() {
                 let queue = match crate::cli::queue::scan_queue_no_dups(&repo) {
                     Ok(q) => q,
                     Err(e) => {
@@ -494,11 +503,7 @@ fn render_json(item: &WaitItem) -> serde_json::Value {
             "plan": plan,
             "question": question,
         }),
-        WaitItem::Unblocked {
-            name,
-            plan,
-            answer,
-        } => serde_json::json!({
+        WaitItem::Unblocked { name, plan, answer } => serde_json::json!({
             "kind": "unblocked",
             "name": name,
             "plan": plan,

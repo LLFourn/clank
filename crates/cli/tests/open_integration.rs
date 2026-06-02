@@ -322,7 +322,9 @@ fn resume_recommended_when_session_jsonl_exists() {
     write(
         repo,
         ".clank/agents/claude/config.json",
-        &format!(r#"{{"session":{{"id":"{uuid}","tool":"claude","updated_at":"2026-01-01T00:00:00Z"}}}}"#),
+        &format!(
+            r#"{{"session":{{"id":"{uuid}","tool":"claude","updated_at":"2026-01-01T00:00:00Z"}}}}"#
+        ),
     );
     git(repo, &["add", "-A"]);
     git(repo, &["commit", "--quiet", "-m", "seed"]);
@@ -382,7 +384,9 @@ fn codex_session_recommended_when_rollout_jsonl_exists() {
     write(
         repo,
         ".clank/agents/codex/config.json",
-        &format!(r#"{{"session":{{"id":"{uuid}","tool":"codex","updated_at":"2026-01-01T00:00:00Z"}}}}"#),
+        &format!(
+            r#"{{"session":{{"id":"{uuid}","tool":"codex","updated_at":"2026-01-01T00:00:00Z"}}}}"#
+        ),
     );
     git(repo, &["add", "-A"]);
     git(repo, &["commit", "--quiet", "-m", "seed"]);
@@ -433,7 +437,11 @@ fn init_needed_when_claude_permissions_missing() {
     let home = tempfile::tempdir().unwrap();
     let dir = init_repo();
     let repo = dir.path();
-    write(repo, ".clank/.gitignore", "/agents/\n/cache/\n/feedback/\n/queue/\n");
+    write(
+        repo,
+        ".clank/.gitignore",
+        "/agents/\n/cache/\n/feedback/\n/queue/\n",
+    );
     let v = run_open(repo, home.path());
     let gaps = gap_kinds(&v);
     assert!(
@@ -447,7 +455,11 @@ fn init_needed_when_post_rewrite_hook_absent() {
     let home = tempfile::tempdir().unwrap();
     let dir = init_repo();
     let repo = dir.path();
-    write(repo, ".clank/.gitignore", "/agents/\n/cache/\n/feedback/\n/queue/\n");
+    write(
+        repo,
+        ".clank/.gitignore",
+        "/agents/\n/cache/\n/feedback/\n/queue/\n",
+    );
     write(
         repo,
         ".claude/settings.local.json",
@@ -566,7 +578,10 @@ fn clank_init_recommendation_carries_gaps_array() {
         .find(|r| r["kind"] == "clank_init")
         .unwrap_or_else(|| panic!("no clank_init rec; got {recs:?}"));
     let gaps = init_rec["gaps"].as_array().expect("gaps array");
-    assert!(!gaps.is_empty(), "gaps should be populated for init-needed state");
+    assert!(
+        !gaps.is_empty(),
+        "gaps should be populated for init-needed state"
+    );
     let top_gap_kinds = gap_kinds(&v);
     let rec_gaps: Vec<String> = gaps
         .iter()

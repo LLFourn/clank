@@ -84,8 +84,8 @@ fn dry_run_finish_composite(
 ) -> anyhow::Result<()> {
     println!("# clank finish --dry preview");
     println!("# plan: {}", preview.plan_id);
-    let amending_existing = args.amend
-        && matches!(preview.readiness, FinalizeReadiness::AlreadyFinished);
+    let amending_existing =
+        args.amend && matches!(preview.readiness, FinalizeReadiness::AlreadyFinished);
     if amending_existing {
         println!("# would amend HEAD finalize commit:");
     } else {
@@ -210,11 +210,13 @@ fn reason_to_msg(reason: &FinalizeBlockReason) -> String {
         FinalizeBlockReason::NotFinished { state } => match state {
             clank_core::vocab::CommitGateState::Approved => {
                 "latest reviewable commit is approved but not FINISHED — \
-                 a reviewer needs to mark FINISHED before finalize".into()
+                 a reviewer needs to mark FINISHED before finalize"
+                    .into()
             }
             clank_core::vocab::CommitGateState::ChangesRequested => {
                 "changes requested on the latest reviewable commit; address them \
-                 and re-commit before finalize".into()
+                 and re-commit before finalize"
+                    .into()
             }
             clank_core::vocab::CommitGateState::Unreviewed => {
                 "latest reviewable commit hasn't been reviewed yet".into()
@@ -278,11 +280,7 @@ async fn finalize(
     Ok(())
 }
 
-fn amend_already_finished(
-    repo: &Path,
-    stem: &str,
-    message: Option<&str>,
-) -> anyhow::Result<()> {
+fn amend_already_finished(repo: &Path, stem: &str, message: Option<&str>) -> anyhow::Result<()> {
     let default_msg = format!("[{stem}] finish");
     let msg = message.unwrap_or(&default_msg);
     git_run(repo, &["commit", "--amend", "--quiet", "-m", msg])

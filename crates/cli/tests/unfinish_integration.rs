@@ -71,7 +71,11 @@ fn run_clank(repo: &Path, args: &[&str]) -> std::process::Output {
 fn seed_finished_plan(stem: &str) -> (tempfile::TempDir, String) {
     let dir = init_repo();
     let repo = dir.path();
-    write(repo, &format!(".clank/plans/{stem}.md"), &format!("# {stem}\n"));
+    write(
+        repo,
+        &format!(".clank/plans/{stem}.md"),
+        &format!("# {stem}\n"),
+    );
     commit(repo, &format!("[{stem}] intro"));
     let pre_finish = head_sha(repo);
 
@@ -82,7 +86,10 @@ fn seed_finished_plan(stem: &str) -> (tempfile::TempDir, String) {
     );
     git(repo, &["rm", "--quiet", &format!(".clank/plans/{stem}.md")]);
     git(repo, &["add", &format!(".clank/finished/{stem}.md")]);
-    git(repo, &["commit", "--quiet", "-m", &format!("[{stem}] finish")]);
+    git(
+        repo,
+        &["commit", "--quiet", "-m", &format!("[{stem}] finish")],
+    );
 
     (dir, pre_finish)
 }
@@ -130,9 +137,7 @@ fn unfinish_refuses_when_worktree_dirty_unstaged() {
     );
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
-        stderr.contains("dirty")
-            || stderr.contains("stash")
-            || stderr.contains("commit"),
+        stderr.contains("dirty") || stderr.contains("stash") || stderr.contains("commit"),
         "error should explain how to recover; got: {stderr}"
     );
     assert_eq!(
@@ -155,10 +160,7 @@ fn unfinish_refuses_when_index_dirty_staged() {
     git(repo, &["add", "src/lib.rs"]);
 
     let out = run_clank(repo, &["unfinish", "foo"]);
-    assert!(
-        !out.status.success(),
-        "unfinish must refuse a dirty index"
-    );
+    assert!(!out.status.success(), "unfinish must refuse a dirty index");
     assert_eq!(
         head_sha(repo),
         finish_sha,

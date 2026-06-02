@@ -64,11 +64,7 @@ pub fn canonical_feedback_path(
 ) -> PathBuf {
     let mode = filename_mode(scope_shas);
     let stem = filename_stem(target_sha, mode);
-    PathBuf::from(format!(
-        "agents/{}/feedback/{}.md",
-        author.as_str(),
-        stem
-    ))
+    PathBuf::from(format!("agents/{}/feedback/{}.md", author.as_str(), stem))
 }
 
 /// Build the repo-relative wire-form feedback path

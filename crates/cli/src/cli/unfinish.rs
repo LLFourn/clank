@@ -67,13 +67,7 @@ fn require_head_is_trivial_finish(repo: &Path, stem: &str) -> anyhow::Result<()>
     let out = std::process::Command::new("git")
         .arg("-C")
         .arg(repo)
-        .args([
-            "diff-tree",
-            "--no-commit-id",
-            "--name-status",
-            "-r",
-            "HEAD",
-        ])
+        .args(["diff-tree", "--no-commit-id", "--name-status", "-r", "HEAD"])
         .output()?;
     if !out.status.success() {
         anyhow::bail!(
@@ -100,12 +94,8 @@ fn require_head_is_trivial_finish(repo: &Path, stem: &str) -> anyhow::Result<()>
         entries.push((status, path));
     }
 
-    let added_finished = entries
-        .iter()
-        .any(|(s, p)| *s == 'A' && p == &finished_rel);
-    let deleted_plan = entries
-        .iter()
-        .any(|(s, p)| *s == 'D' && p == &plans_rel);
+    let added_finished = entries.iter().any(|(s, p)| *s == 'A' && p == &finished_rel);
+    let deleted_plan = entries.iter().any(|(s, p)| *s == 'D' && p == &plans_rel);
     if !added_finished {
         anyhow::bail!(
             "finish for `{stem}` is not at HEAD — `{finished_rel}` was not added by this commit. Find the finish commit and operate from there."
@@ -119,9 +109,7 @@ fn require_head_is_trivial_finish(repo: &Path, stem: &str) -> anyhow::Result<()>
 
     let extras: Vec<&(char, String)> = entries
         .iter()
-        .filter(|(s, p)| {
-            !((*s == 'A' && p == &finished_rel) || (*s == 'D' && p == &plans_rel))
-        })
+        .filter(|(s, p)| !((*s == 'A' && p == &finished_rel) || (*s == 'D' && p == &plans_rel)))
         .collect();
     if !extras.is_empty() {
         let listed = extras

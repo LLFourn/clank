@@ -80,4 +80,3 @@ pub fn run_idle_hook(repo: &Path, config: &HookConfig) -> Option<String> {
         Some(prompt)
     }
 }
-

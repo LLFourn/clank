@@ -68,9 +68,18 @@ fn human_output_shows_author_verdict_summary_and_body() {
         .unwrap();
     assert!(out.status.success());
     let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(stdout.contains("codex"), "should show author; got:\n{stdout}");
-    assert!(stdout.contains("APPROVE"), "should show verdict; got:\n{stdout}");
-    assert!(stdout.contains("clean impl"), "should show summary; got:\n{stdout}");
+    assert!(
+        stdout.contains("codex"),
+        "should show author; got:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("APPROVE"),
+        "should show verdict; got:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("clean impl"),
+        "should show summary; got:\n{stdout}"
+    );
     assert!(
         stdout.contains("No blocking findings"),
         "should show body; got:\n{stdout}"

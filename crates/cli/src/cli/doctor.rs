@@ -12,7 +12,9 @@ use super::DoctorArgs;
 use crate::agent_env::{
     detect_session_from_env, explicit_label_from_env, resolve_identity_from_env,
 };
-use crate::agent_store::{agent_config_path, agents_root, load_agent_config, load_all_agent_configs};
+use crate::agent_store::{
+    agent_config_path, agents_root, load_agent_config, load_all_agent_configs,
+};
 use clank_core::role_for;
 
 /// Sentinel returned by [`run`] when one or more checks failed.

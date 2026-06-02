@@ -1038,10 +1038,7 @@ mod tests {
         let parsed = parse_diff_tree(stdout).unwrap();
         assert_eq!(parsed.plan_touches.len(), 1);
         assert_eq!(parsed.plan_touches[0].plan.as_str(), "foo");
-        assert!(matches!(
-            parsed.plan_touches[0].kind,
-            PlanTouchKind::Finish
-        ));
+        assert!(matches!(parsed.plan_touches[0].kind, PlanTouchKind::Finish));
     }
 
     #[test]

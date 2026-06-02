@@ -55,12 +55,41 @@ async fn build_site(
     .await?;
 
     let head_sha = head_sha(repo)?;
-    let events: Vec<LogEvent> = match head_sha.as_ref() {
-        Some(head) => {
+
+    // Decide whether we can do an incremental fold from the
+    // prior built head. Requirements: (1) not --rebuild, (2)
+    // existing index has a marker, (3) cached event log on
+    // disk, (4) prev_head is a strict ancestor of head_sha.
+    let prior_head = if force_rebuild {
+        None
+    } else {
+        read_prior_head(out_dir)
+    };
+    let cached_events: Option<Vec<LogEvent>> = match (prior_head.as_deref(), head_sha.as_ref()) {
+        (Some(prev), Some(head))
+            if prev != head.as_str() && prev_is_ancestor(repo, prev, head.as_str()) =>
+        {
+            read_events_cache(out_dir)
+        }
+        _ => None,
+    };
+
+    let events: Vec<LogEvent> = match (cached_events, head_sha.as_ref(), prior_head.as_deref()) {
+        // Incremental: cached log + slice from prev_head.
+        (Some(mut prior_events), Some(head), Some(prev)) => {
+            let prev_sha = clank_core::ids::CommitSha::parse(prev)
+                .map_err(|e| anyhow::anyhow!("parse prior head sha `{prev}`: {e}"))?;
+            let (_state, slice) = crate::rebuild::rebuild_from(repo, Some(&prev_sha), head).await?;
+            prior_events.extend(slice);
+            prior_events
+        }
+        // Full fold (first build, --rebuild, or stale cache).
+        (None, Some(head), _) => {
             let (_state, events) = crate::rebuild::rebuild_from(repo, None, head).await?;
             events
         }
-        None => Vec::new(),
+        // No head — empty repo.
+        _ => Vec::new(),
     };
 
     let event_shas: Vec<CommitSha> = events.iter().map(event_sha).cloned().collect();
@@ -70,23 +99,9 @@ async fn build_site(
     // Common shared CSS file.
     std::fs::write(out_dir.join("style.css"), CSS)?;
 
-    // Identify the prior build's head, if the existing index
-    // carries a usable marker for an ancestor of head_sha. The
-    // "old" range = events older than prev_head (their pages
-    // are reusable). The "new" range = events at or after
-    // prev_head (must rewrite).
-    let prior = if force_rebuild {
-        None
-    } else {
-        read_prior_head(out_dir)
-    };
-    let prior_ancestor = match (prior.as_deref(), head_sha.as_ref()) {
-        (Some(prev), Some(head)) if prev_is_ancestor(repo, prev, head.as_str()) => {
-            Some(prev.to_string())
-        }
-        _ => None,
-    };
-    let new_range_start = prior_ancestor.as_deref().map(|s| s.to_string());
+    // Persist the event log so the next incremental run can
+    // skip the full fold.
+    write_events_cache(out_dir, &events)?;
 
     // Index page — always full re-render so the status header,
     // verdict marks, and umbrella grouping reflect current
@@ -95,36 +110,22 @@ async fn build_site(
     let index_html = render_index(&status, &events, &reviews, &subjects, head_str);
     std::fs::write(out_dir.join("index.html"), index_html)?;
 
-    // Per-commit pages: write every commit in the new range +
-    // the top-N most-recent events from the old range (their
+    // Per-commit pages: write every commit whose page is
+    // missing on disk + the top-N most-recent events (their
     // feedback may have updated). Reuse existing files for
     // everything else.
-    let prev_sha_set: std::collections::HashSet<String> = events
+    let top_n_sha_set: std::collections::HashSet<String> = events
         .iter()
         .rev()
         .take(TOP_N_FEEDBACK_RECHECK)
         .map(|e| event_sha(e).as_str().to_string())
         .collect();
-    let in_new_range = |sha: &str| -> bool {
-        let Some(start) = new_range_start.as_deref() else {
-            return true; // no prior — everything is new
-        };
-        // Walk back from the slice's chronological order: an
-        // event is "new" iff it's at or after `prev_head`. The
-        // simplest signal we have is "the file already exists
-        // on disk." If file missing → must write. If present →
-        // skip unless top-N.
-        let _ = start;
-        !out_dir
-            .join(format!("commit/{sha}.html"))
-            .exists()
-    };
-
     let writes_needed: Vec<&LogEvent> = events
         .iter()
         .filter(|e| {
             let s = event_sha(e).as_str();
-            in_new_range(s) || prev_sha_set.contains(s)
+            let exists = out_dir.join(format!("commit/{s}.html")).exists();
+            !exists || top_n_sha_set.contains(s)
         })
         .collect();
     progress.begin("writing pages", writes_needed.len());
@@ -137,6 +138,21 @@ async fn build_site(
     }
     progress.end();
 
+    Ok(())
+}
+
+fn events_cache_path(out_dir: &Path) -> std::path::PathBuf {
+    out_dir.join("events.json")
+}
+
+fn read_events_cache(out_dir: &Path) -> Option<Vec<LogEvent>> {
+    let body = std::fs::read_to_string(events_cache_path(out_dir)).ok()?;
+    serde_json::from_str(&body).ok()
+}
+
+fn write_events_cache(out_dir: &Path, events: &[LogEvent]) -> anyhow::Result<()> {
+    let body = serde_json::to_string(events)?;
+    std::fs::write(events_cache_path(out_dir), body)?;
     Ok(())
 }
 
@@ -319,19 +335,21 @@ fn render_index(
          <meta name=\"clank:last-built-sha\" content=\"{}\">\n",
         head_sha.unwrap_or("")
     );
-    write_doc_open_with_meta(&mut out, &format!("clank · {}", status.basename), ".", &meta);
+    write_doc_open_with_meta(
+        &mut out,
+        &format!("clank · {}", status.basename),
+        ".",
+        &meta,
+    );
     out.push_str("<header class=\"status\">\n");
-    out.push_str(&format!(
-        "  <h1>{}</h1>\n",
-        esc(&status.basename)
-    ));
+    out.push_str(&format!("  <h1>{}</h1>\n", esc(&status.basename)));
     let branch = status.branch.as_deref().unwrap_or("(detached)");
-    let head_short = status
-        .head_sha
-        .as_deref()
-        .map(short)
-        .unwrap_or("(no head)");
-    let dirty = if status.worktree_dirty { " · dirty" } else { "" };
+    let head_short = status.head_sha.as_deref().map(short).unwrap_or("(no head)");
+    let dirty = if status.worktree_dirty {
+        " · dirty"
+    } else {
+        ""
+    };
     out.push_str(&format!(
         "  <div class=\"status-meta\"><span class=\"branch\">{}</span> · <code>{}</code>{}</div>\n",
         esc(branch),
@@ -373,7 +391,10 @@ fn render_index(
                 "      <li><code>{}</code>/{}{} — {}</li>\n",
                 esc(&b.agent),
                 esc(&b.name),
-                b.plan.as_deref().map(|p| format!(" · plan {p}")).unwrap_or_default(),
+                b.plan
+                    .as_deref()
+                    .map(|p| format!(" · plan {p}"))
+                    .unwrap_or_default(),
                 esc(&b.question)
             ));
         }
@@ -462,10 +483,7 @@ fn render_row(
         .unwrap_or_default();
     let raw_subject = subjects.get(sha.as_str()).map(String::as_str).unwrap_or("");
     let body = clank_core::repo_state::parse_subject(raw_subject).body;
-    let mut out = format!(
-        "<div class=\"row\" data-sha=\"{}\">\n",
-        esc(sha.as_str())
-    );
+    let mut out = format!("<div class=\"row\" data-sha=\"{}\">\n", esc(sha.as_str()));
     out.push_str(&format!(
         "  <a class=\"row-link\" href=\"commit/{}.html\">\n",
         esc(sha.as_str())
@@ -774,9 +792,8 @@ fn render_markdown(md: &str) -> String {
     // `InlineHtml` events represent literal HTML tags from the
     // source; replace them with empty text so the output is
     // strictly the markdown-derived structure.
-    let parser = Parser::new_ext(md, opts).filter(|ev| {
-        !matches!(ev, Event::Html(_) | Event::InlineHtml(_))
-    });
+    let parser =
+        Parser::new_ext(md, opts).filter(|ev| !matches!(ev, Event::Html(_) | Event::InlineHtml(_)));
     let mut out = String::new();
     html::push_html(&mut out, parser);
     out
@@ -836,7 +853,9 @@ fn head_sha(repo: &Path) -> anyhow::Result<Option<CommitSha>> {
     if s.is_empty() {
         return Ok(None);
     }
-    Ok(Some(CommitSha::parse(&s).map_err(|e| anyhow::anyhow!("parse HEAD sha `{s}`: {e}"))?))
+    Ok(Some(CommitSha::parse(&s).map_err(|e| {
+        anyhow::anyhow!("parse HEAD sha `{s}`: {e}")
+    })?))
 }
 
 fn commit_subject(repo: &Path, sha: &CommitSha) -> String {
@@ -918,7 +937,10 @@ fn launch_opener(path: &Path) -> anyhow::Result<()> {
     let prog = "explorer";
     #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
     {
-        anyhow::bail!("no known opener for this platform; open `{}` manually", path_str);
+        anyhow::bail!(
+            "no known opener for this platform; open `{}` manually",
+            path_str
+        );
     }
     #[allow(unreachable_code)]
     {

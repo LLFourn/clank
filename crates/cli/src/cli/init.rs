@@ -28,8 +28,9 @@ use clank_core::ids::AgentLabel;
 use clank_core::vocab::{Role, Tool};
 
 use crate::init_facts::{
-    CLANK_GITIGNORE_BODY as GITIGNORE_BODY, CLANK_GITIGNORE_LEGACY_BODIES as LEGACY_GITIGNORE_BODIES,
-    CLAUDE_ALLOW_RULES, POST_REWRITE_BODY, POST_REWRITE_MARKER,
+    CLANK_GITIGNORE_BODY as GITIGNORE_BODY,
+    CLANK_GITIGNORE_LEGACY_BODIES as LEGACY_GITIGNORE_BODIES, CLAUDE_ALLOW_RULES,
+    POST_REWRITE_BODY, POST_REWRITE_MARKER,
 };
 
 pub async fn run(args: InitArgs) -> anyhow::Result<()> {
@@ -55,9 +56,8 @@ fn write_post_rewrite_hook(repo: &Path, force: bool) -> anyhow::Result<()> {
         return Ok(());
     };
     if let Some(parent) = hook_path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| {
-            anyhow::anyhow!("creating hooks dir `{}`: {e}", parent.display())
-        })?;
+        std::fs::create_dir_all(parent)
+            .map_err(|e| anyhow::anyhow!("creating hooks dir `{}`: {e}", parent.display()))?;
     }
     match std::fs::read_to_string(&hook_path) {
         Ok(existing) if existing.contains(POST_REWRITE_MARKER) => {

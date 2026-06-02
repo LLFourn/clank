@@ -62,8 +62,13 @@ impl StatusSnapshot {
         let reviews = crate::fs_review_lookup::FsReviewLookup::new(repo, state.head.as_ref());
         let work_status = state.fold.derive_status(&reviews, &work_policy);
 
-        let (plans, last_finished) =
-            select_plans_and_finished(&work_status.plans, &state.fold, basename, plan_arg, watch_mode)?;
+        let (plans, last_finished) = select_plans_and_finished(
+            &work_status.plans,
+            &state.fold,
+            basename,
+            plan_arg,
+            watch_mode,
+        )?;
 
         let blocks = crate::cli::block::scan_blocks(repo);
         let queue_count = crate::cli::queue::scan_queue(repo).len();
@@ -178,7 +183,11 @@ impl StatusSnapshot {
             let _ = writeln!(out, "  latest reviewable: {}", short_sha(v.sha.as_str()));
             let _ = writeln!(out, "  gate:              {}", v.gate);
             let _ = writeln!(out, "  waiting on:        {}", waiting_actor(&v.waiting_on));
-            let _ = writeln!(out, "  reason:            {}", waiting_reason(&v.waiting_on));
+            let _ = writeln!(
+                out,
+                "  reason:            {}",
+                waiting_reason(&v.waiting_on)
+            );
         }
 
         if self.plans.is_empty() {
@@ -283,9 +292,7 @@ async fn run_watch(
         }
 
         match rx.recv_timeout(Duration::from_secs(2)) {
-            Ok(()) => {
-                while rx.recv_timeout(Duration::from_millis(200)).is_ok() {}
-            }
+            Ok(()) => while rx.recv_timeout(Duration::from_millis(200)).is_ok() {},
             Err(mpsc::RecvTimeoutError::Timeout) => {}
             Err(mpsc::RecvTimeoutError::Disconnected) => {
                 anyhow::bail!("filesystem watcher disconnected")
@@ -438,8 +445,7 @@ fn waiting_reason(w: &WaitingOn) -> String {
             parts.join("; ")
         }
         WaitingOn::MasterToContinue => {
-            "gate approved (not FINISHED) — continue work or ask a reviewer to mark FINISHED"
-                .into()
+            "gate approved (not FINISHED) — continue work or ask a reviewer to mark FINISHED".into()
         }
         WaitingOn::MasterToFinalize => "gate FINISHED — run `clank finish`".into(),
         WaitingOn::MasterToCommit => "gate approved but plan file dirty".into(),

@@ -354,11 +354,7 @@ fn installed_hook_rewires_on_real_amend() {
     // can find it.
     let clank_dir = Path::new(clank_bin()).parent().unwrap();
     let existing_path = std::env::var("PATH").unwrap_or_default();
-    let new_path = format!(
-        "{}:{}",
-        clank_dir.display(),
-        existing_path,
-    );
+    let new_path = format!("{}:{}", clank_dir.display(), existing_path,);
 
     // Stage a real change so amend actually rewrites the commit.
     write(repo, "src/lib.rs", "// impl\n");
