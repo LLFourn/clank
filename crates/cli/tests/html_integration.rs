@@ -797,6 +797,117 @@ fn html_incremental_refreshes_status_header_on_empty_slice() {
 }
 
 #[test]
+fn html_diff_has_line_numbers_and_syntax_classes() {
+    let dir = init_repo();
+    let repo = dir.path();
+    write(repo, ".clank/plans/foo.md", "# foo\n");
+    commit(repo, "[foo] intro");
+    write(repo, "src/lib.rs", "fn answer() -> i32 {\n    42\n}\n");
+    commit(repo, "[foo] impl");
+    let sha = head_sha(repo);
+
+    let out = run_clank(repo, &["html"]);
+    assert!(out.status.success());
+    let page =
+        std::fs::read_to_string(repo.join(format!(".clank/html/commit/{sha}.html"))).unwrap();
+    // Line numbers: at least one new-side line number `1`.
+    assert!(
+        page.contains("<span class=\"ln new\">1</span>"),
+        "expected new-side line number 1 in the diff; page len {}",
+        page.len()
+    );
+    assert!(
+        page.contains("<span class=\"ln old\">"),
+        "old-line-number gutter missing"
+    );
+    // Syntect classes: Rust grammar tags `fn` as
+    // `storage.type.function.rust` (not `keyword`), and any
+    // Rust source gets the outer `hl-source hl-rust` wrapper.
+    // Verify both bits engaged.
+    assert!(
+        page.contains("hl-source") && page.contains("hl-rust"),
+        "expected syntect Rust source classes; got {}",
+        &page[..page.len().min(2000)]
+    );
+}
+
+#[test]
+fn html_diff_unknown_extension_still_renders() {
+    let dir = init_repo();
+    let repo = dir.path();
+    write(repo, ".clank/plans/foo.md", "# foo\n");
+    commit(repo, "[foo] intro");
+    write(repo, "weird.unknownext", "anything\n");
+    commit(repo, "[foo] touch unknown");
+    let sha = head_sha(repo);
+
+    let out = run_clank(repo, &["html"]);
+    assert!(out.status.success());
+    let page =
+        std::fs::read_to_string(repo.join(format!(".clank/html/commit/{sha}.html"))).unwrap();
+    assert!(
+        page.contains("weird.unknownext"),
+        "file heading should still appear"
+    );
+    assert!(
+        page.contains("class=\"hunk\""),
+        "hunk container must render even for unknown extensions"
+    );
+}
+
+#[test]
+fn html_diff_hunk_header_uses_full_width_band() {
+    let dir = init_repo();
+    let repo = dir.path();
+    write(repo, ".clank/plans/foo.md", "# foo\n");
+    commit(repo, "[foo] intro");
+    write(repo, "src/x.rs", "fn x() {}\n");
+    commit(repo, "[foo] x");
+    let sha = head_sha(repo);
+
+    let out = run_clank(repo, &["html"]);
+    assert!(out.status.success());
+    let page =
+        std::fs::read_to_string(repo.join(format!(".clank/html/commit/{sha}.html"))).unwrap();
+    // The `@@ ...` hunk header line gets the `hunk-hdr`
+    // class on its own div (no line-number gutters).
+    assert!(
+        page.contains("class=\"line hunk-hdr\""),
+        "hunk header missing the hunk-hdr class"
+    );
+    assert!(
+        page.contains("@@") && page.contains("hunk-hdr"),
+        "hunk header text should appear alongside the class"
+    );
+}
+
+#[test]
+fn html_diff_rows_have_no_trailing_newline_in_markup() {
+    // The pre-fancy renderer emitted "</span>\n<span" which
+    // combined with a 1.4 line-height to produce a visible
+    // gap between rows. The new layout uses `<div>` per
+    // line with no inter-element whitespace inside a single
+    // line's markup other than CSS-controlled grid rows.
+    // Smoke-check: there's no `</span></div>\n<span` pattern
+    // that would imply a row-internal hard break.
+    let dir = init_repo();
+    let repo = dir.path();
+    write(repo, ".clank/plans/foo.md", "# foo\n");
+    commit(repo, "[foo] intro");
+    write(repo, "src/lib.rs", "fn x() {}\n");
+    commit(repo, "[foo] impl");
+    let sha = head_sha(repo);
+    let out = run_clank(repo, &["html"]);
+    assert!(out.status.success());
+    let page =
+        std::fs::read_to_string(repo.join(format!(".clank/html/commit/{sha}.html"))).unwrap();
+    assert!(
+        !page.contains("</div>\n      <div class=\"line\""),
+        "rows must not introduce a raw-newline separator between line divs"
+    );
+}
+
+#[test]
 fn init_gitignore_includes_html_dir() {
     let dir = init_repo();
     let out = run_clank(dir.path(), &["init", "--yes"]);

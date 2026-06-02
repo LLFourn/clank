@@ -17,6 +17,7 @@ pub mod doctor;
 pub mod feedback;
 pub mod finish;
 pub mod html;
+pub mod html_highlight;
 pub mod init;
 pub mod log;
 pub mod open;

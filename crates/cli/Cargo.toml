@@ -40,6 +40,13 @@ tempfile = "3"
 # Markdown -> HTML for clank html.
 pulldown-cmark = { version = "0.13", default-features = false, features = ["html"] }
 
+# Syntax highlighting for clank html diffs. `default-fancy`
+# brings in the compiled-in default grammar set + the no-onig
+# regex backend (pure Rust) so we don't pull in `onig` and
+# `libclang`. CSS-class output mode keeps theming in our
+# stylesheet — we don't ship a syntect theme.
+syntect = { version = "5", default-features = false, features = ["default-fancy"] }
+
 # RFC3339 timestamp formatting for AgentConfig.session.updated_at.
 # UTC only — local-offset has soundness issues in multi-threaded programs.
 time = { version = "0.3", features = ["formatting"] }

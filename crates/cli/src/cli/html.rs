@@ -689,7 +689,30 @@ fn render_commit_page(
 
 struct FilePatch {
     header: String,
-    hunks: Vec<String>,
+    hunks: Vec<Hunk>,
+}
+
+struct Hunk {
+    /// Verbatim hunk header line including `@@ ... @@`.
+    header_line: String,
+    /// Starting old/new line numbers from `@@ -A,B +C,D @@`.
+    old_start: u32,
+    new_start: u32,
+    /// Body lines (without trailing `\n`).
+    body: Vec<String>,
+}
+
+fn parse_hunk_header(line: &str) -> Option<(u32, u32)> {
+    // `@@ -A,B +C,D @@ optional context`
+    let stripped = line.strip_prefix("@@ ")?;
+    let close = stripped.find("@@")?;
+    let nums = &stripped[..close];
+    let mut parts = nums.split_whitespace();
+    let old_chunk = parts.next()?.strip_prefix('-')?;
+    let new_chunk = parts.next()?.strip_prefix('+')?;
+    let old_start: u32 = old_chunk.split(',').next()?.parse().ok()?;
+    let new_start: u32 = new_chunk.split(',').next()?.parse().ok()?;
+    Some((old_start, new_start))
 }
 
 fn commit_diff(repo: &Path, sha: &CommitSha) -> Vec<FilePatch> {
@@ -709,8 +732,8 @@ fn commit_diff(repo: &Path, sha: &CommitSha) -> Vec<FilePatch> {
 fn parse_unified_diff(text: &str) -> Vec<FilePatch> {
     let mut files: Vec<FilePatch> = Vec::new();
     let mut cur_header: Option<String> = None;
-    let mut cur_hunks: Vec<String> = Vec::new();
-    let mut cur_hunk: Option<String> = None;
+    let mut cur_hunks: Vec<Hunk> = Vec::new();
+    let mut cur_hunk: Option<Hunk> = None;
     for line in text.lines() {
         if line.starts_with("diff --git") {
             if let Some(h) = cur_hunk.take() {
@@ -727,11 +750,15 @@ fn parse_unified_diff(text: &str) -> Vec<FilePatch> {
             if let Some(h) = cur_hunk.take() {
                 cur_hunks.push(h);
             }
-            cur_hunk = Some(format!("{line}\n"));
-        } else if cur_hunk.is_some() {
-            // Body line of the current hunk.
-            cur_hunk.as_mut().unwrap().push_str(line);
-            cur_hunk.as_mut().unwrap().push('\n');
+            let (old_start, new_start) = parse_hunk_header(line).unwrap_or((0, 0));
+            cur_hunk = Some(Hunk {
+                header_line: line.to_string(),
+                old_start,
+                new_start,
+                body: Vec::new(),
+            });
+        } else if let Some(h) = cur_hunk.as_mut() {
+            h.body.push(line.to_string());
         } else if let Some(h) = cur_header.as_mut() {
             // Pre-hunk metadata lines (index, ---, +++).
             h.push('\n');
@@ -759,29 +786,81 @@ fn render_file_patch(fp: &FilePatch) -> String {
         .and_then(|rest| rest.split_once(' '))
         .map(|(_a, b)| b.trim_start_matches("b/").to_string())
         .unwrap_or_else(|| "(unknown)".to_string());
+    let ext = std::path::Path::new(&path)
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|s| s.to_string());
     let mut s = String::new();
     s.push_str(&format!(
         "  <details open class=\"file\"><summary>{}</summary>\n",
         esc(&path)
     ));
     for hunk in &fp.hunks {
-        s.push_str("    <pre class=\"hunk\"><code>\n");
-        for line in hunk.lines() {
-            let cls = match line.chars().next() {
-                Some('+') if !line.starts_with("+++") => "add",
-                Some('-') if !line.starts_with("---") => "del",
-                Some('@') => "hunk-hdr",
-                _ => "ctx",
+        s.push_str("    <div class=\"hunk\">\n");
+        // Hunk header line: full-width band, no line numbers.
+        s.push_str(&format!(
+            "      <div class=\"line hunk-hdr\"><span class=\"src\">{}</span></div>\n",
+            esc(&hunk.header_line)
+        ));
+        let mut old_no = hunk.old_start;
+        let mut new_no = hunk.new_start;
+        for line in &hunk.body {
+            let (cls, sign, source) = classify_line(line);
+            let (old_label, new_label) = match cls {
+                "add" => {
+                    let l = (String::new(), new_no.to_string());
+                    new_no += 1;
+                    l
+                }
+                "del" => {
+                    let l = (old_no.to_string(), String::new());
+                    old_no += 1;
+                    l
+                }
+                "ctx" => {
+                    let l = (old_no.to_string(), new_no.to_string());
+                    old_no += 1;
+                    new_no += 1;
+                    l
+                }
+                _ => (String::new(), String::new()),
+            };
+            let highlighted = if source.is_empty() {
+                String::new()
+            } else {
+                crate::cli::html_highlight::highlight_line(ext.as_deref(), source)
             };
             s.push_str(&format!(
-                "<span class=\"line {cls}\">{}</span>\n",
-                esc(line)
+                "      <div class=\"line {cls}\"><span class=\"ln old\">{}</span><span class=\"ln new\">{}</span><span class=\"sign\">{}</span><span class=\"src\">{}</span></div>\n",
+                esc(&old_label),
+                esc(&new_label),
+                esc(sign),
+                highlighted
             ));
         }
-        s.push_str("    </code></pre>\n");
+        s.push_str("    </div>\n");
     }
     s.push_str("  </details>\n");
     s
+}
+
+fn classify_line(line: &str) -> (&'static str, &'static str, &str) {
+    if line.starts_with("+++") || line.starts_with("---") {
+        return ("meta", " ", line);
+    }
+    if let Some(rest) = line.strip_prefix('+') {
+        ("add", "+", rest)
+    } else if let Some(rest) = line.strip_prefix('-') {
+        ("del", "-", rest)
+    } else if let Some(rest) = line.strip_prefix(' ') {
+        ("ctx", " ", rest)
+    } else if line.starts_with('\\') {
+        // "\ No newline at end of file" — treat as a context
+        // annotation; show verbatim with empty line numbers.
+        ("meta", " ", line)
+    } else {
+        ("ctx", " ", line)
+    }
 }
 
 // ─────────────────────────── helpers ────────────────────────
@@ -1166,12 +1245,47 @@ section h3 { font-size: .9rem; text-transform: uppercase; letter-spacing: .05em;
 .review .summary { margin: .25rem 0 .5rem; font-weight: 500; }
 .file { margin: .5rem 0; }
 .file summary { font: 500 .9rem/1.4 var(--mono); cursor: pointer; padding: .25rem .35rem; background: var(--pill-bg); border-radius: 3px; }
-.hunk { font: .8rem/1.4 var(--mono); margin: .35rem 0; padding: .5rem .35rem; background: var(--bg); border: 1px solid var(--rule); border-radius: 3px; overflow-x: auto; }
-.hunk code { background: transparent; padding: 0; }
-.line { display: block; padding: 0 .25rem; white-space: pre; }
+.hunk { font: .8rem/1.25 var(--mono); margin: .35rem 0; background: var(--bg); border: 1px solid var(--rule); border-radius: 3px; overflow-x: auto; }
+.line {
+  display: grid;
+  grid-template-columns: 3.2em 3.2em 1.1em 1fr;
+  white-space: pre;
+}
+.line .ln {
+  text-align: right;
+  padding: 0 .35em;
+  color: var(--hunk-hdr);
+  user-select: none;
+  font-feature-settings: "tnum";
+}
+.line .sign { text-align: center; color: var(--fg-dim); }
+.line .src { padding-right: .35em; }
 .line.add { background: var(--add-bg); }
 .line.del { background: var(--del-bg); }
-.line.hunk-hdr { color: var(--hunk-hdr); }
+.line.hunk-hdr { background: var(--pill-bg); color: var(--hunk-hdr); padding: .1rem 0; grid-template-columns: 1fr; }
+.line.hunk-hdr .src { padding-left: .5rem; }
+.line.meta { color: var(--fg-dim); }
+/* syntect class colors (light) */
+.hl-keyword { color: #a626a4; }
+.hl-storage { color: #a626a4; }
+.hl-constant { color: #986801; }
+.hl-string { color: #50a14f; }
+.hl-comment { color: var(--fg-dim); font-style: italic; }
+.hl-entity { color: #4078f2; }
+.hl-support { color: #0184bc; }
+.hl-variable { color: #e45649; }
+.hl-punctuation { color: var(--fg-dim); }
+@media (prefers-color-scheme: dark) {
+  .hl-keyword { color: #c678dd; }
+  .hl-storage { color: #c678dd; }
+  .hl-constant { color: #d19a66; }
+  .hl-string { color: #98c379; }
+  .hl-comment { color: #7c7c7c; font-style: italic; }
+  .hl-entity { color: #61afef; }
+  .hl-support { color: #56b6c2; }
+  .hl-variable { color: #e06c75; }
+  .hl-punctuation { color: #8e8c89; }
+}
 @media print {
   .row-link:hover { background: transparent; }
   details > summary { list-style: none; }
