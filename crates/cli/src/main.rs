@@ -28,8 +28,8 @@ enum Command {
     /// a plan.
     Log(cli::LogArgs),
     /// Render the event log + status to a static HTML site at
-    /// `.clank/html/`. Pass `--open` to launch the result in
-    /// your browser.
+    /// `.clank/html/`. Use `clank html open` to build and
+    /// launch the result in your browser.
     Html(cli::HtmlArgs),
     /// Inspect a path: classify what's there (no repo / git
     /// without clank / clank initialized) and return enough
