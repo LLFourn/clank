@@ -1,3 +1,4 @@
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use super::{QueueArgs, QueueCmd, resolve_repo};
@@ -6,9 +7,116 @@ pub async fn run(args: QueueArgs) -> anyhow::Result<()> {
     let repo = resolve_repo(args.repo.as_deref())?;
     match args.command {
         None => list(&repo),
-        Some(QueueCmd::Add(a)) => add(&repo, &a.name, a.priority),
+        Some(QueueCmd::Add(a)) => {
+            let source = pick_body_source(&repo, &a.name, &a)?;
+            add(&repo, &a.name, a.priority, source)
+        }
         Some(QueueCmd::Remove(r)) => remove(&repo, &r.name),
         Some(QueueCmd::Promote(p)) => promote(&repo, &p.name),
+    }
+}
+
+/// Where a queued stub's body came from. Used for error
+/// messages so the user knows what to fix.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum BodySourceKind {
+    Inline,
+    FromPath(PathBuf),
+    Stdin,
+    StubsDir(PathBuf),
+}
+
+impl BodySourceKind {
+    fn describe(&self) -> String {
+        match self {
+            BodySourceKind::Inline => "-m".to_string(),
+            BodySourceKind::Stdin => "--from -".to_string(),
+            BodySourceKind::FromPath(p) => format!("--from {}", p.display()),
+            BodySourceKind::StubsDir(p) => format!("`{}`", p.display()),
+        }
+    }
+}
+
+pub(crate) struct BodySource {
+    pub raw: String,
+    pub kind: BodySourceKind,
+}
+
+fn pick_body_source(
+    repo: &Path,
+    name: &str,
+    args: &super::QueueAddArgs,
+) -> anyhow::Result<BodySource> {
+    if let Some(path) = &args.from {
+        if path == &PathBuf::from("-") {
+            let mut buf = String::new();
+            std::io::stdin()
+                .read_to_string(&mut buf)
+                .map_err(|e| anyhow::anyhow!("reading stdin: {e}"))?;
+            return Ok(BodySource {
+                raw: buf,
+                kind: BodySourceKind::Stdin,
+            });
+        }
+        let raw = std::fs::read_to_string(path)
+            .map_err(|e| anyhow::anyhow!("reading `{}`: {e}", path.display()))?;
+        return Ok(BodySource {
+            raw,
+            kind: BodySourceKind::FromPath(path.clone()),
+        });
+    }
+    if let Some(msg) = &args.message {
+        return Ok(BodySource {
+            raw: msg.clone(),
+            kind: BodySourceKind::Inline,
+        });
+    }
+    let stubs_path = repo.join(format!(".clank/stubs/{name}.md"));
+    if stubs_path.is_file() {
+        let raw = std::fs::read_to_string(&stubs_path)
+            .map_err(|e| anyhow::anyhow!("reading `{}`: {e}", stubs_path.display()))?;
+        return Ok(BodySource {
+            raw,
+            kind: BodySourceKind::StubsDir(stubs_path),
+        });
+    }
+    anyhow::bail!(
+        "no body for `{name}`. Pass one of:\n  \
+         --from <path>   read body from a file (or `--from -` for stdin)\n  \
+         -m \"<body>\"   inline body\n  \
+         or write `.clank/stubs/{name}.md` and re-run."
+    );
+}
+
+/// Ensure the body has non-empty content beyond the
+/// `# <name>` header. Returns the normalized body (with a
+/// leading header prepended when missing) or an error
+/// citing the source.
+fn normalize_and_validate(
+    name: &str,
+    source: BodySource,
+) -> anyhow::Result<String> {
+    let raw = source.raw;
+    let has_header = raw
+        .lines()
+        .next()
+        .map(|l| l.trim_start_matches('#').trim() == name)
+        .unwrap_or(false);
+    let post_header = if has_header {
+        raw.lines().skip(1).collect::<Vec<_>>().join("\n")
+    } else {
+        raw.clone()
+    };
+    if post_header.trim().is_empty() {
+        anyhow::bail!(
+            "queued body for `{name}` from {} is empty after the header; pass non-empty content.",
+            source.kind.describe()
+        );
+    }
+    if has_header {
+        Ok(raw)
+    } else {
+        Ok(format!("# {name}\n{raw}"))
     }
 }
 
@@ -107,13 +215,16 @@ fn validate_name(name: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn add(repo: &Path, name: &str, priority: u16) -> anyhow::Result<()> {
+fn add(
+    repo: &Path,
+    name: &str,
+    priority: u16,
+    source: BodySource,
+) -> anyhow::Result<()> {
     validate_name(name)?;
     if priority > 999 {
         anyhow::bail!("priority must be 0-999");
     }
-    let dir = queue_dir(repo);
-    std::fs::create_dir_all(&dir)?;
     let scanned = scan_queue(repo);
     let conflicts: Vec<&QueueEntry> = scanned.iter().filter(|e| e.name == name).collect();
     if !conflicts.is_empty() {
@@ -127,9 +238,15 @@ fn add(repo: &Path, name: &str, priority: u16) -> anyhow::Result<()> {
              Delete it from .clank/queue/ first or pick a different name."
         );
     }
+    let body = normalize_and_validate(name, source)?;
+    let dir = queue_dir(repo);
+    std::fs::create_dir_all(&dir)?;
     let dest = dir.join(format!("{priority:03}-{name}.md"));
-    std::fs::write(&dest, format!("# {name}\n"))?;
-    println!("queued `{name}` at priority {priority:03} ({})", dest.display());
+    std::fs::write(&dest, body)?;
+    println!(
+        "queued `{name}` at priority {priority:03} ({})",
+        dest.display()
+    );
     Ok(())
 }
 
@@ -234,10 +351,17 @@ mod tests {
         assert_eq!(entries[0].name, "good");
     }
 
+    fn inline(body: &str) -> BodySource {
+        BodySource {
+            raw: body.to_string(),
+            kind: BodySourceKind::Inline,
+        }
+    }
+
     #[test]
     fn invalid_name_rejected() {
         let dir = tempfile::tempdir().unwrap();
-        let result = add(dir.path(), ".hidden", 100);
+        let result = add(dir.path(), ".hidden", 100, inline("body\n"));
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("invalid plan name"));
     }
@@ -245,18 +369,61 @@ mod tests {
     #[test]
     fn priority_over_999_rejected() {
         let dir = tempfile::tempdir().unwrap();
-        let result = add(dir.path(), "foo", 1000);
+        let result = add(dir.path(), "foo", 1000, inline("body\n"));
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("0-999"));
     }
 
     #[test]
-    fn add_writes_empty_stub_with_header() {
+    fn add_writes_stub_with_header_prepended() {
         let dir = tempfile::tempdir().unwrap();
-        add(dir.path(), "foo", 400).unwrap();
+        add(dir.path(), "foo", 400, inline("real body\n")).unwrap();
         let path = dir.path().join(".clank/queue/400-foo.md");
         let body = std::fs::read_to_string(&path).unwrap();
-        assert_eq!(body, "# foo\n");
+        assert_eq!(body, "# foo\nreal body\n");
+    }
+
+    #[test]
+    fn add_preserves_existing_header_when_present() {
+        let dir = tempfile::tempdir().unwrap();
+        add(
+            dir.path(),
+            "foo",
+            400,
+            inline("# foo\n\nreal body\n"),
+        )
+        .unwrap();
+        let body = std::fs::read_to_string(dir.path().join(".clank/queue/400-foo.md"))
+            .unwrap();
+        assert_eq!(body, "# foo\n\nreal body\n");
+    }
+
+    #[test]
+    fn add_rejects_inline_message_with_only_header() {
+        let dir = tempfile::tempdir().unwrap();
+        let result = add(dir.path(), "foo", 400, inline("# foo\n"));
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("empty after the header") && msg.contains("-m"),
+            "unexpected error: {msg}"
+        );
+        assert!(
+            !dir.path().join(".clank/queue/400-foo.md").exists(),
+            "must not write a file on rejection"
+        );
+    }
+
+    #[test]
+    fn add_rejects_inline_message_whitespace_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let result = add(dir.path(), "foo", 400, inline("   \n\n"));
+        assert!(result.is_err());
+        assert!(
+            result.unwrap_err().to_string().contains("empty after"),
+            "expected empty-after-header message"
+        );
+        assert!(!dir.path().join(".clank/queue/400-foo.md").exists());
     }
 
     #[test]
@@ -264,7 +431,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let q = dir.path().join(".clank/queue");
         write(&q.join("400-foo.md"), "# foo\n");
-        let result = add(dir.path(), "foo", 410);
+        let result = add(dir.path(), "foo", 410, inline("body\n"));
         assert!(result.is_err());
         let msg = result.unwrap_err().to_string();
         assert!(

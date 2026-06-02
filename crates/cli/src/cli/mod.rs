@@ -506,9 +506,12 @@ pub struct QueueArgs {
 
 #[derive(clap::Subcommand, Debug)]
 pub enum QueueCmd {
-    /// Create an empty queued plan stub at
-    /// `.clank/queue/<NNN>-<name>.md`. The agent (or human)
-    /// then edits that file in place.
+    /// Add a queued plan stub at
+    /// `.clank/queue/<NNN>-<name>.md`. Body comes from one
+    /// of three sources, checked in this order:
+    /// `--from <path>` (use `-` for stdin), `-m "<body>"`,
+    /// or fallback to `.clank/stubs/<name>.md` if it exists.
+    /// Empty / header-only content is rejected.
     Add(QueueAddArgs),
     /// Remove an item from the queue.
     Remove(QueueRemoveArgs),
@@ -521,6 +524,14 @@ pub struct QueueAddArgs {
     pub name: String,
     #[arg(long, default_value_t = 500)]
     pub priority: u16,
+    /// Inline body. Multi-line allowed (newlines preserved).
+    /// Mutually exclusive with `--from`.
+    #[arg(short = 'm', long, conflicts_with = "from")]
+    pub message: Option<String>,
+    /// Read the body from this file. `-` reads stdin.
+    /// Mutually exclusive with `-m`.
+    #[arg(long, value_name = "PATH")]
+    pub from: Option<PathBuf>,
 }
 
 #[derive(Args, Debug)]
