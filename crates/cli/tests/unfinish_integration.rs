@@ -189,6 +189,68 @@ fn unfinish_refuses_when_head_is_not_a_finish_commit() {
 }
 
 #[test]
+fn unfinish_refuses_add_only_finished_marker() {
+    // A commit that ADDs .clank/finished/<stem>.md without
+    // deleting .clank/plans/<stem>.md isn't a trivial rename;
+    // dropping it would obliterate the finished marker but
+    // leave the plan file behind, no inverse semantics.
+    let dir = init_repo();
+    let repo = dir.path();
+    write(repo, ".clank/plans/foo.md", "# foo\n");
+    commit(repo, "[foo] intro");
+
+    // Add ONLY the finished marker, leaving the plans file in
+    // place.
+    write(repo, ".clank/finished/foo.md", "# foo\n");
+    git(repo, &["add", ".clank/finished/foo.md"]);
+    git(repo, &["commit", "--quiet", "-m", "[foo] add-only"]);
+
+    let before = head_sha(repo);
+    let out = run_clank(repo, &["unfinish", "foo"]);
+    assert!(
+        !out.status.success(),
+        "unfinish must refuse an add-only finish commit"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("did not delete") || stderr.contains("trivial"),
+        "error should explain the missing delete; got: {stderr}"
+    );
+    assert_eq!(head_sha(repo), before, "HEAD must NOT move");
+}
+
+#[test]
+fn unfinish_refuses_content_mismatched_rename() {
+    // A commit that renames plans/ → finished/ but changes the
+    // file's content along the way also isn't a trivial finish.
+    // `git reset --hard HEAD~` would silently lose the content
+    // change.
+    let dir = init_repo();
+    let repo = dir.path();
+    write(repo, ".clank/plans/foo.md", "# foo\noriginal body\n");
+    commit(repo, "[foo] intro");
+
+    // Rename AND edit the body in the same commit.
+    write(repo, ".clank/finished/foo.md", "# foo\nEDITED body\n");
+    git(repo, &["rm", "--quiet", ".clank/plans/foo.md"]);
+    git(repo, &["add", ".clank/finished/foo.md"]);
+    git(repo, &["commit", "--quiet", "-m", "[foo] finish+edit"]);
+
+    let before = head_sha(repo);
+    let out = run_clank(repo, &["unfinish", "foo"]);
+    assert!(
+        !out.status.success(),
+        "unfinish must refuse a rename-with-edit"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("changed plan body") || stderr.contains("manually"),
+        "error should explain the content mismatch; got: {stderr}"
+    );
+    assert_eq!(head_sha(repo), before, "HEAD must NOT move");
+}
+
+#[test]
 fn unfinish_refuses_when_finish_commit_has_unrelated_changes() {
     let dir = init_repo();
     let repo = dir.path();

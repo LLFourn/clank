@@ -103,9 +103,17 @@ fn require_head_is_trivial_finish(repo: &Path, stem: &str) -> anyhow::Result<()>
     let added_finished = entries
         .iter()
         .any(|(s, p)| *s == 'A' && p == &finished_rel);
+    let deleted_plan = entries
+        .iter()
+        .any(|(s, p)| *s == 'D' && p == &plans_rel);
     if !added_finished {
         anyhow::bail!(
             "finish for `{stem}` is not at HEAD — `{finished_rel}` was not added by this commit. Find the finish commit and operate from there."
+        );
+    }
+    if !deleted_plan {
+        anyhow::bail!(
+            "HEAD added `{finished_rel}` but did not delete `{plans_rel}` — this isn't a trivial finish commit. Fix the history manually first."
         );
     }
 
@@ -125,7 +133,34 @@ fn require_head_is_trivial_finish(repo: &Path, stem: &str) -> anyhow::Result<()>
             "HEAD's finish commit carries changes beyond the rename — refusing to drop it. Fix the history manually first.\n  {listed}"
         );
     }
+
+    // Content equality: HEAD~:plans/<stem>.md must match
+    // HEAD:finished/<stem>.md byte-for-byte. A rename that
+    // also edited content would silently lose the edit on
+    // `git reset --hard HEAD~`.
+    let before = git_show(repo, &format!("HEAD~:{plans_rel}"))?;
+    let after = git_show(repo, &format!("HEAD:{finished_rel}"))?;
+    if before != after {
+        anyhow::bail!(
+            "HEAD's finish commit changed plan body in addition to renaming it. Fix the history manually first."
+        );
+    }
     Ok(())
+}
+
+fn git_show(repo: &Path, spec: &str) -> anyhow::Result<Vec<u8>> {
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["show", spec])
+        .output()?;
+    if !out.status.success() {
+        anyhow::bail!(
+            "git show {spec} failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    Ok(out.stdout)
 }
 
 fn head_sha(repo: &Path) -> anyhow::Result<String> {
