@@ -21,21 +21,52 @@ single-line header:
 ```
 
 The agent (or human) then edits that file in place. No external
-file required, no copy step. Re-running `clank queue add` for
-the same name is an error ("queue item already exists at …").
+file required, no copy step.
 
 `--priority` keeps the existing `0..=999` range and `500`
 default.
+
+## Duplicate / ambiguous name handling
+
+Queue items are keyed by `<name>` for `scan` / `remove` /
+`promote`. Two files with the same name and different priority
+prefixes (e.g. `400-foo.md` and `410-foo.md`) make every keyed
+operation ambiguous.
+
+Don't try to deduplicate or auto-resolve. Instead:
+
+- `clank queue add <name>` fails if ANY existing
+  `.clank/queue/<NNN>-<name>.md` matches the name, regardless
+  of the priority prefix.
+- `scan` / `remove` / `promote` fail loudly when they
+  encounter multiple files for the same name.
+- Every failure message tells the agent the exact fix:
+
+  ```
+  ambiguous queue name `<name>`: matched 400-<name>.md and
+  410-<name>.md. Delete the duplicate from .clank/queue/ and
+  re-run.
+  ```
+
+  That puts the cleanup squarely on the agent. No silent
+  recovery.
 
 ## Surfaces touched
 
 - `crates/cli/src/cli/queue.rs::add` — drop the
   `~/.clank/stubs/<name>.md` lookup; write the new file
-  directly under `.clank/queue/`. Refuse if the destination
-  already exists.
-- `crates/cli/src/cli/mod.rs:629` — strip the
-  "`.clank/stubs/*`" mention from the `QueueAddArgs` doc
-  comment.
+  directly under `.clank/queue/`. Refuse if ANY existing
+  `.clank/queue/<NNN>-<name>.md` matches the name (any
+  priority prefix).
+- `crates/cli/src/cli/queue.rs::scan_queue` /
+  `::remove` / `::promote` — when more than one file matches
+  a name, bail with the ambiguity message documented above
+  instead of silently picking one.
+- `crates/cli/src/cli/mod.rs` `QueueCmd::Add` doc comment
+  (currently "Add a stub to the queue.") — rewrite to reflect
+  the new behavior, e.g. "Add an empty queued plan stub at
+  `.clank/queue/<NNN>-<name>.md`." No mention of
+  `~/.clank/stubs/`.
 - Any other comment / doc / test referring to
   `~/.clank/stubs/` or `.clank/stubs/` — grep and remove.
   (The skill assets I already checked don't mention it; only
@@ -48,8 +79,15 @@ default.
   — fresh repo, run `clank queue add foo --priority 400`,
   assert `.clank/queue/400-foo.md` exists with
   `# foo\n` body, no read from `$HOME/.clank/stubs/`.
-- `queue_add_refuses_when_destination_exists` — pre-create
-  `.clank/queue/400-foo.md`, run the command, assert error.
+- `queue_add_refuses_when_same_name_any_priority` — pre-create
+  `.clank/queue/400-foo.md`, then run `clank queue add foo
+  --priority 410`; assert it fails with a message naming the
+  existing file. Pin that the destination at
+  `.clank/queue/410-foo.md` is NOT created.
+- `queue_promote_fails_on_ambiguous_name` — seed two files
+  for the same name at different priorities, run `clank
+  queue promote foo`, assert failure + the documented
+  "delete the duplicate" message.
 - Sanity: any existing queue test that pre-seeded a
   `~/.clank/stubs/<name>.md` file gets rewritten to drop that
   setup step.
