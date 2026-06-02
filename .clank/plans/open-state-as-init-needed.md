@@ -23,18 +23,27 @@ Variants on disk today (cross-checked against `cli/init.rs`):
 
 - `MissingClankDir` — `.clank/` doesn't exist.
   (`init.rs::write_scaffold` creates it.)
-- `MissingClankGitignore` — `.clank/.gitignore` is absent or
-  doesn't match `GITIGNORE_BODY`. (`init.rs::write_scaffold`
-  writes/upgrades it.)
+- `MissingClankGitignore` — `.clank/.gitignore` is absent
+  OR its body matches one of the `LEGACY_GITIGNORE_BODIES`
+  init silently upgrades. (`init.rs::write_scaffold` writes
+  or upgrades only these cases; foreign drifted content
+  makes init BAIL, so it doesn't count as an InitGap — see
+  "Drifted state" below.)
 - `MissingClaudePermissions` — `.claude/settings.local.json`
-  is absent or its `permissions.allow` doesn't include
+  is absent OR its `permissions.allow` doesn't include
   `Write(.clank/agents/**)`, `Edit(.clank/agents/**)`, or
   `Read(.clank/agents/**)`. (`init.rs::write_claude_perms`
-  tag-merges them.)
-- `MissingPostRewriteHook` — `git rev-parse --git-path
-  hooks/post-rewrite` resolves to a file that doesn't carry
-  `POST_REWRITE_MARKER` (or doesn't exist).
-  (`init.rs::write_post_rewrite_hook` installs / refreshes.)
+  tag-merges; never clobbers, so the partial case is
+  repairable.)
+- `MissingPostRewriteHook` — the resolved
+  `hooks/post-rewrite` file is absent OR contains
+  `POST_REWRITE_MARKER` but its body has drifted from the
+  canonical `POST_REWRITE_BODY`.
+  (`init.rs::write_post_rewrite_hook` writes the missing
+  case and refreshes the marker-present case. Foreign
+  hooks — no marker — only WARN and require
+  `--force-hooks`, so they don't count as an InitGap — see
+  "Drifted state" below.)
 
 `ClankReady` is the absence of all of the above.
 
@@ -53,6 +62,26 @@ Variants on disk today (cross-checked against `cli/init.rs`):
   agents is `ClankReady` + empty `agents` array. The
   `BindAgent` recommendation is the action, independent of
   init.
+
+### Drifted state (warnings, not InitGaps)
+
+Things `clank init` refuses to fix on a clean re-run go in
+`OpenResponse::warnings`, NOT in `init_gaps`. Otherwise the
+editor would prompt "run clank init" for a state init won't
+actually repair.
+
+- **Foreign post-rewrite hook**: hook file present but
+  missing `POST_REWRITE_MARKER`. Warning text mentions the
+  resolved hook path and that `clank init --force-hooks`
+  would overwrite it.
+- **Drifted `.clank/.gitignore`**: body neither matches
+  `GITIGNORE_BODY` nor any `LEGACY_GITIGNORE_BODIES` entry.
+  Warning text mentions the path and that init will bail
+  until the file is removed or matches the canonical body.
+
+Both probe via the same predicates `init.rs` uses; no
+parallel logic — extract a `clank_init_facts` helper module
+that both `init.rs` (writer) and `open.rs` (reader) call.
 
 ## Wire shape (JSON)
 
@@ -150,13 +179,27 @@ Wire shape:
   has a `gaps` field matching the top-level `init_gaps`
   kinds in order.
 
-Root-gitignore advisory:
+Drifted-state warnings (NOT InitGaps):
 
 - `warning_for_ancestor_gitignore_excluding_clank_paths`
   — ancestor `.gitignore` excludes `.clank/plans/`; assert
   a `warnings` entry mentions the source file and that no
-  `MissingGitignoreEntries`-style `InitGap` is emitted
-  (init doesn't fix this).
+  init-gap of that shape is emitted (init doesn't fix
+  this).
+- `foreign_post_rewrite_hook_is_warning_not_init_gap`
+  — pre-existing `hooks/post-rewrite` without the clank
+  marker; assert NO `missing_post_rewrite_hook` in
+  `init_gaps`, a warning mentions the path + the
+  `--force-hooks` escape hatch.
+- `legacy_clank_gitignore_is_init_gap` — write a known
+  legacy body to `.clank/.gitignore`; assert
+  `missing_clank_gitignore` IS in `init_gaps` (init will
+  silently upgrade).
+- `foreign_clank_gitignore_is_warning_not_init_gap` —
+  write arbitrary content to `.clank/.gitignore`; assert
+  NO `missing_clank_gitignore` in `init_gaps`, a warning
+  mentions that init bails until the file matches the
+  canonical body.
 
 ## Out of scope
 
