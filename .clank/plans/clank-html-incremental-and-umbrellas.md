@@ -52,34 +52,54 @@ On the next `clank html`:
 
 ### Umbrella boundary merge
 
-The new slice's earliest event may belong in the SAME
-umbrella as the existing topmost rendered row (e.g. prior
-build ended with `[foo] revise`; the new slice starts with
-`[foo] impl`). Blindly prepending a new `[foo]` umbrella
-would produce two `[foo]` cycles for what is actually one
-continuous cycle.
+The timeline is rendered NEWEST-FIRST: the top of the DOM
+is the most recent event, the bottom is the oldest. So the
+boundary between "stuff already on the page" and "new
+slice rows being spliced in" sits between:
+
+- the BOTTOM of the new slice's grouping (its OLDEST
+  umbrella — i.e., the one that, in render order, will sit
+  just above the prior top), AND
+- the prior index's TOPMOST umbrella.
+
+If those two umbrellas share a plan key, they're the same
+cycle and must merge. Blindly prepending the full new
+grouping would otherwise leave two adjacent `[foo]`
+umbrellas where there should be one.
 
 Rule the splicer applies, in order:
 
-1. Read the prior index's TOPMOST umbrella (the most
-   recently rendered group): its `data-umbrella-key`
-   attribute (`foo`, `bar`, `ad-hoc`, etc.) plus its
-   `data-umbrella-tail-sha` attribute (sha of its
-   most-recent row).
+1. Read the prior index's TOPMOST umbrella: its
+   `data-umbrella-key` attribute (`foo`, `bar`, `ad-hoc`,
+   etc.).
 2. Group the NEW slice's events into umbrellas using the
-   same grouping rule as a full rebuild.
-3. If the FIRST umbrella in the new grouping shares the
-   same key as the prior topmost umbrella, MERGE: append
-   the new rows into the existing umbrella's row list (in
-   the prior index's DOM), update the umbrella's
-   `data-umbrella-tail-sha` to the new latest sha. Then
-   prepend the REMAINING new umbrellas above it.
-4. Otherwise: prepend all new umbrellas above the prior
-   topmost row.
+   same grouping rule as a full rebuild, ordered
+   chronologically (oldest first). Call the OLDEST new
+   umbrella `slice_tail` and the NEWEST `slice_head`.
+3. If `slice_tail.key == prior_top.key`, MERGE: take the
+   rows in `slice_tail` and INSERT them at the TOP of the
+   prior topmost umbrella's row list (still newest-first
+   inside the umbrella — the new rows are more recent
+   than the existing ones).  Then prepend every OTHER new
+   umbrella (everything except `slice_tail`) above the
+   prior topmost umbrella, ordered newest-first.
+4. Otherwise: no merge. Prepend every new umbrella above
+   the prior topmost umbrella, ordered newest-first.
 
-Tag every umbrella with `data-umbrella-key=` (and
-`data-umbrella-tail-sha=` on the latest row inside it) at
-render time so the splicer doesn't have to re-derive group
+Concrete example codex flagged: prior top is `[foo] revise`
+inside a `[foo]` umbrella. New slice in chronological
+order: `[foo] impl` then `[bar] intro` (bar is newer).
+Grouping: `slice_tail = [foo] impl`, `slice_head = [bar]
+intro`. Merge fires: `[foo] impl` goes to the top of the
+existing `[foo]` umbrella's row list (above `[foo]
+revise`). Then `[bar]` is prepended above the merged
+`[foo]` umbrella. Final render: `[bar]` umbrella, then
+`[foo]` umbrella containing `[foo] impl` then
+`[foo] revise`. Exactly one `[foo]` umbrella; rows newest-
+first within it.
+
+Tag every umbrella with `data-umbrella-key=` at render
+time so the splicer doesn't have to re-derive group
 identity from text.
 
 ### HTML container shape
@@ -332,12 +352,21 @@ Incremental:
   fold ends with `[foo] revise` as the topmost row inside
   a `[foo]` umbrella; add a new `[foo] impl` commit; run
   incremental; assert the rendered index has exactly ONE
-  `[foo]` umbrella, containing both the prior rows and
-  the new row.
+  `[foo]` umbrella, containing the new `[foo] impl` row
+  ABOVE the prior `[foo] revise` row (newest-first inside
+  the umbrella).
 - `html_incremental_starts_new_umbrella_on_plan_change` —
   prior tail is `[foo] revise`; new slice is
   `[bar] intro`; assert the rendered index has TWO
   umbrellas, `[bar]` above `[foo]`, in that order.
+- `html_incremental_merges_then_starts_new_above` —
+  codex's regression: prior tail is `[foo] revise`;
+  new slice is `[foo] impl` then `[bar] intro` (bar is
+  newest). Assert the rendered index has TWO umbrellas:
+  `[bar]` on top, then a SINGLE `[foo]` umbrella below
+  containing `[foo] impl` (top) and `[foo] revise`
+  (bottom). Pins both the boundary-merge target
+  selection and the inner-row prepend order.
 - `html_timeline_uses_div_container_not_ol` — assert
   the rendered `class="timeline"` element is a `<div>`,
   not an `<ol>` (and that umbrella `<section>` blocks
