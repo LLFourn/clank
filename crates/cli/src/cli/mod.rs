@@ -488,7 +488,9 @@ pub struct QueueArgs {
 
 #[derive(clap::Subcommand, Debug)]
 pub enum QueueCmd {
-    /// Add a stub to the queue.
+    /// Create an empty queued plan stub at
+    /// `.clank/queue/<NNN>-<name>.md`. The agent (or human)
+    /// then edits that file in place.
     Add(QueueAddArgs),
     /// Remove an item from the queue.
     Remove(QueueRemoveArgs),

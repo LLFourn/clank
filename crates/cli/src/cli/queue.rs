@@ -69,32 +69,54 @@ fn validate_name(name: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn add(repo: &Path, stub_name: &str, priority: u16) -> anyhow::Result<()> {
-    validate_name(stub_name)?;
-    let home = std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .ok_or_else(|| anyhow::anyhow!("HOME not set"))?;
+fn add(repo: &Path, name: &str, priority: u16) -> anyhow::Result<()> {
+    validate_name(name)?;
     if priority > 999 {
         anyhow::bail!("priority must be 0-999");
     }
-    let stub_path = home.join(format!(".clank/stubs/{stub_name}.md"));
-    if !stub_path.exists() {
-        anyhow::bail!("stub `{stub_name}` not found at {}", stub_path.display());
-    }
     let dir = queue_dir(repo);
     std::fs::create_dir_all(&dir)?;
-    let dest = dir.join(format!("{priority:03}-{stub_name}.md"));
-    std::fs::copy(&stub_path, &dest)?;
-    println!("queued `{stub_name}` at priority {priority:03}");
+    let scanned = scan_queue(repo);
+    let conflicts: Vec<&QueueEntry> = scanned.iter().filter(|e| e.name == name).collect();
+    if !conflicts.is_empty() {
+        let listed = conflicts
+            .iter()
+            .map(|e| format!("{:03}-{}.md", e.priority, e.name))
+            .collect::<Vec<_>>()
+            .join(", ");
+        anyhow::bail!(
+            "queue item `{name}` already exists ({listed}). \
+             Delete it from .clank/queue/ first or pick a different name."
+        );
+    }
+    let dest = dir.join(format!("{priority:03}-{name}.md"));
+    std::fs::write(&dest, format!("# {name}\n"))?;
+    println!("queued `{name}` at priority {priority:03} ({})", dest.display());
     Ok(())
+}
+
+fn find_unique<'a>(entries: &'a [QueueEntry], name: &str) -> anyhow::Result<&'a QueueEntry> {
+    let matches: Vec<&QueueEntry> = entries.iter().filter(|e| e.name == name).collect();
+    match matches.as_slice() {
+        [] => anyhow::bail!("`{name}` not in queue"),
+        [only] => Ok(*only),
+        many => {
+            let listed = many
+                .iter()
+                .map(|e| format!("{:03}-{}.md", e.priority, e.name))
+                .collect::<Vec<_>>()
+                .join(", ");
+            anyhow::bail!(
+                "ambiguous queue name `{name}`: matched {listed}. \
+                 Delete the duplicate from .clank/queue/ and re-run."
+            );
+        }
+    }
 }
 
 fn remove(repo: &Path, name: &str) -> anyhow::Result<()> {
     let entries = scan_queue(repo);
-    let entry = entries
-        .iter()
-        .find(|e| e.name == name)
-        .ok_or_else(|| anyhow::anyhow!("`{name}` not in queue"))?;
+    let entry = find_unique(&entries, name)?;
     std::fs::remove_file(&entry.path)?;
     println!("removed `{name}` from queue");
     Ok(())
@@ -103,10 +125,7 @@ fn remove(repo: &Path, name: &str) -> anyhow::Result<()> {
 fn promote(repo: &Path, name: &str) -> anyhow::Result<()> {
     validate_name(name)?;
     let entries = scan_queue(repo);
-    let entry = entries
-        .iter()
-        .find(|e| e.name == name)
-        .ok_or_else(|| anyhow::anyhow!("`{name}` not in queue"))?;
+    let entry = find_unique(&entries, name)?;
     let dest = repo.join(format!(".clank/plans/{name}.md"));
     if dest.exists() {
         anyhow::bail!("plan `{name}` already exists in plans/");
@@ -191,5 +210,61 @@ mod tests {
         let result = add(dir.path(), "foo", 1000);
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("0-999"));
+    }
+
+    #[test]
+    fn add_writes_empty_stub_with_header() {
+        let dir = tempfile::tempdir().unwrap();
+        add(dir.path(), "foo", 400).unwrap();
+        let path = dir.path().join(".clank/queue/400-foo.md");
+        let body = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(body, "# foo\n");
+    }
+
+    #[test]
+    fn add_refuses_when_same_name_any_priority() {
+        let dir = tempfile::tempdir().unwrap();
+        let q = dir.path().join(".clank/queue");
+        write(&q.join("400-foo.md"), "# foo\n");
+        let result = add(dir.path(), "foo", 410);
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("already exists") && msg.contains("400-foo.md"),
+            "unexpected error: {msg}"
+        );
+        assert!(
+            !dir.path().join(".clank/queue/410-foo.md").exists(),
+            "destination must not be created on conflict"
+        );
+    }
+
+    #[test]
+    fn promote_fails_on_ambiguous_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let q = dir.path().join(".clank/queue");
+        write(&q.join("400-foo.md"), "# foo\n");
+        write(&q.join("410-foo.md"), "# foo v2\n");
+        let result = promote(dir.path(), "foo");
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(msg.contains("ambiguous"), "unexpected error: {msg}");
+        assert!(msg.contains("400-foo.md"));
+        assert!(msg.contains("410-foo.md"));
+        assert!(msg.contains("Delete the duplicate"));
+    }
+
+    #[test]
+    fn remove_fails_on_ambiguous_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let q = dir.path().join(".clank/queue");
+        write(&q.join("400-foo.md"), "# foo\n");
+        write(&q.join("410-foo.md"), "# foo v2\n");
+        let result = remove(dir.path(), "foo");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("ambiguous"));
+        // Both files survive the failed remove.
+        assert!(dir.path().join(".clank/queue/400-foo.md").is_file());
+        assert!(dir.path().join(".clank/queue/410-foo.md").is_file());
     }
 }
