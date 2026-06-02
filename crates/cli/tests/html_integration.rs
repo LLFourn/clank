@@ -256,12 +256,10 @@ fn html_index_for_repo_with_no_commits_succeeds() {
 }
 
 #[test]
-fn html_open_subcommand_is_accepted_alongside_flag() {
-    // `clank html open` must parse the same as `clank html
-    // --open`. We can't actually exec the opener here without
-    // a browser, so use --help to confirm the positional form
-    // parses (clap exits 0 on --help even when other args are
-    // unparseable).
+fn html_open_is_a_subcommand_and_unknown_subcommand_errors() {
+    // `clank html open --help` should succeed (clap recognizes
+    // the subcommand) and a bogus subcommand should fail at
+    // parse time.
     let dir = init_repo();
     let out = Command::new(clank_bin())
         .args(["html", "open", "--help"])
@@ -275,23 +273,11 @@ fn html_open_subcommand_is_accepted_alongside_flag() {
         "clank html open --help should parse cleanly; stderr=`{}`",
         String::from_utf8_lossy(&out.stderr)
     );
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(
-        stdout.contains("ACTION") || stdout.contains("html"),
-        "expected help output to mention the html surface; got: {stdout}"
-    );
 
-    // And: a bogus positional must error with a clear message
-    // (not silently build).
-    let bogus = run_clank(dir.path(), &["html", "bogus-action"]);
+    let bogus = run_clank(dir.path(), &["html", "bogus-subcommand"]);
     assert!(
         !bogus.status.success(),
-        "an unknown action must NOT be treated as a no-op build"
-    );
-    let stderr = String::from_utf8_lossy(&bogus.stderr);
-    assert!(
-        stderr.contains("unknown action") || stderr.contains("bogus-action"),
-        "error should mention the bogus action; got: {stderr}"
+        "an unknown subcommand must fail at parse time"
     );
 }
 

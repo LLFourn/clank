@@ -125,18 +125,19 @@ pub struct LogArgs {
 
 #[derive(Args, Debug)]
 pub struct HtmlArgs {
-    /// Optional sub-action. `open` is equivalent to `--open`;
-    /// any other value is rejected. Lets you spell either
-    /// `clank html --open` or `clank html open`.
-    #[arg(value_name = "ACTION")]
-    pub action: Option<String>,
+    #[command(subcommand)]
+    pub command: Option<HtmlCmd>,
     /// Repo root. Defaults to the cwd's git toplevel.
     #[arg(long, value_name = "PATH")]
     pub repo: Option<PathBuf>,
-    /// Build, then launch `open`/`xdg-open`/`start` against the
-    /// generated `index.html`.
-    #[arg(long)]
-    pub open: bool,
+}
+
+#[derive(clap::Subcommand, Debug)]
+pub enum HtmlCmd {
+    /// Build the site, then launch the host browser
+    /// (`open` / `xdg-open` / `explorer`) on the generated
+    /// `index.html`.
+    Open,
 }
 
 #[derive(Args, Debug)]

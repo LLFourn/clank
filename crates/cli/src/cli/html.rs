@@ -15,25 +15,16 @@ use clank_core::ids::CommitSha;
 use clank_core::repo_state::LogEvent;
 use clank_core::vocab::Verdict;
 
-use super::{HtmlArgs, repo_basename, resolve_repo};
+use super::{HtmlArgs, HtmlCmd, repo_basename, resolve_repo};
 use crate::cli::status::StatusSnapshot;
 
 pub async fn run(args: HtmlArgs) -> anyhow::Result<()> {
-    let open_via_action = match args.action.as_deref() {
-        None => false,
-        Some("open") => true,
-        Some(other) => {
-            anyhow::bail!(
-                "unknown action `{other}`. Pass `open` (or use --open) to launch the result, or omit for a plain build."
-            );
-        }
-    };
     let repo = resolve_repo(args.repo.as_deref())?;
     let basename = repo_basename(&repo)?;
     let out_dir = repo.join(".clank/html");
     build_site(&repo, &basename, &out_dir).await?;
     println!("wrote {}", out_dir.display());
-    if args.open || open_via_action {
+    if matches!(args.command, Some(HtmlCmd::Open)) {
         launch_opener(&out_dir.join("index.html"))?;
     }
     Ok(())
