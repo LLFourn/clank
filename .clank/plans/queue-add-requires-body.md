@@ -37,6 +37,27 @@ lists all three options. Empty stubs are NEVER created.
   fires before any of the body sources are read — no IO
   wasted on conflicts.
 
+## Content validation
+
+Picking a source isn't enough; we must also reject sources
+that resolve to nothing useful. After loading the body from
+whichever source applies, normalize and validate:
+
+1. If a `# <name>` header isn't present at the top, prepend
+   one (keeps queue files consistently shaped).
+2. Compute the "post-header" content: everything after the
+   first heading line, with leading/trailing whitespace
+   trimmed.
+3. If the post-header content is empty — the body is JUST
+   the header, or the source was empty / pure whitespace —
+   reject with a message naming the source and what was
+   missing, e.g.
+   `"queued body for \`foo\` from -m is empty after the
+   header; pass non-empty content."`
+
+This is the actual "no empty stubs" check the plan is named
+for. A body source alone doesn't satisfy it.
+
 ## `.clank/stubs/`
 
 - New repo-relative directory for stub drafts.
@@ -76,6 +97,20 @@ lists all three options. Empty stubs are NEVER created.
   stdin; assert body content lands.
 - `queue_add_m_and_from_mutually_exclusive` — both flags
   → clap parse error.
+
+Content-validation tests (the post-source check):
+
+- `queue_add_rejects_inline_message_with_only_header` —
+  `-m "# foo"`; assert error mentions "empty after the
+  header" and that no queue file is written.
+- `queue_add_rejects_inline_message_with_only_whitespace` —
+  `-m "   \n\n"`; assert error and no file.
+- `queue_add_rejects_from_file_that_is_header_only` —
+  prepare a `--from` file containing just `# foo\n`; assert
+  error and no file.
+- `queue_add_rejects_empty_stubs_file` —
+  `.clank/stubs/foo.md` exists but is empty; assert error
+  and no file.
 
 ## Out of scope
 
