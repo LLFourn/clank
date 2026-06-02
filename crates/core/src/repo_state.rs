@@ -1183,7 +1183,10 @@ mod tests {
             !events.iter().any(|e| matches!(e, LogEvent::AdHoc { .. })),
             "no AdHoc events before adoption; got {events:?}"
         );
-        assert!(s.ad_hoc.is_empty(), "ad_hoc bucket stays empty pre-adoption");
+        assert!(
+            s.ad_hoc.is_empty(),
+            "ad_hoc bucket stays empty pre-adoption"
+        );
         assert!(matches!(events.last(), Some(LogEvent::PlanIntro { .. })));
         assert!(s.adopted);
     }
