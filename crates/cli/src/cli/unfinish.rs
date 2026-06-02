@@ -1,4 +1,5 @@
-//! `clank unfinish <plan>` — move a finished plan back to active.
+//! `clank unfinish <plan>` — drop the finish commit from
+//! history. Rewrites HEAD, doesn't layer an inverse commit.
 
 use std::path::Path;
 
@@ -15,39 +16,135 @@ pub async fn run(args: UnfinishArgs) -> anyhow::Result<()> {
     let plan_key = clank_core::ids::PlanKey::parse(&stem)
         .map_err(|e| anyhow::anyhow!("invalid plan stem `{stem}`: {e}"))?;
 
-    let finished_path = repo.join(format!(".clank/finished/{}.md", plan_key.as_str()));
-    if !finished_path.exists() {
-        anyhow::bail!(
-            "plan `{}` is not finished (no `.clank/finished/{}.md`)",
-            plan_key.as_str(),
-            plan_key.as_str()
-        );
-    }
+    require_clean_worktree(&repo)?;
+    require_head_is_trivial_finish(&repo, plan_key.as_str())?;
 
-    let plans_path = repo.join(format!(".clank/plans/{}.md", plan_key.as_str()));
-    if plans_path.exists() {
-        anyhow::bail!(
-            "`.clank/plans/{}.md` already exists — plan is already active",
-            plan_key.as_str()
-        );
-    }
+    let dropped = head_sha(&repo)?;
 
-    std::fs::create_dir_all(repo.join(".clank/plans"))?;
+    git_run(&repo, &["reset", "--hard", "--quiet", "HEAD~"])?;
 
-    git_run(
-        &repo,
-        &[
-            "mv",
-            &format!(".clank/finished/{}.md", plan_key.as_str()),
-            &format!(".clank/plans/{}.md", plan_key.as_str()),
-        ],
-    )?;
-
-    let msg = format!("[{}] unfinish", plan_key.as_str());
-    git_run(&repo, &["commit", "--quiet", "-m", &msg])?;
-
-    println!("unfinished `{}`", plan_key.as_str());
+    println!(
+        "unfinished `{}`; dropped finalize commit {}",
+        plan_key.as_str(),
+        short(&dropped)
+    );
     Ok(())
+}
+
+/// Bail if the worktree or index has any changes. `git reset
+/// --hard HEAD~` would otherwise obliterate them.
+fn require_clean_worktree(repo: &Path) -> anyhow::Result<()> {
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["status", "--porcelain"])
+        .output()?;
+    if !out.status.success() {
+        anyhow::bail!(
+            "git status failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    if !out.stdout.is_empty() {
+        anyhow::bail!(
+            "worktree or index is dirty — commit or stash your changes before running `clank unfinish`.\n\n{}",
+            String::from_utf8_lossy(&out.stdout).trim()
+        );
+    }
+    Ok(())
+}
+
+/// Bail unless HEAD is a trivial finish commit for `<stem>` —
+/// exactly two path changes that rename
+/// `.clank/plans/<stem>.md` → `.clank/finished/<stem>.md`
+/// (delete the former, add the latter; nothing else). Anything
+/// else and we refuse to rewrite history, since `git reset
+/// --hard HEAD~` would silently drop the extra changes.
+fn require_head_is_trivial_finish(repo: &Path, stem: &str) -> anyhow::Result<()> {
+    let plans_rel = format!(".clank/plans/{stem}.md");
+    let finished_rel = format!(".clank/finished/{stem}.md");
+
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args([
+            "diff-tree",
+            "--no-commit-id",
+            "--name-status",
+            "-r",
+            "HEAD",
+        ])
+        .output()?;
+    if !out.status.success() {
+        anyhow::bail!(
+            "git diff-tree failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    let raw = String::from_utf8_lossy(&out.stdout);
+    let mut entries: Vec<(char, String)> = Vec::new();
+    for line in raw.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let mut parts = line.splitn(2, '\t');
+        let status = parts
+            .next()
+            .and_then(|s| s.chars().next())
+            .ok_or_else(|| anyhow::anyhow!("malformed diff-tree line: `{line}`"))?;
+        let path = parts
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("malformed diff-tree line: `{line}`"))?
+            .to_string();
+        entries.push((status, path));
+    }
+
+    let added_finished = entries
+        .iter()
+        .any(|(s, p)| *s == 'A' && p == &finished_rel);
+    if !added_finished {
+        anyhow::bail!(
+            "finish for `{stem}` is not at HEAD — `{finished_rel}` was not added by this commit. Find the finish commit and operate from there."
+        );
+    }
+
+    let extras: Vec<&(char, String)> = entries
+        .iter()
+        .filter(|(s, p)| {
+            !((*s == 'A' && p == &finished_rel) || (*s == 'D' && p == &plans_rel))
+        })
+        .collect();
+    if !extras.is_empty() {
+        let listed = extras
+            .iter()
+            .map(|(s, p)| format!("{s}\t{p}"))
+            .collect::<Vec<_>>()
+            .join("\n  ");
+        anyhow::bail!(
+            "HEAD's finish commit carries changes beyond the rename — refusing to drop it. Fix the history manually first.\n  {listed}"
+        );
+    }
+    Ok(())
+}
+
+fn head_sha(repo: &Path) -> anyhow::Result<String> {
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["rev-parse", "HEAD"])
+        .output()?;
+    if !out.status.success() {
+        anyhow::bail!(
+            "git rev-parse HEAD failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
+fn short(sha: &str) -> &str {
+    &sha[..sha.len().min(7)]
 }
 
 fn git_run(repo: &Path, args: &[&str]) -> anyhow::Result<()> {
