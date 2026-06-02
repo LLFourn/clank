@@ -628,7 +628,7 @@ pub struct PurgeArgs {
     pub plan: Option<String>,
     /// Strip EVERY `.clank/` path from history (plan files,
     /// finalize snapshots, AND non-plan Clank metadata like
-    /// `.clank/.gitignore` and `.clank/stubs/*`). Cannot be
+    /// `.clank/.gitignore` and `.clank/queue/*`). Cannot be
     /// combined with a plan argument.
     #[arg(long)]
     pub all: bool,

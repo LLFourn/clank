@@ -214,7 +214,13 @@ pub async fn run(args: WfwArgs) -> anyhow::Result<()> {
     }
 
     if !initial_suppress_all && role == Role::Master && plan_filter.is_none() && initial_state.fold.plans.is_empty() {
-        let queue = crate::cli::queue::scan_queue(&repo);
+        let queue = match crate::cli::queue::scan_queue_no_dups(&repo) {
+            Ok(q) => q,
+            Err(e) => {
+                eprintln!("wfw: {e}");
+                Vec::new()
+            }
+        };
         if let Some(first) = queue.first() {
             let items = [WaitItem::PromoteFromQueue {
                 name: first.name.clone(),
@@ -314,7 +320,13 @@ pub async fn run(args: WfwArgs) -> anyhow::Result<()> {
                 && plan_filter.is_none()
                 && state.fold.plans.is_empty()
             {
-                let queue = crate::cli::queue::scan_queue(&repo);
+                let queue = match crate::cli::queue::scan_queue_no_dups(&repo) {
+                    Ok(q) => q,
+                    Err(e) => {
+                        eprintln!("wfw: {e}");
+                        Vec::new()
+                    }
+                };
                 if let Some(first) = queue.first() {
                     let items = [WaitItem::PromoteFromQueue {
                         name: first.name.clone(),

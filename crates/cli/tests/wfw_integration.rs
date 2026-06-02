@@ -1032,6 +1032,53 @@ fn wfw_reviewer_no_plans_still_blocks() {
 }
 
 #[test]
+fn wfw_skips_queue_promote_on_duplicate_names() {
+    // Regression: two queue files with the same logical name
+    // must not silently surface as a promote item. wfw should
+    // bail loudly (to stderr) and emit no items.
+    let dir = init_repo();
+    let repo = dir.path();
+    write(repo, "README.md", "x");
+    commit(repo, "init");
+    write(repo, ".clank/queue/400-foo.md", "# foo\n");
+    write(repo, ".clank/queue/410-foo.md", "# foo v2\n");
+
+    let output = clank_cmd(repo)
+        .args([
+            "wfw",
+            "--no-poll",
+            "--author",
+            "lloyd",
+            "--role",
+            "master",
+            "--timeout",
+            "1s",
+        ])
+        .arg("--repo")
+        .arg(repo)
+        .output()
+        .expect("spawn clank wfw");
+    // No queue item promoted → master times out (exit 2).
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "expected timeout exit; got stdout=`{}` stderr=`{}`",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("ambiguous") && stderr.contains("foo"),
+        "expected ambiguity warning on stderr; got: {stderr}"
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        !stdout.contains("promote_from_queue"),
+        "wfw must NOT emit a promote item under name ambiguity; got: {stdout}"
+    );
+}
+
+#[test]
 fn wfw_fresh_repo_does_not_surface_adhoc_review_by_default() {
     // A repo with no `.clank/` config and a plain commit must not
     // surface AdHocReview work to a reviewer. The default for

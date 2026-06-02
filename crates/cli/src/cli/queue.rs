@@ -22,6 +22,44 @@ pub struct QueueEntry {
     pub path: PathBuf,
 }
 
+/// Validate that no two entries share the same `name`. Returns
+/// the entry list on success, or a loud error naming every
+/// conflicting file pair. Callers that act on a queue item
+/// (wfw promote, queue remove/promote) should use this; callers
+/// that merely render (list, status count) can stay on
+/// `scan_queue`.
+pub fn scan_queue_no_dups(repo: &Path) -> anyhow::Result<Vec<QueueEntry>> {
+    let entries = scan_queue(repo);
+    let mut names: std::collections::BTreeMap<&str, Vec<&QueueEntry>> =
+        std::collections::BTreeMap::new();
+    for e in &entries {
+        names.entry(e.name.as_str()).or_default().push(e);
+    }
+    let dupes: Vec<(String, Vec<String>)> = names
+        .into_iter()
+        .filter(|(_, v)| v.len() > 1)
+        .map(|(name, v)| {
+            let files: Vec<String> = v
+                .iter()
+                .map(|e| format!("{:03}-{}.md", e.priority, e.name))
+                .collect();
+            (name.to_string(), files)
+        })
+        .collect();
+    if dupes.is_empty() {
+        return Ok(entries);
+    }
+    let listed = dupes
+        .iter()
+        .map(|(name, files)| format!("`{name}` matched {}", files.join(", ")))
+        .collect::<Vec<_>>()
+        .join("; ");
+    anyhow::bail!(
+        "ambiguous queue names: {listed}. \
+         Delete the duplicate(s) from .clank/queue/ and re-run."
+    );
+}
+
 pub fn scan_queue(repo: &Path) -> Vec<QueueEntry> {
     let dir = queue_dir(repo);
     let Ok(entries) = std::fs::read_dir(&dir) else {
