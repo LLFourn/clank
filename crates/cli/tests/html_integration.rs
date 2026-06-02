@@ -1291,6 +1291,34 @@ fn html_commit_page_plan_line_links_to_plan_page() {
 }
 
 #[test]
+fn html_plan_page_timeline_row_links_resolve_to_top_level_commit_dir() {
+    let dir = init_repo();
+    let repo = dir.path();
+    write(repo, ".clank/plans/foo.md", "# foo\n");
+    commit(repo, "[foo] intro");
+    let sha = head_sha(repo);
+
+    let out = run_clank(repo, &["html"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let page = std::fs::read_to_string(repo.join(".clank/html/plan/foo.html")).unwrap();
+    let expected = format!("href=\"../commit/{sha}.html\"");
+    let wrong = format!("href=\"commit/{sha}.html\"");
+    assert!(
+        page.contains(&expected),
+        "plan page row link should resolve to {expected}; got:\n{page}"
+    );
+    assert!(
+        !page.contains(&wrong),
+        "plan page must NOT carry top-level-relative {wrong} (would resolve to .clank/html/plan/commit/...)"
+    );
+}
+
+#[test]
 fn html_plan_page_refreshes_on_feedback_only_rebuild() {
     // Reviewer's case: a new FINISHED review lands on a top-N
     // commit without any new git commit. The index and commit

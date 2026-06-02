@@ -483,6 +483,7 @@ fn render_index(
         reviews,
         subjects,
         PlanLinkMode::LinkRelativeToIndex,
+        "",
     ));
     out.push_str("</main>\n");
     write_doc_close(&mut out);
@@ -504,11 +505,16 @@ enum PlanLinkMode {
 /// umbrella sections grouping contiguous same-plan events.
 /// Returns the full block (or an empty-state paragraph when
 /// there are no events).
+///
+/// `commit_href_prefix` makes per-row commit links resolve
+/// correctly from non-root pages: `""` from the index,
+/// `"../"` from `.clank/html/plan/<stem>.html`.
 fn render_timeline(
     events: &[LogEvent],
     reviews: &BTreeMap<String, Vec<Review>>,
     subjects: &BTreeMap<String, String>,
     plan_link_mode: PlanLinkMode,
+    commit_href_prefix: &str,
 ) -> String {
     if events.is_empty() {
         return "<p class=\"empty\">No events yet.</p>\n".to_string();
@@ -530,6 +536,7 @@ fn render_timeline(
             reviews,
             subjects,
             plan_link_mode,
+            commit_href_prefix,
         ));
         newest_first = rest.to_vec();
     }
@@ -545,6 +552,7 @@ fn render_umbrella(
     reviews: &BTreeMap<String, Vec<Review>>,
     subjects: &BTreeMap<String, String>,
     plan_link_mode: PlanLinkMode,
+    commit_href_prefix: &str,
 ) -> String {
     let mut out = format!(
         "<section class=\"umbrella umbrella-{kind}\" data-umbrella-key=\"{key_attr}\">\n",
@@ -567,7 +575,7 @@ fn render_umbrella(
     }
     out.push_str("</header>\n");
     for event in rows {
-        out.push_str(&render_row(event, reviews, subjects));
+        out.push_str(&render_row(event, reviews, subjects, commit_href_prefix));
     }
     out.push_str("</section>\n");
     out
@@ -579,6 +587,7 @@ fn render_row(
     event: &LogEvent,
     reviews: &BTreeMap<String, Vec<Review>>,
     subjects: &BTreeMap<String, String>,
+    commit_href_prefix: &str,
 ) -> String {
     let sha = event_sha(event);
     let kind = event_kind_label(event);
@@ -595,7 +604,8 @@ fn render_row(
         short = esc(short(sha.as_str()))
     ));
     out.push_str(&format!(
-        "  <a class=\"row-link\" href=\"commit/{}.html\">\n",
+        "  <a class=\"row-link\" href=\"{}commit/{}.html\">\n",
+        commit_href_prefix,
         esc(sha.as_str())
     ));
     out.push_str(&format!(
@@ -880,6 +890,7 @@ fn render_plan_page(
         reviews,
         subjects,
         PlanLinkMode::NoLink,
+        "../",
     ));
 
     if let Some(md) = plan_body_at_head(repo, stem, lifecycle) {
