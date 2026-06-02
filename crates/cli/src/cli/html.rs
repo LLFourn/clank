@@ -18,11 +18,16 @@ use clank_core::vocab::Verdict;
 use super::{HtmlArgs, HtmlCmd, repo_basename, resolve_repo};
 use crate::cli::status::StatusSnapshot;
 
+const BUILDER_VERSION: &str = "1";
+const TOP_N_FEEDBACK_RECHECK: usize = 10;
+
 pub async fn run(args: HtmlArgs) -> anyhow::Result<()> {
     let repo = resolve_repo(args.repo.as_deref())?;
     let basename = repo_basename(&repo)?;
     let out_dir = repo.join(".clank/html");
-    build_site(&repo, &basename, &out_dir).await?;
+    let progress = Progress::new(args.quiet);
+    build_site(&repo, &basename, &out_dir, args.rebuild, &progress).await?;
+    progress.finish();
     println!("wrote {}", out_dir.display());
     if matches!(args.command, Some(HtmlCmd::Open)) {
         launch_opener(&out_dir.join("index.html"))?;
@@ -30,7 +35,13 @@ pub async fn run(args: HtmlArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn build_site(repo: &Path, basename: &str, out_dir: &Path) -> anyhow::Result<()> {
+async fn build_site(
+    repo: &Path,
+    basename: &str,
+    out_dir: &Path,
+    force_rebuild: bool,
+    progress: &Progress,
+) -> anyhow::Result<()> {
     std::fs::create_dir_all(out_dir)?;
     std::fs::create_dir_all(out_dir.join("commit"))?;
 
@@ -59,19 +70,150 @@ async fn build_site(repo: &Path, basename: &str, out_dir: &Path) -> anyhow::Resu
     // Common shared CSS file.
     std::fs::write(out_dir.join("style.css"), CSS)?;
 
-    // Index page.
-    let index_html = render_index(&status, &events, &reviews, &subjects);
+    // Identify the prior build's head, if the existing index
+    // carries a usable marker for an ancestor of head_sha. The
+    // "old" range = events older than prev_head (their pages
+    // are reusable). The "new" range = events at or after
+    // prev_head (must rewrite).
+    let prior = if force_rebuild {
+        None
+    } else {
+        read_prior_head(out_dir)
+    };
+    let prior_ancestor = match (prior.as_deref(), head_sha.as_ref()) {
+        (Some(prev), Some(head)) if prev_is_ancestor(repo, prev, head.as_str()) => {
+            Some(prev.to_string())
+        }
+        _ => None,
+    };
+    let new_range_start = prior_ancestor.as_deref().map(|s| s.to_string());
+
+    // Index page — always full re-render so the status header,
+    // verdict marks, and umbrella grouping reflect current
+    // state regardless of slice contents.
+    let head_str = head_sha.as_ref().map(|s| s.as_str());
+    let index_html = render_index(&status, &events, &reviews, &subjects, head_str);
     std::fs::write(out_dir.join("index.html"), index_html)?;
 
-    // Per-commit pages.
-    for event in &events {
+    // Per-commit pages: write every commit in the new range +
+    // the top-N most-recent events from the old range (their
+    // feedback may have updated). Reuse existing files for
+    // everything else.
+    let prev_sha_set: std::collections::HashSet<String> = events
+        .iter()
+        .rev()
+        .take(TOP_N_FEEDBACK_RECHECK)
+        .map(|e| event_sha(e).as_str().to_string())
+        .collect();
+    let in_new_range = |sha: &str| -> bool {
+        let Some(start) = new_range_start.as_deref() else {
+            return true; // no prior — everything is new
+        };
+        // Walk back from the slice's chronological order: an
+        // event is "new" iff it's at or after `prev_head`. The
+        // simplest signal we have is "the file already exists
+        // on disk." If file missing → must write. If present →
+        // skip unless top-N.
+        let _ = start;
+        !out_dir
+            .join(format!("commit/{sha}.html"))
+            .exists()
+    };
+
+    let writes_needed: Vec<&LogEvent> = events
+        .iter()
+        .filter(|e| {
+            let s = event_sha(e).as_str();
+            in_new_range(s) || prev_sha_set.contains(s)
+        })
+        .collect();
+    progress.begin("writing pages", writes_needed.len());
+    for (i, event) in writes_needed.iter().enumerate() {
         let sha = event_sha(event);
         let path = out_dir.join(format!("commit/{}.html", sha.as_str()));
         let page = render_commit_page(repo, event, &reviews);
         std::fs::write(&path, page)?;
+        progress.tick(i + 1);
     }
+    progress.end();
 
     Ok(())
+}
+
+/// Parse `<meta name="clank:last-built-sha" content="...">`
+/// out of the existing index, returning Some only when the
+/// builder version also matches ours.
+fn read_prior_head(out_dir: &Path) -> Option<String> {
+    let body = std::fs::read_to_string(out_dir.join("index.html")).ok()?;
+    let version = meta_value(&body, "clank:builder-version")?;
+    if version != BUILDER_VERSION {
+        return None;
+    }
+    meta_value(&body, "clank:last-built-sha")
+}
+
+fn meta_value(html: &str, name: &str) -> Option<String> {
+    let needle = format!("name=\"{name}\"");
+    let pos = html.find(&needle)?;
+    let tag_start = html[..pos].rfind('<')?;
+    let tag_end = html[tag_start..].find('>')?;
+    let tag = &html[tag_start..tag_start + tag_end];
+    let content_marker = "content=\"";
+    let content_pos = tag.find(content_marker)?;
+    let after = &tag[content_pos + content_marker.len()..];
+    let close = after.find('"')?;
+    Some(after[..close].to_string())
+}
+
+fn prev_is_ancestor(repo: &Path, prev: &str, head: &str) -> bool {
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["merge-base", "--is-ancestor", prev, head])
+        .status();
+    matches!(out, Ok(s) if s.success())
+}
+
+/// Stderr progress bar. No-op when stderr isn't a TTY or
+/// `--quiet` was passed.
+struct Progress {
+    enabled: bool,
+}
+
+impl Progress {
+    fn new(quiet: bool) -> Self {
+        use std::io::IsTerminal;
+        Self {
+            enabled: !quiet && std::io::stderr().is_terminal(),
+        }
+    }
+    fn begin(&self, label: &str, total: usize) {
+        if !self.enabled || total == 0 {
+            return;
+        }
+        eprint!("clank html: {label} 0/{total}\r");
+        let _ = std::io::Write::flush(&mut std::io::stderr());
+    }
+    fn tick(&self, done: usize) {
+        if !self.enabled {
+            return;
+        }
+        eprint!("clank html: writing pages {done}\r");
+        let _ = std::io::Write::flush(&mut std::io::stderr());
+    }
+    fn end(&self) {
+        if !self.enabled {
+            return;
+        }
+        eprint!("\x1b[2K\r");
+        let _ = std::io::Write::flush(&mut std::io::stderr());
+    }
+    fn finish(&self) {
+        if !self.enabled {
+            return;
+        }
+        eprint!("\x1b[2K\r");
+    }
 }
 
 // ─────────────────────────── data ───────────────────────────
@@ -169,9 +311,15 @@ fn render_index(
     events: &[LogEvent],
     reviews: &BTreeMap<String, Vec<Review>>,
     subjects: &BTreeMap<String, String>,
+    head_sha: Option<&str>,
 ) -> String {
     let mut out = String::new();
-    write_doc_open(&mut out, &format!("clank · {}", status.basename), ".");
+    let meta = format!(
+        "<meta name=\"clank:builder-version\" content=\"{BUILDER_VERSION}\">\n\
+         <meta name=\"clank:last-built-sha\" content=\"{}\">\n",
+        head_sha.unwrap_or("")
+    );
+    write_doc_open_with_meta(&mut out, &format!("clank · {}", status.basename), ".", &meta);
     out.push_str("<header class=\"status\">\n");
     out.push_str(&format!(
         "  <h1>{}</h1>\n",
@@ -235,60 +383,143 @@ fn render_index(
 
     out.push_str("<main>\n");
     out.push_str("<h2>Timeline</h2>\n");
-    if events.is_empty() {
-        out.push_str("<p class=\"empty\">No events yet.</p>\n");
-    } else {
-        out.push_str("<ol class=\"timeline\" reversed>\n");
-        for event in events.iter().rev() {
-            let sha = event_sha(event);
-            let plan = event_plan(event);
-            let kind = event_kind_label(event);
-            let marks = reviews
-                .get(sha.as_str())
-                .map(|v| verdict_marks_html(v.as_slice()))
-                .unwrap_or_default();
-            let subject = subjects
-                .get(sha.as_str())
-                .map(String::as_str)
-                .unwrap_or("");
-            out.push_str("<li class=\"row\">\n");
-            out.push_str(&format!(
-                "  <a class=\"row-link\" href=\"commit/{}.html\">\n",
-                esc(sha.as_str())
-            ));
-            out.push_str(&format!(
-                "    <code class=\"sha\">{}</code>\n",
-                esc(short(sha.as_str()))
-            ));
-            out.push_str(&format!(
-                "    <span class=\"kind kind-{}\">{}</span>\n",
-                kind, kind
-            ));
-            if let Some(p) = plan {
-                out.push_str(&format!(
-                    "    <span class=\"plan-pill\">{}</span>\n",
-                    esc(p)
-                ));
-            }
-            out.push_str(&format!(
-                "    <span class=\"subject\">{}</span>\n",
-                esc(subject.trim())
-            ));
-            if !marks.is_empty() {
-                out.push_str(&format!("    <span class=\"marks\">{marks}</span>\n"));
-            }
-            out.push_str(&format!(
-                "    <span class=\"ts\">{}</span>\n",
-                esc(&fmt_ts(event_ts(event)))
-            ));
-            out.push_str("  </a>\n");
-            out.push_str("</li>\n");
-        }
-        out.push_str("</ol>\n");
-    }
+    out.push_str(&render_timeline(events, reviews, subjects));
     out.push_str("</main>\n");
     write_doc_close(&mut out);
     out
+}
+
+/// Render the `<div class="timeline">` block: newest-first
+/// umbrella sections grouping contiguous same-plan events.
+/// Returns the full block (or an empty-state paragraph when
+/// there are no events).
+fn render_timeline(
+    events: &[LogEvent],
+    reviews: &BTreeMap<String, Vec<Review>>,
+    subjects: &BTreeMap<String, String>,
+) -> String {
+    if events.is_empty() {
+        return "<p class=\"empty\">No events yet.</p>\n".to_string();
+    }
+    let mut out = String::from("<div class=\"timeline\">\n");
+    // Group newest-first.
+    let mut newest_first: Vec<&LogEvent> = events.iter().rev().collect();
+    while !newest_first.is_empty() {
+        // Take a run of contiguous same-key events.
+        let key = umbrella_key(newest_first[0]);
+        let split = newest_first
+            .iter()
+            .position(|e| umbrella_key(e) != key)
+            .unwrap_or(newest_first.len());
+        let (run, rest) = newest_first.split_at(split);
+        out.push_str(&render_umbrella(&key, run, reviews, subjects));
+        newest_first = rest.to_vec();
+    }
+    out.push_str("</div>\n");
+    out
+}
+
+/// One umbrella section: header + the rows it groups, in
+/// newest-first order (the caller already ordered the run).
+fn render_umbrella(
+    key: &UmbrellaKey,
+    rows: &[&LogEvent],
+    reviews: &BTreeMap<String, Vec<Review>>,
+    subjects: &BTreeMap<String, String>,
+) -> String {
+    let mut out = format!(
+        "<section class=\"umbrella umbrella-{kind}\" data-umbrella-key=\"{key_attr}\">\n",
+        kind = key.kind_class(),
+        key_attr = esc(&key.attr_value())
+    );
+    out.push_str("  <header class=\"umbrella-header\">");
+    match key {
+        UmbrellaKey::Plan(p) => {
+            out.push_str(&format!("<span class=\"plan-pill\">{}</span>", esc(p)))
+        }
+        UmbrellaKey::AdHoc => out.push_str("<span class=\"adhoc-label\">ad-hoc</span>"),
+    }
+    out.push_str("</header>\n");
+    for event in rows {
+        out.push_str(&render_row(event, reviews, subjects));
+    }
+    out.push_str("</section>\n");
+    out
+}
+
+/// One timeline row. Tagged with `data-sha=<full-sha>` so the
+/// incremental splicer can target it by selector.
+fn render_row(
+    event: &LogEvent,
+    reviews: &BTreeMap<String, Vec<Review>>,
+    subjects: &BTreeMap<String, String>,
+) -> String {
+    let sha = event_sha(event);
+    let kind = event_kind_label(event);
+    let marks = reviews
+        .get(sha.as_str())
+        .map(|v| verdict_marks_html(v.as_slice()))
+        .unwrap_or_default();
+    let raw_subject = subjects.get(sha.as_str()).map(String::as_str).unwrap_or("");
+    let body = clank_core::repo_state::parse_subject(raw_subject).body;
+    let mut out = format!(
+        "<div class=\"row\" data-sha=\"{}\">\n",
+        esc(sha.as_str())
+    );
+    out.push_str(&format!(
+        "  <a class=\"row-link\" href=\"commit/{}.html\">\n",
+        esc(sha.as_str())
+    ));
+    out.push_str(&format!(
+        "    <code class=\"sha\">{}</code>\n",
+        esc(short(sha.as_str()))
+    ));
+    out.push_str(&format!(
+        "    <span class=\"kind kind-{}\">{}</span>\n",
+        kind, kind
+    ));
+    out.push_str(&format!(
+        "    <span class=\"subject\">{}</span>\n",
+        esc(body.trim())
+    ));
+    out.push_str(&format!("    <span class=\"marks\">{marks}</span>\n"));
+    let iso = fmt_ts(event_ts(event));
+    out.push_str(&format!(
+        "    <time class=\"ts\" data-iso=\"{iso}\">{iso}</time>\n",
+        iso = esc(&iso)
+    ));
+    out.push_str("  </a>\n");
+    out.push_str("</div>\n");
+    out
+}
+
+/// Identity key used to group adjacent events into one umbrella.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum UmbrellaKey {
+    Plan(String),
+    AdHoc,
+}
+
+impl UmbrellaKey {
+    fn kind_class(&self) -> &'static str {
+        match self {
+            UmbrellaKey::Plan(_) => "plan",
+            UmbrellaKey::AdHoc => "adhoc",
+        }
+    }
+    fn attr_value(&self) -> String {
+        match self {
+            UmbrellaKey::Plan(p) => p.clone(),
+            UmbrellaKey::AdHoc => "ad-hoc".to_string(),
+        }
+    }
+}
+
+fn umbrella_key(event: &LogEvent) -> UmbrellaKey {
+    match event_plan(event) {
+        Some(p) => UmbrellaKey::Plan(p.to_string()),
+        None => UmbrellaKey::AdHoc,
+    }
 }
 
 // ──────────────────────── commit page ───────────────────────
@@ -323,9 +554,10 @@ fn render_commit_page(
             esc(p)
         ));
     }
+    let subject_body = clank_core::repo_state::parse_subject(&subject).body;
     out.push_str(&format!(
         "  <h2 class=\"subject\">{}</h2>\n",
-        esc(&subject)
+        esc(subject_body)
     ));
     out.push_str(&format!(
         "  <p class=\"sha-full\"><code>{}</code></p>\n",
@@ -700,6 +932,19 @@ fn launch_opener(path: &Path) -> anyhow::Result<()> {
 
 // ─────────────────────── document chrome ────────────────────
 
+fn write_doc_open_with_meta(out: &mut String, title: &str, css_rel: &str, extra_head: &str) {
+    out.push_str("<!doctype html>\n<html lang=\"en\"><head>\n");
+    out.push_str("<meta charset=\"utf-8\">\n");
+    out.push_str("<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">\n");
+    out.push_str(extra_head);
+    out.push_str(&format!("<title>{}</title>\n", esc(title)));
+    out.push_str(&format!(
+        "<link rel=\"stylesheet\" href=\"{}/style.css\">\n",
+        esc(css_rel)
+    ));
+    out.push_str("</head>\n<body>\n");
+}
+
 fn write_doc_open(out: &mut String, title: &str, css_rel: &str) {
     out.push_str("<!doctype html>\n<html lang=\"en\"><head>\n");
     out.push_str("<meta charset=\"utf-8\">\n");
@@ -713,8 +958,42 @@ fn write_doc_open(out: &mut String, title: &str, css_rel: &str) {
 }
 
 fn write_doc_close(out: &mut String) {
+    // Optional JS: walks `[data-iso]` and rewrites text to a
+    // relative phrasing ("4h ago"). If JS is disabled the raw
+    // ISO stays visible — load-bearing fallback.
+    out.push_str("<script>");
+    out.push_str(RELATIVE_TIME_JS);
+    out.push_str("</script>\n");
     out.push_str("</body></html>\n");
 }
+
+const RELATIVE_TIME_JS: &str = r#"
+(function () {
+  function rel(iso) {
+    var t = Date.parse(iso);
+    if (isNaN(t)) return iso;
+    var s = Math.round((Date.now() - t) / 1000);
+    var sign = s >= 0 ? '' : 'in ';
+    var abs = Math.abs(s);
+    if (s < 0) s = abs;
+    var unit;
+    if (abs < 60) { unit = abs + 's'; }
+    else if (abs < 3600) { unit = Math.round(abs/60) + 'm'; }
+    else if (abs < 86400) { unit = Math.round(abs/3600) + 'h'; }
+    else if (abs < 86400*30) { unit = Math.round(abs/86400) + 'd'; }
+    else if (abs < 86400*365) { unit = Math.round(abs/(86400*30)) + 'mo'; }
+    else { unit = Math.round(abs/(86400*365)) + 'y'; }
+    return sign + unit + (s >= 0 ? ' ago' : '');
+  }
+  var nodes = document.querySelectorAll('[data-iso]');
+  for (var i = 0; i < nodes.length; i++) {
+    var n = nodes[i];
+    var iso = n.getAttribute('data-iso');
+    n.title = iso;
+    n.textContent = rel(iso);
+  }
+})();
+"#;
 
 // ─────────────────────────── CSS ────────────────────────────
 
@@ -785,15 +1064,21 @@ header.status h1 { margin: 0 0 .25rem; font-size: 1.2rem; }
 .gate-finished { color: var(--finished); }
 .gate-changes_requested { color: var(--changes); }
 h2 { font-size: 1rem; text-transform: uppercase; letter-spacing: .05em; color: var(--fg-dim); margin: 1rem 0 .5rem; }
-.timeline { list-style: none; margin: 0; padding: 0; }
+.timeline { margin: 0; padding: 0; }
+.umbrella { margin: .65rem 0; border-left: 3px solid var(--rule); padding-left: .6rem; }
+.umbrella + .umbrella { margin-top: 1rem; }
+.umbrella-header { font: 600 .8rem/1 var(--mono); margin-bottom: .25rem; }
+.umbrella-adhoc > .umbrella-header { color: var(--fg-dim); }
+.adhoc-label { display: inline-block; padding: .15rem .45rem; border-radius: 999px; background: transparent; color: var(--fg-dim); text-transform: lowercase; letter-spacing: .04em; }
 .row { border-top: 1px solid var(--rule); }
-.row:first-child { border-top: 0; }
+.umbrella > .row:first-of-type { border-top: 0; }
 .row-link {
   display: grid;
-  grid-template-columns: 5rem 4.5rem auto 1fr auto auto;
+  grid-template-columns: 5rem 4.5rem 1fr auto auto;
   gap: .6rem;
   align-items: center;
-  padding: .35rem .15rem;
+  padding: .3rem .15rem;
+  line-height: 1.25;
   text-decoration: none; color: inherit;
 }
 .row-link:hover { background: var(--pill-bg); }

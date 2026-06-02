@@ -130,6 +130,14 @@ pub struct HtmlArgs {
     /// Repo root. Defaults to the cwd's git toplevel.
     #[arg(long, value_name = "PATH")]
     pub repo: Option<PathBuf>,
+    /// Ignore the cached `clank:last-built-sha` marker and
+    /// re-render every page from scratch.
+    #[arg(long)]
+    pub rebuild: bool,
+    /// Suppress the progress bar (also auto-suppressed when
+    /// stderr isn't a TTY).
+    #[arg(long)]
+    pub quiet: bool,
 }
 
 #[derive(clap::Subcommand, Debug)]

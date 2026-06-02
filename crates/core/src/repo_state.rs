@@ -312,15 +312,41 @@ pub enum TitlePrefix {
     Plans(Vec<String>),
 }
 
-/// Pure prefix parser. Returns `None` for "no recognized prefix";
-/// the classifier then falls back to touch / hint inference.
-pub fn parse_title_prefix(subject: &str) -> Option<TitlePrefix> {
-    let trimmed = subject.trim_start();
-    let rest = trimmed.strip_prefix('[')?;
-    let close = rest.find(']')?;
+/// A commit subject parsed into its `[prefix] body` parts.
+/// `body` is the text after a recognized prefix (with the
+/// single separating space consumed); when no prefix matched,
+/// `body` is the raw subject verbatim.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParsedSubject<'a> {
+    pub prefix: Option<TitlePrefix>,
+    pub body: &'a str,
+}
+
+/// Pure subject parser. Splits a commit subject into its
+/// `[plan,...] | [misc]` prefix and the remaining body. Both
+/// renderers and the classifier go through this so prefix
+/// vocabulary lives in one place.
+pub fn parse_subject(subject: &str) -> ParsedSubject<'_> {
+    let trimmed_offset = subject.len() - subject.trim_start().len();
+    let trimmed = &subject[trimmed_offset..];
+    let Some(rest) = trimmed.strip_prefix('[') else {
+        return ParsedSubject {
+            prefix: None,
+            body: subject,
+        };
+    };
+    let Some(close) = rest.find(']') else {
+        return ParsedSubject {
+            prefix: None,
+            body: subject,
+        };
+    };
     let inner = &rest[..close];
     if inner.is_empty() {
-        return None;
+        return ParsedSubject {
+            prefix: None,
+            body: subject,
+        };
     }
     let names: Vec<String> = inner
         .split(',')
@@ -328,12 +354,30 @@ pub fn parse_title_prefix(subject: &str) -> Option<TitlePrefix> {
         .filter(|s| !s.is_empty())
         .collect();
     if names.is_empty() {
-        return None;
+        return ParsedSubject {
+            prefix: None,
+            body: subject,
+        };
     }
-    if names.len() == 1 && names[0].eq_ignore_ascii_case("misc") {
-        return Some(TitlePrefix::Misc);
+    let prefix = if names.len() == 1 && names[0].eq_ignore_ascii_case("misc") {
+        TitlePrefix::Misc
+    } else {
+        TitlePrefix::Plans(names)
+    };
+    // body starts after `[<inner>]`. Consume one separating
+    // space if present so callers don't have to.
+    let after = &rest[close + 1..];
+    let body = after.strip_prefix(' ').unwrap_or(after);
+    ParsedSubject {
+        prefix: Some(prefix),
+        body,
     }
-    Some(TitlePrefix::Plans(names))
+}
+
+/// Pure prefix parser. Thin wrapper over [`parse_subject`]
+/// kept for callers that only need the prefix.
+pub fn parse_title_prefix(subject: &str) -> Option<TitlePrefix> {
+    parse_subject(subject).prefix
 }
 
 /// Pure classifier. Computes `plan_attribution` (a set, possibly
@@ -1328,5 +1372,93 @@ mod tests {
         assert!(warning_mentions_plan(&w, &plan("foo")));
         assert!(warning_mentions_plan(&w, &plan("bar")));
         assert!(!warning_mentions_plan(&w, &plan("baz")));
+    }
+
+    // ============ parse_subject ============
+
+    #[test]
+    fn parse_subject_single_plan() {
+        let p = parse_subject("[foo] intro");
+        assert_eq!(p.prefix, Some(TitlePrefix::Plans(vec!["foo".into()])));
+        assert_eq!(p.body, "intro");
+    }
+
+    #[test]
+    fn parse_subject_multi_plan() {
+        let p = parse_subject("[foo,bar] shared work");
+        assert_eq!(
+            p.prefix,
+            Some(TitlePrefix::Plans(vec!["foo".into(), "bar".into()]))
+        );
+        assert_eq!(p.body, "shared work");
+    }
+
+    #[test]
+    fn parse_subject_misc() {
+        let p = parse_subject("[misc] drive-by");
+        assert_eq!(p.prefix, Some(TitlePrefix::Misc));
+        assert_eq!(p.body, "drive-by");
+    }
+
+    #[test]
+    fn parse_subject_misc_case_insensitive() {
+        let p = parse_subject("[MISC] x");
+        assert_eq!(p.prefix, Some(TitlePrefix::Misc));
+        assert_eq!(p.body, "x");
+    }
+
+    #[test]
+    fn parse_subject_no_prefix() {
+        let p = parse_subject("plain commit");
+        assert!(p.prefix.is_none());
+        assert_eq!(p.body, "plain commit");
+    }
+
+    #[test]
+    fn parse_subject_empty_brackets() {
+        let p = parse_subject("[] body");
+        assert!(p.prefix.is_none());
+        assert_eq!(p.body, "[] body");
+    }
+
+    #[test]
+    fn parse_subject_no_close_bracket() {
+        let p = parse_subject("[unterminated body");
+        assert!(p.prefix.is_none());
+        assert_eq!(p.body, "[unterminated body");
+    }
+
+    #[test]
+    fn parse_subject_leading_whitespace_preserves_body_offset() {
+        // Leading whitespace stays in body when no prefix.
+        let p = parse_subject("  plain");
+        assert!(p.prefix.is_none());
+        assert_eq!(p.body, "  plain");
+    }
+
+    #[test]
+    fn parse_subject_consumes_one_separating_space() {
+        // Only one space is consumed between `]` and body.
+        let p = parse_subject("[foo]  double-space");
+        assert_eq!(p.prefix, Some(TitlePrefix::Plans(vec!["foo".into()])));
+        assert_eq!(p.body, " double-space");
+    }
+
+    #[test]
+    fn parse_subject_no_body() {
+        let p = parse_subject("[foo]");
+        assert_eq!(p.prefix, Some(TitlePrefix::Plans(vec!["foo".into()])));
+        assert_eq!(p.body, "");
+    }
+
+    #[test]
+    fn parse_title_prefix_still_works() {
+        // Backwards-compat wrapper.
+        assert_eq!(
+            parse_title_prefix("[foo] x"),
+            Some(TitlePrefix::Plans(vec!["foo".into()]))
+        );
+        assert_eq!(parse_title_prefix("[misc] x"), Some(TitlePrefix::Misc));
+        assert_eq!(parse_title_prefix("plain"), None);
     }
 }
