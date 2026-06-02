@@ -308,13 +308,33 @@ pages and the index share it.
 - `crates/cli/src/cli/html.rs`:
   - Read existing `index.html` and parse the meta markers
     when present.
-  - Implement the slice path: fold from prev_head, render
-    new commit pages, splice new rows into the timeline,
-    re-render the top-N feedback sections in their per-
-    commit pages.
-  - Refactor `render_index` into separate header + timeline
-    chunks so splicing only touches the timeline `<ol>`.
-  - Group events into umbrellas during timeline rendering.
+  - Refactor `render_index` into three independent chunks
+    that can be re-rendered in isolation:
+    1. `render_status_header(&StatusSnapshot) -> String`
+    2. `render_timeline_umbrellas(&[LogEvent], ...) -> String`
+       (full or partial; the splicer feeds it slice events)
+    3. `render_row(event, reviews, subject) -> String`
+       (used for individual marks/row rewrites)
+  - Implement the slice path:
+    a. ALWAYS re-render the status header and replace the
+       existing `<header class="status">` block, even on
+       empty-slice incremental runs. Feedback gates,
+       last-finished state, queue count, blocks, dirty
+       bit, and branch metadata can all shift without a
+       new commit.
+    b. Fold the slice via `rebuild_from(repo, Some(prev), &head)`.
+    c. Write a per-commit page for each new event.
+    d. Splice the slice's umbrellas into the existing
+       `<div class="timeline">` per the boundary-merge
+       rule above. Container is a `<div>`, NOT an
+       `<ol>` (per "HTML container shape").
+    e. For each of the top N prior-timeline commits whose
+       feedback has changed, rewrite BOTH the per-commit
+       page's `<section class="reviews">` AND that
+       commit's `<span class="marks">` in the index
+       (selected by `data-sha=`).
+  - Group events into umbrellas during timeline rendering;
+    each umbrella carries `data-umbrella-key=`.
   - Inline `<script>` for relative timestamps.
   - Add `--rebuild` and `--quiet` flags via `HtmlArgs`
     additions in `cli/mod.rs`.
@@ -348,6 +368,16 @@ Incremental:
   also shows the new verdict (regression for the case
   where commit pages were updated but the index marks
   went stale).
+- `html_incremental_refreshes_status_header_on_empty_slice`
+  — codex's regression: run `clank html` to produce the
+  initial site, then WITHOUT landing any new commit,
+  write a fresh feedback file that flips a plan's gate
+  (e.g. APPROVE → FINISHED, or first FINISHED on an
+  unreviewed plan). Run `clank html` again. Assert the
+  rendered `<header class="status">` reflects the new
+  gate state (and last-finished / queue / blocks if
+  affected). Pins "header always re-renders, slice or
+  no slice."
 - `html_incremental_merges_continuation_umbrella` —
   fold ends with `[foo] revise` as the topmost row inside
   a `[foo]` umbrella; add a new `[foo] impl` commit; run
