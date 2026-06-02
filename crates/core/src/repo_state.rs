@@ -1107,8 +1107,21 @@ mod tests {
 
     #[test]
     fn ad_hoc_eligible_commit_lands_in_ad_hoc() {
+        // Adoption required before AdHocs surface.
         let mut s = RepoState::new();
-        let mut e = ev("1111", 1, "fix typo", Vec::new());
+        s.apply_commit(&ev(
+            "0001",
+            0,
+            "[foo] intro",
+            touches(&[("foo", TouchKind::Intro)]),
+        ));
+        s.apply_commit(&ev(
+            "0002",
+            0,
+            "[foo] finish",
+            touches(&[("foo", TouchKind::Finish)]),
+        ));
+        let mut e = ev("1111", 1, "[misc] fix typo", Vec::new());
         e.has_code_changes = true;
         s.apply_commit(&e);
         assert_eq!(s.ad_hoc.len(), 1);
@@ -1116,10 +1129,11 @@ mod tests {
 
     #[test]
     fn plan_commit_supersedes_adhoc() {
-        // Adoption first, then a plain commit lands in ad_hoc,
-        // then a plan touch supersedes it. (Pre-adoption plain
-        // commits don't enter ad_hoc at all — see
-        // `adhoc_suppressed_before_first_plan_intro`.)
+        // Adoption first; then finalize so the active-plan hint
+        // is cleared (otherwise a no-prefix code commit would
+        // inherit it and classify as PlanCommit, not AdHoc).
+        // Then a `[misc]` commit lands in ad_hoc, and a fresh
+        // plan touch supersedes it.
         let mut s = RepoState::new();
         s.apply_commit(&ev(
             "1111",
@@ -1127,14 +1141,20 @@ mod tests {
             "[foo] intro",
             touches(&[("foo", TouchKind::Intro)]),
         ));
-        let mut e = ev("2222", 2, "fix typo", Vec::new());
+        s.apply_commit(&ev(
+            "2222",
+            2,
+            "[foo] finish",
+            touches(&[("foo", TouchKind::Finish)]),
+        ));
+        let mut e = ev("3333", 3, "[misc] fix typo", Vec::new());
         e.has_code_changes = true;
         s.apply_commit(&e);
         assert_eq!(s.ad_hoc.len(), 1);
 
         s.apply_commit(&ev(
-            "3333",
-            3,
+            "4444",
+            4,
             "[bar] intro",
             touches(&[("bar", TouchKind::Intro)]),
         ));
@@ -1170,28 +1190,10 @@ mod tests {
 
     #[test]
     fn adhoc_emitted_after_first_plan_intro() {
-        // After adoption, a plain code commit DOES emit AdHoc.
-        let mut s = RepoState::new();
-        s.apply_commit(&ev(
-            "1111",
-            1,
-            "[foo] intro",
-            touches(&[("foo", TouchKind::Intro)]),
-        ));
-        let mut e = ev("2222", 2, "plain code", Vec::new());
-        e.has_code_changes = true;
-        let events = s.apply_commit(&e);
-        assert!(
-            events.iter().any(|e| matches!(e, LogEvent::AdHoc { .. })),
-            "post-adoption plain commit should emit AdHoc; got {events:?}"
-        );
-        assert_eq!(s.ad_hoc.len(), 1);
-    }
-
-    #[test]
-    fn adhoc_emitted_again_after_plan_finalized() {
-        // intro -> finish -> plain code commit. Repo is still
-        // adopted (finished_plans has the entry).
+        // After adoption + finish (to clear the active-plan
+        // hint), a `[misc]` code commit emits AdHoc. A
+        // no-prefix code commit would inherit the active hint
+        // and classify as PlanCommit instead.
         let mut s = RepoState::new();
         s.apply_commit(&ev(
             "1111",
@@ -1205,22 +1207,52 @@ mod tests {
             "[foo] finish",
             touches(&[("foo", TouchKind::Finish)]),
         ));
-        let mut e = ev("3333", 3, "drive-by fix", Vec::new());
+        let mut e = ev("3333", 3, "[misc] drive-by fix", Vec::new());
         e.has_code_changes = true;
         let events = s.apply_commit(&e);
         assert!(
             events.iter().any(|e| matches!(e, LogEvent::AdHoc { .. })),
-            "post-finalize plain commit should emit AdHoc; got {events:?}"
+            "post-adoption [misc] commit should emit AdHoc; got {events:?}"
+        );
+        assert_eq!(s.ad_hoc.len(), 1);
+    }
+
+    #[test]
+    fn adhoc_emitted_again_after_plan_finalized() {
+        // intro -> finish -> `[misc]` code commit. Repo is
+        // still adopted (finished_plans has the entry).
+        // Finish also clears the active-plan hint so the
+        // misc commit doesn't inherit foo.
+        let mut s = RepoState::new();
+        s.apply_commit(&ev(
+            "1111",
+            1,
+            "[foo] intro",
+            touches(&[("foo", TouchKind::Intro)]),
+        ));
+        s.apply_commit(&ev(
+            "2222",
+            2,
+            "[foo] finish",
+            touches(&[("foo", TouchKind::Finish)]),
+        ));
+        let mut e = ev("3333", 3, "[misc] drive-by fix", Vec::new());
+        e.has_code_changes = true;
+        let events = s.apply_commit(&e);
+        assert!(
+            events.iter().any(|e| matches!(e, LogEvent::AdHoc { .. })),
+            "post-finalize [misc] commit should emit AdHoc; got {events:?}"
         );
     }
 
     #[test]
     fn adhoc_emitted_after_plan_deleted_then_plain_commit() {
-        // Codex's flag: intro -> delete -> plain commit.
+        // Codex's flag: intro -> delete -> `[misc]` commit.
         // After PlanDeleted, `plans` is empty AND
         // `finished_plans` is empty for this plan — but
-        // `adopted` is durable, so the plain commit still
-        // emits AdHoc.
+        // `adopted` is durable, so the misc commit still
+        // emits AdHoc. PlanDeleted also clears the
+        // active-plan hint so we don't inherit foo.
         let mut s = RepoState::new();
         s.apply_commit(&ev(
             "1111",
@@ -1237,12 +1269,12 @@ mod tests {
         assert!(s.plans.is_empty());
         assert!(s.finished_plans.is_empty());
         assert!(s.adopted, "adoption must persist across PlanDeleted");
-        let mut e = ev("3333", 3, "drive-by fix", Vec::new());
+        let mut e = ev("3333", 3, "[misc] drive-by fix", Vec::new());
         e.has_code_changes = true;
         let events = s.apply_commit(&e);
         assert!(
             events.iter().any(|e| matches!(e, LogEvent::AdHoc { .. })),
-            "plain commit after PlanDeleted must still emit AdHoc; got {events:?}"
+            "[misc] commit after PlanDeleted must still emit AdHoc; got {events:?}"
         );
     }
 
