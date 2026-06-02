@@ -1291,34 +1291,46 @@ fn html_commit_page_plan_line_links_to_plan_page() {
 }
 
 #[test]
-fn html_incremental_rewrites_affected_plan_pages() {
+fn html_plan_page_refreshes_on_feedback_only_rebuild() {
+    // Reviewer's case: a new FINISHED review lands on a top-N
+    // commit without any new git commit. The index and commit
+    // page already refresh; the plan page must too — its
+    // timeline rows render the same verdict marks.
     let dir = init_repo();
     let repo = dir.path();
     write(repo, ".clank/plans/foo.md", "# foo\n");
     commit(repo, "[foo] intro");
+    let sha = head_sha(repo);
+    let short = &sha[..7];
 
     let out = run_clank(repo, &["html"]);
-    assert!(out.status.success());
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     let foo_page = repo.join(".clank/html/plan/foo.html");
-    let foo_mtime_1 = std::fs::metadata(&foo_page).unwrap().modified().unwrap();
+    let before = std::fs::read_to_string(&foo_page).unwrap();
+    assert!(
+        !before.contains("mark-finished"),
+        "plan page should start with no FINISHED mark"
+    );
 
-    // Sleep just enough for filesystem mtime resolution to
-    // register a difference if a write happens.
-    std::thread::sleep(std::time::Duration::from_millis(1100));
-
-    // New commit on a DIFFERENT plan; foo's page should NOT
-    // be rewritten.
-    write(repo, ".clank/plans/bar.md", "# bar\n");
-    commit(repo, "[bar] intro");
+    write(
+        repo,
+        &format!(".clank/agents/alice/feedback/{short}.md"),
+        "FINISHED ship it\n",
+    );
 
     let out = run_clank(repo, &["html"]);
-    assert!(out.status.success());
-    let foo_mtime_2 = std::fs::metadata(&foo_page).unwrap().modified().unwrap();
-    let bar_page = repo.join(".clank/html/plan/bar.html");
-    assert!(bar_page.is_file(), "bar.html should have been written");
-
-    assert_eq!(
-        foo_mtime_1, foo_mtime_2,
-        "foo.html should be untouched by an unrelated bar commit"
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let after = std::fs::read_to_string(&foo_page).unwrap();
+    assert!(
+        after.contains("mark-finished"),
+        "plan page should pick up the FINISHED mark after a feedback-only rebuild; got:\n{after}"
     );
 }

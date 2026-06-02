@@ -161,27 +161,26 @@ async fn build_site(
     }
     progress.end();
 
-    // Plan pages. One per active or finished plan. On full
-    // rebuild every page is rewritten; on incremental, only
-    // plans whose events appeared in the SLICE (not the top-N
-    // feedback re-check window). Top-N re-checks only refresh
-    // verdict-mark state, which the plan page also shows but
-    // doesn't materially change between identical reviews —
-    // we accept slightly stale plan-page marks until the next
-    // commit on that plan or a `--rebuild`.
+    // Plan pages. One per active or finished plan.
+    //
+    // On full rebuild every page is rewritten. On incremental,
+    // affected = (slice plans) ∪ (plans whose commits are in
+    // writes_needed). The second term covers feedback-only
+    // rebuilds at the same HEAD: a new review on a top-N
+    // commit changes the verdict marks that the plan page
+    // also renders, so the page must refresh too. The cost is
+    // that an unrelated slice still re-renders plan pages
+    // whose commits happen to be in top-N — acceptable; they
+    // age out of top-N quickly and the rendered output is
+    // identical when reviews haven't actually changed.
     let plan_buckets = collect_plan_buckets(&events);
-    let slice_plans: std::collections::HashSet<String> = match prior_events.as_ref() {
-        Some(prior) => events
-            .iter()
-            .skip(prior.len())
-            .filter_map(|e| event_plan(e).map(str::to_string))
-            .collect(),
-        None => plan_buckets.keys().cloned().collect(),
-    };
     let affected: std::collections::HashSet<String> = if force_rebuild {
         plan_buckets.keys().cloned().collect()
     } else {
-        slice_plans
+        writes_needed
+            .iter()
+            .filter_map(|e| event_plan(e).map(str::to_string))
+            .collect()
     };
     let plan_writes: Vec<(&String, &PlanLifecycle)> = plan_buckets
         .iter()
