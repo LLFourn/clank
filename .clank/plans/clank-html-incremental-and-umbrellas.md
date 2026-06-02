@@ -239,9 +239,14 @@ pub fn parse_subject(subject: &str) -> ParsedSubject<'_>;
 
 Existing classifier path: rewrite the one site that calls
 `parse_title_prefix` to read `parse_subject(...).prefix`.
-Renderers (`clank log`, `clank html`) call `parse_subject`
-directly and render `.body`. No re-stripping, no string
-juggling, no re-finding the `]`.
+This plan ALSO migrates `clank html` to render
+`parse_subject(...).body`. Other subject consumers
+(`clank log` human + JSON output, status snapshot
+`head_subject`, stop-hook prompts) stay on the raw subject
+in this plan — they're a separate user-visible behavior
+change that should ship as its own plan (with their own
+output tests). Document the new helper as the canonical
+parse so future migrations are mechanical.
 
 Observable behavior in `clank html`:
 
