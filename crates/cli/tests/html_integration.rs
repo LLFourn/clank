@@ -967,10 +967,7 @@ fn init_gitignore_includes_html_dir() {
 
 fn commit_with_body(repo: &Path, subject: &str, body: &str) {
     git(repo, &["add", "-A"]);
-    git(
-        repo,
-        &["commit", "--quiet", "-m", subject, "-m", body],
-    );
+    git(repo, &["commit", "--quiet", "-m", subject, "-m", body]);
 }
 
 #[test]
@@ -986,9 +983,14 @@ fn html_commit_page_renders_commit_body() {
     let sha = head_sha(repo);
 
     let out = run_clank(repo, &["html"]);
-    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 
-    let page = std::fs::read_to_string(repo.join(format!(".clank/html/commit/{sha}.html"))).unwrap();
+    let page =
+        std::fs::read_to_string(repo.join(format!(".clank/html/commit/{sha}.html"))).unwrap();
     assert!(
         page.contains("<pre class=\"commit-body\">"),
         "expected commit-body block, got:\n{page}"
@@ -1012,9 +1014,14 @@ fn html_commit_page_omits_body_section_for_subject_only_commits() {
     let sha = head_sha(repo);
 
     let out = run_clank(repo, &["html"]);
-    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 
-    let page = std::fs::read_to_string(repo.join(format!(".clank/html/commit/{sha}.html"))).unwrap();
+    let page =
+        std::fs::read_to_string(repo.join(format!(".clank/html/commit/{sha}.html"))).unwrap();
     assert!(
         !page.contains("<pre class=\"commit-body\">"),
         "should not emit commit-body for subject-only commit; got:\n{page}"
@@ -1030,7 +1037,11 @@ fn html_shas_are_copy_buttons() {
     let sha = head_sha(repo);
 
     let out = run_clank(repo, &["html"]);
-    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 
     let index = std::fs::read_to_string(repo.join(".clank/html/index.html")).unwrap();
     assert!(
@@ -1039,7 +1050,8 @@ fn html_shas_are_copy_buttons() {
         )),
         "index timeline row should use sha-copy button; got:\n{index}"
     );
-    let page = std::fs::read_to_string(repo.join(format!(".clank/html/commit/{sha}.html"))).unwrap();
+    let page =
+        std::fs::read_to_string(repo.join(format!(".clank/html/commit/{sha}.html"))).unwrap();
     assert!(
         page.contains(&format!(
             "<button class=\"sha-copy\" type=\"button\" data-sha=\"{sha}\""
@@ -1056,7 +1068,11 @@ fn html_inline_script_handles_sha_copy() {
     commit(repo, "[foo] intro");
 
     let out = run_clank(repo, &["html"]);
-    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 
     let index = std::fs::read_to_string(repo.join(".clank/html/index.html")).unwrap();
     assert!(
@@ -1075,7 +1091,11 @@ fn html_no_js_fallback_keeps_sha_text_visible() {
     let short = &sha[..7];
 
     let out = run_clank(repo, &["html"]);
-    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 
     let index = std::fs::read_to_string(repo.join(".clank/html/index.html")).unwrap();
     let needle = format!("title=\"{sha}\">{short}</button>");
@@ -1093,7 +1113,11 @@ fn html_timeline_row_does_not_nest_button_inside_anchor() {
     commit(repo, "[foo] intro");
 
     let out = run_clank(repo, &["html"]);
-    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 
     let index = std::fs::read_to_string(repo.join(".clank/html/index.html")).unwrap();
     for row in index.split("<div class=\"row\"").skip(1) {
