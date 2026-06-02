@@ -277,6 +277,17 @@ async fn inspect(requested: &str) -> anyhow::Result<OpenResponse> {
         if let Some(w) = fold_warning {
             warnings.push(w);
         }
+        // A fully-init'd repo with no on-disk agents still
+        // wants the editor to bind one — emit a generic
+        // BindAgent recommendation in that case.
+        let recs = if info.agents.is_empty() && recs.is_empty() {
+            vec![Recommendation::BindAgent {
+                label: None,
+                tool: None,
+            }]
+        } else {
+            recs
+        };
         (Some(info), recs)
     } else {
         (
@@ -287,6 +298,12 @@ async fn inspect(requested: &str) -> anyhow::Result<OpenResponse> {
             }],
         )
     };
+
+    // Root / ancestor gitignore advisory. Mirrors what
+    // `init.rs::warn_if_globally_excluded` checks — init only
+    // warns about these and doesn't fix them, so they're
+    // surfaced as `warnings` here, not as InitGaps.
+    warnings.extend(probe_ancestor_gitignore_advisory(&repo_root));
 
     let (state, mut recommendations) = if init_gaps.is_empty() {
         (OpenState::ClankReady, Vec::new())
@@ -382,6 +399,55 @@ fn probe_init_state(repo: &Path) -> (Vec<InitGap>, Vec<String>) {
     }
 
     (gaps, warnings)
+}
+
+/// Probe whether an ancestor `.gitignore` (or `core.excludesFile`)
+/// excludes any `.clank/` subpath that should be tracked. Mirrors
+/// `init.rs::warn_if_globally_excluded` — init only WARNS about
+/// these and doesn't write them, so they're advisories, not
+/// InitGaps.
+fn probe_ancestor_gitignore_advisory(repo: &Path) -> Vec<String> {
+    const TRACKED_PROBES: &[&str] = &[
+        ".clank/plans",
+        ".clank/finished",
+    ];
+    let mut out = Vec::new();
+    for rel in TRACKED_PROBES {
+        let probe = repo.join(rel);
+        let output = std::process::Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(["check-ignore", "-v"])
+            .arg(probe.as_path())
+            .output();
+        let Ok(output) = output else { continue };
+        if output.status.code() != Some(0) {
+            continue;
+        }
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let line = stdout.lines().next().unwrap_or("").trim_end();
+        if line.is_empty() {
+            continue;
+        }
+        // Suppress hits inside our own .clank/.gitignore — those
+        // are intentional. `check-ignore -v` format:
+        //   <source_file>:<line>:<pattern>\t<probed>
+        let source = line.split_once('\t').map(|(s, _)| s).unwrap_or("");
+        let source_file = source.split(':').next().unwrap_or("");
+        let sp = Path::new(source_file);
+        let is_managed = sp.file_name().is_some_and(|n| n == ".gitignore")
+            && sp.parent().is_some_and(|p| p.ends_with(".clank"));
+        if is_managed {
+            continue;
+        }
+        out.push(format!(
+            "ancestor .gitignore (or core.excludesFile) excludes `{rel}` — \
+             tracked clank files would be hidden. Source: {line}. \
+             `clank init` only warns about this; fix by editing the offending \
+             gitignore yourself."
+        ));
+    }
+    out
 }
 
 fn lex_absolute(p: &str) -> PathBuf {

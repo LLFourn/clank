@@ -159,18 +159,28 @@ pub fn classify_claude_perms(repo: &Path) -> ClaudePermsState {
     let Some(obj) = v.as_object() else {
         return ClaudePermsState::Drifted;
     };
-    let allow = obj
-        .get("permissions")
-        .and_then(|p| p.as_object())
-        .and_then(|p| p.get("allow"))
-        .and_then(|a| a.as_array());
-    let allow = match allow {
-        Some(a) => a,
-        None => {
-            return ClaudePermsState::NeedsPatch {
-                missing_rules: CLAUDE_ALLOW_RULES.iter().map(|s| (*s).to_string()).collect(),
-            };
+    // Init's repair only works when the path is well-shaped at
+    // every level it touches: top-level object, `permissions`
+    // either absent or an object, `permissions.allow` either
+    // absent or an array. Anything else makes
+    // `write_claude_perms` bail — surface as Drifted, not
+    // NeedsPatch.
+    let allow = match obj.get("permissions") {
+        None => None, // init will fill in
+        Some(p) if p.is_object() => {
+            let pobj = p.as_object().unwrap();
+            match pobj.get("allow") {
+                None => None, // init will fill in
+                Some(a) if a.is_array() => Some(a.as_array().unwrap()),
+                Some(_) => return ClaudePermsState::Drifted,
+            }
         }
+        Some(_) => return ClaudePermsState::Drifted,
+    };
+    let Some(allow) = allow else {
+        return ClaudePermsState::NeedsPatch {
+            missing_rules: CLAUDE_ALLOW_RULES.iter().map(|s| (*s).to_string()).collect(),
+        };
     };
     let present: Vec<&str> = allow.iter().filter_map(|v| v.as_str()).collect();
     let missing: Vec<String> = CLAUDE_ALLOW_RULES
@@ -283,6 +293,33 @@ mod tests {
         let dir = tempdir();
         std::fs::create_dir_all(dir.path().join(".claude")).unwrap();
         std::fs::write(claude_perms_path(dir.path()), "not json").unwrap();
+        assert_eq!(classify_claude_perms(dir.path()), ClaudePermsState::Drifted);
+    }
+
+    #[test]
+    fn classify_claude_perms_drifted_when_permissions_not_object() {
+        // init.rs bails when permissions isn't a JSON object;
+        // open.rs must surface that as a drift warning, not as
+        // a fixable NeedsPatch.
+        let dir = tempdir();
+        std::fs::create_dir_all(dir.path().join(".claude")).unwrap();
+        std::fs::write(
+            claude_perms_path(dir.path()),
+            r#"{"permissions":"oh no"}"#,
+        )
+        .unwrap();
+        assert_eq!(classify_claude_perms(dir.path()), ClaudePermsState::Drifted);
+    }
+
+    #[test]
+    fn classify_claude_perms_drifted_when_allow_not_array() {
+        let dir = tempdir();
+        std::fs::create_dir_all(dir.path().join(".claude")).unwrap();
+        std::fs::write(
+            claude_perms_path(dir.path()),
+            r#"{"permissions":{"allow":"single-string-not-array"}}"#,
+        )
+        .unwrap();
         assert_eq!(classify_claude_perms(dir.path()), ClaudePermsState::Drifted);
     }
 }

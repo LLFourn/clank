@@ -579,6 +579,75 @@ fn clank_init_recommendation_carries_gaps_array() {
 }
 
 #[test]
+fn clank_ready_unaffected_by_unbound_agents() {
+    let home = tempfile::tempdir().unwrap();
+    let dir = init_repo();
+    let repo = dir.path();
+    let out = Command::new(clank_bin())
+        .args(["init", "--yes"])
+        .arg("--repo")
+        .arg(repo)
+        .env("HOME", home.path())
+        .env_remove("CLAUDE_CODE_SESSION_ID")
+        .env_remove("CODEX_THREAD_ID")
+        .env_remove("CLANK_AGENT")
+        .output()
+        .expect("spawn clank init");
+    assert!(
+        out.status.success(),
+        "clank init failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    // No `.clank/agents/<label>/` dirs created (init runs
+    // without a bound agent session under the test env).
+    let agents_root = repo.join(".clank/agents");
+    if agents_root.exists() {
+        // Remove any auto-created agent dirs so the test pins
+        // the "no known agents" branch deterministically.
+        for entry in std::fs::read_dir(&agents_root).unwrap().flatten() {
+            std::fs::remove_dir_all(entry.path()).unwrap();
+        }
+    }
+
+    let v = run_open(repo, home.path());
+    assert_eq!(v["state"], "clank_ready", "got {v}");
+    let agents = v["clank"]["agents"].as_array().expect("agents array");
+    assert!(agents.is_empty(), "expected empty agents; got {agents:?}");
+    let kinds = rec_kinds(&v);
+    assert_eq!(
+        kinds,
+        vec!["bind_agent"],
+        "ready repo with no agents must surface a single bind_agent rec"
+    );
+}
+
+#[test]
+fn warning_for_ancestor_gitignore_excluding_clank_paths() {
+    let home = tempfile::tempdir().unwrap();
+    let dir = init_repo();
+    let repo = dir.path();
+    // Root gitignore EXCLUDES .clank/ entirely — exactly the
+    // kind of misconfiguration init only warns about.
+    write(repo, ".gitignore", ".clank/\n");
+
+    let v = run_open(repo, home.path());
+    let warnings = v["warnings"].as_array().expect("warnings present");
+    assert!(
+        warnings.iter().any(|w| {
+            let s = w.as_str().unwrap_or("");
+            s.contains("ancestor .gitignore") && s.contains(".clank/plans")
+        }),
+        "expected ancestor-gitignore warning; got {warnings:?}"
+    );
+    let gaps = gap_kinds(&v);
+    // This is NOT a fixable InitGap — init doesn't repair it.
+    assert!(
+        !gaps.iter().any(|g| g.contains("gitignore_entries")),
+        "ancestor-gitignore exclusion must NOT be an InitGap; got {gaps:?}"
+    );
+}
+
+#[test]
 fn warnings_field_omitted_when_empty() {
     let home = tempfile::tempdir().unwrap();
     let target = tempfile::tempdir().unwrap();
