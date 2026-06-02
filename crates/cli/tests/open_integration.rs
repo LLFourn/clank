@@ -128,7 +128,7 @@ fn git_without_clank() {
     let home = tempfile::tempdir().unwrap();
     let dir = init_repo();
     let v = run_open(dir.path(), home.path());
-    assert_eq!(v["state"], "git_without_clank");
+    assert_eq!(v["state"], "clank_init_needed");
     assert_eq!(v["git"]["is_repo"], true);
     assert_eq!(v["git"]["head_branch"], "main");
     assert_eq!(v["git"]["dirty"], false);
@@ -137,11 +137,12 @@ fn git_without_clank() {
 }
 
 #[test]
-fn clank_initialized_without_config_json() {
-    // Regression: `.clank/config.json` is optional now that
-    // master is per-agent. A repo whose `.clank/` is set up
-    // without that file must still classify as
-    // `ClankInitialized`, not `GitWithoutClank`.
+fn clank_field_populated_when_clank_dir_present_without_config_json() {
+    // Regression: in the old model, a repo with `.clank/` but no
+    // `config.json` was misclassified as GitWithoutClank — clank
+    // info was dropped entirely. Under the new model the state
+    // is `clank_init_needed` (init artifacts are still missing),
+    // but the `clank` field must still be populated.
     let home = tempfile::tempdir().unwrap();
     let dir = init_repo();
     let repo = dir.path();
@@ -149,23 +150,19 @@ fn clank_initialized_without_config_json() {
     git(repo, &["add", "-A"]);
     git(repo, &["commit", "--quiet", "-m", "seed"]);
     let v = run_open(repo, home.path());
-    assert_eq!(
-        v["state"], "clank_initialized",
-        "expected clank_initialized without config.json; got {v}"
-    );
-    let kinds = rec_kinds(&v);
+    assert_eq!(v["state"], "clank_init_needed");
     assert!(
-        !kinds.iter().any(|k| k == "clank_init"),
-        "must NOT recommend clank_init on a clank-initialized repo; got {kinds:?}"
+        v.get("clank").is_some() && !v["clank"].is_null(),
+        "clank field must be populated when .clank/ is present; got {v}"
     );
 }
 
 #[test]
-fn clank_initialized_linked_worktree_without_config_json() {
-    // Pin the original bug: linked worktree, `.clank/` is set
-    // up under the linked tree, no config.json. clank open
-    // against the worktree path must report
-    // `clank_initialized`.
+fn linked_worktree_without_config_json_populates_clank_field() {
+    // Pin the original bug shape: linked worktree, `.clank/` in
+    // the linked tree only, no `config.json`. State is now
+    // `clank_init_needed` (the linked tree's hooks/gitignore/
+    // permissions aren't init'd) but `clank` info populates.
     let home = tempfile::tempdir().unwrap();
     let main = init_repo();
     let main_repo = main.path();
@@ -186,12 +183,15 @@ fn clank_initialized_linked_worktree_without_config_json() {
         ],
     );
 
-    // Set up `.clank/` in the linked worktree only — no config.json.
     write(&wt_path, ".clank/plans/.gitkeep", "");
 
     let v = run_open(&wt_path, home.path());
-    assert_eq!(v["state"], "clank_initialized");
+    assert_eq!(v["state"], "clank_init_needed");
     assert_eq!(v["git"]["is_linked_worktree"], true);
+    assert!(
+        v.get("clank").is_some() && !v["clank"].is_null(),
+        "clank field must be populated in linked worktree; got {v}"
+    );
 }
 
 #[test]
@@ -214,14 +214,20 @@ fn clank_initialized_with_master_and_reviewer() {
     git(repo, &["commit", "--quiet", "-m", "seed"]);
 
     let v = run_open(repo, home.path());
-    assert_eq!(v["state"], "clank_initialized");
+    assert_eq!(v["state"], "clank_init_needed");
     assert_eq!(v["clank"]["master_agents"], serde_json::json!(["claude"]));
     assert_eq!(v["clank"]["agents"].as_array().unwrap().len(), 2);
-    // No JSONL on disk under fake HOME → not resumable, so bind_agent
-    // recommendations rather than resume_agent.
+    // No JSONL on disk under fake HOME → not resumable, so each
+    // agent gets a bind_agent (no resume_agent). The init gaps
+    // also surface a clank_init recommendation; the count of
+    // bind_agents specifically must be 2.
     let kinds = rec_kinds(&v);
-    assert!(kinds.iter().all(|k| k == "bind_agent"));
-    assert_eq!(kinds.len(), 2);
+    let bind_count = kinds.iter().filter(|k| *k == "bind_agent").count();
+    assert_eq!(bind_count, 2, "expected 2 bind_agent recs; got {kinds:?}");
+    assert!(
+        !kinds.iter().any(|k| k == "resume_agent"),
+        "no resume_agent should appear without on-disk JSONL"
+    );
 }
 
 #[test]
@@ -235,7 +241,6 @@ fn clank_initialized_subdir_resolves_to_repo_root() {
     git(repo, &["commit", "--quiet", "-m", "seed"]);
 
     let v = run_open(&repo.join("src"), home.path());
-    assert_eq!(v["state"], "clank_initialized");
     let opened = v["opened_path"].as_str().unwrap();
     let root = v["repo_root"].as_str().unwrap();
     assert!(
@@ -243,9 +248,10 @@ fn clank_initialized_subdir_resolves_to_repo_root() {
         "opened_path should be subdir; got {opened}"
     );
     assert_ne!(opened, root);
-    // No clank_init recommendation when already initialized.
-    let kinds = rec_kinds(&v);
-    assert!(!kinds.iter().any(|k| k == "clank_init"));
+    assert!(
+        root.ends_with(repo.file_name().unwrap().to_str().unwrap()),
+        "repo_root should be the toplevel; got {root}"
+    );
 }
 
 #[test]
@@ -330,9 +336,11 @@ fn resume_recommended_when_session_jsonl_exists() {
 
     let v = run_open(repo, home.path());
     let recs = v["recommendations"].as_array().unwrap();
-    assert_eq!(recs.len(), 1);
-    assert_eq!(recs[0]["kind"], "resume_agent");
-    assert_eq!(recs[0]["command_hint"], format!("claude --resume {uuid}"));
+    let resume = recs
+        .iter()
+        .find(|r| r["kind"] == "resume_agent")
+        .unwrap_or_else(|| panic!("no resume_agent recommendation; got {recs:?}"));
+    assert_eq!(resume["command_hint"], format!("claude --resume {uuid}"));
     assert_eq!(v["clank"]["agents"][0]["session_resumable"], true);
 }
 
@@ -352,8 +360,15 @@ fn stale_session_id_falls_back_to_bind_agent() {
 
     let v = run_open(repo, home.path());
     let recs = v["recommendations"].as_array().unwrap();
-    assert_eq!(recs.len(), 1);
-    assert_eq!(recs[0]["kind"], "bind_agent");
+    let bind = recs
+        .iter()
+        .find(|r| r["kind"] == "bind_agent")
+        .unwrap_or_else(|| panic!("no bind_agent recommendation; got {recs:?}"));
+    assert_eq!(bind["label"], "claude");
+    assert!(
+        !recs.iter().any(|r| r["kind"] == "resume_agent"),
+        "stale session should fall back to bind, not resume; got {recs:?}"
+    );
     assert_eq!(v["clank"]["agents"][0]["session_resumable"], false);
 }
 
@@ -382,9 +397,185 @@ fn codex_session_recommended_when_rollout_jsonl_exists() {
 
     let v = run_open(repo, home.path());
     let recs = v["recommendations"].as_array().unwrap();
-    assert_eq!(recs.len(), 1);
-    assert_eq!(recs[0]["kind"], "resume_agent");
-    assert_eq!(recs[0]["command_hint"], format!("codex resume {uuid}"));
+    let resume = recs
+        .iter()
+        .find(|r| r["kind"] == "resume_agent")
+        .unwrap_or_else(|| panic!("no resume_agent recommendation; got {recs:?}"));
+    assert_eq!(resume["command_hint"], format!("codex resume {uuid}"));
+}
+
+fn gap_kinds(v: &Value) -> Vec<String> {
+    v["init_gaps"]
+        .as_array()
+        .map(|arr| {
+            arr.iter()
+                .map(|g| g["kind"].as_str().unwrap().to_string())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+#[test]
+fn init_needed_when_clank_dir_missing() {
+    let home = tempfile::tempdir().unwrap();
+    let dir = init_repo();
+    let v = run_open(dir.path(), home.path());
+    assert_eq!(v["state"], "clank_init_needed");
+    let gaps = gap_kinds(&v);
+    assert!(
+        gaps.iter().any(|g| g == "missing_clank_dir"),
+        "expected missing_clank_dir; got {gaps:?}"
+    );
+}
+
+#[test]
+fn init_needed_when_claude_permissions_missing() {
+    let home = tempfile::tempdir().unwrap();
+    let dir = init_repo();
+    let repo = dir.path();
+    write(repo, ".clank/.gitignore", "/agents/\n/cache/\n/feedback/\n/queue/\n");
+    let v = run_open(repo, home.path());
+    let gaps = gap_kinds(&v);
+    assert!(
+        gaps.iter().any(|g| g == "missing_claude_permissions"),
+        "expected missing_claude_permissions; got {gaps:?}"
+    );
+}
+
+#[test]
+fn init_needed_when_post_rewrite_hook_absent() {
+    let home = tempfile::tempdir().unwrap();
+    let dir = init_repo();
+    let repo = dir.path();
+    write(repo, ".clank/.gitignore", "/agents/\n/cache/\n/feedback/\n/queue/\n");
+    write(
+        repo,
+        ".claude/settings.local.json",
+        r#"{"permissions":{"allow":["Write(.clank/agents/**)","Edit(.clank/agents/**)","Read(.clank/agents/**)"]}}"#,
+    );
+    let v = run_open(repo, home.path());
+    let gaps = gap_kinds(&v);
+    assert!(
+        gaps.iter().any(|g| g == "missing_post_rewrite_hook"),
+        "expected missing_post_rewrite_hook; got {gaps:?}"
+    );
+}
+
+#[test]
+fn legacy_clank_gitignore_is_init_gap() {
+    let home = tempfile::tempdir().unwrap();
+    let dir = init_repo();
+    let repo = dir.path();
+    write(repo, ".clank/.gitignore", "feedback/\ncache/\n");
+    let v = run_open(repo, home.path());
+    let gaps = gap_kinds(&v);
+    assert!(
+        gaps.iter().any(|g| g == "missing_clank_gitignore"),
+        "legacy body should be an init gap; got {gaps:?}"
+    );
+}
+
+#[test]
+fn foreign_clank_gitignore_is_warning_not_init_gap() {
+    let home = tempfile::tempdir().unwrap();
+    let dir = init_repo();
+    let repo = dir.path();
+    write(repo, ".clank/.gitignore", "totally-foreign-content\n");
+    let v = run_open(repo, home.path());
+    let gaps = gap_kinds(&v);
+    assert!(
+        !gaps.iter().any(|g| g == "missing_clank_gitignore"),
+        "foreign body should NOT be an init gap (init bails on it); got {gaps:?}"
+    );
+    let warnings = v["warnings"].as_array().expect("warnings present");
+    assert!(
+        warnings.iter().any(|w| {
+            let s = w.as_str().unwrap_or("");
+            s.contains(".clank/.gitignore") && s.contains("drifted")
+        }),
+        "expected drift warning; got {warnings:?}"
+    );
+}
+
+#[test]
+fn foreign_post_rewrite_hook_is_warning_not_init_gap() {
+    let home = tempfile::tempdir().unwrap();
+    let dir = init_repo();
+    let repo = dir.path();
+    let hook = repo.join(".git/hooks/post-rewrite");
+    std::fs::create_dir_all(hook.parent().unwrap()).unwrap();
+    std::fs::write(&hook, "#!/bin/sh\necho not-clank\n").unwrap();
+    let v = run_open(repo, home.path());
+    let gaps = gap_kinds(&v);
+    assert!(
+        !gaps.iter().any(|g| g == "missing_post_rewrite_hook"),
+        "foreign hook should NOT be an init gap (init only warns); got {gaps:?}"
+    );
+    let warnings = v["warnings"].as_array().expect("warnings present");
+    assert!(
+        warnings.iter().any(|w| {
+            let s = w.as_str().unwrap_or("");
+            s.contains("post-rewrite") && s.contains("--force-hooks")
+        }),
+        "expected foreign-hook warning mentioning --force-hooks; got {warnings:?}"
+    );
+}
+
+#[test]
+fn clank_ready_after_full_init() {
+    let home = tempfile::tempdir().unwrap();
+    let dir = init_repo();
+    let repo = dir.path();
+    // clank init --yes does the full repair sweep.
+    let out = Command::new(clank_bin())
+        .args(["init", "--yes"])
+        .arg("--repo")
+        .arg(repo)
+        .env("HOME", home.path())
+        .env_remove("CLAUDE_CODE_SESSION_ID")
+        .env_remove("CODEX_THREAD_ID")
+        .env_remove("CLANK_AGENT")
+        .output()
+        .expect("spawn clank init");
+    assert!(
+        out.status.success(),
+        "clank init --yes failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v = run_open(repo, home.path());
+    assert_eq!(v["state"], "clank_ready", "got {v}");
+    assert!(
+        v.get("init_gaps").is_none(),
+        "init_gaps should be omitted when empty; got {v}"
+    );
+    let recs = v["recommendations"].as_array().unwrap();
+    assert!(
+        !recs.iter().any(|r| r["kind"] == "clank_init"),
+        "no clank_init recommendation when ready; got {recs:?}"
+    );
+}
+
+#[test]
+fn clank_init_recommendation_carries_gaps_array() {
+    let home = tempfile::tempdir().unwrap();
+    let dir = init_repo();
+    let v = run_open(dir.path(), home.path());
+    let recs = v["recommendations"].as_array().unwrap();
+    let init_rec = recs
+        .iter()
+        .find(|r| r["kind"] == "clank_init")
+        .unwrap_or_else(|| panic!("no clank_init rec; got {recs:?}"));
+    let gaps = init_rec["gaps"].as_array().expect("gaps array");
+    assert!(!gaps.is_empty(), "gaps should be populated for init-needed state");
+    let top_gap_kinds = gap_kinds(&v);
+    let rec_gaps: Vec<String> = gaps
+        .iter()
+        .map(|g| g.as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(
+        rec_gaps, top_gap_kinds,
+        "recommendation's gaps must mirror top-level init_gaps kinds in order"
+    );
 }
 
 #[test]
@@ -421,7 +612,7 @@ fn linked_worktree_git_dir_outside_repo_root() {
     );
 
     let v = run_open(&linked_path, home.path());
-    assert_eq!(v["state"], "git_without_clank");
+    assert_eq!(v["state"], "clank_init_needed");
     assert_eq!(v["git"]["is_linked_worktree"], true);
     let git_dir = v["git"]["git_dir"].as_str().unwrap();
     let repo_root = v["repo_root"].as_str().unwrap();
@@ -446,7 +637,7 @@ fn symlink_canonicalizes_to_target() {
     std::os::unix::fs::symlink(repo, &link).unwrap();
 
     let v = run_open(&link, home.path());
-    assert_eq!(v["state"], "clank_initialized");
+    assert_eq!(v["state"], "clank_init_needed");
     let opened = v["opened_path"].as_str().unwrap();
     let canonical_target = dunce::canonicalize(repo)
         .unwrap()
@@ -475,7 +666,7 @@ fn fold_failure_pushes_warning_but_keeps_clank_initialized() {
     std::fs::write(&head_ref, "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef\n").unwrap();
 
     let v = run_open(repo, home.path());
-    assert_eq!(v["state"], "clank_initialized");
+    assert_eq!(v["state"], "clank_init_needed");
     let warnings = v["warnings"].as_array().expect("warnings present");
     assert!(
         warnings.iter().any(|w| {

@@ -14,6 +14,7 @@ pub mod fs_review_lookup;
 pub mod fs_watcher;
 pub mod git_io;
 pub mod hook_config;
+pub mod init_facts;
 pub mod preview;
 pub mod runtime;
 pub mod state_cache;

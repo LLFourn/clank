@@ -27,24 +27,10 @@ use crate::agent_store::{
 use clank_core::ids::AgentLabel;
 use clank_core::vocab::{Role, Tool};
 
-/// The current canonical content of `.clank/.gitignore`.
-///
-/// In the current model, only `plans/` and `finished/` under
-/// `.clank/` are tracked (the artifacts being reviewed + the
-/// durable record of finalized plans). Everything else is local:
-/// per-agent configs, feedback, cache. The root gitignore's
-/// `.clank/*` + `!.clank/plans/` + `!.clank/finished/`
-/// carve-outs are the authoritative rule; the inner gitignore
-/// is defensive (catches per-agent state even if a root
-/// gitignore is misconfigured or absent).
-const GITIGNORE_BODY: &str = "/agents/\n/cache/\n/feedback/\n/queue/\n";
-
-const LEGACY_GITIGNORE_BODIES: &[&str] = &[
-    "/agents/\n/cache/\n/feedback/\n",
-    "feedback/\ncache/\n",
-    "feedback/\ncache/\nagents/*/config.json\n",
-    "/feedback/\n/cache/\nagents/*/config.json\n",
-];
+use crate::init_facts::{
+    CLANK_GITIGNORE_BODY as GITIGNORE_BODY, CLANK_GITIGNORE_LEGACY_BODIES as LEGACY_GITIGNORE_BODIES,
+    CLAUDE_ALLOW_RULES, POST_REWRITE_BODY, POST_REWRITE_MARKER,
+};
 
 pub async fn run(args: InitArgs) -> anyhow::Result<()> {
     let repo = resolve_repo(args.repo.as_deref())?;
@@ -55,11 +41,6 @@ pub async fn run(args: InitArgs) -> anyhow::Result<()> {
     bootstrap_agent_identity(&repo, args.yes).await?;
     Ok(())
 }
-
-const POST_REWRITE_MARKER: &str = "# clank rewire hook";
-const POST_REWRITE_BODY: &str = "#!/usr/bin/env sh\n\
-# clank rewire hook\n\
-exec clank rewire --from-stdin\n";
 
 /// Install the `post-rewrite` git hook so feedback files
 /// follow commits through rebases/amends. Resolves the real
@@ -243,12 +224,6 @@ fn check_one(repo: &Path, rel: &str) {
 /// based, so there's no equivalent file to write for codex —
 /// its sandbox already permits writes inside the workspace.
 fn write_claude_perms(repo: &Path) -> anyhow::Result<()> {
-    const OUR_ALLOW: &[&str] = &[
-        "Write(.clank/agents/**)",
-        "Edit(.clank/agents/**)",
-        "Read(.clank/agents/**)",
-    ];
-
     let claude_dir = repo.join(".claude");
     let path = claude_dir.join("settings.local.json");
 
@@ -276,8 +251,8 @@ fn write_claude_perms(repo: &Path) -> anyhow::Result<()> {
         .ok_or_else(|| anyhow::anyhow!("`permissions.allow` is not a JSON array"))?;
 
     let mut added = false;
-    for rule in OUR_ALLOW {
-        let exists = allow.iter().any(|v| v.as_str() == Some(rule));
+    for rule in CLAUDE_ALLOW_RULES {
+        let exists = allow.iter().any(|v| v.as_str() == Some(*rule));
         if !exists {
             allow.push(serde_json::Value::String((*rule).into()));
             added = true;

@@ -32,6 +32,11 @@ pub struct OpenResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub clank: Option<ClankInfo>,
     pub recommendations: Vec<Recommendation>,
+    /// InitGaps `clank init` would actually fix on a clean
+    /// re-run. Omitted when state is `clank_ready` (or pre-git
+    /// states where init isn't applicable).
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub init_gaps: Vec<InitGap>,
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub warnings: Vec<String>,
 }
@@ -43,8 +48,43 @@ pub enum OpenState {
     PathNotDirectory,
     EmptyDirectory,
     DirectoryNotGit,
-    GitWithoutClank,
-    ClankInitialized,
+    /// Repo is in a git tree but `clank init` has something to
+    /// do (creating the dir, installing the hook, patching
+    /// permissions, etc.). Details in `init_gaps`.
+    ClankInitNeeded,
+    /// `.clank/` and every other artifact `clank init` manages
+    /// are present and current. The repo can be opened without
+    /// running init.
+    ClankReady,
+}
+
+/// One thing `clank init` would fix on a clean re-run.
+#[derive(Serialize, Debug, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum InitGap {
+    MissingClankDir,
+    /// `.clank/.gitignore` is absent or matches a known legacy
+    /// body that init silently upgrades.
+    MissingClankGitignore,
+    /// `.claude/settings.local.json` is absent or its
+    /// `permissions.allow` array doesn't include one or more
+    /// of clank's rules.
+    MissingClaudePermissions,
+    /// `hooks/post-rewrite` is absent, or it carries the clank
+    /// marker but its body has drifted from the canonical
+    /// `POST_REWRITE_BODY`.
+    MissingPostRewriteHook,
+}
+
+impl InitGap {
+    pub fn kind_str(&self) -> &'static str {
+        match self {
+            InitGap::MissingClankDir => "missing_clank_dir",
+            InitGap::MissingClankGitignore => "missing_clank_gitignore",
+            InitGap::MissingClaudePermissions => "missing_claude_permissions",
+            InitGap::MissingPostRewriteHook => "missing_post_rewrite_hook",
+        }
+    }
 }
 
 #[derive(Serialize)]
@@ -88,6 +128,11 @@ pub enum Recommendation {
     },
     ClankInit {
         cwd: String,
+        /// Snake-case kinds for the gaps init will fix at this
+        /// path. Matches the top-level `init_gaps` array in
+        /// content + order.
+        #[serde(skip_serializing_if = "Vec::is_empty", default)]
+        gaps: Vec<String>,
     },
     BindAgent {
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -127,12 +172,14 @@ async fn inspect(requested: &str) -> anyhow::Result<OpenResponse> {
                 },
                 Recommendation::ClankInit {
                     cwd: opened.to_string_lossy().to_string(),
+                    gaps: Vec::new(),
                 },
                 Recommendation::BindAgent {
                     label: None,
                     tool: None,
                 },
             ],
+            init_gaps: Vec::new(),
             warnings,
         });
     }
@@ -150,6 +197,7 @@ async fn inspect(requested: &str) -> anyhow::Result<OpenResponse> {
             git: None,
             clank: None,
             recommendations: vec![],
+            init_gaps: Vec::new(),
             warnings,
         });
     }
@@ -181,12 +229,16 @@ async fn inspect(requested: &str) -> anyhow::Result<OpenResponse> {
             clank: None,
             recommendations: vec![
                 Recommendation::GitInit { cwd: cwd.clone() },
-                Recommendation::ClankInit { cwd: cwd.clone() },
+                Recommendation::ClankInit {
+                    cwd: cwd.clone(),
+                    gaps: Vec::new(),
+                },
                 Recommendation::BindAgent {
                     label: None,
                     tool: None,
                 },
             ],
+            init_gaps: Vec::new(),
             warnings,
         });
     };
@@ -204,47 +256,132 @@ async fn inspect(requested: &str) -> anyhow::Result<OpenResponse> {
         dirty,
     };
 
-    // `.clank/` directory is the ClankInitialized marker.
-    // `config.json` became optional once master moved to a
-    // per-agent role claim; gating on it caused false-negatives
-    // for repos whose `.clank/` is fully set up without one.
-    let clank_dir = repo_root.join(".clank");
-    if !clank_dir.is_dir() {
-        let cwd = repo_root.to_string_lossy().to_string();
-        return Ok(OpenResponse {
-            requested_path: requested.to_string(),
-            opened_path: opened.to_string_lossy().to_string(),
-            state: OpenState::GitWithoutClank,
-            repo_root: Some(cwd.clone()),
-            git: Some(git),
-            clank: None,
-            recommendations: vec![
-                Recommendation::ClankInit { cwd: cwd.clone() },
-                Recommendation::BindAgent {
-                    label: None,
-                    tool: None,
-                },
-            ],
-            warnings,
-        });
-    }
-
-    let (clank_info, agent_recs, fold_warning) =
-        clank_info_for_repo(&repo_root).await;
-    if let Some(w) = fold_warning {
+    // Probe each artifact `clank init` manages. Build init_gaps
+    // (the cases init repairs on a clean re-run) and drift
+    // warnings (foreign content init won't fix without
+    // --force-hooks or manual cleanup) from the same shared
+    // classifiers in `crate::init_facts`.
+    let (init_gaps, drift_warnings) = probe_init_state(&repo_root);
+    for w in drift_warnings {
         warnings.push(w);
     }
+
+    let cwd = repo_root.to_string_lossy().to_string();
+
+    // ClankInfo + agent recommendations only when .clank/ is
+    // present. When the dir is missing the fold has nothing
+    // to look at; skip cleanly.
+    let clank_dir_present = repo_root.join(".clank").is_dir();
+    let (clank, mut agent_recs) = if clank_dir_present {
+        let (info, recs, fold_warning) = clank_info_for_repo(&repo_root).await;
+        if let Some(w) = fold_warning {
+            warnings.push(w);
+        }
+        (Some(info), recs)
+    } else {
+        (
+            None,
+            vec![Recommendation::BindAgent {
+                label: None,
+                tool: None,
+            }],
+        )
+    };
+
+    let (state, mut recommendations) = if init_gaps.is_empty() {
+        (OpenState::ClankReady, Vec::new())
+    } else {
+        let gap_kinds: Vec<String> = init_gaps
+            .iter()
+            .map(|g| g.kind_str().to_string())
+            .collect();
+        (
+            OpenState::ClankInitNeeded,
+            vec![Recommendation::ClankInit {
+                cwd: cwd.clone(),
+                gaps: gap_kinds,
+            }],
+        )
+    };
+    recommendations.append(&mut agent_recs);
 
     Ok(OpenResponse {
         requested_path: requested.to_string(),
         opened_path: opened.to_string_lossy().to_string(),
-        state: OpenState::ClankInitialized,
-        repo_root: Some(repo_root.to_string_lossy().to_string()),
+        state,
+        repo_root: Some(cwd),
         git: Some(git),
-        clank: Some(clank_info),
-        recommendations: agent_recs,
+        clank,
+        recommendations,
+        init_gaps,
         warnings,
     })
+}
+
+/// Probe every artifact `clank init` manages and return the
+/// gaps + drift warnings.
+fn probe_init_state(repo: &Path) -> (Vec<InitGap>, Vec<String>) {
+    use crate::init_facts::{
+        ClaudePermsState, GitignoreState, HookState, classify_claude_perms,
+        classify_clank_gitignore, classify_post_rewrite_hook, claude_perms_path,
+        clank_gitignore_path, post_rewrite_hook_path,
+    };
+    let mut gaps = Vec::new();
+    let mut warnings = Vec::new();
+
+    if !repo.join(".clank").is_dir() {
+        gaps.push(InitGap::MissingClankDir);
+    }
+
+    match classify_clank_gitignore(repo) {
+        GitignoreState::Missing | GitignoreState::Legacy => {
+            gaps.push(InitGap::MissingClankGitignore);
+        }
+        GitignoreState::Drifted => {
+            warnings.push(format!(
+                "`{}` has drifted from the canonical body; \
+                 clank init will bail until the file is removed \
+                 or matches the canonical content.",
+                clank_gitignore_path(repo).display()
+            ));
+        }
+        GitignoreState::Canonical => {}
+    }
+
+    match classify_claude_perms(repo) {
+        ClaudePermsState::Missing | ClaudePermsState::NeedsPatch { .. } => {
+            gaps.push(InitGap::MissingClaudePermissions);
+        }
+        ClaudePermsState::Drifted => {
+            warnings.push(format!(
+                "`{}` isn't valid JSON / lacks `permissions.allow`; \
+                 clank init won't repair this. Fix the file by hand \
+                 or delete it.",
+                claude_perms_path(repo).display()
+            ));
+        }
+        ClaudePermsState::Complete => {}
+    }
+
+    match classify_post_rewrite_hook(repo) {
+        HookState::Missing | HookState::Refreshable => {
+            gaps.push(InitGap::MissingPostRewriteHook);
+        }
+        HookState::Foreign => {
+            let path = post_rewrite_hook_path(repo)
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|| "(unknown)".to_string());
+            warnings.push(format!(
+                "`{path}` is a foreign post-rewrite hook (no clank marker). \
+                 clank init leaves it alone. \
+                 Pass `clank init --force-hooks` to overwrite, \
+                 or chain `clank rewire --from-stdin` into it manually."
+            ));
+        }
+        HookState::Canonical | HookState::Indeterminate => {}
+    }
+
+    (gaps, warnings)
 }
 
 fn lex_absolute(p: &str) -> PathBuf {
@@ -525,7 +662,22 @@ fn format_waiting_on(w: &clank_core::plan_view::WaitingOn) -> String {
 }
 
 fn print_human(r: &OpenResponse) {
-    println!("state:        {}", state_label(&r.state));
+    let state_line = if r.init_gaps.is_empty() {
+        state_label(&r.state).to_string()
+    } else {
+        format!(
+            "{} ({} gap{})",
+            state_label(&r.state),
+            r.init_gaps.len(),
+            if r.init_gaps.len() == 1 { "" } else { "s" }
+        )
+    };
+    println!("state:        {state_line}");
+    if !r.init_gaps.is_empty() {
+        for gap in &r.init_gaps {
+            println!("              - {}", gap.kind_str());
+        }
+    }
     println!("opened_path:  {}", r.opened_path);
     println!(
         "repo_root:    {}",
@@ -588,8 +740,8 @@ fn state_label(s: &OpenState) -> &'static str {
         OpenState::PathNotDirectory => "PathNotDirectory",
         OpenState::EmptyDirectory => "EmptyDirectory",
         OpenState::DirectoryNotGit => "DirectoryNotGit",
-        OpenState::GitWithoutClank => "GitWithoutClank",
-        OpenState::ClankInitialized => "ClankInitialized",
+        OpenState::ClankInitNeeded => "ClankInitNeeded",
+        OpenState::ClankReady => "ClankReady",
     }
 }
 
@@ -597,7 +749,15 @@ fn rec_label(r: &Recommendation) -> String {
     match r {
         Recommendation::InitDirectory { path } => format!("create directory `{path}`"),
         Recommendation::GitInit { cwd } => format!("git init in `{cwd}`"),
-        Recommendation::ClankInit { cwd } => format!("clank init in `{cwd}`"),
+        Recommendation::ClankInit { cwd, gaps } => {
+            if gaps.is_empty() {
+                format!("clank init in `{cwd}`")
+            } else {
+                format!("clank init in `{cwd}` ({} gap{})",
+                    gaps.len(),
+                    if gaps.len() == 1 { "" } else { "s" })
+            }
+        }
         Recommendation::BindAgent { label, tool } => {
             let l = label.as_deref().unwrap_or("<new>");
             let t = tool.as_deref().unwrap_or("<choose>");
