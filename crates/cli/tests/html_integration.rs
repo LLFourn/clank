@@ -438,6 +438,59 @@ fn html_emits_inline_relative_time_script_and_data_iso_attrs() {
 }
 
 #[test]
+fn html_incremental_refreshes_prior_top_after_fat_slice_pushes_them_out() {
+    // Codex's regression: feedback lands on what was the top
+    // of the prior timeline. The next build adds >10 new
+    // commits, pushing the old top out of the current top-N.
+    // The prior top commit's page must still be refreshed
+    // because it was in the PRIOR top-N when the feedback
+    // landed.
+    let dir = init_repo();
+    let repo = dir.path();
+    write(repo, ".clank/plans/foo.md", "# foo\n");
+    commit(repo, "[foo] intro");
+    let prior_top_sha = head_sha(repo);
+
+    // First build with just the intro.
+    run_clank(repo, &["html"])
+        .status
+        .success()
+        .then_some(())
+        .expect("build 1");
+    let prior_top_page = repo.join(format!(".clank/html/commit/{prior_top_sha}.html"));
+    let initial = std::fs::read_to_string(&prior_top_page).unwrap();
+    assert!(
+        !initial.contains("FINISHED"),
+        "no FINISHED in first-build page"
+    );
+
+    // Feedback on the prior top + 12 new commits.
+    write(
+        repo,
+        &format!(".clank/agents/alice/feedback/{prior_top_sha}.md"),
+        "FINISHED ship it\n",
+    );
+    for i in 0..12 {
+        write(repo, &format!("src/f{i}.rs"), "// x\n");
+        commit(repo, &format!("[foo] revise {i}"));
+    }
+
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+    run_clank(repo, &["html"])
+        .status
+        .success()
+        .then_some(())
+        .expect("build 2");
+
+    let refreshed = std::fs::read_to_string(&prior_top_page).unwrap();
+    assert!(
+        refreshed.contains("FINISHED"),
+        "prior top commit's page must be refreshed even when pushed out of current top-N; len {}",
+        refreshed.len()
+    );
+}
+
+#[test]
 fn html_incremental_same_head_reuses_event_cache_and_preserves_old_pages() {
     // Codex's regression: feedback-only rebuild at the same
     // HEAD must not re-fold the repo. The cached event log
@@ -469,7 +522,11 @@ fn html_incremental_same_head_reuses_event_cache_and_preserves_old_pages() {
     let head_before = head_sha(repo);
 
     // First build.
-    run_clank(repo, &["html"]).status.success().then_some(()).expect("build 1");
+    run_clank(repo, &["html"])
+        .status
+        .success()
+        .then_some(())
+        .expect("build 1");
     let oldest_path = repo.join(format!(".clank/html/commit/{intro_sha}.html"));
     let old_meta = std::fs::metadata(&oldest_path).unwrap();
     let old_mtime = filetime::FileTime::from_last_modification_time(&old_meta);
@@ -483,7 +540,11 @@ fn html_incremental_same_head_reuses_event_cache_and_preserves_old_pages() {
     );
 
     // Rebuild. HEAD is unchanged.
-    run_clank(repo, &["html"]).status.success().then_some(()).expect("build 2");
+    run_clank(repo, &["html"])
+        .status
+        .success()
+        .then_some(())
+        .expect("build 2");
     let head_after = head_sha(repo);
     assert_eq!(head_before, head_after, "HEAD must not have moved");
 

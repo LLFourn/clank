@@ -75,27 +75,36 @@ async fn build_site(
     //    appended to the cached log.
     // 3. Otherwise (cache miss / --rebuild / not an
     //    ancestor): full fold from root.
-    let events: Vec<LogEvent> = match (
-        prior_head.as_deref(),
-        head_sha.as_ref(),
-        read_events_cache(out_dir),
-    ) {
-        (Some(prev), Some(head), Some(prior_events)) if prev == head.as_str() => prior_events,
-        (Some(prev), Some(head), Some(mut prior_events))
-            if prev_is_ancestor(repo, prev, head.as_str()) =>
-        {
-            let prev_sha = clank_core::ids::CommitSha::parse(prev)
-                .map_err(|e| anyhow::anyhow!("parse prior head sha `{prev}`: {e}"))?;
-            let (_state, slice) = crate::rebuild::rebuild_from(repo, Some(&prev_sha), head).await?;
-            prior_events.extend(slice);
-            prior_events
-        }
-        (_, Some(head), _) => {
-            let (_state, events) = crate::rebuild::rebuild_from(repo, None, head).await?;
-            events
-        }
-        _ => Vec::new(),
-    };
+    //
+    // We also retain the PRIOR event list so the top-N
+    // feedback re-check below targets the prior timeline's
+    // top — not the current one. After a slice that adds
+    // more than TOP_N commits, the prior top commits drop
+    // out of the new top-N, but their feedback may still
+    // have changed and we need to refresh those pages.
+    let cached_prior = read_events_cache(out_dir);
+    let (events, prior_events): (Vec<LogEvent>, Option<Vec<LogEvent>>) =
+        match (prior_head.as_deref(), head_sha.as_ref(), cached_prior) {
+            (Some(prev), Some(head), Some(prior_events)) if prev == head.as_str() => {
+                (prior_events.clone(), Some(prior_events))
+            }
+            (Some(prev), Some(head), Some(prior_events))
+                if prev_is_ancestor(repo, prev, head.as_str()) =>
+            {
+                let prev_sha = clank_core::ids::CommitSha::parse(prev)
+                    .map_err(|e| anyhow::anyhow!("parse prior head sha `{prev}`: {e}"))?;
+                let (_state, slice) =
+                    crate::rebuild::rebuild_from(repo, Some(&prev_sha), head).await?;
+                let mut combined = prior_events.clone();
+                combined.extend(slice);
+                (combined, Some(prior_events))
+            }
+            (_, Some(head), _) => {
+                let (_state, events) = crate::rebuild::rebuild_from(repo, None, head).await?;
+                (events, None)
+            }
+            _ => (Vec::new(), None),
+        };
 
     let event_shas: Vec<CommitSha> = events.iter().map(event_sha).cloned().collect();
     let reviews = collect_reviews(repo, &event_shas);
@@ -116,10 +125,14 @@ async fn build_site(
     std::fs::write(out_dir.join("index.html"), index_html)?;
 
     // Per-commit pages: write every commit whose page is
-    // missing on disk + the top-N most-recent events (their
-    // feedback may have updated). Reuse existing files for
-    // everything else.
-    let top_n_sha_set: std::collections::HashSet<String> = events
+    // missing on disk + the top-N most-recent events of the
+    // PRIOR timeline (their feedback may have updated even
+    // if a fat slice has since pushed them out of the
+    // current top-N). On a full rebuild (no prior cache) the
+    // top-N of the current events is used — equivalent to
+    // the prior, since they overlap.
+    let top_n_source: &[LogEvent] = prior_events.as_deref().unwrap_or(&events);
+    let top_n_sha_set: std::collections::HashSet<String> = top_n_source
         .iter()
         .rev()
         .take(TOP_N_FEEDBACK_RECHECK)
