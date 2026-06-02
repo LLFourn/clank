@@ -964,3 +964,147 @@ fn init_gitignore_includes_html_dir() {
         "canonical .clank/.gitignore should include /html/; got:\n{body}"
     );
 }
+
+fn commit_with_body(repo: &Path, subject: &str, body: &str) {
+    git(repo, &["add", "-A"]);
+    git(
+        repo,
+        &["commit", "--quiet", "-m", subject, "-m", body],
+    );
+}
+
+#[test]
+fn html_commit_page_renders_commit_body() {
+    let dir = init_repo();
+    let repo = dir.path();
+    write(repo, ".clank/plans/foo.md", "# foo\n\nbody\n");
+    commit_with_body(
+        repo,
+        "[foo] intro",
+        "First paragraph explains the why.\n\nSecond paragraph continues.",
+    );
+    let sha = head_sha(repo);
+
+    let out = run_clank(repo, &["html"]);
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+
+    let page = std::fs::read_to_string(repo.join(format!(".clank/html/commit/{sha}.html"))).unwrap();
+    assert!(
+        page.contains("<pre class=\"commit-body\">"),
+        "expected commit-body block, got:\n{page}"
+    );
+    assert!(
+        page.contains("First paragraph explains the why."),
+        "body first line missing"
+    );
+    assert!(
+        page.contains("Second paragraph continues."),
+        "body second paragraph missing"
+    );
+}
+
+#[test]
+fn html_commit_page_omits_body_section_for_subject_only_commits() {
+    let dir = init_repo();
+    let repo = dir.path();
+    write(repo, ".clank/plans/foo.md", "# foo\n");
+    commit(repo, "[foo] intro");
+    let sha = head_sha(repo);
+
+    let out = run_clank(repo, &["html"]);
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+
+    let page = std::fs::read_to_string(repo.join(format!(".clank/html/commit/{sha}.html"))).unwrap();
+    assert!(
+        !page.contains("<pre class=\"commit-body\">"),
+        "should not emit commit-body for subject-only commit; got:\n{page}"
+    );
+}
+
+#[test]
+fn html_shas_are_copy_buttons() {
+    let dir = init_repo();
+    let repo = dir.path();
+    write(repo, ".clank/plans/foo.md", "# foo\n");
+    commit(repo, "[foo] intro");
+    let sha = head_sha(repo);
+
+    let out = run_clank(repo, &["html"]);
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+
+    let index = std::fs::read_to_string(repo.join(".clank/html/index.html")).unwrap();
+    assert!(
+        index.contains(&format!(
+            "<button class=\"sha-copy\" type=\"button\" data-sha=\"{sha}\""
+        )),
+        "index timeline row should use sha-copy button; got:\n{index}"
+    );
+    let page = std::fs::read_to_string(repo.join(format!(".clank/html/commit/{sha}.html"))).unwrap();
+    assert!(
+        page.contains(&format!(
+            "<button class=\"sha-copy\" type=\"button\" data-sha=\"{sha}\""
+        )),
+        "commit page header should use sha-copy button; got:\n{page}"
+    );
+}
+
+#[test]
+fn html_inline_script_handles_sha_copy() {
+    let dir = init_repo();
+    let repo = dir.path();
+    write(repo, ".clank/plans/foo.md", "# foo\n");
+    commit(repo, "[foo] intro");
+
+    let out = run_clank(repo, &["html"]);
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+
+    let index = std::fs::read_to_string(repo.join(".clank/html/index.html")).unwrap();
+    assert!(
+        index.contains("document.querySelectorAll('.sha-copy')"),
+        "inline script should attach the sha-copy handler; got:\n{index}"
+    );
+}
+
+#[test]
+fn html_no_js_fallback_keeps_sha_text_visible() {
+    let dir = init_repo();
+    let repo = dir.path();
+    write(repo, ".clank/plans/foo.md", "# foo\n");
+    commit(repo, "[foo] intro");
+    let sha = head_sha(repo);
+    let short = &sha[..7];
+
+    let out = run_clank(repo, &["html"]);
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+
+    let index = std::fs::read_to_string(repo.join(".clank/html/index.html")).unwrap();
+    let needle = format!("title=\"{sha}\">{short}</button>");
+    assert!(
+        index.contains(&needle),
+        "abbreviated SHA must be the button's visible text; needle = {needle}\ngot:\n{index}"
+    );
+}
+
+#[test]
+fn html_timeline_row_does_not_nest_button_inside_anchor() {
+    let dir = init_repo();
+    let repo = dir.path();
+    write(repo, ".clank/plans/foo.md", "# foo\n");
+    commit(repo, "[foo] intro");
+
+    let out = run_clank(repo, &["html"]);
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+
+    let index = std::fs::read_to_string(repo.join(".clank/html/index.html")).unwrap();
+    for row in index.split("<div class=\"row\"").skip(1) {
+        let block = row.split("</div>").next().unwrap_or("");
+        let anchor_idx = block.find("<a class=\"row-link\"");
+        let button_idx = block.find("<button class=\"sha-copy\"");
+        if let (Some(a), Some(b)) = (anchor_idx, button_idx) {
+            assert!(
+                b < a,
+                "<button class=\"sha-copy\"> must precede <a class=\"row-link\"> (sibling, not nested) in row block:\n{block}"
+            );
+        }
+    }
+}

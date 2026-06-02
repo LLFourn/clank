@@ -506,12 +506,13 @@ fn render_row(
     let body = clank_core::repo_state::parse_subject(raw_subject).body;
     let mut out = format!("<div class=\"row\" data-sha=\"{}\">\n", esc(sha.as_str()));
     out.push_str(&format!(
-        "  <a class=\"row-link\" href=\"commit/{}.html\">\n",
-        esc(sha.as_str())
+        "  <button class=\"sha-copy\" type=\"button\" data-sha=\"{full}\" title=\"{full}\">{short}</button>\n",
+        full = esc(sha.as_str()),
+        short = esc(short(sha.as_str()))
     ));
     out.push_str(&format!(
-        "    <code class=\"sha\">{}</code>\n",
-        esc(short(sha.as_str()))
+        "  <a class=\"row-link\" href=\"commit/{}.html\">\n",
+        esc(sha.as_str())
     ));
     out.push_str(&format!(
         "    <span class=\"kind kind-{}\">{}</span>\n",
@@ -582,10 +583,11 @@ fn render_commit_page(
     out.push_str("<header class=\"commit-header\">\n");
     out.push_str("  <p class=\"crumb\"><a href=\"../index.html\">← timeline</a></p>\n");
     out.push_str(&format!(
-        "  <h1><code>{}</code> <span class=\"kind kind-{}\">{}</span></h1>\n",
-        esc(short(sha.as_str())),
+        "  <h1><button class=\"sha-copy\" type=\"button\" data-sha=\"{full}\" title=\"{full}\">{short}</button> <span class=\"kind kind-{}\">{}</span></h1>\n",
         kind,
-        kind
+        kind,
+        full = esc(sha.as_str()),
+        short = esc(short(sha.as_str()))
     ));
     if let Some(p) = plan {
         out.push_str(&format!(
@@ -598,9 +600,16 @@ fn render_commit_page(
         "  <h2 class=\"subject\">{}</h2>\n",
         esc(subject_body)
     ));
+    let body = commit_body(repo, sha);
+    if !body.is_empty() {
+        out.push_str(&format!(
+            "  <pre class=\"commit-body\">{}</pre>\n",
+            esc(&body)
+        ));
+    }
     out.push_str(&format!(
-        "  <p class=\"sha-full\"><code>{}</code></p>\n",
-        esc(sha.as_str())
+        "  <p class=\"sha-full\"><button class=\"sha-copy\" type=\"button\" data-sha=\"{full}\" title=\"{full}\">{full}</button></p>\n",
+        full = esc(sha.as_str())
     ));
     out.push_str("</header>\n");
 
@@ -975,6 +984,22 @@ fn commit_subject(repo: &Path, sha: &CommitSha) -> String {
     String::from_utf8_lossy(&out.stdout).trim().to_string()
 }
 
+/// The commit message body (everything after the subject line
+/// and its trailing blank). Empty when the commit has only a
+/// subject.
+fn commit_body(repo: &Path, sha: &CommitSha) -> String {
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["log", "-1", "--format=%b", sha.as_str()])
+        .output();
+    let Ok(out) = out else { return String::new() };
+    if !out.status.success() {
+        return String::new();
+    }
+    String::from_utf8_lossy(&out.stdout).trim().to_string()
+}
+
 /// Batch-fetch commit subjects via a single `git log` so the
 /// index doesn't shell out per row.
 fn collect_subjects(repo: &Path, head: Option<&CommitSha>) -> BTreeMap<String, String> {
@@ -1118,6 +1143,19 @@ const RELATIVE_TIME_JS: &str = r#"
     n.title = iso;
     n.textContent = rel(iso);
   }
+  document.querySelectorAll('.sha-copy').forEach(function (btn) {
+    btn.addEventListener('click', function (ev) {
+      ev.preventDefault();
+      ev.stopPropagation();
+      var full = btn.getAttribute('data-sha') || btn.textContent;
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(full).then(function () {
+          btn.classList.add('copied');
+          setTimeout(function () { btn.classList.remove('copied'); }, 1000);
+        });
+      }
+    });
+  });
 })();
 "#;
 
@@ -1196,19 +1234,45 @@ h2 { font-size: 1rem; text-transform: uppercase; letter-spacing: .05em; color: v
 .umbrella-header { font: 600 .8rem/1 var(--mono); margin-bottom: .25rem; }
 .umbrella-adhoc > .umbrella-header { color: var(--fg-dim); }
 .adhoc-label { display: inline-block; padding: .15rem .45rem; border-radius: 999px; background: transparent; color: var(--fg-dim); text-transform: lowercase; letter-spacing: .04em; }
-.row { border-top: 1px solid var(--rule); }
-.umbrella > .row:first-of-type { border-top: 0; }
-.row-link {
+.row {
   display: grid;
   grid-template-columns: 5rem 4.5rem 1fr auto auto;
   gap: .6rem;
   align-items: center;
   padding: .3rem .15rem;
   line-height: 1.25;
+  border-top: 1px solid var(--rule);
+}
+.umbrella > .row:first-of-type { border-top: 0; }
+.row:hover { background: var(--pill-bg); }
+.row-link {
+  display: contents;
   text-decoration: none; color: inherit;
 }
-.row-link:hover { background: var(--pill-bg); }
+.row > .sha-copy { justify-self: start; }
 .sha { font: 500 .85rem/1 var(--mono); color: var(--fg-dim); }
+.sha-copy {
+  font: 500 .85rem/1 var(--mono);
+  background: transparent;
+  border: 0;
+  color: var(--fg-dim);
+  padding: .15rem .3rem;
+  border-radius: 3px;
+  cursor: pointer;
+}
+.sha-copy:hover { background: var(--pill-bg); color: var(--fg); }
+.row:hover .sha-copy { color: var(--fg); }
+.sha-copy.copied { color: var(--approve); }
+.sha-copy.copied::after { content: " copied"; font-size: .75em; }
+.commit-body {
+  font: .9rem/1.45 var(--mono);
+  background: var(--pill-bg);
+  padding: .65rem .85rem;
+  border-radius: 4px;
+  margin: .5rem 0;
+  white-space: pre-wrap;
+  overflow-x: auto;
+}
 .kind { font: 600 .75rem/1 var(--mono); text-transform: uppercase; letter-spacing: .04em; color: var(--fg-dim); }
 .kind-finish, .kind-intro { color: var(--finished); }
 .kind-code, .kind-mixed { color: var(--approve); }
