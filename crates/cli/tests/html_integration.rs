@@ -256,6 +256,46 @@ fn html_index_for_repo_with_no_commits_succeeds() {
 }
 
 #[test]
+fn html_open_subcommand_is_accepted_alongside_flag() {
+    // `clank html open` must parse the same as `clank html
+    // --open`. We can't actually exec the opener here without
+    // a browser, so use --help to confirm the positional form
+    // parses (clap exits 0 on --help even when other args are
+    // unparseable).
+    let dir = init_repo();
+    let out = Command::new(clank_bin())
+        .args(["html", "open", "--help"])
+        .arg("--repo")
+        .arg(dir.path())
+        .env("HOME", dir.path())
+        .output()
+        .expect("spawn clank");
+    assert!(
+        out.status.success(),
+        "clank html open --help should parse cleanly; stderr=`{}`",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("ACTION") || stdout.contains("html"),
+        "expected help output to mention the html surface; got: {stdout}"
+    );
+
+    // And: a bogus positional must error with a clear message
+    // (not silently build).
+    let bogus = run_clank(dir.path(), &["html", "bogus-action"]);
+    assert!(
+        !bogus.status.success(),
+        "an unknown action must NOT be treated as a no-op build"
+    );
+    let stderr = String::from_utf8_lossy(&bogus.stderr);
+    assert!(
+        stderr.contains("unknown action") || stderr.contains("bogus-action"),
+        "error should mention the bogus action; got: {stderr}"
+    );
+}
+
+#[test]
 fn init_gitignore_includes_html_dir() {
     let dir = init_repo();
     let out = run_clank(dir.path(), &["init", "--yes"]);

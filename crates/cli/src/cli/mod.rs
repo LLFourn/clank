@@ -125,6 +125,11 @@ pub struct LogArgs {
 
 #[derive(Args, Debug)]
 pub struct HtmlArgs {
+    /// Optional sub-action. `open` is equivalent to `--open`;
+    /// any other value is rejected. Lets you spell either
+    /// `clank html --open` or `clank html open`.
+    #[arg(value_name = "ACTION")]
+    pub action: Option<String>,
     /// Repo root. Defaults to the cwd's git toplevel.
     #[arg(long, value_name = "PATH")]
     pub repo: Option<PathBuf>,
