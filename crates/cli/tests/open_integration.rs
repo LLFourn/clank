@@ -137,6 +137,64 @@ fn git_without_clank() {
 }
 
 #[test]
+fn clank_initialized_without_config_json() {
+    // Regression: `.clank/config.json` is optional now that
+    // master is per-agent. A repo whose `.clank/` is set up
+    // without that file must still classify as
+    // `ClankInitialized`, not `GitWithoutClank`.
+    let home = tempfile::tempdir().unwrap();
+    let dir = init_repo();
+    let repo = dir.path();
+    write(repo, ".clank/plans/.gitkeep", "");
+    git(repo, &["add", "-A"]);
+    git(repo, &["commit", "--quiet", "-m", "seed"]);
+    let v = run_open(repo, home.path());
+    assert_eq!(
+        v["state"], "clank_initialized",
+        "expected clank_initialized without config.json; got {v}"
+    );
+    let kinds = rec_kinds(&v);
+    assert!(
+        !kinds.iter().any(|k| k == "clank_init"),
+        "must NOT recommend clank_init on a clank-initialized repo; got {kinds:?}"
+    );
+}
+
+#[test]
+fn clank_initialized_linked_worktree_without_config_json() {
+    // Pin the original bug: linked worktree, `.clank/` is set
+    // up under the linked tree, no config.json. clank open
+    // against the worktree path must report
+    // `clank_initialized`.
+    let home = tempfile::tempdir().unwrap();
+    let main = init_repo();
+    let main_repo = main.path();
+    write(main_repo, "README.md", "x");
+    git(main_repo, &["add", "-A"]);
+    git(main_repo, &["commit", "--quiet", "-m", "seed"]);
+
+    let wt_parent = tempfile::tempdir().unwrap();
+    let wt_path = wt_parent.path().join("linked");
+    git(
+        main_repo,
+        &[
+            "worktree",
+            "add",
+            wt_path.to_str().unwrap(),
+            "-b",
+            "feature",
+        ],
+    );
+
+    // Set up `.clank/` in the linked worktree only — no config.json.
+    write(&wt_path, ".clank/plans/.gitkeep", "");
+
+    let v = run_open(&wt_path, home.path());
+    assert_eq!(v["state"], "clank_initialized");
+    assert_eq!(v["git"]["is_linked_worktree"], true);
+}
+
+#[test]
 fn clank_initialized_with_master_and_reviewer() {
     let home = tempfile::tempdir().unwrap();
     let dir = init_repo();

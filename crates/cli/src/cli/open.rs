@@ -204,8 +204,12 @@ async fn inspect(requested: &str) -> anyhow::Result<OpenResponse> {
         dirty,
     };
 
-    let clank_config_path = repo_root.join(".clank/config.json");
-    if !clank_config_path.is_file() {
+    // `.clank/` directory is the ClankInitialized marker.
+    // `config.json` became optional once master moved to a
+    // per-agent role claim; gating on it caused false-negatives
+    // for repos whose `.clank/` is fully set up without one.
+    let clank_dir = repo_root.join(".clank");
+    if !clank_dir.is_dir() {
         let cwd = repo_root.to_string_lossy().to_string();
         return Ok(OpenResponse {
             requested_path: requested.to_string(),
