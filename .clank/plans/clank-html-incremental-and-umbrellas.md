@@ -134,6 +134,29 @@ umbrella starts when the plan attribution changes. A single
 plan can spawn multiple umbrellas if interleaved with
 other plans or ad-hoc commits.
 
+### Subject prefix stripping
+
+The umbrella header already says `[foo]`, so the
+`[foo] subject` prefix on each row is pure noise. Strip the
+leading `[<plan>] ` (or `[<a>,<b>] ` for multi-plan tags)
+from the subject text BEFORE rendering. Concretely:
+
+- If the umbrella's plan name is `foo`, a subject of
+  `[foo] intro` renders as `intro`.
+- A subject of `[foo,bar] shared work` rendered inside
+  the `foo` umbrella renders as `shared work` (drop the
+  whole bracketed prefix; the multi-plan attribution is
+  already implicit from the umbrella + the
+  shared-prefix link the per-commit page can carry).
+- A subject that doesn't start with `[…] ` renders
+  verbatim.
+- Subjects rendered OUTSIDE any plan umbrella
+  (`ad-hoc` group) keep the raw subject; nothing to
+  strip.
+
+Apply the same strip on the per-commit page header so the
+`<h2 class="subject">` doesn't repeat `[<plan>]` either.
+
 ### CSS shape
 
 - `.umbrella` is a `<section>` with a left border + soft
@@ -228,6 +251,17 @@ Umbrella:
 - `html_timeline_ad_hoc_umbrella_label` — adopted repo
   with two consecutive ad-hocs; assert one umbrella with
   label "ad-hoc" containing both rows.
+- `html_timeline_strips_plan_prefix_from_subject` — seed
+  commit `[foo] intro`; assert the index row's subject
+  text is `intro` (no `[foo]`) when rendered inside the
+  `foo` umbrella, AND the per-commit page header reads
+  `intro` (not `[foo] intro`).
+- `html_timeline_strips_multi_plan_prefix` — commit
+  `[foo,bar] shared work`; under the `foo` umbrella the
+  subject reads `shared work`.
+- `html_timeline_leaves_non_prefixed_subjects_alone` —
+  ad-hoc commit titled `random fix`; assert the rendered
+  subject is `random fix` (no over-aggressive stripping).
 
 Relative timestamps:
 
