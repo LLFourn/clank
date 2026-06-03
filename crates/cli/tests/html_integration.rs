@@ -1362,3 +1362,155 @@ fn html_plan_page_refreshes_on_feedback_only_rebuild() {
         "plan page should pick up the FINISHED mark after a feedback-only rebuild; got:\n{after}"
     );
 }
+
+/// Replace the builder-version meta tag in an existing index
+/// with a fake value so the next `clank html` sees it as a
+/// stale prior build.
+fn corrupt_builder_version(index_path: &Path) {
+    let body = std::fs::read_to_string(index_path).unwrap();
+    let needle = "name=\"clank:builder-version\" content=\"";
+    let start = body.find(needle).expect("meta tag present");
+    let after = &body[start + needle.len()..];
+    let close = after.find('"').unwrap();
+    let mut patched = String::with_capacity(body.len());
+    patched.push_str(&body[..start + needle.len()]);
+    patched.push_str("old-version");
+    patched.push_str(&after[close..]);
+    std::fs::write(index_path, patched).unwrap();
+}
+
+#[test]
+fn html_version_mismatch_rebuilds_every_commit_page() {
+    let dir = init_repo();
+    let repo = dir.path();
+    write(repo, ".clank/plans/foo.md", "# foo\n");
+    commit(repo, "[foo] intro");
+    let sha1 = head_sha(repo);
+    write(repo, "src/lib.rs", "// x\n");
+    commit(repo, "[foo] impl");
+    let sha2 = head_sha(repo);
+
+    let out = run_clank(repo, &["html"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // Append a sentinel to each commit page so we can detect
+    // when the builder overwrites them.
+    let page1 = repo.join(format!(".clank/html/commit/{sha1}.html"));
+    let page2 = repo.join(format!(".clank/html/commit/{sha2}.html"));
+    for page in [&page1, &page2] {
+        let mut body = std::fs::read_to_string(page).unwrap();
+        body.push_str("<!-- SENTINEL -->");
+        std::fs::write(page, body).unwrap();
+    }
+
+    corrupt_builder_version(&repo.join(".clank/html/index.html"));
+
+    let out = run_clank(repo, &["html"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    for page in [&page1, &page2] {
+        let body = std::fs::read_to_string(page).unwrap();
+        assert!(
+            !body.contains("<!-- SENTINEL -->"),
+            "{page:?} should be rewritten on a stale prior build; sentinel still present"
+        );
+    }
+}
+
+#[test]
+fn html_version_mismatch_rebuilds_every_plan_page() {
+    let dir = init_repo();
+    let repo = dir.path();
+    write(repo, ".clank/plans/foo.md", "# foo\n");
+    commit(repo, "[foo] intro");
+    write(repo, ".clank/plans/bar.md", "# bar\n");
+    commit(repo, "[bar] intro");
+
+    let out = run_clank(repo, &["html"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let foo_page = repo.join(".clank/html/plan/foo.html");
+    let bar_page = repo.join(".clank/html/plan/bar.html");
+    for page in [&foo_page, &bar_page] {
+        let mut body = std::fs::read_to_string(page).unwrap();
+        body.push_str("<!-- SENTINEL -->");
+        std::fs::write(page, body).unwrap();
+    }
+
+    corrupt_builder_version(&repo.join(".clank/html/index.html"));
+
+    let out = run_clank(repo, &["html"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    for page in [&foo_page, &bar_page] {
+        let body = std::fs::read_to_string(page).unwrap();
+        assert!(
+            !body.contains("<!-- SENTINEL -->"),
+            "{page:?} should be rewritten on a stale prior build; sentinel still present"
+        );
+    }
+}
+
+#[test]
+fn html_version_match_preserves_incremental_skip() {
+    // Regression: when the prior index's version matches
+    // ours, an incremental rebuild after a new commit must
+    // NOT rewrite older commit pages that are outside the
+    // top-N refresh window. We use enough buffer commits to
+    // push the original commit past TOP_N_FEEDBACK_RECHECK
+    // (= 10).
+    let dir = init_repo();
+    let repo = dir.path();
+    write(repo, ".clank/plans/foo.md", "# foo\n");
+    commit(repo, "[foo] intro");
+    let pinned = head_sha(repo);
+
+    for i in 0..11 {
+        write(repo, &format!("src/f{i}.rs"), "// x\n");
+        commit(repo, &format!("[foo] impl-{i}"));
+    }
+
+    let out = run_clank(repo, &["html"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let pinned_path = repo.join(format!(".clank/html/commit/{pinned}.html"));
+    let mtime_before =
+        filetime::FileTime::from_last_modification_time(&std::fs::metadata(&pinned_path).unwrap());
+
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+    write(repo, "src/extra.rs", "// y\n");
+    commit(repo, "[foo] impl-extra");
+
+    let out = run_clank(repo, &["html"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let mtime_after =
+        filetime::FileTime::from_last_modification_time(&std::fs::metadata(&pinned_path).unwrap());
+
+    assert_eq!(
+        mtime_before, mtime_after,
+        "pinned older commit page should NOT be rewritten when version matches and it's outside top-N"
+    );
+}

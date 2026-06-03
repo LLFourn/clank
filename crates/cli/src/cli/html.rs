@@ -19,7 +19,11 @@ use clank_core::wait::PlanWorkState;
 use super::{HtmlArgs, HtmlCmd, repo_basename, resolve_repo};
 use crate::cli::status::StatusSnapshot;
 
-const BUILDER_VERSION: &str = "1";
+/// Bump when the rendered markup, CSS, JS, or output
+/// directory layout under `.clank/html/` changes shape. A
+/// bump forces a full rebuild of every per-commit and
+/// per-plan page on the next `clank html` invocation.
+const BUILDER_VERSION: &str = "2";
 const TOP_N_FEEDBACK_RECHECK: usize = 10;
 
 pub async fn run(args: HtmlArgs) -> anyhow::Result<()> {
@@ -40,7 +44,7 @@ async fn build_site(
     repo: &Path,
     basename: &str,
     out_dir: &Path,
-    force_rebuild: bool,
+    mut force_rebuild: bool,
     progress: &Progress,
 ) -> anyhow::Result<()> {
     std::fs::create_dir_all(out_dir)?;
@@ -62,10 +66,22 @@ async fn build_site(
     // prior built head. Requirements: (1) not --rebuild, (2)
     // existing index has a marker, (3) cached event log on
     // disk, (4) prev_head is a strict ancestor of head_sha.
+    //
+    // A stale prior build (version mismatch) is upgraded to
+    // a full rebuild here, so every per-commit and per-plan
+    // page on disk is rewritten under the new builder
+    // version's markup/CSS/JS/layout.
     let prior_head = if force_rebuild {
         None
     } else {
-        read_prior_head(out_dir)
+        match read_prior_build(out_dir) {
+            PriorBuild::Fresh { sha } => Some(sha),
+            PriorBuild::Stale => {
+                force_rebuild = true;
+                None
+            }
+            PriorBuild::None => None,
+        }
     };
     // Three cases for the event log:
     //
@@ -230,16 +246,39 @@ fn write_events_cache(out_dir: &Path, events: &[LogEvent]) -> anyhow::Result<()>
     Ok(())
 }
 
-/// Parse `<meta name="clank:last-built-sha" content="...">`
-/// out of the existing index, returning Some only when the
-/// builder version also matches ours.
-fn read_prior_head(out_dir: &Path) -> Option<String> {
-    let body = std::fs::read_to_string(out_dir.join("index.html")).ok()?;
-    let version = meta_value(&body, "clank:builder-version")?;
+/// What the prior `clank html` build left on disk, from
+/// `build_site`'s point of view.
+enum PriorBuild {
+    /// No prior index.html, or its meta tags are unreadable
+    /// — cold build.
+    None,
+    /// Prior index exists but its builder version doesn't
+    /// match ours. The rendered markup/CSS/JS/layout has
+    /// since changed shape; existing per-commit and per-plan
+    /// pages on disk are stale and must be rewritten.
+    Stale,
+    /// Prior index matches our builder version. `sha` is the
+    /// last-built head — eligible for incremental fold if
+    /// it's an ancestor of the current head.
+    Fresh { sha: String },
+}
+
+/// Inspect `.clank/html/index.html` and classify the prior
+/// build.
+fn read_prior_build(out_dir: &Path) -> PriorBuild {
+    let Ok(body) = std::fs::read_to_string(out_dir.join("index.html")) else {
+        return PriorBuild::None;
+    };
+    let Some(version) = meta_value(&body, "clank:builder-version") else {
+        return PriorBuild::None;
+    };
     if version != BUILDER_VERSION {
-        return None;
+        return PriorBuild::Stale;
     }
-    meta_value(&body, "clank:last-built-sha")
+    match meta_value(&body, "clank:last-built-sha") {
+        Some(sha) => PriorBuild::Fresh { sha },
+        None => PriorBuild::None,
+    }
 }
 
 fn meta_value(html: &str, name: &str) -> Option<String> {
