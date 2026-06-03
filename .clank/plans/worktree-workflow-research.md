@@ -102,16 +102,19 @@ required vs merely convenient.
 The session-fork mechanics were answered while researching F2.
 Summary; full detail is in Cluster F's findings:
 
-| Agent      | Resume | Fork | Resume into new cwd | Notes |
-|------------|--------|------|---------------------|-------|
-| claude code | `--resume <id>` | `--fork-session` | **no** (issues #58591, #28745, #28314, #30906, #42596) | `claude -w` starts a *new* session in a worktree; cannot relocate an existing one |
-| codex CLI   | `codex resume <id>` | `/fork` | **yes** (`--cd <dir>`, plus `--add-dir`) | Sessions stored under `~/.codex/sessions/YYYY/MM/DD/`; `codex resume --all` surfaces sessions from other cwds |
+*Revised after user correction (see F2 revision).*
 
-A1 verdict: fork-into-worktree is **clean for codex, broken for
-claude code**. The clank workflow has to assume the master session
-in a new worktree starts fresh; continuity comes from plan body +
-commits + feedback, which clank already owns. Cluster F's F2
-finding stands.
+| Agent       | Resume          | Fork in place   | Into a claude-managed worktree              | Into an arbitrary cwd                  | Notes |
+|-------------|-----------------|-----------------|---------------------------------------------|----------------------------------------|-------|
+| claude code | `--resume <id>` | `--fork-session` | **yes** via `--resume <id> -w <name>`; compose with `--tmux` for iTerm2-native or classic tmux | **no** for arbitrary user-supplied cwd (issues #58591, #28745, #28314, #30906, #42596) | `--from-pr` for PR-linked resume |
+| codex CLI   | `codex resume <id>` | `/fork`       | n/a (no worktree-managed flag); use `--cd` | **yes** (`--cd <dir>`, `--add-dir`)    | Sessions in `~/.codex/sessions/YYYY/MM/DD/`; `codex resume --all` cross-cwd |
+
+A1 verdict: fork-into-worktree is **clean for both runtimes** as
+long as we go through the *supported* mechanism (claude's `-w`,
+codex's `--cd`). Continuity rides along in both cases. Clank's
+own artifacts (plan body, commits, feedback) remain the
+durable-across-restart source of truth, but we don't have to
+rely on them to compensate for missing session state.
 
 #### A2 — Multi-instance same cwd: actively broken upstream
 
@@ -467,6 +470,7 @@ this whole research plan:
 
 | Tool          | Language | Multiplexer       | Isolation     | Notes                                 |
 |---------------|----------|-------------------|---------------|---------------------------------------|
+| **claude code itself** | TS | **tmux + iTerm2 native panes** (built-in via `--tmux` on `--worktree`) | git worktree | Designed-in worktree flow; informs F5 |
 | claude-squad  | Go       | **tmux** (delegated) | git worktree | Multi-agent, hotkey-switch, sessions  |
 | Conductor     | Swift / macOS | macOS GUI (own) | own workspaces | macOS-only, handles PR/merge, paid    |
 | r3bl_tui PTYMux | Rust   | **own (public lib)** | n/a (lib)   | Documented `core::pty_mux` API, F1–F9 hotkey switch, OffscreenBuffer per tile, 0.7.8 / Jan 2026 |
@@ -494,34 +498,53 @@ construction. Embedding as a plugin host is heavier than driving
 tmux and gives us a comparable result; it's worth tracking but
 not leading with.
 
-#### F2 — Spawn-into-worktree blocked by claude code session limitations
+#### F2 — Spawn-into-worktree is a first-class flow in claude code
 
-This is the **most important and least pleasant finding** in
-Cluster F. The "open a new worktree → fork the active session into
-it → resume" flow runs into a hard constraint:
+*Revised after user correction: I read the issue tracker too
+narrowly and missed the canonical `-w` flag. Verified against
+`claude --help` on the installed CLI (June 2026).*
 
-- **claude code** has `--fork-session` and `--resume <id>` and `-w
-  <worktree>` flags, but **cannot resume a session in a different
-  cwd**. Open issues #58591, #28745, #28314, #30906, #42596 all
-  describe this. `claude -w` starts a *new* session in a worktree;
-  it cannot move an existing session into one.
-- **codex** is materially better: `codex resume <id> --cd <dir>`
-  *does* work; `/fork` exists; `--add-dir` allows cross-project
-  coordination.
+claude code ships **first-class flags for the session-into-
+worktree dance**:
 
-So the asymmetry is:
-- master (claude) sessions can be forked *or* moved to a worktree,
-  but not both at once. Fork lands in original cwd; worktree start
-  is a fresh session.
-- reviewer (codex) sessions can be both forked and relocated.
+- `-w, --worktree [name]` — "Create a new git worktree for this
+  session (optionally specify a name)". Composes with `--resume`
+  and `--fork-session`: `claude --resume <id> -w <name>` lands an
+  existing session inside a fresh worktree; `--fork-session -w
+  <name>` does the same with a fork copy of the conversation.
+- `--tmux` — "Create a tmux session for the worktree (requires
+  --worktree). Uses iTerm2 native panes when available; use
+  --tmux=classic for traditional tmux." So claude code's *own*
+  designers picked tmux (with iTerm2-native-panes promotion) as
+  the multi-window UX for the worktree flow.
+- `--from-pr` — resumes a session linked to a PR by
+  number/URL. Useful for the PR-review use case in Cluster B.
 
-This forces the worktree workflow to **accept that the master
-session in a new worktree is a fresh session, not a fork** (unless
-upstream claude code lands `--cwd` on resume). Conversation
-history doesn't ride along. The continuity must come from the
-plan body + commit log + feedback files — which is exactly the
-clank model. So the constraint hurts less than it looks: clank's
-*existing* artifacts already carry the state that matters.
+The earlier finding (referencing issues #58591, #28745, #28314,
+#30906, #42596) was about a *different* scenario — resuming into
+an arbitrary user-supplied cwd that claude does not own. That
+limitation still holds for "I want to point an existing session
+at any directory on disk", but it does **not** block the worktree
+spawn flow because `-w` is the supported path: claude creates the
+worktree and binds the session to it in one step.
+
+For codex, `codex resume <id> --cd <dir>` already supported the
+arbitrary-cwd case, as previously noted.
+
+Net for the worktree workflow:
+- Master (claude) spawn-into-worktree is **clean** via `claude
+  --resume <id> -w <name>` (or `--fork-session` to branch). Plus
+  `--tmux` gives a multiplexed UX for free, with iTerm2-native
+  panes auto-detected.
+- Reviewer (codex) spawn-into-worktree is **clean** via `codex
+  resume <id> --cd <worktree>`.
+- The "conversation history doesn't ride along" pessimism in the
+  pre-revision finding was wrong. Both runtimes preserve history
+  through their resume mechanisms when targeting a worktree they
+  manage.
+
+This is a strict upgrade to F2 and reshapes the F5 recommendation
+(see below).
 
 #### F3 — Background-activity surfacing (design preview only)
 
@@ -551,11 +574,18 @@ and not unblocked by *either* multiplexer), the recommended path:
   keeps the worktree workflow stable across backends.
 
 - **Backend A — tmux driver (recommended for v1).** Lowest risk.
-  Maturity, ubiquity, and a working precedent (claude-squad) all
-  favour it. Users without a tmux config still get a sensible UX
-  because clank ships the config. Clank shells out to tmux for
-  spawning, switching, and status updates; embeds in emacs via
-  `vterm` / `eat` or runs as a free-standing terminal app.
+  Maturity, ubiquity, *and a working precedent in claude code
+  itself* (the `--tmux` flag on `--worktree`, which auto-prefers
+  iTerm2 native panes) all favour it. Two corollaries the
+  pre-revision recommendation underweighted:
+  1. Clank may not need to ship a tmux config at all for the
+     master tile — `claude --resume <id> -w <name> --tmux` does
+     it natively. Clank wraps the *outer* tmux session and adds
+     reviewer tiles + chrome.
+  2. On macOS+iTerm2 the user gets *native iTerm2 panes* instead
+     of in-terminal tmux UI, for free. The chrome story has to
+     handle both — iTerm2 panes need their indicators set via
+     iTerm2's escape sequences, tmux panes via the status line.
 
 - **Backend B — r3bl_tui::PTYMux driver (recommended as a
   parallel spike, candidate for v2).** Pure-Rust, in-process,
