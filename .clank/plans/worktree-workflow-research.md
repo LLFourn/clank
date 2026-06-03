@@ -452,6 +452,131 @@ spec?
   open --worktree <name>` vs implicit current-worktree
   resolution).
 
+### Findings (master)
+
+#### C1 — Local-only ignores: the cleanest path is "never tracked"
+
+Git's four local-only ignore mechanisms, ranked by fit for the
+"don't push `.clank/` upstream" goal:
+
+| Mechanism                       | Scope                   | Works on tracked files? | Survives `checkout` / `pull`? | Fit for `.clank/`         |
+|---------------------------------|-------------------------|-------------------------|------------------------------|---------------------------|
+| Repo `.gitignore` (committed)   | Repo-wide               | No (untracked only)     | Yes                          | **Best when accepted**    |
+| `.git/info/exclude`             | Per-clone (shared across worktrees) | No (untracked only) | Yes                | Best when repo `.gitignore` is rejected |
+| `core.excludesFile` (global)    | All repos for this user | No (untracked only)     | Yes                          | Useful as a user-wide net |
+| `update-index --skip-worktree`  | Per-file                | Yes                     | Auto-unsets on upstream change | Wrong tool (per-file, fragile)   |
+| `update-index --assume-unchanged` | Per-file              | Yes                     | Errors on branch checkout    | Wrong tool (performance hint, not ignore) |
+
+The two takeaways:
+
+- **`.gitignore` and `.git/info/exclude` only work for untracked
+  files.** Once `.clank/` is committed upstream by anyone, those
+  mechanisms can't help — the path is tracked and the worktree
+  is forced to materialise it. The recovery path is *not* a flag
+  flip; it's a history rewrite.
+- **`skip-worktree` and `assume-unchanged` are not the right
+  tool** even though they sound close. The first auto-unsets on
+  upstream change; the second is documented as a performance
+  hint that errors on branch checkout. Either would fail under
+  normal git operations the user runs every day.
+
+Recommendation:
+
+- **Tier 1 — repo accepts `.clank/` in `.gitignore`**: commit it
+  to the repo's `.gitignore`. Cleanest, no per-user setup.
+- **Tier 2 — repo will NOT carry the ignore entry**: clank
+  `setup` writes `.clank/` into the local clone's
+  `.git/info/exclude`. Per-user, no upstream artifact. Verify the
+  user has never `git add`ed `.clank/` first.
+- **Tier 3 — `.clank/` is already tracked upstream**: a one-shot
+  `clank purge --all --into-branch wipe-clank` rewrites history
+  to remove all `.clank/` paths. The user then pushes that branch
+  and asks maintainers to switch. This is the "rip the bandaid"
+  case.
+
+Note on per-worktree scope: `.git/info/exclude` lives in
+`$GIT_DIR/info/exclude`. For git worktrees, `$GIT_DIR` is shared
+across the main repo and all `worktree add` worktrees (each
+worktree's `.git` file points back to the main repo's
+`.git/worktrees/<name>/`). So `info/exclude` is repo-wide, not
+per-worktree. That's fine for our case — we want `.clank/`
+ignored everywhere — but worth recording.
+
+#### C2 — `clank purge --squash` is the load-bearing PR primitive
+
+`clank purge --help` (read locally) already exposes everything
+the finalize-to-PR flow needs:
+
+- `--squash "<msg>"` collapses the plan-attributed range into a
+  single commit.
+- `--all` strips *every* `.clank/` path (plans, finalize
+  snapshots, queue, the `.clank/.gitignore`).
+- `--into-branch <name>` writes the rewritten chain to a fresh
+  branch instead of touching the current one — strictly safer.
+- `--dry` previews without mutating, `--yes` skips the prompt.
+- `--amend` for amending a HEAD finalize commit in place.
+
+What this means for the PR finalize flow:
+
+```sh
+# in the worktree, after `clank finish`
+clank purge --squash "<plan-title>: <one-line>" \
+            --into-branch pr-<plan-name>
+git push -u origin pr-<plan-name>
+gh pr create --body "$(clank log <plan> --format=pr-body)"
+```
+
+That's three commands. A `clank pr` (proposed in B3) just wraps
+them, with the squash message defaulting to the plan title and
+the body filled from the plan's markdown. No new purge code
+needed — the primitive is already shippable.
+
+Open question for the user: should `clank pr` *always* squash
+`.clank/` out, or should it offer a `--keep-clank` flag for
+users in clank-friendly repos (Tier 1 above)? The default of
+"strip" is the safer surprise.
+
+Open question for the spec: when umbrella plans land in v2
+(B2), the "plan-attributed range" gets ambiguous — do we squash
+per-sub-plan into a stack, or roll them all? Defer until v2;
+flag it here so future planning doesn't miss it.
+
+#### C3 — `clank open` under worktrees: minimum viable spec
+
+Read `clank open --help`: it takes a path, classifies what's at
+that path (no-repo / git-without-clank / clank-initialised), and
+returns structured data. **Read-only, no editor invocation.**
+That design already composes with worktrees without changes —
+a worktree path is just a path, and the editor reads the
+structured result to decide what to do.
+
+So `clank open` itself does not need worktree awareness. What's
+missing is an *enumeration* command for editors that want to
+present a picker:
+
+- `clank worktree list` — return the active worktrees for this
+  clank repo (name, path, branch, current plan, gate state). The
+  editor calls `clank open <picked-path>` after the user picks.
+- The current-worktree resolution is the same as git's: derived
+  from cwd via `git rev-parse --show-toplevel`. No new resolver
+  needed.
+
+For specific editors:
+
+- **emacs** (current user): the `clank open` JSON already feeds
+  the user's existing emacs hook. The new `clank worktree list`
+  command lets emacs present a picker before calling `clank open
+  <path>`. No change to `clank open`'s contract.
+- **VS Code / JetBrains** (windows-per-folder / project-per-
+  window): each worktree opens as its own window. The editor
+  consumes `clank worktree list` for the picker, then opens the
+  picked path natively. clank doesn't need editor-specific code.
+
+C3 verdict: **no change to `clank open` required**. Add a
+sibling `clank worktree list` so editors can present a picker;
+that single command is enough to make the worktree flow
+ergonomic across emacs, VS Code, and JetBrains.
+
 ### Cluster D — Terminal and window orchestration (fallback path)
 
 This cluster is the *fallback* if Cluster F's multiplexer doesn't
