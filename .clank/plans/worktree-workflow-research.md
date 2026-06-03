@@ -638,6 +638,71 @@ contract?
 - Method: design exercise; tie back to A1 (session forking) and A2
   (multi-instance).
 
+### Findings (master)
+
+This cluster largely collapses now that F5 settled on the tmux
+backend (with `claude --tmux` invoking iTerm2 native panes when
+available). The pre-revision D framed itself as "the fallback if
+F1 fails"; F1 didn't fail, so most D questions are no longer
+load-bearing. Recording the residual answers for completeness:
+
+#### D1 — Delegation shape
+
+Subsumed by F5. The chosen model is **clank delegates through
+claude's own multiplexer integration**: `clank queue promote
+--worktree` invokes `claude --resume <id> -w <name> --tmux`,
+which handles the PTY/spawn/tmux/iTerm2 work natively. Clank
+adds the reviewer tile (`codex resume --cd <worktree>` into the
+same tmux session) and the chrome line (F3).
+
+The user's editor (emacs, VS Code, JetBrains) opens the worktree
+path independently via `clank open <worktree-path>`. The agent
+terminals stay inside the tmux session — they're not embedded in
+the editor. This matches claude code's own opinion that the
+terminal is the agent's home.
+
+For emacs users who prefer in-editor terminals, `vterm` or `eat`
+can attach to the clank-managed tmux session (`tmux attach -t
+<session-name>`) inside an emacs buffer. That's a user-side
+configuration, not a clank-side feature.
+
+#### D2 — Agent-pair binding
+
+Subsumed by F5. The binding *is* the tmux session: master and
+reviewer panes live in the same session and switch with the
+hotkey. There is no need for a separate "agent-pair" concept —
+"the panes in this tmux session" is the pair.
+
+The pre-revision design options (single-active-buffer, always-
+paired, focus-follows-gate) become user-side tmux config
+choices, not clank concerns. Recommended default: `claude
+--tmux` opens one window per agent (claude=window 1,
+codex=window 2), user switches with `prefix-1` / `prefix-2`,
+chrome indicates which one wants attention.
+
+#### D3 — Spawn cost and lifecycle
+
+The tmux session itself outlives both the agent terminals and
+`clank wfw`. Concrete contract:
+
+- `clank queue promote --worktree` creates the worktree and the
+  tmux session if they don't exist, then spawns
+  `claude --resume <id> -w <name> --tmux` and `codex resume
+  <reviewer-id> --cd <worktree>` inside it.
+- `clank wfw` re-attaches to the existing tmux session — does
+  not spawn a new one. If the session is missing (user killed
+  it), `clank wfw` exits with an instruction to re-promote or to
+  manually attach.
+- `clank worktree cleanup <name>` (B3) tears down the tmux
+  session, the worktree, and the local branch.
+
+So spawn happens once at promote-time; cleanup happens explicitly
+at merge-time. The middle is the user re-attaching as needed,
+which is the standard tmux story.
+
+D verdict: no fallback path needed. Cluster D is fully subsumed
+by F5's choice. Marking complete.
+
 ### Cluster E — Strategic
 
 E1. **Critical assessment.** Honestly, does clank serve a purpose
@@ -879,18 +944,67 @@ Net for the worktree workflow:
 This is a strict upgrade to F2 and reshapes the F5 recommendation
 (see below).
 
-#### F3 — Background-activity surfacing (design preview only)
+#### F3 — Background-activity surfacing
 
-Not full Findings yet — flagging the design direction:
+Now that F5 settled on tmux-as-the-multiplexer (with iTerm2
+native panes when available), F3 reduces to a concrete spec
+against two well-documented surfaces:
 
-- chrome bar carrying `<agent> <role> <gate-state> <activity-mark>`
-  per tile. Activity mark = `*` for new output since last view,
-  `!` for stop-hook fire (clank already emits stop-hook signal).
-- when delegated to tmux, this becomes a status-line config we
-  ship plus a clank subcommand (`clank chrome` or similar) that
-  emits the per-pane chrome line tmux can poll.
-- the indicator is *cheap* to add in either delegated-tmux or
-  native-mux worlds. Not load-bearing on the F1-vs-F5 choice.
+**On tmux panes:**
+
+- `pane-border-status top|bottom` enables a per-pane border
+  caption; `pane-border-format` is the format string. Available
+  since tmux 2.3 (border-format) / 2.6 (per-pane titles).
+- `set -g monitor-activity on` plus
+  `set -g visual-activity on/off` gives a visual flag on any
+  inactive pane that produces output. Cheap activity indicator
+  with no clank-side polling.
+- Clank populates the per-pane chrome by sending OSC 0/2 title
+  updates from inside the pane (the clank session-bound shell
+  does this), then `pane-border-format` interpolates the title.
+
+**On iTerm2 native panes** (which `claude --tmux` prefers when
+available — F2):
+
+- Per-session user variables via the proprietary escape
+  `OSC 1337 ; SetUserVar=name=<base64-value> ST`. Surface them in
+  the session title, tab title, or badge.
+- Badge is the most visible: top-right text overlay on the
+  session, configurable via `OSC 1337 ; SetBadgeFormat=...`. We
+  can drop role + gate state there; users see it without
+  switching panes.
+- iTerm2 also has a "new output" indicator on inactive sessions
+  for free, analogous to tmux's `monitor-activity`.
+
+**Chrome contract.** Each clank-bound shell emits, after every
+stop-hook fire or gate-state change:
+
+```
+agent=<label>  role=<master|reviewer>  plan=<stem>  gate=<state>
+```
+
+formatted into both:
+- tmux's `pane-border-format` (via OSC title sequence)
+- iTerm2's user variables (via `iterm2_set_user_var clank.gate
+  <state>` etc., then a badge format like `[%(user.clank.role)]
+  %(user.clank.gate)`)
+
+This is a single "emit chrome line" hook in the clank shell, not
+two separate code paths — the shell just writes both escape
+sequences and lets whichever terminal is reading honour what it
+understands. tmux ignores iTerm2's `OSC 1337`; iTerm2's tmux
+integration mode passes through pane titles.
+
+**Activity vs gate-flip:** the design separates
+- activity (any output) — handled by tmux/iTerm2 for free, no
+  clank code needed.
+- gate-flip (master→reviewer transition, REQUEST_CHANGES posted,
+  etc.) — handled by clank emitting the chrome line on the
+  inactive pane via the same shell-side hook above.
+
+F3 verdict: cheap, no new clank infrastructure, no polling, lean
+on the terminal's existing primitives. The single new piece is a
+"clank chrome" shell-side emitter that writes the OSC sequences.
 
 #### F5 — Recommended choice: two viable backends, ship behind a trait
 
