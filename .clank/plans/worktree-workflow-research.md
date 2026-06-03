@@ -263,7 +263,160 @@ around.
 - Method: write two concrete day-in-the-life scripts; identify the
   commands clank would need to expose.
 
-### Cluster C — Repo and filesystem hygiene
+### Findings (master)
+
+#### B1 — Plan-in-main, impl-in-worktree (with one important caveat)
+
+Stubs and the queue live in main. Promotion either stays in main
+(solo mode, no worktree) or runs into a worktree (multi-worktree
+mode). The natural lifecycle:
+
+```
+stubs/  (main)        →  user authors stubs from any session
+queue/  (main)        →  `clank queue add` orders & priorities
+plans/  (main or wt)  →  `clank queue promote` activates
+                          • solo: in main, no worktree
+                          • multi-wt: in the worktree
+finished/ (main)      →  `clank finish` always re-lands here so
+                          main has the merged history of plans
+```
+
+The **caveat**: clank's plan-state files (the markdown body, the
+finished/ dir) need to be on a branch the user wants to merge.
+In multi-worktree mode the plan body is *born* in the worktree
+and rides into main through the same PR as the code changes —
+unless we squash it out via `clank purge --squash` (Cluster C).
+The two policies — "keep `.clank/` in the merged history" vs
+"squash it out before opening the PR" — are user-configurable
+not architecturally fixed; Cluster C explores the trade-off.
+
+Implication for B1: clank's worktree spawn does *not* need to
+move plan files around. The plan is created in the worktree from
+the promoted stub; `clank finish` in the worktree writes to the
+worktree's `.clank/finished/`; on merge the file lands in main's
+`.clank/finished/` (or doesn't, if the policy is squash-out).
+
+#### B2 — Plan ↔ PR cardinality: 1:1 with deferred stacked-PR support
+
+The 2026 stacked-PR landscape is now serious:
+
+- **Graphite** (AI-augmented review, stack-aware merge queue,
+  free CLI) is the commercial lead.
+- **git-spice** is the open-source stacked-branches tool.
+- **jj-spice** wraps jj users into the same workflow.
+- **GitHub itself** shipped `gh stack` on 2026-04-13 (private
+  preview, waitlist at `gh.io/stacksbeta`).
+- The pattern documented across multiple 2026 write-ups: AI
+  agent writes the code, then *stacks* it into reviewable PRs
+  for a human (or another agent) to review.
+
+Two clank cardinalities are credible:
+
+- **v1 default — 1 plan = 1 PR**: simplest, matches the
+  "worktree-per-PR" framing, and is what every prior-art article
+  describes for claude code's existing `-w` flow. Each
+  finalized plan becomes a PR.
+- **v2 optional — umbrella plan = stacked PR set**: clank
+  already has umbrella-grouping logic in the HTML render. A
+  later plan can extend this to "umbrella finalize → stacked
+  PRs", driven by `gh stack` (once GA) or `git-spice`. v1
+  should not foreclose this — the worktree-and-finalize
+  primitives need to be able to chain.
+
+Recommendation: ship 1:1 in v1. Don't build umbrella→stack
+until either GitHub ships `gh stack` GA or a user need actually
+shows up; until then it's premature complexity. Watch the
+landscape for 6–12 months.
+
+#### B3 — Flagship workflow: worktree-per-PR with solo as a degenerate case
+
+The two modes from the brief are not separate workflows — they
+are the same workflow with the worktree count varied. Stating
+them as one workflow simplifies the CLI surface and the mental
+model:
+
+- **solo mode** = the workflow run in the user's main cwd, no
+  worktree ever spawned. Useful when the user wants one task at
+  a time and doesn't care about parallel work.
+- **multi-worktree mode** = the same workflow, but each plan
+  promotion spawns a worktree.
+
+A2's two-claude finding lands as a soft push, not a hard rule:
+*if* the user wants parallel masters or wants to hand-drive
+claude in main alongside clank's claude, they need
+multi-worktree. Otherwise solo is fine.
+
+##### Day in the life — solo mode
+
+```sh
+# user already has a clank-bound claude session running in cwd
+clank queue add my-feature -m "..."     # stub → queue
+clank queue promote my-feature          # active plan in this cwd
+# (claude master commits, codex reviews via stop hook, iterate)
+clank finish my-feature                 # finished/, ready to PR
+gh pr create                            # or `clank pr` later
+```
+
+No new commands needed. This is mostly what works today.
+
+##### Day in the life — multi-worktree mode
+
+```sh
+# user is in main repo; clank's claude master and codex reviewer
+# are running here for any in-main work
+clank queue add my-feature -m "..."
+clank queue promote my-feature --worktree   # NEW: spawns wt
+# clank runs internally:
+#   claude --resume <master-id> -w my-feature --tmux
+#   codex resume <reviewer-id> --cd <worktree>/
+#   (export CLAUDE_CONFIG_DIR / CODEX_HOME per A2)
+# user's terminal switches into the new worktree's tmux session
+# (master tile focused; reviewer tile in background per F3 chrome)
+# ... iterate ...
+clank finish my-feature                 # in the worktree
+clank pr                                # NEW: opens the PR
+# after merge:
+clank worktree cleanup my-feature       # NEW: prune worktree+branch
+```
+
+New surface introduced by multi-worktree mode:
+
+- `clank queue promote --worktree` — promotes into a fresh
+  worktree (uses `claude --resume -w` under the hood).
+- `clank pr` — convenience over `gh pr create` that fills the
+  body from the plan markdown. Optional; the user can keep
+  using `gh` directly.
+- `clank worktree cleanup` — prune the worktree post-merge.
+- A `MuxBackend` (Cluster F) wires the new tmux/iTerm2 panes
+  into the user's terminal session.
+
+What clank does *automatically* in multi-wt mode:
+
+- Creates the worktree via claude's own `-w` flag (not custom
+  git plumbing).
+- Sets per-worktree `CLAUDE_CONFIG_DIR` and `CODEX_HOME` (A2's
+  runtime-state isolation).
+- Spawns the reviewer (codex) inside the same worktree with
+  `codex resume <id> --cd`.
+- Composes the mux chrome line with role + gate state per tile
+  (F3).
+- On `clank pr`, fills the PR body from the plan markdown and
+  optionally squashes `.clank/` out (Cluster C policy).
+
+Where the editor lives: in multi-wt mode the canonical UX is
+"clank owns the terminal session, the editor follows". The
+editor opens the worktree path (via `clank open --worktree
+<name>`); the agent terminals stay inside the clank-managed
+tmux/iTerm2 panes. Cluster D (now mostly collapsed) covers the
+fallback if the user's editor can't follow.
+
+##### Recommendation
+
+**Flagship = the unified workflow above.** Ship solo and
+multi-wt as the same code path with `--worktree` as the toggle.
+The user's day-to-day choice is "do I want to keep working in
+main, or do I want to fork to a worktree for this plan?", not
+"which clank mode am I in today".
 
 How does clank coexist with a repo whose maintainers won't accept
 `.clank/` upstream?
