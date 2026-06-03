@@ -285,6 +285,136 @@ swap implementations without re-shipping plans.
   TUI; confirm clank's user-facing commands look the same under
   both.
 
+### Findings (master)
+
+#### F1 — PTY multiplexing in Rust is tractable but expensive
+
+Building a native multiplexer is **technically possible**:
+
+- `portable-pty` (the cross-platform PTY crate `wezterm` ships)
+  plus `vt100` or `alacritty_terminal` for parsing the hidden
+  tiles' screen state, plus `crossterm`/`ratatui` for chrome and
+  raw mode, is the proven recipe. Working open-source examples
+  exist: `term39`, `croft` (VSCode-style TUI), `wtmux`, `psmux`.
+- `r3bl_tui` v0.7.7+ ships an *internal* "Terminal Multiplexer
+  with VT-100 ANSI Parsing" module, but the public API is not
+  stable yet — the doc coverage is ~62% and there's no documented
+  embed surface. We can't shortcut F1 by depending on r3bl_tui;
+  we'd be building on `portable-pty` directly.
+
+Engineering reality: every working example above is *itself* a
+sizeable Rust project (thousands of lines). The ANSI/VT
+escape-sequence surface is large; "good enough that claude code
+and codex render correctly in the hidden tile" is more work than
+"draws ASCII". Estimate **weeks of focused work** to ship
+something that doesn't visually corrupt under the agent CLIs we
+care about, plus an ongoing maintenance cost as those CLIs evolve
+their rendering.
+
+Verdict on F1 alone: feasible, but not cheap.
+
+#### F4 — Prior art makes the call obvious: delegate to tmux
+
+The closest existing tool is **claude-squad** (smtg-ai), and its
+architectural choice is the single most informative data point in
+this whole research plan:
+
+| Tool          | Language | Multiplexer       | Isolation     | Notes                                 |
+|---------------|----------|-------------------|---------------|---------------------------------------|
+| claude-squad  | Go       | **tmux** (delegated) | git worktree | Multi-agent, hotkey-switch, sessions  |
+| Conductor     | Swift / macOS | macOS GUI (own) | own workspaces | macOS-only, handles PR/merge, paid    |
+| r3bl_tui      | Rust     | own (internal)    | n/a (lib)     | Library, no stable public mux API     |
+| zellij        | Rust     | own               | n/a (mux)     | WASM plugin system; community is building claude-code plugins for zellij |
+| Shipyard etc. | varies   | varies            | varies        | 6+ orchestrators surveyed for 2026    |
+
+The single most relevant fact: **claude-squad faced almost exactly
+our problem statement and chose to delegate to tmux instead of
+building a multiplexer**. They got hotkey switching, session
+isolation, parallel agent execution, and worktree binding without
+writing their own PTY/VT code. The Go vs Rust difference doesn't
+change the trade-off.
+
+Zellij is the other credible host: it's Rust, embeds a WASM plugin
+runtime, and at least one community project is already building
+claude-code orchestration as a zellij plugin. Embedding as a
+*plugin host* is heavier than driving tmux, but lighter than
+rolling our own multiplexer and gives us layout/session features
+for free.
+
+#### F2 — Spawn-into-worktree blocked by claude code session limitations
+
+This is the **most important and least pleasant finding** in
+Cluster F. The "open a new worktree → fork the active session into
+it → resume" flow runs into a hard constraint:
+
+- **claude code** has `--fork-session` and `--resume <id>` and `-w
+  <worktree>` flags, but **cannot resume a session in a different
+  cwd**. Open issues #58591, #28745, #28314, #30906, #42596 all
+  describe this. `claude -w` starts a *new* session in a worktree;
+  it cannot move an existing session into one.
+- **codex** is materially better: `codex resume <id> --cd <dir>`
+  *does* work; `/fork` exists; `--add-dir` allows cross-project
+  coordination.
+
+So the asymmetry is:
+- master (claude) sessions can be forked *or* moved to a worktree,
+  but not both at once. Fork lands in original cwd; worktree start
+  is a fresh session.
+- reviewer (codex) sessions can be both forked and relocated.
+
+This forces the worktree workflow to **accept that the master
+session in a new worktree is a fresh session, not a fork** (unless
+upstream claude code lands `--cwd` on resume). Conversation
+history doesn't ride along. The continuity must come from the
+plan body + commit log + feedback files — which is exactly the
+clank model. So the constraint hurts less than it looks: clank's
+*existing* artifacts already carry the state that matters.
+
+#### F3 — Background-activity surfacing (design preview only)
+
+Not full Findings yet — flagging the design direction:
+
+- chrome bar carrying `<agent> <role> <gate-state> <activity-mark>`
+  per tile. Activity mark = `*` for new output since last view,
+  `!` for stop-hook fire (clank already emits stop-hook signal).
+- when delegated to tmux, this becomes a status-line config we
+  ship plus a clank subcommand (`clank chrome` or similar) that
+  emits the per-pane chrome line tmux can poll.
+- the indicator is *cheap* to add in either delegated-tmux or
+  native-mux worlds. Not load-bearing on the F1-vs-F5 choice.
+
+#### F5 — Recommended choice: ship the F5 path as the default
+
+Given F1 (feasible-but-weeks), F4 (claude-squad already solved
+this with delegation), and F2 (the worktree session-fork story is
+already constrained by upstream and won't be unblocked by a
+native multiplexer), the recommended path is:
+
+- **Default and shipped:** clank drives **tmux** as the
+  multiplexer. Clank owns the session model, the worktree binding,
+  the chrome line, and the agent-spawn commands. tmux handles the
+  PTYs, the input forwarding, the hotkey switching, and the
+  always-alive hidden tiles.
+- **Optional and later:** consider zellij as an alternate backend
+  via its plugin system if and when there's a concrete user need
+  the tmux path can't serve.
+- **Not recommended:** rolling our own PTY/VT multiplexer.
+  claude-squad — a project with the same scope as us, more
+  engineering hours, and a year head start — chose not to. There
+  is no evidence we'd do better with less.
+
+This is a *reframe* of what the user asked: clank still spawns the
+TUI, still hands the user a hotkey, still keeps the inactive
+agents alive, still ties one terminal to one worktree. The only
+difference is the multiplexing engine is tmux, not custom Rust
+code. From the user's seat in emacs, the experience can be
+identical.
+
+The remaining open question is the emacs binding: does the user
+want a *tmux session embedded in emacs* (via `vterm` / `eat`), or
+do they want emacs to call out to a real terminal app holding the
+tmux session? That decision feeds Cluster D.
+
 ## Deliverable
 
 This plan body, FINISHED. Each cluster gets a `### Findings`
