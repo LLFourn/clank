@@ -766,7 +766,11 @@ clank's peer-review loop produces:
 Clank should stop short of competing with the orchestrator
 landscape. Specifically:
 
-1. **Don't build a multiplexer.** Already settled in F5.
+1. **Don't build a bespoke PTY/VT multiplexer.** Delegate to
+   tmux (via `claude --tmux`) for v1; keep r3bl_tui::PTYMux as
+   a spike behind a `MuxBackend` trait. The trait is a thin
+   abstraction *over existing libraries*, not custom PTY/VT
+   code. Already settled in F5.
 2. **Don't build a queue scheduler.** The existing priority
    queue is fine for ordering; resist features that turn it
    into a job runner.
@@ -1208,27 +1212,40 @@ user before any implementation stub is promoted.
 
 ### 1. F verdict
 
-**Native multiplexer is feasible.** `r3bl_tui::core::pty_mux`
-exposes a public `PTYMux` + `Process` API with F1–F9 hotkey
-switch, per-process OffscreenBuffer, and an in-docs example that
-maps almost verbatim to `claude` + `codex` invocations. F1 is
-settled in our favour — the *library* path is cheap. Building
-from `portable-pty` primitives is no longer on the table.
+**No bespoke PTY/VT multiplexer.** This is the *shape* of the F
+verdict, and it matches E1's "narrow inward" recommendation
+exactly. Clank does not write its own PTY layer, its own VT
+parser, or its own raw-mode renderer. Whichever backend clank
+runs against is one *we already get for free* from an existing
+library (r3bl_tui) or external process (tmux). The `MuxBackend`
+trait introduced in F5 is a thin abstraction *over those
+libraries*, not custom code.
+
+**Native (in-process) backend is feasible.**
+`r3bl_tui::core::pty_mux` exposes a public `PTYMux` + `Process`
+API with F1–F9 hotkey switch, per-process OffscreenBuffer, and
+an in-docs example that maps almost verbatim to `claude` +
+`codex` invocations. F1 is settled in our favour — the
+*library* path is cheap. Building from `portable-pty`
+primitives is off the table.
 
 **v1 backend recommendation: tmux, via claude code's own
 integration.** `claude --resume <id> -w <name> --tmux` already
 creates the worktree, opens the tmux session, and prefers iTerm2
 native panes when available. clank wraps this by adding the
 reviewer tile (`codex resume --cd <worktree>` in the same
-session) and the chrome line (F3).
+session) and the chrome line (F3). Tmux dependency caveat: v1
+*requires tmux on the user's PATH*. The implementation has to
+ship presence detection and a clear "install tmux" path; see
+§3 for the stub and §4 for the user-policy question.
 
 **v2 candidate: r3bl_tui::PTYMux native backend.** A short spike
 hosting `claude` + `codex` inside `PTYMux`'s OffscreenBuffer
 will tell us whether the rendering holds up. If it does,
 `r3bl_tui::PTYMux` becomes the v2 default; tmux remains a
 configurable backend for users who want shared sessions across
-non-clank workflows. The `MuxBackend` trait defined in F5 is the
-abstraction that keeps both paths shippable.
+non-clank workflows. Either backend lives behind `MuxBackend`,
+so the choice is configurable not architectural.
 
 ### 2. Recommended flagship workflow
 
@@ -1284,11 +1301,21 @@ finishes:
   `clank init --local-ignore`) to write `.clank/` into
   `$GIT_COMMON_DIR/info/exclude` for repos that won't carry the
   ignore upstream.
+- **`tmux-presence-detection`** — `clank doctor` learns to flag
+  missing `tmux` for users opting into `--worktree`. The CLI
+  refuses `clank queue promote --worktree` with a clear "install
+  tmux: brew install tmux / apt install tmux / ..." message
+  when `tmux` is absent from `PATH`. Real concern: this very
+  research environment does not have `tmux` installed (verified
+  by `which tmux` returning 127), so the assumption "every clank
+  user has tmux" is false out of the gate. Whether clank should
+  *install* tmux itself or only *detect+document* is a §4
+  question.
 
-The order matters: `worktree-spawn-and-env` and `muxbackend-
-trait-and-tmux-driver` are the foundation; the spike, the PR
-wrapper, the list command, and the local-ignore setup can land
-in parallel after them.
+The order matters: `worktree-spawn-and-env`, `muxbackend-trait-
+and-tmux-driver`, and `tmux-presence-detection` are the
+foundation; the spike, the PR wrapper, the list command, and
+the local-ignore setup can land in parallel after them.
 
 ### 4. Open questions back to the user
 
@@ -1306,6 +1333,13 @@ above get promoted:
   *always* squash `.clank/` out of the PR branch (Tier 1
   default), or offer `--keep-clank` for clank-friendly repos
   with the safer default being strip?
+- **tmux installation policy.** v1's multi-worktree mode
+  requires `tmux` on `PATH`. This research env doesn't have it.
+  Should clank: (a) detect and refuse with a "please install
+  tmux" message, (b) attempt to install via the user's package
+  manager when missing, or (c) ship an embedded tmux build?
+  Recommendation is (a) for v1 — fewest surprises — but the
+  user picks.
 - **Editor binding scope.** Recommendation in D1 is that clank
   delegates to `clank open` / `clank worktree list` and the
   editor follows. Confirm: do you want a clank-side emacs
