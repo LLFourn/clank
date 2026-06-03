@@ -116,49 +116,64 @@ own artifacts (plan body, commits, feedback) remain the
 durable-across-restart source of truth, but we don't have to
 rely on them to compensate for missing session state.
 
-#### A2 — Multi-instance same cwd: actively broken upstream
+#### A2 — Multi-instance same cwd: two orthogonal isolation problems
 
-Two claude code processes pointed at the same working directory
-are **not safe today** (June 2026). The failure is a real runtime
-constraint, not just an editor cosmetic issue:
+*Revised after codex review (REQUEST_CHANGES on d4b8c36) and
+on-disk verification.*
 
-- `~/.claude.json` (global config) is corrupted by concurrent
-  writes — invalid JSON across instances (issue #28992).
-- Lock acquisition fails at `~/.local/share/claude/versions/<v>/`
-  with logged `Lock acquisition failed for ...` warnings (issue
-  #13287).
-- Stale lock files at `~/.local/state/claude/locks/` persist
-  across reboots with no automatic cleanup (issue #14301).
-- Shell-state corruption: concurrent instances share a snapshot
-  directory keyed by cwd hash, race on writes, and surface as
-  `bash: …: No such file or directory` mid-tool-call (issue
-  #4014).
-- Outright regression in 2.0.61: "if two Claude Code instances
-  are loaded, they can no longer operate in parallel — when one
-  runs, the other one stops and no more messages can be received"
-  (issue #13499).
-- There is an open feature request to add a session lock file
-  (#19364) — i.e. upstream has not committed to fixing this
-  structurally yet.
+Two claude code processes against the same `~/.claude/` *and* the
+same cwd hit two distinct classes of failure. Conflating them was
+the bug in the pre-revision finding. Listing them separately:
 
-**Workaround that does help:** set `CLAUDE_CONFIG_DIR` per
-instance so each claude has its own ~/.claude root. This sidesteps
-the global-config-corruption case directly. It does **not** fix
-the shell-snapshot-by-cwd-hash case because that key is derived
-from cwd, not config root — so even with separate config dirs,
-two claudes in the same cwd still race on shell-snapshot files.
+**Runtime-state collisions** — caused by sharing `~/.claude/`,
+not by sharing cwd:
 
-**Workaround that fully helps:** distinct cwds — i.e. git
-worktrees. This is what every observed orchestrator does:
-claude-squad (per-session worktree), Conductor (per-workspace
-isolated copy), the community claude-pool daemon (managed pool,
-distinct worktrees).
+- `~/.claude.json` global config corrupted by concurrent writes
+  (issue #28992).
+- Lock acquisition at `~/.local/share/claude/versions/<v>/`
+  failing across instances (issue #13287); stale lock files at
+  `~/.local/state/claude/locks/` (issue #14301).
+- Shell-snapshot race: snapshots live at
+  `~/.claude/shell-snapshots/snapshot-<shell>-<TIMESTAMP>-<NONCE>.sh`.
+  Verified on disk in this session. The naming is **timestamp +
+  nonce**, *not* cwd-derived (correcting the pre-revision
+  claim). The race is that instance B's periodic cleanup pass
+  sees instance A's snapshots in the same shared directory and
+  deletes them as "old", after which instance A tries to source
+  a now-missing file (issue #4014; the issue itself recommends
+  per-process state dirs as the fix).
+- 2.0.61 regression: two instances loaded simultaneously can no
+  longer operate in parallel — one freezes (issue #13499).
+- Open RFE #19364 for a structural session-lock fix.
 
-A2 verdict: **worktrees are required**, not optional, the moment
-clank wants two claude masters live at once. They are also the
-right answer for "user is hand-driving claude in main while
-clank's claude is also doing work" — without a worktree those
-two claudes will fight at the runtime layer.
+**Edit collisions** — caused by sharing cwd:
+
+- Both claudes have the same files in their editing surface;
+  concurrent `Edit` calls or one-edit-one-read can interleave
+  unpredictably.
+- One agent's `git rebase -i` blocks the other's `git status`
+  view; reentrancy on user-interactive git ops is undefined.
+- Hooks (post-commit, post-rewrite, etc.) fire twice and may
+  fight or interleave their side effects.
+
+The two classes are **orthogonal**. The right tool for each:
+
+| Isolation goal           | Tool                       | Why                                                                                   |
+|--------------------------|----------------------------|---------------------------------------------------------------------------------------|
+| Runtime state            | `CLAUDE_CONFIG_DIR` per instance | Per docs, relocates *every* `~/.claude` path including shell-snapshots, locks, sessions, config; instance B's cleanup can't see instance A's files because they live in a different root |
+| Filesystem / edit state  | git worktree per instance  | Distinct working trees so concurrent edits don't trample; distinct git index per worktree |
+| Both                     | Both, together             | Required for full safety. CLAUDE_CONFIG_DIR alone leaves edit collisions; worktree alone leaves runtime-state collisions |
+
+A2 verdict (revised): both isolations are needed for the
+two-claude case, but **for different reasons** and each fixes
+its own class of problem. The pre-revision claim that "cwd alone
+fixes snapshot races" was wrong: cwd has no bearing on the
+snapshot naming. The correct prescription is *per-worktree
+CLAUDE_CONFIG_DIR + per-worktree cwd*, which the spawn command
+already had to do anyway. Cluster F2's `claude --resume <id> -w
+<name>` flow handles the cwd half cleanly; clank's spawn
+command needs to also export `CLAUDE_CONFIG_DIR=$WORKTREE/.clank/claude-config`
+(or similar) before invoking claude.
 
 #### A3 — Cross-agent review on shared cwd: workable, with rules
 
@@ -183,25 +198,38 @@ touch codex's `~/.codex/` tree:
   right now".
 
 A3 verdict: **codex-reviewing-claude in the same cwd is the
-default case clank already runs today and works**. Pushing it
-into a worktree is convenient (matches A2), not load-bearing.
-Two-claude is the case worktrees are *required* for.
+default case clank already runs today and works**. Codex and
+claude don't share `~/.claude/` (codex uses `~/.codex/`), so the
+runtime-state collisions in A2 don't apply across runtimes. The
+remaining shared-cwd risks are pure edit collisions, which
+read-only-sandbox codex avoids by construction.
+
+Pushing the mixed case into a worktree is convenient, not
+load-bearing. The two-claude case (or two-codex, by analogy with
+codex's own `~/.codex/` state) is the case worktrees are
+*required* for — and even there, only for the edit-isolation
+half. The runtime-state half is fixed by `CLAUDE_CONFIG_DIR` /
+`CODEX_HOME` per instance, which is cheaper than a worktree.
 
 #### Implications for the workflow
 
-- The flagship worktree workflow has to assume each worktree gets
-  its own `CLAUDE_CONFIG_DIR` *and* its own cwd. Both are needed:
-  cwd alone fixes the snapshot races; config dir alone fixes the
-  global-config corruption.
-- A "worktree spawn" command should export
-  `CLAUDE_CONFIG_DIR=$WORKTREE/.clank/claude-config` (or a
-  similar per-worktree path) into the master's environment
-  before `claude` launches. Codex needs the analogous
-  `CODEX_HOME` set per worktree.
-- Plan-in-main, impl-in-worktree (B1) is unavoidable for any
+- A spawn command for a new worktree exports
+  `CLAUDE_CONFIG_DIR=$WORKTREE/.clank/claude-config` and
+  `CODEX_HOME=$WORKTREE/.clank/codex-home` (or similar) before
+  invoking the agent. This is the **runtime-state** half. It is
+  cheap (just env vars) and removes the upstream lock/cleanup
+  races without needing a worktree.
+- The worktree itself is the **filesystem-state** half — the
+  cwd that `claude --resume <id> -w <name>` sets up.
+- Plan-in-main, impl-in-worktree (B1) remains unavoidable for any
   flow where the user already has a claude master running in
-  main. That same constraint pushes B3 toward worktree-per-PR
-  as the flagship mode.
+  main, *but the reason is the edit half, not the runtime-state
+  half*. The runtime-state half could be handled with per-session
+  `CLAUDE_CONFIG_DIR` even inside one cwd — useful to know for
+  cheaper "two reviewers, one tree" cases later.
+- B3's flagship is still pushed toward worktree-per-PR, but the
+  pressure is now correctly attributed to "two masters cannot
+  share an edit surface", not to a debunked snapshot-race claim.
 
 ### Cluster B — Workflow shape
 
