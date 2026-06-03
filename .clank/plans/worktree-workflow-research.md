@@ -712,6 +712,94 @@ model give a unique edge, and where is it reinventing a wheel?
 - Method: write a one-page positioning memo. Be willing to
   conclude clank should narrow its scope.
 
+### Findings (master)
+
+#### E1 — Clank's reason to exist is the gate, not the orchestration
+
+**Where clank is unique.** None of the surveyed tools have what
+clank's peer-review loop produces:
+
+- **A typed verdict state machine.** `APPROVE`,
+  `REQUEST_CHANGES`, `FINISHED` aren't comments — they drive a
+  waiting-on field, a gate state, and the stop-hook
+  continuation logic. claude-squad and Conductor isolate
+  parallel sessions; they don't have a notion of "this commit is
+  pending one approval before master can finalize". The 2026
+  orchestrator survey (Shipyard, ccpm, Mission Control, etc.)
+  doesn't surface this primitive either.
+- **Plan as a durable, multi-commit artifact.** Other tools'
+  unit of work is "a session" or "a workspace". Clank's is "a
+  plan" — a markdown body that accumulates commits and
+  feedback across many turns, eventually landing in
+  `.clank/finished/`. That gives clank an artifact-driven
+  continuity model that works *even when sessions can't be
+  forked* (e.g. claude code's arbitrary-cwd resume gap from A1).
+- **Master/reviewer role split with role-aware stop hooks.**
+  Stop hook continuations differ by role: master gets
+  "continue/finish/revise" prompts, reviewer gets "review
+  this commit at <sha>" prompts. The other orchestrators run
+  agents in parallel; they don't structure the handoff between
+  roles.
+
+**Where clank overlaps with prior art (and shouldn't compete).**
+
+- **Session isolation via git worktrees.** claude-squad does
+  this. claude code's `-w` does this. Conductor does this.
+  Clank should *use* claude's `-w` (per F2/B3) and not build
+  parallel worktree plumbing.
+- **Terminal multiplexing.** tmux exists; claude code's `--tmux`
+  drives it; claude-squad delegates to it. Clank should do the
+  same (per F5). Building a custom TUI puts us in the same lane
+  as r3bl_tui PTYMux without a reason to win.
+- **PR creation, merge orchestration.** `gh` does this. Clank's
+  `clank pr` is a thin capture-body-then-squash-then-create
+  wrapper (per C2) and that's all it should be. Not a merge
+  queue, not a CI orchestrator.
+- **Generic "parallel agent" runner.** Conductor and claude-squad
+  do this. If a user wants 5 unrelated tasks running in
+  parallel, those tools serve that need better than clank
+  could. Clank's parallelism is in service of *one peer-review
+  loop per plan*, not generic fan-out.
+
+**Honest scope recommendation: narrow inward.**
+
+Clank should stop short of competing with the orchestrator
+landscape. Specifically:
+
+1. **Don't build a multiplexer.** Already settled in F5.
+2. **Don't build a queue scheduler.** The existing priority
+   queue is fine for ordering; resist features that turn it
+   into a job runner.
+3. **Don't build agent-pool management.** A clank plan is a
+   *single* gate-driven loop, not a swarm. The "claude pool"
+   pattern (community claude-pool daemon, etc.) is a different
+   product.
+4. **Don't build merge orchestration.** Defer to `gh stack` /
+   Graphite when stacked PRs become relevant (B2 v2).
+
+**Where clank *should* invest:**
+
+- Make the gate state machine richer (umbrella plans → stacked
+  PRs, concurrent review cycles per the queued `concurrent-
+  review-cycles` stub, parallel plan reviews per
+  `parallel-plan-reviews` stub).
+- Improve the chrome surface (F3) so the gate state is visible
+  without switching panes.
+- Tighten the artifact model so plans carry their full review
+  history into `.clank/finished/` and the HTML render.
+- Better cross-agent handoff: explicit "the reviewer
+  REQUEST_CHANGES'd X, here is the structured patch suggestion"
+  rather than free-text feedback.
+
+**The one-sentence positioning.** Clank is *peer-review
+infrastructure for AI coding agents*. It lives one layer above
+claude code / codex (which provide the agent sessions and the
+worktree primitives) and one layer below an orchestrator like
+claude-squad (which provides parallel session management for
+fundamentally independent tasks). Its reason to exist is the
+*gated, multi-agent, peer-review loop on a single plan*. Any
+feature outside that scope is overreach.
+
 ### Cluster F — Clank as agent-multiplexer TUI (the linchpin)
 
 **Do this cluster first.** Its answer changes the rest of the
@@ -1109,3 +1197,131 @@ These are flagged here so we ask up front rather than guess:
 - Is critical assessment (E1) for your own gut-check, or should
   the synthesis be allowed to recommend "narrow clank's scope to
   X"?
+
+## Synthesis
+
+This is the final section the Deliverable promised: F verdict
+first (since it gates everything else), then the recommended
+flagship workflow, then the distilled list of new clank
+commands/hooks, then the open questions to take back to the
+user before any implementation stub is promoted.
+
+### 1. F verdict
+
+**Native multiplexer is feasible.** `r3bl_tui::core::pty_mux`
+exposes a public `PTYMux` + `Process` API with F1–F9 hotkey
+switch, per-process OffscreenBuffer, and an in-docs example that
+maps almost verbatim to `claude` + `codex` invocations. F1 is
+settled in our favour — the *library* path is cheap. Building
+from `portable-pty` primitives is no longer on the table.
+
+**v1 backend recommendation: tmux, via claude code's own
+integration.** `claude --resume <id> -w <name> --tmux` already
+creates the worktree, opens the tmux session, and prefers iTerm2
+native panes when available. clank wraps this by adding the
+reviewer tile (`codex resume --cd <worktree>` in the same
+session) and the chrome line (F3).
+
+**v2 candidate: r3bl_tui::PTYMux native backend.** A short spike
+hosting `claude` + `codex` inside `PTYMux`'s OffscreenBuffer
+will tell us whether the rendering holds up. If it does,
+`r3bl_tui::PTYMux` becomes the v2 default; tmux remains a
+configurable backend for users who want shared sessions across
+non-clank workflows. The `MuxBackend` trait defined in F5 is the
+abstraction that keeps both paths shippable.
+
+### 2. Recommended flagship workflow
+
+**Worktree-per-PR with solo as the degenerate case (B3).** Solo
+mode is the same workflow with zero spawned worktrees; multi-wt
+mode spawns one per plan promotion. Day-in-the-life sketches in
+B3 show the user-facing surface for each. The two are exposed
+as a single CLI surface with `--worktree` as the per-plan
+toggle.
+
+The flagship is constrained by two findings the rest of the
+research surfaced:
+
+- **A2's isolation matrix** — per-instance `CLAUDE_CONFIG_DIR` +
+  `CODEX_HOME` plus per-instance cwd (worktree). Both halves
+  needed for the two-master case; the env half is also useful
+  for "two reviewers in one tree".
+- **F2's worktree integration** — claude code's `-w` is the
+  supported session-into-worktree mechanism. The arbitrary-cwd
+  resume gap (#58591) doesn't bite this flow.
+
+### 3. Required new clank commands / hooks
+
+Across all clusters, the surface that needs to land:
+
+| Command                                  | Purpose                                                                          | Source cluster |
+|------------------------------------------|----------------------------------------------------------------------------------|----------------|
+| `clank queue promote --worktree`         | Spawn a worktree via `claude -w`, set `CLAUDE_CONFIG_DIR`/`CODEX_HOME`, promote the plan, spawn master+reviewer tiles | B3, F2, A2 |
+| `clank pr`                               | Capture body → `clank purge --squash --into-branch` → push → `gh pr create --head`. Wraps C2's four-step sequence | B3, C2 |
+| `clank worktree list`                    | Enumerate worktrees + per-worktree plan/gate state for editor pickers            | C3            |
+| `clank worktree cleanup <name>`          | Tear down tmux session, worktree, local branch                                   | B3, D3        |
+| `clank chrome` *(internal, shell-side)*  | Emit OSC title + OSC 1337 user-var/badge updates on gate-state changes           | F3            |
+| **Net-new**: trait `MuxBackend` (Rust)   | Abstract spawn-tile / focus-tile / emit-status / kill-tile / attach across tmux + r3bl_tui::PTYMux backends | F5            |
+
+Implementation stubs that should be queued *after* this plan
+finishes:
+
+- **`worktree-spawn-and-env`** — implements `clank queue
+  promote --worktree`, the env-var export, the claude `-w` call,
+  and the codex `--cd` call.
+- **`muxbackend-trait-and-tmux-driver`** — defines the trait,
+  ships the tmux driver as the v1 default. Includes the F3
+  chrome emitter.
+- **`muxbackend-r3bl-spike`** — proves (or disproves) the
+  r3bl_tui::PTYMux backend by hosting `claude` + `codex` and
+  observing the render fidelity over real use.
+- **`clank-pr-wrapper`** — implements the four-command capture+
+  squash+push+create sequence behind a single command, with
+  `--keep-clank` for clank-friendly repos.
+- **`clank-worktree-list`** — read-only enumeration for editor
+  pickers; powers the C3 emacs/VS Code/JetBrains integration.
+- **`local-ignore-setup`** — extend `clank setup` (or add
+  `clank init --local-ignore`) to write `.clank/` into
+  `$GIT_COMMON_DIR/info/exclude` for repos that won't carry the
+  ignore upstream.
+
+The order matters: `worktree-spawn-and-env` and `muxbackend-
+trait-and-tmux-driver` are the foundation; the spike, the PR
+wrapper, the list command, and the local-ignore setup can land
+in parallel after them.
+
+### 4. Open questions back to the user
+
+These need user input before any of the implementation stubs
+above get promoted:
+
+- **Flagship scope.** B3 recommends one unified workflow with
+  `--worktree` as the toggle. Confirm: do you want both modes
+  shipped together, or just multi-wt with solo as a
+  documentation footnote?
+- **r3bl_tui spike.** Recommended as a v2 candidate. Confirm:
+  proceed with the spike alongside v1, defer until users push
+  back on the tmux dependency, or skip entirely?
+- **`.clank/` ignore policy default.** Should `clank pr`
+  *always* squash `.clank/` out of the PR branch (Tier 1
+  default), or offer `--keep-clank` for clank-friendly repos
+  with the safer default being strip?
+- **Editor binding scope.** Recommendation in D1 is that clank
+  delegates to `clank open` / `clank worktree list` and the
+  editor follows. Confirm: do you want a clank-side emacs
+  integration shipped, or is the JSON contract enough for the
+  user's existing hook?
+- **Critical assessment licence (E1).** The synthesis takes E1's
+  "narrow clank inward" recommendation literally — no
+  multiplexer, no queue scheduler, no agent-pool management,
+  no merge orchestration. Confirm this scoping or push back.
+- **Out-of-scope items the research touched but didn't resolve.**
+  Umbrella plans → stacked PRs (B2 v2), concurrent review
+  cycles per the existing stub, parallel plan reviews per the
+  existing stub. These should be their own plans once stacked-
+  PR tooling stabilises.
+
+When the user answers these, the implementation stubs in §3 can
+be promoted in the recommended order. Until then, this plan is
+the design memo their answers operate on.
+
