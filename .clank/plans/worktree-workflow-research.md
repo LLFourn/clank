@@ -287,31 +287,72 @@ swap implementations without re-shipping plans.
 
 ### Findings (master)
 
-#### F1 — PTY multiplexing in Rust is tractable but expensive
+#### F1 — PTY multiplexing in Rust: cheaper than first reported
 
-Building a native multiplexer is **technically possible**:
+*Revised after codex review (reviewer-supplied contradictory
+evidence on r3bl_tui).*
 
-- `portable-pty` (the cross-platform PTY crate `wezterm` ships)
-  plus `vt100` or `alacritty_terminal` for parsing the hidden
-  tiles' screen state, plus `crossterm`/`ratatui` for chrome and
-  raw mode, is the proven recipe. Working open-source examples
-  exist: `term39`, `croft` (VSCode-style TUI), `wtmux`, `psmux`.
-- `r3bl_tui` v0.7.7+ ships an *internal* "Terminal Multiplexer
-  with VT-100 ANSI Parsing" module, but the public API is not
-  stable yet — the doc coverage is ~62% and there's no documented
-  embed surface. We can't shortcut F1 by depending on r3bl_tui;
-  we'd be building on `portable-pty` directly.
+Building a native multiplexer is **technically possible at two
+very different price points**:
 
-Engineering reality: every working example above is *itself* a
-sizeable Rust project (thousands of lines). The ANSI/VT
-escape-sequence surface is large; "good enough that claude code
-and codex render correctly in the hidden tile" is more work than
-"draws ASCII". Estimate **weeks of focused work** to ship
-something that doesn't visually corrupt under the agent CLIs we
-care about, plus an ongoing maintenance cost as those CLIs evolve
-their rendering.
+- **Library path (cheap, surprising):** `r3bl_tui` v0.7.8 (2026-01-23)
+  exposes `r3bl_tui::core::pty_mux` as a **public** module with
+  `PTYMux`, `PTYMuxBuilder`, `Process`, `ProcessManager`,
+  `InputRouter`, `OutputRenderer`, and the constants
+  `MAX_PROCESSES = 9` and `STATUS_BAR_HEIGHT`. The documented
+  usage example is:
 
-Verdict on F1 alone: feasible, but not cheap.
+  ```rust
+  let processes = vec![
+      Process::new("bash",    "bash", vec![], terminal_size),
+      Process::new("editor",  "nvim", vec![], terminal_size),
+      Process::new("monitor", "htop", vec![], terminal_size),
+  ];
+  let multiplexer = PTYMux::builder()
+      .processes(processes)
+      .build()?;
+  multiplexer.run().await?;
+  ```
+
+  That is almost verbatim what a `clank tui` entry point would
+  call, substituting `claude` and `codex`. F1–F9 hotkey switching
+  is built in. Each process gets an `OffscreenBuffer` that
+  receives ANSI output through a vt-100 parser, so hidden tiles
+  preserve screen state and switch instantly.
+
+  My earlier WebFetch summary missed this — codex's independent
+  research caught the mismatch. The reviewer note's directive to
+  do independent research paid for itself on the very first
+  review.
+
+- **Primitives path (expensive):** Build on `portable-pty` +
+  `vt100` / `alacritty_terminal` + `crossterm`/`ratatui` directly.
+  Working open-source proofs of this pattern exist (`term39`,
+  `croft`, `wtmux`, `psmux`), each itself a multi-thousand-line
+  project. Weeks of focused work plus ongoing rendering-fidelity
+  maintenance as the agent CLIs evolve.
+
+Caveats on the library path:
+
+- r3bl_tui is **pre-1.0 (0.7.8)** with no explicit stability
+  claim and a single maintaining organisation (r3bl-org). A
+  breaking change in a minor version is plausible.
+- `MAX_PROCESSES = 9` is well above our master+reviewers use case
+  (typically 2–4) but worth noting.
+- Pulls in 48+ transitive deps (tokio, crossterm, portable-pty,
+  vte, serde, syntect, ...). Clank's existing dep graph already
+  overlaps most of these.
+- A spike is still needed to confirm `claude` and `codex`
+  themselves render correctly inside `r3bl_tui`'s OffscreenBuffer
+  — claude code in particular does heavy interactive UI work
+  that may exercise corners of the VT-100 parser that simpler
+  workloads don't.
+
+Verdict on F1 alone: the *library path* changes the answer from
+"feasible but expensive" to "feasible and cheap *if the spike
+passes*". The spike (host two interactive shells, then host
+`claude` + `codex`, confirm no visible corruption) is now the
+gating sub-task, not the multiplexer architecture itself.
 
 #### F4 — Prior art makes the call obvious: delegate to tmux
 
@@ -323,23 +364,30 @@ this whole research plan:
 |---------------|----------|-------------------|---------------|---------------------------------------|
 | claude-squad  | Go       | **tmux** (delegated) | git worktree | Multi-agent, hotkey-switch, sessions  |
 | Conductor     | Swift / macOS | macOS GUI (own) | own workspaces | macOS-only, handles PR/merge, paid    |
-| r3bl_tui      | Rust     | own (internal)    | n/a (lib)     | Library, no stable public mux API     |
+| r3bl_tui PTYMux | Rust   | **own (public lib)** | n/a (lib)   | Documented `core::pty_mux` API, F1–F9 hotkey switch, OffscreenBuffer per tile, 0.7.8 / Jan 2026 |
 | zellij        | Rust     | own               | n/a (mux)     | WASM plugin system; community is building claude-code plugins for zellij |
 | Shipyard etc. | varies   | varies            | varies        | 6+ orchestrators surveyed for 2026    |
 
-The single most relevant fact: **claude-squad faced almost exactly
-our problem statement and chose to delegate to tmux instead of
-building a multiplexer**. They got hotkey switching, session
-isolation, parallel agent execution, and worktree binding without
-writing their own PTY/VT code. The Go vs Rust difference doesn't
-change the trade-off.
+Two viable hosts emerge, not one:
 
-Zellij is the other credible host: it's Rust, embeds a WASM plugin
-runtime, and at least one community project is already building
-claude-code orchestration as a zellij plugin. Embedding as a
-*plugin host* is heavier than driving tmux, but lighter than
-rolling our own multiplexer and gives us layout/session features
-for free.
+- **claude-squad's pattern (tmux + worktrees + thin TUI driver).**
+  Most relevant fact in the table: claude-squad faced almost
+  exactly our problem statement and chose tmux. They got hotkey
+  switching, session isolation, parallel agent execution, and
+  worktree binding without writing PTY/VT code. Maturity and
+  ubiquity arguments below.
+- **r3bl_tui PTYMux (in-process, pure-Rust embed).** The library
+  path from F1. The selling point versus tmux: no external runtime
+  dep, no IPC dance, native control of the chrome and the
+  spawning semantics. The risk versus tmux: pre-1.0, single
+  upstream maintainer, no widely-reported track record with the
+  agent CLIs.
+
+Zellij is a more distant third — Rust, has a WASM plugin runtime,
+and a community plugin for claude-code orchestration is under
+construction. Embedding as a plugin host is heavier than driving
+tmux and gives us a comparable result; it's worth tracking but
+not leading with.
 
 #### F2 — Spawn-into-worktree blocked by claude code session limitations
 
@@ -383,37 +431,56 @@ Not full Findings yet — flagging the design direction:
 - the indicator is *cheap* to add in either delegated-tmux or
   native-mux worlds. Not load-bearing on the F1-vs-F5 choice.
 
-#### F5 — Recommended choice: ship the F5 path as the default
+#### F5 — Recommended choice: two viable backends, ship behind a trait
 
-Given F1 (feasible-but-weeks), F4 (claude-squad already solved
-this with delegation), and F2 (the worktree session-fork story is
-already constrained by upstream and won't be unblocked by a
-native multiplexer), the recommended path is:
+Given F1 (one library path is cheap if the spike passes; the
+primitives path is weeks), F4 (claude-squad demonstrates tmux
+works at scale; r3bl_tui PTYMux is a real public-API alternative),
+and F2 (the worktree session-fork story is constrained by upstream
+and not unblocked by *either* multiplexer), the recommended path:
 
-- **Default and shipped:** clank drives **tmux** as the
-  multiplexer. Clank owns the session model, the worktree binding,
-  the chrome line, and the agent-spawn commands. tmux handles the
-  PTYs, the input forwarding, the hotkey switching, and the
-  always-alive hidden tiles.
-- **Optional and later:** consider zellij as an alternate backend
-  via its plugin system if and when there's a concrete user need
-  the tmux path can't serve.
-- **Not recommended:** rolling our own PTY/VT multiplexer.
-  claude-squad — a project with the same scope as us, more
-  engineering hours, and a year head start — chose not to. There
-  is no evidence we'd do better with less.
+- **Design clank to a `MuxBackend` trait** that captures the
+  minimal surface: spawn-tile-with-process, focus-tile,
+  emit-status-line, kill-tile, attach-existing. Both backends
+  below have to implement it. The trait is the contract that
+  keeps the worktree workflow stable across backends.
 
-This is a *reframe* of what the user asked: clank still spawns the
-TUI, still hands the user a hotkey, still keeps the inactive
-agents alive, still ties one terminal to one worktree. The only
-difference is the multiplexing engine is tmux, not custom Rust
-code. From the user's seat in emacs, the experience can be
-identical.
+- **Backend A — tmux driver (recommended for v1).** Lowest risk.
+  Maturity, ubiquity, and a working precedent (claude-squad) all
+  favour it. Users without a tmux config still get a sensible UX
+  because clank ships the config. Clank shells out to tmux for
+  spawning, switching, and status updates; embeds in emacs via
+  `vterm` / `eat` or runs as a free-standing terminal app.
 
-The remaining open question is the emacs binding: does the user
-want a *tmux session embedded in emacs* (via `vterm` / `eat`), or
-do they want emacs to call out to a real terminal app holding the
-tmux session? That decision feeds Cluster D.
+- **Backend B — r3bl_tui::PTYMux driver (recommended as a
+  parallel spike, candidate for v2).** Pure-Rust, in-process,
+  removes the external tmux dependency, and gives clank direct
+  control of the chrome and spawning semantics. Pre-1.0 + single
+  upstream is the only real blocker; a spike that hosts `claude`
+  + `codex` for an hour of real use will tell us whether the
+  rendering holds up. If it does, this becomes the v2 default
+  and tmux is kept as a fallback backend for users who prefer it
+  or who want shared tmux sessions across non-clank workflows.
+
+- **Not recommended for now:** rolling our own PTY+VT
+  multiplexer from primitives. With r3bl_tui::PTYMux on the
+  table, "build from `portable-pty` + `vt100`" stops being a
+  serious option — it's strictly more work for the same UX.
+  Zellij-as-host stays on the watch list but doesn't lead.
+
+This is a *reframe* of what the user asked: clank still spawns
+the TUI, still hands the user a hotkey, still keeps the inactive
+agents alive, still ties one terminal to one worktree. v1 ships
+tmux-backed; v2 may flip to r3bl_tui::PTYMux based on spike
+results. The CLI surface stays the same across the two.
+
+The remaining open questions for the user:
+
+- Are we comfortable shipping v1 with a hard tmux dependency, or
+  do we want to gate v1 behind the r3bl_tui spike landing first?
+- For the emacs binding: tmux session *embedded in emacs* (via
+  `vterm` / `eat`), or emacs calling out to a real terminal app
+  holding the tmux session? This decision feeds Cluster D.
 
 ## Deliverable
 
