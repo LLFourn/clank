@@ -484,22 +484,28 @@ Recommendation:
 
 - **Tier 1 — repo accepts `.clank/` in `.gitignore`**: commit it
   to the repo's `.gitignore`. Cleanest, no per-user setup.
-- **Tier 2 — repo will NOT carry the ignore entry**: clank
-  `setup` writes `.clank/` into the local clone's
-  `.git/info/exclude`. Per-user, no upstream artifact. Verify the
-  user has never `git add`ed `.clank/` first.
+- **Tier 2 — repo will NOT carry the ignore entry**: append
+  `.clank/` to the local clone's `.git/info/exclude`. Per-user,
+  no upstream artifact. Verify the user has never `git add`ed
+  `.clank/` first. *Today this is a manual one-shot* (`echo
+  '.clank/' >> "$(git rev-parse --git-common-dir)/info/exclude"`);
+  **proposed**: extend `clank setup` (or a new `clank init
+  --local-ignore`) to do this for the user. The current `clank
+  setup --help` only documents user-scope installation
+  (~/.claude, ~/.codex), so this is net-new repo-scope work,
+  not just renaming an existing flag.
 - **Tier 3 — `.clank/` is already tracked upstream**: a one-shot
   `clank purge --all --into-branch wipe-clank` rewrites history
   to remove all `.clank/` paths. The user then pushes that branch
   and asks maintainers to switch. This is the "rip the bandaid"
   case.
 
-Note on per-worktree scope: `.git/info/exclude` lives in
-`$GIT_DIR/info/exclude`. For git worktrees, `$GIT_DIR` is shared
-across the main repo and all `worktree add` worktrees (each
-worktree's `.git` file points back to the main repo's
-`.git/worktrees/<name>/`). So `info/exclude` is repo-wide, not
-per-worktree. That's fine for our case — we want `.clank/`
+Note on per-worktree scope: `info/exclude` lives in
+`$GIT_COMMON_DIR/info/exclude` — the main repo's `.git/info/`,
+which linked worktrees share (each linked worktree has a private
+`$GIT_DIR` at `<main>/.git/worktrees/<name>/` but `$GIT_COMMON_DIR`
+points back to the main `.git/`). So `info/exclude` is repo-wide,
+not per-worktree. That's fine for our case — we want `.clank/`
 ignored everywhere — but worth recording.
 
 #### C2 — `clank purge --squash` is the load-bearing PR primitive
@@ -516,20 +522,25 @@ the finalize-to-PR flow needs:
 - `--dry` previews without mutating, `--yes` skips the prompt.
 - `--amend` for amending a HEAD finalize commit in place.
 
-What this means for the PR finalize flow:
+What this means for the PR finalize flow (real commands today,
+no fabricated flags):
 
 ```sh
 # in the worktree, after `clank finish`
 clank purge --squash "<plan-title>: <one-line>" \
             --into-branch pr-<plan-name>
 git push -u origin pr-<plan-name>
-gh pr create --body "$(clank log <plan> --format=pr-body)"
+gh pr create --body "$(cat .clank/finished/<plan>.md)"
 ```
 
-That's three commands. A `clank pr` (proposed in B3) just wraps
-them, with the squash message defaulting to the plan title and
-the body filled from the plan's markdown. No new purge code
-needed — the primitive is already shippable.
+That's three commands. A **proposed** `clank pr` wrapper (B3)
+would default the squash message to the plan title and the body
+to the plan markdown. No new purge code needed — the rewrite
+primitive is already shippable. The `clank log` surface (which
+exposes `--json`, `--oneline`, `--plan`, no `--format=pr-body`)
+might also grow a PR-body formatter, but it doesn't have to for
+v1: piping `cat .clank/finished/<plan>.md` to `gh pr create`
+covers the common case.
 
 Open question for the user: should `clank pr` *always* squash
 `.clank/` out, or should it offer a `--keep-clank` flag for
