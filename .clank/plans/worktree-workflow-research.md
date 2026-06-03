@@ -523,23 +523,37 @@ the finalize-to-PR flow needs:
 - `--amend` for amending a HEAD finalize commit in place.
 
 What this means for the PR finalize flow (real commands today,
-no fabricated flags):
+no fabricated flags). Two ordering gotchas need calling out
+explicitly:
+
+1. `clank purge --into-branch pr-<plan-name>` writes the
+   rewritten chain to a fresh branch ref but **does not check it
+   out**. The user's current branch stays selected.
+2. The squash strips `.clank/finished/<plan>.md` from the
+   rewritten branch, so the plan body has to be captured *before*
+   the rewrite (or read from the pre-purge branch).
+
+Given those two, the correct sequence is:
 
 ```sh
-# in the worktree, after `clank finish`
+# in the worktree, after `clank finish`, on the worktree branch
+PR_BODY="$(cat .clank/finished/<plan>.md)"
 clank purge --squash "<plan-title>: <one-line>" \
             --into-branch pr-<plan-name>
 git push -u origin pr-<plan-name>
-gh pr create --body "$(cat .clank/finished/<plan>.md)"
+gh pr create --head pr-<plan-name> --body "$PR_BODY"
 ```
 
-That's three commands. A **proposed** `clank pr` wrapper (B3)
-would default the squash message to the plan title and the body
-to the plan markdown. No new purge code needed — the rewrite
-primitive is already shippable. The `clank log` surface (which
-exposes `--json`, `--oneline`, `--plan`, no `--format=pr-body`)
-might also grow a PR-body formatter, but it doesn't have to for
-v1: piping `cat .clank/finished/<plan>.md` to `gh pr create`
+Four commands. The capture-first / push-rewritten / pass-`--head`
+shape is exactly the kind of thing a wrapper should hide. A
+**proposed** `clank pr` does all four, defaults the squash
+message to the plan title, and reads the body from the
+pre-purge tree before invoking the rewrite. No new purge code
+needed — the rewrite primitive is already shippable.
+
+The `clank log` surface (which exposes `--json`, `--oneline`,
+`--plan`, no `--format=pr-body`) could grow a PR-body formatter
+later, but it doesn't have to for v1: the captured plan markdown
 covers the common case.
 
 Open question for the user: should `clank pr` *always* squash
