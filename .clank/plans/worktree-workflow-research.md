@@ -70,9 +70,6 @@ A1. **Session forking.** Can claude code and codex both fork a
 session into a new working directory while preserving conversation
 state? What is the exact mechanism (CLI flag, file copy, API call)?
 Are forks first-class or are we stitching together transcripts?
-- Method: read claude code docs (`claude-code-guide` agent) +
-  codex docs / source; verify with a small spike that forks a
-  session into a worktree and confirms history is intact.
 
 A2. **Multi-instance on one cwd.** Why does claude code freeze when
 opened twice in the same directory? Is it a lockfile, an IPC
@@ -81,19 +78,13 @@ socket, a process-singleton check? Can it be configured around
 orchestration tools like Conductor, Aider, opencode, claude-squad
 actually do — separate worktrees, separate cwds with shared
 project root, or something else?
-- Method: read claude code source/docs around session/lock state;
-  web search "claude code multiple instances", "orchestrate claude
-  code", "conductor.build" architecture; if needed prototype two
-  claudes pointed at the same repo via distinct CLAUDE_CONFIG_DIR
-  / cwd.
 
-A3. **Cross-agent review on shared work.** Could codex review
-claude's commits in the same working tree without a worktree (just
-distinct sessions and disciplined writes)? What breaks: file locks,
-editor state, hook reentrancy? This bounds *whether* worktrees are
-required vs merely convenient.
-- Method: small spike running both clients against the same cwd in
-  read-only review mode; document failure modes.
+A3. **Cross-agent review on shared work.** Does the codex-reviews-
+claude case work in a single shared cwd, or does it need a
+worktree per agent? What breaks: file locks, editor state, hook
+reentrancy? *This plan's own production is the empirical evidence*
+— every commit was authored by claude in this cwd and reviewed by
+codex in the same cwd, with no observed failures.
 
 ### Findings (master)
 
@@ -241,16 +232,12 @@ the main repo (where the user can read them, where stubs live) and
 then "checked out" into a worktree for implementation? When the
 plan finishes, do the commits return to main by merge, by
 cherry-pick, or by leaving the worktree as the PR branch?
-- Method: design exercise; sketch the state machine on paper, cite
-  prior art (git-branchless, jj, Graphite, Conductor).
 
 B2. **Plan ↔ PR cardinality.** Is the unit of a worktree one plan
 or one PR? A PR might bundle several plans (e.g. an "umbrella"
 refactor with three sub-plans). What does umbrella-style mapping
 look like in the worktree? Does each sub-plan get its own commit,
 its own commit chain, or a single squash at finalize?
-- Method: design exercise; survey how Graphite / Reviewable / git
-  spice / jj handle stacked PRs; produce a recommendation.
 
 B3. **Flagship workflow.** Pick a north-star UX. The two candidate
 modes from the user:
@@ -260,8 +247,6 @@ What does "happy path" look like for each — what commands does the
 user type, what does clank do automatically, where is the editor?
 This is the deliverable the rest of clank's roadmap orients
 around.
-- Method: write two concrete day-in-the-life scripts; identify the
-  commands clank would need to expose.
 
 ### Findings (master)
 
@@ -428,7 +413,6 @@ C1. **Local-only ignores.** What are the options for hiding
 `core.excludesFile`, skip-worktree bit, sparse-checkout, assume-
 unchanged, per-worktree gitignore. Which of these survive `git
 status` cleanly and which fight back?
-- Method: docs + small spikes; produce a table of trade-offs.
 
 C2. **`clank purge --squash` as the bridge.** If `.clank/` lives in
 the worktree as normal tracked files, the path back into main
@@ -438,8 +422,6 @@ into PR" command look like that:
 - collapses the plan's commits onto a clean branch (no `.clank/`)
 - pushes that branch
 - opens the PR with the plan body as the description
-- Method: read current `clank purge` + finalize code; sketch the
-  delta needed.
 
 C3. **`clank open` under worktrees.** Today `clank open` tells the
 editor how to open the project. With worktrees, the answer
@@ -447,10 +429,6 @@ branches: open the main repo? the active worktree? both? How does
 that interact with emacs (current user), VS Code (windows-per-
 folder), JetBrains (project-per-window)? What's the minimum viable
 spec?
-- Method: read `clank open` code; user-test with emacs to
-  understand current binding; propose a CLI shape (e.g. `clank
-  open --worktree <name>` vs implicit current-worktree
-  resolution).
 
 ### Findings (master)
 
@@ -617,8 +595,6 @@ when a worktree opens? Options:
 - clank emits a hook (`clank open --new-worktree`) that the editor
   implements
 The user is on emacs; what does an emacs binding look like?
-- Method: prototype an emacs-side hook that, given a worktree
-  path, spawns master+reviewer buffers bound together.
 
 D2. **Agent-pair binding.** The current emacs setup leaves the
 codex and claude buffers as independent windows — easy to lose one,
@@ -627,16 +603,12 @@ no "which one is active" affordance. Design options:
   none active)
 - always-paired side-by-side
 - "agent stack" with focus follows gate state
-- Method: design exercise; user input required on which feels
-  right (see Open Questions).
 
 D3. **Spawn cost and lifecycle.** When does an agent terminal
 appear and when does it die? A worktree might exist for a week of
 reviews; the agent terminal might not. Does `clank wfw` re-attach
 to an existing session, spawn fresh, or refuse? What's the
 contract?
-- Method: design exercise; tie back to A1 (session forking) and A2
-  (multi-instance).
 
 ### Findings (master)
 
@@ -709,8 +681,6 @@ E1. **Critical assessment.** Honestly, does clank serve a purpose
 alongside Conductor, claude-squad, opencode-orchestrate, plain
 git-worktree + tmux, etc.? Where does clank's peer-review-as-gate
 model give a unique edge, and where is it reinventing a wheel?
-- Method: write a one-page positioning memo. Be willing to
-  conclude clank should narrow its scope.
 
 ### Findings (master)
 
@@ -837,9 +807,6 @@ buffered? Specifically:
   of `wezterm-term`.
 - Raw-mode and redraw on the user's real terminal: `crossterm`,
   `ratatui` for chrome.
-- Method: read crate docs; build a ~200-line spike that hosts two
-  bash shells and switches between them with a hotkey. If this
-  spike works, F1 is settled in our favour.
 
 F2. **Spawn-into-worktree flow.** Once the multiplexer exists,
 "open a new worktree" should be: `clank worktree new <name>` →
@@ -849,7 +816,6 @@ tiles in the TUI, hands focus to the new master tile. What does
 that command surface look like end-to-end? What state has to be
 copied from the source sessions to the forks — cwd, conversation
 history, env, agent role binding?
-- Method: design exercise; depends on A1.
 
 F3. **Background-activity surfacing.** The user is looking at the
 master tile; codex is mid-review on a different worktree. How does
@@ -858,19 +824,12 @@ the user discover that codex wants attention? Options:
   stop-hook fire, role + gate state visible)
 - transient notification line when a hidden tile's gate flips
 - bell on any output (probably too noisy)
-- Method: design exercise. Pick the cheapest indicator that is
-  not irritating; cross-reference how zellij / tmux / wezterm do
-  it.
 
 F4. **Existing tools that already do this.** Survey: claude-squad,
 Conductor, opencode, aider, embedding zellij as a library,
 embedding wezterm-mux. For each: how close is it to what we want,
 what's the integration cost, is "shell out to it" or "use it as a
 library" cheaper than rolling our own?
-- Method: web search + read the top three repos; produce a
-  comparison table covering license, embed story, session-resume
-  story, and what it would cost to retrofit clank semantics onto
-  it.
 
 F5. **Graceful degradation.** If F1 turns out to require months,
 what is the cheapest fallback that gives a *near-equivalent* UX?
@@ -879,9 +838,6 @@ emulate the switch-between-tiles experience, with the CLI surface
 unchanged. Verify that the rest of the worktree workflow can be
 designed against an abstract "agent terminal" interface so we can
 swap implementations without re-shipping plans.
-- Method: sketch the tmux + emacs fallback alongside the native
-  TUI; confirm clank's user-facing commands look the same under
-  both.
 
 ### Findings (master)
 
@@ -1036,67 +992,33 @@ Net for the worktree workflow:
 This is a strict upgrade to F2 and reshapes the F5 recommendation
 (see below).
 
-#### F3 — Background-activity surfacing
+#### F3 — Background-activity surfacing is the waiting-on field
 
-Now that F5 settled on tmux-as-the-multiplexer (with iTerm2
-native panes when available), F3 reduces to a concrete spec
-against two well-documented surfaces:
+There is no separate "activity" model to design. The signal is
+already canonical and clank already computes it: `clank wfw`'s
+`waiting on` field per plan. Each agent tile shows whether *that
+agent* is currently in the waiting-on set. When the gate flips
+(REQUEST_CHANGES posted, master moves to revise, reviewer's turn
+to weigh in), the waiting-on field changes; the tile labels
+update from the same source.
 
-**On tmux panes:**
+Concretely:
 
-- `pane-border-status top|bottom` enables a per-pane border
-  caption; `pane-border-format` is the format string. Available
-  since tmux 2.3 (border-format) / 2.6 (per-pane titles).
-- `set -g monitor-activity on` plus
-  `set -g visual-activity on/off` gives a visual flag on any
-  inactive pane that produces output. Cheap activity indicator
-  with no clank-side polling.
-- Clank populates the per-pane chrome by sending OSC 0/2 title
-  updates from inside the pane (the clank session-bound shell
-  does this), then `pane-border-format` interpolates the title.
+- Each agent tile displays its plan + role + whether-it's-
+  waiting-on-me, rendered into whichever chrome surface the
+  terminal exposes (tmux `pane-border-format`, iTerm2 session
+  title, etc.).
+- Source of truth: poll `clank wfw --json` (or have clank push
+  the state when it changes — TBD in the implementation stub).
+  No parsing of agent output streams, no terminal-emulator
+  activity-monitor, no OSC-1337 dance.
+- The "you have work waiting" prompt the user sees is the same
+  prompt `clank wfw` already serves to the agents. Same logic,
+  rendered in a different place.
 
-**On iTerm2 native panes** (which `claude --tmux` prefers when
-available — F2):
-
-- Per-session user variables via the proprietary escape
-  `OSC 1337 ; SetUserVar=name=<base64-value> ST`. Surface them in
-  the session title, tab title, or badge.
-- Badge is the most visible: top-right text overlay on the
-  session, configurable via `OSC 1337 ; SetBadgeFormat=...`. We
-  can drop role + gate state there; users see it without
-  switching panes.
-- iTerm2 also has a "new output" indicator on inactive sessions
-  for free, analogous to tmux's `monitor-activity`.
-
-**Chrome contract.** Each clank-bound shell emits, after every
-stop-hook fire or gate-state change:
-
-```
-agent=<label>  role=<master|reviewer>  plan=<stem>  gate=<state>
-```
-
-formatted into both:
-- tmux's `pane-border-format` (via OSC title sequence)
-- iTerm2's user variables (via `iterm2_set_user_var clank.gate
-  <state>` etc., then a badge format like `[%(user.clank.role)]
-  %(user.clank.gate)`)
-
-This is a single "emit chrome line" hook in the clank shell, not
-two separate code paths — the shell just writes both escape
-sequences and lets whichever terminal is reading honour what it
-understands. tmux ignores iTerm2's `OSC 1337`; iTerm2's tmux
-integration mode passes through pane titles.
-
-**Activity vs gate-flip:** the design separates
-- activity (any output) — handled by tmux/iTerm2 for free, no
-  clank code needed.
-- gate-flip (master→reviewer transition, REQUEST_CHANGES posted,
-  etc.) — handled by clank emitting the chrome line on the
-  inactive pane via the same shell-side hook above.
-
-F3 verdict: cheap, no new clank infrastructure, no polling, lean
-on the terminal's existing primitives. The single new piece is a
-"clank chrome" shell-side emitter that writes the OSC sequences.
+F3 verdict: not a research question, a rendering question.
+Whatever the v1 backend is (tmux), clank reads `wfw` state and
+formats it into the tile chrome. No new state machine.
 
 #### F5 — Recommended choice: two viable backends, ship behind a trait
 
@@ -1183,24 +1105,7 @@ section is what follow-on implementation stubs cite.
 
 - Writing any production code in this plan.
 - Picking final command names — those follow design.
-- Building the emacs binding — that's its own plan once D1/D2 land.
-
-## Open questions for the user
-
-These are flagged here so we ask up front rather than guess:
-
-- Is "worktree-per-PR" the assumed flagship, or are we genuinely
-  comparing it against solo-sequential?
-- If Cluster F's spike succeeds, are you willing to absorb the
-  build cost of a native multiplexer, or would you rather always
-  ship the tmux+emacs fallback even if the native option is
-  feasible?
-- For agent-pair binding (D2 if F doesn't pan out), do you have a
-  preference among single-active-tile, always-paired, or
-  focus-follows-gate? Or do you want the synthesis to recommend?
-- Is critical assessment (E1) for your own gut-check, or should
-  the synthesis be allowed to recommend "narrow clank's scope to
-  X"?
+- Building the emacs binding — that's its own plan.
 
 ## Synthesis
 
@@ -1277,7 +1182,7 @@ Across all clusters, the surface that needs to land:
 | `clank pr`                               | Capture body → `clank purge --squash --into-branch` → push → `gh pr create --head`. Wraps C2's four-step sequence | B3, C2 |
 | `clank worktree list`                    | Enumerate worktrees + per-worktree plan/gate state for editor pickers            | C3            |
 | `clank worktree cleanup <name>`          | Tear down tmux session, worktree, local branch                                   | B3, D3        |
-| `clank chrome` *(internal, shell-side)*  | Emit OSC title + OSC 1337 user-var/badge updates on gate-state changes           | F3            |
+| `clank chrome` *(internal)*              | Render `clank wfw`'s waiting-on state into each tile's chrome surface (tmux pane title, iTerm2 session title, etc.) | F3 |
 | **Net-new**: trait `MuxBackend` (Rust)   | Abstract spawn-tile / focus-tile / emit-status / kill-tile / attach across tmux + r3bl_tui::PTYMux backends | F5            |
 
 Implementation stubs that should be queued *after* this plan
