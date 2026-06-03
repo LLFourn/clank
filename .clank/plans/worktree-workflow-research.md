@@ -995,11 +995,11 @@ This is a strict upgrade to F2 and reshapes the F5 recommendation
 #### F3 — Background-activity surfacing is the waiting-on field
 
 There is no separate "activity" model to design. The signal is
-already canonical and clank already computes it: `clank wfw`'s
-`waiting on` field per plan. Each agent tile shows whether *that
-agent* is currently in the waiting-on set. When the gate flips
+already canonical and clank already computes it: each plan's
+`waiting_on` field. Each agent tile shows whether *that agent* is
+currently in the waiting-on set. When the gate flips
 (REQUEST_CHANGES posted, master moves to revise, reviewer's turn
-to weigh in), the waiting-on field changes; the tile labels
+to weigh in), the waiting-on field changes and the tile labels
 update from the same source.
 
 Concretely:
@@ -1008,17 +1008,18 @@ Concretely:
   waiting-on-me, rendered into whichever chrome surface the
   terminal exposes (tmux `pane-border-format`, iTerm2 session
   title, etc.).
-- Source of truth: poll `clank wfw --json` (or have clank push
-  the state when it changes — TBD in the implementation stub).
-  No parsing of agent output streams, no terminal-emulator
+- Source of truth: `clank status -j` exposes `plans[].waiting_on`
+  directly; `clank status --watch -j` streams one compact JSON
+  line per change. That is the chrome API. `clank wfw` is the
+  blocking work-pump for an agent and intentionally hides
+  state from non-callers — don't use it here.
+- No parsing of agent output streams, no terminal-emulator
   activity-monitor, no OSC-1337 dance.
-- The "you have work waiting" prompt the user sees is the same
-  prompt `clank wfw` already serves to the agents. Same logic,
-  rendered in a different place.
 
 F3 verdict: not a research question, a rendering question.
-Whatever the v1 backend is (tmux), clank reads `wfw` state and
-formats it into the tile chrome. No new state machine.
+Whatever the v1 backend is (tmux), clank reads
+`clank status --watch -j`'s `waiting_on` updates and formats
+them into the tile chrome. No new state machine.
 
 #### F5 — Recommended choice: two viable backends, ship behind a trait
 
@@ -1182,7 +1183,7 @@ Across all clusters, the surface that needs to land:
 | `clank pr`                               | Capture body → `clank purge --squash --into-branch` → push → `gh pr create --head`. Wraps C2's four-step sequence | B3, C2 |
 | `clank worktree list`                    | Enumerate worktrees + per-worktree plan/gate state for editor pickers            | C3            |
 | `clank worktree cleanup <name>`          | Tear down tmux session, worktree, local branch                                   | B3, D3        |
-| `clank chrome` *(internal)*              | Render `clank wfw`'s waiting-on state into each tile's chrome surface (tmux pane title, iTerm2 session title, etc.) | F3 |
+| `clank chrome` *(internal)*              | Consume `clank status --watch -j`'s `plans[].waiting_on` stream and render it into each tile's chrome surface (tmux pane title, iTerm2 session title, etc.) | F3 |
 | **Net-new**: trait `MuxBackend` (Rust)   | Abstract spawn-tile / focus-tile / emit-status / kill-tile / attach across tmux + r3bl_tui::PTYMux backends | F5            |
 
 Implementation stubs that should be queued *after* this plan
