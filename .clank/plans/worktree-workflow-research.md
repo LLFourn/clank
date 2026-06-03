@@ -418,6 +418,8 @@ The user's day-to-day choice is "do I want to keep working in
 main, or do I want to fork to a worktree for this plan?", not
 "which clank mode am I in today".
 
+### Cluster C — Repo and filesystem hygiene
+
 How does clank coexist with a repo whose maintainers won't accept
 `.clank/` upstream?
 
