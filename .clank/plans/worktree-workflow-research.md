@@ -95,6 +95,111 @@ required vs merely convenient.
 - Method: small spike running both clients against the same cwd in
   read-only review mode; document failure modes.
 
+### Findings (master)
+
+#### A1 — Session forking (cross-references F2)
+
+The session-fork mechanics were answered while researching F2.
+Summary; full detail is in Cluster F's findings:
+
+| Agent      | Resume | Fork | Resume into new cwd | Notes |
+|------------|--------|------|---------------------|-------|
+| claude code | `--resume <id>` | `--fork-session` | **no** (issues #58591, #28745, #28314, #30906, #42596) | `claude -w` starts a *new* session in a worktree; cannot relocate an existing one |
+| codex CLI   | `codex resume <id>` | `/fork` | **yes** (`--cd <dir>`, plus `--add-dir`) | Sessions stored under `~/.codex/sessions/YYYY/MM/DD/`; `codex resume --all` surfaces sessions from other cwds |
+
+A1 verdict: fork-into-worktree is **clean for codex, broken for
+claude code**. The clank workflow has to assume the master session
+in a new worktree starts fresh; continuity comes from plan body +
+commits + feedback, which clank already owns. Cluster F's F2
+finding stands.
+
+#### A2 — Multi-instance same cwd: actively broken upstream
+
+Two claude code processes pointed at the same working directory
+are **not safe today** (June 2026). The failure is a real runtime
+constraint, not just an editor cosmetic issue:
+
+- `~/.claude.json` (global config) is corrupted by concurrent
+  writes — invalid JSON across instances (issue #28992).
+- Lock acquisition fails at `~/.local/share/claude/versions/<v>/`
+  with logged `Lock acquisition failed for ...` warnings (issue
+  #13287).
+- Stale lock files at `~/.local/state/claude/locks/` persist
+  across reboots with no automatic cleanup (issue #14301).
+- Shell-state corruption: concurrent instances share a snapshot
+  directory keyed by cwd hash, race on writes, and surface as
+  `bash: …: No such file or directory` mid-tool-call (issue
+  #4014).
+- Outright regression in 2.0.61: "if two Claude Code instances
+  are loaded, they can no longer operate in parallel — when one
+  runs, the other one stops and no more messages can be received"
+  (issue #13499).
+- There is an open feature request to add a session lock file
+  (#19364) — i.e. upstream has not committed to fixing this
+  structurally yet.
+
+**Workaround that does help:** set `CLAUDE_CONFIG_DIR` per
+instance so each claude has its own ~/.claude root. This sidesteps
+the global-config-corruption case directly. It does **not** fix
+the shell-snapshot-by-cwd-hash case because that key is derived
+from cwd, not config root — so even with separate config dirs,
+two claudes in the same cwd still race on shell-snapshot files.
+
+**Workaround that fully helps:** distinct cwds — i.e. git
+worktrees. This is what every observed orchestrator does:
+claude-squad (per-session worktree), Conductor (per-workspace
+isolated copy), the community claude-pool daemon (managed pool,
+distinct worktrees).
+
+A2 verdict: **worktrees are required**, not optional, the moment
+clank wants two claude masters live at once. They are also the
+right answer for "user is hand-driving claude in main while
+clank's claude is also doing work" — without a worktree those
+two claudes will fight at the runtime layer.
+
+#### A3 — Cross-agent review on shared cwd: workable, with rules
+
+Mixing **one claude + one codex** in the same cwd is materially
+safer than two claudes, because the failure modes above are
+internal to claude code's shared state directories and do not
+touch codex's `~/.codex/` tree:
+
+- Codex supports `--sandbox read-only`, an OS-enforced sandbox
+  that prevents any writes from the codex process. A read-only
+  reviewer cannot corrupt the master's work-in-progress.
+- The community pattern documented in the SmartScope and
+  shakacode write-ups: generate a `REVIEW_ID` per review,
+  namespace temp files (`/tmp/claude-plan-${REVIEW_ID}.md`,
+  `/tmp/codex-review-${REVIEW_ID}.md`). Clank's
+  per-`<commit-sha>` feedback paths achieve the same isolation
+  natively.
+- Risks that *remain* in shared cwd: editor reentrancy (only one
+  process can hold an interactive `git rebase -i` etc.), hook
+  reentrancy if two agents trip the same post-write hook, and
+  the user's own clarity about "which agent is touching the tree
+  right now".
+
+A3 verdict: **codex-reviewing-claude in the same cwd is the
+default case clank already runs today and works**. Pushing it
+into a worktree is convenient (matches A2), not load-bearing.
+Two-claude is the case worktrees are *required* for.
+
+#### Implications for the workflow
+
+- The flagship worktree workflow has to assume each worktree gets
+  its own `CLAUDE_CONFIG_DIR` *and* its own cwd. Both are needed:
+  cwd alone fixes the snapshot races; config dir alone fixes the
+  global-config corruption.
+- A "worktree spawn" command should export
+  `CLAUDE_CONFIG_DIR=$WORKTREE/.clank/claude-config` (or a
+  similar per-worktree path) into the master's environment
+  before `claude` launches. Codex needs the analogous
+  `CODEX_HOME` set per worktree.
+- Plan-in-main, impl-in-worktree (B1) is unavoidable for any
+  flow where the user already has a claude master running in
+  main. That same constraint pushes B3 toward worktree-per-PR
+  as the flagship mode.
+
 ### Cluster B — Workflow shape
 
 What does the lifecycle of a worktree-shaped clank session look
