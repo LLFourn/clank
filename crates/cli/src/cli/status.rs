@@ -399,7 +399,6 @@ fn select_plans_and_finished(
 
 fn waiting_actor(w: &WaitingOn) -> String {
     match w {
-        WaitingOn::FirstReview => "any reviewer".into(),
         WaitingOn::ReviewerApprovalsMissing { missing } => missing
             .iter()
             .map(|a| a.as_str())
@@ -414,7 +413,6 @@ fn waiting_actor(w: &WaitingOn) -> String {
 
 fn waiting_reason(w: &WaitingOn) -> String {
     match w {
-        WaitingOn::FirstReview => "no reviewer has weighed in yet".into(),
         WaitingOn::ReviewerApprovalsMissing { missing } => {
             let names = missing
                 .iter()

@@ -225,6 +225,98 @@ fn wfw_reviewer_wakes_on_new_reviewable_commit() {
 }
 
 #[test]
+fn wfw_already_approved_reviewer_does_not_wake_while_peer_pending() {
+    // Two registered reviewers; alice has APPROVED but bob hasn't.
+    // The all-reviewers gate's load-bearing UX guarantee: alice
+    // should NOT be woken again — only bob (the missing reviewer)
+    // has work. alice's wfw must time out.
+    let dir = init_repo();
+    let repo = dir.path();
+    register_reviewer(repo, "bob");
+    write(repo, ".clank/plans/foo.md", "# foo\n");
+    commit(repo, "[foo] intro");
+    let intro_sha = head_sha(repo);
+
+    // alice already approved; bob hasn't reviewed. alice should
+    // get no review item.
+    write(
+        repo,
+        &format!(".clank/agents/alice/feedback/{intro_sha}.md"),
+        "APPROVE\n\nlgtm\n",
+    );
+
+    let output = clank_cmd(repo)
+        .args([
+            "wfw",
+            "--no-poll",
+            "--author",
+            "alice",
+            "--role",
+            "reviewers",
+            "--timeout",
+            "3s",
+        ])
+        .arg("--repo")
+        .arg(repo)
+        .output()
+        .expect("spawn");
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    // Timeout-without-work exits 0 with empty work output; the
+    // important assertion is that NO review item was emitted.
+    assert!(
+        !stdout.contains("review"),
+        "alice already approved; should not get a review wake. stdout=`{stdout}` stderr=`{stderr}`"
+    );
+}
+
+#[test]
+fn wfw_missing_reviewer_does_wake_while_peer_already_approved() {
+    // Symmetric counterpart: two registered reviewers; alice has
+    // APPROVED but bob hasn't. bob calls wfw — they should get
+    // their review item promptly.
+    let dir = init_repo();
+    let repo = dir.path();
+    register_reviewer(repo, "bob");
+    write(repo, ".clank/plans/foo.md", "# foo\n");
+    commit(repo, "[foo] intro");
+    let intro_sha = head_sha(repo);
+
+    write(
+        repo,
+        &format!(".clank/agents/alice/feedback/{intro_sha}.md"),
+        "APPROVE\n\nlgtm\n",
+    );
+
+    let output = clank_cmd(repo)
+        .args([
+            "wfw",
+            "--no-poll",
+            "--author",
+            "bob",
+            "--role",
+            "reviewers",
+            "--timeout",
+            "3s",
+        ])
+        .arg("--repo")
+        .arg(repo)
+        .output()
+        .expect("spawn");
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    assert!(
+        output.status.success(),
+        "wfw exit={:?} stdout=`{stdout}` stderr=`{stderr}`",
+        output.status
+    );
+    assert!(
+        stdout.contains("review") && stdout.contains(&intro_sha[..7]),
+        "bob is the missing reviewer; should get a review item for the intro sha {intro_sha}; got stdout=`{stdout}`"
+    );
+}
+
+#[test]
 fn wfw_reviewer_wakes_on_code_only_commit() {
     // Regression for the ref-only wake path: an attribution-only
     // (code-only) commit doesn't touch any `.clank/` path, so the

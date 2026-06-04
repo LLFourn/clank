@@ -314,10 +314,17 @@ impl RepoState {
                             .filter(|label| !approved_by.contains(label))
                             .cloned()
                             .collect();
-                        match crate::repo_state::NonEmptyVec::new(missing) {
-                            Ok(missing) => WaitingOn::ReviewerApprovalsMissing { missing },
-                            Err(_) => WaitingOn::FirstReview, // unreachable under new semantics
-                        }
+                        // `missing` is non-empty here: the
+                        // Unreviewed gate state is reached only when
+                        // `compute_gate` finds at least one expected
+                        // reviewer with no Approve/Finished entry.
+                        // `expected_reviewers` is non-empty in this
+                        // branch (zero-reviewer maps to Approved
+                        // earlier), so the filter result is non-empty.
+                        let missing = crate::repo_state::NonEmptyVec::new(missing).expect(
+                            "Unreviewed gate state implies a non-empty missing reviewer set",
+                        );
+                        WaitingOn::ReviewerApprovalsMissing { missing }
                     }
                 };
 
@@ -386,17 +393,6 @@ impl WorkStatus {
                         next: MasterNext::Finalize,
                         reason: WaitingReason::ReadyToFinalize,
                         gate: ps.gate,
-                    });
-                }
-                (Role::Reviewers, WaitingOn::FirstReview) => {
-                    out.push(WaitItem::Reviewer {
-                        plan: ps.plan.clone(),
-                        sha: ps.sha.clone(),
-                        feedback_path: format!(
-                            ".clank/agents/{}/feedback/{}.md",
-                            author.as_str(),
-                            ps.sha.as_str()
-                        ),
                     });
                 }
                 (Role::Reviewers, WaitingOn::ReviewerApprovalsMissing { missing })
@@ -619,6 +615,85 @@ mod tests {
         assert_eq!(
             compute_gate(&reviews, &[label("codex"), label("ruthless")]),
             CommitGateState::Unreviewed
+        );
+    }
+
+    // ============ work_for: per-author reviewer wake ============
+
+    fn work_status_with_one_plan(waiting_on: WaitingOn) -> WorkStatus {
+        WorkStatus {
+            plans: vec![PlanWorkState {
+                plan: plan("a.md"),
+                sha: sha("aaaa"),
+                gate: CommitGateState::Unreviewed,
+                waiting_on,
+                touched_code: false,
+            }],
+            ad_hoc: Vec::new(),
+        }
+    }
+
+    fn missing(labels: &[&str]) -> WaitingOn {
+        let missing = labels.iter().map(|l| label(l)).collect();
+        let missing = crate::repo_state::NonEmptyVec::new(missing).unwrap();
+        WaitingOn::ReviewerApprovalsMissing { missing }
+    }
+
+    #[test]
+    fn work_for_missing_reviewer_gets_review_item() {
+        // Two registered reviewers; neither has reviewed yet. Both
+        // are in the missing set; each gets a review item.
+        let ws = work_status_with_one_plan(missing(&["codex", "ruthless"]));
+        let codex_work = ws.work_for(&label("codex"), Role::Reviewers);
+        assert_eq!(codex_work.len(), 1, "codex should get a review item");
+        assert!(matches!(codex_work[0], WaitItem::Reviewer { .. }));
+
+        let ruthless_work = ws.work_for(&label("ruthless"), Role::Reviewers);
+        assert_eq!(ruthless_work.len(), 1, "ruthless should get a review item");
+    }
+
+    #[test]
+    fn work_for_already_approved_reviewer_gets_no_item() {
+        // The load-bearing UX guarantee: a reviewer who has already
+        // posted APPROVE/FINISHED does NOT get a redundant wake.
+        // Only `ruthless` is in `missing` (codex already approved).
+        let ws = work_status_with_one_plan(missing(&["ruthless"]));
+        let codex_work = ws.work_for(&label("codex"), Role::Reviewers);
+        assert!(
+            codex_work.is_empty(),
+            "codex already approved; should not be woken again"
+        );
+        let ruthless_work = ws.work_for(&label("ruthless"), Role::Reviewers);
+        assert_eq!(
+            ruthless_work.len(),
+            1,
+            "ruthless is the missing reviewer; should get the item"
+        );
+    }
+
+    #[test]
+    fn work_for_stale_reviewer_not_in_expected_gets_no_item() {
+        // alice is no longer expected (her dir might still exist on
+        // disk but she's not in the missing set). work_for returns
+        // nothing for her.
+        let ws = work_status_with_one_plan(missing(&["codex"]));
+        let alice_work = ws.work_for(&label("alice"), Role::Reviewers);
+        assert!(
+            alice_work.is_empty(),
+            "alice is not in missing; should not be woken"
+        );
+    }
+
+    #[test]
+    fn work_for_master_unaffected_by_missing_reviewers() {
+        // Reviewers gate uses ReviewerApprovalsMissing; master's role
+        // does not emit a Reviewer item, and no Master variant fires
+        // for this gate state. Verify master gets nothing here.
+        let ws = work_status_with_one_plan(missing(&["codex"]));
+        let master_work = ws.work_for(&label("lloyd"), Role::Master);
+        assert!(
+            master_work.is_empty(),
+            "master has no work while reviewers are still owed"
         );
     }
 

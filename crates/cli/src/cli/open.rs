@@ -719,7 +719,6 @@ async fn fold_summary(repo_root: &Path) -> (usize, Option<String>, Option<String
 fn format_waiting_on(w: &clank_core::plan_view::WaitingOn) -> String {
     use clank_core::plan_view::WaitingOn::*;
     match w {
-        FirstReview => "first review".to_string(),
         ReviewerApprovalsMissing { .. } => "reviewers".to_string(),
         MasterToRevise { .. } => "master to revise".to_string(),
         MasterToContinue => "master to continue".to_string(),

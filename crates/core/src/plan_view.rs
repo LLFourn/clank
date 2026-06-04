@@ -20,12 +20,12 @@ pub struct WorktreeFacts {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum WaitingOn {
-    /// Nobody has reviewed any commit in this plan yet. Any
-    /// reviewer agent is eligible.
-    FirstReview,
     /// Latest reviewable commit lacks feedback from one or more
-    /// existing participants. `missing` is non-empty by construction
-    /// — the empty case is `FirstReview`.
+    /// registered reviewers. `missing` is non-empty by construction.
+    /// (The `FirstReview` variant — "any reviewer eligible" — was
+    /// removed when the all-reviewers gate landed: under the new
+    /// semantics every commit's reviewer set is the registered
+    /// `expected_reviewers` list, never "anyone who shows up".)
     ReviewerApprovalsMissing { missing: NonEmptyVec<AgentLabel> },
     /// A reviewer requested changes (or left an ambiguous verdict).
     /// Master needs to address.
