@@ -47,18 +47,28 @@ New subcommand: `clank demote <plan> [--priority <N>] [--stub] [--force] [--into
 
    Rationale for the two-tier policy (ruthless review of 91dc0b4): `Rewrite`-bypass via `--force` is user-recoverable — they wrote the code, they can rewrite it. `KeepVerbatim`-bypass would drop someone else's commit, which is a coordination event, not a flag-flip. Option C from the review: refuse foreign-commit drops entirely. The single `--force` flag is sufficient because it only ever applies to Rewrite cases now.
 
-3. **Pre-rewrite: save the plan body**.
+3. **Pre-rewrite checks (in order)**. Demote must be transactional: NOTHING on the filesystem changes until the rewrite has succeeded (codex review of 9bb7d0d). All checks happen first; in-memory state is staged but not written.
    - **Working-tree-dirty refusal**: if `.clank/plans/<plan>.md` in the working tree differs from HEAD's version, demote errors out. Diagnostic: "commit your plan-body changes or `git stash` before demoting." Rationale: silently choosing HEAD-or-working-tree would lose user edits one direction or the other; refusing matches clank's "fail closed on risky implicit state" pattern (ruthless review of 91dc0b4).
-   - When clean: read `.clank/plans/<plan>.md` from HEAD. Write to one of:
+   - **Read plan body into memory** from HEAD's tree. Never reads the working tree (the dirty-refusal already ensured they match).
+   - **Determine target path** for the saved body:
      - **Default**: `.clank/queue/<NNN>-<plan>.md` where `<NNN>` is `--priority` (default 500).
      - **`--stub`**: `.clank/stubs/<plan>.md`.
-   - **Collision**: if the target file already exists, error out (don't clobber). The user picks a different priority or moves the existing file.
+   - **Collision pre-check**: if the target file already exists, error out (don't clobber). Detected NOW, not after rewrite.
 
-4. **Rewrite**: invoke the existing rewrite engine with all-Drop dispositions for the plan range. Foreign commits NOT in the range are KeepVerbatim. The engine produces a new chain that excludes the plan's commits entirely.
+4. **Rewrite**: invoke the existing rewrite engine with all-Drop dispositions for the plan range. Foreign commits NOT in the range stay `KeepVerbatim`. The engine produces a new chain that excludes the plan's commits entirely. If the engine returns an error (protected-branch refusal, branch-name collision under `--into-branch`, plumbing error, stale ref) → demote bails BEFORE any post-rewrite writes happen. No queue/stub file. No orphan cleanup. Filesystem matches pre-demote state.
 
-5. **Post-rewrite: clean orphaned feedback files**. Walk `.clank/agents/*/feedback/`; for each file whose name matches a dropped SHA (or maps to a dropped commit via the existing rewire indexing), delete it. Print a one-line summary of how many files were removed per agent.
+5. **Post-rewrite (only on success)**:
+   a. **Write the plan body** to the target path determined in step 3.
+   b. **Clean orphaned feedback files**: walk `.clank/agents/*/feedback/`; for each file whose name matches a dropped SHA (or maps to a dropped commit via the existing rewire indexing), delete it. Print a one-line summary of how many files were removed per agent.
+   c. Print success summary: dropped SHA count, queue/stub target written, orphan-feedback count.
 
-6. **Branch safety**: inherits `clank purge`'s protections. `--into-branch` writes the rewritten chain to a fresh branch; refuses to rewrite protected branches without `--allow-rewrite-protected`.
+6. **`--into-branch` semantics — preview-only path**. When `--into-branch <name>` is set, the rewrite engine writes the rewritten chain to a fresh branch and leaves HEAD on master untouched. In that case:
+   - The plan body is NOT written to the queue/stub.
+   - The orphaned feedback is NOT cleaned up.
+   - Print: "rewritten chain at `<name>`. To complete the demote: switch to `<name>` and run `clank demote <plan>` (without `--into-branch`)."
+   Rationale (codex review of 9bb7d0d): `--into-branch` is a preview/safety mechanism for the rewrite. Writing the queue file or cleaning feedback while master still has `.clank/plans/<plan>.md` active would leave the repo in a contradictory state (one active plan + one queued duplicate). The full demote semantics only fire on the in-place path.
+
+7. **Branch safety**: inherits `clank purge`'s protections. `--into-branch` refuses if `<name>` already exists. Refuses to rewrite protected branches in-place without `--allow-rewrite-protected`.
 
 ### Implementation note
 
@@ -78,7 +88,7 @@ The genuinely new code is the safety-check classification + the plan-body save. 
 | `--priority <N>` | Queue priority for the re-queued plan body (default 500). Ignored with `--stub`. |
 | `--stub` | Write to `.clank/stubs/<plan>.md` instead of `.clank/queue/`. |
 | `--force` | Allow demote when the range has `Rewrite` dispositions (your own code-touching commits). Has NO effect on `KeepVerbatim` (foreign commits) — those refuse unconditionally. |
-| `--into-branch <name>` | Write rewritten chain to a fresh branch (same as purge). Refuses if `<name>` already exists. Composes with `--dry`: prints the intended branch name without creating it. |
+| `--into-branch <name>` | Preview-only: write rewritten chain to a fresh branch and leave master + queue/stub + feedback untouched. To complete the demote, the user switches to `<name>` and re-runs without `--into-branch`. Refuses if `<name>` already exists. Composes with `--dry`: prints the intended branch name without creating it. |
 | `--dry` | Print the planned drop + safety check result + queue-write target + orphan feedback count; exit 0. Composes with `--into-branch`: shows the branch that would be created. |
 | `--yes` | Skip interactive confirmation. |
 | `--allow-rewrite-protected` | Inherited from purge. |
@@ -104,12 +114,13 @@ The "save plan body before rewrite" is a one-line filesystem op; do it BEFORE in
 - `clank demote <plan> --force` on the `Rewrite` error case drops the commits anyway (user opted in to losing their code).
 - `clank demote <plan> --force` on the `KeepVerbatim` error case STILL refuses — the foreign-commit refusal is unconditional (ruthless review of 91dc0b4: dropping someone else's commit is a coordination event, not a flag-flip).
 - `.clank/plans/<plan>.md` in the working tree differs from HEAD's version → demote errors out naming the dirty file, no filesystem changes. User commits/stashes before re-running.
-- `--into-branch <existing-name>` errors out with "branch already exists". No filesystem changes.
+- `--into-branch <existing-name>` errors out with "branch already exists". No filesystem changes — no queue/stub file, no feedback removed, original branch heads unchanged.
+- **Transactional rollback (codex review of 9bb7d0d)**: when the rewrite engine fails for ANY reason after pre-checks pass (protected-branch refusal without `--allow-rewrite-protected`, dirty non-plan worktree, stale ref, plumbing error, branch collision), the queue/stub file is NOT written and orphan feedback is NOT cleaned. Filesystem matches pre-demote state. The user retries demote after fixing the underlying issue.
 - `--into-branch <name> --dry` prints "would write rewritten chain to `<name>`" without creating the branch.
 - `clank demote <plan> --stub` writes the plan body to `.clank/stubs/<plan>.md` instead of the queue.
 - `clank demote <plan> --priority 100` puts the queue file at `.clank/queue/100-<plan>.md`.
 - `clank demote <plan> --dry` prints the plan body's intended target, the per-commit disposition table, the orphan-feedback count, and exits 0 with no filesystem changes.
-- `clank demote <plan> --into-branch <name>` writes the rewritten chain to a fresh branch; HEAD is unchanged.
+- `clank demote <plan> --into-branch <name>` writes the rewritten chain to a fresh branch; HEAD is unchanged; **no queue/stub file is written**; **no orphan feedback is cleaned**; stdout prints the completion-recipe ("switch to `<name>` and re-run without `--into-branch`").
 - Target-collision: a pre-existing `.clank/queue/<NNN>-<plan>.md` (or `.clank/stubs/<plan>.md` with `--stub`) causes demote to error before any rewrite. Filesystem unchanged.
 - After demote, `clank status` shows the plan back in the queue and no longer in `.clank/plans/`.
 - `cargo test --workspace` passes.
@@ -127,9 +138,11 @@ A new `crates/cli/tests/demote_integration.rs` (mirrors the existing rewrite/pur
 - `demote_stub_writes_to_stubs_dir`: `--stub` lands at `.clank/stubs/<plan>.md`.
 - `demote_priority_writes_to_queue_with_priority`: `--priority 100` lands at `.clank/queue/100-<plan>.md`.
 - `demote_dry_no_changes`: `--dry` prints intent (per-commit disposition + queue target + orphan count) + exits 0 without filesystem changes.
-- `demote_into_branch_does_not_touch_head`: `--into-branch <name>` leaves master alone, writes the chain to `<name>`.
-- `demote_into_branch_collision_errors`: pre-create `<name>`; assert demote refuses + filesystem unchanged.
-- `demote_into_branch_with_dry_does_not_create_branch`: `--into-branch <name> --dry` reports intent + leaves `<name>` non-existent.
+- `demote_into_branch_does_not_touch_head`: `--into-branch <name>` leaves master alone, writes the chain to `<name>`. NO queue file written. NO feedback removed. stdout names the completion-recipe.
+- `demote_into_branch_collision_errors`: pre-create `<name>`; assert demote refuses + filesystem unchanged (no queue file, no feedback removed).
+- `demote_into_branch_with_dry_does_not_create_branch`: `--into-branch <name> --dry` reports intent + leaves `<name>` non-existent + no queue file written.
+- `demote_protected_branch_refusal_leaves_no_partial_state`: protected branch + no `--allow-rewrite-protected`; assert error + queue file NOT written + feedback NOT cleaned. Locks in the transactional rollback for the most common failure mode.
+- `demote_target_collision_detected_before_rewrite`: pre-populate `.clank/queue/500-<plan>.md`; assert error fires BEFORE git history is touched (HEAD unchanged, no orphaned partial-rewrite state).
 - `demote_priority_collision_errors`: pre-populate `.clank/queue/500-<plan>.md`; assert demote errors out before any rewrite.
 - `demote_stub_collision_errors`: pre-populate `.clank/stubs/<plan>.md`; assert demote --stub errors out.
 - `demote_orphaned_feedback_removed`: per-plan feedback files (`.clank/agents/*/feedback/<dropped-sha>.md`) are gone after a successful demote.
