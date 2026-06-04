@@ -50,9 +50,48 @@ The `any()` calls are the bug. Change to all-of-expected-reviewers semantics:
 
 For the latest reviewable SHA on an active plan:
 
-1. Enumerate the expected reviewer set as above. The function signature changes to `compute_gate(reviews: &[ReviewEntry], expected_reviewers: &[AgentLabel])` — pass the expected set in. Callers (`derive_status` at `wait.rs:189`, and the two direct call sites at `wait.rs:205` and `wait.rs:262`) need to source this from `RepoState`.
-2. For each expected reviewer, look up the feedback file `<repo>/.clank/agents/<label>/feedback/<sha>.md` (already done by the existing `ReviewLookup` trait; the entries arrive in the `reviews` slice).
-3. Gate state derives from the *full set*. Verdict semantics: `Approve` = mid-flight signoff (master can continue iterating), `Finished` = "this plan is done" (master can finalize). Rules applied in order:
+1. **Threading the expected reviewer list into core (sans-IO).** `RepoState` is sans-IO and intentionally doesn't read `.clank/agents/`. Agent enumeration lives in the CLI filesystem layer (`agent_store::load_all_agent_configs` at `crates/cli/src/agent_store.rs:48`). So the reviewer list must be threaded *into* core via an existing sans-IO surface, not loaded from inside core.
+
+   **Chosen path: extend `WorkPolicy`** at `crates/core/src/wait.rs:142` with a new field:
+   ```rust
+   pub struct WorkPolicy {
+       pub plan_feedback: bool,
+       pub adhoc_feedback: bool,
+       pub expected_reviewers: Vec<AgentLabel>,
+   }
+   ```
+   `WorkPolicy` is already where the CLI passes config-derived flags into core, and is already threaded through `derive_status(&self, reviews, policy)`. Adding the reviewer list here keeps the sans-IO boundary intact.
+
+   Rejected alternative: extending `ReviewLookup` (codex's other suggestion). The trait's contract is "give me reviews for this SHA"; loading agent configs is a separate IO concern.
+
+2. **`compute_gate` signature changes** to accept the expected reviewer list:
+   ```rust
+   pub fn compute_gate(
+       reviews: &[ReviewEntry],
+       expected_reviewers: &[AgentLabel],
+   ) -> CommitGateState
+   ```
+   Both internal call sites in `derive_status` (lines 205, 262) pass `&policy.expected_reviewers`.
+3. **CLI-side reviewer enumeration (callers of `derive_status`).** Every call site of `derive_status` in clank-cli must populate `WorkPolicy.expected_reviewers` before invoking. Sites to update:
+   - `crates/cli/src/cli/status.rs:63` (`clank status`)
+   - `crates/cli/src/cli/open.rs:696` (`clank open`)
+   - `crates/cli/src/cli/wfw.rs:191`, `:305` (`clank wfw`)
+   - `crates/cli/src/preview.rs:80` and the local wrapper at `:443` (used by `clank finish` preview)
+
+   Each call site does:
+   ```rust
+   let expected_reviewers = agent_store::load_all_agent_configs(repo)?
+       .into_iter()
+       .filter(|(_, cfg)| cfg.role == AgentRole::Reviewers)
+       .map(|(label, _)| label)
+       .collect();
+   let policy = WorkPolicy { plan_feedback, adhoc_feedback, expected_reviewers };
+   ```
+   This is the existing enumeration mechanism; we're just feeding its output into the policy struct.
+
+4. For each expected reviewer, look up the feedback file (already done by the existing `ReviewLookup` trait; the entries arrive in the `reviews` slice).
+
+5. Gate state derives from the *full set*. Verdict semantics: `Approve` = mid-flight signoff (master can continue iterating), `Finished` = "this plan is done" (master can finalize). Rules applied in order:
    - If any review has verdict `RequestChanges` or `Unmarked` → `ChangesRequested`.
    - Else if any expected reviewer has NO entry in `reviews` → `Unreviewed`.
    - Else if EVERY expected reviewer posted `Finished` → `Finished` (master can `clank finish`).
@@ -63,7 +102,7 @@ Critical contract: a single reviewer posting `Finished` is NOT enough to make th
 
 The existing `CommitGateState` enum variants (`Unreviewed`, `Approved`, `Finished`, `ChangesRequested`) are sufficient — no new variants needed. Their *meaning* changes: `Unreviewed` becomes "missing reviewer(s)", `Approved` becomes "every reviewer signed off mid-flight (continue OK)", `Finished` becomes "every reviewer marked done (finalize OK)".
 
-The `waiting_on` projection at `WaitingOn` (separate function — locate during impl) also needs updating to surface which specific reviewers are missing when the gate is `Unreviewed`.
+The `waiting_on` projection in `derive_status` (lines 220-246) currently maps `Unreviewed` → `WaitingOn::FirstReview`. With multi-reviewer semantics, this needs to surface *which* reviewers are missing. Change `WaitingOn::FirstReview` to carry the missing reviewer set (e.g., `FirstReview { missing: Vec<AgentLabel> }`), OR introduce a sibling variant `AwaitingReviewers { missing: Vec<AgentLabel> }` and reserve `FirstReview` for the "zero reviews yet" case. Pick during implementation based on which variant's existing consumers would break least.
 
 ### `clank wfw` for master
 
