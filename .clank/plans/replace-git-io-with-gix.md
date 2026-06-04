@@ -35,6 +35,12 @@ gix = { version = "0.84", default-features = false, features = [
 
 Explicitly **not** enabling: `blocking-network-client`, `async-network-client`, any HTTP transport features. We don't clone/fetch/push from git_io.
 
+**Feature-trim ladder (if the size escape hatch fires):** the four enabled features rank by load-bearing-ness as `revision` > `blob-diff` > `max-performance-safe` > `parallel`. The first two are migration targets (rev_walk + tree-diff are the whole point); never trim them. If 45MB is exceeded, drop in this order:
+
+1. **Drop `parallel` first.** clank never caches a `Repository` across threads today; `Send`-ness is unused. Smallest impact.
+2. **Drop `max-performance-safe` second.** Accept the pure-Rust zlib decompression perf hit. clank's git workloads are small (one repo, dozens of commits, kilobytes of blobs), so the hit is bounded.
+3. **Stop.** If we're still over budget after those two, the plan's premise is wrong and we should reassess (not silently drop a load-bearing feature).
+
 ### Repository handle pattern
 
 Today: each `git_io::*` function shells out from scratch. With gix, opening a `Repository` parses config and probes the filesystem — non-trivial per-call cost.
@@ -62,6 +68,28 @@ Migration default: keep `&Path` signatures, open per-call. Adding a `Repo` cache
 | `snapshot(repo_root)` | composes `head_id` + `commit_message` + `tree_clank_paths` + `diff_tree_changes` on one opened `Repository` |
 | `collect_feedback_files(repo_root)` | unchanged — filesystem walk, not git |
 
+### `first_added_commit` algorithm sketch
+
+The only function without a one-liner gix equivalent. Walks `first_parent_only` from HEAD newest→oldest looking for the commit where `path` was introduced:
+
+```
+for info in repo.rev_walk([head]).first_parent_only().all()? {
+    let commit = repo.find_commit(info.id)?;
+    let in_this = commit.tree()?.lookup_entry_by_path(path)?.is_some();
+    if !in_this { continue; }                           // path not here yet — older
+    let parent = match commit.parent_ids().next() {
+        Some(p) => repo.find_commit(p.detach())?.tree()?,
+        None => return Ok(Some(commit.id().detach())),  // root commit with path = intro
+    };
+    if parent.lookup_entry_by_path(path)?.is_none() {
+        return Ok(Some(commit.id().detach()));          // path absent in parent = intro
+    }
+}
+Ok(None)                                                // path never present on first-parent line
+```
+
+Semantics match the current shell-out: "the most recent first-parent commit where this path was introduced". ~15-20 LoC including error mapping.
+
 ### Sharp edges to know about up front
 
 1. **`Commit::author()` / `committer()` return `Result`** since gix 0.76 (truly malformed headers fail). Plan error handling through `GitIoError`.
@@ -71,7 +99,7 @@ Migration default: keep `&Path` signatures, open per-call. Adding a `Repo` cache
 5. **No built-in "first commit introducing a path"** — `first_added_commit` is the only function that needs hand-rolled logic (~20 LoC).
 6. **Object cache:** call `repo.object_cache_size_if_unset(64 * 1024 * 1024)` once after opening before heavy traversal. gix docs flag this explicitly.
 7. **Threading:** `Repository` is `!Send` without the `parallel` feature, never `Sync`. Use `ThreadSafeRepository` if we ever cache a handle across threads (we currently don't).
-8. **Semver pre-1.0**: gix breaks on minor bumps. Pin to `0.84` (caret-major-zero matches patch only). Plan to revisit on each minor bump.
+8. **Semver pre-1.0 cadence (recurring maintenance tax)**: gix releases minor versions roughly every 1-2 months and breaking changes are common in those bumps. Adding gix puts clank on a treadmill where every couple of months someone reviews a breaking-change PR. This is the recurring cost the migration accepts. The honest framing: we're trading subprocess fragility (silent runtime drift via `core.quotePath`, format changes) for library fragility (loud compile-time breakage on `cargo update`). Compile-time breakage is preferable — you find out immediately, not when a user reports a mysterious diff misparse. Pin to `0.84` (caret-major-zero matches patch only). A follow-up plan vendoring a thin wrapper crate to amortize this churn is a possibility but not in scope here.
 
 ### Scope of this plan
 
@@ -95,18 +123,42 @@ Out:
 Each step is its own commit. Reviewers approve incrementally. Goal: existing tests stay green after every commit.
 
 1. **Add gix dependency** (Cargo.toml + Cargo.lock). No code change yet; just confirms the dep tree compiles and binary size delta is acceptable. Verify `cargo build --workspace` clean.
-2. **Migrate `commit_message`** — smallest text-parser; tests are minimal; serves as the spike that confirms gix's API fits our error model.
+2. **Migrate `commit_message` — explicit spike-and-evaluate checkpoint.** Smallest text-parser; tests are minimal. After this commit lands and is approved, the implementer stops and evaluates: did `gix::Commit::message()` integrate cleanly into `GitIoError`? Did binary size grow within budget? Did the type-mapping between `bstr::BStr` and our `String` return type fall out naturally? If any of those answers is "no, this is awkward", the plan reverts (one commit revert, dep removed) and we re-evaluate scope. This is the cheap-bailout point. Past this checkpoint, the migration commits.
 3. **Migrate `rev_parse_head`, `parent_of`, `commit_parent_count`** — trivial, mechanical.
 4. **Migrate `is_ancestor`** — uses `merge_base` idiom.
 5. **Migrate the `first_parent_commits_*` family** (3 functions). They share the rev_walk builder pattern; pull a small helper out.
 6. **Migrate `show_blob`, `ls_tree_plans`, `tree_plan_paths`, `tree_clank_paths`** — tree-iteration family. Recorder-based.
 7. **Migrate `first_added_commit`** — the hand-rolled walk.
-8. **Migrate `diff_tree_changes`** — the biggest win. ~100 LoC of `parse_diff_tree` + 10+ parser tests go away. The function-output tests stay.
+8. **Migrate `diff_tree_changes`** — the biggest win. The 10 `parse_diff_tree_*` tests in `git_io.rs:938-1048` are *scenario tests*, not parser-implementation noise. Each verifies a real behavioral case (rename out of plans, plans-with-code, finish detection via plan-deleted+finished-added, etc.). They must be **converted, not deleted**.
+
+   **Test conversion plan — one-to-one mapping:**
+
+   For each of the 10 `parse_diff_tree_*` tests, write an integration test in a new `crates/cli/tests/diff_tree_changes_scenarios.rs` file that:
+   - Builds a real git tree using `tempfile` + `git init` + commits matching the scenario shape.
+   - Calls `diff_tree_changes(repo, sha)` directly.
+   - Asserts the same `CommitChanges` shape the parser test was asserting.
+
+   Scenario coverage to preserve, by name:
+   - `single_plan_intro` — first commit introducing `.clank/plans/<plan>.md`.
+   - `rename_out_of_plans_is_delete` — `git mv .clank/plans/x.md other.md` registers as plan deletion.
+   - `rename_into_plans_is_intro` — `git mv other.md .clank/plans/x.md` registers as plan intro.
+   - `plan_revision_with_code` — same commit touches a plan and unrelated source.
+   - `pure_code` — no `.clank/` touch.
+   - `multi_plan_touch` — one commit touches multiple `.clank/plans/*.md`.
+   - `ignores_other_clank_paths` — `.clank/agents/` etc. is not classified as plan touch.
+   - `finish_detected_when_plan_deleted_and_finished_added` — paired delete+add detects finish.
+   - `finished_added_alone_is_finish` — `.clank/finished/<plan>.md` added without paired delete still detects finish.
+   - `finished_without_md_extension_ignored` — `.clank/finished/<plan>` with no `.md` doesn't count.
+
+   Only after the 10 integration tests are written and green is `parse_diff_tree` + its parser tests removed in the same commit. The new tests are the spec; the parser deletion is the cleanup.
+
+   Acceptance check for this step: `git_io.rs` line count drops by ~150-200; `diff_tree_changes_scenarios.rs` exists with 10 tests passing.
 9. **Migrate `snapshot`** — falls out naturally once its primitives are migrated.
 
 ## Verification
 
 - `cargo build --workspace` + `cargo test --workspace` green after every commit.
+- After the final migration commit: `grep -n "run_ok\b" crates/cli/src/git_io.rs` must return nothing. (Mutating ops live elsewhere; `git_io.rs` is reads-only after this plan.)
 - A spike test: synth a repo with `diff.mnemonicPrefix=true` set and confirm the gix-backed `diff_tree_changes` is immune (the shell-out path would silently break).
 - Binary size diff before/after via `cargo bloat --release` or `ls -la target/release/clank`. Plan acceptance: ≤ 50% size growth (clank is currently around 30MB stripped; under 45MB after migration is acceptable; over that triggers a feature-flag trim).
 - Spot-check: at least one consumer (`rebuild.rs`) end-to-end with a real local clone, confirm no behavior regression.
