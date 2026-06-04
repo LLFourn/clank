@@ -52,13 +52,16 @@ For the latest reviewable SHA on an active plan:
 
 1. Enumerate the expected reviewer set as above. The function signature changes to `compute_gate(reviews: &[ReviewEntry], expected_reviewers: &[AgentLabel])` — pass the expected set in. Callers (`derive_status` at `wait.rs:189`, and the two direct call sites at `wait.rs:205` and `wait.rs:262`) need to source this from `RepoState`.
 2. For each expected reviewer, look up the feedback file `<repo>/.clank/agents/<label>/feedback/<sha>.md` (already done by the existing `ReviewLookup` trait; the entries arrive in the `reviews` slice).
-3. Gate state derives from the *full set*:
+3. Gate state derives from the *full set*. Verdict semantics: `Approve` = mid-flight signoff (master can continue iterating), `Finished` = "this plan is done" (master can finalize). Rules applied in order:
    - If any review has verdict `RequestChanges` or `Unmarked` → `ChangesRequested`.
-   - If any expected reviewer has NO entry in `reviews` → `Unreviewed` (the existing variant already covers this semantic — keep it; the new contract is "Unreviewed means at least one expected reviewer hasn't weighed in").
-   - If every expected reviewer has posted `Approve` or `Finished`, AND at least one is `Finished` → `Finished`.
-   - If every expected reviewer has posted `Approve` or `Finished`, and none is `Finished` → `Approved`.
+   - Else if any expected reviewer has NO entry in `reviews` → `Unreviewed`.
+   - Else if EVERY expected reviewer posted `Finished` → `Finished` (master can `clank finish`).
+   - Else if every expected reviewer posted `Approve` or `Finished` (and not all `Finished`) → `Approved` (master can continue, but cannot finalize yet because at least one reviewer hasn't said the plan is done).
+   - (Unreachable given the checks above.)
 
-The existing `CommitGateState` enum variants (`Unreviewed`, `Approved`, `Finished`, `ChangesRequested`) are sufficient — no new variants needed. Their *meaning* changes: `Unreviewed` becomes "missing reviewer(s)", `Approved`/`Finished` become "consensus reached".
+Critical contract: a single reviewer posting `Finished` is NOT enough to make the gate `Finished`. ALL expected reviewers must post `Finished`. If two reviewers exist and one says `Finished` while the other says `Approve`, the gate is `Approved` (continue), not `Finished` (finalize). This matches the existing acceptance line that says master cannot `clank finish` until every reviewer has posted FINISHED — codex flagged that my earlier draft violated this by promoting "one Finished + others Approve" to gate `Finished`.
+
+The existing `CommitGateState` enum variants (`Unreviewed`, `Approved`, `Finished`, `ChangesRequested`) are sufficient — no new variants needed. Their *meaning* changes: `Unreviewed` becomes "missing reviewer(s)", `Approved` becomes "every reviewer signed off mid-flight (continue OK)", `Finished` becomes "every reviewer marked done (finalize OK)".
 
 The `waiting_on` projection at `WaitingOn` (separate function — locate during impl) also needs updating to surface which specific reviewers are missing when the gate is `Unreviewed`.
 
@@ -94,8 +97,8 @@ In `clank-core` (gate projection unit tests):
 - Two reviewers, both APPROVE → `approved`.
 - Two reviewers, one APPROVE one REQUEST_CHANGES → `changes_requested`.
 - Two reviewers, one APPROVE one missing-feedback → `awaiting_reviewers` (or current equivalent), `waiting_on: { reviewers: [<missing>] }`.
-- Two reviewers, both FINISHED → `ready_to_finalize`.
-- Two reviewers, one FINISHED one APPROVE → `ready_to_finalize` (the master CAN finalize since the spec is "all signed off"; promote the most-decisive verdict).
+- Two reviewers, both FINISHED → `Finished` (master can `clank finish`).
+- Two reviewers, one FINISHED one APPROVE → `Approved` (master can continue but NOT finalize — only one reviewer has signed off as done; the other still treats it as mid-flight).
 - Zero reviewers (master-only repo) → gate decided by master alone (preserve existing single-agent behavior).
 
 In `clank-cli` (`clank wfw` integration):
