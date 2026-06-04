@@ -59,7 +59,7 @@ impl StatusSnapshot {
         let work_policy = clank_core::wait::WorkPolicy {
             plan_feedback: config.review.plan_feedback,
             adhoc_feedback: config.review.adhoc_feedback,
-            expected_reviewers: load_expected_reviewers(repo),
+            expected_reviewers: load_expected_reviewers(repo)?,
         };
         let reviews = crate::fs_review_lookup::FsReviewLookup::new(repo, state.head.as_ref());
         let work_status = state.fold.derive_status(&reviews, &work_policy);

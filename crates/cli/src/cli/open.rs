@@ -688,10 +688,20 @@ async fn fold_summary(repo_root: &Path) -> (usize, Option<String>, Option<String
             Err(e) => return (0, None, Some(format!("fold failed: {e}"))),
         };
     let config = crate::cli::config::load(repo_root);
+    let expected_reviewers = match crate::agent_store::load_expected_reviewers(repo_root) {
+        Ok(v) => v,
+        Err(e) => {
+            return (
+                0,
+                None,
+                Some(format!("loading registered reviewers failed: {e}")),
+            );
+        }
+    };
     let work_policy = clank_core::wait::WorkPolicy {
         plan_feedback: config.review.plan_feedback,
         adhoc_feedback: config.review.adhoc_feedback,
-        expected_reviewers: crate::agent_store::load_expected_reviewers(repo_root),
+        expected_reviewers,
     };
     let reviews = crate::fs_review_lookup::FsReviewLookup::new(repo_root, state.head.as_ref());
     let work_status = state.fold.derive_status(&reviews, &work_policy);

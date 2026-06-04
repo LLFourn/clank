@@ -58,17 +58,22 @@ pub fn load_all_agent_configs(repo: &Path) -> anyhow::Result<Vec<(AgentLabel, Ag
 
 /// Labels of every agent in this repo with `role: Reviewers`.
 /// Used by gate-projection callers to populate
-/// `WorkPolicy.expected_reviewers`. Lossy: agents whose config
-/// fails to parse are silently skipped (use `clank doctor` to
-/// surface those).
-pub fn load_expected_reviewers(repo: &Path) -> Vec<AgentLabel> {
+/// `WorkPolicy.expected_reviewers`.
+///
+/// **Strict** by design: a malformed `.clank/agents/<label>/config.json`
+/// is propagated as an error rather than silently dropping that
+/// reviewer. The gate's "zero registered reviewers → auto-Approved"
+/// rule means lossy loading would fail open — a single corrupted
+/// reviewer config could let master finalize without review. This
+/// path fails closed instead. Use `clank doctor` to inspect / fix
+/// broken configs.
+pub fn load_expected_reviewers(repo: &Path) -> anyhow::Result<Vec<AgentLabel>> {
     use clank_core::vocab::Role;
-    load_all_agent_configs_lossy(repo)
-        .unwrap_or_default()
+    Ok(load_all_agent_configs(repo)?
         .into_iter()
         .filter(|(_, cfg)| cfg.role == Role::Reviewers)
         .map(|(label, _)| label)
-        .collect()
+        .collect())
 }
 
 /// Same as [`load_all_agent_configs`] but silently drops agents

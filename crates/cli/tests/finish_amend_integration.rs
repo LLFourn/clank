@@ -93,6 +93,46 @@ fn finish_amend_dry_purge_does_not_mutate_head_when_already_finished() {
 }
 
 #[test]
+fn finish_fails_closed_on_malformed_reviewer_config() {
+    // Regression: a corrupted .clank/agents/<label>/config.json
+    // must NOT silently behave like a zero-reviewer repo (which would
+    // auto-Approve and let master finalize without any review).
+    // The expected-reviewer loader is strict; finalize fails closed.
+    let dir = init_repo();
+    let repo = dir.path();
+    write(repo, ".clank/plans/foo.md", "# foo\n");
+    // Malformed JSON in codex's config — this would silently drop
+    // codex under lossy loading.
+    write(
+        repo,
+        ".clank/agents/codex/config.json",
+        "{ this is not valid JSON",
+    );
+    git(repo, &["add", "-A"]);
+    git(repo, &["commit", "--quiet", "-m", "[foo] intro"]);
+
+    let out = run_clank(repo, &["finish", "foo"]);
+    assert!(
+        !out.status.success(),
+        "clank finish must fail closed when a reviewer config is malformed; got stdout=`{}` stderr=`{}`",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        combined.to_lowercase().contains("codex")
+            || combined.to_lowercase().contains("config")
+            || combined.to_lowercase().contains("agent")
+            || combined.to_lowercase().contains("json"),
+        "expected error to mention the broken config; got: {combined}"
+    );
+}
+
+#[test]
 fn finish_rejects_approve_without_finished() {
     // Plan intro is APPROVED but not FINISHED. clank finish must
     // refuse — only a FINISHED verdict unlocks finalize when there

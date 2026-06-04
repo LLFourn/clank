@@ -39,6 +39,8 @@ pub enum PreviewError {
     FeedbackScan(#[from] crate::feedback_scan::FeedbackScanError),
     #[error("worktree facts: {0}")]
     WorktreeFacts(#[from] crate::worktree_facts::WorktreeFactsError),
+    #[error("loading registered reviewers: {0}")]
+    AgentLoad(anyhow::Error),
 }
 
 /// Single-plan finalize preview. The plan must be active in
@@ -78,7 +80,8 @@ pub async fn build_finish_preview(
     let latest_reviewable_sha = active.and_then(latest_reviewable);
 
     let gate_state = compute_gate(repo_root, latest_reviewable_sha.as_ref())?;
-    let expected_reviewers = crate::agent_store::load_expected_reviewers(repo_root);
+    let expected_reviewers =
+        crate::agent_store::load_expected_reviewers(repo_root).map_err(PreviewError::AgentLoad)?;
 
     let readiness = compute_finalize_readiness(
         is_finished,
@@ -456,7 +459,8 @@ fn compute_gate(
     };
     let reviews = crate::fs_review_lookup::FsReviewLookup::new(repo_root, Some(target));
     let entries = reviews.reviews_for(target);
-    let expected_reviewers = crate::agent_store::load_expected_reviewers(repo_root);
+    let expected_reviewers =
+        crate::agent_store::load_expected_reviewers(repo_root).map_err(PreviewError::AgentLoad)?;
     Ok(clank_core::wait::compute_gate(
         &entries,
         &expected_reviewers,
