@@ -137,6 +137,45 @@ fn doctor_warns_on_unbound_master_symmetrically() {
 }
 
 #[test]
+fn doctor_warns_when_launch_command_missing_from_path() {
+    // Phase C of agent-config-and-start: doctor surfaces a Warn
+    // when an agent's launch.command isn't on $PATH. Catches
+    // typos before the user tries `clank agent start <name>`.
+    let dir = init_repo();
+    let repo = dir.path();
+    write(repo, ".clank/.gitignore", ".gitignore\n");
+    write(
+        repo,
+        ".clank/agents/codex/config.json",
+        r#"{
+            "auto_mode":"on",
+            "role":"reviewers",
+            "session":{"id":"11111111-1111-1111-1111-111111111111","tool":"codex","updated_at":"2026-06-04T12:00:00Z"},
+            "launch":{"command":"definitely-not-installed-anywhere"}
+        }"#,
+    );
+
+    let out = run_doctor(repo);
+    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+    let parsed: serde_json::Value = serde_json::from_str(&stdout).expect("doctor JSON parse");
+    let checks = parsed.as_array().expect("array");
+    let launch_warn = checks
+        .iter()
+        .find(|c| c["name"].as_str() == Some("agent: codex launch"))
+        .expect("expected agent: codex launch check");
+    assert_eq!(launch_warn["status"], "warn");
+    let msg = launch_warn["message"].as_str().unwrap_or("");
+    assert!(
+        msg.contains("not found on $PATH"),
+        "warning should mention $PATH; got: {msg}"
+    );
+    assert!(
+        msg.contains("definitely-not-installed-anywhere"),
+        "warning should name the offending command; got: {msg}"
+    );
+}
+
+#[test]
 fn doctor_warn_for_unbound_does_not_introduce_new_fail() {
     // The unbound-reviewer warning must not escalate to Fail status
     // for the agent entry itself. (Doctor's overall exit code may

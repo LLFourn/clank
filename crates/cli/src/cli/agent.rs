@@ -8,17 +8,21 @@
 //! path, since `clank agent list` is the user's window onto the
 //! gate's reviewer set.
 
+use std::path::Path;
+
 use serde::Serialize;
 
-use crate::agent_store::load_all_agent_configs;
-use clank_core::agent_config::AgentConfig;
+use crate::agent_store::{load_agent_config, load_all_agent_configs};
+use clank_core::agent_config::{AgentConfig, LaunchConfig, Session};
 use clank_core::ids::AgentLabel;
+use clank_core::vocab::Tool;
 
-use super::{AgentArgs, AgentCmd, AgentListArgs, resolve_repo};
+use super::{AgentArgs, AgentCmd, AgentListArgs, AgentStartArgs, resolve_repo};
 
 pub async fn run(args: AgentArgs) -> anyhow::Result<()> {
     match args.command {
         AgentCmd::List(a) => list(a),
+        AgentCmd::Start(a) => start(a),
     }
 }
 
@@ -112,6 +116,152 @@ fn print_human(rows: &[AgentRow]) {
             r.label, r.role, bound, tool
         );
     }
+}
+
+/// `clank agent start <name>`: exec into the agent's CLI tool
+/// with session restored and the configured launch profile
+/// applied. Requires a bound session (one policy: no fallback
+/// to bare tool — see plan rationale at Phase B step 2).
+fn start(args: AgentStartArgs) -> anyhow::Result<()> {
+    let repo = resolve_repo(args.repo.as_deref())?;
+    let label = AgentLabel::parse(&args.name)
+        .map_err(|e| anyhow::anyhow!("invalid agent label `{}`: {e}", args.name))?;
+
+    let cfg = match load_agent_config(&repo, &label)? {
+        Some(c) => c,
+        None => {
+            anyhow::bail!(
+                "no agent `{name}` in this repo. Create `.clank/agents/{name}/config.json` \
+                 (or hand-edit one from the seed) before running `clank agent start`.",
+                name = args.name
+            );
+        }
+    };
+
+    let session = cfg.session.as_ref().ok_or_else(|| {
+        anyhow::anyhow!(
+            "agent `{name}` has no bound session. Run `clank as {name}` from inside the agent's CLI to bind.",
+            name = args.name
+        )
+    })?;
+
+    let composed = compose_launch(&repo, session, cfg.launch.as_ref());
+
+    if args.print {
+        print_composed(&composed);
+        return Ok(());
+    }
+
+    exec_composed(composed)
+}
+
+/// Composed launch line: executable + argv + env additions.
+#[derive(Debug, Clone)]
+struct ComposedLaunch {
+    program: String,
+    args: Vec<String>,
+    env_overrides: std::collections::BTreeMap<String, String>,
+}
+
+fn compose_launch(repo: &Path, session: &Session, launch: Option<&LaunchConfig>) -> ComposedLaunch {
+    let tool = session.tool;
+    let program = launch
+        .and_then(|l| l.command.clone())
+        .unwrap_or_else(|| tool.as_str().to_string());
+
+    let launch_args = launch.map(|l| l.args.clone()).unwrap_or_default();
+
+    let session_restore = session_restore_args(tool, session.id.as_str(), repo);
+
+    let mut args = launch_args;
+    args.extend(session_restore);
+
+    let env_overrides = launch.map(|l| l.env.clone()).unwrap_or_default();
+
+    ComposedLaunch {
+        program,
+        args,
+        env_overrides,
+    }
+}
+
+/// Tool-specific session-restore suffix. Goes AFTER `launch.args`
+/// so codex's `resume` subcommand doesn't capture them (see Phase
+/// B step 3 of the plan).
+fn session_restore_args(tool: Tool, session_id: &str, repo: &Path) -> Vec<String> {
+    match tool {
+        Tool::Claude => vec!["--resume".into(), session_id.into()],
+        Tool::Codex => vec![
+            "resume".into(),
+            session_id.into(),
+            "--cd".into(),
+            repo.to_string_lossy().into_owned(),
+        ],
+    }
+}
+
+/// Print the composed launch: shell-quoted argv on stdout, env
+/// diff on stderr. Used by `--print` for tests + zellij-style
+/// introspection.
+fn print_composed(c: &ComposedLaunch) {
+    let mut line = shell_quote(&c.program);
+    for a in &c.args {
+        line.push(' ');
+        line.push_str(&shell_quote(a));
+    }
+    println!("{line}");
+    if !c.env_overrides.is_empty() {
+        for (k, v) in &c.env_overrides {
+            eprintln!("env: {k}={v}");
+        }
+    }
+}
+
+fn shell_quote(s: &str) -> String {
+    // POSIX single-quote escaping. Closes out for embedded
+    // single quotes via the standard `'\''` dance.
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('\'');
+    for ch in s.chars() {
+        if ch == '\'' {
+            out.push_str("'\\''");
+        } else {
+            out.push(ch);
+        }
+    }
+    out.push('\'');
+    out
+}
+
+#[cfg(unix)]
+fn exec_composed(c: ComposedLaunch) -> anyhow::Result<()> {
+    use std::os::unix::process::CommandExt;
+    let mut cmd = std::process::Command::new(&c.program);
+    cmd.args(&c.args);
+    for (k, v) in &c.env_overrides {
+        cmd.env(k, v);
+    }
+    // `exec` replaces the current process; the only return
+    // value is the io::Error if exec itself fails (e.g.
+    // command-not-found, permissions).
+    let err = cmd.exec();
+    Err(anyhow::anyhow!("failed to exec `{}`: {err}", c.program))
+}
+
+#[cfg(not(unix))]
+fn exec_composed(c: ComposedLaunch) -> anyhow::Result<()> {
+    // Non-unix fallback: spawn + wait. Process replacement isn't
+    // available on Windows; the calling shell sees clank exit
+    // with the child's status.
+    let status = std::process::Command::new(&c.program)
+        .args(&c.args)
+        .envs(c.env_overrides.iter())
+        .status()
+        .map_err(|e| anyhow::anyhow!("failed to spawn `{}`: {e}", c.program))?;
+    if !status.success() {
+        anyhow::bail!("`{}` exited with status {}", c.program, status);
+    }
+    Ok(())
 }
 
 #[cfg(test)]

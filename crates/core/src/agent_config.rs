@@ -13,6 +13,8 @@
 //! THE master" — gate state is computed from the cumulative
 //! participant set, not from role claims.
 
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
 
 use crate::ids::{AgentLabel, SessionId};
@@ -44,6 +46,40 @@ pub struct AgentConfig {
     /// `CLAUDE_CODE_SESSION_ID` / `CODEX_THREAD_ID` env var.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session: Option<Session>,
+    /// Per-agent launch profile for `clank agent start <label>`.
+    /// `None` means "use the tool's bare name with no extra args
+    /// or env." Populate to attach a skill / profile / env to
+    /// this agent's spawner.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub launch: Option<LaunchConfig>,
+}
+
+/// Per-agent launch profile. Consumed by `clank agent start`.
+///
+/// Args are spliced BEFORE the session-restore suffix (claude's
+/// `--resume <id>` or codex's `resume <id> --cd <repo>`) so they
+/// attach to the top-level tool. For codex specifically: flags
+/// AFTER the `resume` subcommand attach to `resume`, not to the
+/// `codex` binary; putting `launch.args` first preserves the
+/// typical use case (`codex --profile deep resume <id>`). For
+/// claude (flat flags) position is cosmetic, but the same rule
+/// keeps the mental model consistent.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct LaunchConfig {
+    /// Override the executable. `None` falls back to the
+    /// session-tool's bare name (`claude` / `codex`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command: Option<String>,
+    /// Args passed to the executable BEFORE the session-restore
+    /// suffix. Example: `["--profile", "deep"]` for a codex agent
+    /// produces `codex --profile deep resume <id> --cd <repo>`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub args: Vec<String>,
+    /// Env vars merged onto the calling process env. On key
+    /// collision, this map wins ("config wins over inherited
+    /// environment").
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub env: BTreeMap<String, String>,
 }
 
 /// One session's binding to an agent label. Stored under
@@ -103,6 +139,73 @@ mod tests {
                 id: session_id("742f6a04-f174-409a-ab01-419a16c5f372"),
                 tool: Tool::Claude,
                 updated_at: "2026-05-23T16:24:47+10:00".into(),
+            }),
+            launch: None,
+        };
+        let json = serde_json::to_string(&cfg).unwrap();
+        let back: AgentConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(cfg, back);
+    }
+
+    #[test]
+    fn launch_field_deserializes_when_absent() {
+        let json = r#"{ "auto_mode": "off" }"#;
+        let cfg: AgentConfig = serde_json::from_str(json).unwrap();
+        assert!(cfg.launch.is_none());
+        let back = serde_json::to_string(&cfg).unwrap();
+        assert!(
+            !back.contains("launch"),
+            "Option::None must not serialize: {back}"
+        );
+    }
+
+    #[test]
+    fn launch_field_deserializes_when_present() {
+        let json = r#"{
+            "auto_mode": "off",
+            "launch": {
+                "command": "claude",
+                "args": ["--skill", "ruthless"],
+                "env": { "CLAUDE_PROFILE": "review" }
+            }
+        }"#;
+        let cfg: AgentConfig = serde_json::from_str(json).unwrap();
+        let launch = cfg.launch.expect("launch must deserialize");
+        assert_eq!(launch.command.as_deref(), Some("claude"));
+        assert_eq!(
+            launch.args,
+            vec!["--skill".to_string(), "ruthless".to_string()]
+        );
+        assert_eq!(
+            launch.env.get("CLAUDE_PROFILE").map(|s| s.as_str()),
+            Some("review")
+        );
+    }
+
+    #[test]
+    fn launch_config_default_is_empty() {
+        let lc = LaunchConfig::default();
+        assert!(lc.command.is_none());
+        assert!(lc.args.is_empty());
+        assert!(lc.env.is_empty());
+        // Round-trips as `{}`.
+        let json = serde_json::to_string(&lc).unwrap();
+        assert_eq!(json, "{}", "default LaunchConfig should emit `{{}}`");
+    }
+
+    #[test]
+    fn launch_config_round_trips_through_agent_config() {
+        let mut env = BTreeMap::new();
+        env.insert("FOO".to_string(), "bar".to_string());
+        let cfg = AgentConfig {
+            auto_mode: AutoMode::Off,
+            role: Role::Reviewers,
+            wfw_timeout: None,
+            session: None,
+            launch: Some(LaunchConfig {
+                command: Some("codex".to_string()),
+                args: vec!["--profile".to_string(), "deep".to_string()],
+                env,
             }),
         };
         let json = serde_json::to_string(&cfg).unwrap();

@@ -196,6 +196,26 @@ fn repo_checks(repo: &Path) -> Vec<CheckResult> {
                         CheckResult::ok(SECTION, format!("agent: {}", label.as_str()), base_msg)
                     };
                     out.push(entry);
+
+                    // `cfg.launch.command on $PATH?` — Warn if the
+                    // configured launch command isn't found.
+                    // Catches typos in `launch.command` before the
+                    // user tries `clank agent start <label>`.
+                    if let Some(launch) = &cfg.launch {
+                        if let Some(cmd) = launch.command.as_deref() {
+                            if which::which(cmd).is_err() {
+                                out.push(CheckResult::warn(
+                                    SECTION,
+                                    format!("agent: {} launch", label.as_str()),
+                                    format!(
+                                        "`launch.command = {cmd:?}` not found on $PATH; \
+                                         `clank agent start {}` will fail at exec time",
+                                        label.as_str()
+                                    ),
+                                ));
+                            }
+                        }
+                    }
                 }
             }
             Err(e) => out.push(CheckResult::fail(

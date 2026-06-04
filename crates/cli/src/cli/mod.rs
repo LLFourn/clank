@@ -530,6 +530,10 @@ pub enum AgentCmd {
     /// Enumerate registered agents in this repo with their roles
     /// and bind state.
     List(AgentListArgs),
+    /// Launch an agent's CLI tool with its session restored and
+    /// any configured `launch` profile applied. Requires the
+    /// agent to have a bound session (`clank as <name>`).
+    Start(AgentStartArgs),
 }
 
 #[derive(Args, Debug)]
@@ -540,6 +544,22 @@ pub struct AgentListArgs {
     /// Emit machine-readable JSON instead of human text.
     #[arg(short = 'j', long)]
     pub json: bool,
+}
+
+#[derive(Args, Debug)]
+pub struct AgentStartArgs {
+    /// Agent label to start.
+    pub name: String,
+    /// Repo root. Defaults to the cwd's git toplevel.
+    #[arg(long, value_name = "PATH")]
+    pub repo: Option<PathBuf>,
+    /// Instead of execing the composed command, print the argv
+    /// (shell-quoted, on stdout) and the env diff (on stderr)
+    /// and exit 0. Useful for `clank open zellij` to introspect
+    /// the spawn line, and for integration tests that can't
+    /// observe an exec'd process.
+    #[arg(long)]
+    pub print: bool,
 }
 
 #[derive(clap::Subcommand, Debug)]
