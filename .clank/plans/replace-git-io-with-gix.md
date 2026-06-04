@@ -74,14 +74,14 @@ The spike surfaced one real semantic divergence: `repo.head_id()` peels HEAD thr
 | ~~`ls_tree_plans(repo, head)`~~ | **DELETED** — dead code (zero callers) |
 | `show_blob(repo, sha, path)` | `repo.find_commit(sha)?.tree()?.lookup_entry_by_path(path)? + repo.find_blob(entry.oid())?.data.clone()` |
 | `is_ancestor(repo, a, b)` | `matches!(repo.merge_base(a, b), Ok(id) if id.detach() == a)` (no built-in; idiom from gix docs) |
-| `first_parent_commits_between(repo, from, to)` | `repo.rev_walk([to]).with_hidden([from]).first_parent_only().sorting(ByCommitTime(NewestFirst)).all()?` |
+| `first_parent_commits_between(repo, from, to)` | `repo.rev_walk([to]).with_hidden([from]).first_parent_only().sorting(ByCommitTime(NewestFirst)).all()?` then **reverse the Vec** before returning. The legacy API contract is **oldest-first** (matches `git log --reverse`); gix's walks all yield newest-first. Reversal happens in the wrapper, not at gix call time. |
 | `parent_of(repo, sha)` | `repo.find_commit(sha)?.parent_ids().next().map(\|id\| id.detach())` |
 | ~~`first_added_commit(repo, path)`~~ | **DELETED** — dead code (zero callers); would have needed gix rename-detection (`Rewrites`) to preserve `--follow` semantics |
 | `tree_plan_paths(repo, sha)` | Recorder walk, filter by `filepath.starts_with(b".clank/plans/")` and `mode.is_blob()` |
 | `tree_clank_paths(repo, sha)` | same Recorder walk, filter by `filepath.starts_with(b".clank/")` and `mode.is_blob()` |
 | `commit_parent_count(repo, sha)` | `repo.find_commit(sha)?.parent_ids().count()` |
-| `first_parent_commits_to(repo, to)` | `repo.rev_walk([to]).first_parent_only().all()?` |
-| `first_parent_commits(repo)` | `repo.rev_walk([repo.head_id()?.detach()]).first_parent_only().all()?` |
+| `first_parent_commits_to(repo, to)` | `repo.rev_walk([to]).first_parent_only().all()?` then **reverse the Vec** (oldest-first contract; same reason as above) |
+| `first_parent_commits(repo)` | `repo.rev_walk([repo.head().ok()?.id()?.detach()]).first_parent_only().all()?` then **reverse the Vec**. Use `head().id()` not `head_id()` (per the rev_parse_head divergence noted above). |
 | ~~`commit_message(repo, sha)`~~ | **DELETED** — dead code (zero callers) |
 | `diff_tree_changes(repo, sha) -> CommitChanges` | `repo.diff_tree_to_tree(Some(&parent_tree), Some(&this_tree), Some(Options{ rewrites: Some(Rewrites{ percentage: Some(0.5), .. }), location: Some(Location::Path), .. }))?` → match `Change::{Addition, Deletion, Modification, Rewrite}`. **First-parent for merges:** `commit.parent_ids().next()` IS the first parent (the legacy shell-out's `--first-parent` semantics fall out naturally — no extra flag needed). **Root commit:** when `parent_ids().next()` is None, pass `Some(&repo.empty_tree())` as the parent (matches the legacy `--root` flag's behavior). |
 | `snapshot(repo_root)` | composes `head_id` + `commit_message` + `tree_clank_paths` + `diff_tree_changes` on one opened `Repository` |
@@ -96,7 +96,9 @@ The spike surfaced one real semantic divergence: `repo.head_id()` peels HEAD thr
 5. **No built-in "first commit introducing a path"** — `first_added_commit` is the only function that needs hand-rolled logic (~20 LoC).
 6. **Object cache:** call `repo.object_cache_size_if_unset(64 * 1024 * 1024)` once after opening before heavy traversal. gix docs flag this explicitly.
 7. **Threading:** `Repository` is `!Send` without the `parallel` feature, never `Sync`. Use `ThreadSafeRepository` if we ever cache a handle across threads (we currently don't).
-8. **Semver pre-1.0 cadence (recurring maintenance tax)**: gix releases minor versions roughly every 1-2 months and breaking changes are common in those bumps. Adding gix puts clank on a treadmill where every couple of months someone reviews a breaking-change PR. This is the recurring cost the migration accepts. The honest framing: we're trading subprocess fragility (silent runtime drift via `core.quotePath`, format changes) for library fragility (loud compile-time breakage on `cargo update`). Compile-time breakage is preferable — you find out immediately, not when a user reports a mysterious diff misparse. Pin to `0.84` (caret-major-zero matches patch only). A follow-up plan vendoring a thin wrapper crate to amortize this churn is a possibility but not in scope here.
+8. **gix walks are newest-first; the legacy API is oldest-first.** Every `first_parent_commits_*` function returns `Vec<CommitMeta>` ordered oldest-first (matches `git log --reverse`'s output). gix's `rev_walk` yields newest-first regardless of `Sorting` choice — `ByCommitTime(NewestFirst)` makes ordering deterministic across DAG layouts but does NOT reverse. The wrapper must `.collect()` the walk, then `.reverse()` the Vec, before returning. Forgetting this swaps the API contract silently and breaks every caller that consumes the timeline (rebuild fold, status projection, the attribution walk). Codex caught this in plan review of `42e0f8d`.
+
+9. **Semver pre-1.0 cadence (recurring maintenance tax)**: gix releases minor versions roughly every 1-2 months and breaking changes are common in those bumps. Adding gix puts clank on a treadmill where every couple of months someone reviews a breaking-change PR. This is the recurring cost the migration accepts. The honest framing: we're trading subprocess fragility (silent runtime drift via `core.quotePath`, format changes) for library fragility (loud compile-time breakage on `cargo update`). Compile-time breakage is preferable — you find out immediately, not when a user reports a mysterious diff misparse. Pin to `0.84` (caret-major-zero matches patch only). A follow-up plan vendoring a thin wrapper crate to amortize this churn is a possibility but not in scope here.
 
 ### Scope of this plan
 
