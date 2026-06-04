@@ -43,20 +43,6 @@ async fn run(repo: &Path, args: &[&str]) -> Result<std::process::Output, GitIoEr
         .map_err(|e| GitIoError::Spawn(format!("{e}")))
 }
 
-/// Like `run` + non-zero check, preserving trailing newlines.
-/// Used for blob reads where the exact body matters for hashing.
-async fn run_ok_raw(repo: &Path, args: &[&str]) -> Result<String, GitIoError> {
-    let output = run(repo, args).await?;
-    if !output.status.success() {
-        return Err(GitIoError::NonZero {
-            context: format!("git {}", args.join(" ")),
-            code: output.status.code(),
-            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
-        });
-    }
-    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
-}
-
 /// Resolve HEAD to its commit SHA. Returns `Ok(None)` for an empty
 /// repo (unborn HEAD) or when the path isn't a git repository.
 ///
@@ -80,15 +66,63 @@ pub async fn rev_parse_head(repo: &Path) -> Result<Option<CommitSha>, GitIoError
     }
 }
 
-/// `git show HEAD:<path>` — return the blob content at the given ref.
+/// Return the blob content at `rel_path` in the tree of `rev`.
 /// Preserves trailing whitespace (newlines matter for hashing).
+///
+/// Errors if the repo can't be opened, the commit/path isn't
+/// found, or the entry isn't a blob.
 pub async fn show_blob(
     repo: &Path,
     rev: &CommitSha,
     rel_path: &Path,
 ) -> Result<String, GitIoError> {
-    let spec = format!("{}:{}", rev.as_str(), rel_path.display());
-    run_ok_raw(repo, &["show", &spec]).await
+    let repo_path = repo.to_path_buf();
+    let rev_str = rev.as_str().to_string();
+    let path_str = rel_path.to_string_lossy().into_owned();
+    let context = format!("show_blob {rev_str}:{path_str}");
+    tokio::task::spawn_blocking(move || -> Result<String, GitIoError> {
+        let repo = gix::open(&repo_path).map_err(|e| GitIoError::NonZero {
+            context: context.clone(),
+            code: None,
+            stderr: format!("gix open: {e}"),
+        })?;
+        let oid = gix::ObjectId::from_hex(rev_str.as_bytes()).map_err(|e| GitIoError::Parse {
+            context: context.clone(),
+            detail: format!("rev oid hex: {e}"),
+        })?;
+        let commit = repo.find_commit(oid).map_err(|e| GitIoError::NonZero {
+            context: context.clone(),
+            code: None,
+            stderr: format!("find_commit: {e}"),
+        })?;
+        let tree = commit.tree().map_err(|e| GitIoError::NonZero {
+            context: context.clone(),
+            code: None,
+            stderr: format!("commit.tree: {e}"),
+        })?;
+        let entry = tree
+            .lookup_entry_by_path(&path_str)
+            .map_err(|e| GitIoError::NonZero {
+                context: context.clone(),
+                code: None,
+                stderr: format!("lookup_entry_by_path: {e}"),
+            })?
+            .ok_or_else(|| GitIoError::NonZero {
+                context: context.clone(),
+                code: Some(128),
+                stderr: format!("path `{path_str}` not in tree at {rev_str}"),
+            })?;
+        let blob = repo
+            .find_blob(entry.oid())
+            .map_err(|e| GitIoError::NonZero {
+                context,
+                code: None,
+                stderr: format!("find_blob: {e}"),
+            })?;
+        Ok(String::from_utf8_lossy(&blob.data).into_owned())
+    })
+    .await
+    .map_err(|e| GitIoError::Spawn(format!("blocking task join failed: {e}")))?
 }
 
 /// True iff `ancestor` is reachable from `head` along any parent
@@ -273,31 +307,36 @@ pub async fn tree_plan_paths(
     stem: &str,
     include_finalize: bool,
 ) -> Result<Vec<String>, GitIoError> {
-    let mut pathspecs: Vec<String> = vec![format!(".clank/plans/{stem}.md")];
-    if include_finalize {
-        pathspecs.push(format!(".clank/finished/{stem}.md"));
-    }
-    let mut args: Vec<String> = vec![
-        "ls-tree".into(),
-        "-r".into(),
-        "--name-only".into(),
-        "--".into(),
-        sha.as_str().to_string(),
-    ];
-    args.extend(pathspecs);
-    let args_ref: Vec<&str> = args.iter().map(String::as_str).collect();
-    let output = run(repo, &args_ref).await?;
-    if !output.status.success() {
-        return Ok(Vec::new());
-    }
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let mut paths: Vec<String> = stdout
-        .lines()
-        .filter(|l| !l.is_empty())
-        .map(|s| s.to_string())
-        .collect();
-    paths.sort();
-    Ok(paths)
+    let repo_path = repo.to_path_buf();
+    let sha_str = sha.as_str().to_string();
+    let stem_str = stem.to_string();
+    let candidates: Vec<String> = {
+        let mut v = vec![format!(".clank/plans/{stem_str}.md")];
+        if include_finalize {
+            v.push(format!(".clank/finished/{stem_str}.md"));
+        }
+        v
+    };
+    let paths_opt = tokio::task::spawn_blocking(move || -> Option<Vec<String>> {
+        let repo = gix::open(&repo_path).ok()?;
+        let oid = gix::ObjectId::from_hex(sha_str.as_bytes()).ok()?;
+        let tree = repo.find_commit(oid).ok()?.tree().ok()?;
+        let mut found: Vec<String> = candidates
+            .into_iter()
+            .filter(|path| {
+                tree.lookup_entry_by_path(path)
+                    .ok()
+                    .flatten()
+                    .filter(|e| e.mode().is_blob())
+                    .is_some()
+            })
+            .collect();
+        found.sort();
+        Some(found)
+    })
+    .await
+    .map_err(|e| GitIoError::Spawn(format!("blocking task join failed: {e}")))?;
+    Ok(paths_opt.unwrap_or_default())
 }
 
 /// List every blob path under `.clank/` in the tree at `sha`.
@@ -308,29 +347,26 @@ pub async fn tree_plan_paths(
 /// `.clank/` content from its parent even when the commit's diff
 /// didn't touch `.clank/`.
 pub async fn tree_clank_paths(repo: &Path, sha: &CommitSha) -> Result<Vec<String>, GitIoError> {
-    let output = run(
-        repo,
-        &[
-            "ls-tree",
-            "-r",
-            "--name-only",
-            "--",
-            sha.as_str(),
-            ".clank/",
-        ],
-    )
-    .await?;
-    if !output.status.success() {
-        return Ok(Vec::new());
-    }
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let mut paths: Vec<String> = stdout
-        .lines()
-        .filter(|l| !l.is_empty())
-        .map(|s| s.to_string())
-        .collect();
-    paths.sort();
-    Ok(paths)
+    let repo_path = repo.to_path_buf();
+    let sha_str = sha.as_str().to_string();
+    let paths_opt = tokio::task::spawn_blocking(move || -> Option<Vec<String>> {
+        let repo = gix::open(&repo_path).ok()?;
+        let oid = gix::ObjectId::from_hex(sha_str.as_bytes()).ok()?;
+        let tree = repo.find_commit(oid).ok()?.tree().ok()?;
+        let mut recorder = gix::traverse::tree::Recorder::default();
+        tree.traverse().breadthfirst(&mut recorder).ok()?;
+        let mut paths: Vec<String> = recorder
+            .records
+            .into_iter()
+            .filter(|e| e.mode.is_blob() && e.filepath.starts_with(b".clank/"))
+            .map(|e| String::from_utf8_lossy(&e.filepath).into_owned())
+            .collect();
+        paths.sort();
+        Some(paths)
+    })
+    .await
+    .map_err(|e| GitIoError::Spawn(format!("blocking task join failed: {e}")))?;
+    Ok(paths_opt.unwrap_or_default())
 }
 
 /// Number of parents on `sha`. Two or more = merge commit. Errors
