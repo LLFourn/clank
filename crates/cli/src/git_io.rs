@@ -538,7 +538,7 @@ fn diff_record_from_gix_change(ch: gix::object::tree::diff::ChangeDetached) -> O
             location,
             entry_mode,
             ..
-        } if entry_mode.is_blob() => Some(DiffRecord {
+        } if entry_mode.is_no_tree() => Some(DiffRecord {
             status_char: 'A',
             is_rename: false,
             old_path: None,
@@ -548,7 +548,7 @@ fn diff_record_from_gix_change(ch: gix::object::tree::diff::ChangeDetached) -> O
             location,
             entry_mode,
             ..
-        } if entry_mode.is_blob() => Some(DiffRecord {
+        } if entry_mode.is_no_tree() => Some(DiffRecord {
             status_char: 'D',
             is_rename: false,
             old_path: None,
@@ -558,7 +558,7 @@ fn diff_record_from_gix_change(ch: gix::object::tree::diff::ChangeDetached) -> O
             location,
             entry_mode,
             ..
-        } if entry_mode.is_blob() => Some(DiffRecord {
+        } if entry_mode.is_no_tree() => Some(DiffRecord {
             status_char: 'M',
             is_rename: false,
             old_path: None,
@@ -570,17 +570,21 @@ fn diff_record_from_gix_change(ch: gix::object::tree::diff::ChangeDetached) -> O
             copy,
             entry_mode,
             ..
-        } if entry_mode.is_blob() => Some(DiffRecord {
+        } if entry_mode.is_no_tree() => Some(DiffRecord {
             status_char: if copy { 'C' } else { 'R' },
             is_rename: true,
             old_path: Some(String::from_utf8_lossy(&source_location).into_owned()),
             new_path: String::from_utf8_lossy(&location).into_owned(),
         }),
-        // Tree / submodule / non-blob entries: ignore. The legacy
-        // parser assumed everything in `diff-tree --name-status`
-        // output was a file because that command emits only leaf
-        // changes by default; gix's structured Change includes
-        // every level, so we filter explicitly here.
+        // Trees only: ignore. The legacy `diff-tree
+        // --name-status` parser handled every leaf shape it
+        // saw — blobs, symlinks, and submodule commits all
+        // appear as leaf records. gix's Change enum surfaces
+        // tree-level diffs too, so we filter explicitly via
+        // `is_no_tree()` rather than the narrower `is_blob()`
+        // (which would silently drop symlinks/submodules under
+        // .clank/ from `touched_clank` and `clank_paths_touched`).
+        // Codex caught this on a6b7725.
         _ => None,
     }
 }

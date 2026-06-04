@@ -232,6 +232,62 @@ async fn finished_added_alone_is_finish() {
     ));
 }
 
+/// Regression for codex on a6b7725: gix's `entry_mode.is_blob()`
+/// returns false for symlinks and submodule commits. The legacy
+/// `diff-tree --name-status` parser would still see them as leaf
+/// changes — so an add/delete/modify of a symlink OUTSIDE
+/// `.clank/` must register as `has_non_plan_code_changes`, and
+/// a symlink touch UNDER `.clank/` must register as
+/// `touched_clank`. The filter is `is_no_tree()`, not
+/// `is_blob()`.
+#[cfg(unix)]
+#[tokio::test]
+async fn symlink_outside_clank_is_code_change() {
+    let dir = init_repo();
+    let repo = dir.path();
+    write(repo, "README.md", "seed\n");
+    commit(repo, "seed");
+    // Add a symlink at repo root.
+    std::os::unix::fs::symlink("README.md", repo.join("link-to-readme")).unwrap();
+    commit(repo, "add symlink");
+
+    let changes = diff_tree_changes(repo, &head_sha(repo)).await.unwrap();
+    assert!(
+        changes.plan_touches.is_empty(),
+        "symlink outside .clank/ shouldn't produce plan touches"
+    );
+    assert!(
+        changes.has_non_plan_code_changes,
+        "symlink outside .clank/ must register as code change; got {changes:?}"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn symlink_under_clank_touches_clank() {
+    let dir = init_repo();
+    let repo = dir.path();
+    write(repo, "README.md", "seed\n");
+    commit(repo, "seed");
+    std::fs::create_dir_all(repo.join(".clank/extras")).unwrap();
+    std::os::unix::fs::symlink("../../README.md", repo.join(".clank/extras/link")).unwrap();
+    commit(repo, "add clank symlink");
+
+    let changes = diff_tree_changes(repo, &head_sha(repo)).await.unwrap();
+    assert!(
+        changes.touched_clank,
+        "symlink under .clank/ must set touched_clank; got {changes:?}"
+    );
+    assert!(
+        changes
+            .clank_paths_touched
+            .iter()
+            .any(|p| p == ".clank/extras/link"),
+        "symlink path should appear in clank_paths_touched; got {:?}",
+        changes.clank_paths_touched
+    );
+}
+
 #[tokio::test]
 async fn finished_without_md_extension_ignored() {
     let dir = init_repo();
