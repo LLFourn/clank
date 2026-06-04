@@ -80,18 +80,21 @@ For the latest reviewable SHA on an active plan:
 
    Each call site does:
    ```rust
+   use clank_core::vocab::Role;
    let expected_reviewers = agent_store::load_all_agent_configs(repo)?
        .into_iter()
-       .filter(|(_, cfg)| cfg.role == AgentRole::Reviewers)
+       .filter(|(_, cfg)| cfg.role == Role::Reviewers)
        .map(|(label, _)| label)
        .collect();
    let policy = WorkPolicy { plan_feedback, adhoc_feedback, expected_reviewers };
    ```
+   (`Role::Reviewers` is the actual enum variant from `clank_core::vocab`.)
    This is the existing enumeration mechanism; we're just feeding its output into the policy struct.
 
 4. For each expected reviewer, look up the feedback file (already done by the existing `ReviewLookup` trait; the entries arrive in the `reviews` slice).
 
 5. Gate state derives from the *full set*. Verdict semantics: `Approve` = mid-flight signoff (master can continue iterating), `Finished` = "this plan is done" (master can finalize). Rules applied in order:
+   - **Zero-reviewer case first**: if `expected_reviewers` is empty → `Approved`. Rationale: a master-only repo (no registered reviewers) has nothing to wait for; every commit is auto-approved for continuation. Master decides `clank finish` independently (the `Finished` gate state is never reachable in this mode, but `clank finish` doesn't require it). This mirrors the existing `plan_feedback=false` bypass behavior. Without this special case, the "every expected reviewer posted Finished" rule below is *vacuously true* with an empty set and would incorrectly fire `Finished` immediately after every commit.
    - If any review has verdict `RequestChanges` or `Unmarked` → `ChangesRequested`.
    - Else if any expected reviewer has NO entry in `reviews` → `Unreviewed`.
    - Else if EVERY expected reviewer posted `Finished` → `Finished` (master can `clank finish`).
@@ -138,7 +141,8 @@ In `clank-core` (gate projection unit tests):
 - Two reviewers, one APPROVE one missing-feedback → `awaiting_reviewers` (or current equivalent), `waiting_on: { reviewers: [<missing>] }`.
 - Two reviewers, both FINISHED → `Finished` (master can `clank finish`).
 - Two reviewers, one FINISHED one APPROVE → `Approved` (master can continue but NOT finalize — only one reviewer has signed off as done; the other still treats it as mid-flight).
-- Zero reviewers (master-only repo) → gate decided by master alone (preserve existing single-agent behavior).
+- Zero reviewers + any review entries → `Approved` (the zero-reviewer rule fires before the other checks; master is unblocked, master decides `clank finish` independently). Includes the case where `reviews` is empty AND `expected_reviewers` is empty.
+- Zero reviewers + a stale REQUEST_CHANGES from a removed reviewer → `Approved` (the removed reviewer is no longer in `expected_reviewers`, so their entry shouldn't gate. Validates that the zero-reviewer rule fires first.)
 
 In `clank-cli` (`clank wfw` integration):
 
