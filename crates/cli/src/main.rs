@@ -27,6 +27,11 @@ enum Command {
     Agent(cli::AgentArgs),
     /// Strip a plan's `.clank/` artifacts from history.
     Purge(cli::PurgeArgs),
+    /// Abort an in-flight plan: drop its commits from history AND
+    /// save the plan body back to the queue (or stub) for
+    /// re-attempt. Transactional — fails closed at every
+    /// boundary, leaves no partial state on error.
+    Demote(cli::DemoteArgs),
     /// Print a chronological timeline of commits and reviews for
     /// a plan.
     Log(cli::LogArgs),
@@ -94,6 +99,7 @@ async fn main() -> anyhow::Result<()> {
         Command::Queue(args) => cli::queue::run(args).await,
         Command::Agent(args) => cli::agent::run(args).await,
         Command::Purge(args) => cli::purge::run(args).await,
+        Command::Demote(args) => cli::demote::run(args).await,
         Command::Log(args) => cli::log::run(args).await,
         Command::Html(args) => cli::html::run(args).await,
         Command::Open(args) => cli::open::run(args).await,

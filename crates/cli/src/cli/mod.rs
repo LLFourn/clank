@@ -14,6 +14,7 @@ pub mod as_cmd;
 pub mod auto;
 pub mod block;
 pub mod config;
+pub mod demote;
 pub mod doctor;
 pub mod feedback;
 pub mod finish;
@@ -622,6 +623,48 @@ pub struct FinishArgs {
     /// Skip the on-disk state cache: don't read it, don't write it.
     #[arg(long)]
     pub no_cache: bool,
+}
+
+#[derive(Args, Debug)]
+pub struct DemoteArgs {
+    /// Plan stem to demote (same parsing as `clank purge`).
+    pub plan: Option<String>,
+    /// Repo root. Defaults to the cwd's git toplevel.
+    #[arg(long, value_name = "PATH")]
+    pub repo: Option<PathBuf>,
+    /// Queue priority for the re-queued plan body (default 500).
+    /// Ignored when `--stub` is set.
+    #[arg(long, value_name = "N")]
+    pub priority: Option<u16>,
+    /// Write the plan body to `.clank/stubs/<plan>.md` instead of
+    /// the queue.
+    #[arg(long)]
+    pub stub: bool,
+    /// Allow demote when the plan range contains `Rewrite`
+    /// dispositions (your own code-touching commits). Does NOT
+    /// bypass `KeepVerbatim` (foreign commits) — those refuse
+    /// unconditionally.
+    #[arg(long)]
+    pub force: bool,
+    /// Preview-only: write the rewritten chain to a fresh branch
+    /// and leave master + queue/stub + feedback untouched. To
+    /// complete the demote, switch to the branch and re-run
+    /// without `--into-branch`.
+    #[arg(long, value_name = "NAME")]
+    pub into_branch: Option<String>,
+    /// Print the planned drop + safety result + queue target +
+    /// orphan-feedback count without changing the filesystem.
+    #[arg(long)]
+    pub dry: bool,
+    /// Skip the interactive confirmation prompt.
+    #[arg(long)]
+    pub yes: bool,
+    /// Permit rewriting a protected branch in place. Without
+    /// this flag, demote refuses to rewrite `main`/`master` or
+    /// any branch matched by `branch.<name>.protect` in git
+    /// config. `--into-branch` bypasses the protection check.
+    #[arg(long)]
+    pub allow_rewrite_protected: bool,
 }
 
 #[derive(Args, Debug)]
