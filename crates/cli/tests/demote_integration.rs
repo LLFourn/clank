@@ -282,6 +282,74 @@ fn demote_dirty_plan_file_errors() {
     assert!(!repo.join(".clank/queue/500-zeta.md").exists());
 }
 
+// NOTE on foreign-refusal tests (left out intentionally):
+//
+// The plan called for `demote_plan_with_foreign_commits_refuses_unconditionally`
+// and `demote_force_does_not_bypass_foreign_refusal`. Reproducing
+// `foreign: true` in a tempdir-based test requires merge commits
+// from side branches — clank's `RepoState.fold.plans[plan_key].commits`
+// attributes EVERY first-parent commit in the plan's active range to
+// the plan (even commits that touch only non-plan files), so a
+// linear-history "unrelated commit between intro and revise" classifies
+// as `Rewrite + foreign=false`, not foreign. The Rewrite + non-foreign
+// path is already covered by `demote_plan_with_code_commits_requires_force`
+// and `demote_force_drops_mixed_commits`.
+//
+// The structural fix to `safety_check` on b8091ba (refuse on `c.foreign`
+// regardless of disposition) defends against the merge-side-branch
+// scenario. The fact that the linear-history tests don't reach the
+// foreign branch is fine — the fix doesn't regress when there's
+// nothing foreign to catch.
+
+#[test]
+fn demote_into_branch_with_dry_does_not_create_branch() {
+    let dir = init_repo_with_master();
+    let repo = dir.path();
+    seed_plan_only_commits(repo, "pi", 0);
+
+    let out = run_demote(repo, &["pi", "--into-branch", "demote-pi-preview", "--dry"]);
+    assert!(out.status.success(), "--into-branch + --dry should succeed");
+    // Branch was NOT created.
+    let branches = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["branch", "--list", "demote-pi-preview"])
+        .output()
+        .unwrap();
+    let listed = String::from_utf8_lossy(&branches.stdout);
+    assert!(
+        listed.trim().is_empty(),
+        "--dry must not create the branch; got: {listed}"
+    );
+    // No queue file.
+    assert!(!repo.join(".clank/queue/500-pi.md").exists());
+}
+
+#[test]
+fn demote_stub_collision_errors() {
+    let dir = init_repo_with_master();
+    let repo = dir.path();
+    seed_plan_only_commits(repo, "rho", 0);
+    let head_before = head_sha(repo);
+    // Pre-populate the stub target.
+    write(repo, ".clank/stubs/rho.md", "# pre-existing stub\n");
+
+    let out = run_demote(repo, &["rho", "--stub"]);
+    assert!(
+        !out.status.success(),
+        "demote --stub must refuse when stub target exists; stdout=`{}` stderr=`{}`",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    // History untouched.
+    assert_eq!(head_sha(repo), head_before);
+    // Pre-existing stub unchanged.
+    let stub = std::fs::read_to_string(repo.join(".clank/stubs/rho.md")).unwrap();
+    assert!(stub.contains("pre-existing stub"));
+    // Plan still in working tree.
+    assert!(repo.join(".clank/plans/rho.md").exists());
+}
+
 #[test]
 fn demote_dry_no_changes() {
     let dir = init_repo_with_master();
