@@ -65,7 +65,7 @@ New subcommand: `clank demote <plan> [--priority <N>] [--stub] [--force] [--into
 6. **`--into-branch` semantics — preview-only path**. When `--into-branch <name>` is set, the rewrite engine writes the rewritten chain to a fresh branch and leaves HEAD on master untouched. In that case:
    - The plan body is NOT written to the queue/stub.
    - The orphaned feedback is NOT cleaned up.
-   - Print: "rewritten chain at `<name>`. To complete the demote: switch to `<name>` and run `clank demote <plan>` (without `--into-branch`)."
+   - Print a two-line completion recipe: "Inspect the rewrite at `<name>` to confirm it does what you want. To complete the demote on this branch, run `clank demote <plan>` (without `--into-branch`)." Note: the user stays on the original branch to run the in-place demote — switching to `<name>` would put them on the rewritten chain where `.clank/plans/<plan>.md` no longer exists, and demote there couldn't resolve the plan or read its body (codex caught the impossible "switch to" recipe on 625b8af).
    Rationale (codex review of 9bb7d0d): `--into-branch` is a preview/safety mechanism for the rewrite. Writing the queue file or cleaning feedback while master still has `.clank/plans/<plan>.md` active would leave the repo in a contradictory state (one active plan + one queued duplicate). The full demote semantics only fire on the in-place path.
 
 7. **Branch safety**: inherits `clank purge`'s protections. `--into-branch` refuses if `<name>` already exists. Refuses to rewrite protected branches in-place without `--allow-rewrite-protected`.
@@ -88,7 +88,7 @@ The genuinely new code is the safety-check classification + the plan-body save. 
 | `--priority <N>` | Queue priority for the re-queued plan body (default 500). Ignored with `--stub`. |
 | `--stub` | Write to `.clank/stubs/<plan>.md` instead of `.clank/queue/`. |
 | `--force` | Allow demote when the range has `Rewrite` dispositions (your own code-touching commits). Has NO effect on `KeepVerbatim` (foreign commits) — those refuse unconditionally. |
-| `--into-branch <name>` | Preview-only: write rewritten chain to a fresh branch and leave master + queue/stub + feedback untouched. To complete the demote, the user switches to `<name>` and re-runs without `--into-branch`. Refuses if `<name>` already exists. Composes with `--dry`: prints the intended branch name without creating it. |
+| `--into-branch <name>` | Preview-only: write rewritten chain to a fresh branch and leave master + queue/stub + feedback untouched. To complete the demote, the user inspects `<name>` then re-runs demote (without `--into-branch`) from the ORIGINAL branch — staying where `.clank/plans/<plan>.md` still exists so the plan can be resolved. Refuses if `<name>` already exists. Composes with `--dry`: prints the intended branch name without creating it. |
 | `--dry` | Print the planned drop + safety check result + queue-write target + orphan feedback count; exit 0. Composes with `--into-branch`: shows the branch that would be created. |
 | `--yes` | Skip interactive confirmation. |
 | `--allow-rewrite-protected` | Inherited from purge. |
@@ -118,7 +118,7 @@ The bulk of this is reusing `clank purge`'s rewrite engine — the engine alread
 - `clank demote <plan> --stub` writes the plan body to `.clank/stubs/<plan>.md` instead of the queue.
 - `clank demote <plan> --priority 100` puts the queue file at `.clank/queue/100-<plan>.md`.
 - `clank demote <plan> --dry` prints the plan body's intended target, the per-commit disposition table, the orphan-feedback count, and exits 0 with no filesystem changes.
-- `clank demote <plan> --into-branch <name>` writes the rewritten chain to a fresh branch; HEAD is unchanged; **no queue/stub file is written**; **no orphan feedback is cleaned**; stdout prints the completion-recipe ("switch to `<name>` and re-run without `--into-branch`").
+- `clank demote <plan> --into-branch <name>` writes the rewritten chain to a fresh branch; HEAD is unchanged; **no queue/stub file is written**; **no orphan feedback is cleaned**; stdout prints the completion-recipe ("Inspect the rewrite at `<name>` to confirm... To complete the demote on this branch, run `clank demote <plan>` without `--into-branch`"). The user stays on the original branch to run the in-place demote.
 - Target-collision: a pre-existing `.clank/queue/<NNN>-<plan>.md` (or `.clank/stubs/<plan>.md` with `--stub`) causes demote to error before any rewrite. Filesystem unchanged.
 - After demote, `clank status` shows the plan back in the queue and no longer in `.clank/plans/`.
 - `cargo test --workspace` passes.
