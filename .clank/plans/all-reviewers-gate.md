@@ -105,10 +105,24 @@ For the latest reviewable SHA on an active plan:
 
 4. For each expected reviewer, look up the feedback file (already done by the existing `ReviewLookup` trait; the entries arrive in the `reviews` slice).
 
-5. Gate state derives from the *full set*. Verdict semantics: `Approve` = mid-flight signoff (master can continue iterating), `Finished` = "this plan is done" (master can finalize). Rules applied in order:
-   - **Zero-reviewer case first**: if `expected_reviewers` is empty → `Approved`. Rationale: a master-only repo (no registered reviewers) has nothing to wait for; every commit is auto-approved for continuation. Master decides `clank finish` independently (the `Finished` gate state is never reachable in this mode, but `clank finish` doesn't require it). This mirrors the existing `plan_feedback=false` bypass behavior. Without this special case, the "every expected reviewer posted Finished" rule below is *vacuously true* with an empty set and would incorrectly fire `Finished` immediately after every commit.
-   - If any review has verdict `RequestChanges` or `Unmarked` → `ChangesRequested`.
-   - Else if any expected reviewer has NO entry in `reviews` → `Unreviewed`.
+5. **Filter reviews to expected reviewers FIRST.** `ReviewLookup::reviews_for(sha)` (the CLI impl `FsReviewLookup` scans `<repo>/.clank/agents/*/feedback/<sha>.md`) can return entries from author labels whose `.clank/agents/<label>/config.json` no longer marks them as reviewers — orphan dirs from removed reviewers, agents whose role flipped from `Reviewers` to `Master`, etc. Without filtering, a stale `REQUEST_CHANGES` from such an author would gate `ChangesRequested` even though they aren't expected to gate anything.
+
+   `compute_gate` (and the matching `WaitingOn` projection in `derive_status`) MUST start by filtering reviews to authors in `expected_reviewers`:
+   ```rust
+   let expected: HashSet<&AgentLabel> = expected_reviewers.iter().collect();
+   let reviews: Vec<&ReviewEntry> = reviews
+       .iter()
+       .filter(|r| expected.contains(&r.author))
+       .collect();
+   ```
+   All subsequent precedence rules operate on this filtered set. The same filter applies to the `WaitingOn::MasterToRevise { requesters, ambiguous }` payload built in `derive_status` at lines 222-235 — both lists are sourced from the same review set and must be filtered too.
+
+   With this filter in place, "stale REQUEST_CHANGES from a removed reviewer doesn't gate" becomes a uniform principle rather than a zero-reviewer-special-case.
+
+6. Gate state then derives from the *filtered* set. Verdict semantics: `Approve` = mid-flight signoff (master can continue iterating), `Finished` = "this plan is done" (master can finalize). Rules applied in order:
+   - **Zero-reviewer case first**: if `expected_reviewers` is empty → `Approved`. Rationale: a master-only repo (no registered reviewers) has nothing to wait for; every commit is auto-approved for continuation. `compute_finalize_readiness` (see step 3) treats this as ready-to-finalize. Without this special case, the "every expected reviewer posted Finished" rule below is *vacuously true* with an empty set and would incorrectly fire `Finished`.
+   - If any *filtered* review has verdict `RequestChanges` or `Unmarked` → `ChangesRequested`.
+   - Else if any expected reviewer has NO entry in the *filtered* reviews → `Unreviewed`.
    - Else if EVERY expected reviewer posted `Finished` → `Finished` (master can `clank finish`).
    - Else if every expected reviewer posted `Approve` or `Finished` (and not all `Finished`) → `Approved` (master can continue, but cannot finalize yet because at least one reviewer hasn't said the plan is done).
    - (Unreachable given the checks above.)
@@ -155,6 +169,9 @@ In `clank-core` (gate projection unit tests):
 - Two reviewers, one FINISHED one APPROVE → `Approved` (master can continue but NOT finalize — only one reviewer has signed off as done; the other still treats it as mid-flight).
 - Zero reviewers + any review entries → `Approved` (the zero-reviewer rule fires before the other checks; master is unblocked). Includes the case where `reviews` is empty AND `expected_reviewers` is empty.
 - Zero reviewers + a stale REQUEST_CHANGES from a removed reviewer → `Approved` (the removed reviewer is no longer in `expected_reviewers`, so their entry shouldn't gate. Validates that the zero-reviewer rule fires first.)
+- Two expected reviewers (codex, ruthless) both APPROVE + a stale REQUEST_CHANGES from a removed `alice` author → `Approved` (the filter drops alice's entry before the precedence rules; same principle as the zero-reviewer case but in non-zero mode).
+- Two expected reviewers, one APPROVE one missing + a stale FINISHED from a removed author → `Unreviewed` (filter drops the stale entry; the still-pending expected reviewer is what gates).
+- `MasterToRevise.requesters` payload test: two expected reviewers REQUEST_CHANGES + a removed-author REQUEST_CHANGES — the payload contains only the two expected authors, not the removed one.
 
 For `compute_finalize_readiness` (in `crates/cli/src/preview.rs`):
 - Zero reviewers + gate `Approved` → ready to finalize (the new `!expected_reviewers.is_empty()` guard skips the `gate != Finished` rejection).
