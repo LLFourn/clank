@@ -9,6 +9,7 @@
 use clap::Args;
 use std::path::{Path, PathBuf};
 
+pub mod agent;
 pub mod as_cmd;
 pub mod auto;
 pub mod block;
@@ -514,6 +515,30 @@ pub struct QueueArgs {
     pub command: Option<QueueCmd>,
     #[arg(long, value_name = "PATH")]
     pub repo: Option<PathBuf>,
+}
+
+/// Read-only inspection of the repo's registered agents.
+#[derive(Args, Debug)]
+pub struct AgentArgs {
+    #[command(subcommand)]
+    pub command: AgentCmd,
+}
+
+#[derive(clap::Subcommand, Debug)]
+pub enum AgentCmd {
+    /// Enumerate registered agents in this repo with their roles
+    /// and bind state.
+    List(AgentListArgs),
+}
+
+#[derive(Args, Debug)]
+pub struct AgentListArgs {
+    /// Repo root. Defaults to the cwd's git toplevel.
+    #[arg(long, value_name = "PATH")]
+    pub repo: Option<PathBuf>,
+    /// Emit machine-readable JSON instead of human text.
+    #[arg(short = 'j', long)]
+    pub json: bool,
 }
 
 #[derive(clap::Subcommand, Debug)]

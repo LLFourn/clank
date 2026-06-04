@@ -153,24 +153,49 @@ fn repo_checks(repo: &Path) -> Vec<CheckResult> {
                     ));
                 }
                 for (label, cfg) in &agents {
-                    out.push(CheckResult::ok(
-                        SECTION,
-                        format!("agent: {}", label.as_str()),
-                        format!(
-                            "{}: auto_mode={}, session={}",
-                            agent_config_path(repo, label).display(),
-                            cfg.auto_mode.as_str(),
-                            cfg.session
-                                .as_ref()
-                                .map(|s| format!(
-                                    "{} bound to {} ({})",
-                                    s.tool.as_str(),
-                                    s.id.as_str(),
-                                    s.updated_at
-                                ))
-                                .unwrap_or_else(|| "unbound".to_string()),
-                        ),
-                    ));
+                    let session_desc = cfg
+                        .session
+                        .as_ref()
+                        .map(|s| {
+                            format!(
+                                "{} bound to {} ({})",
+                                s.tool.as_str(),
+                                s.id.as_str(),
+                                s.updated_at
+                            )
+                        })
+                        .unwrap_or_else(|| "unbound".to_string());
+                    let base_msg = format!(
+                        "{}: auto_mode={}, session={}",
+                        agent_config_path(repo, label).display(),
+                        cfg.auto_mode.as_str(),
+                        session_desc,
+                    );
+                    // Unbound reviewer: the all-reviewers gate will
+                    // never see APPROVE/FINISHED from this label, so
+                    // every commit's gate stays Unreviewed until the
+                    // user runs `clank as <label>` from inside the
+                    // agent's session.
+                    // Unbound master is uncommon but possible (e.g.
+                    // seeded with `default_agents`, never launched);
+                    // flag for symmetry — Phase 2's bootstrap would
+                    // bind it on next `clank init`, but until then
+                    // there's no master operating the plan.
+                    let entry = if cfg.session.is_none() {
+                        let role_str = cfg.role.as_str();
+                        CheckResult::warn(
+                            SECTION,
+                            format!("agent: {}", label.as_str()),
+                            format!(
+                                "{base_msg} — registered {role_str} is unbound; \
+                                 run `clank as {}` from inside the agent's session to bind",
+                                label.as_str()
+                            ),
+                        )
+                    } else {
+                        CheckResult::ok(SECTION, format!("agent: {}", label.as_str()), base_msg)
+                    };
+                    out.push(entry);
                 }
             }
             Err(e) => out.push(CheckResult::fail(

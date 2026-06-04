@@ -22,6 +22,9 @@ enum Command {
     Unfinish(cli::UnfinishArgs),
     /// Manage the plan queue.
     Queue(cli::QueueArgs),
+    /// Read-only inspection of the repo's registered agents
+    /// (`clank agent list`).
+    Agent(cli::AgentArgs),
     /// Strip a plan's `.clank/` artifacts from history.
     Purge(cli::PurgeArgs),
     /// Print a chronological timeline of commits and reviews for
@@ -89,6 +92,7 @@ async fn main() -> anyhow::Result<()> {
         Command::Finish(args) => cli::finish::run(args).await,
         Command::Unfinish(args) => cli::unfinish::run(args).await,
         Command::Queue(args) => cli::queue::run(args).await,
+        Command::Agent(args) => cli::agent::run(args).await,
         Command::Purge(args) => cli::purge::run(args).await,
         Command::Log(args) => cli::log::run(args).await,
         Command::Html(args) => cli::html::run(args).await,
