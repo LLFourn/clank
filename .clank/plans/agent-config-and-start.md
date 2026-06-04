@@ -31,7 +31,7 @@ Same gap blocks a useful invariant: "if `clank agent start <name>` works, every 
 - **POC script reference**: `open-worktree.sh` in repo root invokes `command "$MASTER_TOOL"` with a hardcoded seed prompt. No way to thread `--skill` or `--profile` through.
 - **Tool detection**: `Session.tool: Tool` enum is `Claude | Codex`. Default for `LaunchConfig.command` (when None) can fall back to the tool's bare name.
 - **No `LaunchConfig` exists today**: greenfield struct.
-- **Session restore**: claude CLI supports `claude --resume <session-id>`. Codex CLI supports `codex resume <id> --cd <dir>` (per the worktree-workflow-research findings). Both stable. `clank agent start` composes them when a session is bound; runs the bare tool when not.
+- **Session restore**: claude CLI supports `claude --resume <session-id>`. Codex CLI supports `codex resume <id> --cd <dir>` (per the worktree-workflow-research findings). Both stable. `clank agent start` composes them when a session is bound. No-bound-session is an error path (see Phase B step 2), not a fallback to the bare tool — that policy was set when codex caught the contradiction on 12c6c97.
 - **Gate semantics**: verified already requires all-FINISH (see Rescope notice). No change in scope.
 
 ## Approach
