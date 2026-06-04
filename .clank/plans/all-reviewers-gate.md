@@ -139,11 +139,34 @@ The `waiting_on` projection in `derive_status` (lines 220-246) currently maps `U
 
 This is the load-bearing user-facing change: master's stop-hook continuation prompt fires only after the full reviewer set is in.
 
-### Stop hook for reviewers — non-redundant wake (optional polish)
+### Reviewer-side work emission (load-bearing — `work_for`)
 
-When a reviewer's stop hook fires, check: have all peers including me already posted APPROVE/FINISHED for the latest reviewable SHA? If yes, don't fire continuation work — there's nothing to review (master will move on after the final reviewer's verdict lands).
+The symmetric piece to the master gate. Today `RepoState::work_for` at `crates/core/src/wait.rs:275` emits `WaitItem::Reviewer` for ANY reviewer whenever `WaitingOn` is `FirstReview` (line 315). Under multi-reviewer semantics this fires the wrong reviewers: after codex has APPROVED and ruthless is still missing, codex would *still* be woken with a review item even though they have no work to do — the `WaitingOn::FirstReview` payload doesn't know who specifically is missing.
 
-This is symmetric to the master fix: don't redundantly wake a reviewer who has already done their job. It's polish, not load-bearing — if it complicates the implementation, defer.
+This is **not optional polish** — without it, every reviewer gets woken redundantly on every review cycle and the all-reviewers gate's main user benefit (each agent only gets pinged when they actually have work) doesn't materialize.
+
+Concrete changes:
+
+1. **`WaitingOn::FirstReview` carries the missing-reviewer set.** Either extend the existing variant to `FirstReview { missing: Vec<AgentLabel> }`, or add a sibling `AwaitingReviewers { missing: Vec<AgentLabel> }` and reserve `FirstReview` for the "literally zero reviews yet" case. Decided at impl time based on which shape's existing consumers (HTML render, status JSON, etc.) need fewer touches — but the missing set MUST be carried, not implicit.
+
+2. **`work_for`'s reviewer arm filters on the missing set.** At `wait.rs:315`, change to:
+   ```rust
+   (Role::Reviewers, WaitingOn::FirstReview { missing })
+       if missing.contains(author) =>
+   {
+       out.push(WaitItem::Reviewer { ... });
+   }
+   (Role::Reviewers, WaitingOn::FirstReview { .. }) => { /* this reviewer already approved; no item */ }
+   ```
+   Result: a reviewer who has already posted APPROVE/FINISHED on the latest SHA gets no `WaitItem::Reviewer` for it; only the reviewers in `missing` do.
+
+3. **`derive_status` populates `missing` correctly.** When the gate computes to `Unreviewed`, the `WaitingOn::FirstReview { missing: ... }` payload is built from `expected_reviewers \ {authors of approving/finished filtered reviews}`. Same filter as step 5.
+
+4. **Other call sites that match on `WaitingOn::FirstReview`** must be updated to handle the new payload shape. Grep before implementing:
+   ```
+   grep -rn "WaitingOn::FirstReview" crates/ --include="*.rs"
+   ```
+   Likely sites: status rendering, HTML output, wfw output. Each just needs the payload field added (or destructured).
 
 ### Out of scope (explicitly)
 
@@ -178,10 +201,19 @@ For `compute_finalize_readiness` (in `crates/cli/src/preview.rs`):
 - Non-zero reviewers + gate `Approved` → still blocked with `NotFinished { state: Approved }` (unchanged).
 - Non-zero reviewers + gate `Finished` → ready to finalize (unchanged).
 
+In `clank-core` (`work_for` unit tests):
+
+- Two reviewers (codex, ruthless), neither reviewed → `work_for(codex, Role::Reviewers)` returns one `WaitItem::Reviewer`; same for ruthless.
+- Two reviewers, codex APPROVED + ruthless missing → `work_for(codex, ...)` returns NO `WaitItem::Reviewer` (codex already did their job); `work_for(ruthless, ...)` returns one.
+- Two reviewers, both APPROVED → both `work_for` calls return no `WaitItem::Reviewer`.
+- Stale reviewer (orphan `alice` dir, not in `expected_reviewers`) calls `work_for(alice, Role::Reviewers)` → returns nothing for this plan (alice's label isn't in `missing` because they aren't expected).
+
 In `clank-cli` (`clank wfw` integration):
 
 - Multi-reviewer setup, only some reviewers approved → master's `wfw` blocks with `waiting_on: { reviewers: [<missing>] }`.
 - Multi-reviewer setup, all reviewers signed off → master's `wfw` returns `gate_approved`.
+- Multi-reviewer setup, codex calls `clank wfw` after their APPROVE landed but ruthless hasn't reviewed → codex's wfw blocks (no work for codex; ruthless is the one with work).
+- Multi-reviewer setup, ruthless calls `clank wfw` while still missing → ruthless's wfw returns a review item.
 
 Regression:
 
