@@ -1675,6 +1675,233 @@ fn wfw_repo_block_suppresses_queue_promotion() {
     );
 }
 
+// ─── wfw-surfaces-work-around-blocked-plans ──────────────────────
+//
+// When a master's only active plan is blocked at the agent level
+// (a plan-scope block), wfw used to silently park because the
+// queue-fallback gate checked `fold.plans.is_empty()` rather than
+// "no actionable plans for this agent." Below tests cover the fix:
+// master sees the next queue item AND the pending Blocked entry.
+
+#[test]
+fn wfw_master_blocked_plan_surfaces_next_queue_item() {
+    let dir = init_repo();
+    let repo = dir.path();
+    disable_adhoc_review(repo);
+    // One active plan.
+    write(repo, ".clank/plans/foo.md", "# foo\n");
+    commit(repo, "[foo] intro");
+
+    // Plan-scope block on `foo` for the calling master.
+    write(
+        repo,
+        ".clank/agents/lloyd/blocks/foo/need-decision.md",
+        "is this the right direction?",
+    );
+
+    // A queued item.
+    std::fs::create_dir_all(repo.join(".clank/queue")).unwrap();
+    std::fs::write(
+        repo.join(".clank/queue/100-next-thing.md"),
+        "# next thing\n",
+    )
+    .unwrap();
+
+    let output = clank_cmd(repo)
+        .args([
+            "wfw",
+            "--no-poll",
+            "--author",
+            "lloyd",
+            "--role",
+            "master",
+            "--timeout",
+            "2s",
+            "--json",
+        ])
+        .arg("--repo")
+        .arg(repo)
+        .output()
+        .expect("spawn clank wfw");
+
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    assert!(
+        output.status.success(),
+        "wfw should exit success when surfacing PromoteFromQueue; \
+         exit={:?} stdout=`{stdout}` stderr=`{}`",
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        stdout.contains("promote_from_queue") && stdout.contains("next-thing"),
+        "stdout should include PromoteFromQueue for the queue item; got: {stdout}"
+    );
+    assert!(
+        stdout.contains("blocked") && stdout.contains("need-decision"),
+        "stdout should ALSO surface the pending Blocked entry; got: {stdout}"
+    );
+}
+
+#[test]
+fn wfw_master_blocked_plan_empty_queue_times_out() {
+    // Empty queue + only-plan-blocked → master parks until
+    // timeout. (No PromoteFromQueue to emit.) The idle hook
+    // would fire in this branch if configured, but a stop-hook
+    // continuation only happens on success exits.
+    let dir = init_repo();
+    let repo = dir.path();
+    disable_adhoc_review(repo);
+    write(repo, ".clank/plans/foo.md", "# foo\n");
+    commit(repo, "[foo] intro");
+    write(
+        repo,
+        ".clank/agents/lloyd/blocks/foo/halt.md",
+        "stop everything",
+    );
+
+    let output = clank_cmd(repo)
+        .args([
+            "wfw",
+            "--no-poll",
+            "--author",
+            "lloyd",
+            "--role",
+            "master",
+            "--timeout",
+            "1s",
+            "--json",
+        ])
+        .arg("--repo")
+        .arg(repo)
+        .output()
+        .expect("spawn clank wfw");
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "empty queue + all plans blocked → park until timeout; \
+         exit={:?} stdout=`{stdout}`",
+        output.status
+    );
+    assert!(
+        !stdout.contains("promote_from_queue"),
+        "no queue item to promote; got: {stdout}"
+    );
+}
+
+#[test]
+fn wfw_master_one_blocked_one_actionable_returns_only_actionable() {
+    // Two active plans, one blocked, one with master work pending.
+    // Master should see ONLY the actionable plan's work item plus
+    // the pending Blocked entry — NOT PromoteFromQueue (an
+    // actionable plan still exists for this agent).
+    let dir = init_repo();
+    let repo = dir.path();
+    disable_adhoc_review(repo);
+    // Plan A (will be blocked).
+    write(repo, ".clank/plans/foo.md", "# foo\n");
+    commit(repo, "[foo] intro");
+    // Plan B (REQUEST_CHANGES from alice → master work pending).
+    write(repo, ".clank/plans/bar.md", "# bar\n");
+    commit(repo, "[bar] intro");
+    let bar_sha = head_sha(repo);
+    write(
+        repo,
+        &format!(".clank/agents/alice/feedback/{}.md", &bar_sha[..7]),
+        "REQUEST_CHANGES need tightening\n",
+    );
+
+    // Plan-scope block on foo (NOT on bar).
+    write(
+        repo,
+        ".clank/agents/lloyd/blocks/foo/halt.md",
+        "stop everything",
+    );
+
+    // Queue item that should NOT be surfaced — bar is actionable.
+    std::fs::create_dir_all(repo.join(".clank/queue")).unwrap();
+    std::fs::write(repo.join(".clank/queue/100-other.md"), "# other\n").unwrap();
+
+    let output = clank_cmd(repo)
+        .args([
+            "wfw",
+            "--no-poll",
+            "--author",
+            "lloyd",
+            "--role",
+            "master",
+            "--timeout",
+            "2s",
+            "--json",
+        ])
+        .arg("--repo")
+        .arg(repo)
+        .output()
+        .expect("spawn clank wfw");
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    assert!(
+        output.status.success(),
+        "wfw should exit success on actionable plan; stdout=`{stdout}`"
+    );
+    // bar's master work surfaces.
+    assert!(
+        stdout.contains("bar"),
+        "actionable plan `bar` must be surfaced; got: {stdout}"
+    );
+    // Queue NOT surfaced (an actionable plan exists).
+    assert!(
+        !stdout.contains("promote_from_queue"),
+        "queue must NOT surface while an actionable plan exists; got: {stdout}"
+    );
+}
+
+#[test]
+fn wfw_reviewer_blocked_plan_does_not_surface_promote() {
+    // Regression guard for the master-only role gate: this fix is
+    // scoped to master. Reviewer code paths must NOT start emitting
+    // PromoteFromQueue when all reviewable plans are suppressed.
+    let dir = init_repo();
+    let repo = dir.path();
+    disable_adhoc_review(repo);
+    write(repo, ".clank/plans/foo.md", "# foo\n");
+    commit(repo, "[foo] intro");
+    // alice is the reviewer (auto-registered by init_repo).
+    write(
+        repo,
+        ".clank/agents/alice/blocks/foo/need-decision.md",
+        "is this the right direction?",
+    );
+
+    std::fs::create_dir_all(repo.join(".clank/queue")).unwrap();
+    std::fs::write(
+        repo.join(".clank/queue/100-next-thing.md"),
+        "# next thing\n",
+    )
+    .unwrap();
+
+    let output = clank_cmd(repo)
+        .args([
+            "wfw",
+            "--no-poll",
+            "--author",
+            "alice",
+            "--role",
+            "reviewers",
+            "--timeout",
+            "1s",
+            "--json",
+        ])
+        .arg("--repo")
+        .arg(repo)
+        .output()
+        .expect("spawn clank wfw");
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    assert!(
+        !stdout.contains("promote_from_queue"),
+        "reviewer must NEVER see PromoteFromQueue; got: {stdout}"
+    );
+}
+
 #[test]
 fn wfw_parks_on_pending_block() {
     let dir = init_repo();

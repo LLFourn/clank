@@ -174,6 +174,8 @@ pub async fn run(args: WfwArgs) -> anyhow::Result<()> {
     let snapshot = StartupSnapshot::capture(&initial_state.fold, plan_filter.as_ref());
 
     let initial_suppress_all;
+    let initial_block_items: Vec<WaitItem>;
+    let initial_suppressed_plans;
     {
         let br = check_blocks(&repo, &author);
         initial_suppress_all = br.suppress_all;
@@ -216,13 +218,22 @@ pub async fn run(args: WfwArgs) -> anyhow::Result<()> {
                 return Ok(());
             }
         } // !suppress_all
+        initial_block_items = br.items;
+        initial_suppressed_plans = br.suppressed_plans;
     }
 
-    if !initial_suppress_all
-        && role == Role::Master
-        && plan_filter.is_none()
-        && initial_state.fold.plans.is_empty()
-    {
+    // Master with no actionable plans (either no plans at all, or
+    // every active plan suppressed by per-plan blocks) should be
+    // pointed at the queue. The pre-fix gate checked
+    // `fold.plans.is_empty()` only, so a master whose only active
+    // plan was agent-blocked got no signal at all.
+    let actionable = initial_state
+        .fold
+        .plans
+        .iter()
+        .filter(|(k, _)| !initial_suppressed_plans.contains(k))
+        .count();
+    if !initial_suppress_all && role == Role::Master && plan_filter.is_none() && actionable == 0 {
         let queue = match crate::cli::queue::scan_queue_no_dups(&repo) {
             Ok(q) => q,
             Err(e) => {
@@ -231,10 +242,11 @@ pub async fn run(args: WfwArgs) -> anyhow::Result<()> {
             }
         };
         if let Some(first) = queue.first() {
-            let items = [WaitItem::PromoteFromQueue {
+            let mut items = initial_block_items.clone();
+            items.push(WaitItem::PromoteFromQueue {
                 name: first.name.clone(),
                 priority: first.priority,
-            }];
+            });
             emit(&items, args.json);
             return Ok(());
         }
@@ -329,7 +341,15 @@ pub async fn run(args: WfwArgs) -> anyhow::Result<()> {
                 emit(&items, args.json);
                 return Ok(());
             }
-            if role == Role::Master && plan_filter.is_none() && state.fold.plans.is_empty() {
+            // Same actionable-count gate as the initial pass — see
+            // the comment above the initial gate. Watch-loop variant.
+            let actionable_in_loop = state
+                .fold
+                .plans
+                .iter()
+                .filter(|(k, _)| !br.suppressed_plans.contains(k))
+                .count();
+            if role == Role::Master && plan_filter.is_none() && actionable_in_loop == 0 {
                 let queue = match crate::cli::queue::scan_queue_no_dups(&repo) {
                     Ok(q) => q,
                     Err(e) => {
@@ -338,10 +358,11 @@ pub async fn run(args: WfwArgs) -> anyhow::Result<()> {
                     }
                 };
                 if let Some(first) = queue.first() {
-                    let items = [WaitItem::PromoteFromQueue {
+                    let mut items = br.items.clone();
+                    items.push(WaitItem::PromoteFromQueue {
                         name: first.name.clone(),
                         priority: first.priority,
-                    }];
+                    });
                     emit(&items, args.json);
                     return Ok(());
                 }
