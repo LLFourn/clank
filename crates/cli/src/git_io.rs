@@ -108,30 +108,48 @@ pub async fn show_blob(
 /// True iff `ancestor` is reachable from `head` along any parent
 /// chain. Used by Phase-2 incremental cache loading to find an
 /// ancestor cache to fold-forward from.
+///
+/// gix backend via `merge_base(a, b) == a` idiom. Disjoint
+/// histories (no common ancestor) → `Ok(false)` matching the
+/// legacy `git merge-base --is-ancestor` exit-1 case. Other gix
+/// errors (object missing, cache failure) propagate.
 pub async fn is_ancestor(
     repo: &Path,
     ancestor: &CommitSha,
     head: &CommitSha,
 ) -> Result<bool, GitIoError> {
-    let output = run(
-        repo,
-        &[
-            "merge-base",
-            "--is-ancestor",
-            ancestor.as_str(),
-            head.as_str(),
-        ],
-    )
-    .await?;
-    match output.status.code() {
-        Some(0) => Ok(true),
-        Some(1) => Ok(false),
-        _ => Err(GitIoError::NonZero {
-            context: format!("merge-base --is-ancestor {ancestor} {head}"),
-            code: output.status.code(),
-            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
-        }),
-    }
+    let repo_path = repo.to_path_buf();
+    let ancestor_str = ancestor.as_str().to_string();
+    let head_str = head.as_str().to_string();
+    let context = format!("is_ancestor {ancestor_str} {head_str}");
+    tokio::task::spawn_blocking(move || -> Result<bool, GitIoError> {
+        let repo = gix::open(&repo_path).map_err(|e| GitIoError::NonZero {
+            context: context.clone(),
+            code: None,
+            stderr: format!("gix open: {e}"),
+        })?;
+        let ancestor_oid =
+            gix::ObjectId::from_hex(ancestor_str.as_bytes()).map_err(|e| GitIoError::Parse {
+                context: context.clone(),
+                detail: format!("ancestor oid hex: {e}"),
+            })?;
+        let head_oid =
+            gix::ObjectId::from_hex(head_str.as_bytes()).map_err(|e| GitIoError::Parse {
+                context: context.clone(),
+                detail: format!("head oid hex: {e}"),
+            })?;
+        match repo.merge_base(ancestor_oid, head_oid) {
+            Ok(id) => Ok(id.detach() == ancestor_oid),
+            Err(gix::repository::merge_base::Error::NotFound { .. }) => Ok(false),
+            Err(e) => Err(GitIoError::NonZero {
+                context,
+                code: None,
+                stderr: format!("merge_base: {e}"),
+            }),
+        }
+    })
+    .await
+    .map_err(|e| GitIoError::Spawn(format!("blocking task join failed: {e}")))?
 }
 
 /// First-parent commits between `base` (exclusive) and `tip`
