@@ -11,7 +11,16 @@ Downstream consequences:
 
 ## Root cause / architecture
 
-The `diff --git` line is genuinely ambiguous when paths contain whitespace — there is no way to recover the split without knowing the path length. The cleaner model is to treat `diff --git` as a section marker only and source the canonical paths from the `--- a/<path>` and `+++ b/<path>` lines that follow each header. Those lines have a single prefix delimiter and the path runs to end-of-line, so they parse unambiguously.
+The `diff --git` line is genuinely ambiguous when paths contain whitespace — there is no way to recover the split without knowing the path length. The cleaner model is to treat `diff --git` as a section marker only and source the canonical paths from the `--- a/<path>` and `+++ b/<path>` lines that follow each header.
+
+Important: these lines are NOT "path runs to end-of-line". When the path contains whitespace (or in certain other cases), git delimits the path from optional trailing metadata (timestamps, etc.) with a literal TAB character. The canonical format is:
+
+```
+--- a/<path>\t[optional metadata]\n
++++ b/<path>\t[optional metadata]\n
+```
+
+The path always runs from after the `a/`/`b/` prefix up to the first TAB character (or end-of-line if no TAB is present). Splitting on TAB preserves leading and internal spaces in the path while stripping the trailing-tab-plus-metadata that git emits for whitespace-containing paths.
 
 (Secondary concern: git's `core.quotePath` C-escapes some paths. Not in scope for this fix unless trivial to address; if not, leave a comment noting the limitation.)
 
@@ -19,15 +28,15 @@ The `diff --git` line is genuinely ambiguous when paths contain whitespace — t
 
 The path for each file section is gathered from up to four possible sources, in this priority order, so each git-diff shape produces a correct path:
 
-| Source line                                | When it fires                  | Reliable for spaces?         |
-|--------------------------------------------|--------------------------------|------------------------------|
-| `+++ b/<path>` (path runs to EOL)          | normal, addition               | yes                          |
-| `--- a/<path>` (path runs to EOL)          | normal, deletion               | yes                          |
-| `rename to <path>` / `rename from <path>`  | pure renames (no ---/+++)      | yes                          |
-| `Binary files a/<old> and b/<new> differ`  | binary files (no ---/+++)      | only if path lacks " and "   |
-| `diff --git a/<old> b/<new>` (last resort) | nothing else fired             | no — same bug as today       |
+| Source line                                       | When it fires                  | Reliable for spaces?         |
+|---------------------------------------------------|--------------------------------|------------------------------|
+| `+++ b/<path>[\t metadata]` (path ends at tab/EOL)| normal, addition               | yes                          |
+| `--- a/<path>[\t metadata]` (path ends at tab/EOL)| normal, deletion               | yes                          |
+| `rename to <path>` / `rename from <path>`         | pure renames (no ---/+++)      | yes                          |
+| `Binary files a/<old> and b/<new> differ`         | binary files (no ---/+++)      | only if path lacks " and "   |
+| `diff --git a/<old> b/<new>` (last resort)        | nothing else fired             | no — same bug as today       |
 
-1. Restructure `parse_diff` so the canonical path for a section is set when we see `+++ b/<path>` (preferred) or `--- a/<path>` (for deletions or as fallback). Take everything after the `a/` / `b/` prefix to end-of-line.
+1. Restructure `parse_diff` so the canonical path for a section is set when we see `+++ b/<path>` (preferred) or `--- a/<path>` (for deletions or as fallback). Take the substring after the `a/` / `b/` prefix up to the first TAB character, or end-of-line if no TAB is present. Do NOT trim trailing whitespace — internal/leading spaces are part of the path, only the TAB delimiter and anything after it are metadata.
 2. `diff --git` becomes a boundary detector only — it starts a new `FileDiff` but does NOT set the path. The `parse_diff_git` function (or the inlined prefix check) returns Option<()> rather than Option<(String, String)>.
 3. Renames are unchanged from today: the existing `rename from` / `rename to` handlers (lines 50-58) already source paths from those lines unambiguously. Pure renames (similarity 100%, no `---`/`+++`) keep working via that path; renames with content changes will get the path from `+++`/`---` as for any modified file.
 4. Binary files: parse the `Binary files a/<old> and b/<new> differ` line for the path. The ` and ` separator is the only reliable split, with the known limitation that a path containing the literal substring ` and ` will mis-parse — flag this in a code comment and a TODO.
@@ -37,8 +46,9 @@ The path for each file section is gathered from up to four possible sources, in 
 
 In `diff_parser.rs`:
 
-- Path with a single space (`foo bar.txt`) — modified file.
-- Path with multiple spaces and a leading space (`  foo  bar.txt`) — modified file.
+- Path with a single space (`foo bar.txt`) — modified file. Test fixture must include the literal trailing TAB that git emits in the `--- a/foo bar.txt\t` / `+++ b/foo bar.txt\t` headers.
+- Path with multiple spaces and a leading space (`  foo  bar.txt`) — modified file, with trailing-TAB metadata in the fixture.
+- Path with a trailing-TAB followed by literal timestamp metadata (`--- a/foo bar.txt\t2024-01-01 12:00:00.000000000 +0000`) — verify the metadata is stripped and only the path remains.
 - Pure rename with spaces: `diff --git a/old name.txt b/new name.txt` + `similarity index 100%` + `rename from old name.txt` + `rename to new name.txt`. Verify old/new path captured from `rename from`/`rename to`. NO `---`/`+++` lines present.
 - Rename WITH content changes and spaces: `rename from` + `rename to` + `--- a/old name.txt` + `+++ b/new name.txt`. Verify old/new captured.
 - Addition (`/dev/null` → `b/foo bar.txt`).
