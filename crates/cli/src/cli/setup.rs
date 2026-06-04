@@ -72,6 +72,11 @@ pub async fn run(args: SetupArgs) -> anyhow::Result<()> {
         args.dry_run,
         &mut summary,
     )?;
+    install_codex_rule(
+        &home.join(".codex/rules/default.rules"),
+        args.dry_run,
+        &mut summary,
+    )?;
 
     if summary.is_empty() {
         println!("clank setup: nothing to do (all assets already in place)");
@@ -133,6 +138,84 @@ fn install_skill(
         }
         Err(e) => return Err(e.into()),
     }
+    Ok(())
+}
+
+/// The line we ensure is present in codex's command-rules file.
+/// Bare prefix `["clank"]` whitelists every `clank <subcommand>`
+/// without enumerating each one — the gate state machine itself
+/// is what enforces "did this agent have the right to do that."
+///
+/// Format is codex's `prefix_rule(pattern=[...], decision="allow|deny")`
+/// DSL.
+const CODEX_RULE_LINE: &str = r#"prefix_rule(pattern=["clank"], decision="allow")"#;
+
+/// Substring used to identify ANY rule whose pattern is the
+/// single-element list `["clank"]`. The closing `]` immediately
+/// after `"clank"` distinguishes the bare pattern from longer
+/// patterns like `["clank", "init"]` — those contain `, "init"]`
+/// between the `"` and the `]` so this substring is absent.
+const CODEX_BARE_CLANK_PATTERN: &str = r#"pattern=["clank"]"#;
+
+/// Ensure the codex command-rules file contains a bare `clank`
+/// allow rule.
+///
+/// Idempotent: if a matching `decision="allow"` rule already
+/// exists, no-op.
+///
+/// Fail-closed: if a matching `decision="deny"` rule exists, the
+/// user has explicitly denied the pattern and we error out
+/// naming the offending line. Don't silently override.
+///
+/// Honors `--dry-run`: prints the intended action without
+/// touching the filesystem.
+fn install_codex_rule(path: &Path, dry_run: bool, summary: &mut Vec<String>) -> anyhow::Result<()> {
+    let existing = match std::fs::read_to_string(path) {
+        Ok(s) => Some(s),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => {
+            return Err(anyhow::Error::from(e).context(format!("reading `{}`", path.display())));
+        }
+    };
+
+    if let Some(content) = &existing {
+        for line in content.lines() {
+            if !line.contains(CODEX_BARE_CLANK_PATTERN) {
+                continue;
+            }
+            if line.contains(r#"decision="deny""#) {
+                anyhow::bail!(
+                    "{}: line `{}` denies the `clank` pattern; \
+                     remove or change it before re-running `clank setup`",
+                    path.display(),
+                    line.trim(),
+                );
+            }
+            if line.contains(r#"decision="allow""#) {
+                summary.push(format!("  ok    {}", path.display()));
+                return Ok(());
+            }
+        }
+    }
+
+    if !dry_run {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("creating `{}`", parent.display()))?;
+        }
+        let mut new_content = existing.unwrap_or_default();
+        if !new_content.is_empty() && !new_content.ends_with('\n') {
+            new_content.push('\n');
+        }
+        new_content.push_str(CODEX_RULE_LINE);
+        new_content.push('\n');
+        std::fs::write(path, new_content)
+            .with_context(|| format!("writing `{}`", path.display()))?;
+    }
+    summary.push(format!(
+        "  write {} (append `clank` allow rule)",
+        path.display()
+    ));
     Ok(())
 }
 

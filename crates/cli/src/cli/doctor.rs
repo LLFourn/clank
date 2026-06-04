@@ -357,8 +357,56 @@ fn user_checks() -> Vec<CheckResult> {
         "codex",
         "~/.codex/hooks.json",
     ));
+    out.push(check_codex_rule(
+        &home.join(".codex/rules/default.rules"),
+        "~/.codex/rules/default.rules",
+    ));
 
     out
+}
+
+/// Check that codex's command-rules file contains a bare `clank`
+/// allow rule. Warn if missing — without it, codex sessions
+/// prompt the user to approve each `clank <subcommand>`
+/// invocation it sees for the first time.
+fn check_codex_rule(path: &Path, display: &str) -> CheckResult {
+    const SECTION: &str = "user";
+    let body = match std::fs::read_to_string(path) {
+        Ok(s) => s,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return CheckResult::warn(
+                SECTION,
+                display,
+                "missing — run `clank setup` to add the `clank` allow rule \
+                 (without it, codex prompts to approve every new clank subcommand)"
+                    .to_string(),
+            );
+        }
+        Err(e) => return CheckResult::fail(SECTION, display, format!("read failed: {e}")),
+    };
+    for line in body.lines() {
+        if !line.contains(r#"pattern=["clank"]"#) {
+            continue;
+        }
+        if line.contains(r#"decision="allow""#) {
+            return CheckResult::ok(SECTION, display, "`clank` allow rule present");
+        }
+        if line.contains(r#"decision="deny""#) {
+            return CheckResult::warn(
+                SECTION,
+                display,
+                format!(
+                    "`clank` is DENIED at line `{}` — remove or change it then run `clank setup`",
+                    line.trim()
+                ),
+            );
+        }
+    }
+    CheckResult::warn(
+        SECTION,
+        display,
+        "`clank` allow rule missing — run `clank setup` to add it".to_string(),
+    )
 }
 
 fn check_skill_file(path: &Path, expected: &str, display: &str) -> CheckResult {
