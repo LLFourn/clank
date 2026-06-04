@@ -264,6 +264,66 @@ fn init_seeds_master_role_when_specified() {
 }
 
 #[test]
+fn init_default_agents_preserve_role_even_when_label_already_bound() {
+    // Codex's catch on 5036f18: default_agents declares codex as
+    // reviewer; codex already has a bound config (session populated)
+    // from a prior `clank as`; no master exists; calling session is
+    // codex's. Under the session-absence guard, preserve_existing_role
+    // was false because codex had a session — Phase 2 then flipped
+    // codex to master, overriding the user's declared default.
+    //
+    // The fix: scope preserve to "label in default_agents" not
+    // "session absent". The user's declared default is the source
+    // of truth for the role regardless of bind state.
+    const CODEX_SESSION: &str = "019e54b7-b1c9-7552-8075-69db24499247";
+    let dir = init_repo();
+    let repo = dir.path();
+    // User declares codex as reviewer.
+    write_user_config(
+        repo,
+        r#"{ "default_agents": [{ "label": "codex", "role": "reviewers" }] }"#,
+    );
+    // codex was previously bound via `clank as`: role reviewers + session populated.
+    let codex_dir = repo.join(".clank/agents/codex");
+    std::fs::create_dir_all(&codex_dir).unwrap();
+    std::fs::write(
+        codex_dir.join("config.json"),
+        format!(
+            r#"{{
+                "auto_mode": "off",
+                "role": "reviewers",
+                "session": {{
+                    "id": "{CODEX_SESSION}",
+                    "tool": "codex",
+                    "updated_at": "2026-06-04T12:00:00Z"
+                }}
+            }}"#
+        ),
+    )
+    .unwrap();
+
+    let out = run_init(repo, &[("CODEX_THREAD_ID", CODEX_SESSION)]);
+    assert!(
+        out.status.success(),
+        "init failed: stderr=`{}`",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let codex: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(codex_dir.join("config.json")).unwrap())
+            .unwrap();
+    assert_eq!(
+        codex["role"], "reviewers",
+        "user's declared default_agents role must be preserved even when the label is already bound; got {codex}"
+    );
+    // Session still bound (binding logic ran).
+    assert_eq!(
+        codex["session"]["id"], CODEX_SESSION,
+        "session binding must be preserved"
+    );
+}
+
+#[test]
 fn init_existing_bound_agent_still_claims_master_when_no_master_exists() {
     // Regression for codex's catch on 1b719cc: a pre-existing agent
     // config created by `clank as` (i.e. with a session field) and

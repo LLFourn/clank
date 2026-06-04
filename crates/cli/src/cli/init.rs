@@ -39,8 +39,8 @@ pub async fn run(args: InitArgs) -> anyhow::Result<()> {
     write_claude_perms(&repo)?;
     write_post_rewrite_hook(&repo, args.force_hooks)?;
     warn_if_globally_excluded(&repo);
-    seed_default_agents(&repo)?;
-    bootstrap_agent_identity(&repo, args.yes).await?;
+    let default_agent_labels = seed_default_agents(&repo)?;
+    bootstrap_agent_identity(&repo, args.yes, &default_agent_labels).await?;
     Ok(())
 }
 
@@ -65,15 +65,22 @@ pub async fn run(args: InitArgs) -> anyhow::Result<()> {
 ///
 /// **Failure**: fails closed if the user config is malformed —
 /// see `config::load_default_agents`.
-fn seed_default_agents(repo: &Path) -> anyhow::Result<()> {
+///
+/// Returns the set of labels declared in `default_agents` (regardless
+/// of whether they were newly seeded or skipped because their config
+/// already existed). `bootstrap_agent_identity` consumes this set to
+/// decide which calling-agent roles to preserve.
+fn seed_default_agents(repo: &Path) -> anyhow::Result<std::collections::HashSet<AgentLabel>> {
     let home = std::env::var_os("HOME").map(PathBuf::from);
     let agents = crate::cli::config::load_default_agents(home.as_deref())?;
+    let mut declared = std::collections::HashSet::new();
     if agents.is_empty() {
-        return Ok(());
+        return Ok(declared);
     }
     let mut seeded = Vec::new();
     let mut skipped = Vec::new();
     for entry in &agents {
+        declared.insert(entry.label.clone());
         let config_path = crate::agent_store::agent_config_path(repo, &entry.label);
         if config_path.exists() {
             skipped.push(entry.label.as_str().to_string());
@@ -100,7 +107,7 @@ fn seed_default_agents(repo: &Path) -> anyhow::Result<()> {
             skipped.join(", ")
         );
     }
-    Ok(())
+    Ok(declared)
 }
 
 /// Install the `post-rewrite` git hook so feedback files
@@ -333,7 +340,11 @@ fn write_claude_perms(repo: &Path) -> anyhow::Result<()> {
 /// Phase 2: if running inside an agent, prompt for label +
 /// master? and write the bootstrap config. Skipped silently if
 /// no session env detected (caller's not in an agent).
-async fn bootstrap_agent_identity(repo: &Path, yes: bool) -> anyhow::Result<()> {
+async fn bootstrap_agent_identity(
+    repo: &Path,
+    yes: bool,
+    default_agent_labels: &std::collections::HashSet<AgentLabel>,
+) -> anyhow::Result<()> {
     let detected = match detect_session_from_env() {
         Ok(d) => d,
         Err(e) => {
@@ -367,22 +378,20 @@ async fn bootstrap_agent_identity(repo: &Path, yes: bool) -> anyhow::Result<()> 
     let label = AgentLabel::parse(&label_raw)
         .map_err(|e| anyhow::anyhow!("invalid label `{label_raw}`: {e}"))?;
 
-    // If the calling agent has a config skeleton from
-    // `default_agents` seeding (config exists, no session field
-    // yet), preserve its role. Without this guard, a seeded
-    // reviewer whose session happens to bind on first init would
-    // get its role overwritten to `master` by the
-    // no-existing-master branch below.
+    // If the calling agent's label is declared in the user's
+    // `default_agents` list, the user has stated their preferred
+    // role for this label. Phase 2's master-claim logic must
+    // respect that — independent of whether the agent has been
+    // bound by a prior `clank as` (session present) or is a fresh
+    // seeded skeleton (session absent).
     //
-    // Scoped to seeded skeletons specifically: a config WITH a
-    // session was created by a prior `clank as` and should still
-    // be eligible for the role assignment flow (e.g., a repo
-    // where only `codex` is bound but has no master — `clank init`
-    // should still let codex claim master). The distinguishing
-    // trait is `session.is_none()`.
-    let preserve_existing_role = load_agent_config(repo, &label)?
-        .as_ref()
-        .is_some_and(|cfg| cfg.session.is_none());
+    // The previous discriminator (`session.is_none()`) handled the
+    // fresh-skeleton case but missed the bound case: codex declared
+    // as reviewer + bound by prior `clank as` + no master → init
+    // would have flipped codex to master, overriding the user's
+    // declared default. Codex caught this; this fix scopes to
+    // "label in default_agents" instead.
+    let preserve_existing_role = default_agent_labels.contains(&label);
 
     let has_existing_master = load_all_agent_configs(repo)?
         .iter()
