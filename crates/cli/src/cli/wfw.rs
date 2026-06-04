@@ -211,6 +211,17 @@ pub async fn run(args: WfwArgs) -> anyhow::Result<()> {
             }
             items.extend(detect_finished(&snapshot, &initial_state.fold));
             if !items.is_empty() {
+                // Co-surface pending Blocked entries alongside
+                // actionable items so a partial-block situation
+                // (plan A blocked, plan B actionable) shows BOTH.
+                // Codex caught the omission on 0a3c039.
+                let blocked_items: Vec<_> = br
+                    .items
+                    .iter()
+                    .filter(|i| matches!(i, WaitItem::Blocked { .. }))
+                    .cloned()
+                    .collect();
+                items.extend(blocked_items);
                 for firing in &firings_from_items(&items) {
                     hook_config::run_hook(&repo, &hook_config, firing);
                 }
@@ -335,6 +346,15 @@ pub async fn run(args: WfwArgs) -> anyhow::Result<()> {
             }
             items.extend(detect_finished(&snapshot, &state.fold));
             if !items.is_empty() {
+                // Co-surface pending Blocked entries (codex caught
+                // on 0a3c039).
+                let blocked_items: Vec<_> = br
+                    .items
+                    .iter()
+                    .filter(|i| matches!(i, WaitItem::Blocked { .. }))
+                    .cloned()
+                    .collect();
+                items.extend(blocked_items);
                 for firing in &firings_from_items(&items) {
                     hook_config::run_hook(&repo, &hook_config, firing);
                 }

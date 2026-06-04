@@ -1853,6 +1853,13 @@ fn wfw_master_one_blocked_one_actionable_returns_only_actionable() {
         !stdout.contains("promote_from_queue"),
         "queue must NOT surface while an actionable plan exists; got: {stdout}"
     );
+    // Blocked entry MUST also surface so master sees both.
+    // Codex caught the omission on 0a3c039 — actionable-path
+    // used to emit only the actionable items.
+    assert!(
+        stdout.contains("blocked") && stdout.contains("halt"),
+        "Blocked entry for foo must co-surface with bar's work; got: {stdout}"
+    );
 }
 
 #[test]
