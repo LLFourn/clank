@@ -16,7 +16,7 @@ pub use crate::model::CommitGate;
 pub use crate::model::Feedback;
 
 // ============================================================
-// Diff types (consumed by `crates/cli/src/diff_parser.rs`)
+// Diff types — wire format for structured diff payloads.
 // ============================================================
 
 /// One file's diff inside a structured-diff payload.

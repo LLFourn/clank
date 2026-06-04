@@ -146,32 +146,6 @@ pub async fn show_blob(
     run_ok_raw(repo, &["show", &spec]).await
 }
 
-/// `git show <sha>` — return the full commit patch (header + diff) as text.
-/// Used by the commit-diff route to render impl commits.
-/// Patch text from `git diff <from>:<from_path> <to>:<to_path>` (unified
-/// diff form, parseable by `diff_parser::parse_diff`). The two paths
-/// differ when the plan file moved between active↔done somewhere between
-/// `from` and `to`; for revisions on the same side they're equal.
-pub async fn diff_two_blobs(
-    repo: &Path,
-    from: &CommitSha,
-    from_path: &Path,
-    to: &CommitSha,
-    to_path: &Path,
-) -> Result<String, GitIoError> {
-    let from_spec = format!("{}:{}", from.as_str(), from_path.display());
-    let to_spec = format!("{}:{}", to.as_str(), to_path.display());
-    run_ok_raw(
-        repo,
-        &["diff", "--no-color", "--no-ext-diff", &from_spec, &to_spec],
-    )
-    .await
-}
-
-pub async fn show_commit(repo: &Path, sha: &CommitSha) -> Result<String, GitIoError> {
-    run_ok_raw(repo, &["show", "--no-color", sha.as_str()]).await
-}
-
 /// True iff `ancestor` is reachable from `head` along any parent
 /// chain. Used by Phase-2 incremental cache loading to find an
 /// ancestor cache to fold-forward from.
@@ -462,10 +436,9 @@ pub struct CommitMeta {
 
 /// Subject + extended message body for a single commit. Uses
 /// `git show -s --format=%s%x00%b` so the patch text is never read or
-/// returned — the caller's `message_body` is guaranteed not to contain
-/// `diff --git` markers (that would happen if we parsed `show_commit`
-/// output by hand). Subject is the first line; body is everything after
-/// the blank line that separates the subject from the message body, or
+/// returned — `message_body` is guaranteed not to contain `diff --git`
+/// markers. Subject is the first line; body is everything after the
+/// blank line that separates the subject from the message body, or
 /// empty when the commit has no extended body.
 pub async fn commit_message(repo: &Path, sha: &CommitSha) -> Result<(String, String), GitIoError> {
     let stdout = run_ok(repo, &["show", "-s", "--format=%s%x00%b", sha.as_str()]).await?;

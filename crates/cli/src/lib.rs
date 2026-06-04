@@ -1,5 +1,4 @@
 // Core types and pure projections.
-pub mod diff_parser;
 pub mod disk_format;
 pub mod disk_snapshot;
 pub mod lifecycle;
