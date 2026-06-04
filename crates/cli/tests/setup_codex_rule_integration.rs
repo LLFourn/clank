@@ -149,6 +149,40 @@ fn setup_errors_on_incomplete_clank_allow_line() {
 }
 
 #[test]
+fn setup_errors_on_missing_pattern_close_bracket() {
+    // Regression for codex on 9e92239: a `prefix_rule(` line
+    // whose pattern array is missing its closing `]` was passing
+    // every check — the line ended with `)`, contained
+    // `pattern=[`, and had `decision="allow"`. But the missing
+    // `]` means the pattern array spills into the decision arg,
+    // breaking codex's parse. Substring matches against
+    // `pattern=["clank"]` (the bare-pattern marker) miss this
+    // because the closing `]` isn't there. Setup would have
+    // appended our rule on top of the broken file.
+    let home = tempfile::tempdir().unwrap();
+    let path = rules_path(home.path());
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    // Note: pattern array is missing its closing `]`.
+    let broken = r#"prefix_rule(pattern=["clank", decision="allow")"#;
+    let original = format!("{broken}\n");
+    std::fs::write(&path, &original).unwrap();
+    let out = run_setup(home.path(), false);
+    assert!(
+        !out.status.success(),
+        "setup must fail-closed on missing pattern `]`; stdout=`{}` stderr=`{}`",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let after = std::fs::read_to_string(&path).unwrap();
+    assert_eq!(after, original, "file must not be modified on error");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("malformed") && stderr.contains("]"),
+        "stderr should explain the missing `]`; got: {stderr}"
+    );
+}
+
+#[test]
 fn setup_errors_on_malformed_unrelated_rule_line() {
     // Codex's broader concern on 6a4fec7: a malformed prefix_rule
     // line that DOESN'T match our pattern should also fail-closed.

@@ -182,6 +182,9 @@ fn validate_prefix_rule_line(path: &Path, lineno: usize, trimmed: &str) -> anyho
     if !trimmed.contains("pattern=[") {
         return Err(malformed("missing `pattern=[...]` argument"));
     }
+    if !trimmed.contains(']') {
+        return Err(malformed("`pattern=[...]` is missing its closing `]`"));
+    }
     let has_allow = trimmed.contains(r#"decision="allow""#);
     let has_deny = trimmed.contains(r#"decision="deny""#);
     if !has_allow && !has_deny {
