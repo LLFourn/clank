@@ -26,6 +26,16 @@ use clank_core::ids::CommitSha;
 use super::DemoteArgs;
 
 pub async fn run(args: DemoteArgs) -> anyhow::Result<()> {
+    // Priority bound mirrors `clank queue add` — `scan_queue`
+    // only recognizes three-digit names, so a queue file at
+    // `.clank/queue/1000-foo.md` would be invisible to
+    // `clank status` and `clank queue promote`. Codex caught
+    // this on 625b8af.
+    if let Some(p) = args.priority {
+        if p > 999 {
+            anyhow::bail!("--priority must be 0-999 (matches `clank queue add`)");
+        }
+    }
     let repo = super::resolve_repo(args.repo.as_deref())?;
     let basename = crate::lifecycle::RepoBasename::from_repo_root(&repo)
         .ok_or_else(|| anyhow::anyhow!("unknown repo basename: {}", repo.display()))?;
@@ -129,8 +139,17 @@ pub async fn run(args: DemoteArgs) -> anyhow::Result<()> {
                 "rewrote `{stem}` onto `{branch}` (now at {} = {tip}).",
                 &tip[..tip.len().min(7)],
             );
+            // Codex caught on 625b8af: the previous recipe said
+            // "switch to <branch> and run clank demote <plan>"
+            // but switching means `.clank/plans/<plan>.md` is
+            // already gone from the working tree, so demote
+            // can't resolve the plan there. Correct recipe:
+            // inspect, then run demote in-place from the
+            // current (original) branch to actually queue the
+            // body + clean feedback.
+            println!("  Inspect the rewrite at `{branch}` to confirm it does what you want.");
             println!(
-                "To complete the demote: switch to `{branch}` and run `clank demote {stem}` (without --into-branch)."
+                "  To complete the demote on this branch, run `clank demote {stem}` (without --into-branch)."
             );
         }
         return Ok(());
@@ -165,18 +184,26 @@ pub async fn run(args: DemoteArgs) -> anyhow::Result<()> {
 }
 
 /// Tiered safety check per the plan:
-/// - All `Drop`: ok.
-/// - Any `Rewrite` (non-foreign): refuse unless `--force`.
-/// - Any `KeepVerbatim` (foreign): unconditional refusal.
+/// - All non-foreign `Drop`: ok.
+/// - Any `Rewrite` non-foreign: refuse unless `--force`.
+/// - Any foreign commit (regardless of disposition): unconditional refusal.
+///
+/// Codex caught on 625b8af: a foreign commit interleaved after
+/// intro can classify as `Rewrite` (not just `KeepVerbatim`) when
+/// the preview sees plan paths in its tree. Refusing only on
+/// `KeepVerbatim` would let a foreign Rewrite slip through and
+/// the engine could rewrite someone else's commit. So: any
+/// `c.foreign` is a refusal, regardless of disposition.
 fn safety_check(commits: &[RewriteCommit], force: bool) -> anyhow::Result<()> {
     let mut rewrite_shas: Vec<&CommitSha> = Vec::new();
     let mut foreign_shas: Vec<&CommitSha> = Vec::new();
     for c in commits {
-        match c.disposition {
-            RewriteDisposition::Drop => {}
-            RewriteDisposition::Rewrite if !c.foreign => rewrite_shas.push(&c.sha),
-            RewriteDisposition::KeepVerbatim if c.foreign => foreign_shas.push(&c.sha),
-            _ => {}
+        if c.foreign {
+            foreign_shas.push(&c.sha);
+            continue;
+        }
+        if c.disposition == RewriteDisposition::Rewrite {
+            rewrite_shas.push(&c.sha);
         }
     }
     if !foreign_shas.is_empty() {
@@ -243,12 +270,28 @@ fn dropped_shas(commits: &[RewriteCommit]) -> Vec<CommitSha> {
         .collect()
 }
 
+/// Build the set of feedback-file stems that key on a dropped SHA.
+/// Mirrors `rewire::find_source`'s probe order: feedback files are
+/// keyed by either the full 40-char SHA OR a 7-char short prefix.
+/// Codex caught on 625b8af: a stem-equals-full-SHA-only filter
+/// leaves real short-keyed orphans behind (every existing feedback
+/// file in this repo's history uses the short form).
+fn orphan_targets(dropped: &[CommitSha]) -> std::collections::HashSet<String> {
+    let mut targets = std::collections::HashSet::new();
+    for sha in dropped {
+        let full = sha.as_str();
+        targets.insert(full.to_string());
+        let short = &full[..7.min(full.len())];
+        targets.insert(short.to_string());
+    }
+    targets
+}
+
 /// Walk `.clank/agents/*/feedback/**` and delete files whose file
-/// stem matches one of the dropped SHAs. Returns the count of
-/// files removed.
+/// stem matches one of the dropped SHAs (full or 7-char short).
+/// Returns the count of files removed.
 fn clean_orphan_feedback(repo: &Path, dropped: &[CommitSha]) -> anyhow::Result<usize> {
-    use std::collections::HashSet;
-    let dropped_set: HashSet<&str> = dropped.iter().map(|s| s.as_str()).collect();
+    let targets = orphan_targets(dropped);
     let agents_root = repo.join(".clank/agents");
     if !agents_root.exists() {
         return Ok(0);
@@ -260,14 +303,13 @@ fn clean_orphan_feedback(repo: &Path, dropped: &[CommitSha]) -> anyhow::Result<u
         if !feedback_dir.exists() {
             continue;
         }
-        walk_and_remove_matching(&feedback_dir, &dropped_set, &mut count)?;
+        walk_and_remove_matching(&feedback_dir, &targets, &mut count)?;
     }
     Ok(count)
 }
 
 fn count_orphan_feedback(repo: &Path, dropped: &[CommitSha]) -> anyhow::Result<usize> {
-    use std::collections::HashSet;
-    let dropped_set: HashSet<&str> = dropped.iter().map(|s| s.as_str()).collect();
+    let targets = orphan_targets(dropped);
     let agents_root = repo.join(".clank/agents");
     if !agents_root.exists() {
         return Ok(0);
@@ -279,14 +321,14 @@ fn count_orphan_feedback(repo: &Path, dropped: &[CommitSha]) -> anyhow::Result<u
         if !feedback_dir.exists() {
             continue;
         }
-        walk_and_count_matching(&feedback_dir, &dropped_set, &mut count)?;
+        walk_and_count_matching(&feedback_dir, &targets, &mut count)?;
     }
     Ok(count)
 }
 
 fn walk_and_remove_matching(
     dir: &Path,
-    targets: &std::collections::HashSet<&str>,
+    targets: &std::collections::HashSet<String>,
     count: &mut usize,
 ) -> anyhow::Result<()> {
     for entry in std::fs::read_dir(dir)? {
@@ -305,7 +347,7 @@ fn walk_and_remove_matching(
 
 fn walk_and_count_matching(
     dir: &Path,
-    targets: &std::collections::HashSet<&str>,
+    targets: &std::collections::HashSet<String>,
     count: &mut usize,
 ) -> anyhow::Result<()> {
     for entry in std::fs::read_dir(dir)? {

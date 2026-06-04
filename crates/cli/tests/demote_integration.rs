@@ -397,11 +397,14 @@ fn demote_into_branch_does_not_touch_head() {
         listed.contains("demote-iota"),
         "demote-iota branch should be created; git branch output: {listed}"
     );
-    // stdout mentions the completion recipe.
+    // stdout mentions the completion recipe (codex fix on 625b8af:
+    // recipe says "complete on this branch, run demote without
+    // --into-branch" — not "switch to <branch>", which would lose
+    // the plan file).
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
-        stdout.contains("switch to") && stdout.contains("without --into-branch"),
-        "stdout should print the completion recipe; got: {stdout}"
+        stdout.contains("Inspect the rewrite") && stdout.contains("without --into-branch"),
+        "stdout should print the corrected completion recipe; got: {stdout}"
     );
 }
 
@@ -425,6 +428,102 @@ fn demote_into_branch_collision_errors() {
     assert_eq!(head_sha(repo), head_before);
     assert!(repo.join(".clank/plans/kappa.md").exists());
     assert!(!repo.join(".clank/queue/500-kappa.md").exists());
+}
+
+#[test]
+fn demote_priority_above_999_rejected() {
+    // Regression for codex on 625b8af: priorities > 999 produce
+    // queue filenames `scan_queue` can't see (status / queue
+    // promote ignore them). Match `clank queue add`'s validation
+    // and reject before any rewrite.
+    let dir = init_repo_with_master();
+    let repo = dir.path();
+    seed_plan_only_commits(repo, "mu", 0);
+    let head_before = head_sha(repo);
+
+    let out = run_demote(repo, &["mu", "--priority", "1000"]);
+    assert!(
+        !out.status.success(),
+        "demote --priority 1000 must be rejected; stdout=`{}` stderr=`{}`",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    // No history change, no queue file written.
+    assert_eq!(head_sha(repo), head_before);
+    assert!(!repo.join(".clank/queue/1000-mu.md").exists());
+    assert!(!repo.join(".clank/queue/500-mu.md").exists());
+}
+
+#[test]
+fn demote_short_sha_feedback_removed() {
+    // Regression for codex on 625b8af: feedback files in this
+    // repo are keyed by 7-char short SHAs (the only naming
+    // convention `clank feedback write` produces). The orphan
+    // cleanup must match both full SHAs AND short prefixes.
+    let dir = init_repo_with_master();
+    let repo = dir.path();
+    seed_plan_only_commits(repo, "nu", 1);
+    let log = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["log", "--format=%H"])
+        .output()
+        .unwrap();
+    let shas: Vec<String> = String::from_utf8_lossy(&log.stdout)
+        .lines()
+        .map(|s| s.to_string())
+        .collect();
+    let plan_head_full = &shas[0];
+    let plan_intro_full = &shas[1];
+    let seed_full = &shas[2];
+
+    // Write feedback using 7-char short SHAs (the actual
+    // convention).
+    let plan_head_short = &plan_head_full[..7];
+    let plan_intro_short = &plan_intro_full[..7];
+    let seed_short = &seed_full[..7];
+    write(
+        repo,
+        &format!(".clank/agents/claude/feedback/{plan_head_short}.md"),
+        "APPROVE\n",
+    );
+    write(
+        repo,
+        &format!(".clank/agents/claude/feedback/{plan_intro_short}.md"),
+        "APPROVE\n",
+    );
+    write(
+        repo,
+        &format!(".clank/agents/claude/feedback/{seed_short}.md"),
+        "APPROVE\n",
+    );
+
+    let out = run_demote(repo, &["nu"]);
+    assert!(out.status.success(), "demote failed");
+
+    // Short-keyed plan feedback gone.
+    assert!(
+        !repo
+            .join(format!(
+                ".clank/agents/claude/feedback/{plan_head_short}.md"
+            ))
+            .exists(),
+        "short-keyed orphan feedback should be removed"
+    );
+    assert!(
+        !repo
+            .join(format!(
+                ".clank/agents/claude/feedback/{plan_intro_short}.md"
+            ))
+            .exists(),
+        "short-keyed orphan feedback should be removed"
+    );
+    // Seed feedback survives.
+    assert!(
+        repo.join(format!(".clank/agents/claude/feedback/{seed_short}.md"))
+            .exists(),
+        "non-dropped SHA's feedback must survive"
+    );
 }
 
 #[test]
