@@ -1,11 +1,24 @@
 # codex-allowed-clank-commands
-# Seed codex's allowed-commands list with every clank subcommand so the user isn't prompted to approve each one
+# Install a `clank` allow rule in codex's command-rules file during `clank setup`
 
-## Problem
+## Scope honesty (per ruthless review of 3688c72)
 
-Reported by lloyd 2026-06-04: codex prompted to confirm `clank finish`. Same prompt class fires for every `clank <verb>` shape not previously seen. Every gated approval interrupts the workflow.
+This plan was originally framed as "fix the `clank finish` approval prompt." On verification that framing turns out to be misleading. The user already has `prefix_rule(pattern=["clank"], decision="allow")` at line 57 of `~/.codex/rules/default.rules` AND they were still prompted for `clank finish`. Two possible causes:
 
-The clank/setup pipeline writes the Stop hook into codex's `~/.codex/hooks.json` and seeds the SKILL into `~/.codex/skills/clank/`. But it does NOT register `clank` in codex's command rules file. That gap is why each new `clank X` shape requires user approval.
+1. **Running-session reload gap**: codex may not hot-reload rules. The bare `["clank"]` was added late (likely by the user clicking "always allow" earlier in the session), and the running session had cached rules from before that. New sessions would pick up the rule fine.
+2. **Prefix-arity mismatch**: codex's `prefix_rule` may require exact-arity match (pattern length == command length), in which case `["clank"]` matches only the bare `clank` invocation, never `clank finish`. The user's file having BOTH `["clank", "init"]` and `["clank"]` is consistent with this — the more specific entry would be redundant under true prefix matching.
+
+Without reading codex's source (it ships as a binary), neither hypothesis can be confirmed from inspection alone.
+
+**This plan installs a baseline `clank` rule during `clank setup` so new users start with it. It does NOT guarantee fixing the symptom that triggered the report — that fix depends on which of the two hypotheses above is correct. If hypothesis 1: the rule takes effect on next codex session start. If hypothesis 2: this plan ships the wrong rule shape and a follow-up plan must install per-subcommand entries.**
+
+The implementer's first task post-promotion is the empirical test: in a fresh codex session with ONLY the bare `["clank"]` rule, attempt `clank finish` and observe whether the prompt fires. Result drives the rule shape choice (see "Granularity decision" below).
+
+## Problem (narrowed)
+
+Currently `clank setup` installs the Stop hook and SKILL into `~/.codex/` but doesn't touch `~/.codex/rules/default.rules`. New users running `clank setup` get the workflow assets but NOT the command-approval rule. Every fresh `clank <verb>` invocation triggers an "always allow / once / deny" prompt the first time codex sees that exact command shape.
+
+The user-scope assets pipeline should write the rule that puts `clank` in codex's allow-list, whatever the right rule shape turns out to be after the empirical test.
 
 ## Verified before promotion
 
@@ -23,11 +36,7 @@ prefix_rule(pattern=["clank"], decision="allow")
 
 The last line — `pattern=["clank"]` — is the exact entry this plan wants to install. It should match every `clank <subcommand>` invocation as a prefix.
 
-Note: the user ALREADY has this line (line 57 of their file), yet was still prompted for `clank finish` in the reporting session. Possible reasons:
-- Codex doesn't hot-reload rules during a running session; the rule was added late and won't apply until next session start.
-- Or codex's prefix matching has a subtle gap with bare single-token patterns.
-
-Either way, automating the write closes the gap idempotently — new users get it pre-installed, existing users see a no-op.
+(The two-hypothesis ambiguity around whether bare `["clank"]` matches `clank finish` is called out in the "Scope honesty" section above — both hypotheses share the same plan response: install the bare rule as a starting point, run the empirical test to decide whether per-subcommand entries are required.)
 
 **Q2 — clank init vs clank setup wiring (verified by reading `crates/cli/src/cli/init.rs` + `setup.rs`):**
 
@@ -37,11 +46,39 @@ Therefore: the rule write belongs in `clank setup`, not `clank init`. Users who 
 
 ## Approach
 
-1. **Extend `clank setup` to ensure the codex rule is present.** Read `~/.codex/rules/default.rules` (or create it if missing). If a line matching `prefix_rule(pattern=["clank"], decision="allow")` exists (exact match on the pattern + decision), no-op. Otherwise, append the line. Same fail-closed semantics as the rest of setup: malformed file → error, never silently overwrite other rules.
+### Step 0 — empirical test (BEFORE writing code)
 
-2. **Doctor check**: extend `clank doctor`'s user-scope section with a "codex command rules include `clank` prefix" entry. Reads the file, parses for the matching line, Warn if missing. Names the fix command (`clank setup`).
+In a fresh codex session (cleanly started, not the one in which the rule was added), with ONLY the bare `prefix_rule(pattern=["clank"], decision="allow")` rule in `default.rules`, attempt to run `clank finish` (or any other `clank <verb>` codex hasn't seen before). Observe whether the approval prompt fires.
 
-3. **Allow-list granularity decision: bare `["clank"]` prefix.** Whitelists every `clank <subcommand>`. clank is a peer-review workflow tool; agents are expected to run any of its commands, and the gate state machine itself enforces "did this agent have the right to do that." A second layer of per-command approval-checks via codex's rules file is redundant and adds maintenance burden every time a new subcommand ships.
+Outcomes:
+- **No prompt → bare rule works.** Hypothesis 1 (running-session reload gap) confirmed. Implementation uses the bare `["clank"]` rule. Continue to step 1.
+- **Prompt fires → bare rule does NOT match.** Hypothesis 2 (prefix-arity mismatch) confirmed. Implementation must enumerate per-subcommand rules. Continue to step 1 with the rule-shape adjusted: instead of one bare-prefix line, write one line per subcommand in the `Command` enum at `crates/cli/src/main.rs:15-78`.
+
+Document the test outcome in the implementation commit message.
+
+### Steps 1-3 (the same regardless of step-0 outcome — only the rule SHAPE changes)
+
+1. **Extend `clank setup` to ensure the codex rule(s) are present.** Read `~/.codex/rules/default.rules` (or create it + parent dirs if missing). For each line the plan needs:
+   - **No matching line exists → append the line at the end of the file.** Trailing-append matches the file's existing convention; the user's file accumulates allows in order of approval.
+   - **Exact-match allow line already present → no-op.** Idempotent.
+   - **A `decision="deny"` line for the same pattern exists → ERROR.** Don't silently override a user's explicit denial; print a diagnostic naming the file path and the line content, and ask the user to remove it manually. Fail-closed.
+   - **Malformed file (un-parseable lines, missing closing bracket, etc.) → ERROR.** Same fail-closed semantics as the rest of setup; never overwrite existing rules.
+
+2. **Doctor check**: extend `clank doctor`'s user-scope section with a "codex command rules include `clank` allow rule" entry. Reads the file, parses for the matching line(s), Warn if missing. Names the fix command (`clank setup`). For the per-subcommand case, Warn lists which entries are missing.
+
+3. **Allow-list granularity decision.** Determined by step 0:
+   - **Bare prefix (`["clank"]`)** if hypothesis 1 — minimal entry, zero maintenance.
+   - **Per-subcommand (`["clank", "init"]`, `["clank", "finish"]`, ...)** if hypothesis 2 — one entry per subcommand from the `Command` enum. Adds maintenance: every new subcommand requires a new entry. `clank setup` can derive the list from the enum so the maintenance is "do nothing; setup picks up new variants automatically."
+
+   Either way: clank is a peer-review workflow tool; agents are expected to run any of its commands, and the gate state machine itself enforces "did this agent have the right to do that." A second layer of per-command approval-checks via codex's rules file is redundant; we want all clank commands allowed.
+
+### Rule precedence note
+
+The plan assumes last-match-wins or first-match-wins doesn't matter for our case because:
+- We never write a `deny` rule (only `allow`).
+- We error out if a user has an existing `deny` for the same pattern (step 1 above).
+
+So precedence between two `allow` rules is irrelevant — they have the same decision. If a future plan ever needs to OVERRIDE an existing rule, precedence becomes load-bearing and gets revisited then.
 
 ## Out of scope
 
@@ -52,20 +89,22 @@ Therefore: the rule write belongs in `clank setup`, not `clank init`. Users who 
 
 ## Acceptance
 
-- After `clank setup`, running any `clank <subcommand>` from inside a codex session does NOT prompt the user for approval (modulo any session-cache caveats outside our control).
-- Idempotent: re-running `clank setup` doesn't duplicate the entry.
-- A malformed `default.rules` file errors out cleanly (fail-closed); the existing rules aren't overwritten.
+- **Fresh codex session started after `clank setup`** runs any `clank <subcommand>` without an approval prompt. (Acknowledges hypothesis-1 reload requirement; running sessions need restart to reload rules.)
+- Idempotent: re-running `clank setup` doesn't duplicate any entry.
+- A malformed `default.rules` file errors out cleanly (fail-closed); existing rules aren't overwritten.
+- An existing `decision="deny"` rule for the same pattern triggers an error naming the offending line; the user removes it manually before re-running setup.
 - `clank doctor` includes a check for the codex allow-list entry; Warn when missing with `clank setup` as the suggested fix.
 - Existing claude-side permissions writes unchanged.
 
 ## Tests
 
-- **Integration test (setup writes rule)**: temp HOME, run `clank setup`, read the resulting `~/.codex/rules/default.rules`, assert the `prefix_rule(pattern=["clank"], decision="allow")` line is present.
-- **Integration test (idempotent)**: pre-populate the file with the line, run `clank setup`, assert exactly one matching line afterwards.
+- **Integration test (setup writes rule)**: temp HOME, run `clank setup`, read the resulting `~/.codex/rules/default.rules`, assert the expected rule shape (per step-0 outcome) is present.
+- **Integration test (idempotent)**: pre-populate the file with the rule(s), run `clank setup`, assert exactly one matching line per entry afterwards.
 - **Integration test (creates file)**: temp HOME with no `~/.codex/rules/` dir at all, run `clank setup`, assert the dir and file are created with the entry.
-- **Integration test (other rules preserved)**: pre-populate file with unrelated rules, run setup, assert the original rules are still present + the clank line was appended.
+- **Integration test (other rules preserved)**: pre-populate file with unrelated rules, run setup, assert the original rules are still present + the clank line(s) were appended.
+- **Integration test (deny-collision errors)**: pre-populate file with `prefix_rule(pattern=["clank"], decision="deny")`, run `clank setup`, assert it exits non-zero with a diagnostic naming the offending line. File is left unchanged.
 - **Doctor test**: temp HOME with no rule → Warn entry naming "clank setup" as fix; with rule → no warn.
 
 ## Implementation note
 
-The line should be appended at the end of the file (not inserted at a specific position) to avoid disrupting the user's existing rule order. Codex's docs (or testing) should confirm whether rule order affects matching — if last-match-wins, append is safe; if first-match-wins, the position might matter for the clank rule to take effect ahead of any potential deny rule. Current observation: the user's file has the bare `["clank"]` at line 57 of ~57 lines (the end) and all earlier rules are more specific allows, so trailing-append is consistent with the existing convention.
+Appended at the end of the file (matches the user's file's existing convention; the deny-collision check in step 1 covers the "deny precedes our allow" corner case explicitly rather than relying on file order). For the per-subcommand case under hypothesis 2, sort the new entries before appending so the file stays grep-friendly.
