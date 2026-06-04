@@ -43,22 +43,8 @@ async fn run(repo: &Path, args: &[&str]) -> Result<std::process::Output, GitIoEr
         .map_err(|e| GitIoError::Spawn(format!("{e}")))
 }
 
-async fn run_ok(repo: &Path, args: &[&str]) -> Result<String, GitIoError> {
-    let output = run(repo, args).await?;
-    if !output.status.success() {
-        return Err(GitIoError::NonZero {
-            context: format!("git {}", args.join(" ")),
-            code: output.status.code(),
-            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
-        });
-    }
-    Ok(String::from_utf8_lossy(&output.stdout)
-        .trim_end()
-        .to_string())
-}
-
-/// Like `run_ok` but preserves trailing newlines. Used for blob reads
-/// where the exact body matters for hashing.
+/// Like `run` + non-zero check, preserving trailing newlines.
+/// Used for blob reads where the exact body matters for hashing.
 async fn run_ok_raw(repo: &Path, args: &[&str]) -> Result<String, GitIoError> {
     let output = run(repo, args).await?;
     if !output.status.success() {
@@ -152,6 +138,64 @@ pub async fn is_ancestor(
     .map_err(|e| GitIoError::Spawn(format!("blocking task join failed: {e}")))?
 }
 
+/// Walk first-parent commits and collect `CommitMeta` (sha, author
+/// timestamp, subject) oldest-first — matches the legacy
+/// `git log --first-parent --reverse --format=%H%x00%at%x00%s`
+/// contract.
+///
+/// gix walks newest-first regardless of `Sorting` choice; this
+/// helper does the `.reverse()` at the end so callers consume
+/// the timeline chronologically (see sharp edge #8 in the plan).
+///
+/// `from = Some(oid)` excludes that commit and its ancestors
+/// (gix's `with_hidden`, equivalent to `git log from..tip`).
+/// `from = None` walks from `tip` all the way back to the root.
+fn first_parent_walk(
+    repo: &gix::Repository,
+    from: Option<gix::ObjectId>,
+    tip: gix::ObjectId,
+    context: &'static str,
+) -> Result<Vec<CommitMeta>, GitIoError> {
+    let walk_err = |e: &dyn std::fmt::Display, stage: &str| GitIoError::NonZero {
+        context: context.to_string(),
+        code: None,
+        stderr: format!("{stage}: {e}"),
+    };
+    let mut builder = repo.rev_walk([tip]).first_parent_only();
+    if let Some(from_oid) = from {
+        builder = builder.with_hidden([from_oid]);
+    }
+    let walk = builder.all().map_err(|e| walk_err(&e, "rev_walk"))?;
+    let mut out = Vec::new();
+    for info in walk {
+        let info = info.map_err(|e| walk_err(&e, "walk iter"))?;
+        let commit = info.object().map_err(|e| walk_err(&e, "info.object"))?;
+        let author = commit.author().map_err(|e| walk_err(&e, "commit.author"))?;
+        let author_ts: i64 = author
+            .time()
+            .map_err(|e| walk_err(&e, "author.time parse"))?
+            .seconds;
+        let msg = commit
+            .message()
+            .map_err(|e| walk_err(&e, "commit.message"))?;
+        // `summary()` trims trailing whitespace and folds internal
+        // newlines — matches the legacy `git log --format=%s` output
+        // (which strips the trailing \n that git stores). Raw
+        // `msg.title` retains the trailing newline.
+        let subject = msg.summary().to_string();
+        let sha = parse_sha(context, &info.id.to_string())?;
+        out.push(CommitMeta {
+            sha,
+            author_ts,
+            subject,
+        });
+    }
+    // gix walks newest-first; reverse to match the legacy
+    // oldest-first contract every caller depends on.
+    out.reverse();
+    Ok(out)
+}
+
 /// First-parent commits between `base` (exclusive) and `tip`
 /// (inclusive), oldest-first.
 pub async fn first_parent_commits_between(
@@ -159,38 +203,30 @@ pub async fn first_parent_commits_between(
     base: &CommitSha,
     tip: &CommitSha,
 ) -> Result<Vec<CommitMeta>, GitIoError> {
-    let range = format!("{}..{}", base.as_str(), tip.as_str());
-    let stdout = run_ok(
-        repo,
-        &[
-            "log",
-            "--first-parent",
-            "--reverse",
-            "--format=%H%x00%at%x00%s",
-            &range,
-        ],
-    )
-    .await?;
-    let mut out = Vec::new();
-    for line in stdout.lines() {
-        if line.is_empty() {
-            continue;
-        }
-        let mut parts = line.splitn(3, '\0');
-        let sha = parts.next().unwrap_or("").trim();
-        let ts = parts.next().unwrap_or("0").trim();
-        let subject = parts.next().unwrap_or("").to_string();
-        if sha.is_empty() {
-            continue;
-        }
-        let author_ts = ts.parse::<i64>().unwrap_or(0);
-        out.push(CommitMeta {
-            sha: parse_sha("first_parent_commits_between", sha)?,
-            author_ts,
-            subject,
-        });
-    }
-    Ok(out)
+    const CONTEXT: &str = "first_parent_commits_between";
+    let repo_path = repo.to_path_buf();
+    let base_str = base.as_str().to_string();
+    let tip_str = tip.as_str().to_string();
+    tokio::task::spawn_blocking(move || -> Result<Vec<CommitMeta>, GitIoError> {
+        let repo = gix::open(&repo_path).map_err(|e| GitIoError::NonZero {
+            context: CONTEXT.into(),
+            code: None,
+            stderr: format!("gix open: {e}"),
+        })?;
+        let base_oid =
+            gix::ObjectId::from_hex(base_str.as_bytes()).map_err(|e| GitIoError::Parse {
+                context: CONTEXT.into(),
+                detail: format!("base oid hex: {e}"),
+            })?;
+        let tip_oid =
+            gix::ObjectId::from_hex(tip_str.as_bytes()).map_err(|e| GitIoError::Parse {
+                context: CONTEXT.into(),
+                detail: format!("tip oid hex: {e}"),
+            })?;
+        first_parent_walk(&repo, Some(base_oid), tip_oid, CONTEXT)
+    })
+    .await
+    .map_err(|e| GitIoError::Spawn(format!("blocking task join failed: {e}")))?
 }
 
 /// First parent of the given commit. Returns `Ok(None)` for the
@@ -333,70 +369,43 @@ pub async fn first_parent_commits_to(
     repo: &Path,
     tip: &CommitSha,
 ) -> Result<Vec<CommitMeta>, GitIoError> {
-    let stdout = run_ok(
-        repo,
-        &[
-            "log",
-            "--first-parent",
-            "--reverse",
-            "--format=%H%x00%at%x00%s",
-            tip.as_str(),
-        ],
-    )
-    .await?;
-    let mut out = Vec::new();
-    for line in stdout.lines() {
-        if line.is_empty() {
-            continue;
-        }
-        let mut parts = line.splitn(3, '\0');
-        let sha = parts.next().unwrap_or("").trim();
-        let ts = parts.next().unwrap_or("0").trim();
-        let subject = parts.next().unwrap_or("").to_string();
-        if sha.is_empty() {
-            continue;
-        }
-        let author_ts = ts.parse::<i64>().unwrap_or(0);
-        out.push(CommitMeta {
-            sha: parse_sha("first_parent_commits_to", sha)?,
-            author_ts,
-            subject,
-        });
-    }
-    Ok(out)
+    const CONTEXT: &str = "first_parent_commits_to";
+    let repo_path = repo.to_path_buf();
+    let tip_str = tip.as_str().to_string();
+    tokio::task::spawn_blocking(move || -> Result<Vec<CommitMeta>, GitIoError> {
+        let repo = gix::open(&repo_path).map_err(|e| GitIoError::NonZero {
+            context: CONTEXT.into(),
+            code: None,
+            stderr: format!("gix open: {e}"),
+        })?;
+        let tip_oid =
+            gix::ObjectId::from_hex(tip_str.as_bytes()).map_err(|e| GitIoError::Parse {
+                context: CONTEXT.into(),
+                detail: format!("tip oid hex: {e}"),
+            })?;
+        first_parent_walk(&repo, None, tip_oid, CONTEXT)
+    })
+    .await
+    .map_err(|e| GitIoError::Spawn(format!("blocking task join failed: {e}")))?
 }
 
 pub async fn first_parent_commits(repo: &Path) -> Result<Vec<CommitMeta>, GitIoError> {
-    let stdout = run_ok(
-        repo,
-        &[
-            "log",
-            "--first-parent",
-            "--reverse",
-            "--format=%H%x00%at%x00%s",
-        ],
-    )
-    .await?;
-    let mut out = Vec::new();
-    for line in stdout.lines() {
-        if line.is_empty() {
-            continue;
-        }
-        let mut parts = line.splitn(3, '\0');
-        let sha = parts.next().unwrap_or("").trim();
-        let ts = parts.next().unwrap_or("0").trim();
-        let subject = parts.next().unwrap_or("").to_string();
-        if sha.is_empty() {
-            continue;
-        }
-        let author_ts = ts.parse::<i64>().unwrap_or(0);
-        out.push(CommitMeta {
-            sha: parse_sha("first_parent_commits", sha)?,
-            author_ts,
-            subject,
-        });
-    }
-    Ok(out)
+    const CONTEXT: &str = "first_parent_commits";
+    let repo_path = repo.to_path_buf();
+    tokio::task::spawn_blocking(move || -> Result<Vec<CommitMeta>, GitIoError> {
+        let repo = gix::open(&repo_path).map_err(|e| GitIoError::NonZero {
+            context: CONTEXT.into(),
+            code: None,
+            stderr: format!("gix open: {e}"),
+        })?;
+        let head_oid = match repo.head().ok().and_then(|h| h.id()) {
+            Some(id) => id.detach(),
+            None => return Ok(Vec::new()), // unborn HEAD / no commits → empty
+        };
+        first_parent_walk(&repo, None, head_oid, CONTEXT)
+    })
+    .await
+    .map_err(|e| GitIoError::Spawn(format!("blocking task join failed: {e}")))?
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
