@@ -94,55 +94,6 @@ pub async fn rev_parse_head(repo: &Path) -> Result<Option<CommitSha>, GitIoError
     }
 }
 
-/// A committed plan file under `.clank/plans/` (or `.clank/plans/done/`).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PlanEntry {
-    /// Path relative to the repo root.
-    pub path: PathBuf,
-    pub blob_sha: String,
-}
-
-/// `git ls-tree -r HEAD -- .clank/plans/` parsed into structured entries.
-///
-/// Returns an empty vec if the path doesn't exist in HEAD.
-pub async fn ls_tree_plans(repo: &Path, head: &CommitSha) -> Result<Vec<PlanEntry>, GitIoError> {
-    let output = run(
-        repo,
-        &["ls-tree", "-r", "--", head.as_str(), ".clank/plans/"],
-    )
-    .await?;
-    // Path-not-in-tree is `exit 0` with empty output, but older git versions
-    // return non-zero. Treat any failure here as "no entries."
-    if !output.status.success() {
-        return Ok(Vec::new());
-    }
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let mut entries = Vec::new();
-    for line in stdout.lines() {
-        // Format: <mode> <type> <sha>\t<path>
-        let (head_part, path) = match line.split_once('\t') {
-            Some(p) => p,
-            None => continue,
-        };
-        let mut tokens = head_part.split_ascii_whitespace();
-        let _mode = tokens.next();
-        let kind = tokens.next();
-        let sha = tokens.next();
-        if kind != Some("blob") {
-            continue;
-        }
-        let sha = match sha {
-            Some(s) => s.to_string(),
-            None => continue,
-        };
-        entries.push(PlanEntry {
-            path: PathBuf::from(path),
-            blob_sha: sha,
-        });
-    }
-    Ok(entries)
-}
-
 /// `git show HEAD:<path>` — return the blob content at the given ref.
 /// Preserves trailing whitespace (newlines matter for hashing).
 pub async fn show_blob(
@@ -238,38 +189,6 @@ pub async fn parent_of(repo: &Path, sha: &CommitSha) -> Result<Option<CommitSha>
     } else {
         Ok(Some(parse_sha("parent_of", &s)?))
     }
-}
-
-/// `git log --diff-filter=A --follow --format=%H -- <path>` — the commit
-/// that first introduced `path` along the follow chain. Returns
-/// `Ok(None)` if no such commit exists (e.g. the path was never added,
-/// which shouldn't happen for a path returned by `ls_tree_plans`).
-pub async fn first_added_commit(
-    repo: &Path,
-    rel_path: &Path,
-) -> Result<Option<CommitSha>, GitIoError> {
-    let path_str = rel_path.to_str().ok_or_else(|| GitIoError::Parse {
-        context: "first_added_commit".into(),
-        detail: format!("non-utf8 path: {}", rel_path.display()),
-    })?;
-    let s = run_ok(
-        repo,
-        &[
-            "log",
-            "--diff-filter=A",
-            "--follow",
-            "--format=%H",
-            "--",
-            path_str,
-        ],
-    )
-    .await?;
-    // `--follow` may report multiple A commits across renames; the oldest
-    // is the last line of `--format=%H` output.
-    let oldest = s.lines().last().map(str::trim).filter(|s| !s.is_empty());
-    oldest
-        .map(|s| parse_sha("first_added_commit", s))
-        .transpose()
 }
 
 /// `git log --first-parent --reverse --format=%H` — all commits along
@@ -440,28 +359,6 @@ pub struct CommitMeta {
     pub sha: CommitSha,
     pub author_ts: i64,
     pub subject: String,
-}
-
-/// Subject + extended message body for a single commit. Uses
-/// `git show -s --format=%s%x00%b` so the patch text is never read or
-/// returned — `message_body` is guaranteed not to contain `diff --git`
-/// markers. Subject is the first line; body is everything after the
-/// blank line that separates the subject from the message body, or
-/// empty when the commit has no extended body.
-pub async fn commit_message(repo: &Path, sha: &CommitSha) -> Result<(String, String), GitIoError> {
-    let stdout = run_ok(repo, &["show", "-s", "--format=%s%x00%b", sha.as_str()]).await?;
-    let mut parts = stdout.splitn(2, '\0');
-    let subject = parts
-        .next()
-        .unwrap_or("")
-        .trim_end_matches('\n')
-        .to_string();
-    let body = parts
-        .next()
-        .unwrap_or("")
-        .trim_end_matches('\n')
-        .to_string();
-    Ok((subject, body))
 }
 
 /// `git diff-tree -r --name-status -M --no-commit-id <sha>` parsed into a

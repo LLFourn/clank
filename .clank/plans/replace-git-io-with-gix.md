@@ -50,48 +50,42 @@ Today: each `git_io::*` function shells out from scratch. With gix, opening a `R
 
 Migration default: keep `&Path` signatures, open per-call. Adding a `Repo` cache layer is a follow-up optimization once the migration is green.
 
+### Dead-code purge (committed alongside the spike)
+
+Audit during the spike found three functions in `git_io.rs` with zero callers anywhere in the workspace:
+
+- `commit_message` — the original spike target. Dead, deleted.
+- `first_added_commit` — used `git log --diff-filter=A --follow` which would have needed gix's rename-detection (`Rewrites` options) to preserve semantics. Dead, deleted.
+- `ls_tree_plans` + the `PlanEntry` struct it returned. Dead, deleted.
+
+Migration scope shrank from 16 functions to **13**. The dead deletions also retired ~80 LoC and removed one feature dependency (`--follow` rename-following would have driven extra gix surface).
+
+### Step 2 became `rev_parse_head`, not `commit_message`
+
+The plan originally named `commit_message` as the step-2 spike. The audit above retired it. The actual spike landed against `rev_parse_head` (used in `rebuild.rs:131`, `preview.rs:232`, and `snapshot`'s internal call site) — same checkpoint purpose, real call sites.
+
+The spike surfaced one real semantic divergence: `repo.head_id()` peels HEAD through to a commit object (errors on dangling HEAD); `repo.head()?.id()` reads the ref target WITHOUT peeling (matches `git rev-parse HEAD`'s legacy behavior). The dangling-HEAD regression test at `open_integration.rs:737` caught the difference. The implementation uses the non-peeling variant.
+
 ### Per-function API mapping (concrete gix 0.84 references)
 
 | `git_io.rs` function | gix call |
 |---|---|
-| `rev_parse_head(repo) -> Option<CommitSha>` | `gix::open(repo).ok().and_then(\|r\| r.head_id().ok()).map(\|id\| id.detach())` |
-| `ls_tree_plans(repo, head) -> Vec<PlanEntry>` | `repo.find_commit(head)?.tree()?.traverse().breadthfirst(&mut Recorder::default())?`, filter `records` by `filepath.starts_with(b".clank/plans/")` and `mode.is_blob()` |
+| `rev_parse_head(repo) -> Option<CommitSha>` | `gix::open(repo).ok().and_then(\|r\| r.head().ok()).and_then(\|h\| h.id()).map(\|id\| id.detach())` — note `head().id()`, NOT `head_id()`; the latter peels and breaks dangling-HEAD semantics |
+| ~~`ls_tree_plans(repo, head)`~~ | **DELETED** — dead code (zero callers) |
 | `show_blob(repo, sha, path)` | `repo.find_commit(sha)?.tree()?.lookup_entry_by_path(path)? + repo.find_blob(entry.oid())?.data.clone()` |
 | `is_ancestor(repo, a, b)` | `matches!(repo.merge_base(a, b), Ok(id) if id.detach() == a)` (no built-in; idiom from gix docs) |
 | `first_parent_commits_between(repo, from, to)` | `repo.rev_walk([to]).with_hidden([from]).first_parent_only().sorting(ByCommitTime(NewestFirst)).all()?` |
 | `parent_of(repo, sha)` | `repo.find_commit(sha)?.parent_ids().next().map(\|id\| id.detach())` |
-| `first_added_commit(repo, path)` | custom ~20 LoC: walk `first_parent_only` newest→oldest, find last commit where `tree.lookup_entry_by_path(path).is_some()` and parent's tree returns `None`. No built-in. |
-| `tree_plan_paths(repo, sha)` | same Recorder walk as `ls_tree_plans`, narrower filter |
+| ~~`first_added_commit(repo, path)`~~ | **DELETED** — dead code (zero callers); would have needed gix rename-detection (`Rewrites`) to preserve `--follow` semantics |
+| `tree_plan_paths(repo, sha)` | Recorder walk, filter by `filepath.starts_with(b".clank/plans/")` and `mode.is_blob()` |
 | `tree_clank_paths(repo, sha)` | same Recorder walk, filter by `filepath.starts_with(b".clank/")` and `mode.is_blob()` |
 | `commit_parent_count(repo, sha)` | `repo.find_commit(sha)?.parent_ids().count()` |
 | `first_parent_commits_to(repo, to)` | `repo.rev_walk([to]).first_parent_only().all()?` |
 | `first_parent_commits(repo)` | `repo.rev_walk([repo.head_id()?.detach()]).first_parent_only().all()?` |
-| `commit_message(repo, sha)` | `let m = commit.message()?; (m.title.to_string(), m.body.map(\|b\| b.to_string()).unwrap_or_default())` |
-| `diff_tree_changes(repo, sha) -> CommitChanges` | `repo.diff_tree_to_tree(Some(&parent_tree), Some(&this_tree), Some(Options{ rewrites: Some(Rewrites{ percentage: Some(0.5), .. }), location: Some(Location::Path), .. }))?` → match `Change::{Addition, Deletion, Modification, Rewrite}` |
+| ~~`commit_message(repo, sha)`~~ | **DELETED** — dead code (zero callers) |
+| `diff_tree_changes(repo, sha) -> CommitChanges` | `repo.diff_tree_to_tree(Some(&parent_tree), Some(&this_tree), Some(Options{ rewrites: Some(Rewrites{ percentage: Some(0.5), .. }), location: Some(Location::Path), .. }))?` → match `Change::{Addition, Deletion, Modification, Rewrite}`. **First-parent for merges:** `commit.parent_ids().next()` IS the first parent (the legacy shell-out's `--first-parent` semantics fall out naturally — no extra flag needed). **Root commit:** when `parent_ids().next()` is None, pass `Some(&repo.empty_tree())` as the parent (matches the legacy `--root` flag's behavior). |
 | `snapshot(repo_root)` | composes `head_id` + `commit_message` + `tree_clank_paths` + `diff_tree_changes` on one opened `Repository` |
 | `collect_feedback_files(repo_root)` | unchanged — filesystem walk, not git |
-
-### `first_added_commit` algorithm sketch
-
-The only function without a one-liner gix equivalent. Walks `first_parent_only` from HEAD newest→oldest looking for the commit where `path` was introduced:
-
-```
-for info in repo.rev_walk([head]).first_parent_only().all()? {
-    let commit = repo.find_commit(info.id)?;
-    let in_this = commit.tree()?.lookup_entry_by_path(path)?.is_some();
-    if !in_this { continue; }                           // path not here yet — older
-    let parent = match commit.parent_ids().next() {
-        Some(p) => repo.find_commit(p.detach())?.tree()?,
-        None => return Ok(Some(commit.id().detach())),  // root commit with path = intro
-    };
-    if parent.lookup_entry_by_path(path)?.is_none() {
-        return Ok(Some(commit.id().detach()));          // path absent in parent = intro
-    }
-}
-Ok(None)                                                // path never present on first-parent line
-```
-
-Semantics match the current shell-out: "the most recent first-parent commit where this path was introduced". ~15-20 LoC including error mapping.
 
 ### Sharp edges to know about up front
 
@@ -125,14 +119,13 @@ Out:
 
 Each step is its own commit. Reviewers approve incrementally. Goal: existing tests stay green after every commit.
 
-1. **Add gix dependency** (Cargo.toml + Cargo.lock). No code change yet; just confirms the dep tree compiles and binary size delta is acceptable. Verify `cargo build --workspace` clean.
-2. **Migrate `commit_message` — explicit spike-and-evaluate checkpoint.** Smallest text-parser; tests are minimal. After this commit lands and is approved, the implementer stops and evaluates: did `gix::Commit::message()` integrate cleanly into `GitIoError`? Did binary size grow within budget? Did the type-mapping between `bstr::BStr` and our `String` return type fall out naturally? If any of those answers is "no, this is awkward", the plan reverts (one commit revert, dep removed) and we re-evaluate scope. This is the cheap-bailout point. Past this checkpoint, the migration commits.
-3. **Migrate `rev_parse_head`, `parent_of`, `commit_parent_count`** — trivial, mechanical.
+1. **Add gix dependency** (Cargo.toml + Cargo.lock). No code change yet; just confirms the dep tree compiles and binary size delta is acceptable. Verify `cargo build --workspace` clean. **DONE: commit `3518604`** (5.6 MB → 5.6 MB; DCE strips unused gix).
+2. **Spike-and-evaluate checkpoint: migrate `rev_parse_head` + delete dead code.** (Originally named `commit_message` but that function turned out to be dead.) After this commit, the implementer evaluates: did gix integrate cleanly into `GitIoError`? Did binary size grow within budget? If either is "no, this is awkward", the plan reverts. **DONE: commit `d2e846b`** (spike) + this commit (dead-code purge). Outcome: PROCEED. Binary 6.54 MB; ~5.5 MB headroom.
+3. **Migrate `parent_of`, `commit_parent_count`** — trivial, mechanical.
 4. **Migrate `is_ancestor`** — uses `merge_base` idiom.
 5. **Migrate the `first_parent_commits_*` family** (3 functions). They share the rev_walk builder pattern; pull a small helper out.
-6. **Migrate `show_blob`, `ls_tree_plans`, `tree_plan_paths`, `tree_clank_paths`** — tree-iteration family. Recorder-based.
-7. **Migrate `first_added_commit`** — the hand-rolled walk.
-8. **Migrate `diff_tree_changes`** — the biggest win. The 10 `parse_diff_tree_*` tests in `git_io.rs:938-1048` are *scenario tests*, not parser-implementation noise. Each verifies a real behavioral case (rename out of plans, plans-with-code, finish detection via plan-deleted+finished-added, etc.). They must be **converted, not deleted**.
+6. **Migrate `show_blob`, `tree_plan_paths`, `tree_clank_paths`** — tree-iteration family. Recorder-based.
+7. **Migrate `diff_tree_changes`** — the biggest win. The 10 `parse_diff_tree_*` tests in `git_io.rs:938-1048` are *scenario tests*, not parser-implementation noise. Each verifies a real behavioral case (rename out of plans, plans-with-code, finish detection via plan-deleted+finished-added, etc.). They must be **converted, not deleted**.
 
    **Test conversion plan — one-to-one mapping:**
 
@@ -156,7 +149,7 @@ Each step is its own commit. Reviewers approve incrementally. Goal: existing tes
    Only after the 10 integration tests are written and green is `parse_diff_tree` + its parser tests removed in the same commit. The new tests are the spec; the parser deletion is the cleanup.
 
    Acceptance check for this step: `git_io.rs` line count drops by ~150-200; `diff_tree_changes_scenarios.rs` exists with 10 tests passing.
-9. **Migrate `snapshot`** — falls out naturally once its primitives are migrated.
+8. **Migrate `snapshot`** — falls out naturally once its primitives are migrated.
 
 ## Verification
 
