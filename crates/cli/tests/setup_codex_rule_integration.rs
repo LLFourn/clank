@@ -118,6 +118,36 @@ fn setup_errors_on_existing_deny_for_clank() {
 }
 
 #[test]
+fn setup_errors_on_malformed_clank_rule_line() {
+    // Regression for codex on ab79722: a `prefix_rule` line that
+    // references the bare `clank` pattern but has neither
+    // `decision="allow"` nor `decision="deny"` (e.g. a typo'd
+    // decision) is malformed. Setup must error rather than
+    // appending our line alongside, which would leave codex with
+    // an ambiguous rule the user can't easily reconcile.
+    let home = tempfile::tempdir().unwrap();
+    let path = rules_path(home.path());
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let malformed = r#"prefix_rule(pattern=["clank"], decision="alow")"#;
+    let original = format!("{malformed}\n");
+    std::fs::write(&path, &original).unwrap();
+    let out = run_setup(home.path(), false);
+    assert!(
+        !out.status.success(),
+        "setup must fail-closed on malformed clank-pattern line; stdout=`{}` stderr=`{}`",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let after = std::fs::read_to_string(&path).unwrap();
+    assert_eq!(after, original, "file must not be modified on error");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("malformed"),
+        "stderr should explain the failure; got: {stderr}"
+    );
+}
+
+#[test]
 fn setup_ignores_more_specific_patterns() {
     // Pre-existing `["clank", "init"]` is a *different* pattern;
     // setup should still append the bare `["clank"]` rule.

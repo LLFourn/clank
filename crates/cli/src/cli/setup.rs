@@ -179,19 +179,41 @@ fn install_codex_rule(path: &Path, dry_run: bool, summary: &mut Vec<String>) -> 
     };
 
     if let Some(content) = &existing {
-        for line in content.lines() {
+        for (idx, line) in content.lines().enumerate() {
+            let lineno = idx + 1;
             if !line.contains(CODEX_BARE_CLANK_PATTERN) {
                 continue;
             }
-            if line.contains(r#"decision="deny""#) {
+            let is_allow = line.contains(r#"decision="allow""#);
+            let is_deny = line.contains(r#"decision="deny""#);
+            if !is_allow && !is_deny {
+                // The line references our pattern but has no
+                // recognized decision — most likely the user has a
+                // typo (`decision="alow"`, missing closing quote,
+                // etc.). Fail closed: appending our allow rule
+                // without addressing the broken line would leave
+                // codex in an ambiguous state. The user owns the
+                // rules file; surface the diagnostic and ask them
+                // to fix it manually.
                 anyhow::bail!(
-                    "{}: line `{}` denies the `clank` pattern; \
-                     remove or change it before re-running `clank setup`",
+                    "{}:{}: line `{}` references the `clank` pattern but has no \
+                     `decision=\"allow|deny\"` — file appears malformed. \
+                     Fix or remove the line, then re-run `clank setup`.",
                     path.display(),
+                    lineno,
                     line.trim(),
                 );
             }
-            if line.contains(r#"decision="allow""#) {
+            if is_deny {
+                anyhow::bail!(
+                    "{}:{}: line `{}` denies the `clank` pattern; \
+                     remove or change it before re-running `clank setup`",
+                    path.display(),
+                    lineno,
+                    line.trim(),
+                );
+            }
+            if is_allow {
                 summary.push(format!("  ok    {}", path.display()));
                 return Ok(());
             }

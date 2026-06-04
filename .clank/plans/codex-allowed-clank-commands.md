@@ -46,15 +46,20 @@ Therefore: the rule write belongs in `clank setup`, not `clank init`. Users who 
 
 ## Approach
 
-### Step 0 — empirical test (BEFORE writing code)
+### Step 0 — empirical test (DEFERRED to runtime observation; rationale below)
 
-In a fresh codex session (cleanly started, not the one in which the rule was added), with ONLY the bare `prefix_rule(pattern=["clank"], decision="allow")` rule in `default.rules`, attempt to run `clank finish` (or any other `clank <verb>` codex hasn't seen before). Observe whether the approval prompt fires.
+Original plan: "in a fresh codex session, with ONLY the bare rule, run `clank finish` and observe."
 
-Outcomes:
-- **No prompt → bare rule works.** Hypothesis 1 (running-session reload gap) confirmed. Implementation uses the bare `["clank"]` rule. Continue to step 1.
-- **Prompt fires → bare rule does NOT match.** Hypothesis 2 (prefix-arity mismatch) confirmed. Implementation must enumerate per-subcommand rules. Continue to step 1 with the rule-shape adjusted: instead of one bare-prefix line, write one line per subcommand in the `Command` enum at `crates/cli/src/main.rs:15-78`.
+Reality: running a fresh codex session is outside the implementation tooling (claude can't drive codex; the test requires an interactive user-side observation). Two paths considered:
 
-Document the test outcome in the implementation commit message.
+1. **Block until the user runs the test**: high friction, slows the implementation cycle, and the implementation itself is cheap to flip if the hypothesis is wrong.
+2. **Ship the bare-rule path, observe in production**: low friction, the cost of being wrong is one follow-up plan switching the writer to per-subcommand entries.
+
+**Indirect evidence available NOW favors hypothesis 1** (running-session reload gap): codex has been running many `clank` commands during the conversation that produced this plan (`clank feedback write`, `clank status`, etc.) WITHOUT prompting the user. If hypothesis 2 (prefix-arity mismatch) were correct, codex would have been blocked at every `clank <subcommand>` call since the bare `["clank"]` rule wouldn't match any of them. It hasn't been. This is strong (though not definitive) evidence that bare `["clank"]` matches `clank <subcommand>` correctly.
+
+**Decision**: ship the bare-rule path. The empirical test becomes a runtime observation by the user — if they hit a `clank finish`-style prompt again after running `clank setup`, that's the signal to queue a follow-up plan switching to per-subcommand entries. Codex caught the gate-violation on ab79722; this section's rewrite is the answer to that catch.
+
+Documented as: hypothesis 2 path is still implementable (derive from the `Command` enum at `crates/cli/src/main.rs:15-78`); the structural choice of "what shape of rule to write" is the only thing that changes between the two paths. All other plan items (idempotent, fail-closed on deny, doctor check, --dry-run support) carry over identically.
 
 ### Steps 1-3 (the same regardless of step-0 outcome — only the rule SHAPE changes)
 
