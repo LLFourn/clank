@@ -58,7 +58,9 @@ Document the test outcome in the implementation commit message.
 
 ### Steps 1-3 (the same regardless of step-0 outcome — only the rule SHAPE changes)
 
-1. **Extend `clank setup` to ensure the codex rule(s) are present.** Read `~/.codex/rules/default.rules` (or create it + parent dirs if missing). For each line the plan needs:
+1. **Extend `clank setup` to ensure the codex rule(s) are present.** Honors the existing `--dry-run` flag (every other setup write does — see `crates/cli/src/cli/setup.rs:83-124`). Under `--dry-run`: print the intended action (create file / append line / skip) without writing. Without `--dry-run`: perform the write.
+
+   Read `~/.codex/rules/default.rules` (or create it + parent dirs if missing). For each line the plan needs:
    - **No matching line exists → append the line at the end of the file.** Trailing-append matches the file's existing convention; the user's file accumulates allows in order of approval.
    - **Exact-match allow line already present → no-op.** Idempotent.
    - **A `decision="deny"` line for the same pattern exists → ERROR.** Don't silently override a user's explicit denial; print a diagnostic naming the file path and the line content, and ask the user to remove it manually. Fail-closed.
@@ -84,8 +86,9 @@ So precedence between two `allow` rules is irrelevant — they have the same dec
 
 - The claude side: claude's hook + permissions surface is already handled by `write_claude_perms` in `init.rs`. Codex parity is the gap this plan closes.
 - Restructuring codex's existing config format. The DSL line-append + grep-for-presence pattern is sufficient.
-- Generalizing to per-subcommand rules. If a user wants finer-grained control, they edit the file by hand — that's the codex UX.
 - Touching `clank init`. User-scope installation stays in `clank setup`.
+
+(The per-subcommand vs bare-rule choice is in scope — it's the load-bearing decision step 0 resolves. Removed the earlier "generalize to per-subcommand is out of scope" line since it contradicted step 0; codex caught the contradiction on 75808e5.)
 
 ## Acceptance
 
@@ -103,6 +106,7 @@ So precedence between two `allow` rules is irrelevant — they have the same dec
 - **Integration test (creates file)**: temp HOME with no `~/.codex/rules/` dir at all, run `clank setup`, assert the dir and file are created with the entry.
 - **Integration test (other rules preserved)**: pre-populate file with unrelated rules, run setup, assert the original rules are still present + the clank line(s) were appended.
 - **Integration test (deny-collision errors)**: pre-populate file with `prefix_rule(pattern=["clank"], decision="deny")`, run `clank setup`, assert it exits non-zero with a diagnostic naming the offending line. File is left unchanged.
+- **Integration test (dry-run)**: temp HOME with no rule, run `clank setup --dry-run`, assert (a) stdout reports the intended rule write and (b) `~/.codex/rules/default.rules` is NOT created. Mirrors the existing dry-run pattern for other setup writes.
 - **Doctor test**: temp HOME with no rule → Warn entry naming "clank setup" as fix; with rule → no warn.
 
 ## Implementation note
