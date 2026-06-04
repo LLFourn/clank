@@ -175,19 +175,24 @@ pub async fn first_parent_commits_between(
     Ok(out)
 }
 
-/// `git rev-parse <sha>^` — first parent of the given commit. Returns
-/// `Ok(None)` for the root commit (no parent).
+/// First parent of the given commit. Returns `Ok(None)` for the
+/// root commit (no parent) or when the commit / repo can't be
+/// opened (preserves the legacy shell-out's lenient semantics —
+/// missing commits map to None, not an error).
 pub async fn parent_of(repo: &Path, sha: &CommitSha) -> Result<Option<CommitSha>, GitIoError> {
-    let spec = format!("{}^", sha.as_str());
-    let output = run(repo, &["rev-parse", "--verify", &spec]).await?;
-    if !output.status.success() {
-        return Ok(None);
-    }
-    let s = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    if s.is_empty() {
-        Ok(None)
-    } else {
-        Ok(Some(parse_sha("parent_of", &s)?))
+    let repo_path = repo.to_path_buf();
+    let sha_str = sha.as_str().to_string();
+    let parent_opt = tokio::task::spawn_blocking(move || -> Option<gix::ObjectId> {
+        let repo = gix::open(&repo_path).ok()?;
+        let oid = gix::ObjectId::from_hex(sha_str.as_bytes()).ok()?;
+        let commit = repo.find_commit(oid).ok()?;
+        commit.parent_ids().next().map(|id| id.detach())
+    })
+    .await
+    .map_err(|e| GitIoError::Spawn(format!("blocking task join failed: {e}")))?;
+    match parent_opt {
+        None => Ok(None),
+        Some(oid) => Ok(Some(parse_sha("parent_of", &oid.to_string())?)),
     }
 }
 
@@ -274,10 +279,32 @@ pub async fn tree_clank_paths(repo: &Path, sha: &CommitSha) -> Result<Vec<String
     Ok(paths)
 }
 
-/// Number of parents on `sha`. Two or more = merge commit.
+/// Number of parents on `sha`. Two or more = merge commit. Errors
+/// if the repo or commit can't be opened (strict — matches the
+/// legacy shell-out's `run_ok` behavior).
 pub async fn commit_parent_count(repo: &Path, sha: &CommitSha) -> Result<usize, GitIoError> {
-    let stdout = run_ok(repo, &["show", "-s", "--format=%P", sha.as_str()]).await?;
-    Ok(stdout.split_whitespace().count())
+    let repo_path = repo.to_path_buf();
+    let sha_str = sha.as_str().to_string();
+    let context = format!("commit_parent_count {sha_str}");
+    tokio::task::spawn_blocking(move || -> Result<usize, GitIoError> {
+        let repo = gix::open(&repo_path).map_err(|e| GitIoError::NonZero {
+            context: context.clone(),
+            code: None,
+            stderr: format!("gix open: {e}"),
+        })?;
+        let oid = gix::ObjectId::from_hex(sha_str.as_bytes()).map_err(|e| GitIoError::Parse {
+            context: context.clone(),
+            detail: format!("oid hex: {e}"),
+        })?;
+        let commit = repo.find_commit(oid).map_err(|e| GitIoError::NonZero {
+            context,
+            code: None,
+            stderr: format!("find_commit: {e}"),
+        })?;
+        Ok(commit.parent_ids().count())
+    })
+    .await
+    .map_err(|e| GitIoError::Spawn(format!("blocking task join failed: {e}")))?
 }
 
 /// First-parent walk pinned to a specific tip SHA. Unlike
