@@ -25,12 +25,12 @@ That's error-prone and easy to half-do.
 - **Feedback files are NOT tracked in git** (verified by `.gitignore`: `.clank/*` with carve-outs only for `.clank/plans/` and `.clank/finished/`; `.clank/agents/` is local-only). So they don't appear in commit content; the rewrite engine doesn't see them. Orphan cleanup must happen as a filesystem-level pass alongside the rewrite, not as part of the rewrite itself.
 - **`clank purge` already supports `--into-branch`, `--dry`, `--yes`, `--allow-rewrite-protected`.** Demote should inherit the same flags with the same semantics.
 
-These findings collapse the plan's load-bearing logic into a small surface:
+These findings collapse the plan's load-bearing logic into a small surface (see Approach for the full transactional ordering):
 
 1. Demote's safety check reuses `clank purge`'s preview output. The check is simply "any `Rewrite` or `KeepVerbatim` disposition in the range?" — those are exactly the commits that have "real work" demote would lose.
-2. With `--force`, demote uses a different disposition strategy: transform every commit in the range to `Drop` regardless. The rewrite engine then drops the whole range.
-3. Orphaned feedback files: walk `.clank/agents/*/feedback/` after the rewrite succeeds; delete files whose key SHA is in the dropped set.
-4. Plan-body save: read `.clank/plans/<plan>.md` from the working tree (or from the latest-reviewable tree if the working tree is dirty) BEFORE the rewrite; write to `.clank/queue/<NNN>-<plan>.md` or `.clank/stubs/<plan>.md`.
+2. With `--force`, demote uses a different disposition strategy: transform every commit in the range to `Drop` regardless. The rewrite engine then drops the whole range. `--force` does NOT bypass `KeepVerbatim` — foreign-commit drops are unconditional refusals.
+3. Plan-body save reads from HEAD (after a dirty-tree refusal); the body lives in memory only until the rewrite succeeds. The filesystem write to `.clank/queue/<NNN>-<plan>.md` or `.clank/stubs/<plan>.md` happens AFTER the rewrite succeeds, not before. See Approach step 5.
+4. Orphaned feedback files: walk `.clank/agents/*/feedback/` AFTER the rewrite succeeds; delete files whose key SHA is in the dropped set. Step 5b.
 
 ## Approach
 
@@ -95,9 +95,7 @@ The genuinely new code is the safety-check classification + the plan-body save. 
 
 ### Implementation note
 
-The bulk of this is reusing `clank purge`'s rewrite engine — the engine already supports "drop these SHAs from history" as a primitive. The plan-specific safety check (refuse if non-plan commits) is the new logic.
-
-The "save plan body before rewrite" is a one-line filesystem op; do it BEFORE invoking the rewrite so a failed rewrite doesn't leave the plan body in limbo.
+The bulk of this is reusing `clank purge`'s rewrite engine — the engine already supports "drop these SHAs from history" as a primitive. The plan-specific new logic is the safety classification (Drop/Rewrite/KeepVerbatim tiering), the dirty-tree refusal, the in-memory plan-body capture + collision pre-check, and the transactional ordering (no filesystem writes until the rewrite engine returns success). The pre-rewrite checks all operate on in-memory state; the queue/stub write and orphan-feedback cleanup only fire after step 4 succeeds.
 
 ## Out of scope
 
