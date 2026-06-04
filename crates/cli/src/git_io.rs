@@ -12,8 +12,6 @@ use crate::lifecycle::{CommitSha, PlanKey};
 
 #[derive(Debug, thiserror::Error)]
 pub enum GitIoError {
-    #[error("git command failed to spawn: {0}")]
-    Spawn(String),
     #[error("git {context}: exit {code:?}: {stderr}")]
     NonZero {
         context: String,
@@ -39,15 +37,12 @@ fn parse_sha(context: &str, s: &str) -> Result<CommitSha, GitIoError> {
 /// pointed-at object exists (matches `git rev-parse HEAD` behavior
 /// on a repo with a dangling HEAD ref). Callers handle `None` as
 /// "no commits to fold from" / cold cache.
-pub async fn rev_parse_head(repo: &Path) -> Result<Option<CommitSha>, GitIoError> {
-    let repo_path = repo.to_path_buf();
-    let oid_opt = tokio::task::spawn_blocking(move || -> Option<gix::ObjectId> {
-        let repo = gix::open(&repo_path).ok()?;
+pub fn rev_parse_head(repo: &Path) -> Result<Option<CommitSha>, GitIoError> {
+    let oid_opt: Option<gix::ObjectId> = (|| {
+        let repo = gix::open(repo).ok()?;
         let head = repo.head().ok()?;
         head.id().map(|id| id.detach())
-    })
-    .await
-    .map_err(|e| GitIoError::Spawn(format!("blocking task join failed: {e}")))?;
+    })();
     match oid_opt {
         None => Ok(None),
         Some(oid) => Ok(Some(parse_sha("head_id", &oid.to_string())?)),
@@ -59,58 +54,49 @@ pub async fn rev_parse_head(repo: &Path) -> Result<Option<CommitSha>, GitIoError
 ///
 /// Errors if the repo can't be opened, the commit/path isn't
 /// found, or the entry isn't a blob.
-pub async fn show_blob(
-    repo: &Path,
-    rev: &CommitSha,
-    rel_path: &Path,
-) -> Result<String, GitIoError> {
-    let repo_path = repo.to_path_buf();
-    let rev_str = rev.as_str().to_string();
-    let path_str = rel_path.to_string_lossy().into_owned();
+pub fn show_blob(repo: &Path, rev: &CommitSha, rel_path: &Path) -> Result<String, GitIoError> {
+    let rev_str = rev.as_str();
+    let path_str = rel_path.to_string_lossy();
     let context = format!("show_blob {rev_str}:{path_str}");
-    tokio::task::spawn_blocking(move || -> Result<String, GitIoError> {
-        let repo = gix::open(&repo_path).map_err(|e| GitIoError::NonZero {
+    let repo = gix::open(repo).map_err(|e| GitIoError::NonZero {
+        context: context.clone(),
+        code: None,
+        stderr: format!("gix open: {e}"),
+    })?;
+    let oid = gix::ObjectId::from_hex(rev_str.as_bytes()).map_err(|e| GitIoError::Parse {
+        context: context.clone(),
+        detail: format!("rev oid hex: {e}"),
+    })?;
+    let commit = repo.find_commit(oid).map_err(|e| GitIoError::NonZero {
+        context: context.clone(),
+        code: None,
+        stderr: format!("find_commit: {e}"),
+    })?;
+    let tree = commit.tree().map_err(|e| GitIoError::NonZero {
+        context: context.clone(),
+        code: None,
+        stderr: format!("commit.tree: {e}"),
+    })?;
+    let entry = tree
+        .lookup_entry_by_path(path_str.as_ref())
+        .map_err(|e| GitIoError::NonZero {
             context: context.clone(),
             code: None,
-            stderr: format!("gix open: {e}"),
-        })?;
-        let oid = gix::ObjectId::from_hex(rev_str.as_bytes()).map_err(|e| GitIoError::Parse {
+            stderr: format!("lookup_entry_by_path: {e}"),
+        })?
+        .ok_or_else(|| GitIoError::NonZero {
             context: context.clone(),
-            detail: format!("rev oid hex: {e}"),
+            code: Some(128),
+            stderr: format!("path `{path_str}` not in tree at {rev_str}"),
         })?;
-        let commit = repo.find_commit(oid).map_err(|e| GitIoError::NonZero {
-            context: context.clone(),
+    let blob = repo
+        .find_blob(entry.oid())
+        .map_err(|e| GitIoError::NonZero {
+            context,
             code: None,
-            stderr: format!("find_commit: {e}"),
+            stderr: format!("find_blob: {e}"),
         })?;
-        let tree = commit.tree().map_err(|e| GitIoError::NonZero {
-            context: context.clone(),
-            code: None,
-            stderr: format!("commit.tree: {e}"),
-        })?;
-        let entry = tree
-            .lookup_entry_by_path(&path_str)
-            .map_err(|e| GitIoError::NonZero {
-                context: context.clone(),
-                code: None,
-                stderr: format!("lookup_entry_by_path: {e}"),
-            })?
-            .ok_or_else(|| GitIoError::NonZero {
-                context: context.clone(),
-                code: Some(128),
-                stderr: format!("path `{path_str}` not in tree at {rev_str}"),
-            })?;
-        let blob = repo
-            .find_blob(entry.oid())
-            .map_err(|e| GitIoError::NonZero {
-                context,
-                code: None,
-                stderr: format!("find_blob: {e}"),
-            })?;
-        Ok(String::from_utf8_lossy(&blob.data).into_owned())
-    })
-    .await
-    .map_err(|e| GitIoError::Spawn(format!("blocking task join failed: {e}")))?
+    Ok(String::from_utf8_lossy(&blob.data).into_owned())
 }
 
 /// True iff `ancestor` is reachable from `head` along any parent
@@ -121,43 +107,36 @@ pub async fn show_blob(
 /// histories (no common ancestor) → `Ok(false)` matching the
 /// legacy `git merge-base --is-ancestor` exit-1 case. Other gix
 /// errors (object missing, cache failure) propagate.
-pub async fn is_ancestor(
+pub fn is_ancestor(
     repo: &Path,
     ancestor: &CommitSha,
     head: &CommitSha,
 ) -> Result<bool, GitIoError> {
-    let repo_path = repo.to_path_buf();
-    let ancestor_str = ancestor.as_str().to_string();
-    let head_str = head.as_str().to_string();
-    let context = format!("is_ancestor {ancestor_str} {head_str}");
-    tokio::task::spawn_blocking(move || -> Result<bool, GitIoError> {
-        let repo = gix::open(&repo_path).map_err(|e| GitIoError::NonZero {
+    let context = format!("is_ancestor {} {}", ancestor.as_str(), head.as_str());
+    let repo = gix::open(repo).map_err(|e| GitIoError::NonZero {
+        context: context.clone(),
+        code: None,
+        stderr: format!("gix open: {e}"),
+    })?;
+    let ancestor_oid =
+        gix::ObjectId::from_hex(ancestor.as_str().as_bytes()).map_err(|e| GitIoError::Parse {
             context: context.clone(),
-            code: None,
-            stderr: format!("gix open: {e}"),
+            detail: format!("ancestor oid hex: {e}"),
         })?;
-        let ancestor_oid =
-            gix::ObjectId::from_hex(ancestor_str.as_bytes()).map_err(|e| GitIoError::Parse {
-                context: context.clone(),
-                detail: format!("ancestor oid hex: {e}"),
-            })?;
-        let head_oid =
-            gix::ObjectId::from_hex(head_str.as_bytes()).map_err(|e| GitIoError::Parse {
-                context: context.clone(),
-                detail: format!("head oid hex: {e}"),
-            })?;
-        match repo.merge_base(ancestor_oid, head_oid) {
-            Ok(id) => Ok(id.detach() == ancestor_oid),
-            Err(gix::repository::merge_base::Error::NotFound { .. }) => Ok(false),
-            Err(e) => Err(GitIoError::NonZero {
-                context,
-                code: None,
-                stderr: format!("merge_base: {e}"),
-            }),
-        }
-    })
-    .await
-    .map_err(|e| GitIoError::Spawn(format!("blocking task join failed: {e}")))?
+    let head_oid =
+        gix::ObjectId::from_hex(head.as_str().as_bytes()).map_err(|e| GitIoError::Parse {
+            context: context.clone(),
+            detail: format!("head oid hex: {e}"),
+        })?;
+    match repo.merge_base(ancestor_oid, head_oid) {
+        Ok(id) => Ok(id.detach() == ancestor_oid),
+        Err(gix::repository::merge_base::Error::NotFound { .. }) => Ok(false),
+        Err(e) => Err(GitIoError::NonZero {
+            context,
+            code: None,
+            stderr: format!("merge_base: {e}"),
+        }),
+    }
 }
 
 /// Walk first-parent commits and collect `CommitMeta` (sha, author
@@ -220,52 +199,41 @@ fn first_parent_walk(
 
 /// First-parent commits between `base` (exclusive) and `tip`
 /// (inclusive), oldest-first.
-pub async fn first_parent_commits_between(
+pub fn first_parent_commits_between(
     repo: &Path,
     base: &CommitSha,
     tip: &CommitSha,
 ) -> Result<Vec<CommitMeta>, GitIoError> {
     const CONTEXT: &str = "first_parent_commits_between";
-    let repo_path = repo.to_path_buf();
-    let base_str = base.as_str().to_string();
-    let tip_str = tip.as_str().to_string();
-    tokio::task::spawn_blocking(move || -> Result<Vec<CommitMeta>, GitIoError> {
-        let repo = gix::open(&repo_path).map_err(|e| GitIoError::NonZero {
+    let repo = gix::open(repo).map_err(|e| GitIoError::NonZero {
+        context: CONTEXT.into(),
+        code: None,
+        stderr: format!("gix open: {e}"),
+    })?;
+    let base_oid =
+        gix::ObjectId::from_hex(base.as_str().as_bytes()).map_err(|e| GitIoError::Parse {
             context: CONTEXT.into(),
-            code: None,
-            stderr: format!("gix open: {e}"),
+            detail: format!("base oid hex: {e}"),
         })?;
-        let base_oid =
-            gix::ObjectId::from_hex(base_str.as_bytes()).map_err(|e| GitIoError::Parse {
-                context: CONTEXT.into(),
-                detail: format!("base oid hex: {e}"),
-            })?;
-        let tip_oid =
-            gix::ObjectId::from_hex(tip_str.as_bytes()).map_err(|e| GitIoError::Parse {
-                context: CONTEXT.into(),
-                detail: format!("tip oid hex: {e}"),
-            })?;
-        first_parent_walk(&repo, Some(base_oid), tip_oid, CONTEXT)
-    })
-    .await
-    .map_err(|e| GitIoError::Spawn(format!("blocking task join failed: {e}")))?
+    let tip_oid =
+        gix::ObjectId::from_hex(tip.as_str().as_bytes()).map_err(|e| GitIoError::Parse {
+            context: CONTEXT.into(),
+            detail: format!("tip oid hex: {e}"),
+        })?;
+    first_parent_walk(&repo, Some(base_oid), tip_oid, CONTEXT)
 }
 
 /// First parent of the given commit. Returns `Ok(None)` for the
 /// root commit (no parent) or when the commit / repo can't be
 /// opened (preserves the legacy shell-out's lenient semantics —
 /// missing commits map to None, not an error).
-pub async fn parent_of(repo: &Path, sha: &CommitSha) -> Result<Option<CommitSha>, GitIoError> {
-    let repo_path = repo.to_path_buf();
-    let sha_str = sha.as_str().to_string();
-    let parent_opt = tokio::task::spawn_blocking(move || -> Option<gix::ObjectId> {
-        let repo = gix::open(&repo_path).ok()?;
-        let oid = gix::ObjectId::from_hex(sha_str.as_bytes()).ok()?;
+pub fn parent_of(repo: &Path, sha: &CommitSha) -> Result<Option<CommitSha>, GitIoError> {
+    let parent_opt: Option<gix::ObjectId> = (|| {
+        let repo = gix::open(repo).ok()?;
+        let oid = gix::ObjectId::from_hex(sha.as_str().as_bytes()).ok()?;
         let commit = repo.find_commit(oid).ok()?;
         commit.parent_ids().next().map(|id| id.detach())
-    })
-    .await
-    .map_err(|e| GitIoError::Spawn(format!("blocking task join failed: {e}")))?;
+    })();
     match parent_opt {
         None => Ok(None),
         Some(oid) => Ok(Some(parse_sha("parent_of", &oid.to_string())?)),
@@ -289,25 +257,22 @@ pub async fn parent_of(repo: &Path, sha: &CommitSha) -> Result<Option<CommitSha>
 /// `.clank/finished/<stem>/`. Sorted. Used by the single-plan
 /// rewrite preview so classification can be tree-based instead of
 /// diff-touch based.
-pub async fn tree_plan_paths(
+pub fn tree_plan_paths(
     repo: &Path,
     sha: &CommitSha,
     stem: &str,
     include_finalize: bool,
 ) -> Result<Vec<String>, GitIoError> {
-    let repo_path = repo.to_path_buf();
-    let sha_str = sha.as_str().to_string();
-    let stem_str = stem.to_string();
     let candidates: Vec<String> = {
-        let mut v = vec![format!(".clank/plans/{stem_str}.md")];
+        let mut v = vec![format!(".clank/plans/{stem}.md")];
         if include_finalize {
-            v.push(format!(".clank/finished/{stem_str}.md"));
+            v.push(format!(".clank/finished/{stem}.md"));
         }
         v
     };
-    let paths_opt = tokio::task::spawn_blocking(move || -> Option<Vec<String>> {
-        let repo = gix::open(&repo_path).ok()?;
-        let oid = gix::ObjectId::from_hex(sha_str.as_bytes()).ok()?;
+    let paths_opt: Option<Vec<String>> = (|| {
+        let repo = gix::open(repo).ok()?;
+        let oid = gix::ObjectId::from_hex(sha.as_str().as_bytes()).ok()?;
         let tree = repo.find_commit(oid).ok()?.tree().ok()?;
         let mut found: Vec<String> = candidates
             .into_iter()
@@ -321,9 +286,7 @@ pub async fn tree_plan_paths(
             .collect();
         found.sort();
         Some(found)
-    })
-    .await
-    .map_err(|e| GitIoError::Spawn(format!("blocking task join failed: {e}")))?;
+    })();
     Ok(paths_opt.unwrap_or_default())
 }
 
@@ -334,12 +297,10 @@ pub async fn tree_plan_paths(
 /// touched — because every post-intro commit's tree inherits
 /// `.clank/` content from its parent even when the commit's diff
 /// didn't touch `.clank/`.
-pub async fn tree_clank_paths(repo: &Path, sha: &CommitSha) -> Result<Vec<String>, GitIoError> {
-    let repo_path = repo.to_path_buf();
-    let sha_str = sha.as_str().to_string();
-    let paths_opt = tokio::task::spawn_blocking(move || -> Option<Vec<String>> {
-        let repo = gix::open(&repo_path).ok()?;
-        let oid = gix::ObjectId::from_hex(sha_str.as_bytes()).ok()?;
+pub fn tree_clank_paths(repo: &Path, sha: &CommitSha) -> Result<Vec<String>, GitIoError> {
+    let paths_opt: Option<Vec<String>> = (|| {
+        let repo = gix::open(repo).ok()?;
+        let oid = gix::ObjectId::from_hex(sha.as_str().as_bytes()).ok()?;
         let tree = repo.find_commit(oid).ok()?.tree().ok()?;
         let mut recorder = gix::traverse::tree::Recorder::default();
         tree.traverse().breadthfirst(&mut recorder).ok()?;
@@ -351,84 +312,65 @@ pub async fn tree_clank_paths(repo: &Path, sha: &CommitSha) -> Result<Vec<String
             .collect();
         paths.sort();
         Some(paths)
-    })
-    .await
-    .map_err(|e| GitIoError::Spawn(format!("blocking task join failed: {e}")))?;
+    })();
     Ok(paths_opt.unwrap_or_default())
 }
 
 /// Number of parents on `sha`. Two or more = merge commit. Errors
 /// if the repo or commit can't be opened.
-pub async fn commit_parent_count(repo: &Path, sha: &CommitSha) -> Result<usize, GitIoError> {
-    let repo_path = repo.to_path_buf();
-    let sha_str = sha.as_str().to_string();
-    let context = format!("commit_parent_count {sha_str}");
-    tokio::task::spawn_blocking(move || -> Result<usize, GitIoError> {
-        let repo = gix::open(&repo_path).map_err(|e| GitIoError::NonZero {
-            context: context.clone(),
-            code: None,
-            stderr: format!("gix open: {e}"),
-        })?;
-        let oid = gix::ObjectId::from_hex(sha_str.as_bytes()).map_err(|e| GitIoError::Parse {
-            context: context.clone(),
-            detail: format!("oid hex: {e}"),
-        })?;
-        let commit = repo.find_commit(oid).map_err(|e| GitIoError::NonZero {
-            context,
-            code: None,
-            stderr: format!("find_commit: {e}"),
-        })?;
-        Ok(commit.parent_ids().count())
-    })
-    .await
-    .map_err(|e| GitIoError::Spawn(format!("blocking task join failed: {e}")))?
+pub fn commit_parent_count(repo: &Path, sha: &CommitSha) -> Result<usize, GitIoError> {
+    let context = format!("commit_parent_count {}", sha.as_str());
+    let repo = gix::open(repo).map_err(|e| GitIoError::NonZero {
+        context: context.clone(),
+        code: None,
+        stderr: format!("gix open: {e}"),
+    })?;
+    let oid = gix::ObjectId::from_hex(sha.as_str().as_bytes()).map_err(|e| GitIoError::Parse {
+        context: context.clone(),
+        detail: format!("oid hex: {e}"),
+    })?;
+    let commit = repo.find_commit(oid).map_err(|e| GitIoError::NonZero {
+        context,
+        code: None,
+        stderr: format!("find_commit: {e}"),
+    })?;
+    Ok(commit.parent_ids().count())
 }
 
 /// First-parent walk pinned to a specific tip SHA. Unlike
 /// `first_parent_commits` (which walks live HEAD), this anchors to
 /// the caller's snapshot so the resulting range never disagrees
 /// with a value the daemon already projected.
-pub async fn first_parent_commits_to(
+pub fn first_parent_commits_to(
     repo: &Path,
     tip: &CommitSha,
 ) -> Result<Vec<CommitMeta>, GitIoError> {
     const CONTEXT: &str = "first_parent_commits_to";
-    let repo_path = repo.to_path_buf();
-    let tip_str = tip.as_str().to_string();
-    tokio::task::spawn_blocking(move || -> Result<Vec<CommitMeta>, GitIoError> {
-        let repo = gix::open(&repo_path).map_err(|e| GitIoError::NonZero {
+    let repo = gix::open(repo).map_err(|e| GitIoError::NonZero {
+        context: CONTEXT.into(),
+        code: None,
+        stderr: format!("gix open: {e}"),
+    })?;
+    let tip_oid =
+        gix::ObjectId::from_hex(tip.as_str().as_bytes()).map_err(|e| GitIoError::Parse {
             context: CONTEXT.into(),
-            code: None,
-            stderr: format!("gix open: {e}"),
+            detail: format!("tip oid hex: {e}"),
         })?;
-        let tip_oid =
-            gix::ObjectId::from_hex(tip_str.as_bytes()).map_err(|e| GitIoError::Parse {
-                context: CONTEXT.into(),
-                detail: format!("tip oid hex: {e}"),
-            })?;
-        first_parent_walk(&repo, None, tip_oid, CONTEXT)
-    })
-    .await
-    .map_err(|e| GitIoError::Spawn(format!("blocking task join failed: {e}")))?
+    first_parent_walk(&repo, None, tip_oid, CONTEXT)
 }
 
-pub async fn first_parent_commits(repo: &Path) -> Result<Vec<CommitMeta>, GitIoError> {
+pub fn first_parent_commits(repo: &Path) -> Result<Vec<CommitMeta>, GitIoError> {
     const CONTEXT: &str = "first_parent_commits";
-    let repo_path = repo.to_path_buf();
-    tokio::task::spawn_blocking(move || -> Result<Vec<CommitMeta>, GitIoError> {
-        let repo = gix::open(&repo_path).map_err(|e| GitIoError::NonZero {
-            context: CONTEXT.into(),
-            code: None,
-            stderr: format!("gix open: {e}"),
-        })?;
-        let head_oid = match repo.head().ok().and_then(|h| h.id()) {
-            Some(id) => id.detach(),
-            None => return Ok(Vec::new()), // unborn HEAD / no commits → empty
-        };
-        first_parent_walk(&repo, None, head_oid, CONTEXT)
-    })
-    .await
-    .map_err(|e| GitIoError::Spawn(format!("blocking task join failed: {e}")))?
+    let repo = gix::open(repo).map_err(|e| GitIoError::NonZero {
+        context: CONTEXT.into(),
+        code: None,
+        stderr: format!("gix open: {e}"),
+    })?;
+    let head_oid = match repo.head().ok().and_then(|h| h.id()) {
+        Some(id) => id.detach(),
+        None => return Ok(Vec::new()), // unborn HEAD / no commits → empty
+    };
+    first_parent_walk(&repo, None, head_oid, CONTEXT)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -452,73 +394,65 @@ pub struct CommitMeta {
 /// First-parent semantics for merge commits fall out from
 /// `parent_ids().next()` being the first parent (matches the
 /// legacy `-m --first-parent` flag combination).
-pub async fn diff_tree_changes(repo: &Path, sha: &CommitSha) -> Result<CommitChanges, GitIoError> {
-    let repo_path = repo.to_path_buf();
-    let sha_str = sha.as_str().to_string();
-    let context = format!("diff_tree_changes {sha_str}");
-    tokio::task::spawn_blocking(move || -> Result<CommitChanges, GitIoError> {
-        let repo = gix::open(&repo_path).map_err(|e| GitIoError::NonZero {
-            context: context.clone(),
+pub fn diff_tree_changes(repo: &Path, sha: &CommitSha) -> Result<CommitChanges, GitIoError> {
+    let context = format!("diff_tree_changes {}", sha.as_str());
+    let repo = gix::open(repo).map_err(|e| GitIoError::NonZero {
+        context: context.clone(),
+        code: None,
+        stderr: format!("gix open: {e}"),
+    })?;
+    let oid = gix::ObjectId::from_hex(sha.as_str().as_bytes()).map_err(|e| GitIoError::Parse {
+        context: context.clone(),
+        detail: format!("oid hex: {e}"),
+    })?;
+    let commit = repo.find_commit(oid).map_err(|e| GitIoError::NonZero {
+        context: context.clone(),
+        code: None,
+        stderr: format!("find_commit: {e}"),
+    })?;
+    let this_tree = commit.tree().map_err(|e| GitIoError::NonZero {
+        context: context.clone(),
+        code: None,
+        stderr: format!("commit.tree: {e}"),
+    })?;
+    // First-parent semantics fall out: `parent_ids().next()` IS
+    // the first parent for merges. Root commit → no parent →
+    // diff against the empty tree (matches legacy `--root`).
+    let parent_tree_owned = match commit.parent_ids().next() {
+        Some(p) => Some(
+            repo.find_commit(p.detach())
+                .map_err(|e| GitIoError::NonZero {
+                    context: context.clone(),
+                    code: None,
+                    stderr: format!("parent find_commit: {e}"),
+                })?
+                .tree()
+                .map_err(|e| GitIoError::NonZero {
+                    context: context.clone(),
+                    code: None,
+                    stderr: format!("parent tree: {e}"),
+                })?,
+        ),
+        None => None,
+    };
+    let parent_tree_ref = parent_tree_owned.as_ref();
+    // Enable rename tracking with the git default 50% similarity
+    // (matches legacy `-M` flag). diff_tree_to_tree with `None`
+    // for options uses the repo's configured defaults, which may
+    // have rewrites=None — so build the Options explicitly.
+    let opts = gix::diff::Options::default().with_rewrites(Some(gix::diff::Rewrites::default()));
+    let raw_changes = repo
+        .diff_tree_to_tree(parent_tree_ref, Some(&this_tree), opts)
+        .map_err(|e| GitIoError::NonZero {
+            context,
             code: None,
-            stderr: format!("gix open: {e}"),
+            stderr: format!("diff_tree_to_tree: {e}"),
         })?;
-        let oid = gix::ObjectId::from_hex(sha_str.as_bytes()).map_err(|e| GitIoError::Parse {
-            context: context.clone(),
-            detail: format!("oid hex: {e}"),
-        })?;
-        let commit = repo.find_commit(oid).map_err(|e| GitIoError::NonZero {
-            context: context.clone(),
-            code: None,
-            stderr: format!("find_commit: {e}"),
-        })?;
-        let this_tree = commit.tree().map_err(|e| GitIoError::NonZero {
-            context: context.clone(),
-            code: None,
-            stderr: format!("commit.tree: {e}"),
-        })?;
-        // First-parent semantics fall out: `parent_ids().next()` IS
-        // the first parent for merges. Root commit → no parent →
-        // diff against the empty tree (matches legacy `--root`).
-        let parent_tree_owned = match commit.parent_ids().next() {
-            Some(p) => Some(
-                repo.find_commit(p.detach())
-                    .map_err(|e| GitIoError::NonZero {
-                        context: context.clone(),
-                        code: None,
-                        stderr: format!("parent find_commit: {e}"),
-                    })?
-                    .tree()
-                    .map_err(|e| GitIoError::NonZero {
-                        context: context.clone(),
-                        code: None,
-                        stderr: format!("parent tree: {e}"),
-                    })?,
-            ),
-            None => None,
-        };
-        let parent_tree_ref = parent_tree_owned.as_ref();
-        // Enable rename tracking with the git default 50%
-        // similarity (matches legacy `-M` flag). diff_tree_to_tree
-        // with `None` for options uses the repo's configured
-        // defaults, which may have rewrites=None — so build the
-        // Options explicitly.
-        let opts =
-            gix::diff::Options::default().with_rewrites(Some(gix::diff::Rewrites::default()));
-        let raw_changes = repo
-            .diff_tree_to_tree(parent_tree_ref, Some(&this_tree), opts)
-            .map_err(|e| GitIoError::NonZero {
-                context,
-                code: None,
-                stderr: format!("diff_tree_to_tree: {e}"),
-            })?;
-        let records: Vec<DiffRecord> = raw_changes
-            .into_iter()
-            .filter_map(diff_record_from_gix_change)
-            .collect();
-        Ok(apply_diff_records(&records))
-    })
-    .await
-    .map_err(|e| GitIoError::Spawn(format!("blocking task join failed: {e}")))?
+    let records: Vec<DiffRecord> = raw_changes
+        .into_iter()
+        .filter_map(diff_record_from_gix_change)
+        .collect();
+    Ok(apply_diff_records(&records))
 }
 
 /// Per-change record extracted from gix's `Change` enum. Mirrors
@@ -784,16 +718,16 @@ fn apply_diff_records(records: &[DiffRecord]) -> CommitChanges {
 /// Working-tree feedback is gathered separately via
 /// [`collect_feedback_files`] and applied by
 /// `disk_snapshot::attach_live_feedback`.
-pub async fn snapshot(repo_root: &Path) -> Result<CommitSnapshot, GitIoError> {
-    let head = rev_parse_head(repo_root).await?;
+pub fn snapshot(repo_root: &Path) -> Result<CommitSnapshot, GitIoError> {
+    let head = rev_parse_head(repo_root)?;
     let Some(head) = head else {
         return Ok(CommitSnapshot::default());
     };
 
-    let metas = first_parent_commits(repo_root).await?;
+    let metas = first_parent_commits(repo_root)?;
     let mut history: Vec<CommitEvent> = Vec::with_capacity(metas.len());
     for meta in metas {
-        let changes = diff_tree_changes(repo_root, &meta.sha).await?;
+        let changes = diff_tree_changes(repo_root, &meta.sha)?;
         history.push(CommitEvent {
             commit: meta.sha,
             author_ts: meta.author_ts,

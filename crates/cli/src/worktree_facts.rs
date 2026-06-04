@@ -32,7 +32,7 @@ pub async fn read_worktree_facts(
         Err(e) => return Err(e.into()),
     };
     let head_body = match head {
-        Some(h) => git_io::show_blob(repo, h, Path::new(plan_path)).await.ok(),
+        Some(h) => git_io::show_blob(repo, h, Path::new(plan_path)).ok(),
         None => None,
     };
     let status = match (head_body.as_deref(), worktree_body.as_deref()) {

@@ -53,9 +53,7 @@ pub async fn rebuild_from(
     if let Some(f) = from {
         for cached_head in state_cache::list_cached_heads(repo_root) {
             let usable = &cached_head == f
-                || git_io::is_ancestor(repo_root, &cached_head, f)
-                    .await
-                    .unwrap_or(false);
+                || git_io::is_ancestor(repo_root, &cached_head, f).unwrap_or(false);
             if !usable {
                 continue;
             }
@@ -78,11 +76,11 @@ pub async fn rebuild_from(
         let base = state.head.clone();
         let metas = match base.as_ref() {
             Some(b) if b == target => Vec::new(),
-            Some(b) => git_io::first_parent_commits_between(repo_root, b, target).await?,
-            None => git_io::first_parent_commits_to(repo_root, target).await?,
+            Some(b) => git_io::first_parent_commits_between(repo_root, b, target)?,
+            None => git_io::first_parent_commits_to(repo_root, target)?,
         };
         for meta in metas {
-            let changes = git_io::diff_tree_changes(repo_root, &meta.sha).await?;
+            let changes = git_io::diff_tree_changes(repo_root, &meta.sha)?;
             let event = CommitEvent {
                 commit: meta.sha.clone(),
                 author_ts: meta.author_ts,
@@ -97,12 +95,12 @@ pub async fn rebuild_from(
     // Phase 2 (collecting): fold from `from` (exclusive) through `to` (inclusive).
     let base = state.head.clone();
     let metas = match base.as_ref() {
-        Some(b) => git_io::first_parent_commits_between(repo_root, b, to).await?,
-        None => git_io::first_parent_commits_to(repo_root, to).await?,
+        Some(b) => git_io::first_parent_commits_between(repo_root, b, to)?,
+        None => git_io::first_parent_commits_to(repo_root, to)?,
     };
     let mut log_events = Vec::new();
     for meta in metas {
-        let changes = git_io::diff_tree_changes(repo_root, &meta.sha).await?;
+        let changes = git_io::diff_tree_changes(repo_root, &meta.sha)?;
         let event = CommitEvent {
             commit: meta.sha.clone(),
             author_ts: meta.author_ts,
@@ -128,7 +126,7 @@ pub async fn rebuild_with_diagnostics(
     repo_root: &Path,
     policy: CachePolicy,
 ) -> Result<(RepoState, RebuildDiagnostics), RebuildError> {
-    let head = git_io::rev_parse_head(repo_root).await?;
+    let head = git_io::rev_parse_head(repo_root)?;
 
     if policy == CachePolicy::Use
         && let Some(ref h) = head
@@ -151,7 +149,7 @@ pub async fn rebuild_with_diagnostics(
             if &cached_head == h {
                 continue;
             }
-            match git_io::is_ancestor(repo_root, &cached_head, h).await {
+            match git_io::is_ancestor(repo_root, &cached_head, h) {
                 Ok(true) => {}
                 _ => continue,
             }
@@ -184,7 +182,7 @@ pub async fn rebuild_with_diagnostics(
         }
     }
 
-    let snapshot = git_io::snapshot(repo_root).await?;
+    let snapshot = git_io::snapshot(repo_root)?;
     let state = derive_state(repo_root.to_path_buf(), snapshot).await?;
 
     if policy == CachePolicy::Use {
@@ -224,9 +222,9 @@ async fn fold_forward(
             detail: "cached state has no head".into(),
         });
     };
-    let metas = git_io::first_parent_commits_between(repo_root, &base, target_head).await?;
+    let metas = git_io::first_parent_commits_between(repo_root, &base, target_head)?;
     for meta in metas {
-        let changes = git_io::diff_tree_changes(repo_root, &meta.sha).await?;
+        let changes = git_io::diff_tree_changes(repo_root, &meta.sha)?;
         let event = CommitEvent {
             commit: meta.sha.clone(),
             author_ts: meta.author_ts,

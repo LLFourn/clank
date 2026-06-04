@@ -137,7 +137,7 @@ pub async fn build_rewrite_preview(
         .clone()
         .ok_or_else(|| PreviewError::NoHead(basename.as_str().to_string()))?;
 
-    let metas = first_parent_commits_to(repo_root, &head_sha).await?;
+    let metas = first_parent_commits_to(repo_root, &head_sha)?;
     let start = match intro_sha.as_ref() {
         Some(intro) => metas.iter().position(|m| &m.sha == intro).ok_or_else(|| {
             PreviewError::IntroNotInWalk {
@@ -174,8 +174,8 @@ pub async fn build_rewrite_preview(
 
     let mut per_commit = Vec::with_capacity(range.len());
     for meta in range {
-        let parent_count = commit_parent_count(repo_root, &meta.sha).await?;
-        let changes = diff_tree_changes(repo_root, &meta.sha).await?;
+        let parent_count = commit_parent_count(repo_root, &meta.sha)?;
+        let changes = diff_tree_changes(repo_root, &meta.sha)?;
         per_commit.push((meta, changes, parent_count > 1));
     }
     let linear = !per_commit.iter().any(|(_, _, is_merge)| *is_merge);
@@ -183,7 +183,7 @@ pub async fn build_rewrite_preview(
     let mut commits = Vec::with_capacity(per_commit.len());
     for (meta, changes, _) in &per_commit {
         let strippable_in_tree =
-            tree_plan_paths(repo_root, &meta.sha, plan_key.as_str(), include_finalize).await?;
+            tree_plan_paths(repo_root, &meta.sha, plan_key.as_str(), include_finalize)?;
         let strip_predicate_for_diff = |p: &str| -> bool {
             p == format!(".clank/plans/{}.md", plan_key.as_str())
                 || (include_finalize && p == format!(".clank/finished/{}.md", plan_key.as_str()))
@@ -206,7 +206,7 @@ pub async fn build_rewrite_preview(
     }
 
     let head_strip_paths =
-        tree_plan_paths(repo_root, &head_sha, plan_key.as_str(), include_finalize).await?;
+        tree_plan_paths(repo_root, &head_sha, plan_key.as_str(), include_finalize)?;
 
     Ok(RewritePreviewResponse {
         plan_id: plan_id_str,
@@ -229,19 +229,18 @@ pub async fn build_rewrite_preview_all(
         .ok_or_else(|| PreviewError::UnknownRepo(repo_root.display().to_string()))?;
     let repo_basename = basename.as_str().to_string();
 
-    let head_sha = rev_parse_head(repo_root)
-        .await?
-        .ok_or_else(|| PreviewError::NoHead(repo_basename.clone()))?;
+    let head_sha =
+        rev_parse_head(repo_root)?.ok_or_else(|| PreviewError::NoHead(repo_basename.clone()))?;
 
-    let metas = first_parent_commits_to(repo_root, &head_sha).await?;
+    let metas = first_parent_commits_to(repo_root, &head_sha)?;
 
     let mut intro_pos: Option<usize> = None;
     let mut per_commit = Vec::with_capacity(metas.len());
     let mut plans_seen: BTreeSet<PlanKey> = BTreeSet::new();
     for (idx, meta) in metas.into_iter().enumerate() {
-        let parent_count = commit_parent_count(repo_root, &meta.sha).await?;
+        let parent_count = commit_parent_count(repo_root, &meta.sha)?;
         let is_merge = parent_count > 1;
-        let changes = diff_tree_changes(repo_root, &meta.sha).await?;
+        let changes = diff_tree_changes(repo_root, &meta.sha)?;
         for touch in &changes.plan_touches {
             plans_seen.insert(touch.plan.clone());
         }
@@ -261,7 +260,7 @@ pub async fn build_rewrite_preview_all(
             let intro_sha = Some(per_commit[start].0.sha.clone());
             let mut commits = Vec::with_capacity(per_commit.len() - start);
             for (meta, changes, _) in &per_commit[start..] {
-                let tree_clank = tree_clank_paths(repo_root, &meta.sha).await?;
+                let tree_clank = tree_clank_paths(repo_root, &meta.sha)?;
                 let strippable_in_tree: Vec<String> = tree_clank
                     .into_iter()
                     .filter(|p| include_finalize || !p.starts_with(".clank/finished/"))
@@ -287,8 +286,7 @@ pub async fn build_rewrite_preview_all(
         None => (None, Vec::new()),
     };
 
-    let head_strip_paths: Vec<String> = tree_clank_paths(repo_root, &head_sha)
-        .await?
+    let head_strip_paths: Vec<String> = tree_clank_paths(repo_root, &head_sha)?
         .into_iter()
         .filter(|p| include_finalize || !p.starts_with(".clank/finished/"))
         .collect();
@@ -329,7 +327,7 @@ async fn re_fold_finished_plan_natives(
 ) -> Result<BTreeSet<CommitSha>, PreviewError> {
     use crate::disk_snapshot::{CommitEvent, apply_commit};
 
-    let metas = first_parent_commits_to(repo_root, finalized_at).await?;
+    let metas = first_parent_commits_to(repo_root, finalized_at)?;
     let final_idx = metas
         .iter()
         .position(|m| &m.sha == finalized_at)
@@ -341,7 +339,7 @@ async fn re_fold_finished_plan_natives(
     let (mut scratch, start_idx) = pick_cache_anchor(repo_root, &metas, final_idx).await?;
 
     for meta in &metas[start_idx..final_idx] {
-        let changes = diff_tree_changes(repo_root, &meta.sha).await?;
+        let changes = diff_tree_changes(repo_root, &meta.sha)?;
         let event = CommitEvent {
             commit: meta.sha.clone(),
             author_ts: meta.author_ts,

@@ -69,7 +69,7 @@ async fn single_plan_intro() {
     write(repo, ".clank/plans/foo.md", "# foo\n");
     commit(repo, "intro foo");
 
-    let changes = diff_tree_changes(repo, &head_sha(repo)).await.unwrap();
+    let changes = diff_tree_changes(repo, &head_sha(repo)).unwrap();
     assert_eq!(changes.plan_touches.len(), 1);
     assert_eq!(changes.plan_touches[0].plan.as_str(), "foo");
     assert!(matches!(changes.plan_touches[0].kind, PlanTouchKind::Intro));
@@ -93,7 +93,7 @@ async fn rename_out_of_plans_is_delete() {
     );
     commit(repo, "move out");
 
-    let changes = diff_tree_changes(repo, &head_sha(repo)).await.unwrap();
+    let changes = diff_tree_changes(repo, &head_sha(repo)).unwrap();
     assert_eq!(changes.plan_touches.len(), 1);
     assert_eq!(changes.plan_touches[0].plan.as_str(), "foo");
     assert!(matches!(
@@ -118,7 +118,7 @@ async fn rename_into_plans_is_intro() {
     );
     commit(repo, "promote foo");
 
-    let changes = diff_tree_changes(repo, &head_sha(repo)).await.unwrap();
+    let changes = diff_tree_changes(repo, &head_sha(repo)).unwrap();
     assert_eq!(changes.plan_touches.len(), 1);
     assert_eq!(changes.plan_touches[0].plan.as_str(), "foo");
     assert!(matches!(changes.plan_touches[0].kind, PlanTouchKind::Intro));
@@ -136,7 +136,7 @@ async fn plan_revision_with_code() {
     write(repo, "src/lib.rs", "// v2\n");
     commit(repo, "update foo and code");
 
-    let changes = diff_tree_changes(repo, &head_sha(repo)).await.unwrap();
+    let changes = diff_tree_changes(repo, &head_sha(repo)).unwrap();
     assert_eq!(changes.plan_touches.len(), 1);
     assert!(matches!(
         changes.plan_touches[0].kind,
@@ -155,7 +155,7 @@ async fn pure_code() {
     write(repo, "tests/bar.rs", "// added\n");
     commit(repo, "more code");
 
-    let changes = diff_tree_changes(repo, &head_sha(repo)).await.unwrap();
+    let changes = diff_tree_changes(repo, &head_sha(repo)).unwrap();
     assert!(changes.plan_touches.is_empty());
     assert!(changes.has_non_plan_code_changes);
 }
@@ -172,7 +172,7 @@ async fn multi_plan_touch() {
     write(repo, "src/lib.rs", "// v2\n");
     commit(repo, "touch foo + bar + code");
 
-    let changes = diff_tree_changes(repo, &head_sha(repo)).await.unwrap();
+    let changes = diff_tree_changes(repo, &head_sha(repo)).unwrap();
     assert_eq!(changes.plan_touches.len(), 2);
     assert!(changes.has_non_plan_code_changes);
 }
@@ -186,7 +186,7 @@ async fn ignores_other_clank_paths() {
     write(repo, ".clank/feedback/foo/plan/alice.md", "review\n");
     commit(repo, "add feedback");
 
-    let changes = diff_tree_changes(repo, &head_sha(repo)).await.unwrap();
+    let changes = diff_tree_changes(repo, &head_sha(repo)).unwrap();
     assert!(changes.plan_touches.is_empty());
     assert!(!changes.has_non_plan_code_changes);
 }
@@ -201,7 +201,7 @@ async fn finish_detected_when_plan_deleted_and_finished_added() {
     std::fs::remove_file(repo.join(".clank/plans/foo.md")).unwrap();
     commit(repo, "finish foo");
 
-    let changes = diff_tree_changes(repo, &head_sha(repo)).await.unwrap();
+    let changes = diff_tree_changes(repo, &head_sha(repo)).unwrap();
     assert_eq!(changes.plan_touches.len(), 1);
     assert_eq!(changes.plan_touches[0].plan.as_str(), "foo");
     assert!(matches!(
@@ -223,7 +223,7 @@ async fn finished_added_alone_is_finish() {
     write(repo, ".clank/finished/foo.md", "# foo\n");
     commit(repo, "add finished only");
 
-    let changes = diff_tree_changes(repo, &head_sha(repo)).await.unwrap();
+    let changes = diff_tree_changes(repo, &head_sha(repo)).unwrap();
     assert_eq!(changes.plan_touches.len(), 1);
     assert_eq!(changes.plan_touches[0].plan.as_str(), "foo");
     assert!(matches!(
@@ -251,7 +251,7 @@ async fn symlink_outside_clank_is_code_change() {
     std::os::unix::fs::symlink("README.md", repo.join("link-to-readme")).unwrap();
     commit(repo, "add symlink");
 
-    let changes = diff_tree_changes(repo, &head_sha(repo)).await.unwrap();
+    let changes = diff_tree_changes(repo, &head_sha(repo)).unwrap();
     assert!(
         changes.plan_touches.is_empty(),
         "symlink outside .clank/ shouldn't produce plan touches"
@@ -273,7 +273,7 @@ async fn symlink_under_clank_touches_clank() {
     std::os::unix::fs::symlink("../../README.md", repo.join(".clank/extras/link")).unwrap();
     commit(repo, "add clank symlink");
 
-    let changes = diff_tree_changes(repo, &head_sha(repo)).await.unwrap();
+    let changes = diff_tree_changes(repo, &head_sha(repo)).unwrap();
     assert!(
         changes.touched_clank,
         "symlink under .clank/ must set touched_clank; got {changes:?}"
@@ -297,7 +297,7 @@ async fn finished_without_md_extension_ignored() {
     write(repo, ".clank/finished/foo", "# foo no ext\n");
     commit(repo, "add finished-no-md");
 
-    let changes = diff_tree_changes(repo, &head_sha(repo)).await.unwrap();
+    let changes = diff_tree_changes(repo, &head_sha(repo)).unwrap();
     assert!(changes.plan_touches.is_empty());
     assert!(!changes.has_non_plan_code_changes);
 }
