@@ -1,7 +1,10 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
+use anyhow::Context;
 use clank_core::HookEvent;
+use clank_core::ids::AgentLabel;
+use clank_core::vocab::Role;
 use serde::Deserialize;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -90,6 +93,55 @@ impl HooksFile {
             _ => None,
         }
     }
+}
+
+/// One entry in the user-scope `~/.clank/config.json` `default_agents`
+/// list. Consumed by `clank init` to pre-create per-agent config
+/// skeletons so a fresh repo's gate has registered reviewers
+/// immediately (no per-repo `clank as` dance).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct DefaultAgent {
+    pub label: AgentLabel,
+    #[serde(default)]
+    pub role: Role,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct UserDefaultAgentsFile {
+    #[serde(default)]
+    default_agents: Vec<DefaultAgent>,
+}
+
+/// Strict loader for the user-scope `default_agents` list.
+///
+/// The main `load`/`apply_layer` path is intentionally lossy
+/// (logs+ignores malformed JSON) because review/hooks settings can
+/// safely fall back to defaults. `default_agents` cannot fall back
+/// safely: an empty list under the all-reviewers gate means
+/// "master-only repo, auto-approve every commit". A silently
+/// dropped `default_agents` would convert a multi-reviewer setup
+/// into auto-finalize. This loader fails closed — a malformed user
+/// config errors with the parse diagnostic.
+///
+/// Returns an empty list (success) when the user config doesn't
+/// exist or has no `default_agents` field. Errors when the file
+/// exists but won't parse.
+pub fn load_default_agents(home: Option<&Path>) -> anyhow::Result<Vec<DefaultAgent>> {
+    let Some(home) = home else {
+        return Ok(Vec::new());
+    };
+    let path = home.join(".clank/config.json");
+    let body = match std::fs::read_to_string(&path) {
+        Ok(b) => b,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => {
+            return Err(anyhow::anyhow!(e))
+                .with_context(|| format!("reading user config {}", path.display()));
+        }
+    };
+    let parsed: UserDefaultAgentsFile = serde_json::from_str(&body)
+        .with_context(|| format!("parsing user config {}", path.display()))?;
+    Ok(parsed.default_agents)
 }
 
 pub fn load(repo_root: &Path) -> Config {

@@ -14,7 +14,7 @@
 //!   to tool-name + reviewers.
 
 use std::io::{IsTerminal, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::Context;
 
@@ -39,7 +39,58 @@ pub async fn run(args: InitArgs) -> anyhow::Result<()> {
     write_claude_perms(&repo)?;
     write_post_rewrite_hook(&repo, args.force_hooks)?;
     warn_if_globally_excluded(&repo);
+    seed_default_agents(&repo)?;
     bootstrap_agent_identity(&repo, args.yes).await?;
+    Ok(())
+}
+
+/// Seed per-agent config skeletons from `~/.clank/config.json`'s
+/// `default_agents` list, so a fresh repo has registered reviewers
+/// the moment `clank init` returns. The all-reviewers gate requires
+/// at least one registered reviewer to behave non-trivially; without
+/// this step, a brand-new repo auto-approves every commit.
+///
+/// Idempotent: any existing `.clank/agents/<label>/config.json` is
+/// preserved (the user may have run `clank as` already, populating
+/// the `session` field).
+///
+/// Fails closed if the user config is malformed — see
+/// `config::load_default_agents`.
+fn seed_default_agents(repo: &Path) -> anyhow::Result<()> {
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    let agents = crate::cli::config::load_default_agents(home.as_deref())?;
+    if agents.is_empty() {
+        return Ok(());
+    }
+    let mut seeded = Vec::new();
+    let mut skipped = Vec::new();
+    for entry in &agents {
+        let config_path = crate::agent_store::agent_config_path(repo, &entry.label);
+        if config_path.exists() {
+            skipped.push(entry.label.as_str().to_string());
+            continue;
+        }
+        let cfg = clank_core::agent_config::AgentConfig {
+            role: entry.role,
+            ..Default::default()
+        };
+        crate::agent_store::save_agent_config(repo, &entry.label, &cfg)?;
+        seeded.push(entry.label.as_str().to_string());
+    }
+    if !seeded.is_empty() {
+        println!(
+            "seeded {} agent skeleton(s): {}",
+            seeded.len(),
+            seeded.join(", ")
+        );
+    }
+    if !skipped.is_empty() {
+        println!(
+            "skipped {} existing agent(s): {}",
+            skipped.len(),
+            skipped.join(", ")
+        );
+    }
     Ok(())
 }
 
