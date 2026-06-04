@@ -71,18 +71,26 @@ async fn run_ok_raw(repo: &Path, args: &[&str]) -> Result<String, GitIoError> {
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
-/// `git rev-parse HEAD`. Returns `Ok(None)` for an empty repo (no commits).
+/// Resolve HEAD to its commit SHA. Returns `Ok(None)` for an empty
+/// repo (unborn HEAD) or when the path isn't a git repository.
+///
+/// gix backend; preserves the legacy shell-out's lenient semantics:
+/// reads the HEAD ref's target WITHOUT peeling/validating the
+/// pointed-at object exists (matches `git rev-parse HEAD` behavior
+/// on a repo with a dangling HEAD ref). Callers handle `None` as
+/// "no commits to fold from" / cold cache.
 pub async fn rev_parse_head(repo: &Path) -> Result<Option<CommitSha>, GitIoError> {
-    let output = run(repo, &["rev-parse", "HEAD"]).await?;
-    if !output.status.success() {
-        // Most likely: empty repo. Treat as None.
-        return Ok(None);
-    }
-    let s = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    if s.is_empty() {
-        Ok(None)
-    } else {
-        Ok(Some(parse_sha("rev-parse HEAD", &s)?))
+    let repo_path = repo.to_path_buf();
+    let oid_opt = tokio::task::spawn_blocking(move || -> Option<gix::ObjectId> {
+        let repo = gix::open(&repo_path).ok()?;
+        let head = repo.head().ok()?;
+        head.id().map(|id| id.detach())
+    })
+    .await
+    .map_err(|e| GitIoError::Spawn(format!("blocking task join failed: {e}")))?;
+    match oid_opt {
+        None => Ok(None),
+        Some(oid) => Ok(Some(parse_sha("head_id", &oid.to_string())?)),
     }
 }
 

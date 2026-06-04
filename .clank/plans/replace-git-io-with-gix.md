@@ -26,12 +26,15 @@ Confirmed via crates.io 2026-05-26 release. MSRV: Rust 1.85 (clank already build
 ```toml
 [dependencies]
 gix = { version = "0.84", default-features = false, features = [
+    "sha1",                  # required: at least one hash backend must be enabled
     "revision",              # rev_parse, rev_walk, merge_base
     "blob-diff",             # diff::tree_with_rewrites with rename detection
     "max-performance-safe",  # zlib-rs + parallel without C deps
     "parallel",              # Repository: Send under parallel feature
 ] }
 ```
+
+The `sha1` feature is required: `gix-hash` refuses to build without at least one hash backend, and `default-features = false` strips the default `sha1`. clank only ever operates on sha1 repos (git defaults to sha1; `--object-format=sha256` at init is exceedingly rare), so this is mechanical, not a decision point.
 
 Explicitly **not** enabling: `blocking-network-client`, `async-network-client`, any HTTP transport features. We don't clone/fetch/push from git_io.
 
@@ -160,7 +163,7 @@ Each step is its own commit. Reviewers approve incrementally. Goal: existing tes
 - `cargo build --workspace` + `cargo test --workspace` green after every commit.
 - After the final migration commit: `grep -n "run_ok\b" crates/cli/src/git_io.rs` must return nothing. (Mutating ops live elsewhere; `git_io.rs` is reads-only after this plan.)
 - A spike test: synth a repo with `diff.mnemonicPrefix=true` set and confirm the gix-backed `diff_tree_changes` is immune (the shell-out path would silently break).
-- Binary size diff before/after via `cargo bloat --release` or `ls -la target/release/clank`. Plan acceptance: ≤ 50% size growth (clank is currently around 30MB stripped; under 45MB after migration is acceptable; over that triggers a feature-flag trim).
+- Binary size diff before/after via `ls -la target/release/clank`. **Baseline verified 2026-06-04: 5.6 MB stripped** (the original plan-text estimate of "~30MB" was wrong — corrected here so the checkpoint arithmetic matches reality). Plan acceptance ceiling: **12 MB stripped post-migration** (~6.4 MB headroom for gix's full linked surface). Rationale: a typical gix linkage with `revision` + `blob-diff` + `parallel` + `max-performance-safe` lands in the 3-6 MB range from comparable downstream tools; 12 MB ceiling gives headroom for that without rubber-stamping unbounded growth. If exceeded at step 2 (the spike), the trim ladder fires before further commits land.
 - Spot-check: at least one consumer (`rebuild.rs`) end-to-end with a real local clone, confirm no behavior regression.
 
 ## Acceptance
