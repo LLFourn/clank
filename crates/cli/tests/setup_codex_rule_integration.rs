@@ -118,6 +118,62 @@ fn setup_errors_on_existing_deny_for_clank() {
 }
 
 #[test]
+fn setup_errors_on_incomplete_clank_allow_line() {
+    // Regression for codex on 6a4fec7: a `prefix_rule(` line that
+    // matches the bare-clank pattern + has `decision="allow"` BUT
+    // is missing the closing `)` was previously treated as a
+    // valid existing allow rule (idempotent skip), leaving codex
+    // with a broken file. The malformed-line check must catch
+    // this regardless of which decision field is present.
+    let home = tempfile::tempdir().unwrap();
+    let path = rules_path(home.path());
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    // Note: missing closing `)`.
+    let incomplete = r#"prefix_rule(pattern=["clank"], decision="allow""#;
+    let original = format!("{incomplete}\n");
+    std::fs::write(&path, &original).unwrap();
+    let out = run_setup(home.path(), false);
+    assert!(
+        !out.status.success(),
+        "setup must fail-closed on incomplete allow line; stdout=`{}` stderr=`{}`",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let after = std::fs::read_to_string(&path).unwrap();
+    assert_eq!(after, original, "file must not be modified on error");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("malformed"),
+        "stderr should explain the malformed line; got: {stderr}"
+    );
+}
+
+#[test]
+fn setup_errors_on_malformed_unrelated_rule_line() {
+    // Codex's broader concern on 6a4fec7: a malformed prefix_rule
+    // line that DOESN'T match our pattern should also fail-closed.
+    // The user's file is broken regardless of which rule we care
+    // about; appending our line on top would silently preserve
+    // the brokenness.
+    let home = tempfile::tempdir().unwrap();
+    let path = rules_path(home.path());
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    // Note: missing closing `)` on an unrelated rule.
+    let broken = r#"prefix_rule(pattern=["foo"], decision="allow""#;
+    let original = format!("{broken}\n");
+    std::fs::write(&path, &original).unwrap();
+    let out = run_setup(home.path(), false);
+    assert!(
+        !out.status.success(),
+        "setup must fail-closed on any malformed prefix_rule line; stdout=`{}` stderr=`{}`",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let after = std::fs::read_to_string(&path).unwrap();
+    assert_eq!(after, original, "file must not be modified on error");
+}
+
+#[test]
 fn setup_errors_on_malformed_clank_rule_line() {
     // Regression for codex on ab79722: a `prefix_rule` line that
     // references the bare `clank` pattern but has neither
@@ -128,7 +184,7 @@ fn setup_errors_on_malformed_clank_rule_line() {
     let home = tempfile::tempdir().unwrap();
     let path = rules_path(home.path());
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-    let malformed = r#"prefix_rule(pattern=["clank"], decision="alow")"#;
+    let malformed = r#"prefix_rule(pattern=["clank"], decision="alow")"#; // typo'd decision
     let original = format!("{malformed}\n");
     std::fs::write(&path, &original).unwrap();
     let out = run_setup(home.path(), false);

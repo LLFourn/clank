@@ -157,6 +157,41 @@ const CODEX_RULE_LINE: &str = r#"prefix_rule(pattern=["clank"], decision="allow"
 /// between the `"` and the `]` so this substring is absent.
 const CODEX_BARE_CLANK_PATTERN: &str = r#"pattern=["clank"]"#;
 
+/// Minimal structural validation of a `prefix_rule(` line. The
+/// file is the user's; we don't try to be a full DSL parser.
+/// What we DO catch: lines that announce themselves as
+/// `prefix_rule(` calls but are missing the closing `)`, missing
+/// the `pattern=[...]` argument, or missing an
+/// `decision="allow|deny"` argument. Each of these would leave
+/// codex with a broken rules file after our append.
+fn validate_prefix_rule_line(path: &Path, lineno: usize, trimmed: &str) -> anyhow::Result<()> {
+    let malformed = |reason: &str| -> anyhow::Error {
+        anyhow::anyhow!(
+            "{}:{}: line `{}` is malformed ({}); fix or remove it, then re-run `clank setup`",
+            path.display(),
+            lineno,
+            trimmed,
+            reason
+        )
+    };
+    // Must close the call. Strip a trailing comment if codex
+    // ever adds support; for now we trust line.trim().
+    if !trimmed.ends_with(')') {
+        return Err(malformed("missing closing `)`"));
+    }
+    if !trimmed.contains("pattern=[") {
+        return Err(malformed("missing `pattern=[...]` argument"));
+    }
+    let has_allow = trimmed.contains(r#"decision="allow""#);
+    let has_deny = trimmed.contains(r#"decision="deny""#);
+    if !has_allow && !has_deny {
+        return Err(malformed(
+            r#"missing `decision="allow"` or `decision="deny"` argument"#,
+        ));
+    }
+    Ok(())
+}
+
 /// Ensure the codex command-rules file contains a bare `clank`
 /// allow rule.
 ///
@@ -179,44 +214,39 @@ fn install_codex_rule(path: &Path, dry_run: bool, summary: &mut Vec<String>) -> 
     };
 
     if let Some(content) = &existing {
+        let mut existing_clank_allow_seen = false;
         for (idx, line) in content.lines().enumerate() {
             let lineno = idx + 1;
-            if !line.contains(CODEX_BARE_CLANK_PATTERN) {
+            let trimmed = line.trim();
+            if !trimmed.starts_with("prefix_rule(") {
                 continue;
             }
-            let is_allow = line.contains(r#"decision="allow""#);
-            let is_deny = line.contains(r#"decision="deny""#);
-            if !is_allow && !is_deny {
-                // The line references our pattern but has no
-                // recognized decision — most likely the user has a
-                // typo (`decision="alow"`, missing closing quote,
-                // etc.). Fail closed: appending our allow rule
-                // without addressing the broken line would leave
-                // codex in an ambiguous state. The user owns the
-                // rules file; surface the diagnostic and ask them
-                // to fix it manually.
-                anyhow::bail!(
-                    "{}:{}: line `{}` references the `clank` pattern but has no \
-                     `decision=\"allow|deny\"` — file appears malformed. \
-                     Fix or remove the line, then re-run `clank setup`.",
-                    path.display(),
-                    lineno,
-                    line.trim(),
-                );
+            // Any `prefix_rule(` line must be well-formed. The
+            // user's rules file is their space; if it's already
+            // broken, appending our line wouldn't fix it AND would
+            // leave us as the most recent edit on a broken file.
+            // Surface the diagnostic; let the user fix it manually.
+            validate_prefix_rule_line(path, lineno, trimmed)?;
+
+            if !trimmed.contains(CODEX_BARE_CLANK_PATTERN) {
+                continue;
             }
-            if is_deny {
+            if trimmed.contains(r#"decision="deny""#) {
                 anyhow::bail!(
                     "{}:{}: line `{}` denies the `clank` pattern; \
                      remove or change it before re-running `clank setup`",
                     path.display(),
                     lineno,
-                    line.trim(),
+                    trimmed,
                 );
             }
-            if is_allow {
-                summary.push(format!("  ok    {}", path.display()));
-                return Ok(());
+            if trimmed.contains(r#"decision="allow""#) {
+                existing_clank_allow_seen = true;
             }
+        }
+        if existing_clank_allow_seen {
+            summary.push(format!("  ok    {}", path.display()));
+            return Ok(());
         }
     }
 
