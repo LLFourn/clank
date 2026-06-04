@@ -358,8 +358,7 @@ pub async fn tree_clank_paths(repo: &Path, sha: &CommitSha) -> Result<Vec<String
 }
 
 /// Number of parents on `sha`. Two or more = merge commit. Errors
-/// if the repo or commit can't be opened (strict — matches the
-/// legacy shell-out's `run_ok` behavior).
+/// if the repo or commit can't be opened.
 pub async fn commit_parent_count(repo: &Path, sha: &CommitSha) -> Result<usize, GitIoError> {
     let repo_path = repo.to_path_buf();
     let sha_str = sha.as_str().to_string();
@@ -773,13 +772,10 @@ fn apply_diff_records(records: &[DiffRecord]) -> CommitChanges {
 /// commit-derived rebuild; `disk_snapshot::derive_base_state`
 /// consumes the result as a feedback-blind fold.
 ///
-/// Two IO steps in order:
-/// 1. `git rev-parse HEAD` (empty repo → empty snapshot).
-/// 2. Per-commit walk along HEAD's first-parent chain. For each
-///    commit: `git diff-tree` for the diff structure; `git show`
-///    per plan-file Add/Modify (body) and per finalize-file upsert
-///    (first line) so each `CommitEvent` carries everything the
-///    fold needs.
+/// Composes the migrated primitives:
+/// 1. `rev_parse_head` (empty repo / unborn HEAD → empty snapshot).
+/// 2. `first_parent_commits` for the oldest-first first-parent walk.
+/// 3. `diff_tree_changes` per commit for the structured changes.
 ///
 /// Working-tree feedback is gathered separately via
 /// [`collect_feedback_files`] and applied by
