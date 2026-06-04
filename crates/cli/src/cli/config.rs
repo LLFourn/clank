@@ -114,18 +114,23 @@ struct UserDefaultAgentsFile {
 
 /// Strict loader for the user-scope `default_agents` list.
 ///
-/// The main `load`/`apply_layer` path is intentionally lossy
+/// **Scope**: user-scope only (`~/.clank/config.json`). Repo-scope
+/// config (`<repo>/.clank/config.json`) is NOT consulted here.
+/// Rationale: `clank init` runs before any repo-scope config
+/// exists, so a repo-scope `default_agents` field at init time is
+/// the empty case anyway. A future plan that adds repo-scope agent
+/// management owns that policy.
+///
+/// **Failure policy**: missing file = empty list (no opt-in = no
+/// seed); malformed file = error. This is deliberately stricter
+/// than the main `apply_layer` path, which is lossy
 /// (logs+ignores malformed JSON) because review/hooks settings can
 /// safely fall back to defaults. `default_agents` cannot fall back
 /// safely: an empty list under the all-reviewers gate means
 /// "master-only repo, auto-approve every commit". A silently
 /// dropped `default_agents` would convert a multi-reviewer setup
-/// into auto-finalize. This loader fails closed — a malformed user
-/// config errors with the parse diagnostic.
-///
-/// Returns an empty list (success) when the user config doesn't
-/// exist or has no `default_agents` field. Errors when the file
-/// exists but won't parse.
+/// into auto-finalize. Fail-closed here even though the rest of
+/// the config layer is lossy.
 pub fn load_default_agents(home: Option<&Path>) -> anyhow::Result<Vec<DefaultAgent>> {
     let Some(home) = home else {
         return Ok(Vec::new());

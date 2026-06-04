@@ -50,12 +50,21 @@ pub async fn run(args: InitArgs) -> anyhow::Result<()> {
 /// at least one registered reviewer to behave non-trivially; without
 /// this step, a brand-new repo auto-approves every commit.
 ///
-/// Idempotent: any existing `.clank/agents/<label>/config.json` is
-/// preserved (the user may have run `clank as` already, populating
-/// the `session` field).
+/// **Ordering**: must run before `bootstrap_agent_identity` so its
+/// `has_existing_master` check at `:361` sees seeded master
+/// entries (a seeded master flips the calling agent's role default
+/// from master to reviewers).
 ///
-/// Fails closed if the user config is malformed — see
-/// `config::load_default_agents`.
+/// **Idempotent**: any existing `.clank/agents/<label>/config.json`
+/// is preserved (the user may have run `clank as` already,
+/// populating the `session` field). Seeded skeletons set
+/// `auto_mode: off` — the agent still has to run `clank auto on`
+/// to actively respond. This is a *registration* helper, not an
+/// *activation* helper; making it both was deferred to avoid
+/// auto-enabling agents the user hasn't actively confirmed.
+///
+/// **Failure**: fails closed if the user config is malformed —
+/// see `config::load_default_agents`.
 fn seed_default_agents(repo: &Path) -> anyhow::Result<()> {
     let home = std::env::var_os("HOME").map(PathBuf::from);
     let agents = crate::cli::config::load_default_agents(home.as_deref())?;
@@ -358,11 +367,20 @@ async fn bootstrap_agent_identity(repo: &Path, yes: bool) -> anyhow::Result<()> 
     let label = AgentLabel::parse(&label_raw)
         .map_err(|e| anyhow::anyhow!("invalid label `{label_raw}`: {e}"))?;
 
+    // If the calling agent already has a config on disk (e.g.
+    // seeded by `default_agents`), preserve its role. Without this
+    // guard, an agent seeded as `reviewers` whose session happens
+    // to bind on first init would get its role overwritten to
+    // `master` by the no-existing-master branch below.
+    let preserve_existing_role = load_agent_config(repo, &label)?.is_some();
+
     let has_existing_master = load_all_agent_configs(repo)?
         .iter()
         .any(|(_, cfg)| cfg.role == Role::Master);
 
-    let make_master = if has_existing_master {
+    let make_master = if preserve_existing_role {
+        false
+    } else if has_existing_master {
         if interactive {
             prompt_yes_no(
                 "Default this agent to master role (vs reviewers)? [y/N] ",

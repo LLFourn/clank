@@ -264,6 +264,84 @@ fn init_seeds_master_role_when_specified() {
 }
 
 #[test]
+fn init_seeded_master_flips_calling_agent_to_reviewers() {
+    // Phase 2 interaction: when default_agents seeds a master entry,
+    // bootstrap_agent_identity's has_existing_master check sees it and
+    // the calling agent defaults to reviewers (under --yes, no prompt).
+    let dir = init_repo();
+    let repo = dir.path();
+    write_user_config(
+        repo,
+        r#"{ "default_agents": [{ "label": "lloyd", "role": "master" }] }"#,
+    );
+
+    let out = run_init(repo, &[("CLAUDE_CODE_SESSION_ID", CLAUDE_SESSION)]);
+    assert!(
+        out.status.success(),
+        "init failed: stderr=`{}`",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // Seeded lloyd remains master.
+    let lloyd: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(repo.join(".clank/agents/lloyd/config.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(lloyd["role"], "master");
+
+    // Calling claude session bound as reviewer (not master) because
+    // a master already exists from seeding.
+    let claude: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(repo.join(".clank/agents/claude/config.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        claude["role"], "reviewers",
+        "claude must default to reviewers when seed already contains a master; got {claude}"
+    );
+    assert_eq!(
+        claude["session"]["id"], CLAUDE_SESSION,
+        "claude's session must be bound"
+    );
+}
+
+#[test]
+fn init_calling_agent_label_collides_with_seeded_entry() {
+    // Phase 2 interaction: the calling agent's tool-default label
+    // (e.g. "codex" for a codex session) collides with a seeded
+    // reviewer entry. The calling session binds to the existing
+    // skeleton — role preserved, session populated.
+    const CODEX_SESSION: &str = "019e54b7-b1c9-7552-8075-69db24499247";
+    let dir = init_repo();
+    let repo = dir.path();
+    write_user_config(
+        repo,
+        r#"{ "default_agents": [{ "label": "codex", "role": "reviewers" }] }"#,
+    );
+
+    let out = run_init(repo, &[("CODEX_THREAD_ID", CODEX_SESSION)]);
+    assert!(
+        out.status.success(),
+        "init failed: stderr=`{}`",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let codex: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(repo.join(".clank/agents/codex/config.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        codex["role"], "reviewers",
+        "seeded role must be preserved when the calling session binds; got {codex}"
+    );
+    assert_eq!(
+        codex["session"]["id"], CODEX_SESSION,
+        "calling session must be bound to the existing skeleton; got {codex}"
+    );
+    assert_eq!(codex["session"]["tool"], "codex");
+}
+
+#[test]
 fn init_fails_on_corrupt_existing_agent_config() {
     let dir = init_repo();
     let repo = dir.path();
