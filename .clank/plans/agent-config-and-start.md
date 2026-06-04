@@ -57,8 +57,10 @@ pub struct LaunchConfig {
     /// session-tool's bare name.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub command: Option<String>,
-    /// Args passed to the executable (after session-restore
-    /// args if a session is bound).
+    /// Args passed to the executable BEFORE the session-restore
+    /// suffix (so flags attach to the tool itself, not to
+    /// codex's `resume` subcommand). Example: `["--profile",
+    /// "deep"]` produces `codex --profile deep resume <id>...`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub args: Vec<String>,
     /// Env vars merged onto the exec environment.
@@ -82,22 +84,29 @@ Behavior:
 
 1. **Resolve `<name>`** via `agent_store::load_agent_config(repo, label)`. Error if absent: "no agent `<name>` in this repo — run `clank agent add` (when shipped) or create `.clank/agents/<name>/config.json`."
 
-2. **Determine session-tool**: from `cfg.session.tool` if bound, else error: "agent `<name>` has no bound session. Run `clank as <name>` from inside the agent's CLI to bind."
+2. **Bound session is REQUIRED.** `cfg.session` must be `Some(_)`. If absent, error: "agent `<name>` has no bound session. Run `clank as <name>` from inside the agent's CLI to bind." Rationale (codex caught the contradiction on 12c6c97): `AgentConfig` only stores the tool name inside `Session`, so without a bound session there's no reliable way to pick `claude` vs `codex` as the default command. Requiring a bound session removes that ambiguity entirely. (A future plan could make `cfg.launch.command` sufficient on its own, but mixing two policies — "bound session → tool from session" vs "no session + launch.command → that command" — splits the start logic into two branches with subtle interactions. One policy: session required.)
 
-3. **Compose the command**:
+3. **Compose the command.** `launch.args` go on the top-level tool **BEFORE** the session-restore suffix. This is the only shape that works consistently across both tools:
+
+   - **claude**: `claude [launch.args...] --resume <session-id>`
+   - **codex**:  `codex  [launch.args...] resume <session-id> --cd <repo>`
+
+   Resolution:
    - executable = `cfg.launch.command.as_deref().unwrap_or(tool.as_str())`
-   - args = session-restore prefix (if bound) + `cfg.launch.args`
-     - claude bound: `["--resume", <session-id>]`
-     - codex bound: `["resume", <session-id>, "--cd", <repo>]`
-   - env = process env ∪ `cfg.launch.env`
+   - args = `cfg.launch.args ++ session_restore_args(tool, session_id, repo_path)`
+     - `session_restore_args(Claude, id, _)` = `["--resume", id]`
+     - `session_restore_args(Codex, id, repo)` = `["resume", id, "--cd", repo]`
+   - env = process env merged with `cfg.launch.env`; **`cfg.launch.env` overrides on key collision** (matches the "config wins over inherited environment" convention; ruthless review of 12c6c97).
 
-4. **`exec` into the composed command.** On unix: `std::os::unix::process::CommandExt::exec` replaces the calling process. The agent's CLI is now in this terminal pane.
+   Rationale for "launch.args first" (ruthless review of 12c6c97): codex's session-restore is a SUBCOMMAND (`resume`); flags AFTER it attach to `resume` rather than the codex binary itself. Putting `launch.args` BEFORE the subcommand keeps them attached to the tool (typical case: `codex --profile deep resume <id>`). Claude has flat flags, so position is purely cosmetic for that tool — using the same "launch.args first" rule for both gives one consistent mental model.
 
-5. **`--print` flag** (optional convenience): print the composed command + env diff instead of execing. Useful for `clank open zellij` if it wants to construct layout commands rather than exec directly. Implementer's call whether to include in this plan or follow-up.
+4. **`exec` into the composed command.** On unix: `std::os::unix::process::CommandExt::exec` replaces the calling process. The agent's CLI takes over this terminal pane.
+
+5. **`--print` flag — IN SCOPE for this plan** (ruthless review of 12c6c97). Without it the integration tests can't assert on the composed command (exec replaces the process; can't observe). With it: prints the composed argv on stdout in shell-quoted form (e.g. `claude '--skill' 'ruthless' '--resume' '<id>'`) and the env diff on stderr, then exits 0 without execing. Useful for tests AND for `clank open zellij` to construct layout commands programmatically.
 
 ### Phase C — doctor check
 
-Extend `clank doctor`'s repo-scope agents section with: "If `cfg.launch` is set but the executable isn't on `$PATH`, Warn." Catches typos in `launch.command` before the user tries to start the agent.
+Extend `clank doctor`'s repo-scope agents section with: "If `cfg.launch.command` is set but the executable isn't on `$PATH`, Warn." Catches typos in `launch.command` before the user tries to start the agent. Implementation: the `which` crate (small, no_std-ish) handles the cross-platform `$PATH` walk; one-line dep add to `crates/cli/Cargo.toml`.
 
 ## Out of scope
 
@@ -113,8 +122,8 @@ Extend `clank doctor`'s repo-scope agents section with: "If `cfg.launch` is set 
 - `AgentConfig` has a new optional `launch: Option<LaunchConfig>` field. Schema unchanged for configs that don't set it.
 - `clank agent start <name>` with no `launch` config + bound claude session execs into `claude --resume <session-id>`.
 - `clank agent start <name>` with no `launch` config + bound codex session execs into `codex resume <session-id> --cd <repo>`.
-- `clank agent start <name>` with `launch = { command: "claude", args: ["--skill", "ruthless"] }` execs into `claude --resume <session-id> --skill ruthless` (session-restore args precede launch args).
-- `clank agent start <name>` with no bound session errors out asking the user to `clank as <name>` first.
+- `clank agent start <name>` with `launch = { command: "claude", args: ["--skill", "ruthless"] }` execs into `claude --skill ruthless --resume <session-id>` (launch args precede session-restore — see Phase B step 3 rationale).
+- `clank agent start <name>` with no bound session errors out asking the user to `clank as <name>` first — REGARDLESS of whether `cfg.launch.command` is set (one policy: session always required; codex review of 12c6c97).
 - `clank agent start <name>` for an unknown name errors with a clear diagnostic.
 - `clank doctor` Warns if an agent's `cfg.launch.command` isn't on `$PATH`.
 - `cargo test --workspace` passes.
@@ -129,9 +138,11 @@ Unit tests in `crates/core/src/agent_config.rs`:
 
 Integration tests in a new `crates/cli/tests/agent_start_integration.rs`:
 
-- `agent_start_with_bound_claude_session_execs_claude_resume`: cannot directly assert exec (process replacement), so use a `--print` flag (or wrap exec in a testable indirection) to verify the constructed command.
-- `agent_start_no_launch_config_uses_bare_tool`: same pattern, assert `claude --resume <id>` is the constructed command.
-- `agent_start_with_launch_args_appends_after_session_restore`: `["--skill", "ruthless"]` lands AFTER the `--resume <id>` args.
+- `agent_start_with_bound_claude_session_prints_claude_resume`: invokes `clank agent start <name> --print`; asserts stdout contains the shell-quoted `claude --resume <session-id>`.
+- `agent_start_no_launch_config_uses_bare_tool`: `--print` output equals `claude '--resume' '<id>'` (or codex equivalent).
+- `agent_start_launch_args_precede_session_restore`: `launch.args = ["--skill", "ruthless"]` for a claude agent produces `--print` output `claude '--skill' 'ruthless' '--resume' '<id>'` (launch args BEFORE session-restore — locks in the codex-driven ordering decision).
+- `agent_start_codex_launch_args_precede_subcommand`: `launch.args = ["--profile", "deep"]` for a codex agent produces `codex '--profile' 'deep' resume '<id>' '--cd' '<repo>'`.
+- `agent_start_env_override_wins_on_collision`: `cfg.launch.env = { "FOO": "from-config" }` with `FOO=from-env` in process env; assert the env diff line in `--print`'s stderr shows `FOO=from-config`.
 - `agent_start_unknown_agent_errors`: clear diagnostic, exit non-zero.
 - `agent_start_no_session_errors_with_clank_as_hint`: bound-session-required diagnostic.
 
@@ -139,11 +150,18 @@ Doctor tests:
 
 - `doctor_warns_when_launch_command_missing_from_path`: `cfg.launch.command = "definitely-not-installed"` triggers a Warn entry naming the agent + command.
 
-## Open questions (resolve at implementation)
+## Resolved at promotion
 
-- **`--print` mode**: include in this plan or follow-up? Argues for inclusion: unblocks zellij + provides testability. Argues against: small extra surface. Lean toward **include**.
-- **Default args policy**: should `launch.args` be the FULL arg list (caller can include flags before session-restore) or just APPEND after session-restore? Plan body says append; verify against the most common `claude --skill X --resume <id>` shape. If users want `--skill` BEFORE `--resume`, the order matters.
-- **What happens when the calling process exits before exec succeeds?** `exec` semantics: the new program replaces the current process; failures (e.g., `command` not found) propagate as the standard exec error and the user sees them. No special handling needed.
+(Closing the original open questions per codex + ruthless reviews of 12c6c97.)
+
+- **`--print` mode**: YES, in scope (ruthless review). Required for integration tests + useful for `clank open zellij` to introspect the composed command.
+- **Args composition**: `launch.args` go BEFORE the session-restore suffix for both tools (ruthless review). For codex this attaches them to the `codex` binary instead of the `resume` subcommand; for claude position is cosmetic but the rule stays consistent.
+- **Env merging precedence**: `cfg.launch.env` overrides process env on key collision (ruthless review). Standard "config wins over inherited environment" pattern.
+- **No-bound-session policy**: ERROR unconditionally; do not fall back to `launch.command` (codex review). One policy, no branches.
+
+## Remaining open question
+
+- **`exec` failure semantics**: when `exec` fails (command not found, permissions, etc.), the standard error propagates as the process exits with the exec error code. No special handling needed. Left here only as a note for the implementer that no extra wrapping is required.
 
 ## Related history
 
