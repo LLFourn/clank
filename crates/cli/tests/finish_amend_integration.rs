@@ -95,10 +95,18 @@ fn finish_amend_dry_purge_does_not_mutate_head_when_already_finished() {
 #[test]
 fn finish_rejects_approve_without_finished() {
     // Plan intro is APPROVED but not FINISHED. clank finish must
-    // refuse — only a FINISHED verdict unlocks finalize.
+    // refuse — only a FINISHED verdict unlocks finalize when there
+    // is at least one registered reviewer.
     let dir = init_repo();
     let repo = dir.path();
     write(repo, ".clank/plans/foo.md", "# foo\n");
+    // Register codex as a reviewer so the all-reviewers gate
+    // treats their verdict as load-bearing.
+    write(
+        repo,
+        ".clank/agents/codex/config.json",
+        "{\"role\":\"reviewers\"}",
+    );
     git(repo, &["add", "-A"]);
     git(repo, &["commit", "--quiet", "-m", "[foo] intro"]);
     let intro_sha = head_sha(repo);

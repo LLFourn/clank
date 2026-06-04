@@ -38,7 +38,19 @@ fn init_repo() -> tempfile::TempDir {
     git(path, &["config", "user.email", "test@test"]);
     git(path, &["config", "user.name", "test"]);
     git(path, &["config", "commit.gpgsign", "false"]);
+    // Pre-register alice as a reviewer — the most-used label in this
+    // test file. Tests that use other reviewer labels register them
+    // individually.
+    register_reviewer(path, "alice");
     dir
+}
+
+fn register_reviewer(repo: &Path, label: &str) {
+    write(
+        repo,
+        &format!(".clank/agents/{label}/config.json"),
+        "{\"role\":\"reviewers\"}",
+    );
 }
 
 fn write(repo: &Path, rel: &str, body: &str) {
@@ -333,12 +345,15 @@ fn wfw_reviewer_wakes_on_commit_with_index_already_staged() {
 fn wfw_master_wakes_on_request_changes_feedback() {
     let dir = init_repo();
     let repo = dir.path();
+    // This test uses codex as the reviewer; register codex so the
+    // all-reviewers gate treats its verdict as load-bearing.
+    register_reviewer(repo, "codex");
     write(repo, ".clank/plans/foo.md", "# foo\n");
     commit(repo, "[foo] intro");
     let intro_sha = head_sha(repo);
 
-    // Initial: no feedback at all. Gate=Unreviewed, waiting_on=FirstReview.
-    // Master role has no work (FirstReview only fires for reviewers).
+    // Initial: no feedback at all. Gate=Unreviewed, waiting_on=ReviewerApprovalsMissing.
+    // Master role has no work; reviewers do.
     let mut child = spawn_wfw(
         repo,
         &["--author", "lloyd", "--role", "master", "--timeout", "30s"],

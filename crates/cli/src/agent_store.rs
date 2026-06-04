@@ -56,6 +56,21 @@ pub fn load_all_agent_configs(repo: &Path) -> anyhow::Result<Vec<(AgentLabel, Ag
     Ok(out)
 }
 
+/// Labels of every agent in this repo with `role: Reviewers`.
+/// Used by gate-projection callers to populate
+/// `WorkPolicy.expected_reviewers`. Lossy: agents whose config
+/// fails to parse are silently skipped (use `clank doctor` to
+/// surface those).
+pub fn load_expected_reviewers(repo: &Path) -> Vec<AgentLabel> {
+    use clank_core::vocab::Role;
+    load_all_agent_configs_lossy(repo)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|(_, cfg)| cfg.role == Role::Reviewers)
+        .map(|(label, _)| label)
+        .collect()
+}
+
 /// Same as [`load_all_agent_configs`] but silently drops agents
 /// whose `config.json` failed to parse. Use this for the identity
 /// resolver path where a single broken config shouldn't take

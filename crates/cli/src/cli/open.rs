@@ -691,6 +691,7 @@ async fn fold_summary(repo_root: &Path) -> (usize, Option<String>, Option<String
     let work_policy = clank_core::wait::WorkPolicy {
         plan_feedback: config.review.plan_feedback,
         adhoc_feedback: config.review.adhoc_feedback,
+        expected_reviewers: crate::agent_store::load_expected_reviewers(repo_root),
     };
     let reviews = crate::fs_review_lookup::FsReviewLookup::new(repo_root, state.head.as_ref());
     let work_status = state.fold.derive_status(&reviews, &work_policy);
