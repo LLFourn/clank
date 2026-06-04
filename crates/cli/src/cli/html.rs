@@ -1175,7 +1175,7 @@ fn esc(s: &str) -> String {
 }
 
 fn render_markdown(md: &str) -> String {
-    use pulldown_cmark::{Event, Options, Parser, html};
+    use pulldown_cmark::{CodeBlockKind, Event, Options, Parser, Tag, TagEnd, html};
     let mut opts = Options::empty();
     opts.insert(Options::ENABLE_TABLES);
     opts.insert(Options::ENABLE_STRIKETHROUGH);
@@ -1184,12 +1184,61 @@ fn render_markdown(md: &str) -> String {
     // can contain user-controlled HTML that we don't want to
     // pass through verbatim. pulldown-cmark's `Html` and
     // `InlineHtml` events represent literal HTML tags from the
-    // source; replace them with empty text so the output is
-    // strictly the markdown-derived structure.
-    let parser =
-        Parser::new_ext(md, opts).filter(|ev| !matches!(ev, Event::Html(_) | Event::InlineHtml(_)));
+    // source.
+    //
+    // Within a fenced code block: buffer the text events,
+    // pass the buffered source through syntect, and emit the
+    // resulting <pre><code class="hl">...</code></pre> directly.
+    // Outside fenced blocks: hand events to pulldown-cmark's
+    // `push_html` for the normal HTML rendering.
     let mut out = String::new();
-    html::push_html(&mut out, parser);
+    let mut buffer: Vec<Event<'_>> = Vec::new();
+    let mut in_fenced: Option<String> = None; // Some(lang) while inside a fenced block
+    let mut code_buf = String::new();
+    for ev in Parser::new_ext(md, opts) {
+        if matches!(&ev, Event::Html(_) | Event::InlineHtml(_)) {
+            continue;
+        }
+        match (&in_fenced, &ev) {
+            (None, Event::Start(Tag::CodeBlock(CodeBlockKind::Fenced(info)))) => {
+                // Flush pending non-code events to push_html.
+                if !buffer.is_empty() {
+                    html::push_html(&mut out, buffer.drain(..));
+                }
+                in_fenced = Some(info.to_string());
+                code_buf.clear();
+            }
+            (Some(lang), Event::Text(text)) => {
+                code_buf.push_str(text);
+                let _ = lang; // lang consumed at End below
+            }
+            (Some(lang), Event::End(TagEnd::CodeBlock)) => {
+                let lang_hint = if lang.trim().is_empty() {
+                    None
+                } else {
+                    Some(lang.trim())
+                };
+                let highlighted = crate::cli::html_highlight::highlight_block(lang_hint, &code_buf);
+                out.push_str("<pre><code class=\"hl\">");
+                out.push_str(&highlighted);
+                out.push_str("</code></pre>");
+                in_fenced = None;
+                code_buf.clear();
+            }
+            (Some(_), _) => {
+                // Other events inside a fenced block (rare —
+                // pulldown emits only Text inside fences) are
+                // dropped from the highlighted output. The
+                // text accumulator above is the source of truth.
+            }
+            (None, _) => {
+                buffer.push(ev);
+            }
+        }
+    }
+    if !buffer.is_empty() {
+        html::push_html(&mut out, buffer.drain(..));
+    }
     out
 }
 
@@ -1645,3 +1694,70 @@ section h3 { font-size: .9rem; text-transform: uppercase; letter-spacing: .05em;
   details > summary { list-style: none; }
 }
 "#;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn render_markdown_highlights_fenced_block() {
+        let md = "\n```rust\nfn main() {}\n```\n";
+        let html = render_markdown(md);
+        assert!(
+            html.contains("<pre><code class=\"hl\">"),
+            "expected highlighted code wrapper; got: {html}"
+        );
+        assert!(
+            html.contains("class=\"hl-"),
+            "expected syntect hl- token classes; got: {html}"
+        );
+    }
+
+    #[test]
+    fn render_markdown_untyped_fence_is_plain_safe() {
+        let md = "\n```\n<div>raw</div>\n```\n";
+        let html = render_markdown(md);
+        assert!(
+            html.contains("<pre><code class=\"hl\">"),
+            "untyped fences still go through the highlight wrapper; got: {html}"
+        );
+        // No raw HTML passthrough — the <div> is escaped.
+        assert!(
+            html.contains("&lt;div&gt;"),
+            "raw HTML inside untyped fence must be escaped; got: {html}"
+        );
+        assert!(
+            !html.contains("<div>raw</div>"),
+            "raw HTML must not pass through; got: {html}"
+        );
+    }
+
+    #[test]
+    fn render_markdown_html_filter_still_runs() {
+        // Regression guard for the inline-HTML stripper that
+        // already filtered <script> etc out of non-fenced
+        // markdown. The new event walker must preserve this.
+        let md = "<script>alert(1)</script>\n\nhello";
+        let html = render_markdown(md);
+        assert!(
+            !html.contains("<script>"),
+            "raw <script> must be stripped from non-code markdown; got: {html}"
+        );
+        assert!(
+            html.contains("hello"),
+            "regular markdown content must still render; got: {html}"
+        );
+    }
+
+    #[test]
+    fn render_markdown_unknown_lang_falls_back_to_plain_text() {
+        let md = "\n```not-a-real-lang\nsome content <here>\n```\n";
+        let html = render_markdown(md);
+        // Plain-text fallback still escapes.
+        assert!(html.contains("&lt;here&gt;"), "got: {html}");
+        assert!(
+            html.contains("<pre><code class=\"hl\">"),
+            "wrapper still applied; got: {html}"
+        );
+    }
+}
