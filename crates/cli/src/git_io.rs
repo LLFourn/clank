@@ -1,10 +1,8 @@
 //! Git introspection for the filesystem-truth model. Narrowly-scoped
-//! reads only — never writes. Functions here run `git` as a subprocess
-//! and parse the output.
+//! reads only — never writes. Functions here use `gix` (gitoxide)
+//! programmatically; the subprocess + text-parse era is gone.
 
 use std::path::{Path, PathBuf};
-
-use tokio::process::Command;
 
 use crate::disk_format::parse_feedback_path;
 use crate::disk_snapshot::{
@@ -31,16 +29,6 @@ fn parse_sha(context: &str, s: &str) -> Result<CommitSha, GitIoError> {
         context: context.to_string(),
         detail: e.to_string(),
     })
-}
-
-async fn run(repo: &Path, args: &[&str]) -> Result<std::process::Output, GitIoError> {
-    Command::new("git")
-        .arg("-C")
-        .arg(repo)
-        .args(args)
-        .output()
-        .await
-        .map_err(|e| GitIoError::Spawn(format!("{e}")))
 }
 
 /// Resolve HEAD to its commit SHA. Returns `Ok(None)` for an empty
@@ -462,37 +450,146 @@ pub struct CommitMeta {
 /// shells out to `git show <sha>:<path>` to capture the body's first
 /// non-empty line (what the finalize rule's APPROVE check reads).
 pub async fn diff_tree_changes(repo: &Path, sha: &CommitSha) -> Result<CommitChanges, GitIoError> {
-    // `-m --first-parent`: for merge commits, emit the diff against
-    // the first parent (otherwise diff-tree suppresses merges,
-    // hiding plan/finalize touches that landed via --no-ff). `--root`
-    // is for the initial commit's "diff against the empty tree."
-    let output = run(
-        repo,
-        &[
-            "diff-tree",
-            "-r",
-            "-m",
-            "--first-parent",
-            "--root",
-            "--no-commit-id",
-            "--name-status",
-            "-M",
-            sha.as_str(),
-        ],
-    )
-    .await?;
-    if !output.status.success() {
-        return Err(GitIoError::NonZero {
-            context: format!("diff-tree {}", sha.as_str()),
-            code: output.status.code(),
-            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
-        });
-    }
-    let changes = parse_diff_tree(&String::from_utf8_lossy(&output.stdout))?;
-    Ok(changes)
+    let repo_path = repo.to_path_buf();
+    let sha_str = sha.as_str().to_string();
+    let context = format!("diff_tree_changes {sha_str}");
+    tokio::task::spawn_blocking(move || -> Result<CommitChanges, GitIoError> {
+        let repo = gix::open(&repo_path).map_err(|e| GitIoError::NonZero {
+            context: context.clone(),
+            code: None,
+            stderr: format!("gix open: {e}"),
+        })?;
+        let oid = gix::ObjectId::from_hex(sha_str.as_bytes()).map_err(|e| GitIoError::Parse {
+            context: context.clone(),
+            detail: format!("oid hex: {e}"),
+        })?;
+        let commit = repo.find_commit(oid).map_err(|e| GitIoError::NonZero {
+            context: context.clone(),
+            code: None,
+            stderr: format!("find_commit: {e}"),
+        })?;
+        let this_tree = commit.tree().map_err(|e| GitIoError::NonZero {
+            context: context.clone(),
+            code: None,
+            stderr: format!("commit.tree: {e}"),
+        })?;
+        // First-parent semantics fall out: `parent_ids().next()` IS
+        // the first parent for merges. Root commit → no parent →
+        // diff against the empty tree (matches legacy `--root`).
+        let parent_tree_owned = match commit.parent_ids().next() {
+            Some(p) => Some(
+                repo.find_commit(p.detach())
+                    .map_err(|e| GitIoError::NonZero {
+                        context: context.clone(),
+                        code: None,
+                        stderr: format!("parent find_commit: {e}"),
+                    })?
+                    .tree()
+                    .map_err(|e| GitIoError::NonZero {
+                        context: context.clone(),
+                        code: None,
+                        stderr: format!("parent tree: {e}"),
+                    })?,
+            ),
+            None => None,
+        };
+        let parent_tree_ref = parent_tree_owned.as_ref();
+        // Enable rename tracking with the git default 50%
+        // similarity (matches legacy `-M` flag). diff_tree_to_tree
+        // with `None` for options uses the repo's configured
+        // defaults, which may have rewrites=None — so build the
+        // Options explicitly.
+        let opts =
+            gix::diff::Options::default().with_rewrites(Some(gix::diff::Rewrites::default()));
+        let raw_changes = repo
+            .diff_tree_to_tree(parent_tree_ref, Some(&this_tree), opts)
+            .map_err(|e| GitIoError::NonZero {
+                context,
+                code: None,
+                stderr: format!("diff_tree_to_tree: {e}"),
+            })?;
+        let records: Vec<DiffRecord> = raw_changes
+            .into_iter()
+            .filter_map(diff_record_from_gix_change)
+            .collect();
+        Ok(apply_diff_records(&records))
+    })
+    .await
+    .map_err(|e| GitIoError::Spawn(format!("blocking task join failed: {e}")))?
 }
 
-fn parse_diff_tree(stdout: &str) -> Result<CommitChanges, GitIoError> {
+/// Per-change record extracted from gix's `Change` enum. Mirrors
+/// the (status_char, old_path, new_path) tuple the legacy
+/// `diff-tree --name-status -M` parser produced — so the domain
+/// logic in `apply_diff_records` can stay shape-for-shape
+/// identical to the legacy `parse_diff_tree` body.
+struct DiffRecord {
+    /// 'A' add, 'D' delete, 'M' modify, 'R' rename, 'C' copy.
+    status_char: char,
+    is_rename: bool,
+    old_path: Option<String>,
+    new_path: String,
+}
+
+fn diff_record_from_gix_change(ch: gix::object::tree::diff::ChangeDetached) -> Option<DiffRecord> {
+    use gix::object::tree::diff::ChangeDetached as Ch;
+    match ch {
+        Ch::Addition {
+            location,
+            entry_mode,
+            ..
+        } if entry_mode.is_blob() => Some(DiffRecord {
+            status_char: 'A',
+            is_rename: false,
+            old_path: None,
+            new_path: String::from_utf8_lossy(&location).into_owned(),
+        }),
+        Ch::Deletion {
+            location,
+            entry_mode,
+            ..
+        } if entry_mode.is_blob() => Some(DiffRecord {
+            status_char: 'D',
+            is_rename: false,
+            old_path: None,
+            new_path: String::from_utf8_lossy(&location).into_owned(),
+        }),
+        Ch::Modification {
+            location,
+            entry_mode,
+            ..
+        } if entry_mode.is_blob() => Some(DiffRecord {
+            status_char: 'M',
+            is_rename: false,
+            old_path: None,
+            new_path: String::from_utf8_lossy(&location).into_owned(),
+        }),
+        Ch::Rewrite {
+            location,
+            source_location,
+            copy,
+            entry_mode,
+            ..
+        } if entry_mode.is_blob() => Some(DiffRecord {
+            status_char: if copy { 'C' } else { 'R' },
+            is_rename: true,
+            old_path: Some(String::from_utf8_lossy(&source_location).into_owned()),
+            new_path: String::from_utf8_lossy(&location).into_owned(),
+        }),
+        // Tree / submodule / non-blob entries: ignore. The legacy
+        // parser assumed everything in `diff-tree --name-status`
+        // output was a file because that command emits only leaf
+        // changes by default; gix's structured Change includes
+        // every level, so we filter explicitly here.
+        _ => None,
+    }
+}
+
+/// Build a `CommitChanges` from per-change records. This is the
+/// domain logic that was the body of `parse_diff_tree`; extracted
+/// so the gix-backed `diff_tree_changes` and the parser-removal
+/// share one source of truth.
+fn apply_diff_records(records: &[DiffRecord]) -> CommitChanges {
     let mut plan_touches: Vec<PlanTouch> = Vec::new();
     let mut has_non_plan_code_changes = false;
     let mut clank_paths: Vec<String> = Vec::new();
@@ -500,30 +597,17 @@ fn parse_diff_tree(stdout: &str) -> Result<CommitChanges, GitIoError> {
     let mut touched_clank = false;
     let mut plans_finished_added: std::collections::BTreeSet<PlanKey> = Default::default();
 
-    for line in stdout.lines() {
-        let line = line.trim_end_matches('\r');
-        if line.is_empty() {
-            continue;
-        }
-        let mut parts = line.splitn(4, '\t');
-        let status = parts.next().ok_or_else(|| GitIoError::Parse {
-            context: "diff-tree".into(),
-            detail: format!("empty status: {line}"),
-        })?;
-        let first_path = parts.next().ok_or_else(|| GitIoError::Parse {
-            context: "diff-tree".into(),
-            detail: format!("missing path: {line}"),
-        })?;
-        let second_path = parts.next();
-
-        let is_rename = status.starts_with('R') || status.starts_with('C');
-        let new_path = if is_rename {
-            second_path.unwrap_or(first_path)
-        } else {
-            first_path
-        };
-        let old_path = if is_rename { Some(first_path) } else { None };
-        let status_char = status.chars().next().unwrap_or(' ');
+    for record in records {
+        let DiffRecord {
+            status_char,
+            is_rename,
+            old_path,
+            new_path,
+        } = record;
+        let status_char = *status_char;
+        let is_rename = *is_rename;
+        let old_path: Option<&str> = old_path.as_deref();
+        let new_path: &str = new_path.as_str();
 
         let new_rel = PathBuf::from(new_path);
         let old_rel = old_path.map(PathBuf::from);
@@ -672,13 +756,13 @@ fn parse_diff_tree(stdout: &str) -> Result<CommitChanges, GitIoError> {
     clank_paths.dedup();
     clank_paths_touched.sort();
     clank_paths_touched.dedup();
-    Ok(CommitChanges {
+    CommitChanges {
         plan_touches,
         has_non_plan_code_changes,
         clank_paths,
         touched_clank,
         clank_paths_touched,
-    })
+    }
 }
 
 /// Gather a `CommitSnapshot` for `repo_root`. IO half of the
@@ -902,119 +986,10 @@ mod tests {
         assert!(!is_plan_path(&PathBuf::from(".clank/plans/sub/foo.md")));
     }
 
-    #[test]
-    fn parse_diff_tree_single_plan_intro() {
-        let stdout = "A\t.clank/plans/foo.md\n";
-        let parsed = parse_diff_tree(stdout).unwrap();
-        let changes = &parsed;
-        assert_eq!(changes.plan_touches.len(), 1);
-        assert_eq!(changes.plan_touches[0].plan.as_str(), "foo");
-        assert!(matches!(changes.plan_touches[0].kind, PlanTouchKind::Intro));
-        assert_eq!(
-            changes.plan_touches[0].new_path.as_deref(),
-            Some(Path::new(".clank/plans/foo.md"))
-        );
-        assert!(!changes.has_non_plan_code_changes);
-    }
-
-    /// Regression for codex on 004fbcb: renaming a plan OUT of
-    /// `.clank/plans/<key>.md` (e.g. into `done/`) must Delete the
-    /// plan key, not Revise it into a non-plan path.
-    #[test]
-    fn parse_diff_tree_rename_out_of_plans_is_delete() {
-        let stdout = "R100\t.clank/plans/foo.md\t.clank/plans/done/foo.md\n";
-        let parsed = parse_diff_tree(stdout).unwrap();
-        let changes = &parsed;
-        assert_eq!(changes.plan_touches.len(), 1);
-        assert_eq!(changes.plan_touches[0].plan.as_str(), "foo");
-        assert!(matches!(
-            changes.plan_touches[0].kind,
-            PlanTouchKind::Revision
-        ));
-        assert!(
-            changes.plan_touches[0].new_path.is_none(),
-            "rename out of plans/ must produce new_path=None (Delete)",
-        );
-    }
-
-    /// Mirror case: renaming a file INTO `.clank/plans/<key>.md`
-    /// must Intro the plan.
-    #[test]
-    fn parse_diff_tree_rename_into_plans_is_intro() {
-        let stdout = "R100\t.clank/plans/done/foo.md\t.clank/plans/foo.md\n";
-        let parsed = parse_diff_tree(stdout).unwrap();
-        let changes = &parsed;
-        assert_eq!(changes.plan_touches.len(), 1);
-        assert_eq!(changes.plan_touches[0].plan.as_str(), "foo");
-        assert!(matches!(changes.plan_touches[0].kind, PlanTouchKind::Intro));
-        assert!(changes.plan_touches[0].new_path.is_some());
-    }
-
-    #[test]
-    fn parse_diff_tree_plan_revision_with_code() {
-        let stdout = "M\t.clank/plans/foo.md\nM\tsrc/lib.rs\n";
-        let parsed = parse_diff_tree(stdout).unwrap();
-        let changes = &parsed;
-        assert_eq!(changes.plan_touches.len(), 1);
-        assert!(matches!(
-            changes.plan_touches[0].kind,
-            PlanTouchKind::Revision
-        ));
-        assert!(changes.has_non_plan_code_changes);
-    }
-
-    #[test]
-    fn parse_diff_tree_pure_code() {
-        let stdout = "M\tsrc/foo.rs\nA\ttests/bar.rs\n";
-        let parsed = parse_diff_tree(stdout).unwrap();
-        let changes = &parsed;
-        assert!(changes.plan_touches.is_empty());
-        assert!(changes.has_non_plan_code_changes);
-    }
-
-    #[test]
-    fn parse_diff_tree_multi_plan_touch() {
-        let stdout = "M\t.clank/plans/foo.md\nA\t.clank/plans/bar.md\nM\tsrc/lib.rs\n";
-        let parsed = parse_diff_tree(stdout).unwrap();
-        let changes = &parsed;
-        assert_eq!(changes.plan_touches.len(), 2);
-        assert!(changes.has_non_plan_code_changes);
-    }
-
-    #[test]
-    fn parse_diff_tree_ignores_other_clank_paths() {
-        let stdout = "A\t.clank/feedback/foo/plan/alice.md\n";
-        let parsed = parse_diff_tree(stdout).unwrap();
-        let changes = &parsed;
-        assert!(changes.plan_touches.is_empty());
-        assert!(!changes.has_non_plan_code_changes);
-    }
-
-    #[test]
-    fn parse_diff_tree_finish_detected_when_plan_deleted_and_finished_added() {
-        // Deleting from plans/ and adding to finished/ in the same commit = Finish.
-        let stdout = "D\t.clank/plans/foo.md\nA\t.clank/finished/foo.md\n";
-        let parsed = parse_diff_tree(stdout).unwrap();
-        assert_eq!(parsed.plan_touches.len(), 1);
-        assert_eq!(parsed.plan_touches[0].plan.as_str(), "foo");
-        assert!(matches!(parsed.plan_touches[0].kind, PlanTouchKind::Finish));
-    }
-
-    #[test]
-    fn parse_diff_tree_finished_added_alone_is_finish() {
-        let stdout = "A\t.clank/finished/foo.md\n";
-        let parsed = parse_diff_tree(stdout).unwrap();
-        assert_eq!(parsed.plan_touches.len(), 1);
-        assert_eq!(parsed.plan_touches[0].plan.as_str(), "foo");
-        assert!(matches!(parsed.plan_touches[0].kind, PlanTouchKind::Finish));
-    }
-
-    #[test]
-    fn parse_diff_tree_finished_without_md_extension_ignored() {
-        // Old-style `.clank/finished/foo` (no .md) is not a finished path.
-        let stdout = "A\t.clank/finished/foo\n";
-        let parsed = parse_diff_tree(stdout).unwrap();
-        assert!(parsed.plan_touches.is_empty());
-        assert!(!parsed.has_non_plan_code_changes);
-    }
+    // The 10 `parse_diff_tree_*` scenario tests that used to live
+    // here have been converted to integration tests building real
+    // git repos; see `crates/cli/tests/diff_tree_changes_scenarios.rs`.
+    // Same scenario names, same assertions — only the input shape
+    // changes (real commits + diff_tree_changes call instead of
+    // synthetic stdout + parse_diff_tree call).
 }
