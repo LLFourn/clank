@@ -272,11 +272,11 @@ pub async fn parent_of(repo: &Path, sha: &CommitSha) -> Result<Option<CommitSha>
     }
 }
 
-/// `git log --first-parent --reverse --format=%H` — all commits along
-/// the first-parent chain from the root up to HEAD, oldest first. Used
-/// for the attribution walk. Each entry carries the author timestamp
-/// (unix seconds) and the commit subject (first line), batched into one
-/// `git log` invocation so per-rebuild git overhead stays bounded.
+/// All commits along the first-parent chain from the root up to
+/// HEAD, oldest-first. Used for the attribution walk. Each entry
+/// carries the author timestamp (unix seconds) and the commit
+/// subject (first line) via gix's `rev_walk` with
+/// `first_parent_only`.
 ///
 /// We deliberately don't try to bound by an `<intro>..HEAD` range: with
 /// multiple sessions each having their own intro, identifying the
@@ -438,16 +438,20 @@ pub struct CommitMeta {
     pub subject: String,
 }
 
-/// `git diff-tree -r --name-status -M --no-commit-id <sha>` parsed into a
-/// `CommitChanges`. Renames are detected as `R<score>` entries with both
-/// old and new paths.
+/// Structured changes for `sha` against its first parent (or the
+/// empty tree for the root commit), translated into a
+/// `CommitChanges`.
 ///
-/// For the root commit (no parent), uses `--root` form to enumerate its
-/// added files.
+/// gix backend via `repo.diff_tree_to_tree` with
+/// `Rewrites::default()` (50% similarity — matches the legacy
+/// `-M` flag). Tree-level entries are filtered out via
+/// `EntryMode::is_no_tree()`; the legacy parser implicitly did
+/// the same by only seeing leaf records from
+/// `diff-tree --name-status`.
 ///
-/// For added/modified `.clank/finished/<stem>/<file>` paths this also
-/// shells out to `git show <sha>:<path>` to capture the body's first
-/// non-empty line (what the finalize rule's APPROVE check reads).
+/// First-parent semantics for merge commits fall out from
+/// `parent_ids().next()` being the first parent (matches the
+/// legacy `-m --first-parent` flag combination).
 pub async fn diff_tree_changes(repo: &Path, sha: &CommitSha) -> Result<CommitChanges, GitIoError> {
     let repo_path = repo.to_path_buf();
     let sha_str = sha.as_str().to_string();
