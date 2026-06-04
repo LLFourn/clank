@@ -76,7 +76,19 @@ For the latest reviewable SHA on an active plan:
    - `crates/cli/src/cli/status.rs:63` (`clank status`)
    - `crates/cli/src/cli/open.rs:696` (`clank open`)
    - `crates/cli/src/cli/wfw.rs:191`, `:305` (`clank wfw`)
-   - `crates/cli/src/preview.rs:80` and the local wrapper at `:443` (used by `clank finish` preview)
+   - `crates/cli/src/preview.rs:80` (`clank finish` preview pipeline)
+
+   Additionally, `compute_finalize_readiness` at `crates/cli/src/preview.rs:401` must also accept the expected reviewer set so master-only repos can finalize. Current code rejects unless `gate_state == Finished`; with the zero-reviewer rule returning `Approved`, a master-only repo could never `clank finish` without this change. Extend the signature:
+   ```rust
+   pub fn compute_finalize_readiness(
+       is_finished: bool,
+       latest_reviewable_sha: Option<&CommitSha>,
+       gate_state: CommitGateState,
+       worktree_status: PlanWorktreeStatus,
+       expected_reviewers: &[AgentLabel],   // NEW
+   ) -> FinalizeReadiness
+   ```
+   And change the gate-check at line 414 to: `if gate_state != CommitGateState::Finished && !expected_reviewers.is_empty()` — i.e. for a zero-reviewer repo, `Approved` is sufficient for finalize. The three call sites of `compute_finalize_readiness` in `preview.rs` (lines 82, 541, 563) get the same reviewer-enumeration treatment as the `derive_status` callers above.
 
    Each call site does:
    ```rust
@@ -141,8 +153,13 @@ In `clank-core` (gate projection unit tests):
 - Two reviewers, one APPROVE one missing-feedback → `awaiting_reviewers` (or current equivalent), `waiting_on: { reviewers: [<missing>] }`.
 - Two reviewers, both FINISHED → `Finished` (master can `clank finish`).
 - Two reviewers, one FINISHED one APPROVE → `Approved` (master can continue but NOT finalize — only one reviewer has signed off as done; the other still treats it as mid-flight).
-- Zero reviewers + any review entries → `Approved` (the zero-reviewer rule fires before the other checks; master is unblocked, master decides `clank finish` independently). Includes the case where `reviews` is empty AND `expected_reviewers` is empty.
+- Zero reviewers + any review entries → `Approved` (the zero-reviewer rule fires before the other checks; master is unblocked). Includes the case where `reviews` is empty AND `expected_reviewers` is empty.
 - Zero reviewers + a stale REQUEST_CHANGES from a removed reviewer → `Approved` (the removed reviewer is no longer in `expected_reviewers`, so their entry shouldn't gate. Validates that the zero-reviewer rule fires first.)
+
+For `compute_finalize_readiness` (in `crates/cli/src/preview.rs`):
+- Zero reviewers + gate `Approved` → ready to finalize (the new `!expected_reviewers.is_empty()` guard skips the `gate != Finished` rejection).
+- Non-zero reviewers + gate `Approved` → still blocked with `NotFinished { state: Approved }` (unchanged).
+- Non-zero reviewers + gate `Finished` → ready to finalize (unchanged).
 
 In `clank-cli` (`clank wfw` integration):
 
