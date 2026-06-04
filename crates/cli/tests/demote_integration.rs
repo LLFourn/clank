@@ -499,6 +499,31 @@ fn demote_into_branch_collision_errors() {
 }
 
 #[test]
+fn demote_stub_with_high_priority_succeeds() {
+    // Regression for codex on 1f88597: --priority validation
+    // must NOT fire when --stub is set (priority is documented
+    // as ignored under --stub). Pre-fix: --priority 1000 with
+    // --stub errored anyway. Post-fix: succeeds, body lands at
+    // .clank/stubs/<plan>.md, priority value irrelevant.
+    let dir = init_repo_with_master();
+    let repo = dir.path();
+    seed_plan_only_commits(repo, "sigma", 0);
+
+    let out = run_demote(repo, &["sigma", "--stub", "--priority", "1000"]);
+    assert!(
+        out.status.success(),
+        "--stub --priority 1000 must succeed (priority is ignored under --stub); \
+         stdout=`{}` stderr=`{}`",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(repo.join(".clank/stubs/sigma.md").exists());
+    // No queue file written, regardless of the priority value.
+    assert!(!repo.join(".clank/queue/1000-sigma.md").exists());
+    assert!(!repo.join(".clank/queue/500-sigma.md").exists());
+}
+
+#[test]
 fn demote_priority_above_999_rejected() {
     // Regression for codex on 625b8af: priorities > 999 produce
     // queue filenames `scan_queue` can't see (status / queue

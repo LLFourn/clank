@@ -31,9 +31,17 @@ pub async fn run(args: DemoteArgs) -> anyhow::Result<()> {
     // `.clank/queue/1000-foo.md` would be invisible to
     // `clank status` and `clank queue promote`. Codex caught
     // this on 625b8af.
-    if let Some(p) = args.priority {
-        if p > 999 {
-            anyhow::bail!("--priority must be 0-999 (matches `clank queue add`)");
+    //
+    // Only validate when --stub is absent: --priority is
+    // documented as ignored under --stub (the body goes to
+    // `.clank/stubs/<plan>.md`, no priority slot). Validating
+    // when ignored would error on combinations that should
+    // just succeed (codex caught the inconsistency on 1f88597).
+    if !args.stub {
+        if let Some(p) = args.priority {
+            if p > 999 {
+                anyhow::bail!("--priority must be 0-999 (matches `clank queue add`)");
+            }
         }
     }
     let repo = super::resolve_repo(args.repo.as_deref())?;
@@ -374,4 +382,118 @@ fn confirm_demote(stem: &str, into_branch: Option<&str>) -> anyhow::Result<bool>
     let mut line = String::new();
     std::io::stdin().read_line(&mut line)?;
     Ok(matches!(line.trim(), "y" | "Y" | "yes" | "Yes"))
+}
+
+#[cfg(test)]
+mod tests {
+    //! Focused unit tests for the parts of demote that are hard
+    //! to exercise via the tempdir integration suite — primarily
+    //! the foreign-commit refusal in `safety_check`. The
+    //! integration tests can't easily construct
+    //! `foreign: true` commits because clank's fold attributes
+    //! every first-parent in-range commit to the active plan;
+    //! constructing here directly bypasses that.
+    use super::*;
+
+    fn sha(hex_byte: &str) -> CommitSha {
+        // Build a 40-char SHA from a 2-char hex repetition.
+        let full: String = hex_byte.repeat(20);
+        CommitSha::parse(&full).expect("valid hex SHA")
+    }
+
+    fn commit(s: &str, disposition: RewriteDisposition, foreign: bool) -> RewriteCommit {
+        RewriteCommit {
+            sha: sha(s),
+            subject: format!("test-{s}"),
+            disposition,
+            foreign,
+            strip_paths: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn safety_check_all_drop_ok() {
+        let commits = vec![
+            commit("aa", RewriteDisposition::Drop, false),
+            commit("bb", RewriteDisposition::Drop, false),
+        ];
+        safety_check(&commits, false).expect("all-Drop should pass");
+        safety_check(&commits, true).expect("all-Drop should pass with --force too");
+    }
+
+    #[test]
+    fn safety_check_rewrite_refuses_without_force() {
+        let commits = vec![commit("cc", RewriteDisposition::Rewrite, false)];
+        let err = safety_check(&commits, false).expect_err("must refuse");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("non-plan content") && msg.contains("--force"),
+            "diagnostic should mention non-plan + --force; got: {msg}"
+        );
+    }
+
+    #[test]
+    fn safety_check_rewrite_allowed_with_force() {
+        let commits = vec![commit("dd", RewriteDisposition::Rewrite, false)];
+        safety_check(&commits, true).expect("--force should bypass Rewrite refusal");
+    }
+
+    #[test]
+    fn safety_check_foreign_keepverbatim_refuses_unconditionally() {
+        // Locks in codex bug 1 fix on b8091ba: a foreign commit
+        // refuses regardless of disposition. KeepVerbatim is the
+        // common foreign disposition.
+        let commits = vec![commit("ee", RewriteDisposition::KeepVerbatim, true)];
+        let err = safety_check(&commits, false).expect_err("must refuse without --force");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("foreign") && msg.contains("git rebase"),
+            "diagnostic should mention foreign + git rebase; got: {msg}"
+        );
+        // `--force` must NOT bypass.
+        let err2 = safety_check(&commits, true).expect_err("--force must NOT bypass foreign");
+        let msg2 = format!("{err2:#}");
+        assert!(
+            msg2.contains("foreign"),
+            "--force-bypass attempt must still cite foreign; got: {msg2}"
+        );
+    }
+
+    #[test]
+    fn safety_check_foreign_rewrite_refuses_unconditionally() {
+        // The trap codex caught: a foreign commit that classifies
+        // as Rewrite (not KeepVerbatim) would have fallen through
+        // the previous match's `_ => {}` arm. The fix promotes
+        // `c.foreign` to a leading check that runs regardless of
+        // disposition.
+        let commits = vec![commit("ff", RewriteDisposition::Rewrite, true)];
+        let err = safety_check(&commits, false).expect_err("must refuse");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("foreign"),
+            "Rewrite-foreign must trigger foreign refusal, not Rewrite refusal; got: {msg}"
+        );
+        // `--force` must NOT bypass even though --force normally
+        // covers Rewrite cases.
+        let err2 = safety_check(&commits, true).expect_err("--force must NOT bypass foreign");
+        let msg2 = format!("{err2:#}");
+        assert!(msg2.contains("foreign"));
+    }
+
+    #[test]
+    fn safety_check_mixed_foreign_and_rewrite_refuses_on_foreign_first() {
+        // Diagnostic order matters: if both Rewrite-non-foreign
+        // AND foreign exist, the foreign refusal fires first
+        // because foreign is unconditional.
+        let commits = vec![
+            commit("11", RewriteDisposition::Rewrite, false),
+            commit("22", RewriteDisposition::Rewrite, true),
+        ];
+        let err = safety_check(&commits, false).expect_err("must refuse");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("foreign"),
+            "foreign refusal must take precedence; got: {msg}"
+        );
+    }
 }
