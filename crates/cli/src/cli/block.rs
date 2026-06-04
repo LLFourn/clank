@@ -11,6 +11,20 @@ pub async fn run(args: BlockArgs) -> anyhow::Result<()> {
 }
 
 async fn run_create(args: BlockCreateArgs) -> anyhow::Result<()> {
+    // Scope is explicit-or-error: forgetting to scope would
+    // silently suppress every wfw item for this agent across
+    // every plan + queue item (because `wfw::check_blocks`
+    // reads `plan: None` as `suppress_all = true`). Make the
+    // user choose. `--plan` and `--all` are mutually exclusive
+    // (clap enforces via `conflicts_with`); at least one must
+    // be present here.
+    if args.plan.is_none() && !args.all {
+        anyhow::bail!(
+            "block scope is required: pass `--plan <plan-stem>` to scope to a single plan, \
+             or `--all` to suppress every wfw item for this agent (rarely the right call)"
+        );
+    }
+
     let repo = resolve_repo(args.repo.as_deref())?;
     let author = match args.author.as_deref() {
         Some(raw) => clank_core::ids::AgentLabel::parse(raw)
@@ -24,6 +38,12 @@ async fn run_create(args: BlockCreateArgs) -> anyhow::Result<()> {
             .join("blocks")
             .join(plan)
     } else {
+        // --all path. Print the warning on stderr so the user
+        // sees it even when the success line is captured.
+        eprintln!(
+            "REPO-WIDE BLOCK: this will suppress every wfw item for `{}` until the block is answered",
+            author.as_str()
+        );
         agents_root(&repo).join(author.as_str()).join("blocks")
     };
     std::fs::create_dir_all(&dir)?;

@@ -83,5 +83,8 @@ rescope as needed — split into smaller plans if appropriate
 
 **Blocks**: if reviews become contentious, the plan is
 drifting from user intent, or the work feels unwise, use
-`clank block create <name> -m "question"` to ask the human.
+`clank block create <name> --plan <plan-stem> -m "question"`
+to ask the human. Scope is mandatory: `--plan <stem>` targets
+one plan (the usual case); `--all` suppresses every wfw item
+across all plans + queue items (rarely the right call).
 Use `clank block clean` to acknowledge answered blocks.

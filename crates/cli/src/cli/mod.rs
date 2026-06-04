@@ -653,9 +653,16 @@ pub struct BlockCreateArgs {
     /// Question or reason for the block.
     #[arg(short = 'm', value_name = "MSG")]
     pub message: String,
-    /// Scope block to a specific plan.
+    /// Scope the block to a specific plan. Mutually exclusive with
+    /// `--all`. Exactly one is required.
     #[arg(long, value_name = "PLAN")]
     pub plan: Option<String>,
+    /// Scope the block to the entire repo (suppresses every wfw item
+    /// for the calling agent across all plans + queue items). Mutually
+    /// exclusive with `--plan`. Exactly one is required. Use sparingly
+    /// — most blocks should be plan-scoped.
+    #[arg(long, conflicts_with = "plan")]
+    pub all: bool,
     /// Agent label. Resolved from env when omitted.
     #[arg(long, value_name = "LABEL")]
     pub author: Option<String>,

@@ -473,6 +473,37 @@ mod tests {
     }
 
     #[test]
+    fn embedded_skills_use_scoped_block_create_recipe() {
+        // Regression for block-create-explicit-scope: both skill
+        // assets used to embed `clank block create <name> -m
+        // "question"` with no scope flag. After CLI flipped to
+        // require explicit scope, that recipe became a no-op
+        // error. Lock in the scoped recipe so future skill
+        // edits don't silently regress.
+        for (name, body) in [
+            ("CLAUDE_SKILL_BODY", CLAUDE_SKILL_BODY),
+            ("CODEX_SKILL_BODY", CODEX_SKILL_BODY),
+        ] {
+            assert!(
+                body.contains("clank block create"),
+                "{name} should still document block create"
+            );
+            assert!(
+                body.contains("--plan"),
+                "{name} must document `--plan` as the primary scope flag; \
+                 forgetting it makes the recipe error at runtime"
+            );
+            // The bare invocation pattern (with no flag immediately
+            // after the name) is what regressed. Guard against it
+            // returning verbatim.
+            assert!(
+                !body.contains(r#"clank block create <name> -m "question""#),
+                "{name} must not embed the legacy no-scope recipe"
+            );
+        }
+    }
+
+    #[test]
     fn merge_hook_creates_settings_with_claude_entry() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join(".claude/settings.json");
