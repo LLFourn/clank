@@ -367,12 +367,22 @@ async fn bootstrap_agent_identity(repo: &Path, yes: bool) -> anyhow::Result<()> 
     let label = AgentLabel::parse(&label_raw)
         .map_err(|e| anyhow::anyhow!("invalid label `{label_raw}`: {e}"))?;
 
-    // If the calling agent already has a config on disk (e.g.
-    // seeded by `default_agents`), preserve its role. Without this
-    // guard, an agent seeded as `reviewers` whose session happens
-    // to bind on first init would get its role overwritten to
-    // `master` by the no-existing-master branch below.
-    let preserve_existing_role = load_agent_config(repo, &label)?.is_some();
+    // If the calling agent has a config skeleton from
+    // `default_agents` seeding (config exists, no session field
+    // yet), preserve its role. Without this guard, a seeded
+    // reviewer whose session happens to bind on first init would
+    // get its role overwritten to `master` by the
+    // no-existing-master branch below.
+    //
+    // Scoped to seeded skeletons specifically: a config WITH a
+    // session was created by a prior `clank as` and should still
+    // be eligible for the role assignment flow (e.g., a repo
+    // where only `codex` is bound but has no master — `clank init`
+    // should still let codex claim master). The distinguishing
+    // trait is `session.is_none()`.
+    let preserve_existing_role = load_agent_config(repo, &label)?
+        .as_ref()
+        .is_some_and(|cfg| cfg.session.is_none());
 
     let has_existing_master = load_all_agent_configs(repo)?
         .iter()

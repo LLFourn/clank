@@ -264,6 +264,56 @@ fn init_seeds_master_role_when_specified() {
 }
 
 #[test]
+fn init_existing_bound_agent_still_claims_master_when_no_master_exists() {
+    // Regression for codex's catch on 1b719cc: a pre-existing agent
+    // config created by `clank as` (i.e. with a session field) and
+    // no master in the repo must still go through the master-claim
+    // flow on subsequent `clank init`. The preserve_existing_role
+    // guard is scoped to seeded skeletons (no session); a previously
+    // bound agent is NOT a skeleton and shouldn't be locked out of
+    // role assignment.
+    let dir = init_repo();
+    let repo = dir.path();
+    // No user-scope default_agents at all.
+    // Pre-existing codex bound by a prior `clank as`: role=reviewers,
+    // session populated. No other agents in the repo.
+    let codex_dir = repo.join(".clank/agents/codex");
+    std::fs::create_dir_all(&codex_dir).unwrap();
+    std::fs::write(
+        codex_dir.join("config.json"),
+        r#"{
+            "auto_mode": "off",
+            "role": "reviewers",
+            "session": {
+                "id": "019e54b7-b1c9-7552-8075-69db24499247",
+                "tool": "codex",
+                "updated_at": "2026-06-04T12:00:00Z"
+            }
+        }"#,
+    )
+    .unwrap();
+
+    let out = run_init(
+        repo,
+        &[("CODEX_THREAD_ID", "019e54b7-b1c9-7552-8075-69db24499247")],
+    );
+    assert!(
+        out.status.success(),
+        "init failed: stderr=`{}`",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let cfg: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(codex_dir.join("config.json")).unwrap())
+            .unwrap();
+    assert_eq!(
+        cfg["role"], "master",
+        "previously bound agent should still be eligible to claim master when no master exists; \
+         got {cfg}"
+    );
+}
+
+#[test]
 fn init_seeded_master_flips_calling_agent_to_reviewers() {
     // Phase 2 interaction: when default_agents seeds a master entry,
     // bootstrap_agent_identity's has_existing_master check sees it and
