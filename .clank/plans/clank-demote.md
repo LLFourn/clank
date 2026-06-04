@@ -40,15 +40,19 @@ New subcommand: `clank demote <plan> [--priority <N>] [--stub] [--force] [--into
 
 1. **Identify the plan's commit range** using the existing `build_rewrite_preview` for `<plan>`. Range is `[intro_sha, latest_reviewable]` per the existing plan-attribution logic.
 
-2. **Safety check (default-on; bypassed by `--force`)**: examine each commit's `RewriteDisposition` in the preview:
-   - All `Drop` → safe to demote. The plan only contains plan-body edits.
-   - Any `Rewrite` → at least one commit has non-plan content that demote would lose. Refuse with a diagnostic naming the offending SHAs + their non-plan paths (already in the preview's `strip_paths` and `foreign` fields).
-   - Any `KeepVerbatim` → foreign commit interleaved in the plan's range. Same refusal — dropping the range would also drop someone else's commit. The `--force` bypass here is genuinely dangerous; print an extra warning.
+2. **Safety check (tiered by danger level)**. Examine each commit's `RewriteDisposition` in the preview:
+   - **All `Drop`** → safe to demote. The plan only contains plan-body edits.
+   - **Any `Rewrite`** → at least one commit has non-plan content (user's own code-touching commits) that demote would lose. Refuse with a diagnostic naming the offending SHAs + their non-plan paths (from the preview's `strip_paths` field). `--force` overrides: the user explicitly opted in to losing their code changes.
+   - **Any `KeepVerbatim`** → foreign commit interleaved in the plan's range. Refuse **unconditionally**, regardless of `--force`. Diagnostic: "foreign commit <SHA> is interleaved in this plan's range — demote can't safely drop someone else's work. Resolve via `git rebase -i` or coordinate with the foreign-commit author."
 
-3. **Pre-rewrite: save the plan body**. Read `.clank/plans/<plan>.md` at HEAD (or at the latest-reviewable SHA if HEAD is dirty / mid-rebase). Write to one of:
-   - **Default**: `.clank/queue/<NNN>-<plan>.md` where `<NNN>` is `--priority` (default 500).
-   - **`--stub`**: `.clank/stubs/<plan>.md`.
-   - Collision: if the target file already exists, error out (don't clobber). The user picks a different priority or moves the existing file.
+   Rationale for the two-tier policy (ruthless review of 91dc0b4): `Rewrite`-bypass via `--force` is user-recoverable — they wrote the code, they can rewrite it. `KeepVerbatim`-bypass would drop someone else's commit, which is a coordination event, not a flag-flip. Option C from the review: refuse foreign-commit drops entirely. The single `--force` flag is sufficient because it only ever applies to Rewrite cases now.
+
+3. **Pre-rewrite: save the plan body**.
+   - **Working-tree-dirty refusal**: if `.clank/plans/<plan>.md` in the working tree differs from HEAD's version, demote errors out. Diagnostic: "commit your plan-body changes or `git stash` before demoting." Rationale: silently choosing HEAD-or-working-tree would lose user edits one direction or the other; refusing matches clank's "fail closed on risky implicit state" pattern (ruthless review of 91dc0b4).
+   - When clean: read `.clank/plans/<plan>.md` from HEAD. Write to one of:
+     - **Default**: `.clank/queue/<NNN>-<plan>.md` where `<NNN>` is `--priority` (default 500).
+     - **`--stub`**: `.clank/stubs/<plan>.md`.
+   - **Collision**: if the target file already exists, error out (don't clobber). The user picks a different priority or moves the existing file.
 
 4. **Rewrite**: invoke the existing rewrite engine with all-Drop dispositions for the plan range. Foreign commits NOT in the range are KeepVerbatim. The engine produces a new chain that excludes the plan's commits entirely.
 
@@ -73,9 +77,9 @@ The genuinely new code is the safety-check classification + the plan-body save. 
 | `<plan>` | Plan stem. Same parsing as `clank purge`. |
 | `--priority <N>` | Queue priority for the re-queued plan body (default 500). Ignored with `--stub`. |
 | `--stub` | Write to `.clank/stubs/<plan>.md` instead of `.clank/queue/`. |
-| `--force` | Allow demote when the range has non-plan-editing commits. |
-| `--into-branch <name>` | Write rewritten chain to a fresh branch (same as purge). |
-| `--dry` | Print the planned drop + safety check result + queue-write target; exit 0. |
+| `--force` | Allow demote when the range has `Rewrite` dispositions (your own code-touching commits). Has NO effect on `KeepVerbatim` (foreign commits) — those refuse unconditionally. |
+| `--into-branch <name>` | Write rewritten chain to a fresh branch (same as purge). Refuses if `<name>` already exists. Composes with `--dry`: prints the intended branch name without creating it. |
+| `--dry` | Print the planned drop + safety check result + queue-write target + orphan feedback count; exit 0. Composes with `--into-branch`: shows the branch that would be created. |
 | `--yes` | Skip interactive confirmation. |
 | `--allow-rewrite-protected` | Inherited from purge. |
 
@@ -96,8 +100,12 @@ The "save plan body before rewrite" is a one-line filesystem op; do it BEFORE in
 
 - `clank demote <plan>` on a plan whose commits ONLY touch `.clank/plans/<plan>.md` (all `Drop` dispositions in the preview) succeeds without `--force`. After: HEAD is at `<intro>^`, the plan body lives at `.clank/queue/500-<plan>.md`, the per-plan feedback files have been removed, and `git log` shows no trace of the dropped SHAs.
 - `clank demote <plan>` on a plan with at least one `Rewrite` disposition (mixed plan+code commits) errors out naming the offending SHAs and their non-plan paths. No filesystem changes.
-- `clank demote <plan>` on a plan with at least one `KeepVerbatim` disposition (foreign commit interleaved) errors out naming the foreign SHA. No filesystem changes.
-- `clank demote <plan> --force` on either error case drops the commits anyway, with an explicit warning about the foreign-commit case if present.
+- `clank demote <plan>` on a plan with at least one `KeepVerbatim` disposition (foreign commit interleaved) errors out naming the foreign SHA + suggesting `git rebase -i` or coordination with the foreign-commit author. No filesystem changes.
+- `clank demote <plan> --force` on the `Rewrite` error case drops the commits anyway (user opted in to losing their code).
+- `clank demote <plan> --force` on the `KeepVerbatim` error case STILL refuses — the foreign-commit refusal is unconditional (ruthless review of 91dc0b4: dropping someone else's commit is a coordination event, not a flag-flip).
+- `.clank/plans/<plan>.md` in the working tree differs from HEAD's version → demote errors out naming the dirty file, no filesystem changes. User commits/stashes before re-running.
+- `--into-branch <existing-name>` errors out with "branch already exists". No filesystem changes.
+- `--into-branch <name> --dry` prints "would write rewritten chain to `<name>`" without creating the branch.
 - `clank demote <plan> --stub` writes the plan body to `.clank/stubs/<plan>.md` instead of the queue.
 - `clank demote <plan> --priority 100` puts the queue file at `.clank/queue/100-<plan>.md`.
 - `clank demote <plan> --dry` prints the plan body's intended target, the per-commit disposition table, the orphan-feedback count, and exits 0 with no filesystem changes.
@@ -112,13 +120,16 @@ A new `crates/cli/tests/demote_integration.rs` (mirrors the existing rewrite/pur
 
 - `demote_plan_only_commits_succeeds_without_force`: plan with all-Drop dispositions; assert success + queue entry written + head moved + orphaned feedback removed.
 - `demote_plan_with_code_commits_requires_force`: setup with `src/foo.rs` modified in a plan commit (Rewrite disposition); assert error names the SHA + filesystem unchanged.
-- `demote_plan_with_foreign_commits_requires_force`: foreign commit interleaved between intro and HEAD (KeepVerbatim); assert error names the foreign SHA + filesystem unchanged.
+- `demote_plan_with_foreign_commits_refuses_unconditionally`: foreign commit interleaved between intro and HEAD (KeepVerbatim); assert error names the foreign SHA + suggests `git rebase -i` + filesystem unchanged.
 - `demote_force_drops_mixed_commits`: Rewrite-case + `--force`; assert drop succeeds and the code changes are gone (the user opted in).
-- `demote_force_drops_foreign_commits_with_warning`: KeepVerbatim-case + `--force`; assert drop succeeds + warning printed to stderr naming the foreign SHA.
+- `demote_force_does_not_bypass_foreign_refusal`: KeepVerbatim-case + `--force`; assert error STILL fires + filesystem unchanged. Locks in the unconditional refusal.
+- `demote_dirty_plan_file_errors`: working-tree-modified `.clank/plans/<plan>.md`; assert error names the dirty file, no rewrite happened.
 - `demote_stub_writes_to_stubs_dir`: `--stub` lands at `.clank/stubs/<plan>.md`.
 - `demote_priority_writes_to_queue_with_priority`: `--priority 100` lands at `.clank/queue/100-<plan>.md`.
 - `demote_dry_no_changes`: `--dry` prints intent (per-commit disposition + queue target + orphan count) + exits 0 without filesystem changes.
 - `demote_into_branch_does_not_touch_head`: `--into-branch <name>` leaves master alone, writes the chain to `<name>`.
+- `demote_into_branch_collision_errors`: pre-create `<name>`; assert demote refuses + filesystem unchanged.
+- `demote_into_branch_with_dry_does_not_create_branch`: `--into-branch <name> --dry` reports intent + leaves `<name>` non-existent.
 - `demote_priority_collision_errors`: pre-populate `.clank/queue/500-<plan>.md`; assert demote errors out before any rewrite.
 - `demote_stub_collision_errors`: pre-populate `.clank/stubs/<plan>.md`; assert demote --stub errors out.
 - `demote_orphaned_feedback_removed`: per-plan feedback files (`.clank/agents/*/feedback/<dropped-sha>.md`) are gone after a successful demote.
