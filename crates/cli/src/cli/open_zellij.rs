@@ -166,8 +166,14 @@ fn push_pane(out: &mut String, label: &str, role_str: &str, repo_path: &str) {
     let label_esc = kdl_escape(label);
     let role_esc = kdl_escape(role_str);
     let repo_esc = kdl_escape(repo_path);
+    // `cwd` is per-pane so the launched tool (e.g. `claude
+    // --resume`, which doesn't take a path argument) runs in
+    // the repo regardless of the shell that invoked
+    // `zellij --layout`. Codex caught on 8075d43 that pinning
+    // `--repo` on `clank agent start` only fixes clank-side
+    // resolution; the exec'd tool inherits process cwd.
     out.push_str(&format!(
-        "            pane name=\"{label_esc} ({role_esc})\" {{\n"
+        "            pane name=\"{label_esc} ({role_esc})\" cwd=\"{repo_esc}\" {{\n"
     ));
     out.push_str("                command \"clank\"\n");
     out.push_str(&format!(
@@ -314,6 +320,29 @@ mod tests {
         assert!(kdl.contains(&format!(
             "args \"agent\" \"start\" \"carol\" \"--repo\" \"{TEST_REPO}\""
         )));
+    }
+
+    #[test]
+    fn compose_kdl_panes_set_cwd_to_repo_path() {
+        // Codex 8075d43: pinning `--repo` on `clank agent start`
+        // fixes config resolution but the exec'd tool (e.g.
+        // `claude --resume`) inherits process cwd. Each pane's
+        // KDL block sets `cwd="<repo>"` so the spawned tool
+        // lands in the repo regardless of the shell that
+        // invoked zellij.
+        let master = agent("alice", Role::Master);
+        let bob = agent("bob", Role::Reviewer);
+        let kdl = compose_kdl(TEST_TAB, TEST_REPO, &master, &[&bob]);
+        // Master pane.
+        assert!(
+            kdl.contains(&format!("name=\"alice (master)\" cwd=\"{TEST_REPO}\"")),
+            "master pane should set cwd; got:\n{kdl}"
+        );
+        // Reviewer pane.
+        assert!(
+            kdl.contains(&format!("name=\"bob (reviewer)\" cwd=\"{TEST_REPO}\"")),
+            "reviewer pane should set cwd; got:\n{kdl}"
+        );
     }
 
     #[test]

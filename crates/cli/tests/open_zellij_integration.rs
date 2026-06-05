@@ -403,6 +403,62 @@ fn open_zellij_adds_zellij_dir_to_gitignore_idempotently() {
 }
 
 #[test]
+fn open_zellij_panes_set_cwd_to_repo_so_tool_launches_in_repo() {
+    // Codex 8075d43: --repo on `clank agent start` only fixes
+    // clank-side config resolution. The exec'd tool (e.g.
+    // `claude --resume <session>`) inherits process cwd. To
+    // ensure the tool launches IN the repo, each pane's KDL
+    // sets `cwd="<repo>"`. Verify from a DIFFERENT invocation
+    // cwd so we know we're not accidentally testing pwd-leak.
+    let dir = init_repo();
+    let repo = dir.path();
+    write_repo_agents(
+        repo,
+        vec![agent("alice", Role::Master), agent("bob", Role::Reviewer)],
+    );
+
+    let cwd = std::env::temp_dir();
+    let out = Command::new(clank_bin())
+        .current_dir(&cwd)
+        .args(["open", "zellij", "--repo"])
+        .arg(repo)
+        .arg("--print")
+        .env_remove("ZELLIJ_SESSION_NAME")
+        .env("HOME", repo)
+        .output()
+        .expect("spawn");
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    // Each pane has its own cwd= attribute. macOS /tmp →
+    // /private/tmp canonicalization means we look for the
+    // pattern shape, not exact match.
+    for label in ["alice", "bob"] {
+        let role = if label == "alice" {
+            "master"
+        } else {
+            "reviewer"
+        };
+        let pat = format!("name=\"{label} ({role})\" cwd=\"");
+        let pos = stdout
+            .find(&pat)
+            .unwrap_or_else(|| panic!("{label}'s pane must have cwd= attribute; got:\n{stdout}"));
+        let after = &stdout[pos + pat.len()..];
+        let close = after.find('"').unwrap();
+        let cwd_value = &after[..close];
+        assert!(
+            cwd_value.starts_with('/'),
+            "{label}'s cwd must be an absolute path; got: {cwd_value}"
+        );
+        let basename = repo.file_name().and_then(|s| s.to_str()).unwrap();
+        assert!(
+            cwd_value.contains(basename),
+            "{label}'s cwd must reference the repo (basename {basename}), \
+             not the invocation cwd; got: {cwd_value}"
+        );
+    }
+}
+
+#[test]
 fn open_zellij_pane_commands_pin_repo_via_absolute_path() {
     // Codex 361b104: when `clank open zellij --repo <abs-path>`
     // is invoked from a different cwd, the spawned zellij
