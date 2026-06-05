@@ -29,7 +29,7 @@ Concrete pointers checked in tree at the time of writing — re-confirm at promo
 - **Plan-resolve surface**: `crates/cli/src/cli/plan_resolve.rs:15-37` (`resolve_plan`) takes `(state, expected_basename, plan_arg: Option<&str>)` and returns a `PlanKey`. `crates/cli/src/cli/plan_resolve.rs:92-109` (`parse_arg`) handles bare-stem / `.md` / `<basename>/<stem>.md` / `.clank/plans/<stem>.md` forms. `clank log` and `clank purge` already consume it (`crates/cli/src/cli/log.rs:21-30`, `crates/cli/src/cli/purge.rs:62`).
 - **Plan-or-range pattern**: `clank log` already accepts BOTH a `--plan` flag AND a positional `<range>` arg (`crates/cli/src/cli/log.rs:21-42`). They are independent: `--plan` filters, `<range>` bounds. We do NOT want that shape — `clank diff` takes ONE positional that is EITHER a plan OR a range. See "Argument parsing" under Open questions.
 - **Range parsing**: `crates/cli/src/cli/log.rs:102-117` (`parse_range`) already handles `<from>..<to>` and bare `<sha>` (latter expands to `<sha>^..HEAD`). Reuse or factor out — the diff command wants `<from>..<to>` semantics most of the time.
-- **Plan → range conversion**: doesn't exist as a single helper today. `clank log` uses the `PlanKey` to filter the rebuilt log; it does NOT collapse a plan to a `<intro_sha>..<finalize_or_head_sha>` range. The diff command will need this. Probably belongs next to `resolve_plan`, e.g. `plan_resolve::range_for_plan(state, &plan_key) -> (Option<CommitSha>, CommitSha)`.
+- **Plan → commit list (NOT range)**: codex review of cba9249 caught that a chronological range would include interleaved commits from other concurrently-active plans. The diff command needs the plan-attributed commit LIST, not a range. `state.fold.plans[plan_key].commits` carries this for active plans; for finished plans, `preview::build_rewrite_preview` re-derives it. Helper belongs next to `resolve_plan`: `plan_resolve::commits_for_plan(state, &plan_key) -> Vec<CommitSha>`. See Phase 3.
 - **Config schema is typed today** at `crates/cli/src/cli/config.rs:12-43` (`Config { review, hooks }`) but the on-disk layer is read via `apply_layer` (`config.rs:245-292`) which uses an intermediate `ConfigFile` struct. The `agents` field is read via separate typed wrappers (`RepoAgentsFile` / `UserAgentsFile`, `config.rs:128-141`). A new `diff` section follows the same pattern — typed Rust struct, additive to `Config`, additive to the on-disk schema.
 - **LaunchConfig exists and is the right shape for "command + args + env"**: `crates/core/src/agent_config.rs:67-83`. It's already used by `DefaultAgent.launch` in the declaration. Reusing it for the editor config keeps one launch-profile schema across the codebase.
 - **Compose+exec pattern lives at** `crates/cli/src/cli/agent.rs:199-242` (`compose_launch`, `ComposedLaunch`) and `agent.rs:277-301` (`exec_composed` — `unix::process::CommandExt::exec` on unix, `spawn().wait()` on non-unix). The unix `exec` path REPLACES the current process; the diff command wants `spawn()` semantics (clank stays alive to print messages / return control), so this is "inspired by" not "share with".
@@ -87,23 +87,34 @@ clank diff [<plan|range>] [--plan <plan>] [--range <range>]
 
 If no positional is given and neither `--plan` nor `--range` is set: infer the single active plan via `resolve_plan(state, basename, None)` — same fallback `clank log` uses without `--plan` (`log.rs:21-30`).
 
-### Phase 3: Plan → commit range resolution
+### Phase 3: Plan → commit list (NOT range). Range stays as range.
 
-For a plan name:
+**The interleaving problem** (codex review of cba9249): clank explicitly supports multiple concurrently-active plans (`all-reviewers-gate` finished; multiple `plans/*.md` legal). Commits from plans A and B interleave in chronological order. A plain `intro_sha^..HEAD` git range for plan A would include plan B's commits. `clank diff <plan>` returning a chronological range is "show me everything between A's intro and now," not "show me what A did." Two different semantics; only the second matches the agent's mental model ("Lloyd, look at the changes I made for THIS plan").
 
-1. Resolve the plan key via `plan_resolve::resolve_plan` (already does the "active vs finished vs unknown" classification).
-2. Convert to a commit range. The "natural" range is `intro_sha^..finalize_sha` for finished plans, or `intro_sha^..HEAD` for in-flight plans.
-3. The state-fold already tracks the intro and finalize commits per plan (`state.fold.plans` for active, `state.fold.finished_plans` for finished). Add a helper:
+**Resolution**: `clank diff <plan>` produces the COMMIT LIST attributed to the plan, NOT a range. `clank diff <range>` keeps range semantics for ad-hoc use. The editor decides how to render each.
+
+The state-fold already tracks per-plan commit timelines (this is what `clank log <plan>` filters by). For an active plan: `state.fold.plans[plan_key].commits`. For a finished plan: re-derive via `crate::preview::build_rewrite_preview` (same path `clank purge` / `clank demote` use to enumerate plan-attributed commits).
+
+Add a helper next to `resolve_plan`:
 
 ```rust
-// in plan_resolve.rs or a new range.rs sibling
-pub fn range_for_plan(state: &RepoState, key: &PlanKey)
-    -> anyhow::Result<(Option<CommitSha>, CommitSha)>;
+// in plan_resolve.rs or a new commits.rs sibling
+pub fn commits_for_plan(state: &RepoState, key: &PlanKey)
+    -> anyhow::Result<Vec<CommitSha>>;
 ```
 
-Returns `(from, to)` matching the `(Option<CommitSha>, CommitSha)` shape `clank log` already uses (`log.rs:102-117`). `from = intro^` (so the intro itself is included in the diff); `to = finalize_sha` for finished plans, `HEAD` for active.
+Returns the chronologically-ordered plan-attributed commits.
 
-For a raw range (`HEAD~3..HEAD` or `abc..def`): reuse `log::parse_range` (factor out to `plan_resolve` or a new `range_parse` module so log and diff share it — both want the same `(Option<CommitSha>, CommitSha)` output).
+**For a raw range** (`HEAD~3..HEAD` or `abc..def`): keep range semantics. Reuse `log::parse_range` (factor out to `plan_resolve` or a new `range_parse` module so log and diff share it — same `(Option<CommitSha>, CommitSha)` output).
+
+**Two semantically-distinct primitives surface to the editor** (via Phase 4 env vars below):
+
+| User invocation | Semantic | Surfaces |
+|---|---|---|
+| `clank diff <plan>` | plan-exact | `CLANK_DIFF_KIND=plan`, `CLANK_DIFF_COMMITS=sha1,sha2,...`, `CLANK_DIFF_PLAN=<stem>`. NO `CLANK_DIFF_RANGE` (would mislead). |
+| `clank diff <range>` | ad-hoc range | `CLANK_DIFF_KIND=range`, `CLANK_DIFF_RANGE=<from>..<to>`. NO `CLANK_DIFF_COMMITS`. |
+
+Editors that want a SINGLE-PATCH view (rather than per-commit) can opt-in via a `{patch_file}` template variable in `LaunchConfig.args` (see Phase 4); when present, clank synthesizes a tempfile patch from `CLANK_DIFF_COMMITS` (cherry-pick-style stacked diff) or from the range (`git diff <from>..<to>`), and substitutes the path.
 
 ### Phase 4: Compose the editor invocation
 
@@ -118,21 +129,37 @@ struct ComposedDiffLaunch {
 }
 ```
 
-Template substitution in `args`:
+Template substitution in `args` — different variables available depending on `CLANK_DIFF_KIND`:
 
-- `{range}` → `<from>..<to>` literal string (for editor commands that build the diff themselves, e.g. `emacsclient -e "(magit-diff '$range')"`).
-- `{from}`, `{to}` → individual SHAs.
+Common (always available):
 - `{repo}` → repo root absolute path.
+
+For `CLANK_DIFF_KIND=range` (`clank diff <range>`):
+- `{range}` → `<from>..<to>` literal.
+- `{from}`, `{to}` → individual SHAs.
+
+For `CLANK_DIFF_KIND=plan` (`clank diff <plan>`):
+- `{plan}` → plan stem.
+- `{commits}` → comma-separated SHA list (same as `CLANK_DIFF_COMMITS`).
+- `{first_commit}`, `{last_commit}` → endpoints of the commit list.
+
+For both (opt-in by use; only synthesized if the template appears):
+- `{patch_file}` → absolute path to a tempfile containing a synthesized patch. For range: `git diff <from>..<to>`. For plan: stacked `git format-patch`-style concatenation of the plan's commits. The tempfile is cleaned up after the editor exits (under `--wait`) or after a `clank-managed` cleanup timeout (under fire-and-forget; specific timeout pinned at implementation).
+
+Using a template variable that doesn't apply to the current `CLANK_DIFF_KIND` → error at compose time ("`{range}` not available when launching via `--plan`"). Avoids silent confusion.
 
 Env additions (in addition to whatever `LaunchConfig.env` supplies):
 
-- `CLANK_DIFF_RANGE` = `<from>..<to>`.
-- `CLANK_DIFF_PLAN` = plan stem if applicable, else unset.
+- `CLANK_DIFF_KIND` = `"plan"` or `"range"`. ALWAYS set.
+- `CLANK_DIFF_REPO` = repo root. ALWAYS set.
 - `CLANK_DIFF_PROMPT` = the `--prompt` text if set.
-- `CLANK_DIFF_FOCUS` = newline-separated `<file>:<lines>` entries (or JSON; resolve at promote-time).
-- `CLANK_DIFF_REPO` = repo root.
+- `CLANK_DIFF_FOCUS` = newline-separated `<file>:<lines>` entries.
+- Kind-specific:
+  - When `CLANK_DIFF_KIND=plan`: `CLANK_DIFF_PLAN=<stem>`, `CLANK_DIFF_COMMITS=<comma-separated SHAs in chronological order>`.
+  - When `CLANK_DIFF_KIND=range`: `CLANK_DIFF_RANGE=<from>..<to>`.
+- The kind-specific env vars from the OTHER kind are explicitly NOT set (no `CLANK_DIFF_RANGE` for plan invocations, no `CLANK_DIFF_COMMITS` for range invocations). This is load-bearing: a misconfigured editor command that reads `CLANK_DIFF_RANGE` would silently produce wrong output for a plan invocation if we set both.
 
-The "what does the editor receive" question is the load-bearing decision (see Open questions). The env-var channel is the most universal — every editor's launch shell can read env. Stdin piping is reserved for editors that explicitly want raw patch text (out of scope for v1).
+The env-var channel is the most universal — every editor's launch shell can read env. Stdin piping is reserved for editors that explicitly want raw patch text (out of scope for v1).
 
 ### Phase 5: Spawn semantics (`--wait` vs fire-and-forget)
 
@@ -180,10 +207,7 @@ These are the decisions worth a real conversation. Marking them so the promotion
    - (c) CLI arg substitution via `{prompt}` template — requires user to wire it in their `LaunchConfig.args`.
    - **Tentative pick**: (a) ALWAYS + (c) AS AN OPTION. Env is the safe default; users who want it in the arg list can interpolate `{prompt}`.
 
-5. **What does the editor receive: raw patch on stdin, two trees, or just the range string?**
-   - The simplest answer is "just the range string"; the user's editor command runs `git diff <range>` itself. emacs does this trivially via `magit-diff-range`.
-   - Stdin piping of `git diff <range>` output is also cheap to support but redundant for any editor that can shell out.
-   - **Tentative pick**: range string only (via env + template subst). Editor is responsible for running `git diff`. Stdin piping reserved as an opt-in `LaunchConfig` extension later.
+5. **What does the editor receive: raw patch on stdin, two trees, or just the range string?** — **RESOLVED** (codex cba9249 forced the call). Editors get two semantically-distinct primitives via env vars: `CLANK_DIFF_COMMITS` for plan invocations (plan-attributed SHA list), `CLANK_DIFF_RANGE` for range invocations (raw `<from>..<to>` string). Plus an opt-in `{patch_file}` template variable that synthesizes a tempfile patch for editors that want a single-patch view. Stdin piping deferred. See Phase 3 + Phase 4 for the table of which env vars are set under which invocation.
 
 6. **`--wait` mechanics on SIGINT**: if user ctrl-c's clank while it's waiting on the editor, do we forward SIGINT, kill the child, or let it keep running?
    - **Tentative pick**: forward SIGINT (most editors handle it; emacsclient + vscode `--wait` cleanly exit on it), then wait for the child to exit. Document as "ctrl-c is forwarded; editor decides cleanup."
@@ -214,16 +238,18 @@ These are the decisions worth a real conversation. Marking them so the promotion
 
 **Subcommand surface (Phase 2 + 6)**
 
-- `clank diff <plan>` resolves the plan via `plan_resolve::resolve_plan` and converts to a commit range via the new `range_for_plan` helper.
+- `clank diff <plan>` resolves the plan via `plan_resolve::resolve_plan` and produces the plan-attributed commit list via `commits_for_plan` (NOT a range; codex review of cba9249 — the plan-attributed commit list is the only correct primitive when plans interleave).
 - `clank diff <range>` (raw `<from>..<to>` or bare SHA) parses via the shared range parser.
+- `clank diff <plan>` in a repo with interleaved commits from another plan does NOT include the other plan's commits in `CLANK_DIFF_COMMITS` or in the synthesized `{patch_file}`.
 - `clank diff` (no args) infers the single active plan, errors with candidates listed if ambiguous (same UX as `clank log` without `--plan`).
 - `clank diff --plan <x>` and `clank diff --range <x>` work as explicit overrides; mutually exclusive with each other and with the positional.
 - `clank diff --print` emits the composed launch line (program + argv + env) on stdout, exits 0, spawns nothing.
 
 **Editor launch (Phase 4 + 5)**
 
-- Composed launch substitutes `{range}`, `{from}`, `{to}`, `{repo}` in `LaunchConfig.args`.
-- Env additions include `CLANK_DIFF_RANGE`, `CLANK_DIFF_PLAN` (if applicable), `CLANK_DIFF_PROMPT` (if `--prompt`), `CLANK_DIFF_FOCUS` (if any `--focus`), `CLANK_DIFF_REPO`.
+- Composed launch substitutes the kind-specific template variables in `LaunchConfig.args`. For range: `{range}`, `{from}`, `{to}`, `{repo}`. For plan: `{plan}`, `{commits}`, `{first_commit}`, `{last_commit}`, `{repo}`. For both: `{patch_file}` synthesizes a tempfile on use.
+- Using a template variable that doesn't apply to the current kind errors at compose time with a clear message.
+- Env additions: `CLANK_DIFF_KIND` and `CLANK_DIFF_REPO` ALWAYS set. Range kind adds `CLANK_DIFF_RANGE`. Plan kind adds `CLANK_DIFF_PLAN` + `CLANK_DIFF_COMMITS`. The other kind's env vars are explicitly NOT set (no leakage). `CLANK_DIFF_PROMPT` set when `--prompt`; `CLANK_DIFF_FOCUS` when `--focus`.
 - Default spawn = fire-and-forget; `--wait` blocks until exit; `--no-wait` overrides config-default `wait: true`.
 - Errors clearly when `diff.editor` is unconfigured: "no editor configured; set diff.editor.command in ~/.clank/config.json".
 
@@ -241,31 +267,34 @@ These are the decisions worth a real conversation. Marking them so the promotion
 3. `diff_config_repo_scope_overrides_user_scope`: user-scope `editor: vim`; repo-scope `editor: emacsclient`; loaded `cfg.diff.editor.command == "emacsclient"`.
 4. `diff_config_malformed_ignored`: malformed JSON in the `diff` section logs a warning and `cfg.diff` falls back to default — same lossy semantics as the rest of `apply_layer`.
 
-### Plan → range resolution
+### Plan → commit list resolution
 
-5. `range_for_plan_finished_returns_intro_parent_to_finalize`: repo with a finished plan; `range_for_plan(&state, &key)` returns `(Some(intro^), finalize_sha)`.
-6. `range_for_plan_active_returns_intro_parent_to_head`: repo with an active plan; helper returns `(Some(intro^), HEAD)`.
-7. `range_for_plan_unknown_errors`: plan key not in `state.fold.plans` → error matches "plan not found".
+5. `commits_for_plan_active_returns_plan_attributed_chronological`: repo with an active plan + 3 plan commits; `commits_for_plan` returns those 3 SHAs in chronological order.
+6. `commits_for_plan_finished_returns_intro_to_finalize_set`: repo with a finished plan; helper returns the full set including the finalize commit.
+7. `commits_for_plan_excludes_interleaved_other_plan_commits` **(codex cba9249)**: repo with plan A (intro + 1 revise), plan B (intro + 1 revise) interleaved chronologically; `commits_for_plan(state, key_A)` returns ONLY plan A's 2 SHAs.
+8. `commits_for_plan_unknown_errors`: plan key not in fold → error matches "plan not found".
 
 ### CLI surface
 
-8. `clank_diff_positional_resolves_plan`: `clank diff foo --print` resolves `foo` as a plan, emits a composed line that references the plan's intro..finalize range.
-9. `clank_diff_positional_resolves_range`: `clank diff HEAD~2..HEAD --print` skips plan resolution, parses as a range, emits a composed line referencing HEAD~2..HEAD.
-10. `clank_diff_positional_unknown_errors_clearly`: `clank diff not-a-plan-not-a-range --print` errors with a message that mentions both interpretations ("`not-a-plan-not-a-range` is not a known plan and is not a valid git range").
-11. `clank_diff_no_args_infers_single_active_plan`: one active plan in repo; `clank diff --print` resolves it.
-12. `clank_diff_no_args_ambiguous_lists_candidates`: two active plans; `clank diff` errors with both listed (same shape as `clank log`'s ambiguity error).
+9. `clank_diff_positional_resolves_plan`: `clank diff foo --print` resolves `foo` as a plan; composed env includes `CLANK_DIFF_KIND=plan` + `CLANK_DIFF_COMMITS=<sha1>,<sha2>,...` + `CLANK_DIFF_PLAN=foo`. Does NOT include `CLANK_DIFF_RANGE`.
+10. `clank_diff_positional_resolves_range`: `clank diff HEAD~2..HEAD --print` skips plan resolution; composed env includes `CLANK_DIFF_KIND=range` + `CLANK_DIFF_RANGE=HEAD~2..HEAD`. Does NOT include `CLANK_DIFF_COMMITS`.
+11. `clank_diff_positional_unknown_errors_clearly`: `clank diff not-a-plan-not-a-range --print` errors with a message that mentions both interpretations ("`not-a-plan-not-a-range` is not a known plan and is not a valid git range").
+12. `clank_diff_no_args_infers_single_active_plan`: one active plan in repo; `clank diff --print` resolves it.
+13. `clank_diff_no_args_ambiguous_lists_candidates`: two active plans; `clank diff` errors with both listed (same shape as `clank log`'s ambiguity error).
+14. `clank_diff_plan_kind_template_var_used_in_range_invocation_errors` and inverse: `LaunchConfig.args = ["--commits", "{commits}"]` invoked with `clank diff <range>` → compose-time error naming the wrong-kind template variable.
 
 ### Launch composition
 
-13. `clank_diff_substitutes_range_template_in_args`: `LaunchConfig { args: ["--eval", "(magit-diff '{range}')"] }` → composed args contain `(magit-diff 'HEAD~2..HEAD')`.
-14. `clank_diff_sets_env_vars`: composed env contains `CLANK_DIFF_RANGE`, `CLANK_DIFF_REPO`, AND (when `--prompt`/`--focus` are set) `CLANK_DIFF_PROMPT` / `CLANK_DIFF_FOCUS`.
-15. `clank_diff_print_outputs_composed_line`: `--print` emits program + shell-quoted args on stdout and env additions on stderr (mirrors `agent start --print`).
-16. `clank_diff_unconfigured_editor_errors`: no `diff.editor` set → error names the config key + path.
-17. `clank_diff_wait_flag_overrides_config_default`: config has `wait: false`; `--wait` flips composed `wait` to true. And vice versa for `--no-wait` over config `wait: true`.
+15. `clank_diff_substitutes_range_template_in_args`: range invocation; `LaunchConfig { args: ["--eval", "(magit-diff '{range}')"] }` → composed args contain `(magit-diff 'HEAD~2..HEAD')`.
+16. `clank_diff_substitutes_plan_commits_template_in_args`: plan invocation; `LaunchConfig { args: ["--eval", "(magit-show-commits '{commits}')"] }` → composed args contain `(magit-show-commits 'sha1,sha2')`.
+17. `clank_diff_patch_file_template_synthesizes_tempfile_path`: `LaunchConfig { args: ["{patch_file}"] }` → clank writes synthesized patch to a tempfile, composed args contain the absolute path. Tempfile path can be opened.
+18. `clank_diff_print_outputs_composed_line`: `--print` emits program + shell-quoted args on stdout and env additions on stderr (mirrors `agent start --print`).
+19. `clank_diff_unconfigured_editor_errors`: no `diff.editor` set → error names the config key + path.
+20. `clank_diff_wait_flag_overrides_config_default`: config has `wait: false`; `--wait` flips composed `wait` to true. And vice versa for `--no-wait` over config `wait: true`.
 
 ### Smoke (gate-able by feature)
 
-18. `clank_diff_spawns_configured_editor_smoke`: with `diff.editor.command = "true"` (POSIX no-op binary), `clank diff <range>` (fire-and-forget) returns Ok and the test process doesn't block. With `--wait`, the same returns Ok after `true` exits.
+21. `clank_diff_spawns_configured_editor_smoke`: with `diff.editor.command = "true"` (POSIX no-op binary), `clank diff <range>` (fire-and-forget) returns Ok and the test process doesn't block. With `--wait`, the same returns Ok after `true` exits.
 
 ## Related history
 
