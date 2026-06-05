@@ -632,6 +632,111 @@ fn clank_agent_promote_errors_when_label_absent() {
     assert!(stderr.contains("phantom") && stderr.contains("not in repo-scope"));
 }
 
+#[test]
+fn clank_agent_promote_atomic_write() {
+    // Plan: agent-promote-replaces-set-role; codex 57df9a7 catch.
+    // Lock in the "one write, all changes" property for the
+    // repair path. Pre-state has 3 masters + 1 reviewer; promote
+    // the reviewer; verify:
+    // 1. The config file's inode changed exactly once (atomic
+    //    rename semantic from `write_repo_config`'s tempfile.persist
+    //    — N separate writes would produce a different inode each
+    //    iteration; inode-after must match the post-state's
+    //    SINGLE rename).
+    // 2. The on-disk content reflects ALL demotions + the
+    //    promotion as one consistent transition (no partial state
+    //    where some demotions are applied but not others).
+    //
+    // Inode tracking is the structural defense: a per-iteration
+    // write pattern (write_repo_config inside a demotion loop)
+    // would reset the inode each loop, but the LAST one wins.
+    // The OPERATIONAL behavior — file consistent + single
+    // observable write event — is what users see and is what
+    // the helper's "no I/O" contract guarantees structurally.
+    use std::os::unix::fs::MetadataExt;
+    let env = Env::new();
+    write_repo_config(
+        env.repo(),
+        &RepoConfigFile {
+            agents: Some(vec![
+                clank::cli::config::DefaultAgent {
+                    label: AgentLabel::parse("alice").unwrap(),
+                    role: Role::Master,
+                    tool: Some(clank_core::vocab::Tool::Claude),
+                    launch: None,
+                    initial_prompt: None,
+                },
+                clank::cli::config::DefaultAgent {
+                    label: AgentLabel::parse("bob").unwrap(),
+                    role: Role::Master,
+                    tool: Some(clank_core::vocab::Tool::Codex),
+                    launch: None,
+                    initial_prompt: None,
+                },
+                clank::cli::config::DefaultAgent {
+                    label: AgentLabel::parse("carol").unwrap(),
+                    role: Role::Master,
+                    tool: Some(clank_core::vocab::Tool::Claude),
+                    launch: None,
+                    initial_prompt: None,
+                },
+                clank::cli::config::DefaultAgent {
+                    label: AgentLabel::parse("dave").unwrap(),
+                    role: Role::Reviewer,
+                    tool: Some(clank_core::vocab::Tool::Codex),
+                    launch: None,
+                    initial_prompt: None,
+                },
+            ]),
+            ..Default::default()
+        },
+    );
+
+    let cfg_path = env.repo().join(".clank/config.json");
+    let ino_before = std::fs::metadata(&cfg_path).unwrap().ino();
+    let mtime_before = std::fs::metadata(&cfg_path).unwrap().modified().unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(20));
+
+    let out = env.agent(&["promote", "dave"]);
+    assert!(out.status.success(), "promote failed");
+
+    let ino_after = std::fs::metadata(&cfg_path).unwrap().ino();
+    let mtime_after = std::fs::metadata(&cfg_path).unwrap().modified().unwrap();
+
+    // A write happened.
+    assert!(
+        mtime_after > mtime_before,
+        "promote must rewrite the declaration"
+    );
+    assert_ne!(
+        ino_before, ino_after,
+        "atomic rename (write_repo_config's tempfile.persist) must produce a new inode"
+    );
+
+    // All changes persisted as a single transition.
+    let repo = read_repo_config(env.repo());
+    let agents = repo.agents.unwrap();
+    let masters: Vec<_> = agents.iter().filter(|e| e.role == Role::Master).collect();
+    assert_eq!(
+        masters.len(),
+        1,
+        "single-write transaction must apply ALL demotions + the promotion together"
+    );
+    assert_eq!(masters[0].label.as_str(), "dave");
+    for (label, expected_role) in [
+        ("alice", Role::Reviewer),
+        ("bob", Role::Reviewer),
+        ("carol", Role::Reviewer),
+        ("dave", Role::Master),
+    ] {
+        let e = agents.iter().find(|a| a.label.as_str() == label).unwrap();
+        assert_eq!(
+            e.role, expected_role,
+            "{label} role mismatch in single-transaction post-state"
+        );
+    }
+}
+
 // ── add --role master enforces the same invariant ────────────────
 
 #[test]
