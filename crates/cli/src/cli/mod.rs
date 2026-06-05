@@ -186,14 +186,14 @@ pub enum OpenCmd {
 #[derive(Args, Debug)]
 pub struct OpenDryArgs {
     /// Path to inspect. Echoed back verbatim as `requested_path`;
-    /// not canonicalized until existence is confirmed.
+    /// not canonicalized until existence is confirmed. The repo
+    /// root is derived from this path's `git rev-parse --show-toplevel`,
+    /// so no `--repo` flag is needed — codex caught on 30a0194
+    /// that adding one would have been a silent no-op.
     pub path: String,
     /// Emit the response as JSON.
     #[arg(short = 'j', long)]
     pub json: bool,
-    /// Repo root override. Defaults to the cwd's git toplevel.
-    #[arg(long, value_name = "PATH")]
-    pub repo: Option<PathBuf>,
 }
 
 #[derive(Args, Debug)]

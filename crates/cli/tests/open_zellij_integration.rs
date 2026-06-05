@@ -78,6 +78,37 @@ fn run_zellij(repo: &Path, args: &[&str]) -> std::process::Output {
 // ─── Phase 1: dry-rename regression ────────────────────────────
 
 #[test]
+fn open_dry_rejects_unknown_repo_flag() {
+    // Codex 30a0194: `clank open dry --repo <path>` was
+    // accepted by clap but silently ignored by run_dry. The
+    // path argument carries the repo info already (the
+    // inspector derives the repo from the path itself), so
+    // there is no `--repo` flag on `open dry`. Lock this in:
+    // passing `--repo` must fail at the clap layer, NOT
+    // succeed silently.
+    let dir = init_repo();
+    let repo = dir.path();
+    let out = Command::new(clank_bin())
+        .args(["open", "dry", "--repo", "/tmp", "/tmp/some/path"])
+        .env("HOME", repo)
+        .env_remove("ZELLIJ_SESSION_NAME")
+        .output()
+        .expect("spawn");
+    assert!(
+        !out.status.success(),
+        "open dry --repo must be rejected (silent no-op flags mislead editor integrations); \
+         got stdout=`{}` stderr=`{}`",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("--repo") || stderr.contains("unexpected") || stderr.contains("argument"),
+        "error should mention the unknown flag; got: {stderr}"
+    );
+}
+
+#[test]
 fn legacy_open_invocation_errors_with_subcommand_hint() {
     // `clank open <path>` (without the `dry` subcommand) must
     // fail. Clap's exact wording is whatever it is — we just
