@@ -167,11 +167,20 @@ Integration tests in `crates/cli/tests/agent_start_integration.rs`:
   visible fresh-init flow.
 - **UPDATE existing test**
   `agent_start_no_bound_session_errors_with_clank_as_hint`
-  at `agent_start_integration.rs:311-345`: today asserts
-  ERROR + "clank as" hint. After this plan, the same setup
-  (skeleton with `session: None`) bootstraps instead.
-  Rename to `agent_start_session_none_bootstraps_via_seed_prompt`
-  and assert success + bootstrap prompt in argv.
+  at `agent_start_integration.rs:311-345` (codex a8164a1
+  catch — original update broke the negative path).
+  Today's setup writes ONLY an unbound skeleton with no
+  repo/user declaration entry, so `load_merged_agents`
+  legacy-synthesizes a declaration with `tool: None` from
+  `config.rs:502-506` (the tool is inferred from
+  `cfg.session`, which is None → tool=None). With tool=None
+  the bootstrap path now correctly ERRORS with the
+  no-bootstrap-tool hint. Keep this test, but rename to
+  `agent_start_session_none_with_no_tool_errors_with_hint`
+  and assert the no-bootstrap-tool error message (label name
+  + tool-fix hint), NOT the legacy "no clank as" wording.
+  This continues to defend the legacy-skeleton-without-tool
+  negative path.
 
 Negative tests (existing behavior preserved):
 
@@ -179,6 +188,10 @@ Negative tests (existing behavior preserved):
   still fires.
 - Declaration entry's launch has no command AND tool=None →
   bootstrap errors with the named-agent + tool-fix hint.
+  (The renamed
+  `agent_start_session_none_with_no_tool_errors_with_hint`
+  above covers this for the legacy-skeleton synthesis
+  variant.)
 
 ## Out of scope
 
@@ -198,30 +211,42 @@ Negative tests (existing behavior preserved):
 
 ## Acceptance
 
-Bootstrap path:
-- **(a) Missing-skeleton case**: `clank agent start
-  <label>` for an agent in the merged declaration with no
-  `<repo>/.clank/agents/<label>/config.json` spawns the
-  bare tool with the seed prompt instead of erroring.
+All bootstrap criteria are gated on the declaration
+resolving a bootstrap program (`launch.command` set OR
+`tool` set). Without a resolvable program, the no-bootstrap-
+tool error path applies — codex a8164a1 catch: the prior
+acceptance unconditionally asserted "always bootstraps,"
+which contradicted the no-tool negative path.
+
+Bootstrap path (resolvable program present):
+- **(a) Missing-skeleton case**: `clank agent start <label>`
+  for a declared agent with a resolvable bootstrap program
+  and no `<repo>/.clank/agents/<label>/config.json` spawns
+  the bare tool with the seed prompt instead of erroring.
 - **(b) Session-none case** (codex 5428550 catch — must be
-  in acceptance too, not just Approach/Tests): `clank
-  agent start <label>` for an agent whose skeleton EXISTS
-  but has `session: None` ALSO spawns the bootstrap.
-  Implementation cannot satisfy this acceptance while
-  leaving fresh-init repos broken.
+  in acceptance too): same for a declared agent with a
+  resolvable bootstrap program and skeleton-with-`session:
+  None`. Implementation cannot satisfy this while leaving
+  fresh-init repos with declared `tool` broken.
 
 Negative paths preserved:
 - `clank agent start <label>` for an agent NOT in the
   declaration continues to error with "no such agent".
-- `clank agent start <label>` for an agent with neither
-  `launch.command` nor `tool` set surfaces the actionable
+- `clank agent start <label>` for a declared agent WITHOUT
+  a resolvable bootstrap program (no `launch.command` AND
+  `tool: None`) surfaces the actionable no-bootstrap-tool
   error hint with the edit-or-remove-and-re-add path.
+  Includes the legacy-skeleton-without-tool synthesis case
+  via `config.rs:502-506`.
 
 End-to-end:
 - `clank open zellij` in any repo where some declared
-  agents are unbound (either case (a) or (b)) opens all
-  declared-agent panes successfully; unbound panes greet
-  with the bootstrap prompt; bound panes resume normally.
+  agents are unbound (either case (a) or (b)) with a
+  resolvable bootstrap program opens those panes
+  successfully; unbound panes greet with the bootstrap
+  prompt; bound panes resume normally. Panes for declared
+  agents WITHOUT a resolvable program surface the error
+  rather than bootstrapping silently.
 - After the agent runs `clank as <label>` once, subsequent
   `clank agent start <label>` calls resume the session
   normally (existing behavior preserved).
