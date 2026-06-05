@@ -93,7 +93,7 @@ fn ensure_gitignore_zellij_entry(repo: &Path) -> anyhow::Result<()> {
 /// Triage the declaration into (master, reviewers).
 ///
 /// - zero masters → error (suggest `clank agent add ... --role master`)
-/// - multiple masters → error (suggest `clank agent set-role`)
+/// - multiple masters → error (suggest `clank agent promote`)
 /// - exactly one master → ok; reviewers preserve declaration order
 fn classify_roles(agents: &[DefaultAgent]) -> anyhow::Result<(&DefaultAgent, Vec<&DefaultAgent>)> {
     let masters: Vec<&DefaultAgent> = agents.iter().filter(|a| a.role == Role::Master).collect();
@@ -115,8 +115,9 @@ fn classify_roles(agents: &[DefaultAgent]) -> anyhow::Result<(&DefaultAgent, Vec
                 .collect();
             anyhow::bail!(
                 "multiple master agents registered: {}. zellij layout requires \
-                 exactly one master. Resolve with `clank agent set-role <label> reviewer` \
-                 to demote a duplicate.",
+                 exactly one master. Resolve with `clank agent promote <label>` \
+                 to make exactly one of them master (all OTHERS automatically \
+                 become reviewers).",
                 names.join(", ")
             )
         }
@@ -254,8 +255,8 @@ mod tests {
             "multi-master diagnostic must list BOTH masters; got: {msg}"
         );
         assert!(
-            msg.contains("clank agent set-role"),
-            "diagnostic should suggest set-role; got: {msg}"
+            msg.contains("clank agent promote"),
+            "diagnostic should suggest promote; got: {msg}"
         );
     }
 

@@ -1,4 +1,4 @@
-//! Integration tests for `clank agent add/remove/set-role` (Phase 4
+//! Integration tests for `clank agent add/remove/promote` (Phase 4
 //! of `agent-add-cli-and-repo-scope`).
 //!
 //! Tests construct config files via the typed `RepoConfigFile` /
@@ -373,7 +373,7 @@ fn clank_agent_remove_preserves_per_agent_directory() {
     );
 }
 
-// ── Phase 4 acceptance: clank agent set-role ─────────────────────
+// ── clank agent promote (plan: agent-promote-replaces-set-role) ──
 
 #[test]
 fn clank_agent_remove_drops_role_from_resolve_even_when_skeleton_preserved() {
@@ -440,29 +440,317 @@ fn clank_agent_remove_drops_role_from_resolve_even_when_skeleton_preserved() {
 }
 
 #[test]
-fn clank_agent_set_role_flips_role_in_place() {
-    // set-role edits the DECLARATION entry. Skeleton is untouched.
+fn clank_agent_promote_flips_reviewer_to_master() {
+    // promote edits the DECLARATION entry. Skeleton is untouched.
+    // Rename of `clank_agent_set_role_flips_role_in_place` per
+    // plan agent-promote-replaces-set-role.
     let env = Env::new();
-    env.agent(&["add", "codex", "--tool", "codex"]);
+    env.agent(&["add", "codex", "--tool", "codex"]); // reviewer by default
     let before_skeleton =
         std::fs::read_to_string(env.repo().join(".clank/agents/codex/config.json")).unwrap();
 
-    let out = env.agent(&["set-role", "codex", "master"]);
+    let out = env.agent(&["promote", "codex"]);
     assert!(
         out.status.success(),
-        "set-role failed: stderr=`{}`",
+        "promote failed: stderr=`{}`",
         String::from_utf8_lossy(&out.stderr)
     );
-    // Declaration entry has the new role.
     let repo = read_repo_config(env.repo());
     let entry = &repo.agents.unwrap()[0];
     assert_eq!(entry.label.as_str(), "codex");
     assert_eq!(entry.role, Role::Master);
-    // Skeleton untouched.
     let after_skeleton =
         std::fs::read_to_string(env.repo().join(".clank/agents/codex/config.json")).unwrap();
     assert_eq!(
         before_skeleton, after_skeleton,
-        "skeleton must NOT be modified by set-role"
+        "skeleton must NOT be modified by promote"
     );
+}
+
+#[test]
+fn clank_agent_promote_swaps_old_master_to_reviewer() {
+    // Pre-state: master=alice, reviewer=bob. promote bob.
+    // Post-state: reviewer=alice, master=bob.
+    let env = Env::new();
+    env.agent(&["add", "alice", "--tool", "claude", "--role", "master"]);
+    env.agent(&["add", "bob", "--tool", "codex"]);
+
+    let out = env.agent(&["promote", "bob"]);
+    assert!(
+        out.status.success(),
+        "promote failed: stderr=`{}`",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("promoted") && stderr.contains("bob") && stderr.contains("alice"),
+        "stderr must announce promoted=bob + demoted=alice; got: {stderr}"
+    );
+
+    let repo = read_repo_config(env.repo());
+    let agents = repo.agents.unwrap();
+    let alice = agents.iter().find(|e| e.label.as_str() == "alice").unwrap();
+    let bob = agents.iter().find(|e| e.label.as_str() == "bob").unwrap();
+    assert_eq!(alice.role, Role::Reviewer);
+    assert_eq!(bob.role, Role::Master);
+}
+
+#[test]
+fn clank_agent_promote_no_op_when_already_only_master() {
+    let env = Env::new();
+    env.agent(&["add", "alice", "--tool", "claude", "--role", "master"]);
+    env.agent(&["add", "bob", "--tool", "codex"]);
+
+    // mtime baseline of the declaration file.
+    let cfg_path = env.repo().join(".clank/config.json");
+    let before_mtime = std::fs::metadata(&cfg_path).unwrap().modified().unwrap();
+    // Sleep enough that a write would produce a different mtime.
+    std::thread::sleep(std::time::Duration::from_millis(20));
+
+    let out = env.agent(&["promote", "alice"]);
+    assert!(out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("already the only master"),
+        "no-op must announce it; got: {stderr}"
+    );
+    let after_mtime = std::fs::metadata(&cfg_path).unwrap().modified().unwrap();
+    assert_eq!(
+        before_mtime, after_mtime,
+        "no-op promote must not rewrite the declaration"
+    );
+}
+
+#[test]
+fn clank_agent_promote_from_zero_masters() {
+    let env = Env::new();
+    env.agent(&["add", "alice", "--tool", "claude"]); // reviewer
+    env.agent(&["add", "bob", "--tool", "codex"]); // reviewer
+
+    let out = env.agent(&["promote", "alice"]);
+    assert!(out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("promoted") && stderr.contains("alice"));
+    assert!(
+        !stderr.contains("demoted"),
+        "zero prior masters means no demotion suffix; got: {stderr}"
+    );
+
+    let repo = read_repo_config(env.repo());
+    let agents = repo.agents.unwrap();
+    let alice = agents.iter().find(|e| e.label.as_str() == "alice").unwrap();
+    let bob = agents.iter().find(|e| e.label.as_str() == "bob").unwrap();
+    assert_eq!(alice.role, Role::Master);
+    assert_eq!(bob.role, Role::Reviewer);
+}
+
+#[test]
+fn clank_agent_promote_repairs_pre_existing_multi_master() {
+    // Codex d1c1de5 catch: pre-existing multi-master configs
+    // (writable by today's buggy `set-role` / `add --role
+    // master`) must be repaired by promote. Post-state must
+    // have exactly one master regardless of how many existed
+    // before.
+    let env = Env::new();
+    // Hand-write the buggy state — 3 masters + 1 reviewer.
+    write_repo_config(
+        env.repo(),
+        &RepoConfigFile {
+            agents: Some(vec![
+                clank::cli::config::DefaultAgent {
+                    label: AgentLabel::parse("alice").unwrap(),
+                    role: Role::Master,
+                    tool: Some(clank_core::vocab::Tool::Claude),
+                    launch: None,
+                    initial_prompt: None,
+                },
+                clank::cli::config::DefaultAgent {
+                    label: AgentLabel::parse("bob").unwrap(),
+                    role: Role::Master,
+                    tool: Some(clank_core::vocab::Tool::Codex),
+                    launch: None,
+                    initial_prompt: None,
+                },
+                clank::cli::config::DefaultAgent {
+                    label: AgentLabel::parse("carol").unwrap(),
+                    role: Role::Master,
+                    tool: Some(clank_core::vocab::Tool::Claude),
+                    launch: None,
+                    initial_prompt: None,
+                },
+                clank::cli::config::DefaultAgent {
+                    label: AgentLabel::parse("dave").unwrap(),
+                    role: Role::Reviewer,
+                    tool: Some(clank_core::vocab::Tool::Codex),
+                    launch: None,
+                    initial_prompt: None,
+                },
+            ]),
+            ..Default::default()
+        },
+    );
+
+    let out = env.agent(&["promote", "dave"]);
+    assert!(
+        out.status.success(),
+        "promote-repair failed: stderr=`{}`",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    // All three prior masters must appear in the demoted list.
+    for prev in ["alice", "bob", "carol"] {
+        assert!(
+            stderr.contains(prev),
+            "demoted list must include {prev}; got: {stderr}"
+        );
+    }
+    assert!(stderr.contains("promoted") && stderr.contains("dave"));
+
+    // Post-state must have exactly one master (dave), all
+    // others reviewers.
+    let repo = read_repo_config(env.repo());
+    let agents = repo.agents.unwrap();
+    let masters: Vec<_> = agents.iter().filter(|e| e.role == Role::Master).collect();
+    assert_eq!(
+        masters.len(),
+        1,
+        "post-state must have exactly one master; got {} ({:?})",
+        masters.len(),
+        masters.iter().map(|e| e.label.as_str()).collect::<Vec<_>>()
+    );
+    assert_eq!(masters[0].label.as_str(), "dave");
+}
+
+#[test]
+fn clank_agent_promote_errors_when_label_absent() {
+    let env = Env::new();
+    env.agent(&["add", "alice", "--tool", "claude"]);
+
+    let out = env.agent(&["promote", "phantom"]);
+    assert!(!out.status.success(), "promote of missing label must error");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("phantom") && stderr.contains("not in repo-scope"));
+}
+
+// ── add --role master enforces the same invariant ────────────────
+
+#[test]
+fn clank_agent_add_role_master_with_no_existing_master() {
+    let env = Env::new();
+    env.agent(&["add", "alice", "--tool", "claude"]); // reviewer
+
+    let out = env.agent(&["add", "bob", "--tool", "codex", "--role", "master"]);
+    assert!(out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("registered") && stderr.contains("bob"));
+    assert!(
+        !stderr.contains("demoted"),
+        "no existing master → no demoted suffix; got: {stderr}"
+    );
+
+    let repo = read_repo_config(env.repo());
+    let agents = repo.agents.unwrap();
+    let alice = agents.iter().find(|e| e.label.as_str() == "alice").unwrap();
+    let bob = agents.iter().find(|e| e.label.as_str() == "bob").unwrap();
+    assert_eq!(alice.role, Role::Reviewer);
+    assert_eq!(bob.role, Role::Master);
+}
+
+#[test]
+fn clank_agent_add_role_master_demotes_existing_master() {
+    let env = Env::new();
+    env.agent(&["add", "alice", "--tool", "claude", "--role", "master"]);
+
+    let out = env.agent(&["add", "bob", "--tool", "codex", "--role", "master"]);
+    assert!(out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("demoted") && stderr.contains("alice"),
+        "add of second master must demote first; got: {stderr}"
+    );
+
+    let repo = read_repo_config(env.repo());
+    let agents = repo.agents.unwrap();
+    let alice = agents.iter().find(|e| e.label.as_str() == "alice").unwrap();
+    let bob = agents.iter().find(|e| e.label.as_str() == "bob").unwrap();
+    assert_eq!(alice.role, Role::Reviewer);
+    assert_eq!(bob.role, Role::Master);
+}
+
+#[test]
+fn clank_agent_add_role_master_repairs_pre_existing_multi_master() {
+    // Codex a71bd8e catch (the architectural inconsistency
+    // resolution): `add --role master` enforces the same
+    // unique-master invariant as promote. Pre-existing multi-
+    // master configs are repaired on the next master-add.
+    let env = Env::new();
+    write_repo_config(
+        env.repo(),
+        &RepoConfigFile {
+            agents: Some(vec![
+                clank::cli::config::DefaultAgent {
+                    label: AgentLabel::parse("alice").unwrap(),
+                    role: Role::Master,
+                    tool: Some(clank_core::vocab::Tool::Claude),
+                    launch: None,
+                    initial_prompt: None,
+                },
+                clank::cli::config::DefaultAgent {
+                    label: AgentLabel::parse("bob").unwrap(),
+                    role: Role::Master,
+                    tool: Some(clank_core::vocab::Tool::Codex),
+                    launch: None,
+                    initial_prompt: None,
+                },
+            ]),
+            ..Default::default()
+        },
+    );
+
+    let out = env.agent(&["add", "carol", "--tool", "claude", "--role", "master"]);
+    assert!(
+        out.status.success(),
+        "add-repair failed: stderr=`{}`",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    for prev in ["alice", "bob"] {
+        assert!(
+            stderr.contains(prev),
+            "demoted list must include {prev}; got: {stderr}"
+        );
+    }
+
+    let repo = read_repo_config(env.repo());
+    let agents = repo.agents.unwrap();
+    let masters: Vec<_> = agents.iter().filter(|e| e.role == Role::Master).collect();
+    assert_eq!(
+        masters.len(),
+        1,
+        "post-state must have exactly one master after add-repair"
+    );
+    assert_eq!(masters[0].label.as_str(), "carol");
+}
+
+#[test]
+fn clank_agent_add_role_reviewer_does_not_demote_master() {
+    // Regression guard: the unique-master helper only fires
+    // when the NEW entry's role is master.
+    let env = Env::new();
+    env.agent(&["add", "alice", "--tool", "claude", "--role", "master"]);
+
+    let out = env.agent(&["add", "bob", "--tool", "codex"]); // reviewer
+    assert!(out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !stderr.contains("demoted"),
+        "add --role reviewer must NOT demote anyone; got: {stderr}"
+    );
+
+    let repo = read_repo_config(env.repo());
+    let agents = repo.agents.unwrap();
+    let alice = agents.iter().find(|e| e.label.as_str() == "alice").unwrap();
+    let bob = agents.iter().find(|e| e.label.as_str() == "bob").unwrap();
+    assert_eq!(alice.role, Role::Master);
+    assert_eq!(bob.role, Role::Reviewer);
 }

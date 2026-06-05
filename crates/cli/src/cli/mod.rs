@@ -694,9 +694,11 @@ pub enum AgentCmd {
     /// Remove an agent from the declaration. Per-agent skeleton
     /// directory + feedback history are preserved.
     Remove(AgentRemoveArgs),
-    /// Change an existing agent's role in the declaration.
-    #[command(name = "set-role")]
-    SetRole(AgentSetRoleArgs),
+    /// Promote an agent to master in the declaration. Atomically
+    /// demotes any other masters to reviewer — the post-condition
+    /// is "exactly one master in the targeted scope" regardless
+    /// of pre-state. Repairs pre-existing multi-master configs.
+    Promote(AgentPromoteArgs),
 }
 
 #[derive(Args, Debug)]
@@ -784,14 +786,11 @@ pub struct AgentRemoveArgs {
 }
 
 #[derive(Args, Debug)]
-pub struct AgentSetRoleArgs {
-    /// Agent label to update.
+pub struct AgentPromoteArgs {
+    /// Agent label to promote to master.
     pub label: String,
-    /// New role.
-    #[arg(value_enum)]
-    pub role: RoleArg,
-    /// Edit the user-scope `default_agents` entry instead of the
-    /// repo-scope `agents` entry.
+    /// Promote in the user-scope `default_agents` instead of the
+    /// repo-scope `agents`.
     #[arg(long)]
     pub global: bool,
     /// Repo root. Defaults to the cwd's git toplevel.

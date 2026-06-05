@@ -248,8 +248,8 @@ fn open_zellij_multiple_masters_errors_with_diagnostic() {
         "multi-master diagnostic must list BOTH masters; got: {stderr}"
     );
     assert!(
-        stderr.contains("clank agent set-role"),
-        "diagnostic should suggest set-role; got: {stderr}"
+        stderr.contains("clank agent promote"),
+        "diagnostic should suggest promote; got: {stderr}"
     );
 }
 

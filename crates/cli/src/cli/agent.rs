@@ -24,7 +24,7 @@ use clank_core::vocab::{AutoMode, Role, Tool};
 use std::collections::BTreeMap;
 
 use super::{
-    AgentAddArgs, AgentArgs, AgentCmd, AgentListArgs, AgentRemoveArgs, AgentSetRoleArgs,
+    AgentAddArgs, AgentArgs, AgentCmd, AgentListArgs, AgentPromoteArgs, AgentRemoveArgs,
     AgentStartArgs, resolve_repo,
 };
 
@@ -34,7 +34,7 @@ pub async fn run(args: AgentArgs) -> anyhow::Result<()> {
         AgentCmd::Start(a) => start(a),
         AgentCmd::Add(a) => add(a),
         AgentCmd::Remove(a) => remove(a),
-        AgentCmd::SetRole(a) => set_role(a),
+        AgentCmd::Promote(a) => promote(a),
     }
 }
 
@@ -499,9 +499,22 @@ fn add(args: AgentAddArgs) -> anyhow::Result<()> {
         let mut file = read_user_config(home_ref)?;
         let mut agents = file.default_agents.unwrap_or_default();
         agents.push(entry);
+        // Plan: agent-promote-replaces-set-role — `add --role
+        // master` enforces the same unique-master invariant as
+        // `promote`. Reuses the shared helper so both paths
+        // centralize the check.
+        let demoted = if role == Role::Master {
+            ensure_unique_master(&mut agents, &label)
+        } else {
+            Vec::new()
+        };
         file.default_agents = Some(agents);
         write_user_config(home_ref, &file)?;
-        eprintln!("registered `{}` in user-scope `default_agents`", args.label);
+        eprintln!(
+            "registered `{}` in user-scope `default_agents`{}",
+            args.label,
+            format_demoted_suffix(&demoted)
+        );
     } else {
         // Repo-scope add: refuse if already in repo-scope. ALLOW
         // shadowing user-scope (REPLACE semantics) with stderr
@@ -511,6 +524,11 @@ fn add(args: AgentAddArgs) -> anyhow::Result<()> {
         }
         let mut current_repo = repo_set.unwrap_or_default();
         current_repo.push(entry);
+        let demoted = if role == Role::Master {
+            ensure_unique_master(&mut current_repo, &label)
+        } else {
+            Vec::new()
+        };
         // Skeleton write FIRST (idempotent at-rest; preserves
         // existing per-machine state if a prior `clank as` bound
         // a session). Then declaration write. See plan Phase 5.
@@ -524,7 +542,11 @@ fn add(args: AgentAddArgs) -> anyhow::Result<()> {
                 args.label
             );
         }
-        eprintln!("registered `{}` in repo-scope `agents`", args.label);
+        eprintln!(
+            "registered `{}` in repo-scope `agents`{}",
+            args.label,
+            format_demoted_suffix(&demoted)
+        );
     }
     Ok(())
 }
@@ -586,11 +608,47 @@ fn remove(args: AgentRemoveArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// `clank agent set-role <label> <role> [--global]`.
-fn set_role(args: AgentSetRoleArgs) -> anyhow::Result<()> {
+/// Set `new_master`'s role to `Master` and demote every OTHER
+/// entry with `Role::Master` to `Reviewer`. Returns the labels
+/// that were demoted (caller uses these for the diagnostic).
+///
+/// One sweep over the slice. No I/O. This is the single
+/// enforcement point for the "exactly one master per scope"
+/// invariant — `promote` and `add --role master` both go through
+/// it (plan: `agent-promote-replaces-set-role`).
+pub(super) fn ensure_unique_master(
+    agents: &mut [DefaultAgent],
+    new_master: &AgentLabel,
+) -> Vec<AgentLabel> {
+    let mut demoted = Vec::new();
+    for entry in agents.iter_mut() {
+        if entry.label == *new_master {
+            entry.role = Role::Master;
+        } else if entry.role == Role::Master {
+            entry.role = Role::Reviewer;
+            demoted.push(entry.label.clone());
+        }
+    }
+    demoted
+}
+
+fn format_demoted_suffix(demoted: &[AgentLabel]) -> String {
+    if demoted.is_empty() {
+        String::new()
+    } else {
+        let joined = demoted
+            .iter()
+            .map(|l| format!("`{}`", l.as_str()))
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!(" (demoted {joined})")
+    }
+}
+
+/// `clank agent promote <label> [--global]`.
+fn promote(args: AgentPromoteArgs) -> anyhow::Result<()> {
     let label = AgentLabel::parse(&args.label)
         .map_err(|e| anyhow::anyhow!("invalid agent label `{}`: {e}", args.label))?;
-    let new_role: Role = args.role.into();
     let repo = resolve_repo(args.repo.as_deref())?;
     let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
 
@@ -602,38 +660,56 @@ fn set_role(args: AgentSetRoleArgs) -> anyhow::Result<()> {
         let mut agents = file.default_agents.ok_or_else(|| {
             anyhow::anyhow!("agent `{}` not in user-scope `default_agents`", args.label)
         })?;
-        let entry = agents
-            .iter_mut()
-            .find(|e| e.label == label)
-            .ok_or_else(|| {
-                anyhow::anyhow!("agent `{}` not in user-scope `default_agents`", args.label)
-            })?;
-        entry.role = new_role;
+        if !agents.iter().any(|e| e.label == label) {
+            anyhow::bail!("agent `{}` not in user-scope `default_agents`", args.label);
+        }
+        // Detect no-op BEFORE mutating: target is already the only
+        // master in this scope.
+        let already_only_master = agents
+            .iter()
+            .all(|e| (e.label == label) == (e.role == Role::Master));
+        if already_only_master {
+            eprintln!(
+                "note: `{}` is already the only master in user-scope",
+                args.label
+            );
+            return Ok(());
+        }
+        let demoted = ensure_unique_master(&mut agents, &label);
         file.default_agents = Some(agents);
         write_user_config(home_ref, &file)?;
         eprintln!(
-            "set role of `{}` to `{}` in user-scope",
+            "promoted `{}` to master in user-scope{}",
             args.label,
-            new_role.as_str()
+            format_demoted_suffix(&demoted)
         );
     } else {
         let mut file = read_repo_config(&repo)?;
         let mut agents = file.agents.ok_or_else(|| {
             anyhow::anyhow!(
-                "no repo-scope `agents` declaration; nothing to set-role in. Run `clank agent add` first."
+                "no repo-scope `agents` declaration; nothing to promote in. Run `clank agent add` first."
             )
         })?;
-        let entry = agents
-            .iter_mut()
-            .find(|e| e.label == label)
-            .ok_or_else(|| anyhow::anyhow!("agent `{}` not in repo-scope `agents`", args.label))?;
-        entry.role = new_role;
+        if !agents.iter().any(|e| e.label == label) {
+            anyhow::bail!("agent `{}` not in repo-scope `agents`", args.label);
+        }
+        let already_only_master = agents
+            .iter()
+            .all(|e| (e.label == label) == (e.role == Role::Master));
+        if already_only_master {
+            eprintln!(
+                "note: `{}` is already the only master in repo-scope",
+                args.label
+            );
+            return Ok(());
+        }
+        let demoted = ensure_unique_master(&mut agents, &label);
         file.agents = Some(agents);
         write_repo_config(&repo, &file)?;
         eprintln!(
-            "set role of `{}` to `{}` in repo-scope",
+            "promoted `{}` to master in repo-scope{}",
             args.label,
-            new_role.as_str()
+            format_demoted_suffix(&demoted)
         );
     }
     Ok(())
