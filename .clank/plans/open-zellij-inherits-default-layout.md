@@ -105,16 +105,25 @@ single place to look for the fix.
     }
     ```
     No `tab-bar`/`status-bar` panes anymore.
-  - Need a small KDL-aware splicer. Cheapest route: treat
-    the dumped layout as text, find the top-level
-    `layout {` opening brace, walk to its matching `}`,
-    strip any sibling `tab` blocks, insert the clank tab
-    just before the closing `}`. Brace-matching is fine
-    here because KDL block strings can't contain
-    unescaped `{`/`}` (we already escape via
-    `kdl_escape`).
-  - Keep `kdl_escape` and `push_pane` — only the bars and
-    the outer shell change.
+  - **Use the `kdl` crate** to parse the dumped layout into
+    a document tree, manipulate the tree (find the top-level
+    `layout` node, strip any `tab` children, append clank's
+    `tab name="<repo>"` node), then serialize back. Reason
+    (codex bab9a08 catch): the dumped layout is USER
+    INPUT — clank's `kdl_escape` doesn't apply, and KDL
+    string values (`"..."`, raw strings) can legally contain
+    `{`/`}`. A naive brace-walker would mismatch on inputs
+    like `pane name="hello { world }" { ... }`. A real
+    parser is the right defense; the `kdl` crate is small
+    (~150KB compiled) and handles strings, raw strings,
+    comments, and the full KDL grammar correctly.
+  - The clank `tab` node is constructed via the kdl crate's
+    builder API rather than string concatenation. `kdl_escape`
+    becomes unused (real KDL emitter handles escaping). Drop
+    it.
+  - `push_pane` is replaced by a small helper that builds a
+    `KdlNode` for one pane (name, cwd, command, args)
+    rather than appending pre-escaped text to a `String`.
 - Tests in the same file:
   - Update existing `compose_kdl_*` cases — they currently
     assert the presence of `zellij:tab-bar` / `zellij:status-bar`
@@ -138,15 +147,27 @@ single place to look for the fix.
     `layout { tab }` (the built-in default-layout-with-empty-tab
     shape); assert the empty `tab` is stripped before clank's
     tab is inserted.
+  - Add `splice_handles_braces_inside_quoted_strings`
+    (codex bab9a08 catch): fixture base layout has
+    `pane name="hello { world }" { plugin location="x" }` —
+    a string value containing literal `{` and `}`. Assert
+    the splicer correctly identifies the top-level `layout
+    { ... }` block boundary AND does not strip / corrupt the
+    quoted string. This is the regression defense against
+    naive brace-walking.
 
 ## Fallbacks
 
 - `zellij setup --dump-layout default` fails or zellij is
   not on `PATH`: fall back to today's hardcoded layout so
   the command still works in environments without zellij
-  available at compose time. Surface a one-line stderr
-  note: `note: using built-in fallback layout; install
-  zellij or set --base-layout to inherit your default`.
+  available at compose time. Surface a one-line stderr note
+  (codex bab9a08 catch — `--base-layout` was OOS, so the
+  diagnostic only mentions supported actions):
+  `note: zellij not available; using clank's built-in
+  fallback layout. Install zellij and configure
+  default_tab_template in ~/.config/zellij/layouts/default.kdl
+  to inherit your chrome.`
 - `zellij` is installed but the default layout has no
   `default_tab_template`: don't synthesize one — pass it
   through. The user will see a bar-less clank tab, which
