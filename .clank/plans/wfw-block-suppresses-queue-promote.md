@@ -119,3 +119,13 @@ plan-scoped blocks suppress plan items.
 - This plan's gap was empirically demonstrated by my own block
   on `open-zellij-inherits-default-layout` during 2026-06-06:
   block created, queue-promote still firing on every poll.
+
+## Cycle notes
+
+- `9da0243` (this revision): pinned queue-scan +
+  repo-wide-unchanged per codex `f64a974`'s catches. Codex
+  separately flagged that 9da0243 accidentally modified the
+  open-zellij plan body (an in-progress edit from before
+  lloyd blocked that plan). That cross-plan-scope issue was
+  reverted in `5b964fa` (zellij plan body restored to its
+  17475a5 state). This wfw plan's substance is unchanged.
