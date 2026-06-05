@@ -32,41 +32,56 @@ plan-scoped blocks suppress plan items.
 1. **Block scope detection**: today's `BlockEntry.plan: Option<String>`
    carries the plan name when scoped. The queue item's name is
    the same kebab-case identifier. Match by string.
-2. **Suppression in the promote path**: locate the
-   `promote_from_queue` emit site in `wfw.rs` (search for
-   `WaitItem::PromoteFromQueue`). Before emitting, check
-   `suppressed_plans` (the set built by `check_blocks`) — if the
-   queue item's name is in it, skip the emit.
-3. **Repo-wide blocks**: a block with `plan: None` already
-   suppresses all per-plan work via the "repo-wide suppress"
-   path. Extending it to also suppress `promote_from_queue`
-   matches the user's expectation that "I've blocked everything;
-   stop pinging me." Pin at promote-time.
+2. **Suppression in the promote path** (PINNED per codex f64a974):
+   the two promote-emit sites at `wfw.rs:253-265` and
+   `wfw.rs:377-389` currently use `queue.first()`. Replace
+   with `queue.iter().find(|q| !suppressed_plans.contains(&q.name))`
+   — scan to the first UNSUPPRESSED queue item. This handles
+   the "highest-priority item is blocked but lower-priority
+   items aren't" case correctly. A blocked first item should
+   not hide the next unblocked item — that would defeat the
+   purpose of the queue.
+3. **Repo-wide blocks** (PINNED per codex f64a974: behavior
+   UNCHANGED): today, a repo-wide block (`plan: None`) makes
+   wfw park/timeout without emitting a Blocked item — verified
+   by the existing test at `wfw_integration.rs:1684`. **This
+   plan does NOT change that behavior.** The promote path's
+   new scan-for-unsuppressed logic is plan-scope-only. Repo-wide
+   blocks continue to park the entire wfw call (their
+   suppression is upstream of the promote scan and doesn't
+   need this plan's change).
 
 ## Surfaces touched
 
 - `crates/cli/src/cli/wfw.rs`:
   - `check_blocks` builds `suppressed_plans`. Already in place.
-  - The promote-emit site (grep for `PromoteFromQueue`) gains a
-    pre-check: if `suppressed_plans.contains(queue_item.name)`,
-    skip the emit. If there's a separate "repo-wide block
-    present" boolean (from check_blocks), check it too and skip
-    on true.
+  - Two promote-emit sites at `:253-265` and `:377-389`. Each
+    changes from `queue.first()` to
+    `queue.iter().find(|q| !suppressed_plans.contains(&q.name))`.
+    No change to the repo-wide-block code path (which short-
+    circuits earlier).
 
 ## Tests
 
-- `wfw_block_on_queue_item_name_suppresses_promote`: create a
-  queue item `foo`; create a block scoped to plan `foo`; assert
-  `clank wfw --json` does NOT emit `promote_from_queue` for foo.
-  Verify the `Blocked` item still emits.
-- `wfw_repo_wide_block_suppresses_all_promotes`: create two queue
-  items; create a repo-wide block (plan: None); assert no
-  `promote_from_queue` items emitted; the `Blocked` item still
-  emits.
+- `wfw_block_on_queue_item_name_suppresses_promote`: queue item
+  `foo` (only); block scoped to plan `foo`; assert `clank wfw
+  --json` does NOT emit `promote_from_queue` for `foo`. The
+  `Blocked` item itself continues to emit (plan-scoped blocks
+  already emit Blocked items today).
 - `wfw_block_on_different_plan_does_not_suppress_unrelated_promote`:
   queue item `foo`; block scoped to plan `bar`; assert wfw still
-  emits `promote_from_queue` for foo (the block on bar shouldn't
-  hide unrelated work).
+  emits `promote_from_queue` for `foo`. No over-suppression.
+- `wfw_blocked_first_queue_item_still_surfaces_next_unblocked`
+  (codex f64a974 catch — pinned): queue items `foo` (priority
+  100), `bar` (priority 200); block scoped to plan `foo`;
+  assert wfw emits `promote_from_queue` for `bar` (the next
+  unsuppressed item in priority order). A blocked first item
+  must NOT hide later unblocked items — that would defeat the
+  purpose of the queue.
+- Existing `wfw_integration.rs:1684` test (repo-wide block
+  suppresses everything): MUST continue to pass unchanged.
+  Repo-wide block behavior (park/timeout, no Blocked emit) is
+  explicitly preserved by this plan.
 
 ## Out of scope
 
@@ -77,17 +92,22 @@ plan-scoped blocks suppress plan items.
 - Renaming `suppressed_plans` to something queue-aware. The set's
   contents are strings; it can serve both purposes without
   renaming if the comment is updated.
+- Changes to repo-wide block behavior (codex f64a974 pin —
+  repo-wide blocks today park wfw without emitting a Blocked
+  item; this plan preserves that exactly).
 
 ## Acceptance
 
 - Open block scoped to a queued item's name → `clank wfw` does
   NOT emit `promote_from_queue` for that item.
-- Repo-wide open block (plan: None) → `clank wfw` does NOT emit
-  ANY `promote_from_queue` item.
 - Block scoped to plan `bar` does NOT suppress promote of queued
   item `foo` (no over-suppression).
-- The `Blocked` item itself continues to emit as today (so the
-  agent knows there's a block).
+- A blocked HIGHEST-priority queue item does NOT hide a later
+  unblocked item — wfw scans to the first unsuppressed entry.
+- Plan-scoped blocks continue to emit a `Blocked` item alongside
+  the (now-filtered) promote scan, as they do today.
+- Repo-wide block behavior is UNCHANGED — existing
+  `wfw_integration.rs:1684` test passes without modification.
 - `cargo test --workspace` passes.
 
 ## Related
