@@ -503,6 +503,13 @@ fn clank_diff_unconfigured_editor_errors() {
         stderr.contains("no editor configured") && stderr.contains("diff.editor.command"),
         "diagnostic should name diff.editor.command; got: {stderr}"
     );
+    // Codex d861e85: example in the message uses the real CLI
+    // syntax (key-then-action, not action-then-key).
+    assert!(
+        stderr.contains("clank config diff.editor.command set"),
+        "diagnostic must use real CLI syntax `clank config <key> set <value>`, \
+         not the inverted `clank config set <key> <value>` form; got: {stderr}"
+    );
 }
 
 #[test]

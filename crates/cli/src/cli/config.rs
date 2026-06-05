@@ -724,8 +724,12 @@ pub fn get_value(cfg: &Config, key: &str) -> String {
         "diff.wait" => cfg
             .diff
             .wait
-            .map(|b| b.to_string())
-            .unwrap_or_else(|| "null".to_string()),
+            // Catalog default is "false"; report the effective
+            // default (NOT "null") when unset so `clank config`
+            // matches what `clank diff` actually uses (codex
+            // d861e85 caught the catalog/get-value mismatch).
+            .unwrap_or(false)
+            .to_string(),
         _ => "unknown key".to_string(),
     }
 }
@@ -1197,6 +1201,17 @@ mod tests {
         assert_eq!(editor.command.as_deref(), Some("emacsclient"));
         assert_eq!(editor.args, vec!["-c".to_string(), "{patch_file}".into()]);
         assert_eq!(cfg.diff.wait, Some(true));
+    }
+
+    #[test]
+    fn diff_wait_get_returns_effective_default_when_unset() {
+        // Codex d861e85: catalog says default=false; consumer
+        // uses unwrap_or(false). `clank config diff.wait get`
+        // should report "false", not "null", so the user sees
+        // the same value the consumer will use.
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = load_with_home(tmp.path(), None);
+        assert_eq!(get_value(&cfg, "diff.wait"), "false");
     }
 
     #[test]

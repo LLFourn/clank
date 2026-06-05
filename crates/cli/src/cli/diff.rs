@@ -66,10 +66,13 @@ pub async fn run(args: DiffArgs) -> anyhow::Result<()> {
 
     let config = super::config::load(&repo);
     let editor = config.diff.editor.clone().ok_or_else(|| {
+        // CLI syntax is key-then-action, NOT action-then-key.
+        // Codex d861e85 caught the wrong example in this
+        // diagnostic; locked in by an integration test.
         anyhow::anyhow!(
             "no editor configured; set diff.editor.command in ~/.clank/config.json \
              (or your repo's .clank/config.json). Example: \
-             `clank config set diff.editor.command emacsclient`."
+             `clank config diff.editor.command set emacsclient`."
         )
     })?;
 
