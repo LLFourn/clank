@@ -64,23 +64,13 @@ At `clank open zellij` time:
 
 1. Shell out to `zellij setup --dump-layout default` to
    get the user's resolved default layout as KDL on stdout.
-2. Parse the layout via the `kdl` crate. Find the top-level
-   `layout` node, then:
-   a. **Strip empty placeholder tabs only** (codex 17475a5
-      catch). A node counts as "empty placeholder" iff it
-      is a `tab` node with NO entries (no `name="..."`),
-      AND its children list is empty OR contains only a
-      single bare `pane` node with no children. This is the
-      shape the zellij built-in default-layout-with-empty-tab
-      emits. User-defined non-empty tabs (named, multi-pane,
-      with commands) are PRESERVED — they become sibling
-      tabs to clank's in the spawned session.
-   b. Append clank's `tab name="<repo>" { ... }` node as
-      the last child. Result: user's `default_tab_template`
-      (if any) + user's preserved tabs (if any) + clank's
-      tab.
-3. Serialize back via `kdl` and write to
-   `.clank/zellij/layout.kdl`.
+2. Find the top-level `layout {` block via brace-walker;
+   strip any existing `tab` blocks inside it (the user's
+   default may have an empty `tab` placeholder); splice
+   clank's `tab name="<repo>" { ... }` block as a sibling
+   of whatever else is in the layout (panes, plugins,
+   `default_tab_template`, etc. — preserved verbatim).
+3. Write the merged KDL to `.clank/zellij/layout.kdl`.
 4. `zellij --layout <path>` as today.
 
 **Inheritance contract**: clank inherits the user's
