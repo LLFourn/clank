@@ -407,7 +407,7 @@ async fn bootstrap_agent_identity(
     } else if has_existing_master {
         if interactive {
             prompt_yes_no(
-                "Default this agent to master role (vs reviewers)? [y/N] ",
+                "Default this agent to master role (vs reviewer)? [y/N] ",
                 false,
             )?
         } else {

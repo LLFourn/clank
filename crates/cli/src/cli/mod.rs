@@ -97,7 +97,7 @@ pub struct InitArgs {
     pub repo: Option<PathBuf>,
     /// Skip the interactive agent-identity prompts (phase 2)
     /// and accept defaults: label = tool name (claude/codex),
-    /// role = reviewers. Useful for scripts.
+    /// role = reviewer. Useful for scripts.
     #[arg(short = 'y', long)]
     pub yes: bool,
     /// Overwrite an existing foreign `post-rewrite` hook.
@@ -253,7 +253,7 @@ pub struct WfwArgs {
     pub author: Option<String>,
     /// Which side of the workflow this caller plays. Optional:
     /// defaults to `master` iff the resolved label matches
-    /// `.clank/config.json`'s `master` field, else `reviewers`.
+    /// `.clank/config.json`'s `master` field, else `reviewer`.
     #[arg(long, value_enum)]
     pub role: Option<WfwRole>,
     /// Restrict watch / report to one plan (same parser as
@@ -509,9 +509,9 @@ pub enum AutoCmd {
 pub struct AutoOnArgs {
     #[arg(long, value_name = "PATH")]
     pub repo: Option<PathBuf>,
-    /// Designate this agent as `master` or `reviewers` for the
+    /// Designate this agent as `master` or `reviewer` for the
     /// repo. `master` writes `.clank/config.json` with this
-    /// label; `reviewers` clears master only if this agent
+    /// label; `reviewer` clears master only if this agent
     /// currently holds it.
     #[arg(long, value_enum)]
     pub role: Option<RoleArg>,
@@ -671,8 +671,8 @@ pub struct AgentStartArgs {
 pub struct AgentAddArgs {
     /// Agent label to register.
     pub label: String,
-    /// Role for this agent. Defaults to `reviewers`.
-    #[arg(long, value_enum, default_value = "reviewers")]
+    /// Role for this agent. Defaults to `reviewer`.
+    #[arg(long, value_enum, default_value = "reviewer")]
     pub role: RoleArg,
     /// Tool this agent runs. Defaults to `claude`.
     #[arg(long, value_enum, default_value = "claude")]
