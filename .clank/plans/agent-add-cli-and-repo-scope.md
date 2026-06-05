@@ -84,12 +84,12 @@ Two filesystem writes per add: the list entry in the chosen config.json AND the 
 Decision (ruthless review 55f14f2): **"doctor as recovery surface" pattern**, not in-process rollback.
 
 1. **Pre-checks (in-memory)**: label not in the list at the chosen scope; if `--global`, label also not in repo-scope's list (cross-direction collision → REFUSE). If repo-scope add and label already in user-scope's list, ALLOW + stderr notice ("repo-scope `<label>` shadows user-scope default") — REPLACE semantics naturally permit shadowing.
-2. **Skeleton write first** (when target = repo): `mkdir -p` + `write_atomic` (tempfile + rename). Idempotent at-rest if the dir already exists from a prior `clank as <label>` binding — overwrite the config.json with the new role + launch fields.
-3. **List entry write** (tempfile + atomic rename on the parent config.json).
+2. **Skeleton write first** (when target = repo): `mkdir -p` + `write_atomic` (tempfile + rename) for the per-machine skeleton. Per Phase 1, the skeleton holds ONLY per-machine state (`auto_mode`, `wfw_timeout`, `session`) — role and launch live in the declaration. If a prior `clank as <label>` binding already created the skeleton, **preserve existing `session` + `auto_mode` + `wfw_timeout` values**; only write a skeleton when none exists (or backfill missing fields with defaults). Never clobber session state from this command. Codex caught the contradiction with the old "overwrite with role + launch" instruction on b13122d.
+3. **List entry write** (tempfile + atomic rename on the parent config.json) — writes the FULL `DefaultAgent` (label, role, tool, launch) per Phase 4.
 
 If step 3 fails, the skeleton dir is left in place. **Doctor catches both inconsistency directions**:
-- Existing check (already shipped): "merged set non-empty but `<repo>/.clank/agents/` is empty" → Warn.
-- New check (this plan): per-agent dir present but label NOT in repo-scope `agents` list → Warn with diagnostic "found `.clank/agents/<label>/config.json` but `<label>` not in repo-scope `agents` list; run `clank agent add <label>` to register, or remove the directory."
+- Existing check (already shipped): "merged declaration set non-empty but `<repo>/.clank/agents/` is empty" → Warn.
+- New check (this plan): per-agent dir present but label NOT in the **merged declaration** (NOT just repo-scope `agents`) → Warn with diagnostic "found `.clank/agents/<label>/config.json` but `<label>` not in the merged agent declaration (neither repo-scope `agents` nor user-scope `default_agents`); run `clank agent add <label>` to register, or remove the directory." Codex caught the wrong-scope check on b13122d.
 
 This accepts that single-process atomicity over two fs entries isn't free and lets doctor surface inconsistency. The alternative (best-effort rollback on step-3 failure) has its own failure modes (rollback can itself fail) and adds code complexity for a rare path.
 
@@ -100,8 +100,8 @@ When NO `--launch-*` flag is passed: declaration's `launch` field is `None` (not
 ### Phase 7: Doctor checks (additions)
 
 - **Per-agent Warn** (not aggregated) so each missing/orphan entry is actionable.
-- **Missing skeleton diagnostic**: "agent `<label>` in repo-scope `agents` list but `.clank/agents/<label>/config.json` missing; run `clank init` to seed the skeleton."
-- **Orphan skeleton diagnostic**: "found `.clank/agents/<label>/config.json` but `<label>` not registered in repo-scope `agents` list; run `clank agent add <label>` to register, or `rm -rf` the directory to remove it."
+- **Missing skeleton diagnostic**: "agent `<label>` in merged declaration but `.clank/agents/<label>/config.json` missing; run `clank init` to seed the skeleton." The check walks the merged declaration (repo-scope `agents` if present, else user-scope `default_agents`), NOT just repo-scope.
+- **Orphan skeleton diagnostic**: "found `.clank/agents/<label>/config.json` but `<label>` not in the merged declaration (neither repo-scope `agents` nor user-scope `default_agents`); run `clank agent add <label>` to register, or `rm -rf` the directory to remove it."
 
 ## Verified before promotion (resolved 2026-06-05)
 
