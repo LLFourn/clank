@@ -80,6 +80,7 @@ fn run_start(repo: &Path, args: &[&str]) -> std::process::Output {
         .arg("start")
         .arg("--repo")
         .arg(repo)
+        .env("HOME", repo) // isolate from user-scope default_agents
         .args(args);
     cmd.output().expect("spawn clank agent start")
 }
@@ -107,6 +108,7 @@ fn agent(
         role,
         tool,
         launch,
+        initial_prompt: None,
     }
 }
 
@@ -394,5 +396,55 @@ fn agent_start_propagates_malformed_declaration_error() {
     assert!(
         stderr.contains("parsing") || stderr.contains("config") || stderr.contains("json"),
         "stderr should explain the parse failure; got: {stderr}"
+    );
+}
+
+#[test]
+fn agent_start_initial_prompt_lands_in_composed_print() {
+    // Acceptance criterion: `clank agent start <label> --print`
+    // for an agent with auto_mode=On (no explicit initial_prompt)
+    // shows the default prompt as the trailing positional arg.
+    let dir = init_repo();
+    let repo = dir.path();
+    // Skeleton: auto_mode = On + bound claude session.
+    let cfg = clank_core::agent_config::AgentConfig {
+        auto_mode: clank_core::vocab::AutoMode::On,
+        role: clank_core::vocab::Role::Reviewer,
+        wfw_timeout: None,
+        session: Some(clank_core::agent_config::Session {
+            id: clank_core::ids::SessionId::parse(CLAUDE_SESSION).unwrap(),
+            tool: clank_core::vocab::Tool::Claude,
+            updated_at: "2026-06-04T12:00:00Z".to_string(),
+        }),
+        launch: None,
+    };
+    clank::agent_store::save_agent_config(
+        repo,
+        &clank_core::ids::AgentLabel::parse("claude").unwrap(),
+        &cfg,
+    )
+    .unwrap();
+    // Declaration: minimal — no explicit initial_prompt.
+    write_repo_agents(
+        repo,
+        &[agent(
+            "claude",
+            clank_core::vocab::Role::Reviewer,
+            Some(clank_core::vocab::Tool::Claude),
+            None,
+        )],
+    );
+
+    let out = run_start(repo, &["claude", "--print"]);
+    assert!(
+        out.status.success(),
+        "--print failed: stderr=`{}`",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let trimmed = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    let expected = format!("'claude' '--resume' '{CLAUDE_SESSION}' 'Session resumed.'");
+    assert_eq!(
+        trimmed, expected,
+        "auto_mode=On + no explicit prompt → default 'Session resumed.' as trailing arg; got: `{trimmed}`"
     );
 }

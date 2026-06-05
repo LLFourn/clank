@@ -20,7 +20,7 @@ use crate::agent_store::{agent_config_path, load_agent_config, save_agent_config
 use crate::cli::config::{DefaultAgent, RepoConfigFile, UserConfigFile};
 use clank_core::agent_config::{AgentConfig, LaunchConfig, Session};
 use clank_core::ids::AgentLabel;
-use clank_core::vocab::{Role, Tool};
+use clank_core::vocab::{AutoMode, Role, Tool};
 use std::collections::BTreeMap;
 
 use super::{
@@ -186,12 +186,17 @@ fn start(args: AgentStartArgs) -> anyhow::Result<()> {
     // the user puzzled why `--skill X` wasn't applied. Codex caught
     // the unwrap_or_default on eef4c49.
     let merged = crate::cli::config::load_merged_agents(&repo, home.as_deref())?;
-    let declaration_launch = merged
-        .iter()
-        .find(|e| e.label == label)
-        .and_then(|e| e.launch.as_ref());
+    let entry = merged.iter().find(|e| e.label == label);
+    let declaration_launch = entry.and_then(|e| e.launch.as_ref());
+    let declaration_prompt = entry.and_then(|e| e.initial_prompt.as_deref());
+    let resolved_prompt = resolve_initial_prompt(declaration_prompt, cfg.auto_mode);
 
-    let composed = compose_launch(&repo, session, declaration_launch);
+    let composed = compose_launch(
+        &repo,
+        session,
+        declaration_launch,
+        resolved_prompt.as_deref(),
+    );
 
     if args.print {
         print_composed(&composed);
@@ -209,7 +214,53 @@ struct ComposedLaunch {
     env_overrides: std::collections::BTreeMap<String, String>,
 }
 
-fn compose_launch(repo: &Path, session: &Session, launch: Option<&LaunchConfig>) -> ComposedLaunch {
+/// Default `initial_prompt` when `auto_mode == On` and the
+/// declaration's `initial_prompt` field is unset. Verbatim per
+/// `agent-start-initial-prompt` Phase 3:
+/// - Triggers turn-end with minimum surface (both tools produce
+///   a one-line ack).
+/// - Does NOT instruct the agent to run `clank wfw` itself (the
+///   stop hook is the orchestrator; double-trigger to avoid).
+/// - Does NOT expose orchestration internals (no "stop hook",
+///   no "work loop") — agent only learns contextual location.
+///
+/// Test `resolve_initial_prompt_uses_default_when_auto_on_and_declaration_unset`
+/// asserts on this string with `assert_eq!`, so a tweak fails
+/// the test deliberately.
+pub(super) const DEFAULT_AUTO_PROMPT: &str = "Session resumed.";
+
+/// Resolve the initial prompt for an agent-start invocation.
+///
+/// Three-input policy:
+/// - `declaration`: `DefaultAgent.initial_prompt`. `Some("")`
+///    means "explicitly disable" — falls back to None, NOT
+///    Some("") through. Lets a user with auto_mode=On opt out
+///    of the prompt without disabling auto_mode itself.
+/// - `auto_mode`: per-machine preference from the agent skeleton.
+///    When On, supplies the [`DEFAULT_AUTO_PROMPT`] fallback.
+/// - Returns the resolved prompt or None.
+pub(super) fn resolve_initial_prompt(
+    declaration: Option<&str>,
+    auto_mode: AutoMode,
+) -> Option<String> {
+    if let Some(s) = declaration {
+        if s.is_empty() {
+            return None;
+        }
+        return Some(s.to_string());
+    }
+    if auto_mode == AutoMode::On {
+        return Some(DEFAULT_AUTO_PROMPT.to_string());
+    }
+    None
+}
+
+fn compose_launch(
+    repo: &Path,
+    session: &Session,
+    launch: Option<&LaunchConfig>,
+    initial_prompt: Option<&str>,
+) -> ComposedLaunch {
     let tool = session.tool;
     let program = launch
         .and_then(|l| l.command.clone())
@@ -221,6 +272,9 @@ fn compose_launch(repo: &Path, session: &Session, launch: Option<&LaunchConfig>)
 
     let mut args = launch_args;
     args.extend(session_restore);
+    if let Some(prompt) = initial_prompt {
+        args.push(prompt.to_string());
+    }
 
     let env_overrides = launch.map(|l| l.env.clone()).unwrap_or_default();
 
@@ -233,7 +287,11 @@ fn compose_launch(repo: &Path, session: &Session, launch: Option<&LaunchConfig>)
 
 /// Tool-specific session-restore suffix. Goes AFTER `launch.args`
 /// so codex's `resume` subcommand doesn't capture them (see Phase
-/// B step 3 of the plan).
+/// B step 3 of the plan). The initial prompt (when present) is
+/// appended by [`compose_launch`] AFTER this suffix — for codex
+/// that means the prompt is the final positional, AFTER `--cd
+/// <repo>` (clap parses options + positionals independently, so
+/// the option/positional ordering is flexible).
 fn session_restore_args(tool: Tool, session_id: &str, repo: &Path) -> Vec<String> {
     match tool {
         Tool::Claude => vec!["--resume".into(), session_id.into()],
@@ -337,6 +395,7 @@ fn add(args: AgentAddArgs) -> anyhow::Result<()> {
         role,
         tool: Some(tool),
         launch,
+        initial_prompt: args.initial_prompt.clone(),
     };
 
     // Pre-checks (in-memory, no writes yet). Use declaration-only
@@ -623,6 +682,112 @@ mod tests {
             tool: Tool::Claude,
             updated_at: "2026-06-04T12:00:00Z".to_string(),
         }
+    }
+
+    // ── compose_launch initial-prompt tests ────────────────────
+
+    fn claude_session() -> Session {
+        Session {
+            id: clank_core::ids::SessionId::parse("aaaaaaaa-1111-2222-3333-444444444444").unwrap(),
+            tool: Tool::Claude,
+            updated_at: "2026-06-04T12:00:00Z".to_string(),
+        }
+    }
+
+    fn codex_session() -> Session {
+        Session {
+            id: clank_core::ids::SessionId::parse("bbbbbbbb-1111-2222-3333-444444444444").unwrap(),
+            tool: Tool::Codex,
+            updated_at: "2026-06-04T12:00:00Z".to_string(),
+        }
+    }
+
+    #[test]
+    fn compose_launch_appends_initial_prompt_when_set() {
+        let s = claude_session();
+        let c = compose_launch(Path::new("/repo"), &s, None, Some("custom prompt"));
+        assert_eq!(
+            c.args.last().map(|s| s.as_str()),
+            Some("custom prompt"),
+            "trailing arg should be the prompt; got: {:?}",
+            c.args
+        );
+    }
+
+    #[test]
+    fn compose_launch_omits_prompt_when_none() {
+        let s = claude_session();
+        let c = compose_launch(Path::new("/repo"), &s, None, None);
+        // Current behavior preserved exactly: trailing arg is the session id, no prompt.
+        assert_eq!(
+            c.args.last().map(|s| s.as_str()),
+            Some("aaaaaaaa-1111-2222-3333-444444444444"),
+            "no trailing prompt should be appended; got: {:?}",
+            c.args
+        );
+    }
+
+    #[test]
+    fn compose_launch_codex_prompt_is_final_positional_after_cd() {
+        // For codex, --cd <repo> comes from session_restore_args
+        // BEFORE the prompt. The prompt is the final positional.
+        let s = codex_session();
+        let c = compose_launch(Path::new("/repo"), &s, None, Some("ack"));
+        // Expected: ["resume", "<id>", "--cd", "/repo", "ack"]
+        assert_eq!(c.args.last().map(|s| s.as_str()), Some("ack"));
+        // --cd <repo> appears before the prompt.
+        let cd_pos = c.args.iter().position(|s| s == "--cd").unwrap();
+        let prompt_pos = c.args.iter().position(|s| s == "ack").unwrap();
+        assert!(
+            cd_pos < prompt_pos,
+            "--cd must come before prompt; argv: {:?}",
+            c.args
+        );
+    }
+
+    // ── resolve_initial_prompt policy tests ────────────────────
+
+    #[test]
+    fn resolve_initial_prompt_uses_declaration_field_when_set() {
+        let out = resolve_initial_prompt(Some("foo"), AutoMode::Off);
+        assert_eq!(out, Some("foo".to_string()));
+    }
+
+    #[test]
+    fn resolve_initial_prompt_uses_default_when_auto_on_and_declaration_unset() {
+        // Pinned: exact equality against the constant so a future
+        // tweak to DEFAULT_AUTO_PROMPT fails the test deliberately.
+        let out = resolve_initial_prompt(None, AutoMode::On);
+        assert_eq!(out, Some("Session resumed.".to_string()));
+    }
+
+    #[test]
+    fn resolve_initial_prompt_returns_none_when_auto_off_and_declaration_unset() {
+        let out = resolve_initial_prompt(None, AutoMode::Off);
+        assert_eq!(out, None);
+    }
+
+    #[test]
+    fn resolve_initial_prompt_declaration_wins_over_auto_default() {
+        let out = resolve_initial_prompt(Some("custom"), AutoMode::On);
+        assert_eq!(out, Some("custom".to_string()));
+    }
+
+    #[test]
+    fn resolve_initial_prompt_empty_declaration_string_disables_prompt() {
+        // Ruthless 0fe1567 pin: Some("") is the explicit-disable
+        // escape hatch. Without this, the only way to opt out of
+        // the auto_mode default would be to disable auto_mode
+        // itself — coupling two unrelated concerns.
+        let out = resolve_initial_prompt(Some(""), AutoMode::On);
+        assert_eq!(out, None);
+    }
+
+    #[test]
+    fn resolve_initial_prompt_empty_declaration_string_disables_prompt_under_auto_off() {
+        // Declaration is authoritative regardless of auto_mode.
+        let out = resolve_initial_prompt(Some(""), AutoMode::Off);
+        assert_eq!(out, None);
     }
 
     #[test]

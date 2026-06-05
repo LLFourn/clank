@@ -57,6 +57,7 @@ fn agent(label: &str, role: Role) -> DefaultAgent {
         role,
         tool: None,
         launch: None,
+        initial_prompt: None,
     }
 }
 

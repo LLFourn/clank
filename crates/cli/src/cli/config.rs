@@ -173,6 +173,22 @@ pub struct DefaultAgent {
     /// `clank agent start` to compose the executed command.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub launch: Option<LaunchConfig>,
+    /// Initial prompt passed to the resumed tool. When `Some(s)`
+    /// with non-empty `s`, `clank agent start <label>` appends
+    /// the string as a trailing positional after session-restore,
+    /// e.g. `claude --resume <id> "<s>"`. When `Some("")` the
+    /// prompt is explicitly disabled (escape hatch — opt out of
+    /// the auto_mode=On default without disabling auto_mode
+    /// itself; ruthless 0fe1567 pin). When `None`, the auto_mode
+    /// default applies: `Session resumed.` when auto_mode=On,
+    /// no prompt when auto_mode=Off.
+    ///
+    /// NOT a launch sub-field (codex 527eaec pin): LaunchConfig
+    /// is shared with `Config.diff.editor` and its docstring
+    /// directs adding new fields here rather than overloading
+    /// the shared profile.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub initial_prompt: Option<String>,
 }
 
 /// Repo-scope `<repo>/.clank/config.json` deserialization wrapper
@@ -488,6 +504,7 @@ fn load_legacy_skeleton_agents(repo_root: &Path) -> anyhow::Result<Vec<DefaultAg
             role: cfg.role,
             tool: cfg.session.as_ref().map(|s| s.tool),
             launch: cfg.launch.clone(),
+            initial_prompt: None,
         });
     }
     // Stable order.

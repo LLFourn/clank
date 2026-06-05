@@ -736,6 +736,14 @@ pub struct AgentAddArgs {
     /// the inherited environment on key collision.
     #[arg(long = "launch-env", value_name = "KEY=VAL")]
     pub launch_envs: Vec<String>,
+    /// Initial prompt passed to the resumed tool as a trailing
+    /// positional. Pass `""` to explicitly disable the prompt
+    /// (escape hatch when `auto_mode == On` but you don't want
+    /// the default `Session resumed.` prompt). Unset = follow
+    /// auto_mode default. NOT a `--launch-*` flag because the
+    /// field lives on `DefaultAgent`, not `LaunchConfig`.
+    #[arg(long, value_name = "STRING")]
+    pub initial_prompt: Option<String>,
     /// Repo root. Defaults to the cwd's git toplevel.
     #[arg(long, value_name = "PATH")]
     pub repo: Option<PathBuf>,

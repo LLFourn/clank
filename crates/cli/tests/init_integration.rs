@@ -128,6 +128,7 @@ fn user_agent(label: &str) -> clank::cli::config::DefaultAgent {
         role: clank_core::vocab::Role::default(),
         tool: None,
         launch: None,
+        initial_prompt: None,
     }
 }
 
@@ -335,6 +336,7 @@ fn init_seeds_master_role_when_specified() {
                     role: clank_core::vocab::Role::Master,
                     tool: None,
                     launch: None,
+                    initial_prompt: None,
                 },
                 user_agent("bob"),
             ]),
@@ -489,6 +491,7 @@ fn init_seeded_master_flips_calling_agent_to_reviewers() {
                 role: clank_core::vocab::Role::Master,
                 tool: None,
                 launch: None,
+                initial_prompt: None,
             }]),
             ..Default::default()
         },

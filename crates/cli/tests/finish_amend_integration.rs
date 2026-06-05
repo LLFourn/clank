@@ -150,6 +150,7 @@ fn finish_rejects_approve_without_finished() {
             role: clank_core::vocab::Role::Reviewer,
             tool: None,
             launch: None,
+            initial_prompt: None,
         }]),
     };
     write(

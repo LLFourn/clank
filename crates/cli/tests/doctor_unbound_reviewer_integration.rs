@@ -76,6 +76,7 @@ fn register_agents(repo: &Path, agents: &[(&str, clank_core::vocab::Role)]) {
             role: *role,
             tool: None,
             launch: None,
+            initial_prompt: None,
         })
         .collect();
     let file = clank::cli::config::RepoConfigFile {
@@ -102,6 +103,7 @@ fn register_agent_with_launch(
             role,
             tool: None,
             launch: Some(launch),
+            initial_prompt: None,
         }]),
         ..Default::default()
     };

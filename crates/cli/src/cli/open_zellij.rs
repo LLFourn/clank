@@ -225,6 +225,7 @@ mod tests {
             role,
             tool: None,
             launch: None,
+            initial_prompt: None,
         }
     }
 
@@ -400,6 +401,7 @@ mod tests {
             role: Role::Master,
             tool: None,
             launch: None,
+            initial_prompt: None,
         };
         let kdl = compose_kdl(TEST_TAB, TEST_REPO, &master, &[]);
         // The raw `"name"` text MUST appear escaped, not as a

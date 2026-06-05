@@ -41,6 +41,7 @@ fn init_repo() -> tempfile::TempDir {
             role: clank_core::vocab::Role::Reviewer,
             tool: None,
             launch: None,
+            initial_prompt: None,
         }],
     );
     dir

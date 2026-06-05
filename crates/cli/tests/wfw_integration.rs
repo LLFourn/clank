@@ -58,6 +58,7 @@ fn register_reviewer(repo: &Path, label: &str) {
             role: clank_core::vocab::Role::Reviewer,
             tool: None,
             launch: None,
+            initial_prompt: None,
         };
         f.agents.get_or_insert_with(Vec::new).push(entry);
     });

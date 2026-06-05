@@ -76,6 +76,7 @@ fn agent_decl(label: &str, role: clank_core::vocab::Role) -> clank::cli::config:
         role,
         tool: None,
         launch: None,
+        initial_prompt: None,
     }
 }
 

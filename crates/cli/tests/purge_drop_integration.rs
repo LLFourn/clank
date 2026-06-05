@@ -43,6 +43,7 @@ fn init_repo_with_master() -> tempfile::TempDir {
             role: clank_core::vocab::Role::Master,
             tool: None,
             launch: None,
+            initial_prompt: None,
         }]),
         ..Default::default()
     };
