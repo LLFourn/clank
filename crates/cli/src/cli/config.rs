@@ -275,9 +275,20 @@ pub struct HooksSection {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub blocked: Option<Option<String>>,
     /// Forward-compat catchall for hook event names this build
-    /// doesn't know about yet. Preserved on round-trip.
+    /// doesn't know about yet. `serde_json::Value` (NOT
+    /// `Option<String>`) so a newer clank can write a richer
+    /// hook value shape (e.g. `{"future_hook": {"cmd": "x",
+    /// "env": {...}}}`) and an older clank's read-modify-write
+    /// preserves it intact. Codex caught the regression on
+    /// 2706484: narrowing to `Option<String>` would have made
+    /// `RepoConfigFile` parsing REJECT any non-string/non-null
+    /// unknown hook value — breaking the forward-compat the
+    /// typed round-trip is supposed to provide. The lossy
+    /// `HooksFile` reader (used by `apply_layer`) already
+    /// returns `None` for non-string lookups, so the typed
+    /// `Config.hooks` semantic doesn't change.
     #[serde(flatten, skip_serializing_if = "BTreeMap::is_empty")]
-    pub extra: BTreeMap<String, Option<String>>,
+    pub extra: BTreeMap<String, serde_json::Value>,
 }
 
 /// Round-trip variant of [`ReviewFile`] (which is Deserialize-only).
@@ -1447,7 +1458,7 @@ mod tests {
         assert_eq!(hooks.master_work, Some(Some("echo m".to_string())));
         assert_eq!(
             hooks.extra.get("some_future_event"),
-            Some(&Some("echo future".to_string())),
+            Some(&serde_json::Value::String("echo future".to_string())),
             "unknown hook event must land in hooks.extra; got: {:?}",
             hooks.extra
         );
@@ -1458,6 +1469,47 @@ mod tests {
             out.contains("some_future_event"),
             "forward-compat hook key must survive serialize; got: {out}"
         );
+    }
+
+    #[test]
+    fn hooks_section_forward_compat_preserves_non_string_unknown_hook_value() {
+        // Codex caught on 2706484: HooksSection.extra was typed
+        // as BTreeMap<String, Option<String>>, so any unknown
+        // hook whose value was NOT a string/null would make
+        // serde refuse to parse the file. A newer clank that
+        // writes a richer hook shape (object, array, number)
+        // would have broken an older clank's read-modify-write.
+        //
+        // Fix: extra is BTreeMap<String, serde_json::Value> so
+        // any JSON value round-trips intact.
+        let raw = r#"{
+            "hooks": {
+                "master_work": "echo m",
+                "future_object_hook": {"cmd": "x", "args": ["a", "b"]},
+                "future_array_hook": ["echo", "first", "echo", "second"],
+                "future_number_hook": 42
+            }
+        }"#;
+        let parsed: RepoConfigFile = serde_json::from_str(raw).expect(
+            "non-string unknown hook values must NOT cause deserialize failure — \
+             that would break forward-compat",
+        );
+        let hooks = parsed.hooks.as_ref().expect("hooks section present");
+        // Known typed field still parsed normally.
+        assert_eq!(hooks.master_work, Some(Some("echo m".to_string())));
+        // Non-string values preserved as raw Value.
+        assert!(hooks.extra.get("future_object_hook").unwrap().is_object());
+        assert!(hooks.extra.get("future_array_hook").unwrap().is_array());
+        assert_eq!(
+            hooks.extra.get("future_number_hook").unwrap().as_i64(),
+            Some(42)
+        );
+        // Round-trip preserves them all.
+        let out = serde_json::to_string(&parsed).unwrap();
+        assert!(out.contains("future_object_hook"));
+        assert!(out.contains("future_array_hook"));
+        assert!(out.contains("future_number_hook"));
+        assert!(out.contains("\"cmd\":\"x\""));
     }
 
     #[test]
