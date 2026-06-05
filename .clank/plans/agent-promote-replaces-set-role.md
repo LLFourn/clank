@@ -75,25 +75,44 @@ So no flow regresses.
 ## Surfaces touched
 
 - `crates/cli/src/cli/agent.rs`:
+  - **Shared helper** (codex a71bd8e catch — see "Why this
+    matters" for the invariant argument):
+    ```rust
+    fn ensure_unique_master(
+        agents: &mut [DefaultAgent],
+        new_master: &AgentLabel,
+    ) -> Vec<AgentLabel>;
+    ```
+    Sets `new_master`'s role to Master, sets every OTHER
+    entry with role=Master to Reviewer, returns the
+    labels that were demoted (for diagnostic output). One
+    sweep over the slice. No I/O.
   - Add `fn promote(args: AgentPromoteArgs)` next to the
-    existing `set_role` (~line 590).
-  - Logic: load config in the targeted scope, find
-    `<label>` (error if absent — reuse `set_role`'s
-    not-found error path), collect labels of ALL OTHER
-    entries with `role == Master`. If `<label>` is master
-    AND that collection is empty → no-op. Else: set
-    `<label>` to master AND set every entry in the
-    collected list to reviewer. One write at the end.
-  - Same `--global` / `--repo` flag handling as `set_role`.
+    existing `set_role` (~line 590). Loads config in the
+    targeted scope, finds `<label>` (error if absent —
+    reuse `set_role`'s not-found error path), calls
+    `ensure_unique_master`, writes back. Same
+    `--global` / `--repo` flag handling as `set_role`.
+  - **Update `fn add`** (codex a71bd8e catch — the same
+    invariant must hold on add): when the new entry's
+    role is Master, call `ensure_unique_master` on the
+    in-memory agents list BEFORE writing. Same diagnostic
+    output for any demotions. `add --role reviewer`
+    unchanged (no master-uniqueness implication).
   - On no-op (already the only master):
     `note: \`{label}\` is already the only master in {scope}`
-    to stderr, exit 0.
+    to stderr, exit 0. (promote-only — add can't no-op
+    since it's introducing a new label.)
   - On promotion (zero prior masters):
     `promoted \`{label}\` to master in {scope}`.
   - On promotion (1+ prior masters, repair case included):
     `promoted \`{label}\` to master in {scope} (demoted \`p1\`, \`p2\`, ...)`
     — backticks around each demoted label, comma-separated,
     no trailing "and."
+  - On `add --role master` with existing masters: same
+    `(demoted ...)` suffix appended to the existing
+    `registered \`{label}\` in {scope} \`agents\``
+    message.
 - `crates/cli/src/cli/mod.rs`:
   - Add `AgentCmd::Promote(AgentPromoteArgs)` variant.
   - Remove `AgentCmd::SetRole` and `AgentSetRoleArgs`.
@@ -157,6 +176,28 @@ Integration tests in
   no longer exist (the demote case if there was one;
   the duplicate-master-allowed case).
 
+`agent add --role master` tests (codex a71bd8e catch —
+the same invariant must hold here):
+
+- `clank_agent_add_role_master_with_no_existing_master`:
+  Pre-state: reviewer=A. `add B --role master`. Post:
+  reviewer=A, master=B. Stdout: `registered \`B\` in
+  ... \`agents\`` only (no demoted suffix).
+- `clank_agent_add_role_master_demotes_existing_master`:
+  Pre-state: master=A. `add B --role master`. Post:
+  reviewer=A, master=B. Stdout includes
+  `(demoted \`A\`)`.
+- **`clank_agent_add_role_master_repairs_pre_existing_multi_master`**:
+  Pre-state: master=A, master=B (created by hand-editing
+  the JSON to simulate the buggy state). `add C --role
+  master`. Post: reviewer=A, reviewer=B, master=C.
+  Stdout includes `(demoted \`A\`, \`B\`)`. Same repair
+  semantic as promote's repair test.
+- `clank_agent_add_role_reviewer_does_not_demote_master`
+  (regression guard): Pre-state: master=A. `add B --role
+  reviewer`. Post: master=A, reviewer=B. The shared
+  helper only fires when the new entry's role IS master.
+
 ## CLI surface change
 
 The `clank agent` subcommand list goes from:
@@ -196,14 +237,14 @@ itself errors on half its inputs.
   to `clank_agent_promote_flips_role_in_place` (or
   similar). Today's body just does set-role and asserts
   the role flipped — same semantic under promote.
-- **Confirmed Out-of-scope follow-up is real**:
-  `clank agent add --role master` at `agent.rs:446` does
-  NOT check for an existing master. Adding a second
-  master via `add` is currently possible. Same invariant
-  violation as `set-role <X> master`. This plan does NOT
-  fix that path; a follow-up should make `agent add
-  --role master` invoke the same atomic-promote logic
-  (or delegate to it).
+- **`clank agent add --role master` at `agent.rs:446`** also
+  fails to check for an existing master today — same
+  invariant violation as `set-role <X> master`. **Updated
+  per codex a71bd8e catch**: this plan now covers BOTH
+  paths via the `ensure_unique_master` shared helper.
+  Original out-of-scope carve-out contradicted the plan's
+  "unreachable via CLI" claim; widening the plan resolves
+  the inconsistency.
 
 ## Edge cases
 
@@ -233,11 +274,10 @@ itself errors on half its inputs.
 - A `swap <a> <b>` command. `promote` already handles the
   swap implicitly; an explicit swap is just sugar with
   no extra power.
-- Renaming `agent add --role master` to something else.
-  `add` declares a new agent; "promote on add" is a valid
-  semantic that `add` already gets right (and rejects if
-  the role would create two masters? — verify; if not, a
-  separate plan can add that guard).
+- (removed: the `agent add --role master` carve-out is
+  now in scope per codex a71bd8e — both promote AND add
+  use the `ensure_unique_master` helper. The original
+  carve-out contradicted the invariant claim below.)
 
 ## Why this matters
 
@@ -249,3 +289,15 @@ who holds the master slot." `promote` makes the model
 explicit in the CLI; `set-role` lies about the model and
 defers the violation to a later command that has no
 context for diagnosing it.
+
+**The invariant is unrepresentable via the CLI only if
+BOTH role-mutation paths enforce it** (codex a71bd8e
+catch). Today, both `set-role` and `add --role master`
+violate it. This plan removes `set-role`, replaces it
+with `promote` (which enforces unique-master), AND has
+`add` enforce the same invariant on creation. After this
+plan, no CLI command can produce a two-master state
+regardless of starting state. The shared
+`ensure_unique_master` helper centralizes the invariant
+in one place rather than duplicating the check across
+two code paths — which is how invariant drift starts.
