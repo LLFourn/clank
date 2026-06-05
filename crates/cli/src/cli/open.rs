@@ -6,11 +6,18 @@ use std::path::{Path, PathBuf};
 
 use serde::Serialize;
 
-use super::OpenArgs;
+use super::{OpenArgs, OpenCmd, OpenDryArgs};
 use clank_core::agent_config::AgentConfig;
 use clank_core::vocab::{Role, Tool};
 
 pub async fn run(args: OpenArgs) -> anyhow::Result<()> {
+    match args.command {
+        OpenCmd::Dry(dry) => run_dry(dry).await,
+        OpenCmd::Zellij(zellij) => super::open_zellij::run(zellij).await,
+    }
+}
+
+pub async fn run_dry(args: OpenDryArgs) -> anyhow::Result<()> {
     let response = inspect(&args.path).await?;
     if args.json {
         println!("{}", serde_json::to_string_pretty(&response)?);

@@ -24,6 +24,7 @@ pub mod html_highlight;
 pub mod init;
 pub mod log;
 pub mod open;
+pub mod open_zellij;
 pub mod plan_resolve;
 pub mod purge;
 pub mod queue;
@@ -161,14 +162,50 @@ pub enum HtmlCmd {
     Open,
 }
 
+/// `clank open` — container subcommand. `dry` is the existing
+/// path classifier (renamed from `clank open <path>` per
+/// `clank-open-zellij`); `zellij` is the new layout spawner.
 #[derive(Args, Debug)]
 pub struct OpenArgs {
+    #[command(subcommand)]
+    pub command: OpenCmd,
+}
+
+#[derive(clap::Subcommand, Debug)]
+pub enum OpenCmd {
+    /// Classify a path against the active repo; emit JSON or
+    /// human-readable. Renamed from `clank open <path>`.
+    Dry(OpenDryArgs),
+    /// Auto-generate a zellij layout (KDL) for master + reviewer
+    /// panes. Spawn the tab via `zellij action new-tab`, or use
+    /// `--print` to emit the composed KDL on stdout + the
+    /// would-be-spawned argv on stderr.
+    Zellij(OpenZellijArgs),
+}
+
+#[derive(Args, Debug)]
+pub struct OpenDryArgs {
     /// Path to inspect. Echoed back verbatim as `requested_path`;
     /// not canonicalized until existence is confirmed.
     pub path: String,
     /// Emit the response as JSON.
     #[arg(short = 'j', long)]
     pub json: bool,
+    /// Repo root override. Defaults to the cwd's git toplevel.
+    #[arg(long, value_name = "PATH")]
+    pub repo: Option<PathBuf>,
+}
+
+#[derive(Args, Debug)]
+pub struct OpenZellijArgs {
+    /// Repo root override. Defaults to the cwd's git toplevel.
+    #[arg(long, value_name = "PATH")]
+    pub repo: Option<PathBuf>,
+    /// Emit the composed KDL on stdout + the would-be-spawned
+    /// argv on stderr, exit 0, don't shell out to zellij. Mirrors
+    /// `clank diff --print` / `clank agent start --print`.
+    #[arg(long)]
+    pub print: bool,
 }
 
 /// `clank diff <plan|range>` — launch the configured editor on

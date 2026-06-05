@@ -37,17 +37,17 @@ fn write(repo: &Path, rel: &str, body: &str) {
 
 fn run_open(path: &Path, home: &Path) -> Value {
     let out = Command::new(clank_bin())
-        .args(["open", "--json"])
+        .args(["open", "dry", "--json"])
         .arg(path)
         .env("HOME", home)
         .env_remove("CLAUDE_CODE_SESSION_ID")
         .env_remove("CODEX_THREAD_ID")
         .env_remove("CLANK_AGENT")
         .output()
-        .expect("spawn clank open");
+        .expect("spawn clank open dry");
     assert!(
         out.status.success(),
-        "clank open failed: {} {}",
+        "clank open dry failed: {} {}",
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr),
     );
@@ -56,7 +56,7 @@ fn run_open(path: &Path, home: &Path) -> Value {
 
 fn run_open_raw(arg: &str, home: &Path) -> Value {
     let out = Command::new(clank_bin())
-        .args(["open", "--json", arg])
+        .args(["open", "dry", "--json", arg])
         .env("HOME", home)
         .env_remove("CLAUDE_CODE_SESSION_ID")
         .env_remove("CODEX_THREAD_ID")
