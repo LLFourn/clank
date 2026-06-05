@@ -17,11 +17,21 @@ errored because ruthless had never been bound in frostsnap.
 ## Goal
 
 When `clank agent start <label>` is called for an agent
-that's in the merged declaration but has no skeleton in
-this repo, spawn the bare tool with a seed prompt asking
-the agent to bind itself via `clank as <label>`. After the
-first turn, the skeleton exists and subsequent
-`clank agent start <label>` calls resume normally.
+that is registered in the merged declaration but **not yet
+bound to a session in this repo**, spawn the bare tool with
+a seed prompt asking the agent to bind itself via
+`clank as <label>`. "Not yet bound" covers both:
+- **Missing skeleton**: no
+  `<repo>/.clank/agents/<label>/config.json` (the case
+  lloyd hit in frostsnap, where ruthless was declared
+  globally but never bound there).
+- **Session-less skeleton**: skeleton EXISTS with
+  `session: None` (the fresh-init path: `clank init`
+  seeds default_agents this way).
+
+After the first turn, `clank as` binds the session, and
+subsequent `clank agent start <label>` calls resume
+normally.
 
 This is the behavior the POC `open-worktree.sh` script
 implemented (bare tool + seed prompt). Bringing it into
@@ -79,9 +89,16 @@ In `cli::agent::start` (or `agent_start::run`):
    - **Tool resolution** (PINNED per codex eef6853):
      priority order — declaration's `launch.command` (if set,
      used verbatim); else declaration's `tool` field (claude
-     / codex); else **ERROR** with: `agent <label> has no
-     bootstrap tool: set the declaration's tool field via
-     \`clank agent add <label> --tool <claude|codex>\``.
+     / codex); else **ERROR** with an actionable hint
+     (codex 5428550 catch: today's `clank agent add` refuses
+     duplicate labels and there is no `set-tool` subcommand,
+     so the hint must point at a path the user can actually
+     take). The pinned message:
+     ``agent <label> has no bootstrap tool. Either edit
+     <config-path>.json to add `"tool": "claude"` (or
+     "codex") under this agent, or remove and re-register:
+     `clank agent remove <label> && clank agent add <label>
+     --tool <claude|codex>`.``
      Don't fall back to label-as-tool-name — that masks
      misconfiguration.
    - Args: declaration's `launch.args` (if any) + a final
@@ -181,15 +198,30 @@ Negative tests (existing behavior preserved):
 
 ## Acceptance
 
-- `clank agent start <label>` for an agent that's in the
-  merged declaration but has no skeleton in this repo
-  spawns the bare tool with the seed prompt instead of
-  erroring.
+Bootstrap path:
+- **(a) Missing-skeleton case**: `clank agent start
+  <label>` for an agent in the merged declaration with no
+  `<repo>/.clank/agents/<label>/config.json` spawns the
+  bare tool with the seed prompt instead of erroring.
+- **(b) Session-none case** (codex 5428550 catch — must be
+  in acceptance too, not just Approach/Tests): `clank
+  agent start <label>` for an agent whose skeleton EXISTS
+  but has `session: None` ALSO spawns the bootstrap.
+  Implementation cannot satisfy this acceptance while
+  leaving fresh-init repos broken.
+
+Negative paths preserved:
 - `clank agent start <label>` for an agent NOT in the
   declaration continues to error with "no such agent".
-- `clank open zellij` in a fresh repo (no per-agent
-  skeletons) opens all declared-agent panes successfully;
-  each pane greets with the bootstrap prompt.
+- `clank agent start <label>` for an agent with neither
+  `launch.command` nor `tool` set surfaces the actionable
+  error hint with the edit-or-remove-and-re-add path.
+
+End-to-end:
+- `clank open zellij` in any repo where some declared
+  agents are unbound (either case (a) or (b)) opens all
+  declared-agent panes successfully; unbound panes greet
+  with the bootstrap prompt; bound panes resume normally.
 - After the agent runs `clank as <label>` once, subsequent
   `clank agent start <label>` calls resume the session
   normally (existing behavior preserved).
