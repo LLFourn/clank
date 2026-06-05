@@ -233,11 +233,11 @@ pub(super) const DEFAULT_AUTO_PROMPT: &str = "Session resumed.";
 ///
 /// Three-input policy:
 /// - `declaration`: `DefaultAgent.initial_prompt`. `Some("")`
-///    means "explicitly disable" — falls back to None, NOT
-///    Some("") through. Lets a user with auto_mode=On opt out
-///    of the prompt without disabling auto_mode itself.
+///   means "explicitly disable" — falls back to None, NOT
+///   Some("") through. Lets a user with auto_mode=On opt out
+///   of the prompt without disabling auto_mode itself.
 /// - `auto_mode`: per-machine preference from the agent skeleton.
-///    When On, supplies the [`DEFAULT_AUTO_PROMPT`] fallback.
+///   When On, supplies the [`DEFAULT_AUTO_PROMPT`] fallback.
 /// - Returns the resolved prompt or None.
 pub(super) fn resolve_initial_prompt(
     declaration: Option<&str>,

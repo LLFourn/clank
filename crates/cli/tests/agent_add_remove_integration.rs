@@ -167,6 +167,67 @@ fn clank_agent_add_no_launch_flags_leaves_launch_none() {
         "no --launch-* flags → declaration.launch must be None; got {:?}",
         agents[0].launch
     );
+    // Same default for initial_prompt — no --initial-prompt → None.
+    assert!(
+        agents[0].initial_prompt.is_none(),
+        "no --initial-prompt → declaration.initial_prompt must be None; got {:?}",
+        agents[0].initial_prompt
+    );
+}
+
+#[test]
+fn clank_agent_add_initial_prompt_persists_to_config() {
+    // Acceptance #3 round-trip: `clank agent add --initial-prompt
+    // "..."` must write the field to the declaration. Without this
+    // test, a bug in the agent_add write path (e.g., serde skipping
+    // the field on serialization) wouldn't be caught — the
+    // resolver/compose tests use typed write_repo_agents shortcuts,
+    // not the real `clank agent add` CLI surface.
+    let env = Env::new();
+    let out = env.agent(&[
+        "add",
+        "alice",
+        "--tool",
+        "claude",
+        "--initial-prompt",
+        "custom prompt",
+    ]);
+    assert!(
+        out.status.success(),
+        "add failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let repo = read_repo_config(env.repo());
+    let agents = repo.agents.unwrap();
+    assert_eq!(
+        agents[0].initial_prompt.as_deref(),
+        Some("custom prompt"),
+        "--initial-prompt must round-trip to declaration; got {:?}",
+        agents[0].initial_prompt,
+    );
+}
+
+#[test]
+fn clank_agent_add_empty_initial_prompt_persists_as_empty_string() {
+    // `Some("")` is the explicit-disable gesture. It round-trips
+    // as Some("") at the config layer; resolve_initial_prompt
+    // is what collapses it to None at start-time. Locking in the
+    // round-trip semantic separately from the resolver semantic.
+    let env = Env::new();
+    let out = env.agent(&["add", "alice", "--tool", "claude", "--initial-prompt", ""]);
+    assert!(
+        out.status.success(),
+        "add with empty --initial-prompt failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let repo = read_repo_config(env.repo());
+    let agents = repo.agents.unwrap();
+    assert_eq!(
+        agents[0].initial_prompt.as_deref(),
+        Some(""),
+        "empty --initial-prompt must round-trip as Some(\"\"); got {:?}",
+        agents[0].initial_prompt,
+    );
 }
 
 #[test]
