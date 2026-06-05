@@ -314,6 +314,70 @@ fn clank_agent_remove_preserves_per_agent_directory() {
 // ── Phase 4 acceptance: clank agent set-role ─────────────────────
 
 #[test]
+fn clank_agent_remove_drops_role_from_resolve_even_when_skeleton_preserved() {
+    // Codex caught on ebc5d38: `resolve_role` had a second
+    // skeleton fallback that defeated `clank agent remove`.
+    // After remove, the skeleton is intentionally preserved (for
+    // feedback history) — but `resolve_role` was reading the
+    // skeleton's role field, treating a removed agent as still
+    // registered.
+    //
+    // Repro from codex's review:
+    //   - explicit empty repo declaration (`agents: []`).
+    //   - preserved skeleton with role=master + auto_mode=off.
+    //   - `auto status` reports role=master.
+    //
+    // Fix: declaration is THE source of truth; no second
+    // skeleton fallback in `resolve_role`. After remove, the
+    // agent gets the DEFAULT role (Reviewers) from
+    // `unwrap_or_default`.
+    let env = Env::new();
+    // Explicit empty repo declaration.
+    write_repo_config(
+        env.repo(),
+        &RepoConfigFile {
+            agents: Some(Vec::new()),
+            ..Default::default()
+        },
+    );
+    // Preserved skeleton claiming role=master.
+    let cfg = clank_core::agent_config::AgentConfig {
+        auto_mode: clank_core::vocab::AutoMode::Off,
+        role: Role::Master,
+        wfw_timeout: None,
+        session: None,
+        launch: None,
+    };
+    clank::agent_store::save_agent_config(env.repo(), &AgentLabel::parse("codex").unwrap(), &cfg)
+        .unwrap();
+
+    // Run `clank auto status --json` for the removed agent.
+    let mut cmd = Command::new(clank_bin());
+    let out = cmd
+        .args(["auto", "status", "--json"])
+        .arg("--repo")
+        .arg(env.repo())
+        .env("HOME", env.home())
+        .env("CLANK_AGENT", "codex")
+        .env_remove("CLAUDE_CODE_SESSION_ID")
+        .env_remove("CODEX_THREAD_ID")
+        .output()
+        .expect("spawn clank auto status");
+    assert!(
+        out.status.success(),
+        "auto status failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let parsed: serde_json::Value =
+        serde_json::from_str(&String::from_utf8_lossy(&out.stdout)).unwrap();
+    assert_eq!(
+        parsed["role"], "reviewers",
+        "explicit empty declaration must drop the removed agent's role to the default (reviewers); \
+         skeleton fallback in resolve_role defeated `clank agent remove`. Got: {parsed}"
+    );
+}
+
+#[test]
 fn clank_agent_set_role_flips_role_in_place() {
     // set-role edits the DECLARATION entry. Skeleton is untouched.
     let env = Env::new();
