@@ -147,56 +147,63 @@ fn print_human(rows: &[AgentRow]) {
     }
 }
 
-/// `clank agent start <name>`: exec into the agent's CLI tool
-/// with session restored and the configured launch profile
-/// applied. Requires a bound session (one policy: no fallback
-/// to bare tool — see plan rationale at Phase B step 2 of
-/// `agent-config-and-start`).
+/// `clank agent start <name>`: exec into the agent's CLI tool.
+///
+/// Two paths:
+/// - **Resume** (declaration + bound session): exec with the
+///   configured launch profile + session-restore suffix.
+/// - **Bootstrap** (declaration but no bound session — skeleton
+///   missing OR `session: None`): exec the bare tool with a seed
+///   prompt instructing the agent to run `clank as <label>`. After
+///   that bind, subsequent calls hit the resume path. See
+///   `compose_bootstrap_launch` for the program-resolution policy.
+///   Plan: `agent-start-bootstraps-missing-skeleton`.
 ///
 /// Launch profile source: the merged declaration's `launch`
-/// field (per `agent-add-cli-and-repo-scope` — declaration is
-/// the source of truth for role + tool + launch). Session
-/// binding still comes from the per-agent skeleton.
+/// field (per `agent-add-cli-and-repo-scope`). Session binding
+/// state comes from the per-agent skeleton.
 fn start(args: AgentStartArgs) -> anyhow::Result<()> {
     let repo = resolve_repo(args.repo.as_deref())?;
     let label = AgentLabel::parse(&args.name)
         .map_err(|e| anyhow::anyhow!("invalid agent label `{}`: {e}", args.name))?;
 
-    let cfg = match load_agent_config(&repo, &label)? {
-        Some(c) => c,
-        None => {
-            anyhow::bail!(
-                "no agent `{name}` in this repo. Create `.clank/agents/{name}/config.json` \
-                 (or hand-edit one from the seed) before running `clank agent start`.",
-                name = args.name
-            );
-        }
-    };
-
-    let session = cfg.session.as_ref().ok_or_else(|| {
-        anyhow::anyhow!(
-            "agent `{name}` has no bound session. Run `clank as {name}` from inside the agent's CLI to bind.",
-            name = args.name
-        )
-    })?;
-
     let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
-    // Propagate parse errors — silently falling back to an empty
-    // declaration would drop the configured launch profile + leave
-    // the user puzzled why `--skill X` wasn't applied. Codex caught
-    // the unwrap_or_default on eef4c49.
     let merged = crate::cli::config::load_merged_agents(&repo, home.as_deref())?;
     let entry = merged.iter().find(|e| e.label == label);
-    let declaration_launch = entry.and_then(|e| e.launch.as_ref());
-    let declaration_prompt = entry.and_then(|e| e.initial_prompt.as_deref());
-    let resolved_prompt = resolve_initial_prompt(declaration_prompt, cfg.auto_mode);
 
-    let composed = compose_launch(
-        &repo,
-        session,
-        declaration_launch,
-        resolved_prompt.as_deref(),
-    );
+    let cfg = load_agent_config(&repo, &label)?;
+
+    if entry.is_none() && cfg.is_none() {
+        anyhow::bail!(
+            "no agent `{name}` in this repo. Create `.clank/agents/{name}/config.json` \
+             (or hand-edit one from the seed) before running `clank agent start`.",
+            name = args.name
+        );
+    }
+
+    let bound_session = cfg.as_ref().and_then(|c| c.session.as_ref());
+    let composed = match (entry, bound_session) {
+        (Some(entry), None) => compose_bootstrap_launch(entry)?,
+        (None, None) => {
+            // Declaration absent AND skeleton has no session: legacy-synth
+            // path would have inserted `entry`, so this arm is the
+            // "skeleton exists but synthesis returned tool=None and
+            // launch.command absent" case. Surface the actionable hint.
+            anyhow::bail!(no_bootstrap_tool_message(&label));
+        }
+        (entry_opt, Some(session)) => {
+            let cfg = cfg.as_ref().expect("session implies skeleton");
+            let declaration_launch = entry_opt.and_then(|e| e.launch.as_ref());
+            let declaration_prompt = entry_opt.and_then(|e| e.initial_prompt.as_deref());
+            let resolved_prompt = resolve_initial_prompt(declaration_prompt, cfg.auto_mode);
+            compose_launch(
+                &repo,
+                session,
+                declaration_launch,
+                resolved_prompt.as_deref(),
+            )
+        }
+    };
 
     if args.print {
         print_composed(&composed);
@@ -204,6 +211,62 @@ fn start(args: AgentStartArgs) -> anyhow::Result<()> {
     }
 
     exec_composed(composed)
+}
+
+/// Bootstrap launch: declared agent has no bound session in this
+/// repo. Spawn the bare tool with a seed prompt instructing the
+/// agent to run `clank as <label>`, which creates the skeleton +
+/// session binding. Subsequent `clank agent start <label>` calls
+/// resume normally.
+///
+/// Plan: `agent-start-bootstraps-missing-skeleton`.
+fn compose_bootstrap_launch(
+    entry: &crate::cli::config::DefaultAgent,
+) -> anyhow::Result<ComposedLaunch> {
+    let program = entry
+        .launch
+        .as_ref()
+        .and_then(|l| l.command.clone())
+        .or_else(|| entry.tool.map(|t| t.as_str().to_string()))
+        .ok_or_else(|| anyhow::anyhow!(no_bootstrap_tool_message(&entry.label)))?;
+
+    let mut args = entry
+        .launch
+        .as_ref()
+        .map(|l| l.args.clone())
+        .unwrap_or_default();
+    args.push(bootstrap_bind_prompt(&entry.label));
+
+    let env_overrides = entry
+        .launch
+        .as_ref()
+        .map(|l| l.env.clone())
+        .unwrap_or_default();
+
+    Ok(ComposedLaunch {
+        program,
+        args,
+        env_overrides,
+    })
+}
+
+/// Seed prompt for the bootstrap launch. Verbatim per the plan's
+/// PINNED string — `bootstrap_uses_tool_from_declaration` test
+/// asserts on this with `assert_eq!`, so a wording tweak fails the
+/// test deliberately.
+pub(super) fn bootstrap_bind_prompt(label: &AgentLabel) -> String {
+    format!("Run `clank as {}` to bind this session.", label.as_str())
+}
+
+fn no_bootstrap_tool_message(label: &AgentLabel) -> String {
+    let name = label.as_str();
+    format!(
+        "agent `{name}` has no bootstrap tool. Either edit \
+         `.clank/agents/{name}/config.json` (or your user-scope \
+         config) to add `\"tool\": \"claude\"` (or `\"codex\"`), \
+         or remove and re-register: `clank agent remove {name} && \
+         clank agent add {name} --tool <claude|codex>`."
+    )
 }
 
 /// Composed launch line: executable + argv + env additions.
@@ -781,6 +844,83 @@ mod tests {
         // itself — coupling two unrelated concerns.
         let out = resolve_initial_prompt(Some(""), AutoMode::On);
         assert_eq!(out, None);
+    }
+
+    // ── compose_bootstrap_launch policy tests ─────────────────
+    // Plan: agent-start-bootstraps-missing-skeleton.
+
+    fn entry_with(
+        tool: Option<Tool>,
+        launch: Option<LaunchConfig>,
+    ) -> crate::cli::config::DefaultAgent {
+        crate::cli::config::DefaultAgent {
+            label: label("phantom"),
+            role: clank_core::vocab::Role::Reviewer,
+            tool,
+            launch,
+            initial_prompt: None,
+        }
+    }
+
+    #[test]
+    fn bootstrap_uses_tool_from_declaration() {
+        let entry = entry_with(
+            Some(Tool::Claude),
+            Some(LaunchConfig {
+                command: None,
+                args: vec!["--skill".into(), "ruthless".into()],
+                env: Default::default(),
+            }),
+        );
+        let composed = compose_bootstrap_launch(&entry).expect("compose");
+        assert_eq!(composed.program, "claude");
+        assert_eq!(
+            composed.args,
+            vec![
+                "--skill".to_string(),
+                "ruthless".to_string(),
+                "Run `clank as phantom` to bind this session.".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn bootstrap_prefers_launch_command_over_tool() {
+        let entry = entry_with(
+            Some(Tool::Claude),
+            Some(LaunchConfig {
+                command: Some("my-claude-wrapper".into()),
+                args: vec![],
+                env: Default::default(),
+            }),
+        );
+        let composed = compose_bootstrap_launch(&entry).expect("compose");
+        // launch.command wins; tool=claude is only the fallback.
+        assert_eq!(composed.program, "my-claude-wrapper");
+    }
+
+    #[test]
+    fn bootstrap_errors_when_no_tool_or_command() {
+        let entry = entry_with(None, None);
+        let err = compose_bootstrap_launch(&entry).expect_err("must error");
+        let msg = format!("{err}");
+        assert!(msg.contains("phantom"), "error names the label: {msg}");
+        assert!(
+            msg.contains("tool") && (msg.contains("claude") || msg.contains("codex")),
+            "error mentions tool fix: {msg}"
+        );
+        assert!(
+            msg.contains("clank agent remove") || msg.contains("edit"),
+            "error gives an actionable path: {msg}"
+        );
+    }
+
+    #[test]
+    fn bootstrap_bind_prompt_is_pinned_verbatim() {
+        // Pinned: exact equality so a future wording tweak fails
+        // the test deliberately.
+        let s = bootstrap_bind_prompt(&label("phantom"));
+        assert_eq!(s, "Run `clank as phantom` to bind this session.");
     }
 
     #[test]

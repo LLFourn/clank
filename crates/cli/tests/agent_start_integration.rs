@@ -308,39 +308,59 @@ fn agent_start_unknown_agent_errors() {
 }
 
 #[test]
-fn agent_start_no_bound_session_errors_with_clank_as_hint() {
+fn agent_start_session_none_with_no_tool_errors_with_hint() {
+    // Plan: agent-start-bootstraps-missing-skeleton. Renamed from
+    // `agent_start_no_bound_session_errors_with_clank_as_hint`.
+    //
+    // Legacy-skeleton fallback path: `write_unbound_skeleton` writes
+    // ONLY an AgentConfig (session=None, launch=None). No explicit
+    // declaration. `load_merged_agents` legacy-synthesizes a
+    // declaration via `config.rs:502-506` where tool is derived
+    // from cfg.session — None here → tool=None. Bootstrap's
+    // tool-resolution priority (launch.command > tool > error)
+    // surfaces the no-bootstrap-tool error. Pinned per codex a8164a1
+    // catch on the prior plan revision.
     let dir = init_repo();
     let repo = dir.path();
-    // Agent config exists but no `session` field.
     write_unbound_skeleton(repo, "codex");
 
     let out = run_start(repo, &["codex", "--print"]);
     assert!(
         !out.status.success(),
-        "no-bound-session must error; stdout=`{}` stderr=`{}`",
+        "session-none + no-tool must error; stdout=`{}` stderr=`{}`",
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr)
     );
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
-        stderr.contains("clank as codex") || stderr.contains("clank as `codex`"),
-        "stderr should suggest `clank as <name>`; got: {stderr}"
+        stderr.contains("codex"),
+        "stderr should name the agent label; got: {stderr}"
+    );
+    assert!(
+        stderr.contains("no bootstrap tool"),
+        "stderr should classify the failure as no-bootstrap-tool; got: {stderr}"
+    );
+    assert!(
+        stderr.contains("clank agent remove") || stderr.contains("edit"),
+        "stderr should give an actionable path; got: {stderr}"
     );
 }
 
 #[test]
-fn agent_start_no_session_errors_even_when_launch_command_set() {
-    // Locks in the "one policy: session always required" decision
-    // (codex review of 12c6c97). Even with launch.command
-    // explicitly set, no-bound-session is an error path — NOT a
-    // fallback to running the launch command directly.
+fn agent_start_session_none_with_launch_command_bootstraps() {
+    // Plan: agent-start-bootstraps-missing-skeleton. Inverts
+    // `agent_start_no_session_errors_even_when_launch_command_set`
+    // from 12c6c97 — that test locked in the strict "session
+    // always required" policy, which the bootstrap plan
+    // intentionally supersedes. With launch.command set, tool
+    // resolution succeeds; the bootstrap path fires.
     let dir = init_repo();
     let repo = dir.path();
     let cfg = clank_core::agent_config::AgentConfig {
         auto_mode: clank_core::vocab::AutoMode::Off,
         role: clank_core::vocab::Role::Master,
         launch: Some(clank_core::agent_config::LaunchConfig {
-            command: Some("claude".into()),
+            command: Some("my-claude-wrapper".into()),
             args: vec!["--skill".into(), "ruthless".into()],
             env: Default::default(),
         }),
@@ -354,10 +374,106 @@ fn agent_start_no_session_errors_even_when_launch_command_set() {
 
     let out = run_start(repo, &["lloyd", "--print"]);
     assert!(
-        !out.status.success(),
-        "no-bound-session must error even with launch.command set; stdout=`{}` stderr=`{}`",
+        out.status.success(),
+        "session-none + launch.command should bootstrap, not error; stdout=`{}` stderr=`{}`",
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("my-claude-wrapper"),
+        "argv must use launch.command, not the tool fallback; got: {stdout}"
+    );
+    assert!(
+        stdout.contains("Run `clank as lloyd` to bind this session."),
+        "argv must include the bootstrap bind prompt; got: {stdout}"
+    );
+}
+
+#[test]
+fn agent_start_bootstraps_when_skeleton_missing() {
+    // Plan: agent-start-bootstraps-missing-skeleton. The
+    // missing-skeleton path: declaration registers `phantom` with
+    // a resolvable tool, but no per-repo skeleton exists. Bootstrap
+    // spawns the bare tool with the seed prompt.
+    let dir = init_repo();
+    let repo = dir.path();
+    write_repo_agents(
+        repo,
+        &[clank::cli::config::DefaultAgent {
+            label: clank_core::ids::AgentLabel::parse("phantom").unwrap(),
+            role: clank_core::vocab::Role::Reviewer,
+            tool: Some(clank_core::vocab::Tool::Claude),
+            launch: None,
+            initial_prompt: None,
+        }],
+    );
+    // Do NOT write a skeleton.
+
+    let out = run_start(repo, &["phantom", "--print"]);
+    assert!(
+        out.status.success(),
+        "missing-skeleton + declaration with tool should bootstrap; stdout=`{}` stderr=`{}`",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("claude"),
+        "argv must start with the resolved tool `claude`; got: {stdout}"
+    );
+    assert!(
+        stdout.contains("Run `clank as phantom` to bind this session."),
+        "argv must include the bootstrap bind prompt; got: {stdout}"
+    );
+    // Bootstrap path MUST NOT add a session-restore suffix.
+    assert!(
+        !stdout.contains("--resume"),
+        "bootstrap must not pass --resume (no session yet); got: {stdout}"
+    );
+}
+
+#[test]
+fn agent_start_bootstraps_when_skeleton_exists_but_session_none() {
+    // Plan: agent-start-bootstraps-missing-skeleton — codex eef6853
+    // catch. The fresh-init path: `clank init` seeds default_agents
+    // as skeletons-without-session. With a declaration that resolves
+    // a tool, bootstrap fires for this case too.
+    let dir = init_repo();
+    let repo = dir.path();
+    write_repo_agents(
+        repo,
+        &[clank::cli::config::DefaultAgent {
+            label: clank_core::ids::AgentLabel::parse("phantom").unwrap(),
+            role: clank_core::vocab::Role::Reviewer,
+            tool: Some(clank_core::vocab::Tool::Codex),
+            launch: None,
+            initial_prompt: None,
+        }],
+    );
+    // Skeleton EXISTS but session: None (the fresh-init shape).
+    write_unbound_skeleton(repo, "phantom");
+
+    let out = run_start(repo, &["phantom", "--print"]);
+    assert!(
+        out.status.success(),
+        "skeleton + session=None + declaration tool should bootstrap; stdout=`{}` stderr=`{}`",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("codex"),
+        "argv must use the declaration's tool (codex); got: {stdout}"
+    );
+    assert!(
+        stdout.contains("Run `clank as phantom` to bind this session."),
+        "argv must include the bootstrap bind prompt; got: {stdout}"
+    );
+    // No resume — there's no session id yet.
+    assert!(
+        !stdout.contains("--resume") && !stdout.contains(" resume "),
+        "bootstrap must not pass any session-restore suffix; got: {stdout}"
     );
 }
 

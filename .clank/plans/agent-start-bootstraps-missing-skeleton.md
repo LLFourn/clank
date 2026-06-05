@@ -195,6 +195,13 @@ Negative tests (existing behavior preserved):
 
 ## Out of scope
 
+- **`clank as <label>` failure mode** (ruthless 3ab2def pin):
+  if the bootstrap agent runs `clank as` and it fails
+  (session-id detection bug, daemon error, etc.), the agent's
+  reply surfaces the failure to the user. The next
+  `clank agent start <label>` re-attempts bootstrap because
+  the skeleton/session state remains unchanged. No automatic
+  retry / fallback logic in v1.
 - Auto-running `clank as <label>` on the agent's behalf.
   The seed-prompt approach lets the agent itself execute
   the bind so the session-id-to-label mapping is owned by
