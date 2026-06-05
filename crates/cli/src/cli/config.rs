@@ -1468,7 +1468,7 @@ mod tests {
         let merged = load_merged_agents(tmp.path(), Some(home.path())).unwrap();
         assert_eq!(merged.len(), 1);
         assert_eq!(merged[0].label.as_str(), "legacy-reviewer");
-        assert_eq!(merged[0].role, Role::Reviewers);
+        assert_eq!(merged[0].role, Role::Reviewer);
     }
 
     #[test]

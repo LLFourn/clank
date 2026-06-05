@@ -139,7 +139,7 @@ fn clank_agent_add_writes_list_entry_and_skeleton() {
     assert_eq!(agents.len(), 1);
     let entry = &agents[0];
     assert_eq!(entry.label.as_str(), "codex");
-    assert_eq!(entry.role, Role::Reviewers);
+    assert_eq!(entry.role, Role::Reviewer);
     assert_eq!(entry.tool, Some(clank_core::vocab::Tool::Codex));
     let launch = entry.launch.as_ref().expect("launch present");
     assert_eq!(launch.command.as_deref(), Some("codex"));
@@ -224,7 +224,7 @@ fn clank_agent_add_repo_scope_shadows_user_scope_with_notice() {
     write_user_config(
         env.home(),
         &UserConfigFile {
-            default_agents: Some(vec![agent_decl("codex", Role::Reviewers)]),
+            default_agents: Some(vec![agent_decl("codex", Role::Reviewer)]),
             ..Default::default()
         },
     );
@@ -252,7 +252,7 @@ fn clank_agent_add_global_refuses_when_repo_scope_has_label() {
     write_repo_config(
         env.repo(),
         &RepoConfigFile {
-            agents: Some(vec![agent_decl("codex", Role::Reviewers)]),
+            agents: Some(vec![agent_decl("codex", Role::Reviewer)]),
             ..Default::default()
         },
     );
@@ -371,8 +371,8 @@ fn clank_agent_remove_drops_role_from_resolve_even_when_skeleton_preserved() {
     let parsed: serde_json::Value =
         serde_json::from_str(&String::from_utf8_lossy(&out.stdout)).unwrap();
     assert_eq!(
-        parsed["role"], "reviewers",
-        "explicit empty declaration must drop the removed agent's role to the default (reviewers); \
+        parsed["role"], "reviewer",
+        "explicit empty declaration must drop the removed agent's role to the default (reviewer); \
          skeleton fallback in resolve_role defeated `clank agent remove`. Got: {parsed}"
     );
 }

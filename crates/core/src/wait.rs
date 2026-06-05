@@ -395,7 +395,7 @@ impl WorkStatus {
                         gate: ps.gate,
                     });
                 }
-                (Role::Reviewers, WaitingOn::ReviewerApprovalsMissing { missing })
+                (Role::Reviewer, WaitingOn::ReviewerApprovalsMissing { missing })
                     if missing.as_slice().iter().any(|l| l == author) =>
                 {
                     // Only emit a review item for this reviewer if THEY
@@ -416,7 +416,7 @@ impl WorkStatus {
         }
         for ah in &self.ad_hoc {
             match (role, ah.gate) {
-                (Role::Reviewers, crate::vocab::CommitGateState::Unreviewed) => {
+                (Role::Reviewer, crate::vocab::CommitGateState::Unreviewed) => {
                     out.push(WaitItem::AdHocReview {
                         sha: ah.sha.clone(),
                         feedback_path: format!(
@@ -644,11 +644,11 @@ mod tests {
         // Two registered reviewers; neither has reviewed yet. Both
         // are in the missing set; each gets a review item.
         let ws = work_status_with_one_plan(missing(&["codex", "ruthless"]));
-        let codex_work = ws.work_for(&label("codex"), Role::Reviewers);
+        let codex_work = ws.work_for(&label("codex"), Role::Reviewer);
         assert_eq!(codex_work.len(), 1, "codex should get a review item");
         assert!(matches!(codex_work[0], WaitItem::Reviewer { .. }));
 
-        let ruthless_work = ws.work_for(&label("ruthless"), Role::Reviewers);
+        let ruthless_work = ws.work_for(&label("ruthless"), Role::Reviewer);
         assert_eq!(ruthless_work.len(), 1, "ruthless should get a review item");
     }
 
@@ -658,12 +658,12 @@ mod tests {
         // posted APPROVE/FINISHED does NOT get a redundant wake.
         // Only `ruthless` is in `missing` (codex already approved).
         let ws = work_status_with_one_plan(missing(&["ruthless"]));
-        let codex_work = ws.work_for(&label("codex"), Role::Reviewers);
+        let codex_work = ws.work_for(&label("codex"), Role::Reviewer);
         assert!(
             codex_work.is_empty(),
             "codex already approved; should not be woken again"
         );
-        let ruthless_work = ws.work_for(&label("ruthless"), Role::Reviewers);
+        let ruthless_work = ws.work_for(&label("ruthless"), Role::Reviewer);
         assert_eq!(
             ruthless_work.len(),
             1,
@@ -677,7 +677,7 @@ mod tests {
         // disk but she's not in the missing set). work_for returns
         // nothing for her.
         let ws = work_status_with_one_plan(missing(&["codex"]));
-        let alice_work = ws.work_for(&label("alice"), Role::Reviewers);
+        let alice_work = ws.work_for(&label("alice"), Role::Reviewer);
         assert!(
             alice_work.is_empty(),
             "alice is not in missing; should not be woken"

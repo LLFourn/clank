@@ -55,7 +55,7 @@ fn register_reviewer(repo: &Path, label: &str) {
     merge_repo_config(repo, |v| {
         let entry = serde_json::to_value(clank::cli::config::DefaultAgent {
             label: clank_core::ids::AgentLabel::parse(label).unwrap(),
-            role: clank_core::vocab::Role::Reviewers,
+            role: clank_core::vocab::Role::Reviewer,
             tool: None,
             launch: None,
         })

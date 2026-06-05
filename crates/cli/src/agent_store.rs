@@ -102,7 +102,7 @@ pub fn load_expected_reviewers(repo: &Path) -> anyhow::Result<Vec<AgentLabel>> {
     let merged = crate::cli::config::load_merged_agents(repo, home.as_deref())?;
     Ok(merged
         .into_iter()
-        .filter(|e| e.role == Role::Reviewers)
+        .filter(|e| e.role == Role::Reviewer)
         .map(|e| e.label)
         .collect())
 }

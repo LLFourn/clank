@@ -216,15 +216,20 @@ impl AutoMode {
 #[serde(rename_all = "snake_case")]
 pub enum Role {
     Master,
+    /// Singular per `role-reviewers-to-reviewer-rename`: one
+    /// agent declaration entry has ONE role, so the noun should
+    /// match. `#[serde(alias = "reviewers")]` preserves
+    /// backwards compat for existing on-disk configs.
+    #[serde(alias = "reviewers")]
     #[default]
-    Reviewers,
+    Reviewer,
 }
 
 impl Role {
     pub fn as_str(self) -> &'static str {
         match self {
             Role::Master => "master",
-            Role::Reviewers => "reviewers",
+            Role::Reviewer => "reviewer",
         }
     }
 }
@@ -262,4 +267,50 @@ impl_display_via_as_str! {
     AutoMode,
     Role,
     HookEvent,
+}
+
+#[cfg(test)]
+mod role_rename_tests {
+    use super::Role;
+
+    #[test]
+    fn role_reviewers_string_deserializes_as_alias() {
+        // Plan acceptance: existing on-disk configs with "reviewers"
+        // must continue working via the serde alias.
+        let parsed: Role = serde_json::from_str(r#""reviewers""#).unwrap();
+        assert_eq!(parsed, Role::Reviewer);
+    }
+
+    #[test]
+    fn role_reviewer_singular_string_deserializes() {
+        let parsed: Role = serde_json::from_str(r#""reviewer""#).unwrap();
+        assert_eq!(parsed, Role::Reviewer);
+    }
+
+    #[test]
+    fn role_reviewer_round_trips_as_singular() {
+        // Acceptance: serialized output emits "reviewer", not
+        // "reviewers". The alias is read-only.
+        let out = serde_json::to_string(&Role::Reviewer).unwrap();
+        assert_eq!(out, r#""reviewer""#);
+    }
+
+    #[test]
+    fn role_master_unaffected_by_rename() {
+        let out = serde_json::to_string(&Role::Master).unwrap();
+        assert_eq!(out, r#""master""#);
+        let parsed: Role = serde_json::from_str(r#""master""#).unwrap();
+        assert_eq!(parsed, Role::Master);
+    }
+
+    #[test]
+    fn role_default_is_reviewer() {
+        assert_eq!(Role::default(), Role::Reviewer);
+    }
+
+    #[test]
+    fn role_as_str_returns_singular() {
+        assert_eq!(Role::Reviewer.as_str(), "reviewer");
+        assert_eq!(Role::Master.as_str(), "master");
+    }
 }

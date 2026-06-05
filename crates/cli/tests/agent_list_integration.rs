@@ -53,7 +53,7 @@ fn write_bound_skeleton(
 ) {
     let cfg = clank_core::agent_config::AgentConfig {
         auto_mode,
-        role: clank_core::vocab::Role::Reviewers, // unused; declaration owns
+        role: clank_core::vocab::Role::Reviewer, // unused; declaration owns
         wfw_timeout: None,
         session: Some(clank_core::agent_config::Session {
             id: clank_core::ids::SessionId::parse(session_id).unwrap(),
@@ -114,8 +114,8 @@ fn agent_list_shows_bound_and_unbound() {
         repo,
         &[
             agent_decl("claude", clank_core::vocab::Role::Master),
-            agent_decl("codex", clank_core::vocab::Role::Reviewers),
-            agent_decl("ruthless", clank_core::vocab::Role::Reviewers),
+            agent_decl("codex", clank_core::vocab::Role::Reviewer),
+            agent_decl("ruthless", clank_core::vocab::Role::Reviewer),
         ],
     );
     // Bound master (session state in skeleton).
@@ -171,7 +171,7 @@ fn agent_list_json_schema() {
         repo,
         &[
             agent_decl("claude", clank_core::vocab::Role::Master),
-            agent_decl("ruthless", clank_core::vocab::Role::Reviewers),
+            agent_decl("ruthless", clank_core::vocab::Role::Reviewer),
         ],
     );
     write_bound_skeleton(
@@ -197,7 +197,7 @@ fn agent_list_json_schema() {
     assert!(arr[0]["session_id"].is_string());
     // Then reviewer.
     assert_eq!(arr[1]["label"], "ruthless");
-    assert_eq!(arr[1]["role"], "reviewers");
+    assert_eq!(arr[1]["role"], "reviewer");
     assert_eq!(arr[1]["bound"], false);
     assert!(arr[1]["tool"].is_null());
     assert!(arr[1]["session_id"].is_null());
@@ -214,7 +214,7 @@ fn agent_list_omits_orphan_skeleton() {
     // Declaration registers only alice.
     write_repo_agents(
         repo,
-        &[agent_decl("alice", clank_core::vocab::Role::Reviewers)],
+        &[agent_decl("alice", clank_core::vocab::Role::Reviewer)],
     );
     // Orphan skeleton for `removed` — present on disk but not in
     // declaration.
@@ -250,7 +250,7 @@ fn agent_list_shows_declared_agents_even_without_skeleton() {
         repo,
         &[agent_decl(
             "declared-only",
-            clank_core::vocab::Role::Reviewers,
+            clank_core::vocab::Role::Reviewer,
         )],
     );
     // No skeleton for `declared-only`.

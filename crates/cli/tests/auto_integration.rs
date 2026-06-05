@@ -210,7 +210,10 @@ fn auto_on_role_reviewers_writes_agent_config() {
         &std::fs::read_to_string(repo.join(".clank/agents/alice/config.json")).unwrap(),
     )
     .unwrap();
-    assert_eq!(cfg["role"], "reviewers");
+    // Canonical singular per role-reviewers-to-reviewer-rename.
+    // `--role reviewers` on the CLI still works via the clap
+    // alias, but the on-disk value is the canonical "reviewer".
+    assert_eq!(cfg["role"], "reviewer");
 }
 
 #[test]

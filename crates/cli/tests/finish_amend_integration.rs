@@ -147,7 +147,7 @@ fn finish_rejects_approve_without_finished() {
     let file = clank::cli::config::RepoAgentsFile {
         agents: Some(vec![clank::cli::config::DefaultAgent {
             label: clank_core::ids::AgentLabel::parse("codex").unwrap(),
-            role: clank_core::vocab::Role::Reviewers,
+            role: clank_core::vocab::Role::Reviewer,
             tool: None,
             launch: None,
         }]),

@@ -108,7 +108,7 @@ async fn compute_wait_outcome(
 
     let role_arg = match role {
         Role::Master => "master",
-        Role::Reviewers => "reviewers",
+        Role::Reviewer => "reviewer",
     };
     let timeout_arg = wfw_timeout.unwrap_or("0");
 

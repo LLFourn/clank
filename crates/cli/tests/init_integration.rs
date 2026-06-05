@@ -95,7 +95,7 @@ fn init_defaults_to_reviewers_when_master_exists() {
     )
     .unwrap();
     assert_eq!(
-        cfg["role"], "reviewers",
+        cfg["role"], "reviewer",
         "second agent should default to reviewers when master exists; got config: {cfg}"
     );
 }
@@ -132,7 +132,7 @@ fn init_seeds_default_agents_from_user_config() {
         let cfg: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&cfg_path).unwrap()).unwrap();
         assert_eq!(
-            cfg["role"], "reviewers",
+            cfg["role"], "reviewer",
             "{label} should default to reviewers; got {cfg}"
         );
         assert!(
@@ -304,7 +304,7 @@ fn init_seeds_master_role_when_specified() {
         &std::fs::read_to_string(repo.join(".clank/agents/bob/config.json")).unwrap(),
     )
     .unwrap();
-    assert_eq!(bob["role"], "reviewers");
+    assert_eq!(bob["role"], "reviewer");
 }
 
 #[test]
@@ -357,7 +357,7 @@ fn init_default_agents_preserve_role_even_when_label_already_bound() {
         serde_json::from_str(&std::fs::read_to_string(codex_dir.join("config.json")).unwrap())
             .unwrap();
     assert_eq!(
-        codex["role"], "reviewers",
+        codex["role"], "reviewer",
         "user's declared default_agents role must be preserved even when the label is already bound; got {codex}"
     );
     // Session still bound (binding logic ran).
@@ -450,8 +450,8 @@ fn init_seeded_master_flips_calling_agent_to_reviewers() {
     )
     .unwrap();
     assert_eq!(
-        claude["role"], "reviewers",
-        "claude must default to reviewers when seed already contains a master; got {claude}"
+        claude["role"], "reviewer",
+        "claude must default to reviewer when seed already contains a master; got {claude}"
     );
     assert_eq!(
         claude["session"]["id"], CLAUDE_SESSION,
@@ -485,7 +485,7 @@ fn init_calling_agent_label_collides_with_seeded_entry() {
     )
     .unwrap();
     assert_eq!(
-        codex["role"], "reviewers",
+        codex["role"], "reviewer",
         "seeded role must be preserved when the calling session binds; got {codex}"
     );
     assert_eq!(

@@ -138,7 +138,7 @@ mod tests {
         let back: AgentConfig = serde_json::from_str(&json).unwrap();
         assert_eq!(cfg, back);
         assert_eq!(back.auto_mode, AutoMode::Off);
-        assert_eq!(back.role, Role::Reviewers);
+        assert_eq!(back.role, Role::Reviewer);
         assert!(back.wfw_timeout.is_none());
         assert!(back.session.is_none());
     }
@@ -213,7 +213,7 @@ mod tests {
         env.insert("FOO".to_string(), "bar".to_string());
         let cfg = AgentConfig {
             auto_mode: AutoMode::Off,
-            role: Role::Reviewers,
+            role: Role::Reviewer,
             wfw_timeout: None,
             session: None,
             launch: Some(LaunchConfig {
@@ -232,7 +232,7 @@ mod tests {
         let json = r#"{ "auto_mode": "wait" }"#;
         let cfg: AgentConfig = serde_json::from_str(json).unwrap();
         assert_eq!(cfg.auto_mode, AutoMode::On);
-        assert_eq!(cfg.role, Role::Reviewers);
+        assert_eq!(cfg.role, Role::Reviewer);
         assert!(cfg.wfw_timeout.is_none());
         assert!(cfg.session.is_none());
     }
@@ -262,6 +262,6 @@ mod tests {
 
     #[test]
     fn role_for_no_config_yields_default_reviewers() {
-        assert_eq!(role_for(&label("alice"), None), Role::Reviewers);
+        assert_eq!(role_for(&label("alice"), None), Role::Reviewer);
     }
 }

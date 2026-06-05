@@ -40,7 +40,7 @@ fn skeleton(
 ) -> clank_core::agent_config::AgentConfig {
     clank_core::agent_config::AgentConfig {
         auto_mode,
-        role: clank_core::vocab::Role::Reviewers, // skeleton role unused; declaration is source of truth
+        role: clank_core::vocab::Role::Reviewer, // skeleton role unused; declaration is source of truth
         wfw_timeout: None,
         session,
         launch: None,
@@ -130,7 +130,7 @@ fn doctor_warns_on_unbound_reviewer() {
     let dir = init_repo();
     let repo = dir.path();
     write(repo, ".clank/.gitignore", ".gitignore\n");
-    register_agents(repo, &[("ruthless", clank_core::vocab::Role::Reviewers)]);
+    register_agents(repo, &[("ruthless", clank_core::vocab::Role::Reviewer)]);
     write_skeleton(
         repo,
         "ruthless",
@@ -166,7 +166,7 @@ fn doctor_does_not_warn_on_bound_reviewer() {
     let dir = init_repo();
     let repo = dir.path();
     write(repo, ".clank/.gitignore", ".gitignore\n");
-    register_agents(repo, &[("codex", clank_core::vocab::Role::Reviewers)]);
+    register_agents(repo, &[("codex", clank_core::vocab::Role::Reviewer)]);
     write_skeleton(
         repo,
         "codex",
@@ -237,7 +237,7 @@ fn doctor_warns_when_launch_command_missing_from_path() {
     register_agent_with_launch(
         repo,
         "codex",
-        clank_core::vocab::Role::Reviewers,
+        clank_core::vocab::Role::Reviewer,
         clank_core::agent_config::LaunchConfig {
             command: Some("definitely-not-installed-anywhere".to_string()),
             args: Vec::new(),
@@ -285,7 +285,7 @@ fn doctor_warns_on_missing_skeleton() {
     let dir = init_repo();
     let repo = dir.path();
     write(repo, ".clank/.gitignore", ".gitignore\n");
-    register_agents(repo, &[("phantom", clank_core::vocab::Role::Reviewers)]);
+    register_agents(repo, &[("phantom", clank_core::vocab::Role::Reviewer)]);
     // No skeleton written.
 
     let out = run_doctor(repo);
@@ -385,7 +385,7 @@ fn doctor_warn_for_unbound_does_not_introduce_new_fail() {
     let dir = init_repo();
     let repo = dir.path();
     write(repo, ".clank/.gitignore", ".gitignore\n");
-    register_agents(repo, &[("ruthless", clank_core::vocab::Role::Reviewers)]);
+    register_agents(repo, &[("ruthless", clank_core::vocab::Role::Reviewer)]);
     write_skeleton(
         repo,
         "ruthless",

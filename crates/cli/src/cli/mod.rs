@@ -316,6 +316,43 @@ pub fn resolve_poll(explicit: Option<bool>, codex_sandbox: Option<&str>) -> bool
 }
 
 #[cfg(test)]
+mod role_arg_alias_tests {
+    use super::{RoleArg, WfwRole};
+    use clap::ValueEnum;
+
+    #[test]
+    fn role_arg_accepts_canonical_singular() {
+        let parsed = RoleArg::from_str("reviewer", false).unwrap();
+        assert!(matches!(parsed, RoleArg::Reviewer));
+    }
+
+    #[test]
+    fn role_arg_accepts_plural_alias() {
+        // Plan acceptance: `--role reviewers` keeps working via
+        // the clap alias.
+        let parsed = RoleArg::from_str("reviewers", false).unwrap();
+        assert!(matches!(parsed, RoleArg::Reviewer));
+    }
+
+    #[test]
+    fn wfw_role_accepts_both_forms() {
+        assert!(matches!(
+            WfwRole::from_str("reviewer", false).unwrap(),
+            WfwRole::Reviewer
+        ));
+        assert!(matches!(
+            WfwRole::from_str("reviewers", false).unwrap(),
+            WfwRole::Reviewer
+        ));
+    }
+
+    #[test]
+    fn role_arg_rejects_unrelated_strings() {
+        assert!(RoleArg::from_str("xyzzy", false).is_err());
+    }
+}
+
+#[cfg(test)]
 mod resolve_poll_tests {
     use super::resolve_poll;
 
@@ -356,14 +393,18 @@ mod resolve_poll_tests {
 #[derive(Copy, Clone, Debug, clap::ValueEnum)]
 pub enum WfwRole {
     Master,
-    Reviewers,
+    /// Singular per `role-reviewers-to-reviewer-rename`.
+    /// `alias = "reviewers"` preserves backwards compat for
+    /// users typing `--role reviewers` on `clank wfw`.
+    #[clap(alias = "reviewers")]
+    Reviewer,
 }
 
 impl From<WfwRole> for clank_core::Role {
     fn from(r: WfwRole) -> Self {
         match r {
             WfwRole::Master => clank_core::Role::Master,
-            WfwRole::Reviewers => clank_core::Role::Reviewers,
+            WfwRole::Reviewer => clank_core::Role::Reviewer,
         }
     }
 }
@@ -502,7 +543,11 @@ pub struct AutoStatusArgs {
 #[derive(Copy, Clone, Debug, clap::ValueEnum)]
 pub enum RoleArg {
     Master,
-    Reviewers,
+    /// Singular per `role-reviewers-to-reviewer-rename`.
+    /// `alias = "reviewers"` preserves backwards compat for
+    /// users typing `--role reviewers`.
+    #[clap(alias = "reviewers")]
+    Reviewer,
 }
 
 #[derive(Args, Debug)]

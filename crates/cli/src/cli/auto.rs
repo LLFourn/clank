@@ -103,7 +103,7 @@ impl From<crate::cli::RoleArg> for Role {
     fn from(r: crate::cli::RoleArg) -> Self {
         match r {
             crate::cli::RoleArg::Master => Role::Master,
-            crate::cli::RoleArg::Reviewers => Role::Reviewers,
+            crate::cli::RoleArg::Reviewer => Role::Reviewer,
         }
     }
 }

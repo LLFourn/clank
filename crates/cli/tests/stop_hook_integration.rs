@@ -38,7 +38,7 @@ fn init_repo() -> tempfile::TempDir {
         path,
         &[clank::cli::config::DefaultAgent {
             label: clank_core::ids::AgentLabel::parse("alice").unwrap(),
-            role: clank_core::vocab::Role::Reviewers,
+            role: clank_core::vocab::Role::Reviewer,
             tool: None,
             launch: None,
         }],

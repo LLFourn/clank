@@ -630,12 +630,12 @@ mod tests {
         let session = make_session();
         let row = AgentRow::from_join(
             &label("alice"),
-            Role::Reviewers,
+            Role::Reviewer,
             Some(Tool::Codex), // declared tool (overridden by session)
             Some(&session),
         );
         assert_eq!(row.label, "alice");
-        assert_eq!(row.role, "reviewers");
+        assert_eq!(row.role, "reviewer");
         assert!(row.bound);
         assert_eq!(row.tool.as_deref(), Some("claude")); // from session
         assert!(row.session_id.is_some());
@@ -643,7 +643,7 @@ mod tests {
 
     #[test]
     fn agent_row_unbound_uses_declared_tool() {
-        let row = AgentRow::from_join(&label("alice"), Role::Reviewers, Some(Tool::Claude), None);
+        let row = AgentRow::from_join(&label("alice"), Role::Reviewer, Some(Tool::Claude), None);
         assert!(!row.bound);
         assert_eq!(row.tool.as_deref(), Some("claude"));
         assert!(row.session_id.is_none());
@@ -651,7 +651,7 @@ mod tests {
 
     #[test]
     fn agent_row_unbound_no_declared_tool_shows_none() {
-        let row = AgentRow::from_join(&label("alice"), Role::Reviewers, None, None);
+        let row = AgentRow::from_join(&label("alice"), Role::Reviewer, None, None);
         assert!(!row.bound);
         assert!(row.tool.is_none());
     }

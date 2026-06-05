@@ -47,7 +47,7 @@ fn write_skeleton_with_session(
 ) {
     let cfg = clank_core::agent_config::AgentConfig {
         auto_mode: clank_core::vocab::AutoMode::Off,
-        role: clank_core::vocab::Role::Reviewers, // unused; declaration owns
+        role: clank_core::vocab::Role::Reviewer, // unused; declaration owns
         wfw_timeout: None,
         session: Some(clank_core::agent_config::Session {
             id: clank_core::ids::SessionId::parse(session_id).unwrap(),
@@ -188,7 +188,7 @@ fn agent_start_launch_args_precede_session_restore_for_claude() {
         repo,
         &[agent(
             "ruthless",
-            clank_core::vocab::Role::Reviewers,
+            clank_core::vocab::Role::Reviewer,
             Some(clank_core::vocab::Tool::Claude),
             Some(clank_core::agent_config::LaunchConfig {
                 command: Some("claude".into()),
@@ -228,7 +228,7 @@ fn agent_start_codex_launch_args_precede_subcommand() {
         repo,
         &[agent(
             "codex-deep",
-            clank_core::vocab::Role::Reviewers,
+            clank_core::vocab::Role::Reviewer,
             Some(clank_core::vocab::Tool::Codex),
             Some(clank_core::agent_config::LaunchConfig {
                 command: Some("codex".into()),
@@ -272,7 +272,7 @@ fn agent_start_env_overrides_appear_on_stderr() {
         repo,
         &[agent(
             "codex",
-            clank_core::vocab::Role::Reviewers,
+            clank_core::vocab::Role::Reviewer,
             Some(clank_core::vocab::Tool::Codex),
             Some(clank_core::agent_config::LaunchConfig {
                 command: Some("codex".into()),
