@@ -3,9 +3,10 @@ use std::path::{Path, PathBuf};
 
 use anyhow::Context;
 use clank_core::HookEvent;
+use clank_core::agent_config::LaunchConfig;
 use clank_core::ids::AgentLabel;
-use clank_core::vocab::Role;
-use serde::Deserialize;
+use clank_core::vocab::{Role, Tool};
+use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Config {
@@ -95,31 +96,56 @@ impl HooksFile {
     }
 }
 
-/// One entry in the user-scope `~/.clank/config.json` `default_agents`
-/// list. Consumed by `clank init` to pre-create per-agent config
-/// skeletons so a fresh repo's gate has registered reviewers
-/// immediately (no per-repo `clank as` dance).
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+/// One entry in the merged agent declaration. Lives in both the
+/// user-scope `~/.clank/config.json` `default_agents` list and the
+/// repo-scope `<repo>/.clank/config.json` `agents` list. The
+/// merged set is the source of truth for "which agents exist + their
+/// role + tool + launch profile" (per `agent-add-cli-and-repo-scope`).
+/// Per-agent skeletons at `.clank/agents/<label>/config.json` hold
+/// only per-machine state (auto_mode, wfw_timeout, session).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub struct DefaultAgent {
     pub label: AgentLabel,
     #[serde(default)]
     pub role: Role,
+    /// Tool this agent runs (claude / codex). Consumed by spawners
+    /// (zellij layouts) and by `clank agent start` as a fallback
+    /// when the session is unbound. `None` = no preferred tool
+    /// declared (rare; most adds use `--tool`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool: Option<Tool>,
+    /// Launch profile (command override + args + env). Same shape
+    /// as `clank_core::agent_config::LaunchConfig`. Consumed by
+    /// `clank agent start` to compose the executed command.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub launch: Option<LaunchConfig>,
 }
 
-#[derive(Debug, Default, Deserialize)]
-struct UserDefaultAgentsFile {
-    #[serde(default)]
-    default_agents: Vec<DefaultAgent>,
+/// Repo-scope `<repo>/.clank/config.json` deserialization wrapper
+/// for the `agents` field. Public so tests + the `clank agent
+/// add/remove/set-role` writers can round-trip via serde rather
+/// than hand-rolling JSON.
+#[derive(Debug, Default, Deserialize, Serialize)]
+pub struct RepoAgentsFile {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub agents: Vec<DefaultAgent>,
+}
+
+/// User-scope `~/.clank/config.json` deserialization wrapper for
+/// the `default_agents` field. Public for the same reason as
+/// [`RepoAgentsFile`].
+#[derive(Debug, Default, Deserialize, Serialize)]
+pub struct UserAgentsFile {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub default_agents: Vec<DefaultAgent>,
 }
 
 /// Strict loader for the user-scope `default_agents` list.
 ///
-/// **Scope**: user-scope only (`~/.clank/config.json`). Repo-scope
-/// config (`<repo>/.clank/config.json`) is NOT consulted here.
-/// Rationale: `clank init` runs before any repo-scope config
-/// exists, so a repo-scope `default_agents` field at init time is
-/// the empty case anyway. A future plan that adds repo-scope agent
-/// management owns that policy.
+/// **Scope**: user-scope only. For the merged set (user-scope ∪
+/// repo-scope-overrides), use [`load_merged_agents`]. This function
+/// remains for the `clank init` path where repo-scope config
+/// doesn't yet exist.
 ///
 /// **Failure policy**: missing file = empty list (no opt-in = no
 /// seed); malformed file = error. This is deliberately stricter
@@ -144,9 +170,45 @@ pub fn load_default_agents(home: Option<&Path>) -> anyhow::Result<Vec<DefaultAge
                 .with_context(|| format!("reading user config {}", path.display()));
         }
     };
-    let parsed: UserDefaultAgentsFile = serde_json::from_str(&body)
+    let parsed: UserAgentsFile = serde_json::from_str(&body)
         .with_context(|| format!("parsing user config {}", path.display()))?;
     Ok(parsed.default_agents)
+}
+
+/// Strict loader for the repo-scope `agents` list at
+/// `<repo>/.clank/config.json`. Same failure-policy semantics as
+/// [`load_default_agents`] (missing = empty; malformed = error)
+/// for the same reason: silently dropping a multi-reviewer set
+/// would convert the repo to auto-finalize.
+pub fn load_repo_agents(repo_root: &Path) -> anyhow::Result<Vec<DefaultAgent>> {
+    let path = repo_root.join(".clank/config.json");
+    let body = match std::fs::read_to_string(&path) {
+        Ok(b) => b,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => {
+            return Err(anyhow::anyhow!(e))
+                .with_context(|| format!("reading repo config {}", path.display()));
+        }
+    };
+    let parsed: RepoAgentsFile = serde_json::from_str(&body)
+        .with_context(|| format!("parsing repo config {}", path.display()))?;
+    Ok(parsed.agents)
+}
+
+/// Merged agent declaration: repo-scope `agents` if present (REPLACE
+/// semantics — `the local project can modify it`); else fall back
+/// to user-scope `default_agents`. This is the source of truth for
+/// "which agents exist + their role + tool + launch profile" per
+/// `agent-add-cli-and-repo-scope`.
+pub fn load_merged_agents(
+    repo_root: &Path,
+    home: Option<&Path>,
+) -> anyhow::Result<Vec<DefaultAgent>> {
+    let repo = load_repo_agents(repo_root)?;
+    if !repo.is_empty() {
+        return Ok(repo);
+    }
+    load_default_agents(home)
 }
 
 pub fn load(repo_root: &Path) -> Config {

@@ -94,27 +94,29 @@ fn finish_amend_dry_purge_does_not_mutate_head_when_already_finished() {
 
 #[test]
 fn finish_fails_closed_on_malformed_reviewer_config() {
-    // Regression: a corrupted .clank/agents/<label>/config.json
-    // must NOT silently behave like a zero-reviewer repo (which would
-    // auto-Approve and let master finalize without any review).
-    // The expected-reviewer loader is strict; finalize fails closed.
+    // Regression: a corrupted agent declaration must NOT silently
+    // behave like a zero-reviewer repo (which would auto-Approve
+    // and let master finalize without any review). The
+    // declaration loader is strict; finalize fails closed.
+    //
+    // After agent-add-cli-and-repo-scope, the agent declaration
+    // lives in .clank/config.json's `agents` field (or
+    // ~/.clank/config.json's default_agents), NOT in the per-agent
+    // skeleton. This test exercises the repo-scope declaration's
+    // strict-fail semantic.
     let dir = init_repo();
     let repo = dir.path();
     write(repo, ".clank/plans/foo.md", "# foo\n");
-    // Malformed JSON in codex's config — this would silently drop
-    // codex under lossy loading.
-    write(
-        repo,
-        ".clank/agents/codex/config.json",
-        "{ this is not valid JSON",
-    );
+    // Malformed JSON in the repo-scope agents declaration — would
+    // silently drop reviewers under lossy loading.
+    write(repo, ".clank/config.json", "{ this is not valid JSON");
     git(repo, &["add", "-A"]);
     git(repo, &["commit", "--quiet", "-m", "[foo] intro"]);
 
     let out = run_clank(repo, &["finish", "foo"]);
     assert!(
         !out.status.success(),
-        "clank finish must fail closed when a reviewer config is malformed; got stdout=`{}` stderr=`{}`",
+        "clank finish must fail closed when the declaration is malformed; got stdout=`{}` stderr=`{}`",
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr),
     );
@@ -124,10 +126,10 @@ fn finish_fails_closed_on_malformed_reviewer_config() {
         String::from_utf8_lossy(&out.stderr)
     );
     assert!(
-        combined.to_lowercase().contains("codex")
-            || combined.to_lowercase().contains("config")
+        combined.to_lowercase().contains("config")
             || combined.to_lowercase().contains("agent")
-            || combined.to_lowercase().contains("json"),
+            || combined.to_lowercase().contains("json")
+            || combined.to_lowercase().contains("parsing"),
         "expected error to mention the broken config; got: {combined}"
     );
 }
@@ -140,12 +142,20 @@ fn finish_rejects_approve_without_finished() {
     let dir = init_repo();
     let repo = dir.path();
     write(repo, ".clank/plans/foo.md", "# foo\n");
-    // Register codex as a reviewer so the all-reviewers gate
-    // treats their verdict as load-bearing.
+    // Register codex as a reviewer via the repo-scope declaration
+    // (source of truth post agent-add-cli-and-repo-scope).
+    let file = clank::cli::config::RepoAgentsFile {
+        agents: vec![clank::cli::config::DefaultAgent {
+            label: clank_core::ids::AgentLabel::parse("codex").unwrap(),
+            role: clank_core::vocab::Role::Reviewers,
+            tool: None,
+            launch: None,
+        }],
+    };
     write(
         repo,
-        ".clank/agents/codex/config.json",
-        "{\"role\":\"reviewers\"}",
+        ".clank/config.json",
+        &serde_json::to_string_pretty(&file).unwrap(),
     );
     git(repo, &["add", "-A"]);
     git(repo, &["commit", "--quiet", "-m", "[foo] intro"]);

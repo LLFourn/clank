@@ -46,11 +46,46 @@ fn init_repo() -> tempfile::TempDir {
 }
 
 fn register_reviewer(repo: &Path, label: &str) {
-    write(
-        repo,
-        &format!(".clank/agents/{label}/config.json"),
-        "{\"role\":\"reviewers\"}",
-    );
+    // Source of truth for gate input is the merged declaration
+    // post agent-add-cli-and-repo-scope. Append <label> to
+    // <repo>/.clank/config.json's `agents` field, preserving any
+    // other top-level keys (review, hooks) the test setup may
+    // have written. A single typed RepoConfigFile that serdes
+    // all fields would be cleaner — tracked as a follow-up plan.
+    merge_repo_config(repo, |v| {
+        let entry = serde_json::to_value(clank::cli::config::DefaultAgent {
+            label: clank_core::ids::AgentLabel::parse(label).unwrap(),
+            role: clank_core::vocab::Role::Reviewers,
+            tool: None,
+            launch: None,
+        })
+        .unwrap();
+        let agents = v
+            .as_object_mut()
+            .unwrap()
+            .entry("agents")
+            .or_insert_with(|| serde_json::json!([]));
+        agents.as_array_mut().unwrap().push(entry);
+    });
+}
+
+/// Read-modify-write helper for `<repo>/.clank/config.json`. The
+/// modify closure receives a mutable `serde_json::Value` (object)
+/// and returns nothing. Preserves any keys the caller doesn't
+/// touch so layered test setups (TestEnv::new + register_reviewer
+/// + per-test hook config) compose without clobbering each other.
+fn merge_repo_config<F: FnOnce(&mut serde_json::Value)>(repo: &Path, modify: F) {
+    let path = repo.join(".clank/config.json");
+    let mut value: serde_json::Value = match std::fs::read_to_string(&path) {
+        Ok(s) => serde_json::from_str(&s).unwrap_or_else(|_| serde_json::json!({})),
+        Err(_) => serde_json::json!({}),
+    };
+    if !value.is_object() {
+        value = serde_json::json!({});
+    }
+    modify(&mut value);
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(&path, serde_json::to_string_pretty(&value).unwrap()).unwrap();
 }
 
 fn write(repo: &Path, rel: &str, body: &str) {
@@ -87,9 +122,11 @@ impl TestEnv {
         let repo = init_repo();
         // Disable ad-hoc review by default in tests so only plan
         // work is visible (matches pre-adhoc-review behavior).
-        let cfg_path = repo.path().join(".clank/config.json");
-        std::fs::create_dir_all(cfg_path.parent().unwrap()).unwrap();
-        std::fs::write(&cfg_path, r#"{"review":{"adhoc_feedback":false}}"#).unwrap();
+        // Uses merge so register_reviewer's prior `agents` field
+        // survives.
+        merge_repo_config(repo.path(), |v| {
+            v["review"] = serde_json::json!({"adhoc_feedback": false});
+        });
         Self {
             home: tempfile::tempdir().unwrap(),
             repo,
@@ -121,13 +158,12 @@ fn clank_cmd(repo: &Path) -> Command {
 }
 
 /// Disable ad-hoc review in a test repo so old tests that expect
-/// "reviewer blocks with no plans" still pass.
+/// "reviewer blocks with no plans" still pass. Uses merge so any
+/// prior agent registrations survive.
 fn disable_adhoc_review(repo: &Path) {
-    write(
-        repo,
-        ".clank/config.json",
-        r#"{"review":{"adhoc_feedback":false}}"#,
-    );
+    merge_repo_config(repo, |v| {
+        v["review"] = serde_json::json!({"adhoc_feedback": false});
+    });
 }
 
 /// Spawn `clank wfw …` with stdout piped. Returns a handle the test
@@ -1274,13 +1310,9 @@ fn wfw_hook_fires_reviewer_work() {
 
     let marker = repo.join("hook-fired.txt");
     let hook_cmd = format!("echo $CLANK_EVENT $CLANK_PLAN > {}", marker.display());
-    write(
-        repo,
-        ".clank/config.json",
-        &format!(
-            r#"{{"review":{{"adhoc_feedback":false}},"hooks":{{"reviewer-work":"{hook_cmd}"}}}}"#
-        ),
-    );
+    merge_repo_config(repo, |v| {
+        v["hooks"] = serde_json::json!({"reviewer-work": hook_cmd});
+    });
 
     let mut child = env
         .cmd()
@@ -1323,11 +1355,9 @@ fn wfw_hook_failure_does_not_fail_wfw() {
     write(repo, "README.md", "# repo\n");
     commit(repo, "init");
 
-    write(
-        repo,
-        ".clank/config.json",
-        r#"{"review":{"adhoc_feedback":false},"hooks":{"reviewer-work":"exit 1"}}"#,
-    );
+    merge_repo_config(repo, |v| {
+        v["hooks"] = serde_json::json!({"reviewer-work": "exit 1"});
+    });
 
     let mut child = env
         .cmd()
@@ -1376,11 +1406,9 @@ fn wfw_master_empty_parks_with_hooks_configured() {
     write(repo, "README.md", "# repo\n");
     commit(repo, "init");
 
-    write(
-        repo,
-        ".clank/config.json",
-        r#"{"review":{"adhoc_feedback":false},"hooks":{"reviewer_work":"true"}}"#,
-    );
+    merge_repo_config(repo, |v| {
+        v["hooks"] = serde_json::json!({"reviewer_work": "true"});
+    });
 
     let output = env
         .cmd()
@@ -1475,14 +1503,10 @@ fn wfw_user_hooks_shadowed_by_repo_hooks() {
     )
     .unwrap();
 
-    write(
-        repo,
-        ".clank/config.json",
-        &format!(
-            r#"{{"review":{{"adhoc_feedback":false}},"hooks":{{"reviewer-work":"touch {}"}}}}"#,
-            repo_marker.display()
-        ),
-    );
+    let repo_marker_path = repo_marker.display().to_string();
+    merge_repo_config(repo, |v| {
+        v["hooks"] = serde_json::json!({"reviewer-work": format!("touch {}", repo_marker_path)});
+    });
 
     let mut child = env
         .cmd()

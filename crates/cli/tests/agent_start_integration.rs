@@ -49,6 +49,32 @@ fn run_start(repo: &Path, args: &[&str]) -> std::process::Output {
     cmd.output().expect("spawn clank agent start")
 }
 
+/// Write the repo-scope `agents` declaration via the typed struct
+/// so schema changes show up as type errors rather than silent
+/// JSON drift.
+fn write_repo_agents(repo: &Path, agents: &[clank::cli::config::DefaultAgent]) {
+    let file = clank::cli::config::RepoAgentsFile {
+        agents: agents.to_vec(),
+    };
+    let json = serde_json::to_string_pretty(&file).unwrap();
+    std::fs::create_dir_all(repo.join(".clank")).unwrap();
+    std::fs::write(repo.join(".clank/config.json"), json).unwrap();
+}
+
+fn agent(
+    label: &str,
+    role: clank_core::vocab::Role,
+    tool: Option<clank_core::vocab::Tool>,
+    launch: Option<clank_core::agent_config::LaunchConfig>,
+) -> clank::cli::config::DefaultAgent {
+    clank::cli::config::DefaultAgent {
+        label: clank_core::ids::AgentLabel::parse(label).unwrap(),
+        role,
+        tool,
+        launch,
+    }
+}
+
 const CLAUDE_SESSION: &str = "742f6a04-f174-409a-ab01-419a16c5f372";
 const CODEX_SESSION: &str = "019e54b7-b1c9-7552-8075-69db24499247";
 
@@ -108,7 +134,8 @@ fn agent_start_launch_args_precede_session_restore_for_claude() {
     // Locks in the codex-driven ordering decision: launch args
     // attach to the tool itself, BEFORE the session-restore
     // suffix. For claude (flat flags) this is cosmetic but
-    // consistent.
+    // consistent. Launch lives in the repo-scope declaration
+    // per `agent-add-cli-and-repo-scope`.
     let dir = init_repo();
     let repo = dir.path();
     write(
@@ -117,11 +144,23 @@ fn agent_start_launch_args_precede_session_restore_for_claude() {
         &format!(
             r#"{{
                 "auto_mode":"off",
-                "role":"reviewers",
-                "session":{{"id":"{CLAUDE_SESSION}","tool":"claude","updated_at":"2026-06-04T12:00:00Z"}},
-                "launch":{{"command":"claude","args":["--skill","ruthless"]}}
+                "session":{{"id":"{CLAUDE_SESSION}","tool":"claude","updated_at":"2026-06-04T12:00:00Z"}}
             }}"#
         ),
+    );
+    // Launch profile lives in the merged declaration.
+    write_repo_agents(
+        repo,
+        &[agent(
+            "ruthless",
+            clank_core::vocab::Role::Reviewers,
+            Some(clank_core::vocab::Tool::Claude),
+            Some(clank_core::agent_config::LaunchConfig {
+                command: Some("claude".into()),
+                args: vec!["--skill".into(), "ruthless".into()],
+                env: Default::default(),
+            }),
+        )],
     );
 
     let out = run_start(repo, &["ruthless", "--print"]);
@@ -136,7 +175,8 @@ fn agent_start_launch_args_precede_session_restore_for_claude() {
 fn agent_start_codex_launch_args_precede_subcommand() {
     // Critical for codex: launch.args must attach to the
     // `codex` binary, NOT to the `resume` subcommand. The fix
-    // is that launch.args come BEFORE session-restore.
+    // is that launch.args come BEFORE session-restore. Launch
+    // lives in the repo-scope declaration.
     let dir = init_repo();
     let repo = dir.path();
     write(
@@ -145,11 +185,22 @@ fn agent_start_codex_launch_args_precede_subcommand() {
         &format!(
             r#"{{
                 "auto_mode":"off",
-                "role":"reviewers",
-                "session":{{"id":"{CODEX_SESSION}","tool":"codex","updated_at":"2026-06-04T12:00:00Z"}},
-                "launch":{{"command":"codex","args":["--profile","deep"]}}
+                "session":{{"id":"{CODEX_SESSION}","tool":"codex","updated_at":"2026-06-04T12:00:00Z"}}
             }}"#
         ),
+    );
+    write_repo_agents(
+        repo,
+        &[agent(
+            "codex-deep",
+            clank_core::vocab::Role::Reviewers,
+            Some(clank_core::vocab::Tool::Codex),
+            Some(clank_core::agent_config::LaunchConfig {
+                command: Some("codex".into()),
+                args: vec!["--profile".into(), "deep".into()],
+                env: Default::default(),
+            }),
+        )],
     );
 
     let out = run_start(repo, &["codex-deep", "--print"]);
@@ -174,14 +225,26 @@ fn agent_start_env_overrides_appear_on_stderr() {
         &format!(
             r#"{{
                 "auto_mode":"off",
-                "role":"reviewers",
-                "session":{{"id":"{CODEX_SESSION}","tool":"codex","updated_at":"2026-06-04T12:00:00Z"}},
-                "launch":{{
-                    "command":"codex",
-                    "env":{{"CODEX_PROFILE":"review","CODEX_LOG":"debug"}}
-                }}
+                "session":{{"id":"{CODEX_SESSION}","tool":"codex","updated_at":"2026-06-04T12:00:00Z"}}
             }}"#
         ),
+    );
+    // Env lives in the merged declaration's launch profile.
+    let mut env = std::collections::BTreeMap::new();
+    env.insert("CODEX_PROFILE".to_string(), "review".to_string());
+    env.insert("CODEX_LOG".to_string(), "debug".to_string());
+    write_repo_agents(
+        repo,
+        &[agent(
+            "codex",
+            clank_core::vocab::Role::Reviewers,
+            Some(clank_core::vocab::Tool::Codex),
+            Some(clank_core::agent_config::LaunchConfig {
+                command: Some("codex".into()),
+                args: vec![],
+                env,
+            }),
+        )],
     );
 
     let out = run_start(repo, &["codex", "--print"]);

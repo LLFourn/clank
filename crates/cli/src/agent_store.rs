@@ -56,23 +56,28 @@ pub fn load_all_agent_configs(repo: &Path) -> anyhow::Result<Vec<(AgentLabel, Ag
     Ok(out)
 }
 
-/// Labels of every agent in this repo with `role: Reviewers`.
-/// Used by gate-projection callers to populate
-/// `WorkPolicy.expected_reviewers`.
+/// Labels of every agent registered as a reviewer in this repo.
 ///
-/// **Strict** by design: a malformed `.clank/agents/<label>/config.json`
-/// is propagated as an error rather than silently dropping that
-/// reviewer. The gate's "zero registered reviewers → auto-Approved"
-/// rule means lossy loading would fail open — a single corrupted
-/// reviewer config could let master finalize without review. This
-/// path fails closed instead. Use `clank doctor` to inspect / fix
-/// broken configs.
+/// Source of truth: the **merged agent declaration** (repo-scope
+/// `<repo>/.clank/config.json#/agents` if present, else user-scope
+/// `~/.clank/config.json#/default_agents`). Per
+/// `agent-add-cli-and-repo-scope`, the declaration drives gate
+/// input — `clank agent remove` removing the declaration entry IS
+/// what removes a reviewer from the gate.
+///
+/// **Strict** by design: a malformed declaration file is
+/// propagated as an error rather than silently dropping reviewers.
+/// The gate's "zero registered reviewers → auto-Approved" rule
+/// means lossy loading would fail open — a corrupted declaration
+/// could let master finalize without review. Fails closed instead.
 pub fn load_expected_reviewers(repo: &Path) -> anyhow::Result<Vec<AgentLabel>> {
     use clank_core::vocab::Role;
-    Ok(load_all_agent_configs(repo)?
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    let merged = crate::cli::config::load_merged_agents(repo, home.as_deref())?;
+    Ok(merged
         .into_iter()
-        .filter(|(_, cfg)| cfg.role == Role::Reviewers)
-        .map(|(label, _)| label)
+        .filter(|e| e.role == Role::Reviewers)
+        .map(|e| e.label)
         .collect())
 }
 

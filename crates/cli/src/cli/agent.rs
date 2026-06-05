@@ -121,7 +121,13 @@ fn print_human(rows: &[AgentRow]) {
 /// `clank agent start <name>`: exec into the agent's CLI tool
 /// with session restored and the configured launch profile
 /// applied. Requires a bound session (one policy: no fallback
-/// to bare tool — see plan rationale at Phase B step 2).
+/// to bare tool — see plan rationale at Phase B step 2 of
+/// `agent-config-and-start`).
+///
+/// Launch profile source: the merged declaration's `launch`
+/// field (per `agent-add-cli-and-repo-scope` — declaration is
+/// the source of truth for role + tool + launch). Session
+/// binding still comes from the per-agent skeleton.
 fn start(args: AgentStartArgs) -> anyhow::Result<()> {
     let repo = resolve_repo(args.repo.as_deref())?;
     let label = AgentLabel::parse(&args.name)
@@ -145,7 +151,14 @@ fn start(args: AgentStartArgs) -> anyhow::Result<()> {
         )
     })?;
 
-    let composed = compose_launch(&repo, session, cfg.launch.as_ref());
+    let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+    let merged = crate::cli::config::load_merged_agents(&repo, home.as_deref()).unwrap_or_default();
+    let declaration_launch = merged
+        .iter()
+        .find(|e| e.label == label)
+        .and_then(|e| e.launch.as_ref());
+
+    let composed = compose_launch(&repo, session, declaration_launch);
 
     if args.print {
         print_composed(&composed);
