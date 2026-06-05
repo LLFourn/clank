@@ -409,7 +409,11 @@ fn print_composed(c: &ComposedDiffLaunch) {
     }
     println!("{line}");
     for (k, v) in &c.env_overrides {
-        eprintln!("env: {k}={v}");
+        // Escape newlines so multi-line values (CLANK_DIFF_FOCUS
+        // with multiple --focus flags, etc.) stay on one line.
+        // Tests + zellij-style consumers split on \n to recover.
+        let escaped = v.replace('\\', "\\\\").replace('\n', "\\n");
+        eprintln!("env: {k}={escaped}");
     }
     eprintln!("wait: {}", c.wait);
 }
