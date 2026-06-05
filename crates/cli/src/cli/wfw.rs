@@ -108,15 +108,14 @@ pub async fn run(args: WfwArgs) -> anyhow::Result<()> {
         None => crate::agent_env::resolve_identity_from_env(&repo)?,
     };
 
-    // Resolve --role from the agent's own config when omitted.
-    // Role is a per-user preference, not a repo-shared claim —
-    // see `clank_core::agent_config` module docs.
+    // Resolve --role from the merged declaration when omitted.
+    // The declaration is authoritative for role per
+    // `agent-add-cli-and-repo-scope`; `resolve_role` falls back to
+    // skeleton for pre-Phase-1 repos. Codex caught the
+    // skeleton-only lookup on da71c84.
     let role: Role = match args.role {
         Some(explicit) => explicit.into(),
-        None => {
-            let agent_cfg = crate::agent_store::load_agent_config(&repo, &author)?;
-            clank_core::role_for(&author, agent_cfg.as_ref())
-        }
+        None => crate::agent_store::resolve_role(&repo, &author)?,
     };
 
     let policy = if args.no_cache {

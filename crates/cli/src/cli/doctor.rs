@@ -140,96 +140,156 @@ fn repo_checks(repo: &Path) -> Vec<CheckResult> {
     // .claude/settings.local.json permissions.
     out.push(check_claude_perms(repo));
 
-    // Per-agent configs.
-    if agents_root(repo).is_dir() {
-        match load_all_agent_configs(repo) {
-            Ok(agents) => {
-                if agents.is_empty() {
-                    out.push(CheckResult::ok(
-                        SECTION,
-                        "agents",
-                        "no agents bound yet (run `clank as <label>` in an agent session)"
-                            .to_string(),
-                    ));
-                }
-                for (label, cfg) in &agents {
-                    let session_desc = cfg
-                        .session
-                        .as_ref()
-                        .map(|s| {
-                            format!(
-                                "{} bound to {} ({})",
-                                s.tool.as_str(),
-                                s.id.as_str(),
-                                s.updated_at
-                            )
-                        })
-                        .unwrap_or_else(|| "unbound".to_string());
-                    let base_msg = format!(
-                        "{}: auto_mode={}, session={}",
-                        agent_config_path(repo, label).display(),
-                        cfg.auto_mode.as_str(),
-                        session_desc,
-                    );
-                    // Unbound reviewer: the all-reviewers gate will
-                    // never see APPROVE/FINISHED from this label, so
-                    // every commit's gate stays Unreviewed until the
-                    // user runs `clank as <label>` from inside the
-                    // agent's session.
-                    // Unbound master is uncommon but possible (e.g.
-                    // seeded with `default_agents`, never launched);
-                    // flag for symmetry — Phase 2's bootstrap would
-                    // bind it on next `clank init`, but until then
-                    // there's no master operating the plan.
-                    let entry = if cfg.session.is_none() {
-                        let role_str = cfg.role.as_str();
-                        CheckResult::warn(
-                            SECTION,
-                            format!("agent: {}", label.as_str()),
-                            format!(
-                                "{base_msg} — registered {role_str} is unbound; \
-                                 run `clank as {}` from inside the agent's session to bind",
-                                label.as_str()
-                            ),
-                        )
-                    } else {
-                        CheckResult::ok(SECTION, format!("agent: {}", label.as_str()), base_msg)
-                    };
-                    out.push(entry);
-
-                    // `cfg.launch.command on $PATH?` — Warn if the
-                    // configured launch command isn't found.
-                    // Catches typos in `launch.command` before the
-                    // user tries `clank agent start <label>`.
-                    if let Some(launch) = &cfg.launch {
-                        if let Some(cmd) = launch.command.as_deref() {
-                            if which::which(cmd).is_err() {
-                                out.push(CheckResult::warn(
-                                    SECTION,
-                                    format!("agent: {} launch", label.as_str()),
-                                    format!(
-                                        "`launch.command = {cmd:?}` not found on $PATH; \
-                                         `clank agent start {}` will fail at exec time",
-                                        label.as_str()
-                                    ),
-                                ));
-                            }
-                        }
-                    }
-                }
-            }
-            Err(e) => out.push(CheckResult::fail(
+    // Per-agent checks: iterate the merged declaration (source of
+    // truth per agent-add-cli-and-repo-scope), join skeleton state,
+    // and also flag orphan skeletons (skeleton present, label not
+    // in declaration).
+    let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+    let merged = match crate::cli::config::load_merged_agents(repo, home.as_deref()) {
+        Ok(m) => m,
+        Err(e) => {
+            out.push(CheckResult::fail(
                 SECTION,
                 "agents",
-                format!("failed to load agent configs: {e:#}"),
-            )),
+                format!("failed to load agent declaration: {e:#}"),
+            ));
+            return out;
         }
-    } else {
+    };
+
+    if merged.is_empty() && !agents_root(repo).is_dir() {
         out.push(CheckResult::ok(
             SECTION,
             "agents",
-            ".clank/agents/ does not exist yet (created lazily)".to_string(),
+            "no agents declared (run `clank agent add <label>`)".to_string(),
         ));
+    }
+
+    // Per-declared-agent checks: skeleton presence + launch
+    // command resolution.
+    for entry in &merged {
+        let label = &entry.label;
+        let role_str = entry.role.as_str();
+        let skeleton = match load_agent_config(repo, label) {
+            Ok(s) => s,
+            Err(e) => {
+                out.push(CheckResult::fail(
+                    SECTION,
+                    format!("agent: {}", label.as_str()),
+                    format!("failed to read skeleton: {e:#}"),
+                ));
+                continue;
+            }
+        };
+
+        // Missing skeleton diagnostic: declared but no
+        // `.clank/agents/<label>/config.json` (Phase 7 of plan).
+        let Some(cfg) = skeleton else {
+            out.push(CheckResult::warn(
+                SECTION,
+                format!("agent: {}", label.as_str()),
+                format!(
+                    "agent `{}` in merged declaration but `.clank/agents/{}/config.json` missing; \
+                     run `clank init` to seed the skeleton",
+                    label.as_str(),
+                    label.as_str(),
+                ),
+            ));
+            continue;
+        };
+
+        let session_desc = cfg
+            .session
+            .as_ref()
+            .map(|s| {
+                format!(
+                    "{} bound to {} ({})",
+                    s.tool.as_str(),
+                    s.id.as_str(),
+                    s.updated_at
+                )
+            })
+            .unwrap_or_else(|| "unbound".to_string());
+        let base_msg = format!(
+            "{}: auto_mode={}, session={}",
+            agent_config_path(repo, label).display(),
+            cfg.auto_mode.as_str(),
+            session_desc,
+        );
+        // Unbound: the all-reviewers gate will never see
+        // APPROVE/FINISHED from this label until the user runs
+        // `clank as <label>` from inside the agent's session.
+        let agent_check = if cfg.session.is_none() {
+            CheckResult::warn(
+                SECTION,
+                format!("agent: {}", label.as_str()),
+                format!(
+                    "{base_msg} — registered {role_str} is unbound; \
+                     run `clank as {}` from inside the agent's session to bind",
+                    label.as_str()
+                ),
+            )
+        } else {
+            CheckResult::ok(SECTION, format!("agent: {}", label.as_str()), base_msg)
+        };
+        out.push(agent_check);
+
+        // `declaration.launch.command on $PATH?` — Warn if the
+        // configured launch command isn't found. Catches typos in
+        // `launch.command` before the user tries
+        // `clank agent start <label>`. Reads launch from the
+        // DECLARATION (per agent-add-cli-and-repo-scope), not the
+        // skeleton.
+        if let Some(launch) = &entry.launch {
+            if let Some(cmd) = launch.command.as_deref() {
+                if which::which(cmd).is_err() {
+                    out.push(CheckResult::warn(
+                        SECTION,
+                        format!("agent: {} launch", label.as_str()),
+                        format!(
+                            "`launch.command = {cmd:?}` not found on $PATH; \
+                             `clank agent start {}` will fail at exec time",
+                            label.as_str()
+                        ),
+                    ));
+                }
+            }
+        }
+    }
+
+    // Orphan-skeleton check: walk .clank/agents/ and flag any
+    // directory whose label isn't in the merged declaration
+    // (Phase 7 of plan). Doctor as recovery surface for
+    // `clank agent add` partial failures.
+    if agents_root(repo).is_dir() {
+        let declared_labels: std::collections::HashSet<&str> =
+            merged.iter().map(|e| e.label.as_str()).collect();
+        match load_all_agent_configs(repo) {
+            Ok(skeletons) => {
+                for (skel_label, _) in &skeletons {
+                    if !declared_labels.contains(skel_label.as_str()) {
+                        out.push(CheckResult::warn(
+                            SECTION,
+                            format!("agent: {}", skel_label.as_str()),
+                            format!(
+                                "found `.clank/agents/{}/config.json` but `{}` not in the merged agent declaration \
+                                 (neither repo-scope `agents` nor user-scope `default_agents`); \
+                                 run `clank agent add {}` to register, or `rm -rf .clank/agents/{}/` to remove it",
+                                skel_label.as_str(),
+                                skel_label.as_str(),
+                                skel_label.as_str(),
+                                skel_label.as_str(),
+                            ),
+                        ));
+                    }
+                }
+            }
+            Err(e) => out.push(CheckResult::warn(
+                SECTION,
+                "agents",
+                format!("failed to scan skeleton dirs for orphans: {e:#}"),
+            )),
+        }
     }
 
     out

@@ -13,19 +13,28 @@
 
 use std::path::Path;
 
+use anyhow::Context;
 use serde::Serialize;
 
-use crate::agent_store::load_agent_config;
-use clank_core::agent_config::{LaunchConfig, Session};
+use crate::agent_store::{agent_config_path, load_agent_config, save_agent_config};
+use crate::cli::config::{DefaultAgent, RepoConfigFile, UserConfigFile};
+use clank_core::agent_config::{AgentConfig, LaunchConfig, Session};
 use clank_core::ids::AgentLabel;
 use clank_core::vocab::{Role, Tool};
+use std::collections::BTreeMap;
 
-use super::{AgentArgs, AgentCmd, AgentListArgs, AgentStartArgs, resolve_repo};
+use super::{
+    AgentAddArgs, AgentArgs, AgentCmd, AgentListArgs, AgentRemoveArgs, AgentSetRoleArgs,
+    AgentStartArgs, resolve_repo,
+};
 
 pub async fn run(args: AgentArgs) -> anyhow::Result<()> {
     match args.command {
         AgentCmd::List(a) => list(a),
         AgentCmd::Start(a) => start(a),
+        AgentCmd::Add(a) => add(a),
+        AgentCmd::Remove(a) => remove(a),
+        AgentCmd::SetRole(a) => set_role(a),
     }
 }
 
@@ -299,6 +308,305 @@ fn exec_composed(c: ComposedLaunch) -> anyhow::Result<()> {
         anyhow::bail!("`{}` exited with status {}", c.program, status);
     }
     Ok(())
+}
+
+// ── Phase 4 + 5 + 6: clank agent add/remove/set-role ─────────────
+//
+// All three mutate the merged-declaration source of truth:
+// repo-scope `<repo>/.clank/config.json` `agents` (default) or
+// user-scope `~/.clank/config.json` `default_agents` (`--global`).
+// The per-agent skeleton at `<repo>/.clank/agents/<label>/config.json`
+// holds only per-machine state — these commands NEVER write role or
+// launch into the skeleton. See Phase 5 of agent-add-cli-and-repo-scope.
+
+/// `clank agent add <label> [...]`.
+fn add(args: AgentAddArgs) -> anyhow::Result<()> {
+    let label = AgentLabel::parse(&args.label)
+        .map_err(|e| anyhow::anyhow!("invalid agent label `{}`: {e}", args.label))?;
+    let role: Role = args.role.into();
+    let tool: Tool = args.tool.into();
+
+    let repo = resolve_repo(args.repo.as_deref())?;
+    let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+
+    let env = parse_env_overrides(&args.launch_envs)?;
+    let launch = build_launch(args.launch_cmd, args.launch_args, env);
+
+    let entry = DefaultAgent {
+        label: label.clone(),
+        role,
+        tool: Some(tool),
+        launch,
+    };
+
+    // Pre-checks (in-memory, no writes yet). Use declaration-only
+    // loaders — legacy skeleton fallback would conflate
+    // pre-existing skeletons with explicit registrations and
+    // refuse adds the user actually wants. Codex review of da71c84
+    // drove the explicit declared-vs-merged split.
+    let repo_set = crate::cli::config::load_repo_agents(&repo)?;
+    let user_set = crate::cli::config::load_default_agents(home.as_deref())?;
+    let in_repo = repo_set
+        .as_ref()
+        .map(|set| set.iter().any(|e| e.label == label))
+        .unwrap_or(false);
+    let in_user = user_set.iter().any(|e| e.label == label);
+
+    if args.global {
+        // User-scope add: refuse if label exists in user-scope OR
+        // in repo-scope (cross-scope ambiguity).
+        if in_user {
+            anyhow::bail!(
+                "agent `{}` already in user-scope `default_agents`",
+                args.label
+            );
+        }
+        if in_repo {
+            anyhow::bail!(
+                "agent `{}` is registered in repo-scope `agents` for this repo; \
+                 adding it to user-scope would produce ambiguous merge behavior. \
+                 Remove the repo-scope entry first or pick a different label.",
+                args.label
+            );
+        }
+        let home_ref = home
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("--global requires $HOME"))?;
+        let mut file = read_user_config(home_ref)?;
+        let mut agents = file.default_agents.unwrap_or_default();
+        agents.push(entry);
+        file.default_agents = Some(agents);
+        write_user_config(home_ref, &file)?;
+        eprintln!("registered `{}` in user-scope `default_agents`", args.label);
+    } else {
+        // Repo-scope add: refuse if already in repo-scope. ALLOW
+        // shadowing user-scope (REPLACE semantics) with stderr
+        // notice.
+        if in_repo {
+            anyhow::bail!("agent `{}` already in repo-scope `agents`", args.label);
+        }
+        let mut current_repo = repo_set.unwrap_or_default();
+        current_repo.push(entry);
+        // Skeleton write FIRST (idempotent at-rest; preserves
+        // existing per-machine state if a prior `clank as` bound
+        // a session). Then declaration write. See plan Phase 5.
+        write_skeleton_preserving_machine_state(&repo, &label)?;
+        let mut file = read_repo_config(&repo)?;
+        file.agents = Some(current_repo);
+        write_repo_config(&repo, &file)?;
+        if in_user {
+            eprintln!(
+                "note: repo-scope `{}` shadows user-scope default",
+                args.label
+            );
+        }
+        eprintln!("registered `{}` in repo-scope `agents`", args.label);
+    }
+    Ok(())
+}
+
+/// `clank agent remove <label> [--global]`.
+fn remove(args: AgentRemoveArgs) -> anyhow::Result<()> {
+    let label = AgentLabel::parse(&args.label)
+        .map_err(|e| anyhow::anyhow!("invalid agent label `{}`: {e}", args.label))?;
+    let repo = resolve_repo(args.repo.as_deref())?;
+    let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+
+    if args.global {
+        let home_ref = home
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("--global requires $HOME"))?;
+        let mut file = read_user_config(home_ref)?;
+        let mut agents = file.default_agents.ok_or_else(|| {
+            anyhow::anyhow!("agent `{}` not in user-scope `default_agents`", args.label)
+        })?;
+        let before = agents.len();
+        agents.retain(|e| e.label != label);
+        if agents.len() == before {
+            anyhow::bail!("agent `{}` not in user-scope `default_agents`", args.label);
+        }
+        // Empty list collapses to `None` so the key drops out of
+        // the JSON (Option's skip_serializing_if).
+        file.default_agents = if agents.is_empty() {
+            None
+        } else {
+            Some(agents)
+        };
+        write_user_config(home_ref, &file)?;
+        eprintln!("removed `{}` from user-scope `default_agents`", args.label);
+    } else {
+        let mut file = read_repo_config(&repo)?;
+        let mut current = file
+            .agents
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("agent `{}` not in repo-scope `agents`", args.label))?;
+        let before = current.len();
+        current.retain(|e| e.label != label);
+        if current.len() == before {
+            anyhow::bail!("agent `{}` not in repo-scope `agents`", args.label);
+        }
+        // Preserve the empty-list override semantic: if the user
+        // explicitly registered `agents: []` AND removed the
+        // last entry from a previously-populated list, keep
+        // `agents: []` (empty override). Distinguish "we removed
+        // the last entry from a list of N" (keep []) from "the
+        // list was already empty" (covered above by the
+        // bail!-on-no-change).
+        file.agents = Some(current);
+        write_repo_config(&repo, &file)?;
+        eprintln!(
+            "removed `{}` from repo-scope `agents` (per-agent dir + feedback preserved)",
+            args.label
+        );
+    }
+    Ok(())
+}
+
+/// `clank agent set-role <label> <role> [--global]`.
+fn set_role(args: AgentSetRoleArgs) -> anyhow::Result<()> {
+    let label = AgentLabel::parse(&args.label)
+        .map_err(|e| anyhow::anyhow!("invalid agent label `{}`: {e}", args.label))?;
+    let new_role: Role = args.role.into();
+    let repo = resolve_repo(args.repo.as_deref())?;
+    let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+
+    if args.global {
+        let home_ref = home
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("--global requires $HOME"))?;
+        let mut file = read_user_config(home_ref)?;
+        let mut agents = file.default_agents.ok_or_else(|| {
+            anyhow::anyhow!("agent `{}` not in user-scope `default_agents`", args.label)
+        })?;
+        let entry = agents
+            .iter_mut()
+            .find(|e| e.label == label)
+            .ok_or_else(|| {
+                anyhow::anyhow!("agent `{}` not in user-scope `default_agents`", args.label)
+            })?;
+        entry.role = new_role;
+        file.default_agents = Some(agents);
+        write_user_config(home_ref, &file)?;
+        eprintln!(
+            "set role of `{}` to `{}` in user-scope",
+            args.label,
+            new_role.as_str()
+        );
+    } else {
+        let mut file = read_repo_config(&repo)?;
+        let mut agents = file.agents.ok_or_else(|| {
+            anyhow::anyhow!(
+                "no repo-scope `agents` declaration; nothing to set-role in. Run `clank agent add` first."
+            )
+        })?;
+        let entry = agents
+            .iter_mut()
+            .find(|e| e.label == label)
+            .ok_or_else(|| anyhow::anyhow!("agent `{}` not in repo-scope `agents`", args.label))?;
+        entry.role = new_role;
+        file.agents = Some(agents);
+        write_repo_config(&repo, &file)?;
+        eprintln!(
+            "set role of `{}` to `{}` in repo-scope",
+            args.label,
+            new_role.as_str()
+        );
+    }
+    Ok(())
+}
+
+fn parse_env_overrides(raw: &[String]) -> anyhow::Result<BTreeMap<String, String>> {
+    let mut out = BTreeMap::new();
+    for s in raw {
+        let (k, v) = s
+            .split_once('=')
+            .ok_or_else(|| anyhow::anyhow!("--launch-env value `{s}` must be `KEY=VAL`"))?;
+        if k.is_empty() {
+            anyhow::bail!("--launch-env key cannot be empty: `{s}`");
+        }
+        out.insert(k.to_string(), v.to_string());
+    }
+    Ok(out)
+}
+
+/// Construct a `LaunchConfig` from CLI args. Returns `None` when
+/// no launch-related flag was passed (Phase 6 default: skeleton
+/// declaration's `launch` field is absent rather than `Some({})`).
+fn build_launch(
+    cmd: Option<String>,
+    args: Vec<String>,
+    env: BTreeMap<String, String>,
+) -> Option<LaunchConfig> {
+    if cmd.is_none() && args.is_empty() && env.is_empty() {
+        return None;
+    }
+    Some(LaunchConfig {
+        command: cmd,
+        args,
+        env,
+    })
+}
+
+/// Read `~/.clank/config.json` as a typed [`UserConfigFile`].
+/// Missing file → default; malformed JSON → error.
+fn read_user_config(home: &Path) -> anyhow::Result<UserConfigFile> {
+    let path = home.join(".clank/config.json");
+    match std::fs::read_to_string(&path) {
+        Ok(s) => serde_json::from_str(&s).with_context(|| format!("parsing {}", path.display())),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(UserConfigFile::default()),
+        Err(e) => Err(anyhow::Error::from(e).context(format!("reading {}", path.display()))),
+    }
+}
+
+/// Atomic write of `~/.clank/config.json`. Round-trip preserves
+/// `review`, `hooks`, and any unknown fields (via the `extra`
+/// flatten catchall on [`UserConfigFile`]).
+fn write_user_config(home: &Path, file: &UserConfigFile) -> anyhow::Result<()> {
+    write_typed_config(&home.join(".clank/config.json"), file)
+}
+
+/// Read `<repo>/.clank/config.json` as a typed [`RepoConfigFile`].
+fn read_repo_config(repo: &Path) -> anyhow::Result<RepoConfigFile> {
+    let path = repo.join(".clank/config.json");
+    match std::fs::read_to_string(&path) {
+        Ok(s) => serde_json::from_str(&s).with_context(|| format!("parsing {}", path.display())),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(RepoConfigFile::default()),
+        Err(e) => Err(anyhow::Error::from(e).context(format!("reading {}", path.display()))),
+    }
+}
+
+fn write_repo_config(repo: &Path, file: &RepoConfigFile) -> anyhow::Result<()> {
+    write_typed_config(&repo.join(".clank/config.json"), file)
+}
+
+fn write_typed_config<T: serde::Serialize>(path: &Path, value: &T) -> anyhow::Result<()> {
+    use std::io::Write;
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("no parent for `{}`", path.display()))?;
+    std::fs::create_dir_all(parent)?;
+    let mut tmp = tempfile::Builder::new()
+        .prefix(".clank-config-")
+        .suffix(".json.tmp")
+        .tempfile_in(parent)?;
+    tmp.write_all(serde_json::to_string_pretty(value)?.as_bytes())?;
+    tmp.write_all(b"\n")?;
+    tmp.as_file_mut().sync_all()?;
+    tmp.persist(path).map_err(|e| e.error)?;
+    Ok(())
+}
+
+/// Idempotent skeleton write: creates `<repo>/.clank/agents/<label>/config.json`
+/// with DEFAULT per-machine state IF the file doesn't exist.
+/// Pre-existing skeletons (e.g., from a prior `clank as <label>`
+/// binding) are left untouched — `clank agent add` MUST NOT clobber
+/// session / auto_mode / wfw_timeout.
+fn write_skeleton_preserving_machine_state(repo: &Path, label: &AgentLabel) -> anyhow::Result<()> {
+    let path = agent_config_path(repo, label);
+    if path.exists() {
+        return Ok(()); // preserve existing per-machine state
+    }
+    save_agent_config(repo, label, &AgentConfig::default())
 }
 
 #[cfg(test)]

@@ -73,7 +73,11 @@ async fn run_status(args: AutoStatusArgs) -> anyhow::Result<()> {
     let label = resolve_identity_from_env(&repo)?;
 
     let cfg = load_agent_config(&repo, &label)?.unwrap_or_default();
-    let role = role_for(&label, Some(&cfg));
+    // Role resolution prefers the merged declaration (codex review
+    // of da71c84). Fall back to the skeleton's role for pre-Phase-1
+    // repos.
+    let role = crate::agent_store::resolve_role(&repo, &label)
+        .unwrap_or_else(|_| role_for(&label, Some(&cfg)));
 
     if args.json {
         let payload = serde_json::json!({

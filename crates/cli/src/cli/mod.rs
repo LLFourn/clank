@@ -534,6 +534,15 @@ pub enum AgentCmd {
     /// any configured `launch` profile applied. Requires the
     /// agent to have a bound session (`clank as <name>`).
     Start(AgentStartArgs),
+    /// Register a new agent in the repo-scope `agents` declaration
+    /// (or user-scope `default_agents` with `--global`).
+    Add(AgentAddArgs),
+    /// Remove an agent from the declaration. Per-agent skeleton
+    /// directory + feedback history are preserved.
+    Remove(AgentRemoveArgs),
+    /// Change an existing agent's role in the declaration.
+    #[command(name = "set-role")]
+    SetRole(AgentSetRoleArgs),
 }
 
 #[derive(Args, Debug)]
@@ -560,6 +569,70 @@ pub struct AgentStartArgs {
     /// observe an exec'd process.
     #[arg(long)]
     pub print: bool,
+}
+
+#[derive(Args, Debug)]
+pub struct AgentAddArgs {
+    /// Agent label to register.
+    pub label: String,
+    /// Role for this agent. Defaults to `reviewers`.
+    #[arg(long, value_enum, default_value = "reviewers")]
+    pub role: RoleArg,
+    /// Tool this agent runs. Defaults to `claude`.
+    #[arg(long, value_enum, default_value = "claude")]
+    pub tool: ToolArg,
+    /// Write to user-scope `~/.clank/config.json` `default_agents`
+    /// instead of repo-scope `<repo>/.clank/config.json` `agents`.
+    /// User-scope adds do NOT create per-agent skeletons (those
+    /// land in each repo on first `clank init`).
+    #[arg(long)]
+    pub global: bool,
+    /// Override the executable used by `clank agent start`. If
+    /// unset, the agent's session-tool name (`claude` / `codex`)
+    /// is used.
+    #[arg(long, value_name = "CMD")]
+    pub launch_cmd: Option<String>,
+    /// Arguments inserted on the tool invocation BEFORE the
+    /// session-restore suffix. Repeat for multiple args.
+    #[arg(long = "launch-arg", value_name = "ARG")]
+    pub launch_args: Vec<String>,
+    /// Environment overrides applied to the spawned process.
+    /// Format `KEY=VAL`. Repeatable. `cfg.launch.env` wins over
+    /// the inherited environment on key collision.
+    #[arg(long = "launch-env", value_name = "KEY=VAL")]
+    pub launch_envs: Vec<String>,
+    /// Repo root. Defaults to the cwd's git toplevel.
+    #[arg(long, value_name = "PATH")]
+    pub repo: Option<PathBuf>,
+}
+
+#[derive(Args, Debug)]
+pub struct AgentRemoveArgs {
+    /// Agent label to remove.
+    pub label: String,
+    /// Remove from user-scope `default_agents` instead of
+    /// repo-scope `agents`.
+    #[arg(long)]
+    pub global: bool,
+    /// Repo root. Defaults to the cwd's git toplevel.
+    #[arg(long, value_name = "PATH")]
+    pub repo: Option<PathBuf>,
+}
+
+#[derive(Args, Debug)]
+pub struct AgentSetRoleArgs {
+    /// Agent label to update.
+    pub label: String,
+    /// New role.
+    #[arg(value_enum)]
+    pub role: RoleArg,
+    /// Edit the user-scope `default_agents` entry instead of the
+    /// repo-scope `agents` entry.
+    #[arg(long)]
+    pub global: bool,
+    /// Repo root. Defaults to the cwd's git toplevel.
+    #[arg(long, value_name = "PATH")]
+    pub repo: Option<PathBuf>,
 }
 
 #[derive(clap::Subcommand, Debug)]

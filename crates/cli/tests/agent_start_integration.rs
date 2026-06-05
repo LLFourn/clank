@@ -39,6 +39,41 @@ fn write(repo: &Path, rel: &str, body: &str) {
     std::fs::write(abs, body).unwrap();
 }
 
+fn write_skeleton_with_session(
+    repo: &Path,
+    label: &str,
+    tool: clank_core::vocab::Tool,
+    session_id: &str,
+) {
+    let cfg = clank_core::agent_config::AgentConfig {
+        auto_mode: clank_core::vocab::AutoMode::Off,
+        role: clank_core::vocab::Role::Reviewers, // unused; declaration owns
+        wfw_timeout: None,
+        session: Some(clank_core::agent_config::Session {
+            id: clank_core::ids::SessionId::parse(session_id).unwrap(),
+            tool,
+            updated_at: "2026-06-04T12:00:00Z".to_string(),
+        }),
+        launch: None,
+    };
+    clank::agent_store::save_agent_config(
+        repo,
+        &clank_core::ids::AgentLabel::parse(label).unwrap(),
+        &cfg,
+    )
+    .unwrap();
+}
+
+fn write_unbound_skeleton(repo: &Path, label: &str) {
+    let cfg = clank_core::agent_config::AgentConfig::default();
+    clank::agent_store::save_agent_config(
+        repo,
+        &clank_core::ids::AgentLabel::parse(label).unwrap(),
+        &cfg,
+    )
+    .unwrap();
+}
+
 fn run_start(repo: &Path, args: &[&str]) -> std::process::Output {
     let mut cmd = Command::new(clank_bin());
     cmd.arg("agent")
@@ -54,7 +89,7 @@ fn run_start(repo: &Path, args: &[&str]) -> std::process::Output {
 /// JSON drift.
 fn write_repo_agents(repo: &Path, agents: &[clank::cli::config::DefaultAgent]) {
     let file = clank::cli::config::RepoAgentsFile {
-        agents: agents.to_vec(),
+        agents: Some(agents.to_vec()),
     };
     let json = serde_json::to_string_pretty(&file).unwrap();
     std::fs::create_dir_all(repo.join(".clank")).unwrap();

@@ -145,12 +145,12 @@ fn finish_rejects_approve_without_finished() {
     // Register codex as a reviewer via the repo-scope declaration
     // (source of truth post agent-add-cli-and-repo-scope).
     let file = clank::cli::config::RepoAgentsFile {
-        agents: vec![clank::cli::config::DefaultAgent {
+        agents: Some(vec![clank::cli::config::DefaultAgent {
             label: clank_core::ids::AgentLabel::parse("codex").unwrap(),
             role: clank_core::vocab::Role::Reviewers,
             tool: None,
             launch: None,
-        }],
+        }]),
     };
     write(
         repo,

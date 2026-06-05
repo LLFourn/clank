@@ -125,10 +125,17 @@ pub struct DefaultAgent {
 /// for the `agents` field. Public so tests + the `clank agent
 /// add/remove/set-role` writers can round-trip via serde rather
 /// than hand-rolling JSON.
+///
+/// `agents` is `Option<Vec>` (NOT `Vec`) — presence-aware. `None`
+/// = key absent (caller falls back to user-scope). `Some(vec)` =
+/// key present (even if empty). `Some(vec![])` serializes as
+/// `"agents": []` and counts as an explicit override per
+/// [`load_repo_agents`]'s semantics. Codex caught the `Vec` +
+/// `skip_serializing_if = "Vec::is_empty"` conflation on da71c84.
 #[derive(Debug, Default, Deserialize, Serialize)]
 pub struct RepoAgentsFile {
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub agents: Vec<DefaultAgent>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agents: Option<Vec<DefaultAgent>>,
 }
 
 /// User-scope `~/.clank/config.json` deserialization wrapper for
@@ -136,8 +143,68 @@ pub struct RepoAgentsFile {
 /// [`RepoAgentsFile`].
 #[derive(Debug, Default, Deserialize, Serialize)]
 pub struct UserAgentsFile {
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub default_agents: Vec<DefaultAgent>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_agents: Option<Vec<DefaultAgent>>,
+}
+
+/// Round-trip typed schema for `<repo>/.clank/config.json`.
+///
+/// Used by `clank agent add/remove/set-role` (Phase 4 of
+/// `agent-add-cli-and-repo-scope`) for read-modify-write: deserialize
+/// the file, edit one field, reserialize. The `extra` flatten
+/// catchall preserves unknown top-level keys so a newer clank's
+/// config keys don't get wiped by an older clank's `agent add`.
+///
+/// **NOTE**: the `apply_layer` path (the lossy read-only loader used
+/// by [`load`]) still uses its own private structs because it has
+/// different failure semantics. The two paths are NOT unified yet —
+/// see the queued `typed-config-dogfood` plan.
+#[derive(Debug, Default, Deserialize, Serialize)]
+pub struct RepoConfigFile {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub review: Option<ReviewSection>,
+    /// Raw hook entries — string or null. Kept as Value because
+    /// the existing `HooksFile` lossy-loader handles both shapes;
+    /// the write path just preserves whatever was there.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub hooks: BTreeMap<String, serde_json::Value>,
+    /// `None` = `agents` key absent (caller falls back to
+    /// user-scope). `Some(vec)` = key present (even if empty).
+    /// Same presence semantics as [`load_repo_agents`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agents: Option<Vec<DefaultAgent>>,
+    /// Forward-compat catchall: any top-level key this version
+    /// of clank doesn't know about. Preserved on round-trip.
+    #[serde(flatten)]
+    pub extra: BTreeMap<String, serde_json::Value>,
+}
+
+/// Round-trip typed schema for `~/.clank/config.json`. Same shape
+/// as [`RepoConfigFile`] but with `default_agents` instead of
+/// `agents`.
+#[derive(Debug, Default, Deserialize, Serialize)]
+pub struct UserConfigFile {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub review: Option<ReviewSection>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub hooks: BTreeMap<String, serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_agents: Option<Vec<DefaultAgent>>,
+    #[serde(flatten)]
+    pub extra: BTreeMap<String, serde_json::Value>,
+}
+
+/// Round-trip variant of [`ReviewFile`] (which is Deserialize-only).
+/// Same field names + serde aliases so a config written by the
+/// round-trip path stays readable by the lossy `apply_layer` path.
+#[derive(Debug, Default, Deserialize, Serialize)]
+pub struct ReviewSection {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub adhoc_feedback: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan_feedback: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub require_commit_prefix: Option<bool>,
 }
 
 /// Strict loader for the user-scope `default_agents` list.
@@ -172,7 +239,7 @@ pub fn load_default_agents(home: Option<&Path>) -> anyhow::Result<Vec<DefaultAge
     };
     let parsed: UserAgentsFile = serde_json::from_str(&body)
         .with_context(|| format!("parsing user config {}", path.display()))?;
-    Ok(parsed.default_agents)
+    Ok(parsed.default_agents.unwrap_or_default())
 }
 
 /// Presence-aware loader for the repo-scope `agents` list at
@@ -208,23 +275,111 @@ pub fn load_repo_agents(repo_root: &Path) -> anyhow::Result<Option<Vec<DefaultAg
     Ok(Some(agents))
 }
 
+/// Declaration-only merge: repo-scope `agents` if present, else
+/// user-scope `default_agents`. NO legacy skeleton fallback.
+///
+/// Used by paths that specifically need to know "what did the user
+/// explicitly declare?" — `clank init`'s `seed_default_agents`
+/// (legacy skeletons aren't things the user asked to seed) and
+/// `clank agent add`'s cross-scope collision pre-check.
+///
+/// [`load_merged_agents`] is the right choice for gate / runtime
+/// paths that need to see ALL registered agents including legacy.
+pub fn load_declared_agents(
+    repo_root: &Path,
+    home: Option<&Path>,
+) -> anyhow::Result<Vec<DefaultAgent>> {
+    if let Some(repo) = load_repo_agents(repo_root)? {
+        return Ok(repo);
+    }
+    load_default_agents(home)
+}
+
 /// Merged agent declaration: repo-scope `agents` if present (REPLACE
 /// semantics — `the local project can modify it`); else fall back
-/// to user-scope `default_agents`. This is the source of truth for
-/// "which agents exist + their role + tool + launch profile" per
-/// `agent-add-cli-and-repo-scope`.
+/// to user-scope `default_agents`; else fall back to scanning the
+/// per-agent skeleton directories at `<repo>/.clank/agents/*/`.
+/// This is the source of truth for "which agents exist + their
+/// role + tool + launch profile" per `agent-add-cli-and-repo-scope`.
+///
+/// **Three fallback layers** (codex review 2 of da71c84):
+/// 1. Repo-scope `<repo>/.clank/config.json` `agents` key present
+///    (even if empty) → use it.
+/// 2. User-scope `~/.clank/config.json` `default_agents` non-empty
+///    → use it.
+/// 3. **Legacy fallback**: skeleton dirs at `.clank/agents/*/`
+///    scanned and synthesized into `DefaultAgent` entries. Preserves
+///    the plan's "existing repos keep working" promise — repos that
+///    pre-date this plan have skeletons but no declaration, and
+///    must still surface their registered agents to the gate.
+///    `tool` + `launch` fields stay None (skeleton doesn't carry
+///    those post-Phase-3); `role` comes from the skeleton's
+///    legacy `role` field.
 ///
 /// An EXPLICIT empty `agents: []` at repo-scope returns the empty
-/// set (disables user-scope defaults for this repo). Only an
-/// absent repo-scope (no `agents` key) falls back to user-scope.
+/// set (disables user-scope AND legacy fallbacks).
 pub fn load_merged_agents(
     repo_root: &Path,
     home: Option<&Path>,
 ) -> anyhow::Result<Vec<DefaultAgent>> {
-    match load_repo_agents(repo_root)? {
-        Some(repo) => Ok(repo),
-        None => load_default_agents(home),
+    if let Some(repo) = load_repo_agents(repo_root)? {
+        return Ok(repo);
     }
+    let user = load_default_agents(home)?;
+    if !user.is_empty() {
+        return Ok(user);
+    }
+    // Legacy fallback: synthesize from skeleton dirs. Preserves
+    // pre-Phase-1 repos that have skeletons but no declaration.
+    load_legacy_skeleton_agents(repo_root)
+}
+
+/// Scan `<repo>/.clank/agents/*/config.json` and synthesize
+/// `DefaultAgent` entries from each skeleton's legacy `role` field.
+/// Used by [`load_merged_agents`] as a fallback when neither
+/// repo-scope `agents` nor user-scope `default_agents` are
+/// configured.
+fn load_legacy_skeleton_agents(repo_root: &Path) -> anyhow::Result<Vec<DefaultAgent>> {
+    let agents_root = repo_root.join(".clank/agents");
+    if !agents_root.is_dir() {
+        return Ok(Vec::new());
+    }
+    let mut out = Vec::new();
+    for entry in std::fs::read_dir(&agents_root)? {
+        let entry = entry?;
+        if !entry.file_type()?.is_dir() {
+            continue;
+        }
+        let name = entry.file_name();
+        let Some(name_str) = name.to_str() else {
+            continue;
+        };
+        let Ok(label) = AgentLabel::parse(name_str) else {
+            continue;
+        };
+        let cfg_path = entry.path().join("config.json");
+        let body = match std::fs::read_to_string(&cfg_path) {
+            Ok(b) => b,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => {
+                return Err(anyhow::Error::from(e))
+                    .with_context(|| format!("reading {}", cfg_path.display()));
+            }
+        };
+        // Use the typed AgentConfig deserialize — extracts the
+        // legacy `role` field cleanly.
+        let cfg: clank_core::agent_config::AgentConfig = serde_json::from_str(&body)
+            .with_context(|| format!("parsing {}", cfg_path.display()))?;
+        out.push(DefaultAgent {
+            label,
+            role: cfg.role,
+            tool: cfg.session.as_ref().map(|s| s.tool),
+            launch: cfg.launch.clone(),
+        });
+    }
+    // Stable order.
+    out.sort_by(|a, b| a.label.as_str().cmp(b.label.as_str()));
+    Ok(out)
 }
 
 pub fn load(repo_root: &Path) -> Config {
@@ -891,6 +1046,59 @@ mod tests {
             Some(Vec::new()),
             "explicit `agents: []` → Some(vec![])"
         );
+    }
+
+    #[test]
+    fn repo_agents_file_round_trips_explicit_empty() {
+        // Codex caught on da71c84: writers using the typed wrapper
+        // must serialize `agents: []` for an explicit empty
+        // override. Pre-fix the field was `Vec<DefaultAgent>` with
+        // `skip_serializing_if = "Vec::is_empty"` → empty vecs
+        // disappeared from JSON.
+        let file = RepoAgentsFile {
+            agents: Some(Vec::new()),
+        };
+        let json = serde_json::to_string(&file).unwrap();
+        assert!(
+            json.contains(r#""agents":[]"#),
+            "empty override must serialize as `agents: []`; got: {json}"
+        );
+        let round_trip: RepoAgentsFile = serde_json::from_str(&json).unwrap();
+        assert_eq!(round_trip.agents, Some(Vec::new()));
+    }
+
+    #[test]
+    fn repo_agents_file_round_trips_absent() {
+        let file = RepoAgentsFile { agents: None };
+        let json = serde_json::to_string(&file).unwrap();
+        // Absent should NOT serialize the `agents` key.
+        assert!(
+            !json.contains("agents"),
+            "absent must not serialize agents key; got: {json}"
+        );
+    }
+
+    #[test]
+    fn load_merged_agents_falls_back_to_skeleton_when_no_declaration() {
+        // Codex caught on da71c84: existing repos with skeletons
+        // but no declaration must keep working. The legacy
+        // fallback synthesizes DefaultAgent entries from skeleton
+        // configs.
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        // Skeleton for `legacy-reviewer` — no declaration anywhere.
+        let agent_path = tmp.path().join(".clank/agents/legacy-reviewer");
+        std::fs::create_dir_all(&agent_path).unwrap();
+        std::fs::write(
+            agent_path.join("config.json"),
+            r#"{"auto_mode":"off","role":"reviewers"}"#,
+        )
+        .unwrap();
+
+        let merged = load_merged_agents(tmp.path(), Some(home.path())).unwrap();
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].label.as_str(), "legacy-reviewer");
+        assert_eq!(merged[0].role, Role::Reviewers);
     }
 
     #[test]

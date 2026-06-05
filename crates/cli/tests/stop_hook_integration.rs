@@ -48,7 +48,7 @@ fn init_repo() -> tempfile::TempDir {
 
 fn write_repo_agents_file(repo: &Path, agents: &[clank::cli::config::DefaultAgent]) {
     let file = clank::cli::config::RepoAgentsFile {
-        agents: agents.to_vec(),
+        agents: Some(agents.to_vec()),
     };
     let json = serde_json::to_string_pretty(&file).unwrap();
     std::fs::create_dir_all(repo.join(".clank")).unwrap();

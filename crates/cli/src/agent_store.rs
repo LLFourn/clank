@@ -56,6 +56,27 @@ pub fn load_all_agent_configs(repo: &Path) -> anyhow::Result<Vec<(AgentLabel, Ag
     Ok(out)
 }
 
+/// Resolve an agent's role: the merged declaration's role wins.
+/// Falls back to the skeleton's legacy `role` field if no
+/// declaration entry exists (e.g., pre-Phase-1 repo where the
+/// skeleton is the only source of role information).
+///
+/// Codex caught on da71c84 that `wfw`, `stop_hook`, and `auto`
+/// were reading role from the skeleton directly, contradicting
+/// the plan's "declaration is authoritative for role" decision
+/// and meaning `clank agent set-role` wouldn't affect those code
+/// paths.
+pub fn resolve_role(repo: &Path, label: &AgentLabel) -> anyhow::Result<clank_core::vocab::Role> {
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    let merged = crate::cli::config::load_merged_agents(repo, home.as_deref())?;
+    if let Some(entry) = merged.iter().find(|e| &e.label == label) {
+        return Ok(entry.role);
+    }
+    // Skeleton fallback for pre-Phase-1 repos.
+    let cfg = load_agent_config(repo, label)?;
+    Ok(clank_core::role_for(label, cfg.as_ref()))
+}
+
 /// Labels of every agent registered as a reviewer in this repo.
 ///
 /// Source of truth: the **merged agent declaration** (repo-scope

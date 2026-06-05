@@ -37,11 +37,37 @@ fn write(repo: &Path, rel: &str, body: &str) {
 /// struct so schema changes type-check.
 fn write_repo_agents(repo: &Path, agents: &[clank::cli::config::DefaultAgent]) {
     let file = clank::cli::config::RepoAgentsFile {
-        agents: agents.to_vec(),
+        agents: Some(agents.to_vec()),
     };
     let json = serde_json::to_string_pretty(&file).unwrap();
     std::fs::create_dir_all(repo.join(".clank")).unwrap();
     std::fs::write(repo.join(".clank/config.json"), json).unwrap();
+}
+
+fn write_bound_skeleton(
+    repo: &Path,
+    label: &str,
+    auto_mode: clank_core::vocab::AutoMode,
+    tool: clank_core::vocab::Tool,
+    session_id: &str,
+) {
+    let cfg = clank_core::agent_config::AgentConfig {
+        auto_mode,
+        role: clank_core::vocab::Role::Reviewers, // unused; declaration owns
+        wfw_timeout: None,
+        session: Some(clank_core::agent_config::Session {
+            id: clank_core::ids::SessionId::parse(session_id).unwrap(),
+            tool,
+            updated_at: "2026-06-04T12:00:00Z".to_string(),
+        }),
+        launch: None,
+    };
+    clank::agent_store::save_agent_config(
+        repo,
+        &clank_core::ids::AgentLabel::parse(label).unwrap(),
+        &cfg,
+    )
+    .unwrap();
 }
 
 fn agent_decl(label: &str, role: clank_core::vocab::Role) -> clank::cli::config::DefaultAgent {
@@ -93,16 +119,20 @@ fn agent_list_shows_bound_and_unbound() {
         ],
     );
     // Bound master (session state in skeleton).
-    write(
+    write_bound_skeleton(
         repo,
-        ".clank/agents/claude/config.json",
-        r#"{"auto_mode":"off","session":{"id":"11111111-1111-1111-1111-111111111111","tool":"claude","updated_at":"2026-06-04T12:00:00Z"}}"#,
+        "claude",
+        clank_core::vocab::AutoMode::Off,
+        clank_core::vocab::Tool::Claude,
+        "11111111-1111-1111-1111-111111111111",
     );
     // Bound reviewer.
-    write(
+    write_bound_skeleton(
         repo,
-        ".clank/agents/codex/config.json",
-        r#"{"auto_mode":"on","session":{"id":"22222222-2222-2222-2222-222222222222","tool":"codex","updated_at":"2026-06-04T12:00:00Z"}}"#,
+        "codex",
+        clank_core::vocab::AutoMode::On,
+        clank_core::vocab::Tool::Codex,
+        "22222222-2222-2222-2222-222222222222",
     );
     // Unbound seeded reviewer (no skeleton — appears unbound).
 
@@ -144,10 +174,12 @@ fn agent_list_json_schema() {
             agent_decl("ruthless", clank_core::vocab::Role::Reviewers),
         ],
     );
-    write(
+    write_bound_skeleton(
         repo,
-        ".clank/agents/claude/config.json",
-        r#"{"auto_mode":"off","session":{"id":"11111111-1111-1111-1111-111111111111","tool":"claude","updated_at":"2026-06-04T12:00:00Z"}}"#,
+        "claude",
+        clank_core::vocab::AutoMode::Off,
+        clank_core::vocab::Tool::Claude,
+        "11111111-1111-1111-1111-111111111111",
     );
 
     let out = run_list(repo, true);
@@ -186,10 +218,12 @@ fn agent_list_omits_orphan_skeleton() {
     );
     // Orphan skeleton for `removed` — present on disk but not in
     // declaration.
-    write(
+    write_bound_skeleton(
         repo,
-        ".clank/agents/removed/config.json",
-        r#"{"auto_mode":"off","session":{"id":"33333333-3333-3333-3333-333333333333","tool":"claude","updated_at":"2026-06-04T12:00:00Z"}}"#,
+        "removed",
+        clank_core::vocab::AutoMode::Off,
+        clank_core::vocab::Tool::Claude,
+        "33333333-3333-3333-3333-333333333333",
     );
 
     let out = run_list(repo, true);

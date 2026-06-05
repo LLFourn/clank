@@ -23,7 +23,7 @@ use crate::agent_store::load_agent_config;
 use crate::lifecycle::AgentLabel;
 use clank_core::{
     AutoMode, CLAUDE_CONTINUATION_EXIT, CodexBlockDecision, HOOK_OK_EXIT, HookInput, HookOutcome,
-    Role, Tool, role_for,
+    Role, Tool,
 };
 
 pub async fn run(args: StopHookArgs) -> anyhow::Result<()> {
@@ -65,9 +65,15 @@ async fn compute_outcome(tool: Tool, repo_override: Option<&Path>) -> HookOutcom
         }
     };
 
-    // Role is a per-user preference on the agent's own config —
-    // no repo-shared config to load.
-    let role = role_for(&label, Some(&cfg));
+    // Role resolution prefers the merged declaration (per
+    // agent-add-cli-and-repo-scope: declaration is authoritative).
+    // Falls back to the skeleton's legacy `role` field for
+    // pre-Phase-1 repos. Codex caught the skeleton-only lookup on
+    // da71c84. Errors fall back to the skeleton role — the hook
+    // path is fail-soft (a config parse error shouldn't block the
+    // agent's session).
+    let role = crate::agent_store::resolve_role(&repo, &label)
+        .unwrap_or_else(|_| clank_core::role_for(&label, Some(&cfg)));
 
     match cfg.auto_mode {
         AutoMode::Off => HookOutcome::Silent,

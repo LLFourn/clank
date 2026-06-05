@@ -33,6 +33,86 @@ fn write(repo: &Path, rel: &str, body: &str) {
     std::fs::write(abs, body).unwrap();
 }
 
+/// Build a skeleton with optional session.
+fn skeleton(
+    auto_mode: clank_core::vocab::AutoMode,
+    session: Option<clank_core::agent_config::Session>,
+) -> clank_core::agent_config::AgentConfig {
+    clank_core::agent_config::AgentConfig {
+        auto_mode,
+        role: clank_core::vocab::Role::Reviewers, // skeleton role unused; declaration is source of truth
+        wfw_timeout: None,
+        session,
+        launch: None,
+    }
+}
+
+/// Build a bound session.
+fn session(tool: clank_core::vocab::Tool, id: &str) -> clank_core::agent_config::Session {
+    clank_core::agent_config::Session {
+        id: clank_core::ids::SessionId::parse(id).unwrap(),
+        tool,
+        updated_at: "2026-06-04T12:00:00Z".to_string(),
+    }
+}
+
+/// Write the per-machine skeleton via the existing typed
+/// save_agent_config — no JSON literals.
+fn write_skeleton(repo: &Path, label: &str, cfg: &clank_core::agent_config::AgentConfig) {
+    clank::agent_store::save_agent_config(
+        repo,
+        &clank_core::ids::AgentLabel::parse(label).unwrap(),
+        cfg,
+    )
+    .unwrap();
+}
+
+/// Register agents in the repo-scope declaration via typed struct.
+fn register_agents(repo: &Path, agents: &[(&str, clank_core::vocab::Role)]) {
+    let decls: Vec<clank::cli::config::DefaultAgent> = agents
+        .iter()
+        .map(|(label, role)| clank::cli::config::DefaultAgent {
+            label: clank_core::ids::AgentLabel::parse(label).unwrap(),
+            role: *role,
+            tool: None,
+            launch: None,
+        })
+        .collect();
+    let file = clank::cli::config::RepoConfigFile {
+        agents: Some(decls),
+        ..Default::default()
+    };
+    std::fs::create_dir_all(repo.join(".clank")).unwrap();
+    std::fs::write(
+        repo.join(".clank/config.json"),
+        serde_json::to_string_pretty(&file).unwrap(),
+    )
+    .unwrap();
+}
+
+fn register_agent_with_launch(
+    repo: &Path,
+    label: &str,
+    role: clank_core::vocab::Role,
+    launch: clank_core::agent_config::LaunchConfig,
+) {
+    let file = clank::cli::config::RepoConfigFile {
+        agents: Some(vec![clank::cli::config::DefaultAgent {
+            label: clank_core::ids::AgentLabel::parse(label).unwrap(),
+            role,
+            tool: None,
+            launch: Some(launch),
+        }]),
+        ..Default::default()
+    };
+    std::fs::create_dir_all(repo.join(".clank")).unwrap();
+    std::fs::write(
+        repo.join(".clank/config.json"),
+        serde_json::to_string_pretty(&file).unwrap(),
+    )
+    .unwrap();
+}
+
 fn run_doctor(repo: &Path) -> std::process::Output {
     Command::new(clank_bin())
         .arg("doctor")
@@ -50,11 +130,11 @@ fn doctor_warns_on_unbound_reviewer() {
     let dir = init_repo();
     let repo = dir.path();
     write(repo, ".clank/.gitignore", ".gitignore\n");
-    // Seeded reviewer with no session.
-    write(
+    register_agents(repo, &[("ruthless", clank_core::vocab::Role::Reviewers)]);
+    write_skeleton(
         repo,
-        ".clank/agents/ruthless/config.json",
-        r#"{"auto_mode":"off","role":"reviewers"}"#,
+        "ruthless",
+        &skeleton(clank_core::vocab::AutoMode::Off, None),
     );
 
     let out = run_doctor(repo);
@@ -86,10 +166,17 @@ fn doctor_does_not_warn_on_bound_reviewer() {
     let dir = init_repo();
     let repo = dir.path();
     write(repo, ".clank/.gitignore", ".gitignore\n");
-    write(
+    register_agents(repo, &[("codex", clank_core::vocab::Role::Reviewers)]);
+    write_skeleton(
         repo,
-        ".clank/agents/codex/config.json",
-        r#"{"auto_mode":"on","role":"reviewers","session":{"id":"11111111-1111-1111-1111-111111111111","tool":"codex","updated_at":"2026-06-04T12:00:00Z"}}"#,
+        "codex",
+        &skeleton(
+            clank_core::vocab::AutoMode::On,
+            Some(session(
+                clank_core::vocab::Tool::Codex,
+                "11111111-1111-1111-1111-111111111111",
+            )),
+        ),
     );
 
     let out = run_doctor(repo);
@@ -111,10 +198,11 @@ fn doctor_warns_on_unbound_master_symmetrically() {
     let dir = init_repo();
     let repo = dir.path();
     write(repo, ".clank/.gitignore", ".gitignore\n");
-    write(
+    register_agents(repo, &[("lloyd", clank_core::vocab::Role::Master)]);
+    write_skeleton(
         repo,
-        ".clank/agents/lloyd/config.json",
-        r#"{"auto_mode":"off","role":"master"}"#,
+        "lloyd",
+        &skeleton(clank_core::vocab::AutoMode::Off, None),
     );
 
     let out = run_doctor(repo);
@@ -144,15 +232,28 @@ fn doctor_warns_when_launch_command_missing_from_path() {
     let dir = init_repo();
     let repo = dir.path();
     write(repo, ".clank/.gitignore", ".gitignore\n");
-    write(
+    // Launch lives on the declaration per
+    // agent-add-cli-and-repo-scope Phase 1.
+    register_agent_with_launch(
         repo,
-        ".clank/agents/codex/config.json",
-        r#"{
-            "auto_mode":"on",
-            "role":"reviewers",
-            "session":{"id":"11111111-1111-1111-1111-111111111111","tool":"codex","updated_at":"2026-06-04T12:00:00Z"},
-            "launch":{"command":"definitely-not-installed-anywhere"}
-        }"#,
+        "codex",
+        clank_core::vocab::Role::Reviewers,
+        clank_core::agent_config::LaunchConfig {
+            command: Some("definitely-not-installed-anywhere".to_string()),
+            args: Vec::new(),
+            env: Default::default(),
+        },
+    );
+    write_skeleton(
+        repo,
+        "codex",
+        &skeleton(
+            clank_core::vocab::AutoMode::On,
+            Some(session(
+                clank_core::vocab::Tool::Codex,
+                "11111111-1111-1111-1111-111111111111",
+            )),
+        ),
     );
 
     let out = run_doctor(repo);
@@ -185,10 +286,11 @@ fn doctor_warn_for_unbound_does_not_introduce_new_fail() {
     let dir = init_repo();
     let repo = dir.path();
     write(repo, ".clank/.gitignore", ".gitignore\n");
-    write(
+    register_agents(repo, &[("ruthless", clank_core::vocab::Role::Reviewers)]);
+    write_skeleton(
         repo,
-        ".clank/agents/ruthless/config.json",
-        r#"{"auto_mode":"off","role":"reviewers"}"#,
+        "ruthless",
+        &skeleton(clank_core::vocab::AutoMode::Off, None),
     );
 
     let out = run_doctor(repo);

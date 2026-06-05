@@ -72,10 +72,12 @@ pub async fn run(args: InitArgs) -> anyhow::Result<()> {
 /// decide which calling-agent roles to preserve.
 fn seed_default_agents(repo: &Path) -> anyhow::Result<std::collections::HashSet<AgentLabel>> {
     let home = std::env::var_os("HOME").map(PathBuf::from);
-    // Use the merged loader so a repo with its own `agents` field
-    // seeds from THAT set, not user-scope `default_agents`. Codex
-    // caught the unmigrated init seeding on eef4c49.
-    let agents = crate::cli::config::load_merged_agents(repo, home.as_deref())?;
+    // Use the declaration-only loader (NOT load_merged_agents) so
+    // the legacy-skeleton fallback doesn't count pre-existing
+    // skeletons as "things the user asked to seed." Codex caught
+    // the unmigrated seeding on eef4c49; the legacy-fallback
+    // leakage was caught on da71c84.
+    let agents = crate::cli::config::load_declared_agents(repo, home.as_deref())?;
     let mut declared = std::collections::HashSet::new();
     if agents.is_empty() {
         return Ok(declared);
