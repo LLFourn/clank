@@ -27,9 +27,9 @@ Tradeoffs:
 
 ## Approach
 
-### Phase 1: KDL shape — wrap panes in a tab block
+### Phase 1: KDL shape — wrap panes in a tab block + pin --repo in pane commands
 
-The current KDL is a flat `layout { pane... pane... pane... }`. Wrap the existing content in a `tab name="<basename>"` block:
+The current KDL is a flat `layout { pane... pane... pane... }`. Wrap the existing content in a `tab name="<basename>"` block AND pin the repo on every `clank agent start` invocation:
 
 ```
 layout {
@@ -38,7 +38,11 @@ layout {
             plugin location="zellij:tab-bar"
         }
         pane split_direction="horizontal" {
-            ... master + reviewer panes ...
+            pane name="<master> (master)" {
+                command "clank"
+                args "agent" "start" "<master>" "--repo" "<absolute-repo-path>"
+            }
+            ... reviewer panes (same shape) ...
         }
         pane size=2 borderless=true {
             plugin location="zellij:status-bar"
@@ -47,7 +51,9 @@ layout {
 }
 ```
 
-The `tab name` value goes through `kdl_escape` like every other interpolation. `compose_kdl`'s signature stays but takes an extra `tab_name: &str` parameter.
+**Why `--repo` on every pane** (codex caught on 361b104): `zellij --layout <file>` spawns a NEW session whose cwd inherits from the calling shell. If the user runs `clank open zellij --repo /path/to/repo` from a DIFFERENT directory, the spawned session lands in that other directory and the pane commands `clank agent start <label>` (no `--repo`) would resolve the wrong repo (or fail to find one). Pinning `--repo <abs-path>` makes the resolved repo unambiguous regardless of zellij's cwd.
+
+The `tab name` value AND the absolute repo path BOTH go through `kdl_escape`. `compose_kdl`'s signature grows two parameters: `tab_name: &str` and `repo_path: &str`.
 
 ### Phase 2: Write layout file under `<repo>/.clank/zellij/`
 
@@ -60,7 +66,7 @@ The `tab name` value goes through `kdl_escape` like every other interpolation. `
 ### Phase 3: Spawn mechanism
 
 - Drop the `ZELLIJ_SESSION_NAME` guard (irrelevant — `zellij --layout` works from outside).
-- Drop the `--cwd <repo>` flag (`zellij --layout` uses the cwd of the calling shell; the user is already in the repo).
+- Drop the `--cwd <repo>` flag from the spawn argv. The repo context lives in the KDL via the per-pane `--repo` argument (Phase 1), so the spawned zellij session's cwd doesn't need to match.
 - New spawn: `zellij --layout <path>`. That's it.
 - Update `compose_spawn_argv` to return `["zellij", "--layout", <path>]`.
 
@@ -75,9 +81,10 @@ Migrate the 3 affected tests:
 2. RENAME `open_zellij_no_zellij_session_succeeds_with_print` → `open_zellij_print_mode_emits_kdl_without_writing_file`. Assert KDL on stdout, no file at `<repo>/.clank/zellij/layout.kdl` afterwards.
 3. UPDATE `open_zellij_tab_name_in_print_spawn_metadata`: shift assertion from `--name <basename>` argv flag to `tab name="<basename>"` substring in the KDL body. Plus `spawn:` line contains `--layout` + the would-be-written path.
 
-Add 2 new tests:
+Add 3 new tests:
 4. `open_zellij_writes_layout_file_under_clank_dir`: non-print path; mock the spawn somehow (or just verify the file exists + has expected content even if the spawn fails because no real zellij). Acceptance is "file written," not "zellij spawned" — the latter needs zellij installed.
 5. `open_zellij_adds_zellij_dir_to_gitignore`: assert `<repo>/.clank/.gitignore` contains `/zellij/` after invocation; assert idempotency on a second invocation.
+6. `open_zellij_pane_commands_pin_repo_via_absolute_path` (codex 361b104 catch): invoke `clank open zellij --print --repo <abs-path>` from a DIFFERENT cwd; assert every pane's `args` line contains `"--repo" "<abs-path>"`. Locks in that the spawned session's cwd doesn't matter — the repo is pinned per-pane.
 
 ### Out of scope
 
@@ -91,7 +98,8 @@ Add 2 new tests:
 - Spawn shells out to `zellij --layout <path>` only — NO `zellij action`.
 - `--print` mode emits KDL on stdout + `spawn: zellij --layout <path>` on stderr; does NOT write the file.
 - KDL contains `tab name="<basename>"` wrapping the panes.
-- All escape coverage from `30a0194` (label quotes, control chars) extends to the new `tab name` interpolation.
+- Every pane's `args` line contains `"--repo" "<absolute-repo-path>"` so the resolved repo is unambiguous regardless of the spawned zellij session's cwd. Verified by `open_zellij_pane_commands_pin_repo_via_absolute_path`.
+- All escape coverage from `30a0194` (label quotes, control chars) extends to the new `tab name` AND `--repo <path>` interpolations.
 - `cargo test --workspace` passes.
 
 ## Related history
