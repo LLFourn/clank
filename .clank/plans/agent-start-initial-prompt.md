@@ -40,25 +40,53 @@ lloyd directive: "Sure we can make it configurable but we should have a sane def
 
 ### Phase 2: Composition — append after session-restore
 
-The prompt is **resolved by the caller** (`agent_start::run`), NOT inside `compose_launch`. compose_launch takes a pre-resolved `Option<&str>` and just appends it after session-restore.
+The prompt is **resolved by a free function in `crates/cli/src/cli/agent.rs`**, NOT inside `compose_launch`. compose_launch takes a pre-resolved `Option<&str>` and just appends it after session-restore.
 
-Caller logic in `agent_start::run`:
+#### Resolver: pinned location + signature
+
+`crates/cli/src/cli/agent.rs` (sibling to `compose_launch`):
 
 ```rust
-let resolved_prompt: Option<String> = default_agent
-    .initial_prompt
-    .clone()
-    .or_else(|| {
-        if agent_config.auto_mode == AutoMode::On {
-            Some(DEFAULT_AUTO_PROMPT.to_string())
-        } else {
-            None
+/// Resolve the initial prompt for an agent-start invocation.
+///
+/// Three-input policy (ruthless 0fe1567 pins):
+/// - `declaration`: `DefaultAgent.initial_prompt`. `Some("")`
+///    means "explicitly disable" — it falls back to None, NOT
+///    Some("") through. Lets a user with auto_mode=On opt out
+///    of the prompt without disabling auto_mode itself.
+/// - `auto_mode`: per-machine preference from the agent skeleton.
+///    When On, supplies the [`DEFAULT_AUTO_PROMPT`] fallback.
+/// - Returns the resolved prompt or None.
+fn resolve_initial_prompt(
+    declaration: Option<&str>,
+    auto_mode: AutoMode,
+) -> Option<String> {
+    if let Some(s) = declaration {
+        if s.is_empty() {
+            return None; // explicit "disable" gesture
         }
-    });
+        return Some(s.to_string());
+    }
+    if auto_mode == AutoMode::On {
+        return Some(DEFAULT_AUTO_PROMPT.to_string());
+    }
+    None
+}
+```
+
+**`Some("")` semantic (pinned per ruthless 0fe1567)**: empty string in the declaration field is treated as "explicitly disable the prompt." Without this, the only way to disable the auto_mode default would be to disable auto_mode itself — coupling two unrelated concerns. With it, `clank agent add --initial-prompt ""` is the natural escape hatch. (Alternative considered: reject `""` at config-write time. Rejected because it makes the disable gesture less discoverable — users expect the empty value to mean "no value.")
+
+#### Caller logic in `agent_start::run`
+
+```rust
+let resolved_prompt = resolve_initial_prompt(
+    default_agent.initial_prompt.as_deref(),
+    agent_config.auto_mode,
+);
 let composed = compose_launch(repo, session, launch, resolved_prompt.as_deref());
 ```
 
-compose_launch's new signature:
+#### compose_launch's new signature
 
 ```rust
 fn compose_launch(
@@ -71,21 +99,27 @@ fn compose_launch(
 
 When `initial_prompt` is `Some(s)`, append `s` after session_restore. For codex, position the `--cd <repo>` option before the prompt positional so the prompt is the final argv slot. Both clap (codex) and commander.js (claude) parse options independently of positional args, so option order is flexible — putting `--cd` between `resume <id>` and the prompt is the safe shape.
 
-This split keeps compose_launch a pure projection that doesn't know about `DefaultAgent` or `AgentConfig`. The "where does the prompt come from" policy lives in the caller alongside the rest of agent_start's resolution logic.
+This split keeps compose_launch a pure projection that doesn't know about `DefaultAgent` or `AgentConfig`. The resolution policy lives in `resolve_initial_prompt` alongside the rest of agent_start's resolution logic.
 
-### Phase 3: Default prompt content
+### Phase 3: Default prompt content (PINNED)
 
-When auto_mode is On and no explicit `initial_prompt` is configured, default to:
+`DEFAULT_AUTO_PROMPT` is the verbatim string:
 
-> `Resumed. Acknowledge and wait for the stop hook to drive the next turn.`
+```
+Session resumed.
+```
+
+That's the whole thing. Two words plus a period. The constant lives next to `compose_launch` in `crates/cli/src/cli/agent.rs`.
 
 Rationale:
-- Short enough that the agent processes it in one turn (target: a one-line reply, then turn ends).
-- **Does NOT instruct the agent to run `clank wfw` itself.** The stop hook is the orchestrator. If the prompt told the agent to run wfw, the agent would: (a) run wfw and process the work in one turn, (b) end turn, (c) the stop hook would fire wfw a SECOND time. Avoidable double-trigger. Cleaner architecture: prompt just triggers the turn-end; stop hook drives the loop.
-- Explicit about the resume context so the agent doesn't try to enumerate plans or make up work.
+- Triggers turn-end with the minimum surface area possible. Both claude and codex will produce a one-line ack and end the turn.
+- **Does NOT instruct the agent to run `clank wfw` itself.** The stop hook is the orchestrator. If the prompt told the agent to run wfw, the agent would: (a) run wfw and process the work in one turn, (b) end turn, (c) the stop hook would fire wfw a SECOND time. Avoidable double-trigger.
+- **Does NOT expose orchestration internals** (the stop hook, the wfw loop) to the agent's prompt. Ruthless 0fe1567: "stop hook to drive the next turn" leaks orchestration the agent doesn't need; "Reply briefly so the work loop can continue" same problem. `Session resumed.` is purely contextual — agent knows where it is, no instruction about what comes next.
 - Generic — applies equally to master + reviewer roles.
 
-Pin at promotion-time: alternative phrasings reviewers may want. The architectural property to preserve: **prompt triggers turn-end; stop hook drives the work loop. Don't make the agent run wfw itself.**
+**Phase 5 test #5 asserts on this string with `assert_eq!`, NOT `assert!(...contains(...))`.** A future tweak to the constant deliberately fails the test so the change is reviewable.
+
+Architectural property to preserve: **prompt triggers turn-end; stop hook drives the work loop. Don't make the agent run wfw itself; don't expose orchestration internals.**
 
 ### Phase 4: (folded into Phase 2)
 
@@ -100,14 +134,16 @@ Unit tests in `cli::agent::tests` (test `compose_launch` directly — pure proje
 2. `compose_launch_omits_prompt_when_none`: pass `None`; argv has no trailing prompt (current behavior preserved).
 3. `compose_launch_codex_prompt_is_final_positional_after_cd`: codex composition has `--cd <repo>` BEFORE the prompt so the prompt is the final arg.
 
-Unit tests for the caller's prompt-resolution policy in `cli::agent::tests` (test the resolution helper, not compose_launch):
-4. `resolve_initial_prompt_uses_declaration_field_when_set`: DefaultAgent.initial_prompt = Some("foo"), auto_mode = Off → "foo".
-5. `resolve_initial_prompt_uses_default_when_auto_on_and_declaration_unset`: DefaultAgent.initial_prompt = None, auto_mode = On → DEFAULT_AUTO_PROMPT.
-6. `resolve_initial_prompt_returns_none_when_auto_off_and_declaration_unset`: DefaultAgent.initial_prompt = None, auto_mode = Off → None.
-7. `resolve_initial_prompt_declaration_wins_over_auto_default`: DefaultAgent.initial_prompt = Some("custom"), auto_mode = On → "custom".
+Unit tests for `resolve_initial_prompt` in `cli::agent::tests` (test the policy helper, not compose_launch):
+4. `resolve_initial_prompt_uses_declaration_field_when_set`: declaration=Some("foo"), auto_mode=Off → Some("foo").
+5. `resolve_initial_prompt_uses_default_when_auto_on_and_declaration_unset`: declaration=None, auto_mode=On → Some(DEFAULT_AUTO_PROMPT.into()). **`assert_eq!(out, Some("Session resumed.".to_string()))` — exact match, NOT `contains`, so a future tweak to the constant deliberately fails this test.**
+6. `resolve_initial_prompt_returns_none_when_auto_off_and_declaration_unset`: declaration=None, auto_mode=Off → None.
+7. `resolve_initial_prompt_declaration_wins_over_auto_default`: declaration=Some("custom"), auto_mode=On → Some("custom").
+7a. `resolve_initial_prompt_empty_declaration_string_disables_prompt`: declaration=Some(""), auto_mode=On → None (pinned per ruthless 0fe1567 — empty string is the explicit-disable escape hatch).
+7b. `resolve_initial_prompt_empty_declaration_string_disables_prompt_under_auto_off`: declaration=Some(""), auto_mode=Off → None (same semantic regardless of auto_mode — declaration is authoritative).
 
 Integration test:
-8. `agent_start_initial_prompt_lands_in_composed_print`: via `clank agent start <label> --print`, configure an agent with auto_mode=On + tool=claude; assert stdout ends with the default prompt single-quoted.
+8. `agent_start_initial_prompt_lands_in_composed_print`: via `clank agent start <label> --print`, configure an agent with auto_mode=On + tool=claude; assert stdout ends with `'Session resumed.'` (exact match).
 
 ### Out of scope
 
