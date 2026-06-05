@@ -98,15 +98,27 @@ impl Verdict {
     }
 }
 
-/// Per-commit gate state.
+/// Per-plan gate state.
 ///
-/// Precedence (any single review pushes the gate to the highest
-/// matching state):
+/// Review-driven precedence (any single review pushes the gate to
+/// the highest matching state):
 /// - `ChangesRequested`: ≥1 reviewer voted REQUEST_CHANGES.
 /// - `Finished`: ≥1 reviewer voted FINISHED, none requested changes.
 /// - `Approved`: ≥1 reviewer voted APPROVE, none FINISHED or
 ///   request-changes.
 /// - `Unreviewed`: no recognized verdict yet on this commit.
+///
+/// **`Blocked` dominates all review-driven states.** A plan with at
+/// least one open plan-scoped block is `Blocked` regardless of
+/// review state on the latest reviewable commit (or in fact even
+/// without any reviewable commit). The block creator clears the
+/// block out-of-band; review-side work is not the path forward.
+///
+/// **Variant order is wincode-encoded** (this enum derives
+/// `wincode::SchemaRead/Write` under `cache-encoding`). New variants
+/// MUST be appended at the end so existing cached payloads remain
+/// decodable. `Blocked` is at position 4. The cache invalidates via
+/// `CACHE_FORMAT_VERSION` bump when needed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 #[cfg_attr(
@@ -118,6 +130,7 @@ pub enum CommitGateState {
     Approved,
     Finished,
     ChangesRequested,
+    Blocked,
 }
 
 impl CommitGateState {
@@ -127,6 +140,7 @@ impl CommitGateState {
             CommitGateState::Approved => "approved",
             CommitGateState::Finished => "finished",
             CommitGateState::ChangesRequested => "changes_requested",
+            CommitGateState::Blocked => "blocked",
         }
     }
 }

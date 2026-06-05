@@ -17,7 +17,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use serde::{Deserialize, Serialize};
 
 use crate::ids::{AgentLabel, CommitSha, PlanKey};
-use crate::plan_view::WaitingOn;
+use crate::plan_view::{PlanBlock, WaitingOn};
 use crate::repo_state::RepoState;
 use crate::vocab::{Role, WaitingReason};
 
@@ -126,11 +126,22 @@ impl StartupSnapshot {
     }
 }
 
-// ── ReviewLookup trait + derive_status ──────────────────
+// ── PlanStateLookup trait + derive_status ──────────────────
 
-pub trait ReviewLookup {
+/// Filesystem-projection adapter for one `derive_status` fold round.
+/// Surfaces both review feedback and pending blocks for the per-plan
+/// gate computation. Renamed from `ReviewLookup` in
+/// `status-blocks-dominate-gate` once `blocks_for` joined the trait
+/// surface — "review lookup" was a name lie after the extension.
+pub trait PlanStateLookup {
     fn reviews_for(&self, sha: &CommitSha) -> Vec<ReviewEntry>;
     fn worktree_status(&self, plan: &PlanKey) -> crate::vocab::PlanWorktreeStatus;
+    /// Pending (unanswered) plan-scoped blocks for the given plan.
+    /// Default impl returns `vec![]` so existing test mocks keep
+    /// compiling without block awareness.
+    fn blocks_for(&self, _plan: &PlanKey) -> Vec<PlanBlock> {
+        Vec::new()
+    }
 }
 
 #[derive(Clone)]
@@ -158,7 +169,12 @@ pub struct WorkStatus {
 #[derive(Debug, Clone)]
 pub struct PlanWorkState {
     pub plan: PlanKey,
-    pub sha: CommitSha,
+    /// `Some(sha)` for plans with a reviewable commit (the normal
+    /// case). `None` for blocked plans that have no reviewable
+    /// commit yet (e.g. an intro-only plan with an open block).
+    /// Renderer omits the `latest reviewable:` line when this is
+    /// None.
+    pub sha: Option<CommitSha>,
     pub gate: crate::vocab::CommitGateState,
     pub waiting_on: WaitingOn,
     pub touched_code: bool,
@@ -226,12 +242,45 @@ pub fn compute_gate(
 }
 
 impl RepoState {
-    pub fn derive_status(&self, reviews: &impl ReviewLookup, policy: &WorkPolicy) -> WorkStatus {
+    pub fn derive_status(&self, reviews: &impl PlanStateLookup, policy: &WorkPolicy) -> WorkStatus {
         use crate::vocab::{CommitGateState, PlanWorktreeStatus};
 
         let mut plans = Vec::new();
         {
             for (key, ps) in &self.plans {
+                // Block precedence: pending plan-scoped blocks
+                // dominate the review gate AND surface plans that
+                // have no reviewable commit yet (intro-only with
+                // an open block). Block check runs BEFORE the
+                // empty-reviewable early-continue.
+                let mut pending_blocks = reviews.blocks_for(key);
+                if !pending_blocks.is_empty() {
+                    // Lexicographic tie-breaker by (creator, name)
+                    // matches scan_blocks's sort order. The first
+                    // pending block surfaces on the gate line.
+                    pending_blocks.sort_by(|a, b| {
+                        a.creator
+                            .as_str()
+                            .cmp(b.creator.as_str())
+                            .then_with(|| a.name.cmp(&b.name))
+                    });
+                    let block = pending_blocks.into_iter().next().unwrap();
+                    let reviewable = ps.reviewable_shas();
+                    let sha = reviewable.last().cloned();
+                    let latest_event = sha
+                        .as_ref()
+                        .and_then(|s| ps.commits.iter().rev().find(|e| &e.sha == s));
+                    let touched_code = latest_event.is_some_and(|e| e.touched_code);
+                    plans.push(PlanWorkState {
+                        plan: key.clone(),
+                        sha,
+                        gate: CommitGateState::Blocked,
+                        waiting_on: WaitingOn::Blocked { block },
+                        touched_code,
+                    });
+                    continue;
+                }
+
                 let reviewable = ps.reviewable_shas();
                 if reviewable.is_empty() {
                     continue;
@@ -268,6 +317,17 @@ impl RepoState {
 
                 let worktree = reviews.worktree_status(key);
                 let waiting_on = match gate {
+                    CommitGateState::Blocked => {
+                        // Unreachable: the block-precedence check above
+                        // already consumed any blocked plan via the
+                        // continue. compute_gate cannot return Blocked
+                        // (it's a per-commit review verdict; Blocked is
+                        // a plan-level state). This arm exists only to
+                        // satisfy match exhaustiveness.
+                        unreachable!(
+                            "compute_gate cannot return Blocked; plan-level Blocked is handled above"
+                        );
+                    }
                     CommitGateState::ChangesRequested => {
                         let requesters = filtered_entries
                             .iter()
@@ -330,7 +390,7 @@ impl RepoState {
 
                 plans.push(PlanWorkState {
                     plan: key.clone(),
-                    sha: latest_sha,
+                    sha: Some(latest_sha),
                     gate,
                     waiting_on,
                     touched_code,
@@ -358,11 +418,24 @@ impl WorkStatus {
     pub fn work_for(&self, author: &AgentLabel, role: Role) -> Vec<WaitItem> {
         let mut out = Vec::new();
         for ps in &self.plans {
+            // Safe: only non-blocked plans reach the WaitItem-emitting
+            // arms below, and the block-precedence path in
+            // `derive_status` guarantees those have Some(sha). The
+            // Blocked first-arm catches any blocked plan before the
+            // unwrap is reached.
+            let sha_for_item = || {
+                ps.sha
+                    .clone()
+                    .expect("non-blocked plan must have a reviewable sha")
+            };
             match (role, &ps.waiting_on) {
+                // blocked plans emit no work for any role —
+                // block-creator clears the block out-of-band
+                (_, WaitingOn::Blocked { .. }) => {}
                 (Role::Master, WaitingOn::MasterToRevise { .. }) => {
                     out.push(WaitItem::Master {
                         plan: ps.plan.clone(),
-                        sha: ps.sha.clone(),
+                        sha: sha_for_item(),
                         next: MasterNext::Revise,
                         reason: WaitingReason::AddressCommitChanges,
                         gate: ps.gate,
@@ -371,7 +444,7 @@ impl WorkStatus {
                 (Role::Master, WaitingOn::MasterToCommit) => {
                     out.push(WaitItem::Master {
                         plan: ps.plan.clone(),
-                        sha: ps.sha.clone(),
+                        sha: sha_for_item(),
                         next: MasterNext::Commit,
                         reason: WaitingReason::CommitPlanRevision,
                         gate: ps.gate,
@@ -380,7 +453,7 @@ impl WorkStatus {
                 (Role::Master, WaitingOn::MasterToContinue) => {
                     out.push(WaitItem::Master {
                         plan: ps.plan.clone(),
-                        sha: ps.sha.clone(),
+                        sha: sha_for_item(),
                         next: MasterNext::Continue,
                         reason: WaitingReason::GateApproved,
                         gate: ps.gate,
@@ -389,7 +462,7 @@ impl WorkStatus {
                 (Role::Master, WaitingOn::MasterToFinalize) => {
                     out.push(WaitItem::Master {
                         plan: ps.plan.clone(),
-                        sha: ps.sha.clone(),
+                        sha: sha_for_item(),
                         next: MasterNext::Finalize,
                         reason: WaitingReason::ReadyToFinalize,
                         gate: ps.gate,
@@ -401,14 +474,15 @@ impl WorkStatus {
                     // Only emit a review item for this reviewer if THEY
                     // are in the missing set. Reviewers who have already
                     // posted APPROVE/FINISHED don't get redundant wakes.
+                    let sha = sha_for_item();
                     out.push(WaitItem::Reviewer {
                         plan: ps.plan.clone(),
-                        sha: ps.sha.clone(),
                         feedback_path: format!(
                             ".clank/agents/{}/feedback/{}.md",
                             author.as_str(),
-                            ps.sha.as_str()
+                            sha.as_str()
                         ),
+                        sha,
                     });
                 }
                 _ => {}
@@ -624,7 +698,7 @@ mod tests {
         WorkStatus {
             plans: vec![PlanWorkState {
                 plan: plan("a.md"),
-                sha: sha("aaaa"),
+                sha: Some(sha("aaaa")),
                 gate: CommitGateState::Unreviewed,
                 waiting_on,
                 touched_code: false,
@@ -812,12 +886,12 @@ mod tests {
         assert_eq!(snap.watched, std::iter::once(plan("a")).collect());
     }
 
-    // ============ derive_status ad-hoc ============
+    // ============ derive_status ad-hoc + blocks ============
 
     use crate::repo_state::AdHocEvent;
 
     struct MockReviews(Vec<(CommitSha, Vec<ReviewEntry>)>);
-    impl ReviewLookup for MockReviews {
+    impl PlanStateLookup for MockReviews {
         fn reviews_for(&self, sha: &CommitSha) -> Vec<ReviewEntry> {
             self.0
                 .iter()
@@ -828,6 +902,180 @@ mod tests {
         fn worktree_status(&self, _plan: &PlanKey) -> PlanWorktreeStatus {
             PlanWorktreeStatus::Clean
         }
+    }
+
+    /// `PlanStateLookup` mock that surfaces a configured list of
+    /// blocks for each plan (and otherwise no reviews).
+    struct MockBlocks(std::collections::BTreeMap<PlanKey, Vec<PlanBlock>>);
+    impl PlanStateLookup for MockBlocks {
+        fn reviews_for(&self, _sha: &CommitSha) -> Vec<ReviewEntry> {
+            Vec::new()
+        }
+        fn worktree_status(&self, _plan: &PlanKey) -> PlanWorktreeStatus {
+            PlanWorktreeStatus::Clean
+        }
+        fn blocks_for(&self, plan: &PlanKey) -> Vec<PlanBlock> {
+            self.0.get(plan).cloned().unwrap_or_default()
+        }
+    }
+
+    fn mkblock(creator: &str, name: &str, msg: &str) -> PlanBlock {
+        PlanBlock {
+            creator: label(creator),
+            name: name.to_string(),
+            message: msg.to_string(),
+        }
+    }
+
+    fn plan_policy() -> WorkPolicy {
+        WorkPolicy {
+            plan_feedback: true,
+            adhoc_feedback: false,
+            expected_reviewers: vec![label("codex"), label("ruthless")],
+        }
+    }
+
+    #[test]
+    fn compute_gate_unaffected_by_blocks() {
+        // compute_gate is per-commit pure; blocks live a layer up
+        // in derive_status. compute_gate's behavior is unchanged.
+        assert_eq!(compute_gate(&[], &[]), CommitGateState::Approved);
+        let reviews = [entry(crate::vocab::Verdict::Approve, "codex")];
+        assert_eq!(
+            compute_gate(&reviews, &[label("codex")]),
+            CommitGateState::Approved
+        );
+    }
+
+    fn make_plan_with_one_reviewable(commit_sha: CommitSha) -> PlanState {
+        use crate::repo_state::PlanTimelineEvent;
+        let mut ps = PlanState::default();
+        ps.commits.push(PlanTimelineEvent {
+            sha: commit_sha.clone(),
+            ts: 1,
+            touched_plan: false,
+            touched_code: true,
+        });
+        ps
+    }
+
+    #[test]
+    fn derive_status_plan_with_pending_block_returns_blocked_gate() {
+        // A plan with a reviewable commit + a pending block lands
+        // in PlanWorkState with gate=Blocked and waiting_on=Blocked.
+        let mut state = RepoState::default();
+        state
+            .plans
+            .insert(plan("foo"), make_plan_with_one_reviewable(sha("aaaa")));
+        let blocks = std::collections::BTreeMap::from([(
+            plan("foo"),
+            vec![mkblock("claude", "halt", "checking the design")],
+        )]);
+        let status = state.derive_status(&MockBlocks(blocks), &plan_policy());
+        assert_eq!(status.plans.len(), 1);
+        let ps = &status.plans[0];
+        assert_eq!(ps.gate, CommitGateState::Blocked);
+        match &ps.waiting_on {
+            WaitingOn::Blocked { block } => {
+                assert_eq!(block.creator.as_str(), "claude");
+                assert_eq!(block.name, "halt");
+                assert_eq!(block.message, "checking the design");
+            }
+            other => panic!("expected WaitingOn::Blocked; got: {other:?}"),
+        }
+        // sha is still Some — the plan has a reviewable commit.
+        assert_eq!(
+            ps.sha.as_ref().map(|s| s.as_str()),
+            Some(sha("aaaa").as_str())
+        );
+    }
+
+    #[test]
+    fn derive_status_intro_only_plan_with_block_surfaces_with_none_sha() {
+        // Pin 2: a plan with NO reviewable commit + open block
+        // still surfaces in per-plan output (was invisible
+        // pre-change). sha is None.
+        let mut state = RepoState::default();
+        state.plans.insert(plan("foo"), PlanState::default());
+        let blocks = std::collections::BTreeMap::from([(
+            plan("foo"),
+            vec![mkblock("claude", "halt", "intro only")],
+        )]);
+        let status = state.derive_status(&MockBlocks(blocks), &plan_policy());
+        assert_eq!(status.plans.len(), 1);
+        let ps = &status.plans[0];
+        assert_eq!(ps.gate, CommitGateState::Blocked);
+        assert!(
+            ps.sha.is_none(),
+            "intro-only blocked plan: sha must be None"
+        );
+    }
+
+    #[test]
+    fn derive_status_plan_with_no_block_uses_review_gate() {
+        // Empty blocks → review gate path (Unreviewed in this case
+        // since no reviews were provided).
+        let mut state = RepoState::default();
+        state
+            .plans
+            .insert(plan("foo"), make_plan_with_one_reviewable(sha("aaaa")));
+        let status = state.derive_status(&MockBlocks(Default::default()), &plan_policy());
+        assert_eq!(status.plans.len(), 1);
+        assert_eq!(status.plans[0].gate, CommitGateState::Unreviewed);
+    }
+
+    #[test]
+    fn derive_status_picks_first_pending_block_when_multiple() {
+        // Tie-breaker pinned in Phase 2: lex-first by (creator, name)
+        // matches scan_blocks's sort. The first pending block surfaces
+        // on the gate line.
+        let mut state = RepoState::default();
+        state
+            .plans
+            .insert(plan("foo"), make_plan_with_one_reviewable(sha("aaaa")));
+        let blocks = std::collections::BTreeMap::from([(
+            plan("foo"),
+            vec![
+                // Order them in the WRONG order so we can verify
+                // derive_status sorts. Expected first: (codex, alpha).
+                mkblock("codex", "zebra", "z"),
+                mkblock("claude", "yak", "y"),
+                mkblock("codex", "alpha", "a"),
+            ],
+        )]);
+        let status = state.derive_status(&MockBlocks(blocks), &plan_policy());
+        let block_creator = match &status.plans[0].waiting_on {
+            WaitingOn::Blocked { block } => block.creator.as_str().to_string(),
+            other => panic!("expected Blocked; got: {other:?}"),
+        };
+        let block_name = match &status.plans[0].waiting_on {
+            WaitingOn::Blocked { block } => block.name.clone(),
+            _ => unreachable!(),
+        };
+        // Lex by (creator, name): claude < codex, so claude/yak wins.
+        assert_eq!(block_creator, "claude");
+        assert_eq!(block_name, "yak");
+    }
+
+    #[test]
+    fn work_for_blocked_plan_emits_no_master_or_reviewer_items() {
+        // Phase 5 pin: blocked plans emit no work for any role.
+        // Block-creator clears the block out-of-band.
+        let mut state = RepoState::default();
+        state
+            .plans
+            .insert(plan("foo"), make_plan_with_one_reviewable(sha("aaaa")));
+        let blocks = std::collections::BTreeMap::from([(
+            plan("foo"),
+            vec![mkblock("claude", "halt", "wait")],
+        )]);
+        let status = state.derive_status(&MockBlocks(blocks), &plan_policy());
+        // Master gets nothing.
+        let master_items = status.work_for(&label("claude"), Role::Master);
+        assert_eq!(master_items.len(), 0);
+        // Reviewer gets nothing — even if they haven't reviewed yet.
+        let reviewer_items = status.work_for(&label("codex"), Role::Reviewer);
+        assert_eq!(reviewer_items.len(), 0);
     }
 
     fn adhoc_policy() -> WorkPolicy {

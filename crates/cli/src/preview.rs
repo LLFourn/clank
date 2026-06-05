@@ -17,7 +17,7 @@ use clank_core::api::{
     RewriteCommit, RewriteDisposition, RewritePreviewResponse,
 };
 use clank_core::vocab::{CommitGateState, PlanWorktreeStatus};
-use clank_core::wait::ReviewLookup;
+use clank_core::wait::PlanStateLookup;
 
 #[derive(Debug, thiserror::Error)]
 pub enum PreviewError {
@@ -455,7 +455,7 @@ fn compute_gate(
     let Some(target) = target_sha else {
         return Ok(CommitGateState::Unreviewed);
     };
-    let reviews = crate::fs_review_lookup::FsReviewLookup::new(repo_root, Some(target));
+    let reviews = crate::fs_plan_state_lookup::FsPlanStateLookup::new(repo_root, Some(target));
     let entries = reviews.reviews_for(target);
     let expected_reviewers =
         crate::agent_store::load_expected_reviewers(repo_root).map_err(PreviewError::AgentLoad)?;

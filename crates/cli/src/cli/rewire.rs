@@ -133,7 +133,7 @@ fn plan_actions(repo: &Path, pairs: &[RewritePair]) -> Plan {
 }
 
 /// Probe for the source file in the same order
-/// `FsReviewLookup::reviews_for` does: full-form first, then
+/// `FsPlanStateLookup::reviews_for` does: full-form first, then
 /// 7-char short form.
 fn find_source(feedback_dir: &Path, old: &CommitSha) -> Option<PathBuf> {
     let full = feedback_dir.join(format!("{}.md", old.as_str()));

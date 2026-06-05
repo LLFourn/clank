@@ -1,25 +1,26 @@
-//! Filesystem implementation of `ReviewLookup` for the CLI.
+//! Filesystem implementation of `PlanStateLookup` for the CLI.
 //!
 //! Scans `.clank/agents/*/feedback/<sha>.md` for review files.
 
 use std::path::Path;
 
 use clank_core::ids::{CommitSha, PlanKey};
+use clank_core::plan_view::PlanBlock;
 use clank_core::vocab::{PlanWorktreeStatus, Verdict};
-use clank_core::wait::{ReviewEntry, ReviewLookup};
+use clank_core::wait::{PlanStateLookup, ReviewEntry};
 
-pub struct FsReviewLookup<'a> {
+pub struct FsPlanStateLookup<'a> {
     pub repo: &'a Path,
     head: Option<&'a CommitSha>,
 }
 
-impl<'a> FsReviewLookup<'a> {
+impl<'a> FsPlanStateLookup<'a> {
     pub fn new(repo: &'a Path, head: Option<&'a CommitSha>) -> Self {
         Self { repo, head }
     }
 }
 
-impl ReviewLookup for FsReviewLookup<'_> {
+impl PlanStateLookup for FsPlanStateLookup<'_> {
     fn reviews_for(&self, sha: &CommitSha) -> Vec<ReviewEntry> {
         let agents_dir = self.repo.join(".clank/agents");
         let Ok(agents) = std::fs::read_dir(&agents_dir) else {
@@ -56,6 +57,25 @@ impl ReviewLookup for FsReviewLookup<'_> {
             }
         }
         entries
+    }
+
+    fn blocks_for(&self, plan: &PlanKey) -> Vec<PlanBlock> {
+        // Reuse the existing scan_blocks pass and project pending
+        // (unanswered) plan-scoped blocks for this plan key.
+        let plan_str = plan.as_str();
+        crate::cli::block::scan_blocks(self.repo)
+            .into_iter()
+            .filter(|b| b.answer.is_none() && b.plan.as_deref() == Some(plan_str))
+            .filter_map(|b| {
+                clank_core::ids::AgentLabel::parse(&b.agent)
+                    .ok()
+                    .map(|creator| PlanBlock {
+                        creator,
+                        name: b.name,
+                        message: b.question,
+                    })
+            })
+            .collect()
     }
 
     fn worktree_status(&self, plan: &PlanKey) -> PlanWorktreeStatus {

@@ -226,6 +226,9 @@ fn reason_to_msg(reason: &FinalizeBlockReason) -> String {
                 // only emits NotFinished when state != Finished.
                 "gate is unexpectedly Finished but finalize is blocked".into()
             }
+            clank_core::vocab::CommitGateState::Blocked => {
+                "plan has an open block — clear the block before finalize".into()
+            }
         },
         FinalizeBlockReason::PlanFileMissing => "plan file is missing from the worktree".into(),
         FinalizeBlockReason::PlanFileDirty => {

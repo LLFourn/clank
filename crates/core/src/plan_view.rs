@@ -16,6 +16,19 @@ pub struct WorktreeFacts {
     pub status: PlanWorktreeStatus,
 }
 
+/// Projection of a CLI `BlockEntry` for use inside `derive_status`'s
+/// fold output. The CLI `BlockEntry` (on-disk scan result) stays
+/// as-is; this type carries only what the gate fold needs. The
+/// `creator` field name (vs `BlockEntry::agent`) makes the role
+/// explicit at the projection boundary: this is specifically the
+/// agent that CREATED the block, not "an agent" generically.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PlanBlock {
+    pub creator: AgentLabel,
+    pub name: String,
+    pub message: String,
+}
+
 /// Human-meaningful summary of "what's blocking this plan."
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -46,4 +59,10 @@ pub enum WaitingOn {
     /// Gate is approved but the plan file has uncommitted edits.
     /// Master needs to commit the next revision.
     MasterToCommit,
+    /// Plan has an open (unanswered) plan-scoped block. The block
+    /// creator must clear it; reviewers and master are NOT being
+    /// asked to act. Dominates all review-driven `WaitingOn`
+    /// variants regardless of review state on the latest
+    /// reviewable commit.
+    Blocked { block: PlanBlock },
 }

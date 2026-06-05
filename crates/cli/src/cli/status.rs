@@ -16,6 +16,7 @@ use crate::lifecycle::PlanKey;
 use crate::repo_state::RepoState;
 use clank_core::plan_view::WaitingOn;
 use clank_core::repo_state::FinishedPlan;
+use clank_core::vocab::CommitGateState;
 use clank_core::wait::PlanWorkState;
 
 pub(crate) struct StatusSnapshot {
@@ -61,7 +62,8 @@ impl StatusSnapshot {
             adhoc_feedback: config.review.adhoc_feedback,
             expected_reviewers: load_expected_reviewers(repo)?,
         };
-        let reviews = crate::fs_review_lookup::FsReviewLookup::new(repo, state.head.as_ref());
+        let reviews =
+            crate::fs_plan_state_lookup::FsPlanStateLookup::new(repo, state.head.as_ref());
         let work_status = state.fold.derive_status(&reviews, &work_policy);
 
         let (plans, last_finished) = select_plans_and_finished(
@@ -96,9 +98,13 @@ impl StatusSnapshot {
             .map(|v| {
                 serde_json::json!({
                     "plan": v.plan.as_str(),
-                    "latest_reviewable_sha": v.sha.as_str(),
+                    // None when plan is blocked with no reviewable commit yet.
+                    "latest_reviewable_sha": v.sha.as_ref().map(|s| s.as_str()),
                     "gate_state": v.gate,
-                    "waiting_on": format!("{:?}", v.waiting_on),
+                    // Structured `WaitingOn` via existing serde derive
+                    // (was a `Debug` string — never a stable contract).
+                    // Per status-blocks-dominate-gate.
+                    "waiting_on": v.waiting_on,
                 })
             })
             .collect();
@@ -182,8 +188,22 @@ impl StatusSnapshot {
         for v in &self.plans {
             let _ = writeln!(out);
             let _ = writeln!(out, "plan: {}", v.plan.as_str());
-            let _ = writeln!(out, "  latest reviewable: {}", short_sha(v.sha.as_str()));
-            let _ = writeln!(out, "  gate:              {}", v.gate);
+            // Omit `latest reviewable:` line when sha is None (blocked
+            // plan with no reviewable commit yet — e.g. intro-only).
+            if let Some(sha) = &v.sha {
+                let _ = writeln!(out, "  latest reviewable: {}", short_sha(sha.as_str()));
+            }
+            // `BLOCKED` uppercase on the gate line is a renderer-only
+            // emphasis for the blocked state per lloyd's "screaming
+            // loudly" directive. Other gates stay lowercase via
+            // CommitGateState's Display impl. Wire form
+            // (CommitGateState::as_str) remains lowercase "blocked".
+            let gate_display = if matches!(v.gate, CommitGateState::Blocked) {
+                "BLOCKED".to_string()
+            } else {
+                v.gate.to_string()
+            };
+            let _ = writeln!(out, "  gate:              {gate_display}");
             let _ = writeln!(out, "  waiting on:        {}", waiting_actor(&v.waiting_on));
             let _ = writeln!(
                 out,
@@ -399,6 +419,7 @@ fn select_plans_and_finished(
 
 fn waiting_actor(w: &WaitingOn) -> String {
     match w {
+        WaitingOn::Blocked { block } => block.creator.as_str().to_string(),
         WaitingOn::ReviewerApprovalsMissing { missing } => missing
             .iter()
             .map(|a| a.as_str())
@@ -411,8 +432,26 @@ fn waiting_actor(w: &WaitingOn) -> String {
     }
 }
 
+/// Max chars of block-message body shown on the per-plan `reason:`
+/// line. Full message stays in the bottom `blocks:` footer.
+const BLOCK_REASON_MAX_LEN: usize = 80;
+
+/// First line of a block message, trimmed + truncated to
+/// `BLOCK_REASON_MAX_LEN` chars + `…` ellipsis if longer.
+fn first_line(s: &str) -> String {
+    let line = s.trim_start();
+    let line = line.split('\n').next().unwrap_or("");
+    if line.chars().count() <= BLOCK_REASON_MAX_LEN {
+        line.to_string()
+    } else {
+        let truncated: String = line.chars().take(BLOCK_REASON_MAX_LEN).collect();
+        format!("{truncated}…")
+    }
+}
+
 fn waiting_reason(w: &WaitingOn) -> String {
     match w {
+        WaitingOn::Blocked { block } => format!("blocked: {}", first_line(&block.message)),
         WaitingOn::ReviewerApprovalsMissing { missing } => {
             let names = missing
                 .iter()

@@ -27,7 +27,12 @@ const CACHE_MAGIC: &[u8] = b"CLANK-STATE\n";
 /// - v7: `RepoState::adopted` field gates pre-adoption AdHoc emission.
 ///   Older post-adoption caches would load with `adopted = false` and
 ///   silently suppress legitimate AdHoc events; bump forces a re-fold.
-const CACHE_FORMAT_VERSION: u32 = 7;
+/// - v8: `CommitGateState::Blocked` variant added (appended at
+///   position 4) for `status-blocks-dominate-gate`. Wincode is
+///   position-encoded; existing v7 payloads would technically
+///   decode, but bumping forces stale caches to be reclaimed via
+///   filename mismatch — clean invalidation, no error path needed.
+const CACHE_FORMAT_VERSION: u32 = 8;
 const CLANK_CACHE_GENERATION: u32 = 1;
 
 const HEADER_LEN: usize = CACHE_MAGIC.len() + 4 + 4 + 40;

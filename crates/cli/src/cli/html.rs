@@ -953,12 +953,14 @@ fn verdict_gate_label(g: clank_core::vocab::CommitGateState) -> &'static str {
         G::Finished => "finished",
         G::ChangesRequested => "changes-requested",
         G::Unreviewed => "unreviewed",
+        G::Blocked => "blocked",
     }
 }
 
 fn waiting_on_label(w: &clank_core::plan_view::WaitingOn) -> String {
     use clank_core::plan_view::WaitingOn as W;
     match w {
+        W::Blocked { block } => format!("blocked ({})", block.creator.as_str()),
         W::ReviewerApprovalsMissing { missing } => {
             let mut names: Vec<String> = missing
                 .as_slice()

@@ -710,7 +710,8 @@ async fn fold_summary(repo_root: &Path) -> (usize, Option<String>, Option<String
         adhoc_feedback: config.review.adhoc_feedback,
         expected_reviewers,
     };
-    let reviews = crate::fs_review_lookup::FsReviewLookup::new(repo_root, state.head.as_ref());
+    let reviews =
+        crate::fs_plan_state_lookup::FsPlanStateLookup::new(repo_root, state.head.as_ref());
     let work_status = state.fold.derive_status(&reviews, &work_policy);
     let active_plans = work_status.plans.len();
     let waiting_on = if work_status.plans.len() == 1 {
@@ -726,6 +727,7 @@ async fn fold_summary(repo_root: &Path) -> (usize, Option<String>, Option<String
 fn format_waiting_on(w: &clank_core::plan_view::WaitingOn) -> String {
     use clank_core::plan_view::WaitingOn::*;
     match w {
+        Blocked { block } => format!("blocked ({})", block.creator.as_str()),
         ReviewerApprovalsMissing { .. } => "reviewers".to_string(),
         MasterToRevise { .. } => "master to revise".to_string(),
         MasterToContinue => "master to continue".to_string(),
