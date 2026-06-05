@@ -46,6 +46,8 @@ Counter-shape (rejected): patch only `status.rs`'s `to_human` to inspect `self.b
 - `BlockEntry` is defined at `crates/cli/src/cli/block.rs:147-154` and lives in the CLI crate. To use it inside `clank-core::wait` the type (or a trimmed-down `PlanBlock` projection of it) needs to move to `clank-core`. `BlockEntry` currently has `agent`, `name`, `plan: Option<String>`, `question`, `answer`. The `question` field actually holds the FULL block-message body — see `block.rs:210` `std::fs::read_to_string(file.path())`.
 - wfw's block handling is independent of `derive_status`: `crates/cli/src/cli/wfw.rs:404-447` (`check_blocks`) runs its own `scan_blocks` pass, emits `WaitItem::Blocked` items, and suppresses per-plan `Master` / `Reviewer` items via `suppressed_plans`. This is correct as-is and lloyd has explicitly scoped it out.
 - The current `clank status --json` shape includes `"gate_state": v.gate` and `"waiting_on": format!("{:?}", v.waiting_on)` (`status.rs:97-103`) plus a sibling top-level `"blocks": [...]` array (`:121-134`). Adding `Blocked` to either enum changes the `gate_state` string value when a block is open; the `waiting_on` Debug string also changes. Flag this as a wire-format change in Acceptance.
+- **Wincode cache schema** (ruthless e5d5451 pin 1): `CommitGateState` derives `wincode::SchemaWrite`+`SchemaRead` under `cache-encoding` (`vocab.rs:110-115`). `WaitingOn` does NOT (verified at `plan_view.rs:21-49`). Wincode is position-encoded; the safe addition is to APPEND `Blocked` at the END of `CommitGateState`'s variant list (position 4, after `ChangesRequested`). Existing cached payloads with variants 0-3 remain readable verbatim. The cache layer at `crates/cli/src/state_cache.rs:30` uses a filename-encoded version (`CACHE_FORMAT_VERSION: u32 = 7`, written into `<head>.v<version>.bin`) and self-heals on mismatch via `try_load` (`:73-86`) which removes the offending file before propagating the error. **Pin: bump to `CACHE_FORMAT_VERSION = 8`** in the impl commit so stale v7 caches become orphans that wincode never tries to read; no error-path heroics needed.
+- **`derive_status` early-continue on empty reviewable** (ruthless e5d5451 pin 2): `wait.rs:236-238` skips plans with `reviewable_shas().is_empty()`. A plan with intro-only commits + an open block is currently NOT in `derive_status`'s per-plan output. **Pin: move the block-precedence check BEFORE the early-continue** so blocked intro-only plans surface in the per-plan view ("blocked plans should scream loudly" applies even when no reviewable commit exists). Implication: `PlanWorkState.sha` must become `Option<CommitSha>` to represent the "blocked but no reviewable commit" case. Renderer omits the `latest reviewable:` line when `sha == None`.
 
 ## Approach
 
@@ -57,22 +59,29 @@ Concrete schema additions:
 
 - New type in `crates/core/src/plan_view.rs` (next to `WaitingOn`):
   ```rust
+  /// Projection of a `BlockEntry` for use inside `derive_status`'s
+  /// fold output. The CLI `BlockEntry` (on-disk scan result) stays
+  /// as-is; this type carries only what the gate fold needs. The
+  /// `creator` field name (vs `BlockEntry::agent`) makes the role
+  /// explicit at the projection boundary: this is specifically
+  /// the agent that CREATED the block, not "an agent" generically.
+  #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
   pub struct PlanBlock {
       pub creator: AgentLabel,
       pub name: String,    // the block's identifying slug
       pub message: String, // full block-body text
   }
   ```
-  Trimmed projection of `BlockEntry`. `BlockEntry` (CLI crate) stays as the on-disk scan result.
-- New variant `WaitingOn::Blocked { block: PlanBlock }`.
-- New variant `CommitGateState::Blocked`. Precedence documented in rustdoc: a plan with an open block is `Blocked` regardless of review state on the latest reviewable commit. `as_str()` returns `"blocked"`.
+- New variant `WaitingOn::Blocked { block: PlanBlock }`. Serializes as `{"kind": "blocked", "block": {"creator": "<label>", "name": "<slug>", "message": "<body>"}}` via the existing `#[serde(tag = "kind", rename_all = "snake_case")]` attr on `WaitingOn` (`plan_view.rs:21`). Test #7 asserts this verbatim.
+- New variant `CommitGateState::Blocked` — **unit variant only** (no payload; block details live on `WaitingOn::Blocked.block`). `as_str()` returns `"blocked"`. Appended at the END of the variant list (position 4) for wincode-schema forward-compat. Precedence documented in rustdoc.
+- `PlanWorkState.sha` changes from `CommitSha` to `Option<CommitSha>` (per Pin 2 above) — represents "blocked plan with no reviewable commit yet."
 
 ### Phase 2 — Teach `derive_status` to fold blocks in (PINNED)
 
-- **Pinned: extend the `ReviewLookup` trait** (`crates/core/src/wait.rs:131`) with `fn blocks_for(&self, plan: &PlanKey) -> Vec<PlanBlock>` and a default impl returning `vec![]` so existing test mocks keep compiling. Alternative (separate `BlockLookup` arg) rejected — `ReviewLookup` is already the "filesystem-projection adapter for one fold round"; adding blocks fits the same role and avoids fragmenting the trait surface.
+- **Pinned: extend the `ReviewLookup` trait AND rename it to `PlanStateLookup`** (`crates/core/src/wait.rs:131`). Add `fn blocks_for(&self, plan: &PlanKey) -> Vec<PlanBlock>` with a default impl returning `vec![]` so existing test mocks keep compiling. The rename closes ruthless e5d5451's pin 4 — after adding `blocks_for`, the name `ReviewLookup` is a lie at the call site (`reviews_for` + `blocks_for` is "plan state", not just review state). Cost is ~5 call sites in `clank-core` + 1 production impl (`FsReviewLookup` → `FsPlanStateLookup`) + test mocks. Alternative (separate `BlockLookup` arg) rejected for the same role-fragmentation reason.
 - In `derive_status`'s per-plan loop, BEFORE computing the review-driven gate, query `blocks_for(key)`. If a pending (unanswered) block exists, set `gate = CommitGateState::Blocked` and `waiting_on = WaitingOn::Blocked { block: <first pending> }`. Skip the review-gate branch entirely for that plan.
 - **Pinned: tie-breaker for multiple pending blocks** = lexicographically-first by `(agent, name)`, matching `scan_blocks`'s existing sort order. Test #4 asserts this.
-- **Pinned: repo-wide blocks (`plan: None`) are NOT folded** into `derive_status` per-plan. Status's per-plan section reflects only plan-scoped blocks; repo-wide blocks continue to appear in the `blocks:` footer (with the footer becoming a smaller residual list since plan-scoped ones now surface on their own per-plan line). Rationale: repo-wide blocks are a global thing — surfacing them on every plan would clutter the per-plan summary without adding signal beyond what the footer already provides. wfw's `suppress_all` mechanism for repo-wide blocks remains independent and unchanged.
+- **Pinned: repo-wide blocks (`plan: None`) are NOT folded** into `derive_status` per-plan. Status's per-plan section reflects only plan-scoped blocks; repo-wide blocks continue to appear in the `blocks:` footer (with the footer becoming a smaller residual list since plan-scoped ones now surface on their own per-plan line). Rationale: repo-wide blocks are a global thing — surfacing them on every plan would clutter the per-plan summary without adding signal beyond what the footer already provides. wfw's `suppress_all` mechanism for repo-wide blocks remains independent and unchanged. (Ruthless e5d5451 pin 3 — the prior plan body had a contradictory hedge in Out-of-scope; that's removed.)
 
 ### Phase 3 — Adapt the CLI lookup
 
@@ -84,7 +93,8 @@ Concrete schema additions:
 In `crates/cli/src/cli/status.rs`:
 
 - `waiting_actor` (`:400-412`) gains a `WaitingOn::Blocked { block }` arm returning `block.creator.as_str().to_string()`.
-- `waiting_reason` (`:414-453`) gains a `WaitingOn::Blocked { block }` arm returning `format!("blocked: {}", first_line(&block.message))`. `first_line` trims whitespace and takes characters up to the first `\n`, then truncates to a sane width (e.g. 80 chars + ellipsis). Multi-line block bodies are common; the footer still shows the full text.
+- `waiting_reason` (`:414-453`) gains a `WaitingOn::Blocked { block }` arm returning `format!("blocked: {}", first_line(&block.message))`.
+- **`first_line` helper pinned** (ruthless e5d5451 bonus): sibling free fn in `status.rs` (next to `waiting_reason`). Trims leading whitespace, takes characters up to the first `\n` (exclusive), then truncates to `BLOCK_REASON_MAX_LEN` characters + `…` ellipsis if longer. Constant `BLOCK_REASON_MAX_LEN: usize = 80`. The footer still shows the full untruncated block body.
 - **Pinned: uppercase `BLOCKED` in the human `gate:` line only.** Other gate states stay lowercase. This is a renderer-only special case in `to_human` (not in `CommitGateState::as_str()` — that stays lowercase `"blocked"` for the wire form). lloyd's "screaming loudly" directive justifies the inconsistency for this one state. Concrete output:
   ```
   gate:              BLOCKED
@@ -97,7 +107,8 @@ In `crates/cli/src/cli/status.rs`:
 
 ### Phase 5 — Verify wfw is unchanged
 
-- `crates/cli/src/cli/wfw.rs:404-447`'s `check_blocks` continues to drive wfw's `Blocked` / `Unblocked` items and `suppressed_plans` exactly as today. wfw's loop emits a `Reviewer` item to a reviewer who hasn't reviewed yet — the underlying review-gate state machine in `work_for` (`wait.rs:357-439`) STILL sees `WaitingOn::ReviewerApprovalsMissing` etc., not `WaitingOn::Blocked`, because `check_blocks` runs alongside (not through) `derive_status`. The wfw flow is: run `derive_status` (gives review-driven items) → run `check_blocks` (gives `Blocked` items + suppresses overlapping plan items). Phase 2's change DOES affect this: if `derive_status` now returns `WaitingOn::Blocked`, the `work_for` arms in `wait.rs:357-439` need a new no-op arm so blocked plans don't accidentally emit a `Master` item with a `Blocked` waiting state. Add `(_, WaitingOn::Blocked { .. }) => {}` to `work_for`.
+- `crates/cli/src/cli/wfw.rs:404-447`'s `check_blocks` continues to drive wfw's `Blocked` / `Unblocked` items and `suppressed_plans` exactly as today. wfw's loop emits a `Reviewer` item to a reviewer who hasn't reviewed yet — the underlying review-gate state machine in `work_for` (`wait.rs:357-439`) STILL sees `WaitingOn::ReviewerApprovalsMissing` etc., not `WaitingOn::Blocked`, because `check_blocks` runs alongside (not through) `derive_status`. The wfw flow is: run `derive_status` (gives review-driven items) → run `check_blocks` (gives `Blocked` items + suppresses overlapping plan items). Phase 2's change DOES affect this: if `derive_status` now returns `WaitingOn::Blocked`, the `work_for` arms in `wait.rs:357-439` need a new no-op arm so blocked plans don't accidentally emit a `Master` item with a `Blocked` waiting state.
+- **`work_for` Blocked arm pinned** (ruthless e5d5451 bonus): add `(_, WaitingOn::Blocked { .. }) => return None,` as the FIRST arm of the match (before the role-specific arms), with comment `// blocked plans emit no work for any role — block-creator clears the block out-of-band`. Catches all roles uniformly; placement first makes the precedence visible at a glance.
 - Net effect on wfw output: identical. Master no longer gets a `Master { next: …, reason: … }` item for a blocked plan (currently it would NOT either, because `suppressed_plans` already drops it — but this change makes the dropping explicit at the model level, not just at the suppression-list level). Reviewers don't get a `Reviewer` item for a blocked plan (same suppression path covers them). Verify both with the existing wfw integration tests pass unchanged.
 
 ### Phase 6 — Tests
@@ -121,9 +132,12 @@ Integration test (new file `crates/cli/tests/status_blocked_plan_integration.rs`
      - contains `reason:            blocked: wait — checking the design`.
      - does NOT contain `missing approval from codex, ruthless`.
      - the `blocks:` footer still lists the BLOCKED entry.
-7. `status_blocked_plan_json_emits_blocked_gate_state`: same setup, `clank status --json`, parse, assert `plans[0].gate_state == "blocked"` and `plans[0].waiting_on` is a structured `{kind: "blocked", block: {creator: "claude", …}}` value (not a Debug string).
+7. `status_blocked_plan_json_emits_blocked_gate_state`: same setup, `clank status --json`, parse, assert:
+   - `plans[0].gate_state == "blocked"` (lowercase wire form).
+   - `plans[0].waiting_on == {"kind": "blocked", "block": {"creator": "claude", "name": "blah", "message": "wait — checking the design"}}` (structured serde, not a `Debug` string).
+   The exact JSON shape is locked in here so the wire-format migration is testable end-to-end.
 8. `status_unblocked_plan_returns_to_review_gate`: same setup then `clank unblock claude blah --plan foo --message ok` → `clank status` shows the original `gate: unreviewed` / `waiting on: codex, ruthless` shape.
-9. `status_two_pending_blocks_on_same_plan_picks_first`: lexicographic order pin. Optional but recommended.
+9. `status_two_pending_blocks_on_same_plan_picks_first` (**REQUIRED**, not optional — ruthless e5d5451 pin 5): lexicographic order is pinned in Phase 2; a pinned property without a defending test is aspirational.
 
 Existing tests to re-run untouched:
 
@@ -136,14 +150,18 @@ Existing tests to re-run untouched:
 - Changing how blocks are CREATED, ANSWERED, or LIFECYCLE-MANAGED. `clank block create` / `clank unblock` / `clank block clean` keep their semantics.
 - Changing wfw's wake / suppress behavior. lloyd was explicit: blocks dominating `status` does NOT mean wfw should wake reviewers or the block-creator to "clear" the block. wfw stays exactly as today.
 - The stop-hook's `Blocked` hook event firing. That fires at block-create time (`crates/cli/src/cli/block.rs:54-69`) and is unrelated to status display.
-- Repo-wide (`plan: None`) blocks changing every plan's `gate:` line. Default treats only plan-scoped blocks as plan-level state; repo-wide blocks remain in the `blocks:` footer. (Pin alternative at promotion-time if lloyd wants repo-wide blocks to ALSO flip every plan to BLOCKED.)
+- Repo-wide (`plan: None`) blocks changing every plan's `gate:` line. **Pinned in Phase 2**: only plan-scoped blocks flip per-plan `gate:`; repo-wide blocks remain in the `blocks:` footer (alternative explicitly rejected — see Phase 2 rationale).
 - TUI / HTML rendering changes outside `clank status`'s human + json paths.
 - Renaming `CommitGateState` if Phase 1 pursues the "don't extend `CommitGateState`" alternative — that's a follow-up plan, not in this scope.
 
 ## Acceptance
 
-- `WaitingOn` gains a `Blocked { block: PlanBlock }` variant (or `PlanWorkState` gains an `Option<PlanBlock>` sibling field — pinned in Phase 1).
-- `CommitGateState` gains a `Blocked` variant (or alternative pinned in Phase 1 — flag the wire-format consequence either way).
+- `WaitingOn` gains a `Blocked { block: PlanBlock }` variant. Serializes as `{"kind": "blocked", "block": {...}}`.
+- `CommitGateState` gains a unit `Blocked` variant **appended at the end** of the variant list (wincode position 4). `as_str()` returns `"blocked"`.
+- `PlanWorkState.sha` becomes `Option<CommitSha>` to represent blocked plans with no reviewable commit.
+- `PlanBlock` type added in `clank-core::plan_view` with derives `Debug, Clone, PartialEq, Eq, Serialize, Deserialize`.
+- `ReviewLookup` trait renamed to `PlanStateLookup`; gains `blocks_for()` with a default impl returning `vec![]`. `FsReviewLookup` → `FsPlanStateLookup`. Both renamed consistently across `clank-core` and `clank-cli`.
+- `CACHE_FORMAT_VERSION` bumped from 7 to 8 in `crates/cli/src/state_cache.rs` (forces stale v7 caches to become orphans on filename mismatch — no error-path heroics).
 - `derive_status` returns `gate == Blocked` and `waiting_on == Blocked { block: … }` for any plan with at least one pending plan-scoped block.
 - `compute_gate` (the per-commit pure function) is UNCHANGED. Block precedence lives in the multi-plan fold, not the per-commit verdict computation.
 - `work_for` returns nothing for a blocked plan regardless of role.
