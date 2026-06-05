@@ -1823,21 +1823,29 @@ fn wfw_block_on_queue_item_name_suppresses_promote() {
         .output()
         .expect("spawn");
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-    // With the only queue item suppressed and no other work, wfw
-    // should park (exit 2 timeout) and NOT emit promote_from_queue.
+    // wfw must succeed (exit 0) AND emit the Blocked item. The
+    // promote_from_queue signal for the blocked queue item is
+    // suppressed; the Blocked item itself MUST still emit so the
+    // agent sees what's holding the queue (plan acceptance).
+    // Codex 62f22c2 catch: my prior assertion accepted either
+    // "blocked emits" OR "wfw times out" — the timeout branch was
+    // a bug, not an acceptable fallback.
+    assert!(
+        output.status.success(),
+        "wfw should succeed and emit Blocked, not time out; \
+         exit={:?} stdout=`{stdout}` stderr=`{}`",
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
+    );
     assert!(
         !stdout.contains("promote_from_queue"),
         "promote_from_queue must NOT emit when block scopes to the queue \
          item's name; got: {stdout}"
     );
-    // The Blocked item should still emit (plan-scoped block).
-    let combined = stdout.clone() + &String::from_utf8_lossy(&output.stderr);
     assert!(
-        combined.contains("blocked") || output.status.code() == Some(2),
-        "either blocked item emits OR wfw times out; got stdout=`{stdout}` \
-         stderr=`{}` code={:?}",
-        String::from_utf8_lossy(&output.stderr),
-        output.status.code()
+        stdout.contains("blocked") && stdout.contains("dont-yet"),
+        "Blocked item MUST still emit so the agent sees what's holding \
+         the queue; got: {stdout}"
     );
 }
 

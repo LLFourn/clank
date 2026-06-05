@@ -272,6 +272,17 @@ pub async fn run(args: WfwArgs) -> anyhow::Result<()> {
             emit(&items, args.json);
             return Ok(());
         }
+        // Codex 62f22c2: when the queue is non-empty but every item
+        // is suppressed by a plan-scoped block, we still emit the
+        // Blocked items so the agent sees what's holding the queue.
+        // (Empty-queue + plan-blocked behavior unchanged from today
+        // — wfw parks. The change is scoped to "queue had items we
+        // filtered out," matching the acceptance "plan-scoped blocks
+        // continue to emit alongside the now-filtered promote scan.")
+        if !queue.is_empty() && !initial_block_items.is_empty() {
+            emit(&initial_block_items, args.json);
+            return Ok(());
+        }
         hook_config::run_idle_hook(&repo, &hook_config);
     }
 
@@ -403,6 +414,13 @@ pub async fn run(args: WfwArgs) -> anyhow::Result<()> {
                         priority: first.priority,
                     });
                     emit(&items, args.json);
+                    return Ok(());
+                }
+                // Codex 62f22c2: queue had items but every one was
+                // suppressed — surface the Blocked items so the agent
+                // sees the holding cause. Empty-queue path unchanged.
+                if !queue.is_empty() && !br.items.is_empty() {
+                    emit(&br.items, args.json);
                     return Ok(());
                 }
             }
