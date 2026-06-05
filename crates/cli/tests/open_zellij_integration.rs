@@ -521,3 +521,55 @@ fn open_zellij_pane_commands_pin_repo_via_absolute_path() {
         );
     }
 }
+
+// ─── document-clank-open-zellij-new-tab ─────────────────────────
+
+#[test]
+fn clank_open_zellij_help_documents_auto_detect() {
+    // Plan: document-clank-open-zellij-new-tab. The doc must tell
+    // users that `clank open zellij` opens a new tab when run
+    // inside a zellij session and a new session otherwise — both
+    // behaviors flow from `zellij --layout` natively.
+    let out = Command::new(clank_bin())
+        .args(["open", "zellij", "--help"])
+        .output()
+        .expect("spawn clank open zellij --help");
+    assert!(
+        out.status.success(),
+        "--help should exit 0; stderr=`{}`",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("new tab"),
+        "long_about must mention `new tab` (inside-session behavior); got: {stdout}"
+    );
+    assert!(
+        stdout.contains("new session"),
+        "long_about must mention `new session` (outside-session behavior); got: {stdout}"
+    );
+}
+
+#[test]
+fn clank_open_help_does_not_claim_action_new_tab() {
+    // Plan: document-clank-open-zellij-new-tab. The pre-plan
+    // variant docstring at mod.rs:194-197 claimed "Spawn the tab
+    // via `zellij action new-tab`" — that command path was
+    // discussed in early drafts but never implemented (the real
+    // spawn at open_zellij.rs:37 uses `--layout`). Defend against
+    // regression to the wrong description on both surfaces.
+    for (label, args) in [
+        ("clank open --help", vec!["open", "--help"]),
+        ("clank open zellij --help", vec!["open", "zellij", "--help"]),
+    ] {
+        let out = Command::new(clank_bin())
+            .args(&args)
+            .output()
+            .unwrap_or_else(|_| panic!("spawn {label}"));
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            !stdout.contains("action new-tab"),
+            "{label} must NOT claim `action new-tab` (that was never the implementation); got: {stdout}"
+        );
+    }
+}

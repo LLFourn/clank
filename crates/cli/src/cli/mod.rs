@@ -192,9 +192,15 @@ pub enum OpenCmd {
     /// human-readable. Renamed from `clank open <path>`.
     Dry(OpenDryArgs),
     /// Auto-generate a zellij layout (KDL) for master + reviewer
-    /// panes. Spawn the tab via `zellij action new-tab`, or use
-    /// `--print` to emit the composed KDL on stdout + the
-    /// would-be-spawned argv on stderr.
+    /// panes and spawn it via `zellij --layout`.
+    ///
+    /// Inside an existing zellij session, the layout opens as a
+    /// new tab (no new session is spawned). Outside any session,
+    /// it starts a new session. This is zellij's `--layout`
+    /// behavior — no extra detection in clank.
+    ///
+    /// Use `--print` to emit the composed KDL on stdout + the
+    /// would-be-spawned argv on stderr instead of shelling out.
     Zellij(OpenZellijArgs),
 }
 
