@@ -277,6 +277,105 @@ fn doctor_warns_when_launch_command_missing_from_path() {
 }
 
 #[test]
+fn doctor_warns_on_missing_skeleton() {
+    // Phase 7: declaration says agent X is registered, but no
+    // skeleton at .clank/agents/<X>/config.json. Doctor surfaces
+    // a Warn naming the label + diagnostic mentioning
+    // `clank init`.
+    let dir = init_repo();
+    let repo = dir.path();
+    write(repo, ".clank/.gitignore", ".gitignore\n");
+    register_agents(repo, &[("phantom", clank_core::vocab::Role::Reviewers)]);
+    // No skeleton written.
+
+    let out = run_doctor(repo);
+    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+    let parsed: serde_json::Value = serde_json::from_str(&stdout).expect("doctor JSON parse");
+    let checks = parsed.as_array().expect("array");
+    let phantom_check = checks
+        .iter()
+        .find(|c| c["name"].as_str() == Some("agent: phantom"))
+        .expect("expected agent: phantom check");
+    assert_eq!(
+        phantom_check["status"], "warn",
+        "missing skeleton must be Warn; got {phantom_check}"
+    );
+    let msg = phantom_check["message"].as_str().unwrap_or("");
+    assert!(
+        msg.contains("in merged declaration"),
+        "diagnostic should mention `in merged declaration`; got: {msg}"
+    );
+    assert!(
+        msg.contains("missing"),
+        "diagnostic should mention skeleton missing; got: {msg}"
+    );
+    assert!(
+        msg.contains("clank init"),
+        "diagnostic should mention `clank init` as the fix; got: {msg}"
+    );
+}
+
+#[test]
+fn doctor_warns_on_orphan_skeleton() {
+    // Phase 7: per-agent dir exists but label NOT in the merged
+    // declaration (neither repo-scope nor user-scope). Doctor
+    // surfaces a Warn naming the label + diagnostic mentioning
+    // `clank agent add` AND `rm -rf`.
+    let dir = init_repo();
+    let repo = dir.path();
+    write(repo, ".clank/.gitignore", ".gitignore\n");
+    // Empty declaration (explicit empty override).
+    let file = clank::cli::config::RepoConfigFile {
+        agents: Some(Vec::new()),
+        ..Default::default()
+    };
+    std::fs::create_dir_all(repo.join(".clank")).unwrap();
+    std::fs::write(
+        repo.join(".clank/config.json"),
+        serde_json::to_string_pretty(&file).unwrap(),
+    )
+    .unwrap();
+    // Orphan skeleton.
+    write_skeleton(
+        repo,
+        "orphan",
+        &skeleton(
+            clank_core::vocab::AutoMode::Off,
+            Some(session(
+                clank_core::vocab::Tool::Claude,
+                "11111111-1111-1111-1111-111111111111",
+            )),
+        ),
+    );
+
+    let out = run_doctor(repo);
+    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+    let parsed: serde_json::Value = serde_json::from_str(&stdout).expect("doctor JSON parse");
+    let checks = parsed.as_array().expect("array");
+    let orphan_check = checks
+        .iter()
+        .find(|c| c["name"].as_str() == Some("agent: orphan"))
+        .expect("expected agent: orphan check");
+    assert_eq!(
+        orphan_check["status"], "warn",
+        "orphan skeleton must be Warn; got {orphan_check}"
+    );
+    let msg = orphan_check["message"].as_str().unwrap_or("");
+    assert!(
+        msg.contains("not in the merged agent declaration"),
+        "diagnostic should mention `not in the merged agent declaration`; got: {msg}"
+    );
+    assert!(
+        msg.contains("clank agent add"),
+        "diagnostic should mention `clank agent add` as a recovery option; got: {msg}"
+    );
+    assert!(
+        msg.contains("rm -rf"),
+        "diagnostic should mention `rm -rf` as a removal option; got: {msg}"
+    );
+}
+
+#[test]
 fn doctor_warn_for_unbound_does_not_introduce_new_fail() {
     // The unbound-reviewer warning must not escalate to Fail status
     // for the agent entry itself. (Doctor's overall exit code may

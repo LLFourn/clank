@@ -594,7 +594,9 @@ pub struct AgentAddArgs {
     pub launch_cmd: Option<String>,
     /// Arguments inserted on the tool invocation BEFORE the
     /// session-restore suffix. Repeat for multiple args.
-    #[arg(long = "launch-arg", value_name = "ARG")]
+    /// `allow_hyphen_values` lets you pass values that start with
+    /// `-` or `--` directly (e.g. `--launch-arg --profile`).
+    #[arg(long = "launch-arg", value_name = "ARG", allow_hyphen_values = true)]
     pub launch_args: Vec<String>,
     /// Environment overrides applied to the spawned process.
     /// Format `KEY=VAL`. Repeatable. `cfg.launch.env` wins over

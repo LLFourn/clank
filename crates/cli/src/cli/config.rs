@@ -197,11 +197,27 @@ pub struct UserConfigFile {
 /// Round-trip variant of [`ReviewFile`] (which is Deserialize-only).
 /// Same field names + serde aliases so a config written by the
 /// round-trip path stays readable by the lossy `apply_layer` path.
+///
+/// Legacy aliases `force_review_on_misc_commits` /
+/// `force_review_on_plan_commits` are accepted on deserialize
+/// (matching [`ReviewFile`]) and **canonicalized** on
+/// reserialize (output always uses the modern names). Codex
+/// caught the missing aliases on 9218aa9 — without them, a
+/// config using the legacy keys would lose its review settings
+/// after any agent-mutation round-trip.
 #[derive(Debug, Default, Deserialize, Serialize)]
 pub struct ReviewSection {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        alias = "force_review_on_misc_commits",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub adhoc_feedback: Option<bool>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        alias = "force_review_on_plan_commits",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub plan_feedback: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub require_commit_prefix: Option<bool>,
@@ -1046,6 +1062,65 @@ mod tests {
             Some(Vec::new()),
             "explicit `agents: []` → Some(vec![])"
         );
+    }
+
+    #[test]
+    fn review_section_legacy_aliases_round_trip_canonical() {
+        // Codex caught on 9218aa9: ReviewSection was missing the
+        // legacy `force_review_on_misc_commits` /
+        // `force_review_on_plan_commits` aliases ReviewFile has.
+        // Round-trip path would lose these values on agent
+        // mutation. Fix: aliases accepted on deserialize,
+        // canonicalized on reserialize.
+        let legacy_json = r#"{
+            "force_review_on_misc_commits": true,
+            "force_review_on_plan_commits": false
+        }"#;
+        let parsed: ReviewSection = serde_json::from_str(legacy_json).unwrap();
+        assert_eq!(parsed.adhoc_feedback, Some(true));
+        assert_eq!(parsed.plan_feedback, Some(false));
+        // Reserialize: canonical names.
+        let out = serde_json::to_string(&parsed).unwrap();
+        assert!(
+            out.contains(r#""adhoc_feedback":true"#),
+            "should canonicalize to adhoc_feedback; got: {out}"
+        );
+        assert!(
+            out.contains(r#""plan_feedback":false"#),
+            "should canonicalize to plan_feedback; got: {out}"
+        );
+        assert!(
+            !out.contains("force_review_on"),
+            "legacy keys must NOT appear in serialized output; got: {out}"
+        );
+    }
+
+    #[test]
+    fn repo_config_with_legacy_review_keys_round_trips() {
+        // Full round-trip: a RepoConfigFile with legacy review
+        // keys deserializes, reserializes with canonical keys,
+        // and preserves the values. This is the path that
+        // `clank agent add/remove/set-role` exercises.
+        let legacy_json = r#"{
+            "review": {
+                "force_review_on_misc_commits": true,
+                "force_review_on_plan_commits": true
+            },
+            "agents": [
+                {"label": "alice", "role": "reviewers"}
+            ]
+        }"#;
+        let parsed: RepoConfigFile = serde_json::from_str(legacy_json).unwrap();
+        let review = parsed.review.as_ref().expect("review section present");
+        assert_eq!(review.adhoc_feedback, Some(true));
+        assert_eq!(review.plan_feedback, Some(true));
+        let agents = parsed.agents.as_ref().expect("agents present");
+        assert_eq!(agents.len(), 1);
+        // Reserialize and confirm.
+        let out = serde_json::to_string(&parsed).unwrap();
+        assert!(out.contains(r#""adhoc_feedback":true"#));
+        assert!(out.contains(r#""plan_feedback":true"#));
+        assert!(!out.contains("force_review_on"));
     }
 
     #[test]
