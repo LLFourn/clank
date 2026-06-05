@@ -158,8 +158,23 @@ pub struct HtmlArgs {
 pub enum HtmlCmd {
     /// Build the site, then launch the host browser
     /// (`open` / `xdg-open` / `explorer`) on the generated
-    /// `index.html`.
-    Open,
+    /// `index.html` — or on `plan/<stem>.html` if a plan name
+    /// is supplied.
+    Open(HtmlOpenArgs),
+}
+
+#[derive(clap::Args, Debug)]
+pub struct HtmlOpenArgs {
+    /// Plan name. When supplied, the browser opens
+    /// `plan/<stem>.html` instead of `index.html`. Resolved
+    /// against active plans first, then finished — same shape
+    /// as `clank diff <plan>`.
+    pub plan: Option<String>,
+    /// Print the resolved target path on stdout and exit
+    /// without launching a browser. Mirrors `--print` on
+    /// `clank agent start`, `clank diff`, `clank open zellij`.
+    #[arg(long)]
+    pub print_path: bool,
 }
 
 /// `clank open` — container subcommand. `dry` is the existing

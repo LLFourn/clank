@@ -34,10 +34,42 @@ pub async fn run(args: HtmlArgs) -> anyhow::Result<()> {
     build_site(&repo, &basename, &out_dir, args.rebuild, &progress).await?;
     progress.finish();
     println!("wrote {}", out_dir.display());
-    if matches!(args.command, Some(HtmlCmd::Open)) {
-        launch_opener(&out_dir.join("index.html"))?;
+    if let Some(HtmlCmd::Open(open_args)) = args.command {
+        let target = resolve_open_target(&repo, &basename, &out_dir, &open_args).await?;
+        if open_args.print_path {
+            println!("{}", target.display());
+        } else {
+            launch_opener(&target)?;
+        }
     }
     Ok(())
+}
+
+/// Resolve the target file the browser (or `--print-path`) lands on.
+/// When `plan` is set, returns `<out_dir>/plan/<stem>.html` after
+/// resolving the plan name via the shared `plan_resolve` helper —
+/// errors with the established "not a known plan" diagnostic on
+/// miss (parity with `clank diff <plan>`). When `plan` is None,
+/// returns `<out_dir>/index.html` (current backward-compat).
+async fn resolve_open_target(
+    repo: &Path,
+    basename: &str,
+    out_dir: &Path,
+    args: &crate::cli::HtmlOpenArgs,
+) -> anyhow::Result<std::path::PathBuf> {
+    match args.plan.as_deref() {
+        Some(raw) => {
+            let state =
+                crate::rebuild::rebuild_repo_with_policy(repo, crate::rebuild::CachePolicy::Use)
+                    .await
+                    .map_err(|e| {
+                        anyhow::anyhow!("failed to fold repo `{}`: {e}", repo.display())
+                    })?;
+            let key = crate::cli::plan_resolve::resolve_plan(&state, basename, Some(raw))?;
+            Ok(out_dir.join(format!("plan/{}.html", key.as_str())))
+        }
+        None => Ok(out_dir.join("index.html")),
+    }
 }
 
 async fn build_site(
