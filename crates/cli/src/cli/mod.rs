@@ -932,6 +932,16 @@ pub struct PurgeArgs {
     /// Skip the on-disk state cache: don't read it, don't write it.
     #[arg(long)]
     pub no_cache: bool,
+    /// Drop EVERY commit attributed to the plan, including the
+    /// implementation code — not just `.clank/` artifacts. The
+    /// plan AND its work both vanish from history. Refuses
+    /// foreign commits unconditionally (same policy as
+    /// `clank demote`). Does NOT save the plan body anywhere —
+    /// use `clank demote` if you want to re-queue the plan for
+    /// another attempt. Mutually exclusive with `--all`,
+    /// `--squash`, and `--amend`.
+    #[arg(long)]
+    pub drop: bool,
 }
 
 /// Resolve the repo root: explicit `--repo` path wins, otherwise
