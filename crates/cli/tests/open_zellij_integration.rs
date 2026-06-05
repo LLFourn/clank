@@ -255,26 +255,11 @@ fn open_zellij_multiple_masters_errors_with_diagnostic() {
 // ─── Phase 3: spawn vs --print ─────────────────────────────────
 
 #[test]
-fn open_zellij_no_zellij_session_errors_without_print() {
-    let dir = init_repo();
-    let repo = dir.path();
-    write_repo_agents(repo, vec![agent("alice", Role::Master)]);
-
-    // No --print, no ZELLIJ_SESSION_NAME → must error.
-    let out = run_zellij(repo, &[]);
-    assert!(
-        !out.status.success(),
-        "missing zellij session must error without --print"
-    );
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(
-        stderr.contains("ZELLIJ_SESSION_NAME") && stderr.contains("--print"),
-        "diagnostic should name the env var AND the --print escape; got: {stderr}"
-    );
-}
-
-#[test]
-fn open_zellij_no_zellij_session_succeeds_with_print() {
+fn open_zellij_print_mode_emits_kdl_without_writing_file() {
+    // --print is inspection-only: emit KDL on stdout + the
+    // would-be-spawned argv on stderr, but DO NOT write the
+    // layout file. (Codex 361b104 plan refinement: file-write
+    // is a non-print side effect.)
     let dir = init_repo();
     let repo = dir.path();
     write_repo_agents(repo, vec![agent("alice", Role::Master)]);
@@ -282,13 +267,17 @@ fn open_zellij_no_zellij_session_succeeds_with_print() {
     let out = run_zellij(repo, &["--print"]);
     assert!(
         out.status.success(),
-        "--print should succeed even without ZELLIJ_SESSION_NAME; stderr=`{}`",
+        "--print should succeed without zellij installed; stderr=`{}`",
         String::from_utf8_lossy(&out.stderr)
     );
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
         stdout.contains("layout {"),
         "KDL should be on stdout; got: {stdout}"
+    );
+    assert!(
+        !repo.join(".clank/zellij/layout.kdl").exists(),
+        "--print mode must NOT write the layout file"
     );
 }
 
@@ -329,26 +318,149 @@ fn open_zellij_reviewer_order_matches_declaration_order() {
 }
 
 #[test]
-fn open_zellij_tab_name_in_print_spawn_metadata() {
+fn open_zellij_tab_name_in_kdl_and_layout_path_in_spawn_metadata() {
+    // Tab name now lives in the KDL (`tab name="<basename>"`)
+    // rather than a `--name` argv flag. The spawn argv on
+    // stderr is `zellij --layout <path>` only.
     let dir = init_repo();
     let repo = dir.path();
     write_repo_agents(repo, vec![agent("alice", Role::Master)]);
 
     let out = run_zellij(repo, &["--print"]);
     assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
-    // The basename of the tempdir is what becomes the tab name.
     let basename = repo.file_name().and_then(|s| s.to_str()).unwrap();
     assert!(
-        stderr.contains(&format!("--name {basename}")),
-        "spawn metadata must include --name <basename> ({basename}); got: {stderr}"
+        stdout.contains(&format!("tab name=\"{basename}\"")),
+        "KDL should contain `tab name=\"<basename>\"`; got:\n{stdout}"
+    );
+    // macOS canonicalizes /tmp → /private/tmp, so we can't
+    // predict the exact prefix. Verify shape only.
+    assert!(
+        stderr.contains("spawn: zellij --layout"),
+        "spawn metadata must be `zellij --layout <path>`; got: {stderr}"
     );
     assert!(
-        stderr.contains("--cwd"),
-        "spawn metadata must include --cwd; got: {stderr}"
+        stderr.contains(".clank/zellij/layout.kdl"),
+        "spawn line must reference the layout path; got: {stderr}"
     );
+}
+
+#[test]
+fn open_zellij_writes_layout_file_under_clank_dir() {
+    // Non-print: layout file is written under
+    // <repo>/.clank/zellij/layout.kdl. The spawn itself will
+    // fail (no zellij in CI / no session), but the file write
+    // happens before the spawn so we can assert on the
+    // post-state regardless.
+    let dir = init_repo();
+    let repo = dir.path();
+    write_repo_agents(repo, vec![agent("alice", Role::Master)]);
+
+    let _ = run_zellij(repo, &[]); // ignore status — zellij absent in CI
+    let layout_path = repo.join(".clank/zellij/layout.kdl");
     assert!(
-        stderr.contains(&repo.display().to_string()),
-        "spawn metadata must include the repo path; got: {stderr}"
+        layout_path.exists(),
+        "layout.kdl should be written at {} even if spawn fails",
+        layout_path.display()
     );
+    let body = std::fs::read_to_string(&layout_path).unwrap();
+    assert!(
+        body.contains("layout {"),
+        "file should be valid KDL; got:\n{body}"
+    );
+    let basename = repo.file_name().and_then(|s| s.to_str()).unwrap();
+    assert!(
+        body.contains(&format!("tab name=\"{basename}\"")),
+        "file should have the tab name; got:\n{body}"
+    );
+}
+
+#[test]
+fn open_zellij_adds_zellij_dir_to_gitignore_idempotently() {
+    let dir = init_repo();
+    let repo = dir.path();
+    write_repo_agents(repo, vec![agent("alice", Role::Master)]);
+
+    // First invocation.
+    let _ = run_zellij(repo, &[]);
+    let gitignore = repo.join(".clank/.gitignore");
+    let body1 = std::fs::read_to_string(&gitignore).unwrap();
+    assert!(
+        body1.lines().any(|l| l.trim() == "/zellij/"),
+        "gitignore should contain `/zellij/`; got:\n{body1}"
+    );
+
+    // Second invocation — must NOT add a duplicate entry.
+    let _ = run_zellij(repo, &[]);
+    let body2 = std::fs::read_to_string(&gitignore).unwrap();
+    assert_eq!(
+        body2.matches("/zellij/").count(),
+        1,
+        "second invocation must not duplicate /zellij/; got:\n{body2}"
+    );
+}
+
+#[test]
+fn open_zellij_pane_commands_pin_repo_via_absolute_path() {
+    // Codex 361b104: when `clank open zellij --repo <abs-path>`
+    // is invoked from a different cwd, the spawned zellij
+    // session's cwd doesn't match the repo. Every pane command
+    // must pin `--repo <abs-path>` so the resolved repo is
+    // unambiguous.
+    let dir = init_repo();
+    let repo = dir.path();
+    write_repo_agents(
+        repo,
+        vec![agent("alice", Role::Master), agent("bob", Role::Reviewer)],
+    );
+
+    // Invoke from a DIFFERENT cwd (the tempdir's parent, or
+    // any path that isn't the repo).
+    let cwd = std::env::temp_dir();
+    let out = Command::new(clank_bin())
+        .current_dir(&cwd)
+        .args(["open", "zellij", "--repo"])
+        .arg(repo)
+        .arg("--print")
+        .env_remove("ZELLIJ_SESSION_NAME")
+        .env("HOME", repo)
+        .output()
+        .expect("spawn clank open zellij");
+    assert!(
+        out.status.success(),
+        "--print from outside repo should succeed; stderr=`{}`",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    // Whatever path clank resolved for --repo is what shows up
+    // in the pane args. macOS canonicalization (/tmp → /private/tmp)
+    // means we can't assert on `repo.display()` directly. The
+    // shape we care about: the args have `--repo` pinned to an
+    // absolute path (not the cwd we invoked from).
+    let cwd_str = cwd.display().to_string();
+    for label in ["alice", "bob"] {
+        let pat = format!("args \"agent\" \"start\" \"{label}\" \"--repo\" \"");
+        let pos = stdout
+            .find(&pat)
+            .unwrap_or_else(|| panic!("{label}'s args must contain `--repo` pin; got:\n{stdout}"));
+        let after = &stdout[pos + pat.len()..];
+        let close = after.find('"').unwrap();
+        let path_in_args = &after[..close];
+        assert!(
+            path_in_args.starts_with('/'),
+            "{label}'s --repo must be an absolute path, not relative; got: {path_in_args}"
+        );
+        assert!(
+            path_in_args != cwd_str,
+            "{label}'s --repo must NOT be the invocation cwd ({cwd_str}) — that's the bug we're guarding against; got: {path_in_args}"
+        );
+        // Sanity: it should at least contain the tempdir's basename.
+        let basename = repo.file_name().and_then(|s| s.to_str()).unwrap();
+        assert!(
+            path_in_args.contains(basename),
+            "{label}'s --repo should reference the actual repo (basename {basename}); got: {path_in_args}"
+        );
+    }
 }
