@@ -38,13 +38,16 @@ Quite a bit has shifted since the subagent first drafted this:
 
 ### Phase 1: Type `hooks` properly + add a `HooksSection` to the umbrella
 
-Replace `RepoConfigFile.hooks: BTreeMap<String, Value>` and `UserConfigFile.hooks: BTreeMap<String, Value>` with a typed `HooksSection`:
+Replace `RepoConfigFile.hooks: BTreeMap<String, Value>` and `UserConfigFile.hooks: BTreeMap<String, Value>` with a typed `HooksSection`. Each entry is `Option<Option<String>>` so presence-aware semantics work (matches the existing `HooksFile.get(event) -> Option<Option<String>>` shape): `Some(Some("cmd"))` = explicitly set; `Some(None)` = explicitly null (disable); `None` = absent (use default).
 
 ```rust
 #[derive(Debug, Default, Deserialize, Serialize)]
 pub struct HooksSection {
+    /// `Some(Some("cmd"))` = explicitly set;
+    /// `Some(None)` = explicitly null (disable);
+    /// `None` = absent (use default).
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub master_work: Option<Option<String>>,  // Some(Some("cmd")) = set; Some(None) = explicitly null; None = absent
+    pub master_work: Option<Option<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reviewer_work: Option<Option<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -53,10 +56,44 @@ pub struct HooksSection {
     pub idle: Option<Option<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub blocked: Option<Option<String>>,
+    /// Forward-compat catchall for hook event names this build
+    /// doesn't know about yet (e.g. newer clank wrote it).
+    /// Preserved on round-trip. Ruthless caught the gap on
+    /// b6323be: `RepoConfigFile.extra` catches unknown SECTIONS
+    /// at the top level, NOT unknown FIELDS inside the hooks
+    /// section. Without this `extra`, round-trip would silently
+    /// drop unknown hooks (or `deny_unknown_fields` would error
+    /// loudly — both wrong).
+    #[serde(flatten)]
+    pub extra: BTreeMap<String, Option<String>>,
 }
 ```
 
-Each entry is `Option<Option<String>>` so presence-aware semantics work (matches the existing `HooksFile.get(event) -> Option<Option<String>>` shape). Forward-compat: any unknown hook names land in `RepoConfigFile.extra` via the existing `#[serde(flatten)]` catchall.
+**Round-trip vs lossy-reader equivalence**: `RepoConfigFile` (round-trip; used by writers) and the private `HooksFile` (lossy reader; used by `apply_layer`) co-exist. Writes through the typed path MUST yield the same `Config.hooks` as the lossy reader would. Ruthless review of b6323be pointed out the silent-drift risk. New unit test:
+
+```rust
+#[test]
+fn hooks_section_round_trips_through_apply_layer() {
+    let written = RepoConfigFile {
+        hooks: Some(HooksSection {
+            master_work: Some(Some("echo hello".into())),
+            idle: Some(None), // explicitly disabled
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join(".clank/config.json");
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(&path, serde_json::to_string_pretty(&written).unwrap()).unwrap();
+    let cfg = load_with_home(tmp.path(), None);
+    assert_eq!(cfg.hooks.get(&HookEvent::MasterWork), Some(&Some("echo hello".to_string())));
+    assert_eq!(cfg.hooks.get(&HookEvent::Idle), Some(&None));
+    assert!(!cfg.hooks.contains_key(&HookEvent::ReviewerWork));
+}
+```
+
+Also add a "forward-compat unknown hook" test: write a config with `{"hooks": {"some_future_event": "cmd"}}` via the JSON serializer, round-trip through `RepoConfigFile`, assert `extra.get("some_future_event")` returns the value.
 
 ### Phase 2: Migrate the 21 JSON-literal sites in tests
 
@@ -70,21 +107,41 @@ Per the verified count: 21 sites across 8 files. For each, swap the literal for 
 
 `wfw_integration.rs:160-180` defines `merge_repo_config(repo, |v: &mut Value| {...})` — added as a workaround when the typed structs didn't cover all fields. With Phase 1 + 2, this helper has no callers; remove it.
 
-### Phase 4: Lock in via negative regression test
+### Phase 4: Lock in via negative regression test (best-effort, with opt-out)
 
-Add a unit test in `crates/cli/tests/` (or as a build script) that greps for the JSON-literal pattern and fails if any return:
+Ruthless review of b6323be flagged real fragility with a naive regex approach: multi-line literals get missed; tests that assert on JSON OUTPUT (not write JSON config) produce false positives. Pinned approach (best-effort):
 
 ```rust
 #[test]
 fn no_json_literal_config_writes_in_tests() {
-    let pattern = regex::Regex::new(r#"r#"\{[^}]*"(role|agents|review|diff|hooks)"#).unwrap();
+    // Match raw-string literals that look like config JSON
+    // (contain one of the known top-level field names AND end
+    // with .clank/config.json or similar writer hints).
+    // `(?s)` flag enables multi-line `.`.
+    let pattern = regex::RegexBuilder::new(
+        r#"(?s)r#"\{[^"]*"(role|agents|review|diff|hooks|default_agents)""#,
+    )
+    .build()
+    .unwrap();
+    let allow_marker = "// allow-json-literal: ";
     for entry in walkdir::WalkDir::new("crates/cli/tests") {
         let entry = entry.unwrap();
-        if entry.path().extension().map_or(false, |e| e == "rs") {
+        if entry.path().extension().is_some_and(|e| e == "rs") {
             let body = std::fs::read_to_string(entry.path()).unwrap();
+            // Strip lines with the explicit allow-marker before
+            // matching, so a deliberate test (e.g. asserting on
+            // JSON output shape) can opt out with a comment
+            // citing the reason.
+            let filtered: String = body
+                .lines()
+                .filter(|l| !l.contains(allow_marker))
+                .collect::<Vec<_>>()
+                .join("\n");
             assert!(
-                !pattern.is_match(&body),
-                "JSON literal config write found in `{}`; use the typed RepoConfigFile/UserConfigFile struct instead.",
+                !pattern.is_match(&filtered),
+                "JSON literal config-shaped write found in `{}`. Either use the typed \
+                 RepoConfigFile/UserConfigFile struct, or add `// allow-json-literal: <reason>` \
+                 on the same line if this is a legitimate output-assertion.",
                 entry.path().display()
             );
         }
@@ -92,7 +149,9 @@ fn no_json_literal_config_writes_in_tests() {
 }
 ```
 
-(Alternative: a CI grep step. Decide at implementation.)
+The `// allow-json-literal: <reason>` opt-out handles false positives (tests that check JSON output shape rather than write config). The pattern itself is best-effort, NOT a formal grammar — relies on the field-name heuristic. AST-based alternatives (parse each test file as Rust syntax, walk literal nodes) are more precise but ~10x the code; defer unless the heuristic produces too much friction.
+
+Alternative if the in-tree test approach proves too fragile: ship as a CI grep step (or `xtask check-typed-config`) with the same allow-marker semantics. Decision at implementation.
 
 ### Out of scope for THIS plan
 
