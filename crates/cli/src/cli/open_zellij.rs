@@ -87,8 +87,13 @@ fn classify_roles(agents: &[DefaultAgent]) -> anyhow::Result<(&DefaultAgent, Vec
     }
 }
 
-/// Hand-rolled KDL composer. `AgentLabel::parse` restricts charset
-/// so we don't need quote-escaping here.
+/// Hand-rolled KDL composer. Every interpolated string value goes
+/// through [`kdl_escape`] — codex caught on 818d8be that
+/// `AgentLabel::parse` permits `"`, newlines, control chars,
+/// and other KDL-significant chars (it only blocks empty,
+/// `.`/`..`, leading `.`, `/`, and `\\`). Naive interpolation
+/// would produce malformed (or injected) KDL when zellij tries
+/// to consume it.
 fn compose_kdl(master: &DefaultAgent, reviewers: &[&DefaultAgent]) -> String {
     let mut out = String::new();
     out.push_str("layout {\n");
@@ -109,12 +114,37 @@ fn compose_kdl(master: &DefaultAgent, reviewers: &[&DefaultAgent]) -> String {
 }
 
 fn push_pane(out: &mut String, label: &str, role_str: &str) {
-    out.push_str(&format!("        pane name=\"{label} ({role_str})\" {{\n"));
+    let label_esc = kdl_escape(label);
+    let role_esc = kdl_escape(role_str);
+    out.push_str(&format!(
+        "        pane name=\"{label_esc} ({role_esc})\" {{\n"
+    ));
     out.push_str("            command \"clank\"\n");
     out.push_str(&format!(
-        "            args \"agent\" \"start\" \"{label}\"\n"
+        "            args \"agent\" \"start\" \"{label_esc}\"\n"
     ));
     out.push_str("        }\n");
+}
+
+/// Escape a string for use inside a KDL `"..."` quoted string.
+/// KDL's escape syntax matches C-style: `\\`, `\"`, `\n`, `\r`,
+/// `\t`, plus `\u{XXXX}` for other control characters.
+fn kdl_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for ch in s.chars() {
+        match ch {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if c.is_control() => {
+                out.push_str(&format!("\\u{{{:x}}}", c as u32));
+            }
+            c => out.push(c),
+        }
+    }
+    out
 }
 
 /// The argv we would pass to `zellij action new-tab` — emitted on
@@ -230,6 +260,68 @@ mod tests {
         let codex_idx = kdl.find("name=\"codex (reviewer)\"").unwrap();
         assert!(bob_idx < alice_idx, "bob must come before alice");
         assert!(alice_idx < codex_idx, "alice must come before codex");
+    }
+
+    #[test]
+    fn kdl_escape_escapes_quotes_and_backslashes() {
+        // Codex caught on 818d8be that AgentLabel doesn't restrict
+        // `"`, `\\`, newlines, etc. — interpolating raw labels
+        // into KDL strings would yield malformed output. The
+        // escape helper must round-trip these to KDL's C-style
+        // escapes.
+        assert_eq!(kdl_escape(r#"with"quote"#), r#"with\"quote"#);
+        assert_eq!(kdl_escape(r"with\backslash"), r"with\\backslash");
+        assert_eq!(kdl_escape("with\nnewline"), "with\\nnewline");
+        assert_eq!(kdl_escape("with\rreturn"), "with\\rreturn");
+        assert_eq!(kdl_escape("with\ttab"), "with\\ttab");
+        assert_eq!(kdl_escape("plain"), "plain");
+    }
+
+    #[test]
+    fn kdl_escape_escapes_other_control_chars_as_unicode() {
+        // Control chars beyond the common ones (0x00–0x1f minus
+        // \n/\r/\t) get the \u{XXXX} form so KDL can parse them
+        // unambiguously.
+        let result = kdl_escape("a\x01b\x7fc");
+        assert!(
+            result.contains("\\u{1}"),
+            "should escape 0x01; got: {result}"
+        );
+        assert!(
+            result.contains("\\u{7f}"),
+            "should escape DEL (0x7f); got: {result}"
+        );
+    }
+
+    #[test]
+    fn compose_kdl_escapes_quote_in_label() {
+        // Pane name + args interpolations both go through
+        // kdl_escape. A pathological label with a literal quote
+        // must not break the layout string.
+        let master = DefaultAgent {
+            label: AgentLabel::parse(r#"weird"name"#).unwrap(),
+            role: Role::Master,
+            tool: None,
+            launch: None,
+        };
+        let kdl = compose_kdl(&master, &[]);
+        // The raw `"name"` text MUST appear escaped, not as a
+        // bare `"` that would close the KDL string early.
+        assert!(
+            kdl.contains(r#"weird\"name"#),
+            "label's quote must be escaped in KDL; got:\n{kdl}"
+        );
+        // Sanity: the well-formed KDL has matching `"` characters
+        // (every unescaped `"` is balanced). Count unescaped
+        // quotes by counting `\"` and total `"`.
+        let total_quotes = kdl.matches('"').count();
+        let escaped_quotes = kdl.matches("\\\"").count();
+        let unescaped = total_quotes - escaped_quotes;
+        assert_eq!(
+            unescaped % 2,
+            0,
+            "unescaped quotes must come in pairs; got {unescaped} (total={total_quotes}, escaped={escaped_quotes}). KDL:\n{kdl}"
+        );
     }
 
     #[test]
