@@ -24,19 +24,34 @@ Replace `clank agent set-role` with `clank agent promote`:
 clank agent promote <label> [--global]
 ```
 
-Behavior:
+Behavior (PINNED per codex d1c1de5 catch — pre-existing
+multi-master configs must be repaired by promote, since
+they're already possible via today's `set-role` /
+`agent add --role master`):
 
-1. If `<label>` is already master → no-op, exit 0 with a
-   `note: <label> is already master` message.
-2. If `<label>` is a reviewer and there's no current
-   master → make `<label>` master.
-3. If `<label>` is a reviewer and there IS a current
-   master → atomically: set the old master to reviewer
-   AND set `<label>` to master. One write, both changes.
+1. Find all current masters in the targeted scope.
+2. If `<label>` is master AND no other agent is master →
+   no-op, exit 0 with
+   `note: <label> is already the only master`.
+3. Otherwise: atomically set `<label>` to master AND
+   demote EVERY OTHER master in the same scope to
+   reviewer. One write, all changes.
 
-That covers every legitimate transition. The illegitimate
-ones (two masters; zero masters via demotion) become
-unrepresentable in the CLI.
+This guarantees the post-condition "exactly one master"
+regardless of whether the pre-state had zero, one, or
+many masters. The illegitimate states (multiple masters;
+zero masters via demotion) become unreachable via the
+CLI even if they exist on disk from earlier buggy
+operations — `promote` is the repair path.
+
+Output messages:
+- No-op: `note: \`<label>\` is already the only master in <scope>`.
+- Promote from zero masters:
+  `promoted \`<label>\` to master in <scope>`.
+- Promote with one demotion:
+  `promoted \`<label>\` to master in <scope> (demoted \`<prev>\`)`.
+- Promote with multiple demotions (repair case):
+  `promoted \`<label>\` to master in <scope> (demoted \`<prev1>\`, \`<prev2>\`, ...)`.
 
 ## Why not keep `set-role`
 
@@ -62,16 +77,23 @@ So no flow regresses.
 - `crates/cli/src/cli/agent.rs`:
   - Add `fn promote(args: AgentPromoteArgs)` next to the
     existing `set_role` (~line 590).
-  - Logic: load config, find `<label>`, find any existing
-    master, mutate both entries, write back. Same
-    `--global` / `--repo` flag handling as `set_role`.
-  - On no-op (already master): print
-    `note: \`{label}\` is already master in {scope}` to
-    stderr, exit 0.
-  - On promotion: print
-    `promoted \`{label}\` to master in {scope} (demoted \`{prev}\`)`
-    or `promoted \`{label}\` to master in {scope}` if no
-    prior master.
+  - Logic: load config in the targeted scope, find
+    `<label>` (error if absent — reuse `set_role`'s
+    not-found error path), collect labels of ALL OTHER
+    entries with `role == Master`. If `<label>` is master
+    AND that collection is empty → no-op. Else: set
+    `<label>` to master AND set every entry in the
+    collected list to reviewer. One write at the end.
+  - Same `--global` / `--repo` flag handling as `set_role`.
+  - On no-op (already the only master):
+    `note: \`{label}\` is already the only master in {scope}`
+    to stderr, exit 0.
+  - On promotion (zero prior masters):
+    `promoted \`{label}\` to master in {scope}`.
+  - On promotion (1+ prior masters, repair case included):
+    `promoted \`{label}\` to master in {scope} (demoted \`p1\`, \`p2\`, ...)`
+    — backticks around each demoted label, comma-separated,
+    no trailing "and."
 - `crates/cli/src/cli/mod.rs`:
   - Add `AgentCmd::Promote(AgentPromoteArgs)` variant.
   - Remove `AgentCmd::SetRole` and `AgentSetRoleArgs`.
@@ -83,14 +105,57 @@ So no flow regresses.
     > reviewer` to demote a duplicate."
     New:
     > "Resolve with `clank agent promote <label>` to
-    > make exactly one of them master (the others
+    > make exactly one of them master (all OTHERS
     > automatically become reviewers)."
+    Also update the assertion at
+    `open_zellij.rs:257-258` ("diagnostic should suggest
+    set-role") and the integration test at
+    `open_zellij_integration.rs:251` to match.
 - `crates/cli/tests/agent_add_remove_integration.rs`,
   `crates/cli/tests/open_zellij_integration.rs`: any
   invocation of `clank agent set-role` becomes
   `clank agent promote`. The semantics map cleanly because
   every existing test that uses `set-role` is either
   promoting a reviewer to master or doing a no-op.
+
+## Tests
+
+Integration tests in
+`crates/cli/tests/agent_add_remove_integration.rs`:
+
+- `clank_agent_promote_flips_reviewer_to_master`
+  (rename of `clank_agent_set_role_flips_role_in_place`):
+  Pre-state: master=A, reviewer=B. `promote B`. Post-state:
+  reviewer=A, master=B. Asserts stdout has
+  `promoted` and `demoted` keywords with the right labels.
+- `clank_agent_promote_no_op_when_already_only_master`:
+  Pre-state: master=A. `promote A`. Asserts no write
+  (file mtime unchanged) AND stderr contains
+  `already the only master`.
+- `clank_agent_promote_from_zero_masters`:
+  Pre-state: reviewer=A, reviewer=B. `promote A`.
+  Post-state: master=A, reviewer=B. Stdout has
+  `promoted` but NOT `demoted` (no prior master to list).
+- **`clank_agent_promote_repairs_pre_existing_multi_master`**
+  (codex d1c1de5 catch — the repair case): Pre-state:
+  master=A, master=B, master=C, reviewer=D. `promote D`.
+  Post-state: reviewer=A, reviewer=B, reviewer=C,
+  master=D. Stdout lists ALL THREE demoted:
+  `(demoted \`A\`, \`B\`, \`C\`)`. Pin: assert each label
+  appears in the demoted list AND that the post-state
+  has exactly one master. This is the test that defends
+  the repair semantic — without it, the implementation
+  could "find the first master, demote it" and still
+  leave two masters, satisfying earlier acceptance.
+- `clank_agent_promote_errors_when_label_absent`:
+  reuse `set_role`'s existing not-found error path.
+- `clank_agent_promote_atomic_write`: verify the underlying
+  file is written exactly once (mtime increments once),
+  not once per demote. Lock in the "one write, all
+  changes" property.
+- Delete `clank_agent_set_role_*` tests for paths that
+  no longer exist (the demote case if there was one;
+  the duplicate-master-allowed case).
 
 ## CLI surface change
 
