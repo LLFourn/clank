@@ -84,6 +84,11 @@ fn target_line(stdout: &str) -> String {
 
 #[test]
 fn html_open_with_active_plan_arg_prints_per_plan_path() {
+    // Codex 005213d / dfe596d: --print-path's scriptable contract
+    // is "stdout contains ONLY the resolved path + newline" so that
+    // `$(clank html open <plan> --print-path)` works verbatim. This
+    // test pins that exact shape — diagnostic / progress lines go
+    // to stderr.
     let dir = init_repo();
     let repo = dir.path();
     intro_plan(repo, "foo");
@@ -95,12 +100,17 @@ fn html_open_with_active_plan_arg_prints_per_plan_path() {
         String::from_utf8_lossy(&out.stderr)
     );
     let stdout = String::from_utf8_lossy(&out.stdout);
-    let target = target_line(&stdout);
-    assert!(
-        target.ends_with("plan/foo.html"),
-        "target must end with `plan/foo.html`; got: `{target}`\nfull stdout:\n{stdout}"
+    let expected = format!(
+        "{}/.clank/html/plan/foo.html\n",
+        dunce::canonicalize(repo).unwrap().display()
+    );
+    assert_eq!(
+        stdout.as_ref(),
+        expected,
+        "stdout MUST be exactly the resolved target path + newline (no progress / wrote-line / etc.)"
     );
     // The page must actually exist on disk.
+    let target = stdout.trim().to_string();
     assert!(
         Path::new(&target).exists(),
         "rendered file must exist at {target}"

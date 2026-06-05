@@ -33,7 +33,24 @@ pub async fn run(args: HtmlArgs) -> anyhow::Result<()> {
     let progress = Progress::new(args.quiet);
     build_site(&repo, &basename, &out_dir, args.rebuild, &progress).await?;
     progress.finish();
-    println!("wrote {}", out_dir.display());
+
+    // Under `--print-path`, stdout must contain ONLY the resolved
+    // path so callers can use `$(clank html open <plan> --print-path)`
+    // verbatim. Route the build-info line to stderr in that mode.
+    // Codex caught the dual-line stdout on dfe596d.
+    let print_path = matches!(
+        args.command,
+        Some(HtmlCmd::Open(crate::cli::HtmlOpenArgs {
+            print_path: true,
+            ..
+        }))
+    );
+    if print_path {
+        eprintln!("wrote {}", out_dir.display());
+    } else {
+        println!("wrote {}", out_dir.display());
+    }
+
     if let Some(HtmlCmd::Open(open_args)) = args.command {
         let target = resolve_open_target(&repo, &basename, &out_dir, &open_args).await?;
         if open_args.print_path {
