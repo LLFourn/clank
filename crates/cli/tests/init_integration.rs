@@ -79,7 +79,12 @@ fn init_defaults_to_reviewers_when_master_exists() {
     std::fs::create_dir_all(&bob_dir).unwrap();
     std::fs::write(
         bob_dir.join("config.json"),
-        r#"{"auto_mode":"off","role":"master"}"#,
+        &serde_json::to_string_pretty(&clank_core::agent_config::AgentConfig {
+            auto_mode: clank_core::vocab::AutoMode::Off,
+            role: clank_core::vocab::Role::Master,
+            ..Default::default()
+        })
+        .unwrap(),
     )
     .unwrap();
 
@@ -108,16 +113,34 @@ fn write_user_config(home: &Path, body: &str) {
     std::fs::write(dir.join("config.json"), body).unwrap();
 }
 
+/// Typed `UserConfigFile` writer for `~/.clank/config.json` per
+/// `typed-config-dogfood`. Prefer this for new sites; the
+/// string-based `write_user_config` above is kept for tests that
+/// deliberately exercise alias / negative-input paths.
+fn write_user_config_typed(home: &Path, file: &clank::cli::config::UserConfigFile) {
+    write_user_config(home, &serde_json::to_string_pretty(file).unwrap());
+}
+
+/// Builder for a `DefaultAgent` with sensible defaults.
+fn user_agent(label: &str) -> clank::cli::config::DefaultAgent {
+    clank::cli::config::DefaultAgent {
+        label: clank_core::ids::AgentLabel::parse(label).unwrap(),
+        role: clank_core::vocab::Role::default(),
+        tool: None,
+        launch: None,
+    }
+}
+
 #[test]
 fn init_seeds_default_agents_from_user_config() {
     let dir = init_repo();
     let repo = dir.path();
-    write_user_config(
+    write_user_config_typed(
         repo,
-        r#"{ "default_agents": [
-            { "label": "codex" },
-            { "label": "ruthless" }
-        ] }"#,
+        &clank::cli::config::UserConfigFile {
+            default_agents: Some(vec![user_agent("codex"), user_agent("ruthless")]),
+            ..Default::default()
+        },
     );
 
     let out = run_init(repo, &[("CLAUDE_CODE_SESSION_ID", CLAUDE_SESSION)]);
@@ -152,17 +175,21 @@ fn init_with_repo_scope_agents_seeds_override_set() {
     let dir = init_repo();
     let repo = dir.path();
     // User-scope says [codex, ruthless].
-    write_user_config(
+    write_user_config_typed(
         repo,
-        r#"{ "default_agents": [
-            { "label": "codex" },
-            { "label": "ruthless" }
-        ] }"#,
+        &clank::cli::config::UserConfigFile {
+            default_agents: Some(vec![user_agent("codex"), user_agent("ruthless")]),
+            ..Default::default()
+        },
     );
-    // Repo-scope overrides with just [overlord].
+    // Repo-scope overrides with just [overlord]. Uses the
+    // plural "reviewers" alias deliberately — locks in the
+    // serde-alias backwards-compat path. allow-json-literal:
+    // exercising the legacy `"reviewers"` alias on input.
     std::fs::create_dir_all(repo.join(".clank")).unwrap();
     std::fs::write(
         repo.join(".clank/config.json"),
+        // allow-json-literal: alias-on-input regression
         r#"{"agents":[{"label":"overlord","role":"reviewers"}]}"#,
     )
     .unwrap();
@@ -194,17 +221,27 @@ fn init_default_agents_idempotent_preserves_existing_session() {
     let repo = dir.path();
     let codex_dir = repo.join(".clank/agents/codex");
     std::fs::create_dir_all(&codex_dir).unwrap();
-    let existing = r#"{
-        "auto_mode": "on",
-        "role": "reviewers",
-        "session": {
-            "id": "11111111-2222-3333-4444-555555555555",
-            "tool": "codex",
-            "updated_at": "2026-06-04T12:00:00Z"
-        }
-    }"#;
-    std::fs::write(codex_dir.join("config.json"), existing).unwrap();
-    write_user_config(repo, r#"{ "default_agents": [{ "label": "codex" }] }"#);
+    let existing = clank_core::agent_config::AgentConfig {
+        auto_mode: clank_core::vocab::AutoMode::On,
+        session: Some(clank_core::agent_config::Session {
+            id: clank_core::ids::SessionId::parse("11111111-2222-3333-4444-555555555555").unwrap(),
+            tool: clank_core::vocab::Tool::Codex,
+            updated_at: "2026-06-04T12:00:00Z".to_string(),
+        }),
+        ..Default::default()
+    };
+    std::fs::write(
+        codex_dir.join("config.json"),
+        serde_json::to_string_pretty(&existing).unwrap(),
+    )
+    .unwrap();
+    write_user_config_typed(
+        repo,
+        &clank::cli::config::UserConfigFile {
+            default_agents: Some(vec![user_agent("codex")]),
+            ..Default::default()
+        },
+    );
 
     let out = run_init(repo, &[("CLAUDE_CODE_SESSION_ID", CLAUDE_SESSION)]);
     assert!(out.status.success(), "init failed");
@@ -246,7 +283,16 @@ fn init_no_user_config_no_seeding() {
 fn init_user_config_without_default_agents_field_no_seeding() {
     let dir = init_repo();
     let repo = dir.path();
-    write_user_config(repo, r#"{ "hooks": { "idle": "echo idle" } }"#);
+    write_user_config_typed(
+        repo,
+        &clank::cli::config::UserConfigFile {
+            hooks: Some(clank::cli::config::HooksSection {
+                idle: Some(Some("echo idle".to_string())),
+                ..Default::default()
+            }),
+            ..Default::default()
+        },
+    );
 
     let out = run_init(repo, &[("CLAUDE_CODE_SESSION_ID", CLAUDE_SESSION)]);
     assert!(out.status.success(), "init failed");
@@ -263,6 +309,7 @@ fn init_fails_closed_on_malformed_user_config() {
     let repo = dir.path();
     write_user_config(
         repo,
+        // allow-json-literal: deliberately invalid `role` for fail-closed test (typed construction would refuse to compile).
         r#"{ "default_agents": [{ "label": "codex", "role": "not-a-real-role" }] }"#,
     );
 
@@ -279,12 +326,20 @@ fn init_fails_closed_on_malformed_user_config() {
 fn init_seeds_master_role_when_specified() {
     let dir = init_repo();
     let repo = dir.path();
-    write_user_config(
+    write_user_config_typed(
         repo,
-        r#"{ "default_agents": [
-            { "label": "alice", "role": "master" },
-            { "label": "bob", "role": "reviewers" }
-        ] }"#,
+        &clank::cli::config::UserConfigFile {
+            default_agents: Some(vec![
+                clank::cli::config::DefaultAgent {
+                    label: clank_core::ids::AgentLabel::parse("alice").unwrap(),
+                    role: clank_core::vocab::Role::Master,
+                    tool: None,
+                    launch: None,
+                },
+                user_agent("bob"),
+            ]),
+            ..Default::default()
+        },
     );
 
     let out = run_init(repo, &[("CLAUDE_CODE_SESSION_ID", CLAUDE_SESSION)]);
@@ -323,26 +378,27 @@ fn init_default_agents_preserve_role_even_when_label_already_bound() {
     let dir = init_repo();
     let repo = dir.path();
     // User declares codex as reviewer.
-    write_user_config(
+    write_user_config_typed(
         repo,
-        r#"{ "default_agents": [{ "label": "codex", "role": "reviewers" }] }"#,
+        &clank::cli::config::UserConfigFile {
+            default_agents: Some(vec![user_agent("codex")]),
+            ..Default::default()
+        },
     );
-    // codex was previously bound via `clank as`: role reviewers + session populated.
+    // codex was previously bound via `clank as`: role reviewer + session populated.
     let codex_dir = repo.join(".clank/agents/codex");
     std::fs::create_dir_all(&codex_dir).unwrap();
     std::fs::write(
         codex_dir.join("config.json"),
-        format!(
-            r#"{{
-                "auto_mode": "off",
-                "role": "reviewers",
-                "session": {{
-                    "id": "{CODEX_SESSION}",
-                    "tool": "codex",
-                    "updated_at": "2026-06-04T12:00:00Z"
-                }}
-            }}"#
-        ),
+        serde_json::to_string_pretty(&clank_core::agent_config::AgentConfig {
+            session: Some(clank_core::agent_config::Session {
+                id: clank_core::ids::SessionId::parse(CODEX_SESSION).unwrap(),
+                tool: clank_core::vocab::Tool::Codex,
+                updated_at: "2026-06-04T12:00:00Z".to_string(),
+            }),
+            ..Default::default()
+        })
+        .unwrap(),
     )
     .unwrap();
 
@@ -385,15 +441,16 @@ fn init_existing_bound_agent_still_claims_master_when_no_master_exists() {
     std::fs::create_dir_all(&codex_dir).unwrap();
     std::fs::write(
         codex_dir.join("config.json"),
-        r#"{
-            "auto_mode": "off",
-            "role": "reviewers",
-            "session": {
-                "id": "019e54b7-b1c9-7552-8075-69db24499247",
-                "tool": "codex",
-                "updated_at": "2026-06-04T12:00:00Z"
-            }
-        }"#,
+        serde_json::to_string_pretty(&clank_core::agent_config::AgentConfig {
+            session: Some(clank_core::agent_config::Session {
+                id: clank_core::ids::SessionId::parse("019e54b7-b1c9-7552-8075-69db24499247")
+                    .unwrap(),
+                tool: clank_core::vocab::Tool::Codex,
+                updated_at: "2026-06-04T12:00:00Z".to_string(),
+            }),
+            ..Default::default()
+        })
+        .unwrap(),
     )
     .unwrap();
 
@@ -424,9 +481,17 @@ fn init_seeded_master_flips_calling_agent_to_reviewers() {
     // the calling agent defaults to reviewers (under --yes, no prompt).
     let dir = init_repo();
     let repo = dir.path();
-    write_user_config(
+    write_user_config_typed(
         repo,
-        r#"{ "default_agents": [{ "label": "lloyd", "role": "master" }] }"#,
+        &clank::cli::config::UserConfigFile {
+            default_agents: Some(vec![clank::cli::config::DefaultAgent {
+                label: clank_core::ids::AgentLabel::parse("lloyd").unwrap(),
+                role: clank_core::vocab::Role::Master,
+                tool: None,
+                launch: None,
+            }]),
+            ..Default::default()
+        },
     );
 
     let out = run_init(repo, &[("CLAUDE_CODE_SESSION_ID", CLAUDE_SESSION)]);
@@ -468,9 +533,12 @@ fn init_calling_agent_label_collides_with_seeded_entry() {
     const CODEX_SESSION: &str = "019e54b7-b1c9-7552-8075-69db24499247";
     let dir = init_repo();
     let repo = dir.path();
-    write_user_config(
+    write_user_config_typed(
         repo,
-        r#"{ "default_agents": [{ "label": "codex", "role": "reviewers" }] }"#,
+        &clank::cli::config::UserConfigFile {
+            default_agents: Some(vec![user_agent("codex")]),
+            ..Default::default()
+        },
     );
 
     let out = run_init(repo, &[("CODEX_THREAD_ID", CODEX_SESSION)]);

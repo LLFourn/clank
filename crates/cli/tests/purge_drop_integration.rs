@@ -34,16 +34,27 @@ fn init_repo_with_master() -> tempfile::TempDir {
     write(path, ".clank/.gitignore", "/agents/\n/cache/\n");
     write(path, ".gitignore", ".clank/agents/\n.clank/cache/\n");
     // Master agent in declaration so the all-reviewers gate
-    // doesn't auto-approve.
+    // doesn't auto-approve. Typed RepoConfigFile per
+    // typed-config-dogfood — schema drift becomes a type
+    // error rather than a silent JSON-shape change.
+    let repo_file = clank::cli::config::RepoConfigFile {
+        agents: Some(vec![clank::cli::config::DefaultAgent {
+            label: clank_core::ids::AgentLabel::parse("claude").unwrap(),
+            role: clank_core::vocab::Role::Master,
+            tool: None,
+            launch: None,
+        }]),
+        ..Default::default()
+    };
     write(
         path,
         ".clank/config.json",
-        r#"{"agents":[{"label":"claude","role":"master"}]}"#,
+        &serde_json::to_string_pretty(&repo_file).unwrap(),
     );
     write(
         path,
         ".clank/agents/claude/config.json",
-        r#"{"auto_mode":"off"}"#,
+        &serde_json::to_string_pretty(&clank_core::agent_config::AgentConfig::default()).unwrap(),
     );
     write(path, "README.md", "seed\n");
     git(path, &["add", "-A"]);

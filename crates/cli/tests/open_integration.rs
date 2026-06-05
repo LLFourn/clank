@@ -203,12 +203,32 @@ fn clank_initialized_with_master_and_reviewer() {
     write(
         repo,
         ".clank/agents/claude/config.json",
-        r#"{"role":"master","session":{"id":"00000000-0000-4000-8000-000000000001","tool":"claude","updated_at":"2026-01-01T00:00:00Z"}}"#,
+        &serde_json::to_string_pretty(&clank_core::agent_config::AgentConfig {
+            role: clank_core::vocab::Role::Master,
+            session: Some(clank_core::agent_config::Session {
+                id: clank_core::ids::SessionId::parse("00000000-0000-4000-8000-000000000001")
+                    .unwrap(),
+                tool: clank_core::vocab::Tool::Claude,
+                updated_at: "2026-01-01T00:00:00Z".to_string(),
+            }),
+            ..Default::default()
+        })
+        .unwrap(),
     );
     write(
         repo,
         ".clank/agents/codex/config.json",
-        r#"{"role":"reviewers","session":{"id":"00000000-0000-4000-8000-000000000002","tool":"codex","updated_at":"2026-01-01T00:00:00Z"}}"#,
+        &serde_json::to_string_pretty(&clank_core::agent_config::AgentConfig {
+            role: clank_core::vocab::Role::Reviewer,
+            session: Some(clank_core::agent_config::Session {
+                id: clank_core::ids::SessionId::parse("00000000-0000-4000-8000-000000000002")
+                    .unwrap(),
+                tool: clank_core::vocab::Tool::Codex,
+                updated_at: "2026-01-01T00:00:00Z".to_string(),
+            }),
+            ..Default::default()
+        })
+        .unwrap(),
     );
     git(repo, &["add", "-A"]);
     git(repo, &["commit", "--quiet", "-m", "seed"]);
@@ -263,12 +283,20 @@ fn master_agents_empty_when_all_reviewers() {
     write(
         repo,
         ".clank/agents/a/config.json",
-        r#"{"role":"reviewers"}"#,
+        &serde_json::to_string_pretty(&clank_core::agent_config::AgentConfig {
+            role: clank_core::vocab::Role::Reviewer,
+            ..Default::default()
+        })
+        .unwrap(),
     );
     write(
         repo,
         ".clank/agents/b/config.json",
-        r#"{"role":"reviewers"}"#,
+        &serde_json::to_string_pretty(&clank_core::agent_config::AgentConfig {
+            role: clank_core::vocab::Role::Reviewer,
+            ..Default::default()
+        })
+        .unwrap(),
     );
     git(repo, &["add", "-A"]);
     git(repo, &["commit", "--quiet", "-m", "seed"]);
@@ -283,8 +311,24 @@ fn master_agents_lists_multiple_masters() {
     let dir = init_repo();
     let repo = dir.path();
     write(repo, ".clank/config.json", "{}");
-    write(repo, ".clank/agents/a/config.json", r#"{"role":"master"}"#);
-    write(repo, ".clank/agents/b/config.json", r#"{"role":"master"}"#);
+    write(
+        repo,
+        ".clank/agents/a/config.json",
+        &serde_json::to_string_pretty(&clank_core::agent_config::AgentConfig {
+            role: clank_core::vocab::Role::Master,
+            ..Default::default()
+        })
+        .unwrap(),
+    );
+    write(
+        repo,
+        ".clank/agents/b/config.json",
+        &serde_json::to_string_pretty(&clank_core::agent_config::AgentConfig {
+            role: clank_core::vocab::Role::Master,
+            ..Default::default()
+        })
+        .unwrap(),
+    );
     git(repo, &["add", "-A"]);
     git(repo, &["commit", "--quiet", "-m", "seed"]);
 

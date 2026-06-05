@@ -38,11 +38,16 @@ fn init_repo_with_master() -> tempfile::TempDir {
     git(repo, &["config", "commit.gpgsign", "false"]);
     write(repo, ".clank/.gitignore", "/agents/\n/cache/\n");
     write(repo, ".gitignore", ".clank/agents/\n.clank/cache/\n");
-    // Master agent for this repo.
+    // Master agent for this repo (typed AgentConfig per typed-config-dogfood).
+    let cfg = clank_core::agent_config::AgentConfig {
+        auto_mode: clank_core::vocab::AutoMode::Off,
+        role: clank_core::vocab::Role::Master,
+        ..Default::default()
+    };
     write(
         repo,
         ".clank/agents/claude/config.json",
-        r#"{"auto_mode":"off","role":"master"}"#,
+        &serde_json::to_string_pretty(&cfg).unwrap(),
     );
     write(repo, "README.md", "seed\n");
     git(repo, &["add", "-A"]);

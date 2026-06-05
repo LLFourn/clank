@@ -228,7 +228,12 @@ fn auto_on_role_only_touches_self() {
     std::fs::create_dir_all(repo.join(".clank/agents/bob")).unwrap();
     std::fs::write(
         repo.join(".clank/agents/bob/config.json"),
-        r#"{"auto_mode":"off","role":"master"}"#,
+        &serde_json::to_string_pretty(&clank_core::agent_config::AgentConfig {
+            auto_mode: clank_core::vocab::AutoMode::Off,
+            role: clank_core::vocab::Role::Master,
+            ..Default::default()
+        })
+        .unwrap(),
     )
     .unwrap();
 

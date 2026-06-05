@@ -217,11 +217,12 @@ pub struct UserAgentsFile {
 pub struct RepoConfigFile {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub review: Option<ReviewSection>,
-    /// Raw hook entries — string or null. Kept as Value because
-    /// the existing `HooksFile` lossy-loader handles both shapes;
-    /// the write path just preserves whatever was there.
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub hooks: BTreeMap<String, serde_json::Value>,
+    /// Typed hook entries per `typed-config-dogfood`. Producers
+    /// construct via `HooksSection` rather than `BTreeMap<String,
+    /// Value>` so schema drift is a type error, not a silent
+    /// round-trip drop.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hooks: Option<HooksSection>,
     /// `None` = `agents` key absent (caller falls back to
     /// user-scope). `Some(vec)` = key present (even if empty).
     /// Same presence semantics as [`load_repo_agents`].
@@ -240,12 +241,43 @@ pub struct RepoConfigFile {
 pub struct UserConfigFile {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub review: Option<ReviewSection>,
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub hooks: BTreeMap<String, serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hooks: Option<HooksSection>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_agents: Option<Vec<DefaultAgent>>,
     #[serde(flatten)]
     pub extra: BTreeMap<String, serde_json::Value>,
+}
+
+/// Typed `hooks` section for round-trip producers per
+/// `typed-config-dogfood`. Each entry is `Option<Option<String>>`
+/// so presence-aware semantics work:
+/// - `Some(Some("cmd"))` = explicitly set
+/// - `Some(None)` = explicitly null (disable)
+/// - `None` = absent (use default)
+///
+/// The `extra` flatten catchall preserves unknown hook event
+/// names on round-trip — ruthless caught the gap on b6323be
+/// (`RepoConfigFile.extra` catches unknown SECTIONS at the top
+/// level, NOT unknown FIELDS inside hooks; without per-section
+/// `extra`, round-trip would silently drop forward-compat
+/// hooks).
+#[derive(Debug, Default, Deserialize, Serialize)]
+pub struct HooksSection {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub master_work: Option<Option<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reviewer_work: Option<Option<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan_finalized: Option<Option<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idle: Option<Option<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blocked: Option<Option<String>>,
+    /// Forward-compat catchall for hook event names this build
+    /// doesn't know about yet. Preserved on round-trip.
+    #[serde(flatten, skip_serializing_if = "BTreeMap::is_empty")]
+    pub extra: BTreeMap<String, Option<String>>,
 }
 
 /// Round-trip variant of [`ReviewFile`] (which is Deserialize-only).
@@ -1356,6 +1388,75 @@ mod tests {
             empty,
             Some(Vec::new()),
             "explicit `agents: []` → Some(vec![])"
+        );
+    }
+
+    #[test]
+    fn hooks_section_round_trips_through_apply_layer() {
+        // typed-config-dogfood Phase 1 acceptance gate.
+        // Writes via the typed RepoConfigFile + HooksSection path,
+        // reads via apply_layer (the lossy loader). The two paths
+        // MUST produce equivalent in-memory Config.hooks results
+        // — without this test, the round-trip and lossy paths
+        // could drift silently and most consumers go through
+        // apply_layer.
+        let tmp = tempfile::tempdir().unwrap();
+        let file = RepoConfigFile {
+            hooks: Some(HooksSection {
+                master_work: Some(Some("echo hello".into())),
+                idle: Some(None), // explicitly disabled
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let path = tmp.path().join(".clank/config.json");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, serde_json::to_string_pretty(&file).unwrap()).unwrap();
+        let cfg = load_with_home(tmp.path(), None);
+        assert_eq!(
+            cfg.hooks.get(&HookEvent::MasterWork),
+            Some(&Some("echo hello".to_string())),
+            "master_work hook should round-trip; cfg.hooks={:?}",
+            cfg.hooks
+        );
+        assert_eq!(
+            cfg.hooks.get(&HookEvent::Idle),
+            Some(&None),
+            "explicit null should round-trip as Some(None) (disable)"
+        );
+        assert!(
+            !cfg.hooks.contains_key(&HookEvent::ReviewerWork),
+            "unset hook must not appear in the loaded config"
+        );
+    }
+
+    #[test]
+    fn hooks_section_forward_compat_unknown_event_preserved() {
+        // Ruthless review of b6323be: HooksSection's `extra`
+        // catchall preserves unknown hook event names on
+        // round-trip. Without the per-section `extra`, serde
+        // would silently drop them.
+        let raw = r#"{
+            "hooks": {
+                "master_work": "echo m",
+                "some_future_event": "echo future"
+            }
+        }"#;
+        let parsed: RepoConfigFile = serde_json::from_str(raw).unwrap();
+        let hooks = parsed.hooks.as_ref().expect("hooks section present");
+        assert_eq!(hooks.master_work, Some(Some("echo m".to_string())));
+        assert_eq!(
+            hooks.extra.get("some_future_event"),
+            Some(&Some("echo future".to_string())),
+            "unknown hook event must land in hooks.extra; got: {:?}",
+            hooks.extra
+        );
+        // Re-serialize and assert the unknown key survives the
+        // round trip.
+        let out = serde_json::to_string(&parsed).unwrap();
+        assert!(
+            out.contains("some_future_event"),
+            "forward-compat hook key must survive serialize; got: {out}"
         );
     }
 

@@ -117,12 +117,11 @@ const CODEX_SESSION: &str = "019e54b7-b1c9-7552-8075-69db24499247";
 fn agent_start_no_launch_config_uses_bare_tool_for_claude() {
     let dir = init_repo();
     let repo = dir.path();
-    write(
+    write_skeleton_with_session(
         repo,
-        ".clank/agents/claude/config.json",
-        &format!(
-            r#"{{"auto_mode":"off","role":"master","session":{{"id":"{CLAUDE_SESSION}","tool":"claude","updated_at":"2026-06-04T12:00:00Z"}}}}"#
-        ),
+        "claude",
+        clank_core::vocab::Tool::Claude,
+        CLAUDE_SESSION,
     );
 
     let out = run_start(repo, &["claude", "--print"]);
@@ -141,13 +140,7 @@ fn agent_start_no_launch_config_uses_bare_tool_for_claude() {
 fn agent_start_no_launch_config_uses_bare_tool_for_codex() {
     let dir = init_repo();
     let repo = dir.path();
-    write(
-        repo,
-        ".clank/agents/codex/config.json",
-        &format!(
-            r#"{{"auto_mode":"off","role":"reviewers","session":{{"id":"{CODEX_SESSION}","tool":"codex","updated_at":"2026-06-04T12:00:00Z"}}}}"#
-        ),
-    );
+    write_skeleton_with_session(repo, "codex", clank_core::vocab::Tool::Codex, CODEX_SESSION);
 
     let out = run_start(repo, &["codex", "--print"]);
     assert!(out.status.success(), "start --print failed");
@@ -317,11 +310,7 @@ fn agent_start_no_bound_session_errors_with_clank_as_hint() {
     let dir = init_repo();
     let repo = dir.path();
     // Agent config exists but no `session` field.
-    write(
-        repo,
-        ".clank/agents/codex/config.json",
-        r#"{"auto_mode":"off","role":"reviewers"}"#,
-    );
+    write_unbound_skeleton(repo, "codex");
 
     let out = run_start(repo, &["codex", "--print"]);
     assert!(
@@ -345,14 +334,20 @@ fn agent_start_no_session_errors_even_when_launch_command_set() {
     // fallback to running the launch command directly.
     let dir = init_repo();
     let repo = dir.path();
+    let cfg = clank_core::agent_config::AgentConfig {
+        auto_mode: clank_core::vocab::AutoMode::Off,
+        role: clank_core::vocab::Role::Master,
+        launch: Some(clank_core::agent_config::LaunchConfig {
+            command: Some("claude".into()),
+            args: vec!["--skill".into(), "ruthless".into()],
+            env: Default::default(),
+        }),
+        ..Default::default()
+    };
     write(
         repo,
         ".clank/agents/lloyd/config.json",
-        r#"{
-            "auto_mode":"off",
-            "role":"master",
-            "launch":{"command":"claude","args":["--skill","ruthless"]}
-        }"#,
+        &serde_json::to_string_pretty(&cfg).unwrap(),
     );
 
     let out = run_start(repo, &["lloyd", "--print"]);
