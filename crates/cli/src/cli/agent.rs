@@ -261,9 +261,11 @@ pub(super) fn bootstrap_bind_prompt(label: &AgentLabel) -> String {
 fn no_bootstrap_tool_message(label: &AgentLabel) -> String {
     let name = label.as_str();
     format!(
-        "agent `{name}` has no bootstrap tool. Either edit \
-         `.clank/agents/{name}/config.json` (or your user-scope \
-         config) to add `\"tool\": \"claude\"` (or `\"codex\"`), \
+        "agent `{name}` has no bootstrap tool. The `tool` field lives \
+         on the agents declaration, not the per-agent skeleton. \
+         Either edit the `agents` entry in `.clank/config.json` (or \
+         `default_agents` in `~/.clank/config.json`) to add \
+         `\"tool\": \"claude\"` (or `\"codex\"`) under this label, \
          or remove and re-register: `clank agent remove {name} && \
          clank agent add {name} --tool <claude|codex>`."
     )
@@ -909,9 +911,23 @@ mod tests {
             msg.contains("tool") && (msg.contains("claude") || msg.contains("codex")),
             "error mentions tool fix: {msg}"
         );
+        // Codex 9c431de catch: the hint must point at the
+        // DECLARATION (`.clank/config.json` agents block or user-
+        // scope `default_agents`), NOT the per-agent skeleton at
+        // `.clank/agents/<label>/config.json` (which has no `tool`
+        // field). Pinned so a regression to "edit the skeleton"
+        // fails the test deliberately.
         assert!(
-            msg.contains("clank agent remove") || msg.contains("edit"),
-            "error gives an actionable path: {msg}"
+            msg.contains(".clank/config.json"),
+            "error must reference the repo-scope declaration file path; got: {msg}"
+        );
+        assert!(
+            !msg.contains(".clank/agents/"),
+            "error must NOT direct users to the per-agent skeleton path (no tool field there); got: {msg}"
+        );
+        assert!(
+            msg.contains("clank agent remove") && msg.contains("clank agent add"),
+            "error gives the remove-and-re-add path; got: {msg}"
         );
     }
 
