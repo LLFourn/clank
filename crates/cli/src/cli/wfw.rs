@@ -253,7 +253,17 @@ pub async fn run(args: WfwArgs) -> anyhow::Result<()> {
                 Vec::new()
             }
         };
-        if let Some(first) = queue.first() {
+        // Scan to the first queue item NOT suppressed by a plan-scoped
+        // block. A block on the top-priority queued plan must not hide
+        // lower-priority unblocked items — that would defeat the
+        // queue. Repo-wide blocks short-circuit upstream
+        // (`initial_suppress_all`) and don't reach this branch.
+        let first_unsuppressed = queue.iter().find(|q| {
+            !initial_suppressed_plans
+                .iter()
+                .any(|k| k.as_str() == q.name)
+        });
+        if let Some(first) = first_unsuppressed {
             let mut items = initial_block_items.clone();
             items.push(WaitItem::PromoteFromQueue {
                 name: first.name.clone(),
@@ -379,7 +389,14 @@ pub async fn run(args: WfwArgs) -> anyhow::Result<()> {
                         Vec::new()
                     }
                 };
-                if let Some(first) = queue.first() {
+                // Same scan-to-first-unsuppressed semantic as the
+                // initial promote site above. Blocks on the top
+                // priority queued plan must not hide lower-priority
+                // unblocked items.
+                let first_unsuppressed = queue
+                    .iter()
+                    .find(|q| !br.suppressed_plans.iter().any(|k| k.as_str() == q.name));
+                if let Some(first) = first_unsuppressed {
                     let mut items = br.items.clone();
                     items.push(WaitItem::PromoteFromQueue {
                         name: first.name.clone(),

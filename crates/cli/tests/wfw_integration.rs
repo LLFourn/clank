@@ -1791,6 +1791,139 @@ fn wfw_master_blocked_plan_surfaces_next_queue_item() {
 }
 
 #[test]
+fn wfw_block_on_queue_item_name_suppresses_promote() {
+    // Acceptance from wfw-block-suppresses-queue-promote: an open
+    // block scoped to a queued item's name suppresses the
+    // promote_from_queue signal for THAT item.
+    let dir = init_repo();
+    let repo = dir.path();
+    disable_adhoc_review(repo);
+    // Queue item `foo` — name matches a plan key the agent might
+    // promote.
+    std::fs::create_dir_all(repo.join(".clank/queue")).unwrap();
+    std::fs::write(repo.join(".clank/queue/100-foo.md"), "# foo\n").unwrap();
+    // Block scoped to plan `foo` — even though foo isn't an active
+    // plan yet, the block by-name suppresses its promote signal.
+    write(repo, ".clank/agents/lloyd/blocks/foo/dont-yet.md", "wait");
+
+    let output = clank_cmd(repo)
+        .args([
+            "wfw",
+            "--no-poll",
+            "--author",
+            "lloyd",
+            "--role",
+            "master",
+            "--timeout",
+            "2s",
+            "--json",
+        ])
+        .arg("--repo")
+        .arg(repo)
+        .output()
+        .expect("spawn");
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    // With the only queue item suppressed and no other work, wfw
+    // should park (exit 2 timeout) and NOT emit promote_from_queue.
+    assert!(
+        !stdout.contains("promote_from_queue"),
+        "promote_from_queue must NOT emit when block scopes to the queue \
+         item's name; got: {stdout}"
+    );
+    // The Blocked item should still emit (plan-scoped block).
+    let combined = stdout.clone() + &String::from_utf8_lossy(&output.stderr);
+    assert!(
+        combined.contains("blocked") || output.status.code() == Some(2),
+        "either blocked item emits OR wfw times out; got stdout=`{stdout}` \
+         stderr=`{}` code={:?}",
+        String::from_utf8_lossy(&output.stderr),
+        output.status.code()
+    );
+}
+
+#[test]
+fn wfw_block_on_different_plan_does_not_suppress_unrelated_promote() {
+    // Block on plan `bar` must NOT suppress promote of unrelated
+    // queue item `foo`. No over-suppression.
+    let dir = init_repo();
+    let repo = dir.path();
+    disable_adhoc_review(repo);
+    std::fs::create_dir_all(repo.join(".clank/queue")).unwrap();
+    std::fs::write(repo.join(".clank/queue/100-foo.md"), "# foo\n").unwrap();
+    // Block scoped to a DIFFERENT plan name.
+    write(repo, ".clank/agents/lloyd/blocks/bar/unrelated.md", "wait");
+
+    let output = clank_cmd(repo)
+        .args([
+            "wfw",
+            "--no-poll",
+            "--author",
+            "lloyd",
+            "--role",
+            "master",
+            "--timeout",
+            "2s",
+            "--json",
+        ])
+        .arg("--repo")
+        .arg(repo)
+        .output()
+        .expect("spawn");
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    assert!(
+        stdout.contains("promote_from_queue") && stdout.contains("foo"),
+        "block on `bar` must NOT suppress promote of `foo`; got: {stdout}"
+    );
+}
+
+#[test]
+fn wfw_blocked_first_queue_item_still_surfaces_next_unblocked() {
+    // Codex f64a974 pin: a block on the highest-priority queued
+    // plan must NOT hide the next unblocked queue item. wfw scans
+    // to the first unsuppressed entry in priority order.
+    let dir = init_repo();
+    let repo = dir.path();
+    disable_adhoc_review(repo);
+    std::fs::create_dir_all(repo.join(".clank/queue")).unwrap();
+    // Two queue items, foo (lower priority number = higher priority)
+    // and bar.
+    std::fs::write(repo.join(".clank/queue/100-foo.md"), "# foo\n").unwrap();
+    std::fs::write(repo.join(".clank/queue/200-bar.md"), "# bar\n").unwrap();
+    // Block on foo (the top-priority entry).
+    write(repo, ".clank/agents/lloyd/blocks/foo/dont.md", "wait");
+
+    let output = clank_cmd(repo)
+        .args([
+            "wfw",
+            "--no-poll",
+            "--author",
+            "lloyd",
+            "--role",
+            "master",
+            "--timeout",
+            "2s",
+            "--json",
+        ])
+        .arg("--repo")
+        .arg(repo)
+        .output()
+        .expect("spawn");
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    // bar should surface as the promote item — the block on foo
+    // doesn't hide the next unblocked queue item.
+    assert!(
+        stdout.contains("promote_from_queue") && stdout.contains("bar"),
+        "wfw should surface bar (next unblocked queue item) when foo is \
+         blocked; got: {stdout}"
+    );
+    // Sanity: it should NOT surface foo as the promote item.
+    assert!(
+        !(stdout.contains("promote_from_queue") && stdout.contains("\"name\":\"foo\"")),
+        "wfw should NOT surface the blocked top-priority foo; got: {stdout}"
+    );
+}
+
+#[test]
 fn wfw_master_blocked_plan_empty_queue_times_out() {
     // Empty queue + only-plan-blocked → master parks until
     // timeout. (No PromoteFromQueue to emit.) The idle hook
