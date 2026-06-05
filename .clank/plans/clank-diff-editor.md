@@ -1,0 +1,282 @@
+# clank-diff-editor
+# `clank diff <plan|range>` — universal editor launcher for plan/commit diffs, with optional agent-supplied prompt + focus hints. Configured per-user (and per-repo) in `.clank/config.json`.
+
+## Problem
+
+lloyd 2026-06-05:
+
+> I want clank agents to have a universal way to open a diff in an editor for the user. This would be in ~/.config.json. The agent or the user would go "clank diff <plan-name>" or even a commit range. This call could have a --wait option which waits for the process spawned to be closed before continuing. Otherwise it just opens and continues.
+>
+> To the tool internally I suppose the right api is to pass the plan name (if it's not an adhoc commit range), the commit range, maybe even a prompt from the agent about what the user should be reviewing. Maybe even particular sections of certain files that should be of interest. The idea is that it could open emacs in a certain way with all the panes arranged according to what the command was told was important.
+
+Today an agent that wants a human to glance at a diff has two bad options:
+
+1. Print the diff inline into its tool transcript (loses fidelity, no editor jumps, no syntax navigation).
+2. Ask the user to manually `git diff <range>` in their own terminal (high friction; the agent's context — "look at the lifecycle hook in `state.rs:120`" — is lost).
+
+Clank already has the structured surface to make this push-button:
+
+- Plans → commit ranges via `crate::cli::plan_resolve::resolve_plan` (already used by `clank log`, `clank purge`, `clank finish`).
+- A typed `.clank/config.json` schema (`crate::cli::config::Config`, extended throughout `agent-add-cli-and-repo-scope`).
+- A working "compose-launch + exec" pattern in `crate::cli::agent::compose_launch` (declaration `launch: Option<LaunchConfig>` → executable + args + env), which is a near-perfect template for the editor-launch path.
+
+What's missing: a subcommand that wires plan-resolve + a configured editor invocation together, with an env channel for agent-supplied context (`--prompt`, `--focus`).
+
+## Verified before promotion (2026-06-05)
+
+Concrete pointers checked in tree at the time of writing — re-confirm at promote-time, code moves fast:
+
+- **Plan-resolve surface**: `crates/cli/src/cli/plan_resolve.rs:15-37` (`resolve_plan`) takes `(state, expected_basename, plan_arg: Option<&str>)` and returns a `PlanKey`. `crates/cli/src/cli/plan_resolve.rs:92-109` (`parse_arg`) handles bare-stem / `.md` / `<basename>/<stem>.md` / `.clank/plans/<stem>.md` forms. `clank log` and `clank purge` already consume it (`crates/cli/src/cli/log.rs:21-30`, `crates/cli/src/cli/purge.rs:62`).
+- **Plan-or-range pattern**: `clank log` already accepts BOTH a `--plan` flag AND a positional `<range>` arg (`crates/cli/src/cli/log.rs:21-42`). They are independent: `--plan` filters, `<range>` bounds. We do NOT want that shape — `clank diff` takes ONE positional that is EITHER a plan OR a range. See "Argument parsing" under Open questions.
+- **Range parsing**: `crates/cli/src/cli/log.rs:102-117` (`parse_range`) already handles `<from>..<to>` and bare `<sha>` (latter expands to `<sha>^..HEAD`). Reuse or factor out — the diff command wants `<from>..<to>` semantics most of the time.
+- **Plan → range conversion**: doesn't exist as a single helper today. `clank log` uses the `PlanKey` to filter the rebuilt log; it does NOT collapse a plan to a `<intro_sha>..<finalize_or_head_sha>` range. The diff command will need this. Probably belongs next to `resolve_plan`, e.g. `plan_resolve::range_for_plan(state, &plan_key) -> (Option<CommitSha>, CommitSha)`.
+- **Config schema is typed today** at `crates/cli/src/cli/config.rs:12-43` (`Config { review, hooks }`) but the on-disk layer is read via `apply_layer` (`config.rs:245-292`) which uses an intermediate `ConfigFile` struct. The `agents` field is read via separate typed wrappers (`RepoAgentsFile` / `UserAgentsFile`, `config.rs:128-141`). A new `diff` section follows the same pattern — typed Rust struct, additive to `Config`, additive to the on-disk schema.
+- **LaunchConfig exists and is the right shape for "command + args + env"**: `crates/core/src/agent_config.rs:67-83`. It's already used by `DefaultAgent.launch` in the declaration. Reusing it for the editor config keeps one launch-profile schema across the codebase.
+- **Compose+exec pattern lives at** `crates/cli/src/cli/agent.rs:199-242` (`compose_launch`, `ComposedLaunch`) and `agent.rs:277-301` (`exec_composed` — `unix::process::CommandExt::exec` on unix, `spawn().wait()` on non-unix). The unix `exec` path REPLACES the current process; the diff command wants `spawn()` semantics (clank stays alive to print messages / return control), so this is "inspired by" not "share with".
+- **POC for the same shape exists** at the repo root: `open-worktree.sh` reads structured config from `clank open --json` and constructs a zellij KDL layout from it. Not a direct precedent for diff but illustrates the "structured config → editor pane arrangement" pattern. `clank-open-zellij` (queued at `.clank/queue/600-clank-open-zellij.md`) is the related "open multi-pane editor" plan.
+
+## Approach (phased)
+
+### Phase 1: Editor config schema in `.clank/config.json`
+
+Add a `diff` section to the typed config. Sketched shape (pin exact field names at promote-time):
+
+```rust
+#[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize, Serialize)]
+pub struct DiffConfig {
+    /// Editor launch profile. `None` = `clank diff` errors with
+    /// "no editor configured; set diff.editor in
+    /// ~/.clank/config.json". Default-empty avoids accidentally
+    /// launching `vi` or `$EDITOR` (which would surprise users
+    /// who set `$EDITOR` for git commit-msg editing but expected
+    /// a different review surface for diffs).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub editor: Option<LaunchConfig>,
+    /// Default `--wait` behavior. `Some(true)` = wait by default,
+    /// `--no-wait` overrides. `Some(false)` = fire-and-forget,
+    /// `--wait` overrides. `None` = fire-and-forget (current
+    /// default per Lloyd's wording: "otherwise it just opens and
+    /// continues").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wait: Option<bool>,
+}
+```
+
+Layered loader same as the existing review/hooks settings: user-scope `~/.clank/config.json` provides a baseline; repo-scope `<repo>/.clank/config.json` can override (this lets the repo say "use magit for THIS project even though my user-scope says vscode"). Same lossy semantics as the rest of `apply_layer` — malformed editor config logs a warning and falls back to "no editor configured."
+
+**Typed from day one** per `typed-config-dogfood`. No raw JSON literals in tests; construct `DiffConfig` values and serialize via `serde_json::to_string_pretty`.
+
+### Phase 2: `clank diff` subcommand surface
+
+Add `clank diff` to `crates/cli/src/cli/mod.rs`. Shape:
+
+```text
+clank diff [<plan|range>] [--plan <plan>] [--range <range>]
+           [--prompt <text>] [--focus <file>[:<lines>]]...
+           [--wait | --no-wait]
+           [--print] [--repo <path>]
+```
+
+- **Positional `<plan|range>`**: auto-resolves. Disambiguation policy under Open questions.
+- **`--plan` / `--range`**: explicit forms; mutually exclusive with each other and with the positional. Useful when the heuristic guesses wrong.
+- **`--prompt <text>`**: agent-supplied free-form hint about what's interesting. Passed to the editor via env var (see Phase 4).
+- **`--focus <file>[:<lines>]`** (repeatable): pin specific file regions. Forwarded to the editor as a structured list (see Phase 4). Line syntax pinned in open questions.
+- **`--wait` / `--no-wait`**: override the configured default. Mutually exclusive.
+- **`--print`**: dry-run; print the composed editor command (program + argv + env additions) and exit 0. Mirrors `clank agent start --print` (see `agent.rs:191-194`). Critical for tests and for the "verify my editor config" loop.
+- **`--repo`**: standard override (same as every other subcommand).
+
+If no positional is given and neither `--plan` nor `--range` is set: infer the single active plan via `resolve_plan(state, basename, None)` — same fallback `clank log` uses without `--plan` (`log.rs:21-30`).
+
+### Phase 3: Plan → commit range resolution
+
+For a plan name:
+
+1. Resolve the plan key via `plan_resolve::resolve_plan` (already does the "active vs finished vs unknown" classification).
+2. Convert to a commit range. The "natural" range is `intro_sha^..finalize_sha` for finished plans, or `intro_sha^..HEAD` for in-flight plans.
+3. The state-fold already tracks the intro and finalize commits per plan (`state.fold.plans` for active, `state.fold.finished_plans` for finished). Add a helper:
+
+```rust
+// in plan_resolve.rs or a new range.rs sibling
+pub fn range_for_plan(state: &RepoState, key: &PlanKey)
+    -> anyhow::Result<(Option<CommitSha>, CommitSha)>;
+```
+
+Returns `(from, to)` matching the `(Option<CommitSha>, CommitSha)` shape `clank log` already uses (`log.rs:102-117`). `from = intro^` (so the intro itself is included in the diff); `to = finalize_sha` for finished plans, `HEAD` for active.
+
+For a raw range (`HEAD~3..HEAD` or `abc..def`): reuse `log::parse_range` (factor out to `plan_resolve` or a new `range_parse` module so log and diff share it — both want the same `(Option<CommitSha>, CommitSha)` output).
+
+### Phase 4: Compose the editor invocation
+
+Mirrors `agent::compose_launch` (`agent.rs:207-227`) at the structural level. The composed value:
+
+```rust
+struct ComposedDiffLaunch {
+    program: String,
+    args: Vec<String>,
+    env_overrides: BTreeMap<String, String>,
+    wait: bool,
+}
+```
+
+Template substitution in `args`:
+
+- `{range}` → `<from>..<to>` literal string (for editor commands that build the diff themselves, e.g. `emacsclient -e "(magit-diff '$range')"`).
+- `{from}`, `{to}` → individual SHAs.
+- `{repo}` → repo root absolute path.
+
+Env additions (in addition to whatever `LaunchConfig.env` supplies):
+
+- `CLANK_DIFF_RANGE` = `<from>..<to>`.
+- `CLANK_DIFF_PLAN` = plan stem if applicable, else unset.
+- `CLANK_DIFF_PROMPT` = the `--prompt` text if set.
+- `CLANK_DIFF_FOCUS` = newline-separated `<file>:<lines>` entries (or JSON; resolve at promote-time).
+- `CLANK_DIFF_REPO` = repo root.
+
+The "what does the editor receive" question is the load-bearing decision (see Open questions). The env-var channel is the most universal — every editor's launch shell can read env. Stdin piping is reserved for editors that explicitly want raw patch text (out of scope for v1).
+
+### Phase 5: Spawn semantics (`--wait` vs fire-and-forget)
+
+Two code paths, both via `std::process::Command`:
+
+- **Fire-and-forget** (default): `spawn()` + drop the `Child` handle. The editor outlives clank. On unix this works as long as we don't hold stdio handles open in a way that pins the child. Detach stdio (`Stdio::null()` for stdin/stdout/stderr) unless the user wants to see editor output inline; that's a corner the plan can defer.
+- **`--wait`**: `spawn().wait()`. Clank's exit code = editor's exit code. Sigint cleanup: if clank receives SIGINT during the wait, forward to the child and wait for cleanup (or document that it's the editor's responsibility to handle SIGINT — emacsclient does, vim does, vscode `--wait` does).
+
+This is intentionally NOT exec-replacement (unlike `agent start`). Clank's diff command always returns to its caller so the agent can react to a non-wait launch or to the wait-completed exit.
+
+### Phase 6: CLI plumbing
+
+- Wire `DiffArgs` into `mod.rs` alongside `LogArgs` / `PurgeArgs`.
+- Add a `crates/cli/src/cli/diff.rs` module with `pub async fn run(args: DiffArgs) -> anyhow::Result<()>`.
+- Register in the top-level `clap` dispatch (parent enum lives in `crates/cli/src/main.rs` — verify path at promote-time, not re-read here).
+- Doctor: optional new diagnostic — "diff.editor configured but `command` not on PATH" → Warn. Low priority; can be a follow-up plan if it complicates this one.
+
+### Phase 7: Tests
+
+Listed in Tests section below.
+
+## Open questions (resolve at promote-time, NOT now)
+
+These are the decisions worth a real conversation. Marking them so the promotion review has something concrete to argue about:
+
+1. **Positional disambiguation: plan name vs. commit range.** Options:
+   - (a) Try `plan_resolve::parse_arg + resolve_plan` first; on failure, try `parse_range`. Pro: zero friction for the common case. Con: error message on an unknown plan is "no candidates" + a confusing fallback if the range parser ALSO rejects it.
+   - (b) Heuristic: argument contains `..` → range; else plan. Pro: predictable. Con: bare-SHA range (`clank log HEAD` style) becomes ambiguous.
+   - (c) Require explicit `--plan` or `--range`; positional is rejected. Pro: zero ambiguity. Con: noisy for the common case (`clank diff foo` is what users will type).
+   - **Tentative pick**: (a) with a clear error message ("`<arg>` is not a known plan and is not a valid git range"). Pin at promote-time.
+
+2. **Editor config shape**: `LaunchConfig` reuse vs new `DiffEditorConfig` struct.
+   - Reusing `LaunchConfig` (Phase 1 sketch above) gets command + args + env for free AND keeps a single launch-profile struct in the codebase. But `LaunchConfig` was designed for the `agent start` session-restore path and the docstring (`agent_config.rs:57-66`) explicitly mentions claude/codex args ordering. Reusing means widening that docstring or accepting it's a bit overloaded.
+   - **Tentative pick**: reuse `LaunchConfig`. Add a note to its docstring that it's a general-purpose launch profile, not agent-specific. If the editor case grows extra fields (template-variable list, focus-arg builder) we can split later.
+
+3. **Template variable syntax for `--focus`**:
+   - (a) `file.rs:L10-L42` — emacs/github-style.
+   - (b) `file.rs:10-42` — terse.
+   - (c) `file.rs#L10-L42` — github URL fragment style.
+   - **Tentative pick**: (b) for the CLI flag (`--focus path/to/file.rs:10-42`); emit (a) or (b) into env depending on what editors expect. Pin at promote-time.
+
+4. **`--prompt` delivery channel**:
+   - (a) Env var (`CLANK_DIFF_PROMPT`) — universal, any editor's launch shell can read.
+   - (b) stdin pipe — works if the editor takes input but most diff-oriented editors don't.
+   - (c) CLI arg substitution via `{prompt}` template — requires user to wire it in their `LaunchConfig.args`.
+   - **Tentative pick**: (a) ALWAYS + (c) AS AN OPTION. Env is the safe default; users who want it in the arg list can interpolate `{prompt}`.
+
+5. **What does the editor receive: raw patch on stdin, two trees, or just the range string?**
+   - The simplest answer is "just the range string"; the user's editor command runs `git diff <range>` itself. emacs does this trivially via `magit-diff-range`.
+   - Stdin piping of `git diff <range>` output is also cheap to support but redundant for any editor that can shell out.
+   - **Tentative pick**: range string only (via env + template subst). Editor is responsible for running `git diff`. Stdin piping reserved as an opt-in `LaunchConfig` extension later.
+
+6. **`--wait` mechanics on SIGINT**: if user ctrl-c's clank while it's waiting on the editor, do we forward SIGINT, kill the child, or let it keep running?
+   - **Tentative pick**: forward SIGINT (most editors handle it; emacsclient + vscode `--wait` cleanly exit on it), then wait for the child to exit. Document as "ctrl-c is forwarded; editor decides cleanup."
+
+7. **Repo-scope override granularity**: should repo-scope `diff.editor` REPLACE user-scope (like `agents`) or override field-by-field (like `review`/`hooks`)?
+   - **Tentative pick**: field-by-field (REPLACE for `editor` as a whole struct, but layered: if repo-scope sets `wait` and not `editor`, fall back to user-scope `editor` + repo-scope `wait`). Matches `apply_layer`'s existing behavior for review/hooks. Pin at promote-time.
+
+8. **Plan range edge cases**: a plan that has been deleted (`PlanDeleted` log event) — does `clank diff <stem>` resolve, or error? A plan with no commits yet (intro only) — empty diff? Worth enumerating.
+
+## Out of scope
+
+- Multi-editor support per repo (one config, one editor — if you want both vim and emacs, swap config per session).
+- Editor-side integration helpers (no shipped emacs lisp / vscode extension that knows how to consume `CLANK_DIFF_*`). Users wire their own.
+- Diff rendering inside clank itself. `clank diff` is a LAUNCHER, not a renderer. `clank-html` already covers "render diff as a web page."
+- Per-commit diff (vs range diff). v1 is range-only. `--commit <sha>` shorthand is a follow-up.
+- Pinning a specific worktree (multi-worktree diff). v1 uses the cwd's repo + working tree.
+- Doctor diagnostic for "editor binary not on PATH." Deferred; useful but not load-bearing.
+- A repo-scope `diff.editor` REPLACE-vs-merge semantics decision that requires changing `apply_layer`. If the existing layered semantics work, use them; if not, defer.
+
+## Acceptance
+
+**Config schema (Phase 1)**
+
+- `Config` carries a `diff: DiffConfig` field; `DiffConfig` carries `editor: Option<LaunchConfig>` + `wait: Option<bool>`.
+- `apply_layer` reads `diff` from both user-scope and repo-scope `.clank/config.json`.
+- Schema is typed from day one; no hand-rolled JSON in any new test.
+- `clank config diff.editor` / `clank config diff.wait` enumerated in `KEY_CATALOG` (matches the existing pattern at `config.rs:304-361`). `clank config` enumerates them.
+
+**Subcommand surface (Phase 2 + 6)**
+
+- `clank diff <plan>` resolves the plan via `plan_resolve::resolve_plan` and converts to a commit range via the new `range_for_plan` helper.
+- `clank diff <range>` (raw `<from>..<to>` or bare SHA) parses via the shared range parser.
+- `clank diff` (no args) infers the single active plan, errors with candidates listed if ambiguous (same UX as `clank log` without `--plan`).
+- `clank diff --plan <x>` and `clank diff --range <x>` work as explicit overrides; mutually exclusive with each other and with the positional.
+- `clank diff --print` emits the composed launch line (program + argv + env) on stdout, exits 0, spawns nothing.
+
+**Editor launch (Phase 4 + 5)**
+
+- Composed launch substitutes `{range}`, `{from}`, `{to}`, `{repo}` in `LaunchConfig.args`.
+- Env additions include `CLANK_DIFF_RANGE`, `CLANK_DIFF_PLAN` (if applicable), `CLANK_DIFF_PROMPT` (if `--prompt`), `CLANK_DIFF_FOCUS` (if any `--focus`), `CLANK_DIFF_REPO`.
+- Default spawn = fire-and-forget; `--wait` blocks until exit; `--no-wait` overrides config-default `wait: true`.
+- Errors clearly when `diff.editor` is unconfigured: "no editor configured; set diff.editor.command in ~/.clank/config.json".
+
+**Workspace**
+
+- `cargo test --workspace` passes.
+- No raw JSON literals introduced in any new test (per `typed-config-dogfood` direction).
+
+## Tests
+
+### Config schema
+
+1. `diff_config_round_trips_with_editor_and_wait`: build `DiffConfig { editor: Some(LaunchConfig { ... }), wait: Some(true) }`, serialize, deserialize, assert equality.
+2. `diff_config_defaults_when_section_absent`: `.clank/config.json` with no `diff` key → `cfg.diff` is default (`editor: None`, `wait: None`).
+3. `diff_config_repo_scope_overrides_user_scope`: user-scope `editor: vim`; repo-scope `editor: emacsclient`; loaded `cfg.diff.editor.command == "emacsclient"`.
+4. `diff_config_malformed_ignored`: malformed JSON in the `diff` section logs a warning and `cfg.diff` falls back to default — same lossy semantics as the rest of `apply_layer`.
+
+### Plan → range resolution
+
+5. `range_for_plan_finished_returns_intro_parent_to_finalize`: repo with a finished plan; `range_for_plan(&state, &key)` returns `(Some(intro^), finalize_sha)`.
+6. `range_for_plan_active_returns_intro_parent_to_head`: repo with an active plan; helper returns `(Some(intro^), HEAD)`.
+7. `range_for_plan_unknown_errors`: plan key not in `state.fold.plans` → error matches "plan not found".
+
+### CLI surface
+
+8. `clank_diff_positional_resolves_plan`: `clank diff foo --print` resolves `foo` as a plan, emits a composed line that references the plan's intro..finalize range.
+9. `clank_diff_positional_resolves_range`: `clank diff HEAD~2..HEAD --print` skips plan resolution, parses as a range, emits a composed line referencing HEAD~2..HEAD.
+10. `clank_diff_positional_unknown_errors_clearly`: `clank diff not-a-plan-not-a-range --print` errors with a message that mentions both interpretations ("`not-a-plan-not-a-range` is not a known plan and is not a valid git range").
+11. `clank_diff_no_args_infers_single_active_plan`: one active plan in repo; `clank diff --print` resolves it.
+12. `clank_diff_no_args_ambiguous_lists_candidates`: two active plans; `clank diff` errors with both listed (same shape as `clank log`'s ambiguity error).
+
+### Launch composition
+
+13. `clank_diff_substitutes_range_template_in_args`: `LaunchConfig { args: ["--eval", "(magit-diff '{range}')"] }` → composed args contain `(magit-diff 'HEAD~2..HEAD')`.
+14. `clank_diff_sets_env_vars`: composed env contains `CLANK_DIFF_RANGE`, `CLANK_DIFF_REPO`, AND (when `--prompt`/`--focus` are set) `CLANK_DIFF_PROMPT` / `CLANK_DIFF_FOCUS`.
+15. `clank_diff_print_outputs_composed_line`: `--print` emits program + shell-quoted args on stdout and env additions on stderr (mirrors `agent start --print`).
+16. `clank_diff_unconfigured_editor_errors`: no `diff.editor` set → error names the config key + path.
+17. `clank_diff_wait_flag_overrides_config_default`: config has `wait: false`; `--wait` flips composed `wait` to true. And vice versa for `--no-wait` over config `wait: true`.
+
+### Smoke (gate-able by feature)
+
+18. `clank_diff_spawns_configured_editor_smoke`: with `diff.editor.command = "true"` (POSIX no-op binary), `clank diff <range>` (fire-and-forget) returns Ok and the test process doesn't block. With `--wait`, the same returns Ok after `true` exits.
+
+## Related history
+
+- `clank-log-v2` (FINISHED): introduced `clank log <range>` + plan-or-range patterns. Range parser (`log::parse_range`) is the reuse target for Phase 3.
+- `clank-open-inspector` (FINISHED) + `clank-open-inspector-impl` (FINISHED): `clank open` family of commands. Different surface (path classifier, not diff launcher), but the "config-driven editor target" idea is adjacent.
+- `agent-config-and-start` (FINISHED `18a5e78`): shipped `LaunchConfig` + `compose_launch` + `--print` UX. `clank diff` reuses the launch-profile shape and mirrors `--print` semantics.
+- `agent-add-cli-and-repo-scope` (active): typed config evolution + repo-scope overrides for `agents`. Same layering pattern applies to `diff`. Promote AFTER this lands so the config-write helpers are stable.
+- `typed-config-dogfood` (queued, `.clank/queue/500-typed-config-dogfood.md`): all new config types ship typed + serde-driven. This plan honors that direction from day one.
+- `clank-open-zellij` (queued, `.clank/queue/600-clank-open-zellij.md`): sibling "config-driven editor surface." Different scope (multi-agent layout vs single-diff launch) but worth landing both before the user assembles the full review-loop UX.
+- `open-worktree.sh` (untracked POC at repo root): illustrates the "structured config → editor pane layout" pattern. Not a precedent for diff specifically, but the same mental model.
+
+## Suggested ordering
+
+Land AFTER `agent-add-cli-and-repo-scope` (active) so `LaunchConfig` reuse is stable and the typed-config patterns are settled. Independent of `clank-open-zellij` (queued) — both can land in either order. Probably land BEFORE or alongside `typed-config-dogfood` since this plan adds a new typed section as a fresh datapoint for the dogfood migration.
