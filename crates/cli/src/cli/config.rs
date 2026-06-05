@@ -77,16 +77,31 @@ struct ConfigFile {
 }
 
 /// Lossy-deserialize wrapper for `.clank/config.json#/diff`. Used
-/// by `apply_layer`. The corresponding round-trip
-/// serialize-capable type lives in `RepoConfigFile.extra` for now
-/// — `clank agent add/remove/set-role` doesn't write the `diff`
-/// section, so we don't need an explicit Serialize variant yet.
+/// by `apply_layer`. Uses presence-aware Option fields on the
+/// editor's sub-fields so field-by-field layering per OQ7 of
+/// `clank-diff-editor` actually works — codex 8cccb87 caught
+/// that replacing the whole LaunchConfig dropped user-scope
+/// args/env when repo-scope set only command.
 #[derive(Debug, Default, Deserialize)]
 struct DiffFile {
     #[serde(default)]
-    editor: Option<LaunchConfig>,
+    editor: Option<DiffEditorFile>,
     #[serde(default)]
     wait: Option<bool>,
+}
+
+/// Layer-specific editor file. Each field is `Option<T>` so we
+/// can distinguish "absent from this layer" from "explicitly
+/// empty." `apply_layer` merges field-by-field into
+/// `cfg.diff.editor`.
+#[derive(Debug, Default, Deserialize)]
+struct DiffEditorFile {
+    #[serde(default)]
+    command: Option<String>,
+    #[serde(default)]
+    args: Option<Vec<String>>,
+    #[serde(default)]
+    env: Option<BTreeMap<String, String>>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -504,15 +519,25 @@ fn apply_layer(cfg: &mut Config, path: Option<&Path>) -> BTreeSet<String> {
     // stays from user-scope. Each non-None field replaces the
     // current effective value.
     if let Some(diff) = parsed.diff {
-        if let Some(editor) = diff.editor {
-            // Track which sub-fields were present so the source
-            // resolver can attribute them. Only `diff.editor.command`
-            // is currently catalog-enumerated; args/env need
-            // hand-editing per the catalog entry.
-            if editor.command.is_some() {
+        if let Some(editor_layer) = diff.editor {
+            // Field-by-field merge per OQ7. Start from the
+            // current effective editor (Some/None) and overlay
+            // any fields the new layer explicitly sets. Codex
+            // 8cccb87 caught the whole-struct replacement bug
+            // that dropped user-scope args/env when repo-scope
+            // set only command.
+            let mut effective = cfg.diff.editor.clone().unwrap_or_default();
+            if let Some(cmd) = editor_layer.command {
+                effective.command = Some(cmd);
                 present.insert("diff.editor.command".to_string());
             }
-            cfg.diff.editor = Some(editor);
+            if let Some(args) = editor_layer.args {
+                effective.args = args;
+            }
+            if let Some(env) = editor_layer.env {
+                effective.env = env;
+            }
+            cfg.diff.editor = Some(effective);
         }
         if let Some(wait) = diff.wait {
             cfg.diff.wait = Some(wait);
@@ -1172,6 +1197,78 @@ mod tests {
         assert_eq!(editor.command.as_deref(), Some("emacsclient"));
         assert_eq!(editor.args, vec!["-c".to_string(), "{patch_file}".into()]);
         assert_eq!(cfg.diff.wait, Some(true));
+    }
+
+    #[test]
+    fn diff_editor_subfields_merge_per_oq7() {
+        // Codex caught on 8cccb87: apply_layer was replacing the
+        // whole LaunchConfig instead of merging fields. Repo-scope
+        // setting only `command` would drop user-scope `args` and
+        // `env`.
+        //
+        // OQ7 pinned: field-by-field layering. User-scope sets
+        // editor.command + editor.args + editor.env; repo-scope
+        // sets only editor.command. Result: command overridden;
+        // args + env preserved from user-scope.
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        write(
+            &home.path().join(".clank/config.json"),
+            r#"{
+                "diff": {
+                    "editor": {
+                        "command": "vim",
+                        "args": ["-no-plugin", "-N"],
+                        "env": {"VIMRUNTIME": "/usr/share/vim"}
+                    }
+                }
+            }"#,
+        );
+        write(
+            &tmp.path().join(".clank/config.json"),
+            r#"{"diff": {"editor": {"command": "emacsclient"}}}"#,
+        );
+        let cfg = load_with_home(tmp.path(), Some(home.path()));
+        let editor = cfg.diff.editor.expect("editor present");
+        // Command overridden by repo-scope.
+        assert_eq!(editor.command.as_deref(), Some("emacsclient"));
+        // Args + env preserved from user-scope (repo-scope didn't
+        // set them).
+        assert_eq!(
+            editor.args,
+            vec!["-no-plugin".to_string(), "-N".to_string()],
+            "user-scope args must survive when repo-scope didn't set them"
+        );
+        assert_eq!(
+            editor.env.get("VIMRUNTIME").map(|s| s.as_str()),
+            Some("/usr/share/vim"),
+            "user-scope env must survive when repo-scope didn't set them"
+        );
+    }
+
+    #[test]
+    fn diff_editor_subfields_repo_args_replaces_user_args() {
+        // Field-by-field doesn't deep-merge lists/maps — when
+        // repo-scope DOES set args, it REPLACES the whole list.
+        // (Same as how `--launch-arg` works on `clank agent add`.)
+        // Codex's OQ7 reasoning: each field is independently
+        // overridden when present in the layer.
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        write(
+            &home.path().join(".clank/config.json"),
+            r#"{"diff": {"editor": {"command": "vim", "args": ["-A"]}}}"#,
+        );
+        write(
+            &tmp.path().join(".clank/config.json"),
+            r#"{"diff": {"editor": {"args": ["-B", "-C"]}}}"#,
+        );
+        let cfg = load_with_home(tmp.path(), Some(home.path()));
+        let editor = cfg.diff.editor.expect("editor present");
+        // Command from user-scope (repo didn't set it).
+        assert_eq!(editor.command.as_deref(), Some("vim"));
+        // Args fully replaced by repo-scope.
+        assert_eq!(editor.args, vec!["-B".to_string(), "-C".to_string()]);
     }
 
     #[test]
