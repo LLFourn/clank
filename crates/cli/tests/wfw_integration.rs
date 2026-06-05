@@ -1958,6 +1958,78 @@ fn wfw_reviewer_blocked_plan_does_not_surface_promote() {
 }
 
 #[test]
+fn wfw_reviewer_blocked_plan_emits_no_review_item() {
+    // Acceptance from status-blocks-dominate-gate: blocked plan +
+    // a reviewer who hasn't reviewed yet → wfw must NOT surface
+    // a Reviewer item for that plan. Pre-change this held via
+    // wfw's `suppressed_plans` set; post-change it ALSO holds via
+    // work_for's Blocked first-arm making the suppression explicit
+    // at the model level. This test pins the property survives
+    // the model change — if EITHER layer broke (and the other
+    // compensated by accident), this test catches it.
+    //
+    // From a reviewer's perspective on a master-owned block:
+    // - The block was authored by master (claude), not this
+    //   reviewer (bob), so wfw doesn't wake bob to ANSWER the
+    //   block — bob has no role in clearing it.
+    // - The block suppresses the per-plan reviewer item that bob
+    //   would otherwise see (foo's implement commit needs review).
+    // - With no other work, wfw parks until timeout.
+    let dir = init_repo();
+    let repo = dir.path();
+    disable_adhoc_review(repo);
+    // bob is a second reviewer beyond alice (auto-registered).
+    register_reviewer(repo, "bob");
+    write(repo, ".clank/plans/foo.md", "# foo\n");
+    commit(repo, "[foo] intro");
+    write(repo, "src/foo.rs", "fn main() {}\n");
+    commit(repo, "[foo] implement");
+
+    // Master (claude) opens a plan-scoped block.
+    write(
+        repo,
+        ".clank/agents/claude/blocks/foo/wait.md",
+        "checking the design",
+    );
+
+    let mut child = spawn_wfw(
+        repo,
+        &[
+            "--author",
+            "bob",
+            "--role",
+            "reviewers",
+            "--timeout",
+            "3s",
+            "--json",
+        ],
+    );
+    let exit = wait_for_exit(&mut child, Duration::from_secs(10));
+    let stdout = read_stdout_to_end(&mut child);
+    // wfw parks on the block (exit 2 == timeout); no Reviewer
+    // item was surfaced for the blocked plan.
+    assert_eq!(
+        exit.code(),
+        Some(2),
+        "reviewer should park on blocked plan — no Reviewer item should surface; \
+         got exit={exit:?} stdout=`{stdout}`"
+    );
+    // Defensive: even if wfw emits diagnostic JSON, it must not
+    // contain a `reviewer`-kind item or a `feedback_path` payload
+    // (the Reviewer item's tell). A future regression where the
+    // suppression breaks at one layer but holds at the other would
+    // be caught by this negative assertion AND the timeout above.
+    assert!(
+        !stdout.contains("\"kind\":\"reviewer\""),
+        "reviewer item must NOT be emitted while plan is blocked; got stdout=`{stdout}`"
+    );
+    assert!(
+        !stdout.contains("feedback_path"),
+        "feedback_path is the Reviewer item's payload tell; must not appear; got stdout=`{stdout}`"
+    );
+}
+
+#[test]
 fn wfw_parks_on_pending_block() {
     let dir = init_repo();
     let repo = dir.path();
