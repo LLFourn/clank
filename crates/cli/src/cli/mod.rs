@@ -15,6 +15,7 @@ pub mod auto;
 pub mod block;
 pub mod config;
 pub mod demote;
+pub mod diff;
 pub mod doctor;
 pub mod feedback;
 pub mod finish;
@@ -162,6 +163,50 @@ pub struct OpenArgs {
     /// Emit the response as JSON.
     #[arg(short = 'j', long)]
     pub json: bool,
+}
+
+/// `clank diff <plan|range>` — launch the configured editor on
+/// a plan or commit range diff.
+#[derive(Args, Debug)]
+pub struct DiffArgs {
+    /// Plan name OR git commit range. Auto-resolves: try plan-resolve
+    /// first, then range. Use `--plan` / `--range` for an explicit
+    /// override when the heuristic guesses wrong.
+    pub target: Option<String>,
+    /// Explicit plan name (mutually exclusive with `--range` and
+    /// the positional target).
+    #[arg(long, conflicts_with_all = ["range", "target"])]
+    pub plan: Option<String>,
+    /// Explicit git commit range (mutually exclusive with `--plan`
+    /// and the positional target).
+    #[arg(long, conflicts_with_all = ["plan", "target"])]
+    pub range: Option<String>,
+    /// Agent-supplied hint about what's interesting in this diff.
+    /// Surfaced to the editor via `CLANK_DIFF_PROMPT` and the
+    /// `{prompt}` template variable.
+    #[arg(long, value_name = "TEXT")]
+    pub prompt: Option<String>,
+    /// File region of interest. Format: `path/to/file:start-end`,
+    /// `path/to/file:line` (shorthand for `line-line`), or
+    /// `path/to/file` (whole file). Repeatable. Surfaced via
+    /// `CLANK_DIFF_FOCUS` (newline-separated).
+    #[arg(long, value_name = "FILE[:LINES]")]
+    pub focus: Vec<String>,
+    /// Wait for the editor to exit before returning. Overrides
+    /// `diff.wait` from config.
+    #[arg(long, conflicts_with = "no_wait")]
+    pub wait: bool,
+    /// Fire-and-forget. Overrides `diff.wait: true` from config.
+    #[arg(long = "no-wait", conflicts_with = "wait")]
+    pub no_wait: bool,
+    /// Print the composed launch line (program + shell-quoted args
+    /// on stdout, env additions on stderr) and exit 0 without
+    /// spawning. Mirrors `clank agent start --print`.
+    #[arg(long)]
+    pub print: bool,
+    /// Repo root. Defaults to the cwd's git toplevel.
+    #[arg(long, value_name = "PATH")]
+    pub repo: Option<PathBuf>,
 }
 
 #[derive(Args, Debug)]

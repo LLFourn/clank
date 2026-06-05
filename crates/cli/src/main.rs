@@ -27,6 +27,9 @@ enum Command {
     Agent(cli::AgentArgs),
     /// Strip a plan's `.clank/` artifacts from history.
     Purge(cli::PurgeArgs),
+    /// Launch the configured editor on a plan or commit-range
+    /// diff. See `clank diff --help` for argument shapes.
+    Diff(cli::DiffArgs),
     /// Abort an in-flight plan: drop its commits from history AND
     /// save the plan body back to the queue (or stub) for
     /// re-attempt. Transactional — fails closed at every
@@ -99,6 +102,7 @@ async fn main() -> anyhow::Result<()> {
         Command::Queue(args) => cli::queue::run(args).await,
         Command::Agent(args) => cli::agent::run(args).await,
         Command::Purge(args) => cli::purge::run(args).await,
+        Command::Diff(args) => cli::diff::run(args).await,
         Command::Demote(args) => cli::demote::run(args).await,
         Command::Log(args) => cli::log::run(args).await,
         Command::Html(args) => cli::html::run(args).await,

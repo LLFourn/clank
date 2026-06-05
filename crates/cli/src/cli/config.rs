@@ -14,6 +14,10 @@ pub struct Config {
     /// `Some(cmd)` = hook set, `None` = explicitly disabled (null).
     /// Absent keys are not in the map at all.
     pub hooks: BTreeMap<HookEvent, Option<String>>,
+    /// `clank diff` settings — editor launch profile + default
+    /// wait behavior. Layered field-by-field via `apply_layer`
+    /// (matches `review`/`hooks`; NOT REPLACE like `agents`).
+    pub diff: DiffConfig,
 }
 
 impl Default for Config {
@@ -21,8 +25,28 @@ impl Default for Config {
         Self {
             review: ReviewConfig::default(),
             hooks: BTreeMap::new(),
+            diff: DiffConfig::default(),
         }
     }
+}
+
+/// `clank diff` config: editor launch profile + default wait
+/// behavior. Loaded from `.clank/config.json#/diff` (user and
+/// repo scopes, layered field-by-field).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct DiffConfig {
+    /// Editor launch profile. `None` means no editor is
+    /// configured; `clank diff` errors with a message naming
+    /// `diff.editor.command`. Default-empty avoids accidentally
+    /// launching `$EDITOR` (which users may set for git commit
+    /// message editing but not as their diff review surface).
+    pub editor: Option<LaunchConfig>,
+    /// Default `--wait` behavior. `Some(true)` = wait by default
+    /// (`--no-wait` overrides). `Some(false)` = fire-and-forget
+    /// (`--wait` overrides). `None` = fire-and-forget (system
+    /// default per lloyd's wording: "otherwise it just opens and
+    /// continues").
+    pub wait: Option<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -48,6 +72,21 @@ struct ConfigFile {
     review: Option<ReviewFile>,
     #[serde(default)]
     hooks: Option<HooksFile>,
+    #[serde(default)]
+    diff: Option<DiffFile>,
+}
+
+/// Lossy-deserialize wrapper for `.clank/config.json#/diff`. Used
+/// by `apply_layer`. The corresponding round-trip
+/// serialize-capable type lives in `RepoConfigFile.extra` for now
+/// — `clank agent add/remove/set-role` doesn't write the `diff`
+/// section, so we don't need an explicit Serialize variant yet.
+#[derive(Debug, Default, Deserialize)]
+struct DiffFile {
+    #[serde(default)]
+    editor: Option<LaunchConfig>,
+    #[serde(default)]
+    wait: Option<bool>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -459,6 +498,21 @@ fn apply_layer(cfg: &mut Config, path: Option<&Path>) -> BTreeSet<String> {
             }
         }
     }
+    // Field-by-field diff layering: per OQ7 (clank-diff-editor),
+    // repo-scope overrides user-scope at the field level. If
+    // repo-scope sets diff.wait but not diff.editor, the editor
+    // stays from user-scope. Each non-None field replaces the
+    // current effective value.
+    if let Some(diff) = parsed.diff {
+        if let Some(editor) = diff.editor {
+            cfg.diff.editor = Some(editor);
+            present.insert("diff.editor".to_string());
+        }
+        if let Some(wait) = diff.wait {
+            cfg.diff.wait = Some(wait);
+            present.insert("diff.wait".to_string());
+        }
+    }
     present
 }
 
@@ -528,6 +582,20 @@ pub static KEY_CATALOG: &[KeyDef] = &[
         type_desc: "string|null",
         default: "null",
         help: "Shell command to run when an agent creates a block",
+    },
+    KeyDef {
+        section: "diff",
+        name: "editor",
+        type_desc: "launch profile",
+        default: "none",
+        help: "Editor launch profile for `clank diff` (object: command, args, env)",
+    },
+    KeyDef {
+        section: "diff",
+        name: "wait",
+        type_desc: "bool",
+        default: "false",
+        help: "Default `--wait` behavior for `clank diff`; --no-wait/--wait override",
     },
 ];
 
@@ -1038,6 +1106,94 @@ mod tests {
         let result = tokio::runtime::Runtime::new().unwrap().block_on(run(args));
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("unknown action"));
+    }
+
+    #[test]
+    fn diff_config_defaults_when_section_absent() {
+        // Test 2: .clank/config.json with no `diff` key → cfg.diff
+        // is default (editor: None, wait: None).
+        let tmp = tempfile::tempdir().unwrap();
+        write(
+            &tmp.path().join(".clank/config.json"),
+            r#"{"review": {"adhoc_feedback": true}}"#,
+        );
+        let cfg = load_with_home(tmp.path(), None);
+        assert!(cfg.diff.editor.is_none());
+        assert!(cfg.diff.wait.is_none());
+    }
+
+    #[test]
+    fn diff_config_loads_editor_and_wait() {
+        // Test 1: full DiffConfig round-trip via load (the public
+        // loader is what callers actually use).
+        let tmp = tempfile::tempdir().unwrap();
+        write(
+            &tmp.path().join(".clank/config.json"),
+            r#"{
+                "diff": {
+                    "editor": {
+                        "command": "emacsclient",
+                        "args": ["-c", "{patch_file}"],
+                        "env": {"DISPLAY": ":0"}
+                    },
+                    "wait": true
+                }
+            }"#,
+        );
+        let cfg = load_with_home(tmp.path(), None);
+        let editor = cfg.diff.editor.expect("editor present");
+        assert_eq!(editor.command.as_deref(), Some("emacsclient"));
+        assert_eq!(editor.args, vec!["-c".to_string(), "{patch_file}".into()]);
+        assert_eq!(cfg.diff.wait, Some(true));
+    }
+
+    #[test]
+    fn diff_config_repo_scope_overrides_user_scope_field_by_field() {
+        // Test 3: user-scope editor=vim, wait=false; repo-scope
+        // editor=emacsclient. Result: editor=emacsclient (overridden),
+        // wait=false (untouched in repo-scope). OQ7's
+        // field-by-field layering semantic.
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        write(
+            &home.path().join(".clank/config.json"),
+            r#"{
+                "diff": {
+                    "editor": {"command": "vim"},
+                    "wait": false
+                }
+            }"#,
+        );
+        write(
+            &tmp.path().join(".clank/config.json"),
+            r#"{
+                "diff": {
+                    "editor": {"command": "emacsclient"}
+                }
+            }"#,
+        );
+        let cfg = load_with_home(tmp.path(), Some(home.path()));
+        let editor = cfg.diff.editor.expect("editor present");
+        assert_eq!(editor.command.as_deref(), Some("emacsclient"));
+        // wait was NOT overridden by repo-scope (repo-scope didn't
+        // set it), so user-scope's value survives.
+        assert_eq!(cfg.diff.wait, Some(false));
+    }
+
+    #[test]
+    fn diff_config_malformed_ignored_per_apply_layer_semantics() {
+        // Test 4: malformed JSON in the `diff` section logs a
+        // warning and cfg.diff falls back to default. Same lossy
+        // semantics as the rest of apply_layer (the entire layer
+        // is skipped if parse fails).
+        let tmp = tempfile::tempdir().unwrap();
+        write(
+            &tmp.path().join(".clank/config.json"),
+            "{ this is not valid JSON",
+        );
+        let cfg = load_with_home(tmp.path(), None);
+        assert!(cfg.diff.editor.is_none());
+        assert!(cfg.diff.wait.is_none());
     }
 
     #[test]

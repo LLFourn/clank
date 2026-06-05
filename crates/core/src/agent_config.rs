@@ -54,16 +54,30 @@ pub struct AgentConfig {
     pub launch: Option<LaunchConfig>,
 }
 
-/// Per-agent launch profile. Consumed by `clank agent start`.
+/// General-purpose launch profile: executable + args + env.
 ///
-/// Args are spliced BEFORE the session-restore suffix (claude's
-/// `--resume <id>` or codex's `resume <id> --cd <repo>`) so they
-/// attach to the top-level tool. For codex specifically: flags
-/// AFTER the `resume` subcommand attach to `resume`, not to the
-/// `codex` binary; putting `launch.args` first preserves the
-/// typical use case (`codex --profile deep resume <id>`). For
-/// claude (flat flags) position is cosmetic, but the same rule
-/// keeps the mental model consistent.
+/// Two consumers in the codebase today (per OQ2 of
+/// `clank-diff-editor`: reuse this struct rather than fork):
+///
+/// 1. **`clank agent start <name>`** (per-agent launch). Args are
+///    spliced BEFORE the session-restore suffix (claude's
+///    `--resume <id>` or codex's `resume <id> --cd <repo>`) so
+///    they attach to the top-level tool. For codex specifically:
+///    flags AFTER the `resume` subcommand attach to `resume`, not
+///    to the `codex` binary; putting `launch.args` first preserves
+///    the typical use case (`codex --profile deep resume <id>`).
+///    For claude (flat flags) position is cosmetic, but the same
+///    rule keeps the mental model consistent.
+///
+/// 2. **`clank diff` editor launch** (`Config.diff.editor`).
+///    `args` may include template variables like `{range}`,
+///    `{commits}`, `{patch_file}` that are substituted at compose
+///    time. Args do not have a "session-restore suffix" concept;
+///    args are passed verbatim (post-substitution) to the editor.
+///
+/// If future consumers need fields beyond `command/args/env`
+/// (e.g. multi-pane layout descriptors), split into a sibling
+/// struct rather than overloading this one.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct LaunchConfig {
     /// Override the executable. `None` falls back to the

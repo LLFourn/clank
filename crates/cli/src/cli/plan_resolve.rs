@@ -1,7 +1,9 @@
 //! Local plan resolution for the operator CLI. Operates against a
 //! freshly-folded [`RepoState`] — no daemon required.
 
-use crate::lifecycle::PlanKey;
+use std::path::Path;
+
+use crate::lifecycle::{CommitSha, PlanKey};
 use crate::repo_state::RepoState;
 
 /// Resolve a CLI plan argument against a local `RepoState`.
@@ -106,6 +108,56 @@ pub fn parse_arg(raw: &str, expected_basename: &str) -> anyhow::Result<String> {
         return Ok(rest.trim_end_matches(".md").to_string());
     }
     Ok(raw.trim_end_matches(".md").to_string())
+}
+
+/// Plan-attributed commits for a plan key, in chronological order.
+///
+/// Source of truth differs by plan status:
+/// - **Active**: `state.fold.plans[plan_key].commits` — the fold's
+///   per-plan timeline. Attribution is intrinsic (the fold only
+///   adds plan-attributed events to a plan's timeline).
+/// - **Finished**: re-derive via [`crate::preview::build_rewrite_preview`]
+///   and **FILTER `!c.foreign`**. The preview is range-based
+///   (`[intro_sha, head_sha]`); it includes interleaved non-plan
+///   commits marked `foreign: true` per `clank_core::api::RewriteCommit`.
+///   The foreign filter is load-bearing — codex caught (twice)
+///   that omitting it reintroduces the interleaved-plans bug
+///   (cba9249 active-path; 0859200 finished-path).
+///
+/// Returns an error if the plan key is in neither `state.fold.plans`
+/// nor `state.fold.finished_plans` — matches `resolve_plan`'s
+/// "plan not found" diagnostic shape.
+pub async fn commits_for_plan(
+    repo_root: &Path,
+    state: &RepoState,
+    plan_key: &PlanKey,
+) -> anyhow::Result<Vec<CommitSha>> {
+    // Active path: fold's per-plan timeline is already
+    // plan-attributed. Cheap — no preview rebuild needed.
+    if let Some(ps) = state.fold.plans.get(plan_key) {
+        return Ok(ps.commits.iter().map(|e| e.sha.clone()).collect());
+    }
+    // Finished path: preview rebuild + foreign filter.
+    let is_finished = state
+        .fold
+        .finished_plans
+        .iter()
+        .any(|f| &f.plan == plan_key);
+    if !is_finished {
+        anyhow::bail!(
+            "plan `{}` not found in active or finished sets",
+            plan_key.as_str()
+        );
+    }
+    let preview = crate::preview::build_rewrite_preview(repo_root, state, plan_key, true)
+        .await
+        .map_err(|e| anyhow::anyhow!("rewrite preview failed for `{}`: {e}", plan_key.as_str()))?;
+    Ok(preview
+        .commits
+        .iter()
+        .filter(|c| !c.foreign)
+        .map(|c| c.sha.clone())
+        .collect())
 }
 
 #[cfg(test)]
