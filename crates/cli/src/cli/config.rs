@@ -505,8 +505,14 @@ fn apply_layer(cfg: &mut Config, path: Option<&Path>) -> BTreeSet<String> {
     // current effective value.
     if let Some(diff) = parsed.diff {
         if let Some(editor) = diff.editor {
+            // Track which sub-fields were present so the source
+            // resolver can attribute them. Only `diff.editor.command`
+            // is currently catalog-enumerated; args/env need
+            // hand-editing per the catalog entry.
+            if editor.command.is_some() {
+                present.insert("diff.editor.command".to_string());
+            }
             cfg.diff.editor = Some(editor);
-            present.insert("diff.editor".to_string());
         }
         if let Some(wait) = diff.wait {
             cfg.diff.wait = Some(wait);
@@ -585,10 +591,10 @@ pub static KEY_CATALOG: &[KeyDef] = &[
     },
     KeyDef {
         section: "diff",
-        name: "editor",
-        type_desc: "launch profile",
-        default: "none",
-        help: "Editor launch profile for `clank diff` (object: command, args, env)",
+        name: "editor.command",
+        type_desc: "string|null",
+        default: "null",
+        help: "Editor executable for `clank diff`. Args/env need hand-editing in .clank/config.json under diff.editor.{args,env}",
     },
     KeyDef {
         section: "diff",
@@ -684,6 +690,17 @@ pub fn get_value(cfg: &Config, key: &str) -> String {
         "hooks.plan_finalized" => hook_display(cfg.hooks.get(&HookEvent::PlanFinalized)),
         "hooks.idle" => hook_display(cfg.hooks.get(&HookEvent::Idle)),
         "hooks.blocked" => hook_display(cfg.hooks.get(&HookEvent::Blocked)),
+        "diff.editor.command" => cfg
+            .diff
+            .editor
+            .as_ref()
+            .and_then(|l| l.command.clone())
+            .unwrap_or_else(|| "null".to_string()),
+        "diff.wait" => cfg
+            .diff
+            .wait
+            .map(|b| b.to_string())
+            .unwrap_or_else(|| "null".to_string()),
         _ => "unknown key".to_string(),
     }
 }
@@ -698,16 +715,22 @@ fn event_to_key_name(event: HookEvent) -> &'static str {
     }
 }
 
-fn key_to_json_path(key: &str) -> Option<(&'static str, &'static str)> {
+/// Map a dotted catalog key to its JSON path. Slice depth varies:
+/// most keys are two-level (`review.adhoc_feedback` → `["review",
+/// "adhoc_feedback"]`); `diff.editor.command` is three-level
+/// (`["diff", "editor", "command"]`).
+fn key_to_json_path(key: &str) -> Option<&'static [&'static str]> {
     match key {
-        "review.adhoc_feedback" => Some(("review", "adhoc_feedback")),
-        "review.plan_feedback" => Some(("review", "plan_feedback")),
-        "review.require_commit_prefix" => Some(("review", "require_commit_prefix")),
-        "hooks.master_work" => Some(("hooks", "master_work")),
-        "hooks.reviewer_work" => Some(("hooks", "reviewer_work")),
-        "hooks.plan_finalized" => Some(("hooks", "plan_finalized")),
-        "hooks.idle" => Some(("hooks", "idle")),
-        "hooks.blocked" => Some(("hooks", "blocked")),
+        "review.adhoc_feedback" => Some(&["review", "adhoc_feedback"]),
+        "review.plan_feedback" => Some(&["review", "plan_feedback"]),
+        "review.require_commit_prefix" => Some(&["review", "require_commit_prefix"]),
+        "hooks.master_work" => Some(&["hooks", "master_work"]),
+        "hooks.reviewer_work" => Some(&["hooks", "reviewer_work"]),
+        "hooks.plan_finalized" => Some(&["hooks", "plan_finalized"]),
+        "hooks.idle" => Some(&["hooks", "idle"]),
+        "hooks.blocked" => Some(&["hooks", "blocked"]),
+        "diff.wait" => Some(&["diff", "wait"]),
+        "diff.editor.command" => Some(&["diff", "editor", "command"]),
         _ => None,
     }
 }
@@ -726,6 +749,8 @@ fn key_name(cmd: &ConfigKey) -> &'static str {
         ConfigKey::HooksPlanFinalized(_) => "hooks.plan_finalized",
         ConfigKey::HooksIdle(_) => "hooks.idle",
         ConfigKey::HooksBlocked(_) => "hooks.blocked",
+        ConfigKey::DiffEditorCommand(_) => "diff.editor.command",
+        ConfigKey::DiffWait(_) => "diff.wait",
     }
 }
 
@@ -738,7 +763,9 @@ fn key_args(cmd: &ConfigKey) -> &ConfigKeyArgs {
         | ConfigKey::HooksReviewerWork(a)
         | ConfigKey::HooksPlanFinalized(a)
         | ConfigKey::HooksIdle(a)
-        | ConfigKey::HooksBlocked(a) => a,
+        | ConfigKey::HooksBlocked(a)
+        | ConfigKey::DiffEditorCommand(a)
+        | ConfigKey::DiffWait(a) => a,
     }
 }
 
@@ -774,6 +801,10 @@ pub async fn run(args: ConfigArgs) -> anyhow::Result<()> {
                     "plan_finalized": cfg.hooks.get(&HookEvent::PlanFinalized),
                     "idle": cfg.hooks.get(&HookEvent::Idle),
                     "blocked": cfg.hooks.get(&HookEvent::Blocked),
+                },
+                "diff": {
+                    "editor": cfg.diff.editor,
+                    "wait": cfg.diff.wait,
                 }
             });
             println!("{}", serde_json::to_string_pretty(&obj)?);
@@ -828,9 +859,8 @@ pub async fn run(args: ConfigArgs) -> anyhow::Result<()> {
             if def.type_desc == "bool" && value != "true" && value != "false" {
                 anyhow::bail!("{key} is a bool; value must be true or false");
             }
-            let (section, field) =
-                key_to_json_path(key).expect("key_name always returns a catalog key");
-            set_repo_key(&repo, section, field, value, def.type_desc)?;
+            let path = key_to_json_path(key).expect("key_name always returns a catalog key");
+            set_repo_key(&repo, path, value, def.type_desc)?;
             let kvs = resolve_key_values(&repo);
             if let Some(kv) = kvs.iter().find(|kv| kv.key == key) {
                 println!("{} = {} ({})", kv.key, kv.value, kv.source);
@@ -844,13 +874,10 @@ pub async fn run(args: ConfigArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn set_repo_key(
-    repo: &Path,
-    section: &str,
-    field: &str,
-    value: &str,
-    type_desc: &str,
-) -> anyhow::Result<()> {
+fn set_repo_key(repo: &Path, path: &[&str], value: &str, type_desc: &str) -> anyhow::Result<()> {
+    if path.is_empty() {
+        anyhow::bail!("empty JSON path");
+    }
     let config_path = repo.join(".clank/config.json");
     let mut root: serde_json::Value = if config_path.exists() {
         let body = std::fs::read_to_string(&config_path)?;
@@ -858,18 +885,6 @@ fn set_repo_key(
     } else {
         serde_json::Value::Object(serde_json::Map::new())
     };
-
-    let obj = root
-        .as_object_mut()
-        .ok_or_else(|| anyhow::anyhow!("config.json is not a JSON object"))?;
-
-    let sec = obj
-        .entry(section)
-        .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
-
-    let sec_obj = sec
-        .as_object_mut()
-        .ok_or_else(|| anyhow::anyhow!("config section `{section}` is not an object"))?;
 
     let json_val = match type_desc {
         "bool" => match value {
@@ -886,7 +901,19 @@ fn set_repo_key(
         }
     };
 
-    sec_obj.insert(field.to_string(), json_val);
+    // Walk the path, creating intermediate objects as needed.
+    let mut cursor = root
+        .as_object_mut()
+        .ok_or_else(|| anyhow::anyhow!("config.json is not a JSON object"))?;
+    for segment in &path[..path.len() - 1] {
+        let entry = cursor
+            .entry(*segment)
+            .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
+        cursor = entry
+            .as_object_mut()
+            .ok_or_else(|| anyhow::anyhow!("config segment `{segment}` is not an object"))?;
+    }
+    cursor.insert(path.last().unwrap().to_string(), json_val);
 
     if let Some(parent) = config_path.parent() {
         std::fs::create_dir_all(parent)?;
@@ -1008,7 +1035,7 @@ mod tests {
     fn set_repo_key_creates_file() {
         let tmp = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(tmp.path().join(".clank")).unwrap();
-        set_repo_key(tmp.path(), "review", "adhoc_feedback", "false", "bool").unwrap();
+        set_repo_key(tmp.path(), &["review", "adhoc_feedback"], "false", "bool").unwrap();
         let cfg = load_isolated(tmp.path());
         assert!(!cfg.review.adhoc_feedback);
     }
@@ -1041,7 +1068,7 @@ mod tests {
     fn set_prints_new_effective_value() {
         let tmp = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(tmp.path().join(".clank")).unwrap();
-        set_repo_key(tmp.path(), "review", "adhoc_feedback", "false", "bool").unwrap();
+        set_repo_key(tmp.path(), &["review", "adhoc_feedback"], "false", "bool").unwrap();
         let kvs = resolve_key_values_with_home(tmp.path(), None);
         let kv = kvs
             .iter()
@@ -1071,7 +1098,7 @@ mod tests {
     fn hook_set_true_writes_string_not_bool() {
         let tmp = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(tmp.path().join(".clank")).unwrap();
-        set_repo_key(tmp.path(), "hooks", "master_work", "true", "string|null").unwrap();
+        set_repo_key(tmp.path(), &["hooks", "master_work"], "true", "string|null").unwrap();
         let body = std::fs::read_to_string(tmp.path().join(".clank/config.json")).unwrap();
         let v: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert_eq!(
@@ -1084,7 +1111,7 @@ mod tests {
     fn hook_set_null_writes_json_null() {
         let tmp = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(tmp.path().join(".clank")).unwrap();
-        set_repo_key(tmp.path(), "hooks", "idle", "null", "string|null").unwrap();
+        set_repo_key(tmp.path(), &["hooks", "idle"], "null", "string|null").unwrap();
         let body = std::fs::read_to_string(tmp.path().join(".clank/config.json")).unwrap();
         let v: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert!(v["hooks"]["idle"].is_null());

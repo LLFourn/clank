@@ -82,6 +82,12 @@ pub enum ConfigKey {
     /// Shell command to run when an agent creates a block. string or null.
     #[command(name = "hooks.blocked", alias = "hooks_blocked")]
     HooksBlocked(ConfigKeyArgs),
+    /// Editor executable for `clank diff`. string or null.
+    #[command(name = "diff.editor.command", alias = "diff_editor_command")]
+    DiffEditorCommand(ConfigKeyArgs),
+    /// Default `--wait` behavior for `clank diff`. bool, default: false.
+    #[command(name = "diff.wait", alias = "diff_wait")]
+    DiffWait(ConfigKeyArgs),
 }
 
 #[derive(Args, Debug)]

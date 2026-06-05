@@ -90,7 +90,7 @@ pub async fn run(args: DiffArgs) -> anyhow::Result<()> {
         return Ok(());
     }
 
-    spawn(composed)
+    spawn(composed).await
 }
 
 /// Resolve which kind of diff this invocation targets per OQ1.
@@ -429,42 +429,25 @@ fn shell_quote(s: &str) -> String {
 }
 
 #[cfg(unix)]
-fn spawn(c: ComposedDiffLaunch) -> anyhow::Result<()> {
+async fn spawn(c: ComposedDiffLaunch) -> anyhow::Result<()> {
     use std::os::unix::process::CommandExt;
 
+    if c.wait {
+        // --wait: install a SIGINT handler that forwards to the
+        // child PID and continues waiting (per OQ6 of the plan
+        // body). Clank's default SIGINT behavior would terminate
+        // clank before the child exits; the explicit handler
+        // keeps clank alive until the editor cleans up.
+        return wait_with_sigint_forward(c).await;
+    }
+
+    // Fire-and-forget: detach stdio, spawn, drop. The child
+    // outlives clank.
     let mut cmd = Command::new(&c.program);
     cmd.args(&c.args);
     for (k, v) in &c.env_overrides {
         cmd.env(k, v);
     }
-
-    if c.wait {
-        // --wait: spawn + wait + propagate exit code. SIGINT
-        // handling per OQ6: rely on rustix default behavior
-        // (SIGINT received during wait is forwarded to the
-        // foreground process group, which includes the child).
-        // Editor handles its own cleanup.
-        let status = cmd
-            .status()
-            .map_err(|e| anyhow::anyhow!("failed to spawn `{}`: {e}", c.program))?;
-        if !status.success() {
-            // Match the editor's exit code as faithfully as
-            // possible. Signal exits map to 128+signal per shell
-            // convention.
-            let code = status
-                .code()
-                .or_else(|| {
-                    use std::os::unix::process::ExitStatusExt;
-                    status.signal().map(|s| 128 + s)
-                })
-                .unwrap_or(1);
-            std::process::exit(code);
-        }
-        return Ok(());
-    }
-
-    // Fire-and-forget: detach stdio, spawn, drop. The child
-    // outlives clank.
     cmd.stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
@@ -482,8 +465,59 @@ fn spawn(c: ComposedDiffLaunch) -> anyhow::Result<()> {
     Ok(())
 }
 
+#[cfg(unix)]
+async fn wait_with_sigint_forward(c: ComposedDiffLaunch) -> anyhow::Result<()> {
+    use tokio::process::Command as TokioCommand;
+    use tokio::signal::unix::{SignalKind, signal};
+
+    let mut cmd = TokioCommand::new(&c.program);
+    cmd.args(&c.args);
+    for (k, v) in &c.env_overrides {
+        cmd.env(k, v);
+    }
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| anyhow::anyhow!("failed to spawn `{}`: {e}", c.program))?;
+    let child_id = child.id();
+
+    let mut sigint = signal(SignalKind::interrupt())
+        .map_err(|e| anyhow::anyhow!("failed to install SIGINT handler: {e}"))?;
+
+    loop {
+        tokio::select! {
+            status = child.wait() => {
+                let status = status
+                    .map_err(|e| anyhow::anyhow!("waiting on `{}`: {e}", c.program))?;
+                if !status.success() {
+                    let code = status
+                        .code()
+                        .or_else(|| {
+                            use std::os::unix::process::ExitStatusExt;
+                            status.signal().map(|s| 128 + s)
+                        })
+                        .unwrap_or(1);
+                    std::process::exit(code);
+                }
+                return Ok(());
+            }
+            _ = sigint.recv() => {
+                // Forward SIGINT to the child; keep waiting.
+                // The editor decides cleanup. Per OQ6 of the
+                // plan body.
+                if let Some(pid) = child_id {
+                    unsafe { libc::kill(pid as i32, libc::SIGINT) };
+                }
+            }
+        }
+    }
+}
+
 #[cfg(not(unix))]
-fn spawn(c: ComposedDiffLaunch) -> anyhow::Result<()> {
+async fn spawn(c: ComposedDiffLaunch) -> anyhow::Result<()> {
+    // Non-unix fallback: no signal-forwarding semantics. Windows'
+    // SIGINT story is different (CTRL_C events vs unix signals);
+    // we get the default behavior for now and can revisit if a
+    // Windows user reports breakage.
     let mut cmd = Command::new(&c.program);
     cmd.args(&c.args);
     for (k, v) in &c.env_overrides {
