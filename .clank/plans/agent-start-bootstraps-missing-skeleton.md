@@ -60,12 +60,30 @@ In `cli::agent::start` (or `agent_start::run`):
 3. If no declaration entry exists → today's "no such agent"
    error (this is still a real error: label was never
    registered).
-4. If declaration entry exists AND skeleton exists → today's
-   resume behavior (load skeleton, get session, compose
-   launch).
-5. **NEW**: declaration entry exists BUT skeleton doesn't:
-   bootstrap path. Compose a launch with:
-   - Tool: from declaration's `tool` field (claude / codex).
+4. If declaration entry exists AND skeleton exists AND
+   `skeleton.session.is_some()` → today's resume behavior
+   (compose launch with `--resume <session-id>`).
+5. **NEW (BOOTSTRAP)**: declaration entry exists but EITHER
+   (a) skeleton is missing OR (b) skeleton exists with
+   `session: None`. Both are "agent registered, never bound
+   in this repo." Both lead to the bootstrap path. Codex
+   eef6853 catch: `clank init` already seeds default_agents
+   as session-less skeletons (`init.rs:47-61`, `:94-98`), so
+   case (b) is the freshly-init'd-repo path and (a) is the
+   declared-globally-but-never-init'd path. Existing test
+   `agent_start_no_bound_session_errors_with_clank_as_hint`
+   at `agent_start_integration.rs:311-345` needs to flip
+   from asserting-error to asserting-bootstrap-prompt.
+
+   Bootstrap launch composition:
+   - **Tool resolution** (PINNED per codex eef6853):
+     priority order — declaration's `launch.command` (if set,
+     used verbatim); else declaration's `tool` field (claude
+     / codex); else **ERROR** with: `agent <label> has no
+     bootstrap tool: set the declaration's tool field via
+     \`clank agent add <label> --tool <claude|codex>\``.
+     Don't fall back to label-as-tool-name — that masks
+     misconfiguration.
    - Args: declaration's `launch.args` (if any) + a final
      positional bootstrap prompt (PINNED verbatim):
      ``"Run `clank as <label>` to bind this session."``
@@ -102,24 +120,48 @@ session-restore suffix.
 
 ## Tests
 
-- Unit test for `compose_bootstrap_launch`: declaration with
+Unit tests on `compose_bootstrap_launch`:
+
+- `bootstrap_uses_tool_from_declaration`: declaration with
   tool=claude + launch.args=["--skill", "ruthless"]; assert
   argv is `["claude", "--skill", "ruthless", "<bootstrap-prompt>"]`
   (no --resume, prompt as final positional).
-- Integration test in
-  `crates/cli/tests/agent_start_integration.rs`:
-  - Set up declaration with a registered reviewer label
-    `phantom` (via typed `RepoConfigFile`).
-  - Do NOT create a skeleton at
-    `<repo>/.clank/agents/phantom/config.json`.
-  - Spawn `clank agent start phantom --print`.
-  - Assert stdout argv ends with the bootstrap prompt
-    (e.g. `'claude' '<bootstrap-prompt>'`), not the
-    "no such agent" error.
-- Negative test: agent NOT in declaration → today's "no
-  such agent" error still fires (the existing test
-  `agent_start_no_skeleton_errors` or equivalent should
-  pass unchanged).
+- `bootstrap_prefers_launch_command_over_tool`: declaration
+  with launch.command="my-claude-wrapper" + tool=claude;
+  assert argv[0] is "my-claude-wrapper", not "claude".
+- `bootstrap_errors_when_no_tool_or_command`: declaration
+  with tool=None and launch.command=None; assert the error
+  message names the agent label AND mentions
+  `--tool <claude|codex>` so the user knows the fix.
+
+Integration tests in `crates/cli/tests/agent_start_integration.rs`:
+
+- `agent_start_bootstraps_when_skeleton_missing`:
+  declaration registers `phantom` (via typed `RepoConfigFile`);
+  no skeleton at `<repo>/.clank/agents/phantom/config.json`;
+  spawn `clank agent start phantom --print`; assert stdout
+  argv ends with `<bootstrap-prompt>` and exit 0.
+- `agent_start_bootstraps_when_skeleton_exists_but_session_none`
+  (codex eef6853 catch — the fresh-init case): declaration
+  registers `phantom`; skeleton EXISTS with `session: None`;
+  spawn `clank agent start phantom --print`; assert same
+  bootstrap argv shape AND exit 0. This is the path that
+  `clank init` produces, so this test mirrors the user-
+  visible fresh-init flow.
+- **UPDATE existing test**
+  `agent_start_no_bound_session_errors_with_clank_as_hint`
+  at `agent_start_integration.rs:311-345`: today asserts
+  ERROR + "clank as" hint. After this plan, the same setup
+  (skeleton with `session: None`) bootstraps instead.
+  Rename to `agent_start_session_none_bootstraps_via_seed_prompt`
+  and assert success + bootstrap prompt in argv.
+
+Negative tests (existing behavior preserved):
+
+- Agent NOT in declaration → today's "no such agent" error
+  still fires.
+- Declaration entry's launch has no command AND tool=None →
+  bootstrap errors with the named-agent + tool-fix hint.
 
 ## Out of scope
 
