@@ -33,6 +33,26 @@ fn write(repo: &Path, rel: &str, body: &str) {
     std::fs::write(abs, body).unwrap();
 }
 
+/// Write the repo-scope `agents` declaration via the typed
+/// struct so schema changes type-check.
+fn write_repo_agents(repo: &Path, agents: &[clank::cli::config::DefaultAgent]) {
+    let file = clank::cli::config::RepoAgentsFile {
+        agents: agents.to_vec(),
+    };
+    let json = serde_json::to_string_pretty(&file).unwrap();
+    std::fs::create_dir_all(repo.join(".clank")).unwrap();
+    std::fs::write(repo.join(".clank/config.json"), json).unwrap();
+}
+
+fn agent_decl(label: &str, role: clank_core::vocab::Role) -> clank::cli::config::DefaultAgent {
+    clank::cli::config::DefaultAgent {
+        label: clank_core::ids::AgentLabel::parse(label).unwrap(),
+        role,
+        tool: None,
+        launch: None,
+    }
+}
+
 fn run_list(repo: &Path, json: bool) -> std::process::Output {
     let mut cmd = Command::new(clank_bin());
     cmd.arg("agent").arg("list").arg("--repo").arg(repo);
@@ -62,24 +82,29 @@ fn agent_list_empty_repo_succeeds() {
 fn agent_list_shows_bound_and_unbound() {
     let dir = init_repo();
     let repo = dir.path();
-    // Bound master.
+    // Declaration is the source of truth post
+    // agent-add-cli-and-repo-scope; skeletons hold session state.
+    write_repo_agents(
+        repo,
+        &[
+            agent_decl("claude", clank_core::vocab::Role::Master),
+            agent_decl("codex", clank_core::vocab::Role::Reviewers),
+            agent_decl("ruthless", clank_core::vocab::Role::Reviewers),
+        ],
+    );
+    // Bound master (session state in skeleton).
     write(
         repo,
         ".clank/agents/claude/config.json",
-        r#"{"auto_mode":"off","role":"master","session":{"id":"11111111-1111-1111-1111-111111111111","tool":"claude","updated_at":"2026-06-04T12:00:00Z"}}"#,
+        r#"{"auto_mode":"off","session":{"id":"11111111-1111-1111-1111-111111111111","tool":"claude","updated_at":"2026-06-04T12:00:00Z"}}"#,
     );
     // Bound reviewer.
     write(
         repo,
         ".clank/agents/codex/config.json",
-        r#"{"auto_mode":"on","role":"reviewers","session":{"id":"22222222-2222-2222-2222-222222222222","tool":"codex","updated_at":"2026-06-04T12:00:00Z"}}"#,
+        r#"{"auto_mode":"on","session":{"id":"22222222-2222-2222-2222-222222222222","tool":"codex","updated_at":"2026-06-04T12:00:00Z"}}"#,
     );
-    // Unbound seeded reviewer.
-    write(
-        repo,
-        ".clank/agents/ruthless/config.json",
-        r#"{"auto_mode":"off","role":"reviewers"}"#,
-    );
+    // Unbound seeded reviewer (no skeleton — appears unbound).
 
     let out = run_list(repo, false);
     assert!(out.status.success(), "agent list failed");
@@ -112,15 +137,17 @@ fn agent_list_shows_bound_and_unbound() {
 fn agent_list_json_schema() {
     let dir = init_repo();
     let repo = dir.path();
-    write(
+    write_repo_agents(
         repo,
-        ".clank/agents/claude/config.json",
-        r#"{"auto_mode":"off","role":"master","session":{"id":"11111111-1111-1111-1111-111111111111","tool":"claude","updated_at":"2026-06-04T12:00:00Z"}}"#,
+        &[
+            agent_decl("claude", clank_core::vocab::Role::Master),
+            agent_decl("ruthless", clank_core::vocab::Role::Reviewers),
+        ],
     );
     write(
         repo,
-        ".clank/agents/ruthless/config.json",
-        r#"{"auto_mode":"off","role":"reviewers"}"#,
+        ".clank/agents/claude/config.json",
+        r#"{"auto_mode":"off","session":{"id":"11111111-1111-1111-1111-111111111111","tool":"claude","updated_at":"2026-06-04T12:00:00Z"}}"#,
     );
 
     let out = run_list(repo, true);
@@ -145,15 +172,80 @@ fn agent_list_json_schema() {
 }
 
 #[test]
-fn agent_list_fails_on_malformed_agent_config() {
+fn agent_list_omits_orphan_skeleton() {
+    // Codex review of eef4c49: list reads the declaration, NOT
+    // the skeleton dirs. A skeleton without a declaration entry
+    // is an orphan (doctor surfaces it separately); it must not
+    // appear in `clank agent list`.
     let dir = init_repo();
     let repo = dir.path();
-    write(repo, ".clank/agents/broken/config.json", "{ not json");
+    // Declaration registers only alice.
+    write_repo_agents(
+        repo,
+        &[agent_decl("alice", clank_core::vocab::Role::Reviewers)],
+    );
+    // Orphan skeleton for `removed` — present on disk but not in
+    // declaration.
+    write(
+        repo,
+        ".clank/agents/removed/config.json",
+        r#"{"auto_mode":"off","session":{"id":"33333333-3333-3333-3333-333333333333","tool":"claude","updated_at":"2026-06-04T12:00:00Z"}}"#,
+    );
+
+    let out = run_list(repo, true);
+    assert!(out.status.success(), "agent list failed");
+    let parsed: serde_json::Value =
+        serde_json::from_str(&String::from_utf8_lossy(&out.stdout)).unwrap();
+    let arr = parsed.as_array().unwrap();
+    let labels: Vec<&str> = arr.iter().map(|r| r["label"].as_str().unwrap()).collect();
+    assert_eq!(
+        labels,
+        vec!["alice"],
+        "orphan must not appear; got {labels:?}"
+    );
+}
+
+#[test]
+fn agent_list_shows_declared_agents_even_without_skeleton() {
+    // Codex review of eef4c49: declared agents without skeletons
+    // appear as unbound. The OLD skeleton-scanning implementation
+    // dropped them entirely.
+    let dir = init_repo();
+    let repo = dir.path();
+    write_repo_agents(
+        repo,
+        &[agent_decl(
+            "declared-only",
+            clank_core::vocab::Role::Reviewers,
+        )],
+    );
+    // No skeleton for `declared-only`.
+
+    let out = run_list(repo, true);
+    assert!(out.status.success());
+    let parsed: serde_json::Value =
+        serde_json::from_str(&String::from_utf8_lossy(&out.stdout)).unwrap();
+    let arr = parsed.as_array().unwrap();
+    assert_eq!(arr.len(), 1);
+    assert_eq!(arr[0]["label"], "declared-only");
+    assert_eq!(arr[0]["bound"], false);
+}
+
+#[test]
+fn agent_list_fails_on_malformed_agent_config() {
+    // After agent-add-cli-and-repo-scope, `clank agent list` reads
+    // the merged declaration. A malformed `.clank/config.json`
+    // (the declaration file) must fail closed — silently dropping
+    // would hide misconfigured agents from the user's "what's
+    // registered" view.
+    let dir = init_repo();
+    let repo = dir.path();
+    write(repo, ".clank/config.json", "{ not json");
 
     let out = run_list(repo, false);
     assert!(
         !out.status.success(),
-        "agent list must fail on malformed config; stdout=`{}` stderr=`{}`",
+        "agent list must fail on malformed declaration; stdout=`{}` stderr=`{}`",
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr)
     );

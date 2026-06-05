@@ -1,21 +1,24 @@
 //! `clank agent list` — enumerate registered agents in this repo
 //! with role and bind state. Read-only; never mutates state.
 //!
-//! Reads from `.clank/agents/<label>/config.json` (the existing
-//! source of truth used by the all-reviewers gate). Uses strict
-//! loading so a malformed agent config surfaces as an error rather
-//! than being silently dropped — same policy as the gate-input
-//! path, since `clank agent list` is the user's window onto the
-//! gate's reviewer set.
+//! Source of truth: the **merged agent declaration** (repo-scope
+//! `<repo>/.clank/config.json#/agents` if present, else user-scope
+//! `~/.clank/config.json#/default_agents`). Per
+//! `agent-add-cli-and-repo-scope`, the declaration drives role +
+//! tool + launch; per-agent skeleton supplies session binding
+//! state. List joins both. Declared agents without skeletons
+//! render as unbound; orphan skeletons (skeleton without
+//! declaration) are NOT listed — `clank doctor` surfaces them
+//! separately.
 
 use std::path::Path;
 
 use serde::Serialize;
 
-use crate::agent_store::{load_agent_config, load_all_agent_configs};
-use clank_core::agent_config::{AgentConfig, LaunchConfig, Session};
+use crate::agent_store::load_agent_config;
+use clank_core::agent_config::{LaunchConfig, Session};
 use clank_core::ids::AgentLabel;
-use clank_core::vocab::Tool;
+use clank_core::vocab::{Role, Tool};
 
 use super::{AgentArgs, AgentCmd, AgentListArgs, AgentStartArgs, resolve_repo};
 
@@ -36,20 +39,27 @@ struct AgentRow {
 }
 
 impl AgentRow {
-    fn from_config(label: &AgentLabel, cfg: &AgentConfig) -> Self {
-        let (bound, tool, session_id) = match &cfg.session {
+    fn from_join(
+        label: &AgentLabel,
+        role: Role,
+        declared_tool: Option<Tool>,
+        session: Option<&Session>,
+    ) -> Self {
+        let (bound, tool_str, session_id) = match session {
+            // Session.tool wins for the displayed tool when bound —
+            // it's the tool actually running the agent.
             Some(s) => (
                 true,
                 Some(s.tool.as_str().to_string()),
                 Some(s.id.as_str().to_string()),
             ),
-            None => (false, None, None),
+            None => (false, declared_tool.map(|t| t.as_str().to_string()), None),
         };
         Self {
             label: label.as_str().to_string(),
-            role: cfg.role.as_str().to_string(),
+            role: role.as_str().to_string(),
             bound,
-            tool,
+            tool: tool_str,
             session_id,
         }
     }
@@ -57,11 +67,21 @@ impl AgentRow {
 
 fn list(args: AgentListArgs) -> anyhow::Result<()> {
     let repo = resolve_repo(args.repo.as_deref())?;
-    let raw = load_all_agent_configs(&repo)?;
-    let mut rows: Vec<AgentRow> = raw
-        .iter()
-        .map(|(label, cfg)| AgentRow::from_config(label, cfg))
-        .collect();
+    let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+    // Declaration is the source of truth for which agents are
+    // registered; skeleton supplies session state (codex review of
+    // eef4c49 — was scanning skeleton dirs).
+    let declared = crate::cli::config::load_merged_agents(&repo, home.as_deref())?;
+    let mut rows: Vec<AgentRow> = Vec::with_capacity(declared.len());
+    for entry in &declared {
+        let skeleton = load_agent_config(&repo, &entry.label)?;
+        rows.push(AgentRow::from_join(
+            &entry.label,
+            entry.role,
+            entry.tool,
+            skeleton.as_ref().and_then(|c| c.session.as_ref()),
+        ));
+    }
     // Stable ordering: master first, then alphabetic by label.
     rows.sort_by(|a, b| {
         let role_key = |r: &str| match r {
@@ -152,7 +172,11 @@ fn start(args: AgentStartArgs) -> anyhow::Result<()> {
     })?;
 
     let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
-    let merged = crate::cli::config::load_merged_agents(&repo, home.as_deref()).unwrap_or_default();
+    // Propagate parse errors — silently falling back to an empty
+    // declaration would drop the configured launch profile + leave
+    // the user puzzled why `--skill X` wasn't applied. Codex caught
+    // the unwrap_or_default on eef4c49.
+    let merged = crate::cli::config::load_merged_agents(&repo, home.as_deref())?;
     let declaration_launch = merged
         .iter()
         .find(|e| e.label == label)
@@ -281,41 +305,46 @@ fn exec_composed(c: ComposedLaunch) -> anyhow::Result<()> {
 mod tests {
     use super::*;
 
-    use clank_core::vocab::Role;
-
     fn label(s: &str) -> AgentLabel {
         AgentLabel::parse(s).unwrap()
     }
 
-    fn cfg(role: Role, bound: bool) -> AgentConfig {
-        let mut c = AgentConfig::default();
-        c.role = role;
-        if bound {
-            c.session = Some(clank_core::agent_config::Session {
-                id: clank_core::ids::SessionId::parse("11111111-1111-1111-1111-111111111111")
-                    .unwrap(),
-                tool: clank_core::vocab::Tool::Claude,
-                updated_at: "2026-06-04T12:00:00Z".to_string(),
-            });
+    fn make_session() -> Session {
+        Session {
+            id: clank_core::ids::SessionId::parse("11111111-1111-1111-1111-111111111111").unwrap(),
+            tool: Tool::Claude,
+            updated_at: "2026-06-04T12:00:00Z".to_string(),
         }
-        c
     }
 
     #[test]
-    fn agent_row_from_config_bound() {
-        let row = AgentRow::from_config(&label("alice"), &cfg(Role::Reviewers, true));
+    fn agent_row_bound_uses_session_tool() {
+        let session = make_session();
+        let row = AgentRow::from_join(
+            &label("alice"),
+            Role::Reviewers,
+            Some(Tool::Codex), // declared tool (overridden by session)
+            Some(&session),
+        );
         assert_eq!(row.label, "alice");
         assert_eq!(row.role, "reviewers");
         assert!(row.bound);
-        assert_eq!(row.tool.as_deref(), Some("claude"));
+        assert_eq!(row.tool.as_deref(), Some("claude")); // from session
         assert!(row.session_id.is_some());
     }
 
     #[test]
-    fn agent_row_from_config_unbound() {
-        let row = AgentRow::from_config(&label("alice"), &cfg(Role::Reviewers, false));
+    fn agent_row_unbound_uses_declared_tool() {
+        let row = AgentRow::from_join(&label("alice"), Role::Reviewers, Some(Tool::Claude), None);
+        assert!(!row.bound);
+        assert_eq!(row.tool.as_deref(), Some("claude"));
+        assert!(row.session_id.is_none());
+    }
+
+    #[test]
+    fn agent_row_unbound_no_declared_tool_shows_none() {
+        let row = AgentRow::from_join(&label("alice"), Role::Reviewers, None, None);
         assert!(!row.bound);
         assert!(row.tool.is_none());
-        assert!(row.session_id.is_none());
     }
 }

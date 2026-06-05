@@ -143,6 +143,50 @@ fn init_seeds_default_agents_from_user_config() {
 }
 
 #[test]
+fn init_with_repo_scope_agents_seeds_override_set() {
+    // Codex review of eef4c49: `clank init` must consume the
+    // MERGED declaration (repo-scope `agents` if present, else
+    // user-scope `default_agents`). Pre-fix it seeded only from
+    // user-scope, so a repo with its own `agents` field still got
+    // user-scope skeletons.
+    let dir = init_repo();
+    let repo = dir.path();
+    // User-scope says [codex, ruthless].
+    write_user_config(
+        repo,
+        r#"{ "default_agents": [
+            { "label": "codex" },
+            { "label": "ruthless" }
+        ] }"#,
+    );
+    // Repo-scope overrides with just [overlord].
+    std::fs::create_dir_all(repo.join(".clank")).unwrap();
+    std::fs::write(
+        repo.join(".clank/config.json"),
+        r#"{"agents":[{"label":"overlord","role":"reviewers"}]}"#,
+    )
+    .unwrap();
+
+    let out = run_init(repo, &[("CLAUDE_CODE_SESSION_ID", CLAUDE_SESSION)]);
+    assert!(out.status.success(), "init failed");
+
+    // Only overlord's skeleton should exist; the user-scope
+    // codex/ruthless must NOT be seeded.
+    assert!(
+        repo.join(".clank/agents/overlord/config.json").exists(),
+        "repo-scope agent must be seeded"
+    );
+    assert!(
+        !repo.join(".clank/agents/codex/config.json").exists(),
+        "user-scope agent must NOT be seeded when repo-scope is present"
+    );
+    assert!(
+        !repo.join(".clank/agents/ruthless/config.json").exists(),
+        "user-scope agent must NOT be seeded when repo-scope is present"
+    );
+}
+
+#[test]
 fn init_default_agents_idempotent_preserves_existing_session() {
     // Existing per-agent config (with a session field) must not be
     // overwritten by clank init.

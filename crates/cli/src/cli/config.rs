@@ -175,24 +175,37 @@ pub fn load_default_agents(home: Option<&Path>) -> anyhow::Result<Vec<DefaultAge
     Ok(parsed.default_agents)
 }
 
-/// Strict loader for the repo-scope `agents` list at
-/// `<repo>/.clank/config.json`. Same failure-policy semantics as
-/// [`load_default_agents`] (missing = empty; malformed = error)
-/// for the same reason: silently dropping a multi-reviewer set
-/// would convert the repo to auto-finalize.
-pub fn load_repo_agents(repo_root: &Path) -> anyhow::Result<Vec<DefaultAgent>> {
+/// Presence-aware loader for the repo-scope `agents` list at
+/// `<repo>/.clank/config.json`. Returns:
+/// - `Ok(None)` — config file absent OR present without an `agents`
+///   key. Caller should fall back to user-scope.
+/// - `Ok(Some(vec))` — `agents` key present (even if empty `[]`).
+///   Caller treats this as the authoritative set; `Some(vec![])`
+///   explicitly overrides user-scope with the empty set (codex
+///   caught the conflation on eef4c49).
+///
+/// Same failure-policy as [`load_default_agents`]: malformed JSON
+/// errors; missing file is the empty case.
+pub fn load_repo_agents(repo_root: &Path) -> anyhow::Result<Option<Vec<DefaultAgent>>> {
     let path = repo_root.join(".clank/config.json");
     let body = match std::fs::read_to_string(&path) {
         Ok(b) => b,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(e) => {
             return Err(anyhow::anyhow!(e))
                 .with_context(|| format!("reading repo config {}", path.display()));
         }
     };
-    let parsed: RepoAgentsFile = serde_json::from_str(&body)
+    // Use Value to detect key presence — the typed-struct path
+    // can't distinguish "absent" from "explicit empty list."
+    let value: serde_json::Value = serde_json::from_str(&body)
         .with_context(|| format!("parsing repo config {}", path.display()))?;
-    Ok(parsed.agents)
+    let Some(agents_value) = value.get("agents") else {
+        return Ok(None);
+    };
+    let agents: Vec<DefaultAgent> = serde_json::from_value(agents_value.clone())
+        .with_context(|| format!("parsing `agents` in {}", path.display()))?;
+    Ok(Some(agents))
 }
 
 /// Merged agent declaration: repo-scope `agents` if present (REPLACE
@@ -200,15 +213,18 @@ pub fn load_repo_agents(repo_root: &Path) -> anyhow::Result<Vec<DefaultAgent>> {
 /// to user-scope `default_agents`. This is the source of truth for
 /// "which agents exist + their role + tool + launch profile" per
 /// `agent-add-cli-and-repo-scope`.
+///
+/// An EXPLICIT empty `agents: []` at repo-scope returns the empty
+/// set (disables user-scope defaults for this repo). Only an
+/// absent repo-scope (no `agents` key) falls back to user-scope.
 pub fn load_merged_agents(
     repo_root: &Path,
     home: Option<&Path>,
 ) -> anyhow::Result<Vec<DefaultAgent>> {
-    let repo = load_repo_agents(repo_root)?;
-    if !repo.is_empty() {
-        return Ok(repo);
+    match load_repo_agents(repo_root)? {
+        Some(repo) => Ok(repo),
+        None => load_default_agents(home),
     }
-    load_default_agents(home)
 }
 
 pub fn load(repo_root: &Path) -> Config {
@@ -851,6 +867,95 @@ mod tests {
         let result = tokio::runtime::Runtime::new().unwrap().block_on(run(args));
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("unknown action"));
+    }
+
+    #[test]
+    fn load_repo_agents_distinguishes_absent_from_explicit_empty() {
+        // Codex review of eef4c49: REPLACE semantics require
+        // `agents: []` to disable user-scope defaults, distinct
+        // from `agents` key absent (which falls back to user-scope).
+        let tmp = tempfile::tempdir().unwrap();
+        // Absent: no agents key at all.
+        write(
+            &tmp.path().join(".clank/config.json"),
+            r#"{"review": {"adhoc_feedback": true}}"#,
+        );
+        let absent = load_repo_agents(tmp.path()).unwrap();
+        assert!(absent.is_none(), "no agents key → None; got {absent:?}");
+
+        // Explicit empty: agents key present, list empty.
+        write(&tmp.path().join(".clank/config.json"), r#"{"agents": []}"#);
+        let empty = load_repo_agents(tmp.path()).unwrap();
+        assert_eq!(
+            empty,
+            Some(Vec::new()),
+            "explicit `agents: []` → Some(vec![])"
+        );
+    }
+
+    #[test]
+    fn load_merged_agents_explicit_empty_repo_overrides_user_scope() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        // User-scope has reviewers.
+        write(
+            &home.path().join(".clank/config.json"),
+            r#"{"default_agents":[{"label":"alice","role":"reviewers"}]}"#,
+        );
+        // Repo-scope explicitly empty: user-scope MUST NOT leak through.
+        write(&tmp.path().join(".clank/config.json"), r#"{"agents": []}"#);
+        let merged = load_merged_agents(tmp.path(), Some(home.path())).unwrap();
+        assert!(
+            merged.is_empty(),
+            "explicit empty repo-scope must override user-scope; got {merged:?}"
+        );
+    }
+
+    #[test]
+    fn load_merged_agents_absent_repo_falls_back_to_user_scope() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        write(
+            &home.path().join(".clank/config.json"),
+            r#"{"default_agents":[{"label":"alice","role":"reviewers"}]}"#,
+        );
+        // No repo-scope config at all.
+        let merged = load_merged_agents(tmp.path(), Some(home.path())).unwrap();
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].label.as_str(), "alice");
+    }
+
+    #[test]
+    fn load_merged_agents_repo_replaces_user_scope() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        write(
+            &home.path().join(".clank/config.json"),
+            r#"{"default_agents":[{"label":"alice","role":"reviewers"}]}"#,
+        );
+        write(
+            &tmp.path().join(".clank/config.json"),
+            r#"{"agents":[{"label":"bob","role":"master"}]}"#,
+        );
+        let merged = load_merged_agents(tmp.path(), Some(home.path())).unwrap();
+        assert_eq!(merged.len(), 1);
+        assert_eq!(
+            merged[0].label.as_str(),
+            "bob",
+            "repo-scope replaces user-scope"
+        );
+    }
+
+    #[test]
+    fn load_repo_agents_malformed_json_errors() {
+        let tmp = tempfile::tempdir().unwrap();
+        write(&tmp.path().join(".clank/config.json"), "{ not json");
+        let err = load_repo_agents(tmp.path()).expect_err("must fail closed");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("parsing") || msg.contains("repo config"),
+            "diagnostic should mention parse failure; got: {msg}"
+        );
     }
 
     #[test]

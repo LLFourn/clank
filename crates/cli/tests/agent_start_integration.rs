@@ -328,3 +328,41 @@ fn agent_start_no_session_errors_even_when_launch_command_set() {
         String::from_utf8_lossy(&out.stderr)
     );
 }
+
+#[test]
+fn agent_start_propagates_malformed_declaration_error() {
+    // Codex review of eef4c49: agent start was swallowing
+    // load_merged_agents errors with unwrap_or_default. Violates
+    // the strict-fail policy + silently drops the configured
+    // launch profile.
+    let dir = init_repo();
+    let repo = dir.path();
+    // Valid skeleton with bound session — start would succeed if
+    // we ignored the declaration error.
+    write(
+        repo,
+        ".clank/agents/codex/config.json",
+        &format!(
+            r#"{{
+                "auto_mode":"off",
+                "session":{{"id":"{CODEX_SESSION}","tool":"codex","updated_at":"2026-06-04T12:00:00Z"}}
+            }}"#
+        ),
+    );
+    // Malformed repo-scope declaration.
+    write(repo, ".clank/config.json", "{ not json");
+
+    let out = run_start(repo, &["codex", "--print"]);
+    assert!(
+        !out.status.success(),
+        "agent start must fail closed when declaration is malformed; \
+         stdout=`{}` stderr=`{}`",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("parsing") || stderr.contains("config") || stderr.contains("json"),
+        "stderr should explain the parse failure; got: {stderr}"
+    );
+}
