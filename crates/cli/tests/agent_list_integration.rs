@@ -82,6 +82,13 @@ fn agent_decl(label: &str, role: clank_core::vocab::Role) -> clank::cli::config:
 fn run_list(repo: &Path, json: bool) -> std::process::Output {
     let mut cmd = Command::new(clank_bin());
     cmd.arg("agent").arg("list").arg("--repo").arg(repo);
+    // Isolate HOME to the temp repo so the developer's
+    // user-scope `~/.clank/config.json#default_agents` doesn't
+    // leak into the test. Ruthless caught the gap on 841cdf2:
+    // `agent_list_empty_repo_succeeds` failed on a dev machine
+    // with global default_agents configured because the test
+    // saw them via the merged declaration.
+    cmd.env("HOME", repo);
     if json {
         cmd.arg("--json");
     }
