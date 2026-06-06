@@ -26,8 +26,10 @@ use crate::vocab::{Role, WaitingReason};
 pub enum MasterNext {
     /// REQUEST_CHANGES on the latest reviewable. Address + recommit.
     Revise,
-    /// Approved gate but the plan file has uncommitted edits. Commit
-    /// the next revision (or stash).
+    /// Plan file has uncommitted edits. Commit before any further
+    /// work or review motion can land — uncommitted plan changes
+    /// supersede whatever the last committed version's gate state
+    /// says.
     Commit,
     /// APPROVED (not FINISHED) on the latest reviewable. Master
     /// keeps working — more impl, more docs, more tests, or
@@ -316,75 +318,86 @@ impl RepoState {
                     .collect();
 
                 let worktree = reviews.worktree_status(key);
-                let waiting_on = match gate {
-                    CommitGateState::Blocked => {
-                        // Unreachable: the block-precedence check above
-                        // already consumed any blocked plan via the
-                        // continue. compute_gate cannot return Blocked
-                        // (it's a per-commit review verdict; Blocked is
-                        // a plan-level state). This arm exists only to
-                        // satisfy match exhaustiveness.
-                        unreachable!(
-                            "compute_gate cannot return Blocked; plan-level Blocked is handled above"
-                        );
-                    }
-                    CommitGateState::ChangesRequested => {
-                        let requesters = filtered_entries
-                            .iter()
-                            .filter(|r| r.verdict == crate::vocab::Verdict::RequestChanges)
-                            .map(|r| r.author.clone())
-                            .collect();
-                        let ambiguous = filtered_entries
-                            .iter()
-                            .filter(|r| r.verdict == crate::vocab::Verdict::Unmarked)
-                            .map(|r| r.author.clone())
-                            .collect();
-                        WaitingOn::MasterToRevise {
-                            requesters,
-                            ambiguous,
+                // Worktree-first dispatch: an uncommitted plan edit
+                // is author intent that supersedes the gate's view of
+                // the last committed version. Routing the master to
+                // anything other than Commit is asking them to make
+                // decisions on a version they're already replacing,
+                // AND wakes reviewers to a doc that's about to change.
+                //
+                // Block precedence still wins (handled by the
+                // `continue` above), so this only runs for unblocked
+                // plans.
+                //
+                // Plan: wfw-master-returns-on-dirty-plan-any-gate.
+                let waiting_on = if worktree == PlanWorktreeStatus::BodyDirty {
+                    WaitingOn::MasterToCommit
+                } else {
+                    match gate {
+                        CommitGateState::Blocked => {
+                            // Unreachable: the block-precedence check above
+                            // already consumed any blocked plan via the
+                            // continue. compute_gate cannot return Blocked
+                            // (it's a per-commit review verdict; Blocked is
+                            // a plan-level state). This arm exists only to
+                            // satisfy match exhaustiveness.
+                            unreachable!(
+                                "compute_gate cannot return Blocked; plan-level Blocked is handled above"
+                            );
                         }
-                    }
-                    CommitGateState::Finished => match worktree {
-                        PlanWorktreeStatus::BodyDirty => WaitingOn::MasterToCommit,
-                        _ => WaitingOn::MasterToFinalize,
-                    },
-                    CommitGateState::Approved => match worktree {
-                        PlanWorktreeStatus::BodyDirty => WaitingOn::MasterToCommit,
-                        _ => WaitingOn::MasterToContinue,
-                    },
-                    CommitGateState::Unreviewed => {
-                        // Compute the set of expected reviewers that
-                        // haven't posted Approve or Finished. Stale
-                        // RequestChanges from removed authors don't
-                        // count because the filter dropped them.
-                        let approved_by: std::collections::HashSet<&AgentLabel> = filtered_entries
-                            .iter()
-                            .filter(|r| {
-                                matches!(
-                                    r.verdict,
-                                    crate::vocab::Verdict::Approve
-                                        | crate::vocab::Verdict::Finished
-                                )
-                            })
-                            .map(|r| &r.author)
-                            .collect();
-                        let missing: Vec<AgentLabel> = policy
-                            .expected_reviewers
-                            .iter()
-                            .filter(|label| !approved_by.contains(label))
-                            .cloned()
-                            .collect();
-                        // `missing` is non-empty here: the
-                        // Unreviewed gate state is reached only when
-                        // `compute_gate` finds at least one expected
-                        // reviewer with no Approve/Finished entry.
-                        // `expected_reviewers` is non-empty in this
-                        // branch (zero-reviewer maps to Approved
-                        // earlier), so the filter result is non-empty.
-                        let missing = crate::repo_state::NonEmptyVec::new(missing).expect(
-                            "Unreviewed gate state implies a non-empty missing reviewer set",
-                        );
-                        WaitingOn::ReviewerApprovalsMissing { missing }
+                        CommitGateState::ChangesRequested => {
+                            let requesters = filtered_entries
+                                .iter()
+                                .filter(|r| r.verdict == crate::vocab::Verdict::RequestChanges)
+                                .map(|r| r.author.clone())
+                                .collect();
+                            let ambiguous = filtered_entries
+                                .iter()
+                                .filter(|r| r.verdict == crate::vocab::Verdict::Unmarked)
+                                .map(|r| r.author.clone())
+                                .collect();
+                            WaitingOn::MasterToRevise {
+                                requesters,
+                                ambiguous,
+                            }
+                        }
+                        CommitGateState::Finished => WaitingOn::MasterToFinalize,
+                        CommitGateState::Approved => WaitingOn::MasterToContinue,
+                        CommitGateState::Unreviewed => {
+                            // Compute the set of expected reviewers that
+                            // haven't posted Approve or Finished. Stale
+                            // RequestChanges from removed authors don't
+                            // count because the filter dropped them.
+                            let approved_by: std::collections::HashSet<&AgentLabel> =
+                                filtered_entries
+                                    .iter()
+                                    .filter(|r| {
+                                        matches!(
+                                            r.verdict,
+                                            crate::vocab::Verdict::Approve
+                                                | crate::vocab::Verdict::Finished
+                                        )
+                                    })
+                                    .map(|r| &r.author)
+                                    .collect();
+                            let missing: Vec<AgentLabel> = policy
+                                .expected_reviewers
+                                .iter()
+                                .filter(|label| !approved_by.contains(label))
+                                .cloned()
+                                .collect();
+                            // `missing` is non-empty here: the
+                            // Unreviewed gate state is reached only when
+                            // `compute_gate` finds at least one expected
+                            // reviewer with no Approve/Finished entry.
+                            // `expected_reviewers` is non-empty in this
+                            // branch (zero-reviewer maps to Approved
+                            // earlier), so the filter result is non-empty.
+                            let missing = crate::repo_state::NonEmptyVec::new(missing).expect(
+                                "Unreviewed gate state implies a non-empty missing reviewer set",
+                            );
+                            WaitingOn::ReviewerApprovalsMissing { missing }
+                        }
                     }
                 };
 
@@ -1145,6 +1158,196 @@ mod tests {
         assert!(
             work.is_empty(),
             "approve on latest should produce no master work; got {work:?}"
+        );
+    }
+
+    // ====== wfw-master-returns-on-dirty-plan-any-gate ======
+    // Plan: dirty plan file pre-empts all gate-driven decisions
+    // for the master, regardless of gate state.
+
+    /// `PlanStateLookup` mock that combines reviews + a fixed
+    /// `BodyDirty` worktree status for ALL plans. The reviews mock
+    /// is empty by default but can be populated via `with_reviews`.
+    struct MockDirty {
+        reviews: Vec<(CommitSha, Vec<ReviewEntry>)>,
+        blocks: std::collections::BTreeMap<PlanKey, Vec<PlanBlock>>,
+    }
+
+    impl MockDirty {
+        fn new() -> Self {
+            Self {
+                reviews: Vec::new(),
+                blocks: std::collections::BTreeMap::new(),
+            }
+        }
+        fn with_reviews(mut self, reviews: Vec<(CommitSha, Vec<ReviewEntry>)>) -> Self {
+            self.reviews = reviews;
+            self
+        }
+        fn with_block(mut self, plan_key: PlanKey, blocks: Vec<PlanBlock>) -> Self {
+            self.blocks.insert(plan_key, blocks);
+            self
+        }
+    }
+
+    impl PlanStateLookup for MockDirty {
+        fn reviews_for(&self, sha: &CommitSha) -> Vec<ReviewEntry> {
+            self.reviews
+                .iter()
+                .filter(|(s, _)| s == sha)
+                .flat_map(|(_, e)| e.clone())
+                .collect()
+        }
+        fn worktree_status(&self, _plan: &PlanKey) -> PlanWorktreeStatus {
+            PlanWorktreeStatus::BodyDirty
+        }
+        fn blocks_for(&self, plan: &PlanKey) -> Vec<PlanBlock> {
+            self.blocks.get(plan).cloned().unwrap_or_default()
+        }
+    }
+
+    #[test]
+    fn master_with_dirty_plan_and_unreviewed_gate_returns_commit() {
+        // Pre-fix: Unreviewed + BodyDirty produced
+        // ReviewerApprovalsMissing — master got NO work item; both
+        // sides were waiting for each other. Post-fix: worktree-first
+        // dispatch routes master to MasterToCommit.
+        let mut state = RepoState::default();
+        state
+            .plans
+            .insert(plan("foo"), make_plan_with_one_reviewable(sha("aaaa")));
+        // No reviews → Unreviewed gate.
+        let status = state.derive_status(&MockDirty::new(), &plan_policy());
+        let work = status.work_for(&label("lloyd"), Role::Master);
+        assert_eq!(work.len(), 1, "master must get exactly one item");
+        match &work[0] {
+            WaitItem::Master {
+                next: MasterNext::Commit,
+                reason: WaitingReason::CommitPlanRevision,
+                ..
+            } => {}
+            other => panic!("expected Master {{ next: Commit, .. }}; got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn master_with_dirty_plan_and_changes_requested_returns_commit() {
+        // The architectural mismatch this plan fixes: the previous
+        // behavior routed master to Revise even though the worktree
+        // already had a new revision in flight.
+        let mut state = RepoState::default();
+        state
+            .plans
+            .insert(plan("foo"), make_plan_with_one_reviewable(sha("aaaa")));
+        let reviews = vec![(
+            sha("aaaa"),
+            vec![ReviewEntry {
+                author: label("codex"),
+                verdict: crate::vocab::Verdict::RequestChanges,
+            }],
+        )];
+        let mock = MockDirty::new().with_reviews(reviews);
+        let status = state.derive_status(&mock, &plan_policy());
+        let work = status.work_for(&label("lloyd"), Role::Master);
+        assert_eq!(work.len(), 1);
+        match &work[0] {
+            WaitItem::Master {
+                next: MasterNext::Commit,
+                ..
+            } => {}
+            WaitItem::Master {
+                next: MasterNext::Revise,
+                ..
+            } => panic!("dirty plan must override Revise — that's the architectural mismatch"),
+            other => panic!("expected Master Commit; got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn master_with_dirty_plan_and_approved_gate_returns_commit() {
+        // Regression fence — Approved+Dirty already produced Commit
+        // via the pre-fix per-arm check. Defends against re-introducing
+        // the bug when the per-arm checks are removed.
+        let mut state = RepoState::default();
+        state
+            .plans
+            .insert(plan("foo"), make_plan_with_one_reviewable(sha("aaaa")));
+        let reviews = vec![(
+            sha("aaaa"),
+            vec![
+                ReviewEntry {
+                    author: label("codex"),
+                    verdict: crate::vocab::Verdict::Approve,
+                },
+                ReviewEntry {
+                    author: label("ruthless"),
+                    verdict: crate::vocab::Verdict::Approve,
+                },
+            ],
+        )];
+        let mock = MockDirty::new().with_reviews(reviews);
+        let status = state.derive_status(&mock, &plan_policy());
+        let work = status.work_for(&label("lloyd"), Role::Master);
+        assert_eq!(work.len(), 1);
+        assert!(matches!(
+            work[0],
+            WaitItem::Master {
+                next: MasterNext::Commit,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn master_with_dirty_plan_and_blocked_plan_returns_blocked() {
+        // Block precedence wins. The plan-level Blocked state is
+        // resolved in derive_status BEFORE the worktree-first
+        // dispatch, so a blocked plan with BodyDirty still surfaces
+        // as Blocked, and work_for emits no Master Commit item.
+        let mut state = RepoState::default();
+        state
+            .plans
+            .insert(plan("foo"), make_plan_with_one_reviewable(sha("aaaa")));
+        let mock =
+            MockDirty::new().with_block(plan("foo"), vec![mkblock("claude", "halt", "hold")]);
+        let status = state.derive_status(&mock, &plan_policy());
+        assert_eq!(status.plans[0].gate, CommitGateState::Blocked);
+        // Blocked plans emit no work for any role.
+        let master_work = status.work_for(&label("lloyd"), Role::Master);
+        let reviewer_work = status.work_for(&label("codex"), Role::Reviewer);
+        assert!(
+            master_work.is_empty(),
+            "blocked plan must not emit master work; got {master_work:?}"
+        );
+        assert!(
+            reviewer_work.is_empty(),
+            "blocked plan must not emit reviewer work; got {reviewer_work:?}"
+        );
+    }
+
+    #[test]
+    fn reviewer_does_not_get_work_on_master_dirty_plan() {
+        // Reviewer-side consequence (documented in plan body): a
+        // dirty plan file routes the master to Commit but does NOT
+        // wake reviewers. Their review effort on the committed
+        // version would be at risk of being thrown away the moment
+        // master commits the revision.
+        let mut state = RepoState::default();
+        state
+            .plans
+            .insert(plan("foo"), make_plan_with_one_reviewable(sha("aaaa")));
+        // No reviews → Unreviewed gate. Pre-fix this would have
+        // woken reviewers via ReviewerApprovalsMissing.
+        let status = state.derive_status(&MockDirty::new(), &plan_policy());
+        let codex_work = status.work_for(&label("codex"), Role::Reviewer);
+        let ruthless_work = status.work_for(&label("ruthless"), Role::Reviewer);
+        assert!(
+            codex_work.is_empty(),
+            "dirty plan must not wake reviewer codex; got {codex_work:?}"
+        );
+        assert!(
+            ruthless_work.is_empty(),
+            "dirty plan must not wake reviewer ruthless; got {ruthless_work:?}"
         );
     }
 }
