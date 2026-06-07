@@ -35,7 +35,6 @@ Two top-level keys:
   "agents": {
     "claude":   { "tool": "claude" },
     "codex":    { "tool": "codex" },
-    "grok":     { "tool": "claude" },
     "ruthless": { "tool": "claude", "launch": { "command": "claude", "args": ["--skill", "ruthless"] } }
   },
   "teams": {
@@ -47,14 +46,17 @@ Two top-level keys:
       "master": "claude",
       "commit_reviewers": ["codex"],
       "gate_reviewers":   ["ruthless"]
-    },
-    "research": {
-      "master": "grok",
-      "commit_reviewers": ["claude"]
     }
   }
 }
 ```
+
+(Examples use only `claude` and `codex` as tool names —
+clank doesn't support other tools yet. The `tool` field
+is a typed enum, not a free string. Future plan:
+`tool-specific-launch-shortcuts` lets you write
+`"tool": "claude", "skills": ["ruthless"]` instead of the
+verbose `launch` form below — out of scope for this plan.)
 
 - `agents` is a label-keyed dictionary of agent
   DESCRIPTIONS only. No role, no team affiliation. Just
@@ -79,47 +81,59 @@ Two top-level keys:
 
 ```json
 {
-  "team": "dev",
-  "master_override": "codex",
-  "local_agents": [
+  "team": [
+    { "include": "dev" },
     "ruthless",
-    { "ref": "alice", "tier": "gate" },
-    { "label": "bob", "tool": "claude", "role": "reviewer", "tier": "commit" }
-  ]
+    { "agent": "alice", "review": "gate" },
+    { "label": "bob", "tool": "claude", "review": "commit" }
+  ],
+  "promoted": "codex"
 }
 ```
 
-- `team`: name of a team in user-scope `teams`.
-- `master_override` (optional): label of an agent who
-  takes the master role IN THIS REPO ONLY. Written by
-  `clank promote <agent>`. Doesn't modify the team's
+Or the common case (just one user-scope team, no extras):
+
+```json
+{
+  "team": "dev"
+}
+```
+
+- **`team`**: either a string (sugar for `[{"include":
+  "<name>"}]`) or an array. Array entries are
+  untagged-enum variants (see Typed serde section):
+  1. **Bare string** (`"ruthless"`) — by-name reference
+     to a user-scope agent. Review tier defaults to
+     `commit`.
+  2. **`{ "include": "<team-name>" }`** — pulls in a
+     team's full composition (master + both reviewer
+     lists). At most ONE include per array; multiple
+     includes are out of scope for v1 (use locals to
+     add specific agents instead).
+  3. **`{ "agent": "<label>", "review": "..." }`** —
+     by-name reference with explicit review tier. Used
+     when you want a user-scope agent at a non-default
+     tier for this repo.
+  4. **Fully inline** (`{ "label": "...", "tool":
+     "...", "review": "...", ... }`) — for agents you
+     want ONLY in this repo, not declared globally.
+     Fields: `label`, `tool`, optional `launch`,
+     optional `role`, optional `review` (default
+     `commit`).
+- **`promoted`** (optional): label of an agent who takes
+  the master role IN THIS REPO ONLY. Written by `clank
+  promote <agent>`. Doesn't modify the included team's
   user-scope master config. Resolution swaps: this label
-  becomes master, the team's original master gets demoted
-  to commit-reviewer (joining `commit_reviewers`, not
-  dropped).
-- `local_agents`: optional list of additions for THIS
-  repo only. Three forms (untagged enum on parse):
-  1. **Bare string** (`"ruthless"`) — by-name reference.
-     Tier defaults to `commit`. The quickest form.
-  2. **By-name with tier override** (`{"ref": "alice",
-     "tier": "gate"}`) — pulls the agent's
-     description from user-scope `agents` but pins their
-     tier locally. Use when you want a user-scope agent
-     at a non-default tier for this repo.
-  3. **Fully inline** (`{"label": "bob", "tool":
-     "claude", "tier": "commit"}`) — for agents you want
-     ONLY in this repo, not declared globally. Fields:
-     `label`, `tool`, optional `launch`, optional `role`
-     (see below), optional `tier` (default `commit`).
-- **All `local_agents` entries are REVIEWERS** (codex
-  66751c8 pin — was previously underspecified, allowing
-  inline `role: "master"` which would conflict with team
-  master / `master_override`). The only path to a master
-  designation in a repo is:
+  becomes master, the included team's original master
+  gets demoted to commit-reviewer (joining
+  `commit_reviewers`, not dropped).
+- **Master designation is single-source-of-truth**: an
+  inline local entry cannot directly designate master.
+  The only paths to master are:
   - `clank team set-master <team> <agent>` (user-scope
     team config), OR
-  - `clank promote <agent>` (repo `master_override`).
-  `local_agents` cannot directly designate a master.
+  - `clank promote <agent>` (writes `promoted` at repo
+    scope).
   Role-field handling on inline entries:
   - **Omitted**: defaults to `reviewer`.
   - **`"reviewer"`**: valid (explicit form of the
@@ -127,8 +141,12 @@ Two top-level keys:
   - **`"master"`**: REJECTED at parse time with an
     actionable error pointing at `clank promote <label>`
     as the right surface.
-  To make a local agent the repo's master: add them via
-  `local_agents` AND then `clank promote <label>`.
+  To make a local agent the repo's master: add them in
+  the `team` array AND then `clank promote <label>`.
+- **`review` field values**: `"commit"` or `"gate"`.
+  Names what the agent reviews (commits or gates), not
+  which "tier" they belong to. Same semantic, friendlier
+  name.
 
 ### Repo per-agent state (`<repo>/.clank/agents/<label>/config.json`, gitignored)
 
@@ -136,36 +154,48 @@ Purely STATE: `session`, `auto_mode`, `wfw_timeout`. NO
 declaration fields (no role, no tool, no launch).
 
 **The presence of this file does NOT determine
-registration.** Registration is computed from user-scope
-team + local_agents. State files for agents that aren't in
-the registered set become orphan state — kept on disk but
-ignored by gates / lists / spawners.
+registration.** Registration is computed from the `team`
+field (team includes + local entries) plus `promoted`.
+State files for agents that aren't in the registered set
+become orphan state — kept on disk but ignored by gates
+/ lists / spawners.
 
 `clank doctor` surfaces orphan state files so the user can
 clean them up.
 
 ## Registration resolution
 
-For a given repo, the registered set is computed as:
+For a given repo, the registered set is computed by
+folding over `team` entries in order:
 
-1. Read `<repo>/.clank/config.json#/team` → team name.
-2. Look up the team in `~/.clank/config.json#/teams`.
-3. Master = `agents[teams.<team>.master]`. Commit-reviewers
-   = `agents[teams.<team>.commit_reviewers[i]]` for each
-   i. Gate-reviewers =
-   `agents[teams.<team>.gate_reviewers[i]]` for each i.
-4. Append `local_agents`:
-   - Bare-string by-name: look up in user-scope `agents`.
-     Add to `commit_reviewers` (default tier).
-   - `{ref, tier}` by-name with override: look up in
-     user-scope. Add to the named tier list.
-   - Inline object: add verbatim to the tier list named
-     by its `tier` field (default `commit`).
-5. **Apply `master_override`** (if set in repo config):
-   - new_master = registered agent matching the override
-     label (looked up in the set built so far — must be
-     present in some reviewer tier, else error).
-   - prev_master = the team's original master.
+1. Read `<repo>/.clank/config.json#/team` — either a
+   string (treat as single-element array
+   `[{"include": "<name>"}]`) or an array.
+2. Initialize empty `master = None`,
+   `commit_reviewers = []`, `gate_reviewers = []`.
+3. For each entry in the array:
+   - **`{ "include": "<team-name>" }`**: look up the
+     team in `~/.clank/config.json#/teams`. Set
+     `master = agents[team.master]`. Append
+     `agents[team.commit_reviewers[i]]` to
+     `commit_reviewers`. Append
+     `agents[team.gate_reviewers[i]]` to
+     `gate_reviewers`. At most one `include` per array;
+     reject the second with a parse-time error.
+   - **Bare string `"<label>"`**: look up label in
+     user-scope `agents`. Add to `commit_reviewers`.
+   - **`{ "agent": "<label>", "review": "..." }`**:
+     look up label in user-scope. Add to the named
+     review list (`commit_reviewers` or
+     `gate_reviewers`).
+   - **Inline** (`{ "label", "tool", "review"?, ... }`):
+     add verbatim to the named review list (default
+     `commit_reviewers`).
+4. **Apply `promoted`** (if set):
+   - new_master = registered agent matching the
+     `promoted` label (looked up in the set built so
+     far — must be present somewhere, else error).
+   - prev_master = current `master`.
    - Master = new_master.
    - commit_reviewers = (existing commit_reviewers ∪
      {prev_master}) − {new_master}.
@@ -174,8 +204,9 @@ For a given repo, the registered set is computed as:
      since gate-tier is for opt-in lighter-touch
      reviewers; the demoted master should be tracking
      every commit.)
-6. The resulting (master, commit_reviewers, gate_reviewers)
-   tuple IS the registered set for this repo.
+5. The resulting (master, commit_reviewers,
+   gate_reviewers) tuple IS the registered set for this
+   repo.
 
 ## Gate state machine with commit/gate tiers
 
@@ -236,40 +267,66 @@ Edge cases pinned:
 7. **Master in either reviewer list**: rejected at parse
    time. Master is the master slot, not a reviewer.
 
-## Old-format detection (panic everywhere except init)
+## Config errors propagate via anyhow
 
-**No backwards compatibility on the config schema.** Any
-clank command that reads `.clank/config.json` and detects
-an old-format signal (a `"agents"` key in the typed
-`extra` catchall — i.e., the legacy
-`agents-declaration-is-user-local` shape) panics with:
+**No special "panic everywhere except init" handling.**
+The typed serde struct + anyhow propagation is enough.
+Lloyd's directive (2026-06-08): just let serde deserialize
+into the proper struct; if it fails, anyhow propagates
+the error up through `main` with a clear message. No
+ad-hoc detection code, no detect-and-panic, no separate
+loader path.
 
-```
-.clank/config.json is in an old clank format (contains
-legacy `agents` block). Run `clank init` to migrate.
-```
+**What this looks like in practice**:
 
-The only command exempt from this panic is `clank init`,
-which has the migration code path (described in CLI
-surface changes below).
+- Old `agents-declaration-is-user-local` config had
+  `"agents": [...]` (array) at top level. New schema has
+  no top-level `"agents"` field; the array would either
+  land in `extra` (the flatten catchall) or fail
+  deserialization depending on shape. Either way:
+  - Commands like `clank wfw`, `clank agent list`, etc.
+    that READ the config will try to deserialize. If the
+    typed deserialize fails (most cases — old `agents`
+    array isn't a valid `Vec<LocalAgentEntry>` either),
+    serde returns an error. `.with_context(|| format!(
+    "parsing {}", path))` adds the file path. anyhow
+    propagates to main; user sees:
+    ```
+    Error: parsing /path/to/.clank/config.json
+    Caused by:
+        invalid type: sequence, expected a map, at line 2 column 13
+    ```
+  - That's enough to point the user at the file and the
+    structural problem. No bespoke "this is a legacy
+    config" message.
+- For the case where the old `agents` field happens to
+  land in `extra` (e.g., if the new schema accepted
+  arbitrary shapes there), the leftover key is preserved
+  for forward-compat round-trip but is invisible to the
+  registered-set resolution. The user sees an
+  empty-team error from registration logic, OR notices
+  on `clank agent list`.
 
-Coverage applies to: `clank agent`, `clank team`,
-`clank wfw`, `clank status`, `clank as`, `clank auto`,
-`clank diff`, `clank queue`, etc. — every command that
-loads the repo config goes through the same loader, and
-the loader is what panics. One enforcement point.
+**`clank init`** handles old-format detection as part of
+its own migration logic — it's the only command that
+NEEDS to recognize the old shape (to clean it up). Init
+attempts the new-format deserialize first; on failure,
+attempts a `LegacyRepoConfigFile` typed struct (with the
+old `agents: Option<Vec<DefaultAgent>>` field) as a
+fallback. If that succeeds, runs the migration cleanup
+described in the CLI surface section. If both fail, the
+error propagates as above.
 
-**Scope of strict-panic**: config files only. Per-agent
-skeletons (`.clank/agents/<label>/config.json`) and the
-`.empty` sentinel are STATE, not config, and are tolerated
-as harmless (the new resolution ignores them).
+**Scope**: config files only. Per-agent skeletons
+(`.clank/agents/<label>/config.json`) and the `.empty`
+sentinel are STATE, not config, and are tolerated as
+harmless (the new resolution doesn't read them).
 
-User-scope `~/.clank/config.json` gets the same treatment:
-if it has a top-level `default_agents` key (the legacy
-shape), every command panics until the user manually
-updates it. There's no `clank init --user` migration —
-the user-scope file is hand-edited by users via their
-dotfiles, so panic + clear error is appropriate.
+User-scope `~/.clank/config.json` gets the same
+treatment: a legacy `default_agents` key would either
+fail typed deserialization (anyhow propagates) or land
+in `extra` (gets ignored). No `clank init --user`
+migration — users hand-edit their own dotfiles.
 
 ## CLI surface changes
 
@@ -284,9 +341,12 @@ discover.
   - **Fresh repo**: write team to
     `<repo>/.clank/config.json` + gitignore the file.
   - **New-format repo with existing team**: REWRITE the
-    team field. Leaves `local_agents`, `master_override`,
-    per-agent state files untouched. ("I started under
-    `default` but it's really `research` work — swap it.")
+    `team` field to a single-include shape. If the
+    existing `team` was an array (with locals), preserve
+    the local entries — just replace the `include` entry.
+    Leaves `promoted` and per-agent state files
+    untouched. ("I started under `default` but it's
+    really `research` work — swap it.")
   - **Old-format repo** (has `.clank/config.json#/agents`
     block):
     1. Remove the legacy `agents` key from
@@ -326,24 +386,24 @@ detection signals are present.
   - `add --global <label> --tool <tool> [--launch-cmd ...]
     [--initial-prompt ...]`: write to user-scope `agents`
     table.
-  - `add <label> --tool <tool> [--tier commit|gate]` (no
-    `--global`): add fully-inline to repo's
-    `local_agents`. Default tier is `commit`.
-  - `add <label> [--tier gate]` (no `--tool`, no
-    `--global`): add by-name reference to repo's
-    `local_agents`; looks up user-scope `agents` at
-    registration time. If `--tier` is set to a
-    non-default value, writes the `{ref, tier}` shape;
-    otherwise writes the bare-string shape.
+  - `add <label> --tool <tool> [--review commit|gate]`
+    (no `--global`): append fully-inline entry to repo's
+    `team` array. Default review kind is `commit`.
+  - `add <label> [--review gate]` (no `--tool`, no
+    `--global`): append by-name entry to repo's `team`
+    array; looks up user-scope `agents` at registration
+    time. If `--review` is set to a non-default value,
+    writes the `{ "agent": "<label>", "review": "..." }`
+    shape; otherwise writes the bare-string shape.
   - `remove --global <label>`: remove from user-scope.
     Also removes from any team that referenced it
     (refuses if the label is a master of some team
     without `--force`).
   - `remove <label>` (no `--global`): drop from repo's
-    `local_agents`.
+    `team` array (any entry referencing this label).
   - `list`: registered for THIS repo (runs the full
-    resolution algorithm — team + master_override +
-    local_agents). Shows tier for each reviewer.
+    resolution algorithm — team includes + entries +
+    `promoted`). Shows review kind for each reviewer.
   - `start <label>`: unchanged behavior (launches tool).
 
 - **`clank team`** — team COMPOSITIONS (the "which set").
@@ -358,12 +418,12 @@ detection signals are present.
     it (clank doesn't track which repos use which teams,
     so this either requires user confirmation or uses
     `--force` to delete blindly).
-  - `add <team> <agent> [--tier commit|gate]`: add an
-    agent to the team. Default tier is `commit`. Refuses
-    if the agent isn't declared in user-scope `agents`.
-    Refuses if the agent is already in the team (any
-    tier). To move an agent between tiers, use `remove`
-    then `add`.
+  - `add <team> <agent> [--review commit|gate]`: add an
+    agent to the team. Default review kind is `commit`.
+    Refuses if the agent isn't declared in user-scope
+    `agents`. Refuses if the agent is already in the
+    team (any review kind). To move an agent between
+    kinds, use `remove` then `add`.
     Naming: just `add` (not `add-reviewer`) because
     master is a SEPARATE designation via `set-master` —
     you don't `add-reviewer` and `add-master`, you add
@@ -392,16 +452,17 @@ detection signals are present.
 - **`clank promote <agent>`** STAYS — but its scope and
   data model change.
   - **Scope**: repo-scope only. It's a per-repo master
-    OVERRIDE, not a team mutation.
-  - **Data**: writes `master_override: <agent>` to
+    designation, not a team mutation.
+  - **Data**: writes `promoted: <agent>` to
     `<repo>/.clank/config.json`. The team's user-scope
     master config is untouched.
-  - **Resolution with override**: master =
-    `master_override`; reviewers = (team reviewers ∪
-    local_agents) − new_master + previous_master_demoted.
-    Same swap semantic as today's `clank agent promote`
-    repair behavior — the displaced master joins the
-    reviewer list, doesn't drop.
+  - **Resolution with `promoted`**: master = `promoted`;
+    commit_reviewers = (existing commit_reviewers ∪
+    {previous_master}) − {new_master}; gate_reviewers =
+    existing gate_reviewers − {new_master}. Same swap
+    semantic as today's `clank agent promote` repair
+    behavior — the displaced master joins
+    commit_reviewers, doesn't drop.
   - **No `--global` flag**: master changes at the team
     level go through `clank team set-master`, not
     `promote`.
@@ -489,7 +550,7 @@ pub struct TeamComposition {
 
 #[derive(Deserialize, Serialize, Clone, Copy)]
 #[serde(rename_all = "snake_case")]
-pub enum ReviewerTier {
+pub enum ReviewKind {
     Commit,
     Gate,
 }
@@ -497,12 +558,15 @@ pub enum ReviewerTier {
 // Repo-scope (<repo>/.clank/config.json)
 #[derive(Deserialize, Serialize)]
 pub struct RepoConfigFile {
+    /// Either a string (sugar for `[{"include": <name>}]`)
+    /// or an array of TeamEntry. Serde untagged enum
+    /// distinguishes via `serde_json::Value::is_string()`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub team: Option<String>,
+    pub team: Option<TeamField>,
+    /// Optional repo-scope master promotion. Renamed from
+    /// `master_override` per lloyd 2026-06-08.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub master_override: Option<AgentLabel>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub local_agents: Vec<LocalAgentEntry>,
+    pub promoted: Option<AgentLabel>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub review: Option<ReviewSection>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -515,23 +579,35 @@ pub struct RepoConfigFile {
 
 #[derive(Deserialize, Serialize)]
 #[serde(untagged)]
-pub enum LocalAgentEntry {
-    /// Bare string: `"ruthless"`. Tier defaults to commit.
-    ByName(AgentLabel),
-    /// By-name with tier override:
-    /// `{"ref": "ruthless", "tier": "gate"}`.
-    ByNameWithTier {
-        #[serde(rename = "ref")]
-        ref_label: AgentLabel,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        tier: Option<ReviewerTier>,
-    },
-    /// Fully inline: `{"label": ..., "tool": ..., ...}`.
-    Inline(InlineLocalAgent),
+pub enum TeamField {
+    /// Sugar: `"team": "dev"` == `"team": [{"include": "dev"}]`.
+    Single(String),
+    /// Full form: array of mixed entries.
+    Array(Vec<TeamEntry>),
 }
 
 #[derive(Deserialize, Serialize)]
-pub struct InlineLocalAgent {
+#[serde(untagged)]
+pub enum TeamEntry {
+    /// `{ "include": "<team-name>" }` — pull in a team
+    /// composition.
+    Include { include: String },
+    /// `{ "agent": "<label>", "review": "..." }` —
+    /// by-name reference with explicit review kind.
+    ByName {
+        agent: AgentLabel,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        review: Option<ReviewKind>,
+    },
+    /// Fully inline: `{ "label", "tool", "review"?, ... }`.
+    Inline(InlineAgent),
+    /// Bare string: `"ruthless"`. Equivalent to
+    /// `{ "agent": "ruthless" }`.
+    BareString(AgentLabel),
+}
+
+#[derive(Deserialize, Serialize)]
+pub struct InlineAgent {
     pub label: AgentLabel,
     pub tool: Tool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -544,9 +620,10 @@ pub struct InlineLocalAgent {
     /// `Some(Role::Reviewer)` both resolve to reviewer.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub role: Option<Role>,
-    /// Reviewer tier. Default `commit` if omitted.
+    /// What kind of review they do. Default `commit` if
+    /// omitted.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub tier: Option<ReviewerTier>,
+    pub review: Option<ReviewKind>,
 }
 ```
 
@@ -603,7 +680,8 @@ Three architectural wins:
 
 1. **Default agents flow into repos by default.** "Use
    my normal agents + one local addition" is just
-   `clank init --team dev` + adding to `local_agents`.
+   `clank init --team dev` + `clank agent add <label>`
+   (which appends to the `team` array).
    The current REPLACE model makes this require manual
    re-adding of every default.
 2. **The sentinel goes away.** Five separate sentinel-
