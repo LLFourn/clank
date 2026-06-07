@@ -84,14 +84,43 @@ pub(crate) fn migrate_legacy_agents_block(repo: &Path) -> anyhow::Result<()> {
     let agents: Vec<crate::cli::config::DefaultAgent> = serde_json::from_value(agents_val)
         .with_context(|| format!("parsing legacy `agents` block in {}", cfg_path.display()))?;
     if agents.is_empty() {
-        // Case B: explicit empty → write the sentinel.
+        // Case B: explicit empty → quarantine any pre-existing
+        // skeleton config.json files (their declarations were
+        // suppressed by the legacy `agents: []` block; they must
+        // STAY suppressed across the migration) and write the
+        // sentinel. Codex 36624a5 catch: without the quarantine,
+        // a stale `.clank/agents/<label>/config.json` left over
+        // from before the `agents: []` block could be resurrected
+        // by `clank agent add` (which clears the sentinel) or by
+        // a subsequent operation that reads skeletons directly.
+        //
+        // Feedback subdirs are preserved (review history stays).
+        // We delete the config.json only.
+        let agents_dir = repo.join(".clank/agents");
+        if agents_dir.is_dir() {
+            for entry in std::fs::read_dir(&agents_dir)? {
+                let entry = entry?;
+                if !entry.file_type()?.is_dir() {
+                    continue;
+                }
+                let cfg_path = entry.path().join("config.json");
+                if cfg_path.is_file() {
+                    std::fs::remove_file(&cfg_path).with_context(|| {
+                        format!(
+                            "removing stale skeleton {} during explicit-empty migration",
+                            cfg_path.display()
+                        )
+                    })?;
+                }
+            }
+        }
         let sentinel = repo.join(".clank/agents/.empty");
         if let Some(parent) = sentinel.parent() {
             std::fs::create_dir_all(parent)?;
         }
         std::fs::write(&sentinel, b"")?;
         println!(
-            "migrated explicit-empty agents declaration to {} (now per-user)",
+            "migrated explicit-empty agents declaration to {} (now per-user; stale skeleton configs removed)",
             sentinel.strip_prefix(repo).unwrap_or(&sentinel).display()
         );
     } else {

@@ -230,6 +230,133 @@ fn clank_agent_add_to_unmigrated_repo_migrates_legacy_block_first() {
 }
 
 #[test]
+fn clank_agent_promote_on_explicit_empty_repo_refuses_with_stale_skeletons_quarantined() {
+    // Codex 36624a5 catch (repro 1): unmigrated repo has
+    // `.clank/config.json` = {"agents": []} (explicit empty —
+    // disable user-scope fallback) PLUS stale per-agent skeletons
+    // from before the empty block was written. Pre-fix:
+    //   - promote bob → migration writes .empty, but stale
+    //     skeletons survived.
+    //   - load_skeleton_agents sees the stale skeletons.
+    //   - promote mutates them, reports success.
+    //   - load_merged_agents returns []  (the sentinel wins).
+    //   - The promote claim was a lie.
+    // Post-fix: explicit-empty migration quarantines (deletes
+    // config.json under each agent dir; preserves feedback/).
+    // promote sees zero skeletons, refuses with "no agents
+    // registered" — telling the truth.
+    let env = Env::new();
+    write_repo_config(
+        env.repo(),
+        &RepoConfigFile {
+            agents: Some(Vec::new()),
+            ..Default::default()
+        },
+    );
+    // Stale skeletons left over from before the agents: [] was set.
+    write_skeleton_declaration(
+        env.repo(),
+        "alice",
+        Role::Master,
+        Some(clank_core::vocab::Tool::Claude),
+    );
+    write_skeleton_declaration(
+        env.repo(),
+        "bob",
+        Role::Reviewer,
+        Some(clank_core::vocab::Tool::Codex),
+    );
+
+    let out = env.agent(&["promote", "bob"]);
+    assert!(
+        !out.status.success(),
+        "promote on explicit-empty repo must refuse; got success: stdout=`{}` stderr=`{}`",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    // load_merged_agents reflects the explicit-empty intent.
+    let merged = clank::cli::config::load_merged_agents(env.repo(), Some(env.home())).unwrap();
+    assert!(
+        merged.is_empty(),
+        "load_merged_agents must respect the sentinel; got {merged:?}"
+    );
+    // Sentinel exists; stale skeleton configs are gone.
+    assert!(
+        env.repo().join(".clank/agents/.empty").is_file(),
+        "sentinel must exist post-migration"
+    );
+    assert!(
+        !env.repo().join(".clank/agents/alice/config.json").is_file(),
+        "stale alice skeleton config must be quarantined"
+    );
+    assert!(
+        !env.repo().join(".clank/agents/bob/config.json").is_file(),
+        "stale bob skeleton config must be quarantined"
+    );
+}
+
+#[test]
+fn clank_agent_add_on_explicit_empty_repo_registers_only_the_new_agent() {
+    // Codex 36624a5 catch (repro 2): unmigrated repo has
+    // `.clank/config.json` = {"agents": []} PLUS stale skeleton
+    // configs. Pre-fix:
+    //   - add bob → migration writes .empty, add clears it,
+    //     writes bob's skeleton.
+    //   - Stale alice skeleton survived → merged view now has
+    //     BOTH alice and bob, even though alice was supposed to
+    //     be suppressed by the explicit-empty block.
+    // Post-fix: migration quarantines stale skeletons before
+    // writing the sentinel. add then proceeds normally and the
+    // post-state is EXACTLY {bob}.
+    let env = Env::new();
+    write_repo_config(
+        env.repo(),
+        &RepoConfigFile {
+            agents: Some(Vec::new()),
+            ..Default::default()
+        },
+    );
+    write_skeleton_declaration(
+        env.repo(),
+        "alice",
+        Role::Master,
+        Some(clank_core::vocab::Tool::Claude),
+    );
+
+    let out = env.agent(&["add", "bob", "--tool", "codex"]);
+    assert!(
+        out.status.success(),
+        "add failed: stderr=`{}`",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let merged = clank::cli::config::load_merged_agents(env.repo(), Some(env.home())).unwrap();
+    let names: Vec<_> = merged
+        .iter()
+        .map(|e| e.label.as_str().to_string())
+        .collect();
+    assert_eq!(
+        names,
+        vec!["bob".to_string()],
+        "post-state must contain exactly bob (alice was quarantined by the explicit-empty migration); got: {names:?}"
+    );
+    // Stale alice skeleton config is gone; bob's skeleton is present.
+    assert!(
+        !env.repo().join(".clank/agents/alice/config.json").is_file(),
+        "stale alice skeleton config must be quarantined"
+    );
+    assert!(
+        env.repo().join(".clank/agents/bob/config.json").is_file(),
+        "bob's new skeleton must exist"
+    );
+    // Sentinel was cleared by the 0→1 add transition.
+    assert!(
+        !env.repo().join(".clank/agents/.empty").is_file(),
+        "sentinel must be cleared on first agent registration"
+    );
+}
+
+#[test]
 fn clank_agent_add_no_launch_flags_leaves_launch_none() {
     // Phase 6 default: declaration entry has launch: None when no
     // --launch-* flag is passed.
