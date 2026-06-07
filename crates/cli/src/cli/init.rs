@@ -61,7 +61,7 @@ pub async fn run(args: InitArgs) -> anyhow::Result<()> {
 /// In BOTH cases, remove the `agents` key from
 /// `.clank/config.json`. Idempotent: re-running with the key
 /// already absent is a no-op.
-fn migrate_legacy_agents_block(repo: &Path) -> anyhow::Result<()> {
+pub(crate) fn migrate_legacy_agents_block(repo: &Path) -> anyhow::Result<()> {
     let cfg_path = repo.join(".clank/config.json");
     let body = match std::fs::read_to_string(&cfg_path) {
         Ok(b) => b,

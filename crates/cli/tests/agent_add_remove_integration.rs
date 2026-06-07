@@ -172,6 +172,64 @@ fn clank_agent_add_writes_list_entry_and_skeleton() {
 }
 
 #[test]
+fn clank_agent_add_to_unmigrated_repo_migrates_legacy_block_first() {
+    // Codex 182cf05 catch: pre-fix, an unmigrated repo with the
+    // legacy `.clank/config.json#/agents` block would shadow
+    // `agent add`'s skeleton write — `load_merged_agents` (and
+    // thus `agent list`, gates, etc.) read the legacy block first
+    // and never saw the new agent. The fix: agent add migrates
+    // the legacy block (same step as `clank init`) before writing
+    // the new skeleton. Symmetric for remove/promote.
+    let env = Env::new();
+    // Hand-write a legacy block (the pre-migration state).
+    write_repo_config(
+        env.repo(),
+        &RepoConfigFile {
+            agents: Some(vec![DefaultAgent {
+                label: AgentLabel::parse("alice").unwrap(),
+                role: Role::Master,
+                tool: Some(clank_core::vocab::Tool::Claude),
+                launch: None,
+                initial_prompt: None,
+            }]),
+            ..Default::default()
+        },
+    );
+
+    let out = env.agent(&["add", "bob", "--tool", "codex"]);
+    assert!(
+        out.status.success(),
+        "add failed: stderr=`{}`",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // Acceptance: load_merged_agents reflects the new agent.
+    let merged = clank::cli::config::load_merged_agents(env.repo(), Some(env.home())).unwrap();
+    let names: Vec<_> = merged
+        .iter()
+        .map(|e| e.label.as_str().to_string())
+        .collect();
+    assert!(
+        names.contains(&"bob".to_string()),
+        "after add, merged view must include bob; got: {names:?}"
+    );
+    assert!(
+        names.contains(&"alice".to_string()),
+        "legacy block must have been migrated into alice's skeleton, not dropped; got: {names:?}"
+    );
+    // The legacy block is gone from .clank/config.json.
+    let cfg = read_repo_config(env.repo());
+    assert!(
+        cfg.agents.is_none(),
+        "legacy agents key must be migrated out; still present as {:?}",
+        cfg.agents
+    );
+    // Both agents now have per-agent skeletons.
+    assert!(env.repo().join(".clank/agents/alice/config.json").exists());
+    assert!(env.repo().join(".clank/agents/bob/config.json").exists());
+}
+
+#[test]
 fn clank_agent_add_no_launch_flags_leaves_launch_none() {
     // Phase 6 default: declaration entry has launch: None when no
     // --launch-* flag is passed.

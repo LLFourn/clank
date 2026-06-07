@@ -519,6 +519,14 @@ fn add(args: AgentAddArgs) -> anyhow::Result<()> {
         // Repo-scope add (plan: agents-declaration-is-user-local):
         // writes the per-agent skeleton directly. No `.clank/config.json#/agents`
         // block anymore — skeleton presence IS registration.
+        //
+        // Codex 182cf05 catch: if the repo still has the legacy
+        // `agents` block in `.clank/config.json`, that block shadows
+        // skeleton mutations in `load_merged_agents`. Migrate it
+        // out now before writing — idempotent if already migrated.
+        // Without this, `clank agent list` after `agent add` would
+        // show the stale legacy block, not the newly-added skeleton.
+        crate::cli::init::migrate_legacy_agents_block(&repo)?;
         let skeleton_existed = load_agent_config(&repo, &label)?.is_some();
         if skeleton_existed {
             anyhow::bail!(
@@ -661,6 +669,10 @@ fn remove(args: AgentRemoveArgs) -> anyhow::Result<()> {
         // Repo-scope remove (plan: agents-declaration-is-user-local).
         // Deletes the per-agent skeleton config.json. The dir's
         // feedback/ subdir is preserved (review history stays).
+        //
+        // Codex 182cf05 catch: migrate any legacy block before
+        // operating so the skeleton view becomes the truth.
+        crate::cli::init::migrate_legacy_agents_block(&repo)?;
         let cfg_path = agent_config_path(&repo, &label);
         if !cfg_path.is_file() {
             anyhow::bail!(
@@ -775,6 +787,11 @@ fn promote(args: AgentPromoteArgs) -> anyhow::Result<()> {
         // Operates on per-agent skeletons; ensure_unique_master_via_skeletons
         // writes one file per affected agent (atomic per-file,
         // non-transactional across files — pinned per codex 861c364).
+        //
+        // Codex 182cf05 catch: migrate the legacy block before
+        // reading skeletons so mutations land in the source of
+        // truth and aren't shadowed by the stale block.
+        crate::cli::init::migrate_legacy_agents_block(&repo)?;
         let entries = crate::cli::config::load_skeleton_agents(&repo)?;
         if entries.is_empty() {
             anyhow::bail!(
