@@ -74,7 +74,7 @@ Two top-level keys:
   "master_override": "codex",
   "local_agents": [
     "ruthless",
-    { "label": "alice", "tool": "claude", "role": "reviewer" }
+    { "label": "alice", "tool": "claude" }
   ]
 }
 ```
