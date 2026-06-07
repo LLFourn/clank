@@ -89,13 +89,25 @@ Two top-level keys:
 - `local_agents`: optional list of additions for THIS repo
   only. Each entry is either:
   - A string (by-name reference): resolved against user-
-    scope `agents`. Lets the user pull in an agent that's
-    not part of their chosen team for this specific repo.
-    Role defaults to reviewer; can be overridden by a
-    fully-inline form.
+    scope `agents`. Pulls in an agent that's not part of
+    the chosen team for this specific repo.
   - A fully-specified inline object: label + tool +
-    optional launch + role. For agents the user wants ONLY
-    in this repo, not declared globally.
+    optional launch. For agents the user wants ONLY in
+    this repo, not declared globally.
+- **All `local_agents` entries are REVIEWERS** (codex
+  66751c8 pin — was previously underspecified, allowing
+  inline `role: "master"` which would conflict with team
+  master / `master_override`). The only path to a master
+  designation in a repo is:
+  - `clank team set-master <team> <agent>` (user-scope
+    team config), OR
+  - `clank promote <agent>` (repo `master_override`).
+  `local_agents` cannot directly designate a master; the
+  by-name and inline forms both omit / ignore any `role`
+  field. To make a local agent the repo's master, add
+  them via `local_agents` AND then `clank promote <label>`.
+  Schema validation rejects `role: "master"` in a
+  `local_agents` inline object with an actionable error.
 
 ### Repo per-agent state (`<repo>/.clank/agents/<label>/config.json`, gitignored)
 
@@ -139,24 +151,41 @@ For a given repo, the registered set is computed as:
 
 ## CLI surface changes
 
-- **`clank init --team <name>`**: writes the team field to
-  `<repo>/.clank/config.json` AND adds `/config.json` to
-  `.clank/.gitignore` AND crashes if it detects the old
-  `agents` block from `agents-declaration-is-user-local`
-  with a clear "this repo is in the old format; re-run
-  `clank init` to migrate." NO silent migration.
-- **`clank init --team <name>`** is ALSO the way to CHANGE
-  the team on an already-initialized repo. Idempotent +
-  re-runnable: rewrites the team field to the new value,
-  leaves `local_agents` and per-agent state files
-  untouched. The registered set changes immediately on
-  the next gate computation. Useful for "I started this
-  repo under `default` but it's really `research` work —
-  swap it."
-- **`clank init`** (no `--team`): on a fresh repo, uses
-  team `default`. On an already-initialized repo, no-op
-  (preserves the existing team selection rather than
-  silently reverting to `default`).
+**`clank init` modes (codex 66751c8 pin — old contract
+was self-contradictory: same command was supposed to both
+crash on old format AND migrate it. Disambiguated via an
+explicit `--migrate` flag).**
+
+- **`clank init --migrate [--team <name>]`** — explicit
+  one-time migration command. Detects old-format signals
+  (`.clank/config.json#/agents` is Some, OR per-agent
+  skeletons have declaration fields like `tool` /
+  `initial_prompt`), then:
+  1. Strips declaration fields from per-agent skeletons
+     (keeps session, auto_mode, wfw_timeout).
+  2. Deletes `.clank/agents/.empty` sentinel if present.
+  3. Writes the chosen team to `<repo>/.clank/config.json`
+     (default team if `--team` not specified).
+  4. Adds `/config.json` to `.clank/.gitignore`.
+  Refuses if NO old-format signal is present (don't run
+  migration on a clean repo — that's a foot-gun; pushes
+  user to plain `init`).
+- **`clank init --team <name>`** (no `--migrate`) — fresh
+  init OR team-switch on a new-format repo.
+  - Fresh repo: write the team to
+    `<repo>/.clank/config.json` + gitignore.
+  - Already-initialized new-format repo: REWRITE the
+    team field. Leaves `local_agents`, `master_override`,
+    per-agent state files untouched. This is the
+    "change team" path ("I started under `default` but
+    it's really `research` work — swap it.").
+  - Old-format repo: REFUSE with
+    "old format detected; re-run with `--migrate` to
+    migrate." Names the detected signal.
+- **`clank init`** (no flags) —
+  - Fresh repo: use team `default`.
+  - New-format repo: no-op (preserves existing team).
+  - Old-format repo: REFUSE with same migrate hint.
 - **`clank agent`** — agent DESCRIPTIONS (the "who"):
   - `add --global <label> --tool <tool> [--launch-cmd ...]`:
     write to user-scope `agents` table.
@@ -322,12 +351,33 @@ the back-compat point we crash against. This plan
 supersedes that one's data model entirely; it's not a
 small revision. Separate plan.
 
+## Multi-user scope (codex 66751c8 pin)
+
+This plan does NOT solve multi-user gate alignment.
+Teams live in each user's `~/.clank/config.json` — they
+share a NAME convention, not a definition. Two users on
+the same repo can each `clank init --team dev` and have
+completely different `dev` compositions on each machine,
+so gate states still diverge.
+
+Concretely: alice's `dev` = {claude (master), codex
+(reviewer)}, bob's `dev` = {grok (master), claude
+(reviewer), alice (reviewer)}. Same repo, same commit,
+different gate state on each machine.
+
+**Scope**: single-user-multi-machine via dotfile sync.
+The user's `~/.clank/config.json` flows to all their
+machines; `dev` means the same thing across their own
+environments. Multi-user gate alignment is OUT OF SCOPE
+and would require a separate tracked snapshot/version
+mechanism (e.g., a tracked
+`<repo>/.clank/team_snapshot.json` capturing the team
+composition at a specific commit so reviewers see the
+same expected set). That mechanism is a separate plan if
+multi-user becomes a real use case; today clank's actual
+workflow is single-user-per-repo and this plan is
+honest about that.
+
 ## Status
 
-Stub — not yet sized. Two follow-up architectural
-revisits queued in conversation:
-- This (team-based registration + un-track config.json).
-- The cleanup of how `expected_reviewers` is computed
-  multi-user (codex previously noted gate divergence
-  between users; team model resolves this since both
-  users on the same team see the same composition).
+Stub — not yet sized.
