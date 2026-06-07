@@ -48,6 +48,26 @@ fn run_init(repo: &Path, env: &[(&str, &str)]) -> std::process::Output {
     cmd.output().expect("spawn clank init")
 }
 
+/// Variant for tests that need a HOME distinct from the repo
+/// (e.g., codex 3cb8002 catch: user-scope `default_agents` at
+/// `$HOME/.clank/config.json` must NOT be re-seeded into a repo
+/// that has its own declaration via the migrated legacy block).
+fn run_init_with_home(repo: &Path, home: &Path, env: &[(&str, &str)]) -> std::process::Output {
+    let mut cmd = Command::new(clank_bin());
+    cmd.arg("init")
+        .arg("--yes")
+        .arg("--repo")
+        .arg(repo)
+        .env_remove("CLAUDE_CODE_SESSION_ID")
+        .env_remove("CODEX_THREAD_ID")
+        .env_remove("CLANK_AGENT")
+        .env("HOME", home);
+    for (k, v) in env {
+        cmd.env(k, v);
+    }
+    cmd.output().expect("spawn clank init")
+}
+
 #[test]
 fn init_auto_claims_master_when_no_existing_agents() {
     let dir = init_repo();
@@ -211,6 +231,61 @@ fn init_with_repo_scope_agents_seeds_override_set() {
     assert!(
         !repo.join(".clank/agents/ruthless/config.json").exists(),
         "user-scope agent must NOT be seeded when repo-scope is present"
+    );
+}
+
+#[test]
+fn init_migrates_legacy_block_does_not_reseed_user_scope_with_separate_home() {
+    // Codex 3cb8002 catch: when HOME is distinct from the repo,
+    // pre-fix init ran migrate_legacy_agents_block (alice's
+    // legacy entry → .clank/agents/alice/config.json, key
+    // removed) and then seed_default_agents fell back to
+    // user-scope `default_agents` since the repo key was gone.
+    // Result: the repo got BOTH alice (from migration) AND
+    // codex (from user-scope), violating the legacy REPLACE
+    // semantic that "repo agents block overrides user-scope."
+    //
+    // Post-fix: seed_default_agents detects that the repo
+    // already has a declaration (skeletons exist post-migration,
+    // OR sentinel file exists) and skips user-scope seeding.
+    let dir = init_repo();
+    let repo = dir.path();
+    let home_dir = tempfile::tempdir().unwrap();
+    let home = home_dir.path();
+
+    // User-scope defaults: codex (would be wrongly seeded pre-fix).
+    write_user_config_typed(
+        home,
+        &clank::cli::config::UserConfigFile {
+            default_agents: Some(vec![user_agent("codex")]),
+            ..Default::default()
+        },
+    );
+    // Repo-scope legacy block: alice (will be migrated). Exercises
+    // the pre-migration legacy `agents` field shape directly.
+    std::fs::create_dir_all(repo.join(".clank")).unwrap();
+    let legacy_block_body =
+        // allow-json-literal: pre-fix shape we defend the migration against
+        r#"{"agents":[{"label":"alice","role":"master","tool":"claude"}]}"#;
+    std::fs::write(repo.join(".clank/config.json"), legacy_block_body).unwrap();
+
+    let out = run_init_with_home(repo, home, &[("CLAUDE_CODE_SESSION_ID", CLAUDE_SESSION)]);
+    assert!(
+        out.status.success(),
+        "init failed: stderr=`{}`",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // alice's skeleton must exist (migrated from legacy block).
+    assert!(
+        repo.join(".clank/agents/alice/config.json").exists(),
+        "migrated alice must have a skeleton"
+    );
+    // codex's skeleton must NOT exist — user-scope was suppressed
+    // by the migrated repo declaration.
+    assert!(
+        !repo.join(".clank/agents/codex/config.json").exists(),
+        "user-scope codex must NOT be seeded when repo has migrated declaration"
     );
 }
 

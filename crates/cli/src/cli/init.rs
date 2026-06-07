@@ -39,8 +39,8 @@ pub async fn run(args: InitArgs) -> anyhow::Result<()> {
     write_claude_perms(&repo)?;
     write_post_rewrite_hook(&repo, args.force_hooks)?;
     warn_if_globally_excluded(&repo);
-    migrate_legacy_agents_block(&repo)?;
-    let default_agent_labels = seed_default_agents(&repo)?;
+    let migrated_labels = migrate_legacy_agents_block_collecting(&repo)?;
+    let default_agent_labels = seed_default_agents(&repo, &migrated_labels)?;
     bootstrap_agent_identity(&repo, args.yes, &default_agent_labels).await?;
     Ok(())
 }
@@ -62,10 +62,26 @@ pub async fn run(args: InitArgs) -> anyhow::Result<()> {
 /// `.clank/config.json`. Idempotent: re-running with the key
 /// already absent is a no-op.
 pub(crate) fn migrate_legacy_agents_block(repo: &Path) -> anyhow::Result<()> {
+    migrate_legacy_agents_block_collecting(repo).map(|_| ())
+}
+
+/// Same as [`migrate_legacy_agents_block`] but returns the set of
+/// labels that were migrated from the legacy block in case A
+/// (Some(non-empty)). Empty for case B (sentinel) and the no-op
+/// case. Plan agents-declaration-is-user-local + codex 3cb8002:
+/// the migrated set feeds bootstrap_agent_identity's
+/// `preserve_existing_role` check — the user stated role for these
+/// labels via the legacy block, just like user-scope
+/// `default_agents`.
+pub(crate) fn migrate_legacy_agents_block_collecting(
+    repo: &Path,
+) -> anyhow::Result<std::collections::HashSet<AgentLabel>> {
     let cfg_path = repo.join(".clank/config.json");
     let body = match std::fs::read_to_string(&cfg_path) {
         Ok(b) => b,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(std::collections::HashSet::new());
+        }
         Err(e) => {
             return Err(anyhow::Error::from(e))
                 .with_context(|| format!("reading {}", cfg_path.display()));
@@ -75,14 +91,15 @@ pub(crate) fn migrate_legacy_agents_block(repo: &Path) -> anyhow::Result<()> {
         serde_json::from_str(&body).with_context(|| format!("parsing {}", cfg_path.display()))?;
     let obj = match value.as_object_mut() {
         Some(o) => o,
-        None => return Ok(()),
+        None => return Ok(std::collections::HashSet::new()),
     };
     let agents_val = match obj.remove("agents") {
         Some(v) => v,
-        None => return Ok(()), // No legacy block; nothing to do.
+        None => return Ok(std::collections::HashSet::new()), // No legacy block; nothing to do.
     };
     let agents: Vec<crate::cli::config::DefaultAgent> = serde_json::from_value(agents_val)
         .with_context(|| format!("parsing legacy `agents` block in {}", cfg_path.display()))?;
+    let mut migrated_labels = std::collections::HashSet::new();
     if agents.is_empty() {
         // Case B: explicit empty → quarantine any pre-existing
         // skeleton config.json files (their declarations were
@@ -126,6 +143,7 @@ pub(crate) fn migrate_legacy_agents_block(repo: &Path) -> anyhow::Result<()> {
     } else {
         // Case A: materialize each entry into its skeleton.
         for entry in &agents {
+            migrated_labels.insert(entry.label.clone());
             let skel_path = crate::agent_store::agent_config_path(repo, &entry.label);
             let existing = std::fs::read_to_string(&skel_path).ok();
             let mut cfg: clank_core::agent_config::AgentConfig = match existing {
@@ -151,7 +169,7 @@ pub(crate) fn migrate_legacy_agents_block(repo: &Path) -> anyhow::Result<()> {
     let new_body = serde_json::to_string_pretty(&value)
         .with_context(|| format!("re-serializing {}", cfg_path.display()))?;
     std::fs::write(&cfg_path, new_body + "\n")?;
-    Ok(())
+    Ok(migrated_labels)
 }
 
 /// Seed per-agent config skeletons from `~/.clank/config.json`'s
@@ -180,22 +198,63 @@ pub(crate) fn migrate_legacy_agents_block(repo: &Path) -> anyhow::Result<()> {
 /// of whether they were newly seeded or skipped because their config
 /// already existed). `bootstrap_agent_identity` consumes this set to
 /// decide which calling-agent roles to preserve.
-fn seed_default_agents(repo: &Path) -> anyhow::Result<std::collections::HashSet<AgentLabel>> {
+fn seed_default_agents(
+    repo: &Path,
+    migrated_labels: &std::collections::HashSet<AgentLabel>,
+) -> anyhow::Result<std::collections::HashSet<AgentLabel>> {
     let home = std::env::var_os("HOME").map(PathBuf::from);
-    // Use the declaration-only loader (NOT load_merged_agents) so
-    // the legacy-skeleton fallback doesn't count pre-existing
-    // skeletons as "things the user asked to seed." Codex caught
-    // the unmigrated seeding on eef4c49; the legacy-fallback
-    // leakage was caught on da71c84.
-    let agents = crate::cli::config::load_declared_agents(repo, home.as_deref())?;
+
+    // `declared` (returned) is the union of labels the user has
+    // EXPLICITLY OPINED ABOUT across both scopes:
+    // - User-scope `default_agents` (explicit user intent).
+    // - Labels migrated from the legacy `agents` block at init time
+    //   (the legacy block was an explicit user declaration of role).
+    //
+    // It does NOT include pre-existing per-agent skeletons that
+    // came from a prior `clank as` bind, since those skeletons may
+    // hold a default role rather than a user-stated preference.
+    // bootstrap_agent_identity uses `declared` to preserve role
+    // for labels the user has opined about — including those the
+    // legacy block opined about — and to leave non-opined labels
+    // eligible for the master-claim flow.
+    let user_decls = crate::cli::config::load_default_agents(home.as_deref())?;
+    let post_migration_skeletons = crate::cli::config::load_skeleton_agents(repo)?;
     let mut declared = std::collections::HashSet::new();
-    if agents.is_empty() {
+    for entry in &user_decls {
+        declared.insert(entry.label.clone());
+    }
+    for label in migrated_labels {
+        declared.insert(label.clone());
+    }
+
+    // Plan agents-declaration-is-user-local + codex 3cb8002 catch:
+    // if the repo already has its own declaration (sentinel for
+    // explicit-empty, OR any per-agent skeleton because the
+    // legacy-block migration above just materialized them), do
+    // NOT seed user-scope defaults — that would conflate the
+    // repo's REPLACE override with the user's defaults.
+    //
+    // Without this check, init's ordering on a separate-HOME repo:
+    //   1. migrate_legacy_agents_block: alice (legacy) →
+    //      .clank/agents/alice/config.json. Key removed.
+    //   2. seed_default_agents (this fn): sees no legacy block
+    //      now, falls back to user-scope `default_agents`,
+    //      seeds codex too. The repo now has both alice AND
+    //      codex even though pre-init it had ONLY alice.
+    let repo_has_declaration = crate::cli::config::empty_sentinel_path(repo).is_file()
+        || !post_migration_skeletons.is_empty();
+    if repo_has_declaration {
+        return Ok(declared);
+    }
+
+    // No repo declaration → seed user-scope `default_agents` as
+    // new skeletons.
+    if user_decls.is_empty() {
         return Ok(declared);
     }
     let mut seeded = Vec::new();
     let mut skipped = Vec::new();
-    for entry in &agents {
-        declared.insert(entry.label.clone());
+    for entry in &user_decls {
         let config_path = crate::agent_store::agent_config_path(repo, &entry.label);
         if config_path.exists() {
             skipped.push(entry.label.as_str().to_string());
