@@ -166,19 +166,26 @@ discover.
     per-agent state files untouched. ("I started under
     `default` but it's really `research` work — swap it.")
   - **Old-format repo** (has `.clank/config.json#/agents`
-    block OR per-agent skeletons with `tool` /
-    `initial_prompt` declaration fields):
-    1. Strip declaration fields from per-agent skeletons
-       (keeps session, auto_mode, wfw_timeout).
-    2. Delete `.clank/agents/.empty` sentinel if present.
-    3. Remove the legacy `agents` key from
+    block):
+    1. Remove the legacy `agents` key from
        `.clank/config.json`.
-    4. Write the chosen team.
-    5. Gitignore `config.json`.
-    Print a clear stderr summary: `cleaned up old-format
-    artifacts (N skeleton fields stripped, sentinel
-    removed, legacy agents block dropped) and set team to
-    <name>.` The user knows exactly what changed.
+    2. Write the chosen team.
+    3. Gitignore `config.json` (add `/config.json` to
+       `.clank/.gitignore`; warn if the file is currently
+       tracked in git — user must `git rm --cached
+       .clank/config.json` to untrack the committed
+       copy).
+    Per-agent dirs (`.clank/agents/<label>/`) and the
+    `.empty` sentinel are LEFT ALONE.  Sessions are
+    sacred — `clank init` must never risk corrupting a
+    bound `clank as` session. Any leftover declaration
+    fields (`tool`, `initial_prompt`) in per-agent
+    skeletons become harmless dead bytes; the new
+    resolution doesn't read them.
+    Print a clear stderr summary: `cleaned up
+    .clank/config.json (legacy agents key dropped, team
+    set to <name>, gitignored).` The user knows what
+    changed; what wasn't touched is implicit.
 - **`clank init`** (no `--team`) —
   - Fresh repo: use team `default`.
   - New-format repo with existing team: no-op (preserves
@@ -271,19 +278,31 @@ detection signals are present.
 
 ## What goes away
 
-- `.clank/agents/.empty` sentinel and ALL its lifecycle
-  code (sentinel-aware checks in init bootstrap, `clank
-  as`, `clank auto on/off`, etc.). The new model doesn't
-  need it.
+- All sentinel-aware code paths in the production code:
+  the checks in `bootstrap_agent_identity`, `clank as`,
+  `clank auto on/off`, `clank agent add/remove`'s
+  sentinel lifecycle. The new resolution never reads the
+  sentinel file; if it's present on disk from an
+  unmigrated repo, the new code ignores it (the file is
+  harmless dead bytes).
 - `DefaultAgent` in `crates/cli/src/cli/config.rs` —
   superseded by `AgentDescription` + `TeamComposition`.
 - The `RepoConfigFile.agents` deprecated field.
 - `clank agent add`'s skeleton write — skeletons no
-  longer carry declaration fields.
+  longer carry declaration fields. The skeleton becomes
+  purely state.
 - The legacy-migration code in `clank init` from the
-  prior plan (`agents-declaration-is-user-local`) — old
-  repos crash with "re-run clank init" instead of being
-  auto-migrated.
+  prior plan (`agents-declaration-is-user-local`) —
+  replaced by the simpler config.json-only cleanup
+  described above.
+
+**What stays on disk** (potentially, from old repos):
+- `.clank/agents/<label>/config.json` files with leftover
+  declaration fields. Sessions are sacred; init never
+  touches these.
+- `.clank/agents/.empty` if present. New code ignores
+  it; we don't clean it up because that's still a
+  per-agent-dir write.
 
 ## Why this matters
 
