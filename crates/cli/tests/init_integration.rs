@@ -290,6 +290,101 @@ fn init_migrates_legacy_block_does_not_reseed_user_scope_with_separate_home() {
 }
 
 #[test]
+fn init_with_explicit_empty_block_does_not_bootstrap_or_resurrect_skeleton() {
+    // Codex 7e2983f catch: pre-fix the explicit-empty migration
+    // wrote the `.empty` sentinel, but `bootstrap_agent_identity`
+    // unconditionally wrote the calling agent's skeleton. The
+    // skeleton was suppressed by the sentinel in load_merged_agents,
+    // so `agent list` was clean — but a later
+    // `clank agent add bob` (which clears the sentinel as the
+    // 0→1 transition) would RESURRECT the hidden skeleton and
+    // register both bob AND the bootstrap-bound agent.
+    //
+    // Post-fix: bootstrap respects the sentinel and SKIPS binding,
+    // printing a note that explains how to opt in (`clank agent
+    // add <label>`).
+    let dir = init_repo();
+    let repo = dir.path();
+    let home_dir = tempfile::tempdir().unwrap();
+    let home = home_dir.path();
+
+    // User-scope user has codex in their defaults (would be
+    // seeded if the repo didn't have explicit-empty).
+    write_user_config_typed(
+        home,
+        &clank::cli::config::UserConfigFile {
+            default_agents: Some(vec![user_agent("codex")]),
+            ..Default::default()
+        },
+    );
+    // Repo-scope legacy block: explicit empty.
+    std::fs::create_dir_all(repo.join(".clank")).unwrap();
+    let explicit_empty_body =
+        // allow-json-literal: pre-fix shape we defend the migration against
+        r#"{"agents":[]}"#;
+    std::fs::write(repo.join(".clank/config.json"), explicit_empty_body).unwrap();
+
+    // Run init INSIDE codex.
+    let out = run_init_with_home(repo, home, &[("CODEX_THREAD_ID", CODEX_SESSION)]);
+    assert!(
+        out.status.success(),
+        "init failed: stderr=`{}`",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // No skeletons must exist. The sentinel does.
+    assert!(
+        repo.join(".clank/agents/.empty").is_file(),
+        "sentinel must be present (explicit-empty intent)"
+    );
+    assert!(
+        !repo.join(".clank/agents/codex/config.json").is_file(),
+        "bootstrap must NOT write a hidden skeleton when sentinel is active"
+    );
+
+    // load_merged_agents reflects the empty intent.
+    let merged = clank::cli::config::load_merged_agents(repo, Some(home)).unwrap();
+    assert!(
+        merged.is_empty(),
+        "merged view must respect explicit-empty post-init; got {merged:?}"
+    );
+
+    // Now run `clank agent add bob --tool claude`. The pre-fix
+    // bug: this would resurrect the hidden codex skeleton.
+    let bin = clank_bin();
+    let mut cmd = Command::new(bin);
+    let add_out = cmd
+        .args(["agent", "add", "bob", "--tool", "claude"])
+        .arg("--repo")
+        .arg(repo)
+        .env("HOME", home)
+        .env_remove("CLAUDE_CODE_SESSION_ID")
+        .env_remove("CODEX_THREAD_ID")
+        .env_remove("CLANK_AGENT")
+        .output()
+        .expect("spawn clank agent add");
+    assert!(
+        add_out.status.success(),
+        "add failed: stderr=`{}`",
+        String::from_utf8_lossy(&add_out.stderr)
+    );
+    // Post-state: only bob is registered. No resurrected codex.
+    let after = clank::cli::config::load_merged_agents(repo, Some(home)).unwrap();
+    let names: Vec<_> = after.iter().map(|e| e.label.as_str().to_string()).collect();
+    assert_eq!(
+        names,
+        vec!["bob".to_string()],
+        "post-state must be EXACTLY [bob] — explicit-empty intent must not allow bootstrap-written codex to resurrect; got {names:?}"
+    );
+    assert!(
+        !repo.join(".clank/agents/codex/config.json").is_file(),
+        "codex skeleton must NOT exist (would be the resurrection bug)"
+    );
+}
+
+const CODEX_SESSION: &str = "019e54b7-b1c9-7552-8075-69db24499247";
+
+#[test]
 fn init_default_agents_idempotent_preserves_existing_session() {
     // Existing per-agent config (with a session field) must not be
     // overwritten by clank init.

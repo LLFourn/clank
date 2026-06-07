@@ -538,6 +538,23 @@ async fn bootstrap_agent_identity(
         return Ok(());
     };
 
+    // Codex 7e2983f catch: respect explicit-empty (`.empty`
+    // sentinel) — don't write a hidden skeleton that a
+    // subsequent `clank agent add` would resurrect by clearing
+    // the sentinel.
+    if crate::cli::config::empty_sentinel_path(repo).is_file() {
+        println!(
+            "explicit-empty agents declaration is active \
+             (.clank/agents/.empty present); skipping identity \
+             bootstrap. To register the calling agent, run \
+             `clank agent add <label> --tool {}` (which will \
+             clear the sentinel as the 0→1 transition).",
+            tool.as_str()
+        );
+        let _ = session_id; // kept for symmetry; not bound here
+        return Ok(());
+    }
+
     let default_label = match tool {
         Tool::Claude => "claude",
         Tool::Codex => "codex",
