@@ -175,8 +175,9 @@ folding over `team` entries in order:
    `commit_reviewers = []`, `gate_reviewers = []`.
 3. For each entry in the array:
    - **`{ "include": "<team-name>" }`**: look up the
-     team in `~/.clank/config.json#/teams`. Set
-     `master = agents[team.master]`. Append
+     team in `~/.clank/config.json#/teams`. If
+     `team.master` is `Some(label)`, set
+     `master = Some(agents[label])`. Append
      `agents[team.commit_reviewers[i]]` to
      `commit_reviewers`. Append
      `agents[team.gate_reviewers[i]]` to
@@ -195,16 +196,29 @@ folding over `team` entries in order:
    - new_master = registered agent matching the
      `promoted` label (looked up in the set built so
      far — must be present somewhere, else error).
-   - prev_master = current `master`.
+   - prev_master = current `master` (may be None if
+     the included team has no master designated).
    - Master = new_master.
    - commit_reviewers = (existing commit_reviewers ∪
-     {prev_master}) − {new_master}.
+     (prev_master.into_iter())) − {new_master}.
    - gate_reviewers = existing gate_reviewers − {new_master}.
-   - (Demoted prev_master always joins commit_reviewers
-     since gate-tier is for opt-in lighter-touch
-     reviewers; the demoted master should be tracking
-     every commit.)
-5. The resulting (master, commit_reviewers,
+   - (When prev_master is None, no demotion happens —
+     `promoted` is the first master designation.)
+5. **Validate master is set** (codex 4c79ed2 catch): if
+   `master` is still `None` after step 4, the repo's team
+   composition has no master and `promoted` wasn't set
+   at repo scope. Error with hint:
+   ```
+   team `<name>` has no master designated. Either set a
+   team-level master via `clank team set-master <name>
+   <agent>`, or designate a per-repo master via
+   `clank promote <agent>`.
+   ```
+   This validation runs at registration-resolution time,
+   NOT at config deserialize time — empty-team scaffolding
+   via `clank team create` is allowed as a transient
+   state.
+6. The resulting (master, commit_reviewers,
    gate_reviewers) tuple IS the registered set for this
    repo.
 
@@ -541,7 +555,17 @@ pub struct AgentDescription {
 
 #[derive(Deserialize, Serialize)]
 pub struct TeamComposition {
-    pub master: AgentLabel,
+    /// Optional at the storage layer so `clank team create
+    /// <name>` can scaffold an empty team. Validated as
+    /// REQUIRED at USE time (codex 4c79ed2 catch — was
+    /// non-optional, conflicted with CLI's empty-create
+    /// flow). Resolution: if a repo's `team` includes a
+    /// team whose `master` is None AND `promoted` isn't
+    /// set at repo scope, error with a hint pointing at
+    /// `clank team set-master <team> <agent>` or
+    /// `clank promote <agent>`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub master: Option<AgentLabel>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub commit_reviewers: Vec<AgentLabel>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -638,13 +662,28 @@ to `main` with the file path and serde's structural
 explanation. No bespoke detection code.
 
 `clank init` is the only command that NEEDS to recognize
-the old shape (so it can clean it up). It attempts the
-new-format deserialize first; on failure, attempts a
-`LegacyRepoConfigFile` typed-struct fallback (with the old
-`agents: Option<Vec<DefaultAgent>>` field). If the legacy
-deserialize succeeds, init runs the cleanup described in
-the CLI surface section. If both fail, the error
-propagates as above.
+the old shape (so it can clean it up). It has TWO triggers
+for migration (codex 4c79ed2 catch — was specified for
+the first only, missing the success-with-extra path):
+
+1. **New-format deserialize fails entirely** (e.g., the
+   old `agents` field was the top-level shape and the
+   types didn't line up): attempt a
+   `LegacyRepoConfigFile` typed-struct fallback with
+   the old `agents: Option<Vec<DefaultAgent>>` field. If
+   the legacy deserialize succeeds, run cleanup. If both
+   fail, error propagates as above.
+2. **New-format deserialize succeeds AND
+   `repo_config.extra.contains_key("agents")`**: the
+   legacy `agents` key landed in the flatten catchall.
+   Init mutates `extra` to drop the key, then writes
+   back through typed serde. Other commands tolerate the
+   key in `extra` (it's invisible to registered-set
+   resolution), but init cleans it up as a one-time
+   migration.
+
+Both triggers converge on "clean new-format config without
+the legacy key."
 
 **Migration write path**: init mutates the typed
 `RepoConfigFile` in memory (drops the legacy block, sets
