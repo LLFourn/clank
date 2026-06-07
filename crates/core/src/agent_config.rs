@@ -52,6 +52,18 @@ pub struct AgentConfig {
     /// this agent's spawner.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub launch: Option<LaunchConfig>,
+    /// Tool this agent runs (claude / codex). First-class as of
+    /// `agents-declaration-is-user-local` — previously derived
+    /// from `session.tool`, which gave `None` for unbound agents
+    /// and caused the bootstrap-no-tool synthesis bug.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool: Option<Tool>,
+    /// Initial prompt to splice into the launch argv after
+    /// `launch.args` (and after the session-restore suffix for
+    /// bound agents). `Some("")` is the explicit-disable gesture
+    /// — see `resolve_initial_prompt` in `cli::agent`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub initial_prompt: Option<String>,
 }
 
 /// General-purpose launch profile: executable + args + env.
@@ -155,6 +167,8 @@ mod tests {
                 updated_at: "2026-05-23T16:24:47+10:00".into(),
             }),
             launch: None,
+            tool: None,
+            initial_prompt: None,
         };
         let json = serde_json::to_string(&cfg).unwrap();
         let back: AgentConfig = serde_json::from_str(&json).unwrap();
@@ -221,6 +235,8 @@ mod tests {
                 args: vec!["--profile".to_string(), "deep".to_string()],
                 env,
             }),
+            tool: None,
+            initial_prompt: None,
         };
         let json = serde_json::to_string(&cfg).unwrap();
         let back: AgentConfig = serde_json::from_str(&json).unwrap();

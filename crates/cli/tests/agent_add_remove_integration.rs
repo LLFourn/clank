@@ -74,8 +74,10 @@ impl Env {
 
 fn read_repo_config(repo: &Path) -> RepoConfigFile {
     let path = repo.join(".clank/config.json");
-    let body = std::fs::read_to_string(&path).expect("repo config exists");
-    serde_json::from_str(&body).expect("repo config parses as RepoConfigFile")
+    match std::fs::read_to_string(&path) {
+        Ok(body) => serde_json::from_str(&body).expect("repo config parses as RepoConfigFile"),
+        Err(_) => RepoConfigFile::default(),
+    }
 }
 
 fn read_user_config(home: &Path) -> UserConfigFile {
@@ -101,6 +103,23 @@ fn write_repo_config(repo: &Path, file: &RepoConfigFile) {
         serde_json::to_string_pretty(file).unwrap(),
     )
     .unwrap();
+}
+
+/// Write a per-agent skeleton with declaration fields populated.
+/// Use instead of write_repo_config's agents block for fixtures
+/// that need to seed the new per-agent declaration shape.
+fn write_skeleton_declaration(
+    repo: &Path,
+    label: &str,
+    role: Role,
+    tool: Option<clank_core::vocab::Tool>,
+) {
+    let cfg = clank_core::agent_config::AgentConfig {
+        role,
+        tool,
+        ..Default::default()
+    };
+    clank::agent_store::save_agent_config(repo, &AgentLabel::parse(label).unwrap(), &cfg).unwrap();
 }
 
 fn write_user_config(home: &Path, file: &UserConfigFile) {
@@ -135,8 +154,7 @@ fn clank_agent_add_writes_list_entry_and_skeleton() {
         String::from_utf8_lossy(&out.stderr)
     );
     // Declaration: full DefaultAgent (label + role + tool + launch).
-    let repo = read_repo_config(env.repo());
-    let agents = repo.agents.expect("agents key present");
+    let agents = clank::cli::config::load_skeleton_agents(env.repo()).unwrap();
     assert_eq!(agents.len(), 1);
     let entry = &agents[0];
     assert_eq!(entry.label.as_str(), "codex");
@@ -160,8 +178,7 @@ fn clank_agent_add_no_launch_flags_leaves_launch_none() {
     let env = Env::new();
     let out = env.agent(&["add", "alice", "--tool", "claude"]);
     assert!(out.status.success(), "add failed");
-    let repo = read_repo_config(env.repo());
-    let agents = repo.agents.unwrap();
+    let agents = clank::cli::config::load_skeleton_agents(env.repo()).unwrap();
     assert!(
         agents[0].launch.is_none(),
         "no --launch-* flags → declaration.launch must be None; got {:?}",
@@ -197,8 +214,7 @@ fn clank_agent_add_initial_prompt_persists_to_config() {
         "add failed: {}",
         String::from_utf8_lossy(&out.stderr)
     );
-    let repo = read_repo_config(env.repo());
-    let agents = repo.agents.unwrap();
+    let agents = clank::cli::config::load_skeleton_agents(env.repo()).unwrap();
     assert_eq!(
         agents[0].initial_prompt.as_deref(),
         Some("custom prompt"),
@@ -220,8 +236,7 @@ fn clank_agent_add_empty_initial_prompt_persists_as_empty_string() {
         "add with empty --initial-prompt failed: {}",
         String::from_utf8_lossy(&out.stderr)
     );
-    let repo = read_repo_config(env.repo());
-    let agents = repo.agents.unwrap();
+    let agents = clank::cli::config::load_skeleton_agents(env.repo()).unwrap();
     assert_eq!(
         agents[0].initial_prompt.as_deref(),
         Some(""),
@@ -274,8 +289,8 @@ fn clank_agent_add_refuses_duplicate_at_same_scope() {
         "diagnostic should mention duplicate; got: {stderr}"
     );
     // Filesystem unchanged: still one entry.
-    let repo = read_repo_config(env.repo());
-    assert_eq!(repo.agents.unwrap().len(), 1);
+    let agents = clank::cli::config::load_skeleton_agents(env.repo()).unwrap();
+    assert_eq!(agents.len(), 1);
 }
 
 #[test]
@@ -301,9 +316,9 @@ fn clank_agent_add_repo_scope_shadows_user_scope_with_notice() {
         stderr.contains("shadows user-scope") || stderr.contains("shadows"),
         "stderr must include shadow notice; got: {stderr}"
     );
-    // Repo-scope now has codex.
-    let repo = read_repo_config(env.repo());
-    assert_eq!(repo.agents.unwrap()[0].label.as_str(), "codex");
+    // Repo-scope now has codex (per-agent skeleton).
+    let agents = clank::cli::config::load_skeleton_agents(env.repo()).unwrap();
+    assert_eq!(agents[0].label.as_str(), "codex");
 }
 
 #[test]
@@ -409,6 +424,8 @@ fn clank_agent_remove_drops_role_from_resolve_even_when_skeleton_preserved() {
         wfw_timeout: None,
         session: None,
         launch: None,
+        tool: None,
+        initial_prompt: None,
     };
     clank::agent_store::save_agent_config(env.repo(), &AgentLabel::parse("codex").unwrap(), &cfg)
         .unwrap();
@@ -455,15 +472,28 @@ fn clank_agent_promote_flips_reviewer_to_master() {
         "promote failed: stderr=`{}`",
         String::from_utf8_lossy(&out.stderr)
     );
-    let repo = read_repo_config(env.repo());
-    let entry = &repo.agents.unwrap()[0];
+    let agents = clank::cli::config::load_skeleton_agents(env.repo()).unwrap();
+    let entry = &agents[0];
     assert_eq!(entry.label.as_str(), "codex");
     assert_eq!(entry.role, Role::Master);
-    let after_skeleton =
-        std::fs::read_to_string(env.repo().join(".clank/agents/codex/config.json")).unwrap();
+    // Plan agents-declaration-is-user-local: promote now mutates
+    // the skeleton's `role` field (the skeleton IS the declaration).
+    // The session/auto_mode/wfw_timeout MUST be preserved.
+    let after_cfg: clank_core::agent_config::AgentConfig = serde_json::from_str(
+        &std::fs::read_to_string(env.repo().join(".clank/agents/codex/config.json")).unwrap(),
+    )
+    .unwrap();
+    let before_cfg: clank_core::agent_config::AgentConfig =
+        serde_json::from_str(&before_skeleton).unwrap();
+    assert_eq!(after_cfg.role, Role::Master);
+    assert_eq!(before_cfg.session, after_cfg.session, "session preserved");
     assert_eq!(
-        before_skeleton, after_skeleton,
-        "skeleton must NOT be modified by promote"
+        before_cfg.auto_mode, after_cfg.auto_mode,
+        "auto_mode preserved"
+    );
+    assert_eq!(
+        before_cfg.wfw_timeout, after_cfg.wfw_timeout,
+        "wfw_timeout preserved"
     );
 }
 
@@ -487,8 +517,7 @@ fn clank_agent_promote_swaps_old_master_to_reviewer() {
         "stderr must announce promoted=bob + demoted=alice; got: {stderr}"
     );
 
-    let repo = read_repo_config(env.repo());
-    let agents = repo.agents.unwrap();
+    let agents = clank::cli::config::load_skeleton_agents(env.repo()).unwrap();
     let alice = agents.iter().find(|e| e.label.as_str() == "alice").unwrap();
     let bob = agents.iter().find(|e| e.label.as_str() == "bob").unwrap();
     assert_eq!(alice.role, Role::Reviewer);
@@ -501,10 +530,12 @@ fn clank_agent_promote_no_op_when_already_only_master() {
     env.agent(&["add", "alice", "--tool", "claude", "--role", "master"]);
     env.agent(&["add", "bob", "--tool", "codex"]);
 
-    // mtime baseline of the declaration file.
-    let cfg_path = env.repo().join(".clank/config.json");
-    let before_mtime = std::fs::metadata(&cfg_path).unwrap().modified().unwrap();
-    // Sleep enough that a write would produce a different mtime.
+    // Plan agents-declaration-is-user-local: skeleton IS the
+    // declaration. mtime baseline of alice's skeleton.
+    let alice_skel = env.repo().join(".clank/agents/alice/config.json");
+    let bob_skel = env.repo().join(".clank/agents/bob/config.json");
+    let alice_before = std::fs::metadata(&alice_skel).unwrap().modified().unwrap();
+    let bob_before = std::fs::metadata(&bob_skel).unwrap().modified().unwrap();
     std::thread::sleep(std::time::Duration::from_millis(20));
 
     let out = env.agent(&["promote", "alice"]);
@@ -514,10 +545,15 @@ fn clank_agent_promote_no_op_when_already_only_master() {
         stderr.contains("already the only master"),
         "no-op must announce it; got: {stderr}"
     );
-    let after_mtime = std::fs::metadata(&cfg_path).unwrap().modified().unwrap();
+    let alice_after = std::fs::metadata(&alice_skel).unwrap().modified().unwrap();
+    let bob_after = std::fs::metadata(&bob_skel).unwrap().modified().unwrap();
     assert_eq!(
-        before_mtime, after_mtime,
-        "no-op promote must not rewrite the declaration"
+        alice_before, alice_after,
+        "no-op promote must not rewrite alice's skeleton"
+    );
+    assert_eq!(
+        bob_before, bob_after,
+        "no-op promote must not rewrite bob's skeleton"
     );
 }
 
@@ -536,8 +572,7 @@ fn clank_agent_promote_from_zero_masters() {
         "zero prior masters means no demotion suffix; got: {stderr}"
     );
 
-    let repo = read_repo_config(env.repo());
-    let agents = repo.agents.unwrap();
+    let agents = clank::cli::config::load_skeleton_agents(env.repo()).unwrap();
     let alice = agents.iter().find(|e| e.label.as_str() == "alice").unwrap();
     let bob = agents.iter().find(|e| e.label.as_str() == "bob").unwrap();
     assert_eq!(alice.role, Role::Master);
@@ -552,42 +587,32 @@ fn clank_agent_promote_repairs_pre_existing_multi_master() {
     // have exactly one master regardless of how many existed
     // before.
     let env = Env::new();
-    // Hand-write the buggy state — 3 masters + 1 reviewer.
-    write_repo_config(
+    // Plan agents-declaration-is-user-local: skeletons hold the
+    // declaration. Hand-write the buggy state — 3 masters + 1
+    // reviewer — as per-agent skeletons.
+    write_skeleton_declaration(
         env.repo(),
-        &RepoConfigFile {
-            agents: Some(vec![
-                clank::cli::config::DefaultAgent {
-                    label: AgentLabel::parse("alice").unwrap(),
-                    role: Role::Master,
-                    tool: Some(clank_core::vocab::Tool::Claude),
-                    launch: None,
-                    initial_prompt: None,
-                },
-                clank::cli::config::DefaultAgent {
-                    label: AgentLabel::parse("bob").unwrap(),
-                    role: Role::Master,
-                    tool: Some(clank_core::vocab::Tool::Codex),
-                    launch: None,
-                    initial_prompt: None,
-                },
-                clank::cli::config::DefaultAgent {
-                    label: AgentLabel::parse("carol").unwrap(),
-                    role: Role::Master,
-                    tool: Some(clank_core::vocab::Tool::Claude),
-                    launch: None,
-                    initial_prompt: None,
-                },
-                clank::cli::config::DefaultAgent {
-                    label: AgentLabel::parse("dave").unwrap(),
-                    role: Role::Reviewer,
-                    tool: Some(clank_core::vocab::Tool::Codex),
-                    launch: None,
-                    initial_prompt: None,
-                },
-            ]),
-            ..Default::default()
-        },
+        "alice",
+        Role::Master,
+        Some(clank_core::vocab::Tool::Claude),
+    );
+    write_skeleton_declaration(
+        env.repo(),
+        "bob",
+        Role::Master,
+        Some(clank_core::vocab::Tool::Codex),
+    );
+    write_skeleton_declaration(
+        env.repo(),
+        "carol",
+        Role::Master,
+        Some(clank_core::vocab::Tool::Claude),
+    );
+    write_skeleton_declaration(
+        env.repo(),
+        "dave",
+        Role::Reviewer,
+        Some(clank_core::vocab::Tool::Codex),
     );
 
     let out = env.agent(&["promote", "dave"]);
@@ -608,8 +633,7 @@ fn clank_agent_promote_repairs_pre_existing_multi_master() {
 
     // Post-state must have exactly one master (dave), all
     // others reviewers.
-    let repo = read_repo_config(env.repo());
-    let agents = repo.agents.unwrap();
+    let agents = clank::cli::config::load_skeleton_agents(env.repo()).unwrap();
     let masters: Vec<_> = agents.iter().filter(|e| e.role == Role::Master).collect();
     assert_eq!(
         masters.len(),
@@ -629,7 +653,13 @@ fn clank_agent_promote_errors_when_label_absent() {
     let out = env.agent(&["promote", "phantom"]);
     assert!(!out.status.success(), "promote of missing label must error");
     let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(stderr.contains("phantom") && stderr.contains("not in repo-scope"));
+    // Post agents-declaration-is-user-local: the error mentions the
+    // per-agent skeleton path (the new declaration home).
+    assert!(stderr.contains("phantom"));
+    assert!(
+        stderr.contains("not registered") || stderr.contains("not in repo-scope"),
+        "stderr should classify as not-registered; got: {stderr}"
+    );
 }
 
 #[test]
@@ -655,53 +685,44 @@ fn clank_agent_promote_atomic_write() {
     // the helper's "no I/O" contract guarantees structurally.
     use std::os::unix::fs::MetadataExt;
     let env = Env::new();
-    write_repo_config(
+    // Plan agents-declaration-is-user-local: seed via per-agent
+    // skeletons. The promote path mutates each affected skeleton
+    // (N atomic per-file writes; non-transactional across files).
+    write_skeleton_declaration(
         env.repo(),
-        &RepoConfigFile {
-            agents: Some(vec![
-                clank::cli::config::DefaultAgent {
-                    label: AgentLabel::parse("alice").unwrap(),
-                    role: Role::Master,
-                    tool: Some(clank_core::vocab::Tool::Claude),
-                    launch: None,
-                    initial_prompt: None,
-                },
-                clank::cli::config::DefaultAgent {
-                    label: AgentLabel::parse("bob").unwrap(),
-                    role: Role::Master,
-                    tool: Some(clank_core::vocab::Tool::Codex),
-                    launch: None,
-                    initial_prompt: None,
-                },
-                clank::cli::config::DefaultAgent {
-                    label: AgentLabel::parse("carol").unwrap(),
-                    role: Role::Master,
-                    tool: Some(clank_core::vocab::Tool::Claude),
-                    launch: None,
-                    initial_prompt: None,
-                },
-                clank::cli::config::DefaultAgent {
-                    label: AgentLabel::parse("dave").unwrap(),
-                    role: Role::Reviewer,
-                    tool: Some(clank_core::vocab::Tool::Codex),
-                    launch: None,
-                    initial_prompt: None,
-                },
-            ]),
-            ..Default::default()
-        },
+        "alice",
+        Role::Master,
+        Some(clank_core::vocab::Tool::Claude),
+    );
+    write_skeleton_declaration(
+        env.repo(),
+        "bob",
+        Role::Master,
+        Some(clank_core::vocab::Tool::Codex),
+    );
+    write_skeleton_declaration(
+        env.repo(),
+        "carol",
+        Role::Master,
+        Some(clank_core::vocab::Tool::Claude),
+    );
+    write_skeleton_declaration(
+        env.repo(),
+        "dave",
+        Role::Reviewer,
+        Some(clank_core::vocab::Tool::Codex),
     );
 
-    let cfg_path = env.repo().join(".clank/config.json");
-    let ino_before = std::fs::metadata(&cfg_path).unwrap().ino();
-    let mtime_before = std::fs::metadata(&cfg_path).unwrap().modified().unwrap();
+    let dave_skel = env.repo().join(".clank/agents/dave/config.json");
+    let ino_before = std::fs::metadata(&dave_skel).unwrap().ino();
+    let mtime_before = std::fs::metadata(&dave_skel).unwrap().modified().unwrap();
     std::thread::sleep(std::time::Duration::from_millis(20));
 
     let out = env.agent(&["promote", "dave"]);
     assert!(out.status.success(), "promote failed");
 
-    let ino_after = std::fs::metadata(&cfg_path).unwrap().ino();
-    let mtime_after = std::fs::metadata(&cfg_path).unwrap().modified().unwrap();
+    let ino_after = std::fs::metadata(&dave_skel).unwrap().ino();
+    let mtime_after = std::fs::metadata(&dave_skel).unwrap().modified().unwrap();
 
     // A write happened.
     assert!(
@@ -714,8 +735,7 @@ fn clank_agent_promote_atomic_write() {
     );
 
     // All changes persisted as a single transition.
-    let repo = read_repo_config(env.repo());
-    let agents = repo.agents.unwrap();
+    let agents = clank::cli::config::load_skeleton_agents(env.repo()).unwrap();
     let masters: Vec<_> = agents.iter().filter(|e| e.role == Role::Master).collect();
     assert_eq!(
         masters.len(),
@@ -753,8 +773,7 @@ fn clank_agent_add_role_master_with_no_existing_master() {
         "no existing master → no demoted suffix; got: {stderr}"
     );
 
-    let repo = read_repo_config(env.repo());
-    let agents = repo.agents.unwrap();
+    let agents = clank::cli::config::load_skeleton_agents(env.repo()).unwrap();
     let alice = agents.iter().find(|e| e.label.as_str() == "alice").unwrap();
     let bob = agents.iter().find(|e| e.label.as_str() == "bob").unwrap();
     assert_eq!(alice.role, Role::Reviewer);
@@ -774,8 +793,7 @@ fn clank_agent_add_role_master_demotes_existing_master() {
         "add of second master must demote first; got: {stderr}"
     );
 
-    let repo = read_repo_config(env.repo());
-    let agents = repo.agents.unwrap();
+    let agents = clank::cli::config::load_skeleton_agents(env.repo()).unwrap();
     let alice = agents.iter().find(|e| e.label.as_str() == "alice").unwrap();
     let bob = agents.iter().find(|e| e.label.as_str() == "bob").unwrap();
     assert_eq!(alice.role, Role::Reviewer);
@@ -789,27 +807,18 @@ fn clank_agent_add_role_master_repairs_pre_existing_multi_master() {
     // unique-master invariant as promote. Pre-existing multi-
     // master configs are repaired on the next master-add.
     let env = Env::new();
-    write_repo_config(
+    // Plan agents-declaration-is-user-local: seed via skeletons.
+    write_skeleton_declaration(
         env.repo(),
-        &RepoConfigFile {
-            agents: Some(vec![
-                clank::cli::config::DefaultAgent {
-                    label: AgentLabel::parse("alice").unwrap(),
-                    role: Role::Master,
-                    tool: Some(clank_core::vocab::Tool::Claude),
-                    launch: None,
-                    initial_prompt: None,
-                },
-                clank::cli::config::DefaultAgent {
-                    label: AgentLabel::parse("bob").unwrap(),
-                    role: Role::Master,
-                    tool: Some(clank_core::vocab::Tool::Codex),
-                    launch: None,
-                    initial_prompt: None,
-                },
-            ]),
-            ..Default::default()
-        },
+        "alice",
+        Role::Master,
+        Some(clank_core::vocab::Tool::Claude),
+    );
+    write_skeleton_declaration(
+        env.repo(),
+        "bob",
+        Role::Master,
+        Some(clank_core::vocab::Tool::Codex),
     );
 
     let out = env.agent(&["add", "carol", "--tool", "claude", "--role", "master"]);
@@ -826,8 +835,7 @@ fn clank_agent_add_role_master_repairs_pre_existing_multi_master() {
         );
     }
 
-    let repo = read_repo_config(env.repo());
-    let agents = repo.agents.unwrap();
+    let agents = clank::cli::config::load_skeleton_agents(env.repo()).unwrap();
     let masters: Vec<_> = agents.iter().filter(|e| e.role == Role::Master).collect();
     assert_eq!(
         masters.len(),
@@ -852,8 +860,7 @@ fn clank_agent_add_role_reviewer_does_not_demote_master() {
         "add --role reviewer must NOT demote anyone; got: {stderr}"
     );
 
-    let repo = read_repo_config(env.repo());
-    let agents = repo.agents.unwrap();
+    let agents = clank::cli::config::load_skeleton_agents(env.repo()).unwrap();
     let alice = agents.iter().find(|e| e.label.as_str() == "alice").unwrap();
     let bob = agents.iter().find(|e| e.label.as_str() == "bob").unwrap();
     assert_eq!(alice.role, Role::Master);

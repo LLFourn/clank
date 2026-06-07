@@ -55,6 +55,8 @@ fn write_skeleton_with_session(
             updated_at: "2026-06-04T12:00:00Z".to_string(),
         }),
         launch: None,
+        tool: None,
+        initial_prompt: None,
     };
     clank::agent_store::save_agent_config(
         repo,
@@ -533,6 +535,8 @@ fn agent_start_initial_prompt_lands_in_composed_print() {
             updated_at: "2026-06-04T12:00:00Z".to_string(),
         }),
         launch: None,
+        tool: None,
+        initial_prompt: None,
     };
     clank::agent_store::save_agent_config(
         repo,

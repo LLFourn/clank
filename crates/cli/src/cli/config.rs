@@ -239,9 +239,21 @@ pub struct RepoConfigFile {
     /// round-trip drop.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hooks: Option<HooksSection>,
-    /// `None` = `agents` key absent (caller falls back to
-    /// user-scope). `Some(vec)` = key present (even if empty).
-    /// Same presence semantics as [`load_repo_agents`].
+    /// **DEPRECATED** per `agents-declaration-is-user-local`.
+    ///
+    /// Agents now live in per-agent skeletons at
+    /// `.clank/agents/<label>/config.json` (gitignored,
+    /// per-user). `clank init` migrates any value here to those
+    /// skeletons + removes the key from the JSON file.
+    ///
+    /// The typed field is kept so:
+    /// - Older repos with an unmigrated `agents` block round-trip
+    ///   cleanly through tests and tools.
+    /// - The migration helper can deserialize the block.
+    ///
+    /// **Production code MUST NOT read or write this field**.
+    /// Use `load_merged_agents` (which is skeleton-first) or the
+    /// per-agent skeleton helpers in `crate::agent_store`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agents: Option<Vec<DefaultAgent>>,
     /// Forward-compat catchall: any top-level key this version
@@ -424,51 +436,61 @@ pub fn load_declared_agents(
     load_default_agents(home)
 }
 
-/// Merged agent declaration: repo-scope `agents` if present (REPLACE
-/// semantics — `the local project can modify it`); else fall back
-/// to user-scope `default_agents`; else fall back to scanning the
-/// per-agent skeleton directories at `<repo>/.clank/agents/*/`.
-/// This is the source of truth for "which agents exist + their
-/// role + tool + launch profile" per `agent-add-cli-and-repo-scope`.
+/// Path to the per-repo "explicit empty agents" sentinel. When
+/// present, [`load_merged_agents`] returns an empty Vec and does
+/// NOT fall back to user-scope `default_agents`. Plan:
+/// `agents-declaration-is-user-local` (codex 861c364 catch —
+/// preserves today's `agents: []` semantic across the migration
+/// from tracked block to per-agent skeleton model).
+pub fn empty_sentinel_path(repo_root: &Path) -> PathBuf {
+    repo_root.join(".clank/agents/.empty")
+}
+
+/// Merged agent declaration. Source of truth for "which agents
+/// exist + their role + tool + launch profile" per
+/// `agents-declaration-is-user-local`.
 ///
-/// **Three fallback layers** (codex review 2 of da71c84):
-/// 1. Repo-scope `<repo>/.clank/config.json` `agents` key present
-///    (even if empty) → use it.
-/// 2. User-scope `~/.clank/config.json` `default_agents` non-empty
-///    → use it.
-/// 3. **Legacy fallback**: skeleton dirs at `.clank/agents/*/`
-///    scanned and synthesized into `DefaultAgent` entries. Preserves
-///    the plan's "existing repos keep working" promise — repos that
-///    pre-date this plan have skeletons but no declaration, and
-///    must still surface their registered agents to the gate.
-///    `tool` + `launch` fields stay None (skeleton doesn't carry
-///    those post-Phase-3); `role` comes from the skeleton's
-///    legacy `role` field.
+/// **Resolution order**:
+/// 1. `.clank/agents/.empty` sentinel exists → empty Vec
+///    (explicit no-fallback).
+/// 2. `<repo>/.clank/agents/*/config.json` scan → if >0
+///    entries, return them.
+/// 3. Else → user-scope `~/.clank/config.json#/default_agents`.
 ///
-/// An EXPLICIT empty `agents: []` at repo-scope returns the empty
-/// set (disables user-scope AND legacy fallbacks).
+/// Per-agent skeletons are the primary source. The tracked
+/// `.clank/config.json#/agents` block is gone (migrated by
+/// `clank init`); see [`load_repo_agents`] which now only
+/// powers `clank init`'s migration detection.
 pub fn load_merged_agents(
     repo_root: &Path,
     home: Option<&Path>,
 ) -> anyhow::Result<Vec<DefaultAgent>> {
+    if empty_sentinel_path(repo_root).is_file() {
+        return Ok(Vec::new());
+    }
+    // Back-compat for unmigrated repos: if .clank/config.json#/agents
+    // is still present (Some), honor its presence-aware semantic
+    // (Some([]) → empty override; Some(non-empty) → use it).
+    // `clank init` migrates this out to per-agent skeletons + sentinel.
     if let Some(repo) = load_repo_agents(repo_root)? {
         return Ok(repo);
     }
-    let user = load_default_agents(home)?;
-    if !user.is_empty() {
-        return Ok(user);
+    let skeletons = load_skeleton_agents(repo_root)?;
+    if !skeletons.is_empty() {
+        return Ok(skeletons);
     }
-    // Legacy fallback: synthesize from skeleton dirs. Preserves
-    // pre-Phase-1 repos that have skeletons but no declaration.
-    load_legacy_skeleton_agents(repo_root)
+    load_default_agents(home)
 }
 
-/// Scan `<repo>/.clank/agents/*/config.json` and synthesize
-/// `DefaultAgent` entries from each skeleton's legacy `role` field.
-/// Used by [`load_merged_agents`] as a fallback when neither
-/// repo-scope `agents` nor user-scope `default_agents` are
-/// configured.
-fn load_legacy_skeleton_agents(repo_root: &Path) -> anyhow::Result<Vec<DefaultAgent>> {
+/// Scan `<repo>/.clank/agents/*/config.json` and convert each
+/// skeleton into a `DefaultAgent` entry.
+///
+/// `tool` is read from the skeleton's `tool` field (first-class
+/// since `agents-declaration-is-user-local`). For backward compat
+/// with skeletons written before that field existed, falls back
+/// to `session.tool` when the field is unset. New skeletons set
+/// `tool` explicitly at `clank agent add` time.
+pub fn load_skeleton_agents(repo_root: &Path) -> anyhow::Result<Vec<DefaultAgent>> {
     let agents_root = repo_root.join(".clank/agents");
     if !agents_root.is_dir() {
         return Ok(Vec::new());
@@ -483,6 +505,11 @@ fn load_legacy_skeleton_agents(repo_root: &Path) -> anyhow::Result<Vec<DefaultAg
         let Some(name_str) = name.to_str() else {
             continue;
         };
+        // Skip dotted names (e.g. .empty sentinel handled
+        // elsewhere; we never want to parse it as a label).
+        if name_str.starts_with('.') {
+            continue;
+        }
         let Ok(label) = AgentLabel::parse(name_str) else {
             continue;
         };
@@ -495,19 +522,18 @@ fn load_legacy_skeleton_agents(repo_root: &Path) -> anyhow::Result<Vec<DefaultAg
                     .with_context(|| format!("reading {}", cfg_path.display()));
             }
         };
-        // Use the typed AgentConfig deserialize — extracts the
-        // legacy `role` field cleanly.
         let cfg: clank_core::agent_config::AgentConfig = serde_json::from_str(&body)
             .with_context(|| format!("parsing {}", cfg_path.display()))?;
         out.push(DefaultAgent {
             label,
             role: cfg.role,
-            tool: cfg.session.as_ref().map(|s| s.tool),
+            // tool field wins; session.tool is the backward-compat
+            // fallback for skeletons predating the field.
+            tool: cfg.tool.or_else(|| cfg.session.as_ref().map(|s| s.tool)),
             launch: cfg.launch.clone(),
-            initial_prompt: None,
+            initial_prompt: cfg.initial_prompt.clone(),
         });
     }
-    // Stable order.
     out.sort_by(|a, b| a.label.as_str().cmp(b.label.as_str()));
     Ok(out)
 }

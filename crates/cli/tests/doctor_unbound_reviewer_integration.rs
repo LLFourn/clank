@@ -44,6 +44,8 @@ fn skeleton(
         wfw_timeout: None,
         session,
         launch: None,
+        tool: None,
+        initial_prompt: None,
     }
 }
 

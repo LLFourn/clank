@@ -17,7 +17,7 @@ use anyhow::Context;
 use serde::Serialize;
 
 use crate::agent_store::{agent_config_path, load_agent_config, save_agent_config};
-use crate::cli::config::{DefaultAgent, RepoConfigFile, UserConfigFile};
+use crate::cli::config::{DefaultAgent, UserConfigFile};
 use clank_core::agent_config::{AgentConfig, LaunchConfig, Session};
 use clank_core::ids::AgentLabel;
 use clank_core::vocab::{AutoMode, Role, Tool};
@@ -261,13 +261,13 @@ pub(super) fn bootstrap_bind_prompt(label: &AgentLabel) -> String {
 fn no_bootstrap_tool_message(label: &AgentLabel) -> String {
     let name = label.as_str();
     format!(
-        "agent `{name}` has no bootstrap tool. The `tool` field lives \
-         on the agents declaration, not the per-agent skeleton. \
-         Either edit the `agents` entry in `.clank/config.json` (or \
-         `default_agents` in `~/.clank/config.json`) to add \
-         `\"tool\": \"claude\"` (or `\"codex\"`) under this label, \
-         or remove and re-register: `clank agent remove {name} && \
-         clank agent add {name} --tool <claude|codex>`."
+        "agent `{name}` has no bootstrap tool. Either edit \
+         `.clank/agents/{name}/config.json` to add \
+         `\"tool\": \"claude\"` (or `\"codex\"`), or \
+         `default_agents` in `~/.clank/config.json` for a \
+         user-scope default, or remove and re-register: \
+         `clank agent remove {name} && clank agent add {name} \
+         --tool <claude|codex>`."
     )
 }
 
@@ -516,38 +516,115 @@ fn add(args: AgentAddArgs) -> anyhow::Result<()> {
             format_demoted_suffix(&demoted)
         );
     } else {
-        // Repo-scope add: refuse if already in repo-scope. ALLOW
-        // shadowing user-scope (REPLACE semantics) with stderr
-        // notice.
-        if in_repo {
-            anyhow::bail!("agent `{}` already in repo-scope `agents`", args.label);
+        // Repo-scope add (plan: agents-declaration-is-user-local):
+        // writes the per-agent skeleton directly. No `.clank/config.json#/agents`
+        // block anymore — skeleton presence IS registration.
+        let skeleton_existed = load_agent_config(&repo, &label)?.is_some();
+        if skeleton_existed {
+            anyhow::bail!(
+                "agent `{}` already registered (skeleton at .clank/agents/{}/config.json exists)",
+                args.label,
+                args.label
+            );
         }
-        let mut current_repo = repo_set.unwrap_or_default();
-        current_repo.push(entry);
+        // Write the new skeleton with declaration fields populated.
+        let mut new_cfg = AgentConfig {
+            role,
+            tool: Some(tool),
+            launch: entry.launch.clone(),
+            initial_prompt: entry.initial_prompt.clone(),
+            ..AgentConfig::default()
+        };
+        save_agent_config(&repo, &label, &new_cfg)?;
+        // Multi-master invariant: demote any other masters.
         let demoted = if role == Role::Master {
-            ensure_unique_master(&mut current_repo, &label)
+            ensure_unique_master_via_skeletons(&repo, &label)?
         } else {
             Vec::new()
         };
-        // Skeleton write FIRST (idempotent at-rest; preserves
-        // existing per-machine state if a prior `clank as` bound
-        // a session). Then declaration write. See plan Phase 5.
-        write_skeleton_preserving_machine_state(&repo, &label)?;
-        let mut file = read_repo_config(&repo)?;
-        file.agents = Some(current_repo);
-        write_repo_config(&repo, &file)?;
+        // 0→1 transition: delete the explicit-empty sentinel if it
+        // existed. Codex 861c364 catch — the sentinel's whole
+        // point is "no agents intended"; once the user registers
+        // one, the intent is reversed.
+        let sentinel_existed = clear_empty_sentinel(&repo)?;
+        // The new_cfg may need re-saving if ensure_unique_master demoted
+        // the agent we just added? No — we set role explicitly above; the
+        // helper only demotes OTHERS. But if --role master AND no other
+        // master existed, demoted is empty and skeleton is fine.
+        let _ = &mut new_cfg; // silence: kept for symmetry / future use.
         if in_user {
             eprintln!(
                 "note: repo-scope `{}` shadows user-scope default",
                 args.label
             );
         }
+        if sentinel_existed {
+            eprintln!("note: cleared `.clank/agents/.empty` sentinel (no longer an empty repo)");
+        }
         eprintln!(
-            "registered `{}` in repo-scope `agents`{}",
+            "registered `{}` in repo-scope agents (skeleton .clank/agents/{}/config.json){}",
+            args.label,
             args.label,
             format_demoted_suffix(&demoted)
         );
     }
+    Ok(())
+}
+
+/// Read each skeleton at `<repo>/.clank/agents/*/config.json`,
+/// set the matching skeleton's role to Master, demote every
+/// OTHER Master-role skeleton to Reviewer, and write each
+/// mutated skeleton back. Per-file atomic via save_agent_config;
+/// N writes non-transactional across files (pinned per codex
+/// 861c364 — partial state is idempotently recoverable via
+/// re-run).
+///
+/// Returns the labels that were demoted (for the diagnostic).
+fn ensure_unique_master_via_skeletons(
+    repo: &Path,
+    new_master: &AgentLabel,
+) -> anyhow::Result<Vec<AgentLabel>> {
+    let entries = crate::cli::config::load_skeleton_agents(repo)?;
+    let mut demoted = Vec::new();
+    for entry in &entries {
+        if entry.label == *new_master {
+            if entry.role != Role::Master {
+                let mut cfg = load_agent_config(repo, &entry.label)?
+                    .expect("skeleton listed by load_skeleton_agents must exist");
+                cfg.role = Role::Master;
+                save_agent_config(repo, &entry.label, &cfg)?;
+            }
+        } else if entry.role == Role::Master {
+            let mut cfg = load_agent_config(repo, &entry.label)?
+                .expect("skeleton listed by load_skeleton_agents must exist");
+            cfg.role = Role::Reviewer;
+            save_agent_config(repo, &entry.label, &cfg)?;
+            demoted.push(entry.label.clone());
+        }
+    }
+    Ok(demoted)
+}
+
+/// Remove the `.clank/agents/.empty` sentinel if it exists.
+/// Returns true iff the file was actually removed.
+fn clear_empty_sentinel(repo: &Path) -> anyhow::Result<bool> {
+    let path = crate::cli::config::empty_sentinel_path(repo);
+    if !path.is_file() {
+        return Ok(false);
+    }
+    std::fs::remove_file(&path).map_err(|e| anyhow::anyhow!("removing {}: {e}", path.display()))?;
+    Ok(true)
+}
+
+/// Write the `.clank/agents/.empty` sentinel as a zero-byte
+/// marker. Idempotent.
+fn write_empty_sentinel(repo: &Path) -> anyhow::Result<()> {
+    let path = crate::cli::config::empty_sentinel_path(repo);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| anyhow::anyhow!("creating {}: {e}", parent.display()))?;
+    }
+    std::fs::write(&path, b"").map_err(|e| anyhow::anyhow!("writing {}: {e}", path.display()))?;
     Ok(())
 }
 
@@ -581,27 +658,37 @@ fn remove(args: AgentRemoveArgs) -> anyhow::Result<()> {
         write_user_config(home_ref, &file)?;
         eprintln!("removed `{}` from user-scope `default_agents`", args.label);
     } else {
-        let mut file = read_repo_config(&repo)?;
-        let mut current = file
-            .agents
-            .clone()
-            .ok_or_else(|| anyhow::anyhow!("agent `{}` not in repo-scope `agents`", args.label))?;
-        let before = current.len();
-        current.retain(|e| e.label != label);
-        if current.len() == before {
-            anyhow::bail!("agent `{}` not in repo-scope `agents`", args.label);
+        // Repo-scope remove (plan: agents-declaration-is-user-local).
+        // Deletes the per-agent skeleton config.json. The dir's
+        // feedback/ subdir is preserved (review history stays).
+        let cfg_path = agent_config_path(&repo, &label);
+        if !cfg_path.is_file() {
+            anyhow::bail!(
+                "agent `{}` not registered in this repo (no .clank/agents/{}/config.json)",
+                args.label,
+                args.label
+            );
         }
-        // Preserve the empty-list override semantic: if the user
-        // explicitly registered `agents: []` AND removed the
-        // last entry from a previously-populated list, keep
-        // `agents: []` (empty override). Distinguish "we removed
-        // the last entry from a list of N" (keep []) from "the
-        // list was already empty" (covered above by the
-        // bail!-on-no-change).
-        file.agents = Some(current);
-        write_repo_config(&repo, &file)?;
+        std::fs::remove_file(&cfg_path)
+            .map_err(|e| anyhow::anyhow!("removing {}: {e}", cfg_path.display()))?;
+        // N→0 transition: write the .empty sentinel to preserve
+        // the no-fallback intent. Codex 828207c catch — without
+        // this, removing the last agent silently re-exposes
+        // user-scope defaults.
+        let remaining = crate::cli::config::load_skeleton_agents(&repo)?;
+        let wrote_sentinel = if remaining.is_empty() {
+            write_empty_sentinel(&repo)?;
+            true
+        } else {
+            false
+        };
+        if wrote_sentinel {
+            eprintln!(
+                "wrote `.clank/agents/.empty` sentinel (repo now has zero agents; user-scope fallback suppressed)"
+            );
+        }
         eprintln!(
-            "removed `{}` from repo-scope `agents` (per-agent dir + feedback preserved)",
+            "removed `{}` from repo-scope agents (per-agent feedback preserved)",
             args.label
         );
     }
@@ -684,16 +771,24 @@ fn promote(args: AgentPromoteArgs) -> anyhow::Result<()> {
             format_demoted_suffix(&demoted)
         );
     } else {
-        let mut file = read_repo_config(&repo)?;
-        let mut agents = file.agents.ok_or_else(|| {
-            anyhow::anyhow!(
-                "no repo-scope `agents` declaration; nothing to promote in. Run `clank agent add` first."
-            )
-        })?;
-        if !agents.iter().any(|e| e.label == label) {
-            anyhow::bail!("agent `{}` not in repo-scope `agents`", args.label);
+        // Repo-scope promote (plan: agents-declaration-is-user-local).
+        // Operates on per-agent skeletons; ensure_unique_master_via_skeletons
+        // writes one file per affected agent (atomic per-file,
+        // non-transactional across files — pinned per codex 861c364).
+        let entries = crate::cli::config::load_skeleton_agents(&repo)?;
+        if entries.is_empty() {
+            anyhow::bail!(
+                "no agents registered in this repo; nothing to promote in. Run `clank agent add` first."
+            );
         }
-        let already_only_master = agents
+        if !entries.iter().any(|e| e.label == label) {
+            anyhow::bail!(
+                "agent `{}` not registered in this repo (no .clank/agents/{}/config.json)",
+                args.label,
+                args.label
+            );
+        }
+        let already_only_master = entries
             .iter()
             .all(|e| (e.label == label) == (e.role == Role::Master));
         if already_only_master {
@@ -703,9 +798,7 @@ fn promote(args: AgentPromoteArgs) -> anyhow::Result<()> {
             );
             return Ok(());
         }
-        let demoted = ensure_unique_master(&mut agents, &label);
-        file.agents = Some(agents);
-        write_repo_config(&repo, &file)?;
+        let demoted = ensure_unique_master_via_skeletons(&repo, &label)?;
         eprintln!(
             "promoted `{}` to master in repo-scope{}",
             args.label,
@@ -765,20 +858,6 @@ fn write_user_config(home: &Path, file: &UserConfigFile) -> anyhow::Result<()> {
     write_typed_config(&home.join(".clank/config.json"), file)
 }
 
-/// Read `<repo>/.clank/config.json` as a typed [`RepoConfigFile`].
-fn read_repo_config(repo: &Path) -> anyhow::Result<RepoConfigFile> {
-    let path = repo.join(".clank/config.json");
-    match std::fs::read_to_string(&path) {
-        Ok(s) => serde_json::from_str(&s).with_context(|| format!("parsing {}", path.display())),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(RepoConfigFile::default()),
-        Err(e) => Err(anyhow::Error::from(e).context(format!("reading {}", path.display()))),
-    }
-}
-
-fn write_repo_config(repo: &Path, file: &RepoConfigFile) -> anyhow::Result<()> {
-    write_typed_config(&repo.join(".clank/config.json"), file)
-}
-
 fn write_typed_config<T: serde::Serialize>(path: &Path, value: &T) -> anyhow::Result<()> {
     use std::io::Write;
     let parent = path
@@ -794,19 +873,6 @@ fn write_typed_config<T: serde::Serialize>(path: &Path, value: &T) -> anyhow::Re
     tmp.as_file_mut().sync_all()?;
     tmp.persist(path).map_err(|e| e.error)?;
     Ok(())
-}
-
-/// Idempotent skeleton write: creates `<repo>/.clank/agents/<label>/config.json`
-/// with DEFAULT per-machine state IF the file doesn't exist.
-/// Pre-existing skeletons (e.g., from a prior `clank as <label>`
-/// binding) are left untouched — `clank agent add` MUST NOT clobber
-/// session / auto_mode / wfw_timeout.
-fn write_skeleton_preserving_machine_state(repo: &Path, label: &AgentLabel) -> anyhow::Result<()> {
-    let path = agent_config_path(repo, label);
-    if path.exists() {
-        return Ok(()); // preserve existing per-machine state
-    }
-    save_agent_config(repo, label, &AgentConfig::default())
 }
 
 #[cfg(test)]
@@ -987,19 +1053,19 @@ mod tests {
             msg.contains("tool") && (msg.contains("claude") || msg.contains("codex")),
             "error mentions tool fix: {msg}"
         );
-        // Codex 9c431de catch: the hint must point at the
-        // DECLARATION (`.clank/config.json` agents block or user-
-        // scope `default_agents`), NOT the per-agent skeleton at
-        // `.clank/agents/<label>/config.json` (which has no `tool`
-        // field). Pinned so a regression to "edit the skeleton"
-        // fails the test deliberately.
+        // Plan agents-declaration-is-user-local: the `tool`
+        // field now lives on the per-agent skeleton at
+        // `.clank/agents/<label>/config.json` (codex 9c431de's
+        // "edit the declaration" hint was correct for the prior
+        // model; now the declaration IS the skeleton). The
+        // user-scope path is the secondary option.
         assert!(
-            msg.contains(".clank/config.json"),
-            "error must reference the repo-scope declaration file path; got: {msg}"
+            msg.contains(".clank/agents/phantom/config.json"),
+            "error must point at the per-agent skeleton (the new declaration home); got: {msg}"
         );
         assert!(
-            !msg.contains(".clank/agents/"),
-            "error must NOT direct users to the per-agent skeleton path (no tool field there); got: {msg}"
+            msg.contains("~/.clank/config.json"),
+            "error must also mention user-scope path as an alternative; got: {msg}"
         );
         assert!(
             msg.contains("clank agent remove") && msg.contains("clank agent add"),

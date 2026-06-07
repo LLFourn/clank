@@ -39,8 +39,89 @@ pub async fn run(args: InitArgs) -> anyhow::Result<()> {
     write_claude_perms(&repo)?;
     write_post_rewrite_hook(&repo, args.force_hooks)?;
     warn_if_globally_excluded(&repo);
+    migrate_legacy_agents_block(&repo)?;
     let default_agent_labels = seed_default_agents(&repo)?;
     bootstrap_agent_identity(&repo, args.yes, &default_agent_labels).await?;
+    Ok(())
+}
+
+/// Migrate the legacy `.clank/config.json#/agents` block to
+/// per-agent skeletons + sentinel, then remove the key.
+///
+/// Plan: `agents-declaration-is-user-local`. Two cases:
+/// - `Some(non-empty vec)`: materialize each entry into
+///   `.clank/agents/<label>/config.json`, MERGING with any
+///   pre-existing skeleton state (preserve
+///   session/auto_mode/wfw_timeout).
+/// - `Some(vec![])`: write the explicit-empty sentinel
+///   `.clank/agents/.empty` (codex 861c364 catch — preserves
+///   the today-semantic that `agents: []` disables user-scope
+///   fallback).
+///
+/// In BOTH cases, remove the `agents` key from
+/// `.clank/config.json`. Idempotent: re-running with the key
+/// already absent is a no-op.
+fn migrate_legacy_agents_block(repo: &Path) -> anyhow::Result<()> {
+    let cfg_path = repo.join(".clank/config.json");
+    let body = match std::fs::read_to_string(&cfg_path) {
+        Ok(b) => b,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => {
+            return Err(anyhow::Error::from(e))
+                .with_context(|| format!("reading {}", cfg_path.display()));
+        }
+    };
+    let mut value: serde_json::Value =
+        serde_json::from_str(&body).with_context(|| format!("parsing {}", cfg_path.display()))?;
+    let obj = match value.as_object_mut() {
+        Some(o) => o,
+        None => return Ok(()),
+    };
+    let agents_val = match obj.remove("agents") {
+        Some(v) => v,
+        None => return Ok(()), // No legacy block; nothing to do.
+    };
+    let agents: Vec<crate::cli::config::DefaultAgent> = serde_json::from_value(agents_val)
+        .with_context(|| format!("parsing legacy `agents` block in {}", cfg_path.display()))?;
+    if agents.is_empty() {
+        // Case B: explicit empty → write the sentinel.
+        let sentinel = repo.join(".clank/agents/.empty");
+        if let Some(parent) = sentinel.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(&sentinel, b"")?;
+        println!(
+            "migrated explicit-empty agents declaration to {} (now per-user)",
+            sentinel.strip_prefix(repo).unwrap_or(&sentinel).display()
+        );
+    } else {
+        // Case A: materialize each entry into its skeleton.
+        for entry in &agents {
+            let skel_path = crate::agent_store::agent_config_path(repo, &entry.label);
+            let existing = std::fs::read_to_string(&skel_path).ok();
+            let mut cfg: clank_core::agent_config::AgentConfig = match existing {
+                Some(body) => serde_json::from_str(&body)
+                    .with_context(|| format!("parsing existing {}", skel_path.display()))?,
+                None => clank_core::agent_config::AgentConfig::default(),
+            };
+            // Overwrite declaration fields with the legacy block's
+            // values. Preserve session/auto_mode/wfw_timeout from
+            // any pre-existing skeleton (per-machine state).
+            cfg.role = entry.role;
+            cfg.tool = entry.tool;
+            cfg.launch = entry.launch.clone();
+            cfg.initial_prompt = entry.initial_prompt.clone();
+            crate::agent_store::save_agent_config(repo, &entry.label, &cfg)?;
+        }
+        println!(
+            "migrated {} agents declaration(s) to per-agent skeletons (now per-user)",
+            agents.len()
+        );
+    }
+    // Write back the config without the agents key.
+    let new_body = serde_json::to_string_pretty(&value)
+        .with_context(|| format!("re-serializing {}", cfg_path.display()))?;
+    std::fs::write(&cfg_path, new_body + "\n")?;
     Ok(())
 }
 
