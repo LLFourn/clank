@@ -285,36 +285,6 @@ detection signals are present.
   repos crash with "re-run clank init" instead of being
   auto-migrated.
 
-## Migration story for old-format repos
-
-`clank init` detects EITHER:
-- `<repo>/.clank/config.json#/agents` is `Some(...)` (the
-  pre-`agents-declaration-is-user-local` shape), OR
-- `<repo>/.clank/agents/<label>/config.json` has the
-  `tool` / `initial_prompt` declaration fields populated
-  (the post-`agents-declaration-is-user-local` shape).
-
-In either case, crash with:
-
-```
-this repo is in an old clank format. Re-run `clank init
---team <name>` to migrate to the team-based model. Any
-existing per-agent state (sessions, auto_mode) will be
-preserved.
-```
-
-The re-run does:
-1. Strip declaration fields (tool, initial_prompt) from
-   per-agent skeleton files. Keep session, auto_mode,
-   wfw_timeout.
-2. Delete `.clank/agents/.empty` if present.
-3. Write `<repo>/.clank/config.json` with the chosen team
-   (default if not specified).
-4. Add `/config.json` to `.clank/.gitignore`.
-5. Print: "migrated repo to team-based model. Registered
-   agents are now determined by the `<team>` team in
-   `~/.clank/config.json`."
-
 ## Why this matters
 
 Three architectural wins:
@@ -339,17 +309,12 @@ together.
 
 ## Open questions
 
-- `local_agents` by-name reference: does it default to
-  reviewer role, or pick up the role from whatever team
-  context exists? Probably reviewer-by-default since the
-  team's master is already chosen.
-- Should the team selector in repo-scope have a way to
-  override the team's master for THIS repo (e.g.,
-  `"team_master": "codex"`)? Or is that overengineering?
-- What's the bind UX when no team is set yet?
-  `clank as <label>` before `clank init --team dev` —
-  refuse? Auto-init with default team? Probably refuse
-  + suggest init.
+- **Bind UX when no team is set yet**: `clank as <label>`
+  before `clank init --team dev` — refuse? Auto-init
+  with default team? Leaning refuse + suggest
+  `clank init`, mirroring how the just-shipped
+  `agents-declaration-is-user-local` handles the
+  no-declaration case. Pin during implementation.
 
 ## Why this is a NEW plan, not a revision
 
