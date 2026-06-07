@@ -41,15 +41,16 @@ Two top-level keys:
   "teams": {
     "default": {
       "master": "claude",
-      "reviewers": ["codex"]
+      "commit_reviewers": ["codex"]
     },
     "dev": {
       "master": "claude",
-      "reviewers": ["codex", "ruthless"]
+      "commit_reviewers": ["codex"],
+      "gate_reviewers":   ["ruthless"]
     },
     "research": {
       "master": "grok",
-      "reviewers": ["claude"]
+      "commit_reviewers": ["claude"]
     }
   }
 }
@@ -59,10 +60,18 @@ Two top-level keys:
   DESCRIPTIONS only. No role, no team affiliation. Just
   what tool to spawn and how. Reused across teams.
 - `teams` is a label-keyed dictionary of compositions. Each
-  team picks ONE master and N reviewers by referring to
-  agent names. Roles are per-team (a single agent can be
-  master in one team, reviewer in another, absent from a
-  third).
+  team picks ONE master and TWO reviewer sets by tier:
+  - `commit_reviewers`: review every commit on the plan.
+    Master waits for them per-commit.
+  - `gate_reviewers`: only review when ALL commit-reviewers
+    have voted approve OR finished — they weigh in at gate
+    transition moments (Approved, Finished). Used for
+    deep / architectural checks at structural moments
+    rather than per-commit churn.
+  Roles are per-team (a single agent can be master in one
+  team, commit-reviewer in another, gate-reviewer in a
+  third). Both reviewer lists are optional; see Gate
+  state machine below for the empty-set rule.
 - The `default` team is just one entry in the table. No
   magic. `clank init` without `--team` uses it.
 
@@ -74,7 +83,8 @@ Two top-level keys:
   "master_override": "codex",
   "local_agents": [
     "ruthless",
-    { "label": "alice", "tool": "claude", "role": "reviewer" }
+    { "ref": "alice", "tier": "gate" },
+    { "label": "bob", "tool": "claude", "role": "reviewer", "tier": "commit" }
   ]
 }
 ```
@@ -85,15 +95,22 @@ Two top-level keys:
   `clank promote <agent>`. Doesn't modify the team's
   user-scope master config. Resolution swaps: this label
   becomes master, the team's original master gets demoted
-  to reviewer (joining the reviewer list, not dropped).
-- `local_agents`: optional list of additions for THIS repo
-  only. Each entry is either:
-  - A string (by-name reference): resolved against user-
-    scope `agents`. Pulls in an agent that's not part of
-    the chosen team for this specific repo.
-  - A fully-specified inline object: label + tool +
-    optional launch. For agents the user wants ONLY in
-    this repo, not declared globally.
+  to commit-reviewer (joining `commit_reviewers`, not
+  dropped).
+- `local_agents`: optional list of additions for THIS
+  repo only. Three forms (untagged enum on parse):
+  1. **Bare string** (`"ruthless"`) — by-name reference.
+     Tier defaults to `commit`. The quickest form.
+  2. **By-name with tier override** (`{"ref": "alice",
+     "tier": "gate"}`) — pulls the agent's
+     description from user-scope `agents` but pins their
+     tier locally. Use when you want a user-scope agent
+     at a non-default tier for this repo.
+  3. **Fully inline** (`{"label": "bob", "tool":
+     "claude", "tier": "commit"}`) — for agents you want
+     ONLY in this repo, not declared globally. Fields:
+     `label`, `tool`, optional `launch`, optional `role`
+     (see below), optional `tier` (default `commit`).
 - **All `local_agents` entries are REVIEWERS** (codex
   66751c8 pin — was previously underspecified, allowing
   inline `role: "master"` which would conflict with team
@@ -133,25 +150,91 @@ For a given repo, the registered set is computed as:
 
 1. Read `<repo>/.clank/config.json#/team` → team name.
 2. Look up the team in `~/.clank/config.json#/teams`.
-3. Master = `agents[teams.<team>.master]`. Reviewers =
-   `agents[teams.<team>.reviewers[i]]` for each i.
+3. Master = `agents[teams.<team>.master]`. Commit-reviewers
+   = `agents[teams.<team>.commit_reviewers[i]]` for each
+   i. Gate-reviewers =
+   `agents[teams.<team>.gate_reviewers[i]]` for each i.
 4. Append `local_agents`:
-   - By-name reference: look up label in user-scope
-     `agents`. Add as reviewer.
-   - Inline object: add verbatim.
+   - Bare-string by-name: look up in user-scope `agents`.
+     Add to `commit_reviewers` (default tier).
+   - `{ref, tier}` by-name with override: look up in
+     user-scope. Add to the named tier list.
+   - Inline object: add verbatim to the tier list named
+     by its `tier` field (default `commit`).
 5. **Apply `master_override`** (if set in repo config):
    - new_master = registered agent matching the override
      label (looked up in the set built so far — must be
-     present, else error).
+     present in some reviewer tier, else error).
    - prev_master = the team's original master.
    - Master = new_master.
-   - Reviewers = (existing reviewers ∪ {prev_master}) −
-     {new_master}.
-   - Same swap semantic as today's `clank agent promote`
-     repair — displaced master joins reviewers, doesn't
-     drop.
-6. The resulting list IS the registered set for this repo
-   (replaces every current `load_merged_agents` caller).
+   - commit_reviewers = (existing commit_reviewers ∪
+     {prev_master}) − {new_master}.
+   - gate_reviewers = existing gate_reviewers − {new_master}.
+   - (Demoted prev_master always joins commit_reviewers
+     since gate-tier is for opt-in lighter-touch
+     reviewers; the demoted master should be tracking
+     every commit.)
+6. The resulting (master, commit_reviewers, gate_reviewers)
+   tuple IS the registered set for this repo.
+
+## Gate state machine with commit/gate tiers
+
+`compute_gate` in `crates/core/src/wait.rs` extends to
+five states. The two-tier reviewer model is FIRST-CLASS
+in the core type, not hidden in `wfw`'s wake logic.
+
+States (transition order):
+
+| State | Condition |
+|---|---|
+| `Unreviewed` | At least one commit-reviewer hasn't voted approve/finished (no Request-Changes filed by anyone) |
+| `ChangesRequested` | Any reviewer (commit OR gate) voted Request-Changes |
+| `ApprovedPendingGate` | All commit-reviewers voted approve/finished AND ≥1 gate-reviewer hasn't voted approve/finished (no Request-Changes) |
+| `Approved` | All commit-reviewers AND all gate-reviewers voted approve OR finished AND ≥1 voted only Approve (not Finished) |
+| `Finished` | All commit-reviewers AND all gate-reviewers voted Finished |
+
+Wake conditions:
+
+| State | Who wakes |
+|---|---|
+| `Unreviewed` | Commit-reviewers who haven't voted |
+| `ChangesRequested` | Master → revise |
+| `ApprovedPendingGate` | Gate-reviewers who haven't voted |
+| `Approved` | Master → continue |
+| `Finished` | Master → finalize |
+
+Edge cases pinned:
+
+1. **Empty `commit_reviewers`, non-empty `gate_reviewers`**:
+   "all commit-reviewers approved" is vacuously true on
+   the empty set, so state transitions to
+   `ApprovedPendingGate` immediately on first commit.
+   Gate-reviewer fires per-commit. Functionally identical
+   to gate-reviewer being a commit-reviewer. **No
+   special-case code** — set semantics produce it.
+2. **Empty both `commit_reviewers` and `gate_reviewers`**:
+   gate jumps straight to `Finished` (today's
+   zero-reviewer auto-approve behavior).
+3. **Gate-reviewer votes Request-Changes**: trumps state
+   regardless of tier — gate transitions to
+   `ChangesRequested`. Master revises. After re-commit,
+   cycle restarts from the new commit's `Unreviewed`
+   state.
+4. **Gate-reviewer approves but doesn't Finish**: state =
+   `Approved` (not `Finished`). Master sees "continue."
+   Eventually master signals reviewers to upgrade verdict
+   to Finished; when all of both tiers Finish → state =
+   `Finished`.
+5. **Gate-reviewer votes before commit-reviewers** (a
+   gate-reviewer who's "watching" votes early): verdict
+   is stored but the gate state ignores it until
+   commit-reviewers are all-approved/finished. The vote
+   sits as latent state. State machine reads
+   commit-reviewers FIRST.
+6. **Same agent in both tier lists**: rejected at parse
+   time. One tier per team per agent.
+7. **Master in either reviewer list**: rejected at parse
+   time. Master is the master slot, not a reviewer.
 
 ## Old-format detection (panic everywhere except init)
 
@@ -240,42 +323,71 @@ cleanup: clean new-format. Re-running `clank init` is
 always safe — the cleanup branch only fires when the
 detection signals are present.
 - **`clank agent`** — agent DESCRIPTIONS (the "who"):
-  - `add --global <label> --tool <tool> [--launch-cmd ...]`:
-    write to user-scope `agents` table.
-  - `add <label> --tool <tool>` (no `--global`): add inline
-    to repo's `local_agents`.
-  - `add <label>` (by-name, no `--tool`): add by-name
-    reference to repo's `local_agents`; looks up
-    user-scope `agents` at registration time.
-  - `remove --global <label>`: remove from user-scope. Also
-    removes from any team that referenced it (refuses if
-    the label is a master of some team without `--force`).
+  - `add --global <label> --tool <tool> [--launch-cmd ...]
+    [--initial-prompt ...]`: write to user-scope `agents`
+    table.
+  - `add <label> --tool <tool> [--tier commit|gate]` (no
+    `--global`): add fully-inline to repo's
+    `local_agents`. Default tier is `commit`.
+  - `add <label> [--tier gate]` (no `--tool`, no
+    `--global`): add by-name reference to repo's
+    `local_agents`; looks up user-scope `agents` at
+    registration time. If `--tier` is set to a
+    non-default value, writes the `{ref, tier}` shape;
+    otherwise writes the bare-string shape.
+  - `remove --global <label>`: remove from user-scope.
+    Also removes from any team that referenced it
+    (refuses if the label is a master of some team
+    without `--force`).
   - `remove <label>` (no `--global`): drop from repo's
     `local_agents`.
   - `list`: registered for THIS repo (runs the full
-    resolution algorithm — team + local_agents).
+    resolution algorithm — team + master_override +
+    local_agents). Shows tier for each reviewer.
   - `start <label>`: unchanged behavior (launches tool).
 
-- **`clank team`** — team COMPOSITIONS (the "which set"):
-  All operations implicitly target user-scope (teams live
-  nowhere else). No `--global` flag needed.
+- **`clank team`** — team COMPOSITIONS (the "which set").
+  All operations implicitly target user-scope. No
+  `--global` flag needed.
   - `list`: list all teams in user-scope.
   - `create <name>`: create an empty team (no master, no
-    reviewers; must be populated before it's useful).
+    reviewers in either tier; must be populated before
+    it's useful).
   - `delete <name>`: remove team. Refuses if any
     `<repo>/.clank/config.json#/team` currently references
     it (clank doesn't track which repos use which teams,
     so this either requires user confirmation or uses
     `--force` to delete blindly).
-  - `set-master <team> <agent>`: change a team's master.
-    Replaces the existing master (the unique-master
-    invariant is per-team, automatic).
-  - `add-reviewer <team> <agent>`: pull agent into team as
-    reviewer. Refuses if agent isn't declared in
-    user-scope `agents`.
-  - `remove-reviewer <team> <agent>`: drop from team's
-    reviewers list.
-  - `show <team>`: print master + reviewers.
+  - `add <team> <agent> [--tier commit|gate]`: add an
+    agent to the team. Default tier is `commit`. Refuses
+    if the agent isn't declared in user-scope `agents`.
+    Refuses if the agent is already in the team (any
+    tier). To move an agent between tiers, use `remove`
+    then `add`.
+    Naming: just `add` (not `add-reviewer`) because
+    master is a SEPARATE designation via `set-master` —
+    you don't `add-reviewer` and `add-master`, you add
+    agents and one of them is set to master.
+  - `remove <team> <agent>`: remove agent from team.
+    Finds them in whichever reviewer tier they're in.
+    Refuses to remove a team's master (use `set-master`
+    to designate a different agent first, or `delete`
+    the team).
+  - `set-master <team> <agent>`: designates master. If
+    the agent was previously in either reviewer tier
+    list, they're moved out of it (one agent can't be
+    both master and reviewer in the same team). The
+    previous master is moved to `commit_reviewers` (NOT
+    dropped — they're still a registered member of the
+    team, just at the most-engaged tier).
+  - `show <team>`: prints master + both tier reviewer
+    lists. Format:
+    ```
+    team `dev`:
+      master:           claude
+      commit reviewers: codex
+      gate reviewers:   ruthless
+    ```
 
 - **`clank promote <agent>`** STAYS — but its scope and
   data model change.
@@ -348,13 +460,24 @@ pub struct AgentDescription {
     pub tool: Tool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub launch: Option<LaunchConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub initial_prompt: Option<String>,
 }
 
 #[derive(Deserialize, Serialize)]
 pub struct TeamComposition {
     pub master: AgentLabel,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub reviewers: Vec<AgentLabel>,
+    pub commit_reviewers: Vec<AgentLabel>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub gate_reviewers: Vec<AgentLabel>,
+}
+
+#[derive(Deserialize, Serialize, Clone, Copy)]
+#[serde(rename_all = "snake_case")]
+pub enum ReviewerTier {
+    Commit,
+    Gate,
 }
 
 // Repo-scope (<repo>/.clank/config.json)
@@ -367,6 +490,8 @@ pub struct RepoConfigFile {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub local_agents: Vec<LocalAgentEntry>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub review: Option<ReviewSection>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hooks: Option<HooksSection>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub diff: Option<DiffConfig>,
@@ -374,10 +499,34 @@ pub struct RepoConfigFile {
     pub extra: BTreeMap<String, serde_json::Value>,
 }
 
+// User-scope also has review/hooks/diff (codex 984d461 pin —
+// these are config sections that existed on the prior model
+// and must round-trip through the typed struct, not get
+// relegated to `extra`):
+//
+// pub struct UserConfigFile {
+//     pub agents: BTreeMap<AgentLabel, AgentDescription>,
+//     pub teams: BTreeMap<String, TeamComposition>,
+//     pub review: Option<ReviewSection>,
+//     pub hooks: Option<HooksSection>,
+//     pub diff: Option<DiffConfig>,
+//     pub extra: BTreeMap<String, Value>,
+// }
+
 #[derive(Deserialize, Serialize)]
 #[serde(untagged)]
 pub enum LocalAgentEntry {
+    /// Bare string: `"ruthless"`. Tier defaults to commit.
     ByName(AgentLabel),
+    /// By-name with tier override:
+    /// `{"ref": "ruthless", "tier": "gate"}`.
+    ByNameWithTier {
+        #[serde(rename = "ref")]
+        ref_label: AgentLabel,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tier: Option<ReviewerTier>,
+    },
+    /// Fully inline: `{"label": ..., "tool": ..., ...}`.
     Inline(InlineLocalAgent),
 }
 
@@ -387,12 +536,17 @@ pub struct InlineLocalAgent {
     pub tool: Tool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub launch: Option<LaunchConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub initial_prompt: Option<String>,
     /// Optional explicit role. Validated AFTER deserialize:
     /// `Some(Role::Master)` is rejected with an actionable
     /// error pointing at `clank promote`. `None` and
     /// `Some(Role::Reviewer)` both resolve to reviewer.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub role: Option<Role>,
+    /// Reviewer tier. Default `commit` if omitted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tier: Option<ReviewerTier>,
 }
 ```
 
