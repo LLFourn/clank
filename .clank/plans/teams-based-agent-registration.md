@@ -427,16 +427,28 @@ detection signals are present.
   registration is just "team has no agents" or "team is
   unset."
 
-## Typed serde throughout (no `serde_json::Value` soup)
+## Typed serde throughout
 
-Every config file goes through a typed struct with
-`#[derive(Deserialize, Serialize)]`. No `serde_json::Value`
-in the read or write paths. The just-shipped plan's
-migration code at `init.rs:90` used `serde_json::Value` as
-a shortcut to strip one key — that's a regression vs the
-`typed-config-dogfood` discipline and this plan fixes it.
+Every config file round-trips through a typed struct with
+`#[derive(Deserialize, Serialize)]`. The discipline
+(codex a7db7a2 catch — sharpened from the earlier
+overstatement):
 
-Typed structs added:
+- **No whole-document `serde_json::Value` parsing**. Every
+  key the schema knows about is typed.
+- **No ad-hoc `Value` mutation** in production paths. The
+  prior plan's `init.rs:90` migration code parsed the
+  whole config as `Value` and used `obj.remove("agents")`
+  on it — that's the regression this plan fixes.
+- **`Value` IS allowed in `#[serde(flatten)] extra:
+  BTreeMap<String, serde_json::Value>` catchalls**. The
+  catchall serves two purposes: forward-compat preserves
+  unknown keys across round-trip, AND it's the typed
+  surface where we detect leftover-keys like the legacy
+  `agents`. Removing the catchall would lose forward-
+  compat AND break detection.
+
+Typed structs:
 
 ```rust
 // User-scope (~/.clank/config.json)
@@ -446,6 +458,8 @@ pub struct UserConfigFile {
     pub agents: BTreeMap<AgentLabel, AgentDescription>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub teams: BTreeMap<String, TeamComposition>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub review: Option<ReviewSection>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hooks: Option<HooksSection>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -498,20 +512,6 @@ pub struct RepoConfigFile {
     #[serde(flatten)]
     pub extra: BTreeMap<String, serde_json::Value>,
 }
-
-// User-scope also has review/hooks/diff (codex 984d461 pin —
-// these are config sections that existed on the prior model
-// and must round-trip through the typed struct, not get
-// relegated to `extra`):
-//
-// pub struct UserConfigFile {
-//     pub agents: BTreeMap<AgentLabel, AgentDescription>,
-//     pub teams: BTreeMap<String, TeamComposition>,
-//     pub review: Option<ReviewSection>,
-//     pub hooks: Option<HooksSection>,
-//     pub diff: Option<DiffConfig>,
-//     pub extra: BTreeMap<String, Value>,
-// }
 
 #[derive(Deserialize, Serialize)]
 #[serde(untagged)]
