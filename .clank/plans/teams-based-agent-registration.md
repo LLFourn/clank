@@ -74,7 +74,7 @@ Two top-level keys:
   "master_override": "codex",
   "local_agents": [
     "ruthless",
-    { "label": "alice", "tool": "claude" }
+    { "label": "alice", "tool": "claude", "role": "reviewer" }
   ]
 }
 ```
@@ -102,12 +102,16 @@ Two top-level keys:
   - `clank team set-master <team> <agent>` (user-scope
     team config), OR
   - `clank promote <agent>` (repo `master_override`).
-  `local_agents` cannot directly designate a master; the
-  by-name and inline forms both omit / ignore any `role`
-  field. To make a local agent the repo's master, add
-  them via `local_agents` AND then `clank promote <label>`.
-  Schema validation rejects `role: "master"` in a
-  `local_agents` inline object with an actionable error.
+  `local_agents` cannot directly designate a master.
+  Role-field handling on inline entries:
+  - **Omitted**: defaults to `reviewer`.
+  - **`"reviewer"`**: valid (explicit form of the
+    default — encouraged for readability).
+  - **`"master"`**: REJECTED at parse time with an
+    actionable error pointing at `clank promote <label>`
+    as the right surface.
+  To make a local agent the repo's master: add them via
+  `local_agents` AND then `clank promote <label>`.
 
 ### Repo per-agent state (`<repo>/.clank/agents/<label>/config.json`, gitignored)
 
@@ -148,6 +152,41 @@ For a given repo, the registered set is computed as:
      drop.
 6. The resulting list IS the registered set for this repo
    (replaces every current `load_merged_agents` caller).
+
+## Old-format detection (panic everywhere except init)
+
+**No backwards compatibility on the config schema.** Any
+clank command that reads `.clank/config.json` and detects
+an old-format signal (a `"agents"` key in the typed
+`extra` catchall — i.e., the legacy
+`agents-declaration-is-user-local` shape) panics with:
+
+```
+.clank/config.json is in an old clank format (contains
+legacy `agents` block). Run `clank init` to migrate.
+```
+
+The only command exempt from this panic is `clank init`,
+which has the migration code path (described in CLI
+surface changes below).
+
+Coverage applies to: `clank agent`, `clank team`,
+`clank wfw`, `clank status`, `clank as`, `clank auto`,
+`clank diff`, `clank queue`, etc. — every command that
+loads the repo config goes through the same loader, and
+the loader is what panics. One enforcement point.
+
+**Scope of strict-panic**: config files only. Per-agent
+skeletons (`.clank/agents/<label>/config.json`) and the
+`.empty` sentinel are STATE, not config, and are tolerated
+as harmless (the new resolution ignores them).
+
+User-scope `~/.clank/config.json` gets the same treatment:
+if it has a top-level `default_agents` key (the legacy
+shape), every command panics until the user manually
+updates it. There's no `clank init --user` migration —
+the user-scope file is hand-edited by users via their
+dotfiles, so panic + clear error is appropriate.
 
 ## CLI surface changes
 
@@ -275,6 +314,106 @@ detection signals are present.
   because state files don't drive registration. Empty
   registration is just "team has no agents" or "team is
   unset."
+
+## Typed serde throughout (no `serde_json::Value` soup)
+
+Every config file goes through a typed struct with
+`#[derive(Deserialize, Serialize)]`. No `serde_json::Value`
+in the read or write paths. The just-shipped plan's
+migration code at `init.rs:90` used `serde_json::Value` as
+a shortcut to strip one key — that's a regression vs the
+`typed-config-dogfood` discipline and this plan fixes it.
+
+Typed structs added:
+
+```rust
+// User-scope (~/.clank/config.json)
+#[derive(Deserialize, Serialize)]
+pub struct UserConfigFile {
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub agents: BTreeMap<AgentLabel, AgentDescription>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub teams: BTreeMap<String, TeamComposition>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hooks: Option<HooksSection>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub diff: Option<DiffConfig>,
+    // Forward-compat catchall + leftover-key detection point.
+    #[serde(flatten)]
+    pub extra: BTreeMap<String, serde_json::Value>,
+}
+
+#[derive(Deserialize, Serialize)]
+pub struct AgentDescription {
+    pub tool: Tool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub launch: Option<LaunchConfig>,
+}
+
+#[derive(Deserialize, Serialize)]
+pub struct TeamComposition {
+    pub master: AgentLabel,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reviewers: Vec<AgentLabel>,
+}
+
+// Repo-scope (<repo>/.clank/config.json)
+#[derive(Deserialize, Serialize)]
+pub struct RepoConfigFile {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub team: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub master_override: Option<AgentLabel>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub local_agents: Vec<LocalAgentEntry>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hooks: Option<HooksSection>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub diff: Option<DiffConfig>,
+    #[serde(flatten)]
+    pub extra: BTreeMap<String, serde_json::Value>,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(untagged)]
+pub enum LocalAgentEntry {
+    ByName(AgentLabel),
+    Inline(InlineLocalAgent),
+}
+
+#[derive(Deserialize, Serialize)]
+pub struct InlineLocalAgent {
+    pub label: AgentLabel,
+    pub tool: Tool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub launch: Option<LaunchConfig>,
+    /// Optional explicit role. Validated AFTER deserialize:
+    /// `Some(Role::Master)` is rejected with an actionable
+    /// error pointing at `clank promote`. `None` and
+    /// `Some(Role::Reviewer)` both resolve to reviewer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role: Option<Role>,
+}
+```
+
+**Old-format detection via the typed `extra` catchall**: a
+loader checks `repo_config.extra.contains_key("agents")`.
+That's a key lookup on a typed `BTreeMap<String, Value>` —
+no whole-document `Value` parsing. If present:
+- `clank init`: removes the key from `extra`, writes back
+  through the typed serializer.
+- Every other command: panics with the actionable error
+  (see "Old-format detection" section below).
+
+**Migration write path**: the migration mutates the typed
+`RepoConfigFile` in memory (`extra.remove("agents")`,
+`team = Some(name)`), then `serde_json::to_string_pretty(&typed)`
+serializes it back. The `extra` flatten preserves any
+forward-compat keys this clank version doesn't know about.
+
+The existing `no_json_literal_config_writes_in_tests` lint
+already covers config WRITES; this plan extends discipline
+to READS by never `Value`-parsing whole config files.
 
 ## What goes away
 
