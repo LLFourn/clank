@@ -151,41 +151,48 @@ For a given repo, the registered set is computed as:
 
 ## CLI surface changes
 
-**`clank init` modes (codex 66751c8 pin — old contract
-was self-contradictory: same command was supposed to both
-crash on old format AND migrate it. Disambiguated via an
-explicit `--migrate` flag).**
+**`clank init` is the only setup/migration command** — no
+separate `--migrate` flag. Codex 66751c8's "explicit
+signal" catch is addressed by a clear stderr message
+naming what was done, not by a flag the user has to
+discover.
 
-- **`clank init --migrate [--team <name>]`** — explicit
-  one-time migration command. Detects old-format signals
-  (`.clank/config.json#/agents` is Some, OR per-agent
-  skeletons have declaration fields like `tool` /
-  `initial_prompt`), then:
-  1. Strips declaration fields from per-agent skeletons
-     (keeps session, auto_mode, wfw_timeout).
-  2. Deletes `.clank/agents/.empty` sentinel if present.
-  3. Writes the chosen team to `<repo>/.clank/config.json`
-     (default team if `--team` not specified).
-  4. Adds `/config.json` to `.clank/.gitignore`.
-  Refuses if NO old-format signal is present (don't run
-  migration on a clean repo — that's a foot-gun; pushes
-  user to plain `init`).
-- **`clank init --team <name>`** (no `--migrate`) — fresh
-  init OR team-switch on a new-format repo.
-  - Fresh repo: write the team to
-    `<repo>/.clank/config.json` + gitignore.
-  - Already-initialized new-format repo: REWRITE the
+- **`clank init --team <name>`** — set the team for this
+  repo. Idempotent across states:
+  - **Fresh repo**: write team to
+    `<repo>/.clank/config.json` + gitignore the file.
+  - **New-format repo with existing team**: REWRITE the
     team field. Leaves `local_agents`, `master_override`,
-    per-agent state files untouched. This is the
-    "change team" path ("I started under `default` but
-    it's really `research` work — swap it.").
-  - Old-format repo: REFUSE with
-    "old format detected; re-run with `--migrate` to
-    migrate." Names the detected signal.
-- **`clank init`** (no flags) —
+    per-agent state files untouched. ("I started under
+    `default` but it's really `research` work — swap it.")
+  - **Old-format repo** (has `.clank/config.json#/agents`
+    block OR per-agent skeletons with `tool` /
+    `initial_prompt` declaration fields):
+    1. Strip declaration fields from per-agent skeletons
+       (keeps session, auto_mode, wfw_timeout).
+    2. Delete `.clank/agents/.empty` sentinel if present.
+    3. Remove the legacy `agents` key from
+       `.clank/config.json`.
+    4. Write the chosen team.
+    5. Gitignore `config.json`.
+    Print a clear stderr summary: `cleaned up old-format
+    artifacts (N skeleton fields stripped, sentinel
+    removed, legacy agents block dropped) and set team to
+    <name>.` The user knows exactly what changed.
+- **`clank init`** (no `--team`) —
   - Fresh repo: use team `default`.
-  - New-format repo: no-op (preserves existing team).
-  - Old-format repo: REFUSE with same migrate hint.
+  - New-format repo with existing team: no-op (preserves
+    the existing selection rather than silently reverting
+    to `default`).
+  - Old-format repo: same cleanup as `--team` above, but
+    sets team to `default`.
+
+The "what's different about the second invocation"
+question codex raised is answered by file state, not by
+a flag. Pre-cleanup: old-format signals present. Post-
+cleanup: clean new-format. Re-running `clank init` is
+always safe — the cleanup branch only fires when the
+detection signals are present.
 - **`clank agent`** — agent DESCRIPTIONS (the "who"):
   - `add --global <label> --tool <tool> [--launch-cmd ...]`:
     write to user-scope `agents` table.
