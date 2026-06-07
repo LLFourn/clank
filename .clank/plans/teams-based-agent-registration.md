@@ -627,20 +627,31 @@ pub struct InlineAgent {
 }
 ```
 
-**Old-format detection via the typed `extra` catchall**: a
-loader checks `repo_config.extra.contains_key("agents")`.
-That's a key lookup on a typed `BTreeMap<String, Value>` —
-no whole-document `Value` parsing. If present:
-- `clank init`: removes the key from `extra`, writes back
-  through the typed serializer.
-- Every other command: panics with the actionable error
-  (see "Old-format detection" section below).
+**Old-format handling**: see the "Config errors propagate
+via anyhow" section above for the full story. The short
+version: every command except `clank init` just calls
+`serde_json::from_str::<RepoConfigFile>(&body)
+.with_context(|| format!("parsing {}", path))?` — if the
+typed deserialize fails (which it will for the old
+`agents: [...]` array shape), anyhow propagates the error
+to `main` with the file path and serde's structural
+explanation. No bespoke detection code.
 
-**Migration write path**: the migration mutates the typed
-`RepoConfigFile` in memory (`extra.remove("agents")`,
-`team = Some(name)`), then `serde_json::to_string_pretty(&typed)`
-serializes it back. The `extra` flatten preserves any
-forward-compat keys this clank version doesn't know about.
+`clank init` is the only command that NEEDS to recognize
+the old shape (so it can clean it up). It attempts the
+new-format deserialize first; on failure, attempts a
+`LegacyRepoConfigFile` typed-struct fallback (with the old
+`agents: Option<Vec<DefaultAgent>>` field). If the legacy
+deserialize succeeds, init runs the cleanup described in
+the CLI surface section. If both fail, the error
+propagates as above.
+
+**Migration write path**: init mutates the typed
+`RepoConfigFile` in memory (drops the legacy block, sets
+`team`), then `serde_json::to_string_pretty(&typed)`
+serializes it back through typed serde. The `extra`
+flatten preserves any forward-compat keys this clank
+version doesn't know about.
 
 The existing `no_json_literal_config_writes_in_tests` lint
 already covers config WRITES; this plan extends discipline
@@ -723,8 +734,8 @@ completely different `dev` compositions on each machine,
 so gate states still diverge.
 
 Concretely: alice's `dev` = {claude (master), codex
-(reviewer)}, bob's `dev` = {grok (master), claude
-(reviewer), alice (reviewer)}. Same repo, same commit,
+(reviewer)}, bob's `dev` = {codex (master), claude
+(reviewer), ruthless (reviewer)}. Same repo, same commit,
 different gate state on each machine.
 
 **Scope**: single-user-multi-machine via dotfile sync.
