@@ -105,17 +105,47 @@ Pinned fix: a zero-byte sentinel file at
 `.clank/agents/.empty` represents the explicit-empty
 state. Per-user (lives under the gitignored
 `.clank/agents/` dir, same scope as the rest of the
-declarations). `clank init` migration writes the
-sentinel when `.clank/config.json#/agents` is
-`Some(vec![])`. `clank agent add` deletes the sentinel
-when registering the first agent (the user clearly
-no longer wants empty). `clank agent remove` does NOT
-re-create it — explicit-empty is a deliberate user
-gesture, not a transient state. To restore the
-explicit-empty intent, the user re-runs an explicit
-"disable user-scope fallback" command (proposed:
-`clank agent reset --empty` — out of scope for this
-plan; if needed, queue separately).
+declarations).
+
+Sentinel lifecycle:
+- `clank init` migration: writes the sentinel when
+  `.clank/config.json#/agents` is `Some(vec![])`.
+- `clank agent add` (first agent): deletes the
+  sentinel — the user has registered an agent, they
+  no longer want empty.
+- `clank agent remove` (last skeleton): writes the
+  sentinel (codex 828207c catch — see below). The user
+  registered agents and then explicitly removed them
+  all; that's the same intent as `agents: []` was
+  today. Without this step, `agent remove` would
+  silently re-expose user-scope defaults.
+- No state transitions happen while the user has 1+
+  skeletons; the sentinel is only consulted when zero
+  skeletons exist.
+
+#### remove-last must preserve no-fallback (codex 828207c)
+
+Today's semantic: removing the last entry from
+`.clank/config.json#/agents` leaves `agents: Some([])`,
+which keeps user-scope fallback suppressed. Concrete
+flow this protects:
+
+1. User has user-scope defaults `[claude, codex, ruthless]`.
+2. User runs `clank agent add codex --tool codex` in a
+   repo. REPLACE semantics — user-scope ignored.
+3. User runs `clank agent remove codex` (decided not
+   to use codex either).
+4. **Today**: `.clank/config.json#/agents = Some([])`.
+   No fallback. Repo has zero agents, as intended.
+5. **My initial proposal**: zero skeletons → fallback
+   fires → claude/codex/ruthless from user-scope all
+   reappear. Wrong.
+
+Fix: `clank agent remove` whose post-state is zero
+skeletons writes the sentinel. Symmetric pair with
+`clank agent add` which deletes the sentinel on the
+0→1 transition. The repo's intent ("I do NOT want user
+defaults here") is preserved across the remove path.
 
 ### 3. `.clank/config.json#/agents` removed
 
@@ -162,7 +192,10 @@ no-op in both cases (the `agents` key is already None).
   The default target is repo-scope per-agent skeleton.
 - `remove`: deletes
   `.clank/agents/<label>/config.json`. The `feedback/`
-  subdir is preserved (review history stays).
+  subdir is preserved (review history stays). **If
+  this was the last skeleton**, also writes
+  `.clank/agents/.empty` to preserve the no-fallback
+  intent (codex 828207c).
 - `promote`: mutates `role` in the target skeleton(s)
   via the existing `ensure_unique_master` helper. Same
   flag handling as today.
@@ -263,6 +296,20 @@ recoverable via re-run."
   has `.clank/agents/.empty`. Run `clank agent add codex
   --tool codex`. Assert the sentinel file is gone AND
   codex skeleton exists.
+- **`clank_agent_remove_last_skeleton_creates_empty_sentinel`**
+  (codex 828207c catch): pre-state has codex skeleton
+  only AND user-scope defaults = `[claude, codex,
+  ruthless]`. Run `clank agent remove codex`. Assert
+  `.clank/agents/.empty` EXISTS AND
+  `load_merged_agents` returns `Vec::new()` (NOT the
+  user-scope defaults — claude/codex/ruthless do NOT
+  reappear).
+- `clank_agent_remove_with_remaining_skeletons_does_not_create_sentinel`
+  (no over-application): pre-state has codex + claude
+  skeletons. Run `clank agent remove codex`. Assert
+  `.clank/agents/.empty` does NOT exist (claude
+  remains). The sentinel only fires on the N→0
+  transition.
 - `clank_agent_add_writes_per_agent_skeleton`: replaces
   today's `add` integration tests that assert
   `.clank/config.json#/agents`. New assertion: the
@@ -318,12 +365,15 @@ recoverable via re-run."
   idempotently recoverable via re-run, per codex 861c364
   pin). The unique-master invariant still holds via
   `ensure_unique_master`.
-- Explicit-empty intent is preserved (codex 861c364
-  catch): migrating `.clank/config.json#/agents` =
-  `Some(vec![])` writes a `.clank/agents/.empty`
-  sentinel; `load_merged_agents` checks for that file
-  first and returns `Vec::new()` (no user-scope
-  fallback) when present.
+- Explicit-empty intent is preserved across every
+  surface (codex 861c364 + 828207c catches):
+  - Migration: `agents: []` → `.clank/agents/.empty`.
+  - Add (0→1): sentinel deleted.
+  - Remove (N→0): sentinel written.
+  - `load_merged_agents` checks the sentinel first and
+    returns `Vec::new()` (no user-scope fallback) when
+    present. Repos that intend "no agents here" never
+    silently re-expose user defaults.
 - The bootstrap path (just shipped in
   `agent-start-bootstraps-missing-skeleton`) now reads
   `tool` from the skeleton directly. The no-tool error
