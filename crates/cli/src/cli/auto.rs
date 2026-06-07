@@ -29,7 +29,9 @@ async fn run_on(args: AutoOnArgs) -> anyhow::Result<()> {
     let repo = resolve_repo(args.repo.as_deref())?;
     let label = resolve_identity_from_env(&repo)?;
 
-    let mut cfg = load_agent_config(&repo, &label)?.unwrap_or_default();
+    let existing = load_agent_config(&repo, &label)?;
+    refuse_if_sentinel_would_create_skeleton(&repo, &label, existing.is_some())?;
+    let mut cfg = existing.unwrap_or_default();
     cfg.auto_mode = AutoMode::On;
     if let Some(t) = args.wfw_timeout.as_deref() {
         cfg.wfw_timeout = Some(t.to_string());
@@ -54,7 +56,9 @@ async fn run_off(args: AutoOffArgs) -> anyhow::Result<()> {
     let repo = resolve_repo(args.repo.as_deref())?;
     let label = resolve_identity_from_env(&repo)?;
 
-    let mut cfg = load_agent_config(&repo, &label)?.unwrap_or_default();
+    let existing = load_agent_config(&repo, &label)?;
+    refuse_if_sentinel_would_create_skeleton(&repo, &label, existing.is_some())?;
+    let mut cfg = existing.unwrap_or_default();
     cfg.auto_mode = AutoMode::Off;
     if let Some(role_arg) = args.role {
         cfg.role = role_arg.into();
@@ -66,6 +70,39 @@ async fn run_off(args: AutoOffArgs) -> anyhow::Result<()> {
         println!("  role: {}", cfg.role.as_str());
     }
     Ok(())
+}
+
+/// Refuse the auto mutation when the explicit-empty sentinel is
+/// active AND the call would CREATE a new skeleton.
+///
+/// Plan: `agents-declaration-is-user-local` + codex 8f30c5d
+/// catch. The auto path's `unwrap_or_default()` shape silently
+/// creates a hidden skeleton for unregistered agents — under
+/// the sentinel that skeleton would be invisible until a later
+/// `clank agent add` cleared the sentinel and resurrected it.
+///
+/// Mutating an EXISTING skeleton's auto_mode is allowed (no
+/// resurrection risk — the skeleton was already there); creating
+/// one would violate the explicit-empty intent.
+fn refuse_if_sentinel_would_create_skeleton(
+    repo: &std::path::Path,
+    label: &clank_core::ids::AgentLabel,
+    skeleton_exists: bool,
+) -> anyhow::Result<()> {
+    if skeleton_exists {
+        return Ok(());
+    }
+    if !crate::cli::config::empty_sentinel_path(repo).is_file() {
+        return Ok(());
+    }
+    anyhow::bail!(
+        "explicit-empty agents declaration is active \
+         (`.clank/agents/.empty` present); refusing to create a new \
+         skeleton for `{label}` via `clank auto`. To register this \
+         agent, run `clank agent add {label} --tool <claude|codex>` \
+         first (which clears the sentinel as the 0→1 transition).",
+        label = label.as_str(),
+    );
 }
 
 async fn run_status(args: AutoStatusArgs) -> anyhow::Result<()> {

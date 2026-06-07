@@ -345,3 +345,60 @@ fn clank_agent_overrides_invalid_session_id() {
     let body: serde_json::Value = serde_json::from_slice(&out.stdout).expect("valid JSON");
     assert_eq!(body["label"], "alice");
 }
+
+#[test]
+fn clank_auto_on_refuses_when_empty_sentinel_active_and_no_resurrection_on_later_add() {
+    // Codex 8f30c5d catch: pre-fix `clank auto on` (with
+    // CLANK_AGENT) wrote a default skeleton via the
+    // `unwrap_or_default()` shape, even when `.clank/agents/.empty`
+    // was active. Same hidden-skeleton resurrection class as
+    // `clank as` (closed in 8f30c5d) and `clank init`
+    // bootstrap (closed in 7e2983f).
+    //
+    // Post-fix: auto on/off refuse when sentinel is active AND
+    // the skeleton would be CREATED (not just updated).
+    let dir = init_repo();
+    let repo = dir.path();
+    std::fs::create_dir_all(repo.join(".clank/agents")).unwrap();
+    std::fs::write(repo.join(".clank/agents/.empty"), b"").unwrap();
+
+    let out = run_clank(repo, &["auto", "on"], &[("CLANK_AGENT", "codex")]);
+    assert!(
+        !out.status.success(),
+        "auto on must refuse when sentinel is active; got success: stdout=`{}` stderr=`{}`",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains(".empty") && stderr.contains("clank agent add"),
+        "refusal message must name the sentinel + suggest agent add; got: {stderr}"
+    );
+    assert!(
+        !repo.join(".clank/agents/codex/config.json").is_file(),
+        "no skeleton must be written by refused auto on"
+    );
+
+    // Subsequent `clank agent add bob --tool claude` must register
+    // ONLY bob; no resurrected codex.
+    let add_out = run_clank(repo, &["agent", "add", "bob", "--tool", "claude"], &[]);
+    assert!(
+        add_out.status.success(),
+        "add failed: stderr=`{}`",
+        String::from_utf8_lossy(&add_out.stderr)
+    );
+    let merged = clank::cli::config::load_merged_agents(repo, Some(repo)).unwrap();
+    let names: Vec<_> = merged
+        .iter()
+        .map(|e| e.label.as_str().to_string())
+        .collect();
+    assert_eq!(
+        names,
+        vec!["bob".to_string()],
+        "post-state must be exactly [bob]; codex must NOT resurrect via the auto path; got {names:?}"
+    );
+    assert!(
+        !repo.join(".clank/agents/codex/config.json").is_file(),
+        "codex skeleton must NOT exist post-add (would be the resurrection bug)"
+    );
+}
