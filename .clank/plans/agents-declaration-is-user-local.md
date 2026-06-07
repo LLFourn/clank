@@ -69,20 +69,53 @@ persists across sessions.
 In `crates/cli/src/cli/config.rs`, the merged-agent
 resolution becomes:
 
-1. Scan `<repo>/.clank/agents/*/config.json` —
+1. If a sentinel file `.clank/agents/.empty` exists →
+   return an empty Vec. Explicit no-fallback per codex
+   861c364 catch (see *Explicit-empty sentinel* below).
+2. Scan `<repo>/.clank/agents/*/config.json` —
    declared agents in this repo.
-2. If empty, fall back to user-scope
+3. If the scan returned >0 entries → return them.
+4. Else → fall back to user-scope
    `~/.clank/config.json#/default_agents`.
 
-REPLACE semantics still hold: if ANY skeleton exists,
-user-scope is ignored entirely for THIS repo. Same shape
-as today's repo-vs-user override.
+REPLACE semantics still hold: if any skeletons exist OR
+the sentinel file exists, user-scope is ignored entirely
+for THIS repo. Same shape as today's
+presence-aware repo-vs-user override.
 
 The current legacy-synthesis path at `config.rs:502-506`
 (which derives `DefaultAgent.tool` from
 `cfg.session.tool`) becomes the PRIMARY path, now
 reading the new explicit `tool` field instead of
 inferring from session.
+
+#### Explicit-empty sentinel (codex 861c364 catch)
+
+Today `RepoAgentsFile.agents` is `Option<Vec>` and `None`
+vs `Some(vec![])` matters: `Some(vec![])` is the
+"explicit no agents" gesture that disables user-scope
+fallback. The plan as written silently dropped this
+distinction — migrating `agents: []` would remove the
+key, leave zero skeletons, and `load_merged_agents`
+would then fall back to user-scope, flipping a
+deliberate "no agents in this repo" into "use my user
+defaults."
+
+Pinned fix: a zero-byte sentinel file at
+`.clank/agents/.empty` represents the explicit-empty
+state. Per-user (lives under the gitignored
+`.clank/agents/` dir, same scope as the rest of the
+declarations). `clank init` migration writes the
+sentinel when `.clank/config.json#/agents` is
+`Some(vec![])`. `clank agent add` deletes the sentinel
+when registering the first agent (the user clearly
+no longer wants empty). `clank agent remove` does NOT
+re-create it — explicit-empty is a deliberate user
+gesture, not a transient state. To restore the
+explicit-empty intent, the user re-runs an explicit
+"disable user-scope fallback" command (proposed:
+`clank agent reset --empty` — out of scope for this
+plan; if needed, queue separately).
 
 ### 3. `.clank/config.json#/agents` removed
 
@@ -98,18 +131,29 @@ by the migration step below.
 When `clank init` runs and detects
 `.clank/config.json#/agents` is non-None:
 
-1. For each entry in the block, write the declaration
-   fields (role, tool, launch, initial_prompt) into
+1. **Case A — `Some(non-empty vec)`**: for each entry in
+   the block, write the declaration fields (role, tool,
+   launch, initial_prompt) into
    `.clank/agents/<label>/config.json`, MERGING with any
    existing skeleton (preserving
    session/auto_mode/wfw_timeout).
-2. Remove the `agents` key from `.clank/config.json`.
-3. Print:
-   `migrated <N> agents declaration(s) to per-agent
-   skeletons (now per-user)`.
+2. **Case B — `Some(vec![])`** (codex 861c364 catch):
+   write a zero-byte file at `.clank/agents/.empty` to
+   preserve the explicit-empty intent. No per-agent
+   skeletons get written; the sentinel handles fallback
+   suppression.
+3. Remove the `agents` key from `.clank/config.json` in
+   BOTH cases.
+4. Print:
+   - Case A:
+     `migrated <N> agents declaration(s) to per-agent
+     skeletons (now per-user)`.
+   - Case B:
+     `migrated explicit-empty agents declaration to
+     .clank/agents/.empty (now per-user)`.
 
 Idempotent: re-running `clank init` after migration is a
-no-op (the `agents` key is already None).
+no-op in both cases (the `agents` key is already None).
 
 ### 5. `clank agent add / remove / promote`
 
@@ -131,17 +175,22 @@ mutates per-agent skeleton files (one write per demote
 "one JSON file written once" to "N skeleton files
 written".
 
-**Open question (decide in implementation)**: should
-the multi-skeleton write be transactional? Options:
-- Accept N writes — atomicity per-file. If a crash
-  happens mid-loop, the post-state has SOME demotes
-  applied.
-- Stage all writes, then `fsync` + rename together.
-  More code but truly atomic.
+**PINNED (codex 861c364 catch — was an open question,
+now decided)**: accept N non-transactional writes.
+Each per-file write is itself atomic via
+`save_agent_config`'s tempfile-and-rename. Crash
+mid-loop leaves SOME demotes applied; on next
+invocation `promote` runs `ensure_unique_master` from
+the new pre-state and converges. Re-running is the
+recovery path; the existing
+`clank_agent_promote_atomic_write` test pattern is
+adapted to check per-file atomicity instead of
+single-file-mtime.
 
-Recommendation: accept N writes. The window is small
-(one process, milliseconds) and `promote` is
-idempotent — re-running fixes any partial state.
+Acceptance: existing atomic-write property statement
+("one write, all changes") is replaced by "N atomic
+per-file writes; partial state is idempotently
+recoverable via re-run."
 
 ## Surfaces touched
 
@@ -196,6 +245,24 @@ idempotent — re-running fixes any partial state.
   `.clank/agents/codex/config.json` ALREADY exists with
   `session: Some(...)`. Migration merges in declaration
   fields without clobbering session.
+- `clank_init_migrates_explicit_empty_agents_to_sentinel`
+  (codex 861c364 catch): fixture has
+  `.clank/config.json#/agents` = `Some(vec![])`. Run
+  `clank init`. Assert
+  `.clank/agents/.empty` zero-byte file is created AND
+  the `agents` key is removed from `.clank/config.json`.
+- `load_merged_agents_respects_empty_sentinel`
+  (codex 861c364 catch): user-scope `default_agents` is
+  set to `[claude, codex]`. Repo has
+  `.clank/agents/.empty` AND no per-agent skeletons.
+  Assert `load_merged_agents` returns Vec::new(), NOT
+  the user-scope defaults. This is the load-bearing
+  test that the explicit-empty intent is preserved
+  across the migration.
+- `clank_agent_add_deletes_empty_sentinel`: pre-state
+  has `.clank/agents/.empty`. Run `clank agent add codex
+  --tool codex`. Assert the sentinel file is gone AND
+  codex skeleton exists.
 - `clank_agent_add_writes_per_agent_skeleton`: replaces
   today's `add` integration tests that assert
   `.clank/config.json#/agents`. New assertion: the
@@ -246,8 +313,17 @@ idempotent — re-running fixes any partial state.
   repo `.clank/config.json` file is unchanged by this
   operation.
 - `clank agent promote` mutates per-agent skeletons
-  (one write per affected agent). The unique-master
-  invariant still holds via `ensure_unique_master`.
+  (one atomic write per affected agent;
+  non-transactional across files — partial state is
+  idempotently recoverable via re-run, per codex 861c364
+  pin). The unique-master invariant still holds via
+  `ensure_unique_master`.
+- Explicit-empty intent is preserved (codex 861c364
+  catch): migrating `.clank/config.json#/agents` =
+  `Some(vec![])` writes a `.clank/agents/.empty`
+  sentinel; `load_merged_agents` checks for that file
+  first and returns `Vec::new()` (no user-scope
+  fallback) when present.
 - The bootstrap path (just shipped in
   `agent-start-bootstraps-missing-skeleton`) now reads
   `tool` from the skeleton directly. The no-tool error
