@@ -73,6 +73,22 @@ pub fn load_all_agent_configs(repo: &Path) -> anyhow::Result<Vec<(AgentLabel, Ag
 /// was returning role=master from the skeleton, even though the
 /// explicit empty declaration says no agents are registered.
 pub fn resolve_role(repo: &Path, label: &AgentLabel) -> anyhow::Result<clank_core::vocab::Role> {
+    // Plan: teams-based-agent-registration (codex b59dafb
+    // catch — role resolution was left on the legacy path
+    // while reviewer tiers cut over to the new resolver. A
+    // team master whose legacy `default_agents` entry is
+    // `role: reviewer` was getting Role::Reviewer here, so
+    // master work items never emitted for them).
+    //
+    // Dispatch: when the repo config has a `team` field, run
+    // the new resolver and derive role from the resolved set
+    // (label == master → Master; otherwise Reviewer if in
+    // either tier; else default). Falls back to legacy when
+    // no team field is set.
+    if let Some(set) = try_resolve_via_team(repo)? {
+        return Ok(role_from_registered_set(&set, label));
+    }
+    // Legacy path.
     let home = std::env::var_os("HOME").map(PathBuf::from);
     let merged = crate::cli::config::load_merged_agents(repo, home.as_deref())?;
     Ok(merged
@@ -126,27 +142,95 @@ pub fn load_expected_reviewers(repo: &Path) -> anyhow::Result<Vec<AgentLabel>> {
 /// This is the production cutover surface: subsequent
 /// phases remove the fallback path entirely.
 pub fn load_reviewer_tiers(repo: &Path) -> anyhow::Result<(Vec<AgentLabel>, Vec<AgentLabel>)> {
+    match try_resolve_via_team(repo)? {
+        Some(set) => {
+            let commit = set.commit_reviewers.into_iter().map(|a| a.label).collect();
+            let gate = set.gate_reviewers.into_iter().map(|a| a.label).collect();
+            Ok((commit, gate))
+        }
+        None => {
+            // No team set or no repo config — legacy single-list
+            // path.
+            Ok((load_expected_reviewers(repo)?, Vec::new()))
+        }
+    }
+}
+
+/// Plan: teams-based-agent-registration (phase 6b).
+///
+/// Shared dispatch helper for `load_reviewer_tiers` and
+/// `resolve_role`. Returns:
+/// - `Ok(Some(RegisteredSet))` when the repo config parses
+///   AND has a `team` field. The set is the result of running
+///   `resolve_registered_set` against the new typed schemas.
+/// - `Ok(None)` when the repo has no `team` field set (or
+///   no repo config exists), signaling the caller should fall
+///   back to legacy behavior. Per codex b59dafb, this case is
+///   narrower than "any parse error" — a present-but-malformed
+///   `team` / `promoted` field now FAILS instead of silently
+///   falling back.
+///
+/// Failure modes:
+/// - Repo config exists but new-schema parse fails AND the
+///   legacy parse can't see it as `default_agents`/`agents`
+///   etc.: returns an error (fail-closed). Legacy `agents`
+///   array shape lands in `extra` of the new schema (via the
+///   flatten catchall), so legacy repos do NOT trigger the
+///   parse-fail path — they parse successfully with no
+///   `team` field and fall through to `Ok(None)`.
+/// - User config doesn't parse as new-schema when team is
+///   set: error propagates (fail-closed).
+/// - `resolve_registered_set` returns error (UnknownTeam,
+///   NoMaster, etc.): error propagates.
+/// Plan: teams-based-agent-registration (codex b59dafb pure
+/// helper). Derive a role from a resolved registered set.
+/// Pure: no $HOME, no filesystem. Testable directly.
+fn role_from_registered_set(
+    set: &crate::cli::teams_config::RegisteredSet,
+    label: &AgentLabel,
+) -> clank_core::vocab::Role {
+    use clank_core::vocab::Role;
+    if &set.master == label {
+        return Role::Master;
+    }
+    let in_either_tier = set
+        .commit_reviewers
+        .iter()
+        .chain(set.gate_reviewers.iter())
+        .any(|a| &a.label == label);
+    if in_either_tier {
+        Role::Reviewer
+    } else {
+        Role::default()
+    }
+}
+
+fn try_resolve_via_team(
+    repo: &Path,
+) -> anyhow::Result<Option<crate::cli::teams_config::RegisteredSet>> {
     use crate::cli::teams_config::{RepoConfigFile, UserConfigFile, resolve_registered_set};
 
-    // Try the new path: read repo config as new-schema and
-    // check for `team`. If no team field, fall back.
     let repo_cfg_path = repo.join(".clank/config.json");
-    let repo_cfg: RepoConfigFile = match std::fs::read_to_string(&repo_cfg_path) {
-        Ok(s) => match serde_json::from_str(&s) {
-            Ok(c) => c,
-            Err(_) => {
-                // Repo config didn't parse as new-schema (e.g.
-                // legacy `agents` array shape). Fall back to
-                // legacy path.
-                return Ok((load_expected_reviewers(repo)?, Vec::new()));
-            }
-        },
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => RepoConfigFile::default(),
+    let body = match std::fs::read_to_string(&repo_cfg_path) {
+        Ok(s) => s,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(e.into()),
     };
+    // Fail-closed on parse error (codex b59dafb catch). Legacy
+    // `agents` array shape DOES parse here — the new schema's
+    // `agents` field is a BTreeMap, not a Vec, so legacy gets
+    // captured in `extra`. A real parse error means the file
+    // is genuinely malformed (e.g. invalid JSON, unknown
+    // strongly-typed field shape) and should surface, not be
+    // silently swallowed by the legacy fallback.
+    let repo_cfg: RepoConfigFile = serde_json::from_str(&body).map_err(|e| {
+        anyhow::anyhow!(
+            "parsing {} as new-schema RepoConfigFile: {e}",
+            repo_cfg_path.display()
+        )
+    })?;
     if repo_cfg.team.is_none() {
-        // No team set → legacy behavior.
-        return Ok((load_expected_reviewers(repo)?, Vec::new()));
+        return Ok(None);
     }
 
     // Team is set: read user-scope new schema and resolve.
@@ -165,18 +249,7 @@ pub fn load_reviewer_tiers(repo: &Path) -> anyhow::Result<(Vec<AgentLabel>, Vec<
         None => UserConfigFile::default(),
     };
 
-    let resolved = resolve_registered_set(&user_cfg, &repo_cfg)?;
-    let commit = resolved
-        .commit_reviewers
-        .into_iter()
-        .map(|a| a.label)
-        .collect();
-    let gate = resolved
-        .gate_reviewers
-        .into_iter()
-        .map(|a| a.label)
-        .collect();
-    Ok((commit, gate))
+    Ok(Some(resolve_registered_set(&user_cfg, &repo_cfg)?))
 }
 
 /// Same as [`load_all_agent_configs`] but silently drops agents
@@ -343,4 +416,87 @@ fn save_json<T: serde::Serialize>(path: &Path, value: &T) -> anyhow::Result<()> 
     tmp.as_file_mut().sync_all()?;
     tmp.persist(path).map_err(|e| e.error)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cli::teams_config::{AgentDescription, RegisteredSet, ResolvedAgent};
+    use clank_core::vocab::{Role, Tool};
+
+    fn label(s: &str) -> AgentLabel {
+        AgentLabel::parse(s).unwrap()
+    }
+
+    fn desc(tool: Tool) -> AgentDescription {
+        AgentDescription {
+            tool,
+            launch: None,
+            initial_prompt: None,
+        }
+    }
+
+    fn registered_set(master: &str, commit: &[&str], gate: &[&str]) -> RegisteredSet {
+        RegisteredSet {
+            master: label(master),
+            master_desc: desc(Tool::Claude),
+            commit_reviewers: commit
+                .iter()
+                .map(|l| ResolvedAgent {
+                    label: label(l),
+                    desc: desc(Tool::Claude),
+                })
+                .collect(),
+            gate_reviewers: gate
+                .iter()
+                .map(|l| ResolvedAgent {
+                    label: label(l),
+                    desc: desc(Tool::Claude),
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn role_from_registered_set_returns_master_for_team_master() {
+        // Codex b59dafb catch: the team master must be
+        // Role::Master regardless of what the legacy
+        // `default_agents` entry says. Pre-fix, the role
+        // resolver was reading the legacy merged declaration
+        // and returning Role::Reviewer for a team master whose
+        // legacy entry said reviewer — leading to master work
+        // items never emitting via wfw.
+        let set = registered_set("codex", &["claude"], &["ruthless"]);
+        assert_eq!(
+            role_from_registered_set(&set, &label("codex")),
+            Role::Master
+        );
+    }
+
+    #[test]
+    fn role_from_registered_set_returns_reviewer_for_commit_tier() {
+        let set = registered_set("codex", &["claude"], &["ruthless"]);
+        assert_eq!(
+            role_from_registered_set(&set, &label("claude")),
+            Role::Reviewer
+        );
+    }
+
+    #[test]
+    fn role_from_registered_set_returns_reviewer_for_gate_tier() {
+        let set = registered_set("codex", &["claude"], &["ruthless"]);
+        assert_eq!(
+            role_from_registered_set(&set, &label("ruthless")),
+            Role::Reviewer
+        );
+    }
+
+    #[test]
+    fn role_from_registered_set_returns_default_for_unknown_label() {
+        let set = registered_set("codex", &["claude"], &["ruthless"]);
+        assert_eq!(
+            role_from_registered_set(&set, &label("phantom")),
+            Role::default()
+        );
+    }
 }
