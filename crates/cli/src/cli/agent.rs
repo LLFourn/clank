@@ -498,7 +498,7 @@ fn add(args: AgentAddArgs) -> anyhow::Result<()> {
             .ok_or_else(|| anyhow::anyhow!("--global requires $HOME"))?;
         let mut file = read_user_config(home_ref)?;
         let mut agents = file.default_agents.unwrap_or_default();
-        agents.push(entry);
+        agents.push(entry.clone());
         // Plan: agent-promote-replaces-set-role — `add --role
         // master` enforces the same unique-master invariant as
         // `promote`. Reuses the shared helper so both paths
@@ -510,6 +510,17 @@ fn add(args: AgentAddArgs) -> anyhow::Result<()> {
         };
         file.default_agents = Some(agents);
         write_user_config(home_ref, &file)?;
+
+        // Plan: teams-based-agent-registration (phase 5).
+        // Dual-write the new user-scope `agents` map so
+        // `clank team add`/`set-master` (which read the new
+        // schema) can reference this label. The new map is
+        // also keyed by label, but the description shape is
+        // purely declarative (no role — roles live per-team
+        // now). Phase 6 cuts over read paths and drops the
+        // `default_agents` write here.
+        write_new_user_agents_entry(home_ref, &label, tool, &entry)?;
+
         eprintln!(
             "registered `{}` in user-scope `default_agents`{}",
             args.label,
@@ -875,6 +886,46 @@ fn write_user_config(home: &Path, file: &UserConfigFile) -> anyhow::Result<()> {
     write_typed_config(&home.join(".clank/config.json"), file)
 }
 
+/// Plan: teams-based-agent-registration (phase 5).
+///
+/// Dual-write helper: after `clank agent add --global` writes
+/// to the legacy `default_agents`, this helper opens the same
+/// file via the NEW `teams_config::UserConfigFile` schema and
+/// inserts the agent description into the new `agents` map. The
+/// old `default_agents` field round-trips through the new
+/// schema's `extra` flatten catchall.
+///
+/// Both schemas have non-overlapping required fields:
+/// - Old: `default_agents`. New: `agents`, `teams`.
+/// - The `extra` catchall on each preserves the other's fields
+///   on round-trip.
+///
+/// Phase 6 will swap callers from the old schema to the new
+/// schema and remove this dual-write — `default_agents` becomes
+/// unused legacy at that point.
+fn write_new_user_agents_entry(
+    home: &Path,
+    label: &AgentLabel,
+    tool: Tool,
+    entry: &DefaultAgent,
+) -> anyhow::Result<()> {
+    use crate::cli::teams_config::{AgentDescription, UserConfigFile as NewUserConfigFile};
+    let path = home.join(".clank/config.json");
+    let mut file: NewUserConfigFile = match std::fs::read_to_string(&path) {
+        Ok(s) => serde_json::from_str(&s)
+            .with_context(|| format!("parsing {} as new-schema UserConfigFile", path.display()))?,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => NewUserConfigFile::default(),
+        Err(e) => return Err(anyhow::Error::from(e).context(format!("reading {}", path.display()))),
+    };
+    let desc = AgentDescription {
+        tool,
+        launch: entry.launch.clone(),
+        initial_prompt: entry.initial_prompt.clone(),
+    };
+    file.agents.insert(label.clone(), desc);
+    write_typed_config(&path, &file)
+}
+
 fn write_typed_config<T: serde::Serialize>(path: &Path, value: &T) -> anyhow::Result<()> {
     use std::io::Write;
     let parent = path
@@ -924,6 +975,73 @@ mod tests {
             tool: Tool::Codex,
             updated_at: "2026-06-04T12:00:00Z".to_string(),
         }
+    }
+
+    #[test]
+    fn write_new_user_agents_entry_preserves_legacy_default_agents() {
+        // Plan: teams-based-agent-registration (phase 5 dual-write).
+        // Old `default_agents` written by the legacy code path
+        // must round-trip through the new schema's `extra`
+        // catchall so the post-add file still has both shapes.
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        let cfg_path = home.join(".clank/config.json");
+        std::fs::create_dir_all(cfg_path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &cfg_path,
+            r#"{"default_agents":[{"label":"existing","role":"reviewer","tool":"claude"}]}"#,
+        )
+        .unwrap();
+
+        let label = AgentLabel::parse("claude").unwrap();
+        let entry = DefaultAgent {
+            label: label.clone(),
+            role: Role::Reviewer,
+            tool: Some(Tool::Claude),
+            launch: None,
+            initial_prompt: None,
+        };
+        write_new_user_agents_entry(home, &label, Tool::Claude, &entry).unwrap();
+
+        // Re-read the file via the new schema and confirm
+        // BOTH the new `agents` map AND the legacy
+        // `default_agents` field are preserved.
+        let body = std::fs::read_to_string(&cfg_path).unwrap();
+        let new_cfg: crate::cli::teams_config::UserConfigFile =
+            serde_json::from_str(&body).unwrap();
+        assert!(new_cfg.agents.contains_key(&label));
+        assert_eq!(new_cfg.agents.get(&label).unwrap().tool, Tool::Claude);
+        // Legacy field is in extra (the new schema doesn't know
+        // about default_agents directly).
+        assert!(new_cfg.extra.contains_key("default_agents"));
+    }
+
+    #[test]
+    fn write_new_user_agents_entry_round_trips_via_team_cli_view() {
+        // The whole point of the dual-write: after
+        // `clank agent add --global`, the new `agents` map is
+        // populated so `clank team add` can validate the
+        // reference. This test confirms the file shape is
+        // consumable by the team CLI's reader.
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        let label = AgentLabel::parse("codex").unwrap();
+        let entry = DefaultAgent {
+            label: label.clone(),
+            role: Role::Reviewer,
+            tool: Some(Tool::Codex),
+            launch: None,
+            initial_prompt: None,
+        };
+        write_new_user_agents_entry(home, &label, Tool::Codex, &entry).unwrap();
+
+        let body = std::fs::read_to_string(home.join(".clank/config.json")).unwrap();
+        let new_cfg: crate::cli::teams_config::UserConfigFile =
+            serde_json::from_str(&body).unwrap();
+        let desc = new_cfg.agents.get(&label).unwrap();
+        assert_eq!(desc.tool, Tool::Codex);
+        assert!(desc.launch.is_none());
+        assert!(desc.initial_prompt.is_none());
     }
 
     #[test]
