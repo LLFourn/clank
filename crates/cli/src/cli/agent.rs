@@ -817,6 +817,19 @@ fn promote(args: AgentPromoteArgs) -> anyhow::Result<()> {
             format_demoted_suffix(&demoted)
         );
     } else {
+        // Plan: teams-based-agent-registration (phase 6c).
+        // Dispatch: if the repo has a `team` field set (new
+        // model), write the `promoted` field to the repo
+        // config. The new resolver applies promoted as a
+        // per-repo master designation — the team's user-scope
+        // master config is left untouched.
+        //
+        // Otherwise fall through to the legacy
+        // skeleton-mutation path (unchanged).
+        if write_repo_promoted_field_if_team_set(&repo, &label)? {
+            return Ok(());
+        }
+
         // Repo-scope promote (plan: agents-declaration-is-user-local).
         // Operates on per-agent skeletons; ensure_unique_master_via_skeletons
         // writes one file per affected agent (atomic per-file,
@@ -857,6 +870,112 @@ fn promote(args: AgentPromoteArgs) -> anyhow::Result<()> {
         );
     }
     Ok(())
+}
+
+/// Plan: teams-based-agent-registration (phase 6c).
+///
+/// When the repo's `.clank/config.json` has a new-schema
+/// `team` field set, write the `promoted: <label>` field
+/// instead of mutating per-agent skeletons. Validates that
+/// the label is reachable in the registered set (so a
+/// nonexistent label errors before writing).
+///
+/// Returns:
+/// - `Ok(true)` when the new-schema path handled the
+///   promote. Caller should return early.
+/// - `Ok(false)` when the repo is unmigrated (no team
+///   field) — caller continues to the legacy skeleton
+///   path.
+/// - `Err(_)` when reading/parsing the config files fails
+///   or when the label isn't a valid promote target
+///   (UnknownAgent, NoMaster, etc. from the resolver).
+fn write_repo_promoted_field_if_team_set(
+    repo: &Path,
+    promoted: &AgentLabel,
+) -> anyhow::Result<bool> {
+    use crate::cli::teams_config::{RepoConfigFile, UserConfigFile};
+    use anyhow::Context;
+    use std::io::Write;
+
+    let repo_cfg_path = repo.join(".clank/config.json");
+    let body = match std::fs::read_to_string(&repo_cfg_path) {
+        Ok(s) => s,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(e) => return Err(e.into()),
+    };
+    let mut repo_cfg: RepoConfigFile = serde_json::from_str(&body).map_err(|e| {
+        anyhow::anyhow!(
+            "parsing {} as new-schema RepoConfigFile: {e}",
+            repo_cfg_path.display()
+        )
+    })?;
+    if repo_cfg.team.is_none() {
+        return Ok(false);
+    }
+
+    // Validate via the resolver. Load user-scope, set
+    // `promoted` in a TEMPORARY clone of repo_cfg, run the
+    // resolver — if the label isn't reachable it errors
+    // (UnknownAgent / PromotedNotPresent). Only persist on
+    // success.
+    let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+    let user_cfg: UserConfigFile = match home.as_deref() {
+        Some(h) => {
+            let user_path = h.join(".clank/config.json");
+            match std::fs::read_to_string(&user_path) {
+                Ok(s) => serde_json::from_str(&s).with_context(|| {
+                    format!(
+                        "parsing {} as new-schema UserConfigFile",
+                        user_path.display()
+                    )
+                })?,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => UserConfigFile::default(),
+                Err(e) => {
+                    return Err(
+                        anyhow::Error::from(e).context(format!("reading {}", user_path.display()))
+                    );
+                }
+            }
+        }
+        None => UserConfigFile::default(),
+    };
+
+    // No-op short-circuit: promoted already equals this
+    // label.
+    if repo_cfg.promoted.as_ref() == Some(promoted) {
+        eprintln!(
+            "note: `{}` is already the promoted master in repo-scope",
+            promoted.as_str()
+        );
+        return Ok(true);
+    }
+
+    // Validate by running the resolver with the proposed
+    // promoted field. On success, persist.
+    let mut probe = repo_cfg.clone();
+    probe.promoted = Some(promoted.clone());
+    let resolved = crate::cli::teams_config::resolve_registered_set(&user_cfg, &probe)
+        .with_context(|| format!("validating `promote {}`", promoted.as_str()))?;
+    // The resolver confirms the label is registered. Persist.
+    repo_cfg.promoted = Some(promoted.clone());
+    let parent = repo_cfg_path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("no parent for `{}`", repo_cfg_path.display()))?;
+    std::fs::create_dir_all(parent)?;
+    let mut tmp = tempfile::Builder::new()
+        .prefix(".clank-config-")
+        .suffix(".json.tmp")
+        .tempfile_in(parent)?;
+    tmp.write_all(serde_json::to_string_pretty(&repo_cfg)?.as_bytes())?;
+    tmp.write_all(b"\n")?;
+    tmp.as_file_mut().sync_all()?;
+    tmp.persist(&repo_cfg_path).map_err(|e| e.error)?;
+    let _ = resolved;
+    eprintln!(
+        "promoted `{}` to master in repo-scope (new-schema `promoted` field)",
+        promoted.as_str()
+    );
+    Ok(true)
 }
 
 fn parse_env_overrides(raw: &[String]) -> anyhow::Result<BTreeMap<String, String>> {
@@ -1058,6 +1177,134 @@ mod tests {
         // Legacy field is in extra (the new schema doesn't know
         // about default_agents directly).
         assert!(new_cfg.extra.contains_key("default_agents"));
+    }
+
+    #[test]
+    fn write_repo_promoted_field_when_team_set() {
+        // Plan: teams-based-agent-registration (phase 6c).
+        // When the repo has a `team` field, `clank promote`
+        // writes `promoted: <label>` to the repo config
+        // instead of mutating per-agent skeletons.
+        use crate::cli::teams_config::{
+            AgentDescription, RepoConfigFile, TeamComposition, UserConfigFile,
+        };
+        let user_home = tempfile::tempdir().unwrap();
+        // Seed user-scope: claude as master of `dev`, codex as
+        // commit reviewer.
+        let mut user_cfg = UserConfigFile::default();
+        user_cfg.agents.insert(
+            AgentLabel::parse("claude").unwrap(),
+            AgentDescription {
+                tool: Tool::Claude,
+                launch: None,
+                initial_prompt: None,
+            },
+        );
+        user_cfg.agents.insert(
+            AgentLabel::parse("codex").unwrap(),
+            AgentDescription {
+                tool: Tool::Codex,
+                launch: None,
+                initial_prompt: None,
+            },
+        );
+        user_cfg.teams.insert(
+            "dev".to_string(),
+            TeamComposition {
+                master: Some(AgentLabel::parse("claude").unwrap()),
+                commit_reviewers: vec![AgentLabel::parse("codex").unwrap()],
+                gate_reviewers: vec![],
+            },
+        );
+        std::fs::create_dir_all(user_home.path().join(".clank")).unwrap();
+        std::fs::write(
+            user_home.path().join(".clank/config.json"),
+            serde_json::to_string_pretty(&user_cfg).unwrap(),
+        )
+        .unwrap();
+        // Seed repo with `team: dev` and no promoted.
+        let repo = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(repo.path().join(".clank")).unwrap();
+        std::fs::write(repo.path().join(".clank/config.json"), r#"{"team":"dev"}"#).unwrap();
+
+        // Run promote with $HOME set to our temp dir. Use a
+        // mutex to serialize against other tests that touch
+        // $HOME — phase-6a tests dropped this pattern after
+        // lifting `home` to a param, but `promote` flows
+        // through the production agent CLI dispatch which
+        // reads $HOME directly. Acceptable trade-off for this
+        // test because the alternative (lifting home all the
+        // way through `promote`) cascades into the CLI surface.
+        let lock = home_test_lock().lock().unwrap();
+        let prev = std::env::var_os("HOME");
+        // SAFETY: serialized by `lock`.
+        unsafe {
+            std::env::set_var("HOME", user_home.path());
+        }
+
+        let codex_label = AgentLabel::parse("codex").unwrap();
+        let handled = write_repo_promoted_field_if_team_set(repo.path(), &codex_label).unwrap();
+
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("HOME", v),
+                None => std::env::remove_var("HOME"),
+            }
+        }
+        drop(lock);
+
+        assert!(handled, "team field set → new-schema path should handle");
+        let body = std::fs::read_to_string(repo.path().join(".clank/config.json")).unwrap();
+        let parsed: RepoConfigFile = serde_json::from_str(&body).unwrap();
+        assert_eq!(
+            parsed.promoted.as_ref().map(|l| l.as_str()),
+            Some("codex"),
+            "promoted field should be `codex`"
+        );
+    }
+
+    #[test]
+    fn write_repo_promoted_field_returns_false_when_no_team_set() {
+        // Repo has no `team` field → caller should continue to
+        // the legacy skeleton path.
+        let repo = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(repo.path().join(".clank")).unwrap();
+        std::fs::write(repo.path().join(".clank/config.json"), "{}").unwrap();
+        let lock = home_test_lock().lock().unwrap();
+        let prev = std::env::var_os("HOME");
+        unsafe {
+            std::env::set_var("HOME", repo.path()); // not seeded; irrelevant
+        }
+        let label = AgentLabel::parse("codex").unwrap();
+        let handled = write_repo_promoted_field_if_team_set(repo.path(), &label).unwrap();
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("HOME", v),
+                None => std::env::remove_var("HOME"),
+            }
+        }
+        drop(lock);
+        assert!(
+            !handled,
+            "no team → legacy path should run (handler returns false)"
+        );
+    }
+
+    #[test]
+    fn write_repo_promoted_field_returns_false_when_no_repo_config() {
+        let repo = tempfile::tempdir().unwrap();
+        let label = AgentLabel::parse("codex").unwrap();
+        let handled = write_repo_promoted_field_if_team_set(repo.path(), &label).unwrap();
+        assert!(!handled);
+    }
+
+    /// Tests that mutate `$HOME` MUST serialize against each
+    /// other — `std::env` is process-global and cargo runs
+    /// tests in parallel by default.
+    fn home_test_lock() -> &'static std::sync::Mutex<()> {
+        use std::sync::OnceLock;
+        static LOCK: OnceLock<std::sync::Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| std::sync::Mutex::new(()))
     }
 
     #[test]

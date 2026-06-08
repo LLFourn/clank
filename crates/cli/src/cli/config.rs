@@ -292,7 +292,7 @@ pub struct UserConfigFile {
 /// level, NOT unknown FIELDS inside hooks; without per-section
 /// `extra`, round-trip would silently drop forward-compat
 /// hooks).
-#[derive(Debug, Default, Deserialize, Serialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct HooksSection {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub master_work: Option<Option<String>>,
@@ -332,7 +332,7 @@ pub struct HooksSection {
 /// caught the missing aliases on 9218aa9 — without them, a
 /// config using the legacy keys would lose its review settings
 /// after any agent-mutation round-trip.
-#[derive(Debug, Default, Deserialize, Serialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct ReviewSection {
     #[serde(
         default,

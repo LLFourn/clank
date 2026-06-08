@@ -81,7 +81,7 @@ pub enum ReviewKind {
 
 /// Repo-scope `<repo>/.clank/config.json`. Gitignored by
 /// `clank init` — config is per-user-per-repo.
-#[derive(Debug, Default, Deserialize, Serialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct RepoConfigFile {
     /// String (sugar for `[{"include": "<name>"}]`) or array
     /// of `TeamEntry`.
