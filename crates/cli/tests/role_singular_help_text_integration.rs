@@ -27,9 +27,9 @@ fn help_for(args: &[&str]) -> String {
 // role default to assert.
 
 // NOTE: `init_help_uses_canonical_singular_role` was removed —
-// `clank init` no longer assigns a role (it only binds a
-// session; roles are team-derived), so its help text has no
-// role default to assert (`teams-based-agent-registration`).
+// `clank init` assigns nothing (no role, no session bind), so
+// its help text has no role default to assert
+// (`teams-based-agent-registration`).
 
 #[test]
 fn wfw_help_uses_canonical_singular_role() {

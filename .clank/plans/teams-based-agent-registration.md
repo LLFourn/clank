@@ -419,58 +419,36 @@ and the `bootstrap_agent_identity` step are gone.)
 
 ## CLI surface changes
 
-**`clank init` is the only setup/migration command** — no
-separate `--migrate` flag. Codex 66751c8's "explicit
-signal" catch is addressed by a clear stderr message
-naming what was done, not by a flag the user has to
-discover.
+**AS SHIPPED (hard cut, lloyd 2026-06-09):** the
+init/migration design below was simplified during
+implementation. There is NO old-format migration, NO
+default-team fallback, and NO session bind in `clank init`.
+The authoritative behavior:
 
-- **`clank init --team <name>`** — set the team for this
-  repo. Idempotent across states:
-  - **Fresh repo**: write team to
-    `<repo>/.clank/config.json` + gitignore the file.
-  - **New-format repo with existing team**: REWRITE the
-    `team` field to a single-include shape. If the
-    existing `team` was an array (with locals), preserve
-    the local entries — just replace the `include` entry.
-    Leaves `promoted` and per-agent state files
-    untouched. ("I started under `default` but it's
-    really `research` work — swap it.")
-  - **Old-format repo** (has `.clank/config.json#/agents`
-    block):
-    1. Remove the legacy `agents` key from
-       `.clank/config.json`.
-    2. Write the chosen team.
-    3. Gitignore `config.json` (add `/config.json` to
-       `.clank/.gitignore`; warn if the file is currently
-       tracked in git — user must `git rm --cached
-       .clank/config.json` to untrack the committed
-       copy).
-    Per-agent dirs (`.clank/agents/<label>/`) and the
-    `.empty` sentinel are LEFT ALONE.  Sessions are
-    sacred — `clank init` must never risk corrupting a
-    bound `clank as` session. Any leftover declaration
-    fields (`tool`, `initial_prompt`) in per-agent
-    skeletons become harmless dead bytes; the new
-    resolution doesn't read them.
-    Print a clear stderr summary: `cleaned up
-    .clank/config.json (legacy agents key dropped, team
-    set to <name>, gitignored).` The user knows what
-    changed; what wasn't touched is implicit.
-- **`clank init`** (no `--team`) —
-  - Fresh repo: use team `default`.
-  - New-format repo with existing team: no-op (preserves
-    the existing selection rather than silently reverting
-    to `default`).
-  - Old-format repo: same cleanup as `--team` above, but
-    sets team to `default`.
+- **`clank init`** — pure repo setup: scaffold `.clank/`,
+  install the `post-rewrite` hook + claude perms, warn on
+  globally-excluded paths. Assigns nothing (no session bind,
+  no env lookup, no role). See "`clank init` assigns
+  nothing" above.
+- **`clank init --team <name>`** — additionally validates the
+  team exists in user-scope `~/.clank/config.json#/teams` and
+  writes `team: "<name>"` to `<repo>/.clank/config.json` (+
+  gitignores the file). Idempotent: re-running rewrites the
+  `team` field.
+- **`clank init` with no `--team`** — does NOT pick a
+  `default` team and does NOT migrate old configs. A repo left
+  without a `team` simply has none; workflow commands then
+  error with `no_team_configured()` until you re-run with
+  `--team`. A stale legacy `agents` array (from the
+  pre-cut shipped model) lands in the new schema's `extra`
+  catchall and is ignored — no automated cleanup.
 
-The "what's different about the second invocation"
-question codex raised is answered by file state, not by
-a flag. Pre-cleanup: old-format signals present. Post-
-cleanup: clean new-format. Re-running `clank init` is
-always safe — the cleanup branch only fires when the
-detection signals are present.
+The original plan envisioned an old-format detection +
+migration path (legacy `agents` block removal, `default`
+team fallback, the `.empty` sentinel). The hard cut deleted
+the legacy types outright instead, so none of that ships;
+the historical design is preserved here only as context.
+
 - **`clank agent`** — agent DESCRIPTIONS (the "who"):
   - `add --global <label> --tool <tool> [--launch-cmd ...]
     [--initial-prompt ...]`: write to user-scope `agents`

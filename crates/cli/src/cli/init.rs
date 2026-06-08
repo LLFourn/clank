@@ -1,18 +1,18 @@
-//! `clank init` — scaffold `.clank/` in a repo + bind the
-//! calling agent's session if running inside claude/codex.
+//! `clank init` — pure repo setup. Non-interactive, assigns
+//! nothing (`teams-based-agent-registration`, lloyd 2026-06-09):
 //!
-//! Two phases:
-//! - **Phase 1 (always runs, non-interactive):** write
-//!   `.clank/.gitignore`, write `.claude/settings.local.json`
-//!   with claude edit-permission rules for `.clank/agents/**`,
-//!   warn if the root gitignore swallows any `.clank/` path the
-//!   plan needs tracked, and (with `--team`) record the repo's
-//!   team.
-//! - **Phase 2 (only when running inside an agent):** prompt
-//!   for the agent's label and bind the session via the shared
-//!   bind helper. Identity (role/tool/launch) is team-based and
-//!   lives in user/repo config, NOT in the per-agent skeleton —
-//!   bootstrap only touches `session`.
+//! - write `.clank/.gitignore`,
+//! - write `.claude/settings.local.json` with claude
+//!   edit-permission rules for `.clank/agents/**`,
+//! - install the `post-rewrite` git hook,
+//! - warn if the root gitignore swallows any `.clank/` path the
+//!   plan needs tracked,
+//! - with `--team <name>`, record the repo's chosen team.
+//!
+//! It does NOT bind a session, read agent env vars
+//! (`CLAUDE_CODE_SESSION_ID` / `CODEX_THREAD_ID`), prompt for an
+//! identity, or assign a role. Session binding is `clank as`'s
+//! sole job; roles are team-derived.
 
 use std::path::Path;
 

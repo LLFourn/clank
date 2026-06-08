@@ -705,8 +705,8 @@ pub enum AgentCmd {
     /// + feedback history are preserved.
     Remove(AgentRemoveArgs),
     /// Designate an agent as this repo's master by writing the
-    /// `promoted` field to `<repo>/.clank/config.json`. (Team-
-    /// level master changes go through `clank team set-master`.)
+    /// `promoted` field to `<repo>/.clank/config.json`.
+    /// (Team-level master changes go through `clank team set-master`.)
     Promote(AgentPromoteArgs),
 }
 
