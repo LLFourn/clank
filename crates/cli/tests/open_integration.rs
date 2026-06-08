@@ -547,7 +547,7 @@ fn clank_ready_after_full_init() {
     let home = tempfile::tempdir().unwrap();
     let dir = init_repo();
     let repo = dir.path();
-    // clank init --yes does the full repair sweep.
+    // clank init does the repo setup (scaffold + hook + perms).
     let out = Command::new(clank_bin())
         .args(["init"])
         .arg("--repo")
@@ -560,7 +560,7 @@ fn clank_ready_after_full_init() {
         .expect("spawn clank init");
     assert!(
         out.status.success(),
-        "clank init --yes failed: {}",
+        "clank init failed: {}",
         String::from_utf8_lossy(&out.stderr)
     );
     let v = run_open(repo, home.path());

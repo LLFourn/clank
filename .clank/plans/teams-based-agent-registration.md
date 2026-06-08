@@ -104,8 +104,12 @@ verbose `launch` form below — out of scope for this plan.)
   team, commit-reviewer in another, gate-reviewer in a
   third). Both reviewer lists are optional; see Gate
   state machine below for the empty-set rule.
-- The `default` team is just one entry in the table. No
-  magic. `clank init` without `--team` uses it.
+- The `default` team is just one entry in the table — no
+  magic, and (AS SHIPPED) no automatic use: `clank init`
+  without `--team` does NOT fall back to it. A repo gets a
+  team only when `--team <name>` is passed. (`default` is a
+  conventional name a user may pick, e.g. `clank init --team
+  default`, nothing more.)
 
 ### Repo-scope (`<repo>/.clank/config.json`, gitignored, per-user-per-repo)
 
@@ -725,12 +729,15 @@ migration. A stale repo is fixed by re-running
 the leftover `agents` key rides `extra` harmlessly. No
 detect-and-migrate code ships.
 
-**Migration write path**: init mutates the typed
-`RepoConfigFile` in memory (drops the legacy block, sets
-`team`), then `serde_json::to_string_pretty(&typed)`
-serializes it back through typed serde. The `extra`
-flatten preserves any forward-compat keys this clank
-version doesn't know about.
+**`clank init --team` write path (AS SHIPPED)**:
+`write_repo_team_field` reads `<repo>/.clank/config.json` as
+the typed `RepoConfigFile`, sets `team =
+Some(TeamField::Single(name))`, and serializes it back via
+`serde_json::to_string_pretty`. It does NOT drop any legacy
+`agents` key — that key (if present) rides the `extra`
+flatten and is preserved untouched. There is no
+legacy-block removal step; the prior "drops the legacy
+block" design was not built.
 
 The existing `no_json_literal_config_writes_in_tests` lint
 already covers config WRITES; this plan extends discipline
