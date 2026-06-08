@@ -98,11 +98,6 @@ pub struct InitArgs {
     /// Repo root. Defaults to the cwd's git toplevel.
     #[arg(long, value_name = "PATH")]
     pub repo: Option<PathBuf>,
-    /// Skip the interactive agent-identity prompts (phase 2)
-    /// and accept defaults: label = tool name (claude/codex),
-    /// role = reviewer. Useful for scripts.
-    #[arg(short = 'y', long)]
-    pub yes: bool,
     /// Overwrite an existing foreign `post-rewrite` hook.
     #[arg(long)]
     pub force_hooks: bool,
@@ -110,10 +105,10 @@ pub struct InitArgs {
     /// `team: "<name>"` field to `<repo>/.clank/config.json`.
     /// The team must exist in `~/.clank/config.json#/teams`
     /// (create one with `clank team create <name>` first).
-    /// Plan: `teams-based-agent-registration`. When omitted,
-    /// no team field is written (registration falls back to
-    /// the legacy `default_agents` / per-agent skeleton model
-    /// until phase 6 cuts over).
+    /// Plan: `teams-based-agent-registration`. When omitted, no
+    /// team is set — workflow commands (`wfw`, `finish`,
+    /// `promote`) will then require one and tell you to re-run
+    /// with `--team`.
     #[arg(long, value_name = "NAME")]
     pub team: Option<String>,
 }
@@ -693,23 +688,25 @@ pub struct AgentArgs {
 
 #[derive(clap::Subcommand, Debug)]
 pub enum AgentCmd {
-    /// Enumerate registered agents in this repo with their roles
-    /// and bind state.
+    /// Enumerate the repo's registered agents (resolved from its
+    /// team) with their role, review tier, and bind state.
     List(AgentListArgs),
     /// Launch an agent's CLI tool with its session restored and
     /// any configured `launch` profile applied. Requires the
     /// agent to have a bound session (`clank as <name>`).
     Start(AgentStartArgs),
-    /// Register a new agent in the repo-scope `agents` declaration
-    /// (or user-scope `default_agents` with `--global`).
+    /// Declare an agent: `--global` writes a description to
+    /// user-scope `agents`; otherwise add the agent to THIS
+    /// repo's `team` array (inline with `--tool`, else by-name).
     Add(AgentAddArgs),
-    /// Remove an agent from the declaration. Per-agent skeleton
-    /// directory + feedback history are preserved.
+    /// Remove an agent: `--global` drops it from user-scope
+    /// `agents` (and any team referencing it); otherwise remove
+    /// it from THIS repo's `team` array. Per-agent skeleton dir
+    /// + feedback history are preserved.
     Remove(AgentRemoveArgs),
-    /// Promote an agent to master in the declaration. Atomically
-    /// demotes any other masters to reviewer — the post-condition
-    /// is "exactly one master in the targeted scope" regardless
-    /// of pre-state. Repairs pre-existing multi-master configs.
+    /// Designate an agent as this repo's master by writing the
+    /// `promoted` field to `<repo>/.clank/config.json`. (Team-
+    /// level master changes go through `clank team set-master`.)
     Promote(AgentPromoteArgs),
 }
 

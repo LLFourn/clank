@@ -549,7 +549,7 @@ fn clank_ready_after_full_init() {
     let repo = dir.path();
     // clank init --yes does the full repair sweep.
     let out = Command::new(clank_bin())
-        .args(["init", "--yes"])
+        .args(["init"])
         .arg("--repo")
         .arg(repo)
         .env("HOME", home.path())
@@ -608,7 +608,7 @@ fn clank_ready_unaffected_by_unbound_agents() {
     let dir = init_repo();
     let repo = dir.path();
     let out = Command::new(clank_bin())
-        .args(["init", "--yes"])
+        .args(["init"])
         .arg("--repo")
         .arg(repo)
         .env("HOME", home.path())

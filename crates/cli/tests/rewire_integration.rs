@@ -61,7 +61,7 @@ fn run_clank(repo: &Path, args: &[&str]) -> std::process::Output {
 #[test]
 fn clank_init_installs_post_rewrite_hook() {
     let dir = init_repo();
-    let out = run_clank(dir.path(), &["init", "--yes"]);
+    let out = run_clank(dir.path(), &["init"]);
     assert!(
         out.status.success(),
         "clank init failed: {}",
@@ -103,7 +103,7 @@ fn clank_init_installs_hook_in_linked_worktree() {
     );
 
     // Run clank init INSIDE the linked worktree.
-    let out = run_clank(&wt_path, &["init", "--yes"]);
+    let out = run_clank(&wt_path, &["init"]);
     assert!(
         out.status.success(),
         "clank init in linked worktree failed: {}",
@@ -332,7 +332,7 @@ fn installed_hook_rewires_on_real_amend() {
     // Init so the hook is in place. Run with HOME pointed
     // somewhere innocuous to avoid touching the user's
     // real config / agent state.
-    let out = run_clank(repo, &["init", "--yes"]);
+    let out = run_clank(repo, &["init"]);
     assert!(
         out.status.success(),
         "clank init failed: {}",

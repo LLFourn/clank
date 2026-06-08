@@ -376,6 +376,47 @@ fail typed deserialization (anyhow propagates) or land
 in `extra` (gets ignored). No `clank init --user`
 migration — users hand-edit their own dotfiles.
 
+## Read-only renderers degrade; workflow commands hard-error
+
+A boundary that emerged during implementation (ruthless NIT
+on f6feba2 asked it be recorded): when a repo has no `team`
+configured, the two classes of command behave differently.
+
+- **Workflow / mutation commands** — `clank wfw`, the stop-hook,
+  `clank finish`, `clank promote`, `clank demote`, `clank purge`
+  (anything that drives or gates the review loop) — **hard-error**
+  via `agent_store::load_reviewer_tiers` →
+  `no_team_configured()`: "this repo has no team configured. Run
+  `clank init --team <name>`." You can't run the workflow without
+  a team, so refusing is correct.
+- **Read-only renderers** — `clank status`, `clank html`,
+  `clank open`, `clank doctor` — **degrade**: no team → empty
+  reviewer tiers → the gate computes as zero-reviewer (Approved)
+  and the timeline/status renders anyway. A brand-new repo with
+  commits but no team must still render; crashing a viewer on
+  config absence is wrong.
+
+The degrade has ONE structural point: `status::StatusSnapshot`
+calls `agent_store::reviewer_tiers_for_render` (never-errors;
+no team / misconfigured team → empty tiers), and BOTH `clank
+status` and `clank html` route through `StatusSnapshot`, so the
+single decision covers every renderer. `doctor` reports the
+no-team condition as a finding; `open` catches the error into a
+display message. This makes "renderers degrade, workflow
+hard-errors" a property of the architecture, not a thing each
+command must remember.
+
+## `clank init` assigns nothing (lloyd 2026-06-09)
+
+`clank init` is **pure repo setup**: scaffold `.clank/`
+(gitignore), install the `post-rewrite` hook + claude
+permissions, and — with `--team <name>` — write the repo's
+`team` field. It does NOT bind sessions, read agent env vars
+(`CLAUDE_CODE_SESSION_ID` / `CODEX_THREAD_ID`), prompt for an
+identity, or assign a role. Session binding is `clank as`'s
+sole responsibility; roles are team-derived. (The `--yes` flag
+and the `bootstrap_agent_identity` step are gone.)
+
 ## CLI surface changes
 
 **`clank init` is the only setup/migration command** — no

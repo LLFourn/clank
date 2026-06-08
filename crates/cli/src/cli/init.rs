@@ -14,16 +14,11 @@
 //!   lives in user/repo config, NOT in the per-agent skeleton —
 //!   bootstrap only touches `session`.
 
-use std::io::{IsTerminal, Write};
 use std::path::Path;
 
 use anyhow::Context;
 
 use super::{InitArgs, resolve_repo};
-use crate::agent_env::detect_session_from_env;
-use crate::agent_store::{agent_config_path, bind_session_to_agent};
-use clank_core::ids::AgentLabel;
-use clank_core::vocab::Tool;
 
 use crate::init_facts::{
     CLANK_GITIGNORE_BODY as GITIGNORE_BODY,
@@ -31,13 +26,19 @@ use crate::init_facts::{
     POST_REWRITE_BODY, POST_REWRITE_MARKER,
 };
 
+/// `clank init` is pure repo setup: scaffold `.clank/`, install
+/// the git hook + claude perms, and (optionally) pick a team.
+/// It does NOT bind sessions, read agent env vars
+/// (`CLAUDE_CODE_SESSION_ID` / `CODEX_THREAD_ID`), prompt for an
+/// identity, or assign any role — that's `clank as`'s job. Plan:
+/// `teams-based-agent-registration` (lloyd 2026-06-09: init
+/// assigns nothing).
 pub async fn run(args: InitArgs) -> anyhow::Result<()> {
     let repo = resolve_repo(args.repo.as_deref())?;
     write_scaffold(&repo)?;
     write_claude_perms(&repo)?;
     write_post_rewrite_hook(&repo, args.force_hooks)?;
     warn_if_globally_excluded(&repo);
-    bootstrap_agent_identity(&repo, args.yes).await?;
     // When `--team <name>` is set, write the team field to
     // `<repo>/.clank/config.json` (new-schema). Validation:
     // the named team must exist in user-scope.
@@ -276,80 +277,6 @@ fn write_claude_perms(repo: &Path) -> anyhow::Result<()> {
         println!("{} already has clank permissions", path.display());
     }
     Ok(())
-}
-
-/// Phase 2: if running inside an agent, prompt for the label and
-/// bind the session. Skipped silently if no session env detected
-/// (caller's not in an agent).
-///
-/// Identity (role/tool/launch) is team-based and lives in
-/// user/repo config; bootstrap only writes the per-agent
-/// skeleton's `session` field via the shared bind helper.
-async fn bootstrap_agent_identity(repo: &Path, yes: bool) -> anyhow::Result<()> {
-    let detected = match detect_session_from_env() {
-        Ok(d) => d,
-        Err(e) => {
-            // Hostile env (both session vars set, garbage value).
-            // Don't fail init; just skip the bootstrap.
-            eprintln!("skipping agent bootstrap: {e}");
-            return Ok(());
-        }
-    };
-    let Some((tool, session_id)) = detected else {
-        println!(
-            "not running inside an agent (no CLAUDE_CODE_SESSION_ID / \
-             CODEX_THREAD_ID). Skipping session bind — run \
-             `clank init` (or `clank as <label>`) from inside your \
-             agent to bind."
-        );
-        return Ok(());
-    };
-
-    let default_label = match tool {
-        Tool::Claude => "claude",
-        Tool::Codex => "codex",
-    };
-
-    let interactive = !yes && std::io::stdin().is_terminal();
-    let label_raw = if interactive {
-        prompt_with_default(&format!("Agent label [{default_label}]: "), default_label)?
-    } else {
-        default_label.to_string()
-    };
-    let label = AgentLabel::parse(&label_raw)
-        .map_err(|e| anyhow::anyhow!("invalid label `{label_raw}`: {e}"))?;
-
-    // Bind via the shared helper — this preserves the
-    // "one session, one label" invariant that `clank as` enforces,
-    // so a sequence like `clank as alice; clank init --yes`
-    // doesn't leave the session bound to BOTH alice and the
-    // tool-name default. Stale bindings on other agents get
-    // cleared atomically with the new bind.
-    let outcome = bind_session_to_agent(repo, &label, tool, &session_id)?;
-    println!(
-        "bound {} session {} → agent `{}` ({})",
-        tool.as_str(),
-        session_id.as_str(),
-        outcome.label.as_str(),
-        agent_config_path(repo, &label).display(),
-    );
-    for other in outcome.cleared_from {
-        println!("  (cleared stale binding on `{}`)", other.as_str());
-    }
-    Ok(())
-}
-
-fn prompt_with_default(prompt: &str, default: &str) -> anyhow::Result<String> {
-    print!("{prompt}");
-    std::io::stdout().flush()?;
-    let mut line = String::new();
-    std::io::stdin().read_line(&mut line)?;
-    let trimmed = line.trim();
-    if trimmed.is_empty() {
-        Ok(default.to_string())
-    } else {
-        Ok(trimmed.to_string())
-    }
 }
 
 /// True if the matched rule lives in `<repo>/.clank/.gitignore`

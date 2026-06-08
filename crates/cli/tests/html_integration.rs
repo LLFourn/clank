@@ -956,7 +956,7 @@ fn html_diff_rows_have_no_trailing_newline_in_markup() {
 #[test]
 fn init_gitignore_includes_html_dir() {
     let dir = init_repo();
-    let out = run_clank(dir.path(), &["init", "--yes"]);
+    let out = run_clank(dir.path(), &["init"]);
     assert!(out.status.success());
     let body = std::fs::read_to_string(dir.path().join(".clank/.gitignore")).unwrap();
     assert!(
