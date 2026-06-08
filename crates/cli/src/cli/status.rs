@@ -56,11 +56,14 @@ impl StatusSnapshot {
         let worktree_dirty = worktree_dirty(repo)?;
 
         let config = crate::cli::config::load(repo);
-        // Phase 6b of teams-based-agent-registration: dispatch
-        // to the new two-tier resolver when the repo config has
-        // a `team` field; fall back to single-list legacy when
-        // it doesn't. load_reviewer_tiers does the routing.
-        let (commit_reviewers, gate_reviewers) = crate::agent_store::load_reviewer_tiers(repo)?;
+        // Plan: teams-based-agent-registration. `status` is a
+        // read-only renderer (also reused by `clank html`), so it
+        // DEGRADES on a team-less / misconfigured repo: no team →
+        // empty reviewer tiers → gate computes as zero-reviewer
+        // (Approved). It never hard-errors the way the
+        // workflow-driving commands (wfw / finish / promote) do.
+        let (commit_reviewers, gate_reviewers) =
+            crate::agent_store::reviewer_tiers_for_render(repo);
         let work_policy = clank_core::wait::WorkPolicy {
             plan_feedback: config.review.plan_feedback,
             adhoc_feedback: config.review.adhoc_feedback,

@@ -7,6 +7,8 @@
 //! `.clank/` paths); `--drop` removes the whole commit including
 //! the code.
 
+mod common;
+
 use std::path::Path;
 use std::process::Command;
 
@@ -33,25 +35,10 @@ fn init_repo_with_master() -> tempfile::TempDir {
     git(path, &["config", "commit.gpgsign", "false"]);
     write(path, ".clank/.gitignore", "/agents/\n/cache/\n");
     write(path, ".gitignore", ".clank/agents/\n.clank/cache/\n");
-    // Master agent in declaration so the all-reviewers gate
-    // doesn't auto-approve. Typed RepoConfigFile per
-    // typed-config-dogfood — schema drift becomes a type
-    // error rather than a silent JSON-shape change.
-    let repo_file = clank::cli::config::RepoConfigFile {
-        agents: Some(vec![clank::cli::config::DefaultAgent {
-            label: clank_core::ids::AgentLabel::parse("claude").unwrap(),
-            role: clank_core::vocab::Role::Master,
-            tool: None,
-            launch: None,
-            initial_prompt: None,
-        }]),
-        ..Default::default()
-    };
-    write(
-        path,
-        ".clank/config.json",
-        &serde_json::to_string_pretty(&repo_file).unwrap(),
-    );
+    // Register claude as master + codex reviewer via the
+    // repo-scope team (`teams-based-agent-registration`) so the
+    // gate has a registered reviewer and doesn't auto-approve.
+    common::write_team_config(path, "claude", &["codex"], &[]);
     write(
         path,
         ".clank/agents/claude/config.json",

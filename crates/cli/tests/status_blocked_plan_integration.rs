@@ -5,12 +5,10 @@
 //! BLOCKED`, `waiting on: <creator>`, `reason: blocked: ...` —
 //! and that unblocking restores the underlying review-driven gate.
 
+mod common;
+
 use std::path::Path;
 use std::process::Command;
-
-use clank::cli::config::{DefaultAgent, RepoConfigFile};
-use clank_core::ids::AgentLabel;
-use clank_core::vocab::Role;
 
 fn clank_bin() -> &'static str {
     env!("CARGO_BIN_EXE_clank")
@@ -33,35 +31,7 @@ fn init_repo() -> tempfile::TempDir {
     git(path, &["config", "user.email", "test@test"]);
     git(path, &["config", "user.name", "test"]);
     git(path, &["config", "commit.gpgsign", "false"]);
-    write_repo_config(
-        path,
-        &RepoConfigFile {
-            agents: Some(vec![
-                DefaultAgent {
-                    label: AgentLabel::parse("claude").unwrap(),
-                    role: Role::Master,
-                    tool: None,
-                    launch: None,
-                    initial_prompt: None,
-                },
-                DefaultAgent {
-                    label: AgentLabel::parse("codex").unwrap(),
-                    role: Role::Reviewer,
-                    tool: None,
-                    launch: None,
-                    initial_prompt: None,
-                },
-                DefaultAgent {
-                    label: AgentLabel::parse("ruthless").unwrap(),
-                    role: Role::Reviewer,
-                    tool: None,
-                    launch: None,
-                    initial_prompt: None,
-                },
-            ]),
-            ..Default::default()
-        },
-    );
+    common::write_team_config(path, "claude", &["codex", "ruthless"], &[]);
     write(path, "README.md", "seed\n");
     git(path, &["add", "-A"]);
     git(path, &["commit", "--quiet", "-m", "seed"]);
@@ -74,15 +44,6 @@ fn write(repo: &Path, rel: &str, body: &str) {
         std::fs::create_dir_all(parent).unwrap();
     }
     std::fs::write(abs, body).unwrap();
-}
-
-fn write_repo_config(repo: &Path, file: &RepoConfigFile) {
-    std::fs::create_dir_all(repo.join(".clank")).unwrap();
-    std::fs::write(
-        repo.join(".clank/config.json"),
-        serde_json::to_string_pretty(file).unwrap(),
-    )
-    .unwrap();
 }
 
 fn run(repo: &Path, args: &[&str]) -> std::process::Output {

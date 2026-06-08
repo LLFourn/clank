@@ -323,10 +323,11 @@ pub(super) const DEFAULT_AUTO_PROMPT: &str = "Session resumed.";
 /// Resolve the initial prompt for an agent-start invocation.
 ///
 /// Three-input policy:
-/// - `declaration`: `DefaultAgent.initial_prompt`. `Some("")`
-///   means "explicitly disable" — falls back to None, NOT
-///   Some("") through. Lets a user with auto_mode=On opt out
-///   of the prompt without disabling auto_mode itself.
+/// - `declaration`: `AgentDescription.initial_prompt` from the
+///   resolved registered set. `Some("")` means "explicitly
+///   disable" — falls back to None, NOT Some("") through. Lets a
+///   user with auto_mode=On opt out of the prompt without
+///   disabling auto_mode itself.
 /// - `auto_mode`: per-machine preference from the agent skeleton.
 ///   When On, supplies the [`DEFAULT_AUTO_PROMPT`] fallback.
 /// - Returns the resolved prompt or None.
@@ -527,10 +528,35 @@ fn add(args: AgentAddArgs) -> anyhow::Result<()> {
                 role: None,
                 review: Some(review),
             }),
-            None => TeamEntry::ByName(ByNameEntry {
-                agent: label.clone(),
-                review: Some(review),
-            }),
+            None => {
+                // By-name entry: the label MUST already exist in
+                // user-scope `agents`, else the resolver fails
+                // closed (UnknownAgent) and every resolver-backed
+                // command breaks until the config is hand-edited.
+                // Validate before persisting (codex d772410 catch;
+                // mirrors `clank team add`'s pre-check).
+                let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+                let declared = home
+                    .as_deref()
+                    .map(|h| -> anyhow::Result<bool> {
+                        Ok(read_user_config(h)?.agents.contains_key(&label))
+                    })
+                    .transpose()?
+                    .unwrap_or(false);
+                if !declared {
+                    anyhow::bail!(
+                        "agent `{}` is not declared in user-scope `agents`. \
+                         Add it with `clank agent add --global {} --tool <claude|codex>` first, \
+                         or pass `--tool` here to add a fully-inline local agent.",
+                        args.label,
+                        args.label
+                    );
+                }
+                TeamEntry::ByName(ByNameEntry {
+                    agent: label.clone(),
+                    review: Some(review),
+                })
+            }
         };
         entries.push(entry);
         repo_cfg.team = Some(TeamField::Array(entries));

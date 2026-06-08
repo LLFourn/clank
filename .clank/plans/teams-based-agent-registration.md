@@ -326,45 +326,44 @@ the error up through `main` with a clear message. No
 ad-hoc detection code, no detect-and-panic, no separate
 loader path.
 
-**What this looks like in practice**:
+**What this looks like in practice** (corrected to match
+the SHIPPED code — ruthless pin on 29483bf/d772410; the
+earlier "deserialize fails with `invalid type: sequence`"
+sub-story was factually wrong):
 
-- Old `agents-declaration-is-user-local` config had
-  `"agents": [...]` (array) at top level. New schema has
-  no top-level `"agents"` field; the array would either
-  land in `extra` (the flatten catchall) or fail
-  deserialization depending on shape. Either way:
-  - Commands like `clank wfw`, `clank agent list`, etc.
-    that READ the config will try to deserialize. If the
-    typed deserialize fails (most cases — old `agents`
-    array isn't a valid `Vec<LocalAgentEntry>` either),
-    serde returns an error. `.with_context(|| format!(
-    "parsing {}", path))` adds the file path. anyhow
-    propagates to main; user sees:
-    ```
-    Error: parsing /path/to/.clank/config.json
-    Caused by:
-        invalid type: sequence, expected a map, at line 2 column 13
-    ```
-  - That's enough to point the user at the file and the
-    structural problem. No bespoke "this is a legacy
-    config" message.
-- For the case where the old `agents` field happens to
-  land in `extra` (e.g., if the new schema accepted
-  arbitrary shapes there), the leftover key is preserved
-  for forward-compat round-trip but is invisible to the
-  registered-set resolution. The user sees an
-  empty-team error from registration logic, OR notices
-  on `clank agent list`.
+- Old `agents-declaration-is-user-local` repo config had a
+  top-level `"agents": [...]` array. The new repo-scope
+  `RepoConfigFile` has NO `agents` field, so that array
+  lands in the `#[serde(flatten)] extra` catchall. **Parse
+  SUCCEEDS** — there is no `Vec<LocalAgentEntry>` field for
+  the array to fail against. The legacy key is preserved on
+  round-trip but is invisible to registration.
+  - The repo therefore has no `team` field set →
+    `try_resolve_via_team` returns `None` → resolver-backed
+    commands (`wfw`, `finish`, `promote`) get the
+    `no_team_configured()` error: `this repo has no team
+    configured. Run \`clank init --team <name>\` to set
+    one.` Read-only renderers (`status`, `html`) degrade to
+    empty reviewers instead (see `reviewer_tiers_for_render`).
+  - The genuine **parse-failure** path is when a
+    strongly-typed field has the wrong shape — e.g.
+    `"team": 42` (not a string or array). Then serde errors,
+    `.with_context("parsing <path>")` adds the file path,
+    anyhow propagates to `main`. The `a9772ef` dispatch
+    tests pin both paths
+    (`try_resolve_via_team_with_fails_closed_on_malformed_repo_config`
+    + `..._legacy_agents_array_lands_in_extra_returns_none`).
+- `no_team_configured()` (in `agent_store.rs`) is the single
+  authority for the no-team message; there is no bespoke
+  "this is a legacy config" detection anywhere.
 
-**`clank init`** handles old-format detection as part of
-its own migration logic — it's the only command that
-NEEDS to recognize the old shape (to clean it up). Init
-attempts the new-format deserialize first; on failure,
-attempts a `LegacyRepoConfigFile` typed struct (with the
-old `agents: Option<Vec<DefaultAgent>>` field) as a
-fallback. If that succeeds, runs the migration cleanup
-described in the CLI surface section. If both fail, the
-error propagates as above.
+**`clank init`** (note: the LegacyRepoConfigFile migration
+fallback was NOT built — the hard cut deleted the legacy
+types entirely rather than carry a migration path). A repo
+with a stale `agents` array in `extra` is simply re-`init`ed
+with `--team`, which writes the `team` field; the leftover
+`agents` key rides the `extra` catchall harmlessly until
+overwritten. No automated legacy migration ships.
 
 **Scope**: config files only. Per-agent skeletons
 (`.clank/agents/<label>/config.json`) and the `.empty`
@@ -687,38 +686,25 @@ pub struct InlineAgent {
 ```
 
 **Old-format handling**: see the "Config errors propagate
-via anyhow" section above for the full story. The short
-version: every command except `clank init` just calls
-`serde_json::from_str::<RepoConfigFile>(&body)
-.with_context(|| format!("parsing {}", path))?` — if the
-typed deserialize fails (which it will for the old
-`agents: [...]` array shape), anyhow propagates the error
-to `main` with the file path and serde's structural
-explanation. No bespoke detection code.
+via anyhow" section above for the authoritative story. The
+short version (corrected — the old `agents: [...]` array
+does NOT fail to parse): repo-scope `RepoConfigFile` has no
+`agents` field, so a legacy `agents` array lands in the
+`extra` flatten catchall and the parse SUCCEEDS with `team:
+None`. Resolver-backed commands then surface
+`no_team_configured()`; a genuine wrong-type field (e.g.
+`team: 42`) is the only thing that makes
+`serde_json::from_str::<RepoConfigFile>` itself error, which
+`.with_context("parsing <path>")` + anyhow propagate to
+`main`.
 
-`clank init` is the only command that NEEDS to recognize
-the old shape (so it can clean it up). It has TWO triggers
-for migration (codex 4c79ed2 catch — was specified for
-the first only, missing the success-with-extra path):
-
-1. **New-format deserialize fails entirely** (e.g., the
-   old `agents` field was the top-level shape and the
-   types didn't line up): attempt a
-   `LegacyRepoConfigFile` typed-struct fallback with
-   the old `agents: Option<Vec<DefaultAgent>>` field. If
-   the legacy deserialize succeeds, run cleanup. If both
-   fail, error propagates as above.
-2. **New-format deserialize succeeds AND
-   `repo_config.extra.contains_key("agents")`**: the
-   legacy `agents` key landed in the flatten catchall.
-   Init mutates `extra` to drop the key, then writes
-   back through typed serde. Other commands tolerate the
-   key in `extra` (it's invisible to registered-set
-   resolution), but init cleans it up as a one-time
-   migration.
-
-Both triggers converge on "clean new-format config without
-the legacy key."
+**What was NOT built**: the `LegacyRepoConfigFile`
+migration fallback. The hard cut (lloyd 2026-06-09) deleted
+the legacy types outright instead of carrying an automated
+migration. A stale repo is fixed by re-running
+`clank init --team <name>`, which writes the `team` field;
+the leftover `agents` key rides `extra` harmlessly. No
+detect-and-migrate code ships.
 
 **Migration write path**: init mutates the typed
 `RepoConfigFile` in memory (drops the legacy block, sets

@@ -12,6 +12,8 @@
 //!    `wfw --role master` is parked; expect a `MasterAction` with
 //!    `next=revise` / `reason=address_commit_changes`.
 
+mod common;
+
 use std::io::Read;
 use std::path::Path;
 use std::process::{Command, Stdio};
@@ -45,23 +47,22 @@ fn init_repo() -> tempfile::TempDir {
     dir
 }
 
+/// Register a reviewer in this repo's team
+/// (`teams-based-agent-registration`). The first call establishes
+/// the team with master `lloyd` (the master author these tests
+/// use) + the reviewer; later calls append additional reviewers.
 fn register_reviewer(repo: &Path, label: &str) {
-    // Source of truth for gate input is the merged declaration
-    // post agent-add-cli-and-repo-scope. Append <label> to
-    // <repo>/.clank/config.json's `agents` field, preserving any
-    // other top-level keys (review, hooks) the test setup may
-    // have written. A single typed RepoConfigFile that serdes
-    // all fields would be cleaner — tracked as a follow-up plan.
-    merge_repo_config(repo, |f| {
-        let entry = clank::cli::config::DefaultAgent {
-            label: clank_core::ids::AgentLabel::parse(label).unwrap(),
-            role: clank_core::vocab::Role::Reviewer,
-            tool: None,
-            launch: None,
-            initial_prompt: None,
-        };
-        f.agents.get_or_insert_with(Vec::new).push(entry);
-    });
+    let path = repo.join(".clank/config.json");
+    let has_team = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+        .map(|v| v.get("team").is_some())
+        .unwrap_or(false);
+    if has_team {
+        common::add_reviewer(repo, label);
+    } else {
+        common::write_team_config(repo, "lloyd", &[label], &[]);
+    }
 }
 
 /// Typed read-modify-write helper for `<repo>/.clank/config.json`
@@ -1468,6 +1469,9 @@ fn wfw_idle_hook_fires_but_master_parks() {
         ".clank/config.json",
         &serde_json::to_string_pretty(&cfg).unwrap(),
     );
+    // wfw resolves the repo's team; register lloyd as master
+    // (merged into the review/hooks config just written).
+    common::write_team_config(repo, "lloyd", &[], &[]);
 
     let output = env
         .cmd()
@@ -1511,13 +1515,9 @@ fn wfw_user_hooks_shadowed_by_repo_hooks() {
 
     let user_config_dir = env.home().join(".clank");
     std::fs::create_dir_all(&user_config_dir).unwrap();
-    let user_cfg = clank::cli::config::UserConfigFile {
-        hooks: Some(clank::cli::config::HooksSection {
-            reviewer_work: Some(Some(format!("touch {}", user_marker.display()))),
-            ..Default::default()
-        }),
-        ..Default::default()
-    };
+    let user_cfg = serde_json::json!({
+        "hooks": { "reviewer_work": format!("touch {}", user_marker.display()) }
+    });
     std::fs::write(
         user_config_dir.join("config.json"),
         serde_json::to_string_pretty(&user_cfg).unwrap(),

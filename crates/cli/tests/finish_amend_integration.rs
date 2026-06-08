@@ -1,5 +1,7 @@
 //! Integration tests for `clank finish --amend` on already-finished plans.
 
+mod common;
+
 use std::path::Path;
 use std::process::Command;
 
@@ -24,6 +26,11 @@ fn init_repo() -> tempfile::TempDir {
     git(path, &["config", "user.email", "test@test"]);
     git(path, &["config", "user.name", "test"]);
     git(path, &["config", "commit.gpgsign", "false"]);
+    // Every finish/amend command resolves the repo's team
+    // (`teams-based-agent-registration`); register a master so
+    // resolution succeeds. Individual tests can overwrite to add
+    // reviewers.
+    common::write_team_config(path, "claude", &[], &[]);
     dir
 }
 
@@ -142,22 +149,9 @@ fn finish_rejects_approve_without_finished() {
     let dir = init_repo();
     let repo = dir.path();
     write(repo, ".clank/plans/foo.md", "# foo\n");
-    // Register codex as a reviewer via the repo-scope declaration
-    // (source of truth post agent-add-cli-and-repo-scope).
-    let file = clank::cli::config::RepoAgentsFile {
-        agents: Some(vec![clank::cli::config::DefaultAgent {
-            label: clank_core::ids::AgentLabel::parse("codex").unwrap(),
-            role: clank_core::vocab::Role::Reviewer,
-            tool: None,
-            launch: None,
-            initial_prompt: None,
-        }]),
-    };
-    write(
-        repo,
-        ".clank/config.json",
-        &serde_json::to_string_pretty(&file).unwrap(),
-    );
+    // Register a master + codex reviewer via the repo-scope team
+    // (`teams-based-agent-registration`).
+    common::write_team_config(repo, "claude", &["codex"], &[]);
     git(repo, &["add", "-A"]);
     git(repo, &["commit", "--quiet", "-m", "[foo] intro"]);
     let intro_sha = head_sha(repo);

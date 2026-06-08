@@ -2,6 +2,8 @@
 //! tiering, transactional ordering, and target-path collision
 //! cases per the plan's acceptance criteria.
 
+mod common;
+
 use std::path::Path;
 use std::process::Command;
 
@@ -38,10 +40,11 @@ fn init_repo_with_master() -> tempfile::TempDir {
     git(repo, &["config", "commit.gpgsign", "false"]);
     write(repo, ".clank/.gitignore", "/agents/\n/cache/\n");
     write(repo, ".gitignore", ".clank/agents/\n.clank/cache/\n");
-    // Master agent for this repo (typed AgentConfig per typed-config-dogfood).
+    // Master agent for this repo via the repo-scope team
+    // (`teams-based-agent-registration`).
+    common::write_team_config(repo, "claude", &[], &[]);
     let cfg = clank_core::agent_config::AgentConfig {
         auto_mode: clank_core::vocab::AutoMode::Off,
-        role: clank_core::vocab::Role::Master,
         ..Default::default()
     };
     write(

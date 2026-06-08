@@ -8,6 +8,8 @@
 //! `--timeout 1s` makes it exit cleanly without producing any
 //! items.
 
+mod common;
+
 use std::path::Path;
 use std::process::Command;
 
@@ -72,11 +74,13 @@ const WFW_TIMEOUT_EXIT: i32 = 2;
 fn wfw_resolves_author_from_session_when_omitted() {
     let dir = init_repo();
     let repo = dir.path();
+    // Team: alice is a commit reviewer (boss is master). wfw
+    // resolves alice from her session binding.
+    common::write_team_config(repo, "boss", &["alice"], &[]);
     bind_alice(repo);
 
-    // No --author / --role passed. Should resolve alice + reviewers
-    // (no master designated). With no work in the repo it'll
-    // time out cleanly.
+    // No --author / --role passed. Should resolve alice + reviewers.
+    // With no work in the repo it'll time out cleanly.
     let out = run_clank(
         repo,
         &["wfw", "--no-poll", "--timeout", "1s"],
@@ -95,14 +99,11 @@ fn wfw_resolves_author_from_session_when_omitted() {
 fn wfw_resolves_role_master_from_repo_config() {
     let dir = init_repo();
     let repo = dir.path();
+    // alice is the team master (role is team-derived now;
+    // `teams-based-agent-registration`). wfw resolves her role
+    // as master from the team, with no explicit `--role`.
+    common::write_team_config(repo, "alice", &[], &[]);
     bind_alice(repo);
-    // Claim master.
-    let out_claim = run_clank(
-        repo,
-        &["auto", "on", "--role", "master"],
-        &[("CLAUDE_CODE_SESSION_ID", CLAUDE_SESSION)],
-    );
-    assert!(out_claim.status.success());
 
     // Add a queue item so master returns PromoteFromQueue (exit 0).
     // A reviewer would timeout (exit 2), confirming the resolved
@@ -133,6 +134,7 @@ fn wfw_resolves_role_master_from_repo_config() {
 fn wfw_explicit_author_overrides_resolver() {
     let dir = init_repo();
     let repo = dir.path();
+    common::write_team_config(repo, "boss", &["alice"], &[]);
     bind_alice(repo);
 
     // Pass --author bob (a label with no binding) — explicit

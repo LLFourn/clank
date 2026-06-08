@@ -96,6 +96,24 @@ pub fn load_reviewer_tiers(repo: &Path) -> anyhow::Result<(Vec<AgentLabel>, Vec<
     }
 }
 
+/// Reviewer tiers for READ-ONLY render paths (`clank status`,
+/// `clank html`). Unlike [`load_reviewer_tiers`], this never
+/// errors: a repo with no team (or a misconfigured one) degrades
+/// to empty tiers so a read-only renderer never crashes on
+/// config absence. The gate then computes as zero-reviewer
+/// (Approved). `clank doctor` is the surface that reports the
+/// underlying misconfiguration. Plan:
+/// `teams-based-agent-registration`.
+pub fn reviewer_tiers_for_render(repo: &Path) -> (Vec<AgentLabel>, Vec<AgentLabel>) {
+    match try_resolve_via_team(repo) {
+        Ok(Some(set)) => (
+            set.commit_reviewers.into_iter().map(|a| a.label).collect(),
+            set.gate_reviewers.into_iter().map(|a| a.label).collect(),
+        ),
+        _ => (Vec::new(), Vec::new()),
+    }
+}
+
 /// Plan: teams-based-agent-registration (phase 6b).
 ///
 /// Shared dispatch helper for `load_reviewer_tiers` and

@@ -7,12 +7,10 @@
 //! mirroring `clank diff --print`'s "argv on stdout + env on
 //! stderr" convention.
 
+mod common;
+
 use std::path::Path;
 use std::process::Command;
-
-use clank::cli::config::{DefaultAgent, RepoConfigFile};
-use clank_core::ids::AgentLabel;
-use clank_core::vocab::Role;
 
 fn clank_bin() -> &'static str {
     env!("CARGO_BIN_EXE_clank")
@@ -38,27 +36,20 @@ fn init_repo() -> tempfile::TempDir {
     dir
 }
 
-fn write_repo_agents(repo: &Path, agents: Vec<DefaultAgent>) {
-    let file = RepoConfigFile {
-        agents: Some(agents),
-        ..Default::default()
-    };
+/// Write a repo `team` array of reviewers WITHOUT a master
+/// (no `promoted`) — used to exercise the no-master error path.
+fn write_repo_reviewers_no_master(repo: &Path, reviewers: &[&str]) {
+    let entries: Vec<serde_json::Value> = reviewers
+        .iter()
+        .map(|r| serde_json::json!({"label": r, "tool": "claude", "review": "commit"}))
+        .collect();
+    let cfg = serde_json::json!({ "team": entries });
     std::fs::create_dir_all(repo.join(".clank")).unwrap();
     std::fs::write(
         repo.join(".clank/config.json"),
-        serde_json::to_string_pretty(&file).unwrap(),
+        serde_json::to_string_pretty(&cfg).unwrap(),
     )
     .unwrap();
-}
-
-fn agent(label: &str, role: Role) -> DefaultAgent {
-    DefaultAgent {
-        label: AgentLabel::parse(label).unwrap(),
-        role,
-        tool: None,
-        launch: None,
-        initial_prompt: None,
-    }
 }
 
 fn run_zellij(repo: &Path, args: &[&str]) -> std::process::Output {
@@ -146,14 +137,7 @@ fn legacy_open_invocation_errors_with_subcommand_hint() {
 fn open_zellij_print_emits_kdl_with_master_and_reviewers() {
     let dir = init_repo();
     let repo = dir.path();
-    write_repo_agents(
-        repo,
-        vec![
-            agent("alice", Role::Master),
-            agent("bob", Role::Reviewer),
-            agent("carol", Role::Reviewer),
-        ],
-    );
+    common::write_team_config(repo, "alice", &["bob", "carol"], &[]);
 
     let out = run_zellij(repo, &["--print"]);
     assert!(
@@ -184,7 +168,7 @@ fn open_zellij_print_emits_kdl_with_master_and_reviewers() {
 fn open_zellij_print_includes_tab_bar_and_status_bar_plugins() {
     let dir = init_repo();
     let repo = dir.path();
-    write_repo_agents(repo, vec![agent("alice", Role::Master)]);
+    common::write_team_config(repo, "alice", &[], &[]);
 
     let out = run_zellij(repo, &["--print"]);
     assert!(out.status.success());
@@ -203,10 +187,10 @@ fn open_zellij_print_includes_tab_bar_and_status_bar_plugins() {
 fn open_zellij_no_master_errors_with_suggestion() {
     let dir = init_repo();
     let repo = dir.path();
-    write_repo_agents(
-        repo,
-        vec![agent("a", Role::Reviewer), agent("b", Role::Reviewer)],
-    );
+    // A team with reviewers but no designated master
+    // (`teams-based-agent-registration`): resolution fails with
+    // the NoMaster error.
+    write_repo_reviewers_no_master(repo, &["a", "b"]);
 
     let out = run_zellij(repo, &["--print"]);
     assert!(
@@ -217,39 +201,8 @@ fn open_zellij_no_master_errors_with_suggestion() {
     );
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
-        stderr.contains("clank agent add") && stderr.contains("--role master"),
-        "diagnostic should name the fix; got: {stderr}"
-    );
-}
-
-#[test]
-fn open_zellij_multiple_masters_errors_with_diagnostic() {
-    let dir = init_repo();
-    let repo = dir.path();
-    write_repo_agents(
-        repo,
-        vec![
-            agent("alice", Role::Master),
-            agent("bob", Role::Master),
-            agent("carol", Role::Reviewer),
-        ],
-    );
-
-    let out = run_zellij(repo, &["--print"]);
-    assert!(
-        !out.status.success(),
-        "multi-master must error; stdout=`{}` stderr=`{}`",
-        String::from_utf8_lossy(&out.stdout),
-        String::from_utf8_lossy(&out.stderr)
-    );
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(
-        stderr.contains("alice") && stderr.contains("bob"),
-        "multi-master diagnostic must list BOTH masters; got: {stderr}"
-    );
-    assert!(
-        stderr.contains("clank agent promote"),
-        "diagnostic should suggest promote; got: {stderr}"
+        stderr.contains("no master") || stderr.contains("set-master") || stderr.contains("promote"),
+        "diagnostic should name the master-designation fix; got: {stderr}"
     );
 }
 
@@ -263,7 +216,7 @@ fn open_zellij_print_mode_emits_kdl_without_writing_file() {
     // is a non-print side effect.)
     let dir = init_repo();
     let repo = dir.path();
-    write_repo_agents(repo, vec![agent("alice", Role::Master)]);
+    common::write_team_config(repo, "alice", &[], &[]);
 
     let out = run_zellij(repo, &["--print"]);
     assert!(
@@ -290,15 +243,7 @@ fn open_zellij_reviewer_order_matches_declaration_order() {
     // iteration would fail this test (per ruthless 7a58d12).
     let dir = init_repo();
     let repo = dir.path();
-    write_repo_agents(
-        repo,
-        vec![
-            agent("master", Role::Master),
-            agent("bob", Role::Reviewer),
-            agent("alice", Role::Reviewer),
-            agent("codex", Role::Reviewer),
-        ],
-    );
+    common::write_team_config(repo, "master", &["bob", "alice", "codex"], &[]);
 
     let out = run_zellij(repo, &["--print"]);
     assert!(out.status.success());
@@ -325,7 +270,7 @@ fn open_zellij_tab_name_in_kdl_and_layout_path_in_spawn_metadata() {
     // stderr is `zellij --layout <path>` only.
     let dir = init_repo();
     let repo = dir.path();
-    write_repo_agents(repo, vec![agent("alice", Role::Master)]);
+    common::write_team_config(repo, "alice", &[], &[]);
 
     let out = run_zellij(repo, &["--print"]);
     assert!(out.status.success());
@@ -357,7 +302,7 @@ fn open_zellij_writes_layout_file_under_clank_dir() {
     // post-state regardless.
     let dir = init_repo();
     let repo = dir.path();
-    write_repo_agents(repo, vec![agent("alice", Role::Master)]);
+    common::write_team_config(repo, "alice", &[], &[]);
 
     let _ = run_zellij(repo, &[]); // ignore status — zellij absent in CI
     let layout_path = repo.join(".clank/zellij/layout.kdl");
@@ -382,7 +327,7 @@ fn open_zellij_writes_layout_file_under_clank_dir() {
 fn open_zellij_adds_zellij_dir_to_gitignore_idempotently() {
     let dir = init_repo();
     let repo = dir.path();
-    write_repo_agents(repo, vec![agent("alice", Role::Master)]);
+    common::write_team_config(repo, "alice", &[], &[]);
 
     // First invocation.
     let _ = run_zellij(repo, &[]);
@@ -413,10 +358,7 @@ fn open_zellij_panes_set_cwd_to_repo_so_tool_launches_in_repo() {
     // cwd so we know we're not accidentally testing pwd-leak.
     let dir = init_repo();
     let repo = dir.path();
-    write_repo_agents(
-        repo,
-        vec![agent("alice", Role::Master), agent("bob", Role::Reviewer)],
-    );
+    common::write_team_config(repo, "alice", &["bob"], &[]);
 
     let cwd = std::env::temp_dir();
     let out = Command::new(clank_bin())
@@ -468,10 +410,7 @@ fn open_zellij_pane_commands_pin_repo_via_absolute_path() {
     // unambiguous.
     let dir = init_repo();
     let repo = dir.path();
-    write_repo_agents(
-        repo,
-        vec![agent("alice", Role::Master), agent("bob", Role::Reviewer)],
-    );
+    common::write_team_config(repo, "alice", &["bob"], &[]);
 
     // Invoke from a DIFFERENT cwd (the tempdir's parent, or
     // any path that isn't the repo).

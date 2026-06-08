@@ -5,6 +5,8 @@
 //! against the per-tool contract table from
 //! `clank-agent-integration` plan + `clank_core::hook_io`.
 
+mod common;
+
 use std::io::Write;
 use std::path::Path;
 use std::process::{Command, Stdio};
@@ -30,30 +32,11 @@ fn init_repo() -> tempfile::TempDir {
     git(path, &["config", "user.email", "test@test"]);
     git(path, &["config", "user.name", "test"]);
     git(path, &["config", "commit.gpgsign", "false"]);
-    // Register alice in the repo-scope declaration so the gate
-    // treats her as a registered reviewer. Post
-    // agent-add-cli-and-repo-scope, expected_reviewers reads from
-    // the declaration, not skeleton.
-    write_repo_agents_file(
-        path,
-        &[clank::cli::config::DefaultAgent {
-            label: clank_core::ids::AgentLabel::parse("alice").unwrap(),
-            role: clank_core::vocab::Role::Reviewer,
-            tool: None,
-            launch: None,
-            initial_prompt: None,
-        }],
-    );
+    // Register a master + alice reviewer via the repo-scope team
+    // (`teams-based-agent-registration`) so the gate treats her as
+    // a registered reviewer.
+    common::write_team_config(path, "master", &["alice"], &[]);
     dir
-}
-
-fn write_repo_agents_file(repo: &Path, agents: &[clank::cli::config::DefaultAgent]) {
-    let file = clank::cli::config::RepoAgentsFile {
-        agents: Some(agents.to_vec()),
-    };
-    let json = serde_json::to_string_pretty(&file).unwrap();
-    std::fs::create_dir_all(repo.join(".clank")).unwrap();
-    std::fs::write(repo.join(".clank/config.json"), json).unwrap();
 }
 
 const CLAUDE_SESSION: &str = "742f6a04-f174-409a-ab01-419a16c5f372";

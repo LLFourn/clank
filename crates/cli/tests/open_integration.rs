@@ -1,5 +1,7 @@
 //! Integration tests for `clank open`.
 
+mod common;
+
 use std::path::Path;
 use std::process::Command;
 
@@ -199,12 +201,12 @@ fn clank_initialized_with_master_and_reviewer() {
     let home = tempfile::tempdir().unwrap();
     let dir = init_repo();
     let repo = dir.path();
-    write(repo, ".clank/config.json", "{}");
+    // Master is team-derived now (`teams-based-agent-registration`).
+    common::write_team_config(repo, "claude", &["codex"], &[]);
     write(
         repo,
         ".clank/agents/claude/config.json",
         &serde_json::to_string_pretty(&clank_core::agent_config::AgentConfig {
-            role: clank_core::vocab::Role::Master,
             session: Some(clank_core::agent_config::Session {
                 id: clank_core::ids::SessionId::parse("00000000-0000-4000-8000-000000000001")
                     .unwrap(),
@@ -219,7 +221,6 @@ fn clank_initialized_with_master_and_reviewer() {
         repo,
         ".clank/agents/codex/config.json",
         &serde_json::to_string_pretty(&clank_core::agent_config::AgentConfig {
-            role: clank_core::vocab::Role::Reviewer,
             session: Some(clank_core::agent_config::Session {
                 id: clank_core::ids::SessionId::parse("00000000-0000-4000-8000-000000000002")
                     .unwrap(),
@@ -275,28 +276,23 @@ fn clank_initialized_subdir_resolves_to_repo_root() {
 }
 
 #[test]
-fn master_agents_empty_when_all_reviewers() {
+fn master_agents_empty_when_no_team_master() {
+    // A repo whose team has reviewers but no master designated
+    // → the resolver yields no master, so `master_agents` is
+    // empty (`teams-based-agent-registration`).
     let home = tempfile::tempdir().unwrap();
     let dir = init_repo();
     let repo = dir.path();
-    write(repo, ".clank/config.json", "{}");
+    let cfg = serde_json::json!({
+        "team": [
+            {"label": "a", "tool": "claude", "review": "commit"},
+            {"label": "b", "tool": "claude", "review": "commit"}
+        ]
+    });
     write(
         repo,
-        ".clank/agents/a/config.json",
-        &serde_json::to_string_pretty(&clank_core::agent_config::AgentConfig {
-            role: clank_core::vocab::Role::Reviewer,
-            ..Default::default()
-        })
-        .unwrap(),
-    );
-    write(
-        repo,
-        ".clank/agents/b/config.json",
-        &serde_json::to_string_pretty(&clank_core::agent_config::AgentConfig {
-            role: clank_core::vocab::Role::Reviewer,
-            ..Default::default()
-        })
-        .unwrap(),
+        ".clank/config.json",
+        &serde_json::to_string_pretty(&cfg).unwrap(),
     );
     git(repo, &["add", "-A"]);
     git(repo, &["commit", "--quiet", "-m", "seed"]);
@@ -305,40 +301,9 @@ fn master_agents_empty_when_all_reviewers() {
     assert_eq!(v["clank"]["master_agents"], serde_json::json!([]));
 }
 
-#[test]
-fn master_agents_lists_multiple_masters() {
-    let home = tempfile::tempdir().unwrap();
-    let dir = init_repo();
-    let repo = dir.path();
-    write(repo, ".clank/config.json", "{}");
-    write(
-        repo,
-        ".clank/agents/a/config.json",
-        &serde_json::to_string_pretty(&clank_core::agent_config::AgentConfig {
-            role: clank_core::vocab::Role::Master,
-            ..Default::default()
-        })
-        .unwrap(),
-    );
-    write(
-        repo,
-        ".clank/agents/b/config.json",
-        &serde_json::to_string_pretty(&clank_core::agent_config::AgentConfig {
-            role: clank_core::vocab::Role::Master,
-            ..Default::default()
-        })
-        .unwrap(),
-    );
-    git(repo, &["add", "-A"]);
-    git(repo, &["commit", "--quiet", "-m", "seed"]);
-
-    let v = run_open(repo, home.path());
-    let masters = v["clank"]["master_agents"].as_array().unwrap();
-    assert_eq!(masters.len(), 2);
-    let mut labels: Vec<&str> = masters.iter().map(|x| x.as_str().unwrap()).collect();
-    labels.sort();
-    assert_eq!(labels, vec!["a", "b"]);
-}
+// NOTE: the prior `master_agents_lists_multiple_masters` test is
+// gone — the team model has exactly one master per repo, so a
+// multi-master scenario is no longer representable.
 
 #[test]
 fn git_dir_normalized_from_repo_root() {

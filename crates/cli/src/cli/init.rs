@@ -352,20 +352,6 @@ fn prompt_with_default(prompt: &str, default: &str) -> anyhow::Result<String> {
     }
 }
 
-fn prompt_yes_no(prompt: &str, default: bool) -> anyhow::Result<bool> {
-    print!("{prompt}");
-    std::io::stdout().flush()?;
-    let mut line = String::new();
-    std::io::stdin().read_line(&mut line)?;
-    let trimmed = line.trim().to_ascii_lowercase();
-    Ok(match trimmed.as_str() {
-        "y" | "yes" => true,
-        "n" | "no" => false,
-        "" => default,
-        _ => default,
-    })
-}
-
 /// True if the matched rule lives in `<repo>/.clank/.gitignore`
 /// (the file we just wrote). `git check-ignore -v` emits records as
 /// `<source_file>:<line>:<pattern>\t<probed>`; we parse the

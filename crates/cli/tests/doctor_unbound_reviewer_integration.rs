@@ -33,19 +33,16 @@ fn write(repo: &Path, rel: &str, body: &str) {
     std::fs::write(abs, body).unwrap();
 }
 
-/// Build a skeleton with optional session.
+/// Build a skeleton with optional session. Skeletons are
+/// STATE-ONLY under `teams-based-agent-registration`.
 fn skeleton(
     auto_mode: clank_core::vocab::AutoMode,
     session: Option<clank_core::agent_config::Session>,
 ) -> clank_core::agent_config::AgentConfig {
     clank_core::agent_config::AgentConfig {
         auto_mode,
-        role: clank_core::vocab::Role::Reviewer, // skeleton role unused; declaration is source of truth
         wfw_timeout: None,
         session,
-        launch: None,
-        tool: None,
-        initial_prompt: None,
     }
 }
 
@@ -69,50 +66,57 @@ fn write_skeleton(repo: &Path, label: &str, cfg: &clank_core::agent_config::Agen
     .unwrap();
 }
 
-/// Register agents in the repo-scope declaration via typed struct.
+/// Register agents in the repo-scope team
+/// (`teams-based-agent-registration`). The master is the entry
+/// with `Role::Master`, else a synthetic `boss` master is added
+/// so resolution succeeds. All others become commit reviewers.
 fn register_agents(repo: &Path, agents: &[(&str, clank_core::vocab::Role)]) {
-    let decls: Vec<clank::cli::config::DefaultAgent> = agents
+    use clank_core::vocab::Role;
+    let master = agents
         .iter()
-        .map(|(label, role)| clank::cli::config::DefaultAgent {
-            label: clank_core::ids::AgentLabel::parse(label).unwrap(),
-            role: *role,
-            tool: None,
-            launch: None,
-            initial_prompt: None,
-        })
-        .collect();
-    let file = clank::cli::config::RepoConfigFile {
-        agents: Some(decls),
-        ..Default::default()
-    };
-    std::fs::create_dir_all(repo.join(".clank")).unwrap();
-    std::fs::write(
-        repo.join(".clank/config.json"),
-        serde_json::to_string_pretty(&file).unwrap(),
-    )
-    .unwrap();
+        .find(|(_, r)| *r == Role::Master)
+        .map(|(l, _)| l.to_string());
+    let master_label = master.clone().unwrap_or_else(|| "boss".to_string());
+    let mut entries = vec![serde_json::json!({
+        "label": master_label, "tool": "claude", "review": "commit"
+    })];
+    for (label, _role) in agents {
+        if Some(label.to_string()) == master {
+            continue;
+        }
+        entries.push(serde_json::json!({
+            "label": label, "tool": "claude", "review": "commit"
+        }));
+    }
+    let cfg = serde_json::json!({ "team": entries, "promoted": master_label });
+    write_repo_config_json(repo, &cfg);
 }
 
 fn register_agent_with_launch(
     repo: &Path,
     label: &str,
-    role: clank_core::vocab::Role,
+    _role: clank_core::vocab::Role,
     launch: clank_core::agent_config::LaunchConfig,
 ) {
-    let file = clank::cli::config::RepoConfigFile {
-        agents: Some(vec![clank::cli::config::DefaultAgent {
-            label: clank_core::ids::AgentLabel::parse(label).unwrap(),
-            role,
-            tool: None,
-            launch: Some(launch),
-            initial_prompt: None,
-        }]),
-        ..Default::default()
-    };
+    // The launched agent is the team master so the registered set
+    // resolves; its inline entry carries the launch profile.
+    let cfg = serde_json::json!({
+        "team": [{
+            "label": label,
+            "tool": "claude",
+            "review": "commit",
+            "launch": launch,
+        }],
+        "promoted": label,
+    });
+    write_repo_config_json(repo, &cfg);
+}
+
+fn write_repo_config_json(repo: &Path, cfg: &serde_json::Value) {
     std::fs::create_dir_all(repo.join(".clank")).unwrap();
     std::fs::write(
         repo.join(".clank/config.json"),
-        serde_json::to_string_pretty(&file).unwrap(),
+        serde_json::to_string_pretty(cfg).unwrap(),
     )
     .unwrap();
 }
@@ -306,16 +310,16 @@ fn doctor_warns_on_missing_skeleton() {
     );
     let msg = phantom_check["message"].as_str().unwrap_or("");
     assert!(
-        msg.contains("in merged declaration"),
-        "diagnostic should mention `in merged declaration`; got: {msg}"
+        msg.contains("registered") && msg.contains("reviewer"),
+        "diagnostic should name the registered role; got: {msg}"
     );
     assert!(
-        msg.contains("missing"),
-        "diagnostic should mention skeleton missing; got: {msg}"
+        msg.contains("config.json"),
+        "diagnostic should mention the missing skeleton path; got: {msg}"
     );
     assert!(
-        msg.contains("clank init"),
-        "diagnostic should mention `clank init` as the fix; got: {msg}"
+        msg.contains("clank as"),
+        "diagnostic should mention `clank as` as the bind fix; got: {msg}"
     );
 }
 
@@ -328,17 +332,9 @@ fn doctor_warns_on_orphan_skeleton() {
     let dir = init_repo();
     let repo = dir.path();
     write(repo, ".clank/.gitignore", ".gitignore\n");
-    // Empty declaration (explicit empty override).
-    let file = clank::cli::config::RepoConfigFile {
-        agents: Some(Vec::new()),
-        ..Default::default()
-    };
-    std::fs::create_dir_all(repo.join(".clank")).unwrap();
-    std::fs::write(
-        repo.join(".clank/config.json"),
-        serde_json::to_string_pretty(&file).unwrap(),
-    )
-    .unwrap();
+    // Registered team is just a master (`boss`); the `orphan`
+    // skeleton below is NOT in the registered set.
+    register_agents(repo, &[("boss", clank_core::vocab::Role::Master)]);
     // Orphan skeleton.
     write_skeleton(
         repo,
@@ -366,8 +362,8 @@ fn doctor_warns_on_orphan_skeleton() {
     );
     let msg = orphan_check["message"].as_str().unwrap_or("");
     assert!(
-        msg.contains("not in the merged agent declaration"),
-        "diagnostic should mention `not in the merged agent declaration`; got: {msg}"
+        msg.contains("registered team set"),
+        "diagnostic should mention the agent isn't in the registered team set; got: {msg}"
     );
     assert!(
         msg.contains("clank agent add"),

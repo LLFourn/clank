@@ -20,25 +20,11 @@ fn help_for(args: &[&str]) -> String {
     String::from_utf8_lossy(&out.stdout).into_owned()
 }
 
-#[test]
-fn agent_add_help_uses_canonical_singular_role() {
-    let help = help_for(&["agent", "add"]);
-    assert!(
-        help.contains("[default: reviewer]"),
-        "agent add --help must show [default: reviewer]; got:\n{help}"
-    );
-    // The `Defaults to` docstring line itself.
-    assert!(
-        help.contains("Defaults to `reviewer`"),
-        "agent add docstring must say `Defaults to \\`reviewer\\``; got:\n{help}"
-    );
-    // Plural must NOT appear as the default (allowed in alias
-    // documentation, but not as the unqualified default).
-    assert!(
-        !help.contains("[default: reviewers]"),
-        "agent add must NOT show [default: reviewers]; got:\n{help}"
-    );
-}
+// NOTE: `agent_add_help_uses_canonical_singular_role` was
+// removed with the `--role` flag on `clank agent add`
+// (`teams-based-agent-registration` hard cut): roles are now a
+// per-team property, not a per-add flag, so `agent add` has no
+// role default to assert.
 
 #[test]
 fn init_help_uses_canonical_singular_role() {
