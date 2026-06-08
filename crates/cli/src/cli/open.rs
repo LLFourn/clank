@@ -8,7 +8,7 @@ use serde::Serialize;
 
 use super::{OpenArgs, OpenCmd, OpenDryArgs};
 use clank_core::agent_config::AgentConfig;
-use clank_core::vocab::{Role, Tool};
+use clank_core::vocab::Tool;
 
 pub async fn run(args: OpenArgs) -> anyhow::Result<()> {
     match args.command {
@@ -569,13 +569,15 @@ async fn clank_info_for_repo(repo_root: &Path) -> (ClankInfo, Vec<Recommendation
     let agent_configs =
         crate::agent_store::load_all_agent_configs_lossy(repo_root).unwrap_or_default();
 
+    // Master is team-derived (`teams-based-agent-registration`).
+    // Best-effort: a repo with no team configured has no master.
     let mut master_agents = Vec::<String>::new();
+    if let Ok(Some(set)) = crate::agent_store::try_resolve_via_team(repo_root) {
+        master_agents.push(set.master.as_str().to_string());
+    }
     let mut agents = Vec::<AgentInfo>::new();
     let mut recommendations = Vec::<Recommendation>::new();
     for (label, cfg) in &agent_configs {
-        if cfg.role == Role::Master {
-            master_agents.push(label.as_str().to_string());
-        }
         let (tool_str, session_id_str, resumable) = agent_session_info(cfg);
         agents.push(AgentInfo {
             label: label.as_str().to_string(),

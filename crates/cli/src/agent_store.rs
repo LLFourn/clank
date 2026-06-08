@@ -56,91 +56,35 @@ pub fn load_all_agent_configs(repo: &Path) -> anyhow::Result<Vec<(AgentLabel, Ag
     Ok(out)
 }
 
-/// Resolve an agent's role from the merged declaration. The
-/// declaration is THE source of truth — if `label` isn't in it,
-/// the agent isn't registered and gets the default role.
+/// Error returned by the team-based resolvers when a repo has no
+/// `team` field configured. No legacy fallback exists: a repo
+/// without a team is a setup error, not a master-only default.
+fn no_team_configured() -> anyhow::Error {
+    anyhow::anyhow!("this repo has no team configured. Run `clank init --team <name>` to set one.")
+}
+
+/// Resolve an agent's role for this repo via the team-based
+/// registered set: `label == master` → `Master`; in either
+/// reviewer tier → `Reviewer`; otherwise the default role.
 ///
-/// Pre-Phase-1 (skeleton-only) repos are handled inside
-/// [`crate::cli::config::load_merged_agents`]'s level-3 legacy
-/// fallback (which synthesizes declaration entries from skeleton
-/// dirs). This function does NOT add a second skeleton fallback
-/// — that would defeat `clank agent remove`, which deliberately
-/// preserves the skeleton dir for feedback history but expects
-/// the declaration entry's removal to take effect.
-///
-/// Codex caught the double-fallback on ebc5d38: a config with
-/// `agents: []` + preserved `.clank/agents/codex/config.json`
-/// was returning role=master from the skeleton, even though the
-/// explicit empty declaration says no agents are registered.
+/// Errors if the repo has no `team` field set — there is no
+/// legacy fallback.
 pub fn resolve_role(repo: &Path, label: &AgentLabel) -> anyhow::Result<clank_core::vocab::Role> {
-    // Plan: teams-based-agent-registration (codex b59dafb
-    // catch — role resolution was left on the legacy path
-    // while reviewer tiers cut over to the new resolver. A
-    // team master whose legacy `default_agents` entry is
-    // `role: reviewer` was getting Role::Reviewer here, so
-    // master work items never emitted for them).
-    //
-    // Dispatch: when the repo config has a `team` field, run
-    // the new resolver and derive role from the resolved set
-    // (label == master → Master; otherwise Reviewer if in
-    // either tier; else default). Falls back to legacy when
-    // no team field is set.
-    if let Some(set) = try_resolve_via_team(repo)? {
-        return Ok(role_from_registered_set(&set, label));
+    match try_resolve_via_team(repo)? {
+        Some(set) => Ok(role_from_registered_set(&set, label)),
+        None => Err(no_team_configured()),
     }
-    // Legacy path.
-    let home = std::env::var_os("HOME").map(PathBuf::from);
-    let merged = crate::cli::config::load_merged_agents(repo, home.as_deref())?;
-    Ok(merged
-        .iter()
-        .find(|e| &e.label == label)
-        .map(|e| e.role)
-        .unwrap_or_default())
 }
 
-/// Labels of every agent registered as a reviewer in this repo.
-///
-/// Source of truth: the **merged agent declaration** (repo-scope
-/// `<repo>/.clank/config.json#/agents` if present, else user-scope
-/// `~/.clank/config.json#/default_agents`). Per
-/// `agent-add-cli-and-repo-scope`, the declaration drives gate
-/// input — `clank agent remove` removing the declaration entry IS
-/// what removes a reviewer from the gate.
-///
-/// **Strict** by design: a malformed declaration file is
-/// propagated as an error rather than silently dropping reviewers.
-/// The gate's "zero registered reviewers → auto-Approved" rule
-/// means lossy loading would fail open — a corrupted declaration
-/// could let master finalize without review. Fails closed instead.
-pub fn load_expected_reviewers(repo: &Path) -> anyhow::Result<Vec<AgentLabel>> {
-    use clank_core::vocab::Role;
-    let home = std::env::var_os("HOME").map(PathBuf::from);
-    let merged = crate::cli::config::load_merged_agents(repo, home.as_deref())?;
-    Ok(merged
-        .into_iter()
-        .filter(|e| e.role == Role::Reviewer)
-        .map(|e| e.label)
-        .collect())
-}
-
-/// Plan: teams-based-agent-registration (phase 6b).
+/// Plan: teams-based-agent-registration.
 ///
 /// Two-tier reviewer split for a repo. Used by `WorkPolicy`
 /// construction sites (status, wfw, open) to feed the
-/// two-tier gate state machine introduced in phase 3.
+/// two-tier gate state machine.
 ///
-/// Returns `(commit_reviewers, gate_reviewers)`:
-/// - If the repo config has a `team` field set, runs
-///   `resolve_registered_set` against the new typed schemas.
-///   commit_reviewers and gate_reviewers come from the
-///   resolved set's reviewer lists.
-/// - If `team` is unset (legacy repo), falls back to
-///   `load_expected_reviewers` (single list) and returns it
-///   as `commit_reviewers` with empty `gate_reviewers` —
-///   preserves pre-plan behavior exactly.
-///
-/// This is the production cutover surface: subsequent
-/// phases remove the fallback path entirely.
+/// Returns `(commit_reviewers, gate_reviewers)` from the
+/// resolved registered set. Errors if the repo has no `team`
+/// field set — there is no legacy fallback.
 pub fn load_reviewer_tiers(repo: &Path) -> anyhow::Result<(Vec<AgentLabel>, Vec<AgentLabel>)> {
     match try_resolve_via_team(repo)? {
         Some(set) => {
@@ -148,11 +92,7 @@ pub fn load_reviewer_tiers(repo: &Path) -> anyhow::Result<(Vec<AgentLabel>, Vec<
             let gate = set.gate_reviewers.into_iter().map(|a| a.label).collect();
             Ok((commit, gate))
         }
-        None => {
-            // No team set or no repo config — legacy single-list
-            // path.
-            Ok((load_expected_reviewers(repo)?, Vec::new()))
-        }
+        None => Err(no_team_configured()),
     }
 }
 
@@ -185,7 +125,7 @@ pub fn load_reviewer_tiers(repo: &Path) -> anyhow::Result<(Vec<AgentLabel>, Vec<
 /// Plan: teams-based-agent-registration (codex b59dafb pure
 /// helper). Derive a role from a resolved registered set.
 /// Pure: no $HOME, no filesystem. Testable directly.
-fn role_from_registered_set(
+pub fn role_from_registered_set(
     set: &crate::cli::teams_config::RegisteredSet,
     label: &AgentLabel,
 ) -> clank_core::vocab::Role {
@@ -205,7 +145,7 @@ fn role_from_registered_set(
     }
 }
 
-fn try_resolve_via_team(
+pub fn try_resolve_via_team(
     repo: &Path,
 ) -> anyhow::Result<Option<crate::cli::teams_config::RegisteredSet>> {
     let home = std::env::var_os("HOME").map(PathBuf::from);

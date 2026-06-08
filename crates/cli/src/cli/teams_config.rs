@@ -166,24 +166,6 @@ pub struct InlineAgent {
     pub review: Option<ReviewKind>,
 }
 
-/// Legacy repo-scope config (the
-/// `agents-declaration-is-user-local` shape) — used by
-/// `clank init`'s migration fallback when new-format
-/// deserialization fails entirely.
-#[derive(Debug, Default, Deserialize, Serialize)]
-pub struct LegacyRepoConfigFile {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub agents: Option<Vec<crate::cli::config::DefaultAgent>>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub review: Option<crate::cli::config::ReviewSection>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub hooks: Option<crate::cli::config::HooksSection>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub diff: Option<crate::cli::config::DiffConfig>,
-    #[serde(flatten)]
-    pub extra: BTreeMap<String, serde_json::Value>,
-}
-
 /// Resolved registered set for a repo: master + two reviewer
 /// lists. Each agent has both a label and the description
 /// resolved at registration time.
@@ -667,23 +649,6 @@ mod tests {
             }
             other => panic!("expected ByName; got {other:?}"),
         }
-    }
-
-    #[test]
-    fn legacy_repo_config_parses_old_shape() {
-        // Init's migration fallback path #1: pre-this-plan
-        // repo config shape. Must deserialize via
-        // LegacyRepoConfigFile when new-format deserialize
-        // fails entirely.
-        let json = r#"{
-            "agents": [
-                {"label": "alice", "role": "master", "tool": "claude"}
-            ]
-        }"#;
-        let legacy: LegacyRepoConfigFile = serde_json::from_str(json).unwrap();
-        let agents = legacy.agents.expect("agents block present");
-        assert_eq!(agents.len(), 1);
-        assert_eq!(agents[0].label.as_str(), "alice");
     }
 
     // ── resolve_registered_set ───────────────────────────

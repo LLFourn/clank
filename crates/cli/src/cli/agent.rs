@@ -1,26 +1,27 @@
-//! `clank agent list` — enumerate registered agents in this repo
-//! with role and bind state. Read-only; never mutates state.
+//! `clank agent` — enumerate / launch / declare agents under the
+//! team-based registration model (`teams-based-agent-registration`).
 //!
-//! Source of truth: the **merged agent declaration** (repo-scope
-//! `<repo>/.clank/config.json#/agents` if present, else user-scope
-//! `~/.clank/config.json#/default_agents`). Per
-//! `agent-add-cli-and-repo-scope`, the declaration drives role +
-//! tool + launch; per-agent skeleton supplies session binding
-//! state. List joins both. Declared agents without skeletons
-//! render as unbound; orphan skeletons (skeleton without
-//! declaration) are NOT listed — `clank doctor` surfaces them
-//! separately.
+//! Source of truth for "who is registered in this repo" is the
+//! TEAM RESOLVER (`agent_store::try_resolve_via_team`): a repo's
+//! `team` field plus the user-scope `agents` + `teams` maps.
+//! The per-agent skeleton at `.clank/agents/<label>/config.json`
+//! holds ONLY per-machine state (`auto_mode`, `wfw_timeout`,
+//! `session`) — no role / tool / launch declaration. `list`
+//! joins the resolved set with each agent's skeleton session.
 
 use std::path::Path;
 
 use anyhow::Context;
 use serde::Serialize;
 
-use crate::agent_store::{agent_config_path, load_agent_config, save_agent_config};
-use crate::cli::config::{DefaultAgent, UserConfigFile};
-use clank_core::agent_config::{AgentConfig, LaunchConfig, Session};
+use crate::agent_store::load_agent_config;
+use crate::cli::teams_config::{
+    AgentDescription, ByNameEntry, InlineAgent, RepoConfigFile, ReviewKind, TeamEntry, TeamField,
+    UserConfigFile,
+};
+use clank_core::agent_config::{LaunchConfig, Session};
 use clank_core::ids::AgentLabel;
-use clank_core::vocab::{AutoMode, Role, Tool};
+use clank_core::vocab::{AutoMode, Tool};
 use std::collections::BTreeMap;
 
 use super::{
@@ -42,6 +43,8 @@ pub async fn run(args: AgentArgs) -> anyhow::Result<()> {
 struct AgentRow {
     label: String,
     role: String,
+    /// `—` for master; `commit` / `gate` for reviewers.
+    review: String,
     bound: bool,
     tool: Option<String>,
     session_id: Option<String>,
@@ -50,8 +53,9 @@ struct AgentRow {
 impl AgentRow {
     fn from_join(
         label: &AgentLabel,
-        role: Role,
-        declared_tool: Option<Tool>,
+        role: &str,
+        review: &str,
+        declared_tool: Tool,
         session: Option<&Session>,
     ) -> Self {
         let (bound, tool_str, session_id) = match session {
@@ -62,11 +66,12 @@ impl AgentRow {
                 Some(s.tool.as_str().to_string()),
                 Some(s.id.as_str().to_string()),
             ),
-            None => (false, declared_tool.map(|t| t.as_str().to_string()), None),
+            None => (false, Some(declared_tool.as_str().to_string()), None),
         };
         Self {
             label: label.as_str().to_string(),
-            role: role.as_str().to_string(),
+            role: role.to_string(),
+            review: review.to_string(),
             bound,
             tool: tool_str,
             session_id,
@@ -76,31 +81,45 @@ impl AgentRow {
 
 fn list(args: AgentListArgs) -> anyhow::Result<()> {
     let repo = resolve_repo(args.repo.as_deref())?;
-    let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
-    // Declaration is the source of truth for which agents are
-    // registered; skeleton supplies session state (codex review of
-    // eef4c49 — was scanning skeleton dirs).
-    let declared = crate::cli::config::load_merged_agents(&repo, home.as_deref())?;
-    let mut rows: Vec<AgentRow> = Vec::with_capacity(declared.len());
-    for entry in &declared {
-        let skeleton = load_agent_config(&repo, &entry.label)?;
+    // Registration is the resolved team set; skeleton supplies
+    // session state only.
+    let Some(set) = crate::agent_store::try_resolve_via_team(&repo)? else {
+        anyhow::bail!(
+            "this repo has no team configured. Run `clank init --team <name>` to set one."
+        );
+    };
+    let mut rows: Vec<AgentRow> = Vec::new();
+    // Master first.
+    {
+        let skeleton = load_agent_config(&repo, &set.master)?;
         rows.push(AgentRow::from_join(
-            &entry.label,
-            entry.role,
-            entry.tool,
+            &set.master,
+            "master",
+            "—",
+            set.master_desc.tool,
             skeleton.as_ref().and_then(|c| c.session.as_ref()),
         ));
     }
-    // Stable ordering: master first, then alphabetic by label.
-    rows.sort_by(|a, b| {
-        let role_key = |r: &str| match r {
-            "master" => 0,
-            _ => 1,
-        };
-        role_key(&a.role)
-            .cmp(&role_key(&b.role))
-            .then_with(|| a.label.cmp(&b.label))
-    });
+    for r in &set.commit_reviewers {
+        let skeleton = load_agent_config(&repo, &r.label)?;
+        rows.push(AgentRow::from_join(
+            &r.label,
+            "reviewer",
+            "commit",
+            r.desc.tool,
+            skeleton.as_ref().and_then(|c| c.session.as_ref()),
+        ));
+    }
+    for r in &set.gate_reviewers {
+        let skeleton = load_agent_config(&repo, &r.label)?;
+        rows.push(AgentRow::from_join(
+            &r.label,
+            "reviewer",
+            "gate",
+            r.desc.tool,
+            skeleton.as_ref().and_then(|c| c.session.as_ref()),
+        ));
+    }
     if args.json {
         let s = serde_json::to_string_pretty(&rows)?;
         println!("{s}");
@@ -167,39 +186,34 @@ fn start(args: AgentStartArgs) -> anyhow::Result<()> {
     let label = AgentLabel::parse(&args.name)
         .map_err(|e| anyhow::anyhow!("invalid agent label `{}`: {e}", args.name))?;
 
-    let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
-    let merged = crate::cli::config::load_merged_agents(&repo, home.as_deref())?;
-    let entry = merged.iter().find(|e| e.label == label);
+    // Registration is the resolved team set. The agent's
+    // description (tool / launch / initial_prompt) comes from
+    // there; the skeleton supplies only session + auto_mode.
+    let Some(set) = crate::agent_store::try_resolve_via_team(&repo)? else {
+        anyhow::bail!(
+            "this repo has no team configured. Run `clank init --team <name>` to set one."
+        );
+    };
+    let desc = find_in_set(&set, &label).ok_or_else(|| {
+        anyhow::anyhow!(
+            "no agent `{}` registered in this repo's team (master/reviewers: {})",
+            args.name,
+            registered_labels(&set).join(", ")
+        )
+    })?;
 
     let cfg = load_agent_config(&repo, &label)?;
-
-    if entry.is_none() && cfg.is_none() {
-        anyhow::bail!(
-            "no agent `{name}` in this repo. Create `.clank/agents/{name}/config.json` \
-             (or hand-edit one from the seed) before running `clank agent start`.",
-            name = args.name
-        );
-    }
-
     let bound_session = cfg.as_ref().and_then(|c| c.session.as_ref());
-    let composed = match (entry, bound_session) {
-        (Some(entry), None) => compose_bootstrap_launch(entry)?,
-        (None, None) => {
-            // Declaration absent AND skeleton has no session: legacy-synth
-            // path would have inserted `entry`, so this arm is the
-            // "skeleton exists but synthesis returned tool=None and
-            // launch.command absent" case. Surface the actionable hint.
-            anyhow::bail!(no_bootstrap_tool_message(&label));
-        }
-        (entry_opt, Some(session)) => {
-            let cfg = cfg.as_ref().expect("session implies skeleton");
-            let declaration_launch = entry_opt.and_then(|e| e.launch.as_ref());
-            let declaration_prompt = entry_opt.and_then(|e| e.initial_prompt.as_deref());
-            let resolved_prompt = resolve_initial_prompt(declaration_prompt, cfg.auto_mode);
+
+    let composed = match bound_session {
+        None => compose_bootstrap_launch(&label, &desc)?,
+        Some(session) => {
+            let auto_mode = cfg.as_ref().map(|c| c.auto_mode).unwrap_or_default();
+            let resolved_prompt = resolve_initial_prompt(desc.initial_prompt.as_deref(), auto_mode);
             compose_launch(
                 &repo,
                 session,
-                declaration_launch,
+                desc.launch.as_ref(),
                 resolved_prompt.as_deref(),
             )
         }
@@ -213,31 +227,56 @@ fn start(args: AgentStartArgs) -> anyhow::Result<()> {
     exec_composed(composed)
 }
 
-/// Bootstrap launch: declared agent has no bound session in this
-/// repo. Spawn the bare tool with a seed prompt instructing the
-/// agent to run `clank as <label>`, which creates the skeleton +
-/// session binding. Subsequent `clank agent start <label>` calls
-/// resume normally.
-///
-/// Plan: `agent-start-bootstraps-missing-skeleton`.
+/// Find an agent's resolved `AgentDescription` in the registered
+/// set, whether it's the master or a reviewer in either tier.
+fn find_in_set(
+    set: &crate::cli::teams_config::RegisteredSet,
+    label: &AgentLabel,
+) -> Option<AgentDescription> {
+    if &set.master == label {
+        return Some(set.master_desc.clone());
+    }
+    set.commit_reviewers
+        .iter()
+        .chain(set.gate_reviewers.iter())
+        .find(|a| &a.label == label)
+        .map(|a| a.desc.clone())
+}
+
+fn registered_labels(set: &crate::cli::teams_config::RegisteredSet) -> Vec<String> {
+    let mut out = vec![set.master.as_str().to_string()];
+    out.extend(
+        set.commit_reviewers
+            .iter()
+            .chain(set.gate_reviewers.iter())
+            .map(|a| a.label.as_str().to_string()),
+    );
+    out
+}
+
+/// Bootstrap launch: a registered agent has no bound session in
+/// this repo. Spawn the tool (from its `AgentDescription`) with a
+/// seed prompt instructing the agent to run `clank as <label>`,
+/// which creates the skeleton + session binding. Subsequent
+/// `clank agent start <label>` calls resume normally.
 fn compose_bootstrap_launch(
-    entry: &crate::cli::config::DefaultAgent,
+    label: &AgentLabel,
+    desc: &AgentDescription,
 ) -> anyhow::Result<ComposedLaunch> {
-    let program = entry
+    let program = desc
         .launch
         .as_ref()
         .and_then(|l| l.command.clone())
-        .or_else(|| entry.tool.map(|t| t.as_str().to_string()))
-        .ok_or_else(|| anyhow::anyhow!(no_bootstrap_tool_message(&entry.label)))?;
+        .unwrap_or_else(|| desc.tool.as_str().to_string());
 
-    let mut args = entry
+    let mut args = desc
         .launch
         .as_ref()
         .map(|l| l.args.clone())
         .unwrap_or_default();
-    args.push(bootstrap_bind_prompt(&entry.label));
+    args.push(bootstrap_bind_prompt(label));
 
-    let env_overrides = entry
+    let env_overrides = desc
         .launch
         .as_ref()
         .map(|l| l.env.clone())
@@ -256,19 +295,6 @@ fn compose_bootstrap_launch(
 /// test deliberately.
 pub(super) fn bootstrap_bind_prompt(label: &AgentLabel) -> String {
     format!("Run `clank as {}` to bind this session.", label.as_str())
-}
-
-fn no_bootstrap_tool_message(label: &AgentLabel) -> String {
-    let name = label.as_str();
-    format!(
-        "agent `{name}` has no bootstrap tool. Either edit \
-         `.clank/agents/{name}/config.json` to add \
-         `\"tool\": \"claude\"` (or `\"codex\"`), or \
-         `default_agents` in `~/.clank/config.json` for a \
-         user-scope default, or remove and re-register: \
-         `clank agent remove {name} && clank agent add {name} \
-         --tool <claude|codex>`."
-    )
 }
 
 /// Composed launch line: executable + argv + env additions.
@@ -433,240 +459,91 @@ fn exec_composed(c: ComposedLaunch) -> anyhow::Result<()> {
     Ok(())
 }
 
-// ── Phase 4 + 5 + 6: clank agent add/remove/set-role ─────────────
+// ── clank agent add / remove / promote (team model) ──────────
 //
-// All three mutate the merged-declaration source of truth:
-// repo-scope `<repo>/.clank/config.json` `agents` (default) or
-// user-scope `~/.clank/config.json` `default_agents` (`--global`).
-// The per-agent skeleton at `<repo>/.clank/agents/<label>/config.json`
-// holds only per-machine state — these commands NEVER write role or
-// launch into the skeleton. See Phase 5 of agent-add-cli-and-repo-scope.
+// `--global` edits user-scope `~/.clank/config.json#/agents`
+// (agent DESCRIPTIONS, reusable across teams). Repo-scope edits
+// THIS repo's `team` array (local entries). `promote` writes the
+// repo `promoted` field. Per-agent skeletons hold only state
+// (session / auto_mode / wfw_timeout) — never declaration.
 
 /// `clank agent add <label> [...]`.
 fn add(args: AgentAddArgs) -> anyhow::Result<()> {
     let label = AgentLabel::parse(&args.label)
         .map_err(|e| anyhow::anyhow!("invalid agent label `{}`: {e}", args.label))?;
-    let role: Role = args.role.into();
-    let tool: Tool = args.tool.into();
-
     let repo = resolve_repo(args.repo.as_deref())?;
-    let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
-
     let env = parse_env_overrides(&args.launch_envs)?;
     let launch = build_launch(args.launch_cmd, args.launch_args, env);
 
-    let entry = DefaultAgent {
-        label: label.clone(),
-        role,
-        tool: Some(tool),
-        launch,
-        initial_prompt: args.initial_prompt.clone(),
-    };
-
-    // Pre-checks (in-memory, no writes yet). Use declaration-only
-    // loaders — legacy skeleton fallback would conflate
-    // pre-existing skeletons with explicit registrations and
-    // refuse adds the user actually wants. Codex review of da71c84
-    // drove the explicit declared-vs-merged split.
-    let repo_set = crate::cli::config::load_repo_agents(&repo)?;
-    let user_set = crate::cli::config::load_default_agents(home.as_deref())?;
-    let in_repo = repo_set
-        .as_ref()
-        .map(|set| set.iter().any(|e| e.label == label))
-        .unwrap_or(false);
-    let in_user = user_set.iter().any(|e| e.label == label);
-    // Plan: teams-based-agent-registration (codex ce72b30 catch).
-    // During the dual-write transition, the new `agents` map
-    // is a valid shape on its own (a user who declared
-    // entries via hand-edited config + later runs of phase 5
-    // adds without the legacy field). The pre-check must
-    // consult BOTH schemas; checking only `default_agents`
-    // would let a label that exists in new-schema `agents`
-    // pass the gate, then `write_new_user_agents_entry`'s
-    // unconditional `agents.insert` would silently overwrite
-    // the existing description.
-    let in_user_new_schema = home
-        .as_deref()
-        .map(|h| read_new_user_agents_map(h).map(|m| m.contains_key(&label)))
-        .transpose()?
-        .unwrap_or(false);
-
     if args.global {
-        // User-scope add: refuse if label exists in EITHER
-        // schema in user-scope OR in repo-scope (cross-scope
-        // ambiguity).
-        if in_user {
-            anyhow::bail!(
-                "agent `{}` already in user-scope `default_agents`",
-                args.label
-            );
-        }
-        if in_user_new_schema {
-            anyhow::bail!(
-                "agent `{}` already in user-scope `agents` map (new schema). \
-                 Remove the existing declaration first, or pick a different label.",
-                args.label
-            );
-        }
-        if in_repo {
-            anyhow::bail!(
-                "agent `{}` is registered in repo-scope `agents` for this repo; \
-                 adding it to user-scope would produce ambiguous merge behavior. \
-                 Remove the repo-scope entry first or pick a different label.",
-                args.label
-            );
-        }
+        let tool: Tool = args
+            .tool
+            .ok_or_else(|| anyhow::anyhow!("--global add requires --tool <claude|codex>"))?
+            .into();
+        let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
         let home_ref = home
             .as_deref()
             .ok_or_else(|| anyhow::anyhow!("--global requires $HOME"))?;
         let mut file = read_user_config(home_ref)?;
-        let mut agents = file.default_agents.unwrap_or_default();
-        agents.push(entry.clone());
-        // Plan: agent-promote-replaces-set-role — `add --role
-        // master` enforces the same unique-master invariant as
-        // `promote`. Reuses the shared helper so both paths
-        // centralize the check.
-        let demoted = if role == Role::Master {
-            ensure_unique_master(&mut agents, &label)
-        } else {
-            Vec::new()
-        };
-        file.default_agents = Some(agents);
-        write_user_config(home_ref, &file)?;
-
-        // Plan: teams-based-agent-registration (phase 5).
-        // Dual-write the new user-scope `agents` map so
-        // `clank team add`/`set-master` (which read the new
-        // schema) can reference this label. The new map is
-        // also keyed by label, but the description shape is
-        // purely declarative (no role — roles live per-team
-        // now). Phase 6 cuts over read paths and drops the
-        // `default_agents` write here.
-        write_new_user_agents_entry(home_ref, &label, tool, &entry)?;
-
-        eprintln!(
-            "registered `{}` in user-scope `default_agents`{}",
-            args.label,
-            format_demoted_suffix(&demoted)
-        );
-    } else {
-        // Repo-scope add (plan: agents-declaration-is-user-local):
-        // writes the per-agent skeleton directly. No `.clank/config.json#/agents`
-        // block anymore — skeleton presence IS registration.
-        //
-        // Codex 182cf05 catch: if the repo still has the legacy
-        // `agents` block in `.clank/config.json`, that block shadows
-        // skeleton mutations in `load_merged_agents`. Migrate it
-        // out now before writing — idempotent if already migrated.
-        // Without this, `clank agent list` after `agent add` would
-        // show the stale legacy block, not the newly-added skeleton.
-        crate::cli::init::migrate_legacy_agents_block(&repo)?;
-        let skeleton_existed = load_agent_config(&repo, &label)?.is_some();
-        if skeleton_existed {
+        if file.agents.contains_key(&label) {
             anyhow::bail!(
-                "agent `{}` already registered (skeleton at .clank/agents/{}/config.json exists)",
-                args.label,
+                "agent `{}` already declared in user-scope `agents`",
                 args.label
             );
         }
-        // Write the new skeleton with declaration fields populated.
-        let mut new_cfg = AgentConfig {
-            role,
-            tool: Some(tool),
-            launch: entry.launch.clone(),
-            initial_prompt: entry.initial_prompt.clone(),
-            ..AgentConfig::default()
-        };
-        save_agent_config(&repo, &label, &new_cfg)?;
-        // Multi-master invariant: demote any other masters.
-        let demoted = if role == Role::Master {
-            ensure_unique_master_via_skeletons(&repo, &label)?
-        } else {
-            Vec::new()
-        };
-        // 0→1 transition: delete the explicit-empty sentinel if it
-        // existed. Codex 861c364 catch — the sentinel's whole
-        // point is "no agents intended"; once the user registers
-        // one, the intent is reversed.
-        let sentinel_existed = clear_empty_sentinel(&repo)?;
-        // The new_cfg may need re-saving if ensure_unique_master demoted
-        // the agent we just added? No — we set role explicitly above; the
-        // helper only demotes OTHERS. But if --role master AND no other
-        // master existed, demoted is empty and skeleton is fine.
-        let _ = &mut new_cfg; // silence: kept for symmetry / future use.
-        if in_user {
-            eprintln!(
-                "note: repo-scope `{}` shadows user-scope default",
-                args.label
-            );
+        file.agents.insert(
+            label.clone(),
+            AgentDescription {
+                tool,
+                launch,
+                initial_prompt: args.initial_prompt.clone(),
+            },
+        );
+        write_user_config(home_ref, &file)?;
+        eprintln!("declared `{}` in user-scope `agents`", args.label);
+    } else {
+        // Repo-scope: append a local entry to this repo's `team`
+        // array.
+        let mut repo_cfg = read_repo_config(&repo)?;
+        let existing = repo_cfg.team.take().ok_or_else(|| {
+            anyhow::anyhow!(
+                "this repo has no team set. Run `clank init --team <name>` before adding local agents."
+            )
+        })?;
+        let mut entries = team_field_into_entries(existing);
+        if team_entries_contain(&entries, &label) {
+            anyhow::bail!("agent `{}` is already in this repo's team", args.label);
         }
-        if sentinel_existed {
-            eprintln!("note: cleared `.clank/agents/.empty` sentinel (no longer an empty repo)");
-        }
+        let review = args
+            .review
+            .map(ReviewKind::from)
+            .unwrap_or(ReviewKind::Commit);
+        let entry = match args.tool {
+            Some(tool_arg) => TeamEntry::Inline(InlineAgent {
+                label: label.clone(),
+                tool: tool_arg.into(),
+                launch,
+                initial_prompt: args.initial_prompt.clone(),
+                role: None,
+                review: Some(review),
+            }),
+            None => TeamEntry::ByName(ByNameEntry {
+                agent: label.clone(),
+                review: Some(review),
+            }),
+        };
+        entries.push(entry);
+        repo_cfg.team = Some(TeamField::Array(entries));
+        write_repo_config(&repo, &repo_cfg)?;
         eprintln!(
-            "registered `{}` in repo-scope agents (skeleton .clank/agents/{}/config.json){}",
+            "added `{}` to this repo's team as a `{}` reviewer",
             args.label,
-            args.label,
-            format_demoted_suffix(&demoted)
+            match review {
+                ReviewKind::Commit => "commit",
+                ReviewKind::Gate => "gate",
+            }
         );
     }
-    Ok(())
-}
-
-/// Read each skeleton at `<repo>/.clank/agents/*/config.json`,
-/// set the matching skeleton's role to Master, demote every
-/// OTHER Master-role skeleton to Reviewer, and write each
-/// mutated skeleton back. Per-file atomic via save_agent_config;
-/// N writes non-transactional across files (pinned per codex
-/// 861c364 — partial state is idempotently recoverable via
-/// re-run).
-///
-/// Returns the labels that were demoted (for the diagnostic).
-fn ensure_unique_master_via_skeletons(
-    repo: &Path,
-    new_master: &AgentLabel,
-) -> anyhow::Result<Vec<AgentLabel>> {
-    let entries = crate::cli::config::load_skeleton_agents(repo)?;
-    let mut demoted = Vec::new();
-    for entry in &entries {
-        if entry.label == *new_master {
-            if entry.role != Role::Master {
-                let mut cfg = load_agent_config(repo, &entry.label)?
-                    .expect("skeleton listed by load_skeleton_agents must exist");
-                cfg.role = Role::Master;
-                save_agent_config(repo, &entry.label, &cfg)?;
-            }
-        } else if entry.role == Role::Master {
-            let mut cfg = load_agent_config(repo, &entry.label)?
-                .expect("skeleton listed by load_skeleton_agents must exist");
-            cfg.role = Role::Reviewer;
-            save_agent_config(repo, &entry.label, &cfg)?;
-            demoted.push(entry.label.clone());
-        }
-    }
-    Ok(demoted)
-}
-
-/// Remove the `.clank/agents/.empty` sentinel if it exists.
-/// Returns true iff the file was actually removed.
-fn clear_empty_sentinel(repo: &Path) -> anyhow::Result<bool> {
-    let path = crate::cli::config::empty_sentinel_path(repo);
-    if !path.is_file() {
-        return Ok(false);
-    }
-    std::fs::remove_file(&path).map_err(|e| anyhow::anyhow!("removing {}: {e}", path.display()))?;
-    Ok(true)
-}
-
-/// Write the `.clank/agents/.empty` sentinel as a zero-byte
-/// marker. Idempotent.
-fn write_empty_sentinel(repo: &Path) -> anyhow::Result<()> {
-    let path = crate::cli::config::empty_sentinel_path(repo);
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|e| anyhow::anyhow!("creating {}: {e}", parent.display()))?;
-    }
-    std::fs::write(&path, b"").map_err(|e| anyhow::anyhow!("writing {}: {e}", path.display()))?;
     Ok(())
 }
 
@@ -675,199 +552,109 @@ fn remove(args: AgentRemoveArgs) -> anyhow::Result<()> {
     let label = AgentLabel::parse(&args.label)
         .map_err(|e| anyhow::anyhow!("invalid agent label `{}`: {e}", args.label))?;
     let repo = resolve_repo(args.repo.as_deref())?;
-    let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
 
     if args.global {
+        let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
         let home_ref = home
             .as_deref()
             .ok_or_else(|| anyhow::anyhow!("--global requires $HOME"))?;
         let mut file = read_user_config(home_ref)?;
-        let mut agents = file.default_agents.ok_or_else(|| {
-            anyhow::anyhow!("agent `{}` not in user-scope `default_agents`", args.label)
-        })?;
-        let before = agents.len();
-        agents.retain(|e| e.label != label);
-        if agents.len() == before {
-            anyhow::bail!("agent `{}` not in user-scope `default_agents`", args.label);
+        if file.agents.remove(&label).is_none() {
+            anyhow::bail!("agent `{}` not in user-scope `agents`", args.label);
         }
-        // Empty list collapses to `None` so the key drops out of
-        // the JSON (Option's skip_serializing_if).
-        file.default_agents = if agents.is_empty() {
-            None
-        } else {
-            Some(agents)
-        };
+        // Scrub the label from every team composition so no
+        // dangling reference survives (it would error at
+        // resolution time otherwise).
+        let mut touched = Vec::new();
+        for (name, team) in file.teams.iter_mut() {
+            let before = team.commit_reviewers.len()
+                + team.gate_reviewers.len()
+                + usize::from(team.master.is_some());
+            if team.master.as_ref() == Some(&label) {
+                team.master = None;
+            }
+            team.commit_reviewers.retain(|l| l != &label);
+            team.gate_reviewers.retain(|l| l != &label);
+            let after = team.commit_reviewers.len()
+                + team.gate_reviewers.len()
+                + usize::from(team.master.is_some());
+            if before != after {
+                touched.push(name.clone());
+            }
+        }
         write_user_config(home_ref, &file)?;
-        eprintln!("removed `{}` from user-scope `default_agents`", args.label);
-    } else {
-        // Repo-scope remove (plan: agents-declaration-is-user-local).
-        // Deletes the per-agent skeleton config.json. The dir's
-        // feedback/ subdir is preserved (review history stays).
-        //
-        // Codex 182cf05 catch: migrate any legacy block before
-        // operating so the skeleton view becomes the truth.
-        crate::cli::init::migrate_legacy_agents_block(&repo)?;
-        let cfg_path = agent_config_path(&repo, &label);
-        if !cfg_path.is_file() {
-            anyhow::bail!(
-                "agent `{}` not registered in this repo (no .clank/agents/{}/config.json)",
+        if touched.is_empty() {
+            eprintln!("removed `{}` from user-scope `agents`", args.label);
+        } else {
+            eprintln!(
+                "removed `{}` from user-scope `agents` (and from teams: {})",
                 args.label,
+                touched.join(", ")
+            );
+        }
+    } else {
+        let mut repo_cfg = read_repo_config(&repo)?;
+        let existing = repo_cfg
+            .team
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("this repo has no team set; nothing to remove"))?;
+        let entries = team_field_into_entries(existing);
+        let before = entries.len();
+        let kept: Vec<TeamEntry> = entries
+            .into_iter()
+            .filter(|e| !team_entry_matches(e, &label))
+            .collect();
+        if kept.len() == before {
+            anyhow::bail!(
+                "agent `{}` is not a local entry in this repo's team",
                 args.label
             );
         }
-        std::fs::remove_file(&cfg_path)
-            .map_err(|e| anyhow::anyhow!("removing {}: {e}", cfg_path.display()))?;
-        // N→0 transition: write the .empty sentinel to preserve
-        // the no-fallback intent. Codex 828207c catch — without
-        // this, removing the last agent silently re-exposes
-        // user-scope defaults.
-        let remaining = crate::cli::config::load_skeleton_agents(&repo)?;
-        let wrote_sentinel = if remaining.is_empty() {
-            write_empty_sentinel(&repo)?;
-            true
-        } else {
-            false
-        };
-        if wrote_sentinel {
-            eprintln!(
-                "wrote `.clank/agents/.empty` sentinel (repo now has zero agents; user-scope fallback suppressed)"
-            );
-        }
-        eprintln!(
-            "removed `{}` from repo-scope agents (per-agent feedback preserved)",
-            args.label
-        );
+        repo_cfg.team = Some(TeamField::Array(kept));
+        write_repo_config(&repo, &repo_cfg)?;
+        eprintln!("removed `{}` from this repo's team", args.label);
     }
     Ok(())
 }
 
-/// Set `new_master`'s role to `Master` and demote every OTHER
-/// entry with `Role::Master` to `Reviewer`. Returns the labels
-/// that were demoted (caller uses these for the diagnostic).
-///
-/// One sweep over the slice. No I/O. This is the single
-/// enforcement point for the "exactly one master per scope"
-/// invariant — `promote` and `add --role master` both go through
-/// it (plan: `agent-promote-replaces-set-role`).
-pub(super) fn ensure_unique_master(
-    agents: &mut [DefaultAgent],
-    new_master: &AgentLabel,
-) -> Vec<AgentLabel> {
-    let mut demoted = Vec::new();
-    for entry in agents.iter_mut() {
-        if entry.label == *new_master {
-            entry.role = Role::Master;
-        } else if entry.role == Role::Master {
-            entry.role = Role::Reviewer;
-            demoted.push(entry.label.clone());
+/// Expand a `TeamField` into its entry list. A `Single(name)`
+/// string is sugar for a one-element `[Include(name)]` array.
+fn team_field_into_entries(field: TeamField) -> Vec<TeamEntry> {
+    match field {
+        TeamField::Single(name) => {
+            vec![TeamEntry::Include(crate::cli::teams_config::IncludeEntry {
+                include: name,
+            })]
         }
-    }
-    demoted
-}
-
-fn format_demoted_suffix(demoted: &[AgentLabel]) -> String {
-    if demoted.is_empty() {
-        String::new()
-    } else {
-        let joined = demoted
-            .iter()
-            .map(|l| format!("`{}`", l.as_str()))
-            .collect::<Vec<_>>()
-            .join(", ");
-        format!(" (demoted {joined})")
+        TeamField::Array(v) => v,
     }
 }
 
-/// `clank agent promote <label> [--global]`.
+/// True if any entry in the array references `label` (by-name,
+/// inline, or bare string — Include entries name a team, not an
+/// agent, so they never match).
+fn team_entries_contain(entries: &[TeamEntry], label: &AgentLabel) -> bool {
+    entries.iter().any(|e| team_entry_matches(e, label))
+}
+
+fn team_entry_matches(entry: &TeamEntry, label: &AgentLabel) -> bool {
+    match entry {
+        TeamEntry::Include(_) => false,
+        TeamEntry::ByName(b) => &b.agent == label,
+        TeamEntry::Inline(i) => &i.label == label,
+        TeamEntry::BareString(l) => l == label,
+    }
+}
+
+/// `clank agent promote <label>` — repo-scope master designation
+/// via the `promoted` field. Team-level master changes go through
+/// `clank team set-master`.
 fn promote(args: AgentPromoteArgs) -> anyhow::Result<()> {
     let label = AgentLabel::parse(&args.label)
         .map_err(|e| anyhow::anyhow!("invalid agent label `{}`: {e}", args.label))?;
     let repo = resolve_repo(args.repo.as_deref())?;
-    let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
-
-    if args.global {
-        let home_ref = home
-            .as_deref()
-            .ok_or_else(|| anyhow::anyhow!("--global requires $HOME"))?;
-        let mut file = read_user_config(home_ref)?;
-        let mut agents = file.default_agents.ok_or_else(|| {
-            anyhow::anyhow!("agent `{}` not in user-scope `default_agents`", args.label)
-        })?;
-        if !agents.iter().any(|e| e.label == label) {
-            anyhow::bail!("agent `{}` not in user-scope `default_agents`", args.label);
-        }
-        // Detect no-op BEFORE mutating: target is already the only
-        // master in this scope.
-        let already_only_master = agents
-            .iter()
-            .all(|e| (e.label == label) == (e.role == Role::Master));
-        if already_only_master {
-            eprintln!(
-                "note: `{}` is already the only master in user-scope",
-                args.label
-            );
-            return Ok(());
-        }
-        let demoted = ensure_unique_master(&mut agents, &label);
-        file.default_agents = Some(agents);
-        write_user_config(home_ref, &file)?;
-        eprintln!(
-            "promoted `{}` to master in user-scope{}",
-            args.label,
-            format_demoted_suffix(&demoted)
-        );
-    } else {
-        // Plan: teams-based-agent-registration (phase 6c).
-        // Dispatch: if the repo has a `team` field set (new
-        // model), write the `promoted` field to the repo
-        // config. The new resolver applies promoted as a
-        // per-repo master designation — the team's user-scope
-        // master config is left untouched.
-        //
-        // Otherwise fall through to the legacy
-        // skeleton-mutation path (unchanged).
-        if write_repo_promoted_field_if_team_set(&repo, &label)? {
-            return Ok(());
-        }
-
-        // Repo-scope promote (plan: agents-declaration-is-user-local).
-        // Operates on per-agent skeletons; ensure_unique_master_via_skeletons
-        // writes one file per affected agent (atomic per-file,
-        // non-transactional across files — pinned per codex 861c364).
-        //
-        // Codex 182cf05 catch: migrate the legacy block before
-        // reading skeletons so mutations land in the source of
-        // truth and aren't shadowed by the stale block.
-        crate::cli::init::migrate_legacy_agents_block(&repo)?;
-        let entries = crate::cli::config::load_skeleton_agents(&repo)?;
-        if entries.is_empty() {
-            anyhow::bail!(
-                "no agents registered in this repo; nothing to promote in. Run `clank agent add` first."
-            );
-        }
-        if !entries.iter().any(|e| e.label == label) {
-            anyhow::bail!(
-                "agent `{}` not registered in this repo (no .clank/agents/{}/config.json)",
-                args.label,
-                args.label
-            );
-        }
-        let already_only_master = entries
-            .iter()
-            .all(|e| (e.label == label) == (e.role == Role::Master));
-        if already_only_master {
-            eprintln!(
-                "note: `{}` is already the only master in repo-scope",
-                args.label
-            );
-            return Ok(());
-        }
-        let demoted = ensure_unique_master_via_skeletons(&repo, &label)?;
-        eprintln!(
-            "promoted `{}` to master in repo-scope{}",
-            args.label,
-            format_demoted_suffix(&demoted)
-        );
+    if !write_repo_promoted_field_if_team_set(&repo, &label)? {
+        anyhow::bail!("this repo has no team configured. Run `clank init --team <name>` first.");
     }
     Ok(())
 }
@@ -1031,65 +818,22 @@ fn write_user_config(home: &Path, file: &UserConfigFile) -> anyhow::Result<()> {
     write_typed_config(&home.join(".clank/config.json"), file)
 }
 
-/// Plan: teams-based-agent-registration (phase 5).
-///
-/// Read-only inspection of the new-schema `agents` map for the
-/// duplicate pre-check in `clank agent add --global`. Returns
-/// an empty map if the file doesn't exist.
-fn read_new_user_agents_map(
-    home: &Path,
-) -> anyhow::Result<
-    std::collections::BTreeMap<AgentLabel, crate::cli::teams_config::AgentDescription>,
-> {
-    use crate::cli::teams_config::UserConfigFile as NewUserConfigFile;
-    let path = home.join(".clank/config.json");
-    let file: NewUserConfigFile = match std::fs::read_to_string(&path) {
-        Ok(s) => serde_json::from_str(&s)
-            .with_context(|| format!("parsing {} as new-schema UserConfigFile", path.display()))?,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => NewUserConfigFile::default(),
-        Err(e) => return Err(anyhow::Error::from(e).context(format!("reading {}", path.display()))),
-    };
-    Ok(file.agents)
+/// Read `<repo>/.clank/config.json` as the typed
+/// [`RepoConfigFile`]. Missing file → default; malformed JSON →
+/// error.
+fn read_repo_config(repo: &Path) -> anyhow::Result<RepoConfigFile> {
+    let path = repo.join(".clank/config.json");
+    match std::fs::read_to_string(&path) {
+        Ok(s) => serde_json::from_str(&s).with_context(|| format!("parsing {}", path.display())),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(RepoConfigFile::default()),
+        Err(e) => Err(anyhow::Error::from(e).context(format!("reading {}", path.display()))),
+    }
 }
 
-/// Plan: teams-based-agent-registration (phase 5).
-///
-/// Dual-write helper: after `clank agent add --global` writes
-/// to the legacy `default_agents`, this helper opens the same
-/// file via the NEW `teams_config::UserConfigFile` schema and
-/// inserts the agent description into the new `agents` map. The
-/// old `default_agents` field round-trips through the new
-/// schema's `extra` flatten catchall.
-///
-/// Both schemas have non-overlapping required fields:
-/// - Old: `default_agents`. New: `agents`, `teams`.
-/// - The `extra` catchall on each preserves the other's fields
-///   on round-trip.
-///
-/// Phase 6 will swap callers from the old schema to the new
-/// schema and remove this dual-write — `default_agents` becomes
-/// unused legacy at that point.
-fn write_new_user_agents_entry(
-    home: &Path,
-    label: &AgentLabel,
-    tool: Tool,
-    entry: &DefaultAgent,
-) -> anyhow::Result<()> {
-    use crate::cli::teams_config::{AgentDescription, UserConfigFile as NewUserConfigFile};
-    let path = home.join(".clank/config.json");
-    let mut file: NewUserConfigFile = match std::fs::read_to_string(&path) {
-        Ok(s) => serde_json::from_str(&s)
-            .with_context(|| format!("parsing {} as new-schema UserConfigFile", path.display()))?,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => NewUserConfigFile::default(),
-        Err(e) => return Err(anyhow::Error::from(e).context(format!("reading {}", path.display()))),
-    };
-    let desc = AgentDescription {
-        tool,
-        launch: entry.launch.clone(),
-        initial_prompt: entry.initial_prompt.clone(),
-    };
-    file.agents.insert(label.clone(), desc);
-    write_typed_config(&path, &file)
+/// Atomic write of `<repo>/.clank/config.json`. The `extra`
+/// flatten catchall preserves unknown sections on round-trip.
+fn write_repo_config(repo: &Path, file: &RepoConfigFile) -> anyhow::Result<()> {
+    write_typed_config(&repo.join(".clank/config.json"), file)
 }
 
 fn write_typed_config<T: serde::Serialize>(path: &Path, value: &T) -> anyhow::Result<()> {
@@ -1141,45 +885,6 @@ mod tests {
             tool: Tool::Codex,
             updated_at: "2026-06-04T12:00:00Z".to_string(),
         }
-    }
-
-    #[test]
-    fn write_new_user_agents_entry_preserves_legacy_default_agents() {
-        // Plan: teams-based-agent-registration (phase 5 dual-write).
-        // Old `default_agents` written by the legacy code path
-        // must round-trip through the new schema's `extra`
-        // catchall so the post-add file still has both shapes.
-        let dir = tempfile::tempdir().unwrap();
-        let home = dir.path();
-        let cfg_path = home.join(".clank/config.json");
-        std::fs::create_dir_all(cfg_path.parent().unwrap()).unwrap();
-        std::fs::write(
-            &cfg_path,
-            r#"{"default_agents":[{"label":"existing","role":"reviewer","tool":"claude"}]}"#,
-        )
-        .unwrap();
-
-        let label = AgentLabel::parse("claude").unwrap();
-        let entry = DefaultAgent {
-            label: label.clone(),
-            role: Role::Reviewer,
-            tool: Some(Tool::Claude),
-            launch: None,
-            initial_prompt: None,
-        };
-        write_new_user_agents_entry(home, &label, Tool::Claude, &entry).unwrap();
-
-        // Re-read the file via the new schema and confirm
-        // BOTH the new `agents` map AND the legacy
-        // `default_agents` field are preserved.
-        let body = std::fs::read_to_string(&cfg_path).unwrap();
-        let new_cfg: crate::cli::teams_config::UserConfigFile =
-            serde_json::from_str(&body).unwrap();
-        assert!(new_cfg.agents.contains_key(&label));
-        assert_eq!(new_cfg.agents.get(&label).unwrap().tool, Tool::Claude);
-        // Legacy field is in extra (the new schema doesn't know
-        // about default_agents directly).
-        assert!(new_cfg.extra.contains_key("default_agents"));
     }
 
     #[test]
@@ -1458,91 +1163,6 @@ mod tests {
     }
 
     #[test]
-    fn read_new_user_agents_map_detects_existing_new_schema_label() {
-        // Codex ce72b30 catch: during the dual-write
-        // transition, the new `agents` map is a valid shape on
-        // its own. The pre-check in `add` must detect labels
-        // declared via that map even when `default_agents`
-        // doesn't list them, OR `write_new_user_agents_entry`'s
-        // unconditional `insert` would silently overwrite the
-        // existing description.
-        let dir = tempfile::tempdir().unwrap();
-        let home = dir.path();
-        let cfg_path = home.join(".clank/config.json");
-        std::fs::create_dir_all(cfg_path.parent().unwrap()).unwrap();
-        // File has only the new-schema `agents` map populated
-        // (no `default_agents` field). This simulates a user
-        // who hand-edited their config or who'll only ever use
-        // the new path going forward.
-        std::fs::write(&cfg_path, r#"{"agents":{"claude":{"tool":"claude"}}}"#).unwrap();
-
-        let map = read_new_user_agents_map(home).unwrap();
-        let label = AgentLabel::parse("claude").unwrap();
-        assert!(
-            map.contains_key(&label),
-            "new-schema agents map should contain claude; got {map:?}"
-        );
-    }
-
-    #[test]
-    fn read_new_user_agents_map_returns_empty_when_no_file() {
-        // Pre-check shouldn't blow up on a fresh repo with no
-        // user-scope config.
-        let dir = tempfile::tempdir().unwrap();
-        let map = read_new_user_agents_map(dir.path()).unwrap();
-        assert!(map.is_empty());
-    }
-
-    #[test]
-    fn read_new_user_agents_map_returns_empty_when_default_agents_only() {
-        // The fallback case the prior pre-check covered. The
-        // new-schema check should NOT flag a label that only
-        // exists in legacy `default_agents`.
-        let dir = tempfile::tempdir().unwrap();
-        let home = dir.path();
-        let cfg_path = home.join(".clank/config.json");
-        std::fs::create_dir_all(cfg_path.parent().unwrap()).unwrap();
-        std::fs::write(
-            &cfg_path,
-            r#"{"default_agents":[{"label":"codex","role":"reviewer","tool":"codex"}]}"#,
-        )
-        .unwrap();
-        let map = read_new_user_agents_map(home).unwrap();
-        assert!(
-            map.is_empty(),
-            "new-schema agents map should be empty when only default_agents present; got {map:?}"
-        );
-    }
-
-    #[test]
-    fn write_new_user_agents_entry_round_trips_via_team_cli_view() {
-        // The whole point of the dual-write: after
-        // `clank agent add --global`, the new `agents` map is
-        // populated so `clank team add` can validate the
-        // reference. This test confirms the file shape is
-        // consumable by the team CLI's reader.
-        let dir = tempfile::tempdir().unwrap();
-        let home = dir.path();
-        let label = AgentLabel::parse("codex").unwrap();
-        let entry = DefaultAgent {
-            label: label.clone(),
-            role: Role::Reviewer,
-            tool: Some(Tool::Codex),
-            launch: None,
-            initial_prompt: None,
-        };
-        write_new_user_agents_entry(home, &label, Tool::Codex, &entry).unwrap();
-
-        let body = std::fs::read_to_string(home.join(".clank/config.json")).unwrap();
-        let new_cfg: crate::cli::teams_config::UserConfigFile =
-            serde_json::from_str(&body).unwrap();
-        let desc = new_cfg.agents.get(&label).unwrap();
-        assert_eq!(desc.tool, Tool::Codex);
-        assert!(desc.launch.is_none());
-        assert!(desc.initial_prompt.is_none());
-    }
-
-    #[test]
     fn compose_launch_appends_initial_prompt_when_set() {
         let s = claude_session();
         let c = compose_launch(Path::new("/repo"), &s, None, Some("custom prompt"));
@@ -1626,13 +1246,8 @@ mod tests {
     // ── compose_bootstrap_launch policy tests ─────────────────
     // Plan: agent-start-bootstraps-missing-skeleton.
 
-    fn entry_with(
-        tool: Option<Tool>,
-        launch: Option<LaunchConfig>,
-    ) -> crate::cli::config::DefaultAgent {
-        crate::cli::config::DefaultAgent {
-            label: label("phantom"),
-            role: clank_core::vocab::Role::Reviewer,
+    fn desc_with(tool: Tool, launch: Option<LaunchConfig>) -> AgentDescription {
+        AgentDescription {
             tool,
             launch,
             initial_prompt: None,
@@ -1640,16 +1255,16 @@ mod tests {
     }
 
     #[test]
-    fn bootstrap_uses_tool_from_declaration() {
-        let entry = entry_with(
-            Some(Tool::Claude),
+    fn bootstrap_uses_tool_from_description() {
+        let desc = desc_with(
+            Tool::Claude,
             Some(LaunchConfig {
                 command: None,
                 args: vec!["--skill".into(), "ruthless".into()],
                 env: Default::default(),
             }),
         );
-        let composed = compose_bootstrap_launch(&entry).expect("compose");
+        let composed = compose_bootstrap_launch(&label("phantom"), &desc).expect("compose");
         assert_eq!(composed.program, "claude");
         assert_eq!(
             composed.args,
@@ -1663,46 +1278,28 @@ mod tests {
 
     #[test]
     fn bootstrap_prefers_launch_command_over_tool() {
-        let entry = entry_with(
-            Some(Tool::Claude),
+        let desc = desc_with(
+            Tool::Claude,
             Some(LaunchConfig {
                 command: Some("my-claude-wrapper".into()),
                 args: vec![],
                 env: Default::default(),
             }),
         );
-        let composed = compose_bootstrap_launch(&entry).expect("compose");
+        let composed = compose_bootstrap_launch(&label("phantom"), &desc).expect("compose");
         // launch.command wins; tool=claude is only the fallback.
         assert_eq!(composed.program, "my-claude-wrapper");
     }
 
     #[test]
-    fn bootstrap_errors_when_no_tool_or_command() {
-        let entry = entry_with(None, None);
-        let err = compose_bootstrap_launch(&entry).expect_err("must error");
-        let msg = format!("{err}");
-        assert!(msg.contains("phantom"), "error names the label: {msg}");
-        assert!(
-            msg.contains("tool") && (msg.contains("claude") || msg.contains("codex")),
-            "error mentions tool fix: {msg}"
-        );
-        // Plan agents-declaration-is-user-local: the `tool`
-        // field now lives on the per-agent skeleton at
-        // `.clank/agents/<label>/config.json` (codex 9c431de's
-        // "edit the declaration" hint was correct for the prior
-        // model; now the declaration IS the skeleton). The
-        // user-scope path is the secondary option.
-        assert!(
-            msg.contains(".clank/agents/phantom/config.json"),
-            "error must point at the per-agent skeleton (the new declaration home); got: {msg}"
-        );
-        assert!(
-            msg.contains("~/.clank/config.json"),
-            "error must also mention user-scope path as an alternative; got: {msg}"
-        );
-        assert!(
-            msg.contains("clank agent remove") && msg.contains("clank agent add"),
-            "error gives the remove-and-re-add path; got: {msg}"
+    fn bootstrap_falls_back_to_tool_when_no_launch_command() {
+        // No launch profile at all → program is the tool name.
+        let desc = desc_with(Tool::Codex, None);
+        let composed = compose_bootstrap_launch(&label("phantom"), &desc).expect("compose");
+        assert_eq!(composed.program, "codex");
+        assert_eq!(
+            composed.args,
+            vec!["Run `clank as phantom` to bind this session.".to_string()]
         );
     }
 
@@ -1726,29 +1323,32 @@ mod tests {
         let session = make_session();
         let row = AgentRow::from_join(
             &label("alice"),
-            Role::Reviewer,
-            Some(Tool::Codex), // declared tool (overridden by session)
+            "reviewer",
+            "commit",
+            Tool::Codex, // description tool (overridden by session when bound)
             Some(&session),
         );
         assert_eq!(row.label, "alice");
         assert_eq!(row.role, "reviewer");
+        assert_eq!(row.review, "commit");
         assert!(row.bound);
         assert_eq!(row.tool.as_deref(), Some("claude")); // from session
         assert!(row.session_id.is_some());
     }
 
     #[test]
-    fn agent_row_unbound_uses_declared_tool() {
-        let row = AgentRow::from_join(&label("alice"), Role::Reviewer, Some(Tool::Claude), None);
+    fn agent_row_unbound_uses_description_tool() {
+        let row = AgentRow::from_join(&label("alice"), "reviewer", "gate", Tool::Claude, None);
         assert!(!row.bound);
+        assert_eq!(row.review, "gate");
         assert_eq!(row.tool.as_deref(), Some("claude"));
         assert!(row.session_id.is_none());
     }
 
     #[test]
-    fn agent_row_unbound_no_declared_tool_shows_none() {
-        let row = AgentRow::from_join(&label("alice"), Role::Reviewer, None, None);
-        assert!(!row.bound);
-        assert!(row.tool.is_none());
+    fn agent_row_master_has_no_review_tier() {
+        let row = AgentRow::from_join(&label("boss"), "master", "—", Tool::Claude, None);
+        assert_eq!(row.role, "master");
+        assert_eq!(row.review, "—");
     }
 }

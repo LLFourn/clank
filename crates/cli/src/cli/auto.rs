@@ -14,8 +14,7 @@
 use super::{AutoArgs, AutoCmd, AutoOffArgs, AutoOnArgs, AutoStatusArgs, resolve_repo};
 use crate::agent_env::resolve_identity_from_env;
 use crate::agent_store::{load_agent_config, save_agent_config};
-use clank_core::role_for;
-use clank_core::vocab::{AutoMode, Role};
+use clank_core::vocab::AutoMode;
 
 pub async fn run(args: AutoArgs) -> anyhow::Result<()> {
     match args.command {
@@ -29,15 +28,10 @@ async fn run_on(args: AutoOnArgs) -> anyhow::Result<()> {
     let repo = resolve_repo(args.repo.as_deref())?;
     let label = resolve_identity_from_env(&repo)?;
 
-    let existing = load_agent_config(&repo, &label)?;
-    refuse_if_sentinel_would_create_skeleton(&repo, &label, existing.is_some())?;
-    let mut cfg = existing.unwrap_or_default();
+    let mut cfg = load_agent_config(&repo, &label)?.unwrap_or_default();
     cfg.auto_mode = AutoMode::On;
     if let Some(t) = args.wfw_timeout.as_deref() {
         cfg.wfw_timeout = Some(t.to_string());
-    }
-    if let Some(role_arg) = args.role {
-        cfg.role = role_arg.into();
     }
     save_agent_config(&repo, &label, &cfg)?;
 
@@ -47,7 +41,14 @@ async fn run_on(args: AutoOnArgs) -> anyhow::Result<()> {
         cfg.auto_mode.as_str()
     );
     if args.role.is_some() {
-        println!("  role: {}", cfg.role.as_str());
+        // Plan: teams-based-agent-registration — role is now a
+        // per-team property, not per-agent state. `--role` no
+        // longer writes anything; change roles via
+        // `clank team set-master` / `clank team add` /
+        // `clank promote`.
+        eprintln!(
+            "note: `--role` is ignored; roles are team-derived now (use `clank team set-master` / `clank promote`)"
+        );
     }
     Ok(())
 }
@@ -56,53 +57,17 @@ async fn run_off(args: AutoOffArgs) -> anyhow::Result<()> {
     let repo = resolve_repo(args.repo.as_deref())?;
     let label = resolve_identity_from_env(&repo)?;
 
-    let existing = load_agent_config(&repo, &label)?;
-    refuse_if_sentinel_would_create_skeleton(&repo, &label, existing.is_some())?;
-    let mut cfg = existing.unwrap_or_default();
+    let mut cfg = load_agent_config(&repo, &label)?.unwrap_or_default();
     cfg.auto_mode = AutoMode::Off;
-    if let Some(role_arg) = args.role {
-        cfg.role = role_arg.into();
-    }
     save_agent_config(&repo, &label, &cfg)?;
 
     println!("auto-mode for `{}` set to off", label.as_str());
     if args.role.is_some() {
-        println!("  role: {}", cfg.role.as_str());
+        eprintln!(
+            "note: `--role` is ignored; roles are team-derived now (use `clank team set-master` / `clank promote`)"
+        );
     }
     Ok(())
-}
-
-/// Refuse the auto mutation when the explicit-empty sentinel is
-/// active AND the call would CREATE a new skeleton.
-///
-/// Plan: `agents-declaration-is-user-local` + codex 8f30c5d
-/// catch. The auto path's `unwrap_or_default()` shape silently
-/// creates a hidden skeleton for unregistered agents — under
-/// the sentinel that skeleton would be invisible until a later
-/// `clank agent add` cleared the sentinel and resurrected it.
-///
-/// Mutating an EXISTING skeleton's auto_mode is allowed (no
-/// resurrection risk — the skeleton was already there); creating
-/// one would violate the explicit-empty intent.
-fn refuse_if_sentinel_would_create_skeleton(
-    repo: &std::path::Path,
-    label: &clank_core::ids::AgentLabel,
-    skeleton_exists: bool,
-) -> anyhow::Result<()> {
-    if skeleton_exists {
-        return Ok(());
-    }
-    if !crate::cli::config::empty_sentinel_path(repo).is_file() {
-        return Ok(());
-    }
-    anyhow::bail!(
-        "explicit-empty agents declaration is active \
-         (`.clank/agents/.empty` present); refusing to create a new \
-         skeleton for `{label}` via `clank auto`. To register this \
-         agent, run `clank agent add {label} --tool <claude|codex>` \
-         first (which clears the sentinel as the 0→1 transition).",
-        label = label.as_str(),
-    );
 }
 
 async fn run_status(args: AutoStatusArgs) -> anyhow::Result<()> {
@@ -110,18 +75,18 @@ async fn run_status(args: AutoStatusArgs) -> anyhow::Result<()> {
     let label = resolve_identity_from_env(&repo)?;
 
     let cfg = load_agent_config(&repo, &label)?.unwrap_or_default();
-    // Role resolution prefers the merged declaration (codex review
-    // of da71c84). Fall back to the skeleton's role for pre-Phase-1
-    // repos.
+    // Role is team-derived; best-effort (a repo with no team set
+    // has no resolvable role — show `unknown` rather than error).
     let role = crate::agent_store::resolve_role(&repo, &label)
-        .unwrap_or_else(|_| role_for(&label, Some(&cfg)));
+        .map(|r| r.as_str().to_string())
+        .unwrap_or_else(|_| "unknown (no team configured)".to_string());
 
     if args.json {
         let payload = serde_json::json!({
             "label": label.as_str(),
             "auto_mode": cfg.auto_mode.as_str(),
             "wfw_timeout": cfg.wfw_timeout,
-            "role": role.as_str(),
+            "role": role,
         });
         println!("{}", serde_json::to_string(&payload)?);
     } else {
@@ -131,16 +96,7 @@ async fn run_status(args: AutoStatusArgs) -> anyhow::Result<()> {
             "  wfw_timeout: {}",
             cfg.wfw_timeout.as_deref().unwrap_or("(indefinite)")
         );
-        println!("  role:        {}", role.as_str());
+        println!("  role:        {role}");
     }
     Ok(())
-}
-
-impl From<crate::cli::RoleArg> for Role {
-    fn from(r: crate::cli::RoleArg) -> Self {
-        match r {
-            crate::cli::RoleArg::Master => Role::Master,
-            crate::cli::RoleArg::Reviewer => Role::Reviewer,
-        }
-    }
 }

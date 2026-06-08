@@ -80,15 +80,16 @@ pub async fn build_finish_preview(
     let latest_reviewable_sha = active.and_then(latest_reviewable);
 
     let gate_state = compute_gate(repo_root, latest_reviewable_sha.as_ref())?;
-    let expected_reviewers =
-        crate::agent_store::load_expected_reviewers(repo_root).map_err(PreviewError::AgentLoad)?;
+    let (commit_reviewers, gate_reviewers) =
+        crate::agent_store::load_reviewer_tiers(repo_root).map_err(PreviewError::AgentLoad)?;
+    let any_registered = !commit_reviewers.is_empty() || !gate_reviewers.is_empty();
 
     let readiness = compute_finalize_readiness(
         is_finished,
         latest_reviewable_sha.as_ref(),
         gate_state,
         worktree_status,
-        &expected_reviewers,
+        any_registered,
     );
 
     Ok(FinishPreviewResponse {
@@ -408,7 +409,7 @@ pub fn compute_finalize_readiness(
     latest_reviewable_sha: Option<&CommitSha>,
     gate_state: CommitGateState,
     worktree_status: PlanWorktreeStatus,
-    expected_reviewers: &[clank_core::AgentLabel],
+    any_registered_reviewers: bool,
 ) -> FinalizeReadiness {
     if is_finished {
         return FinalizeReadiness::AlreadyFinished;
@@ -418,8 +419,8 @@ pub fn compute_finalize_readiness(
         reasons.push(FinalizeBlockReason::NoReviewableCommit);
     }
     // Master-only repo: Approved is sufficient for finalize because
-    // the all-Finished rule is unreachable without expected reviewers.
-    if gate_state != CommitGateState::Finished && !expected_reviewers.is_empty() {
+    // the all-Finished rule is unreachable without registered reviewers.
+    if gate_state != CommitGateState::Finished && any_registered_reviewers {
         reasons.push(FinalizeBlockReason::NotFinished { state: gate_state });
     }
     match worktree_status {
@@ -457,15 +458,12 @@ fn compute_gate(
     };
     let reviews = crate::fs_plan_state_lookup::FsPlanStateLookup::new(repo_root, Some(target));
     let entries = reviews.reviews_for(target);
-    let expected_reviewers =
-        crate::agent_store::load_expected_reviewers(repo_root).map_err(PreviewError::AgentLoad)?;
-    // Phase 3 of teams-based-agent-registration: gate-tier
-    // reviewers default to empty until the new resolver wires
-    // them in. Existing behavior preserved via commit-tier.
+    let (commit_reviewers, gate_reviewers) =
+        crate::agent_store::load_reviewer_tiers(repo_root).map_err(PreviewError::AgentLoad)?;
     Ok(clank_core::wait::compute_gate(
         &entries,
-        &expected_reviewers,
-        &[],
+        &commit_reviewers,
+        &gate_reviewers,
     ))
 }
 
@@ -555,13 +553,12 @@ mod tests {
     #[test]
     fn finalize_blocked_on_approved_gate_with_not_finished() {
         let sha = CommitSha::parse(&"a".repeat(40)).unwrap();
-        let codex = clank_core::AgentLabel::parse("codex").unwrap();
         let readiness = compute_finalize_readiness(
             false,
             Some(&sha),
             CommitGateState::Approved,
             PlanWorktreeStatus::Clean,
-            &[codex],
+            true,
         );
         match readiness {
             FinalizeReadiness::Blocked { reasons } => {
@@ -579,13 +576,12 @@ mod tests {
     #[test]
     fn finalize_ready_on_finished_gate() {
         let sha = CommitSha::parse(&"a".repeat(40)).unwrap();
-        let codex = clank_core::AgentLabel::parse("codex").unwrap();
         let readiness = compute_finalize_readiness(
             false,
             Some(&sha),
             CommitGateState::Finished,
             PlanWorktreeStatus::Clean,
-            &[codex],
+            true,
         );
         assert!(matches!(readiness, FinalizeReadiness::Ready));
     }
@@ -593,14 +589,14 @@ mod tests {
     #[test]
     fn finalize_ready_on_approved_gate_when_no_reviewers() {
         // Master-only repo: Approved is sufficient because the
-        // all-Finished rule is unreachable without expected reviewers.
+        // all-Finished rule is unreachable without registered reviewers.
         let sha = CommitSha::parse(&"a".repeat(40)).unwrap();
         let readiness = compute_finalize_readiness(
             false,
             Some(&sha),
             CommitGateState::Approved,
             PlanWorktreeStatus::Clean,
-            &[],
+            false,
         );
         assert!(matches!(readiness, FinalizeReadiness::Ready));
     }

@@ -7,21 +7,28 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::Context;
-use clank_core::vocab::Role;
 
 use super::OpenZellijArgs;
-use super::config::{DefaultAgent, load_merged_agents};
 use super::{repo_basename, resolve_repo};
 
 pub async fn run(args: OpenZellijArgs) -> anyhow::Result<()> {
     let repo = resolve_repo(args.repo.as_deref())?;
     let basename = repo_basename(&repo)?;
-    let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
-    let agents = load_merged_agents(&repo, home.as_deref())
-        .with_context(|| format!("loading agent declaration for `{}`", repo.display()))?;
-    let (master, reviewers) = classify_roles(&agents)?;
+    // Registration is the resolved team set
+    // (`teams-based-agent-registration`): exactly one master plus
+    // its reviewers, no role-triage needed.
+    let Some(set) = crate::agent_store::try_resolve_via_team(&repo)? else {
+        anyhow::bail!("this repo has no team configured. Run `clank init --team <name>` first.");
+    };
+    let master_label = set.master.as_str().to_string();
+    let reviewer_labels: Vec<String> = set
+        .commit_reviewers
+        .iter()
+        .chain(set.gate_reviewers.iter())
+        .map(|a| a.label.as_str().to_string())
+        .collect();
     let repo_path_str = repo.display().to_string();
-    let kdl = compose_kdl(&basename, &repo_path_str, master, &reviewers);
+    let kdl = compose_kdl(&basename, &repo_path_str, &master_label, &reviewer_labels);
     let layout_path = layout_file_path(&repo);
     let spawn_argv = compose_spawn_argv(&layout_path);
 
@@ -90,40 +97,6 @@ fn ensure_gitignore_zellij_entry(repo: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Triage the declaration into (master, reviewers).
-///
-/// - zero masters → error (suggest `clank agent add ... --role master`)
-/// - multiple masters → error (suggest `clank agent promote`)
-/// - exactly one master → ok; reviewers preserve declaration order
-fn classify_roles(agents: &[DefaultAgent]) -> anyhow::Result<(&DefaultAgent, Vec<&DefaultAgent>)> {
-    let masters: Vec<&DefaultAgent> = agents.iter().filter(|a| a.role == Role::Master).collect();
-    match masters.len() {
-        0 => anyhow::bail!(
-            "no master agent registered for this repo — register one with \
-             `clank agent add <label> --role master`"
-        ),
-        1 => {
-            let master = masters[0];
-            let reviewers: Vec<&DefaultAgent> =
-                agents.iter().filter(|a| a.role == Role::Reviewer).collect();
-            Ok((master, reviewers))
-        }
-        _ => {
-            let names: Vec<String> = masters
-                .iter()
-                .map(|a| a.label.as_str().to_string())
-                .collect();
-            anyhow::bail!(
-                "multiple master agents registered: {}. zellij layout requires \
-                 exactly one master. Resolve with `clank agent promote <label>` \
-                 to make exactly one of them master (all OTHERS automatically \
-                 become reviewers).",
-                names.join(", ")
-            )
-        }
-    }
-}
-
 /// Hand-rolled KDL composer. Every interpolated string value goes
 /// through [`kdl_escape`] — codex caught on 818d8be that
 /// `AgentLabel::parse` permits `"`, newlines, control chars,
@@ -136,12 +109,7 @@ fn classify_roles(agents: &[DefaultAgent]) -> anyhow::Result<(&DefaultAgent, Vec
 /// pane's `clank agent start --repo <path>` so the spawned
 /// session's cwd doesn't affect the resolved repo. Codex caught
 /// the gap on 361b104.
-fn compose_kdl(
-    tab_name: &str,
-    repo_path: &str,
-    master: &DefaultAgent,
-    reviewers: &[&DefaultAgent],
-) -> String {
+fn compose_kdl(tab_name: &str, repo_path: &str, master: &str, reviewers: &[String]) -> String {
     let mut out = String::new();
     let tab_name_esc = kdl_escape(tab_name);
     out.push_str("layout {\n");
@@ -150,9 +118,9 @@ fn compose_kdl(
     out.push_str("            plugin location=\"zellij:tab-bar\"\n");
     out.push_str("        }\n");
     out.push_str("        pane split_direction=\"horizontal\" {\n");
-    push_pane(&mut out, master.label.as_str(), "master", repo_path);
+    push_pane(&mut out, master, "master", repo_path);
     for reviewer in reviewers {
-        push_pane(&mut out, reviewer.label.as_str(), "reviewer", repo_path);
+        push_pane(&mut out, reviewer.as_str(), "reviewer", repo_path);
     }
     out.push_str("        }\n");
     out.push_str("        pane size=2 borderless=true {\n");
@@ -218,61 +186,9 @@ fn compose_spawn_argv(layout_path: &Path) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use clank_core::ids::AgentLabel;
 
-    fn agent(label: &str, role: Role) -> DefaultAgent {
-        DefaultAgent {
-            label: AgentLabel::parse(label).unwrap(),
-            role,
-            tool: None,
-            launch: None,
-            initial_prompt: None,
-        }
-    }
-
-    #[test]
-    fn classify_roles_zero_master_errors_with_suggestion() {
-        let agents = vec![agent("alice", Role::Reviewer)];
-        let err = classify_roles(&agents).unwrap_err();
-        let msg = format!("{err:#}");
-        assert!(
-            msg.contains("no master") && msg.contains("clank agent add"),
-            "diagnostic should name the fix; got: {msg}"
-        );
-    }
-
-    #[test]
-    fn classify_roles_multi_master_errors_with_both_labels() {
-        let agents = vec![
-            agent("alice", Role::Master),
-            agent("bob", Role::Master),
-            agent("carol", Role::Reviewer),
-        ];
-        let err = classify_roles(&agents).unwrap_err();
-        let msg = format!("{err:#}");
-        assert!(
-            msg.contains("alice") && msg.contains("bob"),
-            "multi-master diagnostic must list BOTH masters; got: {msg}"
-        );
-        assert!(
-            msg.contains("clank agent promote"),
-            "diagnostic should suggest promote; got: {msg}"
-        );
-    }
-
-    #[test]
-    fn classify_roles_single_master_returns_master_and_reviewers_in_order() {
-        let agents = vec![
-            agent("master", Role::Master),
-            agent("bob", Role::Reviewer),
-            agent("alice", Role::Reviewer),
-            agent("codex", Role::Reviewer),
-        ];
-        let (master, reviewers) = classify_roles(&agents).unwrap();
-        assert_eq!(master.label.as_str(), "master");
-        let labels: Vec<&str> = reviewers.iter().map(|a| a.label.as_str()).collect();
-        // Declaration order preserved (NOT alphabetical — codex came after alice).
-        assert_eq!(labels, vec!["bob", "alice", "codex"]);
+    fn reviewers(labels: &[&str]) -> Vec<String> {
+        labels.iter().map(|s| s.to_string()).collect()
     }
 
     const TEST_REPO: &str = "/tmp/test-repo";
@@ -280,16 +196,14 @@ mod tests {
 
     #[test]
     fn compose_kdl_includes_tab_bar_and_status_bar_plugins() {
-        let master = agent("m", Role::Master);
-        let kdl = compose_kdl(TEST_TAB, TEST_REPO, &master, &[]);
+        let kdl = compose_kdl(TEST_TAB, TEST_REPO, "m", &[]);
         assert!(kdl.contains("plugin location=\"zellij:tab-bar\""));
         assert!(kdl.contains("plugin location=\"zellij:status-bar\""));
     }
 
     #[test]
     fn compose_kdl_wraps_panes_in_tab_block_with_name() {
-        let master = agent("alice", Role::Master);
-        let kdl = compose_kdl("basename", TEST_REPO, &master, &[]);
+        let kdl = compose_kdl("basename", TEST_REPO, "alice", &[]);
         assert!(
             kdl.contains("tab name=\"basename\""),
             "KDL should wrap panes in a tab block with name; got:\n{kdl}"
@@ -298,10 +212,7 @@ mod tests {
 
     #[test]
     fn compose_kdl_master_and_reviewer_panes_use_clank_agent_start_with_repo() {
-        let master = agent("alice", Role::Master);
-        let bob = agent("bob", Role::Reviewer);
-        let carol = agent("carol", Role::Reviewer);
-        let kdl = compose_kdl(TEST_TAB, TEST_REPO, &master, &[&bob, &carol]);
+        let kdl = compose_kdl(TEST_TAB, TEST_REPO, "alice", &reviewers(&["bob", "carol"]));
         assert!(kdl.contains("name=\"alice (master)\""));
         assert!(kdl.contains("name=\"bob (reviewer)\""));
         assert!(kdl.contains("name=\"carol (reviewer)\""));
@@ -332,15 +243,11 @@ mod tests {
         // KDL block sets `cwd="<repo>"` so the spawned tool
         // lands in the repo regardless of the shell that
         // invoked zellij.
-        let master = agent("alice", Role::Master);
-        let bob = agent("bob", Role::Reviewer);
-        let kdl = compose_kdl(TEST_TAB, TEST_REPO, &master, &[&bob]);
-        // Master pane.
+        let kdl = compose_kdl(TEST_TAB, TEST_REPO, "alice", &reviewers(&["bob"]));
         assert!(
             kdl.contains(&format!("name=\"alice (master)\" cwd=\"{TEST_REPO}\"")),
             "master pane should set cwd; got:\n{kdl}"
         );
-        // Reviewer pane.
         assert!(
             kdl.contains(&format!("name=\"bob (reviewer)\" cwd=\"{TEST_REPO}\"")),
             "reviewer pane should set cwd; got:\n{kdl}"
@@ -349,11 +256,12 @@ mod tests {
 
     #[test]
     fn compose_kdl_reviewer_order_matches_input_order() {
-        let master = agent("m", Role::Master);
-        let bob = agent("bob", Role::Reviewer);
-        let alice = agent("alice", Role::Reviewer);
-        let codex = agent("codex", Role::Reviewer);
-        let kdl = compose_kdl(TEST_TAB, TEST_REPO, &master, &[&bob, &alice, &codex]);
+        let kdl = compose_kdl(
+            TEST_TAB,
+            TEST_REPO,
+            "m",
+            &reviewers(&["bob", "alice", "codex"]),
+        );
         let bob_idx = kdl.find("name=\"bob (reviewer)\"").unwrap();
         let alice_idx = kdl.find("name=\"alice (reviewer)\"").unwrap();
         let codex_idx = kdl.find("name=\"codex (reviewer)\"").unwrap();
@@ -397,14 +305,7 @@ mod tests {
         // Pane name + args interpolations both go through
         // kdl_escape. A pathological label with a literal quote
         // must not break the layout string.
-        let master = DefaultAgent {
-            label: AgentLabel::parse(r#"weird"name"#).unwrap(),
-            role: Role::Master,
-            tool: None,
-            launch: None,
-            initial_prompt: None,
-        };
-        let kdl = compose_kdl(TEST_TAB, TEST_REPO, &master, &[]);
+        let kdl = compose_kdl(TEST_TAB, TEST_REPO, r#"weird"name"#, &[]);
         // The raw `"name"` text MUST appear escaped, not as a
         // bare `"` that would close the KDL string early.
         assert!(
@@ -427,8 +328,7 @@ mod tests {
     fn compose_kdl_escapes_quote_in_tab_name_and_repo_path() {
         // Tab name and repo path both flow through kdl_escape so
         // a pathological cwd or basename can't break the layout.
-        let master = agent("m", Role::Master);
-        let kdl = compose_kdl(r#"weird"tab"#, r#"/tmp/dir"with"quotes"#, &master, &[]);
+        let kdl = compose_kdl(r#"weird"tab"#, r#"/tmp/dir"with"quotes"#, "m", &[]);
         assert!(
             kdl.contains(r#"weird\"tab"#),
             "tab name quote must be escaped; got:\n{kdl}"

@@ -33,10 +33,9 @@
 //! - [`api`] — wire-shape response DTOs (`FinishPreviewResponse`,
 //!   `RewritePreviewResponse`, …) produced by the CLI's preview
 //!   builders.
-//! - [`agent_config`] — typed schemas for per-agent
-//!   (`.clank/agents/<label>/config.json`) and repo-level
-//!   (`.clank/config.json`) settings, plus the `role_for` helper
-//!   used by the identity resolver.
+//! - [`agent_config`] — typed schema for per-agent, per-machine
+//!   state (`.clank/agents/<label>/config.json`): session
+//!   binding, auto-mode, and wfw timeout.
 //! - [`identity`] — pure `resolve_agent_identity` function +
 //!   `IdentityInputs` / `ResolveError` types. The single
 //!   "who am I" resolver shared by stop-hook, auto, wfw, doctor.
@@ -74,7 +73,7 @@ pub use ids::{
     RepoBasename, SessionId,
 };
 
-pub use agent_config::{AgentConfig, Session, role_for};
+pub use agent_config::{AgentConfig, Session};
 pub use hook_io::{
     CLAUDE_CONTINUATION_EXIT, CodexBlockDecision, HOOK_OK_EXIT, HookInput, HookOutcome,
 };

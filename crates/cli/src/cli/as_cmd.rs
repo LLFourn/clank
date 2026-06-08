@@ -31,23 +31,10 @@ pub async fn run(args: AsArgs) -> anyhow::Result<()> {
         )
     })?;
 
-    // Codex 38e105e catch: respect the .empty sentinel. Writing a
-    // skeleton here while sentinel is active would be a hidden
-    // skeleton that a subsequent `clank agent add` (which clears
-    // the sentinel as the 0→1 transition) would resurrect. Refuse
-    // with guidance to the explicit two-step registration path.
-    if crate::cli::config::empty_sentinel_path(&repo).is_file() {
-        anyhow::bail!(
-            "explicit-empty agents declaration is active \
-             (`.clank/agents/.empty` present); refusing to bind \
-             `{label}`. To register this agent, run `clank agent add \
-             {label} --tool {tool}` first (which clears the sentinel \
-             as the 0→1 transition), then re-run `clank as {label}`.",
-            label = label.as_str(),
-            tool = tool.as_str(),
-        );
-    }
-
+    // `clank as` binds a session — pure per-agent STATE. Under
+    // the team model, binding a session for a label that isn't in
+    // the repo's team just produces orphan state (ignored by
+    // gates / lists). No sentinel gate anymore.
     let outcome = bind_session_to_agent(&repo, &label, tool, &session_id)?;
 
     println!(

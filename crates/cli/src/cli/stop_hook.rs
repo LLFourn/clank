@@ -65,15 +65,14 @@ async fn compute_outcome(tool: Tool, repo_override: Option<&Path>) -> HookOutcom
         }
     };
 
-    // Role resolution prefers the merged declaration (per
-    // agent-add-cli-and-repo-scope: declaration is authoritative).
-    // Falls back to the skeleton's legacy `role` field for
-    // pre-Phase-1 repos. Codex caught the skeleton-only lookup on
-    // da71c84. Errors fall back to the skeleton role — the hook
-    // path is fail-soft (a config parse error shouldn't block the
-    // agent's session).
+    // Role is team-derived (`teams-based-agent-registration`).
+    // The hook path is fail-soft: if the repo has no team
+    // configured (or resolution errors), default to Reviewer —
+    // a misconfigured repo shouldn't block the agent's session,
+    // and Reviewer is the conservative default (won't spuriously
+    // drive master-only actions).
     let role = crate::agent_store::resolve_role(&repo, &label)
-        .unwrap_or_else(|_| clank_core::role_for(&label, Some(&cfg)));
+        .unwrap_or_else(|_| clank_core::vocab::Role::default());
 
     match cfg.auto_mode {
         AutoMode::Off => HookOutcome::Silent,

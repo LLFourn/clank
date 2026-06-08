@@ -743,21 +743,26 @@ pub struct AgentStartArgs {
 pub struct AgentAddArgs {
     /// Agent label to register.
     pub label: String,
-    /// Role for this agent. Defaults to `reviewer`.
-    #[arg(long, value_enum, default_value = "reviewer")]
-    pub role: RoleArg,
-    /// Tool this agent runs. Defaults to `claude`.
-    #[arg(long, value_enum, default_value = "claude")]
-    pub tool: ToolArg,
-    /// Write to user-scope `~/.clank/config.json` `default_agents`
-    /// instead of repo-scope `<repo>/.clank/config.json` `agents`.
-    /// User-scope adds do NOT create per-agent skeletons (those
-    /// land in each repo on first `clank init`).
+    /// Tool this agent runs. REQUIRED with `--global` (declares a
+    /// fully-inline description). At repo scope, supplying `--tool`
+    /// adds a fully-inline local agent; omitting it adds a by-name
+    /// reference to a user-scope agent.
+    #[arg(long, value_enum)]
+    pub tool: Option<ToolArg>,
+    /// Write the agent DESCRIPTION to user-scope
+    /// `~/.clank/config.json#/agents` (reusable across teams).
+    /// Without `--global`, the agent is added to THIS repo's
+    /// `team` array as a local entry.
     #[arg(long)]
     pub global: bool,
+    /// What this agent reviews at repo scope: `commit` (every
+    /// commit) or `gate` (gate transitions only). Default
+    /// `commit`. Ignored with `--global` (review tier is a
+    /// per-team property, set via `clank team add`).
+    #[arg(long, value_enum)]
+    pub review: Option<ReviewKindArg>,
     /// Override the executable used by `clank agent start`. If
-    /// unset, the agent's session-tool name (`claude` / `codex`)
-    /// is used.
+    /// unset, the agent's tool name (`claude` / `codex`) is used.
     #[arg(long, value_name = "CMD")]
     pub launch_cmd: Option<String>,
     /// Arguments inserted on the tool invocation BEFORE the
@@ -767,16 +772,15 @@ pub struct AgentAddArgs {
     #[arg(long = "launch-arg", value_name = "ARG", allow_hyphen_values = true)]
     pub launch_args: Vec<String>,
     /// Environment overrides applied to the spawned process.
-    /// Format `KEY=VAL`. Repeatable. `cfg.launch.env` wins over
-    /// the inherited environment on key collision.
+    /// Format `KEY=VAL`. Repeatable. `launch.env` wins over the
+    /// inherited environment on key collision.
     #[arg(long = "launch-env", value_name = "KEY=VAL")]
     pub launch_envs: Vec<String>,
     /// Initial prompt passed to the resumed tool as a trailing
     /// positional. Pass `""` to explicitly disable the prompt
     /// (escape hatch when `auto_mode == On` but you don't want
     /// the default `Session resumed.` prompt). Unset = follow
-    /// auto_mode default. NOT a `--launch-*` flag because the
-    /// field lives on `DefaultAgent`, not `LaunchConfig`.
+    /// auto_mode default.
     #[arg(long, value_name = "STRING")]
     pub initial_prompt: Option<String>,
     /// Repo root. Defaults to the cwd's git toplevel.
@@ -788,8 +792,10 @@ pub struct AgentAddArgs {
 pub struct AgentRemoveArgs {
     /// Agent label to remove.
     pub label: String,
-    /// Remove from user-scope `default_agents` instead of
-    /// repo-scope `agents`.
+    /// Remove the DESCRIPTION from user-scope
+    /// `~/.clank/config.json#/agents` (and from any team that
+    /// references it). Without `--global`, removes the agent from
+    /// THIS repo's `team` array.
     #[arg(long)]
     pub global: bool,
     /// Repo root. Defaults to the cwd's git toplevel.
@@ -799,12 +805,10 @@ pub struct AgentRemoveArgs {
 
 #[derive(Args, Debug)]
 pub struct AgentPromoteArgs {
-    /// Agent label to promote to master.
+    /// Agent label to promote to master IN THIS REPO (writes the
+    /// `promoted` field). To change a team's default master, use
+    /// `clank team set-master <team> <agent>`.
     pub label: String,
-    /// Promote in the user-scope `default_agents` instead of the
-    /// repo-scope `agents`.
-    #[arg(long)]
-    pub global: bool,
     /// Repo root. Defaults to the cwd's git toplevel.
     #[arg(long, value_name = "PATH")]
     pub repo: Option<PathBuf>,

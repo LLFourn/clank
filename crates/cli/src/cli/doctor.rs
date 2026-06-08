@@ -15,7 +15,8 @@ use crate::agent_env::{
 use crate::agent_store::{
     agent_config_path, agents_root, load_agent_config, load_all_agent_configs,
 };
-use clank_core::role_for;
+use crate::cli::teams_config::AgentDescription;
+use clank_core::ids::AgentLabel;
 
 /// Sentinel returned by [`run`] when one or more checks failed.
 /// Routed to exit code 1 by `main::exit_code_for`. Defining it as
@@ -140,36 +141,45 @@ fn repo_checks(repo: &Path) -> Vec<CheckResult> {
     // .claude/settings.local.json permissions.
     out.push(check_claude_perms(repo));
 
-    // Per-agent checks: iterate the merged declaration (source of
-    // truth per agent-add-cli-and-repo-scope), join skeleton state,
-    // and also flag orphan skeletons (skeleton present, label not
-    // in declaration).
-    let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
-    let merged = match crate::cli::config::load_merged_agents(repo, home.as_deref()) {
-        Ok(m) => m,
+    // Per-agent checks: registration comes from the resolved team
+    // set (`teams-based-agent-registration`). Join skeleton state,
+    // and flag orphan skeletons (present on disk, not registered).
+    let registered = match crate::agent_store::try_resolve_via_team(repo) {
+        Ok(Some(set)) => set,
+        Ok(None) => {
+            out.push(CheckResult::warn(
+                SECTION,
+                "agents",
+                "this repo has no team configured; run `clank init --team <name>` to register agents"
+                    .to_string(),
+            ));
+            return out;
+        }
         Err(e) => {
             out.push(CheckResult::fail(
                 SECTION,
                 "agents",
-                format!("failed to load agent declaration: {e:#}"),
+                format!("failed to resolve team registration: {e:#}"),
             ));
             return out;
         }
     };
 
-    if merged.is_empty() && !agents_root(repo).is_dir() {
-        out.push(CheckResult::ok(
-            SECTION,
-            "agents",
-            "no agents declared (run `clank agent add <label>`)".to_string(),
-        ));
+    // (label, role-string, description) for master + reviewers.
+    let mut members: Vec<(AgentLabel, &'static str, AgentDescription)> = Vec::new();
+    members.push((
+        registered.master.clone(),
+        "master",
+        registered.master_desc.clone(),
+    ));
+    for r in &registered.commit_reviewers {
+        members.push((r.label.clone(), "commit reviewer", r.desc.clone()));
+    }
+    for r in &registered.gate_reviewers {
+        members.push((r.label.clone(), "gate reviewer", r.desc.clone()));
     }
 
-    // Per-declared-agent checks: skeleton presence + launch
-    // command resolution.
-    for entry in &merged {
-        let label = &entry.label;
-        let role_str = entry.role.as_str();
+    for (label, role_str, desc) in &members {
         let skeleton = match load_agent_config(repo, label) {
             Ok(s) => s,
             Err(e) => {
@@ -182,15 +192,14 @@ fn repo_checks(repo: &Path) -> Vec<CheckResult> {
             }
         };
 
-        // Missing skeleton diagnostic: declared but no
-        // `.clank/agents/<label>/config.json` (Phase 7 of plan).
         let Some(cfg) = skeleton else {
             out.push(CheckResult::warn(
                 SECTION,
                 format!("agent: {}", label.as_str()),
                 format!(
-                    "agent `{}` in merged declaration but `.clank/agents/{}/config.json` missing; \
-                     run `clank init` to seed the skeleton",
+                    "registered {role_str} `{}` has no `.clank/agents/{}/config.json` yet; \
+                     run `clank as {}` from inside the agent's session to bind",
+                    label.as_str(),
                     label.as_str(),
                     label.as_str(),
                 ),
@@ -216,9 +225,6 @@ fn repo_checks(repo: &Path) -> Vec<CheckResult> {
             cfg.auto_mode.as_str(),
             session_desc,
         );
-        // Unbound: the all-reviewers gate will never see
-        // APPROVE/FINISHED from this label until the user runs
-        // `clank as <label>` from inside the agent's session.
         let agent_check = if cfg.session.is_none() {
             CheckResult::warn(
                 SECTION,
@@ -234,13 +240,10 @@ fn repo_checks(repo: &Path) -> Vec<CheckResult> {
         };
         out.push(agent_check);
 
-        // `declaration.launch.command on $PATH?` — Warn if the
-        // configured launch command isn't found. Catches typos in
-        // `launch.command` before the user tries
-        // `clank agent start <label>`. Reads launch from the
-        // DECLARATION (per agent-add-cli-and-repo-scope), not the
-        // skeleton.
-        if let Some(launch) = &entry.launch {
+        // `description.launch.command on $PATH?` — Warn if the
+        // configured launch command isn't found (catches typos
+        // before `clank agent start <label>` exec time).
+        if let Some(launch) = &desc.launch {
             if let Some(cmd) = launch.command.as_deref() {
                 if which::which(cmd).is_err() {
                     out.push(CheckResult::warn(
@@ -258,23 +261,21 @@ fn repo_checks(repo: &Path) -> Vec<CheckResult> {
     }
 
     // Orphan-skeleton check: walk .clank/agents/ and flag any
-    // directory whose label isn't in the merged declaration
-    // (Phase 7 of plan). Doctor as recovery surface for
-    // `clank agent add` partial failures.
+    // directory whose label isn't in the registered set.
     if agents_root(repo).is_dir() {
-        let declared_labels: std::collections::HashSet<&str> =
-            merged.iter().map(|e| e.label.as_str()).collect();
+        let registered_labels: std::collections::HashSet<&str> =
+            members.iter().map(|(l, _, _)| l.as_str()).collect();
         match load_all_agent_configs(repo) {
             Ok(skeletons) => {
                 for (skel_label, _) in &skeletons {
-                    if !declared_labels.contains(skel_label.as_str()) {
+                    if !registered_labels.contains(skel_label.as_str()) {
                         out.push(CheckResult::warn(
                             SECTION,
                             format!("agent: {}", skel_label.as_str()),
                             format!(
-                                "found `.clank/agents/{}/config.json` but `{}` not in the merged agent declaration \
-                                 (neither repo-scope `agents` nor user-scope `default_agents`); \
-                                 run `clank agent add {}` to register, or `rm -rf .clank/agents/{}/` to remove it",
+                                "found `.clank/agents/{}/config.json` but `{}` is not in this repo's \
+                                 registered team set (orphan state); add it via `clank agent add {}` / \
+                                 `clank team add`, or `rm -rf .clank/agents/{}/` to remove it",
                                 skel_label.as_str(),
                                 skel_label.as_str(),
                                 skel_label.as_str(),
@@ -643,13 +644,15 @@ fn session_checks(repo: Option<&Path>) -> Vec<CheckResult> {
     let source = describe_identity_source(repo, &resolved, &detected, &explicit);
     out.push(CheckResult::ok(SECTION, "identity", source));
 
-    // Inferred role from the resolved agent's own config.
-    let agent_cfg = load_agent_config(repo, &resolved).ok().flatten();
-    let role = role_for(&resolved, agent_cfg.as_ref());
+    // Inferred role from the team resolver (best-effort: a repo
+    // with no team configured has no resolvable role).
+    let role = crate::agent_store::resolve_role(repo, &resolved)
+        .map(|r| r.as_str().to_string())
+        .unwrap_or_else(|_| "unknown (no team configured)".to_string());
     out.push(CheckResult::ok(
         SECTION,
         "role",
-        format!("inferred role: {}", role.as_str()),
+        format!("inferred role: {role}"),
     ));
 
     out

@@ -1,31 +1,29 @@
-//! `clank init` — scaffold `.clank/` in a repo + bootstrap the
-//! calling agent's identity if running inside claude/codex.
+//! `clank init` — scaffold `.clank/` in a repo + bind the
+//! calling agent's session if running inside claude/codex.
 //!
 //! Two phases:
 //! - **Phase 1 (always runs, non-interactive):** write
 //!   `.clank/.gitignore`, write `.claude/settings.local.json`
 //!   with claude edit-permission rules for `.clank/agents/**`,
 //!   warn if the root gitignore swallows any `.clank/` path the
-//!   plan needs tracked.
+//!   plan needs tracked, and (with `--team`) record the repo's
+//!   team.
 //! - **Phase 2 (only when running inside an agent):** prompt
-//!   for the agent's label and whether it's the repo's master,
-//!   then bind the session via `clank as` and (if master) write
-//!   `.clank/config.json`. `--yes` skips prompts; falling back
-//!   to tool-name + reviewers.
+//!   for the agent's label and bind the session via the shared
+//!   bind helper. Identity (role/tool/launch) is team-based and
+//!   lives in user/repo config, NOT in the per-agent skeleton —
+//!   bootstrap only touches `session`.
 
 use std::io::{IsTerminal, Write};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use anyhow::Context;
 
 use super::{InitArgs, resolve_repo};
 use crate::agent_env::detect_session_from_env;
-use crate::agent_store::{
-    agent_config_path, bind_session_to_agent, load_agent_config, load_all_agent_configs,
-    save_agent_config,
-};
+use crate::agent_store::{agent_config_path, bind_session_to_agent};
 use clank_core::ids::AgentLabel;
-use clank_core::vocab::{Role, Tool};
+use clank_core::vocab::Tool;
 
 use crate::init_facts::{
     CLANK_GITIGNORE_BODY as GITIGNORE_BODY,
@@ -39,15 +37,10 @@ pub async fn run(args: InitArgs) -> anyhow::Result<()> {
     write_claude_perms(&repo)?;
     write_post_rewrite_hook(&repo, args.force_hooks)?;
     warn_if_globally_excluded(&repo);
-    let migrated_labels = migrate_legacy_agents_block_collecting(&repo)?;
-    let default_agent_labels = seed_default_agents(&repo, &migrated_labels)?;
-    bootstrap_agent_identity(&repo, args.yes, &default_agent_labels).await?;
-    // Plan: teams-based-agent-registration (phase 6a).
+    bootstrap_agent_identity(&repo, args.yes).await?;
     // When `--team <name>` is set, write the team field to
     // `<repo>/.clank/config.json` (new-schema). Validation:
-    // the named team must exist in user-scope. Wire-up of
-    // the new resolver to actually USE this field comes in
-    // a later phase; for now, init just persists the choice.
+    // the named team must exist in user-scope.
     if let Some(team_name) = args.team.as_deref() {
         let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
         let home_ref = home
@@ -56,245 +49,6 @@ pub async fn run(args: InitArgs) -> anyhow::Result<()> {
         write_repo_team_field(home_ref, &repo, team_name)?;
     }
     Ok(())
-}
-
-/// Migrate the legacy `.clank/config.json#/agents` block to
-/// per-agent skeletons + sentinel, then remove the key.
-///
-/// Plan: `agents-declaration-is-user-local`. Two cases:
-/// - `Some(non-empty vec)`: materialize each entry into
-///   `.clank/agents/<label>/config.json`, MERGING with any
-///   pre-existing skeleton state (preserve
-///   session/auto_mode/wfw_timeout).
-/// - `Some(vec![])`: write the explicit-empty sentinel
-///   `.clank/agents/.empty` (codex 861c364 catch — preserves
-///   the today-semantic that `agents: []` disables user-scope
-///   fallback).
-///
-/// In BOTH cases, remove the `agents` key from
-/// `.clank/config.json`. Idempotent: re-running with the key
-/// already absent is a no-op.
-pub(crate) fn migrate_legacy_agents_block(repo: &Path) -> anyhow::Result<()> {
-    migrate_legacy_agents_block_collecting(repo).map(|_| ())
-}
-
-/// Same as [`migrate_legacy_agents_block`] but returns the set of
-/// labels that were migrated from the legacy block in case A
-/// (Some(non-empty)). Empty for case B (sentinel) and the no-op
-/// case. Plan agents-declaration-is-user-local + codex 3cb8002:
-/// the migrated set feeds bootstrap_agent_identity's
-/// `preserve_existing_role` check — the user stated role for these
-/// labels via the legacy block, just like user-scope
-/// `default_agents`.
-pub(crate) fn migrate_legacy_agents_block_collecting(
-    repo: &Path,
-) -> anyhow::Result<std::collections::HashSet<AgentLabel>> {
-    let cfg_path = repo.join(".clank/config.json");
-    let body = match std::fs::read_to_string(&cfg_path) {
-        Ok(b) => b,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(std::collections::HashSet::new());
-        }
-        Err(e) => {
-            return Err(anyhow::Error::from(e))
-                .with_context(|| format!("reading {}", cfg_path.display()));
-        }
-    };
-    let mut value: serde_json::Value =
-        serde_json::from_str(&body).with_context(|| format!("parsing {}", cfg_path.display()))?;
-    let obj = match value.as_object_mut() {
-        Some(o) => o,
-        None => return Ok(std::collections::HashSet::new()),
-    };
-    let agents_val = match obj.remove("agents") {
-        Some(v) => v,
-        None => return Ok(std::collections::HashSet::new()), // No legacy block; nothing to do.
-    };
-    let agents: Vec<crate::cli::config::DefaultAgent> = serde_json::from_value(agents_val)
-        .with_context(|| format!("parsing legacy `agents` block in {}", cfg_path.display()))?;
-    let mut migrated_labels = std::collections::HashSet::new();
-    if agents.is_empty() {
-        // Case B: explicit empty → quarantine any pre-existing
-        // skeleton config.json files (their declarations were
-        // suppressed by the legacy `agents: []` block; they must
-        // STAY suppressed across the migration) and write the
-        // sentinel. Codex 36624a5 catch: without the quarantine,
-        // a stale `.clank/agents/<label>/config.json` left over
-        // from before the `agents: []` block could be resurrected
-        // by `clank agent add` (which clears the sentinel) or by
-        // a subsequent operation that reads skeletons directly.
-        //
-        // Feedback subdirs are preserved (review history stays).
-        // We delete the config.json only.
-        let agents_dir = repo.join(".clank/agents");
-        if agents_dir.is_dir() {
-            for entry in std::fs::read_dir(&agents_dir)? {
-                let entry = entry?;
-                if !entry.file_type()?.is_dir() {
-                    continue;
-                }
-                let cfg_path = entry.path().join("config.json");
-                if cfg_path.is_file() {
-                    std::fs::remove_file(&cfg_path).with_context(|| {
-                        format!(
-                            "removing stale skeleton {} during explicit-empty migration",
-                            cfg_path.display()
-                        )
-                    })?;
-                }
-            }
-        }
-        let sentinel = repo.join(".clank/agents/.empty");
-        if let Some(parent) = sentinel.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        std::fs::write(&sentinel, b"")?;
-        println!(
-            "migrated explicit-empty agents declaration to {} (now per-user; stale skeleton configs removed)",
-            sentinel.strip_prefix(repo).unwrap_or(&sentinel).display()
-        );
-    } else {
-        // Case A: materialize each entry into its skeleton.
-        for entry in &agents {
-            migrated_labels.insert(entry.label.clone());
-            let skel_path = crate::agent_store::agent_config_path(repo, &entry.label);
-            let existing = std::fs::read_to_string(&skel_path).ok();
-            let mut cfg: clank_core::agent_config::AgentConfig = match existing {
-                Some(body) => serde_json::from_str(&body)
-                    .with_context(|| format!("parsing existing {}", skel_path.display()))?,
-                None => clank_core::agent_config::AgentConfig::default(),
-            };
-            // Overwrite declaration fields with the legacy block's
-            // values. Preserve session/auto_mode/wfw_timeout from
-            // any pre-existing skeleton (per-machine state).
-            cfg.role = entry.role;
-            cfg.tool = entry.tool;
-            cfg.launch = entry.launch.clone();
-            cfg.initial_prompt = entry.initial_prompt.clone();
-            crate::agent_store::save_agent_config(repo, &entry.label, &cfg)?;
-        }
-        println!(
-            "migrated {} agents declaration(s) to per-agent skeletons (now per-user)",
-            agents.len()
-        );
-    }
-    // Write back the config without the agents key.
-    let new_body = serde_json::to_string_pretty(&value)
-        .with_context(|| format!("re-serializing {}", cfg_path.display()))?;
-    std::fs::write(&cfg_path, new_body + "\n")?;
-    Ok(migrated_labels)
-}
-
-/// Seed per-agent config skeletons from `~/.clank/config.json`'s
-/// `default_agents` list, so a fresh repo has registered reviewers
-/// the moment `clank init` returns. The all-reviewers gate requires
-/// at least one registered reviewer to behave non-trivially; without
-/// this step, a brand-new repo auto-approves every commit.
-///
-/// **Ordering**: must run before `bootstrap_agent_identity` so its
-/// `has_existing_master` check at `:361` sees seeded master
-/// entries (a seeded master flips the calling agent's role default
-/// from master to reviewers).
-///
-/// **Idempotent**: any existing `.clank/agents/<label>/config.json`
-/// is preserved (the user may have run `clank as` already,
-/// populating the `session` field). Seeded skeletons set
-/// `auto_mode: off` — the agent still has to run `clank auto on`
-/// to actively respond. This is a *registration* helper, not an
-/// *activation* helper; making it both was deferred to avoid
-/// auto-enabling agents the user hasn't actively confirmed.
-///
-/// **Failure**: fails closed if the user config is malformed —
-/// see `config::load_default_agents`.
-///
-/// Returns the set of labels declared in `default_agents` (regardless
-/// of whether they were newly seeded or skipped because their config
-/// already existed). `bootstrap_agent_identity` consumes this set to
-/// decide which calling-agent roles to preserve.
-fn seed_default_agents(
-    repo: &Path,
-    migrated_labels: &std::collections::HashSet<AgentLabel>,
-) -> anyhow::Result<std::collections::HashSet<AgentLabel>> {
-    let home = std::env::var_os("HOME").map(PathBuf::from);
-
-    // `declared` (returned) is the union of labels the user has
-    // EXPLICITLY OPINED ABOUT across both scopes:
-    // - User-scope `default_agents` (explicit user intent).
-    // - Labels migrated from the legacy `agents` block at init time
-    //   (the legacy block was an explicit user declaration of role).
-    //
-    // It does NOT include pre-existing per-agent skeletons that
-    // came from a prior `clank as` bind, since those skeletons may
-    // hold a default role rather than a user-stated preference.
-    // bootstrap_agent_identity uses `declared` to preserve role
-    // for labels the user has opined about — including those the
-    // legacy block opined about — and to leave non-opined labels
-    // eligible for the master-claim flow.
-    let user_decls = crate::cli::config::load_default_agents(home.as_deref())?;
-    let post_migration_skeletons = crate::cli::config::load_skeleton_agents(repo)?;
-    let mut declared = std::collections::HashSet::new();
-    for entry in &user_decls {
-        declared.insert(entry.label.clone());
-    }
-    for label in migrated_labels {
-        declared.insert(label.clone());
-    }
-
-    // Plan agents-declaration-is-user-local + codex 3cb8002 catch:
-    // if the repo already has its own declaration (sentinel for
-    // explicit-empty, OR any per-agent skeleton because the
-    // legacy-block migration above just materialized them), do
-    // NOT seed user-scope defaults — that would conflate the
-    // repo's REPLACE override with the user's defaults.
-    //
-    // Without this check, init's ordering on a separate-HOME repo:
-    //   1. migrate_legacy_agents_block: alice (legacy) →
-    //      .clank/agents/alice/config.json. Key removed.
-    //   2. seed_default_agents (this fn): sees no legacy block
-    //      now, falls back to user-scope `default_agents`,
-    //      seeds codex too. The repo now has both alice AND
-    //      codex even though pre-init it had ONLY alice.
-    let repo_has_declaration = crate::cli::config::empty_sentinel_path(repo).is_file()
-        || !post_migration_skeletons.is_empty();
-    if repo_has_declaration {
-        return Ok(declared);
-    }
-
-    // No repo declaration → seed user-scope `default_agents` as
-    // new skeletons.
-    if user_decls.is_empty() {
-        return Ok(declared);
-    }
-    let mut seeded = Vec::new();
-    let mut skipped = Vec::new();
-    for entry in &user_decls {
-        let config_path = crate::agent_store::agent_config_path(repo, &entry.label);
-        if config_path.exists() {
-            skipped.push(entry.label.as_str().to_string());
-            continue;
-        }
-        let cfg = clank_core::agent_config::AgentConfig {
-            role: entry.role,
-            ..Default::default()
-        };
-        crate::agent_store::save_agent_config(repo, &entry.label, &cfg)?;
-        seeded.push(entry.label.as_str().to_string());
-    }
-    if !seeded.is_empty() {
-        println!(
-            "seeded {} agent skeleton(s): {}",
-            seeded.len(),
-            seeded.join(", ")
-        );
-    }
-    if !skipped.is_empty() {
-        println!(
-            "skipped {} existing agent(s): {}",
-            skipped.len(),
-            skipped.join(", ")
-        );
-    }
-    Ok(declared)
 }
 
 /// Install the `post-rewrite` git hook so feedback files
@@ -524,14 +278,14 @@ fn write_claude_perms(repo: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Phase 2: if running inside an agent, prompt for label +
-/// master? and write the bootstrap config. Skipped silently if
-/// no session env detected (caller's not in an agent).
-async fn bootstrap_agent_identity(
-    repo: &Path,
-    yes: bool,
-    default_agent_labels: &std::collections::HashSet<AgentLabel>,
-) -> anyhow::Result<()> {
+/// Phase 2: if running inside an agent, prompt for the label and
+/// bind the session. Skipped silently if no session env detected
+/// (caller's not in an agent).
+///
+/// Identity (role/tool/launch) is team-based and lives in
+/// user/repo config; bootstrap only writes the per-agent
+/// skeleton's `session` field via the shared bind helper.
+async fn bootstrap_agent_identity(repo: &Path, yes: bool) -> anyhow::Result<()> {
     let detected = match detect_session_from_env() {
         Ok(d) => d,
         Err(e) => {
@@ -544,29 +298,12 @@ async fn bootstrap_agent_identity(
     let Some((tool, session_id)) = detected else {
         println!(
             "not running inside an agent (no CLAUDE_CODE_SESSION_ID / \
-             CODEX_THREAD_ID). Skipping identity bootstrap — run \
+             CODEX_THREAD_ID). Skipping session bind — run \
              `clank init` (or `clank as <label>`) from inside your \
              agent to bind."
         );
         return Ok(());
     };
-
-    // Codex 7e2983f catch: respect explicit-empty (`.empty`
-    // sentinel) — don't write a hidden skeleton that a
-    // subsequent `clank agent add` would resurrect by clearing
-    // the sentinel.
-    if crate::cli::config::empty_sentinel_path(repo).is_file() {
-        println!(
-            "explicit-empty agents declaration is active \
-             (.clank/agents/.empty present); skipping identity \
-             bootstrap. To register the calling agent, run \
-             `clank agent add <label> --tool {}` (which will \
-             clear the sentinel as the 0→1 transition).",
-            tool.as_str()
-        );
-        let _ = session_id; // kept for symmetry; not bound here
-        return Ok(());
-    }
 
     let default_label = match tool {
         Tool::Claude => "claude",
@@ -581,45 +318,6 @@ async fn bootstrap_agent_identity(
     };
     let label = AgentLabel::parse(&label_raw)
         .map_err(|e| anyhow::anyhow!("invalid label `{label_raw}`: {e}"))?;
-
-    // If the calling agent's label is declared in the user's
-    // `default_agents` list, the user has stated their preferred
-    // role for this label. Phase 2's master-claim logic must
-    // respect that — independent of whether the agent has been
-    // bound by a prior `clank as` (session present) or is a fresh
-    // seeded skeleton (session absent).
-    //
-    // The previous discriminator (`session.is_none()`) handled the
-    // fresh-skeleton case but missed the bound case: codex declared
-    // as reviewer + bound by prior `clank as` + no master → init
-    // would have flipped codex to master, overriding the user's
-    // declared default. Codex caught this; this fix scopes to
-    // "label in default_agents" instead.
-    let preserve_existing_role = default_agent_labels.contains(&label);
-
-    let has_existing_master = load_all_agent_configs(repo)?
-        .iter()
-        .any(|(_, cfg)| cfg.role == Role::Master);
-
-    let make_master = if preserve_existing_role {
-        false
-    } else if has_existing_master {
-        if interactive {
-            prompt_yes_no(
-                "Default this agent to master role (vs reviewer)? [y/N] ",
-                false,
-            )?
-        } else {
-            false
-        }
-    } else if interactive {
-        prompt_yes_no(
-            "No master agent in this repo yet. Claim master? [Y/n] ",
-            true,
-        )?
-    } else {
-        true
-    };
 
     // Bind via the shared helper — this preserves the
     // "one session, one label" invariant that `clank as` enforces,
@@ -637,15 +335,6 @@ async fn bootstrap_agent_identity(
     );
     for other in outcome.cleared_from {
         println!("  (cleared stale binding on `{}`)", other.as_str());
-    }
-
-    if make_master {
-        // Role is a per-user preference; write to the agent's
-        // own config. No repo-shared file involved.
-        let mut cfg = load_agent_config(repo, &label)?.unwrap_or_default();
-        cfg.role = Role::Master;
-        save_agent_config(repo, &label, &cfg)?;
-        println!("  role: master");
     }
     Ok(())
 }
