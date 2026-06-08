@@ -25,6 +25,11 @@ enum Command {
     /// Read-only inspection of the repo's registered agents
     /// (`clank agent list`).
     Agent(cli::AgentArgs),
+    /// Manage user-scope team compositions. Teams group agents
+    /// declared in `~/.clank/config.json#/agents` into a master
+    /// + commit/gate reviewer tiers, so repos can pick one via
+    /// `clank init --team <name>`.
+    Team(cli::TeamArgs),
     /// Strip a plan's `.clank/` artifacts from history.
     Purge(cli::PurgeArgs),
     /// Launch the configured editor on a plan or commit-range
@@ -101,6 +106,7 @@ async fn main() -> anyhow::Result<()> {
         Command::Unfinish(args) => cli::unfinish::run(args).await,
         Command::Queue(args) => cli::queue::run(args).await,
         Command::Agent(args) => cli::agent::run(args).await,
+        Command::Team(args) => cli::team::run(args).await,
         Command::Purge(args) => cli::purge::run(args).await,
         Command::Diff(args) => cli::diff::run(args).await,
         Command::Demote(args) => cli::demote::run(args).await,

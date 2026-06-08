@@ -33,6 +33,7 @@ pub mod rewrite;
 pub mod setup;
 pub mod status;
 pub mod stop_hook;
+pub mod team;
 pub mod teams_config;
 pub mod unfinish;
 pub mod wfw;
@@ -797,6 +798,130 @@ pub struct AgentPromoteArgs {
     /// Repo root. Defaults to the cwd's git toplevel.
     #[arg(long, value_name = "PATH")]
     pub repo: Option<PathBuf>,
+}
+
+/// `clank team` — manage user-scope team compositions
+/// (`~/.clank/config.json#/teams`). Teams group agents from
+/// `~/.clank/config.json#/agents` into a master + two reviewer
+/// tiers (commit + gate). Plan:
+/// `teams-based-agent-registration`. All operations
+/// implicitly target user-scope — teams live nowhere else.
+#[derive(Args, Debug)]
+pub struct TeamArgs {
+    #[command(subcommand)]
+    pub command: TeamCmd,
+}
+
+#[derive(clap::Subcommand, Debug)]
+pub enum TeamCmd {
+    /// List all teams in user-scope.
+    List(TeamListArgs),
+    /// Show one team's master + both reviewer-tier lists.
+    Show(TeamShowArgs),
+    /// Create an empty team (no master, no reviewers in either
+    /// tier). Must be populated via `add` / `set-master` before
+    /// it can be referenced from a repo's `team` field.
+    Create(TeamCreateArgs),
+    /// Delete a team. Refuses if any repo's
+    /// `<repo>/.clank/config.json#/team` currently references
+    /// it (clank can't introspect that, so this requires
+    /// `--force`).
+    Delete(TeamDeleteArgs),
+    /// Add an agent to a team. Default review kind is `commit`;
+    /// use `--review gate` for the gate tier. Master is a
+    /// separate designation via `set-master` — you don't
+    /// `add-reviewer` and `add-master`, you add agents and one
+    /// of them is set to master.
+    Add(TeamAddArgs),
+    /// Remove an agent from a team. Finds them in whichever
+    /// reviewer tier they're in. Refuses to remove the team's
+    /// master (use `set-master` first or `delete` the team).
+    Remove(TeamRemoveArgs),
+    /// Set the team's master. If the agent was previously in
+    /// either reviewer tier, they're moved out of it. The
+    /// previous master (if any) is moved to commit_reviewers
+    /// — they're still a registered member, just at the
+    /// most-engaged tier.
+    SetMaster(TeamSetMasterArgs),
+}
+
+#[derive(Args, Debug)]
+pub struct TeamListArgs {
+    /// Emit machine-readable JSON instead of human text.
+    #[arg(short = 'j', long)]
+    pub json: bool,
+}
+
+#[derive(Args, Debug)]
+pub struct TeamShowArgs {
+    /// Team name to show.
+    pub team: String,
+    /// Emit machine-readable JSON instead of human text.
+    #[arg(short = 'j', long)]
+    pub json: bool,
+}
+
+#[derive(Args, Debug)]
+pub struct TeamCreateArgs {
+    /// Team name to create. Must not collide with an existing
+    /// team in user-scope.
+    pub team: String,
+}
+
+#[derive(Args, Debug)]
+pub struct TeamDeleteArgs {
+    /// Team name to delete.
+    pub team: String,
+    /// Delete even if the team is potentially referenced by a
+    /// repo's `team` field (clank can't introspect that, so
+    /// this is the explicit user opt-in).
+    #[arg(long)]
+    pub force: bool,
+}
+
+#[derive(Args, Debug)]
+pub struct TeamAddArgs {
+    /// Team name to add the agent to.
+    pub team: String,
+    /// Agent label to add. Must be declared in user-scope
+    /// `agents`.
+    pub agent: String,
+    /// Which review kind this agent does. Default `commit`.
+    #[arg(long, value_enum, default_value = "commit")]
+    pub review: ReviewKindArg,
+}
+
+#[derive(Args, Debug)]
+pub struct TeamRemoveArgs {
+    /// Team name to remove the agent from.
+    pub team: String,
+    /// Agent label to remove.
+    pub agent: String,
+}
+
+#[derive(Args, Debug)]
+pub struct TeamSetMasterArgs {
+    /// Team name.
+    pub team: String,
+    /// Agent label to designate as master. Must be declared in
+    /// user-scope `agents`.
+    pub agent: String,
+}
+
+#[derive(Debug, Clone, Copy, clap::ValueEnum)]
+#[clap(rename_all = "snake_case")]
+pub enum ReviewKindArg {
+    Commit,
+    Gate,
+}
+
+impl From<ReviewKindArg> for crate::cli::teams_config::ReviewKind {
+    fn from(a: ReviewKindArg) -> Self {
+        match a {
+            ReviewKindArg::Commit => crate::cli::teams_config::ReviewKind::Commit,
+            ReviewKindArg::Gate => crate::cli::teams_config::ReviewKind::Gate,
+        }
+    }
 }
 
 #[derive(clap::Subcommand, Debug)]
