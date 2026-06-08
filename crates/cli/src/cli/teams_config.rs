@@ -232,6 +232,18 @@ pub enum ResolutionError {
         "team `{team}` has no master designated. Either set a team-level master via `clank team set-master {team} <agent>`, or designate a per-repo master via `clank promote <agent>`."
     )]
     NoMaster { team: String },
+    #[error(
+        "agent `{0}` is the team's master AND listed as a reviewer; an agent has one role per team"
+    )]
+    MasterInReviewerList(AgentLabel),
+    #[error(
+        "agent `{0}` appears in BOTH `commit_reviewers` and `gate_reviewers`; an agent has one review kind per team"
+    )]
+    ReviewerInBothLists(AgentLabel),
+    #[error(
+        "agent `{0}` appears more than once in the same reviewer list; registration is a set, not a bag"
+    )]
+    DuplicateReviewer(AgentLabel),
 }
 
 /// Resolve the registered set for a repo. Implements the
@@ -338,6 +350,16 @@ pub fn resolve_registered_set(
     }
 
     // Step 4: apply `promoted` if set.
+    // The master_desc accumulator carries the resolved
+    // descriptor through to the RegisteredSet build below.
+    // It's `Some(_)` if a master has been chosen at any
+    // point in steps 3-4; the codex 98ed204 catch fixed
+    // here uses the inline agent's descriptor when promoted
+    // points at an inline-only local (the previous code
+    // discarded that descriptor and re-looked-up from
+    // user-scope, which failed UnknownAgent for inline-only
+    // promoted agents).
+    let mut master_desc: Option<AgentDescription> = None;
     if let Some(promoted_label) = &repo.promoted {
         // Find new_master in commit_reviewers or gate_reviewers.
         let from_commit = commit_reviewers
@@ -346,25 +368,22 @@ pub fn resolve_registered_set(
         let from_gate = gate_reviewers
             .iter()
             .position(|a| &a.label == promoted_label);
-        if from_commit.is_none() && from_gate.is_none() {
-            // Also check if it matches the current master
-            // (no-op promotion of the existing master).
-            if master.as_ref() != Some(promoted_label) {
-                return Err(ResolutionError::PromotedNotPresent(promoted_label.clone()));
-            }
-        }
         let new_master_desc: AgentDescription = if let Some(i) = from_commit {
             commit_reviewers.remove(i).desc
         } else if let Some(i) = from_gate {
             gate_reviewers.remove(i).desc
-        } else {
-            // promoted == existing master → no-op.
+        } else if master.as_ref() == Some(promoted_label) {
+            // promoted == existing master → no-op. Resolve
+            // from user-scope (existing master always is).
             user.agents
                 .get(promoted_label)
                 .cloned()
                 .ok_or_else(|| ResolutionError::UnknownAgent(promoted_label.clone()))?
+        } else {
+            return Err(ResolutionError::PromotedNotPresent(promoted_label.clone()));
         };
-        // Demote previous master to commit_reviewers if any.
+        // Demote previous master to commit_reviewers (if it
+        // differed from promoted and existed in user-scope).
         if let Some(prev_master_label) = master.take() {
             if &prev_master_label != promoted_label {
                 let prev_desc = user
@@ -379,24 +398,63 @@ pub fn resolve_registered_set(
             }
         }
         master = Some(promoted_label.clone());
-        // master_desc resolves via the final build below;
-        // store the descriptor to avoid double-lookup.
-        let _ = new_master_desc;
+        master_desc = Some(new_master_desc);
     }
 
     // Step 5: validate master is Some.
     let master_label = master.ok_or_else(|| ResolutionError::NoMaster {
         team: included_team_name.unwrap_or_else(|| "<no team included>".to_string()),
     })?;
-    // Look up the master's description. May come from
-    // user-scope `agents` or (in the rare inline-promoted
-    // case) from inline. For simplicity v1 requires the
-    // promoted/master to be in user-scope agents.
-    let master_desc = user
-        .agents
-        .get(&master_label)
-        .cloned()
-        .ok_or_else(|| ResolutionError::UnknownAgent(master_label.clone()))?;
+    // master_desc was set by step 4 when promoted fired,
+    // or comes from user-scope agents for the
+    // team-included master.
+    let master_desc = match master_desc {
+        Some(d) => d,
+        None => user
+            .agents
+            .get(&master_label)
+            .cloned()
+            .ok_or_else(|| ResolutionError::UnknownAgent(master_label.clone()))?,
+    };
+
+    // Step 6: validate registered-set integrity (codex
+    // 98ed204 pin):
+    // - Master must NOT also be in either reviewer list.
+    // - The same label must NOT appear in BOTH reviewer
+    //   lists (one tier per registered agent).
+    // The plan body pins both at parse-time / registration-
+    // time; checking once after resolution makes the gate
+    // logic downstream rely on a clean shape.
+    if commit_reviewers.iter().any(|a| a.label == master_label) {
+        return Err(ResolutionError::MasterInReviewerList(master_label));
+    }
+    if gate_reviewers.iter().any(|a| a.label == master_label) {
+        return Err(ResolutionError::MasterInReviewerList(master_label));
+    }
+    for ca in &commit_reviewers {
+        if gate_reviewers.iter().any(|ga| ga.label == ca.label) {
+            return Err(ResolutionError::ReviewerInBothLists(ca.label.clone()));
+        }
+    }
+    // Duplicate label within the same reviewer list (two
+    // entries for the same agent in commit_reviewers, etc.)
+    // is also rejected — registration is a set, not a bag.
+    fn first_duplicate(list: &[ResolvedAgent]) -> Option<AgentLabel> {
+        for (i, a) in list.iter().enumerate() {
+            for b in list.iter().skip(i + 1) {
+                if a.label == b.label {
+                    return Some(a.label.clone());
+                }
+            }
+        }
+        None
+    }
+    if let Some(dup) = first_duplicate(&commit_reviewers) {
+        return Err(ResolutionError::DuplicateReviewer(dup));
+    }
+    if let Some(dup) = first_duplicate(&gate_reviewers) {
+        return Err(ResolutionError::DuplicateReviewer(dup));
+    }
 
     Ok(RegisteredSet {
         master: master_label,
@@ -905,6 +963,116 @@ mod tests {
         match err {
             ResolutionError::PromotedNotPresent(l) => assert_eq!(l.as_str(), "phantom"),
             other => panic!("expected PromotedNotPresent; got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resolve_promoted_works_for_inline_only_local_agent() {
+        // Codex 98ed204 catch: inline-only agents (not
+        // declared in user-scope `agents`) must still be
+        // promotable. Pre-fix the resolver re-looked-up
+        // master_desc from user-scope and failed
+        // UnknownAgent when the promoted target was inline.
+        let user = user_with(
+            vec![("claude", Tool::Claude), ("codex", Tool::Codex)],
+            vec![("dev", Some("claude"), vec!["codex"], vec![])],
+        );
+        let repo = RepoConfigFile {
+            team: Some(TeamField::Array(vec![
+                TeamEntry::Include(IncludeEntry {
+                    include: "dev".to_string(),
+                }),
+                TeamEntry::Inline(InlineAgent {
+                    label: label("alice"),
+                    tool: Tool::Claude,
+                    launch: None,
+                    initial_prompt: None,
+                    role: None,
+                    review: None,
+                }),
+            ])),
+            promoted: Some(label("alice")),
+            ..Default::default()
+        };
+        let r = resolve_registered_set(&user, &repo).unwrap();
+        assert_eq!(r.master.as_str(), "alice");
+        assert_eq!(r.master_desc.tool, Tool::Claude);
+        // claude (prev master) joined commit_reviewers.
+        let cr_labels: Vec<_> = r
+            .commit_reviewers
+            .iter()
+            .map(|a| a.label.as_str())
+            .collect();
+        assert!(cr_labels.contains(&"claude"));
+        assert!(cr_labels.contains(&"codex"));
+        assert!(!cr_labels.contains(&"alice"));
+    }
+
+    #[test]
+    fn resolve_rejects_master_also_in_reviewer_list() {
+        // Codex 98ed204 catch: validate registered-set
+        // integrity AFTER resolution.
+        let user = user_with(
+            vec![("claude", Tool::Claude), ("codex", Tool::Codex)],
+            // Team itself declares claude as both master AND
+            // commit_reviewer — invalid but presents to the
+            // resolver as such because user authored the
+            // user-scope config by hand.
+            vec![("dev", Some("claude"), vec!["claude"], vec![])],
+        );
+        let repo = RepoConfigFile {
+            team: Some(TeamField::Single("dev".to_string())),
+            ..Default::default()
+        };
+        let err = resolve_registered_set(&user, &repo).unwrap_err();
+        match err {
+            ResolutionError::MasterInReviewerList(l) => assert_eq!(l.as_str(), "claude"),
+            other => panic!("expected MasterInReviewerList; got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resolve_rejects_reviewer_in_both_tier_lists() {
+        // Codex 98ed204 catch: an agent in both
+        // commit_reviewers and gate_reviewers is invalid.
+        // Same defense-in-depth as MasterInReviewerList.
+        let user = user_with(
+            vec![("claude", Tool::Claude), ("codex", Tool::Codex)],
+            vec![("dev", Some("claude"), vec!["codex"], vec!["codex"])],
+        );
+        let repo = RepoConfigFile {
+            team: Some(TeamField::Single("dev".to_string())),
+            ..Default::default()
+        };
+        let err = resolve_registered_set(&user, &repo).unwrap_err();
+        match err {
+            ResolutionError::ReviewerInBothLists(l) => assert_eq!(l.as_str(), "codex"),
+            other => panic!("expected ReviewerInBothLists; got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resolve_rejects_duplicate_reviewer_within_same_list() {
+        // Defense for the same-label-twice case via local
+        // entries: bare-string "codex" added to a team that
+        // already lists codex in commit_reviewers.
+        let user = user_with(
+            vec![("claude", Tool::Claude), ("codex", Tool::Codex)],
+            vec![("dev", Some("claude"), vec!["codex"], vec![])],
+        );
+        let repo = RepoConfigFile {
+            team: Some(TeamField::Array(vec![
+                TeamEntry::Include(IncludeEntry {
+                    include: "dev".to_string(),
+                }),
+                TeamEntry::BareString(label("codex")),
+            ])),
+            ..Default::default()
+        };
+        let err = resolve_registered_set(&user, &repo).unwrap_err();
+        match err {
+            ResolutionError::DuplicateReviewer(l) => assert_eq!(l.as_str(), "codex"),
+            other => panic!("expected DuplicateReviewer; got {other:?}"),
         }
     }
 }
