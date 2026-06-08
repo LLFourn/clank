@@ -1,5 +1,35 @@
 # teams-based-agent-registration
 
+## Implementation status (lloyd 2026-06-09)
+
+Phases 1-6c shipped. The new model is functional
+end-to-end. Lloyd then chose the HARD CUT (Option A):
+**delete all legacy agent-declaration code paths.** No
+coexistence. After the cut:
+
+- Per-agent skeleton (`.clank/agents/<label>/config.json`)
+  is STATE ONLY: `session`, `auto_mode`, `wfw_timeout`. The
+  declaration fields (`role`, `tool`, `launch`,
+  `initial_prompt`) are GONE from the skeleton — they live
+  in user-scope `agents` (descriptions) + per-team role
+  assignment.
+- Registration is ALWAYS the team resolver. A repo with no
+  `team` field errors with "run `clank init --team`".
+- `default_agents`, `DefaultAgent`, `load_merged_agents`,
+  `load_default_agents`, `load_repo_agents`,
+  `load_skeleton_agents`, `load_expected_reviewers`,
+  `ensure_unique_master`, `ensure_unique_master_via_skeletons`,
+  the legacy `migrate_legacy_agents_block*`, and the
+  `.empty` sentinel + all its lifecycle code are DELETED.
+- `clank agent add/remove`, `clank promote` operate only on
+  the new schema (no dual-write, no `--global`-to-legacy).
+
+This repo (clank itself) was migrated to the new model
+first (user-scope `agents`+`teams`, repo `team: "default"`)
+so the dogfooded review loop survived the deletion.
+
+---
+
 Replaces the model from `agents-declaration-is-user-local`
 (currently shipped) which conflated "agent exists in this
 repo" with "per-agent skeleton file exists on disk." That
