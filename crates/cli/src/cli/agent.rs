@@ -940,8 +940,18 @@ fn write_repo_promoted_field_if_team_set(
         None => UserConfigFile::default(),
     };
 
-    // No-op short-circuit: promoted already equals this
-    // label.
+    // Validate FIRST by running the resolver with the proposed
+    // promoted field, including the no-op case (codex 63b25a1
+    // observation: a stale existing `promoted` pointing at an
+    // agent that no longer exists in the registered set should
+    // surface, not silently succeed).
+    let mut probe = repo_cfg.clone();
+    probe.promoted = Some(promoted.clone());
+    let _resolved = crate::cli::teams_config::resolve_registered_set(&user_cfg, &probe)
+        .with_context(|| format!("validating `promote {}`", promoted.as_str()))?;
+
+    // No-op short-circuit AFTER validation: promoted already
+    // equals this label AND the registered set is still valid.
     if repo_cfg.promoted.as_ref() == Some(promoted) {
         eprintln!(
             "note: `{}` is already the promoted master in repo-scope",
@@ -950,13 +960,7 @@ fn write_repo_promoted_field_if_team_set(
         return Ok(true);
     }
 
-    // Validate by running the resolver with the proposed
-    // promoted field. On success, persist.
-    let mut probe = repo_cfg.clone();
-    probe.promoted = Some(promoted.clone());
-    let resolved = crate::cli::teams_config::resolve_registered_set(&user_cfg, &probe)
-        .with_context(|| format!("validating `promote {}`", promoted.as_str()))?;
-    // The resolver confirms the label is registered. Persist.
+    // Persist.
     repo_cfg.promoted = Some(promoted.clone());
     let parent = repo_cfg_path
         .parent()
@@ -970,7 +974,6 @@ fn write_repo_promoted_field_if_team_set(
     tmp.write_all(b"\n")?;
     tmp.as_file_mut().sync_all()?;
     tmp.persist(&repo_cfg_path).map_err(|e| e.error)?;
-    let _ = resolved;
     eprintln!(
         "promoted `{}` to master in repo-scope (new-schema `promoted` field)",
         promoted.as_str()
@@ -1296,6 +1299,153 @@ mod tests {
         let label = AgentLabel::parse("codex").unwrap();
         let handled = write_repo_promoted_field_if_team_set(repo.path(), &label).unwrap();
         assert!(!handled);
+    }
+
+    #[test]
+    fn write_repo_promoted_field_rejects_nonexistent_label_before_persisting() {
+        // Ruthless 63b25a1 pin: probe-resolve-before-persist
+        // is the load-bearing safety property. A label that
+        // isn't reachable in the resolved registered set must
+        // error BEFORE the repo config is mutated.
+        use crate::cli::teams_config::{
+            AgentDescription, RepoConfigFile, TeamComposition, UserConfigFile,
+        };
+        let user_home = tempfile::tempdir().unwrap();
+        let mut user_cfg = UserConfigFile::default();
+        user_cfg.agents.insert(
+            AgentLabel::parse("claude").unwrap(),
+            AgentDescription {
+                tool: Tool::Claude,
+                launch: None,
+                initial_prompt: None,
+            },
+        );
+        user_cfg.teams.insert(
+            "dev".to_string(),
+            TeamComposition {
+                master: Some(AgentLabel::parse("claude").unwrap()),
+                commit_reviewers: vec![],
+                gate_reviewers: vec![],
+            },
+        );
+        std::fs::create_dir_all(user_home.path().join(".clank")).unwrap();
+        std::fs::write(
+            user_home.path().join(".clank/config.json"),
+            serde_json::to_string_pretty(&user_cfg).unwrap(),
+        )
+        .unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(repo.path().join(".clank")).unwrap();
+        std::fs::write(repo.path().join(".clank/config.json"), r#"{"team":"dev"}"#).unwrap();
+
+        let lock = home_test_lock().lock().unwrap();
+        let prev = std::env::var_os("HOME");
+        unsafe {
+            std::env::set_var("HOME", user_home.path());
+        }
+        let phantom = AgentLabel::parse("phantom").unwrap();
+        let err = write_repo_promoted_field_if_team_set(repo.path(), &phantom).unwrap_err();
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("HOME", v),
+                None => std::env::remove_var("HOME"),
+            }
+        }
+        drop(lock);
+
+        let msg = format!("{err:#}");
+        // Resolver error names the validation context.
+        assert!(
+            msg.contains("validating")
+                || msg.contains("phantom")
+                || msg.contains("UnknownAgent")
+                || msg.contains("PromotedNotPresent"),
+            "expected resolver-rejection error; got: {msg}"
+        );
+        // Repo config was NOT mutated.
+        let body = std::fs::read_to_string(repo.path().join(".clank/config.json")).unwrap();
+        let parsed: RepoConfigFile = serde_json::from_str(&body).unwrap();
+        assert!(
+            parsed.promoted.is_none(),
+            "promoted field should not have been written on validation failure; got {:?}",
+            parsed.promoted
+        );
+    }
+
+    #[test]
+    fn write_repo_promoted_field_no_op_when_already_promoted() {
+        // Ruthless 63b25a1 pin: the no-op short-circuit hits
+        // when the requested label already equals the existing
+        // `promoted` field. After codex 63b25a1 hardening,
+        // validation runs FIRST — so a stale `promoted` would
+        // surface, not silently succeed.
+        use crate::cli::teams_config::{
+            AgentDescription, RepoConfigFile, TeamComposition, UserConfigFile,
+        };
+        let user_home = tempfile::tempdir().unwrap();
+        let mut user_cfg = UserConfigFile::default();
+        user_cfg.agents.insert(
+            AgentLabel::parse("claude").unwrap(),
+            AgentDescription {
+                tool: Tool::Claude,
+                launch: None,
+                initial_prompt: None,
+            },
+        );
+        user_cfg.agents.insert(
+            AgentLabel::parse("codex").unwrap(),
+            AgentDescription {
+                tool: Tool::Codex,
+                launch: None,
+                initial_prompt: None,
+            },
+        );
+        user_cfg.teams.insert(
+            "dev".to_string(),
+            TeamComposition {
+                master: Some(AgentLabel::parse("claude").unwrap()),
+                commit_reviewers: vec![AgentLabel::parse("codex").unwrap()],
+                gate_reviewers: vec![],
+            },
+        );
+        std::fs::create_dir_all(user_home.path().join(".clank")).unwrap();
+        std::fs::write(
+            user_home.path().join(".clank/config.json"),
+            serde_json::to_string_pretty(&user_cfg).unwrap(),
+        )
+        .unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(repo.path().join(".clank")).unwrap();
+        // Seed repo config with promoted already set.
+        std::fs::write(
+            repo.path().join(".clank/config.json"),
+            r#"{"team":"dev","promoted":"codex"}"#,
+        )
+        .unwrap();
+
+        let lock = home_test_lock().lock().unwrap();
+        let prev = std::env::var_os("HOME");
+        unsafe {
+            std::env::set_var("HOME", user_home.path());
+        }
+        let codex = AgentLabel::parse("codex").unwrap();
+        let handled = write_repo_promoted_field_if_team_set(repo.path(), &codex).unwrap();
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("HOME", v),
+                None => std::env::remove_var("HOME"),
+            }
+        }
+        drop(lock);
+
+        assert!(
+            handled,
+            "no-op short-circuit should still return true (handled)"
+        );
+        // Config unchanged — still codex as promoted.
+        let body = std::fs::read_to_string(repo.path().join(".clank/config.json")).unwrap();
+        let parsed: RepoConfigFile = serde_json::from_str(&body).unwrap();
+        assert_eq!(parsed.promoted.as_ref().map(|l| l.as_str()), Some("codex"));
     }
 
     /// Tests that mutate `$HOME` MUST serialize against each
