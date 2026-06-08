@@ -42,6 +42,15 @@ pub async fn run(args: InitArgs) -> anyhow::Result<()> {
     let migrated_labels = migrate_legacy_agents_block_collecting(&repo)?;
     let default_agent_labels = seed_default_agents(&repo, &migrated_labels)?;
     bootstrap_agent_identity(&repo, args.yes, &default_agent_labels).await?;
+    // Plan: teams-based-agent-registration (phase 6a).
+    // When `--team <name>` is set, write the team field to
+    // `<repo>/.clank/config.json` (new-schema). Validation:
+    // the named team must exist in user-scope. Wire-up of
+    // the new resolver to actually USE this field comes in
+    // a later phase; for now, init just persists the choice.
+    if let Some(team_name) = args.team.as_deref() {
+        write_repo_team_field(&repo, team_name)?;
+    }
     Ok(())
 }
 
@@ -682,6 +691,90 @@ fn matched_by_clank_gitignore(record: &str) -> bool {
         && p.parent().is_some_and(|parent| parent.ends_with(".clank"))
 }
 
+/// Plan: teams-based-agent-registration (phase 6a).
+///
+/// Write the `team: "<name>"` field to
+/// `<repo>/.clank/config.json` using the new typed schema.
+///
+/// Validations:
+/// - The named team must exist in user-scope
+///   `~/.clank/config.json#/teams`. Reading nothing → error
+///   (the user needs to `clank team create <name>` first).
+/// - Existing repo config (legacy or new shape) round-trips
+///   through the new schema's `extra` flatten catchall, so
+///   unknown fields (review/hooks/diff sections, etc.) are
+///   preserved.
+fn write_repo_team_field(repo: &Path, team_name: &str) -> anyhow::Result<()> {
+    use crate::cli::teams_config::{RepoConfigFile, TeamField, UserConfigFile};
+    use anyhow::Context;
+    use std::io::Write;
+
+    // Validate against user-scope teams.
+    let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+    if let Some(home) = home {
+        let user_path = home.join(".clank/config.json");
+        let user_cfg: UserConfigFile = match std::fs::read_to_string(&user_path) {
+            Ok(s) => serde_json::from_str(&s).with_context(|| {
+                format!(
+                    "parsing {} as new-schema UserConfigFile",
+                    user_path.display()
+                )
+            })?,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => UserConfigFile::default(),
+            Err(e) => {
+                return Err(
+                    anyhow::Error::from(e).context(format!("reading {}", user_path.display()))
+                );
+            }
+        };
+        if !user_cfg.teams.contains_key(team_name) {
+            anyhow::bail!(
+                "team `{team_name}` not declared in user-scope teams. Create it with \
+                 `clank team create {team_name}` (and optionally `clank team set-master \
+                 {team_name} <agent>` + `clank team add {team_name} <agent>`) first."
+            );
+        }
+    } else {
+        anyhow::bail!("$HOME not set; --team requires a user-scope config");
+    }
+
+    let repo_cfg_path = repo.join(".clank/config.json");
+    let mut repo_cfg: RepoConfigFile = match std::fs::read_to_string(&repo_cfg_path) {
+        Ok(s) => serde_json::from_str(&s).with_context(|| {
+            format!(
+                "parsing {} as new-schema RepoConfigFile",
+                repo_cfg_path.display()
+            )
+        })?,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => RepoConfigFile::default(),
+        Err(e) => {
+            return Err(
+                anyhow::Error::from(e).context(format!("reading {}", repo_cfg_path.display()))
+            );
+        }
+    };
+    repo_cfg.team = Some(TeamField::Single(team_name.to_string()));
+
+    // Atomic write via tempfile + rename.
+    let parent = repo_cfg_path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("no parent for `{}`", repo_cfg_path.display()))?;
+    std::fs::create_dir_all(parent)?;
+    let mut tmp = tempfile::Builder::new()
+        .prefix(".clank-config-")
+        .suffix(".json.tmp")
+        .tempfile_in(parent)?;
+    tmp.write_all(serde_json::to_string_pretty(&repo_cfg)?.as_bytes())?;
+    tmp.write_all(b"\n")?;
+    tmp.as_file_mut().sync_all()?;
+    tmp.persist(&repo_cfg_path).map_err(|e| e.error)?;
+    eprintln!(
+        "wrote `team: \"{team_name}\"` to {}",
+        repo_cfg_path.display()
+    );
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -899,6 +992,92 @@ mod tests {
         let body = std::fs::read_to_string(dir.path().join(".git/hooks/post-rewrite")).unwrap();
         assert!(body.contains(POST_REWRITE_MARKER));
         assert_eq!(body, POST_REWRITE_BODY);
+    }
+
+    // ── Plan: teams-based-agent-registration (phase 6a) ──
+
+    fn write_user_teams(home: &Path, teams: &[&str]) {
+        use crate::cli::teams_config::{TeamComposition, UserConfigFile};
+        let mut cfg = UserConfigFile::default();
+        for name in teams {
+            cfg.teams
+                .insert((*name).to_string(), TeamComposition::default());
+        }
+        let path = home.join(".clank/config.json");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, serde_json::to_string_pretty(&cfg).unwrap()).unwrap();
+    }
+
+    #[test]
+    fn write_repo_team_field_records_team_in_new_schema() {
+        use crate::cli::teams_config::{RepoConfigFile, TeamField};
+        let user_home = tempfile::tempdir().unwrap();
+        write_user_teams(user_home.path(), &["dev"]);
+        // Point HOME at the seeded user-scope.
+        let prev_home = std::env::var_os("HOME");
+        // SAFETY: tests are serialized via the lock below.
+        let _lock = home_test_lock().lock().unwrap();
+        unsafe {
+            std::env::set_var("HOME", user_home.path());
+        }
+
+        let repo = init_repo();
+        write_repo_team_field(repo.path(), "dev").unwrap();
+        let body = std::fs::read_to_string(repo.path().join(".clank/config.json")).unwrap();
+        let parsed: RepoConfigFile = serde_json::from_str(&body).unwrap();
+        match parsed.team {
+            Some(TeamField::Single(ref s)) => assert_eq!(s, "dev"),
+            other => panic!("expected Single(dev); got {other:?}"),
+        }
+
+        // Restore HOME so other tests don't see ours.
+        unsafe {
+            match prev_home {
+                Some(v) => std::env::set_var("HOME", v),
+                None => std::env::remove_var("HOME"),
+            }
+        }
+    }
+
+    #[test]
+    fn write_repo_team_field_rejects_unknown_team() {
+        let user_home = tempfile::tempdir().unwrap();
+        write_user_teams(user_home.path(), &["dev"]);
+        let prev_home = std::env::var_os("HOME");
+        let _lock = home_test_lock().lock().unwrap();
+        unsafe {
+            std::env::set_var("HOME", user_home.path());
+        }
+
+        let repo = init_repo();
+        let err = write_repo_team_field(repo.path(), "nonexistent").unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("not declared"));
+        assert!(msg.contains("clank team create"));
+        assert!(
+            !repo.path().join(".clank/config.json").exists() || {
+                let body = std::fs::read_to_string(repo.path().join(".clank/config.json"))
+                    .unwrap_or_default();
+                !body.contains("\"team\"")
+            }
+        );
+
+        unsafe {
+            match prev_home {
+                Some(v) => std::env::set_var("HOME", v),
+                None => std::env::remove_var("HOME"),
+            }
+        }
+    }
+
+    /// Tests that mutate `$HOME` MUST serialize against each
+    /// other; otherwise cargo's parallel test runner produces
+    /// flaky cross-test contamination. (`std::env` is process-
+    /// global.)
+    fn home_test_lock() -> &'static std::sync::Mutex<()> {
+        use std::sync::OnceLock;
+        static LOCK: OnceLock<std::sync::Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| std::sync::Mutex::new(()))
     }
 
     #[test]

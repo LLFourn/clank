@@ -106,6 +106,16 @@ pub struct InitArgs {
     /// Overwrite an existing foreign `post-rewrite` hook.
     #[arg(long)]
     pub force_hooks: bool,
+    /// Pick a user-scope team for this repo. Writes the
+    /// `team: "<name>"` field to `<repo>/.clank/config.json`.
+    /// The team must exist in `~/.clank/config.json#/teams`
+    /// (create one with `clank team create <name>` first).
+    /// Plan: `teams-based-agent-registration`. When omitted,
+    /// no team field is written (registration falls back to
+    /// the legacy `default_agents` / per-agent skeleton model
+    /// until phase 6 cuts over).
+    #[arg(long, value_name = "NAME")]
+    pub team: Option<String>,
 }
 
 #[derive(Args, Debug)]
