@@ -49,7 +49,11 @@ pub async fn run(args: InitArgs) -> anyhow::Result<()> {
     // the new resolver to actually USE this field comes in
     // a later phase; for now, init just persists the choice.
     if let Some(team_name) = args.team.as_deref() {
-        write_repo_team_field(&repo, team_name)?;
+        let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+        let home_ref = home
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("$HOME not set; --team requires a user-scope config"))?;
+        write_repo_team_field(home_ref, &repo, team_name)?;
     }
     Ok(())
 }
@@ -704,38 +708,31 @@ fn matched_by_clank_gitignore(record: &str) -> bool {
 ///   through the new schema's `extra` flatten catchall, so
 ///   unknown fields (review/hooks/diff sections, etc.) are
 ///   preserved.
-fn write_repo_team_field(repo: &Path, team_name: &str) -> anyhow::Result<()> {
+fn write_repo_team_field(home: &Path, repo: &Path, team_name: &str) -> anyhow::Result<()> {
     use crate::cli::teams_config::{RepoConfigFile, TeamField, UserConfigFile};
     use anyhow::Context;
     use std::io::Write;
 
     // Validate against user-scope teams.
-    let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
-    if let Some(home) = home {
-        let user_path = home.join(".clank/config.json");
-        let user_cfg: UserConfigFile = match std::fs::read_to_string(&user_path) {
-            Ok(s) => serde_json::from_str(&s).with_context(|| {
-                format!(
-                    "parsing {} as new-schema UserConfigFile",
-                    user_path.display()
-                )
-            })?,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => UserConfigFile::default(),
-            Err(e) => {
-                return Err(
-                    anyhow::Error::from(e).context(format!("reading {}", user_path.display()))
-                );
-            }
-        };
-        if !user_cfg.teams.contains_key(team_name) {
-            anyhow::bail!(
-                "team `{team_name}` not declared in user-scope teams. Create it with \
-                 `clank team create {team_name}` (and optionally `clank team set-master \
-                 {team_name} <agent>` + `clank team add {team_name} <agent>`) first."
-            );
+    let user_path = home.join(".clank/config.json");
+    let user_cfg: UserConfigFile = match std::fs::read_to_string(&user_path) {
+        Ok(s) => serde_json::from_str(&s).with_context(|| {
+            format!(
+                "parsing {} as new-schema UserConfigFile",
+                user_path.display()
+            )
+        })?,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => UserConfigFile::default(),
+        Err(e) => {
+            return Err(anyhow::Error::from(e).context(format!("reading {}", user_path.display())));
         }
-    } else {
-        anyhow::bail!("$HOME not set; --team requires a user-scope config");
+    };
+    if !user_cfg.teams.contains_key(team_name) {
+        anyhow::bail!(
+            "team `{team_name}` not declared in user-scope teams. Create it with \
+             `clank team create {team_name}` (and optionally `clank team set-master \
+             {team_name} <agent>` + `clank team add {team_name} <agent>`) first."
+        );
     }
 
     let repo_cfg_path = repo.join(".clank/config.json");
@@ -1013,29 +1010,13 @@ mod tests {
         use crate::cli::teams_config::{RepoConfigFile, TeamField};
         let user_home = tempfile::tempdir().unwrap();
         write_user_teams(user_home.path(), &["dev"]);
-        // Point HOME at the seeded user-scope.
-        let prev_home = std::env::var_os("HOME");
-        // SAFETY: tests are serialized via the lock below.
-        let _lock = home_test_lock().lock().unwrap();
-        unsafe {
-            std::env::set_var("HOME", user_home.path());
-        }
-
         let repo = init_repo();
-        write_repo_team_field(repo.path(), "dev").unwrap();
+        write_repo_team_field(user_home.path(), repo.path(), "dev").unwrap();
         let body = std::fs::read_to_string(repo.path().join(".clank/config.json")).unwrap();
         let parsed: RepoConfigFile = serde_json::from_str(&body).unwrap();
         match parsed.team {
             Some(TeamField::Single(ref s)) => assert_eq!(s, "dev"),
             other => panic!("expected Single(dev); got {other:?}"),
-        }
-
-        // Restore HOME so other tests don't see ours.
-        unsafe {
-            match prev_home {
-                Some(v) => std::env::set_var("HOME", v),
-                None => std::env::remove_var("HOME"),
-            }
         }
     }
 
@@ -1043,14 +1024,8 @@ mod tests {
     fn write_repo_team_field_rejects_unknown_team() {
         let user_home = tempfile::tempdir().unwrap();
         write_user_teams(user_home.path(), &["dev"]);
-        let prev_home = std::env::var_os("HOME");
-        let _lock = home_test_lock().lock().unwrap();
-        unsafe {
-            std::env::set_var("HOME", user_home.path());
-        }
-
         let repo = init_repo();
-        let err = write_repo_team_field(repo.path(), "nonexistent").unwrap_err();
+        let err = write_repo_team_field(user_home.path(), repo.path(), "nonexistent").unwrap_err();
         let msg = format!("{err:#}");
         assert!(msg.contains("not declared"));
         assert!(msg.contains("clank team create"));
@@ -1061,23 +1036,6 @@ mod tests {
                 !body.contains("\"team\"")
             }
         );
-
-        unsafe {
-            match prev_home {
-                Some(v) => std::env::set_var("HOME", v),
-                None => std::env::remove_var("HOME"),
-            }
-        }
-    }
-
-    /// Tests that mutate `$HOME` MUST serialize against each
-    /// other; otherwise cargo's parallel test runner produces
-    /// flaky cross-test contamination. (`std::env` is process-
-    /// global.)
-    fn home_test_lock() -> &'static std::sync::Mutex<()> {
-        use std::sync::OnceLock;
-        static LOCK: OnceLock<std::sync::Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| std::sync::Mutex::new(()))
     }
 
     #[test]
