@@ -208,6 +208,20 @@ fn role_from_registered_set(
 fn try_resolve_via_team(
     repo: &Path,
 ) -> anyhow::Result<Option<crate::cli::teams_config::RegisteredSet>> {
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    try_resolve_via_team_with(repo, home.as_deref())
+}
+
+/// Plan: teams-based-agent-registration (ruthless pin 1).
+///
+/// Testable workhorse that the production [`try_resolve_via_team`]
+/// wraps with `$HOME`. Same semantics; explicit `home`
+/// parameter so tests can seed both repo and user configs
+/// without env mutation.
+fn try_resolve_via_team_with(
+    repo: &Path,
+    home: Option<&Path>,
+) -> anyhow::Result<Option<crate::cli::teams_config::RegisteredSet>> {
     use crate::cli::teams_config::{RepoConfigFile, UserConfigFile, resolve_registered_set};
 
     let repo_cfg_path = repo.join(".clank/config.json");
@@ -234,8 +248,7 @@ fn try_resolve_via_team(
     }
 
     // Team is set: read user-scope new schema and resolve.
-    let home = std::env::var_os("HOME").map(PathBuf::from);
-    let user_cfg: UserConfigFile = match home.as_deref() {
+    let user_cfg: UserConfigFile = match home {
         Some(h) => {
             let p = h.join(".clank/config.json");
             match std::fs::read_to_string(&p) {
@@ -497,6 +510,140 @@ mod tests {
         assert_eq!(
             role_from_registered_set(&set, &label("phantom")),
             Role::default()
+        );
+    }
+
+    // ── try_resolve_via_team_with — dispatch coverage
+    //    (ruthless pin 1 on 8c0fdb2: the dispatch helper had
+    //    no tests despite codex catching two bugs in it). ──
+
+    use crate::cli::teams_config::{TeamComposition, UserConfigFile};
+    use std::collections::BTreeMap;
+    use tempfile::TempDir;
+
+    fn write_repo_config(repo: &Path, body: &str) {
+        let p = repo.join(".clank/config.json");
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(&p, body).unwrap();
+    }
+
+    fn write_user_config_with_team(home: &Path) {
+        let mut user_cfg = UserConfigFile::default();
+        user_cfg.agents.insert(
+            label("codex"),
+            AgentDescription {
+                tool: Tool::Codex,
+                launch: None,
+                initial_prompt: None,
+            },
+        );
+        user_cfg.agents.insert(
+            label("claude"),
+            AgentDescription {
+                tool: Tool::Claude,
+                launch: None,
+                initial_prompt: None,
+            },
+        );
+        let mut teams = BTreeMap::new();
+        teams.insert(
+            "dev".to_string(),
+            TeamComposition {
+                master: Some(label("codex")),
+                commit_reviewers: vec![label("claude")],
+                gate_reviewers: vec![],
+            },
+        );
+        user_cfg.teams = teams;
+        let p = home.join(".clank/config.json");
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(&p, serde_json::to_string_pretty(&user_cfg).unwrap()).unwrap();
+    }
+
+    #[test]
+    fn try_resolve_via_team_with_returns_none_when_repo_config_missing() {
+        let repo = TempDir::new().unwrap();
+        let home = TempDir::new().unwrap();
+        let r = try_resolve_via_team_with(repo.path(), Some(home.path())).unwrap();
+        assert!(r.is_none(), "no repo config → None (legacy fallback)");
+    }
+
+    #[test]
+    fn try_resolve_via_team_with_returns_none_when_no_team_field() {
+        // Repo config exists but has no `team` field set.
+        let repo = TempDir::new().unwrap();
+        let home = TempDir::new().unwrap();
+        write_repo_config(repo.path(), "{}");
+        let r = try_resolve_via_team_with(repo.path(), Some(home.path())).unwrap();
+        assert!(r.is_none(), "no team field → None (legacy fallback)");
+    }
+
+    #[test]
+    fn try_resolve_via_team_with_returns_set_when_team_resolves() {
+        let repo = TempDir::new().unwrap();
+        let home = TempDir::new().unwrap();
+        write_user_config_with_team(home.path());
+        write_repo_config(repo.path(), r#"{"team": "dev"}"#);
+        let set = try_resolve_via_team_with(repo.path(), Some(home.path()))
+            .unwrap()
+            .expect("team field present → Some(set)");
+        assert_eq!(set.master.as_str(), "codex");
+        assert_eq!(set.commit_reviewers.len(), 1);
+        assert_eq!(set.commit_reviewers[0].label.as_str(), "claude");
+    }
+
+    #[test]
+    fn try_resolve_via_team_with_fails_closed_on_malformed_repo_config() {
+        // Codex b59dafb fail-closed catch: a present-but-
+        // malformed `team` field must error, NOT fall back to
+        // legacy reviewers. Here `team: 42` is structurally
+        // invalid for the TeamField untagged enum.
+        let repo = TempDir::new().unwrap();
+        let home = TempDir::new().unwrap();
+        write_repo_config(repo.path(), r#"{"team": 42}"#);
+        let err = try_resolve_via_team_with(repo.path(), Some(home.path())).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("RepoConfigFile"),
+            "expected parse-failure error for malformed team field; got: {msg}"
+        );
+    }
+
+    #[test]
+    fn try_resolve_via_team_with_legacy_agents_array_lands_in_extra_returns_none() {
+        // Back-compat property: a legacy `agents` array shape
+        // parses cleanly via the new schema (lands in `extra`),
+        // and the absence of a `team` field then routes to
+        // legacy fallback. A regression here would fail-closed
+        // on every unmigrated repo — disastrous.
+        let repo = TempDir::new().unwrap();
+        let home = TempDir::new().unwrap();
+        write_repo_config(
+            repo.path(),
+            r#"{"agents": [{"label": "claude", "role": "master", "tool": "claude"}]}"#,
+        );
+        let r = try_resolve_via_team_with(repo.path(), Some(home.path())).unwrap();
+        assert!(
+            r.is_none(),
+            "legacy agents shape parses + no team field → None (legacy fallback)"
+        );
+    }
+
+    #[test]
+    fn try_resolve_via_team_with_propagates_resolver_errors() {
+        // Team is set but the named team doesn't exist in
+        // user-scope → ResolutionError::UnknownTeam propagates.
+        let repo = TempDir::new().unwrap();
+        let home = TempDir::new().unwrap();
+        // user-scope has no teams.
+        std::fs::create_dir_all(home.path().join(".clank")).unwrap();
+        std::fs::write(home.path().join(".clank/config.json"), "{}").unwrap();
+        write_repo_config(repo.path(), r#"{"team": "phantom"}"#);
+        let err = try_resolve_via_team_with(repo.path(), Some(home.path())).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("phantom") || msg.contains("not declared") || msg.contains("UnknownTeam"),
+            "expected UnknownTeam error; got: {msg}"
         );
     }
 }
