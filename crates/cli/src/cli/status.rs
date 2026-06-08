@@ -10,7 +10,6 @@ use std::time::Duration;
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 
 use super::{StatusArgs, repo_basename, resolve_repo};
-use crate::agent_store::load_expected_reviewers;
 use crate::cli::plan_resolve::parse_arg;
 use crate::lifecycle::PlanKey;
 use crate::repo_state::RepoState;
@@ -57,17 +56,16 @@ impl StatusSnapshot {
         let worktree_dirty = worktree_dirty(repo)?;
 
         let config = crate::cli::config::load(repo);
+        // Phase 6b of teams-based-agent-registration: dispatch
+        // to the new two-tier resolver when the repo config has
+        // a `team` field; fall back to single-list legacy when
+        // it doesn't. load_reviewer_tiers does the routing.
+        let (commit_reviewers, gate_reviewers) = crate::agent_store::load_reviewer_tiers(repo)?;
         let work_policy = clank_core::wait::WorkPolicy {
             plan_feedback: config.review.plan_feedback,
             adhoc_feedback: config.review.adhoc_feedback,
-            // Phase 3 of teams-based-agent-registration: gate
-            // reviewers default to empty until the new resolver
-            // is wired in. Existing single-list semantics are
-            // preserved via commit_reviewers; the
-            // ApprovedPendingGate state never fires until
-            // gate_reviewers is populated.
-            commit_reviewers: load_expected_reviewers(repo)?,
-            gate_reviewers: Vec::new(),
+            commit_reviewers,
+            gate_reviewers,
         };
         let reviews =
             crate::fs_plan_state_lookup::FsPlanStateLookup::new(repo, state.head.as_ref());

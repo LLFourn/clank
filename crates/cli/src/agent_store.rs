@@ -107,6 +107,78 @@ pub fn load_expected_reviewers(repo: &Path) -> anyhow::Result<Vec<AgentLabel>> {
         .collect())
 }
 
+/// Plan: teams-based-agent-registration (phase 6b).
+///
+/// Two-tier reviewer split for a repo. Used by `WorkPolicy`
+/// construction sites (status, wfw, open) to feed the
+/// two-tier gate state machine introduced in phase 3.
+///
+/// Returns `(commit_reviewers, gate_reviewers)`:
+/// - If the repo config has a `team` field set, runs
+///   `resolve_registered_set` against the new typed schemas.
+///   commit_reviewers and gate_reviewers come from the
+///   resolved set's reviewer lists.
+/// - If `team` is unset (legacy repo), falls back to
+///   `load_expected_reviewers` (single list) and returns it
+///   as `commit_reviewers` with empty `gate_reviewers` —
+///   preserves pre-plan behavior exactly.
+///
+/// This is the production cutover surface: subsequent
+/// phases remove the fallback path entirely.
+pub fn load_reviewer_tiers(repo: &Path) -> anyhow::Result<(Vec<AgentLabel>, Vec<AgentLabel>)> {
+    use crate::cli::teams_config::{RepoConfigFile, UserConfigFile, resolve_registered_set};
+
+    // Try the new path: read repo config as new-schema and
+    // check for `team`. If no team field, fall back.
+    let repo_cfg_path = repo.join(".clank/config.json");
+    let repo_cfg: RepoConfigFile = match std::fs::read_to_string(&repo_cfg_path) {
+        Ok(s) => match serde_json::from_str(&s) {
+            Ok(c) => c,
+            Err(_) => {
+                // Repo config didn't parse as new-schema (e.g.
+                // legacy `agents` array shape). Fall back to
+                // legacy path.
+                return Ok((load_expected_reviewers(repo)?, Vec::new()));
+            }
+        },
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => RepoConfigFile::default(),
+        Err(e) => return Err(e.into()),
+    };
+    if repo_cfg.team.is_none() {
+        // No team set → legacy behavior.
+        return Ok((load_expected_reviewers(repo)?, Vec::new()));
+    }
+
+    // Team is set: read user-scope new schema and resolve.
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    let user_cfg: UserConfigFile = match home.as_deref() {
+        Some(h) => {
+            let p = h.join(".clank/config.json");
+            match std::fs::read_to_string(&p) {
+                Ok(s) => serde_json::from_str(&s).map_err(|e| {
+                    anyhow::anyhow!("parsing {} as new-schema UserConfigFile: {e}", p.display())
+                })?,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => UserConfigFile::default(),
+                Err(e) => return Err(e.into()),
+            }
+        }
+        None => UserConfigFile::default(),
+    };
+
+    let resolved = resolve_registered_set(&user_cfg, &repo_cfg)?;
+    let commit = resolved
+        .commit_reviewers
+        .into_iter()
+        .map(|a| a.label)
+        .collect();
+    let gate = resolved
+        .gate_reviewers
+        .into_iter()
+        .map(|a| a.label)
+        .collect();
+    Ok((commit, gate))
+}
+
 /// Same as [`load_all_agent_configs`] but silently drops agents
 /// whose `config.json` failed to parse. Use this for the identity
 /// resolver path where a single broken config shouldn't take

@@ -164,11 +164,15 @@ pub async fn run(args: WfwArgs) -> anyhow::Result<()> {
 
     let config = crate::cli::config::load(&repo);
     let hook_config = config.hooks.clone();
+    // Phase 6b of teams-based-agent-registration: dispatch to
+    // the new two-tier resolver when the repo config has a
+    // `team` field; legacy single-list fallback otherwise.
+    let (commit_reviewers, gate_reviewers) = crate::agent_store::load_reviewer_tiers(&repo)?;
     let work_policy = clank_core::wait::WorkPolicy {
         plan_feedback: config.review.plan_feedback,
         adhoc_feedback: config.review.adhoc_feedback,
-        commit_reviewers: crate::agent_store::load_expected_reviewers(&repo)?,
-        gate_reviewers: Vec::new(),
+        commit_reviewers,
+        gate_reviewers,
     };
 
     let snapshot = StartupSnapshot::capture(&initial_state.fold, plan_filter.as_ref());

@@ -695,21 +695,25 @@ async fn fold_summary(repo_root: &Path) -> (usize, Option<String>, Option<String
             Err(e) => return (0, None, Some(format!("fold failed: {e}"))),
         };
     let config = crate::cli::config::load(repo_root);
-    let expected_reviewers = match crate::agent_store::load_expected_reviewers(repo_root) {
-        Ok(v) => v,
-        Err(e) => {
-            return (
-                0,
-                None,
-                Some(format!("loading registered reviewers failed: {e}")),
-            );
-        }
-    };
+    // Phase 6b of teams-based-agent-registration: dispatch to
+    // the new two-tier resolver when the repo config has a
+    // `team` field; legacy single-list fallback otherwise.
+    let (commit_reviewers, gate_reviewers) =
+        match crate::agent_store::load_reviewer_tiers(repo_root) {
+            Ok(t) => t,
+            Err(e) => {
+                return (
+                    0,
+                    None,
+                    Some(format!("loading registered reviewers failed: {e}")),
+                );
+            }
+        };
     let work_policy = clank_core::wait::WorkPolicy {
         plan_feedback: config.review.plan_feedback,
         adhoc_feedback: config.review.adhoc_feedback,
-        commit_reviewers: expected_reviewers,
-        gate_reviewers: Vec::new(),
+        commit_reviewers,
+        gate_reviewers,
     };
     let reviews =
         crate::fs_plan_state_lookup::FsPlanStateLookup::new(repo_root, state.head.as_ref());
