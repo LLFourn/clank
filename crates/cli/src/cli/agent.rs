@@ -475,13 +475,36 @@ fn add(args: AgentAddArgs) -> anyhow::Result<()> {
         .map(|set| set.iter().any(|e| e.label == label))
         .unwrap_or(false);
     let in_user = user_set.iter().any(|e| e.label == label);
+    // Plan: teams-based-agent-registration (codex ce72b30 catch).
+    // During the dual-write transition, the new `agents` map
+    // is a valid shape on its own (a user who declared
+    // entries via hand-edited config + later runs of phase 5
+    // adds without the legacy field). The pre-check must
+    // consult BOTH schemas; checking only `default_agents`
+    // would let a label that exists in new-schema `agents`
+    // pass the gate, then `write_new_user_agents_entry`'s
+    // unconditional `agents.insert` would silently overwrite
+    // the existing description.
+    let in_user_new_schema = home
+        .as_deref()
+        .map(|h| read_new_user_agents_map(h).map(|m| m.contains_key(&label)))
+        .transpose()?
+        .unwrap_or(false);
 
     if args.global {
-        // User-scope add: refuse if label exists in user-scope OR
-        // in repo-scope (cross-scope ambiguity).
+        // User-scope add: refuse if label exists in EITHER
+        // schema in user-scope OR in repo-scope (cross-scope
+        // ambiguity).
         if in_user {
             anyhow::bail!(
                 "agent `{}` already in user-scope `default_agents`",
+                args.label
+            );
+        }
+        if in_user_new_schema {
+            anyhow::bail!(
+                "agent `{}` already in user-scope `agents` map (new schema). \
+                 Remove the existing declaration first, or pick a different label.",
                 args.label
             );
         }
@@ -888,6 +911,27 @@ fn write_user_config(home: &Path, file: &UserConfigFile) -> anyhow::Result<()> {
 
 /// Plan: teams-based-agent-registration (phase 5).
 ///
+/// Read-only inspection of the new-schema `agents` map for the
+/// duplicate pre-check in `clank agent add --global`. Returns
+/// an empty map if the file doesn't exist.
+fn read_new_user_agents_map(
+    home: &Path,
+) -> anyhow::Result<
+    std::collections::BTreeMap<AgentLabel, crate::cli::teams_config::AgentDescription>,
+> {
+    use crate::cli::teams_config::UserConfigFile as NewUserConfigFile;
+    let path = home.join(".clank/config.json");
+    let file: NewUserConfigFile = match std::fs::read_to_string(&path) {
+        Ok(s) => serde_json::from_str(&s)
+            .with_context(|| format!("parsing {} as new-schema UserConfigFile", path.display()))?,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => NewUserConfigFile::default(),
+        Err(e) => return Err(anyhow::Error::from(e).context(format!("reading {}", path.display()))),
+    };
+    Ok(file.agents)
+}
+
+/// Plan: teams-based-agent-registration (phase 5).
+///
 /// Dual-write helper: after `clank agent add --global` writes
 /// to the legacy `default_agents`, this helper opens the same
 /// file via the NEW `teams_config::UserConfigFile` schema and
@@ -1014,6 +1058,63 @@ mod tests {
         // Legacy field is in extra (the new schema doesn't know
         // about default_agents directly).
         assert!(new_cfg.extra.contains_key("default_agents"));
+    }
+
+    #[test]
+    fn read_new_user_agents_map_detects_existing_new_schema_label() {
+        // Codex ce72b30 catch: during the dual-write
+        // transition, the new `agents` map is a valid shape on
+        // its own. The pre-check in `add` must detect labels
+        // declared via that map even when `default_agents`
+        // doesn't list them, OR `write_new_user_agents_entry`'s
+        // unconditional `insert` would silently overwrite the
+        // existing description.
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        let cfg_path = home.join(".clank/config.json");
+        std::fs::create_dir_all(cfg_path.parent().unwrap()).unwrap();
+        // File has only the new-schema `agents` map populated
+        // (no `default_agents` field). This simulates a user
+        // who hand-edited their config or who'll only ever use
+        // the new path going forward.
+        std::fs::write(&cfg_path, r#"{"agents":{"claude":{"tool":"claude"}}}"#).unwrap();
+
+        let map = read_new_user_agents_map(home).unwrap();
+        let label = AgentLabel::parse("claude").unwrap();
+        assert!(
+            map.contains_key(&label),
+            "new-schema agents map should contain claude; got {map:?}"
+        );
+    }
+
+    #[test]
+    fn read_new_user_agents_map_returns_empty_when_no_file() {
+        // Pre-check shouldn't blow up on a fresh repo with no
+        // user-scope config.
+        let dir = tempfile::tempdir().unwrap();
+        let map = read_new_user_agents_map(dir.path()).unwrap();
+        assert!(map.is_empty());
+    }
+
+    #[test]
+    fn read_new_user_agents_map_returns_empty_when_default_agents_only() {
+        // The fallback case the prior pre-check covered. The
+        // new-schema check should NOT flag a label that only
+        // exists in legacy `default_agents`.
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        let cfg_path = home.join(".clank/config.json");
+        std::fs::create_dir_all(cfg_path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &cfg_path,
+            r#"{"default_agents":[{"label":"codex","role":"reviewer","tool":"codex"}]}"#,
+        )
+        .unwrap();
+        let map = read_new_user_agents_map(home).unwrap();
+        assert!(
+            map.is_empty(),
+            "new-schema agents map should be empty when only default_agents present; got {map:?}"
+        );
     }
 
     #[test]
