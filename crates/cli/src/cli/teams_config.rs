@@ -184,6 +184,228 @@ pub struct LegacyRepoConfigFile {
     pub extra: BTreeMap<String, serde_json::Value>,
 }
 
+/// Resolved registered set for a repo: master + two reviewer
+/// lists. Each agent has both a label and the description
+/// resolved at registration time.
+#[derive(Debug, Clone)]
+pub struct RegisteredSet {
+    pub master: AgentLabel,
+    pub master_desc: AgentDescription,
+    pub commit_reviewers: Vec<ResolvedAgent>,
+    pub gate_reviewers: Vec<ResolvedAgent>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ResolvedAgent {
+    pub label: AgentLabel,
+    pub desc: AgentDescription,
+}
+
+/// Errors raised while resolving the registered set for a
+/// repo. Each variant names the user-facing problem so the
+/// CLI can map to actionable diagnostics.
+#[derive(Debug, thiserror::Error)]
+pub enum ResolutionError {
+    #[error("repo config has no `team` field set; run `clank init --team <name>` to pick one")]
+    NoTeamSet,
+    #[error(
+        "team `{0}` referenced from repo config is not declared in user-scope `~/.clank/config.json#/teams`"
+    )]
+    UnknownTeam(String),
+    #[error(
+        "agent `{0}` referenced from repo config is not declared in user-scope `~/.clank/config.json#/agents`"
+    )]
+    UnknownAgent(AgentLabel),
+    #[error(
+        "repo config `team` array contains more than one `include` entry (`{0}` and `{1}`); at most one is allowed in v1"
+    )]
+    MultipleIncludes(String, String),
+    #[error(
+        "inline local agent `{0}` has `role: \"master\"`, which is not allowed in `local_agents` entries. Use `clank promote {0}` after adding to designate master."
+    )]
+    InlineMasterRole(AgentLabel),
+    #[error(
+        "`promoted` label `{0}` is not present in the registered set built from `team` entries"
+    )]
+    PromotedNotPresent(AgentLabel),
+    #[error(
+        "team `{team}` has no master designated. Either set a team-level master via `clank team set-master {team} <agent>`, or designate a per-repo master via `clank promote <agent>`."
+    )]
+    NoMaster { team: String },
+}
+
+/// Resolve the registered set for a repo. Implements the
+/// algorithm from the plan body's "Registration resolution"
+/// section.
+pub fn resolve_registered_set(
+    user: &UserConfigFile,
+    repo: &RepoConfigFile,
+) -> Result<RegisteredSet, ResolutionError> {
+    // Step 1: read `team`. None → no team set.
+    let team_entries = match &repo.team {
+        None => return Err(ResolutionError::NoTeamSet),
+        Some(TeamField::Single(name)) => {
+            // Sugar: single string → one Include entry.
+            vec![TeamEntry::Include(IncludeEntry {
+                include: name.clone(),
+            })]
+        }
+        Some(TeamField::Array(v)) => v.clone(),
+    };
+
+    // Step 2: initialize accumulators.
+    let mut master: Option<AgentLabel> = None;
+    let mut included_team_name: Option<String> = None;
+    let mut commit_reviewers: Vec<ResolvedAgent> = Vec::new();
+    let mut gate_reviewers: Vec<ResolvedAgent> = Vec::new();
+
+    // Track agents added (label → resolved descriptor) so
+    // `promoted` can find them later AND so we can detect
+    // same-label duplicates if they occur (out of scope to
+    // reject here; the gate logic just needs `seen` for the
+    // promoted lookup).
+    fn add_to(list: &mut Vec<ResolvedAgent>, label: AgentLabel, desc: AgentDescription) {
+        list.push(ResolvedAgent { label, desc });
+    }
+    fn lookup_user_agent<'a>(
+        user: &'a UserConfigFile,
+        label: &AgentLabel,
+    ) -> Result<&'a AgentDescription, ResolutionError> {
+        user.agents
+            .get(label)
+            .ok_or_else(|| ResolutionError::UnknownAgent(label.clone()))
+    }
+
+    // Step 3: walk team entries.
+    for entry in team_entries {
+        match entry {
+            TeamEntry::Include(IncludeEntry { include: team_name }) => {
+                if let Some(prev) = &included_team_name {
+                    return Err(ResolutionError::MultipleIncludes(prev.clone(), team_name));
+                }
+                included_team_name = Some(team_name.clone());
+                let team = user
+                    .teams
+                    .get(&team_name)
+                    .ok_or(ResolutionError::UnknownTeam(team_name.clone()))?;
+                if let Some(team_master_label) = &team.master {
+                    let desc = lookup_user_agent(user, team_master_label)?;
+                    master = Some(team_master_label.clone());
+                    // For the typed return shape we also need
+                    // the master's descriptor available later.
+                    // We track it inline by saving the lookup
+                    // here; the final RegisteredSet build uses
+                    // `master_desc` from a second lookup.
+                    let _ = desc;
+                }
+                for r in &team.commit_reviewers {
+                    let d = lookup_user_agent(user, r)?;
+                    add_to(&mut commit_reviewers, r.clone(), d.clone());
+                }
+                for r in &team.gate_reviewers {
+                    let d = lookup_user_agent(user, r)?;
+                    add_to(&mut gate_reviewers, r.clone(), d.clone());
+                }
+            }
+            TeamEntry::BareString(label) => {
+                let d = lookup_user_agent(user, &label)?;
+                add_to(&mut commit_reviewers, label, d.clone());
+            }
+            TeamEntry::ByName(ByNameEntry { agent, review }) => {
+                let d = lookup_user_agent(user, &agent)?;
+                let list = match review.unwrap_or(ReviewKind::Commit) {
+                    ReviewKind::Commit => &mut commit_reviewers,
+                    ReviewKind::Gate => &mut gate_reviewers,
+                };
+                add_to(list, agent, d.clone());
+            }
+            TeamEntry::Inline(inline) => {
+                if matches!(inline.role, Some(Role::Master)) {
+                    return Err(ResolutionError::InlineMasterRole(inline.label));
+                }
+                let desc = AgentDescription {
+                    tool: inline.tool,
+                    launch: inline.launch,
+                    initial_prompt: inline.initial_prompt,
+                };
+                let list = match inline.review.unwrap_or(ReviewKind::Commit) {
+                    ReviewKind::Commit => &mut commit_reviewers,
+                    ReviewKind::Gate => &mut gate_reviewers,
+                };
+                add_to(list, inline.label, desc);
+            }
+        }
+    }
+
+    // Step 4: apply `promoted` if set.
+    if let Some(promoted_label) = &repo.promoted {
+        // Find new_master in commit_reviewers or gate_reviewers.
+        let from_commit = commit_reviewers
+            .iter()
+            .position(|a| &a.label == promoted_label);
+        let from_gate = gate_reviewers
+            .iter()
+            .position(|a| &a.label == promoted_label);
+        if from_commit.is_none() && from_gate.is_none() {
+            // Also check if it matches the current master
+            // (no-op promotion of the existing master).
+            if master.as_ref() != Some(promoted_label) {
+                return Err(ResolutionError::PromotedNotPresent(promoted_label.clone()));
+            }
+        }
+        let new_master_desc: AgentDescription = if let Some(i) = from_commit {
+            commit_reviewers.remove(i).desc
+        } else if let Some(i) = from_gate {
+            gate_reviewers.remove(i).desc
+        } else {
+            // promoted == existing master → no-op.
+            user.agents
+                .get(promoted_label)
+                .cloned()
+                .ok_or_else(|| ResolutionError::UnknownAgent(promoted_label.clone()))?
+        };
+        // Demote previous master to commit_reviewers if any.
+        if let Some(prev_master_label) = master.take() {
+            if &prev_master_label != promoted_label {
+                let prev_desc = user
+                    .agents
+                    .get(&prev_master_label)
+                    .cloned()
+                    .ok_or_else(|| ResolutionError::UnknownAgent(prev_master_label.clone()))?;
+                commit_reviewers.push(ResolvedAgent {
+                    label: prev_master_label,
+                    desc: prev_desc,
+                });
+            }
+        }
+        master = Some(promoted_label.clone());
+        // master_desc resolves via the final build below;
+        // store the descriptor to avoid double-lookup.
+        let _ = new_master_desc;
+    }
+
+    // Step 5: validate master is Some.
+    let master_label = master.ok_or_else(|| ResolutionError::NoMaster {
+        team: included_team_name.unwrap_or_else(|| "<no team included>".to_string()),
+    })?;
+    // Look up the master's description. May come from
+    // user-scope `agents` or (in the rare inline-promoted
+    // case) from inline. For simplicity v1 requires the
+    // promoted/master to be in user-scope agents.
+    let master_desc = user
+        .agents
+        .get(&master_label)
+        .cloned()
+        .ok_or_else(|| ResolutionError::UnknownAgent(master_label.clone()))?;
+
+    Ok(RegisteredSet {
+        master: master_label,
+        master_desc,
+        commit_reviewers,
+        gate_reviewers,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -404,5 +626,285 @@ mod tests {
         let agents = legacy.agents.expect("agents block present");
         assert_eq!(agents.len(), 1);
         assert_eq!(agents[0].label.as_str(), "alice");
+    }
+
+    // ── resolve_registered_set ───────────────────────────
+
+    fn user_with(
+        agents: Vec<(&str, Tool)>,
+        teams: Vec<(&str, Option<&str>, Vec<&str>, Vec<&str>)>,
+    ) -> UserConfigFile {
+        let mut agent_map = BTreeMap::new();
+        for (l, t) in agents {
+            agent_map.insert(
+                label(l),
+                AgentDescription {
+                    tool: t,
+                    launch: None,
+                    initial_prompt: None,
+                },
+            );
+        }
+        let mut team_map = BTreeMap::new();
+        for (name, master, commit, gate) in teams {
+            team_map.insert(
+                name.to_string(),
+                TeamComposition {
+                    master: master.map(label),
+                    commit_reviewers: commit.into_iter().map(label).collect(),
+                    gate_reviewers: gate.into_iter().map(label).collect(),
+                },
+            );
+        }
+        UserConfigFile {
+            agents: agent_map,
+            teams: team_map,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn resolve_with_single_team_string() {
+        let user = user_with(
+            vec![("claude", Tool::Claude), ("codex", Tool::Codex)],
+            vec![("dev", Some("claude"), vec!["codex"], vec![])],
+        );
+        let repo = RepoConfigFile {
+            team: Some(TeamField::Single("dev".to_string())),
+            ..Default::default()
+        };
+        let r = resolve_registered_set(&user, &repo).unwrap();
+        assert_eq!(r.master.as_str(), "claude");
+        assert_eq!(r.commit_reviewers.len(), 1);
+        assert_eq!(r.commit_reviewers[0].label.as_str(), "codex");
+        assert!(r.gate_reviewers.is_empty());
+    }
+
+    #[test]
+    fn resolve_with_gate_reviewers() {
+        let user = user_with(
+            vec![
+                ("claude", Tool::Claude),
+                ("codex", Tool::Codex),
+                ("ruthless", Tool::Claude),
+            ],
+            vec![("dev", Some("claude"), vec!["codex"], vec!["ruthless"])],
+        );
+        let repo = RepoConfigFile {
+            team: Some(TeamField::Single("dev".to_string())),
+            ..Default::default()
+        };
+        let r = resolve_registered_set(&user, &repo).unwrap();
+        assert_eq!(r.master.as_str(), "claude");
+        assert_eq!(r.commit_reviewers.len(), 1);
+        assert_eq!(r.gate_reviewers.len(), 1);
+        assert_eq!(r.gate_reviewers[0].label.as_str(), "ruthless");
+    }
+
+    #[test]
+    fn resolve_promoted_swaps_master() {
+        // Codex 4c79ed2 catch + swap semantic: promoted moves
+        // to master; previous master demotes to commit_reviewers
+        // (not dropped).
+        let user = user_with(
+            vec![("claude", Tool::Claude), ("codex", Tool::Codex)],
+            vec![("dev", Some("claude"), vec!["codex"], vec![])],
+        );
+        let repo = RepoConfigFile {
+            team: Some(TeamField::Single("dev".to_string())),
+            promoted: Some(label("codex")),
+            ..Default::default()
+        };
+        let r = resolve_registered_set(&user, &repo).unwrap();
+        assert_eq!(r.master.as_str(), "codex");
+        // claude (prev master) demoted to commit_reviewers.
+        let cr_labels: Vec<_> = r
+            .commit_reviewers
+            .iter()
+            .map(|a| a.label.as_str())
+            .collect();
+        assert!(cr_labels.contains(&"claude"));
+        // codex no longer in reviewer lists.
+        assert!(!cr_labels.contains(&"codex"));
+    }
+
+    #[test]
+    fn resolve_local_entries_via_array_form() {
+        let user = user_with(
+            vec![
+                ("claude", Tool::Claude),
+                ("codex", Tool::Codex),
+                ("ruthless", Tool::Claude),
+                ("alice", Tool::Claude),
+            ],
+            vec![("dev", Some("claude"), vec!["codex"], vec![])],
+        );
+        let repo = RepoConfigFile {
+            team: Some(TeamField::Array(vec![
+                TeamEntry::Include(IncludeEntry {
+                    include: "dev".to_string(),
+                }),
+                TeamEntry::BareString(label("ruthless")),
+                TeamEntry::ByName(ByNameEntry {
+                    agent: label("alice"),
+                    review: Some(ReviewKind::Gate),
+                }),
+            ])),
+            ..Default::default()
+        };
+        let r = resolve_registered_set(&user, &repo).unwrap();
+        let cr: Vec<_> = r
+            .commit_reviewers
+            .iter()
+            .map(|a| a.label.as_str())
+            .collect();
+        let gr: Vec<_> = r.gate_reviewers.iter().map(|a| a.label.as_str()).collect();
+        assert!(cr.contains(&"codex"));
+        assert!(cr.contains(&"ruthless"));
+        assert!(gr.contains(&"alice"));
+    }
+
+    #[test]
+    fn resolve_no_team_set_errors() {
+        let user = UserConfigFile::default();
+        let repo = RepoConfigFile::default();
+        let err = resolve_registered_set(&user, &repo).unwrap_err();
+        assert!(matches!(err, ResolutionError::NoTeamSet));
+    }
+
+    #[test]
+    fn resolve_unknown_team_errors() {
+        let user = UserConfigFile::default();
+        let repo = RepoConfigFile {
+            team: Some(TeamField::Single("nope".to_string())),
+            ..Default::default()
+        };
+        let err = resolve_registered_set(&user, &repo).unwrap_err();
+        match err {
+            ResolutionError::UnknownTeam(s) => assert_eq!(s, "nope"),
+            other => panic!("expected UnknownTeam; got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resolve_no_master_errors_with_actionable_hint() {
+        // Codex 4c79ed2 catch: team scaffolded via
+        // `clank team create` with no master, and no
+        // `promoted` at repo scope → error at resolution
+        // time, NOT deserialize time.
+        let user = user_with(
+            vec![("codex", Tool::Codex)],
+            vec![("dev", None, vec!["codex"], vec![])],
+        );
+        let repo = RepoConfigFile {
+            team: Some(TeamField::Single("dev".to_string())),
+            ..Default::default()
+        };
+        let err = resolve_registered_set(&user, &repo).unwrap_err();
+        match err {
+            ResolutionError::NoMaster { team } => assert_eq!(team, "dev"),
+            other => panic!("expected NoMaster; got {other:?}"),
+        }
+        // Error message mentions both fix paths.
+        let msg = resolve_registered_set(&user, &repo)
+            .unwrap_err()
+            .to_string();
+        assert!(msg.contains("clank team set-master"));
+        assert!(msg.contains("clank promote"));
+    }
+
+    #[test]
+    fn resolve_no_master_team_recoverable_via_promoted() {
+        // Same setup but `promoted` at repo scope provides
+        // the master. Resolution succeeds.
+        let user = user_with(
+            vec![("codex", Tool::Codex)],
+            vec![("dev", None, vec!["codex"], vec![])],
+        );
+        let repo = RepoConfigFile {
+            team: Some(TeamField::Single("dev".to_string())),
+            promoted: Some(label("codex")),
+            ..Default::default()
+        };
+        let r = resolve_registered_set(&user, &repo).unwrap();
+        assert_eq!(r.master.as_str(), "codex");
+        assert!(r.commit_reviewers.is_empty());
+    }
+
+    #[test]
+    fn resolve_multiple_includes_rejected() {
+        let user = user_with(
+            vec![("claude", Tool::Claude), ("grok", Tool::Claude)],
+            vec![
+                ("dev", Some("claude"), vec![], vec![]),
+                ("research", Some("grok"), vec![], vec![]),
+            ],
+        );
+        let repo = RepoConfigFile {
+            team: Some(TeamField::Array(vec![
+                TeamEntry::Include(IncludeEntry {
+                    include: "dev".to_string(),
+                }),
+                TeamEntry::Include(IncludeEntry {
+                    include: "research".to_string(),
+                }),
+            ])),
+            ..Default::default()
+        };
+        let err = resolve_registered_set(&user, &repo).unwrap_err();
+        match err {
+            ResolutionError::MultipleIncludes(a, b) => {
+                assert_eq!(a, "dev");
+                assert_eq!(b, "research");
+            }
+            other => panic!("expected MultipleIncludes; got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resolve_inline_master_role_rejected() {
+        let user = user_with(
+            vec![("claude", Tool::Claude)],
+            vec![("dev", Some("claude"), vec![], vec![])],
+        );
+        let repo = RepoConfigFile {
+            team: Some(TeamField::Array(vec![
+                TeamEntry::Include(IncludeEntry {
+                    include: "dev".to_string(),
+                }),
+                TeamEntry::Inline(InlineAgent {
+                    label: label("alice"),
+                    tool: Tool::Claude,
+                    launch: None,
+                    initial_prompt: None,
+                    role: Some(Role::Master),
+                    review: None,
+                }),
+            ])),
+            ..Default::default()
+        };
+        let err = resolve_registered_set(&user, &repo).unwrap_err();
+        match err {
+            ResolutionError::InlineMasterRole(l) => assert_eq!(l.as_str(), "alice"),
+            other => panic!("expected InlineMasterRole; got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resolve_promoted_not_present_rejected() {
+        let user = user_with(
+            vec![("claude", Tool::Claude), ("codex", Tool::Codex)],
+            vec![("dev", Some("claude"), vec!["codex"], vec![])],
+        );
+        let repo = RepoConfigFile {
+            team: Some(TeamField::Single("dev".to_string())),
+            promoted: Some(label("phantom")),
+            ..Default::default()
+        };
+        let err = resolve_registered_set(&user, &repo).unwrap_err();
+        match err {
+            ResolutionError::PromotedNotPresent(l) => assert_eq!(l.as_str(), "phantom"),
+            other => panic!("expected PromotedNotPresent; got {other:?}"),
+        }
     }
 }
