@@ -764,6 +764,95 @@ mod tests {
         );
     }
 
+    // ── teams-based-agent-registration: two-tier compute_gate
+    //    edge cases (ruthless pin 1 — defends compute_gate's
+    //    PRODUCTION of the new states; the work_for tests above
+    //    test RECEPTION but bypass compute_gate by constructing
+    //    WorkStatus directly).
+
+    #[test]
+    fn compute_gate_empty_commit_nonempty_gate_returns_approved_pending_gate_immediately() {
+        // The "devolve" property: empty commit_reviewers means
+        // "all commit approved" is vacuously true → state
+        // transitions to ApprovedPendingGate immediately on
+        // first commit (no reviews yet). Gate-reviewer fires
+        // per-commit, functionally as if they were commit-tier.
+        // No special case in code — set semantics produce it.
+        assert_eq!(
+            compute_gate(&[], &[], &[label("ruthless")]),
+            CommitGateState::ApprovedPendingGate
+        );
+    }
+
+    #[test]
+    fn compute_gate_empty_both_returns_approved_not_finished() {
+        // Master-only repo: empty commit + empty gate → Approved
+        // (NOT Finished). Preserves pre-plan behavior; lloyd
+        // 2026-06-08 directive (codex 8cb01b6 catch on the
+        // earlier plan-body drift).
+        assert_eq!(compute_gate(&[], &[], &[]), CommitGateState::Approved);
+    }
+
+    #[test]
+    fn compute_gate_gate_reviewer_rc_trumps_state() {
+        // Gate-tier reviewer's Request-Changes → ChangesRequested
+        // regardless of commit-tier verdicts. The "any reviewer
+        // RC" rule applies uniformly across both tiers.
+        let reviews = [
+            entry(crate::vocab::Verdict::Finished, "codex"),
+            entry(crate::vocab::Verdict::RequestChanges, "ruthless"),
+        ];
+        assert_eq!(
+            compute_gate(&reviews, &[label("codex")], &[label("ruthless")]),
+            CommitGateState::ChangesRequested
+        );
+    }
+
+    #[test]
+    fn compute_gate_gate_reviewer_approves_returns_approved_not_finished() {
+        // All reviewers across both tiers signed off, but ≥1
+        // only Approved (not Finished) → state = Approved (NOT
+        // Finished). Same shape as single-tier "one approve, one
+        // finished" but with the second positive coming from
+        // gate-tier.
+        let reviews = [
+            entry(crate::vocab::Verdict::Finished, "codex"),
+            entry(crate::vocab::Verdict::Approve, "ruthless"),
+        ];
+        assert_eq!(
+            compute_gate(&reviews, &[label("codex")], &[label("ruthless")]),
+            CommitGateState::Approved
+        );
+    }
+
+    #[test]
+    fn compute_gate_gate_reviewer_vote_before_commit_keeps_unreviewed() {
+        // Edge case 5 from the plan body: gate-reviewer who
+        // watches early may vote before commit-reviewers do.
+        // Their verdict is stored, but the state machine reads
+        // commit-reviewers FIRST. The latent gate-reviewer vote
+        // is ignored until commit-reviewers all positive.
+        let reviews = [entry(crate::vocab::Verdict::Approve, "ruthless")];
+        assert_eq!(
+            compute_gate(&reviews, &[label("codex")], &[label("ruthless")]),
+            CommitGateState::Unreviewed
+        );
+    }
+
+    #[test]
+    fn compute_gate_two_tier_all_finished_returns_finished() {
+        // Both tiers all Finished → state = Finished. Completes
+        // the cross-tier verdict matrix.
+        let reviews = [
+            entry(crate::vocab::Verdict::Finished, "codex"),
+            entry(crate::vocab::Verdict::Finished, "ruthless"),
+        ];
+        assert_eq!(
+            compute_gate(&reviews, &[label("codex")], &[label("ruthless")]),
+            CommitGateState::Finished
+        );
+    }
+
     #[test]
     fn compute_gate_filters_stale_request_changes_from_removed_reviewer() {
         // Symmetric case: alice was removed but the dir still exists
