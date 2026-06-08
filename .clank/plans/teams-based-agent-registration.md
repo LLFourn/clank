@@ -258,8 +258,13 @@ Edge cases pinned:
    to gate-reviewer being a commit-reviewer. **No
    special-case code** — set semantics produce it.
 2. **Empty both `commit_reviewers` and `gate_reviewers`**:
-   gate jumps straight to `Finished` (today's
-   zero-reviewer auto-approve behavior).
+   gate stays at `Approved` (matching today's
+   zero-reviewer behavior). Initial draft said
+   `Finished` here, but that would noise every commit
+   in a master-only repo with "ready to finalize"
+   — master keeps working and runs `clank finish` when
+   they decide. Implementation corrected at commit
+   8cb01b6; codex 8cb01b6 caught the plan/code drift.
 3. **Gate-reviewer votes Request-Changes**: trumps state
    regardless of tier — gate transitions to
    `ChangesRequested`. Master revises. After re-commit,

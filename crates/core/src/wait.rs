@@ -567,6 +567,27 @@ impl WorkStatus {
                         sha,
                     });
                 }
+                (Role::Reviewer, WaitingOn::GateReviewersMissing { missing })
+                    if missing.as_slice().iter().any(|l| l == author) =>
+                {
+                    // Gate-tier reviewer wake (codex 8cb01b6 catch):
+                    // ApprovedPendingGate means commit-reviewers are
+                    // all positive; gate-reviewers who haven't voted
+                    // yet need to weigh in. Same shape as the
+                    // commit-tier wake above — emit a Reviewer item
+                    // when THIS reviewer is in the missing set.
+                    // Plan: `teams-based-agent-registration`.
+                    let sha = sha_for_item();
+                    out.push(WaitItem::Reviewer {
+                        plan: ps.plan.clone(),
+                        feedback_path: format!(
+                            ".clank/agents/{}/feedback/{}.md",
+                            author.as_str(),
+                            sha.as_str()
+                        ),
+                        sha,
+                    });
+                }
                 _ => {}
             }
         }
@@ -795,6 +816,12 @@ mod tests {
         WaitingOn::ReviewerApprovalsMissing { missing }
     }
 
+    fn gate_missing(labels: &[&str]) -> WaitingOn {
+        let missing = labels.iter().map(|l| label(l)).collect();
+        let missing = crate::repo_state::NonEmptyVec::new(missing).unwrap();
+        WaitingOn::GateReviewersMissing { missing }
+    }
+
     #[test]
     fn work_for_missing_reviewer_gets_review_item() {
         // Two registered reviewers; neither has reviewed yet. Both
@@ -806,6 +833,51 @@ mod tests {
 
         let ruthless_work = ws.work_for(&label("ruthless"), Role::Reviewer);
         assert_eq!(ruthless_work.len(), 1, "ruthless should get a review item");
+    }
+
+    #[test]
+    fn work_for_missing_gate_reviewer_gets_review_item() {
+        // Plan: teams-based-agent-registration. ApprovedPendingGate
+        // state means commit-tier reviewers all approved; the
+        // listed gate-tier reviewers need to weigh in. Each
+        // missing gate-reviewer should get a Reviewer item via
+        // work_for (codex 8cb01b6 catch).
+        let ws = work_status_with_one_plan(gate_missing(&["ruthless"]));
+        let ruthless_work = ws.work_for(&label("ruthless"), Role::Reviewer);
+        assert_eq!(
+            ruthless_work.len(),
+            1,
+            "ruthless is the missing gate-reviewer; should get a review item"
+        );
+        assert!(matches!(ruthless_work[0], WaitItem::Reviewer { .. }));
+    }
+
+    #[test]
+    fn work_for_non_missing_gate_reviewer_gets_no_item() {
+        // Symmetric to the commit-tier "already approved" rule:
+        // if a gate-reviewer has already posted positive (so
+        // isn't in the missing set), no redundant wake.
+        let ws = work_status_with_one_plan(gate_missing(&["ruthless"]));
+        let other_work = ws.work_for(&label("codex"), Role::Reviewer);
+        assert!(
+            other_work.is_empty(),
+            "codex isn't in the missing gate-reviewer set; should not be woken"
+        );
+    }
+
+    #[test]
+    fn work_for_master_in_approved_pending_gate_state_gets_no_item() {
+        // The whole point of ApprovedPendingGate: master sleeps
+        // while gate-reviewers weigh in. Even though there's a
+        // `master` role asking for work, no Master item should
+        // emit because the gate hasn't transitioned to Approved
+        // yet.
+        let ws = work_status_with_one_plan(gate_missing(&["ruthless"]));
+        let master_work = ws.work_for(&label("lloyd"), Role::Master);
+        assert!(
+            master_work.is_empty(),
+            "master should sleep while gate-reviewers haven't voted; got {master_work:?}"
+        );
     }
 
     #[test]
