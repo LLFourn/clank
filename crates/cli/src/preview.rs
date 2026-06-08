@@ -459,9 +459,13 @@ fn compute_gate(
     let entries = reviews.reviews_for(target);
     let expected_reviewers =
         crate::agent_store::load_expected_reviewers(repo_root).map_err(PreviewError::AgentLoad)?;
+    // Phase 3 of teams-based-agent-registration: gate-tier
+    // reviewers default to empty until the new resolver wires
+    // them in. Existing behavior preserved via commit-tier.
     Ok(clank_core::wait::compute_gate(
         &entries,
         &expected_reviewers,
+        &[],
     ))
 }
 

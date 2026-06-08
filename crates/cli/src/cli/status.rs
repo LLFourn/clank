@@ -60,7 +60,14 @@ impl StatusSnapshot {
         let work_policy = clank_core::wait::WorkPolicy {
             plan_feedback: config.review.plan_feedback,
             adhoc_feedback: config.review.adhoc_feedback,
-            expected_reviewers: load_expected_reviewers(repo)?,
+            // Phase 3 of teams-based-agent-registration: gate
+            // reviewers default to empty until the new resolver
+            // is wired in. Existing single-list semantics are
+            // preserved via commit_reviewers; the
+            // ApprovedPendingGate state never fires until
+            // gate_reviewers is populated.
+            commit_reviewers: load_expected_reviewers(repo)?,
+            gate_reviewers: Vec::new(),
         };
         let reviews =
             crate::fs_plan_state_lookup::FsPlanStateLookup::new(repo, state.head.as_ref());
@@ -420,7 +427,8 @@ fn select_plans_and_finished(
 fn waiting_actor(w: &WaitingOn) -> String {
     match w {
         WaitingOn::Blocked { block } => block.creator.as_str().to_string(),
-        WaitingOn::ReviewerApprovalsMissing { missing } => missing
+        WaitingOn::ReviewerApprovalsMissing { missing }
+        | WaitingOn::GateReviewersMissing { missing } => missing
             .iter()
             .map(|a| a.as_str())
             .collect::<Vec<_>>()
@@ -459,6 +467,14 @@ fn waiting_reason(w: &WaitingOn) -> String {
                 .collect::<Vec<_>>()
                 .join(", ");
             format!("missing approval from {names}")
+        }
+        WaitingOn::GateReviewersMissing { missing } => {
+            let names = missing
+                .iter()
+                .map(|a| a.as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("commit-tier reviewers approved; waiting on gate-tier {names}")
         }
         WaitingOn::MasterToRevise {
             requesters,

@@ -34,12 +34,17 @@ pub struct PlanBlock {
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum WaitingOn {
     /// Latest reviewable commit lacks feedback from one or more
-    /// registered reviewers. `missing` is non-empty by construction.
-    /// (The `FirstReview` variant — "any reviewer eligible" — was
-    /// removed when the all-reviewers gate landed: under the new
-    /// semantics every commit's reviewer set is the registered
-    /// `expected_reviewers` list, never "anyone who shows up".)
+    /// registered COMMIT-tier reviewers. `missing` is non-empty
+    /// by construction. (The `FirstReview` variant — "any reviewer
+    /// eligible" — was removed when the all-reviewers gate
+    /// landed.)
     ReviewerApprovalsMissing { missing: NonEmptyVec<AgentLabel> },
+    /// All commit-reviewers have signed off; one or more
+    /// GATE-tier reviewers haven't voted yet. Plan:
+    /// `teams-based-agent-registration` — gate-reviewers fire
+    /// only at gate-transition moments, not per-commit. `missing`
+    /// is non-empty by construction.
+    GateReviewersMissing { missing: NonEmptyVec<AgentLabel> },
     /// A reviewer requested changes (or left an ambiguous verdict).
     /// Master needs to address.
     MasterToRevise {

@@ -229,6 +229,12 @@ fn reason_to_msg(reason: &FinalizeBlockReason) -> String {
             clank_core::vocab::CommitGateState::Blocked => {
                 "plan has an open block — clear the block before finalize".into()
             }
+            clank_core::vocab::CommitGateState::ApprovedPendingGate => {
+                "latest reviewable commit is approved by commit-tier reviewers; \
+                 gate-tier reviewers haven't all weighed in yet — wait for their FINISHED \
+                 before running finalize"
+                    .into()
+            }
         },
         FinalizeBlockReason::PlanFileMissing => "plan file is missing from the worktree".into(),
         FinalizeBlockReason::PlanFileDirty => {

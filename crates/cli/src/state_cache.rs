@@ -32,7 +32,11 @@ const CACHE_MAGIC: &[u8] = b"CLANK-STATE\n";
 ///   position-encoded; existing v7 payloads would technically
 ///   decode, but bumping forces stale caches to be reclaimed via
 ///   filename mismatch — clean invalidation, no error path needed.
-const CACHE_FORMAT_VERSION: u32 = 8;
+/// - v9: `CommitGateState::ApprovedPendingGate` variant added
+///   (appended at position 5) for `teams-based-agent-registration`.
+///   Same position-encoded discipline; bump forces clean
+///   invalidation.
+const CACHE_FORMAT_VERSION: u32 = 9;
 const CLANK_CACHE_GENERATION: u32 = 1;
 
 const HEADER_LEN: usize = CACHE_MAGIC.len() + 4 + 4 + 40;

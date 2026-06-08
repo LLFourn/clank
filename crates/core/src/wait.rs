@@ -155,11 +155,16 @@ pub struct ReviewEntry {
 pub struct WorkPolicy {
     pub plan_feedback: bool,
     pub adhoc_feedback: bool,
-    /// Labels of agents whose APPROVE/FINISHED is required for the
-    /// gate to advance. Sourced from the CLI's `agent_store` scan
-    /// of `.clank/agents/*/config.json` with `role: Reviewers`.
-    /// Empty = master-only repo (every commit auto-approves).
-    pub expected_reviewers: Vec<AgentLabel>,
+    /// Commit-tier reviewers: review every commit on a plan
+    /// branch. Master waits for all of them per-commit. Plan:
+    /// `teams-based-agent-registration` — replaces the prior
+    /// single-list `expected_reviewers` field.
+    pub commit_reviewers: Vec<AgentLabel>,
+    /// Gate-tier reviewers: only review at gate-transition
+    /// moments (when commit-reviewers are all positive). Used
+    /// for architectural / structural checks at structural
+    /// moments rather than per-commit churn.
+    pub gate_reviewers: Vec<AgentLabel>,
 }
 
 #[derive(Debug, Clone)]
@@ -188,29 +193,54 @@ pub struct AdHocWorkState {
     pub gate: crate::vocab::CommitGateState,
 }
 
+/// Compute the gate state for one commit given its review
+/// entries and the two-tier reviewer split from the team
+/// composition.
+///
+/// Plan: `teams-based-agent-registration`. The five-state
+/// machine extends the prior shape with `ApprovedPendingGate`:
+/// commit-reviewers all approved but gate-reviewers haven't
+/// voted yet. Gate-reviewers wake during this state; master
+/// sleeps.
+///
+/// Empty-set rule (the "devolve" property from the plan body):
+/// when `commit_reviewers` is empty, "all commit-reviewers
+/// approved" is vacuously true on the empty set, so the state
+/// machine transitions to `ApprovedPendingGate` immediately on
+/// the first commit. Gate-reviewers fire per-commit. No special
+/// case in code — set semantics produce it.
 pub fn compute_gate(
     reviews: &[ReviewEntry],
-    expected_reviewers: &[AgentLabel],
+    commit_reviewers: &[AgentLabel],
+    gate_reviewers: &[AgentLabel],
 ) -> crate::vocab::CommitGateState {
     use crate::vocab::{CommitGateState, Verdict};
 
-    // Zero-reviewer mode: master-only repo. Every commit auto-approves.
-    // This MUST be checked before the "every reviewer Finished" rule,
-    // which would otherwise be vacuously true on an empty set.
-    if expected_reviewers.is_empty() {
+    // Zero-reviewer mode (master-only repo): preserve
+    // pre-plan behavior — gate stays Approved (NOT
+    // Finished). Master keeps working and runs `clank
+    // finish` when they decide; auto-Finished would noise
+    // every commit with "ready to finalize." Plan body
+    // initially said Finished here; that was wrong — fixed
+    // during implementation.
+    if commit_reviewers.is_empty() && gate_reviewers.is_empty() {
         return CommitGateState::Approved;
     }
 
-    // Filter reviews to expected reviewers. Stale entries from removed
-    // reviewers (or other authors whose `.clank/agents/<label>/feedback/`
-    // dir still exists) MUST NOT gate decisions. "Removed reviewers don't
-    // gate" is a uniform principle, not a special case.
-    let expected: std::collections::HashSet<&AgentLabel> = expected_reviewers.iter().collect();
+    // Filter reviews to expected reviewers across BOTH tiers.
+    // Stale entries from removed reviewers (or other authors
+    // whose feedback dir still exists) MUST NOT gate decisions.
+    let expected: std::collections::HashSet<&AgentLabel> = commit_reviewers
+        .iter()
+        .chain(gate_reviewers.iter())
+        .collect();
     let reviews: Vec<&ReviewEntry> = reviews
         .iter()
         .filter(|r| expected.contains(&r.author))
         .collect();
 
+    // ChangesRequested: any reviewer (commit OR gate) voted
+    // Request-Changes or Unmarked. Trumps everything.
     if reviews
         .iter()
         .any(|r| r.verdict == Verdict::RequestChanges || r.verdict == Verdict::Unmarked)
@@ -218,29 +248,41 @@ pub fn compute_gate(
         return CommitGateState::ChangesRequested;
     }
 
-    // For "every expected reviewer posted X" checks, build a label→verdict map.
-    let mut by_label: std::collections::HashMap<&AgentLabel, &Verdict> =
-        std::collections::HashMap::new();
-    for r in &reviews {
-        by_label.insert(&r.author, &r.verdict);
-    }
+    // Build label → verdict map for the "all approved/finished"
+    // checks.
+    let by_label: std::collections::HashMap<&AgentLabel, &Verdict> =
+        reviews.iter().map(|r| (&r.author, &r.verdict)).collect();
 
-    let any_missing = expected_reviewers
-        .iter()
-        .any(|label| !by_label.contains_key(label));
-    if any_missing {
+    let positive = |label: &AgentLabel| -> bool {
+        matches!(
+            by_label.get(label),
+            Some(Verdict::Approve | Verdict::Finished)
+        )
+    };
+
+    let all_commit_positive = commit_reviewers.iter().all(positive);
+    if !all_commit_positive {
         return CommitGateState::Unreviewed;
     }
 
-    let all_finished = expected_reviewers
-        .iter()
-        .all(|label| matches!(by_label.get(label), Some(Verdict::Finished)));
-    if all_finished {
-        return CommitGateState::Finished;
+    // All commit-reviewers signed off (approve/finished). Now
+    // check gate-reviewers — they only contribute once
+    // commit-reviewers are unanimous.
+    let all_gate_positive = gate_reviewers.iter().all(positive);
+    if !all_gate_positive {
+        return CommitGateState::ApprovedPendingGate;
     }
 
-    // All expected reviewers signed off (Approve or Finished), but not all Finished.
-    CommitGateState::Approved
+    // Both tiers positive. Decide Finished vs Approved by
+    // whether every reviewer is at Finished verdict.
+    let finished =
+        |label: &AgentLabel| -> bool { matches!(by_label.get(label), Some(Verdict::Finished)) };
+    let all_finished = commit_reviewers.iter().all(finished) && gate_reviewers.iter().all(finished);
+    if all_finished {
+        CommitGateState::Finished
+    } else {
+        CommitGateState::Approved
+    }
 }
 
 impl RepoState {
@@ -293,7 +335,7 @@ impl RepoState {
 
                 let entries = reviews.reviews_for(&latest_sha);
                 let gate = if policy.plan_feedback {
-                    compute_gate(&entries, &policy.expected_reviewers)
+                    compute_gate(&entries, &policy.commit_reviewers, &policy.gate_reviewers)
                 } else {
                     // When plan review is disabled, treat as approved
                     // so master isn't blocked.
@@ -309,9 +351,12 @@ impl RepoState {
 
                 // Filter to expected reviewers for any downstream uses
                 // (MasterToRevise payload, missing-set computation). Same
-                // principle as compute_gate's filter.
-                let expected: std::collections::HashSet<&AgentLabel> =
-                    policy.expected_reviewers.iter().collect();
+                // principle as compute_gate's filter. Both tiers.
+                let expected: std::collections::HashSet<&AgentLabel> = policy
+                    .commit_reviewers
+                    .iter()
+                    .chain(policy.gate_reviewers.iter())
+                    .collect();
                 let filtered_entries: Vec<&ReviewEntry> = entries
                     .iter()
                     .filter(|r| expected.contains(&r.author))
@@ -363,8 +408,36 @@ impl RepoState {
                         }
                         CommitGateState::Finished => WaitingOn::MasterToFinalize,
                         CommitGateState::Approved => WaitingOn::MasterToContinue,
+                        CommitGateState::ApprovedPendingGate => {
+                            // All commit-reviewers signed off; gate-
+                            // reviewers haven't all voted yet. Master
+                            // sleeps; gate-reviewers wake.
+                            let approved_by: std::collections::HashSet<&AgentLabel> =
+                                filtered_entries
+                                    .iter()
+                                    .filter(|r| {
+                                        matches!(
+                                            r.verdict,
+                                            crate::vocab::Verdict::Approve
+                                                | crate::vocab::Verdict::Finished
+                                        )
+                                    })
+                                    .map(|r| &r.author)
+                                    .collect();
+                            let missing_gate: Vec<AgentLabel> = policy
+                                .gate_reviewers
+                                .iter()
+                                .filter(|label| !approved_by.contains(label))
+                                .cloned()
+                                .collect();
+                            let missing = crate::repo_state::NonEmptyVec::new(missing_gate)
+                                .expect(
+                                    "ApprovedPendingGate state implies a non-empty missing gate-reviewer set",
+                                );
+                            WaitingOn::GateReviewersMissing { missing }
+                        }
                         CommitGateState::Unreviewed => {
-                            // Compute the set of expected reviewers that
+                            // Compute the set of commit-reviewers that
                             // haven't posted Approve or Finished. Stale
                             // RequestChanges from removed authors don't
                             // count because the filter dropped them.
@@ -381,20 +454,16 @@ impl RepoState {
                                     .map(|r| &r.author)
                                     .collect();
                             let missing: Vec<AgentLabel> = policy
-                                .expected_reviewers
+                                .commit_reviewers
                                 .iter()
                                 .filter(|label| !approved_by.contains(label))
                                 .cloned()
                                 .collect();
-                            // `missing` is non-empty here: the
-                            // Unreviewed gate state is reached only when
-                            // `compute_gate` finds at least one expected
-                            // reviewer with no Approve/Finished entry.
-                            // `expected_reviewers` is non-empty in this
-                            // branch (zero-reviewer maps to Approved
-                            // earlier), so the filter result is non-empty.
+                            // `missing` is non-empty here: Unreviewed is
+                            // reached only when at least one
+                            // commit-reviewer hasn't posted positive.
                             let missing = crate::repo_state::NonEmptyVec::new(missing).expect(
-                                "Unreviewed gate state implies a non-empty missing reviewer set",
+                                "Unreviewed gate state implies a non-empty missing commit-reviewer set",
                             );
                             WaitingOn::ReviewerApprovalsMissing { missing }
                         }
@@ -415,7 +484,7 @@ impl RepoState {
         if policy.adhoc_feedback {
             if let Some(event) = self.ad_hoc.last() {
                 let entries = reviews.reviews_for(&event.sha);
-                let gate = compute_gate(&entries, &policy.expected_reviewers);
+                let gate = compute_gate(&entries, &policy.commit_reviewers, &policy.gate_reviewers);
                 ad_hoc.push(AdHocWorkState {
                     sha: event.sha.clone(),
                     gate,
@@ -579,21 +648,21 @@ mod tests {
     #[test]
     fn compute_gate_zero_reviewers_is_approved_even_with_no_reviews() {
         // Master-only repo: every commit auto-approves.
-        assert_eq!(compute_gate(&[], &[]), CommitGateState::Approved);
+        assert_eq!(compute_gate(&[], &[], &[]), CommitGateState::Approved);
     }
 
     #[test]
     fn compute_gate_zero_reviewers_ignores_stale_request_changes() {
         // Removed reviewer's stale RC must not gate.
         let reviews = [entry(crate::vocab::Verdict::RequestChanges, "alice")];
-        assert_eq!(compute_gate(&reviews, &[]), CommitGateState::Approved);
+        assert_eq!(compute_gate(&reviews, &[], &[]), CommitGateState::Approved);
     }
 
     #[test]
     fn compute_gate_single_expected_approve_is_approved() {
         let reviews = [entry(crate::vocab::Verdict::Approve, "codex")];
         assert_eq!(
-            compute_gate(&reviews, &[label("codex")]),
+            compute_gate(&reviews, &[label("codex")], &[]),
             CommitGateState::Approved
         );
     }
@@ -602,7 +671,7 @@ mod tests {
     fn compute_gate_single_expected_request_changes() {
         let reviews = [entry(crate::vocab::Verdict::RequestChanges, "codex")];
         assert_eq!(
-            compute_gate(&reviews, &[label("codex")]),
+            compute_gate(&reviews, &[label("codex")], &[]),
             CommitGateState::ChangesRequested
         );
     }
@@ -614,7 +683,7 @@ mod tests {
             entry(crate::vocab::Verdict::Approve, "ruthless"),
         ];
         assert_eq!(
-            compute_gate(&reviews, &[label("codex"), label("ruthless")]),
+            compute_gate(&reviews, &[label("codex"), label("ruthless")], &[]),
             CommitGateState::Approved
         );
     }
@@ -626,7 +695,7 @@ mod tests {
             entry(crate::vocab::Verdict::RequestChanges, "ruthless"),
         ];
         assert_eq!(
-            compute_gate(&reviews, &[label("codex"), label("ruthless")]),
+            compute_gate(&reviews, &[label("codex"), label("ruthless")], &[]),
             CommitGateState::ChangesRequested
         );
     }
@@ -635,7 +704,7 @@ mod tests {
     fn compute_gate_two_expected_one_missing_is_unreviewed() {
         let reviews = [entry(crate::vocab::Verdict::Approve, "codex")];
         assert_eq!(
-            compute_gate(&reviews, &[label("codex"), label("ruthless")]),
+            compute_gate(&reviews, &[label("codex"), label("ruthless")], &[]),
             CommitGateState::Unreviewed
         );
     }
@@ -647,7 +716,7 @@ mod tests {
             entry(crate::vocab::Verdict::Finished, "ruthless"),
         ];
         assert_eq!(
-            compute_gate(&reviews, &[label("codex"), label("ruthless")]),
+            compute_gate(&reviews, &[label("codex"), label("ruthless")], &[]),
             CommitGateState::Finished
         );
     }
@@ -660,7 +729,7 @@ mod tests {
             entry(crate::vocab::Verdict::Approve, "ruthless"),
         ];
         assert_eq!(
-            compute_gate(&reviews, &[label("codex"), label("ruthless")]),
+            compute_gate(&reviews, &[label("codex"), label("ruthless")], &[]),
             CommitGateState::Approved
         );
     }
@@ -669,7 +738,7 @@ mod tests {
     fn compute_gate_unmarked_treated_as_changes() {
         let reviews = [entry(crate::vocab::Verdict::Unmarked, "codex")];
         assert_eq!(
-            compute_gate(&reviews, &[label("codex")]),
+            compute_gate(&reviews, &[label("codex")], &[]),
             CommitGateState::ChangesRequested
         );
     }
@@ -685,7 +754,7 @@ mod tests {
             entry(crate::vocab::Verdict::Approve, "ruthless"),
         ];
         assert_eq!(
-            compute_gate(&reviews, &[label("codex"), label("ruthless")]),
+            compute_gate(&reviews, &[label("codex"), label("ruthless")], &[]),
             CommitGateState::Approved
         );
     }
@@ -700,7 +769,7 @@ mod tests {
             // ruthless missing
         ];
         assert_eq!(
-            compute_gate(&reviews, &[label("codex"), label("ruthless")]),
+            compute_gate(&reviews, &[label("codex"), label("ruthless")], &[]),
             CommitGateState::Unreviewed
         );
     }
@@ -944,7 +1013,8 @@ mod tests {
         WorkPolicy {
             plan_feedback: true,
             adhoc_feedback: false,
-            expected_reviewers: vec![label("codex"), label("ruthless")],
+            commit_reviewers: vec![label("codex"), label("ruthless")],
+            gate_reviewers: vec![],
         }
     }
 
@@ -952,10 +1022,10 @@ mod tests {
     fn compute_gate_unaffected_by_blocks() {
         // compute_gate is per-commit pure; blocks live a layer up
         // in derive_status. compute_gate's behavior is unchanged.
-        assert_eq!(compute_gate(&[], &[]), CommitGateState::Approved);
+        assert_eq!(compute_gate(&[], &[], &[]), CommitGateState::Approved);
         let reviews = [entry(crate::vocab::Verdict::Approve, "codex")];
         assert_eq!(
-            compute_gate(&reviews, &[label("codex")]),
+            compute_gate(&reviews, &[label("codex")], &[]),
             CommitGateState::Approved
         );
     }
@@ -1095,7 +1165,8 @@ mod tests {
         WorkPolicy {
             plan_feedback: true,
             adhoc_feedback: true,
-            expected_reviewers: Vec::new(),
+            commit_reviewers: Vec::new(),
+            gate_reviewers: Vec::new(),
         }
     }
 

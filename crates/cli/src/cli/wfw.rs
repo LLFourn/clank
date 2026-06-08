@@ -167,7 +167,8 @@ pub async fn run(args: WfwArgs) -> anyhow::Result<()> {
     let work_policy = clank_core::wait::WorkPolicy {
         plan_feedback: config.review.plan_feedback,
         adhoc_feedback: config.review.adhoc_feedback,
-        expected_reviewers: crate::agent_store::load_expected_reviewers(&repo)?,
+        commit_reviewers: crate::agent_store::load_expected_reviewers(&repo)?,
+        gate_reviewers: Vec::new(),
     };
 
     let snapshot = StartupSnapshot::capture(&initial_state.fold, plan_filter.as_ref());

@@ -131,6 +131,13 @@ pub enum CommitGateState {
     Finished,
     ChangesRequested,
     Blocked,
+    /// All commit-reviewers voted approve/finished; at least
+    /// one gate-reviewer hasn't voted yet (no Request-Changes
+    /// from anyone). Master sleeps in this state — it's the
+    /// gate-reviewers' window. Plan:
+    /// `teams-based-agent-registration`. Appended at the end
+    /// per the wincode position-encoding comment above.
+    ApprovedPendingGate,
 }
 
 impl CommitGateState {
@@ -141,6 +148,7 @@ impl CommitGateState {
             CommitGateState::Finished => "finished",
             CommitGateState::ChangesRequested => "changes_requested",
             CommitGateState::Blocked => "blocked",
+            CommitGateState::ApprovedPendingGate => "approved_pending_gate",
         }
     }
 }

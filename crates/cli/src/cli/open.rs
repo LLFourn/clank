@@ -708,7 +708,8 @@ async fn fold_summary(repo_root: &Path) -> (usize, Option<String>, Option<String
     let work_policy = clank_core::wait::WorkPolicy {
         plan_feedback: config.review.plan_feedback,
         adhoc_feedback: config.review.adhoc_feedback,
-        expected_reviewers,
+        commit_reviewers: expected_reviewers,
+        gate_reviewers: Vec::new(),
     };
     let reviews =
         crate::fs_plan_state_lookup::FsPlanStateLookup::new(repo_root, state.head.as_ref());
@@ -729,6 +730,7 @@ fn format_waiting_on(w: &clank_core::plan_view::WaitingOn) -> String {
     match w {
         Blocked { block } => format!("blocked ({})", block.creator.as_str()),
         ReviewerApprovalsMissing { .. } => "reviewers".to_string(),
+        GateReviewersMissing { .. } => "gate reviewers".to_string(),
         MasterToRevise { .. } => "master to revise".to_string(),
         MasterToContinue => "master to continue".to_string(),
         MasterToFinalize => "master to finalize".to_string(),

@@ -1003,6 +1003,7 @@ fn verdict_gate_label(g: clank_core::vocab::CommitGateState) -> &'static str {
         G::ChangesRequested => "changes-requested",
         G::Unreviewed => "unreviewed",
         G::Blocked => "blocked",
+        G::ApprovedPendingGate => "approved-pending-gate",
     }
 }
 
@@ -1018,6 +1019,15 @@ fn waiting_on_label(w: &clank_core::plan_view::WaitingOn) -> String {
                 .collect();
             names.sort();
             format!("reviewers ({})", names.join(", "))
+        }
+        W::GateReviewersMissing { missing } => {
+            let mut names: Vec<String> = missing
+                .as_slice()
+                .iter()
+                .map(|a| a.as_str().to_string())
+                .collect();
+            names.sort();
+            format!("gate reviewers ({})", names.join(", "))
         }
         W::MasterToRevise { .. } => "master to revise".to_string(),
         W::MasterToContinue => "master to continue".to_string(),
