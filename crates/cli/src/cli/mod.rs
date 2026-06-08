@@ -33,6 +33,7 @@ pub mod rewrite;
 pub mod setup;
 pub mod status;
 pub mod stop_hook;
+pub mod teams_config;
 pub mod unfinish;
 pub mod wfw;
 

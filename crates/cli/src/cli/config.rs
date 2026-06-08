@@ -33,19 +33,21 @@ impl Default for Config {
 /// `clank diff` config: editor launch profile + default wait
 /// behavior. Loaded from `.clank/config.json#/diff` (user and
 /// repo scopes, layered field-by-field).
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize, Serialize)]
 pub struct DiffConfig {
     /// Editor launch profile. `None` means no editor is
     /// configured; `clank diff` errors with a message naming
     /// `diff.editor.command`. Default-empty avoids accidentally
     /// launching `$EDITOR` (which users may set for git commit
     /// message editing but not as their diff review surface).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub editor: Option<LaunchConfig>,
     /// Default `--wait` behavior. `Some(true)` = wait by default
     /// (`--no-wait` overrides). `Some(false)` = fire-and-forget
     /// (`--wait` overrides). `None` = fire-and-forget (system
     /// default per lloyd's wording: "otherwise it just opens and
     /// continues").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub wait: Option<bool>,
 }
 
