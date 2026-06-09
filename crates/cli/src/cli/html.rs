@@ -30,8 +30,17 @@ pub async fn run(args: HtmlArgs) -> anyhow::Result<()> {
     let repo = resolve_repo(args.repo.as_deref())?;
     let basename = repo_basename(&repo)?;
     let out_dir = repo.join(".clank/html");
+    let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
     let progress = Progress::new(args.quiet);
-    build_site(&repo, &basename, &out_dir, args.rebuild, &progress).await?;
+    build_site(
+        &repo,
+        &basename,
+        &out_dir,
+        home.as_deref(),
+        args.rebuild,
+        &progress,
+    )
+    .await?;
     progress.finish();
 
     // Under `--print-path`, stdout must contain ONLY the resolved
@@ -60,6 +69,22 @@ pub async fn run(args: HtmlArgs) -> anyhow::Result<()> {
         }
     }
     Ok(())
+}
+
+/// Generate the HTML site into `out_dir` (quietly), via the same
+/// `build_site` core `run()` uses. `home` is explicit so
+/// in-process callers (tests) control user-scope resolution
+/// without reading `$HOME`. Plan: dogfood-init-setup-in-tests
+/// (Phase B).
+pub async fn generate(
+    repo: &Path,
+    out_dir: &Path,
+    home: Option<&Path>,
+    rebuild: bool,
+) -> anyhow::Result<()> {
+    let basename = repo_basename(repo)?;
+    let progress = Progress::new(true);
+    build_site(repo, &basename, out_dir, home, rebuild, &progress).await
 }
 
 /// Resolve the target file the browser (or `--print-path`) lands on.
@@ -93,6 +118,7 @@ async fn build_site(
     repo: &Path,
     basename: &str,
     out_dir: &Path,
+    home: Option<&Path>,
     mut force_rebuild: bool,
     progress: &Progress,
 ) -> anyhow::Result<()> {
@@ -100,13 +126,10 @@ async fn build_site(
     std::fs::create_dir_all(out_dir.join("commit"))?;
     std::fs::create_dir_all(out_dir.join("plan"))?;
 
-    // html reads $HOME for now; threading an explicit home through
-    // the html render core is a later Phase-B slice.
-    let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
     let status = StatusSnapshot::build_async(
         repo,
         basename,
-        home.as_deref(),
+        home,
         crate::rebuild::CachePolicy::Use,
         None,
         false,
