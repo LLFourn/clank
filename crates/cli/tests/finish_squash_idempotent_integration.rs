@@ -196,3 +196,40 @@ fn finish_purge_on_finished_plan_strips_clank() {
         "finish --purge must strip the finished snapshot"
     );
 }
+
+#[test]
+fn finish_purge_rerun_reports_plan_gone_cleanly() {
+    // The --purge arm of the re-run question (ruthless 64d458b).
+    // Unlike --squash (which KEEPS the plan record → idempotent
+    // same-sha re-run), --purge is destructive: it removes the
+    // plan from history entirely. So a SECOND --purge can't find
+    // the plan — and that's correct, not a bug. Pin that the
+    // re-run fails with a CLEAR "not found" message (no panic, no
+    // empty-range error) and does NOT mutate HEAD.
+    let env = finished_plan_with_impl_commits();
+    let repo = env.repo();
+
+    let out1 = run_finish(&env, &["--purge", "foo"]);
+    assert!(
+        out1.status.success(),
+        "first purge failed: {}",
+        String::from_utf8_lossy(&out1.stderr)
+    );
+    let head_after_purge = head_sha(repo);
+
+    let out2 = run_finish(&env, &["--purge", "foo"]);
+    assert!(
+        !out2.status.success(),
+        "second purge should fail cleanly (plan is gone), not succeed"
+    );
+    let stderr = String::from_utf8_lossy(&out2.stderr);
+    assert!(
+        stderr.contains("not found"),
+        "re-purge of a purged plan should report it's not found (the plan was removed); got: {stderr}"
+    );
+    assert_eq!(
+        head_after_purge,
+        head_sha(repo),
+        "a failed re-purge must not mutate HEAD"
+    );
+}
