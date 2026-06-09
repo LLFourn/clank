@@ -5,10 +5,6 @@ mod common;
 use std::path::Path;
 use std::process::Command;
 
-fn clank_bin() -> &'static str {
-    env!("CARGO_BIN_EXE_clank")
-}
-
 fn git(repo: &Path, args: &[&str]) {
     let status = Command::new("git")
         .arg("-C")
@@ -19,19 +15,12 @@ fn git(repo: &Path, args: &[&str]) {
     assert!(status.success(), "git {args:?} failed");
 }
 
-fn init_repo() -> tempfile::TempDir {
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path();
-    git(path, &["init", "--quiet", "--initial-branch=main"]);
-    git(path, &["config", "user.email", "test@test"]);
-    git(path, &["config", "user.name", "test"]);
-    git(path, &["config", "commit.gpgsign", "false"]);
-    // Every finish/amend command resolves the repo's team
-    // (`teams-based-agent-registration`); register a master so
-    // resolution succeeds. Individual tests can overwrite to add
-    // reviewers.
-    common::write_team_config(path, "claude", &[], &[]);
-    dir
+/// A bare git repo with a separate HOME, NO team registered.
+/// Callers register the team they need via `env.register_team`
+/// (most want claude-only; one wants a codex reviewer). Keeping
+/// init team-less avoids re-registering an existing team.
+fn init_repo() -> common::TestEnv {
+    common::TestEnv::init()
 }
 
 fn write(repo: &Path, rel: &str, body: &str) {
@@ -50,13 +39,11 @@ fn head_sha(repo: &Path) -> String {
     String::from_utf8(out.stdout).unwrap().trim().to_string()
 }
 
-fn run_clank(repo: &Path, args: &[&str]) -> std::process::Output {
-    let home = tempfile::tempdir().expect("isolated test HOME");
-    Command::new(clank_bin())
+fn run_clank(env: &common::TestEnv, args: &[&str]) -> std::process::Output {
+    env.clank()
         .args(args)
         .arg("--repo")
-        .arg(repo)
-        .env("HOME", home.path())
+        .arg(env.repo())
         .env_remove("CLAUDE_CODE_SESSION_ID")
         .env_remove("CODEX_THREAD_ID")
         .env_remove("CLANK_AGENT")
@@ -64,11 +51,13 @@ fn run_clank(repo: &Path, args: &[&str]) -> std::process::Output {
         .expect("spawn clank")
 }
 
-/// Set up a repo where plan `foo` is already in `.clank/finished/`.
-/// HEAD is a synthetic finalize commit ([foo] finish).
-fn repo_with_finished_foo() -> tempfile::TempDir {
-    let dir = init_repo();
-    let repo = dir.path();
+/// Set up a repo (claude master team) where plan `foo` is already
+/// in `.clank/finished/`. HEAD is a synthetic finalize commit
+/// ([foo] finish).
+fn repo_with_finished_foo() -> common::TestEnv {
+    let env = init_repo();
+    env.register_team("claude", &[], &[]);
+    let repo = env.repo();
     write(repo, ".clank/plans/foo.md", "# foo\n");
     git(repo, &["add", "-A"]);
     git(repo, &["commit", "--quiet", "-m", "[foo] intro"]);
@@ -77,16 +66,16 @@ fn repo_with_finished_foo() -> tempfile::TempDir {
     git(repo, &["rm", "--quiet", ".clank/plans/foo.md"]);
     git(repo, &["add", ".clank/finished/foo.md"]);
     git(repo, &["commit", "--quiet", "-m", "[foo] finish"]);
-    dir
+    env
 }
 
 #[test]
 fn finish_amend_dry_purge_does_not_mutate_head_when_already_finished() {
-    let dir = repo_with_finished_foo();
-    let repo = dir.path();
+    let env = repo_with_finished_foo();
+    let repo = env.repo();
     let before = head_sha(repo);
 
-    let out = run_clank(repo, &["finish", "--amend", "--dry", "--purge", "foo"]);
+    let out = run_clank(&env, &["finish", "--amend", "--dry", "--purge", "foo"]);
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(out.status.success(), "clank finish failed: {stderr}");
 
@@ -112,8 +101,8 @@ fn finish_fails_closed_on_malformed_reviewer_config() {
     // ~/.clank/config.json's default_agents), NOT in the per-agent
     // skeleton. This test exercises the repo-scope declaration's
     // strict-fail semantic.
-    let dir = init_repo();
-    let repo = dir.path();
+    let env = init_repo();
+    let repo = env.repo();
     write(repo, ".clank/plans/foo.md", "# foo\n");
     // Malformed JSON in the repo-scope agents declaration — would
     // silently drop reviewers under lossy loading.
@@ -121,7 +110,7 @@ fn finish_fails_closed_on_malformed_reviewer_config() {
     git(repo, &["add", "-A"]);
     git(repo, &["commit", "--quiet", "-m", "[foo] intro"]);
 
-    let out = run_clank(repo, &["finish", "foo"]);
+    let out = run_clank(&env, &["finish", "foo"]);
     assert!(
         !out.status.success(),
         "clank finish must fail closed when the declaration is malformed; got stdout=`{}` stderr=`{}`",
@@ -147,12 +136,12 @@ fn finish_rejects_approve_without_finished() {
     // Plan intro is APPROVED but not FINISHED. clank finish must
     // refuse — only a FINISHED verdict unlocks finalize when there
     // is at least one registered reviewer.
-    let dir = init_repo();
-    let repo = dir.path();
+    let env = init_repo();
+    let repo = env.repo();
     write(repo, ".clank/plans/foo.md", "# foo\n");
     // Register a master + codex reviewer via the repo-scope team
     // (`teams-based-agent-registration`).
-    common::write_team_config(repo, "claude", &["codex"], &[]);
+    env.register_team("claude", &["codex"], &[]);
     git(repo, &["add", "-A"]);
     git(repo, &["commit", "--quiet", "-m", "[foo] intro"]);
     let intro_sha = head_sha(repo);
@@ -164,7 +153,7 @@ fn finish_rejects_approve_without_finished() {
     git(repo, &["add", "-A"]);
     git(repo, &["commit", "--quiet", "-m", "approve plan"]);
 
-    let out = run_clank(repo, &["finish", "foo"]);
+    let out = run_clank(&env, &["finish", "foo"]);
     assert!(
         !out.status.success(),
         "clank finish should refuse APPROVE-without-FINISHED; got stdout=`{}` stderr=`{}`",
@@ -180,14 +169,14 @@ fn finish_rejects_approve_without_finished() {
 
 #[test]
 fn finish_amend_no_dry_rewrites_head_message_when_already_finished() {
-    let dir = repo_with_finished_foo();
-    let repo = dir.path();
+    let env = repo_with_finished_foo();
+    let repo = env.repo();
     let before_sha = head_sha(repo);
     let finished_path = repo.join(".clank/finished/foo.md");
     let before_body = std::fs::read_to_string(&finished_path).unwrap();
 
     let out = run_clank(
-        repo,
+        &env,
         &["finish", "--amend", "-m", "[foo] finish (refreshed)", "foo"],
     );
     let stderr = String::from_utf8_lossy(&out.stderr);
