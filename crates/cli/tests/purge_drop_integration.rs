@@ -26,19 +26,15 @@ fn git(repo: &Path, args: &[&str]) {
     assert!(status.success(), "git {args:?} failed");
 }
 
-fn init_repo_with_master() -> tempfile::TempDir {
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path();
-    git(path, &["init", "--quiet", "--initial-branch=main"]);
-    git(path, &["config", "user.email", "test@test"]);
-    git(path, &["config", "user.name", "test"]);
-    git(path, &["config", "commit.gpgsign", "false"]);
+fn init_repo_with_master() -> common::TestEnv {
+    let env = common::TestEnv::init();
+    let path = env.repo();
     write(path, ".clank/.gitignore", "/agents/\n/cache/\n");
     write(path, ".gitignore", ".clank/agents/\n.clank/cache/\n");
-    // Register claude as master + codex reviewer via the
-    // repo-scope team (`teams-based-agent-registration`) so the
-    // gate has a registered reviewer and doesn't auto-approve.
-    common::write_team_config(path, "claude", &["codex"], &[]);
+    // Register claude as master + codex reviewer via the real
+    // cores (`dogfood-init-setup-in-tests`) so the gate has a
+    // registered reviewer and doesn't auto-approve.
+    env.register_team("claude", &["codex"], &[]);
     write(
         path,
         ".clank/agents/claude/config.json",
@@ -47,7 +43,7 @@ fn init_repo_with_master() -> tempfile::TempDir {
     write(path, "README.md", "seed\n");
     git(path, &["add", "-A"]);
     git(path, &["commit", "--quiet", "-m", "seed"]);
-    dir
+    env
 }
 
 fn write(repo: &Path, rel: &str, body: &str) {
@@ -58,11 +54,12 @@ fn write(repo: &Path, rel: &str, body: &str) {
     std::fs::write(abs, body).unwrap();
 }
 
-fn run_purge(repo: &Path, args: &[&str]) -> std::process::Output {
+fn run_purge(env: &common::TestEnv, args: &[&str]) -> std::process::Output {
     let mut cmd = Command::new(clank_bin());
     cmd.arg("purge")
         .arg("--repo")
-        .arg(repo)
+        .arg(env.repo())
+        .env("HOME", env.home())
         .arg("--yes")
         .arg("--allow-rewrite-protected") // test repos init on main
         .args(args);
@@ -85,8 +82,8 @@ fn drop_drops_mixed_plan_and_code_commits() {
     // `clank purge`. Setup a plan with a mixed plan+code commit;
     // run `--drop`; assert the CODE is gone (today's purge would
     // have kept it).
-    let dir = init_repo_with_master();
-    let repo = dir.path();
+    let env = init_repo_with_master();
+    let repo = env.repo();
     // Plan intro (plan-body only).
     write(repo, ".clank/plans/foo.md", "# foo\n");
     git(repo, &["add", "-A"]);
@@ -103,7 +100,7 @@ fn drop_drops_mixed_plan_and_code_commits() {
         "pre-condition: src/foo.rs should exist before drop"
     );
 
-    let out = run_purge(repo, &["foo", "--drop"]);
+    let out = run_purge(&env, &["foo", "--drop"]);
     assert!(
         out.status.success(),
         "purge --drop failed: stdout=`{}` stderr=`{}`",
@@ -129,8 +126,8 @@ fn drop_drops_mixed_plan_and_code_commits() {
 fn drop_drops_plan_only_commits() {
     // Plan with only plan-body commits (no code). --drop succeeds
     // and the plan history is gone.
-    let dir = init_repo_with_master();
-    let repo = dir.path();
+    let env = init_repo_with_master();
+    let repo = env.repo();
     write(repo, ".clank/plans/alpha.md", "# v1\n");
     git(repo, &["add", "-A"]);
     git(repo, &["commit", "--quiet", "-m", "[alpha] intro"]);
@@ -138,7 +135,7 @@ fn drop_drops_plan_only_commits() {
     git(repo, &["add", "-A"]);
     git(repo, &["commit", "--quiet", "-m", "[alpha] revise"]);
 
-    let out = run_purge(repo, &["alpha", "--drop"]);
+    let out = run_purge(&env, &["alpha", "--drop"]);
     assert!(
         out.status.success(),
         "purge --drop failed: stderr=`{}`",
@@ -152,13 +149,13 @@ fn drop_does_not_write_queue_or_stub() {
     // Critical: --drop must NOT save the plan body anywhere
     // (that's `clank demote`'s job). Asserts no queue or stub
     // files materialize.
-    let dir = init_repo_with_master();
-    let repo = dir.path();
+    let env = init_repo_with_master();
+    let repo = env.repo();
     write(repo, ".clank/plans/beta.md", "# beta\n");
     git(repo, &["add", "-A"]);
     git(repo, &["commit", "--quiet", "-m", "[beta] intro"]);
 
-    let out = run_purge(repo, &["beta", "--drop"]);
+    let out = run_purge(&env, &["beta", "--drop"]);
     assert!(out.status.success());
 
     // No queue file, no stub file.
@@ -187,14 +184,14 @@ fn drop_does_not_write_queue_or_stub() {
 fn drop_into_branch_preview_does_not_touch_current_branch() {
     // --drop --into-branch <name> writes the rewritten chain to
     // <name>, leaves the current branch untouched.
-    let dir = init_repo_with_master();
-    let repo = dir.path();
+    let env = init_repo_with_master();
+    let repo = env.repo();
     write(repo, ".clank/plans/gamma.md", "# gamma\n");
     git(repo, &["add", "-A"]);
     git(repo, &["commit", "--quiet", "-m", "[gamma] intro"]);
     let head_before = head_sha(repo);
 
-    let out = run_purge(repo, &["gamma", "--drop", "--into-branch", "scrubbed"]);
+    let out = run_purge(&env, &["gamma", "--drop", "--into-branch", "scrubbed"]);
     assert!(
         out.status.success(),
         "purge --drop --into-branch failed: stderr=`{}`",
@@ -227,14 +224,14 @@ fn drop_into_branch_preview_does_not_touch_current_branch() {
 
 #[test]
 fn drop_dry_does_not_touch_refs() {
-    let dir = init_repo_with_master();
-    let repo = dir.path();
+    let env = init_repo_with_master();
+    let repo = env.repo();
     write(repo, ".clank/plans/delta.md", "# delta\n");
     git(repo, &["add", "-A"]);
     git(repo, &["commit", "--quiet", "-m", "[delta] intro"]);
     let head_before = head_sha(repo);
 
-    let out = run_purge(repo, &["delta", "--drop", "--dry"]);
+    let out = run_purge(&env, &["delta", "--drop", "--dry"]);
     assert!(
         out.status.success(),
         "--drop --dry failed: stderr=`{}`",
@@ -246,8 +243,8 @@ fn drop_dry_does_not_touch_refs() {
 
 #[test]
 fn drop_protected_branch_refusal_inherited() {
-    let dir = init_repo_with_master();
-    let repo = dir.path();
+    let env = init_repo_with_master();
+    let repo = env.repo();
     write(repo, ".clank/plans/epsilon.md", "# eps\n");
     git(repo, &["add", "-A"]);
     git(repo, &["commit", "--quiet", "-m", "[epsilon] intro"]);

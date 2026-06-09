@@ -1,15 +1,79 @@
 //! Shared integration-test helpers for the team-based
 //! registration model (`teams-based-agent-registration`).
 //!
-//! Registration is repo-scope only here: a `team` array of
-//! fully-inline entries + a `promoted` master. This needs NO
-//! user-scope config, so tests don't have to control `$HOME`.
+//! Two setup paths:
+//! - [`TestEnv`] + [`register_team`] (preferred): build the team
+//!   through the REAL library cores, in a HOME distinct from the
+//!   repo — the dogfood path (`dogfood-init-setup-in-tests`).
+//! - [`write_team_config`] (legacy, being phased out): repo-only
+//!   raw JSON (inline entries + `promoted`). Needs no user-scope,
+//!   so tests using it can leave `$HOME` empty.
 
 #![allow(dead_code)]
 
 use std::path::Path;
+use std::process::Command;
 
 use serde_json::{Value, json};
+
+/// A git repo with its OWN HOME, distinct from the repo dir, so a
+/// team set up via [`register_team`] persists in user-scope
+/// across every spawned `clank` invocation. Each test owns one;
+/// `run()` helpers point `HOME` at `env.home()`.
+///
+/// `TestEnv` deliberately does NOT provide a `run()`/`cmd()` —
+/// each test file's invocation needs differ (env scrubbing,
+/// piped stdin, extra flags). It owns only the home+repo+team
+/// scaffolding; the file keeps its own `run(&TestEnv, ...)`.
+pub struct TestEnv {
+    pub home: tempfile::TempDir,
+    pub repo: tempfile::TempDir,
+}
+
+impl TestEnv {
+    /// `git init` a fresh repo (main branch, test identity, no
+    /// gpg) alongside a separate empty HOME.
+    pub fn init() -> Self {
+        let home = tempfile::tempdir().expect("home tempdir");
+        let repo = tempfile::tempdir().expect("repo tempdir");
+        let p = repo.path();
+        git(p, &["init", "--quiet", "--initial-branch=main"]);
+        git(p, &["config", "user.email", "test@test"]);
+        git(p, &["config", "user.name", "test"]);
+        git(p, &["config", "commit.gpgsign", "false"]);
+        Self { home, repo }
+    }
+
+    pub fn home(&self) -> &Path {
+        self.home.path()
+    }
+
+    pub fn repo(&self) -> &Path {
+        self.repo.path()
+    }
+
+    /// Register a `default` team via the real cores (see
+    /// [`register_team`]). Call once per env.
+    pub fn register_team(&self, master: &str, commit_reviewers: &[&str], gate_reviewers: &[&str]) {
+        register_team(
+            self.home(),
+            self.repo(),
+            master,
+            commit_reviewers,
+            gate_reviewers,
+        );
+    }
+}
+
+fn git(repo: &Path, args: &[&str]) {
+    let status = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(args)
+        .status()
+        .expect("spawn git");
+    assert!(status.success(), "git {args:?} failed");
+}
 
 /// Register a team THE REAL WAY — through the same library cores
 /// the CLI handlers call, so the test setup and production share

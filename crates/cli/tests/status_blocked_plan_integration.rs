@@ -24,38 +24,16 @@ fn git(repo: &Path, args: &[&str]) {
     assert!(status.success(), "git {args:?} failed");
 }
 
-/// A test repo with its OWN HOME, distinct from the repo dir, so
-/// the team set up via the real cores (`common::register_team`)
-/// persists in user-scope across every `run()` invocation. The
-/// persistent home is what makes the dogfooded setup usable —
-/// a per-call fresh home wouldn't see the registered team.
-struct Env {
-    home: tempfile::TempDir,
-    repo: tempfile::TempDir,
-}
-
-impl Env {
-    fn repo(&self) -> &Path {
-        self.repo.path()
-    }
-}
-
-fn init_repo() -> Env {
-    let home = tempfile::tempdir().unwrap();
-    let repo = tempfile::tempdir().unwrap();
-    let path = repo.path();
-    git(path, &["init", "--quiet", "--initial-branch=main"]);
-    git(path, &["config", "user.email", "test@test"]);
-    git(path, &["config", "user.name", "test"]);
-    git(path, &["config", "commit.gpgsign", "false"]);
+fn init_repo() -> common::TestEnv {
+    let env = common::TestEnv::init();
     // Dogfood: set up the team through the real library cores
     // (declare agents → create team → set master → add members →
     // point repo at it), not hand-rolled JSON.
-    common::register_team(home.path(), path, "claude", &["codex", "ruthless"], &[]);
-    write(path, "README.md", "seed\n");
-    git(path, &["add", "-A"]);
-    git(path, &["commit", "--quiet", "-m", "seed"]);
-    Env { home, repo }
+    env.register_team("claude", &["codex", "ruthless"], &[]);
+    write(env.repo(), "README.md", "seed\n");
+    git(env.repo(), &["add", "-A"]);
+    git(env.repo(), &["commit", "--quiet", "-m", "seed"]);
+    env
 }
 
 fn write(repo: &Path, rel: &str, body: &str) {
@@ -66,12 +44,12 @@ fn write(repo: &Path, rel: &str, body: &str) {
     std::fs::write(abs, body).unwrap();
 }
 
-fn run(env: &Env, args: &[&str]) -> std::process::Output {
+fn run(env: &common::TestEnv, args: &[&str]) -> std::process::Output {
     let mut cmd = Command::new(clank_bin());
     cmd.args(args)
         .arg("--repo")
         .arg(env.repo())
-        .env("HOME", env.home.path())
+        .env("HOME", env.home())
         .env_remove("CLAUDE_CODE_SESSION_ID")
         .env_remove("CODEX_THREAD_ID")
         .env_remove("CLANK_AGENT");

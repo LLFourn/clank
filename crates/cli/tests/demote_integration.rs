@@ -30,19 +30,15 @@ fn write(repo: &Path, rel: &str, body: &str) {
 }
 
 /// Init a git repo + a master claude agent + a seed commit on
-/// main. Returns the tempdir guard.
-fn init_repo_with_master() -> tempfile::TempDir {
-    let dir = tempfile::tempdir().unwrap();
-    let repo = dir.path();
-    git(repo, &["init", "--quiet", "--initial-branch=main"]);
-    git(repo, &["config", "user.email", "test@test"]);
-    git(repo, &["config", "user.name", "test"]);
-    git(repo, &["config", "commit.gpgsign", "false"]);
+/// main. The team is registered through the real cores
+/// (`dogfood-init-setup-in-tests`); `TestEnv` carries the
+/// separate HOME the registration writes user-scope into.
+fn init_repo_with_master() -> common::TestEnv {
+    let env = common::TestEnv::init();
+    let repo = env.repo();
     write(repo, ".clank/.gitignore", "/agents/\n/cache/\n");
     write(repo, ".gitignore", ".clank/agents/\n.clank/cache/\n");
-    // Master agent for this repo via the repo-scope team
-    // (`teams-based-agent-registration`).
-    common::write_team_config(repo, "claude", &[], &[]);
+    env.register_team("claude", &[], &[]);
     let cfg = clank_core::agent_config::AgentConfig {
         auto_mode: clank_core::vocab::AutoMode::Off,
         ..Default::default()
@@ -55,7 +51,7 @@ fn init_repo_with_master() -> tempfile::TempDir {
     write(repo, "README.md", "seed\n");
     git(repo, &["add", "-A"]);
     git(repo, &["commit", "--quiet", "-m", "seed"]);
-    dir
+    env
 }
 
 /// Add a plan with `n_revisions` plan-body-only commits.
@@ -80,11 +76,12 @@ fn seed_plan_only_commits(repo: &Path, stem: &str, n_revisions: usize) {
     }
 }
 
-fn run_demote(repo: &Path, args: &[&str]) -> std::process::Output {
+fn run_demote(env: &common::TestEnv, args: &[&str]) -> std::process::Output {
     let mut cmd = Command::new(clank_bin());
     cmd.arg("demote")
         .arg("--repo")
-        .arg(repo)
+        .arg(env.repo())
+        .env("HOME", env.home())
         .arg("--yes")
         // Tests init repos on `main`, which is a protected branch
         // by default. Pass the override so the in-place path can
@@ -95,11 +92,12 @@ fn run_demote(repo: &Path, args: &[&str]) -> std::process::Output {
     cmd.output().expect("spawn clank demote")
 }
 
-fn run_demote_protected(repo: &Path, args: &[&str]) -> std::process::Output {
+fn run_demote_protected(env: &common::TestEnv, args: &[&str]) -> std::process::Output {
     let mut cmd = Command::new(clank_bin());
     cmd.arg("demote")
         .arg("--repo")
-        .arg(repo)
+        .arg(env.repo())
+        .env("HOME", env.home())
         .arg("--yes")
         // No --allow-rewrite-protected; exercise the refusal.
         .args(args);
@@ -108,12 +106,12 @@ fn run_demote_protected(repo: &Path, args: &[&str]) -> std::process::Output {
 
 #[test]
 fn demote_plan_only_commits_succeeds_without_force() {
-    let dir = init_repo_with_master();
-    let repo = dir.path();
+    let env = init_repo_with_master();
+    let repo = env.repo();
     seed_plan_only_commits(repo, "alpha", 2);
     let head_before = head_sha(repo);
 
-    let out = run_demote(repo, &["alpha"]);
+    let out = run_demote(&env, &["alpha"]);
     assert!(
         out.status.success(),
         "demote failed: stdout=`{}` stderr=`{}`",
@@ -142,8 +140,8 @@ fn demote_plan_only_commits_succeeds_without_force() {
 
 #[test]
 fn demote_plan_with_code_commits_requires_force() {
-    let dir = init_repo_with_master();
-    let repo = dir.path();
+    let env = init_repo_with_master();
+    let repo = env.repo();
     // Intro commit (plan-only).
     write(repo, ".clank/plans/beta.md", "# v1\n");
     git(repo, &["add", "-A"]);
@@ -154,7 +152,7 @@ fn demote_plan_with_code_commits_requires_force() {
     git(repo, &["add", "-A"]);
     git(repo, &["commit", "--quiet", "-m", "[beta] mixed"]);
 
-    let out = run_demote(repo, &["beta"]);
+    let out = run_demote(&env, &["beta"]);
     assert!(
         !out.status.success(),
         "demote with mixed commits must refuse without --force; stdout=`{}` stderr=`{}`",
@@ -173,8 +171,8 @@ fn demote_plan_with_code_commits_requires_force() {
 
 #[test]
 fn demote_force_drops_mixed_commits() {
-    let dir = init_repo_with_master();
-    let repo = dir.path();
+    let env = init_repo_with_master();
+    let repo = env.repo();
     write(repo, ".clank/plans/beta.md", "# v1\n");
     git(repo, &["add", "-A"]);
     git(repo, &["commit", "--quiet", "-m", "[beta] intro"]);
@@ -183,7 +181,7 @@ fn demote_force_drops_mixed_commits() {
     git(repo, &["add", "-A"]);
     git(repo, &["commit", "--quiet", "-m", "[beta] mixed"]);
 
-    let out = run_demote(repo, &["beta", "--force"]);
+    let out = run_demote(&env, &["beta", "--force"]);
     assert!(
         out.status.success(),
         "demote --force should drop mixed commits; stderr=`{}`",
@@ -197,11 +195,11 @@ fn demote_force_drops_mixed_commits() {
 
 #[test]
 fn demote_stub_writes_to_stubs_dir() {
-    let dir = init_repo_with_master();
-    let repo = dir.path();
+    let env = init_repo_with_master();
+    let repo = env.repo();
     seed_plan_only_commits(repo, "gamma", 0);
 
-    let out = run_demote(repo, &["gamma", "--stub"]);
+    let out = run_demote(&env, &["gamma", "--stub"]);
     assert!(
         out.status.success(),
         "demote --stub failed: stderr=`{}`",
@@ -219,11 +217,11 @@ fn demote_stub_writes_to_stubs_dir() {
 
 #[test]
 fn demote_priority_writes_to_queue_with_priority() {
-    let dir = init_repo_with_master();
-    let repo = dir.path();
+    let env = init_repo_with_master();
+    let repo = env.repo();
     seed_plan_only_commits(repo, "delta", 0);
 
-    let out = run_demote(repo, &["delta", "--priority", "100"]);
+    let out = run_demote(&env, &["delta", "--priority", "100"]);
     assert!(out.status.success(), "demote --priority failed");
     assert!(
         repo.join(".clank/queue/100-delta.md").exists(),
@@ -237,14 +235,14 @@ fn demote_priority_writes_to_queue_with_priority() {
 
 #[test]
 fn demote_target_collision_detected_before_rewrite() {
-    let dir = init_repo_with_master();
-    let repo = dir.path();
+    let env = init_repo_with_master();
+    let repo = env.repo();
     seed_plan_only_commits(repo, "epsilon", 0);
     let head_before = head_sha(repo);
     // Pre-populate the default target.
     write(repo, ".clank/queue/500-epsilon.md", "# stale queued copy\n");
 
-    let out = run_demote(repo, &["epsilon"]);
+    let out = run_demote(&env, &["epsilon"]);
     assert!(
         !out.status.success(),
         "demote must refuse when target file exists; stdout=`{}` stderr=`{}`",
@@ -266,14 +264,14 @@ fn demote_target_collision_detected_before_rewrite() {
 
 #[test]
 fn demote_dirty_plan_file_errors() {
-    let dir = init_repo_with_master();
-    let repo = dir.path();
+    let env = init_repo_with_master();
+    let repo = env.repo();
     seed_plan_only_commits(repo, "zeta", 1);
     let head_before = head_sha(repo);
     // Dirty the plan file in the working tree.
     write(repo, ".clank/plans/zeta.md", "# uncommitted edits\n");
 
-    let out = run_demote(repo, &["zeta"]);
+    let out = run_demote(&env, &["zeta"]);
     assert!(
         !out.status.success(),
         "demote must refuse when plan file is dirty; stdout=`{}` stderr=`{}`",
@@ -311,11 +309,11 @@ fn demote_dirty_plan_file_errors() {
 
 #[test]
 fn demote_into_branch_with_dry_does_not_create_branch() {
-    let dir = init_repo_with_master();
-    let repo = dir.path();
+    let env = init_repo_with_master();
+    let repo = env.repo();
     seed_plan_only_commits(repo, "pi", 0);
 
-    let out = run_demote(repo, &["pi", "--into-branch", "demote-pi-preview", "--dry"]);
+    let out = run_demote(&env, &["pi", "--into-branch", "demote-pi-preview", "--dry"]);
     assert!(out.status.success(), "--into-branch + --dry should succeed");
     // Branch was NOT created.
     let branches = Command::new("git")
@@ -335,14 +333,14 @@ fn demote_into_branch_with_dry_does_not_create_branch() {
 
 #[test]
 fn demote_stub_collision_errors() {
-    let dir = init_repo_with_master();
-    let repo = dir.path();
+    let env = init_repo_with_master();
+    let repo = env.repo();
     seed_plan_only_commits(repo, "rho", 0);
     let head_before = head_sha(repo);
     // Pre-populate the stub target.
     write(repo, ".clank/stubs/rho.md", "# pre-existing stub\n");
 
-    let out = run_demote(repo, &["rho", "--stub"]);
+    let out = run_demote(&env, &["rho", "--stub"]);
     assert!(
         !out.status.success(),
         "demote --stub must refuse when stub target exists; stdout=`{}` stderr=`{}`",
@@ -360,12 +358,12 @@ fn demote_stub_collision_errors() {
 
 #[test]
 fn demote_dry_no_changes() {
-    let dir = init_repo_with_master();
-    let repo = dir.path();
+    let env = init_repo_with_master();
+    let repo = env.repo();
     seed_plan_only_commits(repo, "eta", 1);
     let head_before = head_sha(repo);
 
-    let out = run_demote(repo, &["eta", "--dry"]);
+    let out = run_demote(&env, &["eta", "--dry"]);
     assert!(out.status.success(), "demote --dry should succeed");
     assert_eq!(
         head_sha(repo),
@@ -386,8 +384,8 @@ fn demote_dry_no_changes() {
 
 #[test]
 fn demote_orphaned_feedback_removed() {
-    let dir = init_repo_with_master();
-    let repo = dir.path();
+    let env = init_repo_with_master();
+    let repo = env.repo();
     seed_plan_only_commits(repo, "theta", 1);
     // Capture SHAs in the plan range; we'll use them as feedback
     // file keys.
@@ -420,7 +418,7 @@ fn demote_orphaned_feedback_removed() {
         "APPROVE\n",
     );
 
-    let out = run_demote(repo, &["theta"]);
+    let out = run_demote(&env, &["theta"]);
     assert!(out.status.success(), "demote failed");
 
     // Plan feedback gone.
@@ -442,12 +440,12 @@ fn demote_orphaned_feedback_removed() {
 
 #[test]
 fn demote_into_branch_does_not_touch_head() {
-    let dir = init_repo_with_master();
-    let repo = dir.path();
+    let env = init_repo_with_master();
+    let repo = env.repo();
     seed_plan_only_commits(repo, "iota", 1);
     let head_before = head_sha(repo);
 
-    let out = run_demote(repo, &["iota", "--into-branch", "demote-iota"]);
+    let out = run_demote(&env, &["iota", "--into-branch", "demote-iota"]);
     assert!(
         out.status.success(),
         "demote --into-branch failed: stderr=`{}`",
@@ -486,14 +484,14 @@ fn demote_into_branch_does_not_touch_head() {
 
 #[test]
 fn demote_into_branch_collision_errors() {
-    let dir = init_repo_with_master();
-    let repo = dir.path();
+    let env = init_repo_with_master();
+    let repo = env.repo();
     seed_plan_only_commits(repo, "kappa", 0);
     let head_before = head_sha(repo);
     // Pre-create the target branch.
     git(repo, &["branch", "existing-name"]);
 
-    let out = run_demote(repo, &["kappa", "--into-branch", "existing-name"]);
+    let out = run_demote(&env, &["kappa", "--into-branch", "existing-name"]);
     assert!(
         !out.status.success(),
         "demote --into-branch <existing> must refuse; stdout=`{}` stderr=`{}`",
@@ -513,11 +511,11 @@ fn demote_stub_with_high_priority_succeeds() {
     // as ignored under --stub). Pre-fix: --priority 1000 with
     // --stub errored anyway. Post-fix: succeeds, body lands at
     // .clank/stubs/<plan>.md, priority value irrelevant.
-    let dir = init_repo_with_master();
-    let repo = dir.path();
+    let env = init_repo_with_master();
+    let repo = env.repo();
     seed_plan_only_commits(repo, "sigma", 0);
 
-    let out = run_demote(repo, &["sigma", "--stub", "--priority", "1000"]);
+    let out = run_demote(&env, &["sigma", "--stub", "--priority", "1000"]);
     assert!(
         out.status.success(),
         "--stub --priority 1000 must succeed (priority is ignored under --stub); \
@@ -537,12 +535,12 @@ fn demote_priority_above_999_rejected() {
     // queue filenames `scan_queue` can't see (status / queue
     // promote ignore them). Match `clank queue add`'s validation
     // and reject before any rewrite.
-    let dir = init_repo_with_master();
-    let repo = dir.path();
+    let env = init_repo_with_master();
+    let repo = env.repo();
     seed_plan_only_commits(repo, "mu", 0);
     let head_before = head_sha(repo);
 
-    let out = run_demote(repo, &["mu", "--priority", "1000"]);
+    let out = run_demote(&env, &["mu", "--priority", "1000"]);
     assert!(
         !out.status.success(),
         "demote --priority 1000 must be rejected; stdout=`{}` stderr=`{}`",
@@ -561,8 +559,8 @@ fn demote_short_sha_feedback_removed() {
     // repo are keyed by 7-char short SHAs (the only naming
     // convention `clank feedback write` produces). The orphan
     // cleanup must match both full SHAs AND short prefixes.
-    let dir = init_repo_with_master();
-    let repo = dir.path();
+    let env = init_repo_with_master();
+    let repo = env.repo();
     seed_plan_only_commits(repo, "nu", 1);
     let log = Command::new("git")
         .arg("-C")
@@ -599,7 +597,7 @@ fn demote_short_sha_feedback_removed() {
         "APPROVE\n",
     );
 
-    let out = run_demote(repo, &["nu"]);
+    let out = run_demote(&env, &["nu"]);
     assert!(out.status.success(), "demote failed");
 
     // Short-keyed plan feedback gone.
@@ -629,13 +627,13 @@ fn demote_short_sha_feedback_removed() {
 
 #[test]
 fn demote_protected_branch_refusal_leaves_no_partial_state() {
-    let dir = init_repo_with_master();
-    let repo = dir.path();
+    let env = init_repo_with_master();
+    let repo = env.repo();
     seed_plan_only_commits(repo, "lambda", 1);
     let head_before = head_sha(repo);
 
     // No --allow-rewrite-protected; main is protected by default.
-    let out = run_demote_protected(repo, &["lambda"]);
+    let out = run_demote_protected(&env, &["lambda"]);
     assert!(
         !out.status.success(),
         "demote must refuse to rewrite main without --allow-rewrite-protected; stderr=`{}`",
