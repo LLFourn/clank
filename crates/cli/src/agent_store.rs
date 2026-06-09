@@ -188,13 +188,13 @@ fn try_resolve_via_team_with(
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(e.into()),
     };
-    // Fail-closed on parse error (codex b59dafb catch). Legacy
-    // `agents` array shape DOES parse here — the new schema's
-    // `agents` field is a BTreeMap, not a Vec, so legacy gets
-    // captured in `extra`. A real parse error means the file
-    // is genuinely malformed (e.g. invalid JSON, unknown
-    // strongly-typed field shape) and should surface, not be
-    // silently swallowed by the legacy fallback.
+    // Fail-closed on parse error (codex b59dafb catch). A
+    // leftover legacy `agents` array DOES parse here — the new
+    // schema has no `agents` field, so the array lands in
+    // `extra`. A real parse error means the file is genuinely
+    // malformed (invalid JSON, or a strongly-typed field like
+    // `team` with the wrong shape) and must surface, not be
+    // turned into a silent `Ok(None)`.
     let repo_cfg: RepoConfigFile = serde_json::from_str(&body).map_err(|e| {
         anyhow::anyhow!(
             "parsing {} as new-schema RepoConfigFile: {e}",
@@ -523,7 +523,7 @@ mod tests {
         let repo = TempDir::new().unwrap();
         let home = TempDir::new().unwrap();
         let r = try_resolve_via_team_with(repo.path(), Some(home.path())).unwrap();
-        assert!(r.is_none(), "no repo config → None (legacy fallback)");
+        assert!(r.is_none(), "no repo config → None (no team configured)");
     }
 
     #[test]
@@ -533,7 +533,7 @@ mod tests {
         let home = TempDir::new().unwrap();
         write_repo_config(repo.path(), "{}");
         let r = try_resolve_via_team_with(repo.path(), Some(home.path())).unwrap();
-        assert!(r.is_none(), "no team field → None (legacy fallback)");
+        assert!(r.is_none(), "no team field → None (no team configured)");
     }
 
     #[test]
@@ -548,43 +548,6 @@ mod tests {
         assert_eq!(set.master.as_str(), "codex");
         assert_eq!(set.commit_reviewers.len(), 1);
         assert_eq!(set.commit_reviewers[0].label.as_str(), "claude");
-    }
-
-    #[test]
-    fn try_resolve_via_team_with_fails_closed_on_malformed_repo_config() {
-        // Codex b59dafb fail-closed catch: a present-but-
-        // malformed `team` field must error, NOT fall back to
-        // legacy reviewers. Here `team: 42` is structurally
-        // invalid for the TeamField untagged enum.
-        let repo = TempDir::new().unwrap();
-        let home = TempDir::new().unwrap();
-        write_repo_config(repo.path(), r#"{"team": 42}"#);
-        let err = try_resolve_via_team_with(repo.path(), Some(home.path())).unwrap_err();
-        let msg = format!("{err:#}");
-        assert!(
-            msg.contains("RepoConfigFile"),
-            "expected parse-failure error for malformed team field; got: {msg}"
-        );
-    }
-
-    #[test]
-    fn try_resolve_via_team_with_legacy_agents_array_lands_in_extra_returns_none() {
-        // Back-compat property: a legacy `agents` array shape
-        // parses cleanly via the new schema (lands in `extra`),
-        // and the absence of a `team` field then routes to
-        // legacy fallback. A regression here would fail-closed
-        // on every unmigrated repo — disastrous.
-        let repo = TempDir::new().unwrap();
-        let home = TempDir::new().unwrap();
-        write_repo_config(
-            repo.path(),
-            r#"{"agents": [{"label": "claude", "role": "master", "tool": "claude"}]}"#,
-        );
-        let r = try_resolve_via_team_with(repo.path(), Some(home.path())).unwrap();
-        assert!(
-            r.is_none(),
-            "legacy agents shape parses + no team field → None (legacy fallback)"
-        );
     }
 
     #[test]

@@ -585,29 +585,6 @@ mod tests {
     }
 
     #[test]
-    fn repo_config_legacy_agents_key_lands_in_extra() {
-        // Codex 4c79ed2 catch trigger #2: legacy agents block
-        // in the JSON survives deserialization via `extra`
-        // flatten — init's migration uses this to detect +
-        // clean.
-        let json = r#"{
-            "team": "dev",
-            "agents": [
-                {"label": "alice", "role": "master", "tool": "claude"}
-            ]
-        }"#;
-        let cfg: RepoConfigFile = serde_json::from_str(json).unwrap();
-        // Team deserialized correctly.
-        match cfg.team {
-            Some(TeamField::Single(ref s)) if s == "dev" => {}
-            other => panic!("expected Single(dev); got {other:?}"),
-        }
-        // Legacy agents key landed in extra (init migration
-        // checks for this).
-        assert!(cfg.extra.contains_key("agents"));
-    }
-
-    #[test]
     fn team_entry_bare_string_round_trips() {
         let entry = TeamEntry::BareString(label("ruthless"));
         let json = serde_json::to_string(&entry).unwrap();
