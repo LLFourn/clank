@@ -10,54 +10,33 @@
 
 mod common;
 
-use std::path::Path;
-use std::process::Command;
-
-fn clank_bin() -> &'static str {
-    env!("CARGO_BIN_EXE_clank")
-}
-
-fn git(repo: &Path, args: &[&str]) {
-    let status = Command::new("git")
-        .arg("-C")
-        .arg(repo)
-        .args(args)
-        .status()
-        .expect("git");
-    assert!(status.success(), "git {args:?} failed");
-}
-
-fn init_repo() -> tempfile::TempDir {
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path();
-    git(path, &["init", "--quiet", "--initial-branch=main"]);
-    git(path, &["config", "user.email", "test@test"]);
-    git(path, &["config", "user.name", "test"]);
-    git(path, &["config", "commit.gpgsign", "false"]);
-    dir
+fn init_repo() -> common::TestEnv {
+    common::TestEnv::init()
 }
 
 const CLAUDE_SESSION: &str = "742f6a04-f174-409a-ab01-419a16c5f372";
 
-fn run_clank(repo: &Path, args: &[&str], env: &[(&str, &str)]) -> std::process::Output {
-    let home = tempfile::tempdir().expect("isolated test HOME");
-    let mut cmd = Command::new(clank_bin());
+fn run_clank(
+    env: &common::TestEnv,
+    args: &[&str],
+    extra_env: &[(&str, &str)],
+) -> std::process::Output {
+    let mut cmd = env.clank();
     cmd.args(args)
         .arg("--repo")
-        .arg(repo)
-        .env("HOME", home.path())
+        .arg(env.repo())
         .env_remove("CLAUDE_CODE_SESSION_ID")
         .env_remove("CODEX_THREAD_ID")
         .env_remove("CLANK_AGENT");
-    for (k, v) in env {
+    for (k, v) in extra_env {
         cmd.env(k, v);
     }
     cmd.output().expect("spawn clank")
 }
 
-fn bind_alice(repo: &Path) {
+fn bind_alice(env: &common::TestEnv) {
     let out = run_clank(
-        repo,
+        env,
         &["as", "alice"],
         &[("CLAUDE_CODE_SESSION_ID", CLAUDE_SESSION)],
     );
@@ -73,17 +52,16 @@ const WFW_TIMEOUT_EXIT: i32 = 2;
 
 #[test]
 fn wfw_resolves_author_from_session_when_omitted() {
-    let dir = init_repo();
-    let repo = dir.path();
+    let env = init_repo();
     // Team: alice is a commit reviewer (boss is master). wfw
     // resolves alice from her session binding.
-    common::write_team_config(repo, "boss", &["alice"], &[]);
-    bind_alice(repo);
+    env.register_team("boss", &["alice"], &[]);
+    bind_alice(&env);
 
     // No --author / --role passed. Should resolve alice + reviewers.
     // With no work in the repo it'll time out cleanly.
     let out = run_clank(
-        repo,
+        &env,
         &["wfw", "--no-poll", "--timeout", "1s"],
         &[("CLAUDE_CODE_SESSION_ID", CLAUDE_SESSION)],
     );
@@ -98,23 +76,22 @@ fn wfw_resolves_author_from_session_when_omitted() {
 
 #[test]
 fn wfw_resolves_role_master_from_repo_config() {
-    let dir = init_repo();
-    let repo = dir.path();
+    let env = init_repo();
     // alice is the team master (role is team-derived now;
     // `teams-based-agent-registration`). wfw resolves her role
     // as master from the team, with no explicit `--role`.
-    common::write_team_config(repo, "alice", &[], &[]);
-    bind_alice(repo);
+    env.register_team("alice", &[], &[]);
+    bind_alice(&env);
 
     // Add a queue item so master returns PromoteFromQueue (exit 0).
     // A reviewer would timeout (exit 2), confirming the resolved
     // role was master.
-    let queue_dir = repo.join(".clank/queue");
+    let queue_dir = env.repo().join(".clank/queue");
     std::fs::create_dir_all(&queue_dir).unwrap();
     std::fs::write(queue_dir.join("500-test.md"), "# test\n").unwrap();
 
     let out = run_clank(
-        repo,
+        &env,
         &["wfw", "--no-poll", "--timeout", "1s", "--json"],
         &[("CLAUDE_CODE_SESSION_ID", CLAUDE_SESSION)],
     );
@@ -133,16 +110,15 @@ fn wfw_resolves_role_master_from_repo_config() {
 
 #[test]
 fn wfw_explicit_author_overrides_resolver() {
-    let dir = init_repo();
-    let repo = dir.path();
-    common::write_team_config(repo, "boss", &["alice"], &[]);
-    bind_alice(repo);
+    let env = init_repo();
+    env.register_team("boss", &["alice"], &[]);
+    bind_alice(&env);
 
     // Pass --author bob (a label with no binding) — explicit
     // flag wins. Should still succeed: identity is given, no
     // resolver call.
     let out = run_clank(
-        repo,
+        &env,
         &[
             "wfw",
             "--no-poll",
@@ -160,12 +136,11 @@ fn wfw_explicit_author_overrides_resolver() {
 
 #[test]
 fn wfw_errors_when_no_author_resolvable() {
-    let dir = init_repo();
-    let repo = dir.path();
+    let env = init_repo();
     // No `clank as` and no --author flag. Resolver should refuse
     // with the bootstrap hint.
     let out = run_clank(
-        repo,
+        &env,
         &["wfw", "--no-poll", "--timeout", "1s"],
         &[("CLAUDE_CODE_SESSION_ID", CLAUDE_SESSION)],
     );
