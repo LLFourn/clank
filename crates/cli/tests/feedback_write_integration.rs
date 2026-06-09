@@ -58,12 +58,13 @@ fn one_plan_repo() -> (tempfile::TempDir, String) {
 }
 
 fn run_feedback_write(repo: &Path, args: &[&str]) -> (std::process::ExitStatus, String, String) {
+    let home = tempfile::tempdir().expect("isolated test HOME");
     let output = Command::new(clank_bin())
         .arg("feedback")
         .arg("write")
         .arg("--repo")
         .arg(repo)
-        .env("HOME", repo)
+        .env("HOME", home.path())
         .args(args)
         .output()
         .expect("spawn clank feedback write");

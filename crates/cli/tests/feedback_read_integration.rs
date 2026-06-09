@@ -60,10 +60,11 @@ fn human_output_shows_author_verdict_summary_and_body() {
         "APPROVE clean impl\n\nNo blocking findings.\nAll good.\n",
     );
 
+    let home = tempfile::tempdir().expect("isolated test HOME");
     let out = Command::new(clank_bin())
         .args(["feedback", "read", "--commit", &sha, "--repo"])
         .arg(repo)
-        .env("HOME", repo)
+        .env("HOME", home.path())
         .output()
         .unwrap();
     assert!(out.status.success());
@@ -100,10 +101,11 @@ fn json_output_includes_summary_and_details() {
         "REQUEST_CHANGES overwrought API\n\n- [P1] simplify\n- [P2] rename\n",
     );
 
+    let home = tempfile::tempdir().expect("isolated test HOME");
     let out = Command::new(clank_bin())
         .args(["feedback", "read", "--commit", &sha, "--json", "--repo"])
         .arg(repo)
-        .env("HOME", repo)
+        .env("HOME", home.path())
         .output()
         .unwrap();
     assert!(out.status.success());
@@ -135,10 +137,11 @@ fn short_ref_finds_full_sha_feedback() {
     );
 
     let short = &sha[..7];
+    let home = tempfile::tempdir().expect("isolated test HOME");
     let out = Command::new(clank_bin())
         .args(["feedback", "read", "--commit", short, "--repo"])
         .arg(repo)
-        .env("HOME", repo)
+        .env("HOME", home.path())
         .output()
         .unwrap();
     assert!(out.status.success());
@@ -156,10 +159,11 @@ fn invalid_ref_errors() {
     write(repo, "README.md", "seed\n");
     commit(repo, "seed");
 
+    let home = tempfile::tempdir().expect("isolated test HOME");
     let out = Command::new(clank_bin())
         .args(["feedback", "read", "--commit", "not-a-ref", "--repo"])
         .arg(repo)
-        .env("HOME", repo)
+        .env("HOME", home.path())
         .output()
         .unwrap();
     assert!(!out.status.success());

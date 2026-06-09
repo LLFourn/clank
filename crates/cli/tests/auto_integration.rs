@@ -37,6 +37,7 @@ const CLAUDE_SESSION: &str = "742f6a04-f174-409a-ab01-419a16c5f372";
 /// `--repo <path>` so cwd doesn't matter; always clears inherited
 /// session env so tests are deterministic.
 fn run_clank(repo: &Path, args: &[&str], env: &[(&str, &str)]) -> std::process::Output {
+    let home = tempfile::tempdir().expect("isolated test HOME");
     let mut cmd = Command::new(clank_bin());
     cmd.args(args)
         .arg("--repo")
@@ -44,7 +45,7 @@ fn run_clank(repo: &Path, args: &[&str], env: &[(&str, &str)]) -> std::process::
         .env_remove("CLAUDE_CODE_SESSION_ID")
         .env_remove("CODEX_THREAD_ID")
         .env_remove("CLANK_AGENT")
-        .env("HOME", repo);
+        .env("HOME", home.path());
     for (k, v) in env {
         cmd.env(k, v);
     }

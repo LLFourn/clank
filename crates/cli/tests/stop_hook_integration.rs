@@ -43,12 +43,13 @@ const CLAUDE_SESSION: &str = "742f6a04-f174-409a-ab01-419a16c5f372";
 const CODEX_SESSION: &str = "019e5385-ed97-7603-8561-dd9024328ff9";
 
 fn run_clank(repo: &Path, args: &[&str], env: &[(&str, &str)]) -> std::process::Output {
+    let home = tempfile::tempdir().expect("isolated test HOME");
     let mut cmd = Command::new(clank_bin());
     cmd.args(args)
         .env_remove("CLAUDE_CODE_SESSION_ID")
         .env_remove("CODEX_THREAD_ID")
         .env_remove("CLANK_AGENT")
-        .env("HOME", repo);
+        .env("HOME", home.path());
     for (k, v) in env {
         cmd.env(k, v);
     }
@@ -89,6 +90,7 @@ fn run_stop_hook(
     stdin_json: &str,
     env: &[(&str, &str)],
 ) -> (Option<i32>, String, String) {
+    let home = tempfile::tempdir().expect("isolated test HOME");
     let mut cmd = Command::new(clank_bin());
     cmd.arg("stop-hook")
         .arg("--tool")
@@ -98,7 +100,7 @@ fn run_stop_hook(
         .env_remove("CLAUDE_CODE_SESSION_ID")
         .env_remove("CODEX_THREAD_ID")
         .env_remove("CLANK_AGENT")
-        .env("HOME", repo)
+        .env("HOME", home.path())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());

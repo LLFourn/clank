@@ -51,11 +51,12 @@ fn head_sha(repo: &Path) -> String {
 }
 
 fn run_clank(repo: &Path, args: &[&str]) -> std::process::Output {
+    let home = tempfile::tempdir().expect("isolated test HOME");
     Command::new(clank_bin())
         .args(args)
         .arg("--repo")
         .arg(repo)
-        .env("HOME", repo)
+        .env("HOME", home.path())
         .env_remove("CLAUDE_CODE_SESSION_ID")
         .env_remove("CODEX_THREAD_ID")
         .env_remove("CLANK_AGENT")

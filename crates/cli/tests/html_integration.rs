@@ -49,11 +49,12 @@ fn head_sha(repo: &Path) -> String {
 }
 
 fn run_clank(repo: &Path, args: &[&str]) -> std::process::Output {
+    let home = tempfile::tempdir().expect("isolated test HOME");
     Command::new(clank_bin())
         .args(args)
         .arg("--repo")
         .arg(repo)
-        .env("HOME", repo)
+        .env("HOME", home.path())
         .env_remove("CLAUDE_CODE_SESSION_ID")
         .env_remove("CODEX_THREAD_ID")
         .env_remove("CLANK_AGENT")
@@ -264,11 +265,12 @@ fn html_open_is_a_subcommand_and_unknown_subcommand_errors() {
     // the subcommand) and a bogus subcommand should fail at
     // parse time.
     let dir = init_repo();
+    let home = tempfile::tempdir().expect("isolated test HOME");
     let out = Command::new(clank_bin())
         .args(["html", "open", "--help"])
         .arg("--repo")
         .arg(dir.path())
-        .env("HOME", dir.path())
+        .env("HOME", home.path())
         .output()
         .expect("spawn clank");
     assert!(

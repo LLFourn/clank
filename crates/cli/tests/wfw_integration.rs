@@ -143,12 +143,24 @@ impl TestEnv {
     }
 }
 
-/// Build a `Command` for `clank` with HOME isolated to a temp dir.
-/// For tests that don't use TestEnv, this uses the repo as a
-/// fallback home (no ~/.clank/ will exist there).
-fn clank_cmd(repo: &Path) -> Command {
+/// One empty, process-shared HOME for the non-TestEnv tests:
+/// distinct from any repo (so user-scope ≠ repo-scope) and
+/// empty (these tests put their config in the repo). Read-only
+/// in practice — `clank_cmd` callers never write user-scope —
+/// so sharing across parallel tests is safe. Leaked (lives for
+/// the test process) so the returned `Command`'s HOME stays
+/// valid after the builder returns.
+fn isolated_home() -> &'static Path {
+    use std::sync::OnceLock;
+    static HOME: OnceLock<std::path::PathBuf> = OnceLock::new();
+    HOME.get_or_init(|| tempfile::tempdir().expect("isolated test HOME").keep())
+}
+
+/// Build a `Command` for `clank` with HOME isolated to a temp
+/// dir separate from the repo.
+fn clank_cmd() -> Command {
     let mut cmd = Command::new(clank_bin());
-    cmd.env("HOME", repo);
+    cmd.env("HOME", isolated_home());
     cmd
 }
 
@@ -171,9 +183,9 @@ fn disable_adhoc_review(repo: &Path) {
 /// **Explicitly passes `--no-poll`** so the native-watcher path is
 /// exercised regardless of whether the test suite is running under
 /// `CODEX_SANDBOX=seatbelt`. Any test that wants polling mode must
-/// build its own `clank_cmd(repo)` chain with `--poll`.
+/// build its own `clank_cmd()` chain with `--poll`.
 fn spawn_wfw(repo: &Path, args: &[&str]) -> std::process::Child {
-    let child = clank_cmd(repo)
+    let child = clank_cmd()
         .arg("wfw")
         .arg("--no-poll")
         .args(args)
@@ -279,7 +291,7 @@ fn wfw_already_approved_reviewer_does_not_wake_while_peer_pending() {
         "APPROVE\n\nlgtm\n",
     );
 
-    let output = clank_cmd(repo)
+    let output = clank_cmd()
         .args([
             "wfw",
             "--no-poll",
@@ -322,7 +334,7 @@ fn wfw_missing_reviewer_does_wake_while_peer_already_approved() {
         "APPROVE\n\nlgtm\n",
     );
 
-    let output = clank_cmd(repo)
+    let output = clank_cmd()
         .args([
             "wfw",
             "--no-poll",
@@ -580,7 +592,7 @@ fn wfw_wakes_inside_linked_worktree_when_its_ref_moves() {
 /// repo as a one-shot subcommand. Returns stdout. Panics on non-zero
 /// exit so tests fail loudly when `finish`/`init` etc. break.
 fn clank_run(repo: &Path, args: &[&str]) -> String {
-    let output = clank_cmd(repo)
+    let output = clank_cmd()
         .args(args)
         .arg("--repo")
         .arg(repo)
@@ -613,7 +625,7 @@ fn wfw_master_approve_only_routes_to_continue() {
         "APPROVE\n\nlgtm\n",
     );
 
-    let output = clank_cmd(repo)
+    let output = clank_cmd()
         .args([
             "wfw",
             "--no-poll",
@@ -656,7 +668,7 @@ fn wfw_master_finished_verdict_routes_to_finalize() {
         "FINISHED\n\nplan is done\n",
     );
 
-    let output = clank_cmd(repo)
+    let output = clank_cmd()
         .args([
             "wfw",
             "--no-poll",
@@ -1001,7 +1013,7 @@ fn wfw_plan_already_finished_at_startup_emits_finished_and_exits() {
 
     // Plan is already finished; explicit --plan should emit a
     // finished item and exit 0 within the short timeout, NOT block.
-    let output = clank_cmd(repo)
+    let output = clank_cmd()
         .args([
             "wfw",
             "--no-poll",
@@ -1058,7 +1070,7 @@ fn wfw_polling_mode_wakes_on_commit_via_periodic_refold() {
 
     // Build the Command directly so we can pass --poll. The
     // shared spawn_wfw helper bakes in --no-poll.
-    let mut child = clank_cmd(repo)
+    let mut child = clank_cmd()
         .args([
             "wfw",
             "--poll",
@@ -1101,7 +1113,7 @@ fn wfw_master_no_plans_parks_until_timeout() {
     write(repo, "README.md", "# repo\n");
     commit(repo, "init");
 
-    let output = clank_cmd(repo)
+    let output = clank_cmd()
         .args([
             "wfw",
             "--no-poll",
@@ -1138,7 +1150,7 @@ fn wfw_reviewer_no_plans_still_blocks() {
     disable_adhoc_review(repo);
 
     let start = Instant::now();
-    let output = clank_cmd(repo)
+    let output = clank_cmd()
         .args([
             "wfw",
             "--no-poll",
@@ -1180,7 +1192,7 @@ fn wfw_skips_queue_promote_on_duplicate_names() {
     write(repo, ".clank/queue/400-foo.md", "# foo\n");
     write(repo, ".clank/queue/410-foo.md", "# foo v2\n");
 
-    let output = clank_cmd(repo)
+    let output = clank_cmd()
         .args([
             "wfw",
             "--no-poll",
@@ -1226,7 +1238,7 @@ fn wfw_fresh_repo_does_not_surface_adhoc_review_by_default() {
     write(repo, "README.md", "# repo\n");
     commit(repo, "init");
 
-    let output = clank_cmd(repo)
+    let output = clank_cmd()
         .args([
             "wfw",
             "--no-poll",
@@ -1269,7 +1281,7 @@ fn wfw_master_with_active_plan_still_blocks() {
     commit(repo, "[foo] intro");
 
     let start = Instant::now();
-    let output = clank_cmd(repo)
+    let output = clank_cmd()
         .args([
             "wfw",
             "--no-poll",
@@ -1755,7 +1767,7 @@ fn wfw_master_blocked_plan_surfaces_next_queue_item() {
     )
     .unwrap();
 
-    let output = clank_cmd(repo)
+    let output = clank_cmd()
         .args([
             "wfw",
             "--no-poll",
@@ -1806,7 +1818,7 @@ fn wfw_block_on_queue_item_name_suppresses_promote() {
     // plan yet, the block by-name suppresses its promote signal.
     write(repo, ".clank/agents/lloyd/blocks/foo/dont-yet.md", "wait");
 
-    let output = clank_cmd(repo)
+    let output = clank_cmd()
         .args([
             "wfw",
             "--no-poll",
@@ -1861,7 +1873,7 @@ fn wfw_block_on_different_plan_does_not_suppress_unrelated_promote() {
     // Block scoped to a DIFFERENT plan name.
     write(repo, ".clank/agents/lloyd/blocks/bar/unrelated.md", "wait");
 
-    let output = clank_cmd(repo)
+    let output = clank_cmd()
         .args([
             "wfw",
             "--no-poll",
@@ -1900,7 +1912,7 @@ fn wfw_blocked_first_queue_item_still_surfaces_next_unblocked() {
     // Block on foo (the top-priority entry).
     write(repo, ".clank/agents/lloyd/blocks/foo/dont.md", "wait");
 
-    let output = clank_cmd(repo)
+    let output = clank_cmd()
         .args([
             "wfw",
             "--no-poll",
@@ -1948,7 +1960,7 @@ fn wfw_master_blocked_plan_empty_queue_times_out() {
         "stop everything",
     );
 
-    let output = clank_cmd(repo)
+    let output = clank_cmd()
         .args([
             "wfw",
             "--no-poll",
@@ -2011,7 +2023,7 @@ fn wfw_master_one_blocked_one_actionable_returns_only_actionable() {
     std::fs::create_dir_all(repo.join(".clank/queue")).unwrap();
     std::fs::write(repo.join(".clank/queue/100-other.md"), "# other\n").unwrap();
 
-    let output = clank_cmd(repo)
+    let output = clank_cmd()
         .args([
             "wfw",
             "--no-poll",
@@ -2075,7 +2087,7 @@ fn wfw_reviewer_blocked_plan_does_not_surface_promote() {
     )
     .unwrap();
 
-    let output = clank_cmd(repo)
+    let output = clank_cmd()
         .args([
             "wfw",
             "--no-poll",

@@ -42,9 +42,10 @@ fn run_queue(repo: &Path, queue_subargs: &[&str]) -> std::process::Output {
     let repo_arg = repo.to_string_lossy().to_string();
     let mut argv: Vec<&str> = vec!["queue", "--repo", &repo_arg];
     argv.extend_from_slice(queue_subargs);
+    let home = tempfile::tempdir().expect("isolated test HOME");
     Command::new(clank_bin())
         .args(&argv)
-        .env("HOME", repo)
+        .env("HOME", home.path())
         .env_remove("CLAUDE_CODE_SESSION_ID")
         .env_remove("CODEX_THREAD_ID")
         .env_remove("CLANK_AGENT")
@@ -129,11 +130,12 @@ fn queue_add_fails_with_no_body_source() {
 #[test]
 fn queue_add_from_stdin_dash() {
     let dir = init_repo();
+    let home = tempfile::tempdir().expect("isolated test HOME");
     let mut child = Command::new(clank_bin())
         .args(["queue", "--repo"])
         .arg(dir.path())
         .args(["add", "foo", "--priority", "400", "--from", "-"])
-        .env("HOME", dir.path())
+        .env("HOME", home.path())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())

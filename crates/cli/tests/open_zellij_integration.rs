@@ -53,6 +53,7 @@ fn write_repo_reviewers_no_master(repo: &Path, reviewers: &[&str]) {
 }
 
 fn run_zellij(repo: &Path, args: &[&str]) -> std::process::Output {
+    let home = tempfile::tempdir().expect("isolated test HOME");
     let mut cmd = Command::new(clank_bin());
     cmd.args(["open", "zellij", "--repo"])
         .arg(repo)
@@ -63,7 +64,7 @@ fn run_zellij(repo: &Path, args: &[&str]) -> std::process::Output {
         .env_remove("CLAUDE_CODE_SESSION_ID")
         .env_remove("CODEX_THREAD_ID")
         .env_remove("CLANK_AGENT")
-        .env("HOME", repo);
+        .env("HOME", home.path());
     cmd.output().expect("spawn clank open zellij")
 }
 
@@ -78,11 +79,10 @@ fn open_dry_rejects_unknown_repo_flag() {
     // there is no `--repo` flag on `open dry`. Lock this in:
     // passing `--repo` must fail at the clap layer, NOT
     // succeed silently.
-    let dir = init_repo();
-    let repo = dir.path();
+    let home = tempfile::tempdir().expect("isolated test HOME");
     let out = Command::new(clank_bin())
         .args(["open", "dry", "--repo", "/tmp", "/tmp/some/path"])
-        .env("HOME", repo)
+        .env("HOME", home.path())
         .env_remove("ZELLIJ_SESSION_NAME")
         .output()
         .expect("spawn");
@@ -106,11 +106,10 @@ fn legacy_open_invocation_errors_with_subcommand_hint() {
     // fail. Clap's exact wording is whatever it is — we just
     // want the call to fail AND tell the user it's a subcommand
     // problem (so `--help` can lead them to `dry` / `zellij`).
-    let dir = init_repo();
-    let repo = dir.path();
+    let home = tempfile::tempdir().expect("isolated test HOME");
     let out = Command::new(clank_bin())
         .args(["open", "/tmp/some/path"])
-        .env("HOME", repo)
+        .env("HOME", home.path())
         .env_remove("ZELLIJ_SESSION_NAME")
         .output()
         .expect("spawn");
@@ -361,13 +360,14 @@ fn open_zellij_panes_set_cwd_to_repo_so_tool_launches_in_repo() {
     common::write_team_config(repo, "alice", &["bob"], &[]);
 
     let cwd = std::env::temp_dir();
+    let home = tempfile::tempdir().expect("isolated test HOME");
     let out = Command::new(clank_bin())
         .current_dir(&cwd)
         .args(["open", "zellij", "--repo"])
         .arg(repo)
         .arg("--print")
         .env_remove("ZELLIJ_SESSION_NAME")
-        .env("HOME", repo)
+        .env("HOME", home.path())
         .output()
         .expect("spawn");
     assert!(out.status.success());
@@ -415,13 +415,14 @@ fn open_zellij_pane_commands_pin_repo_via_absolute_path() {
     // Invoke from a DIFFERENT cwd (the tempdir's parent, or
     // any path that isn't the repo).
     let cwd = std::env::temp_dir();
+    let home = tempfile::tempdir().expect("isolated test HOME");
     let out = Command::new(clank_bin())
         .current_dir(&cwd)
         .args(["open", "zellij", "--repo"])
         .arg(repo)
         .arg("--print")
         .env_remove("ZELLIJ_SESSION_NAME")
-        .env("HOME", repo)
+        .env("HOME", home.path())
         .output()
         .expect("spawn clank open zellij");
     assert!(

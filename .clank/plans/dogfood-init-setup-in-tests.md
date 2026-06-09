@@ -129,6 +129,25 @@ SERIES of independently-reviewable phases:
 diff is large. It may even be cleaner as a small series of
 plans; decide at phase boundaries.)
 
+### Prerequisite: tests must use a separate HOME from the repo (lloyd 2026-06-09)
+
+Most integration tests' `run()` helpers set `HOME=repo`
+(`.env("HOME", repo)`). That collapses user-scope
+(`$HOME/.clank/config.json`) and repo-scope
+(`<repo>/.clank/config.json`) onto the SAME FILE — unrealistic
+(no real user has `$HOME == repo`) and the reason the repo-only
+`write_team_config` shortcut was needed. It also blocks the
+real-cores `register_team` (which writes both scopes — they'd
+collide).
+
+**Principle: a test's HOME must be a distinct directory from its
+repo.** Fix this first (its own slice): each `run()` helper
+points `HOME` at a separate tempdir, not the repo. For tests
+that don't touch user-scope, an empty per-invocation tempdir is
+enough; tests that adopt `register_team` own a persistent home
+tempdir and thread it through `run()`. This unblocks the rest of
+Phase A's setup migration.
+
 ## Coverage the migration must NOT silently drop
 
 - **Render formats are contracts (ruthless 14bbfd3 #3).** Tests

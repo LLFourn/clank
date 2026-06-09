@@ -65,12 +65,13 @@ fn intro_plan(repo: &Path, stem: &str) {
 fn run(repo: &Path, args: &[&str]) -> std::process::Output {
     // args[0] is expected to be the top-level subcommand
     // (e.g. "html"). Insert `--repo <repo>` AFTER it.
+    let home = tempfile::tempdir().expect("isolated test HOME");
     let mut cmd = Command::new(clank_bin());
     cmd.arg(args[0])
         .arg("--repo")
         .arg(repo)
         .args(&args[1..])
-        .env("HOME", repo);
+        .env("HOME", home.path());
     cmd.output().expect("spawn clank")
 }
 

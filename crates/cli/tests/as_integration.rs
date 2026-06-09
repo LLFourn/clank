@@ -35,6 +35,7 @@ fn init_repo() -> tempfile::TempDir {
 /// Run `clank as` with a controlled env. Always passes
 /// `--repo <path>` so cwd doesn't matter.
 fn run_as(repo: &Path, label: &str, env: &[(&str, &str)]) -> std::process::Output {
+    let home = tempfile::tempdir().expect("isolated test HOME");
     let mut cmd = Command::new(clank_bin());
     cmd.arg("as")
         .arg(label)
@@ -45,7 +46,7 @@ fn run_as(repo: &Path, label: &str, env: &[(&str, &str)]) -> std::process::Outpu
         .env_remove("CLAUDE_CODE_SESSION_ID")
         .env_remove("CODEX_THREAD_ID")
         .env_remove("CLANK_AGENT")
-        .env("HOME", repo);
+        .env("HOME", home.path());
     for (k, v) in env {
         cmd.env(k, v);
     }

@@ -46,11 +46,12 @@ fn head_sha(repo: &Path) -> String {
 }
 
 fn run_clank(repo: &Path, args: &[&str]) -> std::process::Output {
+    let home = tempfile::tempdir().expect("isolated test HOME");
     Command::new(clank_bin())
         .args(args)
         .arg("--repo")
         .arg(repo)
-        .env("HOME", repo)
+        .env("HOME", home.path())
         .env_remove("CLAUDE_CODE_SESSION_ID")
         .env_remove("CODEX_THREAD_ID")
         .env_remove("CLANK_AGENT")
@@ -147,11 +148,12 @@ fn rewire_from_stdin_copies_feedback_for_simple_rename() {
 
     let stdin_body = format!("{old_sha} {new_sha} amend\n");
 
+    let home = tempfile::tempdir().expect("isolated test HOME");
     let mut child = Command::new(clank_bin())
         .args(["rewire", "--from-stdin"])
         .arg("--repo")
         .arg(repo)
-        .env("HOME", repo)
+        .env("HOME", home.path())
         .env_remove("CLAUDE_CODE_SESSION_ID")
         .env_remove("CODEX_THREAD_ID")
         .stdin(Stdio::piped())
@@ -217,11 +219,12 @@ fn rewire_squash_keeps_only_latest_old() {
     );
 
     let stdin_body = format!("{old_a} {new}\n{old_b} {new}\n{old_c} {new}\n");
+    let home = tempfile::tempdir().expect("isolated test HOME");
     let mut child = Command::new(clank_bin())
         .args(["rewire", "--from-stdin"])
         .arg("--repo")
         .arg(repo)
-        .env("HOME", repo)
+        .env("HOME", home.path())
         .env_remove("CLAUDE_CODE_SESSION_ID")
         .env_remove("CODEX_THREAD_ID")
         .stdin(Stdio::piped())
@@ -288,11 +291,12 @@ fn rewire_does_not_touch_index() {
     let new_sha = head_sha(repo);
 
     let stdin_body = format!("{old_sha} {new_sha}\n");
+    let home = tempfile::tempdir().expect("isolated test HOME");
     let mut child = Command::new(clank_bin())
         .args(["rewire", "--from-stdin"])
         .arg("--repo")
         .arg(repo)
-        .env("HOME", repo)
+        .env("HOME", home.path())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -361,12 +365,13 @@ fn installed_hook_rewires_on_real_amend() {
     git(repo, &["add", "-A"]);
 
     // Real amend → git fires post-rewrite → hook fires clank rewire.
+    let home = tempfile::tempdir().expect("isolated test HOME");
     let status = Command::new("git")
         .arg("-C")
         .arg(repo)
         .args(["commit", "--amend", "--quiet", "--no-edit"])
         .env("PATH", &new_path)
-        .env("HOME", repo)
+        .env("HOME", home.path())
         .env_remove("CLAUDE_CODE_SESSION_ID")
         .env_remove("CODEX_THREAD_ID")
         .env_remove("CLANK_AGENT")
@@ -422,11 +427,12 @@ fn rewire_followed_by_feedback_write_overwrites_rewired_copy() {
     let new_sha = head_sha(repo);
 
     let stdin_body = format!("{old_sha} {new_sha}\n");
+    let home = tempfile::tempdir().expect("isolated test HOME");
     let mut child = Command::new(clank_bin())
         .args(["rewire", "--from-stdin"])
         .arg("--repo")
         .arg(repo)
-        .env("HOME", repo)
+        .env("HOME", home.path())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
