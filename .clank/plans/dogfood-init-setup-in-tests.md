@@ -115,11 +115,21 @@ SERIES of independently-reviewable phases:
   (`common::write_team_config`, per-file `register_reviewer` /
   `write_repo_agents`) with calls to these cores.
 - **Phase B — query/render cores + their test migration.**
-  `status::snapshot(repo) -> StatusView`,
-  `html::render(...) -> String`, `doctor::run(repo) ->
-  Vec<CheckResult>`, `agent::list_rows(repo) -> Vec<AgentRow>`,
-  `open::inspect(...) -> OpenResponse`. Migrate the assertion
-  side to call these in-process.
+  AS SHIPPED, the migrated cores are: `status::snapshot` +
+  `StatusSnapshot::{to_json,to_human}` (status_blocked),
+  `open::inspect -> OpenResponse` (open_integration),
+  `doctor::repo_checks` + `checks_to_json` (doctor_unbound),
+  `html::generate` (html_integration). Each is home-threaded and
+  `pub`; its assertions moved in-process; one CLI smoke per
+  command group keeps the shell glue covered.
+
+  **`agent::list_rows`/`AgentRow` was DESCOPED** (codex 1a82554):
+  the original list had `agent list` integration tests, but those
+  were deleted in the `teams-based-agent-registration` hard cut,
+  so there is no spawning assertion left to migrate. Exposing a
+  `pub list_rows` with no caller would be speculative dead
+  plumbing — out of scope. If `agent list` assertions are added
+  back later, expose the core then, following this same template.
 - **Phase C — cleanup.** Delete `crates/cli/tests/common/mod.rs`'s
   raw-JSON helper and any per-file pokers once nothing uses
   them; confirm only the genuinely-process-level tests still

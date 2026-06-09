@@ -1367,3 +1367,29 @@ fn html_version_match_preserves_incremental_skip() {
         "pinned older commit page should NOT be rewritten when version matches and it's outside top-N"
     );
 }
+
+/// Through-the-binary HAPPY-PATH smoke: the content assertions
+/// above run `html::generate` in-process, so this one spawn
+/// covers the `clank html` shell glue end-to-end — arg parse →
+/// generate → write the site → `wrote <path>` on stdout, exit 0.
+/// Matches the per-command CLI smoke the other Phase-B cores
+/// carry. (The `bogus-subcommand` test covers only the clap
+/// FAILURE path, not this generate→write glue.)
+#[test]
+fn html_cli_smoke_writes_site() {
+    let dir = init_repo();
+    let repo = dir.path();
+    write(repo, ".clank/plans/foo.md", "# foo\n");
+    commit(repo, "[foo] intro");
+
+    let out = run_clank(repo, &["html"]);
+    assert!(
+        out.status.success(),
+        "clank html should exit 0: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        repo.join(".clank/html/index.html").is_file(),
+        "clank html should write index.html"
+    );
+}
