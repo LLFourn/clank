@@ -1408,25 +1408,15 @@ fn wfw_idle_hook_fires_but_master_parks() {
 
     let marker = repo.join("idle-hook-ran.txt");
     let hook_cmd = format!("touch {}", marker.display());
-    let cfg = clank::cli::config::RepoConfigFile {
-        review: Some(clank::cli::config::ReviewSection {
-            adhoc_feedback: Some(false),
-            ..Default::default()
-        }),
-        hooks: Some(clank::cli::config::HooksSection {
+    // setup_no_adhoc already registered the lloyd team + disabled
+    // adhoc review; merge the idle hook into that repo config
+    // (don't overwrite — it carries the team field).
+    merge_repo_config(repo, |f| {
+        f.hooks = Some(clank::cli::config::HooksSection {
             idle: Some(Some(hook_cmd.clone())),
             ..Default::default()
-        }),
-        ..Default::default()
-    };
-    write(
-        repo,
-        ".clank/config.json",
-        &serde_json::to_string_pretty(&cfg).unwrap(),
-    );
-    // wfw resolves the repo's team; register lloyd as master
-    // (merged into the review/hooks config just written).
-    common::write_team_config(repo, "lloyd", &[], &[]);
+        });
+    });
 
     let output = env
         .clank()
