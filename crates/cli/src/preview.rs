@@ -78,8 +78,20 @@ pub async fn build_finish_preview(
     }
 
     let latest_reviewable_sha = active.and_then(latest_reviewable);
+    // Milestone gate (`gate-reviewers-only-plan-change-and-finish`):
+    // the gate tier activates only when the latest reviewable commit
+    // touched the plan doc (or is finished). Look up that flag for
+    // the previewed commit.
+    let latest_touched_plan = active
+        .zip(latest_reviewable_sha.as_ref())
+        .and_then(|(ps, sha)| ps.commits.iter().rev().find(|e| &e.sha == sha))
+        .is_some_and(|e| e.touched_plan);
 
-    let gate_state = compute_gate(repo_root, latest_reviewable_sha.as_ref())?;
+    let gate_state = compute_gate(
+        repo_root,
+        latest_reviewable_sha.as_ref(),
+        latest_touched_plan,
+    )?;
     let (commit_reviewers, gate_reviewers) =
         crate::agent_store::load_reviewer_tiers(repo_root).map_err(PreviewError::AgentLoad)?;
     let any_registered = !commit_reviewers.is_empty() || !gate_reviewers.is_empty();
@@ -452,6 +464,7 @@ fn latest_reviewable(ps: &clank_core::repo_state::PlanState) -> Option<CommitSha
 fn compute_gate(
     repo_root: &Path,
     target_sha: Option<&CommitSha>,
+    latest_touched_plan: bool,
 ) -> Result<CommitGateState, PreviewError> {
     let Some(target) = target_sha else {
         return Ok(CommitGateState::Unreviewed);
@@ -464,6 +477,7 @@ fn compute_gate(
         &entries,
         &commit_reviewers,
         &gate_reviewers,
+        latest_touched_plan,
     ))
 }
 

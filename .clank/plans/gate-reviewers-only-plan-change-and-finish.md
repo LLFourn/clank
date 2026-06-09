@@ -93,20 +93,33 @@ the finish commit — exactly the two milestones the user wants.
 - **Devolve case** (empty `commit_reviewers`, non-empty
   `gate_reviewers`): "all commit positive" and "all finished"
   are both vacuously true, which would make every commit a
-  milestone again. Recommendation: when `commit_reviewers` is
-  empty, the FINISHED milestone cannot be signaled by a commit
-  reviewer, so the milestone reduces to `touched_plan` only —
-  gate reviewers fire on plan-doc commits only in a master+gate
-  setup. Implementer to confirm.
+  milestone again. PINNED (ruthless): when `commit_reviewers` is
+  empty the FINISHED milestone cannot be signaled, so the
+  milestone reduces to `touched_plan` only. Implemented via the
+  `!commit_reviewers.is_empty()` guard in `commit_finished`, and
+  pinned by `compute_gate_empty_commit_gate_only_wakes_on_plan_doc_not_every_commit`
+  (pure-code → Approved, plan-doc → ApprovedPendingGate).
 
-## Known property (not introduced here)
+## Limitation: the gate sees only the LATEST reviewable commit
 
-The gate evaluates only the LATEST reviewable commit. If master
-commits a plan-doc change and then a code commit before reviews
-land, the gate sees the code commit (not a milestone) and the
-plan-approval gate for that plan-doc commit is skipped. This is
-inherent to the existing single-latest-sha gate, not new to this
-change; flag only if it bites.
+**Prominent, by design (ruthless):** the gate evaluates only the
+plan's latest reviewable commit. In the normal commit-then-wait
+flow this is fine — master commits the plan-doc change, the gate
+goes `Unreviewed`, master waits, the commit reviewer approves,
+and the plan-doc commit IS still the latest → the gate reviewer
+sees it. The `compute_gate_plan_doc_commit_approved_wakes_gate`
+test guarantees this common path.
+
+The gap: if master commits a plan-doc change AND a later code
+commit *before* reviews land on the plan-doc commit, the gate
+sees only the code commit (not a milestone) and the plan-approval
+gate for that plan-doc commit is silently skipped — defeating
+milestone (1)'s purpose for that case. This requires master to
+commit past its own unreviewed plan-doc change. It is inherent to
+the existing single-latest-sha gate, NOT introduced here. The
+deeper fix (gate tracks unreviewed plan-doc commits, not just the
+latest sha) is out of scope; this limitation is documented here
+so it is visible rather than a footnote.
 
 ## Out of scope
 

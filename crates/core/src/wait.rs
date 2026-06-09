@@ -203,16 +203,23 @@ pub struct AdHocWorkState {
 /// voted yet. Gate-reviewers wake during this state; master
 /// sleeps.
 ///
-/// Empty-set rule (the "devolve" property from the plan body):
-/// when `commit_reviewers` is empty, "all commit-reviewers
-/// approved" is vacuously true on the empty set, so the state
-/// machine transitions to `ApprovedPendingGate` immediately on
-/// the first commit. Gate-reviewers fire per-commit. No special
-/// case in code — set semantics produce it.
+/// Gate-tier activation is MILESTONE-conditional
+/// (`gate-reviewers-only-plan-change-and-finish`): once the commit
+/// tier is unanimous, the gate tier is consulted only when the
+/// latest reviewable commit is a milestone — `latest_touched_plan`
+/// (plan sign-off) OR commit-tier FINISHED. Routine commits bypass
+/// the gate tier → `Approved`.
+///
+/// Empty-set / devolve rule: with empty `commit_reviewers`, "all
+/// commit positive/finished" is vacuously true. The FINISHED
+/// milestone is guarded (no commit reviewer to signal it), so a
+/// master+gate-only repo wakes gate-reviewers on plan-doc commits
+/// only — not every commit.
 pub fn compute_gate(
     reviews: &[ReviewEntry],
     commit_reviewers: &[AgentLabel],
     gate_reviewers: &[AgentLabel],
+    latest_touched_plan: bool,
 ) -> crate::vocab::CommitGateState {
     use crate::vocab::{CommitGateState, Verdict};
 
@@ -265,19 +272,41 @@ pub fn compute_gate(
         return CommitGateState::Unreviewed;
     }
 
-    // All commit-reviewers signed off (approve/finished). Now
-    // check gate-reviewers — they only contribute once
-    // commit-reviewers are unanimous.
+    let finished =
+        |label: &AgentLabel| -> bool { matches!(by_label.get(label), Some(Verdict::Finished)) };
+
+    // The gate tier is consulted ONLY at a MILESTONE on the latest
+    // reviewable commit — never on routine WIP commits. A milestone
+    // is either:
+    //   1. the commit changed the plan document (`latest_touched_plan`)
+    //      and the commit tier approved it — plan sign-off, or
+    //   2. the commit tier marked it FINISHED — the final gate.
+    // On any other commit (pure code, merely approved) the gate tier
+    // is bypassed and the gate passes straight to `Approved` so master
+    // keeps moving. This makes "gate reviewer woken on an intermediate
+    // code commit" unrepresentable by construction.
+    //
+    // Devolve guard: with an EMPTY commit tier, "all finished" is
+    // vacuously true on the empty set — which would make every commit
+    // a FINISHED milestone and reanimate the regression for master+gate
+    // setups. With no commit reviewer to actually signal FINISHED, the
+    // milestone reduces to `latest_touched_plan` only.
+    let commit_finished = !commit_reviewers.is_empty() && commit_reviewers.iter().all(&finished);
+    let is_milestone = latest_touched_plan || commit_finished;
+    if !is_milestone {
+        return CommitGateState::Approved;
+    }
+
+    // Milestone: the gate tier now contributes.
     let all_gate_positive = gate_reviewers.iter().all(positive);
     if !all_gate_positive {
         return CommitGateState::ApprovedPendingGate;
     }
 
-    // Both tiers positive. Decide Finished vs Approved by
-    // whether every reviewer is at Finished verdict.
-    let finished =
-        |label: &AgentLabel| -> bool { matches!(by_label.get(label), Some(Verdict::Finished)) };
-    let all_finished = commit_reviewers.iter().all(finished) && gate_reviewers.iter().all(finished);
+    // Both tiers positive at a milestone. Decide Finished vs Approved
+    // by whether every reviewer is at Finished verdict.
+    let all_finished =
+        commit_reviewers.iter().all(&finished) && gate_reviewers.iter().all(&finished);
     if all_finished {
         CommitGateState::Finished
     } else {
@@ -332,10 +361,16 @@ impl RepoState {
                 let latest_sha = reviewable.last().unwrap().clone();
                 let latest_event = ps.commits.iter().rev().find(|e| e.sha == latest_sha);
                 let touched_code = latest_event.map_or(false, |e| e.touched_code);
+                let latest_touched_plan = latest_event.map_or(false, |e| e.touched_plan);
 
                 let entries = reviews.reviews_for(&latest_sha);
                 let gate = if policy.plan_feedback {
-                    compute_gate(&entries, &policy.commit_reviewers, &policy.gate_reviewers)
+                    compute_gate(
+                        &entries,
+                        &policy.commit_reviewers,
+                        &policy.gate_reviewers,
+                        latest_touched_plan,
+                    )
                 } else {
                     // When plan review is disabled, treat as approved
                     // so master isn't blocked.
@@ -484,7 +519,16 @@ impl RepoState {
         if policy.adhoc_feedback {
             if let Some(event) = self.ad_hoc.last() {
                 let entries = reviews.reviews_for(&event.sha);
-                let gate = compute_gate(&entries, &policy.commit_reviewers, &policy.gate_reviewers);
+                // An ad-hoc commit has no plan to "change", so it is
+                // never a plan-doc milestone (latest_touched_plan =
+                // false). The ad-hoc tier inversion is tracked
+                // separately (see plan: Out of scope).
+                let gate = compute_gate(
+                    &entries,
+                    &policy.commit_reviewers,
+                    &policy.gate_reviewers,
+                    false,
+                );
                 ad_hoc.push(AdHocWorkState {
                     sha: event.sha.clone(),
                     gate,
@@ -669,21 +713,27 @@ mod tests {
     #[test]
     fn compute_gate_zero_reviewers_is_approved_even_with_no_reviews() {
         // Master-only repo: every commit auto-approves.
-        assert_eq!(compute_gate(&[], &[], &[]), CommitGateState::Approved);
+        assert_eq!(
+            compute_gate(&[], &[], &[], false),
+            CommitGateState::Approved
+        );
     }
 
     #[test]
     fn compute_gate_zero_reviewers_ignores_stale_request_changes() {
         // Removed reviewer's stale RC must not gate.
         let reviews = [entry(crate::vocab::Verdict::RequestChanges, "alice")];
-        assert_eq!(compute_gate(&reviews, &[], &[]), CommitGateState::Approved);
+        assert_eq!(
+            compute_gate(&reviews, &[], &[], false),
+            CommitGateState::Approved
+        );
     }
 
     #[test]
     fn compute_gate_single_expected_approve_is_approved() {
         let reviews = [entry(crate::vocab::Verdict::Approve, "codex")];
         assert_eq!(
-            compute_gate(&reviews, &[label("codex")], &[]),
+            compute_gate(&reviews, &[label("codex")], &[], false),
             CommitGateState::Approved
         );
     }
@@ -692,7 +742,7 @@ mod tests {
     fn compute_gate_single_expected_request_changes() {
         let reviews = [entry(crate::vocab::Verdict::RequestChanges, "codex")];
         assert_eq!(
-            compute_gate(&reviews, &[label("codex")], &[]),
+            compute_gate(&reviews, &[label("codex")], &[], false),
             CommitGateState::ChangesRequested
         );
     }
@@ -704,7 +754,7 @@ mod tests {
             entry(crate::vocab::Verdict::Approve, "ruthless"),
         ];
         assert_eq!(
-            compute_gate(&reviews, &[label("codex"), label("ruthless")], &[]),
+            compute_gate(&reviews, &[label("codex"), label("ruthless")], &[], false),
             CommitGateState::Approved
         );
     }
@@ -716,7 +766,7 @@ mod tests {
             entry(crate::vocab::Verdict::RequestChanges, "ruthless"),
         ];
         assert_eq!(
-            compute_gate(&reviews, &[label("codex"), label("ruthless")], &[]),
+            compute_gate(&reviews, &[label("codex"), label("ruthless")], &[], false),
             CommitGateState::ChangesRequested
         );
     }
@@ -725,7 +775,7 @@ mod tests {
     fn compute_gate_two_expected_one_missing_is_unreviewed() {
         let reviews = [entry(crate::vocab::Verdict::Approve, "codex")];
         assert_eq!(
-            compute_gate(&reviews, &[label("codex"), label("ruthless")], &[]),
+            compute_gate(&reviews, &[label("codex"), label("ruthless")], &[], false),
             CommitGateState::Unreviewed
         );
     }
@@ -737,7 +787,7 @@ mod tests {
             entry(crate::vocab::Verdict::Finished, "ruthless"),
         ];
         assert_eq!(
-            compute_gate(&reviews, &[label("codex"), label("ruthless")], &[]),
+            compute_gate(&reviews, &[label("codex"), label("ruthless")], &[], false),
             CommitGateState::Finished
         );
     }
@@ -750,7 +800,7 @@ mod tests {
             entry(crate::vocab::Verdict::Approve, "ruthless"),
         ];
         assert_eq!(
-            compute_gate(&reviews, &[label("codex"), label("ruthless")], &[]),
+            compute_gate(&reviews, &[label("codex"), label("ruthless")], &[], false),
             CommitGateState::Approved
         );
     }
@@ -759,7 +809,7 @@ mod tests {
     fn compute_gate_unmarked_treated_as_changes() {
         let reviews = [entry(crate::vocab::Verdict::Unmarked, "codex")];
         assert_eq!(
-            compute_gate(&reviews, &[label("codex")], &[]),
+            compute_gate(&reviews, &[label("codex")], &[], false),
             CommitGateState::ChangesRequested
         );
     }
@@ -771,16 +821,24 @@ mod tests {
     //    WorkStatus directly).
 
     #[test]
-    fn compute_gate_empty_commit_nonempty_gate_returns_approved_pending_gate_immediately() {
-        // The "devolve" property: empty commit_reviewers means
-        // "all commit approved" is vacuously true → state
-        // transitions to ApprovedPendingGate immediately on
-        // first commit (no reviews yet). Gate-reviewer fires
-        // per-commit, functionally as if they were commit-tier.
-        // No special case in code — set semantics produce it.
+    fn compute_gate_empty_commit_gate_only_wakes_on_plan_doc_not_every_commit() {
+        // Devolve case under milestone gating
+        // (`gate-reviewers-only-plan-change-and-finish`, ruthless
+        // pin): empty commit_reviewers + gate reviewer. With no
+        // commit reviewer to signal FINISHED, the milestone reduces
+        // to `touched_plan` only — so a ROUTINE (pure-code) commit
+        // does NOT wake the gate reviewer (the regression this
+        // guards against)...
         assert_eq!(
-            compute_gate(&[], &[], &[label("ruthless")]),
-            CommitGateState::ApprovedPendingGate
+            compute_gate(&[], &[], &[label("ruthless")], false),
+            CommitGateState::Approved,
+            "empty-commit + gate: pure-code commit must NOT wake the gate reviewer"
+        );
+        // ...but a PLAN-DOC commit is a milestone and does.
+        assert_eq!(
+            compute_gate(&[], &[], &[label("ruthless")], true),
+            CommitGateState::ApprovedPendingGate,
+            "empty-commit + gate: plan-doc commit IS a milestone → gate wakes"
         );
     }
 
@@ -790,7 +848,10 @@ mod tests {
         // (NOT Finished). Preserves pre-plan behavior; lloyd
         // 2026-06-08 directive (codex 8cb01b6 catch on the
         // earlier plan-body drift).
-        assert_eq!(compute_gate(&[], &[], &[]), CommitGateState::Approved);
+        assert_eq!(
+            compute_gate(&[], &[], &[], false),
+            CommitGateState::Approved
+        );
     }
 
     #[test]
@@ -803,7 +864,7 @@ mod tests {
             entry(crate::vocab::Verdict::RequestChanges, "ruthless"),
         ];
         assert_eq!(
-            compute_gate(&reviews, &[label("codex")], &[label("ruthless")]),
+            compute_gate(&reviews, &[label("codex")], &[label("ruthless")], false),
             CommitGateState::ChangesRequested
         );
     }
@@ -820,7 +881,7 @@ mod tests {
             entry(crate::vocab::Verdict::Approve, "ruthless"),
         ];
         assert_eq!(
-            compute_gate(&reviews, &[label("codex")], &[label("ruthless")]),
+            compute_gate(&reviews, &[label("codex")], &[label("ruthless")], false),
             CommitGateState::Approved
         );
     }
@@ -834,7 +895,7 @@ mod tests {
         // is ignored until commit-reviewers all positive.
         let reviews = [entry(crate::vocab::Verdict::Approve, "ruthless")];
         assert_eq!(
-            compute_gate(&reviews, &[label("codex")], &[label("ruthless")]),
+            compute_gate(&reviews, &[label("codex")], &[label("ruthless")], false),
             CommitGateState::Unreviewed
         );
     }
@@ -848,7 +909,7 @@ mod tests {
             entry(crate::vocab::Verdict::Finished, "ruthless"),
         ];
         assert_eq!(
-            compute_gate(&reviews, &[label("codex")], &[label("ruthless")]),
+            compute_gate(&reviews, &[label("codex")], &[label("ruthless")], false),
             CommitGateState::Finished
         );
     }
@@ -864,7 +925,7 @@ mod tests {
             entry(crate::vocab::Verdict::Approve, "ruthless"),
         ];
         assert_eq!(
-            compute_gate(&reviews, &[label("codex"), label("ruthless")], &[]),
+            compute_gate(&reviews, &[label("codex"), label("ruthless")], &[], false),
             CommitGateState::Approved
         );
     }
@@ -879,8 +940,51 @@ mod tests {
             // ruthless missing
         ];
         assert_eq!(
-            compute_gate(&reviews, &[label("codex"), label("ruthless")], &[]),
+            compute_gate(&reviews, &[label("codex"), label("ruthless")], &[], false),
             CommitGateState::Unreviewed
+        );
+    }
+
+    // ── gate-reviewers-only-plan-change-and-finish: milestone
+    //    gating. The gate tier is consulted ONLY at a plan-doc
+    //    change or a finish — never on routine WIP commits.
+
+    #[test]
+    fn compute_gate_routine_code_commit_approved_does_not_wake_gate() {
+        // THE CORE REGRESSION FIX: commit-reviewer APPROVES a
+        // pure-code (non-plan, non-finish) commit. The gate
+        // reviewer must NOT be woken — gate passes to Approved so
+        // master keeps moving.
+        let reviews = [entry(crate::vocab::Verdict::Approve, "codex")];
+        assert_eq!(
+            compute_gate(&reviews, &[label("codex")], &[label("ruthless")], false),
+            CommitGateState::Approved,
+            "routine code commit (approved, not a milestone) must bypass the gate tier"
+        );
+    }
+
+    #[test]
+    fn compute_gate_plan_doc_commit_approved_wakes_gate() {
+        // Milestone (1) — plan-doc change approved by the commit
+        // tier → gate reviewer signs off on the plan.
+        let reviews = [entry(crate::vocab::Verdict::Approve, "codex")];
+        assert_eq!(
+            compute_gate(&reviews, &[label("codex")], &[label("ruthless")], true),
+            CommitGateState::ApprovedPendingGate,
+            "plan-doc commit (touched_plan) IS a milestone → gate wakes"
+        );
+    }
+
+    #[test]
+    fn compute_gate_finished_commit_wakes_gate_even_without_plan_change() {
+        // Milestone (2) — commit tier FINISHED on a pure-code
+        // commit (touched_plan=false). Still a milestone (the final
+        // gate), so the gate reviewer wakes.
+        let reviews = [entry(crate::vocab::Verdict::Finished, "codex")];
+        assert_eq!(
+            compute_gate(&reviews, &[label("codex")], &[label("ruthless")], false),
+            CommitGateState::ApprovedPendingGate,
+            "FINISHED commit is a milestone → gate wakes even with no plan change"
         );
     }
 
@@ -1183,10 +1287,13 @@ mod tests {
     fn compute_gate_unaffected_by_blocks() {
         // compute_gate is per-commit pure; blocks live a layer up
         // in derive_status. compute_gate's behavior is unchanged.
-        assert_eq!(compute_gate(&[], &[], &[]), CommitGateState::Approved);
+        assert_eq!(
+            compute_gate(&[], &[], &[], false),
+            CommitGateState::Approved
+        );
         let reviews = [entry(crate::vocab::Verdict::Approve, "codex")];
         assert_eq!(
-            compute_gate(&reviews, &[label("codex")], &[]),
+            compute_gate(&reviews, &[label("codex")], &[], false),
             CommitGateState::Approved
         );
     }
