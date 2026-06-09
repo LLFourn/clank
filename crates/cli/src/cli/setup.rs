@@ -414,6 +414,39 @@ fn wrapper_is_clank(wrapper: &serde_json::Value) -> bool {
 mod tests {
     use super::*;
 
+    /// The `- **FINISHED**:` bullet through (exclusive) the next
+    /// `- **REQUEST_CHANGES**:` bullet.
+    fn finished_block(skill: &str) -> &str {
+        let start = skill
+            .find("- **FINISHED**:")
+            .expect("skill has a FINISHED bullet");
+        let rest = &skill[start..];
+        let end = rest
+            .find("- **REQUEST_CHANGES**:")
+            .expect("skill has a REQUEST_CHANGES bullet after FINISHED");
+        &rest[..end]
+    }
+
+    #[test]
+    fn claude_codex_skills_define_finished_identically() {
+        // Divergence guard (finished-means-impl-done-not-plan-text,
+        // ruthless): the FINISHED definition MUST be byte-identical
+        // across the claude and codex skill assets, so the two
+        // agents never drift on what FINISHED means. Editing one
+        // skill's FINISHED bullet without the other fails here.
+        assert_eq!(
+            finished_block(CLAUDE_SKILL_BODY),
+            finished_block(CODEX_SKILL_BODY),
+            "claude and codex skills must define FINISHED identically"
+        );
+        // And the definition must be the implementation-complete
+        // one, not the old plan-text-done phrasing.
+        assert!(
+            finished_block(CLAUDE_SKILL_BODY).contains("fully\n    implemented and merge-ready"),
+            "FINISHED must mean the work is implemented, not the plan text written"
+        );
+    }
+
     fn write_file(path: &Path, contents: &str) {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(path, contents).unwrap();

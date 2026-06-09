@@ -25,14 +25,19 @@ Each repo's `.clank/` directory contains:
   `git commit -m`): first line is a summary, then details. The
   tool prepends the verdict to the file. Verdicts:
   - **APPROVE**: this commit's work is good. Mid-flight signal —
-    master keeps working. When you approve but don't think the
-    plan is fully done, include a one-sentence reason it's not
-    FINISHED yet (e.g. "tests still missing"). This keeps master
-    oriented on what's left.
-  - **FINISHED**: this plan is done — `clank finish` should run.
-    For a research-style plan whose output is the document
-    itself, mark FINISHED on the plan-text commit when the
-    document is complete.
+    master keeps working. When you approve but the plan's work
+    isn't fully IMPLEMENTED yet, include a one-sentence reason
+    it's not FINISHED yet (e.g. "tests still missing"). This
+    keeps master oriented on what's left.
+  - **FINISHED**: the work the plan DESCRIBES is fully
+    implemented and merge-ready — code written, tests passing,
+    review satisfied — so `clank finish` should run. FINISHED
+    does NOT mean "the plan text is written": a complete plan
+    document is the START of implementation, not the end.
+    (Exception: if the plan's only deliverable IS a document — a
+    research or design plan with no code to write — then the
+    finished document IS the implementation; mark FINISHED on the
+    plan-text commit.)
   - **REQUEST_CHANGES**: something needs to change.
 - `clank finish <plan>` — finalize a FINISHED plan (master only).
 - `clank as <label>` — bind this session to an agent label (you'll

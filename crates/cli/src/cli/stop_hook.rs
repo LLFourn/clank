@@ -217,7 +217,7 @@ fn render_wfw_items(items: &[serde_json::Value], label: &AgentLabel, role: Role)
         let short = short_sha(full);
         match kind {
             "reviewer" => out.push_str(&format!(
-                "  - reviewer: plan `{plan}` at {short} — write feedback via\n    `clank feedback write --commit {full} \\\n        --author {label} --verdict approve|finished|request-changes \\\n        -m \"<summary>\"`\n    Use FINISHED when you think the plan is done and `clank finish` should\n    run. Use APPROVE for mid-flight commits; include a one-sentence reason\n    you're not marking FINISHED (e.g. \"tests still missing\").\n",
+                "  - reviewer: plan `{plan}` at {short} — write feedback via\n    `clank feedback write --commit {full} \\\n        --author {label} --verdict approve|finished|request-changes \\\n        -m \"<summary>\"`\n    Use FINISHED only when the plan's work is fully IMPLEMENTED (code written,\n    tests passing) and `clank finish` should run — NOT when the plan text is\n    merely written. Use APPROVE for mid-flight commits; include a one-sentence\n    reason you're not marking FINISHED (e.g. \"tests still missing\").\n",
                 label = label.as_str(),
             )),
             "master" => {
