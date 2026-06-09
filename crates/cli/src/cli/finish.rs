@@ -104,20 +104,28 @@ fn dry_run_finish_composite(
 ) -> anyhow::Result<()> {
     println!("# clank finish --dry preview");
     println!("# plan: {}", preview.plan_id);
-    let amending_existing =
-        args.amend && matches!(preview.readiness, FinalizeReadiness::AlreadyFinished);
-    if amending_existing {
-        println!("# would amend HEAD finalize commit:");
-    } else {
-        println!("# would create finalize commit:");
-    }
+    let already_finished = matches!(preview.readiness, FinalizeReadiness::AlreadyFinished);
     let msg = args
         .message
         .as_deref()
         .map(str::to_string)
         .unwrap_or_else(|| format!("[{stem}] finish"));
-    println!("#   message: {msg}");
-    if !amending_existing {
+    if already_finished && args.amend {
+        // --amend re-commits the existing finalize.
+        println!("# would amend HEAD finalize commit:");
+        println!("#   message: {msg}");
+    } else if already_finished {
+        // Non-amend rewrite on an already-finished plan: the
+        // finalize commit already exists and is NOT touched — only
+        // the range is rewritten below. (Was previously mislabeled
+        // "would create finalize commit"; codex c0c34ef.)
+        println!(
+            "# plan already finished; finalize commit left as-is (only the range is rewritten)."
+        );
+    } else {
+        // Ready, not yet finalized: this run creates the finalize.
+        println!("# would create finalize commit:");
+        println!("#   message: {msg}");
         let approvers: Vec<&str> = preview
             .sealed_approvals
             .iter()

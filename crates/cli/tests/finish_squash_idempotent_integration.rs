@@ -151,6 +151,35 @@ fn finish_squash_is_idempotent_on_rerun() {
 }
 
 #[test]
+fn finish_dry_squash_on_finished_plan_does_not_claim_to_create_finalize() {
+    // codex c0c34ef: the --dry preview for the non-amend
+    // already-finished rewrite path must NOT say "would create
+    // finalize commit" (the finalize already exists) — it should
+    // say the finalize is left as-is, and preview the squash. And
+    // --dry must not move HEAD.
+    let env = finished_plan_with_impl_commits();
+    let repo = env.repo();
+    let before = head_sha(repo);
+
+    let out = run_finish(&env, &["--dry", "--squash", "Implement foo", "foo"]);
+    assert!(
+        out.status.success(),
+        "dry squash failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        !stdout.contains("would create finalize commit"),
+        "dry squash on a FINISHED plan must not claim to create a finalize commit; got:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("already finished") && stdout.contains("squash"),
+        "dry output should note the plan is already finished and preview the squash; got:\n{stdout}"
+    );
+    assert_eq!(before, head_sha(repo), "--dry must not move HEAD");
+}
+
+#[test]
 fn finish_purge_on_finished_plan_strips_clank() {
     let env = finished_plan_with_impl_commits();
     let repo = env.repo();
