@@ -1,5 +1,8 @@
 //! Integration tests for `clank doctor`'s unbound-reviewer warning.
 
+mod common;
+
+use common::TestEnv;
 use std::path::Path;
 use std::process::Command;
 
@@ -7,30 +10,14 @@ fn clank_bin() -> &'static str {
     env!("CARGO_BIN_EXE_clank")
 }
 
-fn git(repo: &Path, args: &[&str]) {
-    let status = Command::new("git")
-        .arg("-C")
-        .arg(repo)
-        .args(args)
-        .status()
-        .expect("git");
-    assert!(status.success(), "git {args:?} failed");
-}
-
-fn init_repo() -> tempfile::TempDir {
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path();
-    git(path, &["init", "--quiet", "--initial-branch=main"]);
-    git(path, &["config", "user.email", "test@test"]);
-    git(path, &["config", "user.name", "test"]);
-    git(path, &["config", "commit.gpgsign", "false"]);
-    dir
-}
-
 fn write(repo: &Path, rel: &str, body: &str) {
     let abs = repo.join(rel);
     std::fs::create_dir_all(abs.parent().unwrap()).unwrap();
     std::fs::write(abs, body).unwrap();
+}
+
+fn init_repo() -> TestEnv {
+    TestEnv::init()
 }
 
 /// Build a skeleton with optional session. Skeletons are
@@ -66,89 +53,76 @@ fn write_skeleton(repo: &Path, label: &str, cfg: &clank_core::agent_config::Agen
     .unwrap();
 }
 
-/// Register agents in the repo-scope team
-/// (`teams-based-agent-registration`). The master is the entry
-/// with `Role::Master`, else a synthetic `boss` master is added
-/// so resolution succeeds. All others become commit reviewers.
-fn register_agents(repo: &Path, agents: &[(&str, clank_core::vocab::Role)]) {
+/// Register agents through the REAL cores
+/// (`dogfood-init-setup-in-tests`). The `Role::Master` entry is
+/// the team master, else a synthetic `boss` master is added so
+/// resolution succeeds; all others become commit reviewers.
+fn register_agents(env: &TestEnv, agents: &[(&str, clank_core::vocab::Role)]) {
     use clank_core::vocab::Role;
     let master = agents
         .iter()
         .find(|(_, r)| *r == Role::Master)
-        .map(|(l, _)| l.to_string());
-    let master_label = master.clone().unwrap_or_else(|| "boss".to_string());
-    let mut entries = vec![serde_json::json!({
-        "label": master_label, "tool": "claude", "review": "commit"
-    })];
-    for (label, _role) in agents {
-        if Some(label.to_string()) == master {
-            continue;
-        }
-        entries.push(serde_json::json!({
-            "label": label, "tool": "claude", "review": "commit"
-        }));
-    }
-    let cfg = serde_json::json!({ "team": entries, "promoted": master_label });
-    write_repo_config_json(repo, &cfg);
+        .map(|(l, _)| *l);
+    let master_label = master.unwrap_or("boss");
+    let reviewers: Vec<&str> = agents
+        .iter()
+        .filter(|(l, _)| Some(*l) != master)
+        .map(|(l, _)| *l)
+        .collect();
+    env.register_team(master_label, &reviewers, &[]);
 }
 
+/// Register a single master agent carrying a launch profile —
+/// via the real cores (`declare_global_agent` with a launch
+/// `AgentDescription`, then a one-member team). `register_team`
+/// uses a default desc, so this case is built explicitly.
 fn register_agent_with_launch(
-    repo: &Path,
+    env: &TestEnv,
     label: &str,
     _role: clank_core::vocab::Role,
     launch: clank_core::agent_config::LaunchConfig,
 ) {
-    // The launched agent is the team master so the registered set
-    // resolves; its inline entry carries the launch profile.
-    let cfg = serde_json::json!({
-        "team": [{
-            "label": label,
-            "tool": "claude",
-            "review": "commit",
-            "launch": launch,
-        }],
-        "promoted": label,
-    });
-    write_repo_config_json(repo, &cfg);
-}
-
-fn write_repo_config_json(repo: &Path, cfg: &serde_json::Value) {
-    std::fs::create_dir_all(repo.join(".clank")).unwrap();
-    std::fs::write(
-        repo.join(".clank/config.json"),
-        serde_json::to_string_pretty(cfg).unwrap(),
+    use clank::cli::teams_config::AgentDescription;
+    use clank_core::ids::AgentLabel;
+    use clank_core::vocab::Tool;
+    let lbl = AgentLabel::parse(label).unwrap();
+    clank::cli::agent::declare_global_agent(
+        env.home(),
+        &lbl,
+        AgentDescription {
+            tool: Tool::Claude,
+            launch: Some(launch),
+            initial_prompt: None,
+        },
     )
     .unwrap();
+    clank::cli::team::create_team(env.home(), "default").unwrap();
+    clank::cli::team::set_master(env.home(), "default", label).unwrap();
+    clank::cli::init::register_repo_team(env.home(), env.repo(), "default").unwrap();
 }
 
-fn run_doctor(repo: &Path) -> std::process::Output {
-    Command::new(clank_bin())
-        .arg("doctor")
-        .arg("--repo")
-        .arg(repo)
-        .arg("--json")
-        .env_remove("CLAUDE_CODE_SESSION_ID")
-        .env_remove("CODEX_THREAD_ID")
-        .output()
-        .expect("spawn clank doctor")
+/// Run doctor's repo-scope checks IN-PROCESS
+/// (`dogfood-init-setup-in-tests` Phase B) and return the same
+/// JSON array `clank doctor --json` emits — no binary spawn. The
+/// agent checks these tests navigate live in the repo section.
+fn run_doctor(env: &TestEnv) -> serde_json::Value {
+    let results = clank::cli::doctor::repo_checks(env.repo(), Some(env.home()));
+    clank::cli::doctor::checks_to_json(&results)
 }
 
 #[test]
 fn doctor_warns_on_unbound_reviewer() {
-    let dir = init_repo();
-    let repo = dir.path();
+    let env = init_repo();
+    let repo = env.repo();
     write(repo, ".clank/.gitignore", ".gitignore\n");
-    register_agents(repo, &[("ruthless", clank_core::vocab::Role::Reviewer)]);
+    register_agents(&env, &[("ruthless", clank_core::vocab::Role::Reviewer)]);
     write_skeleton(
         repo,
         "ruthless",
         &skeleton(clank_core::vocab::AutoMode::Off, None),
     );
 
-    let out = run_doctor(repo);
-    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
-    let parsed: serde_json::Value =
-        serde_json::from_str(&stdout).expect("doctor --json should be valid JSON");
+    let parsed = run_doctor(&env);
     let checks = parsed.as_array().expect("doctor --json should be array");
     let ruthless_check = checks
         .iter()
@@ -171,10 +145,10 @@ fn doctor_warns_on_unbound_reviewer() {
 
 #[test]
 fn doctor_does_not_warn_on_bound_reviewer() {
-    let dir = init_repo();
-    let repo = dir.path();
+    let env = init_repo();
+    let repo = env.repo();
     write(repo, ".clank/.gitignore", ".gitignore\n");
-    register_agents(repo, &[("codex", clank_core::vocab::Role::Reviewer)]);
+    register_agents(&env, &[("codex", clank_core::vocab::Role::Reviewer)]);
     write_skeleton(
         repo,
         "codex",
@@ -187,9 +161,7 @@ fn doctor_does_not_warn_on_bound_reviewer() {
         ),
     );
 
-    let out = run_doctor(repo);
-    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
-    let parsed: serde_json::Value = serde_json::from_str(&stdout).expect("doctor JSON parse");
+    let parsed = run_doctor(&env);
     let checks = parsed.as_array().expect("array");
     let codex_check = checks
         .iter()
@@ -203,19 +175,17 @@ fn doctor_does_not_warn_on_bound_reviewer() {
 
 #[test]
 fn doctor_warns_on_unbound_master_symmetrically() {
-    let dir = init_repo();
-    let repo = dir.path();
+    let env = init_repo();
+    let repo = env.repo();
     write(repo, ".clank/.gitignore", ".gitignore\n");
-    register_agents(repo, &[("lloyd", clank_core::vocab::Role::Master)]);
+    register_agents(&env, &[("lloyd", clank_core::vocab::Role::Master)]);
     write_skeleton(
         repo,
         "lloyd",
         &skeleton(clank_core::vocab::AutoMode::Off, None),
     );
 
-    let out = run_doctor(repo);
-    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
-    let parsed: serde_json::Value = serde_json::from_str(&stdout).expect("doctor JSON parse");
+    let parsed = run_doctor(&env);
     let checks = parsed.as_array().expect("array");
     let lloyd_check = checks
         .iter()
@@ -237,13 +207,13 @@ fn doctor_warns_when_launch_command_missing_from_path() {
     // Phase C of agent-config-and-start: doctor surfaces a Warn
     // when an agent's launch.command isn't on $PATH. Catches
     // typos before the user tries `clank agent start <name>`.
-    let dir = init_repo();
-    let repo = dir.path();
+    let env = init_repo();
+    let repo = env.repo();
     write(repo, ".clank/.gitignore", ".gitignore\n");
     // Launch lives on the declaration per
     // agent-add-cli-and-repo-scope Phase 1.
     register_agent_with_launch(
-        repo,
+        &env,
         "codex",
         clank_core::vocab::Role::Reviewer,
         clank_core::agent_config::LaunchConfig {
@@ -264,9 +234,7 @@ fn doctor_warns_when_launch_command_missing_from_path() {
         ),
     );
 
-    let out = run_doctor(repo);
-    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
-    let parsed: serde_json::Value = serde_json::from_str(&stdout).expect("doctor JSON parse");
+    let parsed = run_doctor(&env);
     let checks = parsed.as_array().expect("array");
     let launch_warn = checks
         .iter()
@@ -290,15 +258,13 @@ fn doctor_warns_on_missing_skeleton() {
     // skeleton at .clank/agents/<X>/config.json. Doctor surfaces
     // a Warn naming the label + diagnostic mentioning
     // `clank init`.
-    let dir = init_repo();
-    let repo = dir.path();
+    let env = init_repo();
+    let repo = env.repo();
     write(repo, ".clank/.gitignore", ".gitignore\n");
-    register_agents(repo, &[("phantom", clank_core::vocab::Role::Reviewer)]);
+    register_agents(&env, &[("phantom", clank_core::vocab::Role::Reviewer)]);
     // No skeleton written.
 
-    let out = run_doctor(repo);
-    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
-    let parsed: serde_json::Value = serde_json::from_str(&stdout).expect("doctor JSON parse");
+    let parsed = run_doctor(&env);
     let checks = parsed.as_array().expect("array");
     let phantom_check = checks
         .iter()
@@ -329,12 +295,12 @@ fn doctor_warns_on_orphan_skeleton() {
     // declaration (neither repo-scope nor user-scope). Doctor
     // surfaces a Warn naming the label + diagnostic mentioning
     // `clank agent add` AND `rm -rf`.
-    let dir = init_repo();
-    let repo = dir.path();
+    let env = init_repo();
+    let repo = env.repo();
     write(repo, ".clank/.gitignore", ".gitignore\n");
     // Registered team is just a master (`boss`); the `orphan`
     // skeleton below is NOT in the registered set.
-    register_agents(repo, &[("boss", clank_core::vocab::Role::Master)]);
+    register_agents(&env, &[("boss", clank_core::vocab::Role::Master)]);
     // Orphan skeleton.
     write_skeleton(
         repo,
@@ -348,9 +314,7 @@ fn doctor_warns_on_orphan_skeleton() {
         ),
     );
 
-    let out = run_doctor(repo);
-    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
-    let parsed: serde_json::Value = serde_json::from_str(&stdout).expect("doctor JSON parse");
+    let parsed = run_doctor(&env);
     let checks = parsed.as_array().expect("array");
     let orphan_check = checks
         .iter()
@@ -382,19 +346,17 @@ fn doctor_warn_for_unbound_does_not_introduce_new_fail() {
     // still be 1 due to pre-existing baseline Fail checks like
     // "no session detected" when run outside an agent; that's
     // unchanged by this plan.)
-    let dir = init_repo();
-    let repo = dir.path();
+    let env = init_repo();
+    let repo = env.repo();
     write(repo, ".clank/.gitignore", ".gitignore\n");
-    register_agents(repo, &[("ruthless", clank_core::vocab::Role::Reviewer)]);
+    register_agents(&env, &[("ruthless", clank_core::vocab::Role::Reviewer)]);
     write_skeleton(
         repo,
         "ruthless",
         &skeleton(clank_core::vocab::AutoMode::Off, None),
     );
 
-    let out = run_doctor(repo);
-    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
-    let parsed: serde_json::Value = serde_json::from_str(&stdout).expect("doctor JSON parse");
+    let parsed = run_doctor(&env);
     let checks = parsed.as_array().expect("array");
     let ruthless_check = checks
         .iter()
@@ -404,4 +366,30 @@ fn doctor_warn_for_unbound_does_not_introduce_new_fail() {
         ruthless_check["status"], "warn",
         "unbound reviewer is Warn (not Fail); got {ruthless_check}"
     );
+}
+
+/// Through-the-binary smoke: the assertions above run doctor's
+/// repo_checks in-process, so this one spawn covers the full
+/// `clank doctor --json` shell glue (repo+user+session checks →
+/// serialize → stdout). Per the Phase-B shell-glue coverage pin.
+#[test]
+fn doctor_cli_smoke_emits_json_array() {
+    let env = init_repo();
+    write(env.repo(), ".clank/.gitignore", ".gitignore\n");
+    register_agents(&env, &[("ruthless", clank_core::vocab::Role::Reviewer)]);
+    let out = Command::new(clank_bin())
+        .arg("doctor")
+        .arg("--repo")
+        .arg(env.repo())
+        .arg("--json")
+        .env("HOME", env.home())
+        .env_remove("CLAUDE_CODE_SESSION_ID")
+        .env_remove("CODEX_THREAD_ID")
+        .output()
+        .expect("spawn clank doctor");
+    // doctor may exit non-zero on baseline Fail checks (e.g. no
+    // session); we only assert it emits a parseable JSON array.
+    let parsed: serde_json::Value = serde_json::from_slice(&out.stdout)
+        .expect("clank doctor --json must emit parseable JSON on stdout");
+    assert!(parsed.is_array(), "doctor --json is an array of checks");
 }
