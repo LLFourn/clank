@@ -201,8 +201,10 @@ fn clank_initialized_with_master_and_reviewer() {
     let home = tempfile::tempdir().unwrap();
     let dir = init_repo();
     let repo = dir.path();
-    // Master is team-derived now (`teams-based-agent-registration`).
-    common::write_team_config(repo, "claude", &["codex"], &[]);
+    // Master is team-derived; register it through the real cores
+    // (`dogfood-init-setup-in-tests`) into the same HOME run_open
+    // reads. `home` and `repo` are already separate dirs here.
+    common::register_team(home.path(), repo, "claude", &["codex"], &[]);
     write(
         repo,
         ".clank/agents/claude/config.json",
