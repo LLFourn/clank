@@ -18,7 +18,7 @@ use clank_core::repo_state::FinishedPlan;
 use clank_core::vocab::CommitGateState;
 use clank_core::wait::PlanWorkState;
 
-pub(crate) struct StatusSnapshot {
+pub struct StatusSnapshot {
     pub(crate) repo_path: PathBuf,
     pub(crate) basename: String,
     pub(crate) branch: Option<String>,
@@ -32,9 +32,14 @@ pub(crate) struct StatusSnapshot {
 }
 
 impl StatusSnapshot {
-    pub(crate) async fn build_async(
+    /// Build the status snapshot. `home` is explicit (not read
+    /// from `$HOME`) so in-process callers — tests + the `clank
+    /// status` shell — control which user-scope config layers in.
+    /// Plan: dogfood-init-setup-in-tests (Phase B).
+    pub async fn build_async(
         repo: &Path,
         basename: &str,
+        home: Option<&Path>,
         policy: crate::rebuild::CachePolicy,
         plan_arg: Option<&str>,
         watch_mode: bool,
@@ -42,12 +47,13 @@ impl StatusSnapshot {
         let state = crate::rebuild::rebuild_repo_with_policy(repo, policy)
             .await
             .map_err(|e| anyhow::anyhow!("failed to fold repo `{}`: {e}", repo.display()))?;
-        Self::from_state(repo, basename, &state, plan_arg, watch_mode)
+        Self::from_state(repo, basename, home, &state, plan_arg, watch_mode)
     }
 
     fn from_state(
         repo: &Path,
         basename: &str,
+        home: Option<&Path>,
         state: &RepoState,
         plan_arg: Option<&str>,
         watch_mode: bool,
@@ -55,7 +61,7 @@ impl StatusSnapshot {
         let (branch, head_sha, head_subject) = head_info(repo);
         let worktree_dirty = worktree_dirty(repo)?;
 
-        let config = crate::cli::config::load(repo);
+        let config = crate::cli::config::load_with_home(repo, home);
         // Plan: teams-based-agent-registration. `status` is a
         // read-only renderer (also reused by `clank html`), so it
         // DEGRADES on a team-less / misconfigured repo: no team →
@@ -63,7 +69,7 @@ impl StatusSnapshot {
         // (Approved). It never hard-errors the way the
         // workflow-driving commands (wfw / finish / promote) do.
         let (commit_reviewers, gate_reviewers) =
-            crate::agent_store::reviewer_tiers_for_render(repo);
+            crate::agent_store::reviewer_tiers_for_render_with(repo, home);
         let work_policy = clank_core::wait::WorkPolicy {
             plan_feedback: config.review.plan_feedback,
             adhoc_feedback: config.review.adhoc_feedback,
@@ -99,7 +105,7 @@ impl StatusSnapshot {
         })
     }
 
-    fn to_json(&self) -> serde_json::Value {
+    pub fn to_json(&self) -> serde_json::Value {
         let plans: Vec<serde_json::Value> = self
             .plans
             .iter()
@@ -163,7 +169,7 @@ impl StatusSnapshot {
         obj
     }
 
-    fn to_human(&self) -> String {
+    pub fn to_human(&self) -> String {
         let mut out = String::new();
         use std::fmt::Write as _;
 
@@ -271,12 +277,29 @@ pub async fn run(args: StatusArgs) -> anyhow::Result<()> {
         crate::rebuild::CachePolicy::Use
     };
 
+    let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+
     if args.watch {
-        return run_watch(repo, basename, policy, args.json, args.plan.as_deref()).await;
+        return run_watch(
+            repo,
+            basename,
+            home,
+            policy,
+            args.json,
+            args.plan.as_deref(),
+        )
+        .await;
     }
 
-    let snapshot =
-        StatusSnapshot::build_async(&repo, &basename, policy, args.plan.as_deref(), false).await?;
+    let snapshot = StatusSnapshot::build_async(
+        &repo,
+        &basename,
+        home.as_deref(),
+        policy,
+        args.plan.as_deref(),
+        false,
+    )
+    .await?;
 
     if args.json {
         println!("{}", serde_json::to_string_pretty(&snapshot.to_json())?);
@@ -290,6 +313,7 @@ pub async fn run(args: StatusArgs) -> anyhow::Result<()> {
 async fn run_watch(
     repo: std::path::PathBuf,
     basename: String,
+    home: Option<std::path::PathBuf>,
     policy: crate::rebuild::CachePolicy,
     json: bool,
     plan_arg: Option<&str>,
@@ -302,7 +326,8 @@ async fn run_watch(
 
     loop {
         let snapshot =
-            StatusSnapshot::build_async(&repo, &basename, policy, plan_arg, true).await?;
+            StatusSnapshot::build_async(&repo, &basename, home.as_deref(), policy, plan_arg, true)
+                .await?;
 
         let output = if json {
             snapshot.to_json_compact()

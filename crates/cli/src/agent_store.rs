@@ -86,7 +86,18 @@ pub fn resolve_role(repo: &Path, label: &AgentLabel) -> anyhow::Result<clank_cor
 /// resolved registered set. Errors if the repo has no `team`
 /// field set — there is no legacy fallback.
 pub fn load_reviewer_tiers(repo: &Path) -> anyhow::Result<(Vec<AgentLabel>, Vec<AgentLabel>)> {
-    match try_resolve_via_team(repo)? {
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    load_reviewer_tiers_with(repo, home.as_deref())
+}
+
+/// Home-explicit [`load_reviewer_tiers`] — for in-process callers
+/// (tests, query cores) that supply the home dir rather than
+/// reading `$HOME`. Plan: dogfood-init-setup-in-tests (Phase B).
+pub fn load_reviewer_tiers_with(
+    repo: &Path,
+    home: Option<&Path>,
+) -> anyhow::Result<(Vec<AgentLabel>, Vec<AgentLabel>)> {
+    match try_resolve_via_team_with(repo, home)? {
         Some(set) => {
             let commit = set.commit_reviewers.into_iter().map(|a| a.label).collect();
             let gate = set.gate_reviewers.into_iter().map(|a| a.label).collect();
@@ -105,7 +116,18 @@ pub fn load_reviewer_tiers(repo: &Path) -> anyhow::Result<(Vec<AgentLabel>, Vec<
 /// underlying misconfiguration. Plan:
 /// `teams-based-agent-registration`.
 pub fn reviewer_tiers_for_render(repo: &Path) -> (Vec<AgentLabel>, Vec<AgentLabel>) {
-    match try_resolve_via_team(repo) {
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    reviewer_tiers_for_render_with(repo, home.as_deref())
+}
+
+/// Home-explicit [`reviewer_tiers_for_render`] — for in-process
+/// render cores that supply the home dir. Same never-errors
+/// degrade semantics. Plan: dogfood-init-setup-in-tests (Phase B).
+pub fn reviewer_tiers_for_render_with(
+    repo: &Path,
+    home: Option<&Path>,
+) -> (Vec<AgentLabel>, Vec<AgentLabel>) {
+    match try_resolve_via_team_with(repo, home) {
         Ok(Some(set)) => (
             set.commit_reviewers.into_iter().map(|a| a.label).collect(),
             set.gate_reviewers.into_iter().map(|a| a.label).collect(),
@@ -174,9 +196,9 @@ pub fn try_resolve_via_team(
 ///
 /// Testable workhorse that the production [`try_resolve_via_team`]
 /// wraps with `$HOME`. Same semantics; explicit `home`
-/// parameter so tests can seed both repo and user configs
-/// without env mutation.
-fn try_resolve_via_team_with(
+/// parameter so tests and in-process query cores can seed both
+/// repo and user configs without env mutation.
+pub fn try_resolve_via_team_with(
     repo: &Path,
     home: Option<&Path>,
 ) -> anyhow::Result<Option<crate::cli::teams_config::RegisteredSet>> {

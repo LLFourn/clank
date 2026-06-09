@@ -100,9 +100,13 @@ async fn build_site(
     std::fs::create_dir_all(out_dir.join("commit"))?;
     std::fs::create_dir_all(out_dir.join("plan"))?;
 
+    // html reads $HOME for now; threading an explicit home through
+    // the html render core is a later Phase-B slice.
+    let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
     let status = StatusSnapshot::build_async(
         repo,
         basename,
+        home.as_deref(),
         crate::rebuild::CachePolicy::Use,
         None,
         false,

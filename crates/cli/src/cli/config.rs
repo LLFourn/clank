@@ -261,7 +261,10 @@ pub fn load(repo_root: &Path) -> Config {
     load_with_home(repo_root, home.as_deref())
 }
 
-fn load_with_home(repo_root: &Path, home: Option<&Path>) -> Config {
+/// Home-explicit [`load`] — for in-process callers (query cores,
+/// tests) that supply the home dir rather than reading `$HOME`.
+/// Plan: dogfood-init-setup-in-tests (Phase B).
+pub fn load_with_home(repo_root: &Path, home: Option<&Path>) -> Config {
     let mut cfg = Config::default();
     let _ = apply_layer(
         &mut cfg,
