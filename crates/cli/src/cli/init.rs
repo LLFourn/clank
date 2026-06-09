@@ -47,7 +47,7 @@ pub async fn run(args: InitArgs) -> anyhow::Result<()> {
         let home_ref = home
             .as_deref()
             .ok_or_else(|| anyhow::anyhow!("$HOME not set; --team requires a user-scope config"))?;
-        write_repo_team_field(home_ref, &repo, team_name)?;
+        register_repo_team(home_ref, &repo, team_name)?;
     }
     Ok(())
 }
@@ -297,20 +297,20 @@ fn matched_by_clank_gitignore(record: &str) -> bool {
         && p.parent().is_some_and(|parent| parent.ends_with(".clank"))
 }
 
-/// Plan: teams-based-agent-registration (phase 6a).
-///
-/// Write the `team: "<name>"` field to
-/// `<repo>/.clank/config.json` using the new typed schema.
+/// Select a team for a repo: write `team: "<name>"` to
+/// `<repo>/.clank/config.json`. `pub`, env-free core (takes
+/// `home` + `repo` explicitly) — both `clank init --team` and
+/// integration-test setup call it. Plan:
+/// dogfood-init-setup-in-tests (Phase A).
 ///
 /// Validations:
 /// - The named team must exist in user-scope
 ///   `~/.clank/config.json#/teams`. Reading nothing → error
 ///   (the user needs to `clank team create <name>` first).
-/// - Existing repo config (legacy or new shape) round-trips
-///   through the new schema's `extra` flatten catchall, so
-///   unknown fields (review/hooks/diff sections, etc.) are
-///   preserved.
-fn write_repo_team_field(home: &Path, repo: &Path, team_name: &str) -> anyhow::Result<()> {
+/// - Existing repo config round-trips through the new schema's
+///   `extra` flatten catchall, so unknown fields
+///   (review/hooks/diff sections, etc.) are preserved.
+pub fn register_repo_team(home: &Path, repo: &Path, team_name: &str) -> anyhow::Result<()> {
     use crate::cli::teams_config::{RepoConfigFile, TeamField, UserConfigFile};
     use anyhow::Context;
     use std::io::Write;
@@ -613,7 +613,7 @@ mod tests {
         let user_home = tempfile::tempdir().unwrap();
         write_user_teams(user_home.path(), &["dev"]);
         let repo = init_repo();
-        write_repo_team_field(user_home.path(), repo.path(), "dev").unwrap();
+        register_repo_team(user_home.path(), repo.path(), "dev").unwrap();
         let body = std::fs::read_to_string(repo.path().join(".clank/config.json")).unwrap();
         let parsed: RepoConfigFile = serde_json::from_str(&body).unwrap();
         match parsed.team {
@@ -627,7 +627,7 @@ mod tests {
         let user_home = tempfile::tempdir().unwrap();
         write_user_teams(user_home.path(), &["dev"]);
         let repo = init_repo();
-        let err = write_repo_team_field(user_home.path(), repo.path(), "nonexistent").unwrap_err();
+        let err = register_repo_team(user_home.path(), repo.path(), "nonexistent").unwrap_err();
         let msg = format!("{err:#}");
         assert!(msg.contains("not declared"));
         assert!(msg.contains("clank team create"));

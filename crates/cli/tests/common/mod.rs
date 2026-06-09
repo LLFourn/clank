@@ -11,6 +11,56 @@ use std::path::Path;
 
 use serde_json::{Value, json};
 
+/// Register a team THE REAL WAY — through the same library cores
+/// the CLI handlers call, so the test setup and production share
+/// one code path (the dogfood payoff of
+/// `dogfood-init-setup-in-tests`). Unlike [`write_team_config`]
+/// (repo-only raw JSON), this writes BOTH scopes, so `home` MUST
+/// be a separate dir from `repo` (a test that sets `HOME=repo`
+/// can't use this — user-scope and repo-scope would collide on
+/// the same `.clank/config.json`).
+///
+/// Sequence mirrors what a user would run:
+/// `clank agent add --global` (declare each agent) →
+/// `clank team create/set-master/add` → `clank init --team`.
+pub fn register_team(
+    home: &Path,
+    repo: &Path,
+    master: &str,
+    commit_reviewers: &[&str],
+    gate_reviewers: &[&str],
+) {
+    use clank::cli::teams_config::{AgentDescription, ReviewKind};
+    use clank_core::ids::AgentLabel;
+    use clank_core::vocab::Tool;
+
+    let desc = || AgentDescription {
+        tool: Tool::Claude,
+        launch: None,
+        initial_prompt: None,
+    };
+    let lbl = |s: &str| AgentLabel::parse(s).unwrap();
+
+    // Declare every agent in user-scope `agents`.
+    for a in std::iter::once(master)
+        .chain(commit_reviewers.iter().copied())
+        .chain(gate_reviewers.iter().copied())
+    {
+        clank::cli::agent::declare_global_agent(home, &lbl(a), desc()).unwrap();
+    }
+    // Build the `default` team via the team cores.
+    clank::cli::team::create_team(home, "default").unwrap();
+    clank::cli::team::set_master(home, "default", master).unwrap();
+    for r in commit_reviewers {
+        clank::cli::team::add_member(home, "default", r, ReviewKind::Commit).unwrap();
+    }
+    for r in gate_reviewers {
+        clank::cli::team::add_member(home, "default", r, ReviewKind::Gate).unwrap();
+    }
+    // Point the repo at the team.
+    clank::cli::init::register_repo_team(home, repo, "default").unwrap();
+}
+
 /// Write `<repo>/.clank/config.json` with a team composed of
 /// inline local entries + a `promoted` master. The master is
 /// added as an inline commit entry and then promoted (the
