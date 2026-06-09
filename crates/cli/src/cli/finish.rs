@@ -91,12 +91,15 @@ pub async fn run(args: FinishArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Dry-run preview for `finish --purge`/`--squash`. The finalize
-/// commit hasn't been created yet, so we emit a description of
-/// the planned action without calling `finalize()` or running the
-/// rewrite engine. Pipe-to-git isn't possible here because the
-/// finalize commit doesn't exist — operator must run the live
-/// command to materialize it before any rebase.
+/// Dry-run preview for `finish --purge`/`--squash`. Emits a
+/// description of the planned action without calling `finalize()`
+/// or running the rewrite engine. Covers all three finalize
+/// states: not-yet-finalized (the run would create the finalize),
+/// already-finished + `--amend` (would re-commit it), and
+/// already-finished without `--amend` (finalize left as-is; only
+/// the range is rewritten). Not pipeable to `git` — for the
+/// not-yet-finalized case the finalize commit doesn't exist yet,
+/// so the operator must run the live command first.
 fn dry_run_finish_composite(
     stem: &str,
     preview: &FinishPreviewResponse,
