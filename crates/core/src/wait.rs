@@ -1310,6 +1310,80 @@ mod tests {
         ps
     }
 
+    fn make_plan_with_plan_doc_commit(commit_sha: CommitSha) -> PlanState {
+        use crate::repo_state::PlanTimelineEvent;
+        let mut ps = PlanState::default();
+        ps.commits.push(PlanTimelineEvent {
+            sha: commit_sha.clone(),
+            ts: 1,
+            touched_plan: true,
+            touched_code: false,
+        });
+        ps
+    }
+
+    fn master_gate_policy() -> WorkPolicy {
+        WorkPolicy {
+            plan_feedback: true,
+            adhoc_feedback: false,
+            commit_reviewers: vec![label("codex")],
+            gate_reviewers: vec![label("ruthless")],
+        }
+    }
+
+    #[test]
+    fn derive_status_routine_code_commit_does_not_wake_gate_reviewer() {
+        // THE REGRESSION GUARANTEE, end-to-end (compute_gate →
+        // derive_status → work_for), per the plan's edge-list and
+        // ruthless's mechanical-check 67: a routine code commit the
+        // commit tier APPROVED must NOT produce a work item for the
+        // gate reviewer. (compute_gate proving Approved isn't enough
+        // — work_for is a separate match-arm surface.)
+        let mut state = RepoState::default();
+        state
+            .plans
+            .insert(plan("foo"), make_plan_with_one_reviewable(sha("aaaa")));
+        let reviews = MockReviews(vec![(
+            sha("aaaa"),
+            vec![entry(crate::vocab::Verdict::Approve, "codex")],
+        )]);
+        let status = state.derive_status(&reviews, &master_gate_policy());
+
+        assert_eq!(
+            status.plans[0].gate,
+            CommitGateState::Approved,
+            "routine code commit must bypass the gate tier"
+        );
+        assert!(
+            status
+                .work_for(&label("ruthless"), Role::Reviewer)
+                .is_empty(),
+            "gate reviewer must NOT be woken on a routine code commit"
+        );
+    }
+
+    #[test]
+    fn derive_status_plan_doc_commit_wakes_gate_reviewer() {
+        // Contrast: a plan-doc commit the commit tier APPROVED IS a
+        // milestone → the gate reviewer DOES get a work item.
+        let mut state = RepoState::default();
+        state
+            .plans
+            .insert(plan("foo"), make_plan_with_plan_doc_commit(sha("bbbb")));
+        let reviews = MockReviews(vec![(
+            sha("bbbb"),
+            vec![entry(crate::vocab::Verdict::Approve, "codex")],
+        )]);
+        let status = state.derive_status(&reviews, &master_gate_policy());
+
+        assert_eq!(status.plans[0].gate, CommitGateState::ApprovedPendingGate);
+        assert_eq!(
+            status.work_for(&label("ruthless"), Role::Reviewer).len(),
+            1,
+            "gate reviewer must be woken on an approved plan-doc commit"
+        );
+    }
+
     #[test]
     fn derive_status_plan_with_pending_block_returns_blocked_gate() {
         // A plan with a reviewable commit + a pending block lands

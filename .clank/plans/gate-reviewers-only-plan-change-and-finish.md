@@ -42,6 +42,16 @@ an intermediate code commit" *unrepresentable*: the gate tier is
 consulted only at the two milestones, by construction — not
 fixed up after the fact.
 
+**Cadence trade (explicit, ruthless):** under this change the
+gate reviewer NO LONGER sees intermediate (between-milestone)
+commits. The commit tier is therefore SOLELY responsible for
+catching per-commit issues between a plan-doc change and the
+finish; the senior/gate reviewer's scope narrows to the design
+(plan) and the final state. This is the intended behavior — the
+whole point is to stop waking the gate reviewer on routine WIP —
+but it is a deliberate cadence shift, recorded here so it is a
+conscious choice rather than something a future reader infers.
+
 ## Where it lives
 
 - `crates/core/src/wait.rs` — `compute_gate(...)`. Currently
