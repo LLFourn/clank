@@ -62,6 +62,33 @@ fn run_clank(repo: &Path, args: &[&str]) -> std::process::Output {
         .expect("spawn clank")
 }
 
+/// Generate the HTML site IN-PROCESS via the real `html::generate`
+/// core (`dogfood-init-setup-in-tests` Phase B) — no `clank html`
+/// spawn. `home` is a fresh empty dir (html has no team; it
+/// degrades to a zero-reviewer render), matching the old
+/// run_clank's isolated HOME. Tests then read the generated files
+/// under `<repo>/.clank/html/` exactly as before.
+fn build_html(repo: &Path) {
+    build_html_inner(repo, false);
+}
+
+fn build_html_rebuild(repo: &Path) {
+    build_html_inner(repo, true);
+}
+
+fn build_html_inner(repo: &Path, rebuild: bool) {
+    let home = tempfile::tempdir().expect("isolated test HOME");
+    tokio::runtime::Runtime::new()
+        .unwrap()
+        .block_on(clank::cli::html::generate(
+            repo,
+            &repo.join(".clank/html"),
+            Some(home.path()),
+            rebuild,
+        ))
+        .expect("html::generate");
+}
+
 #[test]
 fn html_build_writes_index_and_one_commit_page() {
     let dir = init_repo();
@@ -70,12 +97,7 @@ fn html_build_writes_index_and_one_commit_page() {
     commit(repo, "[foo] intro");
     let sha = head_sha(repo);
 
-    let out = run_clank(repo, &["html"]);
-    assert!(
-        out.status.success(),
-        "clank html failed: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
+    build_html(repo);
 
     let index = repo.join(".clank/html/index.html");
     let commit_page = repo.join(format!(".clank/html/commit/{sha}.html"));
@@ -100,8 +122,7 @@ fn html_index_shows_status_header_and_timeline_rows() {
     commit(repo, "[foo] intro");
     let sha = head_sha(repo);
 
-    let out = run_clank(repo, &["html"]);
-    assert!(out.status.success());
+    build_html(repo);
 
     let body = std::fs::read_to_string(repo.join(".clank/html/index.html")).unwrap();
     assert!(
@@ -133,8 +154,7 @@ fn html_commit_page_for_plan_only_renders_markdown() {
     commit(repo, "[foo] intro");
     let sha = head_sha(repo);
 
-    let out = run_clank(repo, &["html"]);
-    assert!(out.status.success());
+    build_html(repo);
     let page =
         std::fs::read_to_string(repo.join(format!(".clank/html/commit/{sha}.html"))).unwrap();
     assert!(
@@ -158,8 +178,7 @@ fn html_commit_page_for_code_commit_renders_diff() {
     commit(repo, "[foo] impl");
     let impl_sha = head_sha(repo);
 
-    let out = run_clank(repo, &["html"]);
-    assert!(out.status.success());
+    build_html(repo);
     let page =
         std::fs::read_to_string(repo.join(format!(".clank/html/commit/{impl_sha}.html"))).unwrap();
     assert!(
@@ -197,8 +216,7 @@ fn html_commit_page_renders_feedback_with_verdict_marks() {
         "FINISHED ship it\n",
     );
 
-    let out = run_clank(repo, &["html"]);
-    assert!(out.status.success());
+    build_html(repo);
     let page =
         std::fs::read_to_string(repo.join(format!(".clank/html/commit/{sha}.html"))).unwrap();
     assert!(
@@ -229,8 +247,7 @@ fn html_escapes_user_content_in_feedback_bodies() {
         "APPROVE looks good\n\n<script>alert('xss')</script>\n",
     );
 
-    let out = run_clank(repo, &["html"]);
-    assert!(out.status.success());
+    build_html(repo);
     let page =
         std::fs::read_to_string(repo.join(format!(".clank/html/commit/{sha}.html"))).unwrap();
     // pulldown-cmark's safe-html (default) leaves raw HTML as
@@ -246,12 +263,7 @@ fn html_escapes_user_content_in_feedback_bodies() {
 #[test]
 fn html_index_for_repo_with_no_commits_succeeds() {
     let dir = init_repo();
-    let out = run_clank(dir.path(), &["html"]);
-    assert!(
-        out.status.success(),
-        "clank html on an empty repo should succeed: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
+    build_html(dir.path());
     let body = std::fs::read_to_string(dir.path().join(".clank/html/index.html")).unwrap();
     assert!(
         body.contains("Timeline"),
@@ -294,12 +306,7 @@ fn html_writes_meta_marker_with_head_sha() {
     commit(repo, "[foo] intro");
     let sha = head_sha(repo);
 
-    let out = run_clank(repo, &["html"]);
-    assert!(
-        out.status.success(),
-        "clank html failed: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
+    build_html(repo);
     let body = std::fs::read_to_string(repo.join(".clank/html/index.html")).unwrap();
     assert!(
         body.contains(&format!("name=\"clank:last-built-sha\" content=\"{sha}\"")),
@@ -318,8 +325,7 @@ fn html_timeline_uses_div_container_not_ol() {
     write(repo, ".clank/plans/foo.md", "# foo\n");
     commit(repo, "[foo] intro");
 
-    let out = run_clank(repo, &["html"]);
-    assert!(out.status.success());
+    build_html(repo);
     let body = std::fs::read_to_string(repo.join(".clank/html/index.html")).unwrap();
     assert!(
         body.contains("<div class=\"timeline\">"),
@@ -340,8 +346,7 @@ fn html_timeline_groups_same_plan_into_umbrella() {
     write(repo, "src/lib.rs", "// impl\n");
     commit(repo, "[foo] impl");
 
-    let out = run_clank(repo, &["html"]);
-    assert!(out.status.success());
+    build_html(repo);
     let body = std::fs::read_to_string(repo.join(".clank/html/index.html")).unwrap();
     let umbrella_count = body.matches("class=\"umbrella umbrella").count();
     assert_eq!(
@@ -362,8 +367,7 @@ fn html_timeline_breaks_umbrella_on_plan_change() {
     write(repo, ".clank/plans/bar.md", "# bar\n");
     commit(repo, "[bar] intro");
 
-    let out = run_clank(repo, &["html"]);
-    assert!(out.status.success());
+    build_html(repo);
     let body = std::fs::read_to_string(repo.join(".clank/html/index.html")).unwrap();
     assert!(body.contains("data-umbrella-key=\"foo\""));
     assert!(body.contains("data-umbrella-key=\"bar\""));
@@ -381,8 +385,7 @@ fn html_timeline_renders_parsed_subject_body() {
     commit(repo, "[foo] intro");
     let sha = head_sha(repo);
 
-    let out = run_clank(repo, &["html"]);
-    assert!(out.status.success());
+    build_html(repo);
     let body = std::fs::read_to_string(repo.join(".clank/html/index.html")).unwrap();
     // Subject body is "intro", not "[foo] intro".
     assert!(
@@ -409,8 +412,7 @@ fn html_timeline_renders_raw_when_no_prefix() {
     write(repo, "src/lib.rs", "// x\n");
     commit(repo, "[misc] random fix");
 
-    let out = run_clank(repo, &["html"]);
-    assert!(out.status.success());
+    build_html(repo);
     let body = std::fs::read_to_string(repo.join(".clank/html/index.html")).unwrap();
     // The misc commit has no plan prefix to strip in the
     // umbrella sense; body should be "random fix".
@@ -428,8 +430,7 @@ fn html_emits_inline_relative_time_script_and_data_iso_attrs() {
     write(repo, ".clank/plans/foo.md", "# foo\n");
     commit(repo, "[foo] intro");
 
-    let out = run_clank(repo, &["html"]);
-    assert!(out.status.success());
+    build_html(repo);
     let body = std::fs::read_to_string(repo.join(".clank/html/index.html")).unwrap();
     assert!(body.contains("<script>"), "inline script missing");
     assert!(
@@ -454,11 +455,7 @@ fn html_incremental_refreshes_prior_top_after_fat_slice_pushes_them_out() {
     let prior_top_sha = head_sha(repo);
 
     // First build with just the intro.
-    run_clank(repo, &["html"])
-        .status
-        .success()
-        .then_some(())
-        .expect("build 1");
+    build_html(repo);
     let prior_top_page = repo.join(format!(".clank/html/commit/{prior_top_sha}.html"));
     let initial = std::fs::read_to_string(&prior_top_page).unwrap();
     assert!(
@@ -478,11 +475,7 @@ fn html_incremental_refreshes_prior_top_after_fat_slice_pushes_them_out() {
     }
 
     std::thread::sleep(std::time::Duration::from_millis(1100));
-    run_clank(repo, &["html"])
-        .status
-        .success()
-        .then_some(())
-        .expect("build 2");
+    build_html(repo);
 
     let refreshed = std::fs::read_to_string(&prior_top_page).unwrap();
     assert!(
@@ -524,11 +517,7 @@ fn html_incremental_same_head_reuses_event_cache_and_preserves_old_pages() {
     let head_before = head_sha(repo);
 
     // First build.
-    run_clank(repo, &["html"])
-        .status
-        .success()
-        .then_some(())
-        .expect("build 1");
+    build_html(repo);
     let oldest_path = repo.join(format!(".clank/html/commit/{intro_sha}.html"));
     let old_meta = std::fs::metadata(&oldest_path).unwrap();
     let old_mtime = filetime::FileTime::from_last_modification_time(&old_meta);
@@ -542,11 +531,7 @@ fn html_incremental_same_head_reuses_event_cache_and_preserves_old_pages() {
     );
 
     // Rebuild. HEAD is unchanged.
-    run_clank(repo, &["html"])
-        .status
-        .success()
-        .then_some(())
-        .expect("build 2");
+    build_html(repo);
     let head_after = head_sha(repo);
     assert_eq!(head_before, head_after, "HEAD must not have moved");
 
@@ -599,11 +584,7 @@ fn html_incremental_skips_old_pages_outside_top_n() {
     };
 
     // First build.
-    run_clank(repo, &["html"])
-        .status
-        .success()
-        .then_some(())
-        .expect("build 1");
+    build_html(repo);
     let oldest_path = repo.join(format!(".clank/html/commit/{intro_sha}.html"));
     let old_meta = std::fs::metadata(&oldest_path).unwrap();
     let old_mtime = filetime::FileTime::from_last_modification_time(&old_meta);
@@ -613,11 +594,7 @@ fn html_incremental_skips_old_pages_outside_top_n() {
     write(repo, "src/extra.rs", "// y\n");
     commit(repo, "[foo] extra");
     let new_sha = head_sha(repo);
-    run_clank(repo, &["html"])
-        .status
-        .success()
-        .then_some(())
-        .expect("build 2");
+    build_html(repo);
 
     assert!(
         repo.join(format!(".clank/html/commit/{new_sha}.html"))
@@ -642,11 +619,7 @@ fn html_incremental_skips_unchanged_commit_pages() {
     let first_sha = head_sha(repo);
 
     // First build.
-    run_clank(repo, &["html"])
-        .status
-        .success()
-        .then_some(())
-        .expect("build 1");
+    build_html(repo);
     let first_path = repo.join(format!(".clank/html/commit/{first_sha}.html"));
     let first_meta = std::fs::metadata(&first_path).unwrap();
     let first_mtime = filetime::FileTime::from_last_modification_time(&first_meta);
@@ -656,11 +629,7 @@ fn html_incremental_skips_unchanged_commit_pages() {
     write(repo, "src/lib.rs", "// x\n");
     commit(repo, "[foo] impl");
     let second_sha = head_sha(repo);
-    run_clank(repo, &["html"])
-        .status
-        .success()
-        .then_some(())
-        .expect("build 2");
+    build_html(repo);
 
     // The new commit's page exists.
     assert!(
@@ -706,20 +675,12 @@ fn html_rebuild_flag_overwrites_pages_outside_top_n() {
             .to_string()
     };
 
-    run_clank(repo, &["html"])
-        .status
-        .success()
-        .then_some(())
-        .expect("build 1");
+    build_html(repo);
     let oldest = repo.join(format!(".clank/html/commit/{intro_sha}.html"));
     let stamp = filetime::FileTime::from_unix_time(1_000_000_000, 0);
     filetime::set_file_times(&oldest, stamp, stamp).unwrap();
 
-    run_clank(repo, &["html", "--rebuild"])
-        .status
-        .success()
-        .then_some(())
-        .expect("rebuild");
+    build_html_rebuild(repo);
 
     let meta = std::fs::metadata(&oldest).unwrap();
     let mtime = filetime::FileTime::from_last_modification_time(&meta);
@@ -738,21 +699,13 @@ fn html_rebuild_flag_overwrites_all_pages() {
     commit(repo, "[foo] intro");
     let sha = head_sha(repo);
 
-    run_clank(repo, &["html"])
-        .status
-        .success()
-        .then_some(())
-        .expect("build 1");
+    build_html(repo);
     let path = repo.join(format!(".clank/html/commit/{sha}.html"));
     // Stamp the file with an old mtime; --rebuild must touch it.
     let old = filetime::FileTime::from_unix_time(1_000_000_000, 0);
     filetime::set_file_times(&path, old, old).unwrap();
 
-    run_clank(repo, &["html", "--rebuild"])
-        .status
-        .success()
-        .then_some(())
-        .expect("rebuild");
+    build_html_rebuild(repo);
     let new_meta = std::fs::metadata(&path).unwrap();
     let new_mtime = filetime::FileTime::from_last_modification_time(&new_meta);
     assert_ne!(
@@ -769,11 +722,7 @@ fn html_incremental_refreshes_status_header_on_empty_slice() {
     write(repo, ".clank/plans/foo.md", "# foo\n");
     commit(repo, "[foo] intro");
     let sha = head_sha(repo);
-    run_clank(repo, &["html"])
-        .status
-        .success()
-        .then_some(())
-        .expect("build 1");
+    build_html(repo);
 
     let before = std::fs::read_to_string(repo.join(".clank/html/index.html")).unwrap();
     assert!(before.contains("gate-unreviewed") || before.contains("waiting"));
@@ -784,11 +733,7 @@ fn html_incremental_refreshes_status_header_on_empty_slice() {
         &format!(".clank/agents/alice/feedback/{sha}.md"),
         "FINISHED ship it\n",
     );
-    run_clank(repo, &["html"])
-        .status
-        .success()
-        .then_some(())
-        .expect("build 2");
+    build_html(repo);
 
     let after = std::fs::read_to_string(repo.join(".clank/html/index.html")).unwrap();
     assert!(
@@ -808,8 +753,7 @@ fn html_diff_has_line_numbers_and_syntax_classes() {
     commit(repo, "[foo] impl");
     let sha = head_sha(repo);
 
-    let out = run_clank(repo, &["html"]);
-    assert!(out.status.success());
+    build_html(repo);
     let page =
         std::fs::read_to_string(repo.join(format!(".clank/html/commit/{sha}.html"))).unwrap();
     // Line numbers: at least one new-side line number `1`.
@@ -843,8 +787,7 @@ fn html_diff_unknown_extension_still_renders() {
     commit(repo, "[foo] touch unknown");
     let sha = head_sha(repo);
 
-    let out = run_clank(repo, &["html"]);
-    assert!(out.status.success());
+    build_html(repo);
     let page =
         std::fs::read_to_string(repo.join(format!(".clank/html/commit/{sha}.html"))).unwrap();
     assert!(
@@ -867,8 +810,7 @@ fn html_diff_hunk_header_uses_full_width_band() {
     commit(repo, "[foo] x");
     let sha = head_sha(repo);
 
-    let out = run_clank(repo, &["html"]);
-    assert!(out.status.success());
+    build_html(repo);
     let page =
         std::fs::read_to_string(repo.join(format!(".clank/html/commit/{sha}.html"))).unwrap();
     // The `@@ ...` hunk header line gets the `hunk-hdr`
@@ -904,8 +846,7 @@ fn html_diff_classifies_plus_plus_and_minus_minus_content_as_add_del() {
     commit(repo, "[foo] mutate");
     let sha = head_sha(repo);
 
-    let out = run_clank(repo, &["html"]);
-    assert!(out.status.success());
+    build_html(repo);
     let page =
         std::fs::read_to_string(repo.join(format!(".clank/html/commit/{sha}.html"))).unwrap();
 
@@ -945,8 +886,7 @@ fn html_diff_rows_have_no_trailing_newline_in_markup() {
     write(repo, "src/lib.rs", "fn x() {}\n");
     commit(repo, "[foo] impl");
     let sha = head_sha(repo);
-    let out = run_clank(repo, &["html"]);
-    assert!(out.status.success());
+    build_html(repo);
     let page =
         std::fs::read_to_string(repo.join(format!(".clank/html/commit/{sha}.html"))).unwrap();
     assert!(
@@ -984,12 +924,7 @@ fn html_commit_page_renders_commit_body() {
     );
     let sha = head_sha(repo);
 
-    let out = run_clank(repo, &["html"]);
-    assert!(
-        out.status.success(),
-        "{}",
-        String::from_utf8_lossy(&out.stderr)
-    );
+    build_html(repo);
 
     let page =
         std::fs::read_to_string(repo.join(format!(".clank/html/commit/{sha}.html"))).unwrap();
@@ -1015,12 +950,7 @@ fn html_commit_page_omits_body_section_for_subject_only_commits() {
     commit(repo, "[foo] intro");
     let sha = head_sha(repo);
 
-    let out = run_clank(repo, &["html"]);
-    assert!(
-        out.status.success(),
-        "{}",
-        String::from_utf8_lossy(&out.stderr)
-    );
+    build_html(repo);
 
     let page =
         std::fs::read_to_string(repo.join(format!(".clank/html/commit/{sha}.html"))).unwrap();
@@ -1038,12 +968,7 @@ fn html_shas_are_copy_buttons() {
     commit(repo, "[foo] intro");
     let sha = head_sha(repo);
 
-    let out = run_clank(repo, &["html"]);
-    assert!(
-        out.status.success(),
-        "{}",
-        String::from_utf8_lossy(&out.stderr)
-    );
+    build_html(repo);
 
     let index = std::fs::read_to_string(repo.join(".clank/html/index.html")).unwrap();
     assert!(
@@ -1069,12 +994,7 @@ fn html_inline_script_handles_sha_copy() {
     write(repo, ".clank/plans/foo.md", "# foo\n");
     commit(repo, "[foo] intro");
 
-    let out = run_clank(repo, &["html"]);
-    assert!(
-        out.status.success(),
-        "{}",
-        String::from_utf8_lossy(&out.stderr)
-    );
+    build_html(repo);
 
     let index = std::fs::read_to_string(repo.join(".clank/html/index.html")).unwrap();
     assert!(
@@ -1092,12 +1012,7 @@ fn html_no_js_fallback_keeps_sha_text_visible() {
     let sha = head_sha(repo);
     let short = &sha[..7];
 
-    let out = run_clank(repo, &["html"]);
-    assert!(
-        out.status.success(),
-        "{}",
-        String::from_utf8_lossy(&out.stderr)
-    );
+    build_html(repo);
 
     let index = std::fs::read_to_string(repo.join(".clank/html/index.html")).unwrap();
     let needle = format!("title=\"{sha}\">{short}</button>");
@@ -1114,12 +1029,7 @@ fn html_timeline_row_does_not_nest_button_inside_anchor() {
     write(repo, ".clank/plans/foo.md", "# foo\n");
     commit(repo, "[foo] intro");
 
-    let out = run_clank(repo, &["html"]);
-    assert!(
-        out.status.success(),
-        "{}",
-        String::from_utf8_lossy(&out.stderr)
-    );
+    build_html(repo);
 
     let index = std::fs::read_to_string(repo.join(".clank/html/index.html")).unwrap();
     for row in index.split("<div class=\"row\"").skip(1) {
@@ -1144,12 +1054,7 @@ fn html_writes_plan_page_for_each_active_plan() {
     write(repo, ".clank/plans/bar.md", "# bar\n");
     commit(repo, "[bar] intro");
 
-    let out = run_clank(repo, &["html"]);
-    assert!(
-        out.status.success(),
-        "{}",
-        String::from_utf8_lossy(&out.stderr)
-    );
+    build_html(repo);
 
     assert!(repo.join(".clank/html/plan/foo.html").is_file());
     assert!(repo.join(".clank/html/plan/bar.html").is_file());
@@ -1180,12 +1085,7 @@ fn html_writes_plan_page_for_finished_plans() {
     .unwrap();
     commit(repo, "[foo] finish");
 
-    let out = run_clank(repo, &["html"]);
-    assert!(
-        out.status.success(),
-        "{}",
-        String::from_utf8_lossy(&out.stderr)
-    );
+    build_html(repo);
 
     let page = repo.join(".clank/html/plan/foo.html");
     assert!(
@@ -1210,8 +1110,7 @@ fn html_plan_page_contains_events_for_that_plan_only() {
     commit(repo, "[bar] intro");
     let bar_sha = head_sha(repo);
 
-    let out = run_clank(repo, &["html"]);
-    assert!(out.status.success());
+    build_html(repo);
 
     let foo_page = std::fs::read_to_string(repo.join(".clank/html/plan/foo.html")).unwrap();
     let bar_page = std::fs::read_to_string(repo.join(".clank/html/plan/bar.html")).unwrap();
@@ -1245,8 +1144,7 @@ fn html_plan_page_renders_markdown_body() {
     );
     commit(repo, "[foo] intro");
 
-    let out = run_clank(repo, &["html"]);
-    assert!(out.status.success());
+    build_html(repo);
 
     let page = std::fs::read_to_string(repo.join(".clank/html/plan/foo.html")).unwrap();
     assert!(
@@ -1263,8 +1161,7 @@ fn html_index_umbrella_links_to_plan_page() {
     write(repo, ".clank/plans/foo.md", "# foo\n");
     commit(repo, "[foo] intro");
 
-    let out = run_clank(repo, &["html"]);
-    assert!(out.status.success());
+    build_html(repo);
 
     let index = std::fs::read_to_string(repo.join(".clank/html/index.html")).unwrap();
     assert!(
@@ -1281,8 +1178,7 @@ fn html_commit_page_plan_line_links_to_plan_page() {
     commit(repo, "[foo] intro");
     let sha = head_sha(repo);
 
-    let out = run_clank(repo, &["html"]);
-    assert!(out.status.success());
+    build_html(repo);
 
     let page =
         std::fs::read_to_string(repo.join(format!(".clank/html/commit/{sha}.html"))).unwrap();
@@ -1300,12 +1196,7 @@ fn html_plan_page_timeline_row_links_resolve_to_top_level_commit_dir() {
     commit(repo, "[foo] intro");
     let sha = head_sha(repo);
 
-    let out = run_clank(repo, &["html"]);
-    assert!(
-        out.status.success(),
-        "{}",
-        String::from_utf8_lossy(&out.stderr)
-    );
+    build_html(repo);
 
     let page = std::fs::read_to_string(repo.join(".clank/html/plan/foo.html")).unwrap();
     let expected = format!("href=\"../commit/{sha}.html\"");
@@ -1333,12 +1224,7 @@ fn html_plan_page_refreshes_on_feedback_only_rebuild() {
     let sha = head_sha(repo);
     let short = &sha[..7];
 
-    let out = run_clank(repo, &["html"]);
-    assert!(
-        out.status.success(),
-        "{}",
-        String::from_utf8_lossy(&out.stderr)
-    );
+    build_html(repo);
     let foo_page = repo.join(".clank/html/plan/foo.html");
     let before = std::fs::read_to_string(&foo_page).unwrap();
     assert!(
@@ -1352,12 +1238,7 @@ fn html_plan_page_refreshes_on_feedback_only_rebuild() {
         "FINISHED ship it\n",
     );
 
-    let out = run_clank(repo, &["html"]);
-    assert!(
-        out.status.success(),
-        "{}",
-        String::from_utf8_lossy(&out.stderr)
-    );
+    build_html(repo);
     let after = std::fs::read_to_string(&foo_page).unwrap();
     assert!(
         after.contains("mark-finished"),
@@ -1392,12 +1273,7 @@ fn html_version_mismatch_rebuilds_every_commit_page() {
     commit(repo, "[foo] impl");
     let sha2 = head_sha(repo);
 
-    let out = run_clank(repo, &["html"]);
-    assert!(
-        out.status.success(),
-        "{}",
-        String::from_utf8_lossy(&out.stderr)
-    );
+    build_html(repo);
 
     // Append a sentinel to each commit page so we can detect
     // when the builder overwrites them.
@@ -1411,12 +1287,7 @@ fn html_version_mismatch_rebuilds_every_commit_page() {
 
     corrupt_builder_version(&repo.join(".clank/html/index.html"));
 
-    let out = run_clank(repo, &["html"]);
-    assert!(
-        out.status.success(),
-        "{}",
-        String::from_utf8_lossy(&out.stderr)
-    );
+    build_html(repo);
 
     for page in [&page1, &page2] {
         let body = std::fs::read_to_string(page).unwrap();
@@ -1436,12 +1307,7 @@ fn html_version_mismatch_rebuilds_every_plan_page() {
     write(repo, ".clank/plans/bar.md", "# bar\n");
     commit(repo, "[bar] intro");
 
-    let out = run_clank(repo, &["html"]);
-    assert!(
-        out.status.success(),
-        "{}",
-        String::from_utf8_lossy(&out.stderr)
-    );
+    build_html(repo);
 
     let foo_page = repo.join(".clank/html/plan/foo.html");
     let bar_page = repo.join(".clank/html/plan/bar.html");
@@ -1453,12 +1319,7 @@ fn html_version_mismatch_rebuilds_every_plan_page() {
 
     corrupt_builder_version(&repo.join(".clank/html/index.html"));
 
-    let out = run_clank(repo, &["html"]);
-    assert!(
-        out.status.success(),
-        "{}",
-        String::from_utf8_lossy(&out.stderr)
-    );
+    build_html(repo);
 
     for page in [&foo_page, &bar_page] {
         let body = std::fs::read_to_string(page).unwrap();
@@ -1488,12 +1349,7 @@ fn html_version_match_preserves_incremental_skip() {
         commit(repo, &format!("[foo] impl-{i}"));
     }
 
-    let out = run_clank(repo, &["html"]);
-    assert!(
-        out.status.success(),
-        "{}",
-        String::from_utf8_lossy(&out.stderr)
-    );
+    build_html(repo);
     let pinned_path = repo.join(format!(".clank/html/commit/{pinned}.html"));
     let mtime_before =
         filetime::FileTime::from_last_modification_time(&std::fs::metadata(&pinned_path).unwrap());
@@ -1502,12 +1358,7 @@ fn html_version_match_preserves_incremental_skip() {
     write(repo, "src/extra.rs", "// y\n");
     commit(repo, "[foo] impl-extra");
 
-    let out = run_clank(repo, &["html"]);
-    assert!(
-        out.status.success(),
-        "{}",
-        String::from_utf8_lossy(&out.stderr)
-    );
+    build_html(repo);
     let mtime_after =
         filetime::FileTime::from_last_modification_time(&std::fs::metadata(&pinned_path).unwrap());
 
