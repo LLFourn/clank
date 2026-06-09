@@ -24,18 +24,38 @@ fn git(repo: &Path, args: &[&str]) {
     assert!(status.success(), "git {args:?} failed");
 }
 
-fn init_repo() -> tempfile::TempDir {
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path();
+/// A test repo with its OWN HOME, distinct from the repo dir, so
+/// the team set up via the real cores (`common::register_team`)
+/// persists in user-scope across every `run()` invocation. The
+/// persistent home is what makes the dogfooded setup usable —
+/// a per-call fresh home wouldn't see the registered team.
+struct Env {
+    home: tempfile::TempDir,
+    repo: tempfile::TempDir,
+}
+
+impl Env {
+    fn repo(&self) -> &Path {
+        self.repo.path()
+    }
+}
+
+fn init_repo() -> Env {
+    let home = tempfile::tempdir().unwrap();
+    let repo = tempfile::tempdir().unwrap();
+    let path = repo.path();
     git(path, &["init", "--quiet", "--initial-branch=main"]);
     git(path, &["config", "user.email", "test@test"]);
     git(path, &["config", "user.name", "test"]);
     git(path, &["config", "commit.gpgsign", "false"]);
-    common::write_team_config(path, "claude", &["codex", "ruthless"], &[]);
+    // Dogfood: set up the team through the real library cores
+    // (declare agents → create team → set master → add members →
+    // point repo at it), not hand-rolled JSON.
+    common::register_team(home.path(), path, "claude", &["codex", "ruthless"], &[]);
     write(path, "README.md", "seed\n");
     git(path, &["add", "-A"]);
     git(path, &["commit", "--quiet", "-m", "seed"]);
-    dir
+    Env { home, repo }
 }
 
 fn write(repo: &Path, rel: &str, body: &str) {
@@ -46,13 +66,12 @@ fn write(repo: &Path, rel: &str, body: &str) {
     std::fs::write(abs, body).unwrap();
 }
 
-fn run(repo: &Path, args: &[&str]) -> std::process::Output {
-    let home = tempfile::tempdir().expect("isolated test HOME");
+fn run(env: &Env, args: &[&str]) -> std::process::Output {
     let mut cmd = Command::new(clank_bin());
     cmd.args(args)
         .arg("--repo")
-        .arg(repo)
-        .env("HOME", home.path())
+        .arg(env.repo())
+        .env("HOME", env.home.path())
         .env_remove("CLAUDE_CODE_SESSION_ID")
         .env_remove("CODEX_THREAD_ID")
         .env_remove("CLANK_AGENT");
@@ -79,14 +98,14 @@ fn revise_plan(repo: &Path, stem: &str, body: &str) {
 
 #[test]
 fn status_shows_blocked_gate_and_creator_for_plan_block() {
-    let dir = init_repo();
-    let repo = dir.path();
+    let env = init_repo();
+    let repo = env.repo();
     intro_plan(repo, "foo", "# foo\n");
     revise_plan(repo, "foo", "# foo v2\n");
 
     // Create a plan-scoped block via the CLI.
     let block_out = run(
-        repo,
+        &env,
         &[
             "block",
             "create",
@@ -105,7 +124,7 @@ fn status_shows_blocked_gate_and_creator_for_plan_block() {
         String::from_utf8_lossy(&block_out.stderr)
     );
 
-    let status_out = run(repo, &["status"]);
+    let status_out = run(&env, &["status"]);
     assert!(status_out.status.success());
     let stdout = String::from_utf8_lossy(&status_out.stdout);
     assert!(
@@ -133,18 +152,18 @@ fn status_shows_blocked_gate_and_creator_for_plan_block() {
 
 #[test]
 fn status_blocked_plan_json_emits_blocked_gate_state_and_structured_waiting_on() {
-    let dir = init_repo();
-    let repo = dir.path();
+    let env = init_repo();
+    let repo = env.repo();
     intro_plan(repo, "foo", "# foo\n");
     revise_plan(repo, "foo", "# foo v2\n");
     run(
-        repo,
+        &env,
         &[
             "block", "create", "--plan", "foo", "--author", "claude", "halt", "-m", "checking",
         ],
     );
 
-    let out = run(repo, &["status", "--json"]);
+    let out = run(&env, &["status", "--json"]);
     assert!(out.status.success());
     let stdout = String::from_utf8_lossy(&out.stdout);
     let parsed: serde_json::Value = serde_json::from_str(&stdout)
@@ -163,19 +182,19 @@ fn status_blocked_plan_json_emits_blocked_gate_state_and_structured_waiting_on()
 
 #[test]
 fn status_unblocked_plan_returns_to_review_gate() {
-    let dir = init_repo();
-    let repo = dir.path();
+    let env = init_repo();
+    let repo = env.repo();
     intro_plan(repo, "foo", "# foo\n");
     revise_plan(repo, "foo", "# foo v2\n");
     run(
-        repo,
+        &env,
         &[
             "block", "create", "--plan", "foo", "--author", "claude", "halt", "-m", "checking",
         ],
     );
     // Block must answer back via `clank unblock <agent> <name> --plan ... -m ...`.
     let unblock = run(
-        repo,
+        &env,
         &[
             "unblock", "claude", "halt", "--plan", "foo", "-m", "resolved",
         ],
@@ -186,7 +205,7 @@ fn status_unblocked_plan_returns_to_review_gate() {
         String::from_utf8_lossy(&unblock.stderr)
     );
 
-    let out = run(repo, &["status"]);
+    let out = run(&env, &["status"]);
     let stdout = String::from_utf8_lossy(&out.stdout);
     // After unblock, the per-plan gate line must NOT be the
     // blocked form. The footer may still say `UNBLOCKED ...`
@@ -209,21 +228,21 @@ fn status_unblocked_plan_returns_to_review_gate() {
 #[test]
 fn status_two_pending_blocks_on_same_plan_picks_first_lex() {
     // Phase 2 tie-breaker pin: lex-first by (creator, name).
-    let dir = init_repo();
-    let repo = dir.path();
+    let env = init_repo();
+    let repo = env.repo();
     intro_plan(repo, "foo", "# foo\n");
     revise_plan(repo, "foo", "# foo v2\n");
     // Two blocks on the same plan. Author them in non-lex order
     // so the test fails if `derive_status` accidentally took
     // file-system iteration order.
     run(
-        repo,
+        &env,
         &[
             "block", "create", "--plan", "foo", "--author", "claude", "zebra", "-m", "z first",
         ],
     );
     run(
-        repo,
+        &env,
         &[
             "block",
             "create",
@@ -237,7 +256,7 @@ fn status_two_pending_blocks_on_same_plan_picks_first_lex() {
         ],
     );
 
-    let out = run(repo, &["status"]);
+    let out = run(&env, &["status"]);
     let stdout = String::from_utf8_lossy(&out.stdout);
     // `alpha` sorts before `zebra` for the same creator.
     assert!(
