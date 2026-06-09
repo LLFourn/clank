@@ -252,17 +252,31 @@ fn drop_protected_branch_refusal_inherited() {
 
     // Use a separate command-builder so we can OMIT
     // --allow-rewrite-protected (run_purge always passes it).
+    // HOME must point at env.home() — the team lives there now —
+    // so the command reaches the protected-branch refusal rather
+    // than failing earlier on a missing user-scope team (codex
+    // 9b497a5).
     let out = Command::new(clank_bin())
         .arg("purge")
         .arg("--repo")
         .arg(repo)
+        .env("HOME", env.home())
         .arg("--yes")
         .args(["epsilon", "--drop"])
         .output()
         .expect("spawn clank purge");
     assert!(
         !out.status.success(),
-        "--drop on protected branch must refuse without --allow-rewrite-protected"
+        "--drop on protected branch must refuse without --allow-rewrite-protected; stderr=`{}`",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    // Assert the refusal is the PROTECTED-BRANCH one, not some
+    // earlier unrelated failure — otherwise the test passes for
+    // the wrong reason.
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("protected") || stderr.contains("--allow-rewrite-protected"),
+        "expected protected-branch refusal naming the override; got: {stderr}"
     );
     assert_eq!(head_sha(repo), head_before, "refusal must leave HEAD alone");
 }
