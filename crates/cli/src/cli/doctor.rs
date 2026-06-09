@@ -80,9 +80,10 @@ pub async fn run(args: DoctorArgs) -> anyhow::Result<()> {
     let mut results: Vec<CheckResult> = Vec::new();
 
     // Repo scope — skip if we're not in a clank-initialized repo.
+    let home = std::env::var_os("HOME").map(PathBuf::from);
     let repo = super::resolve_repo(args.repo.as_deref()).ok();
     if let Some(repo) = repo.as_deref() {
-        results.extend(repo_checks(repo));
+        results.extend(repo_checks(repo, home.as_deref()));
     } else {
         results.push(CheckResult::warn(
             "repo",
@@ -108,7 +109,11 @@ pub async fn run(args: DoctorArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn repo_checks(repo: &Path) -> Vec<CheckResult> {
+/// Repo-scope checks. `home` is explicit (not read from `$HOME`)
+/// so in-process callers (tests) control team resolution. `pub`
+/// for in-process assertion. Plan: dogfood-init-setup-in-tests
+/// (Phase B).
+pub fn repo_checks(repo: &Path, home: Option<&Path>) -> Vec<CheckResult> {
     let mut out: Vec<CheckResult> = Vec::new();
     const SECTION: &str = "repo";
 
@@ -144,7 +149,7 @@ fn repo_checks(repo: &Path) -> Vec<CheckResult> {
     // Per-agent checks: registration comes from the resolved team
     // set (`teams-based-agent-registration`). Join skeleton state,
     // and flag orphan skeletons (present on disk, not registered).
-    let registered = match crate::agent_store::try_resolve_via_team(repo) {
+    let registered = match crate::agent_store::try_resolve_via_team_with(repo, home) {
         Ok(Some(set)) => set,
         Ok(None) => {
             out.push(CheckResult::warn(
@@ -701,24 +706,32 @@ fn describe_identity_source(
     format!("resolved to `{}` (source unknown)", resolved.as_str())
 }
 
+/// Serialize checks to the `--json` wire array (one object per
+/// check). `pub` so in-process callers (tests) assert on the
+/// exact shape `clank doctor --json` emits without a spawn.
+/// Plan: dogfood-init-setup-in-tests (Phase B).
+pub fn checks_to_json(results: &[CheckResult]) -> serde_json::Value {
+    let payload: Vec<_> = results
+        .iter()
+        .map(|r| {
+            serde_json::json!({
+                "section": r.section,
+                "name": r.name,
+                "status": match r.status {
+                    CheckStatus::Ok => "ok",
+                    CheckStatus::Warn => "warn",
+                    CheckStatus::Fail => "fail",
+                },
+                "message": r.message,
+            })
+        })
+        .collect();
+    serde_json::Value::Array(payload)
+}
+
 fn render(results: &[CheckResult], json: bool) -> anyhow::Result<()> {
     if json {
-        let payload: Vec<_> = results
-            .iter()
-            .map(|r| {
-                serde_json::json!({
-                    "section": r.section,
-                    "name": r.name,
-                    "status": match r.status {
-                        CheckStatus::Ok => "ok",
-                        CheckStatus::Warn => "warn",
-                        CheckStatus::Fail => "fail",
-                    },
-                    "message": r.message,
-                })
-            })
-            .collect();
-        println!("{}", serde_json::to_string(&payload)?);
+        println!("{}", serde_json::to_string(&checks_to_json(results))?);
         return Ok(());
     }
 
@@ -757,7 +770,7 @@ mod tests {
     #[test]
     fn repo_checks_warn_on_missing_gitignore() {
         let dir = init_git_repo();
-        let results = repo_checks(dir.path());
+        let results = repo_checks(dir.path(), None);
         let gi = results
             .iter()
             .find(|r| r.name == ".clank/.gitignore")
@@ -769,7 +782,7 @@ mod tests {
     #[test]
     fn repo_checks_warn_on_missing_claude_perms() {
         let dir = init_git_repo();
-        let results = repo_checks(dir.path());
+        let results = repo_checks(dir.path(), None);
         let perm = results
             .iter()
             .find(|r| r.name == ".claude/settings.local.json")
