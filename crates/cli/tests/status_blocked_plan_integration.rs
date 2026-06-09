@@ -10,10 +10,6 @@ mod common;
 use std::path::Path;
 use std::process::Command;
 
-fn clank_bin() -> &'static str {
-    env!("CARGO_BIN_EXE_clank")
-}
-
 fn git(repo: &Path, args: &[&str]) {
     let status = Command::new("git")
         .arg("-C")
@@ -45,11 +41,10 @@ fn write(repo: &Path, rel: &str, body: &str) {
 }
 
 fn run(env: &common::TestEnv, args: &[&str]) -> std::process::Output {
-    let mut cmd = Command::new(clank_bin());
+    let mut cmd = env.clank();
     cmd.args(args)
         .arg("--repo")
         .arg(env.repo())
-        .env("HOME", env.home())
         .env_remove("CLAUDE_CODE_SESSION_ID")
         .env_remove("CODEX_THREAD_ID")
         .env_remove("CLANK_AGENT");

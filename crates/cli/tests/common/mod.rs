@@ -63,6 +63,19 @@ impl TestEnv {
             gate_reviewers,
         );
     }
+
+    /// A base `clank` command with `HOME` PRE-POINTED at this
+    /// env's separate home dir. Always start hand-built commands
+    /// from here so the team registered into `home()` is visible
+    /// and `HOME` can't be forgotten — the footgun codex caught
+    /// on 9b497a5, where a command that omitted `HOME` could fail
+    /// for the wrong reason. Callers add `--repo`, args, and any
+    /// `env_remove` scrubbing themselves (those vary per command).
+    pub fn clank(&self) -> Command {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_clank"));
+        cmd.env("HOME", self.home());
+        cmd
+    }
 }
 
 fn git(repo: &Path, args: &[&str]) {

@@ -7,10 +7,6 @@ mod common;
 use std::path::Path;
 use std::process::Command;
 
-fn clank_bin() -> &'static str {
-    env!("CARGO_BIN_EXE_clank")
-}
-
 fn git(repo: &Path, args: &[&str]) {
     let status = Command::new("git")
         .arg("-C")
@@ -77,11 +73,10 @@ fn seed_plan_only_commits(repo: &Path, stem: &str, n_revisions: usize) {
 }
 
 fn run_demote(env: &common::TestEnv, args: &[&str]) -> std::process::Output {
-    let mut cmd = Command::new(clank_bin());
+    let mut cmd = env.clank();
     cmd.arg("demote")
         .arg("--repo")
         .arg(env.repo())
-        .env("HOME", env.home())
         .arg("--yes")
         // Tests init repos on `main`, which is a protected branch
         // by default. Pass the override so the in-place path can
@@ -93,11 +88,10 @@ fn run_demote(env: &common::TestEnv, args: &[&str]) -> std::process::Output {
 }
 
 fn run_demote_protected(env: &common::TestEnv, args: &[&str]) -> std::process::Output {
-    let mut cmd = Command::new(clank_bin());
+    let mut cmd = env.clank();
     cmd.arg("demote")
         .arg("--repo")
         .arg(env.repo())
-        .env("HOME", env.home())
         .arg("--yes")
         // No --allow-rewrite-protected; exercise the refusal.
         .args(args);

@@ -12,10 +12,6 @@ mod common;
 use std::path::Path;
 use std::process::Command;
 
-fn clank_bin() -> &'static str {
-    env!("CARGO_BIN_EXE_clank")
-}
-
 fn git(repo: &Path, args: &[&str]) {
     let status = Command::new("git")
         .arg("-C")
@@ -55,11 +51,10 @@ fn write(repo: &Path, rel: &str, body: &str) {
 }
 
 fn run_purge(env: &common::TestEnv, args: &[&str]) -> std::process::Output {
-    let mut cmd = Command::new(clank_bin());
+    let mut cmd = env.clank();
     cmd.arg("purge")
         .arg("--repo")
         .arg(env.repo())
-        .env("HOME", env.home())
         .arg("--yes")
         .arg("--allow-rewrite-protected") // test repos init on main
         .args(args);
@@ -250,17 +245,17 @@ fn drop_protected_branch_refusal_inherited() {
     git(repo, &["commit", "--quiet", "-m", "[epsilon] intro"]);
     let head_before = head_sha(repo);
 
-    // Use a separate command-builder so we can OMIT
+    // Use `env.clank()` (HOME pre-set) but OMIT
     // --allow-rewrite-protected (run_purge always passes it).
-    // HOME must point at env.home() — the team lives there now —
-    // so the command reaches the protected-branch refusal rather
-    // than failing earlier on a missing user-scope team (codex
-    // 9b497a5).
-    let out = Command::new(clank_bin())
+    // Starting from env.clank() guarantees the team in env.home()
+    // is visible, so the command reaches the protected-branch
+    // refusal rather than failing earlier on a missing user-scope
+    // team (codex 9b497a5 footgun, now designed out).
+    let out = env
+        .clank()
         .arg("purge")
         .arg("--repo")
         .arg(repo)
-        .env("HOME", env.home())
         .arg("--yes")
         .args(["epsilon", "--drop"])
         .output()
