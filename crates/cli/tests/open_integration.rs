@@ -38,40 +38,21 @@ fn write(repo: &Path, rel: &str, body: &str) {
 }
 
 fn run_open(path: &Path, home: &Path) -> Value {
-    let out = Command::new(clank_bin())
-        .args(["open", "dry", "--json"])
-        .arg(path)
-        .env("HOME", home)
-        .env_remove("CLAUDE_CODE_SESSION_ID")
-        .env_remove("CODEX_THREAD_ID")
-        .env_remove("CLANK_AGENT")
-        .output()
-        .expect("spawn clank open dry");
-    assert!(
-        out.status.success(),
-        "clank open dry failed: {} {}",
-        String::from_utf8_lossy(&out.stdout),
-        String::from_utf8_lossy(&out.stderr),
-    );
-    serde_json::from_slice(&out.stdout).expect("valid JSON")
+    run_open_raw(path.to_str().expect("utf-8 path"), home)
 }
 
+/// Build the `open dry` inspection IN-PROCESS via the real
+/// `open::inspect` core (`dogfood-init-setup-in-tests` Phase B),
+/// then serialize to JSON so the existing `v["..."]` assertions
+/// (and the json wire-shape they cover) hold without a spawn.
+/// `home` is explicit so the team master / session-resume
+/// detection resolve against it.
 fn run_open_raw(arg: &str, home: &Path) -> Value {
-    let out = Command::new(clank_bin())
-        .args(["open", "dry", "--json", arg])
-        .env("HOME", home)
-        .env_remove("CLAUDE_CODE_SESSION_ID")
-        .env_remove("CODEX_THREAD_ID")
-        .env_remove("CLANK_AGENT")
-        .output()
-        .expect("spawn clank open");
-    assert!(
-        out.status.success(),
-        "clank open failed: {} {}",
-        String::from_utf8_lossy(&out.stdout),
-        String::from_utf8_lossy(&out.stderr),
-    );
-    serde_json::from_slice(&out.stdout).expect("valid JSON")
+    let response = tokio::runtime::Runtime::new()
+        .unwrap()
+        .block_on(clank::cli::open::inspect(arg, Some(home)))
+        .expect("open::inspect");
+    serde_json::to_value(&response).expect("serialize OpenResponse")
 }
 
 fn rec_kinds(v: &Value) -> Vec<String> {
@@ -785,4 +766,27 @@ fn lex_clean_for_missing_relative_path() {
         Path::new(v["opened_path"].as_str().unwrap()).is_absolute(),
         "opened_path should be absolute for missing relative input"
     );
+}
+
+/// Through-the-binary smoke: the assertions above run
+/// `open::inspect` in-process, so this one spawn covers the
+/// `clank open dry --json` shell glue (arg parse → inspect →
+/// serialize → stdout). Per the Phase-B shell-glue coverage pin.
+#[test]
+fn open_dry_cli_smoke_emits_json() {
+    let home = tempfile::tempdir().unwrap();
+    let dir = init_repo();
+    let out = Command::new(clank_bin())
+        .args(["open", "dry", "--json"])
+        .arg(dir.path())
+        .env("HOME", home.path())
+        .env_remove("CLAUDE_CODE_SESSION_ID")
+        .env_remove("CODEX_THREAD_ID")
+        .env_remove("CLANK_AGENT")
+        .output()
+        .expect("spawn clank open dry");
+    assert!(out.status.success(), "clank open dry should exit 0");
+    let v: Value = serde_json::from_slice(&out.stdout)
+        .expect("clank open dry --json must emit parseable JSON on stdout");
+    assert!(v.get("state").is_some(), "json has a state field");
 }

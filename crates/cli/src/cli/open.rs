@@ -18,7 +18,8 @@ pub async fn run(args: OpenArgs) -> anyhow::Result<()> {
 }
 
 pub async fn run_dry(args: OpenDryArgs) -> anyhow::Result<()> {
-    let response = inspect(&args.path).await?;
+    let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+    let response = inspect(&args.path, home.as_deref()).await?;
     if args.json {
         println!("{}", serde_json::to_string_pretty(&response)?);
     } else {
@@ -155,7 +156,12 @@ pub enum Recommendation {
     },
 }
 
-async fn inspect(requested: &str) -> anyhow::Result<OpenResponse> {
+/// Inspect a path for `clank open dry`. `home` is explicit (not
+/// read from `$HOME`) so in-process callers — tests + the `clank
+/// open` shell — control user-scope resolution (team master,
+/// session-resume detection). Plan: dogfood-init-setup-in-tests
+/// (Phase B).
+pub async fn inspect(requested: &str, home: Option<&Path>) -> anyhow::Result<OpenResponse> {
     let mut warnings = Vec::<String>::new();
 
     let exists = std::fs::exists(requested)
@@ -280,7 +286,7 @@ async fn inspect(requested: &str) -> anyhow::Result<OpenResponse> {
     // to look at; skip cleanly.
     let clank_dir_present = repo_root.join(".clank").is_dir();
     let (clank, mut agent_recs) = if clank_dir_present {
-        let (info, recs, fold_warning) = clank_info_for_repo(&repo_root).await;
+        let (info, recs, fold_warning) = clank_info_for_repo(&repo_root, home).await;
         if let Some(w) = fold_warning {
             warnings.push(w);
         }
@@ -565,20 +571,23 @@ fn directory_is_empty(path: &Path) -> bool {
     true
 }
 
-async fn clank_info_for_repo(repo_root: &Path) -> (ClankInfo, Vec<Recommendation>, Option<String>) {
+async fn clank_info_for_repo(
+    repo_root: &Path,
+    home: Option<&Path>,
+) -> (ClankInfo, Vec<Recommendation>, Option<String>) {
     let agent_configs =
         crate::agent_store::load_all_agent_configs_lossy(repo_root).unwrap_or_default();
 
     // Master is team-derived (`teams-based-agent-registration`).
     // Best-effort: a repo with no team configured has no master.
     let mut master_agents = Vec::<String>::new();
-    if let Ok(Some(set)) = crate::agent_store::try_resolve_via_team(repo_root) {
+    if let Ok(Some(set)) = crate::agent_store::try_resolve_via_team_with(repo_root, home) {
         master_agents.push(set.master.as_str().to_string());
     }
     let mut agents = Vec::<AgentInfo>::new();
     let mut recommendations = Vec::<Recommendation>::new();
     for (label, cfg) in &agent_configs {
-        let (tool_str, session_id_str, resumable) = agent_session_info(cfg);
+        let (tool_str, session_id_str, resumable) = agent_session_info(cfg, home);
         agents.push(AgentInfo {
             label: label.as_str().to_string(),
             tool: tool_str.clone(),
@@ -607,7 +616,7 @@ async fn clank_info_for_repo(repo_root: &Path) -> (ClankInfo, Vec<Recommendation
         }
     }
 
-    let (active_plans, waiting_on, fold_warning) = fold_summary(repo_root).await;
+    let (active_plans, waiting_on, fold_warning) = fold_summary(repo_root, home).await;
 
     (
         ClankInfo {
@@ -621,7 +630,10 @@ async fn clank_info_for_repo(repo_root: &Path) -> (ClankInfo, Vec<Recommendation
     )
 }
 
-fn agent_session_info(cfg: &AgentConfig) -> (Option<String>, Option<String>, bool) {
+fn agent_session_info(
+    cfg: &AgentConfig,
+    home: Option<&Path>,
+) -> (Option<String>, Option<String>, bool) {
     let Some(session) = cfg.session.as_ref() else {
         return (None, None, false);
     };
@@ -631,18 +643,17 @@ fn agent_session_info(cfg: &AgentConfig) -> (Option<String>, Option<String>, boo
     }
     .to_string();
     let session_id = session.id.as_str().to_string();
-    let resumable = session_jsonl_exists(&session.tool, &session_id);
+    let resumable = session_jsonl_exists(&session.tool, &session_id, home);
     (Some(tool_str), Some(session_id), resumable)
 }
 
-fn session_jsonl_exists(tool: &Tool, session_id: &str) -> bool {
-    let Some(home) = std::env::var_os("HOME") else {
+fn session_jsonl_exists(tool: &Tool, session_id: &str, home: Option<&Path>) -> bool {
+    let Some(home) = home else {
         return false;
     };
-    let home = PathBuf::from(home);
     match tool {
-        Tool::Claude => claude_session_jsonl_exists(&home, session_id),
-        Tool::Codex => codex_session_jsonl_exists(&home, session_id),
+        Tool::Claude => claude_session_jsonl_exists(home, session_id),
+        Tool::Codex => codex_session_jsonl_exists(home, session_id),
     }
 }
 
@@ -688,7 +699,10 @@ fn walk_for_session(dir: &Path, session_id: &str, depth: usize) -> bool {
     false
 }
 
-async fn fold_summary(repo_root: &Path) -> (usize, Option<String>, Option<String>) {
+async fn fold_summary(
+    repo_root: &Path,
+    home: Option<&Path>,
+) -> (usize, Option<String>, Option<String>) {
     let state =
         match crate::rebuild::rebuild_repo_with_policy(repo_root, crate::rebuild::CachePolicy::Use)
             .await
@@ -696,12 +710,12 @@ async fn fold_summary(repo_root: &Path) -> (usize, Option<String>, Option<String
             Ok(s) => s,
             Err(e) => return (0, None, Some(format!("fold failed: {e}"))),
         };
-    let config = crate::cli::config::load(repo_root);
+    let config = crate::cli::config::load_with_home(repo_root, home);
     // Reviewer tiers from the team resolver
     // (`teams-based-agent-registration`); the no-team error is
     // caught below into a display message rather than crashing.
     let (commit_reviewers, gate_reviewers) =
-        match crate::agent_store::load_reviewer_tiers(repo_root) {
+        match crate::agent_store::load_reviewer_tiers_with(repo_root, home) {
             Ok(t) => t,
             Err(e) => {
                 return (
