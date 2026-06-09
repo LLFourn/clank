@@ -15,21 +15,21 @@ use anyhow::Context;
 use clank_core::ids::AgentLabel;
 
 use crate::cli::teams_config::{AgentDescription, ReviewKind, TeamComposition, UserConfigFile};
-use crate::cli::{
-    TeamAddArgs, TeamArgs, TeamCmd, TeamCreateArgs, TeamDeleteArgs, TeamListArgs, TeamRemoveArgs,
-    TeamSetMasterArgs, TeamShowArgs,
-};
+use crate::cli::{TeamArgs, TeamCmd, TeamListArgs, TeamShowArgs};
 
 pub async fn run(args: TeamArgs) -> anyhow::Result<()> {
     let home = home_dir()?;
+    // `run` is the thin imperative shell: resolve `$HOME`, unpack
+    // clap args, call the env-free/args-free `pub` cores below.
+    // Plan: dogfood-init-setup-in-tests (Phase A).
     match args.command {
         TeamCmd::List(a) => list(&home, a),
         TeamCmd::Show(a) => show(&home, a),
-        TeamCmd::Create(a) => create(&home, a),
-        TeamCmd::Delete(a) => delete(&home, a),
-        TeamCmd::Add(a) => add(&home, a),
-        TeamCmd::Remove(a) => remove(&home, a),
-        TeamCmd::SetMaster(a) => set_master(&home, a),
+        TeamCmd::Create(a) => create_team(&home, &a.team),
+        TeamCmd::Delete(a) => delete_team(&home, &a.team, a.force),
+        TeamCmd::Add(a) => add_member(&home, &a.team, &a.agent, a.review.into()),
+        TeamCmd::Remove(a) => remove_member(&home, &a.team, &a.agent),
+        TeamCmd::SetMaster(a) => set_master(&home, &a.team, &a.agent),
     }
 }
 
@@ -43,7 +43,10 @@ fn user_config_path(home: &Path) -> PathBuf {
     home.join(".clank/config.json")
 }
 
-fn read_user_config(home: &Path) -> anyhow::Result<UserConfigFile> {
+/// Read user-scope `~/.clank/config.json` as the typed
+/// [`UserConfigFile`]. `pub` so integration tests can assert
+/// team state after calling the cores.
+pub fn read_user_config(home: &Path) -> anyhow::Result<UserConfigFile> {
     let path = user_config_path(home);
     match std::fs::read_to_string(&path) {
         Ok(s) => serde_json::from_str(&s).with_context(|| format!("parsing {}", path.display())),
@@ -169,83 +172,87 @@ fn show(home: &Path, args: TeamShowArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn create(home: &Path, args: TeamCreateArgs) -> anyhow::Result<()> {
+// ── mutation cores ───────────────────────────────────────────
+//
+// `pub`, env-free (take an explicit `home: &Path`), args-free
+// (take primitives, not clap `Args`). Both `run()` above and the
+// integration-test setup call these, so the test model and the
+// production model are THE SAME CODE. Plan:
+// dogfood-init-setup-in-tests (Phase A). These still do file IO
+// (read/write `~/.clank/config.json`) — "core" means no env/clap,
+// not pure.
+
+/// Create an empty user-scope team. Errors if it already exists.
+pub fn create_team(home: &Path, team: &str) -> anyhow::Result<()> {
     let mut cfg = read_user_config(home)?;
-    if cfg.teams.contains_key(&args.team) {
-        anyhow::bail!("team `{}` already exists in user-scope `teams`", args.team);
+    if cfg.teams.contains_key(team) {
+        anyhow::bail!("team `{team}` already exists in user-scope `teams`");
     }
     cfg.teams
-        .insert(args.team.clone(), TeamComposition::default());
+        .insert(team.to_string(), TeamComposition::default());
     write_user_config(home, &cfg)?;
     eprintln!(
-        "created empty team `{}` in user-scope (use `clank team set-master {} <agent>` to designate the master)",
-        args.team, args.team
+        "created empty team `{team}` in user-scope (use `clank team set-master {team} <agent>` to designate the master)"
     );
     Ok(())
 }
 
-fn delete(home: &Path, args: TeamDeleteArgs) -> anyhow::Result<()> {
+/// Delete a user-scope team. Requires `force` (clank can't see
+/// which repos reference it).
+pub fn delete_team(home: &Path, team: &str, force: bool) -> anyhow::Result<()> {
     let mut cfg = read_user_config(home)?;
-    if !cfg.teams.contains_key(&args.team) {
-        anyhow::bail!("team `{}` not in user-scope `teams`", args.team);
+    if !cfg.teams.contains_key(team) {
+        anyhow::bail!("team `{team}` not in user-scope `teams`");
     }
-    if !args.force {
+    if !force {
         anyhow::bail!(
-            "team `{}` may be referenced by a repo's `.clank/config.json#/team` field. \
+            "team `{team}` may be referenced by a repo's `.clank/config.json#/team` field. \
              Pass `--force` to delete anyway. Repos still pointing at the deleted team will \
-             fail with `UnknownTeam` at registration time.",
-            args.team
+             fail with `UnknownTeam` at registration time."
         );
     }
-    cfg.teams.remove(&args.team);
+    cfg.teams.remove(team);
     write_user_config(home, &cfg)?;
-    eprintln!("deleted team `{}` from user-scope", args.team);
+    eprintln!("deleted team `{team}` from user-scope");
     Ok(())
 }
 
-fn add(home: &Path, args: TeamAddArgs) -> anyhow::Result<()> {
+/// Add an agent to a team's reviewer tier. The agent must be
+/// declared in user-scope `agents`; one tier per team.
+pub fn add_member(home: &Path, team: &str, agent: &str, review: ReviewKind) -> anyhow::Result<()> {
     let mut cfg = read_user_config(home)?;
-    let label = parse_label(&args.agent)?;
+    let label = parse_label(agent)?;
 
     if !cfg.agents.contains_key(&label) {
         anyhow::bail!(
-            "agent `{}` is not declared in user-scope `agents`. Add it via `clank agent add --global {} --tool <claude|codex>` first.",
-            args.agent,
-            args.agent
+            "agent `{agent}` is not declared in user-scope `agents`. Add it via `clank agent add --global {agent} --tool <claude|codex>` first."
         );
     }
 
-    let team = cfg
+    let team_comp = cfg
         .teams
-        .get_mut(&args.team)
-        .ok_or_else(|| anyhow::anyhow!("team `{}` not in user-scope `teams`", args.team))?;
+        .get_mut(team)
+        .ok_or_else(|| anyhow::anyhow!("team `{team}` not in user-scope `teams`"))?;
 
-    if team.master.as_ref() == Some(&label) {
+    if team_comp.master.as_ref() == Some(&label) {
         anyhow::bail!(
-            "agent `{}` is already the master of team `{}`. Use `clank team set-master` to change the master, or remove this agent from the master slot first.",
-            args.agent,
-            args.team
+            "agent `{agent}` is already the master of team `{team}`. Use `clank team set-master` to change the master, or remove this agent from the master slot first."
         );
     }
-    if team.commit_reviewers.contains(&label) || team.gate_reviewers.contains(&label) {
+    if team_comp.commit_reviewers.contains(&label) || team_comp.gate_reviewers.contains(&label) {
         anyhow::bail!(
-            "agent `{}` is already in team `{}` (one tier per team). Use `clank team remove` then `clank team add` to move them between tiers.",
-            args.agent,
-            args.team
+            "agent `{agent}` is already in team `{team}` (one tier per team). Use `clank team remove` then `clank team add` to move them between tiers."
         );
     }
 
-    let kind: ReviewKind = args.review.into();
-    match kind {
-        ReviewKind::Commit => team.commit_reviewers.push(label),
-        ReviewKind::Gate => team.gate_reviewers.push(label),
+    match review {
+        ReviewKind::Commit => team_comp.commit_reviewers.push(label),
+        ReviewKind::Gate => team_comp.gate_reviewers.push(label),
     }
     write_user_config(home, &cfg)?;
     eprintln!(
-        "added `{}` to team `{}` as `{}` reviewer",
-        args.agent,
-        args.team,
-        match kind {
+        "added `{agent}` to team `{team}` as `{}` reviewer",
+        match review {
             ReviewKind::Commit => "commit",
             ReviewKind::Gate => "gate",
         }
@@ -253,61 +260,63 @@ fn add(home: &Path, args: TeamAddArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn remove(home: &Path, args: TeamRemoveArgs) -> anyhow::Result<()> {
+/// Remove an agent from a team's reviewer tiers. Refuses to
+/// remove the team's master.
+pub fn remove_member(home: &Path, team: &str, agent: &str) -> anyhow::Result<()> {
     let mut cfg = read_user_config(home)?;
-    let label = parse_label(&args.agent)?;
+    let label = parse_label(agent)?;
 
-    let team = cfg
+    let team_comp = cfg
         .teams
-        .get_mut(&args.team)
-        .ok_or_else(|| anyhow::anyhow!("team `{}` not in user-scope `teams`", args.team))?;
+        .get_mut(team)
+        .ok_or_else(|| anyhow::anyhow!("team `{team}` not in user-scope `teams`"))?;
 
-    if team.master.as_ref() == Some(&label) {
+    if team_comp.master.as_ref() == Some(&label) {
         anyhow::bail!(
-            "agent `{}` is the master of team `{}`. Use `clank team set-master` to designate a different master first, or `clank team delete` the team.",
-            args.agent,
-            args.team
+            "agent `{agent}` is the master of team `{team}`. Use `clank team set-master` to designate a different master first, or `clank team delete` the team."
         );
     }
-    let initial_commit = team.commit_reviewers.len();
-    team.commit_reviewers.retain(|l| l != &label);
-    let initial_gate = team.gate_reviewers.len();
-    team.gate_reviewers.retain(|l| l != &label);
+    let initial_commit = team_comp.commit_reviewers.len();
+    team_comp.commit_reviewers.retain(|l| l != &label);
+    let initial_gate = team_comp.gate_reviewers.len();
+    team_comp.gate_reviewers.retain(|l| l != &label);
 
-    if team.commit_reviewers.len() == initial_commit && team.gate_reviewers.len() == initial_gate {
-        anyhow::bail!("agent `{}` is not in team `{}`", args.agent, args.team);
+    if team_comp.commit_reviewers.len() == initial_commit
+        && team_comp.gate_reviewers.len() == initial_gate
+    {
+        anyhow::bail!("agent `{agent}` is not in team `{team}`");
     }
 
     write_user_config(home, &cfg)?;
-    eprintln!("removed `{}` from team `{}`", args.agent, args.team);
+    eprintln!("removed `{agent}` from team `{team}`");
     Ok(())
 }
 
-fn set_master(home: &Path, args: TeamSetMasterArgs) -> anyhow::Result<()> {
+/// Designate a team's master. Moves the agent out of any reviewer
+/// tier; demotes the previous master to commit_reviewers.
+pub fn set_master(home: &Path, team: &str, agent: &str) -> anyhow::Result<()> {
     let mut cfg = read_user_config(home)?;
-    let label = parse_label(&args.agent)?;
+    let label = parse_label(agent)?;
 
     if !cfg.agents.contains_key(&label) {
         anyhow::bail!(
-            "agent `{}` is not declared in user-scope `agents`. Add it via `clank agent add --global {} --tool <claude|codex>` first.",
-            args.agent,
-            args.agent
+            "agent `{agent}` is not declared in user-scope `agents`. Add it via `clank agent add --global {agent} --tool <claude|codex>` first."
         );
     }
 
-    let team = cfg
+    let team_comp = cfg
         .teams
-        .get_mut(&args.team)
-        .ok_or_else(|| anyhow::anyhow!("team `{}` not in user-scope `teams`", args.team))?;
+        .get_mut(team)
+        .ok_or_else(|| anyhow::anyhow!("team `{team}` not in user-scope `teams`"))?;
 
     // If the agent was previously in a reviewer tier, move them
     // out (one role per team).
-    let was_commit = team.commit_reviewers.iter().any(|l| l == &label);
-    let was_gate = team.gate_reviewers.iter().any(|l| l == &label);
-    team.commit_reviewers.retain(|l| l != &label);
-    team.gate_reviewers.retain(|l| l != &label);
+    let was_commit = team_comp.commit_reviewers.iter().any(|l| l == &label);
+    let was_gate = team_comp.gate_reviewers.iter().any(|l| l == &label);
+    team_comp.commit_reviewers.retain(|l| l != &label);
+    team_comp.gate_reviewers.retain(|l| l != &label);
 
-    let prev_master = team.master.replace(label);
+    let prev_master = team_comp.master.replace(label);
 
     // Demote previous master to commit_reviewers (the more
     // engaged tier — they were master; the team probably wants
@@ -315,13 +324,13 @@ fn set_master(home: &Path, args: TeamSetMasterArgs) -> anyhow::Result<()> {
     // the same label (no-op promotion).
     let mut demoted: Option<AgentLabel> = None;
     if let Some(prev) = prev_master {
-        if prev != team.master.as_ref().unwrap().clone() {
-            team.commit_reviewers.push(prev.clone());
+        if prev != *team_comp.master.as_ref().unwrap() {
+            team_comp.commit_reviewers.push(prev.clone());
             demoted = Some(prev);
         }
     }
     write_user_config(home, &cfg)?;
-    let mut msg = format!("set `{}` as master of team `{}`", args.agent, args.team);
+    let mut msg = format!("set `{agent}` as master of team `{team}`");
     if let Some(d) = demoted {
         msg.push_str(&format!(" (demoted `{}` to commit reviewer)", d.as_str()));
     }
@@ -377,30 +386,9 @@ mod tests {
             &[],
         );
 
-        create(
-            home,
-            TeamCreateArgs {
-                team: "dev".to_string(),
-            },
-        )
-        .unwrap();
-        set_master(
-            home,
-            TeamSetMasterArgs {
-                team: "dev".to_string(),
-                agent: "claude".to_string(),
-            },
-        )
-        .unwrap();
-        add(
-            home,
-            TeamAddArgs {
-                team: "dev".to_string(),
-                agent: "codex".to_string(),
-                review: crate::cli::ReviewKindArg::Commit,
-            },
-        )
-        .unwrap();
+        create_team(home, "dev").unwrap();
+        set_master(home, "dev", "claude").unwrap();
+        add_member(home, "dev", "codex", ReviewKind::Commit).unwrap();
 
         let cfg = read_user_config(home).unwrap();
         let dev = cfg.teams.get("dev").unwrap();
@@ -422,14 +410,7 @@ mod tests {
             &[("dev", &dev)],
         );
 
-        set_master(
-            home,
-            TeamSetMasterArgs {
-                team: "dev".to_string(),
-                agent: "codex".to_string(),
-            },
-        )
-        .unwrap();
+        set_master(home, "dev", "codex").unwrap();
 
         let cfg = read_user_config(home).unwrap();
         let dev = cfg.teams.get("dev").unwrap();
@@ -451,15 +432,7 @@ mod tests {
             &[("dev", &dev)],
         );
 
-        add(
-            home,
-            TeamAddArgs {
-                team: "dev".to_string(),
-                agent: "ruthless".to_string(),
-                review: crate::cli::ReviewKindArg::Gate,
-            },
-        )
-        .unwrap();
+        add_member(home, "dev", "ruthless", ReviewKind::Gate).unwrap();
 
         let cfg = read_user_config(home).unwrap();
         let dev = cfg.teams.get("dev").unwrap();
@@ -482,15 +455,7 @@ mod tests {
             &[("dev", &dev)],
         );
 
-        let err = add(
-            home,
-            TeamAddArgs {
-                team: "dev".to_string(),
-                agent: "codex".to_string(),
-                review: crate::cli::ReviewKindArg::Gate,
-            },
-        )
-        .unwrap_err();
+        let err = add_member(home, "dev", "codex", ReviewKind::Gate).unwrap_err();
         let msg = format!("{err:#}");
         assert!(msg.contains("already in team"));
     }
@@ -503,14 +468,7 @@ mod tests {
         dev.master = Some(AgentLabel::parse("claude").unwrap());
         seed_user_config(home, &[("claude", Tool::Claude)], &[("dev", &dev)]);
 
-        let err = delete(
-            home,
-            TeamDeleteArgs {
-                team: "dev".to_string(),
-                force: false,
-            },
-        )
-        .unwrap_err();
+        let err = delete_team(home, "dev", false).unwrap_err();
         let msg = format!("{err:#}");
         assert!(msg.contains("--force"));
 
@@ -527,14 +485,7 @@ mod tests {
         dev.master = Some(AgentLabel::parse("claude").unwrap());
         seed_user_config(home, &[("claude", Tool::Claude)], &[("dev", &dev)]);
 
-        let err = remove(
-            home,
-            TeamRemoveArgs {
-                team: "dev".to_string(),
-                agent: "claude".to_string(),
-            },
-        )
-        .unwrap_err();
+        let err = remove_member(home, "dev", "claude").unwrap_err();
         let msg = format!("{err:#}");
         assert!(msg.contains("master"));
     }
