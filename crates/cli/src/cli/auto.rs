@@ -1,15 +1,17 @@
 //! `clank auto on|off|status` — manage this agent's auto-mode
-//! and role for the current repo.
+//! (the per-agent Stop-hook behavior) for the current repo.
 //!
 //! Resolves the calling agent's label via `agent_env::
 //! resolve_identity_from_env`. Errors with an actionable message
 //! if the session isn't bound — `clank auto` is NOT a bootstrap
-//! path (that's `clank as` or `clank init` phase 2).
+//! path (that's `clank as`).
 //!
-//! Role is a per-user preference stored on the agent's own
-//! config. Setting `--role master` doesn't make any repo-wide
-//! assertion — it just changes what `wfw` / `stop-hook` default
-//! to for THIS agent.
+//! `auto_mode` is per-agent STATE. Role is NOT — under
+//! `teams-based-agent-registration` roles are team-derived, so
+//! the `--role` flag here is an accepted no-op (kept only so
+//! older invocations don't hard-error; it prints a note). Change
+//! roles via `clank team set-master` / `clank team add` /
+//! `clank promote`.
 
 use super::{AutoArgs, AutoCmd, AutoOffArgs, AutoOnArgs, AutoStatusArgs, resolve_repo};
 use crate::agent_env::resolve_identity_from_env;

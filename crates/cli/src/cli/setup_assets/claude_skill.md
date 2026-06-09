@@ -58,9 +58,10 @@ User invoked `/clank` with arguments: "$ARGUMENTS"
   equivalent in codex) to present these options to the user:
   - "Enable auto-mode" → `clank auto on`
   - "Disable auto-mode" → `clank auto off`
-  - "Switch role to master" → `clank auto on --role master`
-  - "Switch role to reviewer" → `clank auto on --role reviewer`
   Run the matching command via Bash, then re-print state.
+  (Role is team-derived now — change it with `clank team
+  set-master` / `clank team add` / `clank promote`, NOT via
+  `clank auto`.)
 - **Otherwise**: pass arguments through. Run `clank $ARGUMENTS`
   via Bash and relay the full stdout to the user as your response.
 

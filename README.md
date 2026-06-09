@@ -153,16 +153,19 @@ Identity is keyed by the agent's session id (`CLAUDE_CODE_SESSION_ID` /
 `CODEX_THREAD_ID`). Two same-tool sessions in the same repo can bind to
 different labels.
 
-Role is a per-user preference:
+Roles are a property of the repo's **team**, not a per-agent flag. An
+agent is master / commit-reviewer / gate-reviewer because the team says
+so. Change roles with:
 
 ```sh
-clank auto on --role master      # default this agent to master view
-clank auto on --role reviewers   # default to reviewers
+clank team set-master <team> <agent>   # team-level master
+clank team add <team> <agent> [--review commit|gate]
+clank promote <agent>                  # per-repo master override
 ```
 
-Each agent's role is independent; setting yours doesn't make any
-repo-wide assertion. Gate state is computed from who's actually
-participated (written feedback), not from role claims.
+`clank auto on|off` toggles an agent's auto-mode (Stop-hook behavior),
+which is independent per-agent state. (It still accepts a legacy
+`--role` flag, but that's now a no-op — roles are team-derived.)
 
 ## Layout
 

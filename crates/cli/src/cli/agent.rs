@@ -685,23 +685,21 @@ fn promote(args: AgentPromoteArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Plan: teams-based-agent-registration (phase 6c).
+/// Plan: teams-based-agent-registration.
 ///
-/// When the repo's `.clank/config.json` has a new-schema
-/// `team` field set, write the `promoted: <label>` field
-/// instead of mutating per-agent skeletons. Validates that
-/// the label is reachable in the registered set (so a
-/// nonexistent label errors before writing).
+/// When the repo's `.clank/config.json` has a `team` field set,
+/// write the `promoted: <label>` field. Validates that the
+/// label is reachable in the registered set (so a nonexistent
+/// label errors before writing).
 ///
 /// Returns:
-/// - `Ok(true)` when the new-schema path handled the
-///   promote. Caller should return early.
-/// - `Ok(false)` when the repo is unmigrated (no team
-///   field) — caller continues to the legacy skeleton
-///   path.
-/// - `Err(_)` when reading/parsing the config files fails
-///   or when the label isn't a valid promote target
-///   (UnknownAgent, NoMaster, etc. from the resolver).
+/// - `Ok(true)` when the promote was written. Caller returns.
+/// - `Ok(false)` when the repo has no `team` field. The caller
+///   (`promote`) then errors with the no-team message — there
+///   is no legacy path.
+/// - `Err(_)` when reading/parsing the config files fails or
+///   when the label isn't a valid promote target (UnknownAgent,
+///   NoMaster, etc. from the resolver).
 fn write_repo_promoted_field_if_team_set(
     repo: &Path,
     promoted: &AgentLabel,
@@ -999,8 +997,9 @@ mod tests {
 
     #[test]
     fn write_repo_promoted_field_returns_false_when_no_team_set() {
-        // Repo has no `team` field → caller should continue to
-        // the legacy skeleton path.
+        // Repo has no `team` field → the helper returns false so
+        // `promote` errors with the no-team message (there is no
+        // legacy path to continue to).
         let repo = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(repo.path().join(".clank")).unwrap();
         std::fs::write(repo.path().join(".clank/config.json"), "{}").unwrap();
@@ -1020,7 +1019,7 @@ mod tests {
         drop(lock);
         assert!(
             !handled,
-            "no team → legacy path should run (handler returns false)"
+            "no team → handler returns false (promote then errors)"
         );
     }
 

@@ -9,10 +9,11 @@
 //! All structs round-trip through serde with
 //! `#[derive(Deserialize, Serialize)]`. No whole-document
 //! `serde_json::Value` parsing — only `extra:
-//! BTreeMap<String, Value>` flatten catchalls preserve unknown
-//! keys for forward-compat AND surface leftover keys (the
-//! init migration uses `extra.contains_key("agents")` to
-//! detect the legacy block).
+//! BTreeMap<String, Value>` flatten catchalls, which preserve
+//! unknown keys for forward-compat (a leftover legacy
+//! `agents`/`default_agents` key from a pre-hard-cut config
+//! lands here and is ignored — there is no migration that reads
+//! it).
 
 use std::collections::BTreeMap;
 
@@ -35,9 +36,9 @@ pub struct UserConfigFile {
     pub hooks: Option<crate::cli::config::HooksSection>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub diff: Option<crate::cli::config::DiffConfig>,
-    /// Forward-compat catchall. The `init` migration checks
-    /// `extra.contains_key("agents")` to detect the legacy
-    /// `default_agents` shape (when present).
+    /// Forward-compat catchall. A leftover legacy `default_agents`
+    /// key (from a pre-hard-cut config) lands here and is ignored
+    /// — there is no migration that reads it.
     #[serde(flatten)]
     pub extra: BTreeMap<String, serde_json::Value>,
 }
@@ -98,9 +99,9 @@ pub struct RepoConfigFile {
     pub hooks: Option<crate::cli::config::HooksSection>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub diff: Option<crate::cli::config::DiffConfig>,
-    /// Forward-compat catchall. The `init` migration checks
-    /// `extra.contains_key("agents")` to detect the legacy
-    /// repo-scope `agents` block.
+    /// Forward-compat catchall. A leftover legacy repo-scope
+    /// `agents` array (from a pre-hard-cut config) lands here and
+    /// is ignored — there is no migration that reads it.
     #[serde(flatten)]
     pub extra: BTreeMap<String, serde_json::Value>,
 }

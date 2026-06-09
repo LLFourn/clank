@@ -151,9 +151,12 @@ impl HooksFile {
 
 /// Round-trip typed schema for `<repo>/.clank/config.json`.
 ///
-/// Used by `clank agent add/remove/set-role` (Phase 4 of
-/// `agent-add-cli-and-repo-scope`) for read-modify-write: deserialize
-/// the file, edit one field, reserialize. The `extra` flatten
+/// Carries the flat config sections (`review`, `hooks`, `diff`)
+/// for `clank config` read-modify-write. NOTE: agent
+/// registration moved out of this struct entirely
+/// (`teams-based-agent-registration`); the `team` / `promoted`
+/// fields live on `teams_config::RepoConfigFile` and any unknown
+/// keys round-trip through the `extra` flatten below.
 /// catchall preserves unknown top-level keys so a newer clank's
 /// config keys don't get wiped by an older clank's `agent add`.
 ///

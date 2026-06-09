@@ -116,26 +116,26 @@ pub fn reviewer_tiers_for_render(repo: &Path) -> (Vec<AgentLabel>, Vec<AgentLabe
 
 /// Plan: teams-based-agent-registration (phase 6b).
 ///
-/// Shared dispatch helper for `load_reviewer_tiers` and
-/// `resolve_role`. Returns:
+/// Shared dispatch helper for `load_reviewer_tiers`,
+/// `reviewer_tiers_for_render`, and `resolve_role`. Returns:
 /// - `Ok(Some(RegisteredSet))` when the repo config parses
 ///   AND has a `team` field. The set is the result of running
 ///   `resolve_registered_set` against the new typed schemas.
-/// - `Ok(None)` when the repo has no `team` field set (or
-///   no repo config exists), signaling the caller should fall
-///   back to legacy behavior. Per codex b59dafb, this case is
-///   narrower than "any parse error" — a present-but-malformed
-///   `team` / `promoted` field now FAILS instead of silently
-///   falling back.
+/// - `Ok(None)` when the repo has no `team` field set (or no
+///   repo config exists). This is "no team configured" — the
+///   callers handle it per the render-vs-workflow boundary:
+///   workflow commands error (`no_team_configured()`),
+///   read-only renderers degrade to empty tiers. There is no
+///   legacy fallback.
 ///
 /// Failure modes:
-/// - Repo config exists but new-schema parse fails AND the
-///   legacy parse can't see it as `default_agents`/`agents`
-///   etc.: returns an error (fail-closed). Legacy `agents`
-///   array shape lands in `extra` of the new schema (via the
-///   flatten catchall), so legacy repos do NOT trigger the
-///   parse-fail path — they parse successfully with no
-///   `team` field and fall through to `Ok(None)`.
+/// - Repo config exists but new-schema parse fails (a
+///   strongly-typed field like `team` has the wrong shape, e.g.
+///   `team: 42`): returns an error (fail-closed). A legacy
+///   `agents` array does NOT trigger this — the new
+///   `RepoConfigFile` has no `agents` field, so the array lands
+///   in the `extra` flatten catchall, parse SUCCEEDS, and the
+///   repo falls through to `Ok(None)` (no team).
 /// - User config doesn't parse as new-schema when team is
 ///   set: error propagates (fail-closed).
 /// - `resolve_registered_set` returns error (UnknownTeam,

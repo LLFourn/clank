@@ -697,9 +697,9 @@ async fn fold_summary(repo_root: &Path) -> (usize, Option<String>, Option<String
             Err(e) => return (0, None, Some(format!("fold failed: {e}"))),
         };
     let config = crate::cli::config::load(repo_root);
-    // Phase 6b of teams-based-agent-registration: dispatch to
-    // the new two-tier resolver when the repo config has a
-    // `team` field; legacy single-list fallback otherwise.
+    // Reviewer tiers from the team resolver
+    // (`teams-based-agent-registration`); the no-team error is
+    // caught below into a display message rather than crashing.
     let (commit_reviewers, gate_reviewers) =
         match crate::agent_store::load_reviewer_tiers(repo_root) {
             Ok(t) => t,
