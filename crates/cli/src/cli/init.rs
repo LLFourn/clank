@@ -39,17 +39,68 @@ pub async fn run(args: InitArgs) -> anyhow::Result<()> {
     write_claude_perms(&repo)?;
     write_post_rewrite_hook(&repo, args.force_hooks)?;
     warn_if_globally_excluded(&repo);
-    // When `--team <name>` is set, write the team field to
-    // `<repo>/.clank/config.json` (new-schema). Validation:
-    // the named team must exist in user-scope.
-    if let Some(team_name) = args.team.as_deref() {
-        let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
-        let home_ref = home
-            .as_deref()
-            .ok_or_else(|| anyhow::anyhow!("$HOME not set; --team requires a user-scope config"))?;
-        register_repo_team(home_ref, &repo, team_name)?;
+
+    let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+    match args.team.as_deref() {
+        // Explicit `--team <name>`: authoritative. Validates the
+        // team exists in user-scope and writes it (overwriting any
+        // prior selection).
+        Some(team_name) => {
+            let home_ref = home.as_deref().ok_or_else(|| {
+                anyhow::anyhow!("$HOME not set; --team requires a user-scope config")
+            })?;
+            register_repo_team(home_ref, &repo, team_name)?;
+        }
+        // Bare `clank init`: adopt the user's `default` team so the
+        // next workflow command works
+        // (`clank-init-defaults-to-default-team`). Three guards:
+        //   - never CLOBBER an existing selection (re-init on a repo
+        //     that already chose a team is a no-op for the team),
+        //   - never INVENT a team (only the literal `default`),
+        //   - never HARD-FAIL the scaffold (warn to stderr instead).
+        None => {
+            if repo_has_team(&repo)? {
+                // Already chose a team; bare re-init preserves it.
+            } else if let Some(home_ref) = home.as_deref() {
+                let user_cfg = crate::cli::team::read_user_config(home_ref)?;
+                if user_cfg.teams.contains_key("default") {
+                    register_repo_team(home_ref, &repo, "default")?;
+                } else {
+                    eprintln!(
+                        "note: no `default` team in ~/.clank/config.json — this repo has no \
+                         team configured. Run `clank init --team <name>`, or create a default \
+                         team with `clank team create default` + `clank team set-master \
+                         default <agent>` / `clank team add default <agent>`."
+                    );
+                }
+            } else {
+                eprintln!(
+                    "note: $HOME not set; no team configured for this repo. \
+                     Run `clank init --team <name>`."
+                );
+            }
+        }
     }
     Ok(())
+}
+
+/// True iff `<repo>/.clank/config.json` already has a `team`
+/// field. Keeps bare `clank init` from clobbering an existing
+/// team selection on re-init (ruthless cc4c7c8). Missing config →
+/// no team; malformed → fails closed (same policy as
+/// `register_repo_team`).
+fn repo_has_team(repo: &Path) -> anyhow::Result<bool> {
+    use anyhow::Context;
+    let path = repo.join(".clank/config.json");
+    match std::fs::read_to_string(&path) {
+        Ok(s) => {
+            let cfg: crate::cli::teams_config::RepoConfigFile =
+                serde_json::from_str(&s).with_context(|| format!("parsing {}", path.display()))?;
+            Ok(cfg.team.is_some())
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(anyhow::Error::from(e).context(format!("reading {}", path.display()))),
+    }
 }
 
 /// Install the `post-rewrite` git hook so feedback files

@@ -56,6 +56,25 @@ immediately errors on the next command.
   history in `.clank/finished/`; do NOT edit it — this plan
   records the reversal.
 
+### Sizing concerns folded (ruthless cc4c7c8)
+
+- **Never clobber an existing team on re-init** (the regression
+  risk): the `default`-adoption applies ONLY when the repo has no
+  `team` field yet. A bare `clank init` on a repo already set to
+  `team: dev` (e.g. re-run to refresh hooks/perms) PRESERVES
+  `dev`. Implemented via a `repo_has_team(repo)` guard before the
+  default path; `--team <name>` remains the explicit override.
+- **Warning → stderr** (not stdout): per the convention (stdout =
+  artifact, stderr = metadata/warnings), the no-default warning
+  prints to stderr so it doesn't pollute output and tests can
+  assert it separately.
+- **Missing `~/.clank` is empty, not an error**: verified —
+  `read_user_config`/`register_repo_team` treat a non-existent
+  user config as an empty `UserConfigFile` (NotFound → default),
+  so a first-ever `clank init` warns rather than failing at the
+  read. Pinned by `bare_init_without_default_team_succeeds_and_warns`
+  (fresh HOME → exit 0 + warn).
+
 ## Surfaces
 
 - `crates/cli/src/cli/init.rs` `run()` — when `args.team` is
