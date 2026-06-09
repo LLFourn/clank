@@ -91,16 +91,15 @@ fn finish_amend_dry_purge_does_not_mutate_head_when_already_finished() {
 
 #[test]
 fn finish_fails_closed_on_malformed_reviewer_config() {
-    // Regression: a corrupted agent declaration must NOT silently
+    // Regression: a corrupted repo config must NOT silently
     // behave like a zero-reviewer repo (which would auto-Approve
-    // and let master finalize without any review). The
-    // declaration loader is strict; finalize fails closed.
+    // and let master finalize without any review). The team
+    // resolver is strict; finalize fails closed.
     //
-    // After agent-add-cli-and-repo-scope, the agent declaration
-    // lives in .clank/config.json's `agents` field (or
-    // ~/.clank/config.json's default_agents), NOT in the per-agent
-    // skeleton. This test exercises the repo-scope declaration's
-    // strict-fail semantic.
+    // Under teams-based-agent-registration the repo's team lives
+    // in `<repo>/.clank/config.json` (the `team` field, resolved
+    // against user-scope `agents`/`teams`). A malformed file must
+    // surface as a parse error, not degrade to "no reviewers".
     let env = init_repo();
     let repo = env.repo();
     write(repo, ".clank/plans/foo.md", "# foo\n");

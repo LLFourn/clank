@@ -16,24 +16,8 @@ fn clank_bin() -> &'static str {
     env!("CARGO_BIN_EXE_clank")
 }
 
-fn git(repo: &Path, args: &[&str]) {
-    let status = Command::new("git")
-        .arg("-C")
-        .arg(repo)
-        .args(args)
-        .status()
-        .expect("git");
-    assert!(status.success(), "git {args:?} failed");
-}
-
-fn init_repo() -> tempfile::TempDir {
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path();
-    git(path, &["init", "--quiet", "--initial-branch=main"]);
-    git(path, &["config", "user.email", "test@test"]);
-    git(path, &["config", "user.name", "test"]);
-    git(path, &["config", "commit.gpgsign", "false"]);
-    dir
+fn init_repo() -> common::TestEnv {
+    common::TestEnv::init()
 }
 
 /// Write a repo `team` array of reviewers WITHOUT a master
@@ -52,19 +36,17 @@ fn write_repo_reviewers_no_master(repo: &Path, reviewers: &[&str]) {
     .unwrap();
 }
 
-fn run_zellij(repo: &Path, args: &[&str]) -> std::process::Output {
-    let home = tempfile::tempdir().expect("isolated test HOME");
-    let mut cmd = Command::new(clank_bin());
+fn run_zellij(env: &common::TestEnv, args: &[&str]) -> std::process::Output {
+    let mut cmd = env.clank();
     cmd.args(["open", "zellij", "--repo"])
-        .arg(repo)
+        .arg(env.repo())
         .args(args)
         // Tests should never need a real zellij. Default to
         // NOT being inside a session unless the test sets it.
         .env_remove("ZELLIJ_SESSION_NAME")
         .env_remove("CLAUDE_CODE_SESSION_ID")
         .env_remove("CODEX_THREAD_ID")
-        .env_remove("CLANK_AGENT")
-        .env("HOME", home.path());
+        .env_remove("CLANK_AGENT");
     cmd.output().expect("spawn clank open zellij")
 }
 
@@ -134,11 +116,10 @@ fn legacy_open_invocation_errors_with_subcommand_hint() {
 
 #[test]
 fn open_zellij_print_emits_kdl_with_master_and_reviewers() {
-    let dir = init_repo();
-    let repo = dir.path();
-    common::write_team_config(repo, "alice", &["bob", "carol"], &[]);
+    let env = init_repo();
+    env.register_team("alice", &["bob", "carol"], &[]);
 
-    let out = run_zellij(repo, &["--print"]);
+    let out = run_zellij(&env, &["--print"]);
     assert!(
         out.status.success(),
         "--print failed: stderr=`{}`",
@@ -165,11 +146,10 @@ fn open_zellij_print_emits_kdl_with_master_and_reviewers() {
 
 #[test]
 fn open_zellij_print_includes_tab_bar_and_status_bar_plugins() {
-    let dir = init_repo();
-    let repo = dir.path();
-    common::write_team_config(repo, "alice", &[], &[]);
+    let env = init_repo();
+    env.register_team("alice", &[], &[]);
 
-    let out = run_zellij(repo, &["--print"]);
+    let out = run_zellij(&env, &["--print"]);
     assert!(out.status.success());
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
@@ -184,14 +164,13 @@ fn open_zellij_print_includes_tab_bar_and_status_bar_plugins() {
 
 #[test]
 fn open_zellij_no_master_errors_with_suggestion() {
-    let dir = init_repo();
-    let repo = dir.path();
+    let env = init_repo();
     // A team with reviewers but no designated master
     // (`teams-based-agent-registration`): resolution fails with
     // the NoMaster error.
-    write_repo_reviewers_no_master(repo, &["a", "b"]);
+    write_repo_reviewers_no_master(env.repo(), &["a", "b"]);
 
-    let out = run_zellij(repo, &["--print"]);
+    let out = run_zellij(&env, &["--print"]);
     assert!(
         !out.status.success(),
         "no-master must error; stdout=`{}` stderr=`{}`",
@@ -213,11 +192,10 @@ fn open_zellij_print_mode_emits_kdl_without_writing_file() {
     // would-be-spawned argv on stderr, but DO NOT write the
     // layout file. (Codex 361b104 plan refinement: file-write
     // is a non-print side effect.)
-    let dir = init_repo();
-    let repo = dir.path();
-    common::write_team_config(repo, "alice", &[], &[]);
+    let env = init_repo();
+    env.register_team("alice", &[], &[]);
 
-    let out = run_zellij(repo, &["--print"]);
+    let out = run_zellij(&env, &["--print"]);
     assert!(
         out.status.success(),
         "--print should succeed without zellij installed; stderr=`{}`",
@@ -229,7 +207,7 @@ fn open_zellij_print_mode_emits_kdl_without_writing_file() {
         "KDL should be on stdout; got: {stdout}"
     );
     assert!(
-        !repo.join(".clank/zellij/layout.kdl").exists(),
+        !env.repo().join(".clank/zellij/layout.kdl").exists(),
         "--print mode must NOT write the layout file"
     );
 }
@@ -240,11 +218,10 @@ fn open_zellij_print_mode_emits_kdl_without_writing_file() {
 fn open_zellij_reviewer_order_matches_declaration_order() {
     // Explicit non-alphabetical order so a BTreeMap-ordered
     // iteration would fail this test (per ruthless 7a58d12).
-    let dir = init_repo();
-    let repo = dir.path();
-    common::write_team_config(repo, "master", &["bob", "alice", "codex"], &[]);
+    let env = init_repo();
+    env.register_team("master", &["bob", "alice", "codex"], &[]);
 
-    let out = run_zellij(repo, &["--print"]);
+    let out = run_zellij(&env, &["--print"]);
     assert!(out.status.success());
     let stdout = String::from_utf8_lossy(&out.stdout);
     let bob_idx = stdout
@@ -267,15 +244,14 @@ fn open_zellij_tab_name_in_kdl_and_layout_path_in_spawn_metadata() {
     // Tab name now lives in the KDL (`tab name="<basename>"`)
     // rather than a `--name` argv flag. The spawn argv on
     // stderr is `zellij --layout <path>` only.
-    let dir = init_repo();
-    let repo = dir.path();
-    common::write_team_config(repo, "alice", &[], &[]);
+    let env = init_repo();
+    env.register_team("alice", &[], &[]);
 
-    let out = run_zellij(repo, &["--print"]);
+    let out = run_zellij(&env, &["--print"]);
     assert!(out.status.success());
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
-    let basename = repo.file_name().and_then(|s| s.to_str()).unwrap();
+    let basename = env.repo().file_name().and_then(|s| s.to_str()).unwrap();
     assert!(
         stdout.contains(&format!("tab name=\"{basename}\"")),
         "KDL should contain `tab name=\"<basename>\"`; got:\n{stdout}"
@@ -299,12 +275,11 @@ fn open_zellij_writes_layout_file_under_clank_dir() {
     // fail (no zellij in CI / no session), but the file write
     // happens before the spawn so we can assert on the
     // post-state regardless.
-    let dir = init_repo();
-    let repo = dir.path();
-    common::write_team_config(repo, "alice", &[], &[]);
+    let env = init_repo();
+    env.register_team("alice", &[], &[]);
 
-    let _ = run_zellij(repo, &[]); // ignore status — zellij absent in CI
-    let layout_path = repo.join(".clank/zellij/layout.kdl");
+    let _ = run_zellij(&env, &[]); // ignore status — zellij absent in CI
+    let layout_path = env.repo().join(".clank/zellij/layout.kdl");
     assert!(
         layout_path.exists(),
         "layout.kdl should be written at {} even if spawn fails",
@@ -315,7 +290,7 @@ fn open_zellij_writes_layout_file_under_clank_dir() {
         body.contains("layout {"),
         "file should be valid KDL; got:\n{body}"
     );
-    let basename = repo.file_name().and_then(|s| s.to_str()).unwrap();
+    let basename = env.repo().file_name().and_then(|s| s.to_str()).unwrap();
     assert!(
         body.contains(&format!("tab name=\"{basename}\"")),
         "file should have the tab name; got:\n{body}"
@@ -324,13 +299,12 @@ fn open_zellij_writes_layout_file_under_clank_dir() {
 
 #[test]
 fn open_zellij_adds_zellij_dir_to_gitignore_idempotently() {
-    let dir = init_repo();
-    let repo = dir.path();
-    common::write_team_config(repo, "alice", &[], &[]);
+    let env = init_repo();
+    env.register_team("alice", &[], &[]);
 
     // First invocation.
-    let _ = run_zellij(repo, &[]);
-    let gitignore = repo.join(".clank/.gitignore");
+    let _ = run_zellij(&env, &[]);
+    let gitignore = env.repo().join(".clank/.gitignore");
     let body1 = std::fs::read_to_string(&gitignore).unwrap();
     assert!(
         body1.lines().any(|l| l.trim() == "/zellij/"),
@@ -338,7 +312,7 @@ fn open_zellij_adds_zellij_dir_to_gitignore_idempotently() {
     );
 
     // Second invocation — must NOT add a duplicate entry.
-    let _ = run_zellij(repo, &[]);
+    let _ = run_zellij(&env, &[]);
     let body2 = std::fs::read_to_string(&gitignore).unwrap();
     assert_eq!(
         body2.matches("/zellij/").count(),
@@ -355,19 +329,17 @@ fn open_zellij_panes_set_cwd_to_repo_so_tool_launches_in_repo() {
     // ensure the tool launches IN the repo, each pane's KDL
     // sets `cwd="<repo>"`. Verify from a DIFFERENT invocation
     // cwd so we know we're not accidentally testing pwd-leak.
-    let dir = init_repo();
-    let repo = dir.path();
-    common::write_team_config(repo, "alice", &["bob"], &[]);
+    let env = init_repo();
+    env.register_team("alice", &["bob"], &[]);
 
     let cwd = std::env::temp_dir();
-    let home = tempfile::tempdir().expect("isolated test HOME");
-    let out = Command::new(clank_bin())
+    let out = env
+        .clank()
         .current_dir(&cwd)
         .args(["open", "zellij", "--repo"])
-        .arg(repo)
+        .arg(env.repo())
         .arg("--print")
         .env_remove("ZELLIJ_SESSION_NAME")
-        .env("HOME", home.path())
         .output()
         .expect("spawn");
     assert!(out.status.success());
@@ -392,7 +364,7 @@ fn open_zellij_panes_set_cwd_to_repo_so_tool_launches_in_repo() {
             cwd_value.starts_with('/'),
             "{label}'s cwd must be an absolute path; got: {cwd_value}"
         );
-        let basename = repo.file_name().and_then(|s| s.to_str()).unwrap();
+        let basename = env.repo().file_name().and_then(|s| s.to_str()).unwrap();
         assert!(
             cwd_value.contains(basename),
             "{label}'s cwd must reference the repo (basename {basename}), \
@@ -408,21 +380,19 @@ fn open_zellij_pane_commands_pin_repo_via_absolute_path() {
     // session's cwd doesn't match the repo. Every pane command
     // must pin `--repo <abs-path>` so the resolved repo is
     // unambiguous.
-    let dir = init_repo();
-    let repo = dir.path();
-    common::write_team_config(repo, "alice", &["bob"], &[]);
+    let env = init_repo();
+    env.register_team("alice", &["bob"], &[]);
 
     // Invoke from a DIFFERENT cwd (the tempdir's parent, or
     // any path that isn't the repo).
     let cwd = std::env::temp_dir();
-    let home = tempfile::tempdir().expect("isolated test HOME");
-    let out = Command::new(clank_bin())
+    let out = env
+        .clank()
         .current_dir(&cwd)
         .args(["open", "zellij", "--repo"])
-        .arg(repo)
+        .arg(env.repo())
         .arg("--print")
         .env_remove("ZELLIJ_SESSION_NAME")
-        .env("HOME", home.path())
         .output()
         .expect("spawn clank open zellij");
     assert!(
@@ -454,7 +424,7 @@ fn open_zellij_pane_commands_pin_repo_via_absolute_path() {
             "{label}'s --repo must NOT be the invocation cwd ({cwd_str}) — that's the bug we're guarding against; got: {path_in_args}"
         );
         // Sanity: it should at least contain the tempdir's basename.
-        let basename = repo.file_name().and_then(|s| s.to_str()).unwrap();
+        let basename = env.repo().file_name().and_then(|s| s.to_str()).unwrap();
         assert!(
             path_in_args.contains(basename),
             "{label}'s --repo should reference the actual repo (basename {basename}); got: {path_in_args}"
