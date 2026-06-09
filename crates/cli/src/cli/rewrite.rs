@@ -536,7 +536,15 @@ async fn apply_squash(
     let new_tree = build_stripped_tree_from_sha(repo, head_str, &strip)?;
     // Author/timestamp: prefer HEAD's so the squashed commit
     // doesn't look like a fresh authorship event from now.
-    // Committer-side fields will refresh.
+    //
+    // Committer date is ALSO pinned to the author date (not left to
+    // refresh to `now`) so the squash is IDEMPOTENT BY CONSTRUCTION
+    // (`finish-squash-idempotent-on-finished`): re-running
+    // `finish --squash "msg"` over an already-squashed single
+    // commit reproduces the SAME sha — tree, parents, author, AND
+    // committer are all deterministic, so commit-tree yields the
+    // identical object. (A `now` committer date would churn the sha
+    // on every re-run.)
     let mut cmd = std::process::Command::new("git");
     cmd.arg("-C").arg(repo);
     let author = git_capture(repo, &["show", "-s", "--format=%an <%ae>", head_str])?;
@@ -546,6 +554,7 @@ async fn apply_squash(
         cmd.env("GIT_AUTHOR_EMAIL", email);
     }
     cmd.env("GIT_AUTHOR_DATE", author_date.trim());
+    cmd.env("GIT_COMMITTER_DATE", author_date.trim());
     cmd.args(["commit-tree", &new_tree]);
     if let Some(p) = intro_parent {
         cmd.args(["-p", p]);

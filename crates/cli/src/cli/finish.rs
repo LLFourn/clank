@@ -45,6 +45,26 @@ pub async fn run(args: FinishArgs) -> anyhow::Result<()> {
         return Ok(());
     }
 
+    // Non-amend `--squash`/`--purge` on an already-finished plan:
+    // the finalize tree is already on disk, so skip `finalize()`
+    // (it would no-op) and run the rewrite directly. This un-blocks
+    // a keep-`.clank/` squash decided AFTER the finish landed
+    // (`finish-squash-idempotent-on-finished`). NOT factored with
+    // the `--amend` branch above: the load-bearing difference is
+    // that branch's `amend_already_finished` HEAD re-commit, which
+    // must stay amend-only — this path only rewrites the range, it
+    // does not touch the finalize commit. Plain `finish` (no
+    // purge/squash) still falls through to the no-op below.
+    if matches!(preview.readiness, FinalizeReadiness::AlreadyFinished)
+        && (args.purge || args.squash.is_some())
+    {
+        if args.dry {
+            return dry_run_finish_composite(&stem, &preview, &args);
+        }
+        run_post_finalize_rewrite(&repo, &plan_key, args).await?;
+        return Ok(());
+    }
+
     if !dispatch_readiness(&preview)? {
         return Ok(());
     }
