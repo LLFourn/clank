@@ -14,14 +14,11 @@
 
 mod common;
 
+use common::TestEnv;
 use std::io::Read;
 use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
-
-fn clank_bin() -> &'static str {
-    env!("CARGO_BIN_EXE_clank")
-}
 
 fn git(repo: &Path, args: &[&str]) {
     let status = Command::new("git")
@@ -33,36 +30,24 @@ fn git(repo: &Path, args: &[&str]) {
     assert!(status.success(), "git {args:?} failed");
 }
 
-fn init_repo() -> tempfile::TempDir {
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path();
-    git(path, &["init", "--quiet", "--initial-branch=main"]);
-    git(path, &["config", "user.email", "test@test"]);
-    git(path, &["config", "user.name", "test"]);
-    git(path, &["config", "commit.gpgsign", "false"]);
-    // Pre-register alice as a reviewer — the most-used label in this
-    // test file. Tests that use other reviewer labels register them
-    // individually.
-    register_reviewer(path, "alice");
-    dir
+/// Set up a TestEnv for wfw tests: a `lloyd`-master team with the
+/// given commit reviewers, registered through the REAL library
+/// cores (`dogfood-init-setup-in-tests`) into the env's separate
+/// HOME. `lloyd` is the master author these tests use; `alice` is
+/// the most-common reviewer.
+fn setup(reviewers: &[&str]) -> TestEnv {
+    let env = TestEnv::init();
+    env.register_team("lloyd", reviewers, &[]);
+    env
 }
 
-/// Register a reviewer in this repo's team
-/// (`teams-based-agent-registration`). The first call establishes
-/// the team with master `lloyd` (the master author these tests
-/// use) + the reviewer; later calls append additional reviewers.
-fn register_reviewer(repo: &Path, label: &str) {
-    let path = repo.join(".clank/config.json");
-    let has_team = std::fs::read_to_string(&path)
-        .ok()
-        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
-        .map(|v| v.get("team").is_some())
-        .unwrap_or(false);
-    if has_team {
-        common::add_reviewer(repo, label);
-    } else {
-        common::write_team_config(repo, "lloyd", &[label], &[]);
-    }
+/// Like [`setup`] but with ad-hoc review disabled, so only plan
+/// work is visible (matches the pre-adhoc-review tests that used
+/// the old `TestEnv::new()`).
+fn setup_no_adhoc(reviewers: &[&str]) -> TestEnv {
+    let env = setup(reviewers);
+    disable_adhoc_review(env.repo());
+    env
 }
 
 /// Typed read-modify-write helper for `<repo>/.clank/config.json`
@@ -101,69 +86,6 @@ fn head_sha(repo: &Path) -> String {
     String::from_utf8(out.stdout).unwrap().trim().to_string()
 }
 
-/// Test environment with separate home and repo dirs so user-level
-/// `~/.clank/config.json` doesn't leak into assertions and
-/// user→repo config shadowing can be tested.
-struct TestEnv {
-    home: tempfile::TempDir,
-    repo: tempfile::TempDir,
-}
-
-impl TestEnv {
-    fn new() -> Self {
-        let repo = init_repo();
-        // Disable ad-hoc review by default in tests so only plan
-        // work is visible (matches pre-adhoc-review behavior).
-        // Uses merge so register_reviewer's prior `agents` field
-        // survives.
-        merge_repo_config(repo.path(), |f| {
-            f.review = Some(clank::cli::config::ReviewSection {
-                adhoc_feedback: Some(false),
-                ..Default::default()
-            });
-        });
-        Self {
-            home: tempfile::tempdir().unwrap(),
-            repo,
-        }
-    }
-
-    fn repo(&self) -> &Path {
-        self.repo.path()
-    }
-
-    fn home(&self) -> &Path {
-        self.home.path()
-    }
-
-    fn cmd(&self) -> Command {
-        let mut cmd = Command::new(clank_bin());
-        cmd.env("HOME", self.home());
-        cmd
-    }
-}
-
-/// One empty, process-shared HOME for the non-TestEnv tests:
-/// distinct from any repo (so user-scope ≠ repo-scope) and
-/// empty (these tests put their config in the repo). Read-only
-/// in practice — `clank_cmd` callers never write user-scope —
-/// so sharing across parallel tests is safe. Leaked (lives for
-/// the test process) so the returned `Command`'s HOME stays
-/// valid after the builder returns.
-fn isolated_home() -> &'static Path {
-    use std::sync::OnceLock;
-    static HOME: OnceLock<std::path::PathBuf> = OnceLock::new();
-    HOME.get_or_init(|| tempfile::tempdir().expect("isolated test HOME").keep())
-}
-
-/// Build a `Command` for `clank` with HOME isolated to a temp
-/// dir separate from the repo.
-fn clank_cmd() -> Command {
-    let mut cmd = Command::new(clank_bin());
-    cmd.env("HOME", isolated_home());
-    cmd
-}
-
 /// Disable ad-hoc review in a test repo so old tests that expect
 /// "reviewer blocks with no plans" still pass. Uses merge so any
 /// prior agent registrations survive.
@@ -183,14 +105,15 @@ fn disable_adhoc_review(repo: &Path) {
 /// **Explicitly passes `--no-poll`** so the native-watcher path is
 /// exercised regardless of whether the test suite is running under
 /// `CODEX_SANDBOX=seatbelt`. Any test that wants polling mode must
-/// build its own `clank_cmd()` chain with `--poll`.
-fn spawn_wfw(repo: &Path, args: &[&str]) -> std::process::Child {
-    let child = clank_cmd()
+/// build its own `env.clank()` chain with `--poll`.
+fn spawn_wfw(env: &TestEnv, args: &[&str]) -> std::process::Child {
+    let child = env
+        .clank()
         .arg("wfw")
         .arg("--no-poll")
         .args(args)
         .arg("--repo")
-        .arg(repo)
+        .arg(env.repo())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -221,8 +144,8 @@ fn read_stderr_to_end(child: &mut std::process::Child) -> String {
 
 #[test]
 fn wfw_reviewer_wakes_on_new_reviewable_commit() {
-    let dir = init_repo();
-    let repo = dir.path();
+    let env = setup(&["alice"]);
+    let repo = env.repo();
     write(repo, ".clank/plans/foo.md", "# foo\n");
     commit(repo, "[foo] intro");
     let intro_sha = head_sha(repo);
@@ -237,7 +160,7 @@ fn wfw_reviewer_wakes_on_new_reviewable_commit() {
     );
 
     let mut child = spawn_wfw(
-        repo,
+        &env,
         &[
             "--author",
             "alice",
@@ -276,9 +199,8 @@ fn wfw_already_approved_reviewer_does_not_wake_while_peer_pending() {
     // The all-reviewers gate's load-bearing UX guarantee: alice
     // should NOT be woken again — only bob (the missing reviewer)
     // has work. alice's wfw must time out.
-    let dir = init_repo();
-    let repo = dir.path();
-    register_reviewer(repo, "bob");
+    let env = setup(&["alice", "bob"]);
+    let repo = env.repo();
     write(repo, ".clank/plans/foo.md", "# foo\n");
     commit(repo, "[foo] intro");
     let intro_sha = head_sha(repo);
@@ -291,7 +213,8 @@ fn wfw_already_approved_reviewer_does_not_wake_while_peer_pending() {
         "APPROVE\n\nlgtm\n",
     );
 
-    let output = clank_cmd()
+    let output = env
+        .clank()
         .args([
             "wfw",
             "--no-poll",
@@ -321,9 +244,8 @@ fn wfw_missing_reviewer_does_wake_while_peer_already_approved() {
     // Symmetric counterpart: two registered reviewers; alice has
     // APPROVED but bob hasn't. bob calls wfw — they should get
     // their review item promptly.
-    let dir = init_repo();
-    let repo = dir.path();
-    register_reviewer(repo, "bob");
+    let env = setup(&["alice", "bob"]);
+    let repo = env.repo();
     write(repo, ".clank/plans/foo.md", "# foo\n");
     commit(repo, "[foo] intro");
     let intro_sha = head_sha(repo);
@@ -334,7 +256,8 @@ fn wfw_missing_reviewer_does_wake_while_peer_already_approved() {
         "APPROVE\n\nlgtm\n",
     );
 
-    let output = clank_cmd()
+    let output = env
+        .clank()
         .args([
             "wfw",
             "--no-poll",
@@ -368,8 +291,8 @@ fn wfw_reviewer_wakes_on_code_only_commit() {
     // (code-only) commit doesn't touch any `.clank/` path, so the
     // ONLY signal the watcher has is the git-ref update. Confirms
     // logs/HEAD + refs/ watching reaches a parked reviewer.
-    let dir = init_repo();
-    let repo = dir.path();
+    let env = setup(&["alice"]);
+    let repo = env.repo();
     write(repo, ".clank/plans/foo.md", "# foo\n");
     commit(repo, "[foo] intro");
     let intro_sha = head_sha(repo);
@@ -382,7 +305,7 @@ fn wfw_reviewer_wakes_on_code_only_commit() {
     );
 
     let mut child = spawn_wfw(
-        repo,
+        &env,
         &[
             "--author",
             "alice",
@@ -429,8 +352,8 @@ fn wfw_reviewer_wakes_on_commit_with_index_already_staged() {
     // on is the commit-boundary metadata update. If
     // non-recursive `.git/` doesn't catch that, this test
     // fails.
-    let dir = init_repo();
-    let repo = dir.path();
+    let env = setup(&["alice"]);
+    let repo = env.repo();
     write(repo, ".clank/plans/foo.md", "# foo\n");
     commit(repo, "[foo] intro");
     let intro_sha = head_sha(repo);
@@ -449,7 +372,7 @@ fn wfw_reviewer_wakes_on_commit_with_index_already_staged() {
     git(repo, &["add", "src/lib.rs"]);
 
     let mut child = spawn_wfw(
-        repo,
+        &env,
         &[
             "--author",
             "alice",
@@ -481,11 +404,10 @@ fn wfw_reviewer_wakes_on_commit_with_index_already_staged() {
 
 #[test]
 fn wfw_master_wakes_on_request_changes_feedback() {
-    let dir = init_repo();
-    let repo = dir.path();
-    // This test uses codex as the reviewer; register codex so the
-    // all-reviewers gate treats its verdict as load-bearing.
-    register_reviewer(repo, "codex");
+    // This test uses codex as the reviewer so the all-reviewers
+    // gate treats its verdict as load-bearing.
+    let env = setup(&["alice", "codex"]);
+    let repo = env.repo();
     write(repo, ".clank/plans/foo.md", "# foo\n");
     commit(repo, "[foo] intro");
     let intro_sha = head_sha(repo);
@@ -493,7 +415,7 @@ fn wfw_master_wakes_on_request_changes_feedback() {
     // Initial: no feedback at all. Gate=Unreviewed, waiting_on=ReviewerApprovalsMissing.
     // Master role has no work; reviewers do.
     let mut child = spawn_wfw(
-        repo,
+        &env,
         &["--author", "lloyd", "--role", "master", "--timeout", "30s"],
     );
 
@@ -524,8 +446,8 @@ fn wfw_master_wakes_on_request_changes_feedback() {
 
 #[test]
 fn wfw_wakes_inside_linked_worktree_when_its_ref_moves() {
-    let main_dir = init_repo();
-    let main = main_dir.path();
+    let env = setup(&["alice"]);
+    let main = env.repo();
     write(main, ".clank/plans/foo.md", "# foo\n");
     commit(main, "[foo] intro");
 
@@ -554,17 +476,28 @@ fn wfw_wakes_inside_linked_worktree_when_its_ref_moves() {
         "APPROVE\n\nlgtm\n",
     );
 
-    let mut child = spawn_wfw(
-        wt,
-        &[
+    // spawn_wfw runs against env.repo(); this test needs wfw inside
+    // the LINKED WORKTREE, so build the command directly (HOME still
+    // baked in via env.clank()) and point --repo at the worktree.
+    let mut child = env
+        .clank()
+        .arg("wfw")
+        .arg("--no-poll")
+        .args([
             "--author",
             "alice",
             "--role",
             "reviewers",
             "--timeout",
             "30s",
-        ],
-    );
+        ])
+        .arg("--repo")
+        .arg(wt)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn clank wfw");
+    std::thread::sleep(Duration::from_millis(1500));
 
     // Advance the linked worktree's branch from the main worktree's
     // perspective via a separate `git` invocation. This updates the
@@ -591,11 +524,12 @@ fn wfw_wakes_inside_linked_worktree_when_its_ref_moves() {
 /// Run the `clank` binary (the one this test crate built) against a
 /// repo as a one-shot subcommand. Returns stdout. Panics on non-zero
 /// exit so tests fail loudly when `finish`/`init` etc. break.
-fn clank_run(repo: &Path, args: &[&str]) -> String {
-    let output = clank_cmd()
+fn clank_run(env: &TestEnv, args: &[&str]) -> String {
+    let output = env
+        .clank()
         .args(args)
         .arg("--repo")
-        .arg(repo)
+        .arg(env.repo())
         .output()
         .expect("spawn clank");
     if !output.status.success() {
@@ -613,8 +547,8 @@ fn clank_run(repo: &Path, args: &[&str]) -> String {
 fn wfw_master_approve_only_routes_to_continue() {
     // APPROVE alone (no FINISHED) routes master to Continue,
     // regardless of whether the approved commit touched code.
-    let dir = init_repo();
-    let repo = dir.path();
+    let env = setup(&["alice"]);
+    let repo = env.repo();
     write(repo, ".clank/plans/foo.md", "# foo\n");
     commit(repo, "[foo] intro");
     let intro_sha = head_sha(repo);
@@ -625,7 +559,8 @@ fn wfw_master_approve_only_routes_to_continue() {
         "APPROVE\n\nlgtm\n",
     );
 
-    let output = clank_cmd()
+    let output = env
+        .clank()
         .args([
             "wfw",
             "--no-poll",
@@ -654,8 +589,8 @@ fn wfw_master_approve_only_routes_to_continue() {
 
 #[test]
 fn wfw_master_finished_verdict_routes_to_finalize() {
-    let dir = init_repo();
-    let repo = dir.path();
+    let env = setup(&["alice"]);
+    let repo = env.repo();
     write(repo, ".clank/plans/foo.md", "# foo\n");
     commit(repo, "[foo] intro");
     let intro_sha = head_sha(repo);
@@ -668,7 +603,8 @@ fn wfw_master_finished_verdict_routes_to_finalize() {
         "FINISHED\n\nplan is done\n",
     );
 
-    let output = clank_cmd()
+    let output = env
+        .clank()
         .args([
             "wfw",
             "--no-poll",
@@ -693,8 +629,8 @@ fn wfw_master_finished_verdict_routes_to_finalize() {
 
 #[test]
 fn wfw_reviewer_finish_wake_human_output() {
-    let dir = init_repo();
-    let repo = dir.path();
+    let env = setup(&["alice"]);
+    let repo = env.repo();
     write(repo, ".clank/plans/foo.md", "# foo\n");
     commit(repo, "[foo] intro");
     let intro_sha = head_sha(repo);
@@ -714,7 +650,7 @@ fn wfw_reviewer_finish_wake_human_output() {
 
     // Park as alice (no reviewer work, gate already approved).
     let mut child = spawn_wfw(
-        repo,
+        &env,
         &[
             "--author",
             "alice",
@@ -726,7 +662,7 @@ fn wfw_reviewer_finish_wake_human_output() {
     );
 
     // Finalize the plan from outside.
-    clank_run(repo, &["finish", "foo"]);
+    clank_run(&env, &["finish", "foo"]);
 
     let exit = wait_for_exit(&mut child, Duration::from_secs(20));
     let stdout = read_stdout_to_end(&mut child);
@@ -743,8 +679,8 @@ fn wfw_reviewer_finish_wake_human_output() {
 
 #[test]
 fn wfw_reviewer_finish_wake_json_output() {
-    let dir = init_repo();
-    let repo = dir.path();
+    let env = setup(&["alice"]);
+    let repo = env.repo();
     write(repo, ".clank/plans/foo.md", "# foo\n");
     commit(repo, "[foo] intro");
     let intro_sha = head_sha(repo);
@@ -763,7 +699,7 @@ fn wfw_reviewer_finish_wake_json_output() {
     );
 
     let mut child = spawn_wfw(
-        repo,
+        &env,
         &[
             "--author",
             "alice",
@@ -775,7 +711,7 @@ fn wfw_reviewer_finish_wake_json_output() {
         ],
     );
 
-    clank_run(repo, &["finish", "foo"]);
+    clank_run(&env, &["finish", "foo"]);
     let final_sha = head_sha(repo);
 
     let exit = wait_for_exit(&mut child, Duration::from_secs(20));
@@ -801,8 +737,8 @@ fn wfw_plan_filter_finish_wake() {
     // Same as reviewer-finish-wake but with --plan, exercising the
     // snapshot path that previously returned Ok(None) when the
     // filtered plan disappeared.
-    let dir = init_repo();
-    let repo = dir.path();
+    let env = setup(&["alice"]);
+    let repo = env.repo();
     write(repo, ".clank/plans/foo.md", "# foo\n");
     commit(repo, "[foo] intro");
     let intro_sha = head_sha(repo);
@@ -821,7 +757,7 @@ fn wfw_plan_filter_finish_wake() {
     );
 
     let mut child = spawn_wfw(
-        repo,
+        &env,
         &[
             "--author",
             "alice",
@@ -834,7 +770,7 @@ fn wfw_plan_filter_finish_wake() {
         ],
     );
 
-    clank_run(repo, &["finish", "foo"]);
+    clank_run(&env, &["finish", "foo"]);
 
     let exit = wait_for_exit(&mut child, Duration::from_secs(20));
     let stdout = read_stdout_to_end(&mut child);
@@ -856,8 +792,8 @@ fn wfw_mixed_work_and_finished_on_one_wake() {
     // reviewable commit on `a` and (b) finalize `b`. The next
     // refold should emit BOTH a reviewer item for `a` and a
     // finished item for `b` — not just one of them.
-    let dir = init_repo();
-    let repo = dir.path();
+    let env = setup(&["alice"]);
+    let repo = env.repo();
     write(repo, ".clank/plans/a.md", "# a\n");
     commit(repo, "[a] intro");
     let a_intro = head_sha(repo);
@@ -887,7 +823,7 @@ fn wfw_mixed_work_and_finished_on_one_wake() {
     );
 
     let mut child = spawn_wfw(
-        repo,
+        &env,
         &[
             "--author",
             "alice",
@@ -902,7 +838,7 @@ fn wfw_mixed_work_and_finished_on_one_wake() {
     // Land a new reviewable commit on `a` AND finalize `b`.
     write(repo, ".clank/plans/a.md", "# a v2\n");
     commit(repo, "[a] revise");
-    clank_run(repo, &["finish", "b"]);
+    clank_run(&env, &["finish", "b"]);
 
     let exit = wait_for_exit(&mut child, Duration::from_secs(20));
     let stdout = read_stdout_to_end(&mut child);
@@ -938,8 +874,8 @@ fn wfw_finish_wake_survives_early_snapshot_event() {
     // heartbeat refold is the safety net. This test forces the
     // ordering: write the finished file manually, sleep PAST the
     // debounce window, THEN run the same `git` calls clank finish does.
-    let dir = init_repo();
-    let repo = dir.path();
+    let env = setup(&["alice"]);
+    let repo = env.repo();
     write(repo, ".clank/plans/foo.md", "# foo\n");
     commit(repo, "[foo] intro");
     let intro_sha = head_sha(repo);
@@ -953,7 +889,7 @@ fn wfw_finish_wake_survives_early_snapshot_event() {
     );
 
     let mut child = spawn_wfw(
-        repo,
+        &env,
         &[
             "--author",
             "alice",
@@ -990,8 +926,8 @@ fn wfw_finish_wake_survives_early_snapshot_event() {
 
 #[test]
 fn wfw_plan_already_finished_at_startup_emits_finished_and_exits() {
-    let dir = init_repo();
-    let repo = dir.path();
+    let env = setup(&["alice"]);
+    let repo = env.repo();
     write(repo, ".clank/plans/foo.md", "# foo\n");
     commit(repo, "[foo] intro");
     let intro_sha = head_sha(repo);
@@ -1008,12 +944,13 @@ fn wfw_plan_already_finished_at_startup_emits_finished_and_exits() {
         &format!(".clank/agents/alice/feedback/{impl_sha}.md"),
         "FINISHED\n",
     );
-    clank_run(repo, &["finish", "foo"]);
+    clank_run(&env, &["finish", "foo"]);
     let final_sha = head_sha(repo);
 
     // Plan is already finished; explicit --plan should emit a
     // finished item and exit 0 within the short timeout, NOT block.
-    let output = clank_cmd()
+    let output = env
+        .clank()
         .args([
             "wfw",
             "--no-poll",
@@ -1054,8 +991,8 @@ fn wfw_polling_mode_wakes_on_commit_via_periodic_refold() {
     // comes from the 500ms periodic refold tick. Stage the
     // change BEFORE parking wfw so no `.clank/` event is in
     // play either — the ONLY signal available is the tick.
-    let dir = init_repo();
-    let repo = dir.path();
+    let env = setup(&["alice"]);
+    let repo = env.repo();
     write(repo, ".clank/plans/foo.md", "# foo\n");
     commit(repo, "[foo] intro");
     let intro_sha = head_sha(repo);
@@ -1070,7 +1007,8 @@ fn wfw_polling_mode_wakes_on_commit_via_periodic_refold() {
 
     // Build the Command directly so we can pass --poll. The
     // shared spawn_wfw helper bakes in --no-poll.
-    let mut child = clank_cmd()
+    let mut child = env
+        .clank()
         .args([
             "wfw",
             "--poll",
@@ -1108,12 +1046,13 @@ fn wfw_polling_mode_wakes_on_commit_via_periodic_refold() {
 
 #[test]
 fn wfw_master_no_plans_parks_until_timeout() {
-    let dir = init_repo();
-    let repo = dir.path();
+    let env = setup(&["alice"]);
+    let repo = env.repo();
     write(repo, "README.md", "# repo\n");
     commit(repo, "init");
 
-    let output = clank_cmd()
+    let output = env
+        .clank()
         .args([
             "wfw",
             "--no-poll",
@@ -1143,14 +1082,15 @@ fn wfw_reviewer_no_plans_still_blocks() {
     // MUST keep blocking on an empty plan set — a plan they need to
     // review may land any moment. If a future change widens the
     // early-exit to both roles this test catches it.
-    let dir = init_repo();
-    let repo = dir.path();
+    let env = setup(&["alice"]);
+    let repo = env.repo();
     write(repo, "README.md", "# repo\n");
     commit(repo, "init");
     disable_adhoc_review(repo);
 
     let start = Instant::now();
-    let output = clank_cmd()
+    let output = env
+        .clank()
         .args([
             "wfw",
             "--no-poll",
@@ -1185,14 +1125,15 @@ fn wfw_skips_queue_promote_on_duplicate_names() {
     // Regression: two queue files with the same logical name
     // must not silently surface as a promote item. wfw should
     // bail loudly (to stderr) and emit no items.
-    let dir = init_repo();
-    let repo = dir.path();
+    let env = setup(&["alice"]);
+    let repo = env.repo();
     write(repo, "README.md", "x");
     commit(repo, "init");
     write(repo, ".clank/queue/400-foo.md", "# foo\n");
     write(repo, ".clank/queue/410-foo.md", "# foo v2\n");
 
-    let output = clank_cmd()
+    let output = env
+        .clank()
         .args([
             "wfw",
             "--no-poll",
@@ -1233,12 +1174,13 @@ fn wfw_fresh_repo_does_not_surface_adhoc_review_by_default() {
     // surface AdHocReview work to a reviewer. The default for
     // review.adhoc_feedback is `false`, so wfw should time out
     // cleanly (exit 2) instead of pulling the commit in for review.
-    let dir = init_repo();
-    let repo = dir.path();
+    let env = setup(&["alice"]);
+    let repo = env.repo();
     write(repo, "README.md", "# repo\n");
     commit(repo, "init");
 
-    let output = clank_cmd()
+    let output = env
+        .clank()
         .args([
             "wfw",
             "--no-poll",
@@ -1275,13 +1217,14 @@ fn wfw_master_with_active_plan_still_blocks() {
     // waiting on reviewers must still block — reviewer feedback can
     // arrive and transition the gate. The early-exit only applies to
     // an empty plan set.
-    let dir = init_repo();
-    let repo = dir.path();
+    let env = setup(&["alice"]);
+    let repo = env.repo();
     write(repo, ".clank/plans/foo.md", "# foo\n");
     commit(repo, "[foo] intro");
 
     let start = Instant::now();
-    let output = clank_cmd()
+    let output = env
+        .clank()
         .args([
             "wfw",
             "--no-poll",
@@ -1313,7 +1256,7 @@ fn wfw_master_with_active_plan_still_blocks() {
 
 #[test]
 fn wfw_hook_fires_reviewer_work() {
-    let env = TestEnv::new();
+    let env = setup_no_adhoc(&["alice"]);
     let repo = env.repo();
     write(repo, "README.md", "# repo\n");
     commit(repo, "init");
@@ -1328,7 +1271,7 @@ fn wfw_hook_fires_reviewer_work() {
     });
 
     let mut child = env
-        .cmd()
+        .clank()
         .arg("wfw")
         .arg("--no-poll")
         .args([
@@ -1363,7 +1306,7 @@ fn wfw_hook_fires_reviewer_work() {
 
 #[test]
 fn wfw_hook_failure_does_not_fail_wfw() {
-    let env = TestEnv::new();
+    let env = setup_no_adhoc(&["alice"]);
     let repo = env.repo();
     write(repo, "README.md", "# repo\n");
     commit(repo, "init");
@@ -1376,7 +1319,7 @@ fn wfw_hook_failure_does_not_fail_wfw() {
     });
 
     let mut child = env
-        .cmd()
+        .clank()
         .arg("wfw")
         .arg("--no-poll")
         .args([
@@ -1417,7 +1360,7 @@ fn wfw_hook_failure_does_not_fail_wfw() {
 
 #[test]
 fn wfw_master_empty_parks_with_hooks_configured() {
-    let env = TestEnv::new();
+    let env = setup_no_adhoc(&["alice"]);
     let repo = env.repo();
     write(repo, "README.md", "# repo\n");
     commit(repo, "init");
@@ -1430,7 +1373,7 @@ fn wfw_master_empty_parks_with_hooks_configured() {
     });
 
     let output = env
-        .cmd()
+        .clank()
         .args([
             "wfw",
             "--no-poll",
@@ -1458,7 +1401,7 @@ fn wfw_master_empty_parks_with_hooks_configured() {
 
 #[test]
 fn wfw_idle_hook_fires_but_master_parks() {
-    let env = TestEnv::new();
+    let env = setup_no_adhoc(&["alice"]);
     let repo = env.repo();
     write(repo, "README.md", "# repo\n");
     commit(repo, "init");
@@ -1486,7 +1429,7 @@ fn wfw_idle_hook_fires_but_master_parks() {
     common::write_team_config(repo, "lloyd", &[], &[]);
 
     let output = env
-        .cmd()
+        .clank()
         .args([
             "wfw",
             "--no-poll",
@@ -1517,7 +1460,7 @@ fn wfw_idle_hook_fires_but_master_parks() {
 
 #[test]
 fn wfw_user_hooks_shadowed_by_repo_hooks() {
-    let env = TestEnv::new();
+    let env = setup_no_adhoc(&["alice"]);
     let repo = env.repo();
     write(repo, "README.md", "# repo\n");
     commit(repo, "init");
@@ -1525,13 +1468,17 @@ fn wfw_user_hooks_shadowed_by_repo_hooks() {
     let user_marker = env.home().join("user-hook-ran.txt");
     let repo_marker = repo.join("repo-hook-ran.txt");
 
-    let user_config_dir = env.home().join(".clank");
-    std::fs::create_dir_all(&user_config_dir).unwrap();
-    let user_cfg = serde_json::json!({
-        "hooks": { "reviewer_work": format!("touch {}", user_marker.display()) }
+    // MERGE the user-level hook into the existing user config —
+    // setup() registered the team into the same file, so a blind
+    // overwrite would wipe it and break resolution. Read it back,
+    // add hooks, write it out.
+    let mut user_cfg = clank::cli::team::read_user_config(env.home()).unwrap();
+    user_cfg.hooks = Some(clank::cli::config::HooksSection {
+        reviewer_work: Some(Some(format!("touch {}", user_marker.display()))),
+        ..Default::default()
     });
     std::fs::write(
-        user_config_dir.join("config.json"),
+        env.home().join(".clank/config.json"),
         serde_json::to_string_pretty(&user_cfg).unwrap(),
     )
     .unwrap();
@@ -1545,7 +1492,7 @@ fn wfw_user_hooks_shadowed_by_repo_hooks() {
     });
 
     let mut child = env
-        .cmd()
+        .clank()
         .arg("wfw")
         .arg("--no-poll")
         .args([
@@ -1579,14 +1526,14 @@ fn wfw_user_hooks_shadowed_by_repo_hooks() {
 
 #[test]
 fn wfw_master_parked_wakes_on_queue_item() {
-    let dir = init_repo();
-    let repo = dir.path();
+    let env = setup(&["alice"]);
+    let repo = env.repo();
     disable_adhoc_review(repo);
     write(repo, "README.md", "# repo\n");
     commit(repo, "init");
 
     let mut child = spawn_wfw(
-        repo,
+        &env,
         &[
             "--author",
             "lloyd",
@@ -1619,8 +1566,8 @@ fn wfw_master_parked_wakes_on_queue_item() {
 
 #[test]
 fn wfw_master_with_active_plan_ignores_queue() {
-    let dir = init_repo();
-    let repo = dir.path();
+    let env = setup(&["alice"]);
+    let repo = env.repo();
     write(repo, ".clank/plans/foo.md", "# foo\n");
     commit(repo, "[foo] intro");
 
@@ -1628,7 +1575,7 @@ fn wfw_master_with_active_plan_ignores_queue() {
     std::fs::write(repo.join(".clank/queue/100-queued.md"), "# queued\n").unwrap();
 
     let mut child = spawn_wfw(
-        repo,
+        &env,
         &[
             "--author",
             "lloyd",
@@ -1655,8 +1602,8 @@ fn wfw_master_with_active_plan_ignores_queue() {
 
 #[test]
 fn wfw_repo_block_suppresses_available_work() {
-    let dir = init_repo();
-    let repo = dir.path();
+    let env = setup(&["alice"]);
+    let repo = env.repo();
     write(repo, ".clank/plans/foo.md", "# foo\n");
     commit(repo, "[foo] intro");
 
@@ -1667,7 +1614,7 @@ fn wfw_repo_block_suppresses_available_work() {
     );
 
     let mut child = spawn_wfw(
-        repo,
+        &env,
         &[
             "--author",
             "claude",
@@ -1694,8 +1641,8 @@ fn wfw_repo_block_suppresses_available_work() {
 
 #[test]
 fn wfw_repo_block_suppresses_queue_promotion() {
-    let dir = init_repo();
-    let repo = dir.path();
+    let env = setup(&["alice"]);
+    let repo = env.repo();
     disable_adhoc_review(repo);
     write(repo, "README.md", "# repo\n");
     commit(repo, "init");
@@ -1710,7 +1657,7 @@ fn wfw_repo_block_suppresses_queue_promotion() {
     );
 
     let mut child = spawn_wfw(
-        repo,
+        &env,
         &[
             "--author",
             "lloyd",
@@ -1745,8 +1692,8 @@ fn wfw_repo_block_suppresses_queue_promotion() {
 
 #[test]
 fn wfw_master_blocked_plan_surfaces_next_queue_item() {
-    let dir = init_repo();
-    let repo = dir.path();
+    let env = setup(&["alice"]);
+    let repo = env.repo();
     disable_adhoc_review(repo);
     // One active plan.
     write(repo, ".clank/plans/foo.md", "# foo\n");
@@ -1767,7 +1714,8 @@ fn wfw_master_blocked_plan_surfaces_next_queue_item() {
     )
     .unwrap();
 
-    let output = clank_cmd()
+    let output = env
+        .clank()
         .args([
             "wfw",
             "--no-poll",
@@ -1807,8 +1755,8 @@ fn wfw_block_on_queue_item_name_suppresses_promote() {
     // Acceptance from wfw-block-suppresses-queue-promote: an open
     // block scoped to a queued item's name suppresses the
     // promote_from_queue signal for THAT item.
-    let dir = init_repo();
-    let repo = dir.path();
+    let env = setup(&["alice"]);
+    let repo = env.repo();
     disable_adhoc_review(repo);
     // Queue item `foo` — name matches a plan key the agent might
     // promote.
@@ -1818,7 +1766,8 @@ fn wfw_block_on_queue_item_name_suppresses_promote() {
     // plan yet, the block by-name suppresses its promote signal.
     write(repo, ".clank/agents/lloyd/blocks/foo/dont-yet.md", "wait");
 
-    let output = clank_cmd()
+    let output = env
+        .clank()
         .args([
             "wfw",
             "--no-poll",
@@ -1865,15 +1814,16 @@ fn wfw_block_on_queue_item_name_suppresses_promote() {
 fn wfw_block_on_different_plan_does_not_suppress_unrelated_promote() {
     // Block on plan `bar` must NOT suppress promote of unrelated
     // queue item `foo`. No over-suppression.
-    let dir = init_repo();
-    let repo = dir.path();
+    let env = setup(&["alice"]);
+    let repo = env.repo();
     disable_adhoc_review(repo);
     std::fs::create_dir_all(repo.join(".clank/queue")).unwrap();
     std::fs::write(repo.join(".clank/queue/100-foo.md"), "# foo\n").unwrap();
     // Block scoped to a DIFFERENT plan name.
     write(repo, ".clank/agents/lloyd/blocks/bar/unrelated.md", "wait");
 
-    let output = clank_cmd()
+    let output = env
+        .clank()
         .args([
             "wfw",
             "--no-poll",
@@ -1901,8 +1851,8 @@ fn wfw_blocked_first_queue_item_still_surfaces_next_unblocked() {
     // Codex f64a974 pin: a block on the highest-priority queued
     // plan must NOT hide the next unblocked queue item. wfw scans
     // to the first unsuppressed entry in priority order.
-    let dir = init_repo();
-    let repo = dir.path();
+    let env = setup(&["alice"]);
+    let repo = env.repo();
     disable_adhoc_review(repo);
     std::fs::create_dir_all(repo.join(".clank/queue")).unwrap();
     // Two queue items, foo (lower priority number = higher priority)
@@ -1912,7 +1862,8 @@ fn wfw_blocked_first_queue_item_still_surfaces_next_unblocked() {
     // Block on foo (the top-priority entry).
     write(repo, ".clank/agents/lloyd/blocks/foo/dont.md", "wait");
 
-    let output = clank_cmd()
+    let output = env
+        .clank()
         .args([
             "wfw",
             "--no-poll",
@@ -1949,8 +1900,8 @@ fn wfw_master_blocked_plan_empty_queue_times_out() {
     // timeout. (No PromoteFromQueue to emit.) The idle hook
     // would fire in this branch if configured, but a stop-hook
     // continuation only happens on success exits.
-    let dir = init_repo();
-    let repo = dir.path();
+    let env = setup(&["alice"]);
+    let repo = env.repo();
     disable_adhoc_review(repo);
     write(repo, ".clank/plans/foo.md", "# foo\n");
     commit(repo, "[foo] intro");
@@ -1960,7 +1911,8 @@ fn wfw_master_blocked_plan_empty_queue_times_out() {
         "stop everything",
     );
 
-    let output = clank_cmd()
+    let output = env
+        .clank()
         .args([
             "wfw",
             "--no-poll",
@@ -1996,8 +1948,8 @@ fn wfw_master_one_blocked_one_actionable_returns_only_actionable() {
     // Master should see ONLY the actionable plan's work item plus
     // the pending Blocked entry — NOT PromoteFromQueue (an
     // actionable plan still exists for this agent).
-    let dir = init_repo();
-    let repo = dir.path();
+    let env = setup(&["alice"]);
+    let repo = env.repo();
     disable_adhoc_review(repo);
     // Plan A (will be blocked).
     write(repo, ".clank/plans/foo.md", "# foo\n");
@@ -2023,7 +1975,8 @@ fn wfw_master_one_blocked_one_actionable_returns_only_actionable() {
     std::fs::create_dir_all(repo.join(".clank/queue")).unwrap();
     std::fs::write(repo.join(".clank/queue/100-other.md"), "# other\n").unwrap();
 
-    let output = clank_cmd()
+    let output = env
+        .clank()
         .args([
             "wfw",
             "--no-poll",
@@ -2068,8 +2021,8 @@ fn wfw_reviewer_blocked_plan_does_not_surface_promote() {
     // Regression guard for the master-only role gate: this fix is
     // scoped to master. Reviewer code paths must NOT start emitting
     // PromoteFromQueue when all reviewable plans are suppressed.
-    let dir = init_repo();
-    let repo = dir.path();
+    let env = setup(&["alice"]);
+    let repo = env.repo();
     disable_adhoc_review(repo);
     write(repo, ".clank/plans/foo.md", "# foo\n");
     commit(repo, "[foo] intro");
@@ -2087,7 +2040,8 @@ fn wfw_reviewer_blocked_plan_does_not_surface_promote() {
     )
     .unwrap();
 
-    let output = clank_cmd()
+    let output = env
+        .clank()
         .args([
             "wfw",
             "--no-poll",
@@ -2128,11 +2082,10 @@ fn wfw_reviewer_blocked_plan_emits_no_review_item() {
     // - The block suppresses the per-plan reviewer item that bob
     //   would otherwise see (foo's implement commit needs review).
     // - With no other work, wfw parks until timeout.
-    let dir = init_repo();
-    let repo = dir.path();
+    // bob is a second reviewer beyond alice.
+    let env = setup(&["alice", "bob"]);
+    let repo = env.repo();
     disable_adhoc_review(repo);
-    // bob is a second reviewer beyond alice (auto-registered).
-    register_reviewer(repo, "bob");
     write(repo, ".clank/plans/foo.md", "# foo\n");
     commit(repo, "[foo] intro");
     write(repo, "src/foo.rs", "fn main() {}\n");
@@ -2146,7 +2099,7 @@ fn wfw_reviewer_blocked_plan_emits_no_review_item() {
     );
 
     let mut child = spawn_wfw(
-        repo,
+        &env,
         &[
             "--author",
             "bob",
@@ -2184,8 +2137,8 @@ fn wfw_reviewer_blocked_plan_emits_no_review_item() {
 
 #[test]
 fn wfw_parks_on_pending_block() {
-    let dir = init_repo();
-    let repo = dir.path();
+    let env = setup(&["alice"]);
+    let repo = env.repo();
     disable_adhoc_review(repo);
     write(repo, "README.md", "# repo\n");
     commit(repo, "init");
@@ -2197,7 +2150,7 @@ fn wfw_parks_on_pending_block() {
     );
 
     let mut child = spawn_wfw(
-        repo,
+        &env,
         &[
             "--author",
             "claude",
@@ -2220,8 +2173,8 @@ fn wfw_parks_on_pending_block() {
 
 #[test]
 fn wfw_wakes_on_unblock() {
-    let dir = init_repo();
-    let repo = dir.path();
+    let env = setup(&["alice"]);
+    let repo = env.repo();
     disable_adhoc_review(repo);
     write(repo, "README.md", "# repo\n");
     commit(repo, "init");
@@ -2233,7 +2186,7 @@ fn wfw_wakes_on_unblock() {
     );
 
     let mut child = spawn_wfw(
-        repo,
+        &env,
         &[
             "--author",
             "claude",
