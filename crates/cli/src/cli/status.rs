@@ -31,6 +31,23 @@ pub struct StatusSnapshot {
     pub(crate) queue_count: usize,
 }
 
+/// In-process convenience for tests / callers that want a status
+/// snapshot from just `(repo, home)`: cache enabled, no plan
+/// filter, not watch mode. Hides `CachePolicy`/basename plumbing.
+/// Plan: dogfood-init-setup-in-tests (Phase B).
+pub async fn snapshot(repo: &Path, home: Option<&Path>) -> anyhow::Result<StatusSnapshot> {
+    let basename = repo_basename(repo)?;
+    StatusSnapshot::build_async(
+        repo,
+        &basename,
+        home,
+        crate::rebuild::CachePolicy::Use,
+        None,
+        false,
+    )
+    .await
+}
+
 impl StatusSnapshot {
     /// Build the status snapshot. `home` is explicit (not read
     /// from `$HOME`) so in-process callers — tests + the `clank

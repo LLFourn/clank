@@ -51,6 +51,17 @@ fn run(env: &common::TestEnv, args: &[&str]) -> std::process::Output {
     cmd.output().expect("spawn")
 }
 
+/// Build the status snapshot IN-PROCESS via the real status core
+/// (`dogfood-init-setup-in-tests` Phase B) — no binary spawn.
+/// `home` is the env's separate home so the team resolves. Blocks
+/// on the async core with a fresh runtime so tests stay `#[test]`.
+fn status_snapshot(env: &common::TestEnv) -> clank::cli::status::StatusSnapshot {
+    tokio::runtime::Runtime::new()
+        .unwrap()
+        .block_on(clank::cli::status::snapshot(env.repo(), Some(env.home())))
+        .expect("build status snapshot")
+}
+
 fn intro_plan(repo: &Path, stem: &str, body: &str) {
     write(repo, &format!(".clank/plans/{stem}.md"), body);
     git(repo, &["add", "-A"]);
@@ -97,29 +108,27 @@ fn status_shows_blocked_gate_and_creator_for_plan_block() {
         String::from_utf8_lossy(&block_out.stderr)
     );
 
-    let status_out = run(&env, &["status"]);
-    assert!(status_out.status.success());
-    let stdout = String::from_utf8_lossy(&status_out.stdout);
+    let human = status_snapshot(&env).to_human();
     assert!(
-        stdout.contains("gate:              BLOCKED"),
-        "gate should show uppercase BLOCKED; got:\n{stdout}"
+        human.contains("gate:              BLOCKED"),
+        "gate should show uppercase BLOCKED; got:\n{human}"
     );
     assert!(
-        stdout.contains("waiting on:        claude"),
-        "waiting on should be block creator (claude), not reviewers; got:\n{stdout}"
+        human.contains("waiting on:        claude"),
+        "waiting on should be block creator (claude), not reviewers; got:\n{human}"
     );
     assert!(
-        stdout.contains("reason:            blocked: wait — checking the design"),
-        "reason should start with `blocked:` + first line of message; got:\n{stdout}"
+        human.contains("reason:            blocked: wait — checking the design"),
+        "reason should start with `blocked:` + first line of message; got:\n{human}"
     );
     assert!(
-        !stdout.contains("missing approval"),
-        "must NOT show the review-gate reason when blocked; got:\n{stdout}"
+        !human.contains("missing approval"),
+        "must NOT show the review-gate reason when blocked; got:\n{human}"
     );
     // The footer audit list still includes the block.
     assert!(
-        stdout.contains("BLOCKED (claude"),
-        "blocks: footer should still list the entry; got:\n{stdout}"
+        human.contains("BLOCKED (claude"),
+        "blocks: footer should still list the entry; got:\n{human}"
     );
 }
 
@@ -136,11 +145,7 @@ fn status_blocked_plan_json_emits_blocked_gate_state_and_structured_waiting_on()
         ],
     );
 
-    let out = run(&env, &["status", "--json"]);
-    assert!(out.status.success());
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    let parsed: serde_json::Value = serde_json::from_str(&stdout)
-        .unwrap_or_else(|e| panic!("status --json parse: {e}\nstdout:\n{stdout}"));
+    let parsed = status_snapshot(&env).to_json();
     let plans = parsed["plans"].as_array().expect("plans array");
     assert_eq!(plans.len(), 1, "expected one active plan; got: {plans:?}");
     let p = &plans[0];
@@ -178,23 +183,22 @@ fn status_unblocked_plan_returns_to_review_gate() {
         String::from_utf8_lossy(&unblock.stderr)
     );
 
-    let out = run(&env, &["status"]);
-    let stdout = String::from_utf8_lossy(&out.stdout);
+    let human = status_snapshot(&env).to_human();
     // After unblock, the per-plan gate line must NOT be the
     // blocked form. The footer may still say `UNBLOCKED ...`
     // (that's just the audit history), so we check the specific
     // `gate:              BLOCKED` form rather than just `BLOCKED`.
     assert!(
-        !stdout.contains("gate:              BLOCKED"),
-        "after unblock, gate should NOT be BLOCKED; got:\n{stdout}"
+        !human.contains("gate:              BLOCKED"),
+        "after unblock, gate should NOT be BLOCKED; got:\n{human}"
     );
     assert!(
-        stdout.contains("gate:              unreviewed"),
-        "after unblock, gate should be unreviewed (no reviews posted); got:\n{stdout}"
+        human.contains("gate:              unreviewed"),
+        "after unblock, gate should be unreviewed (no reviews posted); got:\n{human}"
     );
     assert!(
-        stdout.contains("missing approval"),
-        "after unblock, reason should be the review-gate text; got:\n{stdout}"
+        human.contains("missing approval"),
+        "after unblock, reason should be the review-gate text; got:\n{human}"
     );
 }
 
@@ -229,11 +233,34 @@ fn status_two_pending_blocks_on_same_plan_picks_first_lex() {
         ],
     );
 
-    let out = run(&env, &["status"]);
-    let stdout = String::from_utf8_lossy(&out.stdout);
+    let human = status_snapshot(&env).to_human();
     // `alpha` sorts before `zebra` for the same creator.
     assert!(
-        stdout.contains("reason:            blocked: a is lex-first"),
-        "lex-first block (alpha) should surface as reason; got:\n{stdout}"
+        human.contains("reason:            blocked: a is lex-first"),
+        "lex-first block (alpha) should surface as reason; got:\n{human}"
     );
+}
+
+/// Through-the-binary smoke: the content assertions above run the
+/// status core in-process, so this one spawn covers the `clank
+/// status` SHELL glue — arg parse → snapshot → render → stdout —
+/// for both human and `--json` output. Per the Phase-B
+/// shell-glue coverage pin.
+#[test]
+fn status_cli_smoke_emits_human_and_json() {
+    let env = init_repo();
+    intro_plan(env.repo(), "foo", "# foo\n");
+
+    let human = run(&env, &["status"]);
+    assert!(human.status.success());
+    assert!(
+        !human.stdout.is_empty(),
+        "clank status should print to stdout"
+    );
+
+    let json = run(&env, &["status", "--json"]);
+    assert!(json.status.success());
+    let parsed: serde_json::Value = serde_json::from_slice(&json.stdout)
+        .expect("clank status --json must emit parseable JSON on stdout");
+    assert!(parsed["plans"].is_array(), "json has a plans array");
 }
