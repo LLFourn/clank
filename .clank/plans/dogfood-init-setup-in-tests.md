@@ -67,26 +67,90 @@ Everything else should move in-process.
   but the CLI prints it; tests spawn `clank status` and parse
   stdout/json instead of building the snapshot directly.
 
-## The work
+## Visibility: cores are `pub` in the internal lib crate (codex 14bbfd3)
 
-1. Extract arg-free, env-free `pub(crate)` cores for the
-   mutation commands: `team::create_team` / `set_master` /
-   `add_member`, `agent::declare_global` / `add_local` /
-   `remove_*` / `promote_repo`, `init::scaffold` +
-   `register_repo_team`, `as_cmd::bind`, `auto::set_mode`,
-   `feedback::write_entry`, `finish` / `demote` / `purge`
-   cores.
-2. Extract query/render cores that RETURN values:
-   `status::snapshot(repo) -> StatusView`, `html::render(...) ->
-   String`, `doctor::run(repo) -> Vec<CheckResult>`,
-   `agent::list_rows(repo) -> Vec<AgentRow>`, `open::inspect(...)
-   -> OpenResponse`.
-3. Make every `run()` handler a thin wrapper over the core.
-4. Migrate the integration suite: setup via the real cores;
-   assert via the query cores; delete the per-file raw-JSON
-   helpers and `crates/cli/tests/common/mod.rs`'s
-   `write_team_config`. Only the genuinely-process-level tests
-   (above) keep spawning.
+Integration tests under `crates/cli/tests/` are SEPARATE crates;
+they can only reach `pub` items exported by the `clank` library,
+not `pub(crate)`. So the cores must be **`pub`** (not
+`pub(crate)`).
+
+That is consistent with the existing convention, not a new
+surface concern: `clank`'s lib crate is internal — it backs the
+binary and its own integration tests; it is NOT a published
+library with a semver contract. Today's integration tests
+already call `pub` lib items (`clank::cli::config::*`,
+`clank::agent_store::{load_reviewer_tiers, try_resolve_via_team}`,
+`clank::cli::teams_config::*`). The cores join that same
+internal-pub surface. To keep it deliberate rather than
+accidental, gather the test-facing entry points under a clearly
+named module path (e.g. each command module's `pub fn <verb>`),
+and resist exposing internal helpers — only the verbs tests need
+go `pub`.
+
+## Contract: cores are env-free + args-free, NOT pure (ruthless 14bbfd3 #2)
+
+The cores still do file IO (read/write `.clank/`) and shell out
+to `git`. "Core" here means: **no `$HOME`/cwd env reads, no clap
+`Args` structs** — they take resolved `(home, repo, params)`.
+The testability win is that a test passes explicit tempdir paths
+and calls the core IN-PROCESS (no subprocess), not that the core
+is side-effect-free. Do NOT over-engineer toward purity (no
+filesystem-abstraction injection); passing resolved paths is the
+whole mechanism.
+
+## The work — phased (ruthless 14bbfd3 #1)
+
+This touches nearly every CLI command (~12 mutation cores + ~5
+query cores + thin-shelling every `run()` + ~30 test files). As
+one commit it's an unreviewable mega-diff, so land it as a
+SERIES of independently-reviewable phases:
+
+- **Phase A — mutation cores + their test migration.** Extract
+  `pub` cores for `team::create_team` / `set_master` /
+  `add_member`, `agent::declare_global` / `add_local` /
+  `remove_*` / `promote_repo`, `init::scaffold` +
+  `register_repo_team`, `as_cmd::bind`, `auto::set_mode`,
+  `feedback::write_entry`, `finish` / `demote` / `purge`.
+  Thin-shell their `run()`. Replace the test SETUP pokers
+  (`common::write_team_config`, per-file `register_reviewer` /
+  `write_repo_agents`) with calls to these cores.
+- **Phase B — query/render cores + their test migration.**
+  `status::snapshot(repo) -> StatusView`,
+  `html::render(...) -> String`, `doctor::run(repo) ->
+  Vec<CheckResult>`, `agent::list_rows(repo) -> Vec<AgentRow>`,
+  `open::inspect(...) -> OpenResponse`. Migrate the assertion
+  side to call these in-process.
+- **Phase C — cleanup.** Delete `crates/cli/tests/common/mod.rs`'s
+  raw-JSON helper and any per-file pokers once nothing uses
+  them; confirm only the genuinely-process-level tests still
+  spawn the binary.
+
+(Each phase may itself be split if a single command group's
+diff is large. It may even be cleaner as a small series of
+plans; decide at phase boundaries.)
+
+## Coverage the migration must NOT silently drop
+
+- **Render formats are contracts (ruthless 14bbfd3 #3).** Tests
+  that assert on `clank status --json` / `clank html` stdout
+  cover the SERIALIZATION shape (a consumed wire format for
+  `--json`). When migrating, keep a test of the actual rendered
+  string/JSON — call the render core and assert on its returned
+  `String`/serialized output, NOT just the pre-render struct.
+  "Assert the value" must not silently replace "assert the
+  format."
+- **Shell-glue (ruthless 14bbfd3 #4).** Once tests call cores
+  directly, each thin `run()` (resolve `$HOME`/cwd, parse clap,
+  thread args, format) is no longer exercised — and that wiring
+  is exactly where a path-drop / flag-drop bug hides. Either
+  keep ONE through-the-binary smoke test per command group, or
+  make each shell mechanically trivial enough that inspection
+  suffices. Do not migrate 100% in-process and leave every shell
+  untested.
+
+(The "which tests genuinely need the binary" list above —
+`wfw`, `stop_hook`, `agent start`, clap-rejection — are the
+only ones that keep spawning.)
 
 ## Why this is a follow-up, not part of the hard cut
 
