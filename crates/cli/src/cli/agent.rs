@@ -468,7 +468,8 @@ fn exec_composed(c: ComposedLaunch) -> anyhow::Result<()> {
 // repo `promoted` field. Per-agent skeletons hold only state
 // (session / auto_mode / wfw_timeout) — never declaration.
 
-/// `clank agent add <label> [...]`.
+/// `clank agent add <label> [...]` — thin shell: resolve env,
+/// build the launch profile, dispatch to a `pub` core.
 fn add(args: AgentAddArgs) -> anyhow::Result<()> {
     let label = AgentLabel::parse(&args.label)
         .map_err(|e| anyhow::anyhow!("invalid agent label `{}`: {e}", args.label))?;
@@ -485,95 +486,128 @@ fn add(args: AgentAddArgs) -> anyhow::Result<()> {
         let home_ref = home
             .as_deref()
             .ok_or_else(|| anyhow::anyhow!("--global requires $HOME"))?;
-        let mut file = read_user_config(home_ref)?;
-        if file.agents.contains_key(&label) {
-            anyhow::bail!(
-                "agent `{}` already declared in user-scope `agents`",
-                args.label
-            );
-        }
-        file.agents.insert(
-            label.clone(),
+        declare_global_agent(
+            home_ref,
+            &label,
             AgentDescription {
                 tool,
                 launch,
                 initial_prompt: args.initial_prompt.clone(),
             },
-        );
-        write_user_config(home_ref, &file)?;
-        eprintln!("declared `{}` in user-scope `agents`", args.label);
+        )?;
     } else {
-        // Repo-scope: append a local entry to this repo's `team`
-        // array.
-        let mut repo_cfg = read_repo_config(&repo)?;
-        let existing = repo_cfg.team.take().ok_or_else(|| {
-            anyhow::anyhow!(
-                "this repo has no team set. Run `clank init --team <name>` before adding local agents."
-            )
-        })?;
-        let mut entries = team_field_into_entries(existing);
-        if team_entries_contain(&entries, &label) {
-            anyhow::bail!("agent `{}` is already in this repo's team", args.label);
-        }
         let review = args
             .review
             .map(ReviewKind::from)
             .unwrap_or(ReviewKind::Commit);
-        let entry = match args.tool {
-            Some(tool_arg) => TeamEntry::Inline(InlineAgent {
-                label: label.clone(),
-                tool: tool_arg.into(),
-                launch,
-                initial_prompt: args.initial_prompt.clone(),
-                role: None,
-                review: Some(review),
-            }),
-            None => {
-                // By-name entry: the label MUST already exist in
-                // user-scope `agents`, else the resolver fails
-                // closed (UnknownAgent) and every resolver-backed
-                // command breaks until the config is hand-edited.
-                // Validate before persisting (codex d772410 catch;
-                // mirrors `clank team add`'s pre-check).
-                let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
-                let declared = home
-                    .as_deref()
-                    .map(|h| -> anyhow::Result<bool> {
-                        Ok(read_user_config(h)?.agents.contains_key(&label))
-                    })
-                    .transpose()?
-                    .unwrap_or(false);
-                if !declared {
-                    anyhow::bail!(
-                        "agent `{}` is not declared in user-scope `agents`. \
-                         Add it with `clank agent add --global {} --tool <claude|codex>` first, \
-                         or pass `--tool` here to add a fully-inline local agent.",
-                        args.label,
-                        args.label
-                    );
-                }
-                TeamEntry::ByName(ByNameEntry {
-                    agent: label.clone(),
-                    review: Some(review),
-                })
-            }
-        };
-        entries.push(entry);
-        repo_cfg.team = Some(TeamField::Array(entries));
-        write_repo_config(&repo, &repo_cfg)?;
-        eprintln!(
-            "added `{}` to this repo's team as a `{}` reviewer",
-            args.label,
-            match review {
-                ReviewKind::Commit => "commit",
-                ReviewKind::Gate => "gate",
-            }
-        );
+        let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+        add_local_agent(
+            &repo,
+            home.as_deref(),
+            &label,
+            args.tool.map(Into::into),
+            launch,
+            args.initial_prompt.clone(),
+            review,
+        )?;
     }
     Ok(())
 }
 
-/// `clank agent remove <label> [--global]`.
+// ── agent mutation cores ─────────────────────────────────────
+//
+// `pub`, env-free (explicit `home`/`repo`), args-free. Both
+// `run()` and integration-test setup call these. Plan:
+// dogfood-init-setup-in-tests (Phase A).
+
+/// Declare an agent DESCRIPTION in user-scope `agents`. Errors if
+/// the label already exists there.
+pub fn declare_global_agent(
+    home: &Path,
+    label: &AgentLabel,
+    desc: AgentDescription,
+) -> anyhow::Result<()> {
+    let mut file = read_user_config(home)?;
+    if file.agents.contains_key(label) {
+        anyhow::bail!(
+            "agent `{}` already declared in user-scope `agents`",
+            label.as_str()
+        );
+    }
+    file.agents.insert(label.clone(), desc);
+    write_user_config(home, &file)?;
+    eprintln!("declared `{}` in user-scope `agents`", label.as_str());
+    Ok(())
+}
+
+/// Append a local entry to THIS repo's `team` array. With `tool`
+/// set it's a fully-inline entry; without, a by-name reference
+/// (which requires the label exist in user-scope `agents` —
+/// validated against `home`, codex d772410 catch).
+pub fn add_local_agent(
+    repo: &Path,
+    home: Option<&Path>,
+    label: &AgentLabel,
+    tool: Option<Tool>,
+    launch: Option<LaunchConfig>,
+    initial_prompt: Option<String>,
+    review: ReviewKind,
+) -> anyhow::Result<()> {
+    let mut repo_cfg = read_repo_config(repo)?;
+    let existing = repo_cfg.team.take().ok_or_else(|| {
+        anyhow::anyhow!(
+            "this repo has no team set. Run `clank init --team <name>` before adding local agents."
+        )
+    })?;
+    let mut entries = team_field_into_entries(existing);
+    if team_entries_contain(&entries, label) {
+        anyhow::bail!("agent `{}` is already in this repo's team", label.as_str());
+    }
+    let entry = match tool {
+        Some(tool) => TeamEntry::Inline(InlineAgent {
+            label: label.clone(),
+            tool,
+            launch,
+            initial_prompt,
+            role: None,
+            review: Some(review),
+        }),
+        None => {
+            let declared = home
+                .map(|h| -> anyhow::Result<bool> {
+                    Ok(read_user_config(h)?.agents.contains_key(label))
+                })
+                .transpose()?
+                .unwrap_or(false);
+            if !declared {
+                anyhow::bail!(
+                    "agent `{label}` is not declared in user-scope `agents`. \
+                     Add it with `clank agent add --global {label} --tool <claude|codex>` first, \
+                     or pass `--tool` here to add a fully-inline local agent.",
+                    label = label.as_str()
+                );
+            }
+            TeamEntry::ByName(ByNameEntry {
+                agent: label.clone(),
+                review: Some(review),
+            })
+        }
+    };
+    entries.push(entry);
+    repo_cfg.team = Some(TeamField::Array(entries));
+    write_repo_config(repo, &repo_cfg)?;
+    eprintln!(
+        "added `{}` to this repo's team as a `{}` reviewer",
+        label.as_str(),
+        match review {
+            ReviewKind::Commit => "commit",
+            ReviewKind::Gate => "gate",
+        }
+    );
+    Ok(())
+}
+
+/// `clank agent remove <label> [--global]` — thin shell.
 fn remove(args: AgentRemoveArgs) -> anyhow::Result<()> {
     let label = AgentLabel::parse(&args.label)
         .map_err(|e| anyhow::anyhow!("invalid agent label `{}`: {e}", args.label))?;
@@ -584,62 +618,74 @@ fn remove(args: AgentRemoveArgs) -> anyhow::Result<()> {
         let home_ref = home
             .as_deref()
             .ok_or_else(|| anyhow::anyhow!("--global requires $HOME"))?;
-        let mut file = read_user_config(home_ref)?;
-        if file.agents.remove(&label).is_none() {
-            anyhow::bail!("agent `{}` not in user-scope `agents`", args.label);
-        }
-        // Scrub the label from every team composition so no
-        // dangling reference survives (it would error at
-        // resolution time otherwise).
-        let mut touched = Vec::new();
-        for (name, team) in file.teams.iter_mut() {
-            let before = team.commit_reviewers.len()
-                + team.gate_reviewers.len()
-                + usize::from(team.master.is_some());
-            if team.master.as_ref() == Some(&label) {
-                team.master = None;
-            }
-            team.commit_reviewers.retain(|l| l != &label);
-            team.gate_reviewers.retain(|l| l != &label);
-            let after = team.commit_reviewers.len()
-                + team.gate_reviewers.len()
-                + usize::from(team.master.is_some());
-            if before != after {
-                touched.push(name.clone());
-            }
-        }
-        write_user_config(home_ref, &file)?;
-        if touched.is_empty() {
-            eprintln!("removed `{}` from user-scope `agents`", args.label);
-        } else {
-            eprintln!(
-                "removed `{}` from user-scope `agents` (and from teams: {})",
-                args.label,
-                touched.join(", ")
-            );
-        }
+        remove_global_agent(home_ref, &label)?;
     } else {
-        let mut repo_cfg = read_repo_config(&repo)?;
-        let existing = repo_cfg
-            .team
-            .take()
-            .ok_or_else(|| anyhow::anyhow!("this repo has no team set; nothing to remove"))?;
-        let entries = team_field_into_entries(existing);
-        let before = entries.len();
-        let kept: Vec<TeamEntry> = entries
-            .into_iter()
-            .filter(|e| !team_entry_matches(e, &label))
-            .collect();
-        if kept.len() == before {
-            anyhow::bail!(
-                "agent `{}` is not a local entry in this repo's team",
-                args.label
-            );
-        }
-        repo_cfg.team = Some(TeamField::Array(kept));
-        write_repo_config(&repo, &repo_cfg)?;
-        eprintln!("removed `{}` from this repo's team", args.label);
+        remove_local_agent(&repo, &label)?;
     }
+    Ok(())
+}
+
+/// Remove an agent DESCRIPTION from user-scope `agents` and scrub
+/// it from every team composition (master + both reviewer tiers)
+/// so no dangling reference survives.
+pub fn remove_global_agent(home: &Path, label: &AgentLabel) -> anyhow::Result<()> {
+    let mut file = read_user_config(home)?;
+    if file.agents.remove(label).is_none() {
+        anyhow::bail!("agent `{}` not in user-scope `agents`", label.as_str());
+    }
+    let mut touched = Vec::new();
+    for (name, team) in file.teams.iter_mut() {
+        let before = team.commit_reviewers.len()
+            + team.gate_reviewers.len()
+            + usize::from(team.master.is_some());
+        if team.master.as_ref() == Some(label) {
+            team.master = None;
+        }
+        team.commit_reviewers.retain(|l| l != label);
+        team.gate_reviewers.retain(|l| l != label);
+        let after = team.commit_reviewers.len()
+            + team.gate_reviewers.len()
+            + usize::from(team.master.is_some());
+        if before != after {
+            touched.push(name.clone());
+        }
+    }
+    write_user_config(home, &file)?;
+    if touched.is_empty() {
+        eprintln!("removed `{}` from user-scope `agents`", label.as_str());
+    } else {
+        eprintln!(
+            "removed `{}` from user-scope `agents` (and from teams: {})",
+            label.as_str(),
+            touched.join(", ")
+        );
+    }
+    Ok(())
+}
+
+/// Remove any local entry referencing `label` from THIS repo's
+/// `team` array.
+pub fn remove_local_agent(repo: &Path, label: &AgentLabel) -> anyhow::Result<()> {
+    let mut repo_cfg = read_repo_config(repo)?;
+    let existing = repo_cfg
+        .team
+        .take()
+        .ok_or_else(|| anyhow::anyhow!("this repo has no team set; nothing to remove"))?;
+    let entries = team_field_into_entries(existing);
+    let before = entries.len();
+    let kept: Vec<TeamEntry> = entries
+        .into_iter()
+        .filter(|e| !team_entry_matches(e, label))
+        .collect();
+    if kept.len() == before {
+        anyhow::bail!(
+            "agent `{}` is not a local entry in this repo's team",
+            label.as_str()
+        );
+    }
+    repo_cfg.team = Some(TeamField::Array(kept));
+    write_repo_config(repo, &repo_cfg)?;
+    eprintln!("removed `{}` from this repo's team", label.as_str());
     Ok(())
 }
 
@@ -679,13 +725,15 @@ fn promote(args: AgentPromoteArgs) -> anyhow::Result<()> {
     let label = AgentLabel::parse(&args.label)
         .map_err(|e| anyhow::anyhow!("invalid agent label `{}`: {e}", args.label))?;
     let repo = resolve_repo(args.repo.as_deref())?;
-    if !write_repo_promoted_field_if_team_set(&repo, &label)? {
+    let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+    if !promote_repo_master(&repo, home.as_deref(), &label)? {
         anyhow::bail!("this repo has no team configured. Run `clank init --team <name>` first.");
     }
     Ok(())
 }
 
-/// Plan: teams-based-agent-registration.
+/// Plan: dogfood-init-setup-in-tests (Phase A) — `pub`,
+/// env-free core (takes `home` explicitly).
 ///
 /// When the repo's `.clank/config.json` has a `team` field set,
 /// write the `promoted: <label>` field. Validates that the
@@ -693,15 +741,16 @@ fn promote(args: AgentPromoteArgs) -> anyhow::Result<()> {
 /// label errors before writing).
 ///
 /// Returns:
-/// - `Ok(true)` when the promote was written. Caller returns.
+/// - `Ok(true)` when the promote was written (or was a no-op).
 /// - `Ok(false)` when the repo has no `team` field. The caller
 ///   (`promote`) then errors with the no-team message — there
 ///   is no legacy path.
 /// - `Err(_)` when reading/parsing the config files fails or
 ///   when the label isn't a valid promote target (UnknownAgent,
 ///   NoMaster, etc. from the resolver).
-fn write_repo_promoted_field_if_team_set(
+pub fn promote_repo_master(
     repo: &Path,
+    home: Option<&Path>,
     promoted: &AgentLabel,
 ) -> anyhow::Result<bool> {
     use crate::cli::teams_config::{RepoConfigFile, UserConfigFile};
@@ -729,8 +778,7 @@ fn write_repo_promoted_field_if_team_set(
     // resolver — if the label isn't reachable it errors
     // (UnknownAgent / PromotedNotPresent). Only persist on
     // success.
-    let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
-    let user_cfg: UserConfigFile = match home.as_deref() {
+    let user_cfg: UserConfigFile = match home {
         Some(h) => {
             let user_path = h.join(".clank/config.json");
             match std::fs::read_to_string(&user_path) {
@@ -959,31 +1007,9 @@ mod tests {
         std::fs::create_dir_all(repo.path().join(".clank")).unwrap();
         std::fs::write(repo.path().join(".clank/config.json"), r#"{"team":"dev"}"#).unwrap();
 
-        // Run promote with $HOME set to our temp dir. Use a
-        // mutex to serialize against other tests that touch
-        // $HOME — phase-6a tests dropped this pattern after
-        // lifting `home` to a param, but `promote` flows
-        // through the production agent CLI dispatch which
-        // reads $HOME directly. Acceptable trade-off for this
-        // test because the alternative (lifting home all the
-        // way through `promote`) cascades into the CLI surface.
-        let lock = home_test_lock().lock().unwrap();
-        let prev = std::env::var_os("HOME");
-        // SAFETY: serialized by `lock`.
-        unsafe {
-            std::env::set_var("HOME", user_home.path());
-        }
-
         let codex_label = AgentLabel::parse("codex").unwrap();
-        let handled = write_repo_promoted_field_if_team_set(repo.path(), &codex_label).unwrap();
-
-        unsafe {
-            match prev {
-                Some(v) => std::env::set_var("HOME", v),
-                None => std::env::remove_var("HOME"),
-            }
-        }
-        drop(lock);
+        let handled =
+            promote_repo_master(repo.path(), Some(user_home.path()), &codex_label).unwrap();
 
         assert!(handled, "team field set → new-schema path should handle");
         let body = std::fs::read_to_string(repo.path().join(".clank/config.json")).unwrap();
@@ -1003,20 +1029,8 @@ mod tests {
         let repo = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(repo.path().join(".clank")).unwrap();
         std::fs::write(repo.path().join(".clank/config.json"), "{}").unwrap();
-        let lock = home_test_lock().lock().unwrap();
-        let prev = std::env::var_os("HOME");
-        unsafe {
-            std::env::set_var("HOME", repo.path()); // not seeded; irrelevant
-        }
         let label = AgentLabel::parse("codex").unwrap();
-        let handled = write_repo_promoted_field_if_team_set(repo.path(), &label).unwrap();
-        unsafe {
-            match prev {
-                Some(v) => std::env::set_var("HOME", v),
-                None => std::env::remove_var("HOME"),
-            }
-        }
-        drop(lock);
+        let handled = promote_repo_master(repo.path(), None, &label).unwrap();
         assert!(
             !handled,
             "no team → handler returns false (promote then errors)"
@@ -1027,7 +1041,7 @@ mod tests {
     fn write_repo_promoted_field_returns_false_when_no_repo_config() {
         let repo = tempfile::tempdir().unwrap();
         let label = AgentLabel::parse("codex").unwrap();
-        let handled = write_repo_promoted_field_if_team_set(repo.path(), &label).unwrap();
+        let handled = promote_repo_master(repo.path(), None, &label).unwrap();
         assert!(!handled);
     }
 
@@ -1068,20 +1082,8 @@ mod tests {
         std::fs::create_dir_all(repo.path().join(".clank")).unwrap();
         std::fs::write(repo.path().join(".clank/config.json"), r#"{"team":"dev"}"#).unwrap();
 
-        let lock = home_test_lock().lock().unwrap();
-        let prev = std::env::var_os("HOME");
-        unsafe {
-            std::env::set_var("HOME", user_home.path());
-        }
         let phantom = AgentLabel::parse("phantom").unwrap();
-        let err = write_repo_promoted_field_if_team_set(repo.path(), &phantom).unwrap_err();
-        unsafe {
-            match prev {
-                Some(v) => std::env::set_var("HOME", v),
-                None => std::env::remove_var("HOME"),
-            }
-        }
-        drop(lock);
+        let err = promote_repo_master(repo.path(), Some(user_home.path()), &phantom).unwrap_err();
 
         let msg = format!("{err:#}");
         // Resolver error names the validation context.
@@ -1153,20 +1155,8 @@ mod tests {
         )
         .unwrap();
 
-        let lock = home_test_lock().lock().unwrap();
-        let prev = std::env::var_os("HOME");
-        unsafe {
-            std::env::set_var("HOME", user_home.path());
-        }
         let codex = AgentLabel::parse("codex").unwrap();
-        let handled = write_repo_promoted_field_if_team_set(repo.path(), &codex).unwrap();
-        unsafe {
-            match prev {
-                Some(v) => std::env::set_var("HOME", v),
-                None => std::env::remove_var("HOME"),
-            }
-        }
-        drop(lock);
+        let handled = promote_repo_master(repo.path(), Some(user_home.path()), &codex).unwrap();
 
         assert!(
             handled,
@@ -1176,15 +1166,6 @@ mod tests {
         let body = std::fs::read_to_string(repo.path().join(".clank/config.json")).unwrap();
         let parsed: RepoConfigFile = serde_json::from_str(&body).unwrap();
         assert_eq!(parsed.promoted.as_ref().map(|l| l.as_str()), Some("codex"));
-    }
-
-    /// Tests that mutate `$HOME` MUST serialize against each
-    /// other — `std::env` is process-global and cargo runs
-    /// tests in parallel by default.
-    fn home_test_lock() -> &'static std::sync::Mutex<()> {
-        use std::sync::OnceLock;
-        static LOCK: OnceLock<std::sync::Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| std::sync::Mutex::new(()))
     }
 
     #[test]
