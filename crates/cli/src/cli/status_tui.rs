@@ -8,6 +8,18 @@
 //! behavior is unit-testable headless; only the ioctl, the escape
 //! sequences, and the loop touch a real terminal.
 //!
+//! ## Visual grammar — "instrument panel"
+//!
+//! One loud signal lamp and a quiet gauge cluster. The top bar
+//! (bold + reverse-video, state-colored) carries WHO is active and
+//! their verb on the left, the plan stem on the right. Below it, a
+//! right-aligned dim label gutter (`gate` / `ask` / `next` /
+//! `queue` / `git` / `done`) with each fact stated EXACTLY once —
+//! nothing the bar already says is repeated. One hue per frame
+//! (the bar's state color); body text is monochrome with dim
+//! labels. Small panes get a one-line queue summary (`next … +N`);
+//! tall panes expand it to a block.
+//!
 //! No input handling: no raw mode, no event loop, no TUI framework.
 //! Exit is closing the pane (or Ctrl-C — a SIGINT handler restores
 //! the terminal first).
@@ -17,120 +29,206 @@ use std::path::PathBuf;
 use std::sync::mpsc;
 use std::time::Duration;
 
-use super::status::{
-    StatusSnapshot, attach_watcher, build_watcher, short_sha, waiting_actor, waiting_reason,
-};
+use super::status::{StatusSnapshot, attach_watcher, build_watcher, short_sha, waiting_actor};
 use clank_core::plan_view::WaitingOn;
 use clank_core::wait::PlanWorkState;
+
+// ── span model ──────────────────────────────────────────────
+//
+// Body lines carry inline styling (dim labels next to plain
+// values), and truncation must never split an ANSI escape — so
+// lines are built as styled SPANS of plain text, truncated by
+// display width at the span level, and only then serialized to
+// ANSI.
+
+#[derive(Clone, Copy, PartialEq)]
+enum Style {
+    Plain,
+    Dim,
+    /// State-colored (the frame's one hue) — used sparingly for
+    /// the line that demands action (a pending block's question).
+    Accent,
+}
+
+struct Span(Style, String);
+
+fn dim(s: impl Into<String>) -> Span {
+    Span(Style::Dim, s.into())
+}
+fn plain(s: impl Into<String>) -> Span {
+    Span(Style::Plain, s.into())
+}
+
+/// Right-aligned label gutter: 5 columns + 2 spaces, dim. The
+/// fixed gutter is what makes the cluster read as one organized
+/// instrument instead of stacked key:value dumps.
+fn label(name: &str) -> Span {
+    dim(format!("{name:>5}  "))
+}
 
 // ── pure layout ─────────────────────────────────────────────
 
 /// Render the snapshot into at most `rows` lines, each at most
-/// `cols` chars. Priority-ordered tiers, greedy fit: a tier is
-/// included only if the remaining rows hold its minimum height.
-/// The tier-1 active-agent headline ALWAYS renders — even at
-/// `rows == 1`.
+/// `cols` display columns. Priority-ordered sections, greedy fit.
+/// The who's-active bar ALWAYS renders — even at `rows == 1`.
 pub(crate) fn render(snap: &StatusSnapshot, rows: u16, cols: u16) -> Vec<String> {
     let rows = rows.max(1) as usize;
     let cols = cols.max(1) as usize;
+    let color = state_color(snap);
+
     let mut out: Vec<String> = Vec::with_capacity(rows);
+    out.push(bar(snap, color, cols));
 
-    // Tier 1: active agent — unconditional.
-    out.push(headline(snap));
+    let mut body: Vec<Vec<Span>> = Vec::new();
 
-    // Tier 2: current plan (first in snapshot order).
-    if let Some(v) = snap.plans.first() {
-        if out.len() < rows {
-            let sha = v
-                .sha
-                .as_ref()
-                .map(|s| format!(" @ {}", short_sha(s.as_str())))
-                .unwrap_or_default();
-            out.push(format!("plan: {}{sha}", v.plan.as_str()));
+    // Breathing room under the bar — the bar needs negative space
+    // to read as a lamp, but only once the pane can afford it.
+    let breath = rows >= 4;
+
+    // `ask` — a pending block's question is the single case where
+    // detail outranks state: a human must act. Accent-colored.
+    for b in snap.blocks.iter().filter(|b| b.answer.is_none()) {
+        body.push(vec![
+            label("ask"),
+            Span(Style::Accent, first_line(&b.question)),
+        ]);
+    }
+
+    // `gate` — state + the sha under review. The bar already names
+    // the actor, so the waiting-reason is NOT repeated here.
+    if let [v] = snap.plans.as_slice() {
+        let mut line = vec![label("gate"), plain(v.gate.to_string())];
+        if let Some(sha) = &v.sha {
+            line.push(dim(format!(" @ {}", short_sha(sha.as_str()))));
         }
-        // Tier 3: gate state + waiting-on reason.
-        if out.len() < rows {
-            out.push(format!(
-                "gate: {} — {}",
-                v.gate,
-                waiting_reason(&v.waiting_on)
-            ));
+        body.push(line);
+    }
+
+    // Multi-plan: one aligned line per plan (emoji, actor, plan,
+    // gate) — the bar shows only the count.
+    if snap.plans.len() > 1 {
+        for v in &snap.plans {
+            body.push(vec![
+                plain(format!("{} ", emoji_of(&v.waiting_on))),
+                plain(actor_of(v)),
+                dim(format!("  {}  ", v.plan.as_str())),
+                plain(v.gate.to_string()),
+            ]);
         }
     }
 
-    // Tier 4: queue — header + at least one name, else skip.
-    if !snap.queue.is_empty() && rows - out.len() >= 2 {
-        out.push(format!("queued ({}):", snap.queue.len()));
-        for (i, name) in snap.queue.iter().enumerate() {
-            if out.len() >= rows {
-                break;
+    // Queue: a tall pane gets the full block; otherwise one
+    // summary line — head of the queue + how many more.
+    let queue_block = rows >= 12 && snap.queue.len() > 1;
+    if !snap.queue.is_empty() {
+        if queue_block {
+            for (i, name) in snap.queue.iter().enumerate() {
+                body.push(if i == 0 {
+                    vec![label("queue"), plain(name.clone())]
+                } else {
+                    vec![label(""), dim(name.clone())]
+                });
             }
-            out.push(format!("  {}. {name}", i + 1));
+        } else if !(snap.plans.is_empty() && snap.queue.len() == 1) {
+            // (suppressed when the bar itself is the promote line
+            // for the only queued item — it would be a repeat)
+            let mut line = vec![label("next"), plain(snap.queue[0].clone())];
+            if snap.queue.len() > 1 {
+                line.push(dim(format!(" +{}", snap.queue.len() - 1)));
+            }
+            body.push(line);
         }
     }
 
-    // Tier 5: extras, line by line as space allows.
-    if out.len() < rows {
+    // `git` — branch, head, dirty. Quietest gauge, dim throughout.
+    {
         let branch = snap.branch.as_deref().unwrap_or("?");
         let head = snap.head_sha.as_deref().map(short_sha).unwrap_or("?");
         let dirty = if snap.worktree_dirty { " (dirty)" } else { "" };
-        out.push(format!("branch: {branch} @ {head}{dirty}"));
-    }
-    if snap.plans.len() > 1 && rows - out.len() >= 2 {
-        out.push("plans:".to_string());
-        for v in &snap.plans {
-            if out.len() >= rows {
-                break;
-            }
-            out.push(format!(
-                "  {} @ {} → {}",
-                v.plan.as_str(),
-                v.gate,
-                waiting_actor(&v.waiting_on)
-            ));
-        }
-    }
-    if out.len() < rows {
-        if let Some(fp) = &snap.last_finished {
-            if snap.plans.is_empty() {
-                out.push(format!(
-                    "last finished: {} ({})",
-                    fp.plan.as_str(),
-                    short_sha(fp.finalized_at.as_str())
-                ));
-            }
-        }
-    }
-    let pending_blocks = snap.blocks.iter().filter(|b| b.answer.is_none()).count();
-    if pending_blocks > 0 && out.len() < rows {
-        out.push(format!("blocks: {pending_blocks} pending"));
+        body.push(vec![label("git"), dim(format!("{branch} {head}{dirty}"))]);
     }
 
-    out.truncate(rows);
-    for line in &mut out {
-        *line = truncate_to(line, cols);
+    // `done` — last finished, only when the repo is idle.
+    if snap.plans.is_empty() {
+        if let Some(fp) = &snap.last_finished {
+            body.push(vec![
+                label("done"),
+                dim(format!(
+                    "{} @ {}",
+                    fp.plan.as_str(),
+                    short_sha(fp.finalized_at.as_str())
+                )),
+            ]);
+        }
     }
-    // Style the headline LAST, after truncation: ANSI escapes are
-    // zero-width, so styling first would corrupt the width math
-    // (and a truncation could split an escape). The banner is
-    // bold + reverse-video + color, padded to the full width —
-    // a loud who's-active bar at the top of the pane (lloyd).
-    if let Some(first) = out.first_mut() {
-        *first = style_banner(first, headline_color(snap), cols);
+
+    // Greedy fit: bar (+breath) then body lines until rows run out.
+    if breath && out.len() < rows && !body.is_empty() {
+        out.push(String::new());
+    }
+    for line in body {
+        if out.len() >= rows {
+            break;
+        }
+        out.push(emit(&line, color, cols));
     }
     out
 }
 
-/// ANSI color code for the headline banner, by who we're waiting
-/// on: red = a human must act (blocked), yellow = reviewers,
-/// green = master working a plan, cyan = master should promote,
-/// plain dim for truly idle.
-fn headline_color(snap: &StatusSnapshot) -> &'static str {
-    if snap
+/// The signal lamp: `{emoji} {ACTOR} {verb}` left, plan stem
+/// right, gap-filled, bold + reverse-video in the state color,
+/// padded to exactly `cols` display columns. The right segment is
+/// dropped when the pane is too narrow for both.
+fn bar(snap: &StatusSnapshot, color: &str, cols: usize) -> String {
+    let (left, right) = bar_text(snap);
+    let left = truncate_to(&left, cols);
+    let lw = display_width(&left);
+    let rw = display_width(&right);
+    // Keep the right segment only when it fits with ≥2 cols of gap.
+    let body = if !right.is_empty() && lw + 2 + rw <= cols {
+        format!("{left}{}{right}", " ".repeat(cols - lw - rw))
+    } else {
+        format!("{left}{}", " ".repeat(cols - lw))
+    };
+    format!("\x1b[1;7;{color}m{body}\x1b[0m")
+}
+
+/// Bar text: (left = who + verb, right = where). Every state
+/// names WHO must act; `idle` only when nothing and nobody waits.
+fn bar_text(snap: &StatusSnapshot) -> (String, String) {
+    match snap.plans.as_slice() {
+        [] if !snap.queue.is_empty() => {
+            let master = snap.master.as_deref().unwrap_or("master").to_uppercase();
+            let right = if snap.queue.len() > 1 {
+                format!("{} +{}", snap.queue[0], snap.queue.len() - 1)
+            } else {
+                snap.queue[0].clone()
+            };
+            (format!("📋 {master} promote"), right)
+        }
+        [] => ("💤 idle".to_string(), String::new()),
+        [v] => (
+            format!(
+                "{} {} {}",
+                emoji_of(&v.waiting_on),
+                actor_of(v).to_uppercase(),
+                verb_of(&v.waiting_on)
+            ),
+            v.plan.as_str().to_string(),
+        ),
+        many => (format!("🔀 {} ACTIVE", many.len()), String::new()),
+    }
+}
+
+/// The frame's one hue: red = a human must act (blocked), yellow
+/// = reviewers, green = master working, cyan = promote, dim idle.
+fn state_color(snap: &StatusSnapshot) -> &'static str {
+    let blocked = snap
         .plans
         .iter()
         .any(|v| matches!(v.waiting_on, WaitingOn::Blocked { .. }))
-    {
+        || snap.blocks.iter().any(|b| b.answer.is_none());
+    if blocked {
         return "31"; // red
     }
     match snap.plans.as_slice() {
@@ -151,71 +249,11 @@ fn headline_color(snap: &StatusSnapshot) -> &'static str {
     }
 }
 
-/// Bold + reverse-video + color, padded to `cols` so the banner
-/// spans the pane width. Pads by DISPLAY width, not char count —
-/// the leading emoji is two columns, and padding by chars made
-/// the reverse-video background overflow the pane by one column
-/// and wrap (lloyd + ruthless 1fee586).
-fn style_banner(text: &str, color: &str, cols: usize) -> String {
-    let pad = cols.saturating_sub(display_width(text));
-    format!("\x1b[1;7;{color}m{text}{}\x1b[0m", " ".repeat(pad))
-}
-
-/// Display columns a char occupies in the terminal. Not a full
-/// unicode-width implementation: banner/tier content is validated
-/// ASCII (plan stems, agent labels, gate names) plus the fixed
-/// status emoji set — so "emoji plane → 2, else 1" is exact for
-/// everything we render, with zero new deps.
-fn char_width(c: char) -> usize {
-    if ('\u{1F000}'..='\u{1FAFF}').contains(&c) {
-        2
-    } else {
-        1
-    }
-}
-
-fn display_width(s: &str) -> usize {
-    s.chars().map(char_width).sum()
-}
-
-/// Tier-1 headline: whose turn is it to unblock progress.
-/// Deterministic multi-plan rule (ruthless 9d01e47 concern 2):
-/// with N>1 active plans the headline is a count plus
-/// `actor(plan)` pairs in snapshot order (lexicographic by plan
-/// key, since `derive_status` folds a BTreeMap); width truncation
-/// trims the tail.
-///
-/// No active plan but a non-empty queue is still somebody's turn
-/// — MASTER's, to promote the next item (lloyd, reopen round):
-/// the headline names the master label and the head of the queue.
-/// `idle` is reserved for truly idle (no plans AND empty queue).
-fn headline(snap: &StatusSnapshot) -> String {
-    match snap.plans.as_slice() {
-        [] if !snap.queue.is_empty() => {
-            let master = snap.master.as_deref().unwrap_or("master");
-            format!(
-                "📋 {} — promote — {} ({} queued)",
-                master.to_uppercase(),
-                snap.queue[0],
-                snap.queue.len()
-            )
-        }
-        [] => "💤 idle".to_string(),
-        [v] => format!(
-            "{} {} — {} — {} @ {}",
-            emoji_of(&v.waiting_on),
-            actor_of(v).to_uppercase(),
-            verb_of(&v.waiting_on),
-            v.plan.as_str(),
-            v.gate
-        ),
-        many => {
-            let pairs: Vec<String> = many
-                .iter()
-                .map(|v| format!("{}({})", actor_of(v).to_uppercase(), v.plan.as_str()))
-                .collect();
-            format!("🔀 {} plans: {}", many.len(), pairs.join(", "))
-        }
+fn actor_of(v: &PlanWorkState) -> String {
+    match &v.waiting_on {
+        // Blocked = awaiting the human, not the block's creator.
+        WaitingOn::Blocked { .. } => "human".to_string(),
+        w => waiting_actor(w),
     }
 }
 
@@ -231,14 +269,6 @@ fn emoji_of(w: &WaitingOn) -> &'static str {
     }
 }
 
-fn actor_of(v: &PlanWorkState) -> String {
-    match &v.waiting_on {
-        // Blocked = awaiting the human, not the block's creator.
-        WaitingOn::Blocked { .. } => "human".to_string(),
-        w => waiting_actor(w),
-    }
-}
-
 fn verb_of(w: &WaitingOn) -> &'static str {
     match w {
         WaitingOn::ReviewerApprovalsMissing { .. } => "reviewing",
@@ -249,6 +279,57 @@ fn verb_of(w: &WaitingOn) -> &'static str {
         WaitingOn::MasterToFinalize => "finalizing",
         WaitingOn::Blocked { .. } => "blocked",
     }
+}
+
+/// First line of a block question, for the `ask` gauge.
+fn first_line(s: &str) -> String {
+    s.trim_start().split('\n').next().unwrap_or("").to_string()
+}
+
+// ── span emission (width math + ANSI) ───────────────────────
+
+/// Serialize spans to one ANSI line, truncated to `cols` display
+/// columns with `…`. Truncation happens on the PLAIN text span by
+/// span — an escape can never be split, and a dropped span drops
+/// its styling with it.
+fn emit(spans: &[Span], color: &str, cols: usize) -> String {
+    let mut out = String::new();
+    let mut used = 0;
+    for Span(style, text) in spans {
+        let remaining = cols.saturating_sub(used);
+        if remaining == 0 {
+            break;
+        }
+        let piece = truncate_to(text, remaining);
+        used += display_width(&piece);
+        let truncated_here = piece.ends_with('…') && !text.ends_with('…');
+        match style {
+            Style::Plain => out.push_str(&piece),
+            Style::Dim => out.push_str(&format!("\x1b[2m{piece}\x1b[0m")),
+            Style::Accent => out.push_str(&format!("\x1b[{color}m{piece}\x1b[0m")),
+        }
+        if truncated_here {
+            break;
+        }
+    }
+    out
+}
+
+/// Display columns a char occupies in the terminal. Not a full
+/// unicode-width implementation: rendered content is validated
+/// ASCII (plan stems, agent labels, gate names) plus the fixed
+/// status emoji set — so "emoji plane → 2, else 1" is exact for
+/// everything we draw, with zero new deps.
+fn char_width(c: char) -> usize {
+    if ('\u{1F000}'..='\u{1FAFF}').contains(&c) {
+        2
+    } else {
+        1
+    }
+}
+
+fn display_width(s: &str) -> usize {
+    s.chars().map(char_width).sum()
 }
 
 /// Truncate to `cols` DISPLAY columns with a `…` ellipsis.
@@ -420,26 +501,6 @@ mod tests {
         }
     }
 
-    /// Visible text of a line: ANSI escape sequences removed,
-    /// banner padding trimmed. Tests pin what the EYE sees.
-    fn visible(line: &str) -> String {
-        let mut out = String::new();
-        let mut chars = line.chars();
-        while let Some(c) = chars.next() {
-            if c == '\x1b' {
-                // skip to the terminating `m` of the CSI sequence
-                for e in chars.by_ref() {
-                    if e == 'm' {
-                        break;
-                    }
-                }
-            } else {
-                out.push(c);
-            }
-        }
-        out.trim_end().to_string()
-    }
-
     fn snap(plans: Vec<PlanWorkState>, queue: Vec<&str>) -> StatusSnapshot {
         StatusSnapshot {
             repo_path: "/r".into(),
@@ -456,110 +517,14 @@ mod tests {
         }
     }
 
-    #[test]
-    fn one_row_always_renders_active_agent() {
-        // THE invariant: even at 1 row the active-agent headline
-        // renders (ruthless 9d01e47 concern 1).
-        let s = snap(vec![plan_state("foo", reviewer_missing("codex"))], vec![]);
-        let lines = render(&s, 1, 80);
-        assert_eq!(lines.len(), 1);
-        assert_eq!(
-            visible(&lines[0]),
-            "👀 CODEX — reviewing — foo @ unreviewed"
-        );
-    }
-
-    #[test]
-    fn idle_renders_idle_even_at_one_row() {
-        // Truly idle: no plans AND empty queue.
-        let s = snap(vec![], vec![]);
-        assert_eq!(visible(&render(&s, 1, 80)[0]), "💤 idle");
-    }
-
-    #[test]
-    fn no_plan_with_queue_names_master_and_next_promote() {
-        // lloyd (reopen round): no active plan + non-empty queue is
-        // MASTER's turn — promote the next item. The headline must
-        // name the agent we're waiting on, not say `idle`.
-        let s = snap(vec![], vec!["zellij-layout", "wfw-hint"]);
-        let lines = render(&s, 1, 80);
-        assert_eq!(
-            visible(&lines[0]),
-            "📋 CLAUDE — promote — zellij-layout (2 queued)"
-        );
-    }
-
-    #[test]
-    fn no_plan_with_queue_and_no_team_falls_back_to_master() {
-        // Render path degrades on a teamless repo: no resolved
-        // master label → the role name.
-        let mut s = snap(vec![], vec!["zellij-layout"]);
-        s.master = None;
-        let lines = render(&s, 1, 80);
-        assert_eq!(
-            visible(&lines[0]),
-            "📋 MASTER — promote — zellij-layout (1 queued)"
-        );
-    }
-
-    #[test]
-    fn two_plans_get_deterministic_count_headline() {
-        // Concern 2: N>1 active plans → count + actor(plan) pairs
-        // in snapshot order. Exact string pinned.
-        let s = snap(
-            vec![
-                plan_state("alpha", reviewer_missing("codex")),
-                plan_state("beta", WaitingOn::MasterToContinue),
-            ],
-            vec![],
-        );
-        let lines = render(&s, 1, 80);
-        assert_eq!(visible(&lines[0]), "🔀 2 plans: CODEX(alpha), MASTER(beta)");
-    }
-
-    #[test]
-    fn width_truncates_every_line_with_ellipsis() {
-        let s = snap(
-            vec![plan_state(
-                "a-very-long-plan-name-that-will-not-fit",
-                reviewer_missing("codex"),
-            )],
-            vec!["another-quite-long-queued-name"],
-        );
-        let lines = render(&s, 24, 10);
-        // Measure visible DISPLAY width (emoji are 2 cols): char
-        // count was the exact blind spot that let the banner
-        // overflow the pane by one column (ruthless 1fee586 +
-        // lloyd's real-pane repro).
-        for line in &lines {
-            assert!(
-                display_width(visible(line).trim_end()) <= 10,
-                "line wider than 10 display cols: `{line}`"
-            );
-        }
-        assert!(
-            visible(&lines[0]).ends_with('…'),
-            "truncated headline ends with ellipsis"
-        );
-    }
-
-    #[test]
-    fn banner_padding_fills_exactly_to_display_width() {
-        // The full-width reverse-video banner must be EXACTLY cols
-        // display-wide — one more wraps the background to the next
-        // line (the bug lloyd hit). Don't trim padding here: the
-        // emoji (2 cols) + text + pad must sum to cols precisely.
-        let s = snap(vec![plan_state("foo", reviewer_missing("codex"))], vec![]);
-        let lines = render(&s, 1, 60);
-        assert_eq!(
-            display_width(&visible_untrimmed(&lines[0])),
-            60,
-            "banner visible display width must equal cols exactly"
-        );
+    /// Visible text: ANSI escapes removed, trailing pad trimmed.
+    /// Tests pin what the EYE sees.
+    fn visible(line: &str) -> String {
+        visible_untrimmed(line).trim_end().to_string()
     }
 
     /// `visible` without the trailing-pad trim — for asserting the
-    /// banner's exact padded width.
+    /// bar's exact padded width.
     fn visible_untrimmed(line: &str) -> String {
         let mut out = String::new();
         let mut chars = line.chars();
@@ -578,69 +543,200 @@ mod tests {
     }
 
     #[test]
-    fn greedy_fit_drops_queue_when_rows_exhausted() {
-        // Tiers 1-3 take 3 rows; the queue tier needs 2 more
-        // (header + ≥1 item). At 3 and 4 rows it must not render a
-        // bare header; at 5 it appears.
+    fn one_row_always_renders_active_agent_bar() {
+        // THE invariant: even at 1 row the who's-active bar renders
+        // (ruthless 9d01e47 concern 1) — actor + verb left, plan
+        // right.
+        let s = snap(vec![plan_state("foo", reviewer_missing("codex"))], vec![]);
+        let lines = render(&s, 1, 40);
+        assert_eq!(lines.len(), 1);
+        let v = visible(&lines[0]);
+        assert!(v.starts_with("👀 CODEX reviewing"), "got `{v}`");
+        assert!(v.ends_with("foo"), "plan stem right-aligned; got `{v}`");
+    }
+
+    #[test]
+    fn bar_drops_right_segment_when_too_narrow() {
+        let s = snap(
+            vec![plan_state(
+                "a-very-long-plan-name-that-will-not-fit",
+                reviewer_missing("codex"),
+            )],
+            vec![],
+        );
+        let v = visible(&render(&s, 1, 20)[0]);
+        assert_eq!(v, "👀 CODEX reviewing", "left segment only; got `{v}`");
+    }
+
+    #[test]
+    fn idle_renders_idle_even_at_one_row() {
+        // Truly idle: no plans AND empty queue.
+        let s = snap(vec![], vec![]);
+        assert_eq!(visible(&render(&s, 1, 80)[0]), "💤 idle");
+    }
+
+    #[test]
+    fn no_plan_with_queue_names_master_and_next_promote() {
+        // lloyd (reopen round): no active plan + non-empty queue is
+        // MASTER's turn — promote. Names the agent; queue head on
+        // the right with the remainder count.
+        let s = snap(vec![], vec!["zellij-layout", "wfw-hint"]);
+        let v = visible(&render(&s, 1, 60)[0]);
+        assert!(v.starts_with("📋 CLAUDE promote"), "got `{v}`");
+        assert!(v.ends_with("zellij-layout +1"), "got `{v}`");
+    }
+
+    #[test]
+    fn no_plan_with_queue_and_no_team_falls_back_to_master() {
+        let mut s = snap(vec![], vec!["zellij-layout"]);
+        s.master = None;
+        let v = visible(&render(&s, 1, 60)[0]);
+        assert!(v.starts_with("📋 MASTER promote"), "got `{v}`");
+    }
+
+    #[test]
+    fn single_plan_body_states_each_fact_once() {
+        // The bar names actor+verb+plan; the body must NOT repeat
+        // them — gate line carries state + sha, git line the repo.
+        let s = snap(
+            vec![plan_state("foo", reviewer_missing("codex"))],
+            vec!["q1"],
+        );
+        let lines = render(&s, 8, 60);
+        let texts: Vec<String> = lines.iter().map(|l| visible(l)).collect();
+        assert_eq!(texts[1], "", "breath line under the bar");
+        assert_eq!(texts[2], " gate  unreviewed @ abc1230");
+        assert_eq!(texts[3], " next  q1");
+        assert_eq!(texts[4], "  git  master deadbee");
+        // No body line repeats the actor or the plan stem.
+        for t in &texts[1..] {
+            assert!(!t.contains("codex") && !t.contains("foo"), "repeat: `{t}`");
+        }
+    }
+
+    #[test]
+    fn width_truncates_every_line_by_display_width() {
+        let s = snap(
+            vec![plan_state(
+                "a-very-long-plan-name-that-will-not-fit",
+                reviewer_missing("codex"),
+            )],
+            vec!["another-quite-long-queued-name"],
+        );
+        let lines = render(&s, 24, 10);
+        for line in &lines {
+            assert!(
+                display_width(visible(line).trim_end()) <= 10,
+                "line wider than 10 display cols: `{line}`"
+            );
+        }
+    }
+
+    #[test]
+    fn bar_padding_fills_exactly_to_display_width() {
+        // The reverse-video bar must be EXACTLY cols display-wide —
+        // one more wraps the background (the bug lloyd hit live).
+        let s = snap(vec![plan_state("foo", reviewer_missing("codex"))], vec![]);
+        for cols in [9, 20, 39, 60] {
+            let lines = render(&s, 1, cols);
+            assert_eq!(
+                display_width(&visible_untrimmed(&lines[0])),
+                cols as usize,
+                "bar must be exactly {cols} display cols"
+            );
+        }
+    }
+
+    #[test]
+    fn tiny_pane_keeps_bar_and_gate_before_queue() {
+        // Greedy order: bar, gate; the queue summary only once
+        // there's room (no breath line below 4 rows).
         let s = snap(
             vec![plan_state("foo", reviewer_missing("codex"))],
             vec!["q1", "q2"],
         );
-        let at3 = render(&s, 3, 80);
-        assert!(
-            !at3.iter().any(|l| l.starts_with("queued")),
-            "no queue tier at 3 rows: {at3:?}"
-        );
-        let at5 = render(&s, 5, 80);
-        assert!(
-            at5.iter().any(|l| l.starts_with("queued (2):")),
-            "queue header at 5 rows: {at5:?}"
-        );
-        assert!(at5.iter().any(|l| l.contains("1. q1")));
+        let texts: Vec<String> = render(&s, 2, 60).iter().map(|l| visible(l)).collect();
+        assert!(texts[1].starts_with(" gate"), "got {texts:?}");
+        let texts: Vec<String> = render(&s, 3, 60).iter().map(|l| visible(l)).collect();
+        assert!(texts[2].starts_with(" next  q1 +1"), "got {texts:?}");
     }
 
     #[test]
-    fn queue_names_render_in_priority_order_as_space_allows() {
+    fn tall_pane_expands_queue_block() {
         let s = snap(
             vec![plan_state("foo", reviewer_missing("codex"))],
-            vec!["first", "second", "third", "fourth"],
+            vec!["first", "second", "third"],
         );
-        // 5 rows: 3 tiers + header + exactly ONE queue item.
-        let lines = render(&s, 5, 80);
-        assert_eq!(lines[3], "queued (4):");
-        assert_eq!(lines[4], "  1. first");
-        // 7 rows: three items fit.
-        let lines = render(&s, 7, 80);
-        assert_eq!(lines[6], "  3. third");
+        let texts: Vec<String> = render(&s, 14, 60).iter().map(|l| visible(l)).collect();
+        let qi = texts
+            .iter()
+            .position(|t| t.starts_with("queue  first"))
+            .expect("queue block header");
+        assert_eq!(texts[qi + 1].trim(), "second");
+        assert_eq!(texts[qi + 2].trim(), "third");
+        assert!(
+            !texts.iter().any(|t| t.contains("next")),
+            "summary line replaced by block"
+        );
     }
 
     #[test]
-    fn blocked_plan_headline_awaits_human() {
+    fn blocked_plan_bar_names_human_and_ask_carries_question() {
         use clank_core::plan_view::PlanBlock;
-        let s = snap(
+        let mut s = snap(
             vec![plan_state(
                 "foo",
                 WaitingOn::Blocked {
                     block: PlanBlock {
                         creator: AgentLabel::parse("claude").unwrap(),
                         name: "q".into(),
-                        message: "is this right?".into(),
+                        message: "is this right?\nmore detail".into(),
                     },
                 },
             )],
             vec![],
         );
-        let lines = render(&s, 1, 80);
-        assert_eq!(visible(&lines[0]), "🙋 HUMAN — blocked — foo @ unreviewed");
+        s.blocks = vec![crate::cli::block::BlockEntry {
+            agent: "claude".into(),
+            name: "q".into(),
+            plan: None,
+            question: "is this right?\nmore detail".into(),
+            answer: None,
+        }];
+        let texts: Vec<String> = render(&s, 6, 60).iter().map(|l| visible(l)).collect();
+        assert!(texts[0].starts_with("🙋 HUMAN blocked"), "got {texts:?}");
+        assert_eq!(texts[2], "  ask  is this right?");
     }
 
     #[test]
-    fn extras_render_branch_line_when_space() {
-        let s = snap(vec![plan_state("foo", reviewer_missing("codex"))], vec![]);
-        let lines = render(&s, 24, 80);
+    fn two_plans_get_count_bar_and_per_plan_lines() {
+        let s = snap(
+            vec![
+                plan_state("alpha", reviewer_missing("codex")),
+                plan_state("beta", WaitingOn::MasterToContinue),
+            ],
+            vec![],
+        );
+        let texts: Vec<String> = render(&s, 8, 60).iter().map(|l| visible(l)).collect();
+        assert!(texts[0].starts_with("🔀 2 ACTIVE"), "got {texts:?}");
+        assert_eq!(texts[2], "👀 codex  alpha  unreviewed");
+        assert_eq!(texts[3], "🔨 master  beta  unreviewed");
+    }
+
+    #[test]
+    fn idle_with_done_shows_last_finished() {
+        use clank_core::repo_state::FinishedPlan;
+        let mut s = snap(vec![], vec![]);
+        s.last_finished = Some(FinishedPlan {
+            plan: PlanKey::parse("old-plan").unwrap(),
+            intro: CommitSha::parse(&format!("{:0<40}", "aa")).unwrap(),
+            finalized_at: CommitSha::parse(&format!("{:0<40}", "bb")).unwrap(),
+        });
+        let texts: Vec<String> = render(&s, 6, 60).iter().map(|l| visible(l)).collect();
+        assert_eq!(texts[0], "💤 idle");
         assert!(
-            lines.iter().any(|l| l.starts_with("branch: master @ ")),
-            "extras tier shows branch/head: {lines:?}"
+            texts.iter().any(|t| t.starts_with(" done  old-plan @ ")),
+            "got {texts:?}"
         );
     }
 }
