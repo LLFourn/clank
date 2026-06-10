@@ -32,6 +32,10 @@ pub struct StatusSnapshot {
     /// counts everywhere else derive from it). Plan:
     /// clank-status-tui.
     pub(crate) queue: Vec<String>,
+    /// The team's master label, when a team resolves (render path:
+    /// degrades to None on a teamless repo). The TUI's idle+queue
+    /// headline names master as the agent whose turn it is.
+    pub(crate) master: Option<String>,
 }
 
 /// In-process convenience for tests / callers that want a status
@@ -88,8 +92,26 @@ impl StatusSnapshot {
         // empty reviewer tiers → gate computes as zero-reviewer
         // (Approved). It never hard-errors the way the
         // workflow-driving commands (wfw / finish / promote) do.
-        let (commit_reviewers, gate_reviewers) =
-            crate::agent_store::reviewer_tiers_for_render_with(repo, home);
+        let registered = crate::agent_store::try_resolve_via_team_with(repo, home)
+            .ok()
+            .flatten();
+        let master = registered
+            .as_ref()
+            .map(|set| set.master.as_str().to_string());
+        let (commit_reviewers, gate_reviewers) = registered
+            .map(|set| {
+                (
+                    set.commit_reviewers
+                        .into_iter()
+                        .map(|a| a.label)
+                        .collect::<Vec<_>>(),
+                    set.gate_reviewers
+                        .into_iter()
+                        .map(|a| a.label)
+                        .collect::<Vec<_>>(),
+                )
+            })
+            .unwrap_or_default();
         let work_policy = clank_core::wait::WorkPolicy {
             plan_feedback: config.review.plan_feedback,
             adhoc_feedback: config.review.adhoc_feedback,
@@ -128,6 +150,7 @@ impl StatusSnapshot {
             last_finished,
             blocks,
             queue,
+            master,
         })
     }
 

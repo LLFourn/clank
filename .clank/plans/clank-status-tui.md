@@ -198,6 +198,21 @@ the start (per the testing rule: test the subroutines the CLI
 calls, never spawn the binary). No TUI test was deleted; nothing
 needs re-pinning.
 
+REOPENED (lloyd 2026-06-10): with no active plan the headline
+said just `idle`, but a non-empty queue means it IS somebody's
+turn — master's, to promote the next item. The tier-1 headline
+must always name whose turn it is:
+
+- no plans + non-empty queue →
+  `* {master} — promote — {next-queue-item} ({N} queued)`
+- `idle` reserved for truly idle (no plans AND empty queue).
+
+Snapshot gains `master: Option<String>` from the same
+`try_resolve_via_team_with` resolution that already supplies the
+reviewer tiers (one call now provides master + both tiers;
+render-degrades to None → headline falls back to the role name
+`master` on a teamless repo). Tests pin both headlines.
+
 Originally queued lloyd 2026-06-09: live read-only status
 dashboard for a zellij pane; must stay useful when tiny — always
 show the active agent — and progressively reveal current plan,

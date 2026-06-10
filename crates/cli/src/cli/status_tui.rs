@@ -119,8 +119,21 @@ pub(crate) fn render(snap: &StatusSnapshot, rows: u16, cols: u16) -> Vec<String>
 /// `actor(plan)` pairs in snapshot order (lexicographic by plan
 /// key, since `derive_status` folds a BTreeMap); width truncation
 /// trims the tail.
+///
+/// No active plan but a non-empty queue is still somebody's turn
+/// — MASTER's, to promote the next item (lloyd, reopen round):
+/// the headline names the master label and the head of the queue.
+/// `idle` is reserved for truly idle (no plans AND empty queue).
 fn headline(snap: &StatusSnapshot) -> String {
     match snap.plans.as_slice() {
+        [] if !snap.queue.is_empty() => {
+            let master = snap.master.as_deref().unwrap_or("master");
+            format!(
+                "* {master} — promote — {} ({} queued)",
+                snap.queue[0],
+                snap.queue.len()
+            )
+        }
         [] => "idle".to_string(),
         [v] => format!(
             "* {} — {} — {} @ {}",
@@ -329,6 +342,7 @@ mod tests {
             last_finished: None,
             blocks: Vec::new(),
             queue: queue.into_iter().map(str::to_string).collect(),
+            master: Some("claude".into()),
         }
     }
 
@@ -344,8 +358,29 @@ mod tests {
 
     #[test]
     fn idle_renders_idle_even_at_one_row() {
+        // Truly idle: no plans AND empty queue.
         let s = snap(vec![], vec![]);
         assert_eq!(render(&s, 1, 80), vec!["idle".to_string()]);
+    }
+
+    #[test]
+    fn no_plan_with_queue_names_master_and_next_promote() {
+        // lloyd (reopen round): no active plan + non-empty queue is
+        // MASTER's turn — promote the next item. The headline must
+        // name the agent we're waiting on, not say `idle`.
+        let s = snap(vec![], vec!["zellij-layout", "wfw-hint"]);
+        let lines = render(&s, 1, 80);
+        assert_eq!(lines[0], "* claude — promote — zellij-layout (2 queued)");
+    }
+
+    #[test]
+    fn no_plan_with_queue_and_no_team_falls_back_to_master() {
+        // Render path degrades on a teamless repo: no resolved
+        // master label → the role name.
+        let mut s = snap(vec![], vec!["zellij-layout"]);
+        s.master = None;
+        let lines = render(&s, 1, 80);
+        assert_eq!(lines[0], "* master — promote — zellij-layout (1 queued)");
     }
 
     #[test]
