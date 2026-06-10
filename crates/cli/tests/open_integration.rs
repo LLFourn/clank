@@ -463,10 +463,14 @@ fn init_needed_when_post_rewrite_hook_absent() {
 
 #[test]
 fn legacy_clank_gitignore_is_init_gap() {
+    // Legacy under the SET model (ruthless 02da305) = a managed
+    // SUBSET (repairable by appending). The old unanchored
+    // spellings ("feedback/\ncache/\n") are foreign lines now —
+    // Drifted, covered by the foreign-content test below.
     let home = tempfile::tempdir().unwrap();
     let dir = init_repo();
     let repo = dir.path();
-    write(repo, ".clank/.gitignore", "feedback/\ncache/\n");
+    write(repo, ".clank/.gitignore", "/agents/\n/cache/\n");
     let v = run_open(repo, home.path());
     let gaps = gap_kinds(&v);
     assert!(

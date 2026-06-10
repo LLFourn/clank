@@ -21,9 +21,8 @@ use anyhow::Context;
 use super::{InitArgs, resolve_repo};
 
 use crate::init_facts::{
-    CLANK_GITIGNORE_BODY as GITIGNORE_BODY,
-    CLANK_GITIGNORE_LEGACY_BODIES as LEGACY_GITIGNORE_BODIES, CLAUDE_ALLOW_RULES,
-    POST_REWRITE_BODY, POST_REWRITE_MARKER,
+    CLANK_GITIGNORE_ENTRIES, CLAUDE_ALLOW_RULES, POST_REWRITE_BODY, POST_REWRITE_MARKER,
+    clank_gitignore_body, classify_gitignore_body,
 };
 
 /// `clank init` is pure repo setup: scaffold `.clank/`, install
@@ -191,25 +190,43 @@ fn write_scaffold(repo: &Path) -> anyhow::Result<()> {
     std::fs::create_dir_all(&plans_dir)?;
 
     let gitignore = clank_dir.join(".gitignore");
+    // SET-membership model (ruthless 02da305): three commands
+    // mutate this file (init, fork's /worktrees/ ensure, open
+    // zellij's /zellij/ ensure), so validation is "every managed
+    // entry present, nothing foreign" — order-irrelevant — and
+    // repair APPENDS the missing entries rather than rewriting,
+    // so an incrementally-appended file can never wedge a later
+    // init.
     match std::fs::read_to_string(&gitignore) {
-        Ok(existing) if existing == GITIGNORE_BODY => {
-            println!("{} already up to date", gitignore.display());
-        }
-        Ok(existing) if LEGACY_GITIGNORE_BODIES.contains(&existing.as_str()) => {
-            // Known prior content — silently upgrade.
-            std::fs::write(&gitignore, GITIGNORE_BODY)?;
-            println!("upgraded {}", gitignore.display());
-        }
-        Ok(_existing) => {
-            anyhow::bail!(
-                "{} exists with different content; refusing to overwrite. \
-                 Inspect it, delete it, or edit it to match the documented content:\n{}",
-                gitignore.display(),
-                GITIGNORE_BODY
-            );
-        }
+        Ok(existing) => match classify_gitignore_body(&existing) {
+            crate::init_facts::GitignoreState::Canonical => {
+                println!("{} already up to date", gitignore.display());
+            }
+            crate::init_facts::GitignoreState::Legacy => {
+                let mut body = existing;
+                if !body.is_empty() && !body.ends_with('\n') {
+                    body.push('\n');
+                }
+                for entry in CLANK_GITIGNORE_ENTRIES {
+                    if !body.lines().any(|l| l.trim() == *entry) {
+                        body.push_str(entry);
+                        body.push('\n');
+                    }
+                }
+                std::fs::write(&gitignore, body)?;
+                println!("upgraded {}", gitignore.display());
+            }
+            _ => {
+                anyhow::bail!(
+                    "{} contains unmanaged content; refusing to overwrite. \
+                     Inspect it, delete it, or reduce it to the managed entries:\n{}",
+                    gitignore.display(),
+                    clank_gitignore_body()
+                );
+            }
+        },
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            std::fs::write(&gitignore, GITIGNORE_BODY)?;
+            std::fs::write(&gitignore, clank_gitignore_body())?;
             println!("wrote {}", gitignore.display());
         }
         Err(e) => return Err(e.into()),
@@ -447,7 +464,7 @@ mod tests {
         write_scaffold(dir.path()).unwrap();
         assert!(dir.path().join(".clank/plans").is_dir());
         let body = std::fs::read_to_string(dir.path().join(".clank/.gitignore")).unwrap();
-        assert_eq!(body, GITIGNORE_BODY);
+        assert_eq!(body, clank_gitignore_body());
         // Sanity: anchored patterns blanket the per-agent subtree.
         assert!(body.contains("/agents/"));
         assert!(body.contains("/feedback/"));
@@ -460,19 +477,63 @@ mod tests {
         write_scaffold(dir.path()).unwrap();
         write_scaffold(dir.path()).unwrap();
         let body = std::fs::read_to_string(dir.path().join(".clank/.gitignore")).unwrap();
-        assert_eq!(body, GITIGNORE_BODY);
+        assert_eq!(body, clank_gitignore_body());
     }
 
     #[test]
-    fn writes_scaffold_upgrades_legacy_body() {
+    fn writes_scaffold_repairs_subset_by_appending() {
+        // SET model (ruthless 02da305): a managed subset is
+        // repaired by APPENDING the missing entries — existing
+        // order preserved, result classifies Canonical.
         let dir = init_repo();
         let gitignore = dir.path().join(".clank/.gitignore");
         std::fs::create_dir_all(gitignore.parent().unwrap()).unwrap();
-        // Seed with the legacy body that pre-dated task #265.
-        std::fs::write(&gitignore, "feedback/\ncache/\n").unwrap();
+        std::fs::write(&gitignore, "/cache/\n/agents/\n").unwrap();
         write_scaffold(dir.path()).unwrap();
         let body = std::fs::read_to_string(&gitignore).unwrap();
-        assert_eq!(body, GITIGNORE_BODY);
+        assert!(
+            body.starts_with("/cache/\n/agents/\n"),
+            "order preserved: {body}"
+        );
+        assert_eq!(
+            classify_gitignore_body(&body),
+            crate::init_facts::GitignoreState::Canonical
+        );
+    }
+
+    #[test]
+    fn writes_scaffold_survives_incremental_appends() {
+        // THE ruthless 02da305 repro: a pre-/worktrees/ repo gets
+        // `clank fork`'s append, then a later `clank init` must
+        // REPAIR (append the rest), not bail "refusing to
+        // overwrite" — append-by-entry and validate-by-set are now
+        // the same model.
+        let dir = init_repo();
+        let gitignore = dir.path().join(".clank/.gitignore");
+        std::fs::create_dir_all(gitignore.parent().unwrap()).unwrap();
+        std::fs::write(
+            &gitignore,
+            "/agents/\n/cache/\n/feedback/\n/queue/\n/html/\n",
+        )
+        .unwrap();
+        crate::init_facts::ensure_clank_gitignore_entry(dir.path(), "/worktrees/").unwrap();
+        write_scaffold(dir.path()).expect("init must repair, not bail");
+        let body = std::fs::read_to_string(&gitignore).unwrap();
+        assert_eq!(
+            classify_gitignore_body(&body),
+            crate::init_facts::GitignoreState::Canonical
+        );
+    }
+
+    #[test]
+    fn writes_scaffold_bails_on_foreign_content() {
+        // Unmanaged lines (incl. truly ancient unanchored
+        // spellings) are user content we refuse to clobber.
+        let dir = init_repo();
+        let gitignore = dir.path().join(".clank/.gitignore");
+        std::fs::create_dir_all(gitignore.parent().unwrap()).unwrap();
+        std::fs::write(&gitignore, "feedback/\ncache/\n").unwrap();
+        assert!(write_scaffold(dir.path()).is_err());
     }
 
     #[test]
@@ -698,7 +759,7 @@ mod tests {
         std::fs::write(dir.path().join(".clank/.gitignore"), "something/else\n").unwrap();
         let err = write_scaffold(dir.path()).unwrap_err();
         let msg = format!("{err}");
-        assert!(msg.contains("different content"), "unexpected error: {msg}");
+        assert!(msg.contains("unmanaged content"), "unexpected error: {msg}");
         let body = std::fs::read_to_string(dir.path().join(".clank/.gitignore")).unwrap();
         assert_eq!(
             body, "something/else\n",

@@ -62,7 +62,7 @@ fn source_with_bound_team() -> TestEnv {
     write(
         repo,
         ".clank/.gitignore",
-        clank::init_facts::CLANK_GITIGNORE_BODY,
+        &clank::init_facts::clank_gitignore_body(),
     );
     write(repo, "src/lib.rs", "// base\n");
     commit(repo, "[misc] base");

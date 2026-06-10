@@ -6,26 +6,42 @@
 
 use std::path::{Path, PathBuf};
 
-/// Canonical body of `.clank/.gitignore`. Everything local-only
-/// lives here: agent state, caches, the queue, rendered html,
+/// The managed entries of `.clank/.gitignore` — everything
+/// local-only: agent state, caches, the queue, rendered html,
 /// shelved-plan state (plan-lifecycle-verbs), fork worktrees
-/// (clank-fork-worktree-sessions — codex 335c0fc caught the
-/// default location not being covered), and generated zellij
-/// layouts.
-pub const CLANK_GITIGNORE_BODY: &str =
-    "/agents/\n/cache/\n/feedback/\n/queue/\n/html/\n/shelved/\n/worktrees/\n/zellij/\n";
-
-/// Older bodies init silently upgrades to `CLANK_GITIGNORE_BODY`.
-/// Anything else makes init bail.
-pub const CLANK_GITIGNORE_LEGACY_BODIES: &[&str] = &[
-    "/agents/\n/cache/\n/feedback/\n/queue/\n/html/\n",
-    "/agents/\n/cache/\n/feedback/\n/queue/\n/html/\n/zellij/\n",
-    "/agents/\n/cache/\n/feedback/\n/queue/\n",
-    "/agents/\n/cache/\n/feedback/\n",
-    "feedback/\ncache/\n",
-    "feedback/\ncache/\nagents/*/config.json\n",
-    "/feedback/\n/cache/\nagents/*/config.json\n",
+/// (clank-fork-worktree-sessions), generated zellij layouts.
+///
+/// The file is validated and repaired by SET MEMBERSHIP, not
+/// exact string match (ruthless 02da305): three commands mutate
+/// it (init writes/repairs; fork ensures `/worktrees/`;
+/// open zellij ensures `/zellij/`), so order-insensitive
+/// "contains every managed entry, nothing foreign" is the only
+/// model under which incremental appends can't drift the file
+/// out of recognition. This also killed the combinatorial
+/// legacy-bodies list (every new entry demanded enumerating its
+/// subset x ordering permutations — which is exactly how
+/// /shelved/ slipped).
+pub const CLANK_GITIGNORE_ENTRIES: &[&str] = &[
+    "/agents/",
+    "/cache/",
+    "/feedback/",
+    "/queue/",
+    "/html/",
+    "/shelved/",
+    "/worktrees/",
+    "/zellij/",
 ];
+
+/// Canonical WRITE form for fresh files: the managed entries,
+/// one per line, in `CLANK_GITIGNORE_ENTRIES` order.
+pub fn clank_gitignore_body() -> String {
+    let mut out = String::new();
+    for e in CLANK_GITIGNORE_ENTRIES {
+        out.push_str(e);
+        out.push('\n');
+    }
+    out
+}
 
 /// Marker line embedded in the canonical post-rewrite hook so we
 /// can recognize our own across re-runs.
@@ -94,19 +110,31 @@ pub enum GitignoreState {
 
 pub fn classify_clank_gitignore(repo: &Path) -> GitignoreState {
     match std::fs::read_to_string(clank_gitignore_path(repo)) {
-        Ok(body) if body == CLANK_GITIGNORE_BODY => GitignoreState::Canonical,
-        Ok(body)
-            if CLANK_GITIGNORE_LEGACY_BODIES
-                .iter()
-                .any(|legacy| *legacy == body) =>
-        {
-            GitignoreState::Legacy
-        }
-        Ok(_) => GitignoreState::Drifted,
+        Ok(body) => classify_gitignore_body(&body),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => GitignoreState::Missing,
         // Permission errors / IO errors: treat as drifted so we
         // surface a warning rather than silently claim Ready.
         Err(_) => GitignoreState::Drifted,
+    }
+}
+
+/// Set-membership classification (pure): every non-empty line
+/// must be a managed entry (else Drifted — foreign content we
+/// won't touch); all managed entries present → Canonical (order
+/// irrelevant); some missing → Legacy (repairable by appending).
+pub fn classify_gitignore_body(body: &str) -> GitignoreState {
+    let lines: Vec<&str> = body
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .collect();
+    if lines.iter().any(|l| !CLANK_GITIGNORE_ENTRIES.contains(l)) {
+        return GitignoreState::Drifted;
+    }
+    if CLANK_GITIGNORE_ENTRIES.iter().all(|e| lines.contains(e)) {
+        GitignoreState::Canonical
+    } else {
+        GitignoreState::Legacy
     }
 }
 
@@ -233,7 +261,7 @@ mod tests {
     fn classify_clank_gitignore_canonical() {
         let dir = tempdir();
         std::fs::create_dir_all(dir.path().join(".clank")).unwrap();
-        std::fs::write(clank_gitignore_path(dir.path()), CLANK_GITIGNORE_BODY).unwrap();
+        std::fs::write(clank_gitignore_path(dir.path()), clank_gitignore_body()).unwrap();
         assert_eq!(
             classify_clank_gitignore(dir.path()),
             GitignoreState::Canonical
@@ -242,14 +270,54 @@ mod tests {
 
     #[test]
     fn classify_clank_gitignore_legacy() {
+        // SET model: a subset of managed entries (any order) is
+        // Legacy/repairable.
         let dir = tempdir();
         std::fs::create_dir_all(dir.path().join(".clank")).unwrap();
         std::fs::write(
             clank_gitignore_path(dir.path()),
-            CLANK_GITIGNORE_LEGACY_BODIES[0],
+            "/cache/\n/agents/\n/worktrees/\n",
         )
         .unwrap();
         assert_eq!(classify_clank_gitignore(dir.path()), GitignoreState::Legacy);
+    }
+
+    #[test]
+    fn ensure_entry_appends_and_is_idempotent() {
+        // The shared single-entry ensure (fork: /worktrees/,
+        // open zellij: /zellij/) — append once, never duplicate,
+        // create the file when missing.
+        let dir = tempdir();
+        ensure_clank_gitignore_entry(dir.path(), "/zellij/").unwrap();
+        ensure_clank_gitignore_entry(dir.path(), "/zellij/").unwrap();
+        let body = std::fs::read_to_string(clank_gitignore_path(dir.path())).unwrap();
+        assert_eq!(body.matches("/zellij/").count(), 1, "{body}");
+
+        std::fs::write(clank_gitignore_path(dir.path()), "/agents/\n").unwrap();
+        ensure_clank_gitignore_entry(dir.path(), "/worktrees/").unwrap();
+        let body = std::fs::read_to_string(clank_gitignore_path(dir.path())).unwrap();
+        assert!(body.starts_with("/agents/\n"), "existing preserved: {body}");
+        assert!(body.contains("/worktrees/\n"), "appended: {body}");
+    }
+
+    #[test]
+    fn classify_gitignore_body_is_order_insensitive_and_set_based() {
+        // Canonical = all managed entries, ANY order.
+        let reversed: String = CLANK_GITIGNORE_ENTRIES
+            .iter()
+            .rev()
+            .map(|e| format!("{e}\n"))
+            .collect();
+        assert_eq!(
+            classify_gitignore_body(&reversed),
+            GitignoreState::Canonical
+        );
+        // A managed subset PLUS a foreign line = Drifted (foreign
+        // wins — we never touch user content).
+        assert_eq!(
+            classify_gitignore_body("/agents/\nmy-custom-thing\n"),
+            GitignoreState::Drifted
+        );
     }
 
     #[test]

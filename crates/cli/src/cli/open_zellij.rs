@@ -78,7 +78,8 @@ pub async fn run(args: OpenZellijArgs) -> anyhow::Result<()> {
     }
 
     write_layout_file(&repo, &kdl)?;
-    ensure_gitignore_zellij_entry(&repo)?;
+    crate::init_facts::ensure_clank_gitignore_entry(&repo, "/zellij/")
+        .context("ensuring /zellij/ gitignore entry")?;
 
     if let Some(pre) = &pre_argv {
         // Best-effort: a failed delete of a dead session just means
@@ -123,35 +124,6 @@ fn write_layout_file(repo: &Path, kdl: &str) -> anyhow::Result<PathBuf> {
     std::fs::rename(&tmp, &path)
         .with_context(|| format!("renaming `{}` → `{}`", tmp.display(), path.display()))?;
     Ok(path)
-}
-
-/// Idempotently ensure `<repo>/.clank/.gitignore` contains a
-/// `/zellij/` line so the generated layout file isn't tracked.
-fn ensure_gitignore_zellij_entry(repo: &Path) -> anyhow::Result<()> {
-    const ENTRY: &str = "/zellij/";
-    let path = repo.join(".clank/.gitignore");
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("creating `{}`", parent.display()))?;
-    }
-    let body = match std::fs::read_to_string(&path) {
-        Ok(s) => s,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
-        Err(e) => {
-            return Err(anyhow::Error::from(e).context(format!("reading `{}`", path.display())));
-        }
-    };
-    if body.lines().any(|l| l.trim() == ENTRY) {
-        return Ok(());
-    }
-    let mut new_body = body;
-    if !new_body.is_empty() && !new_body.ends_with('\n') {
-        new_body.push('\n');
-    }
-    new_body.push_str(ENTRY);
-    new_body.push('\n');
-    std::fs::write(&path, new_body).with_context(|| format!("writing `{}`", path.display()))?;
-    Ok(())
 }
 
 /// The marker node a template must contain; clank replaces it
@@ -766,43 +738,6 @@ mod tests {
     fn layout_file_path_is_under_clank_zellij_dir() {
         let p = layout_file_path(Path::new("/tmp/repo"));
         assert_eq!(p, Path::new("/tmp/repo/.clank/zellij/layout.kdl"));
-    }
-
-    #[test]
-    fn ensure_gitignore_creates_file_with_entry_when_missing() {
-        let dir = tempfile::tempdir().unwrap();
-        ensure_gitignore_zellij_entry(dir.path()).unwrap();
-        let body = std::fs::read_to_string(dir.path().join(".clank/.gitignore")).unwrap();
-        assert!(
-            body.lines().any(|l| l.trim() == "/zellij/"),
-            "expected /zellij/ in gitignore; got: {body:?}"
-        );
-    }
-
-    #[test]
-    fn ensure_gitignore_appends_entry_when_other_entries_exist() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::create_dir_all(dir.path().join(".clank")).unwrap();
-        std::fs::write(dir.path().join(".clank/.gitignore"), "/agents/\n/cache/\n").unwrap();
-        ensure_gitignore_zellij_entry(dir.path()).unwrap();
-        let body = std::fs::read_to_string(dir.path().join(".clank/.gitignore")).unwrap();
-        assert!(body.contains("/agents/"), "existing entries preserved");
-        assert!(body.contains("/cache/"));
-        assert!(body.contains("/zellij/"), "new entry appended");
-    }
-
-    #[test]
-    fn ensure_gitignore_is_idempotent_when_entry_already_present() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::create_dir_all(dir.path().join(".clank")).unwrap();
-        std::fs::write(dir.path().join(".clank/.gitignore"), "/zellij/\n").unwrap();
-        ensure_gitignore_zellij_entry(dir.path()).unwrap();
-        let body = std::fs::read_to_string(dir.path().join(".clank/.gitignore")).unwrap();
-        assert_eq!(
-            body.matches("/zellij/").count(),
-            1,
-            "second invocation must NOT add a duplicate entry; got body:\n{body}"
-        );
     }
 
     #[test]
