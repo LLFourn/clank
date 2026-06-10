@@ -110,7 +110,52 @@ pub(crate) fn render(snap: &StatusSnapshot, rows: u16, cols: u16) -> Vec<String>
     for line in &mut out {
         *line = truncate_to(line, cols);
     }
+    // Style the headline LAST, after truncation: ANSI escapes are
+    // zero-width, so styling first would corrupt the width math
+    // (and a truncation could split an escape). The banner is
+    // bold + reverse-video + color, padded to the full width —
+    // a loud who's-active bar at the top of the pane (lloyd).
+    if let Some(first) = out.first_mut() {
+        *first = style_banner(first, headline_color(snap), cols);
+    }
     out
+}
+
+/// ANSI color code for the headline banner, by who we're waiting
+/// on: red = a human must act (blocked), yellow = reviewers,
+/// green = master working a plan, cyan = master should promote,
+/// plain dim for truly idle.
+fn headline_color(snap: &StatusSnapshot) -> &'static str {
+    if snap
+        .plans
+        .iter()
+        .any(|v| matches!(v.waiting_on, WaitingOn::Blocked { .. }))
+    {
+        return "31"; // red
+    }
+    match snap.plans.as_slice() {
+        [] if !snap.queue.is_empty() => "36", // cyan: promote
+        [] => "2",                            // dim: idle
+        plans => {
+            let any_master = plans.iter().any(|v| {
+                matches!(
+                    v.waiting_on,
+                    WaitingOn::MasterToRevise { .. }
+                        | WaitingOn::MasterToContinue
+                        | WaitingOn::MasterToCommit
+                        | WaitingOn::MasterToFinalize
+                )
+            });
+            if any_master { "32" } else { "33" } // green / yellow
+        }
+    }
+}
+
+/// Bold + reverse-video + color, padded to `cols` so the banner
+/// spans the pane width.
+fn style_banner(text: &str, color: &str, cols: usize) -> String {
+    let pad = cols.saturating_sub(text.chars().count());
+    format!("\x1b[1;7;{color}m{text}{}\x1b[0m", " ".repeat(pad))
 }
 
 /// Tier-1 headline: whose turn is it to unblock progress.
@@ -129,15 +174,17 @@ fn headline(snap: &StatusSnapshot) -> String {
         [] if !snap.queue.is_empty() => {
             let master = snap.master.as_deref().unwrap_or("master");
             format!(
-                "* {master} — promote — {} ({} queued)",
+                "📋 {} — promote — {} ({} queued)",
+                master.to_uppercase(),
                 snap.queue[0],
                 snap.queue.len()
             )
         }
-        [] => "idle".to_string(),
+        [] => "💤 idle".to_string(),
         [v] => format!(
-            "* {} — {} — {} @ {}",
-            actor_of(v),
+            "{} {} — {} — {} @ {}",
+            emoji_of(&v.waiting_on),
+            actor_of(v).to_uppercase(),
             verb_of(&v.waiting_on),
             v.plan.as_str(),
             v.gate
@@ -145,10 +192,22 @@ fn headline(snap: &StatusSnapshot) -> String {
         many => {
             let pairs: Vec<String> = many
                 .iter()
-                .map(|v| format!("{}({})", actor_of(v), v.plan.as_str()))
+                .map(|v| format!("{}({})", actor_of(v).to_uppercase(), v.plan.as_str()))
                 .collect();
-            format!("* {} plans: {}", many.len(), pairs.join(", "))
+            format!("🔀 {} plans: {}", many.len(), pairs.join(", "))
         }
+    }
+}
+
+fn emoji_of(w: &WaitingOn) -> &'static str {
+    match w {
+        WaitingOn::ReviewerApprovalsMissing { .. } => "👀",
+        WaitingOn::GateReviewersMissing { .. } => "🔍",
+        WaitingOn::MasterToRevise { .. }
+        | WaitingOn::MasterToContinue
+        | WaitingOn::MasterToCommit => "🔨",
+        WaitingOn::MasterToFinalize => "🏁",
+        WaitingOn::Blocked { .. } => "🙋",
     }
 }
 
@@ -330,6 +389,26 @@ mod tests {
         }
     }
 
+    /// Visible text of a line: ANSI escape sequences removed,
+    /// banner padding trimmed. Tests pin what the EYE sees.
+    fn visible(line: &str) -> String {
+        let mut out = String::new();
+        let mut chars = line.chars();
+        while let Some(c) = chars.next() {
+            if c == '\x1b' {
+                // skip to the terminating `m` of the CSI sequence
+                for e in chars.by_ref() {
+                    if e == 'm' {
+                        break;
+                    }
+                }
+            } else {
+                out.push(c);
+            }
+        }
+        out.trim_end().to_string()
+    }
+
     fn snap(plans: Vec<PlanWorkState>, queue: Vec<&str>) -> StatusSnapshot {
         StatusSnapshot {
             repo_path: "/r".into(),
@@ -353,14 +432,17 @@ mod tests {
         let s = snap(vec![plan_state("foo", reviewer_missing("codex"))], vec![]);
         let lines = render(&s, 1, 80);
         assert_eq!(lines.len(), 1);
-        assert_eq!(lines[0], "* codex — reviewing — foo @ unreviewed");
+        assert_eq!(
+            visible(&lines[0]),
+            "👀 CODEX — reviewing — foo @ unreviewed"
+        );
     }
 
     #[test]
     fn idle_renders_idle_even_at_one_row() {
         // Truly idle: no plans AND empty queue.
         let s = snap(vec![], vec![]);
-        assert_eq!(render(&s, 1, 80), vec!["idle".to_string()]);
+        assert_eq!(visible(&render(&s, 1, 80)[0]), "💤 idle");
     }
 
     #[test]
@@ -370,7 +452,10 @@ mod tests {
         // name the agent we're waiting on, not say `idle`.
         let s = snap(vec![], vec!["zellij-layout", "wfw-hint"]);
         let lines = render(&s, 1, 80);
-        assert_eq!(lines[0], "* claude — promote — zellij-layout (2 queued)");
+        assert_eq!(
+            visible(&lines[0]),
+            "📋 CLAUDE — promote — zellij-layout (2 queued)"
+        );
     }
 
     #[test]
@@ -380,7 +465,10 @@ mod tests {
         let mut s = snap(vec![], vec!["zellij-layout"]);
         s.master = None;
         let lines = render(&s, 1, 80);
-        assert_eq!(lines[0], "* master — promote — zellij-layout (1 queued)");
+        assert_eq!(
+            visible(&lines[0]),
+            "📋 MASTER — promote — zellij-layout (1 queued)"
+        );
     }
 
     #[test]
@@ -395,7 +483,7 @@ mod tests {
             vec![],
         );
         let lines = render(&s, 1, 80);
-        assert_eq!(lines[0], "* 2 plans: codex(alpha), master(beta)");
+        assert_eq!(visible(&lines[0]), "🔀 2 plans: CODEX(alpha), MASTER(beta)");
     }
 
     #[test]
@@ -408,13 +496,19 @@ mod tests {
             vec!["another-quite-long-queued-name"],
         );
         let lines = render(&s, 24, 10);
+        // Measure VISIBLE width: the banner line carries zero-width
+        // ANSI escapes plus full-width padding, so raw char count
+        // overshoots by design.
         for line in &lines {
             assert!(
-                line.chars().count() <= 10,
-                "line wider than 10 cols: `{line}`"
+                visible(line).chars().count() <= 10,
+                "line wider than 10 visible cols: `{line}`"
             );
         }
-        assert!(lines[0].ends_with('…'), "truncated line ends with ellipsis");
+        assert!(
+            visible(&lines[0]).ends_with('…'),
+            "truncated headline ends with ellipsis"
+        );
     }
 
     #[test]
@@ -471,7 +565,7 @@ mod tests {
             vec![],
         );
         let lines = render(&s, 1, 80);
-        assert_eq!(lines[0], "* human — blocked — foo @ unreviewed");
+        assert_eq!(visible(&lines[0]), "🙋 HUMAN — blocked — foo @ unreviewed");
     }
 
     #[test]
