@@ -74,6 +74,21 @@ terminal's dimensions from Rust.
 - Zero reviewers (master-only team): stage-only layout + --tui
   pane; no empty stack region.
 
+## Status pane repo pinning (codex 7d3b5d1 — REQUIRED)
+
+The generated `--tui` pane must pin its repo EXACTLY like the
+agent panes already do (the codex 361b104/8075d43 lineage):
+`cwd="<abs-repo>"` on the pane AND
+`args "status" "--repo" "<abs-repo>" "--tui"`. Without both, a
+`clank open zellij --repo /path` invoked from another directory
+ships an instrument panel folding the CALLER's cwd repo while
+the agent panes work the intended one — same-looking pane, wrong
+data. All interpolations through `kdl_escape` as usual.
+
+Acceptance: a compose test pins the status pane's cwd + --repo
+against a repo path that is NOT the test process cwd (the
+existing agent-pane tests' shape), for both orientations.
+
 ## Out of scope
 
 - The zellij-focus-follower (RELEASE-CHECKLIST item) — active
