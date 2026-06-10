@@ -185,9 +185,10 @@ pub struct HtmlOpenArgs {
     pub print_path: bool,
 }
 
-/// `clank open` — container subcommand. `dry` is the existing
-/// path classifier (renamed from `clank open <path>` per
-/// `clank-open-zellij`); `zellij` is the new layout spawner.
+/// `clank open` — bare form opens the zellij agent workspace
+/// (context-aware: new tab in-session, attach-or-create outside;
+/// `clank-open-zellij-context`). Subcommands: `dry` = the
+/// read-only path classifier; `zellij` = the opener, explicit.
 #[derive(Args, Debug)]
 #[command(args_conflicts_with_subcommands = true)]
 pub struct OpenArgs {

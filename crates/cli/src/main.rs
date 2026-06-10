@@ -49,10 +49,10 @@ enum Command {
     /// `.clank/html/`. Use `clank html open` to build and
     /// launch the result in your browser.
     Html(cli::HtmlArgs),
-    /// Inspect a path: classify what's there (no repo / git
-    /// without clank / clank initialized) and return enough
-    /// structured data for an editor to drive its own bootstrap.
-    /// Read-only; never mutates.
+    /// Open your agent workspace (zellij), context-aware: a new
+    /// tab inside a session, attach-or-create `clank-<repo>`
+    /// outside. `clank open dry <path>` is the read-only path
+    /// classifier
     Open(cli::OpenArgs),
     /// Rewire feedback files after a rebase / amend. Installed
     /// as a `post-rewrite` git hook by `clank init`; reads

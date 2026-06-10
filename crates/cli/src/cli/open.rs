@@ -917,6 +917,9 @@ mod open_args_tests {
         // loud parse error instead.
         assert!(T::try_parse_from(["t", "open", "--print", "zellij"]).is_err());
         assert!(T::try_parse_from(["t", "open", "--repo", "/r", "dry", "/x"]).is_err());
+        // And the pre-rename muscle-memory form `clank open <path>`
+        // errors rather than mis-parsing (ruthless a25f71d minor).
+        assert!(T::try_parse_from(["t", "open", "/some/path"]).is_err());
     }
 
     #[test]
