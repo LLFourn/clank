@@ -531,7 +531,14 @@ fn create_argv(layout_path: &Path, name: &str) -> Vec<String> {
         "zellij".to_string(),
         "--session".to_string(),
         name.to_string(),
-        "--layout".to_string(),
+        // MUST be `--new-session-with-layout`, NOT `--layout`:
+        // alongside `--session`, plain `--layout` means "add this
+        // layout as a tab to session <name>", which errors with
+        // "There is no active session!" when the session doesn't
+        // exist yet (the Create case). `--new-session-with-layout`
+        // always starts a fresh session. (Verified live against
+        // zellij 0.44.)
+        "--new-session-with-layout".to_string(),
         layout_path.display().to_string(),
         "options".to_string(),
         "--session-serialization".to_string(),
@@ -1113,7 +1120,7 @@ dead-one [Created 10h ago] (EXITED - attach to resurrect)
                 "zellij",
                 "--session",
                 "clank-r",
-                "--layout",
+                "--new-session-with-layout",
                 "/r/.clank/zellij/layout.kdl",
                 "options",
                 "--session-serialization",
