@@ -79,7 +79,7 @@ investigated while authoring this checklist and need no plan.
 
 - [ ] **`help-output-beauty`** — `clank --help` wraps badly
   because several subcommands carry paragraph-length `about`
-  strings (team, demote, open, rewire, stop-hook…). Fix shape:
+  strings (team, shelve, open, rewire, stop-hook…). Fix shape:
   one-line `about` for the command list + move the detail to
   `long_about` (shown on `clank <cmd> --help`). Audit all
   subcommands; eyeball at 80 cols. Small, mechanical.

@@ -14,7 +14,6 @@ pub mod as_cmd;
 pub mod auto;
 pub mod block;
 pub mod config;
-pub mod demote;
 pub mod diff;
 pub mod doctor;
 pub mod feedback;
@@ -31,6 +30,7 @@ pub mod queue;
 pub mod rewire;
 pub mod rewrite;
 pub mod setup;
+pub mod shelve;
 pub mod status;
 pub(crate) mod status_tui;
 pub mod stop_hook;
@@ -1020,45 +1020,65 @@ pub struct FinishArgs {
 }
 
 #[derive(Args, Debug)]
-pub struct DemoteArgs {
-    /// Plan stem to demote (same parsing as `clank purge`).
+pub struct ShelveArgs {
+    #[command(subcommand)]
+    pub command: Option<ShelveCmd>,
+    /// Plan stem to shelve (same parsing as `clank purge`).
     pub plan: Option<String>,
     /// Repo root. Defaults to the cwd's git toplevel.
     #[arg(long, value_name = "PATH")]
     pub repo: Option<PathBuf>,
-    /// Queue priority for the re-queued plan body (default 500).
-    /// Ignored when `--stub` is set.
+    /// Record that this plan is waiting on another; `clank status`
+    /// nudges to unshelve once that plan finishes.
+    #[arg(long = "for", value_name = "PLAN")]
+    pub waiting_for: Option<String>,
+    /// Also save the plan body back to the queue for re-attempt
+    /// from scratch (absorbs the removed `clank demote`).
+    #[arg(long)]
+    pub to_queue: bool,
+    /// Queue priority for `--to-queue` (default 500).
     #[arg(long, value_name = "N")]
     pub priority: Option<u16>,
-    /// Write the plan body to `.clank/stubs/<plan>.md` instead of
-    /// the queue.
-    #[arg(long)]
-    pub stub: bool,
-    /// Allow demote when the plan range contains `Rewrite`
+    /// Allow shelving when the plan range contains `Rewrite`
     /// dispositions (your own code-touching commits). Does NOT
-    /// bypass `KeepVerbatim` (foreign commits) — those refuse
-    /// unconditionally.
+    /// bypass foreign commits — those refuse unconditionally.
     #[arg(long)]
     pub force: bool,
-    /// Preview-only: write the rewritten chain to a fresh branch
-    /// and leave master + queue/stub + feedback untouched. To
-    /// complete the demote, switch to the branch and re-run
-    /// without `--into-branch`.
-    #[arg(long, value_name = "NAME")]
-    pub into_branch: Option<String>,
-    /// Print the planned drop + safety result + queue target +
-    /// orphan-feedback count without changing the filesystem.
+    /// Print the plan without changing anything.
     #[arg(long)]
     pub dry: bool,
     /// Skip the interactive confirmation prompt.
     #[arg(long)]
     pub yes: bool,
-    /// Permit rewriting a protected branch in place. Without
-    /// this flag, demote refuses to rewrite `main`/`master` or
-    /// any branch matched by `branch.<name>.protect` in git
-    /// config. `--into-branch` bypasses the protection check.
+    /// Permit rewriting a protected branch in place.
     #[arg(long)]
     pub allow_rewrite_protected: bool,
+}
+
+#[derive(clap::Subcommand, Debug)]
+pub enum ShelveCmd {
+    /// Permanently discard a plan's shelved commits + state.
+    Clean(ShelveCleanArgs),
+}
+
+#[derive(Args, Debug)]
+pub struct ShelveCleanArgs {
+    /// Shelved plan stem.
+    pub plan: String,
+    #[arg(long, value_name = "PATH")]
+    pub repo: Option<PathBuf>,
+    /// Skip the interactive confirmation prompt.
+    #[arg(long)]
+    pub yes: bool,
+}
+
+#[derive(Args, Debug)]
+pub struct UnshelveArgs {
+    /// Shelved plan stem to restore.
+    pub plan: String,
+    /// Repo root. Defaults to the cwd's git toplevel.
+    #[arg(long, value_name = "PATH")]
+    pub repo: Option<PathBuf>,
 }
 
 #[derive(Args, Debug)]
@@ -1184,8 +1204,8 @@ pub struct PurgeArgs {
     /// implementation code — not just `.clank/` artifacts. The
     /// plan AND its work both vanish from history. Refuses
     /// foreign commits unconditionally (same policy as
-    /// `clank demote`). Does NOT save the plan body anywhere —
-    /// use `clank demote` if you want to re-queue the plan for
+    /// `clank shelve --to-queue`). Does NOT save the plan body —
+    /// use `clank shelve --to-queue` if you want to re-queue it for
     /// another attempt. Mutually exclusive with `--all`,
     /// `--squash`, and `--amend`.
     #[arg(long)]

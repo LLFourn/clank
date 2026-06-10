@@ -36,6 +36,19 @@ pub struct StatusSnapshot {
     /// degrades to None on a teamless repo). The TUI's idle+queue
     /// headline names master as the agent whose turn it is.
     pub(crate) master: Option<String>,
+    /// Shelved plans (stem, what they're waiting for if `--for`
+    /// was used, and whether that wait is over). Plan:
+    /// plan-lifecycle-verbs.
+    pub(crate) shelved: Vec<ShelvedView>,
+}
+
+/// One shelved plan as the renderers see it.
+pub(crate) struct ShelvedView {
+    pub(crate) stem: String,
+    pub(crate) waiting_for: Option<String>,
+    /// True when `waiting_for` names a plan that has finished —
+    /// the unshelve nudge.
+    pub(crate) ready: bool,
 }
 
 /// In-process convenience for tests / callers that want a status
@@ -139,6 +152,24 @@ impl StatusSnapshot {
             .map(|e| e.name)
             .collect();
 
+        let shelved: Vec<ShelvedView> = crate::cli::shelve::scan_shelved(repo)
+            .into_iter()
+            .map(|(stem, st)| {
+                let ready = st.waiting_for.as_deref().is_some_and(|w| {
+                    state
+                        .fold
+                        .finished_plans
+                        .iter()
+                        .any(|fp| fp.plan.as_str() == w)
+                });
+                ShelvedView {
+                    stem,
+                    waiting_for: st.waiting_for,
+                    ready,
+                }
+            })
+            .collect();
+
         Ok(Self {
             repo_path: repo.to_path_buf(),
             basename: basename.to_string(),
@@ -151,6 +182,7 @@ impl StatusSnapshot {
             blocks,
             queue,
             master,
+            shelved,
         })
     }
 
@@ -218,6 +250,21 @@ impl StatusSnapshot {
             // (clank-status-tui); queue_count kept for consumers.
             obj["queue"] = serde_json::json!(self.queue);
         }
+        if !self.shelved.is_empty() {
+            // Additive (plan-lifecycle-verbs).
+            obj["shelved"] = serde_json::json!(
+                self.shelved
+                    .iter()
+                    .map(|sv| {
+                        serde_json::json!({
+                            "plan": sv.stem,
+                            "waiting_for": sv.waiting_for,
+                            "ready": sv.ready,
+                        })
+                    })
+                    .collect::<Vec<_>>()
+            );
+        }
         obj
     }
 
@@ -244,6 +291,14 @@ impl StatusSnapshot {
                 self.queue.len(),
                 if self.queue.len() == 1 { "" } else { "s" }
             );
+        }
+        for sv in &self.shelved {
+            let note = match (&sv.waiting_for, sv.ready) {
+                (Some(w), true) => format!(" (was waiting on {w} — FINISHED; unshelve?)"),
+                (Some(w), false) => format!(" (waiting on {w})"),
+                (None, _) => String::new(),
+            };
+            let _ = writeln!(out, "shelved: {}{note}", sv.stem);
         }
 
         if self.plans.is_empty() && self.last_finished.is_none() {

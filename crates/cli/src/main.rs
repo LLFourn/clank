@@ -39,7 +39,8 @@ enum Command {
     /// save the plan body back to the queue (or stub) for
     /// re-attempt. Transactional — fails closed at every
     /// boundary, leaves no partial state on error.
-    Demote(cli::DemoteArgs),
+    Shelve(cli::ShelveArgs),
+    Unshelve(cli::UnshelveArgs),
     /// Print a chronological timeline of commits and reviews for
     /// a plan.
     Log(cli::LogArgs),
@@ -109,7 +110,11 @@ async fn main() -> anyhow::Result<()> {
         Command::Team(args) => cli::team::run(args).await,
         Command::Purge(args) => cli::purge::run(args).await,
         Command::Diff(args) => cli::diff::run(args).await,
-        Command::Demote(args) => cli::demote::run(args).await,
+        Command::Shelve(args) => match args.command {
+            Some(cli::ShelveCmd::Clean(clean)) => cli::shelve::run_clean(clean).await,
+            None => cli::shelve::run_shelve(args).await,
+        },
+        Command::Unshelve(args) => cli::shelve::run_unshelve(args).await,
         Command::Log(args) => cli::log::run(args).await,
         Command::Html(args) => cli::html::run(args).await,
         Command::Open(args) => cli::open::run(args).await,

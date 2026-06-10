@@ -47,6 +47,10 @@ Each repo's `.clank/` directory contains:
   `clank feedback write ... --verdict finished -m "ship it"`
   `clank feedback write ... --verdict request-changes -m "overwrought API in foo.rs"`
 - `clank finish <plan>` — finalize a FINISHED plan (master only).
+- `clank shelve <plan>` / `clank unshelve <plan>` — set an
+  in-flight plan's commits aside / restore them later (reviews
+  reset on restore). `--to-queue` also re-queues the body.
+  `clank purge --drop <plan>` is the full delete (commits + body).
 - `clank as <label>` — bind this session to an agent label (you'll
   typically run this once per session at the start).
 - `clank auto on|off [--role …]` — toggle the Stop-hook auto-mode

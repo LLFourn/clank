@@ -140,6 +140,17 @@ pub(crate) fn render(snap: &StatusSnapshot, rows: u16, cols: u16) -> Vec<String>
         }
     }
 
+    // `shelf` — shelved plans; the unshelve nudge once a `--for`
+    // dependency finishes (plan-lifecycle-verbs).
+    for sv in &snap.shelved {
+        let note = match (&sv.waiting_for, sv.ready) {
+            (Some(w), true) => format!(" — {w} finished; unshelve?"),
+            (Some(w), false) => format!(" — waiting on {w}"),
+            (None, _) => String::new(),
+        };
+        body.push(vec![label("shelf"), plain(sv.stem.clone()), dim(note)]);
+    }
+
     // `git` — branch, head, dirty. Quietest gauge, dim throughout.
     {
         let branch = snap.branch.as_deref().unwrap_or("?");
@@ -514,6 +525,7 @@ mod tests {
             blocks: Vec::new(),
             queue: queue.into_iter().map(str::to_string).collect(),
             master: Some("claude".into()),
+            shelved: Vec::new(),
         }
     }
 
