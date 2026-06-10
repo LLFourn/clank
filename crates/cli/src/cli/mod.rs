@@ -118,10 +118,16 @@ pub struct InitArgs {
 #[derive(Args, Debug)]
 pub struct ForkArgs {
     /// Worktree name — also the new branch name and the zellij
-    /// tab name.
-    pub name: String,
+    /// tab name. Defaults to `pr-<N>` when `--pr` is given.
+    #[arg(required_unless_present = "pr")]
+    pub name: Option<String>,
     /// Repo to fork from. Defaults to the cwd's git toplevel.
     pub source: Option<PathBuf>,
+    /// Fork onto a GitHub PR: fetches `pull/<N>/head`, bases the
+    /// worktree on the pinned head sha, and orients the forked
+    /// sessions to "reviewing PR #<N>: <title>".
+    #[arg(long, value_name = "N", conflicts_with = "branch")]
+    pub pr: Option<u32>,
     /// Base the worktree's new branch on this ref instead of
     /// source HEAD (e.g. a fetched PR head).
     #[arg(long, value_name = "REF")]

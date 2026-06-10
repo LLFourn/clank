@@ -83,8 +83,9 @@ fn source_with_bound_team() -> TestEnv {
 
 fn fork_args(env: &TestEnv, name: &str) -> clank::cli::ForkArgs {
     clank::cli::ForkArgs {
-        name: name.into(),
+        name: Some(name.into()),
         source: Some(env.repo().to_path_buf()),
+        pr: None,
         branch: None,
         path: None,
         prompt: None,
@@ -276,5 +277,86 @@ fn fork_keeps_status_clean_even_with_stale_gitignore() {
     assert!(
         gi.lines().any(|l| l == "/worktrees/"),
         "entry appended: {gi}"
+    );
+}
+
+/// A bare "origin" carrying refs/pull/123/head, so `fork --pr`
+/// exercises the real fetch path with no network and no gh (the
+/// title lookup fails -> the degraded prompt, deterministically).
+fn add_local_pr_remote(env: &TestEnv, pr_head_msg: &str) -> String {
+    let repo = env.repo();
+    // Inside this env's own tempdir (home) — a shared-/tmp path
+    // collides under parallel test runs.
+    let bare = env.home().join("origin.git");
+    git(repo, &["init", "--bare", "--quiet", bare.to_str().unwrap()]);
+    git(repo, &["remote", "add", "origin", bare.to_str().unwrap()]);
+    // A divergent PR head: commit on a temp branch, push to the
+    // pull ref, then drop the local branch.
+    git(repo, &["checkout", "--quiet", "-b", "tmp-pr"]);
+    write(repo, "src/pr_change.rs", "// pr\n");
+    commit(repo, pr_head_msg);
+    let sha = git_out(repo, &["rev-parse", "HEAD"]).trim().to_string();
+    git(
+        repo,
+        &["push", "--quiet", "origin", "HEAD:refs/pull/123/head"],
+    );
+    git(repo, &["checkout", "--quiet", "-"]);
+    git(repo, &["branch", "--quiet", "-D", "tmp-pr"]);
+    sha
+}
+
+#[test]
+fn fork_pr_fetches_pins_and_orients() {
+    let env = source_with_bound_team();
+    let repo = env.repo();
+    let pr_sha = add_local_pr_remote(&env, "[misc] the pr change");
+
+    let mut args = fork_args(&env, "ignored");
+    args.name = None;
+    args.pr = Some(123);
+    let dest = block_on(clank::cli::fork::run_fork(&args, Some(env.home()))).unwrap();
+
+    // Name derived, worktree based on the PINNED PR head sha.
+    assert!(dest.ends_with(".clank/worktrees/pr-123"), "{dest:?}");
+    assert_eq!(git_out(&dest, &["rev-parse", "HEAD"]).trim(), pr_sha);
+    // Orientation: degraded gh-less prompt, deterministic.
+    let spec = std::fs::read_to_string(dest.join(".clank/agents/claude/fork.json")).unwrap();
+    assert!(
+        spec.contains("reviewing PR #123"),
+        "PR orientation in prompt: {spec}"
+    );
+}
+
+#[test]
+fn fork_pr_precondition_failure_never_touches_network() {
+    // Ruthless 91ecaf2 edge 1: the fetch sits AFTER the fail-closed
+    // line. With an unbound session AND an invalid remote, the
+    // error must be the session one — a fetch attempt would have
+    // failed loudly with a fetch error instead.
+    let env = TestEnv::init();
+    env.register_team("claude", &["codex"], &[]);
+    let repo = env.repo();
+    write(repo, "src/lib.rs", "// base\n");
+    commit(repo, "[misc] base");
+    git(
+        repo,
+        &["remote", "add", "origin", "/nonexistent/nowhere.git"],
+    );
+    bind_session(
+        &env,
+        "claude",
+        clank_core::vocab::Tool::Claude,
+        "11111111-1111-1111-1111-111111111111",
+    );
+    // codex unbound.
+    let mut args = fork_args(&env, "ignored");
+    args.name = None;
+    args.pr = Some(123);
+    let err = block_on(clank::cli::fork::run_fork(&args, Some(env.home())))
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("codex") && err.contains("bound session"),
+        "precondition error, not a fetch error: {err}"
     );
 }

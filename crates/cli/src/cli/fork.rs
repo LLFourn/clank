@@ -87,7 +87,8 @@ pub async fn run(args: ForkArgs) -> anyhow::Result<()> {
 /// read-only validation (fail-closed: no mutation until all
 /// checks pass).
 pub async fn run_fork(args: &ForkArgs, home: Option<&Path>) -> anyhow::Result<PathBuf> {
-    let name = args.name.as_str();
+    let name = derived_name(args.name.as_deref(), args.pr)?;
+    let name = name.as_str();
     if name.is_empty() || name.contains('/') || name.contains(char::is_whitespace) {
         anyhow::bail!("fork name must be a simple directory/branch name (got `{name}`)");
     }
@@ -135,7 +136,24 @@ pub async fn run_fork(args: &ForkArgs, home: Option<&Path>) -> anyhow::Result<Pa
             dest.display()
         );
     }
-    let base = args.branch.as_deref().unwrap_or("HEAD");
+    // ── Network + mutation side of the fail-closed line ──
+    // The PR fetch (and the best-effort gh title lookup) are side
+    // effects, so they sit AFTER every precondition (ruthless
+    // 91ecaf2 edge 1): `fork --pr` against a repo with an unbound
+    // session bails before touching the network.
+    let pinned_pr_base: Option<String> = match args.pr {
+        Some(pr) => Some(fetch_pr_head(&source, pr)?),
+        None => None,
+    };
+    let base = pinned_pr_base
+        .as_deref()
+        .or(args.branch.as_deref())
+        .unwrap_or("HEAD");
+    let purpose_owned: Option<String> = match (args.prompt.as_deref(), args.pr) {
+        (Some(p), _) => Some(p.to_string()),
+        (None, Some(pr)) => Some(default_pr_purpose(pr, gh_pr_title(&source, pr).as_deref())),
+        (None, None) => None,
+    };
 
     // ── Mutation starts: the worktree. ──
     // The default location must never pollute main-repo status —
@@ -175,7 +193,7 @@ pub async fn run_fork(args: &ForkArgs, home: Option<&Path>) -> anyhow::Result<Pa
             .with_context(|| format!("seeding `{}`", dst_cfg.display()))?;
     }
 
-    let purpose = args.prompt.as_deref().unwrap_or("parallel work");
+    let purpose = purpose_owned.as_deref().unwrap_or("parallel work");
     for (label, session) in &sessions {
         let spec = ForkSpec {
             tool: session.tool,
@@ -203,9 +221,120 @@ pub async fn run_fork(args: &ForkArgs, home: Option<&Path>) -> anyhow::Result<Pa
     Ok(dest)
 }
 
+/// Pure name derivation: explicit name wins; `--pr N` defaults
+/// to `pr-N`; clap's required_unless_present guarantees one of
+/// them is set (the error here is a type-system backstop).
+fn derived_name(explicit: Option<&str>, pr: Option<u32>) -> anyhow::Result<String> {
+    match (explicit, pr) {
+        (Some(n), _) => Ok(n.to_string()),
+        (None, Some(pr)) => Ok(format!("pr-{pr}")),
+        (None, None) => anyhow::bail!("a fork name (or --pr) is required"),
+    }
+}
+
+/// Pure default-purpose derivation for `--pr` (explicit --prompt
+/// handled by the caller): title is best-effort.
+fn default_pr_purpose(pr: u32, title: Option<&str>) -> String {
+    match title {
+        Some(t) if !t.trim().is_empty() => format!("reviewing PR #{pr}: {}", t.trim()),
+        _ => format!("reviewing PR #{pr}"),
+    }
+}
+
+/// Fetch the PR head via GitHub's refspec (pure git — no gh
+/// dependency; works for fork-PRs too) and PIN it to a sha:
+/// FETCH_HEAD is volatile, so resolve immediately and base the
+/// worktree on the sha, not the symref.
+fn fetch_pr_head(source: &Path, pr: u32) -> anyhow::Result<String> {
+    let refspec = format!("pull/{pr}/head");
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(source)
+        .args(["fetch", "origin", &refspec])
+        .output()
+        .context("spawning git fetch")?;
+    if !out.status.success() {
+        anyhow::bail!(
+            "fetching PR #{pr} (`git fetch origin {refspec}`) failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(source)
+        .args(["rev-parse", "FETCH_HEAD"])
+        .output()
+        .context("spawning git rev-parse FETCH_HEAD")?;
+    if !out.status.success() {
+        anyhow::bail!("resolving FETCH_HEAD after the PR fetch failed");
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
+/// Best-effort PR title for the orientation prompt. Runs gh IN
+/// THE SOURCE DIR (ruthless 91ecaf2 edge 3 — gh infers the repo
+/// from cwd, so `--source /other` must not read the caller's
+/// repo). Missing/unauthenticated gh, or any failure → None (the
+/// prompt degrades to "reviewing PR #N").
+fn gh_pr_title(source: &Path, pr: u32) -> Option<String> {
+    let out = std::process::Command::new("gh")
+        .current_dir(source)
+        .args([
+            "pr",
+            "view",
+            &pr.to_string(),
+            "--json",
+            "title",
+            "-q",
+            ".title",
+        ])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let title = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if title.is_empty() { None } else { Some(title) }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn derivation_matrix() {
+        // ruthless 91ecaf2: the full matrix.
+        assert_eq!(derived_name(Some("x"), Some(7)).unwrap(), "x");
+        assert_eq!(derived_name(None, Some(123)).unwrap(), "pr-123");
+        assert_eq!(derived_name(Some("x"), None).unwrap(), "x");
+        assert!(derived_name(None, None).is_err());
+
+        assert_eq!(
+            default_pr_purpose(123, Some("Fix the frobnicator")),
+            "reviewing PR #123: Fix the frobnicator"
+        );
+        assert_eq!(default_pr_purpose(123, Some("  ")), "reviewing PR #123");
+        assert_eq!(default_pr_purpose(123, None), "reviewing PR #123");
+    }
+
+    #[test]
+    fn pr_conflicts_with_branch_and_name_optional_shapes() {
+        use clap::Parser;
+        #[derive(Parser)]
+        struct T {
+            #[command(flatten)]
+            f: super::super::ForkArgs,
+        }
+        // --pr alone: ok, name optional.
+        assert!(T::try_parse_from(["t", "--pr", "123"]).is_ok());
+        // name alone: ok (normal fork).
+        assert!(T::try_parse_from(["t", "myname"]).is_ok());
+        // neither: clap required error.
+        assert!(T::try_parse_from(["t"]).is_err());
+        // --pr + --branch: loud conflict, not silent precedence
+        // (ruthless 91ecaf2 edge 2).
+        assert!(T::try_parse_from(["t", "--pr", "1", "--branch", "main"]).is_err());
+    }
 
     #[test]
     fn should_open_matrix() {
