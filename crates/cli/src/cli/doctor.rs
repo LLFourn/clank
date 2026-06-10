@@ -146,6 +146,32 @@ pub fn repo_checks(repo: &Path, home: Option<&Path>) -> Vec<CheckResult> {
     // .claude/settings.local.json permissions.
     out.push(check_claude_perms(repo));
 
+    // User zellij layout template, when configured: parse + marker
+    // presence (`zellij-layout-config-around-agent-panes`). Checked
+    // BEFORE the team-resolution early-returns so a broken template
+    // surfaces at doctor time even on a teamless repo — never at
+    // `open zellij` time.
+    if let Some(template) = home
+        .map(crate::cli::team::read_user_config)
+        .transpose()
+        .ok()
+        .flatten()
+        .and_then(|cfg| cfg.zellij.and_then(|z| z.layout))
+    {
+        match crate::cli::open_zellij::validate_template(&template) {
+            Ok(()) => out.push(CheckResult::ok(
+                SECTION,
+                "zellij layout template",
+                "parses and contains the `clank_agents` marker".to_string(),
+            )),
+            Err(e) => out.push(CheckResult::fail(
+                SECTION,
+                "zellij layout template",
+                format!("{e:#}"),
+            )),
+        }
+    }
+
     // Per-agent checks: registration comes from the resolved team
     // set (`teams-based-agent-registration`). Join skeleton state,
     // and flag orphan skeletons (present on disk, not registered).

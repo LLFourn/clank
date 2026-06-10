@@ -36,11 +36,41 @@ pub struct UserConfigFile {
     pub hooks: Option<crate::cli::config::HooksSection>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub diff: Option<crate::cli::config::DiffConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub zellij: Option<ZellijSection>,
     /// Forward-compat catchall. A leftover legacy `default_agents`
     /// key (from a pre-hard-cut config) lands here and is ignored
     /// — there is no migration that reads it.
     #[serde(flatten)]
     pub extra: BTreeMap<String, serde_json::Value>,
+}
+
+/// User-scope zellij preferences
+/// (`zellij-layout-config-around-agent-panes`). UI chrome is a
+/// personal preference, so this lives in `~/.clank/config.json`
+/// only — no repo-scope override.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct ZellijSection {
+    /// KDL layout TEMPLATE wrapping clank's agent panes. Must
+    /// contain a `clank_agents` marker node, which clank replaces
+    /// with the composed agent pane group. Unset → clank's
+    /// built-in layout. Example with custom chrome and a live
+    /// status pane:
+    ///
+    /// ```kdl
+    /// layout {
+    ///     default_tab_template {
+    ///         pane size=1 borderless=true { plugin location="compact-bar" }
+    ///         children
+    ///     }
+    ///     tab name="clank" {
+    ///         clank_agents
+    ///         pane size=8 { command "clank"; args "status" "--tui" }
+    ///     }
+    /// }
+    /// ```
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub layout: Option<String>,
 }
 
 /// One agent's description: which tool to spawn + optional

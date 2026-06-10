@@ -118,6 +118,52 @@ separate plan needed.
 - Per-pane command customization beyond the existing
   `clank agent start <label>` invocation.
 
+## Decisions (sized, ruthless fb3f85f concerns folded)
+
+1. **Marker = sentinel NODE + kdl-parse tree-substitution**
+   (concern 1, load-bearing). A `clank_agents` node; clank parses
+   the template with the `kdl` crate, depth-first replaces every
+   marker node with the composed agent pane group, re-serializes.
+   No string-replace on user-authored KDL: a node can't
+   false-match comments or string literals (pinned by test:
+   `marker_inside_comment_or_string_is_not_substituted`), and the
+   substituted result is valid KDL by construction. Dep pinned to
+   `kdl = "4"` — KDL v1, the SAME dialect zellij itself parses
+   (kdl 6.x defaults to KDL 2.0, which zellij does not read).
+2. **Problem #2 fixed for zero-config users too** (concern 2,
+   option b): the BUILT-IN layout became a template using
+   `default_tab_template`, so bars apply to runtime-spawned tabs
+   out of the box — and the built-in flows through the SAME
+   substitution path as user templates (one code path; the
+   built-in IS a template with the marker).
+3. **Validation early** (concern 3): `validate_template` = parse
+   + marker-present; result-validity is by construction (tree
+   substitution), so those two checks are the whole contract.
+   Wired into `clank doctor` (runs BEFORE the team-resolution
+   early-returns, so a broken template surfaces even on a
+   teamless repo), failing with the kdl parse error or a message
+   naming `clank_agents`.
+
+AS SHIPPED:
+- `teams_config::ZellijSection { layout }` on `UserConfigFile`
+  (user-scope only), rustdoc carries the documented example —
+  compact-bar chrome + a `clank status --tui` pane next to the
+  marker (the TUI-status-pane dissolve).
+- `open_zellij`: `BUILT_IN_TEMPLATE` (default_tab_template +
+  marker), `agent_group_kdl`, `substitute_marker`/
+  `substitute_in_doc` (depth-first, splices at marker position,
+  counts replacements, errors at 0 naming the marker),
+  `validate_template`, `compose_kdl(.., user_template)`.
+  `run()` reads `~/.clank/config.json#/zellij/layout`.
+- Tests (all in-process, no binary spawning): 22 in
+  open_zellij (15 pre-existing pass unchanged through the new
+  pipeline — built-in output equivalence; 7 new: built-in
+  default_tab_template + parses, chrome preserved + marker
+  substituted + user owns bars, nested marker, no-marker error,
+  invalid-KDL error, comment/string no-false-match, validate
+  matrix) + 4 doctor tests (broken/marker-less/valid/absent).
+
 ## Status
 
-Stub — queued 2026-06-09 (replaces open-zellij-inherits-default-layout).
+Sized + implemented 2026-06-10 (replaces
+open-zellij-inherits-default-layout, queued 2026-06-09).

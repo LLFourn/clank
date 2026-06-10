@@ -28,7 +28,22 @@ pub async fn run(args: OpenZellijArgs) -> anyhow::Result<()> {
         .map(|a| a.label.as_str().to_string())
         .collect();
     let repo_path_str = repo.display().to_string();
-    let kdl = compose_kdl(&basename, &repo_path_str, &master_label, &reviewer_labels);
+    // User-authored layout chrome from `~/.clank/config.json`
+    // (`zellij-layout-config-around-agent-panes`); None → the
+    // built-in template.
+    let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+    let user_template = home
+        .as_deref()
+        .map(crate::cli::team::read_user_config)
+        .transpose()?
+        .and_then(|cfg| cfg.zellij.and_then(|z| z.layout));
+    let kdl = compose_kdl(
+        &basename,
+        &repo_path_str,
+        &master_label,
+        &reviewer_labels,
+        user_template.as_deref(),
+    )?;
     let layout_path = layout_file_path(&repo);
     let spawn_argv = compose_spawn_argv(&layout_path);
 
@@ -96,38 +111,130 @@ fn ensure_gitignore_zellij_entry(repo: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Hand-rolled KDL composer. Every interpolated string value goes
-/// through [`kdl_escape`] — codex caught on 818d8be that
-/// `AgentLabel::parse` permits `"`, newlines, control chars,
-/// and other KDL-significant chars (it only blocks empty,
-/// `.`/`..`, leading `.`, `/`, and `\\`). Naive interpolation
-/// would produce malformed (or injected) KDL when zellij tries
-/// to consume it.
+/// The marker node a template must contain; clank replaces it
+/// with the composed agent pane group. A NODE (not a string
+/// token) so comments/string-literals can't false-match and the
+/// substituted result is valid KDL by construction (ruthless
+/// fb3f85f concern 1).
+pub(crate) const AGENTS_MARKER: &str = "clank_agents";
+
+/// Built-in zero-config template. Uses `default_tab_template` so
+/// the bars apply to runtime-spawned tabs too — previously the
+/// bars were panes of clank's tab only and NEW tabs dropped them
+/// (the plan's problem #2; fixed for zero-config users as well
+/// per ruthless fb3f85f concern 2 option b). `__TAB__` is an
+/// internal placeholder interpolated (escaped) before parsing —
+/// it never appears in user templates, which own their tab names.
+const BUILT_IN_TEMPLATE: &str = r#"layout {
+    default_tab_template {
+        pane size=1 borderless=true {
+            plugin location="zellij:tab-bar"
+        }
+        children
+        pane size=2 borderless=true {
+            plugin location="zellij:status-bar"
+        }
+    }
+    tab name="__TAB__" {
+        clank_agents
+    }
+}
+"#;
+
+/// Compose the final layout: pick the template (user-authored
+/// from `~/.clank/config.json#/zellij/layout`, else the built-in)
+/// and tree-substitute the agent pane group at the `clank_agents`
+/// marker. One code path for both — the built-in IS a template.
+///
+/// Every interpolated string value goes through [`kdl_escape`] —
+/// codex caught on 818d8be that `AgentLabel::parse` permits `"`,
+/// newlines, control chars, and other KDL-significant chars.
 ///
 /// `repo_path` is the absolute repo path injected into every
 /// pane's `clank agent start --repo <path>` so the spawned
-/// session's cwd doesn't affect the resolved repo. Codex caught
-/// the gap on 361b104.
-fn compose_kdl(tab_name: &str, repo_path: &str, master: &str, reviewers: &[String]) -> String {
+/// session's cwd doesn't affect the resolved repo (codex 361b104).
+fn compose_kdl(
+    tab_name: &str,
+    repo_path: &str,
+    master: &str,
+    reviewers: &[String],
+    user_template: Option<&str>,
+) -> anyhow::Result<String> {
+    let built_in;
+    let template = match user_template {
+        Some(t) => t,
+        None => {
+            built_in = BUILT_IN_TEMPLATE.replace("__TAB__", &kdl_escape(tab_name));
+            &built_in
+        }
+    };
+    let agents = agent_group_kdl(repo_path, master, reviewers);
+    substitute_marker(template, &agents)
+}
+
+/// The agent pane group clank owns: master + reviewers side by
+/// side.
+fn agent_group_kdl(repo_path: &str, master: &str, reviewers: &[String]) -> String {
     let mut out = String::new();
-    let tab_name_esc = kdl_escape(tab_name);
-    out.push_str("layout {\n");
-    out.push_str(&format!("    tab name=\"{tab_name_esc}\" {{\n"));
-    out.push_str("        pane size=1 borderless=true {\n");
-    out.push_str("            plugin location=\"zellij:tab-bar\"\n");
-    out.push_str("        }\n");
-    out.push_str("        pane split_direction=\"horizontal\" {\n");
+    out.push_str("pane split_direction=\"horizontal\" {\n");
     push_pane(&mut out, master, "master", repo_path);
     for reviewer in reviewers {
         push_pane(&mut out, reviewer.as_str(), "reviewer", repo_path);
     }
-    out.push_str("        }\n");
-    out.push_str("        pane size=2 borderless=true {\n");
-    out.push_str("            plugin location=\"zellij:status-bar\"\n");
-    out.push_str("        }\n");
-    out.push_str("    }\n");
     out.push_str("}\n");
     out
+}
+
+/// Parse the template, find the `clank_agents` marker node(s),
+/// replace each with the agent group, serialize. Errors when the
+/// template isn't valid KDL or has no marker — both name the
+/// problem at the source (config validation / open time), never
+/// at zellij launch.
+fn substitute_marker(template: &str, agents_kdl: &str) -> anyhow::Result<String> {
+    let mut doc: kdl::KdlDocument = template.parse().map_err(|e: kdl::KdlError| {
+        anyhow::anyhow!("zellij layout template is not valid KDL: {e}")
+    })?;
+    let agents_doc: kdl::KdlDocument = agents_kdl
+        .parse()
+        .expect("clank-generated agent group is valid KDL");
+    let replaced = substitute_in_doc(&mut doc, agents_doc.nodes());
+    if replaced == 0 {
+        anyhow::bail!(
+            "zellij layout template has no `{AGENTS_MARKER}` marker node — clank doesn't \
+             know where the agent panes go. Add a `{AGENTS_MARKER}` node where the panes \
+             should be."
+        );
+    }
+    Ok(doc.to_string())
+}
+
+/// Depth-first replace of every `clank_agents` node with clones
+/// of `agents`. Returns how many markers were replaced.
+fn substitute_in_doc(doc: &mut kdl::KdlDocument, agents: &[kdl::KdlNode]) -> usize {
+    let mut replaced = 0;
+    let nodes = doc.nodes_mut();
+    let mut i = 0;
+    while i < nodes.len() {
+        if nodes[i].name().value() == AGENTS_MARKER {
+            nodes.splice(i..=i, agents.iter().cloned());
+            replaced += 1;
+            i += agents.len();
+            continue;
+        }
+        if let Some(children) = nodes[i].children_mut() {
+            replaced += substitute_in_doc(children, agents);
+        }
+        i += 1;
+    }
+    replaced
+}
+
+/// Validate a user template early (config load / `clank doctor`):
+/// parses as KDL and contains the marker. The substituted result
+/// is valid by construction (tree substitution), so these two
+/// checks are the whole contract (ruthless fb3f85f concern 3).
+pub(crate) fn validate_template(template: &str) -> anyhow::Result<()> {
+    substitute_marker(template, "pane\n").map(|_| ())
 }
 
 fn push_pane(out: &mut String, label: &str, role_str: &str, repo_path: &str) {
@@ -204,14 +311,14 @@ mod tests {
 
     #[test]
     fn compose_kdl_includes_tab_bar_and_status_bar_plugins() {
-        let kdl = compose_kdl(TEST_TAB, TEST_REPO, "m", &[]);
+        let kdl = compose_kdl(TEST_TAB, TEST_REPO, "m", &[], None).unwrap();
         assert!(kdl.contains("plugin location=\"zellij:tab-bar\""));
         assert!(kdl.contains("plugin location=\"zellij:status-bar\""));
     }
 
     #[test]
     fn compose_kdl_wraps_panes_in_tab_block_with_name() {
-        let kdl = compose_kdl("basename", TEST_REPO, "alice", &[]);
+        let kdl = compose_kdl("basename", TEST_REPO, "alice", &[], None).unwrap();
         assert!(
             kdl.contains("tab name=\"basename\""),
             "KDL should wrap panes in a tab block with name; got:\n{kdl}"
@@ -220,7 +327,14 @@ mod tests {
 
     #[test]
     fn compose_kdl_master_and_reviewer_panes_use_clank_agent_start_with_repo() {
-        let kdl = compose_kdl(TEST_TAB, TEST_REPO, "alice", &reviewers(&["bob", "carol"]));
+        let kdl = compose_kdl(
+            TEST_TAB,
+            TEST_REPO,
+            "alice",
+            &reviewers(&["bob", "carol"]),
+            None,
+        )
+        .unwrap();
         assert!(kdl.contains("name=\"alice (master)\""));
         assert!(kdl.contains("name=\"bob (reviewer)\""));
         assert!(kdl.contains("name=\"carol (reviewer)\""));
@@ -251,7 +365,7 @@ mod tests {
         // KDL block sets `cwd="<repo>"` so the spawned tool
         // lands in the repo regardless of the shell that
         // invoked zellij.
-        let kdl = compose_kdl(TEST_TAB, TEST_REPO, "alice", &reviewers(&["bob"]));
+        let kdl = compose_kdl(TEST_TAB, TEST_REPO, "alice", &reviewers(&["bob"]), None).unwrap();
         assert!(
             kdl.contains(&format!("name=\"alice (master)\" cwd=\"{TEST_REPO}\"")),
             "master pane should set cwd; got:\n{kdl}"
@@ -269,7 +383,9 @@ mod tests {
             TEST_REPO,
             "m",
             &reviewers(&["bob", "alice", "codex"]),
-        );
+            None,
+        )
+        .unwrap();
         let bob_idx = kdl.find("name=\"bob (reviewer)\"").unwrap();
         let alice_idx = kdl.find("name=\"alice (reviewer)\"").unwrap();
         let codex_idx = kdl.find("name=\"codex (reviewer)\"").unwrap();
@@ -313,7 +429,7 @@ mod tests {
         // Pane name + args interpolations both go through
         // kdl_escape. A pathological label with a literal quote
         // must not break the layout string.
-        let kdl = compose_kdl(TEST_TAB, TEST_REPO, r#"weird"name"#, &[]);
+        let kdl = compose_kdl(TEST_TAB, TEST_REPO, r#"weird"name"#, &[], None).unwrap();
         // The raw `"name"` text MUST appear escaped, not as a
         // bare `"` that would close the KDL string early.
         assert!(
@@ -336,7 +452,7 @@ mod tests {
     fn compose_kdl_escapes_quote_in_tab_name_and_repo_path() {
         // Tab name and repo path both flow through kdl_escape so
         // a pathological cwd or basename can't break the layout.
-        let kdl = compose_kdl(r#"weird"tab"#, r#"/tmp/dir"with"quotes"#, "m", &[]);
+        let kdl = compose_kdl(r#"weird"tab"#, r#"/tmp/dir"with"quotes"#, "m", &[], None).unwrap();
         assert!(
             kdl.contains(r#"weird\"tab"#),
             "tab name quote must be escaped; got:\n{kdl}"
@@ -410,5 +526,135 @@ mod tests {
         assert_eq!(path, dir.path().join(".clank/zellij/layout.kdl"));
         let body = std::fs::read_to_string(&path).unwrap();
         assert_eq!(body, "layout { }\n");
+    }
+
+    // ── template substitution (zellij-layout-config-around-agent-panes) ──
+
+    #[test]
+    fn built_in_layout_uses_default_tab_template_and_parses() {
+        // Ruthless fb3f85f concern 2 option (b): the zero-config
+        // built-in now uses default_tab_template, so bars apply to
+        // runtime-spawned tabs too (the plan's problem #2, fixed
+        // for everyone, not just template authors).
+        let kdl = compose_kdl(TEST_TAB, TEST_REPO, "m", &[], None).unwrap();
+        assert!(kdl.contains("default_tab_template"), "got:\n{kdl}");
+        let _: kdl::KdlDocument = kdl.parse().expect("built-in output is valid KDL");
+        assert!(
+            !kdl.contains(AGENTS_MARKER),
+            "marker must be substituted away; got:\n{kdl}"
+        );
+    }
+
+    #[test]
+    fn user_template_chrome_preserved_and_marker_substituted() {
+        // The documented example: user-authored chrome (compact-bar
+        // + a `clank status --tui` pane) around the marker.
+        let template = r##"layout {
+    default_tab_template {
+        pane size=1 borderless=true {
+            plugin location="compact-bar"
+        }
+        children
+    }
+    tab name="my-clank" {
+        clank_agents
+        pane size=8 {
+            command "clank"
+            args "status" "--tui"
+        }
+    }
+}
+"##;
+        let kdl = compose_kdl(
+            TEST_TAB,
+            TEST_REPO,
+            "alice",
+            &reviewers(&["bob"]),
+            Some(template),
+        )
+        .unwrap();
+        // Chrome preserved verbatim.
+        assert!(
+            kdl.contains("plugin location=\"compact-bar\""),
+            "got:\n{kdl}"
+        );
+        assert!(kdl.contains("tab name=\"my-clank\""));
+        assert!(kdl.contains("\"status\" \"--tui\""));
+        // The built-in bars are NOT injected — user owns the chrome.
+        assert!(!kdl.contains("zellij:tab-bar"));
+        // Marker replaced with the agent group.
+        assert!(!kdl.contains(AGENTS_MARKER));
+        assert!(kdl.contains("name=\"alice (master)\""));
+        assert!(kdl.contains("name=\"bob (reviewer)\""));
+        let _: kdl::KdlDocument = kdl.parse().expect("substituted output is valid KDL");
+    }
+
+    #[test]
+    fn marker_found_in_nested_children() {
+        let template = r##"layout {
+    tab {
+        pane split_direction="vertical" {
+            clank_agents
+        }
+    }
+}
+"##;
+        let kdl = compose_kdl(TEST_TAB, TEST_REPO, "m", &[], Some(template)).unwrap();
+        assert!(!kdl.contains(AGENTS_MARKER));
+        assert!(kdl.contains("name=\"m (master)\""));
+    }
+
+    #[test]
+    fn template_without_marker_errors_naming_it() {
+        let template = "layout {\n    tab {\n        pane\n    }\n}\n";
+        let err = compose_kdl(TEST_TAB, TEST_REPO, "m", &[], Some(template)).unwrap_err();
+        assert!(
+            err.to_string().contains("clank_agents"),
+            "error must name the marker; got: {err}"
+        );
+    }
+
+    #[test]
+    fn template_with_invalid_kdl_errors_at_compose_not_zellij() {
+        let template = "layout { tab { pane "; // unclosed
+        let err = compose_kdl(TEST_TAB, TEST_REPO, "m", &[], Some(template)).unwrap_err();
+        assert!(err.to_string().contains("not valid KDL"), "got: {err}");
+    }
+
+    #[test]
+    fn marker_inside_comment_or_string_is_not_substituted() {
+        // Ruthless fb3f85f concern 1: a NODE marker can't false-match
+        // text. The comment + string mention the marker but the only
+        // real node is in the tab.
+        let template = r##"layout {
+    // put clank_agents here someday
+    tab name="clank_agents" {
+        clank_agents
+    }
+}
+"##;
+        let kdl = compose_kdl(TEST_TAB, TEST_REPO, "m", &[], Some(template)).unwrap();
+        // The comment + the tab NAME survive untouched; the node is
+        // replaced.
+        assert!(kdl.contains("// put clank_agents here someday"));
+        assert!(kdl.contains("tab name=\"clank_agents\""));
+        assert!(kdl.contains("name=\"m (master)\""));
+    }
+
+    #[test]
+    fn validate_template_checks_parse_and_marker() {
+        assert!(validate_template("layout {\n    clank_agents\n}\n").is_ok());
+        assert!(
+            validate_template("layout {\n    pane\n}\n")
+                .unwrap_err()
+                .to_string()
+                .contains("clank_agents")
+        );
+        assert!(
+            validate_template("layout { pane ")
+                .unwrap_err()
+                .to_string()
+                .contains("not valid KDL")
+        );
     }
 }

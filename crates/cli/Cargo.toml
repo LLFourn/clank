@@ -66,6 +66,7 @@ gix = { version = "0.84", default-features = false, features = [
     "max-performance-safe",  # zlib-rs + parallel without C deps
     "parallel",              # Repository: Send under parallel feature
 ] }
+kdl = "4"
 
 [dev-dependencies]
 filetime = "0.2"

@@ -362,3 +362,70 @@ fn doctor_warn_for_unbound_does_not_introduce_new_fail() {
         "unbound reviewer is Warn (not Fail); got {ruthless_check}"
     );
 }
+
+// ── zellij layout template validation (zellij-layout-config-around-agent-panes) ──
+
+/// Write a user-scope config with a zellij layout template via the
+/// typed schema (no raw JSON literals).
+fn write_user_zellij_template(env: &TestEnv, template: &str) {
+    use clank::cli::teams_config::ZellijSection;
+    let mut cfg = clank::cli::team::read_user_config(env.home()).unwrap();
+    cfg.zellij = Some(ZellijSection {
+        layout: Some(template.to_string()),
+    });
+    let path = env.home().join(".clank/config.json");
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(&path, serde_json::to_string_pretty(&cfg).unwrap()).unwrap();
+}
+
+fn zellij_check(results: &[clank::cli::doctor::CheckResult]) -> Option<String> {
+    let json = clank::cli::doctor::checks_to_json(results);
+    json.as_array().and_then(|arr| {
+        arr.iter()
+            .find(|c| c["name"] == "zellij layout template")
+            .map(|c| format!("{} {}", c["status"], c["message"]))
+    })
+}
+
+#[test]
+fn doctor_validates_broken_zellij_template_at_doctor_time() {
+    let env = init_repo();
+    write_user_zellij_template(&env, "layout { pane "); // invalid KDL
+    let results = clank::cli::doctor::repo_checks(env.repo(), Some(env.home()));
+    let line = zellij_check(&results).expect("zellij template check present");
+    assert!(
+        line.contains("fail") && line.contains("not valid KDL"),
+        "broken template must FAIL at doctor time; got: {line}"
+    );
+}
+
+#[test]
+fn doctor_flags_template_missing_the_marker() {
+    let env = init_repo();
+    write_user_zellij_template(&env, "layout {\n    pane\n}\n");
+    let results = clank::cli::doctor::repo_checks(env.repo(), Some(env.home()));
+    let line = zellij_check(&results).expect("zellij template check present");
+    assert!(
+        line.contains("fail") && line.contains("clank_agents"),
+        "marker-less template must FAIL naming the marker; got: {line}"
+    );
+}
+
+#[test]
+fn doctor_passes_valid_zellij_template() {
+    let env = init_repo();
+    write_user_zellij_template(&env, "layout {\n    clank_agents\n}\n");
+    let results = clank::cli::doctor::repo_checks(env.repo(), Some(env.home()));
+    let line = zellij_check(&results).expect("zellij template check present");
+    assert!(line.contains("ok"), "valid template passes; got: {line}");
+}
+
+#[test]
+fn doctor_skips_zellij_check_when_unconfigured() {
+    let env = init_repo();
+    let results = clank::cli::doctor::repo_checks(env.repo(), Some(env.home()));
+    assert!(
+        zellij_check(&results).is_none(),
+        "no zellij config → no check emitted"
+    );
+}
