@@ -41,9 +41,8 @@ pub async fn run(args: OpenZellijArgs) -> anyhow::Result<()> {
     write_layout_file(&repo, &kdl)?;
     ensure_gitignore_zellij_entry(&repo)?;
 
-    let status = std::process::Command::new("zellij")
-        .arg("--layout")
-        .arg(&layout_path)
+    let status = std::process::Command::new(&spawn_argv[0])
+        .args(&spawn_argv[1..])
         .status()
         .context("spawning zellij --layout")?;
     if !status.success() {
@@ -172,14 +171,23 @@ fn kdl_escape(s: &str) -> String {
     out
 }
 
-/// The argv we would pass to `zellij --layout <path>` — emitted
-/// on stderr in `--print` mode so tests + tools can inspect
-/// without observing the spawn.
+/// The argv used to spawn zellij — also emitted on stderr in
+/// `--print` mode so tests + tools can inspect without observing
+/// the spawn.
+///
+/// Session serialization is disabled: clank sessions are cheap to
+/// regenerate from the layout, and each serializing server polls
+/// `ps -ao ppid,args` on an interval — accumulated detached
+/// sessions congest the whole machine (observed ~320 servers
+/// pinning every core with concurrent `ps` scans).
 fn compose_spawn_argv(layout_path: &Path) -> Vec<String> {
     vec![
         "zellij".to_string(),
         "--layout".to_string(),
         layout_path.display().to_string(),
+        "options".to_string(),
+        "--session-serialization".to_string(),
+        "false".to_string(),
     ]
 }
 
@@ -340,12 +348,16 @@ mod tests {
     }
 
     #[test]
-    fn compose_spawn_argv_is_zellij_layout_path() {
+    fn compose_spawn_argv_is_zellij_layout_path_with_serialization_off() {
         let argv = compose_spawn_argv(Path::new("/tmp/repo/.clank/zellij/layout.kdl"));
         assert_eq!(argv[0], "zellij");
         assert_eq!(argv[1], "--layout");
         assert_eq!(argv[2], "/tmp/repo/.clank/zellij/layout.kdl");
-        assert_eq!(argv.len(), 3, "no extra args; got: {argv:?}");
+        assert_eq!(
+            argv[3..],
+            ["options", "--session-serialization", "false"],
+            "clank sessions must opt out of serialization; got: {argv:?}"
+        );
     }
 
     #[test]

@@ -3,10 +3,6 @@
 use std::path::Path;
 use std::process::Command;
 
-fn clank_bin() -> &'static str {
-    env!("CARGO_BIN_EXE_clank")
-}
-
 fn git(repo: &Path, args: &[&str]) {
     let status = Command::new("git")
         .arg("-C")
@@ -46,20 +42,6 @@ fn head_sha(repo: &Path) -> String {
         .output()
         .unwrap();
     String::from_utf8(out.stdout).unwrap().trim().to_string()
-}
-
-fn run_clank(repo: &Path, args: &[&str]) -> std::process::Output {
-    let home = tempfile::tempdir().expect("isolated test HOME");
-    Command::new(clank_bin())
-        .args(args)
-        .arg("--repo")
-        .arg(repo)
-        .env("HOME", home.path())
-        .env_remove("CLAUDE_CODE_SESSION_ID")
-        .env_remove("CODEX_THREAD_ID")
-        .env_remove("CLANK_AGENT")
-        .output()
-        .expect("spawn clank")
 }
 
 /// Generate the HTML site IN-PROCESS via the real `html::generate`
@@ -268,33 +250,6 @@ fn html_index_for_repo_with_no_commits_succeeds() {
     assert!(
         body.contains("Timeline"),
         "Timeline section should appear even with no events"
-    );
-}
-
-#[test]
-fn html_open_is_a_subcommand_and_unknown_subcommand_errors() {
-    // `clank html open --help` should succeed (clap recognizes
-    // the subcommand) and a bogus subcommand should fail at
-    // parse time.
-    let dir = init_repo();
-    let home = tempfile::tempdir().expect("isolated test HOME");
-    let out = Command::new(clank_bin())
-        .args(["html", "open", "--help"])
-        .arg("--repo")
-        .arg(dir.path())
-        .env("HOME", home.path())
-        .output()
-        .expect("spawn clank");
-    assert!(
-        out.status.success(),
-        "clank html open --help should parse cleanly; stderr=`{}`",
-        String::from_utf8_lossy(&out.stderr)
-    );
-
-    let bogus = run_clank(dir.path(), &["html", "bogus-subcommand"]);
-    assert!(
-        !bogus.status.success(),
-        "an unknown subcommand must fail at parse time"
     );
 }
 
@@ -895,18 +850,6 @@ fn html_diff_rows_have_no_trailing_newline_in_markup() {
     );
 }
 
-#[test]
-fn init_gitignore_includes_html_dir() {
-    let dir = init_repo();
-    let out = run_clank(dir.path(), &["init"]);
-    assert!(out.status.success());
-    let body = std::fs::read_to_string(dir.path().join(".clank/.gitignore")).unwrap();
-    assert!(
-        body.contains("/html/"),
-        "canonical .clank/.gitignore should include /html/; got:\n{body}"
-    );
-}
-
 fn commit_with_body(repo: &Path, subject: &str, body: &str) {
     git(repo, &["add", "-A"]);
     git(repo, &["commit", "--quiet", "-m", subject, "-m", body]);
@@ -1365,31 +1308,5 @@ fn html_version_match_preserves_incremental_skip() {
     assert_eq!(
         mtime_before, mtime_after,
         "pinned older commit page should NOT be rewritten when version matches and it's outside top-N"
-    );
-}
-
-/// Through-the-binary HAPPY-PATH smoke: the content assertions
-/// above run `html::generate` in-process, so this one spawn
-/// covers the `clank html` shell glue end-to-end — arg parse →
-/// generate → write the site → `wrote <path>` on stdout, exit 0.
-/// Matches the per-command CLI smoke the other Phase-B cores
-/// carry. (The `bogus-subcommand` test covers only the clap
-/// FAILURE path, not this generate→write glue.)
-#[test]
-fn html_cli_smoke_writes_site() {
-    let dir = init_repo();
-    let repo = dir.path();
-    write(repo, ".clank/plans/foo.md", "# foo\n");
-    commit(repo, "[foo] intro");
-
-    let out = run_clank(repo, &["html"]);
-    assert!(
-        out.status.success(),
-        "clank html should exit 0: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    assert!(
-        repo.join(".clank/html/index.html").is_file(),
-        "clank html should write index.html"
     );
 }

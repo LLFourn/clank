@@ -4,11 +4,6 @@ mod common;
 
 use common::TestEnv;
 use std::path::Path;
-use std::process::Command;
-
-fn clank_bin() -> &'static str {
-    env!("CARGO_BIN_EXE_clank")
-}
 
 fn write(repo: &Path, rel: &str, body: &str) {
     let abs = repo.join(rel);
@@ -366,30 +361,4 @@ fn doctor_warn_for_unbound_does_not_introduce_new_fail() {
         ruthless_check["status"], "warn",
         "unbound reviewer is Warn (not Fail); got {ruthless_check}"
     );
-}
-
-/// Through-the-binary smoke: the assertions above run doctor's
-/// repo_checks in-process, so this one spawn covers the full
-/// `clank doctor --json` shell glue (repo+user+session checks →
-/// serialize → stdout). Per the Phase-B shell-glue coverage pin.
-#[test]
-fn doctor_cli_smoke_emits_json_array() {
-    let env = init_repo();
-    write(env.repo(), ".clank/.gitignore", ".gitignore\n");
-    register_agents(&env, &[("ruthless", clank_core::vocab::Role::Reviewer)]);
-    let out = Command::new(clank_bin())
-        .arg("doctor")
-        .arg("--repo")
-        .arg(env.repo())
-        .arg("--json")
-        .env("HOME", env.home())
-        .env_remove("CLAUDE_CODE_SESSION_ID")
-        .env_remove("CODEX_THREAD_ID")
-        .output()
-        .expect("spawn clank doctor");
-    // doctor may exit non-zero on baseline Fail checks (e.g. no
-    // session); we only assert it emits a parseable JSON array.
-    let parsed: serde_json::Value = serde_json::from_slice(&out.stdout)
-        .expect("clank doctor --json must emit parseable JSON on stdout");
-    assert!(parsed.is_array(), "doctor --json is an array of checks");
 }

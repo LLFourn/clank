@@ -13,14 +13,11 @@ use std::path::Path;
 use std::process::Command;
 
 /// A git repo with its OWN HOME, distinct from the repo dir, so a
-/// team set up via [`register_team`] persists in user-scope
-/// across every spawned `clank` invocation. Each test owns one;
-/// `run()` helpers point `HOME` at `env.home()`.
-///
-/// `TestEnv` deliberately does NOT provide a `run()`/`cmd()` —
-/// each test file's invocation needs differ (env scrubbing,
-/// piped stdin, extra flags). It owns only the home+repo+team
-/// scaffolding; the file keeps its own `run(&TestEnv, ...)`.
+/// team set up via [`register_team`] persists in user-scope.
+/// Tests pass `env.home()` / `env.repo()` to the library cores
+/// they call in-process — no test executes the clank binary
+/// (clean break, lloyd 2026-06-10; behavior coverage lives in
+/// each `cli::*` module's unit tests).
 pub struct TestEnv {
     pub home: tempfile::TempDir,
     pub repo: tempfile::TempDir,
@@ -58,19 +55,6 @@ impl TestEnv {
             commit_reviewers,
             gate_reviewers,
         );
-    }
-
-    /// A base `clank` command with `HOME` PRE-POINTED at this
-    /// env's separate home dir. Always start hand-built commands
-    /// from here so the team registered into `home()` is visible
-    /// and `HOME` can't be forgotten — the footgun codex caught
-    /// on 9b497a5, where a command that omitted `HOME` could fail
-    /// for the wrong reason. Callers add `--repo`, args, and any
-    /// `env_remove` scrubbing themselves (those vary per command).
-    pub fn clank(&self) -> Command {
-        let mut cmd = Command::new(env!("CARGO_BIN_EXE_clank"));
-        cmd.env("HOME", self.home());
-        cmd
     }
 }
 

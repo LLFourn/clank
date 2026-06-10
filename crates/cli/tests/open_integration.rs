@@ -7,10 +7,6 @@ use std::process::Command;
 
 use serde_json::Value;
 
-fn clank_bin() -> &'static str {
-    env!("CARGO_BIN_EXE_clank")
-}
-
 fn git(repo: &Path, args: &[&str]) {
     let status = Command::new("git")
         .arg("-C")
@@ -526,40 +522,6 @@ fn foreign_post_rewrite_hook_is_warning_not_init_gap() {
 }
 
 #[test]
-fn clank_ready_after_full_init() {
-    let home = tempfile::tempdir().unwrap();
-    let dir = init_repo();
-    let repo = dir.path();
-    // clank init does the repo setup (scaffold + hook + perms).
-    let out = Command::new(clank_bin())
-        .args(["init"])
-        .arg("--repo")
-        .arg(repo)
-        .env("HOME", home.path())
-        .env_remove("CLAUDE_CODE_SESSION_ID")
-        .env_remove("CODEX_THREAD_ID")
-        .env_remove("CLANK_AGENT")
-        .output()
-        .expect("spawn clank init");
-    assert!(
-        out.status.success(),
-        "clank init failed: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    let v = run_open(repo, home.path());
-    assert_eq!(v["state"], "clank_ready", "got {v}");
-    assert!(
-        v.get("init_gaps").is_none(),
-        "init_gaps should be omitted when empty; got {v}"
-    );
-    let recs = v["recommendations"].as_array().unwrap();
-    assert!(
-        !recs.iter().any(|r| r["kind"] == "clank_init"),
-        "no clank_init recommendation when ready; got {recs:?}"
-    );
-}
-
-#[test]
 fn clank_init_recommendation_carries_gaps_array() {
     let home = tempfile::tempdir().unwrap();
     let dir = init_repo();
@@ -582,49 +544,6 @@ fn clank_init_recommendation_carries_gaps_array() {
     assert_eq!(
         rec_gaps, top_gap_kinds,
         "recommendation's gaps must mirror top-level init_gaps kinds in order"
-    );
-}
-
-#[test]
-fn clank_ready_unaffected_by_unbound_agents() {
-    let home = tempfile::tempdir().unwrap();
-    let dir = init_repo();
-    let repo = dir.path();
-    let out = Command::new(clank_bin())
-        .args(["init"])
-        .arg("--repo")
-        .arg(repo)
-        .env("HOME", home.path())
-        .env_remove("CLAUDE_CODE_SESSION_ID")
-        .env_remove("CODEX_THREAD_ID")
-        .env_remove("CLANK_AGENT")
-        .output()
-        .expect("spawn clank init");
-    assert!(
-        out.status.success(),
-        "clank init failed: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    // No `.clank/agents/<label>/` dirs created (init runs
-    // without a bound agent session under the test env).
-    let agents_root = repo.join(".clank/agents");
-    if agents_root.exists() {
-        // Remove any auto-created agent dirs so the test pins
-        // the "no known agents" branch deterministically.
-        for entry in std::fs::read_dir(&agents_root).unwrap().flatten() {
-            std::fs::remove_dir_all(entry.path()).unwrap();
-        }
-    }
-
-    let v = run_open(repo, home.path());
-    assert_eq!(v["state"], "clank_ready", "got {v}");
-    let agents = v["clank"]["agents"].as_array().expect("agents array");
-    assert!(agents.is_empty(), "expected empty agents; got {agents:?}");
-    let kinds = rec_kinds(&v);
-    assert_eq!(
-        kinds,
-        vec!["bind_agent"],
-        "ready repo with no agents must surface a single bind_agent rec"
     );
 }
 
@@ -766,27 +685,4 @@ fn lex_clean_for_missing_relative_path() {
         Path::new(v["opened_path"].as_str().unwrap()).is_absolute(),
         "opened_path should be absolute for missing relative input"
     );
-}
-
-/// Through-the-binary smoke: the assertions above run
-/// `open::inspect` in-process, so this one spawn covers the
-/// `clank open dry --json` shell glue (arg parse → inspect →
-/// serialize → stdout). Per the Phase-B shell-glue coverage pin.
-#[test]
-fn open_dry_cli_smoke_emits_json() {
-    let home = tempfile::tempdir().unwrap();
-    let dir = init_repo();
-    let out = Command::new(clank_bin())
-        .args(["open", "dry", "--json"])
-        .arg(dir.path())
-        .env("HOME", home.path())
-        .env_remove("CLAUDE_CODE_SESSION_ID")
-        .env_remove("CODEX_THREAD_ID")
-        .env_remove("CLANK_AGENT")
-        .output()
-        .expect("spawn clank open dry");
-    assert!(out.status.success(), "clank open dry should exit 0");
-    let v: Value = serde_json::from_slice(&out.stdout)
-        .expect("clank open dry --json must emit parseable JSON on stdout");
-    assert!(v.get("state").is_some(), "json has a state field");
 }
