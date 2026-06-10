@@ -6,12 +6,20 @@
 
 use std::path::{Path, PathBuf};
 
-/// Canonical body of `.clank/.gitignore`.
-pub const CLANK_GITIGNORE_BODY: &str = "/agents/\n/cache/\n/feedback/\n/queue/\n/html/\n";
+/// Canonical body of `.clank/.gitignore`. Everything local-only
+/// lives here: agent state, caches, the queue, rendered html,
+/// shelved-plan state (plan-lifecycle-verbs), fork worktrees
+/// (clank-fork-worktree-sessions — codex 335c0fc caught the
+/// default location not being covered), and generated zellij
+/// layouts.
+pub const CLANK_GITIGNORE_BODY: &str =
+    "/agents/\n/cache/\n/feedback/\n/queue/\n/html/\n/shelved/\n/worktrees/\n/zellij/\n";
 
 /// Older bodies init silently upgrades to `CLANK_GITIGNORE_BODY`.
 /// Anything else makes init bail.
 pub const CLANK_GITIGNORE_LEGACY_BODIES: &[&str] = &[
+    "/agents/\n/cache/\n/feedback/\n/queue/\n/html/\n",
+    "/agents/\n/cache/\n/feedback/\n/queue/\n/html/\n/zellij/\n",
     "/agents/\n/cache/\n/feedback/\n/queue/\n",
     "/agents/\n/cache/\n/feedback/\n",
     "feedback/\ncache/\n",
@@ -328,4 +336,30 @@ mod tests {
         .unwrap();
         assert_eq!(classify_claude_perms(dir.path()), ClaudePermsState::Drifted);
     }
+}
+
+/// Idempotently ensure `<repo>/.clank/.gitignore` contains
+/// `entry` (one line). Shared by the commands that create
+/// local-only state in repos whose gitignore may predate the
+/// entry (fork: /worktrees/, open zellij: /zellij/).
+pub fn ensure_clank_gitignore_entry(repo: &Path, entry: &str) -> std::io::Result<()> {
+    let path = clank_gitignore_path(repo);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let body = match std::fs::read_to_string(&path) {
+        Ok(s) => s,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => return Err(e),
+    };
+    if body.lines().any(|l| l.trim() == entry) {
+        return Ok(());
+    }
+    let mut new_body = body;
+    if !new_body.is_empty() && !new_body.ends_with('\n') {
+        new_body.push('\n');
+    }
+    new_body.push_str(entry);
+    new_body.push('\n');
+    std::fs::write(&path, new_body)
 }

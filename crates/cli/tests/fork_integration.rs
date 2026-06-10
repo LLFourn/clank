@@ -62,7 +62,7 @@ fn source_with_bound_team() -> TestEnv {
     write(
         repo,
         ".clank/.gitignore",
-        "/cache/\n/agents/\n/worktrees/\n",
+        clank::init_facts::CLANK_GITIGNORE_BODY,
     );
     write(repo, "src/lib.rs", "// base\n");
     commit(repo, "[misc] base");
@@ -135,6 +135,15 @@ fn fork_creates_worktree_and_seeds_team() {
     assert!(
         dest.join(".clank/.gitignore").is_file(),
         "tracked state checked out"
+    );
+    // THE codex 335c0fc assertion: the default worktree location
+    // never pollutes main-repo status (canonical gitignore covers
+    // /worktrees/; fork also ensures the entry idempotently for
+    // repos predating it).
+    assert_eq!(
+        git_out(repo, &["status", "--porcelain"]).trim(),
+        "",
+        "fork must leave main-repo status clean"
     );
 
     // Per-agent fork specs with the right source ids + orientation.
@@ -241,4 +250,31 @@ fn fork_rejects_bad_names() {
         .to_string();
         assert!(err.contains("simple"), "`{bad}` rejected: {err}");
     }
+}
+
+#[test]
+fn fork_keeps_status_clean_even_with_stale_gitignore() {
+    // Repos initialized before /worktrees/ joined the canonical
+    // body: fork ensures the entry idempotently (codex 335c0fc).
+    let env = source_with_bound_team();
+    let repo = env.repo();
+    write(repo, ".clank/.gitignore", "/cache/\n/agents/\n");
+    commit(repo, "[misc] stale gitignore");
+
+    block_on(clank::cli::fork::run_fork(
+        &fork_args(&env, "wt"),
+        Some(env.home()),
+    ))
+    .unwrap();
+
+    let status = git_out(repo, &["status", "--porcelain"]);
+    assert!(
+        !status.contains("worktrees"),
+        "worktree dir must be ignored: {status}"
+    );
+    let gi = std::fs::read_to_string(repo.join(".clank/.gitignore")).unwrap();
+    assert!(
+        gi.lines().any(|l| l == "/worktrees/"),
+        "entry appended: {gi}"
+    );
 }
