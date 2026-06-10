@@ -38,14 +38,20 @@ me back to before they happened, remember to put them back later."
 ### Shelve
 
 `clank shelve <plan>` on an in-flight plan:
-- Notes the plan's first commit and current HEAD in clank state.
-- Resets the branch back to before the plan's first commit.
-- The plan's commits become unreachable from the branch BUT
-  preserved (refs in clank state, recoverable).
-- The plan's `.clank/plans/<plan>.md` file moves to a
-  shelved-plans area (or stays put with a "shelved" marker —
-  detail).
-- `clank status` shows the plan as **shelved**, listing what it
+- FIRST protects the current tip with a real git ref
+  (`refs/clank/shelved/<plan>`) — GC-safe, see the design
+  section below.
+- Drops the plan's commits from the branch via the SAME rewrite
+  path demote uses today (not a reset) — inheriting all its
+  guards, including the foreign-commit refusal: a plan
+  interleaved with other work cannot be shelved (same policy as
+  demote today; `plan-reorder` is the future enabler for
+  disentangling).
+- The plan's commits stay reachable from the protective ref;
+  shelve state (`.clank/shelved/<plan>.json`) records the
+  ordered plan shas + the ref + optional `--for`.
+- The plan file leaves the branch with the dropped intro commit;
+  `clank status` shows the plan as **shelved**, listing what it
   was waiting on if `--for` was used (see below).
 
 Optional flag: `--for <other-plan>` records the dependency
@@ -55,15 +61,26 @@ prompts described below.
 ### Unshelve
 
 `clank unshelve <plan>` on a shelved plan:
-- Cherry-picks the plan's commits back on top of current HEAD.
-- Restores the plan file from shelved to in-flight.
-- Clank state notes the plan is live again.
+- Cherry-picks the recorded plan commits (in order) from under
+  the protective ref onto current HEAD.
+- The plan file returns with the replayed intro; clank state
+  notes the plan is live again; ref + shelve state are deleted
+  only after the restore fully lands (fail-closed).
+- **Reviews reset — by design (lloyd 2026-06-10)**: the
+  cherry-picked commits are NEW shas in a NEW code context (the
+  awaited work landed underneath), so prior verdicts don't
+  carry. No feedback/state migration happens at all; the fold
+  sees the new head, derives gate=Unreviewed, and the commit
+  reviewers wake to re-review. This is a feature: nobody
+  approved A-on-top-of-B. (It also deletes the would-be most
+  complex machinery — git fires `post-rewrite` only on
+  rebase/amend, never cherry-pick, so verdict preservation
+  would have needed bespoke re-map wiring we now don't build.)
 
-Auto-prompted unshelve:
-- When the plan recorded as `--for X` finishes, clank prompts:
-  "Plan X just finished. Plan A was shelved for it — unshelve
-  now?"
-- `clank status` flags shelved-but-precondition-met plans.
+Unshelve nudge:
+- `clank status` flags shelved plans whose `--for X` is now in
+  finished_plans ("shelved for X — X finished"). No interactive
+  finish-time prompt (finish stays non-interactive).
 
 ### Edge cases the user should see handled
 
@@ -83,15 +100,17 @@ Auto-prompted unshelve:
 clank shelve A
 clank shelve A --for B          # records the dependency
 clank unshelve A                # explicit
-clank shelve list               # show all shelved plans + reasons
+clank shelve list               # OPTIONAL/v2 — `clank status`
+                                #   already shows shelved plans
 clank shelve clean A            # discard a shelved plan permanently
 ```
 
 ## Relationship to `plan-reorder` (split out)
 
 `shelve` is **workflow-time intent** — captured before the
-interleaving exists. Cheap to use, no history rewrite needed
-(reset + cherry-pick).
+interleaving exists. Cheap to use: a guarded drop of a clean
+single-plan range + a protective ref (mechanically a rewrite,
+but of the trivial contiguous kind).
 
 `reorder` is **post-hoc cleanup** — needed when the interleaving
 already exists, either because shelve wasn't used or because two
@@ -193,12 +212,15 @@ ref protecting everything:
    protective ref, optional `--for <plan>`, shelved-at).
 3. **Drop via the rewrite engine** — the same
    `build_rewrite_preview` + `run_rewrite` path demote uses
-   (demote.rs:21/58/119), NOT a reset. This handles
-   NON-CONTIGUOUS / interleaved plan commits identically for
-   plain shelve and `--to-queue` (concern 3: a reset-based shelve
-   would silently narrow demote's any-position capability AND
-   discard other plans' commits layered on top; routing both
-   through the rewrite keeps one code path and full capability).
+   (demote.rs), NOT a reset. CORRECTION (codex 3a6b14f): demote
+   does NOT handle interleaved plans — it unconditionally
+   refuses foreign commits in the range (rewrite blockers, a
+   deliberate safety from codex 625b8af). Shelve inherits the
+   SAME refusal: shelving an interleaved plan errors cleanly
+   (no narrowing — capability parity with demote — and no
+   reset-style discarding of commits layered on top).
+   `plan-reorder` (split-out sibling) is the future path to
+   disentangle interleaved plans into shelvable blocks.
 4. `--to-queue` additionally saves the plan body back to the
    queue (demote's existing body-save), removing the in-flight
    plan file; plain shelve marks the plan shelved (file moves to
@@ -208,16 +230,16 @@ ref protecting everything:
 
 1. Cherry-pick the recorded shas (in order) from under the
    protective ref onto current HEAD.
-2. **Explicit old→new sha re-map** (concern 2): cherry-pick mints
-   NEW shas and git's post-rewrite hook does NOT fire for
-   cherry-pick — the existing feedback-migration path will not
-   run. unshelve itself re-maps: feedback files
-   (`.clank/agents/*/feedback/<old>.md` → `<new>.md`), and any
-   recorded shas in shelve state, using the cherry-pick's
-   old→new pairs (read from `git rev-parse` after each pick, or
-   `git cherry-pick --keep-redundant-commits` sequence output).
-   Reuse the same re-map helper the post-rewrite hook uses
-   (`clank rewire` internals) — call it directly with the pairs.
+2. **No re-map — reviews reset (concern 2, RESOLVED by design
+   decision, lloyd 2026-06-10)**: verdict preservation across
+   unshelve is not wanted. The cherry-picked commits are new
+   shas in a new context; old approvals don't apply, so nothing
+   migrates. (Context on the machinery this avoids: git fires
+   `post-rewrite` for rebase/amend only — never cherry-pick —
+   and clank's own rewrites do their migration in-process, so
+   preservation would have required bespoke old→new pair
+   plumbing. With re-review semantics the gate machinery does
+   everything: new head → Unreviewed → reviewers wake.)
 3. On success: delete the protective ref + shelve state, restore
    the plan file to `.clank/plans/`.
 4. Conflicts: stop like a normal cherry-pick; the protective ref
