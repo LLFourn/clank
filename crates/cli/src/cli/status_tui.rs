@@ -48,6 +48,9 @@ enum Style {
     /// State-colored (the frame's one hue) — used sparingly for
     /// the line that demands action (a pending block's question).
     Accent,
+    /// Fixed ANSI color (the log tier's verdict ticks — green ✓ /
+    /// cyan ✓✓ / red ✗; lloyd asked for the marks to pop).
+    Color(&'static str),
 }
 
 struct Span(Style, String);
@@ -189,18 +192,60 @@ pub(crate) fn render(snap: &StatusSnapshot, rows: u16, cols: u16) -> Vec<String>
     // bottom (tail), every line dim + display-width truncated via
     // the same emit path as the gauges. A blank separator when
     // there's room for it plus at least one line.
-    if out.len() < rows && !snap.log_lines.is_empty() {
+    if out.len() < rows && !snap.log_rows.is_empty() {
         let mut avail = rows - out.len();
         if avail >= 2 {
             out.push(String::new());
             avail -= 1;
         }
-        let start = snap.log_lines.len().saturating_sub(avail);
-        for line in &snap.log_lines[start..] {
-            out.push(emit(&[dim(line.clone())], color, cols));
+        let start = snap.log_rows.len().saturating_sub(avail);
+        for row in &snap.log_rows[start..] {
+            out.push(emit(&log_row_spans(row), color, cols));
         }
     }
     out
+}
+
+/// Style one log row for the pane: umbrella headers plain at
+/// column 0, commit shas dim with plain subjects, review marks in
+/// their verdict colors (green ✓ / cyan ✓✓ / red ✗) with dim
+/// authors (log-plan-umbrellas).
+fn log_row_spans(row: &crate::cli::log::OnelineRow) -> Vec<Span> {
+    use crate::cli::log::OnelineRow;
+    use clank_core::vocab::Verdict;
+    match row {
+        OnelineRow::Header { plan } => {
+            vec![plain(plan.clone().unwrap_or_else(|| "adhoc".to_string()))]
+        }
+        OnelineRow::Commit { sha, subject } => vec![
+            dim(format!("  {} ", &sha.as_str()[..7])),
+            plain(subject.clone()),
+        ],
+        OnelineRow::Review {
+            verdict,
+            author,
+            summary,
+        } => {
+            let mark_color = match verdict {
+                Verdict::Approve => "32",
+                Verdict::Finished => "36",
+                Verdict::RequestChanges => "31",
+                Verdict::Unmarked => "2",
+            };
+            let mark = crate::cli::log::verdict_mark(*verdict, false);
+            let snip = if summary.is_empty() {
+                String::new()
+            } else {
+                format!(": {summary}")
+            };
+            vec![
+                plain("    ".to_string()),
+                Span(Style::Color(mark_color), mark),
+                dim(format!(" {author}")),
+                plain(snip),
+            ]
+        }
+    }
 }
 
 /// The signal lamp: `{emoji} {ACTOR} {verb}` left, plan stem
@@ -335,6 +380,7 @@ fn emit(spans: &[Span], color: &str, cols: usize) -> String {
             Style::Plain => out.push_str(&piece),
             Style::Dim => out.push_str(&format!("\x1b[2m{piece}\x1b[0m")),
             Style::Accent => out.push_str(&format!("\x1b[{color}m{piece}\x1b[0m")),
+            Style::Color(c) => out.push_str(&format!("\x1b[{c}m{piece}\x1b[0m")),
         }
         if truncated_here {
             break;
@@ -543,7 +589,7 @@ pub(crate) mod tests {
             queue: queue.into_iter().map(str::to_string).collect(),
             master: Some("claude".into()),
             shelved: Vec::new(),
-            log_lines: Vec::new(),
+            log_rows: Vec::new(),
         }
     }
 
@@ -776,9 +822,16 @@ mod log_tier_tests {
     use super::tests::{plan_state, reviewer_missing, snap, visible};
     use super::*;
 
-    fn snap_with_log(lines: &[&str]) -> StatusSnapshot {
+    fn commit_row(subject: &str) -> crate::cli::log::OnelineRow {
+        crate::cli::log::OnelineRow::Commit {
+            sha: crate::lifecycle::CommitSha::parse(&format!("{:0<40}", "abc1234")).unwrap(),
+            subject: subject.to_string(),
+        }
+    }
+
+    fn snap_with_log(subjects: &[&str]) -> StatusSnapshot {
         let mut s = snap(vec![plan_state("foo", reviewer_missing("codex"))], vec![]);
-        s.log_lines = lines.iter().map(|l| l.to_string()).collect();
+        s.log_rows = subjects.iter().map(|l| commit_row(l)).collect();
         s
     }
 
@@ -789,10 +842,16 @@ mod log_tier_tests {
         let s = snap_with_log(&["e1", "e2", "e3", "e4", "e5"]);
         let texts: Vec<String> = render(&s, 8, 60).iter().map(|l| visible(l)).collect();
         assert_eq!(texts.len(), 8);
-        assert_eq!(texts[5], "e3");
-        assert_eq!(texts[6], "e4");
-        assert_eq!(texts[7], "e5", "most recent visible at the bottom");
-        assert!(!texts.iter().any(|t| t == "e1"), "oldest dropped first");
+        assert!(texts[5].ends_with("e3"), "got {texts:?}");
+        assert!(texts[6].ends_with("e4"), "got {texts:?}");
+        assert!(
+            texts[7].ends_with("e5"),
+            "most recent visible at the bottom: {texts:?}"
+        );
+        assert!(
+            !texts.iter().any(|t| t.ends_with("e1")),
+            "oldest dropped first"
+        );
     }
 
     #[test]
@@ -801,7 +860,7 @@ mod log_tier_tests {
         // 3 rows: bar + gate + git eat everything.
         let texts: Vec<String> = render(&s, 3, 60).iter().map(|l| visible(l)).collect();
         assert!(
-            !texts.iter().any(|t| t.starts_with('e')),
+            !texts.iter().any(|t| t.ends_with("e1") || t.ends_with("e2")),
             "no log rows at 3 rows: {texts:?}"
         );
     }
@@ -811,7 +870,7 @@ mod log_tier_tests {
         // Wide-char commit subjects (emoji) must truncate by
         // display columns — the same blind spot the banner had
         // (ruthless 54c37f6 concern 3).
-        let s = snap_with_log(&["abc1234 🔨🔨🔨🔨🔨🔨 a very wide subject"]);
+        let s = snap_with_log(&["🔨🔨🔨🔨🔨🔨 a very wide subject"]);
         let lines = render(&s, 10, 14);
         for line in &lines {
             assert!(
@@ -819,5 +878,42 @@ mod log_tier_tests {
                 "log line wider than 14 display cols: `{line}`"
             );
         }
+    }
+
+    #[test]
+    fn log_rows_styled_per_kind() {
+        use crate::cli::log::OnelineRow;
+        use clank_core::vocab::Verdict;
+        let mut s = snap(vec![plan_state("foo", reviewer_missing("codex"))], vec![]);
+        s.log_rows = vec![
+            OnelineRow::Header {
+                plan: Some("foo".into()),
+            },
+            commit_row("intro"),
+            OnelineRow::Review {
+                verdict: Verdict::Approve,
+                author: "codex".into(),
+                summary: "lgtm".into(),
+            },
+        ];
+        let lines = render(&s, 10, 60);
+        let texts: Vec<String> = lines.iter().map(|l| visible(l)).collect();
+        // Umbrella header at column 0; commit indented under it.
+        assert!(texts.iter().any(|t| t == "foo"), "header: {texts:?}");
+        assert!(
+            texts.iter().any(|t| t.starts_with("  abc1234 intro")),
+            "commit indented: {texts:?}"
+        );
+        // The verdict tick is COLORED (green for approve) in the raw
+        // ANSI output — lloyd's "make the ticks pop".
+        let raw = lines.join("");
+        assert!(
+            raw.contains("\x1b[32m✓\x1b[0m"),
+            "approve tick must be green: {raw:?}"
+        );
+        assert!(
+            texts.iter().any(|t| t.contains("✓ codex: lgtm")),
+            "review line: {texts:?}"
+        );
     }
 }

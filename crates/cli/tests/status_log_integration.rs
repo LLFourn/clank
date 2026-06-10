@@ -59,15 +59,22 @@ fn snapshot_carries_recent_oneline_log_with_reviews() {
         .unwrap();
     let lines = snap.log_lines_for_test();
     let joined = lines.join("\n");
-    assert!(joined.contains("[foo] intro"), "got:\n{joined}");
-    assert!(joined.contains("[foo] impl a"), "got:\n{joined}");
+    // Umbrella shape (log-plan-umbrellas): plan header at col 0,
+    // commits beneath with the [foo] prefix STRIPPED.
+    assert!(
+        lines.iter().any(|l| l == "foo"),
+        "umbrella header:\n{joined}"
+    );
+    assert!(!joined.contains("[foo]"), "prefix stripped:\n{joined}");
+    assert!(joined.contains(" intro"), "got:\n{joined}");
+    assert!(joined.contains(" impl a"), "got:\n{joined}");
     assert!(
         joined.contains("✓ codex: lgtm"),
         "review sub-line:\n{joined}"
     );
     // Chronological: intro before impl.
     assert!(
-        joined.find("[foo] intro").unwrap() < joined.find("[foo] impl a").unwrap(),
+        joined.find(" intro").unwrap() < joined.find(" impl a").unwrap(),
         "oldest first:\n{joined}"
     );
 }

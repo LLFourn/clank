@@ -635,25 +635,17 @@ fn render_timeline(
         return "<p class=\"empty\">No events yet.</p>\n".to_string();
     }
     let mut out = String::from("<div class=\"timeline\">\n");
-    // Group newest-first.
-    let mut newest_first: Vec<&LogEvent> = events.iter().rev().collect();
-    while !newest_first.is_empty() {
-        // Take a run of contiguous same-key events.
-        let key = umbrella_key(newest_first[0]);
-        let split = newest_first
-            .iter()
-            .position(|e| umbrella_key(e) != key)
-            .unwrap_or(newest_first.len());
-        let (run, rest) = newest_first.split_at(split);
+    // Group newest-first via the SHARED contiguous-run rule.
+    let newest_first: Vec<&LogEvent> = events.iter().rev().collect();
+    for (key, run) in clank_core::repo_state::umbrella_sections(&newest_first) {
         out.push_str(&render_umbrella(
             &key,
-            run,
+            &run,
             reviews,
             subjects,
             plan_link_mode,
             commit_href_prefix,
         ));
-        newest_first = rest.to_vec();
     }
     out.push_str("</div>\n");
     out
@@ -671,20 +663,21 @@ fn render_umbrella(
 ) -> String {
     let mut out = format!(
         "<section class=\"umbrella umbrella-{kind}\" data-umbrella-key=\"{key_attr}\">\n",
-        kind = key.kind_class(),
-        key_attr = esc(&key.attr_value())
+        kind = umbrella_kind_class(key),
+        key_attr = esc(&umbrella_attr_value(key))
     );
     out.push_str("  <header class=\"umbrella-header\">");
     match key {
         UmbrellaKey::Plan(p) => match plan_link_mode {
             PlanLinkMode::LinkRelativeToIndex => out.push_str(&format!(
                 "<a class=\"plan-pill\" href=\"plan/{}.html\">{}</a>",
-                esc(p),
-                esc(p)
+                esc(p.as_str()),
+                esc(p.as_str())
             )),
-            PlanLinkMode::NoLink => {
-                out.push_str(&format!("<span class=\"plan-pill\">{}</span>", esc(p)))
-            }
+            PlanLinkMode::NoLink => out.push_str(&format!(
+                "<span class=\"plan-pill\">{}</span>",
+                esc(p.as_str())
+            )),
         },
         UmbrellaKey::AdHoc => out.push_str("<span class=\"adhoc-label\">ad-hoc</span>"),
     }
@@ -742,32 +735,22 @@ fn render_row(
     out
 }
 
-/// Identity key used to group adjacent events into one umbrella.
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum UmbrellaKey {
-    Plan(String),
-    AdHoc,
-}
+// Display adapters over the SHARED umbrella key (core owns the
+// grouping rule — log-plan-umbrellas factored it so html and the
+// oneline renderers can't drift on "what counts as one umbrella").
+use clank_core::repo_state::UmbrellaKey;
 
-impl UmbrellaKey {
-    fn kind_class(&self) -> &'static str {
-        match self {
-            UmbrellaKey::Plan(_) => "plan",
-            UmbrellaKey::AdHoc => "adhoc",
-        }
-    }
-    fn attr_value(&self) -> String {
-        match self {
-            UmbrellaKey::Plan(p) => p.clone(),
-            UmbrellaKey::AdHoc => "ad-hoc".to_string(),
-        }
+fn umbrella_kind_class(key: &UmbrellaKey) -> &'static str {
+    match key {
+        UmbrellaKey::Plan(_) => "plan",
+        UmbrellaKey::AdHoc => "adhoc",
     }
 }
 
-fn umbrella_key(event: &LogEvent) -> UmbrellaKey {
-    match event_plan(event) {
-        Some(p) => UmbrellaKey::Plan(p.to_string()),
-        None => UmbrellaKey::AdHoc,
+fn umbrella_attr_value(key: &UmbrellaKey) -> String {
+    match key {
+        UmbrellaKey::Plan(p) => p.as_str().to_string(),
+        UmbrellaKey::AdHoc => "ad-hoc".to_string(),
     }
 }
 

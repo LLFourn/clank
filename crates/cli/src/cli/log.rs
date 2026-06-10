@@ -198,7 +198,7 @@ fn kind_label(tp: bool, tc: bool) -> &'static str {
     }
 }
 
-fn verdict_mark(v: Verdict, c: bool) -> String {
+pub(crate) fn verdict_mark(v: Verdict, c: bool) -> String {
     let (mark, col) = match v {
         Verdict::Approve => ("✓", G),
         Verdict::Finished => ("✓✓", C),
@@ -307,8 +307,15 @@ fn print_human(events: &[&LogEvent], repo: &Path, shas: &[CommitSha]) -> anyhow:
 /// by the CLI renderer (which colors it) and the status TUI's log
 /// pane (which dims it). Plan: status-tui-live-log.
 pub(crate) enum OnelineRow {
+    /// Umbrella header: the plan that groups the following commit
+    /// rows, or `None` for the ad-hoc bucket
+    /// (log-plan-umbrellas).
+    Header { plan: Option<String> },
     Commit {
         sha: CommitSha,
+        /// Subject with the `[plan]` prefix STRIPPED when it
+        /// matches the enclosing umbrella's plan (redundant under
+        /// the header); verbatim otherwise.
         subject: String,
     },
     Review {
@@ -326,33 +333,61 @@ pub(crate) fn oneline_rows(
     events: &[&LogEvent],
     reviews: &std::collections::BTreeMap<String, Vec<Review>>,
 ) -> Vec<OnelineRow> {
+    use clank_core::repo_state::{UmbrellaKey, parse_subject, umbrella_sections};
     let mut out = Vec::new();
-    for event in events {
-        let (sha, subject) = match event {
-            LogEvent::PlanIntro { sha, subject, .. }
-            | LogEvent::PlanCommit { sha, subject, .. }
-            | LogEvent::AdHoc { sha, subject, .. } => (sha, subject.clone()),
-            LogEvent::PlanFinalized { plan, sha, .. } => {
-                (sha, format!("[{}] finish", plan.as_str()))
-            }
-            LogEvent::PlanDeleted { plan, sha, .. } => (sha, format!("Delete {}", plan.as_str())),
+    for (key, run) in umbrella_sections(events) {
+        let umbrella_plan = match &key {
+            UmbrellaKey::Plan(p) => Some(p.as_str().to_string()),
+            UmbrellaKey::AdHoc => None,
         };
-        out.push(OnelineRow::Commit {
-            sha: sha.clone(),
-            subject,
+        out.push(OnelineRow::Header {
+            plan: umbrella_plan.clone(),
         });
-        // AdHoc rows carried no review sub-lines before the
-        // factoring; keep that shape.
-        if matches!(event, LogEvent::AdHoc { .. }) {
-            continue;
-        }
-        if let Some(rs) = reviews.get(sha.as_str()) {
-            for r in rs {
-                out.push(OnelineRow::Review {
-                    verdict: r.verdict,
-                    author: r.author.clone(),
-                    summary: r.summary.clone(),
-                });
+        for event in run {
+            let (sha, subject) = match event {
+                LogEvent::PlanIntro { sha, subject, .. }
+                | LogEvent::PlanCommit { sha, subject, .. }
+                | LogEvent::AdHoc { sha, subject, .. } => (sha, subject.clone()),
+                LogEvent::PlanFinalized { plan, sha, .. } => {
+                    (sha, format!("[{}] finish", plan.as_str()))
+                }
+                LogEvent::PlanDeleted { plan, sha, .. } => {
+                    (sha, format!("Delete {}", plan.as_str()))
+                }
+            };
+            // Strip the `[plan]` prefix only when it names EXACTLY
+            // the umbrella's plan — a real parse
+            // (core::parse_subject), never string-munging. Foreign
+            // or multi-plan prefixes still carry information and
+            // stay verbatim.
+            let parsed = parse_subject(&subject);
+            let strip = matches!(
+                (&umbrella_plan, &parsed.prefix),
+                (Some(up), Some(clank_core::repo_state::TitlePrefix::Plans(ps)))
+                    if ps.len() == 1 && &ps[0] == up
+            );
+            let subject = if strip {
+                parsed.body.to_string()
+            } else {
+                subject.clone()
+            };
+            out.push(OnelineRow::Commit {
+                sha: sha.clone(),
+                subject,
+            });
+            // AdHoc rows carried no review sub-lines before the
+            // factoring; keep that shape.
+            if matches!(event, LogEvent::AdHoc { .. }) {
+                continue;
+            }
+            if let Some(rs) = reviews.get(sha.as_str()) {
+                for r in rs {
+                    out.push(OnelineRow::Review {
+                        verdict: r.verdict,
+                        author: r.author.clone(),
+                        summary: r.summary.clone(),
+                    });
+                }
             }
         }
     }
@@ -364,7 +399,8 @@ pub(crate) fn oneline_rows(
 pub(crate) fn oneline_plain_lines(rows: &[OnelineRow]) -> Vec<String> {
     rows.iter()
         .map(|row| match row {
-            OnelineRow::Commit { sha, subject } => format!("{} {subject}", short(sha)),
+            OnelineRow::Header { plan } => plan.clone().unwrap_or_else(|| "adhoc".to_string()),
+            OnelineRow::Commit { sha, subject } => format!("  {} {subject}", short(sha)),
             OnelineRow::Review {
                 verdict,
                 author,
@@ -376,7 +412,7 @@ pub(crate) fn oneline_plain_lines(rows: &[OnelineRow]) -> Vec<String> {
                 } else {
                     format!(": {summary}")
                 };
-                format!("  {m} {author}{snip}")
+                format!("    {m} {author}{snip}")
             }
         })
         .collect()
@@ -387,11 +423,19 @@ fn print_oneline(events: &[&LogEvent], repo: &Path, shas: &[CommitSha]) -> anyho
     let c = color();
     for row in oneline_rows(events, &reviews) {
         match row {
+            OnelineRow::Header { plan } => {
+                let name = plan.unwrap_or_else(|| "adhoc".to_string());
+                if c {
+                    println!("{C}{name}{Z}");
+                } else {
+                    println!("{name}");
+                }
+            }
             OnelineRow::Commit { sha, subject } => {
                 if c {
-                    println!("{Y}{}{Z} {subject}", short(&sha));
+                    println!("  {Y}{}{Z} {subject}", short(&sha));
                 } else {
-                    println!("{} {subject}", short(&sha));
+                    println!("  {} {subject}", short(&sha));
                 }
             }
             OnelineRow::Review {
@@ -406,9 +450,9 @@ fn print_oneline(events: &[&LogEvent], repo: &Path, shas: &[CommitSha]) -> anyho
                     format!(": {summary}")
                 };
                 if c {
-                    println!("  {m} {C}{author}{Z}{snip}");
+                    println!("    {m} {C}{author}{Z}{snip}");
                 } else {
-                    println!("  {m} {author}{snip}");
+                    println!("    {m} {author}{snip}");
                 }
             }
         }
@@ -530,14 +574,55 @@ mod tests {
             }],
         );
         let lines = oneline_plain_lines(&oneline_rows(&refs, &reviews));
+        // Umbrella shape (log-plan-umbrellas): plan header at col
+        // 0, commits indented with matching prefixes stripped,
+        // ad-hoc commits under their own bucket.
         assert_eq!(
             lines,
             vec![
-                "aa00000 [foo] intro".to_string(),
-                "  ✓ codex: lgtm".to_string(),
-                "bb00000 [foo] finish".to_string(),
-                "cc00000 drive-by".to_string(),
+                "foo".to_string(),
+                "  aa00000 intro".to_string(),
+                "    ✓ codex: lgtm".to_string(),
+                "  bb00000 finish".to_string(),
+                "adhoc".to_string(),
+                "  cc00000 drive-by".to_string(),
             ]
+        );
+    }
+
+    #[test]
+    fn oneline_rows_umbrella_headers_and_prefix_stripping() {
+        use clank_core::repo_state::LogEvent;
+        let sha = |n: u8| crate::lifecycle::CommitSha::parse(&format!("{n:0<40x}")).unwrap();
+        let foo = crate::lifecycle::PlanKey::parse("foo").unwrap();
+        let e1 = LogEvent::PlanCommit {
+            plan: foo.clone(),
+            sha: sha(1),
+            ts: 1,
+            touched_plan: true,
+            touched_code: false,
+            subject: "[foo] intro".into(),
+        };
+        // Multi-plan prefix carries information → stays verbatim.
+        let e2 = LogEvent::PlanCommit {
+            plan: foo.clone(),
+            sha: sha(2),
+            ts: 2,
+            touched_plan: false,
+            touched_code: true,
+            subject: "[foo,bar] shared change".into(),
+        };
+        let events = [&e1, &e2];
+        let rows = oneline_rows(&events, &Default::default());
+        let lines = oneline_plain_lines(&rows);
+        assert_eq!(lines[0], "foo", "umbrella header at col 0");
+        assert!(
+            lines[1].ends_with(" intro"),
+            "matching prefix stripped: {lines:?}"
+        );
+        assert!(
+            lines[2].ends_with(" [foo,bar] shared change"),
+            "multi-plan prefix kept verbatim: {lines:?}"
         );
     }
 }

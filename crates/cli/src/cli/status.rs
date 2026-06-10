@@ -40,11 +40,16 @@ pub struct StatusSnapshot {
     /// was used, and whether that wait is over). Plan:
     /// plan-lifecycle-verbs.
     pub(crate) shelved: Vec<ShelvedView>,
-    /// Recent activity as plain `clank log --oneline` lines,
-    /// chronological (oldest first) — the TUI's log pane takes the
-    /// tail. Built from the fold's LogEvents (subjects carried; no
-    /// per-event git shelling). Plan: status-tui-live-log.
-    pub(crate) log_lines: Vec<String>,
+    /// Recent activity as STRUCTURED oneline rows (umbrella
+    /// headers + commits + reviews), chronological (oldest first)
+    /// — the TUI's log pane takes the tail and styles per row
+    /// kind. Built from the fold's LogEvents (subjects carried; no
+    /// per-event git shelling). NOT emitted by `to_json` — the
+    /// status --json log shape is unchanged; `clank log --json`
+    /// is the machine log surface (log-plan-umbrellas, ruthless
+    /// 3ea8580 concern 1). Plans: status-tui-live-log,
+    /// log-plan-umbrellas.
+    pub(crate) log_rows: Vec<crate::cli::log::OnelineRow>,
 }
 
 /// One shelved plan as the renderers see it.
@@ -89,10 +94,8 @@ impl StatusSnapshot {
         let state = crate::rebuild::rebuild_repo_with_policy(repo, policy)
             .await
             .map_err(|e| anyhow::anyhow!("failed to fold repo `{}`: {e}", repo.display()))?;
-        let log_lines = recent_log_lines(repo, &state).await;
-        Self::from_state(
-            repo, basename, home, &state, plan_arg, watch_mode, log_lines,
-        )
+        let log_rows = recent_log_rows(repo, &state).await;
+        Self::from_state(repo, basename, home, &state, plan_arg, watch_mode, log_rows)
     }
 
     fn from_state(
@@ -102,7 +105,7 @@ impl StatusSnapshot {
         state: &RepoState,
         plan_arg: Option<&str>,
         watch_mode: bool,
-        log_lines: Vec<String>,
+        log_rows: Vec<crate::cli::log::OnelineRow>,
     ) -> anyhow::Result<Self> {
         let (branch, head_sha, head_subject) = head_info(repo);
         let worktree_dirty = worktree_dirty(repo)?;
@@ -192,14 +195,14 @@ impl StatusSnapshot {
             queue,
             master,
             shelved,
-            log_lines,
+            log_rows,
         })
     }
 
     /// Test accessor for the TUI log lines (integration tests live
     /// in a separate crate; the field stays crate-private).
-    pub fn log_lines_for_test(&self) -> &[String] {
-        &self.log_lines
+    pub fn log_lines_for_test(&self) -> Vec<String> {
+        crate::cli::log::oneline_plain_lines(&self.log_rows)
     }
 
     pub fn to_json(&self) -> serde_json::Value {
@@ -490,7 +493,7 @@ async fn run_watch(
 /// TUI styles them). Scope: the single active plan's events when
 /// exactly one plan is active, repo-wide otherwise. Best-effort:
 /// any failure yields an empty pane, never a status error.
-async fn recent_log_lines(repo: &Path, state: &RepoState) -> Vec<String> {
+async fn recent_log_rows(repo: &Path, state: &RepoState) -> Vec<crate::cli::log::OnelineRow> {
     use clank_core::repo_state::LogEvent;
     const LOG_WINDOW: usize = 30;
 
@@ -529,8 +532,7 @@ async fn recent_log_lines(repo: &Path, state: &RepoState) -> Vec<String> {
         })
         .collect();
     let reviews = crate::cli::log::collect_reviews(repo, &reviewable);
-    let rows = crate::cli::log::oneline_rows(&filtered, &reviews);
-    crate::cli::log::oneline_plain_lines(&rows)
+    crate::cli::log::oneline_rows(&filtered, &reviews)
 }
 
 pub(crate) fn build_watcher(tx: mpsc::Sender<()>) -> anyhow::Result<RecommendedWatcher> {

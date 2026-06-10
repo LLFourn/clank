@@ -244,6 +244,54 @@ pub enum LogEvent {
     },
 }
 
+impl LogEvent {
+    /// The plan this event belongs to, or `None` for ad-hoc.
+    pub fn plan(&self) -> Option<&PlanKey> {
+        match self {
+            LogEvent::PlanIntro { plan, .. }
+            | LogEvent::PlanCommit { plan, .. }
+            | LogEvent::PlanFinalized { plan, .. }
+            | LogEvent::PlanDeleted { plan, .. } => Some(plan),
+            LogEvent::AdHoc { .. } => None,
+        }
+    }
+}
+
+/// What groups a run of timeline events into one umbrella: the
+/// plan they belong to, or the ad-hoc bucket.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UmbrellaKey {
+    Plan(PlanKey),
+    AdHoc,
+}
+
+pub fn umbrella_key(event: &LogEvent) -> UmbrellaKey {
+    match event.plan() {
+        Some(p) => UmbrellaKey::Plan(p.clone()),
+        None => UmbrellaKey::AdHoc,
+    }
+}
+
+/// THE umbrella rule, shared by every timeline renderer (html,
+/// `clank log --oneline`, the status TUI log pane): group
+/// CONTIGUOUS same-key events into one section. A plan
+/// interrupted by another plan's (or ad-hoc) commit opens a NEW
+/// umbrella — chronology is never reordered, so interleaved
+/// `A1 B1 A2` yields THREE sections (A, B, A), not a merged A.
+/// Direction-agnostic: sections come out in the order events go
+/// in (html feeds newest-first, the log/TUI oldest-first).
+pub fn umbrella_sections<'a>(events: &[&'a LogEvent]) -> Vec<(UmbrellaKey, Vec<&'a LogEvent>)> {
+    let mut out: Vec<(UmbrellaKey, Vec<&'a LogEvent>)> = Vec::new();
+    for e in events {
+        let key = umbrella_key(e);
+        match out.last_mut() {
+            Some((k, run)) if *k == key => run.push(e),
+            _ => out.push((key, vec![e])),
+        }
+    }
+    out
+}
+
 // ============================================================
 // CommitEvent — fold input
 // ============================================================
@@ -1471,5 +1519,55 @@ mod tests {
         );
         assert_eq!(parse_title_prefix("[misc] x"), Some(TitlePrefix::Misc));
         assert_eq!(parse_title_prefix("plain"), None);
+    }
+
+    // ── umbrella_sections (log-plan-umbrellas) ──
+
+    fn log_ev(plan: Option<&str>, n: u8) -> LogEvent {
+        let sha = CommitSha::parse(&format!("{n:0<40x}")).unwrap();
+        match plan {
+            Some(p) => LogEvent::PlanCommit {
+                plan: PlanKey::parse(p).unwrap(),
+                sha,
+                ts: n as i64,
+                touched_plan: false,
+                touched_code: true,
+                subject: format!("[{p}] c{n}"),
+            },
+            None => LogEvent::AdHoc {
+                sha,
+                ts: n as i64,
+                subject: format!("adhoc c{n}"),
+            },
+        }
+    }
+
+    #[test]
+    fn umbrella_sections_split_on_interleave_never_reorder() {
+        // THE load-bearing rule (ruthless 3ea8580 concern 2):
+        // A1 B1 A2 yields THREE umbrellas (A, B, A) — merging A1+A2
+        // into one A-umbrella would reorder chronology.
+        let a1 = log_ev(Some("a"), 1);
+        let b1 = log_ev(Some("b"), 2);
+        let a2 = log_ev(Some("a"), 3);
+        let events = [&a1, &b1, &a2];
+        let sections = umbrella_sections(&events);
+        let keys: Vec<&UmbrellaKey> = sections.iter().map(|(k, _)| k).collect();
+        assert_eq!(sections.len(), 3, "A1 B1 A2 → three umbrellas");
+        assert_eq!(*keys[0], UmbrellaKey::Plan(PlanKey::parse("a").unwrap()));
+        assert_eq!(*keys[1], UmbrellaKey::Plan(PlanKey::parse("b").unwrap()));
+        assert_eq!(*keys[2], UmbrellaKey::Plan(PlanKey::parse("a").unwrap()));
+    }
+
+    #[test]
+    fn umbrella_sections_group_contiguous_and_adhoc() {
+        let a1 = log_ev(Some("a"), 1);
+        let a2 = log_ev(Some("a"), 2);
+        let x = log_ev(None, 3);
+        let events = [&a1, &a2, &x];
+        let sections = umbrella_sections(&events);
+        assert_eq!(sections.len(), 2);
+        assert_eq!(sections[0].1.len(), 2, "contiguous same-plan run groups");
+        assert_eq!(sections[1].0, UmbrellaKey::AdHoc);
     }
 }
