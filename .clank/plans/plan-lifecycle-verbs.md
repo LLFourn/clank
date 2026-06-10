@@ -171,3 +171,68 @@ documented full-delete; no new top-level verb.**
 Sizing should verify what of demote's existing transactional
 machinery (drop-from-history + save-body, fail-closed
 boundaries) is directly reusable as shelve's `--to-queue` path.
+
+## Git mechanics DESIGNED (ruthless c8f216b concerns folded)
+
+The three concerns converge on ONE mechanism that answers all of
+them — shelve routes through demote's rewrite engine, with a real
+ref protecting everything:
+
+### Shelve (all variants, incl. --to-queue)
+
+1. **Protect first**: `git update-ref refs/clank/shelved/<plan>
+   <current-tip>` — a REAL ref at the pre-shelve tip. Every one
+   of the plan's commits is an ancestor of that tip, so all of
+   them are reachable and GC-protected no matter how interleaved
+   they are (concern 1: a sha in `.clank/` state protects
+   nothing; `git gc` would eat the work shelve promises to keep).
+   The rewrite engine already shells `git update-ref`
+   (rewrite.rs:147/164) — same tool.
+2. **Record** the plan's attributed commit shas IN ORDER in
+   shelve state (`.clank/shelved/<plan>.json`: shas, the
+   protective ref, optional `--for <plan>`, shelved-at).
+3. **Drop via the rewrite engine** — the same
+   `build_rewrite_preview` + `run_rewrite` path demote uses
+   (demote.rs:21/58/119), NOT a reset. This handles
+   NON-CONTIGUOUS / interleaved plan commits identically for
+   plain shelve and `--to-queue` (concern 3: a reset-based shelve
+   would silently narrow demote's any-position capability AND
+   discard other plans' commits layered on top; routing both
+   through the rewrite keeps one code path and full capability).
+4. `--to-queue` additionally saves the plan body back to the
+   queue (demote's existing body-save), removing the in-flight
+   plan file; plain shelve marks the plan shelved (file moves to
+   `.clank/shelved/`).
+
+### Unshelve
+
+1. Cherry-pick the recorded shas (in order) from under the
+   protective ref onto current HEAD.
+2. **Explicit old→new sha re-map** (concern 2): cherry-pick mints
+   NEW shas and git's post-rewrite hook does NOT fire for
+   cherry-pick — the existing feedback-migration path will not
+   run. unshelve itself re-maps: feedback files
+   (`.clank/agents/*/feedback/<old>.md` → `<new>.md`), and any
+   recorded shas in shelve state, using the cherry-pick's
+   old→new pairs (read from `git rev-parse` after each pick, or
+   `git cherry-pick --keep-redundant-commits` sequence output).
+   Reuse the same re-map helper the post-rewrite hook uses
+   (`clank rewire` internals) — call it directly with the pairs.
+3. On success: delete the protective ref + shelve state, restore
+   the plan file to `.clank/plans/`.
+4. Conflicts: stop like a normal cherry-pick; the protective ref
+   and shelve state stay until the user completes or aborts
+   (fail-closed — nothing is deleted until the restore fully
+   lands).
+
+### Minor notes (ruthless), decided
+
+- `--for` surfacing: recorded in shelve state; `clank status`
+  (and the TUI extras tier, later) flag "shelved for X — X
+  finished" once X is in finished_plans. NO finish-time prompt in
+  v1 (finish stays non-interactive; the status flag is the
+  prompt).
+- Blocks: shelving a plan with an active block DROPS the block,
+  and unshelve does NOT restore it — conscious choice: the block
+  conversation is stale by the time the plan returns; the user
+  re-asks if still relevant. Documented in shelve's help.
