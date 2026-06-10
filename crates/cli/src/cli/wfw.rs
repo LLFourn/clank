@@ -468,8 +468,14 @@ fn emit(items: &[WaitItem], json: bool) {
     }
 }
 
+/// 12 hex chars (48 bits), not git's display default of 7: agents
+/// COMPOSE `feedback write --commit <sha>` from this hint, and
+/// `CommitRef::resolve_against` errors on an ambiguous prefix — at
+/// 12 chars a collision is effectively impossible, so the hint
+/// always resolves (`wfw-output-is-a-minimal-hint`, ruthless
+/// 201e498 concern 2). The full sha stays in the json field.
 fn short(sha: &CommitSha) -> &str {
-    &sha.as_str()[..sha.as_str().len().min(7)]
+    &sha.as_str()[..sha.as_str().len().min(12)]
 }
 
 fn render_json(item: &WaitItem) -> serde_json::Value {
@@ -581,16 +587,19 @@ fn render_human(item: &WaitItem) -> String {
         }
         WaitItem::AdHocRevise { sha } => format!("adhoc-revise  {}  address changes", short(sha)),
         WaitItem::PromoteFromQueue { name, priority } => {
-            format!("promote  {name}  (priority {priority:03}) — run `clank queue promote {name}`")
+            format!("promote  {name}  (priority {priority:03})")
         }
         WaitItem::Blocked {
             agent,
             name,
             plan,
-            question,
+            // The question is for the HUMAN (who reads the block
+            // elsewhere); the woken agent only needs "not your
+            // move". It stays a json field.
+            question: _,
         } => {
             let scope = plan.as_deref().unwrap_or("repo");
-            format!("blocked  {agent}/{name}  scope={scope}  {question}")
+            format!("blocked  {agent}/{name}  scope={scope}  (awaiting human)")
         }
         WaitItem::Unblocked { name, plan, answer } => {
             let scope = plan.as_deref().unwrap_or("repo");
@@ -739,5 +748,61 @@ mod tests {
     fn parse_timeout_rejects_garbage() {
         assert!(parse_timeout("abc").is_err());
         assert!(parse_timeout("5x").is_err());
+    }
+
+    // ── minimal-hint rendering (wfw-output-is-a-minimal-hint) ──
+
+    fn sha(s: &str) -> CommitSha {
+        CommitSha::parse(&format!("{s:0<40}")).unwrap()
+    }
+
+    #[test]
+    fn hint_sha_is_twelve_chars() {
+        // Agents compose `feedback write --commit <sha>` from the
+        // hint; 12 hex chars can't realistically be ambiguous
+        // (ruthless 201e498 concern 2). Full sha stays in json.
+        assert_eq!(short(&sha("abc")).len(), 12);
+    }
+
+    #[test]
+    fn human_lines_carry_no_tutorial() {
+        let promote = render_human(&WaitItem::PromoteFromQueue {
+            name: "some-plan".into(),
+            priority: 300,
+        });
+        assert_eq!(promote, "promote  some-plan  (priority 300)");
+
+        let blocked = render_human(&WaitItem::Blocked {
+            agent: "claude".into(),
+            name: "q".into(),
+            plan: Some("foo".into()),
+            question: "should we?".into(),
+        });
+        assert_eq!(blocked, "blocked  claude/q  scope=foo  (awaiting human)");
+        assert!(
+            !blocked.contains("should we?"),
+            "block question is for the human, not the woken agent"
+        );
+    }
+
+    #[test]
+    fn json_keeps_structured_fields_including_full_sha_and_question() {
+        // Parity = same DATA, different format (ruthless concern
+        // 3): json keeps the structured fields a consumer needs —
+        // the FULL sha and the block question — while tutorial
+        // STRINGS exist in neither view.
+        let j = render_json(&WaitItem::Reviewer {
+            plan: PlanKey::parse("foo").unwrap(),
+            sha: sha("abc"),
+            feedback_path: ".clank/agents/x/feedback/abc.md".into(),
+        });
+        assert_eq!(j["sha"].as_str().unwrap().len(), 40, "full sha in json");
+        let j = render_json(&WaitItem::Blocked {
+            agent: "claude".into(),
+            name: "q".into(),
+            plan: Some("foo".into()),
+            question: "should we?".into(),
+        });
+        assert_eq!(j["question"], "should we?", "question stays a json field");
     }
 }

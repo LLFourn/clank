@@ -197,8 +197,11 @@ fn parse_wfw_json(raw: &[u8]) -> Result<Vec<serde_json::Value>, String> {
 
 /// Render wfw's JSON `items` array into the continuation prompt
 /// body. Loose stringly-typed projection because we're consuming
-/// our own JSON output via subprocess. Same `--author` + full-SHA
-/// rules as the hint-mode renderer (removed).
+/// our own JSON output via subprocess. One MINIMAL line per item
+/// — who/verb + plan + 12-char sha (`wfw-output-is-a-minimal-hint`):
+/// the HOW (feedback-write form, verdicts, promote evaluation,
+/// unblock) lives in the agent's skill doc, not re-taught per
+/// wake.
 fn render_wfw_items(items: &[serde_json::Value], label: &AgentLabel, role: Role) -> String {
     let mut out = String::new();
     out.push_str(&format!(
@@ -215,72 +218,59 @@ fn render_wfw_items(items: &[serde_json::Value], label: &AgentLabel, role: Role)
             .and_then(|v| v.as_str())
             .unwrap_or("");
         let short = short_sha(full);
+        // Minimal hints (`wfw-output-is-a-minimal-hint`): one line
+        // per item — WHO/verb + plan + short sha. The HOW (the
+        // `feedback write` form, verdict meanings, promote
+        // evaluation, unblock command) lives in the agent's skill
+        // doc, not re-taught per wake. The 12-char sha is what the
+        // agent composes `feedback write --commit` from; `clank
+        // status` has the rest.
         match kind {
-            "reviewer" => out.push_str(&format!(
-                "  - reviewer: plan `{plan}` at {short} — write feedback via\n    `clank feedback write --commit {full} \\\n        --author {label} --verdict approve|finished|request-changes \\\n        -m \"<summary>\"`\n    Use FINISHED only when the plan's work is fully IMPLEMENTED (code written,\n    tests passing) and `clank finish` should run — NOT when the plan text is\n    merely written. Use APPROVE for mid-flight commits; include a one-sentence\n    reason you're not marking FINISHED (e.g. \"tests still missing\").\n",
-                label = label.as_str(),
-            )),
+            "reviewer" => out.push_str(&format!("  - reviewer: review {plan} @ {short}\n")),
             "master" => {
                 let next = item.get("next").and_then(|v| v.as_str()).unwrap_or("?");
                 let reason = item.get("reason").and_then(|v| v.as_str()).unwrap_or("?");
-                out.push_str(&format!(
-                    "  - master: plan `{plan}` at {short} ({full}) — next={next} ({reason})\n",
-                ));
+                out.push_str(&format!("  - master: {next} {plan} @ {short} ({reason})\n"));
             }
-            "finished" => out.push_str(&format!(
-                "  - finished: plan `{plan}` finalized at {short}\n",
-            )),
+            "finished" => out.push_str(&format!("  - finished: {plan} @ {short}\n")),
             "idle" => {
                 let prompt = item.get("prompt").and_then(|v| v.as_str()).unwrap_or("");
                 out.push_str(&format!("  - idle: {prompt}\n"));
             }
-            "adhoc_review" => {
-                let fp = item.get("feedback_path").and_then(|v| v.as_str()).unwrap_or("");
-                out.push_str(&format!(
-                    "  - adhoc review: commit {short} — write feedback via\n    `clank feedback write --commit {full} \\\n        --author {label} --verdict approve|finished|request-changes \\\n        -m \"<summary>\"`\n",
-                    label = label.as_str(),
-                ));
-                let _ = fp;
-            }
-            "adhoc_revise" => {
-                out.push_str(&format!(
-                    "  - adhoc revise: commit {short} ({full}) — address reviewer feedback\n",
-                ));
-            }
+            "adhoc_review" => out.push_str(&format!("  - adhoc-review: {short}\n")),
+            "adhoc_revise" => out.push_str(&format!("  - adhoc-revise: {short}\n")),
             "promote_from_queue" => {
                 let name = item.get("name").and_then(|v| v.as_str()).unwrap_or("?");
                 let priority = item.get("priority").and_then(|v| v.as_u64()).unwrap_or(0);
-                out.push_str(&format!(
-                    "  - promote: queue item `{name}` (priority {priority:03})\n    Read `.clank/queue/{priority:03}-{name}.md`, evaluate whether it is\n    well-scoped and ready to implement. Edit/rescope as needed.\n    When ready: `clank queue promote {name}`\n",
-                ));
+                out.push_str(&format!("  - promote: {name} (priority {priority:03})\n"));
             }
             "blocked" => {
                 let agent = item.get("agent").and_then(|v| v.as_str()).unwrap_or("?");
                 let name = item.get("name").and_then(|v| v.as_str()).unwrap_or("?");
-                let block_plan = item.get("plan").and_then(|v| v.as_str());
-                let question = item.get("question").and_then(|v| v.as_str()).unwrap_or("");
-                let scope = block_plan.unwrap_or("repo");
-                let plan_flag = block_plan.map(|p| format!(" --plan {p}")).unwrap_or_default();
+                let scope = item.get("plan").and_then(|v| v.as_str()).unwrap_or("repo");
                 out.push_str(&format!(
-                    "  - blocked: agent `{agent}` block `{name}` (scope: {scope})\n    Question: {question}\n    This block suppresses work until a human runs:\n    `clank unblock {agent} {name}{plan_flag} -m \"<answer>\"`\n",
+                    "  - blocked: {agent}/{name} on {scope} (awaiting human)\n"
                 ));
             }
             "unblocked" => {
                 let name = item.get("name").and_then(|v| v.as_str()).unwrap_or("?");
+                // The answer is the action payload (the human's
+                // instruction) — signal, not tutorial.
                 let answer = item.get("answer").and_then(|v| v.as_str()).unwrap_or("");
-                out.push_str(&format!(
-                    "  - answer: block `{name}` has been answered\n    Answer: {answer}\n",
-                ));
+                out.push_str(&format!("  - unblocked: {name}: {answer}\n"));
             }
-            other => out.push_str(&format!("  - {other}: plan `{plan}` at {short} ({full})\n",)),
+            other => out.push_str(&format!("  - {other}: {plan} @ {short}\n")),
         }
     }
     out.push_str("\nAct on these items now.");
     out
 }
 
+/// 12 chars, matching wfw's hint width: agents compose
+/// `feedback write --commit <sha>` from this, and 12 hex chars
+/// can't realistically be ambiguous (ruthless 201e498 concern 2).
 fn short_sha(s: &str) -> &str {
-    &s[..s.len().min(7)]
+    &s[..s.len().min(12)]
 }
 
 /// Render the outcome to the per-tool wire shape and exit.
@@ -311,5 +301,80 @@ fn emit_and_exit(outcome: HookOutcome, tool: Tool) -> ! {
             eprintln!("{message}");
             std::process::exit(HOOK_OK_EXIT);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn items_text(items: &[serde_json::Value]) -> String {
+        render_wfw_items(items, &AgentLabel::parse("codex").unwrap(), Role::Reviewer)
+    }
+
+    const FULL_SHA: &str = "f6feba231685eb198eb412e5d014de836c4ddf81";
+
+    #[test]
+    fn reviewer_item_is_a_one_line_hint() {
+        let out = items_text(&[serde_json::json!({
+            "kind": "reviewer",
+            "plan": "some-plan",
+            "sha": FULL_SHA,
+        })]);
+        assert!(
+            out.contains("  - reviewer: review some-plan @ f6feba231685\n"),
+            "got:\n{out}"
+        );
+    }
+
+    #[test]
+    fn wake_carries_no_tutorial_strings() {
+        // The HOW lives in the skill doc, not the wake
+        // (wfw-output-is-a-minimal-hint). One wake with every
+        // tutorial-bearing kind must contain none of the old
+        // reference material.
+        let out = items_text(&[
+            serde_json::json!({"kind": "reviewer", "plan": "p", "sha": FULL_SHA}),
+            serde_json::json!({"kind": "promote_from_queue", "name": "n", "priority": 300}),
+            serde_json::json!({"kind": "blocked", "agent": "claude", "name": "q",
+                               "plan": "p", "question": "full question text"}),
+            serde_json::json!({"kind": "adhoc_review", "sha": FULL_SHA}),
+        ]);
+        for tutorial in [
+            "feedback write", // the spelled-out command
+            "FINISHED",       // the verdict essay
+            "approve|finished|request-changes",
+            "clank unblock",      // the spelled-out unblock
+            "evaluate whether",   // the promote walkthrough
+            "full question text", // block question is for the human
+            FULL_SHA,             // full sha never appears in the hint
+        ] {
+            assert!(
+                !out.contains(tutorial),
+                "wake must not carry `{tutorial}`; got:\n{out}"
+            );
+        }
+    }
+
+    #[test]
+    fn blocked_and_promote_are_one_liners() {
+        let out = items_text(&[
+            serde_json::json!({"kind": "blocked", "agent": "claude", "name": "q",
+                               "plan": "foo", "question": "?"}),
+            serde_json::json!({"kind": "promote_from_queue", "name": "next-up", "priority": 42}),
+        ]);
+        assert!(out.contains("  - blocked: claude/q on foo (awaiting human)\n"));
+        assert!(out.contains("  - promote: next-up (priority 042)\n"));
+    }
+
+    #[test]
+    fn unblocked_answer_is_signal_and_kept() {
+        let out = items_text(&[serde_json::json!({
+            "kind": "unblocked", "name": "q", "answer": "yes, proceed with B"
+        })]);
+        assert!(
+            out.contains("  - unblocked: q: yes, proceed with B\n"),
+            "the human's answer is the action payload; got:\n{out}"
+        );
     }
 }

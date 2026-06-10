@@ -447,6 +447,26 @@ mod tests {
         );
     }
 
+    #[test]
+    fn skills_teach_compose_from_hint_not_verbatim() {
+        // wfw-output-is-a-minimal-hint (ruthless 201e498 concern
+        // 1): the wake no longer carries a verbatim command, so
+        // neither skill may promise one — and both must teach the
+        // same compose-from-the-hint behavior (lockstep, like the
+        // FINISHED-definition guard above).
+        const HINT_SENTENCE: &str = "Each item is a one-line hint: kind, plan, short sha.";
+        for (name, body) in [("claude", CLAUDE_SKILL_BODY), ("codex", CODEX_SKILL_BODY)] {
+            assert!(
+                !body.contains("run it verbatim"),
+                "{name} skill still promises a verbatim command"
+            );
+            assert!(
+                body.contains(HINT_SENTENCE),
+                "{name} skill must teach composing from the one-line hint"
+            );
+        }
+    }
+
     fn write_file(path: &Path, contents: &str) {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(path, contents).unwrap();

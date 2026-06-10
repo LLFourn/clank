@@ -109,8 +109,57 @@ a one-line string built from those same fields.
 
 - Changing what work wfw detects (gate logic untouched).
 
+## Decisions (sized, ruthless 201e498 concerns folded)
+
+1. **Skill lockstep, co-shipped** (concern 1): the wake-trim and
+   the skill rewording land in THE SAME commit. Both skills'
+   stop-hook paragraph now reads "Each item is a one-line hint:
+   kind, plan, short sha. Compose any `clank feedback write
+   --commit <sha> …` invocation yourself from the form documented
+   above" — the form was already documented in both skills, so
+   nothing new to teach. Lockstep pinned by a setup test
+   (`skills_teach_compose_from_hint_not_verbatim`: neither skill
+   says "run it verbatim"; both carry the identical hint
+   sentence). REINSTALL NOTE: not fully live until the binary is
+   rebuilt (`cargo install`) AND the skills re-installed
+   (`clank setup`) — the installed skill saying "verbatim" while
+   the new binary emits trimmed wakes is a known transitional
+   window.
+2. **Hint sha = 12 hex chars** (concern 2): both wfw's human
+   `short()` and stop_hook's `short_sha` emit 12 chars (48 bits —
+   a collision among a repo's reviewable shas is effectively
+   impossible, so the composed `feedback write --commit` always
+   resolves). The FULL sha stays in the json field as the
+   structured fallback.
+3. **Json keeps structure, drops only tutorial strings**
+   (concern 3): wfw's json was ALREADY tutorial-free (all
+   structured fields); it is unchanged — full sha, plan,
+   plan_path, feedback_path, next/reason/gate, block question all
+   stay. Pinned by `json_keeps_structured_fields_…`. The block
+   QUESTION leaves only the HUMAN-readable line (it's for the
+   human; the woken agent needs "awaiting human"), stays in json.
+
+AS SHIPPED:
+- stop_hook.rs `render_wfw_items`: every kind is one line
+  (reviewer/master/finished/idle/adhoc-review/adhoc-revise/
+  promote/blocked/unblocked). Deleted per-wake tutorials: the
+  spelled-out `feedback write` invocation + verdict menu, the
+  FINISHED-vs-APPROVE essay (canonical home = the skills, per
+  finished-means-impl-done-not-plan-text), the promote
+  evaluate-walkthrough (skill has it), the `clank unblock`
+  spell-out + block question. The unblock ANSWER stays (it's the
+  action payload).
+- wfw.rs human: promote drops the command tail; blocked drops the
+  question; hint shas 12 chars. Json untouched.
+- Tests, all in-process: 4 stop_hook composer tests (one-line
+  shapes; a no-tutorial-strings sweep incl. full-sha-never-
+  appears; unblocked answer kept), 3 wfw render tests (12-char
+  sha, no-tutorial human lines, json structure incl. full sha +
+  question), 1 setup lockstep test.
+
 ## Status
 
-Stub — queued LOW priority (lloyd 2026-06-09: "cheeky" /
-nice-to-have). Pure UX-noise cleanup; no behavior change. Sized
-at promote time 2026-06-10 with the notes above.
+Implemented 2026-06-10. Originally queued LOW priority (lloyd
+2026-06-09: "cheeky" / nice-to-have). Pure UX-noise cleanup; no
+behavior change. Sized at promote time 2026-06-10 with the notes
+above.

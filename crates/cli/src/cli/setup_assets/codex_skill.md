@@ -49,8 +49,10 @@ Each repo's `.clank/` directory contains:
 
 When the Stop hook returns work (codex shows it as
 "Stop hook (blocked) feedback: …"), act on it immediately.
-Reviewer prompts include the exact `clank feedback write …`
-invocation to use — run it verbatim.
+Each item is a one-line hint: kind, plan, short sha. Compose any
+`clank feedback write --commit <sha> …` invocation yourself from
+the form documented above (short SHAs resolve); run
+`clank status` if you need more context than the hint carries.
 
 **Queue promote items**: do NOT blindly promote. Read the
 queued plan file, evaluate whether it is well-scoped and
