@@ -3,21 +3,25 @@
 `clank fork <name>` — create a linked git worktree and seed it so
 the WHOLE TEAM continues there in forked sessions: try a
 divergent approach, or host a PR review, without disturbing the
-original repo's sessions. The worktree path prints as the sole
-stdout line, so it composes:
+original repo's sessions.
+
+**Opening follows the bare-verb convention** (finalized in
+clank-open-zellij-context, which this plan inherits): run INSIDE
+a zellij session, `clank fork <name>` defaults to OPENING the new
+tab (master + reviewers in the fork) — `--no-open` opts out.
+Outside zellij it does not auto-spawn a session; the worktree
+path prints as the sole stdout line either way, so manual
+composition still works:
 
 ```sh
-clank open zellij --repo "$(clank fork myfeature)"
+clank open --repo "$(clank fork --no-open myfeature)"
 ```
-
-→ new zellij tab named `myfeature`, master + reviewers running in
-the fork. `--open zellij` is sugar for exactly that composition.
 
 ## Command
 
 ```
 clank fork <name> [<source-repo>] [--branch <ref>] [--path <dir>]
-           [--prompt <text>] [--open zellij]
+           [--prompt <text>] [--no-open]
 ```
 
 - `<name>` — worktree dir name = new branch name = zellij tab.
@@ -29,6 +33,9 @@ clank fork <name> [<source-repo>] [--branch <ref>] [--path <dir>]
   `<source-repo>/.clank/worktrees/<name>`.
 - `--prompt <text>` — extra orienting context appended to the
   standard orientation prompt (see Sessions).
+- `--no-open` — skip the default tab-opening when inside zellij
+  (for scripting / manual composition). Outside zellij there is
+  nothing to skip: fork never auto-creates a session.
 
 ## Decided design
 
