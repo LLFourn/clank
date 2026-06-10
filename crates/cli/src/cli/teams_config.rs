@@ -53,9 +53,10 @@ pub struct UserConfigFile {
 pub struct ZellijSection {
     /// KDL layout TEMPLATE wrapping clank's agent panes. Must
     /// contain a `clank_agents` marker node, which clank replaces
-    /// with the composed agent pane group. Unset → clank's
-    /// built-in layout. Example with custom chrome and a live
-    /// status pane:
+    /// with the composed agent pane group — master stage + stacked
+    /// reviewers + a `clank status --tui` instrument pane (the
+    /// group BRINGS its own status pane; don't add another). Unset
+    /// → clank's built-in layout. Example with custom chrome:
     ///
     /// ```kdl
     /// layout {
@@ -65,7 +66,6 @@ pub struct ZellijSection {
     ///     }
     ///     tab name="clank" {
     ///         clank_agents
-    ///         pane size=8 { command "clank"; args "status" "--tui" }
     ///     }
     /// }
     /// ```

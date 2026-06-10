@@ -37,12 +37,17 @@ pub async fn run(args: OpenZellijArgs) -> anyhow::Result<()> {
         .map(crate::cli::team::read_user_config)
         .transpose()?
         .and_then(|cfg| cfg.zellij.and_then(|z| z.layout));
+    // Orientation from the SPAWNING terminal's dimensions
+    // (zellij-default-layout); ioctl stays at the shell, compose
+    // stays pure over (cols, rows).
+    let (rows, cols) = crate::cli::status_tui::term_size();
     let kdl = compose_kdl(
         &basename,
         &repo_path_str,
         &master_label,
         &reviewer_labels,
         user_template.as_deref(),
+        (cols, rows),
     )?;
     let layout_path = layout_file_path(&repo);
     let spawn_argv = compose_spawn_argv(&layout_path);
@@ -159,30 +164,167 @@ fn compose_kdl(
     master: &str,
     reviewers: &[String],
     user_template: Option<&str>,
+    term: (u16, u16),
 ) -> anyhow::Result<String> {
-    let built_in;
-    let template = match user_template {
-        Some(t) => t,
+    let orientation = Orientation::detect(term);
+    let agents = agent_group_kdl(repo_path, master, reviewers, orientation);
+    match user_template {
+        // User templates: unchanged marker contract — the detected
+        // orientation's group, NO swap blocks (swap_tiled_layout is
+        // a layout-root construct; splicing it into arbitrary user
+        // templates is fragile — template authors write their own
+        // swaps).
+        Some(t) => substitute_marker(t, &agents),
         None => {
-            built_in = BUILT_IN_TEMPLATE.replace("__TAB__", &kdl_escape(tab_name));
-            &built_in
+            let built_in = BUILT_IN_TEMPLATE.replace("__TAB__", &kdl_escape(tab_name));
+            let base = substitute_marker(&built_in, &agents)?;
+            // BOTH orientations ship as swap variants so alt+[ /
+            // alt+] flips the arrangement at runtime.
+            add_swap_variants(&base, repo_path, master, reviewers)
         }
-    };
-    let agents = agent_group_kdl(repo_path, master, reviewers);
-    substitute_marker(template, &agents)
+    }
 }
 
-/// The agent pane group clank owns: master + reviewers side by
-/// side.
-fn agent_group_kdl(repo_path: &str, master: &str, reviewers: &[String]) -> String {
-    let mut out = String::new();
-    out.push_str("pane split_direction=\"horizontal\" {\n");
-    push_pane(&mut out, master, "master", repo_path);
-    for reviewer in reviewers {
-        push_pane(&mut out, reviewer.as_str(), "reviewer", repo_path);
+/// Which way the stage/stack axis runs, from the spawning
+/// terminal's shape. Terminal cells are ~2:1 (h:w), so a visually
+/// square terminal is ~2:1 cols:rows — wider than that reads as
+/// landscape. The ioctl's 24x80 fallback lands on landscape, the
+/// safe default.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum Orientation {
+    Landscape,
+    Portrait,
+}
+
+impl Orientation {
+    fn detect((cols, rows): (u16, u16)) -> Self {
+        if (cols as u32) >= 2 * rows as u32 {
+            Orientation::Landscape
+        } else {
+            Orientation::Portrait
+        }
     }
+    fn other(self) -> Self {
+        match self {
+            Orientation::Landscape => Orientation::Portrait,
+            Orientation::Portrait => Orientation::Landscape,
+        }
+    }
+    fn name(self) -> &'static str {
+        match self {
+            Orientation::Landscape => "landscape",
+            Orientation::Portrait => "portrait",
+        }
+    }
+}
+
+/// The agent pane group clank owns: master is the STAGE (~65%),
+/// reviewers STACK in the smaller region, and a `clank status
+/// --tui` instrument pane sits beside/below the stack
+/// (zellij-default-layout). Landscape: master left, right column
+/// = stack over tui. Portrait: master top, bottom row = stack
+/// beside tui. Zero reviewers: no stack region — stage + tui.
+///
+/// zellij KDL: `split_direction="vertical"` lays children out as
+/// COLUMNS, `"horizontal"` as ROWS.
+fn agent_group_kdl(
+    repo_path: &str,
+    master: &str,
+    reviewers: &[String],
+    orientation: Orientation,
+) -> String {
+    let mut out = String::new();
+    let (outer, inner) = match orientation {
+        Orientation::Landscape => ("vertical", "horizontal"),
+        Orientation::Portrait => ("horizontal", "vertical"),
+    };
+    out.push_str(&format!("pane split_direction=\"{outer}\" {{\n"));
+    // The stage.
+    push_agent_pane(
+        &mut out,
+        "    ",
+        " size=\"65%\"",
+        master,
+        "master",
+        repo_path,
+    );
+    // The side region: reviewer stack + instrument pane.
+    out.push_str(&format!(
+        "    pane size=\"35%\" split_direction=\"{inner}\" {{\n"
+    ));
+    if !reviewers.is_empty() {
+        out.push_str("        pane stacked=true {\n");
+        for reviewer in reviewers {
+            push_agent_pane(
+                &mut out,
+                "            ",
+                "",
+                reviewer.as_str(),
+                "reviewer",
+                repo_path,
+            );
+        }
+        out.push_str("        }\n");
+    }
+    // The instrument pane: repo pinned via cwd AND --repo (codex
+    // 7d3b5d1 — the 361b104/8075d43 lineage applies to every
+    // generated command, not just agent panes). Small on purpose:
+    // the TUI degrades gracefully (1-row bar invariant).
+    let tui_size = match orientation {
+        Orientation::Landscape => "size=10",
+        Orientation::Portrait => "size=\"30%\"",
+    };
+    let repo_esc = kdl_escape(repo_path);
+    out.push_str(&format!(
+        "        pane {tui_size} name=\"status\" cwd=\"{repo_esc}\" {{\n"
+    ));
+    out.push_str("            command \"clank\"\n");
+    out.push_str(&format!(
+        "            args \"status\" \"--repo\" \"{repo_esc}\" \"--tui\"\n"
+    ));
+    out.push_str("        }\n");
+    out.push_str("    }\n");
     out.push_str("}\n");
     out
+}
+
+/// Insert `swap_tiled_layout` blocks (one per orientation) into
+/// the composed built-in layout so alt+[ / alt+] flips the
+/// arrangement. Tree-inserted into the parsed doc (valid KDL by
+/// construction), never string-spliced.
+fn add_swap_variants(
+    base: &str,
+    repo_path: &str,
+    master: &str,
+    reviewers: &[String],
+) -> anyhow::Result<String> {
+    let mut doc: kdl::KdlDocument = base.parse().expect("composed built-in layout is valid KDL");
+    let mut swaps = String::new();
+    for o in [Orientation::Landscape, Orientation::Portrait] {
+        swaps.push_str(&format!("swap_tiled_layout name=\"{}\" {{\n", o.name()));
+        swaps.push_str("    tab {\n");
+        for line in agent_group_kdl(repo_path, master, reviewers, o).lines() {
+            swaps.push_str("        ");
+            swaps.push_str(line);
+            swaps.push('\n');
+        }
+        swaps.push_str("    }\n");
+        swaps.push_str("}\n");
+    }
+    let swaps_doc: kdl::KdlDocument = swaps
+        .parse()
+        .expect("clank-generated swap variants are valid KDL");
+    let layout_node = doc
+        .nodes_mut()
+        .iter_mut()
+        .find(|n| n.name().value() == "layout")
+        .ok_or_else(|| anyhow::anyhow!("composed layout lost its `layout` root"))?;
+    if let Some(children) = layout_node.children_mut() {
+        for node in swaps_doc.nodes() {
+            children.nodes_mut().push(node.clone());
+        }
+    }
+    Ok(doc.to_string())
 }
 
 /// Parse the template, find the `clank_agents` marker node(s),
@@ -237,24 +379,30 @@ pub(crate) fn validate_template(template: &str) -> anyhow::Result<()> {
     substitute_marker(template, "pane\n").map(|_| ())
 }
 
-fn push_pane(out: &mut String, label: &str, role_str: &str, repo_path: &str) {
+/// One agent pane. `cwd` is per-pane so the launched tool (e.g.
+/// `claude --resume`, which doesn't take a path argument) runs in
+/// the repo regardless of the shell that invoked
+/// `zellij --layout`; `--repo` pins clank-side resolution (codex
+/// 8075d43 + 361b104).
+fn push_agent_pane(
+    out: &mut String,
+    indent: &str,
+    extra_attrs: &str,
+    label: &str,
+    role_str: &str,
+    repo_path: &str,
+) {
     let label_esc = kdl_escape(label);
     let role_esc = kdl_escape(role_str);
     let repo_esc = kdl_escape(repo_path);
-    // `cwd` is per-pane so the launched tool (e.g. `claude
-    // --resume`, which doesn't take a path argument) runs in
-    // the repo regardless of the shell that invoked
-    // `zellij --layout`. Codex caught on 8075d43 that pinning
-    // `--repo` on `clank agent start` only fixes clank-side
-    // resolution; the exec'd tool inherits process cwd.
     out.push_str(&format!(
-        "            pane name=\"{label_esc} ({role_esc})\" cwd=\"{repo_esc}\" {{\n"
+        "{indent}pane{extra_attrs} name=\"{label_esc} ({role_esc})\" cwd=\"{repo_esc}\" {{\n"
     ));
-    out.push_str("                command \"clank\"\n");
+    out.push_str(&format!("{indent}    command \"clank\"\n"));
     out.push_str(&format!(
-        "                args \"agent\" \"start\" \"{label_esc}\" \"--repo\" \"{repo_esc}\"\n"
+        "{indent}    args \"agent\" \"start\" \"{label_esc}\" \"--repo\" \"{repo_esc}\"\n"
     ));
-    out.push_str("            }\n");
+    out.push_str(&format!("{indent}}}\n"));
 }
 
 /// Escape a string for use inside a KDL `"..."` quoted string.
@@ -307,18 +455,22 @@ mod tests {
     }
 
     const TEST_REPO: &str = "/tmp/test-repo";
+    /// 200x50 cells — comfortably landscape (cols >= 2*rows).
+    const LANDSCAPE: (u16, u16) = (200, 50);
+    /// 80x60 cells — portrait (cols < 2*rows).
+    const PORTRAIT: (u16, u16) = (80, 60);
     const TEST_TAB: &str = "test-repo";
 
     #[test]
     fn compose_kdl_includes_tab_bar_and_status_bar_plugins() {
-        let kdl = compose_kdl(TEST_TAB, TEST_REPO, "m", &[], None).unwrap();
+        let kdl = compose_kdl(TEST_TAB, TEST_REPO, "m", &[], None, LANDSCAPE).unwrap();
         assert!(kdl.contains("plugin location=\"zellij:tab-bar\""));
         assert!(kdl.contains("plugin location=\"zellij:status-bar\""));
     }
 
     #[test]
     fn compose_kdl_wraps_panes_in_tab_block_with_name() {
-        let kdl = compose_kdl("basename", TEST_REPO, "alice", &[], None).unwrap();
+        let kdl = compose_kdl("basename", TEST_REPO, "alice", &[], None, LANDSCAPE).unwrap();
         assert!(
             kdl.contains("tab name=\"basename\""),
             "KDL should wrap panes in a tab block with name; got:\n{kdl}"
@@ -333,6 +485,7 @@ mod tests {
             "alice",
             &reviewers(&["bob", "carol"]),
             None,
+            LANDSCAPE,
         )
         .unwrap();
         assert!(kdl.contains("name=\"alice (master)\""));
@@ -365,7 +518,15 @@ mod tests {
         // KDL block sets `cwd="<repo>"` so the spawned tool
         // lands in the repo regardless of the shell that
         // invoked zellij.
-        let kdl = compose_kdl(TEST_TAB, TEST_REPO, "alice", &reviewers(&["bob"]), None).unwrap();
+        let kdl = compose_kdl(
+            TEST_TAB,
+            TEST_REPO,
+            "alice",
+            &reviewers(&["bob"]),
+            None,
+            LANDSCAPE,
+        )
+        .unwrap();
         assert!(
             kdl.contains(&format!("name=\"alice (master)\" cwd=\"{TEST_REPO}\"")),
             "master pane should set cwd; got:\n{kdl}"
@@ -384,6 +545,7 @@ mod tests {
             "m",
             &reviewers(&["bob", "alice", "codex"]),
             None,
+            LANDSCAPE,
         )
         .unwrap();
         let bob_idx = kdl.find("name=\"bob (reviewer)\"").unwrap();
@@ -429,7 +591,7 @@ mod tests {
         // Pane name + args interpolations both go through
         // kdl_escape. A pathological label with a literal quote
         // must not break the layout string.
-        let kdl = compose_kdl(TEST_TAB, TEST_REPO, r#"weird"name"#, &[], None).unwrap();
+        let kdl = compose_kdl(TEST_TAB, TEST_REPO, r#"weird"name"#, &[], None, LANDSCAPE).unwrap();
         // The raw `"name"` text MUST appear escaped, not as a
         // bare `"` that would close the KDL string early.
         assert!(
@@ -452,7 +614,15 @@ mod tests {
     fn compose_kdl_escapes_quote_in_tab_name_and_repo_path() {
         // Tab name and repo path both flow through kdl_escape so
         // a pathological cwd or basename can't break the layout.
-        let kdl = compose_kdl(r#"weird"tab"#, r#"/tmp/dir"with"quotes"#, "m", &[], None).unwrap();
+        let kdl = compose_kdl(
+            r#"weird"tab"#,
+            r#"/tmp/dir"with"quotes"#,
+            "m",
+            &[],
+            None,
+            LANDSCAPE,
+        )
+        .unwrap();
         assert!(
             kdl.contains(r#"weird\"tab"#),
             "tab name quote must be escaped; got:\n{kdl}"
@@ -536,7 +706,7 @@ mod tests {
         // built-in now uses default_tab_template, so bars apply to
         // runtime-spawned tabs too (the plan's problem #2, fixed
         // for everyone, not just template authors).
-        let kdl = compose_kdl(TEST_TAB, TEST_REPO, "m", &[], None).unwrap();
+        let kdl = compose_kdl(TEST_TAB, TEST_REPO, "m", &[], None, LANDSCAPE).unwrap();
         assert!(kdl.contains("default_tab_template"), "got:\n{kdl}");
         let _: kdl::KdlDocument = kdl.parse().expect("built-in output is valid KDL");
         assert!(
@@ -571,6 +741,7 @@ mod tests {
             "alice",
             &reviewers(&["bob"]),
             Some(template),
+            LANDSCAPE,
         )
         .unwrap();
         // Chrome preserved verbatim.
@@ -599,7 +770,7 @@ mod tests {
     }
 }
 "##;
-        let kdl = compose_kdl(TEST_TAB, TEST_REPO, "m", &[], Some(template)).unwrap();
+        let kdl = compose_kdl(TEST_TAB, TEST_REPO, "m", &[], Some(template), LANDSCAPE).unwrap();
         assert!(!kdl.contains(AGENTS_MARKER));
         assert!(kdl.contains("name=\"m (master)\""));
     }
@@ -607,7 +778,8 @@ mod tests {
     #[test]
     fn template_without_marker_errors_naming_it() {
         let template = "layout {\n    tab {\n        pane\n    }\n}\n";
-        let err = compose_kdl(TEST_TAB, TEST_REPO, "m", &[], Some(template)).unwrap_err();
+        let err =
+            compose_kdl(TEST_TAB, TEST_REPO, "m", &[], Some(template), LANDSCAPE).unwrap_err();
         assert!(
             err.to_string().contains("clank_agents"),
             "error must name the marker; got: {err}"
@@ -617,7 +789,8 @@ mod tests {
     #[test]
     fn template_with_invalid_kdl_errors_at_compose_not_zellij() {
         let template = "layout { tab { pane "; // unclosed
-        let err = compose_kdl(TEST_TAB, TEST_REPO, "m", &[], Some(template)).unwrap_err();
+        let err =
+            compose_kdl(TEST_TAB, TEST_REPO, "m", &[], Some(template), LANDSCAPE).unwrap_err();
         assert!(err.to_string().contains("not valid KDL"), "got: {err}");
     }
 
@@ -633,7 +806,7 @@ mod tests {
     }
 }
 "##;
-        let kdl = compose_kdl(TEST_TAB, TEST_REPO, "m", &[], Some(template)).unwrap();
+        let kdl = compose_kdl(TEST_TAB, TEST_REPO, "m", &[], Some(template), LANDSCAPE).unwrap();
         // The comment + the tab NAME survive untouched; the node is
         // replaced.
         assert!(kdl.contains("// put clank_agents here someday"));
@@ -655,6 +828,127 @@ mod tests {
                 .unwrap_err()
                 .to_string()
                 .contains("not valid KDL")
+        );
+    }
+
+    // ── zellij-default-layout: stage / stack / tui + orientation ──
+
+    #[test]
+    fn landscape_stage_stack_and_pinned_tui_pane() {
+        let kdl = compose_kdl(
+            TEST_TAB,
+            TEST_REPO,
+            "alice",
+            &reviewers(&["bob", "carol"]),
+            None,
+            LANDSCAPE,
+        )
+        .unwrap();
+        // Stage: master gets the big pane.
+        assert!(
+            kdl.contains("pane size=\"65%\" name=\"alice (master)\""),
+            "master is the 65% stage:\n{kdl}"
+        );
+        // Reviewers stack (one visible, rest collapsed bars).
+        assert!(kdl.contains("pane stacked=true"), "reviewer stack:\n{kdl}");
+        // The instrument pane is repo-pinned BOTH ways (codex
+        // 7d3b5d1): cwd AND --repo, against a repo that is NOT the
+        // test process cwd.
+        assert!(
+            kdl.contains(&format!("name=\"status\" cwd=\"{TEST_REPO}\"")),
+            "tui pane cwd pinned:\n{kdl}"
+        );
+        assert!(
+            kdl.contains(&format!(
+                "args \"status\" \"--repo\" \"{TEST_REPO}\" \"--tui\""
+            )),
+            "tui pane --repo pinned:\n{kdl}"
+        );
+        let _: kdl::KdlDocument = kdl.parse().expect("valid KDL");
+    }
+
+    #[test]
+    fn portrait_tui_pane_pinned_like_landscape() {
+        // 5aec9b9 acceptance: the status pane's repo pin (cwd AND
+        // --repo) holds in BOTH orientations, against a repo that
+        // is not the process cwd.
+        let kdl = compose_kdl(
+            TEST_TAB,
+            TEST_REPO,
+            "alice",
+            &reviewers(&["bob"]),
+            None,
+            PORTRAIT,
+        )
+        .unwrap();
+        assert!(
+            kdl.contains(&format!("name=\"status\" cwd=\"{TEST_REPO}\"")),
+            "portrait tui cwd pinned:\n{kdl}"
+        );
+        assert!(
+            kdl.contains(&format!(
+                "args \"status\" \"--repo\" \"{TEST_REPO}\" \"--tui\""
+            )),
+            "portrait tui --repo pinned:\n{kdl}"
+        );
+        let _: kdl::KdlDocument = kdl.parse().expect("valid KDL");
+    }
+
+    #[test]
+    fn orientation_detected_from_terminal_dims() {
+        // Landscape dims → outer split is COLUMNS (vertical);
+        // portrait dims → ROWS (horizontal). The base tab carries
+        // the detected arrangement.
+        let land = compose_kdl(TEST_TAB, TEST_REPO, "m", &[], None, LANDSCAPE).unwrap();
+        let port = compose_kdl(TEST_TAB, TEST_REPO, "m", &[], None, PORTRAIT).unwrap();
+        let base_tab = |k: &str| {
+            let i = k.find("tab name=").unwrap();
+            let j = k.find("swap_tiled_layout").unwrap_or(k.len());
+            k[i..j].to_string()
+        };
+        assert!(
+            base_tab(&land).contains("pane split_direction=\"vertical\""),
+            "landscape base = columns:\n{land}"
+        );
+        assert!(
+            base_tab(&port).contains("pane split_direction=\"horizontal\""),
+            "portrait base = rows:\n{port}"
+        );
+    }
+
+    #[test]
+    fn built_in_ships_both_swap_variants_user_templates_get_none() {
+        let built_in = compose_kdl(TEST_TAB, TEST_REPO, "m", &[], None, LANDSCAPE).unwrap();
+        assert!(
+            built_in.contains("swap_tiled_layout name=\"landscape\"")
+                && built_in.contains("swap_tiled_layout name=\"portrait\""),
+            "both variants for alt+[ flipping:\n{built_in}"
+        );
+        let user = compose_kdl(
+            TEST_TAB,
+            TEST_REPO,
+            "m",
+            &[],
+            Some("layout {\n    clank_agents\n}\n"),
+            LANDSCAPE,
+        )
+        .unwrap();
+        assert!(
+            !user.contains("swap_tiled_layout"),
+            "user templates own their swaps:\n{user}"
+        );
+    }
+
+    #[test]
+    fn zero_reviewers_skips_stack_keeps_tui() {
+        let kdl = compose_kdl(TEST_TAB, TEST_REPO, "m", &[], None, LANDSCAPE).unwrap();
+        assert!(
+            !kdl.contains("stacked=true"),
+            "no empty stack region:\n{kdl}"
+        );
+        assert!(
+            kdl.contains("\"--tui\""),
+            "instrument pane still ships:\n{kdl}"
         );
     }
 }

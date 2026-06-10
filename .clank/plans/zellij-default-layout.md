@@ -119,3 +119,33 @@ Stub — queued lloyd 2026-06-10.
   so err small. Orientation rule: landscape iff cols >= 2*rows
   (the ~0.5 cell aspect makes 2:1 cols:rows roughly square;
   wider → landscape), fallback landscape when the ioctl fails.
+
+## Implementation round notes (2026-06-10, session takeover)
+
+(This plan's implementation started in a duplicate master
+session; the duplicate was killed mid-flight and the surviving
+session reconciled + finished the work — fittingly, the
+companion plan `zellij-session-dedup` queues the fix for that
+exact footgun.)
+
+- Concern 3 (the --tui double-up) resolved as OPTION A: the
+  substituted agent group carries the instrument pane everywhere
+  (built-in AND user templates), and the documented example in
+  `ZellijSection`'s rustdoc DROPPED its own --tui pane — the doc
+  now says the group brings its own. The
+  `user_template_chrome_preserved…` test still adds a custom
+  pane, which remains supported (users CAN add panes; the doc
+  just no longer tells them to duplicate the status pane).
+- 5aec9b9 acceptance completed: the status pane's cwd + --repo
+  pin is asserted in BOTH orientations against a repo distinct
+  from process cwd (`landscape_stage_stack_and_pinned_tui_pane`
+  + `portrait_tui_pane_pinned_like_landscape`).
+- Concern 2 (empirical GO/NO-GO for swap_tiled_layout ×
+  default_tab_template × stacked group): NOT verifiable headless
+  — zellij has no offline renderer. PENDING a live check: fresh
+  `clank open zellij` after install, then alt+[ / alt+] to flip
+  orientations and confirm the bars + stack + tui survive the
+  swap. Reviewers should hold FINISHED until lloyd (or an agent
+  in a real session) confirms; if swaps misbehave, fallback is
+  detected-orientation-only (drop the swap blocks, keep
+  everything else).

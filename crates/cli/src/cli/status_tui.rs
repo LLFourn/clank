@@ -437,7 +437,7 @@ fn truncate_to(s: &str, cols: usize) -> String {
 /// the correct per-platform request constant + struct layout —
 /// hardcoding the number is the portability trap. Falls back to
 /// 24x80 when stdout isn't a terminal (piped / headless tests).
-fn term_size() -> (u16, u16) {
+pub(crate) fn term_size() -> (u16, u16) {
     use std::os::unix::io::AsRawFd;
     let mut ws: libc::winsize = unsafe { std::mem::zeroed() };
     let fd = std::io::stdout().as_raw_fd();
