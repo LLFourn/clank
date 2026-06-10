@@ -909,6 +909,17 @@ mod open_args_tests {
     }
 
     #[test]
+    fn parent_flags_with_subcommand_is_a_parse_error_not_silently_ignored() {
+        // codex 458bb8e: `clank open --print zellij` used to parse
+        // with the parent --print silently ignored (dispatch reads
+        // only the subcommand's args when one is present).
+        // args_conflicts_with_subcommands makes the mixed form a
+        // loud parse error instead.
+        assert!(T::try_parse_from(["t", "open", "--print", "zellij"]).is_err());
+        assert!(T::try_parse_from(["t", "open", "--repo", "/r", "dry", "/x"]).is_err());
+    }
+
+    #[test]
     fn explicit_subcommands_unchanged() {
         let o = parse(&["t", "open", "zellij", "--print"]);
         match o.command {

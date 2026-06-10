@@ -189,6 +189,7 @@ pub struct HtmlOpenArgs {
 /// path classifier (renamed from `clank open <path>` per
 /// `clank-open-zellij`); `zellij` is the new layout spawner.
 #[derive(Args, Debug)]
+#[command(args_conflicts_with_subcommands = true)]
 pub struct OpenArgs {
     #[command(subcommand)]
     pub command: Option<OpenCmd>,
