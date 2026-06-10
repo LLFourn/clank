@@ -188,18 +188,18 @@ pub(crate) fn render(snap: &StatusSnapshot, rows: u16, cols: u16) -> Vec<String>
     }
 
     // `log` — the LOWEST tier (status-tui-live-log): recent
-    // activity fills whatever rows remain, most recent at the
-    // bottom (tail), every line dim + display-width truncated via
-    // the same emit path as the gauges. A blank separator when
-    // there's room for it plus at least one line.
+    // activity fills whatever rows remain, MOST RECENT AT THE TOP
+    // (rows arrive newest-first, git-log convention — lloyd), each
+    // line styled per row kind + display-width truncated via the
+    // same emit path as the gauges. A blank separator when there's
+    // room for it plus at least one line.
     if out.len() < rows && !snap.log_rows.is_empty() {
         let mut avail = rows - out.len();
         if avail >= 2 {
             out.push(String::new());
             avail -= 1;
         }
-        let start = snap.log_rows.len().saturating_sub(avail);
-        for row in &snap.log_rows[start..] {
+        for row in snap.log_rows.iter().take(avail) {
             out.push(emit(&log_row_spans(row), color, cols));
         }
     }
@@ -836,18 +836,19 @@ mod log_tier_tests {
     }
 
     #[test]
-    fn log_fills_leftover_rows_most_recent_at_bottom() {
+    fn log_fills_leftover_rows_most_recent_at_top() {
         // 8 rows: bar + breath + gate + git = 4, separator + 3 log
         // lines fit → the TAIL of the log (most recent) is shown.
-        let s = snap_with_log(&["e1", "e2", "e3", "e4", "e5"]);
+        // Rows arrive newest-first (e5 is the most recent commit).
+        let s = snap_with_log(&["e5", "e4", "e3", "e2", "e1"]);
         let texts: Vec<String> = render(&s, 8, 60).iter().map(|l| visible(l)).collect();
         assert_eq!(texts.len(), 8);
-        assert!(texts[5].ends_with("e3"), "got {texts:?}");
-        assert!(texts[6].ends_with("e4"), "got {texts:?}");
         assert!(
-            texts[7].ends_with("e5"),
-            "most recent visible at the bottom: {texts:?}"
+            texts[5].ends_with("e5"),
+            "most recent at the TOP of the log: {texts:?}"
         );
+        assert!(texts[6].ends_with("e4"), "got {texts:?}");
+        assert!(texts[7].ends_with("e3"), "got {texts:?}");
         assert!(
             !texts.iter().any(|t| t.ends_with("e1")),
             "oldest dropped first"

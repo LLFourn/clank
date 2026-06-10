@@ -41,9 +41,9 @@ pub struct StatusSnapshot {
     /// plan-lifecycle-verbs.
     pub(crate) shelved: Vec<ShelvedView>,
     /// Recent activity as STRUCTURED oneline rows (umbrella
-    /// headers + commits + reviews), chronological (oldest first)
-    /// — the TUI's log pane takes the tail and styles per row
-    /// kind. Built from the fold's LogEvents (subjects carried; no
+    /// headers + commits + reviews), NEWEST FIRST (the git-log
+    /// convention every log display follows; lloyd) — the TUI's
+    /// log pane takes the head and styles per row kind. Built from the fold's LogEvents (subjects carried; no
     /// per-event git shelling). NOT emitted by `to_json` — the
     /// status --json log shape is unchanged; `clank log --json`
     /// is the machine log surface (log-plan-umbrellas, ruthless
@@ -532,7 +532,9 @@ async fn recent_log_rows(repo: &Path, state: &RepoState) -> Vec<crate::cli::log:
         })
         .collect();
     let reviews = crate::cli::log::collect_reviews(repo, &reviewable);
-    crate::cli::log::oneline_rows(&filtered, &reviews)
+    // Newest first, like `clank log` — the pane reads top-down.
+    let newest_first: Vec<&LogEvent> = filtered.into_iter().rev().collect();
+    crate::cli::log::oneline_rows(&newest_first, &reviews)
 }
 
 pub(crate) fn build_watcher(tx: mpsc::Sender<()>) -> anyhow::Result<RecommendedWatcher> {

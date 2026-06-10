@@ -74,7 +74,7 @@ fn snapshot_carries_recent_oneline_log_with_reviews() {
     );
     // Chronological: intro before impl.
     assert!(
-        joined.find(" intro").unwrap() < joined.find(" impl a").unwrap(),
-        "oldest first:\n{joined}"
+        joined.find(" impl a").unwrap() < joined.find(" intro").unwrap(),
+        "newest first:\n{joined}"
     );
 }
