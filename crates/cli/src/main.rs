@@ -35,11 +35,12 @@ enum Command {
     /// Launch the configured editor on a plan or commit-range
     /// diff. See `clank diff --help` for argument shapes.
     Diff(cli::DiffArgs),
-    /// Abort an in-flight plan: drop its commits from history AND
-    /// save the plan body back to the queue (or stub) for
-    /// re-attempt. Transactional — fails closed at every
-    /// boundary, leaves no partial state on error.
+    /// Set an in-flight plan's commits aside (kept restorable on a
+    /// protective ref) and clean them off the branch. `--to-queue`
+    /// also saves the plan body back to the queue for re-attempt
     Shelve(cli::ShelveArgs),
+    /// Restore a shelved plan: replay its commits onto HEAD.
+    /// Reviews reset (the replayed commits are re-reviewed)
     Unshelve(cli::UnshelveArgs),
     /// Print a chronological timeline of commits and reviews for
     /// a plan.

@@ -223,14 +223,28 @@ pub async fn run_shelve(args: ShelveArgs) -> anyhow::Result<()> {
     let outcome = match rewrite_result {
         Ok(o) => o,
         Err(e) => {
-            // The rewrite refused (e.g. protected branch without the
-            // override) — nothing was dropped, so the branch still
-            // reaches every commit and the protective ref + state we
-            // just created are safe to roll back. Leaving them would
-            // strand stale shelved state that blocks the next
-            // attempt (codex 1f4800a).
-            let _ = git_delete_ref(&repo, &ref_name(&stem));
-            let _ = std::fs::remove_file(&sp);
+            // Roll back the protective ref + state ONLY when the
+            // branch never moved (pre-rewrite refusal, e.g.
+            // protected branch without the override): the branch
+            // still reaches every commit, and stranded state would
+            // block the next attempt (codex 1f4800a). But
+            // run_rewrite can also fail AFTER moving the branch
+            // (update-ref ok, reset --hard failed) — then the
+            // commits ARE dropped and the protective ref is the
+            // ONLY thing keeping them GC-safe; it must survive
+            // (codex 115c014).
+            let head_now = git_head(&repo);
+            if head_now.as_deref() == Some(preview.head_sha.as_str()) {
+                let _ = git_delete_ref(&repo, &ref_name(&stem));
+                let _ = std::fs::remove_file(&sp);
+            } else {
+                eprintln!(
+                    "shelve: rewrite failed AFTER the branch moved; keeping \
+                     {} and {} so the commits stay recoverable",
+                    ref_name(&stem),
+                    sp.display()
+                );
+            }
             return Err(e);
         }
     };
@@ -346,6 +360,22 @@ pub async fn run_clean(args: ShelveCleanArgs) -> anyhow::Result<()> {
     std::fs::remove_file(&sp).with_context(|| format!("removing `{}`", sp.display()))?;
     println!("discarded shelved state for `{stem}`");
     Ok(())
+}
+
+/// Current HEAD sha, or None if it can't be read (detached states
+/// and read failures both land on the SAFE side of the rollback
+/// decision: keep the protective ref).
+fn git_head(repo: &Path) -> Option<String> {
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["rev-parse", "HEAD"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    Some(String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
 
 fn git_update_ref(repo: &Path, name: &str, sha: &str) -> anyhow::Result<()> {
