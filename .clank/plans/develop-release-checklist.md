@@ -2,7 +2,7 @@
 
 This stub is to develop a full release checklist. What do we need to move into production:
 
-The main thing we need to do is to test the first experience with it. 
+The main thing we need to do is to test the first experience with it.
 
 1. How are you meant to easily install it -- curl from github to | sh?
 2. Need github builds for platforms then
