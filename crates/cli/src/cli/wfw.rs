@@ -2,20 +2,24 @@
 //! items to print.
 //!
 //! Two roles. `--role master` watches for plans where the gate
-//! has moved on without master. `--role reviewers` watches for
-//! plans whose latest reviewable commit needs an opinion from
-//! `--author`. Both also receive `Finished` notices when a
-//! watched plan transitions into `finished_plans` — wfw's exit
-//! is positive in either case.
+//! has moved on without master, and additionally receives
+//! `Finished` notices when a watched plan transitions into
+//! `finished_plans` (the notice is what fires the
+//! `plan_finalized` hook). `--role reviewers` watches for plans
+//! whose latest reviewable commit needs an opinion from
+//! `--author` — and ONLY that: a finish is a notification with no
+//! reviewer action, so it never wakes a reviewer
+//! (`finish-does-not-wake-reviewers`).
 //!
 //! `wfw` folds the repo, runs `RepoState::derive_status` (which
 //! threads `wait::compute_gate` over every plan), filters the
 //! result through `RepoState::work_for` for the agent's
-//! perspective, then concatenates any `detect_finished` notices
-//! from a startup snapshot. When the initial fold finds at least
-//! one item it prints it and exits; otherwise it watches the
-//! filesystem for changes that could plausibly flip the
-//! projection and refolds on each debounced event.
+//! perspective, then — for master only — concatenates any
+//! `detect_finished` notices from a startup snapshot. When the
+//! initial fold finds at least one item it prints it and exits;
+//! otherwise it watches the filesystem for changes that could
+//! plausibly flip the projection and refolds on each debounced
+//! event.
 
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
