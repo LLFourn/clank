@@ -212,6 +212,10 @@ pub enum LogEvent {
         plan: PlanKey,
         sha: CommitSha,
         ts: i64,
+        /// Commit subject, carried from the fold input so renderers
+        /// (clank log --oneline, the status TUI log pane) never
+        /// shell `git log -1` per event (status-tui-live-log).
+        subject: String,
     },
     PlanCommit {
         plan: PlanKey,
@@ -219,6 +223,8 @@ pub enum LogEvent {
         ts: i64,
         touched_plan: bool,
         touched_code: bool,
+        /// See `PlanIntro::subject`.
+        subject: String,
     },
     PlanFinalized {
         plan: PlanKey,
@@ -233,6 +239,8 @@ pub enum LogEvent {
     AdHoc {
         sha: CommitSha,
         ts: i64,
+        /// See `PlanIntro::subject`.
+        subject: String,
     },
 }
 
@@ -556,6 +564,7 @@ impl RepoState {
                         plan: touch.plan.clone(),
                         sha: event.sha.clone(),
                         ts: event.author_ts,
+                        subject: event.subject.clone(),
                     });
                 }
                 TouchKind::Revise => {
@@ -609,6 +618,7 @@ impl RepoState {
                     ts: event.author_ts,
                     touched_plan: tp,
                     touched_code: tc,
+                    subject: event.subject.clone(),
                 });
             }
         }
@@ -654,6 +664,7 @@ impl RepoState {
             log_events.push(LogEvent::AdHoc {
                 sha: event.sha.clone(),
                 ts: event.author_ts,
+                subject: event.subject.clone(),
             });
         }
 

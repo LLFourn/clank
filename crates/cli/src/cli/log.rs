@@ -86,7 +86,7 @@ pub async fn run(args: LogArgs) -> anyhow::Result<()> {
 
 // ── git helpers ──────────────────────────────────────────────
 
-fn git_rev_parse(repo: &Path, rev: &str) -> Option<CommitSha> {
+pub(crate) fn git_rev_parse(repo: &Path, rev: &str) -> Option<CommitSha> {
     let o = std::process::Command::new("git")
         .arg("-C")
         .arg(repo)
@@ -135,32 +135,20 @@ fn commit_info(repo: &Path, sha: &CommitSha) -> (String, String, String) {
     }
 }
 
-fn commit_subject(repo: &Path, sha: &CommitSha) -> String {
-    let o = std::process::Command::new("git")
-        .arg("-C")
-        .arg(repo)
-        .args(["log", "-1", "--format=%s", sha.as_str()])
-        .output();
-    match o {
-        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).trim().to_string(),
-        _ => String::new(),
-    }
-}
-
-fn short(sha: &CommitSha) -> &str {
+pub(crate) fn short(sha: &CommitSha) -> &str {
     &sha.as_str()[..sha.as_str().len().min(7)]
 }
 
 // ── reviews ─────────────────────────────────────────────────
 
-struct Review {
-    author: String,
-    verdict: Verdict,
-    summary: String,
-    body: String,
+pub(crate) struct Review {
+    pub(crate) author: String,
+    pub(crate) verdict: Verdict,
+    pub(crate) summary: String,
+    pub(crate) body: String,
 }
 
-fn collect_reviews(
+pub(crate) fn collect_reviews(
     repo: &Path,
     reviewable_shas: &[CommitSha],
 ) -> std::collections::BTreeMap<String, Vec<Review>> {
@@ -315,48 +303,112 @@ fn print_human(events: &[&LogEvent], repo: &Path, shas: &[CommitSha]) -> anyhow:
     Ok(())
 }
 
-fn print_oneline(events: &[&LogEvent], repo: &Path, shas: &[CommitSha]) -> anyhow::Result<()> {
-    let reviews = collect_reviews(repo, shas);
-    let c = color();
+/// One `--oneline` display row: data only, no formatting — shared
+/// by the CLI renderer (which colors it) and the status TUI's log
+/// pane (which dims it). Plan: status-tui-live-log.
+pub(crate) enum OnelineRow {
+    Commit {
+        sha: CommitSha,
+        subject: String,
+    },
+    Review {
+        verdict: Verdict,
+        author: String,
+        summary: String,
+    },
+}
+
+/// Pure row producer for the oneline view. Subjects come from the
+/// fold's `LogEvent`s (carried since status-tui-live-log) — no
+/// per-event `git log -1` shelling, which matters for the live TUI
+/// pane re-rendering every refresh.
+pub(crate) fn oneline_rows(
+    events: &[&LogEvent],
+    reviews: &std::collections::BTreeMap<String, Vec<Review>>,
+) -> Vec<OnelineRow> {
+    let mut out = Vec::new();
     for event in events {
-        let (_plan, sha, subj_override) = match event {
-            LogEvent::PlanIntro { plan, sha, .. } | LogEvent::PlanCommit { plan, sha, .. } => {
-                (plan, sha, None)
-            }
+        let (sha, subject) = match event {
+            LogEvent::PlanIntro { sha, subject, .. }
+            | LogEvent::PlanCommit { sha, subject, .. }
+            | LogEvent::AdHoc { sha, subject, .. } => (sha, subject.clone()),
             LogEvent::PlanFinalized { plan, sha, .. } => {
-                (plan, sha, Some(format!("[{}] finish", plan.as_str())))
+                (sha, format!("[{}] finish", plan.as_str()))
             }
-            LogEvent::PlanDeleted { plan, sha, .. } => {
-                (plan, sha, Some(format!("Delete {}", plan.as_str())))
-            }
-            LogEvent::AdHoc { sha, .. } => {
-                let subj = commit_subject(repo, sha);
-                if c {
-                    println!("{Y}{}{Z} {subj}", short(sha));
-                } else {
-                    println!("{} {subj}", short(sha));
-                }
-                continue;
-            }
+            LogEvent::PlanDeleted { plan, sha, .. } => (sha, format!("Delete {}", plan.as_str())),
         };
-        let subj = subj_override.unwrap_or_else(|| commit_subject(repo, sha));
-        if c {
-            println!("{Y}{}{Z} {subj}", short(sha));
-        } else {
-            println!("{} {subj}", short(sha));
+        out.push(OnelineRow::Commit {
+            sha: sha.clone(),
+            subject,
+        });
+        // AdHoc rows carried no review sub-lines before the
+        // factoring; keep that shape.
+        if matches!(event, LogEvent::AdHoc { .. }) {
+            continue;
         }
         if let Some(rs) = reviews.get(sha.as_str()) {
             for r in rs {
-                let m = verdict_mark(r.verdict, c);
-                let snip = if r.summary.is_empty() {
+                out.push(OnelineRow::Review {
+                    verdict: r.verdict,
+                    author: r.author.clone(),
+                    summary: r.summary.clone(),
+                });
+            }
+        }
+    }
+    out
+}
+
+/// Plain-text lines for one row set (the TUI's log pane). NO ANSI —
+/// the consumer styles (the TUI dims via its span model).
+pub(crate) fn oneline_plain_lines(rows: &[OnelineRow]) -> Vec<String> {
+    rows.iter()
+        .map(|row| match row {
+            OnelineRow::Commit { sha, subject } => format!("{} {subject}", short(sha)),
+            OnelineRow::Review {
+                verdict,
+                author,
+                summary,
+            } => {
+                let m = verdict_mark(*verdict, false);
+                let snip = if summary.is_empty() {
                     String::new()
                 } else {
-                    format!(": {}", r.summary)
+                    format!(": {summary}")
+                };
+                format!("  {m} {author}{snip}")
+            }
+        })
+        .collect()
+}
+
+fn print_oneline(events: &[&LogEvent], repo: &Path, shas: &[CommitSha]) -> anyhow::Result<()> {
+    let reviews = collect_reviews(repo, shas);
+    let c = color();
+    for row in oneline_rows(events, &reviews) {
+        match row {
+            OnelineRow::Commit { sha, subject } => {
+                if c {
+                    println!("{Y}{}{Z} {subject}", short(&sha));
+                } else {
+                    println!("{} {subject}", short(&sha));
+                }
+            }
+            OnelineRow::Review {
+                verdict,
+                author,
+                summary,
+            } => {
+                let m = verdict_mark(verdict, c);
+                let snip = if summary.is_empty() {
+                    String::new()
+                } else {
+                    format!(": {summary}")
                 };
                 if c {
-                    println!("  {m} {C}{}{Z}{snip}", r.author);
+                    println!("  {m} {C}{author}{Z}{snip}");
                 } else {
-                    println!("  {m} {}{snip}", r.author);
+                    println!("  {m} {author}{snip}");
                 }
             }
         }
@@ -369,9 +421,14 @@ fn print_json(events: &[&LogEvent], repo: &Path, shas: &[CommitSha]) -> anyhow::
     let mut out: Vec<serde_json::Value> = Vec::new();
     for event in events {
         let obj = match event {
-            LogEvent::PlanIntro { plan, sha, ts } => serde_json::json!({
+            LogEvent::PlanIntro {
+                plan,
+                sha,
+                ts,
+                subject,
+            } => serde_json::json!({
                 "kind": "intro", "plan": plan.as_str(), "sha": sha.as_str(),
-                "ts": ts, "subject": commit_subject(repo, sha),
+                "ts": ts, "subject": subject,
             }),
             LogEvent::PlanCommit {
                 plan,
@@ -379,10 +436,11 @@ fn print_json(events: &[&LogEvent], repo: &Path, shas: &[CommitSha]) -> anyhow::
                 ts,
                 touched_plan,
                 touched_code,
+                subject,
             } => serde_json::json!({
                 "kind": "commit", "plan": plan.as_str(), "sha": sha.as_str(),
                 "ts": ts, "touched_plan": touched_plan, "touched_code": touched_code,
-                "subject": commit_subject(repo, sha),
+                "subject": subject,
             }),
             LogEvent::PlanFinalized { plan, sha, ts } => serde_json::json!({
                 "kind": "finalized", "plan": plan.as_str(), "sha": sha.as_str(), "ts": ts,
@@ -390,9 +448,9 @@ fn print_json(events: &[&LogEvent], repo: &Path, shas: &[CommitSha]) -> anyhow::
             LogEvent::PlanDeleted { plan, sha, ts } => serde_json::json!({
                 "kind": "deleted", "plan": plan.as_str(), "sha": sha.as_str(), "ts": ts,
             }),
-            LogEvent::AdHoc { sha, ts } => serde_json::json!({
+            LogEvent::AdHoc { sha, ts, subject } => serde_json::json!({
                 "kind": "ad-hoc", "sha": sha.as_str(), "ts": ts,
-                "subject": commit_subject(repo, sha),
+                "subject": subject,
             }),
         };
         out.push(obj);
@@ -414,4 +472,72 @@ fn print_json(events: &[&LogEvent], repo: &Path, shas: &[CommitSha]) -> anyhow::
     }
     println!("{}", serde_json::to_string_pretty(&out)?);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clank_core::ids::PlanKey;
+
+    fn sha(s: &str) -> CommitSha {
+        CommitSha::parse(&format!("{s:0<40}")).unwrap()
+    }
+
+    #[test]
+    fn oneline_rows_round_trip_shapes() {
+        // Concern 2 (ruthless 54c37f6): the factoring must preserve
+        // the shipped --oneline shapes. Pin the plain forms (the
+        // colored path wraps the same fields in Y/C/Z, visible in
+        // print_oneline).
+        let events = [
+            LogEvent::PlanIntro {
+                plan: PlanKey::parse("foo").unwrap(),
+                sha: sha("aa"),
+                ts: 1,
+                subject: "[foo] intro".into(),
+            },
+            LogEvent::PlanFinalized {
+                plan: PlanKey::parse("foo").unwrap(),
+                sha: sha("bb"),
+                ts: 2,
+            },
+            LogEvent::AdHoc {
+                sha: sha("cc"),
+                ts: 3,
+                subject: "drive-by".into(),
+            },
+        ];
+        let refs: Vec<&LogEvent> = events.iter().collect();
+        let mut reviews = std::collections::BTreeMap::new();
+        reviews.insert(
+            sha("aa").as_str().to_string(),
+            vec![Review {
+                author: "codex".into(),
+                verdict: Verdict::Approve,
+                summary: "lgtm".into(),
+                body: String::new(),
+            }],
+        );
+        // AdHoc carries reviews in the map but must NOT emit
+        // sub-lines (pre-factoring shape).
+        reviews.insert(
+            sha("cc").as_str().to_string(),
+            vec![Review {
+                author: "codex".into(),
+                verdict: Verdict::Approve,
+                summary: "x".into(),
+                body: String::new(),
+            }],
+        );
+        let lines = oneline_plain_lines(&oneline_rows(&refs, &reviews));
+        assert_eq!(
+            lines,
+            vec![
+                "aa00000 [foo] intro".to_string(),
+                "  ✓ codex: lgtm".to_string(),
+                "bb00000 [foo] finish".to_string(),
+                "cc00000 drive-by".to_string(),
+            ]
+        );
+    }
 }

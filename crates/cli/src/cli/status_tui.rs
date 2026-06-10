@@ -183,6 +183,23 @@ pub(crate) fn render(snap: &StatusSnapshot, rows: u16, cols: u16) -> Vec<String>
         }
         out.push(emit(&line, color, cols));
     }
+
+    // `log` — the LOWEST tier (status-tui-live-log): recent
+    // activity fills whatever rows remain, most recent at the
+    // bottom (tail), every line dim + display-width truncated via
+    // the same emit path as the gauges. A blank separator when
+    // there's room for it plus at least one line.
+    if out.len() < rows && !snap.log_lines.is_empty() {
+        let mut avail = rows - out.len();
+        if avail >= 2 {
+            out.push(String::new());
+            avail -= 1;
+        }
+        let start = snap.log_lines.len().saturating_sub(avail);
+        for line in &snap.log_lines[start..] {
+            out.push(emit(&[dim(line.clone())], color, cols));
+        }
+    }
     out
 }
 
@@ -490,13 +507,13 @@ pub(crate) async fn run_tui(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::lifecycle::{AgentLabel, CommitSha, PlanKey};
     use clank_core::repo_state::NonEmptyVec;
     use clank_core::vocab::CommitGateState;
 
-    fn plan_state(stem: &str, waiting_on: WaitingOn) -> PlanWorkState {
+    pub(crate) fn plan_state(stem: &str, waiting_on: WaitingOn) -> PlanWorkState {
         PlanWorkState {
             plan: PlanKey::parse(stem).unwrap(),
             sha: Some(CommitSha::parse(&format!("{:0<40}", "abc123")).unwrap()),
@@ -506,13 +523,13 @@ mod tests {
         }
     }
 
-    fn reviewer_missing(label: &str) -> WaitingOn {
+    pub(crate) fn reviewer_missing(label: &str) -> WaitingOn {
         WaitingOn::ReviewerApprovalsMissing {
             missing: NonEmptyVec::new(vec![AgentLabel::parse(label).unwrap()]).unwrap(),
         }
     }
 
-    fn snap(plans: Vec<PlanWorkState>, queue: Vec<&str>) -> StatusSnapshot {
+    pub(crate) fn snap(plans: Vec<PlanWorkState>, queue: Vec<&str>) -> StatusSnapshot {
         StatusSnapshot {
             repo_path: "/r".into(),
             basename: "r".into(),
@@ -526,12 +543,13 @@ mod tests {
             queue: queue.into_iter().map(str::to_string).collect(),
             master: Some("claude".into()),
             shelved: Vec::new(),
+            log_lines: Vec::new(),
         }
     }
 
     /// Visible text: ANSI escapes removed, trailing pad trimmed.
     /// Tests pin what the EYE sees.
-    fn visible(line: &str) -> String {
+    pub(crate) fn visible(line: &str) -> String {
         visible_untrimmed(line).trim_end().to_string()
     }
 
@@ -750,5 +768,56 @@ mod tests {
             texts.iter().any(|t| t.starts_with(" done  old-plan @ ")),
             "got {texts:?}"
         );
+    }
+}
+
+#[cfg(test)]
+mod log_tier_tests {
+    use super::tests::{plan_state, reviewer_missing, snap, visible};
+    use super::*;
+
+    fn snap_with_log(lines: &[&str]) -> StatusSnapshot {
+        let mut s = snap(vec![plan_state("foo", reviewer_missing("codex"))], vec![]);
+        s.log_lines = lines.iter().map(|l| l.to_string()).collect();
+        s
+    }
+
+    #[test]
+    fn log_fills_leftover_rows_most_recent_at_bottom() {
+        // 8 rows: bar + breath + gate + git = 4, separator + 3 log
+        // lines fit → the TAIL of the log (most recent) is shown.
+        let s = snap_with_log(&["e1", "e2", "e3", "e4", "e5"]);
+        let texts: Vec<String> = render(&s, 8, 60).iter().map(|l| visible(l)).collect();
+        assert_eq!(texts.len(), 8);
+        assert_eq!(texts[5], "e3");
+        assert_eq!(texts[6], "e4");
+        assert_eq!(texts[7], "e5", "most recent visible at the bottom");
+        assert!(!texts.iter().any(|t| t == "e1"), "oldest dropped first");
+    }
+
+    #[test]
+    fn log_absent_when_no_rows_remain() {
+        let s = snap_with_log(&["e1", "e2"]);
+        // 3 rows: bar + gate + git eat everything.
+        let texts: Vec<String> = render(&s, 3, 60).iter().map(|l| visible(l)).collect();
+        assert!(
+            !texts.iter().any(|t| t.starts_with('e')),
+            "no log rows at 3 rows: {texts:?}"
+        );
+    }
+
+    #[test]
+    fn log_lines_truncate_by_display_width() {
+        // Wide-char commit subjects (emoji) must truncate by
+        // display columns — the same blind spot the banner had
+        // (ruthless 54c37f6 concern 3).
+        let s = snap_with_log(&["abc1234 🔨🔨🔨🔨🔨🔨 a very wide subject"]);
+        let lines = render(&s, 10, 14);
+        for line in &lines {
+            assert!(
+                display_width(visible(line).trim_end()) <= 14,
+                "log line wider than 14 display cols: `{line}`"
+            );
+        }
     }
 }
