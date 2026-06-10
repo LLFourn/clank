@@ -626,172 +626,15 @@ fn wfw_master_finished_verdict_routes_to_finalize() {
         "expected Finalize routing for FINISHED verdict; got stdout=`{stdout}`"
     );
 }
-
-#[test]
-fn wfw_reviewer_finish_wake_human_output() {
-    let env = setup(&["alice"]);
-    let repo = env.repo();
-    write(repo, ".clank/plans/foo.md", "# foo\n");
-    commit(repo, "[foo] intro");
-    let intro_sha = head_sha(repo);
-    write(
-        repo,
-        &format!(".clank/agents/alice/feedback/{intro_sha}.md"),
-        "APPROVE\n\nlgtm\n",
-    );
-    write(repo, "src/lib.rs", "// impl\n");
-    commit(repo, "[foo] impl");
-    let impl_sha = head_sha(repo);
-    write(
-        repo,
-        &format!(".clank/agents/alice/feedback/{impl_sha}.md"),
-        "FINISHED\n\nlgtm\n",
-    );
-
-    // Park as alice (no reviewer work, gate already approved).
-    let mut child = spawn_wfw(
-        &env,
-        &[
-            "--author",
-            "alice",
-            "--role",
-            "reviewers",
-            "--timeout",
-            "30s",
-        ],
-    );
-
-    // Finalize the plan from outside.
-    clank_run(&env, &["finish", "foo"]);
-
-    let exit = wait_for_exit(&mut child, Duration::from_secs(20));
-    let stdout = read_stdout_to_end(&mut child);
-    let stderr = read_stderr_to_end(&mut child);
-    assert!(
-        exit.success(),
-        "wfw exit={exit:?} stdout=`{stdout}` stderr=`{stderr}`"
-    );
-    assert!(
-        stdout.contains("finished") && stdout.contains("foo"),
-        "expected finished notice for foo; got stdout=`{stdout}`"
-    );
-}
-
-#[test]
-fn wfw_reviewer_finish_wake_json_output() {
-    let env = setup(&["alice"]);
-    let repo = env.repo();
-    write(repo, ".clank/plans/foo.md", "# foo\n");
-    commit(repo, "[foo] intro");
-    let intro_sha = head_sha(repo);
-    write(
-        repo,
-        &format!(".clank/agents/alice/feedback/{intro_sha}.md"),
-        "APPROVE\n\nlgtm\n",
-    );
-    write(repo, "src/lib.rs", "// impl\n");
-    commit(repo, "[foo] impl");
-    let impl_sha = head_sha(repo);
-    write(
-        repo,
-        &format!(".clank/agents/alice/feedback/{impl_sha}.md"),
-        "FINISHED\n\nlgtm\n",
-    );
-
-    let mut child = spawn_wfw(
-        &env,
-        &[
-            "--author",
-            "alice",
-            "--role",
-            "reviewers",
-            "--timeout",
-            "30s",
-            "-j",
-        ],
-    );
-
-    clank_run(&env, &["finish", "foo"]);
-    let final_sha = head_sha(repo);
-
-    let exit = wait_for_exit(&mut child, Duration::from_secs(20));
-    let stdout = read_stdout_to_end(&mut child);
-    let stderr = read_stderr_to_end(&mut child);
-    assert!(
-        exit.success(),
-        "wfw exit={exit:?} stdout=`{stdout}` stderr=`{stderr}`"
-    );
-    let v: serde_json::Value =
-        serde_json::from_str(stdout.trim()).expect("wfw -j stdout must be valid JSON");
-    let items = v["items"].as_array().expect("items array");
-    let finished = items
-        .iter()
-        .find(|i| i["kind"] == "finished")
-        .expect("at least one finished item");
-    assert_eq!(finished["plan"], "foo");
-    assert_eq!(finished["finalized_at"], final_sha);
-}
-
-#[test]
-fn wfw_plan_filter_finish_wake() {
-    // Same as reviewer-finish-wake but with --plan, exercising the
-    // snapshot path that previously returned Ok(None) when the
-    // filtered plan disappeared.
-    let env = setup(&["alice"]);
-    let repo = env.repo();
-    write(repo, ".clank/plans/foo.md", "# foo\n");
-    commit(repo, "[foo] intro");
-    let intro_sha = head_sha(repo);
-    write(
-        repo,
-        &format!(".clank/agents/alice/feedback/{intro_sha}.md"),
-        "APPROVE\n",
-    );
-    write(repo, "src/lib.rs", "// impl\n");
-    commit(repo, "[foo] impl");
-    let impl_sha = head_sha(repo);
-    write(
-        repo,
-        &format!(".clank/agents/alice/feedback/{impl_sha}.md"),
-        "FINISHED\n",
-    );
-
-    let mut child = spawn_wfw(
-        &env,
-        &[
-            "--author",
-            "alice",
-            "--role",
-            "reviewers",
-            "--plan",
-            "foo",
-            "--timeout",
-            "30s",
-        ],
-    );
-
-    clank_run(&env, &["finish", "foo"]);
-
-    let exit = wait_for_exit(&mut child, Duration::from_secs(20));
-    let stdout = read_stdout_to_end(&mut child);
-    let stderr = read_stderr_to_end(&mut child);
-    assert!(
-        exit.success(),
-        "wfw exit={exit:?} stdout=`{stdout}` stderr=`{stderr}`"
-    );
-    assert!(
-        stdout.contains("finished"),
-        "expected finished notice for filtered plan; got stdout=`{stdout}`"
-    );
-}
-
 #[test]
 fn wfw_mixed_work_and_finished_on_one_wake() {
     // Two active plans `a` and `b`. Alice has approved both
     // intros. Park wfw, then in quick succession (a) land a new
-    // reviewable commit on `a` and (b) finalize `b`. The next
-    // refold should emit BOTH a reviewer item for `a` and a
-    // finished item for `b` — not just one of them.
+    // reviewable commit on `a` and (b) finalize `b`. Alice wakes
+    // for the REAL work (reviewer item on `a`), but the finish of
+    // `b` is a notification with no reviewer action — it must NOT
+    // appear in her items (`finish-does-not-wake-reviewers`;
+    // previously this test asserted she got both).
     let env = setup(&["alice"]);
     let repo = env.repo();
     write(repo, ".clank/plans/a.md", "# a\n");
@@ -857,133 +700,14 @@ fn wfw_mixed_work_and_finished_on_one_wake() {
         .iter()
         .any(|i| i["kind"] == "finished" && i["plan"] == "b");
     assert!(
-        has_reviewer_for_a && has_finished_for_b,
-        "expected reviewer(a) AND finished(b) in same items[]; got stdout=`{stdout}`"
-    );
-}
-
-#[test]
-fn wfw_finish_wake_survives_early_snapshot_event() {
-    // Race regression: `clank finish` moves `.clank/plans/<stem>.md`
-    // to `.clank/finished/<stem>.md` BEFORE committing. The FS event
-    // for that file write wakes wfw, the 200ms debounce ends BEFORE
-    // the commit lands, and the refold sees nothing finished. If wfw
-    // relied solely on the post-commit git-ref event for the second
-    // wake, that event could fail to fire (notify drops it under
-    // load, debounce ate it, etc.) and wfw would block forever. The
-    // heartbeat refold is the safety net. This test forces the
-    // ordering: write the finished file manually, sleep PAST the
-    // debounce window, THEN run the same `git` calls clank finish does.
-    let env = setup(&["alice"]);
-    let repo = env.repo();
-    write(repo, ".clank/plans/foo.md", "# foo\n");
-    commit(repo, "[foo] intro");
-    let intro_sha = head_sha(repo);
-    // Approval is untracked feedback — `.clank/agents/` is
-    // gitignored just like `.clank/feedback/` was. The
-    // subsequent staged-finalize commit doesn't pick it up.
-    write(
-        repo,
-        &format!(".clank/agents/alice/feedback/{intro_sha}.md"),
-        "APPROVE\n",
-    );
-
-    let mut child = spawn_wfw(
-        &env,
-        &[
-            "--author",
-            "alice",
-            "--role",
-            "reviewers",
-            "--timeout",
-            "30s",
-        ],
-    );
-
-    // Stage 1: write the finished plan file (mv-finish approach).
-    write(repo, ".clank/finished/foo.md", "# foo\n");
-
-    // Stage 2: sleep past the watcher's debounce window.
-    std::thread::sleep(Duration::from_millis(1200));
-
-    // Stage 3: commit the finalize — delete from plans/, add to finished/.
-    git(repo, &["rm", "--quiet", ".clank/plans/foo.md"]);
-    git(repo, &["add", ".clank/finished/foo.md"]);
-    git(repo, &["commit", "--quiet", "-m", "[foo] finish"]);
-
-    let exit = wait_for_exit(&mut child, Duration::from_secs(20));
-    let stdout = read_stdout_to_end(&mut child);
-    let stderr = read_stderr_to_end(&mut child);
-    assert!(
-        exit.success(),
-        "wfw exit={exit:?} stdout=`{stdout}` stderr=`{stderr}`"
+        has_reviewer_for_a,
+        "expected reviewer(a) in items[]; got stdout=`{stdout}`"
     );
     assert!(
-        stdout.contains("finished") && stdout.contains("foo"),
-        "expected finished notice after early-snapshot + late-commit race; got stdout=`{stdout}` stderr=`{stderr}`"
+        !has_finished_for_b,
+        "finished(b) is a notification, not reviewer work — must NOT be in a reviewer's items[]; got stdout=`{stdout}`"
     );
 }
-
-#[test]
-fn wfw_plan_already_finished_at_startup_emits_finished_and_exits() {
-    let env = setup(&["alice"]);
-    let repo = env.repo();
-    write(repo, ".clank/plans/foo.md", "# foo\n");
-    commit(repo, "[foo] intro");
-    let intro_sha = head_sha(repo);
-    write(
-        repo,
-        &format!(".clank/agents/alice/feedback/{intro_sha}.md"),
-        "APPROVE\n",
-    );
-    write(repo, "src/lib.rs", "// impl\n");
-    commit(repo, "[foo] impl");
-    let impl_sha = head_sha(repo);
-    write(
-        repo,
-        &format!(".clank/agents/alice/feedback/{impl_sha}.md"),
-        "FINISHED\n",
-    );
-    clank_run(&env, &["finish", "foo"]);
-    let final_sha = head_sha(repo);
-
-    // Plan is already finished; explicit --plan should emit a
-    // finished item and exit 0 within the short timeout, NOT block.
-    let output = env
-        .clank()
-        .args([
-            "wfw",
-            "--no-poll",
-            "--author",
-            "alice",
-            "--role",
-            "reviewers",
-            "--plan",
-            "foo",
-            "--timeout",
-            "2s",
-            "-j",
-        ])
-        .arg("--repo")
-        .arg(repo)
-        .output()
-        .expect("spawn wfw");
-    assert!(
-        output.status.success(),
-        "wfw exit={:?} stderr=`{}`",
-        output.status,
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-    let v: serde_json::Value =
-        serde_json::from_str(stdout.trim()).expect("wfw -j stdout must be valid JSON");
-    let items = v["items"].as_array().expect("items array");
-    assert_eq!(items.len(), 1, "expected exactly one item; got {stdout}");
-    assert_eq!(items[0]["kind"], "finished");
-    assert_eq!(items[0]["plan"], "foo");
-    assert_eq!(items[0]["finalized_at"], final_sha);
-}
-
 #[test]
 fn wfw_polling_mode_wakes_on_commit_via_periodic_refold() {
     // Polling-mode proof: with --poll explicit, wfw does NOT
@@ -2221,4 +1945,196 @@ fn wait_for_exit(child: &mut std::process::Child, max: Duration) -> std::process
             Err(e) => panic!("try_wait failed: {e}"),
         }
     }
+}
+
+// ── finish-does-not-wake-reviewers ─────────────────────────────
+// A plan finalizing is a NOTIFICATION, not work. Reviewers have no
+// action on a finish and must NOT be woken; master (which owns the
+// finalization lifecycle + the plan_finalized hook) still is.
+
+#[test]
+fn wfw_reviewer_not_woken_when_plan_finishes() {
+    let env = setup(&["alice"]);
+    let repo = env.repo();
+    write(repo, ".clank/plans/foo.md", "# foo\n");
+    commit(repo, "[foo] intro");
+    let intro_sha = head_sha(repo);
+    // alice approved the intro → gate Approved → no pending review
+    // work for her; she's idle.
+    write(
+        repo,
+        &format!(".clank/agents/alice/feedback/{intro_sha}.md"),
+        "APPROVE\n\nlgtm\n",
+    );
+
+    let mut child = spawn_wfw(
+        &env,
+        &[
+            "--author",
+            "alice",
+            "--role",
+            "reviewers",
+            "--timeout",
+            "6s",
+        ],
+    );
+
+    // foo finalizes during alice's watch.
+    write(repo, ".clank/finished/foo.md", "# foo\n");
+    std::fs::remove_file(repo.join(".clank/plans/foo.md")).unwrap();
+    commit(repo, "[foo] finish");
+
+    // alice must NOT wake on the finish — wfw runs to its own 6s
+    // timeout and exits with no Finished notice. (If she WERE woken,
+    // stdout would carry the finished item for foo.)
+    let exit = wait_for_exit(&mut child, Duration::from_secs(20));
+    let stdout = read_stdout_to_end(&mut child);
+    // Not woken: wfw runs to its own --timeout and exits non-zero
+    // ("wfw timed out") with NO Finished notice. A wake would exit
+    // 0 with foo's finished item on stdout — so a SUCCESS exit here
+    // would itself mean the reviewer was wrongly woken.
+    assert!(
+        !exit.success(),
+        "reviewer should have TIMED OUT (not woken by the finish), but wfw exited 0; stdout=`{stdout}`"
+    );
+    assert!(
+        !stdout.to_lowercase().contains("finish") && !stdout.contains("foo"),
+        "reviewer must NOT be woken by a plan finish; got stdout=`{stdout}`"
+    );
+}
+
+#[test]
+fn wfw_master_woken_when_plan_finishes() {
+    // Option A (the resolved master policy): master KEEPS waking on a
+    // finish — that wake is master's action (it fires the
+    // plan_finalized announcement hook). Master is idle here (gate
+    // Unreviewed: waiting on alice), so the finish is the sole wake
+    // reason, proving master still receives it.
+    let env = setup(&["alice"]);
+    let repo = env.repo();
+    write(repo, ".clank/plans/foo.md", "# foo\n");
+    commit(repo, "[foo] intro");
+
+    let mut child = spawn_wfw(
+        &env,
+        &["--author", "lloyd", "--role", "master", "--timeout", "30s"],
+    );
+
+    // foo finalizes during master's watch.
+    write(repo, ".clank/finished/foo.md", "# foo\n");
+    std::fs::remove_file(repo.join(".clank/plans/foo.md")).unwrap();
+    commit(repo, "[foo] finish");
+
+    let exit = wait_for_exit(&mut child, Duration::from_secs(20));
+    let stdout = read_stdout_to_end(&mut child);
+    let stderr = read_stderr_to_end(&mut child);
+    assert!(exit.success(), "wfw exit={exit:?} stderr=`{stderr}`");
+    assert!(
+        stdout.contains("foo") && stdout.to_lowercase().contains("finish"),
+        "master SHOULD be woken by a plan finish (Option A); got stdout=`{stdout}`"
+    );
+}
+
+#[test]
+fn wfw_master_finish_wake_json_output() {
+    // JSON shape of the Finished notice (kind/plan/finalized_at),
+    // on MASTER — the role that still receives it
+    // (`finish-does-not-wake-reviewers`; this coverage previously
+    // lived on a reviewer watcher).
+    let env = setup(&["alice"]);
+    let repo = env.repo();
+    write(repo, ".clank/plans/foo.md", "# foo\n");
+    commit(repo, "[foo] intro");
+
+    // Master is idle (gate Unreviewed: waiting on alice — no master
+    // work), so the finish notice below is the sole wake. (With a
+    // FINISHED verdict already on disk, master's initial pass would
+    // instead wake with a finalize item and never see the notice.)
+    let mut child = spawn_wfw(
+        &env,
+        &[
+            "--author",
+            "lloyd",
+            "--role",
+            "master",
+            "--timeout",
+            "30s",
+            "-j",
+        ],
+    );
+
+    // Finalize foo manually (same commit shape `clank finish` makes).
+    write(repo, ".clank/finished/foo.md", "# foo\n");
+    std::fs::remove_file(repo.join(".clank/plans/foo.md")).unwrap();
+    commit(repo, "[foo] finish");
+    let final_sha = head_sha(repo);
+
+    let exit = wait_for_exit(&mut child, Duration::from_secs(20));
+    let stdout = read_stdout_to_end(&mut child);
+    let stderr = read_stderr_to_end(&mut child);
+    assert!(
+        exit.success(),
+        "wfw exit={exit:?} stdout=`{stdout}` stderr=`{stderr}`"
+    );
+    let v: serde_json::Value =
+        serde_json::from_str(stdout.trim()).expect("wfw -j stdout must be valid JSON");
+    let items = v["items"].as_array().expect("items array");
+    let finished = items
+        .iter()
+        .find(|i| i["kind"] == "finished")
+        .expect("at least one finished item");
+    assert_eq!(finished["plan"], "foo");
+    assert_eq!(finished["finalized_at"], final_sha);
+}
+
+#[test]
+fn wfw_finish_wake_survives_early_snapshot_event() {
+    // Race regression: `clank finish` moves `.clank/plans/<stem>.md`
+    // to `.clank/finished/<stem>.md` BEFORE committing. The FS event
+    // for that file write wakes wfw, the 200ms debounce ends BEFORE
+    // the commit lands, and the refold sees nothing finished. If wfw
+    // relied solely on the post-commit git-ref event for the second
+    // wake, that event could fail to fire (notify drops it under
+    // load, debounce ate it, etc.) and wfw would block forever. The
+    // heartbeat refold is the safety net. This test forces the
+    // ordering: write the finished file manually, sleep PAST the
+    // debounce window, THEN run the same `git` calls clank finish
+    // does. Watches as MASTER — the role that receives Finished
+    // (`finish-does-not-wake-reviewers`).
+    let env = setup(&["alice"]);
+    let repo = env.repo();
+    write(repo, ".clank/plans/foo.md", "# foo\n");
+    commit(repo, "[foo] intro");
+    // No approval: gate stays Unreviewed (waiting on alice), so the
+    // parked master has no work and the finish notice is the sole
+    // wake. (An APPROVE here would flip the gate to Approved →
+    // MasterToContinue, waking master at the initial pass.)
+
+    let mut child = spawn_wfw(
+        &env,
+        &["--author", "lloyd", "--role", "master", "--timeout", "30s"],
+    );
+
+    // Stage 1: write the finished plan file (mv-finish approach).
+    write(repo, ".clank/finished/foo.md", "# foo\n");
+
+    // Stage 2: sleep past the watcher's debounce window.
+    std::thread::sleep(Duration::from_millis(1200));
+
+    // Stage 3: commit the finalize — delete from plans/, add to finished/.
+    git(repo, &["rm", "--quiet", ".clank/plans/foo.md"]);
+    git(repo, &["add", ".clank/finished/foo.md"]);
+    git(repo, &["commit", "--quiet", "-m", "[foo] finish"]);
+
+    let exit = wait_for_exit(&mut child, Duration::from_secs(20));
+    let stdout = read_stdout_to_end(&mut child);
+    let stderr = read_stderr_to_end(&mut child);
+    assert!(
+        exit.success(),
+        "wfw exit={exit:?} stdout=`{stdout}` stderr=`{stderr}`"
+    );
+    assert!(
+        stdout.contains("finished") && stdout.contains("foo"),
+        "expected finished notice after early-snapshot + late-commit race; got stdout=`{stdout}` stderr=`{stderr}`"
+    );
 }

@@ -44,21 +44,74 @@ rule — and for reviewers it shouldn't surface at all.
 Keep `detect_finished` out of the reviewer work stream entirely:
 a reviewer is never woken by a finish.
 
-- Scope the `detect_finished` extend to `role == Role::Master`
-  (master is the finalization-lifecycle role and the natural home
-  for the `plan_finalized` hook). Reviewers' wfw ignores Finished.
-- Preserve the two legitimate paths:
-  - The one-shot "your `--plan` target is already finished, stop
-    waiting" exit (wfw.rs:150) — keep; it's for an agent that
-    explicitly asked about that plan.
-  - The `plan_finalized` hook (HookEvent::PlanFinalized, wfw.rs:74)
-    still fires — now from master's stream only, so
-    `say $CLANK_PLAN finalized` still happens once without waking
-    reviewers.
-- Recommended: also stop Finished from being the SOLE wake reason
-  for MASTER (co-surface like Blocked; never wake an idle master
-  on a finish alone). At minimum, reviewers must never wake.
-  Decide during impl.
+- Gate the `detect_finished` extend (both wfw call sites: initial
+  pass + watch loop) on `role == Role::Master`. Master is the
+  finalization-lifecycle role and the natural home for the
+  `plan_finalized` hook; a reviewer has no action on a finish.
+- The `plan_finalized` hook (HookEvent::PlanFinalized, wfw.rs:74)
+  still fires from master's stream, so `say $CLANK_PLAN finalized`
+  still happens once without waking reviewers.
+
+### Simplification: remove `wfw --plan` entirely (lloyd 2026-06-09)
+
+Sizing this surfaced that `wfw --plan`'s only remaining
+distinctive behaviors were finish-notice paths (the one-shot
+"already finished at startup" exit and the watch-loop finished
+notice for an explicit watcher). Under the teams redesign, all
+team members are on board with all tasks — there are no separate
+plans for separate agents, so a per-agent plan filter on wfw is
+dead complexity. Rather than thread Finished-surfacing exceptions
+through it (`role == Master || plan_filter.is_some()`), DELETE
+the flag:
+
+- `WfwArgs.plan` removed; `wfw` always watches every active plan.
+- The `--plan` resolution block (incl. the one-shot
+  already-finished exit) removed; `active_summary` and the
+  `parse_arg`/`repo_basename` plumbing in wfw with it.
+- `StartupSnapshot::capture(state)` loses its `plan_filter`
+  param — the watched set is always every active plan at startup.
+- The per-item plan_filter retain in both passes removed, and the
+  master no-actionable-plans queue hint no longer checks
+  `plan_filter.is_none()`.
+- Other commands' `--plan`/plan args (status, log, block create,
+  finish …) are untouched — this removes the WATCH filter, not
+  plan addressing.
+
+This collapses the gate to a clean `role == Role::Master` and
+deletes the stale-resume one-shot path outright (an agent resumed
+against an already-finished plan now just gets its normal
+role-appropriate work view).
+
+### Master: keep waking on Finished — Option A (resolved, ruthless 70b479f)
+
+The stub floated also co-surfacing Finished for MASTER (never
+wake alone, like Blocked). That CONTRADICTS keeping the
+`plan_finalized` hook: the hook fires exactly when wfw emits the
+Finished item (wfw.rs:74), so if master co-surfaced it (never
+emitted alone), an idle-master finish would never fire
+`say $CLANK_PLAN finalized`. The two can't both hold without
+decoupling the hook from the wfw emit.
+
+**Decision: Option A.** Master KEEPS waking on Finished — that
+wake IS master's action on a finish (it fires the announcement
+hook). Reviewers never wake on a finish (they have no action).
+This is NOT symmetry-breaking for its own sake: master owns the
+finalization lifecycle and its announcement; a reviewer owns
+neither. So the ONLY change is the `role == Role::Master` guard
+on the work-stream extend (218/375); master's behavior is
+unchanged. (Option B — decouple the hook to `clank finish` time,
+then co-surface master too — is more consistent with the
+notification-not-work model but a larger change; deferred.)
+
+Note (codex 70b479f): the stub's "appended after retain so it
+isn't scoped to the watched plan" is imprecise —
+`StartupSnapshot::capture` already applied the `--plan`
+singleton. The bug is purely the role/wake semantics, not
+explicit-plan scoping. Concern 2 (preserve the one-shot `--plan`
+finished exit) is superseded by the `--plan` removal above — the
+exit is deleted along with the flag it served. Concern 3:
+concept-grep confirms the two work-stream extends are the only
+`Finished` injections.
 
 ## Scope
 
@@ -70,9 +123,10 @@ a reviewer is never woken by a finish.
 
 ## Out of scope
 
-- The plan_filter one-shot finished exit (wfw.rs:150) — keep.
 - The `PlanFinalized` hook itself — keep firing (just not to
   reviewers).
+- `--plan`/plan args on OTHER commands (status, log, block
+  create, finish …) — only wfw's watch filter is removed.
 
 ## Origin
 

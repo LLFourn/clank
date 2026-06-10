@@ -94,8 +94,9 @@ pub enum WaitItem {
 /// newly transitioned to finished.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StartupSnapshot {
-    /// Plan keys this wfw is responsible for. With `--plan foo`,
-    /// `{foo}`. Without `--plan`, the active plan keys at startup.
+    /// Plan keys this wfw is responsible for: the active plan keys
+    /// at startup. (All team members watch every plan — there is no
+    /// per-agent plan filter.)
     pub watched: BTreeSet<PlanKey>,
     /// Finalize SHAs already present at startup, keyed by plan.
     /// A watched plan is "newly finished" iff its current
@@ -106,14 +107,10 @@ pub struct StartupSnapshot {
 }
 
 impl StartupSnapshot {
-    /// Build from initial fold + the resolved `--plan` filter.
-    /// Without a filter the watched set is every active plan at
-    /// startup; with one it's the singleton.
-    pub fn capture(state: &RepoState, plan_filter: Option<&PlanKey>) -> Self {
-        let watched: BTreeSet<PlanKey> = match plan_filter {
-            Some(k) => std::iter::once(k.clone()).collect(),
-            None => state.plans.keys().cloned().collect(),
-        };
+    /// Build from the initial fold. The watched set is every active
+    /// plan at startup (all team members watch every plan).
+    pub fn capture(state: &RepoState) -> Self {
+        let watched: BTreeSet<PlanKey> = state.plans.keys().cloned().collect();
         let mut finished_at_startup: BTreeMap<PlanKey, BTreeSet<CommitSha>> = BTreeMap::new();
         for fp in &state.finished_plans {
             finished_at_startup
@@ -1214,23 +1211,14 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_capture_watched_from_active_plans_when_no_filter() {
+    fn snapshot_capture_watches_all_active_plans() {
         let mut state = RepoState::default();
         state.plans.insert(plan("a"), PlanState::default());
         state.plans.insert(plan("b"), PlanState::default());
-        let snap = StartupSnapshot::capture(&state, None);
+        let snap = StartupSnapshot::capture(&state);
         assert_eq!(snap.watched.len(), 2);
         assert!(snap.watched.contains(&plan("a")));
         assert!(snap.watched.contains(&plan("b")));
-    }
-
-    #[test]
-    fn snapshot_capture_watched_is_singleton_with_filter() {
-        let mut state = RepoState::default();
-        state.plans.insert(plan("a"), PlanState::default());
-        state.plans.insert(plan("b"), PlanState::default());
-        let snap = StartupSnapshot::capture(&state, Some(&plan("a")));
-        assert_eq!(snap.watched, std::iter::once(plan("a")).collect());
     }
 
     // ============ derive_status ad-hoc + blocks ============

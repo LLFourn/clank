@@ -23,12 +23,10 @@ use std::time::Duration;
 
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 
-use super::{WfwArgs, repo_basename, resolve_repo};
+use super::{WfwArgs, resolve_repo};
 use crate::cli::block::scan_blocks;
-use crate::cli::plan_resolve::parse_arg;
 use crate::hook_config::{self, HookFiring};
 use crate::lifecycle::{AgentLabel, CommitSha, PlanKey};
-use crate::repo_state::RepoState;
 use clank_core::Role;
 use clank_core::vocab::HookEvent;
 use clank_core::wait::{StartupSnapshot, WaitItem, detect_finished};
@@ -95,7 +93,6 @@ pub async fn run(args: WfwArgs) -> anyhow::Result<()> {
     let poll_mode = args.effective_poll();
 
     let repo = resolve_repo(args.repo.as_deref())?;
-    let basename = repo_basename(&repo)?;
 
     // Resolve --author via the shared identity resolver when
     // omitted. Same precedence rule as `clank auto`: explicit
@@ -126,41 +123,6 @@ pub async fn run(args: WfwArgs) -> anyhow::Result<()> {
         .await
         .map_err(|e| anyhow::anyhow!("failed to fold repo `{}`: {e}", repo.display()))?;
 
-    let plan_filter = match args.plan.as_deref() {
-        Some(raw) => {
-            let stem = parse_arg(raw, &basename)?;
-            let key = PlanKey::parse(&stem)
-                .map_err(|e| anyhow::anyhow!("invalid plan stem `{stem}`: {e}"))?;
-            let is_active = initial_state.fold.plans.contains_key(&key);
-            let finished_at = initial_state
-                .fold
-                .finished_plans
-                .iter()
-                .rev()
-                .find(|fp| fp.plan == key)
-                .map(|fp| fp.finalized_at.clone());
-            if !is_active && finished_at.is_none() {
-                anyhow::bail!(
-                    "plan `{basename}/{stem}.md` not active. active: {}",
-                    active_summary(&initial_state, &basename)
-                );
-            }
-            if !is_active {
-                // Already-finished plan and explicit `--plan`: emit
-                // a one-shot Finished notice and exit. No watch loop.
-                // This is the "agent resumed with stale state" path.
-                let item = WaitItem::Finished {
-                    plan: key.clone(),
-                    finalized_at: finished_at.expect("checked just above"),
-                };
-                emit(&[item], args.json);
-                return Ok(());
-            }
-            Some(key)
-        }
-        None => None,
-    };
-
     let config = crate::cli::config::load(&repo);
     let hook_config = config.hooks.clone();
     // Reviewer tiers from the team resolver. wfw is a workflow
@@ -175,7 +137,7 @@ pub async fn run(args: WfwArgs) -> anyhow::Result<()> {
         gate_reviewers,
     };
 
-    let snapshot = StartupSnapshot::capture(&initial_state.fold, plan_filter.as_ref());
+    let snapshot = StartupSnapshot::capture(&initial_state.fold);
 
     let initial_suppress_all;
     let initial_block_items: Vec<WaitItem>;
@@ -199,14 +161,6 @@ pub async fn run(args: WfwArgs) -> anyhow::Result<()> {
             );
             let status = initial_state.fold.derive_status(&reviews, &work_policy);
             let mut items = status.work_for(&author, role);
-            if let Some(ref pf) = plan_filter {
-                items.retain(|item| match item {
-                    WaitItem::Master { plan, .. }
-                    | WaitItem::Reviewer { plan, .. }
-                    | WaitItem::Finished { plan, .. } => plan == pf,
-                    _ => false,
-                });
-            }
             if !br.suppressed_plans.is_empty() {
                 items.retain(|item| match item {
                     WaitItem::Master { plan, .. } | WaitItem::Reviewer { plan, .. } => {
@@ -215,7 +169,15 @@ pub async fn run(args: WfwArgs) -> anyhow::Result<()> {
                     _ => true,
                 });
             }
-            items.extend(detect_finished(&snapshot, &initial_state.fold));
+            // Finished is a NOTIFICATION, not work, and only MASTER
+            // acts on it (the finalization-lifecycle role + home of
+            // the plan_finalized hook). A reviewer has no action on a
+            // finish, so injecting it into the work stream would wake
+            // an idle reviewer via the `!items.is_empty()` gate below
+            // for nothing (`finish-does-not-wake-reviewers`).
+            if role == Role::Master {
+                items.extend(detect_finished(&snapshot, &initial_state.fold));
+            }
             if !items.is_empty() {
                 // Co-surface pending Blocked entries alongside
                 // actionable items so a partial-block situation
@@ -250,7 +212,7 @@ pub async fn run(args: WfwArgs) -> anyhow::Result<()> {
         .iter()
         .filter(|(k, _)| !initial_suppressed_plans.contains(k))
         .count();
-    if !initial_suppress_all && role == Role::Master && plan_filter.is_none() && actionable == 0 {
+    if !initial_suppress_all && role == Role::Master && actionable == 0 {
         let queue = match crate::cli::queue::scan_queue_no_dups(&repo) {
             Ok(q) => q,
             Err(e) => {
@@ -356,14 +318,6 @@ pub async fn run(args: WfwArgs) -> anyhow::Result<()> {
                 crate::fs_plan_state_lookup::FsPlanStateLookup::new(&repo, state.head.as_ref());
             let status = state.fold.derive_status(&reviews, &work_policy);
             let mut items = status.work_for(&author, role);
-            if let Some(ref pf) = plan_filter {
-                items.retain(|item| match item {
-                    WaitItem::Master { plan, .. }
-                    | WaitItem::Reviewer { plan, .. }
-                    | WaitItem::Finished { plan, .. } => plan == pf,
-                    _ => false,
-                });
-            }
             if !br.suppressed_plans.is_empty() {
                 items.retain(|item| match item {
                     WaitItem::Master { plan, .. } | WaitItem::Reviewer { plan, .. } => {
@@ -372,7 +326,12 @@ pub async fn run(args: WfwArgs) -> anyhow::Result<()> {
                     _ => true,
                 });
             }
-            items.extend(detect_finished(&snapshot, &state.fold));
+            // Master-only Finished notice (watch loop); see the
+            // initial-pass rationale above
+            // (`finish-does-not-wake-reviewers`).
+            if role == Role::Master {
+                items.extend(detect_finished(&snapshot, &state.fold));
+            }
             if !items.is_empty() {
                 // Co-surface pending Blocked entries (codex caught
                 // on 0a3c039).
@@ -397,7 +356,7 @@ pub async fn run(args: WfwArgs) -> anyhow::Result<()> {
                 .iter()
                 .filter(|(k, _)| !br.suppressed_plans.contains(k))
                 .count();
-            if role == Role::Master && plan_filter.is_none() && actionable_in_loop == 0 {
+            if role == Role::Master && actionable_in_loop == 0 {
                 let queue = match crate::cli::queue::scan_queue_no_dups(&repo) {
                     Ok(q) => q,
                     Err(e) => {
@@ -487,20 +446,6 @@ fn check_blocks(repo: &Path, author: &AgentLabel) -> BlockResult {
     }
 
     result
-}
-
-fn active_summary(state: &RepoState, basename: &str) -> String {
-    let names: Vec<String> = state
-        .fold
-        .plans
-        .keys()
-        .map(|k| format!("{basename}/{}.md", k.as_str()))
-        .collect();
-    if names.is_empty() {
-        "(none)".into()
-    } else {
-        names.join(", ")
-    }
 }
 
 fn emit(items: &[WaitItem], json: bool) {

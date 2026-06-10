@@ -321,11 +321,6 @@ pub struct WfwArgs {
     /// `.clank/config.json`'s `master` field, else `reviewer`.
     #[arg(long, value_enum)]
     pub role: Option<WfwRole>,
-    /// Restrict watch / report to one plan (same parser as
-    /// `clank status --plan`). Without it, wfw considers every
-    /// active plan in the repo.
-    #[arg(long, value_name = "PLAN")]
-    pub plan: Option<String>,
     /// Maximum wait. Accepts `30s`, `5m`, `1h`. `0` (default) means
     /// wait indefinitely.
     #[arg(long, default_value = "0", value_name = "DURATION")]
