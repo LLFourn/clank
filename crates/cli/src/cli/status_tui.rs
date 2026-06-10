@@ -152,10 +152,30 @@ fn headline_color(snap: &StatusSnapshot) -> &'static str {
 }
 
 /// Bold + reverse-video + color, padded to `cols` so the banner
-/// spans the pane width.
+/// spans the pane width. Pads by DISPLAY width, not char count —
+/// the leading emoji is two columns, and padding by chars made
+/// the reverse-video background overflow the pane by one column
+/// and wrap (lloyd + ruthless 1fee586).
 fn style_banner(text: &str, color: &str, cols: usize) -> String {
-    let pad = cols.saturating_sub(text.chars().count());
+    let pad = cols.saturating_sub(display_width(text));
     format!("\x1b[1;7;{color}m{text}{}\x1b[0m", " ".repeat(pad))
+}
+
+/// Display columns a char occupies in the terminal. Not a full
+/// unicode-width implementation: banner/tier content is validated
+/// ASCII (plan stems, agent labels, gate names) plus the fixed
+/// status emoji set — so "emoji plane → 2, else 1" is exact for
+/// everything we render, with zero new deps.
+fn char_width(c: char) -> usize {
+    if ('\u{1F000}'..='\u{1FAFF}').contains(&c) {
+        2
+    } else {
+        1
+    }
+}
+
+fn display_width(s: &str) -> usize {
+    s.chars().map(char_width).sum()
 }
 
 /// Tier-1 headline: whose turn is it to unblock progress.
@@ -231,16 +251,27 @@ fn verb_of(w: &WaitingOn) -> &'static str {
     }
 }
 
-/// Truncate to `cols` display chars with a `…` ellipsis. Char-based
-/// (not byte) so multi-byte content can't split.
+/// Truncate to `cols` DISPLAY columns with a `…` ellipsis.
+/// Width-aware (emoji count as 2) so a kept double-width char
+/// can't push the line past the pane edge.
 fn truncate_to(s: &str, cols: usize) -> String {
-    if s.chars().count() <= cols {
+    if display_width(s) <= cols {
         return s.to_string();
     }
     if cols == 0 {
         return String::new();
     }
-    let mut t: String = s.chars().take(cols - 1).collect();
+    // Keep chars while they fit in cols-1 (reserving 1 for `…`).
+    let mut t = String::new();
+    let mut w = 0;
+    for c in s.chars() {
+        let cw = char_width(c);
+        if w + cw > cols - 1 {
+            break;
+        }
+        t.push(c);
+        w += cw;
+    }
     t.push('…');
     t
 }
@@ -496,19 +527,54 @@ mod tests {
             vec!["another-quite-long-queued-name"],
         );
         let lines = render(&s, 24, 10);
-        // Measure VISIBLE width: the banner line carries zero-width
-        // ANSI escapes plus full-width padding, so raw char count
-        // overshoots by design.
+        // Measure visible DISPLAY width (emoji are 2 cols): char
+        // count was the exact blind spot that let the banner
+        // overflow the pane by one column (ruthless 1fee586 +
+        // lloyd's real-pane repro).
         for line in &lines {
             assert!(
-                visible(line).chars().count() <= 10,
-                "line wider than 10 visible cols: `{line}`"
+                display_width(visible(line).trim_end()) <= 10,
+                "line wider than 10 display cols: `{line}`"
             );
         }
         assert!(
             visible(&lines[0]).ends_with('…'),
             "truncated headline ends with ellipsis"
         );
+    }
+
+    #[test]
+    fn banner_padding_fills_exactly_to_display_width() {
+        // The full-width reverse-video banner must be EXACTLY cols
+        // display-wide — one more wraps the background to the next
+        // line (the bug lloyd hit). Don't trim padding here: the
+        // emoji (2 cols) + text + pad must sum to cols precisely.
+        let s = snap(vec![plan_state("foo", reviewer_missing("codex"))], vec![]);
+        let lines = render(&s, 1, 60);
+        assert_eq!(
+            display_width(&visible_untrimmed(&lines[0])),
+            60,
+            "banner visible display width must equal cols exactly"
+        );
+    }
+
+    /// `visible` without the trailing-pad trim — for asserting the
+    /// banner's exact padded width.
+    fn visible_untrimmed(line: &str) -> String {
+        let mut out = String::new();
+        let mut chars = line.chars();
+        while let Some(c) = chars.next() {
+            if c == '\x1b' {
+                for e in chars.by_ref() {
+                    if e == 'm' {
+                        break;
+                    }
+                }
+            } else {
+                out.push(c);
+            }
+        }
+        out
     }
 
     #[test]
