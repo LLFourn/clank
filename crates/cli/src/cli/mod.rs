@@ -18,6 +18,7 @@ pub mod diff;
 pub mod doctor;
 pub mod feedback;
 pub mod finish;
+pub mod fork;
 pub mod html;
 pub mod html_highlight;
 pub mod init;
@@ -112,6 +113,31 @@ pub struct InitArgs {
     /// with `--team`.
     #[arg(long, value_name = "NAME")]
     pub team: Option<String>,
+}
+
+#[derive(Args, Debug)]
+pub struct ForkArgs {
+    /// Worktree name — also the new branch name and the zellij
+    /// tab name.
+    pub name: String,
+    /// Repo to fork from. Defaults to the cwd's git toplevel.
+    pub source: Option<PathBuf>,
+    /// Base the worktree's new branch on this ref instead of
+    /// source HEAD (e.g. a fetched PR head).
+    #[arg(long, value_name = "REF")]
+    pub branch: Option<String>,
+    /// Worktree destination. Defaults to
+    /// `<source>/.clank/worktrees/<name>`.
+    #[arg(long, value_name = "DIR")]
+    pub path: Option<PathBuf>,
+    /// Extra orienting context for the forked sessions (appended
+    /// to the standard orientation prompt).
+    #[arg(long, value_name = "TEXT")]
+    pub prompt: Option<String>,
+    /// Skip the default tab-opening when run inside zellij.
+    /// Outside zellij fork never auto-spawns a session.
+    #[arg(long)]
+    pub no_open: bool,
 }
 
 #[derive(Args, Debug)]

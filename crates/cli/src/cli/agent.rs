@@ -206,7 +206,14 @@ fn start(args: AgentStartArgs) -> anyhow::Result<()> {
     let bound_session = cfg.as_ref().and_then(|c| c.session.as_ref());
 
     let composed = match bound_session {
-        None => compose_bootstrap_launch(&label, &desc)?,
+        // A seeded fork spec (clank fork) takes precedence over the
+        // plain bootstrap on first launch: fork the source session
+        // with the orientation prompt; the forked id then binds via
+        // the env-var hook and later starts hit the resume path.
+        None => match crate::cli::fork::load_fork_spec(&repo, &label)? {
+            Some(spec) => compose_fork_launch(&spec, &desc),
+            None => compose_bootstrap_launch(&label, &desc)?,
+        },
         Some(session) => {
             let auto_mode = cfg.as_ref().map(|c| c.auto_mode).unwrap_or_default();
             let resolved_prompt = resolve_initial_prompt(desc.initial_prompt.as_deref(), auto_mode);
@@ -287,6 +294,49 @@ fn compose_bootstrap_launch(
         args,
         env_overrides,
     })
+}
+
+/// Launch a FORKED copy of a source session (clank fork): both
+/// tools fork cleanly — `claude --resume <src> --fork-session`
+/// mints a diverged session; `codex fork <src> [prompt]` likewise
+/// (no `--cd` needed: the pane's cwd IS the worktree). The
+/// orientation prompt rides as the trailing positional on both.
+fn compose_fork_launch(
+    spec: &crate::cli::fork::ForkSpec,
+    desc: &AgentDescription,
+) -> ComposedLaunch {
+    let program = desc
+        .launch
+        .as_ref()
+        .and_then(|l| l.command.clone())
+        .unwrap_or_else(|| spec.tool.as_str().to_string());
+    let mut args = desc
+        .launch
+        .as_ref()
+        .map(|l| l.args.clone())
+        .unwrap_or_default();
+    match spec.tool {
+        Tool::Claude => {
+            args.push("--resume".into());
+            args.push(spec.from_session.clone());
+            args.push("--fork-session".into());
+        }
+        Tool::Codex => {
+            args.push("fork".into());
+            args.push(spec.from_session.clone());
+        }
+    }
+    args.push(spec.prompt.clone());
+    let env_overrides = desc
+        .launch
+        .as_ref()
+        .map(|l| l.env.clone())
+        .unwrap_or_default();
+    ComposedLaunch {
+        program,
+        args,
+        env_overrides,
+    }
 }
 
 /// Seed prompt for the bootstrap launch. Verbatim per the plan's
@@ -1356,5 +1406,49 @@ mod tests {
         let row = AgentRow::from_join(&label("boss"), "master", "—", Tool::Claude, None);
         assert_eq!(row.role, "master");
         assert_eq!(row.review, "—");
+    }
+
+    #[test]
+    fn fork_launch_composes_per_tool_with_orientation_prompt() {
+        // clank-fork-worktree-sessions: the seeded fork spec turns
+        // into the per-tool fork argv with the orientation prompt
+        // as the trailing positional. Both tools fork cleanly
+        // (verified live 2026-06-10 — the stale "codex can't fork"
+        // research claim is dead).
+        let desc = AgentDescription {
+            tool: Tool::Claude,
+            launch: None,
+            initial_prompt: None,
+        };
+        let spec = crate::cli::fork::ForkSpec {
+            tool: Tool::Claude,
+            from_session: "abc-123".into(),
+            prompt: "You are `claude` in worktree `x`…".into(),
+        };
+        let c = compose_fork_launch(&spec, &desc);
+        assert_eq!(c.program, "claude");
+        assert_eq!(
+            c.args,
+            vec![
+                "--resume",
+                "abc-123",
+                "--fork-session",
+                "You are `claude` in worktree `x`…",
+            ]
+        );
+
+        let desc = AgentDescription {
+            tool: Tool::Codex,
+            launch: None,
+            initial_prompt: None,
+        };
+        let spec = crate::cli::fork::ForkSpec {
+            tool: Tool::Codex,
+            from_session: "def-456".into(),
+            prompt: "orient".into(),
+        };
+        let c = compose_fork_launch(&spec, &desc);
+        assert_eq!(c.program, "codex");
+        assert_eq!(c.args, vec!["fork", "def-456", "orient"]);
     }
 }

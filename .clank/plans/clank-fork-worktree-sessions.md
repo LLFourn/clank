@@ -113,6 +113,16 @@ clank fork <name> [<source-repo>] [--branch <ref>] [--path <dir>]
   per-tool fork commands + orientation prompt; missing-session
   precondition refuses with the agent list; `--path`/`--branch`
   respected; stdout = path only.
+- **Open decision is a PURE seam** (ruthless 84fb046):
+  `should_open(inside_zellij, no_open)` — the spawn itself is
+  untestable (no-binary-spawning rule), so the decision fn is,
+  with all four cases pinned: inside+default → open;
+  inside+--no-open → skip; outside+either → skip; stdout stays
+  path-only throughout. Same pattern as dedup's decide_session.
+- Fork-launch composition is pure too: given a fork spec,
+  the composed argv is `claude --resume <src> --fork-session …` /
+  `codex fork <src> …` — asserted like the existing
+  `agent start --print` compose tests.
 - repo_basename(worktree) returns the worktree name.
 
 ## Relationship to clank-pr-review-mode

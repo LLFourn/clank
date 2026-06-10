@@ -39,6 +39,9 @@ enum Command {
     /// protective ref) and clean them off the branch. `--to-queue`
     /// also saves the plan body back to the queue for re-attempt
     Shelve(cli::ShelveArgs),
+    /// Create a linked worktree with the whole team's sessions
+    /// forked into it (opens a tab when inside zellij)
+    Fork(cli::ForkArgs),
     /// Restore a shelved plan: replay its commits onto HEAD.
     /// Reviews reset (the replayed commits are re-reviewed)
     Unshelve(cli::UnshelveArgs),
@@ -116,6 +119,7 @@ async fn main() -> anyhow::Result<()> {
             None => cli::shelve::run_shelve(args).await,
         },
         Command::Unshelve(args) => cli::shelve::run_unshelve(args).await,
+        Command::Fork(args) => cli::fork::run(args).await,
         Command::Log(args) => cli::log::run(args).await,
         Command::Html(args) => cli::html::run(args).await,
         Command::Open(args) => cli::open::run(args).await,

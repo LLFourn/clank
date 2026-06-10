@@ -1,0 +1,212 @@
+//! `clank fork <name>` — create a linked git worktree and seed it
+//! so the WHOLE TEAM continues there in forked sessions
+//! (plan: clank-fork-worktree-sessions).
+//!
+//! Fork-on-launch: this command mints no session ids. It seeds a
+//! one-shot fork spec per agent (`.clank/agents/<label>/fork.json`
+//! in the WORKTREE, gitignored); `clank agent start` consumes it
+//! on first launch (`claude --resume <src> --fork-session` /
+//! `codex fork <src> …`) and the forked id binds via the normal
+//! env-var hook. Both tools fork CLEANLY — verified against
+//! installed binaries 2026-06-10.
+//!
+//! Opening follows the bare-verb convention
+//! (clank-open-zellij-context): inside zellij the new tab opens by
+//! default (`--no-open` opts out); outside zellij fork never
+//! auto-spawns. The worktree path is the SOLE stdout line either
+//! way, so `clank open --repo "$(clank fork --no-open x)"`
+//! composes.
+
+use std::path::{Path, PathBuf};
+
+use anyhow::Context;
+
+use crate::lifecycle::AgentLabel;
+
+use super::ForkArgs;
+
+/// One-shot fork spec consumed by `clank agent start`'s bootstrap
+/// path when the agent has no bound session yet.
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+pub struct ForkSpec {
+    pub tool: clank_core::vocab::Tool,
+    /// The SOURCE repo's session id this agent forks from.
+    pub from_session: String,
+    /// Orientation prompt delivered to the forked session on its
+    /// first launch.
+    pub prompt: String,
+}
+
+pub fn fork_spec_path(repo: &Path, label: &AgentLabel) -> PathBuf {
+    repo.join(format!(".clank/agents/{}/fork.json", label.as_str()))
+}
+
+pub fn load_fork_spec(repo: &Path, label: &AgentLabel) -> anyhow::Result<Option<ForkSpec>> {
+    let path = fork_spec_path(repo, label);
+    match std::fs::read_to_string(&path) {
+        Ok(s) => {
+            Ok(Some(serde_json::from_str(&s).with_context(|| {
+                format!("parsing `{}`", path.display())
+            })?))
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(anyhow::Error::from(e).context(format!("reading `{}`", path.display()))),
+    }
+}
+
+/// THE open decision, pure (ruthless 84fb046: the spawn itself is
+/// untestable under the no-binary-spawning rule, so the decision
+/// is). Inside zellij the tab opens by default; `--no-open` opts
+/// out; outside zellij there is never an auto-spawn.
+fn should_open(inside_zellij: bool, no_open: bool) -> bool {
+    inside_zellij && !no_open
+}
+
+pub async fn run(args: ForkArgs) -> anyhow::Result<()> {
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    let dest = run_fork(&args, home.as_deref()).await?;
+    // SOLE stdout line: the worktree path (composition contract).
+    println!("{}", dest.display());
+
+    let inside_zellij = std::env::var_os("ZELLIJ").is_some();
+    if should_open(inside_zellij, args.no_open) {
+        super::open_zellij::run(super::OpenZellijArgs {
+            repo: Some(dest),
+            print: false,
+        })
+        .await?;
+    } else if !args.no_open && !inside_zellij {
+        eprintln!("open it with: clank open --repo {}", dest.display());
+    }
+    Ok(())
+}
+
+/// The fork core: worktree + seed. Returns the worktree path.
+/// `home` is explicit (dogfood pattern) so tests control the
+/// user-scope config. Everything before the `git worktree add` is
+/// read-only validation (fail-closed: no mutation until all
+/// checks pass).
+pub async fn run_fork(args: &ForkArgs, home: Option<&Path>) -> anyhow::Result<PathBuf> {
+    let name = args.name.as_str();
+    if name.is_empty() || name.contains('/') || name.contains(char::is_whitespace) {
+        anyhow::bail!("fork name must be a simple directory/branch name (got `{name}`)");
+    }
+    let source = super::resolve_repo(args.source.as_deref())?;
+
+    // Team + precondition: EVERY registered agent must have a
+    // bound session in the source repo — a fork with nothing to
+    // fork is meaningless.
+    let Some(set) = crate::agent_store::try_resolve_via_team_with(&source, home)? else {
+        anyhow::bail!("this repo has no team configured. Run `clank init --team <name>` first.");
+    };
+    let mut members: Vec<AgentLabel> = vec![set.master.clone()];
+    members.extend(set.commit_reviewers.iter().map(|a| a.label.clone()));
+    members.extend(set.gate_reviewers.iter().map(|a| a.label.clone()));
+
+    let mut sessions: Vec<(AgentLabel, clank_core::agent_config::Session)> = Vec::new();
+    let mut missing: Vec<String> = Vec::new();
+    for label in &members {
+        match crate::agent_store::load_agent_config(&source, label)? {
+            Some(cfg) if cfg.session.is_some() => {
+                sessions.push((label.clone(), cfg.session.unwrap()));
+            }
+            _ => missing.push(label.as_str().to_string()),
+        }
+    }
+    if !missing.is_empty() {
+        anyhow::bail!(
+            "cannot fork: agent(s) without a bound session in {}: {}. \
+             Every team member needs a live session to fork (bind with `clank as <label>` \
+             in each agent's pane).",
+            source.display(),
+            missing.join(", ")
+        );
+    }
+
+    let dest = match &args.path {
+        Some(p) => p.clone(),
+        None => source.join(format!(".clank/worktrees/{name}")),
+    };
+    if dest.exists() {
+        anyhow::bail!(
+            "worktree destination `{}` already exists. Remove it with \
+             `git worktree remove {}` or pick another name.",
+            dest.display(),
+            dest.display()
+        );
+    }
+    let base = args.branch.as_deref().unwrap_or("HEAD");
+
+    // ── Mutation starts: the worktree. ──
+    if let Some(parent) = dest.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating `{}`", parent.display()))?;
+    }
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(&source)
+        .args(["worktree", "add", "-b", name])
+        .arg(&dest)
+        .arg(base)
+        .output()
+        .context("spawning git worktree add")?;
+    if !out.status.success() {
+        anyhow::bail!(
+            "git worktree add failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+
+    // ── Seed the worktree's gitignored .clank/ ──
+    // Repo config (team selection) is per-worktree + gitignored,
+    // so it doesn't arrive with the checkout. Tracked state
+    // (plans/, finished/, .gitignore) does.
+    let src_cfg = source.join(".clank/config.json");
+    if src_cfg.is_file() {
+        let dst_cfg = dest.join(".clank/config.json");
+        std::fs::create_dir_all(dst_cfg.parent().expect("has parent"))?;
+        std::fs::copy(&src_cfg, &dst_cfg)
+            .with_context(|| format!("seeding `{}`", dst_cfg.display()))?;
+    }
+
+    let purpose = args.prompt.as_deref().unwrap_or("parallel work");
+    for (label, session) in &sessions {
+        let spec = ForkSpec {
+            tool: session.tool,
+            from_session: session.id.as_str().to_string(),
+            prompt: format!(
+                "You are `{label}` in worktree `{name}` of {source_path} \
+                 (branch `{name}` off {base}), session forked for: {purpose}. \
+                 Run `clank as {label}` to bind this forked session.",
+                label = label.as_str(),
+                source_path = source.display(),
+            ),
+        };
+        let path = fork_spec_path(&dest, label);
+        std::fs::create_dir_all(path.parent().expect("has parent"))?;
+        std::fs::write(&path, serde_json::to_string_pretty(&spec)?)
+            .with_context(|| format!("writing `{}`", path.display()))?;
+    }
+
+    eprintln!(
+        "forked `{name}`: worktree at {} (branch `{name}` off {base}, {} agent sessions to fork on launch)",
+        dest.display(),
+        sessions.len(),
+    );
+    eprintln!("  teardown: git worktree remove {}", dest.display());
+    Ok(dest)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn should_open_matrix() {
+        // The four cases ruthless 84fb046 demanded pinned.
+        assert!(should_open(true, false), "inside + default → open");
+        assert!(!should_open(true, true), "inside + --no-open → skip");
+        assert!(!should_open(false, false), "outside + default → skip");
+        assert!(!should_open(false, true), "outside + --no-open → skip");
+    }
+}
