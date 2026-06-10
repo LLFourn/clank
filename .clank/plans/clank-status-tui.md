@@ -168,7 +168,37 @@ branch/head/dirty, per-plan breakdown when N>1, last-finished
 
 ## Status
 
-Stub — queued (lloyd 2026-06-09: live read-only status dashboard
-for a zellij pane; must stay useful when tiny — always show the
-active agent — and progressively reveal current plan, state, and
-the ordered queue as space grows).
+IMPLEMENTED — landed in 6472334 (codex's ffb94b9 review note
+"still needs its actual status --tui implementation" predates
+seeing that commit; the gate had already moved to the adhoc
+commit ffb94b9, so 6472334's diff was never reviewed on its own —
+reviewers: it contains the whole feature).
+
+AS SHIPPED, 6472334:
+- `crates/cli/src/cli/status_tui.rs` — pure
+  `render(snapshot, rows, cols) -> Vec<String>` (tiers + greedy
+  fit, char-truncation), `headline`/`actor_of`/`verb_of`,
+  `term_size` (libc TIOCGWINSZ), `AltScreen` RAII +
+  panic-hook + SIGINT/SIGTERM restore, `paint`
+  (home/clear-to-EOL/clear-below), `run_tui` loop over
+  `build_watcher`/`attach_watcher` with 1s heartbeat.
+- `StatusSnapshot.queue: Vec<String>` (names, priority order)
+  replaced `queue_count`; `--json` gains additive `queue` array
+  (queue_count kept); html.rs count derives.
+- `StatusArgs.tui` (conflicts with --json/--watch/--plan);
+  dispatch at the top of `status::run`.
+- 8 in-lib unit tests on the pure renderer (1-row invariant,
+  idle, truncation, greedy cutoff, queue order, blocked actor,
+  extras, 2-plan deterministic headline).
+
+Interaction with the adhoc binary-spawning-test purge (ffb94b9,
+attributed to this plan): the TUI's coverage is UNAFFECTED — it
+was written as in-process unit tests of the pure renderer from
+the start (per the testing rule: test the subroutines the CLI
+calls, never spawn the binary). No TUI test was deleted; nothing
+needs re-pinning.
+
+Originally queued lloyd 2026-06-09: live read-only status
+dashboard for a zellij pane; must stay useful when tiny — always
+show the active agent — and progressively reveal current plan,
+state, and the ordered queue as space grows.
