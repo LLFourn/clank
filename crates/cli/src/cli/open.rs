@@ -12,8 +12,11 @@ use clank_core::vocab::Tool;
 
 pub async fn run(args: OpenArgs) -> anyhow::Result<()> {
     match args.command {
-        OpenCmd::Dry(dry) => run_dry(dry).await,
-        OpenCmd::Zellij(zellij) => super::open_zellij::run(zellij).await,
+        Some(OpenCmd::Dry(dry)) => run_dry(dry).await,
+        Some(OpenCmd::Zellij(zellij)) => super::open_zellij::run(zellij).await,
+        // Bare `clank open`: the zellij opener with the flattened
+        // flags (clank-open-zellij-context).
+        None => super::open_zellij::run(args.zellij).await,
     }
 }
 
@@ -864,5 +867,55 @@ fn rec_label(r: &Recommendation) -> String {
             command_hint,
             ..
         } => format!("resume agent `{label}` ({command_hint})"),
+    }
+}
+
+#[cfg(test)]
+mod open_args_tests {
+    use super::super::{OpenArgs, OpenCmd};
+    use clap::Parser;
+
+    /// Minimal root so the OpenArgs clap shape is testable
+    /// in-process (the real root lives in main.rs).
+    #[derive(Parser, Debug)]
+    struct T {
+        #[command(subcommand)]
+        cmd: C,
+    }
+    #[derive(clap::Subcommand, Debug)]
+    enum C {
+        Open(OpenArgs),
+    }
+
+    fn parse(argv: &[&str]) -> OpenArgs {
+        match T::parse_from(argv).cmd {
+            C::Open(o) => o,
+        }
+    }
+
+    #[test]
+    fn bare_open_routes_to_zellij_with_flags() {
+        // clank-open-zellij-context: bare `clank open` = the
+        // zellij opener; its flags work on the bare form via the
+        // flattened (shared, drift-proof) OpenZellijArgs.
+        let o = parse(&["t", "open"]);
+        assert!(o.command.is_none());
+        assert!(!o.zellij.print);
+
+        let o = parse(&["t", "open", "--print", "--repo", "/r"]);
+        assert!(o.command.is_none());
+        assert!(o.zellij.print);
+        assert_eq!(o.zellij.repo.as_deref(), Some(std::path::Path::new("/r")));
+    }
+
+    #[test]
+    fn explicit_subcommands_unchanged() {
+        let o = parse(&["t", "open", "zellij", "--print"]);
+        match o.command {
+            Some(OpenCmd::Zellij(z)) => assert!(z.print),
+            other => panic!("expected zellij subcommand, got {other:?}"),
+        }
+        let o = parse(&["t", "open", "dry", "/some/path"]);
+        assert!(matches!(o.command, Some(OpenCmd::Dry(_))));
     }
 }
