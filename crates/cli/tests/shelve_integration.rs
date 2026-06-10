@@ -331,3 +331,33 @@ fn status_surfaces_shelved_with_for_nudge() {
         snap.to_human()
     );
 }
+
+#[test]
+fn rewrite_refusal_rolls_back_ref_and_state() {
+    // codex 1f4800a: the protective ref + state land BEFORE the
+    // rewrite, but a rewrite refusal (here: protected branch
+    // without the override) must roll them back — nothing was
+    // dropped, so the branch still reaches every commit, and
+    // stale state would block the next shelve attempt.
+    let env = repo_with_inflight_foo();
+    let repo = env.repo();
+
+    let mut args = shelve_args(&env, false, None);
+    args.allow_rewrite_protected = false; // tests run on `main` → refusal
+    let err = block_on(clank::cli::shelve::run_shelve(args))
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("protected branch"), "got: {err}");
+
+    // Rolled back: no ref, no state, commits untouched.
+    assert!(!git_out(repo, &["show-ref"]).contains("refs/clank/shelved/foo"));
+    assert!(!repo.join(".clank/shelved/foo.json").exists());
+    assert!(git_out(repo, &["log", "--format=%s"]).contains("[foo] impl b"));
+
+    // And the retry path is clear: a corrected attempt succeeds.
+    block_on(clank::cli::shelve::run_shelve(shelve_args(
+        &env, false, None,
+    )))
+    .unwrap();
+    assert!(repo.join(".clank/shelved/foo.json").is_file());
+}

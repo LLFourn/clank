@@ -207,7 +207,7 @@ pub async fn run_shelve(args: ShelveArgs) -> anyhow::Result<()> {
             }
         })
         .collect();
-    let outcome = run_rewrite(RewriteOpts {
+    let rewrite_result = run_rewrite(RewriteOpts {
         repo: &repo,
         intro_sha: preview.intro_sha.as_ref(),
         head_sha: &preview.head_sha,
@@ -219,7 +219,21 @@ pub async fn run_shelve(args: ShelveArgs) -> anyhow::Result<()> {
         squash: None,
         head_strip_paths: &preview.head_strip_paths,
     })
-    .await?;
+    .await;
+    let outcome = match rewrite_result {
+        Ok(o) => o,
+        Err(e) => {
+            // The rewrite refused (e.g. protected branch without the
+            // override) — nothing was dropped, so the branch still
+            // reaches every commit and the protective ref + state we
+            // just created are safe to roll back. Leaving them would
+            // strand stale shelved state that blocks the next
+            // attempt (codex 1f4800a).
+            let _ = git_delete_ref(&repo, &ref_name(&stem));
+            let _ = std::fs::remove_file(&sp);
+            return Err(e);
+        }
+    };
 
     if let Some((target, body)) = &queue_target {
         if let Some(parent) = target.parent() {

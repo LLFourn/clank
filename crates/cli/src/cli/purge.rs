@@ -465,7 +465,7 @@ fn is_finish_diff(lines: &[String], plan_key: Option<&PlanKey>) -> bool {
 }
 
 /// Foreign-commit refusal under `--drop`. Mirrors the foreign
-/// arm of `cli::demote::safety_check`. The `Rewrite` tier is
+/// arm of `cli::shelve::safety_check`. The `Rewrite` tier is
 /// NOT enforced under `--drop` — the `--drop` flag itself is
 /// the opt-in to losing code (Phase 2, OQ1 tentative pick:
 /// skip the Rewrite-requires-force tier).
@@ -491,7 +491,7 @@ fn drop_safety_check(commits: &[RewriteCommit]) -> anyhow::Result<()> {
 /// Transform every non-foreign plan-attributed commit's
 /// disposition to `Drop`. Foreign commits are preserved as-is
 /// (gated out by `drop_safety_check` above; this is defensive).
-/// Mirrors `cli::demote.rs`'s transform.
+/// Mirrors `cli::shelve.rs`'s transform.
 fn transform_all_to_drop(commits: &[RewriteCommit]) -> Vec<RewriteCommit> {
     commits
         .iter()
@@ -524,7 +524,7 @@ fn confirm_drop(
         "About to DROP all {dropped_count} commit(s) attributed to `{stem}` and write \
          rewritten history to {target}. \
          This deletes the implementation code, not just `.clank/` artifacts. \
-         There is NO archived copy of the plan body anywhere — for that, use `clank demote`. \
+         There is NO archived copy of the plan body anywhere — for that, use `clank shelve --to-queue`. \
          Continue? [y/N] "
     );
     confirm_with(&prompt)
@@ -685,7 +685,7 @@ mod tests {
     #[test]
     fn drop_safety_check_passes_rewrite_non_foreign_without_force() {
         // OQ1 pinned: --drop is the opt-in; Rewrite tier is NOT
-        // enforced under --drop. (Contrast with `clank demote`
+        // enforced under --drop. (Contrast with `clank shelve`
         // which requires --force for non-foreign Rewrite.)
         use clank_core::api::{RewriteCommit, RewriteDisposition};
         use clank_core::ids::CommitSha;
