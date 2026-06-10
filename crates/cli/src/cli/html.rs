@@ -566,11 +566,11 @@ fn render_index(
     } else {
         out.push_str("  <div class=\"empty\">No active plans — repo is idle.</div>\n");
     }
-    if status.queue_count > 0 {
+    if !status.queue.is_empty() {
         out.push_str(&format!(
             "  <div class=\"queue\">queue: {} item{}</div>\n",
-            status.queue_count,
-            if status.queue_count == 1 { "" } else { "s" }
+            status.queue.len(),
+            if status.queue.len() == 1 { "" } else { "s" }
         ));
     }
     if !status.blocks.is_empty() {

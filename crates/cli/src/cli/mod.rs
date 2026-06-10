@@ -32,6 +32,7 @@ pub mod rewire;
 pub mod rewrite;
 pub mod setup;
 pub mod status;
+pub(crate) mod status_tui;
 pub mod stop_hook;
 pub mod team;
 pub mod teams_config;
@@ -302,6 +303,11 @@ pub struct StatusArgs {
     /// line per update.
     #[arg(long)]
     pub watch: bool,
+    /// Full-screen read-only live status view, sized for a small
+    /// zellij pane. No input handling — close the pane (or Ctrl-C)
+    /// to exit. Conflicts with --json/--watch/--plan.
+    #[arg(long, conflicts_with_all = ["json", "watch", "plan"])]
+    pub tui: bool,
 }
 
 #[derive(Args, Debug)]

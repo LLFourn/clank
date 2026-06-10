@@ -28,7 +28,10 @@ pub struct StatusSnapshot {
     pub(crate) plans: Vec<PlanWorkState>,
     pub(crate) last_finished: Option<FinishedPlan>,
     pub(crate) blocks: Vec<crate::cli::block::BlockEntry>,
-    pub(crate) queue_count: usize,
+    /// Queued plan names in priority order (the TUI's tier-4 list;
+    /// counts everywhere else derive from it). Plan:
+    /// clank-status-tui.
+    pub(crate) queue: Vec<String>,
 }
 
 /// In-process convenience for tests / callers that want a status
@@ -106,7 +109,13 @@ impl StatusSnapshot {
         )?;
 
         let blocks = crate::cli::block::scan_blocks(repo);
-        let queue_count = crate::cli::queue::scan_queue(repo).len();
+        // scan_queue returns entries sorted by (priority, name);
+        // capture the names so the snapshot stays the single source
+        // of truth for the queue (count derives from it).
+        let queue: Vec<String> = crate::cli::queue::scan_queue(repo)
+            .into_iter()
+            .map(|e| e.name)
+            .collect();
 
         Ok(Self {
             repo_path: repo.to_path_buf(),
@@ -118,7 +127,7 @@ impl StatusSnapshot {
             plans,
             last_finished,
             blocks,
-            queue_count,
+            queue,
         })
     }
 
@@ -180,8 +189,11 @@ impl StatusSnapshot {
             "finished_plans": finished,
             "blocks": all_blocks,
         });
-        if self.queue_count > 0 {
-            obj["queue_count"] = serde_json::json!(self.queue_count);
+        if !self.queue.is_empty() {
+            obj["queue_count"] = serde_json::json!(self.queue.len());
+            // Names in priority order. Additive wire-format change
+            // (clank-status-tui); queue_count kept for consumers.
+            obj["queue"] = serde_json::json!(self.queue);
         }
         obj
     }
@@ -202,12 +214,12 @@ impl StatusSnapshot {
             "dirty:  {}",
             if self.worktree_dirty { "yes" } else { "no" }
         );
-        if self.queue_count > 0 {
+        if !self.queue.is_empty() {
             let _ = writeln!(
                 out,
                 "queue:  {} item{}",
-                self.queue_count,
-                if self.queue_count == 1 { "" } else { "s" }
+                self.queue.len(),
+                if self.queue.len() == 1 { "" } else { "s" }
             );
         }
 
@@ -296,6 +308,10 @@ pub async fn run(args: StatusArgs) -> anyhow::Result<()> {
 
     let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
 
+    if args.tui {
+        return crate::cli::status_tui::run_tui(repo, basename, home, policy).await;
+    }
+
     if args.watch {
         return run_watch(
             repo,
@@ -373,7 +389,7 @@ async fn run_watch(
     }
 }
 
-fn build_watcher(tx: mpsc::Sender<()>) -> anyhow::Result<RecommendedWatcher> {
+pub(crate) fn build_watcher(tx: mpsc::Sender<()>) -> anyhow::Result<RecommendedWatcher> {
     Ok(notify::recommended_watcher(
         move |res: notify::Result<notify::Event>| {
             if res.is_ok() {
@@ -383,7 +399,7 @@ fn build_watcher(tx: mpsc::Sender<()>) -> anyhow::Result<RecommendedWatcher> {
     )?)
 }
 
-fn attach_watcher(watcher: &mut RecommendedWatcher, repo: &Path) -> anyhow::Result<()> {
+pub(crate) fn attach_watcher(watcher: &mut RecommendedWatcher, repo: &Path) -> anyhow::Result<()> {
     let clank_root = repo.join(".clank");
     if let Err(e) = std::fs::create_dir_all(&clank_root) {
         anyhow::bail!("ensure `{}` exists: {e}", clank_root.display());
@@ -467,7 +483,7 @@ fn select_plans_and_finished(
     Ok((plans, last_finished))
 }
 
-fn waiting_actor(w: &WaitingOn) -> String {
+pub(crate) fn waiting_actor(w: &WaitingOn) -> String {
     match w {
         WaitingOn::Blocked { block } => block.creator.as_str().to_string(),
         WaitingOn::ReviewerApprovalsMissing { missing }
@@ -500,7 +516,7 @@ fn first_line(s: &str) -> String {
     }
 }
 
-fn waiting_reason(w: &WaitingOn) -> String {
+pub(crate) fn waiting_reason(w: &WaitingOn) -> String {
     match w {
         WaitingOn::Blocked { block } => format!("blocked: {}", first_line(&block.message)),
         WaitingOn::ReviewerApprovalsMissing { missing } => {
@@ -563,7 +579,7 @@ fn active_summary(fold: &clank_core::repo_state::RepoState, basename: &str) -> S
     }
 }
 
-fn short_sha(s: &str) -> &str {
+pub(crate) fn short_sha(s: &str) -> &str {
     &s[..s.len().min(7)]
 }
 

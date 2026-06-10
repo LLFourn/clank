@@ -121,6 +121,43 @@ Notes:
 - Re-query every paint (cheap) so resize is picked up by the
   `recv_timeout` heartbeat — no SIGWINCH handler needed.
 
+## Sizing concerns resolved (ruthless 9d01e47)
+
+1. **Layout is a pure unit-tested function.**
+   `status_tui::render(snapshot, rows, cols) -> Vec<String>` —
+   the paint loop just calls it. Tests pin: 1 row → active-agent
+   headline ALWAYS renders; idle → `idle` at 1 row; every line
+   ≤ cols (char-based truncation, `…` ellipsis); greedy cutoff
+   (queue tier absent at 3-4 rows, appears at 5 with header +
+   ≥1 item — never a bare header); queue names in priority order
+   as space allows. Only the ioctl / escape codes / loop are
+   untested.
+2. **Multi-plan headline rule (deterministic):** N>1 active plans
+   → `* N plans: actor1(plan1), actor2(plan2), …` in snapshot
+   order (lexicographic by plan key — derive_status folds a
+   BTreeMap); width truncation trims the tail; extras tier lists
+   the full per-plan breakdown. Exact 2-plan string pinned in
+   test. `Blocked` renders actor `human` (awaiting the human, not
+   the block creator).
+3. **Ctrl-C handled, not documented away:** SIGINT + SIGTERM
+   handlers write the restore sequence (async-signal-safe `write`
+   + `_exit(128+sig)`) so a direct-terminal user is never left on
+   the alt screen with a hidden cursor. RAII Drop covers normal
+   exits; the panic hook covers panic=abort.
+4. **Snapshot/JSON addition intentional:** `StatusSnapshot.queue:
+   Vec<String>` (names, priority order; replaces `queue_count` —
+   counts derive from it). `--json` gains an additive `queue`
+   array; `queue_count` stays for existing consumers. Emitted
+   only when non-empty, same as before.
+
+Extras-tier deviation from the stub: the "reviewer-tier
+breakdown" extra is dropped in v1 — reviewer tiers aren't on the
+snapshot, and side-loading team config into the renderer would
+break the snapshot-is-the-single-source-of-truth rule. Add it by
+extending the snapshot if wanted later. Extras shipped:
+branch/head/dirty, per-plan breakdown when N>1, last-finished
+(idle only), pending-blocks count.
+
 ## Out of scope
 
 - Any input / interactivity (quit keys, scrolling, tabs). If ever
