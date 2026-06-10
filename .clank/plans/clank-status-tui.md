@@ -1,0 +1,137 @@
+# clank-status-tui
+
+A full-screen, READ-ONLY, live-updating status view —
+`clank status --tui` — sized to live in a small zellij pane and
+show the user where the agents are up to. No input handling
+(strictly a display). The more terminal space it gets, the more
+it shows; when tiny it still shows the most important thing.
+
+## Build on `clank status --watch`, don't fork it
+
+`--tui` is a third RENDER TARGET over the machinery `--watch`
+already has (status.rs), NOT a new data path:
+- `build_watcher` + `attach_watcher` — notify on `.clank/` +
+  `.git/`, already race-free.
+- `StatusSnapshot::build_async` — rebuilt per change; already the
+  single source of truth (also feeds `clank html`).
+- the existing human renderer produces the status text.
+Reuse all three. The snapshot stays the one source of truth;
+`--tui` only changes HOW it's drawn (cursor-home + clear-to-EOL
+in place, instead of stacked text blocks).
+
+## Responsive layout — the core requirement
+
+Render a PRIORITY-ORDERED list of sections, including from the
+top until available rows run out, truncating each line to the
+terminal width (ellipsis). Tiers, smallest space first:
+
+1. **Active agent (ALWAYS — even at 1 row).** Who the gate is
+   currently waiting on, and doing what, e.g.
+   `* ruthless - reviewing - finished-means-impl @ approved_pending_gate`
+   If nobody is active: `idle`. This line must always render.
+2. **Current plan** — the active plan's name (+ short sha).
+3. **State** — gate state + waiting-on reason
+   (`approved_pending_gate - commit reviewers approved; waiting on ruthless`).
+4. **Queue** — `Queued (N):` then queued plan names in PRIORITY
+   ORDER, as many as fit.
+5. **Extras (lots of space)** — branch/head/dirty, reviewer-tier
+   breakdown, all in-flight plans if more than one, a "watching"
+   tick.
+
+Greedy fit: include section K only if the remaining rows hold its
+minimum height; otherwise stop. Width: truncate per line. The
+smallest useful view is a single line; it degrades gracefully
+upward.
+
+## Snapshot gap to close (promote-time note)
+
+`StatusSnapshot` today carries only `queue_count: usize`, but
+tier 4 renders queued plan NAMES in priority order. Extend the
+snapshot (e.g. `queue: Vec<String>` of stems in priority order,
+from the same scan the count comes from) rather than side-loading
+a second queue scan in the TUI renderer — the snapshot stays the
+single source of truth; `queue_count` then derives from it.
+Everything else the tiers need is already on the snapshot
+(`plans: Vec<PlanWorkState>` carries `gate` + `waiting_on` for
+the active-agent line; branch/head/dirty for the extras tier).
+
+## "Active agent" is derived, not a process probe
+
+The active agent comes from the existing `WorkStatus` /
+`waiting_on` (derive_status) — not from probing running
+processes:
+- `MasterTo{Continue,Commit,Revise,Finalize}` -> master active.
+- `ReviewerApprovalsMissing{missing}` -> that commit reviewer.
+- `GateReviewersMissing{missing}` -> that gate reviewer.
+- `Blocked` -> nobody (awaiting human).
+So "active" = whose turn it is to unblock progress. If multiple
+in-flight plans each await a different agent, the 1-line headline
+summarizes (count / most-salient) and the extras tier lists them.
+True "process running right now" liveness would be a separate
+signal — out of scope.
+
+## Implementation notes
+
+- No TUI framework. No input -> no raw mode, no event loop.
+- Alt-screen via an RAII guard (`Drop` restores show-cursor +
+  leave-alt-screen on EVERY exit path) PLUS a
+  `std::panic::set_hook` that prints the restore sequence (covers
+  `panic=abort`, where Drop won't run). Ctrl-C left to close the
+  pane in v1.
+- Paint = `\x1b[H` (home), each line + `\x1b[K` (clear to EOL),
+  then `\x1b[J` to clear leftover rows from a taller previous
+  frame. No full `2J` clear -> no flicker.
+- `recv_timeout` on the notify channel (~1s heartbeat) so the view
+  re-reads terminal size and repaints on resize without a SIGWINCH
+  handler.
+
+## Terminal size: unsafe `TIOCGWINSZ` ioctl via libc (DECIDED)
+
+Responsiveness needs the terminal rows/cols each paint. Do it with
+a raw ioctl — `libc` is ALREADY a direct dependency of the cli
+crate (libc 0.2.x), so this is zero new deps and no framework.
+
+Portability is the whole point: do NOT hardcode the request
+constant — it differs per platform (Linux `0x5413`, macOS/BSD
+`0x40087468`, computed via the BSD `_IOR` macro). Use libc's
+per-platform definitions so it works on any nix:
+
+```rust
+fn term_size() -> (u16, u16) {            // (rows, cols)
+    use std::os::unix::io::AsRawFd;
+    let mut ws: libc::winsize = unsafe { std::mem::zeroed() };
+    let fd = std::io::stdout().as_raw_fd();
+    // SAFETY: ws is a valid winsize; ioctl fills it or returns -1.
+    let rc = unsafe { libc::ioctl(fd, libc::TIOCGWINSZ, &mut ws) };
+    if rc == 0 && ws.ws_row > 0 && ws.ws_col > 0 {
+        (ws.ws_row, ws.ws_col)
+    } else {
+        (24, 80) // not a tty / piped (e.g. tests) — sane fallback
+    }
+}
+```
+
+Notes:
+- `libc::TIOCGWINSZ`, `libc::winsize`, `libc::ioctl` carry the
+  correct per-target constant + struct layout — that's what makes
+  it nix-portable. Hardcoding the number is the trap.
+- Query the stdout fd (the pane's tty). On failure (rc != 0, or
+  zero dims when output isn't a terminal) fall back to 24x80 so
+  the renderer and tests still work headless.
+- Re-query every paint (cheap) so resize is picked up by the
+  `recv_timeout` heartbeat — no SIGWINCH handler needed.
+
+## Out of scope
+
+- Any input / interactivity (quit keys, scrolling, tabs). If ever
+  wanted, THEN reach for ratatui+crossterm.
+- `--watch`'s existing text/JSON modes — unchanged.
+- Adding a `--tui` status pane to `clank open zellij`'s generated
+  layout — natural follow-on, separate plan.
+
+## Status
+
+Stub — queued (lloyd 2026-06-09: live read-only status dashboard
+for a zellij pane; must stay useful when tiny — always show the
+active agent — and progressively reveal current plan, state, and
+the ordered queue as space grows).
