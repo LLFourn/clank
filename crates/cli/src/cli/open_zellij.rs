@@ -50,10 +50,29 @@ pub async fn run(args: OpenZellijArgs) -> anyhow::Result<()> {
         (cols, rows),
     )?;
     let layout_path = layout_file_path(&repo);
-    let spawn_argv = compose_spawn_argv(&layout_path);
+    let name = session_name(&basename);
+
+    // Inside zellij: new tab in the current session (no dedup —
+    // see in_session_tab_argv). Outside: attach-or-create against
+    // the deterministic session name.
+    let (pre_argv, spawn_argv) = if std::env::var_os("ZELLIJ").is_some() {
+        (None, in_session_tab_argv(&layout_path))
+    } else {
+        let listing = zellij_list_sessions();
+        match decide_session(&listing, &name) {
+            SessionPlan::Attach => (None, attach_argv(&name)),
+            SessionPlan::Create => (None, create_argv(&layout_path, &name)),
+            SessionPlan::DeleteDeadThenCreate => {
+                (Some(delete_argv(&name)), create_argv(&layout_path, &name))
+            }
+        }
+    };
 
     if args.print {
         println!("{kdl}");
+        if let Some(pre) = &pre_argv {
+            eprintln!("pre-spawn: {}", pre.join(" "));
+        }
         eprintln!("spawn: {}", spawn_argv.join(" "));
         return Ok(());
     }
@@ -61,14 +80,33 @@ pub async fn run(args: OpenZellijArgs) -> anyhow::Result<()> {
     write_layout_file(&repo, &kdl)?;
     ensure_gitignore_zellij_entry(&repo)?;
 
+    if let Some(pre) = &pre_argv {
+        // Best-effort: a failed delete of a dead session just means
+        // the create below errors visibly.
+        let _ = std::process::Command::new(&pre[0]).args(&pre[1..]).status();
+    }
+    if spawn_argv[1] == "attach" {
+        eprintln!("attaching to existing session `{name}`");
+    }
     let status = std::process::Command::new(&spawn_argv[0])
         .args(&spawn_argv[1..])
         .status()
-        .context("spawning zellij --layout")?;
+        .context("spawning zellij")?;
     if !status.success() {
-        anyhow::bail!("zellij --layout exited {status}");
+        anyhow::bail!("zellij exited {status}");
     }
     Ok(())
+}
+
+/// `zellij list-sessions -n` stdout, or empty when the command
+/// fails — zellij exits non-zero when NO sessions exist, which is
+/// exactly the Create case, so failure degrades to "no sessions".
+fn zellij_list_sessions() -> String {
+    std::process::Command::new("zellij")
+        .args(["list-sessions", "-n"])
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
+        .unwrap_or_default()
 }
 
 fn layout_file_path(repo: &Path) -> PathBuf {
@@ -435,7 +473,91 @@ fn kdl_escape(s: &str) -> String {
 /// `ps -ao ppid,args` on an interval — accumulated detached
 /// sessions congest the whole machine (observed ~320 servers
 /// pinning every core with concurrent `ps` scans).
-fn compose_spawn_argv(layout_path: &Path) -> Vec<String> {
+/// Deterministic per-repo session name (`zellij-session-dedup`):
+/// zellij enforces NAME UNIQUENESS, so a stable name makes
+/// duplicate clank sessions unrepresentable — re-running
+/// `clank open zellij` attaches instead of minting another
+/// randomly-named session full of fresh agent instances.
+fn session_name(basename: &str) -> String {
+    format!("clank-{basename}")
+}
+
+/// What to do about the named session, decided PURELY over
+/// `zellij list-sessions -n` output (`-n` = no ANSI; each line is
+/// `<name> [Created …]` with a trailing `(EXITED - …)` marker for
+/// dead sessions and `(current)` for the one we're inside).
+/// First-whitespace-token name match keeps the parse robust to
+/// trailing-format drift; the EXITED marker is the only other
+/// thing we read (ruthless a9ac348 concern 2).
+///
+/// Race note (concern 1, pinned by probe): zellij can't create
+/// two sessions with one name, so if a session appears between
+/// the list and the spawn, `--session` fails with a visible
+/// "already exists" error — the race fails SAFE (an error, never
+/// a silent duplicate).
+#[derive(Debug, PartialEq, Clone, Copy)]
+enum SessionPlan {
+    Create,
+    Attach,
+    DeleteDeadThenCreate,
+}
+
+fn decide_session(list_output: &str, name: &str) -> SessionPlan {
+    for line in list_output.lines() {
+        let Some(first) = line.split_whitespace().next() else {
+            continue;
+        };
+        if first != name {
+            continue;
+        }
+        if line.contains("EXITED") {
+            // Serialization is off for clank sessions, so a dead
+            // one can't resurrect meaningfully — clear and recreate.
+            return SessionPlan::DeleteDeadThenCreate;
+        }
+        return SessionPlan::Attach;
+    }
+    SessionPlan::Create
+}
+
+/// Create a fresh named session with the layout. Session
+/// serialization is disabled: clank sessions are cheap to
+/// regenerate from the layout, and each serializing server polls
+/// `ps -ao ppid,args` on an interval — accumulated detached
+/// sessions congest the whole machine (observed ~320 servers
+/// pinning every core with concurrent `ps` scans).
+fn create_argv(layout_path: &Path, name: &str) -> Vec<String> {
+    vec![
+        "zellij".to_string(),
+        "--session".to_string(),
+        name.to_string(),
+        "--layout".to_string(),
+        layout_path.display().to_string(),
+        "options".to_string(),
+        "--session-serialization".to_string(),
+        "false".to_string(),
+    ]
+}
+
+fn attach_argv(name: &str) -> Vec<String> {
+    vec!["zellij".to_string(), "attach".to_string(), name.to_string()]
+}
+
+fn delete_argv(name: &str) -> Vec<String> {
+    vec![
+        "zellij".to_string(),
+        "delete-session".to_string(),
+        name.to_string(),
+    ]
+}
+
+/// Inside an existing zellij session ($ZELLIJ set) the layout
+/// opens as a new TAB in the current session — no --session flag
+/// (zellij ignores/conflicts it in-session). NOTE: a re-run
+/// INSIDE a clank session still adds a duplicate tab of agents —
+/// within-session dedup is OUT OF SCOPE here (concern 3); the
+/// per-agent pidfile guard is the future cover for that path.
+fn in_session_tab_argv(layout_path: &Path) -> Vec<String> {
     vec![
         "zellij".to_string(),
         "--layout".to_string(),
@@ -630,19 +752,6 @@ mod tests {
         assert!(
             kdl.contains(r#"/tmp/dir\"with\"quotes"#),
             "repo path quote must be escaped; got:\n{kdl}"
-        );
-    }
-
-    #[test]
-    fn compose_spawn_argv_is_zellij_layout_path_with_serialization_off() {
-        let argv = compose_spawn_argv(Path::new("/tmp/repo/.clank/zellij/layout.kdl"));
-        assert_eq!(argv[0], "zellij");
-        assert_eq!(argv[1], "--layout");
-        assert_eq!(argv[2], "/tmp/repo/.clank/zellij/layout.kdl");
-        assert_eq!(
-            argv[3..],
-            ["options", "--session-serialization", "false"],
-            "clank sessions must opt out of serialization; got: {argv:?}"
         );
     }
 
@@ -950,5 +1059,94 @@ mod tests {
             kdl.contains("\"--tui\""),
             "instrument pane still ships:\n{kdl}"
         );
+    }
+
+    // ── session dedup (zellij-session-dedup) ──
+
+    #[test]
+    fn decide_session_three_branches() {
+        // Canned `list-sessions -n` output, per the live probe:
+        // `<name> [Created …]` + `(EXITED - attach to resurrect)`
+        // for dead sessions, `(current)` for the one we're inside.
+        let listing = "\
+clank-clank [Created 31m 15s ago] (current)
+other-repo [Created 2h ago]
+dead-one [Created 10h ago] (EXITED - attach to resurrect)
+";
+        assert_eq!(
+            decide_session(listing, "clank-clank"),
+            SessionPlan::Attach,
+            "live (even current) → attach"
+        );
+        assert_eq!(decide_session(listing, "other-repo"), SessionPlan::Attach);
+        assert_eq!(
+            decide_session(listing, "dead-one"),
+            SessionPlan::DeleteDeadThenCreate,
+            "EXITED → delete + recreate (serialization is off)"
+        );
+        assert_eq!(
+            decide_session(listing, "clank-absent"),
+            SessionPlan::Create,
+            "absent → create"
+        );
+        assert_eq!(
+            decide_session("", "anything"),
+            SessionPlan::Create,
+            "empty listing (zellij errors when no sessions) → create"
+        );
+    }
+
+    #[test]
+    fn decide_session_matches_whole_name_token_only() {
+        // `clank-foo` must not match `clank-foobar` (first-token
+        // equality, not prefix).
+        let listing = "clank-foobar [Created 1m ago]\n";
+        assert_eq!(decide_session(listing, "clank-foo"), SessionPlan::Create);
+    }
+
+    #[test]
+    fn argv_shapes_for_each_plan() {
+        let layout = Path::new("/r/.clank/zellij/layout.kdl");
+        assert_eq!(
+            create_argv(layout, "clank-r"),
+            vec![
+                "zellij",
+                "--session",
+                "clank-r",
+                "--layout",
+                "/r/.clank/zellij/layout.kdl",
+                "options",
+                "--session-serialization",
+                "false",
+            ]
+        );
+        assert_eq!(attach_argv("clank-r"), vec!["zellij", "attach", "clank-r"]);
+        assert_eq!(
+            delete_argv("clank-r"),
+            vec!["zellij", "delete-session", "clank-r"]
+        );
+        // The in-session tab path carries NO --session flag: inside
+        // zellij even an explicit --session is overridden into
+        // new-tab behavior (probed live, the hard way — a stray
+        // probe tabbed a duplicate agent set into the operator's
+        // session). Within-session dedup is the pidfile guard's
+        // job, out of scope here (concern 3).
+        assert_eq!(
+            in_session_tab_argv(layout),
+            vec![
+                "zellij",
+                "--layout",
+                "/r/.clank/zellij/layout.kdl",
+                "options",
+                "--session-serialization",
+                "false",
+            ]
+        );
+    }
+
+    #[test]
+    fn session_name_is_deterministic_per_repo() {
+        assert_eq!(session_name("clank"), "clank-clank");
+        assert_eq!(session_name("bindex-fun"), "clank-bindex-fun");
     }
 }

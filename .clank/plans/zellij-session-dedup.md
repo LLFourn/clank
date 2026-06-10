@@ -61,3 +61,39 @@ edits corrupting each other (lloyd 2026-06-10).
 
 Stub — queued lloyd 2026-06-10 ("clank open zellij should
 resume one if it's already running somehow").
+
+## Sizing concerns answered (ruthless a9ac348, with live probes)
+
+1. **`--session <existing-live-name>` behavior — pinned, twice.**
+   Zellij enforces session-NAME UNIQUENESS, so the deterministic
+   name makes silent duplicates unrepresentable; the design is
+   list-first (we never intentionally hit the existing-name
+   case), and the TOCTOU race fails SAFE — a visible
+   "already exists" error, never a duplicate. Probed live with a
+   bonus finding: INSIDE a zellij session, even an explicit
+   `--session <name>` is overridden into new-tab behavior (the
+   probe tabbed a duplicate agent set into the operator's live
+   session — promptly killed — which is concern 3's case
+   demonstrated empirically).
+2. **list-sessions parsing**: `-n` (no-formatting) output probed:
+   `<name> [Created …]` with `(EXITED - attach to resurrect)` /
+   `(current)` suffixes. The parser reads ONLY the first
+   whitespace token (whole-token equality, not prefix — tested)
+   and the `EXITED` substring; everything else is free to drift.
+   `-s` rejected: it lists dead sessions indistinguishably.
+   `zellij list-sessions` exits non-zero when no sessions exist —
+   degraded to empty listing = Create (tested).
+3. **Within-session re-run: OUT OF SCOPE, now documented** (and
+   empirically demonstrated, see 1): the $ZELLIJ branch keeps
+   new-tab behavior and cannot dedup; the per-agent pidfile guard
+   (Related section) is the future cover. The in-session argv
+   carries no --session flag.
+
+AS SHIPPED: session_name() (`clank-<basename>`), SessionPlan +
+decide_session (pure over -n output; Attach / Create /
+DeleteDeadThenCreate — dead sessions can't resurrect with
+serialization off), create/attach/delete/in-session argv
+builders, run() branches with `--print` showing pre-spawn +
+spawn argv, attach announced on stderr. Tests: the three
+branches + empty-listing + whole-token matching + all argv
+shapes + deterministic naming.
