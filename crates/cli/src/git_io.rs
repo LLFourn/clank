@@ -1148,8 +1148,8 @@ mod tests {
     mod walker_equivalence {
         //! The walker must produce byte-identical `CommitEvent`s to
         //! the legacy per-commit producer (`first_parent_commits_to`
-        //! + `diff_tree_changes`) — the legacy pair is kept as the
-        //! reference implementation for exactly this test.
+        //! plus `diff_tree_changes`) — the legacy pair is kept as
+        //! the reference implementation for exactly this test.
         use super::super::*;
         use std::path::Path;
         use std::process::Command;
