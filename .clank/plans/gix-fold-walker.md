@@ -92,6 +92,16 @@ streams and identical final RepoState. Keep unit tests for the
 one-level comparison logic as a pure function over (parent
 entries, child entries) if it factors cleanly.
 
+## Results (measured at impl)
+
+bdk (1042 first-parent commits, cold cache, release build):
+`clank log` CPU time 0.33s → 0.04s (~8×), byte-identical output.
+The ratio grows with host-repo tree size: the entry compare is
+O(1) per commit while the full diff scales with the tree. Note
+codex's fmt request on the first cut was addressed by amend into
+the reviewable commit (rustfmt on the test fixture only — no
+semantic change).
+
 ## Non-goals
 
 - Caching strategy changes (separate plan: fold-checkpoint-cache,
