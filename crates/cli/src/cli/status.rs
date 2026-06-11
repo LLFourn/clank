@@ -568,6 +568,9 @@ async fn recent_log_rows(repo: &Path, state: &RepoState) -> Vec<crate::cli::log:
 /// The matcher anchors at the repo root's `.gitignore` (plus
 /// `.git/info/exclude`); nested `.gitignore` files aren't modeled —
 /// a path only they ignore costs a harmless debounced wake.
+/// TRACKED-but-gitignored files (`git add -f`) are dropped like
+/// any ignored path: their edits refresh `dirty:` on the 60s
+/// backstop, not instantly.
 pub(crate) struct WakeFilter {
     repo_root: PathBuf,
     git_dir: PathBuf,
@@ -678,7 +681,10 @@ pub(crate) fn watch_status_paths(
 
 /// Forward SIGWINCH into the wake channel so a terminal resize is
 /// just another event. A forwarding thread, not a signal handler:
-/// `mpsc::Sender::send` is not async-signal-safe.
+/// `mpsc::Sender::send` is not async-signal-safe. The thread
+/// blocks in `forever()` and only notices a dropped receiver on
+/// the next signal — it leaks until process exit, which is fine
+/// for the once-per-process TUI.
 pub(crate) fn spawn_sigwinch_forwarder(tx: mpsc::Sender<()>) -> anyhow::Result<()> {
     let mut signals = signal_hook::iterator::Signals::new([signal_hook::consts::SIGWINCH])?;
     std::thread::spawn(move || {
