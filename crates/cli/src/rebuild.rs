@@ -133,10 +133,15 @@ fn fold_events(
 }
 
 /// Thin checkpoints to the spacing policy relative to `tip_depth`,
-/// then run the mtime backstop (reclaims stale-branch checkpoints
-/// and old-format files). Deletion is by depth value: in the rare
-/// case of two branches checkpointed at the same depth, both go —
-/// worth at most a re-fold.
+/// then run the mtime backstop. The backstop is depth/ancestry-
+/// blind: besides stale-branch and old-format files it also
+/// collapses aged ON-CHAIN checkpoints on an idle repo (>24h
+/// untouched), so a far-back resume there re-folds from root once
+/// and re-seeds — accepted trade-off (ruthless 0ca555d residual);
+/// scope the mtime prune to non-first-parent-ancestors if that
+/// ever matters. Deletion is by depth value: in the rare case of
+/// two branches checkpointed at the same depth, both go — worth
+/// at most a re-fold.
 fn prune_checkpoints(repo_root: &Path, tip_depth: u64) {
     let checkpoints = state_cache::list_checkpoints(repo_root);
     let depths: Vec<u64> = checkpoints.iter().map(|c| c.depth).collect();
