@@ -1,11 +1,21 @@
-//! Commit-keyed cache for [`RepoState`].
+//! Commit-keyed checkpoint store for [`RepoState`].
 //!
-//! Files live at `<repo>/.clank/cache/repo-state/<head-sha>.v<format>.bin`.
-//! Each file starts with a fixed-size header (magic + format_version
-//! + clank_version + head_sha) validated before deserialization.
-//! `RepoState.root` is NOT in the body — the cache injects the
-//! canonical root at load time so a relocated cache directory can't
-//! leak a stale absolute path.
+//! Files live at
+//! `<repo>/.clank/cache/repo-state/<head-sha>.<depth>.v<format>.bin`,
+//! where `<depth>` is the commit's first-parent count from the repo
+//! root. Depth lives in the FILENAME so the spacing policy
+//! (`clank_core::checkpoint`) can plan pruning and the rebuild
+//! lookup can order candidates from one `read_dir`, without
+//! deserializing payloads. Depth is a placement/ordering hint only —
+//! correctness of a loaded state never depends on it (lookups
+//! confirm ancestry; a wrong depth merely mis-spaces future
+//! checkpoints).
+//!
+//! Each file starts with a fixed-size header (magic, format
+//! version, clank generation, head sha) validated before
+//! deserialization. `RepoState.root` is NOT in the body — the
+//! cache injects the canonical root at load time so a relocated
+//! cache directory can't leak a stale absolute path.
 
 use std::fs;
 use std::io::{Read, Write};
@@ -36,7 +46,12 @@ const CACHE_MAGIC: &[u8] = b"CLANK-STATE\n";
 ///   (appended at position 5) for `teams-based-agent-registration`.
 ///   Same position-encoded discipline; bump forces clean
 ///   invalidation.
-const CACHE_FORMAT_VERSION: u32 = 9;
+/// - v10: filename gains the commit depth
+///   (`<sha>.<depth>.v10.bin`) for `fold-checkpoint-cache`.
+///   Payload unchanged; the bump retires v9 names so the new
+///   depth-aware listing never sees depthless files (mtime aging
+///   reclaims them).
+const CACHE_FORMAT_VERSION: u32 = 10;
 const CLANK_CACHE_GENERATION: u32 = 1;
 
 const HEADER_LEN: usize = CACHE_MAGIC.len() + 4 + 4 + 40;
@@ -73,18 +88,32 @@ fn cache_dir(repo_root: &Path) -> PathBuf {
     repo_root.join(".clank").join("cache").join("repo-state")
 }
 
-fn cache_file_for(repo_root: &Path, head: &CommitSha) -> PathBuf {
-    cache_dir(repo_root).join(format!("{}.v{}.bin", head.as_str(), CACHE_FORMAT_VERSION))
+fn cache_file_for(repo_root: &Path, head: &CommitSha, depth: u64) -> PathBuf {
+    cache_dir(repo_root).join(format!(
+        "{}.{}.v{}.bin",
+        head.as_str(),
+        depth,
+        CACHE_FORMAT_VERSION
+    ))
 }
 
-/// Try to load a cached [`RepoState`] for `(repo_root, head)`. Any
-/// error path removes the offending file before returning.
-pub fn try_load(repo_root: &Path, head: &CommitSha) -> Result<Option<RepoState>, CacheError> {
-    let path = cache_file_for(repo_root, head);
-    match try_load_inner(&path, head) {
+/// One on-disk checkpoint: a `RepoState` snapshot at `sha`, whose
+/// first-parent depth from the repo root is `depth` (read from the
+/// filename — see the module doc for its trust level).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CheckpointRef {
+    pub sha: CommitSha,
+    pub depth: u64,
+}
+
+/// Try to load the checkpoint `cp` refers to. Any error path
+/// removes the offending file before returning.
+pub fn try_load(repo_root: &Path, cp: &CheckpointRef) -> Result<Option<RepoState>, CacheError> {
+    let path = cache_file_for(repo_root, &cp.sha, cp.depth);
+    match try_load_inner(&path, &cp.sha) {
         Ok(opt) => Ok(opt.map(|payload| RepoState {
             root: repo_root.to_path_buf(),
-            head: Some(head.clone()),
+            head: Some(cp.sha.clone()),
             fold: payload.fold,
         })),
         Err(e) => {
@@ -92,6 +121,12 @@ pub fn try_load(repo_root: &Path, head: &CommitSha) -> Result<Option<RepoState>,
             Err(e)
         }
     }
+}
+
+/// Delete one checkpoint file. Losing a race to another pruning
+/// process is fine — deletion is idempotent.
+pub fn remove(repo_root: &Path, cp: &CheckpointRef) {
+    let _ = fs::remove_file(cache_file_for(repo_root, &cp.sha, cp.depth));
 }
 
 fn try_load_inner(path: &Path, head: &CommitSha) -> Result<Option<Payload>, CacheError> {
@@ -139,7 +174,10 @@ fn try_load_inner(path: &Path, head: &CommitSha) -> Result<Option<Payload>, Cach
     Ok(Some(payload))
 }
 
-pub fn write(repo_root: &Path, state: &RepoState) -> Result<(), CacheError> {
+/// Persist `state` as the checkpoint at `(state.head, depth)`.
+/// Atomic (temp + rename); concurrent writers of the same
+/// checkpoint converge on identical content.
+pub fn write(repo_root: &Path, state: &RepoState, depth: u64) -> Result<(), CacheError> {
     let Some(head) = state.head.as_ref() else {
         return Ok(());
     };
@@ -162,11 +200,12 @@ pub fn write(repo_root: &Path, state: &RepoState) -> Result<(), CacheError> {
     buf.extend_from_slice(sha_bytes);
     buf.extend_from_slice(&body);
 
-    let final_path = cache_file_for(repo_root, head);
+    let final_path = cache_file_for(repo_root, head, depth);
     let nonce = TEMP_NONCE.fetch_add(1, Ordering::Relaxed);
     let tmp_path = dir.join(format!(
-        ".{}.v{}.tmp.{}.{}",
+        ".{}.{}.v{}.tmp.{}.{}",
         head.as_str(),
+        depth,
         CACHE_FORMAT_VERSION,
         std::process::id(),
         nonce,
@@ -180,15 +219,16 @@ pub fn write(repo_root: &Path, state: &RepoState) -> Result<(), CacheError> {
     Ok(())
 }
 
-/// Every cached HEAD-SHA for `repo_root`, ordered most-recently-
-/// modified first. Used by Phase-2 incremental cache loading.
-pub fn list_cached_heads(repo_root: &Path) -> Vec<CommitSha> {
+/// Every checkpoint for `repo_root`, ordered deepest (closest to
+/// tip) first — the order rebuild lookups probe in. One `read_dir`;
+/// no payloads are opened.
+pub fn list_checkpoints(repo_root: &Path) -> Vec<CheckpointRef> {
     let dir = cache_dir(repo_root);
     let Ok(entries) = fs::read_dir(&dir) else {
         return Vec::new();
     };
     let suffix = format!(".v{}.bin", CACHE_FORMAT_VERSION);
-    let mut candidates: Vec<(SystemTime, CommitSha)> = Vec::new();
+    let mut candidates: Vec<CheckpointRef> = Vec::new();
     for entry in entries.flatten() {
         let path = entry.path();
         if !path.is_file() {
@@ -198,20 +238,22 @@ pub fn list_cached_heads(repo_root: &Path) -> Vec<CommitSha> {
             Some(n) => n,
             None => continue,
         };
-        let Some(sha_str) = name.strip_suffix(&suffix) else {
+        let Some(stem) = name.strip_suffix(&suffix) else {
+            continue;
+        };
+        let Some((sha_str, depth_str)) = stem.split_once('.') else {
             continue;
         };
         let Ok(sha) = CommitSha::parse(sha_str) else {
             continue;
         };
-        let mtime = match fs::metadata(&path).and_then(|m| m.modified()) {
-            Ok(t) => t,
-            Err(_) => continue,
+        let Ok(depth) = depth_str.parse::<u64>() else {
+            continue;
         };
-        candidates.push((mtime, sha));
+        candidates.push(CheckpointRef { sha, depth });
     }
-    candidates.sort_by(|a, b| b.0.cmp(&a.0));
-    candidates.into_iter().map(|(_, sha)| sha).collect()
+    candidates.sort_by_key(|c| std::cmp::Reverse(c.depth));
+    candidates
 }
 
 /// Logarithmic thinning. Files under `FRESH_HOURS` survive; older
@@ -280,12 +322,19 @@ mod tests {
         state
     }
 
+    fn cp_for(state: &RepoState, depth: u64) -> CheckpointRef {
+        CheckpointRef {
+            sha: state.head.clone().unwrap(),
+            depth,
+        }
+    }
+
     #[test]
     fn write_then_load_round_trips() {
         let dir = fresh_repo();
         let state = synth_state(dir.path());
-        write(dir.path(), &state).unwrap();
-        let loaded = try_load(dir.path(), state.head.as_ref().unwrap())
+        write(dir.path(), &state, 7).unwrap();
+        let loaded = try_load(dir.path(), &cp_for(&state, 7))
             .unwrap()
             .expect("cache file should exist after write");
         assert_eq!(loaded.head, state.head);
@@ -296,19 +345,65 @@ mod tests {
     fn missing_file_returns_none() {
         let dir = fresh_repo();
         let head = CommitSha::parse("0123456789abcdef0123456789abcdef01234567").unwrap();
-        assert!(try_load(dir.path(), &head).unwrap().is_none());
+        assert!(
+            try_load(
+                dir.path(),
+                &CheckpointRef {
+                    sha: head,
+                    depth: 1
+                }
+            )
+            .unwrap()
+            .is_none()
+        );
     }
 
     #[test]
     fn try_load_error_deletes_offending_file() {
         let dir = fresh_repo();
         let state = synth_state(dir.path());
-        write(dir.path(), &state).unwrap();
-        let path = cache_file_for(dir.path(), state.head.as_ref().unwrap());
+        write(dir.path(), &state, 3).unwrap();
+        let path = cache_file_for(dir.path(), state.head.as_ref().unwrap(), 3);
         let mut bytes = fs::read(&path).unwrap();
         bytes[0] = b'X';
         fs::write(&path, &bytes).unwrap();
-        let _ = try_load(dir.path(), state.head.as_ref().unwrap()).unwrap_err();
+        let _ = try_load(dir.path(), &cp_for(&state, 3)).unwrap_err();
         assert!(!path.exists());
+    }
+
+    #[test]
+    fn list_checkpoints_orders_deepest_first_and_skips_foreign_names() {
+        let dir = fresh_repo();
+        let mut state = synth_state(dir.path());
+        write(dir.path(), &state, 5).unwrap();
+        state.head = Some(CommitSha::parse("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa").unwrap());
+        write(dir.path(), &state, 12).unwrap();
+        // Old-format (depthless) and unrelated files are ignored.
+        fs::write(
+            cache_dir(dir.path()).join(format!(
+                "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb.v{CACHE_FORMAT_VERSION}.bin"
+            )),
+            b"junk",
+        )
+        .unwrap();
+        fs::write(cache_dir(dir.path()).join("README"), b"junk").unwrap();
+
+        let listed = list_checkpoints(dir.path());
+        assert_eq!(
+            listed.iter().map(|c| c.depth).collect::<Vec<_>>(),
+            vec![12, 5],
+            "deepest first"
+        );
+    }
+
+    #[test]
+    fn remove_deletes_only_the_named_checkpoint() {
+        let dir = fresh_repo();
+        let state = synth_state(dir.path());
+        write(dir.path(), &state, 5).unwrap();
+        write(dir.path(), &state, 9).unwrap();
+        remove(dir.path(), &cp_for(&state, 5));
+        let listed = list_checkpoints(dir.path());
+        assert_eq!(listed.iter().map(|c| c.depth).collect::<Vec<_>>(), vec![9]);
     }
 }

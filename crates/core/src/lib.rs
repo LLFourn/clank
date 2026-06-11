@@ -15,6 +15,9 @@
 //!   `CommitEvent`, `Warning`, …) plus the projection types
 //!   (`CommitNode`, `CommitReview`, …) consumers build from it.
 //!   The on-disk state cache encodes `RepoState` directly.
+//! - [`checkpoint`] — pure spacing policy for the fold's on-disk
+//!   state checkpoints (`should_checkpoint`, `prune_plan`): every
+//!   commit near the tip, gaps doubling with distance.
 //! - [`model`] — small surviving DTOs (`Feedback`, `CommitGate`)
 //!   used by projection-time review-gate computation. Not folded
 //!   into state; built on demand from
@@ -49,6 +52,7 @@
 
 pub mod agent_config;
 pub mod api;
+pub mod checkpoint;
 pub mod feedback_body;
 pub mod feedback_view;
 pub mod hook_io;

@@ -98,6 +98,48 @@ TUI/wfw processes fold concurrently today).
   diagnostics counter, not timing).
 - No binary spawning.
 
+## Refinements at impl time
+
+- Prune model: one survivor per power-of-two DISTANCE BUCKET
+  behind the tip (`[0,2)`, `[2,4)`, `[4,8)`, …; deepest in the
+  bucket wins; tip never deleted) rather than a pairwise-gap
+  walk. Same spacing outcome, simpler invariant, idempotent —
+  all pinned in `clank_core::checkpoint` tests. The lookup
+  guarantee that follows: targets at distance k from the tip find
+  a base within ~k; targets BELOW the shallowest checkpoint
+  (deep range queries on a freshly-pruned cache) fall back to a
+  root fold bounded by their own depth, and that fold writes
+  checkpoints down there — self-healing, one-time cost.
+- The cold path's separate machinery is GONE, not just bypassed:
+  `git_io::snapshot`, `CommitSnapshot`, and `derive_state` were
+  production-dead once the cold fold joined the shared
+  checkpointing loop, and are deleted. Every rebuild — cold,
+  HEAD-change, range — is now literally one code path
+  (`find_base_checkpoint` → `commit_events_between` →
+  `fold_events` → `prune_checkpoints`).
+- `rebuild_with_diagnostics`'s exact-HEAD and ancestor lookups
+  collapsed into the same `find_base_checkpoint` (exact match =
+  the cp.sha == target case of the depth-desc probe).
+- preview's `pick_cache_anchor` rides along: depth-descending
+  listing makes its first positional hit the LATEST usable
+  anchor (previously mtime-ordered, arbitrary under parallel
+  writers).
+- `should_checkpoint(0, _)` is false — a zero gap (the base
+  itself) never re-writes.
+
+## Results (measured at impl)
+
+bdk (1042 first-parent commits, release build, `clank log`):
+- cold + seeding: 0.04s CPU — writes 11 checkpoints at depths
+  1042, 1041, 1040, 1038, 1033, 1022, 1001, 951, 905, 733, 347
+  (dense at tip, gaps doubling — the policy's shape verbatim).
+- warm "frame" (what the TUI pays per second): 0.06s wall /
+  0.02s CPU, vs 0.33s CPU before this plan and ~0.35s+ before
+  gix-fold-walker. The 70%-CPU TUI incident cost is now ~2% per
+  frame.
+- old v9 cache files are ignored by the new listing and age out
+  via the kept mtime backstop.
+
 ## Non-goals
 
 - TUI in-memory session (don't re-derive at all when nothing

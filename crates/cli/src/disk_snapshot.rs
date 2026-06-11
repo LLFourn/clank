@@ -5,16 +5,9 @@
 use std::path::PathBuf;
 
 use crate::disk_format::FeedbackPath;
-use crate::git_io::GitIoError;
 use crate::lifecycle::{CommitSha, PlanKey};
 use crate::repo_state::RepoState;
 use clank_core::repo_state as fold;
-
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub struct CommitSnapshot {
-    pub head: Option<CommitSha>,
-    pub history: Vec<CommitEvent>,
-}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CommitEvent {
@@ -53,20 +46,6 @@ pub struct FeedbackBlob {
     pub parsed: FeedbackPath,
     pub body: String,
     pub created_at: i64,
-}
-
-/// Cold-start derivation: walk HEAD's first-parent chain, apply
-/// each commit through the sans-io fold.
-pub async fn derive_state(
-    repo_root: PathBuf,
-    snapshot: CommitSnapshot,
-) -> Result<RepoState, GitIoError> {
-    let mut state = RepoState::empty(repo_root.clone());
-    state.head = snapshot.head.clone();
-    for event in &snapshot.history {
-        let _ = apply_commit(&mut state, event);
-    }
-    Ok(state)
 }
 
 pub fn apply_commit(state: &mut RepoState, event: &CommitEvent) -> Vec<fold::LogEvent> {

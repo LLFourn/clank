@@ -1,16 +1,16 @@
-//! Cold-start / HEAD-change rebuild. Composes:
-//!
-//! 1. `git_io::snapshot` → `CommitSnapshot`
-//! 2. `disk_snapshot::derive_state` → [`RepoState`] (sans-io fold)
-//!    — or, when a valid exact-HEAD or ancestor cache is available,
-//!    load from `state_cache` (and fold-forward if needed).
+//! The fold drivers. Every rebuild — cold start, HEAD change, or
+//! range query — is the same loop: resume [`RepoState`] from the
+//! deepest usable checkpoint (`state_cache`), apply the missing
+//! commits via `git_io::commit_events_between`, and persist spaced
+//! checkpoints as it goes (`clank_core::checkpoint` policy), so
+//! every fold both benefits from and feeds the cache.
 //!
 //! Feedback files are NOT folded into state; consumers project them
 //! on demand via `git_io::collect_feedback_files`.
 
 use std::path::Path;
 
-use crate::disk_snapshot::{apply_commit, derive_state};
+use crate::disk_snapshot::apply_commit;
 use crate::git_io::{self, GitIoError};
 use crate::lifecycle::CommitSha;
 use crate::repo_state::RepoState;
@@ -38,56 +38,142 @@ pub async fn rebuild_repo(repo_root: &Path) -> Result<RepoState, RebuildError> {
     rebuild_repo_with_policy(repo_root, CachePolicy::Use).await
 }
 
+/// Deepest checkpoint at or before `target`: probe candidates
+/// closest-to-tip first (the listing is depth-descending), confirm
+/// each with one ancestry check, take the first that loads.
+fn find_base_checkpoint(
+    repo_root: &Path,
+    target: &CommitSha,
+) -> Option<(state_cache::CheckpointRef, RepoState)> {
+    for cp in state_cache::list_checkpoints(repo_root) {
+        let usable =
+            cp.sha == *target || git_io::is_ancestor(repo_root, &cp.sha, target).unwrap_or(false);
+        if !usable {
+            continue;
+        }
+        match state_cache::try_load(repo_root, &cp) {
+            Ok(Some(state)) => return Some((cp, state)),
+            Ok(None) => continue,
+            Err(e) => {
+                tracing::warn!(
+                    repo = %repo_root.display(),
+                    checkpoint = %cp.sha,
+                    error = ?e,
+                    "checkpoint load failed; trying next candidate",
+                );
+            }
+        }
+    }
+    None
+}
+
+/// Apply `events` to `state` oldest-first, persisting spaced
+/// checkpoints along the way when `checkpoint` is true.
+///
+/// `base_depth` is `state`'s depth before the first event;
+/// `tip_depth` is the depth of the overall fold target — greater
+/// than `base_depth + events.len()` when a later phase continues
+/// the same fold, so spacing is computed against the real tip.
+/// Returns the log events the fold emitted.
+fn fold_events(
+    repo_root: &Path,
+    state: &mut RepoState,
+    events: Vec<crate::disk_snapshot::CommitEvent>,
+    base_depth: u64,
+    tip_depth: u64,
+    checkpoint: bool,
+) -> Vec<LogEvent> {
+    let mut log_events = Vec::new();
+    let mut last_checkpoint = base_depth;
+    let mut depth = base_depth;
+    for event in events {
+        let sha = event.commit.clone();
+        log_events.extend(apply_commit(state, &event));
+        depth += 1;
+        state.head = Some(sha);
+        if checkpoint
+            && clank_core::checkpoint::should_checkpoint(
+                depth - last_checkpoint,
+                tip_depth.saturating_sub(depth),
+            )
+        {
+            match state_cache::write(repo_root, state, depth) {
+                Ok(()) => last_checkpoint = depth,
+                Err(e) => tracing::warn!(
+                    repo = %repo_root.display(),
+                    depth,
+                    error = ?e,
+                    "checkpoint write failed",
+                ),
+            }
+        }
+    }
+    log_events
+}
+
+/// Thin checkpoints to the spacing policy relative to `tip_depth`,
+/// then run the mtime backstop (reclaims stale-branch checkpoints
+/// and old-format files). Deletion is by depth value: in the rare
+/// case of two branches checkpointed at the same depth, both go —
+/// worth at most a re-fold.
+fn prune_checkpoints(repo_root: &Path, tip_depth: u64) {
+    let checkpoints = state_cache::list_checkpoints(repo_root);
+    let depths: Vec<u64> = checkpoints.iter().map(|c| c.depth).collect();
+    let deletions = clank_core::checkpoint::prune_plan(&depths, tip_depth);
+    for cp in &checkpoints {
+        if deletions.contains(&cp.depth) {
+            state_cache::remove(repo_root, cp);
+        }
+    }
+    if let Err(e) = state_cache::prune(repo_root) {
+        tracing::warn!(
+            repo = %repo_root.display(),
+            error = ?e,
+            "state cache prune failed",
+        );
+    }
+}
+
 /// Rebuild a range `(from, to]` collecting log events. `from` is
-/// exclusive (`None` = repo root), `to` is inclusive. Uses the cache
-/// to skip history before `from`; the cache is invisible to callers.
+/// exclusive (`None` = repo root), `to` is inclusive. Resumes from
+/// the deepest checkpoint at-or-before `from` and writes spaced
+/// checkpoints as it folds — the cache is invisible to callers but
+/// every fold both benefits from and feeds it.
 pub async fn rebuild_from(
     repo_root: &Path,
     from: Option<&CommitSha>,
     to: &CommitSha,
 ) -> Result<(RepoState, Vec<LogEvent>), RebuildError> {
-    // Find the best cache at or before `from`. When `from=None`
-    // (from root), no cache helps — we need to fold everything
-    // to collect all events.
-    let mut best_cache: Option<(CommitSha, RepoState)> = None;
-    if let Some(f) = from {
-        for cached_head in state_cache::list_cached_heads(repo_root) {
-            let usable = &cached_head == f
-                || git_io::is_ancestor(repo_root, &cached_head, f).unwrap_or(false);
-            if !usable {
-                continue;
-            }
-            if let Ok(Some(state)) = state_cache::try_load(repo_root, &cached_head) {
-                best_cache = Some((cached_head, state));
-                break;
-            }
-        }
-    }
-
-    let mut state = match best_cache {
-        Some((_ch, s)) => s,
-        None => RepoState::empty(repo_root.to_path_buf()),
+    let base = from.and_then(|f| find_base_checkpoint(repo_root, f));
+    let (mut state, base_depth) = match base {
+        Some((cp, s)) => (s, cp.depth),
+        None => (RepoState::empty(repo_root.to_path_buf()), 0),
     };
 
-    // Phase 1 (silent): fold from current state head through `from`.
-    // This builds fold context without emitting log events.
+    // Enumerate both phases up front so checkpoint spacing is
+    // computed against the real tip (`to`), not the phase boundary.
     let silent_target = from.cloned();
-    if let Some(ref target) = silent_target {
-        let base = state.head.clone();
-        for event in git_io::commit_events_between(repo_root, base.as_ref(), target)? {
-            let _ = apply_commit(&mut state, &event);
-        }
-        state.head = Some(target.clone());
+    let phase1 = match silent_target.as_ref() {
+        Some(target) => git_io::commit_events_between(repo_root, state.head.as_ref(), target)?,
+        None => Vec::new(),
+    };
+    let phase2_base = silent_target.clone().or_else(|| state.head.clone());
+    let phase2 = git_io::commit_events_between(repo_root, phase2_base.as_ref(), to)?;
+    let mid_depth = base_depth + phase1.len() as u64;
+    let tip_depth = mid_depth + phase2.len() as u64;
+
+    // Phase 1 (silent): fold through `from` to build context;
+    // events discarded.
+    let _ = fold_events(repo_root, &mut state, phase1, base_depth, tip_depth, true);
+    if let Some(target) = silent_target {
+        state.head = Some(target);
     }
 
-    // Phase 2 (collecting): fold from `from` (exclusive) through `to` (inclusive).
-    let base = state.head.clone();
-    let mut log_events = Vec::new();
-    for event in git_io::commit_events_between(repo_root, base.as_ref(), to)? {
-        log_events.extend(apply_commit(&mut state, &event));
-    }
+    // Phase 2 (collecting): fold `(from, to]`.
+    let log_events = fold_events(repo_root, &mut state, phase2, mid_depth, tip_depth, true);
     state.head = Some(to.clone());
 
+    prune_checkpoints(repo_root, tip_depth);
     Ok((state, log_events))
 }
 
@@ -104,106 +190,53 @@ pub async fn rebuild_with_diagnostics(
     policy: CachePolicy,
 ) -> Result<(RepoState, RebuildDiagnostics), RebuildError> {
     let head = git_io::rev_parse_head(repo_root)?;
+    let Some(h) = head else {
+        // Unborn HEAD / no commits: nothing to fold.
+        return Ok((
+            RepoState::empty(repo_root.to_path_buf()),
+            RebuildDiagnostics { cache_hit: false },
+        ));
+    };
 
     if policy == CachePolicy::Use
-        && let Some(ref h) = head
+        && let Some((cp, mut state)) = find_base_checkpoint(repo_root, &h)
     {
-        // Exact-HEAD match.
-        match state_cache::try_load(repo_root, h) {
-            Ok(Some(state)) => return Ok((state, RebuildDiagnostics { cache_hit: true })),
-            Ok(None) => {}
+        if cp.sha == h {
+            return Ok((state, RebuildDiagnostics { cache_hit: true }));
+        }
+        // Fold-forward from the checkpoint to HEAD.
+        match git_io::commit_events_between(repo_root, Some(&cp.sha), &h) {
+            Ok(events) => {
+                let tip_depth = cp.depth + events.len() as u64;
+                let _ = fold_events(repo_root, &mut state, events, cp.depth, tip_depth, true);
+                state.head = Some(h.clone());
+                prune_checkpoints(repo_root, tip_depth);
+                return Ok((state, RebuildDiagnostics { cache_hit: true }));
+            }
             Err(e) => {
                 tracing::warn!(
                     repo = %repo_root.display(),
-                    head = %h,
+                    from = %cp.sha,
+                    to = %h,
                     error = ?e,
-                    "exact-HEAD cache load failed; trying ancestor cache",
+                    "incremental fold-forward failed; falling back to cold fold",
                 );
             }
         }
-        // Phase 2: ancestor match — fold-forward from a cached ancestor.
-        for cached_head in state_cache::list_cached_heads(repo_root) {
-            if &cached_head == h {
-                continue;
-            }
-            match git_io::is_ancestor(repo_root, &cached_head, h) {
-                Ok(true) => {}
-                _ => continue,
-            }
-            match state_cache::try_load(repo_root, &cached_head) {
-                Ok(Some(mut state)) => match fold_forward(repo_root, &mut state, h).await {
-                    Ok(()) => {
-                        write_and_prune(repo_root, &state);
-                        return Ok((state, RebuildDiagnostics { cache_hit: true }));
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            repo = %repo_root.display(),
-                            from = %cached_head,
-                            to = %h,
-                            error = ?e,
-                            "incremental fold-forward failed; falling back to cold fold",
-                        );
-                    }
-                },
-                Ok(None) => continue,
-                Err(e) => {
-                    tracing::warn!(
-                        repo = %repo_root.display(),
-                        cached_head = %cached_head,
-                        error = ?e,
-                        "ancestor cache load failed; trying next candidate",
-                    );
-                }
-            }
-        }
     }
 
-    let snapshot = git_io::snapshot(repo_root)?;
-    let state = derive_state(repo_root.to_path_buf(), snapshot).await?;
-
-    if policy == CachePolicy::Use {
-        write_and_prune(repo_root, &state);
+    // Cold fold from the repo root.
+    let events = git_io::commit_events_between(repo_root, None, &h)?;
+    let tip_depth = events.len() as u64;
+    let mut state = RepoState::empty(repo_root.to_path_buf());
+    let checkpoint = policy == CachePolicy::Use;
+    let _ = fold_events(repo_root, &mut state, events, 0, tip_depth, checkpoint);
+    state.head = Some(h);
+    if checkpoint {
+        prune_checkpoints(repo_root, tip_depth);
     }
 
     Ok((state, RebuildDiagnostics { cache_hit: false }))
-}
-
-fn write_and_prune(repo_root: &Path, state: &RepoState) {
-    if let Err(e) = state_cache::write(repo_root, state) {
-        tracing::warn!(
-            repo = %repo_root.display(),
-            error = ?e,
-            "state cache write failed",
-        );
-    }
-    if let Err(e) = state_cache::prune(repo_root) {
-        tracing::warn!(
-            repo = %repo_root.display(),
-            error = ?e,
-            "state cache prune failed",
-        );
-    }
-}
-
-/// Walk commits from `state.head` (exclusive) to `target_head`
-/// (inclusive), applying each through the sans-io fold.
-async fn fold_forward(
-    repo_root: &Path,
-    state: &mut RepoState,
-    target_head: &CommitSha,
-) -> Result<(), GitIoError> {
-    let Some(base) = state.head.clone() else {
-        return Err(GitIoError::Parse {
-            context: "fold_forward".into(),
-            detail: "cached state has no head".into(),
-        });
-    };
-    for event in git_io::commit_events_between(repo_root, Some(&base), target_head)? {
-        apply_commit(state, &event);
-    }
-    state.head = Some(target_head.clone());
-    Ok(())
 }
 
 #[cfg(test)]
@@ -316,5 +349,139 @@ mod tests {
         assert!(diag.cache_hit);
         let key = PlanKey::parse("foo").unwrap();
         assert_eq!(state.fold.plans[&key].commits.len(), 2);
+    }
+
+    /// `n` code commits on top of whatever exists.
+    fn many_commits(repo: &Path, n: usize) {
+        for i in 0..n {
+            write_file(repo, "src/churn.rs", &format!("// rev {i}\n"));
+            commit(repo, &format!("code: churn {i}"));
+        }
+    }
+
+    /// First-parent shas oldest-first (index + 1 == depth).
+    fn shas_by_depth(repo: &Path) -> Vec<CommitSha> {
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(["rev-list", "--first-parent", "--reverse", "HEAD"])
+            .output()
+            .expect("git");
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .map(|l| CommitSha::parse(l.trim()).unwrap())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn cold_fold_writes_spaced_checkpoints_and_any_point_resumes_nearby() {
+        let dir = init_repo();
+        write_file(dir.path(), ".clank/plans/foo.md", "# foo\n");
+        commit(dir.path(), "[foo] intro");
+        many_commits(dir.path(), 39);
+
+        let _ = rebuild_repo(dir.path()).await.unwrap();
+
+        let checkpoints = state_cache::list_checkpoints(dir.path());
+        let depths: Vec<u64> = checkpoints.iter().map(|c| c.depth).collect();
+        assert_eq!(depths.first(), Some(&40), "tip checkpointed");
+        assert!(
+            checkpoints.len() <= 14,
+            "O(log n) checkpoints for 40 commits: {depths:?}"
+        );
+
+        // The property the TUI's range fold depends on: a recent
+        // point finds a base within roughly its own distance from
+        // the tip — never the repo root. (Targets below the
+        // shallowest checkpoint fall back to a root fold bounded
+        // by their own depth, and that fold self-heals the gap —
+        // covered by rebuild_from_resumes_from_checkpoints…)
+        let shas = shas_by_depth(dir.path());
+        for k in [1u64, 3, 5, 10] {
+            let target_depth = 40 - k;
+            let target = &shas[(target_depth - 1) as usize];
+            let (cp, _) = find_base_checkpoint(dir.path(), target)
+                .unwrap_or_else(|| panic!("base for HEAD~{k}"));
+            let gap = target_depth - cp.depth;
+            assert!(
+                gap <= k.max(2),
+                "HEAD~{k}: base at depth {} leaves gap {gap}",
+                cp.depth
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn checkpoint_contents_equal_a_cold_fold_to_that_sha() {
+        let dir = init_repo();
+        write_file(dir.path(), ".clank/plans/foo.md", "# foo\n");
+        commit(dir.path(), "[foo] intro");
+        many_commits(dir.path(), 20);
+        let _ = rebuild_repo(dir.path()).await.unwrap();
+
+        // Pick a mid-history checkpoint and verify its payload
+        // matches folding from the root to that sha with no cache.
+        let cp = state_cache::list_checkpoints(dir.path())
+            .into_iter()
+            .find(|c| c.depth < 21)
+            .expect("a mid-history checkpoint");
+        let loaded = state_cache::try_load(dir.path(), &cp).unwrap().unwrap();
+        let (cold, _) = rebuild_from(dir.path(), None, &cp.sha).await.unwrap();
+        assert_eq!(loaded.fold, cold.fold, "checkpoint at depth {}", cp.depth);
+    }
+
+    #[tokio::test]
+    async fn rebuild_from_resumes_from_checkpoints_and_seeds_them() {
+        let dir = init_repo();
+        write_file(dir.path(), ".clank/plans/foo.md", "# foo\n");
+        commit(dir.path(), "[foo] intro");
+        many_commits(dir.path(), 29);
+        let shas = shas_by_depth(dir.path());
+        let from = shas[26].clone(); // HEAD~3
+        let head = shas[29].clone();
+
+        // Cold range fold on an empty cache: must seed checkpoints
+        // (the old code wrote nothing here — every TUI frame
+        // re-folded from root).
+        let (state_cold, events_cold) = rebuild_from(dir.path(), Some(&from), &head).await.unwrap();
+        assert_eq!(events_cold.len(), 3);
+        assert!(
+            !state_cache::list_checkpoints(dir.path()).is_empty(),
+            "range fold seeds checkpoints"
+        );
+
+        // Second identical fold resumes from a nearby checkpoint…
+        let (cp, _) = find_base_checkpoint(dir.path(), &from).expect("base exists now");
+        assert!(cp.depth >= 24, "dense-near-tip base, got {}", cp.depth);
+        // …and produces the identical result.
+        let (state_warm, events_warm) = rebuild_from(dir.path(), Some(&from), &head).await.unwrap();
+        assert_eq!(state_cold.fold, state_warm.fold);
+        assert_eq!(events_cold, events_warm);
+    }
+
+    #[tokio::test]
+    async fn tip_advance_rebalances_checkpoint_density() {
+        let dir = init_repo();
+        write_file(dir.path(), ".clank/plans/foo.md", "# foo\n");
+        commit(dir.path(), "[foo] intro");
+        many_commits(dir.path(), 29);
+        let _ = rebuild_repo(dir.path()).await.unwrap();
+
+        many_commits(dir.path(), 30);
+        let _ = rebuild_repo(dir.path()).await.unwrap();
+
+        let depths: Vec<u64> = state_cache::list_checkpoints(dir.path())
+            .iter()
+            .map(|c| c.depth)
+            .collect();
+        assert_eq!(depths.first(), Some(&60), "new tip checkpointed");
+        assert!(
+            depths.len() <= 16,
+            "old dense cluster thinned, not accumulated: {depths:?}"
+        );
+        // The once-dense cluster behind depth 30 collapses to
+        // one-per-bucket relative to the new tip.
+        let old_cluster = depths.iter().filter(|&&d| (25..=30).contains(&d)).count();
+        assert!(old_cluster <= 2, "stale density remains: {depths:?}");
     }
 }

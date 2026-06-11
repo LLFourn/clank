@@ -5,9 +5,7 @@
 use std::path::{Path, PathBuf};
 
 use crate::disk_format::parse_feedback_path;
-use crate::disk_snapshot::{
-    CommitChanges, CommitEvent, CommitSnapshot, FeedbackBlob, PlanTouch, PlanTouchKind,
-};
+use crate::disk_snapshot::{CommitChanges, CommitEvent, FeedbackBlob, PlanTouch, PlanTouchKind};
 use crate::lifecycle::{CommitSha, PlanKey};
 
 #[derive(Debug, thiserror::Error)]
@@ -932,32 +930,6 @@ fn apply_diff_records(records: &[DiffRecord]) -> CommitChanges {
         touched_clank,
         clank_paths_touched,
     }
-}
-
-/// Gather a `CommitSnapshot` for `repo_root`. IO half of the
-/// commit-derived rebuild; `disk_snapshot::derive_base_state`
-/// consumes the result as a feedback-blind fold.
-///
-/// Composes the migrated primitives:
-/// 1. `rev_parse_head` (empty repo / unborn HEAD → empty snapshot).
-/// 2. `first_parent_commits` for the oldest-first first-parent walk.
-/// 3. `diff_tree_changes` per commit for the structured changes.
-///
-/// Working-tree feedback is gathered separately via
-/// [`collect_feedback_files`] and applied by
-/// `disk_snapshot::attach_live_feedback`.
-pub fn snapshot(repo_root: &Path) -> Result<CommitSnapshot, GitIoError> {
-    let head = rev_parse_head(repo_root)?;
-    let Some(head) = head else {
-        return Ok(CommitSnapshot::default());
-    };
-
-    let history = commit_events_between(repo_root, None, &head)?;
-
-    Ok(CommitSnapshot {
-        head: Some(head),
-        history,
-    })
 }
 
 /// Walk `<repo>/.clank/agents/` and return every well-formed

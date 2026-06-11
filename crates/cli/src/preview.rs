@@ -385,11 +385,13 @@ async fn pick_cache_anchor(
         .enumerate()
         .map(|(i, m)| (m.sha.clone(), i))
         .collect();
-    for cached in crate::state_cache::list_cached_heads(repo_root) {
-        let Some(&idx) = ancestor_positions.get(&cached) else {
+    // Depth-descending listing: the first positional hit is also
+    // the latest usable anchor.
+    for cp in crate::state_cache::list_checkpoints(repo_root) {
+        let Some(&idx) = ancestor_positions.get(&cp.sha) else {
             continue;
         };
-        if let Ok(Some(state)) = crate::state_cache::try_load(repo_root, &cached) {
+        if let Ok(Some(state)) = crate::state_cache::try_load(repo_root, &cp) {
             return Ok((state, idx + 1));
         }
     }
