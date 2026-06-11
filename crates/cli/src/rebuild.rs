@@ -38,22 +38,43 @@ pub async fn rebuild_repo(repo_root: &Path) -> Result<RepoState, RebuildError> {
     rebuild_repo_with_policy(repo_root, CachePolicy::Use).await
 }
 
-/// Deepest checkpoint at or before `target`: probe candidates
-/// closest-to-tip first (the listing is depth-descending), confirm
-/// each with one ancestry check, take the first that loads.
+/// Deepest checkpoint ON `target`'s first-parent chain, at or
+/// before `target`. Resolved by walking the chain from `target`
+/// against the candidate set — the first chain member IS the
+/// deepest usable base (and `target` itself when checkpointed).
+/// Graph ancestry is deliberately not consulted: a side-branch
+/// checkpoint that merged in is a graph ancestor but not a valid
+/// resume point for a first-parent fold (codex 6b1c549).
 fn find_base_checkpoint(
     repo_root: &Path,
     target: &CommitSha,
 ) -> Option<(state_cache::CheckpointRef, RepoState)> {
-    for cp in state_cache::list_checkpoints(repo_root) {
-        let usable =
-            cp.sha == *target || git_io::is_ancestor(repo_root, &cp.sha, target).unwrap_or(false);
-        if !usable {
-            continue;
-        }
+    let mut checkpoints = state_cache::list_checkpoints(repo_root);
+    // A corrupt hit is deleted by try_load; retry against the
+    // remaining candidates rather than giving up the whole lookup.
+    loop {
+        let candidates: std::collections::HashSet<CommitSha> =
+            checkpoints.iter().map(|c| c.sha.clone()).collect();
+        let hit = match git_io::first_parent_chain_find(repo_root, target, &candidates) {
+            Ok(Some(sha)) => sha,
+            Ok(None) => return None,
+            Err(e) => {
+                tracing::warn!(
+                    repo = %repo_root.display(),
+                    target = %target,
+                    error = ?e,
+                    "checkpoint chain lookup failed",
+                );
+                return None;
+            }
+        };
+        // Several depths can share a sha only via filename games;
+        // take the deepest listed.
+        let pos = checkpoints.iter().position(|c| c.sha == hit)?;
+        let cp = checkpoints.remove(pos);
         match state_cache::try_load(repo_root, &cp) {
             Ok(Some(state)) => return Some((cp, state)),
-            Ok(None) => continue,
+            Ok(None) => {}
             Err(e) => {
                 tracing::warn!(
                     repo = %repo_root.display(),
@@ -63,8 +84,8 @@ fn find_base_checkpoint(
                 );
             }
         }
+        checkpoints.retain(|c| c.sha != cp.sha);
     }
-    None
 }
 
 /// Apply `events` to `state` oldest-first, persisting spaced
@@ -457,6 +478,70 @@ mod tests {
         let (state_warm, events_warm) = rebuild_from(dir.path(), Some(&from), &head).await.unwrap();
         assert_eq!(state_cold.fold, state_warm.fold);
         assert_eq!(events_cold, events_warm);
+    }
+
+    #[tokio::test]
+    async fn side_branch_checkpoint_is_not_a_resume_base() {
+        // codex 6b1c549: a checkpoint written on a side branch is a
+        // GRAPH ancestor of main after a no-ff merge, but not a
+        // first-parent ancestor. Resuming from it would fold the
+        // side branch's .clank changes twice (once in the loaded
+        // state, again via the merge commit's diff).
+        let dir = init_repo();
+        let repo = dir.path();
+        write_file(repo, ".clank/plans/foo.md", "# foo\n");
+        commit(repo, "[foo] intro");
+
+        // Side branch revises the plan; checkpoint written THERE
+        // (the only checkpoints in existence).
+        run_git(repo, &["checkout", "--quiet", "-b", "side"]);
+        write_file(repo, ".clank/plans/foo.md", "# foo v2\n");
+        commit(repo, "[foo] side revision");
+        let _ = rebuild_repo(repo).await.unwrap();
+        let side_tip = state_cache::list_checkpoints(repo)
+            .first()
+            .unwrap()
+            .sha
+            .clone();
+
+        // Merge into main as a non-first-parent.
+        run_git(repo, &["checkout", "--quiet", "main"]);
+        run_git(
+            repo,
+            &["merge", "--quiet", "--no-ff", "-m", "merge side", "side"],
+        );
+        let head = git_io::rev_parse_head(repo).unwrap().unwrap();
+
+        // The side checkpoint must not be offered as a base…
+        assert!(
+            git_io::is_ancestor(repo, &side_tip, &head).unwrap(),
+            "precondition: side tip IS a graph ancestor (the trap)"
+        );
+        assert!(
+            find_base_checkpoint(repo, &head).is_none()
+                || find_base_checkpoint(repo, &head).unwrap().0.sha != side_tip,
+            "side-branch checkpoint offered as resume base"
+        );
+
+        // …and the cached rebuild must equal a cache-blind fold:
+        // exactly one revision entry for foo (the merge), no
+        // duplicate from the side sha.
+        let (cached, _) = rebuild_with_diagnostics(repo, CachePolicy::Use)
+            .await
+            .unwrap();
+        let (blind, _) = rebuild_with_diagnostics(repo, CachePolicy::Bypass)
+            .await
+            .unwrap();
+        assert_eq!(
+            cached.fold, blind.fold,
+            "side checkpoint corrupted the fold"
+        );
+        let key = PlanKey::parse("foo").unwrap();
+        assert_eq!(
+            cached.fold.plans[&key].commits.len(),
+            2,
+            "intro + merge revision only — no duplicated side commit"
+        );
     }
 
     #[tokio::test]

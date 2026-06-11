@@ -126,6 +126,15 @@ TUI/wfw processes fold concurrently today).
   writers).
 - `should_checkpoint(0, _)` is false — a zero gap (the base
   itself) never re-writes.
+- Lookup ancestry is FIRST-PARENT, not graph (codex 6b1c549, a
+  real catch): a side-branch checkpoint that later merges in is a
+  graph ancestor of main but resuming from it folds the branch's
+  `.clank` changes twice (once in the loaded state, again via the
+  merge diff). `find_base_checkpoint` now walks the target's
+  first-parent chain against the candidate set — which is also
+  cheaper warm (a couple of commit reads, no merge-base probes)
+  and finds the deepest on-chain base by construction. Regression
+  test: side_branch_checkpoint_is_not_a_resume_base.
 
 ## Results (measured at impl)
 

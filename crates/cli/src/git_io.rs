@@ -432,6 +432,54 @@ fn clank_entry_oid(
     Ok(None)
 }
 
+/// Walk `tip`'s first-parent chain (inclusive of `tip`) and return
+/// the first sha present in `candidates` — `None` if the chain
+/// reaches the root without a hit.
+///
+/// This is the fold's notion of ancestry: a checkpoint is only a
+/// valid resume point if it sits ON the target's first-parent
+/// chain. Graph ancestry (`is_ancestor` via merge-base) is NOT
+/// sufficient — a checkpoint written on a side branch that later
+/// merges in is a graph ancestor, but resuming from it mixes
+/// side-branch folded state with the first-parent walk and
+/// duplicates the merge's `.clank` changes (codex 6b1c549).
+pub fn first_parent_chain_find(
+    repo_path: &Path,
+    tip: &CommitSha,
+    candidates: &std::collections::HashSet<CommitSha>,
+) -> Result<Option<CommitSha>, GitIoError> {
+    const CONTEXT: &str = "first_parent_chain_find";
+    if candidates.is_empty() {
+        return Ok(None);
+    }
+    let mut repo = gix::open(repo_path).map_err(|e| GitIoError::NonZero {
+        context: CONTEXT.into(),
+        code: None,
+        stderr: format!("gix open: {e}"),
+    })?;
+    repo.object_cache_size_if_unset(4 * 1024 * 1024);
+    let mut cursor =
+        gix::ObjectId::from_hex(tip.as_str().as_bytes()).map_err(|e| GitIoError::Parse {
+            context: CONTEXT.into(),
+            detail: format!("tip oid hex: {e}"),
+        })?;
+    loop {
+        let sha = parse_sha(CONTEXT, &cursor.to_string())?;
+        if candidates.contains(&sha) {
+            return Ok(Some(sha));
+        }
+        let commit = repo.find_commit(cursor).map_err(|e| GitIoError::NonZero {
+            context: CONTEXT.into(),
+            code: None,
+            stderr: format!("find_commit: {e}"),
+        })?;
+        match commit.parent_ids().next() {
+            Some(p) => cursor = p.detach(),
+            None => return Ok(None),
+        }
+    }
+}
+
 /// First-parent `CommitEvent`s between `base` (exclusive; `None` =
 /// repo root) and `tip` (inclusive), oldest-first — the fold's
 /// event producer.
