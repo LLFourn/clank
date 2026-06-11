@@ -24,7 +24,10 @@ pub struct StatusSnapshot {
     pub(crate) branch: Option<String>,
     pub(crate) head_sha: Option<String>,
     pub(crate) head_subject: Option<String>,
-    pub(crate) worktree_dirty: bool,
+    /// `Some` iff the worktree is dirty — carries the +/− line
+    /// counts vs HEAD and the untracked-file count
+    /// (tui-event-driven-dirty-stats).
+    pub(crate) dirty: Option<DirtyStats>,
     pub(crate) plans: Vec<PlanWorkState>,
     pub(crate) last_finished: Option<FinishedPlan>,
     pub(crate) blocks: Vec<crate::cli::block::BlockEntry>,
@@ -108,7 +111,7 @@ impl StatusSnapshot {
         log_rows: Vec<crate::cli::log::OnelineRow>,
     ) -> anyhow::Result<Self> {
         let (branch, head_sha, head_subject) = head_info(repo);
-        let worktree_dirty = worktree_dirty(repo)?;
+        let dirty = dirty_stats(repo)?;
 
         let config = crate::cli::config::load_with_home(repo, home);
         // Plan: teams-based-agent-registration. `status` is a
@@ -188,7 +191,7 @@ impl StatusSnapshot {
             branch,
             head_sha,
             head_subject,
-            worktree_dirty,
+            dirty,
             plans,
             last_finished,
             blocks,
@@ -258,11 +261,20 @@ impl StatusSnapshot {
             "branch": self.branch,
             "head_sha": self.head_sha,
             "head_subject": self.head_subject,
-            "worktree_dirty": self.worktree_dirty,
+            "worktree_dirty": self.dirty.is_some(),
             "plans": plans,
             "finished_plans": finished,
             "blocks": all_blocks,
         });
+        if let Some(d) = &self.dirty {
+            // Additive (tui-event-driven-dirty-stats);
+            // worktree_dirty kept for existing consumers.
+            obj["dirty_stats"] = serde_json::json!({
+                "insertions": d.insertions,
+                "deletions": d.deletions,
+                "untracked": d.untracked,
+            });
+        }
         if !self.queue.is_empty() {
             obj["queue_count"] = serde_json::json!(self.queue.len());
             // Names in priority order. Additive wire-format change
@@ -301,7 +313,10 @@ impl StatusSnapshot {
         let _ = writeln!(
             out,
             "dirty:  {}",
-            if self.worktree_dirty { "yes" } else { "no" }
+            match &self.dirty {
+                Some(d) => format!("yes ({})", dirty_summary(d)),
+                None => "no".to_string(),
+            }
         );
         if !self.queue.is_empty() {
             let _ = writeln!(
@@ -449,8 +464,7 @@ async fn run_watch(
     plan_arg: Option<&str>,
 ) -> anyhow::Result<()> {
     let (tx, rx) = mpsc::channel::<()>();
-    let mut watcher = build_watcher(tx)?;
-    attach_watcher(&mut watcher, &repo)?;
+    let _watcher = watch_status_paths(tx, &repo)?;
 
     let mut last_emitted: Option<String> = None;
 
@@ -476,7 +490,11 @@ async fn run_watch(
             last_emitted = Some(output);
         }
 
-        match rx.recv_timeout(Duration::from_secs(2)) {
+        // Event-driven: worktree edits, .clank writes, and git-dir
+        // changes all arrive as watcher events now, so no fast
+        // poll. The long timeout is a backstop against watcher
+        // pathologies the error channel doesn't surface.
+        match rx.recv_timeout(Duration::from_secs(60)) {
             Ok(()) => while rx.recv_timeout(Duration::from_millis(200)).is_ok() {},
             Err(mpsc::RecvTimeoutError::Timeout) => {}
             Err(mpsc::RecvTimeoutError::Disconnected) => {
@@ -537,29 +555,139 @@ async fn recent_log_rows(repo: &Path, state: &RepoState) -> Vec<crate::cli::log:
     crate::cli::log::oneline_rows(&newest_first, &reviews)
 }
 
-pub(crate) fn build_watcher(tx: mpsc::Sender<()>) -> anyhow::Result<RecommendedWatcher> {
-    Ok(notify::recommended_watcher(
-        move |res: notify::Result<notify::Event>| {
-            if res.is_ok() {
-                let _ = tx.send(());
-            }
-        },
-    )?)
+/// Decides which filesystem events wake the status loops. Wakes on:
+/// anything under `.clank/` (feedback/queue/agent state are load-
+/// bearing wake sources even though gitignored); anything under the
+/// git dir (HEAD moves, ref updates, checkpoint-adjacent churn);
+/// any `.gitignore` change (which also refreshes the matcher); and
+/// any worktree path the gitignore rules do NOT match. Drops
+/// gitignore-matched worktree paths — a `cargo build` writing
+/// thousands of `target/` files says nothing about clank state or
+/// worktree dirt.
+///
+/// The matcher anchors at the repo root's `.gitignore` (plus
+/// `.git/info/exclude`); nested `.gitignore` files aren't modeled —
+/// a path only they ignore costs a harmless debounced wake.
+pub(crate) struct WakeFilter {
+    repo_root: PathBuf,
+    git_dir: PathBuf,
+    clank_root: PathBuf,
+    matcher: ignore::gitignore::Gitignore,
 }
 
-pub(crate) fn attach_watcher(watcher: &mut RecommendedWatcher, repo: &Path) -> anyhow::Result<()> {
+impl WakeFilter {
+    pub(crate) fn new(repo_root: &Path, git_dir: &Path) -> Self {
+        // FSEvents delivers canonical paths (`/private/var/…`);
+        // compare against canonical roots or every prefix check
+        // misses on symlinked locations (e.g. macOS tempdirs).
+        let repo_root = dunce::canonicalize(repo_root).unwrap_or_else(|_| repo_root.to_path_buf());
+        let git_dir = dunce::canonicalize(git_dir).unwrap_or_else(|_| git_dir.to_path_buf());
+        Self {
+            clank_root: repo_root.join(".clank"),
+            matcher: Self::build_matcher(&repo_root, &git_dir),
+            repo_root,
+            git_dir,
+        }
+    }
+
+    fn build_matcher(repo_root: &Path, git_dir: &Path) -> ignore::gitignore::Gitignore {
+        let mut builder = ignore::gitignore::GitignoreBuilder::new(repo_root);
+        let _ = builder.add(repo_root.join(".gitignore"));
+        let _ = builder.add(git_dir.join("info").join("exclude"));
+        builder
+            .build()
+            .unwrap_or_else(|_| ignore::gitignore::Gitignore::empty())
+    }
+
+    /// True → the event at `path` should wake the loop.
+    pub(crate) fn wakes(&mut self, path: &Path) -> bool {
+        if path.starts_with(&self.clank_root) || path.starts_with(&self.git_dir) {
+            return true;
+        }
+        if path.file_name().is_some_and(|n| n == ".gitignore") {
+            self.matcher = Self::build_matcher(&self.repo_root, &self.git_dir);
+            return true;
+        }
+        // Paths outside the root (the matcher would panic on them)
+        // shouldn't arrive; if one does, wake conservatively.
+        if !path.starts_with(&self.repo_root) {
+            return true;
+        }
+        // `is_dir` races with deletion; a vanished path reads as
+        // non-dir, which only loosens matching toward a wake.
+        !self
+            .matcher
+            .matched_path_or_any_parents(path, path.is_dir())
+            .is_ignore()
+    }
+
+    #[cfg(test)]
+    fn with_rules(repo_root: &Path, git_dir: &Path, rules: &[&str]) -> Self {
+        let mut builder = ignore::gitignore::GitignoreBuilder::new(repo_root);
+        for rule in rules {
+            builder.add_line(None, rule).expect("test rule");
+        }
+        Self {
+            repo_root: repo_root.to_path_buf(),
+            git_dir: git_dir.to_path_buf(),
+            clank_root: repo_root.join(".clank"),
+            matcher: builder.build().expect("test matcher"),
+        }
+    }
+}
+
+/// Watcher for the status loops: the repo root recursively (working
+/// tree, `.clank`, and `.git` when embedded) plus the git dir when
+/// it lives elsewhere (linked worktrees) — events filtered through
+/// [`WakeFilter`]. Watcher ERRORS also wake: notify signals queue
+/// overflow as an error event, and the right response is one cheap
+/// rebuild, not silent staleness.
+pub(crate) fn watch_status_paths(
+    tx: mpsc::Sender<()>,
+    repo: &Path,
+) -> anyhow::Result<RecommendedWatcher> {
     let clank_root = repo.join(".clank");
     if let Err(e) = std::fs::create_dir_all(&clank_root) {
         anyhow::bail!("ensure `{}` exists: {e}", clank_root.display());
     }
-    watcher
-        .watch(&clank_root, RecursiveMode::Recursive)
-        .map_err(|e| anyhow::anyhow!("watch `{}` failed: {e}", clank_root.display()))?;
-
     let git_dir = git_resolve_dir(repo)?;
+    let mut filter = WakeFilter::new(repo, &git_dir);
+    let mut watcher = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
+        match res {
+            Ok(event) => {
+                // Path-less events (rescan notices) wake conservatively.
+                if event.paths.is_empty() || event.paths.iter().any(|p| filter.wakes(p)) {
+                    let _ = tx.send(());
+                }
+            }
+            Err(_) => {
+                let _ = tx.send(());
+            }
+        }
+    })?;
     watcher
-        .watch(&git_dir, RecursiveMode::Recursive)
-        .map_err(|e| anyhow::anyhow!("watch `{}` failed: {e}", git_dir.display()))?;
+        .watch(repo, RecursiveMode::Recursive)
+        .map_err(|e| anyhow::anyhow!("watch `{}` failed: {e}", repo.display()))?;
+    if !git_dir.starts_with(repo) {
+        watcher
+            .watch(&git_dir, RecursiveMode::Recursive)
+            .map_err(|e| anyhow::anyhow!("watch `{}` failed: {e}", git_dir.display()))?;
+    }
+    Ok(watcher)
+}
+
+/// Forward SIGWINCH into the wake channel so a terminal resize is
+/// just another event. A forwarding thread, not a signal handler:
+/// `mpsc::Sender::send` is not async-signal-safe.
+pub(crate) fn spawn_sigwinch_forwarder(tx: mpsc::Sender<()>) -> anyhow::Result<()> {
+    let mut signals = signal_hook::iterator::Signals::new([signal_hook::consts::SIGWINCH])?;
+    std::thread::spawn(move || {
+        for _ in signals.forever() {
+            if tx.send(()).is_err() {
+                break;
+            }
+        }
+    });
     Ok(())
 }
 
@@ -738,13 +866,95 @@ fn head_info(repo: &Path) -> (Option<String>, Option<String>, Option<String>) {
     (branch, sha, subject)
 }
 
-fn worktree_dirty(repo: &Path) -> anyhow::Result<bool> {
+/// Worktree dirt summary: +/− line counts vs HEAD (staged and
+/// unstaged together) and the untracked-file count. Untracked
+/// lines are NOT folded into the +/− numbers — a diff against
+/// HEAD doesn't see them, and pretending otherwise lies.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct DirtyStats {
+    pub(crate) insertions: u64,
+    pub(crate) deletions: u64,
+    pub(crate) untracked: u64,
+}
+
+/// `None` = clean. Both probes run `--no-optional-locks`: they
+/// execute on every watcher-driven repaint, and a plain
+/// `git status` opportunistically rewrites `.git/index` (stat
+/// refresh) — an event the watcher would see, waking the loop the
+/// probe itself was serving (self-wake feedback).
+fn dirty_stats(repo: &Path) -> anyhow::Result<Option<DirtyStats>> {
+    let porcelain = git_nol(repo, &["status", "--porcelain"])?;
+    if porcelain.is_empty() {
+        return Ok(None);
+    }
+    // `diff HEAD` fails on an unborn HEAD — degrade to 0/0 (the
+    // untracked count still tells the story there).
+    let shortstat = git_nol(repo, &["diff", "HEAD", "--shortstat"]).unwrap_or_default();
+    let (insertions, deletions) = parse_shortstat(&shortstat);
+    Ok(Some(DirtyStats {
+        insertions,
+        deletions,
+        untracked: count_untracked(&porcelain),
+    }))
+}
+
+/// Run git with `--no-optional-locks`, returning stdout. Errors on
+/// spawn failure or non-zero exit.
+fn git_nol(repo: &Path, args: &[&str]) -> anyhow::Result<String> {
     let output = std::process::Command::new("git")
+        .arg("--no-optional-locks")
         .arg("-C")
         .arg(repo)
-        .args(["status", "--porcelain"])
+        .args(args)
         .output()?;
-    Ok(!output.stdout.is_empty())
+    if !output.status.success() {
+        anyhow::bail!(
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+/// `+12 −3 · 2 untracked`, omitting zero parts. A dirty tree whose
+/// numbers are all zero (e.g. a mode-only change) reads `changes`.
+pub(crate) fn dirty_summary(d: &DirtyStats) -> String {
+    let mut parts = Vec::new();
+    if d.insertions > 0 || d.deletions > 0 {
+        parts.push(format!("+{} −{}", d.insertions, d.deletions));
+    }
+    if d.untracked > 0 {
+        parts.push(format!("{} untracked", d.untracked));
+    }
+    if parts.is_empty() {
+        return "changes".to_string();
+    }
+    parts.join(" · ")
+}
+
+fn count_untracked(porcelain: &str) -> u64 {
+    porcelain.lines().filter(|l| l.starts_with("??")).count() as u64
+}
+
+/// Parse `git diff --shortstat` output, e.g.
+/// ` 3 files changed, 12 insertions(+), 3 deletions(-)` → (12, 3).
+/// Either clause may be absent; empty input → (0, 0).
+fn parse_shortstat(s: &str) -> (u64, u64) {
+    let (mut insertions, mut deletions) = (0, 0);
+    for part in s.trim().split(',') {
+        let Some((num, rest)) = part.trim().split_once(' ') else {
+            continue;
+        };
+        let Ok(n) = num.parse::<u64>() else {
+            continue;
+        };
+        if rest.starts_with("insertion") {
+            insertions = n;
+        } else if rest.starts_with("deletion") {
+            deletions = n;
+        }
+    }
+    (insertions, deletions)
 }
 
 fn git_output(repo: &Path, args: &[&str]) -> Option<String> {
@@ -763,5 +973,168 @@ fn git_output(repo: &Path, args: &[&str]) -> Option<String> {
         None
     } else {
         Some(trimmed.to_string())
+    }
+}
+
+#[cfg(test)]
+mod dirty_and_wake_tests {
+    use super::*;
+    use std::process::Command;
+
+    #[test]
+    fn parse_shortstat_matrix() {
+        let cases = [
+            ("", (0, 0)),
+            (
+                " 3 files changed, 12 insertions(+), 3 deletions(-)\n",
+                (12, 3),
+            ),
+            (" 1 file changed, 1 insertion(+)\n", (1, 0)),
+            (" 1 file changed, 5 deletions(-)\n", (0, 5)),
+            (" 2 files changed\n", (0, 0)),
+        ];
+        for (input, want) in cases {
+            assert_eq!(parse_shortstat(input), want, "input: {input:?}");
+        }
+    }
+
+    #[test]
+    fn count_untracked_reads_porcelain() {
+        assert_eq!(
+            count_untracked(" M src/a.rs\n?? new.rs\n?? dir/\nA  staged.rs\n"),
+            2
+        );
+        assert_eq!(count_untracked(""), 0);
+    }
+
+    #[test]
+    fn dirty_summary_omits_zero_parts() {
+        let s = |i, d, u| {
+            dirty_summary(&DirtyStats {
+                insertions: i,
+                deletions: d,
+                untracked: u,
+            })
+        };
+        assert_eq!(s(12, 3, 0), "+12 −3");
+        assert_eq!(s(12, 3, 2), "+12 −3 · 2 untracked");
+        assert_eq!(s(0, 0, 2), "2 untracked");
+        assert_eq!(s(0, 0, 0), "changes");
+        assert_eq!(s(0, 5, 0), "+0 −5");
+    }
+
+    #[test]
+    fn wake_filter_matrix() {
+        let root = Path::new("/repo");
+        let git_dir = Path::new("/repo/.git");
+        let mut f = WakeFilter::with_rules(root, git_dir, &["/target/", "*.log"]);
+        // .clank and .git are exempt from ignore rules.
+        assert!(f.wakes(Path::new("/repo/.clank/agents/codex/feedback/abc.md")));
+        assert!(f.wakes(Path::new("/repo/.git/HEAD")));
+        // Worktree paths: ignored → drop, tracked-ish → wake.
+        assert!(!f.wakes(Path::new("/repo/target/debug/build/junk.o")));
+        assert!(!f.wakes(Path::new("/repo/build.log")));
+        assert!(f.wakes(Path::new("/repo/src/lib.rs")));
+        assert!(f.wakes(Path::new("/repo/Cargo.toml")));
+        // .gitignore changes always wake (and refresh the matcher).
+        assert!(f.wakes(Path::new("/repo/.gitignore")));
+    }
+
+    fn git(repo: &Path, args: &[&str]) {
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(args)
+            .output()
+            .expect("git");
+        assert!(
+            out.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    fn fixture_repo() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        let r = dir.path();
+        git(r, &["init", "--quiet", "-b", "main"]);
+        git(r, &["config", "user.email", "t@t"]);
+        git(r, &["config", "user.name", "t"]);
+        std::fs::write(r.join("a.txt"), "one\ntwo\nthree\n").unwrap();
+        git(r, &["add", "-A"]);
+        git(r, &["commit", "--quiet", "-m", "base"]);
+        dir
+    }
+
+    #[test]
+    fn dirty_stats_reports_lines_and_untracked() {
+        let dir = fixture_repo();
+        let r = dir.path();
+        assert_eq!(dirty_stats(r).unwrap(), None, "clean tree");
+
+        // 1 line modified (one in, one out), 2 added; one untracked.
+        std::fs::write(r.join("a.txt"), "one\nTWO\nthree\nfour\nfive\n").unwrap();
+        std::fs::write(r.join("new.txt"), "x\n").unwrap();
+        let d = dirty_stats(r).unwrap().expect("dirty");
+        assert_eq!((d.insertions, d.deletions), (3, 1));
+        assert_eq!(d.untracked, 1);
+    }
+
+    #[test]
+    fn dirty_probe_never_writes_the_index() {
+        // The self-wake hazard: a probe that refreshes .git/index
+        // would fire the watcher that triggered the probe. With
+        // --no-optional-locks the index bytes must stay untouched
+        // even when stat info is stale.
+        let dir = fixture_repo();
+        let r = dir.path();
+        std::fs::write(r.join("a.txt"), "one\ntwo\nthree\nmore\n").unwrap();
+        // Make stat info stale so a plain `git status` would want
+        // to refresh the index.
+        let index = r.join(".git/index");
+        let before = std::fs::read(&index).unwrap();
+        let mtime_before = std::fs::metadata(&index).unwrap().modified().unwrap();
+        let _ = dirty_stats(r).unwrap();
+        assert_eq!(
+            std::fs::read(&index).unwrap(),
+            before,
+            "index bytes changed"
+        );
+        assert_eq!(
+            std::fs::metadata(&index).unwrap().modified().unwrap(),
+            mtime_before,
+            "index mtime changed"
+        );
+    }
+
+    #[test]
+    fn watcher_wakes_on_tracked_edit_not_on_ignored() {
+        let dir = fixture_repo();
+        let r = dir.path();
+        std::fs::write(r.join(".gitignore"), "/target/\n").unwrap();
+        git(r, &["add", "-A"]);
+        git(r, &["commit", "--quiet", "-m", "gitignore"]);
+        std::fs::create_dir_all(r.join("target/debug")).unwrap();
+
+        let (tx, rx) = mpsc::channel::<()>();
+        let _watcher = watch_status_paths(tx, r).unwrap();
+        // Let the watcher settle (registration races the first writes).
+        std::thread::sleep(Duration::from_millis(250));
+        while rx.try_recv().is_ok() {}
+
+        // Ignored path: no wake.
+        std::fs::write(r.join("target/debug/out.o"), "junk").unwrap();
+        assert!(
+            rx.recv_timeout(Duration::from_millis(500)).is_err(),
+            "ignored build artifact woke the loop"
+        );
+
+        // Tracked-file edit: wakes (this is what keeps `dirty:`
+        // fresh without any poll).
+        std::fs::write(r.join("a.txt"), "edited\n").unwrap();
+        assert!(
+            rx.recv_timeout(Duration::from_secs(5)).is_ok(),
+            "tracked edit did not wake the loop"
+        );
     }
 }

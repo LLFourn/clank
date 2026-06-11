@@ -29,7 +29,9 @@ use std::path::PathBuf;
 use std::sync::mpsc;
 use std::time::Duration;
 
-use super::status::{StatusSnapshot, attach_watcher, build_watcher, short_sha, waiting_actor};
+use super::status::{
+    StatusSnapshot, short_sha, spawn_sigwinch_forwarder, waiting_actor, watch_status_paths,
+};
 use clank_core::plan_view::WaitingOn;
 use clank_core::wait::PlanWorkState;
 
@@ -158,7 +160,10 @@ pub(crate) fn render(snap: &StatusSnapshot, rows: u16, cols: u16) -> Vec<String>
     {
         let branch = snap.branch.as_deref().unwrap_or("?");
         let head = snap.head_sha.as_deref().map(short_sha).unwrap_or("?");
-        let dirty = if snap.worktree_dirty { " (dirty)" } else { "" };
+        let dirty = match &snap.dirty {
+            Some(d) => format!(" (dirty: {})", super::status::dirty_summary(d)),
+            None => String::new(),
+        };
         body.push(vec![label("git"), dim(format!("{branch} {head}{dirty}"))]);
     }
 
@@ -520,10 +525,13 @@ fn paint(lines: &[String]) {
     let _ = out.flush();
 }
 
-/// The `--tui` loop: rebuild the snapshot on each `.clank/`/`.git`
-/// change (same watcher as `--watch`), re-query the terminal size
-/// every paint (the ~1s heartbeat doubles as the resize poll — no
-/// SIGWINCH handler), repaint in place.
+/// The `--tui` loop, fully event-driven: the watcher covers the
+/// working tree (gitignore-filtered), `.clank/`, and the git dir;
+/// SIGWINCH arrives on the same channel, so a resize is just
+/// another wake. Between events there is nothing to redraw —
+/// nothing rendered is clock-relative — so the only timeout is a
+/// slow backstop against watcher pathologies the error channel
+/// doesn't surface (tui-event-driven-dirty-stats).
 pub(crate) async fn run_tui(
     repo: PathBuf,
     basename: String,
@@ -531,8 +539,8 @@ pub(crate) async fn run_tui(
     policy: crate::rebuild::CachePolicy,
 ) -> anyhow::Result<()> {
     let (tx, rx) = mpsc::channel::<()>();
-    let mut watcher = build_watcher(tx)?;
-    attach_watcher(&mut watcher, &repo)?;
+    let _watcher = watch_status_paths(tx.clone(), &repo)?;
+    spawn_sigwinch_forwarder(tx)?;
 
     let _guard = AltScreen::enter();
     loop {
@@ -542,7 +550,7 @@ pub(crate) async fn run_tui(
         let (rows, cols) = term_size();
         paint(&render(&snapshot, rows, cols));
 
-        match rx.recv_timeout(Duration::from_secs(1)) {
+        match rx.recv_timeout(Duration::from_secs(60)) {
             Ok(()) => while rx.recv_timeout(Duration::from_millis(200)).is_ok() {},
             Err(mpsc::RecvTimeoutError::Timeout) => {}
             Err(mpsc::RecvTimeoutError::Disconnected) => {
@@ -582,7 +590,7 @@ pub(crate) mod tests {
             branch: Some("master".into()),
             head_sha: Some(format!("{:0<40}", "deadbeef")),
             head_subject: None,
-            worktree_dirty: false,
+            dirty: None,
             plans,
             last_finished: None,
             blocks: Vec::new(),

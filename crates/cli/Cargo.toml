@@ -11,6 +11,12 @@ clap = { version = "4", features = ["derive", "env"] }
 notify = "8"
 notify-debouncer-full = "0.6"
 
+# Gitignore matching for the worktree watcher's wake filter.
+ignore = "0.4"
+
+# SIGWINCH forwarding for the event-driven TUI.
+signal-hook = "0.3"
+
 # Hashing
 blake3 = "1"
 

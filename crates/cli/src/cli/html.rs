@@ -534,7 +534,7 @@ fn render_index(
     out.push_str(&format!("  <h1>{}</h1>\n", esc(&status.basename)));
     let branch = status.branch.as_deref().unwrap_or("(detached)");
     let head_short = status.head_sha.as_deref().map(short).unwrap_or("(no head)");
-    let dirty = if status.worktree_dirty {
+    let dirty = if status.dirty.is_some() {
         " · dirty"
     } else {
         ""
