@@ -10,7 +10,7 @@
 
 use std::path::Path;
 
-use crate::disk_snapshot::{CommitEvent, apply_commit, derive_state};
+use crate::disk_snapshot::{apply_commit, derive_state};
 use crate::git_io::{self, GitIoError};
 use crate::lifecycle::CommitSha;
 use crate::repo_state::RepoState;
@@ -74,19 +74,7 @@ pub async fn rebuild_from(
     let silent_target = from.cloned();
     if let Some(ref target) = silent_target {
         let base = state.head.clone();
-        let metas = match base.as_ref() {
-            Some(b) if b == target => Vec::new(),
-            Some(b) => git_io::first_parent_commits_between(repo_root, b, target)?,
-            None => git_io::first_parent_commits_to(repo_root, target)?,
-        };
-        for meta in metas {
-            let changes = git_io::diff_tree_changes(repo_root, &meta.sha)?;
-            let event = CommitEvent {
-                commit: meta.sha.clone(),
-                author_ts: meta.author_ts,
-                subject: meta.subject,
-                changes,
-            };
+        for event in git_io::commit_events_between(repo_root, base.as_ref(), target)? {
             let _ = apply_commit(&mut state, &event);
         }
         state.head = Some(target.clone());
@@ -94,19 +82,8 @@ pub async fn rebuild_from(
 
     // Phase 2 (collecting): fold from `from` (exclusive) through `to` (inclusive).
     let base = state.head.clone();
-    let metas = match base.as_ref() {
-        Some(b) => git_io::first_parent_commits_between(repo_root, b, to)?,
-        None => git_io::first_parent_commits_to(repo_root, to)?,
-    };
     let mut log_events = Vec::new();
-    for meta in metas {
-        let changes = git_io::diff_tree_changes(repo_root, &meta.sha)?;
-        let event = CommitEvent {
-            commit: meta.sha.clone(),
-            author_ts: meta.author_ts,
-            subject: meta.subject,
-            changes,
-        };
+    for event in git_io::commit_events_between(repo_root, base.as_ref(), to)? {
         log_events.extend(apply_commit(&mut state, &event));
     }
     state.head = Some(to.clone());
@@ -222,15 +199,7 @@ async fn fold_forward(
             detail: "cached state has no head".into(),
         });
     };
-    let metas = git_io::first_parent_commits_between(repo_root, &base, target_head)?;
-    for meta in metas {
-        let changes = git_io::diff_tree_changes(repo_root, &meta.sha)?;
-        let event = CommitEvent {
-            commit: meta.sha.clone(),
-            author_ts: meta.author_ts,
-            subject: meta.subject,
-            changes,
-        };
+    for event in git_io::commit_events_between(repo_root, Some(&base), target_head)? {
         apply_commit(state, &event);
     }
     state.head = Some(target_head.clone());

@@ -380,6 +380,222 @@ pub struct CommitMeta {
     pub subject: String,
 }
 
+/// Per-commit decision in the fold walk, from a one-level
+/// comparison of parent vs child root trees. The recursive diff
+/// runs only on `FullDiff` commits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DiffGate {
+    /// Root trees identical: empty commit, no changes at all.
+    NoChanges,
+    /// Roots differ but the `.clank` entry OID is unchanged (or
+    /// absent on both sides): only non-clank paths changed.
+    /// Because a tree entry's OID covers everything beneath it,
+    /// entry equality proves nothing under `.clank/` changed.
+    CodeOnly,
+    /// The `.clank` entry differs: a real diff is required.
+    FullDiff,
+}
+
+fn diff_gate(
+    roots_equal: bool,
+    parent_clank: Option<gix::ObjectId>,
+    child_clank: Option<gix::ObjectId>,
+) -> DiffGate {
+    if roots_equal {
+        DiffGate::NoChanges
+    } else if parent_clank == child_clank {
+        DiffGate::CodeOnly
+    } else {
+        DiffGate::FullDiff
+    }
+}
+
+/// OID of the top-level `.clank` entry of `tree_id`; `None` when
+/// absent (pre-clank history).
+fn clank_entry_oid(
+    repo: &gix::Repository,
+    tree_id: gix::ObjectId,
+    context: &str,
+) -> Result<Option<gix::ObjectId>, GitIoError> {
+    let tree = repo.find_tree(tree_id).map_err(|e| GitIoError::NonZero {
+        context: context.to_string(),
+        code: None,
+        stderr: format!("find_tree: {e}"),
+    })?;
+    for entry in tree.iter() {
+        let entry = entry.map_err(|e| GitIoError::Parse {
+            context: context.to_string(),
+            detail: format!("tree entry: {e}"),
+        })?;
+        if entry.filename() == ".clank" {
+            return Ok(Some(entry.oid().to_owned()));
+        }
+    }
+    Ok(None)
+}
+
+/// First-parent `CommitEvent`s between `base` (exclusive; `None` =
+/// repo root) and `tip` (inclusive), oldest-first — the fold's
+/// event producer.
+///
+/// One repository open for the whole walk, carrying each commit's
+/// root tree forward (it is the next commit's parent tree). Per
+/// commit, the root trees are compared one level deep and the
+/// recursive diff runs only when the `.clank` entry OID changed —
+/// the same tree-entry short-circuit `git log -- .clank` uses for
+/// pathspec limiting. Pre-clank history (no `.clank` entry on
+/// either side) is near-free, which subsumes "start the fold where
+/// `.clank` was introduced".
+///
+/// Commits where `.clank` DID change get the full-repo diff, not a
+/// `.clank`-subtree diff: renames crossing the `.clank` boundary
+/// (plan resurrected from outside, plan file moved out) must keep
+/// their rename pairing so `CommitChanges` matches
+/// `diff_tree_changes` exactly. Such commits are the rare case.
+pub fn commit_events_between(
+    repo_path: &Path,
+    base: Option<&CommitSha>,
+    tip: &CommitSha,
+) -> Result<Vec<CommitEvent>, GitIoError> {
+    const CONTEXT: &str = "commit_events_between";
+    let walk_err = |e: &dyn std::fmt::Display, stage: &str| GitIoError::NonZero {
+        context: CONTEXT.to_string(),
+        code: None,
+        stderr: format!("{stage}: {e}"),
+    };
+    let mut repo = gix::open(repo_path).map_err(|e| walk_err(&e, "gix open"))?;
+    // The walk and gated diffs revisit parent commits and trees;
+    // an in-memory object cache makes those re-reads near-free.
+    repo.object_cache_size_if_unset(16 * 1024 * 1024);
+
+    let tip_oid =
+        gix::ObjectId::from_hex(tip.as_str().as_bytes()).map_err(|e| GitIoError::Parse {
+            context: CONTEXT.into(),
+            detail: format!("tip oid hex: {e}"),
+        })?;
+    let base_oid = base
+        .map(|b| {
+            gix::ObjectId::from_hex(b.as_str().as_bytes()).map_err(|e| GitIoError::Parse {
+                context: CONTEXT.into(),
+                detail: format!("base oid hex: {e}"),
+            })
+        })
+        .transpose()?;
+    if base_oid == Some(tip_oid) {
+        return Ok(Vec::new());
+    }
+
+    struct RawCommit {
+        oid: gix::ObjectId,
+        tree: gix::ObjectId,
+        first_parent: Option<gix::ObjectId>,
+        sha: CommitSha,
+        author_ts: i64,
+        subject: String,
+    }
+    let mut builder = repo.rev_walk([tip_oid]).first_parent_only();
+    if let Some(b) = base_oid {
+        builder = builder.with_hidden([b]);
+    }
+    let walk = builder.all().map_err(|e| walk_err(&e, "rev_walk"))?;
+    let mut raws = Vec::new();
+    for info in walk {
+        let info = info.map_err(|e| walk_err(&e, "walk iter"))?;
+        let commit = info.object().map_err(|e| walk_err(&e, "info.object"))?;
+        let author = commit.author().map_err(|e| walk_err(&e, "commit.author"))?;
+        let author_ts = author
+            .time()
+            .map_err(|e| walk_err(&e, "author.time parse"))?
+            .seconds;
+        let subject = commit
+            .message()
+            .map_err(|e| walk_err(&e, "commit.message"))?
+            .summary()
+            .to_string();
+        let tree = commit
+            .tree_id()
+            .map_err(|e| walk_err(&e, "commit.tree_id"))?
+            .detach();
+        let first_parent = commit.parent_ids().next().map(|p| p.detach());
+        let sha = parse_sha(CONTEXT, &info.id.to_string())?;
+        raws.push(RawCommit {
+            oid: info.id,
+            tree,
+            first_parent,
+            sha,
+            author_ts,
+            subject,
+        });
+    }
+    // gix walks newest-first; the fold applies oldest-first.
+    raws.reverse();
+
+    let mut out = Vec::with_capacity(raws.len());
+    // (commit, root tree) of the previously processed commit — in a
+    // first-parent walk that IS the next commit's first parent,
+    // except across the hidden-`base` boundary.
+    let mut prev: Option<(gix::ObjectId, gix::ObjectId)> = None;
+    for raw in raws {
+        let parent_tree = match raw.first_parent {
+            None => None, // root commit: diff against the empty tree
+            Some(p) => match prev {
+                Some((prev_oid, prev_tree)) if prev_oid == p => Some(prev_tree),
+                // Walk start (parent hidden behind `base`): one lookup.
+                _ => Some(
+                    repo.find_commit(p)
+                        .map_err(|e| walk_err(&e, "parent find_commit"))?
+                        .tree_id()
+                        .map_err(|e| walk_err(&e, "parent tree_id"))?
+                        .detach(),
+                ),
+            },
+        };
+        let roots_equal = parent_tree == Some(raw.tree);
+        let gate = if roots_equal {
+            DiffGate::NoChanges
+        } else {
+            let parent_clank = match parent_tree {
+                Some(t) => clank_entry_oid(&repo, t, CONTEXT)?,
+                None => None,
+            };
+            let child_clank = clank_entry_oid(&repo, raw.tree, CONTEXT)?;
+            diff_gate(roots_equal, parent_clank, child_clank)
+        };
+        let changes = match gate {
+            DiffGate::NoChanges => CommitChanges::default(),
+            DiffGate::CodeOnly => CommitChanges {
+                has_non_plan_code_changes: true,
+                ..Default::default()
+            },
+            DiffGate::FullDiff => {
+                let parent = parent_tree
+                    .map(|t| {
+                        repo.find_tree(t).map_err(|e| GitIoError::NonZero {
+                            context: CONTEXT.to_string(),
+                            code: None,
+                            stderr: format!("parent find_tree: {e}"),
+                        })
+                    })
+                    .transpose()?;
+                let child = repo.find_tree(raw.tree).map_err(|e| GitIoError::NonZero {
+                    context: CONTEXT.to_string(),
+                    code: None,
+                    stderr: format!("find_tree: {e}"),
+                })?;
+                diff_trees_changes(&repo, parent.as_ref(), &child, CONTEXT)?
+            }
+        };
+        prev = Some((raw.oid, raw.tree));
+        out.push(CommitEvent {
+            commit: raw.sha,
+            author_ts: raw.author_ts,
+            subject: raw.subject,
+            changes,
+        });
+    }
+    Ok(out)
+}
+
 /// Structured changes for `sha` against its first parent (or the
 /// empty tree for the root commit), translated into a
 /// `CommitChanges`.
@@ -435,16 +651,28 @@ pub fn diff_tree_changes(repo: &Path, sha: &CommitSha) -> Result<CommitChanges, 
         ),
         None => None,
     };
-    let parent_tree_ref = parent_tree_owned.as_ref();
+    diff_trees_changes(&repo, parent_tree_owned.as_ref(), &this_tree, &context)
+}
+
+/// Recursive rename-tracking diff of two trees → `CommitChanges`.
+/// Shared by `diff_tree_changes` (per-commit reference shape) and
+/// `commit_events_between`'s gated full-diff path — one source of
+/// truth for diff semantics.
+fn diff_trees_changes(
+    repo: &gix::Repository,
+    parent_tree: Option<&gix::Tree<'_>>,
+    this_tree: &gix::Tree<'_>,
+    context: &str,
+) -> Result<CommitChanges, GitIoError> {
     // Enable rename tracking with the git default 50% similarity
     // (matches legacy `-M` flag). diff_tree_to_tree with `None`
     // for options uses the repo's configured defaults, which may
     // have rewrites=None — so build the Options explicitly.
     let opts = gix::diff::Options::default().with_rewrites(Some(gix::diff::Rewrites::default()));
     let raw_changes = repo
-        .diff_tree_to_tree(parent_tree_ref, Some(&this_tree), opts)
+        .diff_tree_to_tree(parent_tree, Some(this_tree), opts)
         .map_err(|e| GitIoError::NonZero {
-            context,
+            context: context.to_string(),
             code: None,
             stderr: format!("diff_tree_to_tree: {e}"),
         })?;
@@ -724,17 +952,7 @@ pub fn snapshot(repo_root: &Path) -> Result<CommitSnapshot, GitIoError> {
         return Ok(CommitSnapshot::default());
     };
 
-    let metas = first_parent_commits(repo_root)?;
-    let mut history: Vec<CommitEvent> = Vec::with_capacity(metas.len());
-    for meta in metas {
-        let changes = diff_tree_changes(repo_root, &meta.sha)?;
-        history.push(CommitEvent {
-            commit: meta.sha,
-            author_ts: meta.author_ts,
-            subject: meta.subject,
-            changes,
-        });
-    }
+    let history = commit_events_between(repo_root, None, &head)?;
 
     Ok(CommitSnapshot {
         head: Some(head),
@@ -896,6 +1114,192 @@ fn is_plan_path(rel: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn oid(byte: u8) -> gix::ObjectId {
+        gix::ObjectId::from_bytes_or_panic(&[byte; 20])
+    }
+
+    #[test]
+    fn diff_gate_matrix() {
+        use DiffGate::*;
+        // (roots_equal, parent_clank, child_clank) → gate
+        let cases = [
+            // empty commit: no work at all
+            (true, None, None, NoChanges),
+            (true, Some(oid(1)), Some(oid(1)), NoChanges),
+            // pre-clank history: absent == absent → code only
+            (false, None, None, CodeOnly),
+            // post-clank, commit doesn't touch .clank
+            (false, Some(oid(1)), Some(oid(1)), CodeOnly),
+            // .clank introduced / removed / modified → real diff
+            (false, None, Some(oid(1)), FullDiff),
+            (false, Some(oid(1)), None, FullDiff),
+            (false, Some(oid(1)), Some(oid(2)), FullDiff),
+        ];
+        for (roots_equal, parent, child, want) in cases {
+            assert_eq!(
+                diff_gate(roots_equal, parent, child),
+                want,
+                "roots_equal={roots_equal} parent={parent:?} child={child:?}"
+            );
+        }
+    }
+
+    mod walker_equivalence {
+        //! The walker must produce byte-identical `CommitEvent`s to
+        //! the legacy per-commit producer (`first_parent_commits_to`
+        //! + `diff_tree_changes`) — the legacy pair is kept as the
+        //! reference implementation for exactly this test.
+        use super::super::*;
+        use std::path::Path;
+        use std::process::Command;
+
+        fn git(repo: &Path, args: &[&str]) {
+            let out = Command::new("git")
+                .arg("-C")
+                .arg(repo)
+                .args(args)
+                .env("GIT_AUTHOR_DATE", "2026-01-01T00:00:00Z")
+                .env("GIT_COMMITTER_DATE", "2026-01-01T00:00:00Z")
+                .output()
+                .expect("git spawns");
+            assert!(
+                out.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+
+        fn write(repo: &Path, rel: &str, body: &str) {
+            let abs = repo.join(rel);
+            std::fs::create_dir_all(abs.parent().unwrap()).unwrap();
+            std::fs::write(abs, body).unwrap();
+        }
+
+        fn commit(repo: &Path, msg: &str) {
+            git(repo, &["add", "-A"]);
+            git(repo, &["commit", "--quiet", "-m", msg]);
+        }
+
+        /// Synthetic history exercising every gate path and the
+        /// boundary-crossing rename semantics the full-repo diff
+        /// preserves: pre-clank code commits, clank intro, plan
+        /// add/modify, mixed commit, rename within .clank
+        /// (plans → finished), rename OUT of .clank, rename INTO
+        /// .clank, empty commit, merge (first-parent).
+        fn build_fixture() -> tempfile::TempDir {
+            let dir = tempfile::tempdir().unwrap();
+            let r = dir.path();
+            git(r, &["init", "--quiet", "-b", "main"]);
+            git(r, &["config", "user.email", "t@t"]);
+            git(r, &["config", "user.name", "t"]);
+
+            // pre-clank era (root + one more code commit)
+            write(r, "src/lib.rs", "// v1\n");
+            commit(r, "code: root");
+            write(r, "src/lib.rs", "// v2\n");
+            commit(r, "code: change");
+            // clank intro
+            write(r, ".clank/config.json", "{}\n");
+            commit(r, "clank: init");
+            // plan intro
+            write(r, ".clank/plans/alpha.md", "# alpha\n");
+            commit(r, "[alpha] intro");
+            // mixed plan + code commit
+            write(r, ".clank/plans/alpha.md", "# alpha v2\n");
+            write(r, "src/lib.rs", "// v3\n");
+            commit(r, "[alpha] step 1");
+            // code-only commit in the clank era
+            write(r, "src/other.rs", "// other\n");
+            commit(r, "code: unrelated");
+            // empty commit
+            git(r, &["commit", "--quiet", "--allow-empty", "-m", "empty"]);
+            // rename within .clank: finalize (plans → finished)
+            std::fs::create_dir_all(r.join(".clank/finished")).unwrap();
+            git(
+                r,
+                &["mv", ".clank/plans/alpha.md", ".clank/finished/alpha.md"],
+            );
+            commit(r, "[alpha] finish");
+            // rename OUT of .clank
+            write(r, ".clank/plans/beta.md", "# beta\nsome body text here\n");
+            commit(r, "[beta] intro");
+            std::fs::create_dir_all(r.join("docs")).unwrap();
+            git(r, &["mv", ".clank/plans/beta.md", "docs/beta.md"]);
+            commit(r, "[beta] moved out");
+            // rename INTO .clank
+            git(r, &["mv", "docs/beta.md", ".clank/plans/beta.md"]);
+            commit(r, "[beta] resurrected");
+            // merge commit (first-parent semantics)
+            git(r, &["checkout", "--quiet", "-b", "side", "HEAD~2"]);
+            write(r, "src/side.rs", "// side\n");
+            commit(r, "code: side branch");
+            git(r, &["checkout", "--quiet", "main"]);
+            git(
+                r,
+                &["merge", "--quiet", "--no-ff", "-m", "merge side", "side"],
+            );
+            dir
+        }
+
+        fn legacy_events(repo: &Path, tip: &CommitSha) -> Vec<CommitEvent> {
+            first_parent_commits_to(repo, tip)
+                .unwrap()
+                .into_iter()
+                .map(|meta| CommitEvent {
+                    changes: diff_tree_changes(repo, &meta.sha).unwrap(),
+                    commit: meta.sha,
+                    author_ts: meta.author_ts,
+                    subject: meta.subject,
+                })
+                .collect()
+        }
+
+        fn head(repo: &Path) -> CommitSha {
+            rev_parse_head(repo).unwrap().unwrap()
+        }
+
+        #[test]
+        fn walker_matches_legacy_producer_from_root() {
+            let dir = build_fixture();
+            let tip = head(dir.path());
+            let walked = commit_events_between(dir.path(), None, &tip).unwrap();
+            let legacy = legacy_events(dir.path(), &tip);
+            assert_eq!(walked.len(), legacy.len(), "same commit count");
+            for (w, l) in walked.iter().zip(&legacy) {
+                assert_eq!(w, l, "diverged at {} ({})", l.commit.as_str(), l.subject);
+            }
+        }
+
+        #[test]
+        fn walker_matches_legacy_producer_from_mid_range_base() {
+            // Base mid-history: the walk's oldest commit must diff
+            // against its REAL first parent (behind the hidden
+            // base), not the empty tree.
+            let dir = build_fixture();
+            let tip = head(dir.path());
+            let all = legacy_events(dir.path(), &tip);
+            for start in [1, all.len() / 2, all.len() - 1] {
+                let base = all[start - 1].commit.clone();
+                let walked = commit_events_between(dir.path(), Some(&base), &tip).unwrap();
+                assert_eq!(
+                    walked,
+                    all[start..],
+                    "range fold from base at index {start}"
+                );
+            }
+        }
+
+        #[test]
+        fn walker_base_equals_tip_is_empty() {
+            let dir = build_fixture();
+            let tip = head(dir.path());
+            assert_eq!(
+                commit_events_between(dir.path(), Some(&tip), &tip).unwrap(),
+                Vec::new()
+            );
+        }
+    }
 
     #[test]
     fn is_plan_path_active() {

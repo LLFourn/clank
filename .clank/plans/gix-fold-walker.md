@@ -43,7 +43,14 @@ One stateful walker owning the traversal, in `git_io`:
     commit is absent==absent, near-free.
   - any OTHER top-level entry differs → `touched_code = true`,
     no recursion needed.
-  - `.clank` entry OID changed → real diff, of that subtree only.
+  - `.clank` entry OID changed → real diff. REFINED at impl time:
+    the full-repo diff (today's exact computation), NOT a
+    subtree-only diff — renames crossing the `.clank` boundary
+    (plan moved out of / resurrected into `.clank/plans/`) lose
+    their rename pairing in a subtree diff, silently changing
+    `PlanTouch` semantics. Clank-touching commits are the rare
+    case, so the win is unaffected and equivalence with the
+    legacy producer becomes exact rather than approximate.
 - Emit the same `CommitEvent { sha, author_ts, subject, changes }`
   — `apply_commit` and everything in core is untouched.
 
@@ -56,6 +63,15 @@ Callers to migrate: the fold loops in `rebuild_with_diagnostics`
 / `fold_forward` and both phases of `rebuild_from` (rebuild.rs).
 The old per-commit helpers stay only if non-fold callers remain;
 otherwise delete.
+
+Sized at impl time: `git_io::snapshot` (the cold fold's producer,
+feeding `derive_state`) is a fourth instance of the same pattern —
+migrated too. `preview.rs` (purge previews) also walks with
+per-commit diffs but additionally needs a per-commit merge bit
+that `CommitEvent` doesn't carry; it is a one-shot command path,
+not the hot fold, so it deliberately stays on the legacy helpers
+(which therefore remain as production API and double as the
+equivalence test's reference implementation).
 
 ## Correctness notes
 
