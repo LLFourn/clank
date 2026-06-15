@@ -90,7 +90,13 @@ fn start_scaffolds_and_pins_head() {
     assert_eq!(state["number"], 123);
     assert_eq!(state["head_sha"], pr_sha, "head pinned to the PR head");
     assert_eq!(state["round"], 0);
-    assert!(state["review_id"].is_null(), "no pending review yet");
+    // The id is resolved on demand, never persisted: the key must be
+    // ABSENT (is_null() would also pass for a present null, proving
+    // nothing — codex c3ad98e).
+    assert!(
+        state.get("review_id").is_none(),
+        "review id must not be persisted: {state}"
+    );
     assert!(dir.join("master.md").is_file());
     assert!(dir.join("reviews").is_dir());
 

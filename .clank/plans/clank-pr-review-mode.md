@@ -151,11 +151,11 @@ stop-hook hint is one line (`pr-review: review #123 round 3`).
 
 ```
 clank pr-review start <pr>   # fetch pull/<pr>/head, pin head_sha,
-                             #   scaffold local state, create the
-                             #   empty pending review (record
-                             #   review_id). Reuses fork --pr's
-                             #   fetch+pin helper; works in any
-                             #   checkout of the PR.
+                             #   scaffold local state. NO GitHub I/O
+                             #   — the pending review is born when
+                             #   master posts its first comment.
+                             #   Reuses fork --pr's fetch+pin helper;
+                             #   works in any checkout of the PR.
 clank pr-review note --verdict <request-changes|finished> -m "…"
                              # reviewer: write reviews/<label>.md,
                              #   stamp reviewed_round = pr.round.
@@ -366,9 +366,10 @@ Keeps the main clank skill uncluttered.
    `cli::pr_review` (2b: `start`/`note`/`abort`/`status`, slug
    parse, master-only role gate, single-active-PR inference; 7
    in-process integration tests + a parse_slug unit test).
-   `/pr-reviews/` added to the canonical gitignore set. GitHub
-   pending-review creation deferred to phase 4 (review_id stays
-   null after `start`).
+   `/pr-reviews/` added to the canonical gitignore set. `start`
+   does no GitHub I/O; the pending review is born when master
+   posts its first comment (the id is resolved on demand, never
+   stored — see the phase-4 refinement).
 3. **Wait surface + gate** — ✅ DONE. PR-keyed `WaitItem::PrReviewer
    {pr,round}` / `PrMaster {pr,round,next}` (+ `PrMasterNext`);
    `WorkStatus.pr_reviews`; `PlanStateLookup::pr_reviews` (default
