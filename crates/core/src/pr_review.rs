@@ -15,11 +15,10 @@ use crate::vocab::Verdict;
 /// `.clank/pr-reviews/<pr>/pr.json` — the review target plus the
 /// round/submit coordination state.
 ///
-/// Both id forms are stored because they live in different API
-/// namespaces (the node-vs-numeric footgun): `review_id` is the
-/// NUMERIC id REST submit/delete take; `review_node_id` is the
-/// GraphQL node id reply-creation takes. Both are `None` until the
-/// pending review is created (a later phase).
+/// The pending review's id is deliberately NOT stored: GitHub
+/// enforces one pending review per user per PR, so it's resolved
+/// on demand (the singleton makes the query unambiguous). Storing
+/// it would dangle if the review were discarded and recreated.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PrReviewState {
     /// `owner/name` slug the gh API calls target.
@@ -28,12 +27,6 @@ pub struct PrReviewState {
     pub number: u32,
     /// Pinned `pull/<n>/head` sha; comments anchor here.
     pub head_sha: String,
-    /// Numeric id of the team's single pending review (REST).
-    #[serde(default)]
-    pub review_id: Option<u64>,
-    /// GraphQL node id of the same review (reply creation).
-    #[serde(default)]
-    pub review_node_id: Option<String>,
     /// Master's current revision counter. Bumped whenever master
     /// changes the pending comments; reviewers stamp the round they
     /// reviewed so a post-approval edit reopens the gate.
@@ -51,8 +44,6 @@ impl PrReviewState {
             repo: repo.into(),
             number,
             head_sha: head_sha.into(),
-            review_id: None,
-            review_node_id: None,
             round: 0,
             submitting: false,
         }
@@ -222,8 +213,6 @@ mod tests {
     fn state_round_trips_through_json() {
         let mut s = PrReviewState::new("owner/repo", 123, "deadbeef");
         s.round = 4;
-        s.review_id = Some(4500050869);
-        s.review_node_id = Some("PRR_kwabc".into());
         s.submitting = true;
         let json = serde_json::to_string(&s).unwrap();
         let back: PrReviewState = serde_json::from_str(&json).unwrap();
@@ -232,11 +221,10 @@ mod tests {
 
     #[test]
     fn state_tolerates_missing_optionals() {
-        // A pr.json written before review creation: no ids, no flag.
+        // A pr.json written by `start` (round 0, not submitting):
+        // the round/submitting fields default when absent.
         let json = r#"{"repo":"o/r","number":7,"head_sha":"abc"}"#;
         let s: PrReviewState = serde_json::from_str(json).unwrap();
-        assert_eq!(s.review_id, None);
-        assert_eq!(s.review_node_id, None);
         assert_eq!(s.round, 0);
         assert!(!s.submitting);
     }

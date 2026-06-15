@@ -68,9 +68,8 @@ is structurally uncommittable onto the PR branch.
 
 ```
 <pr-worktree>/.clank/pr-reviews/<pr>/        (gitignored)
-  pr.json        { repo, number, head_sha (pinned),
-                   review_id (numeric), review_node_id (GraphQL),
-                   round, submitting }
+  pr.json        { repo, number, head_sha (pinned), round,
+                   submitting }
   master.md      master's running summary · general concerns ·
                  the draft body for the final submit
   reviews/
@@ -81,14 +80,12 @@ is structurally uncommittable onto the PR branch.
 `round` is master's current revision counter (see Rounds);
 `submitting` is the TOCTOU freeze flag (see Submit).
 
-**Store BOTH id forms — they live in different namespaces**
-(ruthless da957d7 note 1, a footgun the spike surfaced): GraphQL
-reply creation needs NODE ids (`review_node_id` + the target
-comment's `node_id`); REST submit (`…/reviews/{review_id}/events`)
-and REST delete (`…/pulls/comments/{reply_id}`) take NUMERIC ids.
-The verb/I-O layer is explicit about which form each call wants;
-passing a node id where a numeric id is expected (or vice versa)
-is the classic GitHub-API mistake this design would otherwise hit.
+The pending review's id is **resolved on demand, not stored** —
+see the phase-4 refinement under GitHub mechanics. The
+node-vs-numeric footgun (ruthless da957d7 note 1) closes by never
+persisting either form: each call takes the right one straight
+from the resolve query (REST `id` for submit/discard, `node_id`
+for reply creation).
 
 ## Rounds (the freeze/staleness mechanism, as an integer)
 
@@ -170,8 +167,8 @@ clank pr-review submit       # MASTER-ONLY. Gate must be converged.
                              #   Re-sweep replies, then publish the
                              #   pending review with master.md's
                              #   body. Tears down NOTHING.
-clank pr-review abort        # MASTER-ONLY. Discard the pending
-                             #   review (delete review_id) + local
+clank pr-review abort        # MASTER-ONLY. Resolve + discard the
+                             #   pending review (if any) + local
                              #   scratch. No worktree teardown.
 clank pr-review status       # who we're waiting on (round +
                              #   per-reviewer verdict) — also folded
@@ -215,6 +212,32 @@ revisit only if it ever reads as noise.
 - Discard: `DELETE …/pulls/{n}/reviews/{review_id}`.
 - Master edits/deletes its own and reviewers' pending comments:
   same gh identity + write access, always permitted.
+
+### Phase-4 refinement: RESOLVE the review id, don't store it
+
+The spike confirmed at most ONE pending review per user per PR, so
+clank never persists `review_id` — `submit`/`abort`/`status`
+RESOLVE it on demand: `GET …/pulls/{n}/reviews`, filter
+`state == PENDING` (the singleton guarantees ≤1), take its
+`id`/`node_id`. This is staleness-free: a stored id would dangle if
+the review were discarded + recreated, whereas the query always
+returns the live one (or none → nothing to submit/discard).
+
+This SUPERSEDES the earlier "store both id forms in pr.json"
+note (ruthless da7ab89 #1): the node-vs-numeric distinction still
+matters, but it's resolved per-call from the query result (REST
+`id` for submit/discard, `node_id` for reply creation) rather than
+cached — so the footgun closes by never persisting either. The
+`review_id`/`review_node_id` fields drop from `PrReviewState`.
+
+Division of labor: clank owns the pending-review LIFECYCLE
+(resolve / submit / discard) as testable pure argv-builders +
+response-parsers behind a thin `gh` spawn. The comment SUBSTANCE
+(master's top-level comments, reviewers' threaded replies,
+reactions) is posted by agents via raw `gh` per the skill — clank
+doesn't wrap every comment op. `start` therefore does NO GitHub
+I/O (the pending review is born when master posts its first
+comment); only `submit`/`abort`/`status` query.
 - **SPIKE (verify on a scratch PR before building) — THREE
   load-bearing unknowns, not one** (ruthless e9d1bbb #1). The
   whole model is founded on unverified GitHub behavior; confirm
@@ -361,14 +384,24 @@ Keeps the main clank skill uncluttered.
    via the stop-hook's `clank wfw` pull, like ad-hoc/queue items.
    Tests: core tier-progression + routing (7 cases), in-process
    projection incl. stale-round drop.
-4. **GitHub I/O**: create/submit/discard pending review; add/edit/
-   delete pending comments + replies; reaction read.
-5. **Skill file** `clank-pr-review`.
-6. **`submit`**: convergence check → publish + summary body.
+4. **GitHub I/O** (NEXT): the pending-review LIFECYCLE only —
+   resolve (`GET pulls/N/reviews` → the singleton PENDING),
+   submit (`events` event=COMMENT + body), discard (`DELETE`).
+   Pure argv-builders + response-parsers (unit-tested) behind a
+   thin `gh` spawn; wire `abort` to resolve+discard. Comment
+   substance (post/edit/delete/reply/react) is agent raw-`gh`, not
+   clank verbs — it belongs to phase 5's skill.
+5. **Skill file** `clank-pr-review` — the EXACT `gh`/GraphQL
+   incantations for posting top-level comments, threaded pending
+   replies (`addPullRequestReviewComment` w/ the resolved
+   `node_id`), reactions, and the integrate-and-delete sweep.
+6. **`submit`**: convergence check (gate Finished + structural
+   re-sweep) → resolve review id → publish with master.md body.
 
 Phases 2–3 are pure/local and fully testable in-process; phase 4
-is the gh-shelling layer (tests stub the gh boundary, never spawn
-the clank binary).
+is the gh-shelling layer (pure argv/parse tested; the spawn is a
+shell seam, never unit-tested against live GitHub; the clank
+binary is never spawned in tests).
 
 ## Status
 
