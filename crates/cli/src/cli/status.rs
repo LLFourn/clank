@@ -53,6 +53,9 @@ pub struct StatusSnapshot {
     /// 3ea8580 concern 1). Plans: status-tui-live-log,
     /// log-plan-umbrellas.
     pub(crate) log_rows: Vec<crate::cli::log::OnelineRow>,
+    /// Active GitHub PR reviews (clank-pr-review-mode), for the
+    /// `pr` gauge. Empty in the common (no-PR-review) case.
+    pub(crate) pr_reviews: Vec<clank_core::wait::PrReviewWorkState>,
 }
 
 /// One shelved plan as the renderers see it.
@@ -199,6 +202,7 @@ impl StatusSnapshot {
             master,
             shelved,
             log_rows,
+            pr_reviews: work_status.pr_reviews,
         })
     }
 
@@ -333,6 +337,24 @@ impl StatusSnapshot {
                 (None, _) => String::new(),
             };
             let _ = writeln!(out, "shelved: {}{note}", sv.stem);
+        }
+        for pr in &self.pr_reviews {
+            let waiting = if pr.missing_reviewers.is_empty() {
+                "master".to_string()
+            } else {
+                pr.missing_reviewers
+                    .iter()
+                    .map(|l| l.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            };
+            let _ = writeln!(
+                out,
+                "pr #{}: round {} ({}) — waiting on {waiting}",
+                pr.pr,
+                pr.round,
+                pr.gate.as_str(),
+            );
         }
 
         if self.plans.is_empty() && self.last_finished.is_none() {

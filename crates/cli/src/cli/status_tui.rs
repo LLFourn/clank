@@ -598,6 +598,7 @@ pub(crate) mod tests {
             master: Some("claude".into()),
             shelved: Vec::new(),
             log_rows: Vec::new(),
+            pr_reviews: Vec::new(),
         }
     }
 

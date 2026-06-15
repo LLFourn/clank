@@ -198,6 +198,50 @@ fn note_resolution_errors_when_no_active_review() {
 }
 
 #[test]
+fn pr_review_inputs_project_current_round_verdicts() {
+    let (env, _) = env_with_pr(123);
+    let repo = env.repo();
+    start_with(repo, "o/r", 123, None).unwrap();
+
+    // Fresh review: one input, round 0, no current verdicts.
+    let inputs = clank::cli::pr_review::pr_review_inputs(repo);
+    assert_eq!(inputs.len(), 1);
+    assert_eq!((inputs[0].pr, inputs[0].round), (123, 0));
+    assert!(inputs[0].current_verdicts.is_empty());
+
+    // codex notes FINISHED at round 0 → it shows as a current verdict.
+    note_with(repo, &label("codex"), Some(123), Verdict::Finished, "ok").unwrap();
+    let inputs = clank::cli::pr_review::pr_review_inputs(repo);
+    assert_eq!(inputs[0].current_verdicts.len(), 1);
+    assert_eq!(inputs[0].current_verdicts[0].author, label("codex"));
+    assert_eq!(inputs[0].current_verdicts[0].verdict, Verdict::Finished);
+}
+
+#[test]
+fn pr_review_inputs_drop_stale_round_verdicts() {
+    let (env, _) = env_with_pr(123);
+    let repo = env.repo();
+    start_with(repo, "o/r", 123, None).unwrap();
+    note_with(repo, &label("codex"), Some(123), Verdict::Finished, "ok").unwrap();
+
+    // Master revises → bump pr.json round to 1 (the round bump that
+    // `propose` will do in phase 4; simulated here by editing state).
+    let pr_json = repo.join(".clank/pr-reviews/123/pr.json");
+    let mut state: clank_core::pr_review::PrReviewState =
+        serde_json::from_str(&std::fs::read_to_string(&pr_json).unwrap()).unwrap();
+    state.round = 1;
+    std::fs::write(&pr_json, serde_json::to_string_pretty(&state).unwrap()).unwrap();
+
+    // codex's round-0 verdict is now STALE → not a current verdict.
+    let inputs = clank::cli::pr_review::pr_review_inputs(repo);
+    assert_eq!(inputs[0].round, 1);
+    assert!(
+        inputs[0].current_verdicts.is_empty(),
+        "stale round-0 verdict must not count for round 1"
+    );
+}
+
+#[test]
 fn status_fails_closed_without_a_team() {
     // codex da7ab89: a missing/misconfigured team must NOT make
     // status print "converged" off an empty reviewer set. Start a

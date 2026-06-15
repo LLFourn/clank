@@ -280,6 +280,35 @@ pub fn status_with(repo: &Path, home: Option<&Path>, pr: Option<u32>) -> anyhow:
     Ok(out)
 }
 
+/// Wait-surface inputs for every active PR review: the
+/// current-round verdicts (`reviewed_round == round`) mapped to
+/// `ReviewEntry`, which `derive_status` feeds to `compute_gate`.
+/// Best-effort per PR — a PR whose state/verdicts can't be read is
+/// skipped rather than failing the whole projection (the wait
+/// surface must never panic the loop).
+pub fn pr_review_inputs(repo: &Path) -> Vec<clank_core::wait::PrReviewInput> {
+    active_prs(repo)
+        .into_iter()
+        .filter_map(|pr| {
+            let state = load_state(repo, pr).ok()?;
+            let verdicts = load_verdicts(repo, pr).ok()?;
+            let current_verdicts = verdicts
+                .into_iter()
+                .filter(|(_, v)| v.reviewed_round == state.round)
+                .map(|(author, v)| clank_core::wait::ReviewEntry {
+                    author,
+                    verdict: v.verdict,
+                })
+                .collect();
+            Some(clank_core::wait::PrReviewInput {
+                pr,
+                round: state.round,
+                current_verdicts,
+            })
+        })
+        .collect()
+}
+
 /// Parse every `reviews/<label>.md` for a PR. A corrupt file is an
 /// error (a misread verdict could publish prematurely).
 fn load_verdicts(repo: &Path, pr: u32) -> anyhow::Result<Vec<(AgentLabel, ReviewerVerdict)>> {

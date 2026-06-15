@@ -85,7 +85,13 @@ fn firings_from_items(items: &[WaitItem]) -> Vec<HookFiring> {
             | WaitItem::AdHocRevise { .. }
             | WaitItem::PromoteFromQueue { .. }
             | WaitItem::Blocked { .. }
-            | WaitItem::Unblocked { .. } => None,
+            | WaitItem::Unblocked { .. }
+            // PR-review items surface via the stop-hook's `clank wfw`
+            // pull (like ad-hoc/queue items) rather than a dedicated
+            // proactive OS hook — HookFiring is plan+sha keyed and PR
+            // items are pr+round keyed.
+            | WaitItem::PrReviewer { .. }
+            | WaitItem::PrMaster { .. } => None,
         })
         .collect()
 }
@@ -548,6 +554,17 @@ fn render_json(item: &WaitItem) -> serde_json::Value {
             "plan": plan,
             "answer": answer,
         }),
+        WaitItem::PrReviewer { pr, round } => serde_json::json!({
+            "kind": "pr_reviewer",
+            "pr": pr,
+            "round": round,
+        }),
+        WaitItem::PrMaster { pr, round, next } => serde_json::json!({
+            "kind": "pr_master",
+            "pr": pr,
+            "round": round,
+            "next": next,
+        }),
     }
 }
 
@@ -604,6 +621,12 @@ fn render_human(item: &WaitItem) -> String {
         WaitItem::Unblocked { name, plan, answer } => {
             let scope = plan.as_deref().unwrap_or("repo");
             format!("answer   {name}  scope={scope}  {answer}")
+        }
+        WaitItem::PrReviewer { pr, round } => {
+            format!("pr-review  #{pr}  round {round}  review the pending comments")
+        }
+        WaitItem::PrMaster { pr, round, next } => {
+            format!("pr-review  #{pr}  round {round}  master: {next:?}")
         }
     }
 }

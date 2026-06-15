@@ -346,20 +346,21 @@ Keeps the main clank skill uncluttered.
    `/pr-reviews/` added to the canonical gitignore set. GitHub
    pending-review creation deferred to phase 4 (review_id stays
    null after `start`).
-3. **Wait surface + gate** (NEXT): new PR-keyed `WaitItem`
-   variants (`PrReviewer { pr, round }` / `PrMaster { pr, round,
-   next }`) + a `WorkStatus.pr_reviews` field; a `PlanStateLookup`
-   method (default empty, like `blocks_for`) returning each active
-   PR's `{pr, round, current-round ReviewEntry}` from a
-   `.clank/pr-reviews/` scan in `FsPlanStateLookup`; `derive_status`
-   runs `compute_gate(current_verdicts, commit, gate, false)` per
-   PR and records the missing reviewers per tier; `work_for` routes
-   `PrReviewer` to the missing tier members and `PrMaster` to
-   master; `wfw` JSON/human + `stop_hook` gain a `pr_review` hint
-   line; `clank status`/TUI gain the `pr` gauge. Adding a `WaitItem`
-   variant forces touching every match arm (wfw/stop_hook/status),
-   so this phase is atomic. Fully pure-testable for the gate/route
-   logic; FS scan tested in-process.
+3. **Wait surface + gate** — ✅ DONE. PR-keyed `WaitItem::PrReviewer
+   {pr,round}` / `PrMaster {pr,round,next}` (+ `PrMasterNext`);
+   `WorkStatus.pr_reviews`; `PlanStateLookup::pr_reviews` (default
+   empty) fed by `cli::pr_review::pr_review_inputs` scanning
+   `.clank/pr-reviews/` and passing only current-round verdicts;
+   `derive_status` runs `compute_gate(current, commit, gate,
+   false)` per PR + `missing_for_gate` to find the owing tier;
+   `work_for` routes `PrReviewer` to missing tier members and
+   `PrMaster` to master by gate (Integrate/Submit/Continue);
+   `wfw` JSON+human + `stop_hook` gain `pr_reviewer`/`pr_master`
+   hint lines; `clank status` gains the `pr` line. PR items fire no
+   proactive OS hook (HookFiring is plan+sha keyed) — they surface
+   via the stop-hook's `clank wfw` pull, like ad-hoc/queue items.
+   Tests: core tier-progression + routing (7 cases), in-process
+   projection incl. stale-round drop.
 4. **GitHub I/O**: create/submit/discard pending review; add/edit/
    delete pending comments + replies; reaction read.
 5. **Skill file** `clank-pr-review`.

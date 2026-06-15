@@ -259,6 +259,19 @@ fn render_wfw_items(items: &[serde_json::Value], label: &AgentLabel, role: Role)
                 let answer = item.get("answer").and_then(|v| v.as_str()).unwrap_or("");
                 out.push_str(&format!("  - unblocked: {name}: {answer}\n"));
             }
+            "pr_reviewer" => {
+                let pr = item.get("pr").and_then(|v| v.as_u64()).unwrap_or(0);
+                let round = item.get("round").and_then(|v| v.as_u64()).unwrap_or(0);
+                out.push_str(&format!("  - pr-review: review #{pr} round {round}\n"));
+            }
+            "pr_master" => {
+                let pr = item.get("pr").and_then(|v| v.as_u64()).unwrap_or(0);
+                let round = item.get("round").and_then(|v| v.as_u64()).unwrap_or(0);
+                let next = item.get("next").and_then(|v| v.as_str()).unwrap_or("?");
+                out.push_str(&format!(
+                    "  - pr-review: master {next} #{pr} round {round}\n"
+                ));
+            }
             other => out.push_str(&format!("  - {other}: {plan} @ {short}\n")),
         }
     }
