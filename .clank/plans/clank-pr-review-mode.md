@@ -116,7 +116,30 @@ Reuse the existing two-tier milestone rule: commit reviewers
 (codex) review EVERY round; the gate tier (ruthless) wakes only
 when the commit tier is FINISHED ("ready to submit"). Same policy
 as `gate-reviewers-only-plan-change-and-finish`; zero new gate
-code. `compute_gate` is fed the verdicts read from `reviews/*.md`.
+code.
+
+VERIFIED mechanism (wait.rs:215 read at phase-3 design): feed
+`compute_gate` the CURRENT-round verdicts (the `reviews/*.md`
+entries whose `reviewed_round == pr.round`, mapped to
+`ReviewEntry`) with the team's `commit_reviewers`/`gate_reviewers`
+and **`latest_touched_plan = false`**. The tier semantics then
+fall out unchanged:
+
+- `Unreviewed` → a commit reviewer hasn't posted a current verdict
+  → that commit reviewer's turn.
+- `ChangesRequested` → master integrates (revise → bump round).
+- `ApprovedPendingGate` → commit tier FINISHED is the milestone
+  (`commit_finished` path, since `latest_touched_plan=false`) →
+  gate reviewers wake.
+- `Finished` → both tiers FINISHED → master submits.
+- `Approved` (mid-flight `approve`, no milestone) → master's call;
+  PR reviewers are expected to use `finished`/`request_changes`,
+  so this is a rare nudge state.
+
+So the gate LOGIC is reused verbatim; only the adapter (verdict
+files → current-round `ReviewEntry`s) and the PR-keyed wait items
+are new. `pending_reviewers` stays for the human `status` display
+("waiting on X").
 
 ## Wait-surface integration
 
@@ -323,9 +346,20 @@ Keeps the main clank skill uncluttered.
    `/pr-reviews/` added to the canonical gitignore set. GitHub
    pending-review creation deferred to phase 4 (review_id stays
    null after `start`).
-3. **Wait surface + gate**: the projection, `WaitItem` variants,
-   `work_for` routing, `compute_gate` over verdict files, milestone
-   tiers. `clank status`/TUI `pr` gauge.
+3. **Wait surface + gate** (NEXT): new PR-keyed `WaitItem`
+   variants (`PrReviewer { pr, round }` / `PrMaster { pr, round,
+   next }`) + a `WorkStatus.pr_reviews` field; a `PlanStateLookup`
+   method (default empty, like `blocks_for`) returning each active
+   PR's `{pr, round, current-round ReviewEntry}` from a
+   `.clank/pr-reviews/` scan in `FsPlanStateLookup`; `derive_status`
+   runs `compute_gate(current_verdicts, commit, gate, false)` per
+   PR and records the missing reviewers per tier; `work_for` routes
+   `PrReviewer` to the missing tier members and `PrMaster` to
+   master; `wfw` JSON/human + `stop_hook` gain a `pr_review` hint
+   line; `clank status`/TUI gain the `pr` gauge. Adding a `WaitItem`
+   variant forces touching every match arm (wfw/stop_hook/status),
+   so this phase is atomic. Fully pure-testable for the gate/route
+   logic; FS scan tested in-process.
 4. **GitHub I/O**: create/submit/discard pending review; add/edit/
    delete pending comments + replies; reaction read.
 5. **Skill file** `clank-pr-review`.
