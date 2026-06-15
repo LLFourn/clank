@@ -458,6 +458,16 @@ fn user_checks() -> Vec<CheckResult> {
         crate::cli::setup::CODEX_SKILL_BODY,
         "~/.codex/skills/clank/SKILL.md",
     ));
+    out.push(check_skill_file(
+        &home.join(".claude/skills/clank-pr-review/SKILL.md"),
+        crate::cli::setup::PR_REVIEW_SKILL_BODY,
+        "~/.claude/skills/clank-pr-review/SKILL.md",
+    ));
+    out.push(check_skill_file(
+        &home.join(".codex/skills/clank-pr-review/SKILL.md"),
+        crate::cli::setup::PR_REVIEW_SKILL_BODY,
+        "~/.codex/skills/clank-pr-review/SKILL.md",
+    ));
     // Hook entries.
     out.push(check_hook_entry(
         &home.join(".claude/settings.json"),

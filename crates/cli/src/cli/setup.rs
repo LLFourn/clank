@@ -19,6 +19,10 @@ use super::SetupArgs;
 // the expected embedded content without recomputing the paths.
 pub const CLAUDE_SKILL_BODY: &str = include_str!("setup_assets/claude_skill.md");
 pub const CODEX_SKILL_BODY: &str = include_str!("setup_assets/codex_skill.md");
+/// PR-review mode skill (clank-pr-review-mode). Tool-neutral — the
+/// gh incantations are identical for claude and codex — so one body
+/// installs to both skill dirs.
+pub const PR_REVIEW_SKILL_BODY: &str = include_str!("setup_assets/pr_review_skill.md");
 
 /// Stable identifier we write onto every clank-owned hook entry
 /// as `"id": "<HOOK_ID>"`. The plan's D8 ownership model says
@@ -56,6 +60,20 @@ pub async fn run(args: SetupArgs) -> anyhow::Result<()> {
     install_skill(
         &home.join(".codex/skills/clank/SKILL.md"),
         CODEX_SKILL_BODY,
+        args.force,
+        args.dry_run,
+        &mut summary,
+    )?;
+    install_skill(
+        &home.join(".claude/skills/clank-pr-review/SKILL.md"),
+        PR_REVIEW_SKILL_BODY,
+        args.force,
+        args.dry_run,
+        &mut summary,
+    )?;
+    install_skill(
+        &home.join(".codex/skills/clank-pr-review/SKILL.md"),
+        PR_REVIEW_SKILL_BODY,
         args.force,
         args.dry_run,
         &mut summary,
@@ -465,6 +483,37 @@ mod tests {
                 "{name} skill must teach composing from the one-line hint"
             );
         }
+    }
+
+    #[test]
+    fn pr_review_skill_carries_verbs_and_verified_incantations() {
+        let body = PR_REVIEW_SKILL_BODY;
+        assert!(
+            body.starts_with("---\nname: clank-pr-review\n"),
+            "skill needs the clank-pr-review frontmatter"
+        );
+        for verb in [
+            "clank pr-review start",
+            "clank pr-review note",
+            "clank pr-review submit",
+        ] {
+            assert!(body.contains(verb), "skill must document `{verb}`");
+        }
+        // The verified gh paths (top-level add, threaded reply).
+        assert!(
+            body.contains("addPullRequestReviewThread"),
+            "skill must give the verified top-level-add path"
+        );
+        assert!(
+            body.contains("addPullRequestReviewComment") && body.contains("inReplyTo"),
+            "skill must give the verified threaded-reply path"
+        );
+        // Guard the footgun: resolves use --paginate --jq, never
+        // `--slurp --jq` (gh rejects that combination).
+        assert!(
+            !body.contains("--slurp --jq") && !body.contains("--jq --slurp"),
+            "skill must not pair --slurp with --jq (gh rejects it)"
+        );
     }
 
     fn write_file(path: &Path, contents: &str) {

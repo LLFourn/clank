@@ -400,10 +400,18 @@ Keeps the main clank skill uncluttered.
    the pending review (warn, never fail) before removing the local
    scratch. Comment substance (post/edit/delete/reply/react) is
    agent raw-`gh` — phase 5's skill.
-5. **Skill file** `clank-pr-review` — the EXACT `gh`/GraphQL
-   incantations for posting top-level comments, threaded pending
-   replies (`addPullRequestReviewComment` w/ the resolved
-   `node_id`), reactions, and the integrate-and-delete sweep.
+5. **Skill file** `clank-pr-review` — ✅ DONE.
+   `setup_assets/pr_review_skill.md`, installed by `clank setup` to
+   `~/.{claude,codex}/skills/clank-pr-review/SKILL.md` (+ doctor
+   check). Carries the model, the verbs, and EXACT incantations
+   ALL verified live before writing: create-with-first-comment;
+   `addPullRequestReviewThread` for further top-level comments;
+   `addPullRequestReviewComment` + `inReplyTo` for threaded
+   replies; REST reactions + reply delete; and the resolve
+   one-liner using `--paginate --jq` (NOT `--slurp --jq` — gh
+   rejects that pairing, a footgun the cleanup pass surfaced).
+   Content-guard test pins the verbs + incantations + the
+   slurp/jq guard.
 6. **`submit`**: convergence check (gate Finished + structural
    re-sweep) → resolve review id → publish with master.md body.
 
