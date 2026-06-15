@@ -37,11 +37,10 @@ fn label(s: &str) -> AgentLabel {
     AgentLabel::parse(s).unwrap()
 }
 
-/// A repo with a base commit, a team, and an `origin` bare remote
-/// carrying `refs/pull/<pr>/head` so `start_with`'s fetch works.
-fn env_with_pr(pr: u32) -> (TestEnv, String) {
-    let env = TestEnv::init();
-    env.register_team("claude", &["codex"], &["ruthless"]);
+/// Base commit + an `origin` bare remote carrying
+/// `refs/pull/<pr>/head` so `start_with`'s fetch works. No team —
+/// callers add one when they need it.
+fn setup_repo_with_pr(env: &TestEnv, pr: u32) -> String {
     let repo = env.repo();
     std::fs::write(repo.join("file.rs"), "// base\n").unwrap();
     git(repo, &["add", "-A"]);
@@ -66,6 +65,15 @@ fn env_with_pr(pr: u32) -> (TestEnv, String) {
     );
     git(repo, &["checkout", "--quiet", "-"]);
     git(repo, &["branch", "--quiet", "-D", "pr-branch"]);
+    pr_sha
+}
+
+/// A repo with a base commit, a team, and an `origin` bare remote
+/// carrying `refs/pull/<pr>/head` so `start_with`'s fetch works.
+fn env_with_pr(pr: u32) -> (TestEnv, String) {
+    let env = TestEnv::init();
+    env.register_team("claude", &["codex"], &["ruthless"]);
+    let pr_sha = setup_repo_with_pr(&env, pr);
     (env, pr_sha)
 }
 
@@ -187,4 +195,20 @@ fn note_resolution_errors_when_no_active_review() {
         .unwrap_err()
         .to_string();
     assert!(err.contains("no active PR review"), "got: {err}");
+}
+
+#[test]
+fn status_fails_closed_without_a_team() {
+    // codex da7ab89: a missing/misconfigured team must NOT make
+    // status print "converged" off an empty reviewer set. Start a
+    // review but register no team → status errors, never "done".
+    let env = TestEnv::init();
+    setup_repo_with_pr(&env, 123);
+    start_with(env.repo(), "o/r", 123, None).unwrap();
+    let res = status_with(env.repo(), Some(env.home()), Some(123));
+    let err = res.expect_err("status must fail closed without a team");
+    assert!(
+        !err.to_string().contains("converged"),
+        "must not fabricate convergence: {err}"
+    );
 }

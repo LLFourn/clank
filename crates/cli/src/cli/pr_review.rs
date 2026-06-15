@@ -239,8 +239,13 @@ pub fn status_with(repo: &Path, home: Option<&Path>, pr: Option<u32>) -> anyhow:
     use std::fmt::Write as _;
     let pr = resolve_pr(repo, pr)?;
     let state = load_state(repo, pr)?;
+    // Fail CLOSED on team-resolution failure: an empty reviewer set
+    // would make `pending_reviewers` report "converged" and falsely
+    // mark the review done (codex da7ab89). The reviewer set is what
+    // convergence is measured against, so its absence is an error,
+    // not a degrade.
     let (commit_reviewers, gate_reviewers) =
-        crate::agent_store::load_reviewer_tiers_with(repo, home).unwrap_or_default();
+        crate::agent_store::load_reviewer_tiers_with(repo, home)?;
     let reviewers: Vec<AgentLabel> = commit_reviewers.into_iter().chain(gate_reviewers).collect();
     let verdicts = load_verdicts(repo, pr)?;
 
