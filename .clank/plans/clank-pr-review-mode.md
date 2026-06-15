@@ -205,8 +205,13 @@ revisit only if it ever reads as noise.
 
 ## GitHub mechanics + the one sizing-time spike
 
-- Create pending review: `POST …/pulls/{n}/reviews` with no
-  `event` → PENDING; capture `review_id`.
+- Create pending review (an AGENT, posting the first comment via
+  raw `gh`): `POST …/pulls/{n}/reviews` with no `event` → PENDING.
+  clank doesn't create it or capture the id — it RESOLVES the id
+  per-call (below).
+- Resolve (clank): `GET …/pulls/{n}/reviews`, filter
+  `state == PENDING` (singleton → ≤1); the entry carries both
+  `id` (numeric) and `node_id` (GraphQL).
 - Submit: `POST …/pulls/{n}/reviews/{review_id}/events` with
   `event: COMMENT` + `body` = master.md's summary.
 - Discard: `DELETE …/pulls/{n}/reviews/{review_id}`.
@@ -385,13 +390,16 @@ Keeps the main clank skill uncluttered.
    via the stop-hook's `clank wfw` pull, like ad-hoc/queue items.
    Tests: core tier-progression + routing (7 cases), in-process
    projection incl. stale-round drop.
-4. **GitHub I/O** (NEXT): the pending-review LIFECYCLE only —
-   resolve (`GET pulls/N/reviews` → the singleton PENDING),
-   submit (`events` event=COMMENT + body), discard (`DELETE`).
-   Pure argv-builders + response-parsers (unit-tested) behind a
-   thin `gh` spawn; wire `abort` to resolve+discard. Comment
-   substance (post/edit/delete/reply/react) is agent raw-`gh`, not
-   clank verbs — it belongs to phase 5's skill.
+4. **GitHub I/O** — ✅ DONE. `cli::pr_review::gh`: the
+   pending-review LIFECYCLE only — `resolve_pending_review`
+   (`GET pulls/N/reviews` → the singleton PENDING, both id forms),
+   `submit_review` (events event=COMMENT + body), and
+   `discard_pending_review` (DELETE, no-op if none). Pure
+   argv-builders + `parse_pending_review` unit-tested; only
+   `run_gh` touches the network. `abort` now best-effort discards
+   the pending review (warn, never fail) before removing the local
+   scratch. Comment substance (post/edit/delete/reply/react) is
+   agent raw-`gh` — phase 5's skill.
 5. **Skill file** `clank-pr-review` — the EXACT `gh`/GraphQL
    incantations for posting top-level comments, threaded pending
    replies (`addPullRequestReviewComment` w/ the resolved

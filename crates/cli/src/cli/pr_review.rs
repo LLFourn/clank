@@ -218,8 +218,14 @@ pub fn note_with(
     Ok(path)
 }
 
-/// Discard a PR review's local scratch. MASTER-ONLY: a reviewer's
-/// abort would delete the team's shared review state.
+/// Discard a PR review: the GitHub pending review (if any) AND the
+/// local scratch. MASTER-ONLY: a reviewer's abort would delete the
+/// team's shared review state.
+///
+/// The GitHub discard is best-effort — if `gh` is unavailable or
+/// there's no pending review, the local scratch is still removed
+/// (warn, don't fail): abort is master's explicit "throw it away",
+/// and a dangling draft is recoverable by hand.
 pub fn abort_with(
     repo: &Path,
     home: Option<&Path>,
@@ -228,9 +234,121 @@ pub fn abort_with(
 ) -> anyhow::Result<()> {
     require_master(repo, home, caller, "abort")?;
     let pr = resolve_pr(repo, pr)?;
+    let state = load_state(repo, pr)?;
+    if let Err(e) = gh::discard_pending_review(&state.repo, pr) {
+        eprintln!("warning: discarding the GitHub pending review failed: {e:#}");
+    }
     std::fs::remove_dir_all(pr_dir(repo, pr))
         .with_context(|| format!("removing PR #{pr} review scratch"))?;
     Ok(())
+}
+
+/// The pending-review LIFECYCLE on GitHub: resolve / submit /
+/// discard. clank owns only these — comment substance is agents'
+/// raw `gh` per the skill. The id is resolved per-call from the
+/// singleton (never stored). Pure argv-builders + a response parser
+/// are unit-tested; only `run_gh` touches the network.
+pub mod gh {
+    use anyhow::Context;
+
+    /// The team's single pending review on a PR.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct PendingReview {
+        /// REST numeric id (submit/discard).
+        pub id: u64,
+        /// GraphQL node id (reply creation).
+        pub node_id: String,
+    }
+
+    pub(super) fn resolve_argv(slug: &str, pr: u32) -> Vec<String> {
+        vec![
+            "api".into(),
+            format!("repos/{slug}/pulls/{pr}/reviews"),
+            "--paginate".into(),
+        ]
+    }
+
+    pub(super) fn submit_argv(slug: &str, pr: u32, review_id: u64, body: &str) -> Vec<String> {
+        vec![
+            "api".into(),
+            "--method".into(),
+            "POST".into(),
+            format!("repos/{slug}/pulls/{pr}/reviews/{review_id}/events"),
+            "-f".into(),
+            "event=COMMENT".into(),
+            "-f".into(),
+            format!("body={body}"),
+        ]
+    }
+
+    pub(super) fn discard_argv(slug: &str, pr: u32, review_id: u64) -> Vec<String> {
+        vec![
+            "api".into(),
+            "--method".into(),
+            "DELETE".into(),
+            format!("repos/{slug}/pulls/{pr}/reviews/{review_id}"),
+        ]
+    }
+
+    /// The PENDING review from a `GET …/reviews` array. The
+    /// singleton guarantees at most one; first PENDING wins.
+    pub(super) fn parse_pending_review(json: &str) -> anyhow::Result<Option<PendingReview>> {
+        let reviews: serde_json::Value =
+            serde_json::from_str(json).context("parsing reviews list")?;
+        let Some(arr) = reviews.as_array() else {
+            anyhow::bail!("reviews response is not an array");
+        };
+        for r in arr {
+            if r.get("state").and_then(|s| s.as_str()) == Some("PENDING") {
+                let id = r
+                    .get("id")
+                    .and_then(|v| v.as_u64())
+                    .context("pending review missing numeric id")?;
+                let node_id = r
+                    .get("node_id")
+                    .and_then(|v| v.as_str())
+                    .context("pending review missing node_id")?
+                    .to_string();
+                return Ok(Some(PendingReview { id, node_id }));
+            }
+        }
+        Ok(None)
+    }
+
+    fn run_gh(args: &[String]) -> anyhow::Result<String> {
+        let out = std::process::Command::new("gh")
+            .args(args)
+            .output()
+            .context("spawning gh")?;
+        if !out.status.success() {
+            anyhow::bail!(
+                "gh {args:?} failed: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            );
+        }
+        Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+    }
+
+    /// Resolve the PR's pending review, or `None` if there isn't one.
+    pub fn resolve_pending_review(slug: &str, pr: u32) -> anyhow::Result<Option<PendingReview>> {
+        parse_pending_review(&run_gh(&resolve_argv(slug, pr))?)
+    }
+
+    /// Submit the pending review with `body` as the summary.
+    /// Errors if there's no pending review to submit.
+    pub fn submit_review(slug: &str, pr: u32, body: &str) -> anyhow::Result<()> {
+        let review = resolve_pending_review(slug, pr)?
+            .context("no pending review to submit (has master drafted any comments?)")?;
+        run_gh(&submit_argv(slug, pr, review.id, body)).map(|_| ())
+    }
+
+    /// Discard the pending review if one exists; no-op otherwise.
+    pub fn discard_pending_review(slug: &str, pr: u32) -> anyhow::Result<()> {
+        if let Some(review) = resolve_pending_review(slug, pr)? {
+            run_gh(&discard_argv(slug, pr, review.id)).map(|_| ())?;
+        }
+        Ok(())
+    }
 }
 
 /// Human-readable status: round + per-reviewer verdict + who we're
@@ -377,5 +495,56 @@ mod tests {
             Some("LLFourn/clank")
         );
         assert_eq!(parse_slug("/local/bare.git"), None);
+    }
+
+    #[test]
+    fn gh_argv_shapes() {
+        assert_eq!(
+            gh::resolve_argv("o/r", 7),
+            vec!["api", "repos/o/r/pulls/7/reviews", "--paginate"]
+        );
+        assert_eq!(
+            gh::submit_argv("o/r", 7, 42, "summary body"),
+            vec![
+                "api",
+                "--method",
+                "POST",
+                "repos/o/r/pulls/7/reviews/42/events",
+                "-f",
+                "event=COMMENT",
+                "-f",
+                "body=summary body"
+            ]
+        );
+        assert_eq!(
+            gh::discard_argv("o/r", 7, 42),
+            vec!["api", "--method", "DELETE", "repos/o/r/pulls/7/reviews/42"]
+        );
+    }
+
+    #[test]
+    fn parse_pending_review_finds_the_singleton() {
+        // A mix of submitted + pending: only the PENDING one returns.
+        let json = r#"[
+            {"id": 1, "node_id": "PRR_a", "state": "COMMENTED"},
+            {"id": 2, "node_id": "PRR_b", "state": "PENDING"}
+        ]"#;
+        let pr = gh::parse_pending_review(json).unwrap().unwrap();
+        assert_eq!(pr.id, 2);
+        assert_eq!(pr.node_id, "PRR_b");
+    }
+
+    #[test]
+    fn parse_pending_review_none_when_no_pending() {
+        let json = r#"[{"id": 1, "node_id": "PRR_a", "state": "APPROVED"}]"#;
+        assert_eq!(gh::parse_pending_review(json).unwrap(), None);
+        assert_eq!(gh::parse_pending_review("[]").unwrap(), None);
+    }
+
+    #[test]
+    fn parse_pending_review_rejects_malformed() {
+        assert!(gh::parse_pending_review("{not an array}").is_err());
+        // A PENDING entry missing its ids is an error, not a silent skip.
+        assert!(gh::parse_pending_review(r#"[{"state":"PENDING"}]"#).is_err());
     }
 }
