@@ -91,8 +91,9 @@ Here a plain `round` counter in `pr.json` does the same:
 - A reviewer records `reviewed_round` when they review. They are
   "current" iff `reviewed_round == pr.round`.
 - **Convergence** = for every reviewer, `reviewed_round ==
-  pr.round` AND `verdict == FINISHED`, AND no `🤖` pending replies
-  remain in the draft.
+  pr.round` AND `verdict == FINISHED`, AND only top-level master
+  comments remain in the draft (no pending threaded replies) —
+  the structural check, independent of any marker text.
 
 So if master edits after a reviewer approved, the round advances,
 that reviewer is no longer current, and the gate reopens — the
@@ -254,8 +255,12 @@ Keeps the main clank skill uncluttered.
 
 ## Implementation phases (suggested)
 
-1. **Spike**: confirm the pending-reply API path on a scratch PR;
-   record the exact `gh`/GraphQL incantation.
+1. **Spike**: on a scratch PR, confirm ALL THREE load-bearing
+   unknowns from the spike section — (a) the one-pending-review-
+   per-user singleton, (b) replies stay draft until submit, (c)
+   reaction visibility on pending comments — and record the exact
+   `gh`/GraphQL incantations. The singleton (a) is make-or-break;
+   do not proceed to phase 2 until it holds.
 2. **Local state + verbs**: `pr.json`/`master.md`/`reviews/*.md`,
    `start`/`note`/`abort`, round bumping. Pure-tested parsers for
    the verdict files.
