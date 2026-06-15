@@ -266,7 +266,7 @@ fn default_pr_purpose(pr: u32, title: Option<&str>) -> String {
 /// dependency; works for fork-PRs too) and PIN it to a sha:
 /// FETCH_HEAD is volatile, so resolve immediately and base the
 /// worktree on the sha, not the symref.
-fn fetch_pr_head(source: &Path, pr: u32) -> anyhow::Result<String> {
+pub(crate) fn fetch_pr_head(source: &Path, pr: u32) -> anyhow::Result<String> {
     let refspec = format!("pull/{pr}/head");
     let out = std::process::Command::new("git")
         .arg("-C")

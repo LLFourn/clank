@@ -42,6 +42,9 @@ enum Command {
     /// Create a linked worktree with the whole team's sessions
     /// forked into it (opens a tab when inside zellij)
     Fork(cli::ForkArgs),
+    /// Run the multi-agent review loop against a GitHub PR
+    /// (`clank pr-review start|note|abort|status`).
+    PrReview(cli::PrReviewArgs),
     /// Restore a shelved plan: replay its commits onto HEAD.
     /// Reviews reset (the replayed commits are re-reviewed)
     Unshelve(cli::UnshelveArgs),
@@ -120,6 +123,7 @@ async fn main() -> anyhow::Result<()> {
         },
         Command::Unshelve(args) => cli::shelve::run_unshelve(args).await,
         Command::Fork(args) => cli::fork::run(args).await,
+        Command::PrReview(args) => cli::pr_review::run(args).await,
         Command::Log(args) => cli::log::run(args).await,
         Command::Html(args) => cli::html::run(args).await,
         Command::Open(args) => cli::open::run(args).await,

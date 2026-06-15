@@ -315,9 +315,14 @@ Keeps the main clank skill uncluttered.
    replies via GraphQL `addPullRequestReviewComment`, reactions
    work without leaking. Foundation validated; phases 2–6 cleared
    to proceed.
-2. **Local state + verbs**: `pr.json`/`master.md`/`reviews/*.md`,
-   `start`/`note`/`abort`, round bumping. Pure-tested parsers for
-   the verdict files.
+2. **Local state + verbs** — ✅ DONE. `clank_core::pr_review` (2a:
+   types + parsers + `pending_reviewers`, 8 pure tests) +
+   `cli::pr_review` (2b: `start`/`note`/`abort`/`status`, slug
+   parse, master-only role gate, single-active-PR inference; 7
+   in-process integration tests + a parse_slug unit test).
+   `/pr-reviews/` added to the canonical gitignore set. GitHub
+   pending-review creation deferred to phase 4 (review_id stays
+   null after `start`).
 3. **Wait surface + gate**: the projection, `WaitItem` variants,
    `work_for` routing, `compute_gate` over verdict files, milestone
    tiers. `clank status`/TUI `pr` gauge.

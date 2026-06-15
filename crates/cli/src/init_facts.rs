@@ -27,6 +27,7 @@ pub const CLANK_GITIGNORE_ENTRIES: &[&str] = &[
     "/feedback/",
     "/queue/",
     "/html/",
+    "/pr-reviews/",
     "/shelved/",
     "/worktrees/",
     "/zellij/",

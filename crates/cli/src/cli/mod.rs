@@ -26,6 +26,7 @@ pub mod log;
 pub mod open;
 pub mod open_zellij;
 pub mod plan_resolve;
+pub mod pr_review;
 pub mod purge;
 pub mod queue;
 pub mod rewire;
@@ -582,6 +583,64 @@ impl From<VerdictArg> for clank_core::Verdict {
             VerdictArg::RequestChanges => clank_core::Verdict::RequestChanges,
         }
     }
+}
+
+#[derive(Args, Debug)]
+pub struct PrReviewArgs {
+    #[command(subcommand)]
+    pub command: PrReviewCmd,
+    /// Repo root. Defaults to the cwd's git toplevel.
+    #[arg(long, value_name = "PATH")]
+    pub repo: Option<PathBuf>,
+}
+
+#[derive(clap::Subcommand, Debug)]
+pub enum PrReviewCmd {
+    /// Start reviewing a GitHub PR: pin its head sha and scaffold
+    /// `.clank/pr-reviews/<pr>/`.
+    Start(PrReviewStartArgs),
+    /// Record your reviewer verdict for the current round.
+    Note(PrReviewNoteArgs),
+    /// Discard a PR review's local scratch (master-only).
+    Abort(PrReviewAbortArgs),
+    /// Round + per-reviewer verdicts + who we're waiting on.
+    Status(PrReviewStatusArgs),
+}
+
+#[derive(Args, Debug)]
+pub struct PrReviewStartArgs {
+    /// PR number.
+    pub pr: u32,
+}
+
+#[derive(Args, Debug)]
+pub struct PrReviewNoteArgs {
+    /// Your verdict for the current round.
+    #[arg(long, value_enum)]
+    pub verdict: VerdictArg,
+    /// Review summary (like `git commit -m`).
+    #[arg(short = 'm', value_name = "MSG")]
+    pub message: String,
+    /// PR number. Defaults to the single active review.
+    #[arg(long)]
+    pub pr: Option<u32>,
+    /// Agent label. Defaults to the session-bound identity.
+    #[arg(long, value_name = "LABEL")]
+    pub author: Option<String>,
+}
+
+#[derive(Args, Debug)]
+pub struct PrReviewAbortArgs {
+    /// PR number. Defaults to the single active review.
+    #[arg(long)]
+    pub pr: Option<u32>,
+}
+
+#[derive(Args, Debug)]
+pub struct PrReviewStatusArgs {
+    /// PR number. Defaults to the single active review.
+    #[arg(long)]
+    pub pr: Option<u32>,
 }
 
 #[derive(Args, Debug)]
