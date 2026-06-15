@@ -34,10 +34,18 @@ per PR, which is a threaded draft workspace:
   clean published review. This is "post comments but don't submit
   … then submit the final review."
 
-Reviewer attribution is the `🤖<label>🤖` marker, NOT the GitHub
-author (all agents share one identity). The marker is load-bearing
-and is how master tells its own comments from reviewer replies when
-sweeping the draft clean.
+**Master vs reviewer is a STRUCTURAL distinction, not a text one**
+(ruthless e9d1bbb #3). Master posts **top-level** review comments;
+reviewers post **threaded replies** (`inReplyTo` set). The
+destructive "only master comments remain" sweep keys on that
+structure — delete all replies, keep top-level — never on scanning
+bodies. A body-text emoji must NOT be the load-bearing key for a
+destructive op against a live PR: a reviewer who omits the marker
+would evade deletion, and master quoting `🤖` in its own comment
+would self-delete. The `🤖<label>🤖` marker is retained for HUMAN
+attribution only (all agents share one GitHub author, so the
+marker is how a person reading the PR tells codex's reply from
+ruthless's).
 
 ## Why this shape (resolves the prior review)
 
@@ -124,16 +132,38 @@ clank pr-review note --verdict <request-changes|finished> -m "…"
                              #   themselves is done via gh api per
                              #   the skill — this records the
                              #   authoritative verdict.)
-clank pr-review submit       # gate must be converged; publish the
+clank pr-review submit       # MASTER-ONLY. Gate must be converged.
+                             #   Re-sweep replies, then publish the
                              #   pending review with master.md's
                              #   body. Tears down NOTHING.
-clank pr-review abort        # discard the pending review (delete
-                             #   review_id) + local scratch. No
-                             #   worktree teardown.
+clank pr-review abort        # MASTER-ONLY. Discard the pending
+                             #   review (delete review_id) + local
+                             #   scratch. No worktree teardown.
 clank pr-review status       # who we're waiting on (round +
                              #   per-reviewer verdict) — also folded
                              #   into clank status / TUI.
 ```
+
+`submit` and `abort` are role-gated to master (ruthless e9d1bbb
+minor a): a reviewer running `abort` would delete the team's
+shared pending review out from under everyone.
+
+### Submit is a destructive, racy op — guard it
+
+Convergence ("no reviewer replies remain") and the publish are NOT
+atomic against a reviewer reply landing in between (the round
+counter closes the stale-*approval* race but not this TOCTOU —
+ruthless e9d1bbb #2). A reply in that window would publish a
+half-baked thread onto a real PR. Guards, belt-and-suspenders for
+a user-visible destructive action:
+
+1. master freezes the round (a `submitting` flag in `pr.json`) so
+   reviewers hold off, then
+2. master RE-SWEEPS all replies (structural: delete every reply)
+   immediately before the publish call, then publishes.
+
+In the converged state reviewers are quiescent, so the window is
+narrow — but a live-PR publish earns the explicit guard.
 
 ## GitHub mechanics + the one sizing-time spike
 
@@ -144,15 +174,33 @@ clank pr-review status       # who we're waiting on (round +
 - Discard: `DELETE …/pulls/{n}/reviews/{review_id}`.
 - Master edits/deletes its own and reviewers' pending comments:
   same gh identity + write access, always permitted.
-- **SPIKE (verify on a scratch PR before building):** the exact
-  call that adds a reply to the *pending* review so it stays a
-  draft rather than publishing immediately — likely GraphQL
-  `addPullRequestReviewComment` with the pending `review_id` +
-  `inReplyTo`, since the plain REST reply endpoints tend to
-  publish on the spot. lloyd confirmed the GitHub UI supports
-  pending threaded replies + reactions; this spike pins the API
-  path that reproduces it. Lesson from this session: verify tool
-  capability against the live API before designing on it.
+- **SPIKE (verify on a scratch PR before building) — THREE
+  load-bearing unknowns, not one** (ruthless e9d1bbb #1). The
+  whole model is founded on unverified GitHub behavior; confirm
+  all three before writing code:
+  1. **Single-pending-review singleton.** When a second agent
+     `POST …/pulls/{n}/reviews` with no `event` while a pending
+     review already exists (same identity), does GitHub return the
+     SAME `review_id`, error, or create a SECOND draft? The
+     "one shared draft" model REQUIRES the singleton. If GitHub
+     permits multiple pending reviews per user, the model
+     collapses and needs a different coordination primitive — so
+     this is the make-or-break check.
+  2. **Replies stay draft until submit.** The exact call that adds
+     a reply to the pending review keeping it a draft (not
+     publishing on the spot) — likely GraphQL
+     `addPullRequestReviewComment` with the pending `review_id` +
+     `inReplyTo`; plain REST reply endpoints tend to publish
+     immediately.
+  3. **Reaction visibility on pending comments.** A 👍 / ✅ on a
+     draft comment may publish immediately even while the comment
+     is unsubmitted. If so, reactions CANNOT be the
+     lightweight-approve channel and approval is local-file-only.
+
+  lloyd confirmed the UI supports pending threaded replies +
+  reactions; the spike pins the API paths and the singleton
+  semantics. Lesson from this session: verify tool capability
+  against the live API before designing on it.
 
 ## Anchoring & PR advances
 
@@ -162,6 +210,12 @@ re-pinning: if `pull/<pr>/head` has moved past the pin, `note`/
 pin + bump round). GitHub validates a comment's line against the
 diff at post time, so a bad anchor fails in-loop when master adds
 it — no separate anchor-validation engine.
+
+If master submits anyway without re-pinning (ruthless e9d1bbb
+minor b), GitHub keeps the comments anchored to the old sha and
+renders them as OUTDATED — not an error, just stale-positioned.
+`submit` states this in its warning so master chooses with eyes
+open.
 
 ## Worktree & session model
 
@@ -186,7 +240,15 @@ teaches agents:
   pending replies / reactions for substance, record the
   authoritative verdict with `clank pr-review note`.
 - the marking convention and the "only master comments remain"
-  cleanup invariant.
+  cleanup invariant (structural: master = top-level, reviewers =
+  replies).
+- **EXACT `gh`/GraphQL incantations** for posting pending replies,
+  reactions, edits, and deletes (ruthless e9d1bbb minor c). Since
+  reviewers post the substance via raw `gh` while `clank pr-review
+  note` records the local verdict, the two can diverge if an agent
+  fat-fingers a gh call; verbatim incantations + the two-sided
+  convergence (local FINISHED AND no replies remain) keep them
+  reconciled.
 
 Keeps the main clank skill uncluttered.
 
@@ -216,4 +278,14 @@ the single shared draft workspace (all agents = one gh identity),
 local `.clank/pr-reviews/<pr>/` as the authoritative verdict +
 round-coordination layer, dedicated `clank-pr-review` skill. Both
 of codex's hidden-ref concerns (@8499cf3) are dissolved by the new
-model. Ready to implement after the phase-1 API spike.
+model.
+
+Redesign APPROVED by codex + ruthless @e9d1bbb. This revision
+folds in ruthless's hardening before implementation: the spike now
+covers all three load-bearing GitHub unknowns (singleton pending
+review, draft-reply path, reaction visibility); the destructive
+sweep is STRUCTURAL (delete replies, keep top-level) not
+text-marker-keyed; submit has a round-freeze + pre-publish
+re-sweep against the TOCTOU; submit/abort are master-only; the
+outdated-anchor submit behavior is stated; the skill must carry
+exact gh incantations. Ready to implement after the phase-1 spike.
