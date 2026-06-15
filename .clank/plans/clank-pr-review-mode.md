@@ -203,6 +203,44 @@ narrow — but a live-PR publish earns the explicit guard.
   semantics. Lesson from this session: verify tool capability
   against the live API before designing on it.
 
+### Spike findings — ALL CONFIRMED (2026-06-15, scratch PR)
+
+Ran against a private throwaway PR. The model holds; exact
+incantations (the plan promised to record these):
+
+1. **Singleton — HOLDS (foundation safe).** A second
+   `POST …/pulls/{n}/reviews` with no `event`, same user, returns
+   `422 "User can only have one pending review per pull request"`.
+   The shared-draft model is valid.
+2. **Draft replies — GraphQL only.** REST
+   `POST …/pulls/{n}/comments -F in_reply_to=…` FAILS with the same
+   422 (it tries to open its own pending review). The working path
+   is GraphQL `addPullRequestReviewComment(input:{
+   pullRequestReviewId:<review node_id>, inReplyTo:<comment
+   node_id>, body})` → reply lands in the existing pending review,
+   `state: PENDING`, threaded (`in_reply_to_id` set). Reviewers
+   need the review's + comment's NODE ids (REST responses carry
+   `node_id`).
+3. **Reactions — work and don't leak.**
+   `POST …/pulls/comments/{id}/reactions -f content=+1` succeeds on
+   a pending comment, is readable, and does NOT publish the comment
+   (it stays out of `GET …/pulls/{n}/comments`). So 👍 is a viable
+   lightweight-approve signal — though local files stay
+   authoritative.
+4. **Structural sweep + submit — clean.** Pending comments are
+   invisible in `GET …/pulls/{n}/comments` until submit (count 0
+   throughout iteration). Delete a reply:
+   `DELETE …/pulls/comments/{reply_id}`. Top-level vs reply is
+   `in_reply_to_id == null`. Submit:
+   `POST …/pulls/{n}/reviews/{review_id}/events -f event=COMMENT -f
+   body=…` → `state: COMMENTED`, only the surviving (master)
+   comments publish.
+
+Create-pending shape:
+`POST …/pulls/{n}/reviews -f commit_id=<sha>
+-f "comments[][path]=…" -F "comments[][line]=N"
+-f "comments[][side]=RIGHT" -f "comments[][body]=…"` (no `event`).
+
 ## Anchoring & PR advances
 
 Comments anchor to the pinned `head_sha`. Pin + warn, NO automatic
@@ -255,12 +293,11 @@ Keeps the main clank skill uncluttered.
 
 ## Implementation phases (suggested)
 
-1. **Spike**: on a scratch PR, confirm ALL THREE load-bearing
-   unknowns from the spike section — (a) the one-pending-review-
-   per-user singleton, (b) replies stay draft until submit, (c)
-   reaction visibility on pending comments — and record the exact
-   `gh`/GraphQL incantations. The singleton (a) is make-or-break;
-   do not proceed to phase 2 until it holds.
+1. **Spike** — ✅ DONE 2026-06-15. All three unknowns confirmed on
+   a scratch PR (see Spike findings): singleton holds, draft
+   replies via GraphQL `addPullRequestReviewComment`, reactions
+   work without leaking. Foundation validated; phases 2–6 cleared
+   to proceed.
 2. **Local state + verbs**: `pr.json`/`master.md`/`reviews/*.md`,
    `start`/`note`/`abort`, round bumping. Pure-tested parsers for
    the verdict files.
