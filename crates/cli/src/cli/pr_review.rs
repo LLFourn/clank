@@ -261,10 +261,16 @@ pub mod gh {
     }
 
     pub(super) fn resolve_argv(slug: &str, pr: u32) -> Vec<String> {
+        // `--paginate` alone emits one JSON document PER PAGE
+        // (concatenated), which a single-array parse can't read on a
+        // multi-page PR (codex dcd25f3). `--slurp` merges the pages
+        // into one array-of-pages, which `parse_pending_review`
+        // flattens.
         vec![
             "api".into(),
             format!("repos/{slug}/pulls/{pr}/reviews"),
             "--paginate".into(),
+            "--slurp".into(),
         ]
     }
 
@@ -290,26 +296,33 @@ pub mod gh {
         ]
     }
 
-    /// The PENDING review from a `GET …/reviews` array. The
-    /// singleton guarantees at most one; first PENDING wins.
+    /// The PENDING review from a `gh api --paginate --slurp`
+    /// response: an array of PAGES, each page an array of review
+    /// objects. Flattened across pages; the singleton guarantees at
+    /// most one PENDING, so the first wins.
     pub(super) fn parse_pending_review(json: &str) -> anyhow::Result<Option<PendingReview>> {
-        let reviews: serde_json::Value =
-            serde_json::from_str(json).context("parsing reviews list")?;
-        let Some(arr) = reviews.as_array() else {
-            anyhow::bail!("reviews response is not an array");
+        let pages: serde_json::Value =
+            serde_json::from_str(json).context("parsing slurped reviews response")?;
+        let Some(pages) = pages.as_array() else {
+            anyhow::bail!("slurped reviews response is not an array of pages");
         };
-        for r in arr {
-            if r.get("state").and_then(|s| s.as_str()) == Some("PENDING") {
-                let id = r
-                    .get("id")
-                    .and_then(|v| v.as_u64())
-                    .context("pending review missing numeric id")?;
-                let node_id = r
-                    .get("node_id")
-                    .and_then(|v| v.as_str())
-                    .context("pending review missing node_id")?
-                    .to_string();
-                return Ok(Some(PendingReview { id, node_id }));
+        for page in pages {
+            let Some(reviews) = page.as_array() else {
+                anyhow::bail!("a reviews page is not an array");
+            };
+            for r in reviews {
+                if r.get("state").and_then(|s| s.as_str()) == Some("PENDING") {
+                    let id = r
+                        .get("id")
+                        .and_then(|v| v.as_u64())
+                        .context("pending review missing numeric id")?;
+                    let node_id = r
+                        .get("node_id")
+                        .and_then(|v| v.as_str())
+                        .context("pending review missing node_id")?
+                        .to_string();
+                    return Ok(Some(PendingReview { id, node_id }));
+                }
             }
         }
         Ok(None)
@@ -501,7 +514,7 @@ mod tests {
     fn gh_argv_shapes() {
         assert_eq!(
             gh::resolve_argv("o/r", 7),
-            vec!["api", "repos/o/r/pulls/7/reviews", "--paginate"]
+            vec!["api", "repos/o/r/pulls/7/reviews", "--paginate", "--slurp"]
         );
         assert_eq!(
             gh::submit_argv("o/r", 7, 42, "summary body"),
@@ -524,27 +537,42 @@ mod tests {
 
     #[test]
     fn parse_pending_review_finds_the_singleton() {
-        // A mix of submitted + pending: only the PENDING one returns.
-        let json = r#"[
+        // Slurped shape: array of PAGES. A mix of submitted + pending
+        // within one page: only the PENDING one returns.
+        let json = r#"[[
             {"id": 1, "node_id": "PRR_a", "state": "COMMENTED"},
             {"id": 2, "node_id": "PRR_b", "state": "PENDING"}
-        ]"#;
+        ]]"#;
         let pr = gh::parse_pending_review(json).unwrap().unwrap();
         assert_eq!(pr.id, 2);
         assert_eq!(pr.node_id, "PRR_b");
     }
 
     #[test]
+    fn parse_pending_review_spans_pages() {
+        // codex dcd25f3: the PENDING review can be on a LATER page.
+        // --slurp gives an array of pages; the parser flattens.
+        let json = r#"[
+            [{"id": 1, "node_id": "PRR_a", "state": "COMMENTED"}],
+            [{"id": 2, "node_id": "PRR_b", "state": "PENDING"}]
+        ]"#;
+        let pr = gh::parse_pending_review(json).unwrap().unwrap();
+        assert_eq!(pr.id, 2);
+    }
+
+    #[test]
     fn parse_pending_review_none_when_no_pending() {
-        let json = r#"[{"id": 1, "node_id": "PRR_a", "state": "APPROVED"}]"#;
+        let json = r#"[[{"id": 1, "node_id": "PRR_a", "state": "APPROVED"}]]"#;
         assert_eq!(gh::parse_pending_review(json).unwrap(), None);
+        // No pages, or an empty page.
         assert_eq!(gh::parse_pending_review("[]").unwrap(), None);
+        assert_eq!(gh::parse_pending_review("[[]]").unwrap(), None);
     }
 
     #[test]
     fn parse_pending_review_rejects_malformed() {
         assert!(gh::parse_pending_review("{not an array}").is_err());
         // A PENDING entry missing its ids is an error, not a silent skip.
-        assert!(gh::parse_pending_review(r#"[{"state":"PENDING"}]"#).is_err());
+        assert!(gh::parse_pending_review(r#"[[{"state":"PENDING"}]]"#).is_err());
     }
 }
