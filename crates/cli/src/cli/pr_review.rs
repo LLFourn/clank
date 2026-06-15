@@ -284,7 +284,7 @@ pub fn submit_with(
 ) -> anyhow::Result<()> {
     require_master(repo, home, caller, "submit")?;
     let pr = resolve_pr(repo, pr)?;
-    let mut state = load_state(repo, pr)?;
+    let state = load_state(repo, pr)?;
 
     // Convergence gate — fail closed on team-resolution failure,
     // and compute exactly as the wait surface does (current-round
@@ -313,11 +313,16 @@ pub fn submit_with(
         pr_dir(repo, pr).join("master.md"),
     )?)?;
 
-    // Freeze the round so reviewers hold off, then RE-SWEEP replies
-    // IMMEDIATELY before publishing — closes the TOCTOU where a
-    // reply lands between the convergence check and the publish.
-    state.submitting = true;
-    save_state(repo, pr, &state)?;
+    // RE-SWEEP reviewer replies IMMEDIATELY before publishing: this
+    // is the guard against a reply landing after the convergence
+    // check (ruthless e9d1bbb #2). It is best-effort, not atomic —
+    // GitHub offers no transaction across sweep + submit, and a
+    // reviewer's raw `gh` can't be intercepted — so a reply in the
+    // sub-second sweep→submit gap could still publish. Keeping the
+    // two calls adjacent with nothing between them is the honest
+    // minimum; there is no stronger guarantee available. (An earlier
+    // `submitting` flag claimed a freeze it couldn't enforce against
+    // raw gh, so it was removed rather than left as a false model.)
     let swept = gh::sweep_replies(&state.repo, pr)?;
     gh::submit_review(&state.repo, pr, &body)?;
     if swept > 0 {

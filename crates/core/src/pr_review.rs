@@ -32,9 +32,6 @@ pub struct PrReviewState {
     /// reviewed so a post-approval edit reopens the gate.
     #[serde(default)]
     pub round: u64,
-    /// TOCTOU freeze during submit: reviewers hold off while true.
-    #[serde(default)]
-    pub submitting: bool,
 }
 
 impl PrReviewState {
@@ -45,7 +42,6 @@ impl PrReviewState {
             number,
             head_sha: head_sha.into(),
             round: 0,
-            submitting: false,
         }
     }
 }
@@ -213,20 +209,17 @@ mod tests {
     fn state_round_trips_through_json() {
         let mut s = PrReviewState::new("owner/repo", 123, "deadbeef");
         s.round = 4;
-        s.submitting = true;
         let json = serde_json::to_string(&s).unwrap();
         let back: PrReviewState = serde_json::from_str(&json).unwrap();
         assert_eq!(s, back);
     }
 
     #[test]
-    fn state_tolerates_missing_optionals() {
-        // A pr.json written by `start` (round 0, not submitting):
-        // the round/submitting fields default when absent.
+    fn state_tolerates_missing_round() {
+        // A pr.json written by `start`: round defaults when absent.
         let json = r#"{"repo":"o/r","number":7,"head_sha":"abc"}"#;
         let s: PrReviewState = serde_json::from_str(json).unwrap();
         assert_eq!(s.round, 0);
-        assert!(!s.submitting);
     }
 
     #[test]

@@ -68,8 +68,7 @@ is structurally uncommittable onto the PR branch.
 
 ```
 <pr-worktree>/.clank/pr-reviews/<pr>/        (gitignored)
-  pr.json        { repo, number, head_sha (pinned), round,
-                   submitting }
+  pr.json        { repo, number, head_sha (pinned), round }
   master.md      master's running summary · general concerns ·
                  the draft body for the final submit
   reviews/
@@ -77,8 +76,7 @@ is structurally uncommittable onto the PR branch.
     ruthless.md
 ```
 
-`round` is master's current revision counter (see Rounds);
-`submitting` is the TOCTOU freeze flag (see Submit).
+`round` is master's current revision counter (see Rounds).
 
 The pending review's id is **resolved on demand, not stored** —
 see the phase-4 refinement under GitHub mechanics. The
@@ -184,17 +182,22 @@ shared pending review out from under everyone.
 Convergence ("no reviewer replies remain") and the publish are NOT
 atomic against a reviewer reply landing in between (the round
 counter closes the stale-*approval* race but not this TOCTOU —
-ruthless e9d1bbb #2). A reply in that window would publish a
-half-baked thread onto a real PR. Guards, belt-and-suspenders for
-a user-visible destructive action:
+ruthless e9d1bbb #2). The guard is: master RE-SWEEPS all replies
+(structural: delete every comment with `in_reply_to_id` set)
+IMMEDIATELY before the publish call, with nothing between the two
+gh calls.
 
-1. master freezes the round (a `submitting` flag in `pr.json`) so
-   reviewers hold off, then
-2. master RE-SWEEPS all replies (structural: delete every reply)
-   immediately before the publish call, then publishes.
-
-In the converged state reviewers are quiescent, so the window is
-narrow — but a live-PR publish earns the explicit guard.
+This is best-effort, not a hard freeze — and deliberately so. An
+earlier `submitting` flag in `pr.json` *claimed* a freeze, but a
+synchronous single-master submit can't enforce one against a
+reviewer's RAW `gh` (clank can't intercept it), so the flag was
+unobserved dead state and was removed (codex 803a90b: a freeze
+that isn't enforced is a false model). GitHub offers no
+transaction across sweep+submit, so a reply in the sub-second
+sweep→submit gap could still publish; keeping the two calls
+adjacent is the honest minimum and there is no stronger guarantee
+available. In the converged state reviewers are quiescent, so the
+window is vanishingly narrow.
 
 **Reactions at submit** (ruthless da957d7 note 2): the structural
 sweep deletes replies, not reactions, so a reviewer 👍 on a master
@@ -416,15 +419,15 @@ Keeps the main clank skill uncluttered.
    convergence gate (fail-closed team resolve → current-round
    verdicts through `compute_gate(..., false)` must be Finished),
    `extract_submit_body` from master.md's `## Submit body`
-   (refuses empty/placeholder), then the TOCTOU-safe sequence —
-   set `submitting`, RE-SWEEP reviewer replies
+   (refuses empty/placeholder), then RE-SWEEP reviewer replies
    (`gh::sweep_replies`, structural: delete `in_reply_to_id`-set
-   comments) IMMEDIATELY before `gh::submit_review`, then remove
-   the local scratch (the published review is the durable record,
-   and leaving it would re-surface as submit-again on the wait
-   surface). Tests: extract_submit_body matrix, structural
-   parse_reply_ids (marker-agnostic), submit master-only +
-   not-converged refusal before any gh call.
+   comments) IMMEDIATELY before `gh::submit_review` — best-effort
+   guard, no false freeze flag (see "Submit is a destructive,
+   racy op"). Then remove the local scratch (the published review
+   is the durable record; leaving it would re-surface as
+   submit-again on the wait surface). Tests: extract_submit_body
+   matrix, structural parse_reply_ids (marker-agnostic), submit
+   master-only + not-converged refusal before any gh call.
 
 Phases 2–3 are pure/local and fully testable in-process; phase 4
 is the gh-shelling layer (pure argv/parse tested; the spawn is a
@@ -445,7 +448,8 @@ folds in ruthless's hardening before implementation: the spike now
 covers all three load-bearing GitHub unknowns (singleton pending
 review, draft-reply path, reaction visibility); the destructive
 sweep is STRUCTURAL (delete replies, keep top-level) not
-text-marker-keyed; submit has a round-freeze + pre-publish
-re-sweep against the TOCTOU; submit/abort are master-only; the
+text-marker-keyed; submit re-sweeps immediately before publish as
+the TOCTOU guard (the unenforceable freeze flag was dropped at
+impl — codex 803a90b); submit/abort are master-only; the
 outdated-anchor submit behavior is stated; the skill must carry
 exact gh incantations. Ready to implement after the phase-1 spike.
