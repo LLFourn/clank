@@ -170,6 +170,10 @@ pub async fn run(args: PrReviewArgs) -> anyhow::Result<()> {
             abort_with(&repo, home.as_deref(), &caller, a.pr)?;
             Ok(())
         }
+        PrReviewCmd::Submit(a) => {
+            let caller = crate::agent_env::resolve_identity_from_env(&repo)?;
+            submit_with(&repo, home.as_deref(), &caller, a.pr)
+        }
         PrReviewCmd::Status(a) => {
             print!("{}", status_with(&repo, home.as_deref(), a.pr)?);
             Ok(())
@@ -243,6 +247,94 @@ pub fn abort_with(
     Ok(())
 }
 
+/// The text posted as the published review's summary: the content
+/// under the `## Submit body` heading of `master.md`, to the next
+/// `## ` heading or EOF. Errors if missing or still empty/the
+/// placeholder — clank won't publish a blank or template summary.
+fn extract_submit_body(master_md: &str) -> anyhow::Result<String> {
+    let mut lines = master_md.lines();
+    let found = lines.by_ref().any(|l| l.trim() == "## Submit body");
+    if !found {
+        anyhow::bail!("master.md has no `## Submit body` section to publish");
+    }
+    let body: String = lines
+        .take_while(|l| !l.trim_start().starts_with("## "))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let body = body.trim();
+    if body.is_empty() || body.starts_with('<') {
+        anyhow::bail!(
+            "master.md `## Submit body` is empty or still the placeholder; \
+             write the review summary before submitting"
+        );
+    }
+    Ok(body.to_string())
+}
+
+/// Publish the converged review to the PR. MASTER-ONLY. Gate must
+/// be FINISHED; then freeze the round, re-sweep reviewer replies
+/// (so only master's top-level comments publish), and submit with
+/// master.md's summary body. On success the local scratch is
+/// removed (the published review is the durable record).
+pub fn submit_with(
+    repo: &Path,
+    home: Option<&Path>,
+    caller: &AgentLabel,
+    pr: Option<u32>,
+) -> anyhow::Result<()> {
+    require_master(repo, home, caller, "submit")?;
+    let pr = resolve_pr(repo, pr)?;
+    let mut state = load_state(repo, pr)?;
+
+    // Convergence gate — fail closed on team-resolution failure,
+    // and compute exactly as the wait surface does (current-round
+    // verdicts through compute_gate with latest_touched_plan=false).
+    let (commit_reviewers, gate_reviewers) =
+        crate::agent_store::load_reviewer_tiers_with(repo, home)?;
+    let verdicts = load_verdicts(repo, pr)?;
+    let current: Vec<clank_core::wait::ReviewEntry> = verdicts
+        .iter()
+        .filter(|(_, v)| v.reviewed_round == state.round)
+        .map(|(author, v)| clank_core::wait::ReviewEntry {
+            author: author.clone(),
+            verdict: v.verdict,
+        })
+        .collect();
+    let gate = clank_core::wait::compute_gate(&current, &commit_reviewers, &gate_reviewers, false);
+    if gate != clank_core::vocab::CommitGateState::Finished {
+        anyhow::bail!(
+            "not converged (gate: {}); run `clank pr-review status` — all reviewers must be FINISHED for round {}",
+            gate.as_str(),
+            state.round
+        );
+    }
+
+    let body = extract_submit_body(&std::fs::read_to_string(
+        pr_dir(repo, pr).join("master.md"),
+    )?)?;
+
+    // Freeze the round so reviewers hold off, then RE-SWEEP replies
+    // IMMEDIATELY before publishing — closes the TOCTOU where a
+    // reply lands between the convergence check and the publish.
+    state.submitting = true;
+    save_state(repo, pr, &state)?;
+    let swept = gh::sweep_replies(&state.repo, pr)?;
+    gh::submit_review(&state.repo, pr, &body)?;
+    if swept > 0 {
+        eprintln!(
+            "swept {swept} reviewer repl{} before publishing",
+            if swept == 1 { "y" } else { "ies" }
+        );
+    }
+
+    // Published — the review on GitHub is the durable record; drop
+    // the local scratch so the wait surface stops surfacing it.
+    std::fs::remove_dir_all(pr_dir(repo, pr))
+        .with_context(|| format!("removing PR #{pr} review scratch after publish"))?;
+    println!("published review for PR #{pr}");
+    Ok(())
+}
+
 /// The pending-review LIFECYCLE on GitHub: resolve / submit /
 /// discard. clank owns only these — comment substance is agents'
 /// raw `gh` per the skill. The id is resolved per-call from the
@@ -294,6 +386,53 @@ pub mod gh {
             "DELETE".into(),
             format!("repos/{slug}/pulls/{pr}/reviews/{review_id}"),
         ]
+    }
+
+    pub(super) fn review_comments_argv(slug: &str, pr: u32, review_id: u64) -> Vec<String> {
+        vec![
+            "api".into(),
+            format!("repos/{slug}/pulls/{pr}/reviews/{review_id}/comments"),
+            "--paginate".into(),
+            "--slurp".into(),
+        ]
+    }
+
+    pub(super) fn delete_comment_argv(slug: &str, comment_id: u64) -> Vec<String> {
+        vec![
+            "api".into(),
+            "--method".into(),
+            "DELETE".into(),
+            format!("repos/{slug}/pulls/comments/{comment_id}"),
+        ]
+    }
+
+    /// Numeric ids of the THREADED REPLIES (reviewer comments) in a
+    /// slurped `…/reviews/{id}/comments` response: those with a
+    /// non-null `in_reply_to_id`. Top-level (master) comments have
+    /// `in_reply_to_id` absent/null and are kept. STRUCTURAL — never
+    /// keys on body text (the marker is human-attribution only).
+    pub(super) fn parse_reply_ids(json: &str) -> anyhow::Result<Vec<u64>> {
+        let pages: serde_json::Value =
+            serde_json::from_str(json).context("parsing slurped review comments")?;
+        let Some(pages) = pages.as_array() else {
+            anyhow::bail!("slurped review comments is not an array of pages");
+        };
+        let mut ids = Vec::new();
+        for page in pages {
+            let Some(comments) = page.as_array() else {
+                anyhow::bail!("a comments page is not an array");
+            };
+            for c in comments {
+                if c.get("in_reply_to_id").is_some_and(|v| !v.is_null()) {
+                    let id = c
+                        .get("id")
+                        .and_then(|v| v.as_u64())
+                        .context("reply comment missing numeric id")?;
+                    ids.push(id);
+                }
+            }
+        }
+        Ok(ids)
     }
 
     /// The PENDING review from a `gh api --paginate --slurp`
@@ -361,6 +500,22 @@ pub mod gh {
             run_gh(&discard_argv(slug, pr, review.id)).map(|_| ())?;
         }
         Ok(())
+    }
+
+    /// Delete every threaded reply (reviewer comment) from the
+    /// pending review, leaving only master's top-level comments.
+    /// Returns the count deleted. Run IMMEDIATELY before submit so a
+    /// reply landing during convergence can't publish onto the PR
+    /// (the submit TOCTOU guard).
+    pub fn sweep_replies(slug: &str, pr: u32) -> anyhow::Result<usize> {
+        let Some(review) = resolve_pending_review(slug, pr)? else {
+            return Ok(0);
+        };
+        let ids = parse_reply_ids(&run_gh(&review_comments_argv(slug, pr, review.id))?)?;
+        for id in &ids {
+            run_gh(&delete_comment_argv(slug, *id))?;
+        }
+        Ok(ids.len())
     }
 }
 
@@ -574,5 +729,54 @@ mod tests {
         assert!(gh::parse_pending_review("{not an array}").is_err());
         // A PENDING entry missing its ids is an error, not a silent skip.
         assert!(gh::parse_pending_review(r#"[[{"state":"PENDING"}]]"#).is_err());
+    }
+
+    #[test]
+    fn parse_reply_ids_is_structural_not_marker_keyed() {
+        // Replies (in_reply_to_id set) are swept; top-level (master)
+        // comments are kept — regardless of body text / 🤖 marker.
+        let json = r#"[[
+            {"id": 1, "in_reply_to_id": null, "body": "master top-level"},
+            {"id": 2, "in_reply_to_id": 1, "body": "🤖codex🤖 reply"},
+            {"id": 3, "in_reply_to_id": 1, "body": "reply WITHOUT a marker"},
+            {"id": 4, "body": "master top-level, no in_reply_to_id key"}
+        ]]"#;
+        let mut ids = gh::parse_reply_ids(json).unwrap();
+        ids.sort_unstable();
+        // 2 and 3 are replies (incl. the unmarked one); 1 and 4 are top-level.
+        assert_eq!(ids, vec![2, 3]);
+    }
+
+    #[test]
+    fn gh_sweep_argv_shapes() {
+        assert_eq!(
+            gh::review_comments_argv("o/r", 7, 42),
+            vec![
+                "api",
+                "repos/o/r/pulls/7/reviews/42/comments",
+                "--paginate",
+                "--slurp"
+            ]
+        );
+        assert_eq!(
+            gh::delete_comment_argv("o/r", 99),
+            vec!["api", "--method", "DELETE", "repos/o/r/pulls/comments/99"]
+        );
+    }
+
+    #[test]
+    fn extract_submit_body_matrix() {
+        let ok = "# notes\n\n## Submit body\nShip it: the refactor is clean.\n";
+        assert_eq!(
+            extract_submit_body(ok).unwrap(),
+            "Ship it: the refactor is clean."
+        );
+        // Stops at the next ## heading.
+        let multi = "## Submit body\nthe summary\n\n## Other\nignored\n";
+        assert_eq!(extract_submit_body(multi).unwrap(), "the summary");
+        // Missing section, empty, and the unfilled placeholder all error.
+        assert!(extract_submit_body("# notes\nno section").is_err());
+        assert!(extract_submit_body("## Submit body\n\n").is_err());
+        assert!(extract_submit_body("## Submit body\n<the text…>\n").is_err());
     }
 }

@@ -412,8 +412,19 @@ Keeps the main clank skill uncluttered.
    rejects that pairing, a footgun the cleanup pass surfaced).
    Content-guard test pins the verbs + incantations + the
    slurp/jq guard.
-6. **`submit`**: convergence check (gate Finished + structural
-   re-sweep) → resolve review id → publish with master.md body.
+6. **`submit`** — ✅ DONE. `clank pr-review submit` (master-only):
+   convergence gate (fail-closed team resolve → current-round
+   verdicts through `compute_gate(..., false)` must be Finished),
+   `extract_submit_body` from master.md's `## Submit body`
+   (refuses empty/placeholder), then the TOCTOU-safe sequence —
+   set `submitting`, RE-SWEEP reviewer replies
+   (`gh::sweep_replies`, structural: delete `in_reply_to_id`-set
+   comments) IMMEDIATELY before `gh::submit_review`, then remove
+   the local scratch (the published review is the durable record,
+   and leaving it would re-surface as submit-again on the wait
+   surface). Tests: extract_submit_body matrix, structural
+   parse_reply_ids (marker-agnostic), submit master-only +
+   not-converged refusal before any gh call.
 
 Phases 2–3 are pure/local and fully testable in-process; phase 4
 is the gh-shelling layer (pure argv/parse tested; the spawn is a

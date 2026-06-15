@@ -603,8 +603,17 @@ pub enum PrReviewCmd {
     Note(PrReviewNoteArgs),
     /// Discard a PR review's local scratch (master-only).
     Abort(PrReviewAbortArgs),
+    /// Publish the converged review to the PR (master-only).
+    Submit(PrReviewSubmitArgs),
     /// Round + per-reviewer verdicts + who we're waiting on.
     Status(PrReviewStatusArgs),
+}
+
+#[derive(Args, Debug)]
+pub struct PrReviewSubmitArgs {
+    /// PR number. Defaults to the single active review.
+    #[arg(long)]
+    pub pr: Option<u32>,
 }
 
 #[derive(Args, Debug)]

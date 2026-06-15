@@ -248,6 +248,39 @@ fn pr_review_inputs_drop_stale_round_verdicts() {
 }
 
 #[test]
+fn submit_is_master_only_and_refuses_until_converged() {
+    use clank::cli::pr_review::submit_with;
+    let (env, _) = env_with_pr(123);
+    let repo = env.repo();
+    start_with(repo, "o/r", 123, None).unwrap();
+
+    // Reviewer cannot submit.
+    let err = submit_with(repo, Some(env.home()), &label("codex"), Some(123))
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("master-only"), "got: {err}");
+
+    // Master, but not converged (no verdicts) → refuses BEFORE any
+    // gh call (fails the gate check).
+    let err = submit_with(repo, Some(env.home()), &label("claude"), Some(123))
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("not converged"), "got: {err}");
+
+    // Even one tier finished isn't enough (ruthless still owes).
+    note_with(repo, &label("codex"), Some(123), Verdict::Finished, "ok").unwrap();
+    let err = submit_with(repo, Some(env.home()), &label("claude"), Some(123))
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("not converged"),
+        "commit-only finished still blocks: {err}"
+    );
+    // The scratch is untouched by a refused submit.
+    assert!(repo.join(".clank/pr-reviews/123").exists());
+}
+
+#[test]
 fn status_fails_closed_without_a_team() {
     // codex da7ab89: a missing/misconfigured team must NOT make
     // status print "converged" off an empty reviewer set. Start a
