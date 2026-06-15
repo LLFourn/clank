@@ -68,8 +68,9 @@ is structurally uncommittable onto the PR branch.
 
 ```
 <pr-worktree>/.clank/pr-reviews/<pr>/        (gitignored)
-  pr.json        { repo, number, head_sha (pinned), review_id,
-                   round }
+  pr.json        { repo, number, head_sha (pinned),
+                   review_id (numeric), review_node_id (GraphQL),
+                   round, submitting }
   master.md      master's running summary · general concerns ·
                  the draft body for the final submit
   reviews/
@@ -77,8 +78,17 @@ is structurally uncommittable onto the PR branch.
     ruthless.md
 ```
 
-`review_id` is the GitHub id of the team's single pending review.
-`round` is master's current revision counter — see Rounds.
+`round` is master's current revision counter (see Rounds);
+`submitting` is the TOCTOU freeze flag (see Submit).
+
+**Store BOTH id forms — they live in different namespaces**
+(ruthless da957d7 note 1, a footgun the spike surfaced): GraphQL
+reply creation needs NODE ids (`review_node_id` + the target
+comment's `node_id`); REST submit (`…/reviews/{review_id}/events`)
+and REST delete (`…/pulls/comments/{reply_id}`) take NUMERIC ids.
+The verb/I-O layer is explicit about which form each call wants;
+passing a node id where a numeric id is expected (or vice versa)
+is the classic GitHub-API mistake this design would otherwise hit.
 
 ## Rounds (the freeze/staleness mechanism, as an integer)
 
@@ -165,6 +175,13 @@ a user-visible destructive action:
 
 In the converged state reviewers are quiescent, so the window is
 narrow — but a live-PR publish earns the explicit guard.
+
+**Reactions at submit** (ruthless da957d7 note 2): the structural
+sweep deletes replies, not reactions, so a reviewer 👍 on a master
+comment would publish as a self-reaction (shared identity).
+Decision: ACCEPT it — cosmetic, and it's the team's own account
+reacting to its own comment. Submit does not clear reactions;
+revisit only if it ever reads as noise.
 
 ## GitHub mechanics + the one sizing-time spike
 
