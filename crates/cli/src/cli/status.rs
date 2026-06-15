@@ -357,7 +357,7 @@ impl StatusSnapshot {
             );
         }
 
-        if self.plans.is_empty() && self.last_finished.is_none() {
+        if self.plans.is_empty() && self.last_finished.is_none() && self.pr_reviews.is_empty() {
             let _ = writeln!(out);
             let _ = writeln!(out, "no active plan, nothing pending");
         }

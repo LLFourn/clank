@@ -275,6 +275,13 @@ fn bar(snap: &StatusSnapshot, color: &str, cols: usize) -> String {
 /// names WHO must act; `idle` only when nothing and nobody waits.
 fn bar_text(snap: &StatusSnapshot) -> (String, String) {
     match snap.plans.as_slice() {
+        // An active PR review is in-flight work — never idle. Plans
+        // take precedence (handled below); among the plan-less
+        // states, PR review beats a queue promote.
+        [] if !snap.pr_reviews.is_empty() => match snap.pr_reviews.as_slice() {
+            [pr] => pr_bar_text(pr, snap.master.as_deref().unwrap_or("master")),
+            many => (format!("🔀 {} PR REVIEWS", many.len()), String::new()),
+        },
         [] if !snap.queue.is_empty() => {
             let master = snap.master.as_deref().unwrap_or("master").to_uppercase();
             let right = if snap.queue.len() > 1 {
@@ -298,6 +305,34 @@ fn bar_text(snap: &StatusSnapshot) -> (String, String) {
     }
 }
 
+/// PR-review signal-lamp text: `{emoji} {ACTOR} {verb}` + `pr #n`,
+/// mirroring the plan bar. Reviewers' turn when any tier member
+/// still owes a verdict; otherwise master's turn, by gate.
+fn pr_bar_text(pr: &clank_core::wait::PrReviewWorkState, master: &str) -> (String, String) {
+    use clank_core::vocab::CommitGateState;
+    let right = format!("pr #{}", pr.pr);
+    let (emoji, actor, verb) = if let Some(reviewer) = pr.missing_reviewers.first() {
+        let emoji = match pr.gate {
+            CommitGateState::ApprovedPendingGate => "🔍",
+            _ => "👀",
+        };
+        (emoji, reviewer.as_str().to_string(), "reviewing")
+    } else {
+        let verb = match pr.gate {
+            CommitGateState::Finished => "submitting",
+            CommitGateState::ChangesRequested => "integrating",
+            _ => "refining",
+        };
+        let emoji = if pr.gate == CommitGateState::Finished {
+            "🏁"
+        } else {
+            "🔨"
+        };
+        (emoji, master.to_string(), verb)
+    };
+    (format!("{emoji} {} {verb}", actor.to_uppercase()), right)
+}
+
 /// The frame's one hue: red = a human must act (blocked), yellow
 /// = reviewers, green = master working, cyan = promote, dim idle.
 fn state_color(snap: &StatusSnapshot) -> &'static str {
@@ -310,6 +345,19 @@ fn state_color(snap: &StatusSnapshot) -> &'static str {
         return "31"; // red
     }
     match snap.plans.as_slice() {
+        // PR review (no plans): yellow when reviewers owe a verdict,
+        // green when it's master's turn — never dim idle.
+        [] if !snap.pr_reviews.is_empty() => {
+            if snap
+                .pr_reviews
+                .iter()
+                .any(|p| !p.missing_reviewers.is_empty())
+            {
+                "33" // yellow: reviewers
+            } else {
+                "32" // green: master
+            }
+        }
         [] if !snap.queue.is_empty() => "36", // cyan: promote
         [] => "2",                            // dim: idle
         plans => {
@@ -625,6 +673,32 @@ pub(crate) mod tests {
             }
         }
         out
+    }
+
+    #[test]
+    fn active_pr_review_is_not_idle() {
+        // codex c04c324: a repo with an active PR review and no plans
+        // must NOT render idle, in the TUI bar OR `clank status`.
+        let mut s = snap(vec![], vec![]);
+        s.pr_reviews.push(clank_core::wait::PrReviewWorkState {
+            pr: 123,
+            round: 1,
+            gate: clank_core::vocab::CommitGateState::Unreviewed,
+            missing_reviewers: vec![AgentLabel::parse("codex").unwrap()],
+        });
+        let bar = visible(&render(&s, 1, 80)[0]);
+        assert!(
+            bar.contains("CODEX") && bar.contains("pr #123"),
+            "bar: {bar}"
+        );
+        assert!(!bar.contains("idle"), "bar: {bar}");
+
+        let human = s.to_human();
+        assert!(human.contains("pr #123"), "to_human: {human}");
+        assert!(
+            !human.contains("nothing pending"),
+            "to_human must not read idle: {human}"
+        );
     }
 
     #[test]
