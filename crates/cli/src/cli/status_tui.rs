@@ -71,6 +71,38 @@ fn label(name: &str) -> Span {
     dim(format!("{name:>5}  "))
 }
 
+/// The `dirty` gauge: `+12` green, `−3` red (GitHub convention),
+/// `· 2 untracked` dim. Mirrors `dirty_summary`'s zero-omission and
+/// all-zero `changes` fallback, but as separately-colored spans —
+/// the pre-joined summary string can't carry per-part color.
+fn dirty_spans(d: &super::status::DirtyStats) -> Vec<Span> {
+    let mut spans = vec![label("dirty")];
+    let mut wrote = false;
+    if d.insertions > 0 {
+        spans.push(Span(Style::Color("32"), format!("+{}", d.insertions)));
+        wrote = true;
+    }
+    if d.deletions > 0 {
+        if wrote {
+            spans.push(dim(" "));
+        }
+        spans.push(Span(Style::Color("31"), format!("−{}", d.deletions)));
+        wrote = true;
+    }
+    if d.untracked > 0 {
+        spans.push(dim(if wrote {
+            format!(" · {} untracked", d.untracked)
+        } else {
+            format!("{} untracked", d.untracked)
+        }));
+        wrote = true;
+    }
+    if !wrote {
+        spans.push(dim("changes"));
+    }
+    spans
+}
+
 // ── pure layout ─────────────────────────────────────────────
 
 /// Render the snapshot into at most `rows` lines, each at most
@@ -156,15 +188,16 @@ pub(crate) fn render(snap: &StatusSnapshot, rows: u16, cols: u16) -> Vec<String>
         body.push(vec![label("shelf"), plain(sv.stem.clone()), dim(note)]);
     }
 
-    // `git` — branch, head, dirty. Quietest gauge, dim throughout.
+    // `git` — branch + head, dim. When the worktree is dirty the
+    // stats get their OWN line below, with GitHub-colored counts
+    // (tui-dirty-line-color).
     {
         let branch = snap.branch.as_deref().unwrap_or("?");
         let head = snap.head_sha.as_deref().map(short_sha).unwrap_or("?");
-        let dirty = match &snap.dirty {
-            Some(d) => format!(" (dirty: {})", super::status::dirty_summary(d)),
-            None => String::new(),
-        };
-        body.push(vec![label("git"), dim(format!("{branch} {head}{dirty}"))]);
+        body.push(vec![label("git"), dim(format!("{branch} {head}"))]);
+    }
+    if let Some(d) = &snap.dirty {
+        body.push(dirty_spans(d));
     }
 
     // `done` — last finished, only when the repo is idle.
@@ -698,6 +731,77 @@ pub(crate) mod tests {
         assert!(
             !human.contains("nothing pending"),
             "to_human must not read idle: {human}"
+        );
+    }
+
+    #[test]
+    fn dirty_stats_get_their_own_github_colored_line() {
+        use crate::cli::status::DirtyStats;
+        let mut s = snap(vec![], vec![]);
+        s.dirty = Some(DirtyStats {
+            insertions: 160,
+            deletions: 45,
+            untracked: 2,
+        });
+        let lines = render(&s, 40, 80);
+
+        // The git line carries branch+head only — no dirty stats.
+        let git = lines
+            .iter()
+            .find(|l| visible(l).trim_start().starts_with("git"))
+            .unwrap();
+        assert!(!visible(git).contains("160"), "git line: {}", visible(git));
+
+        // A distinct `dirty` gauge line holds the stats.
+        let dirty = lines
+            .iter()
+            .find(|l| visible(l).starts_with("dirty"))
+            .expect("a dirty line");
+        assert_eq!(visible(dirty), "dirty  +160 −45 · 2 untracked");
+        // GitHub colors: green wraps the additions, red the deletions.
+        assert!(dirty.contains("\x1b[32m+160"), "green additions: {dirty:?}");
+        assert!(dirty.contains("\x1b[31m−45"), "red deletions: {dirty:?}");
+    }
+
+    #[test]
+    fn dirty_line_omits_zeros_and_falls_back_to_changes() {
+        use crate::cli::status::DirtyStats;
+        let mut s = snap(vec![], vec![]);
+
+        // Only insertions → no `−0`, no red.
+        s.dirty = Some(DirtyStats {
+            insertions: 3,
+            deletions: 0,
+            untracked: 0,
+        });
+        let dirty = render(&s, 40, 80)
+            .into_iter()
+            .find(|l| visible(l).starts_with("dirty"))
+            .unwrap();
+        assert_eq!(visible(&dirty), "dirty  +3");
+        assert!(!dirty.contains("\x1b[31m"), "no red without deletions");
+
+        // All-zero (e.g. mode-only change) → dim `changes`, no color.
+        s.dirty = Some(DirtyStats {
+            insertions: 0,
+            deletions: 0,
+            untracked: 0,
+        });
+        let dirty = render(&s, 40, 80)
+            .into_iter()
+            .find(|l| visible(l).starts_with("dirty"))
+            .unwrap();
+        assert_eq!(visible(&dirty), "dirty  changes");
+        assert!(!dirty.contains("\x1b[32m") && !dirty.contains("\x1b[31m"));
+    }
+
+    #[test]
+    fn clean_tree_emits_no_dirty_line() {
+        let s = snap(vec![], vec![]); // dirty: None
+        let lines = render(&s, 40, 80);
+        assert!(
+            !lines.iter().any(|l| visible(l).starts_with("dirty")),
+            "clean tree must not render a dirty line"
         );
     }
 
