@@ -8,7 +8,7 @@ use common::TestEnv;
 use std::path::Path;
 use std::process::Command;
 
-use clank::cli::pr_review::{abort_with, note_with, start_with, status_with};
+use clank::cli::pr_review::{abort_with, note_with, propose_with, start_with, status_with};
 use clank_core::ids::AgentLabel;
 use clank_core::pr_review::ReviewerVerdict;
 use clank_core::vocab::Verdict;
@@ -158,8 +158,19 @@ fn status_reports_pending_then_converged() {
     let repo = env.repo();
     start_with(repo, "o/r", 123, None).unwrap();
 
+    // Round 0: master drafting — no reviewers summoned yet.
     let s = status_with(repo, Some(env.home()), Some(123)).unwrap();
     assert!(s.contains("round 0"), "{s}");
+    assert!(s.contains("drafting"), "{s}");
+    assert!(
+        !s.contains("waiting on:"),
+        "no reviewers before propose: {s}"
+    );
+
+    // Master opens the review → reviewers summoned at round 1.
+    propose_with(repo, Some(env.home()), &label("claude"), Some(123)).unwrap();
+    let s = status_with(repo, Some(env.home()), Some(123)).unwrap();
+    assert!(s.contains("round 1"), "{s}");
     assert!(s.contains("waiting on:"), "{s}");
     assert!(s.contains("codex") && s.contains("ruthless"), "{s}");
 
@@ -190,6 +201,29 @@ fn abort_is_master_only() {
     assert!(
         !repo.join(".clank/pr-reviews/123").exists(),
         "master abort removed it"
+    );
+}
+
+#[test]
+fn propose_is_master_only_and_bumps_round() {
+    let (env, _) = env_with_pr(123);
+    let repo = env.repo();
+    start_with(repo, "o/r", 123, None).unwrap();
+
+    // A reviewer cannot open the review.
+    let err = propose_with(repo, Some(env.home()), &label("codex"), Some(123))
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("master-only"), "got: {err}");
+
+    // Master opens round 1, then re-opens round 2 after integrating.
+    assert_eq!(
+        propose_with(repo, Some(env.home()), &label("claude"), Some(123)).unwrap(),
+        1
+    );
+    assert_eq!(
+        propose_with(repo, Some(env.home()), &label("claude"), Some(123)).unwrap(),
+        2
     );
 }
 
@@ -230,13 +264,8 @@ fn pr_review_inputs_drop_stale_round_verdicts() {
     start_with(repo, "o/r", 123, None).unwrap();
     note_with(repo, &label("codex"), Some(123), Verdict::Finished, "ok").unwrap();
 
-    // Master revises → bump pr.json round to 1 (the round bump that
-    // `propose` will do in phase 4; simulated here by editing state).
-    let pr_json = repo.join(".clank/pr-reviews/123/pr.json");
-    let mut state: clank_core::pr_review::PrReviewState =
-        serde_json::from_str(&std::fs::read_to_string(&pr_json).unwrap()).unwrap();
-    state.round = 1;
-    std::fs::write(&pr_json, serde_json::to_string_pretty(&state).unwrap()).unwrap();
+    // Master revises → `propose` bumps the round to 1.
+    propose_with(repo, Some(env.home()), &label("claude"), Some(123)).unwrap();
 
     // codex's round-0 verdict is now STALE → not a current verdict.
     let inputs = clank::cli::pr_review::pr_review_inputs(repo);

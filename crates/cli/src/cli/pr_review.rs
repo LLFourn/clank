@@ -165,6 +165,12 @@ pub async fn run(args: PrReviewArgs) -> anyhow::Result<()> {
             println!("{}", path.display());
             Ok(())
         }
+        PrReviewCmd::Propose(a) => {
+            let caller = crate::agent_env::resolve_identity_from_env(&repo)?;
+            let round = propose_with(&repo, home.as_deref(), &caller, a.pr)?;
+            println!("opened review round {round} — reviewers summoned");
+            Ok(())
+        }
         PrReviewCmd::Abort(a) => {
             let caller = crate::agent_env::resolve_identity_from_env(&repo)?;
             abort_with(&repo, home.as_deref(), &caller, a.pr)?;
@@ -201,6 +207,29 @@ pub fn start_with(
     write_atomic(&dir.join("master.md"), MASTER_TEMPLATE.as_bytes())?;
     crate::init_facts::ensure_clank_gitignore_entry(repo, "/pr-reviews/")?;
     Ok(dir)
+}
+
+/// Open (or re-open) the review for the current draft by bumping
+/// the round — the explicit master handoff that summons reviewers.
+/// MASTER-ONLY. The first call (round 0 → 1) opens the initial
+/// review; later calls (after integrating a round's feedback)
+/// re-open at a fresh round so the prior round's approvals go stale
+/// and reviewers re-review. Master posts the GitHub draft comments
+/// first; clank can't (and shouldn't) verify the GitHub side, so
+/// this is master asserting "the draft is ready". Returns the new
+/// round.
+pub fn propose_with(
+    repo: &Path,
+    home: Option<&Path>,
+    caller: &AgentLabel,
+    pr: Option<u32>,
+) -> anyhow::Result<u64> {
+    require_master(repo, home, caller, "propose")?;
+    let pr = resolve_pr(repo, pr)?;
+    let mut state = load_state(repo, pr)?;
+    state.round += 1;
+    save_state(repo, pr, &state)?;
+    Ok(state.round)
 }
 
 /// Record a reviewer's verdict for the current round.
@@ -546,6 +575,21 @@ pub fn status_with(repo: &Path, home: Option<&Path>, pr: Option<u32>) -> anyhow:
         "pr #{} ({})  round {}",
         state.number, state.repo, state.round
     );
+    let _ = writeln!(
+        out,
+        "  {}",
+        crate::cli::status::pr_url(&state.repo, state.number)
+    );
+    // Round 0: the review isn't open yet — master drafts then
+    // `propose`. No reviewers are summoned, so don't report them as
+    // pending (that would contradict the wait surface).
+    if state.round == 0 {
+        let _ = writeln!(
+            out,
+            "  drafting — run `clank pr-review propose` to open for review"
+        );
+        return Ok(out);
+    }
     for label in &reviewers {
         let cell = match verdicts.iter().find(|(l, _)| l == label) {
             Some((_, v)) if v.is_current(state.round) => v.verdict.as_str().to_string(),
@@ -593,6 +637,7 @@ pub fn pr_review_inputs(repo: &Path) -> Vec<clank_core::wait::PrReviewInput> {
                 .collect();
             Some(clank_core::wait::PrReviewInput {
                 pr,
+                repo: state.repo,
                 round: state.round,
                 current_verdicts,
             })

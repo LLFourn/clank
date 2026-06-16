@@ -43,7 +43,7 @@ use clank_core::wait::PlanWorkState;
 // display width at the span level, and only then serialized to
 // ANSI.
 
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, PartialEq)]
 enum Style {
     Plain,
     Dim,
@@ -53,6 +53,12 @@ enum Style {
     /// Fixed ANSI color (the log tier's verdict ticks — green ✓ /
     /// cyan ✓✓ / red ✗; lloyd asked for the marks to pop).
     Color(&'static str),
+    /// An OSC 8 terminal hyperlink wrapping the visible text; the
+    /// String is the (dynamic) target URL — which is why `Style`
+    /// isn't `Copy`. `emit` owns the escape, so the width math
+    /// counts only the visible text, and the target stays the full
+    /// URL even when that text truncates on a narrow pane.
+    Link(String),
 }
 
 struct Span(Style, String);
@@ -194,6 +200,14 @@ pub(crate) fn render(snap: &StatusSnapshot, rows: u16, cols: u16) -> Vec<String>
             (None, _) => String::new(),
         };
         body.push(vec![label("shelf"), plain(sv.stem.clone()), dim(note)]);
+    }
+
+    // `pr` — active PR review(s): the full GitHub URL on its own
+    // line, a clickable OSC 8 hyperlink. The bar carries the
+    // actor/verb + `pr #n`; this is the addressable link.
+    for pr in &snap.pr_reviews {
+        let url = super::status::pr_url(&pr.repo, pr.pr);
+        body.push(vec![label("pr"), Span(Style::Link(url.clone()), url)]);
     }
 
     // `git` — branch + head, dim. When the worktree is dirty the
@@ -352,6 +366,11 @@ fn bar_text(snap: &StatusSnapshot) -> (String, String) {
 fn pr_bar_text(pr: &clank_core::wait::PrReviewWorkState, master: &str) -> (String, String) {
     use clank_core::vocab::CommitGateState;
     let right = format!("pr #{}", pr.pr);
+    // Round 0: the review isn't open yet — master is drafting the
+    // initial comments, then `propose` summons reviewers.
+    if pr.round == 0 {
+        return (format!("🔨 {} drafting", master.to_uppercase()), right);
+    }
     let (emoji, actor, verb) = if let Some(reviewer) = pr.missing_reviewers.first() {
         let emoji = match pr.gate {
             CommitGateState::ApprovedPendingGate => "🔍",
@@ -475,6 +494,8 @@ fn emit(spans: &[Span], color: &str, cols: usize) -> String {
             Style::Dim => out.push_str(&format!("\x1b[2m{piece}\x1b[0m")),
             Style::Accent => out.push_str(&format!("\x1b[{color}m{piece}\x1b[0m")),
             Style::Color(c) => out.push_str(&format!("\x1b[{c}m{piece}\x1b[0m")),
+            // OSC 8 hyperlink: ESC ] 8 ; ; <url> ST <text> ESC ] 8 ; ; ST
+            Style::Link(url) => out.push_str(&format!("\x1b]8;;{url}\x1b\\{piece}\x1b]8;;\x1b\\")),
         }
         if truncated_here {
             break;
@@ -698,19 +719,39 @@ pub(crate) mod tests {
     }
 
     /// `visible` without the trailing-pad trim — for asserting the
-    /// bar's exact padded width.
+    /// bar's exact padded width. Strips both CSI color sequences
+    /// (`ESC [ … m`) and OSC 8 hyperlinks (`ESC ] … ST`); the latter
+    /// matters because a URL like `github.com` contains an `m`, so
+    /// the CSI-only scan would stop mid-URL.
     fn visible_untrimmed(line: &str) -> String {
         let mut out = String::new();
-        let mut chars = line.chars();
+        let mut chars = line.chars().peekable();
         while let Some(c) = chars.next() {
-            if c == '\x1b' {
-                for e in chars.by_ref() {
-                    if e == 'm' {
-                        break;
+            if c != '\x1b' {
+                out.push(c);
+                continue;
+            }
+            match chars.peek() {
+                // OSC: ESC ] … terminated by ST (ESC \) or BEL.
+                Some(']') => {
+                    while let Some(e) = chars.next() {
+                        if e == '\x07' {
+                            break;
+                        }
+                        if e == '\x1b' {
+                            chars.next(); // consume the ST's `\`
+                            break;
+                        }
                     }
                 }
-            } else {
-                out.push(c);
+                // CSI: ESC [ … terminated by a final byte (here `m`).
+                _ => {
+                    for e in chars.by_ref() {
+                        if e == 'm' {
+                            break;
+                        }
+                    }
+                }
             }
         }
         out
@@ -723,6 +764,7 @@ pub(crate) mod tests {
         let mut s = snap(vec![], vec![]);
         s.pr_reviews.push(clank_core::wait::PrReviewWorkState {
             pr: 123,
+            repo: "o/r".into(),
             round: 1,
             gate: clank_core::vocab::CommitGateState::Unreviewed,
             missing_reviewers: vec![AgentLabel::parse("codex").unwrap()],
@@ -740,6 +782,59 @@ pub(crate) mod tests {
             !human.contains("nothing pending"),
             "to_human must not read idle: {human}"
         );
+    }
+
+    fn pr_work(round: u64, missing: &[&str]) -> clank_core::wait::PrReviewWorkState {
+        clank_core::wait::PrReviewWorkState {
+            pr: 5,
+            repo: "LLFourn/clank".into(),
+            round,
+            gate: clank_core::vocab::CommitGateState::Unreviewed,
+            missing_reviewers: missing
+                .iter()
+                .map(|l| AgentLabel::parse(l).unwrap())
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn pr_url_renders_as_a_clickable_link_line() {
+        let mut s = snap(vec![], vec![]);
+        s.pr_reviews.push(pr_work(1, &["codex"]));
+        let lines = render(&s, 40, 80);
+        let pr = lines
+            .iter()
+            .find(|l| visible(l).trim_start().starts_with("pr "))
+            .expect("a pr url line");
+        // Visible text is the bare URL (the `com`/`m` must NOT cut it
+        // short — visible() has to skip OSC 8).
+        assert_eq!(
+            visible(pr).trim_start(),
+            "pr  https://github.com/LLFourn/clank/pull/5"
+        );
+        // The OSC 8 hyperlink wraps it with the full URL as target.
+        assert!(
+            pr.contains("\x1b]8;;https://github.com/LLFourn/clank/pull/5\x1b\\"),
+            "OSC 8 link target: {pr:?}"
+        );
+    }
+
+    #[test]
+    fn round_zero_pr_bar_says_master_drafting_not_reviewing() {
+        // The reported bug: at round 0 the bar must show master
+        // drafting, NOT a reviewer "reviewing".
+        let mut s = snap(vec![], vec![]);
+        s.master = Some("claude".into());
+        s.pr_reviews.push(pr_work(0, &[]));
+        let bar = visible(&render(&s, 1, 80)[0]);
+        assert!(
+            bar.contains("CLAUDE") && bar.contains("drafting"),
+            "bar: {bar}"
+        );
+        assert!(!bar.contains("reviewing"), "bar: {bar}");
+        // And the text surface agrees.
+        let human = s.to_human();
+        assert!(human.contains("master drafting"), "to_human: {human}");
     }
 
     #[test]

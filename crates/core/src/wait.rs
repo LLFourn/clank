@@ -43,6 +43,12 @@ pub enum MasterNext {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PrMasterNext {
+    /// Round 0: the review isn't open yet. Master drafts the initial
+    /// top-level comments, then `clank pr-review propose` opens
+    /// round 1 and summons reviewers. The reviewable artifact (the
+    /// pending-review draft) is master's output, so master always
+    /// acts first — unlike a plan, whose commit exists before review.
+    Draft,
     /// A reviewer requested changes this round: integrate the
     /// feedback into the pending review, delete the reply, bump the
     /// round.
@@ -185,6 +191,8 @@ pub trait PlanStateLookup {
 #[derive(Debug, Clone)]
 pub struct PrReviewInput {
     pub pr: u32,
+    /// `owner/name` slug, for building the PR's GitHub URL.
+    pub repo: String,
     pub round: u64,
     pub current_verdicts: Vec<ReviewEntry>,
 }
@@ -194,6 +202,8 @@ pub struct PrReviewInput {
 #[derive(Debug, Clone)]
 pub struct PrReviewWorkState {
     pub pr: u32,
+    /// `owner/name` slug, for building the PR's GitHub URL.
+    pub repo: String,
     pub round: u64,
     pub gate: crate::vocab::CommitGateState,
     /// Reviewers in the currently-active tier who still owe a
@@ -609,9 +619,19 @@ impl RepoState {
                 &policy.gate_reviewers,
                 false,
             );
-            let missing_reviewers = missing_for_gate(gate, &input.current_verdicts, policy);
+            // Round 0 = master still drafting; the review hasn't been
+            // opened (no `propose` yet), so no reviewer is summoned
+            // whatever the gate says. round is the "opened?" signal —
+            // the PR analogue of a plan's commit existing before its
+            // reviewers are summoned.
+            let missing_reviewers = if input.round == 0 {
+                Vec::new()
+            } else {
+                missing_for_gate(gate, &input.current_verdicts, policy)
+            };
             pr_reviews.push(PrReviewWorkState {
                 pr: input.pr,
+                repo: input.repo,
                 round: input.round,
                 gate,
                 missing_reviewers,
@@ -777,13 +797,21 @@ impl WorkStatus {
                     });
                 }
                 Role::Master => {
-                    let next = match pr.gate {
-                        CommitGateState::ChangesRequested => Some(PrMasterNext::Integrate),
-                        CommitGateState::Finished => Some(PrMasterNext::Submit),
-                        CommitGateState::Approved => Some(PrMasterNext::Continue),
-                        // Unreviewed / ApprovedPendingGate → reviewers'
-                        // turn; Blocked is unreachable for PR reviews.
-                        _ => None,
+                    let next = if pr.round == 0 {
+                        // Round 0: master drafts, then `propose` opens
+                        // the review. Always master's turn, regardless
+                        // of gate.
+                        Some(PrMasterNext::Draft)
+                    } else {
+                        match pr.gate {
+                            CommitGateState::ChangesRequested => Some(PrMasterNext::Integrate),
+                            CommitGateState::Finished => Some(PrMasterNext::Submit),
+                            CommitGateState::Approved => Some(PrMasterNext::Continue),
+                            // Unreviewed / ApprovedPendingGate →
+                            // reviewers' turn; Blocked is unreachable
+                            // for PR reviews.
+                            _ => None,
+                        }
                     };
                     if let Some(next) = next {
                         out.push(WaitItem::PrMaster {
@@ -1443,6 +1471,7 @@ mod tests {
     fn pr_input(round: u64, verdicts: &[(&str, crate::vocab::Verdict)]) -> PrReviewInput {
         PrReviewInput {
             pr: 123,
+            repo: "o/r".into(),
             round,
             current_verdicts: verdicts
                 .iter()
@@ -1467,19 +1496,20 @@ mod tests {
     #[test]
     fn pr_gate_tier_progression() {
         use crate::vocab::{CommitGateState, Verdict};
-        // No current verdicts → commit tier owes review.
-        let s = pr_state(pr_input(0, &[]));
+        // Round >= 1 (review opened by `propose`). No current
+        // verdicts → commit tier owes review.
+        let s = pr_state(pr_input(1, &[]));
         assert_eq!(s.gate, CommitGateState::Unreviewed);
         assert_eq!(s.missing_reviewers, vec![label("codex")]);
 
         // Commit tier FINISHED is the milestone → gate tier wakes.
-        let s = pr_state(pr_input(0, &[("codex", Verdict::Finished)]));
+        let s = pr_state(pr_input(1, &[("codex", Verdict::Finished)]));
         assert_eq!(s.gate, CommitGateState::ApprovedPendingGate);
         assert_eq!(s.missing_reviewers, vec![label("ruthless")]);
 
         // Both tiers FINISHED → master submits, nobody owes review.
         let s = pr_state(pr_input(
-            0,
+            1,
             &[
                 ("codex", Verdict::Finished),
                 ("ruthless", Verdict::Finished),
@@ -1489,9 +1519,37 @@ mod tests {
         assert!(s.missing_reviewers.is_empty());
 
         // A request-changes anywhere → master integrates.
-        let s = pr_state(pr_input(0, &[("codex", Verdict::RequestChanges)]));
+        let s = pr_state(pr_input(1, &[("codex", Verdict::RequestChanges)]));
         assert_eq!(s.gate, CommitGateState::ChangesRequested);
         assert!(s.missing_reviewers.is_empty());
+    }
+
+    #[test]
+    fn pr_round_zero_is_master_draft_turn() {
+        // The reported bug: a freshly-started review (round 0, no
+        // verdicts, nothing drafted) must NOT summon a reviewer — it's
+        // master's turn to draft, then `propose`. compute_gate still
+        // reads Unreviewed, but round, not gate, gates the summon.
+        let s = pr_state(pr_input(0, &[]));
+        assert_eq!(s.gate, crate::vocab::CommitGateState::Unreviewed);
+        assert!(
+            s.missing_reviewers.is_empty(),
+            "no reviewer summoned before the review is opened"
+        );
+        let ws = WorkStatus {
+            plans: Vec::new(),
+            ad_hoc: Vec::new(),
+            pr_reviews: vec![s],
+        };
+        assert_eq!(
+            ws.work_for(&label("claude"), Role::Master),
+            vec![WaitItem::PrMaster {
+                pr: 123,
+                round: 0,
+                next: PrMasterNext::Draft
+            }]
+        );
+        assert!(ws.work_for(&label("codex"), Role::Reviewer).is_empty());
     }
 
     #[test]
@@ -1511,6 +1569,7 @@ mod tests {
             ad_hoc: Vec::new(),
             pr_reviews: vec![PrReviewWorkState {
                 pr: 123,
+                repo: "o/r".into(),
                 round: 2,
                 gate,
                 missing_reviewers: missing.iter().map(|l| label(l)).collect(),

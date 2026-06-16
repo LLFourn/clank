@@ -28,8 +28,14 @@ set) = reviewer. The `🤖` marker is for human attribution only.
 ## clank verbs (run via your shell)
 
 - `clank pr-review start <pr>` — pin the PR head, scaffold
-  `.clank/pr-reviews/<pr>/`. No GitHub I/O; the pending review is
+  `.clank/pr-reviews/<pr>/`. Opens at round 0 = master drafting; NO
+  reviewer is summoned yet. No GitHub I/O; the pending review is
   born when master posts its first comment.
+- `clank pr-review propose` — MASTER ONLY. Open (or re-open) the
+  review for the current draft: bumps the round, which is what
+  summons reviewers. Run it after drafting the initial comments, and
+  again after integrating a round's replies (a fresh round makes the
+  prior round's approvals stale so reviewers re-review).
 - `clank pr-review status` — round + per-reviewer verdict + who
   we're waiting on.
 - `clank pr-review note --verdict <finished|request-changes> -m "<summary>"`
@@ -109,12 +115,13 @@ cannot combine with `--jq`.
 1. `clank pr-review start <pr>`; read the PR; draft top-level
    comments (first via the create call, more via
    `addPullRequestReviewThread`). Keep `master.md` updated with
-   your summary + the body you'll submit.
-2. Bump the round so reviewers re-review: any write under
-   `.clank/pr-reviews/<pr>/` wakes them (e.g. editing `pr.json`'s
-   round, which `clank pr-review` manages).
+   your summary + the body you'll submit. Reviewers are NOT summoned
+   during drafting (round 0).
+2. `clank pr-review propose` — opens the review (round 0 → 1) and
+   summons reviewers. Do this only once the draft is ready.
 3. When reviewers reply: integrate each into your comments, then
-   DELETE the reply. Bump the round again.
+   DELETE the reply, then `clank pr-review propose` again to re-open
+   at a fresh round (their stale approvals no longer count).
 4. When `clank pr-review status` shows converged → `clank pr-review
    submit`.
 

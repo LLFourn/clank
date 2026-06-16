@@ -494,6 +494,7 @@ mod tests {
         );
         for verb in [
             "clank pr-review start",
+            "clank pr-review propose",
             "clank pr-review note",
             "clank pr-review submit",
         ] {

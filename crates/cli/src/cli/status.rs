@@ -339,22 +339,29 @@ impl StatusSnapshot {
             let _ = writeln!(out, "shelved: {}{note}", sv.stem);
         }
         for pr in &self.pr_reviews {
-            let waiting = if pr.missing_reviewers.is_empty() {
-                "master".to_string()
+            let url = pr_url(&pr.repo, pr.pr);
+            if pr.round == 0 {
+                // Not opened yet: master is drafting, no reviewers.
+                let _ = writeln!(out, "pr #{}: round 0 — master drafting", pr.pr);
             } else {
-                pr.missing_reviewers
-                    .iter()
-                    .map(|l| l.as_str())
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            };
-            let _ = writeln!(
-                out,
-                "pr #{}: round {} ({}) — waiting on {waiting}",
-                pr.pr,
-                pr.round,
-                pr.gate.as_str(),
-            );
+                let waiting = if pr.missing_reviewers.is_empty() {
+                    "master".to_string()
+                } else {
+                    pr.missing_reviewers
+                        .iter()
+                        .map(|l| l.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                };
+                let _ = writeln!(
+                    out,
+                    "pr #{}: round {} ({}) — waiting on {waiting}",
+                    pr.pr,
+                    pr.round,
+                    pr.gate.as_str(),
+                );
+            }
+            let _ = writeln!(out, "  {url}");
         }
 
         if self.plans.is_empty() && self.last_finished.is_none() && self.pr_reviews.is_empty() {
@@ -942,6 +949,13 @@ fn git_nol(repo: &Path, args: &[&str]) -> anyhow::Result<String> {
         );
     }
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+/// The PR's GitHub URL from its `owner/name` slug + number. The one
+/// place clank formats a github URL, shared by the text and TUI
+/// status surfaces (the TUI makes it a clickable OSC 8 hyperlink).
+pub(crate) fn pr_url(repo: &str, pr: u32) -> String {
+    format!("https://github.com/{repo}/pull/{pr}")
 }
 
 /// `+12 −3 · 2 untracked`, omitting zero parts. A dirty tree whose

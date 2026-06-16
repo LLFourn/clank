@@ -601,6 +601,9 @@ pub enum PrReviewCmd {
     Start(PrReviewStartArgs),
     /// Record your reviewer verdict for the current round.
     Note(PrReviewNoteArgs),
+    /// Open/re-open the review for the current draft: bump the round
+    /// and summon reviewers (master-only).
+    Propose(PrReviewProposeArgs),
     /// Discard a PR review's local scratch (master-only).
     Abort(PrReviewAbortArgs),
     /// Publish the converged review to the PR (master-only).
@@ -620,6 +623,13 @@ pub struct PrReviewSubmitArgs {
 pub struct PrReviewStartArgs {
     /// PR number.
     pub pr: u32,
+}
+
+#[derive(Args, Debug)]
+pub struct PrReviewProposeArgs {
+    /// PR number. Defaults to the single active review.
+    #[arg(long)]
+    pub pr: Option<u32>,
 }
 
 #[derive(Args, Debug)]
