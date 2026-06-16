@@ -72,9 +72,17 @@ fn label(name: &str) -> Span {
 }
 
 /// The `dirty` gauge: `+12` green, `−3` red (GitHub convention),
-/// `· 2 untracked` dim. Mirrors `dirty_summary`'s zero-omission and
-/// all-zero `changes` fallback, but as separately-colored spans —
-/// the pre-joined summary string can't carry per-part color.
+/// `· 2 untracked` dim; an all-zero (mode-only) change falls back to
+/// a dim `changes`.
+///
+/// Zero omission is per-PART here — insertions-only renders `+3`,
+/// never a red `−0` — which intentionally DIVERGES from the text
+/// `dirty_summary`, that omits per-PAIR and shows `+3 −0`. A colored
+/// line wants no red zero, and matching GitHub (bare `+3` green) is
+/// the point of this gauge. So the two surfaces are NOT mirrors:
+/// don't "unify" them by routing the TUI through `dirty_summary` —
+/// it would reintroduce the `−0`. Only the `changes` fallback is
+/// shared behavior.
 fn dirty_spans(d: &super::status::DirtyStats) -> Vec<Span> {
     let mut spans = vec![label("dirty")];
     let mut wrote = false;
