@@ -104,9 +104,13 @@ pub async fn run_fork_with_review(args: &ForkArgs, home: Option<&Path>) -> anyho
     } else {
         None
     };
-    let dest = run_fork(args, home).await?;
+    // Fetch + pin the PR head ONCE here; `run_fork` bases the
+    // worktree on it and `start_with` anchors the review to the SAME
+    // sha — worktree-base == review-pin by construction (ruthless
+    // b88ae34).
+    let (dest, pinned_head) = run_fork_pinned(args, home).await?;
     if let Some((pr, slug, source)) = review {
-        super::pr_review::start_with(&dest, &slug, pr, Some(&source))?;
+        super::pr_review::start_with(&dest, &slug, pr, Some(&source), pinned_head.as_deref())?;
     }
     Ok(dest)
 }
@@ -117,6 +121,17 @@ pub async fn run_fork_with_review(args: &ForkArgs, home: Option<&Path>) -> anyho
 /// read-only validation (fail-closed: no mutation until all
 /// checks pass).
 pub async fn run_fork(args: &ForkArgs, home: Option<&Path>) -> anyhow::Result<PathBuf> {
+    Ok(run_fork_pinned(args, home).await?.0)
+}
+
+/// `run_fork`, additionally returning the pinned PR head sha
+/// (`Some` iff `--pr`) so a composing caller can anchor downstream
+/// state to the SAME commit the worktree is based on without a
+/// second fetch (ruthless b88ae34).
+pub async fn run_fork_pinned(
+    args: &ForkArgs,
+    home: Option<&Path>,
+) -> anyhow::Result<(PathBuf, Option<String>)> {
     let name = derived_name(args.name.as_deref(), args.pr)?;
     let name = name.as_str();
     if name.is_empty() || name.contains('/') || name.contains(char::is_whitespace) {
@@ -248,7 +263,7 @@ pub async fn run_fork(args: &ForkArgs, home: Option<&Path>) -> anyhow::Result<Pa
         sessions.len(),
     );
     eprintln!("  teardown: git worktree remove {}", dest.display());
-    Ok(dest)
+    Ok((dest, pinned_pr_base))
 }
 
 /// Pure name derivation: explicit name wins; `--pr N` defaults

@@ -85,7 +85,7 @@ fn env_with_pr(pr: u32) -> (TestEnv, String) {
 fn start_scaffolds_and_pins_head() {
     let (env, pr_sha) = env_with_pr(123);
     let repo = env.repo();
-    let dir = start_with(repo, "LLFourn/clank", 123, None).unwrap();
+    let dir = start_with(repo, "LLFourn/clank", 123, None, None).unwrap();
 
     assert!(dir.ends_with(".clank/pr-reviews/123"));
     let state: serde_json::Value =
@@ -113,8 +113,10 @@ fn start_scaffolds_and_pins_head() {
 fn start_refuses_existing() {
     let (env, _) = env_with_pr(7);
     let repo = env.repo();
-    start_with(repo, "o/r", 7, None).unwrap();
-    let err = start_with(repo, "o/r", 7, None).unwrap_err().to_string();
+    start_with(repo, "o/r", 7, None, None).unwrap();
+    let err = start_with(repo, "o/r", 7, None, None)
+        .unwrap_err()
+        .to_string();
     assert!(err.contains("already started"), "got: {err}");
 }
 
@@ -122,7 +124,7 @@ fn start_refuses_existing() {
 fn note_records_verdict_at_current_round() {
     let (env, _) = env_with_pr(123);
     let repo = env.repo();
-    start_with(repo, "o/r", 123, None).unwrap();
+    start_with(repo, "o/r", 123, None, None).unwrap();
 
     let path = note_with(
         repo,
@@ -143,7 +145,7 @@ fn note_records_verdict_at_current_round() {
 fn note_infers_single_active_pr() {
     let (env, _) = env_with_pr(42);
     let repo = env.repo();
-    start_with(repo, "o/r", 42, None).unwrap();
+    start_with(repo, "o/r", 42, None, None).unwrap();
     // No --pr: resolves to the single active review.
     let path = note_with(
         repo,
@@ -160,7 +162,7 @@ fn note_infers_single_active_pr() {
 fn status_reports_pending_then_converged() {
     let (env, _) = env_with_pr(123);
     let repo = env.repo();
-    start_with(repo, "o/r", 123, None).unwrap();
+    start_with(repo, "o/r", 123, None, None).unwrap();
 
     // Round 0: master drafting — no reviewers summoned yet.
     let s = status_with(repo, Some(env.home()), Some(123)).unwrap();
@@ -188,7 +190,7 @@ fn status_reports_pending_then_converged() {
 fn abort_is_master_only() {
     let (env, _) = env_with_pr(123);
     let repo = env.repo();
-    start_with(repo, "o/r", 123, None).unwrap();
+    start_with(repo, "o/r", 123, None, None).unwrap();
 
     // A reviewer cannot abort.
     let err = abort_with(repo, Some(env.home()), &label("codex"), Some(123))
@@ -212,7 +214,7 @@ fn abort_is_master_only() {
 fn propose_is_master_only_and_bumps_round() {
     let (env, _) = env_with_pr(123);
     let repo = env.repo();
-    start_with(repo, "o/r", 123, None).unwrap();
+    start_with(repo, "o/r", 123, None, None).unwrap();
 
     // A reviewer cannot open the review.
     let err = propose_with(repo, Some(env.home()), &label("codex"), Some(123))
@@ -245,8 +247,14 @@ fn checkout_switches_branch_and_scaffolds_in_place() {
         git_out(repo, &["rev-parse", "--abbrev-ref", "HEAD"]),
         "pr-123"
     );
-    // Review scaffolded in place.
-    assert!(repo.join(".clank/pr-reviews/123/pr.json").is_file());
+    // Review scaffolded in place, pinned to the SAME head that was
+    // checked out — one fetch (ruthless b88ae34).
+    let state: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(dir.join("pr.json")).unwrap()).unwrap();
+    assert_eq!(
+        state["head_sha"], pr_sha,
+        "review pins the checked-out head"
+    );
 }
 
 #[test]
@@ -257,7 +265,7 @@ fn checkout_refuses_already_started_review_without_switching_branch() {
     // A review already exists for this PR. Commit the gitignore entry
     // start_with adds so the tree is clean (as in a real repo) — else
     // the dirty guard would fire before the already-started one.
-    start_with(repo, "LLFourn/clank", 123, None).unwrap();
+    start_with(repo, "LLFourn/clank", 123, None, None).unwrap();
     git(repo, &["add", "-A"]);
     git(repo, &["commit", "--quiet", "-m", "start review"]);
     let head_before = git_out(repo, &["rev-parse", "HEAD"]);
@@ -297,7 +305,7 @@ fn note_resolution_errors_when_no_active_review() {
 fn pr_review_inputs_project_current_round_verdicts() {
     let (env, _) = env_with_pr(123);
     let repo = env.repo();
-    start_with(repo, "o/r", 123, None).unwrap();
+    start_with(repo, "o/r", 123, None, None).unwrap();
 
     // Fresh review: one input, round 0, no current verdicts.
     let inputs = clank::cli::pr_review::pr_review_inputs(repo);
@@ -317,7 +325,7 @@ fn pr_review_inputs_project_current_round_verdicts() {
 fn pr_review_inputs_drop_stale_round_verdicts() {
     let (env, _) = env_with_pr(123);
     let repo = env.repo();
-    start_with(repo, "o/r", 123, None).unwrap();
+    start_with(repo, "o/r", 123, None, None).unwrap();
     note_with(repo, &label("codex"), Some(123), Verdict::Finished, "ok").unwrap();
 
     // Master revises → `propose` bumps the round to 1.
@@ -337,7 +345,7 @@ fn submit_is_master_only_and_refuses_until_converged() {
     use clank::cli::pr_review::submit_with;
     let (env, _) = env_with_pr(123);
     let repo = env.repo();
-    start_with(repo, "o/r", 123, None).unwrap();
+    start_with(repo, "o/r", 123, None, None).unwrap();
 
     // Reviewer cannot submit.
     let err = submit_with(repo, Some(env.home()), &label("codex"), Some(123))
@@ -372,7 +380,7 @@ fn status_fails_closed_without_a_team() {
     // review but register no team → status errors, never "done".
     let env = TestEnv::init();
     setup_repo_with_pr(&env, 123);
-    start_with(env.repo(), "o/r", 123, None).unwrap();
+    start_with(env.repo(), "o/r", 123, None, None).unwrap();
     let res = status_with(env.repo(), Some(env.home()), Some(123));
     let err = res.expect_err("status must fail closed without a team");
     assert!(

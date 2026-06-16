@@ -335,7 +335,7 @@ fn fork_pr_review_scaffolds_review_in_the_worktree() {
     // start --fork`: worktree on the PR head + review scaffold in
     // the worktree's .clank/, with the slug from the source origin.
     let env = source_with_bound_team();
-    add_local_pr_remote_gh(&env, "[misc] pr change");
+    let pr_sha = add_local_pr_remote_gh(&env, "[misc] pr change");
 
     let mut args = fork_args(&env, "ignored");
     args.name = None;
@@ -354,6 +354,14 @@ fn fork_pr_review_scaffolds_review_in_the_worktree() {
     assert_eq!(state["number"], 123);
     assert_eq!(state["repo"], "LLFourn/clank", "slug from source origin");
     assert_eq!(state["round"], 0, "round 0 = master drafting");
+    // Pin-once invariant (ruthless b88ae34): the review anchors to the
+    // SAME sha the worktree is based on — by construction, one fetch.
+    assert_eq!(state["head_sha"], pr_sha, "review pins the worktree's head");
+    assert_eq!(
+        git_out(&dest, &["rev-parse", "HEAD"]).trim(),
+        pr_sha,
+        "worktree based on that same head"
+    );
 }
 
 #[test]

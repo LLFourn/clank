@@ -173,7 +173,7 @@ pub async fn run(args: PrReviewArgs) -> anyhow::Result<()> {
         }
         PrReviewCmd::Start(a) => {
             let slug = repo_slug(&repo)?;
-            let dest = start_with(&repo, &slug, a.pr, None)?;
+            let dest = start_with(&repo, &slug, a.pr, None, None)?;
             println!("{}", dest.display());
             Ok(())
         }
@@ -213,17 +213,28 @@ pub async fn run(args: PrReviewArgs) -> anyhow::Result<()> {
 /// PR head, write `pr.json` (round 0, no pending review yet),
 /// the master template, and the `reviews/` dir; ensure the
 /// gitignore entry. The GitHub pending review is created later.
+///
+/// `pinned_head`: when the caller already fetched + pinned the PR
+/// head (the composed `--fork`/`--checkout` paths fetch it to base
+/// the worktree / switch branches), it passes that sha here so the
+/// review anchors to the SAME commit — one fetch, and worktree-base
+/// == review-pin by construction, not coincidence (ruthless b88ae34).
+/// Standalone `pr-review start` passes `None` and fetches.
 pub fn start_with(
     repo: &Path,
     slug: &str,
     pr: u32,
     source: Option<&Path>,
+    pinned_head: Option<&str>,
 ) -> anyhow::Result<PathBuf> {
     let dir = pr_dir(repo, pr);
     if dir.exists() {
         anyhow::bail!("PR #{pr} review already started at `{}`", dir.display());
     }
-    let head_sha = super::fork::fetch_pr_head(source.unwrap_or(repo), pr)?;
+    let head_sha = match pinned_head {
+        Some(s) => s.to_string(),
+        None => super::fork::fetch_pr_head(source.unwrap_or(repo), pr)?,
+    };
     std::fs::create_dir_all(dir.join("reviews"))?;
     save_state(repo, pr, &PrReviewState::new(slug, pr, head_sha))?;
     write_atomic(&dir.join("master.md"), MASTER_TEMPLATE.as_bytes())?;
@@ -268,7 +279,9 @@ pub fn checkout_with(repo: &Path, pr: u32) -> anyhow::Result<PathBuf> {
         anyhow::bail!("branch `{branch}` already exists; check it out yourself or delete it first");
     }
     // Preconditions all passed — now the network side-effect, then
-    // the lone local mutation (the branch switch).
+    // the lone local mutation (the branch switch). The fetched sha is
+    // threaded into start_with so the review pins the SAME head the
+    // branch was checked out to — one fetch (ruthless b88ae34).
     let sha = super::fork::fetch_pr_head(repo, pr)?;
     let out = std::process::Command::new("git")
         .arg("-C")
@@ -282,7 +295,7 @@ pub fn checkout_with(repo: &Path, pr: u32) -> anyhow::Result<PathBuf> {
             String::from_utf8_lossy(&out.stderr).trim()
         );
     }
-    start_with(repo, &slug, pr, None)
+    start_with(repo, &slug, pr, None, Some(&sha))
 }
 
 /// Open (or re-open) the review for the current draft by bumping
