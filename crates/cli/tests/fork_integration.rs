@@ -357,6 +357,32 @@ fn fork_pr_review_scaffolds_review_in_the_worktree() {
 }
 
 #[test]
+fn fork_review_validates_slug_before_creating_the_worktree() {
+    // origin is a local path that does NOT parse as a github slug,
+    // but the PR head IS fetchable. Without the preflight, run_fork
+    // would create the worktree and THEN repo_slug would fail,
+    // orphaning it (codex b944c58). Fail-closed: no worktree.
+    let env = source_with_bound_team();
+    add_local_pr_remote(&env, "[misc] pr change"); // origin.git — not github-shaped
+    let mut args = fork_args(&env, "ignored");
+    args.name = None;
+    args.pr = Some(123);
+    args.review = true;
+
+    let err = block_on(clank::cli::fork::run_fork_with_review(
+        &args,
+        Some(env.home()),
+    ))
+    .unwrap_err()
+    .to_string();
+    assert!(err.contains("owner/name"), "slug parse error: {err}");
+    assert!(
+        !env.repo().join(".clank/worktrees/pr-123").exists(),
+        "fail-closed: slug validated before the worktree is created"
+    );
+}
+
+#[test]
 fn fork_pr_fetches_pins_and_orients() {
     let env = source_with_bound_team();
     let repo = env.repo();

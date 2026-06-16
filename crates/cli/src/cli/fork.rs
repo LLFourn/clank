@@ -90,13 +90,22 @@ pub async fn run(args: ForkArgs) -> anyhow::Result<()> {
 /// (where the forked team's wait surface reads it); the slug comes
 /// from the SOURCE repo's origin, not the worktree cwd.
 pub async fn run_fork_with_review(args: &ForkArgs, home: Option<&Path>) -> anyhow::Result<PathBuf> {
-    let dest = run_fork(args, home).await?;
-    if args.review {
+    // Resolve the review precondition (PR + a parseable origin slug)
+    // BEFORE creating the worktree — fail-closed, so an unparseable
+    // origin doesn't leave a half-made worktree behind (codex
+    // b944c58).
+    let review = if args.review {
         let pr = args
             .pr
             .ok_or_else(|| anyhow::anyhow!("--review requires --pr"))?;
         let source = super::resolve_repo(args.source.as_deref())?;
         let slug = super::pr_review::repo_slug(&source)?;
+        Some((pr, slug, source))
+    } else {
+        None
+    };
+    let dest = run_fork(args, home).await?;
+    if let Some((pr, slug, source)) = review {
         super::pr_review::start_with(&dest, &slug, pr, Some(&source))?;
     }
     Ok(dest)

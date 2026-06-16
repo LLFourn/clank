@@ -233,16 +233,24 @@ pub fn start_with(
 
 /// Check out the PR head in the CURRENT worktree (branch `pr-<n>`),
 /// then scaffold the review in place. The in-place alternative to
-/// `--fork`. Refuses on a dirty worktree BEFORE any fetch — a
-/// checkout would clobber uncommitted work — and refuses if the
-/// `pr-<n>` branch already exists (don't silently reset it). Returns
-/// the scaffolded review dir.
+/// `--fork`.
+///
+/// Fail-closed like `fork`: ALL read-only preconditions are checked
+/// before the `git checkout` mutation, so a doomed run never leaves
+/// the worktree on a switched branch (codex b944c58). Refuses on a
+/// dirty worktree, an already-started review, an unparseable origin
+/// slug, or an existing `pr-<n>` branch — all before any mutation.
+/// Returns the scaffolded review dir.
 pub fn checkout_with(repo: &Path, pr: u32) -> anyhow::Result<PathBuf> {
     if crate::cli::status::dirty_stats(repo)?.is_some() {
         anyhow::bail!("worktree is dirty — commit or stash first; `--checkout` switches branches");
     }
+    if pr_dir(repo, pr).exists() {
+        anyhow::bail!(
+            "PR #{pr} review already started; nothing to check out (run `clank pr-review status`)"
+        );
+    }
     let slug = repo_slug(repo)?;
-    let sha = super::fork::fetch_pr_head(repo, pr)?;
     let branch = format!("pr-{pr}");
     let exists = std::process::Command::new("git")
         .arg("-C")
@@ -259,6 +267,9 @@ pub fn checkout_with(repo: &Path, pr: u32) -> anyhow::Result<PathBuf> {
     if exists {
         anyhow::bail!("branch `{branch}` already exists; check it out yourself or delete it first");
     }
+    // Preconditions all passed — now the network side-effect, then
+    // the lone local mutation (the branch switch).
+    let sha = super::fork::fetch_pr_head(repo, pr)?;
     let out = std::process::Command::new("git")
         .arg("-C")
         .arg(repo)

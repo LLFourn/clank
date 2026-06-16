@@ -250,6 +250,25 @@ fn checkout_switches_branch_and_scaffolds_in_place() {
 }
 
 #[test]
+fn checkout_refuses_already_started_review_without_switching_branch() {
+    use clank::cli::pr_review::checkout_with;
+    let (env, _) = env_with_pr(123);
+    let repo = env.repo();
+    // A review already exists for this PR. Commit the gitignore entry
+    // start_with adds so the tree is clean (as in a real repo) — else
+    // the dirty guard would fire before the already-started one.
+    start_with(repo, "LLFourn/clank", 123, None).unwrap();
+    git(repo, &["add", "-A"]);
+    git(repo, &["commit", "--quiet", "-m", "start review"]);
+    let head_before = git_out(repo, &["rev-parse", "HEAD"]);
+
+    let err = checkout_with(repo, 123).unwrap_err().to_string();
+    assert!(err.contains("already started"), "got: {err}");
+    // Refused BEFORE the checkout: HEAD unchanged (codex b944c58).
+    assert_eq!(git_out(repo, &["rev-parse", "HEAD"]), head_before);
+}
+
+#[test]
 fn checkout_refuses_dirty_worktree_before_fetching() {
     use clank::cli::pr_review::checkout_with;
     let (env, _) = env_with_pr(123);
