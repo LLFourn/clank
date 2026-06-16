@@ -115,7 +115,7 @@ fn resolve_pr(repo: &Path, explicit: Option<u32>) -> anyhow::Result<u32> {
 }
 
 /// Parse `owner/name` from the `origin` remote URL (ssh or https).
-fn repo_slug(repo: &Path) -> anyhow::Result<String> {
+pub(crate) fn repo_slug(repo: &Path) -> anyhow::Result<String> {
     let out = std::process::Command::new("git")
         .arg("-C")
         .arg(repo)
@@ -147,8 +147,30 @@ fn parse_slug(url: &str) -> Option<String> {
 
 pub async fn run(args: PrReviewArgs) -> anyhow::Result<()> {
     let repo = resolve_repo(args.repo.as_deref())?;
+    let repo_arg = args.repo.clone();
     let home = std::env::var_os("HOME").map(PathBuf::from);
     match args.command {
+        PrReviewCmd::Start(a) if a.fork => {
+            // Same operation as `clank fork --pr <N> --review`: the
+            // worktree creation + review scaffold + zellij open all
+            // live in `fork::run`; this verb is just a second door.
+            super::fork::run(crate::cli::ForkArgs {
+                name: None,
+                source: repo_arg,
+                pr: Some(a.pr),
+                branch: None,
+                path: None,
+                prompt: None,
+                no_open: false,
+                review: true,
+            })
+            .await
+        }
+        PrReviewCmd::Start(a) if a.checkout => {
+            let dest = checkout_with(&repo, a.pr)?;
+            println!("{}", dest.display());
+            Ok(())
+        }
         PrReviewCmd::Start(a) => {
             let slug = repo_slug(&repo)?;
             let dest = start_with(&repo, &slug, a.pr, None)?;
@@ -207,6 +229,49 @@ pub fn start_with(
     write_atomic(&dir.join("master.md"), MASTER_TEMPLATE.as_bytes())?;
     crate::init_facts::ensure_clank_gitignore_entry(repo, "/pr-reviews/")?;
     Ok(dir)
+}
+
+/// Check out the PR head in the CURRENT worktree (branch `pr-<n>`),
+/// then scaffold the review in place. The in-place alternative to
+/// `--fork`. Refuses on a dirty worktree BEFORE any fetch — a
+/// checkout would clobber uncommitted work — and refuses if the
+/// `pr-<n>` branch already exists (don't silently reset it). Returns
+/// the scaffolded review dir.
+pub fn checkout_with(repo: &Path, pr: u32) -> anyhow::Result<PathBuf> {
+    if crate::cli::status::dirty_stats(repo)?.is_some() {
+        anyhow::bail!("worktree is dirty — commit or stash first; `--checkout` switches branches");
+    }
+    let slug = repo_slug(repo)?;
+    let sha = super::fork::fetch_pr_head(repo, pr)?;
+    let branch = format!("pr-{pr}");
+    let exists = std::process::Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args([
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            &format!("refs/heads/{branch}"),
+        ])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+    if exists {
+        anyhow::bail!("branch `{branch}` already exists; check it out yourself or delete it first");
+    }
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["checkout", "-b", &branch, &sha])
+        .output()
+        .context("spawning git checkout")?;
+    if !out.status.success() {
+        anyhow::bail!(
+            "git checkout failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    start_with(repo, &slug, pr, None)
 }
 
 /// Open (or re-open) the review for the current draft by bumping
@@ -697,6 +762,23 @@ fn require_master(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn start_fork_and_checkout_are_mutually_exclusive() {
+        use clap::Parser;
+        #[derive(Parser)]
+        struct T {
+            #[command(flatten)]
+            f: crate::cli::PrReviewStartArgs,
+        }
+        assert!(T::try_parse_from(["t", "5"]).is_ok());
+        assert!(T::try_parse_from(["t", "5", "--fork"]).is_ok());
+        assert!(T::try_parse_from(["t", "5", "--checkout"]).is_ok());
+        assert!(
+            T::try_parse_from(["t", "5", "--fork", "--checkout"]).is_err(),
+            "--fork and --checkout must conflict"
+        );
+    }
 
     #[test]
     fn parse_slug_handles_ssh_and_https() {

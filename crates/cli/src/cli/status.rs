@@ -917,7 +917,7 @@ pub(crate) struct DirtyStats {
 /// `git status` opportunistically rewrites `.git/index` (stat
 /// refresh) — an event the watcher would see, waking the loop the
 /// probe itself was serving (self-wake feedback).
-fn dirty_stats(repo: &Path) -> anyhow::Result<Option<DirtyStats>> {
+pub(crate) fn dirty_stats(repo: &Path) -> anyhow::Result<Option<DirtyStats>> {
     let porcelain = git_nol(repo, &["status", "--porcelain"])?;
     if porcelain.is_empty() {
         return Ok(None);

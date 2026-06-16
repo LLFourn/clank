@@ -145,6 +145,10 @@ pub struct ForkArgs {
     /// Outside zellij fork never auto-spawns a session.
     #[arg(long)]
     pub no_open: bool,
+    /// Also scaffold the PR review in the new worktree (requires
+    /// `--pr`). Same as `clank pr-review start <N> --fork`.
+    #[arg(long, requires = "pr")]
+    pub review: bool,
 }
 
 #[derive(Args, Debug)]
@@ -623,6 +627,16 @@ pub struct PrReviewSubmitArgs {
 pub struct PrReviewStartArgs {
     /// PR number.
     pub pr: u32,
+    /// Create a linked worktree on the PR head + seed the team, then
+    /// scaffold the review there (same as `clank fork --pr <N>
+    /// --review`). Mutually exclusive with `--checkout`.
+    #[arg(long, conflicts_with = "checkout")]
+    pub fork: bool,
+    /// Check out the PR head in the CURRENT worktree (branch
+    /// `pr-<N>`), then scaffold the review here. Refuses on a dirty
+    /// worktree. Mutually exclusive with `--fork`.
+    #[arg(long)]
+    pub checkout: bool,
 }
 
 #[derive(Args, Debug)]

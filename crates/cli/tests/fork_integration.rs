@@ -90,6 +90,7 @@ fn fork_args(env: &TestEnv, name: &str) -> clank::cli::ForkArgs {
         path: None,
         prompt: None,
         no_open: true,
+        review: false,
     }
 }
 
@@ -303,6 +304,56 @@ fn add_local_pr_remote(env: &TestEnv, pr_head_msg: &str) -> String {
     git(repo, &["checkout", "--quiet", "-"]);
     git(repo, &["branch", "--quiet", "-D", "tmp-pr"]);
     sha
+}
+
+/// Like `add_local_pr_remote`, but the bare origin lives at a
+/// `github.com/<owner>/<name>.git` path so `repo_slug` parses
+/// `LLFourn/clank` from it while the fetch still works offline —
+/// `--review` needs the slug for the github API.
+fn add_local_pr_remote_gh(env: &TestEnv, pr_head_msg: &str) -> String {
+    let repo = env.repo();
+    let bare = env.home().join("github.com/LLFourn/clank.git");
+    std::fs::create_dir_all(bare.parent().unwrap()).unwrap();
+    git(repo, &["init", "--bare", "--quiet", bare.to_str().unwrap()]);
+    git(repo, &["remote", "add", "origin", bare.to_str().unwrap()]);
+    git(repo, &["checkout", "--quiet", "-b", "tmp-pr"]);
+    write(repo, "src/pr_change.rs", "// pr\n");
+    commit(repo, pr_head_msg);
+    let sha = git_out(repo, &["rev-parse", "HEAD"]).trim().to_string();
+    git(
+        repo,
+        &["push", "--quiet", "origin", "HEAD:refs/pull/123/head"],
+    );
+    git(repo, &["checkout", "--quiet", "-"]);
+    git(repo, &["branch", "--quiet", "-D", "tmp-pr"]);
+    sha
+}
+
+#[test]
+fn fork_pr_review_scaffolds_review_in_the_worktree() {
+    // The shared core behind `fork --pr --review` AND `pr-review
+    // start --fork`: worktree on the PR head + review scaffold in
+    // the worktree's .clank/, with the slug from the source origin.
+    let env = source_with_bound_team();
+    add_local_pr_remote_gh(&env, "[misc] pr change");
+
+    let mut args = fork_args(&env, "ignored");
+    args.name = None;
+    args.pr = Some(123);
+    args.review = true;
+    let dest = block_on(clank::cli::fork::run_fork_with_review(
+        &args,
+        Some(env.home()),
+    ))
+    .unwrap();
+
+    let pr_json = dest.join(".clank/pr-reviews/123/pr.json");
+    assert!(pr_json.is_file(), "review scaffolded in the worktree");
+    let state: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&pr_json).unwrap()).unwrap();
+    assert_eq!(state["number"], 123);
+    assert_eq!(state["repo"], "LLFourn/clank", "slug from source origin");
+    assert_eq!(state["round"], 0, "round 0 = master drafting");
 }
 
 #[test]

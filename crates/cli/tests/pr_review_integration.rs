@@ -46,7 +46,11 @@ fn setup_repo_with_pr(env: &TestEnv, pr: u32) -> String {
     git(repo, &["add", "-A"]);
     git(repo, &["commit", "--quiet", "-m", "base"]);
 
-    let bare = env.home().join("origin.git");
+    // github.com-shaped path so `repo_slug` parses `LLFourn/clank`
+    // from origin (the `--checkout` path needs it) while the fetch
+    // still works offline.
+    let bare = env.home().join("github.com/LLFourn/clank.git");
+    std::fs::create_dir_all(bare.parent().unwrap()).unwrap();
     git(repo, &["init", "--bare", "--quiet", bare.to_str().unwrap()]);
     git(repo, &["remote", "add", "origin", bare.to_str().unwrap()]);
     git(repo, &["checkout", "--quiet", "-b", "pr-branch"]);
@@ -225,6 +229,39 @@ fn propose_is_master_only_and_bumps_round() {
         propose_with(repo, Some(env.home()), &label("claude"), Some(123)).unwrap(),
         2
     );
+}
+
+#[test]
+fn checkout_switches_branch_and_scaffolds_in_place() {
+    use clank::cli::pr_review::checkout_with;
+    let (env, pr_sha) = env_with_pr(123);
+    let repo = env.repo();
+
+    let dir = checkout_with(repo, 123).unwrap();
+    assert!(dir.ends_with(".clank/pr-reviews/123"));
+    // HEAD moved to the PR head on a fresh `pr-123` branch.
+    assert_eq!(git_out(repo, &["rev-parse", "HEAD"]), pr_sha);
+    assert_eq!(
+        git_out(repo, &["rev-parse", "--abbrev-ref", "HEAD"]),
+        "pr-123"
+    );
+    // Review scaffolded in place.
+    assert!(repo.join(".clank/pr-reviews/123/pr.json").is_file());
+}
+
+#[test]
+fn checkout_refuses_dirty_worktree_before_fetching() {
+    use clank::cli::pr_review::checkout_with;
+    let (env, _) = env_with_pr(123);
+    let repo = env.repo();
+    let head_before = git_out(repo, &["rev-parse", "HEAD"]);
+
+    std::fs::write(repo.join("file.rs"), "// uncommitted edit\n").unwrap();
+    let err = checkout_with(repo, 123).unwrap_err().to_string();
+    assert!(err.contains("dirty"), "got: {err}");
+    // Refused BEFORE the checkout: HEAD unchanged, no review scaffold.
+    assert_eq!(git_out(repo, &["rev-parse", "HEAD"]), head_before);
+    assert!(!repo.join(".clank/pr-reviews/123").exists());
 }
 
 #[test]

@@ -64,7 +64,7 @@ fn should_open(inside_zellij: bool, no_open: bool) -> bool {
 
 pub async fn run(args: ForkArgs) -> anyhow::Result<()> {
     let home = std::env::var_os("HOME").map(PathBuf::from);
-    let dest = run_fork(&args, home.as_deref()).await?;
+    let dest = run_fork_with_review(&args, home.as_deref()).await?;
     // SOLE stdout line: the worktree path (composition contract).
     println!("{}", dest.display());
 
@@ -79,6 +79,27 @@ pub async fn run(args: ForkArgs) -> anyhow::Result<()> {
         eprintln!("open it with: clank open --repo {}", dest.display());
     }
     Ok(())
+}
+
+/// `run_fork` plus, when `--review` is set, scaffolding the PR
+/// review in the new worktree. The SINGLE implementation behind both
+/// `clank fork --pr --review` and `clank pr-review start --fork`, so
+/// the two doorways can't diverge. Returns the worktree path.
+///
+/// The review scaffold lands in the worktree's gitignored `.clank/`
+/// (where the forked team's wait surface reads it); the slug comes
+/// from the SOURCE repo's origin, not the worktree cwd.
+pub async fn run_fork_with_review(args: &ForkArgs, home: Option<&Path>) -> anyhow::Result<PathBuf> {
+    let dest = run_fork(args, home).await?;
+    if args.review {
+        let pr = args
+            .pr
+            .ok_or_else(|| anyhow::anyhow!("--review requires --pr"))?;
+        let source = super::resolve_repo(args.source.as_deref())?;
+        let slug = super::pr_review::repo_slug(&source)?;
+        super::pr_review::start_with(&dest, &slug, pr, Some(&source))?;
+    }
+    Ok(dest)
 }
 
 /// The fork core: worktree + seed. Returns the worktree path.
@@ -375,6 +396,9 @@ mod tests {
         // --pr + --branch: loud conflict, not silent precedence
         // (ruthless 91ecaf2 edge 2).
         assert!(T::try_parse_from(["t", "--pr", "1", "--branch", "main"]).is_err());
+        // --review needs --pr (a branch fork has no PR to review).
+        assert!(T::try_parse_from(["t", "myname", "--review"]).is_err());
+        assert!(T::try_parse_from(["t", "--pr", "1", "--review"]).is_ok());
     }
 
     #[test]
