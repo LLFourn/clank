@@ -59,6 +59,10 @@ enum Style {
     /// counts only the visible text, and the target stays the full
     /// URL even when that text truncates on a narrow pane.
     Link(String),
+    /// Background-highlighted (the commit-log plan umbrellas): a
+    /// fixed bold + dark-grey-background SGR so a plan name reads as
+    /// a section divider (tui-log-plan-highlight-align).
+    Highlight,
 }
 
 struct Span(Style, String);
@@ -259,23 +263,44 @@ pub(crate) fn render(snap: &StatusSnapshot, rows: u16, cols: u16) -> Vec<String>
             out.push(String::new());
             avail -= 1;
         }
-        for row in snap.log_rows.iter().take(avail) {
-            out.push(emit(&log_row_spans(row), color, cols));
+        let shown = &snap.log_rows[..avail.min(snap.log_rows.len())];
+        // Align every summary at one column: pad authors to the widest
+        // among the rows actually shown.
+        let author_width = shown
+            .iter()
+            .filter_map(|r| match r {
+                crate::cli::log::OnelineRow::Review { author, .. } => Some(display_width(author)),
+                _ => None,
+            })
+            .max()
+            .unwrap_or(0);
+        for row in shown {
+            out.push(emit(&log_row_spans(row, author_width), color, cols));
         }
     }
     out
 }
 
-/// Style one log row for the pane: umbrella headers plain at
-/// column 0, commit shas dim with plain subjects, review marks in
-/// their verdict colors (green ✓ / cyan ✓✓ / red ✗) with dim
-/// authors (log-plan-umbrellas).
-fn log_row_spans(row: &crate::cli::log::OnelineRow) -> Vec<Span> {
+/// Widest verdict mark in display columns: `✓✓` (Finished) is 2,
+/// the rest are 1. Review marks sit in a field this wide so the
+/// author column is constant regardless of verdict.
+const MARK_FIELD: usize = 2;
+
+/// Style one log row for the pane. Umbrella headers get a
+/// background highlight so they read as section dividers; commit
+/// shas are dim at column 2 with plain subjects; review marks
+/// (green ✓ / cyan ✓✓ / red ✗) start at that SAME column 2, and the
+/// author is padded to `author_width` so every summary begins at one
+/// aligned column (tui-log-plan-highlight-align).
+fn log_row_spans(row: &crate::cli::log::OnelineRow, author_width: usize) -> Vec<Span> {
     use crate::cli::log::OnelineRow;
     use clank_core::vocab::Verdict;
     match row {
         OnelineRow::Header { plan } => {
-            vec![plain(plan.clone().unwrap_or_else(|| "adhoc".to_string()))]
+            vec![Span(
+                Style::Highlight,
+                plan.clone().unwrap_or_else(|| "adhoc".to_string()),
+            )]
         }
         OnelineRow::Commit { sha, subject } => vec![
             dim(format!("  {} ", &sha.as_str()[..7])),
@@ -293,15 +318,23 @@ fn log_row_spans(row: &crate::cli::log::OnelineRow) -> Vec<Span> {
                 Verdict::Unmarked => "2",
             };
             let mark = crate::cli::log::verdict_mark(*verdict, false);
+            // Mark starts at column 2 (== the commit sha); pad it to
+            // MARK_FIELD + a separating space so the author column is
+            // fixed across verdicts.
+            let after_mark = MARK_FIELD.saturating_sub(display_width(&mark)) + 1;
+            // Pad the author so the summary column is fixed across
+            // reviewers (align the end of the names).
+            let author_pad = author_width.saturating_sub(display_width(author));
             let snip = if summary.is_empty() {
                 String::new()
             } else {
                 format!(": {summary}")
             };
             vec![
-                plain("    ".to_string()),
+                plain("  ".to_string()),
                 Span(Style::Color(mark_color), mark),
-                dim(format!(" {author}")),
+                plain(" ".repeat(after_mark)),
+                dim(format!("{author}{}", " ".repeat(author_pad))),
                 plain(snip),
             ]
         }
@@ -496,6 +529,7 @@ fn emit(spans: &[Span], color: &str, cols: usize) -> String {
             Style::Color(c) => out.push_str(&format!("\x1b[{c}m{piece}\x1b[0m")),
             // OSC 8 hyperlink: ESC ] 8 ; ; <url> ST <text> ESC ] 8 ; ; ST
             Style::Link(url) => out.push_str(&format!("\x1b]8;;{url}\x1b\\{piece}\x1b]8;;\x1b\\")),
+            Style::Highlight => out.push_str(&format!("\x1b[1;48;5;238m{piece}\x1b[0m")),
         }
         if truncated_here {
             break;
@@ -1189,22 +1223,69 @@ mod log_tier_tests {
         ];
         let lines = render(&s, 10, 60);
         let texts: Vec<String> = lines.iter().map(|l| visible(l)).collect();
-        // Umbrella header at column 0; commit indented under it.
+        // Umbrella header (visible text is the bare plan name) and the
+        // commit indented under it at column 2.
         assert!(texts.iter().any(|t| t == "foo"), "header: {texts:?}");
         assert!(
             texts.iter().any(|t| t.starts_with("  abc1234 intro")),
             "commit indented: {texts:?}"
         );
+        let raw = lines.join("");
+        // The header carries the background-highlight SGR.
+        assert!(
+            raw.contains("\x1b[1;48;5;238mfoo\x1b[0m"),
+            "header background-highlighted: {raw:?}"
+        );
         // The verdict tick is COLORED (green for approve) in the raw
         // ANSI output — lloyd's "make the ticks pop".
-        let raw = lines.join("");
         assert!(
             raw.contains("\x1b[32m✓\x1b[0m"),
             "approve tick must be green: {raw:?}"
         );
         assert!(
-            texts.iter().any(|t| t.contains("✓ codex: lgtm")),
+            texts.iter().any(|t| t.contains("✓  codex: lgtm")),
             "review line: {texts:?}"
+        );
+    }
+
+    #[test]
+    fn review_marks_align_with_sha_and_summaries_align() {
+        use crate::cli::log::OnelineRow;
+        use clank_core::vocab::Verdict;
+        let review = |v, author: &str| OnelineRow::Review {
+            verdict: v,
+            author: author.into(),
+            summary: "why".into(),
+        };
+        let mut s = snap(vec![plan_state("foo", reviewer_missing("codex"))], vec![]);
+        s.log_rows = vec![
+            commit_row("intro"),
+            review(Verdict::Approve, "codex"), // ✓  (1-wide mark, mid name)
+            review(Verdict::Finished, "ruthless"), // ✓✓ (2-wide mark, long name)
+            review(Verdict::RequestChanges, "zz"), // ✗  (1-wide mark, short name)
+        ];
+        let texts: Vec<String> = render(&s, 12, 80).iter().map(|l| visible(l)).collect();
+
+        // Display COLUMN (not byte offset — ✓ is 3 bytes/1 col, ✓✓ is
+        // 6 bytes/2 cols) of where `needle` begins on a line.
+        let col = |line: &str, needle: &str| display_width(&line[..line.find(needle).unwrap()]);
+
+        // The commit sha sits at column 2 (after "  ").
+        let commit = texts.iter().find(|t| t.contains("abc1234")).unwrap();
+        assert_eq!(col(commit, "abc1234"), 2, "sha at column 2: {commit:?}");
+
+        // Every review mark starts at that SAME column 2, and every
+        // summary (`: why`) starts at one shared column regardless of
+        // mark width or author length.
+        let mut summary_cols = Vec::new();
+        for (mark, name) in [("✓", "codex"), ("✓✓", "ruthless"), ("✗", "zz")] {
+            let line = texts.iter().find(|t| t.contains(name)).unwrap();
+            assert_eq!(col(line, mark), 2, "mark at sha column: {line:?}");
+            summary_cols.push(col(line, ": why"));
+        }
+        assert!(
+            summary_cols.iter().all(|c| *c == summary_cols[0]),
+            "summaries align across marks + name lengths: {summary_cols:?}"
         );
     }
 }
