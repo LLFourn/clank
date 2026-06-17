@@ -361,6 +361,117 @@ mod tests {
         assert!(!diag.cache_hit);
     }
 
+    /// `(inode, mtime_s, mtime_ns, len)` of every cache file, keyed by
+    /// name. The inode is the decisive churn signal: every `write`
+    /// temp+rename swaps it, so a rewrite shows up even within one
+    /// wall-clock second (when mtime wouldn't move).
+    #[cfg(unix)]
+    fn cache_fingerprint(cache: &Path) -> std::collections::BTreeMap<String, (u64, i64, i64, u64)> {
+        use std::os::unix::fs::MetadataExt;
+        let mut m = std::collections::BTreeMap::new();
+        for e in std::fs::read_dir(cache).into_iter().flatten().flatten() {
+            let md = e.metadata().unwrap();
+            m.insert(
+                e.file_name().to_string_lossy().into_owned(),
+                (md.ino(), md.mtime(), md.mtime_nsec(), md.len()),
+            );
+        }
+        m
+    }
+
+    #[cfg(unix)]
+    fn assert_no_churn(
+        before: &std::collections::BTreeMap<String, (u64, i64, i64, u64)>,
+        after: &std::collections::BTreeMap<String, (u64, i64, i64, u64)>,
+    ) {
+        let churned: Vec<String> = before
+            .keys()
+            .filter(|k| after.get(*k) != before.get(*k))
+            .cloned()
+            .collect();
+        assert!(
+            churned.is_empty(),
+            "stable-head folds churned {} cache file(s): {churned:?}",
+            churned.len()
+        );
+    }
+
+    /// Reproduces status-tui-watch-cpu at the engine level. The status
+    /// snapshot's `recent_log_rows` calls `rebuild_from` on EVERY
+    /// render, and `rebuild_from` has no warm-cache fast path — it
+    /// re-folds the recent window and writes spaced checkpoints each
+    /// call. At a STABLE head those checkpoint files already exist, so
+    /// the temp+rename rewrites them, churning their inode/mtime. The
+    /// status watcher sees the `.clank/cache` write and wakes → render
+    /// → rewrite → wake. The cache MUST stay inode-stable across
+    /// repeated stable-head folds. (Verified to FAIL before the
+    /// idempotent-write fix: 6 files churned per round.)
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn repeated_rebuild_from_at_stable_head_does_not_churn_cache() {
+        let dir = init_repo();
+        // More than the log window so `from = HEAD~30` resolves and
+        // the recent slice is dense with checkpoints.
+        for i in 0..40 {
+            write_file(dir.path(), ".clank/plans/foo.md", &format!("# foo v{i}\n"));
+            commit(dir.path(), &format!("[foo] step {i}"));
+        }
+        let head = crate::git_io::rev_parse_head(dir.path())
+            .unwrap()
+            .expect("head");
+        let from = crate::git_io::resolve_commit(dir.path(), "HEAD~30");
+
+        let cache = dir.path().join(".clank/cache/repo-state");
+        // Prime the checkpoint set exactly as a render does.
+        rebuild_from(dir.path(), from.as_ref(), &head)
+            .await
+            .unwrap();
+        let before = cache_fingerprint(&cache);
+        assert!(!before.is_empty(), "priming wrote at least one checkpoint");
+
+        // Repeated renders at the SAME head must not rewrite anything.
+        for _ in 0..5 {
+            rebuild_from(dir.path(), from.as_ref(), &head)
+                .await
+                .unwrap();
+        }
+        assert_no_churn(&before, &cache_fingerprint(&cache));
+    }
+
+    /// The same guarantee through the FULL render path: building a
+    /// `StatusSnapshot` (which runs `rebuild_repo_with_policy` AND
+    /// `recent_log_rows`/`rebuild_from`) repeatedly at a stable head
+    /// must not rewrite any cache file. This is the closest in-process
+    /// proxy for "a status --tui render leaves the cache alone."
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn repeated_status_snapshots_at_stable_head_do_not_churn_cache() {
+        let dir = init_repo();
+        for i in 0..40 {
+            write_file(dir.path(), ".clank/plans/foo.md", &format!("# foo v{i}\n"));
+            commit(dir.path(), &format!("[foo] step {i}"));
+        }
+        let cache = dir.path().join(".clank/cache/repo-state");
+        let build = || {
+            crate::cli::status::StatusSnapshot::build_async(
+                dir.path(),
+                "repo",
+                None,
+                CachePolicy::Use,
+                None,
+                false,
+            )
+        };
+        build().await.unwrap();
+        let before = cache_fingerprint(&cache);
+        assert!(!before.is_empty(), "first snapshot primed the cache");
+
+        for _ in 0..5 {
+            build().await.unwrap();
+        }
+        assert_no_churn(&before, &cache_fingerprint(&cache));
+    }
+
     #[tokio::test]
     async fn ancestor_cache_fold_forwards() {
         let dir = init_repo();

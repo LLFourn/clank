@@ -181,6 +181,19 @@ pub fn write(repo_root: &Path, state: &RepoState, depth: u64) -> Result<(), Cach
     let Some(head) = state.head.as_ref() else {
         return Ok(());
     };
+
+    // Idempotent: a checkpoint payload is a pure function of
+    // `(head sha, depth)`, so an existing file is already byte-correct.
+    // Skip the rewrite entirely (no serialize, no rename) — rewriting
+    // would only churn the file's mtime/inode, which the status watcher
+    // sees and turns into a render→write-cache→wake loop
+    // (status-tui-watch-cpu). A pruned/missing checkpoint is absent
+    // here, so it still gets written.
+    let final_path = cache_file_for(repo_root, head, depth);
+    if final_path.exists() {
+        return Ok(());
+    }
+
     let dir = cache_dir(repo_root);
     fs::create_dir_all(&dir)?;
 
@@ -200,7 +213,6 @@ pub fn write(repo_root: &Path, state: &RepoState, depth: u64) -> Result<(), Cach
     buf.extend_from_slice(sha_bytes);
     buf.extend_from_slice(&body);
 
-    let final_path = cache_file_for(repo_root, head, depth);
     let nonce = TEMP_NONCE.fetch_add(1, Ordering::Relaxed);
     let tmp_path = dir.join(format!(
         ".{}.{}.v{}.tmp.{}.{}",
@@ -339,6 +351,27 @@ mod tests {
             .expect("cache file should exist after write");
         assert_eq!(loaded.head, state.head);
         assert_eq!(loaded.fold, state.fold);
+    }
+
+    #[test]
+    fn write_is_idempotent_when_file_exists() {
+        // A second write of the same (head, depth) must NOT replace the
+        // file — the payload is determined by (head, depth), so a
+        // rewrite only churns the mtime/inode and feeds the status-tui
+        // wake loop (status-tui-watch-cpu). Proven by writing a sentinel
+        // over the real file and asserting `write` leaves it untouched.
+        let dir = fresh_repo();
+        let state = synth_state(dir.path());
+        write(dir.path(), &state, 7).unwrap();
+        let path = cache_file_for(dir.path(), state.head.as_ref().unwrap(), 7);
+
+        fs::write(&path, b"SENTINEL").unwrap();
+        write(dir.path(), &state, 7).unwrap();
+        assert_eq!(
+            fs::read(&path).unwrap(),
+            b"SENTINEL",
+            "write must skip when the checkpoint file already exists"
+        );
     }
 
     #[test]
