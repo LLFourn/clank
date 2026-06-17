@@ -98,6 +98,19 @@ pub fn discover_work_dir(start: &Path) -> Result<Option<PathBuf>, GitIoError> {
     }
 }
 
+/// Read a git config key as a boolean, honoring git's bool syntax
+/// (`true`/`1`/`yes`/`on` → true; `false`/`0`/`no`/`off` → false).
+/// `None` when the key is absent (or unparseable). Replaces
+/// `git config --get <key>` + a hand-rolled truthiness check.
+pub fn config_bool(repo: &Path, key: &str) -> Result<Option<bool>, GitIoError> {
+    let r = gix::open(repo).map_err(|e| GitIoError::NonZero {
+        context: "open".into(),
+        code: None,
+        stderr: format!("open: {e}"),
+    })?;
+    Ok(r.config_snapshot().boolean(key))
+}
+
 /// Return the blob content at `rel_path` in the tree of `rev`.
 /// Preserves trailing whitespace (newlines matter for hashing).
 ///
@@ -1302,6 +1315,39 @@ mod tests {
         // Outside any repo → None (caller bails / falls back).
         let outside = tempfile::tempdir().unwrap();
         assert!(discover_work_dir(outside.path()).unwrap().is_none());
+    }
+
+    #[test]
+    fn config_bool_honors_git_bool_syntax() {
+        use std::process::Command;
+        fn git(dir: &Path, args: &[&str]) {
+            assert!(
+                Command::new("git")
+                    .arg("-C")
+                    .arg(dir)
+                    .args(args)
+                    .status()
+                    .unwrap()
+                    .success(),
+                "git {args:?}"
+            );
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let r = dir.path();
+        git(r, &["init", "--quiet"]);
+        let key = "branch.foo.protect";
+        // Absent → None.
+        assert_eq!(config_bool(r, key).unwrap(), None);
+        // git's truthy/falsy spellings (the reason to use gix's parser
+        // over a hand-rolled match).
+        for truthy in ["true", "1", "yes", "on"] {
+            git(r, &["config", key, truthy]);
+            assert_eq!(config_bool(r, key).unwrap(), Some(true), "{truthy}");
+        }
+        for falsy in ["false", "0", "no", "off"] {
+            git(r, &["config", key, falsy]);
+            assert_eq!(config_bool(r, key).unwrap(), Some(false), "{falsy}");
+        }
     }
 
     mod walker_equivalence {

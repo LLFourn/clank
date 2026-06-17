@@ -267,16 +267,7 @@ fn is_protected_branch(repo: &Path, branch: &str) -> anyhow::Result<bool> {
     if matches!(branch, "main" | "master") {
         return Ok(true);
     }
-    let output = std::process::Command::new("git")
-        .arg("-C")
-        .arg(repo)
-        .args(["config", "--get", &format!("branch.{branch}.protect")])
-        .output()?;
-    if !output.status.success() {
-        return Ok(false);
-    }
-    let val = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    Ok(matches!(val.as_str(), "true" | "1" | "yes" | "on"))
+    Ok(crate::git_io::config_bool(repo, &format!("branch.{branch}.protect"))?.unwrap_or(false))
 }
 
 /// Emit a `git rebase --interactive` todo list. The operator can

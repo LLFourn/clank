@@ -379,19 +379,11 @@ async fn run_amend(repo: &std::path::Path, basename: &str, args: &PurgeArgs) -> 
             .output()?;
         let branch = String::from_utf8_lossy(&current.stdout).trim().to_string();
         let protected_by_name = matches!(branch.as_str(), "main" | "master");
-        let protected_by_config = std::process::Command::new("git")
-            .arg("-C")
-            .arg(repo)
-            .args(["config", "--get", &format!("branch.{branch}.protect")])
-            .output()
-            .map(|o| {
-                o.status.success()
-                    && matches!(
-                        String::from_utf8_lossy(&o.stdout).trim(),
-                        "true" | "1" | "yes" | "on"
-                    )
-            })
-            .unwrap_or(false);
+        let protected_by_config =
+            crate::git_io::config_bool(repo, &format!("branch.{branch}.protect"))
+                .ok()
+                .flatten()
+                .unwrap_or(false);
         if protected_by_name || protected_by_config {
             anyhow::bail!(
                 "refusing to amend protected branch `{branch}`. \
