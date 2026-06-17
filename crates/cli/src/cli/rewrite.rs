@@ -746,8 +746,8 @@ fn parent_of(repo: &Path, sha: &str) -> anyhow::Result<Option<String>> {
 }
 
 fn current_branch(repo: &Path) -> anyhow::Result<String> {
-    let stdout = git_capture(repo, &["symbolic-ref", "--short", "HEAD"])?;
-    Ok(stdout.trim().to_string())
+    crate::git_io::current_branch(repo)?
+        .ok_or_else(|| anyhow::anyhow!("HEAD is detached; cannot determine the branch to rewrite"))
 }
 
 fn git_run(repo: &Path, args: &[&str]) -> anyhow::Result<()> {

@@ -111,6 +111,26 @@ pub fn config_bool(repo: &Path, key: &str) -> Result<Option<bool>, GitIoError> {
     Ok(r.config_snapshot().boolean(key))
 }
 
+/// The short name of the branch HEAD points to (e.g. `master`), or
+/// `None` when HEAD is detached or unborn. Replaces
+/// `git symbolic-ref --short HEAD` (which exits non-zero when
+/// detached — callers map `None` to their own fallback/error).
+pub fn current_branch(repo: &Path) -> Result<Option<String>, GitIoError> {
+    let r = gix::open(repo).map_err(|e| GitIoError::NonZero {
+        context: "current_branch".into(),
+        code: None,
+        stderr: format!("open: {e}"),
+    })?;
+    match r.head_name() {
+        Ok(opt) => Ok(opt.map(|name| name.shorten().to_string())),
+        Err(e) => Err(GitIoError::NonZero {
+            context: "current_branch".into(),
+            code: None,
+            stderr: format!("head_name: {e}"),
+        }),
+    }
+}
+
 /// The commit's subject line — gix `summary()`, matching git's `%s`
 /// subject folding. Replaces `git log -1 --format=%s <sha>`.
 pub fn commit_subject(repo: &Path, sha: &CommitSha) -> Result<String, GitIoError> {
@@ -1439,6 +1459,38 @@ mod tests {
         let head = rev_parse_head(r).unwrap().unwrap();
         assert_eq!(commit_subject(r, &head).unwrap(), "the subject");
         assert_eq!(commit_body(r, &head).unwrap().trim(), "line 1\nline 2");
+    }
+
+    #[test]
+    fn current_branch_reads_head_and_none_when_detached() {
+        use std::process::Command;
+        fn git(dir: &Path, args: &[&str]) {
+            assert!(
+                Command::new("git")
+                    .arg("-C")
+                    .arg(dir)
+                    .args(args)
+                    .status()
+                    .unwrap()
+                    .success(),
+                "git {args:?}"
+            );
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let r = dir.path();
+        git(r, &["init", "--quiet", "--initial-branch=main"]);
+        git(r, &["config", "user.email", "t@t"]);
+        git(r, &["config", "user.name", "t"]);
+        std::fs::write(r.join("f"), "x").unwrap();
+        git(r, &["add", "-A"]);
+        git(r, &["commit", "--quiet", "-m", "c"]);
+
+        assert_eq!(current_branch(r).unwrap().as_deref(), Some("main"));
+
+        // Detached HEAD → None (the old `symbolic-ref` exited non-zero).
+        let head = rev_parse_head(r).unwrap().unwrap();
+        git(r, &["checkout", "--quiet", head.as_str()]);
+        assert_eq!(current_branch(r).unwrap(), None);
     }
 
     mod walker_equivalence {

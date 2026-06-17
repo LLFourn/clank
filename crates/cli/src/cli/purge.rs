@@ -344,12 +344,12 @@ async fn run_amend(repo: &std::path::Path, basename: &str, args: &PurgeArgs) -> 
         anyhow::bail!("working tree dirty; commit or stash first");
     }
     if !args.allow_rewrite_protected {
-        let current = std::process::Command::new("git")
-            .arg("-C")
-            .arg(repo)
-            .args(["symbolic-ref", "--short", "HEAD"])
-            .output()?;
-        let branch = String::from_utf8_lossy(&current.stdout).trim().to_string();
+        // Detached HEAD → no branch name → not protected-by-name
+        // (matches the old empty `symbolic-ref` output).
+        let branch = crate::git_io::current_branch(repo)
+            .ok()
+            .flatten()
+            .unwrap_or_default();
         let protected_by_name = matches!(branch.as_str(), "main" | "master");
         let protected_by_config =
             crate::git_io::config_bool(repo, &format!("branch.{branch}.protect"))

@@ -500,20 +500,11 @@ fn probe_git(path: &Path) -> Option<GitProbe> {
 }
 
 fn head_branch_info(path: &Path) -> (Option<String>, bool) {
-    let out = std::process::Command::new("git")
-        .arg("-C")
-        .arg(path)
-        .args(["symbolic-ref", "--quiet", "--short", "HEAD"])
-        .output();
-    if let Ok(out) = out {
-        if out.status.success() {
-            let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
-            if !s.is_empty() {
-                return (Some(s), false);
-            }
-        }
+    // (branch, detached). Detached/unborn/unresolvable → no branch.
+    match crate::git_io::current_branch(path).ok().flatten() {
+        Some(branch) => (Some(branch), false),
+        None => (None, true),
     }
-    (None, true)
 }
 
 fn worktree_dirty(path: &Path) -> bool {
