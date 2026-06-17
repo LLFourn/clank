@@ -123,9 +123,9 @@ likewise re-fork its ancestor via `claude --resume <src>
 both are fixed. lloyd hit it on codex, but it was never
 codex-specific.
 
-Remaining live confirmation (hand to lloyd if it recurs): reproduce
-A→B→C and, before forking C, check that B's bound id matches B's
-actual working codex session, and that C's `fork.json` `from_session`
-is B's id (not A's). If C still shows A's content with a correct
-`from_session`, the residual is codex-side fork-content lineage, not
-clank.
+Live confirmation: CONFIRMED by lloyd — re-ran the fork chain with the
+fixed binary (the one-shot delete is on master and was installed via a
+later `cargo install`) and the chaining symptom is gone. So the
+one-shot fork-spec fix resolves the reported bug; no codex-side
+residual surfaced. (If it ever recurs, the check is: B's bound id ==
+B's working session, and C's `fork.json` `from_session` == B's id.)
