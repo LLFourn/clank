@@ -39,28 +39,46 @@ Each frame, gated on `$ZELLIJ`:
    pane id). Best-effort; a rename failure never disturbs the render
    loop.
 
-## Per-agent emoji (pure, from the snapshot)
+## Per-agent emoji (pure, from the snapshot) — ONE shared predicate
 
+codex 07f8db1: a bespoke `master_working` that only checks plan
+`waiting_on` master variants DRIFTS — it misses the other states where
+the bar/hook wake master: queue-promote, and PR-review master turns
+(round-0 drafting, refining/submitting with no missing reviewers). The
+fix is NOT to re-enumerate; it's to share the ONE predicate
+`state_color` already uses to paint "master working" green/cyan.
+
+- Factor `master_is_active(snap) -> bool` out of `state_color` (the
+  exact condition it currently paints green/cyan): active AND
+  (any plan `MasterTo{Revise,Continue,Commit,Finalize}` | PR reviews
+  with NO missing reviewers | a non-empty queue). REFACTOR
+  `state_color` to call it, so the bar hue and the pane emoji are one
+  source and cannot disagree.
 - `awaited_reviewers(snap)` = union of every `missing` set
   (`ReviewerApprovalsMissing` + `GateReviewersMissing` across plans,
   plus each PR review's `missing_reviewers`).
-- `master_working(snap)` = any plan whose `waiting_on` is a master
-  action (`MasterToRevise | MasterToContinue | MasterToFinalize |
-  MasterToCommit`).
 - `agent_status_emoji(snap, label, role)`:
   - Reviewer → `👀` if `label ∈ awaited_reviewers` else `💤`
-  - Master → `🔨` if `master_working` else `💤`
+  - Master → `🔨` if `master_is_active` else `💤`
 
-  (Multiple reviewers can be `👀` at once; a `Blocked` plan leaves
-  agents `💤` — the human-action signal lives on the bar/tab as 🙋.)
+Explicit glyph decision (codex's ask): the pane indicator is COARSE —
+ALL master-work states (build / revise / commit / finalize / promote /
+PR draft / refine / submit) show the single `🔨`; the bar keeps the
+fine-grained glyph (📋/🏁/🔨…). The pane answers "is this agent
+working", not "exactly what". Multi-plan naturally supports BOTH a
+`🔨` master and `👀` reviewers at once (master active on one plan,
+reviewers awaited on another) — unlike the single-hue bar.
 
 ## Design / testing
 
-- Pure + unit-tested: `awaited_reviewers`, `master_working`,
-  `agent_status_emoji` (master-working, reviewer-awaited, idle), and a
+- Pure + unit-tested: `master_is_active` (incl. a regression that the
+  queue-promote and PR-master states it shares with `state_color`
+  count as master-active — the drift codex caught), `awaited_reviewers`,
+  `agent_status_emoji` (master-active, reviewer-awaited, idle), and a
   `parse_agent_panes(list_panes_stdout) -> [(id,label,role)]` parser
   pinned to the live 0.44.3 fixture (reuse `strip_leading_emoji` to
-  drop a prior glyph so re-applies are stable).
+  drop a prior glyph so re-applies are stable). `state_color` keeps its
+  existing tests (now routed through the shared predicate).
 - A `PaneStatus` tracker beside `TabIndicator`: dedups per pane id,
   `$ZELLIJ`-gated, shells `rename-pane` best-effort.
 - The rename side effect + list-panes shape are live-verified; not
