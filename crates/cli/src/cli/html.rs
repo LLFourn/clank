@@ -932,16 +932,7 @@ fn plan_body_at_head(repo: &Path, stem: &str, lifecycle: PlanLifecycle) -> Optio
         PlanLifecycle::Active => format!(".clank/plans/{stem}.md"),
         PlanLifecycle::Finished => format!(".clank/finished/{stem}.md"),
     };
-    let out = Command::new("git")
-        .arg("-C")
-        .arg(repo)
-        .args(["show", &format!("{}:{path}", head.as_str())])
-        .output()
-        .ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    Some(String::from_utf8_lossy(&out.stdout).to_string())
+    crate::git_io::show_blob(repo, &head, std::path::Path::new(&path)).ok()
 }
 
 fn render_plan_page(
@@ -1355,21 +1346,7 @@ fn short(sha: &str) -> &str {
 }
 
 fn head_sha(repo: &Path) -> anyhow::Result<Option<CommitSha>> {
-    let out = Command::new("git")
-        .arg("-C")
-        .arg(repo)
-        .args(["rev-parse", "HEAD"])
-        .output()?;
-    if !out.status.success() {
-        return Ok(None);
-    }
-    let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    if s.is_empty() {
-        return Ok(None);
-    }
-    Ok(Some(CommitSha::parse(&s).map_err(|e| {
-        anyhow::anyhow!("parse HEAD sha `{s}`: {e}")
-    })?))
+    Ok(crate::git_io::rev_parse_head(repo)?)
 }
 
 fn commit_subject(repo: &Path, sha: &CommitSha) -> String {
@@ -1436,16 +1413,7 @@ fn plan_body_at_commit(repo: &Path, event: &LogEvent) -> Option<String> {
         }
         LogEvent::AdHoc { .. } => return None,
     };
-    let out = Command::new("git")
-        .arg("-C")
-        .arg(repo)
-        .args(["show", &format!("{}:{}", sha.as_str(), path)])
-        .output()
-        .ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    Some(String::from_utf8_lossy(&out.stdout).to_string())
+    crate::git_io::show_blob(repo, sha, std::path::Path::new(&path)).ok()
 }
 
 fn fmt_ts(ts: i64) -> String {
