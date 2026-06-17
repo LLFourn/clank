@@ -211,7 +211,7 @@ fn start(args: AgentStartArgs) -> anyhow::Result<()> {
         // with the orientation prompt; the forked id then binds via
         // the env-var hook and later starts hit the resume path.
         None => match crate::cli::fork::load_fork_spec(&repo, &label)? {
-            Some(spec) => compose_fork_launch(&spec, &desc),
+            Some(spec) => compose_fork_launch(&spec, &desc, &repo),
             None => compose_bootstrap_launch(&label, &desc)?,
         },
         Some(session) => {
@@ -298,12 +298,18 @@ fn compose_bootstrap_launch(
 
 /// Launch a FORKED copy of a source session (clank fork): both
 /// tools fork cleanly — `claude --resume <src> --fork-session`
-/// mints a diverged session; `codex fork <src> [prompt]` likewise
-/// (no `--cd` needed: the pane's cwd IS the worktree). The
-/// orientation prompt rides as the trailing positional on both.
+/// mints a diverged session; `codex fork -C <worktree> <src>
+/// [prompt]` likewise. `worktree` is this agent's resolved repo (the
+/// fork dest). codex's `-C/--cd` is REQUIRED: forking a session
+/// whose recorded cwd differs from the launch cwd otherwise makes
+/// codex interactively prompt "Choose working directory…" every time
+/// (fork-codex-cd-flag); naming the worktree explicitly skips that
+/// picker. claude takes the cwd from the pane and doesn't prompt.
+/// The orientation prompt rides as the trailing positional on both.
 fn compose_fork_launch(
     spec: &crate::cli::fork::ForkSpec,
     desc: &AgentDescription,
+    worktree: &Path,
 ) -> ComposedLaunch {
     let program = desc
         .launch
@@ -323,6 +329,8 @@ fn compose_fork_launch(
         }
         Tool::Codex => {
             args.push("fork".into());
+            args.push("-C".into());
+            args.push(worktree.display().to_string());
             args.push(spec.from_session.clone());
         }
     }
@@ -1425,8 +1433,10 @@ mod tests {
             from_session: "abc-123".into(),
             prompt: "You are `claude` in worktree `x`…".into(),
         };
-        let c = compose_fork_launch(&spec, &desc);
+        let wt = std::path::Path::new("/repo/.clank/worktrees/x");
+        let c = compose_fork_launch(&spec, &desc, wt);
         assert_eq!(c.program, "claude");
+        // claude takes cwd from the pane — no -C.
         assert_eq!(
             c.args,
             vec![
@@ -1447,8 +1457,19 @@ mod tests {
             from_session: "def-456".into(),
             prompt: "orient".into(),
         };
-        let c = compose_fork_launch(&spec, &desc);
+        let c = compose_fork_launch(&spec, &desc, wt);
         assert_eq!(c.program, "codex");
-        assert_eq!(c.args, vec!["fork", "def-456", "orient"]);
+        // codex gets -C <worktree> so it doesn't prompt for the cwd
+        // (fork-codex-cd-flag).
+        assert_eq!(
+            c.args,
+            vec![
+                "fork",
+                "-C",
+                "/repo/.clank/worktrees/x",
+                "def-456",
+                "orient",
+            ]
+        );
     }
 }
