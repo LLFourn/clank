@@ -1350,32 +1350,18 @@ fn head_sha(repo: &Path) -> anyhow::Result<Option<CommitSha>> {
 }
 
 fn commit_subject(repo: &Path, sha: &CommitSha) -> String {
-    let out = Command::new("git")
-        .arg("-C")
-        .arg(repo)
-        .args(["log", "-1", "--format=%s", sha.as_str()])
-        .output();
-    let Ok(out) = out else { return String::new() };
-    if !out.status.success() {
-        return String::new();
-    }
-    String::from_utf8_lossy(&out.stdout).trim().to_string()
+    crate::git_io::commit_subject(repo, sha)
+        .map(|s| s.trim().to_string())
+        .unwrap_or_default()
 }
 
 /// The commit message body (everything after the subject line
 /// and its trailing blank). Empty when the commit has only a
 /// subject.
 fn commit_body(repo: &Path, sha: &CommitSha) -> String {
-    let out = Command::new("git")
-        .arg("-C")
-        .arg(repo)
-        .args(["log", "-1", "--format=%b", sha.as_str()])
-        .output();
-    let Ok(out) = out else { return String::new() };
-    if !out.status.success() {
-        return String::new();
-    }
-    String::from_utf8_lossy(&out.stdout).trim().to_string()
+    crate::git_io::commit_body(repo, sha)
+        .map(|b| b.trim().to_string())
+        .unwrap_or_default()
 }
 
 /// Batch-fetch commit subjects via a single `git log` so the

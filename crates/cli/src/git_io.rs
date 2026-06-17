@@ -111,6 +111,57 @@ pub fn config_bool(repo: &Path, key: &str) -> Result<Option<bool>, GitIoError> {
     Ok(r.config_snapshot().boolean(key))
 }
 
+/// The commit's subject line — gix `summary()`, matching git's `%s`
+/// subject folding. Replaces `git log -1 --format=%s <sha>`.
+pub fn commit_subject(repo: &Path, sha: &CommitSha) -> Result<String, GitIoError> {
+    let r = gix::open(repo).map_err(|e| GitIoError::NonZero {
+        context: "commit_subject".into(),
+        code: None,
+        stderr: format!("open: {e}"),
+    })?;
+    let oid = gix::ObjectId::from_hex(sha.as_str().as_bytes()).map_err(|e| GitIoError::Parse {
+        context: "commit_subject".into(),
+        detail: format!("oid hex: {e}"),
+    })?;
+    let commit = r.find_commit(oid).map_err(|e| GitIoError::NonZero {
+        context: "commit_subject".into(),
+        code: None,
+        stderr: format!("find_commit: {e}"),
+    })?;
+    let msg = commit.message().map_err(|e| GitIoError::NonZero {
+        context: "commit_subject".into(),
+        code: None,
+        stderr: format!("message: {e}"),
+    })?;
+    Ok(msg.summary().to_string())
+}
+
+/// The commit's body (`%b`) — everything after the subject and its
+/// blank line, or `""` if none. Replaces `git log -1 --format=%b
+/// <sha>`.
+pub fn commit_body(repo: &Path, sha: &CommitSha) -> Result<String, GitIoError> {
+    let r = gix::open(repo).map_err(|e| GitIoError::NonZero {
+        context: "commit_body".into(),
+        code: None,
+        stderr: format!("open: {e}"),
+    })?;
+    let oid = gix::ObjectId::from_hex(sha.as_str().as_bytes()).map_err(|e| GitIoError::Parse {
+        context: "commit_body".into(),
+        detail: format!("oid hex: {e}"),
+    })?;
+    let commit = r.find_commit(oid).map_err(|e| GitIoError::NonZero {
+        context: "commit_body".into(),
+        code: None,
+        stderr: format!("find_commit: {e}"),
+    })?;
+    let msg = commit.message().map_err(|e| GitIoError::NonZero {
+        context: "commit_body".into(),
+        code: None,
+        stderr: format!("message: {e}"),
+    })?;
+    Ok(msg.body().map(|b| b.to_string()).unwrap_or_default())
+}
+
 /// Return the blob content at `rel_path` in the tree of `rev`.
 /// Preserves trailing whitespace (newlines matter for hashing).
 ///
@@ -1348,6 +1399,46 @@ mod tests {
             git(r, &["config", key, falsy]);
             assert_eq!(config_bool(r, key).unwrap(), Some(false), "{falsy}");
         }
+    }
+
+    #[test]
+    fn commit_subject_and_body_match_git() {
+        use std::process::Command;
+        fn git(dir: &Path, args: &[&str]) {
+            assert!(
+                Command::new("git")
+                    .arg("-C")
+                    .arg(dir)
+                    .args(args)
+                    .status()
+                    .unwrap()
+                    .success(),
+                "git {args:?}"
+            );
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let r = dir.path();
+        git(r, &["init", "--quiet"]);
+        git(r, &["config", "user.email", "t@t"]);
+        git(r, &["config", "user.name", "t"]);
+        std::fs::write(r.join("f"), "x").unwrap();
+        git(r, &["add", "-A"]);
+        // `-m subject -m body` → subject + body separated by a blank.
+        git(
+            r,
+            &[
+                "commit",
+                "--quiet",
+                "-m",
+                "the subject",
+                "-m",
+                "line 1\nline 2",
+            ],
+        );
+
+        let head = rev_parse_head(r).unwrap().unwrap();
+        assert_eq!(commit_subject(r, &head).unwrap(), "the subject");
+        assert_eq!(commit_body(r, &head).unwrap().trim(), "line 1\nline 2");
     }
 
     mod walker_equivalence {

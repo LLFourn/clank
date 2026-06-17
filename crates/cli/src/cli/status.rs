@@ -896,11 +896,11 @@ pub(crate) fn short_sha(s: &str) -> &str {
 
 fn head_info(repo: &Path) -> (Option<String>, Option<String>, Option<String>) {
     let branch = git_output(repo, &["symbolic-ref", "--short", "HEAD"]);
-    let sha = crate::git_io::rev_parse_head(repo)
-        .ok()
-        .flatten()
-        .map(|s| s.as_str().to_string());
-    let subject = git_output(repo, &["log", "-1", "--format=%s"]);
+    let head = crate::git_io::rev_parse_head(repo).ok().flatten();
+    let sha = head.as_ref().map(|s| s.as_str().to_string());
+    let subject = head
+        .as_ref()
+        .and_then(|s| crate::git_io::commit_subject(repo, s).ok());
     (branch, sha, subject)
 }
 
