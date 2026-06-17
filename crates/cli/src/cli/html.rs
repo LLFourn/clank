@@ -371,12 +371,12 @@ fn meta_value(html: &str, name: &str) -> Option<String> {
 }
 
 fn prev_is_ancestor(repo: &Path, prev: &str, head: &str) -> bool {
-    let out = std::process::Command::new("git")
-        .arg("-C")
-        .arg(repo)
-        .args(["merge-base", "--is-ancestor", prev, head])
-        .status();
-    matches!(out, Ok(s) if s.success())
+    // Unparseable shas → not-ancestor, matching the old merge-base
+    // exit-1 behavior.
+    let (Ok(prev), Ok(head)) = (CommitSha::parse(prev), CommitSha::parse(head)) else {
+        return false;
+    };
+    crate::git_io::is_ancestor(repo, &prev, &head).unwrap_or(false)
 }
 
 /// Stderr progress bar. No-op when stderr isn't a TTY or

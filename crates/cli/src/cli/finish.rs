@@ -337,18 +337,13 @@ fn require_head_is_finalize(repo: &Path, stem: &str) -> anyhow::Result<()> {
 }
 
 fn head_is_finalize_for(repo: &Path, stem: &str) -> anyhow::Result<bool> {
-    let output = std::process::Command::new("git")
-        .arg("-C")
-        .arg(repo)
-        .args(["diff-tree", "--no-commit-id", "--name-only", "-r", "HEAD"])
-        .output()?;
-    if !output.status.success() {
+    let Some(head) = crate::git_io::rev_parse_head(repo)? else {
         return Ok(false);
-    }
+    };
     let finished_path = format!(".clank/finished/{stem}.md");
-    Ok(String::from_utf8_lossy(&output.stdout)
-        .lines()
-        .any(|l| l == finished_path))
+    Ok(crate::git_io::diff_tree_changes(repo, &head)
+        .map(|c| c.clank_paths_touched.contains(&finished_path))
+        .unwrap_or(false))
 }
 
 fn git_run(repo: &Path, args: &[&str]) -> anyhow::Result<()> {
