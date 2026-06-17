@@ -537,29 +537,43 @@ async fn apply_squash(
     // committer are all deterministic, so commit-tree yields the
     // identical object. (A `now` committer date would churn the sha
     // on every re-run.)
-    let mut cmd = std::process::Command::new("git");
-    cmd.arg("-C").arg(repo);
-    let author = git_capture(repo, &["show", "-s", "--format=%an <%ae>", head_str])?;
-    let author_date = git_capture(repo, &["show", "-s", "--format=%aI", head_str])?;
-    if let Some((name, email)) = parse_author(author.trim()) {
-        cmd.env("GIT_AUTHOR_NAME", name);
-        cmd.env("GIT_AUTHOR_EMAIL", email);
-    }
-    cmd.env("GIT_AUTHOR_DATE", author_date.trim());
-    cmd.env("GIT_COMMITTER_DATE", author_date.trim());
-    cmd.args(["commit-tree", &new_tree]);
-    if let Some(p) = intro_parent {
-        cmd.args(["-p", p]);
-    }
-    cmd.arg("-m").arg(message);
-    let output = cmd.output()?;
-    if !output.status.success() {
-        anyhow::bail!(
-            "git commit-tree failed for squash: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        );
-    }
-    Ok(String::from_utf8(output.stdout)?.trim().to_string())
+    let r = gix::open(repo).with_context(|| format!("gix open `{}`", repo.display()))?;
+    let head = r
+        .find_commit(parse_oid(head_str)?)
+        .with_context(|| format!("find HEAD commit `{head_str}`"))?;
+    // Preserve HEAD's author exactly.
+    let author = head.author().context("HEAD author")?.to_owned()?;
+    // Committer = the configured identity, but with its DATE PINNED to
+    // the author date (per the idempotence note above) rather than
+    // `now` — `gix::date::Time` is Copy, so reusing `author.time`
+    // doesn't disturb the move into the commit.
+    let cfg = r
+        .committer()
+        .ok_or_else(|| anyhow::anyhow!("no committer identity (set user.name / user.email)"))?
+        .context("committer time")?;
+    let committer = gix::actor::Signature {
+        name: cfg.name.to_owned(),
+        email: cfg.email.to_owned(),
+        time: author.time,
+    };
+    let parents = intro_parent
+        .map(parse_oid)
+        .transpose()?
+        .into_iter()
+        .collect();
+    let commit = gix::objs::Commit {
+        tree: parse_oid(&new_tree)?,
+        parents,
+        author,
+        committer,
+        encoding: None,
+        message: message.into(),
+        extra_headers: Vec::new(),
+    };
+    Ok(r.write_object(&commit)
+        .context("write squashed commit")?
+        .detach()
+        .to_string())
 }
 
 /// Alias of [`build_stripped_tree`] for the squash path (works from
@@ -660,12 +674,6 @@ fn commit_tree_sha(repo: &Path, sha: &str) -> anyhow::Result<String> {
         .with_context(|| format!("tree of `{sha}`"))?
         .detach()
         .to_string())
-}
-
-fn parse_author(spec: &str) -> Option<(&str, &str)> {
-    let (name, rest) = spec.rsplit_once(" <")?;
-    let email = rest.trim_end_matches('>');
-    Some((name, email))
 }
 
 fn working_tree_dirty(repo: &Path) -> anyhow::Result<bool> {
@@ -1228,6 +1236,41 @@ mod tests {
         assert_eq!(shell_quote("simple/path.md"), "simple/path.md");
         assert_eq!(shell_quote("a b.md"), "'a b.md'");
         assert_eq!(shell_quote("isn't.md"), r"'isn'\''t.md'");
+    }
+
+    #[tokio::test]
+    async fn apply_squash_is_idempotent() {
+        // Re-squashing an already-squashed commit MUST reproduce the
+        // same sha (finish-squash-idempotent-on-finished): the gix
+        // commit object pins the committer date to the (preserved)
+        // author date, so tree + parents + author + committer are all
+        // deterministic across runs.
+        let dir = init_repo();
+        let repo = dir.path();
+        write(repo, "base.txt", "base\n");
+        let base = commit(repo, "base");
+        write(repo, "feature.txt", "f\n");
+        let c = commit(repo, "feature work");
+
+        let s1 = apply_squash(
+            repo,
+            &CommitSha::parse(&c).unwrap(),
+            &[],
+            Some(&base),
+            "squashed",
+        )
+        .await
+        .unwrap();
+        let s2 = apply_squash(
+            repo,
+            &CommitSha::parse(&s1).unwrap(),
+            &[],
+            Some(&base),
+            "squashed",
+        )
+        .await
+        .unwrap();
+        assert_eq!(s1, s2, "re-squash must reproduce the same sha");
     }
 
     #[tokio::test]
