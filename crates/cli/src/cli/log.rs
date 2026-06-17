@@ -87,16 +87,7 @@ pub async fn run(args: LogArgs) -> anyhow::Result<()> {
 // ── git helpers ──────────────────────────────────────────────
 
 pub(crate) fn git_rev_parse(repo: &Path, rev: &str) -> Option<CommitSha> {
-    let o = std::process::Command::new("git")
-        .arg("-C")
-        .arg(repo)
-        .args(["rev-parse", "--verify", "--quiet", rev])
-        .output()
-        .ok()?;
-    if !o.status.success() {
-        return None;
-    }
-    CommitSha::parse(String::from_utf8_lossy(&o.stdout).trim()).ok()
+    crate::git_io::resolve_commit(repo, rev)
 }
 
 fn parse_range(repo: &Path, range: &str) -> anyhow::Result<(Option<CommitSha>, CommitSha)> {

@@ -108,15 +108,10 @@ async fn run_read(args: FeedbackReadArgs) -> anyhow::Result<()> {
     let repo = resolve_repo(args.repo.as_deref())?;
 
     let rev = args.commit.as_deref().unwrap_or("HEAD");
-    let output = std::process::Command::new("git")
-        .arg("-C")
-        .arg(&repo)
-        .args(["rev-parse", "--verify", "--quiet", rev])
-        .output()?;
-    if !output.status.success() {
-        anyhow::bail!("cannot resolve `{rev}` to a commit");
-    }
-    let full_sha = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let full_sha = crate::git_io::resolve_commit(&repo, rev)
+        .ok_or_else(|| anyhow::anyhow!("cannot resolve `{rev}` to a commit"))?
+        .as_str()
+        .to_string();
     let short_sha = &full_sha[..full_sha.len().min(7)];
 
     let agents_dir = repo.join(".clank/agents");

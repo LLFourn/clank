@@ -719,17 +719,7 @@ fn working_tree_dirty(repo: &Path) -> anyhow::Result<bool> {
 }
 
 fn branch_exists(repo: &Path, branch: &str) -> anyhow::Result<bool> {
-    let output = std::process::Command::new("git")
-        .arg("-C")
-        .arg(repo)
-        .args([
-            "rev-parse",
-            "--verify",
-            "--quiet",
-            &format!("refs/heads/{branch}"),
-        ])
-        .output()?;
-    Ok(output.status.success())
+    Ok(crate::git_io::resolve_commit(repo, &format!("refs/heads/{branch}")).is_some())
 }
 
 fn parent_of(repo: &Path, sha: &str) -> anyhow::Result<Option<String>> {

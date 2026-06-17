@@ -111,6 +111,17 @@ pub fn config_bool(repo: &Path, key: &str) -> Result<Option<bool>, GitIoError> {
     Ok(r.config_snapshot().boolean(key))
 }
 
+/// Resolve a revspec (`HEAD`, a sha, `refs/heads/<b>`, …) to a commit
+/// SHA, or `None` if it can't be resolved. Matches `git rev-parse
+/// --verify --quiet <rev>` (which exits non-zero + empty on an
+/// unresolvable rev). Open/parse failures also fold to `None` — every
+/// caller treats "couldn't resolve" uniformly.
+pub fn resolve_commit(repo: &Path, rev: &str) -> Option<CommitSha> {
+    let r = gix::open(repo).ok()?;
+    let id = r.rev_parse_single(rev).ok()?;
+    CommitSha::parse(&id.detach().to_string()).ok()
+}
+
 /// The short name of the branch HEAD points to (e.g. `master`), or
 /// `None` when HEAD is detached or unborn. Replaces
 /// `git symbolic-ref --short HEAD` (which exits non-zero when
@@ -1491,6 +1502,40 @@ mod tests {
         let head = rev_parse_head(r).unwrap().unwrap();
         git(r, &["checkout", "--quiet", head.as_str()]);
         assert_eq!(current_branch(r).unwrap(), None);
+    }
+
+    #[test]
+    fn resolve_commit_resolves_revs_and_none_for_unknown() {
+        use std::process::Command;
+        fn git(dir: &Path, args: &[&str]) {
+            assert!(
+                Command::new("git")
+                    .arg("-C")
+                    .arg(dir)
+                    .args(args)
+                    .status()
+                    .unwrap()
+                    .success(),
+                "git {args:?}"
+            );
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let r = dir.path();
+        git(r, &["init", "--quiet", "--initial-branch=main"]);
+        git(r, &["config", "user.email", "t@t"]);
+        git(r, &["config", "user.name", "t"]);
+        std::fs::write(r.join("f"), "x").unwrap();
+        git(r, &["add", "-A"]);
+        git(r, &["commit", "--quiet", "-m", "c"]);
+
+        let head = rev_parse_head(r).unwrap().unwrap();
+        // HEAD, a branch ref, and a full sha all resolve to the commit.
+        assert_eq!(resolve_commit(r, "HEAD").as_ref(), Some(&head));
+        assert_eq!(resolve_commit(r, "refs/heads/main").as_ref(), Some(&head));
+        assert_eq!(resolve_commit(r, head.as_str()).as_ref(), Some(&head));
+        // Unresolvable revs → None (matches `--verify --quiet` exit 1).
+        assert_eq!(resolve_commit(r, "refs/heads/nope"), None);
+        assert_eq!(resolve_commit(r, "not-a-real-rev"), None);
     }
 
     mod walker_equivalence {
