@@ -31,16 +31,34 @@ Add an auto default to the existing user-global config
 - Add a field, e.g. `auto: Option<AutoMode>` (or
   `default_auto_mode`), to `UserConfig`. Absent = today's behavior
   (Off), so other users are unaffected — opt-in by writing it.
-- Resolution: when an agent's `auto_mode` is being determined for a
-  FRESH skeleton (no per-agent config yet, or one without an
-  explicit auto setting), fall back to the user-global default
-  instead of `unwrap_or_default()` → Off. Pinpoint the single read
-  site (`agent.rs:218` and wherever `clank as` first writes the
-  skeleton) so the inheritance happens once, consistently.
+
+### One shared resolver — the load-bearing piece (codex b29d8d0)
+
+The default must NOT be applied only at skeleton-creation / agent
+start: the **Stop hook is a separate read path**. Today
+`stop_hook.rs` returns Silent when `load_agent_config` is `None` and
+otherwise matches `cfg.auto_mode` directly — so a fresh session
+(no skeleton yet, or auto unset) would stay silent even with a
+user-global `auto: on`. That's the exact case the user hits.
+
+So introduce ONE resolver — `effective_auto_mode(per_agent:
+Option<&AgentConfig>, user_default: Option<AutoMode>) -> AutoMode` —
+that resolves: explicit per-agent setting wins; else the user-global
+default; else Off. Route EVERY consumer through it:
+  - `stop_hook.rs` (the auto gate — must use it for the `None` /
+    auto-unset case, or fresh sessions never auto-continue),
+  - `agent start` initial-prompt resolution (`agent.rs:218`,
+    feeding `resolve_initial_prompt`),
+  - `clank auto status` (report the EFFECTIVE mode, not just the
+    stored one),
+  - skeleton writes / `clank as` (whatever it persists stays
+    consistent with what the resolver returns).
+No consumer reads `cfg.auto_mode` (or `unwrap_or_default()`) raw
+anymore — the resolver is the single source of truth.
 - This covers forks for free: a forked worktree's fresh agent config
-  inherits the same `~/.clank` default — no separate fork-seeding
-  needed. (Note this explicitly so we don't also build
-  fork-inheritance.)
+  (or absent config) resolves through the same `~/.clank` default —
+  no separate fork-seeding needed. (Note this explicitly so we don't
+  also build fork-inheritance.)
 - Distinguish "never set" from "explicitly set Off": once a session
   runs `clank auto off`, that explicit choice must STICK and not be
   re-defaulted to On on the next start. So the per-agent config needs
@@ -67,19 +85,25 @@ until `clank auto on`, and that no default-on path exists today
 
 ## Testing
 
-Pure config-resolution tests (the seam), no clank-binary spawning:
-- fresh agent config + user-global `auto: on` → resolves On.
+Pure `effective_auto_mode` resolver tests (the seam), no clank-binary
+spawning:
+- fresh / absent agent config + user-global `auto: on` → resolves On.
 - no user-global default → resolves Off (today's behavior, other
   users unaffected).
 - explicit per-agent `clank auto off` → stays Off even with
-  user-global `auto: on` (the "explicit overrides default" + sticky-
-  off case).
+  user-global `auto: on` (explicit overrides default + sticky-off).
+- **Stop-hook path under a user-global default with NO per-agent
+  config → resolves On (not Silent)** — the regression codex flagged;
+  pin it via the stop-hook's auto-resolution seam (the in-process
+  core, not a spawned binary).
 - `UserConfig` round-trips the new field and tolerates its absence.
 
 ## Non-goals
 
-- Changing what auto-mode DOES (the stop-hook loop) — only how its
-  initial value is chosen.
+- Changing what auto-mode DOES once on (the stop-hook continuation
+  behavior) — we only change how the effective auto_mode is RESOLVED
+  (routing the stop hook + others through the shared resolver), not
+  what happens when it's on.
 - A separate fork-inheritance mechanism — the `~/.clank` default
   covers forked worktrees because their fresh agent configs inherit
   it.
