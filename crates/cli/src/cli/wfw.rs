@@ -650,7 +650,7 @@ impl WatchContext {
         let git_dir = if poll_mode {
             None
         } else {
-            Some(git_resolve_dir(repo, "--git-dir")?)
+            Some(git_resolve_dir(repo)?)
         };
         Ok(Self {
             clank_root: repo.join(".clank"),
@@ -683,23 +683,9 @@ impl WatchContext {
     }
 }
 
-fn git_resolve_dir(repo: &Path, flag: &str) -> anyhow::Result<PathBuf> {
-    let output = std::process::Command::new("git")
-        .arg("-C")
-        .arg(repo)
-        .args(["rev-parse", flag])
-        .output()
-        .map_err(|e| anyhow::anyhow!("git rev-parse {flag}: {e}"))?;
-    if !output.status.success() {
-        anyhow::bail!(
-            "git rev-parse {flag} failed: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        );
-    }
-    let raw = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    let p = PathBuf::from(&raw);
-    let absolute = if p.is_absolute() { p } else { repo.join(p) };
-    Ok(dunce::canonicalize(&absolute).unwrap_or(absolute))
+fn git_resolve_dir(repo: &Path) -> anyhow::Result<PathBuf> {
+    let dir = crate::git_io::git_dir(repo)?;
+    Ok(dunce::canonicalize(&dir).unwrap_or(dir))
 }
 
 fn build_watcher(tx: mpsc::Sender<()>) -> anyhow::Result<RecommendedWatcher> {

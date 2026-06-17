@@ -727,22 +727,8 @@ pub(crate) fn spawn_sigwinch_forwarder(tx: mpsc::Sender<()>) -> anyhow::Result<(
 }
 
 fn git_resolve_dir(repo: &Path) -> anyhow::Result<std::path::PathBuf> {
-    let output = std::process::Command::new("git")
-        .arg("-C")
-        .arg(repo)
-        .args(["rev-parse", "--git-dir"])
-        .output()
-        .map_err(|e| anyhow::anyhow!("git rev-parse --git-dir: {e}"))?;
-    if !output.status.success() {
-        anyhow::bail!(
-            "git rev-parse --git-dir failed: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        );
-    }
-    let raw = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    let p = std::path::PathBuf::from(&raw);
-    let absolute = if p.is_absolute() { p } else { repo.join(p) };
-    Ok(dunce::canonicalize(&absolute).unwrap_or(absolute))
+    let dir = crate::git_io::git_dir(repo)?;
+    Ok(dunce::canonicalize(&dir).unwrap_or(dir))
 }
 
 fn select_plans_and_finished(
