@@ -996,29 +996,105 @@ fn parse_agent_panes(list_panes_stdout: &str) -> Vec<(String, String, clank_core
 /// when its desired title CHANGES (dedup per id). `None` (no-op)
 /// outside zellij; best-effort.
 struct PaneStatus {
+    /// Pane id → last title rendered. Dedup: rename a pane only when
+    /// its desired title changes.
     last: std::collections::HashMap<String, String>,
+    /// Cached `(pane_id, label, role)` map. The pane→agent mapping is
+    /// session-stable, so it's fetched via `list-panes` lazily and
+    /// reused — NOT re-shelled once per render (status-tui-watch-cpu
+    /// Fix 3: the per-render subprocess was loading the zellij server).
+    panes: Vec<(String, String, clank_core::vocab::Role)>,
+    primed: bool,
+    /// Wanted labels we re-queried for and still found no pane — so a
+    /// genuinely paneless agent triggers at most one re-query, not one
+    /// per render.
+    requeried_absent: std::collections::HashSet<String>,
 }
 
 impl PaneStatus {
     fn new() -> Option<Self> {
         std::env::var_os("ZELLIJ").map(|_| Self {
             last: std::collections::HashMap::new(),
+            panes: Vec::new(),
+            primed: false,
+            requeried_absent: std::collections::HashSet::new(),
         })
     }
 
     fn update(&mut self, snap: &StatusSnapshot) {
-        let Some(panes) = zellij_list_panes() else {
-            return;
-        };
-        for (id, label, role) in parse_agent_panes(&panes) {
-            let emoji = agent_status_emoji(snap, &label, role);
-            let title = format!("{emoji} {}", agent_pane_title(&label, role.as_str()));
-            if self.last.get(&id).map(String::as_str) == Some(title.as_str()) {
-                continue;
+        self.update_with(snap, zellij_list_panes, zellij_rename_pane);
+    }
+
+    /// Core of [`update`] with the zellij I/O injected, so the caching
+    /// logic is testable without spawning (no-binary-spawning-tests).
+    /// `list_panes` is called only when the cache needs (re)priming;
+    /// `rename` only for panes whose title changed.
+    fn update_with(
+        &mut self,
+        snap: &StatusSnapshot,
+        mut list_panes: impl FnMut() -> Option<String>,
+        mut rename: impl FnMut(&str, &str),
+    ) {
+        // Refresh the cached pane map only when needed: first run, or
+        // when the snapshot wants to mark an agent we have no cached
+        // pane for (a pane was likely added). Steady state reuses the
+        // cache, so no `list-panes` subprocess fires per render.
+        if (!self.primed || self.wants_uncached(snap))
+            && let Some(panes) = list_panes()
+        {
+            self.panes = parse_agent_panes(&panes);
+            self.primed = true;
+            // A fresh map supersedes the give-up memory; re-record any
+            // wanted label that's STILL absent so we don't re-query for
+            // it every render.
+            self.requeried_absent.clear();
+            for label in self.wanted(snap) {
+                if !self.has_pane(&label) {
+                    self.requeried_absent.insert(label);
+                }
             }
-            zellij_rename_pane(&id, &title);
+        }
+        // Build the rename list from the cached map first (immutable
+        // borrow), then apply — keeps `self.panes` and `self.last`
+        // borrows disjoint.
+        let mut renames: Vec<(String, String)> = Vec::new();
+        for (id, label, role) in &self.panes {
+            let emoji = agent_status_emoji(snap, label, *role);
+            let title = format!("{emoji} {}", agent_pane_title(label, role.as_str()));
+            if self.last.get(id).map(String::as_str) != Some(title.as_str()) {
+                renames.push((id.clone(), title));
+            }
+        }
+        for (id, title) in renames {
+            rename(&id, &title);
             self.last.insert(id, title);
         }
+    }
+
+    /// Labels the snapshot wants to mark as active: the master and any
+    /// awaited reviewers. (Idle agents that already have a cached pane
+    /// are handled by the cache; this set only drives the re-query.)
+    fn wanted(&self, snap: &StatusSnapshot) -> Vec<String> {
+        let mut v: Vec<String> = awaited_reviewers(snap)
+            .iter()
+            .map(|l| l.as_str().to_string())
+            .collect();
+        if let Some(m) = snap.master.as_deref() {
+            v.push(m.to_string());
+        }
+        v
+    }
+
+    fn has_pane(&self, label: &str) -> bool {
+        self.panes.iter().any(|(_, l, _)| l == label)
+    }
+
+    /// A wanted agent has no cached pane and we haven't already given
+    /// up re-querying for it — a pane likely appeared since we fetched.
+    fn wants_uncached(&self, snap: &StatusSnapshot) -> bool {
+        self.wanted(snap)
+            .into_iter()
+            .any(|label| !self.has_pane(&label) && !self.requeried_absent.contains(&label))
     }
 }
 
@@ -1436,6 +1512,68 @@ terminal_3  terminal  ruthless (reviewer)
                     Role::Reviewer
                 ),
             ]
+        );
+    }
+
+    #[test]
+    fn pane_status_caches_list_panes_and_renames_only_on_change() {
+        // Fix 3 (status-tui-watch-cpu): the pane→agent map is fetched
+        // ONCE and reused — no `list-panes` subprocess per render — and
+        // a pane is renamed only when its emoji actually changes.
+        use std::cell::{Cell, RefCell};
+
+        let panes_out = "0 PANE claude (master)\n1 PANE codex (reviewer)\n";
+        let list_calls = Cell::new(0usize);
+        let renames = RefCell::new(Vec::<(String, String)>::new());
+        let mut ps = PaneStatus {
+            last: std::collections::HashMap::new(),
+            panes: Vec::new(),
+            primed: false,
+            requeried_absent: std::collections::HashSet::new(),
+        };
+        let go = |ps: &mut PaneStatus, s: &StatusSnapshot| {
+            ps.update_with(
+                s,
+                || {
+                    list_calls.set(list_calls.get() + 1);
+                    Some(panes_out.to_string())
+                },
+                |id, title| {
+                    renames
+                        .borrow_mut()
+                        .push((id.to_string(), title.to_string()))
+                },
+            );
+        };
+
+        // First render: one `list-panes`; both agent panes get a title.
+        let awaited = snap(vec![plan_state("p", reviewer_missing("codex"))], vec![]);
+        go(&mut ps, &awaited);
+        assert_eq!(list_calls.get(), 1, "primed with one list-panes");
+        let after_first = renames.borrow().len();
+        assert_eq!(after_first, 2, "both panes renamed on first render");
+
+        // Same snapshot, many renders: NO further list-panes, NO renames.
+        for _ in 0..5 {
+            go(&mut ps, &awaited);
+        }
+        assert_eq!(list_calls.get(), 1, "list-panes reused from cache");
+        assert_eq!(
+            renames.borrow().len(),
+            after_first,
+            "unchanged emoji => no rename"
+        );
+
+        // Master's turn instead: the plan's wait state toggles BOTH
+        // emojis at once — master 💤→🔨 and codex 👀→💤 — so two panes
+        // rename. Still no re-query: both panes are cached.
+        let idle = snap(vec![plan_state("p", WaitingOn::MasterToContinue)], vec![]);
+        go(&mut ps, &idle);
+        assert_eq!(list_calls.get(), 1, "no re-query: panes already cached");
+        assert_eq!(
+            renames.borrow().len(),
+            after_first + 2,
+            "both flipped panes renamed"
         );
     }
 
