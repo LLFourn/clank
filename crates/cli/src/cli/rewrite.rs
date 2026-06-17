@@ -471,7 +471,7 @@ async fn apply_plan(
                 // Parent chain hops over this commit.
             }
             RewriteDisposition::KeepVerbatim => {
-                let tree = git_capture(repo, &["rev-parse", &format!("{}^{{tree}}", step.sha)])?;
+                let tree = commit_tree_sha(repo, &step.sha)?;
                 let new_sha =
                     commit_tree_preserving_meta(repo, &step.sha, &tree, parent.as_deref())?;
                 parent = Some(new_sha);
@@ -609,35 +609,57 @@ fn commit_tree_preserving_meta(
     tree_sha: &str,
     parent: Option<&str>,
 ) -> anyhow::Result<String> {
-    let author = git_capture(repo, &["show", "-s", "--format=%an <%ae>", original_sha])?;
-    let author_date = git_capture(repo, &["show", "-s", "--format=%aI", original_sha])?;
-    let raw_msg = git_capture(repo, &["show", "-s", "--format=%B", original_sha])?;
+    let r = gix::open(repo).with_context(|| format!("gix open `{}`", repo.display()))?;
+    let orig = r
+        .find_commit(parse_oid(original_sha)?)
+        .with_context(|| format!("find commit `{original_sha}`"))?;
+    // Preserve the original AUTHOR exactly (name/email/time). The
+    // COMMITTER is the ambient identity + now — matching the old
+    // `commit-tree` with `GIT_COMMITTER_*` left unset (a rewrite is a
+    // fresh commit event).
+    let author = orig
+        .author()
+        .with_context(|| format!("author of `{original_sha}`"))?
+        .to_owned()?;
+    let message = orig
+        .message_raw()
+        .with_context(|| format!("message of `{original_sha}`"))?
+        .to_owned();
+    let committer = r
+        .committer()
+        .ok_or_else(|| anyhow::anyhow!("no committer identity (set user.name / user.email)"))?
+        .context("committer time")?
+        .to_owned()?;
+    let parents = parent.map(parse_oid).transpose()?.into_iter().collect();
+    let commit = gix::objs::Commit {
+        tree: parse_oid(tree_sha)?,
+        parents,
+        author,
+        committer,
+        encoding: None,
+        message,
+        extra_headers: Vec::new(),
+    };
+    Ok(r.write_object(&commit)
+        .context("write rewritten commit")?
+        .detach()
+        .to_string())
+}
 
-    let mut cmd = std::process::Command::new("git");
-    cmd.arg("-C").arg(repo);
-    cmd.env("GIT_AUTHOR_NAME", "");
-    cmd.env("GIT_AUTHOR_EMAIL", "");
-    cmd.env_remove("GIT_AUTHOR_NAME");
-    cmd.env_remove("GIT_AUTHOR_EMAIL");
-    cmd.env("GIT_AUTHOR_DATE", author_date.trim());
-    let author = author.trim();
-    if let Some((name, email)) = parse_author(author) {
-        cmd.env("GIT_AUTHOR_NAME", name);
-        cmd.env("GIT_AUTHOR_EMAIL", email);
-    }
-    cmd.args(["commit-tree", tree_sha]);
-    if let Some(p) = parent {
-        cmd.args(["-p", p]);
-    }
-    cmd.arg("-m").arg(raw_msg.trim_end());
-    let output = cmd.output()?;
-    if !output.status.success() {
-        anyhow::bail!(
-            "git commit-tree failed for {original_sha}: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        );
-    }
-    Ok(String::from_utf8(output.stdout)?.trim().to_string())
+/// Parse a hex sha into a gix `ObjectId`.
+fn parse_oid(sha: &str) -> anyhow::Result<gix::ObjectId> {
+    gix::ObjectId::from_hex(sha.as_bytes()).with_context(|| format!("parse sha `{sha}`"))
+}
+
+/// The SHA of `<sha>`'s tree — replaces `git rev-parse <sha>^{tree}`.
+fn commit_tree_sha(repo: &Path, sha: &str) -> anyhow::Result<String> {
+    let r = gix::open(repo).with_context(|| format!("gix open `{}`", repo.display()))?;
+    Ok(r.find_commit(parse_oid(sha)?)
+        .with_context(|| format!("find commit `{sha}`"))?
+        .tree_id()
+        .with_context(|| format!("tree of `{sha}`"))?
+        .detach()
+        .to_string())
 }
 
 fn parse_author(spec: &str) -> Option<(&str, &str)> {
