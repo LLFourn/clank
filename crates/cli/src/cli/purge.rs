@@ -228,53 +228,25 @@ pub(crate) fn build_amend_program(
         );
     }
 
-    let head_sha = crate::git_io::rev_parse_head(repo)?
-        .ok_or_else(|| anyhow::anyhow!("git rev-parse HEAD failed"))?
-        .as_str()
-        .to_string();
+    let head = crate::git_io::rev_parse_head(repo)?
+        .ok_or_else(|| anyhow::anyhow!("git rev-parse HEAD failed"))?;
+    let head_sha = head.as_str().to_string();
 
     let strip_paths: Vec<String> = match plan_key {
+        // The plan's own artifact at HEAD — whichever of plans/ or
+        // finished/ actually exists in the tree.
         Some(k) => {
             let s = k.as_str();
-            let out = std::process::Command::new("git")
-                .arg("-C")
-                .arg(repo)
-                .args([
-                    "ls-tree",
-                    "-r",
-                    "--name-only",
-                    "--",
-                    &head_sha,
-                    &format!(".clank/plans/{s}.md"),
-                    &format!(".clank/finished/{s}.md"),
-                ])
-                .output()?;
-            if !out.status.success() {
-                Vec::new()
-            } else {
-                String::from_utf8_lossy(&out.stdout)
-                    .lines()
-                    .filter(|l| !l.is_empty())
-                    .map(str::to_string)
-                    .collect()
-            }
+            let plan_p = format!(".clank/plans/{s}.md");
+            let finished_p = format!(".clank/finished/{s}.md");
+            crate::git_io::tree_clank_paths(repo, &head)
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|p| *p == plan_p || *p == finished_p)
+                .collect()
         }
-        None => {
-            let out = std::process::Command::new("git")
-                .arg("-C")
-                .arg(repo)
-                .args(["ls-tree", "-r", "--name-only", "--", &head_sha, ".clank/"])
-                .output()?;
-            if !out.status.success() {
-                Vec::new()
-            } else {
-                String::from_utf8_lossy(&out.stdout)
-                    .lines()
-                    .filter(|l| !l.is_empty())
-                    .map(str::to_string)
-                    .collect()
-            }
-        }
+        // Whole-repo amend: every `.clank/` path in HEAD's tree.
+        None => crate::git_io::tree_clank_paths(repo, &head).unwrap_or_default(),
     };
 
     Ok(AmendProgram {
