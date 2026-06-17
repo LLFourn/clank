@@ -434,6 +434,21 @@ fn pr_bar_text(pr: &clank_core::wait::PrReviewWorkState, master: &str) -> (Strin
     (format!("{emoji} {} {verb}", actor.to_uppercase()), right)
 }
 
+/// The bar's leading emoji — the single signal-lamp glyph. Taken
+/// from `bar_text` ITSELF (its first token) rather than recomputed,
+/// so the zellij tab indicator can never disagree with the bar
+/// (tui-tab-mirror-bar-emoji). Every bar left is `"{emoji} …"` and
+/// every lamp glyph is a single space-free grapheme, so the first
+/// whitespace token is exactly the emoji.
+pub(crate) fn bar_emoji(snap: &StatusSnapshot) -> String {
+    bar_text(snap)
+        .0
+        .split_whitespace()
+        .next()
+        .unwrap_or_default()
+        .to_string()
+}
+
 /// Coarse, human-facing attention state for a worktree — the basis
 /// for a zellij tab indicator (spike-zellij-tab-attention):
 /// - `Blocked`: a human must act (an unanswered block, or a plan
@@ -766,6 +781,92 @@ fn paint(lines: &[String]) {
 /// nothing rendered is clock-relative — so the only timeout is a
 /// slow backstop against watcher pathologies the error channel
 /// doesn't surface (tui-event-driven-dirty-stats).
+/// Strip a leading signal-lamp emoji (`"👀 frostsnap"` → `"frostsnap"`)
+/// so a prior, un-restored indicator doesn't stack. A lamp glyph is a
+/// single emoji-plane grapheme followed by a space.
+fn strip_leading_emoji(name: &str) -> String {
+    let mut chars = name.chars();
+    match (chars.next(), chars.next()) {
+        // A lamp glyph (emoji-plane, width 2) followed by a space.
+        (Some(first), Some(' ')) if char_width(first) == 2 => chars.as_str().to_string(),
+        _ => name.to_string(),
+    }
+}
+
+/// The current zellij tab's `(stable id, name)`, or `None` outside
+/// zellij or if the query fails. Parses `zellij action
+/// current-tab-info` (`id: N` / `name: X` lines).
+fn zellij_current_tab() -> Option<(String, String)> {
+    std::env::var_os("ZELLIJ")?;
+    let out = std::process::Command::new("zellij")
+        .args(["action", "current-tab-info"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let s = String::from_utf8_lossy(&out.stdout);
+    let mut id = None;
+    let mut name = None;
+    for line in s.lines() {
+        if let Some(v) = line.strip_prefix("id:") {
+            id = Some(v.trim().to_string());
+        } else if let Some(v) = line.strip_prefix("name:") {
+            name = Some(v.trim().to_string());
+        }
+    }
+    Some((id?, name?))
+}
+
+fn zellij_rename_tab(id: &str, name: &str) {
+    // Best-effort: a transient zellij hiccup must never disrupt the
+    // TUI render loop.
+    let _ = std::process::Command::new("zellij")
+        .args(["action", "rename-tab-by-id", id, name])
+        .status();
+}
+
+/// Mirrors the bar's emoji into the zellij tab name
+/// (tui-tab-mirror-bar-emoji). Captures the tab id + its base name
+/// (sans any stale leading glyph) ONCE; renames only on an emoji
+/// CHANGE; restores the base name on drop (covers a normal/unwound
+/// exit — a signal-killed exit leaves the last glyph, re-synced by the
+/// next TUI launch). `None` (no-op) outside zellij. Lifecycle is the
+/// pane's: this lives only as long as the `status --tui` process, so
+/// there's no separate watcher to leak.
+struct TabIndicator {
+    id: String,
+    base: String,
+    last: Option<String>,
+}
+
+impl TabIndicator {
+    fn new() -> Option<Self> {
+        let (id, name) = zellij_current_tab()?;
+        Some(Self {
+            id,
+            base: strip_leading_emoji(&name),
+            last: None,
+        })
+    }
+
+    fn update(&mut self, emoji: &str) {
+        if emoji.is_empty() || self.last.as_deref() == Some(emoji) {
+            return;
+        }
+        zellij_rename_tab(&self.id, &format!("{emoji} {}", self.base));
+        self.last = Some(emoji.to_string());
+    }
+}
+
+impl Drop for TabIndicator {
+    fn drop(&mut self) {
+        if self.last.is_some() {
+            zellij_rename_tab(&self.id, &self.base);
+        }
+    }
+}
+
 pub(crate) async fn run_tui(
     repo: PathBuf,
     basename: String,
@@ -777,12 +878,18 @@ pub(crate) async fn run_tui(
     spawn_sigwinch_forwarder(tx)?;
 
     let _guard = AltScreen::enter();
+    // When inside zellij, mirror the bar's lamp emoji into the tab
+    // name so the tab bar shows what each worktree is doing.
+    let mut tab = TabIndicator::new();
     loop {
         let snapshot =
             StatusSnapshot::build_async(&repo, &basename, home.as_deref(), policy, None, true)
                 .await?;
         let (rows, cols) = term_size();
         paint(&render(&snapshot, rows, cols));
+        if let Some(tab) = tab.as_mut() {
+            tab.update(&bar_emoji(&snapshot));
+        }
 
         match rx.recv_timeout(Duration::from_secs(60)) {
             Ok(()) => while rx.recv_timeout(Duration::from_millis(200)).is_ok() {},
@@ -1008,6 +1115,35 @@ pub(crate) mod tests {
                 "line wider than {cols}: `{line}`"
             );
         }
+    }
+
+    #[test]
+    fn bar_emoji_is_the_bars_leading_glyph() {
+        // Single source: bar_emoji == the first token of the bar's
+        // left segment, for every representative state.
+        let cases = vec![
+            snap(vec![], vec![]),                                             // idle
+            snap(vec![plan_state("foo", reviewer_missing("codex"))], vec![]), // reviewers
+            snap(vec![], vec!["queued"]),                                     // promote
+        ];
+        for s in &cases {
+            let (left, _) = bar_text(s);
+            let want = left.split_whitespace().next().unwrap();
+            assert_eq!(bar_emoji(s), want, "bar_emoji must match the bar: {left:?}");
+        }
+        // Idle is the sleeping glyph specifically.
+        assert_eq!(bar_emoji(&snap(vec![], vec![])), "💤");
+    }
+
+    #[test]
+    fn strip_leading_emoji_removes_a_stale_glyph_only() {
+        // A prior, un-restored indicator must not stack.
+        assert_eq!(strip_leading_emoji("👀 frostsnap"), "frostsnap");
+        assert_eq!(strip_leading_emoji("💤 clank"), "clank");
+        // A plain name is untouched.
+        assert_eq!(strip_leading_emoji("clank"), "clank");
+        // A name that merely starts with a word (no emoji) is untouched.
+        assert_eq!(strip_leading_emoji("pr-497"), "pr-497");
     }
 
     #[test]
