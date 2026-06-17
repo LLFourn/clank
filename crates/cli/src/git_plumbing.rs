@@ -152,6 +152,8 @@ pub enum ExpectedRef {
     CreateOnly,
     /// The ref must currently point at this sha — refuse if it moved.
     Match(String),
+    /// No precondition — set the ref unconditionally.
+    Any,
 }
 
 /// Point `full_name` (e.g. `refs/heads/foo`) at `new_sha` under the
@@ -170,6 +172,7 @@ pub fn update_ref(
         ExpectedRef::Match(old) => {
             PreviousValue::MustExistAndMatch(gix::refs::Target::Object(parse_oid(&old)?))
         }
+        ExpectedRef::Any => PreviousValue::Any,
     };
     let r = open(repo)?;
     let edit = RefEdit {
@@ -189,5 +192,25 @@ pub fn update_ref(
     };
     r.edit_reference(edit)
         .with_context(|| format!("update `{full_name}`"))?;
+    Ok(())
+}
+
+/// Delete `full_name` — gix ref transaction, replacing `git
+/// update-ref -d <ref>`. Errors if the ref doesn't exist.
+pub fn delete_ref(repo: &Path, full_name: &str) -> anyhow::Result<()> {
+    use gix::refs::transaction::{Change, PreviousValue, RefEdit, RefLog};
+    let r = open(repo)?;
+    let edit = RefEdit {
+        change: Change::Delete {
+            expected: PreviousValue::Any,
+            log: RefLog::AndReference,
+        },
+        name: full_name
+            .try_into()
+            .with_context(|| format!("ref name `{full_name}`"))?,
+        deref: false,
+    };
+    r.edit_reference(edit)
+        .with_context(|| format!("delete `{full_name}`"))?;
     Ok(())
 }

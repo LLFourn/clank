@@ -373,29 +373,12 @@ fn git_head(repo: &Path) -> Option<String> {
 }
 
 fn git_update_ref(repo: &Path, name: &str, sha: &str) -> anyhow::Result<()> {
-    let status = std::process::Command::new("git")
-        .arg("-C")
-        .arg(repo)
-        .args(["update-ref", name, sha])
-        .status()
-        .context("spawning git update-ref")?;
-    if !status.success() {
-        anyhow::bail!("git update-ref {name} {sha} failed");
-    }
-    Ok(())
+    // Unconditional set — the protective ref is ours to overwrite.
+    crate::git_plumbing::update_ref(repo, name, sha, crate::git_plumbing::ExpectedRef::Any)
 }
 
 fn git_delete_ref(repo: &Path, name: &str) -> anyhow::Result<()> {
-    let status = std::process::Command::new("git")
-        .arg("-C")
-        .arg(repo)
-        .args(["update-ref", "-d", name])
-        .status()
-        .context("spawning git update-ref -d")?;
-    if !status.success() {
-        anyhow::bail!("git update-ref -d {name} failed");
-    }
-    Ok(())
+    crate::git_plumbing::delete_ref(repo, name)
 }
 
 fn worktree_dirty(repo: &Path) -> anyhow::Result<bool> {
