@@ -125,19 +125,27 @@ FETCH_HEAD → `resolve_commit`, html `collect_subjects` →
 `ancestor_subjects`).
 
 KEPT on the `git` CLI — each is load-bearing, NOT a fragile
-subprocess-faking-a-read. The COMPLETE remaining production list:
-- **Hooks/signing**: `git commit` (purge).
-- **Network/credentials**: `git fetch` (fork).
+subprocess-faking-a-read. The COMPLETE production list (verified by a
+full `Command::new("git")` audit across `crates/cli/src`, excluding
+test modules):
+- **Hooks/signing — `git commit`**: purge `--amend`, queue promote
+  (intro commit), finish (finalize + amend). Commits must run the
+  user's hooks + signing.
+- **Worktree/index MUTATION**: the finalize/promote/amend sequences
+  that stage + commit — `git rm` (purge, finish), `git add` (queue,
+  finish) building those commits' index alongside the `git commit`
+  above; `reset --hard` (rewrite resync, unfinish), `checkout`
+  (pr-review), `cherry-pick` (shelve).
 - **Worktree CREATION / enumeration**: `worktree add` + `worktree
-  list` (fork `main_repo_root` — list keeps the separate-git-dir edge
-  correct).
-- **Worktree/index MUTATION**: `reset --hard` (rewrite resync),
-  `checkout` (pr-review), `cherry-pick` (shelve), `git rm` (purge),
-  `git add` (queue).
+  list` (fork `main_repo_root` — `list` keeps the separate-git-dir
+  edge correct).
 - **Worktree-state READS** (gitignore/`fileMode`/`autocrlf`/sparse
-  semantics gix would have to reproduce): `status --porcelain` ×4
-  (unfinish/shelve/purge/open dirty checks), `git diff` (diff.rs).
+  semantics gix would have to reproduce): every `status --porcelain`
+  dirty check (unfinish, shelve, purge, open, and rewrite's
+  `working_tree_dirty`), `git diff` (diff.rs), `git diff --quiet`
+  (fs_plan_state_lookup — plan-body-vs-committed status).
 - **gitignore semantics**: `check-ignore` ×3 (init/open/doctor).
+- **Network/credentials**: `git fetch` (fork).
 - **`url.insteadOf` resolution**: `remote get-url` (pr-review
   `repo_slug`).
 - **Output FORMATTERS** (reproducing git's exact format is the
@@ -151,6 +159,6 @@ subprocess-faking-a-read. The COMPLETE remaining production list:
   returns lossy `String`, which would weaken it, so keep raw bytes.
 
 So: every clean-win read is on gix; what remains is delegation in the
-same spirit as the `git commit`/`fetch` decision (worktree semantics,
-gitignore, network, hooks, formatters, byte-exact/rename-detect
-checks).
+same spirit as the `git commit`/`fetch` decision (commits that need
+hooks/signing + their staging, worktree semantics, gitignore, network,
+formatters, byte-exact/rename-detect checks).
