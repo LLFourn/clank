@@ -141,12 +141,20 @@ pub(crate) fn render(snap: &StatusSnapshot, rows: u16, cols: u16) -> Vec<String>
     let breath = rows >= 4;
 
     // `ask` — a pending block's question is the single case where
-    // detail outranks state: a human must act. Accent-colored.
+    // detail outranks state: a human must act. Word-wrapped (not
+    // first-line-truncated) so the reason is fully readable
+    // (tui-block-reason-wrap); accent-colored. The label gutter is 7
+    // cols (`{:>5}  `), so the text wraps to the remaining width and
+    // continuation lines sit under it with a blank gutter.
+    let gutter = display_width(&label("ask").1);
+    let ask_width = cols.saturating_sub(gutter).max(1);
     for b in snap.blocks.iter().filter(|b| b.answer.is_none()) {
-        body.push(vec![
-            label("ask"),
-            Span(Style::Accent, first_line(&b.question)),
-        ]);
+        for (i, line) in wrap(b.question.trim(), ask_width).into_iter().enumerate() {
+            body.push(vec![
+                label(if i == 0 { "ask" } else { "" }),
+                Span(Style::Accent, line),
+            ]);
+        }
     }
 
     // `gate` — state + the sha under review. The bar already names
@@ -533,9 +541,58 @@ fn verb_of(w: &WaitingOn) -> &'static str {
     }
 }
 
-/// First line of a block question, for the `ask` gauge.
-fn first_line(s: &str) -> String {
-    s.trim_start().split('\n').next().unwrap_or("").to_string()
+/// Word-wrap `text` to `width` DISPLAY columns for the `ask` gauge,
+/// so a block reason is fully legible instead of first-line-
+/// truncated (tui-block-reason-wrap). Display-width aware (emoji = 2,
+/// via `char_width`); explicit `\n` are preserved as hard breaks;
+/// within a segment it breaks on whitespace, and hard-breaks a
+/// single token wider than `width` (a long id/URL can't overflow).
+/// `width == 0` degrades to one line per `\n`-segment (no panic).
+fn wrap(text: &str, width: usize) -> Vec<String> {
+    if width == 0 {
+        return text.split('\n').map(str::to_string).collect();
+    }
+    let mut out = Vec::new();
+    for segment in text.split('\n') {
+        let mut line = String::new();
+        let mut line_w = 0usize;
+        for word in segment.split_whitespace() {
+            let ww = display_width(word);
+            let sep = usize::from(!line.is_empty());
+            if line_w + sep + ww <= width {
+                if sep == 1 {
+                    line.push(' ');
+                }
+                line.push_str(word);
+                line_w += sep + ww;
+                continue;
+            }
+            // Doesn't fit: flush the current line first.
+            if !line.is_empty() {
+                out.push(std::mem::take(&mut line));
+                line_w = 0;
+            }
+            if ww <= width {
+                line.push_str(word);
+                line_w = ww;
+            } else {
+                // Token wider than the whole line — hard-break it.
+                for ch in word.chars() {
+                    let cw = char_width(ch);
+                    if line_w + cw > width && !line.is_empty() {
+                        out.push(std::mem::take(&mut line));
+                        line_w = 0;
+                    }
+                    line.push(ch);
+                    line_w += cw;
+                }
+            }
+        }
+        // Trailing line; for an empty/whitespace-only segment this
+        // preserves the intentional blank line.
+        out.push(line);
+    }
+    out
 }
 
 // ── span emission (width math + ANSI) ───────────────────────
@@ -905,6 +962,55 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn wrap_breaks_on_words_newlines_and_long_tokens() {
+        // Word boundaries.
+        assert_eq!(wrap("a b c d", 3), vec!["a b", "c d"]);
+        // Explicit newlines preserved as hard breaks.
+        assert_eq!(wrap("a\nb", 10), vec!["a", "b"]);
+        // Blank line between segments preserved.
+        assert_eq!(wrap("a\n\nb", 10), vec!["a", "", "b"]);
+        // A token wider than the line hard-breaks.
+        assert_eq!(wrap("abcdef", 3), vec!["abc", "def"]);
+        // Display-width aware: each 🔨 is 2 cols, so two per... no,
+        // width 2 fits exactly one per line.
+        assert_eq!(wrap("🔨🔨", 2), vec!["🔨", "🔨"]);
+        // width 0 degrades to one line per newline-segment, no panic.
+        assert_eq!(wrap("a b\nc", 0), vec!["a b", "c"]);
+    }
+
+    #[test]
+    fn block_reason_wraps_across_rows_within_width() {
+        let mut s = snap(vec![], vec![]);
+        s.blocks = vec![crate::cli::block::BlockEntry {
+            agent: "claude".into(),
+            name: "q".into(),
+            plan: None,
+            question: "the first line is long enough to wrap\nsecond paragraph".into(),
+            answer: None,
+        }];
+        let cols = 24;
+        let lines = render(&s, 20, cols as u16);
+        let texts: Vec<String> = lines.iter().map(|l| visible(l)).collect();
+        // The second paragraph is NOT dropped (the bug being fixed).
+        assert!(
+            texts.iter().any(|t| t.contains("second paragraph")),
+            "continuation must survive: {texts:?}"
+        );
+        // The long first line wrapped onto multiple ask rows (the
+        // first carries the `ask` gutter; continuations are indented).
+        let ask_rows = texts.iter().filter(|t| t.contains("first")).count()
+            + texts.iter().filter(|t| t.contains("wrap")).count();
+        assert!(ask_rows >= 1, "first line present: {texts:?}");
+        // Nothing exceeds the pane width.
+        for line in &lines {
+            assert!(
+                display_width(visible(line).trim_end()) <= cols,
+                "line wider than {cols}: `{line}`"
+            );
+        }
+    }
+
+    #[test]
     fn attention_state_classifies_blocked_idle_active() {
         // Idle: nothing in flight.
         assert_eq!(attention_state(&snap(vec![], vec![])), AttentionState::Idle);
@@ -1182,7 +1288,11 @@ pub(crate) mod tests {
         }];
         let texts: Vec<String> = render(&s, 6, 60).iter().map(|l| visible(l)).collect();
         assert!(texts[0].starts_with("🙋 HUMAN blocked"), "got {texts:?}");
+        // The reason WORD-WRAPS now — the second line ("more detail")
+        // is no longer dropped, and continuation aligns under the text
+        // with a blank gutter (tui-block-reason-wrap).
         assert_eq!(texts[2], "  ask  is this right?");
+        assert_eq!(texts[3], "       more detail");
     }
 
     #[test]
