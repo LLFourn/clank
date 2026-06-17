@@ -489,45 +489,13 @@ struct GitProbe {
 }
 
 fn probe_git(path: &Path) -> Option<GitProbe> {
-    let toplevel_out = std::process::Command::new("git")
-        .arg("-C")
-        .arg(path)
-        .args(["rev-parse", "--show-toplevel"])
-        .output()
-        .ok()?;
-    if !toplevel_out.status.success() {
-        return None;
-    }
-    let raw_top = String::from_utf8_lossy(&toplevel_out.stdout)
-        .trim()
-        .to_string();
-    if raw_top.is_empty() {
-        return None;
-    }
-    let repo_root = dunce::canonicalize(&raw_top).unwrap_or_else(|_| PathBuf::from(&raw_top));
-
-    let gitdir_out = std::process::Command::new("git")
-        .arg("-C")
-        .arg(path)
-        .args(["rev-parse", "--git-dir"])
-        .output()
-        .ok()?;
-    if !gitdir_out.status.success() {
-        return None;
-    }
-    let raw_git = String::from_utf8_lossy(&gitdir_out.stdout)
-        .trim()
-        .to_string();
-    if raw_git.is_empty() {
-        return None;
-    }
-    let raw_path = PathBuf::from(&raw_git);
-    let absolute = if raw_path.is_absolute() {
-        raw_path
-    } else {
-        path.join(raw_path)
-    };
-    let git_dir = dunce::canonicalize(&absolute).unwrap_or(absolute);
+    // Discover upward from `path` (gix), then read that repo's
+    // per-worktree gitdir — replacing `git -C path rev-parse
+    // --show-toplevel` + `--git-dir`.
+    let raw_root = crate::git_io::discover_work_dir(path).ok()??;
+    let repo_root = dunce::canonicalize(&raw_root).unwrap_or(raw_root);
+    let raw_git = crate::git_io::git_dir(&repo_root).ok()?;
+    let git_dir = dunce::canonicalize(&raw_git).unwrap_or(raw_git);
     Some(GitProbe { repo_root, git_dir })
 }
 
