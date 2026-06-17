@@ -263,18 +263,7 @@ pub fn checkout_with(repo: &Path, pr: u32) -> anyhow::Result<PathBuf> {
     }
     let slug = repo_slug(repo)?;
     let branch = format!("pr-{pr}");
-    let exists = std::process::Command::new("git")
-        .arg("-C")
-        .arg(repo)
-        .args([
-            "rev-parse",
-            "--verify",
-            "--quiet",
-            &format!("refs/heads/{branch}"),
-        ])
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false);
+    let exists = crate::git_io::resolve_commit(repo, &format!("refs/heads/{branch}")).is_some();
     if exists {
         anyhow::bail!("branch `{branch}` already exists; check it out yourself or delete it first");
     }

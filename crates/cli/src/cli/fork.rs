@@ -372,16 +372,11 @@ pub(crate) fn fetch_pr_head(source: &Path, pr: u32) -> anyhow::Result<String> {
             String::from_utf8_lossy(&out.stderr).trim()
         );
     }
-    let out = std::process::Command::new("git")
-        .arg("-C")
-        .arg(source)
-        .args(["rev-parse", "FETCH_HEAD"])
-        .output()
-        .context("spawning git rev-parse FETCH_HEAD")?;
-    if !out.status.success() {
-        anyhow::bail!("resolving FETCH_HEAD after the PR fetch failed");
-    }
-    Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+    // The fetch itself stays on git (network/credentials); resolving
+    // the resulting FETCH_HEAD is a plain rev read.
+    crate::git_io::resolve_commit(source, "FETCH_HEAD")
+        .map(|s| s.as_str().to_string())
+        .ok_or_else(|| anyhow::anyhow!("resolving FETCH_HEAD after the PR fetch failed"))
 }
 
 /// The MAIN worktree's root, resolved from ANY worktree. The first

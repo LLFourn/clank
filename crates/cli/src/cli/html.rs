@@ -1367,23 +1367,10 @@ fn commit_body(repo: &Path, sha: &CommitSha) -> String {
 /// Batch-fetch commit subjects via a single `git log` so the
 /// index doesn't shell out per row.
 fn collect_subjects(repo: &Path, head: Option<&CommitSha>) -> BTreeMap<String, String> {
-    let mut out = BTreeMap::new();
-    let Some(head) = head else { return out };
-    let res = Command::new("git")
-        .arg("-C")
-        .arg(repo)
-        .args(["log", "--format=%H%x09%s", head.as_str()])
-        .output();
-    let Ok(res) = res else { return out };
-    if !res.status.success() {
-        return out;
+    match head {
+        Some(head) => crate::git_io::ancestor_subjects(repo, head).unwrap_or_default(),
+        None => BTreeMap::new(),
     }
-    for line in String::from_utf8_lossy(&res.stdout).lines() {
-        if let Some((sha, subj)) = line.split_once('\t') {
-            out.insert(sha.to_string(), subj.to_string());
-        }
-    }
-    out
 }
 
 fn plan_body_at_commit(repo: &Path, event: &LogEvent) -> Option<String> {

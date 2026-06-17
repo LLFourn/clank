@@ -176,20 +176,8 @@ fn parse_range(repo: &Path, raw: &str) -> anyhow::Result<(Option<CommitSha>, Com
 }
 
 fn resolve_to_sha(repo: &Path, rev: &str) -> anyhow::Result<CommitSha> {
-    let out = Command::new("git")
-        .arg("-C")
-        .arg(repo)
-        .args(["rev-parse", rev])
-        .output()
-        .with_context(|| format!("invoking git rev-parse `{rev}`"))?;
-    if !out.status.success() {
-        anyhow::bail!(
-            "git rev-parse `{rev}` failed: {}",
-            String::from_utf8_lossy(&out.stderr).trim()
-        );
-    }
-    let sha = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    CommitSha::parse(&sha).map_err(|e| anyhow::anyhow!("invalid SHA from rev-parse: {e}"))
+    crate::git_io::resolve_commit(repo, rev)
+        .ok_or_else(|| anyhow::anyhow!("cannot resolve `{rev}` to a commit"))
 }
 
 fn compose(

@@ -107,9 +107,9 @@ Each of these is shelled for a real reason. The plan must DECIDE
 MIGRATED to gix, behind two cohesive modules:
 - `git_io` (reads, unchanged read-only invariant): `rev_parse_head`,
   `git_dir`/`common_dir`, `discover_work_dir`, `config_bool`,
-  `commit_subject`/`commit_body`, `show_blob`, `tree_clank_paths`,
-  `current_branch`, `resolve_commit`, `parent_of`, `is_ancestor`,
-  `diff_tree_changes`. `resolve_repo` runs on it.
+  `commit_subject`/`commit_body`, `show_blob`, `ancestor_subjects`,
+  `tree_clank_paths`, `current_branch`, `resolve_commit`, `parent_of`,
+  `is_ancestor`, `diff_tree_changes`. `resolve_repo` runs on it.
 - `git_plumbing` (writes — the mutation counterpart): `strip_tree`
   (in-memory tree edit, killed the `GIT_INDEX_FILE` scratch dance),
   `replay_commit` + `squash_commit` (gix commit objects, author
@@ -118,24 +118,39 @@ MIGRATED to gix, behind two cohesive modules:
   `ExpectedRef`). `rewrite.rs` and `shelve.rs` have ZERO inline `gix::`
   — they orchestrate via the typed API.
 
-KEPT on the `git` CLI — load-bearing delegation, NOT debt (each is a
-clean, robust call, not a fragile subprocess-faking-a-read):
-- `git commit` (purge) — runs the user's hooks + signing.
-- `git fetch` (fork) — the user's credentials/transport.
-- `git worktree add` (fork) — worktree CREATION; gix's is immature.
-- `status --porcelain` ×4 (dirty checks), `reset --hard`, `checkout`
-  — worktree-state semantics (gitignore / `fileMode` / `autocrlf` /
-  sparse) that gix would have to reproduce exactly; parity unverified
-  and the calls are clean, so keep.
-- `repo_slug`'s `remote get-url` — resolves `url.insteadOf`.
-- `show --patch` / `--pretty` (diff, html), `log` display in `log.rs`
-  — git's output FORMATTERS (reproducing the exact format is the
-  formatter's job, not ours).
-- `unfinish`'s strict `diff-tree --name-status` finish-check +
-  byte-exact `git show` content compare — precise verifications where
-  git's name-status / raw bytes are the right tool.
-- `queue`'s `git add` — index staging with worktree/gitignore
-  semantics.
+Every config-independent READ that resolves to objects/refs/paths is
+migrated — incl. the ones codex caught (`diff.rs` rev-parse →
+`resolve_commit`, `status.rs` symbolic-ref → `current_branch`, `fork`
+FETCH_HEAD → `resolve_commit`, html `collect_subjects` →
+`ancestor_subjects`).
 
-The clean-win debt is purged; the remainder is delegation the
-`git commit`/`fetch` decision already established.
+KEPT on the `git` CLI — each is load-bearing, NOT a fragile
+subprocess-faking-a-read. The COMPLETE remaining production list:
+- **Hooks/signing**: `git commit` (purge).
+- **Network/credentials**: `git fetch` (fork).
+- **Worktree CREATION / enumeration**: `worktree add` + `worktree
+  list` (fork `main_repo_root` — list keeps the separate-git-dir edge
+  correct).
+- **Worktree/index MUTATION**: `reset --hard` (rewrite resync),
+  `checkout` (pr-review), `cherry-pick` (shelve), `git rm` (purge),
+  `git add` (queue).
+- **Worktree-state READS** (gitignore/`fileMode`/`autocrlf`/sparse
+  semantics gix would have to reproduce): `status --porcelain` ×4
+  (unfinish/shelve/purge/open dirty checks), `git diff` (diff.rs).
+- **gitignore semantics**: `check-ignore` ×3 (init/open/doctor).
+- **`url.insteadOf` resolution**: `remote get-url` (pr-review
+  `repo_slug`).
+- **Output FORMATTERS** (reproducing git's exact format is the
+  formatter's job): `show --patch` (diff), `show --pretty` (html),
+  `log` display (log.rs).
+- **Strict `-M` name-status checks** (rename detection is git's job):
+  `diff-tree --name-status -M` in purge `is_finish_diff` + unfinish's
+  trivial-finish check.
+- **Byte-exact content guard**: `git show <rev>:<path>` in unfinish —
+  a content-equality check guarding `reset --hard HEAD~`; `show_blob`
+  returns lossy `String`, which would weaken it, so keep raw bytes.
+
+So: every clean-win read is on gix; what remains is delegation in the
+same spirit as the `git commit`/`fetch` decision (worktree semantics,
+gitignore, network, hooks, formatters, byte-exact/rename-detect
+checks).
