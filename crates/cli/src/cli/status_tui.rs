@@ -893,11 +893,14 @@ fn parse_current_tab_info(stdout: &str) -> Option<(String, String)> {
 }
 
 fn zellij_rename_tab(id: &str, name: &str) {
-    // Best-effort: a transient zellij hiccup must never disrupt the
-    // TUI render loop.
+    // `.output()` (NOT `.status()`): capture + discard the child's
+    // stdout/stderr so a rename error never bleeds onto the alt-screen
+    // the TUI owns. The loop is event-driven, so an inherited error
+    // line would PERSIST until the next watcher event, not flicker
+    // (ruthless 9c38523).
     let _ = std::process::Command::new("zellij")
         .args(["action", "rename-tab-by-id", id, name])
-        .status();
+        .output();
 }
 
 /// Mirrors the bar's emoji into the zellij tab name
@@ -952,10 +955,14 @@ fn zellij_list_panes() -> Option<String> {
 }
 
 fn zellij_rename_pane(id: &str, name: &str) {
-    // Best-effort: a rename failure must never disturb the loop.
+    // `.output()` (NOT `.status()`): isolate the child's stdout/stderr
+    // from the alt-screen — a stale pane id (closed between list-panes
+    // and the rename) or any zellij hiccup must not bleed an error line
+    // onto the TUI, which the event-driven loop would leave until the
+    // next watcher event (ruthless 9c38523).
     let _ = std::process::Command::new("zellij")
         .args(["action", "rename-pane", "--pane-id", id, name])
-        .status();
+        .output();
 }
 
 /// The agent panes in `zellij action list-panes` output
