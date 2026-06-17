@@ -48,12 +48,21 @@ the bar/hook wake master: queue-promote, and PR-review master turns
 fix is NOT to re-enumerate; it's to share the ONE predicate
 `state_color` already uses to paint "master working" green/cyan.
 
-- Factor `master_is_active(snap) -> bool` out of `state_color` (the
-  exact condition it currently paints green/cyan): active AND
-  (any plan `MasterTo{Revise,Continue,Commit,Finalize}` | PR reviews
-  with NO missing reviewers | a non-empty queue). REFACTOR
-  `state_color` to call it, so the bar hue and the pane emoji are one
-  source and cannot disagree.
+- Factor `master_is_active(snap) -> bool` out of `state_color`, with
+  the SAME BRANCH PRECEDENCE it uses today (codex fbdb27b — NOT a flat
+  OR; plans dominate, so a queue/PR-ready state must NOT mark master
+  active while a plan still awaits reviewers):
+  1. blocked or idle → `false`
+  2. else if any plans exist → `true` iff some plan is
+     `MasterTo{Revise,Continue,Commit,Finalize}` (queue/PR ignored —
+     plans take precedence)
+  3. else if PR reviews exist → `true` iff NO PR has missing reviewers
+  4. else if the queue is non-empty → `true` (promote)
+  5. else → `false`
+
+  REFACTOR `state_color` to call this (green/cyan when true — cyan is
+  the case-4 queue branch, green otherwise; yellow when false), so the
+  bar hue and the pane emoji are one source and cannot disagree.
 - `awaited_reviewers(snap)` = union of every `missing` set
   (`ReviewerApprovalsMissing` + `GateReviewersMissing` across plans,
   plus each PR review's `missing_reviewers`).
@@ -71,9 +80,11 @@ reviewers awaited on another) — unlike the single-hue bar.
 
 ## Design / testing
 
-- Pure + unit-tested: `master_is_active` (incl. a regression that the
-  queue-promote and PR-master states it shares with `state_color`
-  count as master-active — the drift codex caught), `awaited_reviewers`,
+- Pure + unit-tested: `master_is_active` — incl. the PRECEDENCE
+  regression codex fbdb27b named: a plan awaiting reviewers + a
+  non-empty queue is NOT master-active (plans dominate; master `💤`,
+  reviewers `👀`), AND a clean PR / queue-only IS master-active.
+  `awaited_reviewers`,
   `agent_status_emoji` (master-active, reviewer-awaited, idle), and a
   `parse_agent_panes(list_panes_stdout) -> [(id,label,role)]` parser
   pinned to the live 0.44.3 fixture (reuse `strip_leading_emoji` to
