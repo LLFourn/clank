@@ -549,16 +549,10 @@ fn branch_exists(repo: &Path, branch: &str) -> anyhow::Result<bool> {
 }
 
 fn parent_of(repo: &Path, sha: &str) -> anyhow::Result<Option<String>> {
-    let output = std::process::Command::new("git")
-        .arg("-C")
-        .arg(repo)
-        .args(["rev-parse", &format!("{sha}^")])
-        .output()?;
-    if !output.status.success() {
-        // `<sha>^` fails when sha is a root commit.
-        return Ok(None);
-    }
-    Ok(Some(String::from_utf8(output.stdout)?.trim().to_string()))
+    let sha = CommitSha::parse(sha).map_err(|e| anyhow::anyhow!("parse sha `{sha}`: {e}"))?;
+    // `git_io::parent_of` returns `None` for a root commit, matching
+    // the old `rev-parse <sha>^` failure.
+    Ok(crate::git_io::parent_of(repo, &sha)?.map(|p| p.as_str().to_string()))
 }
 
 fn current_branch(repo: &Path) -> anyhow::Result<String> {
