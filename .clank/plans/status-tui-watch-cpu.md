@@ -1,88 +1,133 @@
 # status-tui-watch-cpu
 
-`clank status --tui` panes collectively burn ~44%+ CPU (observed
-2026-06-18: two zellij servers at 51% + 31%, FSEvents at 36.6%, 12
-status-tui panes across worktrees). Two independent causes, both in
-`status_tui.rs` / `status.rs`.
+`clank status --tui` panes + their zellij servers burn ~80% CPU at
+IDLE (observed 2026-06-18: two zellij servers at 42% + 37%, a dozen
+status-tui panes across worktrees at 2–5% each). **No build is
+running** when this happens — so the cost is a self-sustaining loop,
+not `target/` churn.
 
-## Cause 1 — the fs-watch monitors the WHOLE repo (incl. `target/`)
+## Root cause — a derived-cache wake storm
 
-`watch_status_paths` (status.rs) does
-`watcher.watch(repo, RecursiveMode::Recursive)` — it watches the
-entire repository tree, then uses `WakeFilter` to decide whether each
-event should wake a re-render.
+The engine is a feedback loop between the tui's fs-watch and the fold
+cache. Confirmed empirically: with no commits, `.clank/cache/repo-
+state/*` mtimes advance every few seconds across multiple sha files,
+and `zellij action` subprocesses fire continuously.
 
-The gitignore subtlety (lloyd's question): `notify`/FSEvents watches a
-path **regardless of `.gitignore`**. The gitignore matcher in
-`WakeFilter` only suppresses the *wake*, NOT the OS-level watch. So
-`target/` (which churns massively during `cargo build`) is fully
-monitored by FSEvents — 12 panes × whole repo trees including
-`target/` and `.git/objects/`. That's the FSEvents 36.6%, paid even
-though `WakeFilter` never wakes on `target/`.
+The loop:
 
-Why "wake only on tracked files" is NOT the fix: clank's own state
-under `.clank/` (`agents/<>/feedback`, `blocks`, `cache`, `queue`) is
-GITIGNORED but is exactly what the loop must react to (a reviewer
-feedback write flips the gate). A tracked-only wake filter would go
-deaf to clank's own signals. The wake criterion is already right; the
-WATCH SCOPE is wrong.
+1. `WakeFilter::wakes` (status.rs:636) wakes the tui on **ANY** path
+   under `.clank/` — including `.clank/cache/`, the FOLD CACHE.
+2. The tui folds with `CachePolicy::Use`, which writes spaced
+   checkpoints under `.clank/cache/repo-state/` (rebuild.rs
+   `fold_events` → `state_cache::write`).
+3. `state_cache::write` is **non-idempotent**: it builds a temp file
+   and `fs::rename`s it over `cache_file_for(head, depth)` **even when
+   a byte-identical checkpoint already exists**. The payload is a pure
+   function of `(head sha, depth)`, so this is pure churn — but it
+   bumps the mtime.
+4. That mtime event is under `.clank/`, so step 1 wakes **every**
+   clank process folding this repo — the `--tui` pane, the `wfw`
+   reviewer long-poll, the master session, sibling panes. They all
+   re-fold; racing each other's writes/prunes they don't cleanly hit
+   the no-write fast path (`rebuild_with_diagnostics`: `cp.sha == h →
+   return`), so they re-write checkpoints → back to step 1.
+5. Each woken render also shells `zellij action list-panes` + renames
+   (see Amplifier). The **zellij SERVER** does the work of processing
+   the repaints + client connections, which is why the servers sit at
+   ~40% while the pane processes stay light at 2–5%.
 
-### Fix 1
+The core modeling error: **the cache is DERIVED state, and derived
+state is being used as a wake source.** A fold reads the cache and
+re-derives the fold; it must never be woken BY the cache. The genuine
+wake signals are the SOURCE state — `.clank/agents/*/feedback`,
+`blocks`, `plans`, `queue`, `config`, and git refs — all of which the
+watch already covers independently. Waking on the cache is both
+redundant (the source change already woke us) and self-triggering.
 
-Watch only the dirs we actually care about — `.clank/` + the git dir —
-NOT the whole repo. This is exactly what `wfw`'s `WatchContext`
-already does (`wfw.rs`); `status --tui` should match it. FSEvents then
-never monitors `target/` at all.
+### Why the existing "no-write cache hit" doesn't save it
 
-- Trade-off: `dirty: +X −Y` no longer refreshes on every source-file
-  save (we stop watching `src/`); it refreshes on the heartbeat and on
-  `.clank/`/git events instead. Fine for a passive monitor pane — and
-  the heartbeat could be shortened (e.g. 60s → a few seconds) if live
-  dirty matters, still far cheaper than watching the whole tree.
-- Verify no `.clank/cache/` self-trigger: if the tui's re-fold writes
-  under `.clank/cache/` and we wake on all of `.clank/`, that's a
-  render→write→wake loop. Confirm the tui uses a read-only cache
-  policy, or exclude `.clank/cache/` from waking.
-- `wfw`'s `WatchContext` is already narrow — this cause is
-  status-tui-specific.
+`rebuild_with_diagnostics` returns with no write when a checkpoint
+sits exactly at HEAD (`cp.sha == h`). That path is real and correct —
+but it's defeated because (a) writes are non-idempotent rename-
+replaces that churn mtime whenever a fold *does* write, (b) the watch
+turns each such write into a wake for every folding process, and (c)
+concurrent folders race so they don't all cleanly hit. Fixing (a) and
+(b) makes "no commit ⇒ no cache change ⇒ no wake" actually hold.
 
-## Cause 2 — `PaneStatus` shells `zellij action list-panes` every render
+## Fix 1 (primary, modeling) — the cache is not a wake source
+
+`WakeFilter::wakes` must NOT wake on `.clank/cache/`. Keep waking on
+the rest of `.clank/` (feedback/blocks/plans/queue/config are the real
+signals) and on the git dir.
+
+- Concretely: the unconditional `path.starts_with(clank_root)` branch
+  gains a `&& !path.starts_with(clank_root/"cache")` guard (or the
+  watch is scoped to the specific source subdirs). Either way, cache
+  writes stop waking the loop.
+- This alone breaks the storm: cache writes no longer fan out into a
+  re-fold across every process.
+
+## Fix 2 (idempotent write) — no rewrite when nothing changed
+
+`state_cache::write` should skip the rename when `cache_file_for(head,
+depth)` already exists. The payload is determined by `(head sha,
+depth)`, so an existing file is already correct — rewriting it only
+churns the mtime and burns IO. A pruned/missing checkpoint still gets
+written (file absent ⇒ write); an identical one is a no-op.
+
+- This directly enforces "no commit ⇒ the cache doesn't change," and
+  is defense-in-depth behind Fix 1 (even processes that legitimately
+  fold-forward once won't re-churn on the steady state).
+
+## Fix 3 (amplifier) — `PaneStatus` caches the pane-id map
 
 `PaneStatus::update` (status_tui.rs, from tui-agent-pane-status-emoji)
 calls `zellij_list_panes()` UNCONDITIONALLY at the top of every
-`update()` — i.e. every render/wake — before any dedup. Each call is a
-`zellij action list-panes` subprocess + a round-trip to the zellij
-SERVER. During active clank work the loop wakes up to ~5×/s (200ms
-debounce), so each new-binary pane hammers its zellij server several
-times a second. This is the regression behind the 51%/31% server CPU
-(newer `clank-clank` ran ~10%/pane vs older sparrow ~5.7%/pane).
+update — the `self.last` dedup gates the RENAME, not the query. The
+pane-id map (`label (role)` → pane id) is session-stable, so:
 
-### Fix 2
-
-The pane-id map (`label (role)` → pane id) is session-stable, so:
-- Fetch `list-panes` ONCE (lazily on first update), cache the map.
-- On later updates, compute each agent's emoji (pure) and rename ONLY
-  when it changed (the existing `self.last` dedup) — using the cached
-  id. No `list-panes` per render.
+- Fetch `list-panes` ONCE (lazily on first update); cache the map.
+- On later updates compute each agent's emoji (pure) and rename ONLY
+  the changed ones (existing `self.last` dedup) using the cached id.
 - Re-query `list-panes` only when a desired rename target isn't in the
-  cache (a pane was added). `TabIndicator` is already efficient
-  (captures the tab id once, renames only on emoji change) — leave it.
+  cache (a pane was added). `TabIndicator` is already efficient —
+  leave it.
+
+This cuts the per-render zellij-server load even while the loop is
+being fixed, and is correct regardless of Fix 1/2.
+
+## Fix 4 (minor) — narrow the OS watch
+
+`watch_status_paths` watches the whole repo recursively
+(`RecursiveMode::Recursive` on `repo`). The `WakeFilter` already drops
+gitignored worktree paths from WAKING, but FSEvents still MONITORS
+`target/` and `.git/objects/`, paying OS-level cost during `cargo
+build`. Scope the OS watch to the dirs we actually wake on (the source
+`.clank/` subdirs + git dir), matching what `wfw`'s `WatchContext`
+already does. This is a build-time FSEvents win, NOT the idle-time
+engine — lower priority than Fixes 1–3.
 
 ## Testing (in-process; no binary spawning — [[no-binary-spawning-tests]])
 
-- Pure: the watch-target set is `{.clank, git_dir}` not the repo root
-  (assert on the resolved watch paths, or a small seam returning them).
-- Pure: `PaneStatus` calls `list-panes` once then reuses the cache —
-  inject a counting fake for the list-panes call; assert it's not
-  invoked per `update`, and that a rename fires only on emoji change.
-- The actual FSEvents/zellij CPU is verified manually (close panes /
-  observe `ps`); not unit-testable.
+- `WakeFilter`: a path under `.clank/cache/` does NOT wake; paths
+  under `.clank/agents/<>/feedback`, `blocks`, `plans`, `queue` DO
+  wake; a git-ref path wakes. (Pure — `WakeFilter::with_rules`.)
+- `state_cache::write`: writing a checkpoint whose `(head, depth)`
+  file already exists is a no-op — assert the file's mtime/inode is
+  unchanged (or that no rename occurred via a seam).
+- `PaneStatus`: inject a counting fake for `list-panes`; assert it's
+  invoked once across N updates (not per update), and that a rename
+  fires only when an agent's emoji changes.
+- The aggregate CPU drop is verified manually (`ps`, close panes) —
+  not unit-testable.
 
 ## Non-goals
 
 - `wfw`'s wake reliability ([[wfw-indefinite-wait-resilient]]) —
-  separate plan; this one is purely the status-tui watch + pane-rename
-  cost.
-- Changing the emoji vocab / which states show which glyph.
+  separate plan.
+- The checkpoint SPACING / prune policy itself — only its write
+  idempotency (Fix 2) and the watch's treatment of the cache (Fix 1)
+  change; how often/where checkpoints land does not.
+- Changing the emoji vocab or which states map to which glyph.
 - Reimplementing dirty-stat computation (only its refresh cadence
-  changes).
+  shifts, as a consequence of Fix 4).
