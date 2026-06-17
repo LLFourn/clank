@@ -29,6 +29,7 @@ use std::path::PathBuf;
 use std::sync::mpsc;
 use std::time::Duration;
 
+use super::open_zellij::agent_pane_title;
 use super::status::{
     StatusSnapshot, short_sha, spawn_sigwinch_forwarder, waiting_actor, watch_status_paths,
 };
@@ -485,42 +486,106 @@ pub(crate) fn attention_state(snap: &StatusSnapshot) -> AttentionState {
     }
 }
 
+/// Whether master is the agent being woken — the SINGLE predicate
+/// behind both the bar's green/cyan hue and the per-pane `🔨`
+/// (tui-agent-pane-status-emoji). Spelled with `state_color`'s exact
+/// BRANCH PRECEDENCE (codex fbdb27b): plans dominate, so a
+/// queue-ready / clean-PR state must NOT count as master-active while
+/// a plan still awaits reviewers.
+pub(crate) fn master_is_active(snap: &StatusSnapshot) -> bool {
+    if attention_state(snap) != AttentionState::Active {
+        return false; // blocked or idle
+    }
+    match snap.plans.as_slice() {
+        // No plans: PR reviews take precedence over the queue.
+        [] if !snap.pr_reviews.is_empty() => {
+            // Master's turn iff no PR still owes a reviewer.
+            !snap
+                .pr_reviews
+                .iter()
+                .any(|p| !p.missing_reviewers.is_empty())
+        }
+        [] if !snap.queue.is_empty() => true, // promote
+        [] => false,                          // unreachable (Idle covers it)
+        // Plans present: queue/PR ignored — master's turn iff some
+        // plan is on a master action.
+        plans => plans.iter().any(|v| {
+            matches!(
+                v.waiting_on,
+                WaitingOn::MasterToRevise { .. }
+                    | WaitingOn::MasterToContinue
+                    | WaitingOn::MasterToCommit
+                    | WaitingOn::MasterToFinalize
+            )
+        }),
+    }
+}
+
 /// The frame's one hue: red = a human must act (blocked), yellow
 /// = reviewers, green = master working, cyan = promote, dim idle.
 fn state_color(snap: &StatusSnapshot) -> &'static str {
     match attention_state(snap) {
         AttentionState::Blocked => "31", // red
         AttentionState::Idle => "2",     // dim
-        // Finer hues within "active":
-        AttentionState::Active => match snap.plans.as_slice() {
-            // PR review (no plans): yellow when reviewers owe a
-            // verdict, green when it's master's turn.
-            [] if !snap.pr_reviews.is_empty() => {
-                if snap
-                    .pr_reviews
-                    .iter()
-                    .any(|p| !p.missing_reviewers.is_empty())
-                {
-                    "33" // yellow: reviewers
+        AttentionState::Active => {
+            if master_is_active(snap) {
+                // cyan for the queue-promote branch (no plans, no
+                // PRs), green for master working on a plan or PR.
+                if snap.plans.is_empty() && snap.pr_reviews.is_empty() {
+                    "36" // cyan: promote
                 } else {
                     "32" // green: master
                 }
+            } else {
+                "33" // yellow: reviewers
             }
-            [] if !snap.queue.is_empty() => "36", // cyan: promote
-            [] => "2",                            // unreachable (Idle covers it)
-            plans => {
-                let any_master = plans.iter().any(|v| {
-                    matches!(
-                        v.waiting_on,
-                        WaitingOn::MasterToRevise { .. }
-                            | WaitingOn::MasterToContinue
-                            | WaitingOn::MasterToCommit
-                            | WaitingOn::MasterToFinalize
-                    )
-                });
-                if any_master { "32" } else { "33" } // green / yellow
+        }
+    }
+}
+
+/// Reviewers the team is currently waiting on — the union of every
+/// `missing` set (commit + gate tiers across plans, plus each PR
+/// review's `missing_reviewers`). May contain duplicates; callers
+/// test membership.
+pub(crate) fn awaited_reviewers(snap: &StatusSnapshot) -> Vec<&clank_core::ids::AgentLabel> {
+    let mut out = Vec::new();
+    for p in &snap.plans {
+        if let WaitingOn::ReviewerApprovalsMissing { missing }
+        | WaitingOn::GateReviewersMissing { missing } = &p.waiting_on
+        {
+            out.extend(missing.iter());
+        }
+    }
+    for pr in &snap.pr_reviews {
+        out.extend(pr.missing_reviewers.iter());
+    }
+    out
+}
+
+/// The status glyph for ONE agent's pane: `🔨` master working / `👀`
+/// awaited reviewer / `💤` idle (tui-agent-pane-status-emoji). Coarse
+/// by design — every master-work state shows `🔨`; the bar keeps the
+/// fine-grained glyph.
+fn agent_status_emoji(
+    snap: &StatusSnapshot,
+    label: &str,
+    role: clank_core::vocab::Role,
+) -> &'static str {
+    match role {
+        clank_core::vocab::Role::Master => {
+            if master_is_active(snap) {
+                "🔨"
+            } else {
+                "💤"
             }
-        },
+        }
+        clank_core::vocab::Role::Reviewer => {
+            if awaited_reviewers(snap).iter().any(|l| l.as_str() == label) {
+                "👀"
+            } else {
+                "💤"
+            }
+        }
     }
 }
 
@@ -876,6 +941,80 @@ impl Drop for TabIndicator {
     }
 }
 
+fn zellij_list_panes() -> Option<String> {
+    let out = std::process::Command::new("zellij")
+        .args(["action", "list-panes"])
+        .output()
+        .ok()?;
+    out.status
+        .success()
+        .then(|| String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+fn zellij_rename_pane(id: &str, name: &str) {
+    // Best-effort: a rename failure must never disturb the loop.
+    let _ = std::process::Command::new("zellij")
+        .args(["action", "rename-pane", "--pane-id", id, name])
+        .status();
+}
+
+/// The agent panes in `zellij action list-panes` output
+/// (`PANE_ID  TYPE  TITLE`, one per line) → `(pane_id, label, role)`.
+/// A pane is an agent's iff its title (after stripping any leading
+/// status glyph) is `"<label> (master)"` / `"<label> (reviewer)"` —
+/// the exact format `agent_pane_title` emits. Non-agent panes
+/// (status, plugin, the header row) don't match and are skipped.
+fn parse_agent_panes(list_panes_stdout: &str) -> Vec<(String, String, clank_core::vocab::Role)> {
+    use clank_core::vocab::Role;
+    let mut out = Vec::new();
+    for line in list_panes_stdout.lines() {
+        let mut toks = line.split_whitespace();
+        let Some(id) = toks.next() else { continue };
+        toks.next(); // TYPE column
+        let base = strip_leading_emoji(&toks.collect::<Vec<_>>().join(" "));
+        for role in [Role::Master, Role::Reviewer] {
+            if let Some(label) = base.strip_suffix(&format!(" ({})", role.as_str())) {
+                out.push((id.to_string(), label.to_string(), role));
+                break;
+            }
+        }
+    }
+    out
+}
+
+/// Mirrors each AGENT's status glyph onto its OWN pane name
+/// (tui-agent-pane-status-emoji). The `status --tui` pane already
+/// holds the whole snapshot and can rename any pane by id, so it owns
+/// this centrally — the Stop hook stays clean. Renames a pane only
+/// when its desired title CHANGES (dedup per id). `None` (no-op)
+/// outside zellij; best-effort.
+struct PaneStatus {
+    last: std::collections::HashMap<String, String>,
+}
+
+impl PaneStatus {
+    fn new() -> Option<Self> {
+        std::env::var_os("ZELLIJ").map(|_| Self {
+            last: std::collections::HashMap::new(),
+        })
+    }
+
+    fn update(&mut self, snap: &StatusSnapshot) {
+        let Some(panes) = zellij_list_panes() else {
+            return;
+        };
+        for (id, label, role) in parse_agent_panes(&panes) {
+            let emoji = agent_status_emoji(snap, &label, role);
+            let title = format!("{emoji} {}", agent_pane_title(&label, role.as_str()));
+            if self.last.get(&id).map(String::as_str) == Some(title.as_str()) {
+                continue;
+            }
+            zellij_rename_pane(&id, &title);
+            self.last.insert(id, title);
+        }
+    }
+}
+
 pub(crate) async fn run_tui(
     repo: PathBuf,
     basename: String,
@@ -887,9 +1026,10 @@ pub(crate) async fn run_tui(
     spawn_sigwinch_forwarder(tx)?;
 
     let _guard = AltScreen::enter();
-    // When inside zellij, mirror the bar's lamp emoji into the tab
-    // name so the tab bar shows what each worktree is doing.
+    // When inside zellij: mirror the bar's lamp emoji into the tab
+    // name, and each agent's status glyph onto its own pane name.
     let mut tab = TabIndicator::new();
+    let mut panes = PaneStatus::new();
     loop {
         let snapshot =
             StatusSnapshot::build_async(&repo, &basename, home.as_deref(), policy, None, true)
@@ -898,6 +1038,9 @@ pub(crate) async fn run_tui(
         paint(&render(&snapshot, rows, cols));
         if let Some(tab) = tab.as_mut() {
             tab.update(&bar_emoji(&snapshot));
+        }
+        if let Some(panes) = panes.as_mut() {
+            panes.update(&snapshot);
         }
 
         match rx.recv_timeout(Duration::from_secs(60)) {
@@ -1172,6 +1315,138 @@ pub(crate) mod tests {
         assert_eq!(strip_leading_emoji("clank"), "clank");
         // A name that merely starts with a word (no emoji) is untouched.
         assert_eq!(strip_leading_emoji("pr-497"), "pr-497");
+    }
+
+    fn pr_awaiting(missing: &[&str]) -> clank_core::wait::PrReviewWorkState {
+        clank_core::wait::PrReviewWorkState {
+            pr: 1,
+            repo: "o/r".into(),
+            round: 1,
+            gate: clank_core::vocab::CommitGateState::Unreviewed,
+            missing_reviewers: missing
+                .iter()
+                .map(|l| AgentLabel::parse(l).unwrap())
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn master_is_active_follows_state_color_precedence() {
+        // Idle → false.
+        assert!(!master_is_active(&snap(vec![], vec![])));
+        // Plan on a master action → true.
+        assert!(master_is_active(&snap(
+            vec![plan_state("p", WaitingOn::MasterToContinue)],
+            vec![]
+        )));
+        // THE codex fbdb27b case: a plan awaiting reviewers dominates a
+        // pending queue → master is NOT active (bar stays yellow).
+        assert!(
+            !master_is_active(&snap(
+                vec![plan_state("p", reviewer_missing("codex"))],
+                vec!["queued"]
+            )),
+            "plans take precedence over the queue"
+        );
+        // No plans + queue only → master promotes.
+        assert!(master_is_active(&snap(vec![], vec!["queued"])));
+        // No plans + PR: master's turn iff no reviewer is owed.
+        let mut s = snap(vec![], vec![]);
+        s.pr_reviews.push(pr_awaiting(&["codex"]));
+        assert!(!master_is_active(&s), "PR still owes a reviewer");
+        s.pr_reviews[0].missing_reviewers.clear();
+        assert!(master_is_active(&s), "PR fully reviewed → master's turn");
+    }
+
+    #[test]
+    fn awaited_reviewers_unions_plans_and_prs() {
+        let mut s = snap(vec![plan_state("p", reviewer_missing("codex"))], vec![]);
+        s.pr_reviews.push(pr_awaiting(&["ruthless"]));
+        let got: Vec<&str> = awaited_reviewers(&s).iter().map(|l| l.as_str()).collect();
+        assert!(
+            got.contains(&"codex") && got.contains(&"ruthless"),
+            "got: {got:?}"
+        );
+        // Master's turn → nobody awaited.
+        assert!(
+            awaited_reviewers(&snap(
+                vec![plan_state("p", WaitingOn::MasterToContinue)],
+                vec![]
+            ))
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn agent_status_emoji_per_role() {
+        use clank_core::vocab::Role;
+        let working = snap(vec![plan_state("p", WaitingOn::MasterToContinue)], vec![]);
+        assert_eq!(agent_status_emoji(&working, "claude", Role::Master), "🔨");
+        assert_eq!(agent_status_emoji(&working, "codex", Role::Reviewer), "💤");
+
+        let reviewing = snap(vec![plan_state("p", reviewer_missing("codex"))], vec![]);
+        assert_eq!(
+            agent_status_emoji(&reviewing, "codex", Role::Reviewer),
+            "👀"
+        );
+        assert_eq!(
+            agent_status_emoji(&reviewing, "ruthless", Role::Reviewer),
+            "💤"
+        );
+        assert_eq!(agent_status_emoji(&reviewing, "claude", Role::Master), "💤");
+
+        assert_eq!(
+            agent_status_emoji(&snap(vec![], vec![]), "claude", Role::Master),
+            "💤"
+        );
+    }
+
+    #[test]
+    fn parse_agent_panes_from_live_list_panes() {
+        use clank_core::vocab::Role;
+        // Exact `zellij action list-panes` shape (0.44.3); terminal_1
+        // carries a stale glyph that must be stripped.
+        let out = "\
+PANE_ID  TYPE  TITLE
+plugin_0  plugin  (.) - zellij:link
+terminal_0  terminal  claude (master)
+terminal_1  terminal  👀 codex (reviewer)
+terminal_2  terminal  status
+terminal_3  terminal  ruthless (reviewer)
+";
+        assert_eq!(
+            parse_agent_panes(out),
+            vec![
+                ("terminal_0".to_string(), "claude".to_string(), Role::Master),
+                (
+                    "terminal_1".to_string(),
+                    "codex".to_string(),
+                    Role::Reviewer
+                ),
+                (
+                    "terminal_3".to_string(),
+                    "ruthless".to_string(),
+                    Role::Reviewer
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn agent_pane_title_round_trips_through_parse() {
+        use clank_core::vocab::Role;
+        // The shared builder's output is recoverable by the parser —
+        // pins layout + renamer to one format (no silent drift).
+        for (role, label) in [(Role::Master, "alice"), (Role::Reviewer, "bob")] {
+            let line = format!(
+                "terminal_9  terminal  {}",
+                agent_pane_title(label, role.as_str())
+            );
+            assert_eq!(
+                parse_agent_panes(&line),
+                vec![("terminal_9".to_string(), label.to_string(), role)]
+            );
+        }
     }
 
     #[test]

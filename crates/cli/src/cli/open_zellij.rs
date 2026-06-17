@@ -394,6 +394,15 @@ pub(crate) fn validate_template(template: &str) -> anyhow::Result<()> {
 /// the repo regardless of the shell that invoked
 /// `zellij --layout`; `--repo` pins clank-side resolution (codex
 /// 8075d43 + 361b104).
+/// The pane name for an agent: `"<label> (<role>)"`. The SINGLE
+/// source of this format — the zellij layout names panes with it here,
+/// and `status --tui` matches it to map panes back to agents
+/// (tui-agent-pane-status-emoji). A round-trip test pins the two
+/// together so the format can't drift silently.
+pub(crate) fn agent_pane_title(label: &str, role_str: &str) -> String {
+    format!("{label} ({role_str})")
+}
+
 fn push_agent_pane(
     out: &mut String,
     indent: &str,
@@ -402,11 +411,11 @@ fn push_agent_pane(
     role_str: &str,
     repo_path: &str,
 ) {
+    let name_esc = kdl_escape(&agent_pane_title(label, role_str));
     let label_esc = kdl_escape(label);
-    let role_esc = kdl_escape(role_str);
     let repo_esc = kdl_escape(repo_path);
     out.push_str(&format!(
-        "{indent}pane{extra_attrs} name=\"{label_esc} ({role_esc})\" cwd=\"{repo_esc}\" {{\n"
+        "{indent}pane{extra_attrs} name=\"{name_esc}\" cwd=\"{repo_esc}\" {{\n"
     ));
     out.push_str(&format!("{indent}    command \"clank\"\n"));
     out.push_str(&format!(
