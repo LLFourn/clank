@@ -209,11 +209,21 @@ fn start(args: AgentStartArgs) -> anyhow::Result<()> {
         // A seeded fork spec (clank fork) takes precedence over the
         // plain bootstrap on first launch: fork the source session
         // with the orientation prompt; the forked id then binds via
-        // the env-var hook and later starts hit the resume path.
-        None => match crate::cli::fork::load_fork_spec(&repo, &label)? {
-            Some(spec) => compose_fork_launch(&spec, &desc, &repo),
-            None => compose_bootstrap_launch(&label, &desc)?,
-        },
+        // the env-var hook and later starts hit the resume path. The
+        // spec is ONE-SHOT — consume (delete) it on a real launch so
+        // a later relaunch with a lost binding can't re-fork the
+        // ancestor (fork-session-id-chaining). `--print` only peeks.
+        None => {
+            let spec = if args.print {
+                crate::cli::fork::load_fork_spec(&repo, &label)?
+            } else {
+                crate::cli::fork::take_fork_spec(&repo, &label)?
+            };
+            match spec {
+                Some(spec) => compose_fork_launch(&spec, &desc, &repo),
+                None => compose_bootstrap_launch(&label, &desc)?,
+            }
+        }
         Some(session) => {
             let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
             let auto_mode =

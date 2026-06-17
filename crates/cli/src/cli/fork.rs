@@ -54,6 +54,22 @@ pub fn load_fork_spec(repo: &Path, label: &AgentLabel) -> anyhow::Result<Option<
     }
 }
 
+/// CONSUME the fork spec: load it AND delete the file, enforcing the
+/// one-shot contract. Without this, a stale spec lingers and a later
+/// `clank agent start` with a lost binding re-forks the ORIGINAL
+/// ancestor — making a fork-of-a-fork resurrect the grandparent's
+/// session content (fork-session-id-chaining). Deletion is
+/// best-effort after a successful load: the spec has already been
+/// turned into the launch, so a failed unlink shouldn't abort the
+/// launch (it only risks a re-fork, which the binding then prevents).
+pub fn take_fork_spec(repo: &Path, label: &AgentLabel) -> anyhow::Result<Option<ForkSpec>> {
+    let spec = load_fork_spec(repo, label)?;
+    if spec.is_some() {
+        let _ = std::fs::remove_file(fork_spec_path(repo, label));
+    }
+    Ok(spec)
+}
+
 /// THE open decision, pure (ruthless 84fb046: the spawn itself is
 /// untestable under the no-binary-spawning rule, so the decision
 /// is). Inside zellij the tab opens by default; `--no-open` opts
@@ -457,5 +473,37 @@ mod tests {
         assert!(!should_open(true, true), "inside + --no-open → skip");
         assert!(!should_open(false, false), "outside + default → skip");
         assert!(!should_open(false, true), "outside + --no-open → skip");
+    }
+
+    #[test]
+    fn take_fork_spec_is_one_shot() {
+        // The spec must be CONSUMED (deleted) on take, so a lingering
+        // spec can't re-fork the ancestor on a later relaunch
+        // (fork-session-id-chaining).
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        let label = AgentLabel::parse("codex").unwrap();
+
+        // Absent → None, no error.
+        assert!(take_fork_spec(repo, &label).unwrap().is_none());
+
+        let spec = ForkSpec {
+            tool: clank_core::vocab::Tool::Codex,
+            from_session: "ancestor-id".into(),
+            prompt: "orient".into(),
+        };
+        let path = fork_spec_path(repo, &label);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, serde_json::to_string(&spec).unwrap()).unwrap();
+
+        // First take returns it AND deletes the file.
+        assert_eq!(
+            take_fork_spec(repo, &label).unwrap().unwrap().from_session,
+            "ancestor-id"
+        );
+        assert!(!path.exists(), "spec deleted after consume (one-shot)");
+
+        // A relaunch finds nothing — no ancestor re-fork.
+        assert!(take_fork_spec(repo, &label).unwrap().is_none());
     }
 }

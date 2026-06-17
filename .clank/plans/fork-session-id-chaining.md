@@ -82,3 +82,40 @@ localizes the bug before any code change.
 
 - The codex working-dir picker ([[fork-codex-cd-flag]]) — separate
   codex-fork issue, separate plan.
+
+## Findings + fix
+
+Ruled OUT (code + real-data): clank never writes `from_session` into
+a config — it only passes it to `codex fork` / `claude --resume`
+(grep-confirmed). And clank binds whatever `CODEX_THREAD_ID` /
+`CLAUDE_CODE_SESSION_ID` reports (`agent_env::detect_session_from_env`
+via `clank as`). Live evidence from the real frostsnap repo: the two
+one-level forks (pr-496, pr-497) bound DISTINCT, correct codex ids
+(neither is main's), so the env-based bind captures the NEW forked id
+correctly at one level. So the bug is NOT clank stamping the ancestor
+id at bind time.
+
+ROOT CAUSE found in clank: the fork spec `fork.json` is documented
+ONE-SHOT ("consumed on first launch") but `clank agent start` only
+`load`ed it — never deleted it. Confirmed live: pr-496/pr-497 still
+have `fork.json` on disk post-launch, with `from_session` = main's
+ids. A lingering spec is an ancestor-resurrection trap: a fork's
+binding can be cleared (e.g. `bind_session_to_agent` clears a stale
+duplicate that shares a session id), and the next `clank agent start`
+sees no bound session, RE-consumes the stale spec, and
+`codex fork <ancestor>` again — so the agent lands back in an
+ancestor-content session. A fork-of-a-fork then chains off the
+grandparent. That matches "C shows A's last message".
+
+Fix (implemented): `take_fork_spec` (load + delete) enforces the
+one-shot contract; `clank agent start` consumes via it on a real
+launch (`--print` peeks without consuming). Unit-tested
+(`take_fork_spec_is_one_shot`): a consumed spec is gone, a relaunch
+finds nothing → no ancestor re-fork.
+
+Remaining live confirmation (hand to lloyd if it recurs): reproduce
+A→B→C and, before forking C, check that B's bound id matches B's
+actual working codex session, and that C's `fork.json` `from_session`
+is B's id (not A's). If C still shows A's content with a correct
+`from_session`, the residual is codex-side fork-content lineage, not
+clank.
