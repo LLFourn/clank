@@ -7,7 +7,7 @@
 //! pure side-effect-producing infrastructure (git plumbing,
 //! ref updates, tree builds).
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use clank_core::api::{RewriteCommit, RewriteDisposition};
 use clank_core::ids::CommitSha;
@@ -573,12 +573,36 @@ async fn apply_squash(
 /// Like `build_stripped_tree` but takes a sha that we look up
 /// `^{tree}` for. Used by squash where we work from HEAD's tree
 /// directly.
+/// The scratch dir for a private rewrite index. Resolved via git, NOT
+/// hardcoded as `<repo>/.git/clank-rewrite`: in a linked worktree
+/// `<repo>/.git` is a FILE (`gitdir: …`), so `create_dir_all` under it
+/// ENOTDIR'd (rewrite-scratch-dir-worktree). `--git-path` returns the
+/// real per-worktree gitdir; `--path-format=absolute` so it doesn't
+/// depend on the process cwd.
+fn rewrite_scratch_dir(repo: &Path) -> anyhow::Result<PathBuf> {
+    let raw = git_capture(
+        repo,
+        &[
+            "rev-parse",
+            "--path-format=absolute",
+            "--git-path",
+            "clank-rewrite",
+        ],
+    )?;
+    let dir = PathBuf::from(raw.trim());
+    Ok(if dir.is_absolute() {
+        dir
+    } else {
+        repo.join(dir)
+    })
+}
+
 fn build_stripped_tree_from_sha(
     repo: &Path,
     sha: &str,
     strip_paths: &[String],
 ) -> anyhow::Result<String> {
-    let scratch_dir = repo.join(".git").join("clank-rewrite");
+    let scratch_dir = rewrite_scratch_dir(repo)?;
     std::fs::create_dir_all(&scratch_dir)?;
     let unique = format!(
         "squash-{}-{}",
@@ -612,10 +636,11 @@ fn build_stripped_tree_from_sha(
 }
 
 /// Build a new tree object from `<sha>`'s tree by removing each path
-/// in `strip_paths`. Uses a scratch git index under `<repo>/.git/`
-/// so we never disturb the operator's real index.
+/// in `strip_paths`. Uses a scratch git index inside the real gitdir
+/// (see `rewrite_scratch_dir`) so we never disturb the operator's
+/// real index.
 fn build_stripped_tree(repo: &Path, sha: &str, strip_paths: &[String]) -> anyhow::Result<String> {
-    let scratch_dir = repo.join(".git").join("clank-rewrite");
+    let scratch_dir = rewrite_scratch_dir(repo)?;
     std::fs::create_dir_all(&scratch_dir)?;
     let unique = format!(
         "rewrite-{}-{}",
@@ -699,7 +724,18 @@ fn parse_author(spec: &str) -> Option<(&str, &str)> {
 
 fn working_tree_dirty(repo: &Path) -> anyhow::Result<bool> {
     let stdout = git_capture(repo, &["status", "--porcelain"])?;
-    Ok(!stdout.trim().is_empty())
+    // Clank's OWN untracked scratch under `.clank/` (cache, agent
+    // configs, queue, a freshly-written `.gitignore`, …) is local
+    // runtime state, not the operator's work — it must NOT block a
+    // history rewrite (rewrite-scratch-dir-worktree). It's also
+    // irrelevant to the rewrite, which only edits COMMITTED history.
+    // Tracked modifications anywhere (incl. committed `.clank/` plan
+    // files) and untracked files OUTSIDE `.clank/` still count.
+    Ok(stdout.lines().any(|line| {
+        let untracked = line.starts_with("??");
+        let path = line.get(3..).unwrap_or("");
+        !(untracked && path.starts_with(".clank/"))
+    }))
 }
 
 fn branch_exists(repo: &Path, branch: &str) -> anyhow::Result<bool> {
@@ -1548,5 +1584,89 @@ mod tests {
         .await
         .unwrap_err();
         assert!(format!("{err}").contains("merge commit"), "{err}");
+    }
+
+    #[test]
+    fn build_stripped_tree_works_in_a_linked_worktree() {
+        // The bug: a LINKED worktree's `.git` is a FILE, so the old
+        // hardcoded `<repo>/.git/clank-rewrite` ENOTDIR'd
+        // (rewrite-scratch-dir-worktree). Reproduce with a REAL linked
+        // worktree and assert both tree builders succeed there.
+        let dir = init_repo();
+        let repo = dir.path();
+        write(repo, "keep.txt", "keep\n");
+        write(repo, "strip.txt", "strip\n");
+        commit(repo, "base");
+
+        let wt_root = tempfile::tempdir().unwrap();
+        let wt = wt_root.path().join("wt");
+        run(
+            repo,
+            &[
+                "worktree",
+                "add",
+                "--quiet",
+                wt.to_str().unwrap(),
+                "-b",
+                "feature",
+            ],
+        );
+        assert!(
+            wt.join(".git").is_file(),
+            "linked worktree `.git` is a file"
+        );
+
+        write(&wt, "wt.txt", "in worktree\n");
+        let sha = commit(&wt, "wt commit");
+
+        // Pre-fix both of these ENOTDIR'd at
+        // create_dir_all(<wt>/.git/clank-rewrite).
+        let tree = build_stripped_tree(&wt, &sha, &["strip.txt".to_string()]).unwrap();
+        assert!(tree_has(&wt, &tree, "keep.txt"));
+        assert!(!tree_has(&wt, &tree, "strip.txt"), "stripped path removed");
+
+        let squashed = build_stripped_tree_from_sha(&wt, &sha, &["wt.txt".to_string()]).unwrap();
+        assert!(!tree_has(&wt, &squashed, "wt.txt"));
+
+        // The scratch dir resolved into the real per-worktree gitdir,
+        // not under the worktree's `.git` FILE.
+        let scratch = rewrite_scratch_dir(&wt).unwrap();
+        assert!(
+            scratch.is_absolute(),
+            "absolute scratch dir; got {scratch:?}"
+        );
+        assert!(
+            !scratch.starts_with(wt.join(".git")),
+            "scratch must not be under the worktree `.git` file; got {scratch:?}"
+        );
+    }
+
+    #[test]
+    fn working_tree_dirty_excludes_clank_scratch() {
+        // Clank's own untracked `.clank/` scratch must not block a
+        // rewrite, but real uncommitted work still must.
+        let dir = init_repo();
+        let repo = dir.path();
+        write(repo, "src.txt", "x\n");
+        commit(repo, "base");
+        assert!(!working_tree_dirty(repo).unwrap(), "clean tree");
+
+        // Untracked clank scratch → NOT dirty.
+        write(repo, ".clank/cache/state.json", "{}\n");
+        write(repo, ".clank/config.json", "{}\n");
+        assert!(
+            !working_tree_dirty(repo).unwrap(),
+            "untracked .clank/ scratch must not block"
+        );
+
+        // An untracked file OUTSIDE .clank/ → dirty.
+        write(repo, "stray.txt", "oops\n");
+        assert!(working_tree_dirty(repo).unwrap(), "stray untracked counts");
+        std::fs::remove_file(repo.join("stray.txt")).unwrap();
+        assert!(!working_tree_dirty(repo).unwrap());
+
+        // A modified TRACKED file → dirty.
+        write(repo, "src.txt", "changed\n");
+        assert!(working_tree_dirty(repo).unwrap(), "tracked edit must block");
     }
 }
