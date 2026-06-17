@@ -42,8 +42,7 @@ enum Command {
     /// Create a linked worktree with the whole team's sessions
     /// forked into it (opens a tab when inside zellij)
     Fork(cli::ForkArgs),
-    /// Run the multi-agent review loop against a GitHub PR
-    /// (`clank pr-review start|note|abort|status`).
+    /// Run the multi-agent review loop against a GitHub PR.
     PrReview(cli::PrReviewArgs),
     /// Restore a shelved plan: replay its commits onto HEAD.
     /// Reviews reset (the replayed commits are re-reviewed)
