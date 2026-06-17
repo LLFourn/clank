@@ -188,9 +188,15 @@ pub async fn run_fork_pinned(
         );
     }
 
+    // Worktrees live FLAT under the MAIN repo, never nested under the
+    // current worktree — forking from a worktree must produce a
+    // SIBLING, not `<wt>/.clank/worktrees/...` (fork-worktree-nesting).
+    // The fork SOURCE (sessions + base) stays the current worktree;
+    // only the dest LOCATION is main-rooted. `--path` still wins.
+    let main_root = main_repo_root(&source)?;
     let dest = match &args.path {
         Some(p) => p.clone(),
-        None => source.join(format!(".clank/worktrees/{name}")),
+        None => main_root.join(format!(".clank/worktrees/{name}")),
     };
     if dest.exists() {
         anyhow::bail!(
@@ -224,7 +230,7 @@ pub async fn run_fork_pinned(
     // ensure /worktrees/ is gitignored even in repos whose
     // .clank/.gitignore predates the entry (codex 335c0fc; init's
     // canonical body now includes it).
-    crate::init_facts::ensure_clank_gitignore_entry(&source, "/worktrees/")
+    crate::init_facts::ensure_clank_gitignore_entry(&main_root, "/worktrees/")
         .context("ensuring /worktrees/ gitignore entry")?;
     if let Some(parent) = dest.parent() {
         std::fs::create_dir_all(parent)
@@ -376,6 +382,34 @@ pub(crate) fn fetch_pr_head(source: &Path, pr: u32) -> anyhow::Result<String> {
         anyhow::bail!("resolving FETCH_HEAD after the PR fetch failed");
     }
     Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
+/// The MAIN worktree's root, resolved from ANY worktree. The first
+/// `git worktree list --porcelain` entry is always the main
+/// worktree, so this returns the same root whether called from the
+/// main checkout or a linked worktree — letting new worktrees anchor
+/// flat under `<main>/.clank/worktrees/` instead of nesting under the
+/// current one (fork-worktree-nesting).
+fn main_repo_root(repo: &Path) -> anyhow::Result<PathBuf> {
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["worktree", "list", "--porcelain"])
+        .output()
+        .context("spawning git worktree list")?;
+    if !out.status.success() {
+        anyhow::bail!(
+            "resolving the main worktree (`git worktree list`) failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let path = stdout
+        .lines()
+        .next()
+        .and_then(|l| l.strip_prefix("worktree "))
+        .ok_or_else(|| anyhow::anyhow!("`git worktree list` produced no main worktree entry"))?;
+    Ok(PathBuf::from(path))
 }
 
 /// Best-effort PR title for the orientation prompt. Runs gh IN

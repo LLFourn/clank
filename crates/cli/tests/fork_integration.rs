@@ -238,6 +238,73 @@ fn fork_carbon_copies_per_agent_settings_not_session() {
 }
 
 #[test]
+fn fork_from_worktree_lands_sibling_under_main_not_nested() {
+    let env = source_with_bound_team();
+    let main = env.repo().to_path_buf();
+
+    // B: fork from main.
+    let b = block_on(clank::cli::fork::run_fork(
+        &fork_args(&env, "wt1"),
+        Some(env.home()),
+    ))
+    .unwrap();
+    assert_eq!(
+        b.canonicalize().unwrap(),
+        main.join(".clank/worktrees/wt1").canonicalize().unwrap()
+    );
+
+    // Bind sessions IN B (simulate `clank as` in the worktree) so it
+    // can itself be forked.
+    for (label, tool, id) in [
+        (
+            "claude",
+            clank_core::vocab::Tool::Claude,
+            "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+        ),
+        (
+            "codex",
+            clank_core::vocab::Tool::Codex,
+            "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
+        ),
+    ] {
+        let l = clank_core::ids::AgentLabel::parse(label).unwrap();
+        let cfg = clank_core::agent_config::AgentConfig {
+            auto_mode: None,
+            wfw_timeout: None,
+            session: Some(clank_core::agent_config::Session {
+                id: clank_core::ids::SessionId::parse(id).unwrap(),
+                tool,
+                updated_at: "2026-06-17T00:00:00Z".to_string(),
+            }),
+        };
+        clank::agent_store::save_agent_config(&b, &l, &cfg).unwrap();
+    }
+
+    // C: fork FROM B.
+    let mut from_b = fork_args(&env, "wt2");
+    from_b.source = Some(b.clone());
+    let c = block_on(clank::cli::fork::run_fork(&from_b, Some(env.home()))).unwrap();
+
+    // C is a SIBLING under main, NOT nested under B.
+    assert_eq!(
+        c.canonicalize().unwrap(),
+        main.join(".clank/worktrees/wt2").canonicalize().unwrap(),
+        "fork-from-worktree must land under the MAIN repo"
+    );
+    assert!(
+        !c.starts_with(&b),
+        "C must not be nested under B: {}",
+        c.display()
+    );
+    assert_eq!(
+        c.to_string_lossy().matches(".clank/worktrees").count(),
+        1,
+        "exactly one worktrees segment (no nesting): {}",
+        c.display()
+    );
+}
+
+#[test]
 fn fork_refuses_when_sessions_missing() {
     let env = TestEnv::init();
     env.register_team("claude", &["codex"], &[]);
