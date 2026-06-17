@@ -609,15 +609,10 @@ pub async fn run(args: ConfigArgs) -> anyhow::Result<()> {
     let repo = match &args.repo {
         Some(p) => dunce::canonicalize(p)?,
         None => {
-            let output = std::process::Command::new("git")
-                .args(["rev-parse", "--show-toplevel"])
-                .output();
-            match output {
-                Ok(o) if o.status.success() => {
-                    let root = String::from_utf8(o.stdout)?.trim().to_string();
-                    dunce::canonicalize(std::path::Path::new(&root))?
-                }
-                _ => std::env::current_dir()?,
+            let cwd = std::env::current_dir()?;
+            match crate::git_io::discover_work_dir(&cwd)? {
+                Some(root) => dunce::canonicalize(&root)?,
+                None => cwd,
             }
         }
     };

@@ -85,6 +85,19 @@ pub fn common_dir(repo: &Path) -> Result<PathBuf, GitIoError> {
     Ok(absolutize(repo, r.common_dir()))
 }
 
+/// Discover the repository containing `start` — searching UPWARD,
+/// like `git rev-parse --show-toplevel` — and return its working-tree
+/// root. `Ok(None)` when `start` isn't inside a (non-bare) git repo.
+/// Replaces `git rev-parse --show-toplevel`.
+pub fn discover_work_dir(start: &Path) -> Result<Option<PathBuf>, GitIoError> {
+    match gix::discover(start) {
+        Ok(r) => Ok(r.workdir().map(Path::to_path_buf)),
+        // Not inside a repo (or unreadable) — the caller decides
+        // whether that's an error or a fallback.
+        Err(_) => Ok(None),
+    }
+}
+
 /// Return the blob content at `rel_path` in the tree of `rev`.
 /// Preserves trailing whitespace (newlines matter for hashing).
 ///
@@ -1260,6 +1273,35 @@ mod tests {
             "worktree gitdir under common/worktrees; got {gd_wt:?}"
         );
         assert!(git_dir(&wt).unwrap().is_absolute());
+    }
+
+    #[test]
+    fn discover_work_dir_searches_upward_and_none_outside() {
+        use std::process::Command;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        assert!(
+            Command::new("git")
+                .arg("-C")
+                .arg(root)
+                .args(["init", "--quiet"])
+                .status()
+                .unwrap()
+                .success()
+        );
+        // Upward search: from a nested subdir → the repo's work root
+        // (matches `git rev-parse --show-toplevel`).
+        let sub = root.join("a/b");
+        std::fs::create_dir_all(&sub).unwrap();
+        let found = discover_work_dir(&sub).unwrap().unwrap();
+        assert_eq!(
+            found.canonicalize().unwrap(),
+            root.canonicalize().unwrap(),
+            "discover from a subdir returns the toplevel"
+        );
+        // Outside any repo → None (caller bails / falls back).
+        let outside = tempfile::tempdir().unwrap();
+        assert!(discover_work_dir(outside.path()).unwrap().is_none());
     }
 
     mod walker_equivalence {

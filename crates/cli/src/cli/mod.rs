@@ -1357,17 +1357,12 @@ pub(crate) fn resolve_repo(explicit: Option<&Path>) -> anyhow::Result<PathBuf> {
     let raw = if let Some(p) = explicit {
         p.to_path_buf()
     } else {
-        let output = std::process::Command::new("git")
-            .args(["rev-parse", "--show-toplevel"])
-            .output()?;
-        if !output.status.success() {
-            anyhow::bail!(
-                "no --repo given and `git rev-parse --show-toplevel` failed: {}",
-                String::from_utf8_lossy(&output.stderr).trim()
-            );
-        }
-        let root = String::from_utf8(output.stdout)?.trim().to_string();
-        PathBuf::from(root)
+        let cwd = std::env::current_dir()?;
+        crate::git_io::discover_work_dir(&cwd)?.ok_or_else(|| {
+            anyhow::anyhow!(
+                "no --repo given and the working directory is not inside a git repository"
+            )
+        })?
     };
     Ok(dunce::canonicalize(&raw)?)
 }
