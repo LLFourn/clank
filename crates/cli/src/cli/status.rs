@@ -604,6 +604,12 @@ pub(crate) struct WakeFilter {
     repo_root: PathBuf,
     git_dir: PathBuf,
     clank_root: PathBuf,
+    /// `.clank/cache` — the DERIVED fold cache. Excluded from waking:
+    /// it's clank's own re-derivable output, not a state signal, and
+    /// waking on it self-triggers a render→write-cache→wake loop
+    /// (status-tui-watch-cpu). The real signals (feedback/blocks/
+    /// plans/queue) live elsewhere under `.clank`.
+    cache_root: PathBuf,
     matcher: ignore::gitignore::Gitignore,
 }
 
@@ -616,6 +622,7 @@ impl WakeFilter {
         let git_dir = dunce::canonicalize(git_dir).unwrap_or_else(|_| git_dir.to_path_buf());
         Self {
             clank_root: repo_root.join(".clank"),
+            cache_root: repo_root.join(".clank").join("cache"),
             matcher: Self::build_matcher(&repo_root, &git_dir),
             repo_root,
             git_dir,
@@ -633,6 +640,14 @@ impl WakeFilter {
 
     /// True → the event at `path` should wake the loop.
     pub(crate) fn wakes(&mut self, path: &Path) -> bool {
+        // The fold cache is DERIVED state, not a signal. Waking on it
+        // would self-trigger (a render writes the cache, which would
+        // wake the next render) and amplify across every process
+        // folding the repo (status-tui-watch-cpu). Checked BEFORE the
+        // `.clank` wake since the cache lives under `.clank`.
+        if path.starts_with(&self.cache_root) {
+            return false;
+        }
         if path.starts_with(&self.clank_root) || path.starts_with(&self.git_dir) {
             return true;
         }
@@ -663,6 +678,7 @@ impl WakeFilter {
             repo_root: repo_root.to_path_buf(),
             git_dir: git_dir.to_path_buf(),
             clank_root: repo_root.join(".clank"),
+            cache_root: repo_root.join(".clank").join("cache"),
             matcher: builder.build().expect("test matcher"),
         }
     }
@@ -1040,9 +1056,17 @@ mod dirty_and_wake_tests {
         let root = Path::new("/repo");
         let git_dir = Path::new("/repo/.git");
         let mut f = WakeFilter::with_rules(root, git_dir, &["/target/", "*.log"]);
-        // .clank and .git are exempt from ignore rules.
+        // .clank state signals and .git are exempt from ignore rules.
         assert!(f.wakes(Path::new("/repo/.clank/agents/codex/feedback/abc.md")));
+        assert!(f.wakes(Path::new("/repo/.clank/blocks/q.md")));
+        assert!(f.wakes(Path::new("/repo/.clank/plans/foo.md")));
+        assert!(f.wakes(Path::new("/repo/.clank/queue/500-foo.md")));
         assert!(f.wakes(Path::new("/repo/.git/HEAD")));
+        // The DERIVED fold cache must NOT wake — waking on it
+        // self-triggers a render→write-cache→wake loop
+        // (status-tui-watch-cpu). Checked even though it's under
+        // `.clank`.
+        assert!(!f.wakes(Path::new("/repo/.clank/cache/repo-state/abc123.7.v10.bin")));
         // Worktree paths: ignored → drop, tracked-ish → wake.
         assert!(!f.wakes(Path::new("/repo/target/debug/build/junk.o")));
         assert!(!f.wakes(Path::new("/repo/build.log")));
