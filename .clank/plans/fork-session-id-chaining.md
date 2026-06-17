@@ -113,6 +113,16 @@ launch (`--print` peeks without consuming). Unit-tested
 (`take_fork_spec_is_one_shot`): a consumed spec is gone, a relaunch
 finds nothing → no ancestor re-fork.
 
+Is CLAUDE affected? YES — and fixed by the same change. The bug is
+TOOL-AGNOSTIC: `run_fork` writes a `fork.json` for every team member
+(frostsnap's worktrees have a claude `fork.json` too), and the
+non-deletion was in `load_fork_spec`/`agent start`, which are shared
+across tools. So a claude fork whose binding is later lost would
+likewise re-fork its ancestor via `claude --resume <src>
+--fork-session`. `take_fork_spec` consumes the spec for any tool, so
+both are fixed. lloyd hit it on codex, but it was never
+codex-specific.
+
 Remaining live confirmation (hand to lloyd if it recurs): reproduce
 A→B→C and, before forking C, check that B's bound id matches B's
 actual working codex session, and that C's `fork.json` `from_session`
