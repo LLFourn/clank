@@ -805,10 +805,19 @@ fn zellij_current_tab() -> Option<(String, String)> {
     if !out.status.success() {
         return None;
     }
-    let s = String::from_utf8_lossy(&out.stdout);
+    parse_current_tab_info(&String::from_utf8_lossy(&out.stdout))
+}
+
+/// Parse `zellij action current-tab-info` into `(id, name)`. The
+/// output is ONE FIELD PER LINE — verified live against zellij 0.44.3
+/// (`od -c`): `name: <name>\nid: <n>\nposition: …`. Order-independent
+/// (scans all lines); `None` if either field is absent (don't rename
+/// a tab we can't identify). Pure, so the format is unit-tested
+/// without spawning zellij (codex 3cc72aa).
+fn parse_current_tab_info(stdout: &str) -> Option<(String, String)> {
     let mut id = None;
     let mut name = None;
-    for line in s.lines() {
+    for line in stdout.lines() {
         if let Some(v) = line.strip_prefix("id:") {
             id = Some(v.trim().to_string());
         } else if let Some(v) = line.strip_prefix("name:") {
@@ -1133,6 +1142,25 @@ pub(crate) mod tests {
         }
         // Idle is the sleeping glyph specifically.
         assert_eq!(bar_emoji(&snap(vec![], vec![])), "💤");
+    }
+
+    #[test]
+    fn parse_current_tab_info_matches_zellij_044_output() {
+        // The EXACT bytes from `zellij action current-tab-info` on
+        // zellij 0.44.3 (verified via `od -c`): one field per line.
+        let out = "name: clank\nid: 0\nposition: 0\n";
+        assert_eq!(
+            parse_current_tab_info(out),
+            Some(("0".to_string(), "clank".to_string()))
+        );
+        // Order-independent.
+        let reordered = "id: 3\nname: my tab\n";
+        assert_eq!(
+            parse_current_tab_info(reordered),
+            Some(("3".to_string(), "my tab".to_string()))
+        );
+        // Missing id (or name) → None: never rename an unidentified tab.
+        assert_eq!(parse_current_tab_info("position: 0\n"), None);
     }
 
     #[test]
