@@ -366,16 +366,10 @@ pub async fn run_clean(args: ShelveCleanArgs) -> anyhow::Result<()> {
 /// and read failures both land on the SAFE side of the rollback
 /// decision: keep the protective ref).
 fn git_head(repo: &Path) -> Option<String> {
-    let out = std::process::Command::new("git")
-        .arg("-C")
-        .arg(repo)
-        .args(["rev-parse", "HEAD"])
-        .output()
-        .ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    Some(String::from_utf8_lossy(&out.stdout).trim().to_string())
+    crate::git_io::rev_parse_head(repo)
+        .ok()
+        .flatten()
+        .map(|s| s.as_str().to_string())
 }
 
 fn git_update_ref(repo: &Path, name: &str, sha: &str) -> anyhow::Result<()> {

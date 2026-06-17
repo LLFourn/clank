@@ -152,18 +152,10 @@ fn git_show(repo: &Path, spec: &str) -> anyhow::Result<Vec<u8>> {
 }
 
 fn head_sha(repo: &Path) -> anyhow::Result<String> {
-    let out = std::process::Command::new("git")
-        .arg("-C")
-        .arg(repo)
-        .args(["rev-parse", "HEAD"])
-        .output()?;
-    if !out.status.success() {
-        anyhow::bail!(
-            "git rev-parse HEAD failed: {}",
-            String::from_utf8_lossy(&out.stderr).trim()
-        );
-    }
-    Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+    Ok(crate::git_io::rev_parse_head(repo)?
+        .ok_or_else(|| anyhow::anyhow!("git rev-parse HEAD failed: repository has no commits"))?
+        .as_str()
+        .to_string())
 }
 
 fn short(sha: &str) -> &str {

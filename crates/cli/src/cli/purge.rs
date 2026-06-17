@@ -228,15 +228,10 @@ pub(crate) fn build_amend_program(
         );
     }
 
-    let head_out = std::process::Command::new("git")
-        .arg("-C")
-        .arg(repo)
-        .args(["rev-parse", "HEAD"])
-        .output()?;
-    if !head_out.status.success() {
-        anyhow::bail!("git rev-parse HEAD failed");
-    }
-    let head_sha = String::from_utf8(head_out.stdout)?.trim().to_string();
+    let head_sha = crate::git_io::rev_parse_head(repo)?
+        .ok_or_else(|| anyhow::anyhow!("git rev-parse HEAD failed"))?
+        .as_str()
+        .to_string();
 
     let strip_paths: Vec<String> = match plan_key {
         Some(k) => {
@@ -301,12 +296,9 @@ pub(crate) fn render_amend_dry(program: &AmendProgram) -> String {
 }
 
 pub(crate) fn execute_amend(repo: &std::path::Path, program: &AmendProgram) -> anyhow::Result<()> {
-    let current_head = std::process::Command::new("git")
-        .arg("-C")
-        .arg(repo)
-        .args(["rev-parse", "HEAD"])
-        .output()?;
-    let current = String::from_utf8(current_head.stdout)?.trim().to_string();
+    let current = crate::git_io::rev_parse_head(repo)?
+        .map(|s| s.as_str().to_string())
+        .unwrap_or_default();
     if current != program.head_sha {
         anyhow::bail!(
             "HEAD moved since the amend program was built \
