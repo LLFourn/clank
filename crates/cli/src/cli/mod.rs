@@ -618,6 +618,10 @@ pub enum PrReviewCmd {
 
 #[derive(Args, Debug)]
 pub struct PrReviewSubmitArgs {
+    /// The review outcome to publish (GitHub's canonical events).
+    /// Required — master must state the verdict.
+    #[arg(long, value_enum)]
+    pub event: crate::cli::pr_review::ReviewEvent,
     /// PR number. Defaults to the single active review.
     #[arg(long)]
     pub pr: Option<u32>,

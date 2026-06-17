@@ -200,7 +200,7 @@ pub async fn run(args: PrReviewArgs) -> anyhow::Result<()> {
         }
         PrReviewCmd::Submit(a) => {
             let caller = crate::agent_env::resolve_identity_from_env(&repo)?;
-            submit_with(&repo, home.as_deref(), &caller, a.pr)
+            submit_with(&repo, home.as_deref(), &caller, a.pr, a.event)
         }
         PrReviewCmd::Status(a) => {
             print!("{}", status_with(&repo, home.as_deref(), a.pr)?);
@@ -389,16 +389,46 @@ fn extract_submit_body(master_md: &str) -> anyhow::Result<String> {
     Ok(body.to_string())
 }
 
+/// The outcome master publishes the review with — GitHub's three
+/// canonical review events (NOT clank's `Verdict`, which has
+/// `finished`, a clank concept with no GitHub equivalent). Mandatory
+/// on `clank pr-review submit` so master states the verdict explicitly
+/// (pr-review-submit-outcome).
+#[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReviewEvent {
+    Approve,
+    RequestChanges,
+    Comment,
+}
+
+impl ReviewEvent {
+    /// The GitHub `event` value for the reviews API.
+    pub fn as_github(self) -> &'static str {
+        match self {
+            ReviewEvent::Approve => "APPROVE",
+            ReviewEvent::RequestChanges => "REQUEST_CHANGES",
+            ReviewEvent::Comment => "COMMENT",
+        }
+    }
+
+    /// GitHub requires a non-empty body for REQUEST_CHANGES and
+    /// COMMENT, but allows an empty body for APPROVE.
+    fn body_required(self) -> bool {
+        !matches!(self, ReviewEvent::Approve)
+    }
+}
+
 /// Publish the converged review to the PR. MASTER-ONLY. Gate must
-/// be FINISHED; then freeze the round, re-sweep reviewer replies
-/// (so only master's top-level comments publish), and submit with
-/// master.md's summary body. On success the local scratch is
-/// removed (the published review is the durable record).
+/// be FINISHED; then re-sweep reviewer replies (so only master's
+/// top-level comments publish), and submit with `event` as the
+/// outcome and master.md's summary as the body. On success the local
+/// scratch is removed (the published review is the durable record).
 pub fn submit_with(
     repo: &Path,
     home: Option<&Path>,
     caller: &AgentLabel,
     pr: Option<u32>,
+    event: ReviewEvent,
 ) -> anyhow::Result<()> {
     require_master(repo, home, caller, "submit")?;
     let pr = resolve_pr(repo, pr)?;
@@ -427,9 +457,15 @@ pub fn submit_with(
         );
     }
 
-    let body = extract_submit_body(&std::fs::read_to_string(
-        pr_dir(repo, pr).join("master.md"),
-    )?)?;
+    // Body: required for REQUEST_CHANGES / COMMENT (GitHub rejects an
+    // empty body), optional for APPROVE (don't force a summary just to
+    // approve) — pr-review-submit-outcome.
+    let md = std::fs::read_to_string(pr_dir(repo, pr).join("master.md"))?;
+    let body: Option<String> = if event.body_required() {
+        Some(extract_submit_body(&md)?)
+    } else {
+        extract_submit_body(&md).ok()
+    };
 
     // RE-SWEEP reviewer replies IMMEDIATELY before publishing: this
     // is the guard against a reply landing after the convergence
@@ -442,7 +478,7 @@ pub fn submit_with(
     // `submitting` flag claimed a freeze it couldn't enforce against
     // raw gh, so it was removed rather than left as a false model.)
     let swept = gh::sweep_replies(&state.repo, pr)?;
-    gh::submit_review(&state.repo, pr, &body)?;
+    gh::submit_review(&state.repo, pr, event, body.as_deref())?;
     if swept > 0 {
         eprintln!(
             "swept {swept} reviewer repl{} before publishing",
@@ -489,17 +525,28 @@ pub mod gh {
         ]
     }
 
-    pub(super) fn submit_argv(slug: &str, pr: u32, review_id: u64, body: &str) -> Vec<String> {
-        vec![
+    pub(super) fn submit_argv(
+        slug: &str,
+        pr: u32,
+        review_id: u64,
+        event: super::ReviewEvent,
+        body: Option<&str>,
+    ) -> Vec<String> {
+        let mut argv = vec![
             "api".into(),
             "--method".into(),
             "POST".into(),
             format!("repos/{slug}/pulls/{pr}/reviews/{review_id}/events"),
             "-f".into(),
-            "event=COMMENT".into(),
-            "-f".into(),
-            format!("body={body}"),
-        ]
+            format!("event={}", event.as_github()),
+        ];
+        // Omit `body` entirely for a bodyless APPROVE (GitHub allows
+        // it; an empty `-f body=` is unnecessary).
+        if let Some(body) = body {
+            argv.push("-f".into());
+            argv.push(format!("body={body}"));
+        }
+        argv
     }
 
     pub(super) fn discard_argv(slug: &str, pr: u32, review_id: u64) -> Vec<String> {
@@ -609,12 +656,18 @@ pub mod gh {
         parse_pending_review(&run_gh(&resolve_argv(slug, pr))?)
     }
 
-    /// Submit the pending review with `body` as the summary.
-    /// Errors if there's no pending review to submit.
-    pub fn submit_review(slug: &str, pr: u32, body: &str) -> anyhow::Result<()> {
+    /// Submit the pending review with `event` as the outcome and
+    /// `body` (optional for APPROVE) as the summary. Errors if
+    /// there's no pending review to submit.
+    pub fn submit_review(
+        slug: &str,
+        pr: u32,
+        event: super::ReviewEvent,
+        body: Option<&str>,
+    ) -> anyhow::Result<()> {
         let review = resolve_pending_review(slug, pr)?
             .context("no pending review to submit (has master drafted any comments?)")?;
-        run_gh(&submit_argv(slug, pr, review.id, body)).map(|_| ())
+        run_gh(&submit_argv(slug, pr, review.id, event, body)).map(|_| ())
     }
 
     /// Discard the pending review if one exists; no-op otherwise.
@@ -827,22 +880,72 @@ mod tests {
             gh::resolve_argv("o/r", 7),
             vec!["api", "repos/o/r/pulls/7/reviews", "--paginate", "--slurp"]
         );
+        // request-changes / comment carry the body; the event maps to
+        // GitHub's vocabulary.
         assert_eq!(
-            gh::submit_argv("o/r", 7, 42, "summary body"),
+            gh::submit_argv(
+                "o/r",
+                7,
+                42,
+                ReviewEvent::RequestChanges,
+                Some("summary body")
+            ),
             vec![
                 "api",
                 "--method",
                 "POST",
                 "repos/o/r/pulls/7/reviews/42/events",
                 "-f",
-                "event=COMMENT",
+                "event=REQUEST_CHANGES",
                 "-f",
                 "body=summary body"
+            ]
+        );
+        // A bodyless APPROVE omits `-f body=` entirely.
+        assert_eq!(
+            gh::submit_argv("o/r", 7, 42, ReviewEvent::Approve, None),
+            vec![
+                "api",
+                "--method",
+                "POST",
+                "repos/o/r/pulls/7/reviews/42/events",
+                "-f",
+                "event=APPROVE",
             ]
         );
         assert_eq!(
             gh::discard_argv("o/r", 7, 42),
             vec!["api", "--method", "DELETE", "repos/o/r/pulls/7/reviews/42"]
+        );
+    }
+
+    #[test]
+    fn review_event_github_mapping_and_body_rule() {
+        assert_eq!(ReviewEvent::Approve.as_github(), "APPROVE");
+        assert_eq!(ReviewEvent::RequestChanges.as_github(), "REQUEST_CHANGES");
+        assert_eq!(ReviewEvent::Comment.as_github(), "COMMENT");
+        // Only APPROVE may publish without a body.
+        assert!(!ReviewEvent::Approve.body_required());
+        assert!(ReviewEvent::RequestChanges.body_required());
+        assert!(ReviewEvent::Comment.body_required());
+    }
+
+    #[test]
+    fn submit_requires_a_github_event() {
+        use clap::Parser;
+        #[derive(Parser)]
+        struct T {
+            #[command(flatten)]
+            f: crate::cli::PrReviewSubmitArgs,
+        }
+        // --event is mandatory; the values are GitHub's, not clank's.
+        assert!(T::try_parse_from(["t"]).is_err(), "--event required");
+        assert!(T::try_parse_from(["t", "--event", "approve"]).is_ok());
+        assert!(T::try_parse_from(["t", "--event", "request-changes"]).is_ok());
+        assert!(T::try_parse_from(["t", "--event", "comment"]).is_ok());
+        assert!(
+            T::try_parse_from(["t", "--event", "finished"]).is_err(),
+            "clank's `finished` is not a GitHub review event"
         );
     }
 

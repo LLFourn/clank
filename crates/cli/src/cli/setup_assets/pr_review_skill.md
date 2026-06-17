@@ -42,9 +42,12 @@ set) = reviewer. The `🤖` marker is for human attribution only.
   — reviewer: record your authoritative verdict for the current
   round. Author + PR inferred from your binding + the single
   active review.
-- `clank pr-review submit` — MASTER ONLY. Gate must be converged;
-  re-sweeps reviewer replies, then publishes the pending review
-  with `master.md`'s body.
+- `clank pr-review submit --event <approve|request-changes|comment>`
+  — MASTER ONLY. Mandatory `--event` (GitHub's canonical review
+  outcome). Gate must be converged; re-sweeps reviewer replies, then
+  publishes the pending review with that event and `master.md`'s
+  body. `request-changes`/`comment` require a body; `approve` may
+  omit it.
 - `clank pr-review abort` — MASTER ONLY. Discard the pending review
   + local scratch.
 
@@ -123,7 +126,8 @@ cannot combine with `--jq`.
    DELETE the reply, then `clank pr-review propose` again to re-open
    at a fresh round (their stale approvals no longer count).
 4. When `clank pr-review status` shows converged → `clank pr-review
-   submit`.
+   submit --event <approve|request-changes|comment>` (the outcome
+   you're publishing to the PR).
 
 **Reviewer**
 1. On a wake, read master's pending comments + the PR.
