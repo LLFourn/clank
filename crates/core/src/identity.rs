@@ -126,7 +126,7 @@ mod tests {
     }
     fn cfg_with_session(id: &str, tool: Tool) -> AgentConfig {
         AgentConfig {
-            auto_mode: AutoMode::On,
+            auto_mode: Some(AutoMode::On),
             session: Some(Session {
                 id: sid(id),
                 tool,

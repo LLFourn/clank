@@ -21,11 +21,18 @@ use serde::{Deserialize, Serialize};
 
 use clank_core::agent_config::LaunchConfig;
 use clank_core::ids::AgentLabel;
-use clank_core::vocab::{Role, Tool};
+use clank_core::vocab::{AutoMode, Role, Tool};
 
 /// User-scope `~/.clank/config.json`.
 #[derive(Debug, Default, Deserialize, Serialize)]
 pub struct UserConfigFile {
+    /// Machine-wide default auto-mode (`auto-mode-default-on`). A
+    /// fresh agent config inherits this when it has no explicit
+    /// `clank auto on|off`; absent = Off (other machines unaffected
+    /// until they opt in). Resolved via
+    /// `clank_core::agent_config::effective_auto_mode`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto: Option<AutoMode>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub agents: BTreeMap<AgentLabel, AgentDescription>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]

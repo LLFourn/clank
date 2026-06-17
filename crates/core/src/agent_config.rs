@@ -32,8 +32,15 @@ use crate::vocab::{AutoMode, Tool};
 /// from before the cutover) are ignored by serde.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct AgentConfig {
-    #[serde(default)]
-    pub auto_mode: AutoMode,
+    /// `Some` only when this session EXPLICITLY chose via `clank auto
+    /// on|off`; `None` means "unset, inherit the user-global default"
+    /// (`auto-mode-default-on`). The distinction matters: a fresh
+    /// skeleton must be `None` so it can inherit, while an explicit
+    /// `clank auto off` must STICK even under a global default — so
+    /// the field is omitted from a fresh skeleton, never written as a
+    /// silent `off`. Resolve via [`effective_auto_mode`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_mode: Option<AutoMode>,
     /// Wait-for-work timeout as a duration string (`"30m"`,
     /// `"5m"`, `"45s"`). `None` means indefinite. Stringly typed
     /// so users editing JSON see the same form
@@ -47,6 +54,20 @@ pub struct AgentConfig {
     /// `CLAUDE_CODE_SESSION_ID` / `CODEX_THREAD_ID` env var.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session: Option<Session>,
+}
+
+/// Resolve a session's effective auto-mode from the per-agent
+/// setting and the user-global default (`auto-mode-default-on`).
+/// An explicit per-agent choice wins (so `clank auto off` sticks);
+/// otherwise the user-global default applies; otherwise `Off`. This
+/// is THE single resolver — every consumer (stop hook, agent start,
+/// `clank auto status`) routes through it so the surfaces can't
+/// disagree.
+pub fn effective_auto_mode(
+    per_agent: Option<AutoMode>,
+    user_default: Option<AutoMode>,
+) -> AutoMode {
+    per_agent.or(user_default).unwrap_or(AutoMode::Off)
 }
 
 /// General-purpose launch profile: executable + args + env.
@@ -120,7 +141,7 @@ mod tests {
         let json = serde_json::to_string(&cfg).unwrap();
         let back: AgentConfig = serde_json::from_str(&json).unwrap();
         assert_eq!(cfg, back);
-        assert_eq!(back.auto_mode, AutoMode::Off);
+        assert_eq!(back.auto_mode, None, "fresh skeleton is unset, not Off");
         assert!(back.wfw_timeout.is_none());
         assert!(back.session.is_none());
     }
@@ -128,7 +149,7 @@ mod tests {
     #[test]
     fn agent_config_round_trips_populated() {
         let cfg = AgentConfig {
-            auto_mode: AutoMode::On,
+            auto_mode: Some(AutoMode::On),
             wfw_timeout: Some("30m".into()),
             session: Some(Session {
                 id: session_id("742f6a04-f174-409a-ab01-419a16c5f372"),
@@ -154,7 +175,7 @@ mod tests {
             "initial_prompt": "hi"
         }"#;
         let cfg: AgentConfig = serde_json::from_str(json).unwrap();
-        assert_eq!(cfg.auto_mode, AutoMode::Off);
+        assert_eq!(cfg.auto_mode, Some(AutoMode::Off), "explicit off survives");
         assert!(cfg.session.is_none());
         // Reserialization drops the unknown keys entirely.
         let back = serde_json::to_string(&cfg).unwrap();
@@ -178,7 +199,7 @@ mod tests {
     fn agent_config_accepts_missing_optional_fields() {
         let json = r#"{ "auto_mode": "wait" }"#;
         let cfg: AgentConfig = serde_json::from_str(json).unwrap();
-        assert_eq!(cfg.auto_mode, AutoMode::On);
+        assert_eq!(cfg.auto_mode, Some(AutoMode::On));
         assert!(cfg.wfw_timeout.is_none());
         assert!(cfg.session.is_none());
     }
@@ -186,7 +207,7 @@ mod tests {
     #[test]
     fn agent_config_omits_none_session() {
         let cfg = AgentConfig {
-            auto_mode: AutoMode::On,
+            auto_mode: Some(AutoMode::On),
             ..Default::default()
         };
         let json = serde_json::to_string(&cfg).unwrap();
@@ -195,5 +216,19 @@ mod tests {
             !json.contains("wfw_timeout"),
             "expected no wfw_timeout key: {json}"
         );
+    }
+
+    #[test]
+    fn effective_auto_mode_layers_explicit_over_default() {
+        use AutoMode::{Off, On};
+        // Explicit per-agent wins (so `clank auto off` sticks even
+        // under a global default-on).
+        assert_eq!(effective_auto_mode(Some(Off), Some(On)), Off);
+        assert_eq!(effective_auto_mode(Some(On), Some(Off)), On);
+        // Unset per-agent inherits the user-global default.
+        assert_eq!(effective_auto_mode(None, Some(On)), On);
+        assert_eq!(effective_auto_mode(None, Some(Off)), Off);
+        // Nothing set anywhere → Off (today's behavior).
+        assert_eq!(effective_auto_mode(None, None), Off);
     }
 }

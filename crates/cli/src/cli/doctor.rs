@@ -253,7 +253,7 @@ pub fn repo_checks(repo: &Path, home: Option<&Path>) -> Vec<CheckResult> {
         let base_msg = format!(
             "{}: auto_mode={}, session={}",
             agent_config_path(repo, label).display(),
-            cfg.auto_mode.as_str(),
+            cfg.auto_mode.map(|m| m.as_str()).unwrap_or("unset"),
             session_desc,
         );
         let agent_check = if cfg.session.is_none() {

@@ -42,7 +42,7 @@ fn commit(repo: &Path, msg: &str) {
 fn bind_session(env: &TestEnv, label: &str, tool: clank_core::vocab::Tool, id: &str) {
     let l = clank_core::ids::AgentLabel::parse(label).unwrap();
     let cfg = clank_core::agent_config::AgentConfig {
-        auto_mode: clank_core::vocab::AutoMode::Off,
+        auto_mode: None,
         wfw_timeout: None,
         session: Some(clank_core::agent_config::Session {
             id: clank_core::ids::SessionId::parse(id).unwrap(),

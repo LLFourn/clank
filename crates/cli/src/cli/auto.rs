@@ -31,17 +31,13 @@ async fn run_on(args: AutoOnArgs) -> anyhow::Result<()> {
     let label = resolve_identity_from_env(&repo)?;
 
     let mut cfg = load_agent_config(&repo, &label)?.unwrap_or_default();
-    cfg.auto_mode = AutoMode::On;
+    cfg.auto_mode = Some(AutoMode::On);
     if let Some(t) = args.wfw_timeout.as_deref() {
         cfg.wfw_timeout = Some(t.to_string());
     }
     save_agent_config(&repo, &label, &cfg)?;
 
-    println!(
-        "auto-mode for `{}` set to {}",
-        label.as_str(),
-        cfg.auto_mode.as_str()
-    );
+    println!("auto-mode for `{}` set to on", label.as_str());
     if args.role.is_some() {
         // Plan: teams-based-agent-registration — role is now a
         // per-team property, not per-agent state. `--role` no
@@ -60,7 +56,7 @@ async fn run_off(args: AutoOffArgs) -> anyhow::Result<()> {
     let label = resolve_identity_from_env(&repo)?;
 
     let mut cfg = load_agent_config(&repo, &label)?.unwrap_or_default();
-    cfg.auto_mode = AutoMode::Off;
+    cfg.auto_mode = Some(AutoMode::Off);
     save_agent_config(&repo, &label, &cfg)?;
 
     println!("auto-mode for `{}` set to off", label.as_str());
@@ -77,6 +73,11 @@ async fn run_status(args: AutoStatusArgs) -> anyhow::Result<()> {
     let label = resolve_identity_from_env(&repo)?;
 
     let cfg = load_agent_config(&repo, &label)?.unwrap_or_default();
+    // Report the EFFECTIVE auto-mode (explicit per-agent, else the
+    // ~/.clank default, else off) — the same value the stop hook
+    // acts on (auto-mode-default-on).
+    let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+    let effective = crate::cli::team::resolve_effective_auto_mode(Some(&cfg), home.as_deref());
     // Role is team-derived; best-effort (a repo with no team set
     // has no resolvable role — show `unknown` rather than error).
     let role = crate::agent_store::resolve_role(&repo, &label)
@@ -86,14 +87,15 @@ async fn run_status(args: AutoStatusArgs) -> anyhow::Result<()> {
     if args.json {
         let payload = serde_json::json!({
             "label": label.as_str(),
-            "auto_mode": cfg.auto_mode.as_str(),
+            "auto_mode": effective.as_str(),
+            "auto_mode_explicit": cfg.auto_mode.map(|m| m.as_str()),
             "wfw_timeout": cfg.wfw_timeout,
             "role": role,
         });
         println!("{}", serde_json::to_string(&payload)?);
     } else {
         println!("agent: {}", label.as_str());
-        println!("  auto_mode:   {}", cfg.auto_mode.as_str());
+        println!("  auto_mode:   {}", effective.as_str());
         println!(
             "  wfw_timeout: {}",
             cfg.wfw_timeout.as_deref().unwrap_or("(indefinite)")

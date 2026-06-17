@@ -215,7 +215,9 @@ fn start(args: AgentStartArgs) -> anyhow::Result<()> {
             None => compose_bootstrap_launch(&label, &desc)?,
         },
         Some(session) => {
-            let auto_mode = cfg.as_ref().map(|c| c.auto_mode).unwrap_or_default();
+            let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+            let auto_mode =
+                crate::cli::team::resolve_effective_auto_mode(cfg.as_ref(), home.as_deref());
             let resolved_prompt = resolve_initial_prompt(desc.initial_prompt.as_deref(), auto_mode);
             compose_launch(
                 &repo,

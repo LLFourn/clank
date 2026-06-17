@@ -55,6 +55,24 @@ pub fn read_user_config(home: &Path) -> anyhow::Result<UserConfigFile> {
     }
 }
 
+/// Resolve a label's EFFECTIVE auto-mode (`auto-mode-default-on`):
+/// the explicit per-agent setting if any, else the `~/.clank`
+/// user-global default, else Off. THE single resolution entry
+/// point — the stop hook, agent start, and `clank auto status` all
+/// call this, so both the user-default read and the precedence live
+/// in exactly one place (never re-implemented per consumer). `home`
+/// is explicit (dogfood) so it's unit-testable; `per_agent` is the
+/// caller's already-loaded config (avoids a re-load).
+pub(crate) fn resolve_effective_auto_mode(
+    per_agent: Option<&clank_core::agent_config::AgentConfig>,
+    home: Option<&Path>,
+) -> clank_core::vocab::AutoMode {
+    let user_default = home
+        .and_then(|h| read_user_config(h).ok())
+        .and_then(|c| c.auto);
+    clank_core::agent_config::effective_auto_mode(per_agent.and_then(|c| c.auto_mode), user_default)
+}
+
 fn write_user_config(home: &Path, file: &UserConfigFile) -> anyhow::Result<()> {
     use std::io::Write;
     let path = user_config_path(home);
@@ -374,6 +392,46 @@ mod tests {
             cfg.teams.insert(name.to_string(), (*comp).clone());
         }
         write_user_config(home, &cfg).unwrap();
+    }
+
+    #[test]
+    fn resolve_effective_auto_mode_layers_global_default() {
+        use clank_core::agent_config::AgentConfig;
+        use clank_core::vocab::AutoMode;
+        let home_dir = setup_home();
+        let home = home_dir.path();
+
+        // No user-global default, no per-agent config → Off.
+        assert_eq!(resolve_effective_auto_mode(None, Some(home)), AutoMode::Off);
+
+        // Seed a user-global default-on.
+        let cfg = UserConfigFile {
+            auto: Some(AutoMode::On),
+            ..Default::default()
+        };
+        write_user_config(home, &cfg).unwrap();
+
+        // THE codex regression: a MISSING per-agent config under a
+        // global default-on resolves On — so the stop hook no longer
+        // exits Silent for a fresh/unbound session.
+        assert_eq!(resolve_effective_auto_mode(None, Some(home)), AutoMode::On);
+
+        // An unset per-agent config also inherits the global default.
+        let unset = AgentConfig::default();
+        assert_eq!(
+            resolve_effective_auto_mode(Some(&unset), Some(home)),
+            AutoMode::On
+        );
+
+        // An explicit per-agent OFF wins (sticky off under default-on).
+        let off = AgentConfig {
+            auto_mode: Some(AutoMode::Off),
+            ..Default::default()
+        };
+        assert_eq!(
+            resolve_effective_auto_mode(Some(&off), Some(home)),
+            AutoMode::Off
+        );
     }
 
     #[test]

@@ -53,17 +53,22 @@ async fn compute_outcome(tool: Tool, repo_override: Option<&Path>) -> HookOutcom
         }
     };
 
+    // Config may be ABSENT (bound via `clank as` but auto never
+    // touched) — that's not "off", it's "unset, inherit the
+    // ~/.clank default" (auto-mode-default-on). Resolve the
+    // effective mode through the shared resolver so a fresh session
+    // under a user-global default-on actually drives, instead of
+    // silently exiting (codex b29d8d0).
     let cfg = match load_agent_config(&repo, &label) {
-        Ok(Some(c)) => c,
-        // No config yet (agent was bound via `clank as` but never
-        // ran `clank auto on`) — treat as Off, exit silently.
-        Ok(None) => return HookOutcome::Silent,
+        Ok(c) => c,
         Err(e) => {
             return HookOutcome::Diagnostic {
                 message: format!("{e:#}"),
             };
         }
     };
+    let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+    let effective = crate::cli::team::resolve_effective_auto_mode(cfg.as_ref(), home.as_deref());
 
     // Role is team-derived (`teams-based-agent-registration`).
     // The hook path is fail-soft: if the repo has no team
@@ -74,9 +79,12 @@ async fn compute_outcome(tool: Tool, repo_override: Option<&Path>) -> HookOutcom
     let role = crate::agent_store::resolve_role(&repo, &label)
         .unwrap_or_else(|_| clank_core::vocab::Role::default());
 
-    match cfg.auto_mode {
+    match effective {
         AutoMode::Off => HookOutcome::Silent,
-        AutoMode::On => compute_wait_outcome(&repo, &label, role, cfg.wfw_timeout.as_deref()).await,
+        AutoMode::On => {
+            let wfw_timeout = cfg.as_ref().and_then(|c| c.wfw_timeout.clone());
+            compute_wait_outcome(&repo, &label, role, wfw_timeout.as_deref()).await
+        }
     }
 }
 
