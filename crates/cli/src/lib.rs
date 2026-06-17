@@ -12,6 +12,7 @@ pub mod feedback_scan;
 pub mod fs_plan_state_lookup;
 pub mod fs_watcher;
 pub mod git_io;
+pub mod git_plumbing;
 pub mod hook_config;
 pub mod init_facts;
 pub mod preview;

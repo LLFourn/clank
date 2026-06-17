@@ -9,9 +9,10 @@
 
 use std::path::Path;
 
-use anyhow::Context as _;
 use clank_core::api::{RewriteCommit, RewriteDisposition};
 use clank_core::ids::CommitSha;
+
+use crate::git_plumbing::{self, ExpectedRef};
 
 /// Engine inputs. Unpacked fields so both single-plan and all-plans
 /// preview responses can feed the same engine. `dry == true` makes
@@ -139,34 +140,27 @@ pub async fn run(opts: RewriteOpts<'_>) -> anyhow::Result<RewriteOutcome> {
     };
     let updated_branch = match opts.into_branch {
         Some(name) => {
-            // Atomic "must not already exist": all-zero old value
-            // tells git to refuse if the ref exists. Closes the
-            // race between `branch_exists` and `update-ref`.
-            git_run(
+            // Create-or-fail: refuse if the ref already exists (atomic
+            // — closes the `branch_exists` → create race).
+            git_plumbing::update_ref(
                 opts.repo,
-                &[
-                    "update-ref",
-                    &format!("refs/heads/{name}"),
-                    &new_tip,
-                    "0000000000000000000000000000000000000000",
-                ],
+                &format!("refs/heads/{name}"),
+                &new_tip,
+                ExpectedRef::CreateOnly,
             )?;
             name.to_string()
         }
         None => {
             let current = current_branch(opts.repo)?;
-            // Conditional update: expected old value is the head we
+            // Conditional update: the expected old value is the head we
             // previewed against. If the branch moved between preview
-            // and now, refuse — we'd be silently throwing away
+            // and now, refuse — we'd otherwise silently throw away
             // commits that arrived after preview.
-            git_run(
+            git_plumbing::update_ref(
                 opts.repo,
-                &[
-                    "update-ref",
-                    &format!("refs/heads/{current}"),
-                    &new_tip,
-                    opts.head_sha.as_str(),
-                ],
+                &format!("refs/heads/{current}"),
+                &new_tip,
+                ExpectedRef::Match(opts.head_sha.as_str().to_string()),
             )
             .map_err(|e| {
                 anyhow::anyhow!(
@@ -176,7 +170,9 @@ pub async fn run(opts: RewriteOpts<'_>) -> anyhow::Result<RewriteOutcome> {
                     short(opts.head_sha.as_str()),
                 )
             })?;
-            // Re-sync the worktree to the new tip.
+            // Re-sync the worktree to the new tip. Kept on git: a
+            // worktree-state checkout whose exact semantics
+            // (gitignore/fileMode/autocrlf) must match git's.
             git_run(opts.repo, &["reset", "--hard", "HEAD"])?;
             current
         }
@@ -471,16 +467,16 @@ async fn apply_plan(
                 // Parent chain hops over this commit.
             }
             RewriteDisposition::KeepVerbatim => {
-                let tree = commit_tree_sha(repo, &step.sha)?;
+                let tree = git_plumbing::commit_tree_oid(repo, &step.sha)?;
                 let new_sha =
-                    commit_tree_preserving_meta(repo, &step.sha, &tree, parent.as_deref())?;
+                    git_plumbing::replay_commit(repo, &step.sha, &tree, parent.as_deref())?;
                 parent = Some(new_sha);
                 produced_any = true;
             }
             RewriteDisposition::Rewrite => {
-                let new_tree = build_stripped_tree(repo, &step.sha, &step.strip_paths)?;
+                let new_tree = git_plumbing::strip_tree(repo, &step.sha, &step.strip_paths)?;
                 let new_sha =
-                    commit_tree_preserving_meta(repo, &step.sha, &new_tree, parent.as_deref())?;
+                    git_plumbing::replay_commit(repo, &step.sha, &new_tree, parent.as_deref())?;
                 parent = Some(new_sha);
                 produced_any = true;
             }
@@ -525,155 +521,11 @@ async fn apply_squash(
     // for `update-index --force-remove` — added-then-deleted in the
     // range, already gone.
     let head_str = head_sha.as_str();
-    let new_tree = build_stripped_tree_from_sha(repo, head_str, &strip)?;
-    // Author/timestamp: prefer HEAD's so the squashed commit
-    // doesn't look like a fresh authorship event from now.
-    //
-    // Committer date is ALSO pinned to the author date (not left to
-    // refresh to `now`) so the squash is IDEMPOTENT BY CONSTRUCTION
-    // (`finish-squash-idempotent-on-finished`): re-running
-    // `finish --squash "msg"` over an already-squashed single
-    // commit reproduces the SAME sha — tree, parents, author, AND
-    // committer are all deterministic, so commit-tree yields the
-    // identical object. (A `now` committer date would churn the sha
-    // on every re-run.)
-    let r = gix::open(repo).with_context(|| format!("gix open `{}`", repo.display()))?;
-    let head = r
-        .find_commit(parse_oid(head_str)?)
-        .with_context(|| format!("find HEAD commit `{head_str}`"))?;
-    // Preserve HEAD's author exactly.
-    let author = head.author().context("HEAD author")?.to_owned()?;
-    // Committer = the configured identity, but with its DATE PINNED to
-    // the author date (per the idempotence note above) rather than
-    // `now` — `gix::date::Time` is Copy, so reusing `author.time`
-    // doesn't disturb the move into the commit.
-    let cfg = r
-        .committer()
-        .ok_or_else(|| anyhow::anyhow!("no committer identity (set user.name / user.email)"))?
-        .context("committer time")?;
-    let committer = gix::actor::Signature {
-        name: cfg.name.to_owned(),
-        email: cfg.email.to_owned(),
-        time: author.time,
-    };
-    let parents = intro_parent
-        .map(parse_oid)
-        .transpose()?
-        .into_iter()
-        .collect();
-    let commit = gix::objs::Commit {
-        tree: parse_oid(&new_tree)?,
-        parents,
-        author,
-        committer,
-        encoding: None,
-        message: message.into(),
-        extra_headers: Vec::new(),
-    };
-    Ok(r.write_object(&commit)
-        .context("write squashed commit")?
-        .detach()
-        .to_string())
-}
-
-/// Alias of [`build_stripped_tree`] for the squash path (works from
-/// HEAD's tree). Identical behavior; the distinct name marks the
-/// call site.
-fn build_stripped_tree_from_sha(
-    repo: &Path,
-    sha: &str,
-    strip_paths: &[String],
-) -> anyhow::Result<String> {
-    build_stripped_tree(repo, sha, strip_paths)
-}
-
-/// Build a new tree object from `<sha>`'s tree by removing each path
-/// in `strip_paths`. Edits the commit's tree IN MEMORY via gix
-/// (`edit_tree` + `remove` + `write`) — no scratch index, no
-/// `GIT_INDEX_FILE` dance (which previously ENOTDIR'd in linked
-/// worktrees, rewrite-scratch-dir-worktree). Removing a path absent
-/// from the tree is a no-op, matching `update-index --force-remove`.
-fn build_stripped_tree(repo: &Path, sha: &str, strip_paths: &[String]) -> anyhow::Result<String> {
-    let r = gix::open(repo).with_context(|| format!("gix open `{}`", repo.display()))?;
-    let commit_oid =
-        gix::ObjectId::from_hex(sha.as_bytes()).with_context(|| format!("parse sha `{sha}`"))?;
-    let tree_id = r
-        .find_commit(commit_oid)
-        .with_context(|| format!("find commit `{sha}`"))?
-        .tree_id()
-        .with_context(|| format!("tree of `{sha}`"))?;
-    let mut editor = r
-        .edit_tree(tree_id)
-        .with_context(|| format!("edit tree of `{sha}`"))?;
-    for path in strip_paths {
-        editor
-            .remove(path.as_str())
-            .with_context(|| format!("strip `{path}`"))?;
-    }
-    let new_tree = editor.write().context("write stripped tree")?;
-    Ok(new_tree.detach().to_string())
-}
-
-/// Commit a tree preserving the original commit's author, message,
-/// and timestamps. The committer-side fields refresh — we want the
-/// rewrite to be attributable to the rewriter.
-fn commit_tree_preserving_meta(
-    repo: &Path,
-    original_sha: &str,
-    tree_sha: &str,
-    parent: Option<&str>,
-) -> anyhow::Result<String> {
-    let r = gix::open(repo).with_context(|| format!("gix open `{}`", repo.display()))?;
-    let orig = r
-        .find_commit(parse_oid(original_sha)?)
-        .with_context(|| format!("find commit `{original_sha}`"))?;
-    // Preserve the original AUTHOR exactly (name/email/time). The
-    // COMMITTER is the ambient identity + now — matching the old
-    // `commit-tree` with `GIT_COMMITTER_*` left unset (a rewrite is a
-    // fresh commit event).
-    let author = orig
-        .author()
-        .with_context(|| format!("author of `{original_sha}`"))?
-        .to_owned()?;
-    let message = orig
-        .message_raw()
-        .with_context(|| format!("message of `{original_sha}`"))?
-        .to_owned();
-    let committer = r
-        .committer()
-        .ok_or_else(|| anyhow::anyhow!("no committer identity (set user.name / user.email)"))?
-        .context("committer time")?
-        .to_owned()?;
-    let parents = parent.map(parse_oid).transpose()?.into_iter().collect();
-    let commit = gix::objs::Commit {
-        tree: parse_oid(tree_sha)?,
-        parents,
-        author,
-        committer,
-        encoding: None,
-        message,
-        extra_headers: Vec::new(),
-    };
-    Ok(r.write_object(&commit)
-        .context("write rewritten commit")?
-        .detach()
-        .to_string())
-}
-
-/// Parse a hex sha into a gix `ObjectId`.
-fn parse_oid(sha: &str) -> anyhow::Result<gix::ObjectId> {
-    gix::ObjectId::from_hex(sha.as_bytes()).with_context(|| format!("parse sha `{sha}`"))
-}
-
-/// The SHA of `<sha>`'s tree — replaces `git rev-parse <sha>^{tree}`.
-fn commit_tree_sha(repo: &Path, sha: &str) -> anyhow::Result<String> {
-    let r = gix::open(repo).with_context(|| format!("gix open `{}`", repo.display()))?;
-    Ok(r.find_commit(parse_oid(sha)?)
-        .with_context(|| format!("find commit `{sha}`"))?
-        .tree_id()
-        .with_context(|| format!("tree of `{sha}`"))?
-        .detach()
-        .to_string())
+    let new_tree = git_plumbing::strip_tree(repo, head_str, &strip)?;
+    // `squash_commit` carries the idempotence above: HEAD's author is
+    // preserved and the committer date is pinned to it, so re-squashing
+    // reproduces the same sha (finish-squash-idempotent-on-finished).
+    git_plumbing::squash_commit(repo, head_str, &new_tree, intro_parent, message)
 }
 
 fn working_tree_dirty(repo: &Path) -> anyhow::Result<bool> {
@@ -1564,16 +1416,12 @@ mod tests {
         write(&wt, "wt.txt", "in worktree\n");
         let sha = commit(&wt, "wt commit");
 
-        // Pre-fix both of these ENOTDIR'd at
-        // create_dir_all(<wt>/.git/clank-rewrite).
-        let tree = build_stripped_tree(&wt, &sha, &["strip.txt".to_string()]).unwrap();
+        // Pre-fix this ENOTDIR'd at create_dir_all(<wt>/.git/clank-rewrite).
+        // The gix tree builder edits the tree in memory — no scratch
+        // index — so nothing can ENOTDIR on the worktree's `.git` file.
+        let tree = git_plumbing::strip_tree(&wt, &sha, &["strip.txt".to_string()]).unwrap();
         assert!(tree_has(&wt, &tree, "keep.txt"));
         assert!(!tree_has(&wt, &tree, "strip.txt"), "stripped path removed");
-
-        let squashed = build_stripped_tree_from_sha(&wt, &sha, &["wt.txt".to_string()]).unwrap();
-        assert!(!tree_has(&wt, &squashed, "wt.txt"));
-        // (The gix tree builder edits the tree in memory — no scratch
-        // index, so nothing can ENOTDIR on the worktree's `.git` file.)
     }
 
     #[test]
