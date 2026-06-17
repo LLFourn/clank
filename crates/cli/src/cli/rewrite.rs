@@ -7,8 +7,9 @@
 //! pure side-effect-producing infrastructure (git plumbing,
 //! ref updates, tree builds).
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
+use anyhow::Context as _;
 use clank_core::api::{RewriteCommit, RewriteDisposition};
 use clank_core::ids::CommitSha;
 
@@ -561,99 +562,42 @@ async fn apply_squash(
     Ok(String::from_utf8(output.stdout)?.trim().to_string())
 }
 
-/// Like `build_stripped_tree` but takes a sha that we look up
-/// `^{tree}` for. Used by squash where we work from HEAD's tree
-/// directly.
-/// The scratch dir for a private rewrite index. Resolved via git, NOT
-/// hardcoded as `<repo>/.git/clank-rewrite`: in a linked worktree
-/// `<repo>/.git` is a FILE (`gitdir: …`), so `create_dir_all` under it
-/// ENOTDIR'd (rewrite-scratch-dir-worktree). `--git-path` returns the
-/// real per-worktree gitdir; `--path-format=absolute` so it doesn't
-/// depend on the process cwd.
-fn rewrite_scratch_dir(repo: &Path) -> anyhow::Result<PathBuf> {
-    // `clank-rewrite` is PER-WORKTREE scratch → the per-worktree
-    // gitdir (gix `git_dir`), correct for linked worktrees where
-    // `<repo>/.git` is a file.
-    Ok(crate::git_io::git_dir(repo)?.join("clank-rewrite"))
-}
-
+/// Alias of [`build_stripped_tree`] for the squash path (works from
+/// HEAD's tree). Identical behavior; the distinct name marks the
+/// call site.
 fn build_stripped_tree_from_sha(
     repo: &Path,
     sha: &str,
     strip_paths: &[String],
 ) -> anyhow::Result<String> {
-    let scratch_dir = rewrite_scratch_dir(repo)?;
-    std::fs::create_dir_all(&scratch_dir)?;
-    let unique = format!(
-        "squash-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0),
-    );
-    let index_path = scratch_dir.join(unique);
-    let _ = std::fs::remove_file(&index_path);
-
-    let result = (|| -> anyhow::Result<String> {
-        git_run_with_index(
-            repo,
-            &index_path,
-            &["read-tree", &format!("{sha}^{{tree}}")],
-        )?;
-        for path in strip_paths {
-            git_run_with_index(
-                repo,
-                &index_path,
-                &["update-index", "--remove", "--force-remove", path],
-            )?;
-        }
-        let tree = git_capture_with_index(repo, &index_path, &["write-tree"])?;
-        Ok(tree.trim().to_string())
-    })();
-    let _ = std::fs::remove_file(&index_path);
-    result
+    build_stripped_tree(repo, sha, strip_paths)
 }
 
 /// Build a new tree object from `<sha>`'s tree by removing each path
-/// in `strip_paths`. Uses a scratch git index inside the real gitdir
-/// (see `rewrite_scratch_dir`) so we never disturb the operator's
-/// real index.
+/// in `strip_paths`. Edits the commit's tree IN MEMORY via gix
+/// (`edit_tree` + `remove` + `write`) — no scratch index, no
+/// `GIT_INDEX_FILE` dance (which previously ENOTDIR'd in linked
+/// worktrees, rewrite-scratch-dir-worktree). Removing a path absent
+/// from the tree is a no-op, matching `update-index --force-remove`.
 fn build_stripped_tree(repo: &Path, sha: &str, strip_paths: &[String]) -> anyhow::Result<String> {
-    let scratch_dir = rewrite_scratch_dir(repo)?;
-    std::fs::create_dir_all(&scratch_dir)?;
-    let unique = format!(
-        "rewrite-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0),
-    );
-    let index_path = scratch_dir.join(unique);
-    // Belt-and-braces cleanup: if a previous run died here, an
-    // ancient empty index could confuse `read-tree`.
-    let _ = std::fs::remove_file(&index_path);
-
-    let result = (|| -> anyhow::Result<String> {
-        git_run_with_index(
-            repo,
-            &index_path,
-            &["read-tree", &format!("{sha}^{{tree}}")],
-        )?;
-        for path in strip_paths {
-            git_run_with_index(
-                repo,
-                &index_path,
-                &["update-index", "--remove", "--force-remove", path],
-            )?;
-        }
-        let tree = git_capture_with_index(repo, &index_path, &["write-tree"])?;
-        Ok(tree.trim().to_string())
-    })();
-
-    let _ = std::fs::remove_file(&index_path);
-    result
+    let r = gix::open(repo).with_context(|| format!("gix open `{}`", repo.display()))?;
+    let commit_oid =
+        gix::ObjectId::from_hex(sha.as_bytes()).with_context(|| format!("parse sha `{sha}`"))?;
+    let tree_id = r
+        .find_commit(commit_oid)
+        .with_context(|| format!("find commit `{sha}`"))?
+        .tree_id()
+        .with_context(|| format!("tree of `{sha}`"))?;
+    let mut editor = r
+        .edit_tree(tree_id)
+        .with_context(|| format!("edit tree of `{sha}`"))?;
+    for path in strip_paths {
+        editor
+            .remove(path.as_str())
+            .with_context(|| format!("strip `{path}`"))?;
+    }
+    let new_tree = editor.write().context("write stripped tree")?;
+    Ok(new_tree.detach().to_string())
 }
 
 /// Commit a tree preserving the original commit's author, message,
@@ -765,40 +709,6 @@ fn git_capture(repo: &Path, args: &[&str]) -> anyhow::Result<String> {
     if !output.status.success() {
         anyhow::bail!(
             "git {} failed: {}",
-            args.join(" "),
-            String::from_utf8_lossy(&output.stderr).trim()
-        );
-    }
-    Ok(String::from_utf8(output.stdout)?)
-}
-
-fn git_run_with_index(repo: &Path, index: &Path, args: &[&str]) -> anyhow::Result<()> {
-    let status = std::process::Command::new("git")
-        .arg("-C")
-        .arg(repo)
-        .env("GIT_INDEX_FILE", index)
-        .args(args)
-        .status()?;
-    if !status.success() {
-        anyhow::bail!(
-            "git {} (with private index) failed (exit {})",
-            args.join(" "),
-            status.code().unwrap_or(-1)
-        );
-    }
-    Ok(())
-}
-
-fn git_capture_with_index(repo: &Path, index: &Path, args: &[&str]) -> anyhow::Result<String> {
-    let output = std::process::Command::new("git")
-        .arg("-C")
-        .arg(repo)
-        .env("GIT_INDEX_FILE", index)
-        .args(args)
-        .output()?;
-    if !output.status.success() {
-        anyhow::bail!(
-            "git {} (with private index) failed: {}",
             args.join(" "),
             String::from_utf8_lossy(&output.stderr).trim()
         );
@@ -1597,18 +1507,8 @@ mod tests {
 
         let squashed = build_stripped_tree_from_sha(&wt, &sha, &["wt.txt".to_string()]).unwrap();
         assert!(!tree_has(&wt, &squashed, "wt.txt"));
-
-        // The scratch dir resolved into the real per-worktree gitdir,
-        // not under the worktree's `.git` FILE.
-        let scratch = rewrite_scratch_dir(&wt).unwrap();
-        assert!(
-            scratch.is_absolute(),
-            "absolute scratch dir; got {scratch:?}"
-        );
-        assert!(
-            !scratch.starts_with(wt.join(".git")),
-            "scratch must not be under the worktree `.git` file; got {scratch:?}"
-        );
+        // (The gix tree builder edits the tree in memory — no scratch
+        // index, so nothing can ENOTDIR on the worktree's `.git` file.)
     }
 
     #[test]
