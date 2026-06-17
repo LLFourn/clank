@@ -68,3 +68,17 @@ the arg change until the suppression is confirmed.
 
 - Claude's fork path (it doesn't prompt).
 - Broader codex launch-flag changes beyond the cwd picker.
+
+## Verification (resolved)
+
+The live picker-suppression check can't be observed from the headless
+agent shell (codex is an interactive TUI; no non-interactive query
+exists). The user SIGNED OFF on shipping by strong inference — codex
+`-C/--cd <DIR>` is documented as "use the specified directory as its
+working root", so naming the worktree removes the cwd ambiguity that
+triggers the picker. Real-world confirmation is deferred to the
+user's next `clank fork --pr`; they will report if the picker still
+appears, at which point the fallback (a codex config knob) is
+revisited. Shipping on that basis: the change is low-risk and
+reversible, and it strictly adds an explicit `-C` that codex itself
+documents as the working-root selector.
