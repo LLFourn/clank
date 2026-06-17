@@ -101,3 +101,41 @@ Each of these is shelled for a real reason. The plan must DECIDE
 - Reimplementing hooks/signing or network/credentials in-process.
 - sha256 repositories (gix `sha1` feature only, as today).
 - A cached `Repository` handle (separate perf follow-up).
+
+## Status — what landed (M1–M18)
+
+MIGRATED to gix, behind two cohesive modules:
+- `git_io` (reads, unchanged read-only invariant): `rev_parse_head`,
+  `git_dir`/`common_dir`, `discover_work_dir`, `config_bool`,
+  `commit_subject`/`commit_body`, `show_blob`, `tree_clank_paths`,
+  `current_branch`, `resolve_commit`, `parent_of`, `is_ancestor`,
+  `diff_tree_changes`. `resolve_repo` runs on it.
+- `git_plumbing` (writes — the mutation counterpart): `strip_tree`
+  (in-memory tree edit, killed the `GIT_INDEX_FILE` scratch dance),
+  `replay_commit` + `squash_commit` (gix commit objects, author
+  preserved, squash idempotent), `commit_tree_oid`, `update_ref` +
+  `delete_ref` (atomic ref transactions via a clank-native
+  `ExpectedRef`). `rewrite.rs` and `shelve.rs` have ZERO inline `gix::`
+  — they orchestrate via the typed API.
+
+KEPT on the `git` CLI — load-bearing delegation, NOT debt (each is a
+clean, robust call, not a fragile subprocess-faking-a-read):
+- `git commit` (purge) — runs the user's hooks + signing.
+- `git fetch` (fork) — the user's credentials/transport.
+- `git worktree add` (fork) — worktree CREATION; gix's is immature.
+- `status --porcelain` ×4 (dirty checks), `reset --hard`, `checkout`
+  — worktree-state semantics (gitignore / `fileMode` / `autocrlf` /
+  sparse) that gix would have to reproduce exactly; parity unverified
+  and the calls are clean, so keep.
+- `repo_slug`'s `remote get-url` — resolves `url.insteadOf`.
+- `show --patch` / `--pretty` (diff, html), `log` display in `log.rs`
+  — git's output FORMATTERS (reproducing the exact format is the
+  formatter's job, not ours).
+- `unfinish`'s strict `diff-tree --name-status` finish-check +
+  byte-exact `git show` content compare — precise verifications where
+  git's name-status / raw bytes are the right tool.
+- `queue`'s `git add` — index staging with worktree/gitignore
+  semantics.
+
+The clean-win debt is purged; the remainder is delegation the
+`git commit`/`fetch` decision already established.
