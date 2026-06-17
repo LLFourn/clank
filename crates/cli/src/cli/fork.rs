@@ -149,12 +149,15 @@ pub async fn run_fork_pinned(
     members.extend(set.commit_reviewers.iter().map(|a| a.label.clone()));
     members.extend(set.gate_reviewers.iter().map(|a| a.label.clone()));
 
-    let mut sessions: Vec<(AgentLabel, clank_core::agent_config::Session)> = Vec::new();
+    // Keep each member's FULL source config: the session drives the
+    // fork spec, and auto_mode/wfw_timeout get carbon-copied into the
+    // fork (fork-carbon-copy-agent-config).
+    let mut sessions: Vec<(AgentLabel, clank_core::agent_config::AgentConfig)> = Vec::new();
     let mut missing: Vec<String> = Vec::new();
     for label in &members {
         match crate::agent_store::load_agent_config(&source, label)? {
             Some(cfg) if cfg.session.is_some() => {
-                sessions.push((label.clone(), cfg.session.unwrap()));
+                sessions.push((label.clone(), cfg));
             }
             _ => missing.push(label.as_str().to_string()),
         }
@@ -239,7 +242,11 @@ pub async fn run_fork_pinned(
     }
 
     let purpose = purpose_owned.as_deref().unwrap_or("parallel work");
-    for (label, session) in &sessions {
+    for (label, src_cfg) in &sessions {
+        let session = src_cfg
+            .session
+            .as_ref()
+            .expect("session present (filtered above)");
         let spec = ForkSpec {
             tool: session.tool,
             from_session: session.id.as_str().to_string(),
@@ -255,6 +262,24 @@ pub async fn run_fork_pinned(
         std::fs::create_dir_all(path.parent().expect("has parent"))?;
         std::fs::write(&path, serde_json::to_string_pretty(&spec)?)
             .with_context(|| format!("writing `{}`", path.display()))?;
+
+        // Carbon-copy the source's per-agent SETTINGS into the fork —
+        // NOT the session (the fork mints its own via the spec +
+        // `clank as`). auto_mode is Option, so copying None keeps the
+        // fork inheriting the ~/.clank default and copying Some
+        // carries the source's explicit override
+        // (fork-carbon-copy-agent-config). `clank as` later MERGES the
+        // new session into this config, preserving these fields.
+        if src_cfg.auto_mode.is_some() || src_cfg.wfw_timeout.is_some() {
+            let carried = clank_core::agent_config::AgentConfig {
+                auto_mode: src_cfg.auto_mode,
+                wfw_timeout: src_cfg.wfw_timeout.clone(),
+                session: None,
+            };
+            crate::agent_store::save_agent_config(&dest, label, &carried).with_context(|| {
+                format!("carbon-copying `{}` config to the fork", label.as_str())
+            })?;
+        }
     }
 
     eprintln!(

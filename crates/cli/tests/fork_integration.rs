@@ -175,6 +175,69 @@ fn fork_creates_worktree_and_seeds_team() {
 }
 
 #[test]
+fn fork_carbon_copies_per_agent_settings_not_session() {
+    use clank_core::vocab::AutoMode;
+    let env = source_with_bound_team();
+    let repo = env.repo();
+    let claude = clank_core::ids::AgentLabel::parse("claude").unwrap();
+
+    // Source claude: explicit auto OFF + a wfw_timeout (on top of its
+    // bound session).
+    let mut src = clank::agent_store::load_agent_config(repo, &claude)
+        .unwrap()
+        .unwrap();
+    src.auto_mode = Some(AutoMode::Off);
+    src.wfw_timeout = Some("5m".into());
+    clank::agent_store::save_agent_config(repo, &claude, &src).unwrap();
+
+    let dest = block_on(clank::cli::fork::run_fork(
+        &fork_args(&env, "wt"),
+        Some(env.home()),
+    ))
+    .unwrap();
+
+    // Settings carbon-copied; session NOT (the fork mints its own).
+    let dst = clank::agent_store::load_agent_config(&dest, &claude)
+        .unwrap()
+        .unwrap();
+    assert_eq!(dst.auto_mode, Some(AutoMode::Off), "explicit auto carried");
+    assert_eq!(dst.wfw_timeout.as_deref(), Some("5m"), "timeout carried");
+    assert!(dst.session.is_none(), "session is NOT copied");
+
+    // codex (source auto unset, no timeout) → nothing to carry, so no
+    // dest config is written; the fork inherits the global default.
+    let codex = clank_core::ids::AgentLabel::parse("codex").unwrap();
+    assert!(
+        clank::agent_store::load_agent_config(&dest, &codex)
+            .unwrap()
+            .is_none(),
+        "unset source carries nothing (inherits global default)"
+    );
+
+    // `clank as` binding a NEW session MERGES — the carbon-copied
+    // settings survive.
+    let new_sid =
+        clank_core::ids::SessionId::parse("33333333-3333-3333-3333-333333333333").unwrap();
+    clank::agent_store::bind_session_to_agent(
+        &dest,
+        &claude,
+        clank_core::vocab::Tool::Claude,
+        &new_sid,
+    )
+    .unwrap();
+    let after = clank::agent_store::load_agent_config(&dest, &claude)
+        .unwrap()
+        .unwrap();
+    assert_eq!(after.auto_mode, Some(AutoMode::Off), "auto survives bind");
+    assert_eq!(
+        after.wfw_timeout.as_deref(),
+        Some("5m"),
+        "timeout survives bind"
+    );
+    assert_eq!(after.session.unwrap().id, new_sid, "new session bound");
+}
+
+#[test]
 fn fork_refuses_when_sessions_missing() {
     let env = TestEnv::init();
     env.register_team("claude", &["codex"], &[]);
