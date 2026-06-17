@@ -426,45 +426,78 @@ fn pr_bar_text(pr: &clank_core::wait::PrReviewWorkState, master: &str) -> (Strin
     (format!("{emoji} {} {verb}", actor.to_uppercase()), right)
 }
 
-/// The frame's one hue: red = a human must act (blocked), yellow
-/// = reviewers, green = master working, cyan = promote, dim idle.
-fn state_color(snap: &StatusSnapshot) -> &'static str {
+/// Coarse, human-facing attention state for a worktree — the basis
+/// for a zellij tab indicator (spike-zellij-tab-attention):
+/// - `Blocked`: a human must act (an unanswered block, or a plan
+///   parked on one).
+/// - `Idle`: nothing in flight (no active plans, PR reviews, or
+///   queued work) — the "asleep" state.
+/// - `Active`: anything else (work progressing).
+///
+/// `state_color` derives its red (blocked) and dim (idle) hues from
+/// this, so the bar lamp and any tab indicator can never disagree on
+/// what "blocked" or "idle" means.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AttentionState {
+    Active,
+    Idle,
+    Blocked,
+}
+
+pub(crate) fn attention_state(snap: &StatusSnapshot) -> AttentionState {
     let blocked = snap
         .plans
         .iter()
         .any(|v| matches!(v.waiting_on, WaitingOn::Blocked { .. }))
         || snap.blocks.iter().any(|b| b.answer.is_none());
     if blocked {
-        return "31"; // red
+        return AttentionState::Blocked;
     }
-    match snap.plans.as_slice() {
-        // PR review (no plans): yellow when reviewers owe a verdict,
-        // green when it's master's turn — never dim idle.
-        [] if !snap.pr_reviews.is_empty() => {
-            if snap
-                .pr_reviews
-                .iter()
-                .any(|p| !p.missing_reviewers.is_empty())
-            {
-                "33" // yellow: reviewers
-            } else {
-                "32" // green: master
+    let nothing_in_flight =
+        snap.plans.is_empty() && snap.pr_reviews.is_empty() && snap.queue.is_empty();
+    if nothing_in_flight {
+        AttentionState::Idle
+    } else {
+        AttentionState::Active
+    }
+}
+
+/// The frame's one hue: red = a human must act (blocked), yellow
+/// = reviewers, green = master working, cyan = promote, dim idle.
+fn state_color(snap: &StatusSnapshot) -> &'static str {
+    match attention_state(snap) {
+        AttentionState::Blocked => "31", // red
+        AttentionState::Idle => "2",     // dim
+        // Finer hues within "active":
+        AttentionState::Active => match snap.plans.as_slice() {
+            // PR review (no plans): yellow when reviewers owe a
+            // verdict, green when it's master's turn.
+            [] if !snap.pr_reviews.is_empty() => {
+                if snap
+                    .pr_reviews
+                    .iter()
+                    .any(|p| !p.missing_reviewers.is_empty())
+                {
+                    "33" // yellow: reviewers
+                } else {
+                    "32" // green: master
+                }
             }
-        }
-        [] if !snap.queue.is_empty() => "36", // cyan: promote
-        [] => "2",                            // dim: idle
-        plans => {
-            let any_master = plans.iter().any(|v| {
-                matches!(
-                    v.waiting_on,
-                    WaitingOn::MasterToRevise { .. }
-                        | WaitingOn::MasterToContinue
-                        | WaitingOn::MasterToCommit
-                        | WaitingOn::MasterToFinalize
-                )
-            });
-            if any_master { "32" } else { "33" } // green / yellow
-        }
+            [] if !snap.queue.is_empty() => "36", // cyan: promote
+            [] => "2",                            // unreachable (Idle covers it)
+            plans => {
+                let any_master = plans.iter().any(|v| {
+                    matches!(
+                        v.waiting_on,
+                        WaitingOn::MasterToRevise { .. }
+                            | WaitingOn::MasterToContinue
+                            | WaitingOn::MasterToCommit
+                            | WaitingOn::MasterToFinalize
+                    )
+                });
+                if any_master { "32" } else { "33" } // green / yellow
+            }
+        },
     }
 }
 
@@ -869,6 +902,50 @@ pub(crate) mod tests {
         // And the text surface agrees.
         let human = s.to_human();
         assert!(human.contains("master drafting"), "to_human: {human}");
+    }
+
+    #[test]
+    fn attention_state_classifies_blocked_idle_active() {
+        // Idle: nothing in flight.
+        assert_eq!(attention_state(&snap(vec![], vec![])), AttentionState::Idle);
+
+        // Active: an in-flight plan, OR queued work, OR a PR review.
+        assert_eq!(
+            attention_state(&snap(
+                vec![plan_state("foo", reviewer_missing("codex"))],
+                vec![]
+            )),
+            AttentionState::Active
+        );
+        assert_eq!(
+            attention_state(&snap(vec![], vec!["queued"])),
+            AttentionState::Active,
+            "queued work is not idle — master owes a promote"
+        );
+        let mut s = snap(vec![], vec![]);
+        s.pr_reviews.push(clank_core::wait::PrReviewWorkState {
+            pr: 1,
+            repo: "o/r".into(),
+            round: 1,
+            gate: clank_core::vocab::CommitGateState::Unreviewed,
+            missing_reviewers: vec![AgentLabel::parse("codex").unwrap()],
+        });
+        assert_eq!(attention_state(&s), AttentionState::Active);
+
+        // Blocked: an unanswered block dominates even with no plans.
+        let mut s = snap(vec![], vec!["queued"]);
+        s.blocks = vec![crate::cli::block::BlockEntry {
+            agent: "claude".into(),
+            name: "q".into(),
+            plan: None,
+            question: "halt?".into(),
+            answer: None,
+        }];
+        assert_eq!(
+            attention_state(&s),
+            AttentionState::Blocked,
+            "an unanswered block outranks active work"
+        );
     }
 
     #[test]

@@ -90,3 +90,60 @@ teardown cost before deciding.
   Windows.
 - Pane-level (vs tab-level) indicators.
 - Any rich/colored indicator needing a custom zellij WASM plugin.
+
+## Findings
+
+**Classifier — DONE.** `attention_state(&StatusSnapshot) ->
+Active | Idle | Blocked` is implemented in `status_tui.rs` and unit
+tested (`attention_state_classifies_blocked_idle_active`). It is the
+single source of truth: `state_color` was refactored to derive its
+red (Blocked) and dim (Idle) hues from it, so the bar lamp and any
+future tab indicator can't disagree. Boundary chosen: queued-but-
+unpromoted work counts as **Active** (master owes a promote), not
+Idle — flagged as a product call the follow-up can revisit.
+
+**Mechanism — confirmed by API (zellij 0.44.3), not yet live.**
+`zellij action rename-tab-by-id <ID> <NAME>` renames a specific,
+non-focused tab; id from `current-tab-info` / `list-tabs`; clear via
+rename-back or `undo-rename-tab`. No first-class attention flag
+exists, so the rename is the path.
+
+**BLOCKER on the manual half — no TTY in the agent loop.** Creating
+a zellij session needs a controlling terminal; the headless tool
+shell has none, so I cannot run the round-trip / teardown / glyph-
+rendering checks myself. These need a hands-on terminal run (lloyd),
+recipe below.
+
+### Recommendation: Approach A (fold into the `status --tui` pane)
+
+A wins on the one risk that matters — teardown. The built-in layout
+already runs one `clank status --tui` process per clank tab; it is
+inside zellij, already event-driven on the same snapshot, and dies
+with the tab. So the watcher LIFECYCLE is solved for free (no
+forked daemon to orphan — the exact failure mode behind the leaked-
+zellij-server incident). The follow-up plan should: in the TUI loop,
+track the last `attention_state`; on a transition, best-effort shell
+`current-tab-info` + `rename-tab-by-id` (`💤` Idle, `❌` Blocked,
+bare name on Active), gated on `$ZELLIJ`. Limitation: only covers
+layouts that include the status pane (built-in does); user templates
+without it get no indicator — acceptable, documented.
+
+Approach B (forked daemon from `clank open zellij`) is only worth it
+if we need indicators for arbitrary templates, and it re-opens the
+orphan-on-teardown problem. Recommend NOT doing B unless A's
+coverage proves insufficient.
+
+### Verification recipe for lloyd (run inside a real zellij tab)
+
+1. `zellij action current-tab-info` → confirm it prints a stable id.
+2. `zellij action rename-tab-by-id <id> "💤 test"` → tab bar shows
+   `💤 test`; `zellij action rename-tab-by-id <id> "test"` restores.
+   (Answers Q1 + Q5 glyph rendering.)
+3. With `clank status --tui` running in a pane, do the rename while
+   watching it → confirm no redraw/focus glitch (Q2).
+4. Teardown: close the tab, then `ps` / `zellij list-sessions` →
+   confirm no orphan watcher/server (Q3). For A this should be
+   automatic (process dies with the pane).
+
+If steps 1–2 work, A is green and the follow-up implementation plan
+can proceed.
