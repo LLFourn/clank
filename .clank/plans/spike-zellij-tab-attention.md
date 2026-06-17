@@ -147,3 +147,23 @@ coverage proves insufficient.
 
 If steps 1–2 work, A is green and the follow-up implementation plan
 can proceed.
+
+### Live verification — CONFIRMED
+
+The "needs a TTY" caveat was WRONG: it only applies to *spawning* a
+new session, not running `zellij action` inside the one clank already
+runs in. The agent loop is itself inside `clank-clank` (`ZELLIJ=0`),
+so the round-trip was run live:
+
+- `zellij action current-tab-info` → `name: clank, id: 0` — gives a
+  stable id `rename-tab-by-id` accepts (Q1 ✓).
+- `zellij action rename-tab-by-id 0 "💤 spike-test"` →
+  `query-tab-names` returned `💤 spike-test`: the rename took and the
+  emoji round-tripped through the name (Q5 string-level ✓; lloyd
+  confirmed the glyph rendered in the tab bar — "saw it flash").
+- `zellij action rename-tab-by-id 0 "clank"` → restored cleanly.
+
+So the mechanism is proven end-to-end. Q2 (TUI redraw perturbation)
+and Q3 (teardown/orphans) are moot under Approach A by construction —
+the rename is cosmetic (no pane touched) and A adds no process to
+orphan. Spike question fully answered; Approach A is green.
