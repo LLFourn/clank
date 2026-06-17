@@ -580,21 +580,10 @@ async fn apply_squash(
 /// real per-worktree gitdir; `--path-format=absolute` so it doesn't
 /// depend on the process cwd.
 fn rewrite_scratch_dir(repo: &Path) -> anyhow::Result<PathBuf> {
-    let raw = git_capture(
-        repo,
-        &[
-            "rev-parse",
-            "--path-format=absolute",
-            "--git-path",
-            "clank-rewrite",
-        ],
-    )?;
-    let dir = PathBuf::from(raw.trim());
-    Ok(if dir.is_absolute() {
-        dir
-    } else {
-        repo.join(dir)
-    })
+    // `clank-rewrite` is PER-WORKTREE scratch → the per-worktree
+    // gitdir (gix `git_dir`), correct for linked worktrees where
+    // `<repo>/.git` is a file.
+    Ok(crate::git_io::git_dir(repo)?.join("clank-rewrite"))
 }
 
 fn build_stripped_tree_from_sha(

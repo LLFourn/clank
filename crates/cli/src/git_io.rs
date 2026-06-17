@@ -47,6 +47,44 @@ pub fn rev_parse_head(repo: &Path) -> Result<Option<CommitSha>, GitIoError> {
     }
 }
 
+/// Make a gix-returned path absolute. gix yields paths as it
+/// discovered them (usually absolute when opened with an absolute
+/// repo path); a relative one is resolved against `repo`.
+fn absolutize(repo: &Path, p: &Path) -> PathBuf {
+    if p.is_absolute() {
+        p.to_path_buf()
+    } else {
+        repo.join(p)
+    }
+}
+
+/// The PER-WORKTREE git directory — `<repo>/.git` for a main
+/// checkout, `<common>/worktrees/<id>` for a linked worktree. Use for
+/// paths that are per-worktree (HEAD, index, our `clank-rewrite`
+/// scratch). NOT for shared paths like `hooks/` — those live in the
+/// common dir; use [`common_dir`]. Replaces hardcoded `<repo>/.git`
+/// and `git rev-parse --git-path …` for per-worktree paths.
+pub fn git_dir(repo: &Path) -> Result<PathBuf, GitIoError> {
+    let r = gix::open(repo).map_err(|e| GitIoError::NonZero {
+        context: "open".into(),
+        code: None,
+        stderr: format!("open: {e}"),
+    })?;
+    Ok(absolutize(repo, r.git_dir()))
+}
+
+/// The SHARED (common) git directory — `<main>/.git`, identical
+/// across all linked worktrees. Use for shared paths: `hooks/`,
+/// `config`, `info/`. Replaces `git rev-parse --git-path hooks/…`.
+pub fn common_dir(repo: &Path) -> Result<PathBuf, GitIoError> {
+    let r = gix::open(repo).map_err(|e| GitIoError::NonZero {
+        context: "open".into(),
+        code: None,
+        stderr: format!("open: {e}"),
+    })?;
+    Ok(absolutize(repo, r.common_dir()))
+}
+
 /// Return the blob content at `rel_path` in the tree of `rev`.
 /// Preserves trailing whitespace (newlines matter for hashing).
 ///
@@ -1163,6 +1201,65 @@ mod tests {
                 "roots_equal={roots_equal} parent={parent:?} child={child:?}"
             );
         }
+    }
+
+    #[test]
+    fn git_dir_is_per_worktree_common_dir_is_shared() {
+        use std::process::Command;
+        fn git(dir: &Path, args: &[&str]) {
+            let ok = Command::new("git")
+                .arg("-C")
+                .arg(dir)
+                .args(args)
+                .status()
+                .unwrap()
+                .success();
+            assert!(ok, "git {args:?}");
+        }
+        let main = tempfile::tempdir().unwrap();
+        let m = main.path();
+        git(m, &["init", "--quiet", "--initial-branch=main"]);
+        git(m, &["config", "user.email", "t@t"]);
+        git(m, &["config", "user.name", "t"]);
+        std::fs::write(m.join("f.txt"), "x").unwrap();
+        git(m, &["add", "-A"]);
+        git(m, &["commit", "--quiet", "-m", "base"]);
+
+        let wt_root = tempfile::tempdir().unwrap();
+        let wt = wt_root.path().join("wt");
+        git(
+            m,
+            &[
+                "worktree",
+                "add",
+                "--quiet",
+                wt.to_str().unwrap(),
+                "-b",
+                "feat",
+            ],
+        );
+        assert!(
+            wt.join(".git").is_file(),
+            "linked worktree `.git` is a file"
+        );
+
+        // common_dir is SHARED — identical from the main checkout and
+        // the linked worktree.
+        let common_m = common_dir(m).unwrap().canonicalize().unwrap();
+        let common_wt = common_dir(&wt).unwrap().canonicalize().unwrap();
+        assert_eq!(common_m, common_wt, "common dir is shared");
+
+        // git_dir is PER-WORKTREE — differs, and the worktree's lives
+        // under the common dir's `worktrees/`. (This is why hooks must
+        // use common_dir but `clank-rewrite` uses git_dir.)
+        let gd_m = git_dir(m).unwrap().canonicalize().unwrap();
+        let gd_wt = git_dir(&wt).unwrap().canonicalize().unwrap();
+        assert_ne!(gd_m, gd_wt, "per-worktree gitdir differs");
+        assert!(
+            gd_wt.starts_with(common_wt.join("worktrees")),
+            "worktree gitdir under common/worktrees; got {gd_wt:?}"
+        );
+        assert!(git_dir(&wt).unwrap().is_absolute());
     }
 
     mod walker_equivalence {

@@ -73,27 +73,17 @@ pub fn claude_perms_path(repo: &Path) -> PathBuf {
     repo.join(".claude").join("settings.local.json")
 }
 
-/// Resolve the real `post-rewrite` hook path via
-/// `git rev-parse --git-path`. Returns `None` if git can't
-/// resolve it (not a git repo). Honors `.git`-as-file linked
-/// worktrees: the path lands in the main repo's shared
-/// `hooks/` dir.
+/// Resolve the real `post-rewrite` hook path in the SHARED
+/// (common) git dir. `None` if it can't be resolved (not a git
+/// repo). Honors `.git`-as-file linked worktrees: hooks live in
+/// the main repo's shared `hooks/`, so this uses the common dir.
 pub fn post_rewrite_hook_path(repo: &Path) -> Option<PathBuf> {
-    let out = std::process::Command::new("git")
-        .arg("-C")
-        .arg(repo)
-        .args(["rev-parse", "--git-path", "hooks/post-rewrite"])
-        .output()
-        .ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    let raw = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    if raw.is_empty() {
-        return None;
-    }
-    let p = PathBuf::from(&raw);
-    Some(if p.is_absolute() { p } else { repo.join(p) })
+    // `hooks/` is SHARED across linked worktrees → the common dir.
+    Some(
+        crate::git_io::common_dir(repo)
+            .ok()?
+            .join("hooks/post-rewrite"),
+    )
 }
 
 /// Classification of `.clank/.gitignore`'s current state.

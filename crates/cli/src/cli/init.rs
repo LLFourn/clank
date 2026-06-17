@@ -104,7 +104,7 @@ fn repo_has_team(repo: &Path) -> anyhow::Result<bool> {
 
 /// Install the `post-rewrite` git hook so feedback files
 /// follow commits through rebases/amends. Resolves the real
-/// hook path via `git rev-parse --git-path` so this works in
+/// hook path via the shared (common) gitdir so this works in
 /// linked worktrees too (where `.git` is a file pointing at
 /// the worktree's gitdir; hooks live in the main repo's
 /// shared `.git/hooks/`). If a foreign hook exists, print a
@@ -148,27 +148,16 @@ fn write_post_rewrite_hook(repo: &Path, force: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Resolve `<git-common-dir>/hooks/<name>` via
-/// `git rev-parse --git-path hooks/<name>`. The output is
-/// relative to the repo's working directory; we join to absolute
-/// for clarity.
+/// Resolve `<git-common-dir>/hooks/<name>` via gix's common dir —
+/// shared across linked worktrees, so the hook lands in the main
+/// repo's `hooks/`.
 fn resolve_hook_path(repo: &Path, name: &str) -> Option<std::path::PathBuf> {
-    let arg = format!("hooks/{name}");
-    let out = std::process::Command::new("git")
-        .arg("-C")
-        .arg(repo)
-        .args(["rev-parse", "--git-path", &arg])
-        .output()
-        .ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    let raw = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    if raw.is_empty() {
-        return None;
-    }
-    let p = std::path::PathBuf::from(&raw);
-    Some(if p.is_absolute() { p } else { repo.join(p) })
+    // `hooks/` is SHARED across linked worktrees → the common dir.
+    Some(
+        crate::git_io::common_dir(repo)
+            .ok()?
+            .join(format!("hooks/{name}")),
+    )
 }
 
 #[cfg(unix)]
