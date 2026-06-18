@@ -164,10 +164,12 @@ pub async fn run_fork_pinned(
     // The fork SOURCE (sessions + base) stays the current worktree;
     // only the dest LOCATION is main-rooted. `--path` still wins.
     let main_root = main_repo_root(&source)?;
-    let dest = match &args.path {
-        Some(p) => p.clone(),
-        None => main_root.join(format!(".clank/worktrees/{name}")),
-    };
+    let cwd = std::env::current_dir().context("resolving the current directory")?;
+    let dest = resolve_dest(
+        args.path.as_deref(),
+        main_root.join(format!(".clank/worktrees/{name}")),
+        &cwd,
+    );
 
     // Idempotent re-fork (open-and-fork-idempotent Part 4): if `dest`
     // already IS this fork — a registered worktree of `source` on
@@ -433,6 +435,18 @@ fn main_repo_root(repo: &Path) -> anyhow::Result<PathBuf> {
     Ok(PathBuf::from(path))
 }
 
+/// The worktree destination as an ABSOLUTE path: an explicit `--path`
+/// is resolved against `cwd` when relative (git records worktree paths
+/// absolutely, so a relative `dest` would never match on a re-fork —
+/// codex d86f702), else the default `<main>/.clank/worktrees/<name>`.
+fn resolve_dest(path_arg: Option<&Path>, default: PathBuf, cwd: &Path) -> PathBuf {
+    match path_arg {
+        Some(p) if p.is_absolute() => p.to_path_buf(),
+        Some(p) => cwd.join(p),
+        None => default,
+    }
+}
+
 /// The branch checked out at `worktree_path`, if it's a registered
 /// worktree of `repo`; `None` if `repo` doesn't track that path (a
 /// foreign directory) or the worktree is detached. Distinguishes an
@@ -451,29 +465,39 @@ fn registered_worktree_branch(repo: &Path, worktree_path: &Path) -> anyhow::Resu
             String::from_utf8_lossy(&out.stderr).trim()
         );
     }
-    Ok(parse_worktree_branch(
-        &String::from_utf8_lossy(&out.stdout),
-        worktree_path,
-    ))
+    // git records worktree paths absolute + symlink-resolved, so a
+    // symlinked or `..`-laden `dest` won't match textually —
+    // canonicalize both sides before comparing (codex d86f702).
+    let target = canonical(worktree_path);
+    Ok(parse_worktrees(&String::from_utf8_lossy(&out.stdout))
+        .into_iter()
+        .find(|(path, _)| canonical(Path::new(path)) == target)
+        .map(|(_, branch)| branch.to_string()))
 }
 
-/// The short branch name of the `git worktree list --porcelain` block
-/// whose `worktree <path>` matches `target`. Blocks are blank-line
-/// separated: `worktree <path>` then (for a non-detached worktree)
-/// `branch refs/heads/<b>`. `None` if no block matches the path or the
-/// matching one is detached (no `branch` line).
-fn parse_worktree_branch(porcelain: &str, target: &Path) -> Option<String> {
-    let mut in_target = false;
+/// Canonicalize for path comparison, falling back to the path itself
+/// when it can't be resolved (e.g. it no longer exists).
+fn canonical(p: &Path) -> PathBuf {
+    dunce::canonicalize(p).unwrap_or_else(|_| p.to_path_buf())
+}
+
+/// Pure: the `(worktree path, branch)` pairs in `git worktree list
+/// --porcelain`. Blocks are blank-line separated — `worktree <path>`
+/// then (unless detached) `branch refs/heads/<b>`; detached worktrees
+/// (no `branch` line) are omitted.
+fn parse_worktrees(porcelain: &str) -> Vec<(&str, &str)> {
+    let mut pairs = Vec::new();
+    let mut path: Option<&str> = None;
     for line in porcelain.lines() {
-        if let Some(path) = line.strip_prefix("worktree ") {
-            in_target = Path::new(path) == target;
-        } else if in_target {
-            if let Some(branch) = line.strip_prefix("branch refs/heads/") {
-                return Some(branch.to_string());
+        if let Some(p) = line.strip_prefix("worktree ") {
+            path = Some(p);
+        } else if let Some(b) = line.strip_prefix("branch refs/heads/") {
+            if let Some(p) = path.take() {
+                pairs.push((p, b));
             }
         }
     }
-    None
+    pairs
 }
 
 /// Best-effort PR title for the orientation prompt. Runs gh IN
@@ -574,9 +598,10 @@ mod tests {
     }
 
     #[test]
-    fn parse_worktree_branch_matches_path_to_branch() {
+    fn parse_worktrees_extracts_path_branch_pairs_skipping_detached() {
         // Real `git worktree list --porcelain`: blank-line-separated
-        // blocks, the main worktree first.
+        // blocks, the main worktree first; a detached worktree has no
+        // `branch` line and is omitted.
         let porcelain = "\
 worktree /repo
 HEAD aaaa
@@ -591,23 +616,33 @@ HEAD cccc
 detached
 ";
         assert_eq!(
-            parse_worktree_branch(porcelain, Path::new("/repo/.clank/worktrees/myfork")),
-            Some("myfork".to_string())
+            parse_worktrees(porcelain),
+            vec![
+                ("/repo", "main"),
+                ("/repo/.clank/worktrees/myfork", "myfork"),
+            ]
         );
+    }
+
+    #[test]
+    fn resolve_dest_makes_relative_path_absolute() {
+        // The relative `--path` idempotency fix (codex d86f702),
+        // tested without touching the process cwd: a relative `--path`
+        // resolves against the cwd to the SAME absolute path git would
+        // record, so a re-fork matches instead of reading as foreign.
+        let default = PathBuf::from("/main/.clank/worktrees/x");
+        let cwd = Path::new("/work/dir");
         assert_eq!(
-            parse_worktree_branch(porcelain, Path::new("/repo")),
-            Some("main".to_string())
+            resolve_dest(Some(Path::new("sub/x")), default.clone(), cwd),
+            PathBuf::from("/work/dir/sub/x")
         );
-        // Detached worktree → no branch line → None even on a path hit.
+        // Absolute `--path` → verbatim.
         assert_eq!(
-            parse_worktree_branch(porcelain, Path::new("/repo/.clank/worktrees/detached")),
-            None
+            resolve_dest(Some(Path::new("/abs/x")), default.clone(), cwd),
+            PathBuf::from("/abs/x")
         );
-        // Unknown path (foreign directory) → None.
-        assert_eq!(
-            parse_worktree_branch(porcelain, Path::new("/repo/.clank/worktrees/ghost")),
-            None
-        );
+        // No `--path` → the default location.
+        assert_eq!(resolve_dest(None, default.clone(), cwd), default);
     }
 
     fn git(repo: &Path, args: &[&str]) {
@@ -668,6 +703,32 @@ detached
         let got = run_fork(&fork_args("myfork", repo), None)
             .await
             .expect("reopening an existing fork is a no-op, not an error");
+        assert_eq!(got.canonicalize().unwrap(), dest.canonicalize().unwrap());
+    }
+
+    #[tokio::test]
+    async fn reopen_via_noncanonical_path_still_matches() {
+        // A `--path` that points at the existing fork through a `..`
+        // segment is textually != git's absolute record, but must
+        // canonicalize-match and reopen — not read as foreign (codex
+        // d86f702). This is the non-cwd half of the relative-path fix;
+        // the relative→absolute half is `resolve_dest`'s pure test.
+        let dir = init_repo_with_commit();
+        let repo = dir.path();
+        let dest = repo.join(".clank/worktrees/myfork");
+        git(
+            repo,
+            &["worktree", "add", "-b", "myfork", dest.to_str().unwrap()],
+        );
+
+        // Same location, different spelling: .../worktrees/../worktrees/myfork
+        // (the `worktrees` dir exists, so `..` resolves).
+        let noncanonical = repo.join(".clank/worktrees/../worktrees/myfork");
+        let mut args = fork_args("myfork", repo);
+        args.path = Some(noncanonical);
+        let got = run_fork(&args, None)
+            .await
+            .expect("a non-canonical path to the same fork reopens");
         assert_eq!(got.canonicalize().unwrap(), dest.canonicalize().unwrap());
     }
 
