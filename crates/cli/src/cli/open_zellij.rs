@@ -77,6 +77,17 @@ pub async fn run(args: OpenZellijArgs) -> anyhow::Result<()> {
         return Ok(());
     }
 
+    // Idempotent open (open-and-fork-idempotent): inside a session,
+    // don't spawn a second tab for a worktree that already has one.
+    // The tab name is the repo basename; `tab_is_open` matches it
+    // glyph-stripped against the live tab list. The `?` only runs when
+    // `$ZELLIJ` is set (short-circuit), so a failure to query is a
+    // real in-session misconfiguration and surfaces as an error.
+    if std::env::var_os("ZELLIJ").is_some() && tab_is_open(&basename, &zellij_tab_names()?) {
+        eprintln!("tab `{basename}` already open");
+        return Ok(());
+    }
+
     write_layout_file(&repo, &kdl)?;
     crate::init_facts::ensure_clank_gitignore_entry(&repo, "/zellij/")
         .context("ensuring /zellij/ gitignore entry")?;
@@ -97,6 +108,42 @@ pub async fn run(args: OpenZellijArgs) -> anyhow::Result<()> {
         anyhow::bail!("zellij exited {status}");
     }
     Ok(())
+}
+
+/// `zellij action query-tab-names` → one open tab name per line.
+///
+/// ERRORS rather than degrading: this is only ever called when we're
+/// already INSIDE a session (`$ZELLIJ` set), so `zellij` must be
+/// runnable — if it isn't, silently returning "no tabs" would make the
+/// dedup reconcile (open-and-fork-idempotent) misbehave (always "not
+/// open" → double-open), masking a real misconfiguration. The caller
+/// propagates with `?` so the operator sees a clear message. (Contrast
+/// `zellij_list_sessions`, which degrades on purpose: outside a session
+/// a non-zero exit legitimately means "no sessions".)
+fn zellij_tab_names() -> anyhow::Result<Vec<String>> {
+    let out = std::process::Command::new("zellij")
+        .args(["action", "query-tab-names"])
+        .output()
+        .context("running `zellij action query-tab-names` (is zellij on PATH?)")?;
+    if !out.status.success() {
+        anyhow::bail!(
+            "`zellij action query-tab-names` exited {} — can't reconcile open tabs",
+            out.status
+        );
+    }
+    Ok(String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .map(str::to_string)
+        .collect())
+}
+
+/// True if a tab for worktree `tab` (its basename / fork name) is
+/// already open. zellij reports tab names with a possible leading
+/// status glyph (tui-tab-mirror-bar-emoji), so compare glyph-stripped.
+fn tab_is_open(tab: &str, open_names: &[String]) -> bool {
+    open_names
+        .iter()
+        .any(|n| crate::cli::status_tui::strip_leading_emoji(n) == tab)
 }
 
 /// `zellij list-sessions -n` stdout, or empty when the command
@@ -1053,6 +1100,25 @@ dead-one [Created 10h ago] (EXITED - attach to resurrect)
         // equality, not prefix).
         let listing = "clank-foobar [Created 1m ago]\n";
         assert_eq!(decide_session(listing, "clank-foo"), SessionPlan::Create);
+    }
+
+    #[test]
+    fn tab_is_open_matches_glyph_stripped() {
+        // zellij reports tab names with a possible leading status glyph
+        // (tui-tab-mirror-bar-emoji); the reconcile must match the
+        // worktree/fork name glyph-stripped (open-and-fork-idempotent).
+        let open = vec![
+            "🔨 clank".to_string(),
+            "👀 device-prompt-animations".to_string(),
+            "status".to_string(),
+        ];
+        assert!(tab_is_open("clank", &open));
+        assert!(tab_is_open("device-prompt-animations", &open));
+        // No glyph → exact match still works.
+        assert!(tab_is_open("status", &open));
+        // A worktree with no open tab is not "open".
+        assert!(!tab_is_open("frostsnap", &open));
+        assert!(!tab_is_open("clan", &open), "no prefix match");
     }
 
     #[test]

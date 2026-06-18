@@ -849,7 +849,7 @@ fn paint(lines: &[String]) {
 /// Strip a leading signal-lamp emoji (`"👀 frostsnap"` → `"frostsnap"`)
 /// so a prior, un-restored indicator doesn't stack. A lamp glyph is a
 /// single emoji-plane grapheme followed by a space.
-fn strip_leading_emoji(name: &str) -> String {
+pub(crate) fn strip_leading_emoji(name: &str) -> String {
     let mut chars = name.chars();
     match (chars.next(), chars.next()) {
         // A lamp glyph (emoji-plane, width 2) followed by a space.
