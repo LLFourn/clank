@@ -96,16 +96,35 @@ pane-id map (`label (role)` → pane id) is session-stable, so:
 This cuts the per-render zellij-server load even while the loop is
 being fixed, and is correct regardless of Fix 1/2.
 
-## Fix 4 (minor) — narrow the OS watch
+## Fix 4 (narrow the OS watch) — DELIBERATELY NOT DONE
 
-`watch_status_paths` watches the whole repo recursively
-(`RecursiveMode::Recursive` on `repo`). The `WakeFilter` already drops
-gitignored worktree paths from WAKING, but FSEvents still MONITORS
-`target/` and `.git/objects/`, paying OS-level cost during `cargo
-build`. Scope the OS watch to the dirs we actually wake on (the source
-`.clank/` subdirs + git dir), matching what `wfw`'s `WatchContext`
-already does. This is a build-time FSEvents win, NOT the idle-time
-engine — lower priority than Fixes 1–3.
+Originally proposed: stop the whole-repo recursive watch from making
+FSEvents monitor `target/` during `cargo build`, by watching only
+`.clank` + the git dir (as `wfw`'s `WatchContext` does).
+
+Dropped after review, for two reasons:
+
+1. **It wasn't the cause.** The idle CPU was the cache-churn → wake
+   loop (Fixes 1–2), which needs no build at all. `WakeFilter` already
+   drops `target/` events, so monitoring `target/` never drove
+   renders; FSEvents coalesces those writes and filtering them is
+   cheap. The expensive part was the renders the loop forced — already
+   gone. So the build-time monitoring cost is marginal.
+
+2. **The clean version has a real regression; the no-regression
+   version is fiddly.** A recursive OS watch can't exclude a subtree —
+   there's no "watch worktree but skip `target/`" knob; you either
+   watch the whole tree (current) or watch narrower roots. Narrowing
+   to `.clank` + git makes `dirty:` stop refreshing on source saves
+   (it would lag to the 60s heartbeat) — a UX regression on a monitor
+   pane. Keeping `dirty:` fresh while still skipping `target/` would
+   mean watching each top-level entry except `target/`, which is a
+   gitignore-inexact heuristic (misses nested `target/`), misses
+   newly-created top-level dirs, and is more machinery than the
+   build-only benefit justifies.
+
+If build-time FSEvents load ever proves material in practice, revisit
+with the per-sibling watch — but it's out of scope here.
 
 ## Testing (in-process; no binary spawning — [[no-binary-spawning-tests]])
 
@@ -129,5 +148,5 @@ engine — lower priority than Fixes 1–3.
   idempotency (Fix 2) and the watch's treatment of the cache (Fix 1)
   change; how often/where checkpoints land does not.
 - Changing the emoji vocab or which states map to which glyph.
-- Reimplementing dirty-stat computation (only its refresh cadence
-  shifts, as a consequence of Fix 4).
+- The OS watch scope (Fix 4, dropped above) — `dirty:` keeps its
+  current instant refresh on worktree edits.
