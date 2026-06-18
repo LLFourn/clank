@@ -158,6 +158,47 @@ pub async fn run_fork_pinned(
     }
     let source = super::resolve_repo(args.source.as_deref())?;
 
+    // Worktrees live FLAT under the MAIN repo, never nested under the
+    // current worktree — forking from a worktree must produce a
+    // SIBLING, not `<wt>/.clank/worktrees/...` (fork-worktree-nesting).
+    // The fork SOURCE (sessions + base) stays the current worktree;
+    // only the dest LOCATION is main-rooted. `--path` still wins.
+    let main_root = main_repo_root(&source)?;
+    let dest = match &args.path {
+        Some(p) => p.clone(),
+        None => main_root.join(format!(".clank/worktrees/{name}")),
+    };
+
+    // Idempotent re-fork (open-and-fork-idempotent Part 4): if `dest`
+    // already IS this fork — a registered worktree of `source` on
+    // branch `name` — re-running is a no-op on the worktree. Skip the
+    // `git worktree add` + session seeding and return the path so the
+    // caller (re)opens its tab. Bail only on a genuine collision: a
+    // path that isn't our worktree, or one on a different branch (never
+    // silently adopt foreign state).
+    if dest.exists() {
+        return match registered_worktree_branch(&source, &dest)? {
+            Some(branch) if branch == name => {
+                eprintln!(
+                    "fork `{name}` already exists at {} — reopening (no changes)",
+                    dest.display()
+                );
+                Ok((dest, None))
+            }
+            Some(branch) => anyhow::bail!(
+                "`{}` is a worktree on branch `{branch}`, not the clank fork `{name}` — \
+                 remove it (`git worktree remove`) or pick another name.",
+                dest.display(),
+            ),
+            None => anyhow::bail!(
+                "`{}` already exists but is not a clank worktree of this repo. \
+                 Remove it with `git worktree remove {}` or pick another name.",
+                dest.display(),
+                dest.display()
+            ),
+        };
+    }
+
     // Team + precondition: EVERY registered agent must have a
     // bound session in the source repo — a fork with nothing to
     // fork is meaningless.
@@ -191,24 +232,6 @@ pub async fn run_fork_pinned(
         );
     }
 
-    // Worktrees live FLAT under the MAIN repo, never nested under the
-    // current worktree — forking from a worktree must produce a
-    // SIBLING, not `<wt>/.clank/worktrees/...` (fork-worktree-nesting).
-    // The fork SOURCE (sessions + base) stays the current worktree;
-    // only the dest LOCATION is main-rooted. `--path` still wins.
-    let main_root = main_repo_root(&source)?;
-    let dest = match &args.path {
-        Some(p) => p.clone(),
-        None => main_root.join(format!(".clank/worktrees/{name}")),
-    };
-    if dest.exists() {
-        anyhow::bail!(
-            "worktree destination `{}` already exists. Remove it with \
-             `git worktree remove {}` or pick another name.",
-            dest.display(),
-            dest.display()
-        );
-    }
     // ── Network + mutation side of the fail-closed line ──
     // The PR fetch (and the best-effort gh title lookup) are side
     // effects, so they sit AFTER every precondition (ruthless
@@ -410,6 +433,49 @@ fn main_repo_root(repo: &Path) -> anyhow::Result<PathBuf> {
     Ok(PathBuf::from(path))
 }
 
+/// The branch checked out at `worktree_path`, if it's a registered
+/// worktree of `repo`; `None` if `repo` doesn't track that path (a
+/// foreign directory) or the worktree is detached. Distinguishes an
+/// idempotent re-fork from a genuine collision (open-and-fork-
+/// idempotent Part 4).
+fn registered_worktree_branch(repo: &Path, worktree_path: &Path) -> anyhow::Result<Option<String>> {
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["worktree", "list", "--porcelain"])
+        .output()
+        .context("spawning git worktree list")?;
+    if !out.status.success() {
+        anyhow::bail!(
+            "resolving worktrees (`git worktree list`) failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    Ok(parse_worktree_branch(
+        &String::from_utf8_lossy(&out.stdout),
+        worktree_path,
+    ))
+}
+
+/// The short branch name of the `git worktree list --porcelain` block
+/// whose `worktree <path>` matches `target`. Blocks are blank-line
+/// separated: `worktree <path>` then (for a non-detached worktree)
+/// `branch refs/heads/<b>`. `None` if no block matches the path or the
+/// matching one is detached (no `branch` line).
+fn parse_worktree_branch(porcelain: &str, target: &Path) -> Option<String> {
+    let mut in_target = false;
+    for line in porcelain.lines() {
+        if let Some(path) = line.strip_prefix("worktree ") {
+            in_target = Path::new(path) == target;
+        } else if in_target {
+            if let Some(branch) = line.strip_prefix("branch refs/heads/") {
+                return Some(branch.to_string());
+            }
+        }
+    }
+    None
+}
+
 /// Best-effort PR title for the orientation prompt. Runs gh IN
 /// THE SOURCE DIR (ruthless 91ecaf2 edge 3 — gh infers the repo
 /// from cwd, so `--source /other` must not read the caller's
@@ -505,6 +571,143 @@ mod tests {
         assert!(!should_open(true, true), "inside + --no-open → skip");
         assert!(!should_open(false, false), "outside + default → skip");
         assert!(!should_open(false, true), "outside + --no-open → skip");
+    }
+
+    #[test]
+    fn parse_worktree_branch_matches_path_to_branch() {
+        // Real `git worktree list --porcelain`: blank-line-separated
+        // blocks, the main worktree first.
+        let porcelain = "\
+worktree /repo
+HEAD aaaa
+branch refs/heads/main
+
+worktree /repo/.clank/worktrees/myfork
+HEAD bbbb
+branch refs/heads/myfork
+
+worktree /repo/.clank/worktrees/detached
+HEAD cccc
+detached
+";
+        assert_eq!(
+            parse_worktree_branch(porcelain, Path::new("/repo/.clank/worktrees/myfork")),
+            Some("myfork".to_string())
+        );
+        assert_eq!(
+            parse_worktree_branch(porcelain, Path::new("/repo")),
+            Some("main".to_string())
+        );
+        // Detached worktree → no branch line → None even on a path hit.
+        assert_eq!(
+            parse_worktree_branch(porcelain, Path::new("/repo/.clank/worktrees/detached")),
+            None
+        );
+        // Unknown path (foreign directory) → None.
+        assert_eq!(
+            parse_worktree_branch(porcelain, Path::new("/repo/.clank/worktrees/ghost")),
+            None
+        );
+    }
+
+    fn git(repo: &Path, args: &[&str]) {
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+
+    fn init_repo_with_commit() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        git(repo, &["init", "--quiet", "--initial-branch=main"]);
+        git(repo, &["config", "user.email", "t@example.com"]);
+        git(repo, &["config", "user.name", "Tester"]);
+        std::fs::write(repo.join("f"), "x").unwrap();
+        git(repo, &["add", "."]);
+        git(repo, &["commit", "--quiet", "-m", "init"]);
+        dir
+    }
+
+    fn fork_args(name: &str, source: &Path) -> ForkArgs {
+        ForkArgs {
+            name: Some(name.to_string()),
+            source: Some(source.to_path_buf()),
+            pr: None,
+            branch: None,
+            path: None,
+            prompt: None,
+            no_open: true,
+            review: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn reopen_existing_fork_is_a_noop_not_an_error() {
+        // open-and-fork-idempotent Part 4: re-running `clank fork` on an
+        // existing fork must not error and must not re-`add` — it returns
+        // the path so the caller reopens the tab. (The reopen short-
+        // circuits BEFORE team resolution, so no team is needed here; and
+        // a stray `git worktree add -b myfork` would itself error, so a
+        // clean Ok IS proof the add was skipped.)
+        let dir = init_repo_with_commit();
+        let repo = dir.path();
+        let dest = repo.join(".clank/worktrees/myfork");
+        git(
+            repo,
+            &["worktree", "add", "-b", "myfork", dest.to_str().unwrap()],
+        );
+
+        let got = run_fork(&fork_args("myfork", repo), None)
+            .await
+            .expect("reopening an existing fork is a no-op, not an error");
+        assert_eq!(got.canonicalize().unwrap(), dest.canonicalize().unwrap());
+    }
+
+    #[tokio::test]
+    async fn fork_collision_on_a_different_branch_errors() {
+        // The fork's path is taken by a worktree on ANOTHER branch — a
+        // genuine collision; never silently adopt it.
+        let dir = init_repo_with_commit();
+        let repo = dir.path();
+        let dest = repo.join(".clank/worktrees/myfork");
+        git(
+            repo,
+            &["worktree", "add", "-b", "other", dest.to_str().unwrap()],
+        );
+
+        let err = run_fork(&fork_args("myfork", repo), None)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("other") && err.contains("myfork"),
+            "names the conflicting branch and the fork: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn fork_collision_on_a_foreign_directory_errors() {
+        // The path exists but isn't a registered worktree at all.
+        let dir = init_repo_with_commit();
+        let repo = dir.path();
+        std::fs::create_dir_all(repo.join(".clank/worktrees/myfork")).unwrap();
+
+        let err = run_fork(&fork_args("myfork", repo), None)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("not a clank worktree"),
+            "flags the foreign directory: {err}"
+        );
     }
 
     #[test]
