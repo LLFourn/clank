@@ -133,40 +133,122 @@ fn missing_tabs(target_basenames: &[String], open_tabs: &[String]) -> Vec<String
         .collect()
 }
 
+/// What `--all` outside a session should do. The argv split mirrors
+/// [`decide_session`]: an absent or dead `clank-<repo>` session can't
+/// take the add-tabs `--layout` (it errors "no active session" — see
+/// [`create_argv`]), so it is (re)created fresh with EVERY target tab;
+/// only a LIVE session takes the add-tabs argv, and then only for the
+/// tabs not already open (codex e33389b). Pure / testable.
+#[derive(Clone, PartialEq, Debug)]
+enum AllPlan {
+    /// (Re)create a fresh session with every target tab. `delete_first`
+    /// clears a dead same-named session first.
+    CreateFresh { delete_first: bool },
+    /// Live session: add these (currently missing) tabs.
+    AddTabs(Vec<String>),
+    /// Live session already has every target tab: just attach.
+    Attach,
+}
+
+fn plan_all(session: SessionPlan, target_basenames: &[String], open_tabs: &[String]) -> AllPlan {
+    match session {
+        SessionPlan::Create => AllPlan::CreateFresh {
+            delete_first: false,
+        },
+        SessionPlan::DeleteDeadThenCreate => AllPlan::CreateFresh { delete_first: true },
+        SessionPlan::Attach => {
+            let missing = missing_tabs(target_basenames, open_tabs);
+            if missing.is_empty() {
+                AllPlan::Attach
+            } else {
+                AllPlan::AddTabs(missing)
+            }
+        }
+    }
+}
+
 /// `--all` outside a session: ensure the `clank-<repo>` session has a
-/// tab for every target worktree, then drop the operator in. Reconciles
-/// against the session's CURRENT tabs (works even when it's detached or
-/// absent), then adds ONLY the missing ones via `zellij --session
-/// <name> --layout` — which adds tabs to a live session or starts a
-/// fresh one. So an existing one-tab session gets the rest, instead of
-/// a plain `attach` that ignored the layout (codex a0c53c9). When every
-/// tab is already open, it just attaches. Teamless worktrees are
-/// skipped with a notice.
+/// tab for every target worktree, then drop the operator in. Routes
+/// through [`decide_session`] — an absent/dead session is (re)created
+/// fresh with all tabs; a LIVE one gets ONLY its missing tabs added via
+/// the add-tabs `--layout` argv (a plain `attach` would ignore the
+/// layout, leaving a one-tab session short — codex a0c53c9); a live
+/// session that already has every tab is just attached. Teamless
+/// worktrees are skipped with a notice.
 fn open_all(source: &Path, targets: &[PathBuf], print: bool) -> anyhow::Result<()> {
     let name = session_name(&repo_basename(source)?);
-    let open_tabs = session_tab_names(&name);
     let basenames: Vec<String> = targets
         .iter()
         .map(|t| repo_basename(t))
         .collect::<anyhow::Result<_>>()?;
-    let missing = missing_tabs(&basenames, &open_tabs);
+    let session = decide_session(&zellij_list_sessions(), &name);
+    // Only a live session needs a tab query to compute what's missing.
+    let open_tabs = match session {
+        SessionPlan::Attach => session_tab_names(&name),
+        _ => Vec::new(),
+    };
+    let plan = plan_all(session, &basenames, &open_tabs);
 
-    // Nothing to add → the session already has every worktree tab;
-    // just attach the operator to it.
-    if missing.is_empty() {
+    // Attach-only: every tab is already there, no layout to write.
+    if plan == AllPlan::Attach {
         let argv = attach_argv(&name);
         if print {
             eprintln!("spawn: {}", argv.join(" "));
-            return Ok(());
+        } else {
+            eprintln!("session `{name}` already has every worktree tab; attaching");
+            spawn_zellij(&argv)?;
         }
-        return spawn_zellij(&argv, &name);
+        return Ok(());
     }
 
-    // Compose a tab per MISSING worktree (skipping teamless ones).
-    let mut tabs: Vec<TabSpec> = Vec::new();
+    // Layout targets: every target for a fresh session, only the
+    // missing ones when adding to a live session.
+    let include: Option<&[String]> = match &plan {
+        AllPlan::AddTabs(missing) => Some(missing),
+        _ => None,
+    };
+    let tabs = resolve_tabs(targets, include)?;
+    if tabs.is_empty() {
+        anyhow::bail!("no openable worktrees (none have a clank team configured)");
+    }
+
+    let (rows, cols) = crate::cli::status_tui::term_size();
+    let kdl = compose_multitab(&tabs, (cols, rows))?;
+    let layout_path = layout_file_path(source);
+    let (pre, spawn) = match plan {
+        AllPlan::CreateFresh { delete_first } => (
+            delete_first.then(|| delete_argv(&name)),
+            create_argv(&layout_path, &name),
+        ),
+        AllPlan::AddTabs(_) => (None, add_tabs_argv(&layout_path, &name)),
+        AllPlan::Attach => unreachable!("handled above"),
+    };
+
+    if print {
+        println!("{kdl}");
+        if let Some(pre) = &pre {
+            eprintln!("pre-spawn: {}", pre.join(" "));
+        }
+        eprintln!("spawn: {}", spawn.join(" "));
+        return Ok(());
+    }
+    write_layout_file(source, &kdl)?;
+    crate::init_facts::ensure_clank_gitignore_entry(source, "/zellij/")
+        .context("ensuring /zellij/ gitignore entry")?;
+    if let Some(pre) = &pre {
+        let _ = std::process::Command::new(&pre[0]).args(&pre[1..]).status();
+    }
+    spawn_zellij(&spawn)
+}
+
+/// Resolve target worktrees to tab specs, skipping teamless ones with a
+/// notice. `include = Some(names)` restricts to those basenames (the
+/// add-tabs case); `None` includes every target (a fresh session).
+fn resolve_tabs(targets: &[PathBuf], include: Option<&[String]>) -> anyhow::Result<Vec<TabSpec>> {
+    let mut tabs = Vec::new();
     for t in targets {
         let basename = repo_basename(t)?;
-        if !missing.contains(&basename) {
+        if include.is_some_and(|names| !names.contains(&basename)) {
             continue;
         }
         let Some(set) = crate::agent_store::try_resolve_via_team(t)? else {
@@ -186,38 +268,11 @@ fn open_all(source: &Path, targets: &[PathBuf], print: bool) -> anyhow::Result<(
             reviewers,
         });
     }
-    if tabs.is_empty() {
-        anyhow::bail!("no openable worktrees (the missing ones have no clank team configured)");
-    }
-
-    let (rows, cols) = crate::cli::status_tui::term_size();
-    let kdl = compose_multitab(&tabs, (cols, rows))?;
-    let layout_path = layout_file_path(source);
-    // `--session <name> --layout`: adds the layout's tabs to session
-    // <name> when it's live, or starts it fresh when absent.
-    let argv = vec![
-        "zellij".to_string(),
-        "--session".to_string(),
-        name.clone(),
-        "--layout".to_string(),
-        layout_path.display().to_string(),
-    ];
-    if print {
-        println!("{kdl}");
-        eprintln!("spawn: {}", argv.join(" "));
-        return Ok(());
-    }
-    write_layout_file(source, &kdl)?;
-    crate::init_facts::ensure_clank_gitignore_entry(source, "/zellij/")
-        .context("ensuring /zellij/ gitignore entry")?;
-    spawn_zellij(&argv, &name)
+    Ok(tabs)
 }
 
 /// Run a zellij spawn argv, mapping failure to a clear error.
-fn spawn_zellij(argv: &[String], name: &str) -> anyhow::Result<()> {
-    if argv.get(1).map(String::as_str) == Some("attach") {
-        eprintln!("attaching to existing session `{name}`");
-    }
+fn spawn_zellij(argv: &[String]) -> anyhow::Result<()> {
     let status = std::process::Command::new(&argv[0])
         .args(&argv[1..])
         .status()
@@ -827,6 +882,21 @@ fn create_argv(layout_path: &Path, name: &str) -> Vec<String> {
     ]
 }
 
+/// Add the layout's tabs to the LIVE session `name`. Alongside
+/// `--session`, plain `--layout` means "add as tab(s)" — the inverse of
+/// [`create_argv`]'s `--new-session-with-layout`. It errors when the
+/// session isn't live, so callers MUST gate on a live session (the
+/// `--all` Attach branch).
+fn add_tabs_argv(layout_path: &Path, name: &str) -> Vec<String> {
+    vec![
+        "zellij".to_string(),
+        "--session".to_string(),
+        name.to_string(),
+        "--layout".to_string(),
+        layout_path.display().to_string(),
+    ]
+}
+
 fn attach_argv(name: &str) -> Vec<String> {
     vec!["zellij".to_string(), "attach".to_string(), name.to_string()]
 }
@@ -1375,26 +1445,42 @@ dead-one [Created 10h ago] (EXITED - attach to resurrect)
     }
 
     #[test]
-    fn missing_tabs_reconciles_against_a_live_session() {
+    fn plan_all_routes_by_session_state() {
         let targets = vec![
             "clank".to_string(),
             "fork-a".to_string(),
             "fork-b".to_string(),
         ];
-        // Attach case (codex a0c53c9): a live session already shows the
-        // repo tab (glyph-prefixed) + one fork — `--all` must add ONLY
-        // the genuinely-missing tabs, not re-open what's there.
+        // Absent session: can't take `--layout` (errors "no active
+        // session"), so create fresh with every tab.
+        assert_eq!(
+            plan_all(SessionPlan::Create, &targets, &[]),
+            AllPlan::CreateFresh {
+                delete_first: false
+            }
+        );
+        // Dead session: delete it, then create fresh with every tab.
+        assert_eq!(
+            plan_all(SessionPlan::DeleteDeadThenCreate, &targets, &[]),
+            AllPlan::CreateFresh { delete_first: true }
+        );
+        // Live session missing a tab (codex a0c53c9): add ONLY the
+        // missing one — open tabs carry status glyphs, so match stripped.
         let open = vec!["🔨 clank".to_string(), "👀 fork-a".to_string()];
-        assert_eq!(missing_tabs(&targets, &open), vec!["fork-b".to_string()]);
-        // Every tab already open → nothing to add (caller just attaches).
+        assert_eq!(
+            plan_all(SessionPlan::Attach, &targets, &open),
+            AllPlan::AddTabs(vec!["fork-b".to_string()])
+        );
+        // Live session already has every tab → attach, add nothing.
         let all_open = vec![
             "clank".to_string(),
             "fork-a".to_string(),
             "fork-b".to_string(),
         ];
-        assert!(missing_tabs(&targets, &all_open).is_empty());
-        // Absent session → query returns nothing → open them all (fresh).
-        assert_eq!(missing_tabs(&targets, &[]), targets);
+        assert_eq!(
+            plan_all(SessionPlan::Attach, &targets, &all_open),
+            AllPlan::Attach
+        );
     }
 
     #[test]
@@ -1472,6 +1558,19 @@ dead-one [Created 10h ago] (EXITED - attach to resurrect)
         assert_eq!(
             delete_argv("clank-r"),
             vec!["zellij", "delete-session", "clank-r"]
+        );
+        // Add-tabs (live session): plain `--layout`, NOT
+        // `--new-session-with-layout` — adds the layout's tabs to the
+        // running session rather than starting a new one.
+        assert_eq!(
+            add_tabs_argv(layout, "clank-r"),
+            vec![
+                "zellij",
+                "--session",
+                "clank-r",
+                "--layout",
+                "/r/.clank/zellij/layout.kdl",
+            ]
         );
         // The in-session tab path carries NO --session flag: inside
         // zellij even an explicit --session is overridden into
