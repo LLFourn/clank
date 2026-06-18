@@ -89,6 +89,13 @@ Two modes by context:
 - Keep erroring ONLY on a genuine conflict: the branch/path exists but
   is NOT a clank fork of this source (don't silently adopt foreign
   state).
+- KNOWN LIMITATION (skip-if-exists, not per-step ensure): a re-fork on
+  an existing registered worktree skips BOTH the `git worktree add` and
+  the session seeding. A partially-created fork (worktree added but the
+  process died before seeding) is therefore skipped on rerun and stays
+  unseeded — its agents launch fresh, non-forked sessions. Narrow and
+  recoverable (`clank purge` + re-fork); revisit with a per-step ensure
+  if it bites.
 
 ## Design decisions
 

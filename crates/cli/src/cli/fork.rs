@@ -491,10 +491,10 @@ fn parse_worktrees(porcelain: &str) -> Vec<(&str, &str)> {
     for line in porcelain.lines() {
         if let Some(p) = line.strip_prefix("worktree ") {
             path = Some(p);
-        } else if let Some(b) = line.strip_prefix("branch refs/heads/") {
-            if let Some(p) = path.take() {
-                pairs.push((p, b));
-            }
+        } else if let Some(b) = line.strip_prefix("branch refs/heads/")
+            && let Some(p) = path.take()
+        {
+            pairs.push((p, b));
         }
     }
     pairs
